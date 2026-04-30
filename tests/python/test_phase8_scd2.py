@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import uuid
-from collections.abc import Iterator
 from typing import Any
 
 import pytest
@@ -275,21 +274,7 @@ def test_run_history_records_scd2_counts(
     assert found == 1
 
 
-# --- cross-DB ----------------------------------------------------------------
-
-
-@pytest.fixture(scope="module")
-def pg_url_secondary() -> Iterator[str]:
-    pytest.importorskip("testcontainers.postgres")
-    from testcontainers.postgres import PostgresContainer
-
-    with PostgresContainer("postgres:16-alpine", driver=None) as container:
-        host = container.get_container_host_ip()
-        port = container.get_exposed_port(5432)
-        user = container.username
-        password = container.password
-        dbname = container.dbname
-        yield f"postgres://{user}:{password}@{host}:{port}/{dbname}"
+# --- cross-DB (uses session-scoped pg_url_secondary from conftest) ----------
 
 
 def test_cross_db_scd2(

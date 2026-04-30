@@ -22,3 +22,8 @@ deadpool-postgres.workspace = true
 uuid.workspace = true
 futures-util.workspace = true
 bytes.workspace = true
+
+[dev-dependencies]
+testcontainers.workspace = true
+testcontainers-modules.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

@@ -1,9 +1,11 @@
 """Shared pytest fixtures.
 
 `pg_url` provides a connection URL to a throwaway Postgres container.
-The fixture is session-scoped so the container is reused across tests
-in a single run; data isolation is the test's responsibility (drop
-tables in test setup or use unique table names).
+`pg_url_secondary` provides a second, independent container — used by
+cross-DB tests that want source and target on different databases. Both
+fixtures are session-scoped so containers are reused across the run;
+data isolation is each test's responsibility (drop tables in setup or
+use unique schema names).
 """
 
 from __future__ import annotations
@@ -13,8 +15,7 @@ from collections.abc import Iterator
 import pytest
 
 
-@pytest.fixture(scope="session")
-def pg_url() -> Iterator[str]:
+def _start_postgres() -> Iterator[str]:
     pytest.importorskip("testcontainers.postgres")
     from testcontainers.postgres import PostgresContainer
 
@@ -27,3 +28,13 @@ def pg_url() -> Iterator[str]:
         password = container.password
         dbname = container.dbname
         yield f"postgres://{user}:{password}@{host}:{port}/{dbname}"
+
+
+@pytest.fixture(scope="session")
+def pg_url() -> Iterator[str]:
+    yield from _start_postgres()
+
+
+@pytest.fixture(scope="session")
+def pg_url_secondary() -> Iterator[str]:
+    yield from _start_postgres()

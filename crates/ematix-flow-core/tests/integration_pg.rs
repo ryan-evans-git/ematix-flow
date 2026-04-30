@@ -1,0 +1,120 @@
+//! Phase 13: Rust-side end-to-end integration tests against a real Postgres
+//! container. These complement the Python integration tests by exercising
+//! the Rust APIs directly — which is what the runtime will actually use.
+//!
+//! Marked `#[ignore]` so `cargo test` stays fast by default. Run with
+//! `cargo test -p ematix-flow-core -- --ignored` (Docker required).
+
+use ematix_flow_core::pg::PgPool;
+use ematix_flow_core::strategy::append::augment_with_metadata;
+use ematix_flow_core::types::{ColumnSpec, ColumnType, TableSpec};
+use testcontainers::runners::AsyncRunner;
+use testcontainers_modules::postgres::Postgres;
+
+async fn start_postgres() -> (testcontainers::ContainerAsync<Postgres>, String) {
+    let container = Postgres::default()
+        .start()
+        .await
+        .expect("failed to start postgres testcontainer");
+    let host = container
+        .get_host()
+        .await
+        .expect("failed to read host")
+        .to_string();
+    let port = container
+        .get_host_port_ipv4(5432)
+        .await
+        .expect("failed to read port");
+    let url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
+    (container, url)
+}
+
+fn target_spec() -> TableSpec {
+    augment_with_metadata(&TableSpec {
+        schema: "warehouse".into(),
+        name: "event_log".into(),
+        columns: vec![
+            ColumnSpec {
+                name: "event_id".into(),
+                ty: ColumnType::BigInt,
+                nullable: false,
+                primary_key: true,
+            },
+            ColumnSpec {
+                name: "name".into(),
+                ty: ColumnType::Text,
+                nullable: true,
+                primary_key: false,
+            },
+        ],
+        fingerprint: String::new(),
+    })
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker; run with `cargo test -- --ignored`"]
+async fn append_same_db_inserts_and_records_history() {
+    let (_container, url) = start_postgres().await;
+    let pool = PgPool::connect(&url).await.unwrap();
+
+    pool.execute("CREATE SCHEMA src").await.unwrap();
+    pool.execute("CREATE TABLE src.events (event_id BIGINT PRIMARY KEY, name TEXT)")
+        .await
+        .unwrap();
+    pool.execute("INSERT INTO src.events VALUES (1, 'a'), (2, 'b'), (3, 'c')")
+        .await
+        .unwrap();
+
+    let target = target_spec();
+    pool.ensure_table(&target).await.unwrap();
+
+    let result = pool
+        .run_append_same_db(
+            &target,
+            "SELECT event_id, name FROM src.events",
+            "rust_integration_append",
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.rows_inserted, 3);
+    assert_eq!(result.path, "same_db");
+
+    let row_count = pool
+        .fetch_scalar_int("SELECT count(*)::int FROM warehouse.event_log")
+        .await
+        .unwrap();
+    assert_eq!(row_count, 3);
+
+    let history_count = pool
+        .fetch_scalar_int(
+            "SELECT count(*)::int FROM ematix_flow.run_history \
+             WHERE pipeline_name = 'rust_integration_append' AND status = 'success'",
+        )
+        .await
+        .unwrap();
+    assert_eq!(history_count, 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker; run with `cargo test -- --ignored`"]
+async fn ensure_table_round_trips_columns() {
+    let (_container, url) = start_postgres().await;
+    let pool = PgPool::connect(&url).await.unwrap();
+
+    let target = target_spec();
+    pool.ensure_table(&target).await.unwrap();
+    let reflected = pool
+        .read_existing_columns(&target.schema, &target.name)
+        .await
+        .unwrap();
+
+    let names: Vec<&str> = reflected.iter().map(|c| c.name.as_str()).collect();
+    assert!(names.contains(&"event_id"));
+    assert!(names.contains(&"name"));
+    assert!(names.contains(&"_loaded_at"));
+    assert!(names.contains(&"_batch_id"));
+
+    // ensure is idempotent: a second call sees Matched, not Drift.
+    pool.ensure_table(&target).await.unwrap();
+}
