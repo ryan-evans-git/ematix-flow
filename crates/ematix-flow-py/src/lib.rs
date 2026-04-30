@@ -2,6 +2,7 @@ use std::sync::{Arc, OnceLock};
 
 use ematix_flow_core::ddl::{self, DriftResult};
 use ematix_flow_core::pg::{self, EnsureOutcome, PgPool};
+use ematix_flow_core::strategy::append::augment_with_metadata;
 use ematix_flow_core::types::TableSpec;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
@@ -38,6 +39,22 @@ fn parse_table_spec(json: &str) -> PyResult<String> {
 #[pyfunction]
 fn same_database(a: &str, b: &str) -> PyResult<bool> {
     pg::same_database(a, b).map_err(|e| PyValueError::new_err(e.to_string()))
+}
+
+/// Add `_loaded_at` and `_batch_id` columns to a TableSpec if absent.
+/// Returns normalized JSON of the augmented spec (with fingerprint).
+#[pyfunction]
+fn augment_table_spec(spec_json: &str) -> PyResult<String> {
+    let normalized = ematix_flow_core::normalize_table_json(spec_json)
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    let spec: TableSpec =
+        serde_json::from_str(&normalized).map_err(|e| PyValueError::new_err(e.to_string()))?;
+    let augmented = augment_with_metadata(&spec);
+    let augmented_json =
+        serde_json::to_string(&augmented).map_err(|e| PyValueError::new_err(e.to_string()))?;
+    // Re-normalize to recompute fingerprint with the new columns.
+    ematix_flow_core::normalize_table_json(&augmented_json)
+        .map_err(|e| PyValueError::new_err(e.to_string()))
 }
 
 #[pyfunction]
@@ -78,6 +95,64 @@ impl Connection {
         let pool = self.pool.clone();
         py.detach(|| rt().block_on(async move { pool.execute_in_transaction(&sqls).await }))
             .map_err(|e| PyValueError::new_err(e.to_string()))
+    }
+
+    /// (host, port, dbname, user) tuple. Used Python-side to detect the
+    /// same-DB vs cross-DB code path before calling run_append.
+    fn connection_info<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let info = self.pool.info();
+        let dict = PyDict::new(py);
+        dict.set_item("host", &info.host)?;
+        dict.set_item("port", info.port)?;
+        dict.set_item("dbname", &info.dbname)?;
+        dict.set_item("user", &info.user)?;
+        Ok(dict)
+    }
+
+    /// Run an AppendOnly load. If `source` is None, uses self as the source
+    /// (same-DB path); otherwise runs cross-DB COPY through self as target.
+    /// `target_spec_json` is the augmented spec (metadata cols already added).
+    #[pyo3(signature = (target_spec_json, source_query, pipeline_name, source=None))]
+    fn run_append<'py>(
+        &self,
+        py: Python<'py>,
+        target_spec_json: String,
+        source_query: String,
+        pipeline_name: String,
+        source: Option<&Connection>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let normalized = ematix_flow_core::normalize_table_json(&target_spec_json)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        let spec: TableSpec =
+            serde_json::from_str(&normalized).map_err(|e| PyValueError::new_err(e.to_string()))?;
+        let target_pool = self.pool.clone();
+        let source_pool = source.map(|s| s.pool.clone());
+
+        let outcome = py
+            .detach(|| {
+                rt().block_on(async move {
+                    match source_pool {
+                        None => {
+                            target_pool
+                                .run_append_same_db(&spec, &source_query, &pipeline_name)
+                                .await
+                        }
+                        Some(src) => {
+                            target_pool
+                                .run_append_cross_db(&src, &spec, &source_query, &pipeline_name)
+                                .await
+                        }
+                    }
+                })
+            })
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+
+        let dict = PyDict::new(py);
+        dict.set_item("run_id", outcome.run_id)?;
+        dict.set_item("rows_inserted", outcome.rows_inserted)?;
+        dict.set_item("status", outcome.status)?;
+        dict.set_item("path", outcome.path)?;
+        Ok(dict)
     }
 
     /// Ensure the target table exists and matches the declared spec.
@@ -153,6 +228,7 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(parse_table_spec, m)?)?;
     m.add_function(wrap_pyfunction!(same_database, m)?)?;
     m.add_function(wrap_pyfunction!(create_table_sql, m)?)?;
+    m.add_function(wrap_pyfunction!(augment_table_spec, m)?)?;
     m.add_function(wrap_pyfunction!(connect, m)?)?;
     m.add_class::<Connection>()?;
     Ok(())

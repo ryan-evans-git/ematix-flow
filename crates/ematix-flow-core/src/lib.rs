@@ -5,6 +5,7 @@
 pub mod ddl;
 pub mod pg;
 pub mod spec;
+pub mod strategy;
 pub mod types;
 
 pub use spec::{Mode, PipelineSpec, SourceSpec, SpecError, TargetSpec, normalize_json};

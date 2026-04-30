@@ -19,3 +19,6 @@ sha2.workspace = true
 tokio.workspace = true
 tokio-postgres.workspace = true
 deadpool-postgres.workspace = true
+uuid.workspace = true
+futures-util.workspace = true
+bytes.workspace = true
