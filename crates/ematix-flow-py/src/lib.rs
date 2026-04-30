@@ -1,5 +1,8 @@
 use std::sync::{Arc, OnceLock};
 
+use ematix_flow_core::backend::{
+    Backend, Dialect, PostgresBackend, TargetTable, WriteMode,
+};
 use ematix_flow_core::ddl::{self, DriftResult};
 use ematix_flow_core::meta::{DeleteHandling, WatermarkConfig};
 use ematix_flow_core::pg::{self, EnsureOutcome, MergeRunResult, PgPool, Scd2RunResult};
@@ -220,6 +223,17 @@ impl Connection {
     /// as the user code that constructed the Connection.
     fn dsn(&self) -> String {
         self.dsn.clone()
+    }
+
+    /// Phase 30c: backend kind. Used by `pipeline.sync` to detect a
+    /// cross-backend pair (source.dialect != target.dialect) and route
+    /// through the Arrow streaming bridge instead of a Postgres-native
+    /// fast path. Returns the lowercase backend name (`"postgres"`,
+    /// `"mysql"`, ...).
+    fn dialect(&self) -> &'static str {
+        // For Phase 30c the only backend is Postgres. Phase 31+ extend
+        // this to MySQL/SQLite/DuckDB/etc.
+        "postgres"
     }
 
     /// (host, port, dbname, user) tuple. Used Python-side to detect the
@@ -633,6 +647,66 @@ impl Connection {
     }
 }
 
+/// Phase 30c: cross-backend Arrow streaming bridge.
+///
+/// `pipeline.sync` (Python) calls this when source.dialect() !=
+/// target.dialect(). The function:
+///   1. wraps both connections in their respective `Backend` impls,
+///   2. opens a `read_arrow_stream` on the source,
+///   3. pipes the resulting `RecordBatch` stream into the target's
+///      `write_arrow_stream(target=…, mode=…)`.
+///
+/// Returns the row count written. Pure dispatch — no run_history,
+/// no metadata-column augmentation. The strategy executors (Phase 30d)
+/// remain the right layer for SCD2 / merge / row hashing; cross-backend
+/// is currently scoped to append + truncate semantics (mirroring
+/// Phase 27e write_df's inferred-path constraints).
+#[pyfunction]
+#[pyo3(signature = (source, target, source_query, target_schema, target_table, mode))]
+fn cross_backend_arrow_sync(
+    py: Python<'_>,
+    source: &Connection,
+    target: &Connection,
+    source_query: String,
+    target_schema: String,
+    target_table: String,
+    mode: &str,
+) -> PyResult<u64> {
+    let write_mode = match mode {
+        "append" => WriteMode::Append,
+        "truncate" => WriteMode::Truncate,
+        other => {
+            return Err(PyValueError::new_err(format!(
+                "cross-backend Arrow sync supports mode='append'|'truncate', got {other:?}; \
+                 use a same-backend pair for merge/scd1/scd2 (Phase 30d)"
+            )));
+        }
+    };
+    let source_backend: Arc<dyn Backend> = Arc::new(PostgresBackend::new(
+        source.pool.clone(),
+        source.dsn.clone(),
+    ));
+    let target_backend: Arc<dyn Backend> = Arc::new(PostgresBackend::new(
+        target.pool.clone(),
+        target.dsn.clone(),
+    ));
+    let target_ref = TargetTable {
+        schema: target_schema,
+        name: target_table,
+    };
+    let _ = source_backend.dialect(); // anchor for upcoming Phase 31 dispatch
+    let _ = Dialect::Postgres; // keep enum reachable from PyO3 lib for future
+    py.detach(|| {
+        rt().block_on(async move {
+            let stream = source_backend.read_arrow_stream(&source_query).await?;
+            target_backend
+                .write_arrow_stream(&target_ref, stream, write_mode)
+                .await
+        })
+    })
+    .map_err(|e| PyValueError::new_err(e.to_string()))
+}
+
 #[pyfunction]
 fn connect(py: Python<'_>, url: &str) -> PyResult<Connection> {
     let url_owned = url.to_string();
@@ -660,6 +734,7 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(plan_merge_sql, m)?)?;
     m.add_function(wrap_pyfunction!(plan_scd2_sql, m)?)?;
     m.add_function(wrap_pyfunction!(connect, m)?)?;
+    m.add_function(wrap_pyfunction!(cross_backend_arrow_sync, m)?)?;
     m.add_class::<Connection>()?;
     Ok(())
 }
