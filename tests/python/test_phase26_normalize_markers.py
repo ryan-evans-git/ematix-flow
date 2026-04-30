@@ -152,11 +152,14 @@ def test_parse_timestamp_format_and_formats_conflict_raises():
         parse_timestamp(format="YYYY-MM-DD", formats=["MM/DD/YYYY"])
 
 
-def test_parse_timestamp_no_formats_raises():
+def test_parse_timestamp_empty_formats_raises():
     from ematix_flow.normalize import parse_timestamp
 
+    # Empty `formats=[]` is still rejected — that's distinct from
+    # passing nothing (which now picks the auto-detect catalogue per
+    # Phase 26 follow-up Q3.5 γ).
     with pytest.raises(ValueError, match="format"):
-        parse_timestamp()
+        parse_timestamp(formats=[])
 
 
 def test_parse_date_single_format():

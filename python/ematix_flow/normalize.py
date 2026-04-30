@@ -200,6 +200,25 @@ _FORMAT_REGEXES: dict[str, str] = {
 OnFailure = Literal["null", "error", "default"]
 
 
+# Phase 26 follow-up (Q3.5 γ): default catalogues used when callers
+# pass no `format=` / `formats=`. Order matters — first-match-wins on
+# ambiguous inputs. Curated to common ISO + US conventions; rare or
+# locale-specific formats stay opt-in via explicit `formats=[...]`.
+DEFAULT_TIMESTAMP_FORMATS: tuple[str, ...] = (
+    "YYYY-MM-DD HH24:MI:SS.MS",
+    "YYYY-MM-DDTHH24:MI:SSOF",
+    "YYYY-MM-DDTHH24:MI:SS",
+    "YYYY-MM-DD HH24:MI:SS",
+    "YYYY-MM-DD",
+    "MM/DD/YYYY",
+)
+DEFAULT_DATE_FORMATS: tuple[str, ...] = (
+    "YYYY-MM-DD",
+    "YYYYMMDD",
+    "MM/DD/YYYY",
+)
+
+
 def _validate_on_failure_pair(on_failure: OnFailure, default: Any) -> None:
     if on_failure == "default" and default is None:
         raise ValueError(
@@ -212,7 +231,10 @@ def _validate_on_failure_pair(on_failure: OnFailure, default: Any) -> None:
 
 
 def _resolve_formats(
-    format: str | None, formats: Sequence[str] | None
+    format: str | None,
+    formats: Sequence[str] | None,
+    *,
+    default_catalogue: Sequence[str] | None = None,
 ) -> tuple[str, ...]:
     if format is not None and formats is not None:
         raise ValueError("pass either format= or formats=, not both")
@@ -222,6 +244,8 @@ def _resolve_formats(
         if not formats:
             raise ValueError("formats= must contain at least one format")
         return tuple(formats)
+    if default_catalogue is not None:
+        return tuple(default_catalogue)
     raise ValueError("format= or formats= is required")
 
 
@@ -277,7 +301,9 @@ def parse_timestamp(
     on_failure: OnFailure = "null",
     default: Any = None,
 ) -> _ParseTimestamp:
-    resolved = _resolve_formats(format, formats)
+    resolved = _resolve_formats(
+        format, formats, default_catalogue=DEFAULT_TIMESTAMP_FORMATS
+    )
     _validate_on_failure_pair(on_failure, default)
     return _ParseTimestamp(formats=resolved, on_failure=on_failure, default=default)
 
@@ -301,7 +327,9 @@ def parse_date(
     on_failure: OnFailure = "null",
     default: Any = None,
 ) -> _ParseDate:
-    resolved = _resolve_formats(format, formats)
+    resolved = _resolve_formats(
+        format, formats, default_catalogue=DEFAULT_DATE_FORMATS
+    )
     _validate_on_failure_pair(on_failure, default)
     return _ParseDate(formats=resolved, on_failure=on_failure, default=default)
 
@@ -683,6 +711,8 @@ def apply_normalization(
 
 
 __all__ = [
+    "DEFAULT_DATE_FORMATS",
+    "DEFAULT_TIMESTAMP_FORMATS",
     "OnFailure",
     "apply_normalization",
     "clamp",
