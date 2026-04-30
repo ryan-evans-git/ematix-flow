@@ -269,6 +269,7 @@ def _build_preview(
     event_timestamp_column: str | None,
     handle_deletes: str | None,
     dry_run: bool,
+    transforms_pre: list[Any] | None = None,
 ) -> Any:
     """Phase 25: synthesize the plan a pipeline would execute.
 
@@ -301,6 +302,7 @@ def _build_preview(
             compare_columns=compare_columns,
             event_timestamp_column=event_timestamp_column,
             handle_deletes=handle_deletes,
+            transforms_pre=transforms_pre or [],
         )
 
     notes: list[str] = []
@@ -318,15 +320,19 @@ def _build_preview(
 
     # Build the source SQL without invoking a real connection.
     source_sql: str
+    base_source_sql: str
     if source_table is not None and arity == 0:
         # source_table-only path: synthesize SELECT directly.
         target_columns = (
             _target_user_columns(target) if target is not None else None
         )
         if target_columns is None:
-            source_sql = f"SELECT * FROM {source_table}"
+            base_source_sql = f"SELECT * FROM {source_table}"
         else:
-            source_sql = _synth_source_sql(source_table, target_columns, column_map)
+            base_source_sql = _synth_source_sql(
+                source_table, target_columns, column_map
+            )
+        source_sql = base_source_sql
     else:
         # Function-body path: call the user's function with placeholder
         # connections. We pass simple sentinels — the function should
@@ -363,6 +369,16 @@ def _build_preview(
         except Exception as e:
             source_sql = "-- (could not invoke function for preview)"
             notes.append(f"function call failed during preview: {e}")
+
+    # Apply per-column normalization + transforms_pre to the source SQL
+    # so preview() shows the same SQL the strategy will see at sync time.
+    if target is not None and source_sql.strip() and not source_sql.startswith("--"):
+        from ematix_flow.normalize import apply_normalization as _apply_norm
+
+        try:
+            source_sql = _apply_norm(target, source_sql, transforms_pre or [])
+        except Exception as e:  # pragma: no cover — defensive
+            notes.append(f"normalization synthesis failed: {e}")
 
     # Per-target plan synthesis.
     target_plans: list[TargetPlan] = []
@@ -562,6 +578,7 @@ def _execute_dry_run(
     compare_columns: tuple[str, ...] | None,
     event_timestamp_column: str | None,
     handle_deletes: str | None,
+    transforms_pre: list[Any] | None = None,
 ) -> Any:
     """Phase 25b: execute the pipeline plan inside a transaction and
     rollback at the end. Returns a PreviewResult with `is_dry_run=True`
@@ -596,6 +613,7 @@ def _execute_dry_run(
         event_timestamp_column=event_timestamp_column,
         handle_deletes=handle_deletes,
         dry_run=False,  # building the metadata only
+        transforms_pre=transforms_pre or [],
     )
     base.is_dry_run = True
 
@@ -707,6 +725,7 @@ class _EmatixNamespace:
         on_drift: str = "error",
         force_path: str | None = None,
         continue_on_failure: bool = False,
+        transforms_pre: list[Any] | None = None,
     ):
         """Function decorator. Wraps `pipeline.sync` and registers via the
         Phase 12 scheduling registry.
@@ -768,12 +787,22 @@ class _EmatixNamespace:
                     result = asyncio.run(result)
 
                 # Build the source SQL / Source object.
+                from ematix_flow.normalize import apply_normalization
                 from ematix_flow.source import Source as _Source
 
                 if isinstance(result, str):
                     source_sql = result
+                    if target is not None:
+                        source_sql = apply_normalization(
+                            target, source_sql, transforms_pre or []
+                        )
                     source_obj = _Source.postgres_query(src_conn, source_sql)
                 elif isinstance(result, _Source):
+                    if transforms_pre:
+                        raise RuntimeError(
+                            "transforms_pre= is not supported when the pipeline "
+                            "returns a Source object directly; return SQL instead"
+                        )
                     source_obj = result
                 elif result is None:
                     if source_table is None:
@@ -794,6 +823,10 @@ class _EmatixNamespace:
                     source_sql = _synth_source_sql(
                         source_table, target_columns, column_map
                     )
+                    if target is not None:
+                        source_sql = apply_normalization(
+                            target, source_sql, transforms_pre or []
+                        )
                     source_obj = _Source.postgres_query(src_conn, source_sql)
                 elif isinstance(result, dict):
                     return result  # advanced escape hatch
@@ -893,6 +926,7 @@ class _EmatixNamespace:
                     event_timestamp_column=event_timestamp_column,
                     handle_deletes=handle_deletes,
                     dry_run=dry_run,
+                    transforms_pre=transforms_pre or [],
                 )
 
             wrapped._preview = _preview  # type: ignore[attr-defined]
@@ -947,6 +981,8 @@ class _EmatixNamespace:
             }
             unique_groups: dict[str, list[str]] = {}
 
+            from ematix_flow.normalize import is_normalizer as _is_norm
+
             for col_name, annotation in annotations.items():
                 ty, markers = _resolve_column_type(annotation)
 
@@ -959,10 +995,13 @@ class _EmatixNamespace:
                 # nullable from `T | None` already added a marker; honor it.
                 nullable_flag = explicit_nullable
 
+                normalizers = tuple(m for m in markers if _is_norm(m))
+
                 column = Column(
                     type=ty,
                     nullable=nullable_flag,
                     primary_key=primary_key,
+                    normalizers=normalizers,
                 )
                 attrs[col_name] = column
 

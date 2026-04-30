@@ -112,6 +112,9 @@ class Column:
     nullable: bool = True
     primary_key: bool = False
     name: str = field(default="", repr=False)
+    # Phase 26: ordered tuple of per-column normalizer markers. Filtered
+    # at decoration time so pk() / natural_key() / nullable() never appear.
+    normalizers: tuple[Any, ...] = field(default=(), repr=False)
 
     def to_spec(self) -> dict[str, Any]:
         return {
