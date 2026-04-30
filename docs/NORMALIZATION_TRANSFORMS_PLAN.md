@@ -427,6 +427,49 @@ flow transform run --module my_pipelines <name>
 
 For pipelines that *only* contain a transform, no separate flow needed.
 
+### 4.6 DataFrame interop inside `@ematix.transform`
+
+For transforms that need to do real Python work between read and write —
+ML feature engineering, joining against a parquet file, calling a
+scikit model — the connection grows two helpers that auto-detect the
+caller's preferred DataFrame library:
+
+```python
+@ematix.transform(target_connection="warehouse")
+def score_customers(conn):
+    df = conn.read_df("SELECT customer_id, features FROM warehouse.customer_dim")
+    # df is a polars.DataFrame if polars is installed; else a pandas.DataFrame
+    df = df.with_columns(score=predict_with_model(df["features"]))
+    conn.write_df(df, "warehouse.customer_scores", mode="merge", keys=["customer_id"])
+```
+
+**Auto-detect rules (locked Q7 → A — to be confirmed):**
+
+- `conn.read_df(sql, *, prefer="auto")`:
+  - `"auto"` returns polars if `import polars` succeeds, else pandas.
+  - `"polars"` / `"pandas"` force the choice; raises ImportError if missing.
+- `conn.write_df(df, qualified_name, *, mode, keys=None, ...)`:
+  - Detects the input by `isinstance` — polars.DataFrame, pandas.DataFrame.
+  - PyArrow is the on-the-wire format; both libraries convert through it.
+  - Goes through the same strategy executor as `pipeline.sync` so
+    `mode="merge"` / `"append"` / `"truncate"` / `"scd1"` / `"scd2"` all
+    work identically. Behind the scenes: write the DataFrame to a
+    temporary Postgres table via COPY BINARY, then run the chosen strategy
+    against it.
+
+**Why this layer and not normalization:**
+
+Normalization (Phase 26) compiles to in-database SQL on purpose — keeps
+loads fast and atomic with the strategy. DataFrame interop is the
+"escape hatch" for genuine Python work. Different scope, different
+constraints. The split keeps the v0.1 fast-path intact while letting
+ML / advanced workflows pull data into Python when they need to.
+
+**Out of scope here (deferred to Phase 28 — see §7):** PySpark / Spark
+DataFrame interop. PySpark is distributed (JVM, JDBC, cluster config),
+so it ships as `pip install ematix-flow[spark]` with its own
+`conn.read_spark_df` / `conn.write_spark_df` helpers in a later phase.
+
 ---
 
 ## 5. Worked examples
@@ -639,7 +682,7 @@ Tests:
 - `flow validate` smoke tests (good pipeline → exit 0; bad type chain
   → exit nonzero with clear pointer).
 
-### Phase 27 — Transformations (≈1.5–2d)
+### Phase 27 — Transformations + DataFrame interop (≈2–3d)
 
 - `transforms_post=[...]` kwarg on `@ematix.pipeline`. Accepts:
   - SQL strings → run on `target_connection` in own tx
@@ -651,6 +694,17 @@ Tests:
   `transform_started` / `transform_success` / `transform_failed`,
   linked to the parent pipeline's run_id.
 - `flow transform list / run` CLI subcommands.
+- **DataFrame interop (§4.6):**
+  - `Connection.read_df(sql, *, prefer="auto")` — returns polars or
+    pandas DataFrame. Auto-detects via importable libraries.
+  - `Connection.write_df(df, qualified_name, *, mode, keys=None, ...)`
+    — accepts polars or pandas DataFrame, dispatches via `isinstance`.
+    Goes through the same strategy executor as `pipeline.sync` so
+    every mode works identically.
+  - Hard requirement: at least one of polars / pandas installed; the
+    framework declares them as `[df]` extras (`pip install
+    ematix-flow[df]`) and raises a clear ImportError if a user calls
+    `read_df` / `write_df` without either.
 - **Idempotency contract (locked Q6 → A):** the framework guarantees
   idempotency only via the chained-pipeline pattern — write the
   transformation as `@ematix.pipeline(schedule=None, mode="merge", ...)`
@@ -670,6 +724,24 @@ Tests:
 - run_history captures per-transform status linked to parent run_id.
 - `@ematix.transform` registers and runs standalone.
 - `flow transform` CLI subcommands.
+- `read_df` / `write_df` with both polars and pandas (matrix tests).
+- Auto-detect picks polars when both installed; pandas-only when only
+  pandas; clear ImportError when neither.
+
+### Phase 28 — Spark interop (≈2d, optional extra)
+
+Ship as `pip install ematix-flow[spark]`. Adds:
+
+- `Connection.read_spark_df(spark_session, sql)` — returns Spark
+  DataFrame backed by the Postgres JDBC driver.
+- `Connection.write_spark_df(df, qualified_name, *, mode, keys=None)` —
+  writes via JDBC, then runs the strategy against the staged data.
+- Documentation that PySpark requires JVM + JDBC jar and is not part of
+  the default install.
+
+Distinct from Phase 27 because Spark's distributed model needs separate
+plumbing (JDBC, SparkSession plumbing, cluster config) that doesn't
+share much with the polars/pandas in-process path.
 
 ---
 
@@ -684,6 +756,24 @@ Tests:
 | Q4 | `sql()` escape hatch is documented as user-owned-risk. No validation, no escaping. `preview()` flags every `sql()` marker for audit. | §3.4 |
 | Q5 | Cross-row operations (`deduplicate_by`, `filter_where`, `limit`, `sample_pct`) live only at the pipeline level via `transforms_pre=[...]`. No column-level sugar. | §3.2 |
 | Q6 | Idempotency for write-many post-load work goes through the chained-pipeline pattern (Phase 27 §4.3). Raw SQL `transforms_post=` is reserved for naturally-idempotent maintenance ops. Strong docs, no separate decorator. | §4.3, Phase 27 |
+
+### Phase 27 design log (locked)
+
+| ID | Decision | Notes |
+|---|---|---|
+| 27-Q1 | `transforms_post=` accepts strings (always SQL), function refs (passed directly), and `ematix.transform_ref("name")` for name-based lookup of pipelines/transforms. No verb-prefix heuristic. | C |
+| 27-Q2 | Reuse `run_history` table. Add nullable `run_id` UUID (shared by parent + transform rows in one run) and `step_name` (NULL for the main load row, set for transforms). Broaden `status` to include `transform_success` / `transform_failed`. | A |
+| 27-Q3.1 | Transform callable may return a dict of metrics; framework merges it into the `run_history` row. Returning None → `transform_success` with empty metrics. | B |
+| 27-Q3.2 | Transform callable arity is auto-detected via `inspect.signature`: 1-arg gets `(conn,)`, 2-arg gets `(conn, parent)` where `parent` carries `run_id`, `pipeline_name`, `target`, parent metrics; `parent` is None when invoked standalone. | γ |
+| 27-Q4.1 | A `@ematix.transform(schedule=...)` that is also referenced from a pipeline's `transforms_post` fires from both — pipeline post-load AND its own cron, independently. User opted into both. | A |
+| 27-Q4.2 | `flow list` shows pipelines + transforms with a `type=pipeline\|transform` column; `flow transform list` is the filtered shortcut. | β |
+| 27-Q5 | `transform_ref("name")` runs the chained pipeline's full sync independently — fresh connection resolution, own `run_history` row (with shared `run_id`), recursive transforms_post. No implicit batch passing. | A |
+| 27-Q6 | `Connection.read_df` / `write_df` are attached via monkey-patch from `ematix_flow.df` on import. Lazy: importing the df module attaches the methods. Keeps `_core` Rust extension free of polars/pandas coupling. | A |
+| 27-Q7 | `prefer="auto"` returns polars when both polars + pandas are installed; falls back to pandas if only pandas is available. `prefer="pandas"` / `"polars"` force the choice (raises ImportError if missing). | A |
+| 27-Q8.1 | `write_df` accepts a `target=ManagedTable` for production paths (validates df shape, runs full strategy pipeline). Without `target=`, infers schema from df dtypes (ad-hoc / Jupyter convenience). | C |
+| 27-Q8.2 | ManagedTable path auto-augments `_loaded_at` / `_batch_id` like `pipeline.sync`. Inferred path takes the df as-is — no metadata columns auto-added. | γ |
+| 27-Q9 | Transport: convert df → Arrow → COPY BINARY into a temp table, then run the chosen strategy against it. Reuses Phase 9 cross-DB COPY plumbing. Every strategy mode (append/truncate/merge/scd1/scd2) works for free. | A |
+| 27-Q10 | `preview()` lists transforms_post entries (text only, no execution). `dry_run()` skips them entirely (load only). `validate()` EXPLAINs string transforms; callables and `transform_ref` skipped with a note. | B |
 
 ---
 
