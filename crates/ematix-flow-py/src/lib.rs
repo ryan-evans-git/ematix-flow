@@ -1,7 +1,7 @@
 use std::sync::{Arc, OnceLock};
 
 use ematix_flow_core::ddl::{self, DriftResult};
-use ematix_flow_core::meta::WatermarkConfig;
+use ematix_flow_core::meta::{DeleteHandling, WatermarkConfig};
 use ematix_flow_core::pg::{self, EnsureOutcome, MergeRunResult, PgPool, Scd2RunResult};
 use ematix_flow_core::strategy::append::augment_with_metadata;
 use ematix_flow_core::strategy::scd2::augment_with_scd2;
@@ -129,8 +129,10 @@ impl Connection {
 
     /// Run an SCD2 load. Returns rows_inserted (new versions) and
     /// rows_closed (previous versions closed out).
+    /// `handle_deletes='soft'` adds a close-out post-step for keys
+    /// missing from the source.
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (target_spec_json, source_query, pipeline_name, keys, compare_columns, source=None))]
+    #[pyo3(signature = (target_spec_json, source_query, pipeline_name, keys, compare_columns, source=None, handle_deletes=None))]
     fn run_scd2<'py>(
         &self,
         py: Python<'py>,
@@ -140,6 +142,7 @@ impl Connection {
         keys: Vec<String>,
         compare_columns: Vec<String>,
         source: Option<&Connection>,
+        handle_deletes: Option<&str>,
     ) -> PyResult<Bound<'py, PyDict>> {
         if keys.is_empty() {
             return Err(PyValueError::new_err("scd2 requires at least one key"));
@@ -149,6 +152,15 @@ impl Connection {
                 "scd2 requires at least one compare column",
             ));
         }
+        let delete_handling = match handle_deletes {
+            None => None,
+            Some("soft") => Some(DeleteHandling::Soft),
+            Some(other) => {
+                return Err(PyValueError::new_err(format!(
+                    "scd2 supports handle_deletes='soft' only (got {other:?})"
+                )));
+            }
+        };
         let normalized = ematix_flow_core::normalize_table_json(&target_spec_json)
             .map_err(|e| PyValueError::new_err(e.to_string()))?;
         let spec: TableSpec =
@@ -168,6 +180,7 @@ impl Connection {
                                     &keys,
                                     &compare_columns,
                                     &pipeline_name,
+                                    delete_handling,
                                 )
                                 .await
                         }
@@ -180,6 +193,7 @@ impl Connection {
                                     &keys,
                                     &compare_columns,
                                     &pipeline_name,
+                                    delete_handling,
                                 )
                                 .await
                         }
@@ -200,8 +214,10 @@ impl Connection {
     /// Run a MergeUpsert / SCD1 load. Returns rows_inserted/rows_updated/
     /// rows_unchanged. `mode_label` is whatever the user passed ("merge"
     /// or "scd1") and is recorded in run_history.
+    /// `handle_deletes='hard'` runs a DELETE post-step for keys missing
+    /// from the source.
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (target_spec_json, source_query, pipeline_name, keys, update_columns, mode_label, source=None))]
+    #[pyo3(signature = (target_spec_json, source_query, pipeline_name, keys, update_columns, mode_label, source=None, handle_deletes=None))]
     fn run_merge<'py>(
         &self,
         py: Python<'py>,
@@ -212,7 +228,17 @@ impl Connection {
         update_columns: Vec<String>,
         mode_label: String,
         source: Option<&Connection>,
+        handle_deletes: Option<&str>,
     ) -> PyResult<Bound<'py, PyDict>> {
+        let delete_handling = match handle_deletes {
+            None => None,
+            Some("hard") => Some(DeleteHandling::Hard),
+            Some(other) => {
+                return Err(PyValueError::new_err(format!(
+                    "merge supports handle_deletes='hard' only (got {other:?})"
+                )));
+            }
+        };
         if keys.is_empty() {
             return Err(PyValueError::new_err(
                 "merge mode requires at least one key",
@@ -238,6 +264,7 @@ impl Connection {
                                     &update_columns,
                                     &pipeline_name,
                                     &mode_label,
+                                    delete_handling,
                                 )
                                 .await
                         }
@@ -251,6 +278,7 @@ impl Connection {
                                     &update_columns,
                                     &pipeline_name,
                                     &mode_label,
+                                    delete_handling,
                                 )
                                 .await
                         }

@@ -11,7 +11,10 @@ use uuid::Uuid;
 use crate::ddl::{
     DriftResult, ReflectedColumn, canonicalize_reflected_type, compare_table, create_table_sql,
 };
-use crate::meta::{WatermarkConfig, wrap_with_watermark_filter};
+use crate::meta::{
+    DeleteHandling, WatermarkConfig, build_hard_delete_sql, build_scd2_close_missing_sql,
+    wrap_with_watermark_filter,
+};
 use crate::strategy::append::{BATCH_ID_COL, LOADED_AT_COL, plan_same_db_append};
 use crate::strategy::merge::plan_merge_upsert;
 use crate::strategy::scd2::plan_scd2;
@@ -825,6 +828,10 @@ impl PgPool {
 
     /// Same-DB MergeUpsert / SCD1 executor. `mode_label` is whatever the
     /// user requested ("merge" or "scd1") and is recorded in run_history.
+    /// With `delete_handling = Some(Hard)`, a DELETE post-step removes
+    /// target rows whose keys are missing from the source — atomically
+    /// with the upsert.
+    #[allow(clippy::too_many_arguments)]
     pub async fn run_merge_same_db(
         &self,
         target_spec: &TableSpec,
@@ -833,6 +840,7 @@ impl PgPool {
         update_columns: &[String],
         pipeline_name: &str,
         mode_label: &str,
+        delete_handling: Option<DeleteHandling>,
     ) -> Result<MergeRunResult, PgError> {
         self.ensure_meta_schema().await?;
         let run_id = Uuid::new_v4();
@@ -856,6 +864,15 @@ impl PgPool {
             let inserted: i64 = row.get(0);
             let updated: i64 = row.get(1);
             let total: i64 = row.get(2);
+            if matches!(delete_handling, Some(DeleteHandling::Hard)) {
+                let delete_sql = build_hard_delete_sql(
+                    &target_spec.schema,
+                    &target_spec.name,
+                    keys,
+                    source_query,
+                );
+                tx.batch_execute(&delete_sql).await?;
+            }
             tx.commit().await?;
             let unchanged = total - inserted - updated;
             Ok((inserted, updated, unchanged))
@@ -901,6 +918,10 @@ impl PgPool {
     /// 1. Create temp `_scd2_changed_<id>` from a hashed source.
     /// 2. Close out previous current versions for changed keys.
     /// 3. Insert new current versions.
+    ///
+    /// With `delete_handling = Some(Soft)`, a fourth statement closes out
+    /// current versions whose natural key is missing from the source.
+    #[allow(clippy::too_many_arguments)]
     pub async fn run_scd2_same_db(
         &self,
         target_spec: &TableSpec,
@@ -908,6 +929,7 @@ impl PgPool {
         keys: &[String],
         compare_columns: &[String],
         pipeline_name: &str,
+        delete_handling: Option<DeleteHandling>,
     ) -> Result<Scd2RunResult, PgError> {
         self.ensure_meta_schema().await?;
         self.ensure_pgcrypto().await?;
@@ -927,14 +949,25 @@ impl PgPool {
                 .map_err(|e| PgError::Pool(e.to_string()))?;
             let tx = client.transaction().await?;
             tx.batch_execute(&plan.statements[0]).await?;
-            let closed = tx.execute(&plan.statements[1], &[]).await? as i64;
+            let closed_changed = tx.execute(&plan.statements[1], &[]).await? as i64;
             let inserted = if plan.has_metadata {
                 tx.execute(&plan.statements[2], &[&batch_id]).await? as i64
             } else {
                 tx.execute(&plan.statements[2], &[]).await? as i64
             };
+            let closed_missing = if matches!(delete_handling, Some(DeleteHandling::Soft)) {
+                let close_sql = build_scd2_close_missing_sql(
+                    &target_spec.schema,
+                    &target_spec.name,
+                    keys,
+                    source_query,
+                );
+                tx.execute(&close_sql, &[]).await? as i64
+            } else {
+                0
+            };
             tx.commit().await?;
-            Ok((inserted, closed))
+            Ok((inserted, closed_changed + closed_missing))
         }
         .await;
 
@@ -970,6 +1003,7 @@ impl PgPool {
         keys: &[String],
         compare_columns: &[String],
         pipeline_name: &str,
+        delete_handling: Option<DeleteHandling>,
     ) -> Result<Scd2RunResult, PgError> {
         self.ensure_meta_schema().await?;
         self.ensure_pgcrypto().await?;
@@ -1043,14 +1077,25 @@ impl PgPool {
             let _ = sink.finish().await?;
 
             target_tx.batch_execute(&plan.statements[0]).await?;
-            let closed = target_tx.execute(&plan.statements[1], &[]).await? as i64;
+            let closed_changed = target_tx.execute(&plan.statements[1], &[]).await? as i64;
             let inserted = if plan.has_metadata {
                 target_tx.execute(&plan.statements[2], &[&batch_id]).await? as i64
             } else {
                 target_tx.execute(&plan.statements[2], &[]).await? as i64
             };
+            let closed_missing = if matches!(delete_handling, Some(DeleteHandling::Soft)) {
+                let close_sql = build_scd2_close_missing_sql(
+                    &target_spec.schema,
+                    &target_spec.name,
+                    keys,
+                    &format!("SELECT * FROM {staging}"),
+                );
+                target_tx.execute(&close_sql, &[]).await? as i64
+            } else {
+                0
+            };
             target_tx.commit().await?;
-            Ok((inserted, closed))
+            Ok((inserted, closed_changed + closed_missing))
         }
         .await;
 
@@ -1086,6 +1131,7 @@ impl PgPool {
         update_columns: &[String],
         pipeline_name: &str,
         mode_label: &str,
+        delete_handling: Option<DeleteHandling>,
     ) -> Result<MergeRunResult, PgError> {
         self.ensure_meta_schema().await?;
         let run_id = Uuid::new_v4();
@@ -1156,6 +1202,15 @@ impl PgPool {
             let inserted: i64 = row.get(0);
             let updated: i64 = row.get(1);
             let total: i64 = row.get(2);
+            if matches!(delete_handling, Some(DeleteHandling::Hard)) {
+                let delete_sql = build_hard_delete_sql(
+                    &target_spec.schema,
+                    &target_spec.name,
+                    keys,
+                    &format!("SELECT * FROM {staging}"),
+                );
+                target_tx.batch_execute(&delete_sql).await?;
+            }
             target_tx.commit().await?;
             let unchanged = total - inserted - updated;
             Ok((inserted, updated, unchanged))

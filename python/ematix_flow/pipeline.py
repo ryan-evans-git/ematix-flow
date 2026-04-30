@@ -119,9 +119,14 @@ def sync(
     compare_columns: tuple[str, ...] | None = None,
     force_path: str | None = None,
     incremental_column: str | None = None,
+    handle_deletes: str | None = None,
 ) -> dict[str, Any]:
     """Execute a load. Phases 5–8 support 'append', 'truncate', 'merge'/'scd1', 'scd2'.
-    Phase 10: pass `incremental_column='col'` for watermarked append loads."""
+
+    Phase 10: pass `incremental_column='col'` for watermarked append loads.
+    Phase 11: pass `handle_deletes='hard'` (merge/scd1) or `'soft'` (scd2) to
+    handle keys that have disappeared from the source.
+    """
     if mode not in ("append", "truncate", "merge", "scd1", "scd2"):
         raise NotImplementedError(f"mode={mode!r} is not yet implemented")
     if force_path is not None and force_path not in ("same_db", "cross_db"):
@@ -132,6 +137,30 @@ def sync(
         raise ValueError(
             f"incremental_column is only supported for mode='append'; got mode={mode!r}"
         )
+    if handle_deletes is not None:
+        if handle_deletes not in ("hard", "soft"):
+            raise ValueError(
+                f"handle_deletes must be 'hard', 'soft', or None (got {handle_deletes!r})"
+            )
+        if mode in ("append", "truncate"):
+            raise ValueError(
+                f"handle_deletes is not supported for mode={mode!r}; "
+                "use mode='merge'/'scd1' (hard) or mode='scd2' (soft)"
+            )
+        if incremental_column is not None:
+            raise ValueError(
+                "handle_deletes cannot be combined with incremental_column — "
+                "an incremental load can't see absent keys"
+            )
+        if mode in ("merge", "scd1") and handle_deletes != "hard":
+            raise NotImplementedError(
+                f"merge/scd1 + handle_deletes={handle_deletes!r} is not yet implemented; "
+                "Phase 11.5 will add soft-delete via auto _is_deleted column"
+            )
+        if mode == "scd2" and handle_deletes != "soft":
+            raise ValueError(
+                f"scd2 supports handle_deletes='soft' only (got {handle_deletes!r})"
+            )
 
     name = pipeline_name or f"{target.__schema__}.{target.__tablename__}"
 
@@ -198,6 +227,7 @@ def sync(
             resolved_keys,
             resolved_compares,
             src_arg,
+            handle_deletes,
         )
 
     # merge / scd1
@@ -221,4 +251,5 @@ def sync(
         resolved_updates,
         mode,
         src_arg,
+        handle_deletes,
     )
