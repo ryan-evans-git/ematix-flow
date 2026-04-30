@@ -1,6 +1,7 @@
 use std::sync::{Arc, OnceLock};
 
 use ematix_flow_core::ddl::{self, DriftResult};
+use ematix_flow_core::meta::WatermarkConfig;
 use ematix_flow_core::pg::{self, EnsureOutcome, MergeRunResult, PgPool, Scd2RunResult};
 use ematix_flow_core::strategy::append::augment_with_metadata;
 use ematix_flow_core::strategy::scd2::augment_with_scd2;
@@ -315,10 +316,37 @@ impl Connection {
         Ok(dict)
     }
 
+    /// Read the watermark row for `pipeline_name`, or None if absent.
+    /// Returns `{column_name, last_value}` so Python can build a cast
+    /// literal (`'value'::type`) on the next run.
+    fn read_watermark<'py>(
+        &self,
+        py: Python<'py>,
+        pipeline_name: String,
+    ) -> PyResult<Option<Bound<'py, PyDict>>> {
+        let pool = self.pool.clone();
+        let row = py
+            .detach(|| rt().block_on(async move { pool.read_watermark(&pipeline_name).await }))
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        match row {
+            None => Ok(None),
+            Some(r) => {
+                let dict = PyDict::new(py);
+                dict.set_item("pipeline_name", r.pipeline_name)?;
+                dict.set_item("column_name", r.column_name)?;
+                dict.set_item("last_value", r.last_value)?;
+                Ok(Some(dict))
+            }
+        }
+    }
+
     /// Run an AppendOnly load. If `source` is None, uses self as the source
     /// (same-DB path); otherwise runs cross-DB COPY through self as target.
     /// `target_spec_json` is the augmented spec (metadata cols already added).
-    #[pyo3(signature = (target_spec_json, source_query, pipeline_name, source=None))]
+    /// `incremental_column` + `last_value_literal` (an already-cast SQL
+    /// literal like `'2026-04-30T00:00Z'::timestamptz`) opt into watermarking.
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (target_spec_json, source_query, pipeline_name, source=None, incremental_column=None, last_value_literal=None))]
     fn run_append<'py>(
         &self,
         py: Python<'py>,
@@ -326,6 +354,8 @@ impl Connection {
         source_query: String,
         pipeline_name: String,
         source: Option<&Connection>,
+        incremental_column: Option<String>,
+        last_value_literal: Option<String>,
     ) -> PyResult<Bound<'py, PyDict>> {
         let normalized = ematix_flow_core::normalize_table_json(&target_spec_json)
             .map_err(|e| PyValueError::new_err(e.to_string()))?;
@@ -333,6 +363,10 @@ impl Connection {
             serde_json::from_str(&normalized).map_err(|e| PyValueError::new_err(e.to_string()))?;
         let target_pool = self.pool.clone();
         let source_pool = source.map(|s| s.pool.clone());
+        let watermark = incremental_column.map(|column| WatermarkConfig {
+            column,
+            last_value_literal,
+        });
 
         let outcome = py
             .detach(|| {
@@ -340,12 +374,23 @@ impl Connection {
                     match source_pool {
                         None => {
                             target_pool
-                                .run_append_same_db(&spec, &source_query, &pipeline_name)
+                                .run_append_same_db(
+                                    &spec,
+                                    &source_query,
+                                    &pipeline_name,
+                                    watermark.as_ref(),
+                                )
                                 .await
                         }
                         Some(src) => {
                             target_pool
-                                .run_append_cross_db(&src, &spec, &source_query, &pipeline_name)
+                                .run_append_cross_db(
+                                    &src,
+                                    &spec,
+                                    &source_query,
+                                    &pipeline_name,
+                                    watermark.as_ref(),
+                                )
                                 .await
                         }
                     }

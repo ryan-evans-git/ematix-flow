@@ -11,6 +11,7 @@ use uuid::Uuid;
 use crate::ddl::{
     DriftResult, ReflectedColumn, canonicalize_reflected_type, compare_table, create_table_sql,
 };
+use crate::meta::{WatermarkConfig, wrap_with_watermark_filter};
 use crate::strategy::append::{BATCH_ID_COL, LOADED_AT_COL, plan_same_db_append};
 use crate::strategy::merge::plan_merge_upsert;
 use crate::strategy::scd2::plan_scd2;
@@ -108,6 +109,14 @@ pub struct Scd2RunResult {
 
 const META_SCHEMA: &str = "ematix_flow";
 const RUN_HISTORY_TABLE: &str = "run_history";
+const WATERMARKS_TABLE: &str = "watermarks";
+
+#[derive(Debug, Clone)]
+pub struct WatermarkRow {
+    pub pipeline_name: String,
+    pub column_name: String,
+    pub last_value: String,
+}
 
 impl PgPool {
     pub fn info(&self) -> &ConnectionInfo {
@@ -284,6 +293,43 @@ pub enum EnsureOutcome {
     Drift(Vec<crate::ddl::Difference>),
 }
 
+/// Inside the load transaction, fetch `max(col)::text` from the rows just
+/// inserted (matched by `_batch_id`) and UPSERT the watermark row. NULL
+/// max (e.g. when no rows were inserted) is treated as "no advance".
+async fn advance_watermark(
+    tx: &deadpool_postgres::tokio_postgres::Transaction<'_>,
+    target_spec: &TableSpec,
+    batch_id: &Uuid,
+    pipeline_name: &str,
+    watermark: &WatermarkConfig,
+) -> Result<(), PgError> {
+    let max_sql = format!(
+        "SELECT max({col})::text FROM {schema}.{table} WHERE {batch} = $1",
+        col = watermark.column,
+        schema = target_spec.schema,
+        table = target_spec.name,
+        batch = BATCH_ID_COL,
+    );
+    let row = tx.query_opt(&max_sql, &[batch_id]).await?;
+    let new_max: Option<String> = row.and_then(|r| r.get::<_, Option<String>>(0));
+    if let Some(value) = new_max {
+        tx.execute(
+            &format!(
+                "INSERT INTO {META_SCHEMA}.{WATERMARKS_TABLE} \
+                 (pipeline_name, column_name, last_value, updated_at) \
+                 VALUES ($1, $2, $3, now()) \
+                 ON CONFLICT (pipeline_name) DO UPDATE \
+                 SET column_name = EXCLUDED.column_name, \
+                     last_value = EXCLUDED.last_value, \
+                     updated_at = now()"
+            ),
+            &[&pipeline_name, &watermark.column, &value],
+        )
+        .await?;
+    }
+    Ok(())
+}
+
 impl PgPool {
     /// Lazy-create the `ematix_flow.run_history` table. Uses ALTER TABLE
     /// IF NOT EXISTS for columns added in later phases so existing
@@ -313,8 +359,49 @@ impl PgPool {
             "ALTER TABLE {META_SCHEMA}.{RUN_HISTORY_TABLE} \
              ADD COLUMN IF NOT EXISTS rows_unchanged BIGINT"
         );
-        self.execute_in_transaction(&[create_schema, create_table, alter_updated, alter_unchanged])
+        let create_watermarks = format!(
+            "CREATE TABLE IF NOT EXISTS {META_SCHEMA}.{WATERMARKS_TABLE} (
+                pipeline_name TEXT PRIMARY KEY,
+                column_name TEXT NOT NULL,
+                last_value TEXT NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            )"
+        );
+        self.execute_in_transaction(&[
+            create_schema,
+            create_table,
+            alter_updated,
+            alter_unchanged,
+            create_watermarks,
+        ])
+        .await
+    }
+
+    pub async fn read_watermark(
+        &self,
+        pipeline_name: &str,
+    ) -> Result<Option<WatermarkRow>, PgError> {
+        self.ensure_meta_schema().await?;
+        let client = self
+            .pool
+            .get()
             .await
+            .map_err(|e| PgError::Pool(e.to_string()))?;
+        let row = client
+            .query_opt(
+                &format!(
+                    "SELECT pipeline_name, column_name, last_value \
+                     FROM {META_SCHEMA}.{WATERMARKS_TABLE} \
+                     WHERE pipeline_name = $1"
+                ),
+                &[&pipeline_name],
+            )
+            .await?;
+        Ok(row.map(|r| WatermarkRow {
+            pipeline_name: r.get(0),
+            column_name: r.get(1),
+            last_value: r.get(2),
+        }))
     }
 
     async fn insert_history_start(
@@ -420,12 +507,15 @@ impl PgPool {
     }
 
     /// Same-DB AppendOnly executor: target spec already augmented with
-    /// metadata columns and ensured to exist.
+    /// metadata columns and ensured to exist. `watermark` (if any) filters
+    /// the source and gets advanced atomically inside the load transaction
+    /// after a successful INSERT.
     pub async fn run_append_same_db(
         &self,
         target_spec: &TableSpec,
         source_query: &str,
         pipeline_name: &str,
+        watermark: Option<&WatermarkConfig>,
     ) -> Result<AppendRunResult, PgError> {
         self.ensure_meta_schema().await?;
         let run_id = Uuid::new_v4();
@@ -433,7 +523,8 @@ impl PgPool {
         self.insert_history_start(run_id, pipeline_name, target_spec, "append", "same_db")
             .await?;
 
-        let plan = plan_same_db_append(target_spec, source_query);
+        let filtered_source = wrap_with_watermark_filter(source_query, watermark);
+        let plan = plan_same_db_append(target_spec, &filtered_source);
         let result: Result<i64, PgError> = async {
             let mut client = self
                 .pool
@@ -446,6 +537,11 @@ impl PgPool {
             } else {
                 tx.execute(&plan.sql, &[]).await?
             };
+            // Advance the watermark inside the same transaction so a failure
+            // here rolls back the INSERT, and a commit promotes both atomically.
+            if let Some(wc) = watermark {
+                advance_watermark(&tx, target_spec, &batch_id, pipeline_name, wc).await?;
+            }
             tx.commit().await?;
             Ok(rows as i64)
         }
@@ -471,12 +567,14 @@ impl PgPool {
     /// Cross-DB AppendOnly executor: COPY (binary) from source into a
     /// target-side temp staging table, then INSERT INTO target SELECT FROM
     /// staging. Source-side and target-side connections are distinct pools.
+    #[allow(clippy::too_many_arguments)]
     pub async fn run_append_cross_db(
         &self,
         source_pool: &PgPool,
         target_spec: &TableSpec,
         source_query: &str,
         pipeline_name: &str,
+        watermark: Option<&WatermarkConfig>,
     ) -> Result<AppendRunResult, PgError> {
         self.ensure_meta_schema().await?;
         let run_id = Uuid::new_v4();
@@ -500,9 +598,14 @@ impl PgPool {
             .collect::<Vec<_>>()
             .join(", ");
         let staging = format!("_ematix_stage_{}", run_id.simple());
+        // Push the watermark filter down to the source side so we don't COPY
+        // rows we'll discard. The plain (un-watermarked) projected_source is
+        // what feeds the COPY OUT.
+        let filtered_source_for_copy = wrap_with_watermark_filter(source_query, watermark);
         let projected_source = format!(
-            "SELECT {cols} FROM ({source_query}) src",
+            "SELECT {cols} FROM ({source}) src",
             cols = user_columns.join(", "),
+            source = filtered_source_for_copy,
         );
 
         let plan = plan_same_db_append(target_spec, &format!("SELECT * FROM {staging}"));
@@ -547,6 +650,9 @@ impl PgPool {
             } else {
                 target_tx.execute(&plan.sql, &[]).await?
             };
+            if let Some(wc) = watermark {
+                advance_watermark(&target_tx, target_spec, &batch_id, pipeline_name, wc).await?;
+            }
             target_tx.commit().await?;
             Ok(rows as i64)
         }

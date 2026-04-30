@@ -65,6 +65,47 @@ _METADATA_COLS = ("_loaded_at", "_batch_id")
 _SCD2_META_COLS = ("valid_from", "valid_to", "is_current", "row_hash")
 
 
+def _column_type_to_sql(target: type[ManagedTable], column: str) -> str:
+    """Look up the Postgres SQL type for `column` on `target`. Used to
+    cast a watermark text value back to the column's native type."""
+    for name, col in target._columns():
+        if name == column:
+            spec = col.type.to_spec()
+            kind = spec["kind"]
+            mapping = {
+                "small_int": "smallint",
+                "integer": "integer",
+                "big_int": "bigint",
+                "float": "real",
+                "double": "double precision",
+                "boolean": "boolean",
+                "text": "text",
+                "date": "date",
+                "timestamp": "timestamp",
+                "timestamp_tz": "timestamptz",
+                "json": "json",
+                "jsonb": "jsonb",
+                "uuid": "uuid",
+                "bytes": "bytea",
+            }
+            if kind in mapping:
+                return mapping[kind]
+            if kind == "string":
+                return f"varchar({spec['length']})"
+            if kind == "numeric":
+                return f"numeric({spec['precision']},{spec['scale']})"
+            raise ValueError(f"unsupported incremental column type: {kind}")
+    raise ValueError(
+        f"incremental_column={column!r} is not declared on {target.__name__}"
+    )
+
+
+def _build_last_value_literal(value: str, sql_type: str) -> str:
+    # Postgres accepts E'...' for text-quoted values; \\ → \\, ' → ''.
+    escaped = value.replace("\\", "\\\\").replace("'", "''")
+    return f"E'{escaped}'::{sql_type}"
+
+
 def sync(
     *,
     target: type[ManagedTable],
@@ -77,13 +118,19 @@ def sync(
     update_columns: tuple[str, ...] | None = None,
     compare_columns: tuple[str, ...] | None = None,
     force_path: str | None = None,
+    incremental_column: str | None = None,
 ) -> dict[str, Any]:
-    """Execute a load. Phases 5–8 support 'append', 'truncate', 'merge'/'scd1', 'scd2'."""
+    """Execute a load. Phases 5–8 support 'append', 'truncate', 'merge'/'scd1', 'scd2'.
+    Phase 10: pass `incremental_column='col'` for watermarked append loads."""
     if mode not in ("append", "truncate", "merge", "scd1", "scd2"):
         raise NotImplementedError(f"mode={mode!r} is not yet implemented")
     if force_path is not None and force_path not in ("same_db", "cross_db"):
         raise ValueError(
             f"force_path must be 'same_db', 'cross_db', or None (got {force_path!r})"
+        )
+    if incremental_column is not None and mode != "append":
+        raise ValueError(
+            f"incremental_column is only supported for mode='append'; got mode={mode!r}"
         )
 
     name = pipeline_name or f"{target.__schema__}.{target.__tablename__}"
@@ -104,7 +151,22 @@ def sync(
     src_arg = None if same_db else source.connection
 
     if mode == "append":
-        return target_connection.run_append(augmented_json, source.query, name, src_arg)
+        last_literal: str | None = None
+        if incremental_column is not None:
+            sql_type = _column_type_to_sql(target, incremental_column)
+            existing = target_connection.read_watermark(name)
+            if existing is not None and existing.get("column_name") == incremental_column:
+                last_literal = _build_last_value_literal(
+                    existing["last_value"], sql_type
+                )
+        return target_connection.run_append(
+            augmented_json,
+            source.query,
+            name,
+            src_arg,
+            incremental_column,
+            last_literal,
+        )
     if mode == "truncate":
         return target_connection.run_truncate(augmented_json, source.query, name, src_arg)
 
