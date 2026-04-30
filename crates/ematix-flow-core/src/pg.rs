@@ -145,6 +145,13 @@ impl PgPool {
         &self.info
     }
 
+    /// Crate-internal accessor for the underlying pool. Used by
+    /// `crate::backend::PostgresBackend` to acquire clients without
+    /// exposing deadpool internals on the public API.
+    pub(crate) fn raw_pool(&self) -> &Pool {
+        &self.pool
+    }
+
     pub async fn connect(url: &str) -> Result<Self, PgError> {
         let info = parse_url(url)?;
         let pg_cfg: PgConfig = url

@@ -23,6 +23,8 @@ uuid.workspace = true
 futures-util.workspace = true
 bytes.workspace = true
 async-trait = "0.1"
+arrow-array = { workspace = true }
+arrow-schema = { workspace = true }
 
 [dev-dependencies]
 testcontainers.workspace = true

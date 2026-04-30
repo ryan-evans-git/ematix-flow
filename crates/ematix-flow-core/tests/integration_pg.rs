@@ -7,10 +7,11 @@
 
 use std::sync::Arc;
 
-use ematix_flow_core::backend::{Backend, Dialect, PostgresBackend};
+use ematix_flow_core::backend::{Backend, Dialect, PostgresBackend, TargetTable, WriteMode};
 use ematix_flow_core::pg::PgPool;
 use ematix_flow_core::strategy::append::augment_with_metadata;
 use ematix_flow_core::types::{ColumnSpec, ColumnType, TableSpec};
+use futures_util::TryStreamExt;
 use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::postgres::Postgres;
 
@@ -122,6 +123,124 @@ async fn ensure_table_round_trips_columns() {
 
     // ensure is idempotent: a second call sees Matched, not Drift.
     pool.ensure_table(&target).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker; run with `cargo test -- --ignored`"]
+async fn arrow_round_trip_via_backend_trait() {
+    // Phase 30b: read_arrow_stream + write_arrow_stream form a
+    // backend-agnostic IO contract. Round-trip a small table to prove
+    // the contract works on PostgresBackend before generalizing.
+    let (_container, url) = start_postgres().await;
+    let pool = Arc::new(PgPool::connect(&url).await.unwrap());
+    let backend: Arc<dyn Backend> = Arc::new(PostgresBackend::new(pool.clone(), url.clone()));
+
+    backend.execute("CREATE SCHEMA arrow_test").await.unwrap();
+    backend
+        .execute("CREATE TABLE arrow_test.src (id BIGINT, name TEXT, flag BOOLEAN)")
+        .await
+        .unwrap();
+    backend
+        .execute(
+            "INSERT INTO arrow_test.src VALUES \
+             (1, 'a', true), (2, 'b', false), (3, NULL, true)",
+        )
+        .await
+        .unwrap();
+    backend
+        .execute("CREATE TABLE arrow_test.dst (id BIGINT, name TEXT, flag BOOLEAN)")
+        .await
+        .unwrap();
+
+    let stream = backend
+        .read_arrow_stream("SELECT id, name, flag FROM arrow_test.src ORDER BY id")
+        .await
+        .unwrap();
+    let batches: Vec<_> = stream.try_collect().await.unwrap();
+    assert!(!batches.is_empty());
+    let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total, 3);
+    assert_eq!(batches[0].num_columns(), 3);
+    assert_eq!(batches[0].schema().field(0).name(), "id");
+
+    // Round-trip: write the batches back to the destination table.
+    let stream2 = backend
+        .read_arrow_stream("SELECT id, name, flag FROM arrow_test.src ORDER BY id")
+        .await
+        .unwrap();
+    let target = TargetTable {
+        schema: "arrow_test".into(),
+        name: "dst".into(),
+    };
+    let written = backend
+        .write_arrow_stream(&target, stream2, WriteMode::Append)
+        .await
+        .unwrap();
+    assert_eq!(written, 3);
+
+    let dst_count = pool
+        .fetch_scalar_int("SELECT count(*)::int FROM arrow_test.dst")
+        .await
+        .unwrap();
+    assert_eq!(dst_count, 3);
+    let null_count = pool
+        .fetch_scalar_int(
+            "SELECT count(*)::int FROM arrow_test.dst WHERE name IS NULL",
+        )
+        .await
+        .unwrap();
+    assert_eq!(null_count, 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker; run with `cargo test -- --ignored`"]
+async fn arrow_write_stream_truncate_replaces_existing() {
+    let (_container, url) = start_postgres().await;
+    let pool = Arc::new(PgPool::connect(&url).await.unwrap());
+    let backend: Arc<dyn Backend> = Arc::new(PostgresBackend::new(pool.clone(), url.clone()));
+
+    backend.execute("CREATE SCHEMA arrow_trunc").await.unwrap();
+    backend
+        .execute("CREATE TABLE arrow_trunc.t (id INTEGER, label TEXT)")
+        .await
+        .unwrap();
+    backend
+        .execute("INSERT INTO arrow_trunc.t VALUES (99, 'old1'), (100, 'old2')")
+        .await
+        .unwrap();
+    backend
+        .execute("CREATE TABLE arrow_trunc.src (id INTEGER, label TEXT)")
+        .await
+        .unwrap();
+    backend
+        .execute("INSERT INTO arrow_trunc.src VALUES (1, 'new')")
+        .await
+        .unwrap();
+
+    let stream = backend
+        .read_arrow_stream("SELECT id, label FROM arrow_trunc.src")
+        .await
+        .unwrap();
+    let target = TargetTable {
+        schema: "arrow_trunc".into(),
+        name: "t".into(),
+    };
+    backend
+        .write_arrow_stream(&target, stream, WriteMode::Truncate)
+        .await
+        .unwrap();
+    let count = pool
+        .fetch_scalar_int("SELECT count(*)::int FROM arrow_trunc.t")
+        .await
+        .unwrap();
+    assert_eq!(count, 1);
+    let new_present = pool
+        .fetch_scalar_int(
+            "SELECT count(*)::int FROM arrow_trunc.t WHERE id = 1 AND label = 'new'",
+        )
+        .await
+        .unwrap();
+    assert_eq!(new_present, 1);
 }
 
 #[tokio::test(flavor = "multi_thread")]

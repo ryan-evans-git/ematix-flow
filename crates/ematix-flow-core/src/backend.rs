@@ -20,10 +20,18 @@
 //!
 //! See `docs/MULTI_BACKEND_PLAN.md` §3 for the full design.
 
+use std::pin::Pin;
 use std::sync::Arc;
 
+use arrow_array::builder::{
+    BooleanBuilder, Int32Builder, Int64Builder, StringBuilder, TimestampMicrosecondBuilder,
+};
+use arrow_array::{Array, RecordBatch};
+use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use async_trait::async_trait;
+use futures_util::Stream;
 use thiserror::Error;
+use tokio_postgres::types::Type as PgType;
 
 use crate::pg::{ConnectionInfo, PgError, PgPool};
 
@@ -92,6 +100,30 @@ impl From<PgError> for BackendError {
     }
 }
 
+/// Target-table reference passed to `write_arrow_stream`. Concrete enough
+/// to address a row destination in any backend (DB schema + name, S3
+/// prefix, Kafka topic) without coupling the trait to dialect-specific
+/// type catalogues.
+#[derive(Debug, Clone)]
+pub struct TargetTable {
+    pub schema: String,
+    pub name: String,
+}
+
+/// Write semantics for `write_arrow_stream`. Limited to the modes the
+/// universal Arrow path can serve directly. Merge/SCD2 still go through
+/// the dialect-specific strategy executors (Phase 30d).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteMode {
+    Append,
+    Truncate,
+}
+
+/// Stream of Arrow `RecordBatch`es. The universal IO contract for
+/// cross-backend pipelines (Phase 30b → onwards).
+pub type ArrowBatchStream =
+    Pin<Box<dyn Stream<Item = Result<RecordBatch, BackendError>> + Send>>;
+
 /// The unified backend interface. In 30a only the connection-level
 /// surface (`ping`, `execute`, `dialect`, `connection_info`, `dsn`) is
 /// defined; subsequent sub-commits add schema management, strategy
@@ -126,6 +158,25 @@ pub trait Backend: Send + Sync {
     /// prefix). Returns the affected row count where meaningful, 0
     /// otherwise.
     async fn execute(&self, statement: &str) -> Result<u64, BackendError>;
+
+    /// Phase 30b: read source data as a stream of Arrow `RecordBatch`es.
+    /// `query` is dialect-specific (SQL for DBs; topic/path/etc. for
+    /// streaming or object-store backends — Phases 34/36 will refine
+    /// the parameter shape). Implementations are free to chunk batches
+    /// however they like; consumers should treat the stream as opaque.
+    async fn read_arrow_stream(&self, query: &str)
+        -> Result<ArrowBatchStream, BackendError>;
+
+    /// Phase 30b: write a stream of Arrow `RecordBatch`es to `target`
+    /// using the requested write semantics. Returns the number of rows
+    /// written. Merge / SCD2 still flow through dialect-specific
+    /// strategy executors (Phase 30d).
+    async fn write_arrow_stream(
+        &self,
+        target: &TargetTable,
+        stream: ArrowBatchStream,
+        mode: WriteMode,
+    ) -> Result<u64, BackendError>;
 }
 
 /// Postgres backend — wraps an existing `PgPool`. The first impl of the
@@ -168,6 +219,311 @@ impl Backend for PostgresBackend {
     async fn execute(&self, statement: &str) -> Result<u64, BackendError> {
         Ok(self.pool.execute(statement).await?)
     }
+
+    async fn read_arrow_stream(
+        &self,
+        query: &str,
+    ) -> Result<ArrowBatchStream, BackendError> {
+        // Phase 30b minimum-viable: run the query, materialize all rows,
+        // emit one RecordBatch. Streaming chunked output is a future
+        // optimization (use COPY BINARY → arrow encoders).
+        let client = self
+            .pool
+            .raw_pool()
+            .get()
+            .await
+            .map_err(|e| BackendError::Connection(e.to_string()))?;
+        let stmt = client
+            .prepare(query)
+            .await
+            .map_err(PgError::Postgres)
+            .map_err(BackendError::from)?;
+        let rows = client
+            .query(&stmt, &[])
+            .await
+            .map_err(PgError::Postgres)
+            .map_err(BackendError::from)?;
+        let batch = pg_rows_to_record_batch(stmt.columns(), &rows)?;
+        let stream = futures_util::stream::once(async move { Ok::<_, BackendError>(batch) });
+        Ok(Box::pin(stream))
+    }
+
+    async fn write_arrow_stream(
+        &self,
+        target: &TargetTable,
+        stream: ArrowBatchStream,
+        mode: WriteMode,
+    ) -> Result<u64, BackendError> {
+        use futures_util::StreamExt;
+
+        let mut client = self
+            .pool
+            .raw_pool()
+            .get()
+            .await
+            .map_err(|e| BackendError::Connection(e.to_string()))?;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(PgError::Postgres)
+            .map_err(BackendError::from)?;
+        if mode == WriteMode::Truncate {
+            tx.batch_execute(&format!(
+                "TRUNCATE TABLE {}.{}",
+                quote_ident(&target.schema),
+                quote_ident(&target.name)
+            ))
+            .await
+            .map_err(PgError::Postgres)
+            .map_err(BackendError::from)?;
+        }
+        let mut total: u64 = 0;
+        let mut s = stream;
+        while let Some(batch) = s.next().await {
+            let batch = batch?;
+            total += insert_record_batch(&tx, &target.schema, &target.name, &batch).await?;
+        }
+        tx.commit()
+            .await
+            .map_err(PgError::Postgres)
+            .map_err(BackendError::from)?;
+        Ok(total)
+    }
+}
+
+// --- Postgres ↔ Arrow conversion (Phase 30b minimum-viable type set) -------
+
+fn quote_ident(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+fn pg_type_to_arrow(ty: &PgType) -> Result<DataType, BackendError> {
+    Ok(match ty.oid() {
+        20 => DataType::Int64,                                       // INT8
+        23 => DataType::Int32,                                       // INT4
+        25 | 1043 | 1042 => DataType::Utf8,                          // TEXT/VARCHAR/BPCHAR
+        16 => DataType::Boolean,                                     // BOOL
+        1184 | 1114 => DataType::Timestamp(TimeUnit::Microsecond, None), // TIMESTAMPTZ/TIMESTAMP
+        _ => {
+            return Err(BackendError::TypeMapping(format!(
+                "Phase 30b Postgres → Arrow: unsupported type {} (oid={})",
+                ty.name(),
+                ty.oid()
+            )));
+        }
+    })
+}
+
+fn pg_rows_to_record_batch(
+    columns: &[tokio_postgres::Column],
+    rows: &[tokio_postgres::Row],
+) -> Result<RecordBatch, BackendError> {
+    use std::sync::Arc as StdArc;
+
+    let mut fields = Vec::with_capacity(columns.len());
+    for col in columns {
+        let dt = pg_type_to_arrow(col.type_())?;
+        // All columns are nullable for now — column nullability isn't
+        // exposed by tokio-postgres directly; the trait can be tightened
+        // when we wire the planner through (Phase 30c).
+        fields.push(Field::new(col.name(), dt, true));
+    }
+    let schema = StdArc::new(Schema::new(fields.clone()));
+
+    let mut arrays: Vec<StdArc<dyn Array>> = Vec::with_capacity(columns.len());
+    for (idx, col) in columns.iter().enumerate() {
+        let dt = pg_type_to_arrow(col.type_())?;
+        let array: StdArc<dyn Array> = match dt {
+            DataType::Int64 => {
+                let mut b = Int64Builder::with_capacity(rows.len());
+                for row in rows {
+                    let v: Option<i64> = row.try_get(idx).map_err(|e| {
+                        BackendError::TypeMapping(format!(
+                            "row[{idx}] {} → i64: {e}",
+                            col.name()
+                        ))
+                    })?;
+                    b.append_option(v);
+                }
+                StdArc::new(b.finish())
+            }
+            DataType::Int32 => {
+                let mut b = Int32Builder::with_capacity(rows.len());
+                for row in rows {
+                    let v: Option<i32> = row.try_get(idx).map_err(|e| {
+                        BackendError::TypeMapping(format!(
+                            "row[{idx}] {} → i32: {e}",
+                            col.name()
+                        ))
+                    })?;
+                    b.append_option(v);
+                }
+                StdArc::new(b.finish())
+            }
+            DataType::Utf8 => {
+                let mut b = StringBuilder::with_capacity(rows.len(), rows.len() * 16);
+                for row in rows {
+                    let v: Option<&str> = row.try_get(idx).map_err(|e| {
+                        BackendError::TypeMapping(format!(
+                            "row[{idx}] {} → text: {e}",
+                            col.name()
+                        ))
+                    })?;
+                    b.append_option(v);
+                }
+                StdArc::new(b.finish())
+            }
+            DataType::Boolean => {
+                let mut b = BooleanBuilder::with_capacity(rows.len());
+                for row in rows {
+                    let v: Option<bool> = row.try_get(idx).map_err(|e| {
+                        BackendError::TypeMapping(format!(
+                            "row[{idx}] {} → bool: {e}",
+                            col.name()
+                        ))
+                    })?;
+                    b.append_option(v);
+                }
+                StdArc::new(b.finish())
+            }
+            DataType::Timestamp(TimeUnit::Microsecond, _) => {
+                use std::time::SystemTime;
+                let mut b = TimestampMicrosecondBuilder::with_capacity(rows.len());
+                for row in rows {
+                    let v: Option<SystemTime> = row.try_get(idx).map_err(|e| {
+                        BackendError::TypeMapping(format!(
+                            "row[{idx}] {} → timestamp: {e}",
+                            col.name()
+                        ))
+                    })?;
+                    let micros = v.map(system_time_to_micros);
+                    b.append_option(micros);
+                }
+                StdArc::new(b.finish())
+            }
+            other => {
+                return Err(BackendError::TypeMapping(format!(
+                    "no Arrow builder for {other:?}"
+                )));
+            }
+        };
+        arrays.push(array);
+    }
+    RecordBatch::try_new(schema, arrays)
+        .map_err(|e| BackendError::TypeMapping(e.to_string()))
+}
+
+fn system_time_to_micros(t: std::time::SystemTime) -> i64 {
+    use std::time::UNIX_EPOCH;
+    match t.duration_since(UNIX_EPOCH) {
+        Ok(d) => d.as_micros() as i64,
+        Err(e) => -(e.duration().as_micros() as i64),
+    }
+}
+
+async fn insert_record_batch(
+    tx: &deadpool_postgres::Transaction<'_>,
+    schema: &str,
+    table: &str,
+    batch: &RecordBatch,
+) -> Result<u64, BackendError> {
+    use arrow_array::{
+        BooleanArray, Int32Array, Int64Array, StringArray, TimestampMicrosecondArray,
+    };
+
+    if batch.num_rows() == 0 {
+        return Ok(0);
+    }
+    let arrow_schema = batch.schema();
+    let cols: Vec<&str> = arrow_schema.fields().iter().map(|f| f.name().as_str()).collect();
+    let placeholders: Vec<String> = (1..=cols.len()).map(|i| format!("${i}")).collect();
+    let sql = format!(
+        "INSERT INTO {}.{} ({}) VALUES ({})",
+        quote_ident(schema),
+        quote_ident(table),
+        cols.iter()
+            .map(|c| quote_ident(c))
+            .collect::<Vec<_>>()
+            .join(", "),
+        placeholders.join(", ")
+    );
+    let stmt = tx
+        .prepare(&sql)
+        .await
+        .map_err(PgError::Postgres)
+        .map_err(BackendError::from)?;
+
+    let mut rows_written: u64 = 0;
+    for row_idx in 0..batch.num_rows() {
+        // Build the parameter values borrowed for this row's lifetime.
+        // For Phase 30b we only support a starter type set; richer
+        // coverage comes with Phase 30d's strategy-executor migration.
+        let mut owned_strs: Vec<Option<String>> = vec![None; batch.num_columns()];
+        let mut owned_i64: Vec<Option<i64>> = vec![None; batch.num_columns()];
+        let mut owned_i32: Vec<Option<i32>> = vec![None; batch.num_columns()];
+        let mut owned_bool: Vec<Option<bool>> = vec![None; batch.num_columns()];
+        let mut owned_ts: Vec<Option<std::time::SystemTime>> =
+            vec![None; batch.num_columns()];
+
+        for (col_idx, field) in arrow_schema.fields().iter().enumerate() {
+            let col = batch.column(col_idx);
+            if col.is_null(row_idx) {
+                continue;
+            }
+            match field.data_type() {
+                DataType::Int64 => {
+                    let arr = col.as_any().downcast_ref::<Int64Array>().unwrap();
+                    owned_i64[col_idx] = Some(arr.value(row_idx));
+                }
+                DataType::Int32 => {
+                    let arr = col.as_any().downcast_ref::<Int32Array>().unwrap();
+                    owned_i32[col_idx] = Some(arr.value(row_idx));
+                }
+                DataType::Utf8 => {
+                    let arr = col.as_any().downcast_ref::<StringArray>().unwrap();
+                    owned_strs[col_idx] = Some(arr.value(row_idx).to_string());
+                }
+                DataType::Boolean => {
+                    let arr = col.as_any().downcast_ref::<BooleanArray>().unwrap();
+                    owned_bool[col_idx] = Some(arr.value(row_idx));
+                }
+                DataType::Timestamp(TimeUnit::Microsecond, _) => {
+                    let arr =
+                        col.as_any().downcast_ref::<TimestampMicrosecondArray>().unwrap();
+                    let micros = arr.value(row_idx);
+                    let dur = std::time::Duration::from_micros(micros as u64);
+                    owned_ts[col_idx] = Some(std::time::UNIX_EPOCH + dur);
+                }
+                other => {
+                    return Err(BackendError::TypeMapping(format!(
+                        "Arrow → Postgres: unsupported {other:?} for column {}",
+                        field.name()
+                    )));
+                }
+            }
+        }
+
+        type ToSqlRef<'a> = &'a (dyn tokio_postgres::types::ToSql + Sync);
+        let mut params: Vec<ToSqlRef<'_>> = Vec::with_capacity(batch.num_columns());
+        for (col_idx, field) in arrow_schema.fields().iter().enumerate() {
+            match field.data_type() {
+                DataType::Int64 => params.push(&owned_i64[col_idx] as ToSqlRef<'_>),
+                DataType::Int32 => params.push(&owned_i32[col_idx] as ToSqlRef<'_>),
+                DataType::Utf8 => params.push(&owned_strs[col_idx] as ToSqlRef<'_>),
+                DataType::Boolean => params.push(&owned_bool[col_idx] as ToSqlRef<'_>),
+                DataType::Timestamp(TimeUnit::Microsecond, _) => {
+                    params.push(&owned_ts[col_idx] as ToSqlRef<'_>)
+                }
+                _ => unreachable!(),
+            }
+        }
+        rows_written += tx
+            .execute(&stmt, &params)
+            .await
+            .map_err(PgError::Postgres)
+            .map_err(BackendError::from)?;
+    }
+    Ok(rows_written)
 }
 
 #[cfg(test)]
