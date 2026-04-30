@@ -1,13 +1,17 @@
-"""`Pipeline` declarative spec + `pipeline.sync(...)` executor.
+"""`Pipeline` declarative spec + `pipeline.sync(...)` executor + scheduling registry.
 
 Phase 1 introduced the `Pipeline` / `Source` / `Target` round-trip dataclasses;
-Phase 5 adds `sync(...)` for executing a load against a live database.
+Phase 5 adds `sync(...)` for executing a load against a live database;
+Phase 12 adds `@register(name=..., schedule=...)` and helpers used by the
+`flow` CLI to list, run, and run-due against a user's pipeline module.
 """
 
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
+from datetime import datetime, timedelta
 from typing import Any, Literal
 
 from ematix_flow import _core
@@ -253,3 +257,68 @@ def sync(
         src_arg,
         handle_deletes,
     )
+
+
+# --- Phase 12: scheduling registry ------------------------------------------
+
+
+@dataclass(frozen=True)
+class ScheduledPipeline:
+    """A named, scheduled callable. Registered via `@pipeline.register(...)`."""
+
+    name: str
+    schedule: str
+    fn: Callable[[], dict[str, Any]]
+
+
+_REGISTRY: dict[str, ScheduledPipeline] = {}
+
+
+def register(
+    *, name: str, schedule: str
+) -> Callable[[Callable[[], dict[str, Any]]], Callable[[], dict[str, Any]]]:
+    """Decorator: register a callable as a scheduled pipeline.
+
+    The function should perform a sync (or any work) and return a
+    JSON-serializable dict describing what happened.
+    """
+
+    def decorator(
+        fn: Callable[[], dict[str, Any]],
+    ) -> Callable[[], dict[str, Any]]:
+        if name in _REGISTRY:
+            raise ValueError(
+                f"a pipeline named {name!r} is already registered"
+            )
+        _REGISTRY[name] = ScheduledPipeline(name=name, schedule=schedule, fn=fn)
+        return fn
+
+    return decorator
+
+
+def list_pipelines() -> list[ScheduledPipeline]:
+    return list(_REGISTRY.values())
+
+
+def get_pipeline(name: str) -> ScheduledPipeline:
+    return _REGISTRY[name]
+
+
+def run_pipeline(name: str) -> dict[str, Any]:
+    return _REGISTRY[name].fn()
+
+
+def is_due(schedule: str, now: datetime, interval_seconds: int) -> bool:
+    """Return True if `schedule` would fire within the half-open window
+    `(now - interval_seconds, now]`. The intended invocation pattern is
+    an external cron / k8s CronJob calling `flow run-due` once per
+    `interval_seconds`."""
+    from croniter import croniter
+
+    try:
+        base = now - timedelta(seconds=interval_seconds)
+        cron = croniter(schedule, base)
+        next_fire = cron.get_next(datetime)
+    except Exception as e:
+        raise ValueError(f"invalid cron expression {schedule!r}: {e}") from e
+    return base < next_fire <= now

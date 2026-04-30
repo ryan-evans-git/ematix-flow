@@ -26,6 +26,9 @@ classifiers = [
     "Topic :: Database",
     "Topic :: Software Development :: Libraries",
 ]
+dependencies = [
+    "croniter>=2.0",
+]
 
 [project.urls]
 Repository = "https://github.com/ryan-evans-git/ematix-flow"
