@@ -1000,6 +1000,29 @@ class _EmatixNamespace:
         return decorate
 
     @staticmethod
+    def training_set(
+        conn: Any,
+        *,
+        spine: list[dict[str, Any]],
+        feature_views: list[type],
+        columns: dict[type, list[str]] | None = None,
+        prefer: str = "auto",
+    ):
+        """Phase 20: build a training dataset by asof-joining feature_views
+        against spine. Returns a polars (default) or pandas DataFrame.
+        See `ematix_flow.training` for details.
+        """
+        from ematix_flow.training import training_set as _ts
+
+        return _ts(
+            conn,
+            spine=spine,
+            feature_views=feature_views,
+            columns=columns,
+            prefer=prefer,
+        )
+
+    @staticmethod
     def transform_ref(name: str) -> TransformRef:
         """Reference a registered transform or pipeline by name.
 
