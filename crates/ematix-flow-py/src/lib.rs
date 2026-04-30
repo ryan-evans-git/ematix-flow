@@ -1,8 +1,9 @@
 use std::sync::{Arc, OnceLock};
 
 use ematix_flow_core::ddl::{self, DriftResult};
-use ematix_flow_core::pg::{self, EnsureOutcome, MergeRunResult, PgPool};
+use ematix_flow_core::pg::{self, EnsureOutcome, MergeRunResult, PgPool, Scd2RunResult};
 use ematix_flow_core::strategy::append::augment_with_metadata;
+use ematix_flow_core::strategy::scd2::augment_with_scd2;
 use ematix_flow_core::types::TableSpec;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
@@ -39,6 +40,22 @@ fn parse_table_spec(json: &str) -> PyResult<String> {
 #[pyfunction]
 fn same_database(a: &str, b: &str) -> PyResult<bool> {
     pg::same_database(a, b).map_err(|e| PyValueError::new_err(e.to_string()))
+}
+
+/// Add SCD2 metadata columns (valid_from/valid_to/is_current/row_hash)
+/// plus `_loaded_at`/`_batch_id` if absent. valid_from joins the natural
+/// keys to form the composite PK so multiple versions per key can coexist.
+#[pyfunction]
+fn augment_table_spec_scd2(spec_json: &str) -> PyResult<String> {
+    let normalized = ematix_flow_core::normalize_table_json(spec_json)
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    let spec: TableSpec =
+        serde_json::from_str(&normalized).map_err(|e| PyValueError::new_err(e.to_string()))?;
+    let augmented = augment_with_scd2(&spec);
+    let augmented_json =
+        serde_json::to_string(&augmented).map_err(|e| PyValueError::new_err(e.to_string()))?;
+    ematix_flow_core::normalize_table_json(&augmented_json)
+        .map_err(|e| PyValueError::new_err(e.to_string()))
 }
 
 /// Add `_loaded_at` and `_batch_id` columns to a TableSpec if absent.
@@ -106,6 +123,76 @@ impl Connection {
         dict.set_item("port", info.port)?;
         dict.set_item("dbname", &info.dbname)?;
         dict.set_item("user", &info.user)?;
+        Ok(dict)
+    }
+
+    /// Run an SCD2 load. Returns rows_inserted (new versions) and
+    /// rows_closed (previous versions closed out).
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (target_spec_json, source_query, pipeline_name, keys, compare_columns, source=None))]
+    fn run_scd2<'py>(
+        &self,
+        py: Python<'py>,
+        target_spec_json: String,
+        source_query: String,
+        pipeline_name: String,
+        keys: Vec<String>,
+        compare_columns: Vec<String>,
+        source: Option<&Connection>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        if keys.is_empty() {
+            return Err(PyValueError::new_err("scd2 requires at least one key"));
+        }
+        if compare_columns.is_empty() {
+            return Err(PyValueError::new_err(
+                "scd2 requires at least one compare column",
+            ));
+        }
+        let normalized = ematix_flow_core::normalize_table_json(&target_spec_json)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        let spec: TableSpec =
+            serde_json::from_str(&normalized).map_err(|e| PyValueError::new_err(e.to_string()))?;
+        let target_pool = self.pool.clone();
+        let source_pool = source.map(|s| s.pool.clone());
+
+        let outcome: Scd2RunResult = py
+            .detach(|| {
+                rt().block_on(async move {
+                    match source_pool {
+                        None => {
+                            target_pool
+                                .run_scd2_same_db(
+                                    &spec,
+                                    &source_query,
+                                    &keys,
+                                    &compare_columns,
+                                    &pipeline_name,
+                                )
+                                .await
+                        }
+                        Some(src) => {
+                            target_pool
+                                .run_scd2_cross_db(
+                                    &src,
+                                    &spec,
+                                    &source_query,
+                                    &keys,
+                                    &compare_columns,
+                                    &pipeline_name,
+                                )
+                                .await
+                        }
+                    }
+                })
+            })
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+
+        let dict = PyDict::new(py);
+        dict.set_item("run_id", outcome.run_id)?;
+        dict.set_item("rows_inserted", outcome.rows_inserted)?;
+        dict.set_item("rows_closed", outcome.rows_closed)?;
+        dict.set_item("status", outcome.status)?;
+        dict.set_item("path", outcome.path)?;
         Ok(dict)
     }
 
@@ -348,6 +435,7 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(same_database, m)?)?;
     m.add_function(wrap_pyfunction!(create_table_sql, m)?)?;
     m.add_function(wrap_pyfunction!(augment_table_spec, m)?)?;
+    m.add_function(wrap_pyfunction!(augment_table_spec_scd2, m)?)?;
     m.add_function(wrap_pyfunction!(connect, m)?)?;
     m.add_class::<Connection>()?;
     Ok(())

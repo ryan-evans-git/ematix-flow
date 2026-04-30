@@ -13,6 +13,7 @@ use crate::ddl::{
 };
 use crate::strategy::append::{BATCH_ID_COL, LOADED_AT_COL, plan_same_db_append};
 use crate::strategy::merge::plan_merge_upsert;
+use crate::strategy::scd2::plan_scd2;
 use crate::strategy::truncate::plan_truncate_replace;
 use crate::types::TableSpec;
 
@@ -90,6 +91,17 @@ pub struct MergeRunResult {
     pub rows_inserted: i64,
     pub rows_updated: i64,
     pub rows_unchanged: i64,
+    pub status: String,
+    pub path: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct Scd2RunResult {
+    pub run_id: String,
+    /// Number of new current versions inserted (new keys + changed keys).
+    pub rows_inserted: i64,
+    /// Number of previous current versions closed out (changed keys only).
+    pub rows_closed: i64,
     pub status: String,
     pub path: String,
 }
@@ -755,6 +767,197 @@ impl PgPool {
                     rows_unchanged: unchanged,
                     status: "success".into(),
                     path: "same_db".into(),
+                })
+            }
+            Err(err) => {
+                let _ = self.finish_history_failure(run_id, &err.to_string()).await;
+                Err(err)
+            }
+        }
+    }
+
+    /// Lazy-create the pgcrypto extension. SCD2 needs `digest()`. On
+    /// managed services where the user lacks CREATE EXTENSION rights this
+    /// errors with a clear message; future phases can fall back to md5.
+    async fn ensure_pgcrypto(&self) -> Result<(), PgError> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| PgError::Pool(e.to_string()))?;
+        client
+            .batch_execute("CREATE EXTENSION IF NOT EXISTS pgcrypto")
+            .await?;
+        Ok(())
+    }
+
+    /// Same-DB SCD2 executor. Three statements in one transaction:
+    /// 1. Create temp `_scd2_changed_<id>` from a hashed source.
+    /// 2. Close out previous current versions for changed keys.
+    /// 3. Insert new current versions.
+    pub async fn run_scd2_same_db(
+        &self,
+        target_spec: &TableSpec,
+        source_query: &str,
+        keys: &[String],
+        compare_columns: &[String],
+        pipeline_name: &str,
+    ) -> Result<Scd2RunResult, PgError> {
+        self.ensure_meta_schema().await?;
+        self.ensure_pgcrypto().await?;
+        let run_id = Uuid::new_v4();
+        let batch_id = run_id;
+        let run_token = run_id.simple().to_string();
+        self.insert_history_start(run_id, pipeline_name, target_spec, "scd2", "same_db")
+            .await?;
+
+        let plan = plan_scd2(target_spec, source_query, keys, compare_columns, &run_token);
+
+        let result: Result<(i64, i64), PgError> = async {
+            let mut client = self
+                .pool
+                .get()
+                .await
+                .map_err(|e| PgError::Pool(e.to_string()))?;
+            let tx = client.transaction().await?;
+            tx.batch_execute(&plan.statements[0]).await?;
+            let closed = tx.execute(&plan.statements[1], &[]).await? as i64;
+            let inserted = if plan.has_metadata {
+                tx.execute(&plan.statements[2], &[&batch_id]).await? as i64
+            } else {
+                tx.execute(&plan.statements[2], &[]).await? as i64
+            };
+            tx.commit().await?;
+            Ok((inserted, closed))
+        }
+        .await;
+
+        match result {
+            Ok((inserted, closed)) => {
+                // rows_unchanged not meaningful here without a separate
+                // count; record updated=closed for run_history symmetry.
+                self.finish_history_success_merge(run_id, inserted, closed, 0)
+                    .await?;
+                Ok(Scd2RunResult {
+                    run_id: run_id.to_string(),
+                    rows_inserted: inserted,
+                    rows_closed: closed,
+                    status: "success".into(),
+                    path: "same_db".into(),
+                })
+            }
+            Err(err) => {
+                let _ = self.finish_history_failure(run_id, &err.to_string()).await;
+                Err(err)
+            }
+        }
+    }
+
+    /// Cross-DB SCD2 executor. COPY user columns into a target-side temp
+    /// staging table, then run the SCD2 plan against that staging table.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn run_scd2_cross_db(
+        &self,
+        source_pool: &PgPool,
+        target_spec: &TableSpec,
+        source_query: &str,
+        keys: &[String],
+        compare_columns: &[String],
+        pipeline_name: &str,
+    ) -> Result<Scd2RunResult, PgError> {
+        self.ensure_meta_schema().await?;
+        self.ensure_pgcrypto().await?;
+        let run_id = Uuid::new_v4();
+        let batch_id = run_id;
+        let run_token = run_id.simple().to_string();
+        self.insert_history_start(run_id, pipeline_name, target_spec, "scd2", "cross_db")
+            .await?;
+
+        // user columns = target columns minus all metadata (scd2 + run).
+        let user_columns: Vec<&str> = target_spec
+            .columns
+            .iter()
+            .filter(|c| {
+                c.name != LOADED_AT_COL
+                    && c.name != BATCH_ID_COL
+                    && !crate::strategy::scd2::is_scd2_metadata(&c.name)
+            })
+            .map(|c| c.name.as_str())
+            .collect();
+        let staging_def: String = target_spec
+            .columns
+            .iter()
+            .filter(|c| {
+                c.name != LOADED_AT_COL
+                    && c.name != BATCH_ID_COL
+                    && !crate::strategy::scd2::is_scd2_metadata(&c.name)
+            })
+            .map(|c| format!("{} {}", c.name, c.ty.to_postgres_sql()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let staging = format!("_ematix_stage_{}", run_token);
+        let projected_source = format!(
+            "SELECT {cols} FROM ({source_query}) src",
+            cols = user_columns.join(", "),
+        );
+        let plan = plan_scd2(
+            target_spec,
+            &format!("SELECT * FROM {staging}"),
+            keys,
+            compare_columns,
+            &run_token,
+        );
+
+        let result: Result<(i64, i64), PgError> = async {
+            let mut target_client = self
+                .pool
+                .get()
+                .await
+                .map_err(|e| PgError::Pool(e.to_string()))?;
+            let target_tx = target_client.transaction().await?;
+            target_tx
+                .batch_execute(&format!("CREATE TEMP TABLE {staging} ({staging_def})"))
+                .await?;
+
+            let source_client = source_pool
+                .pool
+                .get()
+                .await
+                .map_err(|e| PgError::Pool(e.to_string()))?;
+            let copy_out_sql = format!("COPY ({projected_source}) TO STDOUT (FORMAT binary)");
+            let stream = source_client.copy_out(&copy_out_sql).await?;
+            let copy_in_sql = format!("COPY {staging} FROM STDIN (FORMAT binary)");
+            let sink = target_tx.copy_in::<_, Bytes>(&copy_in_sql).await?;
+            pin_mut!(stream);
+            pin_mut!(sink);
+            while let Some(chunk) = stream.next().await {
+                let bytes = chunk?;
+                sink.send(bytes).await?;
+            }
+            let _ = sink.finish().await?;
+
+            target_tx.batch_execute(&plan.statements[0]).await?;
+            let closed = target_tx.execute(&plan.statements[1], &[]).await? as i64;
+            let inserted = if plan.has_metadata {
+                target_tx.execute(&plan.statements[2], &[&batch_id]).await? as i64
+            } else {
+                target_tx.execute(&plan.statements[2], &[]).await? as i64
+            };
+            target_tx.commit().await?;
+            Ok((inserted, closed))
+        }
+        .await;
+
+        match result {
+            Ok((inserted, closed)) => {
+                self.finish_history_success_merge(run_id, inserted, closed, 0)
+                    .await?;
+                Ok(Scd2RunResult {
+                    run_id: run_id.to_string(),
+                    rows_inserted: inserted,
+                    rows_closed: closed,
+                    status: "success".into(),
+                    path: "cross_db".into(),
                 })
             }
             Err(err) => {

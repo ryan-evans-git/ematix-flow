@@ -62,6 +62,7 @@ def _same_database(a: Any, b: Any) -> bool:
 
 
 _METADATA_COLS = ("_loaded_at", "_batch_id")
+_SCD2_META_COLS = ("valid_from", "valid_to", "is_current", "row_hash")
 
 
 def sync(
@@ -74,13 +75,18 @@ def sync(
     on_drift: str = "error",
     keys: tuple[str, ...] | None = None,
     update_columns: tuple[str, ...] | None = None,
+    compare_columns: tuple[str, ...] | None = None,
 ) -> dict[str, Any]:
-    """Execute a load. Phases 5–7 support 'append', 'truncate', 'merge'/'scd1'."""
-    if mode not in ("append", "truncate", "merge", "scd1"):
+    """Execute a load. Phases 5–8 support 'append', 'truncate', 'merge'/'scd1', 'scd2'."""
+    if mode not in ("append", "truncate", "merge", "scd1", "scd2"):
         raise NotImplementedError(f"mode={mode!r} is not yet implemented")
 
     name = pipeline_name or f"{target.__schema__}.{target.__tablename__}"
-    augmented_json = _core.augment_table_spec(json.dumps(target._to_spec()))
+
+    if mode == "scd2":
+        augmented_json = _core.augment_table_spec_scd2(json.dumps(target._to_spec()))
+    else:
+        augmented_json = _core.augment_table_spec(json.dumps(target._to_spec()))
 
     target_connection.ensure_table(augmented_json, on_drift)
 
@@ -92,6 +98,36 @@ def sync(
     if mode == "truncate":
         return target_connection.run_truncate(augmented_json, source.query, name, src_arg)
 
+    if mode == "scd2":
+        resolved_keys = list(keys) if keys else target._primary_keys()
+        if not resolved_keys:
+            raise ValueError(
+                "mode='scd2' requires keys; pass keys=... or declare primary_key columns"
+            )
+        if compare_columns is None:
+            all_cols = [n for n, _ in target._columns()]
+            resolved_compares = [
+                c
+                for c in all_cols
+                if c not in resolved_keys
+                and c not in _METADATA_COLS
+                and c not in _SCD2_META_COLS
+            ]
+        else:
+            resolved_compares = list(compare_columns)
+        if not resolved_compares:
+            raise ValueError(
+                "mode='scd2' requires at least one compare column; pass compare_columns=..."
+            )
+        return target_connection.run_scd2(
+            augmented_json,
+            source.query,
+            name,
+            resolved_keys,
+            resolved_compares,
+            src_arg,
+        )
+
     # merge / scd1
     resolved_keys = list(keys) if keys else target._primary_keys()
     if not resolved_keys:
@@ -99,7 +135,7 @@ def sync(
             f"mode={mode!r} requires keys; pass keys=... or declare primary_key columns"
         )
     if update_columns is None:
-        all_cols = [name for name, _ in target._columns()]
+        all_cols = [n for n, _ in target._columns()]
         resolved_updates = [
             c for c in all_cols if c not in resolved_keys and c not in _METADATA_COLS
         ]
