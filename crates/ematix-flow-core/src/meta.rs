@@ -58,6 +58,28 @@ pub fn build_hard_delete_sql(
     )
 }
 
+/// Phase 16: TTL expiry post-step for SCD2.
+///
+/// Closes out current versions whose `valid_from` is older than
+/// `now() - ttl_seconds` (sets `valid_to = now()`, `is_current = false`).
+/// No new version is inserted — the row is tombstoned because it has
+/// gone stale per the user's freshness contract.
+pub fn build_scd2_ttl_expire_sql(
+    target_schema: &str,
+    target_table: &str,
+    ttl_seconds: i64,
+) -> String {
+    format!(
+        "UPDATE {schema}.{table} \
+         SET valid_to = now(), is_current = false \
+         WHERE is_current \
+           AND valid_from < now() - make_interval(secs => {ttl_seconds})",
+        schema = target_schema,
+        table = target_table,
+        ttl_seconds = ttl_seconds,
+    )
+}
+
 /// Phase 11: soft-delete (close-out) post-step for SCD2.
 ///
 /// Closes out current versions whose natural key is absent from the
@@ -137,6 +159,17 @@ mod tests {
     fn hard_delete_handles_composite_keys() {
         let sql = build_hard_delete_sql("s", "t", &["a".into(), "b".into()], "SELECT * FROM stage");
         assert!(sql.contains("(a, b) NOT IN (SELECT a, b FROM (SELECT * FROM stage) _del)"));
+    }
+
+    #[test]
+    fn scd2_ttl_expire_targets_stale_current_rows() {
+        use crate::meta::build_scd2_ttl_expire_sql;
+        let sql = build_scd2_ttl_expire_sql("warehouse", "user_dim", 604800);
+        assert!(sql.contains("UPDATE warehouse.user_dim"));
+        assert!(sql.contains("SET valid_to = now()"));
+        assert!(sql.contains("is_current = false"));
+        assert!(sql.contains("WHERE is_current"));
+        assert!(sql.contains("valid_from < now() - make_interval(secs => 604800)"));
     }
 
     #[test]

@@ -242,7 +242,7 @@ impl Connection {
     /// `valid_from` comes from that column; out-of-order arrivals are
     /// rejected with an error.
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (target_spec_json, source_query, pipeline_name, keys, compare_columns, source=None, handle_deletes=None, event_timestamp_column=None, dry_run=false))]
+    #[pyo3(signature = (target_spec_json, source_query, pipeline_name, keys, compare_columns, source=None, handle_deletes=None, event_timestamp_column=None, ttl_seconds=None, dry_run=false))]
     fn run_scd2<'py>(
         &self,
         py: Python<'py>,
@@ -254,6 +254,7 @@ impl Connection {
         source: Option<&Connection>,
         handle_deletes: Option<&str>,
         event_timestamp_column: Option<String>,
+        ttl_seconds: Option<i64>,
         dry_run: bool,
     ) -> PyResult<Bound<'py, PyDict>> {
         if dry_run && source.is_some() {
@@ -300,6 +301,7 @@ impl Connection {
                                     &pipeline_name,
                                     delete_handling,
                                     ets,
+                                    ttl_seconds,
                                     dry_run,
                                 )
                                 .await
@@ -315,6 +317,7 @@ impl Connection {
                                     &pipeline_name,
                                     delete_handling,
                                     ets,
+                                    ttl_seconds,
                                 )
                                 .await
                         }

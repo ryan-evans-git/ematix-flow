@@ -179,6 +179,7 @@ def sync(
     incremental_column: str | None = None,
     handle_deletes: str | None = None,
     event_timestamp_column: str | None = None,
+    ttl: timedelta | None = None,
     dry_run: bool = False,
 ) -> dict[str, Any]:
     """Execute a load. Phases 5–8 support 'append', 'truncate', 'merge'/'scd1', 'scd2'.
@@ -203,6 +204,11 @@ def sync(
         raise ValueError(
             f"event_timestamp_column is only supported for mode='scd2'; got mode={mode!r}"
         )
+    if ttl is not None and mode != "scd2":
+        raise ValueError(
+            f"ttl is only supported for mode='scd2'; got mode={mode!r}"
+        )
+    ttl_seconds = int(ttl.total_seconds()) if ttl is not None else None
     if handle_deletes is not None:
         if handle_deletes not in ("hard", "soft"):
             raise ValueError(
@@ -304,6 +310,7 @@ def sync(
             src_arg,
             handle_deletes,
             event_timestamp_column,
+            ttl_seconds,
             dry_run,
         )
 

@@ -14,7 +14,7 @@ use crate::ddl::{
 };
 use crate::meta::{
     DeleteHandling, WatermarkConfig, build_hard_delete_sql, build_scd2_close_missing_sql,
-    wrap_with_watermark_filter,
+    build_scd2_ttl_expire_sql, wrap_with_watermark_filter,
 };
 use crate::strategy::append::{BATCH_ID_COL, LOADED_AT_COL, plan_same_db_append};
 use crate::strategy::merge::plan_merge_upsert;
@@ -1104,6 +1104,7 @@ impl PgPool {
         pipeline_name: &str,
         delete_handling: Option<DeleteHandling>,
         event_ts_column: Option<&str>,
+        ttl_seconds: Option<i64>,
         dry_run: bool,
     ) -> Result<Scd2RunResult, PgError> {
         if !dry_run {
@@ -1165,12 +1166,24 @@ impl PgPool {
             } else {
                 0
             };
+            // Phase 16: TTL expiry. Closes out current versions whose
+            // valid_from is older than now() - ttl. Same-tx atomicity.
+            let closed_ttl = if let Some(ttl_secs) = ttl_seconds {
+                let ttl_sql = build_scd2_ttl_expire_sql(
+                    &target_spec.schema,
+                    &target_spec.name,
+                    ttl_secs,
+                );
+                tx.execute(&ttl_sql, &[]).await? as i64
+            } else {
+                0
+            };
             if dry_run {
                 tx.rollback().await?;
             } else {
                 tx.commit().await?;
             }
-            Ok((inserted, closed_changed + closed_missing))
+            Ok((inserted, closed_changed + closed_missing + closed_ttl))
         }
         .await;
 
@@ -1212,6 +1225,7 @@ impl PgPool {
         pipeline_name: &str,
         delete_handling: Option<DeleteHandling>,
         event_ts_column: Option<&str>,
+        ttl_seconds: Option<i64>,
     ) -> Result<Scd2RunResult, PgError> {
         self.ensure_meta_schema().await?;
         self.ensure_pgcrypto().await?;
@@ -1323,8 +1337,19 @@ impl PgPool {
             } else {
                 0
             };
+            // Phase 16: TTL expiry runs in the same transaction.
+            let closed_ttl = if let Some(ttl_secs) = ttl_seconds {
+                let ttl_sql = build_scd2_ttl_expire_sql(
+                    &target_spec.schema,
+                    &target_spec.name,
+                    ttl_secs,
+                );
+                target_tx.execute(&ttl_sql, &[]).await? as i64
+            } else {
+                0
+            };
             target_tx.commit().await?;
-            Ok((inserted, closed_changed + closed_missing))
+            Ok((inserted, closed_changed + closed_missing + closed_ttl))
         }
         .await;
 

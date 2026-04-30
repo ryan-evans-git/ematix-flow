@@ -1003,6 +1003,7 @@ class _EmatixNamespace:
         transforms_pre: list[Any] | None = None,
         transforms_post: list[Any] | None = None,
         continue_on_failure_post: bool = False,
+        ttl: Any = None,
     ):
         """Function decorator. Wraps `pipeline.sync` and registers via the
         Phase 12 scheduling registry.
@@ -1132,6 +1133,7 @@ class _EmatixNamespace:
                         incremental_column=incremental_column,
                         on_drift=on_drift,
                         force_path=force_path,
+                        ttl=ttl,
                     )
                     # Phase 27a/b: post-load transforms.
                     if transforms_post:
