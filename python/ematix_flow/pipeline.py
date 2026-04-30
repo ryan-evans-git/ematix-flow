@@ -537,6 +537,109 @@ def list_transforms() -> list[RegistryEntry]:
     return [e for e in list_entries() if e.kind == "transform"]
 
 
+# --- Phase 17: FeatureView registry ---------------------------------------
+
+
+@dataclass(frozen=True)
+class RegisteredFeatureView:
+    """Process-local entry for a `@ematix.feature_view`-decorated class."""
+
+    schema: str
+    tablename: str
+    feature_version: str
+    entity_keys: list[str]
+    event_timestamp_column: str | None
+    ttl_seconds: int | None
+    freshness_sla_seconds: int | None
+    online: bool
+    description: str | None
+    owner: str | None
+    cls: Any
+
+    @property
+    def name(self) -> str:
+        return f"{self.schema}.{self.tablename}.{self.feature_version}"
+
+
+_FEATURE_VIEWS_REGISTRY: dict[str, RegisteredFeatureView] = {}
+
+
+def list_feature_views() -> list[RegisteredFeatureView]:
+    return list(_FEATURE_VIEWS_REGISTRY.values())
+
+
+def _upsert_feature_view_metadata_for_target(
+    *, target_connection: Any, target_cls: Any
+) -> None:
+    """Look up the registered FeatureView for `target_cls` and upsert its
+    metadata row. No-op if not registered (e.g., user constructed a
+    ManagedTable manually with __is_feature_view__ but didn't decorate)."""
+    if not getattr(target_cls, "__is_feature_view__", False):
+        return
+    name = (
+        f"{target_cls.__schema__}.{target_cls.__tablename__}."
+        f"{getattr(target_cls, '__feature_version__', 'v0')}"
+    )
+    fv = _FEATURE_VIEWS_REGISTRY.get(name)
+    if fv is None:
+        return
+    upsert_feature_view_metadata(target_connection, fv)
+
+
+def upsert_feature_view_metadata(
+    target_connection: Any, fv: RegisteredFeatureView
+) -> None:
+    """Record/refresh a FeatureView row in `ematix_flow.feature_views`.
+    Lazy-creates the table on first call. Updates `last_synced_at` to now().
+    """
+    target_connection.execute("CREATE SCHEMA IF NOT EXISTS ematix_flow")
+    target_connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS ematix_flow.feature_views (
+            name TEXT PRIMARY KEY,
+            schema_name TEXT NOT NULL,
+            table_name TEXT NOT NULL,
+            feature_version TEXT NOT NULL,
+            entity_keys TEXT[] NOT NULL,
+            event_timestamp_column TEXT,
+            ttl_seconds BIGINT,
+            description TEXT,
+            owner TEXT,
+            freshness_sla_seconds BIGINT,
+            last_synced_at TIMESTAMPTZ,
+            registered_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        )
+        """
+    )
+    keys_array = "ARRAY[" + ", ".join(f"'{k}'" for k in fv.entity_keys) + "]::text[]"
+    ets = f"'{fv.event_timestamp_column}'" if fv.event_timestamp_column else "NULL"
+    ttl = str(fv.ttl_seconds) if fv.ttl_seconds is not None else "NULL"
+    sla = (
+        str(fv.freshness_sla_seconds) if fv.freshness_sla_seconds is not None else "NULL"
+    )
+    desc = "'" + (fv.description or "").replace("'", "''") + "'" if fv.description else "NULL"
+    owner = "'" + (fv.owner or "").replace("'", "''") + "'" if fv.owner else "NULL"
+    target_connection.execute(
+        f"""
+        INSERT INTO ematix_flow.feature_views
+            (name, schema_name, table_name, feature_version, entity_keys,
+             event_timestamp_column, ttl_seconds, description, owner,
+             freshness_sla_seconds, last_synced_at)
+        VALUES
+            ('{fv.name}', '{fv.schema}', '{fv.tablename}', '{fv.feature_version}',
+             {keys_array}, {ets}, {ttl}, {desc}, {owner}, {sla}, now())
+        ON CONFLICT (name) DO UPDATE SET
+            entity_keys = EXCLUDED.entity_keys,
+            event_timestamp_column = EXCLUDED.event_timestamp_column,
+            ttl_seconds = EXCLUDED.ttl_seconds,
+            description = EXCLUDED.description,
+            owner = EXCLUDED.owner,
+            freshness_sla_seconds = EXCLUDED.freshness_sla_seconds,
+            last_synced_at = now()
+        """
+    )
+
+
 def get_pipeline(name: str) -> ScheduledPipeline:
     return _REGISTRY[name]
 

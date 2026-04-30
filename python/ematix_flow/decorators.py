@@ -906,6 +906,90 @@ def _transform_arity(fn: Callable[..., Any]) -> int:
 class _EmatixNamespace:
     """The `ematix` import handle. `from ematix_flow import ematix`."""
 
+    def feature_view(
+        self,
+        *,
+        schema: str,
+        feature_version: str,
+        name: str | None = None,
+        event_timestamp_column: str | None = None,
+        ttl: Any = None,  # timedelta | None
+        freshness_sla: Any = None,  # timedelta | None
+        online: bool = False,
+        description: str | None = None,
+        owner: str | None = None,
+    ):
+        """Phase 17: declare a FeatureView (ManagedTable + ML dunders).
+
+        Behaves like `@ematix.table` but also: registers in
+        `pipeline._FEATURE_VIEWS_REGISTRY`, records ML dunders on the
+        class, and signals that `pipeline.sync` should default
+        `mode='scd2'` and inherit `event_timestamp_column` / `ttl` from
+        the class when the user doesn't override.
+        """
+        from datetime import timedelta as _td
+
+        def decorate(cls: type) -> type[ManagedTable]:
+            built = self.table(schema=schema, name=name)(cls)
+
+            # Validate at least one primary key.
+            if not built._primary_keys():
+                raise TypeError(
+                    f"FeatureView {built.__name__} must declare at least one "
+                    "primary key (use `pk()` on the entity-key column)"
+                )
+            # Validate event_timestamp_column references a real column.
+            if event_timestamp_column is not None:
+                cols = {n for n, _ in built._columns()}
+                if event_timestamp_column not in cols:
+                    raise ValueError(
+                        f"event_timestamp_column={event_timestamp_column!r} "
+                        f"is not a declared column on {built.__name__} "
+                        f"(have: {sorted(cols)})"
+                    )
+
+            built.__feature_version__ = feature_version
+            built.__event_timestamp_column__ = event_timestamp_column
+            built.__ttl__ = ttl if isinstance(ttl, _td) or ttl is None else _td(seconds=int(ttl))
+            built.__freshness_sla__ = (
+                freshness_sla
+                if isinstance(freshness_sla, _td) or freshness_sla is None
+                else _td(seconds=int(freshness_sla))
+            )
+            built.__online__ = bool(online)
+            built.__description__ = description
+            built.__owner__ = owner
+            built.__is_feature_view__ = True
+
+            from ematix_flow import pipeline as _p
+
+            entity_keys = built._primary_keys()
+            ttl_seconds = (
+                int(built.__ttl__.total_seconds()) if built.__ttl__ is not None else None
+            )
+            sla_seconds = (
+                int(built.__freshness_sla__.total_seconds())
+                if built.__freshness_sla__ is not None
+                else None
+            )
+            fv = _p.RegisteredFeatureView(
+                schema=schema,
+                tablename=built.__tablename__,
+                feature_version=feature_version,
+                entity_keys=list(entity_keys),
+                event_timestamp_column=event_timestamp_column,
+                ttl_seconds=ttl_seconds,
+                freshness_sla_seconds=sla_seconds,
+                online=bool(online),
+                description=description,
+                owner=owner,
+                cls=built,
+            )
+            _p._FEATURE_VIEWS_REGISTRY[fv.name] = fv
+            return built
+
+        return decorate
+
     @staticmethod
     def transform_ref(name: str) -> TransformRef:
         """Reference a registered transform or pipeline by name.
@@ -1021,6 +1105,20 @@ class _EmatixNamespace:
             raise TypeError("targets=[...] must be a non-empty list")
         if source_table is not None:
             _validate_qualified_table(source_table)
+
+        # Phase 17: FeatureView targets default to mode='scd2' and inherit
+        # event_timestamp_column / ttl from class-level dunders unless
+        # the user overrode them at the decorator level.
+        if target is not None and getattr(target, "__is_feature_view__", False):
+            if mode is None:
+                mode = "scd2"
+            if event_timestamp_column is None:
+                event_timestamp_column = getattr(
+                    target, "__event_timestamp_column__", None
+                )
+            if ttl is None:
+                ttl = getattr(target, "__ttl__", None)
+
         if target is not None and mode is None:
             raise TypeError(
                 "@ematix.pipeline(target=...) requires mode=..."
@@ -1135,6 +1233,16 @@ class _EmatixNamespace:
                         force_path=force_path,
                         ttl=ttl,
                     )
+                    # Phase 17: refresh FeatureView metadata table.
+                    if getattr(target, "__is_feature_view__", False):
+                        try:
+                            _p._upsert_feature_view_metadata_for_target(
+                                target_connection=tgt_conn, target_cls=target
+                            )
+                        except Exception:
+                            # Metadata is best-effort — don't fail the pipeline.
+                            pass
+
                     # Phase 27a/b: post-load transforms.
                     if transforms_post:
                         _run_transforms_post(
