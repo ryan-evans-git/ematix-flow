@@ -567,14 +567,21 @@ def _run_transforms_post(
     pipeline_name: str,
     parent_run_id: str | None,
     continue_on_failure: bool,
+    sync_result: dict[str, Any] | None = None,
 ) -> None:
-    """Phase 27a: run each transforms_post entry in its own transaction.
+    """Phase 27a/b: run each transforms_post entry in its own transaction.
 
-    For SQL strings (Phase 27a only): execute, record outcome row in
-    run_history. Halt on first failure unless continue_on_failure=True.
+    Accepted entry types:
+      - str: SQL string, executed on target_connection.
+      - callable: invoked with (conn,) or (conn, parent) — arity
+        auto-detected (Q3.2 γ). Optional dict return value is recorded
+        as metrics_json (Q3.1 B).
 
-    Function refs and `transform_ref(...)` lookups land in Phases
-    27b/27c.
+    Halts on first failure unless continue_on_failure=True. Each step
+    runs in its own transaction (failure of one doesn't roll back
+    earlier successes).
+
+    `transform_ref(...)` name-based lookups land in Phase 27c.
     """
     if not parent_run_id:
         # Defensive: no run_id means we can't link transforms back to a
@@ -583,6 +590,18 @@ def _run_transforms_post(
 
     target_schema = target_cls.__schema__ if target_cls else ""
     target_table = target_cls.__tablename__ if target_cls else ""
+
+    parent_ctx = None
+    if sync_result is not None:
+        from ematix_flow.pipeline import ParentContext as _PC
+
+        parent_ctx = _PC(
+            pipeline_name=pipeline_name,
+            run_id=parent_run_id,
+            rows_inserted=int(sync_result.get("rows_inserted") or 0),
+            rows_updated=int(sync_result.get("rows_updated") or 0),
+            rows_unchanged=int(sync_result.get("rows_unchanged") or 0),
+        )
 
     for i, step in enumerate(transforms_post):
         if isinstance(step, str):
@@ -612,11 +631,30 @@ def _run_transforms_post(
                 )
                 if not continue_on_failure:
                     raise
+        elif callable(step):
+            from ematix_flow import pipeline as _p
+
+            arity = _transform_arity(step)
+            step_name = f"transform[{i}]:{getattr(step, '__name__', 'callable')}"
+            try:
+                _p._invoke_transform_callable(
+                    fn=step,
+                    arity=arity,
+                    conn=target_connection,
+                    parent=parent_ctx,
+                    pipeline_name=pipeline_name,
+                    step_name=step_name,
+                    target_schema=target_schema,
+                    target_table=target_table,
+                    parent_run_id=parent_run_id,
+                )
+            except Exception:
+                if not continue_on_failure:
+                    raise
         else:
             raise TypeError(
                 f"transforms_post[{i}] is {type(step).__name__}; "
-                "Phase 27a only supports SQL string entries (Phases 27b/27c "
-                "add callables and transform_ref lookups)"
+                "expected SQL string, callable, or transform_ref(...)"
             )
 
 
@@ -737,8 +775,54 @@ def _execute_dry_run(
     return base
 
 
+def _transform_arity(fn: Callable[..., Any]) -> int:
+    """Phase 27 Q3.2 (γ): auto-detect 1- or 2-arg transform callable."""
+    arity = _signature_arity(fn)
+    if arity not in (1, 2):
+        raise TypeError(
+            f"@ematix.transform-decorated function must take 1 (conn) or 2 "
+            f"(conn, parent) arguments; {fn.__name__} takes {arity}"
+        )
+    return arity
+
+
 class _EmatixNamespace:
     """The `ematix` import handle. `from ematix_flow import ematix`."""
+
+    def transform(
+        self,
+        *,
+        name: str | None = None,
+        target_connection: str | None = None,
+        schedule: str | None = None,
+    ):
+        """Phase 27b: register a standalone-runnable post-load transformation.
+
+        Decorated callable takes `(conn,)` or `(conn, parent)`; arity is
+        auto-detected. Registered in `pipeline._TRANSFORMS_REGISTRY` and
+        runnable via `flow transform run <name>` or by referencing the
+        function directly inside `transforms_post=[...]`.
+        """
+
+        def decorate(fn: Callable[..., Any]) -> Callable[..., Any]:
+            from ematix_flow import pipeline as _p
+
+            tname = name or fn.__name__
+            if tname in _p._TRANSFORMS_REGISTRY:
+                raise ValueError(
+                    f"a transform named {tname!r} is already registered"
+                )
+            arity = _transform_arity(fn)
+            _p._TRANSFORMS_REGISTRY[tname] = _p.RegisteredTransform(
+                name=tname,
+                schedule=schedule,
+                target_connection=target_connection,
+                fn=fn,
+                arity=arity,
+            )
+            return fn
+
+        return decorate
 
     @staticmethod
     def target(
@@ -919,7 +1003,7 @@ class _EmatixNamespace:
                         on_drift=on_drift,
                         force_path=force_path,
                     )
-                    # Phase 27a: post-load transforms.
+                    # Phase 27a/b: post-load transforms.
                     if transforms_post:
                         _run_transforms_post(
                             transforms_post=transforms_post,
@@ -928,6 +1012,7 @@ class _EmatixNamespace:
                             pipeline_name=name or fn.__name__,
                             parent_run_id=sync_result.get("run_id"),
                             continue_on_failure=continue_on_failure_post,
+                            sync_result=sync_result,
                         )
                     return sync_result
 

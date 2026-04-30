@@ -351,6 +351,125 @@ class ScheduledPipeline:
 _REGISTRY: dict[str, ScheduledPipeline] = {}
 
 
+@dataclass(frozen=True)
+class RegisteredTransform:
+    """Phase 27b: a `@ematix.transform`-decorated standalone callable."""
+
+    name: str
+    schedule: str | None
+    target_connection: str | None
+    fn: Callable[..., Any]
+    arity: int  # 1 (conn,) or 2 (conn, parent)
+
+
+_TRANSFORMS_REGISTRY: dict[str, RegisteredTransform] = {}
+
+
+@dataclass(frozen=True)
+class ParentContext:
+    """Phase 27b: passed as the second arg to 2-arg transform callables.
+
+    `None` is passed when a transform runs standalone (`flow transform run`,
+    its own scheduled cron) — there is no parent pipeline.
+    """
+
+    pipeline_name: str
+    run_id: str
+    rows_inserted: int
+    rows_updated: int
+    rows_unchanged: int
+
+
+def run_transform(name: str) -> dict[str, Any]:
+    """Run a `@ematix.transform`-decorated callable standalone.
+
+    Resolves the transform's `target_connection` (or default), invokes
+    the function with parent=None, records the outcome in run_history,
+    returns a dict {status, metrics, run_id}.
+    """
+    rt = _TRANSFORMS_REGISTRY.get(name)
+    if rt is None:
+        raise KeyError(name)
+    from ematix_flow import config as _config
+
+    conn = _config.connect(rt.target_connection) if rt.target_connection else _config.connect()
+    return _invoke_transform_callable(
+        fn=rt.fn,
+        arity=rt.arity,
+        conn=conn,
+        parent=None,
+        pipeline_name=name,
+        step_name="standalone",
+        target_schema="",
+        target_table="",
+        parent_run_id=None,
+    )
+
+
+def _invoke_transform_callable(
+    *,
+    fn: Callable[..., Any],
+    arity: int,
+    conn: Any,
+    parent: ParentContext | None,
+    pipeline_name: str,
+    step_name: str,
+    target_schema: str,
+    target_table: str,
+    parent_run_id: str | None,
+) -> dict[str, Any]:
+    """Invoke a transform callable, record the outcome, return a result dict.
+
+    Raises any exception the callable raises *after* recording
+    transform_failed. Caller decides whether to propagate.
+    """
+    import uuid as _uuid
+
+    own_run_id = parent_run_id or str(_uuid.uuid4())
+    try:
+        if arity == 1:
+            ret = fn(conn)
+        else:
+            ret = fn(conn, parent)
+    except Exception as e:
+        if parent_run_id:
+            try:
+                conn.record_transform_history(
+                    parent_run_id,
+                    pipeline_name,
+                    step_name,
+                    "transform_failed",
+                    target_schema,
+                    target_table,
+                    str(e),
+                    None,
+                )
+            except Exception:
+                pass
+        raise
+
+    metrics: dict[str, Any] | None = None
+    if isinstance(ret, dict):
+        metrics = ret
+    metrics_json = json.dumps(metrics) if metrics is not None else None
+    if parent_run_id:
+        conn.record_transform_history(
+            parent_run_id,
+            pipeline_name,
+            step_name,
+            "transform_success",
+            target_schema,
+            target_table,
+            None,
+            metrics_json,
+        )
+    return {
+        "status": "transform_success",
+        "metrics": metrics,
+        "run_id": own_run_id,
+    }
+
+
 def register(
     *, name: str, schedule: str
 ) -> Callable[[Callable[[], dict[str, Any]]], Callable[[], dict[str, Any]]]:
