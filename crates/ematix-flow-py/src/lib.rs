@@ -3,8 +3,10 @@ use std::sync::{Arc, OnceLock};
 use ematix_flow_core::ddl::{self, DriftResult};
 use ematix_flow_core::meta::{DeleteHandling, WatermarkConfig};
 use ematix_flow_core::pg::{self, EnsureOutcome, MergeRunResult, PgPool, Scd2RunResult};
-use ematix_flow_core::strategy::append::augment_with_metadata;
-use ematix_flow_core::strategy::scd2::augment_with_scd2;
+use ematix_flow_core::strategy::append::{augment_with_metadata, plan_same_db_append};
+use ematix_flow_core::strategy::merge::plan_merge_upsert;
+use ematix_flow_core::strategy::scd2::{augment_with_scd2, plan_scd2};
+use ematix_flow_core::strategy::truncate::plan_truncate_replace;
 use ematix_flow_core::types::TableSpec;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
@@ -73,6 +75,66 @@ fn augment_table_spec(spec_json: &str) -> PyResult<String> {
     // Re-normalize to recompute fingerprint with the new columns.
     ematix_flow_core::normalize_table_json(&augmented_json)
         .map_err(|e| PyValueError::new_err(e.to_string()))
+}
+
+/// Phase 25: pure-SQL planners exposed for `preview()`. These don't
+/// touch the database; they synthesize the SQL `pipeline.sync` would
+/// execute. Used by the preview/dry-run rendering path.
+#[pyfunction]
+fn plan_append_sql(spec_json: &str, source_query: &str) -> PyResult<String> {
+    let normalized = ematix_flow_core::normalize_table_json(spec_json)
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    let spec: TableSpec =
+        serde_json::from_str(&normalized).map_err(|e| PyValueError::new_err(e.to_string()))?;
+    Ok(plan_same_db_append(&spec, source_query).sql)
+}
+
+#[pyfunction]
+fn plan_truncate_sql(spec_json: &str, source_query: &str) -> PyResult<Vec<String>> {
+    let normalized = ematix_flow_core::normalize_table_json(spec_json)
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    let spec: TableSpec =
+        serde_json::from_str(&normalized).map_err(|e| PyValueError::new_err(e.to_string()))?;
+    Ok(plan_truncate_replace(&spec, source_query).statements)
+}
+
+#[pyfunction]
+fn plan_merge_sql(
+    spec_json: &str,
+    source_query: &str,
+    keys: Vec<String>,
+    update_columns: Vec<String>,
+) -> PyResult<String> {
+    let normalized = ematix_flow_core::normalize_table_json(spec_json)
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    let spec: TableSpec =
+        serde_json::from_str(&normalized).map_err(|e| PyValueError::new_err(e.to_string()))?;
+    Ok(plan_merge_upsert(&spec, source_query, &keys, &update_columns).sql)
+}
+
+#[pyfunction]
+#[pyo3(signature = (spec_json, source_query, keys, compare_columns, run_token, event_ts_column=None))]
+fn plan_scd2_sql(
+    spec_json: &str,
+    source_query: &str,
+    keys: Vec<String>,
+    compare_columns: Vec<String>,
+    run_token: &str,
+    event_ts_column: Option<&str>,
+) -> PyResult<Vec<String>> {
+    let normalized = ematix_flow_core::normalize_table_json(spec_json)
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    let spec: TableSpec =
+        serde_json::from_str(&normalized).map_err(|e| PyValueError::new_err(e.to_string()))?;
+    Ok(plan_scd2(
+        &spec,
+        source_query,
+        &keys,
+        &compare_columns,
+        run_token,
+        event_ts_column,
+    )
+    .statements)
 }
 
 #[pyfunction]
@@ -516,6 +578,10 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(create_table_sql, m)?)?;
     m.add_function(wrap_pyfunction!(augment_table_spec, m)?)?;
     m.add_function(wrap_pyfunction!(augment_table_spec_scd2, m)?)?;
+    m.add_function(wrap_pyfunction!(plan_append_sql, m)?)?;
+    m.add_function(wrap_pyfunction!(plan_truncate_sql, m)?)?;
+    m.add_function(wrap_pyfunction!(plan_merge_sql, m)?)?;
+    m.add_function(wrap_pyfunction!(plan_scd2_sql, m)?)?;
     m.add_function(wrap_pyfunction!(connect, m)?)?;
     m.add_class::<Connection>()?;
     Ok(())

@@ -28,6 +28,7 @@ classifiers = [
 ]
 dependencies = [
     "croniter>=2.0",
+    "rich>=13",
 ]
 
 [project.urls]

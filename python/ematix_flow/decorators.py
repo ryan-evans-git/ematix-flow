@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import functools
 import inspect
+import json
 import re
 import sys
 import types as _types
@@ -216,6 +217,337 @@ def _synth_source_sql(
         else:
             selects.append(col)
     return f"SELECT {', '.join(selects)} FROM {source_table}"
+
+
+def _connection_info_safe(name: str | None) -> tuple[str | None, dict[str, Any] | None]:
+    """Resolve a named connection's (host, port, dbname, user) tuple
+    without raising when the connection isn't configured. Used by
+    preview() so unconfigured connections don't block plan rendering.
+    """
+    if name is None:
+        return None, None
+    try:
+        conn = _resolve_named_connection(name)
+        return name, conn.connection_info()
+    except Exception:
+        return name, None
+
+
+def _resolve_keys_with_reason(
+    target_cls: type[ManagedTable], passed: tuple[str, ...] | None, mode: str
+) -> tuple[list[str], str]:
+    """Mirror pipeline._resolve_merge_keys but also report the reason."""
+    if passed:
+        return list(passed), "from explicit keys="
+    dunder = getattr(target_cls, "__merge_keys__", None)
+    if dunder:
+        return list(dunder), "from __merge_keys__"
+    uniques = getattr(target_cls, "__unique_constraints__", ())
+    if uniques:
+        return list(uniques[0]), "from natural_key() / __unique_constraints__"
+    pks = target_cls._primary_keys()
+    return list(pks), "from primary_key=True"
+
+
+def _build_preview(
+    *,
+    fn: Callable[..., Any],
+    arity: int,
+    is_async: bool,
+    target: type[ManagedTable] | None,
+    targets: list[Any] | None,
+    mode: str | None,
+    name: str,
+    schedule: str | None,
+    source_connection: str | None,
+    target_connection: str | None,
+    source_table: str | None,
+    column_map: dict[str, str] | None,
+    keys: tuple[str, ...] | None,
+    update_columns: tuple[str, ...] | None,
+    compare_columns: tuple[str, ...] | None,
+    event_timestamp_column: str | None,
+    handle_deletes: str | None,
+    dry_run: bool,
+) -> Any:
+    """Phase 25: synthesize the plan a pipeline would execute.
+
+    For preview (dry_run=False): no DB calls. Connections are resolved
+    only to fetch their info; if a connection is missing, we render the
+    plan with a placeholder note instead of failing.
+
+    For dry_run (dry_run=True): not implemented in this commit; raises
+    NotImplementedError for now (lands in the Phase 25 dry_run commit).
+    """
+    from ematix_flow import _core, pipeline as _p
+    from ematix_flow.preview import PreviewResult, TargetPlan
+
+    if dry_run:
+        return _execute_dry_run(
+            fn=fn,
+            arity=arity,
+            is_async=is_async,
+            target=target,
+            targets=targets,
+            mode=mode,
+            name=name,
+            schedule=schedule,
+            source_connection=source_connection,
+            target_connection=target_connection,
+            source_table=source_table,
+            column_map=column_map,
+            keys=keys,
+            update_columns=update_columns,
+            compare_columns=compare_columns,
+            event_timestamp_column=event_timestamp_column,
+            handle_deletes=handle_deletes,
+        )
+
+    notes: list[str] = []
+
+    src_name, src_info = _connection_info_safe(source_connection)
+    tgt_name, tgt_info = _connection_info_safe(target_connection)
+    if source_connection and src_info is None:
+        notes.append(
+            f"source connection {source_connection!r} not currently configured"
+        )
+    if target_connection and tgt_info is None:
+        notes.append(
+            f"target connection {target_connection!r} not currently configured"
+        )
+
+    # Build the source SQL without invoking a real connection.
+    source_sql: str
+    if source_table is not None and arity == 0:
+        # source_table-only path: synthesize SELECT directly.
+        target_columns = (
+            _target_user_columns(target) if target is not None else None
+        )
+        if target_columns is None:
+            source_sql = f"SELECT * FROM {source_table}"
+        else:
+            source_sql = _synth_source_sql(source_table, target_columns, column_map)
+    else:
+        # Function-body path: call the user's function with placeholder
+        # connections. We pass simple sentinels — the function should
+        # only use them to return SQL strings; actual queries happen at
+        # sync time.
+        try:
+            placeholder = _PreviewConn()
+            if arity == 0:
+                ret = fn()
+            elif arity == 1:
+                ret = fn(placeholder)
+            else:
+                ret = fn(placeholder, placeholder)
+            if is_async:
+                import asyncio as _aio
+
+                ret = _aio.run(ret)
+            if isinstance(ret, str):
+                source_sql = ret
+            elif ret is None and source_table is not None:
+                target_columns = (
+                    _target_user_columns(target) if target is not None else None
+                )
+                source_sql = (
+                    _synth_source_sql(source_table, target_columns or [], column_map)
+                    if target_columns is not None
+                    else f"SELECT * FROM {source_table}"
+                )
+            else:
+                source_sql = str(ret) if ret is not None else "-- (no source query)"
+                notes.append(
+                    "function returned a non-string; preview shows the source as-is"
+                )
+        except Exception as e:
+            source_sql = "-- (could not invoke function for preview)"
+            notes.append(f"function call failed during preview: {e}")
+
+    # Per-target plan synthesis.
+    target_plans: list[TargetPlan] = []
+    if target is not None:
+        target_plans.append(
+            _plan_one_target(
+                target_cls=target,
+                mode=mode or "merge",
+                source_sql=source_sql,
+                target_connection_name=target_connection,
+                target_connection_info=tgt_info,
+                keys=keys,
+                update_columns=update_columns,
+                compare_columns=compare_columns,
+                event_timestamp_column=event_timestamp_column,
+                column_map=column_map,
+                source_connection=source_connection,
+            )
+        )
+    elif targets is not None:
+        for t in targets:
+            per_tgt_name = t.target_connection or target_connection
+            _, per_tgt_info = _connection_info_safe(per_tgt_name)
+            target_plans.append(
+                _plan_one_target(
+                    target_cls=t.target_class,
+                    mode=t.mode,
+                    source_sql=source_sql,
+                    target_connection_name=per_tgt_name,
+                    target_connection_info=per_tgt_info,
+                    keys=t.keys,
+                    update_columns=t.update_columns,
+                    compare_columns=t.compare_columns,
+                    event_timestamp_column=t.event_timestamp_column,
+                    column_map=t.column_map,
+                    source_connection=source_connection,
+                )
+            )
+
+    return PreviewResult(
+        pipeline_name=name,
+        schedule=schedule,
+        mode=mode,
+        source_connection_name=src_name,
+        source_connection_info=src_info,
+        source_sql=source_sql,
+        targets=target_plans,
+        is_dry_run=False,
+        notes=notes,
+    )
+
+
+class _PreviewConn:
+    """Placeholder connection used during preview. The user's pipeline
+    function receives this when constructing the source SQL; if they
+    actually call methods on it, we surface a clear error.
+    """
+
+    def __getattr__(self, name: str) -> Any:
+        raise RuntimeError(
+            f"preview/dry_run cannot use Connection.{name} — pipeline functions "
+            "should return a SQL string or Source without making DB calls "
+            "themselves; for queries that need live data, use a function-body "
+            "source SQL"
+        )
+
+    def connection_info(self) -> dict[str, Any]:
+        return {"host": "?", "port": 0, "dbname": "?", "user": "?"}
+
+
+def _plan_one_target(
+    *,
+    target_cls: type[ManagedTable],
+    mode: str,
+    source_sql: str,
+    target_connection_name: str | None,
+    target_connection_info: dict[str, Any] | None,
+    keys: tuple[str, ...] | None,
+    update_columns: tuple[str, ...] | None,
+    compare_columns: tuple[str, ...] | None,
+    event_timestamp_column: str | None,
+    column_map: dict[str, str] | None,
+    source_connection: str | None,
+) -> Any:
+    from ematix_flow import _core
+    from ematix_flow.preview import TargetPlan
+
+    # Augment the spec the way pipeline.sync would.
+    if mode == "scd2":
+        augmented_json = _core.augment_table_spec_scd2(
+            json.dumps(target_cls._to_spec())
+        )
+    else:
+        augmented_json = _core.augment_table_spec(json.dumps(target_cls._to_spec()))
+    augmented = json.loads(augmented_json)
+
+    declared = [name for name, _ in target_cls._columns()]
+    augmented_columns = augmented["columns"]
+
+    resolved_keys, keys_reason = _resolve_keys_with_reason(target_cls, keys, mode)
+
+    compare_resolved: list[str] = []
+    compare_reason = ""
+    if mode == "scd2":
+        if compare_columns is not None:
+            compare_resolved = list(compare_columns)
+            compare_reason = "from explicit compare_columns="
+        else:
+            compare_resolved = [
+                c
+                for c in declared
+                if c not in resolved_keys
+                and c not in ("_loaded_at", "_batch_id", "valid_from", "valid_to", "is_current", "row_hash")
+            ]
+            compare_reason = "auto-derived (non-key non-metadata)"
+    elif mode in ("merge", "scd1"):
+        if update_columns is not None:
+            compare_resolved = list(update_columns)
+            compare_reason = "from explicit update_columns="
+        else:
+            compare_resolved = [
+                c for c in declared if c not in resolved_keys and c not in ("_loaded_at", "_batch_id")
+            ]
+            compare_reason = "auto-derived (non-key non-metadata)"
+
+    # Path decision: if source_connection != target_connection, cross-DB.
+    if source_connection is not None and source_connection != target_connection_name:
+        path = "cross_db"
+        path_reason = f"source connection {source_connection!r} != target {target_connection_name!r}"
+    else:
+        path = "same_db"
+        path_reason = "source and target use the same connection"
+
+    # SQL plan.
+    plan_sql: list[str] = []
+    plan_label = ""
+    if mode == "append":
+        plan_sql = [_core.plan_append_sql(augmented_json, source_sql)]
+        plan_label = "INSERT...SELECT"
+    elif mode == "truncate":
+        plan_sql = list(_core.plan_truncate_sql(augmented_json, source_sql))
+        plan_label = "TRUNCATE + INSERT"
+    elif mode in ("merge", "scd1"):
+        plan_sql = [
+            _core.plan_merge_sql(
+                augmented_json, source_sql, resolved_keys, compare_resolved
+            )
+        ]
+        plan_label = "ON CONFLICT upsert"
+    elif mode == "scd2":
+        plan_sql = list(
+            _core.plan_scd2_sql(
+                augmented_json,
+                source_sql,
+                resolved_keys,
+                compare_resolved,
+                "preview_token",
+                event_timestamp_column,
+            )
+        )
+        plan_label = "SCD2 (CREATE TEMP / UPDATE / INSERT)"
+
+    return TargetPlan(
+        schema_qualified_name=f"{target_cls.__schema__}.{target_cls.__tablename__}",
+        mode=mode,
+        path=path,
+        path_reason=path_reason,
+        augmented_columns=augmented_columns,
+        declared_columns=declared,
+        merge_keys=resolved_keys,
+        merge_keys_reason=keys_reason,
+        compare_columns=compare_resolved,
+        compare_columns_reason=compare_reason,
+        target_connection_name=target_connection_name,
+        target_connection_info=target_connection_info,
+        plan_sql=plan_sql,
+        plan_sql_label=plan_label,
+    )
+
+
+def _execute_dry_run(**kwargs: Any) -> Any:
+    """Phase 25b: execute the pipeline plan inside a transaction and
+    rollback at the end. Lands in the dry_run commit.
+    """
+    raise NotImplementedError("dry_run is implemented in the next Phase 25 commit")
 
 
 class _EmatixNamespace:
@@ -428,6 +760,36 @@ class _EmatixNamespace:
                 return results
 
             wrapped.__wrapped__ = fn  # type: ignore[attr-defined]
+
+            # Phase 25: hook for preview / dry-run rendering. Captures the
+            # decoration-time configuration so pipeline.preview(name) can
+            # synthesize the plan without re-running the user's function
+            # against a real connection (or running it and rolling back).
+            def _preview(*, dry_run: bool = False) -> Any:
+                return _build_preview(
+                    fn=fn,
+                    arity=arity,
+                    is_async=is_async,
+                    target=target,
+                    targets=targets,
+                    mode=mode,
+                    name=name or fn.__name__,
+                    schedule=schedule,
+                    source_connection=source_connection,
+                    target_connection=target_connection,
+                    source_table=source_table,
+                    column_map=column_map,
+                    keys=keys,
+                    update_columns=update_columns,
+                    compare_columns=compare_columns,
+                    event_timestamp_column=event_timestamp_column,
+                    handle_deletes=handle_deletes,
+                    dry_run=dry_run,
+                )
+
+            wrapped._preview = _preview  # type: ignore[attr-defined]
+            wrapped.preview = lambda: _preview(dry_run=False)  # type: ignore[attr-defined]
+            wrapped.dry_run = lambda: _preview(dry_run=True)  # type: ignore[attr-defined]
 
             # Register with the Phase 12 scheduling registry.
             from ematix_flow import pipeline as _p

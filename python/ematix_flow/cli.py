@@ -94,6 +94,49 @@ def _cmd_connections_check(args: argparse.Namespace) -> int:
     return 2
 
 
+def _cmd_preview(args: argparse.Namespace) -> int:
+    _import_user_module(args.module)
+    try:
+        result = p.preview(args.name)
+    except KeyError:
+        print(f"error: no pipeline named {args.name!r}", file=sys.stderr)
+        return 2
+    except TypeError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+    if args.format == "json":
+        print(result.to_json())
+        return 0
+    from ematix_flow.preview import render_text
+
+    use_color = not args.no_color
+    print(render_text(result, verbose=args.verbose, use_color=use_color))
+    return 0
+
+
+def _cmd_dry_run(args: argparse.Namespace) -> int:
+    _import_user_module(args.module)
+    try:
+        result = p.dry_run(args.name)
+    except KeyError:
+        print(f"error: no pipeline named {args.name!r}", file=sys.stderr)
+        return 2
+    except TypeError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+    except NotImplementedError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+    if args.format == "json":
+        print(result.to_json())
+        return 0
+    from ematix_flow.preview import render_text
+
+    use_color = not args.no_color
+    print(render_text(result, verbose=args.verbose, use_color=use_color))
+    return 0
+
+
 def _cmd_connections_set(args: argparse.Namespace) -> int:
     if "=" not in args.assignment:
         print(
@@ -143,6 +186,29 @@ def main(argv: list[str] | None = None) -> int:
         "you invoke `flow run-due`",
     )
     due_p.set_defaults(func=_cmd_run_due)
+
+    # `flow preview / dry-run` subcommands (Phase 25).
+    preview_p = sub.add_parser(
+        "preview",
+        help="show what a pipeline would do without committing",
+    )
+    preview_p.add_argument("name", help="pipeline name (matches @ematix.pipeline name=)")
+    preview_p.add_argument("--module", required=True)
+    preview_p.add_argument("-v", "--verbose", action="store_true")
+    preview_p.add_argument("--format", choices=["text", "json"], default="text")
+    preview_p.add_argument("--no-color", action="store_true")
+    preview_p.set_defaults(func=_cmd_preview)
+
+    dry_p = sub.add_parser(
+        "dry-run",
+        help="execute the pipeline inside a transaction and ROLLBACK at end",
+    )
+    dry_p.add_argument("name", help="pipeline name (matches @ematix.pipeline name=)")
+    dry_p.add_argument("--module", required=True)
+    dry_p.add_argument("-v", "--verbose", action="store_true")
+    dry_p.add_argument("--format", choices=["text", "json"], default="text")
+    dry_p.add_argument("--no-color", action="store_true")
+    dry_p.set_defaults(func=_cmd_dry_run)
 
     # `flow connections {list,check,set}` subcommands (Phase 21).
     conn_p = sub.add_parser("connections", help="manage named DB connections")

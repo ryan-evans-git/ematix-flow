@@ -390,3 +390,39 @@ def is_due(schedule: str, now: datetime, interval_seconds: int) -> bool:
     except Exception as e:
         raise ValueError(f"invalid cron expression {schedule!r}: {e}") from e
     return base < next_fire <= now
+
+
+# --- Phase 25: preview / dry-run --------------------------------------------
+
+
+def preview(name: str, *, dry_run: bool = False) -> Any:
+    """Inspect what a registered pipeline would do without committing.
+
+    Returns a `PreviewResult` (or a `DryRunResult` when `dry_run=True`).
+    The returned value carries the resolved connections, augmented target
+    spec, resolved merge / compare keys with the reasons they were picked,
+    and the SQL the strategy would execute.
+
+    With `dry_run=True`, also runs the strategy inside a transaction and
+    rolls back at the end so the caller sees row counts that *would* have
+    been affected. Run-history side effects are skipped.
+    """
+    sp = _REGISTRY.get(name)
+    if sp is None:
+        raise KeyError(name)
+    fn = sp.fn
+    # The wrapper installed by @ematix.pipeline carries a `_preview` hook
+    # that knows the decorator-time configuration. Plain @register-only
+    # pipelines don't support preview.
+    hook = getattr(fn, "_preview", None)
+    if hook is None:
+        raise TypeError(
+            f"pipeline {name!r} was not built with @ematix.pipeline; preview "
+            "and dry_run are only supported for decorator-built pipelines"
+        )
+    return hook(dry_run=dry_run)
+
+
+def dry_run(name: str) -> Any:
+    """Convenience: `preview(name, dry_run=True)`."""
+    return preview(name, dry_run=True)
