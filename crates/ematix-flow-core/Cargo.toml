@@ -1,0 +1,15 @@
+[package]
+name = "ematix-flow-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Rust core for ematix-flow: declarative table management and load strategies for Postgres."
+
+[lib]
+name = "ematix_flow_core"
+
+[dependencies]
+# Phase 3 will add tokio-postgres, deadpool-postgres, serde, etc.

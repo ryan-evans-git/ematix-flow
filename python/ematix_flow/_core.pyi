@@ -1,0 +1,3 @@
+"""Type stubs for the Rust extension module `ematix_flow._core`."""
+
+def core_version() -> str: ...

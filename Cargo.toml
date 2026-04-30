@@ -1,0 +1,22 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/ematix-flow-core",
+    "crates/ematix-flow-py",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "Apache-2.0"
+repository = "https://github.com/ryan-evans-git/ematix-flow"
+authors = ["Ryan Evans <ryanevans23@gmail.com>"]
+
+[workspace.dependencies]
+ematix-flow-core = { path = "crates/ematix-flow-core" }
+pyo3 = { version = "0.28", features = ["extension-module"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

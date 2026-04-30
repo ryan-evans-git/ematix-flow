@@ -1,0 +1,68 @@
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "ematix-flow"
+version = "0.1.0"
+description = "Declarative table management and load strategies (SCD1/SCD2/append/merge) for Postgres, with a Rust core."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [
+    { name = "Ryan Evans", email = "ryanevans23@gmail.com" },
+]
+keywords = ["data-engineering", "etl", "elt", "scd", "postgres", "data-pipeline"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Rust",
+    "Topic :: Database",
+    "Topic :: Software Development :: Libraries",
+]
+
+[project.urls]
+Repository = "https://github.com/ryan-evans-git/ematix-flow"
+Documentation = "https://github.com/ryan-evans-git/ematix-flow#readme"
+Issues = "https://github.com/ryan-evans-git/ematix-flow/issues"
+
+[project.scripts]
+flow = "ematix_flow.cli:main"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "testcontainers[postgres]>=4.0",
+    "ruff>=0.5",
+    "mypy>=1.10",
+    "maturin>=1.7",
+]
+
+[tool.maturin]
+manifest-path = "crates/ematix-flow-py/Cargo.toml"
+module-name = "ematix_flow._core"
+python-source = "python"
+features = ["pyo3/extension-module"]
+strip = true
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+src = ["python", "tests/python"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests/python"]
+markers = [
+    "integration: requires a live Postgres (slow, opt-in)",
+]
+addopts = "-ra --strict-markers -m 'not integration'"

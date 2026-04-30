@@ -1,0 +1,14 @@
+# Allow PyO3 extension-module crates to link with unresolved Python symbols
+# on macOS. The Python interpreter provides these at module-load time.
+
+[target.aarch64-apple-darwin]
+rustflags = [
+    "-C", "link-arg=-undefined",
+    "-C", "link-arg=dynamic_lookup",
+]
+
+[target.x86_64-apple-darwin]
+rustflags = [
+    "-C", "link-arg=-undefined",
+    "-C", "link-arg=dynamic_lookup",
+]
