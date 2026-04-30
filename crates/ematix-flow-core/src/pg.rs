@@ -555,19 +555,27 @@ impl PgPool {
     /// Same-DB AppendOnly executor: target spec already augmented with
     /// metadata columns and ensured to exist. `watermark` (if any) filters
     /// the source and gets advanced atomically inside the load transaction
-    /// after a successful INSERT.
+    /// after a successful INSERT. With `dry_run = true`, the transaction
+    /// is rolled back at the end and run_history side effects are skipped;
+    /// row counts are still returned.
+    #[allow(clippy::too_many_arguments)]
     pub async fn run_append_same_db(
         &self,
         target_spec: &TableSpec,
         source_query: &str,
         pipeline_name: &str,
         watermark: Option<&WatermarkConfig>,
+        dry_run: bool,
     ) -> Result<AppendRunResult, PgError> {
-        self.ensure_meta_schema().await?;
+        if !dry_run {
+            self.ensure_meta_schema().await?;
+        }
         let run_id = Uuid::new_v4();
         let batch_id = run_id;
-        self.insert_history_start(run_id, pipeline_name, target_spec, "append", "same_db")
-            .await?;
+        if !dry_run {
+            self.insert_history_start(run_id, pipeline_name, target_spec, "append", "same_db")
+                .await?;
+        }
 
         let filtered_source = wrap_with_watermark_filter(source_query, watermark);
         let plan = plan_same_db_append(target_spec, &filtered_source);
@@ -583,28 +591,34 @@ impl PgPool {
             } else {
                 tx.execute(&plan.sql, &[]).await?
             };
-            // Advance the watermark inside the same transaction so a failure
-            // here rolls back the INSERT, and a commit promotes both atomically.
             if let Some(wc) = watermark {
                 advance_watermark(&tx, target_spec, &batch_id, pipeline_name, wc).await?;
             }
-            tx.commit().await?;
+            if dry_run {
+                tx.rollback().await?;
+            } else {
+                tx.commit().await?;
+            }
             Ok(rows as i64)
         }
         .await;
 
         match result {
             Ok(rows_inserted) => {
-                self.finish_history_success(run_id, rows_inserted).await?;
+                if !dry_run {
+                    self.finish_history_success(run_id, rows_inserted).await?;
+                }
                 Ok(AppendRunResult {
                     run_id: run_id.to_string(),
                     rows_inserted,
-                    status: "success".into(),
+                    status: if dry_run { "dry_run" } else { "success" }.into(),
                     path: "same_db".into(),
                 })
             }
             Err(err) => {
-                let _ = self.finish_history_failure(run_id, &err.to_string()).await;
+                if !dry_run {
+                    let _ = self.finish_history_failure(run_id, &err.to_string()).await;
+                }
                 Err(err)
             }
         }
@@ -723,18 +737,24 @@ impl PgPool {
 
     /// Same-DB TruncateReplace executor: TRUNCATE then INSERT...SELECT in
     /// a single transaction so the target's pre-load contents survive on
-    /// failure.
+    /// failure. With `dry_run = true`, ROLLBACK at end and skip
+    /// run_history side effects.
     pub async fn run_truncate_same_db(
         &self,
         target_spec: &TableSpec,
         source_query: &str,
         pipeline_name: &str,
+        dry_run: bool,
     ) -> Result<AppendRunResult, PgError> {
-        self.ensure_meta_schema().await?;
+        if !dry_run {
+            self.ensure_meta_schema().await?;
+        }
         let run_id = Uuid::new_v4();
         let batch_id = run_id;
-        self.insert_history_start(run_id, pipeline_name, target_spec, "truncate", "same_db")
-            .await?;
+        if !dry_run {
+            self.insert_history_start(run_id, pipeline_name, target_spec, "truncate", "same_db")
+                .await?;
+        }
 
         let plan = plan_truncate_replace(target_spec, source_query);
         let result: Result<i64, PgError> = async {
@@ -751,23 +771,31 @@ impl PgPool {
             } else {
                 tx.execute(&plan.statements[1], &[]).await?
             };
-            tx.commit().await?;
+            if dry_run {
+                tx.rollback().await?;
+            } else {
+                tx.commit().await?;
+            }
             Ok(rows as i64)
         }
         .await;
 
         match result {
             Ok(rows_inserted) => {
-                self.finish_history_success(run_id, rows_inserted).await?;
+                if !dry_run {
+                    self.finish_history_success(run_id, rows_inserted).await?;
+                }
                 Ok(AppendRunResult {
                     run_id: run_id.to_string(),
                     rows_inserted,
-                    status: "success".into(),
+                    status: if dry_run { "dry_run" } else { "success" }.into(),
                     path: "same_db".into(),
                 })
             }
             Err(err) => {
-                let _ = self.finish_history_failure(run_id, &err.to_string()).await;
+                if !dry_run {
+                    let _ = self.finish_history_failure(run_id, &err.to_string()).await;
+                }
                 Err(err)
             }
         }
@@ -873,7 +901,8 @@ impl PgPool {
     /// user requested ("merge" or "scd1") and is recorded in run_history.
     /// With `delete_handling = Some(Hard)`, a DELETE post-step removes
     /// target rows whose keys are missing from the source — atomically
-    /// with the upsert.
+    /// with the upsert. With `dry_run = true`, ROLLBACK at end and skip
+    /// run_history side effects.
     #[allow(clippy::too_many_arguments)]
     pub async fn run_merge_same_db(
         &self,
@@ -884,12 +913,17 @@ impl PgPool {
         pipeline_name: &str,
         mode_label: &str,
         delete_handling: Option<DeleteHandling>,
+        dry_run: bool,
     ) -> Result<MergeRunResult, PgError> {
-        self.ensure_meta_schema().await?;
+        if !dry_run {
+            self.ensure_meta_schema().await?;
+        }
         let run_id = Uuid::new_v4();
         let batch_id = run_id;
-        self.insert_history_start(run_id, pipeline_name, target_spec, mode_label, "same_db")
-            .await?;
+        if !dry_run {
+            self.insert_history_start(run_id, pipeline_name, target_spec, mode_label, "same_db")
+                .await?;
+        }
 
         let plan = plan_merge_upsert(target_spec, source_query, keys, update_columns);
         let result: Result<(i64, i64, i64), PgError> = async {
@@ -916,7 +950,11 @@ impl PgPool {
                 );
                 tx.batch_execute(&delete_sql).await?;
             }
-            tx.commit().await?;
+            if dry_run {
+                tx.rollback().await?;
+            } else {
+                tx.commit().await?;
+            }
             let unchanged = total - inserted - updated;
             Ok((inserted, updated, unchanged))
         }
@@ -924,19 +962,23 @@ impl PgPool {
 
         match result {
             Ok((inserted, updated, unchanged)) => {
-                self.finish_history_success_merge(run_id, inserted, updated, unchanged)
-                    .await?;
+                if !dry_run {
+                    self.finish_history_success_merge(run_id, inserted, updated, unchanged)
+                        .await?;
+                }
                 Ok(MergeRunResult {
                     run_id: run_id.to_string(),
                     rows_inserted: inserted,
                     rows_updated: updated,
                     rows_unchanged: unchanged,
-                    status: "success".into(),
+                    status: if dry_run { "dry_run" } else { "success" }.into(),
                     path: "same_db".into(),
                 })
             }
             Err(err) => {
-                let _ = self.finish_history_failure(run_id, &err.to_string()).await;
+                if !dry_run {
+                    let _ = self.finish_history_failure(run_id, &err.to_string()).await;
+                }
                 Err(err)
             }
         }
@@ -978,14 +1020,19 @@ impl PgPool {
         pipeline_name: &str,
         delete_handling: Option<DeleteHandling>,
         event_ts_column: Option<&str>,
+        dry_run: bool,
     ) -> Result<Scd2RunResult, PgError> {
-        self.ensure_meta_schema().await?;
+        if !dry_run {
+            self.ensure_meta_schema().await?;
+        }
         self.ensure_pgcrypto().await?;
         let run_id = Uuid::new_v4();
         let batch_id = run_id;
         let run_token = run_id.simple().to_string();
-        self.insert_history_start(run_id, pipeline_name, target_spec, "scd2", "same_db")
-            .await?;
+        if !dry_run {
+            self.insert_history_start(run_id, pipeline_name, target_spec, "scd2", "same_db")
+                .await?;
+        }
 
         let plan = plan_scd2(
             target_spec,
@@ -1034,7 +1081,11 @@ impl PgPool {
             } else {
                 0
             };
-            tx.commit().await?;
+            if dry_run {
+                tx.rollback().await?;
+            } else {
+                tx.commit().await?;
+            }
             Ok((inserted, closed_changed + closed_missing))
         }
         .await;
@@ -1043,18 +1094,22 @@ impl PgPool {
             Ok((inserted, closed)) => {
                 // rows_unchanged not meaningful here without a separate
                 // count; record updated=closed for run_history symmetry.
-                self.finish_history_success_merge(run_id, inserted, closed, 0)
-                    .await?;
+                if !dry_run {
+                    self.finish_history_success_merge(run_id, inserted, closed, 0)
+                        .await?;
+                }
                 Ok(Scd2RunResult {
                     run_id: run_id.to_string(),
                     rows_inserted: inserted,
                     rows_closed: closed,
-                    status: "success".into(),
+                    status: if dry_run { "dry_run" } else { "success" }.into(),
                     path: "same_db".into(),
                 })
             }
             Err(err) => {
-                let _ = self.finish_history_failure(run_id, &err.to_string()).await;
+                if !dry_run {
+                    let _ = self.finish_history_failure(run_id, &err.to_string()).await;
+                }
                 Err(err)
             }
         }

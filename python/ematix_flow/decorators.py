@@ -543,11 +543,119 @@ def _plan_one_target(
     )
 
 
-def _execute_dry_run(**kwargs: Any) -> Any:
+def _execute_dry_run(
+    *,
+    fn: Callable[..., Any],
+    arity: int,
+    is_async: bool,
+    target: type[ManagedTable] | None,
+    targets: list[Any] | None,
+    mode: str | None,
+    name: str,
+    schedule: str | None,
+    source_connection: str | None,
+    target_connection: str | None,
+    source_table: str | None,
+    column_map: dict[str, str] | None,
+    keys: tuple[str, ...] | None,
+    update_columns: tuple[str, ...] | None,
+    compare_columns: tuple[str, ...] | None,
+    event_timestamp_column: str | None,
+    handle_deletes: str | None,
+) -> Any:
     """Phase 25b: execute the pipeline plan inside a transaction and
-    rollback at the end. Lands in the dry_run commit.
+    rollback at the end. Returns a PreviewResult with `is_dry_run=True`
+    and per-target `dry_run_rows_affected` populated.
+
+    Builds the same plan as preview, then dispatches through pipeline.sync
+    with `dry_run=True` for each target. Always continues through every
+    target regardless of `continue_on_failure` so one bad target doesn't
+    suppress others' errors (matches the locked plan §3.5).
     """
-    raise NotImplementedError("dry_run is implemented in the next Phase 25 commit")
+    from ematix_flow import pipeline as _p
+    from ematix_flow.preview import PreviewResult
+    from ematix_flow.source import Source as _Source
+
+    # Start from the standard preview plan.
+    base = _build_preview(
+        fn=fn,
+        arity=arity,
+        is_async=is_async,
+        target=target,
+        targets=targets,
+        mode=mode,
+        name=name,
+        schedule=schedule,
+        source_connection=source_connection,
+        target_connection=target_connection,
+        source_table=source_table,
+        column_map=column_map,
+        keys=keys,
+        update_columns=update_columns,
+        compare_columns=compare_columns,
+        event_timestamp_column=event_timestamp_column,
+        handle_deletes=handle_deletes,
+        dry_run=False,  # building the metadata only
+    )
+    base.is_dry_run = True
+
+    # Resolve the real connection (we'll actually run SQL through it).
+    tgt_conn = _resolve_named_connection(target_connection)
+
+    # Run the strategy with dry_run=True for each target.
+    if target is not None:
+        try:
+            source_obj = _Source.postgres_query(tgt_conn, base.source_sql)
+            counts = _p.sync(
+                target=target,
+                source=source_obj,
+                target_connection=tgt_conn,
+                mode=mode,  # type: ignore[arg-type]
+                pipeline_name=name,
+                keys=keys,
+                update_columns=update_columns,
+                compare_columns=compare_columns,
+                event_timestamp_column=event_timestamp_column,
+                handle_deletes=handle_deletes,
+                dry_run=True,
+            )
+            tp = base.targets[0]
+            for k in ("rows_inserted", "rows_updated", "rows_unchanged", "rows_closed"):
+                if k in counts and isinstance(counts[k], int):
+                    tp.dry_run_rows_affected[k] = counts[k]
+        except Exception as e:
+            base.targets[0].dry_run_error = str(e)
+    elif targets is not None:
+        for i, t in enumerate(targets):
+            tp = base.targets[i]
+            try:
+                per_tgt_conn = (
+                    _resolve_named_connection(t.target_connection)
+                    if t.target_connection
+                    else tgt_conn
+                )
+                source_obj = _Source.postgres_query(per_tgt_conn, base.source_sql)
+                counts = _p.sync(
+                    target=t.target_class,
+                    source=source_obj,
+                    target_connection=per_tgt_conn,
+                    mode=t.mode,  # type: ignore[arg-type]
+                    pipeline_name=f"{name}::{t.target_class.__schema__}.{t.target_class.__tablename__}",
+                    keys=t.keys,
+                    update_columns=t.update_columns,
+                    compare_columns=t.compare_columns,
+                    event_timestamp_column=t.event_timestamp_column,
+                    handle_deletes=t.handle_deletes,
+                    dry_run=True,
+                )
+                for k in ("rows_inserted", "rows_updated", "rows_unchanged", "rows_closed"):
+                    if k in counts and isinstance(counts[k], int):
+                        tp.dry_run_rows_affected[k] = counts[k]
+            except Exception as e:
+                tp.dry_run_error = str(e)
+                # Always continue through every target (locked plan).
+
+    return base
 
 
 class _EmatixNamespace:

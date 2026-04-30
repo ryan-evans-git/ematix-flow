@@ -179,6 +179,7 @@ def sync(
     incremental_column: str | None = None,
     handle_deletes: str | None = None,
     event_timestamp_column: str | None = None,
+    dry_run: bool = False,
 ) -> dict[str, Any]:
     """Execute a load. Phases 5–8 support 'append', 'truncate', 'merge'/'scd1', 'scd2'.
 
@@ -234,6 +235,9 @@ def sync(
     else:
         augmented_json = _core.augment_table_spec(json.dumps(target._to_spec()))
 
+    # ensure_table is idempotent; safe to call in dry_run too. The DDL
+    # side effect of creating an empty target on first run is benign and
+    # lets dry_run work against a freshly-cloned database.
     target_connection.ensure_table(augmented_json, on_drift)
 
     if force_path == "same_db":
@@ -260,9 +264,12 @@ def sync(
             src_arg,
             incremental_column,
             last_literal,
+            dry_run,
         )
     if mode == "truncate":
-        return target_connection.run_truncate(augmented_json, source.query, name, src_arg)
+        return target_connection.run_truncate(
+            augmented_json, source.query, name, src_arg, dry_run
+        )
 
     if mode == "scd2":
         resolved_keys = _resolve_merge_keys(
@@ -297,6 +304,7 @@ def sync(
             src_arg,
             handle_deletes,
             event_timestamp_column,
+            dry_run,
         )
 
     # merge / scd1
@@ -324,6 +332,7 @@ def sync(
         mode,
         src_arg,
         handle_deletes,
+        dry_run,
     )
 
 

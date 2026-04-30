@@ -197,7 +197,7 @@ impl Connection {
     /// `valid_from` comes from that column; out-of-order arrivals are
     /// rejected with an error.
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (target_spec_json, source_query, pipeline_name, keys, compare_columns, source=None, handle_deletes=None, event_timestamp_column=None))]
+    #[pyo3(signature = (target_spec_json, source_query, pipeline_name, keys, compare_columns, source=None, handle_deletes=None, event_timestamp_column=None, dry_run=false))]
     fn run_scd2<'py>(
         &self,
         py: Python<'py>,
@@ -209,7 +209,13 @@ impl Connection {
         source: Option<&Connection>,
         handle_deletes: Option<&str>,
         event_timestamp_column: Option<String>,
+        dry_run: bool,
     ) -> PyResult<Bound<'py, PyDict>> {
+        if dry_run && source.is_some() {
+            return Err(PyValueError::new_err(
+                "dry_run is supported for same-DB only in v0.1; cross-DB dry_run lands later",
+            ));
+        }
         if keys.is_empty() {
             return Err(PyValueError::new_err("scd2 requires at least one key"));
         }
@@ -249,6 +255,7 @@ impl Connection {
                                     &pipeline_name,
                                     delete_handling,
                                     ets,
+                                    dry_run,
                                 )
                                 .await
                         }
@@ -286,7 +293,7 @@ impl Connection {
     /// `handle_deletes='hard'` runs a DELETE post-step for keys missing
     /// from the source.
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (target_spec_json, source_query, pipeline_name, keys, update_columns, mode_label, source=None, handle_deletes=None))]
+    #[pyo3(signature = (target_spec_json, source_query, pipeline_name, keys, update_columns, mode_label, source=None, handle_deletes=None, dry_run=false))]
     fn run_merge<'py>(
         &self,
         py: Python<'py>,
@@ -298,7 +305,13 @@ impl Connection {
         mode_label: String,
         source: Option<&Connection>,
         handle_deletes: Option<&str>,
+        dry_run: bool,
     ) -> PyResult<Bound<'py, PyDict>> {
+        if dry_run && source.is_some() {
+            return Err(PyValueError::new_err(
+                "dry_run is supported for same-DB only in v0.1",
+            ));
+        }
         let delete_handling = match handle_deletes {
             None => None,
             Some("hard") => Some(DeleteHandling::Hard),
@@ -334,6 +347,7 @@ impl Connection {
                                     &pipeline_name,
                                     &mode_label,
                                     delete_handling,
+                                    dry_run,
                                 )
                                 .await
                         }
@@ -370,7 +384,7 @@ impl Connection {
     /// source (same-DB); otherwise stages source rows through COPY (binary).
     /// TRUNCATE + INSERT happen in the same transaction so the target's
     /// pre-load contents survive any failure.
-    #[pyo3(signature = (target_spec_json, source_query, pipeline_name, source=None))]
+    #[pyo3(signature = (target_spec_json, source_query, pipeline_name, source=None, dry_run=false))]
     fn run_truncate<'py>(
         &self,
         py: Python<'py>,
@@ -378,7 +392,13 @@ impl Connection {
         source_query: String,
         pipeline_name: String,
         source: Option<&Connection>,
+        dry_run: bool,
     ) -> PyResult<Bound<'py, PyDict>> {
+        if dry_run && source.is_some() {
+            return Err(PyValueError::new_err(
+                "dry_run is supported for same-DB only in v0.1",
+            ));
+        }
         let normalized = ematix_flow_core::normalize_table_json(&target_spec_json)
             .map_err(|e| PyValueError::new_err(e.to_string()))?;
         let spec: TableSpec =
@@ -392,7 +412,7 @@ impl Connection {
                     match source_pool {
                         None => {
                             target_pool
-                                .run_truncate_same_db(&spec, &source_query, &pipeline_name)
+                                .run_truncate_same_db(&spec, &source_query, &pipeline_name, dry_run)
                                 .await
                         }
                         Some(src) => {
@@ -443,7 +463,7 @@ impl Connection {
     /// `incremental_column` + `last_value_literal` (an already-cast SQL
     /// literal like `'2026-04-30T00:00Z'::timestamptz`) opt into watermarking.
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (target_spec_json, source_query, pipeline_name, source=None, incremental_column=None, last_value_literal=None))]
+    #[pyo3(signature = (target_spec_json, source_query, pipeline_name, source=None, incremental_column=None, last_value_literal=None, dry_run=false))]
     fn run_append<'py>(
         &self,
         py: Python<'py>,
@@ -453,7 +473,13 @@ impl Connection {
         source: Option<&Connection>,
         incremental_column: Option<String>,
         last_value_literal: Option<String>,
+        dry_run: bool,
     ) -> PyResult<Bound<'py, PyDict>> {
+        if dry_run && source.is_some() {
+            return Err(PyValueError::new_err(
+                "dry_run is supported for same-DB only in v0.1",
+            ));
+        }
         let normalized = ematix_flow_core::normalize_table_json(&target_spec_json)
             .map_err(|e| PyValueError::new_err(e.to_string()))?;
         let spec: TableSpec =
@@ -476,6 +502,7 @@ impl Connection {
                                     &source_query,
                                     &pipeline_name,
                                     watermark.as_ref(),
+                                    dry_run,
                                 )
                                 .await
                         }

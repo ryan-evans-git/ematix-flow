@@ -75,6 +75,7 @@ async fn append_same_db_inserts_and_records_history() {
             "SELECT event_id, name FROM src.events",
             "rust_integration_append",
             None,
+            false,
         )
         .await
         .unwrap();
