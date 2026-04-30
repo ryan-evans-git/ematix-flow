@@ -604,6 +604,8 @@ class ValidateResult:
     `ok` is True when every per-target EXPLAIN succeeded.
     `source_sql` is the synthesized SQL that was EXPLAINed.
     `errors` is a list of human-readable strings, one per failure.
+    `notes` (Phase 27f) records skipped transform entries that can't be
+    EXPLAINed (callables, transform_ref).
     """
 
     pipeline_name: str
@@ -611,6 +613,7 @@ class ValidateResult:
     source_sql: str
     errors: list[str]
     target_connection_name: str | None = None
+    notes: list[str] = field(default_factory=list)
 
 
 def validate(name: str) -> ValidateResult:
@@ -646,6 +649,7 @@ def validate(name: str) -> ValidateResult:
         targets_info = [(None, None)]
 
     primary_conn_name: str | None = None
+    primary_conn = None
     for conn_name, _info in targets_info:
         try:
             conn = _config.connect(conn_name) if conn_name else _config.connect()
@@ -654,10 +658,26 @@ def validate(name: str) -> ValidateResult:
             continue
         if primary_conn_name is None:
             primary_conn_name = conn_name
+            primary_conn = conn
         try:
             conn.execute(f"EXPLAIN {source_sql}")
         except Exception as e:
             errors.append(str(e))
+
+    # Phase 27f Q10 B: EXPLAIN SQL-string transforms_post entries; note
+    # skipped callables / transform_refs.
+    notes: list[str] = []
+    if primary_conn is not None and plan.transforms_post:
+        for i, t in enumerate(plan.transforms_post):
+            if t.kind == "sql":
+                try:
+                    primary_conn.execute(f"EXPLAIN {t.summary}")
+                except Exception as e:
+                    errors.append(f"transforms_post[{i}] (sql): {e}")
+            else:
+                notes.append(
+                    f"transforms_post[{i}] ({t.kind}): skipped — not EXPLAIN-able"
+                )
 
     return ValidateResult(
         pipeline_name=name,
@@ -665,4 +685,5 @@ def validate(name: str) -> ValidateResult:
         source_sql=source_sql,
         errors=errors,
         target_connection_name=primary_conn_name,
+        notes=notes,
     )

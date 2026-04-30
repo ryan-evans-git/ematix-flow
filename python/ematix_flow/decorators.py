@@ -270,6 +270,7 @@ def _build_preview(
     handle_deletes: str | None,
     dry_run: bool,
     transforms_pre: list[Any] | None = None,
+    transforms_post: list[Any] | None = None,
 ) -> Any:
     """Phase 25: synthesize the plan a pipeline would execute.
 
@@ -428,7 +429,33 @@ def _build_preview(
         targets=target_plans,
         is_dry_run=False,
         notes=notes,
+        transforms_post=_summarize_transforms_post(transforms_post or []),
     )
+
+
+def _summarize_transforms_post(entries: list[Any]) -> list[Any]:
+    """Phase 27f: convert transforms_post entries into TransformPlan
+    summaries for preview() rendering. No execution.
+    """
+    from ematix_flow.preview import TransformPlan
+
+    plans = []
+    for step in entries:
+        if isinstance(step, str):
+            summary = step.strip().splitlines()[0][:200]
+            plans.append(TransformPlan(kind="sql", summary=summary))
+        elif isinstance(step, TransformRef):
+            plans.append(TransformPlan(kind="transform_ref", summary=step.name))
+        elif callable(step):
+            plans.append(
+                TransformPlan(
+                    kind="callable",
+                    summary=getattr(step, "__name__", "<callable>"),
+                )
+            )
+        else:
+            plans.append(TransformPlan(kind="unknown", summary=repr(step)))
+    return plans
 
 
 class _PreviewConn:
@@ -1189,6 +1216,7 @@ class _EmatixNamespace:
                     handle_deletes=handle_deletes,
                     dry_run=dry_run,
                     transforms_pre=transforms_pre or [],
+                    transforms_post=transforms_post or [],
                 )
 
             wrapped._preview = _preview  # type: ignore[attr-defined]

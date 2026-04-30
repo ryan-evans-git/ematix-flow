@@ -47,6 +47,19 @@ class TargetPlan:
 
 
 @dataclass
+class TransformPlan:
+    """Phase 27f: per-entry summary of a `transforms_post` step.
+
+    `kind` is "sql", "callable", or "transform_ref". `summary` is a
+    short label (the SQL text for sql, function name for callable,
+    referenced name for transform_ref).
+    """
+
+    kind: str
+    summary: str
+
+
+@dataclass
 class PreviewResult:
     """Structured output of `pipeline.preview(name)`."""
 
@@ -63,6 +76,11 @@ class PreviewResult:
 
     is_dry_run: bool = False
     notes: list[str] = field(default_factory=list)
+
+    # Phase 27f Q10 B: transforms_post entries are listed here for
+    # preview() but not executed; dry_run() ignores them; validate()
+    # EXPLAINs SQL strings only.
+    transforms_post: list[TransformPlan] = field(default_factory=list)
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), indent=2, default=str)
