@@ -47,6 +47,7 @@ fn target_spec() -> TableSpec {
                 primary_key: false,
             },
         ],
+        unique_constraints: Vec::new(),
         fingerprint: String::new(),
     })
 }

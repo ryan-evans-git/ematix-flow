@@ -145,6 +145,7 @@ mod tests {
                     primary_key: false,
                 },
             ],
+            unique_constraints: Vec::new(),
             fingerprint: String::new(),
         }
     }
@@ -247,6 +248,7 @@ mod tests {
                 nullable: false,
                 primary_key: true,
             }],
+            unique_constraints: Vec::new(),
             fingerprint: String::new(),
         };
         let augmented = augment_with_metadata(&spec);

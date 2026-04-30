@@ -9,7 +9,8 @@ use tokio_postgres::{Config as PgConfig, NoTls, config::Host};
 use uuid::Uuid;
 
 use crate::ddl::{
-    DriftResult, ReflectedColumn, canonicalize_reflected_type, compare_table, create_table_sql,
+    DriftResult, ReflectedColumn, canonicalize_reflected_type, compare_table_with_uniques,
+    create_table_sql,
 };
 use crate::meta::{
     DeleteHandling, WatermarkConfig, build_hard_delete_sql, build_scd2_close_missing_sql,
@@ -271,6 +272,45 @@ impl PgPool {
         Ok(out)
     }
 
+    /// Phase 22: read UNIQUE constraints from `information_schema`. Returns
+    /// each constraint's columns ordered by `ordinal_position`. Excludes
+    /// PRIMARY KEY constraints (`tc.constraint_type = 'UNIQUE'` already
+    /// filters them out).
+    pub async fn read_existing_unique_constraints(
+        &self,
+        schema: &str,
+        table: &str,
+    ) -> Result<Vec<Vec<String>>, PgError> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| PgError::Pool(e.to_string()))?;
+        let rows = client
+            .query(
+                // information_schema columns use the `name` type; cast to
+                // text so tokio-postgres can deserialize the resulting
+                // text[] into Vec<String>.
+                "SELECT tc.constraint_name::text,
+                        array_agg(kcu.column_name::text ORDER BY kcu.ordinal_position) AS cols
+                 FROM information_schema.table_constraints tc
+                 JOIN information_schema.key_column_usage kcu
+                   ON tc.constraint_name = kcu.constraint_name
+                  AND tc.table_schema = kcu.table_schema
+                 WHERE tc.table_schema = $1
+                   AND tc.table_name = $2
+                   AND tc.constraint_type = 'UNIQUE'
+                 GROUP BY tc.constraint_name
+                 ORDER BY tc.constraint_name",
+                &[&schema, &table],
+            )
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| row.get::<_, Vec<String>>(1))
+            .collect())
+    }
+
     /// Create the table if missing, or compare against the live schema.
     /// Caller decides what to do with `EnsureOutcome::Drift`.
     pub async fn ensure_table(&self, spec: &TableSpec) -> Result<EnsureOutcome, PgError> {
@@ -282,7 +322,10 @@ impl PgPool {
             return Ok(EnsureOutcome::Created);
         }
         let reflected = self.read_existing_columns(&spec.schema, &spec.name).await?;
-        match compare_table(spec, &reflected) {
+        let reflected_uniques = self
+            .read_existing_unique_constraints(&spec.schema, &spec.name)
+            .await?;
+        match compare_table_with_uniques(spec, &reflected, &reflected_uniques) {
             DriftResult::Match => Ok(EnsureOutcome::Matched),
             DriftResult::Drift(diffs) => Ok(EnsureOutcome::Drift(diffs)),
         }

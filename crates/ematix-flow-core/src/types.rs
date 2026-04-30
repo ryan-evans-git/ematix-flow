@@ -71,6 +71,13 @@ pub struct TableSpec {
     pub schema: String,
     pub name: String,
     pub columns: Vec<ColumnSpec>,
+    /// Phase 22: composite UNIQUE constraints in addition to the primary
+    /// key. Each entry is an ordered list of column names; column order
+    /// within a constraint is significant (Postgres treats `UNIQUE (a, b)`
+    /// and `UNIQUE (b, a)` as distinct indexes). Order across constraints
+    /// is not significant.
+    #[serde(default)]
+    pub unique_constraints: Vec<Vec<String>>,
     /// Computed by Rust during normalize; ignored on input. 32-char hex
     /// (first 16 bytes of SHA-256 over a canonical encoding).
     #[serde(default)]
@@ -95,6 +102,11 @@ impl TableSpec {
         self.name = self.name.trim().to_string();
         for col in &mut self.columns {
             col.name = col.name.trim().to_string();
+        }
+        for uc in &mut self.unique_constraints {
+            for col in uc {
+                *col = col.trim().to_string();
+            }
         }
     }
 
@@ -129,6 +141,34 @@ impl TableSpec {
                 "table must declare at least one primary key column".into(),
             ));
         }
+        // Phase 22: every UNIQUE constraint must be non-empty and reference
+        // declared columns.
+        let column_names: HashSet<&str> = self.columns.iter().map(|c| c.name.as_str()).collect();
+        for (i, uc) in self.unique_constraints.iter().enumerate() {
+            if uc.is_empty() {
+                return Err(SpecError::Validation(format!(
+                    "unique_constraints[{i}] must not be empty"
+                )));
+            }
+            let mut local_seen: HashSet<&str> = HashSet::new();
+            for col in uc {
+                if col.is_empty() {
+                    return Err(SpecError::Validation(format!(
+                        "unique_constraints[{i}] contains an empty column name"
+                    )));
+                }
+                if !column_names.contains(col.as_str()) {
+                    return Err(SpecError::Validation(format!(
+                        "unique_constraints[{i}] references unknown column {col}"
+                    )));
+                }
+                if !local_seen.insert(col.as_str()) {
+                    return Err(SpecError::Validation(format!(
+                        "unique_constraints[{i}] lists column {col} twice"
+                    )));
+                }
+            }
+        }
         Ok(())
     }
 
@@ -144,6 +184,19 @@ impl TableSpec {
             hasher.update(col.ty.to_postgres_sql().as_bytes());
             hasher.update(if col.nullable { b":n" } else { b":N" });
             hasher.update(if col.primary_key { b":p" } else { b":P" });
+        }
+        // Sort the unique-constraint set so the fingerprint is invariant
+        // to the declaration order across constraints (matches the
+        // semantic equality compare_table uses).
+        let mut sorted_unique: Vec<&[String]> = self
+            .unique_constraints
+            .iter()
+            .map(|v| v.as_slice())
+            .collect();
+        sorted_unique.sort();
+        for uc in sorted_unique {
+            hasher.update(b"|U:");
+            hasher.update(uc.join(",").as_bytes());
         }
         let digest = hasher.finalize();
         hex_encode(&digest[..16])
@@ -349,5 +402,156 @@ mod tests {
         let json = serde_json::to_string(&col).unwrap();
         let back: ColumnSpec = serde_json::from_str(&json).unwrap();
         assert_eq!(col, back);
+    }
+
+    // --- Phase 22: unique_constraints --------------------------------------
+
+    #[test]
+    fn unique_constraints_default_empty() {
+        let spec = TableSpec::from_json(customer_dim_json()).unwrap();
+        assert!(spec.unique_constraints.is_empty());
+    }
+
+    #[test]
+    fn unique_constraints_round_trip_through_json() {
+        let raw = r#"{
+            "schema": "warehouse",
+            "name": "customer_order",
+            "columns": [
+                {"name": "id", "type": {"kind": "big_int"}, "nullable": false, "primary_key": true},
+                {"name": "customer_id", "type": {"kind": "big_int"}, "nullable": false, "primary_key": false},
+                {"name": "order_date", "type": {"kind": "date"}, "nullable": false, "primary_key": false}
+            ],
+            "unique_constraints": [["customer_id", "order_date"]]
+        }"#;
+        let spec = TableSpec::from_json(raw).unwrap();
+        assert_eq!(
+            spec.unique_constraints,
+            vec![vec!["customer_id".to_string(), "order_date".to_string()]]
+        );
+        let again = TableSpec::from_json(&spec.to_json().unwrap()).unwrap();
+        assert_eq!(spec, again);
+    }
+
+    #[test]
+    fn unique_constraint_referencing_unknown_column_is_rejected() {
+        let raw = r#"{
+            "schema": "s",
+            "name": "t",
+            "columns": [
+                {"name": "id", "type": {"kind": "big_int"}, "nullable": false, "primary_key": true}
+            ],
+            "unique_constraints": [["nonexistent"]]
+        }"#;
+        let err = TableSpec::from_json(raw).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("nonexistent"));
+    }
+
+    #[test]
+    fn empty_unique_constraint_is_rejected() {
+        let raw = r#"{
+            "schema": "s",
+            "name": "t",
+            "columns": [
+                {"name": "id", "type": {"kind": "big_int"}, "nullable": false, "primary_key": true}
+            ],
+            "unique_constraints": [[]]
+        }"#;
+        assert!(TableSpec::from_json(raw).is_err());
+    }
+
+    #[test]
+    fn duplicate_columns_within_unique_constraint_rejected() {
+        let raw = r#"{
+            "schema": "s",
+            "name": "t",
+            "columns": [
+                {"name": "id", "type": {"kind": "big_int"}, "nullable": false, "primary_key": true},
+                {"name": "x", "type": {"kind": "text"}, "nullable": true, "primary_key": false}
+            ],
+            "unique_constraints": [["x", "x"]]
+        }"#;
+        let err = TableSpec::from_json(raw).unwrap_err();
+        assert!(err.to_string().contains("twice"));
+    }
+
+    #[test]
+    fn fingerprint_changes_when_unique_constraints_change() {
+        let base = r#"{
+            "schema": "s",
+            "name": "t",
+            "columns": [
+                {"name": "id", "type": {"kind": "big_int"}, "nullable": false, "primary_key": true},
+                {"name": "x", "type": {"kind": "text"}, "nullable": true, "primary_key": false}
+            ]
+        }"#;
+        let with_uc = r#"{
+            "schema": "s",
+            "name": "t",
+            "columns": [
+                {"name": "id", "type": {"kind": "big_int"}, "nullable": false, "primary_key": true},
+                {"name": "x", "type": {"kind": "text"}, "nullable": true, "primary_key": false}
+            ],
+            "unique_constraints": [["x"]]
+        }"#;
+        let a = TableSpec::from_json(base).unwrap();
+        let b = TableSpec::from_json(with_uc).unwrap();
+        assert_ne!(a.fingerprint, b.fingerprint);
+    }
+
+    #[test]
+    fn fingerprint_invariant_to_unique_constraint_declaration_order() {
+        let order_a = r#"{
+            "schema": "s",
+            "name": "t",
+            "columns": [
+                {"name": "id", "type": {"kind": "big_int"}, "nullable": false, "primary_key": true},
+                {"name": "x", "type": {"kind": "text"}, "nullable": true, "primary_key": false},
+                {"name": "y", "type": {"kind": "text"}, "nullable": true, "primary_key": false}
+            ],
+            "unique_constraints": [["x"], ["y"]]
+        }"#;
+        let order_b = r#"{
+            "schema": "s",
+            "name": "t",
+            "columns": [
+                {"name": "id", "type": {"kind": "big_int"}, "nullable": false, "primary_key": true},
+                {"name": "x", "type": {"kind": "text"}, "nullable": true, "primary_key": false},
+                {"name": "y", "type": {"kind": "text"}, "nullable": true, "primary_key": false}
+            ],
+            "unique_constraints": [["y"], ["x"]]
+        }"#;
+        let a = TableSpec::from_json(order_a).unwrap();
+        let b = TableSpec::from_json(order_b).unwrap();
+        assert_eq!(a.fingerprint, b.fingerprint);
+    }
+
+    #[test]
+    fn fingerprint_sensitive_to_column_order_within_unique_constraint() {
+        // UNIQUE (a, b) and UNIQUE (b, a) are distinct indexes in Postgres.
+        let ab = r#"{
+            "schema": "s",
+            "name": "t",
+            "columns": [
+                {"name": "id", "type": {"kind": "big_int"}, "nullable": false, "primary_key": true},
+                {"name": "a", "type": {"kind": "text"}, "nullable": true, "primary_key": false},
+                {"name": "b", "type": {"kind": "text"}, "nullable": true, "primary_key": false}
+            ],
+            "unique_constraints": [["a", "b"]]
+        }"#;
+        let ba = r#"{
+            "schema": "s",
+            "name": "t",
+            "columns": [
+                {"name": "id", "type": {"kind": "big_int"}, "nullable": false, "primary_key": true},
+                {"name": "a", "type": {"kind": "text"}, "nullable": true, "primary_key": false},
+                {"name": "b", "type": {"kind": "text"}, "nullable": true, "primary_key": false}
+            ],
+            "unique_constraints": [["b", "a"]]
+        }"#;
+        let a = TableSpec::from_json(ab).unwrap();
+        let b = TableSpec::from_json(ba).unwrap();
+        assert_ne!(a.fingerprint, b.fingerprint);
     }
 }

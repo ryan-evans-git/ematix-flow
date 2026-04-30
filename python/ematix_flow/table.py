@@ -18,6 +18,7 @@ class ManagedTable:
     __schema__: ClassVar[str]
     __tablename__: ClassVar[str]
     __columns__: ClassVar[tuple[tuple[str, Column], ...]]
+    __unique_constraints__: ClassVar[tuple[tuple[str, ...], ...]] = ()
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
         super().__init_subclass__(**kwargs)
@@ -44,11 +45,16 @@ class ManagedTable:
         return [name for name, col in cls.__columns__ if col.primary_key]
 
     @classmethod
+    def _unique_constraints(cls) -> list[list[str]]:
+        return [list(uc) for uc in cls.__unique_constraints__]
+
+    @classmethod
     def _to_spec(cls) -> dict[str, Any]:
         return {
             "schema": cls.__schema__,
             "name": cls.__tablename__,
             "columns": [col.to_spec() for _, col in cls.__columns__],
+            "unique_constraints": cls._unique_constraints(),
         }
 
     @classmethod

@@ -42,6 +42,12 @@ pub enum Difference {
         declared: bool,
         reflected: bool,
     },
+    UniqueConstraintMissing {
+        columns: Vec<String>,
+    },
+    UniqueConstraintExtra {
+        columns: Vec<String>,
+    },
 }
 
 impl fmt::Display for Difference {
@@ -79,6 +85,16 @@ impl fmt::Display for Difference {
                 f,
                 "column `{name}` primary-key mismatch: declared {declared}, reflected {reflected}"
             ),
+            Difference::UniqueConstraintMissing { columns } => write!(
+                f,
+                "unique constraint ({}) is declared but missing in the table",
+                columns.join(", ")
+            ),
+            Difference::UniqueConstraintExtra { columns } => write!(
+                f,
+                "unique constraint ({}) exists in the table but is not declared",
+                columns.join(", ")
+            ),
         }
     }
 }
@@ -115,16 +131,37 @@ pub fn create_table_sql(spec: &TableSpec) -> String {
         out.push_str(&pks.join(", "));
         out.push(')');
     }
+    for uc in &spec.unique_constraints {
+        out.push_str(",\n    UNIQUE (");
+        out.push_str(&uc.join(", "));
+        out.push(')');
+    }
     out.push_str("\n)");
     out
 }
 
 pub fn compare_table(declared: &TableSpec, reflected: &[ReflectedColumn]) -> DriftResult {
+    compare_table_with_uniques(declared, reflected, &[])
+}
+
+/// Phase 22: extended `compare_table` that also flags differences in
+/// UNIQUE constraints. The set comparison ignores constraint-list
+/// ordering across constraints but preserves column order *within* each
+/// constraint (Postgres treats `UNIQUE (a, b)` and `UNIQUE (b, a)` as
+/// distinct indexes).
+pub fn compare_table_with_uniques(
+    declared: &TableSpec,
+    reflected_columns: &[ReflectedColumn],
+    reflected_uniques: &[Vec<String>],
+) -> DriftResult {
     let mut diffs = Vec::new();
-    let reflected_by_name: HashMap<&str, &ReflectedColumn> =
-        reflected.iter().map(|c| (c.name.as_str(), c)).collect();
+    let reflected_by_name: HashMap<&str, &ReflectedColumn> = reflected_columns
+        .iter()
+        .map(|c| (c.name.as_str(), c))
+        .collect();
     let declared_names: std::collections::HashSet<&str> =
         declared.columns.iter().map(|c| c.name.as_str()).collect();
+    let reflected = reflected_columns;
 
     for col in &declared.columns {
         match reflected_by_name.get(col.name.as_str()) {
@@ -161,6 +198,30 @@ pub fn compare_table(declared: &TableSpec, reflected: &[ReflectedColumn]) -> Dri
         if !declared_names.contains(r.name.as_str()) {
             diffs.push(Difference::ColumnExtra {
                 name: r.name.clone(),
+            });
+        }
+    }
+
+    // Phase 22: compare UNIQUE constraints as a set (column order within
+    // a constraint is significant; constraint declaration order is not).
+    let declared_uniques: std::collections::HashSet<&[String]> = declared
+        .unique_constraints
+        .iter()
+        .map(|v| v.as_slice())
+        .collect();
+    let reflected_uniques_set: std::collections::HashSet<&[String]> =
+        reflected_uniques.iter().map(|v| v.as_slice()).collect();
+    for uc in &declared.unique_constraints {
+        if !reflected_uniques_set.contains(uc.as_slice()) {
+            diffs.push(Difference::UniqueConstraintMissing {
+                columns: uc.clone(),
+            });
+        }
+    }
+    for uc in reflected_uniques {
+        if !declared_uniques.contains(uc.as_slice()) {
+            diffs.push(Difference::UniqueConstraintExtra {
+                columns: uc.clone(),
             });
         }
     }
@@ -252,6 +313,7 @@ mod tests {
                     primary_key: false,
                 },
             ],
+            unique_constraints: Vec::new(),
             fingerprint: String::new(),
         }
     }
@@ -293,6 +355,7 @@ mod tests {
                     primary_key: false,
                 },
             ],
+            unique_constraints: Vec::new(),
             fingerprint: String::new(),
         };
         let sql = create_table_sql(&spec);
@@ -456,6 +519,194 @@ mod tests {
                 assert!(msg.contains("customer_id"));
                 assert!(msg.contains("BIGINT"));
                 assert!(msg.contains("INTEGER"));
+            }
+            other => panic!("expected Drift, got {other:?}"),
+        }
+    }
+
+    // --- Phase 22: UNIQUE constraints ------------------------------------
+
+    use crate::ddl::compare_table_with_uniques;
+
+    fn customer_order_with_unique() -> TableSpec {
+        TableSpec {
+            schema: "warehouse".into(),
+            name: "customer_order".into(),
+            columns: vec![
+                ColumnSpec {
+                    name: "id".into(),
+                    ty: ColumnType::BigInt,
+                    nullable: false,
+                    primary_key: true,
+                },
+                ColumnSpec {
+                    name: "customer_id".into(),
+                    ty: ColumnType::BigInt,
+                    nullable: false,
+                    primary_key: false,
+                },
+                ColumnSpec {
+                    name: "order_date".into(),
+                    ty: ColumnType::Date,
+                    nullable: false,
+                    primary_key: false,
+                },
+            ],
+            unique_constraints: vec![vec!["customer_id".into(), "order_date".into()]],
+            fingerprint: String::new(),
+        }
+    }
+
+    #[test]
+    fn create_table_sql_emits_single_unique_clause() {
+        let sql = create_table_sql(&customer_order_with_unique());
+        assert!(sql.contains("PRIMARY KEY (id)"));
+        assert!(sql.contains("UNIQUE (customer_id, order_date)"));
+    }
+
+    #[test]
+    fn create_table_sql_emits_multiple_unique_clauses() {
+        let mut spec = customer_order_with_unique();
+        spec.columns.push(ColumnSpec {
+            name: "external_ref".into(),
+            ty: ColumnType::Text,
+            nullable: true,
+            primary_key: false,
+        });
+        spec.unique_constraints.push(vec!["external_ref".into()]);
+        let sql = create_table_sql(&spec);
+        assert!(sql.contains("UNIQUE (customer_id, order_date)"));
+        assert!(sql.contains("UNIQUE (external_ref)"));
+    }
+
+    #[test]
+    fn compare_table_match_when_uniques_align() {
+        let declared = customer_order_with_unique();
+        let reflected_cols: Vec<ReflectedColumn> = declared
+            .columns
+            .iter()
+            .map(|c| ReflectedColumn {
+                name: c.name.clone(),
+                ty: c.ty.clone(),
+                nullable: c.nullable,
+                primary_key: c.primary_key,
+            })
+            .collect();
+        let reflected_uniques = vec![vec!["customer_id".into(), "order_date".into()]];
+        assert_eq!(
+            compare_table_with_uniques(&declared, &reflected_cols, &reflected_uniques),
+            DriftResult::Match
+        );
+    }
+
+    #[test]
+    fn compare_table_detects_missing_unique_constraint() {
+        let declared = customer_order_with_unique();
+        let reflected_cols: Vec<ReflectedColumn> = declared
+            .columns
+            .iter()
+            .map(|c| ReflectedColumn {
+                name: c.name.clone(),
+                ty: c.ty.clone(),
+                nullable: c.nullable,
+                primary_key: c.primary_key,
+            })
+            .collect();
+        // Live DB has no UNIQUE constraint.
+        let result = compare_table_with_uniques(&declared, &reflected_cols, &[]);
+        match result {
+            DriftResult::Drift(diffs) => {
+                assert!(diffs.iter().any(|d| matches!(
+                    d,
+                    Difference::UniqueConstraintMissing { columns }
+                        if columns == &vec!["customer_id".to_string(), "order_date".to_string()]
+                )));
+            }
+            other => panic!("expected Drift, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn compare_table_detects_extra_unique_constraint() {
+        let mut declared = customer_order_with_unique();
+        declared.unique_constraints.clear();
+        let reflected_cols: Vec<ReflectedColumn> = declared
+            .columns
+            .iter()
+            .map(|c| ReflectedColumn {
+                name: c.name.clone(),
+                ty: c.ty.clone(),
+                nullable: c.nullable,
+                primary_key: c.primary_key,
+            })
+            .collect();
+        let reflected_uniques = vec![vec!["customer_id".into()]];
+        let result = compare_table_with_uniques(&declared, &reflected_cols, &reflected_uniques);
+        match result {
+            DriftResult::Drift(diffs) => {
+                assert!(diffs.iter().any(|d| matches!(
+                    d,
+                    Difference::UniqueConstraintExtra { columns }
+                        if columns == &vec!["customer_id".to_string()]
+                )));
+            }
+            other => panic!("expected Drift, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn compare_table_unique_match_ignores_constraint_order() {
+        let mut declared = customer_order_with_unique();
+        declared.unique_constraints.push(vec!["id".into()]);
+        let reflected_cols: Vec<ReflectedColumn> = declared
+            .columns
+            .iter()
+            .map(|c| ReflectedColumn {
+                name: c.name.clone(),
+                ty: c.ty.clone(),
+                nullable: c.nullable,
+                primary_key: c.primary_key,
+            })
+            .collect();
+        // Live DB has the same uniques but in reversed order.
+        let reflected_uniques = vec![
+            vec!["id".into()],
+            vec!["customer_id".into(), "order_date".into()],
+        ];
+        assert_eq!(
+            compare_table_with_uniques(&declared, &reflected_cols, &reflected_uniques),
+            DriftResult::Match
+        );
+    }
+
+    #[test]
+    fn compare_table_unique_treats_column_order_as_significant() {
+        let declared = customer_order_with_unique();
+        let reflected_cols: Vec<ReflectedColumn> = declared
+            .columns
+            .iter()
+            .map(|c| ReflectedColumn {
+                name: c.name.clone(),
+                ty: c.ty.clone(),
+                nullable: c.nullable,
+                primary_key: c.primary_key,
+            })
+            .collect();
+        // Live DB has UNIQUE (order_date, customer_id) — reversed.
+        let reflected_uniques = vec![vec!["order_date".into(), "customer_id".into()]];
+        let result = compare_table_with_uniques(&declared, &reflected_cols, &reflected_uniques);
+        match result {
+            DriftResult::Drift(diffs) => {
+                assert!(
+                    diffs
+                        .iter()
+                        .any(|d| matches!(d, Difference::UniqueConstraintMissing { .. }))
+                );
+                assert!(
+                    diffs
+                        .iter()
+                        .any(|d| matches!(d, Difference::UniqueConstraintExtra { .. }))
+                );
             }
             other => panic!("expected Drift, got {other:?}"),
         }
