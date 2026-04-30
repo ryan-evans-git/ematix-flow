@@ -87,12 +87,23 @@ fn is_user_data_col(name: &str) -> bool {
 /// versions. `compare_columns` participate in the row hash (changes here
 /// produce new versions). `run_token` distinguishes the temp-table name
 /// across concurrent runs in the same session.
+///
+/// Phase 15: when `event_ts_column = Some(col)`, the plan switches to
+/// event-time semantics — `valid_from` is taken from that source column
+/// instead of `now()`, and the close-out's `valid_to` is set to the new
+/// version's event_ts (so a previous version's `valid_to` equals its
+/// successor's `valid_from`). The src CTE uses `DISTINCT ON (keys) ORDER
+/// BY event_ts DESC` so multiple events for the same key in one source
+/// resolve to the latest. Out-of-order arrivals (event_ts older than the
+/// existing current version's `valid_from`) are caught at execution time
+/// in a separate guard query — not embedded in the plan.
 pub fn plan_scd2(
     target: &TableSpec,
     source_query: &str,
     keys: &[String],
     compare_columns: &[String],
     run_token: &str,
+    event_ts_column: Option<&str>,
 ) -> Scd2Plan {
     let user_columns: Vec<String> = target
         .columns
@@ -121,20 +132,36 @@ pub fn plan_scd2(
     let join_clause = format!("({t_tuple}) = ({src_tuple})");
     let key_tuple: String = keys.join(", ");
 
+    let src_select = match event_ts_column {
+        Some(ets) => format!(
+            "SELECT DISTINCT ON ({keys}) {user_cols}, \
+             {ets}::timestamptz AS _event_ts, \
+             {digest_expr} AS _row_hash \
+             FROM ({source}) q \
+             ORDER BY {keys}, {ets} DESC",
+            keys = key_tuple,
+            user_cols = user_columns.join(", "),
+            ets = ets,
+            digest_expr = digest_expr,
+            source = source_query,
+        ),
+        None => format!(
+            "SELECT {user_cols}, {digest_expr} AS _row_hash FROM ({source}) q",
+            user_cols = user_columns.join(", "),
+            digest_expr = digest_expr,
+            source = source_query,
+        ),
+    };
+
     let create_temp = format!(
         "CREATE TEMP TABLE {stage} ON COMMIT DROP AS \
-         WITH src AS MATERIALIZED ( \
-             SELECT {user_cols}, {digest_expr} AS _row_hash \
-             FROM ({source}) q \
-         ) \
+         WITH src AS MATERIALIZED ( {src_select} ) \
          SELECT src.* FROM src \
          LEFT JOIN {schema}.{table} t \
              ON {join_clause} AND t.{is_current_col} \
          WHERE t.{row_hash_col} IS DISTINCT FROM src._row_hash",
         stage = stage,
-        user_cols = user_columns.join(", "),
-        digest_expr = digest_expr,
-        source = source_query,
+        src_select = src_select,
         schema = target.schema,
         table = target.name,
         join_clause = join_clause,
@@ -142,17 +169,40 @@ pub fn plan_scd2(
         row_hash_col = ROW_HASH_COL,
     );
 
-    let close_out = format!(
-        "UPDATE {schema}.{table} \
-         SET {valid_to} = now(), {is_current} = false \
-         WHERE {is_current} AND ({keys}) IN (SELECT {keys} FROM {stage})",
-        schema = target.schema,
-        table = target.name,
-        valid_to = VALID_TO_COL,
-        is_current = IS_CURRENT_COL,
-        keys = key_tuple,
-        stage = stage,
-    );
+    let close_out = match event_ts_column {
+        Some(_) => {
+            // Correlated UPDATE so each row's valid_to picks up the matching
+            // changed row's event_ts.
+            let join: String = keys
+                .iter()
+                .map(|k| format!("t.{k} = c.{k}"))
+                .collect::<Vec<_>>()
+                .join(" AND ");
+            format!(
+                "UPDATE {schema}.{table} t \
+                 SET {valid_to} = c._event_ts, {is_current} = false \
+                 FROM {stage} c \
+                 WHERE t.{is_current} AND {join}",
+                schema = target.schema,
+                table = target.name,
+                valid_to = VALID_TO_COL,
+                is_current = IS_CURRENT_COL,
+                stage = stage,
+                join = join,
+            )
+        }
+        None => format!(
+            "UPDATE {schema}.{table} \
+             SET {valid_to} = now(), {is_current} = false \
+             WHERE {is_current} AND ({keys}) IN (SELECT {keys} FROM {stage})",
+            schema = target.schema,
+            table = target.name,
+            valid_to = VALID_TO_COL,
+            is_current = IS_CURRENT_COL,
+            keys = key_tuple,
+            stage = stage,
+        ),
+    };
 
     // Insert new versions. Includes user cols + scd2 metadata + run metadata.
     let mut insert_cols: Vec<String> = user_columns.clone();
@@ -161,7 +211,11 @@ pub fn plan_scd2(
     insert_cols.push(IS_CURRENT_COL.into());
     insert_cols.push(ROW_HASH_COL.into());
     let mut select_exprs: Vec<String> = user_columns.clone();
-    select_exprs.push("now()".into()); // valid_from
+    let valid_from_expr: String = match event_ts_column {
+        Some(_) => "_event_ts".into(),
+        None => "now()".into(),
+    };
+    select_exprs.push(valid_from_expr); // valid_from
     select_exprs.push("NULL".into()); // valid_to
     select_exprs.push("true".into()); // is_current
     select_exprs.push("_row_hash".into()); // row_hash
@@ -185,6 +239,35 @@ pub fn plan_scd2(
         statements: vec![create_temp, close_out, insert_new],
         has_metadata,
     }
+}
+
+/// Phase 15: build the SQL that detects out-of-order event arrivals.
+/// Returns a query that yields a single row with `count` = number of
+/// _scd2_changed rows whose event_ts is older than the existing current
+/// version's valid_from. The executor runs this between the CREATE TEMP
+/// and the UPDATE, and raises if count > 0.
+pub fn build_out_of_order_check_sql(
+    target: &TableSpec,
+    keys: &[String],
+    run_token: &str,
+) -> String {
+    let stage = format!("_scd2_changed_{run_token}");
+    let join: String = keys
+        .iter()
+        .map(|k| format!("t.{k} = c.{k}"))
+        .collect::<Vec<_>>()
+        .join(" AND ");
+    format!(
+        "SELECT count(*)::bigint FROM {stage} c \
+         JOIN {schema}.{table} t ON {join} AND t.{is_current} \
+         WHERE t.{valid_from} > c._event_ts",
+        stage = stage,
+        schema = target.schema,
+        table = target.name,
+        join = join,
+        is_current = IS_CURRENT_COL,
+        valid_from = VALID_FROM_COL,
+    )
 }
 
 #[cfg(test)]
@@ -277,6 +360,7 @@ mod tests {
             &["customer_id".into()],
             &["email".into(), "name".into()],
             "abc123",
+            None,
         );
         assert_eq!(plan.statements.len(), 3);
     }
@@ -290,6 +374,7 @@ mod tests {
             &["customer_id".into()],
             &["email".into(), "name".into()],
             "abc123",
+            None,
         );
         let create_temp = &plan.statements[0];
         assert!(create_temp.contains("CREATE TEMP TABLE"));
@@ -313,6 +398,7 @@ mod tests {
             &["customer_id".into()],
             &["email".into(), "name".into()],
             "abc",
+            None,
         );
         let create_temp = &plan.statements[0];
         assert!(create_temp.contains("LEFT JOIN warehouse.customer_dim t"));
@@ -329,6 +415,7 @@ mod tests {
             &["customer_id".into()],
             &["email".into(), "name".into()],
             "abc",
+            None,
         );
         let close_out = &plan.statements[1];
         assert!(close_out.contains("UPDATE warehouse.customer_dim"));
@@ -347,6 +434,7 @@ mod tests {
             &["customer_id".into()],
             &["email".into(), "name".into()],
             "abc",
+            None,
         );
         let insert = &plan.statements[2];
         assert!(insert.contains("INSERT INTO warehouse.customer_dim"));
@@ -368,11 +456,103 @@ mod tests {
             &["customer_id".into(), "email".into()],
             &["name".into()],
             "abc",
+            None,
         );
         let create_temp = &plan.statements[0];
         // JOIN on composite key.
         assert!(create_temp.contains("(t.customer_id, t.email) = (src.customer_id, src.email)"));
         let close_out = &plan.statements[1];
         assert!(close_out.contains("(customer_id, email) IN"));
+    }
+
+    // --- Phase 15: event-time SCD2 ----------------------------------------
+
+    use crate::strategy::scd2::build_out_of_order_check_sql;
+
+    #[test]
+    fn event_time_create_temp_uses_distinct_on_and_event_ts_alias() {
+        let augmented = augment_with_scd2(&customer_dim());
+        let plan = plan_scd2(
+            &augmented,
+            "SELECT * FROM src",
+            &["customer_id".into()],
+            &["email".into(), "name".into()],
+            "abc",
+            Some("event_ts"),
+        );
+        let create_temp = &plan.statements[0];
+        assert!(create_temp.contains("DISTINCT ON (customer_id)"));
+        assert!(create_temp.contains("event_ts::timestamptz AS _event_ts"));
+        assert!(create_temp.contains("ORDER BY customer_id, event_ts DESC"));
+    }
+
+    #[test]
+    fn event_time_close_out_uses_correlated_update_with_event_ts() {
+        let augmented = augment_with_scd2(&customer_dim());
+        let plan = plan_scd2(
+            &augmented,
+            "SELECT * FROM src",
+            &["customer_id".into()],
+            &["email".into(), "name".into()],
+            "abc",
+            Some("event_ts"),
+        );
+        let close_out = &plan.statements[1];
+        assert!(close_out.contains("UPDATE warehouse.customer_dim t"));
+        assert!(close_out.contains("SET valid_to = c._event_ts"));
+        assert!(close_out.contains("is_current = false"));
+        assert!(close_out.contains("FROM _scd2_changed_abc c"));
+        assert!(close_out.contains("t.customer_id = c.customer_id"));
+        assert!(!close_out.contains("now()"));
+    }
+
+    #[test]
+    fn event_time_insert_uses_event_ts_for_valid_from() {
+        let augmented = augment_with_scd2(&customer_dim());
+        let plan = plan_scd2(
+            &augmented,
+            "SELECT * FROM src",
+            &["customer_id".into()],
+            &["email".into(), "name".into()],
+            "abc",
+            Some("event_ts"),
+        );
+        let insert = &plan.statements[2];
+        // valid_from is _event_ts, valid_to is NULL, is_current is true.
+        assert!(insert.contains("_event_ts, NULL, true"));
+        // Must not regress to now() for the valid_from slot.
+        assert!(!insert.contains("now(), NULL, true"));
+    }
+
+    #[test]
+    fn event_time_handles_composite_keys() {
+        let mut spec = customer_dim();
+        spec.columns[1].primary_key = true;
+        let augmented = augment_with_scd2(&spec);
+        let plan = plan_scd2(
+            &augmented,
+            "SELECT * FROM src",
+            &["customer_id".into(), "email".into()],
+            &["name".into()],
+            "abc",
+            Some("event_ts"),
+        );
+        let create_temp = &plan.statements[0];
+        assert!(create_temp.contains("DISTINCT ON (customer_id, email)"));
+        assert!(create_temp.contains("ORDER BY customer_id, email, event_ts DESC"));
+        let close_out = &plan.statements[1];
+        assert!(close_out.contains("t.customer_id = c.customer_id AND t.email = c.email"));
+    }
+
+    #[test]
+    fn out_of_order_check_sql_targets_changed_rows_older_than_current() {
+        let augmented = augment_with_scd2(&customer_dim());
+        let sql = build_out_of_order_check_sql(&augmented, &["customer_id".into()], "abc");
+        assert!(sql.contains("FROM _scd2_changed_abc c"));
+        assert!(sql.contains("JOIN warehouse.customer_dim t"));
+        assert!(sql.contains("t.customer_id = c.customer_id"));
+        assert!(sql.contains("t.is_current"));
+        assert!(sql.contains("WHERE t.valid_from > c._event_ts"));
+        assert!(sql.contains("count(*)::bigint"));
     }
 }

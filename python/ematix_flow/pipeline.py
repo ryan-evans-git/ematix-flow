@@ -124,12 +124,15 @@ def sync(
     force_path: str | None = None,
     incremental_column: str | None = None,
     handle_deletes: str | None = None,
+    event_timestamp_column: str | None = None,
 ) -> dict[str, Any]:
     """Execute a load. Phases 5–8 support 'append', 'truncate', 'merge'/'scd1', 'scd2'.
 
     Phase 10: pass `incremental_column='col'` for watermarked append loads.
     Phase 11: pass `handle_deletes='hard'` (merge/scd1) or `'soft'` (scd2) to
     handle keys that have disappeared from the source.
+    Phase 15: pass `event_timestamp_column='col'` (scd2 only) to take
+    `valid_from` from a source column instead of `now()`.
     """
     if mode not in ("append", "truncate", "merge", "scd1", "scd2"):
         raise NotImplementedError(f"mode={mode!r} is not yet implemented")
@@ -140,6 +143,10 @@ def sync(
     if incremental_column is not None and mode != "append":
         raise ValueError(
             f"incremental_column is only supported for mode='append'; got mode={mode!r}"
+        )
+    if event_timestamp_column is not None and mode != "scd2":
+        raise ValueError(
+            f"event_timestamp_column is only supported for mode='scd2'; got mode={mode!r}"
         )
     if handle_deletes is not None:
         if handle_deletes not in ("hard", "soft"):
@@ -232,6 +239,7 @@ def sync(
             resolved_compares,
             src_arg,
             handle_deletes,
+            event_timestamp_column,
         )
 
     # merge / scd1

@@ -17,7 +17,7 @@ use crate::meta::{
 };
 use crate::strategy::append::{BATCH_ID_COL, LOADED_AT_COL, plan_same_db_append};
 use crate::strategy::merge::plan_merge_upsert;
-use crate::strategy::scd2::plan_scd2;
+use crate::strategy::scd2::{build_out_of_order_check_sql, plan_scd2};
 use crate::strategy::truncate::plan_truncate_replace;
 use crate::types::TableSpec;
 
@@ -921,6 +921,10 @@ impl PgPool {
     ///
     /// With `delete_handling = Some(Soft)`, a fourth statement closes out
     /// current versions whose natural key is missing from the source.
+    /// With `event_ts_column = Some(col)`, switches to event-time SCD2:
+    /// `valid_from` is taken from that source column instead of `now()`,
+    /// the close-out's `valid_to` chains to the new event_ts, and a guard
+    /// query rejects out-of-order arrivals before close-out runs.
     #[allow(clippy::too_many_arguments)]
     pub async fn run_scd2_same_db(
         &self,
@@ -930,6 +934,7 @@ impl PgPool {
         compare_columns: &[String],
         pipeline_name: &str,
         delete_handling: Option<DeleteHandling>,
+        event_ts_column: Option<&str>,
     ) -> Result<Scd2RunResult, PgError> {
         self.ensure_meta_schema().await?;
         self.ensure_pgcrypto().await?;
@@ -939,7 +944,14 @@ impl PgPool {
         self.insert_history_start(run_id, pipeline_name, target_spec, "scd2", "same_db")
             .await?;
 
-        let plan = plan_scd2(target_spec, source_query, keys, compare_columns, &run_token);
+        let plan = plan_scd2(
+            target_spec,
+            source_query,
+            keys,
+            compare_columns,
+            &run_token,
+            event_ts_column,
+        );
 
         let result: Result<(i64, i64), PgError> = async {
             let mut client = self
@@ -949,6 +961,19 @@ impl PgPool {
                 .map_err(|e| PgError::Pool(e.to_string()))?;
             let tx = client.transaction().await?;
             tx.batch_execute(&plan.statements[0]).await?;
+            // Phase 15: detect event_ts arriving older than the existing
+            // current version's valid_from before mutating anything.
+            if event_ts_column.is_some() {
+                let check_sql = build_out_of_order_check_sql(target_spec, keys, &run_token);
+                let row = tx.query_one(&check_sql, &[]).await?;
+                let bad: i64 = row.get(0);
+                if bad > 0 {
+                    return Err(PgError::Pool(format!(
+                        "event_ts out-of-order: {bad} row(s) carry an event_ts older \
+                         than the existing current version's valid_from"
+                    )));
+                }
+            }
             let closed_changed = tx.execute(&plan.statements[1], &[]).await? as i64;
             let inserted = if plan.has_metadata {
                 tx.execute(&plan.statements[2], &[&batch_id]).await? as i64
@@ -1004,6 +1029,7 @@ impl PgPool {
         compare_columns: &[String],
         pipeline_name: &str,
         delete_handling: Option<DeleteHandling>,
+        event_ts_column: Option<&str>,
     ) -> Result<Scd2RunResult, PgError> {
         self.ensure_meta_schema().await?;
         self.ensure_pgcrypto().await?;
@@ -1024,7 +1050,7 @@ impl PgPool {
             })
             .map(|c| c.name.as_str())
             .collect();
-        let staging_def: String = target_spec
+        let mut staging_columns: Vec<String> = target_spec
             .columns
             .iter()
             .filter(|c| {
@@ -1033,12 +1059,21 @@ impl PgPool {
                     && !crate::strategy::scd2::is_scd2_metadata(&c.name)
             })
             .map(|c| format!("{} {}", c.name, c.ty.to_postgres_sql()))
-            .collect::<Vec<_>>()
-            .join(", ");
+            .collect();
+        // Phase 15: when running event-time SCD2 cross-DB, the source-side
+        // event_ts column must travel through staging too — it isn't a
+        // target column but the SCD2 plan against the staging table needs it.
+        let mut projected_select: Vec<String> =
+            user_columns.iter().map(|c| (*c).to_string()).collect();
+        if let Some(ets) = event_ts_column {
+            staging_columns.push(format!("{ets} TIMESTAMPTZ"));
+            projected_select.push(ets.to_string());
+        }
+        let staging_def: String = staging_columns.join(", ");
         let staging = format!("_ematix_stage_{}", run_token);
         let projected_source = format!(
             "SELECT {cols} FROM ({source_query}) src",
-            cols = user_columns.join(", "),
+            cols = projected_select.join(", "),
         );
         let plan = plan_scd2(
             target_spec,
@@ -1046,6 +1081,7 @@ impl PgPool {
             keys,
             compare_columns,
             &run_token,
+            event_ts_column,
         );
 
         let result: Result<(i64, i64), PgError> = async {
@@ -1077,6 +1113,17 @@ impl PgPool {
             let _ = sink.finish().await?;
 
             target_tx.batch_execute(&plan.statements[0]).await?;
+            if event_ts_column.is_some() {
+                let check_sql = build_out_of_order_check_sql(target_spec, keys, &run_token);
+                let row = target_tx.query_one(&check_sql, &[]).await?;
+                let bad: i64 = row.get(0);
+                if bad > 0 {
+                    return Err(PgError::Pool(format!(
+                        "event_ts out-of-order: {bad} row(s) carry an event_ts older \
+                         than the existing current version's valid_from"
+                    )));
+                }
+            }
             let closed_changed = target_tx.execute(&plan.statements[1], &[]).await? as i64;
             let inserted = if plan.has_metadata {
                 target_tx.execute(&plan.statements[2], &[&batch_id]).await? as i64

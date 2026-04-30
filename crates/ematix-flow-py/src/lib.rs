@@ -131,8 +131,11 @@ impl Connection {
     /// rows_closed (previous versions closed out).
     /// `handle_deletes='soft'` adds a close-out post-step for keys
     /// missing from the source.
+    /// `event_timestamp_column='col'` switches to event-time SCD2:
+    /// `valid_from` comes from that column; out-of-order arrivals are
+    /// rejected with an error.
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (target_spec_json, source_query, pipeline_name, keys, compare_columns, source=None, handle_deletes=None))]
+    #[pyo3(signature = (target_spec_json, source_query, pipeline_name, keys, compare_columns, source=None, handle_deletes=None, event_timestamp_column=None))]
     fn run_scd2<'py>(
         &self,
         py: Python<'py>,
@@ -143,6 +146,7 @@ impl Connection {
         compare_columns: Vec<String>,
         source: Option<&Connection>,
         handle_deletes: Option<&str>,
+        event_timestamp_column: Option<String>,
     ) -> PyResult<Bound<'py, PyDict>> {
         if keys.is_empty() {
             return Err(PyValueError::new_err("scd2 requires at least one key"));
@@ -171,6 +175,7 @@ impl Connection {
         let outcome: Scd2RunResult = py
             .detach(|| {
                 rt().block_on(async move {
+                    let ets = event_timestamp_column.as_deref();
                     match source_pool {
                         None => {
                             target_pool
@@ -181,6 +186,7 @@ impl Connection {
                                     &compare_columns,
                                     &pipeline_name,
                                     delete_handling,
+                                    ets,
                                 )
                                 .await
                         }
@@ -194,6 +200,7 @@ impl Connection {
                                     &compare_columns,
                                     &pipeline_name,
                                     delete_handling,
+                                    ets,
                                 )
                                 .await
                         }
