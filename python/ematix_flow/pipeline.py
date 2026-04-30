@@ -568,6 +568,71 @@ def list_feature_views() -> list[RegisteredFeatureView]:
     return list(_FEATURE_VIEWS_REGISTRY.values())
 
 
+def _ensure_online_artifacts(*, target_connection: Any, target_cls: Any) -> None:
+    """Phase 19: ensure the partial index, online MATERIALIZED VIEW, and MV
+    unique index exist for an `online=True` FeatureView. Idempotent —
+    safe to call after every sync."""
+    if not getattr(target_cls, "__is_feature_view__", False):
+        return
+    if not getattr(target_cls, "__online__", False):
+        return
+    schema = target_cls.__schema__
+    table = target_cls.__tablename__
+    online_name = f"{table}__online"
+    keys = target_cls._primary_keys()
+    if not keys:
+        return
+    keys_sql = ", ".join(f'"{k}"' for k in keys)
+    quoted_schema = f'"{schema}"'
+
+    # Partial index on the main table — speeds up WHERE is_current scans
+    # and is the building block referenced in plan §3.4.
+    target_connection.execute(
+        f'CREATE INDEX IF NOT EXISTS '
+        f'"idx__{table}__current_keys" '
+        f'ON {quoted_schema}."{table}" ({keys_sql}) '
+        f"WHERE is_current"
+    )
+    # MV containing only the current versions.
+    target_connection.execute(
+        f'CREATE MATERIALIZED VIEW IF NOT EXISTS '
+        f'{quoted_schema}."{online_name}" '
+        f'AS SELECT * FROM {quoted_schema}."{table}" WHERE is_current'
+    )
+    # Unique index on entity keys so REFRESH MATERIALIZED VIEW
+    # CONCURRENTLY can run.
+    target_connection.execute(
+        f'CREATE UNIQUE INDEX IF NOT EXISTS '
+        f'"uq__{online_name}__keys" '
+        f'ON {quoted_schema}."{online_name}" ({keys_sql})'
+    )
+
+
+def _refresh_online_view(*, target_connection: Any, target_cls: Any) -> None:
+    """Phase 19: REFRESH MATERIALIZED VIEW CONCURRENTLY for online FVs.
+
+    CONCURRENTLY requires that the MV has at least one unique index,
+    which `_ensure_online_artifacts` provides. First-time refresh of a
+    freshly-created MV must NOT use CONCURRENTLY (Postgres requires the
+    MV to have been populated at least once non-concurrently). We try
+    CONCURRENTLY first and fall back to plain REFRESH.
+    """
+    if not getattr(target_cls, "__is_feature_view__", False):
+        return
+    if not getattr(target_cls, "__online__", False):
+        return
+    schema = target_cls.__schema__
+    table = target_cls.__tablename__
+    online_name = f"{table}__online"
+    quoted = f'"{schema}"."{online_name}"'
+    try:
+        target_connection.execute(
+            f"REFRESH MATERIALIZED VIEW CONCURRENTLY {quoted}"
+        )
+    except Exception:
+        target_connection.execute(f"REFRESH MATERIALIZED VIEW {quoted}")
+
+
 def _upsert_feature_view_metadata_for_target(
     *, target_connection: Any, target_cls: Any
 ) -> None:

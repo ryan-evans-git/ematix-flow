@@ -124,6 +124,49 @@ class FeatureView(ManagedTable):
         return dict(row) if row else None
 
     @classmethod
+    def online_features(
+        cls,
+        conn: Any,
+        *,
+        entity_keys: dict[str, Any],
+        columns: list[str] | None = None,
+    ) -> dict[str, Any] | None:
+        """Phase 19: query the `<schema>.<table>__online` materialized view
+        for sub-millisecond inference reads against the current versions.
+
+        Requires the FeatureView to have been declared with `online=True`
+        and synced at least once (the MV is created/refreshed at sync time).
+        """
+        if not getattr(cls, "__online__", False):
+            raise RuntimeError(
+                f"{cls.__name__}.online_features requires online=True on the "
+                "@ematix.feature_view decoration"
+            )
+        keys = _validate_entity_keys(cls, entity_keys)
+        cols = _resolve_columns(cls, columns)
+
+        psycopg2 = _require_psycopg2()
+        from psycopg2.extras import RealDictCursor
+
+        cols_sql = ", ".join(f'"{c}"' for c in cols)
+        where_keys = " AND ".join(f'"{k}" = %s' for k in keys)
+        sql = (
+            f"SELECT {cols_sql} "
+            f'FROM "{cls.__schema__}"."{cls.__tablename__}__online" '
+            f"WHERE {where_keys} "
+            f"LIMIT 1"
+        )
+        params = [entity_keys[k] for k in keys]
+        pg = psycopg2.connect(conn.dsn())
+        try:
+            with pg.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(sql, params)
+                row = cur.fetchone()
+        finally:
+            pg.close()
+        return dict(row) if row else None
+
+    @classmethod
     def historical_features(
         cls,
         conn: Any,

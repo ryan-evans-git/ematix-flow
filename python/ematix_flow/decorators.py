@@ -1251,6 +1251,16 @@ class _EmatixNamespace:
                         except Exception:
                             # Metadata is best-effort — don't fail the pipeline.
                             pass
+                        # Phase 19: ensure + refresh online MV for online=True FVs.
+                        try:
+                            _p._ensure_online_artifacts(
+                                target_connection=tgt_conn, target_cls=target
+                            )
+                            _p._refresh_online_view(
+                                target_connection=tgt_conn, target_cls=target
+                            )
+                        except Exception:
+                            pass
 
                     # Phase 27a/b: post-load transforms.
                     if transforms_post:
