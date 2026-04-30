@@ -137,6 +137,38 @@ def _cmd_dry_run(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_validate(args: argparse.Namespace) -> int:
+    _import_user_module(args.module)
+    try:
+        result = p.validate(args.name)
+    except KeyError:
+        print(f"error: no pipeline named {args.name!r}", file=sys.stderr)
+        return 2
+    except TypeError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+    if args.format == "json":
+        print(
+            json.dumps(
+                {
+                    "pipeline_name": result.pipeline_name,
+                    "ok": result.ok,
+                    "source_sql": result.source_sql,
+                    "errors": result.errors,
+                    "target_connection_name": result.target_connection_name,
+                }
+            )
+        )
+        return 0 if result.ok else 1
+    if result.ok:
+        print(f"{result.pipeline_name}: ok")
+        return 0
+    print(f"{result.pipeline_name}: failed", file=sys.stderr)
+    for err in result.errors:
+        print(f"  - {err}", file=sys.stderr)
+    return 1
+
+
 def _cmd_connections_set(args: argparse.Namespace) -> int:
     if "=" not in args.assignment:
         print(
@@ -209,6 +241,16 @@ def main(argv: list[str] | None = None) -> int:
     dry_p.add_argument("--format", choices=["text", "json"], default="text")
     dry_p.add_argument("--no-color", action="store_true")
     dry_p.set_defaults(func=_cmd_dry_run)
+
+    # `flow validate` (Phase 26): EXPLAIN the synthesized source SQL.
+    val_p = sub.add_parser(
+        "validate",
+        help="EXPLAIN the synthesized source SQL against the target connection",
+    )
+    val_p.add_argument("name", help="pipeline name (matches @ematix.pipeline name=)")
+    val_p.add_argument("--module", required=True)
+    val_p.add_argument("--format", choices=["text", "json"], default="text")
+    val_p.set_defaults(func=_cmd_validate)
 
     # `flow connections {list,check,set}` subcommands (Phase 21).
     conn_p = sub.add_parser("connections", help="manage named DB connections")

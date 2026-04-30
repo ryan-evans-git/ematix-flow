@@ -435,3 +435,74 @@ def preview(name: str, *, dry_run: bool = False) -> Any:
 def dry_run(name: str) -> Any:
     """Convenience: `preview(name, dry_run=True)`."""
     return preview(name, dry_run=True)
+
+
+@dataclass(frozen=True)
+class ValidateResult:
+    """Phase 26: result of `flow validate <pipeline>`.
+
+    `ok` is True when every per-target EXPLAIN succeeded.
+    `source_sql` is the synthesized SQL that was EXPLAINed.
+    `errors` is a list of human-readable strings, one per failure.
+    """
+
+    pipeline_name: str
+    ok: bool
+    source_sql: str
+    errors: list[str]
+    target_connection_name: str | None = None
+
+
+def validate(name: str) -> ValidateResult:
+    """Validate a pipeline by running `EXPLAIN` against the target
+    connection on the synthesized source SQL.
+
+    Catches type/syntax errors at user-controlled times (CI, pre-deploy)
+    without taxing decoration. Does not run any DML.
+    """
+    sp = _REGISTRY.get(name)
+    if sp is None:
+        raise KeyError(name)
+    plan = preview(name)
+    source_sql = plan.source_sql
+    errors: list[str] = []
+
+    # Resolve the target connection. Multi-target pipelines may have
+    # per-target connection overrides; for now validate against each
+    # distinct connection. Single-target uses the pipeline's
+    # target_connection (or default).
+    from ematix_flow import config as _config
+
+    seen_conns: set[tuple[str | None, str | None]] = set()
+    targets_info: list[tuple[str | None, dict | None]] = []
+    if plan.targets:
+        for t in plan.targets:
+            key = (t.target_connection_name, str(t.target_connection_info))
+            if key in seen_conns:
+                continue
+            seen_conns.add(key)
+            targets_info.append((t.target_connection_name, t.target_connection_info))
+    if not targets_info:
+        targets_info = [(None, None)]
+
+    primary_conn_name: str | None = None
+    for conn_name, _info in targets_info:
+        try:
+            conn = _config.connect(conn_name) if conn_name else _config.connect()
+        except Exception as e:
+            errors.append(f"could not resolve connection {conn_name!r}: {e}")
+            continue
+        if primary_conn_name is None:
+            primary_conn_name = conn_name
+        try:
+            conn.execute(f"EXPLAIN {source_sql}")
+        except Exception as e:
+            errors.append(str(e))
+
+    return ValidateResult(
+        pipeline_name=name,
+        ok=not errors,
+        source_sql=source_sql,
+        errors=errors,
+        target_connection_name=primary_conn_name,
+    )

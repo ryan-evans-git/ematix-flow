@@ -28,10 +28,28 @@ const DEFAULT_PORT: u16 = 5432;
 pub enum PgError {
     #[error("invalid connection URL: {0}")]
     Url(String),
-    #[error("postgres error: {0}")]
+    #[error("postgres error: {}", format_pg_error(.0))]
     Postgres(#[from] tokio_postgres::Error),
     #[error("pool error: {0}")]
     Pool(String),
+}
+
+/// `tokio_postgres::Error`'s default Display strips the DB error message
+/// down to "db error". Pull the underlying `DbError` so callers see the
+/// real Postgres message ("column foo does not exist", etc.).
+fn format_pg_error(e: &tokio_postgres::Error) -> String {
+    if let Some(db) = e.as_db_error() {
+        let mut out = format!("{}: {}", db.severity(), db.message());
+        if let Some(detail) = db.detail() {
+            out.push_str(&format!(" ({detail})"));
+        }
+        if let Some(hint) = db.hint() {
+            out.push_str(&format!(" [hint: {hint}]"));
+        }
+        out
+    } else {
+        e.to_string()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
