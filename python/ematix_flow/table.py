@@ -25,6 +25,11 @@ class ManagedTable:
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
         super().__init_subclass__(**kwargs)
+        # Abstract bases (e.g., FeatureView) opt out of validation by
+        # setting `__abstract__ = True` in the class body; concrete
+        # subclasses still go through the full check.
+        if cls.__dict__.get("__abstract__"):
+            return
         if "__schema__" not in {k for c in cls.__mro__ for k in c.__dict__}:
             raise TypeError(f"{cls.__name__} must define __schema__")
         if "__tablename__" not in {k for c in cls.__mro__ for k in c.__dict__}:

@@ -938,6 +938,15 @@ class _EmatixNamespace:
                     f"FeatureView {built.__name__} must declare at least one "
                     "primary key (use `pk()` on the entity-key column)"
                 )
+
+            # Phase 18: re-parent the class to FeatureView so PIT methods
+            # (point_in_time / historical_features) are available.
+            from ematix_flow.feature_view import FeatureView as _FV
+
+            attrs = dict(built.__dict__)
+            for skip in ("__dict__", "__weakref__"):
+                attrs.pop(skip, None)
+            built = type(built.__name__, (_FV,), attrs)
             # Validate event_timestamp_column references a real column.
             if event_timestamp_column is not None:
                 cols = {n for n, _ in built._columns()}
