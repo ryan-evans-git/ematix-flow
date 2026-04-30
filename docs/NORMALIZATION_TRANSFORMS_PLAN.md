@@ -200,8 +200,8 @@ readable and `preview()` can render each layer separately.
 
 | Marker | SQL | Notes |
 |---|---|---|
-| `parse_timestamp(format)` | `to_timestamp(col, format)` | `format` uses Postgres patterns (`YYYY-MM-DD HH24:MI:SS`) |
-| `parse_date(format)` | `to_date(col, format)` | |
+| `parse_timestamp(formats=[...], on_failure="null"\|"error"\|"default", default=...)` | regex-pre-filtered CASE chain over `to_timestamp(col, fmt)` | Phase 26 ships position β (multi-format with built-in regex catalogue). `on_failure="null"` is default — preserves rows when one bad value arrives. `formats=[...]` accepts Postgres format codes (`YYYY-MM-DD HH24:MI:SS`, `MM/DD/YYYY`, etc.). Single-format short form: `parse_timestamp(format=...)` is sugar over `formats=[format]`. |
+| `parse_date(formats=[...], on_failure=..., default=...)` | regex-pre-filtered CASE chain over `to_date` | Same shape as `parse_timestamp`. |
 | `to_timezone(tz)` | `col AT TIME ZONE tz` | |
 | `date_trunc(precision)` | `date_trunc(precision, col)` | `precision = 'day' / 'hour' / ...` |
 
@@ -209,10 +209,13 @@ readable and `preview()` can render each layer separately.
 
 | Marker | SQL |
 |---|---|
-| `parse_int()` | `col::bigint` |
-| `parse_numeric(precision, scale)` | `col::numeric(precision, scale)` |
+| `parse_int(on_failure="null"\|"error"\|"default", default=...)` | regex-validated CASE → `col::bigint` |
+| `parse_numeric(precision, scale, on_failure=..., default=...)` | regex-validated CASE → `col::numeric(p, s)` |
 | `round(precision)` | `round(col, precision)` |
 | `clamp(min, max)` | `least(greatest(col, min), max)` |
+
+`parse_int` / `parse_numeric` follow the same `on_failure` protocol as
+`parse_timestamp`/`parse_date` — `"null"` default preserves rows.
 
 #### Boolean
 
@@ -222,11 +225,11 @@ readable and `preview()` can render each layer separately.
 
 #### NULL handling
 
-| Marker | SQL |
-|---|---|
-| `default(value)` | `COALESCE(col, value)` |
-| `nullif(value)` | `NULLIF(col, value)` |
-| `not_null_or(value)` | `COALESCE(col, value)` (alias for clarity) |
+| Marker | SQL | Notes |
+|---|---|---|
+| `default(value)` | `COALESCE(col, <quoted>)` | Framework quotes per Python type: strings get `''`-escaped single quotes, numerics inlined as literals, booleans → `true`/`false`, `date`/`datetime` → ISO string with `::date`/`::timestamptz` cast. **`default(None)` raises at decoration time** ("use `T \| None` for nullability"). Lists/dicts/bytes raise — punt to `sql()`. |
+| `nullif(value)` | `NULLIF(col, <quoted>)` | Same quoting rules as `default`. |
+| `not_null_or(value)` | `COALESCE(col, <quoted>)` | Alias for `default()` when readability calls for "this column must never be null." |
 
 #### Pipeline-level (transforms_pre)
 
@@ -253,6 +256,15 @@ placeholder for the column name. Compiles to that expression with
 `col` substituted. The user gets full SQL power for the cases the
 named normalizers don't cover.
 
+**Safety contract (locked Q4):**
+- The framework does **not** quote, validate, or escape `sql()`
+  expressions. Users who construct the string from untrusted input
+  own the SQL-injection risk.
+- `preview()` output flags every column carrying a `sql()` marker so
+  the raw expression can be audited before deploy.
+- Use a named normalizer (`default()`, `regex_replace()`, etc.) for
+  parameter-style safety whenever possible.
+
 ### 3.5 Inspection via `preview()`
 
 Phase 25's `preview()` renders the full normalized + transformed SQL
@@ -260,17 +272,35 @@ plan, showing each CTE layer with the normalizer / transform that
 produced it. Users debug "why did this column get blanked" by reading
 the preview output instead of guessing.
 
-### 3.6 Concatenation / derived columns (deferred to Phase 27)
+### 3.6 Concatenation / derived columns (Phase 26, locked Q2)
 
 ```python
-full_name: Annotated[Text, derive("first_name || ' ' || last_name")]
+full_name: Annotated[Text, derive("first_name || ' ' || last_name"), trim()]
 ```
 
-`derive()` is conceptually different from a normalizer — it doesn't
-modify an existing source column, it produces a new one. We'll ship
-it in Phase 27 alongside transformations because the surface area is
-similar (any SQL expression). For Phase 26, users with derived-column
-needs put the expression in the source SELECT directly.
+`derive(expression)` produces a new column from an arbitrary SQL
+expression rather than modifying an existing source column. Ships in
+Phase 26 alongside other normalizers because it's the only way to add
+a computed column when using `source_table=` (no function body to
+modify).
+
+**Position contract (locked Q2 → A.1):** `derive()` must be the
+**first** marker in the chain when present. Subsequent normalizers
+wrap the derived expression naturally:
+
+```python
+# OK — derive first, then trim wraps it
+full_name: Annotated[Text, derive("first_name || ' ' || last_name"), trim()]
+# → trim(first_name || ' ' || last_name) AS full_name
+
+# ERROR at decoration time — derive must be first
+full_name: Annotated[Text, trim(), derive("first_name || ' ' || last_name")]
+```
+
+The framework treats columns with `derive()` differently in source SQL
+synthesis: the column doesn't need to exist in the source query result;
+the derive expression IS the column's value, optionally wrapped by
+later normalizers in the chain.
 
 ---
 
@@ -576,18 +606,40 @@ input type matches the column's declared type. Misuses (`trim()` on a
 - `@ematix.table` decorator collects normalizers per column.
 - `@ematix.pipeline` decorator gains `transforms_pre=[...]` kwarg.
 - Source query synthesis builds CTE-stacked SQL.
-- Validation: type-compatible chains, schema-qualified `sql()` markers.
+- `derive()` marker in Phase 26 (locked Q2 → A.1 — must be first).
+- `default()` strict quoting per Python type (locked Q3 → A); dates +
+  datetimes ship in Phase 26 (locked Q3.2).
+- `parse_timestamp(formats=[...], on_failure=...)` with regex pre-filter
+  catalogue per format (locked Q3.5 → β; default `on_failure="null"`).
+  Same shape for `parse_date`, `parse_int`, `parse_numeric`.
+- `sql()` escape hatch with documented warning + `preview()` flagging
+  (locked Q4 → A — no validation).
+- Pipeline-only `transforms_pre` for cross-row ops (locked Q5 → A —
+  no column-level sugar for dedup/filter/limit/sample).
+- **No** decoration-time type checking on normalizer chains (locked
+  Q1 → A). Postgres runtime errors are the safety net.
 - `preview()` renders the CTE chain with each layer's normalizer.
+
+Plus the Q1 mitigation:
+
+- New `flow validate <pipeline>` CLI subcommand. Runs `EXPLAIN` against
+  the resolved target connection on the synthesized source SQL, surfacing
+  type/syntax errors at user-controlled times (CI, pre-deploy) without
+  taxing decoration. ~30 LOC.
 
 Tests:
 - Unit tests per normalizer (Python → SQL string match).
-- Composition tests (chain of 3+ normalizers).
+- Composition tests (chain of 3+ normalizers, `derive()` position).
+- `default()` quoting per type (string, int, float, bool, date, datetime,
+  None-rejected, unsupported-type-rejected).
+- `parse_timestamp(formats=[...])` with on_failure=null/error/default.
 - Pipeline-level transforms_pre (dedup, filter, limit).
-- `sql()` escape-hatch tests.
-- Type-mismatch validation tests.
+- `sql()` escape-hatch tests + `preview()` flag rendering.
 - Integration: messy CSV → clean target via testcontainers.
+- `flow validate` smoke tests (good pipeline → exit 0; bad type chain
+  → exit nonzero with clear pointer).
 
-### Phase 27 — Transformations + derived columns (≈1.5–2d)
+### Phase 27 — Transformations (≈1.5–2d)
 
 - `transforms_post=[...]` kwarg on `@ematix.pipeline`. Accepts:
   - SQL strings → run on `target_connection` in own tx
@@ -599,43 +651,39 @@ Tests:
   `transform_started` / `transform_success` / `transform_failed`,
   linked to the parent pipeline's run_id.
 - `flow transform list / run` CLI subcommands.
-- `derive("expression")` marker for derived columns (concatenation,
-  computed values).
+- **Idempotency contract (locked Q6 → A):** the framework guarantees
+  idempotency only via the chained-pipeline pattern — write the
+  transformation as `@ematix.pipeline(schedule=None, mode="merge", ...)`
+  and reference by name in `transforms_post`. Raw SQL strings in
+  `transforms_post` are reserved for naturally-idempotent maintenance
+  (`REFRESH MATERIALIZED VIEW`, `ANALYZE`, `VACUUM`). Documentation
+  steers users to the right tool with a clear example.
+
+Note: `derive()` lives in Phase 26 (locked Q2 → A.1) — moved up since
+it unlocks `source_table=` for derived-column use cases.
 
 Tests:
 - Per-pipeline transforms_post string + callable.
+- Chained-pipeline pattern resolves `transforms_post=["other_pipe"]`
+  by name and runs that pipeline's full sync.
 - Halt-on-first vs `continue_on_failure_post`.
-- run_history captures per-transform status.
+- run_history captures per-transform status linked to parent run_id.
 - `@ematix.transform` registers and runs standalone.
 - `flow transform` CLI subcommands.
 
 ---
 
-## 8. Open questions
+## 8. Locked decision log
 
-1. **Normalizer validation timing.** Type-mismatch errors at
-   decoration time would be ideal, but we'd need to introspect the
-   column type without running the decorator. Punt to first run for
-   v0.1?
-2. **Should `derive()` count as normalization or transformation?**
-   It produces a new column from existing ones. I argue it's a
-   transformation (Phase 27) because it's "computing a new value,"
-   while normalizers "fix an existing value." But the user-facing
-   API could treat them as a single bucket if simpler.
-3. **Default value escaping.** `default("US")` vs `default(42)` vs
-   `default(None)`. Current proposal: framework quotes strings,
-   inlines numerics literally, treats `None` as `NULL`. Acceptable?
-4. **`sql()` injection vector.** If user writes
-   `default(user_input)` and `user_input` is attacker-controlled,
-   that's classic SQL injection. Document, don't try to defend.
-5. **Per-column vs per-pipeline `transforms_pre`.** Should
-   `deduplicate_by()` also be available as a column marker? Probably
-   not — it's intrinsically cross-row, but the user-facing question
-   is whether to confuse users by surfacing both forms.
-6. **Idempotency.** `transforms_post=["INSERT INTO summary ..."]` is
-   not idempotent. Should we recommend `INSERT ... ON CONFLICT` or
-   provide an `@ematix.transform` decorator that takes a target table
-   and handles the merge semantics for the user? Probably v0.3.
+| ID | Decision | Recorded |
+|---|---|---|
+| Q1 | No decoration-time type checking. Postgres errors at runtime + `preview()` shows the generated SQL + new `flow validate <pipeline>` CLI subcommand for `EXPLAIN`-based pre-deploy checks. | §6 (Phase 26 plan) |
+| Q2 | `derive(expression)` ships in Phase 26 as a normalization marker. **Must be first** in the chain when present (Position A.1). | §3.6 |
+| Q3 | `default()` uses strict per-type quoting. Strings escape `'` → `''`; numerics inlined; booleans → `true`/`false`; dates/datetimes get ISO + `::date`/`::timestamptz` casts. `default(None)` and unsupported types raise at decoration. | §3.3 (NULL handling) |
+| Q3.5 | `parse_timestamp(formats=[...], on_failure="null"\|"error"\|"default", default=...)` ships in Phase 26 (Position β). Default `on_failure="null"` to preserve rows. Same shape for `parse_date`, `parse_int`, `parse_numeric`. Auto-detect (γ) deferred to a later phase if asked. | §3.3 (date/time, numeric) |
+| Q4 | `sql()` escape hatch is documented as user-owned-risk. No validation, no escaping. `preview()` flags every `sql()` marker for audit. | §3.4 |
+| Q5 | Cross-row operations (`deduplicate_by`, `filter_where`, `limit`, `sample_pct`) live only at the pipeline level via `transforms_pre=[...]`. No column-level sugar. | §3.2 |
+| Q6 | Idempotency for write-many post-load work goes through the chained-pipeline pattern (Phase 27 §4.3). Raw SQL `transforms_post=` is reserved for naturally-idempotent maintenance ops. Strong docs, no separate decorator. | §4.3, Phase 27 |
 
 ---
 
@@ -659,19 +707,36 @@ Tests:
 ## 10. Summary
 
 Normalization (Phase 26) and transformations (Phase 27) layer cleanly
-on top of the existing decorator API.
+on top of the existing decorator API. All seven design questions in
+§8 are locked.
 
 **Normalization** — per-column markers + pipeline-level transforms_pre
 — compiles to CTE-stacked SQL inside the load transaction. Common
-cases (empty→null, trim, parse_timestamp, dedup) get one-line markers
-the user can read at a glance. Custom cases drop to `sql()` with full
-SQL access.
+cases (empty→null, trim, parse_timestamp with multi-format tolerance,
+dedup) get one-line markers the user reads at a glance. The catalogue
+covers every case the user listed plus the high-value extensions a
+real pipeline needs.
+
+`derive()` joins the catalogue (Q2) so `source_table=` users can add
+computed columns without dropping to a function body. Position-required
+first in the chain so SQL composition is unambiguous.
+
+`default()` and the parser markers ship in Phase 26 with strict quoting
+(Q3) and format-resilient `on_failure="null"` defaults (Q3.5) — one bad
+row can't take down a whole load.
+
+`sql()` is the no-validation escape hatch (Q4); `preview()` flags it for
+audit so users can catch their own mistakes before deploy. The new
+`flow validate` CLI (Q1 mitigation) catches type/syntax errors against
+a real connection at user-controlled times.
 
 **Transformations** — pipeline-level `transforms_post` + standalone
 `@ematix.transform` decorator — run after the load commits, each in
 their own transaction, sequentially with halt-on-first by default.
-Three flavors: SQL strings (refresh / analyze), callables, and
-references to other registered pipelines (chaining).
+The chained-pipeline pattern (Q6) is the canonical idempotent path:
+write the transformation as `@ematix.pipeline(schedule=None, mode="merge")`
+and reference by name. Raw SQL is reserved for naturally-idempotent
+maintenance (REFRESH, ANALYZE, VACUUM).
 
 The split keeps the user's mental model crisp: "before write =
 normalization (declarative, atomic with the load)," "after write =
