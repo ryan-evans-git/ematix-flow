@@ -21,7 +21,7 @@ import sys
 from datetime import datetime, timezone
 from typing import Any
 
-from ematix_flow import pipeline as p
+from ematix_flow import config, pipeline as p
 
 
 def _parse_iso(s: str) -> datetime:
@@ -74,6 +74,45 @@ def _cmd_run_due(args: argparse.Namespace) -> int:
     return 1 if failed else 0
 
 
+def _cmd_connections_list(args: argparse.Namespace) -> int:
+    entries = config.list_connections()
+    if not entries:
+        print("no connections configured")
+        return 0
+    width = max(len(name) for name in entries)
+    for name in sorted(entries):
+        print(f"{name:<{width}}  {entries[name]}")
+    return 0
+
+
+def _cmd_connections_check(args: argparse.Namespace) -> int:
+    ok, message = config.check_connection(args.name)
+    if ok:
+        print(f"{args.name}: ok ({message})")
+        return 0
+    print(f"{args.name}: unreachable — {message}", file=sys.stderr)
+    return 2
+
+
+def _cmd_connections_set(args: argparse.Namespace) -> int:
+    if "=" not in args.assignment:
+        print(
+            f"error: expected NAME=DSN, got {args.assignment!r}",
+            file=sys.stderr,
+        )
+        return 2
+    name, _, dsn = args.assignment.partition("=")
+    if not name or not dsn:
+        print(
+            f"error: NAME and DSN must both be non-empty in {args.assignment!r}",
+            file=sys.stderr,
+        )
+        return 2
+    path = config.set_connection(name, dsn)
+    print(f"wrote connection {name!r} to {path}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="flow", description="ematix-flow CLI")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -104,6 +143,30 @@ def main(argv: list[str] | None = None) -> int:
         "you invoke `flow run-due`",
     )
     due_p.set_defaults(func=_cmd_run_due)
+
+    # `flow connections {list,check,set}` subcommands (Phase 21).
+    conn_p = sub.add_parser("connections", help="manage named DB connections")
+    conn_sub = conn_p.add_subparsers(dest="conn_cmd", required=True)
+
+    conn_list = conn_sub.add_parser("list", help="list configured connections")
+    conn_list.set_defaults(func=_cmd_connections_list)
+
+    conn_check = conn_sub.add_parser(
+        "check", help="verify a configured connection is reachable"
+    )
+    conn_check.add_argument("name")
+    conn_check.set_defaults(func=_cmd_connections_check)
+
+    conn_set = conn_sub.add_parser(
+        "set",
+        help="persist a connection to ~/.ematix-flow/connections.toml",
+    )
+    conn_set.add_argument(
+        "assignment",
+        metavar="NAME=DSN",
+        help="e.g., warehouse=postgres://user:pass@host/db",
+    )
+    conn_set.set_defaults(func=_cmd_connections_set)
 
     args = parser.parse_args(argv)
     return args.func(args)
