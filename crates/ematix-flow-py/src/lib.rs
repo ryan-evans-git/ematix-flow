@@ -177,6 +177,42 @@ impl Connection {
             .map_err(|e| PyValueError::new_err(e.to_string()))
     }
 
+    /// Phase 27a: record a transforms_post step in run_history. The
+    /// step's SQL/callable is invoked from Python; this only records
+    /// the outcome row.
+    #[pyo3(signature = (parent_run_id, pipeline_name, step_name, status, target_schema, target_table, error_message=None, metrics_json=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn record_transform_history(
+        &self,
+        py: Python<'_>,
+        parent_run_id: String,
+        pipeline_name: String,
+        step_name: String,
+        status: String,
+        target_schema: String,
+        target_table: String,
+        error_message: Option<String>,
+        metrics_json: Option<String>,
+    ) -> PyResult<()> {
+        let pool = self.pool.clone();
+        py.detach(|| {
+            rt().block_on(async move {
+                pool.insert_transform_history(
+                    &parent_run_id,
+                    &pipeline_name,
+                    &step_name,
+                    &status,
+                    &target_schema,
+                    &target_table,
+                    error_message.as_deref(),
+                    metrics_json.as_deref(),
+                )
+                .await
+            })
+        })
+        .map_err(|e| PyValueError::new_err(e.to_string()))
+    }
+
     /// (host, port, dbname, user) tuple. Used Python-side to detect the
     /// same-DB vs cross-DB code path before calling run_append.
     fn connection_info<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {

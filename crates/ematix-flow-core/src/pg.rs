@@ -423,6 +423,18 @@ impl PgPool {
             "ALTER TABLE {META_SCHEMA}.{RUN_HISTORY_TABLE} \
              ADD COLUMN IF NOT EXISTS rows_unchanged BIGINT"
         );
+        let alter_parent_run_id = format!(
+            "ALTER TABLE {META_SCHEMA}.{RUN_HISTORY_TABLE} \
+             ADD COLUMN IF NOT EXISTS parent_run_id UUID"
+        );
+        let alter_step_name = format!(
+            "ALTER TABLE {META_SCHEMA}.{RUN_HISTORY_TABLE} \
+             ADD COLUMN IF NOT EXISTS step_name TEXT"
+        );
+        let alter_metrics_json = format!(
+            "ALTER TABLE {META_SCHEMA}.{RUN_HISTORY_TABLE} \
+             ADD COLUMN IF NOT EXISTS metrics_json TEXT"
+        );
         let create_watermarks = format!(
             "CREATE TABLE IF NOT EXISTS {META_SCHEMA}.{WATERMARKS_TABLE} (
                 pipeline_name TEXT PRIMARY KEY,
@@ -436,9 +448,63 @@ impl PgPool {
             create_table,
             alter_updated,
             alter_unchanged,
+            alter_parent_run_id,
+            alter_step_name,
+            alter_metrics_json,
             create_watermarks,
         ])
         .await
+    }
+
+    /// Phase 27a: record a `transforms_post` step's outcome. Each step
+    /// gets its own run_history row linked to the parent's run_id via
+    /// `parent_run_id`. `metrics_json` is the optional dict the callable
+    /// returned (Phase 27 §4.2 / Q3.1) — None for SQL-string steps.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn insert_transform_history(
+        &self,
+        parent_run_id: &str,
+        pipeline_name: &str,
+        step_name: &str,
+        status: &str,
+        target_schema: &str,
+        target_table: &str,
+        error_message: Option<&str>,
+        metrics_json: Option<&str>,
+    ) -> Result<(), PgError> {
+        self.ensure_meta_schema().await?;
+        let parent_uuid = Uuid::parse_str(parent_run_id)
+            .map_err(|e| PgError::Pool(format!("invalid parent_run_id: {e}")))?;
+        let row_id = Uuid::new_v4();
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| PgError::Pool(e.to_string()))?;
+        client
+            .execute(
+                &format!(
+                    "INSERT INTO {META_SCHEMA}.{RUN_HISTORY_TABLE} \
+                     (run_id, parent_run_id, pipeline_name, target_schema, target_table, \
+                      mode, path, started_at, finished_at, status, step_name, \
+                      error_message, metrics_json) \
+                     VALUES ($1, $2, $3, $4, $5, 'transform', 'post', now(), now(), \
+                             $6, $7, $8, $9)"
+                ),
+                &[
+                    &row_id,
+                    &parent_uuid,
+                    &pipeline_name,
+                    &target_schema,
+                    &target_table,
+                    &status,
+                    &step_name,
+                    &error_message,
+                    &metrics_json,
+                ],
+            )
+            .await?;
+        Ok(())
     }
 
     pub async fn read_watermark(

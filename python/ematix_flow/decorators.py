@@ -559,6 +559,67 @@ def _plan_one_target(
     )
 
 
+def _run_transforms_post(
+    *,
+    transforms_post: list[Any],
+    target_connection: Any,
+    target_cls: type[ManagedTable] | None,
+    pipeline_name: str,
+    parent_run_id: str | None,
+    continue_on_failure: bool,
+) -> None:
+    """Phase 27a: run each transforms_post entry in its own transaction.
+
+    For SQL strings (Phase 27a only): execute, record outcome row in
+    run_history. Halt on first failure unless continue_on_failure=True.
+
+    Function refs and `transform_ref(...)` lookups land in Phases
+    27b/27c.
+    """
+    if not parent_run_id:
+        # Defensive: no run_id means we can't link transforms back to a
+        # parent. Skip rather than orphan rows.
+        return
+
+    target_schema = target_cls.__schema__ if target_cls else ""
+    target_table = target_cls.__tablename__ if target_cls else ""
+
+    for i, step in enumerate(transforms_post):
+        if isinstance(step, str):
+            step_name = f"transform[{i}]:sql"
+            try:
+                target_connection.execute(step)
+                target_connection.record_transform_history(
+                    parent_run_id,
+                    pipeline_name,
+                    step_name,
+                    "transform_success",
+                    target_schema,
+                    target_table,
+                    None,
+                    None,
+                )
+            except Exception as e:
+                target_connection.record_transform_history(
+                    parent_run_id,
+                    pipeline_name,
+                    step_name,
+                    "transform_failed",
+                    target_schema,
+                    target_table,
+                    str(e),
+                    None,
+                )
+                if not continue_on_failure:
+                    raise
+        else:
+            raise TypeError(
+                f"transforms_post[{i}] is {type(step).__name__}; "
+                "Phase 27a only supports SQL string entries (Phases 27b/27c "
+                "add callables and transform_ref lookups)"
+            )
+
+
 def _execute_dry_run(
     *,
     fn: Callable[..., Any],
@@ -726,6 +787,8 @@ class _EmatixNamespace:
         force_path: str | None = None,
         continue_on_failure: bool = False,
         transforms_pre: list[Any] | None = None,
+        transforms_post: list[Any] | None = None,
+        continue_on_failure_post: bool = False,
     ):
         """Function decorator. Wraps `pipeline.sync` and registers via the
         Phase 12 scheduling registry.
@@ -841,7 +904,7 @@ class _EmatixNamespace:
                 from ematix_flow import pipeline as _p
 
                 if target is not None:
-                    return _p.sync(
+                    sync_result = _p.sync(
                         target=target,
                         source=source_obj,
                         target_connection=tgt_conn,
@@ -856,6 +919,17 @@ class _EmatixNamespace:
                         on_drift=on_drift,
                         force_path=force_path,
                     )
+                    # Phase 27a: post-load transforms.
+                    if transforms_post:
+                        _run_transforms_post(
+                            transforms_post=transforms_post,
+                            target_connection=tgt_conn,
+                            target_cls=target,
+                            pipeline_name=name or fn.__name__,
+                            parent_run_id=sync_result.get("run_id"),
+                            continue_on_failure=continue_on_failure_post,
+                        )
+                    return sync_result
 
                 # Multi-target.
                 results: dict[str, Any] = {}
