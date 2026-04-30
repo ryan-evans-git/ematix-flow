@@ -19,6 +19,9 @@ class ManagedTable:
     __tablename__: ClassVar[str]
     __columns__: ClassVar[tuple[tuple[str, Column], ...]]
     __unique_constraints__: ClassVar[tuple[tuple[str, ...], ...]] = ()
+    # Phase 23: explicit class-level merge-key default. None = unset, fall
+    # through to __unique_constraints__[0] then primary keys.
+    __merge_keys__: ClassVar[tuple[str, ...] | None] = None
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
         super().__init_subclass__(**kwargs)

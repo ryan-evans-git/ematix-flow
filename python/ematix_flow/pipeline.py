@@ -69,6 +69,60 @@ _METADATA_COLS = ("_loaded_at", "_batch_id")
 _SCD2_META_COLS = ("valid_from", "valid_to", "is_current", "row_hash")
 
 
+def _resolve_merge_keys(
+    target: type[ManagedTable],
+    *,
+    passed: tuple[str, ...] | None,
+    pipeline_name: str | None = None,
+) -> list[str]:
+    """Phase 23: pick the merge target columns.
+
+    Resolution order (highest priority first):
+      1. explicit `passed` (from pipeline.sync(keys=...) or @ematix.pipeline)
+      2. `__merge_keys__` class dunder
+      3. first `__unique_constraints__` entry
+      4. `__primary_keys__` (derived from primary_key=True columns)
+
+    When the resolved keys come from steps 2 or 3 and differ from the
+    primary key, emit a UserWarning so the user knows what got picked.
+    Pass an explicit `keys=` to silence.
+    """
+    import warnings
+
+    pks = target._primary_keys()
+
+    if passed is not None:
+        return list(passed)
+
+    dunder = getattr(target, "__merge_keys__", None)
+    if dunder:
+        resolved = list(dunder)
+        if list(resolved) != list(pks):
+            warnings.warn(
+                f"pipeline {pipeline_name!r}: merge keys resolved to {tuple(resolved)} "
+                f"from __merge_keys__, which differs from declared primary key "
+                f"{tuple(pks)}. Pass keys=... explicitly to silence.",
+                UserWarning,
+                stacklevel=3,
+            )
+        return resolved
+
+    uniques = getattr(target, "__unique_constraints__", ())
+    if uniques:
+        resolved = list(uniques[0])
+        if list(resolved) != list(pks):
+            warnings.warn(
+                f"pipeline {pipeline_name!r}: merge keys resolved to {tuple(resolved)} "
+                f"from natural_key()/__unique_constraints__, which differs from declared "
+                f"primary key {tuple(pks)}. Pass keys=... explicitly to silence.",
+                UserWarning,
+                stacklevel=3,
+            )
+        return resolved
+
+    return list(pks)
+
+
 def _column_type_to_sql(target: type[ManagedTable], column: str) -> str:
     """Look up the Postgres SQL type for `column` on `target`. Used to
     cast a watermark text value back to the column's native type."""
@@ -211,10 +265,13 @@ def sync(
         return target_connection.run_truncate(augmented_json, source.query, name, src_arg)
 
     if mode == "scd2":
-        resolved_keys = list(keys) if keys else target._primary_keys()
+        resolved_keys = _resolve_merge_keys(
+            target, passed=keys, pipeline_name=pipeline_name
+        )
         if not resolved_keys:
             raise ValueError(
-                "mode='scd2' requires keys; pass keys=... or declare primary_key columns"
+                "mode='scd2' requires keys; pass keys=..., declare __merge_keys__, "
+                "add a unique_constraint / natural_key, or declare primary_key columns"
             )
         if compare_columns is None:
             all_cols = [n for n, _ in target._columns()]
@@ -243,10 +300,13 @@ def sync(
         )
 
     # merge / scd1
-    resolved_keys = list(keys) if keys else target._primary_keys()
+    resolved_keys = _resolve_merge_keys(
+        target, passed=keys, pipeline_name=pipeline_name
+    )
     if not resolved_keys:
         raise ValueError(
-            f"mode={mode!r} requires keys; pass keys=... or declare primary_key columns"
+            f"mode={mode!r} requires keys; pass keys=..., declare __merge_keys__, "
+            "add a unique_constraint / natural_key, or declare primary_key columns"
         )
     if update_columns is None:
         all_cols = [n for n, _ in target._columns()]
