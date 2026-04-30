@@ -200,6 +200,7 @@ def _write_df_impl(
         schema=schema,
         table=table,
         mode=mode,
+        keys=keys,
     )
 
 
@@ -308,29 +309,57 @@ def _write_df_inferred(
     schema: str,
     table: str,
     mode: str,
+    keys: tuple[str, ...] | None = None,
 ) -> dict[str, Any]:
-    """Q8.2 γ: inferred path — no metadata columns. Create the table from
-    df dtypes if missing; for now only support 'append' (other modes need
-    user-declared keys, which inference doesn't have).
+    """Q8.2 γ: inferred path — no metadata columns.
+
+    Supported modes:
+      - append: COPY into the existing/created table.
+      - truncate: TRUNCATE then COPY.
+      - merge / scd1: requires explicit keys=. Stages via uuid temp table,
+        then INSERT...ON CONFLICT (keys) DO UPDATE SET non_keys.
+      - scd2: rejected — needs SCD2 metadata columns the inferred path
+        can't synthesize. Use target=ManagedTable for SCD2.
     """
-    if mode != "append":
+    if mode == "scd2":
         raise NotImplementedError(
-            f"inferred write_df (no target=) currently only supports mode='append'; "
-            f"declare a @ematix.table class and pass target= for mode={mode!r}"
+            "inferred write_df does not support mode='scd2' — declare a "
+            "@ematix.table class and pass target= for SCD2"
         )
+    if mode not in ("append", "truncate", "merge", "scd1"):
+        raise ValueError(
+            f"inferred write_df: unsupported mode={mode!r}; "
+            "expected 'append', 'truncate', 'merge', or 'scd1'"
+        )
+
     psycopg2 = _require_psycopg2()
     if kind == "polars":
         cols_with_types = _polars_schema_to_pg(df)
-        cols = [c for c, _ in cols_with_types]
     else:
         cols_with_types = _pandas_schema_to_pg(df)
-        cols = [c for c, _ in cols_with_types]
+    cols = [c for c, _ in cols_with_types]
     decls = ", ".join(f'"{c}" {t}' for c, t in cols_with_types)
+
+    if mode in ("merge", "scd1"):
+        if not keys:
+            raise ValueError(
+                f"inferred write_df mode={mode!r} requires keys=[...]; "
+                "without a target= the framework can't infer the upsert key"
+            )
+        unknown = [k for k in keys if k not in cols]
+        if unknown:
+            raise ValueError(
+                f"keys={list(keys)} reference column(s) not in the DataFrame: "
+                f"{unknown} (have: {cols})"
+            )
 
     self.execute(f"CREATE SCHEMA IF NOT EXISTS {schema}")
     self.execute(
         f'CREATE TABLE IF NOT EXISTS "{schema}"."{table}" ({decls})'
     )
+
+    if mode == "truncate":
+        self.execute(f'TRUNCATE TABLE "{schema}"."{table}"')
 
     pg = psycopg2.connect(self.dsn())
     try:
@@ -340,16 +369,54 @@ def _write_df_inferred(
             if kind == "polars"
             else _df_to_csv_bytes_pandas(df, cols)
         )
+
+        if mode in ("append", "truncate"):
+            with pg.cursor() as cur:
+                cur.copy_expert(
+                    f'COPY "{schema}"."{table}" '
+                    f'({", ".join(chr(34) + c + chr(34) for c in cols)}) '
+                    f"FROM STDIN WITH (FORMAT CSV)",
+                    io.BytesIO(csv_bytes),
+                )
+            return {
+                "rows_inserted": len(df),
+                "path": f"inferred_{mode}",
+            }
+
+        # merge / scd1: stage to a uuid table → INSERT ... ON CONFLICT.
+        staging = f"_ematix_df_{uuid.uuid4().hex[:12]}"
         with pg.cursor() as cur:
+            cur.execute(f'CREATE TABLE "{staging}" ({decls})')
             cur.copy_expert(
-                f'COPY "{schema}"."{table}" '
+                f'COPY "{staging}" '
                 f'({", ".join(chr(34) + c + chr(34) for c in cols)}) '
                 f"FROM STDIN WITH (FORMAT CSV)",
                 io.BytesIO(csv_bytes),
             )
+            non_keys = [c for c in cols if c not in keys]
+            target_cols = ", ".join(f'"{c}"' for c in cols)
+            conflict_cols = ", ".join(f'"{k}"' for k in keys)
+            if non_keys:
+                set_clause = ", ".join(
+                    f'"{c}" = EXCLUDED."{c}"' for c in non_keys
+                )
+                upsert = (
+                    f'INSERT INTO "{schema}"."{table}" ({target_cols}) '
+                    f'SELECT {target_cols} FROM "{staging}" '
+                    f"ON CONFLICT ({conflict_cols}) DO UPDATE SET {set_clause}"
+                )
+            else:
+                # All columns are keys → DO NOTHING is the only sensible upsert.
+                upsert = (
+                    f'INSERT INTO "{schema}"."{table}" ({target_cols}) '
+                    f'SELECT {target_cols} FROM "{staging}" '
+                    f"ON CONFLICT ({conflict_cols}) DO NOTHING"
+                )
+            cur.execute(upsert)
+            cur.execute(f'DROP TABLE IF EXISTS "{staging}"')
+        return {"rows_inserted": len(df), "path": "inferred_merge"}
     finally:
         pg.close()
-    return {"rows_inserted": len(df), "path": "inferred"}
 
 
 # --- monkey-patch on import ----------------------------------------------
