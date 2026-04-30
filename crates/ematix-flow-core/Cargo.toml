@@ -12,4 +12,7 @@ description = "Rust core for ematix-flow: declarative table management and load 
 name = "ematix_flow_core"
 
 [dependencies]
-# Phase 3 will add tokio-postgres, deadpool-postgres, serde, etc.
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+# Phase 3 will add tokio-postgres, deadpool-postgres, etc.
