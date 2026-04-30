@@ -43,6 +43,9 @@ flow = "ematix_flow.cli:main"
 df = [
     "psycopg2-binary>=2.9",
 ]
+spark = [
+    "pyspark>=3.4",
+]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
@@ -74,5 +77,6 @@ select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
 testpaths = ["tests/python"]
 markers = [
     "integration: requires a live Postgres (slow, opt-in)",
+    "spark: requires pyspark + a Postgres JDBC jar (slow, opt-in)",
 ]
-addopts = "-ra --strict-markers -m 'not integration'"
+addopts = "-ra --strict-markers -m 'not integration and not spark'"

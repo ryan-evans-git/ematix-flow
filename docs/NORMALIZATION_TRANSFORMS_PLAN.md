@@ -728,20 +728,29 @@ Tests:
 - Auto-detect picks polars when both installed; pandas-only when only
   pandas; clear ImportError when neither.
 
-### Phase 28 — Spark interop (≈2d, optional extra)
+### Phase 28 — Spark interop (shipped)
 
-Ship as `pip install ematix-flow[spark]`. Adds:
+Available via `pip install ematix-flow[spark]`. The `ematix_flow.spark`
+module monkey-patches `_core.Connection` on import:
 
-- `Connection.read_spark_df(spark_session, sql)` — returns Spark
-  DataFrame backed by the Postgres JDBC driver.
-- `Connection.write_spark_df(df, qualified_name, *, mode, keys=None)` —
-  writes via JDBC, then runs the strategy against the staged data.
-- Documentation that PySpark requires JVM + JDBC jar and is not part of
-  the default install.
+- `conn.read_spark_df(spark_session, sql)` — returns a Spark DataFrame
+  backed by the Postgres JDBC driver.
+- `conn.write_spark_df(df, qualified_name, *, mode, target=, keys=, ...)`
+  — stages via JDBC into a uuid-named table, then routes through the
+  strategy executor (same pattern as Phase 27e write_df). Every mode
+  (append/truncate/merge/scd1/scd2) works for free with a ManagedTable.
 
-Distinct from Phase 27 because Spark's distributed model needs separate
-plumbing (JDBC, SparkSession plumbing, cluster config) that doesn't
-share much with the polars/pandas in-process path.
+The user owns the SparkSession (Spark is heavy: JVM, JDBC jar, cluster
+config). Document the lift, don't hide it. The Postgres JDBC jar is
+typically wired via `SparkSession.builder.config("spark.jars.packages",
+"org.postgresql:postgresql:42.7.x")`.
+
+Distinct from Phase 27e because Spark's distributed model needs separate
+plumbing (JDBC, SparkSession, cluster config) that doesn't share much
+with the polars/pandas in-process path.
+
+Tests under `@pytest.mark.spark` are opt-in (`pytest -m spark`) since
+they require pyspark + JDBC jar download.
 
 ---
 
