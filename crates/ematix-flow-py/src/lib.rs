@@ -14,9 +14,17 @@ fn parse_spec(json: &str) -> PyResult<String> {
     ematix_flow_core::normalize_json(json).map_err(|e| PyValueError::new_err(e.to_string()))
 }
 
+/// Parse a `TableSpec` from JSON, normalize/validate it, and return the
+/// normalized JSON with `fingerprint` populated.
+#[pyfunction]
+fn parse_table_spec(json: &str) -> PyResult<String> {
+    ematix_flow_core::normalize_table_json(json).map_err(|e| PyValueError::new_err(e.to_string()))
+}
+
 #[pymodule]
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(core_version, m)?)?;
     m.add_function(wrap_pyfunction!(parse_spec, m)?)?;
+    m.add_function(wrap_pyfunction!(parse_table_spec, m)?)?;
     Ok(())
 }
