@@ -2,6 +2,7 @@
 //!
 //! See `docs/PRD.md` and `docs/IMPLEMENTATION_PLAN.md` for the design.
 
+pub mod backend;
 pub mod ddl;
 pub mod hash;
 pub mod meta;
@@ -10,6 +11,7 @@ pub mod spec;
 pub mod strategy;
 pub mod types;
 
+pub use backend::{Backend, BackendError, Dialect, ObjectFormat, PostgresBackend, StreamingKind};
 pub use spec::{Mode, PipelineSpec, SourceSpec, SpecError, TargetSpec, normalize_json};
 pub use types::{ColumnSpec, ColumnType, TableSpec, normalize_table_json};
 

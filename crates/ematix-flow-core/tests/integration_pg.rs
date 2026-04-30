@@ -5,6 +5,9 @@
 //! Marked `#[ignore]` so `cargo test` stays fast by default. Run with
 //! `cargo test -p ematix-flow-core -- --ignored` (Docker required).
 
+use std::sync::Arc;
+
+use ematix_flow_core::backend::{Backend, Dialect, PostgresBackend};
 use ematix_flow_core::pg::PgPool;
 use ematix_flow_core::strategy::append::augment_with_metadata;
 use ematix_flow_core::types::{ColumnSpec, ColumnType, TableSpec};
@@ -119,4 +122,35 @@ async fn ensure_table_round_trips_columns() {
 
     // ensure is idempotent: a second call sees Matched, not Drift.
     pool.ensure_table(&target).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker; run with `cargo test -- --ignored`"]
+async fn postgres_backend_trait_dispatches_ping_and_execute() {
+    // Phase 30a: confirm the new Backend trait dispatches over a real
+    // Postgres connection identically to the existing PgPool surface.
+    let (_container, url) = start_postgres().await;
+    let pool = Arc::new(PgPool::connect(&url).await.unwrap());
+    let backend: Arc<dyn Backend> = Arc::new(PostgresBackend::new(pool.clone(), url.clone()));
+
+    assert_eq!(backend.dialect(), Dialect::Postgres);
+    assert_eq!(backend.dsn().as_deref(), Some(url.as_str()));
+
+    backend.ping().await.expect("ping via Backend trait");
+
+    backend
+        .execute("CREATE SCHEMA backend_trait_test")
+        .await
+        .expect("execute via Backend trait");
+    let exists: i32 = pool
+        .fetch_scalar_int(
+            "SELECT count(*)::int FROM information_schema.schemata \
+             WHERE schema_name = 'backend_trait_test'",
+        )
+        .await
+        .unwrap();
+    assert_eq!(exists, 1);
+
+    let info = backend.connection_info();
+    assert_eq!(info.dbname, "postgres");
 }
