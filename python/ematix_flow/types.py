@@ -16,6 +16,28 @@ class ColumnType:
     def to_spec(self) -> dict[str, Any]:
         raise NotImplementedError
 
+    def __or__(self, other: Any) -> Any:
+        # Phase 24a: support `String[256] | None` syntax in type
+        # annotations. Returns a detectable wrapper the table decorator
+        # treats as nullable. For non-`None` operands, defer to the
+        # default behavior so unrelated `|` usage isn't silently coerced.
+        if other is None or other is type(None):
+            return _Nullable(self)
+        return NotImplemented
+
+
+class _Nullable:
+    """Internal: result of `ColumnType_instance | None`. The table
+    decorator detects this and produces a nullable column."""
+
+    __slots__ = ("inner",)
+
+    def __init__(self, inner: ColumnType) -> None:
+        self.inner = inner
+
+    def __repr__(self) -> str:
+        return f"{self.inner!r} | None"
+
 
 def _kind(name: str) -> type[ColumnType]:
     """Build a parameter-less `ColumnType` subclass with kind `name`."""
@@ -58,6 +80,11 @@ class String(ColumnType):
     def to_spec(self) -> dict[str, Any]:
         return {"kind": "string", "length": self.length}
 
+    def __class_getitem__(cls, length: int) -> "String":
+        # Phase 24a: `String[256]` evaluates to `String(256)` so the type
+        # reads cleanly inside `Annotated[...]`.
+        return cls(length)
+
 
 class Numeric(ColumnType):
     def __init__(self, precision: int, scale: int) -> None:
@@ -68,6 +95,15 @@ class Numeric(ColumnType):
 
     def to_spec(self) -> dict[str, Any]:
         return {"kind": "numeric", "precision": self.precision, "scale": self.scale}
+
+    def __class_getitem__(cls, params: tuple[int, int]) -> "Numeric":
+        # Phase 24a: `Numeric[12, 2]` evaluates to `Numeric(12, 2)`.
+        if not isinstance(params, tuple) or len(params) != 2:
+            raise TypeError(
+                "Numeric[...] requires two arguments: Numeric[precision, scale]"
+            )
+        precision, scale = params
+        return cls(precision=precision, scale=scale)
 
 
 @dataclass
