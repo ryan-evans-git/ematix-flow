@@ -7,7 +7,9 @@
 
 use std::sync::Arc;
 
-use ematix_flow_core::backend::{Backend, Dialect, PostgresBackend, TargetTable, WriteMode};
+use ematix_flow_core::backend::{
+    Backend, Dialect, PostgresBackend, StrategyRunResult, TargetTable, WriteMode,
+};
 use ematix_flow_core::pg::PgPool;
 use ematix_flow_core::strategy::append::augment_with_metadata;
 use ematix_flow_core::types::{ColumnSpec, ColumnType, TableSpec};
@@ -16,7 +18,13 @@ use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::postgres::Postgres;
 
 async fn start_postgres() -> (testcontainers::ContainerAsync<Postgres>, String) {
+    use testcontainers::ImageExt;
+    // Use a Postgres version that matches the Python integration tests
+    // (postgres:16-alpine). The testcontainers-modules default image is
+    // postgres:11, which lacks features like `WITH ... AS MATERIALIZED`
+    // CTEs that the merge / scd2 strategies emit.
     let container = Postgres::default()
+        .with_tag("16-alpine")
         .start()
         .await
         .expect("failed to start postgres testcontainer");
@@ -123,6 +131,152 @@ async fn ensure_table_round_trips_columns() {
 
     // ensure is idempotent: a second call sees Matched, not Drift.
     pool.ensure_table(&target).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker; run with `cargo test -- --ignored`"]
+async fn run_append_via_backend_trait_same_db() {
+    // Phase 30d: confirm the strategy executors dispatch through the
+    // Backend trait identically to direct PgPool usage. This is the
+    // surface DuckDB / MySQL / etc. will implement.
+    let (_container, url) = start_postgres().await;
+    let pool = Arc::new(PgPool::connect(&url).await.unwrap());
+    let backend: Arc<dyn Backend> = Arc::new(PostgresBackend::new(pool.clone(), url.clone()));
+
+    pool.execute("CREATE SCHEMA src").await.unwrap();
+    pool.execute("CREATE TABLE src.events (event_id BIGINT PRIMARY KEY, name TEXT)")
+        .await
+        .unwrap();
+    pool.execute("INSERT INTO src.events VALUES (1, 'a'), (2, 'b'), (3, 'c')")
+        .await
+        .unwrap();
+
+    let target = target_spec();
+    pool.ensure_table(&target).await.unwrap();
+
+    let result: StrategyRunResult = backend
+        .run_append(
+            &target,
+            "SELECT event_id, name FROM src.events",
+            "trait_append_test",
+            None,
+            None,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.rows_inserted, 3);
+    assert_eq!(result.path, "same_db");
+    assert_eq!(result.status, "success");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker; run with `cargo test -- --ignored`"]
+async fn run_truncate_via_backend_trait() {
+    let (_container, url) = start_postgres().await;
+    let pool = Arc::new(PgPool::connect(&url).await.unwrap());
+    let backend: Arc<dyn Backend> = Arc::new(PostgresBackend::new(pool.clone(), url.clone()));
+
+    pool.execute("CREATE SCHEMA src").await.unwrap();
+    pool.execute("CREATE TABLE src.events (event_id BIGINT PRIMARY KEY, name TEXT)")
+        .await
+        .unwrap();
+    pool.execute("INSERT INTO src.events VALUES (1, 'a'), (2, 'b')")
+        .await
+        .unwrap();
+
+    let target = target_spec();
+    pool.ensure_table(&target).await.unwrap();
+    // Pre-seed the target so truncate has something to clear.
+    backend
+        .run_append(
+            &target,
+            "SELECT 99::bigint AS event_id, 'old'::text AS name",
+            "trait_truncate_seed",
+            None,
+            None,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+
+    let result = backend
+        .run_truncate(
+            &target,
+            "SELECT event_id, name FROM src.events",
+            "trait_truncate_test",
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.rows_inserted, 2);
+    let count = pool
+        .fetch_scalar_int(&format!(
+            "SELECT count(*)::int FROM {}.{}",
+            target.schema, target.name
+        ))
+        .await
+        .unwrap();
+    assert_eq!(count, 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker; run with `cargo test -- --ignored`"]
+async fn run_merge_via_backend_trait() {
+    let (_container, url) = start_postgres().await;
+    let pool = Arc::new(PgPool::connect(&url).await.unwrap());
+    let backend: Arc<dyn Backend> = Arc::new(PostgresBackend::new(pool.clone(), url.clone()));
+
+    pool.execute("CREATE SCHEMA src").await.unwrap();
+    pool.execute("CREATE TABLE src.events (event_id BIGINT PRIMARY KEY, name TEXT)")
+        .await
+        .unwrap();
+    pool.execute("INSERT INTO src.events VALUES (1, 'a'), (2, 'b')")
+        .await
+        .unwrap();
+
+    let target = target_spec();
+    pool.ensure_table(&target).await.unwrap();
+
+    // First run: insert.
+    let result = backend
+        .run_merge(
+            &target,
+            "SELECT event_id, name FROM src.events",
+            &["event_id".to_string()],
+            &["name".to_string()],
+            "trait_merge_test",
+            "merge",
+            None,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.rows_inserted, 2);
+
+    // Update: change name for event_id=1.
+    pool.execute("UPDATE src.events SET name = 'a-new' WHERE event_id = 1")
+        .await
+        .unwrap();
+    let result2 = backend
+        .run_merge(
+            &target,
+            "SELECT event_id, name FROM src.events",
+            &["event_id".to_string()],
+            &["name".to_string()],
+            "trait_merge_test",
+            "merge",
+            None,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+    assert_eq!(result2.rows_updated, Some(1));
 }
 
 #[tokio::test(flavor = "multi_thread")]
