@@ -24,7 +24,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use arrow_array::builder::{
-    BooleanBuilder, Int32Builder, Int64Builder, StringBuilder, TimestampMicrosecondBuilder,
+    BinaryBuilder, BooleanBuilder, Float32Builder, Float64Builder, Int16Builder,
+    Int32Builder, Int64Builder, StringBuilder, TimestampMicrosecondBuilder,
 };
 use arrow_array::{Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
@@ -627,14 +628,21 @@ fn quote_ident(name: &str) -> String {
 
 fn pg_type_to_arrow(ty: &PgType) -> Result<DataType, BackendError> {
     Ok(match ty.oid() {
-        20 => DataType::Int64,                                       // INT8
+        21 => DataType::Int16,                                       // INT2
         23 => DataType::Int32,                                       // INT4
-        25 | 1043 | 1042 => DataType::Utf8,                          // TEXT/VARCHAR/BPCHAR
+        20 => DataType::Int64,                                       // INT8
+        700 => DataType::Float32,                                    // FLOAT4 (REAL)
+        701 => DataType::Float64,                                    // FLOAT8 (DOUBLE)
         16 => DataType::Boolean,                                     // BOOL
+        25 | 1043 | 1042 => DataType::Utf8,                          // TEXT/VARCHAR/BPCHAR
+        17 => DataType::Binary,                                      // BYTEA
+        2950 => DataType::Utf8,                                      // UUID (carry as text)
+        114 | 3802 => DataType::Utf8,                                // JSON / JSONB (text rep)
         1184 | 1114 => DataType::Timestamp(TimeUnit::Microsecond, None), // TIMESTAMPTZ/TIMESTAMP
         _ => {
             return Err(BackendError::TypeMapping(format!(
-                "Phase 30b Postgres → Arrow: unsupported type {} (oid={})",
+                "Postgres → Arrow: unsupported type {} (oid={}); \
+                 add a builder in pg_type_to_arrow / pg_rows_to_record_batch",
                 ty.name(),
                 ty.oid()
             )));
@@ -660,14 +668,16 @@ fn pg_rows_to_record_batch(
 
     let mut arrays: Vec<StdArc<dyn Array>> = Vec::with_capacity(columns.len());
     for (idx, col) in columns.iter().enumerate() {
+        let pg_oid = col.type_().oid();
         let dt = pg_type_to_arrow(col.type_())?;
+        let cap = rows.len();
         let array: StdArc<dyn Array> = match dt {
-            DataType::Int64 => {
-                let mut b = Int64Builder::with_capacity(rows.len());
+            DataType::Int16 => {
+                let mut b = Int16Builder::with_capacity(cap);
                 for row in rows {
-                    let v: Option<i64> = row.try_get(idx).map_err(|e| {
+                    let v: Option<i16> = row.try_get(idx).map_err(|e| {
                         BackendError::TypeMapping(format!(
-                            "row[{idx}] {} → i64: {e}",
+                            "row[{idx}] {} → i16: {e}",
                             col.name()
                         ))
                     })?;
@@ -676,7 +686,7 @@ fn pg_rows_to_record_batch(
                 StdArc::new(b.finish())
             }
             DataType::Int32 => {
-                let mut b = Int32Builder::with_capacity(rows.len());
+                let mut b = Int32Builder::with_capacity(cap);
                 for row in rows {
                     let v: Option<i32> = row.try_get(idx).map_err(|e| {
                         BackendError::TypeMapping(format!(
@@ -688,12 +698,38 @@ fn pg_rows_to_record_batch(
                 }
                 StdArc::new(b.finish())
             }
-            DataType::Utf8 => {
-                let mut b = StringBuilder::with_capacity(rows.len(), rows.len() * 16);
+            DataType::Int64 => {
+                let mut b = Int64Builder::with_capacity(cap);
                 for row in rows {
-                    let v: Option<&str> = row.try_get(idx).map_err(|e| {
+                    let v: Option<i64> = row.try_get(idx).map_err(|e| {
                         BackendError::TypeMapping(format!(
-                            "row[{idx}] {} → text: {e}",
+                            "row[{idx}] {} → i64: {e}",
+                            col.name()
+                        ))
+                    })?;
+                    b.append_option(v);
+                }
+                StdArc::new(b.finish())
+            }
+            DataType::Float32 => {
+                let mut b = Float32Builder::with_capacity(cap);
+                for row in rows {
+                    let v: Option<f32> = row.try_get(idx).map_err(|e| {
+                        BackendError::TypeMapping(format!(
+                            "row[{idx}] {} → f32: {e}",
+                            col.name()
+                        ))
+                    })?;
+                    b.append_option(v);
+                }
+                StdArc::new(b.finish())
+            }
+            DataType::Float64 => {
+                let mut b = Float64Builder::with_capacity(cap);
+                for row in rows {
+                    let v: Option<f64> = row.try_get(idx).map_err(|e| {
+                        BackendError::TypeMapping(format!(
+                            "row[{idx}] {} → f64: {e}",
                             col.name()
                         ))
                     })?;
@@ -702,7 +738,7 @@ fn pg_rows_to_record_batch(
                 StdArc::new(b.finish())
             }
             DataType::Boolean => {
-                let mut b = BooleanBuilder::with_capacity(rows.len());
+                let mut b = BooleanBuilder::with_capacity(cap);
                 for row in rows {
                     let v: Option<bool> = row.try_get(idx).map_err(|e| {
                         BackendError::TypeMapping(format!(
@@ -714,9 +750,65 @@ fn pg_rows_to_record_batch(
                 }
                 StdArc::new(b.finish())
             }
+            DataType::Utf8 => {
+                let mut b = StringBuilder::with_capacity(cap, cap * 16);
+                // For UUID and JSON/JSONB the value type isn't &str —
+                // tokio-postgres returns a uuid::Uuid / serde_json::Value.
+                // We extract via the typed Rust accessor and stringify.
+                for row in rows {
+                    match pg_oid {
+                        2950 => {
+                            let v: Option<uuid::Uuid> = row.try_get(idx).map_err(|e| {
+                                BackendError::TypeMapping(format!(
+                                    "row[{idx}] {} → uuid: {e}",
+                                    col.name()
+                                ))
+                            })?;
+                            b.append_option(v.map(|u| u.to_string()));
+                        }
+                        114 | 3802 => {
+                            // JSON / JSONB → arrow Utf8 via the
+                            // canonical JSON text form. Requires the
+                            // `with-serde_json-1` feature on
+                            // tokio-postgres.
+                            let v: Option<serde_json::Value> =
+                                row.try_get(idx).map_err(|e| {
+                                    BackendError::TypeMapping(format!(
+                                        "row[{idx}] {} → json: {e}",
+                                        col.name()
+                                    ))
+                                })?;
+                            b.append_option(v.map(|j| j.to_string()));
+                        }
+                        _ => {
+                            let v: Option<&str> = row.try_get(idx).map_err(|e| {
+                                BackendError::TypeMapping(format!(
+                                    "row[{idx}] {} → text: {e}",
+                                    col.name()
+                                ))
+                            })?;
+                            b.append_option(v);
+                        }
+                    }
+                }
+                StdArc::new(b.finish())
+            }
+            DataType::Binary => {
+                let mut b = BinaryBuilder::with_capacity(cap, cap * 16);
+                for row in rows {
+                    let v: Option<&[u8]> = row.try_get(idx).map_err(|e| {
+                        BackendError::TypeMapping(format!(
+                            "row[{idx}] {} → bytea: {e}",
+                            col.name()
+                        ))
+                    })?;
+                    b.append_option(v);
+                }
+                StdArc::new(b.finish())
+            }
             DataType::Timestamp(TimeUnit::Microsecond, _) => {
                 use std::time::SystemTime;
-                let mut b = TimestampMicrosecondBuilder::with_capacity(rows.len());
+                let mut b = TimestampMicrosecondBuilder::with_capacity(cap);
                 for row in rows {
                     let v: Option<SystemTime> = row.try_get(idx).map_err(|e| {
                         BackendError::TypeMapping(format!(
@@ -756,7 +848,8 @@ async fn insert_record_batch(
     batch: &RecordBatch,
 ) -> Result<u64, BackendError> {
     use arrow_array::{
-        BooleanArray, Int32Array, Int64Array, StringArray, TimestampMicrosecondArray,
+        BinaryArray, BooleanArray, Float32Array, Float64Array, Int16Array, Int32Array,
+        Int64Array, StringArray, TimestampMicrosecondArray,
     };
 
     if batch.num_rows() == 0 {
@@ -781,17 +874,26 @@ async fn insert_record_batch(
         .map_err(PgError::Postgres)
         .map_err(BackendError::from)?;
 
+    // Resolve each prepared-statement parameter's PG type. tokio_postgres
+    // exposes them via `Statement::params()`. We use them to decide how
+    // to bind Utf8 columns: as &str (TEXT/JSON/JSONB) or as uuid::Uuid
+    // (UUID), since the binary protocol won't auto-cast text → uuid.
+    let param_types: Vec<PgType> = stmt.params().to_vec();
+
     let mut rows_written: u64 = 0;
     for row_idx in 0..batch.num_rows() {
-        // Build the parameter values borrowed for this row's lifetime.
-        // For Phase 30b we only support a starter type set; richer
-        // coverage comes with Phase 30d's strategy-executor migration.
-        let mut owned_strs: Vec<Option<String>> = vec![None; batch.num_columns()];
-        let mut owned_i64: Vec<Option<i64>> = vec![None; batch.num_columns()];
-        let mut owned_i32: Vec<Option<i32>> = vec![None; batch.num_columns()];
-        let mut owned_bool: Vec<Option<bool>> = vec![None; batch.num_columns()];
-        let mut owned_ts: Vec<Option<std::time::SystemTime>> =
-            vec![None; batch.num_columns()];
+        let n = batch.num_columns();
+        let mut owned_strs: Vec<Option<String>> = vec![None; n];
+        let mut owned_i64: Vec<Option<i64>> = vec![None; n];
+        let mut owned_i32: Vec<Option<i32>> = vec![None; n];
+        let mut owned_i16: Vec<Option<i16>> = vec![None; n];
+        let mut owned_f32: Vec<Option<f32>> = vec![None; n];
+        let mut owned_f64: Vec<Option<f64>> = vec![None; n];
+        let mut owned_bool: Vec<Option<bool>> = vec![None; n];
+        let mut owned_ts: Vec<Option<std::time::SystemTime>> = vec![None; n];
+        let mut owned_bytes: Vec<Option<Vec<u8>>> = vec![None; n];
+        let mut owned_uuid: Vec<Option<uuid::Uuid>> = vec![None; n];
+        let mut owned_json: Vec<Option<serde_json::Value>> = vec![None; n];
 
         for (col_idx, field) in arrow_schema.fields().iter().enumerate() {
             let col = batch.column(col_idx);
@@ -799,21 +901,65 @@ async fn insert_record_batch(
                 continue;
             }
             match field.data_type() {
-                DataType::Int64 => {
-                    let arr = col.as_any().downcast_ref::<Int64Array>().unwrap();
-                    owned_i64[col_idx] = Some(arr.value(row_idx));
+                DataType::Int16 => {
+                    let arr = col.as_any().downcast_ref::<Int16Array>().unwrap();
+                    owned_i16[col_idx] = Some(arr.value(row_idx));
                 }
                 DataType::Int32 => {
                     let arr = col.as_any().downcast_ref::<Int32Array>().unwrap();
                     owned_i32[col_idx] = Some(arr.value(row_idx));
                 }
-                DataType::Utf8 => {
-                    let arr = col.as_any().downcast_ref::<StringArray>().unwrap();
-                    owned_strs[col_idx] = Some(arr.value(row_idx).to_string());
+                DataType::Int64 => {
+                    let arr = col.as_any().downcast_ref::<Int64Array>().unwrap();
+                    owned_i64[col_idx] = Some(arr.value(row_idx));
+                }
+                DataType::Float32 => {
+                    let arr = col.as_any().downcast_ref::<Float32Array>().unwrap();
+                    owned_f32[col_idx] = Some(arr.value(row_idx));
+                }
+                DataType::Float64 => {
+                    let arr = col.as_any().downcast_ref::<Float64Array>().unwrap();
+                    owned_f64[col_idx] = Some(arr.value(row_idx));
                 }
                 DataType::Boolean => {
                     let arr = col.as_any().downcast_ref::<BooleanArray>().unwrap();
                     owned_bool[col_idx] = Some(arr.value(row_idx));
+                }
+                DataType::Utf8 => {
+                    let arr = col.as_any().downcast_ref::<StringArray>().unwrap();
+                    let s = arr.value(row_idx);
+                    // Bind by destination PG type — UUID needs a
+                    // uuid::Uuid; JSON/JSONB need a serde_json::Value;
+                    // everything else binds as &str.
+                    let dest_oid = param_types.get(col_idx).map(|t| t.oid());
+                    match dest_oid {
+                        Some(2950) => {
+                            let parsed = uuid::Uuid::parse_str(s).map_err(|e| {
+                                BackendError::TypeMapping(format!(
+                                    "row[{row_idx}] {} → uuid parse: {e}",
+                                    field.name()
+                                ))
+                            })?;
+                            owned_uuid[col_idx] = Some(parsed);
+                        }
+                        Some(114) | Some(3802) => {
+                            let parsed: serde_json::Value =
+                                serde_json::from_str(s).map_err(|e| {
+                                    BackendError::TypeMapping(format!(
+                                        "row[{row_idx}] {} → json parse: {e}",
+                                        field.name()
+                                    ))
+                                })?;
+                            owned_json[col_idx] = Some(parsed);
+                        }
+                        _ => {
+                            owned_strs[col_idx] = Some(s.to_string());
+                        }
+                    }
+                }
+                DataType::Binary => {
+                    let arr = col.as_any().downcast_ref::<BinaryArray>().unwrap();
+                    owned_bytes[col_idx] = Some(arr.value(row_idx).to_vec());
                 }
                 DataType::Timestamp(TimeUnit::Microsecond, _) => {
                     let arr =
@@ -835,10 +981,20 @@ async fn insert_record_batch(
         let mut params: Vec<ToSqlRef<'_>> = Vec::with_capacity(batch.num_columns());
         for (col_idx, field) in arrow_schema.fields().iter().enumerate() {
             match field.data_type() {
-                DataType::Int64 => params.push(&owned_i64[col_idx] as ToSqlRef<'_>),
+                DataType::Int16 => params.push(&owned_i16[col_idx] as ToSqlRef<'_>),
                 DataType::Int32 => params.push(&owned_i32[col_idx] as ToSqlRef<'_>),
-                DataType::Utf8 => params.push(&owned_strs[col_idx] as ToSqlRef<'_>),
+                DataType::Int64 => params.push(&owned_i64[col_idx] as ToSqlRef<'_>),
+                DataType::Float32 => params.push(&owned_f32[col_idx] as ToSqlRef<'_>),
+                DataType::Float64 => params.push(&owned_f64[col_idx] as ToSqlRef<'_>),
                 DataType::Boolean => params.push(&owned_bool[col_idx] as ToSqlRef<'_>),
+                DataType::Utf8 => match param_types.get(col_idx).map(|t| t.oid()) {
+                    Some(2950) => params.push(&owned_uuid[col_idx] as ToSqlRef<'_>),
+                    Some(114) | Some(3802) => {
+                        params.push(&owned_json[col_idx] as ToSqlRef<'_>)
+                    }
+                    _ => params.push(&owned_strs[col_idx] as ToSqlRef<'_>),
+                },
+                DataType::Binary => params.push(&owned_bytes[col_idx] as ToSqlRef<'_>),
                 DataType::Timestamp(TimeUnit::Microsecond, _) => {
                     params.push(&owned_ts[col_idx] as ToSqlRef<'_>)
                 }

@@ -348,6 +348,101 @@ async fn arrow_round_trip_via_backend_trait() {
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs Docker; run with `cargo test -- --ignored`"]
+async fn arrow_round_trip_wide_type_matrix() {
+    // Phase 30d.2: round-trip a wide table covering every type the
+    // Arrow path supports. Coverage gaps surface here as type-mapping
+    // errors with a clear message; passing all types means cross-
+    // backend syncs (Phase 31+) can carry these columns end-to-end.
+    let (_container, url) = start_postgres().await;
+    let pool = Arc::new(PgPool::connect(&url).await.unwrap());
+    let backend: Arc<dyn Backend> = Arc::new(PostgresBackend::new(pool.clone(), url.clone()));
+
+    backend.execute("CREATE SCHEMA wide").await.unwrap();
+    backend
+        .execute(
+            "CREATE TABLE wide.src (
+                a_int2 SMALLINT,
+                a_int4 INTEGER,
+                a_int8 BIGINT,
+                a_float4 REAL,
+                a_float8 DOUBLE PRECISION,
+                a_bool BOOLEAN,
+                a_text TEXT,
+                a_bytea BYTEA,
+                a_uuid UUID,
+                a_json JSONB,
+                a_ts TIMESTAMPTZ
+            )",
+        )
+        .await
+        .unwrap();
+    backend
+        .execute(
+            "INSERT INTO wide.src VALUES (
+                42::smallint,
+                1000000::int,
+                9000000000::bigint,
+                3.14::real,
+                2.718281828::double precision,
+                true,
+                'hello',
+                E'\\\\xDEADBEEF'::bytea,
+                'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'::uuid,
+                '{\"k\": \"v\", \"n\": 1}'::jsonb,
+                '2026-01-01T00:00:00Z'::timestamptz
+            )",
+        )
+        .await
+        .unwrap();
+    backend
+        .execute(
+            "CREATE TABLE wide.dst (
+                a_int2 SMALLINT,
+                a_int4 INTEGER,
+                a_int8 BIGINT,
+                a_float4 REAL,
+                a_float8 DOUBLE PRECISION,
+                a_bool BOOLEAN,
+                a_text TEXT,
+                a_bytea BYTEA,
+                a_uuid UUID,
+                a_json JSONB,
+                a_ts TIMESTAMPTZ
+            )",
+        )
+        .await
+        .unwrap();
+
+    let stream = backend
+        .read_arrow_stream("SELECT * FROM wide.src")
+        .await
+        .unwrap();
+    let target = TargetTable {
+        schema: "wide".into(),
+        name: "dst".into(),
+    };
+    backend
+        .write_arrow_stream(&target, stream, WriteMode::Append)
+        .await
+        .unwrap();
+
+    // Round-trip integrity: every column matches.
+    let count = pool
+        .fetch_scalar_int(
+            "SELECT count(*)::int FROM wide.dst d JOIN wide.src s ON \
+             d.a_int2 = s.a_int2 AND d.a_int4 = s.a_int4 AND d.a_int8 = s.a_int8 \
+             AND d.a_float4 = s.a_float4 AND d.a_float8 = s.a_float8 \
+             AND d.a_bool = s.a_bool AND d.a_text = s.a_text \
+             AND d.a_bytea = s.a_bytea AND d.a_uuid = s.a_uuid \
+             AND d.a_json = s.a_json AND d.a_ts = s.a_ts",
+        )
+        .await
+        .unwrap();
+    assert_eq!(count, 1, "all 11 columns must round-trip identically");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker; run with `cargo test -- --ignored`"]
 async fn arrow_write_stream_truncate_replaces_existing() {
     let (_container, url) = start_postgres().await;
     let pool = Arc::new(PgPool::connect(&url).await.unwrap());
