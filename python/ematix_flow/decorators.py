@@ -631,6 +631,24 @@ def _run_transforms_post(
                 )
                 if not continue_on_failure:
                     raise
+        elif isinstance(step, TransformRef):
+            from ematix_flow import pipeline as _p
+
+            step_name = f"transform[{i}]:ref={step.name}"
+            try:
+                _resolve_and_run_transform_ref(
+                    ref=step,
+                    target_connection=target_connection,
+                    parent_ctx=parent_ctx,
+                    pipeline_name=pipeline_name,
+                    step_name=step_name,
+                    target_schema=target_schema,
+                    target_table=target_table,
+                    parent_run_id=parent_run_id,
+                )
+            except Exception:
+                if not continue_on_failure:
+                    raise
         elif callable(step):
             from ematix_flow import pipeline as _p
 
@@ -656,6 +674,66 @@ def _run_transforms_post(
                 f"transforms_post[{i}] is {type(step).__name__}; "
                 "expected SQL string, callable, or transform_ref(...)"
             )
+
+
+def _resolve_and_run_transform_ref(
+    *,
+    ref: TransformRef,
+    target_connection: Any,
+    parent_ctx: Any,
+    pipeline_name: str,
+    step_name: str,
+    target_schema: str,
+    target_table: str,
+    parent_run_id: str | None,
+) -> None:
+    """Phase 27c: look up `ref.name` first in transforms registry, then
+    pipelines registry. Transforms run with parent context (like a
+    callable). Pipelines run their full sync independently (Q5 A).
+    """
+    from ematix_flow import pipeline as _p
+
+    rt = _p._TRANSFORMS_REGISTRY.get(ref.name)
+    if rt is not None:
+        _p._invoke_transform_callable(
+            fn=rt.fn,
+            arity=rt.arity,
+            conn=target_connection,
+            parent=parent_ctx,
+            pipeline_name=pipeline_name,
+            step_name=step_name,
+            target_schema=target_schema,
+            target_table=target_table,
+            parent_run_id=parent_run_id,
+        )
+        return
+
+    sp = _p._REGISTRY.get(ref.name)
+    if sp is not None:
+        # Q5 A: chained pipelines run their full sync independently —
+        # fresh connection resolution, own run_history row, recursive
+        # transforms_post. We invoke the wrapped function directly.
+        sp.fn()
+        # Record a row tying the chained run to the parent for visibility.
+        if parent_run_id:
+            try:
+                target_connection.record_transform_history(
+                    parent_run_id,
+                    pipeline_name,
+                    step_name,
+                    "transform_success",
+                    target_schema,
+                    target_table,
+                    None,
+                    None,
+                )
+            except Exception:
+                pass
+        return
+
+    raise KeyError(
+        f"transform_ref({ref.name!r}) not found in transforms or pipelines registry"
+    )
 
 
 def _execute_dry_run(
@@ -775,6 +853,18 @@ def _execute_dry_run(
     return base
 
 
+@dataclass(frozen=True)
+class TransformRef:
+    """Phase 27c: name-based reference to a registered pipeline or transform.
+
+    `transforms_post=[ematix.transform_ref("name")]` looks the name up in
+    `_TRANSFORMS_REGISTRY` first, then `_REGISTRY`. Pipelines run their
+    full sync independently (Q5 A); transforms run with parent context.
+    """
+
+    name: str
+
+
 def _transform_arity(fn: Callable[..., Any]) -> int:
     """Phase 27 Q3.2 (γ): auto-detect 1- or 2-arg transform callable."""
     arity = _signature_arity(fn)
@@ -788,6 +878,19 @@ def _transform_arity(fn: Callable[..., Any]) -> int:
 
 class _EmatixNamespace:
     """The `ematix` import handle. `from ematix_flow import ematix`."""
+
+    @staticmethod
+    def transform_ref(name: str) -> TransformRef:
+        """Reference a registered transform or pipeline by name.
+
+        Used inside `transforms_post=[...]` when the target is registered
+        elsewhere by name (rather than passed directly as a function).
+        """
+        if not isinstance(name, str):
+            raise TypeError(
+                f"transform_ref expects a str name, got {type(name).__name__}"
+            )
+        return TransformRef(name=name)
 
     def transform(
         self,
@@ -854,7 +957,7 @@ class _EmatixNamespace:
         *,
         target: type[ManagedTable] | None = None,
         targets: list[Target] | None = None,
-        schedule: str,
+        schedule: str | None,
         mode: str | None = None,
         name: str | None = None,
         source_connection: str | None = None,

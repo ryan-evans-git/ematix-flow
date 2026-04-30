@@ -341,10 +341,15 @@ def sync(
 
 @dataclass(frozen=True)
 class ScheduledPipeline:
-    """A named, scheduled callable. Registered via `@pipeline.register(...)`."""
+    """A named, scheduled callable. Registered via `@pipeline.register(...)`.
+
+    `schedule=None` (Phase 27c) keeps a pipeline registered without a cron
+    — only fires when invoked by another pipeline's transforms_post via
+    `transform_ref(...)` or directly via `flow run`.
+    """
 
     name: str
-    schedule: str
+    schedule: str | None
     fn: Callable[[], dict[str, Any]]
 
 
@@ -471,7 +476,7 @@ def _invoke_transform_callable(
 
 
 def register(
-    *, name: str, schedule: str
+    *, name: str, schedule: str | None
 ) -> Callable[[Callable[[], dict[str, Any]]], Callable[[], dict[str, Any]]]:
     """Decorator: register a callable as a scheduled pipeline.
 
@@ -496,6 +501,35 @@ def list_pipelines() -> list[ScheduledPipeline]:
     return list(_REGISTRY.values())
 
 
+@dataclass(frozen=True)
+class RegistryEntry:
+    """Phase 27c Q4.2 β: unified view across pipelines + transforms for
+    the merged `flow list` output."""
+
+    name: str
+    kind: Literal["pipeline", "transform"]
+    schedule: str | None
+
+
+def list_entries() -> list[RegistryEntry]:
+    """Return pipelines + transforms together, sorted by name."""
+    entries: list[RegistryEntry] = []
+    for sp in _REGISTRY.values():
+        entries.append(
+            RegistryEntry(name=sp.name, kind="pipeline", schedule=sp.schedule)
+        )
+    for rt in _TRANSFORMS_REGISTRY.values():
+        entries.append(
+            RegistryEntry(name=rt.name, kind="transform", schedule=rt.schedule)
+        )
+    entries.sort(key=lambda e: e.name)
+    return entries
+
+
+def list_transforms() -> list[RegistryEntry]:
+    return [e for e in list_entries() if e.kind == "transform"]
+
+
 def get_pipeline(name: str) -> ScheduledPipeline:
     return _REGISTRY[name]
 
@@ -504,11 +538,18 @@ def run_pipeline(name: str) -> dict[str, Any]:
     return _REGISTRY[name].fn()
 
 
-def is_due(schedule: str, now: datetime, interval_seconds: int) -> bool:
+def is_due(schedule: str | None, now: datetime, interval_seconds: int) -> bool:
     """Return True if `schedule` would fire within the half-open window
     `(now - interval_seconds, now]`. The intended invocation pattern is
     an external cron / k8s CronJob calling `flow run-due` once per
-    `interval_seconds`."""
+    `interval_seconds`.
+
+    `schedule=None` always returns False — unscheduled pipelines/transforms
+    are only invoked explicitly (`flow run`, `flow transform run`) or
+    indirectly via `transforms_post=[transform_ref(...)]`.
+    """
+    if schedule is None:
+        return False
     from croniter import croniter
 
     try:
