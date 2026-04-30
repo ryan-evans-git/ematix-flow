@@ -1,6 +1,7 @@
 # ematix-flow — Product Requirements Document (v0.1)
 
-Status: draft, post-intake interview
+Status: **shipped** (alpha). v0.1 scope is fully implemented; significant
+post-v0.1 extensions also landed (see §18).
 Owner: ryanevans23@gmail.com
 Last updated: 2026-04-30
 
@@ -386,9 +387,121 @@ class form.
 - DuckDB adapter (likely first multi-backend addition since it's free,
   embedded, and a great test environment).
 - Snowflake / BigQuery adapters.
-- Non-SQL sources: Parquet on S3, JSON-over-HTTP, Polars/Arrow tables.
+- Non-SQL sources: Parquet on S3, JSON-over-HTTP, Polars/Arrow tables
+  *as inputs* (Phase 27e already enables them as outputs).
 - Schema migrations (auto-`ALTER` behind a flag).
 - CDC / streaming ingestion.
 - Observability hooks (OpenTelemetry traces per run).
 - Pluggable hash functions.
 - Bulk-write optimization for very wide / very large tables.
+
+---
+
+## 18. Post-v0.1 extensions (shipped)
+
+Beyond the original v0.1 scope (§5–§16, Phases 0–14), substantial
+additional surface area shipped in Phases 15–28. Companion design docs:
+
+- [`docs/ERGONOMICS_PLAN.md`](ERGONOMICS_PLAN.md) — Phases 21–25
+- [`docs/NORMALIZATION_TRANSFORMS_PLAN.md`](NORMALIZATION_TRANSFORMS_PLAN.md)
+  — Phases 26–28
+- [`docs/ML_FEATURE_STORE_PLAN.md`](ML_FEATURE_STORE_PLAN.md) —
+  Phases 15–20
+
+### 18.1 Declarative decorator API (Phases 24–25)
+
+The original `class CustomerDim(ManagedTable)` form still works, but
+the recommended API is now decorator-based with PEP 593 `Annotated`
+markers:
+
+```python
+from typing import Annotated
+from ematix_flow import ematix, pk, natural_key
+from ematix_flow.types import BigInt, String, Text, TimestampTZ
+
+@ematix.table(schema="analytics")
+class CustomerDim:
+    customer_id: Annotated[BigInt, pk()]
+    email:       Annotated[String[256], natural_key()]
+    name:        Text | None
+    updated_at:  TimestampTZ
+
+@ematix.pipeline(
+    target=CustomerDim,
+    schedule="0 * * * *",
+    mode="scd2",
+)
+def sync_customers(conn):
+    return "SELECT customer_id, email, name, updated_at FROM raw.customers"
+```
+
+`pipeline.preview(name)` / `pipeline.dry_run(name)` /
+`pipeline.validate(name)` (and CLI equivalents) inspect what a pipeline
+would do before / instead of running it.
+
+### 18.2 Normalization (Phase 26)
+
+Per-column markers compile to in-database SQL applied as a CTE around
+the source query — no row-by-row Python:
+
+```python
+email: Annotated[String[256] | None, lower(), trim(), empty_to_null()]
+ts:    Annotated[TimestampTZ | None, parse_timestamp()]   # auto-detect catalogue
+score: Annotated[BigInt, parse_int(on_failure="default", default=0)]
+region: Annotated[String[8], default("US")]
+full_name: Annotated[Text, derive("first_name || ' ' || last_name"), trim()]
+```
+
+Plus pipeline-level cross-row helpers via `transforms_pre=[
+deduplicate_by("customer_id", order_by="updated_at DESC"),
+filter_where("region IS NOT NULL"), limit(1000), sample_pct(0.1)]`.
+
+### 18.3 Post-load transforms (Phase 27)
+
+`transforms_post=[...]` accepts SQL strings, callables, or
+`ematix.transform_ref("name")`. Each runs in its own transaction
+after the load commits. `@ematix.transform` decorates a standalone
+runnable callable (registered, runnable via `flow transform run`).
+
+### 18.4 DataFrame interop (Phases 27e, 28)
+
+```python
+import ematix_flow.df            # opt-in via [df] extra
+df = conn.read_df("SELECT ... FROM warehouse.customer_dim")
+conn.write_df(df, "warehouse.customer_scores", mode="merge",
+              target=CustomerScores, keys=["customer_id"])
+```
+
+Auto-detects polars vs pandas. `write_df` routes through the strategy
+executor — every mode (append / truncate / merge / scd1 / scd2) works
+identically. Spark equivalent under `[spark]`.
+
+### 18.5 ML feature store (Phases 15–20)
+
+```python
+@ematix.feature_view(schema="features", feature_version="v1",
+                     event_timestamp_column="last_seen",
+                     ttl=timedelta(days=30), online=True)
+class UserFeatures:
+    user_id: Annotated[BigInt, pk()]
+    score:   Numeric[10, 2]
+    last_seen: TimestampTZ
+
+# inference-time
+row = UserFeatures.online_features(conn, entity_keys={"user_id": 100})
+row = UserFeatures.point_in_time(conn, entity_keys={"user_id": 100}, as_of=ts)
+
+# training-set
+df = ematix.training_set(conn, spine=[
+    {"user_id": 1, "as_of": t1}, {"user_id": 2, "as_of": t2},
+], feature_views=[UserFeatures, ItemFeatures])
+```
+
+Event-time SCD2, TTL expiry, online materialized view + REFRESH
+CONCURRENTLY, multi-FV training-set asof-join.
+
+### 18.6 Connection registry (Phase 21)
+
+Named connections via env vars (`EMATIX_FLOW_DSN_WAREHOUSE`) or
+`~/.ematix-flow/connections.toml`. `from ematix_flow import connect;
+conn = connect("warehouse")`.

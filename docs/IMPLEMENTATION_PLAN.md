@@ -8,6 +8,31 @@ real Postgres.
 
 ---
 
+## Status as of 2026-04-30
+
+**v0.1 scope (Phases 0–14): shipped.** All four strategies, watermarks,
+delete handling, scheduling, CLI, and test infra are in place.
+
+**Post-v0.1 (Phases 15–28): also shipped.** ML feature-store path,
+ergonomics decorator overhaul, normalization, transforms, DataFrame
+interop (polars/pandas/pyspark). See:
+
+- `docs/ERGONOMICS_PLAN.md` — Phases 21–25
+- `docs/NORMALIZATION_TRANSFORMS_PLAN.md` — Phases 26–28
+- `docs/ML_FEATURE_STORE_PLAN.md` — Phases 15–20
+
+Test counts (current): 110 Rust unit + 239 default Python + 181
+integration Python (testcontainers + Docker) + 4 opt-in Spark E2E. All
+green on macOS aarch64; CI runs the same matrix on Linux x86_64.
+
+Pending v0.1 release work:
+- Wheel-build CI + PyPI trusted publishing (Phase 14 task list).
+- mkdocs site generation.
+
+Phase status markers below: ✅ shipped, 🚧 partial, ⬜ pending.
+
+---
+
 ## Repo layout (target)
 
 ```
@@ -57,7 +82,7 @@ data-eng-framework/                 (rename to ematix-flow before publish)
 
 ---
 
-## Phase 0 — Repo & build scaffolding (≈1 day)
+## Phase 0 — Repo & build scaffolding (≈1 day) ✅
 
 Goal: a workspace that builds, lints, and ships an empty wheel.
 
@@ -81,7 +106,7 @@ Exit criteria: green CI on a no-op PR.
 
 ---
 
-## Phase 1 — Rust ↔ Python bridge smoke test (≈0.5 day)
+## Phase 1 — Rust ↔ Python bridge smoke test (≈0.5 day) ✅
 
 - [ ] Define a minimal `PipelineSpec` struct in `ematix-flow-core` with
       `serde` derives.
@@ -93,7 +118,7 @@ Exit: round-trip test passing.
 
 ---
 
-## Phase 2 — Type system + ManagedTable (≈1–2 days)
+## Phase 2 — Type system + ManagedTable (≈1–2 days) ✅
 
 - [ ] Rust `types.rs`: enum of supported types, each with `to_postgres_sql()`.
 - [ ] Python `types.py`: `Column`, `Integer`, `BigInt`, `SmallInt`, `String`,
@@ -111,7 +136,7 @@ Exit: a `ManagedTable` declaration can be lowered to a Rust `TableSpec`.
 
 ---
 
-## Phase 3 — Postgres adapter + connection management (≈1–2 days)
+## Phase 3 — Postgres adapter + connection management (≈1–2 days) ✅
 
 - [ ] Rust `pg.rs`: `tokio-postgres` + `deadpool-postgres` pool.
 - [ ] Connection-string parsing with the `postgres` crate's URL parser.
@@ -126,7 +151,7 @@ Exit: `ematix_flow._core.connect(url)` works from Python.
 
 ---
 
-## Phase 4 — DDL planner (≈1–2 days)
+## Phase 4 — DDL planner (≈1–2 days) ✅
 
 - [ ] Rust `ddl.rs::create_table_sql(table_spec) -> String`.
 - [ ] Reflection: `read_existing_columns(conn, schema, table)` returning
@@ -142,7 +167,7 @@ Exit: targets can be created and validated.
 
 ---
 
-## Phase 5 — Strategy: AppendOnly (≈1 day)
+## Phase 5 — Strategy: AppendOnly (≈1 day) ✅
 
 The simplest strategy; proves the planner → executor pipeline end-to-end.
 
@@ -160,7 +185,7 @@ Exit: `pipeline.sync(..., mode="append")` works.
 
 ---
 
-## Phase 6 — Strategy: TruncateReplace (≈0.5 day)
+## Phase 6 — Strategy: TruncateReplace (≈0.5 day) ✅
 
 - [ ] Same-DB: `BEGIN; TRUNCATE; INSERT...SELECT; COMMIT`.
 - [ ] Cross-DB: stage, then `BEGIN; TRUNCATE; INSERT...SELECT FROM stage; COMMIT`.
@@ -170,7 +195,7 @@ Exit: `mode="truncate"` works.
 
 ---
 
-## Phase 7 — Strategy: MergeUpsert / SCD1 (≈1–2 days)
+## Phase 7 — Strategy: MergeUpsert / SCD1 (≈1–2 days) ✅
 
 - [ ] Same-DB: `INSERT INTO target (cols) SELECT cols FROM (<source>) src
       ON CONFLICT (keys) DO UPDATE SET col = EXCLUDED.col, ... WHERE
@@ -186,7 +211,7 @@ Exit: `mode="merge"` / `mode="scd1"` works.
 
 ---
 
-## Phase 8 — Strategy: SCD2 (≈3–4 days, biggest single phase)
+## Phase 8 — Strategy: SCD2 (≈3–4 days, biggest single phase) ✅
 
 - [ ] Hash function (`hash.rs`):
   - Canonical encoding: per-column `coalesce(col::text, '\x00NULL\x00')`
@@ -231,7 +256,7 @@ Exit: `mode="scd2"` works end-to-end.
 
 ---
 
-## Phase 9 — Source abstraction polish (≈1 day)
+## Phase 9 — Source abstraction polish (≈1 day) ✅
 
 - [ ] `Source.postgres_query(conn, query)`: arbitrary SELECT.
 - [ ] `Source.postgres_table(conn, schema, table, columns=None)`: sugar that
@@ -246,7 +271,7 @@ Exit: source resolution is robust and override-able.
 
 ---
 
-## Phase 10 — Watermarking + metadata schema (≈1–2 days)
+## Phase 10 — Watermarking + metadata schema (≈1–2 days) ✅
 
 - [ ] Rust `meta.rs`: lazy creation of `ematix_flow` schema +
       `watermarks`, `run_history`, `schema_history` tables.
@@ -262,7 +287,7 @@ Exit: incremental loads work and are restart-safe.
 
 ---
 
-## Phase 11 — Delete handling opt-in (≈1 day)
+## Phase 11 — Delete handling opt-in (≈1 day) ✅
 
 - [ ] `handle_deletes` argument; mutual-exclusion check vs.
       `incremental_column`.
@@ -275,7 +300,7 @@ Exit: delete handling opt-in works.
 
 ---
 
-## Phase 12 — Scheduling + `flow` CLI (≈1 day)
+## Phase 12 — Scheduling + `flow` CLI (≈1 day) ✅
 
 - [ ] Cron-string parser: `croniter`-style; in Rust use `cron` crate.
 - [ ] `Pipeline(schedule=...)` registration in a module-level registry.
@@ -295,7 +320,7 @@ Exit: `flow run-due` demonstrably runs from cron / k8s CronJob.
 
 ---
 
-## Phase 13 — Test infrastructure (continuous, but polish here, ≈1 day)
+## Phase 13 — Test infrastructure (continuous, but polish here, ≈1 day) ✅
 
 - [ ] `tests/python/conftest.py` provides a `pg_url` fixture using
       `testcontainers[postgres]`.
@@ -307,7 +332,7 @@ Exit: `flow run-due` demonstrably runs from cron / k8s CronJob.
 
 ---
 
-## Phase 14 — Docs, packaging, release (≈2 days)
+## Phase 14 — Docs, packaging, release (≈2 days) 🚧
 
 - [ ] README quickstart (10-minute path: install → declare → SCD2 sync).
 - [ ] `mkdocs` site with: concepts, strategies, sources, scheduling, CLI,
@@ -344,3 +369,138 @@ the prerequisites that feel slow but enable everything else.
 
 Critical path: Phase 0 → 1 → 2 → 3 → 4 → 5 → 7 → 8 → 14. Phases 6, 9, 10,
 11, 12 can fan out in parallel after Phase 7 lands.
+
+---
+
+## Post-v0.1 phase log (Phases 15–28)
+
+The phases below were added after the v0.1 plan was committed. They
+extend the original surface area without changing it. Each ships with
+the same TDD discipline as Phases 0–14: failing test → minimal
+implementation → green tests → integration tests against testcontainers
+Postgres → commit. See companion design docs for locked-decision logs.
+
+### Phase 15 — Event-time SCD2 (≈1d) ✅
+
+`event_timestamp_column='col'` on `pipeline.sync` makes `valid_from`
+come from a source column instead of `now()`. Out-of-order arrivals
+are rejected with a clear error.
+
+### Phase 16 — TTL / expiry (≈0.5d) ✅
+
+`ttl=timedelta(...)` on SCD2 syncs adds a post-step UPDATE closing out
+versions whose `valid_from` is older than `now() - ttl`. Same-tx
+atomicity with the load.
+
+### Phase 17 — `@ematix.feature_view` declarative class (≈1–2d) ✅
+
+`FeatureView(ManagedTable)` base + `@ematix.feature_view(schema=,
+feature_version=, event_timestamp_column=, ttl=, freshness_sla=,
+online=, description=, owner=)` decorator. Process-local
+`_FEATURE_VIEWS_REGISTRY`. Pipelines targeting a FV default to
+`mode='scd2'` and inherit class dunders. Lazy
+`ematix_flow.feature_views` metadata catalog.
+
+### Phase 18 — Point-in-time + asof-join (≈1–2d) ✅
+
+`Cls.point_in_time(conn, entity_keys, as_of)` and
+`Cls.historical_features(conn, spine, columns)` classmethods on
+FeatureView. Single LATERAL JOIN against a VALUES spine. Requires
+`[df]` extra (psycopg2 + DictCursor).
+
+### Phase 19 — Online (`is_current`) snapshot (≈1d) ✅
+
+`online=True` provisions a partial index on the main table, a
+`<table>__online` materialized view, and a unique index for
+`REFRESH … CONCURRENTLY`. Refreshed automatically after each successful
+sync. `Cls.online_features(conn, entity_keys)` queries the MV.
+
+### Phase 20 — Training-dataset builder (≈1d) ✅
+
+`ematix.training_set(conn, spine=, feature_views=[...], columns=,
+prefer="auto")` joins multiple FVs against a spine and returns a
+polars / pandas DataFrame. Single round trip via per-FV LATERAL.
+
+### Phase 21 — Connection registry (≈0.5d) ✅
+
+`from ematix_flow import connect; conn = connect("warehouse")`
+resolves named connections from env vars (`EMATIX_FLOW_DSN_<NAME>`)
+then `~/.ematix-flow/connections.toml`. CLI: `flow connections
+{list, check, set}`. Phase 22–23 extend this with merge-key resolution
+helpers.
+
+### Phase 22 — UNIQUE-constraint reflection (≈0.5d) ✅
+
+`PgPool::read_existing_uniques` returns declared unique constraints
+keyed by name. Used by the drift comparator and the merge-key
+resolution path.
+
+### Phase 23 — Merge-key resolution (≈0.5d) ✅
+
+`pipeline.sync(keys=...)` resolves in priority order: explicit `keys=`
+→ `__merge_keys__` dunder → first `natural_key()` group → primary
+keys. Warn when sources disagree.
+
+### Phase 24 — Decorator API + multi-target (≈2–3d) ✅
+
+`@ematix.table(schema=)` reads PEP 593 `Annotated[T, pk()]` markers.
+`@ematix.pipeline(target=…, schedule=, mode=)` registers a function
+as a pipeline. `targets=[ematix.target(Cls, mode=…), …]` for
+multi-target halt-on-first-failure dispatch.
+
+### Phase 25 — Preview, dry-run, validate (≈2d) ✅
+
+`pipeline.preview(name)` synthesizes the SQL plan with no DB calls;
+`dry_run(name)` runs the load in a transaction and rolls back;
+`validate(name)` EXPLAINs the synthesized SQL. CLI subcommands +
+`rich`-rendered text output. `flow validate` adds Q1 mitigation for
+the no-decoration-time-checking design.
+
+### Phase 26 — Per-column normalization (≈2–3d) ✅
+
+`ematix_flow.normalize` module with marker catalogue compiling to
+in-database SQL applied as CTEs. `parse_timestamp(formats=…,
+on_failure=…)`, `parse_int / parse_numeric / parse_date`,
+`default(value)`, `regex_replace`, `derive(expression)`,
+`whitespace_to_null`, `email_normalize`, etc. Pipeline-level
+`transforms_pre=[deduplicate_by, filter_where, limit, sample_pct]`.
+
+Follow-up (Q3.5 γ): `parse_timestamp()` / `parse_date()` with no args
+fall back to `DEFAULT_TIMESTAMP_FORMATS` / `DEFAULT_DATE_FORMATS`
+catalogues (first-match-wins).
+
+### Phase 27 — Post-load transformations (≈2–3d) ✅
+
+Six sub-phases (27a–27f):
+
+- **27a** `transforms_post=[sql_string, …]` + `continue_on_failure_post`
+  + `run_history` schema migration (`parent_run_id`, `step_name`,
+  `metrics_json`).
+- **27b** Callable transforms with `(conn,)` or `(conn, parent)`
+  auto-detected arity. Optional metrics dict return.
+  `@ematix.transform` decorator + `pipeline.run_transform`.
+- **27c** `ematix.transform_ref("name")` resolves to a registered
+  transform or pipeline (chained-pipeline pattern).
+- **27d** Merged `flow list` + `flow transform list/run`.
+- **27e** `ematix_flow.df` module (`Connection.read_df` /
+  `write_df`, polars or pandas auto-detect, COPY CSV transport, all
+  five strategy modes for inferred + ManagedTable paths). `[df]`
+  extra: psycopg2-binary.
+- **27f** `preview` / `dry_run` / `validate` aware of `transforms_post`.
+
+### Phase 28 — Spark interop (≈2d) ✅
+
+`ematix_flow.spark` monkey-patches `Connection.read_spark_df` /
+`write_spark_df` via Postgres JDBC. Routes write through the strategy
+executor. `[spark]` extra: pyspark. Live E2E tests opt-in via
+`pytest -m spark` (require JVM + JDBC jar).
+
+---
+
+## Pending (post-shipped) housekeeping
+
+- Wheel-build matrix in CI (`maturin` + GitHub Actions for macOS x86_64
+  / aarch64, Linux x86_64 / aarch64).
+- Trusted publishing to PyPI as `ematix-flow`.
+- mkdocs site build with `mkdocstrings` API reference.
+- An `examples/` directory with one runnable example per strategy.
