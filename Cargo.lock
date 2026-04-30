@@ -218,6 +218,7 @@ version = "0.1.0"
 dependencies = [
  "ematix-flow-core",
  "pyo3",
+ "serde_json",
  "tokio",
 ]
 

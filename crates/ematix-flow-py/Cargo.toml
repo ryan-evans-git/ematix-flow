@@ -16,3 +16,4 @@ crate-type = ["cdylib"]
 pyo3.workspace = true
 ematix-flow-core.workspace = true
 tokio.workspace = true
+serde_json.workspace = true

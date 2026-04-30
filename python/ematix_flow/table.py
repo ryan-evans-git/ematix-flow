@@ -54,3 +54,11 @@ class ManagedTable:
     @classmethod
     def _to_normalized_spec(cls) -> dict[str, Any]:
         return json.loads(_core.parse_table_spec(json.dumps(cls._to_spec())))
+
+    @classmethod
+    def ensure(cls, conn: Any, on_drift: str = "error") -> dict[str, Any]:
+        """Pre-flight: create the target table if missing, or compare against
+        the live schema. Raises ValueError if drift is detected and
+        `on_drift="error"` (the default).
+        """
+        return conn.ensure_table(json.dumps(cls._to_spec()), on_drift)

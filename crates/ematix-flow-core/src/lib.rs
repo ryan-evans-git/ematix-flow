@@ -2,6 +2,7 @@
 //!
 //! See `docs/PRD.md` and `docs/IMPLEMENTATION_PLAN.md` for the design.
 
+pub mod ddl;
 pub mod pg;
 pub mod spec;
 pub mod types;

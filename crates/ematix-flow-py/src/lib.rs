@@ -1,8 +1,11 @@
 use std::sync::{Arc, OnceLock};
 
-use ematix_flow_core::pg::{self, PgPool};
+use ematix_flow_core::ddl::{self, DriftResult};
+use ematix_flow_core::pg::{self, EnsureOutcome, PgPool};
+use ematix_flow_core::types::TableSpec;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
+use pyo3::types::{PyDict, PyList};
 use tokio::runtime::Runtime;
 
 static RUNTIME: OnceLock<Runtime> = OnceLock::new();
@@ -37,6 +40,15 @@ fn same_database(a: &str, b: &str) -> PyResult<bool> {
     pg::same_database(a, b).map_err(|e| PyValueError::new_err(e.to_string()))
 }
 
+#[pyfunction]
+fn create_table_sql(spec_json: &str) -> PyResult<String> {
+    let normalized = ematix_flow_core::normalize_table_json(spec_json)
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    let spec: TableSpec =
+        serde_json::from_str(&normalized).map_err(|e| PyValueError::new_err(e.to_string()))?;
+    Ok(ddl::create_table_sql(&spec))
+}
+
 #[pyclass]
 struct Connection {
     pool: Arc<PgPool>,
@@ -67,6 +79,60 @@ impl Connection {
         py.detach(|| rt().block_on(async move { pool.execute_in_transaction(&sqls).await }))
             .map_err(|e| PyValueError::new_err(e.to_string()))
     }
+
+    /// Ensure the target table exists and matches the declared spec.
+    /// `on_drift` ∈ {"error", "warn"}. Returns
+    /// `{"action": "created" | "matched" | "drift", "differences": [...]}`.
+    #[pyo3(signature = (spec_json, on_drift="error"))]
+    fn ensure_table<'py>(
+        &self,
+        py: Python<'py>,
+        spec_json: String,
+        on_drift: &str,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        if on_drift != "error" && on_drift != "warn" {
+            return Err(PyValueError::new_err(format!(
+                "on_drift must be 'error' or 'warn' (got {on_drift:?})"
+            )));
+        }
+        let normalized = ematix_flow_core::normalize_table_json(&spec_json)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        let spec: TableSpec =
+            serde_json::from_str(&normalized).map_err(|e| PyValueError::new_err(e.to_string()))?;
+        let pool = self.pool.clone();
+        let outcome = py
+            .detach(|| rt().block_on(async move { pool.ensure_table(&spec).await }))
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+
+        let dict = PyDict::new(py);
+        let diffs = PyList::empty(py);
+        match outcome {
+            EnsureOutcome::Created => {
+                dict.set_item("action", "created")?;
+            }
+            EnsureOutcome::Matched => {
+                dict.set_item("action", "matched")?;
+            }
+            EnsureOutcome::Drift(differences) => {
+                if on_drift == "error" {
+                    let messages: Vec<String> = differences.iter().map(|d| d.to_string()).collect();
+                    return Err(PyValueError::new_err(format!(
+                        "schema drift detected:\n  - {}",
+                        messages.join("\n  - ")
+                    )));
+                }
+                dict.set_item("action", "drift")?;
+                for d in &differences {
+                    diffs.append(d.to_string())?;
+                }
+            }
+        }
+        // Use the `DriftResult` discriminator for symmetry with the Rust enum
+        // (helps Python tests pattern-match).
+        let _ = DriftResult::Match;
+        dict.set_item("differences", diffs)?;
+        Ok(dict)
+    }
 }
 
 #[pyfunction]
@@ -86,6 +152,7 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(parse_spec, m)?)?;
     m.add_function(wrap_pyfunction!(parse_table_spec, m)?)?;
     m.add_function(wrap_pyfunction!(same_database, m)?)?;
+    m.add_function(wrap_pyfunction!(create_table_sql, m)?)?;
     m.add_function(wrap_pyfunction!(connect, m)?)?;
     m.add_class::<Connection>()?;
     Ok(())

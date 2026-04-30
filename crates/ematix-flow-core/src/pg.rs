@@ -5,6 +5,11 @@ use deadpool_postgres::{Manager, ManagerConfig, Pool, RecyclingMethod};
 use thiserror::Error;
 use tokio_postgres::{Config as PgConfig, NoTls, config::Host};
 
+use crate::ddl::{
+    DriftResult, ReflectedColumn, canonicalize_reflected_type, compare_table, create_table_sql,
+};
+use crate::types::TableSpec;
+
 const DEFAULT_PORT: u16 = 5432;
 
 #[derive(Debug, Error)]
@@ -128,6 +133,110 @@ impl PgPool {
         tx.commit().await?;
         Ok(())
     }
+
+    pub async fn table_exists(&self, schema: &str, table: &str) -> Result<bool, PgError> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| PgError::Pool(e.to_string()))?;
+        let row = client
+            .query_one(
+                "SELECT EXISTS (
+                    SELECT 1 FROM information_schema.tables
+                    WHERE table_schema = $1 AND table_name = $2
+                )",
+                &[&schema, &table],
+            )
+            .await?;
+        Ok(row.get::<_, bool>(0))
+    }
+
+    pub async fn read_existing_columns(
+        &self,
+        schema: &str,
+        table: &str,
+    ) -> Result<Vec<ReflectedColumn>, PgError> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| PgError::Pool(e.to_string()))?;
+        let rows = client
+            .query(
+                "SELECT
+                    c.column_name,
+                    c.data_type,
+                    c.is_nullable = 'YES' AS nullable,
+                    c.character_maximum_length,
+                    c.numeric_precision,
+                    c.numeric_scale,
+                    EXISTS (
+                        SELECT 1
+                        FROM information_schema.table_constraints tc
+                        JOIN information_schema.key_column_usage kcu
+                          ON tc.constraint_name = kcu.constraint_name
+                         AND tc.table_schema = kcu.table_schema
+                        WHERE tc.table_schema = c.table_schema
+                          AND tc.table_name = c.table_name
+                          AND tc.constraint_type = 'PRIMARY KEY'
+                          AND kcu.column_name = c.column_name
+                    ) AS is_primary_key
+                FROM information_schema.columns c
+                WHERE c.table_schema = $1 AND c.table_name = $2
+                ORDER BY c.ordinal_position",
+                &[&schema, &table],
+            )
+            .await?;
+
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let name: String = row.get(0);
+            let data_type: String = row.get(1);
+            let nullable: bool = row.get(2);
+            let char_max: Option<i32> = row.get(3);
+            let num_precision: Option<i32> = row.get(4);
+            let num_scale: Option<i32> = row.get(5);
+            let primary_key: bool = row.get(6);
+            let ty = canonicalize_reflected_type(&data_type, char_max, num_precision, num_scale)
+                .ok_or_else(|| {
+                    PgError::Pool(format!(
+                        "unsupported reflected type for column `{name}`: {data_type}"
+                    ))
+                })?;
+            out.push(ReflectedColumn {
+                name,
+                ty,
+                nullable,
+                primary_key,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Create the table if missing, or compare against the live schema.
+    /// Caller decides what to do with `EnsureOutcome::Drift`.
+    pub async fn ensure_table(&self, spec: &TableSpec) -> Result<EnsureOutcome, PgError> {
+        if !self.table_exists(&spec.schema, &spec.name).await? {
+            let create_schema = format!("CREATE SCHEMA IF NOT EXISTS {}", spec.schema);
+            let create_table = create_table_sql(spec);
+            self.execute_in_transaction(&[create_schema, create_table])
+                .await?;
+            return Ok(EnsureOutcome::Created);
+        }
+        let reflected = self.read_existing_columns(&spec.schema, &spec.name).await?;
+        match compare_table(spec, &reflected) {
+            DriftResult::Match => Ok(EnsureOutcome::Matched),
+            DriftResult::Drift(diffs) => Ok(EnsureOutcome::Drift(diffs)),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum EnsureOutcome {
+    Created,
+    Matched,
+    Drift(Vec<crate::ddl::Difference>),
 }
 
 #[cfg(test)]
