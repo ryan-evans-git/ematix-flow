@@ -1,7 +1,7 @@
 use std::sync::{Arc, OnceLock};
 
 use ematix_flow_core::ddl::{self, DriftResult};
-use ematix_flow_core::pg::{self, EnsureOutcome, PgPool};
+use ematix_flow_core::pg::{self, EnsureOutcome, MergeRunResult, PgPool};
 use ematix_flow_core::strategy::append::augment_with_metadata;
 use ematix_flow_core::types::TableSpec;
 use pyo3::exceptions::PyValueError;
@@ -106,6 +106,78 @@ impl Connection {
         dict.set_item("port", info.port)?;
         dict.set_item("dbname", &info.dbname)?;
         dict.set_item("user", &info.user)?;
+        Ok(dict)
+    }
+
+    /// Run a MergeUpsert / SCD1 load. Returns rows_inserted/rows_updated/
+    /// rows_unchanged. `mode_label` is whatever the user passed ("merge"
+    /// or "scd1") and is recorded in run_history.
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (target_spec_json, source_query, pipeline_name, keys, update_columns, mode_label, source=None))]
+    fn run_merge<'py>(
+        &self,
+        py: Python<'py>,
+        target_spec_json: String,
+        source_query: String,
+        pipeline_name: String,
+        keys: Vec<String>,
+        update_columns: Vec<String>,
+        mode_label: String,
+        source: Option<&Connection>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        if keys.is_empty() {
+            return Err(PyValueError::new_err(
+                "merge mode requires at least one key",
+            ));
+        }
+        let normalized = ematix_flow_core::normalize_table_json(&target_spec_json)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        let spec: TableSpec =
+            serde_json::from_str(&normalized).map_err(|e| PyValueError::new_err(e.to_string()))?;
+        let target_pool = self.pool.clone();
+        let source_pool = source.map(|s| s.pool.clone());
+
+        let outcome: MergeRunResult = py
+            .detach(|| {
+                rt().block_on(async move {
+                    match source_pool {
+                        None => {
+                            target_pool
+                                .run_merge_same_db(
+                                    &spec,
+                                    &source_query,
+                                    &keys,
+                                    &update_columns,
+                                    &pipeline_name,
+                                    &mode_label,
+                                )
+                                .await
+                        }
+                        Some(src) => {
+                            target_pool
+                                .run_merge_cross_db(
+                                    &src,
+                                    &spec,
+                                    &source_query,
+                                    &keys,
+                                    &update_columns,
+                                    &pipeline_name,
+                                    &mode_label,
+                                )
+                                .await
+                        }
+                    }
+                })
+            })
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+
+        let dict = PyDict::new(py);
+        dict.set_item("run_id", outcome.run_id)?;
+        dict.set_item("rows_inserted", outcome.rows_inserted)?;
+        dict.set_item("rows_updated", outcome.rows_updated)?;
+        dict.set_item("rows_unchanged", outcome.rows_unchanged)?;
+        dict.set_item("status", outcome.status)?;
+        dict.set_item("path", outcome.path)?;
         Ok(dict)
     }
 

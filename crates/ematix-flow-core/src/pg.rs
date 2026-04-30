@@ -12,6 +12,7 @@ use crate::ddl::{
     DriftResult, ReflectedColumn, canonicalize_reflected_type, compare_table, create_table_sql,
 };
 use crate::strategy::append::{BATCH_ID_COL, LOADED_AT_COL, plan_same_db_append};
+use crate::strategy::merge::plan_merge_upsert;
 use crate::strategy::truncate::plan_truncate_replace;
 use crate::types::TableSpec;
 
@@ -79,6 +80,16 @@ pub struct PgPool {
 pub struct AppendRunResult {
     pub run_id: String,
     pub rows_inserted: i64,
+    pub status: String,
+    pub path: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct MergeRunResult {
+    pub run_id: String,
+    pub rows_inserted: i64,
+    pub rows_updated: i64,
+    pub rows_unchanged: i64,
     pub status: String,
     pub path: String,
 }
@@ -262,7 +273,9 @@ pub enum EnsureOutcome {
 }
 
 impl PgPool {
-    /// Lazy-create the `ematix_flow.run_history` table.
+    /// Lazy-create the `ematix_flow.run_history` table. Uses ALTER TABLE
+    /// IF NOT EXISTS for columns added in later phases so existing
+    /// installations get upgraded transparently.
     pub async fn ensure_meta_schema(&self) -> Result<(), PgError> {
         let create_schema = format!("CREATE SCHEMA IF NOT EXISTS {META_SCHEMA}");
         let create_table = format!(
@@ -280,7 +293,15 @@ impl PgPool {
                 error_message TEXT
             )"
         );
-        self.execute_in_transaction(&[create_schema, create_table])
+        let alter_updated = format!(
+            "ALTER TABLE {META_SCHEMA}.{RUN_HISTORY_TABLE} \
+             ADD COLUMN IF NOT EXISTS rows_updated BIGINT"
+        );
+        let alter_unchanged = format!(
+            "ALTER TABLE {META_SCHEMA}.{RUN_HISTORY_TABLE} \
+             ADD COLUMN IF NOT EXISTS rows_unchanged BIGINT"
+        );
+        self.execute_in_transaction(&[create_schema, create_table, alter_updated, alter_unchanged])
             .await
     }
 
@@ -336,6 +357,32 @@ impl PgPool {
                      WHERE run_id=$1"
                 ),
                 &[&run_id, &rows_inserted],
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn finish_history_success_merge(
+        &self,
+        run_id: Uuid,
+        inserted: i64,
+        updated: i64,
+        unchanged: i64,
+    ) -> Result<(), PgError> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| PgError::Pool(e.to_string()))?;
+        client
+            .execute(
+                &format!(
+                    "UPDATE {META_SCHEMA}.{RUN_HISTORY_TABLE} \
+                     SET status='success', rows_inserted=$2, rows_updated=$3, \
+                         rows_unchanged=$4, finished_at=now() \
+                     WHERE run_id=$1"
+                ),
+                &[&run_id, &inserted, &updated, &unchanged],
             )
             .await?;
         Ok(())
@@ -647,6 +694,174 @@ impl PgPool {
                 Ok(AppendRunResult {
                     run_id: run_id.to_string(),
                     rows_inserted,
+                    status: "success".into(),
+                    path: "cross_db".into(),
+                })
+            }
+            Err(err) => {
+                let _ = self.finish_history_failure(run_id, &err.to_string()).await;
+                Err(err)
+            }
+        }
+    }
+
+    /// Same-DB MergeUpsert / SCD1 executor. `mode_label` is whatever the
+    /// user requested ("merge" or "scd1") and is recorded in run_history.
+    pub async fn run_merge_same_db(
+        &self,
+        target_spec: &TableSpec,
+        source_query: &str,
+        keys: &[String],
+        update_columns: &[String],
+        pipeline_name: &str,
+        mode_label: &str,
+    ) -> Result<MergeRunResult, PgError> {
+        self.ensure_meta_schema().await?;
+        let run_id = Uuid::new_v4();
+        let batch_id = run_id;
+        self.insert_history_start(run_id, pipeline_name, target_spec, mode_label, "same_db")
+            .await?;
+
+        let plan = plan_merge_upsert(target_spec, source_query, keys, update_columns);
+        let result: Result<(i64, i64, i64), PgError> = async {
+            let mut client = self
+                .pool
+                .get()
+                .await
+                .map_err(|e| PgError::Pool(e.to_string()))?;
+            let tx = client.transaction().await?;
+            let row = if plan.has_metadata {
+                tx.query_one(&plan.sql, &[&batch_id]).await?
+            } else {
+                tx.query_one(&plan.sql, &[]).await?
+            };
+            let inserted: i64 = row.get(0);
+            let updated: i64 = row.get(1);
+            let total: i64 = row.get(2);
+            tx.commit().await?;
+            let unchanged = total - inserted - updated;
+            Ok((inserted, updated, unchanged))
+        }
+        .await;
+
+        match result {
+            Ok((inserted, updated, unchanged)) => {
+                self.finish_history_success_merge(run_id, inserted, updated, unchanged)
+                    .await?;
+                Ok(MergeRunResult {
+                    run_id: run_id.to_string(),
+                    rows_inserted: inserted,
+                    rows_updated: updated,
+                    rows_unchanged: unchanged,
+                    status: "success".into(),
+                    path: "same_db".into(),
+                })
+            }
+            Err(err) => {
+                let _ = self.finish_history_failure(run_id, &err.to_string()).await;
+                Err(err)
+            }
+        }
+    }
+
+    /// Cross-DB MergeUpsert: COPY source rows into a target-side temp
+    /// staging table, then run the merge upsert with the staging table as
+    /// the source.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn run_merge_cross_db(
+        &self,
+        source_pool: &PgPool,
+        target_spec: &TableSpec,
+        source_query: &str,
+        keys: &[String],
+        update_columns: &[String],
+        pipeline_name: &str,
+        mode_label: &str,
+    ) -> Result<MergeRunResult, PgError> {
+        self.ensure_meta_schema().await?;
+        let run_id = Uuid::new_v4();
+        let batch_id = run_id;
+        self.insert_history_start(run_id, pipeline_name, target_spec, mode_label, "cross_db")
+            .await?;
+
+        let user_columns: Vec<&str> = target_spec
+            .columns
+            .iter()
+            .filter(|c| c.name != LOADED_AT_COL && c.name != BATCH_ID_COL)
+            .map(|c| c.name.as_str())
+            .collect();
+        let staging_def: String = target_spec
+            .columns
+            .iter()
+            .filter(|c| c.name != LOADED_AT_COL && c.name != BATCH_ID_COL)
+            .map(|c| format!("{} {}", c.name, c.ty.to_postgres_sql()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let staging = format!("_ematix_stage_{}", run_id.simple());
+        let projected_source = format!(
+            "SELECT {cols} FROM ({source_query}) src",
+            cols = user_columns.join(", "),
+        );
+        let plan = plan_merge_upsert(
+            target_spec,
+            &format!("SELECT * FROM {staging}"),
+            keys,
+            update_columns,
+        );
+
+        let result: Result<(i64, i64, i64), PgError> = async {
+            let mut target_client = self
+                .pool
+                .get()
+                .await
+                .map_err(|e| PgError::Pool(e.to_string()))?;
+            let target_tx = target_client.transaction().await?;
+            target_tx
+                .batch_execute(&format!("CREATE TEMP TABLE {staging} ({staging_def})"))
+                .await?;
+
+            let source_client = source_pool
+                .pool
+                .get()
+                .await
+                .map_err(|e| PgError::Pool(e.to_string()))?;
+            let copy_out_sql = format!("COPY ({projected_source}) TO STDOUT (FORMAT binary)");
+            let stream = source_client.copy_out(&copy_out_sql).await?;
+
+            let copy_in_sql = format!("COPY {staging} FROM STDIN (FORMAT binary)");
+            let sink = target_tx.copy_in::<_, Bytes>(&copy_in_sql).await?;
+
+            pin_mut!(stream);
+            pin_mut!(sink);
+            while let Some(chunk) = stream.next().await {
+                let bytes = chunk?;
+                sink.send(bytes).await?;
+            }
+            let _ = sink.finish().await?;
+
+            let row = if plan.has_metadata {
+                target_tx.query_one(&plan.sql, &[&batch_id]).await?
+            } else {
+                target_tx.query_one(&plan.sql, &[]).await?
+            };
+            let inserted: i64 = row.get(0);
+            let updated: i64 = row.get(1);
+            let total: i64 = row.get(2);
+            target_tx.commit().await?;
+            let unchanged = total - inserted - updated;
+            Ok((inserted, updated, unchanged))
+        }
+        .await;
+
+        match result {
+            Ok((inserted, updated, unchanged)) => {
+                self.finish_history_success_merge(run_id, inserted, updated, unchanged)
+                    .await?;
+                Ok(MergeRunResult {
+                    run_id: run_id.to_string(),
+                    rows_inserted: inserted,
+                    rows_updated: updated,
+                    rows_unchanged: unchanged,
                     status: "success".into(),
                     path: "cross_db".into(),
                 })

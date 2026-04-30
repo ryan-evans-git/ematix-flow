@@ -61,6 +61,9 @@ def _same_database(a: Any, b: Any) -> bool:
     return a.connection_info() == b.connection_info()
 
 
+_METADATA_COLS = ("_loaded_at", "_batch_id")
+
+
 def sync(
     *,
     target: type[ManagedTable],
@@ -69,9 +72,11 @@ def sync(
     mode: Mode = "append",
     pipeline_name: str | None = None,
     on_drift: str = "error",
+    keys: tuple[str, ...] | None = None,
+    update_columns: tuple[str, ...] | None = None,
 ) -> dict[str, Any]:
-    """Execute a load. Phases 5–6 support `mode="append"` and `"truncate"`."""
-    if mode not in ("append", "truncate"):
+    """Execute a load. Phases 5–7 support 'append', 'truncate', 'merge'/'scd1'."""
+    if mode not in ("append", "truncate", "merge", "scd1"):
         raise NotImplementedError(f"mode={mode!r} is not yet implemented")
 
     name = pipeline_name or f"{target.__schema__}.{target.__tablename__}"
@@ -81,6 +86,31 @@ def sync(
 
     same_db = _same_database(source.connection, target_connection)
     src_arg = None if same_db else source.connection
+
     if mode == "append":
         return target_connection.run_append(augmented_json, source.query, name, src_arg)
-    return target_connection.run_truncate(augmented_json, source.query, name, src_arg)
+    if mode == "truncate":
+        return target_connection.run_truncate(augmented_json, source.query, name, src_arg)
+
+    # merge / scd1
+    resolved_keys = list(keys) if keys else target._primary_keys()
+    if not resolved_keys:
+        raise ValueError(
+            f"mode={mode!r} requires keys; pass keys=... or declare primary_key columns"
+        )
+    if update_columns is None:
+        all_cols = [name for name, _ in target._columns()]
+        resolved_updates = [
+            c for c in all_cols if c not in resolved_keys and c not in _METADATA_COLS
+        ]
+    else:
+        resolved_updates = list(update_columns)
+    return target_connection.run_merge(
+        augmented_json,
+        source.query,
+        name,
+        resolved_keys,
+        resolved_updates,
+        mode,
+        src_arg,
+    )
