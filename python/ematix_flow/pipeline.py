@@ -76,10 +76,15 @@ def sync(
     keys: tuple[str, ...] | None = None,
     update_columns: tuple[str, ...] | None = None,
     compare_columns: tuple[str, ...] | None = None,
+    force_path: str | None = None,
 ) -> dict[str, Any]:
     """Execute a load. Phases 5–8 support 'append', 'truncate', 'merge'/'scd1', 'scd2'."""
     if mode not in ("append", "truncate", "merge", "scd1", "scd2"):
         raise NotImplementedError(f"mode={mode!r} is not yet implemented")
+    if force_path is not None and force_path not in ("same_db", "cross_db"):
+        raise ValueError(
+            f"force_path must be 'same_db', 'cross_db', or None (got {force_path!r})"
+        )
 
     name = pipeline_name or f"{target.__schema__}.{target.__tablename__}"
 
@@ -90,7 +95,12 @@ def sync(
 
     target_connection.ensure_table(augmented_json, on_drift)
 
-    same_db = _same_database(source.connection, target_connection)
+    if force_path == "same_db":
+        same_db = True
+    elif force_path == "cross_db":
+        same_db = False
+    else:
+        same_db = _same_database(source.connection, target_connection)
     src_arg = None if same_db else source.connection
 
     if mode == "append":
