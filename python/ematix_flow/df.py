@@ -37,6 +37,62 @@ def _try_import(name: str) -> Any | None:
         return None
 
 
+# Phase 29: ADBC + pyarrow availability check. When both are present we
+# stage DataFrames via Arrow → COPY BINARY (faster + type-correct) instead
+# of CSV → COPY TEXT. The CSV path remains as fallback so users on older
+# `[df]` extras keep working.
+def _adbc_available() -> bool:
+    try:
+        import adbc_driver_postgresql.dbapi  # noqa: F401
+        import pyarrow  # noqa: F401
+
+        return True
+    except ImportError:
+        return False
+
+
+_HAS_ADBC = _adbc_available()
+
+
+def _df_to_arrow_table(df: Any, kind: str) -> Any:
+    """Convert a polars / pandas DataFrame to a pyarrow Table with the
+    column order preserved. Used by the ADBC ingest path.
+    """
+    import pyarrow as pa
+
+    if kind == "polars":
+        return df.to_arrow()
+    return pa.Table.from_pandas(df, preserve_index=False)
+
+
+def _adbc_ingest(
+    dsn: str,
+    schema: str,
+    table: str,
+    arrow_table: Any,
+    *,
+    mode: str = "create_append",
+) -> None:
+    """Stage an Arrow Table to `<schema>.<table>` via ADBC's bulk_ingest
+    (Postgres COPY BINARY under the hood). `mode` is the ADBC ingest mode
+    keyword: "create" / "append" / "create_append" / "replace".
+    """
+    import adbc_driver_postgresql.dbapi as adbc_pg
+
+    conn = adbc_pg.connect(dsn)
+    try:
+        with conn.cursor() as cur:
+            cur.adbc_ingest(
+                table,
+                arrow_table,
+                mode=mode,
+                db_schema_name=schema,
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def _require_psycopg2():
     psycopg2 = _try_import("psycopg2")
     if psycopg2 is None:
@@ -211,16 +267,26 @@ def _stage_df_to_temp_table(
     columns: list[str],
     pg_types: list[str],
 ) -> str:
-    """Create a TEMP table in a fresh psycopg2 session and COPY df rows
-    into it. Returns the temp table name. The session must be kept open
-    by the caller; we close it here, which means the temp table is gone
-    when this function returns. Therefore: stage to a *real* table in the
-    public schema using a uuid suffix, return the name; caller must drop.
-    """
-    psycopg2 = _require_psycopg2()
-    temp_name = f"_ematix_df_{uuid.uuid4().hex[:12]}"
-    cols_decl = ", ".join(f'"{c}" {t}' for c, t in zip(columns, pg_types))
+    """Stage df to a uuid-named real table in the public schema. Returns
+    the table name; caller drops.
 
+    Uses ADBC (Arrow → COPY BINARY) when available — faster, smaller on
+    the wire, type-correct (no string round-tripping for timestamps,
+    numerics, booleans). Falls back to CSV `COPY` when ADBC isn't
+    installed.
+    """
+    temp_name = f"_ematix_df_{uuid.uuid4().hex[:12]}"
+
+    if _HAS_ADBC:
+        # ADBC's create_append mode infers the table schema from the
+        # Arrow table; we don't need to spell out column types.
+        arrow_table = _df_to_arrow_table(df.select(columns) if kind == "polars" else df[columns], kind)
+        _adbc_ingest(conn_dsn, "public", temp_name, arrow_table, mode="create_append")
+        return temp_name
+
+    # Fallback: CSV COPY via psycopg2.
+    psycopg2 = _require_psycopg2()
+    cols_decl = ", ".join(f'"{c}" {t}' for c, t in zip(columns, pg_types))
     pg = psycopg2.connect(conn_dsn)
     try:
         pg.autocommit = True
@@ -361,38 +427,62 @@ def _write_df_inferred(
     if mode == "truncate":
         self.execute(f'TRUNCATE TABLE "{schema}"."{table}"')
 
-    pg = psycopg2.connect(self.dsn())
-    try:
-        pg.autocommit = True
-        csv_bytes = (
-            _df_to_csv_bytes_polars(df, cols)
-            if kind == "polars"
-            else _df_to_csv_bytes_pandas(df, cols)
-        )
+    # append / truncate: ingest directly into the destination.
+    if mode in ("append", "truncate"):
+        if _HAS_ADBC:
+            sub_df = df.select(cols) if kind == "polars" else df[cols]
+            arrow_table = _df_to_arrow_table(sub_df, kind)
+            _adbc_ingest(self.dsn(), schema, table, arrow_table, mode="append")
+        else:
+            pg = psycopg2.connect(self.dsn())
+            try:
+                pg.autocommit = True
+                csv_bytes = (
+                    _df_to_csv_bytes_polars(df, cols)
+                    if kind == "polars"
+                    else _df_to_csv_bytes_pandas(df, cols)
+                )
+                with pg.cursor() as cur:
+                    cur.copy_expert(
+                        f'COPY "{schema}"."{table}" '
+                        f'({", ".join(chr(34) + c + chr(34) for c in cols)}) '
+                        f"FROM STDIN WITH (FORMAT CSV)",
+                        io.BytesIO(csv_bytes),
+                    )
+            finally:
+                pg.close()
+        return {"rows_inserted": len(df), "path": f"inferred_{mode}"}
 
-        if mode in ("append", "truncate"):
-            with pg.cursor() as cur:
+    # merge / scd1: stage to a uuid table → INSERT ... ON CONFLICT.
+    staging = f"_ematix_df_{uuid.uuid4().hex[:12]}"
+    if _HAS_ADBC:
+        sub_df = df.select(cols) if kind == "polars" else df[cols]
+        arrow_table = _df_to_arrow_table(sub_df, kind)
+        _adbc_ingest(self.dsn(), "public", staging, arrow_table, mode="create_append")
+    else:
+        pg_stage = psycopg2.connect(self.dsn())
+        try:
+            pg_stage.autocommit = True
+            csv_bytes = (
+                _df_to_csv_bytes_polars(df, cols)
+                if kind == "polars"
+                else _df_to_csv_bytes_pandas(df, cols)
+            )
+            with pg_stage.cursor() as cur:
+                cur.execute(f'CREATE TABLE "{staging}" ({decls})')
                 cur.copy_expert(
-                    f'COPY "{schema}"."{table}" '
+                    f'COPY "{staging}" '
                     f'({", ".join(chr(34) + c + chr(34) for c in cols)}) '
                     f"FROM STDIN WITH (FORMAT CSV)",
                     io.BytesIO(csv_bytes),
                 )
-            return {
-                "rows_inserted": len(df),
-                "path": f"inferred_{mode}",
-            }
+        finally:
+            pg_stage.close()
 
-        # merge / scd1: stage to a uuid table → INSERT ... ON CONFLICT.
-        staging = f"_ematix_df_{uuid.uuid4().hex[:12]}"
+    pg = psycopg2.connect(self.dsn())
+    try:
+        pg.autocommit = True
         with pg.cursor() as cur:
-            cur.execute(f'CREATE TABLE "{staging}" ({decls})')
-            cur.copy_expert(
-                f'COPY "{staging}" '
-                f'({", ".join(chr(34) + c + chr(34) for c in cols)}) '
-                f"FROM STDIN WITH (FORMAT CSV)",
-                io.BytesIO(csv_bytes),
-            )
             non_keys = [c for c in cols if c not in keys]
             target_cols = ", ".join(f'"{c}"' for c in cols)
             conflict_cols = ", ".join(f'"{k}"' for k in keys)
@@ -406,7 +496,6 @@ def _write_df_inferred(
                     f"ON CONFLICT ({conflict_cols}) DO UPDATE SET {set_clause}"
                 )
             else:
-                # All columns are keys → DO NOTHING is the only sensible upsert.
                 upsert = (
                     f'INSERT INTO "{schema}"."{table}" ({target_cols}) '
                     f'SELECT {target_cols} FROM "{staging}" '
@@ -414,9 +503,9 @@ def _write_df_inferred(
                 )
             cur.execute(upsert)
             cur.execute(f'DROP TABLE IF EXISTS "{staging}"')
-        return {"rows_inserted": len(df), "path": "inferred_merge"}
     finally:
         pg.close()
+    return {"rows_inserted": len(df), "path": "inferred_merge"}
 
 
 # --- monkey-patch on import ----------------------------------------------
