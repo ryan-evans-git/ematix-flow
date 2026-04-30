@@ -70,8 +70,8 @@ def sync(
     pipeline_name: str | None = None,
     on_drift: str = "error",
 ) -> dict[str, Any]:
-    """Execute a load. Phase 5 supports `mode="append"`."""
-    if mode != "append":
+    """Execute a load. Phases 5–6 support `mode="append"` and `"truncate"`."""
+    if mode not in ("append", "truncate"):
         raise NotImplementedError(f"mode={mode!r} is not yet implemented")
 
     name = pipeline_name or f"{target.__schema__}.{target.__tablename__}"
@@ -81,4 +81,6 @@ def sync(
 
     same_db = _same_database(source.connection, target_connection)
     src_arg = None if same_db else source.connection
-    return target_connection.run_append(augmented_json, source.query, name, src_arg)
+    if mode == "append":
+        return target_connection.run_append(augmented_json, source.query, name, src_arg)
+    return target_connection.run_truncate(augmented_json, source.query, name, src_arg)

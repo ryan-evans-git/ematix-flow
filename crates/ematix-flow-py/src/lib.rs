@@ -109,6 +109,53 @@ impl Connection {
         Ok(dict)
     }
 
+    /// Run a TruncateReplace load. If `source` is None, uses self as the
+    /// source (same-DB); otherwise stages source rows through COPY (binary).
+    /// TRUNCATE + INSERT happen in the same transaction so the target's
+    /// pre-load contents survive any failure.
+    #[pyo3(signature = (target_spec_json, source_query, pipeline_name, source=None))]
+    fn run_truncate<'py>(
+        &self,
+        py: Python<'py>,
+        target_spec_json: String,
+        source_query: String,
+        pipeline_name: String,
+        source: Option<&Connection>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let normalized = ematix_flow_core::normalize_table_json(&target_spec_json)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        let spec: TableSpec =
+            serde_json::from_str(&normalized).map_err(|e| PyValueError::new_err(e.to_string()))?;
+        let target_pool = self.pool.clone();
+        let source_pool = source.map(|s| s.pool.clone());
+
+        let outcome = py
+            .detach(|| {
+                rt().block_on(async move {
+                    match source_pool {
+                        None => {
+                            target_pool
+                                .run_truncate_same_db(&spec, &source_query, &pipeline_name)
+                                .await
+                        }
+                        Some(src) => {
+                            target_pool
+                                .run_truncate_cross_db(&src, &spec, &source_query, &pipeline_name)
+                                .await
+                        }
+                    }
+                })
+            })
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+
+        let dict = PyDict::new(py);
+        dict.set_item("run_id", outcome.run_id)?;
+        dict.set_item("rows_inserted", outcome.rows_inserted)?;
+        dict.set_item("status", outcome.status)?;
+        dict.set_item("path", outcome.path)?;
+        Ok(dict)
+    }
+
     /// Run an AppendOnly load. If `source` is None, uses self as the source
     /// (same-DB path); otherwise runs cross-DB COPY through self as target.
     /// `target_spec_json` is the augmented spec (metadata cols already added).
