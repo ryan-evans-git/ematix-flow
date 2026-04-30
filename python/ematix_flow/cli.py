@@ -33,9 +33,56 @@ def _import_user_module(name: str) -> None:
 
 
 def _cmd_list(args: argparse.Namespace) -> int:
+    """Phase 27c Q4.2 β: merged listing of pipelines + transforms."""
     _import_user_module(args.module)
-    for sp in p.list_pipelines():
-        print(f"{sp.name}\t{sp.schedule}")
+    entries = p.list_entries()
+    if args.format == "json":
+        print(
+            json.dumps(
+                [
+                    {"name": e.name, "kind": e.kind, "schedule": e.schedule}
+                    for e in entries
+                ]
+            )
+        )
+        return 0
+    if not entries:
+        return 0
+    name_w = max((len(e.name) for e in entries), default=4)
+    kind_w = max((len(e.kind) for e in entries), default=4)
+    for e in entries:
+        sched = e.schedule if e.schedule is not None else "(unscheduled)"
+        print(f"{e.name:<{name_w}}  {e.kind:<{kind_w}}  {sched}")
+    return 0
+
+
+def _cmd_transform_list(args: argparse.Namespace) -> int:
+    _import_user_module(args.module)
+    entries = p.list_transforms()
+    if args.format == "json":
+        print(
+            json.dumps(
+                [
+                    {"name": e.name, "kind": e.kind, "schedule": e.schedule}
+                    for e in entries
+                ]
+            )
+        )
+        return 0
+    for e in entries:
+        sched = e.schedule if e.schedule is not None else "(unscheduled)"
+        print(f"{e.name}\t{sched}")
+    return 0
+
+
+def _cmd_transform_run(args: argparse.Namespace) -> int:
+    _import_user_module(args.module)
+    try:
+        result = p.run_transform(args.name)
+    except KeyError:
+        print(f"error: no transform named {args.name!r}", file=sys.stderr)
+        return 2
+    print(json.dumps(result, default=str))
     return 0
 
 
@@ -192,8 +239,13 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="flow", description="ematix-flow CLI")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
-    list_p = sub.add_parser("list", help="list registered pipelines")
-    list_p.add_argument("--module", required=True, help="dotted module path that registers pipelines")
+    list_p = sub.add_parser(
+        "list", help="list registered pipelines and transforms"
+    )
+    list_p.add_argument(
+        "--module", required=True, help="dotted module path that registers pipelines"
+    )
+    list_p.add_argument("--format", choices=["text", "json"], default="text")
     list_p.set_defaults(func=_cmd_list)
 
     run_p = sub.add_parser("run", help="run a pipeline by name")
@@ -251,6 +303,22 @@ def main(argv: list[str] | None = None) -> int:
     val_p.add_argument("--module", required=True)
     val_p.add_argument("--format", choices=["text", "json"], default="text")
     val_p.set_defaults(func=_cmd_validate)
+
+    # `flow transform {list,run}` (Phase 27d).
+    xfm_p = sub.add_parser(
+        "transform", help="manage @ematix.transform-decorated callables"
+    )
+    xfm_sub = xfm_p.add_subparsers(dest="xfm_cmd", required=True)
+
+    xfm_list = xfm_sub.add_parser("list", help="list registered transforms")
+    xfm_list.add_argument("--module", required=True)
+    xfm_list.add_argument("--format", choices=["text", "json"], default="text")
+    xfm_list.set_defaults(func=_cmd_transform_list)
+
+    xfm_run = xfm_sub.add_parser("run", help="run a transform standalone")
+    xfm_run.add_argument("--module", required=True)
+    xfm_run.add_argument("name")
+    xfm_run.set_defaults(func=_cmd_transform_run)
 
     # `flow connections {list,check,set}` subcommands (Phase 21).
     conn_p = sub.add_parser("connections", help="manage named DB connections")
