@@ -1,0 +1,362 @@
+"""Phase 27e: DataFrame interop.
+
+Importing this module monkey-patches `_core.Connection` with two methods:
+
+  conn.read_df(sql, *, prefer="auto") -> polars.DataFrame | pandas.DataFrame
+  conn.write_df(df, qualified_name, *, mode, target=None, keys=None, ...)
+
+Auto-detect rules (Q7 → A): `prefer="auto"` returns polars when both
+polars + pandas are installed; falls back to pandas when only pandas
+is installed. Forced `prefer="polars"` / `"pandas"` raises ImportError
+if missing.
+
+Transport (Q9 → A): write_df stages the df to a TEMP table via
+psycopg2 + COPY CSV, then routes through `pipeline.sync` for the
+ManagedTable path so every strategy mode (append/truncate/merge/
+scd1/scd2) works identically. Inferred path (no `target=`) takes the
+df as-is — no metadata columns added (Q8.2 γ).
+
+Requires the `[df]` extra: `pip install ematix-flow[df]`.
+"""
+
+from __future__ import annotations
+
+import csv
+import io
+import json
+import uuid
+from typing import Any, Literal
+
+from ematix_flow import _core
+
+
+def _try_import(name: str) -> Any | None:
+    try:
+        return __import__(name)
+    except ImportError:
+        return None
+
+
+def _require_psycopg2():
+    psycopg2 = _try_import("psycopg2")
+    if psycopg2 is None:
+        raise ImportError(
+            "ematix_flow.df requires psycopg2-binary; install with "
+            "`pip install ematix-flow[df]`"
+        )
+    return psycopg2
+
+
+def _detect_df_kind(df: Any) -> Literal["polars", "pandas"]:
+    polars = _try_import("polars")
+    pandas = _try_import("pandas")
+    if polars is not None and isinstance(df, polars.DataFrame):
+        return "polars"
+    if pandas is not None and isinstance(df, pandas.DataFrame):
+        return "pandas"
+    raise TypeError(
+        f"write_df expected a polars or pandas DataFrame; got "
+        f"{type(df).__name__}. Install with `pip install ematix-flow[df]` "
+        "and pass either polars or pandas."
+    )
+
+
+def _read_df_impl(self, sql: str, *, prefer: str = "auto") -> Any:
+    if prefer not in ("auto", "polars", "pandas"):
+        raise ValueError(
+            f"prefer must be 'auto', 'polars', or 'pandas'; got {prefer!r}"
+        )
+    polars = _try_import("polars")
+    pandas = _try_import("pandas")
+
+    if prefer == "polars" and polars is None:
+        raise ImportError(
+            "prefer='polars' but polars is not installed; "
+            "`pip install polars` or use prefer='pandas'"
+        )
+    if prefer == "pandas" and pandas is None:
+        raise ImportError(
+            "prefer='pandas' but pandas is not installed; "
+            "`pip install pandas` or use prefer='polars'"
+        )
+    if polars is None and pandas is None:
+        raise ImportError(
+            "ematix_flow.df.read_df requires either polars or pandas; "
+            "install via `pip install polars` or `pip install pandas`"
+        )
+
+    chosen = prefer
+    if chosen == "auto":
+        chosen = "polars" if polars is not None else "pandas"
+
+    psycopg2 = _require_psycopg2()
+    pg = psycopg2.connect(self.dsn())
+    try:
+        with pg.cursor() as cur:
+            cur.execute(sql)
+            cols = [d.name for d in cur.description]
+            rows = cur.fetchall()
+        if chosen == "pandas":
+            return pandas.DataFrame(rows, columns=cols)
+        return polars.DataFrame(rows, schema=cols, orient="row")
+    finally:
+        pg.close()
+
+
+# --- write_df helpers -----------------------------------------------------
+
+
+def _df_to_csv_bytes_polars(df: Any, columns: list[str]) -> bytes:
+    """Serialize a polars DataFrame to CSV with given column order."""
+    sub = df.select(columns)
+    buf = io.BytesIO()
+    sub.write_csv(buf, include_header=False)
+    return buf.getvalue()
+
+
+def _df_to_csv_bytes_pandas(df: Any, columns: list[str]) -> bytes:
+    """Serialize a pandas DataFrame to CSV with given column order."""
+    buf = io.StringIO()
+    df.to_csv(buf, index=False, header=False, columns=columns, quoting=csv.QUOTE_MINIMAL)
+    return buf.getvalue().encode("utf-8")
+
+
+_INFER_PG_TYPES = {
+    # polars
+    "Int8": "SMALLINT",
+    "Int16": "SMALLINT",
+    "Int32": "INTEGER",
+    "Int64": "BIGINT",
+    "UInt8": "SMALLINT",
+    "UInt16": "INTEGER",
+    "UInt32": "BIGINT",
+    "UInt64": "NUMERIC",
+    "Float32": "REAL",
+    "Float64": "DOUBLE PRECISION",
+    "Boolean": "BOOLEAN",
+    "String": "TEXT",
+    "Utf8": "TEXT",
+    "Date": "DATE",
+    "Datetime": "TIMESTAMPTZ",
+    # pandas (mapped from str(dtype))
+    "int8": "SMALLINT",
+    "int16": "SMALLINT",
+    "int32": "INTEGER",
+    "int64": "BIGINT",
+    "float32": "REAL",
+    "float64": "DOUBLE PRECISION",
+    "bool": "BOOLEAN",
+    "object": "TEXT",
+    "datetime64[ns]": "TIMESTAMPTZ",
+    "datetime64[us]": "TIMESTAMPTZ",
+    "datetime64[ns, UTC]": "TIMESTAMPTZ",
+}
+
+
+def _polars_schema_to_pg(df: Any) -> list[tuple[str, str]]:
+    return [(name, _INFER_PG_TYPES.get(str(dtype), "TEXT")) for name, dtype in df.schema.items()]
+
+
+def _pandas_schema_to_pg(df: Any) -> list[tuple[str, str]]:
+    return [(name, _INFER_PG_TYPES.get(str(df[name].dtype), "TEXT")) for name in df.columns]
+
+
+def _write_df_impl(
+    self,
+    df: Any,
+    qualified_name: str,
+    *,
+    mode: str,
+    target: Any = None,
+    keys: tuple[str, ...] | None = None,
+    update_columns: tuple[str, ...] | None = None,
+    compare_columns: tuple[str, ...] | None = None,
+    event_timestamp_column: str | None = None,
+) -> dict[str, Any]:
+    if "." not in qualified_name:
+        raise ValueError(
+            f"write_df requires a schema-qualified name (e.g., 'public.t'); "
+            f"got {qualified_name!r}"
+        )
+    schema, _, table = qualified_name.partition(".")
+    kind = _detect_df_kind(df)
+
+    if target is not None:
+        return _write_df_managed(
+            self,
+            df=df,
+            kind=kind,
+            target=target,
+            mode=mode,
+            keys=keys,
+            update_columns=update_columns,
+            compare_columns=compare_columns,
+            event_timestamp_column=event_timestamp_column,
+        )
+    return _write_df_inferred(
+        self,
+        df=df,
+        kind=kind,
+        schema=schema,
+        table=table,
+        mode=mode,
+    )
+
+
+def _stage_df_to_temp_table(
+    conn_dsn: str,
+    df: Any,
+    kind: str,
+    columns: list[str],
+    pg_types: list[str],
+) -> str:
+    """Create a TEMP table in a fresh psycopg2 session and COPY df rows
+    into it. Returns the temp table name. The session must be kept open
+    by the caller; we close it here, which means the temp table is gone
+    when this function returns. Therefore: stage to a *real* table in the
+    public schema using a uuid suffix, return the name; caller must drop.
+    """
+    psycopg2 = _require_psycopg2()
+    temp_name = f"_ematix_df_{uuid.uuid4().hex[:12]}"
+    cols_decl = ", ".join(f'"{c}" {t}' for c, t in zip(columns, pg_types))
+
+    pg = psycopg2.connect(conn_dsn)
+    try:
+        pg.autocommit = True
+        with pg.cursor() as cur:
+            cur.execute(f'CREATE TABLE "{temp_name}" ({cols_decl})')
+            csv_bytes = (
+                _df_to_csv_bytes_polars(df, columns)
+                if kind == "polars"
+                else _df_to_csv_bytes_pandas(df, columns)
+            )
+            cur.copy_expert(
+                f'COPY "{temp_name}" ({", ".join(chr(34) + c + chr(34) for c in columns)}) '
+                f"FROM STDIN WITH (FORMAT CSV)",
+                io.BytesIO(csv_bytes),
+            )
+    except Exception:
+        pg.close()
+        raise
+    pg.close()
+    return temp_name
+
+
+def _write_df_managed(
+    self,
+    *,
+    df: Any,
+    kind: str,
+    target: Any,
+    mode: str,
+    keys: tuple[str, ...] | None,
+    update_columns: tuple[str, ...] | None,
+    compare_columns: tuple[str, ...] | None,
+    event_timestamp_column: str | None,
+) -> dict[str, Any]:
+    """Q8.1 C / Q8.2 γ: validate df shape against ManagedTable, stage
+    via temp table, run the strategy executor for full mode support."""
+    declared = [name for name, _col in target._columns()]
+    if kind == "polars":
+        df_cols = list(df.columns)
+        pg_types = [t for _, t in _polars_schema_to_pg(df)]
+    else:
+        df_cols = list(df.columns)
+        pg_types = [t for _, t in _pandas_schema_to_pg(df)]
+
+    missing = [c for c in declared if c not in df_cols]
+    if missing:
+        raise ValueError(
+            f"DataFrame is missing columns declared on {target.__name__}: {missing}"
+        )
+
+    # Stage to a real (uuid-named) table. Must drop after.
+    types_for_declared = [pg_types[df_cols.index(c)] for c in declared]
+    temp_name = _stage_df_to_temp_table(
+        self.dsn(), df, kind, declared, types_for_declared
+    )
+    try:
+        from ematix_flow import pipeline as _p
+        from ematix_flow.source import Source as _Source
+
+        source_sql = f'SELECT {", ".join(chr(34) + c + chr(34) for c in declared)} FROM "{temp_name}"'
+        source_obj = _Source.postgres_query(self, source_sql)
+        result = _p.sync(
+            target=target,
+            source=source_obj,
+            target_connection=self,
+            mode=mode,
+            pipeline_name=f"write_df:{target.__schema__}.{target.__tablename__}",
+            keys=keys,
+            update_columns=update_columns,
+            compare_columns=compare_columns,
+            event_timestamp_column=event_timestamp_column,
+        )
+        return result
+    finally:
+        try:
+            self.execute(f'DROP TABLE IF EXISTS "{temp_name}"')
+        except Exception:
+            pass
+
+
+def _write_df_inferred(
+    self,
+    *,
+    df: Any,
+    kind: str,
+    schema: str,
+    table: str,
+    mode: str,
+) -> dict[str, Any]:
+    """Q8.2 γ: inferred path — no metadata columns. Create the table from
+    df dtypes if missing; for now only support 'append' (other modes need
+    user-declared keys, which inference doesn't have).
+    """
+    if mode != "append":
+        raise NotImplementedError(
+            f"inferred write_df (no target=) currently only supports mode='append'; "
+            f"declare a @ematix.table class and pass target= for mode={mode!r}"
+        )
+    psycopg2 = _require_psycopg2()
+    if kind == "polars":
+        cols_with_types = _polars_schema_to_pg(df)
+        cols = [c for c, _ in cols_with_types]
+    else:
+        cols_with_types = _pandas_schema_to_pg(df)
+        cols = [c for c, _ in cols_with_types]
+    decls = ", ".join(f'"{c}" {t}' for c, t in cols_with_types)
+
+    self.execute(f"CREATE SCHEMA IF NOT EXISTS {schema}")
+    self.execute(
+        f'CREATE TABLE IF NOT EXISTS "{schema}"."{table}" ({decls})'
+    )
+
+    pg = psycopg2.connect(self.dsn())
+    try:
+        pg.autocommit = True
+        csv_bytes = (
+            _df_to_csv_bytes_polars(df, cols)
+            if kind == "polars"
+            else _df_to_csv_bytes_pandas(df, cols)
+        )
+        with pg.cursor() as cur:
+            cur.copy_expert(
+                f'COPY "{schema}"."{table}" '
+                f'({", ".join(chr(34) + c + chr(34) for c in cols)}) '
+                f"FROM STDIN WITH (FORMAT CSV)",
+                io.BytesIO(csv_bytes),
+            )
+    finally:
+        pg.close()
+    return {"rows_inserted": len(df), "path": "inferred"}
+
+
+# --- monkey-patch on import ----------------------------------------------
+
+
+_core.Connection.read_df = _read_df_impl  # type: ignore[attr-defined]
+_core.Connection.write_df = _write_df_impl  # type: ignore[attr-defined]
+
+
+__all__ = []

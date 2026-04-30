@@ -149,6 +149,7 @@ fn create_table_sql(spec_json: &str) -> PyResult<String> {
 #[pyclass]
 struct Connection {
     pool: Arc<PgPool>,
+    dsn: String,
 }
 
 #[pymethods]
@@ -211,6 +212,14 @@ impl Connection {
             })
         })
         .map_err(|e| PyValueError::new_err(e.to_string()))
+    }
+
+    /// Phase 27e: return the original DSN. The Python-side df module
+    /// uses this to construct a psycopg2 connection for read_df / write_df.
+    /// Carries the password — keep callers within the same trust boundary
+    /// as the user code that constructed the Connection.
+    fn dsn(&self) -> String {
+        self.dsn.clone()
     }
 
     /// (host, port, dbname, user) tuple. Used Python-side to detect the
@@ -623,12 +632,14 @@ impl Connection {
 
 #[pyfunction]
 fn connect(py: Python<'_>, url: &str) -> PyResult<Connection> {
-    let url = url.to_string();
+    let url_owned = url.to_string();
+    let url_for_connect = url_owned.clone();
     let pool = py
-        .detach(|| rt().block_on(async move { PgPool::connect(&url).await }))
+        .detach(|| rt().block_on(async move { PgPool::connect(&url_for_connect).await }))
         .map_err(|e| PyValueError::new_err(e.to_string()))?;
     Ok(Connection {
         pool: Arc::new(pool),
+        dsn: url_owned,
     })
 }
 
