@@ -64,7 +64,13 @@ deltalake = { version = "0.32", default-features = false, features = ["rustls", 
 # compiles librdkafka from source (slow first build, but no system
 # library required) — keeps CI portable. Default features (libz,
 # tokio) cover gzip + tokio integration.
-rdkafka = { version = "0.39", features = ["cmake-build"] }
+rdkafka = { version = "0.39", features = ["cmake-build", "ssl", "sasl"] }
+# AWS MSK IAM token signer (Phase 36f). librdkafka itself doesn't
+# know how to mint MSK IAM tokens — it asks the rust-side via the
+# OAUTHBEARER refresh callback, and we hand it back a presigned
+# AWS-SigV4 URL. This crate generates that URL using the AWS
+# credential chain.
+aws-msk-iam-sasl-signer = "1"
 # `url` is needed to construct deltalake's `Url` parameter; deltalake
 # doesn't re-export it. Already pulled in transitively, so this just
 # brings it into the workspace's direct namespace.

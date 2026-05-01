@@ -98,6 +98,73 @@ impl Default for KafkaBatchConfig {
     }
 }
 
+/// SCRAM mechanisms supported by librdkafka. Most cloud providers
+/// run SHA-512 by default; some self-hosted deployments still use
+/// SHA-256.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScramMechanism {
+    Sha256,
+    Sha512,
+}
+
+impl ScramMechanism {
+    fn as_kafka_str(&self) -> &'static str {
+        match self {
+            ScramMechanism::Sha256 => "SCRAM-SHA-256",
+            ScramMechanism::Sha512 => "SCRAM-SHA-512",
+        }
+    }
+}
+
+/// mTLS / cert-based auth config. All three paths are required:
+/// `ca_location` points at the broker's trust root (usually a CA
+/// bundle); `cert_location` and `key_location` are the client cert
+/// and its private key. `key_password` is for password-protected
+/// keys.
+#[derive(Debug, Clone)]
+pub struct TlsAuth {
+    pub ca_location: String,
+    pub cert_location: String,
+    pub key_location: String,
+    pub key_password: Option<String>,
+}
+
+/// Auth-provider state on `KafkaBackend`. Each variant maps to a
+/// well-known librdkafka security setup (`security.protocol` +
+/// `sasl.mechanism` + the corresponding credential keys). The
+/// builder methods on `KafkaBackend` populate the right variant;
+/// `client_config()` reads it and applies keys.
+///
+/// The framework treats Confluent Cloud, self-hosted SASL, AWS MSK,
+/// and mTLS-enabled deployments as sibling first-class auth modes —
+/// none privileged in the API.
+#[derive(Debug, Clone, Default)]
+enum AuthMode {
+    /// No auth. SASL_PLAINTEXT or PLAINTEXT depending on whether
+    /// the broker speaks TLS — but for `None` we leave
+    /// `security.protocol` unset so librdkafka picks PLAINTEXT.
+    #[default]
+    None,
+    /// SASL/PLAIN over SSL. Confluent Cloud's primary auth mode.
+    SaslPlain { username: String, password: String },
+    /// SASL/SCRAM over SSL. Common for self-hosted Kafka with
+    /// SCRAM-SHA-256/512 user accounts.
+    SaslScram {
+        mechanism: ScramMechanism,
+        username: String,
+        password: String,
+    },
+    /// mTLS — broker authenticates the client by certificate.
+    /// `security.protocol = SSL`.
+    Tls(TlsAuth),
+    /// AWS MSK IAM. Sets `security.protocol = SASL_SSL`,
+    /// `sasl.mechanism = OAUTHBEARER`, and (in the follow-up that
+    /// wires the custom `ClientContext`) registers a
+    /// `generate_oauth_token` callback that mints MSK IAM tokens
+    /// via SigV4 and refreshes them at ~80% of TTL.
+    MskIam { region: String },
+}
+
 /// Lazy-initialized consumer session that persists across
 /// `read_arrow_stream` calls so that:
 ///   - the same group rebalance / offset state is reused (avoids
@@ -146,6 +213,10 @@ pub struct KafkaBackend {
     /// reused on subsequent calls within the same backend instance,
     /// committed by `commit_offsets`.
     consumer_session: Arc<Mutex<ConsumerSession>>,
+    /// Auth provider — `AuthMode::None` for unauthenticated clusters;
+    /// populated by the `with_sasl_plain` / `with_sasl_scram` /
+    /// `with_tls` / `with_msk_iam` builder methods.
+    auth: AuthMode,
 }
 
 impl std::fmt::Debug for ConsumerSession {
@@ -179,7 +250,78 @@ impl KafkaBackend {
             group_id: group_id.map(|s| s.to_string()),
             batch_config: KafkaBatchConfig::default(),
             consumer_session: Arc::new(Mutex::new(ConsumerSession::default())),
+            auth: AuthMode::None,
         })
+    }
+
+    /// SASL/PLAIN over TLS — Confluent Cloud's primary auth mode and
+    /// a common self-hosted setup. Sets:
+    ///   - `security.protocol = SASL_SSL`
+    ///   - `sasl.mechanism = PLAIN`
+    ///   - `sasl.username` / `sasl.password`
+    pub fn with_sasl_plain(
+        mut self,
+        username: impl Into<String>,
+        password: impl Into<String>,
+    ) -> Self {
+        self.auth = AuthMode::SaslPlain {
+            username: username.into(),
+            password: password.into(),
+        };
+        self
+    }
+
+    /// SASL/SCRAM-SHA-{256,512} over TLS — common for self-hosted
+    /// Kafka with SCRAM user accounts. Sets:
+    ///   - `security.protocol = SASL_SSL`
+    ///   - `sasl.mechanism = SCRAM-SHA-256` or `SCRAM-SHA-512`
+    ///   - `sasl.username` / `sasl.password`
+    pub fn with_sasl_scram(
+        mut self,
+        mechanism: ScramMechanism,
+        username: impl Into<String>,
+        password: impl Into<String>,
+    ) -> Self {
+        self.auth = AuthMode::SaslScram {
+            mechanism,
+            username: username.into(),
+            password: password.into(),
+        };
+        self
+    }
+
+    /// mTLS / cert-based authentication. Sets:
+    ///   - `security.protocol = SSL`
+    ///   - `ssl.ca.location`
+    ///   - `ssl.certificate.location` / `ssl.key.location`
+    ///   - `ssl.key.password` (when set)
+    pub fn with_tls(mut self, tls: TlsAuth) -> Self {
+        self.auth = AuthMode::Tls(tls);
+        self
+    }
+
+    /// AWS MSK IAM. Sets:
+    ///   - `security.protocol = SASL_SSL`
+    ///   - `sasl.mechanism = OAUTHBEARER`
+    ///
+    /// Producer / consumer creation in this builder doesn't yet
+    /// register the `generate_oauth_token` callback that mints MSK
+    /// IAM tokens — that needs a custom `ClientContext` (which
+    /// requires parameterizing every `StreamConsumer` /
+    /// `FutureProducer` / `AdminClient` construction site through a
+    /// new `Self::ClientCtx` associated type). Tracked as the 36f
+    /// follow-up; the dep on `aws-msk-iam-sasl-signer` is in place
+    /// so the token-generation side is ready.
+    ///
+    /// In the meantime, calling `ping` / `read_arrow_stream` /
+    /// produce on an MSK-IAM-configured backend will fail at the
+    /// librdkafka layer with a missing-token error — that's the
+    /// honest error to surface until the callback wiring lands.
+    pub fn with_msk_iam(mut self, region: impl Into<String>) -> Self {
+        self.auth = AuthMode::MskIam {
+            region: region.into(),
+        };
+        self
     }
 
     /// Commit any offsets accumulated by prior `read_arrow_stream`
@@ -322,6 +464,47 @@ impl KafkaBackend {
             // throwaway clients (ping / metadata fetches) carry the
             // safe default.
             config.set("enable.auto.commit", "false");
+        }
+        // Phase 36f: layer auth-provider config keys.
+        match &self.auth {
+            AuthMode::None => {}
+            AuthMode::SaslPlain { username, password } => {
+                config.set("security.protocol", "SASL_SSL");
+                config.set("sasl.mechanism", "PLAIN");
+                config.set("sasl.username", username);
+                config.set("sasl.password", password);
+            }
+            AuthMode::SaslScram {
+                mechanism,
+                username,
+                password,
+            } => {
+                config.set("security.protocol", "SASL_SSL");
+                config.set("sasl.mechanism", mechanism.as_kafka_str());
+                config.set("sasl.username", username);
+                config.set("sasl.password", password);
+            }
+            AuthMode::Tls(tls) => {
+                config.set("security.protocol", "SSL");
+                config.set("ssl.ca.location", &tls.ca_location);
+                config.set("ssl.certificate.location", &tls.cert_location);
+                config.set("ssl.key.location", &tls.key_location);
+                if let Some(pw) = &tls.key_password {
+                    config.set("ssl.key.password", pw);
+                }
+            }
+            AuthMode::MskIam { region: _region } => {
+                // Surface the OAUTHBEARER mechanism so librdkafka
+                // knows it should ask us for tokens. The actual
+                // generate_oauth_token callback wiring (custom
+                // ClientContext + aws-msk-iam-sasl-signer) is the
+                // 36f follow-up; until then this fails fast with a
+                // clear "missing token" error from librdkafka, which
+                // is more useful than letting traffic flow on plain
+                // creds.
+                config.set("security.protocol", "SASL_SSL");
+                config.set("sasl.mechanism", "OAUTHBEARER");
+            }
         }
         config
     }
@@ -909,6 +1092,94 @@ mod tests {
             .unwrap()
             .with_batch_config(custom);
         assert_eq!(b.batch_config(), custom);
+    }
+
+    /// `ClientConfig`'s `Debug` strips sensitive keys (passwords),
+    /// so we use `.get(key)` for direct assertions instead.
+    fn config_get(b: &KafkaBackend, key: &str) -> Option<String> {
+        b.client_config().get(key).map(|s| s.to_string())
+    }
+
+    #[test]
+    fn with_sasl_plain_sets_kafka_keys() {
+        let b = KafkaBackend::open("localhost:9092", Some("g1"))
+            .unwrap()
+            .with_sasl_plain("alice", "s3cret");
+        assert_eq!(
+            config_get(&b, "security.protocol").as_deref(),
+            Some("SASL_SSL")
+        );
+        assert_eq!(config_get(&b, "sasl.mechanism").as_deref(), Some("PLAIN"));
+        assert_eq!(config_get(&b, "sasl.username").as_deref(), Some("alice"));
+        assert_eq!(config_get(&b, "sasl.password").as_deref(), Some("s3cret"));
+    }
+
+    #[test]
+    fn with_sasl_scram_sets_kafka_keys_per_mechanism() {
+        let b256 = KafkaBackend::open("localhost:9092", Some("g1"))
+            .unwrap()
+            .with_sasl_scram(ScramMechanism::Sha256, "alice", "s3cret");
+        assert_eq!(
+            config_get(&b256, "sasl.mechanism").as_deref(),
+            Some("SCRAM-SHA-256")
+        );
+        let b512 = KafkaBackend::open("localhost:9092", Some("g1"))
+            .unwrap()
+            .with_sasl_scram(ScramMechanism::Sha512, "bob", "s3cret");
+        assert_eq!(
+            config_get(&b512, "sasl.mechanism").as_deref(),
+            Some("SCRAM-SHA-512")
+        );
+        assert_eq!(config_get(&b512, "sasl.username").as_deref(), Some("bob"));
+    }
+
+    #[test]
+    fn with_tls_sets_kafka_keys() {
+        let tls = TlsAuth {
+            ca_location: "/tmp/ca.pem".into(),
+            cert_location: "/tmp/cert.pem".into(),
+            key_location: "/tmp/key.pem".into(),
+            key_password: Some("kp".into()),
+        };
+        let b = KafkaBackend::open("localhost:9092", Some("g1"))
+            .unwrap()
+            .with_tls(tls);
+        assert_eq!(config_get(&b, "security.protocol").as_deref(), Some("SSL"));
+        assert_eq!(
+            config_get(&b, "ssl.ca.location").as_deref(),
+            Some("/tmp/ca.pem")
+        );
+        assert_eq!(
+            config_get(&b, "ssl.certificate.location").as_deref(),
+            Some("/tmp/cert.pem")
+        );
+        assert_eq!(
+            config_get(&b, "ssl.key.location").as_deref(),
+            Some("/tmp/key.pem")
+        );
+        assert_eq!(config_get(&b, "ssl.key.password").as_deref(), Some("kp"));
+    }
+
+    #[test]
+    fn with_msk_iam_sets_oauthbearer_mechanism() {
+        let b = KafkaBackend::open("localhost:9092", Some("g1"))
+            .unwrap()
+            .with_msk_iam("us-east-1");
+        assert_eq!(
+            config_get(&b, "security.protocol").as_deref(),
+            Some("SASL_SSL")
+        );
+        assert_eq!(
+            config_get(&b, "sasl.mechanism").as_deref(),
+            Some("OAUTHBEARER")
+        );
+    }
+
+    #[test]
+    fn open_with_no_auth_leaves_security_protocol_unset() {
+        let b = KafkaBackend::open("localhost:9092", Some("g1")).unwrap();
+        assert_eq!(config_get(&b, "security.protocol"), None);
+        assert_eq!(config_get(&b, "sasl.mechanism"), None);
     }
 
     #[test]

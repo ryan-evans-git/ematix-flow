@@ -37,6 +37,7 @@ parquet = { workspace = true }
 deltalake = { workspace = true }
 url = { workspace = true }
 rdkafka = { workspace = true }
+aws-msk-iam-sasl-signer = { workspace = true }
 
 [dev-dependencies]
 arrow-array.workspace = true
