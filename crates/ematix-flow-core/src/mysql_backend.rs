@@ -44,12 +44,82 @@ use crate::backend::{
     ArrowBatchStream, Backend, BackendError, DeleteHandling, Dialect, StrategyRunResult,
     TargetTable, WriteMode,
 };
-use crate::meta::{WatermarkConfig, wrap_with_watermark_filter};
+use crate::meta::{WatermarkConfig, build_hard_delete_sql, wrap_with_watermark_filter};
 use crate::pg::ConnectionInfo;
-use crate::strategy::append::{BATCH_ID_COL, plan_same_db_append};
+use crate::strategy::append::{BATCH_ID_COL, LOADED_AT_COL, plan_same_db_append};
 use crate::strategy::truncate::plan_truncate_replace;
 use crate::types::TableSpec;
 use uuid::Uuid;
+
+fn is_metadata_col(name: &str) -> bool {
+    name == LOADED_AT_COL || name == BATCH_ID_COL
+}
+
+/// MySQL-native merge SQL builder.
+///
+/// PG uses `WITH … MATERIALIZED` CTEs + `RETURNING (xmax = 0)` to split
+/// inserts/updates; DuckDB and SQLite use `INSERT … ON CONFLICT (…) DO
+/// UPDATE`. MySQL's equivalent is `INSERT … ON DUPLICATE KEY UPDATE
+/// col = VALUES(col)`. The target table must have a PRIMARY KEY or
+/// UNIQUE index on the merge keys for the conflict to fire.
+///
+/// `_loaded_at` is set to `NOW(6)` and `_batch_id` to the framework
+/// batch UUID literal, so the target carries provenance for both
+/// inserted and updated rows.
+fn mysql_merge_sql(
+    target: &TableSpec,
+    source_query: &str,
+    update_columns: &[String],
+    batch_id: &Uuid,
+) -> String {
+    let user_columns: Vec<String> = target
+        .columns
+        .iter()
+        .filter(|c| !is_metadata_col(&c.name))
+        .map(|c| c.name.clone())
+        .collect();
+    let has_metadata = target.columns.iter().any(|c| is_metadata_col(&c.name));
+    let mut insert_cols: Vec<String> = user_columns.clone();
+    let mut select_exprs: Vec<String> = user_columns.clone();
+    if has_metadata {
+        insert_cols.push(LOADED_AT_COL.into());
+        insert_cols.push(BATCH_ID_COL.into());
+        select_exprs.push("NOW(6)".into());
+        select_exprs.push(format!("'{batch_id}'"));
+    }
+    // Quote metadata column names — both `_loaded_at` and `_batch_id`
+    // start with an underscore but are valid identifiers; user columns
+    // are emitted unquoted, mirroring DuckDB / PG.
+    let on_dup = if update_columns.is_empty() {
+        // No updatable columns? `ON DUPLICATE KEY UPDATE` requires at
+        // least one assignment; collapse to a no-op self-assignment on
+        // the first key column. (MySQL has no `DO NOTHING` syntax for
+        // upserts; this is the conventional workaround.)
+        format!(
+            "ON DUPLICATE KEY UPDATE {col} = {col}",
+            col = user_columns[0]
+        )
+    } else {
+        let mut sets: Vec<String> = update_columns
+            .iter()
+            .map(|c| format!("{c} = VALUES({c})"))
+            .collect();
+        if has_metadata {
+            sets.push(format!("{LOADED_AT_COL} = VALUES({LOADED_AT_COL})"));
+            sets.push(format!("{BATCH_ID_COL} = VALUES({BATCH_ID_COL})"));
+        }
+        format!("ON DUPLICATE KEY UPDATE {}", sets.join(", "))
+    };
+    format!(
+        "INSERT INTO {qualified} ({insert_cols}) \
+         SELECT {select_exprs} FROM ({source}) src_inner \
+         {on_dup}",
+        qualified = qualified(&target.schema, &target.name),
+        insert_cols = insert_cols.join(", "),
+        select_exprs = select_exprs.join(", "),
+        source = source_query,
+    )
+}
 
 const META_SCHEMA: &str = "ematix_flow";
 const RUN_HISTORY_TABLE: &str = "run_history";
@@ -1103,19 +1173,136 @@ impl Backend for MySQLBackend {
 
     async fn run_merge(
         &self,
-        _spec: &TableSpec,
-        _source_query: &str,
-        _keys: &[String],
-        _update_columns: &[String],
-        _pipeline_name: &str,
-        _mode_label: &str,
-        _source_backend: Option<&dyn Backend>,
-        _delete_handling: Option<DeleteHandling>,
-        _dry_run: bool,
+        spec: &TableSpec,
+        source_query: &str,
+        keys: &[String],
+        update_columns: &[String],
+        pipeline_name: &str,
+        mode_label: &str,
+        source_backend: Option<&dyn Backend>,
+        delete_handling: Option<DeleteHandling>,
+        dry_run: bool,
     ) -> Result<StrategyRunResult, BackendError> {
-        Err(BackendError::Other(
-            "MySQL run_merge lands in Phase 33c".into(),
-        ))
+        if source_backend.is_some() {
+            return Err(BackendError::Other(
+                "MySQL cross-backend run_merge goes through the Arrow bridge".into(),
+            ));
+        }
+        let batch_id = Uuid::new_v4();
+        let run_id = Uuid::new_v4();
+        let merge_sql = mysql_merge_sql(spec, source_query, update_columns, &batch_id);
+
+        // MySQL `affected_rows()` for ON DUPLICATE KEY UPDATE counts
+        // each updated row as 2 (insert-attempted + update-applied),
+        // and unchanged matched rows as 0 — so we can't subtract
+        // inserts from total to get updates the way SQLite/DuckDB do.
+        // Compute both counts independently from the source query and
+        // the target's existing keys, then derive updates from the
+        // difference. `rows_unchanged` stays 0 (no MySQL-native way to
+        // distinguish unchanged from updated without a row-by-row hash
+        // compare; same trade-off as DuckDB / SQLite).
+        let qualified_target = qualified(&spec.schema, &spec.name);
+        let key_tuple = keys.join(", ");
+        let source_count_sql = format!("SELECT count(*) FROM ({source_query}) src_total");
+        let insert_count_sql = format!(
+            "SELECT count(*) FROM ({source_query}) src_count \
+             WHERE ({key_tuple}) NOT IN (SELECT {key_tuple} FROM {qualified_target})"
+        );
+        let delete_sql = if matches!(delete_handling, Some(DeleteHandling::Hard)) {
+            Some(build_hard_delete_sql(
+                &spec.schema,
+                &spec.name,
+                keys,
+                source_query,
+            ))
+        } else {
+            None
+        };
+
+        self.ensure_meta_schema().await?;
+        self.record_run_start(
+            run_id,
+            pipeline_name,
+            &spec.schema,
+            &spec.name,
+            mode_label,
+            "same_db",
+        )
+        .await?;
+
+        let merge_result: Result<(i64, i64), BackendError> = async {
+            let mut conn = self
+                .pool
+                .get_conn()
+                .await
+                .map_err(|e| BackendError::Connection(e.to_string()))?;
+            conn.query_drop("START TRANSACTION")
+                .await
+                .map_err(|e| BackendError::Query(e.to_string()))?;
+            // Anti-join count of source rows whose keys aren't in the
+            // target — these are the inserts.
+            let inserts: i64 = match conn.query_first(&insert_count_sql).await {
+                Ok(Some(n)) => n,
+                Ok(None) => 0,
+                Err(e) => {
+                    let _ = conn.query_drop("ROLLBACK").await;
+                    return Err(BackendError::Query(e.to_string()));
+                }
+            };
+            let source_total: i64 = match conn.query_first(&source_count_sql).await {
+                Ok(Some(n)) => n,
+                Ok(None) => 0,
+                Err(e) => {
+                    let _ = conn.query_drop("ROLLBACK").await;
+                    return Err(BackendError::Query(e.to_string()));
+                }
+            };
+            // Run the upsert. We deliberately ignore the affected-row
+            // count returned here; counts come from the COUNT(*) queries.
+            if let Err(e) = conn.query_drop(&merge_sql).await {
+                let _ = conn.query_drop("ROLLBACK").await;
+                return Err(BackendError::Query(e.to_string()));
+            }
+            if let Some(dsql) = &delete_sql
+                && let Err(e) = conn.query_drop(dsql).await
+            {
+                let _ = conn.query_drop("ROLLBACK").await;
+                return Err(BackendError::Query(e.to_string()));
+            }
+            if dry_run {
+                conn.query_drop("ROLLBACK")
+                    .await
+                    .map_err(|e| BackendError::Query(e.to_string()))?;
+            } else {
+                conn.query_drop("COMMIT")
+                    .await
+                    .map_err(|e| BackendError::Query(e.to_string()))?;
+            }
+            let updated = (source_total - inserts).max(0);
+            Ok((inserts, updated))
+        }
+        .await;
+
+        match &merge_result {
+            Ok((inserted, updated)) => {
+                self.record_run_success_merge(run_id, *inserted, *updated, 0)
+                    .await?
+            }
+            Err(e) => {
+                let _ = self.record_run_failure(run_id, &e.to_string()).await;
+            }
+        }
+        let (inserted, updated) = merge_result?;
+
+        Ok(StrategyRunResult {
+            run_id: run_id.to_string(),
+            rows_inserted: inserted,
+            rows_updated: Some(updated),
+            rows_unchanged: Some(0),
+            rows_closed: None,
+            status: if dry_run { "dry_run" } else { "success" }.into(),
+            path: "same_db".into(),
+        })
     }
 
     async fn run_scd2(

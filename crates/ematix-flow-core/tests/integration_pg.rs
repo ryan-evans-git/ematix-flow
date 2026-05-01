@@ -2604,3 +2604,180 @@ async fn mysql_run_append_dry_run_rolls_back() {
         .value(0);
     assert_eq!(total, 0, "dry_run rolled back");
 }
+
+// ----- Phase 33c: MySQL run_merge ---------------------------------------
+
+fn mysql_merge_target_spec() -> TableSpec {
+    augment_with_metadata(&TableSpec {
+        schema: "test".into(),
+        name: "event_log".into(),
+        columns: vec![
+            ColumnSpec {
+                name: "event_id".into(),
+                ty: ColumnType::BigInt,
+                nullable: false,
+                primary_key: true,
+            },
+            ColumnSpec {
+                name: "name".into(),
+                ty: ColumnType::Text,
+                nullable: true,
+                primary_key: false,
+            },
+        ],
+        unique_constraints: Vec::new(),
+        fingerprint: String::new(),
+    })
+}
+
+async fn mysql_merge_setup() -> (testcontainers::ContainerAsync<Mysql>, Arc<dyn Backend>) {
+    let (container, url) = start_mysql().await;
+    let b: Arc<dyn Backend> = Arc::new(MySQLBackend::open(&url).unwrap());
+    b.execute("CREATE TABLE src_events (event_id BIGINT, name VARCHAR(64))")
+        .await
+        .unwrap();
+    // event_log needs a PRIMARY KEY on event_id for ON DUPLICATE KEY
+    // UPDATE to fire.
+    b.execute(
+        "CREATE TABLE event_log (\
+            event_id BIGINT NOT NULL PRIMARY KEY, \
+            name VARCHAR(64), \
+            _loaded_at DATETIME(6) NOT NULL, \
+            _batch_id CHAR(36) NOT NULL\
+        )",
+    )
+    .await
+    .unwrap();
+    (container, b)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker; run with `cargo test -- --ignored`"]
+async fn mysql_run_merge_splits_inserts_from_updates() {
+    use arrow_array::Int64Array;
+
+    let (_c, b) = mysql_merge_setup().await;
+    let target = mysql_merge_target_spec();
+    b.execute("INSERT INTO src_events VALUES (1, 'a'), (2, 'b'), (3, 'c')")
+        .await
+        .unwrap();
+
+    let r1 = b
+        .run_merge(
+            &target,
+            "SELECT event_id, name FROM src_events",
+            &["event_id".into()],
+            &["name".into()],
+            "mysql_merge_split",
+            "merge",
+            None,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+    assert_eq!(r1.rows_inserted, 3);
+    assert_eq!(r1.rows_updated, Some(0));
+
+    b.execute("DELETE FROM src_events").await.unwrap();
+    b.execute("INSERT INTO src_events VALUES (1, 'a-new'), (2, 'b'), (4, 'd')")
+        .await
+        .unwrap();
+    let r2 = b
+        .run_merge(
+            &target,
+            "SELECT event_id, name FROM src_events",
+            &["event_id".into()],
+            &["name".into()],
+            "mysql_merge_split",
+            "merge",
+            None,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+    assert_eq!(r2.rows_inserted, 1, "only event_id=4 is new");
+    assert_eq!(r2.rows_updated, Some(2));
+
+    let s = b
+        .read_arrow_stream("SELECT count(*) FROM event_log")
+        .await
+        .unwrap();
+    let batches: Vec<_> = s.try_collect().await.unwrap();
+    let total = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(total, 4, "target = {{1,2,3,4}}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker; run with `cargo test -- --ignored`"]
+async fn mysql_run_merge_handle_deletes_removes_missing_keys() {
+    use arrow_array::Int64Array;
+    use ematix_flow_core::meta::DeleteHandling;
+
+    let (_c, b) = mysql_merge_setup().await;
+    let target = mysql_merge_target_spec();
+    b.execute("INSERT INTO src_events VALUES (1, 'a'), (2, 'b'), (3, 'c')")
+        .await
+        .unwrap();
+    b.run_merge(
+        &target,
+        "SELECT event_id, name FROM src_events",
+        &["event_id".into()],
+        &["name".into()],
+        "mysql_merge_delete",
+        "merge",
+        None,
+        None,
+        false,
+    )
+    .await
+    .unwrap();
+
+    b.execute("DELETE FROM src_events").await.unwrap();
+    b.execute("INSERT INTO src_events VALUES (1, 'a'), (2, 'b-new')")
+        .await
+        .unwrap();
+    b.run_merge(
+        &target,
+        "SELECT event_id, name FROM src_events",
+        &["event_id".into()],
+        &["name".into()],
+        "mysql_merge_delete",
+        "merge",
+        None,
+        Some(DeleteHandling::Hard),
+        false,
+    )
+    .await
+    .unwrap();
+
+    let s = b
+        .read_arrow_stream(
+            "SELECT count(*), \
+                    CAST(sum(CASE WHEN event_id=3 THEN 1 ELSE 0 END) AS SIGNED) \
+             FROM event_log",
+        )
+        .await
+        .unwrap();
+    let batches: Vec<_> = s.try_collect().await.unwrap();
+    let total = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap()
+        .value(0);
+    let row3 = batches[0]
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(total, 2);
+    assert_eq!(row3, 0, "row 3 hard-deleted");
+}
