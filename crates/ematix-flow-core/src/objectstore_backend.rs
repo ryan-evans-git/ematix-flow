@@ -205,6 +205,85 @@ async fn write_parquet_at_path(
     Ok(total)
 }
 
+/// Read all CSV files under `prefix` and concatenate their Arrow batches.
+/// Each file is assumed to have a header row; the schema is inferred
+/// per file from the first 1024 records (arrow-csv's default cap).
+/// All files in the prefix should share a compatible schema; mismatched
+/// columns surface as errors when the second file's batches arrive.
+async fn read_csv_under_prefix(
+    store: &Arc<dyn ObjectStore>,
+    prefix: ObjectPath,
+) -> Result<Vec<RecordBatch>, BackendError> {
+    use arrow_csv::reader::Format;
+
+    let mut listing = store.list(Some(&prefix));
+    let mut batches: Vec<RecordBatch> = Vec::new();
+    while let Some(meta) = listing.next().await {
+        let meta = meta.map_err(|e| BackendError::Connection(format!("list: {e}")))?;
+        if !meta.location.as_ref().ends_with(".csv") {
+            continue;
+        }
+        let bytes = store
+            .get(&meta.location)
+            .await
+            .map_err(|e| BackendError::Connection(format!("get {}: {e}", meta.location)))?
+            .bytes()
+            .await
+            .map_err(|e| BackendError::Connection(format!("get bytes: {e}")))?;
+        // Two passes over the bytes: first to infer schema, second to
+        // build the typed reader. arrow-csv's Format consumes the
+        // reader, so we hand it a fresh Cursor each time.
+        let format = Format::default().with_header(true);
+        let (schema, _records_inferred) = format
+            .infer_schema(std::io::Cursor::new(&bytes), Some(1024))
+            .map_err(|e| BackendError::Query(format!("csv infer: {e}")))?;
+        let reader = arrow_csv::ReaderBuilder::new(Arc::new(schema))
+            .with_header(true)
+            .build(std::io::Cursor::new(bytes))
+            .map_err(|e| BackendError::Query(format!("csv reader build: {e}")))?;
+        for b in reader {
+            let b = b.map_err(|e| BackendError::Query(format!("csv batch: {e}")))?;
+            batches.push(b);
+        }
+    }
+    Ok(batches)
+}
+
+/// Write a stream of Arrow batches as one CSV file at `path`. Header
+/// row mirrors the schema's field names. Uses arrow-csv's default
+/// formatting (comma delimiter, double-quote escape).
+async fn write_csv_at_path(
+    store: &Arc<dyn ObjectStore>,
+    path: ObjectPath,
+    mut stream: ArrowBatchStream,
+) -> Result<u64, BackendError> {
+    let mut batches: Vec<RecordBatch> = Vec::new();
+    while let Some(b) = stream.next().await {
+        batches.push(b?);
+    }
+    if batches.is_empty() {
+        return Ok(0);
+    }
+    let mut buf: Vec<u8> = Vec::with_capacity(64 * 1024);
+    let mut writer = arrow_csv::WriterBuilder::new()
+        .with_header(true)
+        .build(&mut buf);
+    let mut total: u64 = 0;
+    for batch in &batches {
+        total += batch.num_rows() as u64;
+        writer
+            .write(batch)
+            .map_err(|e| BackendError::Query(format!("csv write batch: {e}")))?;
+    }
+    drop(writer);
+    let bytes = Bytes::from(buf);
+    store
+        .put(&path, bytes.into())
+        .await
+        .map_err(|e| BackendError::Connection(format!("put {path}: {e}")))?;
+    Ok(total)
+}
+
 /// Delete every object under `prefix`. Used by `WriteMode::Truncate`.
 /// Walks the listing and issues per-object deletes — `object_store`
 /// has no atomic prefix-delete primitive (S3/Azure/GCS don't either,
@@ -274,19 +353,16 @@ impl Backend for ObjectStoreBackend {
         // `query` is interpreted as a relative path prefix. Empty string
         // → read everything under the root.
         let prefix = ObjectPath::from(query);
-        // Format dispatch lands in 34b–d; 34a is Parquet only. Reject
-        // mismatched calls with a clear error so users don't accidentally
-        // get empty results.
-        match self.format {
-            ObjectFormat::Parquet => {}
+        let batches = match self.format {
+            ObjectFormat::Parquet => read_parquet_under_prefix(&self.store, prefix).await?,
+            ObjectFormat::Csv => read_csv_under_prefix(&self.store, prefix).await?,
             other => {
                 return Err(BackendError::Other(format!(
                     "ObjectStore read_arrow_stream: format {other:?} lands in \
-                     a later sub-phase (34a covers Parquet only)"
+                     a later sub-phase"
                 )));
             }
-        }
-        let batches = read_parquet_under_prefix(&self.store, prefix).await?;
+        };
         let stream = futures_util::stream::iter(batches.into_iter().map(Ok));
         Ok(Box::pin(stream))
     }
@@ -297,21 +373,19 @@ impl Backend for ObjectStoreBackend {
         stream: ArrowBatchStream,
         mode: WriteMode,
     ) -> Result<u64, BackendError> {
-        match self.format {
-            ObjectFormat::Parquet => {}
-            other => {
-                return Err(BackendError::Other(format!(
-                    "ObjectStore write_arrow_stream: format {other:?} lands in \
-                     a later sub-phase (34a covers Parquet only)"
-                )));
-            }
-        }
         let prefix = target_prefix(target);
         if mode == WriteMode::Truncate {
             delete_under_prefix(&self.store, &prefix).await?;
         }
         let path = new_object_path(&prefix, ext_for_format(self.format));
-        write_parquet_at_path(&self.store, path, stream).await
+        match self.format {
+            ObjectFormat::Parquet => write_parquet_at_path(&self.store, path, stream).await,
+            ObjectFormat::Csv => write_csv_at_path(&self.store, path, stream).await,
+            other => Err(BackendError::Other(format!(
+                "ObjectStore write_arrow_stream: format {other:?} lands in \
+                 a later sub-phase"
+            ))),
+        }
     }
 
     async fn run_append(
@@ -528,14 +602,84 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn objectstore_csv_format_unsupported_in_34a() {
+    async fn objectstore_orc_format_unsupported_until_34c() {
+        // ORC lands in 34d. Until then, mismatched format reads error
+        // with a helpful pointer. (CSV used to be in this list; it
+        // shipped in 34b.)
         let dir = tempfile::tempdir().unwrap();
-        let backend = ObjectStoreBackend::open_local(dir.path(), ObjectFormat::Csv).unwrap();
+        let backend = ObjectStoreBackend::open_local(dir.path(), ObjectFormat::Orc).unwrap();
         let err = match backend.read_arrow_stream("anything").await {
-            Ok(_) => panic!("expected error for CSV in 34a"),
+            Ok(_) => panic!("expected error for ORC in 34b"),
             Err(e) => e,
         };
         let msg = err.to_string();
-        assert!(msg.contains("34a covers Parquet only"), "got: {msg}");
+        assert!(msg.contains("later sub-phase"), "got: {msg}");
+    }
+
+    // --- Phase 34b: CSV ------------------------------------------------------
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn objectstore_local_csv_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = ObjectStoreBackend::open_local(dir.path(), ObjectFormat::Csv).unwrap();
+        backend.ping().await.unwrap();
+
+        let target = TargetTable {
+            schema: "raw".into(),
+            name: "events".into(),
+        };
+        let n = backend
+            .write_arrow_stream(&target, arrow_stream_for(small_batch()), WriteMode::Append)
+            .await
+            .unwrap();
+        assert_eq!(n, 3);
+
+        let stream = backend.read_arrow_stream("raw/events").await.unwrap();
+        let batches: Vec<RecordBatch> = futures_util::TryStreamExt::try_collect(stream)
+            .await
+            .unwrap();
+        let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, 3);
+
+        // Spot-check a value round-trips: arrow-csv re-infers types from
+        // text, so name "alice" should come back as Utf8 / String.
+        let names = batches[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(names.value(0), "alice");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn objectstore_csv_truncate_clears_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = ObjectStoreBackend::open_local(dir.path(), ObjectFormat::Csv).unwrap();
+        let target = TargetTable {
+            schema: "raw".into(),
+            name: "events".into(),
+        };
+        backend
+            .write_arrow_stream(&target, arrow_stream_for(small_batch()), WriteMode::Append)
+            .await
+            .unwrap();
+        backend
+            .write_arrow_stream(&target, arrow_stream_for(small_batch()), WriteMode::Append)
+            .await
+            .unwrap();
+        backend
+            .write_arrow_stream(
+                &target,
+                arrow_stream_for(small_batch()),
+                WriteMode::Truncate,
+            )
+            .await
+            .unwrap();
+        let stream = backend.read_arrow_stream("raw/events").await.unwrap();
+        let batches: Vec<RecordBatch> = futures_util::TryStreamExt::try_collect(stream)
+            .await
+            .unwrap();
+        let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, 3, "old files removed by truncate");
     }
 }

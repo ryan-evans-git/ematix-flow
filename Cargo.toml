@@ -28,6 +28,7 @@ futures-util = "0.3"
 bytes = "1"
 arrow-array = "56"
 arrow-schema = "56"
+arrow-csv = "56"
 # Apache Arrow object_store + parquet — kept on the same major version
 # track as arrow-array (56.x) so the Arrow ABI matches across crates.
 object_store = "0.12"

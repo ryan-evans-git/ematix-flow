@@ -25,6 +25,7 @@ bytes.workspace = true
 async-trait = "0.1"
 arrow-array = { workspace = true }
 arrow-schema = { workspace = true }
+arrow-csv = { workspace = true }
 duckdb = { workspace = true }
 rusqlite = { workspace = true }
 mysql_async = { workspace = true }
