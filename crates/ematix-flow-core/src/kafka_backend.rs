@@ -727,11 +727,14 @@ impl KafkaBackend {
                 }
             }
             KafkaPayloadFormat::Protobuf => {
-                return Err(BackendError::Other(
-                    "Kafka write_arrow_stream_eos Protobuf: surface reserved in \
-                     36h.2; encode lands in Phase 36h.6"
-                        .into(),
-                ));
+                if self.schema_registry_url.is_none() {
+                    return Err(BackendError::Other(
+                        "Kafka write_arrow_stream_eos Protobuf: schema_registry_url is \
+                         required (call `with_schema_registry_url(...)` on the \
+                         backend before writing)"
+                            .into(),
+                    ));
+                }
             }
         }
         let producer = self.acquire_producer().await?;
@@ -763,7 +766,12 @@ impl KafkaBackend {
                     .await?
                 }
                 KafkaPayloadFormat::Protobuf => {
-                    unreachable!("Protobuf format rejected at write_arrow_stream_eos entry")
+                    encode_batch_as_protobuf(
+                        &batch,
+                        topic,
+                        self.schema_registry_url.as_ref().expect("checked above"),
+                    )
+                    .await?
                 }
             };
             all_payloads.append(&mut payloads);
@@ -1299,11 +1307,14 @@ impl Backend for KafkaBackend {
                 }
             }
             KafkaPayloadFormat::Protobuf => {
-                return Err(BackendError::Other(
-                    "Kafka write_arrow_stream Protobuf: surface reserved in \
-                     36h.2; encode lands in Phase 36h.6"
-                        .into(),
-                ));
+                if self.schema_registry_url.is_none() {
+                    return Err(BackendError::Other(
+                        "Kafka write_arrow_stream Protobuf: schema_registry_url is \
+                         required (call `with_schema_registry_url(...)` on the \
+                         backend before writing)"
+                            .into(),
+                    ));
+                }
             }
         }
         let producer = self.acquire_producer().await?;
@@ -1331,10 +1342,14 @@ impl Backend for KafkaBackend {
                     )
                     .await?
                 }
-                // Protobuf is rejected at entry; this arm is
-                // unreachable but kept for compiler exhaustiveness.
                 KafkaPayloadFormat::Protobuf => {
-                    unreachable!("Protobuf format rejected at write entry")
+                    // schema_registry_url presence already validated above.
+                    encode_batch_as_protobuf(
+                        &batch,
+                        topic,
+                        self.schema_registry_url.as_ref().expect("checked above"),
+                    )
+                    .await?
                 }
             };
             // ExactlyOnce: wrap the per-batch produce in a Kafka
@@ -1996,6 +2011,293 @@ fn packed_array_to_json(packed: &protofish::decode::PackedArray) -> Vec<serde_js
     }
 }
 
+/// Encode a `RecordBatch` as Confluent-Schema-Registry-framed
+/// Protobuf payloads, one payload per row. The .proto schema is
+/// fetched from the Schema Registry by subject `<topic>-value`; the
+/// subject must already be registered.
+///
+/// Conversion path: RecordBatch → JSONL → `serde_json::Value` rows →
+/// `protofish::decode::MessageValue` (built field-by-field via
+/// schema-driven coercion) → `MessageValue::encode(&context)` →
+/// frame via `EasyProtoRawEncoder::encode` (which prepends the
+/// magic byte + schema id + message-index varint).
+///
+/// Limits in 36h.6 (intentional, documented):
+///   - Single top-level message per schema (Confluent's most common
+///     setup). The first top-level message in the .proto file is
+///     used; multi-message schemas with non-default message indexes
+///     are a follow-up.
+///   - Enum fields must be JSON integers (not symbolic names).
+///     Round-trip with the decode path requires manually mapping
+///     names → integers in the producer pipeline.
+///   - Logical types (google.protobuf.Timestamp, Duration, Any) lose
+///     the JSON-string hint of the decode path; users must produce
+///     them as nested message objects.
+async fn encode_batch_as_protobuf(
+    batch: &RecordBatch,
+    topic: &str,
+    schema_registry_url: &str,
+) -> Result<Vec<Vec<u8>>, BackendError> {
+    use schema_registry_converter::async_impl::easy_proto_raw::EasyProtoRawEncoder;
+    use schema_registry_converter::async_impl::schema_registry::{
+        SrSettings, get_schema_by_subject,
+    };
+    use schema_registry_converter::proto_resolver::MessageResolver;
+    use schema_registry_converter::schema_registry_common::SubjectNameStrategy;
+
+    // Render to JSONL once, parse each line into a serde_json::Value.
+    let mut buf: Vec<u8> = Vec::with_capacity(batch.num_rows() * 64);
+    {
+        let mut writer = arrow_json::LineDelimitedWriter::new(&mut buf);
+        writer.write(batch).map_err(|e| {
+            BackendError::Query(format!("kafka protobuf encode (json render): {e}"))
+        })?;
+        writer.finish().map_err(|e| {
+            BackendError::Query(format!("kafka protobuf encode (json finish): {e}"))
+        })?;
+    }
+    let mut rows: Vec<serde_json::Value> = Vec::with_capacity(batch.num_rows());
+    for line in buf.split(|&b| b == b'\n').filter(|l| !l.is_empty()) {
+        let v: serde_json::Value = serde_json::from_slice(line)
+            .map_err(|e| BackendError::Query(format!("kafka protobuf encode (json parse): {e}")))?;
+        rows.push(v);
+    }
+
+    let sr_settings = SrSettings::new(schema_registry_url.to_string());
+    let strategy = SubjectNameStrategy::TopicNameStrategy(topic.to_string(), false);
+
+    // Fetch the .proto schema source so we can build MessageValues.
+    let registered = get_schema_by_subject(&sr_settings, &strategy)
+        .await
+        .map_err(|e| BackendError::Query(format!("kafka protobuf schema fetch: {e}")))?;
+    let proto_src = registered.schema;
+
+    // Resolve the primary message's full name (index [0] = first
+    // top-level message in the .proto file).
+    let resolver = MessageResolver::new(&proto_src);
+    let full_name = resolver
+        .find_name(&[0])
+        .ok_or_else(|| {
+            BackendError::Query(
+                "kafka protobuf encode: schema has no top-level message at index [0]".into(),
+            )
+        })?
+        .as_str()
+        .to_string();
+
+    // Parse the schema for protofish encoding.
+    let context = protofish::context::Context::parse([&proto_src])
+        .map_err(|e| BackendError::Query(format!("kafka protobuf encode (parse schema): {e:?}")))?;
+    let msg_info = context.get_message(&full_name).ok_or_else(|| {
+        BackendError::Query(format!(
+            "kafka protobuf encode: message {full_name} not found in parsed context"
+        ))
+    })?;
+
+    let encoder = EasyProtoRawEncoder::new(sr_settings);
+
+    let mut out: Vec<Vec<u8>> = Vec::with_capacity(rows.len());
+    for row in rows {
+        let msg_value = json_to_protofish_message(&row, msg_info, &context)?;
+        let proto_bytes = msg_value.encode(&context).to_vec();
+        let framed = encoder
+            .encode(
+                &proto_bytes,
+                &full_name,
+                SubjectNameStrategy::TopicNameStrategy(topic.to_string(), false),
+            )
+            .await
+            .map_err(|e| BackendError::Query(format!("kafka protobuf frame: {e}")))?;
+        out.push(framed);
+    }
+    Ok(out)
+}
+
+/// Build a `protofish::decode::MessageValue` from a JSON object,
+/// using `MessageInfo` for field-name → field-number resolution and
+/// type coercion. Recurses into nested messages.
+fn json_to_protofish_message(
+    json: &serde_json::Value,
+    msg_info: &protofish::context::MessageInfo,
+    ctx: &protofish::context::Context,
+) -> Result<protofish::decode::MessageValue, BackendError> {
+    use protofish::context::Multiplicity;
+    use protofish::decode::{FieldValue, MessageValue};
+
+    let obj = json.as_object().ok_or_else(|| {
+        BackendError::Query(format!(
+            "kafka protobuf encode: expected JSON object for message {}, got: {json}",
+            msg_info.full_name
+        ))
+    })?;
+    let mut fields: Vec<FieldValue> = Vec::new();
+    for field in msg_info.iter_fields() {
+        let Some(jv) = obj.get(&field.name) else {
+            continue;
+        };
+        if jv.is_null() {
+            continue;
+        }
+        let is_repeated = matches!(
+            field.multiplicity,
+            Multiplicity::Repeated | Multiplicity::RepeatedPacked
+        );
+        if is_repeated {
+            let arr = jv.as_array().ok_or_else(|| {
+                BackendError::Query(format!(
+                    "kafka protobuf encode: field {} is repeated; expected JSON array, got: {jv}",
+                    field.name
+                ))
+            })?;
+            for elem in arr {
+                let v = json_to_protofish_value(elem, &field.field_type, ctx)?;
+                fields.push(FieldValue {
+                    number: field.number,
+                    value: v,
+                });
+            }
+        } else {
+            let v = json_to_protofish_value(jv, &field.field_type, ctx)?;
+            fields.push(FieldValue {
+                number: field.number,
+                value: v,
+            });
+        }
+    }
+    Ok(MessageValue {
+        msg_ref: msg_info.self_ref,
+        fields,
+        garbage: None,
+    })
+}
+
+/// Convert a JSON value to a `protofish::decode::Value` matching the
+/// supplied `ValueType`. Numeric narrowing (i64 → i32 etc.) is
+/// silent — the caller's data is trusted to fit the schema. Hex
+/// strings round-trip back into byte fields. Enums must be JSON
+/// integers (see helper docs on `encode_batch_as_protobuf` for the
+/// reasoning).
+fn json_to_protofish_value(
+    json: &serde_json::Value,
+    vtype: &protofish::context::ValueType,
+    ctx: &protofish::context::Context,
+) -> Result<protofish::decode::Value, BackendError> {
+    use protofish::context::ValueType as Vt;
+    use protofish::decode::{EnumValue, Value as Pv};
+
+    let mismatch = |expected: &str| -> BackendError {
+        BackendError::Query(format!(
+            "kafka protobuf encode: expected {expected}, got JSON: {json}"
+        ))
+    };
+
+    match vtype {
+        Vt::Double => json
+            .as_f64()
+            .map(Pv::Double)
+            .ok_or_else(|| mismatch("number")),
+        Vt::Float => json
+            .as_f64()
+            .map(|f| Pv::Float(f as f32))
+            .ok_or_else(|| mismatch("number")),
+        Vt::Int32 => json
+            .as_i64()
+            .map(|i| Pv::Int32(i as i32))
+            .ok_or_else(|| mismatch("integer")),
+        Vt::Int64 => json
+            .as_i64()
+            .map(Pv::Int64)
+            .ok_or_else(|| mismatch("integer")),
+        Vt::UInt32 => json
+            .as_u64()
+            .map(|u| Pv::UInt32(u as u32))
+            .ok_or_else(|| mismatch("unsigned integer")),
+        Vt::UInt64 => json
+            .as_u64()
+            .map(Pv::UInt64)
+            .ok_or_else(|| mismatch("unsigned integer")),
+        Vt::SInt32 => json
+            .as_i64()
+            .map(|i| Pv::SInt32(i as i32))
+            .ok_or_else(|| mismatch("integer")),
+        Vt::SInt64 => json
+            .as_i64()
+            .map(Pv::SInt64)
+            .ok_or_else(|| mismatch("integer")),
+        Vt::Fixed32 => json
+            .as_u64()
+            .map(|u| Pv::Fixed32(u as u32))
+            .ok_or_else(|| mismatch("unsigned integer")),
+        Vt::Fixed64 => json
+            .as_u64()
+            .map(Pv::Fixed64)
+            .ok_or_else(|| mismatch("unsigned integer")),
+        Vt::SFixed32 => json
+            .as_i64()
+            .map(|i| Pv::SFixed32(i as i32))
+            .ok_or_else(|| mismatch("integer")),
+        Vt::SFixed64 => json
+            .as_i64()
+            .map(Pv::SFixed64)
+            .ok_or_else(|| mismatch("integer")),
+        Vt::Bool => json.as_bool().map(Pv::Bool).ok_or_else(|| mismatch("bool")),
+        Vt::String => json
+            .as_str()
+            .map(|s| Pv::String(s.to_string()))
+            .ok_or_else(|| mismatch("string")),
+        Vt::Bytes => {
+            // Reverse of the decode path: lowercase hex → bytes.
+            let s = json.as_str().ok_or_else(|| mismatch("hex string"))?;
+            let raw = hex_decode(s).map_err(|e| {
+                BackendError::Query(format!("kafka protobuf encode (hex bytes): {e}"))
+            })?;
+            Ok(Pv::Bytes(bytes::Bytes::from(raw)))
+        }
+        Vt::Message(mref) => {
+            let nested = ctx.resolve_message(*mref);
+            let nested_msg = json_to_protofish_message(json, nested, ctx)?;
+            Ok(Pv::Message(Box::new(nested_msg)))
+        }
+        Vt::Enum(eref) => {
+            let v = json.as_i64().ok_or_else(|| {
+                BackendError::Query(format!(
+                    "kafka protobuf encode: enum field requires JSON integer (symbolic \
+                     names not yet supported in 36h.6); got: {json}"
+                ))
+            })?;
+            Ok(Pv::Enum(EnumValue {
+                enum_ref: *eref,
+                value: v,
+            }))
+        }
+    }
+}
+
+/// Decode a lowercase-hex string into bytes. Returns Err if the
+/// string has odd length or non-hex characters.
+fn hex_decode(s: &str) -> Result<Vec<u8>, String> {
+    if s.len() % 2 != 0 {
+        return Err(format!("hex string has odd length ({})", s.len()));
+    }
+    let mut out = Vec::with_capacity(s.len() / 2);
+    let bytes = s.as_bytes();
+    for i in (0..bytes.len()).step_by(2) {
+        let hi = hex_nibble(bytes[i])?;
+        let lo = hex_nibble(bytes[i + 1])?;
+        out.push((hi << 4) | lo);
+    }
+    Ok(out)
+}
+
+fn hex_nibble(c: u8) -> Result<u8, String> {
+    match c {
+        b'0'..=b'9' => Ok(c - b'0'),
+        b'a'..=b'f' => Ok(c - b'a' + 10),
+        b'A'..=b'F' => Ok(c - b'A' + 10),
+        _ => Err(format!("non-hex character: {:?}", c as char)),
+    }
+}
+
 /// Produce each `payload` to `topic` via `producer`, awaiting the
 /// broker ack per message. Returns the number of messages
 /// successfully produced. Used by both the `AtLeastOnce` (no
@@ -2568,7 +2870,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn protobuf_write_rejects_with_pointer_to_36h_6() {
+    async fn protobuf_write_without_sr_url_rejects_with_pointer() {
         use arrow_array::Int64Array;
         use arrow_schema::{DataType, Field, Schema};
         let b = KafkaBackend::open("localhost:9092", None)
@@ -2590,7 +2892,116 @@ mod tests {
             .await
             .unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("Phase 36h.6"), "got: {msg}");
+        assert!(
+            msg.contains("schema_registry_url"),
+            "expected SR URL rejection on protobuf write; got: {msg}"
+        );
+    }
+
+    /// 36h.6: JSON → MessageValue conversion populates fields by
+    /// schema-resolved name and primitive type. Round-trips through
+    /// protofish's encode/decode within a single in-process Context
+    /// (no SR involved).
+    #[test]
+    fn json_to_protofish_message_round_trips_primitives() {
+        use protofish::context::Context;
+        let proto_src = r#"
+            syntax = "proto3";
+            package demo;
+            message Heartbeat {
+                int64 beat = 1;
+                string label = 2;
+                bool ok = 3;
+            }
+        "#;
+        let ctx = Context::parse([proto_src]).expect("parse proto");
+        let msg_info = ctx.get_message("demo.Heartbeat").expect("Heartbeat exists");
+
+        let json = serde_json::json!({
+            "beat": 42,
+            "label": "alice",
+            "ok": true,
+        });
+        let mv = json_to_protofish_message(&json, msg_info, &ctx).expect("convert");
+        let bytes = mv.encode(&ctx);
+        let decoded = msg_info.decode(&bytes, &ctx);
+        // Re-render to JSON and check field presence.
+        let round = protofish_message_to_json(&decoded, &ctx);
+        let obj = round.as_object().unwrap();
+        assert_eq!(obj.get("beat"), Some(&serde_json::json!(42)));
+        assert_eq!(
+            obj.get("label"),
+            Some(&serde_json::Value::String("alice".into()))
+        );
+        assert_eq!(obj.get("ok"), Some(&serde_json::Value::Bool(true)));
+    }
+
+    /// 36h.6: repeated JSON arrays become repeated proto fields.
+    #[test]
+    fn json_to_protofish_message_repeated_round_trip() {
+        use protofish::context::Context;
+        let proto_src = r#"
+            syntax = "proto3";
+            package demo;
+            message Tags {
+                repeated string name = 1;
+            }
+        "#;
+        let ctx = Context::parse([proto_src]).expect("parse proto");
+        let msg_info = ctx.get_message("demo.Tags").expect("Tags exists");
+        let json = serde_json::json!({ "name": ["a", "b", "c"] });
+        let mv = json_to_protofish_message(&json, msg_info, &ctx).expect("convert");
+        // Three FieldValues with number=1.
+        assert_eq!(mv.fields.len(), 3);
+        assert!(
+            mv.fields
+                .iter()
+                .all(|f| f.number == 1 && matches!(&f.value, protofish::decode::Value::String(_)))
+        );
+    }
+
+    /// 36h.6: encode path surfaces a clean error when SR URL is set
+    /// but unreachable. Doesn't require a live SR.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn protobuf_encode_unreachable_sr_returns_clean_error() {
+        use arrow_array::Int64Array;
+        use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "beat",
+            DataType::Int64,
+            false,
+        )]));
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1i64, 2]))]).unwrap();
+        let err = encode_batch_as_protobuf(&batch, "heartbeat", "http://127.0.0.1:1")
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("kafka protobuf schema fetch"),
+            "expected clean schema-fetch error; got: {msg}"
+        );
+    }
+
+    /// hex_decode round-trips lowercase hex strings.
+    #[test]
+    fn hex_decode_round_trips_simple_bytes() {
+        let raw = vec![0x00, 0x10, 0xff, 0xab];
+        let s: String = raw.iter().map(|b| format!("{:02x}", b)).collect();
+        let decoded = hex_decode(&s).expect("decode");
+        assert_eq!(decoded, raw);
+    }
+
+    #[test]
+    fn hex_decode_rejects_odd_length() {
+        let err = hex_decode("abc").unwrap_err();
+        assert!(err.contains("odd length"), "got: {err}");
+    }
+
+    #[test]
+    fn hex_decode_rejects_non_hex() {
+        let err = hex_decode("zz").unwrap_err();
+        assert!(err.contains("non-hex"), "got: {err}");
     }
 
     // --- Phase 36j: delivery semantics ------------------------------------
