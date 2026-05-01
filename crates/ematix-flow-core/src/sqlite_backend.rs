@@ -46,9 +46,9 @@ use crate::backend::{
     ArrowBatchStream, Backend, BackendError, DeleteHandling, Dialect, StrategyRunResult,
     TargetTable, WriteMode,
 };
-use crate::meta::{WatermarkConfig, wrap_with_watermark_filter};
+use crate::meta::{WatermarkConfig, build_hard_delete_sql, wrap_with_watermark_filter};
 use crate::pg::ConnectionInfo;
-use crate::strategy::append::{BATCH_ID_COL, plan_same_db_append};
+use crate::strategy::append::{BATCH_ID_COL, LOADED_AT_COL, plan_same_db_append};
 use crate::strategy::truncate::plan_truncate_replace;
 use crate::types::TableSpec;
 use uuid::Uuid;
@@ -101,6 +101,73 @@ fn sqlite_substitute(sql: &str, batch_id: &Uuid) -> String {
     }
     sql.replace("now()", "strftime('%Y-%m-%dT%H:%M:%fZ', 'now')")
         .replace("$1::uuid", &format!("'{batch_id}'"))
+}
+
+fn is_metadata_col(name: &str) -> bool {
+    name == LOADED_AT_COL || name == BATCH_ID_COL
+}
+
+/// SQLite-native merge SQL builder. SQLite supports `INSERT … ON
+/// CONFLICT (cols) DO UPDATE SET col = excluded.col` since 3.24, but
+/// uses lowercase `excluded` (PG/DuckDB use uppercase `EXCLUDED`).
+/// Otherwise the shape mirrors `duckdb_merge_sql`. UUID + timestamp
+/// emission go as plain TEXT, matching the rest of the SQLite layer.
+fn sqlite_merge_sql(
+    target: &TableSpec,
+    source_query: &str,
+    keys: &[String],
+    update_columns: &[String],
+    batch_id: &Uuid,
+) -> String {
+    let user_columns: Vec<String> = target
+        .columns
+        .iter()
+        .filter(|c| !is_metadata_col(&c.name))
+        .map(|c| c.name.clone())
+        .collect();
+    let has_metadata = target.columns.iter().any(|c| is_metadata_col(&c.name));
+    let mut insert_cols: Vec<String> = user_columns.clone();
+    let mut select_exprs: Vec<String> = user_columns.clone();
+    if has_metadata {
+        insert_cols.push(LOADED_AT_COL.into());
+        insert_cols.push(BATCH_ID_COL.into());
+        select_exprs.push("strftime('%Y-%m-%dT%H:%M:%fZ', 'now')".into());
+        select_exprs.push(format!("'{batch_id}'"));
+    }
+    let on_conflict = if update_columns.is_empty() {
+        format!("ON CONFLICT ({}) DO NOTHING", keys.join(", "))
+    } else {
+        let mut sets: Vec<String> = update_columns
+            .iter()
+            .map(|c| format!("{c} = excluded.{c}"))
+            .collect();
+        if has_metadata {
+            sets.push(format!("{LOADED_AT_COL} = excluded.{LOADED_AT_COL}"));
+            sets.push(format!("{BATCH_ID_COL} = excluded.{BATCH_ID_COL}"));
+        }
+        format!(
+            "ON CONFLICT ({}) DO UPDATE SET {}",
+            keys.join(", "),
+            sets.join(", ")
+        )
+    };
+    // SQLite's UPSERT grammar is ambiguous when the SELECT has a FROM
+    // clause: `… FROM x ON CONFLICT …` could parse as a join. Disambig
+    // with a trailing `WHERE true` (per the SQLite docs' UPSERT note).
+    format!(
+        "INSERT INTO {schema}.{table} ({insert_cols}) \
+         SELECT {select_exprs} FROM ({source}) src_inner WHERE true \
+         {on_conflict}",
+        schema = if target.schema.is_empty() {
+            "main"
+        } else {
+            &target.schema
+        },
+        table = target.name,
+        insert_cols = insert_cols.join(", "),
+        select_exprs = select_exprs.join(", "),
+        source = source_query,
+    )
 }
 
 /// SQLite-backed implementation of `Backend`.
@@ -845,19 +912,114 @@ impl Backend for SQLiteBackend {
 
     async fn run_merge(
         &self,
-        _spec: &TableSpec,
-        _source_query: &str,
-        _keys: &[String],
-        _update_columns: &[String],
-        _pipeline_name: &str,
-        _mode_label: &str,
-        _source_backend: Option<&dyn Backend>,
-        _delete_handling: Option<DeleteHandling>,
-        _dry_run: bool,
+        spec: &TableSpec,
+        source_query: &str,
+        keys: &[String],
+        update_columns: &[String],
+        pipeline_name: &str,
+        mode_label: &str,
+        source_backend: Option<&dyn Backend>,
+        delete_handling: Option<DeleteHandling>,
+        dry_run: bool,
     ) -> Result<StrategyRunResult, BackendError> {
-        Err(BackendError::Other(
-            "SQLite run_merge: not implemented in Phase 32a (lands in 32c)".into(),
-        ))
+        if source_backend.is_some() {
+            return Err(BackendError::Other(
+                "SQLite cross-backend run_merge goes through the Arrow bridge".into(),
+            ));
+        }
+        require_main_schema(&spec.schema)?;
+        let batch_id = Uuid::new_v4();
+        let run_id = Uuid::new_v4();
+        let merge_sql = sqlite_merge_sql(spec, source_query, keys, update_columns, &batch_id);
+        let insert_count_sql = format!(
+            "SELECT count(*) FROM ({src}) src_count \
+             WHERE ({key_tuple}) NOT IN (SELECT {key_tuple} FROM {schema}.{table})",
+            src = source_query,
+            key_tuple = keys.join(", "),
+            schema = if spec.schema.is_empty() {
+                "main"
+            } else {
+                &spec.schema
+            },
+            table = spec.name,
+        );
+        let delete_sql = if matches!(delete_handling, Some(DeleteHandling::Hard)) {
+            Some(build_hard_delete_sql(
+                if spec.schema.is_empty() {
+                    "main"
+                } else {
+                    &spec.schema
+                },
+                &spec.name,
+                keys,
+                source_query,
+            ))
+        } else {
+            None
+        };
+
+        self.ensure_meta_schema().await?;
+        self.record_run_start(
+            run_id,
+            pipeline_name,
+            &spec.schema,
+            &spec.name,
+            mode_label,
+            "same_db",
+        )
+        .await?;
+
+        let merge_result: Result<(i64, i64), BackendError> = self
+            .with_conn_blocking(move |c| {
+                c.execute_batch("BEGIN")
+                    .map_err(|e| BackendError::Query(e.to_string()))?;
+                let inserts: i64 = {
+                    let mut stmt = c
+                        .prepare(&insert_count_sql)
+                        .map_err(|e| BackendError::Query(e.to_string()))?;
+                    stmt.query_row([], |r| r.get(0))
+                        .map_err(|e| BackendError::Query(e.to_string()))?
+                };
+                let total = c
+                    .execute(&merge_sql, [])
+                    .map_err(|e| BackendError::Query(e.to_string()))?
+                    as i64;
+                if let Some(dsql) = &delete_sql {
+                    c.execute(dsql, [])
+                        .map_err(|e| BackendError::Query(e.to_string()))?;
+                }
+                if dry_run {
+                    c.execute_batch("ROLLBACK")
+                        .map_err(|e| BackendError::Query(e.to_string()))?;
+                } else {
+                    c.execute_batch("COMMIT")
+                        .map_err(|e| BackendError::Query(e.to_string()))?;
+                }
+                let updated = (total - inserts).max(0);
+                Ok((inserts, updated))
+            })
+            .await;
+
+        match &merge_result {
+            Ok((inserted, updated)) => {
+                self.record_run_success_merge(run_id, *inserted, *updated, 0)
+                    .await?
+            }
+            Err(e) => {
+                let _ = self.record_run_failure(run_id, &e.to_string()).await;
+            }
+        }
+        let (inserted, updated) = merge_result?;
+
+        Ok(StrategyRunResult {
+            run_id: run_id.to_string(),
+            rows_inserted: inserted,
+            rows_updated: Some(updated),
+            rows_unchanged: Some(0),
+            rows_closed: None,
+            status: if dry_run { "dry_run" } else { "success" }.into(),
+            path: "same_db".into(),
+        })
     }
 
     async fn run_scd2(
@@ -1360,5 +1522,171 @@ mod tests {
             .unwrap()
             .value(0);
         assert_eq!(total, 5);
+    }
+
+    // --- Phase 32c: run_merge ---------------------------------------------
+
+    fn sqlite_merge_target_spec() -> TableSpec {
+        augment_with_metadata(&TableSpec {
+            schema: "main".into(),
+            name: "event_log".into(),
+            columns: vec![
+                ColumnSpec {
+                    name: "event_id".into(),
+                    ty: ColumnType::BigInt,
+                    nullable: false,
+                    primary_key: true,
+                },
+                ColumnSpec {
+                    name: "name".into(),
+                    ty: ColumnType::Text,
+                    nullable: true,
+                    primary_key: false,
+                },
+            ],
+            unique_constraints: Vec::new(),
+            fingerprint: String::new(),
+        })
+    }
+
+    async fn sqlite_merge_setup() -> StdArc<dyn Backend> {
+        let b: StdArc<dyn Backend> = StdArc::new(SQLiteBackend::open(":memory:").unwrap());
+        b.execute("CREATE TABLE src_events (event_id INTEGER, name TEXT)")
+            .await
+            .unwrap();
+        b.execute(
+            "CREATE TABLE event_log (\
+              event_id INTEGER PRIMARY KEY, name TEXT, _loaded_at TEXT, _batch_id TEXT\
+            )",
+        )
+        .await
+        .unwrap();
+        b
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sqlite_run_merge_splits_inserts_from_updates() {
+        let b = sqlite_merge_setup().await;
+        let target = sqlite_merge_target_spec();
+        b.execute("INSERT INTO src_events VALUES (1, 'a'), (2, 'b'), (3, 'c')")
+            .await
+            .unwrap();
+
+        let r1 = b
+            .run_merge(
+                &target,
+                "SELECT event_id, name FROM src_events",
+                &["event_id".into()],
+                &["name".into()],
+                "sqlite_merge_split",
+                "merge",
+                None,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(r1.rows_inserted, 3);
+        assert_eq!(r1.rows_updated, Some(0));
+
+        b.execute("DELETE FROM src_events").await.unwrap();
+        b.execute("INSERT INTO src_events VALUES (1, 'a-new'), (2, 'b'), (4, 'd')")
+            .await
+            .unwrap();
+        let r2 = b
+            .run_merge(
+                &target,
+                "SELECT event_id, name FROM src_events",
+                &["event_id".into()],
+                &["name".into()],
+                "sqlite_merge_split",
+                "merge",
+                None,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(r2.rows_inserted, 1, "only event_id=4 is new");
+        assert_eq!(r2.rows_updated, Some(2));
+
+        use futures_util::TryStreamExt;
+        let s = b
+            .read_arrow_stream("SELECT count(*) FROM event_log")
+            .await
+            .unwrap();
+        let batches: Vec<_> = s.try_collect().await.unwrap();
+        let total = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0);
+        assert_eq!(total, 4, "target = {{1,2,3,4}}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sqlite_run_merge_handle_deletes_removes_missing_keys() {
+        let b = sqlite_merge_setup().await;
+        let target = sqlite_merge_target_spec();
+        b.execute("INSERT INTO src_events VALUES (1, 'a'), (2, 'b'), (3, 'c')")
+            .await
+            .unwrap();
+        b.run_merge(
+            &target,
+            "SELECT event_id, name FROM src_events",
+            &["event_id".into()],
+            &["name".into()],
+            "sqlite_delete",
+            "merge",
+            None,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+
+        b.execute("DELETE FROM src_events").await.unwrap();
+        b.execute("INSERT INTO src_events VALUES (1, 'a'), (2, 'b-new')")
+            .await
+            .unwrap();
+        b.run_merge(
+            &target,
+            "SELECT event_id, name FROM src_events",
+            &["event_id".into()],
+            &["name".into()],
+            "sqlite_delete",
+            "merge",
+            None,
+            Some(DeleteHandling::Hard),
+            false,
+        )
+        .await
+        .unwrap();
+
+        use futures_util::TryStreamExt;
+        let s = b
+            .read_arrow_stream(
+                "SELECT count(*), \
+                        sum(CASE WHEN event_id=3 THEN 1 ELSE 0 END) \
+                 FROM event_log",
+            )
+            .await
+            .unwrap();
+        let batches: Vec<_> = s.try_collect().await.unwrap();
+        let total = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0);
+        let row3 = batches[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0);
+        assert_eq!(total, 2);
+        assert_eq!(row3, 0, "row 3 hard-deleted");
     }
 }
