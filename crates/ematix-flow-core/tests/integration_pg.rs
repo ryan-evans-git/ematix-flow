@@ -13,6 +13,7 @@ use ematix_flow_core::backend::{
 };
 use ematix_flow_core::pg::PgPool;
 use ematix_flow_core::strategy::append::augment_with_metadata;
+use ematix_flow_core::strategy::scd2::augment_with_scd2;
 use ematix_flow_core::types::{ColumnSpec, ColumnType, TableSpec};
 use futures_util::TryStreamExt;
 use testcontainers::runners::AsyncRunner;
@@ -339,9 +340,7 @@ async fn arrow_round_trip_via_backend_trait() {
         .unwrap();
     assert_eq!(dst_count, 3);
     let null_count = pool
-        .fetch_scalar_int(
-            "SELECT count(*)::int FROM arrow_test.dst WHERE name IS NULL",
-        )
+        .fetch_scalar_int("SELECT count(*)::int FROM arrow_test.dst WHERE name IS NULL")
         .await
         .unwrap();
     assert_eq!(null_count, 1);
@@ -809,9 +808,7 @@ async fn arrow_write_stream_truncate_replaces_existing() {
         .unwrap();
     assert_eq!(count, 1);
     let new_present = pool
-        .fetch_scalar_int(
-            "SELECT count(*)::int FROM arrow_trunc.t WHERE id = 1 AND label = 'new'",
-        )
+        .fetch_scalar_int("SELECT count(*)::int FROM arrow_trunc.t WHERE id = 1 AND label = 'new'")
         .await
         .unwrap();
     assert_eq!(new_present, 1);
@@ -846,4 +843,304 @@ async fn postgres_backend_trait_dispatches_ping_and_execute() {
 
     let info = backend.connection_info();
     assert_eq!(info.dbname, "postgres");
+}
+
+// --- Phase 31c: DuckDB SCD2 (no-Docker, in-memory) -----------------------
+
+fn duckdb_scd2_dim_spec() -> TableSpec {
+    augment_with_scd2(&TableSpec {
+        schema: "wh".into(),
+        name: "customer_dim".into(),
+        columns: vec![
+            ColumnSpec {
+                name: "customer_id".into(),
+                ty: ColumnType::BigInt,
+                nullable: false,
+                primary_key: true,
+            },
+            ColumnSpec {
+                name: "email".into(),
+                ty: ColumnType::Text,
+                nullable: false,
+                primary_key: false,
+            },
+            ColumnSpec {
+                name: "name".into(),
+                ty: ColumnType::Text,
+                nullable: true,
+                primary_key: false,
+            },
+        ],
+        unique_constraints: Vec::new(),
+        fingerprint: String::new(),
+    })
+}
+
+async fn create_duckdb_scd2_target(backend: &Arc<dyn Backend>) {
+    backend
+        .execute(
+            "CREATE TABLE wh.customer_dim (\
+              customer_id BIGINT, \
+              email VARCHAR, \
+              name VARCHAR, \
+              valid_from TIMESTAMPTZ NOT NULL, \
+              valid_to TIMESTAMPTZ, \
+              is_current BOOLEAN NOT NULL, \
+              row_hash BLOB NOT NULL, \
+              _loaded_at TIMESTAMPTZ NOT NULL, \
+              _batch_id UUID NOT NULL, \
+              PRIMARY KEY (customer_id, valid_from)\
+            )",
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn duckdb_run_scd2_first_load_inserts_all_current() {
+    let backend: Arc<dyn Backend> = Arc::new(DuckDBBackend::open(":memory:").unwrap());
+    backend.execute("CREATE SCHEMA src").await.unwrap();
+    backend.execute("CREATE SCHEMA wh").await.unwrap();
+    backend
+        .execute("CREATE TABLE src.customers (customer_id BIGINT, email VARCHAR, name VARCHAR)")
+        .await
+        .unwrap();
+    backend
+        .execute(
+            "INSERT INTO src.customers VALUES \
+             (1, 'a@x.com', 'alice'), \
+             (2, 'b@x.com', 'bob'), \
+             (3, 'c@x.com', NULL)",
+        )
+        .await
+        .unwrap();
+    create_duckdb_scd2_target(&backend).await;
+
+    let target = duckdb_scd2_dim_spec();
+    let result = backend
+        .run_scd2(
+            &target,
+            "SELECT customer_id, email, name FROM src.customers",
+            &["customer_id".to_string()],
+            &["email".to_string(), "name".to_string()],
+            "duckdb_scd2_first",
+            None,
+            None,
+            None,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.status, "success");
+    assert_eq!(result.path, "same_db");
+
+    use arrow_array::{BooleanArray, Int64Array};
+    let stream = backend
+        .read_arrow_stream(
+            "SELECT count(*)::BIGINT, sum(CASE WHEN is_current THEN 1 ELSE 0 END)::BIGINT, \
+             sum(CASE WHEN valid_to IS NULL THEN 1 ELSE 0 END)::BIGINT FROM wh.customer_dim",
+        )
+        .await
+        .unwrap();
+    let batches: Vec<_> = stream.try_collect().await.unwrap();
+    let total = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap()
+        .value(0);
+    let currents = batches[0]
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap()
+        .value(0);
+    let null_valid_to = batches[0]
+        .column(2)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(total, 3);
+    assert_eq!(currents, 3);
+    assert_eq!(null_valid_to, 3);
+    let _: BooleanArray; // silence unused-import lint when only Int64Array is used
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn duckdb_run_scd2_second_load_closes_changed_row_and_inserts_new_version() {
+    let backend: Arc<dyn Backend> = Arc::new(DuckDBBackend::open(":memory:").unwrap());
+    backend.execute("CREATE SCHEMA src").await.unwrap();
+    backend.execute("CREATE SCHEMA wh").await.unwrap();
+    backend
+        .execute("CREATE TABLE src.customers (customer_id BIGINT, email VARCHAR, name VARCHAR)")
+        .await
+        .unwrap();
+    backend
+        .execute(
+            "INSERT INTO src.customers VALUES \
+             (1, 'a@x.com', 'alice'), \
+             (2, 'b@x.com', 'bob')",
+        )
+        .await
+        .unwrap();
+    create_duckdb_scd2_target(&backend).await;
+
+    let target = duckdb_scd2_dim_spec();
+    backend
+        .run_scd2(
+            &target,
+            "SELECT customer_id, email, name FROM src.customers",
+            &["customer_id".to_string()],
+            &["email".to_string(), "name".to_string()],
+            "duckdb_scd2_2_first",
+            None,
+            None,
+            None,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+
+    // Bob updates his email; alice unchanged.
+    backend
+        .execute("UPDATE src.customers SET email = 'b2@x.com' WHERE customer_id = 2")
+        .await
+        .unwrap();
+
+    backend
+        .run_scd2(
+            &target,
+            "SELECT customer_id, email, name FROM src.customers",
+            &["customer_id".to_string()],
+            &["email".to_string(), "name".to_string()],
+            "duckdb_scd2_2_second",
+            None,
+            None,
+            None,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+
+    use arrow_array::Int64Array;
+    let stream = backend
+        .read_arrow_stream(
+            "SELECT \
+              count(*)::BIGINT AS total, \
+              sum(CASE WHEN is_current THEN 1 ELSE 0 END)::BIGINT AS currents, \
+              sum(CASE WHEN customer_id = 2 AND is_current THEN 1 ELSE 0 END)::BIGINT AS bob_current, \
+              sum(CASE WHEN customer_id = 2 AND NOT is_current THEN 1 ELSE 0 END)::BIGINT AS bob_closed \
+             FROM wh.customer_dim",
+        )
+        .await
+        .unwrap();
+    let batches: Vec<_> = stream.try_collect().await.unwrap();
+    let col = |i: usize| {
+        batches[0]
+            .column(i)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0)
+    };
+    // 2 rows alice (current) + 2 rows bob (closed + current) = 3 alive + 1 closed = 4 total when alice idempotent (1) + bob old (1) + bob new (1) = 3.
+    // Actually: alice has 1 row, bob has 2 rows (closed old + new current). Total = 3.
+    assert_eq!(col(0), 3, "total versions");
+    assert_eq!(col(1), 2, "current versions: alice + bob_new");
+    assert_eq!(col(2), 1, "exactly one current bob");
+    assert_eq!(col(3), 1, "exactly one closed bob");
+
+    // Closed bob's valid_to is set, current bob's is NULL.
+    let stream = backend
+        .read_arrow_stream(
+            "SELECT \
+              sum(CASE WHEN customer_id = 2 AND NOT is_current AND valid_to IS NOT NULL \
+                       THEN 1 ELSE 0 END)::BIGINT \
+             FROM wh.customer_dim",
+        )
+        .await
+        .unwrap();
+    let batches: Vec<_> = stream.try_collect().await.unwrap();
+    let closed_with_valid_to = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(closed_with_valid_to, 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn duckdb_run_scd2_idempotent_when_no_changes() {
+    let backend: Arc<dyn Backend> = Arc::new(DuckDBBackend::open(":memory:").unwrap());
+    backend.execute("CREATE SCHEMA src").await.unwrap();
+    backend.execute("CREATE SCHEMA wh").await.unwrap();
+    backend
+        .execute("CREATE TABLE src.customers (customer_id BIGINT, email VARCHAR, name VARCHAR)")
+        .await
+        .unwrap();
+    backend
+        .execute("INSERT INTO src.customers VALUES (1, 'a@x.com', 'alice')")
+        .await
+        .unwrap();
+    create_duckdb_scd2_target(&backend).await;
+
+    let target = duckdb_scd2_dim_spec();
+    let args = (
+        "SELECT customer_id, email, name FROM src.customers",
+        vec!["customer_id".to_string()],
+        vec!["email".to_string(), "name".to_string()],
+    );
+
+    backend
+        .run_scd2(
+            &target,
+            args.0,
+            &args.1,
+            &args.2,
+            "duckdb_scd2_idem_1",
+            None,
+            None,
+            None,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+    backend
+        .run_scd2(
+            &target,
+            args.0,
+            &args.1,
+            &args.2,
+            "duckdb_scd2_idem_2",
+            None,
+            None,
+            None,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+
+    use arrow_array::Int64Array;
+    let stream = backend
+        .read_arrow_stream("SELECT count(*)::BIGINT FROM wh.customer_dim")
+        .await
+        .unwrap();
+    let batches: Vec<_> = stream.try_collect().await.unwrap();
+    let total = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(
+        total, 1,
+        "idempotent: no second version when nothing changed"
+    );
 }

@@ -1,8 +1,6 @@
 use std::sync::{Arc, OnceLock};
 
-use ematix_flow_core::backend::{
-    Backend, Dialect, PostgresBackend, TargetTable, WriteMode,
-};
+use ematix_flow_core::backend::{Backend, Dialect, PostgresBackend, TargetTable, WriteMode};
 use ematix_flow_core::ddl::{self, DriftResult};
 use ematix_flow_core::meta::{DeleteHandling, WatermarkConfig};
 use ematix_flow_core::pg::{self, EnsureOutcome, MergeRunResult, PgPool, Scd2RunResult};

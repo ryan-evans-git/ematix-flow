@@ -24,8 +24,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use arrow_array::builder::{
-    BinaryBuilder, BooleanBuilder, Float32Builder, Float64Builder, Int16Builder,
-    Int32Builder, Int64Builder, StringBuilder, TimestampMicrosecondBuilder,
+    BinaryBuilder, BooleanBuilder, Float32Builder, Float64Builder, Int16Builder, Int32Builder,
+    Int64Builder, StringBuilder, TimestampMicrosecondBuilder,
 };
 use arrow_array::{Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
@@ -123,8 +123,7 @@ pub enum WriteMode {
 
 /// Stream of Arrow `RecordBatch`es. The universal IO contract for
 /// cross-backend pipelines (Phase 30b → onwards).
-pub type ArrowBatchStream =
-    Pin<Box<dyn Stream<Item = Result<RecordBatch, BackendError>> + Send>>;
+pub type ArrowBatchStream = Pin<Box<dyn Stream<Item = Result<RecordBatch, BackendError>> + Send>>;
 
 /// Phase 30d: dialect-agnostic result of running a strategy. Each row-
 /// count field is `Option<i64>` because not every strategy meaningfully
@@ -232,8 +231,7 @@ pub trait Backend: Send + Sync {
     /// streaming or object-store backends — Phases 34/36 will refine
     /// the parameter shape). Implementations are free to chunk batches
     /// however they like; consumers should treat the stream as opaque.
-    async fn read_arrow_stream(&self, query: &str)
-        -> Result<ArrowBatchStream, BackendError>;
+    async fn read_arrow_stream(&self, query: &str) -> Result<ArrowBatchStream, BackendError>;
 
     /// Phase 30b: write a stream of Arrow `RecordBatch`es to `target`
     /// using the requested write semantics. Returns the number of rows
@@ -549,10 +547,7 @@ impl Backend for PostgresBackend {
         }
     }
 
-    async fn read_arrow_stream(
-        &self,
-        query: &str,
-    ) -> Result<ArrowBatchStream, BackendError> {
+    async fn read_arrow_stream(&self, query: &str) -> Result<ArrowBatchStream, BackendError> {
         // Phase 30b minimum-viable: run the query, materialize all rows,
         // emit one RecordBatch. Streaming chunked output is a future
         // optimization (use COPY BINARY → arrow encoders).
@@ -628,16 +623,16 @@ fn quote_ident(name: &str) -> String {
 
 fn pg_type_to_arrow(ty: &PgType) -> Result<DataType, BackendError> {
     Ok(match ty.oid() {
-        21 => DataType::Int16,                                       // INT2
-        23 => DataType::Int32,                                       // INT4
-        20 => DataType::Int64,                                       // INT8
-        700 => DataType::Float32,                                    // FLOAT4 (REAL)
-        701 => DataType::Float64,                                    // FLOAT8 (DOUBLE)
-        16 => DataType::Boolean,                                     // BOOL
-        25 | 1043 | 1042 => DataType::Utf8,                          // TEXT/VARCHAR/BPCHAR
-        17 => DataType::Binary,                                      // BYTEA
-        2950 => DataType::Utf8,                                      // UUID (carry as text)
-        114 | 3802 => DataType::Utf8,                                // JSON / JSONB (text rep)
+        21 => DataType::Int16,                                           // INT2
+        23 => DataType::Int32,                                           // INT4
+        20 => DataType::Int64,                                           // INT8
+        700 => DataType::Float32,                                        // FLOAT4 (REAL)
+        701 => DataType::Float64,                                        // FLOAT8 (DOUBLE)
+        16 => DataType::Boolean,                                         // BOOL
+        25 | 1043 | 1042 => DataType::Utf8,                              // TEXT/VARCHAR/BPCHAR
+        17 => DataType::Binary,                                          // BYTEA
+        2950 => DataType::Utf8,                                          // UUID (carry as text)
+        114 | 3802 => DataType::Utf8,                                    // JSON / JSONB (text rep)
         1184 | 1114 => DataType::Timestamp(TimeUnit::Microsecond, None), // TIMESTAMPTZ/TIMESTAMP
         _ => {
             return Err(BackendError::TypeMapping(format!(
@@ -676,10 +671,7 @@ fn pg_rows_to_record_batch(
                 let mut b = Int16Builder::with_capacity(cap);
                 for row in rows {
                     let v: Option<i16> = row.try_get(idx).map_err(|e| {
-                        BackendError::TypeMapping(format!(
-                            "row[{idx}] {} → i16: {e}",
-                            col.name()
-                        ))
+                        BackendError::TypeMapping(format!("row[{idx}] {} → i16: {e}", col.name()))
                     })?;
                     b.append_option(v);
                 }
@@ -689,10 +681,7 @@ fn pg_rows_to_record_batch(
                 let mut b = Int32Builder::with_capacity(cap);
                 for row in rows {
                     let v: Option<i32> = row.try_get(idx).map_err(|e| {
-                        BackendError::TypeMapping(format!(
-                            "row[{idx}] {} → i32: {e}",
-                            col.name()
-                        ))
+                        BackendError::TypeMapping(format!("row[{idx}] {} → i32: {e}", col.name()))
                     })?;
                     b.append_option(v);
                 }
@@ -702,10 +691,7 @@ fn pg_rows_to_record_batch(
                 let mut b = Int64Builder::with_capacity(cap);
                 for row in rows {
                     let v: Option<i64> = row.try_get(idx).map_err(|e| {
-                        BackendError::TypeMapping(format!(
-                            "row[{idx}] {} → i64: {e}",
-                            col.name()
-                        ))
+                        BackendError::TypeMapping(format!("row[{idx}] {} → i64: {e}", col.name()))
                     })?;
                     b.append_option(v);
                 }
@@ -715,10 +701,7 @@ fn pg_rows_to_record_batch(
                 let mut b = Float32Builder::with_capacity(cap);
                 for row in rows {
                     let v: Option<f32> = row.try_get(idx).map_err(|e| {
-                        BackendError::TypeMapping(format!(
-                            "row[{idx}] {} → f32: {e}",
-                            col.name()
-                        ))
+                        BackendError::TypeMapping(format!("row[{idx}] {} → f32: {e}", col.name()))
                     })?;
                     b.append_option(v);
                 }
@@ -728,10 +711,7 @@ fn pg_rows_to_record_batch(
                 let mut b = Float64Builder::with_capacity(cap);
                 for row in rows {
                     let v: Option<f64> = row.try_get(idx).map_err(|e| {
-                        BackendError::TypeMapping(format!(
-                            "row[{idx}] {} → f64: {e}",
-                            col.name()
-                        ))
+                        BackendError::TypeMapping(format!("row[{idx}] {} → f64: {e}", col.name()))
                     })?;
                     b.append_option(v);
                 }
@@ -741,10 +721,7 @@ fn pg_rows_to_record_batch(
                 let mut b = BooleanBuilder::with_capacity(cap);
                 for row in rows {
                     let v: Option<bool> = row.try_get(idx).map_err(|e| {
-                        BackendError::TypeMapping(format!(
-                            "row[{idx}] {} → bool: {e}",
-                            col.name()
-                        ))
+                        BackendError::TypeMapping(format!("row[{idx}] {} → bool: {e}", col.name()))
                     })?;
                     b.append_option(v);
                 }
@@ -771,13 +748,12 @@ fn pg_rows_to_record_batch(
                             // canonical JSON text form. Requires the
                             // `with-serde_json-1` feature on
                             // tokio-postgres.
-                            let v: Option<serde_json::Value> =
-                                row.try_get(idx).map_err(|e| {
-                                    BackendError::TypeMapping(format!(
-                                        "row[{idx}] {} → json: {e}",
-                                        col.name()
-                                    ))
-                                })?;
+                            let v: Option<serde_json::Value> = row.try_get(idx).map_err(|e| {
+                                BackendError::TypeMapping(format!(
+                                    "row[{idx}] {} → json: {e}",
+                                    col.name()
+                                ))
+                            })?;
                             b.append_option(v.map(|j| j.to_string()));
                         }
                         _ => {
@@ -797,10 +773,7 @@ fn pg_rows_to_record_batch(
                 let mut b = BinaryBuilder::with_capacity(cap, cap * 16);
                 for row in rows {
                     let v: Option<&[u8]> = row.try_get(idx).map_err(|e| {
-                        BackendError::TypeMapping(format!(
-                            "row[{idx}] {} → bytea: {e}",
-                            col.name()
-                        ))
+                        BackendError::TypeMapping(format!("row[{idx}] {} → bytea: {e}", col.name()))
                     })?;
                     b.append_option(v);
                 }
@@ -829,8 +802,7 @@ fn pg_rows_to_record_batch(
         };
         arrays.push(array);
     }
-    RecordBatch::try_new(schema, arrays)
-        .map_err(|e| BackendError::TypeMapping(e.to_string()))
+    RecordBatch::try_new(schema, arrays).map_err(|e| BackendError::TypeMapping(e.to_string()))
 }
 
 fn system_time_to_micros(t: std::time::SystemTime) -> i64 {
@@ -848,15 +820,19 @@ async fn insert_record_batch(
     batch: &RecordBatch,
 ) -> Result<u64, BackendError> {
     use arrow_array::{
-        BinaryArray, BooleanArray, Float32Array, Float64Array, Int16Array, Int32Array,
-        Int64Array, StringArray, TimestampMicrosecondArray,
+        BinaryArray, BooleanArray, Float32Array, Float64Array, Int16Array, Int32Array, Int64Array,
+        StringArray, TimestampMicrosecondArray,
     };
 
     if batch.num_rows() == 0 {
         return Ok(0);
     }
     let arrow_schema = batch.schema();
-    let cols: Vec<&str> = arrow_schema.fields().iter().map(|f| f.name().as_str()).collect();
+    let cols: Vec<&str> = arrow_schema
+        .fields()
+        .iter()
+        .map(|f| f.name().as_str())
+        .collect();
     let placeholders: Vec<String> = (1..=cols.len()).map(|i| format!("${i}")).collect();
     let sql = format!(
         "INSERT INTO {}.{} ({}) VALUES ({})",
@@ -962,8 +938,10 @@ async fn insert_record_batch(
                     owned_bytes[col_idx] = Some(arr.value(row_idx).to_vec());
                 }
                 DataType::Timestamp(TimeUnit::Microsecond, _) => {
-                    let arr =
-                        col.as_any().downcast_ref::<TimestampMicrosecondArray>().unwrap();
+                    let arr = col
+                        .as_any()
+                        .downcast_ref::<TimestampMicrosecondArray>()
+                        .unwrap();
                     let micros = arr.value(row_idx);
                     let dur = std::time::Duration::from_micros(micros as u64);
                     owned_ts[col_idx] = Some(std::time::UNIX_EPOCH + dur);
@@ -989,9 +967,7 @@ async fn insert_record_batch(
                 DataType::Boolean => params.push(&owned_bool[col_idx] as ToSqlRef<'_>),
                 DataType::Utf8 => match param_types.get(col_idx).map(|t| t.oid()) {
                     Some(2950) => params.push(&owned_uuid[col_idx] as ToSqlRef<'_>),
-                    Some(114) | Some(3802) => {
-                        params.push(&owned_json[col_idx] as ToSqlRef<'_>)
-                    }
+                    Some(114) | Some(3802) => params.push(&owned_json[col_idx] as ToSqlRef<'_>),
                     _ => params.push(&owned_strs[col_idx] as ToSqlRef<'_>),
                 },
                 DataType::Binary => params.push(&owned_bytes[col_idx] as ToSqlRef<'_>),

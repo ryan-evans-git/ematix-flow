@@ -1176,11 +1176,8 @@ impl PgPool {
             // Phase 16: TTL expiry. Closes out current versions whose
             // valid_from is older than now() - ttl. Same-tx atomicity.
             let closed_ttl = if let Some(ttl_secs) = ttl_seconds {
-                let ttl_sql = build_scd2_ttl_expire_sql(
-                    &target_spec.schema,
-                    &target_spec.name,
-                    ttl_secs,
-                );
+                let ttl_sql =
+                    build_scd2_ttl_expire_sql(&target_spec.schema, &target_spec.name, ttl_secs);
                 tx.execute(&ttl_sql, &[]).await? as i64
             } else {
                 0
@@ -1346,11 +1343,8 @@ impl PgPool {
             };
             // Phase 16: TTL expiry runs in the same transaction.
             let closed_ttl = if let Some(ttl_secs) = ttl_seconds {
-                let ttl_sql = build_scd2_ttl_expire_sql(
-                    &target_spec.schema,
-                    &target_spec.name,
-                    ttl_secs,
-                );
+                let ttl_sql =
+                    build_scd2_ttl_expire_sql(&target_spec.schema, &target_spec.name, ttl_secs);
                 target_tx.execute(&ttl_sql, &[]).await? as i64
             } else {
                 0

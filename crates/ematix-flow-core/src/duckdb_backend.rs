@@ -20,11 +20,12 @@ use duckdb::Connection as DuckConn;
 use futures_util::stream;
 
 use crate::backend::{
-    ArrowBatchStream, Backend, BackendError, Dialect, DeleteHandling, StrategyRunResult,
+    ArrowBatchStream, Backend, BackendError, DeleteHandling, Dialect, StrategyRunResult,
     TargetTable, WriteMode,
 };
 use crate::pg::ConnectionInfo;
 use crate::strategy::append::{BATCH_ID_COL, LOADED_AT_COL, plan_same_db_append};
+use crate::strategy::scd2::{IS_CURRENT_COL, ROW_HASH_COL, VALID_FROM_COL, VALID_TO_COL};
 use crate::strategy::truncate::plan_truncate_replace;
 use crate::types::TableSpec;
 use uuid::Uuid;
@@ -100,6 +101,188 @@ fn substitute_batch_id(sql: &str, batch_id: &Uuid) -> String {
     sql.replace("$1::uuid", &format!("'{}'::uuid", batch_id))
 }
 
+/// DuckDB equivalent of `pg::hash::postgres_digest_expression`.
+///
+/// PG uses `digest(<expr>, 'sha256')` from the pgcrypto extension and
+/// E-string escapes (`E'\\x00NULL\\x00'`, `E'\\x01'`) which DuckDB
+/// doesn't accept. DuckDB's built-in `sha256(varchar)` returns a hex
+/// VARCHAR; `unhex(...)` converts that to BLOB so it round-trips with
+/// the row_hash column type. Null marker uses `chr(0)` to stay
+/// distinguishable from a literal `'NULL'` value.
+fn duckdb_digest_expression(columns: &[String], prefix: &str) -> String {
+    let parts: Vec<String> = columns
+        .iter()
+        .map(|c| {
+            format!(
+                "coalesce({prefix}{c}::VARCHAR, chr(0) || 'NULL' || chr(0))",
+                prefix = prefix,
+                c = c,
+            )
+        })
+        .collect();
+    format!("unhex(sha256({}))", parts.join(" || chr(1) || "))
+}
+
+/// DuckDB-native SCD2 plan. Mirrors `strategy::scd2::plan_scd2` but
+/// emits SQL DuckDB will accept:
+///   - `CREATE TEMP TABLE …` without `ON COMMIT DROP` (DuckDB drops
+///     the temp table only when the connection ends, so we DROP
+///     explicitly at the end of the executor).
+///   - `WITH src AS (…)` without the `MATERIALIZED` hint.
+///   - `unhex(sha256(…))` instead of pgcrypto `digest(…, 'sha256')`.
+///   - `$1::uuid` placeholder substituted to a literal up-front so we
+///     can run the statements through `execute_batch`.
+fn duckdb_scd2_statements(
+    target: &TableSpec,
+    source_query: &str,
+    keys: &[String],
+    compare_columns: &[String],
+    run_token: &str,
+    event_ts_column: Option<&str>,
+    batch_id: &Uuid,
+) -> Vec<String> {
+    let user_columns: Vec<String> = target
+        .columns
+        .iter()
+        .filter(|c| {
+            let n = c.name.as_str();
+            n != VALID_FROM_COL
+                && n != VALID_TO_COL
+                && n != IS_CURRENT_COL
+                && n != ROW_HASH_COL
+                && n != LOADED_AT_COL
+                && n != BATCH_ID_COL
+        })
+        .map(|c| c.name.clone())
+        .collect();
+    let has_metadata = target
+        .columns
+        .iter()
+        .any(|c| c.name == LOADED_AT_COL || c.name == BATCH_ID_COL);
+
+    let stage = format!("_scd2_changed_{run_token}");
+    let digest_expr = duckdb_digest_expression(compare_columns, "");
+    let t_tuple: String = keys
+        .iter()
+        .map(|k| format!("t.{k}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let src_tuple: String = keys
+        .iter()
+        .map(|k| format!("src.{k}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let join_clause = format!("({t_tuple}) = ({src_tuple})");
+    let key_tuple: String = keys.join(", ");
+
+    let src_select = match event_ts_column {
+        Some(ets) => format!(
+            "SELECT DISTINCT ON ({keys}) {user_cols}, \
+             {ets}::TIMESTAMPTZ AS _event_ts, \
+             {digest_expr} AS _row_hash \
+             FROM ({source}) q \
+             ORDER BY {keys}, {ets} DESC",
+            keys = key_tuple,
+            user_cols = user_columns.join(", "),
+            ets = ets,
+            digest_expr = digest_expr,
+            source = source_query,
+        ),
+        None => format!(
+            "SELECT {user_cols}, {digest_expr} AS _row_hash FROM ({source}) q",
+            user_cols = user_columns.join(", "),
+            digest_expr = digest_expr,
+            source = source_query,
+        ),
+    };
+
+    let create_temp = format!(
+        "CREATE TEMP TABLE {stage} AS \
+         WITH src AS ( {src_select} ) \
+         SELECT src.* FROM src \
+         LEFT JOIN {schema}.{table} t \
+             ON {join_clause} AND t.{is_current_col} \
+         WHERE t.{row_hash_col} IS DISTINCT FROM src._row_hash",
+        stage = stage,
+        src_select = src_select,
+        schema = target.schema,
+        table = target.name,
+        join_clause = join_clause,
+        is_current_col = IS_CURRENT_COL,
+        row_hash_col = ROW_HASH_COL,
+    );
+
+    let close_out = match event_ts_column {
+        Some(_) => {
+            let join: String = keys
+                .iter()
+                .map(|k| format!("t.{k} = c.{k}"))
+                .collect::<Vec<_>>()
+                .join(" AND ");
+            format!(
+                "UPDATE {schema}.{table} t \
+                 SET {valid_to} = c._event_ts, {is_current} = false \
+                 FROM {stage} c \
+                 WHERE t.{is_current} AND {join}",
+                schema = target.schema,
+                table = target.name,
+                valid_to = VALID_TO_COL,
+                is_current = IS_CURRENT_COL,
+                stage = stage,
+                join = join,
+            )
+        }
+        None => format!(
+            "UPDATE {schema}.{table} \
+             SET {valid_to} = now(), {is_current} = false \
+             WHERE {is_current} AND ({keys}) IN (SELECT {keys} FROM {stage})",
+            schema = target.schema,
+            table = target.name,
+            valid_to = VALID_TO_COL,
+            is_current = IS_CURRENT_COL,
+            keys = key_tuple,
+            stage = stage,
+        ),
+    };
+
+    let mut insert_cols: Vec<String> = user_columns.clone();
+    insert_cols.push(VALID_FROM_COL.into());
+    insert_cols.push(VALID_TO_COL.into());
+    insert_cols.push(IS_CURRENT_COL.into());
+    insert_cols.push(ROW_HASH_COL.into());
+    let mut select_exprs: Vec<String> = user_columns.clone();
+    let valid_from_expr: String = match event_ts_column {
+        Some(_) => "_event_ts".into(),
+        None => "now()".into(),
+    };
+    select_exprs.push(valid_from_expr);
+    select_exprs.push("NULL".into());
+    select_exprs.push("true".into());
+    select_exprs.push("_row_hash".into());
+    if has_metadata {
+        insert_cols.push(LOADED_AT_COL.into());
+        insert_cols.push(BATCH_ID_COL.into());
+        select_exprs.push("now()".into());
+        select_exprs.push(format!("'{batch_id}'::uuid"));
+    }
+    let insert_new = format!(
+        "INSERT INTO {schema}.{table} ({insert_cols}) \
+         SELECT {select_exprs} FROM {stage}",
+        schema = target.schema,
+        table = target.name,
+        insert_cols = insert_cols.join(", "),
+        select_exprs = select_exprs.join(", "),
+        stage = stage,
+    );
+
+    // Explicit DROP — DuckDB has no `ON COMMIT DROP`, and reusing the
+    // same connection across runs would clash on the temp table name
+    // if we left it behind.
+    let drop_temp = format!("DROP TABLE {stage}");
+
+    vec![create_temp, close_out, insert_new, drop_temp]
+}
+
 /// DuckDB-backed implementation of `Backend`. Created via
 /// `DuckDBBackend::open(":memory:")` for an in-memory database or
 /// `DuckDBBackend::open("/path/to/db.duckdb")` for a file-backed one.
@@ -115,8 +298,7 @@ impl DuckDBBackend {
     pub fn open(location: impl Into<String>) -> Result<Self, BackendError> {
         let location = location.into();
         let conn = if location == ":memory:" {
-            DuckConn::open_in_memory()
-                .map_err(|e| BackendError::Connection(e.to_string()))?
+            DuckConn::open_in_memory().map_err(|e| BackendError::Connection(e.to_string()))?
         } else {
             DuckConn::open(&location).map_err(|e| BackendError::Connection(e.to_string()))?
         };
@@ -194,10 +376,7 @@ impl Backend for DuckDBBackend {
         .await
     }
 
-    async fn read_arrow_stream(
-        &self,
-        query: &str,
-    ) -> Result<ArrowBatchStream, BackendError> {
+    async fn read_arrow_stream(&self, query: &str) -> Result<ArrowBatchStream, BackendError> {
         let q = query.to_string();
         let batches = self
             .with_conn_blocking(move |c| {
@@ -288,8 +467,7 @@ impl Backend for DuckDBBackend {
         }
         if incremental_column.is_some() {
             return Err(BackendError::Other(
-                "DuckDB run_append: incremental_column not yet supported (Phase 31d)"
-                    .into(),
+                "DuckDB run_append: incremental_column not yet supported (Phase 31d)".into(),
             ));
         }
         let plan = plan_same_db_append(spec, source_query);
@@ -446,20 +624,90 @@ impl Backend for DuckDBBackend {
 
     async fn run_scd2(
         &self,
-        _spec: &crate::types::TableSpec,
-        _source_query: &str,
-        _keys: &[String],
-        _compare_columns: &[String],
+        spec: &crate::types::TableSpec,
+        source_query: &str,
+        keys: &[String],
+        compare_columns: &[String],
         _pipeline_name: &str,
-        _source_backend: Option<&dyn Backend>,
-        _delete_handling: Option<DeleteHandling>,
-        _event_timestamp_column: Option<&str>,
-        _ttl_seconds: Option<i64>,
-        _dry_run: bool,
+        source_backend: Option<&dyn Backend>,
+        delete_handling: Option<DeleteHandling>,
+        event_timestamp_column: Option<&str>,
+        ttl_seconds: Option<i64>,
+        dry_run: bool,
     ) -> Result<StrategyRunResult, BackendError> {
-        Err(BackendError::Other(
-            "DuckDB run_scd2: not implemented in Phase 31a (lands in 31c)".into(),
-        ))
+        if source_backend.is_some() {
+            return Err(BackendError::Other(
+                "DuckDB cross-backend run_scd2 goes through the Arrow bridge \
+                 (cross_backend_arrow_sync); same-backend only here"
+                    .into(),
+            ));
+        }
+        if delete_handling.is_some() {
+            return Err(BackendError::Other(
+                "DuckDB run_scd2: handle_deletes not yet supported (Phase 31d)".into(),
+            ));
+        }
+        if ttl_seconds.is_some() {
+            return Err(BackendError::Other(
+                "DuckDB run_scd2: ttl_seconds not yet supported (Phase 31d)".into(),
+            ));
+        }
+        let batch_id = Uuid::new_v4();
+        let run_id = Uuid::new_v4();
+        // The temp-table token must be a valid SQL identifier and unique
+        // across runs that share a connection. Hex of the run UUID
+        // (no dashes) satisfies both.
+        let run_token = run_id.simple().to_string();
+        let stmts = duckdb_scd2_statements(
+            spec,
+            source_query,
+            keys,
+            compare_columns,
+            &run_token,
+            event_timestamp_column,
+            &batch_id,
+        );
+
+        let inserted = self
+            .with_conn_blocking(move |c| {
+                c.execute_batch("BEGIN")
+                    .map_err(|e| BackendError::Query(e.to_string()))?;
+                // Statement order: CREATE TEMP, UPDATE close-out, INSERT
+                // new versions, DROP TEMP. Affected-row count for
+                // `rows_inserted` comes from the INSERT (index 2).
+                let mut inserted: u64 = 0;
+                for (idx, sql) in stmts.iter().enumerate() {
+                    let n = c.execute(sql, []).map_err(|e| {
+                        // Best-effort cleanup so a failure mid-run doesn't
+                        // leave a half-built temp table around. The DROP
+                        // is harmless if the CREATE never succeeded.
+                        let _ = c.execute_batch("ROLLBACK");
+                        BackendError::Query(format!("scd2 stmt {idx} failed: {e}; sql={sql}",))
+                    })?;
+                    if idx == 2 {
+                        inserted = n as u64;
+                    }
+                }
+                if dry_run {
+                    c.execute_batch("ROLLBACK")
+                        .map_err(|e| BackendError::Query(e.to_string()))?;
+                } else {
+                    c.execute_batch("COMMIT")
+                        .map_err(|e| BackendError::Query(e.to_string()))?;
+                }
+                Ok::<u64, BackendError>(inserted)
+            })
+            .await?;
+
+        Ok(StrategyRunResult {
+            run_id: run_id.to_string(),
+            rows_inserted: inserted as i64,
+            rows_updated: None,
+            rows_unchanged: None,
+            rows_closed: None,
+            status: if dry_run { "dry_run" } else { "success" }.into(),
+            path: "same_db".into(),
+        })
     }
 }
 
