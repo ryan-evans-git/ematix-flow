@@ -4871,6 +4871,113 @@ async fn rabbitmq_write_then_read_round_trip() {
     assert!(labels.contains(&"gamma".to_string()));
 }
 
+/// Phase 37a.3: drain without committing → drop the backend (which
+/// closes the channel) → re-consume from a fresh backend. The
+/// broker should re-deliver every unacked message because manual
+/// ack defers ack-on-delivery until commit_offsets fires. Mirrors
+/// Kafka 36e's "no commit before durable write" guarantee.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker; run with `cargo test -- --ignored`"]
+async fn rabbitmq_unacked_messages_redeliver_on_consumer_replace() {
+    use arrow_array::Int64Array;
+    use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+    use ematix_flow_core::backend::WriteMode;
+    use ematix_flow_core::rabbitmq_backend::RabbitBatchConfig;
+
+    let (_container, amqp_url) = start_rabbitmq().await;
+    let queue = "redeliver-queue";
+    declare_rabbitmq_queue(&amqp_url, queue).await;
+
+    // Produce 4 rows.
+    let producer = RabbitMQBackend::open(&amqp_url).unwrap();
+    let arrow_schema = Arc::new(ArrowSchema::new(vec![Field::new(
+        "id",
+        DataType::Int64,
+        false,
+    )]));
+    let batch = arrow_array::RecordBatch::try_new(
+        arrow_schema,
+        vec![Arc::new(Int64Array::from(vec![1_i64, 2, 3, 4]))],
+    )
+    .unwrap();
+    let target = ematix_flow_core::backend::TargetTable {
+        schema: "".into(),
+        name: queue.into(),
+    };
+    let stream: ematix_flow_core::backend::ArrowBatchStream =
+        Box::pin(futures_util::stream::once(async move {
+            Ok::<_, ematix_flow_core::BackendError>(batch)
+        }));
+    let n = producer
+        .write_arrow_stream(&target, stream, WriteMode::Append)
+        .await
+        .unwrap();
+    assert_eq!(n, 4);
+
+    // First consumer: drain but DON'T commit. Then drop.
+    {
+        let consumer =
+            RabbitMQBackend::open(&amqp_url)
+                .unwrap()
+                .with_batch_config(RabbitBatchConfig {
+                    batch_size: 100,
+                    batch_bytes: 1 << 20,
+                    idle_timeout_ms: 3_000,
+                });
+        let stream = consumer.read_arrow_stream(queue).await.unwrap();
+        let batches: Vec<_> = stream.try_collect().await.unwrap();
+        let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, 4, "first drain saw all 4 rows");
+        // Pending tag should be set.
+        assert!(
+            consumer.pending_delivery_count().await >= 1,
+            "expected at least one pending delivery tag"
+        );
+        // Drop without committing.
+    }
+
+    // Give the broker a beat to detect the channel close + requeue.
+    tokio::time::sleep(StdDuration::from_millis(500)).await;
+
+    // Second consumer should see all 4 rows again — they were
+    // requeued because no ack was sent.
+    let consumer2 =
+        RabbitMQBackend::open(&amqp_url)
+            .unwrap()
+            .with_batch_config(RabbitBatchConfig {
+                batch_size: 100,
+                batch_bytes: 1 << 20,
+                idle_timeout_ms: 3_000,
+            });
+    let stream = consumer2.read_arrow_stream(queue).await.unwrap();
+    let batches: Vec<_> = stream.try_collect().await.unwrap();
+    let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(
+        total, 4,
+        "redelivery: second consumer should see all 4 rows again, got {total}"
+    );
+
+    // This time, commit. Then a third consumer should see nothing.
+    consumer2.commit_offsets().await.unwrap();
+    assert_eq!(consumer2.pending_delivery_count().await, 0);
+
+    let consumer3 =
+        RabbitMQBackend::open(&amqp_url)
+            .unwrap()
+            .with_batch_config(RabbitBatchConfig {
+                batch_size: 100,
+                batch_bytes: 1 << 20,
+                idle_timeout_ms: 1_000,
+            });
+    let stream = consumer3.read_arrow_stream(queue).await.unwrap();
+    let batches: Vec<_> = stream.try_collect().await.unwrap();
+    let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(
+        total, 0,
+        "after commit_offsets the queue should be empty; got {total}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs Docker; run with `cargo test -- --ignored`"]
 async fn rabbitmq_read_empty_queue_returns_empty_stream() {

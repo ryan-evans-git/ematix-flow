@@ -19,8 +19,7 @@
 //!     `basic_consume` until idle (no message for `idle_timeout_ms`)
 //!     or the size/byte/window limits in `RabbitBatchConfig` fire.
 //!     Decodes each payload as JSON and concatenates rows into one
-//!     `RecordBatch` via arrow-json. Auto-ack is on; manual ack with
-//!     at-least-once semantics lands in 37a.3.
+//!     `RecordBatch` via arrow-json.
 //!   - `write_arrow_stream(target, ...)` — encodes each row as JSONL
 //!     and produces via `basic_publish` to the default exchange with
 //!     `routing_key = target.name`. Default-exchange routing means
@@ -29,9 +28,24 @@
 //!   - `WriteMode::Truncate` is rejected — queues are append-style
 //!     streams; purging is an admin operation.
 //!
+//! ## What 37a.3 adds (manual ack + at-least-once)
+//!   - Persistent consumer session: `Connection` + `Channel` +
+//!     `Consumer` are held in a Mutex on the backend and reused
+//!     across `read_arrow_stream` calls. Closing the channel between
+//!     calls would requeue all unacked deliveries (AMQP semantics);
+//!     the session keeps that from happening.
+//!   - `basic_consume` switches to `no_ack=false`. Each delivery's
+//!     `delivery_tag` accumulates as a "pending highest tag"; the
+//!     backend never acks on its own.
+//!   - `commit_offsets()` (the `Backend`-trait hook used by the
+//!     streaming pipeline) calls `basic_ack(highest_tag, multiple=true)`
+//!     to ack every accumulated delivery in one round-trip, then
+//!     clears the pending state. Mirrors Kafka 36e.
+//!   - Channel-level `basic_qos` is set to `batch_size` so the broker
+//!     never delivers more unacked messages than the consumer is
+//!     prepared to process in one drain.
+//!
 //! ## What lands in 37a.x
-//!   - 37a.3 — manual ack with at-least-once delivery semantics
-//!     (mirrors Kafka manual offset commits, 36e).
 //!   - 37a.4 — DLQ via dead-letter exchange.
 //!   - 37a.5 — auth providers (TLS, SASL EXTERNAL, plain login —
 //!     `lapin` already supports them through the URI scheme; expose
@@ -44,13 +58,15 @@
 //! validates the URI on connect, so `open` itself only stores the
 //! string and does not allocate any networking resources.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use futures_util::StreamExt;
-use lapin::options::{BasicConsumeOptions, BasicPublishOptions};
+use lapin::options::{BasicAckOptions, BasicConsumeOptions, BasicPublishOptions, BasicQosOptions};
 use lapin::types::FieldTable;
-use lapin::{BasicProperties, Connection, ConnectionProperties};
+use lapin::{BasicProperties, Channel, Connection, ConnectionProperties, Consumer};
+use tokio::sync::Mutex;
 
 use crate::backend::{
     ArrowBatchStream, Backend, BackendError, DeleteHandling, Dialect, StrategyRunResult,
@@ -84,13 +100,37 @@ impl Default for RabbitBatchConfig {
     }
 }
 
+/// Persistent consumer session held across `read_arrow_stream` calls.
+///
+/// Closing the channel between calls would return every unacked
+/// delivery to the queue — that's standard AMQP semantics, not a bug.
+/// Keeping the connection / channel / consumer alive lets us defer
+/// the ack until `commit_offsets()` (i.e., until the target backend
+/// has durably written), which is the at-least-once primitive used
+/// by `StreamingPipeline`.
+struct RabbitConsumerSession {
+    /// Held to keep the connection from closing on drop. Never
+    /// cloned — `lapin::Connection` is `Send + Sync` already.
+    _connection: Connection,
+    channel: Channel,
+    consumer: Consumer,
+    /// Queue name the consumer is bound to. Used to validate that
+    /// subsequent `read_arrow_stream` calls target the same queue
+    /// (we don't yet support session-switching mid-pipeline).
+    queue: String,
+    /// Highest delivery tag we've seen but not yet acked. AMQP's
+    /// `basic_ack(tag, multiple=true)` acks everything up to and
+    /// including this tag in a single round-trip.
+    pending_max_delivery_tag: Option<u64>,
+}
+
 /// RabbitMQ-backed implementation of `Backend`.
 ///
-/// Holds the AMQP URL rather than a long-lived connection — `lapin`
-/// builds connections on demand and channels are cheap. Matches the
-/// "config holder" pattern every other Backend in the framework
-/// uses.
-#[derive(Debug)]
+/// Holds the AMQP URL plus a lazily-initialized consumer session.
+/// The session holds the AMQP `Connection` + `Channel` + `Consumer`
+/// across `read_arrow_stream` calls so manual ack via
+/// `commit_offsets()` works — closing the channel would otherwise
+/// requeue the unacked deliveries.
 pub struct RabbitMQBackend {
     /// Full AMQP URI (`amqp://user:pass@host:port/vhost`).
     amqp_url: String,
@@ -101,6 +141,20 @@ pub struct RabbitMQBackend {
     /// "ematix-flow-consumer". Mostly informational for management
     /// UIs.
     consumer_tag: String,
+    /// Lazy consumer session. Populated on first
+    /// `read_arrow_stream`; reused on subsequent calls and
+    /// `commit_offsets`.
+    consumer_session: Arc<Mutex<Option<RabbitConsumerSession>>>,
+}
+
+impl std::fmt::Debug for RabbitMQBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RabbitMQBackend")
+            .field("amqp_url", &self.amqp_url)
+            .field("batch_config", &self.batch_config)
+            .field("consumer_tag", &self.consumer_tag)
+            .finish_non_exhaustive()
+    }
 }
 
 impl RabbitMQBackend {
@@ -126,6 +180,7 @@ impl RabbitMQBackend {
             amqp_url,
             batch_config: RabbitBatchConfig::default(),
             consumer_tag: "ematix-flow-consumer".to_string(),
+            consumer_session: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -154,6 +209,56 @@ impl RabbitMQBackend {
     /// Borrow the consumer tag prefix.
     pub fn consumer_tag(&self) -> &str {
         &self.consumer_tag
+    }
+
+    /// Test/observability hook: number of unacked deliveries
+    /// accumulated since the last `commit_offsets`. Returns 0 when
+    /// no session has been opened or no pending tag has accumulated.
+    pub async fn pending_delivery_count(&self) -> u64 {
+        // basic_ack(multiple=true) acks tag and everything below it
+        // on the channel, so the highest pending tag is a coarse
+        // upper bound on outstanding delivery count.
+        self.consumer_session
+            .lock()
+            .await
+            .as_ref()
+            .and_then(|s| s.pending_max_delivery_tag)
+            .unwrap_or_default()
+    }
+
+    /// Open the persistent consumer session: connect, create channel,
+    /// set per-channel prefetch via `basic_qos`, and start a
+    /// `basic_consume` with manual ack. The session lives until the
+    /// backend drops.
+    async fn open_consumer_session(
+        &self,
+        queue: &str,
+    ) -> Result<RabbitConsumerSession, BackendError> {
+        let connection = Connection::connect(&self.amqp_url, ConnectionProperties::default())
+            .await
+            .map_err(|e| BackendError::Connection(format!("rabbitmq connect: {e}")))?;
+        let channel = connection
+            .create_channel()
+            .await
+            .map_err(|e| BackendError::Connection(format!("rabbitmq channel: {e}")))?;
+        // basic_qos prefetch_count is u16 — clamp at u16::MAX.
+        let prefetch = self.batch_config.batch_size.min(u16::MAX as usize) as u16;
+        channel
+            .basic_qos(prefetch, BasicQosOptions::default())
+            .await
+            .map_err(|e| BackendError::Query(format!("rabbitmq basic_qos: {e}")))?;
+        let opts = BasicConsumeOptions::default(); // no_ack defaults to false → manual ack.
+        let consumer = channel
+            .basic_consume(queue, &self.consumer_tag, opts, FieldTable::default())
+            .await
+            .map_err(|e| BackendError::Query(format!("rabbitmq basic_consume {queue}: {e}")))?;
+        Ok(RabbitConsumerSession {
+            _connection: connection,
+            channel,
+            consumer,
+            queue: queue.to_string(),
+            pending_max_delivery_tag: None,
+        })
     }
 }
 
@@ -231,16 +336,20 @@ impl Backend for RabbitMQBackend {
     /// Returns an empty stream if the queue is empty (idle timeout
     /// fires immediately).
     ///
-    /// Limits in 37a.2 — folded out in later sub-phases:
+    /// Acks are deferred. The accumulated highest delivery tag is
+    /// remembered on the persistent consumer session and acked in
+    /// one round-trip when `commit_offsets()` fires — which the
+    /// `StreamingPipeline` triggers after the target backend has
+    /// durably written. This is the at-least-once primitive that
+    /// mirrors Kafka 36e.
+    ///
+    /// Limits in 37a.3 — folded out in later sub-phases:
     ///   - JSON-only payload decode (raw bytes / Avro / Protobuf
     ///     land later, mirroring Kafka's 36h trajectory).
-    ///   - Auto-ack: messages are acked at delivery rather than
-    ///     after a durable target write. 37a.3 wires manual ack
-    ///     through the strategy executors.
-    ///   - Single-shot drain: each call opens a fresh connection +
-    ///     channel and tears them down before returning. The long-
-    ///     running supervised-consumer pattern (Kafka 36g) will
-    ///     reuse a persistent channel.
+    ///   - Single queue per backend instance: the first call wins
+    ///     the queue binding; subsequent calls must target the same
+    ///     queue. Multi-queue fanout would need one
+    ///     `RabbitMQBackend` per queue.
     async fn read_arrow_stream(&self, query: &str) -> Result<ArrowBatchStream, BackendError> {
         let queue = query.trim();
         if queue.is_empty() {
@@ -249,49 +358,50 @@ impl Backend for RabbitMQBackend {
             ));
         }
 
-        let conn = Connection::connect(&self.amqp_url, ConnectionProperties::default())
-            .await
-            .map_err(|e| BackendError::Connection(format!("rabbitmq connect: {e}")))?;
-        let channel = conn
-            .create_channel()
-            .await
-            .map_err(|e| BackendError::Connection(format!("rabbitmq channel: {e}")))?;
-
-        let opts = BasicConsumeOptions {
-            no_ack: true, // 37a.2: auto-ack; manual ack lands in 37a.3.
-            ..BasicConsumeOptions::default()
-        };
-        let mut consumer = channel
-            .basic_consume(queue, &self.consumer_tag, opts, FieldTable::default())
-            .await
-            .map_err(|e| BackendError::Query(format!("rabbitmq basic_consume {queue}: {e}")))?;
-
         let cfg = self.batch_config.clone();
+        let mut session_lock = self.consumer_session.lock().await;
+        if session_lock.is_none() {
+            *session_lock = Some(self.open_consumer_session(queue).await?);
+        }
+        let session = session_lock.as_mut().expect("session populated above");
+        if session.queue != queue {
+            return Err(BackendError::Other(format!(
+                "RabbitMQ read_arrow_stream: this backend instance is already \
+                 bound to queue `{}`; multi-queue fanout would need separate \
+                 RabbitMQBackend instances",
+                session.queue
+            )));
+        }
+
         let idle = Duration::from_millis(cfg.idle_timeout_ms);
         let mut payloads: Vec<Vec<u8>> = Vec::new();
         let mut bytes_total: usize = 0;
+        let mut max_tag = session.pending_max_delivery_tag;
         loop {
-            match tokio::time::timeout(idle, consumer.next()).await {
+            match tokio::time::timeout(idle, session.consumer.next()).await {
                 Ok(Some(Ok(delivery))) => {
                     bytes_total += delivery.data.len();
+                    let tag = delivery.delivery_tag;
                     payloads.push(delivery.data);
+                    max_tag = Some(match max_tag {
+                        Some(m) if m > tag => m,
+                        _ => tag,
+                    });
                     if payloads.len() >= cfg.batch_size || bytes_total >= cfg.batch_bytes {
                         break;
                     }
                 }
                 Ok(Some(Err(e))) => {
-                    let _ = channel.close(0, "drain error").await;
-                    let _ = conn.close(0, "drain error").await;
                     return Err(BackendError::Query(format!("rabbitmq consume: {e}")));
                 }
                 // Stream ended (channel closed) or idle timeout — flush.
                 Ok(None) | Err(_) => break,
             }
         }
-        // Best-effort tear-down. If close fails we still have the
-        // payloads; drop will GC the connection.
-        let _ = channel.close(0, "ematix-flow drain done").await;
-        let _ = conn.close(0, "ematix-flow drain done").await;
+        session.pending_max_delivery_tag = max_tag;
+        // Drop the lock before decoding so a concurrent
+        // commit_offsets call doesn't wait on JSON parsing.
+        drop(session_lock);
 
         if payloads.is_empty() {
             let stream = futures_util::stream::empty();
@@ -487,6 +597,27 @@ impl Backend for RabbitMQBackend {
              Delta backend as the SCD2 target"
                 .into(),
         ))
+    }
+
+    /// Manually ack everything we've drained since the last commit.
+    /// Uses `basic_ack(highest_tag, multiple=true)` so all
+    /// accumulated deliveries are acked in one round-trip. No-ops
+    /// if there are no pending tags or no consumer session has been
+    /// opened.
+    async fn commit_offsets(&self) -> Result<(), BackendError> {
+        let mut session_lock = self.consumer_session.lock().await;
+        let Some(session) = session_lock.as_mut() else {
+            return Ok(());
+        };
+        let Some(tag) = session.pending_max_delivery_tag.take() else {
+            return Ok(());
+        };
+        session
+            .channel
+            .basic_ack(tag, BasicAckOptions { multiple: true })
+            .await
+            .map_err(|e| BackendError::Query(format!("rabbitmq basic_ack: {e}")))?;
+        Ok(())
     }
 }
 
