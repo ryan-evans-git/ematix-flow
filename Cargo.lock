@@ -3124,6 +3124,7 @@ dependencies = [
  "prometheus",
  "protofish",
  "rdkafka",
+ "reqwest 0.12.28",
  "rusqlite",
  "schema_registry_converter",
  "serde",

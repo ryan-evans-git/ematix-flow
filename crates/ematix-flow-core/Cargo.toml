@@ -52,4 +52,7 @@ arrow-array.workspace = true
 testcontainers.workspace = true
 testcontainers-modules.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+# Used only by the Pub/Sub Docker integration tests to declare a
+# topic + subscription on the emulator via its REST API.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 tempfile = "3"

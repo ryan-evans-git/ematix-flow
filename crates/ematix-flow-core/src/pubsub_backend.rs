@@ -25,12 +25,28 @@
 //!   - All five strategy executors stub with phase-marker errors,
 //!     mirroring the Kafka / RabbitMQ skeletons.
 //!
+//! ## What 37b.2 adds (Arrow IO)
+//!   - `read_arrow_stream(subscription)` — opens a streaming pull,
+//!     drains messages until idle for `batch_config.idle_timeout_ms`
+//!     or one of the size/byte limits is hit. Each payload is decoded
+//!     as a single JSON object and rows are concatenated into one
+//!     Arrow `RecordBatch` via arrow-json. `query` accepts either a
+//!     bare subscription name (will be qualified with the backend's
+//!     project_id) or a fully-qualified `projects/X/subscriptions/Y`.
+//!   - `write_arrow_stream(target, ...)` — encodes each row as JSONL
+//!     and publishes to `target.name` (bare topic name auto-qualified
+//!     with the backend's project_id, or pass `projects/X/topics/Y`
+//!     directly).
+//!   - `WriteMode::Truncate` is rejected — Pub/Sub topics are
+//!     append-only; purging is an admin-API operation.
+//!   - Auto-ack: each delivery is acked at receive time. Manual ack
+//!     with at-least-once semantics lands in 37b.3 — the Handler
+//!     returned by the SDK already nacks-on-drop, so 37b.3 will
+//!     simply hold the handlers in a session and call `ack()` from
+//!     `commit_offsets()`.
+//!
 //! ## What lands in 37b.x
-//!   - 37b.2 — Arrow IO: `read_arrow_stream(subscription)` via
-//!     pull-based subscriber, `write_arrow_stream(topic, ...)` via
-//!     publisher with batching.
-//!   - 37b.3 — manual ack with at-least-once delivery semantics
-//!     (tracks ack_ids; `commit_offsets()` issues `acknowledge` RPC).
+//!   - 37b.3 — manual ack with at-least-once delivery semantics.
 //!   - 37b.4 — DLQ via the Pub/Sub-native dead-letter-policy
 //!     attached at subscription declaration time + `nack` on
 //!     pull deliveries.
@@ -38,16 +54,44 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
+use futures_util::StreamExt;
 use google_cloud_auth::credentials::Credentials;
 use google_cloud_auth::credentials::anonymous::Builder as AnonymousAuthBuilder;
-use google_cloud_pubsub::client::TopicAdmin;
+use google_cloud_pubsub::client::{Publisher, Subscriber, TopicAdmin};
+use google_cloud_pubsub::model::Message;
 
 use crate::backend::{
     ArrowBatchStream, Backend, BackendError, DeleteHandling, Dialect, StrategyRunResult,
     StreamingKind, TargetTable, WriteMode,
 };
+use crate::kafka_backend::{decode_payloads_as_jsonl, encode_batch_as_jsonl_lines};
 use crate::pg::ConnectionInfo;
 use crate::types::TableSpec;
+
+/// Per-call drain limits for `read_arrow_stream`. First trigger
+/// flushes — the consumer returns whatever it has accumulated and
+/// callers can call `read_arrow_stream` again to continue. Mirrors
+/// `RabbitBatchConfig`.
+#[derive(Debug, Clone)]
+pub struct PubSubBatchConfig {
+    /// Max number of messages per call.
+    pub batch_size: usize,
+    /// Max bytes accumulated per call.
+    pub batch_bytes: usize,
+    /// Idle timeout (ms): if no message arrives within this window,
+    /// the call returns whatever it has (possibly empty).
+    pub idle_timeout_ms: u64,
+}
+
+impl Default for PubSubBatchConfig {
+    fn default() -> Self {
+        Self {
+            batch_size: 1000,
+            batch_bytes: 16 * 1024 * 1024, // 16 MiB
+            idle_timeout_ms: 2_000,
+        }
+    }
+}
 
 /// GCP Pub/Sub-backed implementation of `Backend`.
 ///
@@ -68,6 +112,9 @@ pub struct PubSubBackend {
     /// When true, ping/IO use anonymous credentials (no auth
     /// headers). Required for the emulator path.
     anonymous_auth: bool,
+    /// Per-call drain limits for `read_arrow_stream`. Builder-set
+    /// via `with_batch_config`.
+    batch_config: PubSubBatchConfig,
 }
 
 impl PubSubBackend {
@@ -85,7 +132,19 @@ impl PubSubBackend {
             project_id,
             endpoint: None,
             anonymous_auth: false,
+            batch_config: PubSubBatchConfig::default(),
         })
+    }
+
+    /// Override the per-call drain limits used by `read_arrow_stream`.
+    pub fn with_batch_config(mut self, cfg: PubSubBatchConfig) -> Self {
+        self.batch_config = cfg;
+        self
+    }
+
+    /// Borrow the active batch config.
+    pub fn batch_config(&self) -> &PubSubBatchConfig {
+        &self.batch_config
     }
 
     /// Override the gRPC endpoint. Use `http://<host>:<port>` for
@@ -136,6 +195,65 @@ impl PubSubBackend {
             .build()
             .await
             .map_err(|e| BackendError::Connection(format!("pubsub TopicAdmin build: {e}")))
+    }
+
+    /// Build a `Subscriber` client matching this backend's config.
+    /// Phase 37b.2 builds one per `read_arrow_stream` call; 37b.3
+    /// will keep it alive across calls in a session struct so
+    /// handlers can be retained between drain and ack.
+    async fn subscriber_client(&self) -> Result<Subscriber, BackendError> {
+        let mut builder = Subscriber::builder();
+        if let Some(ep) = &self.endpoint {
+            builder = builder.with_endpoint(ep.clone());
+        }
+        if self.anonymous_auth {
+            let creds: Credentials = AnonymousAuthBuilder::new().build();
+            builder = builder.with_credentials(creds);
+        }
+        builder
+            .build()
+            .await
+            .map_err(|e| BackendError::Connection(format!("pubsub Subscriber build: {e}")))
+    }
+
+    /// Build a per-topic `Publisher` client matching this backend's
+    /// config. The Publisher batches publishes internally; for
+    /// one-shot drains we just construct a fresh one per
+    /// `write_arrow_stream` call.
+    async fn publisher_client(&self, topic: &str) -> Result<Publisher, BackendError> {
+        let mut builder = Publisher::builder(topic.to_string());
+        if let Some(ep) = &self.endpoint {
+            builder = builder.with_endpoint(ep.clone());
+        }
+        if self.anonymous_auth {
+            let creds: Credentials = AnonymousAuthBuilder::new().build();
+            builder = builder.with_credentials(creds);
+        }
+        builder
+            .build()
+            .await
+            .map_err(|e| BackendError::Connection(format!("pubsub Publisher build: {e}")))
+    }
+
+    /// Qualify a bare subscription name with this backend's
+    /// project_id. If the input already starts with `projects/`,
+    /// pass it through unchanged.
+    fn qualify_subscription(&self, name: &str) -> String {
+        if name.starts_with("projects/") {
+            name.to_string()
+        } else {
+            format!("projects/{}/subscriptions/{}", self.project_id, name)
+        }
+    }
+
+    /// Qualify a bare topic name with this backend's project_id.
+    /// Same passthrough behavior as `qualify_subscription`.
+    fn qualify_topic(&self, name: &str) -> String {
+        if name.starts_with("projects/") {
+            name.to_string()
+        } else {
+            format!("projects/{}/topics/{}", self.project_id, name)
+        }
     }
 }
 
@@ -204,45 +322,185 @@ impl Backend for PubSubBackend {
         ))
     }
 
-    /// Arrow consume — stub for 37b.2.
-    async fn read_arrow_stream(&self, _query: &str) -> Result<ArrowBatchStream, BackendError> {
-        Err(BackendError::Other(
-            "Pub/Sub read_arrow_stream: lands in Phase 37b.2 \
-             (subscription pull → Arrow batches via google-cloud-pubsub \
-             Subscriber + arrow-json)"
-                .into(),
-        ))
+    /// Subscribe to `query` (subscription name; bare or
+    /// fully-qualified) and drain messages until idle for
+    /// `batch_config.idle_timeout_ms` or one of the size/byte
+    /// limits hits. Each payload is decoded as a single JSON
+    /// object and rows are concatenated into one Arrow `RecordBatch`.
+    /// Schema is inferred from the first 1024 messages (arrow-json
+    /// default).
+    ///
+    /// Returns an empty stream if the subscription has no pending
+    /// messages (idle timeout fires immediately).
+    ///
+    /// Limits in 37b.2 — folded out in later sub-phases:
+    ///   - JSON-only payload decode.
+    ///   - Auto-ack: each delivery is acked at receive time.
+    ///     37b.3 adds manual ack via `commit_offsets()`.
+    ///   - Single-shot drain: each call opens a fresh streaming
+    ///     pull and tears it down before returning.
+    async fn read_arrow_stream(&self, query: &str) -> Result<ArrowBatchStream, BackendError> {
+        let subscription = query.trim();
+        if subscription.is_empty() {
+            return Err(BackendError::Other(
+                "Pub/Sub read_arrow_stream: query argument must be a non-empty \
+                 subscription name"
+                    .into(),
+            ));
+        }
+        let subscription_name = self.qualify_subscription(subscription);
+
+        let client = self.subscriber_client().await?;
+        let mut stream = client.subscribe(subscription_name).build();
+
+        let cfg = self.batch_config.clone();
+        let idle = Duration::from_millis(cfg.idle_timeout_ms);
+        let mut payloads: Vec<Vec<u8>> = Vec::new();
+        let mut bytes_total: usize = 0;
+        loop {
+            match tokio::time::timeout(idle, stream.next()).await {
+                Ok(Some(Ok((message, handler)))) => {
+                    bytes_total += message.data.len();
+                    payloads.push(message.data.to_vec());
+                    // 37b.2: auto-ack at receive time. 37b.3 will
+                    // hold these in a session and ack from
+                    // commit_offsets() instead.
+                    handler.ack();
+                    if payloads.len() >= cfg.batch_size || bytes_total >= cfg.batch_bytes {
+                        break;
+                    }
+                }
+                Ok(Some(Err(e))) => {
+                    return Err(BackendError::Query(format!("pubsub stream error: {e}")));
+                }
+                // None = end-of-stream (the SDK keeps the stream
+                // open in practice, so this is rare). Err = idle
+                // timeout — flush.
+                Ok(None) | Err(_) => break,
+            }
+        }
+        // Drop the stream → drops the lease loop. Any acks queued
+        // before drop should fire before the loop's UnboundedSender
+        // is closed.
+        drop(stream);
+
+        if payloads.is_empty() {
+            let stream = futures_util::stream::empty();
+            return Ok(Box::pin(stream));
+        }
+        let batches = decode_payloads_as_jsonl(payloads)?;
+        let stream = futures_util::stream::iter(batches.into_iter().map(Ok));
+        Ok(Box::pin(stream))
     }
 
-    /// Arrow produce — stub for 37b.2.
+    /// Produce each Arrow row as a Pub/Sub message to `target.name`
+    /// (topic; bare or fully-qualified). Each batch is encoded as
+    /// JSONL and split row-wise; one `publish` per row. The
+    /// returned `PublishFuture` is awaited so the message_id is
+    /// confirmed before we count the row. `WriteMode::Truncate` is
+    /// rejected — Pub/Sub topics aren't truncatable from a producer.
+    ///
+    /// Limits in 37b.2 — folded out in later sub-phases:
+    ///   - JSON-only payload encode.
+    ///   - One `Publisher` per call (the SDK's internal batching
+    ///     is per-Publisher, so per-call clients miss some
+    ///     batching opportunity. 37b.3 / pipeline-level reuse
+    ///     can amortize that.)
     async fn write_arrow_stream(
         &self,
-        _target: &TargetTable,
-        _stream: ArrowBatchStream,
-        _mode: WriteMode,
+        target: &TargetTable,
+        stream: ArrowBatchStream,
+        mode: WriteMode,
     ) -> Result<u64, BackendError> {
-        Err(BackendError::Other(
-            "Pub/Sub write_arrow_stream: lands in Phase 37b.2 \
-             (Arrow batches → topic via google-cloud-pubsub Publisher)"
-                .into(),
-        ))
+        if mode == WriteMode::Truncate {
+            return Err(BackendError::Other(
+                "Pub/Sub write_arrow_stream: Truncate is not supported on a topic. \
+                 Topics are append-only; to start fresh, delete and recreate the \
+                 topic via gcloud / the Pub/Sub admin API."
+                    .into(),
+            ));
+        }
+        let topic = target.name.trim();
+        if topic.is_empty() {
+            return Err(BackendError::Other(
+                "Pub/Sub write_arrow_stream: target.name (topic) must be non-empty".into(),
+            ));
+        }
+        let topic_name = self.qualify_topic(topic);
+        let publisher = self.publisher_client(&topic_name).await?;
+
+        let mut s = stream;
+        let mut total: u64 = 0;
+        while let Some(batch) = s.next().await {
+            let batch = batch?;
+            if batch.num_rows() == 0 {
+                continue;
+            }
+            let payloads = encode_batch_as_jsonl_lines(&batch)?;
+            // Publish all rows of the batch concurrently and await
+            // the message-ids — the SDK returns a Future per
+            // publish that resolves after the broker ack.
+            let mut futures = Vec::with_capacity(payloads.len());
+            for payload in payloads {
+                let msg = Message::new().set_data(payload);
+                futures.push(publisher.publish(msg));
+            }
+            for fut in futures {
+                fut.await
+                    .map_err(|e| BackendError::Query(format!("pubsub publish: {e}")))?;
+                total += 1;
+            }
+        }
+        Ok(total)
     }
 
+    /// Cross-backend produce-side run_append: read source rows via
+    /// the source's `read_arrow_stream`, produce them to
+    /// `spec.name` (the topic) via `write_arrow_stream`. Mirrors
+    /// the Kafka / RabbitMQ run_append shape.
     async fn run_append(
         &self,
-        _spec: &TableSpec,
-        _source_query: &str,
+        spec: &TableSpec,
+        source_query: &str,
         _pipeline_name: &str,
-        _source_backend: Option<&dyn Backend>,
+        source_backend: Option<&dyn Backend>,
         _incremental_column: Option<&str>,
         _last_value_literal: Option<&str>,
-        _dry_run: bool,
+        dry_run: bool,
     ) -> Result<StrategyRunResult, BackendError> {
-        Err(BackendError::Other(
-            "Pub/Sub run_append: lands in Phase 37b.2+ once \
-             write_arrow_stream is implemented"
-                .into(),
-        ))
+        let source = source_backend.ok_or_else(|| {
+            BackendError::Other(
+                "Pub/Sub run_append: source_backend is required (cross-backend produce)".into(),
+            )
+        })?;
+        if dry_run {
+            return Ok(StrategyRunResult {
+                run_id: String::new(),
+                rows_inserted: 0,
+                rows_updated: None,
+                rows_unchanged: None,
+                rows_closed: None,
+                status: "dry-run".into(),
+                path: format!("pubsub:{}", self.qualify_topic(&spec.name)),
+            });
+        }
+        let target = TargetTable {
+            schema: spec.schema.clone(),
+            name: spec.name.clone(),
+        };
+        let stream = source.read_arrow_stream(source_query).await?;
+        let n = self
+            .write_arrow_stream(&target, stream, WriteMode::Append)
+            .await?;
+        Ok(StrategyRunResult {
+            run_id: String::new(),
+            rows_inserted: n as i64,
+            rows_updated: None,
+            rows_unchanged: None,
+            rows_closed: None,
+            status: "ok".into(),
+            path: format!("pubsub:{}", self.qualify_topic(&spec.name)),
+        })
     }
 
     /// `Truncate` on a topic isn't a producer-side operation — it's
@@ -425,18 +683,18 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn read_arrow_stream_rejects_with_pointer_to_37b_2() {
+    async fn read_arrow_stream_rejects_empty_subscription_name() {
         let b = PubSubBackend::open("p").unwrap();
-        let err = match b.read_arrow_stream("any-sub").await {
-            Ok(_) => panic!("expected stub rejection"),
+        let err = match b.read_arrow_stream("   ").await {
+            Ok(_) => panic!("expected empty-subscription rejection"),
             Err(e) => e,
         };
         let msg = err.to_string();
-        assert!(msg.contains("Phase 37b.2"), "got: {msg}");
+        assert!(msg.contains("non-empty subscription name"), "got: {msg}");
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn write_arrow_stream_rejects_with_pointer_to_37b_2() {
+    async fn write_arrow_stream_truncate_rejects() {
         let b = PubSubBackend::open("p").unwrap();
         let target = TargetTable {
             schema: "".into(),
@@ -444,11 +702,121 @@ mod tests {
         };
         let stream = Box::pin(futures_util::stream::empty());
         let err = b
+            .write_arrow_stream(&target, stream, WriteMode::Truncate)
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("Truncate is not supported"), "got: {msg}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn write_arrow_stream_rejects_empty_topic_name() {
+        let b = PubSubBackend::open("p").unwrap();
+        let target = TargetTable {
+            schema: "".into(),
+            name: "   ".into(),
+        };
+        let stream = Box::pin(futures_util::stream::empty());
+        let err = b
             .write_arrow_stream(&target, stream, WriteMode::Append)
             .await
             .unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("Phase 37b.2"), "got: {msg}");
+        assert!(msg.contains("must be non-empty"), "got: {msg}");
+    }
+
+    #[test]
+    fn batch_config_defaults_are_reasonable() {
+        let cfg = PubSubBatchConfig::default();
+        assert!(cfg.batch_size >= 100);
+        assert!(cfg.batch_bytes >= 1 << 20);
+        assert!(cfg.idle_timeout_ms >= 500);
+    }
+
+    #[test]
+    fn with_batch_config_overrides_default() {
+        let b = PubSubBackend::open("p")
+            .unwrap()
+            .with_batch_config(PubSubBatchConfig {
+                batch_size: 7,
+                batch_bytes: 99,
+                idle_timeout_ms: 11,
+            });
+        assert_eq!(b.batch_config().batch_size, 7);
+        assert_eq!(b.batch_config().batch_bytes, 99);
+        assert_eq!(b.batch_config().idle_timeout_ms, 11);
+    }
+
+    #[test]
+    fn qualify_subscription_prefixes_bare_name() {
+        let b = PubSubBackend::open("my-project").unwrap();
+        assert_eq!(
+            b.qualify_subscription("my-sub"),
+            "projects/my-project/subscriptions/my-sub"
+        );
+    }
+
+    #[test]
+    fn qualify_subscription_passes_through_fully_qualified() {
+        let b = PubSubBackend::open("my-project").unwrap();
+        let fq = "projects/other-project/subscriptions/my-sub";
+        assert_eq!(b.qualify_subscription(fq), fq);
+    }
+
+    #[test]
+    fn qualify_topic_prefixes_bare_name() {
+        let b = PubSubBackend::open("my-project").unwrap();
+        assert_eq!(
+            b.qualify_topic("my-topic"),
+            "projects/my-project/topics/my-topic"
+        );
+    }
+
+    #[test]
+    fn qualify_topic_passes_through_fully_qualified() {
+        let b = PubSubBackend::open("my-project").unwrap();
+        let fq = "projects/other-project/topics/my-topic";
+        assert_eq!(b.qualify_topic(fq), fq);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn run_append_requires_source_backend() {
+        let b = PubSubBackend::open("p").unwrap();
+        let spec = TableSpec {
+            schema: "".into(),
+            name: "t".into(),
+            columns: vec![],
+            unique_constraints: vec![],
+            fingerprint: String::new(),
+        };
+        let err = b
+            .run_append(&spec, "x", "p", None, None, None, false)
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("source_backend is required"), "got: {msg}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn run_append_dry_run_returns_zero_inserts_without_io() {
+        let b = PubSubBackend::open("my-project").unwrap();
+        let spec = TableSpec {
+            schema: "".into(),
+            name: "t".into(),
+            columns: vec![],
+            unique_constraints: vec![],
+            fingerprint: String::new(),
+        };
+        // Construct a noop "source" via the pubsub backend itself —
+        // dry_run skips IO before it actually calls the source.
+        let other = PubSubBackend::open("my-project").unwrap();
+        let res = b
+            .run_append(&spec, "x", "p", Some(&other), None, None, true)
+            .await
+            .unwrap();
+        assert_eq!(res.rows_inserted, 0);
+        assert_eq!(res.status, "dry-run");
+        assert_eq!(res.path, "pubsub:projects/my-project/topics/t");
     }
 
     #[tokio::test(flavor = "multi_thread")]

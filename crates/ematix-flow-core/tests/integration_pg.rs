@@ -4739,6 +4739,55 @@ async fn start_pubsub_emulator() -> (testcontainers::ContainerAsync<CloudSdk>, S
     (container, endpoint)
 }
 
+/// Helper: create a topic + subscription on the emulator using its
+/// REST endpoints directly. The Pub/Sub admin client builds REST
+/// bodies that the emulator finds invalid, so we use reqwest
+/// against the standard /v1 paths. Pub/Sub can't auto-create
+/// either resource: the producer fails with NOT_FOUND if the topic
+/// is missing, and streaming pull returns NOT_FOUND for an unknown
+/// subscription.
+async fn pubsub_create_topic_and_subscription(
+    endpoint: &str,
+    project_id: &str,
+    topic: &str,
+    subscription: &str,
+) {
+    let client = reqwest::Client::new();
+
+    let topic_url = format!("{endpoint}/v1/projects/{project_id}/topics/{topic}");
+    let resp = client
+        .put(&topic_url)
+        .header("content-type", "application/json")
+        .body("{}")
+        .send()
+        .await
+        .expect("create_topic send");
+    assert!(
+        resp.status().is_success(),
+        "create_topic status {}: {}",
+        resp.status(),
+        resp.text().await.unwrap_or_default()
+    );
+
+    let sub_url = format!("{endpoint}/v1/projects/{project_id}/subscriptions/{subscription}");
+    let body = serde_json::json!({
+        "topic": format!("projects/{project_id}/topics/{topic}"),
+    });
+    let resp = client
+        .put(&sub_url)
+        .header("content-type", "application/json")
+        .body(body.to_string())
+        .send()
+        .await
+        .expect("create_subscription send");
+    assert!(
+        resp.status().is_success(),
+        "create_subscription status {}: {}",
+        resp.status(),
+        resp.text().await.unwrap_or_default()
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs Docker; run with `cargo test -- --ignored`"]
 async fn pubsub_backend_ping_against_emulator() {
@@ -4755,6 +4804,121 @@ async fn pubsub_backend_ping_against_emulator() {
     let info = backend.connection_info();
     assert_eq!(info.user, "ematix-test-project");
     assert_eq!(info.dbname, endpoint);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker; run with `cargo test -- --ignored`"]
+async fn pubsub_write_then_read_round_trip() {
+    use arrow_array::{Int64Array, StringArray};
+    use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+    use ematix_flow_core::backend::WriteMode;
+    use ematix_flow_core::pubsub_backend::PubSubBatchConfig;
+
+    let (_container, endpoint) = start_pubsub_emulator().await;
+    let project = "ematix-test-project";
+    let topic = "rt-topic";
+    let subscription = "rt-subscription";
+    pubsub_create_topic_and_subscription(&endpoint, project, topic, subscription).await;
+
+    // Produce 3 rows.
+    let producer = PubSubBackend::open(project)
+        .unwrap()
+        .with_endpoint(endpoint.clone())
+        .with_anonymous_auth();
+    let arrow_schema = Arc::new(ArrowSchema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("label", DataType::Utf8, false),
+    ]));
+    let batch = arrow_array::RecordBatch::try_new(
+        arrow_schema,
+        vec![
+            Arc::new(Int64Array::from(vec![1_i64, 2, 3])),
+            Arc::new(StringArray::from(vec!["alpha", "beta", "gamma"])),
+        ],
+    )
+    .unwrap();
+    let target = ematix_flow_core::backend::TargetTable {
+        schema: "".into(),
+        name: topic.into(),
+    };
+    let stream: ematix_flow_core::backend::ArrowBatchStream =
+        Box::pin(futures_util::stream::once(async move {
+            Ok::<_, ematix_flow_core::BackendError>(batch)
+        }));
+    let n = producer
+        .write_arrow_stream(&target, stream, WriteMode::Append)
+        .await
+        .unwrap();
+    assert_eq!(n, 3);
+
+    // Consume.
+    let consumer = PubSubBackend::open(project)
+        .unwrap()
+        .with_endpoint(endpoint.clone())
+        .with_anonymous_auth()
+        .with_batch_config(PubSubBatchConfig {
+            batch_size: 100,
+            batch_bytes: 1 << 20,
+            // Pub/Sub's streaming pull takes longer to warm up
+            // than RabbitMQ — give it room.
+            idle_timeout_ms: 5_000,
+        });
+    let stream = consumer.read_arrow_stream(subscription).await.unwrap();
+    let batches: Vec<_> = stream.try_collect().await.unwrap();
+    let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total, 3, "expected 3 rows; got {total}");
+
+    let mut ids: Vec<i64> = Vec::new();
+    let mut labels: Vec<String> = Vec::new();
+    for b in &batches {
+        let id_col = b
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let lb_col = b
+            .column_by_name("label")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        for i in 0..b.num_rows() {
+            ids.push(id_col.value(i));
+            labels.push(lb_col.value(i).to_string());
+        }
+    }
+    ids.sort_unstable();
+    assert_eq!(ids, vec![1, 2, 3]);
+    assert!(labels.contains(&"alpha".to_string()));
+    assert!(labels.contains(&"beta".to_string()));
+    assert!(labels.contains(&"gamma".to_string()));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker; run with `cargo test -- --ignored`"]
+async fn pubsub_read_empty_subscription_returns_empty_stream() {
+    use ematix_flow_core::pubsub_backend::PubSubBatchConfig;
+
+    let (_container, endpoint) = start_pubsub_emulator().await;
+    let project = "ematix-test-project";
+    let topic = "empty-topic";
+    let subscription = "empty-sub";
+    pubsub_create_topic_and_subscription(&endpoint, project, topic, subscription).await;
+
+    let consumer = PubSubBackend::open(project)
+        .unwrap()
+        .with_endpoint(endpoint)
+        .with_anonymous_auth()
+        .with_batch_config(PubSubBatchConfig {
+            batch_size: 100,
+            batch_bytes: 1 << 20,
+            idle_timeout_ms: 1_500,
+        });
+    let stream = consumer.read_arrow_stream(subscription).await.unwrap();
+    let batches: Vec<_> = stream.try_collect().await.unwrap();
+    let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total, 0);
 }
 
 // ----- Phase 37a: RabbitMQBackend ping ---------------------------------
