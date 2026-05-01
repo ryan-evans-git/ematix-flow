@@ -299,6 +299,16 @@ pub trait Backend: Send + Sync {
         ttl_seconds: Option<i64>,
         dry_run: bool,
     ) -> Result<StrategyRunResult, BackendError>;
+
+    /// Phase 36e/g: commit any source-side checkpoint state
+    /// accumulated by prior `read_arrow_stream` calls. Default
+    /// implementation is a no-op — most backends have no
+    /// "committed-offset" notion. Kafka overrides to commit consumer
+    /// offsets after the target backend has durably written, which
+    /// is the at-least-once primitive used by `StreamingPipeline`.
+    async fn commit_offsets(&self) -> Result<(), BackendError> {
+        Ok(())
+    }
 }
 
 /// Re-export for trait method signatures.

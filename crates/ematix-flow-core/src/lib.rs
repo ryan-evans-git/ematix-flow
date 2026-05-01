@@ -15,6 +15,7 @@ pub mod pg;
 pub mod spec;
 pub mod sqlite_backend;
 pub mod strategy;
+pub mod streaming;
 pub mod types;
 
 pub use backend::{Backend, BackendError, Dialect, ObjectFormat, PostgresBackend, StreamingKind};

@@ -4272,3 +4272,112 @@ async fn kafka_commit_offsets_no_op_with_no_consumer() {
     let backend = KafkaBackend::open(&bootstrap, Some("commit-noop")).unwrap();
     backend.commit_offsets().await.unwrap();
 }
+
+// ----- Phase 36g: StreamingPipeline (Kafka → SQLite end-to-end) ----------
+
+use ematix_flow_core::streaming::{ShutdownSignal, StreamingPipeline, StreamingPipelineConfig};
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker; run with `cargo test -- --ignored`"]
+async fn streaming_pipeline_kafka_to_sqlite_end_to_end() {
+    use arrow_array::Int64Array;
+
+    let (_container, bootstrap) = start_kafka().await;
+    let topic = "stream-pipeline-test";
+
+    // Produce 7 messages with id field.
+    let payloads: Vec<String> = (1..=7).map(|i| format!(r#"{{"id": {i}}}"#)).collect();
+    let payload_refs: Vec<&str> = payloads.iter().map(|s| s.as_str()).collect();
+    produce_json_messages(&bootstrap, topic, &payload_refs).await;
+
+    // Source: Kafka with a tight batch config so the loop iterates
+    // a few times before draining. Tight idle_pause so empty-batch
+    // sleeps don't dominate the test wall time.
+    let source: Arc<dyn Backend> = Arc::new(
+        ematix_flow_core::KafkaBackend::open(&bootstrap, Some("stream-pipeline-grp"))
+            .unwrap()
+            .with_batch_config(ematix_flow_core::kafka_backend::KafkaBatchConfig {
+                batch_size: 3,
+                idle_timeout_ms: 1_500,
+                batch_window_ms: 10_000,
+                ..Default::default()
+            }),
+    );
+
+    // Target: in-memory SQLite. Schema must match the JSON payload —
+    // arrow-json infers `id` as Int64.
+    let target_backend: Arc<dyn Backend> =
+        Arc::new(ematix_flow_core::SQLiteBackend::open(":memory:").unwrap());
+    target_backend
+        .execute("CREATE TABLE events (id BIGINT)")
+        .await
+        .unwrap();
+
+    let config = StreamingPipelineConfig::new(
+        topic,
+        TargetTable {
+            schema: "main".into(),
+            name: "events".into(),
+        },
+        "stream-test",
+    );
+
+    let pipeline = StreamingPipeline::new(source, Arc::clone(&target_backend), config);
+
+    // Drive the pipeline; trigger shutdown after a short delay so it
+    // gets a chance to drain the topic. 5 seconds covers Kafka
+    // rebalance (15s first-message timeout) — but we expect the
+    // first read to hit before that.
+    let (sig, trigger) = ShutdownSignal::new();
+    let pipeline_handle = tokio::spawn(async move { pipeline.run(sig).await });
+
+    // Poll the target until we see all 7 rows or hit a timeout.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+        let stream = target_backend
+            .read_arrow_stream("SELECT count(*) FROM events")
+            .await
+            .unwrap();
+        let batches: Vec<_> = stream.try_collect().await.unwrap();
+        let n = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0);
+        if n >= 7 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+    trigger.trigger();
+    let metrics = pipeline_handle.await.unwrap().unwrap();
+
+    assert!(metrics.shutdown_triggered);
+    assert_eq!(
+        metrics.total_rows, 7,
+        "all 7 produced rows landed in target"
+    );
+    assert!(
+        metrics.iterations >= 1,
+        "at least one read→write cycle ran (got {})",
+        metrics.iterations
+    );
+
+    // Sanity: target has exactly 7 rows.
+    let stream = target_backend
+        .read_arrow_stream("SELECT count(*) FROM events")
+        .await
+        .unwrap();
+    let batches: Vec<_> = stream.try_collect().await.unwrap();
+    let n = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(n, 7);
+}

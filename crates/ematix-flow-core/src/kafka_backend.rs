@@ -950,6 +950,18 @@ impl Backend for KafkaBackend {
                 .into(),
         ))
     }
+
+    /// Override the trait's default-noop `commit_offsets` to fire
+    /// the inherent `KafkaBackend::commit_offsets`. This way the
+    /// `StreamingPipeline` runner can call `source.commit_offsets()`
+    /// through `&dyn Backend` and have the right thing happen for
+    /// Kafka sources without downcasting.
+    async fn commit_offsets(&self) -> Result<(), BackendError> {
+        // Fully-qualified path to avoid recursing into this trait
+        // method. The inherent method has the same name (the existing
+        // 36e API surface) and that's intentional.
+        Self::commit_offsets(self).await
+    }
 }
 
 /// How long to wait for the first message after subscribing. The
