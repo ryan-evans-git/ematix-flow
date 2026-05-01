@@ -46,6 +46,13 @@ use crate::backend::{
 use crate::pg::ConnectionInfo;
 use crate::types::TableSpec;
 
+/// Path prefix under the object-store root where run_history JSONL
+/// events are written. One file per run, named by run_id, so writes
+/// are conflict-free under concurrent execution. Lives next to the
+/// data prefixes — a peer with a leading underscore so a `target/`
+/// listing won't surface them.
+const RUN_HISTORY_PREFIX: &str = "_ematix_flow/run_history";
+
 /// Object-store backend.
 ///
 /// Construct with [`ObjectStoreBackend::open_local`] for a local-FS
@@ -523,6 +530,64 @@ async fn write_orc_at_path(
     Ok(total)
 }
 
+/// ISO-8601 timestamp for "now" with millisecond precision and a `Z`
+/// suffix. We don't pull in `chrono` for this — the format is
+/// stable enough to format directly from `SystemTime`.
+fn chrono_compat_iso8601_now() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let since_epoch = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    let total_secs = since_epoch.as_secs() as i64;
+    let millis = since_epoch.subsec_millis();
+    let days = total_secs.div_euclid(86_400);
+    let time_secs = total_secs.rem_euclid(86_400);
+    let h = time_secs / 3600;
+    let mi = (time_secs % 3600) / 60;
+    let s = time_secs % 60;
+    let (y, mo, d) = civil_from_days(days);
+    format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}.{millis:03}Z")
+}
+
+/// Howard Hinnant's chrono::civil_from_days. Mirrors the same helper
+/// in `mysql_backend.rs` — kept local so this module has no
+/// cross-backend imports just for one date routine.
+fn civil_from_days(z: i64) -> (i32, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y as i32, m as u32, d as u32)
+}
+
+/// Append a run-history event as a one-line JSON document at
+/// `_ematix_flow/run_history/<run_id>.jsonl`. Object stores have no
+/// SQL surface and append-to-existing-object semantics vary across
+/// providers (S3 has none; Azure has Append Blobs but not on every
+/// SKU), so each run gets its own file. Reading back is a prefix scan
+/// + JSONL parse.
+async fn record_run_event(
+    store: &Arc<dyn ObjectStore>,
+    run_id: &uuid::Uuid,
+    event: &serde_json::Value,
+) -> Result<(), BackendError> {
+    let path = ObjectPath::from(format!("{RUN_HISTORY_PREFIX}/{}.jsonl", run_id.simple()));
+    let mut bytes = serde_json::to_vec(event)
+        .map_err(|e| BackendError::Other(format!("run-history serialize: {e}")))?;
+    bytes.push(b'\n');
+    store
+        .put(&path, Bytes::from(bytes).into())
+        .await
+        .map_err(|e| BackendError::Connection(format!("run-history put: {e}")))?;
+    Ok(())
+}
+
 /// Delete every object under `prefix`. Used by `WriteMode::Truncate`.
 /// Walks the listing and issues per-object deletes — `object_store`
 /// has no atomic prefix-delete primitive (S3/Azure/GCS don't either,
@@ -623,30 +688,139 @@ impl Backend for ObjectStoreBackend {
 
     async fn run_append(
         &self,
-        _spec: &TableSpec,
-        _source_query: &str,
-        _pipeline_name: &str,
-        _source_backend: Option<&dyn Backend>,
-        _incremental_column: Option<&str>,
-        _last_value_literal: Option<&str>,
-        _dry_run: bool,
+        spec: &TableSpec,
+        source_query: &str,
+        pipeline_name: &str,
+        source_backend: Option<&dyn Backend>,
+        incremental_column: Option<&str>,
+        last_value_literal: Option<&str>,
+        dry_run: bool,
     ) -> Result<StrategyRunResult, BackendError> {
-        Err(BackendError::Other(
-            "ObjectStore run_append lands in Phase 34f".into(),
-        ))
+        let source = source_backend.ok_or_else(|| {
+            BackendError::Other(
+                "ObjectStore run_append: source_backend is required \
+                 (object store is a target only — there is no same-DB \
+                 path because raw files have no SQL surface)"
+                    .into(),
+            )
+        })?;
+        // Watermark filter is wrapped at the SQL layer in the source's
+        // dialect — same as every DB-target backend. The object-store
+        // target itself doesn't track watermarks (no MAX-queryable
+        // surface); users running incremental loads to object storage
+        // must persist `last_value_literal` externally.
+        let watermark = incremental_column.map(|c| crate::meta::WatermarkConfig {
+            column: c.to_string(),
+            last_value_literal: last_value_literal.map(|s| s.to_string()),
+        });
+        let filtered_source =
+            crate::meta::wrap_with_watermark_filter(source_query, watermark.as_ref());
+
+        let run_id = uuid::Uuid::now_v7();
+        let started_at = chrono_compat_iso8601_now();
+        let target = TargetTable {
+            schema: spec.schema.clone(),
+            name: spec.name.clone(),
+        };
+
+        let inserted: u64 = if dry_run {
+            // Probe the source so a missing query / bad credentials
+            // surfaces; do not write to the target.
+            let _ = source.read_arrow_stream(&filtered_source).await?;
+            0
+        } else {
+            let stream = source.read_arrow_stream(&filtered_source).await?;
+            self.write_arrow_stream(&target, stream, WriteMode::Append)
+                .await?
+        };
+        let finished_at = chrono_compat_iso8601_now();
+        let event = serde_json::json!({
+            "run_id": run_id.to_string(),
+            "pipeline_name": pipeline_name,
+            "target_schema": spec.schema,
+            "target_table": spec.name,
+            "mode": "append",
+            "path": "cross_backend",
+            "started_at": started_at,
+            "finished_at": finished_at,
+            "status": if dry_run { "dry_run" } else { "success" },
+            "rows_inserted": inserted,
+            "format": format!("{:?}", self.format),
+        });
+        // Best-effort: history-write failure doesn't unwind the data
+        // write. Surface the error so callers can decide.
+        record_run_event(&self.store, &run_id, &event).await?;
+
+        Ok(StrategyRunResult {
+            run_id: run_id.to_string(),
+            rows_inserted: inserted as i64,
+            rows_updated: None,
+            rows_unchanged: None,
+            rows_closed: None,
+            status: if dry_run { "dry_run" } else { "success" }.into(),
+            path: "cross_backend".into(),
+        })
     }
 
     async fn run_truncate(
         &self,
-        _spec: &TableSpec,
-        _source_query: &str,
-        _pipeline_name: &str,
-        _source_backend: Option<&dyn Backend>,
-        _dry_run: bool,
+        spec: &TableSpec,
+        source_query: &str,
+        pipeline_name: &str,
+        source_backend: Option<&dyn Backend>,
+        dry_run: bool,
     ) -> Result<StrategyRunResult, BackendError> {
-        Err(BackendError::Other(
-            "ObjectStore run_truncate lands in Phase 34f".into(),
-        ))
+        let source = source_backend.ok_or_else(|| {
+            BackendError::Other(
+                "ObjectStore run_truncate: source_backend is required \
+                 (object store is a target only)"
+                    .into(),
+            )
+        })?;
+        let run_id = uuid::Uuid::now_v7();
+        let started_at = chrono_compat_iso8601_now();
+        let target = TargetTable {
+            schema: spec.schema.clone(),
+            name: spec.name.clone(),
+        };
+
+        let inserted: u64 = if dry_run {
+            // Touch the source but do not delete or write — a truncate
+            // dry-run is a true no-op against the target.
+            let _ = source.read_arrow_stream(source_query).await?;
+            0
+        } else {
+            let stream = source.read_arrow_stream(source_query).await?;
+            // `write_arrow_stream` with WriteMode::Truncate deletes
+            // every existing object under the prefix before writing.
+            self.write_arrow_stream(&target, stream, WriteMode::Truncate)
+                .await?
+        };
+        let finished_at = chrono_compat_iso8601_now();
+        let event = serde_json::json!({
+            "run_id": run_id.to_string(),
+            "pipeline_name": pipeline_name,
+            "target_schema": spec.schema,
+            "target_table": spec.name,
+            "mode": "truncate",
+            "path": "cross_backend",
+            "started_at": started_at,
+            "finished_at": finished_at,
+            "status": if dry_run { "dry_run" } else { "success" },
+            "rows_inserted": inserted,
+            "format": format!("{:?}", self.format),
+        });
+        record_run_event(&self.store, &run_id, &event).await?;
+
+        Ok(StrategyRunResult {
+            run_id: run_id.to_string(),
+            rows_inserted: inserted as i64,
+            rows_updated: None,
+            rows_unchanged: None,
+            rows_closed: None,
+            status: if dry_run { "dry_run" } else { "success" }.into(),
+            path: "cross_backend".into(),
+        })
     }
 
     /// merge has no native impl on raw object storage — files are
@@ -1031,5 +1205,208 @@ mod tests {
             .unwrap();
         let total: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total, 3, "old files removed by truncate");
+    }
+
+    // --- Phase 34f: run_append + run_truncate (DuckDB → ObjectStore) -------
+
+    use crate::DuckDBBackend;
+
+    async fn duckdb_with_events() -> Arc<dyn Backend> {
+        let duck: Arc<dyn Backend> = Arc::new(DuckDBBackend::open(":memory:").unwrap());
+        duck.execute("CREATE SCHEMA s").await.unwrap();
+        duck.execute("CREATE TABLE s.events (id BIGINT, name VARCHAR)")
+            .await
+            .unwrap();
+        duck.execute("INSERT INTO s.events VALUES (1, 'a'), (2, 'b'), (3, 'c')")
+            .await
+            .unwrap();
+        duck
+    }
+
+    fn small_table_spec() -> TableSpec {
+        use crate::types::{ColumnSpec, ColumnType};
+        TableSpec {
+            schema: "raw".into(),
+            name: "events".into(),
+            columns: vec![
+                ColumnSpec {
+                    name: "id".into(),
+                    ty: ColumnType::BigInt,
+                    nullable: false,
+                    primary_key: false,
+                },
+                ColumnSpec {
+                    name: "name".into(),
+                    ty: ColumnType::Text,
+                    nullable: true,
+                    primary_key: false,
+                },
+            ],
+            unique_constraints: vec![],
+            fingerprint: String::new(),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn objectstore_run_append_from_duckdb_writes_parquet() {
+        let dir = tempfile::tempdir().unwrap();
+        let target_backend =
+            ObjectStoreBackend::open_local(dir.path(), ObjectFormat::Parquet).unwrap();
+        let source = duckdb_with_events().await;
+        let spec = small_table_spec();
+
+        let result = target_backend
+            .run_append(
+                &spec,
+                "SELECT id, name FROM s.events ORDER BY id",
+                "p34f_append",
+                Some(source.as_ref()),
+                None,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.rows_inserted, 3);
+        assert_eq!(result.status, "success");
+        assert_eq!(result.path, "cross_backend");
+
+        // Read back via the same backend and confirm row count.
+        let stream = target_backend
+            .read_arrow_stream("raw/events")
+            .await
+            .unwrap();
+        let batches: Vec<RecordBatch> = futures_util::TryStreamExt::try_collect(stream)
+            .await
+            .unwrap();
+        let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, 3);
+
+        // run_history: one JSONL file under _ematix_flow/run_history.
+        let history_stream = target_backend
+            .read_arrow_stream("non-existent-prefix")
+            .await
+            .unwrap();
+        let _: Vec<RecordBatch> = futures_util::TryStreamExt::try_collect(history_stream)
+            .await
+            .unwrap();
+        // Direct-list the history prefix via the underlying store —
+        // history files are JSONL even though the backend is set to
+        // Parquet, so a format-typed read_arrow_stream would mismatch.
+        let mut listing = target_backend
+            .store()
+            .list(Some(&ObjectPath::from("_ematix_flow/run_history")));
+        let mut history_count = 0;
+        while futures_util::StreamExt::next(&mut listing).await.is_some() {
+            history_count += 1;
+        }
+        assert_eq!(history_count, 1, "exactly one run_history event");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn objectstore_run_truncate_from_duckdb_replaces_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let target_backend =
+            ObjectStoreBackend::open_local(dir.path(), ObjectFormat::Parquet).unwrap();
+        let source = duckdb_with_events().await;
+        let spec = small_table_spec();
+
+        // Two appends seed the target with stale files.
+        for tag in ["t34f_a", "t34f_b"] {
+            target_backend
+                .run_append(
+                    &spec,
+                    "SELECT id, name FROM s.events ORDER BY id",
+                    tag,
+                    Some(source.as_ref()),
+                    None,
+                    None,
+                    false,
+                )
+                .await
+                .unwrap();
+        }
+        // Truncate replaces them with one fresh write.
+        let result = target_backend
+            .run_truncate(
+                &spec,
+                "SELECT id, name FROM s.events ORDER BY id",
+                "t34f_trunc",
+                Some(source.as_ref()),
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.rows_inserted, 3);
+        assert_eq!(result.status, "success");
+
+        let stream = target_backend
+            .read_arrow_stream("raw/events")
+            .await
+            .unwrap();
+        let batches: Vec<RecordBatch> = futures_util::TryStreamExt::try_collect(stream)
+            .await
+            .unwrap();
+        let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, 3, "truncate left only the latest write");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn objectstore_run_append_dry_run_does_not_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let target_backend =
+            ObjectStoreBackend::open_local(dir.path(), ObjectFormat::Parquet).unwrap();
+        let source = duckdb_with_events().await;
+        let spec = small_table_spec();
+
+        let result = target_backend
+            .run_append(
+                &spec,
+                "SELECT id, name FROM s.events ORDER BY id",
+                "p34f_dry",
+                Some(source.as_ref()),
+                None,
+                None,
+                true, // dry_run
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.status, "dry_run");
+        assert_eq!(result.rows_inserted, 0);
+
+        // No data file should exist under the data prefix.
+        let stream = target_backend
+            .read_arrow_stream("raw/events")
+            .await
+            .unwrap();
+        let batches: Vec<RecordBatch> = futures_util::TryStreamExt::try_collect(stream)
+            .await
+            .unwrap();
+        let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, 0, "dry_run must not write data");
+
+        // But the run_history event should record dry_run for audit.
+        let mut listing = target_backend
+            .store()
+            .list(Some(&ObjectPath::from("_ematix_flow/run_history")));
+        let mut history_count = 0;
+        while futures_util::StreamExt::next(&mut listing).await.is_some() {
+            history_count += 1;
+        }
+        assert_eq!(history_count, 1, "dry_run still emits a history event");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn objectstore_run_append_rejects_missing_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let target_backend =
+            ObjectStoreBackend::open_local(dir.path(), ObjectFormat::Parquet).unwrap();
+        let spec = small_table_spec();
+        let err = target_backend
+            .run_append(&spec, "ignored", "p34f_no_src", None, None, None, false)
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("source_backend is required"), "got: {msg}");
     }
 }
