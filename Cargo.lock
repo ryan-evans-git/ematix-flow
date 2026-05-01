@@ -2684,6 +2684,7 @@ dependencies = [
  "arrow-schema",
  "async-trait",
  "aws-msk-iam-sasl-signer",
+ "aws-types",
  "bytes",
  "deadpool-postgres",
  "deltalake",

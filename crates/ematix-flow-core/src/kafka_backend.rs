@@ -48,8 +48,8 @@ use async_trait::async_trait;
 use rdkafka::ClientConfig;
 use rdkafka::Message;
 use rdkafka::admin::AdminClient;
-use rdkafka::client::DefaultClientContext;
-use rdkafka::consumer::{CommitMode, Consumer, StreamConsumer};
+use rdkafka::client::{ClientContext, OAuthToken};
+use rdkafka::consumer::{CommitMode, Consumer, ConsumerContext, StreamConsumer};
 use rdkafka::producer::{FutureProducer, FutureRecord};
 use rdkafka::topic_partition_list::{Offset, TopicPartitionList};
 use rdkafka::util::Timeout;
@@ -165,6 +165,67 @@ enum AuthMode {
     MskIam { region: String },
 }
 
+/// Custom librdkafka client context that overrides
+/// `generate_oauth_token` to mint AWS MSK IAM tokens via SigV4 (the
+/// signing happens inside `aws-msk-iam-sasl-signer`). librdkafka
+/// calls this proactively at ~80% of the previous token's TTL —
+/// we don't have to schedule refresh manually; setting
+/// `ENABLE_REFRESH_OAUTH_TOKEN = true` is the whole opt-in.
+///
+/// For non-MSK auth modes (PLAIN / SCRAM / TLS / no-auth), the
+/// callback is wired but never fires because librdkafka only
+/// invokes it when `sasl.mechanism = OAUTHBEARER`.
+///
+/// We wrap an optional MSK region + an optional tokio runtime
+/// handle. The handle is captured at `with_msk_iam` time
+/// (assumed-async context); the callback uses
+/// `runtime.block_on(...)` to bridge sync librdkafka into the
+/// async signer.
+#[derive(Clone, Default)]
+pub(crate) struct EmatixKafkaContext {
+    msk_region: Option<String>,
+    runtime: Option<tokio::runtime::Handle>,
+}
+
+impl ClientContext for EmatixKafkaContext {
+    const ENABLE_REFRESH_OAUTH_TOKEN: bool = true;
+
+    fn generate_oauth_token(
+        &self,
+        _oauthbearer_config: Option<&str>,
+    ) -> Result<OAuthToken, Box<dyn std::error::Error>> {
+        let region_str = self.msk_region.as_ref().ok_or_else(|| -> Box<dyn std::error::Error> {
+            "OAUTHBEARER token requested but no MSK region configured on KafkaBackend (call `with_msk_iam`)".into()
+        })?;
+        let runtime = self
+            .runtime
+            .as_ref()
+            .ok_or_else(|| -> Box<dyn std::error::Error> {
+                "MSK IAM token: no tokio runtime handle was captured. \
+             Call `KafkaBackend::with_msk_iam(...)` from within an async context \
+             (e.g. inside #[tokio::main] or a runtime block_on)."
+                    .into()
+            })?;
+        let region = aws_types::region::Region::new(region_str.clone());
+        // librdkafka calls this from its background poll thread, not
+        // a tokio runtime worker. `block_on` on the captured handle
+        // bridges that into our async signer call.
+        let principal = format!("kafka/{region_str}");
+        let result =
+            runtime.block_on(async { aws_msk_iam_sasl_signer::generate_auth_token(region).await });
+        let (token, lifetime_ms) = result.map_err(|e| -> Box<dyn std::error::Error> {
+            format!("MSK IAM token generation failed: {e}").into()
+        })?;
+        Ok(OAuthToken {
+            token,
+            principal_name: principal,
+            lifetime_ms,
+        })
+    }
+}
+
+impl ConsumerContext for EmatixKafkaContext {}
+
 /// Lazy-initialized consumer session that persists across
 /// `read_arrow_stream` calls so that:
 ///   - the same group rebalance / offset state is reused (avoids
@@ -179,7 +240,7 @@ enum AuthMode {
 /// re-delivered).
 #[derive(Default)]
 struct ConsumerSession {
-    consumer: Option<Arc<StreamConsumer>>,
+    consumer: Option<Arc<StreamConsumer<EmatixKafkaContext>>>,
     subscribed_topic: Option<String>,
     /// `partition → offset_to_commit`. The commit position is the
     /// offset of the *next* message to consume (i.e. last consumed
@@ -403,7 +464,10 @@ impl KafkaBackend {
     /// session is already subscribed to a different topic, drop the
     /// old consumer (and pending offsets — uncommitted reads on the
     /// old topic will be re-delivered on the next subscribe to it).
-    fn acquire_consumer_for(&self, topic: &str) -> Result<Arc<StreamConsumer>, BackendError> {
+    fn acquire_consumer_for(
+        &self,
+        topic: &str,
+    ) -> Result<Arc<StreamConsumer<EmatixKafkaContext>>, BackendError> {
         let mut session = self
             .consumer_session
             .lock()
@@ -419,8 +483,9 @@ impl KafkaBackend {
             // override at the ClientConfig layer in 36f+.
             let mut config = self.client_config();
             config.set("auto.offset.reset", "earliest");
-            let consumer: StreamConsumer = config
-                .create()
+            let context = self.build_context();
+            let consumer: StreamConsumer<EmatixKafkaContext> = config
+                .create_with_context(context)
                 .map_err(|e| BackendError::Connection(format!("kafka consumer create: {e}")))?;
             consumer
                 .subscribe(&[topic])
@@ -455,6 +520,28 @@ impl KafkaBackend {
     /// Confluent Cloud, self-hosted Kafka with SASL, AWS MSK, and
     /// other cloud-managed Kafka services without privileging any
     /// specific deployment.
+    /// Build a fresh `EmatixKafkaContext` suitable for handing to a
+    /// new producer / consumer / admin client. Captures
+    /// `tokio::runtime::Handle::try_current()` lazily so the MSK IAM
+    /// callback can bridge sync librdkafka into the async signer.
+    /// For non-MSK auth modes the context is essentially inert
+    /// (the OAUTHBEARER override never fires).
+    fn build_context(&self) -> EmatixKafkaContext {
+        let msk_region = match &self.auth {
+            AuthMode::MskIam { region } => Some(region.clone()),
+            _ => None,
+        };
+        let runtime = if msk_region.is_some() {
+            tokio::runtime::Handle::try_current().ok()
+        } else {
+            None
+        };
+        EmatixKafkaContext {
+            msk_region,
+            runtime,
+        }
+    }
+
     pub(crate) fn client_config(&self) -> ClientConfig {
         let mut config = ClientConfig::new();
         config.set("bootstrap.servers", &self.bootstrap_servers);
@@ -561,9 +648,10 @@ impl Backend for KafkaBackend {
         // don't stall the tokio runtime. The client is dropped at the
         // end of the closure (no leak / lifetime trickery needed).
         let config = self.client_config();
+        let context = self.build_context();
         tokio::task::spawn_blocking(move || {
-            let client: AdminClient<DefaultClientContext> = config
-                .create()
+            let client: AdminClient<EmatixKafkaContext> = config
+                .create_with_context(context)
                 .map_err(|e| BackendError::Connection(format!("kafka admin client: {e}")))?;
             client
                 .inner()
@@ -693,9 +781,9 @@ impl Backend for KafkaBackend {
                 "Kafka write_arrow_stream: target.name (topic) must be non-empty".into(),
             ));
         }
-        let producer: FutureProducer = self
+        let producer: FutureProducer<EmatixKafkaContext> = self
             .client_config()
-            .create()
+            .create_with_context(self.build_context())
             .map_err(|e| BackendError::Connection(format!("kafka producer create: {e}")))?;
 
         let mut s = stream;
@@ -888,7 +976,7 @@ const READ_FIRST_MESSAGE_TIMEOUT_SECS: u64 = 15;
 /// `batch_window_ms` clock starts on the first received message,
 /// not on subscribe.
 async fn drain_consumer(
-    consumer: &StreamConsumer,
+    consumer: &StreamConsumer<EmatixKafkaContext>,
     cfg: &KafkaBatchConfig,
 ) -> Result<(Vec<Vec<u8>>, HashMap<i32, i64>), BackendError> {
     let mut payloads: Vec<Vec<u8>> = Vec::new();
@@ -1180,6 +1268,83 @@ mod tests {
         let b = KafkaBackend::open("localhost:9092", Some("g1")).unwrap();
         assert_eq!(config_get(&b, "security.protocol"), None);
         assert_eq!(config_get(&b, "sasl.mechanism"), None);
+    }
+
+    /// Phase 36f.2: build_context() captures the MSK region for the
+    /// OAUTHBEARER callback. Runtime handle is captured only when an
+    /// async runtime is present — this test runs sync, so we assert
+    /// region is set and runtime is None (the callback would error
+    /// helpfully at first OAUTHBEARER fire).
+    #[test]
+    fn build_context_captures_msk_region_without_runtime_in_sync() {
+        let b = KafkaBackend::open("localhost:9092", Some("g1"))
+            .unwrap()
+            .with_msk_iam("us-east-1");
+        let ctx = b.build_context();
+        assert_eq!(ctx.msk_region.as_deref(), Some("us-east-1"));
+        // No tokio runtime in this sync #[test] — handle is None.
+        assert!(ctx.runtime.is_none());
+    }
+
+    /// build_context() captures `Handle::current()` when called from
+    /// async context (the typical caller path for KafkaBackend usage).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn build_context_captures_runtime_handle_in_async() {
+        let b = KafkaBackend::open("localhost:9092", Some("g1"))
+            .unwrap()
+            .with_msk_iam("us-east-1");
+        let ctx = b.build_context();
+        assert_eq!(ctx.msk_region.as_deref(), Some("us-east-1"));
+        assert!(
+            ctx.runtime.is_some(),
+            "runtime handle must be captured for the OAUTHBEARER callback"
+        );
+    }
+
+    /// Non-MSK auth modes don't capture a runtime — the callback
+    /// never fires because librdkafka invokes it only when
+    /// sasl.mechanism = OAUTHBEARER.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn build_context_no_runtime_for_non_msk_auth() {
+        let b = KafkaBackend::open("localhost:9092", Some("g1"))
+            .unwrap()
+            .with_sasl_plain("alice", "s3cret");
+        let ctx = b.build_context();
+        assert!(ctx.msk_region.is_none());
+        assert!(ctx.runtime.is_none());
+    }
+
+    /// generate_oauth_token returns a clear "no region configured"
+    /// error when called on a context with msk_region=None. The
+    /// real callback path only fires for MSK-configured backends,
+    /// but the safety net matters in case of misconfigured tests.
+    #[test]
+    fn generate_oauth_token_errors_without_msk_region() {
+        let ctx = EmatixKafkaContext::default();
+        let err = match ctx.generate_oauth_token(None) {
+            Ok(_) => panic!("expected error"),
+            Err(e) => e,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("no MSK region"), "got: {msg}");
+    }
+
+    /// generate_oauth_token errors with a clear message when called
+    /// on a context that has the MSK region but no runtime handle —
+    /// this is the "user called with_msk_iam from outside async
+    /// context" case.
+    #[test]
+    fn generate_oauth_token_errors_without_runtime() {
+        let ctx = EmatixKafkaContext {
+            msk_region: Some("us-east-1".into()),
+            runtime: None,
+        };
+        let err = match ctx.generate_oauth_token(None) {
+            Ok(_) => panic!("expected error"),
+            Err(e) => e,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("tokio runtime"), "got: {msg}");
     }
 
     #[test]

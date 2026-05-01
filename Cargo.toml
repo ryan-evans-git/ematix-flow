@@ -71,6 +71,10 @@ rdkafka = { version = "0.39", features = ["cmake-build", "ssl", "sasl"] }
 # AWS-SigV4 URL. This crate generates that URL using the AWS
 # credential chain.
 aws-msk-iam-sasl-signer = "1"
+# `Region` ctor for the signer above. It's already a transitive dep
+# of aws-msk-iam-sasl-signer; we declare it directly here so the
+# import isn't accidental.
+aws-types = "1"
 # `url` is needed to construct deltalake's `Url` parameter; deltalake
 # doesn't re-export it. Already pulled in transitively, so this just
 # brings it into the workspace's direct namespace.
