@@ -2257,3 +2257,350 @@ async fn mysql_backend_write_arrow_stream_truncate() {
     // Old rows (99, 100) removed by TRUNCATE; only the new ones remain.
     assert_eq!(ids.values(), &[1, 2]);
 }
+
+// ----- Phase 33b: MySQL run_append + run_truncate + run_history ---------
+
+fn mysql_event_log_spec() -> TableSpec {
+    augment_with_metadata(&TableSpec {
+        schema: "test".into(),
+        name: "event_log".into(),
+        columns: vec![
+            ColumnSpec {
+                name: "event_id".into(),
+                ty: ColumnType::BigInt,
+                nullable: false,
+                primary_key: true,
+            },
+            ColumnSpec {
+                name: "name".into(),
+                ty: ColumnType::Text,
+                nullable: true,
+                primary_key: false,
+            },
+        ],
+        unique_constraints: Vec::new(),
+        fingerprint: String::new(),
+    })
+}
+
+async fn mysql_make_backend_with_event_log()
+-> (testcontainers::ContainerAsync<Mysql>, Arc<dyn Backend>) {
+    let (container, url) = start_mysql().await;
+    let b: Arc<dyn Backend> = Arc::new(MySQLBackend::open(&url).unwrap());
+    b.execute("CREATE TABLE src_events (event_id BIGINT, name VARCHAR(64))")
+        .await
+        .unwrap();
+    b.execute(
+        "CREATE TABLE event_log (\
+            event_id BIGINT, \
+            name VARCHAR(64), \
+            _loaded_at DATETIME(6) NOT NULL, \
+            _batch_id CHAR(36) NOT NULL\
+        )",
+    )
+    .await
+    .unwrap();
+    (container, b)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker; run with `cargo test -- --ignored`"]
+async fn mysql_run_append_inserts_rows_and_records_history() {
+    use arrow_array::Int64Array;
+
+    let (_c, b) = mysql_make_backend_with_event_log().await;
+    b.execute("INSERT INTO src_events VALUES (1, 'a'), (2, 'b'), (3, 'c')")
+        .await
+        .unwrap();
+    let target = mysql_event_log_spec();
+    let result = b
+        .run_append(
+            &target,
+            "SELECT event_id, name FROM src_events",
+            "mysql_append_test",
+            None,
+            None,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.rows_inserted, 3);
+    assert_eq!(result.path, "same_db");
+    assert_eq!(result.status, "success");
+
+    let s = b
+        .read_arrow_stream(
+            "SELECT count(*), \
+                    CAST(sum(status='success') AS SIGNED), \
+                    max(rows_inserted) \
+             FROM ematix_flow.run_history \
+             WHERE pipeline_name='mysql_append_test'",
+        )
+        .await
+        .unwrap();
+    let batches: Vec<_> = s.try_collect().await.unwrap();
+    let count = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap()
+        .value(0);
+    let success = batches[0]
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap()
+        .value(0);
+    let rows_inserted = batches[0]
+        .column(2)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(count, 1);
+    assert_eq!(success, 1);
+    assert_eq!(rows_inserted, 3);
+
+    let s = b
+        .read_arrow_stream("SELECT count(*) FROM event_log")
+        .await
+        .unwrap();
+    let batches: Vec<_> = s.try_collect().await.unwrap();
+    let total = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(total, 3);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker; run with `cargo test -- --ignored`"]
+async fn mysql_run_truncate_replaces_target() {
+    use arrow_array::Int64Array;
+
+    let (_c, b) = mysql_make_backend_with_event_log().await;
+    b.execute(
+        "INSERT INTO event_log VALUES \
+            (99, 'old', '2024-01-01 00:00:00.000000', \
+             '00000000-0000-0000-0000-000000000000')",
+    )
+    .await
+    .unwrap();
+    b.execute("INSERT INTO src_events VALUES (1, 'a')")
+        .await
+        .unwrap();
+    let target = mysql_event_log_spec();
+    let r = b
+        .run_truncate(
+            &target,
+            "SELECT event_id, name FROM src_events",
+            "mysql_truncate_test",
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+    assert_eq!(r.rows_inserted, 1);
+    assert_eq!(r.status, "success");
+
+    let s = b
+        .read_arrow_stream("SELECT count(*), max(event_id) FROM event_log")
+        .await
+        .unwrap();
+    let batches: Vec<_> = s.try_collect().await.unwrap();
+    let total = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap()
+        .value(0);
+    let max_id = batches[0]
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(total, 1, "old row 99 replaced");
+    assert_eq!(max_id, 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker; run with `cargo test -- --ignored`"]
+async fn mysql_run_append_records_failure_when_target_missing() {
+    let (_c, url) = start_mysql().await;
+    let b: Arc<dyn Backend> = Arc::new(MySQLBackend::open(&url).unwrap());
+    b.execute("CREATE TABLE src_events (event_id BIGINT)")
+        .await
+        .unwrap();
+    b.execute("INSERT INTO src_events VALUES (1)")
+        .await
+        .unwrap();
+    let target = augment_with_metadata(&TableSpec {
+        schema: "test".into(),
+        name: "missing_table".into(),
+        columns: vec![ColumnSpec {
+            name: "event_id".into(),
+            ty: ColumnType::BigInt,
+            nullable: false,
+            primary_key: true,
+        }],
+        unique_constraints: Vec::new(),
+        fingerprint: String::new(),
+    });
+    let result = b
+        .run_append(
+            &target,
+            "SELECT event_id FROM src_events",
+            "mysql_failure_test",
+            None,
+            None,
+            None,
+            false,
+        )
+        .await;
+    assert!(result.is_err(), "missing target should error");
+
+    use arrow_array::{Int64Array, StringArray};
+    let s = b
+        .read_arrow_stream(
+            "SELECT count(*), max(status), max(error_message) \
+             FROM ematix_flow.run_history \
+             WHERE pipeline_name='mysql_failure_test'",
+        )
+        .await
+        .unwrap();
+    let batches: Vec<_> = s.try_collect().await.unwrap();
+    let count = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap()
+        .value(0);
+    let status = batches[0]
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap()
+        .value(0);
+    assert_eq!(count, 1);
+    assert_eq!(status, "failed");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker; run with `cargo test -- --ignored`"]
+async fn mysql_run_append_advances_watermark_and_filters_next_run() {
+    use arrow_array::{Int64Array, StringArray};
+
+    let (_c, b) = mysql_make_backend_with_event_log().await;
+    b.execute("INSERT INTO src_events VALUES (1, 'a'), (2, 'b'), (3, 'c')")
+        .await
+        .unwrap();
+    let target = mysql_event_log_spec();
+    let r = b
+        .run_append(
+            &target,
+            "SELECT event_id, name FROM src_events",
+            "mysql_wm_test",
+            None,
+            Some("event_id"),
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+    assert_eq!(r.rows_inserted, 3);
+
+    let s = b
+        .read_arrow_stream(
+            "SELECT column_name, `last_value` FROM ematix_flow.watermarks \
+             WHERE pipeline_name='mysql_wm_test'",
+        )
+        .await
+        .unwrap();
+    let batches: Vec<_> = s.try_collect().await.unwrap();
+    assert_eq!(batches[0].num_rows(), 1);
+    let col = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let last = batches[0]
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(col.value(0), "event_id");
+    assert_eq!(last.value(0), "3");
+
+    // Second run: feed the watermark literal back so only newer rows
+    // come through. Insert (2, 'b2') and (4, 'd'); only 4 should land.
+    b.execute("INSERT INTO src_events VALUES (4, 'd')")
+        .await
+        .unwrap();
+    let r2 = b
+        .run_append(
+            &target,
+            "SELECT event_id, name FROM src_events",
+            "mysql_wm_test",
+            None,
+            Some("event_id"),
+            Some("3"),
+            false,
+        )
+        .await
+        .unwrap();
+    assert_eq!(r2.rows_inserted, 1);
+    let s = b
+        .read_arrow_stream("SELECT count(*) FROM event_log")
+        .await
+        .unwrap();
+    let batches: Vec<_> = s.try_collect().await.unwrap();
+    let total = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(total, 4);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker; run with `cargo test -- --ignored`"]
+async fn mysql_run_append_dry_run_rolls_back() {
+    use arrow_array::Int64Array;
+
+    let (_c, b) = mysql_make_backend_with_event_log().await;
+    b.execute("INSERT INTO src_events VALUES (1, 'a'), (2, 'b')")
+        .await
+        .unwrap();
+    let target = mysql_event_log_spec();
+    let r = b
+        .run_append(
+            &target,
+            "SELECT event_id, name FROM src_events",
+            "mysql_dry_test",
+            None,
+            None,
+            None,
+            true,
+        )
+        .await
+        .unwrap();
+    assert_eq!(r.status, "dry_run");
+
+    let s = b
+        .read_arrow_stream("SELECT count(*) FROM event_log")
+        .await
+        .unwrap();
+    let batches: Vec<_> = s.try_collect().await.unwrap();
+    let total = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(total, 0, "dry_run rolled back");
+}

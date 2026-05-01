@@ -44,8 +44,86 @@ use crate::backend::{
     ArrowBatchStream, Backend, BackendError, DeleteHandling, Dialect, StrategyRunResult,
     TargetTable, WriteMode,
 };
+use crate::meta::{WatermarkConfig, wrap_with_watermark_filter};
 use crate::pg::ConnectionInfo;
+use crate::strategy::append::{BATCH_ID_COL, plan_same_db_append};
+use crate::strategy::truncate::plan_truncate_replace;
 use crate::types::TableSpec;
+use uuid::Uuid;
+
+const META_SCHEMA: &str = "ematix_flow";
+const RUN_HISTORY_TABLE: &str = "run_history";
+const WATERMARKS_TABLE: &str = "watermarks";
+
+/// SQL DDL that lazy-creates the `ematix_flow` database and the
+/// `run_history` + `watermarks` tables on MySQL. Returned as a list so
+/// each statement can be issued individually — `mysql_async` doesn't
+/// enable multi-statement protocol by default.
+///
+/// Type choices (vs PG/DuckDB):
+///   - `run_id` is `CHAR(36)` (canonical hyphenated UUID text) — MySQL
+///     has no native UUID type before 8.4 and we want compat with 8.0+.
+///   - Timestamps are `DATETIME(6)` (microsecond precision, no TZ
+///     conversion). MySQL's TIMESTAMP type is timezone-converted by
+///     the server and limited to 1970–2038, which would drift logs
+///     across timezone changes — DATETIME stays stable.
+///   - InnoDB explicitly so primary keys, FKs, and transactions all
+///     work the same way regardless of server-default storage engine.
+fn ensure_meta_schema_sql() -> Vec<String> {
+    vec![
+        format!("CREATE DATABASE IF NOT EXISTS `{META_SCHEMA}`"),
+        format!(
+            "CREATE TABLE IF NOT EXISTS `{META_SCHEMA}`.`{RUN_HISTORY_TABLE}` (\
+                run_id CHAR(36) NOT NULL PRIMARY KEY, \
+                parent_run_id CHAR(36) NULL, \
+                pipeline_name VARCHAR(255) NOT NULL, \
+                step_name VARCHAR(255) NULL, \
+                target_schema VARCHAR(255) NOT NULL, \
+                target_table VARCHAR(255) NOT NULL, \
+                mode VARCHAR(32) NOT NULL, \
+                path VARCHAR(64) NOT NULL, \
+                started_at DATETIME(6) NOT NULL, \
+                finished_at DATETIME(6) NULL, \
+                status VARCHAR(32) NOT NULL, \
+                rows_inserted BIGINT NULL, \
+                rows_updated BIGINT NULL, \
+                rows_unchanged BIGINT NULL, \
+                error_message TEXT NULL, \
+                metrics_json TEXT NULL\
+             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
+        ),
+        // `last_value` is reserved in MySQL 8 (window function); the
+        // identifier is backtick-quoted everywhere it appears.
+        format!(
+            "CREATE TABLE IF NOT EXISTS `{META_SCHEMA}`.`{WATERMARKS_TABLE}` (\
+                pipeline_name VARCHAR(255) NOT NULL PRIMARY KEY, \
+                column_name VARCHAR(255) NOT NULL, \
+                `last_value` VARCHAR(1024) NOT NULL, \
+                updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)\
+             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
+        ),
+    ]
+}
+
+/// MySQL-specific SQL substitutions on the PG-shaped strategy planner
+/// output. The planners emit:
+///   - `now()` — MySQL accepts this but only at second precision; we
+///     want microseconds for run-history correlation, so rewrite to
+///     `NOW(6)`.
+///   - `$1::uuid` — MySQL has no `$N` placeholders inside `query_drop`
+///     and no UUID cast; replace with a literal `'<uuid>'` string.
+///   - `TRUNCATE TABLE x` — TRUNCATE auto-commits in MySQL, which
+///     would break the TruncateReplace transaction semantics; rewrite
+///     to `DELETE FROM x` so the empty-then-load pair is one atomic
+///     transaction.
+fn mysql_substitute(sql: &str, batch_id: &Uuid) -> String {
+    let trimmed = sql.trim_start();
+    if let Some(rest) = trimmed.strip_prefix("TRUNCATE TABLE ") {
+        return format!("DELETE FROM {rest}");
+    }
+    sql.replace("now()", "NOW(6)")
+        .replace("$1::uuid", &format!("'{batch_id}'"))
+}
 
 /// MySQL-backed implementation of `Backend`.
 ///
@@ -78,6 +156,192 @@ impl MySQLBackend {
     #[allow(dead_code)]
     pub(crate) fn pool(&self) -> &Pool {
         &self.pool
+    }
+
+    /// Lazy-create `ematix_flow.run_history` + `ematix_flow.watermarks`.
+    /// Idempotent: each statement uses `IF NOT EXISTS`.
+    async fn ensure_meta_schema(&self) -> Result<(), BackendError> {
+        let mut conn = self
+            .pool
+            .get_conn()
+            .await
+            .map_err(|e| BackendError::Connection(e.to_string()))?;
+        for stmt in ensure_meta_schema_sql() {
+            conn.query_drop(&stmt)
+                .await
+                .map_err(|e| BackendError::Query(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    async fn record_run_start(
+        &self,
+        run_id: Uuid,
+        pipeline_name: &str,
+        target_schema: &str,
+        target_table: &str,
+        mode: &str,
+        path: &str,
+    ) -> Result<(), BackendError> {
+        let mut conn = self
+            .pool
+            .get_conn()
+            .await
+            .map_err(|e| BackendError::Connection(e.to_string()))?;
+        let sql = format!(
+            "INSERT INTO `{META_SCHEMA}`.`{RUN_HISTORY_TABLE}` \
+             (run_id, pipeline_name, target_schema, target_table, \
+              mode, path, started_at, status) \
+             VALUES (?, ?, ?, ?, ?, ?, NOW(6), 'running')"
+        );
+        conn.exec_drop(
+            &sql,
+            (
+                run_id.to_string(),
+                pipeline_name.to_string(),
+                target_schema.to_string(),
+                target_table.to_string(),
+                mode.to_string(),
+                path.to_string(),
+            ),
+        )
+        .await
+        .map_err(|e| BackendError::Query(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn record_run_success(
+        &self,
+        run_id: Uuid,
+        rows_inserted: i64,
+    ) -> Result<(), BackendError> {
+        let mut conn = self
+            .pool
+            .get_conn()
+            .await
+            .map_err(|e| BackendError::Connection(e.to_string()))?;
+        let sql = format!(
+            "UPDATE `{META_SCHEMA}`.`{RUN_HISTORY_TABLE}` \
+             SET status='success', rows_inserted=?, finished_at=NOW(6) \
+             WHERE run_id=?"
+        );
+        conn.exec_drop(&sql, (rows_inserted, run_id.to_string()))
+            .await
+            .map_err(|e| BackendError::Query(e.to_string()))?;
+        Ok(())
+    }
+
+    #[allow(dead_code)] // wired in 33c
+    async fn record_run_success_merge(
+        &self,
+        run_id: Uuid,
+        rows_inserted: i64,
+        rows_updated: i64,
+        rows_unchanged: i64,
+    ) -> Result<(), BackendError> {
+        let mut conn = self
+            .pool
+            .get_conn()
+            .await
+            .map_err(|e| BackendError::Connection(e.to_string()))?;
+        let sql = format!(
+            "UPDATE `{META_SCHEMA}`.`{RUN_HISTORY_TABLE}` \
+             SET status='success', rows_inserted=?, rows_updated=?, \
+                 rows_unchanged=?, finished_at=NOW(6) \
+             WHERE run_id=?"
+        );
+        conn.exec_drop(
+            &sql,
+            (
+                rows_inserted,
+                rows_updated,
+                rows_unchanged,
+                run_id.to_string(),
+            ),
+        )
+        .await
+        .map_err(|e| BackendError::Query(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn record_run_failure(
+        &self,
+        run_id: Uuid,
+        error_message: &str,
+    ) -> Result<(), BackendError> {
+        let mut conn = self
+            .pool
+            .get_conn()
+            .await
+            .map_err(|e| BackendError::Connection(e.to_string()))?;
+        let sql = format!(
+            "UPDATE `{META_SCHEMA}`.`{RUN_HISTORY_TABLE}` \
+             SET status='failed', error_message=?, finished_at=NOW(6) \
+             WHERE run_id=?"
+        );
+        conn.exec_drop(&sql, (error_message.to_string(), run_id.to_string()))
+            .await
+            .map_err(|e| BackendError::Query(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Compute `MAX(<column>)` over the rows just inserted by this batch
+    /// (matched on `_batch_id`) and UPSERT into the watermarks table.
+    /// NULL `MAX` (zero rows inserted, or column itself NULL) is a
+    /// no-op so a stale `last_value` survives a zero-row run. Mirrors
+    /// `pg::advance_watermark` and `duckdb_backend::advance_watermark`.
+    async fn advance_watermark(
+        &self,
+        target: &TableSpec,
+        batch_id: Uuid,
+        pipeline_name: &str,
+        watermark: &WatermarkConfig,
+    ) -> Result<(), BackendError> {
+        let mut conn = self
+            .pool
+            .get_conn()
+            .await
+            .map_err(|e| BackendError::Connection(e.to_string()))?;
+        // Cast MAX to CHAR so every type round-trips through last_value
+        // as text — matches DuckDB's `::VARCHAR` cast and SQLite's
+        // `CAST(... AS TEXT)`.
+        let max_sql = format!(
+            "SELECT CAST(MAX({col}) AS CHAR) FROM {qualified} \
+             WHERE {batch_id_col} = ?",
+            col = watermark.column,
+            qualified = qualified(&target.schema, &target.name),
+            batch_id_col = BATCH_ID_COL,
+        );
+        let max_value: Option<Option<String>> = conn
+            .exec_first(&max_sql, (batch_id.to_string(),))
+            .await
+            .map_err(|e| BackendError::Query(e.to_string()))?;
+        let value = match max_value.flatten() {
+            Some(v) => v,
+            None => return Ok(()),
+        };
+        // MySQL UPSERT via `INSERT ... ON DUPLICATE KEY UPDATE`. The
+        // legacy `VALUES(col)` form is deprecated in 8.0.20+ but still
+        // works through 8.x; the row-alias form (`INSERT ... AS new
+        // ON DUPLICATE KEY UPDATE col = new.col`) requires 8.0.19+.
+        // We use the legacy form for broader compat with managed MySQL
+        // 5.7 deployments.
+        let upsert_sql = format!(
+            "INSERT INTO `{META_SCHEMA}`.`{WATERMARKS_TABLE}` \
+             (pipeline_name, column_name, `last_value`, updated_at) \
+             VALUES (?, ?, ?, NOW(6)) \
+             ON DUPLICATE KEY UPDATE \
+               column_name = VALUES(column_name), \
+               `last_value` = VALUES(`last_value`), \
+               updated_at = VALUES(updated_at)"
+        );
+        conn.exec_drop(
+            &upsert_sql,
+            (pipeline_name.to_string(), watermark.column.clone(), value),
+        )
+        .await
+        .map_err(|e| BackendError::Query(e.to_string()))?;
+        Ok(())
     }
 }
 
@@ -644,30 +908,197 @@ impl Backend for MySQLBackend {
 
     async fn run_append(
         &self,
-        _spec: &TableSpec,
-        _source_query: &str,
-        _pipeline_name: &str,
-        _source_backend: Option<&dyn Backend>,
-        _incremental_column: Option<&str>,
-        _last_value_literal: Option<&str>,
-        _dry_run: bool,
+        spec: &TableSpec,
+        source_query: &str,
+        pipeline_name: &str,
+        source_backend: Option<&dyn Backend>,
+        incremental_column: Option<&str>,
+        last_value_literal: Option<&str>,
+        dry_run: bool,
     ) -> Result<StrategyRunResult, BackendError> {
-        Err(BackendError::Other(
-            "MySQL run_append lands in Phase 33b".into(),
-        ))
+        if source_backend.is_some() {
+            return Err(BackendError::Other(
+                "MySQL cross-backend run_append goes through the Arrow streaming \
+                 bridge (cross_backend_arrow_sync); same-backend only here"
+                    .into(),
+            ));
+        }
+        let watermark = incremental_column.map(|c| WatermarkConfig {
+            column: c.to_string(),
+            last_value_literal: last_value_literal.map(|s| s.to_string()),
+        });
+        let filtered_source = wrap_with_watermark_filter(source_query, watermark.as_ref());
+        let plan = plan_same_db_append(spec, &filtered_source);
+        let batch_id = Uuid::new_v4();
+        let run_id = Uuid::new_v4();
+        let sql = mysql_substitute(&plan.sql, &batch_id);
+
+        self.ensure_meta_schema().await?;
+        self.record_run_start(
+            run_id,
+            pipeline_name,
+            &spec.schema,
+            &spec.name,
+            "append",
+            "same_db",
+        )
+        .await?;
+
+        // Wrap in a transaction so dry_run can rollback. MySQL DDL
+        // (CREATE TABLE etc.) auto-commits, but our INSERT … SELECT is
+        // pure DML and is fully transactional under InnoDB.
+        let inserted_result: Result<u64, BackendError> = async {
+            let mut conn = self
+                .pool
+                .get_conn()
+                .await
+                .map_err(|e| BackendError::Connection(e.to_string()))?;
+            conn.query_drop("START TRANSACTION")
+                .await
+                .map_err(|e| BackendError::Query(e.to_string()))?;
+            let n_result = conn.query_iter(&sql).await;
+            let n = match n_result {
+                Ok(result) => {
+                    let n = result.affected_rows();
+                    result
+                        .drop_result()
+                        .await
+                        .map_err(|e| BackendError::Query(e.to_string()))?;
+                    n
+                }
+                Err(e) => {
+                    let _ = conn.query_drop("ROLLBACK").await;
+                    return Err(BackendError::Query(e.to_string()));
+                }
+            };
+            if dry_run {
+                conn.query_drop("ROLLBACK")
+                    .await
+                    .map_err(|e| BackendError::Query(e.to_string()))?;
+            } else {
+                conn.query_drop("COMMIT")
+                    .await
+                    .map_err(|e| BackendError::Query(e.to_string()))?;
+            }
+            Ok(n)
+        }
+        .await;
+
+        match &inserted_result {
+            Ok(n) => {
+                self.record_run_success(run_id, *n as i64).await?;
+                if !dry_run && let Some(wc) = watermark.as_ref() {
+                    self.advance_watermark(spec, batch_id, pipeline_name, wc)
+                        .await?;
+                }
+            }
+            Err(e) => {
+                let _ = self.record_run_failure(run_id, &e.to_string()).await;
+            }
+        }
+        let inserted = inserted_result?;
+
+        Ok(StrategyRunResult {
+            run_id: run_id.to_string(),
+            rows_inserted: inserted as i64,
+            rows_updated: None,
+            rows_unchanged: None,
+            rows_closed: None,
+            status: if dry_run { "dry_run" } else { "success" }.into(),
+            path: "same_db".into(),
+        })
     }
 
     async fn run_truncate(
         &self,
-        _spec: &TableSpec,
-        _source_query: &str,
-        _pipeline_name: &str,
-        _source_backend: Option<&dyn Backend>,
-        _dry_run: bool,
+        spec: &TableSpec,
+        source_query: &str,
+        pipeline_name: &str,
+        source_backend: Option<&dyn Backend>,
+        dry_run: bool,
     ) -> Result<StrategyRunResult, BackendError> {
-        Err(BackendError::Other(
-            "MySQL run_truncate lands in Phase 33b".into(),
-        ))
+        if source_backend.is_some() {
+            return Err(BackendError::Other(
+                "MySQL cross-backend run_truncate goes through the Arrow bridge".into(),
+            ));
+        }
+        let plan = plan_truncate_replace(spec, source_query);
+        let batch_id = Uuid::new_v4();
+        let run_id = Uuid::new_v4();
+        // mysql_substitute also rewrites `TRUNCATE TABLE x` → `DELETE
+        // FROM x` so the empty-then-load pair stays inside one
+        // transaction (TRUNCATE auto-commits in MySQL).
+        let stmts: Vec<String> = plan
+            .statements
+            .iter()
+            .map(|s| mysql_substitute(s, &batch_id))
+            .collect();
+
+        self.ensure_meta_schema().await?;
+        self.record_run_start(
+            run_id,
+            pipeline_name,
+            &spec.schema,
+            &spec.name,
+            "truncate",
+            "same_db",
+        )
+        .await?;
+
+        let inserted_result: Result<u64, BackendError> = async {
+            let mut conn = self
+                .pool
+                .get_conn()
+                .await
+                .map_err(|e| BackendError::Connection(e.to_string()))?;
+            conn.query_drop("START TRANSACTION")
+                .await
+                .map_err(|e| BackendError::Query(e.to_string()))?;
+            let mut last_n: u64 = 0;
+            for s in &stmts {
+                let result = match conn.query_iter(s).await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        let _ = conn.query_drop("ROLLBACK").await;
+                        return Err(BackendError::Query(e.to_string()));
+                    }
+                };
+                last_n = result.affected_rows();
+                result
+                    .drop_result()
+                    .await
+                    .map_err(|e| BackendError::Query(e.to_string()))?;
+            }
+            if dry_run {
+                conn.query_drop("ROLLBACK")
+                    .await
+                    .map_err(|e| BackendError::Query(e.to_string()))?;
+            } else {
+                conn.query_drop("COMMIT")
+                    .await
+                    .map_err(|e| BackendError::Query(e.to_string()))?;
+            }
+            Ok(last_n)
+        }
+        .await;
+
+        match &inserted_result {
+            Ok(n) => self.record_run_success(run_id, *n as i64).await?,
+            Err(e) => {
+                let _ = self.record_run_failure(run_id, &e.to_string()).await;
+            }
+        }
+        let inserted = inserted_result?;
+
+        Ok(StrategyRunResult {
+            run_id: run_id.to_string(),
+            rows_inserted: inserted as i64,
+            rows_updated: None,
+            rows_unchanged: None,
+            rows_closed: None,
+            status: if dry_run { "dry_run" } else { "success" }.into(),
+            path: "same_db".into(),
+        })
     }
 
     async fn run_merge(
