@@ -705,6 +705,76 @@ fn cross_backend_arrow_sync(
     .map_err(|e| PyValueError::new_err(e.to_string()))
 }
 
+/// Phase Py.1: run a streaming pipeline from a TOML config
+/// string. Blocks the calling Python thread until SIGTERM /
+/// SIGINT is received or the pipeline exits cleanly.
+///
+/// Returns a dict with keys `total_rows`, `iterations`, and
+/// `shutdown_triggered` mirroring `StreamingPipelineMetrics`.
+/// Errors raise `ValueError` with the underlying error string.
+///
+/// `metrics_port`, when set, spawns the Prometheus `/metrics`
+/// HTTP endpoint on `127.0.0.1:<port>` for the pipeline's
+/// lifetime. Same shape as the `--metrics-port` flag on the
+/// `flow consume` CLI.
+#[pyfunction]
+#[pyo3(signature = (toml_str, metrics_port=None))]
+fn run_pipeline_from_toml_str<'py>(
+    py: Python<'py>,
+    toml_str: &str,
+    metrics_port: Option<u16>,
+) -> PyResult<Bound<'py, PyDict>> {
+    let cfg = ematix_flow_cli::PipelineCliConfig::from_toml_str(toml_str)
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    let options = ematix_flow_cli::ConsumeOptions {
+        metrics_port,
+        // Python path: install_shutdown_handler manages SIGTERM /
+        // SIGINT internally. Python's own signal handler (which
+        // raises KeyboardInterrupt) gets temporarily shadowed by
+        // tokio's; on Ctrl-C the pipeline drains + this fn
+        // returns cleanly with shutdown_triggered=true.
+        shutdown_signal: None,
+    };
+    let metrics = py
+        .detach(|| {
+            rt().block_on(async move { ematix_flow_cli::run_consume_with(cfg, options).await })
+        })
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    let dict = PyDict::new(py);
+    dict.set_item("total_rows", metrics.total_rows)?;
+    dict.set_item("iterations", metrics.iterations)?;
+    dict.set_item("shutdown_triggered", metrics.shutdown_triggered)?;
+    Ok(dict)
+}
+
+/// Phase Py.1: run a streaming pipeline from a TOML config file
+/// path. Convenience wrapper around `run_pipeline_from_toml_str`
+/// that reads the file. Same return shape + error semantics.
+#[pyfunction]
+#[pyo3(signature = (path, metrics_port=None))]
+fn run_pipeline_from_path<'py>(
+    py: Python<'py>,
+    path: &str,
+    metrics_port: Option<u16>,
+) -> PyResult<Bound<'py, PyDict>> {
+    let cfg = ematix_flow_cli::PipelineCliConfig::from_path(path)
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    let options = ematix_flow_cli::ConsumeOptions {
+        metrics_port,
+        shutdown_signal: None,
+    };
+    let metrics = py
+        .detach(|| {
+            rt().block_on(async move { ematix_flow_cli::run_consume_with(cfg, options).await })
+        })
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    let dict = PyDict::new(py);
+    dict.set_item("total_rows", metrics.total_rows)?;
+    dict.set_item("iterations", metrics.iterations)?;
+    dict.set_item("shutdown_triggered", metrics.shutdown_triggered)?;
+    Ok(dict)
+}
+
 #[pyfunction]
 fn connect(py: Python<'_>, url: &str) -> PyResult<Connection> {
     let url_owned = url.to_string();
@@ -733,6 +803,8 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(plan_scd2_sql, m)?)?;
     m.add_function(wrap_pyfunction!(connect, m)?)?;
     m.add_function(wrap_pyfunction!(cross_backend_arrow_sync, m)?)?;
+    m.add_function(wrap_pyfunction!(run_pipeline_from_toml_str, m)?)?;
+    m.add_function(wrap_pyfunction!(run_pipeline_from_path, m)?)?;
     m.add_class::<Connection>()?;
     Ok(())
 }

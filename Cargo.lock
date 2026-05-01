@@ -3314,6 +3314,7 @@ dependencies = [
 name = "ematix-flow-py"
 version = "0.1.0"
 dependencies = [
+ "ematix-flow-cli",
  "ematix-flow-core",
  "pyo3",
  "serde_json",
