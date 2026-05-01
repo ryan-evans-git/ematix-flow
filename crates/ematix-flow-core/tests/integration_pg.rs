@@ -4714,6 +4714,50 @@ async fn eos_pipeline_kafka_to_kafka_round_trip() {
     );
 }
 
+// ----- Phase 37c: KinesisBackend ping ----------------------------------
+
+use ematix_flow_core::KinesisBackend;
+use testcontainers_modules::localstack::LocalStack;
+
+const LOCALSTACK_PORT: u16 = 4566;
+
+async fn start_localstack() -> (testcontainers::ContainerAsync<LocalStack>, String) {
+    let container = LocalStack::default()
+        .start()
+        .await
+        .expect("failed to start localstack testcontainer");
+    let host = container
+        .get_host()
+        .await
+        .expect("failed to read localstack host")
+        .to_string();
+    let port = container
+        .get_host_port_ipv4(LOCALSTACK_PORT)
+        .await
+        .expect("failed to read localstack port");
+    let endpoint = format!("http://{host}:{port}");
+    (container, endpoint)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker; run with `cargo test -- --ignored`"]
+async fn kinesis_backend_ping_against_localstack() {
+    let (_container, endpoint) = start_localstack().await;
+    let backend = KinesisBackend::open("ematix-test-stream")
+        .unwrap()
+        .with_region("us-east-1")
+        .with_endpoint(endpoint.clone())
+        .with_static_credentials("fake", "fake");
+    backend.ping().await.unwrap();
+    assert!(matches!(
+        backend.dialect(),
+        ematix_flow_core::backend::Dialect::Streaming { .. }
+    ));
+    let info = backend.connection_info();
+    assert_eq!(info.user, "ematix-test-stream");
+    assert_eq!(info.dbname, endpoint);
+}
+
 // ----- Phase 37b: PubSubBackend ping -----------------------------------
 
 use ematix_flow_core::PubSubBackend;

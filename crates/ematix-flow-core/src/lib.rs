@@ -8,6 +8,7 @@ pub mod delta_backend;
 pub mod duckdb_backend;
 pub mod hash;
 pub mod kafka_backend;
+pub mod kinesis_backend;
 pub mod meta;
 pub mod mysql_backend;
 pub mod objectstore_backend;
@@ -24,6 +25,7 @@ pub use backend::{Backend, BackendError, Dialect, ObjectFormat, PostgresBackend,
 pub use delta_backend::DeltaBackend;
 pub use duckdb_backend::DuckDBBackend;
 pub use kafka_backend::KafkaBackend;
+pub use kinesis_backend::KinesisBackend;
 pub use mysql_backend::MySQLBackend;
 pub use objectstore_backend::ObjectStoreBackend;
 pub use pubsub_backend::PubSubBackend;

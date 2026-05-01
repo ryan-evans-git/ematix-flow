@@ -53,7 +53,7 @@ duckdb = { version = "1.10502", features = ["bundled", "appender-arrow"] }
 # done manually — rusqlite has no Arrow feature.
 rusqlite = { version = "0.31", features = ["bundled", "chrono", "uuid", "column_decltype", "functions"] }
 testcontainers = "0.27"
-testcontainers-modules = { version = "0.15", features = ["postgres", "mysql", "minio", "kafka", "rabbitmq", "google_cloud_sdk_emulators"] }
+testcontainers-modules = { version = "0.15", features = ["postgres", "mysql", "minio", "kafka", "rabbitmq", "google_cloud_sdk_emulators", "localstack"] }
 mysql_async = { version = "0.36", default-features = false, features = ["minimal-rust", "rustls-tls"] }
 # Delta Lake (Phase 35). Pulls in DataFusion + arrow 58 + parquet 58
 # from the same arrow-rs major track as our pinned ones. `rustls`
@@ -108,6 +108,14 @@ google-cloud-pubsub = { version = "0.33", default-features = false, features = [
 # directly so the backend can construct anonymous credentials
 # (emulator path) without going through pubsub's re-exports.
 google-cloud-auth = { version = "1", default-features = false }
+# AWS SDK for Kinesis (Phase 37c). Pulls in the AWS smithy/runtime
+# stack; aws-config handles credential resolution + region from env
+# / IMDS / shared-config / static credentials. Both pinned to the
+# 1.x major track that matches the rest of the workspace's
+# aws-types pin.
+aws-sdk-kinesis = { version = "1", default-features = false, features = ["rt-tokio", "rustls"] }
+aws-config = { version = "1", default-features = false, features = ["rt-tokio", "rustls", "behavior-version-latest"] }
+aws-credential-types = { version = "1", default-features = false }
 # `url` is needed to construct deltalake's `Url` parameter; deltalake
 # doesn't re-export it. Already pulled in transitively, so this just
 # brings it into the workspace's direct namespace.

@@ -46,6 +46,9 @@ protofish = { workspace = true }
 lapin = { workspace = true }
 google-cloud-pubsub = { workspace = true }
 google-cloud-auth = { workspace = true }
+aws-sdk-kinesis = { workspace = true }
+aws-config = { workspace = true }
+aws-credential-types = { workspace = true }
 
 [dev-dependencies]
 arrow-array.workspace = true
