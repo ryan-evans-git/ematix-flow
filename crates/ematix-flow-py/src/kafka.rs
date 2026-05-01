@@ -46,6 +46,7 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyList;
 
+use crate::arrow_iter::PyArrowBatchIter;
 use crate::rt;
 
 /// Python-facing Kafka backend handle.
@@ -292,6 +293,20 @@ impl PyKafkaBackend {
             })
         })
         .map_err(|e| PyValueError::new_err(e.to_string()))
+    }
+
+    /// Same as :py:meth:`read_arrow_stream` but returns a Python
+    /// iterator yielding one PyArrow RecordBatch at a time
+    /// instead of materializing the full drain into a list.
+    /// Useful when each batch is large and the user wants to
+    /// process them streaming-style.
+    fn iter_arrow_stream(&self, py: Python<'_>, query: &str) -> PyResult<PyArrowBatchIter> {
+        let backend = self.inner.clone();
+        let query = query.to_string();
+        let stream = py
+            .detach(|| rt().block_on(async move { backend.read_arrow_stream(&query).await }))
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        Ok(PyArrowBatchIter::new(stream))
     }
 
     /// Commit the consumer's pending offsets. No-op for

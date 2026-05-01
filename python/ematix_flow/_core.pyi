@@ -1,8 +1,24 @@
 """Type stubs for the Rust extension module `ematix_flow._core`."""
 
-from typing import Any, Iterable, TypedDict
+from typing import Any, Iterable, Iterator, TypedDict
 
 import pyarrow as pa
+
+class ArrowBatchIter(Iterator[pa.RecordBatch]):
+    """Sync iterator over a streaming-source `read_arrow_stream`.
+
+    Yields one ``pyarrow.RecordBatch`` at a time. Raises
+    ``StopIteration`` when the stream is exhausted (drain done,
+    source idle, batch limits hit) and ``ValueError`` on a
+    stream-level error. Single-pass — once exhausted, subsequent
+    ``next()`` calls keep raising ``StopIteration``.
+
+    Constructed via ``Backend.iter_arrow_stream(query)`` on the
+    streaming-backend pyclasses.
+    """
+
+    def __iter__(self) -> "ArrowBatchIter": ...
+    def __next__(self) -> pa.RecordBatch: ...
 
 def core_version() -> str: ...
 
@@ -112,6 +128,10 @@ class KafkaBackend:
         """
         ...
 
+    def iter_arrow_stream(self, query: str) -> ArrowBatchIter:
+        """Streaming variant of read_arrow_stream — yields one batch at a time."""
+        ...
+
     def commit_offsets(self) -> None:
         """Commit the consumer's pending offsets. No-op for producer-only."""
         ...
@@ -146,6 +166,10 @@ class RabbitMQBackend:
         self, queue: str, batches: Iterable[pa.RecordBatch]
     ) -> int:
         """Publish via the default exchange with routing_key=queue."""
+        ...
+
+    def iter_arrow_stream(self, query: str) -> ArrowBatchIter:
+        """Streaming variant of read_arrow_stream — yields one batch at a time."""
         ...
 
     def commit_offsets(self) -> None:
@@ -193,6 +217,10 @@ class PubSubBackend:
         self, topic: str, batches: Iterable[pa.RecordBatch]
     ) -> int:
         """Publish to ``topic``. Bare names are auto-qualified."""
+        ...
+
+    def iter_arrow_stream(self, query: str) -> ArrowBatchIter:
+        """Streaming variant of read_arrow_stream — yields one batch at a time."""
         ...
 
     def commit_offsets(self) -> None:
@@ -247,6 +275,12 @@ class KinesisBackend:
 
         ``partition_key_prefix`` becomes the prefix of per-row
         partition keys (rows fan across shards).
+        """
+        ...
+
+    def iter_arrow_stream(self, query: str) -> ArrowBatchIter:
+        """Streaming variant of read_arrow_stream — yields one batch at a time
+        across the multi-shard fanout.
         """
         ...
 

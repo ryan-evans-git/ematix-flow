@@ -1,3 +1,4 @@
+mod arrow_iter;
 mod kafka;
 mod kinesis;
 mod pubsub;
@@ -815,5 +816,6 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<rabbitmq::PyRabbitMQBackend>()?;
     m.add_class::<pubsub::PyPubSubBackend>()?;
     m.add_class::<kinesis::PyKinesisBackend>()?;
+    m.add_class::<arrow_iter::PyArrowBatchIter>()?;
     Ok(())
 }

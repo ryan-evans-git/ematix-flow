@@ -16,6 +16,7 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyList;
 
+use crate::arrow_iter::PyArrowBatchIter;
 use crate::rt;
 
 /// Python-facing GCP Pub/Sub backend handle.
@@ -142,6 +143,18 @@ impl PyPubSubBackend {
             })
         })
         .map_err(|e| PyValueError::new_err(e.to_string()))
+    }
+
+    /// Streaming variant of :py:meth:`read_arrow_stream` —
+    /// returns a Python iterator yielding one PyArrow
+    /// RecordBatch at a time.
+    fn iter_arrow_stream(&self, py: Python<'_>, query: &str) -> PyResult<PyArrowBatchIter> {
+        let backend = self.inner.clone();
+        let query = query.to_string();
+        let stream = py
+            .detach(|| rt().block_on(async move { backend.read_arrow_stream(&query).await }))
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        Ok(PyArrowBatchIter::new(stream))
     }
 
     /// Ack every retained delivery handler.
