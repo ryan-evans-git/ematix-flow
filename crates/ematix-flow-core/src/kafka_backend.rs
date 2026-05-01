@@ -99,14 +99,19 @@ impl Default for KafkaBatchConfig {
 }
 
 /// Wire format for Kafka message payloads. Selected via
-/// `KafkaBackend::with_payload_format`. JSON is the default and the
-/// only one we ship full encode + decode for in 36h; `RawBytes`
-/// covers the "produce raw application bytes / consume into a single
-/// Binary column" pattern.
+/// `KafkaBackend::with_payload_format`. JSON and RawBytes are
+/// fully implemented in 36h; Avro and Protobuf are reserved
+/// surface — every encode/decode path returns a clear
+/// "lands in Phase 36h.X" error until those sub-phases land
+/// (36h.3 Avro decode, 36h.4 Avro encode, 36h.5 Protobuf decode,
+/// 36h.6 Protobuf encode).
 ///
-/// Avro and Protobuf land in 36h.2 — they require Confluent Schema
-/// Registry integration (schema fetch + magic-byte framing) which is
-/// its own sub-phase.
+/// Each direction is its own sub-phase because the encode and
+/// decode pipelines are largely independent. Decode strips the
+/// 5-byte Confluent magic-byte prefix, fetches the schema from
+/// Schema Registry by ID, decodes into the target's Arrow
+/// dialect; encode does the symmetric reverse + schema
+/// registration on first produce.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum KafkaPayloadFormat {
     /// One JSON object per message. Decodes to N rows with the
@@ -122,6 +127,13 @@ pub enum KafkaPayloadFormat {
     /// message payload (column name doesn't matter — only its
     /// type).
     RawBytes,
+    /// Confluent-Schema-Registry-framed Avro. Surface reserved in
+    /// 36h.2; the decode path lands in 36h.3 and the encode path
+    /// in 36h.4.
+    Avro,
+    /// Confluent-Schema-Registry-framed Protobuf. Decode lands in
+    /// 36h.5, encode in 36h.6.
+    Protobuf,
 }
 
 /// Column name used by the RawBytes decoder for the single Binary
@@ -923,6 +935,27 @@ impl Backend for KafkaBackend {
                 "Kafka read_arrow_stream: query argument must be a non-empty topic name".into(),
             ));
         }
+        // Reject unsupported payload formats *before* opening the
+        // consumer. Saves a broker round-trip + makes the error
+        // testable without Docker.
+        match self.payload_format {
+            KafkaPayloadFormat::Json | KafkaPayloadFormat::RawBytes => {}
+            KafkaPayloadFormat::Avro => {
+                return Err(BackendError::Other(
+                    "Kafka read_arrow_stream Avro: surface reserved in 36h.2; \
+                     decode lands in Phase 36h.3 (Confluent Schema Registry \
+                     client + magic-byte framing + apache_avro::Value → Arrow)"
+                        .into(),
+                ));
+            }
+            KafkaPayloadFormat::Protobuf => {
+                return Err(BackendError::Other(
+                    "Kafka read_arrow_stream Protobuf: surface reserved in 36h.2; \
+                     decode lands in Phase 36h.5 (Schema Registry + prost-reflect)"
+                        .into(),
+                ));
+            }
+        }
 
         // Acquire / lazily-create the persistent consumer session.
         // Reuses the StreamConsumer across calls so group rebalance +
@@ -958,6 +991,14 @@ impl Backend for KafkaBackend {
         let batches = match self.payload_format {
             KafkaPayloadFormat::Json => decode_payloads_as_jsonl(payloads)?,
             KafkaPayloadFormat::RawBytes => decode_payloads_as_raw_bytes(payloads)?,
+            // Avro / Protobuf are rejected up-front (above), so this
+            // arm is unreachable in practice. The compiler enforces
+            // exhaustiveness; we route through unreachable!() to
+            // keep the format-dispatch readable without dragging
+            // duplicated error strings into two places.
+            KafkaPayloadFormat::Avro | KafkaPayloadFormat::Protobuf => {
+                unreachable!("Avro/Protobuf format rejected at read entry")
+            }
         };
         let stream = futures_util::stream::iter(batches.into_iter().map(Ok));
         Ok(Box::pin(stream))
@@ -999,6 +1040,27 @@ impl Backend for KafkaBackend {
                 "Kafka write_arrow_stream: target.name (topic) must be non-empty".into(),
             ));
         }
+        // Reject unsupported payload formats *before* opening the
+        // producer / running init_transactions. Saves a broker
+        // round-trip + makes the error testable without Docker.
+        match self.payload_format {
+            KafkaPayloadFormat::Json | KafkaPayloadFormat::RawBytes => {}
+            KafkaPayloadFormat::Avro => {
+                return Err(BackendError::Other(
+                    "Kafka write_arrow_stream Avro: surface reserved in 36h.2; \
+                     encode lands in Phase 36h.4 (Arrow → apache_avro::Value + \
+                     Schema Registry register/fetch + magic-byte framing)"
+                        .into(),
+                ));
+            }
+            KafkaPayloadFormat::Protobuf => {
+                return Err(BackendError::Other(
+                    "Kafka write_arrow_stream Protobuf: surface reserved in \
+                     36h.2; encode lands in Phase 36h.6"
+                        .into(),
+                ));
+            }
+        }
         let producer = self.acquire_producer().await?;
         let transactional = matches!(
             &self.delivery_semantics,
@@ -1015,6 +1077,11 @@ impl Backend for KafkaBackend {
             let payloads = match self.payload_format {
                 KafkaPayloadFormat::Json => encode_batch_as_jsonl_lines(&batch)?,
                 KafkaPayloadFormat::RawBytes => encode_batch_as_raw_bytes(&batch)?,
+                // Avro / Protobuf are rejected up-front (above), so
+                // this arm is unreachable in practice.
+                KafkaPayloadFormat::Avro | KafkaPayloadFormat::Protobuf => {
+                    unreachable!("Avro/Protobuf format rejected at write entry")
+                }
             };
             // ExactlyOnce: wrap the per-batch produce in a Kafka
             // transaction so a partial-failure mid-batch aborts and
@@ -1691,6 +1758,88 @@ mod tests {
         let err = encode_batch_as_raw_bytes(&batch).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("type Binary"), "got: {msg}");
+    }
+
+    // --- Phase 36h.2: Avro / Protobuf surface reserved --------------------
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn avro_read_rejects_with_pointer_to_36h_3() {
+        let b = KafkaBackend::open("localhost:9092", Some("g1"))
+            .unwrap()
+            .with_payload_format(KafkaPayloadFormat::Avro);
+        let err = match b.read_arrow_stream("any-topic").await {
+            Ok(_) => panic!("expected Avro read rejection"),
+            Err(e) => e,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("Phase 36h.3"), "got: {msg}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn avro_write_rejects_with_pointer_to_36h_4() {
+        use arrow_array::Int64Array;
+        use arrow_schema::{DataType, Field, Schema};
+        let b = KafkaBackend::open("localhost:9092", None)
+            .unwrap()
+            .with_payload_format(KafkaPayloadFormat::Avro);
+        // Build a non-empty stream so dispatch reaches the format
+        // match (an empty stream would early-return before encoding).
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, true)]));
+        let batch =
+            arrow_array::RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1]))])
+                .unwrap();
+        let stream: ArrowBatchStream = Box::pin(futures_util::stream::once(async move {
+            Ok::<_, BackendError>(batch)
+        }));
+        let target = TargetTable {
+            schema: "".into(),
+            name: "any".into(),
+        };
+        let err = b
+            .write_arrow_stream(&target, stream, WriteMode::Append)
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("Phase 36h.4"), "got: {msg}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn protobuf_read_rejects_with_pointer_to_36h_5() {
+        let b = KafkaBackend::open("localhost:9092", Some("g1"))
+            .unwrap()
+            .with_payload_format(KafkaPayloadFormat::Protobuf);
+        let err = match b.read_arrow_stream("any-topic").await {
+            Ok(_) => panic!("expected Protobuf read rejection"),
+            Err(e) => e,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("Phase 36h.5"), "got: {msg}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn protobuf_write_rejects_with_pointer_to_36h_6() {
+        use arrow_array::Int64Array;
+        use arrow_schema::{DataType, Field, Schema};
+        let b = KafkaBackend::open("localhost:9092", None)
+            .unwrap()
+            .with_payload_format(KafkaPayloadFormat::Protobuf);
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, true)]));
+        let batch =
+            arrow_array::RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1]))])
+                .unwrap();
+        let stream: ArrowBatchStream = Box::pin(futures_util::stream::once(async move {
+            Ok::<_, BackendError>(batch)
+        }));
+        let target = TargetTable {
+            schema: "".into(),
+            name: "any".into(),
+        };
+        let err = b
+            .write_arrow_stream(&target, stream, WriteMode::Append)
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("Phase 36h.6"), "got: {msg}");
     }
 
     // --- Phase 36j: delivery semantics ------------------------------------
