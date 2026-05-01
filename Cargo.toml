@@ -23,11 +23,17 @@ sha2 = "0.10"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 tokio-postgres = { version = "0.7", features = ["with-uuid-1", "with-serde_json-1"] }
 deadpool-postgres = "0.14"
-uuid = { version = "1", features = ["v4"] }
+uuid = { version = "1", features = ["v4", "v7"] }
 futures-util = "0.3"
 bytes = "1"
 arrow-array = "56"
 arrow-schema = "56"
+# Apache Arrow object_store + parquet — kept on the same major version
+# track as arrow-array (56.x) so the Arrow ABI matches across crates.
+object_store = "0.12"
+parquet = { version = "56", features = ["arrow", "async", "object_store"] }
+# Add UUIDv7 feature for sortable file names (`<prefix>/<uuid7>.parquet`).
+# Already in the workspace at v1; the v7 feature is a flag flip.
 # DuckDB pinned so the bundled C source matches the arrow-array version.
 # `bundled` compiles DuckDB from source on the first build (~3-5 min,
 # one-time); subsequent builds are cached. This avoids depending on a

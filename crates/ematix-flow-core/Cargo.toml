@@ -28,9 +28,12 @@ arrow-schema = { workspace = true }
 duckdb = { workspace = true }
 rusqlite = { workspace = true }
 mysql_async = { workspace = true }
+object_store = { workspace = true }
+parquet = { workspace = true }
 
 [dev-dependencies]
 arrow-array.workspace = true
 testcontainers.workspace = true
 testcontainers-modules.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+tempfile = "3"
