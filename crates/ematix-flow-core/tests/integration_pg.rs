@@ -1482,3 +1482,188 @@ async fn duckdb_run_append_incremental_filters_and_advances_watermark() {
         .to_string();
     assert_eq!(last, "500");
 }
+
+// --- Phase 31d.3: DuckDB merge insert/update split + handle_deletes ------
+
+fn duckdb_merge_target_spec() -> TableSpec {
+    augment_with_metadata(&TableSpec {
+        schema: "wh".into(),
+        name: "event_log".into(),
+        columns: vec![
+            ColumnSpec {
+                name: "event_id".into(),
+                ty: ColumnType::BigInt,
+                nullable: false,
+                primary_key: true,
+            },
+            ColumnSpec {
+                name: "name".into(),
+                ty: ColumnType::Text,
+                nullable: true,
+                primary_key: false,
+            },
+        ],
+        unique_constraints: Vec::new(),
+        fingerprint: String::new(),
+    })
+}
+
+async fn duckdb_merge_setup(backend: &Arc<dyn Backend>) {
+    backend.execute("CREATE SCHEMA src").await.unwrap();
+    backend.execute("CREATE SCHEMA wh").await.unwrap();
+    backend
+        .execute("CREATE TABLE src.events (event_id BIGINT, name VARCHAR)")
+        .await
+        .unwrap();
+    backend
+        .execute(
+            "CREATE TABLE wh.event_log (\
+              event_id BIGINT PRIMARY KEY, name VARCHAR, \
+              _loaded_at TIMESTAMPTZ, _batch_id UUID\
+            )",
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn duckdb_run_merge_splits_inserts_from_updates() {
+    let backend: Arc<dyn Backend> = Arc::new(DuckDBBackend::open(":memory:").unwrap());
+    duckdb_merge_setup(&backend).await;
+    let target = duckdb_merge_target_spec();
+    backend
+        .execute("INSERT INTO src.events VALUES (1, 'a'), (2, 'b'), (3, 'c')")
+        .await
+        .unwrap();
+
+    // First merge: 3 inserts, 0 updates.
+    let r1 = backend
+        .run_merge(
+            &target,
+            "SELECT event_id, name FROM src.events",
+            &["event_id".into()],
+            &["name".into()],
+            "duckdb_split_test",
+            "merge",
+            None,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+    assert_eq!(r1.rows_inserted, 3, "all 3 are new");
+    assert_eq!(r1.rows_updated, Some(0));
+
+    // Second merge: change 1, leave 2 alone, add 4. Drop 3 from source
+    // (but no handle_deletes → target should still have 3).
+    backend.execute("DELETE FROM src.events").await.unwrap();
+    backend
+        .execute("INSERT INTO src.events VALUES (1, 'a-new'), (2, 'b'), (4, 'd')")
+        .await
+        .unwrap();
+    let r2 = backend
+        .run_merge(
+            &target,
+            "SELECT event_id, name FROM src.events",
+            &["event_id".into()],
+            &["name".into()],
+            "duckdb_split_test",
+            "merge",
+            None,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+    assert_eq!(r2.rows_inserted, 1, "only event_id=4 is new");
+    // 1 + 2 are updates (2's values are unchanged but DuckDB cannot
+    // distinguish without a row-hash; 31d treats them as updates).
+    assert_eq!(r2.rows_updated, Some(2));
+
+    // Target retains row 3 because no handle_deletes.
+    use arrow_array::Int64Array;
+    let stream = backend
+        .read_arrow_stream("SELECT count(*)::BIGINT FROM wh.event_log")
+        .await
+        .unwrap();
+    let batches: Vec<_> = stream.try_collect().await.unwrap();
+    let total = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(total, 4, "target = {{1,2,3,4}}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn duckdb_run_merge_handle_deletes_removes_missing_keys() {
+    use ematix_flow_core::meta::DeleteHandling;
+    let backend: Arc<dyn Backend> = Arc::new(DuckDBBackend::open(":memory:").unwrap());
+    duckdb_merge_setup(&backend).await;
+    let target = duckdb_merge_target_spec();
+    backend
+        .execute("INSERT INTO src.events VALUES (1, 'a'), (2, 'b'), (3, 'c')")
+        .await
+        .unwrap();
+    backend
+        .run_merge(
+            &target,
+            "SELECT event_id, name FROM src.events",
+            &["event_id".into()],
+            &["name".into()],
+            "duckdb_delete_test",
+            "merge",
+            None,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+
+    // Drop event_id=3 from source; merge with handle_deletes=Hard.
+    backend.execute("DELETE FROM src.events").await.unwrap();
+    backend
+        .execute("INSERT INTO src.events VALUES (1, 'a'), (2, 'b-new')")
+        .await
+        .unwrap();
+    backend
+        .run_merge(
+            &target,
+            "SELECT event_id, name FROM src.events",
+            &["event_id".into()],
+            &["name".into()],
+            "duckdb_delete_test",
+            "merge",
+            None,
+            Some(DeleteHandling::Hard),
+            false,
+        )
+        .await
+        .unwrap();
+
+    use arrow_array::Int64Array;
+    let stream = backend
+        .read_arrow_stream(
+            "SELECT count(*)::BIGINT, \
+                    sum(CASE WHEN event_id = 3 THEN 1 ELSE 0 END)::BIGINT \
+             FROM wh.event_log",
+        )
+        .await
+        .unwrap();
+    let batches: Vec<_> = stream.try_collect().await.unwrap();
+    let total = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap()
+        .value(0);
+    let row3 = batches[0]
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(total, 2, "row 3 deleted; only 1 + 2 remain");
+    assert_eq!(row3, 0, "row 3 specifically gone");
+}

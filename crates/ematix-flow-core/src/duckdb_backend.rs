@@ -23,7 +23,7 @@ use crate::backend::{
     ArrowBatchStream, Backend, BackendError, DeleteHandling, Dialect, StrategyRunResult,
     TargetTable, WriteMode,
 };
-use crate::meta::{WatermarkConfig, wrap_with_watermark_filter};
+use crate::meta::{WatermarkConfig, build_hard_delete_sql, wrap_with_watermark_filter};
 use crate::pg::ConnectionInfo;
 use crate::strategy::append::{BATCH_ID_COL, LOADED_AT_COL, plan_same_db_append};
 use crate::strategy::scd2::{IS_CURRENT_COL, ROW_HASH_COL, VALID_FROM_COL, VALID_TO_COL};
@@ -855,14 +855,35 @@ impl Backend for DuckDBBackend {
                 "DuckDB cross-backend run_merge goes through the Arrow bridge".into(),
             ));
         }
-        if delete_handling.is_some() {
-            return Err(BackendError::Other(
-                "DuckDB run_merge: handle_deletes not yet supported (Phase 31d)".into(),
-            ));
-        }
         let batch_id = Uuid::new_v4();
         let run_id = Uuid::new_v4();
-        let sql = duckdb_merge_sql(spec, source_query, keys, update_columns, &batch_id);
+        let merge_sql = duckdb_merge_sql(spec, source_query, keys, update_columns, &batch_id);
+
+        // Pre-merge insert count via anti-join: rows in source whose
+        // keys aren't already in target. Done inside the same
+        // transaction as the merge so source-side data churn doesn't
+        // race with us. DuckDB's `INSERT … ON CONFLICT DO UPDATE`
+        // returns the inserts+updates total; subtracting yields the
+        // update count. PG's xmax trick splits unchanged from updated
+        // — DuckDB has no equivalent, so rows_unchanged stays 0 here.
+        let insert_count_sql = format!(
+            "SELECT count(*)::BIGINT FROM ({src}) src_count \
+             WHERE ({key_tuple}) NOT IN (SELECT {key_tuple} FROM {schema}.{table})",
+            src = source_query,
+            key_tuple = keys.join(", "),
+            schema = spec.schema,
+            table = spec.name,
+        );
+        let delete_sql = if matches!(delete_handling, Some(DeleteHandling::Hard)) {
+            Some(build_hard_delete_sql(
+                &spec.schema,
+                &spec.name,
+                keys,
+                source_query,
+            ))
+        } else {
+            None
+        };
 
         self.ensure_meta_schema().await?;
         self.record_run_start(
@@ -875,18 +896,34 @@ impl Backend for DuckDBBackend {
         )
         .await?;
 
-        // DuckDB's `INSERT ... ON CONFLICT DO UPDATE` returns the
-        // affected-row count as inserts + updates summed (no easy way
-        // to split without a follow-up query). Surface it as
-        // rows_inserted for now; rows_updated tracking is a 31d
-        // refinement.
-        let affected_result: Result<u64, BackendError> = self
+        let merge_result: Result<(i64, i64), BackendError> = self
             .with_conn_blocking(move |c| {
                 c.execute_batch("BEGIN")
                     .map_err(|e| BackendError::Query(e.to_string()))?;
-                let n = c
-                    .execute(&sql, [])
-                    .map_err(|e| BackendError::Query(e.to_string()))?;
+                // Anti-join count first.
+                let inserts: i64 = {
+                    let mut stmt = c
+                        .prepare(&insert_count_sql)
+                        .map_err(|e| BackendError::Query(e.to_string()))?;
+                    let mut rows = stmt
+                        .query([])
+                        .map_err(|e| BackendError::Query(e.to_string()))?;
+                    let row = rows
+                        .next()
+                        .map_err(|e| BackendError::Query(e.to_string()))?
+                        .ok_or_else(|| {
+                            BackendError::Query("anti-join count returned no row".into())
+                        })?;
+                    row.get(0).map_err(|e| BackendError::Query(e.to_string()))?
+                };
+                let total = c
+                    .execute(&merge_sql, [])
+                    .map_err(|e| BackendError::Query(e.to_string()))?
+                    as i64;
+                if let Some(dsql) = &delete_sql {
+                    c.execute(dsql, [])
+                        .map_err(|e| BackendError::Query(e.to_string()))?;
+                }
                 if dry_run {
                     c.execute_batch("ROLLBACK")
                         .map_err(|e| BackendError::Query(e.to_string()))?;
@@ -894,25 +931,26 @@ impl Backend for DuckDBBackend {
                     c.execute_batch("COMMIT")
                         .map_err(|e| BackendError::Query(e.to_string()))?;
                 }
-                Ok::<u64, BackendError>(n as u64)
+                let updated = (total - inserts).max(0);
+                Ok((inserts, updated))
             })
             .await;
 
-        match &affected_result {
-            Ok(n) => {
-                self.record_run_success_merge(run_id, *n as i64, 0, 0)
+        match &merge_result {
+            Ok((inserted, updated)) => {
+                self.record_run_success_merge(run_id, *inserted, *updated, 0)
                     .await?
             }
             Err(e) => {
                 let _ = self.record_run_failure(run_id, &e.to_string()).await;
             }
         }
-        let affected = affected_result?;
+        let (inserted, updated) = merge_result?;
 
         Ok(StrategyRunResult {
             run_id: run_id.to_string(),
-            rows_inserted: affected as i64,
-            rows_updated: Some(0),
+            rows_inserted: inserted,
+            rows_updated: Some(updated),
             rows_unchanged: Some(0),
             rows_closed: None,
             status: if dry_run { "dry_run" } else { "success" }.into(),
