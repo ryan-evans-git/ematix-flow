@@ -30,6 +30,11 @@ arrow-array = "56"
 arrow-schema = "56"
 arrow-csv = "56"
 arrow-json = "56"
+# orc-rust 0.6 is the last release pinned to arrow 56.x. 0.7+ moved to
+# arrow 57/58, which would conflict with our pinned 56 ABI (RecordBatch
+# would be a different type across crates). Bumping the whole workspace
+# to arrow 58 is its own future phase; until then, 0.6.3 covers ORC.
+orc-rust = { version = "0.6", default-features = false }
 # Apache Arrow object_store + parquet — kept on the same major version
 # track as arrow-array (56.x) so the Arrow ABI matches across crates.
 object_store = "0.12"

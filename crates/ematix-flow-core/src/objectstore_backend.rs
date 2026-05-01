@@ -365,6 +365,123 @@ async fn write_jsonl_at_path(
     Ok(total)
 }
 
+/// Read all ORC files under `prefix` and concatenate their Arrow batches.
+/// `orc-rust` 0.6 has a sync `ArrowReaderBuilder` that needs a
+/// `ChunkReader` (essentially `Read + Seek + len`); `Cursor<&[u8]>`
+/// satisfies that.
+async fn read_orc_under_prefix(
+    store: &Arc<dyn ObjectStore>,
+    prefix: ObjectPath,
+) -> Result<Vec<RecordBatch>, BackendError> {
+    use orc_rust::ArrowReaderBuilder;
+
+    let mut listing = store.list(Some(&prefix));
+    let mut batches: Vec<RecordBatch> = Vec::new();
+    while let Some(meta) = listing.next().await {
+        let meta = meta.map_err(|e| BackendError::Connection(format!("list: {e}")))?;
+        if !meta.location.as_ref().ends_with(".orc") {
+            continue;
+        }
+        let bytes = store
+            .get(&meta.location)
+            .await
+            .map_err(|e| BackendError::Connection(format!("get {}: {e}", meta.location)))?
+            .bytes()
+            .await
+            .map_err(|e| BackendError::Connection(format!("get bytes: {e}")))?;
+        // orc-rust's ChunkReader is implemented directly on `Bytes`,
+        // so we hand it the bytes without an intermediate Cursor.
+        let reader = ArrowReaderBuilder::try_new(bytes)
+            .map_err(|e| BackendError::Query(format!("orc open: {e}")))?
+            .build();
+        for b in reader {
+            let b = b.map_err(|e| BackendError::Query(format!("orc batch: {e}")))?;
+            batches.push(b);
+        }
+    }
+    Ok(batches)
+}
+
+/// Write a stream of Arrow batches as one ORC file at `path`.
+///
+/// orc-rust 0.6's `ArrowWriter::close` consumes the writer and offers
+/// no `into_inner`, so we hand it a shared `Arc<Mutex<Vec<u8>>>`
+/// wrapper that impls `std::io::Write`. After close drops the writer
+/// (the Arc clone it owned), the original Arc is unique and we can
+/// take ownership of the Vec for the PUT. orc-rust 0.7+ adds
+/// `into_inner` and would let us drop this wrapper.
+async fn write_orc_at_path(
+    store: &Arc<dyn ObjectStore>,
+    path: ObjectPath,
+    mut stream: ArrowBatchStream,
+) -> Result<u64, BackendError> {
+    use orc_rust::ArrowWriterBuilder;
+    use std::sync::Mutex;
+
+    let mut batches: Vec<RecordBatch> = Vec::new();
+    while let Some(b) = stream.next().await {
+        batches.push(b?);
+    }
+    if batches.is_empty() {
+        return Ok(0);
+    }
+    let schema = batches[0].schema();
+
+    struct SharedBuf(Arc<Mutex<Vec<u8>>>);
+    impl std::io::Write for SharedBuf {
+        fn write(&mut self, src: &[u8]) -> std::io::Result<usize> {
+            let mut buf = self
+                .0
+                .lock()
+                .map_err(|e| std::io::Error::other(format!("orc buf poisoned: {e}")))?;
+            buf.extend_from_slice(src);
+            Ok(src.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    // Scope the !Send writer in an inner block so it's dropped before
+    // the next await — orc-rust 0.6's ArrowWriter holds a
+    // `dyn ColumnStripeEncoder` without `Send`, which would otherwise
+    // poison this future's Send bound.
+    let (buf, total) = {
+        let inner: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::with_capacity(64 * 1024)));
+        let mut writer = ArrowWriterBuilder::new(SharedBuf(inner.clone()), schema)
+            .try_build()
+            .map_err(|e| BackendError::Query(format!("orc writer init: {e}")))?;
+        let mut total: u64 = 0;
+        for batch in &batches {
+            total += batch.num_rows() as u64;
+            writer
+                .write(batch)
+                .map_err(|e| BackendError::Query(format!("orc write batch: {e}")))?;
+        }
+        writer
+            .close()
+            .map_err(|e| BackendError::Query(format!("orc close: {e}")))?;
+        // `close` dropped the writer and its SharedBuf clone. Our
+        // `inner` is now the unique strong reference; take the Vec out.
+        let buf = match Arc::try_unwrap(inner) {
+            Ok(mutex) => mutex
+                .into_inner()
+                .map_err(|e| BackendError::Other(format!("orc buf into_inner: {e}")))?,
+            Err(arc) => arc
+                .lock()
+                .map_err(|e| BackendError::Other(format!("orc buf lock: {e}")))?
+                .clone(),
+        };
+        (buf, total)
+    };
+    let bytes = Bytes::from(buf);
+    store
+        .put(&path, bytes.into())
+        .await
+        .map_err(|e| BackendError::Connection(format!("put {path}: {e}")))?;
+    Ok(total)
+}
+
 /// Delete every object under `prefix`. Used by `WriteMode::Truncate`.
 /// Walks the listing and issues per-object deletes — `object_store`
 /// has no atomic prefix-delete primitive (S3/Azure/GCS don't either,
@@ -438,12 +555,7 @@ impl Backend for ObjectStoreBackend {
             ObjectFormat::Parquet => read_parquet_under_prefix(&self.store, prefix).await?,
             ObjectFormat::Csv => read_csv_under_prefix(&self.store, prefix).await?,
             ObjectFormat::JsonLines => read_jsonl_under_prefix(&self.store, prefix).await?,
-            other => {
-                return Err(BackendError::Other(format!(
-                    "ObjectStore read_arrow_stream: format {other:?} lands in \
-                     a later sub-phase"
-                )));
-            }
+            ObjectFormat::Orc => read_orc_under_prefix(&self.store, prefix).await?,
         };
         let stream = futures_util::stream::iter(batches.into_iter().map(Ok));
         Ok(Box::pin(stream))
@@ -464,10 +576,7 @@ impl Backend for ObjectStoreBackend {
             ObjectFormat::Parquet => write_parquet_at_path(&self.store, path, stream).await,
             ObjectFormat::Csv => write_csv_at_path(&self.store, path, stream).await,
             ObjectFormat::JsonLines => write_jsonl_at_path(&self.store, path, stream).await,
-            other => Err(BackendError::Other(format!(
-                "ObjectStore write_arrow_stream: format {other:?} lands in \
-                 a later sub-phase"
-            ))),
+            ObjectFormat::Orc => write_orc_at_path(&self.store, path, stream).await,
         }
     }
 
@@ -684,19 +793,70 @@ mod tests {
         assert!(msg.contains("Phase 35"), "got: {msg}");
     }
 
+    // --- Phase 34d: ORC -----------------------------------------------------
+
     #[tokio::test(flavor = "multi_thread")]
-    async fn objectstore_orc_format_unsupported_until_34c() {
-        // ORC lands in 34d. Until then, mismatched format reads error
-        // with a helpful pointer. (CSV used to be in this list; it
-        // shipped in 34b.)
+    async fn objectstore_local_orc_round_trip() {
         let dir = tempfile::tempdir().unwrap();
         let backend = ObjectStoreBackend::open_local(dir.path(), ObjectFormat::Orc).unwrap();
-        let err = match backend.read_arrow_stream("anything").await {
-            Ok(_) => panic!("expected error for ORC in 34b"),
-            Err(e) => e,
+        backend.ping().await.unwrap();
+
+        let target = TargetTable {
+            schema: "raw".into(),
+            name: "events".into(),
         };
-        let msg = err.to_string();
-        assert!(msg.contains("later sub-phase"), "got: {msg}");
+        let n = backend
+            .write_arrow_stream(&target, arrow_stream_for(small_batch()), WriteMode::Append)
+            .await
+            .unwrap();
+        assert_eq!(n, 3);
+
+        let stream = backend.read_arrow_stream("raw/events").await.unwrap();
+        let batches: Vec<RecordBatch> = futures_util::TryStreamExt::try_collect(stream)
+            .await
+            .unwrap();
+        let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, 3);
+
+        let names = batches[0]
+            .column_by_name("name")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(names.value(0), "alice");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn objectstore_orc_truncate_clears_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = ObjectStoreBackend::open_local(dir.path(), ObjectFormat::Orc).unwrap();
+        let target = TargetTable {
+            schema: "raw".into(),
+            name: "events".into(),
+        };
+        backend
+            .write_arrow_stream(&target, arrow_stream_for(small_batch()), WriteMode::Append)
+            .await
+            .unwrap();
+        backend
+            .write_arrow_stream(&target, arrow_stream_for(small_batch()), WriteMode::Append)
+            .await
+            .unwrap();
+        backend
+            .write_arrow_stream(
+                &target,
+                arrow_stream_for(small_batch()),
+                WriteMode::Truncate,
+            )
+            .await
+            .unwrap();
+        let stream = backend.read_arrow_stream("raw/events").await.unwrap();
+        let batches: Vec<RecordBatch> = futures_util::TryStreamExt::try_collect(stream)
+            .await
+            .unwrap();
+        let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, 3, "old files removed by truncate");
     }
 
     // --- Phase 34b: CSV ------------------------------------------------------
