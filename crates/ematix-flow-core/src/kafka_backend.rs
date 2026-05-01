@@ -39,7 +39,8 @@
 //! every pipeline targeting Kafka uses. Consumer mode requires a
 //! `group_id` for offset tracking and rebalancing.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use arrow_array::RecordBatch;
@@ -48,8 +49,9 @@ use rdkafka::ClientConfig;
 use rdkafka::Message;
 use rdkafka::admin::AdminClient;
 use rdkafka::client::DefaultClientContext;
-use rdkafka::consumer::{Consumer, StreamConsumer};
+use rdkafka::consumer::{CommitMode, Consumer, StreamConsumer};
 use rdkafka::producer::{FutureProducer, FutureRecord};
+use rdkafka::topic_partition_list::{Offset, TopicPartitionList};
 use rdkafka::util::Timeout;
 
 use crate::backend::{
@@ -96,6 +98,28 @@ impl Default for KafkaBatchConfig {
     }
 }
 
+/// Lazy-initialized consumer session that persists across
+/// `read_arrow_stream` calls so that:
+///   - the same group rebalance / offset state is reused (avoids
+///     re-paying the rebalance cost every read),
+///   - offsets accumulated during read can be committed *after* the
+///     downstream backend has durably written, via
+///     `KafkaBackend::commit_offsets`.
+///
+/// Only one topic is supported per backend handle; subscribing to a
+/// different topic drops and recreates the consumer (and discards
+/// any pending offsets — uncommitted reads on the old topic will be
+/// re-delivered).
+#[derive(Default)]
+struct ConsumerSession {
+    consumer: Option<Arc<StreamConsumer>>,
+    subscribed_topic: Option<String>,
+    /// `partition → offset_to_commit`. The commit position is the
+    /// offset of the *next* message to consume (i.e. last consumed
+    /// offset + 1) — that's what the Kafka commit protocol wants.
+    pending_offsets: HashMap<i32, i64>,
+}
+
 /// Kafka-backed implementation of `Backend`.
 ///
 /// Holds a librdkafka `ClientConfig` rather than a long-lived
@@ -103,6 +127,10 @@ impl Default for KafkaBatchConfig {
 /// clients are constructed on demand from the same config. This
 /// matches how every other Backend in the framework holds a "config"
 /// and constructs a fresh handle per operation.
+///
+/// Consumer-side state (the StreamConsumer + pending offsets) is held
+/// behind a `Mutex` so multiple `read_arrow_stream` + `commit_offsets`
+/// calls can share the same consumer session (Phase 36e).
 #[derive(Debug)]
 pub struct KafkaBackend {
     /// Comma-separated `host:port` list. Cloned into every per-op
@@ -114,6 +142,20 @@ pub struct KafkaBackend {
     /// Batch limits applied by `read_arrow_stream`. Builder-set via
     /// `with_batch_config`; defaults match `KafkaBatchConfig::default`.
     batch_config: KafkaBatchConfig,
+    /// Lazy consumer session — populated on first `read_arrow_stream`,
+    /// reused on subsequent calls within the same backend instance,
+    /// committed by `commit_offsets`.
+    consumer_session: Arc<Mutex<ConsumerSession>>,
+}
+
+impl std::fmt::Debug for ConsumerSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `StreamConsumer` doesn't implement Debug; redact it.
+        f.debug_struct("ConsumerSession")
+            .field("subscribed_topic", &self.subscribed_topic)
+            .field("pending_offsets_count", &self.pending_offsets.len())
+            .finish()
+    }
 }
 
 impl KafkaBackend {
@@ -136,7 +178,116 @@ impl KafkaBackend {
             bootstrap_servers,
             group_id: group_id.map(|s| s.to_string()),
             batch_config: KafkaBatchConfig::default(),
+            consumer_session: Arc::new(Mutex::new(ConsumerSession::default())),
         })
+    }
+
+    /// Commit any offsets accumulated by prior `read_arrow_stream`
+    /// calls on this backend. The commit fires synchronously against
+    /// the broker (`CommitMode::Sync`); on success, the committed
+    /// offsets are cleared from the in-memory pending set.
+    ///
+    /// This is the at-least-once primitive: the framework's
+    /// pipeline executor (a future phase) calls it **after** the
+    /// target backend has durably written the rows. A crash between
+    /// read and commit means the same messages get re-delivered on
+    /// the next consumer session — that's the at-least-once
+    /// guarantee. `enable.auto.commit=false` is set in
+    /// `client_config` so librdkafka never commits behind our back.
+    ///
+    /// No-ops if no consumer has been opened yet, or if no offsets
+    /// are pending — safe to call after a zero-message read.
+    pub async fn commit_offsets(&self) -> Result<(), BackendError> {
+        let snapshot = {
+            let session = self
+                .consumer_session
+                .lock()
+                .map_err(|e| BackendError::Other(format!("kafka consumer lock: {e}")))?;
+            match (
+                session.consumer.as_ref(),
+                session.subscribed_topic.as_deref(),
+                session.pending_offsets.is_empty(),
+            ) {
+                (Some(consumer), Some(topic), false) => Some((
+                    Arc::clone(consumer),
+                    topic.to_string(),
+                    session.pending_offsets.clone(),
+                )),
+                _ => None,
+            }
+        };
+        let Some((consumer, topic, offsets)) = snapshot else {
+            return Ok(());
+        };
+        // Build the TopicPartitionList we want to commit. The Kafka
+        // commit protocol expects "offset of the next message to
+        // consume" per partition — we already store offsets in that
+        // form (last consumed + 1), so it's a direct copy.
+        let mut tpl = TopicPartitionList::new();
+        for (partition, offset) in &offsets {
+            tpl.add_partition_offset(&topic, *partition, Offset::Offset(*offset))
+                .map_err(|e| {
+                    BackendError::Query(format!("kafka commit tpl partition={partition}: {e}"))
+                })?;
+        }
+        // Commit is synchronous (FFI) — wrap in spawn_blocking.
+        tokio::task::spawn_blocking(move || {
+            consumer
+                .commit(&tpl, CommitMode::Sync)
+                .map_err(|e| BackendError::Query(format!("kafka commit: {e}")))
+        })
+        .await
+        .map_err(|e| BackendError::Other(format!("kafka commit join: {e}")))??;
+
+        // Clear pending offsets — only after the broker ack lands.
+        let mut session = self
+            .consumer_session
+            .lock()
+            .map_err(|e| BackendError::Other(format!("kafka consumer lock: {e}")))?;
+        session.pending_offsets.clear();
+        Ok(())
+    }
+
+    /// Number of pending (uncommitted) offsets across all assigned
+    /// partitions. Tests + introspection.
+    pub fn pending_offset_count(&self) -> usize {
+        self.consumer_session
+            .lock()
+            .map(|s| s.pending_offsets.len())
+            .unwrap_or(0)
+    }
+
+    /// Get (or lazily-create) the StreamConsumer for `topic`. If the
+    /// session is already subscribed to a different topic, drop the
+    /// old consumer (and pending offsets — uncommitted reads on the
+    /// old topic will be re-delivered on the next subscribe to it).
+    fn acquire_consumer_for(&self, topic: &str) -> Result<Arc<StreamConsumer>, BackendError> {
+        let mut session = self
+            .consumer_session
+            .lock()
+            .map_err(|e| BackendError::Other(format!("kafka consumer lock: {e}")))?;
+        let need_new = !matches!(
+            (&session.consumer, &session.subscribed_topic),
+            (Some(_), Some(t)) if t == topic
+        );
+        if need_new {
+            // Default to `earliest` so a fresh consumer with no
+            // committed offsets starts from the beginning. Long-
+            // running consumers (36g) may want `latest`; they can
+            // override at the ClientConfig layer in 36f+.
+            let mut config = self.client_config();
+            config.set("auto.offset.reset", "earliest");
+            let consumer: StreamConsumer = config
+                .create()
+                .map_err(|e| BackendError::Connection(format!("kafka consumer create: {e}")))?;
+            consumer
+                .subscribe(&[topic])
+                .map_err(|e| BackendError::Connection(format!("kafka subscribe {topic}: {e}")))?;
+            session.consumer = Some(Arc::new(consumer));
+            session.subscribed_topic = Some(topic.to_string());
+            session.pending_offsets.clear();
+        }
+        Ok(Arc::clone(session.consumer.as_ref().expect("just set")))
     }
 
     /// Override the batch limits applied by `read_arrow_stream`.
@@ -287,23 +438,33 @@ impl Backend for KafkaBackend {
             ));
         }
 
-        // Default to `earliest` so a fresh consumer reads the topic
-        // from the start. Long-running consumers in 36g may want
-        // `latest` instead and can override the config; the batch
-        // `read_arrow_stream` path matches the "drain the topic"
-        // expectation users have when they hand a SQL backend a
-        // `SELECT * FROM …` query.
-        let mut config = self.client_config();
-        config.set("auto.offset.reset", "earliest");
-        let consumer: StreamConsumer = config
-            .create()
-            .map_err(|e| BackendError::Connection(format!("kafka consumer create: {e}")))?;
-        consumer
-            .subscribe(&[topic])
-            .map_err(|e| BackendError::Connection(format!("kafka subscribe {topic}: {e}")))?;
+        // Acquire / lazily-create the persistent consumer session.
+        // Reuses the StreamConsumer across calls so group rebalance +
+        // offset state survives between read_arrow_stream invocations
+        // and `commit_offsets` can target the same broker session.
+        let consumer = self.acquire_consumer_for(topic)?;
 
-        // Drain the consumer into a Vec<Vec<u8>> of payloads.
-        let payloads = drain_consumer(&consumer, &self.batch_config).await?;
+        // Drain the consumer, capturing per-partition max offset+1
+        // so commit_offsets can advance the broker's view atomically.
+        let (payloads, offsets) = drain_consumer(&consumer, &self.batch_config).await?;
+        if !offsets.is_empty() {
+            let mut session = self
+                .consumer_session
+                .lock()
+                .map_err(|e| BackendError::Other(format!("kafka consumer lock: {e}")))?;
+            // Merge: keep the highest commit position per partition.
+            // (Multiple read_arrow_stream calls before a commit will
+            // accumulate offsets across all of them.)
+            for (partition, next_offset) in offsets {
+                let entry = session
+                    .pending_offsets
+                    .entry(partition)
+                    .or_insert(next_offset);
+                if next_offset > *entry {
+                    *entry = next_offset;
+                }
+            }
+        }
         if payloads.is_empty() {
             let stream = futures_util::stream::empty();
             return Ok(Box::pin(stream));
@@ -546,10 +707,13 @@ const READ_FIRST_MESSAGE_TIMEOUT_SECS: u64 = 15;
 async fn drain_consumer(
     consumer: &StreamConsumer,
     cfg: &KafkaBatchConfig,
-) -> Result<Vec<Vec<u8>>, BackendError> {
+) -> Result<(Vec<Vec<u8>>, HashMap<i32, i64>), BackendError> {
     let mut payloads: Vec<Vec<u8>> = Vec::new();
     let mut total_bytes: usize = 0;
     let mut window_start: Option<std::time::Instant> = None;
+    // For commit_offsets: remember the highest (offset + 1) per
+    // partition we've consumed in this drain.
+    let mut max_offsets: HashMap<i32, i64> = HashMap::new();
 
     while payloads.len() < cfg.batch_size {
         // Compute the per-recv timeout. Three clocks are in play:
@@ -579,12 +743,21 @@ async fn drain_consumer(
         let msg = tokio::time::timeout(recv_timeout, recv_fut).await;
         match msg {
             Ok(Ok(borrowed)) => {
+                let partition = borrowed.partition();
+                let offset = borrowed.offset();
                 if let Some(payload) = borrowed.payload() {
                     if window_start.is_none() {
                         window_start = Some(std::time::Instant::now());
                     }
                     total_bytes += payload.len();
                     payloads.push(payload.to_vec());
+                    // Record commit position for this partition: the
+                    // offset of the next message to consume.
+                    let next = offset + 1;
+                    let entry = max_offsets.entry(partition).or_insert(next);
+                    if next > *entry {
+                        *entry = next;
+                    }
                     if total_bytes >= cfg.batch_bytes {
                         break;
                     }
@@ -605,7 +778,7 @@ async fn drain_consumer(
             Err(_elapsed) => break, // idle / window timeout → flush
         }
     }
-    Ok(payloads)
+    Ok((payloads, max_offsets))
 }
 
 /// Decode a Vec of message payloads as JSONL. Concatenates payloads

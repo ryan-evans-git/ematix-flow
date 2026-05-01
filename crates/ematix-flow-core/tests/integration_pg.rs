@@ -4212,3 +4212,63 @@ async fn kafka_read_arrow_stream_honors_batch_window_ms() {
         "elapsed too long ({elapsed:?}); idle_timeout dominated instead of window"
     );
 }
+
+// ----- Phase 36e: Manual offset commits + at-least-once ----------------
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker; run with `cargo test -- --ignored`"]
+async fn kafka_at_least_once_no_commit_redelivers() {
+    let (_container, bootstrap) = start_kafka().await;
+    let topic = "atleastonce-redeliver";
+    let group = "atleastonce-redeliver-grp";
+
+    produce_json_messages(
+        &bootstrap,
+        topic,
+        &[r#"{"id": 1}"#, r#"{"id": 2}"#, r#"{"id": 3}"#],
+    )
+    .await;
+
+    // Session 1: read 3, do NOT commit, drop the backend.
+    {
+        let backend = KafkaBackend::open(&bootstrap, Some(group)).unwrap();
+        let stream = backend.read_arrow_stream(topic).await.unwrap();
+        let batches: Vec<_> = stream.try_collect().await.unwrap();
+        let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, 3);
+        assert!(backend.pending_offset_count() > 0, "offsets pending");
+        // Drop without commit_offsets() — uncommitted reads should
+        // be re-delivered on the next session.
+    }
+
+    // Session 2: same group_id, commit this time.
+    let backend = KafkaBackend::open(&bootstrap, Some(group)).unwrap();
+    let stream = backend.read_arrow_stream(topic).await.unwrap();
+    let batches: Vec<_> = stream.try_collect().await.unwrap();
+    let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total, 3, "messages re-delivered because no prior commit");
+    backend.commit_offsets().await.unwrap();
+    assert_eq!(
+        backend.pending_offset_count(),
+        0,
+        "pending offsets cleared after commit"
+    );
+    drop(backend);
+
+    // Session 3: same group_id, no new produces — should see 0
+    // because session 2 committed.
+    let backend = KafkaBackend::open(&bootstrap, Some(group)).unwrap();
+    let stream = backend.read_arrow_stream(topic).await.unwrap();
+    let batches: Vec<_> = stream.try_collect().await.unwrap();
+    let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total, 0, "committed offsets advance the consumer");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker; run with `cargo test -- --ignored`"]
+async fn kafka_commit_offsets_no_op_with_no_consumer() {
+    let (_container, bootstrap) = start_kafka().await;
+    // Backend with group_id but never read — commit should be a no-op.
+    let backend = KafkaBackend::open(&bootstrap, Some("commit-noop")).unwrap();
+    backend.commit_offsets().await.unwrap();
+}
