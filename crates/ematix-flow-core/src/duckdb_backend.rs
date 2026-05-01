@@ -23,6 +23,7 @@ use crate::backend::{
     ArrowBatchStream, Backend, BackendError, DeleteHandling, Dialect, StrategyRunResult,
     TargetTable, WriteMode,
 };
+use crate::meta::{WatermarkConfig, wrap_with_watermark_filter};
 use crate::pg::ConnectionInfo;
 use crate::strategy::append::{BATCH_ID_COL, LOADED_AT_COL, plan_same_db_append};
 use crate::strategy::scd2::{IS_CURRENT_COL, ROW_HASH_COL, VALID_FROM_COL, VALID_TO_COL};
@@ -36,12 +37,12 @@ fn is_metadata_col(name: &str) -> bool {
 
 const META_SCHEMA: &str = "ematix_flow";
 const RUN_HISTORY_TABLE: &str = "run_history";
+const WATERMARKS_TABLE: &str = "watermarks";
 
-/// SQL that lazy-creates the `ematix_flow.run_history` table on
-/// DuckDB. Mirrors the PG schema (see `pg::ensure_meta_schema`) but
-/// flattened into a single `CREATE TABLE IF NOT EXISTS` since DuckDB
-/// doesn't need the PG-style `ALTER TABLE … ADD COLUMN IF NOT EXISTS`
-/// upgrade pattern (no installed-base to migrate yet).
+/// SQL that lazy-creates the meta schema + `run_history` + `watermarks`
+/// on DuckDB. Mirrors the PG schema (see `pg::ensure_meta_schema`) but
+/// flattened since DuckDB doesn't need the PG-style `ALTER TABLE …
+/// ADD COLUMN IF NOT EXISTS` upgrade pattern (no installed-base yet).
 fn ensure_meta_schema_sql() -> String {
     format!(
         "CREATE SCHEMA IF NOT EXISTS {META_SCHEMA}; \
@@ -62,6 +63,12 @@ fn ensure_meta_schema_sql() -> String {
             rows_unchanged BIGINT, \
             error_message VARCHAR, \
             metrics_json VARCHAR\
+         ); \
+         CREATE TABLE IF NOT EXISTS {META_SCHEMA}.{WATERMARKS_TABLE} (\
+            pipeline_name VARCHAR PRIMARY KEY, \
+            column_name VARCHAR NOT NULL, \
+            last_value VARCHAR NOT NULL, \
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT now()\
          )"
     )
 }
@@ -481,6 +488,77 @@ impl DuckDBBackend {
         })
         .await
     }
+
+    /// Compute `MAX(<column>)::VARCHAR` over the rows that this batch
+    /// just inserted (matched by `_batch_id`) and UPSERT into the
+    /// watermarks table. NULL `MAX` (zero rows inserted, or column
+    /// itself was NULL) is a no-op so a stale `last_value` doesn't get
+    /// clobbered. Mirrors `pg::advance_watermark`.
+    async fn advance_watermark(
+        &self,
+        target: &TableSpec,
+        batch_id: Uuid,
+        pipeline_name: &str,
+        watermark: &WatermarkConfig,
+    ) -> Result<(), BackendError> {
+        let target_schema = target.schema.clone();
+        let target_table = target.name.clone();
+        let pipeline_name = pipeline_name.to_string();
+        let column = watermark.column.clone();
+        self.with_conn_blocking(move |c| {
+            // Read MAX(column) over rows just inserted. We pull as
+            // VARCHAR because watermarks.last_value is VARCHAR and
+            // we'll feed it back as a SQL literal next run; the user
+            // is responsible for any type-specific cast in
+            // last_value_literal.
+            let max_sql = format!(
+                "SELECT MAX({col})::VARCHAR FROM {schema}.{table} \
+                 WHERE {batch_id_col} = ?::uuid",
+                col = column,
+                schema = target_schema,
+                table = target_table,
+                batch_id_col = BATCH_ID_COL,
+            );
+            let mut stmt = c
+                .prepare(&max_sql)
+                .map_err(|e| BackendError::Query(e.to_string()))?;
+            let mut rows = stmt
+                .query(duckdb::params![batch_id.to_string()])
+                .map_err(|e| BackendError::Query(e.to_string()))?;
+            let row = rows
+                .next()
+                .map_err(|e| BackendError::Query(e.to_string()))?;
+            let max_value: Option<String> = match row {
+                Some(r) => r
+                    .get::<_, Option<String>>(0)
+                    .map_err(|e| BackendError::Query(e.to_string()))?,
+                None => None,
+            };
+            // Drop the borrow on the connection so we can issue the
+            // UPSERT below.
+            drop(rows);
+            drop(stmt);
+
+            let Some(value) = max_value else {
+                return Ok(());
+            };
+            c.execute(
+                &format!(
+                    "INSERT INTO {META_SCHEMA}.{WATERMARKS_TABLE} \
+                     (pipeline_name, column_name, last_value, updated_at) \
+                     VALUES (?, ?, ?, now()) \
+                     ON CONFLICT (pipeline_name) DO UPDATE SET \
+                       column_name = EXCLUDED.column_name, \
+                       last_value = EXCLUDED.last_value, \
+                       updated_at = EXCLUDED.updated_at"
+                ),
+                duckdb::params![pipeline_name, column, value],
+            )
+            .map_err(|e| BackendError::Query(e.to_string()))?;
+            Ok(())
+        })
+        .await
+    }
 }
 
 #[async_trait]
@@ -605,7 +683,7 @@ impl Backend for DuckDBBackend {
         pipeline_name: &str,
         source_backend: Option<&dyn Backend>,
         incremental_column: Option<&str>,
-        _last_value_literal: Option<&str>,
+        last_value_literal: Option<&str>,
         dry_run: bool,
     ) -> Result<StrategyRunResult, BackendError> {
         if source_backend.is_some() {
@@ -615,12 +693,12 @@ impl Backend for DuckDBBackend {
                     .into(),
             ));
         }
-        if incremental_column.is_some() {
-            return Err(BackendError::Other(
-                "DuckDB run_append: incremental_column not yet supported (Phase 31d)".into(),
-            ));
-        }
-        let plan = plan_same_db_append(spec, source_query);
+        let watermark = incremental_column.map(|c| WatermarkConfig {
+            column: c.to_string(),
+            last_value_literal: last_value_literal.map(|s| s.to_string()),
+        });
+        let filtered_source = wrap_with_watermark_filter(source_query, watermark.as_ref());
+        let plan = plan_same_db_append(spec, &filtered_source);
         let batch_id = Uuid::new_v4();
         let run_id = Uuid::new_v4();
         let sql = substitute_batch_id(&plan.sql, &batch_id);
@@ -658,7 +736,17 @@ impl Backend for DuckDBBackend {
             .await;
 
         match &inserted_result {
-            Ok(n) => self.record_run_success(run_id, *n as i64).await?,
+            Ok(n) => {
+                self.record_run_success(run_id, *n as i64).await?;
+                // Watermark advancement is best-effort — its failure
+                // doesn't unwind the strategy, but the user's next run
+                // would re-load the same window. dry_run skips because
+                // the data was rolled back.
+                if !dry_run && let Some(wc) = watermark.as_ref() {
+                    self.advance_watermark(spec, batch_id, pipeline_name, wc)
+                        .await?;
+                }
+            }
             Err(e) => {
                 let _ = self.record_run_failure(run_id, &e.to_string()).await;
             }

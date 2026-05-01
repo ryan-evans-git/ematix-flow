@@ -1344,3 +1344,141 @@ async fn duckdb_run_history_records_failure_when_target_missing() {
         "error_message should be non-empty"
     );
 }
+
+// --- Phase 31d.2: incremental_column on DuckDB run_append ----------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn duckdb_run_append_incremental_filters_and_advances_watermark() {
+    let backend: Arc<dyn Backend> = Arc::new(DuckDBBackend::open(":memory:").unwrap());
+    backend.execute("CREATE SCHEMA src").await.unwrap();
+    backend.execute("CREATE SCHEMA wh").await.unwrap();
+    backend
+        .execute("CREATE TABLE src.events (event_id BIGINT, ts BIGINT)")
+        .await
+        .unwrap();
+    backend
+        .execute(
+            "INSERT INTO src.events VALUES \
+             (1, 100), (2, 200), (3, 300)",
+        )
+        .await
+        .unwrap();
+    let target = augment_with_metadata(&TableSpec {
+        schema: "wh".into(),
+        name: "event_log".into(),
+        columns: vec![
+            ColumnSpec {
+                name: "event_id".into(),
+                ty: ColumnType::BigInt,
+                nullable: false,
+                primary_key: true,
+            },
+            ColumnSpec {
+                name: "ts".into(),
+                ty: ColumnType::BigInt,
+                nullable: false,
+                primary_key: false,
+            },
+        ],
+        unique_constraints: Vec::new(),
+        fingerprint: String::new(),
+    });
+    backend
+        .execute(
+            "CREATE TABLE wh.event_log (\
+              event_id BIGINT, ts BIGINT, _loaded_at TIMESTAMPTZ, _batch_id UUID\
+            )",
+        )
+        .await
+        .unwrap();
+
+    // First load with watermark column but no prior literal (cold start).
+    let r1 = backend
+        .run_append(
+            &target,
+            "SELECT event_id, ts FROM src.events",
+            "duckdb_incr_test",
+            None,
+            Some("ts"),
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+    assert_eq!(r1.rows_inserted, 3);
+
+    // Watermark advanced to max(ts) = 300.
+    use arrow_array::{Int64Array, StringArray};
+    let stream = backend
+        .read_arrow_stream(
+            "SELECT last_value FROM ematix_flow.watermarks \
+             WHERE pipeline_name='duckdb_incr_test'",
+        )
+        .await
+        .unwrap();
+    let batches: Vec<_> = stream.try_collect().await.unwrap();
+    let last = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap()
+        .value(0)
+        .to_string();
+    assert_eq!(last, "300");
+
+    // Add a couple of newer rows (ts=400, 500) plus a stale one (ts=150).
+    backend
+        .execute(
+            "INSERT INTO src.events VALUES \
+             (4, 400), (5, 500), (6, 150)",
+        )
+        .await
+        .unwrap();
+
+    // Second load: filter using last literal.
+    let r2 = backend
+        .run_append(
+            &target,
+            "SELECT event_id, ts FROM src.events",
+            "duckdb_incr_test",
+            None,
+            Some("ts"),
+            Some("300"),
+            false,
+        )
+        .await
+        .unwrap();
+    assert_eq!(r2.rows_inserted, 2, "only ts > 300 should pass");
+
+    // Total in target: 3 (first load) + 2 (second) = 5.
+    let stream = backend
+        .read_arrow_stream("SELECT count(*)::BIGINT FROM wh.event_log")
+        .await
+        .unwrap();
+    let batches: Vec<_> = stream.try_collect().await.unwrap();
+    let total = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(total, 5);
+
+    // Watermark advanced to 500.
+    let stream = backend
+        .read_arrow_stream(
+            "SELECT last_value FROM ematix_flow.watermarks \
+             WHERE pipeline_name='duckdb_incr_test'",
+        )
+        .await
+        .unwrap();
+    let batches: Vec<_> = stream.try_collect().await.unwrap();
+    let last = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap()
+        .value(0)
+        .to_string();
+    assert_eq!(last, "500");
+}
