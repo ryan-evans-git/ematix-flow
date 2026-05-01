@@ -54,6 +54,15 @@ rusqlite = { version = "0.31", features = ["bundled", "chrono", "uuid", "column_
 testcontainers = "0.27"
 testcontainers-modules = { version = "0.15", features = ["postgres", "mysql", "minio"] }
 mysql_async = { version = "0.36", default-features = false, features = ["minimal-rust", "rustls-tls"] }
+# Delta Lake (Phase 35). Pulls in DataFusion + arrow 58 + parquet 58
+# from the same arrow-rs major track as our pinned ones. `rustls`
+# feature is required (deltalake compile_errors without one of
+# rustls/native-tls).
+deltalake = { version = "0.32", default-features = false, features = ["rustls", "datafusion"] }
+# `url` is needed to construct deltalake's `Url` parameter; deltalake
+# doesn't re-export it. Already pulled in transitively, so this just
+# brings it into the workspace's direct namespace.
+url = "2"
 
 [profile.release]
 lto = "thin"

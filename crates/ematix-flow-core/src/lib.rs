@@ -4,6 +4,7 @@
 
 pub mod backend;
 pub mod ddl;
+pub mod delta_backend;
 pub mod duckdb_backend;
 pub mod hash;
 pub mod meta;
@@ -16,6 +17,7 @@ pub mod strategy;
 pub mod types;
 
 pub use backend::{Backend, BackendError, Dialect, ObjectFormat, PostgresBackend, StreamingKind};
+pub use delta_backend::DeltaBackend;
 pub use duckdb_backend::DuckDBBackend;
 pub use mysql_backend::MySQLBackend;
 pub use objectstore_backend::ObjectStoreBackend;
