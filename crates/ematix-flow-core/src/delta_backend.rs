@@ -469,19 +469,182 @@ impl Backend for DeltaBackend {
 
     async fn run_merge(
         &self,
-        _spec: &TableSpec,
-        _source_query: &str,
-        _keys: &[String],
-        _update_columns: &[String],
-        _pipeline_name: &str,
-        _mode_label: &str,
-        _source_backend: Option<&dyn Backend>,
-        _delete_handling: Option<DeleteHandling>,
-        _dry_run: bool,
+        spec: &TableSpec,
+        source_query: &str,
+        keys: &[String],
+        update_columns: &[String],
+        pipeline_name: &str,
+        mode_label: &str,
+        source_backend: Option<&dyn Backend>,
+        delete_handling: Option<DeleteHandling>,
+        dry_run: bool,
     ) -> Result<StrategyRunResult, BackendError> {
-        Err(BackendError::Other(
-            "Delta run_merge lands in Phase 35d".into(),
-        ))
+        use deltalake::datafusion::datasource::MemTable;
+        use deltalake::datafusion::prelude::SessionContext;
+
+        let source = source_backend.ok_or_else(|| {
+            BackendError::Other(
+                "Delta run_merge: source_backend is required \
+                 (Delta is a target only)"
+                    .into(),
+            )
+        })?;
+        let run_id = uuid::Uuid::now_v7();
+        let started_at = iso8601_now();
+
+        let (inserted, updated, deleted, status): (i64, i64, i64, &'static str) = if dry_run {
+            // Probe the source query so a missing query / bad
+            // credentials surfaces; do not commit a merge.
+            let _ = source.read_arrow_stream(source_query).await?;
+            (0, 0, 0, "dry_run")
+        } else {
+            // Read source as a single batched DataFusion DataFrame.
+            // The merge engine needs random access to the source for
+            // its join, so streaming isn't a fit here — buffer and
+            // wrap in a `MemTable` provider.
+            let stream = source.read_arrow_stream(source_query).await?;
+            let batches: Vec<RecordBatch> = stream.try_collect().await?;
+            if batches.is_empty() {
+                // No rows → no inserts, no updates, no source-driven
+                // deletes. With handle_deletes::Hard a zero-row source
+                // would normally tombstone the entire target; we error
+                // there to avoid an accidental wipe.
+                if matches!(delete_handling, Some(DeleteHandling::Hard)) {
+                    return Err(BackendError::Other(
+                        "Delta run_merge with handle_deletes=Hard refuses an empty \
+                         source (would delete every target row); pass an explicit \
+                         truncate if that is the intent"
+                            .into(),
+                    ));
+                }
+                (0, 0, 0, "success")
+            } else {
+                let url = self.table_url(&spec.schema, &spec.name)?;
+                let table = open_or_uninit_delta_table(url.clone()).await?;
+                if table.version().is_none() {
+                    return Err(BackendError::Other(format!(
+                        "Delta run_merge: target table {url} is uninitialized; \
+                         run an append first to create the schema"
+                    )));
+                }
+
+                let arrow_schema = batches[0].schema();
+                let memtable = MemTable::try_new(arrow_schema, vec![batches])
+                    .map_err(|e| BackendError::Query(format!("delta merge memtable: {e}")))?;
+                let ctx = SessionContext::new();
+                let df = ctx
+                    .read_table(Arc::new(memtable))
+                    .map_err(|e| BackendError::Query(format!("delta merge read_table: {e}")))?;
+
+                // Predicate as a string — deltalake parses
+                // `target.k = source.k AND …` against the merged
+                // schema. Same shape the SQL backends emit for their
+                // merge planners.
+                let predicate = keys
+                    .iter()
+                    .map(|k| format!("target.{k} = source.{k}"))
+                    .collect::<Vec<_>>()
+                    .join(" AND ");
+
+                let mut merge = table
+                    .merge(df, predicate.as_str())
+                    .with_source_alias("source")
+                    .with_target_alias("target");
+
+                if !update_columns.is_empty() {
+                    let cols = update_columns.to_vec();
+                    // Filter the update to only rows where at least one
+                    // update column actually changed. Otherwise Delta
+                    // (and most MERGE engines) bumps every matched row
+                    // unconditionally, which inflates rows_updated and
+                    // creates a redundant rewrite. `IS DISTINCT FROM`
+                    // is NULL-safe — `target.x = source.x` would skip
+                    // a transition between value and NULL.
+                    let update_predicate = cols
+                        .iter()
+                        .map(|c| format!("target.{c} IS DISTINCT FROM source.{c}"))
+                        .collect::<Vec<_>>()
+                        .join(" OR ");
+                    merge = merge
+                        .when_matched_update(|u| {
+                            let mut u = u.predicate(update_predicate.as_str());
+                            for col_name in &cols {
+                                u = u.update(col_name.as_str(), format!("source.{col_name}"));
+                            }
+                            u
+                        })
+                        .map_err(|e| {
+                            BackendError::Query(format!("delta merge when_matched_update: {e}"))
+                        })?;
+                }
+
+                let user_cols: Vec<String> = spec.columns.iter().map(|c| c.name.clone()).collect();
+                merge = merge
+                    .when_not_matched_insert(|i| {
+                        let mut i = i;
+                        for col_name in &user_cols {
+                            i = i.set(col_name.as_str(), format!("source.{col_name}"));
+                        }
+                        i
+                    })
+                    .map_err(|e| {
+                        BackendError::Query(format!("delta merge when_not_matched_insert: {e}"))
+                    })?;
+
+                if matches!(delete_handling, Some(DeleteHandling::Hard)) {
+                    merge = merge
+                        .when_not_matched_by_source_delete(|d| d)
+                        .map_err(|e| {
+                            BackendError::Query(format!(
+                                "delta merge when_not_matched_by_source_delete: {e}"
+                            ))
+                        })?;
+                }
+
+                let (_table, metrics) = merge
+                    .await
+                    .map_err(|e| BackendError::Query(format!("delta merge: {e}")))?;
+                (
+                    metrics.num_target_rows_inserted as i64,
+                    metrics.num_target_rows_updated as i64,
+                    metrics.num_target_rows_deleted as i64,
+                    "success",
+                )
+            }
+        };
+
+        let finished_at = iso8601_now();
+        let event = serde_json::json!({
+            "run_id": run_id.to_string(),
+            "pipeline_name": pipeline_name,
+            "target_schema": spec.schema,
+            "target_table": spec.name,
+            "mode": mode_label,
+            "path": "cross_backend",
+            "started_at": started_at,
+            "finished_at": finished_at,
+            "status": status,
+            "rows_inserted": inserted,
+            "rows_updated": updated,
+            "rows_deleted": deleted,
+            "format": "delta",
+        });
+        record_run_event(&self.store, &run_id, &event).await?;
+
+        // Plumb target-row deletes through `rows_unchanged` for the
+        // sidecar log; the StrategyRunResult shape keeps `rows_closed`
+        // for SCD2-flavored stats and we use `rows_unchanged` here as
+        // the next-best slot (DBs report 0 here for merges with no
+        // xmax-style split).
+        Ok(StrategyRunResult {
+            run_id: run_id.to_string(),
+            rows_inserted: inserted,
+            rows_updated: Some(updated),
+            rows_unchanged: Some(0),
+            rows_closed: if deleted > 0 { Some(deleted) } else { None },
+            status: status.into(),
+            path: "cross_backend".into(),
+        })
     }
 
     async fn run_scd2(
@@ -796,32 +959,183 @@ mod tests {
         assert!(msg.contains("source_backend is required"), "got: {msg}");
     }
 
+    // --- Phase 35d: run_merge (DuckDB → Delta) -----------------------------
+
+    use crate::meta::DeleteHandling;
+
+    /// Seed `s.events` in DuckDB and seed Delta `raw/events` with one
+    /// commit of the same data. Returns (source, target).
+    async fn duckdb_and_delta_with_seed(dir: &std::path::Path) -> (Arc<dyn Backend>, DeltaBackend) {
+        let source = duckdb_with_events().await;
+        let target = DeltaBackend::open_local(dir).unwrap();
+        let spec = small_table_spec();
+        target
+            .run_append(
+                &spec,
+                "SELECT id, name FROM s.events ORDER BY id",
+                "seed",
+                Some(source.as_ref()),
+                None,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        (source, target)
+    }
+
     #[tokio::test(flavor = "multi_thread")]
-    async fn delta_merge_stub_points_at_35d() {
+    async fn delta_run_merge_inserts_and_updates() {
         let dir = tempfile::tempdir().unwrap();
-        let backend = DeltaBackend::open_local(dir.path()).unwrap();
-        let spec = TableSpec {
-            schema: "s".into(),
-            name: "t".into(),
-            columns: vec![],
-            unique_constraints: vec![],
-            fingerprint: String::new(),
-        };
-        let err = backend
+        let (source, target) = duckdb_and_delta_with_seed(dir.path()).await;
+        // Mutate the source: id=2 changes name, add id=4 as a new row.
+        source
+            .execute("UPDATE s.events SET name = 'b-updated' WHERE id = 2")
+            .await
+            .unwrap();
+        source
+            .execute("INSERT INTO s.events VALUES (4, 'd')")
+            .await
+            .unwrap();
+        let spec = small_table_spec();
+        let result = target
             .run_merge(
                 &spec,
-                "x",
-                &["k".into()],
-                &["c".into()],
-                "p",
+                "SELECT id, name FROM s.events ORDER BY id",
+                &["id".into()],
+                &["name".into()],
+                "p35d_merge",
                 "merge",
+                Some(source.as_ref()),
                 None,
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.rows_inserted, 1, "id=4 inserted");
+        assert_eq!(result.rows_updated, Some(1), "id=2 updated");
+        assert_eq!(result.status, "success");
+
+        let stream = target.read_arrow_stream("raw/events").await.unwrap();
+        let batches: Vec<RecordBatch> = futures_util::TryStreamExt::try_collect(stream)
+            .await
+            .unwrap();
+        let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, 4);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn delta_run_merge_handle_deletes_hard() {
+        let dir = tempfile::tempdir().unwrap();
+        let (source, target) = duckdb_and_delta_with_seed(dir.path()).await;
+        source
+            .execute("DELETE FROM s.events WHERE id = 3")
+            .await
+            .unwrap();
+        let spec = small_table_spec();
+        let result = target
+            .run_merge(
+                &spec,
+                "SELECT id, name FROM s.events ORDER BY id",
+                &["id".into()],
+                &["name".into()],
+                "p35d_hard",
+                "merge",
+                Some(source.as_ref()),
+                Some(DeleteHandling::Hard),
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.rows_inserted, 0);
+        assert_eq!(result.rows_updated, Some(0));
+        assert_eq!(result.rows_closed, Some(1), "id=3 deleted");
+
+        let stream = target.read_arrow_stream("raw/events").await.unwrap();
+        let batches: Vec<RecordBatch> = futures_util::TryStreamExt::try_collect(stream)
+            .await
+            .unwrap();
+        let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn delta_run_merge_dry_run_does_not_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let (source, target) = duckdb_and_delta_with_seed(dir.path()).await;
+        source
+            .execute("UPDATE s.events SET name = 'b-changed' WHERE id = 2")
+            .await
+            .unwrap();
+        let spec = small_table_spec();
+        let result = target
+            .run_merge(
+                &spec,
+                "SELECT id, name FROM s.events ORDER BY id",
+                &["id".into()],
+                &["name".into()],
+                "p35d_dry",
+                "merge",
+                Some(source.as_ref()),
+                None,
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.status, "dry_run");
+        let stream = target.read_arrow_stream("raw/events").await.unwrap();
+        let batches: Vec<RecordBatch> = futures_util::TryStreamExt::try_collect(stream)
+            .await
+            .unwrap();
+        let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, 3);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn delta_run_merge_rejects_uninitialized_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = DeltaBackend::open_local(dir.path()).unwrap();
+        let source = duckdb_with_events().await;
+        let spec = small_table_spec();
+        let err = target
+            .run_merge(
+                &spec,
+                "SELECT id, name FROM s.events",
+                &["id".into()],
+                &["name".into()],
+                "p35d_no_target",
+                "merge",
+                Some(source.as_ref()),
                 None,
                 false,
             )
             .await
             .unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("Phase 35d"), "got: {msg}");
+        assert!(msg.contains("uninitialized"), "got: {msg}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn delta_run_merge_hard_refuses_empty_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let (source, target) = duckdb_and_delta_with_seed(dir.path()).await;
+        source.execute("DELETE FROM s.events").await.unwrap();
+        let spec = small_table_spec();
+        let err = target
+            .run_merge(
+                &spec,
+                "SELECT id, name FROM s.events",
+                &["id".into()],
+                &["name".into()],
+                "p35d_empty_hard",
+                "merge",
+                Some(source.as_ref()),
+                Some(DeleteHandling::Hard),
+                false,
+            )
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("empty source"), "got: {msg}");
     }
 }
