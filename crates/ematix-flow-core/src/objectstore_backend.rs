@@ -284,6 +284,87 @@ async fn write_csv_at_path(
     Ok(total)
 }
 
+/// Read all JSONL files (newline-delimited JSON) under `prefix` and
+/// concatenate their Arrow batches. Schema is inferred per file via
+/// `infer_json_schema_from_seekable`, which seeks the reader back to
+/// the start so a single Cursor handles both passes (vs CSV which
+/// needs two fresh Cursors).
+async fn read_jsonl_under_prefix(
+    store: &Arc<dyn ObjectStore>,
+    prefix: ObjectPath,
+) -> Result<Vec<RecordBatch>, BackendError> {
+    use arrow_json::ReaderBuilder;
+    use arrow_json::reader::infer_json_schema_from_seekable;
+
+    let mut listing = store.list(Some(&prefix));
+    let mut batches: Vec<RecordBatch> = Vec::new();
+    while let Some(meta) = listing.next().await {
+        let meta = meta.map_err(|e| BackendError::Connection(format!("list: {e}")))?;
+        let loc = meta.location.as_ref();
+        // Accept both `.jsonl` (canonical) and `.json` (common alias).
+        if !loc.ends_with(".jsonl") && !loc.ends_with(".json") {
+            continue;
+        }
+        let bytes = store
+            .get(&meta.location)
+            .await
+            .map_err(|e| BackendError::Connection(format!("get {}: {e}", meta.location)))?
+            .bytes()
+            .await
+            .map_err(|e| BackendError::Connection(format!("get bytes: {e}")))?;
+        let mut cursor = std::io::Cursor::new(bytes.as_ref());
+        let (schema, _records_inferred) = infer_json_schema_from_seekable(&mut cursor, Some(1024))
+            .map_err(|e| BackendError::Query(format!("json infer: {e}")))?;
+        // `infer_json_schema_from_seekable` rewinds; the same Cursor
+        // works for the typed reader.
+        let reader = ReaderBuilder::new(Arc::new(schema))
+            .build(std::io::BufReader::new(cursor))
+            .map_err(|e| BackendError::Query(format!("json reader: {e}")))?;
+        for b in reader {
+            let b = b.map_err(|e| BackendError::Query(format!("json batch: {e}")))?;
+            batches.push(b);
+        }
+    }
+    Ok(batches)
+}
+
+/// Write a stream of Arrow batches as one JSONL file at `path`. Each
+/// row becomes a JSON object on its own line.
+async fn write_jsonl_at_path(
+    store: &Arc<dyn ObjectStore>,
+    path: ObjectPath,
+    mut stream: ArrowBatchStream,
+) -> Result<u64, BackendError> {
+    use arrow_json::LineDelimitedWriter;
+
+    let mut batches: Vec<RecordBatch> = Vec::new();
+    while let Some(b) = stream.next().await {
+        batches.push(b?);
+    }
+    if batches.is_empty() {
+        return Ok(0);
+    }
+    let mut buf: Vec<u8> = Vec::with_capacity(64 * 1024);
+    let mut writer = LineDelimitedWriter::new(&mut buf);
+    let mut total: u64 = 0;
+    for batch in &batches {
+        total += batch.num_rows() as u64;
+        writer
+            .write(batch)
+            .map_err(|e| BackendError::Query(format!("jsonl write batch: {e}")))?;
+    }
+    writer
+        .finish()
+        .map_err(|e| BackendError::Query(format!("jsonl finish: {e}")))?;
+    drop(writer);
+    let bytes = Bytes::from(buf);
+    store
+        .put(&path, bytes.into())
+        .await
+        .map_err(|e| BackendError::Connection(format!("put {path}: {e}")))?;
+    Ok(total)
+}
+
 /// Delete every object under `prefix`. Used by `WriteMode::Truncate`.
 /// Walks the listing and issues per-object deletes — `object_store`
 /// has no atomic prefix-delete primitive (S3/Azure/GCS don't either,
@@ -356,6 +437,7 @@ impl Backend for ObjectStoreBackend {
         let batches = match self.format {
             ObjectFormat::Parquet => read_parquet_under_prefix(&self.store, prefix).await?,
             ObjectFormat::Csv => read_csv_under_prefix(&self.store, prefix).await?,
+            ObjectFormat::JsonLines => read_jsonl_under_prefix(&self.store, prefix).await?,
             other => {
                 return Err(BackendError::Other(format!(
                     "ObjectStore read_arrow_stream: format {other:?} lands in \
@@ -381,6 +463,7 @@ impl Backend for ObjectStoreBackend {
         match self.format {
             ObjectFormat::Parquet => write_parquet_at_path(&self.store, path, stream).await,
             ObjectFormat::Csv => write_csv_at_path(&self.store, path, stream).await,
+            ObjectFormat::JsonLines => write_jsonl_at_path(&self.store, path, stream).await,
             other => Err(BackendError::Other(format!(
                 "ObjectStore write_arrow_stream: format {other:?} lands in \
                  a later sub-phase"
@@ -655,6 +738,72 @@ mod tests {
     async fn objectstore_csv_truncate_clears_prefix() {
         let dir = tempfile::tempdir().unwrap();
         let backend = ObjectStoreBackend::open_local(dir.path(), ObjectFormat::Csv).unwrap();
+        let target = TargetTable {
+            schema: "raw".into(),
+            name: "events".into(),
+        };
+        backend
+            .write_arrow_stream(&target, arrow_stream_for(small_batch()), WriteMode::Append)
+            .await
+            .unwrap();
+        backend
+            .write_arrow_stream(&target, arrow_stream_for(small_batch()), WriteMode::Append)
+            .await
+            .unwrap();
+        backend
+            .write_arrow_stream(
+                &target,
+                arrow_stream_for(small_batch()),
+                WriteMode::Truncate,
+            )
+            .await
+            .unwrap();
+        let stream = backend.read_arrow_stream("raw/events").await.unwrap();
+        let batches: Vec<RecordBatch> = futures_util::TryStreamExt::try_collect(stream)
+            .await
+            .unwrap();
+        let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, 3, "old files removed by truncate");
+    }
+
+    // --- Phase 34c: JSONL ----------------------------------------------------
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn objectstore_local_jsonl_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = ObjectStoreBackend::open_local(dir.path(), ObjectFormat::JsonLines).unwrap();
+        backend.ping().await.unwrap();
+
+        let target = TargetTable {
+            schema: "raw".into(),
+            name: "events".into(),
+        };
+        let n = backend
+            .write_arrow_stream(&target, arrow_stream_for(small_batch()), WriteMode::Append)
+            .await
+            .unwrap();
+        assert_eq!(n, 3);
+
+        let stream = backend.read_arrow_stream("raw/events").await.unwrap();
+        let batches: Vec<RecordBatch> = futures_util::TryStreamExt::try_collect(stream)
+            .await
+            .unwrap();
+        let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, 3);
+
+        let names = batches[0]
+            .column_by_name("name")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(names.value(0), "alice");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn objectstore_jsonl_truncate_clears_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = ObjectStoreBackend::open_local(dir.path(), ObjectFormat::JsonLines).unwrap();
         let target = TargetTable {
             schema: "raw".into(),
             name: "events".into(),
