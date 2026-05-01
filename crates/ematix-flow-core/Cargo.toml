@@ -44,6 +44,8 @@ schema_registry_converter = { workspace = true }
 apache-avro = { workspace = true }
 protofish = { workspace = true }
 lapin = { workspace = true }
+google-cloud-pubsub = { workspace = true }
+google-cloud-auth = { workspace = true }
 
 [dev-dependencies]
 arrow-array.workspace = true

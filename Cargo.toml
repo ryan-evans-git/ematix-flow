@@ -53,7 +53,7 @@ duckdb = { version = "1.10502", features = ["bundled", "appender-arrow"] }
 # done manually — rusqlite has no Arrow feature.
 rusqlite = { version = "0.31", features = ["bundled", "chrono", "uuid", "column_decltype", "functions"] }
 testcontainers = "0.27"
-testcontainers-modules = { version = "0.15", features = ["postgres", "mysql", "minio", "kafka", "rabbitmq"] }
+testcontainers-modules = { version = "0.15", features = ["postgres", "mysql", "minio", "kafka", "rabbitmq", "google_cloud_sdk_emulators"] }
 mysql_async = { version = "0.36", default-features = false, features = ["minimal-rust", "rustls-tls"] }
 # Delta Lake (Phase 35). Pulls in DataFusion + arrow 58 + parquet 58
 # from the same arrow-rs major track as our pinned ones. `rustls`
@@ -97,6 +97,17 @@ protofish = { version = "0.5", default-features = false }
 # pure-rust client; rustls-only feature footprint to match other
 # rustls-using deps in this workspace (mysql_async, deltalake).
 lapin = { version = "2", default-features = false, features = ["rustls"] }
+# GCP Pub/Sub gRPC client (Phase 37b). The canonical
+# google-cloud-rust crate. Honors `PUBSUB_EMULATOR_HOST` /
+# `PUBSUB_PROJECT_ID` envs in dev so the same code path drives the
+# emulator-backed Docker integration test as well as production
+# Pub/Sub. We pin a major-stable line; the crate is on the
+# google-cloud-rust ecosystem's release train.
+google-cloud-pubsub = { version = "0.33", default-features = false, features = ["default-rustls-provider"] }
+# Brought in transitively by google-cloud-pubsub for ADC; declared
+# directly so the backend can construct anonymous credentials
+# (emulator path) without going through pubsub's re-exports.
+google-cloud-auth = { version = "1", default-features = false }
 # `url` is needed to construct deltalake's `Url` parameter; deltalake
 # doesn't re-export it. Already pulled in transitively, so this just
 # brings it into the workspace's direct namespace.

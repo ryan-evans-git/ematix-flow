@@ -4714,6 +4714,49 @@ async fn eos_pipeline_kafka_to_kafka_round_trip() {
     );
 }
 
+// ----- Phase 37b: PubSubBackend ping -----------------------------------
+
+use ematix_flow_core::PubSubBackend;
+use testcontainers_modules::google_cloud_sdk_emulators::CloudSdk;
+
+const PUBSUB_EMULATOR_PORT: u16 = 8085;
+
+async fn start_pubsub_emulator() -> (testcontainers::ContainerAsync<CloudSdk>, String) {
+    let container = CloudSdk::pubsub()
+        .start()
+        .await
+        .expect("failed to start gcloud pubsub emulator");
+    let host = container
+        .get_host()
+        .await
+        .expect("failed to read pubsub emulator host")
+        .to_string();
+    let port = container
+        .get_host_port_ipv4(PUBSUB_EMULATOR_PORT)
+        .await
+        .expect("failed to read pubsub emulator port");
+    let endpoint = format!("http://{host}:{port}");
+    (container, endpoint)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker; run with `cargo test -- --ignored`"]
+async fn pubsub_backend_ping_against_emulator() {
+    let (_container, endpoint) = start_pubsub_emulator().await;
+    let backend = PubSubBackend::open("ematix-test-project")
+        .unwrap()
+        .with_endpoint(endpoint.clone())
+        .with_anonymous_auth();
+    backend.ping().await.unwrap();
+    assert!(matches!(
+        backend.dialect(),
+        ematix_flow_core::backend::Dialect::Streaming { .. }
+    ));
+    let info = backend.connection_info();
+    assert_eq!(info.user, "ematix-test-project");
+    assert_eq!(info.dbname, endpoint);
+}
+
 // ----- Phase 37a: RabbitMQBackend ping ---------------------------------
 
 use ematix_flow_core::RabbitMQBackend;
