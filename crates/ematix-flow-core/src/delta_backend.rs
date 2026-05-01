@@ -50,6 +50,7 @@ use crate::backend::{
     TargetTable, WriteMode,
 };
 use crate::pg::ConnectionInfo;
+use crate::strategy::scd2::{IS_CURRENT_COL, ROW_HASH_COL, VALID_FROM_COL, VALID_TO_COL};
 use crate::types::TableSpec;
 
 /// Delta-backed implementation of `Backend`.
@@ -172,6 +173,217 @@ async fn record_run_event(
         .await
         .map_err(|e| BackendError::Connection(format!("delta run-history put: {e}")))?;
     Ok(())
+}
+
+/// Compute one sha256 row_hash per row over the user's `compare_columns`.
+/// Identical protocol to the SQLite `ematix_sha256` UDF and the
+/// `unhex(sha256(...))` expression on PG/DuckDB/MySQL: stringify each
+/// value with a CHAR(0)-wrapped 'NULL' sentinel, separate columns
+/// with CHAR(1), feed into sha256. Returns one 32-byte BinaryArray.
+fn compute_row_hash(
+    batch: &arrow_array::RecordBatch,
+    compare_cols: &[String],
+) -> Result<arrow_array::BinaryArray, BackendError> {
+    use arrow_array::Array;
+    use sha2::{Digest, Sha256};
+
+    let n_rows = batch.num_rows();
+    let arrays: Vec<&dyn Array> = compare_cols
+        .iter()
+        .map(|name| {
+            batch
+                .column_by_name(name)
+                .map(|a| a.as_ref())
+                .ok_or_else(|| {
+                    BackendError::Other(format!(
+                        "scd2: compare column '{name}' not found in source schema"
+                    ))
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let mut builder = arrow_array::builder::BinaryBuilder::with_capacity(n_rows, n_rows * 32);
+    for row in 0..n_rows {
+        let mut hasher = Sha256::new();
+        for (i, arr) in arrays.iter().enumerate() {
+            if i > 0 {
+                hasher.update([0x01u8]);
+            }
+            if arr.is_null(row) {
+                hasher.update([0x00u8]);
+                hasher.update(b"NULL");
+                hasher.update([0x00u8]);
+            } else {
+                let s = arrow_value_as_string(*arr, row);
+                hasher.update(s.as_bytes());
+            }
+        }
+        let bytes: [u8; 32] = hasher.finalize().into();
+        builder.append_value(bytes);
+    }
+    Ok(builder.finish())
+}
+
+/// Stringify a single Arrow value at `row` for hashing. Covers the
+/// types the framework's other backends emit; uses Arrow's own Display
+/// impl as a fallback so we don't have to enumerate every variant.
+fn arrow_value_as_string(arr: &dyn arrow_array::Array, row: usize) -> String {
+    use arrow_array::cast::AsArray;
+    use arrow_array::types::*;
+    use arrow_schema::DataType;
+    match arr.data_type() {
+        DataType::Int8 => arr.as_primitive::<Int8Type>().value(row).to_string(),
+        DataType::Int16 => arr.as_primitive::<Int16Type>().value(row).to_string(),
+        DataType::Int32 => arr.as_primitive::<Int32Type>().value(row).to_string(),
+        DataType::Int64 => arr.as_primitive::<Int64Type>().value(row).to_string(),
+        DataType::UInt8 => arr.as_primitive::<UInt8Type>().value(row).to_string(),
+        DataType::UInt16 => arr.as_primitive::<UInt16Type>().value(row).to_string(),
+        DataType::UInt32 => arr.as_primitive::<UInt32Type>().value(row).to_string(),
+        DataType::UInt64 => arr.as_primitive::<UInt64Type>().value(row).to_string(),
+        DataType::Float32 => arr.as_primitive::<Float32Type>().value(row).to_string(),
+        DataType::Float64 => arr.as_primitive::<Float64Type>().value(row).to_string(),
+        DataType::Boolean => arr
+            .as_any()
+            .downcast_ref::<arrow_array::BooleanArray>()
+            .map(|b| b.value(row).to_string())
+            .unwrap_or_default(),
+        DataType::Utf8 => arr
+            .as_any()
+            .downcast_ref::<arrow_array::StringArray>()
+            .map(|s| s.value(row).to_string())
+            .unwrap_or_default(),
+        DataType::LargeUtf8 => arr
+            .as_any()
+            .downcast_ref::<arrow_array::LargeStringArray>()
+            .map(|s| s.value(row).to_string())
+            .unwrap_or_default(),
+        // Fallback: Arrow's array formatter handles everything else
+        // (timestamps, decimals, lists). Slower than typed access but
+        // correct for any DataType.
+        _ => arrow_cast::display::array_value_to_string(arr, row).unwrap_or_default(),
+    }
+}
+
+/// Append `row_hash` (Binary) to each batch.
+fn augment_with_row_hash(
+    batches: &[arrow_array::RecordBatch],
+    compare_cols: &[String],
+) -> Result<Vec<arrow_array::RecordBatch>, BackendError> {
+    use arrow_array::Array;
+    use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+
+    let mut out = Vec::with_capacity(batches.len());
+    for b in batches {
+        let hash_array = compute_row_hash(b, compare_cols)?;
+        let mut new_columns: Vec<Arc<dyn Array>> = b.columns().iter().map(Arc::clone).collect();
+        new_columns.push(Arc::new(hash_array));
+        let mut new_fields: Vec<Arc<Field>> = b.schema().fields().iter().map(Arc::clone).collect();
+        new_fields.push(Arc::new(Field::new(ROW_HASH_COL, DataType::Binary, false)));
+        let new_schema = Arc::new(ArrowSchema::new(new_fields));
+        out.push(
+            arrow_array::RecordBatch::try_new(new_schema, new_columns)
+                .map_err(|e| BackendError::Other(format!("scd2 augment row_hash: {e}")))?,
+        );
+    }
+    Ok(out)
+}
+
+/// Append `valid_from` / `valid_to` / `is_current` to each batch.
+/// `valid_from = now_micros` (microseconds since UTC epoch),
+/// `valid_to = NULL`, `is_current = true`.
+fn augment_with_scd2_cols(
+    batches: &[arrow_array::RecordBatch],
+    now_micros: i64,
+) -> Result<Vec<arrow_array::RecordBatch>, BackendError> {
+    use arrow_array::builder::TimestampMicrosecondBuilder;
+    use arrow_array::{Array, BooleanArray};
+    use arrow_schema::{DataType, Field, Schema as ArrowSchema, TimeUnit};
+
+    let mut out = Vec::with_capacity(batches.len());
+    for b in batches {
+        let n = b.num_rows();
+        let mut vf = TimestampMicrosecondBuilder::with_capacity(n);
+        let mut vt = TimestampMicrosecondBuilder::with_capacity(n);
+        for _ in 0..n {
+            vf.append_value(now_micros);
+            vt.append_null();
+        }
+        let is_current = BooleanArray::from(vec![true; n]);
+
+        let mut new_columns: Vec<Arc<dyn Array>> = b.columns().iter().map(Arc::clone).collect();
+        new_columns.push(Arc::new(vf.finish()));
+        new_columns.push(Arc::new(vt.finish()));
+        new_columns.push(Arc::new(is_current));
+
+        let mut new_fields: Vec<Arc<Field>> = b.schema().fields().iter().map(Arc::clone).collect();
+        new_fields.push(Arc::new(Field::new(
+            VALID_FROM_COL,
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            false,
+        )));
+        new_fields.push(Arc::new(Field::new(
+            VALID_TO_COL,
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            true,
+        )));
+        new_fields.push(Arc::new(Field::new(
+            IS_CURRENT_COL,
+            DataType::Boolean,
+            false,
+        )));
+        let new_schema = Arc::new(ArrowSchema::new(new_fields));
+
+        out.push(
+            arrow_array::RecordBatch::try_new(new_schema, new_columns)
+                .map_err(|e| BackendError::Other(format!("scd2 augment scd2 cols: {e}")))?,
+        );
+    }
+    Ok(out)
+}
+
+/// Project just the merge-key columns from each batch, preserving
+/// schema. Used to build the source for soft-delete merges where we
+/// only care about whether each target key has a corresponding source
+/// row.
+fn project_columns(
+    batches: &[arrow_array::RecordBatch],
+    columns: &[String],
+) -> Result<Vec<arrow_array::RecordBatch>, BackendError> {
+    use arrow_schema::Schema as ArrowSchema;
+
+    let mut out = Vec::with_capacity(batches.len());
+    for b in batches {
+        let indices: Vec<usize> = columns
+            .iter()
+            .map(|c| {
+                b.schema()
+                    .index_of(c)
+                    .map_err(|_| BackendError::Other(format!("scd2 project: column '{c}' missing")))
+            })
+            .collect::<Result<_, _>>()?;
+        let cols: Vec<_> = indices.iter().map(|i| Arc::clone(b.column(*i))).collect();
+        let fields: Vec<_> = indices
+            .iter()
+            .map(|i| Arc::clone(&b.schema().fields()[*i]))
+            .collect();
+        let schema = Arc::new(ArrowSchema::new(fields));
+        out.push(
+            arrow_array::RecordBatch::try_new(schema, cols)
+                .map_err(|e| BackendError::Other(format!("scd2 project: {e}")))?,
+        );
+    }
+    Ok(out)
+}
+
+/// Convert an ISO-8601 millisecond string back into microseconds since
+/// the UTC epoch — for the close-out / TTL update predicates that
+/// embed `valid_from`/`valid_to` literals.
+fn iso8601_now_micros() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_micros() as i64)
+        .unwrap_or(0)
 }
 
 /// Build a `DeltaTable` for `url` and try to load its log. If the
@@ -649,20 +861,377 @@ impl Backend for DeltaBackend {
 
     async fn run_scd2(
         &self,
-        _spec: &TableSpec,
-        _source_query: &str,
-        _keys: &[String],
-        _compare_columns: &[String],
-        _pipeline_name: &str,
-        _source_backend: Option<&dyn Backend>,
-        _delete_handling: Option<DeleteHandling>,
-        _event_timestamp_column: Option<&str>,
-        _ttl_seconds: Option<i64>,
-        _dry_run: bool,
+        spec: &TableSpec,
+        source_query: &str,
+        keys: &[String],
+        compare_columns: &[String],
+        pipeline_name: &str,
+        source_backend: Option<&dyn Backend>,
+        delete_handling: Option<DeleteHandling>,
+        event_timestamp_column: Option<&str>,
+        ttl_seconds: Option<i64>,
+        dry_run: bool,
     ) -> Result<StrategyRunResult, BackendError> {
-        Err(BackendError::Other(
-            "Delta run_scd2 lands in Phase 35e".into(),
-        ))
+        use deltalake::datafusion::datasource::MemTable;
+        use deltalake::datafusion::prelude::SessionContext;
+
+        // Validation: only Soft delete is meaningful for SCD2 (Hard
+        // is for merge — wholly removes target rows; SCD2's premise
+        // is that history is preserved).
+        if let Some(dh) = delete_handling
+            && !matches!(dh, DeleteHandling::Soft)
+        {
+            return Err(BackendError::Other(format!(
+                "Delta run_scd2: only DeleteHandling::Soft is supported (got {dh:?}); \
+                 Hard is for merge"
+            )));
+        }
+        // Event-time SCD2 lands in a follow-up; the framework's spec
+        // calls for it but the diff/dedup logic is its own pass and
+        // I want the simpler now()-flavored SCD2 in code first.
+        if event_timestamp_column.is_some() {
+            return Err(BackendError::Other(
+                "Delta run_scd2: event_timestamp_column is not yet supported \
+                 (basic SCD2 with valid_from = now() ships in 35e; event-time \
+                 DISTINCT ON dedup is a follow-up)"
+                    .into(),
+            ));
+        }
+
+        let source = source_backend.ok_or_else(|| {
+            BackendError::Other(
+                "Delta run_scd2: source_backend is required (Delta is target only)".into(),
+            )
+        })?;
+
+        let run_id = uuid::Uuid::now_v7();
+        let started_at = iso8601_now();
+        let now_micros = iso8601_now_micros();
+
+        if dry_run {
+            let _ = source.read_arrow_stream(source_query).await?;
+            let finished_at = iso8601_now();
+            let event = serde_json::json!({
+                "run_id": run_id.to_string(),
+                "pipeline_name": pipeline_name,
+                "target_schema": spec.schema,
+                "target_table": spec.name,
+                "mode": "scd2",
+                "path": "cross_backend",
+                "started_at": started_at,
+                "finished_at": finished_at,
+                "status": "dry_run",
+                "rows_inserted": 0,
+                "rows_closed": 0,
+                "format": "delta",
+            });
+            record_run_event(&self.store, &run_id, &event).await?;
+            return Ok(StrategyRunResult {
+                run_id: run_id.to_string(),
+                rows_inserted: 0,
+                rows_updated: None,
+                rows_unchanged: None,
+                rows_closed: Some(0),
+                status: "dry_run".into(),
+                path: "cross_backend".into(),
+            });
+        }
+
+        // Read source as Arrow batches.
+        let stream = source.read_arrow_stream(source_query).await?;
+        let source_batches: Vec<RecordBatch> = stream.try_collect().await?;
+
+        if source_batches.is_empty() {
+            // Empty source + Soft-delete = wipe. Same guard as merge:
+            // refuse to tombstone every current row from a missing
+            // source query. Pass-through otherwise (no-op).
+            if matches!(delete_handling, Some(DeleteHandling::Soft)) {
+                return Err(BackendError::Other(
+                    "Delta run_scd2 with handle_deletes=Soft refuses an empty \
+                     source (would close every current row); pass an explicit \
+                     truncate if that is the intent"
+                        .into(),
+                ));
+            }
+            let finished_at = iso8601_now();
+            let event = serde_json::json!({
+                "run_id": run_id.to_string(),
+                "pipeline_name": pipeline_name,
+                "target_schema": spec.schema,
+                "target_table": spec.name,
+                "mode": "scd2",
+                "path": "cross_backend",
+                "started_at": started_at,
+                "finished_at": finished_at,
+                "status": "success",
+                "rows_inserted": 0,
+                "rows_closed": 0,
+                "format": "delta",
+            });
+            record_run_event(&self.store, &run_id, &event).await?;
+            return Ok(StrategyRunResult {
+                run_id: run_id.to_string(),
+                rows_inserted: 0,
+                rows_updated: None,
+                rows_unchanged: None,
+                rows_closed: Some(0),
+                status: "success".into(),
+                path: "cross_backend".into(),
+            });
+        }
+
+        // Compute row_hash on every source row over the user's
+        // compare_columns. Same protocol the DB backends use.
+        let source_with_hash = augment_with_row_hash(&source_batches, compare_columns)?;
+
+        let url = self.table_url(&spec.schema, &spec.name)?;
+        let table = open_or_uninit_delta_table(url.clone()).await?;
+
+        let inserted_count: u64;
+        let mut closed_count: u64 = 0;
+
+        if table.version().is_none() {
+            // First load: every source row becomes a new current
+            // version. Schema for the target = source schema +
+            // (valid_from, valid_to, is_current). row_hash already
+            // appended.
+            let with_scd2 = augment_with_scd2_cols(&source_with_hash, now_micros)?;
+            let total: u64 = with_scd2.iter().map(|b| b.num_rows() as u64).sum();
+            let target = open_or_uninit_delta_table(url.clone()).await?;
+            target
+                .write(with_scd2)
+                .with_save_mode(SaveMode::Append)
+                .await
+                .map_err(|e| BackendError::Query(format!("delta scd2 first-write: {e}")))?;
+            inserted_count = total;
+        } else {
+            // Subsequent load. Compute "changed" = source rows whose
+            // current target row has a different row_hash, OR source
+            // rows whose key isn't in target.
+            //
+            // We use DataFusion in-memory: register source-with-hash
+            // as `source`, register target-current as `target`, run
+            // a LEFT JOIN, filter where target.row_hash IS NULL OR
+            // target.row_hash != source.row_hash.
+            // Inline target scan: open the target's table at this
+            // URL, run scan_table to get an Arrow stream, filter to
+            // is_current=true rows in DataFusion, and collect.
+            let scan_url = url.clone();
+            let scan_table = open_or_uninit_delta_table(scan_url).await?;
+            let target_current_batches: Vec<RecordBatch> = if scan_table.version().is_none() {
+                vec![]
+            } else {
+                let (_t, df_stream) = scan_table
+                    .scan_table()
+                    .await
+                    .map_err(|e| BackendError::Query(format!("scd2 target scan_table: {e}")))?;
+                let all: Vec<RecordBatch> = df_stream
+                    .map(|r| r.map_err(|e| BackendError::Query(format!("scd2 target scan: {e}"))))
+                    .try_collect()
+                    .await?;
+                // Filter by is_current=true via DataFusion.
+                if all.is_empty() {
+                    vec![]
+                } else {
+                    let schema_for_filter = all[0].schema();
+                    let provider = Arc::new(
+                        MemTable::try_new(schema_for_filter, vec![all]).map_err(|e| {
+                            BackendError::Query(format!("scd2 target memtable: {e}"))
+                        })?,
+                    );
+                    let ctx = SessionContext::new();
+                    ctx.register_table("delta_target_all", provider)
+                        .map_err(|e| BackendError::Query(format!("scd2 target register: {e}")))?;
+                    let df = ctx
+                        .sql(&format!(
+                            "SELECT * FROM delta_target_all WHERE {IS_CURRENT_COL} = true"
+                        ))
+                        .await
+                        .map_err(|e| BackendError::Query(format!("scd2 target filter sql: {e}")))?;
+                    df.collect().await.map_err(|e| {
+                        BackendError::Query(format!("scd2 target filter collect: {e}"))
+                    })?
+                }
+            };
+
+            let ctx = SessionContext::new();
+            let src_schema = source_with_hash[0].schema();
+            let src_provider = Arc::new(
+                MemTable::try_new(src_schema.clone(), vec![source_with_hash.clone()])
+                    .map_err(|e| BackendError::Query(format!("scd2 source memtable: {e}")))?,
+            );
+            ctx.register_table("source", src_provider)
+                .map_err(|e| BackendError::Query(format!("scd2 register source: {e}")))?;
+
+            let target_schema = if !target_current_batches.is_empty() {
+                target_current_batches[0].schema()
+            } else {
+                // No current rows in target — use source-with-hash
+                // schema as a proxy so register_table doesn't fail.
+                src_schema.clone()
+            };
+            let tgt_provider = Arc::new(
+                MemTable::try_new(target_schema, vec![target_current_batches.clone()])
+                    .map_err(|e| BackendError::Query(format!("scd2 target memtable: {e}")))?,
+            );
+            ctx.register_table("target_current", tgt_provider)
+                .map_err(|e| BackendError::Query(format!("scd2 register target: {e}")))?;
+
+            let join_clause = keys
+                .iter()
+                .map(|k| format!("s.{k} = t.{k}"))
+                .collect::<Vec<_>>()
+                .join(" AND ");
+            // We project only `s.*` so the changed-source rows have
+            // the source schema (user cols + row_hash). The hash
+            // comparison handles NULL via the IS DISTINCT FROM-OR
+            // pattern.
+            let diff_sql = format!(
+                "SELECT s.* FROM source s LEFT JOIN target_current t ON {join_clause} \
+                 WHERE t.{ROW_HASH_COL} IS NULL OR t.{ROW_HASH_COL} != s.{ROW_HASH_COL}"
+            );
+            let diff_df = ctx
+                .sql(&diff_sql)
+                .await
+                .map_err(|e| BackendError::Query(format!("scd2 diff sql: {e}")))?;
+            let changed_batches = diff_df
+                .collect()
+                .await
+                .map_err(|e| BackendError::Query(format!("scd2 diff collect: {e}")))?;
+            let changed_count: u64 = changed_batches.iter().map(|b| b.num_rows() as u64).sum();
+
+            if changed_count > 0 {
+                // Pass 1: close-out via merge. Source = changed
+                // (only need the keys), predicate joins keys + filters
+                // is_current=true on target. Update sets valid_to
+                // and is_current=false.
+                let changed_keys_only = project_columns(&changed_batches, keys)?;
+                let close_schema = changed_keys_only[0].schema();
+                let close_provider = Arc::new(
+                    MemTable::try_new(close_schema, vec![changed_keys_only])
+                        .map_err(|e| BackendError::Query(format!("scd2 close memtable: {e}")))?,
+                );
+                let close_ctx = SessionContext::new();
+                let close_df = close_ctx
+                    .read_table(close_provider)
+                    .map_err(|e| BackendError::Query(format!("scd2 close read_table: {e}")))?;
+                let predicate = keys
+                    .iter()
+                    .map(|k| format!("target.{k} = source.{k}"))
+                    .collect::<Vec<_>>()
+                    .join(" AND ");
+                let predicate = format!("{predicate} AND target.{IS_CURRENT_COL} = true");
+
+                // Embed the now-microseconds timestamp as a literal.
+                // Delta's update parser accepts
+                // `arrow_cast(literal, 'Timestamp(Microsecond, None)')`,
+                // but the simpler path is the DataFusion SQL form
+                // `to_timestamp_micros(<int>)`.
+                let now_lit = format!("to_timestamp_micros({now_micros})");
+                let target_for_close = open_or_uninit_delta_table(url.clone()).await?;
+                let (_t, m) = target_for_close
+                    .merge(close_df, predicate.as_str())
+                    .with_source_alias("source")
+                    .with_target_alias("target")
+                    .when_matched_update(|u| {
+                        u.update(VALID_TO_COL, now_lit.as_str())
+                            .update(IS_CURRENT_COL, "false")
+                    })
+                    .map_err(|e| BackendError::Query(format!("scd2 close when_matched: {e}")))?
+                    .await
+                    .map_err(|e| BackendError::Query(format!("scd2 close merge: {e}")))?;
+                closed_count += m.num_target_rows_updated as u64;
+
+                // Pass 2: append new versions for the changed rows.
+                let with_scd2 = augment_with_scd2_cols(&changed_batches, now_micros)?;
+                let target_for_insert = open_or_uninit_delta_table(url.clone()).await?;
+                target_for_insert
+                    .write(with_scd2)
+                    .with_save_mode(SaveMode::Append)
+                    .await
+                    .map_err(|e| BackendError::Query(format!("scd2 insert: {e}")))?;
+            }
+            inserted_count = changed_count;
+        }
+
+        // Soft-delete: close out current rows whose key isn't in source.
+        if matches!(delete_handling, Some(DeleteHandling::Soft)) {
+            let source_keys_only = project_columns(&source_batches, keys)?;
+            let key_schema = source_keys_only[0].schema();
+            let provider = Arc::new(
+                MemTable::try_new(key_schema, vec![source_keys_only])
+                    .map_err(|e| BackendError::Query(format!("scd2 soft-del memtable: {e}")))?,
+            );
+            let ctx = SessionContext::new();
+            let df = ctx
+                .read_table(provider)
+                .map_err(|e| BackendError::Query(format!("scd2 soft-del read_table: {e}")))?;
+            let predicate = keys
+                .iter()
+                .map(|k| format!("target.{k} = source.{k}"))
+                .collect::<Vec<_>>()
+                .join(" AND ");
+            let now_lit = format!("to_timestamp_micros({now_micros})");
+            let target_for_soft = open_or_uninit_delta_table(url.clone()).await?;
+            let (_t, m) = target_for_soft
+                .merge(df, predicate.as_str())
+                .with_source_alias("source")
+                .with_target_alias("target")
+                .when_not_matched_by_source_update(|u| {
+                    u.predicate(format!("target.{IS_CURRENT_COL} = true"))
+                        .update(VALID_TO_COL, now_lit.as_str())
+                        .update(IS_CURRENT_COL, "false")
+                })
+                .map_err(|e| BackendError::Query(format!("scd2 soft-del when_not_matched: {e}")))?
+                .await
+                .map_err(|e| BackendError::Query(format!("scd2 soft-del merge: {e}")))?;
+            closed_count += m.num_target_rows_updated as u64;
+        }
+
+        // TTL: close out current rows whose valid_from is older than now - ttl.
+        if let Some(ttl) = ttl_seconds {
+            let threshold_micros = now_micros - ttl * 1_000_000;
+            let predicate = format!(
+                "{IS_CURRENT_COL} = true AND {VALID_FROM_COL} < to_timestamp_micros({threshold_micros})"
+            );
+            let now_lit = format!("to_timestamp_micros({now_micros})");
+            let target_for_ttl = open_or_uninit_delta_table(url.clone()).await?;
+            let (_t, m) = target_for_ttl
+                .update()
+                .with_predicate(predicate.as_str())
+                .with_update(VALID_TO_COL, now_lit.as_str())
+                .with_update(IS_CURRENT_COL, "false")
+                .await
+                .map_err(|e| BackendError::Query(format!("scd2 ttl: {e}")))?;
+            closed_count += m.num_updated_rows as u64;
+        }
+
+        let finished_at = iso8601_now();
+        let event = serde_json::json!({
+            "run_id": run_id.to_string(),
+            "pipeline_name": pipeline_name,
+            "target_schema": spec.schema,
+            "target_table": spec.name,
+            "mode": "scd2",
+            "path": "cross_backend",
+            "started_at": started_at,
+            "finished_at": finished_at,
+            "status": "success",
+            "rows_inserted": inserted_count,
+            "rows_closed": closed_count,
+            "format": "delta",
+        });
+        record_run_event(&self.store, &run_id, &event).await?;
+
+        Ok(StrategyRunResult {
+            run_id: run_id.to_string(),
+            rows_inserted: inserted_count as i64,
+            rows_updated: None,
+            rows_unchanged: None,
+            rows_closed: Some(closed_count as i64),
+            status: "success".into(),
+            path: "cross_backend".into(),
+        })
     }
 }
 
@@ -1137,5 +1706,372 @@ mod tests {
             .unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("empty source"), "got: {msg}");
+    }
+
+    // --- Phase 35e: run_scd2 (DuckDB → Delta) ------------------------------
+
+    /// Source has (customer_id, email, name); compare on (email, name).
+    fn small_scd2_spec() -> TableSpec {
+        use crate::types::{ColumnSpec, ColumnType};
+        TableSpec {
+            schema: "raw".into(),
+            name: "customer_dim".into(),
+            columns: vec![
+                ColumnSpec {
+                    name: "customer_id".into(),
+                    ty: ColumnType::BigInt,
+                    nullable: false,
+                    primary_key: true,
+                },
+                ColumnSpec {
+                    name: "email".into(),
+                    ty: ColumnType::Text,
+                    nullable: false,
+                    primary_key: false,
+                },
+                ColumnSpec {
+                    name: "name".into(),
+                    ty: ColumnType::Text,
+                    nullable: true,
+                    primary_key: false,
+                },
+            ],
+            unique_constraints: vec![],
+            fingerprint: String::new(),
+        }
+    }
+
+    async fn duckdb_with_customers() -> Arc<dyn Backend> {
+        let duck: Arc<dyn Backend> = Arc::new(DuckDBBackend::open(":memory:").unwrap());
+        duck.execute("CREATE SCHEMA s").await.unwrap();
+        duck.execute("CREATE TABLE s.customers (customer_id BIGINT, email VARCHAR, name VARCHAR)")
+            .await
+            .unwrap();
+        duck.execute(
+            "INSERT INTO s.customers VALUES (1, 'a@x.com', 'alice'), (2, 'b@x.com', 'bob')",
+        )
+        .await
+        .unwrap();
+        duck
+    }
+
+    async fn count_rows(target: &DeltaBackend, table_path: &str) -> usize {
+        let stream = target.read_arrow_stream(table_path).await.unwrap();
+        let batches: Vec<RecordBatch> = futures_util::TryStreamExt::try_collect(stream)
+            .await
+            .unwrap();
+        batches.iter().map(|b| b.num_rows()).sum()
+    }
+
+    async fn count_rows_where(target: &DeltaBackend, table_path: &str, predicate: &str) -> usize {
+        use deltalake::datafusion::datasource::MemTable;
+        use deltalake::datafusion::prelude::SessionContext;
+
+        let stream = target.read_arrow_stream(table_path).await.unwrap();
+        let batches: Vec<RecordBatch> = futures_util::TryStreamExt::try_collect(stream)
+            .await
+            .unwrap();
+        if batches.is_empty() {
+            return 0;
+        }
+        let schema = batches[0].schema();
+        let provider = Arc::new(MemTable::try_new(schema, vec![batches]).unwrap());
+        let ctx = SessionContext::new();
+        ctx.register_table("t", provider).unwrap();
+        let df = ctx
+            .sql(&format!("SELECT count(*) AS n FROM t WHERE {predicate}"))
+            .await
+            .unwrap();
+        let result = df.collect().await.unwrap();
+        let array = result[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        array.value(0) as usize
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn delta_run_scd2_first_load_inserts_all_current() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = DeltaBackend::open_local(dir.path()).unwrap();
+        let source = duckdb_with_customers().await;
+        let spec = small_scd2_spec();
+
+        let r = target
+            .run_scd2(
+                &spec,
+                "SELECT customer_id, email, name FROM s.customers ORDER BY customer_id",
+                &["customer_id".into()],
+                &["email".into(), "name".into()],
+                "p35e_first",
+                Some(source.as_ref()),
+                None,
+                None,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.rows_inserted, 2);
+        assert_eq!(r.rows_closed, Some(0));
+        assert_eq!(r.status, "success");
+
+        assert_eq!(count_rows(&target, "raw/customer_dim").await, 2);
+        assert_eq!(
+            count_rows_where(&target, "raw/customer_dim", "is_current = true").await,
+            2
+        );
+        assert_eq!(
+            count_rows_where(&target, "raw/customer_dim", "valid_to IS NULL").await,
+            2
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn delta_run_scd2_second_load_closes_changed_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = DeltaBackend::open_local(dir.path()).unwrap();
+        let source = duckdb_with_customers().await;
+        let spec = small_scd2_spec();
+
+        // First load.
+        target
+            .run_scd2(
+                &spec,
+                "SELECT customer_id, email, name FROM s.customers ORDER BY customer_id",
+                &["customer_id".into()],
+                &["email".into(), "name".into()],
+                "p35e_a",
+                Some(source.as_ref()),
+                None,
+                None,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+
+        // Mutate bob: bob → bob2 / b2@x.com. Alice unchanged.
+        source
+            .execute("UPDATE s.customers SET email='b2@x.com', name='bob2' WHERE customer_id=2")
+            .await
+            .unwrap();
+        let r = target
+            .run_scd2(
+                &spec,
+                "SELECT customer_id, email, name FROM s.customers ORDER BY customer_id",
+                &["customer_id".into()],
+                &["email".into(), "name".into()],
+                "p35e_b",
+                Some(source.as_ref()),
+                None,
+                None,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.rows_inserted, 1, "only bob is new");
+        assert_eq!(r.rows_closed, Some(1), "old bob is closed");
+
+        assert_eq!(count_rows(&target, "raw/customer_dim").await, 3);
+        assert_eq!(
+            count_rows_where(&target, "raw/customer_dim", "is_current = true").await,
+            2
+        );
+        assert_eq!(
+            count_rows_where(
+                &target,
+                "raw/customer_dim",
+                "customer_id = 2 AND is_current = true",
+            )
+            .await,
+            1
+        );
+        assert_eq!(
+            count_rows_where(
+                &target,
+                "raw/customer_dim",
+                "customer_id = 2 AND is_current = false",
+            )
+            .await,
+            1
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn delta_run_scd2_idempotent_when_no_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = DeltaBackend::open_local(dir.path()).unwrap();
+        let source = duckdb_with_customers().await;
+        let spec = small_scd2_spec();
+
+        for tag in ["p35e_idem_1", "p35e_idem_2"] {
+            target
+                .run_scd2(
+                    &spec,
+                    "SELECT customer_id, email, name FROM s.customers ORDER BY customer_id",
+                    &["customer_id".into()],
+                    &["email".into(), "name".into()],
+                    tag,
+                    Some(source.as_ref()),
+                    None,
+                    None,
+                    None,
+                    false,
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(count_rows(&target, "raw/customer_dim").await, 2);
+        assert_eq!(
+            count_rows_where(&target, "raw/customer_dim", "is_current = true").await,
+            2
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn delta_run_scd2_soft_delete_closes_missing_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = DeltaBackend::open_local(dir.path()).unwrap();
+        let source = duckdb_with_customers().await;
+        let spec = small_scd2_spec();
+
+        target
+            .run_scd2(
+                &spec,
+                "SELECT customer_id, email, name FROM s.customers",
+                &["customer_id".into()],
+                &["email".into(), "name".into()],
+                "p35e_soft_a",
+                Some(source.as_ref()),
+                None,
+                None,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+
+        // Drop bob from source; expect Soft delete to close his current
+        // row.
+        source
+            .execute("DELETE FROM s.customers WHERE customer_id = 2")
+            .await
+            .unwrap();
+        let r = target
+            .run_scd2(
+                &spec,
+                "SELECT customer_id, email, name FROM s.customers",
+                &["customer_id".into()],
+                &["email".into(), "name".into()],
+                "p35e_soft_b",
+                Some(source.as_ref()),
+                Some(DeleteHandling::Soft),
+                None,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.rows_inserted, 0);
+        assert_eq!(r.rows_closed, Some(1));
+
+        // Alice still current; bob no longer current; bob's old row
+        // exists with valid_to set.
+        assert_eq!(
+            count_rows_where(
+                &target,
+                "raw/customer_dim",
+                "customer_id = 1 AND is_current = true",
+            )
+            .await,
+            1
+        );
+        assert_eq!(
+            count_rows_where(
+                &target,
+                "raw/customer_dim",
+                "customer_id = 2 AND is_current = false AND valid_to IS NOT NULL",
+            )
+            .await,
+            1
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn delta_run_scd2_ttl_expires_stale_current() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = DeltaBackend::open_local(dir.path()).unwrap();
+        let source = duckdb_with_customers().await;
+        let spec = small_scd2_spec();
+
+        target
+            .run_scd2(
+                &spec,
+                "SELECT customer_id, email, name FROM s.customers",
+                &["customer_id".into()],
+                &["email".into(), "name".into()],
+                "p35e_ttl_first",
+                Some(source.as_ref()),
+                None,
+                None,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+
+        // No source change; run again with a -1 second TTL so every
+        // current row becomes "stale" and gets tombstoned. Negative
+        // ttl is contrived but exercises the predicate.
+        let r = target
+            .run_scd2(
+                &spec,
+                "SELECT customer_id, email, name FROM s.customers",
+                &["customer_id".into()],
+                &["email".into(), "name".into()],
+                "p35e_ttl_apply",
+                Some(source.as_ref()),
+                None,
+                None,
+                Some(-1),
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.rows_inserted, 0);
+        assert!(r.rows_closed.unwrap() >= 2, "TTL closes both current rows");
+
+        assert_eq!(
+            count_rows_where(&target, "raw/customer_dim", "is_current = true").await,
+            0
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn delta_run_scd2_event_time_not_yet_supported() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = DeltaBackend::open_local(dir.path()).unwrap();
+        let source = duckdb_with_customers().await;
+        let spec = small_scd2_spec();
+        let err = target
+            .run_scd2(
+                &spec,
+                "SELECT customer_id, email, name FROM s.customers",
+                &["customer_id".into()],
+                &["email".into(), "name".into()],
+                "p35e_event_time",
+                Some(source.as_ref()),
+                None,
+                Some("event_ts"),
+                None,
+                false,
+            )
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("event_timestamp_column"), "got: {msg}");
     }
 }

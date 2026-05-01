@@ -2186,6 +2186,7 @@ name = "ematix-flow-core"
 version = "0.1.0"
 dependencies = [
  "arrow-array",
+ "arrow-cast",
  "arrow-csv",
  "arrow-json",
  "arrow-schema",

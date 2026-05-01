@@ -30,6 +30,7 @@ arrow-array = "58"
 arrow-schema = "58"
 arrow-csv = "58"
 arrow-json = "58"
+arrow-cast = "58"
 # orc-rust 0.8 (and onward) tracks arrow 58. Phase 35a workspace bump
 # brought us here so deltalake / iceberg can share the ABI. 0.8 also
 # adds `into_inner` on ArrowWriter, dropping the `Arc<Mutex<Vec<u8>>>`
