@@ -39,12 +39,16 @@
 //! every pipeline targeting Kafka uses. Consumer mode requires a
 //! `group_id` for offset tracking and rebalancing.
 
+use std::sync::Arc;
 use std::time::Duration;
 
+use arrow_array::RecordBatch;
 use async_trait::async_trait;
 use rdkafka::ClientConfig;
+use rdkafka::Message;
 use rdkafka::admin::AdminClient;
 use rdkafka::client::DefaultClientContext;
+use rdkafka::consumer::{Consumer, StreamConsumer};
 
 use crate::backend::{
     ArrowBatchStream, Backend, BackendError, DeleteHandling, Dialect, StrategyRunResult,
@@ -190,10 +194,65 @@ impl Backend for KafkaBackend {
         ))
     }
 
-    async fn read_arrow_stream(&self, _query: &str) -> Result<ArrowBatchStream, BackendError> {
-        Err(BackendError::Other(
-            "Kafka read_arrow_stream lands in Phase 36b".into(),
-        ))
+    /// Subscribe to `query` (a topic name) and read messages until
+    /// the consumer goes idle for `READ_IDLE_TIMEOUT_SECS`. Each
+    /// message payload is decoded as a single JSON object and rows
+    /// are concatenated into one Arrow `RecordBatch`. Schema is
+    /// inferred from the first 1024 messages (arrow-json default).
+    ///
+    /// Returns an empty stream if the topic has no messages.
+    ///
+    /// Limits in 36b — folded out in later sub-phases:
+    ///   - JSON-only payload decode (raw bytes / Avro / Protobuf land
+    ///     in 36h via a `with_format(...)` builder).
+    ///   - Bounded read: stops after `READ_IDLE_TIMEOUT_SECS` of no
+    ///     new messages. The long-running streaming-consumer model
+    ///     (36g) holds the topic open indefinitely and supervises a
+    ///     consumer process; this `read_arrow_stream` is the
+    ///     batch-read complement that fits the framework's existing
+    ///     "read source → write target" call shape.
+    ///   - Auto-commit stays disabled (set in `client_config`); 36e
+    ///     wires the manual-commit path through the strategy
+    ///     executors, where commits fire only after a durable write.
+    async fn read_arrow_stream(&self, query: &str) -> Result<ArrowBatchStream, BackendError> {
+        if self.group_id.is_none() {
+            return Err(BackendError::Other(
+                "Kafka read_arrow_stream: group_id is required for the consumer; \
+                 construct with KafkaBackend::open(bootstrap, Some(group_id))"
+                    .into(),
+            ));
+        }
+        let topic = query.trim();
+        if topic.is_empty() {
+            return Err(BackendError::Other(
+                "Kafka read_arrow_stream: query argument must be a non-empty topic name".into(),
+            ));
+        }
+
+        // Default to `earliest` so a fresh consumer reads the topic
+        // from the start. Long-running consumers in 36g may want
+        // `latest` instead and can override the config; the batch
+        // `read_arrow_stream` path matches the "drain the topic"
+        // expectation users have when they hand a SQL backend a
+        // `SELECT * FROM …` query.
+        let mut config = self.client_config();
+        config.set("auto.offset.reset", "earliest");
+        let consumer: StreamConsumer = config
+            .create()
+            .map_err(|e| BackendError::Connection(format!("kafka consumer create: {e}")))?;
+        consumer
+            .subscribe(&[topic])
+            .map_err(|e| BackendError::Connection(format!("kafka subscribe {topic}: {e}")))?;
+
+        // Drain the consumer into a Vec<Vec<u8>> of payloads.
+        let payloads = drain_consumer(&consumer).await?;
+        if payloads.is_empty() {
+            let stream = futures_util::stream::empty();
+            return Ok(Box::pin(stream));
+        }
+        let batches = decode_payloads_as_jsonl(payloads)?;
+        let stream = futures_util::stream::iter(batches.into_iter().map(Ok));
+        Ok(Box::pin(stream))
     }
 
     async fn write_arrow_stream(
@@ -285,6 +344,100 @@ impl Backend for KafkaBackend {
                 .into(),
         ))
     }
+}
+
+/// How long to wait for the first message after subscribing. The
+/// consumer's initial group join + partition assignment + offset
+/// fetch can take several seconds, so the first-message budget is
+/// larger than the subsequent-message one.
+const READ_FIRST_MESSAGE_TIMEOUT_SECS: u64 = 15;
+
+/// How long to wait without a new message before declaring the
+/// batch-read drained, after the first message has arrived.
+/// `recv()` blocks until a message arrives, so we wrap it in a
+/// tokio timeout. A long-running streaming consumer (36g) doesn't
+/// use this path.
+const READ_IDLE_TIMEOUT_SECS: u64 = 5;
+
+/// Maximum messages collected per `read_arrow_stream` call. Cap
+/// keeps the in-memory accumulator bounded for unbounded topics.
+/// Larger reads should drive the streaming-consumer path (36g)
+/// where backpressure + checkpointing are first-class.
+const READ_MAX_MESSAGES: usize = 100_000;
+
+/// Drain `consumer` into a `Vec<Vec<u8>>` of payloads. Stops at
+/// `READ_IDLE_TIMEOUT_SECS` of silence, or after `READ_MAX_MESSAGES`
+/// messages, whichever comes first. Messages with no payload (Kafka
+/// tombstones) are skipped — they're meaningful for compacted topics
+/// but don't carry a row to decode.
+async fn drain_consumer(consumer: &StreamConsumer) -> Result<Vec<Vec<u8>>, BackendError> {
+    let mut payloads: Vec<Vec<u8>> = Vec::new();
+    while payloads.len() < READ_MAX_MESSAGES {
+        // First-message timeout is generous (group rebalance + offset
+        // fetch can take several seconds on a fresh broker);
+        // subsequent timeouts are tight because we're "draining" a
+        // known-active stream.
+        let timeout_secs = if payloads.is_empty() {
+            READ_FIRST_MESSAGE_TIMEOUT_SECS
+        } else {
+            READ_IDLE_TIMEOUT_SECS
+        };
+        let recv_fut = consumer.recv();
+        let msg = tokio::time::timeout(Duration::from_secs(timeout_secs), recv_fut).await;
+        match msg {
+            Ok(Ok(borrowed)) => {
+                if let Some(payload) = borrowed.payload() {
+                    payloads.push(payload.to_vec());
+                }
+            }
+            Ok(Err(e)) => {
+                // UnknownTopicOrPartition is the broker's way of
+                // saying "this topic doesn't exist". For a batch-read
+                // that's logically equivalent to an empty stream —
+                // return what we have rather than escalating.
+                let s = e.to_string();
+                if s.contains("UnknownTopicOrPartition") || s.contains("Unknown topic or partition")
+                {
+                    break;
+                }
+                return Err(BackendError::Query(format!("kafka recv: {e}")));
+            }
+            Err(_elapsed) => break, // idle timeout → stop
+        }
+    }
+    Ok(payloads)
+}
+
+/// Decode a Vec of message payloads as JSONL. Concatenates payloads
+/// with `\n` separators so arrow-json's
+/// `infer_json_schema_from_seekable` can run a single pass. Returns
+/// the full RecordBatch list — typically one batch for a moderate
+/// drain; arrow-json may chunk if the buffer is large.
+fn decode_payloads_as_jsonl(payloads: Vec<Vec<u8>>) -> Result<Vec<RecordBatch>, BackendError> {
+    use arrow_json::ReaderBuilder;
+    use arrow_json::reader::infer_json_schema_from_seekable;
+
+    let mut buf: Vec<u8> = Vec::with_capacity(payloads.iter().map(|p| p.len() + 1).sum());
+    for p in &payloads {
+        buf.extend_from_slice(p);
+        // arrow-json's line-delimited reader splits on `\n`; ensure
+        // every payload ends with one, regardless of whether the
+        // producer included a trailing newline.
+        if !p.ends_with(b"\n") {
+            buf.push(b'\n');
+        }
+    }
+    let mut cursor = std::io::Cursor::new(buf);
+    let (schema, _records_inferred) = infer_json_schema_from_seekable(&mut cursor, Some(1024))
+        .map_err(|e| BackendError::Query(format!("kafka json infer: {e}")))?;
+    let reader = ReaderBuilder::new(Arc::new(schema))
+        .build(std::io::BufReader::new(cursor))
+        .map_err(|e| BackendError::Query(format!("kafka json reader: {e}")))?;
+    let mut batches: Vec<RecordBatch> = Vec::new();
+    for b in reader {
+        batches.push(b.map_err(|e| BackendError::Query(format!("kafka json batch: {e}")))?);
+    }
+    Ok(batches)
 }
 
 /// Best-effort parse of "host:port,host:port,..." → (first_host, first_port).

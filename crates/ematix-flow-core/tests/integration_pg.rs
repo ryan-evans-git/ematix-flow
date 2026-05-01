@@ -3894,3 +3894,108 @@ async fn kafka_backend_ping_consumer_group() {
     backend.ping().await.unwrap();
     assert_eq!(backend.connection_info().user, "test-group");
 }
+
+// ----- Phase 36b: Kafka consume read_arrow_stream -----------------------
+
+use rdkafka::ClientConfig as KafkaClientConfig;
+use rdkafka::producer::{FutureProducer, FutureRecord};
+use std::time::Duration as StdDuration;
+
+async fn produce_json_messages(bootstrap: &str, topic: &str, payloads: &[&str]) {
+    let producer: FutureProducer = KafkaClientConfig::new()
+        .set("bootstrap.servers", bootstrap)
+        .set("message.timeout.ms", "5000")
+        .create()
+        .expect("kafka producer create");
+    for payload in payloads {
+        producer
+            .send(
+                FutureRecord::<(), str>::to(topic).payload(*payload),
+                StdDuration::from_secs(5),
+            )
+            .await
+            .expect("kafka produce");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker; run with `cargo test -- --ignored`"]
+async fn kafka_read_arrow_stream_consumes_json_messages() {
+    use arrow_array::{Int64Array, StringArray};
+
+    let (_container, bootstrap) = start_kafka().await;
+    let topic = "test-events";
+    produce_json_messages(
+        &bootstrap,
+        topic,
+        &[
+            r#"{"id": 1, "name": "alice"}"#,
+            r#"{"id": 2, "name": "bob"}"#,
+            r#"{"id": 3, "name": "carol"}"#,
+        ],
+    )
+    .await;
+
+    let backend = KafkaBackend::open(&bootstrap, Some("test-consume")).unwrap();
+    let stream = backend.read_arrow_stream(topic).await.unwrap();
+    let batches: Vec<_> = stream.try_collect().await.unwrap();
+    let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total, 3);
+
+    // arrow-json infers schema from message bodies; numeric fields
+    // come back as Int64, string fields as Utf8.
+    let id = batches[0]
+        .column_by_name("id")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let name = batches[0]
+        .column_by_name("name")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let mut pairs: Vec<(i64, String)> = (0..id.len())
+        .map(|i| (id.value(i), name.value(i).to_string()))
+        .collect();
+    pairs.sort_by_key(|(k, _)| *k);
+    assert_eq!(
+        pairs,
+        vec![(1, "alice".into()), (2, "bob".into()), (3, "carol".into())]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker; run with `cargo test -- --ignored`"]
+async fn kafka_read_arrow_stream_empty_topic() {
+    let (_container, bootstrap) = start_kafka().await;
+    // Topic doesn't exist yet; subscription auto-creates it (broker
+    // default), no messages → empty stream after the idle timeout.
+    let backend = KafkaBackend::open(&bootstrap, Some("test-empty")).unwrap();
+    let stream = backend.read_arrow_stream("never-produced").await.unwrap();
+    let batches: Vec<_> = stream.try_collect().await.unwrap();
+    assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn kafka_read_arrow_stream_requires_group_id() {
+    let backend = KafkaBackend::open("localhost:9092", None).unwrap();
+    let err = match backend.read_arrow_stream("any-topic").await {
+        Ok(_) => panic!("expected group_id rejection"),
+        Err(e) => e,
+    };
+    let msg = err.to_string();
+    assert!(msg.contains("group_id is required"), "got: {msg}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn kafka_read_arrow_stream_rejects_empty_topic() {
+    let backend = KafkaBackend::open("localhost:9092", Some("g")).unwrap();
+    let err = match backend.read_arrow_stream("   ").await {
+        Ok(_) => panic!("expected empty-topic rejection"),
+        Err(e) => e,
+    };
+    let msg = err.to_string();
+    assert!(msg.contains("non-empty topic"), "got: {msg}");
+}
