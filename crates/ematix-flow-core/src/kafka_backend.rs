@@ -1181,11 +1181,14 @@ impl Backend for KafkaBackend {
                 }
             }
             KafkaPayloadFormat::Protobuf => {
-                return Err(BackendError::Other(
-                    "Kafka read_arrow_stream Protobuf: surface reserved in 36h.2; \
-                     decode lands in Phase 36h.5 (Schema Registry + prost-reflect)"
-                        .into(),
-                ));
+                if self.schema_registry_url.is_none() {
+                    return Err(BackendError::Other(
+                        "Kafka read_arrow_stream Protobuf: schema_registry_url \
+                         is required (call `with_schema_registry_url(...)` on \
+                         the backend before reading)"
+                            .into(),
+                    ));
+                }
             }
         }
 
@@ -1231,10 +1234,13 @@ impl Backend for KafkaBackend {
                 )
                 .await?
             }
-            // Protobuf still rejected at entry; this arm is
-            // unreachable but kept for compiler exhaustiveness.
             KafkaPayloadFormat::Protobuf => {
-                unreachable!("Protobuf format rejected at read entry")
+                // schema_registry_url presence already validated above.
+                decode_payloads_as_protobuf(
+                    payloads,
+                    self.schema_registry_url.as_ref().expect("checked above"),
+                )
+                .await?
             }
         };
         let stream = futures_util::stream::iter(batches.into_iter().map(Ok));
@@ -1821,6 +1827,175 @@ fn avro_value_to_json(value: &apache_avro::types::Value) -> serde_json::Value {
     }
 }
 
+/// Decode a Vec of message payloads under `KafkaPayloadFormat::Protobuf`.
+/// Confluent wire format: `0x00` magic byte + 4-byte BE schema id +
+/// message-index varint(s) + Protobuf body. The schema (.proto file
+/// content) is fetched from the Schema Registry by id; the SR
+/// converter caches per-id internally so a hot topic only pays the
+/// lookup once.
+///
+/// Decoded `protofish::decode::MessageValue`s are converted to
+/// `serde_json::Value`s using the schema-resolved field names, then
+/// concatenated as JSONL bytes; we then route through the existing
+/// `decode_payloads_as_jsonl` path so Arrow schema inference +
+/// RecordBatch construction is shared with the JSON / Avro decode
+/// paths. The trade-off matches the Avro path: Protobuf int32/64 →
+/// Arrow Int32/Int64 via JSON numbers, but Protobuf bytes are
+/// rendered as lowercase hex strings (no canonical Avro JSON
+/// equivalent for proto bytes — pick whichever round-trips cleanly).
+/// Strict-typed Protobuf→Arrow is a future follow-up.
+async fn decode_payloads_as_protobuf(
+    payloads: Vec<Vec<u8>>,
+    schema_registry_url: &str,
+) -> Result<Vec<RecordBatch>, BackendError> {
+    use schema_registry_converter::async_impl::easy_proto_decoder::EasyProtoDecoder;
+    use schema_registry_converter::async_impl::schema_registry::SrSettings;
+
+    let sr_settings = SrSettings::new(schema_registry_url.to_string());
+    let decoder = EasyProtoDecoder::new(sr_settings);
+
+    let mut json_payloads: Vec<Vec<u8>> = Vec::with_capacity(payloads.len());
+    for payload in payloads {
+        let decoded = decoder
+            .decode_with_context(Some(&payload))
+            .await
+            .map_err(|e| BackendError::Query(format!("kafka protobuf decode: {e}")))?;
+        let Some(decoded) = decoded else {
+            // Null / empty payload — skip.
+            continue;
+        };
+        let json = protofish_message_to_json(&decoded.value, &decoded.context.context);
+        let bytes = serde_json::to_vec(&json)
+            .map_err(|e| BackendError::Other(format!("protobuf→json serialize: {e}")))?;
+        json_payloads.push(bytes);
+    }
+    if json_payloads.is_empty() {
+        return Ok(Vec::new());
+    }
+    decode_payloads_as_jsonl(json_payloads)
+}
+
+/// Convert a `protofish::decode::MessageValue` into a
+/// `serde_json::Value::Object`, using the protofish `Context` to
+/// resolve field numbers → field names. Repeated fields collapse
+/// to JSON arrays (preserving order); singular fields take the last
+/// observed value (proto3 last-wins). Lossy on bytes (rendered as
+/// lowercase hex) — same trade-off as the Avro path.
+fn protofish_message_to_json(
+    msg: &protofish::decode::MessageValue,
+    context: &protofish::context::Context,
+) -> serde_json::Value {
+    use protofish::context::Multiplicity;
+    use serde_json::{Map, Value as Js};
+
+    let info = context.resolve_message(msg.msg_ref);
+
+    // Group field values by field number (preserves order of first
+    // appearance for the iteration below; later we rely on the
+    // schema's field declaration order).
+    let mut by_number: std::collections::BTreeMap<u64, Vec<&protofish::decode::Value>> =
+        std::collections::BTreeMap::new();
+    for fv in &msg.fields {
+        by_number.entry(fv.number).or_default().push(&fv.value);
+    }
+
+    let mut obj: Map<String, Js> = Map::new();
+    for field in info.iter_fields() {
+        let Some(values) = by_number.get(&field.number) else {
+            continue;
+        };
+        let is_repeated = matches!(
+            field.multiplicity,
+            Multiplicity::Repeated | Multiplicity::RepeatedPacked
+        );
+        let json_value = if is_repeated {
+            // Flatten any Packed arrays so each scalar is its own
+            // JSON entry.
+            let mut arr: Vec<Js> = Vec::new();
+            for v in values {
+                match v {
+                    protofish::decode::Value::Packed(packed) => {
+                        for item in packed_array_to_json(packed) {
+                            arr.push(item);
+                        }
+                    }
+                    other => arr.push(protofish_value_to_json(other, context)),
+                }
+            }
+            Js::Array(arr)
+        } else {
+            // Singular: proto3 last-wins. Packed inside a singular
+            // field shouldn't happen, but if it does we take the
+            // first scalar.
+            let last = values.last().expect("non-empty by construction");
+            match last {
+                protofish::decode::Value::Packed(packed) => packed_array_to_json(packed)
+                    .into_iter()
+                    .next()
+                    .unwrap_or(Js::Null),
+                other => protofish_value_to_json(other, context),
+            }
+        };
+        obj.insert(field.name.clone(), json_value);
+    }
+    Js::Object(obj)
+}
+
+/// Convert a `protofish::decode::Value` into a `serde_json::Value`.
+/// Recurses into nested messages via the supplied `Context`.
+fn protofish_value_to_json(
+    value: &protofish::decode::Value,
+    context: &protofish::context::Context,
+) -> serde_json::Value {
+    use protofish::decode::Value as Pv;
+    use serde_json::{Value as Js, json};
+
+    match value {
+        Pv::Double(f) => json!(*f),
+        Pv::Float(f) => json!(*f),
+        Pv::Int32(i) | Pv::SInt32(i) | Pv::SFixed32(i) => json!(*i),
+        Pv::Int64(i) | Pv::SInt64(i) | Pv::SFixed64(i) => json!(*i),
+        Pv::UInt32(u) | Pv::Fixed32(u) => json!(*u),
+        Pv::UInt64(u) | Pv::Fixed64(u) => json!(*u),
+        Pv::Bool(b) => Js::Bool(*b),
+        Pv::String(s) => Js::String(s.clone()),
+        Pv::Bytes(b) => Js::String(b.iter().map(|byte| format!("{:02x}", byte)).collect()),
+        Pv::Message(boxed) => protofish_message_to_json(boxed, context),
+        Pv::Enum(e) => {
+            // Resolve enum name via context; if not available, fall
+            // back to the raw integer value.
+            let enum_info = context.resolve_enum(e.enum_ref);
+            match enum_info.get_field_by_value(e.value) {
+                Some(f) => Js::String(f.name.clone()),
+                None => json!(e.value),
+            }
+        }
+        Pv::Packed(p) => Js::Array(packed_array_to_json(p)),
+        // Incomplete / Unknown fall through to a debug string —
+        // these only appear when the schema is mismatched against
+        // the payload, which is an outright error condition that
+        // SR's id-based resolution should prevent in practice.
+        other => Js::String(format!("{:?}", other)),
+    }
+}
+
+/// Expand a `protofish::decode::PackedArray` into a Vec of
+/// `serde_json::Value` scalars.
+fn packed_array_to_json(packed: &protofish::decode::PackedArray) -> Vec<serde_json::Value> {
+    use protofish::decode::PackedArray as Pa;
+    use serde_json::{Value as Js, json};
+
+    match packed {
+        Pa::Double(v) => v.iter().map(|x| json!(*x)).collect(),
+        Pa::Float(v) => v.iter().map(|x| json!(*x)).collect(),
+        Pa::Int32(v) | Pa::SInt32(v) | Pa::SFixed32(v) => v.iter().map(|x| json!(*x)).collect(),
+        Pa::Int64(v) | Pa::SInt64(v) | Pa::SFixed64(v) => v.iter().map(|x| json!(*x)).collect(),
+        Pa::UInt32(v) | Pa::Fixed32(v) => v.iter().map(|x| json!(*x)).collect(),
+        Pa::UInt64(v) | Pa::Fixed64(v) => v.iter().map(|x| json!(*x)).collect(),
+        Pa::Bool(v) => v.iter().map(|x| Js::Bool(*x)).collect(),
+    }
+}
+
 /// Produce each `payload` to `topic` via `producer`, awaiting the
 /// broker ack per message. Returns the number of messages
 /// successfully produced. Used by both the `AtLeastOnce` (no
@@ -2280,17 +2455,116 @@ mod tests {
         );
     }
 
+    /// 36h.5: protofish → JSON conversion preserves field names
+    /// and primitive types for a simple message.
+    #[test]
+    fn protofish_message_to_json_simple_record() {
+        use protofish::context::Context;
+        use protofish::decode::{FieldValue, MessageValue, Value as Pv};
+
+        let proto_src = r#"
+            syntax = "proto3";
+            package demo;
+            message Heartbeat {
+                int64 beat = 1;
+                string label = 2;
+            }
+        "#;
+        let ctx = Context::parse([proto_src]).expect("parse proto");
+        let msg_info = ctx.get_message("demo.Heartbeat").expect("Heartbeat exists");
+        let msg = MessageValue {
+            msg_ref: msg_info.self_ref,
+            fields: vec![
+                FieldValue {
+                    number: 1,
+                    value: Pv::Int64(7),
+                },
+                FieldValue {
+                    number: 2,
+                    value: Pv::String("alice".into()),
+                },
+            ],
+            garbage: None,
+        };
+        let js = protofish_message_to_json(&msg, &ctx);
+        let obj = js.as_object().expect("record → object");
+        assert_eq!(obj.get("beat"), Some(&serde_json::json!(7)));
+        assert_eq!(
+            obj.get("label"),
+            Some(&serde_json::Value::String("alice".into()))
+        );
+    }
+
+    /// 36h.5: repeated proto fields collapse to JSON arrays in the
+    /// declared field order.
+    #[test]
+    fn protofish_message_to_json_repeated_field_becomes_array() {
+        use protofish::context::Context;
+        use protofish::decode::{FieldValue, MessageValue, Value as Pv};
+
+        let proto_src = r#"
+            syntax = "proto3";
+            package demo;
+            message Tags {
+                repeated string name = 1;
+            }
+        "#;
+        let ctx = Context::parse([proto_src]).expect("parse proto");
+        let msg_info = ctx.get_message("demo.Tags").expect("Tags exists");
+        let msg = MessageValue {
+            msg_ref: msg_info.self_ref,
+            fields: vec![
+                FieldValue {
+                    number: 1,
+                    value: Pv::String("a".into()),
+                },
+                FieldValue {
+                    number: 1,
+                    value: Pv::String("b".into()),
+                },
+            ],
+            garbage: None,
+        };
+        let js = protofish_message_to_json(&msg, &ctx);
+        let arr = js
+            .as_object()
+            .and_then(|o| o.get("name"))
+            .and_then(|v| v.as_array())
+            .expect("name is array");
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0], serde_json::Value::String("a".into()));
+        assert_eq!(arr[1], serde_json::Value::String("b".into()));
+    }
+
+    /// 36h.5: read path surfaces a clean error when SR URL is set
+    /// but unreachable. Doesn't require a live SR.
     #[tokio::test(flavor = "multi_thread")]
-    async fn protobuf_read_rejects_with_pointer_to_36h_5() {
+    async fn protobuf_decode_unreachable_sr_returns_clean_error() {
+        let payloads = vec![vec![0x00, 0x00, 0x00, 0x00, 0x01, 0x08, 0x65]];
+        let err = decode_payloads_as_protobuf(payloads, "http://127.0.0.1:1")
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("kafka protobuf decode"),
+            "expected clean decode error; got: {msg}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn protobuf_read_without_sr_url_rejects_with_pointer() {
         let b = KafkaBackend::open("localhost:9092", Some("g1"))
             .unwrap()
             .with_payload_format(KafkaPayloadFormat::Protobuf);
         let err = match b.read_arrow_stream("any-topic").await {
-            Ok(_) => panic!("expected Protobuf read rejection"),
+            Ok(_) => panic!("expected Protobuf SR URL rejection"),
             Err(e) => e,
         };
         let msg = err.to_string();
-        assert!(msg.contains("Phase 36h.5"), "got: {msg}");
+        assert!(
+            msg.contains("schema_registry_url"),
+            "expected SR URL rejection on protobuf read; got: {msg}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

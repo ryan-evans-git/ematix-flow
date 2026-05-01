@@ -82,11 +82,17 @@ prometheus = "0.14"
 # avro codec via apache-avro and an http client (reqwest) for the
 # SR REST API. `easy` features the high-level decoder/encoder; we
 # use the async variant for tokio integration.
-schema_registry_converter = { version = "4.8", default-features = false, features = ["futures", "native_tls", "avro", "easy"] }
+schema_registry_converter = { version = "4.8", default-features = false, features = ["futures", "native_tls", "avro", "easy", "proto_decoder", "proto_raw"] }
 # Apache Avro Value type + Schema; used by the Avro→JSON
 # converter that bridges decoded Avro values into our existing
 # arrow-json decode path.
 apache-avro = "0.21"
+# Protobuf reflective decoder used by the SR proto_decoder
+# feature. Brought in transitively by schema_registry_converter
+# but declared directly so we can import its `Context`,
+# `MessageValue`, and `Value` types into our protofish→JSON
+# converter (Phase 36h.5).
+protofish = { version = "0.5", default-features = false }
 # `url` is needed to construct deltalake's `Url` parameter; deltalake
 # doesn't re-export it. Already pulled in transitively, so this just
 # brings it into the workspace's direct namespace.
