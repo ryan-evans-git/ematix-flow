@@ -4612,3 +4612,104 @@ async fn kafka_exactly_once_produce_round_trip() {
     let total: usize = batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(total, 3);
 }
+
+// ----- Phase 36j.2: Kafka→Kafka EOS pipeline ----------------------------
+
+use ematix_flow_core::streaming::KafkaToKafkaEosPipeline;
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker; run with `cargo test -- --ignored`"]
+async fn eos_pipeline_kafka_to_kafka_round_trip() {
+    use arrow_array::Int64Array;
+
+    let (_container, bootstrap) = start_kafka().await;
+    let input_topic = "eos-pipeline-in";
+    let output_topic = "eos-pipeline-out";
+
+    // Seed input with 5 messages.
+    let payloads: Vec<String> = (1..=5).map(|i| format!(r#"{{"id": {i}}}"#)).collect();
+    let payload_refs: Vec<&str> = payloads.iter().map(|s| s.as_str()).collect();
+    produce_json_messages(&bootstrap, input_topic, &payload_refs).await;
+
+    let source = Arc::new(
+        ematix_flow_core::KafkaBackend::open(&bootstrap, Some("eos-pipeline-grp"))
+            .unwrap()
+            .with_batch_config(ematix_flow_core::kafka_backend::KafkaBatchConfig {
+                batch_size: 100,
+                batch_window_ms: 1_000,
+                idle_timeout_ms: 1_500,
+                ..Default::default()
+            }),
+    );
+
+    let transactional_id = format!(
+        "eos-pipeline-{:x}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let target = Arc::new(
+        ematix_flow_core::KafkaBackend::open(&bootstrap, None)
+            .unwrap()
+            .with_delivery_semantics(KafkaDeliverySemantics::ExactlyOnce { transactional_id }),
+    );
+
+    let config = StreamingPipelineConfig::new(
+        input_topic,
+        TargetTable {
+            schema: "".into(),
+            name: output_topic.into(),
+        },
+        "eos-test",
+    );
+    let pipeline = KafkaToKafkaEosPipeline::new(source.clone(), target, config).unwrap();
+
+    let (sig, trigger) = ShutdownSignal::new();
+    let pipeline_handle = tokio::spawn(async move { pipeline.run(sig).await });
+
+    // Give the pipeline time to consume + produce + commit.
+    tokio::time::sleep(std::time::Duration::from_secs(8)).await;
+    trigger.trigger();
+    let metrics = pipeline_handle.await.unwrap().unwrap();
+
+    assert!(metrics.shutdown_triggered);
+    assert_eq!(metrics.total_rows, 5);
+
+    // Verify output topic has exactly 5 messages (no duplicates).
+    let verifier =
+        ematix_flow_core::KafkaBackend::open(&bootstrap, Some("eos-verify-grp")).unwrap();
+    let stream = verifier.read_arrow_stream(output_topic).await.unwrap();
+    let batches: Vec<_> = stream.try_collect().await.unwrap();
+    let n_out: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(n_out, 5, "output topic must have exactly 5 rows");
+
+    // Spot check: ids 1..=5 in the output.
+    let mut ids: Vec<i64> = Vec::new();
+    for batch in &batches {
+        let arr = batch
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        for i in 0..arr.len() {
+            ids.push(arr.value(i));
+        }
+    }
+    ids.sort_unstable();
+    assert_eq!(ids, vec![1, 2, 3, 4, 5]);
+
+    // Verify source-side offsets advanced (the EOS commit did
+    // send_offsets_to_transaction). A new consumer in the same group
+    // should see no messages.
+    let recheck =
+        ematix_flow_core::KafkaBackend::open(&bootstrap, Some("eos-pipeline-grp")).unwrap();
+    let stream = recheck.read_arrow_stream(input_topic).await.unwrap();
+    let batches: Vec<_> = stream.try_collect().await.unwrap();
+    let n_remaining: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(
+        n_remaining, 0,
+        "source consumer's offsets should have advanced via send_offsets_to_transaction"
+    );
+}

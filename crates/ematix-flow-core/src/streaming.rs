@@ -36,6 +36,7 @@ use prometheus::{IntCounter, Registry};
 use tokio::sync::watch;
 
 use crate::backend::{ArrowBatchStream, Backend, BackendError, TargetTable, WriteMode};
+use crate::kafka_backend::KafkaBackend;
 
 /// Prometheus counters for a single streaming pipeline. The
 /// counters live on a private Registry so multiple pipelines in one
@@ -400,6 +401,132 @@ impl StreamingPipeline {
     }
 }
 
+/// Phase 36j.2: Kafka→Kafka exactly-once pipeline. Bundles the
+/// source consumer's offset commit into the target producer's
+/// transaction via `send_offsets_to_transaction`, so a partial
+/// failure mid-batch aborts both the produces *and* the offset
+/// advance — re-delivery on restart, no duplicates.
+///
+/// Differences vs the trait-object `StreamingPipeline`:
+///   - typed `Arc<KafkaBackend>` references on both sides (the
+///     coordination logic isn't on the `Backend` trait surface; it
+///     uses Kafka-specific methods like
+///     `pending_offsets_topic_partition_list` and
+///     `consumer_group_metadata`).
+///   - Target must have `KafkaDeliverySemantics::ExactlyOnce`
+///     configured; constructor errors out otherwise.
+///   - Source offsets are advanced as a side-effect of
+///     `commit_transaction`; the pipeline calls
+///     `source.clear_pending_offsets()` after each successful
+///     commit to drop the stale in-memory pending set.
+///
+/// DLQ + Prometheus metrics from the trait-object pipeline aren't
+/// wired here yet — the EOS coordinator focuses on correctness;
+/// observability follow-ups can layer in the same counter struct.
+pub struct KafkaToKafkaEosPipeline {
+    pub source: Arc<KafkaBackend>,
+    pub target: Arc<KafkaBackend>,
+    pub config: StreamingPipelineConfig,
+    pub metrics: StreamingPipelineMetricsCounters,
+}
+
+impl KafkaToKafkaEosPipeline {
+    /// Construct an EOS pipeline. Validates the target backend has
+    /// transactions configured.
+    pub fn new(
+        source: Arc<KafkaBackend>,
+        target: Arc<KafkaBackend>,
+        config: StreamingPipelineConfig,
+    ) -> Result<Self, BackendError> {
+        if !matches!(
+            target.delivery_semantics(),
+            crate::kafka_backend::KafkaDeliverySemantics::ExactlyOnce { .. }
+        ) {
+            return Err(BackendError::Other(
+                "KafkaToKafkaEosPipeline: target must be configured with \
+                 KafkaDeliverySemantics::ExactlyOnce { transactional_id: ... }"
+                    .into(),
+            ));
+        }
+        let metrics = StreamingPipelineMetricsCounters::new(&config.pipeline_name);
+        Ok(Self {
+            source,
+            target,
+            config,
+            metrics,
+        })
+    }
+
+    /// Run the EOS loop until shutdown. Same shape as
+    /// `StreamingPipeline::run` but every batch is bracketed by a
+    /// single Kafka transaction that atomically produces *and*
+    /// advances the source consumer's offsets.
+    pub async fn run(
+        &self,
+        shutdown: ShutdownSignal,
+    ) -> Result<StreamingPipelineMetrics, BackendError> {
+        let mut summary = StreamingPipelineMetrics::default();
+        loop {
+            if shutdown.is_triggered() {
+                summary.shutdown_triggered = true;
+                break;
+            }
+
+            // Use the trait method via Backend so the consumer
+            // session caching machinery still applies.
+            let stream: ArrowBatchStream = (self.source.as_ref() as &dyn Backend)
+                .read_arrow_stream(&self.config.source_query)
+                .await
+                .inspect_err(|_| {
+                    self.metrics.errors.inc();
+                })?;
+            let batches: Vec<RecordBatch> = stream.try_collect().await.inspect_err(|_| {
+                self.metrics.errors.inc();
+            })?;
+
+            if batches.is_empty() {
+                self.metrics.idle_iterations.inc();
+                tokio::select! {
+                    _ = shutdown.wait() => {
+                        summary.shutdown_triggered = true;
+                        break;
+                    }
+                    _ = tokio::time::sleep(Duration::from_millis(self.config.idle_pause_ms)) => {}
+                }
+                continue;
+            }
+
+            let n_rows: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
+            self.metrics.rows_consumed.inc_by(n_rows);
+
+            let target_stream: ArrowBatchStream =
+                Box::pin(futures_util::stream::iter(batches.into_iter().map(Ok)));
+            // Coordinated produce: begin_txn, produce, send_offsets,
+            // commit. On error → abort_txn (already handled inside
+            // write_arrow_stream_eos) → bubble up.
+            let produced = self
+                .target
+                .write_arrow_stream_eos(&self.config.target, target_stream, &self.source)
+                .await
+                .inspect_err(|_| {
+                    self.metrics.errors.inc();
+                })?;
+            self.metrics.rows_written.inc_by(produced);
+
+            // Source offsets advanced atomically as part of the
+            // commit_transaction; drop the pending set so the next
+            // iteration's send_offsets_to_transaction doesn't
+            // re-send the same offsets.
+            self.source.clear_pending_offsets()?;
+
+            self.metrics.batches.inc();
+            summary.total_rows += produced;
+            summary.iterations += 1;
+        }
+        Ok(summary)
+    }
+}
+
 /// Convenience: install OS signal handlers (SIGTERM / SIGINT on
 /// Unix) that fire the returned `ShutdownTrigger`. On non-Unix
 /// platforms only Ctrl-C is caught.
@@ -522,6 +649,32 @@ mod tests {
                 .any(|l| l.starts_with("ematix_streaming_batches_total") && l.ends_with(" 1")),
             "batches=1 line missing in:\n{body}"
         );
+    }
+
+    // --- Phase 36j.2: KafkaToKafkaEosPipeline ----------------------------
+
+    #[test]
+    fn eos_pipeline_rejects_target_without_exactly_once() {
+        use crate::kafka_backend::KafkaBackend;
+
+        let source = Arc::new(KafkaBackend::open("localhost:9092", Some("eos-src-grp")).unwrap());
+        // Target with default (AtLeastOnce) delivery semantics should
+        // be rejected by KafkaToKafkaEosPipeline::new.
+        let target = Arc::new(KafkaBackend::open("localhost:9092", None).unwrap());
+        let cfg = StreamingPipelineConfig::new(
+            "topic",
+            TargetTable {
+                schema: "".into(),
+                name: "out".into(),
+            },
+            "p",
+        );
+        let err = match KafkaToKafkaEosPipeline::new(source, target, cfg) {
+            Ok(_) => panic!("expected target-not-EOS rejection"),
+            Err(e) => e,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("ExactlyOnce"), "got: {msg}");
     }
 
     #[test]

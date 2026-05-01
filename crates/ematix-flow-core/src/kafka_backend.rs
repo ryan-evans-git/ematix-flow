@@ -49,7 +49,9 @@ use rdkafka::ClientConfig;
 use rdkafka::Message;
 use rdkafka::admin::AdminClient;
 use rdkafka::client::{ClientContext, OAuthToken};
-use rdkafka::consumer::{CommitMode, Consumer, ConsumerContext, StreamConsumer};
+use rdkafka::consumer::{
+    CommitMode, Consumer, ConsumerContext, ConsumerGroupMetadata, StreamConsumer,
+};
 use rdkafka::producer::{FutureProducer, FutureRecord, Producer};
 use rdkafka::topic_partition_list::{Offset, TopicPartitionList};
 use rdkafka::util::Timeout;
@@ -601,6 +603,198 @@ impl KafkaBackend {
             .lock()
             .map(|s| s.pending_offsets.len())
             .unwrap_or(0)
+    }
+
+    /// Snapshot pending offsets as a `TopicPartitionList` suitable
+    /// for handing to a producer's `send_offsets_to_transaction`.
+    /// Returns `None` if no consumer session is active or no
+    /// offsets are pending. Used by `KafkaToKafkaEosPipeline` (Phase
+    /// 36j.2) to bundle consumer-side offset advancement into the
+    /// producer's transaction.
+    pub fn pending_offsets_topic_partition_list(&self) -> Option<TopicPartitionList> {
+        let session = self.consumer_session.lock().ok()?;
+        let topic = session.subscribed_topic.as_deref()?;
+        if session.pending_offsets.is_empty() {
+            return None;
+        }
+        let mut tpl = TopicPartitionList::new();
+        for (partition, offset) in &session.pending_offsets {
+            tpl.add_partition_offset(topic, *partition, Offset::Offset(*offset))
+                .ok()?;
+        }
+        Some(tpl)
+    }
+
+    /// Snapshot the source consumer's group metadata. Required by
+    /// `send_offsets_to_transaction` to attribute the offset commit
+    /// to the right consumer group. Returns `None` if no consumer
+    /// session is active.
+    pub fn consumer_group_metadata(&self) -> Option<ConsumerGroupMetadata> {
+        let session = self.consumer_session.lock().ok()?;
+        session.consumer.as_ref()?.group_metadata()
+    }
+
+    /// Drop pending consumer offsets *without* committing to the
+    /// broker. Used by `KafkaToKafkaEosPipeline` after the producer's
+    /// `commit_transaction` has atomically advanced offsets via
+    /// `send_offsets_to_transaction` — the in-memory pending set is
+    /// now stale.
+    pub fn clear_pending_offsets(&self) -> Result<(), BackendError> {
+        let mut session = self
+            .consumer_session
+            .lock()
+            .map_err(|e| BackendError::Other(format!("kafka consumer lock: {e}")))?;
+        session.pending_offsets.clear();
+        Ok(())
+    }
+
+    /// Coordinated transactional produce: bundles the source
+    /// consumer's pending offsets into the producer transaction so
+    /// the entire read-process-write cycle becomes atomic. Phase
+    /// 36j.2 — full Kafka→Kafka exactly-once.
+    ///
+    /// Sequence per call:
+    ///   1. begin_transaction
+    ///   2. produce all rows from `stream` to `target.name`
+    ///   3. send_offsets_to_transaction(source.pending_offsets,
+    ///      source.consumer_group_metadata) — attaches the source
+    ///      consumer's offset commit to the in-flight transaction
+    ///   4. commit_transaction (or abort_transaction on any earlier
+    ///      failure)
+    ///
+    /// After commit, the source's offsets have been advanced as
+    /// part of the transaction; the caller must
+    /// `source.clear_pending_offsets()` to drop the in-memory
+    /// pending set.
+    ///
+    /// Requires `self.delivery_semantics` to be `ExactlyOnce` —
+    /// errors out otherwise. The source must have a consumer
+    /// session with pending offsets (i.e. `read_arrow_stream` has
+    /// been called at least once on it).
+    pub async fn write_arrow_stream_eos(
+        &self,
+        target: &TargetTable,
+        stream: ArrowBatchStream,
+        source: &KafkaBackend,
+    ) -> Result<u64, BackendError> {
+        if !matches!(
+            self.delivery_semantics,
+            KafkaDeliverySemantics::ExactlyOnce { .. }
+        ) {
+            return Err(BackendError::Other(
+                "Kafka write_arrow_stream_eos: target must be configured with \
+                 KafkaDeliverySemantics::ExactlyOnce { transactional_id: ... }"
+                    .into(),
+            ));
+        }
+        let topic = target.name.trim();
+        if topic.is_empty() {
+            return Err(BackendError::Other(
+                "Kafka write_arrow_stream_eos: target.name (topic) must be non-empty".into(),
+            ));
+        }
+        match self.payload_format {
+            KafkaPayloadFormat::Json | KafkaPayloadFormat::RawBytes => {}
+            KafkaPayloadFormat::Avro => {
+                return Err(BackendError::Other(
+                    "Kafka write_arrow_stream_eos Avro: lands in Phase 36h.4".into(),
+                ));
+            }
+            KafkaPayloadFormat::Protobuf => {
+                return Err(BackendError::Other(
+                    "Kafka write_arrow_stream_eos Protobuf: lands in Phase 36h.6".into(),
+                ));
+            }
+        }
+        let producer = self.acquire_producer().await?;
+        // Snapshot source offsets / metadata BEFORE the txn begins
+        // so we don't capture offsets that the source consumer
+        // advances mid-flight (it shouldn't here, but defensive
+        // against future async-consumer churn).
+        let source_offsets = source.pending_offsets_topic_partition_list();
+        let source_cgm = source.consumer_group_metadata();
+
+        // Buffer the stream so the txn-bracketed produce can run
+        // synchronously through `produce_payloads_to_topic`.
+        let mut s = stream;
+        let mut all_payloads: Vec<Vec<u8>> = Vec::new();
+        while let Some(batch) = futures_util::StreamExt::next(&mut s).await {
+            let batch = batch?;
+            if batch.num_rows() == 0 {
+                continue;
+            }
+            let mut payloads = match self.payload_format {
+                KafkaPayloadFormat::Json => encode_batch_as_jsonl_lines(&batch)?,
+                KafkaPayloadFormat::RawBytes => encode_batch_as_raw_bytes(&batch)?,
+                KafkaPayloadFormat::Avro | KafkaPayloadFormat::Protobuf => {
+                    unreachable!("rejected at entry")
+                }
+            };
+            all_payloads.append(&mut payloads);
+        }
+        if all_payloads.is_empty() {
+            return Ok(0);
+        }
+
+        // Begin transaction.
+        let p = Arc::clone(&producer);
+        tokio::task::spawn_blocking(move || p.begin_transaction())
+            .await
+            .map_err(|e| BackendError::Other(format!("kafka begin_transaction join: {e}")))?
+            .map_err(|e| BackendError::Query(format!("kafka begin_transaction: {e}")))?;
+
+        // Produce-then-coordinate-then-commit. On any failure,
+        // abort_transaction (best effort) and surface the error.
+        let result = async {
+            let total = produce_payloads_to_topic(&producer, topic, &all_payloads).await?;
+            // send_offsets_to_transaction only fires if the source
+            // has both offsets and group metadata. A source without
+            // a consumer session (e.g. a producer-only KafkaBackend
+            // accidentally passed in) gets no offset coordination —
+            // arguably an error, but easier to surface as "produced
+            // OK but didn't advance source offsets" which the
+            // caller can detect via source.pending_offset_count.
+            if let (Some(offsets), Some(cgm)) = (source_offsets, source_cgm) {
+                let p = Arc::clone(&producer);
+                tokio::task::spawn_blocking(move || {
+                    p.send_offsets_to_transaction(
+                        &offsets,
+                        &cgm,
+                        Timeout::After(Duration::from_secs(30)),
+                    )
+                })
+                .await
+                .map_err(|e| {
+                    BackendError::Other(format!("kafka send_offsets_to_transaction join: {e}"))
+                })?
+                .map_err(|e| {
+                    BackendError::Query(format!("kafka send_offsets_to_transaction: {e}"))
+                })?;
+            }
+            Ok::<u64, BackendError>(total)
+        }
+        .await;
+
+        match result {
+            Ok(total) => {
+                let p = Arc::clone(&producer);
+                tokio::task::spawn_blocking(move || {
+                    p.commit_transaction(Timeout::After(Duration::from_secs(30)))
+                })
+                .await
+                .map_err(|e| BackendError::Other(format!("kafka commit_transaction join: {e}")))?
+                .map_err(|e| BackendError::Query(format!("kafka commit_transaction: {e}")))?;
+                Ok(total)
+            }
+            Err(e) => {
+                let p = Arc::clone(&producer);
+                let _ = tokio::task::spawn_blocking(move || {
+                    p.abort_transaction(Timeout::After(Duration::from_secs(30)))
+                })
+                .await;
+                Err(e)
+            }
+        }
     }
 
     /// Get (or lazily-create) the FutureProducer for this backend.
