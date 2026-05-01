@@ -9,11 +9,11 @@
 //!   - **CLI.1** — Scaffolding. `flow consume <toml>` parses a
 //!     config, builds source + target backends, and runs a
 //!     [`StreamingPipeline`] under SIGTERM/SIGINT shutdown.
-//!     Backends in CLI.1: Kafka / RabbitMQ / Pub/Sub / Kinesis as
-//!     sources; Postgres / MySQL / SQLite / DuckDB / Kafka /
-//!     RabbitMQ / Pub/Sub / Kinesis / Delta-local as targets.
-//!     S3-backed Delta + the `ObjectStore` formats are deferred to a
-//!     follow-up sub-phase.
+//!     Backends supported: Kafka / RabbitMQ / Pub/Sub / Kinesis
+//!     as sources; Postgres / MySQL / SQLite / DuckDB / Kafka /
+//!     RabbitMQ / Pub/Sub / Kinesis / Delta (local + S3) /
+//!     ObjectStore (local + S3, parquet / csv / orc / jsonl) as
+//!     targets.
 //!   - **CLI.2** — `/metrics` HTTP endpoint exposing the pipeline's
 //!     Prometheus registry. Opt in with `--metrics-port <PORT>`.
 //!     Server shares the pipeline's shutdown signal so both stop
@@ -47,7 +47,7 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
 
-use ematix_flow_core::backend::{Backend, BackendError, TargetTable, WriteMode};
+use ematix_flow_core::backend::{Backend, BackendError, ObjectFormat, TargetTable, WriteMode};
 use ematix_flow_core::pg::PgPool;
 use ematix_flow_core::streaming::{
     ShutdownSignal, StreamingPipeline, StreamingPipelineConfig, StreamingPipelineMetrics,
@@ -57,8 +57,8 @@ use ematix_flow_core::streaming::{
 pub mod metrics_server;
 pub mod supervisor;
 use ematix_flow_core::{
-    DeltaBackend, DuckDBBackend, KafkaBackend, KinesisBackend, MySQLBackend, PostgresBackend,
-    PubSubBackend, RabbitMQBackend, SQLiteBackend,
+    DeltaBackend, DuckDBBackend, KafkaBackend, KinesisBackend, MySQLBackend, ObjectStoreBackend,
+    PostgresBackend, PubSubBackend, RabbitMQBackend, SQLiteBackend,
 };
 use serde::Deserialize;
 
@@ -161,14 +161,72 @@ pub enum TargetConfig {
         secret_access_key: Option<String>,
         partition_key_prefix: String,
     },
-    /// Local-filesystem-backed Delta table. S3-backed Delta + the
-    /// `ObjectStore` formats land in a follow-up CLI sub-phase
-    /// (their format / region / credentials surface doesn't fit
-    /// cleanly into one tagged enum yet).
+    /// Local-filesystem-backed Delta table.
     DeltaLocal {
         path: String,
         table: TableSpecConfig,
     },
+    /// S3-backed Delta table. Production deployments with
+    /// concurrent writers should configure DynamoDB locking
+    /// separately — the `s3` feature flag in deltalake-aws
+    /// registers the basic store; the framework doesn't expose
+    /// per-table lock provider config yet.
+    DeltaS3 {
+        endpoint: String,
+        bucket: String,
+        /// Prefix under the bucket. Empty string = bucket root.
+        #[serde(default)]
+        prefix: String,
+        region: String,
+        access_key_id: String,
+        secret_access_key: String,
+        table: TableSpecConfig,
+    },
+    /// Local-filesystem object store (parquet / csv / orc / jsonl).
+    /// `path` is the root directory; `prefix` is the per-table
+    /// prefix (mapped to `TargetTable.name` so the framework's
+    /// table-prefix builder produces `<root>/<prefix>/...`).
+    ObjectStoreLocal {
+        path: String,
+        format: ObjectFormatConfig,
+        prefix: String,
+    },
+    /// S3-backed object store (parquet / csv / orc / jsonl).
+    ObjectStoreS3 {
+        endpoint: String,
+        bucket: String,
+        region: String,
+        access_key_id: String,
+        secret_access_key: String,
+        format: ObjectFormatConfig,
+        prefix: String,
+    },
+}
+
+/// CLI-side mirror of [`ObjectFormat`]. Defined separately so we
+/// can derive `Deserialize` without touching core (where the
+/// enum has no serde derives yet).
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ObjectFormatConfig {
+    Parquet,
+    Csv,
+    Orc,
+    /// `jsonl` (newline-delimited JSON), matching the framework's
+    /// existing file-suffix convention.
+    #[serde(alias = "jsonl")]
+    JsonLines,
+}
+
+impl From<ObjectFormatConfig> for ObjectFormat {
+    fn from(f: ObjectFormatConfig) -> Self {
+        match f {
+            ObjectFormatConfig::Parquet => ObjectFormat::Parquet,
+            ObjectFormatConfig::Csv => ObjectFormat::Csv,
+            ObjectFormatConfig::Orc => ObjectFormat::Orc,
+            ObjectFormatConfig::JsonLines => ObjectFormat::JsonLines,
+        }
+    }
 }
 
 /// `(schema, name)` pair used by DB targets. Maps onto
@@ -330,6 +388,64 @@ impl PipelineCliConfig {
             TargetConfig::DeltaLocal { path, table } => {
                 let b = DeltaBackend::open_local(path)?;
                 Ok((Arc::new(b), table.into()))
+            }
+            TargetConfig::DeltaS3 {
+                endpoint,
+                bucket,
+                prefix,
+                region,
+                access_key_id,
+                secret_access_key,
+                table,
+            } => {
+                let b = DeltaBackend::open_s3(
+                    endpoint,
+                    bucket,
+                    prefix,
+                    region,
+                    access_key_id,
+                    secret_access_key,
+                )?;
+                Ok((Arc::new(b), table.into()))
+            }
+            TargetConfig::ObjectStoreLocal {
+                path,
+                format,
+                prefix,
+            } => {
+                let b = ObjectStoreBackend::open_local(path, (*format).into())?;
+                Ok((
+                    Arc::new(b),
+                    TargetTable {
+                        schema: String::new(),
+                        name: prefix.clone(),
+                    },
+                ))
+            }
+            TargetConfig::ObjectStoreS3 {
+                endpoint,
+                bucket,
+                region,
+                access_key_id,
+                secret_access_key,
+                format,
+                prefix,
+            } => {
+                let b = ObjectStoreBackend::open_s3(
+                    endpoint,
+                    bucket,
+                    region,
+                    access_key_id,
+                    secret_access_key,
+                    (*format).into(),
+                )?;
+                Ok((
+                    Arc::new(b),
+                    TargetTable {
+                        schema: String::new(),
+                        name: prefix.clone(),
+                    },
+                ))
             }
         }
     }
@@ -729,6 +845,167 @@ mod tests {
         // The Backend trait doesn't expose a direct dialect comparison here
         // without an active connection, but unwrapping the Arc returns the
         // KafkaBackend handle.
+    }
+
+    #[test]
+    fn parses_delta_s3_target() {
+        let toml = r#"
+            pipeline_name = "p"
+            source_query = "topic"
+
+            [source]
+            kind = "kafka"
+            bootstrap_servers = "localhost:9092"
+
+            [target]
+            kind = "delta_s3"
+            endpoint = "http://localhost:9000"
+            bucket = "events"
+            prefix = "raw"
+            region = "us-east-1"
+            access_key_id = "minioadmin"
+            secret_access_key = "minioadmin"
+
+            [target.table]
+            schema = "default"
+            name = "events"
+        "#;
+        let cfg = PipelineCliConfig::from_toml_str(toml).unwrap();
+        match &cfg.target {
+            TargetConfig::DeltaS3 {
+                endpoint,
+                bucket,
+                prefix,
+                region,
+                access_key_id,
+                secret_access_key,
+                table,
+            } => {
+                assert_eq!(endpoint, "http://localhost:9000");
+                assert_eq!(bucket, "events");
+                assert_eq!(prefix, "raw");
+                assert_eq!(region, "us-east-1");
+                assert_eq!(access_key_id, "minioadmin");
+                assert_eq!(secret_access_key, "minioadmin");
+                assert_eq!(table.name, "events");
+            }
+            other => panic!("expected DeltaS3, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_object_store_local_target_with_each_format() {
+        for (format_str, want) in [
+            ("parquet", ObjectFormatConfig::Parquet),
+            ("csv", ObjectFormatConfig::Csv),
+            ("orc", ObjectFormatConfig::Orc),
+            ("json_lines", ObjectFormatConfig::JsonLines),
+            ("jsonl", ObjectFormatConfig::JsonLines), // alias
+        ] {
+            let toml = format!(
+                r#"
+                    pipeline_name = "p"
+                    source_query = "topic"
+
+                    [source]
+                    kind = "kafka"
+                    bootstrap_servers = "localhost:9092"
+
+                    [target]
+                    kind = "object_store_local"
+                    path = "/var/data"
+                    format = "{format_str}"
+                    prefix = "events"
+                "#
+            );
+            let cfg = PipelineCliConfig::from_toml_str(&toml).unwrap();
+            match &cfg.target {
+                TargetConfig::ObjectStoreLocal {
+                    path,
+                    format,
+                    prefix,
+                } => {
+                    assert_eq!(path, "/var/data");
+                    assert_eq!(prefix, "events");
+                    let parsed: ObjectFormat = (*format).into();
+                    let expected: ObjectFormat = want.into();
+                    assert_eq!(parsed, expected, "format mismatch for {format_str}");
+                }
+                other => panic!("expected ObjectStoreLocal, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn parses_object_store_s3_target() {
+        let toml = r#"
+            pipeline_name = "p"
+            source_query = "topic"
+
+            [source]
+            kind = "kafka"
+            bootstrap_servers = "localhost:9092"
+
+            [target]
+            kind = "object_store_s3"
+            endpoint = "http://localhost:9000"
+            bucket = "events"
+            region = "us-east-1"
+            access_key_id = "minioadmin"
+            secret_access_key = "minioadmin"
+            format = "parquet"
+            prefix = "raw"
+        "#;
+        let cfg = PipelineCliConfig::from_toml_str(toml).unwrap();
+        match &cfg.target {
+            TargetConfig::ObjectStoreS3 {
+                endpoint,
+                bucket,
+                region,
+                access_key_id,
+                secret_access_key,
+                format,
+                prefix,
+            } => {
+                assert_eq!(endpoint, "http://localhost:9000");
+                assert_eq!(bucket, "events");
+                assert_eq!(region, "us-east-1");
+                assert_eq!(access_key_id, "minioadmin");
+                assert_eq!(secret_access_key, "minioadmin");
+                assert_eq!(prefix, "raw");
+                let parsed: ObjectFormat = (*format).into();
+                assert_eq!(parsed, ObjectFormat::Parquet);
+            }
+            other => panic!("expected ObjectStoreS3, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn delta_s3_prefix_defaults_to_empty_when_omitted() {
+        let toml = r#"
+            pipeline_name = "p"
+            source_query = "topic"
+
+            [source]
+            kind = "kafka"
+            bootstrap_servers = "localhost:9092"
+
+            [target]
+            kind = "delta_s3"
+            endpoint = "http://localhost:9000"
+            bucket = "events"
+            region = "us-east-1"
+            access_key_id = "minioadmin"
+            secret_access_key = "minioadmin"
+
+            [target.table]
+            name = "events"
+        "#;
+        let cfg = PipelineCliConfig::from_toml_str(toml).unwrap();
+        match &cfg.target {
+            TargetConfig::DeltaS3 { prefix, .. } => assert_eq!(prefix, ""),
+            other => panic!("expected DeltaS3, got {other:?}"),
+        }
     }
 
     #[test]
