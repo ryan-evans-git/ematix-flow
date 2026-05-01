@@ -348,6 +348,228 @@ async fn arrow_round_trip_via_backend_trait() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn duckdb_run_append_same_backend() {
+    // Phase 31b: DuckDB run_append against an in-memory DB.
+    let backend: Arc<dyn Backend> = Arc::new(DuckDBBackend::open(":memory:").unwrap());
+    backend.execute("CREATE SCHEMA src").await.unwrap();
+    backend.execute("CREATE SCHEMA wh").await.unwrap();
+    backend
+        .execute("CREATE TABLE src.events (event_id BIGINT, name VARCHAR)")
+        .await
+        .unwrap();
+    backend
+        .execute("INSERT INTO src.events VALUES (1, 'a'), (2, 'b'), (3, 'c')")
+        .await
+        .unwrap();
+
+    let target = augment_with_metadata(&TableSpec {
+        schema: "wh".into(),
+        name: "event_log".into(),
+        columns: vec![
+            ColumnSpec {
+                name: "event_id".into(),
+                ty: ColumnType::BigInt,
+                nullable: false,
+                primary_key: true,
+            },
+            ColumnSpec {
+                name: "name".into(),
+                ty: ColumnType::Text,
+                nullable: true,
+                primary_key: false,
+            },
+        ],
+        unique_constraints: Vec::new(),
+        fingerprint: String::new(),
+    });
+
+    backend
+        .execute(
+            "CREATE TABLE wh.event_log (\
+              event_id BIGINT, name VARCHAR, _loaded_at TIMESTAMPTZ, _batch_id UUID\
+            )",
+        )
+        .await
+        .unwrap();
+
+    let result = backend
+        .run_append(
+            &target,
+            "SELECT event_id, name FROM src.events",
+            "duckdb_append_test",
+            None,
+            None,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.rows_inserted, 3);
+    assert_eq!(result.path, "same_db");
+    assert_eq!(result.status, "success");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn duckdb_run_truncate_same_backend() {
+    let backend: Arc<dyn Backend> = Arc::new(DuckDBBackend::open(":memory:").unwrap());
+    backend.execute("CREATE SCHEMA src").await.unwrap();
+    backend.execute("CREATE SCHEMA wh").await.unwrap();
+    backend
+        .execute("CREATE TABLE src.events (event_id BIGINT, name VARCHAR)")
+        .await
+        .unwrap();
+    backend
+        .execute("INSERT INTO src.events VALUES (1, 'a')")
+        .await
+        .unwrap();
+    backend
+        .execute(
+            "CREATE TABLE wh.event_log (\
+              event_id BIGINT, name VARCHAR, _loaded_at TIMESTAMPTZ, _batch_id UUID\
+            )",
+        )
+        .await
+        .unwrap();
+    backend
+        .execute(
+            "INSERT INTO wh.event_log VALUES \
+             (99, 'old', now(), gen_random_uuid())",
+        )
+        .await
+        .unwrap();
+
+    let target = augment_with_metadata(&TableSpec {
+        schema: "wh".into(),
+        name: "event_log".into(),
+        columns: vec![
+            ColumnSpec {
+                name: "event_id".into(),
+                ty: ColumnType::BigInt,
+                nullable: false,
+                primary_key: true,
+            },
+            ColumnSpec {
+                name: "name".into(),
+                ty: ColumnType::Text,
+                nullable: true,
+                primary_key: false,
+            },
+        ],
+        unique_constraints: Vec::new(),
+        fingerprint: String::new(),
+    });
+
+    let result = backend
+        .run_truncate(
+            &target,
+            "SELECT event_id, name FROM src.events",
+            "duckdb_truncate_test",
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.rows_inserted, 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn duckdb_run_merge_same_backend() {
+    let backend: Arc<dyn Backend> = Arc::new(DuckDBBackend::open(":memory:").unwrap());
+    backend.execute("CREATE SCHEMA src").await.unwrap();
+    backend.execute("CREATE SCHEMA wh").await.unwrap();
+    backend
+        .execute("CREATE TABLE src.events (event_id BIGINT, name VARCHAR)")
+        .await
+        .unwrap();
+    backend
+        .execute("INSERT INTO src.events VALUES (1, 'a'), (2, 'b')")
+        .await
+        .unwrap();
+    backend
+        .execute(
+            "CREATE TABLE wh.event_log (\
+              event_id BIGINT PRIMARY KEY, name VARCHAR, \
+              _loaded_at TIMESTAMPTZ, _batch_id UUID\
+            )",
+        )
+        .await
+        .unwrap();
+
+    let target = augment_with_metadata(&TableSpec {
+        schema: "wh".into(),
+        name: "event_log".into(),
+        columns: vec![
+            ColumnSpec {
+                name: "event_id".into(),
+                ty: ColumnType::BigInt,
+                nullable: false,
+                primary_key: true,
+            },
+            ColumnSpec {
+                name: "name".into(),
+                ty: ColumnType::Text,
+                nullable: true,
+                primary_key: false,
+            },
+        ],
+        unique_constraints: Vec::new(),
+        fingerprint: String::new(),
+    });
+
+    // First merge: insert.
+    let r1 = backend
+        .run_merge(
+            &target,
+            "SELECT event_id, name FROM src.events",
+            &["event_id".to_string()],
+            &["name".to_string()],
+            "duckdb_merge_test",
+            "merge",
+            None,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+    assert_eq!(r1.rows_inserted, 2);
+
+    // Update one row in source, re-merge: upsert.
+    backend
+        .execute("UPDATE src.events SET name = 'a-new' WHERE event_id = 1")
+        .await
+        .unwrap();
+    backend
+        .run_merge(
+            &target,
+            "SELECT event_id, name FROM src.events",
+            &["event_id".to_string()],
+            &["name".to_string()],
+            "duckdb_merge_test",
+            "merge",
+            None,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+    // Verify the upsert.
+    let stream = backend
+        .read_arrow_stream("SELECT name FROM wh.event_log WHERE event_id = 1")
+        .await
+        .unwrap();
+    use arrow_array::StringArray;
+    use futures_util::TryStreamExt;
+    let batches: Vec<_> = stream.try_collect().await.unwrap();
+    assert_eq!(batches[0].num_rows(), 1);
+    let name_col = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(name_col.value(0), "a-new");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs Docker; run with `cargo test -- --ignored`"]
 async fn cross_backend_pg_to_duckdb_arrow() {
     // Phase 31a's headline test: drive an Arrow stream from a real
