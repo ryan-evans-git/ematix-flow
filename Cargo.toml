@@ -33,6 +33,11 @@ arrow-schema = "56"
 # one-time); subsequent builds are cached. This avoids depending on a
 # system DuckDB install for CI.
 duckdb = { version = "1.4", features = ["bundled", "appender-arrow"] }
+# `bundled` compiles SQLite from source so we don't depend on a system
+# install. `chrono` enables ToSql for chrono types (used for ISO-8601
+# timestamps); `uuid` enables ToSql for uuid::Uuid. Arrow conversion is
+# done manually — rusqlite has no Arrow feature.
+rusqlite = { version = "0.31", features = ["bundled", "chrono", "uuid", "column_decltype"] }
 testcontainers = "0.27"
 testcontainers-modules = { version = "0.15", features = ["postgres"] }
 
