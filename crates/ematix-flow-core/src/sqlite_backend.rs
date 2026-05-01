@@ -49,8 +49,10 @@ use crate::backend::{
 use crate::meta::{WatermarkConfig, build_hard_delete_sql, wrap_with_watermark_filter};
 use crate::pg::ConnectionInfo;
 use crate::strategy::append::{BATCH_ID_COL, LOADED_AT_COL, plan_same_db_append};
+use crate::strategy::scd2::{IS_CURRENT_COL, ROW_HASH_COL, VALID_FROM_COL, VALID_TO_COL};
 use crate::strategy::truncate::plan_truncate_replace;
 use crate::types::TableSpec;
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 const META_RUN_HISTORY: &str = "ematix_flow_run_history";
@@ -105,6 +107,222 @@ fn sqlite_substitute(sql: &str, batch_id: &Uuid) -> String {
 
 fn is_metadata_col(name: &str) -> bool {
     name == LOADED_AT_COL || name == BATCH_ID_COL
+}
+
+const SQLITE_NOW: &str = "strftime('%Y-%m-%dT%H:%M:%fZ', 'now')";
+
+/// SQLite equivalent of `pg::hash::postgres_digest_expression` and
+/// `duckdb_digest_expression`. SQLite has no native sha256, so we
+/// invoke the `ematix_sha256` UDF registered at backend open time.
+/// Returns BLOB so row_hash storage is consistent across backends.
+fn sqlite_digest_expression(columns: &[String], prefix: &str) -> String {
+    let parts: Vec<String> = columns
+        .iter()
+        .map(|c| {
+            format!(
+                "coalesce(CAST({prefix}{c} AS TEXT), char(0) || 'NULL' || char(0))",
+                prefix = prefix,
+                c = c,
+            )
+        })
+        .collect();
+    format!("ematix_sha256({})", parts.join(" || char(1) || "))
+}
+
+/// SQLite-specific SCD2 statement builder. Mirrors the structure of
+/// `duckdb_scd2_statements` but emits SQL SQLite accepts:
+///   - schema is always `main` (validated by caller via require_main_schema).
+///   - `is_current` is INTEGER 0/1 (SQLite has no native BOOLEAN).
+///   - `now()` → `strftime('%Y-%m-%dT%H:%M:%fZ', 'now')`.
+///   - `digest(…, 'sha256')` → `ematix_sha256(…)`.
+///   - `DISTINCT ON (keys) … ORDER BY ts DESC` → ROW_NUMBER subquery,
+///     since SQLite doesn't have DISTINCT ON.
+///   - Temp table dropped explicitly at the end (no ON COMMIT DROP).
+///   - $1::uuid placeholder substituted to a literal up-front.
+fn sqlite_scd2_statements(
+    target: &TableSpec,
+    source_query: &str,
+    keys: &[String],
+    compare_columns: &[String],
+    run_token: &str,
+    event_ts_column: Option<&str>,
+    batch_id: &Uuid,
+) -> Vec<String> {
+    let user_columns: Vec<String> = target
+        .columns
+        .iter()
+        .filter(|c| {
+            let n = c.name.as_str();
+            n != VALID_FROM_COL
+                && n != VALID_TO_COL
+                && n != IS_CURRENT_COL
+                && n != ROW_HASH_COL
+                && n != LOADED_AT_COL
+                && n != BATCH_ID_COL
+        })
+        .map(|c| c.name.clone())
+        .collect();
+    let has_metadata = target
+        .columns
+        .iter()
+        .any(|c| c.name == LOADED_AT_COL || c.name == BATCH_ID_COL);
+
+    let stage = format!("_scd2_changed_{run_token}");
+    let digest_expr = sqlite_digest_expression(compare_columns, "");
+    let key_tuple: String = keys.join(", ");
+    let t_tuple: String = keys
+        .iter()
+        .map(|k| format!("t.{k}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let src_tuple: String = keys
+        .iter()
+        .map(|k| format!("src.{k}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let join_clause = format!("({t_tuple}) = ({src_tuple})");
+    let table_ref = format!("main.{}", target.name);
+
+    let src_select = match event_ts_column {
+        Some(ets) => format!(
+            "SELECT * FROM (\
+               SELECT {user_cols}, {ets} AS _event_ts, \
+                      {digest_expr} AS _row_hash, \
+                      ROW_NUMBER() OVER (PARTITION BY {keys} ORDER BY {ets} DESC) AS _rn \
+               FROM ({source}) q \
+             ) WHERE _rn = 1",
+            user_cols = user_columns.join(", "),
+            ets = ets,
+            digest_expr = digest_expr,
+            keys = key_tuple,
+            source = source_query,
+        ),
+        None => format!(
+            "SELECT {user_cols}, {digest_expr} AS _row_hash FROM ({source}) q",
+            user_cols = user_columns.join(", "),
+            digest_expr = digest_expr,
+            source = source_query,
+        ),
+    };
+
+    let create_temp = format!(
+        "CREATE TEMP TABLE {stage} AS \
+         WITH src AS ( {src_select} ) \
+         SELECT src.* FROM src \
+         LEFT JOIN {table_ref} t \
+             ON {join_clause} AND t.{is_current_col} = 1 \
+         WHERE t.{row_hash_col} IS NOT src._row_hash",
+        stage = stage,
+        src_select = src_select,
+        table_ref = table_ref,
+        join_clause = join_clause,
+        is_current_col = IS_CURRENT_COL,
+        row_hash_col = ROW_HASH_COL,
+    );
+
+    let close_out = match event_ts_column {
+        Some(_) => {
+            // Correlated UPDATE picks each row's valid_to from the matching
+            // changed-stage row's event_ts. SQLite's UPDATE … FROM landed
+            // in 3.33; the bundled SQLite is well past that.
+            let join: String = keys
+                .iter()
+                .map(|k| format!("t.{k} = c.{k}"))
+                .collect::<Vec<_>>()
+                .join(" AND ");
+            format!(
+                "UPDATE {table_ref} AS t \
+                 SET {valid_to} = c._event_ts, {is_current} = 0 \
+                 FROM {stage} c \
+                 WHERE t.{is_current} = 1 AND {join}",
+                table_ref = table_ref,
+                valid_to = VALID_TO_COL,
+                is_current = IS_CURRENT_COL,
+                stage = stage,
+                join = join,
+            )
+        }
+        None => format!(
+            "UPDATE {table_ref} \
+             SET {valid_to} = {now}, {is_current} = 0 \
+             WHERE {is_current} = 1 AND ({keys}) IN (SELECT {keys} FROM {stage})",
+            table_ref = table_ref,
+            valid_to = VALID_TO_COL,
+            is_current = IS_CURRENT_COL,
+            keys = key_tuple,
+            stage = stage,
+            now = SQLITE_NOW,
+        ),
+    };
+
+    let mut insert_cols: Vec<String> = user_columns.clone();
+    insert_cols.push(VALID_FROM_COL.into());
+    insert_cols.push(VALID_TO_COL.into());
+    insert_cols.push(IS_CURRENT_COL.into());
+    insert_cols.push(ROW_HASH_COL.into());
+    let mut select_exprs: Vec<String> = user_columns.clone();
+    let valid_from_expr: String = match event_ts_column {
+        Some(_) => "_event_ts".into(),
+        None => SQLITE_NOW.into(),
+    };
+    select_exprs.push(valid_from_expr);
+    select_exprs.push("NULL".into());
+    select_exprs.push("1".into());
+    select_exprs.push("_row_hash".into());
+    if has_metadata {
+        insert_cols.push(LOADED_AT_COL.into());
+        insert_cols.push(BATCH_ID_COL.into());
+        select_exprs.push(SQLITE_NOW.into());
+        select_exprs.push(format!("'{batch_id}'"));
+    }
+    let insert_new = format!(
+        "INSERT INTO {table_ref} ({insert_cols}) \
+         SELECT {select_exprs} FROM {stage}",
+        table_ref = table_ref,
+        insert_cols = insert_cols.join(", "),
+        select_exprs = select_exprs.join(", "),
+        stage = stage,
+    );
+
+    let drop_temp = format!("DROP TABLE {stage}");
+
+    vec![create_temp, close_out, insert_new, drop_temp]
+}
+
+/// SQLite-specific TTL expiry. PG/DuckDB compute timestamp arithmetic
+/// directly; SQLite stores TIMESTAMPTZ as TEXT (ISO-8601), so we
+/// compare epoch seconds via strftime('%s', …).
+fn sqlite_scd2_ttl_expire_sql(target_table: &str, ttl_seconds: i64) -> String {
+    format!(
+        "UPDATE main.{table} \
+         SET valid_to = {now}, is_current = 0 \
+         WHERE is_current = 1 \
+           AND CAST(strftime('%s', valid_from) AS INTEGER) < \
+               CAST(strftime('%s', 'now') AS INTEGER) - {ttl_seconds}",
+        table = target_table,
+        now = SQLITE_NOW,
+        ttl_seconds = ttl_seconds,
+    )
+}
+
+/// SQLite-specific soft-delete (close-missing). Mirrors
+/// `meta::build_scd2_close_missing_sql` but with SQLite literals.
+fn sqlite_scd2_close_missing_sql(
+    target_table: &str,
+    keys: &[String],
+    source_keys_query: &str,
+) -> String {
+    let key_tuple = keys.join(", ");
+    format!(
+        "UPDATE main.{table} \
+         SET valid_to = {now}, is_current = 0 \
+         WHERE is_current = 1 \
+           AND ({key_tuple}) NOT IN (SELECT {key_tuple} FROM ({source}) _del)",
+        table = target_table,
+        now = SQLITE_NOW,
+        key_tuple = key_tuple,
+        source = source_keys_query,
+    )
 }
 
 /// SQLite-native merge SQL builder. SQLite supports `INSERT … ON
@@ -188,6 +406,25 @@ impl SQLiteBackend {
         } else {
             SqliteConn::open(&location).map_err(|e| BackendError::Connection(e.to_string()))?
         };
+        // Register the SCD2 hash UDF on every connection. SQLite has no
+        // built-in sha256() (PG has pgcrypto.digest, DuckDB has
+        // sha256()/unhex()) so we plug Rust's sha2 in as a scalar
+        // function. Returns BLOB so it round-trips with the row_hash
+        // column type.
+        conn.create_scalar_function(
+            "ematix_sha256",
+            1,
+            rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC
+                | rusqlite::functions::FunctionFlags::SQLITE_UTF8,
+            |ctx| {
+                let s = ctx.get::<String>(0)?;
+                let mut h = Sha256::new();
+                h.update(s.as_bytes());
+                let bytes: [u8; 32] = h.finalize().into();
+                Ok(bytes.to_vec())
+            },
+        )
+        .map_err(|e| BackendError::Connection(e.to_string()))?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
             location,
@@ -1024,20 +1261,112 @@ impl Backend for SQLiteBackend {
 
     async fn run_scd2(
         &self,
-        _spec: &TableSpec,
-        _source_query: &str,
-        _keys: &[String],
-        _compare_columns: &[String],
-        _pipeline_name: &str,
-        _source_backend: Option<&dyn Backend>,
-        _delete_handling: Option<DeleteHandling>,
-        _event_timestamp_column: Option<&str>,
-        _ttl_seconds: Option<i64>,
-        _dry_run: bool,
+        spec: &TableSpec,
+        source_query: &str,
+        keys: &[String],
+        compare_columns: &[String],
+        pipeline_name: &str,
+        source_backend: Option<&dyn Backend>,
+        delete_handling: Option<DeleteHandling>,
+        event_timestamp_column: Option<&str>,
+        ttl_seconds: Option<i64>,
+        dry_run: bool,
     ) -> Result<StrategyRunResult, BackendError> {
-        Err(BackendError::Other(
-            "SQLite run_scd2: not implemented in Phase 32a (lands in 32d)".into(),
-        ))
+        if source_backend.is_some() {
+            return Err(BackendError::Other(
+                "SQLite cross-backend run_scd2 goes through the Arrow bridge".into(),
+            ));
+        }
+        if let Some(dh) = delete_handling
+            && !matches!(dh, DeleteHandling::Soft)
+        {
+            return Err(BackendError::Other(format!(
+                "SQLite run_scd2: only DeleteHandling::Soft is supported (got {dh:?}); \
+                 Hard is for merge"
+            )));
+        }
+        require_main_schema(&spec.schema)?;
+        let batch_id = Uuid::new_v4();
+        let run_id = Uuid::new_v4();
+        let run_token = run_id.simple().to_string();
+        let mut stmts = sqlite_scd2_statements(
+            spec,
+            source_query,
+            keys,
+            compare_columns,
+            &run_token,
+            event_timestamp_column,
+            &batch_id,
+        );
+        // Append soft-delete + TTL between INSERT and the final DROP, so
+        // newly-inserted current rows aren't accidentally tombstoned by
+        // their own absence in the join.
+        let drop_temp = stmts.pop().expect("plan ends with DROP TABLE");
+        if matches!(delete_handling, Some(DeleteHandling::Soft)) {
+            stmts.push(sqlite_scd2_close_missing_sql(
+                &spec.name,
+                keys,
+                source_query,
+            ));
+        }
+        if let Some(ttl) = ttl_seconds {
+            stmts.push(sqlite_scd2_ttl_expire_sql(&spec.name, ttl));
+        }
+        stmts.push(drop_temp);
+
+        self.ensure_meta_schema().await?;
+        self.record_run_start(
+            run_id,
+            pipeline_name,
+            &spec.schema,
+            &spec.name,
+            "scd2",
+            "same_db",
+        )
+        .await?;
+
+        let inserted_result: Result<u64, BackendError> = self
+            .with_conn_blocking(move |c| {
+                c.execute_batch("BEGIN")
+                    .map_err(|e| BackendError::Query(e.to_string()))?;
+                let mut inserted: u64 = 0;
+                for (idx, sql) in stmts.iter().enumerate() {
+                    let n = c.execute(sql, []).map_err(|e| {
+                        let _ = c.execute_batch("ROLLBACK");
+                        BackendError::Query(format!("scd2 stmt {idx} failed: {e}; sql={sql}"))
+                    })?;
+                    if idx == 2 {
+                        inserted = n as u64;
+                    }
+                }
+                if dry_run {
+                    c.execute_batch("ROLLBACK")
+                        .map_err(|e| BackendError::Query(e.to_string()))?;
+                } else {
+                    c.execute_batch("COMMIT")
+                        .map_err(|e| BackendError::Query(e.to_string()))?;
+                }
+                Ok::<u64, BackendError>(inserted)
+            })
+            .await;
+
+        match &inserted_result {
+            Ok(n) => self.record_run_success(run_id, *n as i64).await?,
+            Err(e) => {
+                let _ = self.record_run_failure(run_id, &e.to_string()).await;
+            }
+        }
+        let inserted = inserted_result?;
+
+        Ok(StrategyRunResult {
+            run_id: run_id.to_string(),
+            rows_inserted: inserted as i64,
+            rows_updated: None,
+            rows_unchanged: None,
+            rows_closed: None,
+            status: if dry_run { "dry_run" } else { "success" }.into(),
+            path: "same_db".into(),
+        })
     }
 }
 
@@ -1688,5 +2017,365 @@ mod tests {
             .value(0);
         assert_eq!(total, 2);
         assert_eq!(row3, 0, "row 3 hard-deleted");
+    }
+
+    // --- Phase 32d: run_scd2 ----------------------------------------------
+
+    use crate::strategy::scd2::augment_with_scd2;
+
+    fn sqlite_scd2_dim_spec() -> TableSpec {
+        augment_with_scd2(&TableSpec {
+            schema: "main".into(),
+            name: "customer_dim".into(),
+            columns: vec![
+                ColumnSpec {
+                    name: "customer_id".into(),
+                    ty: ColumnType::BigInt,
+                    nullable: false,
+                    primary_key: true,
+                },
+                ColumnSpec {
+                    name: "email".into(),
+                    ty: ColumnType::Text,
+                    nullable: false,
+                    primary_key: false,
+                },
+                ColumnSpec {
+                    name: "name".into(),
+                    ty: ColumnType::Text,
+                    nullable: true,
+                    primary_key: false,
+                },
+            ],
+            unique_constraints: Vec::new(),
+            fingerprint: String::new(),
+        })
+    }
+
+    async fn sqlite_scd2_setup() -> StdArc<dyn Backend> {
+        let b: StdArc<dyn Backend> = StdArc::new(SQLiteBackend::open(":memory:").unwrap());
+        b.execute("CREATE TABLE src_customers (customer_id INTEGER, email TEXT, name TEXT)")
+            .await
+            .unwrap();
+        b.execute(
+            "CREATE TABLE customer_dim (\
+              customer_id INTEGER, \
+              email TEXT, \
+              name TEXT, \
+              valid_from TEXT NOT NULL, \
+              valid_to TEXT, \
+              is_current INTEGER NOT NULL, \
+              row_hash BLOB NOT NULL, \
+              _loaded_at TEXT NOT NULL, \
+              _batch_id TEXT NOT NULL, \
+              PRIMARY KEY (customer_id, valid_from)\
+            )",
+        )
+        .await
+        .unwrap();
+        b
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sqlite_run_scd2_first_load_inserts_all_current() {
+        let b = sqlite_scd2_setup().await;
+        b.execute(
+            "INSERT INTO src_customers VALUES \
+             (1, 'a@x.com', 'alice'), (2, 'b@x.com', 'bob'), (3, 'c@x.com', NULL)",
+        )
+        .await
+        .unwrap();
+        let target = sqlite_scd2_dim_spec();
+        b.run_scd2(
+            &target,
+            "SELECT customer_id, email, name FROM src_customers",
+            &["customer_id".into()],
+            &["email".into(), "name".into()],
+            "sqlite_scd2_first",
+            None,
+            None,
+            None,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+
+        use futures_util::TryStreamExt;
+        let s = b
+            .read_arrow_stream(
+                "SELECT count(*), \
+                        sum(CASE WHEN is_current=1 THEN 1 ELSE 0 END), \
+                        sum(CASE WHEN valid_to IS NULL THEN 1 ELSE 0 END) \
+                 FROM customer_dim",
+            )
+            .await
+            .unwrap();
+        let batches: Vec<_> = s.try_collect().await.unwrap();
+        let total = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0);
+        let currents = batches[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0);
+        let null_valid_to = batches[0]
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0);
+        assert_eq!(total, 3);
+        assert_eq!(currents, 3);
+        assert_eq!(null_valid_to, 3);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sqlite_run_scd2_second_load_closes_changed_row() {
+        let b = sqlite_scd2_setup().await;
+        b.execute(
+            "INSERT INTO src_customers VALUES (1, 'a@x.com', 'alice'), (2, 'b@x.com', 'bob')",
+        )
+        .await
+        .unwrap();
+        let target = sqlite_scd2_dim_spec();
+        b.run_scd2(
+            &target,
+            "SELECT customer_id, email, name FROM src_customers",
+            &["customer_id".into()],
+            &["email".into(), "name".into()],
+            "sqlite_scd2_a",
+            None,
+            None,
+            None,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+
+        b.execute("UPDATE src_customers SET email = 'b2@x.com' WHERE customer_id = 2")
+            .await
+            .unwrap();
+        b.run_scd2(
+            &target,
+            "SELECT customer_id, email, name FROM src_customers",
+            &["customer_id".into()],
+            &["email".into(), "name".into()],
+            "sqlite_scd2_b",
+            None,
+            None,
+            None,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+
+        use futures_util::TryStreamExt;
+        let s = b
+            .read_arrow_stream(
+                "SELECT count(*), \
+                        sum(CASE WHEN is_current=1 THEN 1 ELSE 0 END), \
+                        sum(CASE WHEN customer_id=2 AND is_current=1 THEN 1 ELSE 0 END), \
+                        sum(CASE WHEN customer_id=2 AND is_current=0 THEN 1 ELSE 0 END) \
+                 FROM customer_dim",
+            )
+            .await
+            .unwrap();
+        let batches: Vec<_> = s.try_collect().await.unwrap();
+        let col = |i: usize| {
+            batches[0]
+                .column(i)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0)
+        };
+        assert_eq!(col(0), 3);
+        assert_eq!(col(1), 2);
+        assert_eq!(col(2), 1, "exactly one current bob");
+        assert_eq!(col(3), 1, "exactly one closed bob");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sqlite_run_scd2_idempotent_when_no_changes() {
+        let b = sqlite_scd2_setup().await;
+        b.execute("INSERT INTO src_customers VALUES (1, 'a@x.com', 'alice')")
+            .await
+            .unwrap();
+        let target = sqlite_scd2_dim_spec();
+        for tag in ["sqlite_scd2_idem_1", "sqlite_scd2_idem_2"] {
+            b.run_scd2(
+                &target,
+                "SELECT customer_id, email, name FROM src_customers",
+                &["customer_id".into()],
+                &["email".into(), "name".into()],
+                tag,
+                None,
+                None,
+                None,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        }
+        use futures_util::TryStreamExt;
+        let s = b
+            .read_arrow_stream("SELECT count(*) FROM customer_dim")
+            .await
+            .unwrap();
+        let batches: Vec<_> = s.try_collect().await.unwrap();
+        let total = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0);
+        assert_eq!(total, 1, "no second version when nothing changed");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sqlite_run_scd2_soft_delete_closes_missing_keys() {
+        let b = sqlite_scd2_setup().await;
+        b.execute(
+            "INSERT INTO src_customers VALUES (1, 'a@x.com', 'alice'), (2, 'b@x.com', 'bob')",
+        )
+        .await
+        .unwrap();
+        let target = sqlite_scd2_dim_spec();
+        b.run_scd2(
+            &target,
+            "SELECT customer_id, email, name FROM src_customers",
+            &["customer_id".into()],
+            &["email".into(), "name".into()],
+            "sqlite_scd2_softdel_a",
+            None,
+            None,
+            None,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+
+        b.execute("DELETE FROM src_customers WHERE customer_id = 2")
+            .await
+            .unwrap();
+        b.run_scd2(
+            &target,
+            "SELECT customer_id, email, name FROM src_customers",
+            &["customer_id".into()],
+            &["email".into(), "name".into()],
+            "sqlite_scd2_softdel_b",
+            None,
+            Some(DeleteHandling::Soft),
+            None,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+
+        use futures_util::TryStreamExt;
+        let s = b
+            .read_arrow_stream(
+                "SELECT \
+                  sum(CASE WHEN customer_id=2 AND is_current=1 THEN 1 ELSE 0 END), \
+                  sum(CASE WHEN customer_id=2 AND is_current=0 AND valid_to IS NOT NULL \
+                           THEN 1 ELSE 0 END), \
+                  sum(CASE WHEN customer_id=1 AND is_current=1 THEN 1 ELSE 0 END) \
+                 FROM customer_dim",
+            )
+            .await
+            .unwrap();
+        let batches: Vec<_> = s.try_collect().await.unwrap();
+        let col = |i: usize| {
+            batches[0]
+                .column(i)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0)
+        };
+        assert_eq!(col(0), 0, "bob's current closed");
+        assert_eq!(col(1), 1, "exactly one closed bob");
+        assert_eq!(col(2), 1, "alice still current");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sqlite_run_scd2_ttl_expires_stale_current() {
+        let b = sqlite_scd2_setup().await;
+        b.execute("INSERT INTO src_customers VALUES (1, 'a@x.com', 'alice')")
+            .await
+            .unwrap();
+        let target = sqlite_scd2_dim_spec();
+        b.run_scd2(
+            &target,
+            "SELECT customer_id, email, name FROM src_customers",
+            &["customer_id".into()],
+            &["email".into(), "name".into()],
+            "sqlite_scd2_ttl_a",
+            None,
+            None,
+            None,
+            Some(600),
+            false,
+        )
+        .await
+        .unwrap();
+
+        // Force-age alice's valid_from beyond the TTL.
+        b.execute(
+            "UPDATE customer_dim SET valid_from = '2020-01-01T00:00:00.000Z' \
+             WHERE customer_id = 1",
+        )
+        .await
+        .unwrap();
+        b.run_scd2(
+            &target,
+            "SELECT customer_id, email, name FROM src_customers",
+            &["customer_id".into()],
+            &["email".into(), "name".into()],
+            "sqlite_scd2_ttl_b",
+            None,
+            None,
+            None,
+            Some(600),
+            false,
+        )
+        .await
+        .unwrap();
+
+        use futures_util::TryStreamExt;
+        let s = b
+            .read_arrow_stream(
+                "SELECT sum(CASE WHEN is_current=1 THEN 1 ELSE 0 END), \
+                        sum(CASE WHEN is_current=0 AND valid_to IS NOT NULL THEN 1 ELSE 0 END) \
+                 FROM customer_dim",
+            )
+            .await
+            .unwrap();
+        let batches: Vec<_> = s.try_collect().await.unwrap();
+        let currents = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0);
+        let closed = batches[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0);
+        assert_eq!(currents, 0, "TTL-expired");
+        assert_eq!(closed, 1);
     }
 }
