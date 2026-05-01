@@ -45,8 +45,27 @@
 //!     never delivers more unacked messages than the consumer is
 //!     prepared to process in one drain.
 //!
+//! ## What 37a.4 adds (DLQ)
+//!   - `nack_pending(requeue)` — batch-nack every accumulated
+//!     delivery tag in one round-trip via `basic_nack(tag,
+//!     multiple=true, requeue)`. With `requeue=false`, the broker
+//!     either drops the messages or routes them to the configured
+//!     `x-dead-letter-exchange` (DLX) — that's standard AMQP DLX
+//!     behavior, controlled at queue declaration time, not by the
+//!     framework.
+//!   - The streaming-pipeline-level DLQ pattern (write a failed
+//!     batch to a DLQ queue via `source.write_arrow_stream`) already
+//!     works for RabbitMQ via the `write_arrow_stream` we ship in
+//!     37a.2 — `dlq_target.name` is the queue name; the default
+//!     exchange routes by queue name.
+//!
+//! ### Two DLQ modes for RabbitMQ
+//! | mode | what it does | when to use |
+//! |--|--|--|
+//! | App-level | StreamingPipeline writes the failed batch's rows to a separate queue via the source backend's `write_arrow_stream`, then commits the source. | Cross-pipeline DLQ replay (re-consume the DLQ queue identically to the primary). |
+//! | Broker-level | `nack_pending(requeue=false)` lets RabbitMQ's DLX feature route the dropped delivery to a configured dead-letter exchange. | Native AMQP DLQ, separate retry/inspection queues, observability via the management plugin. |
+//!
 //! ## What lands in 37a.x
-//!   - 37a.4 — DLQ via dead-letter exchange.
 //!   - 37a.5 — auth providers (TLS, SASL EXTERNAL, plain login —
 //!     `lapin` already supports them through the URI scheme; expose
 //!     the same builder-method surface as Kafka for consistency).
@@ -63,7 +82,9 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use futures_util::StreamExt;
-use lapin::options::{BasicAckOptions, BasicConsumeOptions, BasicPublishOptions, BasicQosOptions};
+use lapin::options::{
+    BasicAckOptions, BasicConsumeOptions, BasicNackOptions, BasicPublishOptions, BasicQosOptions,
+};
 use lapin::types::FieldTable;
 use lapin::{BasicProperties, Channel, Connection, ConnectionProperties, Consumer};
 use tokio::sync::Mutex;
@@ -224,6 +245,42 @@ impl RabbitMQBackend {
             .as_ref()
             .and_then(|s| s.pending_max_delivery_tag)
             .unwrap_or_default()
+    }
+
+    /// Phase 37a.4: batch-nack every accumulated delivery tag in one
+    /// round-trip via `basic_nack(highest_tag, multiple=true, requeue)`.
+    /// Clears the pending state on success.
+    ///
+    ///   - `requeue=true`  — return the deliveries to the front of
+    ///     the queue. Useful for transient errors where retry is
+    ///     appropriate.
+    ///   - `requeue=false` — drop the deliveries. If the source
+    ///     queue was declared with an `x-dead-letter-exchange`
+    ///     argument, the broker routes them to the DLX; otherwise
+    ///     they're discarded silently.
+    ///
+    /// No-ops if no consumer session has been opened or no tag has
+    /// accumulated.
+    pub async fn nack_pending(&self, requeue: bool) -> Result<(), BackendError> {
+        let mut session_lock = self.consumer_session.lock().await;
+        let Some(session) = session_lock.as_mut() else {
+            return Ok(());
+        };
+        let Some(tag) = session.pending_max_delivery_tag.take() else {
+            return Ok(());
+        };
+        session
+            .channel
+            .basic_nack(
+                tag,
+                BasicNackOptions {
+                    multiple: true,
+                    requeue,
+                },
+            )
+            .await
+            .map_err(|e| BackendError::Query(format!("rabbitmq basic_nack: {e}")))?;
+        Ok(())
     }
 
     /// Open the persistent consumer session: connect, create channel,
@@ -846,6 +903,26 @@ mod tests {
             .unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("source_backend is required"), "got: {msg}");
+    }
+
+    /// 37a.3: commit_offsets is a no-op before any consumer session
+    /// has been opened. Lets pipelines call it unconditionally.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn commit_offsets_noop_without_consumer_session() {
+        let b = RabbitMQBackend::open("amqp://localhost").unwrap();
+        b.commit_offsets().await.unwrap();
+        assert_eq!(b.pending_delivery_count().await, 0);
+    }
+
+    /// 37a.4: nack_pending is a no-op before any consumer session has
+    /// been opened, and is idempotent across both requeue=true and
+    /// requeue=false.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn nack_pending_noop_without_consumer_session() {
+        let b = RabbitMQBackend::open("amqp://localhost").unwrap();
+        b.nack_pending(true).await.unwrap();
+        b.nack_pending(false).await.unwrap();
+        assert_eq!(b.pending_delivery_count().await, 0);
     }
 
     #[tokio::test(flavor = "multi_thread")]

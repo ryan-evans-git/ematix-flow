@@ -4789,6 +4789,68 @@ async fn declare_rabbitmq_queue(amqp_url: &str, queue: &str) {
     let _ = conn.close(0, "declare done").await;
 }
 
+/// Phase 37a.4: declare a queue with `x-dead-letter-exchange` so
+/// nacked-with-requeue=false messages route to the configured DLX.
+/// Also declares a fanout DLX and a sibling DLQ-observer queue
+/// bound to it, so the test can read what was dead-lettered.
+async fn declare_rabbitmq_queue_with_dlx(
+    amqp_url: &str,
+    queue: &str,
+    dlx_name: &str,
+    dlq_observer: &str,
+) {
+    use lapin::options::{ExchangeDeclareOptions, QueueBindOptions, QueueDeclareOptions};
+    use lapin::types::{AMQPValue, FieldTable, ShortString};
+    use lapin::{Connection, ConnectionProperties, ExchangeKind};
+
+    let conn = Connection::connect(amqp_url, ConnectionProperties::default())
+        .await
+        .expect("declare connect");
+    let channel = conn.create_channel().await.expect("declare channel");
+
+    channel
+        .exchange_declare(
+            dlx_name,
+            ExchangeKind::Fanout,
+            ExchangeDeclareOptions::default(),
+            FieldTable::default(),
+        )
+        .await
+        .expect("dlx exchange_declare");
+
+    let mut args = FieldTable::default();
+    args.insert(
+        ShortString::from("x-dead-letter-exchange"),
+        AMQPValue::LongString(dlx_name.into()),
+    );
+    channel
+        .queue_declare(queue, QueueDeclareOptions::default(), args)
+        .await
+        .expect("queue_declare with DLX");
+
+    channel
+        .queue_declare(
+            dlq_observer,
+            QueueDeclareOptions::default(),
+            FieldTable::default(),
+        )
+        .await
+        .expect("dlq observer declare");
+    channel
+        .queue_bind(
+            dlq_observer,
+            dlx_name,
+            "",
+            QueueBindOptions::default(),
+            FieldTable::default(),
+        )
+        .await
+        .expect("dlq observer bind");
+
+    let _ = channel.close(0, "declare done").await;
+    let _ = conn.close(0, "declare done").await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs Docker; run with `cargo test -- --ignored`"]
 async fn rabbitmq_write_then_read_round_trip() {
@@ -4976,6 +5038,112 @@ async fn rabbitmq_unacked_messages_redeliver_on_consumer_replace() {
         total, 0,
         "after commit_offsets the queue should be empty; got {total}"
     );
+}
+
+/// Phase 37a.4: produce → consume → nack(requeue=false) → message
+/// disappears from the source queue but reappears on the DLX-bound
+/// observer queue. Validates that our `nack_pending` integrates
+/// correctly with broker-side `x-dead-letter-exchange` routing.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker; run with `cargo test -- --ignored`"]
+async fn rabbitmq_nack_pending_routes_to_dead_letter_exchange() {
+    use arrow_array::Int64Array;
+    use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+    use ematix_flow_core::backend::WriteMode;
+    use ematix_flow_core::rabbitmq_backend::RabbitBatchConfig;
+
+    let (_container, amqp_url) = start_rabbitmq().await;
+    let queue = "dlx-source-queue";
+    let dlx = "dlx-test-exchange";
+    let dlq_observer = "dlx-observer-queue";
+    declare_rabbitmq_queue_with_dlx(&amqp_url, queue, dlx, dlq_observer).await;
+
+    // Produce 3 rows to the source queue.
+    let producer = RabbitMQBackend::open(&amqp_url).unwrap();
+    let arrow_schema = Arc::new(ArrowSchema::new(vec![Field::new(
+        "id",
+        DataType::Int64,
+        false,
+    )]));
+    let batch = arrow_array::RecordBatch::try_new(
+        arrow_schema,
+        vec![Arc::new(Int64Array::from(vec![10_i64, 20, 30]))],
+    )
+    .unwrap();
+    let target = ematix_flow_core::backend::TargetTable {
+        schema: "".into(),
+        name: queue.into(),
+    };
+    let stream: ematix_flow_core::backend::ArrowBatchStream =
+        Box::pin(futures_util::stream::once(async move {
+            Ok::<_, ematix_flow_core::BackendError>(batch)
+        }));
+    let n = producer
+        .write_arrow_stream(&target, stream, WriteMode::Append)
+        .await
+        .unwrap();
+    assert_eq!(n, 3);
+
+    // Drain the source queue → call nack_pending(false) → drop
+    // backend. Native AMQP DLX routing should fire.
+    {
+        let consumer =
+            RabbitMQBackend::open(&amqp_url)
+                .unwrap()
+                .with_batch_config(RabbitBatchConfig {
+                    batch_size: 100,
+                    batch_bytes: 1 << 20,
+                    idle_timeout_ms: 3_000,
+                });
+        let stream = consumer.read_arrow_stream(queue).await.unwrap();
+        let batches: Vec<_> = stream.try_collect().await.unwrap();
+        let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, 3);
+        consumer.nack_pending(false).await.unwrap();
+        assert_eq!(consumer.pending_delivery_count().await, 0);
+    }
+
+    // Give the broker a beat to route to the DLX.
+    tokio::time::sleep(StdDuration::from_millis(500)).await;
+
+    // The source queue should now be empty.
+    {
+        let probe =
+            RabbitMQBackend::open(&amqp_url)
+                .unwrap()
+                .with_batch_config(RabbitBatchConfig {
+                    batch_size: 100,
+                    batch_bytes: 1 << 20,
+                    idle_timeout_ms: 1_000,
+                });
+        let stream = probe.read_arrow_stream(queue).await.unwrap();
+        let batches: Vec<_> = stream.try_collect().await.unwrap();
+        let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(
+            total, 0,
+            "source queue should be empty after nack(requeue=false); got {total}"
+        );
+    }
+
+    // The DLQ observer queue (bound to the DLX) should have
+    // received all 3 rows.
+    {
+        let dlq_consumer =
+            RabbitMQBackend::open(&amqp_url)
+                .unwrap()
+                .with_batch_config(RabbitBatchConfig {
+                    batch_size: 100,
+                    batch_bytes: 1 << 20,
+                    idle_timeout_ms: 2_000,
+                });
+        let stream = dlq_consumer.read_arrow_stream(dlq_observer).await.unwrap();
+        let batches: Vec<_> = stream.try_collect().await.unwrap();
+        let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(
+            total, 3,
+            "DLX observer queue should have all 3 dead-lettered rows; got {total}"
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
