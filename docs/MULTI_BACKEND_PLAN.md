@@ -257,15 +257,50 @@ Q1 → A: append/truncate only on raw files.
 Unblocks merge/scd2 against object storage with proper transactional
 semantics, time-travel, and concurrent-writer correctness.
 
-- `IcebergBackend: Backend` via `iceberg-rust` crate.
-- `DeltaBackend: Backend` via `deltalake-rs` crate.
-- Both backends support all five strategy modes — `MERGE INTO`,
-  schema evolution, partitioning hints.
-- Catalog support: AWS Glue, Hive Metastore, REST catalog, file-based.
+**Status (2026-05):** Delta shipped (35a–f). Iceberg deferred to a
+follow-up phase — see "Phase 35g deferral" below.
+
+Phase 35a (Arrow 58 workspace bump) and 35b–f (DeltaBackend) shipped
+together. The Delta backend supports append, truncate, merge with
+insert/update split + Hard delete, basic SCD2 (no event-time yet),
+soft-delete close-out, and TTL. Tested locally and against MinIO via
+testcontainers.
+
+#### Phase 35g — Iceberg deferral
+
+`iceberg-rust` 0.9 (March 2026) doesn't yet meet our integration bar:
+
+1. **Arrow ABI mismatch.** It pulls in `arrow 57.x`; the workspace
+   committed to `arrow 58.x` in 35a so deltalake (which is on 58) can
+   share `RecordBatch` types with our other backends. Adopting iceberg
+   would either dual-version Arrow (and force IPC-bytes adapters at
+   every Iceberg boundary — slow and ugly) or pin the workspace back
+   to 57 (which would un-ship Delta).
+2. **No high-level merge API.** iceberg 0.9 ships file-level writers
+   (`base_writer`, `file_writer`) but no `MergeBuilder` equivalent —
+   merge / SCD2 would have to be hand-rolled out of low-level
+   primitives (manifest manipulation, copy-on-write delete files).
+   That's its own multi-week project.
+
+**Reconsider when:** iceberg-rust ships an arrow-58 release line AND
+adds a high-level `MergeBuilder` (or equivalent transactional upsert
+surface). At that point Phase 35g becomes mostly a copy of 35b–f with
+deltalake swapped for iceberg, and 35h ships cross-format tests
+(read Iceberg → write Delta, etc.).
+
+#### Phase 35 (when complete) ships:
+
+- `DeltaBackend: Backend` ✅ (35b–f)
+- `IcebergBackend: Backend` ⏸ (35g deferred)
+- All five strategy modes on both — append, truncate, merge, scd1
+  (subset of merge), scd2 (basic).
+- Event-time SCD2 (`event_timestamp_column`) is rejected today; lands
+  in a 35h follow-up.
+- Catalog support: AWS Glue, Hive Metastore, REST catalog, file-based —
+  for both backends. (Delta currently supports file-based only.)
 - `__partition_columns__ = ("year", "month")` dunder for partitioned
   writes.
-- Tests: full strategy matrix on both formats, cross-format reads
-  (read Iceberg, write Delta).
+- Cross-format reads (read Iceberg, write Delta).
 
 ### Phase 36 — Streaming consumer model (≈3–4w)
 
