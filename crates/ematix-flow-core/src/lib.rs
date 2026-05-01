@@ -7,6 +7,7 @@ pub mod ddl;
 pub mod duckdb_backend;
 pub mod hash;
 pub mod meta;
+pub mod mysql_backend;
 pub mod pg;
 pub mod spec;
 pub mod sqlite_backend;
@@ -15,6 +16,7 @@ pub mod types;
 
 pub use backend::{Backend, BackendError, Dialect, ObjectFormat, PostgresBackend, StreamingKind};
 pub use duckdb_backend::DuckDBBackend;
+pub use mysql_backend::MySQLBackend;
 pub use spec::{Mode, PipelineSpec, SourceSpec, SpecError, TargetSpec, normalize_json};
 pub use sqlite_backend::SQLiteBackend;
 pub use types::{ColumnSpec, ColumnType, TableSpec, normalize_table_json};

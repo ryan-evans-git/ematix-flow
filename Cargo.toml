@@ -39,7 +39,8 @@ duckdb = { version = "1.4", features = ["bundled", "appender-arrow"] }
 # done manually — rusqlite has no Arrow feature.
 rusqlite = { version = "0.31", features = ["bundled", "chrono", "uuid", "column_decltype", "functions"] }
 testcontainers = "0.27"
-testcontainers-modules = { version = "0.15", features = ["postgres"] }
+testcontainers-modules = { version = "0.15", features = ["postgres", "mysql"] }
+mysql_async = { version = "0.36", default-features = false, features = ["minimal-rust", "rustls-tls"] }
 
 [profile.release]
 lto = "thin"

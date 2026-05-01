@@ -2052,3 +2052,208 @@ async fn cross_backend_sqlite_to_pg_arrow() {
         .unwrap();
     assert_eq!(count, 2);
 }
+
+// ----- Phase 33a: MySQL integration tests (Docker-only) -----------------
+
+use ematix_flow_core::MySQLBackend;
+use testcontainers_modules::mysql::Mysql;
+
+async fn start_mysql() -> (testcontainers::ContainerAsync<Mysql>, String) {
+    let container = Mysql::default()
+        .start()
+        .await
+        .expect("failed to start mysql testcontainer");
+    let host = container
+        .get_host()
+        .await
+        .expect("failed to read host")
+        .to_string();
+    let port = container
+        .get_host_port_ipv4(3306)
+        .await
+        .expect("failed to read port");
+    // testcontainers-modules' Mysql defaults: root user, empty password,
+    // initial database "test".
+    let url = format!("mysql://root@{host}:{port}/test");
+    (container, url)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker; run with `cargo test -- --ignored`"]
+async fn mysql_backend_ping() {
+    let (_container, url) = start_mysql().await;
+    let backend = MySQLBackend::open(&url).unwrap();
+    backend.ping().await.unwrap();
+    assert_eq!(backend.dialect(), Dialect::MySQL);
+    let info = backend.connection_info();
+    assert_eq!(info.user, "root");
+    assert_eq!(info.dbname, "test");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker; run with `cargo test -- --ignored`"]
+async fn mysql_backend_execute_and_read_arrow_stream() {
+    use arrow_array::Array;
+    use arrow_array::{BooleanArray, Float64Array, Int64Array, StringArray};
+
+    let (_container, url) = start_mysql().await;
+    let backend = MySQLBackend::open(&url).unwrap();
+    backend
+        .execute(
+            "CREATE TABLE items (\
+                id BIGINT, \
+                name VARCHAR(64), \
+                price DOUBLE, \
+                in_stock TINYINT(1)\
+            )",
+        )
+        .await
+        .unwrap();
+    let inserted = backend
+        .execute(
+            "INSERT INTO items VALUES \
+             (1, 'apple', 1.5, 1), \
+             (2, 'banana', 0.75, 0), \
+             (3, NULL, NULL, 1)",
+        )
+        .await
+        .unwrap();
+    assert_eq!(inserted, 3);
+
+    let stream = backend
+        .read_arrow_stream("SELECT id, name, price, in_stock FROM items ORDER BY id")
+        .await
+        .unwrap();
+    let batches: Vec<_> = stream.try_collect().await.unwrap();
+    assert_eq!(batches.len(), 1);
+    let b = &batches[0];
+    assert_eq!(b.num_rows(), 3);
+
+    let ids = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+    assert_eq!(ids.values(), &[1, 2, 3]);
+
+    let names = b.column(1).as_any().downcast_ref::<StringArray>().unwrap();
+    assert_eq!(names.value(0), "apple");
+    assert_eq!(names.value(1), "banana");
+    assert!(names.is_null(2));
+
+    let prices = b.column(2).as_any().downcast_ref::<Float64Array>().unwrap();
+    assert!((prices.value(0) - 1.5).abs() < 1e-9);
+    assert!((prices.value(1) - 0.75).abs() < 1e-9);
+    assert!(prices.is_null(2));
+
+    let stocks = b.column(3).as_any().downcast_ref::<BooleanArray>().unwrap();
+    assert!(stocks.value(0));
+    assert!(!stocks.value(1));
+    assert!(stocks.value(2));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker; run with `cargo test -- --ignored`"]
+async fn mysql_backend_write_arrow_stream() {
+    use arrow_array::{Float64Array, Int64Array, RecordBatch as RB, StringArray};
+    use arrow_schema::{DataType as Dt, Field as F, Schema as S};
+
+    let (_container, url) = start_mysql().await;
+    let backend = MySQLBackend::open(&url).unwrap();
+    backend
+        .execute(
+            "CREATE TABLE writes (\
+                id BIGINT, \
+                name VARCHAR(64), \
+                price DOUBLE\
+            )",
+        )
+        .await
+        .unwrap();
+
+    let schema = std::sync::Arc::new(S::new(vec![
+        F::new("id", Dt::Int64, true),
+        F::new("name", Dt::Utf8, true),
+        F::new("price", Dt::Float64, true),
+    ]));
+    let batch = RB::try_new(
+        schema,
+        vec![
+            std::sync::Arc::new(Int64Array::from(vec![10, 20, 30])),
+            std::sync::Arc::new(StringArray::from(vec!["a", "b", "c"])),
+            std::sync::Arc::new(Float64Array::from(vec![1.0, 2.0, 3.0])),
+        ],
+    )
+    .unwrap();
+    let stream = futures_util::stream::once(async move { Ok::<_, _>(batch) });
+    let stream: ematix_flow_core::backend::ArrowBatchStream = Box::pin(stream);
+
+    let target = TargetTable {
+        schema: "test".into(),
+        name: "writes".into(),
+    };
+    let n = backend
+        .write_arrow_stream(&target, stream, WriteMode::Append)
+        .await
+        .unwrap();
+    assert_eq!(n, 3);
+
+    // Round-trip via a count(*) read.
+    use arrow_array::Int64Array as I64;
+    let s2 = backend
+        .read_arrow_stream("SELECT count(*) AS n FROM writes")
+        .await
+        .unwrap();
+    let bs: Vec<_> = s2.try_collect().await.unwrap();
+    let total = bs[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<I64>()
+        .unwrap()
+        .value(0);
+    assert_eq!(total, 3);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker; run with `cargo test -- --ignored`"]
+async fn mysql_backend_write_arrow_stream_truncate() {
+    use arrow_array::{Int64Array, RecordBatch as RB};
+    use arrow_schema::{DataType as Dt, Field as F, Schema as S};
+
+    let (_container, url) = start_mysql().await;
+    let backend = MySQLBackend::open(&url).unwrap();
+    backend
+        .execute("CREATE TABLE trunc_t (id BIGINT)")
+        .await
+        .unwrap();
+    backend
+        .execute("INSERT INTO trunc_t VALUES (99), (100)")
+        .await
+        .unwrap();
+    let schema = std::sync::Arc::new(S::new(vec![F::new("id", Dt::Int64, true)]));
+    let batch = RB::try_new(
+        schema,
+        vec![std::sync::Arc::new(Int64Array::from(vec![1, 2]))],
+    )
+    .unwrap();
+    let stream = futures_util::stream::once(async move { Ok::<_, _>(batch) });
+    let stream: ematix_flow_core::backend::ArrowBatchStream = Box::pin(stream);
+    let target = TargetTable {
+        schema: "test".into(),
+        name: "trunc_t".into(),
+    };
+    let n = backend
+        .write_arrow_stream(&target, stream, WriteMode::Truncate)
+        .await
+        .unwrap();
+    assert_eq!(n, 2);
+
+    let s2 = backend
+        .read_arrow_stream("SELECT id FROM trunc_t ORDER BY id")
+        .await
+        .unwrap();
+    let bs: Vec<_> = s2.try_collect().await.unwrap();
+    let ids = bs[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<arrow_array::Int64Array>()
+        .unwrap();
+    // Old rows (99, 100) removed by TRUNCATE; only the new ones remain.
+    assert_eq!(ids.values(), &[1, 2]);
+}

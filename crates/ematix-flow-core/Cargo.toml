@@ -27,6 +27,7 @@ arrow-array = { workspace = true }
 arrow-schema = { workspace = true }
 duckdb = { workspace = true }
 rusqlite = { workspace = true }
+mysql_async = { workspace = true }
 
 [dev-dependencies]
 arrow-array.workspace = true
