@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use ematix_flow_cli::{CliError, PipelineCliConfig, run_consume};
+use ematix_flow_cli::{CliError, ConsumeOptions, PipelineCliConfig, run_consume_with};
 use tracing::{error, info};
 
 #[derive(Debug, Parser)]
@@ -32,6 +32,11 @@ enum Commands {
         /// Path to the pipeline TOML config.
         #[arg(value_name = "CONFIG", default_value = "pipeline.toml")]
         config: PathBuf,
+        /// If set, expose Prometheus metrics on `127.0.0.1:<PORT>` at
+        /// `/metrics`. The server shares the pipeline's shutdown
+        /// signal so both stop together.
+        #[arg(long, value_name = "PORT")]
+        metrics_port: Option<u16>,
     },
 }
 
@@ -41,7 +46,10 @@ async fn main() -> ExitCode {
 
     let cli = Cli::parse();
     match cli.command {
-        Commands::Consume { config } => match run_consume_cmd(&config).await {
+        Commands::Consume {
+            config,
+            metrics_port,
+        } => match run_consume_cmd(&config, metrics_port).await {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 error!(error = %e, "flow consume failed");
@@ -51,15 +59,19 @@ async fn main() -> ExitCode {
     }
 }
 
-async fn run_consume_cmd(path: &std::path::Path) -> Result<(), CliError> {
+async fn run_consume_cmd(
+    path: &std::path::Path,
+    metrics_port: Option<u16>,
+) -> Result<(), CliError> {
     let cfg = PipelineCliConfig::from_path(path)?;
     info!(
         pipeline_name = cfg.pipeline_name.as_str(),
         source_query = cfg.source_query.as_str(),
         idle_pause_ms = cfg.idle_pause_ms,
+        metrics_port = ?metrics_port,
         "starting pipeline"
     );
-    let metrics = run_consume(cfg).await?;
+    let metrics = run_consume_with(cfg, ConsumeOptions { metrics_port }).await?;
     info!(
         total_rows = metrics.total_rows,
         iterations = metrics.iterations,

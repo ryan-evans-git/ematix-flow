@@ -6,17 +6,18 @@
 //! that calls into [`run_consume`].
 //!
 //! ## Phases
-//!   - **CLI.1 (this commit)** — Scaffolding. `flow consume <toml>`
-//!     parses a config, builds source + target backends, and runs
-//!     a [`StreamingPipeline`] under SIGTERM/SIGINT shutdown.
+//!   - **CLI.1** — Scaffolding. `flow consume <toml>` parses a
+//!     config, builds source + target backends, and runs a
+//!     [`StreamingPipeline`] under SIGTERM/SIGINT shutdown.
 //!     Backends in CLI.1: Kafka / RabbitMQ / Pub/Sub / Kinesis as
 //!     sources; Postgres / MySQL / SQLite / DuckDB / Kafka /
 //!     RabbitMQ / Pub/Sub / Kinesis / Delta-local as targets.
 //!     S3-backed Delta + the `ObjectStore` formats are deferred to a
-//!     follow-up sub-phase (the format / region / credentials
-//!     surface doesn't fit cleanly into one tagged enum yet).
-//!   - **CLI.2** — `/metrics` HTTP endpoint exposing the pipeline's
-//!     Prometheus registry.
+//!     follow-up sub-phase.
+//!   - **CLI.2 (this commit)** — `/metrics` HTTP endpoint exposing
+//!     the pipeline's Prometheus registry. Opt in with
+//!     `--metrics-port <PORT>`. Server shares the pipeline's
+//!     shutdown signal so both stop together.
 //!   - **CLI.3** — Process-level supervisor: restart-on-crash with
 //!     exponential backoff, multi-pipeline concurrency.
 //!
@@ -40,14 +41,18 @@
 //! name = "events"
 //! ```
 
+use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
 
 use ematix_flow_core::backend::{Backend, BackendError, TargetTable, WriteMode};
 use ematix_flow_core::pg::PgPool;
 use ematix_flow_core::streaming::{
-    StreamingPipeline, StreamingPipelineConfig, StreamingPipelineMetrics, install_shutdown_handler,
+    ShutdownSignal, StreamingPipeline, StreamingPipelineConfig, StreamingPipelineMetrics,
+    install_shutdown_handler,
 };
+
+pub mod metrics_server;
 use ematix_flow_core::{
     DeltaBackend, DuckDBBackend, KafkaBackend, KinesisBackend, MySQLBackend, PostgresBackend,
     PubSubBackend, RabbitMQBackend, SQLiteBackend,
@@ -391,12 +396,35 @@ pub enum CliError {
     Runtime(String),
 }
 
+/// Optional runtime knobs for [`run_consume`]. CLI flags map onto
+/// this; library callers can pass `Default::default()` for the
+/// pipeline-only path.
+#[derive(Debug, Clone, Default)]
+pub struct ConsumeOptions {
+    /// When `Some`, spawn a metrics HTTP server bound to
+    /// `127.0.0.1:<port>` exposing `/metrics` from the pipeline's
+    /// Prometheus registry. The server shares the pipeline's
+    /// shutdown signal so both stop together.
+    pub metrics_port: Option<u16>,
+}
+
 /// Run a single pipeline to completion (until shutdown). Used by
 /// the `flow consume` subcommand and by integration tests.
 ///
-/// The returned [`StreamingPipelineMetrics`] aggregates everything
-/// the pipeline did during its run.
+/// Convenience wrapper around [`run_consume_with`] for callers
+/// that don't need the runtime knobs.
 pub async fn run_consume(config: PipelineCliConfig) -> Result<StreamingPipelineMetrics, CliError> {
+    run_consume_with(config, ConsumeOptions::default()).await
+}
+
+/// Run a single pipeline with explicit [`ConsumeOptions`]. Spawns
+/// the metrics server (if configured) before the pipeline starts,
+/// then awaits the pipeline. The server is asked to shut down
+/// when the pipeline exits, regardless of how it exited.
+pub async fn run_consume_with(
+    config: PipelineCliConfig,
+    options: ConsumeOptions,
+) -> Result<StreamingPipelineMetrics, CliError> {
     let source = config.build_source()?;
     let (target, target_table) = config.build_target().await?;
     let pipeline_cfg = config.streaming_config(target_table);
@@ -406,10 +434,40 @@ pub async fn run_consume(config: PipelineCliConfig) -> Result<StreamingPipelineM
     // handle drops at the end of this function — fine, the signal
     // task lives until SIGTERM/SIGINT or the runtime tears down.
     let (shutdown, _shutdown_handle) = install_shutdown_handler();
-    pipeline
+
+    // Optional metrics server. We give it its own ShutdownSignal
+    // pair so the pipeline's exit (success OR error) can stop the
+    // server before this function returns.
+    let (metrics_signal, metrics_trigger) = ShutdownSignal::new();
+    let metrics_handle = if let Some(port) = options.metrics_port {
+        let addr: SocketAddr =
+            format!("127.0.0.1:{port}")
+                .parse()
+                .map_err(|e: std::net::AddrParseError| {
+                    CliError::Runtime(format!("metrics addr parse: {e}"))
+                })?;
+        let registry = Arc::new(pipeline.metrics_registry().clone());
+        let (_bound, handle) = metrics_server::spawn_metrics_server(addr, registry, metrics_signal)
+            .await
+            .map_err(|e| CliError::Runtime(format!("metrics bind {addr}: {e}")))?;
+        Some(handle)
+    } else {
+        // No server requested — drop the signal pair on the floor.
+        drop(metrics_signal);
+        None
+    };
+
+    let result = pipeline
         .run(shutdown)
         .await
-        .map_err(|e| CliError::Runtime(e.to_string()))
+        .map_err(|e| CliError::Runtime(e.to_string()));
+
+    // Stop the metrics server (best effort).
+    metrics_trigger.trigger();
+    if let Some(handle) = metrics_handle {
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
+    }
+    result
 }
 
 #[cfg(test)]

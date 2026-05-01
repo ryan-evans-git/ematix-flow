@@ -122,6 +122,10 @@ clap = { version = "4", features = ["derive"] }
 toml = "0.9"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+# CLI.2: tiny HTTP server for the /metrics endpoint. axum 0.8
+# already shares hyper with our other deps (aws-sdk-*, tonic via
+# google-cloud-pubsub), so the dep cost is mostly compile-time.
+axum = { version = "0.8", default-features = false, features = ["tokio", "http1"] }
 # `url` is needed to construct deltalake's `Url` parameter; deltalake
 # doesn't re-export it. Already pulled in transitively, so this just
 # brings it into the workspace's direct namespace.
