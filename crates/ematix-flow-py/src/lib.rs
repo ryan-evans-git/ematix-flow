@@ -1,4 +1,7 @@
 mod kafka;
+mod kinesis;
+mod pubsub;
+mod rabbitmq;
 
 use std::sync::{Arc, OnceLock};
 
@@ -809,5 +812,8 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(run_pipeline_from_path, m)?)?;
     m.add_class::<Connection>()?;
     m.add_class::<kafka::PyKafkaBackend>()?;
+    m.add_class::<rabbitmq::PyRabbitMQBackend>()?;
+    m.add_class::<pubsub::PyPubSubBackend>()?;
+    m.add_class::<kinesis::PyKinesisBackend>()?;
     Ok(())
 }
