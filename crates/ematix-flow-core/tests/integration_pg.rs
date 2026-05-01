@@ -3140,3 +3140,297 @@ async fn mysql_run_scd2_ttl_expires_stale_current() {
     assert_eq!(cur, 0, "stale row tombstoned");
     assert_eq!(closed, 1);
 }
+
+// ----- Phase 33e: cross-backend Arrow tests for MySQL ↔ {DuckDB, SQLite, PG}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker; run with `cargo test -- --ignored`"]
+async fn cross_backend_duckdb_to_mysql_arrow() {
+    use arrow_array::Int64Array;
+    let (_container, url) = start_mysql().await;
+    let duck: Arc<dyn Backend> = Arc::new(DuckDBBackend::open(":memory:").unwrap());
+    let mysql: Arc<dyn Backend> = Arc::new(MySQLBackend::open(&url).unwrap());
+
+    duck.execute("CREATE SCHEMA s").await.unwrap();
+    duck.execute("CREATE TABLE s.events (id BIGINT, name VARCHAR, score DOUBLE)")
+        .await
+        .unwrap();
+    duck.execute(
+        "INSERT INTO s.events VALUES \
+         (1, 'alice', 1.5), (2, 'bob', 2.5), (3, NULL, 3.5)",
+    )
+    .await
+    .unwrap();
+    mysql
+        .execute("CREATE TABLE events (id BIGINT, name VARCHAR(64), score DOUBLE)")
+        .await
+        .unwrap();
+
+    let stream = duck
+        .read_arrow_stream("SELECT id, name, score FROM s.events ORDER BY id")
+        .await
+        .unwrap();
+    let target = TargetTable {
+        schema: "test".into(),
+        name: "events".into(),
+    };
+    let n = mysql
+        .write_arrow_stream(&target, stream, WriteMode::Append)
+        .await
+        .unwrap();
+    assert_eq!(n, 3);
+
+    let s = mysql
+        .read_arrow_stream("SELECT count(*) FROM events")
+        .await
+        .unwrap();
+    let batches: Vec<_> = s.try_collect().await.unwrap();
+    let total = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(total, 3);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker; run with `cargo test -- --ignored`"]
+async fn cross_backend_mysql_to_duckdb_arrow() {
+    use arrow_array::Int64Array;
+    let (_container, url) = start_mysql().await;
+    let mysql: Arc<dyn Backend> = Arc::new(MySQLBackend::open(&url).unwrap());
+    let duck: Arc<dyn Backend> = Arc::new(DuckDBBackend::open(":memory:").unwrap());
+
+    mysql
+        .execute("CREATE TABLE events (id BIGINT, name VARCHAR(64))")
+        .await
+        .unwrap();
+    mysql
+        .execute("INSERT INTO events VALUES (1, 'a'), (2, 'b'), (3, 'c')")
+        .await
+        .unwrap();
+    duck.execute("CREATE SCHEMA s").await.unwrap();
+    duck.execute("CREATE TABLE s.events (id BIGINT, name VARCHAR)")
+        .await
+        .unwrap();
+
+    let stream = mysql
+        .read_arrow_stream("SELECT id, name FROM events ORDER BY id")
+        .await
+        .unwrap();
+    let target = TargetTable {
+        schema: "s".into(),
+        name: "events".into(),
+    };
+    let n = duck
+        .write_arrow_stream(&target, stream, WriteMode::Append)
+        .await
+        .unwrap();
+    assert_eq!(n, 3);
+
+    let s = duck
+        .read_arrow_stream("SELECT count(*)::BIGINT FROM s.events")
+        .await
+        .unwrap();
+    let batches: Vec<_> = s.try_collect().await.unwrap();
+    let total = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(total, 3);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker; run with `cargo test -- --ignored`"]
+async fn cross_backend_sqlite_to_mysql_arrow() {
+    use arrow_array::Int64Array;
+    let (_container, url) = start_mysql().await;
+    let sqlite: Arc<dyn Backend> = Arc::new(SQLiteBackend::open(":memory:").unwrap());
+    let mysql: Arc<dyn Backend> = Arc::new(MySQLBackend::open(&url).unwrap());
+
+    sqlite
+        .execute("CREATE TABLE events (id INTEGER, name TEXT)")
+        .await
+        .unwrap();
+    sqlite
+        .execute("INSERT INTO events VALUES (1, 'a'), (2, 'b'), (3, 'c')")
+        .await
+        .unwrap();
+    mysql
+        .execute("CREATE TABLE events (id BIGINT, name VARCHAR(64))")
+        .await
+        .unwrap();
+
+    let stream = sqlite
+        .read_arrow_stream("SELECT id, name FROM events ORDER BY id")
+        .await
+        .unwrap();
+    let target = TargetTable {
+        schema: "test".into(),
+        name: "events".into(),
+    };
+    let n = mysql
+        .write_arrow_stream(&target, stream, WriteMode::Append)
+        .await
+        .unwrap();
+    assert_eq!(n, 3);
+
+    let s = mysql
+        .read_arrow_stream("SELECT count(*) FROM events")
+        .await
+        .unwrap();
+    let batches: Vec<_> = s.try_collect().await.unwrap();
+    let total = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(total, 3);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker; run with `cargo test -- --ignored`"]
+async fn cross_backend_mysql_to_sqlite_arrow() {
+    use arrow_array::Int64Array;
+    let (_container, url) = start_mysql().await;
+    let mysql: Arc<dyn Backend> = Arc::new(MySQLBackend::open(&url).unwrap());
+    let sqlite: Arc<dyn Backend> = Arc::new(SQLiteBackend::open(":memory:").unwrap());
+
+    mysql
+        .execute("CREATE TABLE events (id BIGINT, name VARCHAR(64))")
+        .await
+        .unwrap();
+    mysql
+        .execute("INSERT INTO events VALUES (1, 'a'), (2, 'b'), (3, 'c')")
+        .await
+        .unwrap();
+    sqlite
+        .execute("CREATE TABLE events (id INTEGER, name TEXT)")
+        .await
+        .unwrap();
+
+    let stream = mysql
+        .read_arrow_stream("SELECT id, name FROM events ORDER BY id")
+        .await
+        .unwrap();
+    let target = TargetTable {
+        schema: "main".into(),
+        name: "events".into(),
+    };
+    let n = sqlite
+        .write_arrow_stream(&target, stream, WriteMode::Append)
+        .await
+        .unwrap();
+    assert_eq!(n, 3);
+
+    let s = sqlite
+        .read_arrow_stream("SELECT count(*) FROM events")
+        .await
+        .unwrap();
+    let batches: Vec<_> = s.try_collect().await.unwrap();
+    let total = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(total, 3);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker; run with `cargo test -- --ignored`"]
+async fn cross_backend_pg_to_mysql_arrow() {
+    use arrow_array::Int64Array;
+    let (_pg_c, pg_url) = start_postgres().await;
+    let (_my_c, my_url) = start_mysql().await;
+    let pg_pool = Arc::new(PgPool::connect(&pg_url).await.unwrap());
+    let pg: Arc<dyn Backend> = Arc::new(PostgresBackend::new(pg_pool, pg_url.clone()));
+    let mysql: Arc<dyn Backend> = Arc::new(MySQLBackend::open(&my_url).unwrap());
+
+    pg.execute("CREATE SCHEMA cb_src").await.unwrap();
+    pg.execute("CREATE TABLE cb_src.events (id BIGINT, name TEXT, score DOUBLE PRECISION)")
+        .await
+        .unwrap();
+    pg.execute(
+        "INSERT INTO cb_src.events VALUES (1, 'alice', 1.5), (2, 'bob', 2.5), (3, NULL, 3.5)",
+    )
+    .await
+    .unwrap();
+    mysql
+        .execute("CREATE TABLE events (id BIGINT, name VARCHAR(64), score DOUBLE)")
+        .await
+        .unwrap();
+
+    let stream = pg
+        .read_arrow_stream("SELECT id, name, score FROM cb_src.events ORDER BY id")
+        .await
+        .unwrap();
+    let target = TargetTable {
+        schema: "test".into(),
+        name: "events".into(),
+    };
+    let n = mysql
+        .write_arrow_stream(&target, stream, WriteMode::Append)
+        .await
+        .unwrap();
+    assert_eq!(n, 3);
+
+    let s = mysql
+        .read_arrow_stream("SELECT count(*) FROM events")
+        .await
+        .unwrap();
+    let batches: Vec<_> = s.try_collect().await.unwrap();
+    let total = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(total, 3);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker; run with `cargo test -- --ignored`"]
+async fn cross_backend_mysql_to_pg_arrow() {
+    let (_pg_c, pg_url) = start_postgres().await;
+    let (_my_c, my_url) = start_mysql().await;
+    let pg_pool = Arc::new(PgPool::connect(&pg_url).await.unwrap());
+    let pg: Arc<dyn Backend> = Arc::new(PostgresBackend::new(pg_pool.clone(), pg_url.clone()));
+    let mysql: Arc<dyn Backend> = Arc::new(MySQLBackend::open(&my_url).unwrap());
+
+    mysql
+        .execute("CREATE TABLE events (id BIGINT, name VARCHAR(64))")
+        .await
+        .unwrap();
+    mysql
+        .execute("INSERT INTO events VALUES (1, 'a'), (2, 'b')")
+        .await
+        .unwrap();
+    pg.execute("CREATE SCHEMA cb_dst").await.unwrap();
+    pg.execute("CREATE TABLE cb_dst.events (id BIGINT, name TEXT)")
+        .await
+        .unwrap();
+
+    let stream = mysql
+        .read_arrow_stream("SELECT id, name FROM events ORDER BY id")
+        .await
+        .unwrap();
+    let target = TargetTable {
+        schema: "cb_dst".into(),
+        name: "events".into(),
+    };
+    let n = pg
+        .write_arrow_stream(&target, stream, WriteMode::Append)
+        .await
+        .unwrap();
+    assert_eq!(n, 2);
+    let count = pg_pool
+        .fetch_scalar_int("SELECT count(*)::int FROM cb_dst.events")
+        .await
+        .unwrap();
+    assert_eq!(count, 2);
+}
