@@ -1762,7 +1762,7 @@ fn encode_batch_as_raw_bytes(batch: &RecordBatch) -> Result<Vec<Vec<u8>>, Backen
 /// JSON path), but Avro Decimal / Fixed types lose strict typing
 /// (round-trip via stringification). Strict-typed Avro→Arrow with
 /// schema-driven Arrow builders is a follow-up.
-async fn decode_payloads_as_avro(
+pub async fn decode_payloads_as_avro(
     payloads: Vec<Vec<u8>>,
     schema_registry_url: &str,
 ) -> Result<Vec<RecordBatch>, BackendError> {
@@ -1859,7 +1859,7 @@ fn avro_value_to_json(value: &apache_avro::types::Value) -> serde_json::Value {
 /// rendered as lowercase hex strings (no canonical Avro JSON
 /// equivalent for proto bytes — pick whichever round-trips cleanly).
 /// Strict-typed Protobuf→Arrow is a future follow-up.
-async fn decode_payloads_as_protobuf(
+pub async fn decode_payloads_as_protobuf(
     payloads: Vec<Vec<u8>>,
     schema_registry_url: &str,
 ) -> Result<Vec<RecordBatch>, BackendError> {
@@ -2033,7 +2033,7 @@ fn packed_array_to_json(packed: &protofish::decode::PackedArray) -> Vec<serde_js
 ///   - Logical types (google.protobuf.Timestamp, Duration, Any) lose
 ///     the JSON-string hint of the decode path; users must produce
 ///     them as nested message objects.
-async fn encode_batch_as_protobuf(
+pub async fn encode_batch_as_protobuf(
     batch: &RecordBatch,
     topic: &str,
     schema_registry_url: &str,
@@ -2361,7 +2361,7 @@ fn encode_batch_as_jsonl_lines(batch: &RecordBatch) -> Result<Vec<Vec<u8>>, Back
 /// types (Decimal / Duration / Fixed lose strict typing). Strict-
 /// typed Arrow→Avro builders (no JSON intermediary) is a future
 /// follow-up; the win there is logical-type fidelity, not throughput.
-async fn encode_batch_as_avro(
+pub async fn encode_batch_as_avro(
     batch: &RecordBatch,
     topic: &str,
     schema_registry_url: &str,

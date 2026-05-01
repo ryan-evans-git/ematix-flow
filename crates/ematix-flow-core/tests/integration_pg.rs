@@ -4713,3 +4713,271 @@ async fn eos_pipeline_kafka_to_kafka_round_trip() {
         "source consumer's offsets should have advanced via send_offsets_to_transaction"
     );
 }
+
+// ----- Phase 36h.3.1: live Confluent Schema Registry round-trip ---------
+//
+// Spins up Apicurio's in-memory Confluent-compat Schema Registry
+// (no Kafka dependency — Apicurio's `mem` profile uses an internal
+// in-memory store). The SR's HTTP endpoint at
+// `/apis/ccompat/v7` is wire-compatible with the Confluent SR REST
+// API, so our `schema_registry_converter`-based encode / decode
+// helpers can target it the same way they would target Confluent
+// Cloud or `confluentinc/cp-schema-registry`.
+//
+// Two tests share the helper:
+//   - `kafka_avro_sr_round_trip` — registers an Avro schema via
+//     auto-register (TopicNameStrategyWithSchema), then exercises
+//     `encode_batch_as_avro` (36h.4) → `decode_payloads_as_avro`
+//     (36h.3) end-to-end through the live SR.
+//   - `kafka_protobuf_sr_round_trip` — same shape, but for Protobuf
+//     (36h.5/36h.6). Pre-registration uses `EasyProtoRawEncoder`
+//     with a `SuppliedSchema { schema_type: Protobuf, ... }`.
+
+use schema_registry_converter::async_impl::easy_avro::EasyAvroEncoder;
+use schema_registry_converter::async_impl::easy_proto_raw::EasyProtoRawEncoder;
+use schema_registry_converter::async_impl::schema_registry::SrSettings;
+use schema_registry_converter::avro_common::get_supplied_schema;
+use schema_registry_converter::schema_registry_common::{
+    SchemaType, SubjectNameStrategy, SuppliedSchema,
+};
+use testcontainers::core::{ContainerPort, WaitFor};
+use testcontainers::{GenericImage, ImageExt};
+
+const APICURIO_PORT: u16 = 8080;
+
+async fn start_apicurio_registry() -> (testcontainers::ContainerAsync<GenericImage>, String) {
+    let container = GenericImage::new("apicurio/apicurio-registry-mem", "2.5.10.Final")
+        .with_exposed_port(ContainerPort::Tcp(APICURIO_PORT))
+        // Apicurio prints a startup banner once HTTP is bound. The
+        // exact line varies by version; matching on a stable
+        // substring keeps the wait robust.
+        .with_wait_for(WaitFor::message_on_stdout("started in"))
+        .with_env_var("QUARKUS_PROFILE", "prod")
+        .with_env_var("REGISTRY_AUTH_ENABLED", "false")
+        .start()
+        .await
+        .expect("start apicurio registry");
+    let host = container
+        .get_host()
+        .await
+        .expect("apicurio host")
+        .to_string();
+    let port = container
+        .get_host_port_ipv4(APICURIO_PORT)
+        .await
+        .expect("apicurio port");
+    let url = format!("http://{host}:{port}/apis/ccompat/v7");
+    (container, url)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker; run with `cargo test -- --ignored`"]
+async fn kafka_avro_sr_round_trip() {
+    use arrow_array::{Int64Array, StringArray};
+    use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+    use ematix_flow_core::backend::WriteMode;
+    use ematix_flow_core::kafka_backend::{KafkaPayloadFormat, encode_batch_as_avro};
+
+    let (_container, sr_url) = start_apicurio_registry().await;
+
+    // Avro schema for our test record.
+    let avro_schema_json = r#"
+        {
+            "type": "record",
+            "name": "Heartbeat",
+            "namespace": "demo",
+            "fields": [
+                {"name": "id", "type": "long"},
+                {"name": "label", "type": "string"}
+            ]
+        }
+    "#;
+    let avro_schema = apache_avro::Schema::parse_str(avro_schema_json).unwrap();
+
+    let topic = "avro-rt-topic";
+
+    // Auto-register the schema in SR by issuing a single
+    // encode call against `TopicNameStrategyWithSchema`. After this,
+    // subject "<topic>-value" exists at version 1, and our
+    // helper's `TopicNameStrategy` lookup will resolve it.
+    let sr_settings = SrSettings::new(sr_url.clone());
+    let sample = serde_json::json!({"id": 0_i64, "label": "boot"});
+    let supplied = get_supplied_schema(&avro_schema);
+    let strategy = SubjectNameStrategy::TopicNameStrategyWithSchema(
+        topic.to_string(),
+        false,
+        supplied.clone(),
+    );
+    let encoder = EasyAvroEncoder::new(sr_settings.clone());
+    let _ = encoder
+        .encode_struct(sample, &strategy)
+        .await
+        .expect("auto-register avro schema");
+
+    // Build a small RecordBatch and encode via our helper.
+    let arrow_schema = Arc::new(ArrowSchema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("label", DataType::Utf8, false),
+    ]));
+    let batch = arrow_array::RecordBatch::try_new(
+        arrow_schema,
+        vec![
+            Arc::new(Int64Array::from(vec![1_i64, 2, 3])),
+            Arc::new(StringArray::from(vec!["alpha", "beta", "gamma"])),
+        ],
+    )
+    .unwrap();
+
+    let payloads = encode_batch_as_avro(&batch, topic, &sr_url)
+        .await
+        .expect("encode_batch_as_avro");
+    assert_eq!(payloads.len(), 3);
+    // Each payload starts with the SR magic byte 0x00 + 4-byte BE id.
+    for p in &payloads {
+        assert!(p.len() > 5, "payload too short: {p:?}");
+        assert_eq!(p[0], 0x00, "missing magic byte: {p:?}");
+    }
+
+    // Decode round-trip via our decoder helper.
+    use ematix_flow_core::kafka_backend::decode_payloads_as_avro;
+    let batches = decode_payloads_as_avro(payloads, &sr_url)
+        .await
+        .expect("decode_payloads_as_avro");
+    let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total, 3);
+    let mut ids: Vec<i64> = Vec::new();
+    let mut labels: Vec<String> = Vec::new();
+    for b in &batches {
+        let id_col = b
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let lb_col = b
+            .column_by_name("label")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        for i in 0..b.num_rows() {
+            ids.push(id_col.value(i));
+            labels.push(lb_col.value(i).to_string());
+        }
+    }
+    ids.sort_unstable();
+    assert_eq!(ids, vec![1, 2, 3]);
+    assert!(labels.contains(&"alpha".to_string()));
+    assert!(labels.contains(&"beta".to_string()));
+    assert!(labels.contains(&"gamma".to_string()));
+
+    // Quiet unused-warning.
+    let _ = (KafkaPayloadFormat::Avro, WriteMode::Append);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker; run with `cargo test -- --ignored`"]
+async fn kafka_protobuf_sr_round_trip() {
+    use arrow_array::{Int64Array, StringArray};
+    use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+    use ematix_flow_core::kafka_backend::{decode_payloads_as_protobuf, encode_batch_as_protobuf};
+
+    let (_container, sr_url) = start_apicurio_registry().await;
+
+    // .proto schema source. Single top-level message — matches our
+    // 36h.6 single-message restriction.
+    let proto_src = r#"
+        syntax = "proto3";
+        package demo;
+        message Heartbeat {
+            int64 id = 1;
+            string label = 2;
+        }
+    "#;
+    let topic = "proto-rt-topic";
+    let full_name = "demo.Heartbeat";
+
+    // Pre-register the protobuf schema via EasyProtoRawEncoder using
+    // TopicNameStrategyWithSchema. We need *some* valid proto bytes
+    // for the call to succeed; use protofish to encode an empty
+    // Heartbeat.
+    let context = protofish::context::Context::parse([proto_src]).expect("parse proto");
+    let msg_info = context.get_message(full_name).expect("Heartbeat exists");
+    let empty_msg = protofish::decode::MessageValue {
+        msg_ref: msg_info.self_ref,
+        fields: vec![],
+        garbage: None,
+    };
+    let empty_proto_bytes = empty_msg.encode(&context).to_vec();
+    let supplied = SuppliedSchema {
+        name: Some(full_name.to_string()),
+        schema_type: SchemaType::Protobuf,
+        schema: proto_src.to_string(),
+        references: vec![],
+        properties: None,
+        tags: None,
+    };
+    let strategy =
+        SubjectNameStrategy::TopicNameStrategyWithSchema(topic.to_string(), false, supplied);
+    let sr_settings = SrSettings::new(sr_url.clone());
+    let encoder = EasyProtoRawEncoder::new(sr_settings);
+    let _ = encoder
+        .encode(&empty_proto_bytes, full_name, strategy)
+        .await
+        .expect("auto-register proto schema");
+
+    // Build a RecordBatch and encode via our helper.
+    let arrow_schema = Arc::new(ArrowSchema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("label", DataType::Utf8, false),
+    ]));
+    let batch = arrow_array::RecordBatch::try_new(
+        arrow_schema,
+        vec![
+            Arc::new(Int64Array::from(vec![10_i64, 20, 30])),
+            Arc::new(StringArray::from(vec!["alpha", "beta", "gamma"])),
+        ],
+    )
+    .unwrap();
+
+    let payloads = encode_batch_as_protobuf(&batch, topic, &sr_url)
+        .await
+        .expect("encode_batch_as_protobuf");
+    assert_eq!(payloads.len(), 3);
+    for p in &payloads {
+        assert!(p.len() > 5, "payload too short: {p:?}");
+        assert_eq!(p[0], 0x00, "missing magic byte: {p:?}");
+    }
+
+    // Decode round-trip.
+    let batches = decode_payloads_as_protobuf(payloads, &sr_url)
+        .await
+        .expect("decode_payloads_as_protobuf");
+    let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total, 3);
+    let mut ids: Vec<i64> = Vec::new();
+    let mut labels: Vec<String> = Vec::new();
+    for b in &batches {
+        let id_col = b
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let lb_col = b
+            .column_by_name("label")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        for i in 0..b.num_rows() {
+            ids.push(id_col.value(i));
+            labels.push(lb_col.value(i).to_string());
+        }
+    }
+    ids.sort_unstable();
+    assert_eq!(ids, vec![10, 20, 30]);
+    assert!(labels.contains(&"alpha".to_string()));
+    assert!(labels.contains(&"beta".to_string()));
+    assert!(labels.contains(&"gamma".to_string()));
+}
