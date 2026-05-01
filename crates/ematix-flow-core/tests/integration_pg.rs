@@ -4895,6 +4895,132 @@ async fn pubsub_write_then_read_round_trip() {
     assert!(labels.contains(&"gamma".to_string()));
 }
 
+/// Phase 37b.3: drain a subscription without calling
+/// `commit_offsets()`, drop the backend, then re-consume from a
+/// fresh backend. The broker should re-deliver the same messages
+/// because we never acked them. After commit_offsets, a third
+/// consumer should see an empty subscription. Mirrors the RabbitMQ
+/// at-least-once test from 37a.3.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker; run with `cargo test -- --ignored`"]
+async fn pubsub_unacked_messages_redeliver_on_consumer_replace() {
+    use arrow_array::Int64Array;
+    use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+    use ematix_flow_core::backend::WriteMode;
+    use ematix_flow_core::pubsub_backend::PubSubBatchConfig;
+
+    let (_container, endpoint) = start_pubsub_emulator().await;
+    let project = "ematix-test-project";
+    let topic = "redeliver-topic";
+    let subscription = "redeliver-sub";
+    pubsub_create_topic_and_subscription(&endpoint, project, topic, subscription).await;
+
+    // Produce 4 rows.
+    let producer = PubSubBackend::open(project)
+        .unwrap()
+        .with_endpoint(endpoint.clone())
+        .with_anonymous_auth();
+    let arrow_schema = Arc::new(ArrowSchema::new(vec![Field::new(
+        "id",
+        DataType::Int64,
+        false,
+    )]));
+    let batch = arrow_array::RecordBatch::try_new(
+        arrow_schema,
+        vec![Arc::new(Int64Array::from(vec![1_i64, 2, 3, 4]))],
+    )
+    .unwrap();
+    let target = ematix_flow_core::backend::TargetTable {
+        schema: "".into(),
+        name: topic.into(),
+    };
+    let stream: ematix_flow_core::backend::ArrowBatchStream =
+        Box::pin(futures_util::stream::once(async move {
+            Ok::<_, ematix_flow_core::BackendError>(batch)
+        }));
+    let n = producer
+        .write_arrow_stream(&target, stream, WriteMode::Append)
+        .await
+        .unwrap();
+    assert_eq!(n, 4);
+
+    // First consumer: drain but DON'T commit. Drop without ack →
+    // Handler::Drop nacks → broker redelivers.
+    {
+        let consumer = PubSubBackend::open(project)
+            .unwrap()
+            .with_endpoint(endpoint.clone())
+            .with_anonymous_auth()
+            .with_batch_config(PubSubBatchConfig {
+                batch_size: 100,
+                batch_bytes: 1 << 20,
+                idle_timeout_ms: 5_000,
+            });
+        let stream = consumer.read_arrow_stream(subscription).await.unwrap();
+        let batches: Vec<_> = stream.try_collect().await.unwrap();
+        let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, 4, "first drain saw all 4 rows");
+        assert_eq!(
+            consumer.pending_handler_count().await,
+            4,
+            "expected 4 retained handlers"
+        );
+        // Drop without committing.
+    }
+
+    // Give the broker a beat to detect the drop + reclaim.
+    tokio::time::sleep(StdDuration::from_millis(500)).await;
+
+    // Second consumer should see all 4 rows again.
+    let consumer2 = PubSubBackend::open(project)
+        .unwrap()
+        .with_endpoint(endpoint.clone())
+        .with_anonymous_auth()
+        .with_batch_config(PubSubBatchConfig {
+            batch_size: 100,
+            batch_bytes: 1 << 20,
+            idle_timeout_ms: 5_000,
+        });
+    let stream = consumer2.read_arrow_stream(subscription).await.unwrap();
+    let batches: Vec<_> = stream.try_collect().await.unwrap();
+    let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(
+        total, 4,
+        "redelivery: second consumer should see all 4 rows again, got {total}"
+    );
+
+    // This time, commit. Then a third consumer should see nothing.
+    consumer2.commit_offsets().await.unwrap();
+    assert_eq!(consumer2.pending_handler_count().await, 0);
+
+    // The Pub/Sub SDK's ack is fire-and-forget on an internal
+    // channel; give the lease loop a moment to flush to the broker.
+    tokio::time::sleep(StdDuration::from_millis(1_000)).await;
+
+    // Drop consumer2 explicitly so its lease loop fully shuts down
+    // before consumer3 starts, otherwise both can compete for any
+    // remaining outstanding lease.
+    drop(consumer2);
+    tokio::time::sleep(StdDuration::from_millis(500)).await;
+
+    let consumer3 = PubSubBackend::open(project)
+        .unwrap()
+        .with_endpoint(endpoint)
+        .with_anonymous_auth()
+        .with_batch_config(PubSubBatchConfig {
+            batch_size: 100,
+            batch_bytes: 1 << 20,
+            idle_timeout_ms: 2_000,
+        });
+    let stream = consumer3.read_arrow_stream(subscription).await.unwrap();
+    let batches: Vec<_> = stream.try_collect().await.unwrap();
+    let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(
+        total, 0,
+        "after commit_offsets the subscription should be empty; got {total}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs Docker; run with `cargo test -- --ignored`"]
 async fn pubsub_read_empty_subscription_returns_empty_stream() {

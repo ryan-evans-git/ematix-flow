@@ -39,18 +39,32 @@
 //!     directly).
 //!   - `WriteMode::Truncate` is rejected — Pub/Sub topics are
 //!     append-only; purging is an admin-API operation.
-//!   - Auto-ack: each delivery is acked at receive time. Manual ack
-//!     with at-least-once semantics lands in 37b.3 — the Handler
-//!     returned by the SDK already nacks-on-drop, so 37b.3 will
-//!     simply hold the handlers in a session and call `ack()` from
-//!     `commit_offsets()`.
+//!
+//! ## What 37b.3 adds (manual ack + at-least-once)
+//!   - Persistent consumer session: `Subscriber` + `MessageStream` +
+//!     `Vec<Handler>` are held in a Mutex on the backend and reused
+//!     across `read_arrow_stream` calls. The `Handler` type returned
+//!     by the SDK nacks-on-drop, so retaining handlers is the
+//!     mechanism by which deliveries stay leased to us until we ack.
+//!     Dropping the `MessageStream` also tears down the lease loop
+//!     that re-extends ack-deadlines, so the session keeps it alive.
+//!   - `read_arrow_stream` no longer auto-acks. It pushes each
+//!     delivery's `Handler` onto the session's pending list.
+//!   - `commit_offsets()` drains the held handlers and calls
+//!     `Handler::ack()` on each — fire-and-forget against the SDK's
+//!     internal ack channel; the lease loop flushes them
+//!     server-side. Mirrors Kafka 36e / RabbitMQ 37a.3.
+//!   - Single-subscription-per-backend constraint: the first
+//!     `read_arrow_stream` call binds the session; subsequent calls
+//!     must target the same subscription. Multi-subscription fanout
+//!     would need separate `PubSubBackend` instances.
 //!
 //! ## What lands in 37b.x
-//!   - 37b.3 — manual ack with at-least-once delivery semantics.
 //!   - 37b.4 — DLQ via the Pub/Sub-native dead-letter-policy
-//!     attached at subscription declaration time + `nack` on
-//!     pull deliveries.
+//!     attached at subscription declaration time + `nack_pending()`
+//!     to drop currently-leased deliveries to the DLT topic.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -59,6 +73,9 @@ use google_cloud_auth::credentials::Credentials;
 use google_cloud_auth::credentials::anonymous::Builder as AnonymousAuthBuilder;
 use google_cloud_pubsub::client::{Publisher, Subscriber, TopicAdmin};
 use google_cloud_pubsub::model::Message;
+use google_cloud_pubsub::subscriber::MessageStream;
+use google_cloud_pubsub::subscriber::handler::Handler;
+use tokio::sync::Mutex;
 
 use crate::backend::{
     ArrowBatchStream, Backend, BackendError, DeleteHandling, Dialect, StrategyRunResult,
@@ -93,13 +110,43 @@ impl Default for PubSubBatchConfig {
     }
 }
 
+/// Persistent consumer session held across `read_arrow_stream`
+/// calls.
+///
+/// Three things must stay alive together for manual ack to work:
+///   - the `MessageStream` (its lease loop re-extends ack-deadlines
+///     on the messages we haven't acked yet),
+///   - the `Vec<Handler>` (each `Handler` nacks on drop, so dropping
+///     them all without acking would force re-delivery),
+///   - the bound subscription name (so subsequent calls can be
+///     validated against the original binding).
+struct PubSubConsumerSession {
+    /// The streaming-pull message stream. Held to keep the lease
+    /// loop alive between drains.
+    stream: MessageStream,
+    /// Handlers for delivered-but-not-acked messages. Drained by
+    /// `commit_offsets()` (each `Handler::ack()` consumes the handle).
+    pending_handlers: Vec<Handler>,
+    /// Subscription name (the fully-qualified
+    /// `projects/.../subscriptions/...`) bound on first call.
+    subscription: String,
+}
+
+impl std::fmt::Debug for PubSubConsumerSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PubSubConsumerSession")
+            .field("subscription", &self.subscription)
+            .field("pending_handlers", &self.pending_handlers.len())
+            .finish_non_exhaustive()
+    }
+}
+
 /// GCP Pub/Sub-backed implementation of `Backend`.
 ///
 /// Holds the project_id + optional endpoint + optional anonymous
-/// auth flag. Each per-op gRPC client is built lazily from these
-/// — matches the "config holder" pattern every other Backend in
-/// the framework uses.
-#[derive(Debug, Clone)]
+/// auth flag, plus a lazily-initialized consumer session. The
+/// session keeps the AMQP-style ack discipline working: handlers
+/// are retained until `commit_offsets()` drains them.
 pub struct PubSubBackend {
     /// GCP project id (the bare id, not the fully-qualified
     /// `projects/<id>` form). The framework constructs the
@@ -115,6 +162,21 @@ pub struct PubSubBackend {
     /// Per-call drain limits for `read_arrow_stream`. Builder-set
     /// via `with_batch_config`.
     batch_config: PubSubBatchConfig,
+    /// Lazy consumer session. Populated on first
+    /// `read_arrow_stream`; reused on subsequent calls and
+    /// `commit_offsets`.
+    consumer_session: Arc<Mutex<Option<PubSubConsumerSession>>>,
+}
+
+impl std::fmt::Debug for PubSubBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PubSubBackend")
+            .field("project_id", &self.project_id)
+            .field("endpoint", &self.endpoint)
+            .field("anonymous_auth", &self.anonymous_auth)
+            .field("batch_config", &self.batch_config)
+            .finish_non_exhaustive()
+    }
 }
 
 impl PubSubBackend {
@@ -133,7 +195,20 @@ impl PubSubBackend {
             endpoint: None,
             anonymous_auth: false,
             batch_config: PubSubBatchConfig::default(),
+            consumer_session: Arc::new(Mutex::new(None)),
         })
+    }
+
+    /// Test/observability hook: number of unacked deliveries
+    /// retained in the consumer session. Returns 0 when no session
+    /// has been opened.
+    pub async fn pending_handler_count(&self) -> usize {
+        self.consumer_session
+            .lock()
+            .await
+            .as_ref()
+            .map(|s| s.pending_handlers.len())
+            .unwrap_or(0)
     }
 
     /// Override the per-call drain limits used by `read_arrow_stream`.
@@ -235,6 +310,23 @@ impl PubSubBackend {
             .map_err(|e| BackendError::Connection(format!("pubsub Publisher build: {e}")))
     }
 
+    /// Open the persistent consumer session: build a `Subscriber`,
+    /// start a streaming pull on `subscription_name`, and wrap them
+    /// in a `PubSubConsumerSession` ready to retain handlers across
+    /// drains. Called lazily on first `read_arrow_stream`.
+    async fn open_consumer_session(
+        &self,
+        subscription_name: &str,
+    ) -> Result<PubSubConsumerSession, BackendError> {
+        let client = self.subscriber_client().await?;
+        let stream = client.subscribe(subscription_name.to_string()).build();
+        Ok(PubSubConsumerSession {
+            stream,
+            pending_handlers: Vec::new(),
+            subscription: subscription_name.to_string(),
+        })
+    }
+
     /// Qualify a bare subscription name with this backend's
     /// project_id. If the input already starts with `projects/`,
     /// pass it through unchanged.
@@ -333,12 +425,18 @@ impl Backend for PubSubBackend {
     /// Returns an empty stream if the subscription has no pending
     /// messages (idle timeout fires immediately).
     ///
-    /// Limits in 37b.2 — folded out in later sub-phases:
+    /// Acks are deferred. Each delivery's `Handler` is retained on
+    /// the persistent consumer session and acked when
+    /// `commit_offsets()` fires — which the streaming pipeline
+    /// triggers after the target backend has durably written. This
+    /// is the at-least-once primitive that mirrors Kafka 36e and
+    /// RabbitMQ 37a.3.
+    ///
+    /// Limits in 37b.3 — folded out in later sub-phases:
     ///   - JSON-only payload decode.
-    ///   - Auto-ack: each delivery is acked at receive time.
-    ///     37b.3 adds manual ack via `commit_offsets()`.
-    ///   - Single-shot drain: each call opens a fresh streaming
-    ///     pull and tears it down before returning.
+    ///   - Single subscription per backend instance: the first call
+    ///     wins the subscription binding; subsequent calls must
+    ///     target the same name.
     async fn read_arrow_stream(&self, query: &str) -> Result<ArrowBatchStream, BackendError> {
         let subscription = query.trim();
         if subscription.is_empty() {
@@ -350,22 +448,33 @@ impl Backend for PubSubBackend {
         }
         let subscription_name = self.qualify_subscription(subscription);
 
-        let client = self.subscriber_client().await?;
-        let mut stream = client.subscribe(subscription_name).build();
-
         let cfg = self.batch_config.clone();
+        let mut session_lock = self.consumer_session.lock().await;
+        if session_lock.is_none() {
+            *session_lock = Some(self.open_consumer_session(&subscription_name).await?);
+        }
+        let session = session_lock.as_mut().expect("session populated above");
+        if session.subscription != subscription_name {
+            return Err(BackendError::Other(format!(
+                "Pub/Sub read_arrow_stream: this backend instance is already \
+                 bound to subscription `{}`; multi-subscription fanout would \
+                 need separate PubSubBackend instances",
+                session.subscription
+            )));
+        }
+
         let idle = Duration::from_millis(cfg.idle_timeout_ms);
         let mut payloads: Vec<Vec<u8>> = Vec::new();
         let mut bytes_total: usize = 0;
         loop {
-            match tokio::time::timeout(idle, stream.next()).await {
+            match tokio::time::timeout(idle, session.stream.next()).await {
                 Ok(Some(Ok((message, handler)))) => {
                     bytes_total += message.data.len();
                     payloads.push(message.data.to_vec());
-                    // 37b.2: auto-ack at receive time. 37b.3 will
-                    // hold these in a session and ack from
-                    // commit_offsets() instead.
-                    handler.ack();
+                    // Retain the handler so the message stays leased
+                    // until commit_offsets() fires (or the backend
+                    // drops, in which case Handler::Drop nacks).
+                    session.pending_handlers.push(handler);
                     if payloads.len() >= cfg.batch_size || bytes_total >= cfg.batch_bytes {
                         break;
                     }
@@ -374,15 +483,13 @@ impl Backend for PubSubBackend {
                     return Err(BackendError::Query(format!("pubsub stream error: {e}")));
                 }
                 // None = end-of-stream (the SDK keeps the stream
-                // open in practice, so this is rare). Err = idle
-                // timeout — flush.
+                // open in practice). Err = idle timeout — flush.
                 Ok(None) | Err(_) => break,
             }
         }
-        // Drop the stream → drops the lease loop. Any acks queued
-        // before drop should fire before the loop's UnboundedSender
-        // is closed.
-        drop(stream);
+        // Drop the lock before decoding so a concurrent
+        // commit_offsets call doesn't wait on JSON parsing.
+        drop(session_lock);
 
         if payloads.is_empty() {
             let stream = futures_util::stream::empty();
@@ -561,6 +668,23 @@ impl Backend for PubSubBackend {
              as the SCD2 target"
                 .into(),
         ))
+    }
+
+    /// Drain the consumer session's retained handlers, calling
+    /// `Handler::ack()` on each. The SDK queues each ack on the
+    /// lease loop's internal channel — fire-and-forget; the lease
+    /// loop flushes them server-side. No-op if no consumer session
+    /// has been opened or no handlers are pending.
+    async fn commit_offsets(&self) -> Result<(), BackendError> {
+        let mut session_lock = self.consumer_session.lock().await;
+        let Some(session) = session_lock.as_mut() else {
+            return Ok(());
+        };
+        let drained = std::mem::take(&mut session.pending_handlers);
+        for h in drained {
+            h.ack();
+        }
+        Ok(())
     }
 }
 
@@ -795,6 +919,16 @@ mod tests {
             .unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("source_backend is required"), "got: {msg}");
+    }
+
+    /// 37b.3: commit_offsets is a no-op before any consumer
+    /// session has been opened. Lets pipelines call it
+    /// unconditionally.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn commit_offsets_noop_without_consumer_session() {
+        let b = PubSubBackend::open("p").unwrap();
+        b.commit_offsets().await.unwrap();
+        assert_eq!(b.pending_handler_count().await, 0);
     }
 
     #[tokio::test(flavor = "multi_thread")]
