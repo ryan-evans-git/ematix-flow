@@ -40,6 +40,8 @@ rdkafka = { workspace = true }
 aws-msk-iam-sasl-signer = { workspace = true }
 aws-types = { workspace = true }
 prometheus = { workspace = true }
+schema_registry_converter = { workspace = true }
+apache-avro = { workspace = true }
 
 [dev-dependencies]
 arrow-array.workspace = true

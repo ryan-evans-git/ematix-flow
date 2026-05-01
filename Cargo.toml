@@ -78,6 +78,15 @@ aws-types = "1"
 # Prometheus metrics (Phase 36i). Process-side counters for streaming
 # pipelines; exposed via a tiny built-in /metrics HTTP endpoint.
 prometheus = "0.14"
+# Confluent Schema Registry client (Phase 36h.3+). Pulls in the
+# avro codec via apache-avro and an http client (reqwest) for the
+# SR REST API. `easy` features the high-level decoder/encoder; we
+# use the async variant for tokio integration.
+schema_registry_converter = { version = "4.8", default-features = false, features = ["futures", "native_tls", "avro", "easy"] }
+# Apache Avro Value type + Schema; used by the Avro→JSON
+# converter that bridges decoded Avro values into our existing
+# arrow-json decode path.
+apache-avro = "0.21"
 # `url` is needed to construct deltalake's `Url` parameter; deltalake
 # doesn't re-export it. Already pulled in transitively, so this just
 # brings it into the workspace's direct namespace.

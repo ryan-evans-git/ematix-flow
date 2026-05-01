@@ -393,6 +393,11 @@ pub struct KafkaBackend {
     /// and same-`transactional.id` producers are mutually exclusive
     /// at the broker.
     producer_session: Arc<Mutex<ProducerSession>>,
+    /// Confluent Schema Registry URL (e.g. `http://localhost:8081`).
+    /// Required for `KafkaPayloadFormat::Avro` (Phase 36h.3) and
+    /// `Protobuf` (Phase 36h.5); ignored for JSON / RawBytes.
+    /// Builder-set via `with_schema_registry_url`.
+    schema_registry_url: Option<String>,
 }
 
 impl std::fmt::Debug for ConsumerSession {
@@ -430,7 +435,23 @@ impl KafkaBackend {
             payload_format: KafkaPayloadFormat::default(),
             delivery_semantics: KafkaDeliverySemantics::default(),
             producer_session: Arc::new(Mutex::new(ProducerSession::default())),
+            schema_registry_url: None,
         })
+    }
+
+    /// Configure the Confluent Schema Registry URL used for Avro
+    /// (36h.3) and Protobuf (36h.5) payload formats. The URL is the
+    /// SR REST endpoint, e.g. `http://localhost:8081` or
+    /// `https://psrc-xxxxx.us-east-2.aws.confluent.cloud`.
+    /// Authenticated SR (HTTP Basic) is a future-phase enhancement.
+    pub fn with_schema_registry_url(mut self, url: impl Into<String>) -> Self {
+        self.schema_registry_url = Some(url.into());
+        self
+    }
+
+    /// Borrow the configured Schema Registry URL.
+    pub fn schema_registry_url(&self) -> Option<&str> {
+        self.schema_registry_url.as_deref()
     }
 
     /// Override producer-side delivery semantics. Defaults to
@@ -1129,18 +1150,20 @@ impl Backend for KafkaBackend {
                 "Kafka read_arrow_stream: query argument must be a non-empty topic name".into(),
             ));
         }
-        // Reject unsupported payload formats *before* opening the
-        // consumer. Saves a broker round-trip + makes the error
-        // testable without Docker.
+        // Validate format-specific prerequisites *before* opening
+        // the consumer. Saves a broker round-trip + makes the
+        // rejection paths testable without Docker.
         match self.payload_format {
             KafkaPayloadFormat::Json | KafkaPayloadFormat::RawBytes => {}
             KafkaPayloadFormat::Avro => {
-                return Err(BackendError::Other(
-                    "Kafka read_arrow_stream Avro: surface reserved in 36h.2; \
-                     decode lands in Phase 36h.3 (Confluent Schema Registry \
-                     client + magic-byte framing + apache_avro::Value → Arrow)"
-                        .into(),
-                ));
+                if self.schema_registry_url.is_none() {
+                    return Err(BackendError::Other(
+                        "Kafka read_arrow_stream Avro: schema_registry_url is \
+                         required (call `with_schema_registry_url(...)` on the \
+                         backend before reading)"
+                            .into(),
+                    ));
+                }
             }
             KafkaPayloadFormat::Protobuf => {
                 return Err(BackendError::Other(
@@ -1185,13 +1208,18 @@ impl Backend for KafkaBackend {
         let batches = match self.payload_format {
             KafkaPayloadFormat::Json => decode_payloads_as_jsonl(payloads)?,
             KafkaPayloadFormat::RawBytes => decode_payloads_as_raw_bytes(payloads)?,
-            // Avro / Protobuf are rejected up-front (above), so this
-            // arm is unreachable in practice. The compiler enforces
-            // exhaustiveness; we route through unreachable!() to
-            // keep the format-dispatch readable without dragging
-            // duplicated error strings into two places.
-            KafkaPayloadFormat::Avro | KafkaPayloadFormat::Protobuf => {
-                unreachable!("Avro/Protobuf format rejected at read entry")
+            KafkaPayloadFormat::Avro => {
+                // schema_registry_url presence already validated above.
+                decode_payloads_as_avro(
+                    payloads,
+                    self.schema_registry_url.as_ref().expect("checked above"),
+                )
+                .await?
+            }
+            // Protobuf still rejected at entry; this arm is
+            // unreachable but kept for compiler exhaustiveness.
+            KafkaPayloadFormat::Protobuf => {
+                unreachable!("Protobuf format rejected at read entry")
             }
         };
         let stream = futures_util::stream::iter(batches.into_iter().map(Ok));
@@ -1673,6 +1701,100 @@ fn encode_batch_as_raw_bytes(batch: &RecordBatch) -> Result<Vec<Vec<u8>>, Backen
     Ok(out)
 }
 
+/// Decode a Vec of message payloads under `KafkaPayloadFormat::Avro`.
+/// Confluent wire format: `0x00` magic byte + 4-byte BE schema id +
+/// Avro single-object body. The schema is fetched from the Schema
+/// Registry by id (the SR client caches per-id internally so a hot
+/// topic only pays the lookup once).
+///
+/// Decoded `apache_avro::Value`s are converted to `serde_json::Value`
+/// and concatenated as JSONL bytes; we then route through the
+/// existing `decode_payloads_as_jsonl` path so Arrow schema
+/// inference + RecordBatch construction is shared with the JSON
+/// payload path. The trade-off: Avro `long` → Arrow Int64 (matches
+/// JSON path), but Avro Decimal / Fixed types lose strict typing
+/// (round-trip via stringification). Strict-typed Avro→Arrow with
+/// schema-driven Arrow builders is a follow-up.
+async fn decode_payloads_as_avro(
+    payloads: Vec<Vec<u8>>,
+    schema_registry_url: &str,
+) -> Result<Vec<RecordBatch>, BackendError> {
+    use schema_registry_converter::async_impl::easy_avro::EasyAvroDecoder;
+    use schema_registry_converter::async_impl::schema_registry::SrSettings;
+
+    let sr_settings = SrSettings::new(schema_registry_url.to_string());
+    let decoder = EasyAvroDecoder::new(sr_settings);
+
+    let mut json_payloads: Vec<Vec<u8>> = Vec::with_capacity(payloads.len());
+    for payload in payloads {
+        let decoded = decoder
+            .decode(Some(&payload))
+            .await
+            .map_err(|e| BackendError::Query(format!("kafka avro decode: {e}")))?;
+        let json = avro_value_to_json(&decoded.value);
+        let bytes = serde_json::to_vec(&json)
+            .map_err(|e| BackendError::Other(format!("avro→json serialize: {e}")))?;
+        json_payloads.push(bytes);
+    }
+    decode_payloads_as_jsonl(json_payloads)
+}
+
+/// Convert an `apache_avro::types::Value` into a `serde_json::Value`.
+/// Lossy on logical types: Decimal / Duration / Fixed become
+/// strings; date/time variants become numeric epoch counts; Records
+/// become JSON objects, Arrays become JSON arrays, Unions unwrap to
+/// their inner value (so a `union { null, X }` becomes null or X —
+/// the standard Avro nullable-field idiom). Strict logical-type
+/// preservation is a future-phase enhancement (would build
+/// per-type Arrow arrays directly rather than going through JSON).
+fn avro_value_to_json(value: &apache_avro::types::Value) -> serde_json::Value {
+    use apache_avro::types::Value as Av;
+    use serde_json::Value as Js;
+    use serde_json::json;
+
+    match value {
+        Av::Null => Js::Null,
+        Av::Boolean(b) => Js::Bool(*b),
+        Av::Int(i) => json!(*i),
+        Av::Long(i) => json!(*i),
+        Av::Float(f) => json!(*f),
+        Av::Double(f) => json!(*f),
+        Av::Bytes(b) | Av::Fixed(_, b) => {
+            // Lowercase hex — keeps the dep surface tight (no extra
+            // base64 crate). Users wanting canonical Avro JSON can
+            // post-process; the data is still recoverable.
+            Js::String(b.iter().map(|byte| format!("{:02x}", byte)).collect())
+        }
+        Av::String(s) | Av::Enum(_, s) => Js::String(s.clone()),
+        Av::Union(_idx, inner) => avro_value_to_json(inner),
+        Av::Array(items) => Js::Array(items.iter().map(avro_value_to_json).collect()),
+        Av::Map(m) => Js::Object(
+            m.iter()
+                .map(|(k, v)| (k.clone(), avro_value_to_json(v)))
+                .collect(),
+        ),
+        Av::Record(fields) => Js::Object(
+            fields
+                .iter()
+                .map(|(k, v)| (k.clone(), avro_value_to_json(v)))
+                .collect(),
+        ),
+        Av::Date(d) => json!(*d),
+        Av::Decimal(d) => Js::String(format!("{:?}", d)),
+        Av::TimeMillis(t) => json!(*t),
+        Av::TimeMicros(t) => json!(*t),
+        Av::TimestampMillis(t)
+        | Av::TimestampMicros(t)
+        | Av::TimestampNanos(t)
+        | Av::LocalTimestampMillis(t)
+        | Av::LocalTimestampMicros(t)
+        | Av::LocalTimestampNanos(t) => json!(*t),
+        Av::Duration(d) => Js::String(format!("{:?}", d)),
+        Av::Uuid(u) => Js::String(u.to_string()),
+        other => Js::String(format!("{:?}", other)),
+    }
+}
+
 /// Produce each `payload` to `topic` via `producer`, awaiting the
 /// broker ack per message. Returns the number of messages
 /// successfully produced. Used by both the `AtLeastOnce` (no
@@ -1957,16 +2079,63 @@ mod tests {
     // --- Phase 36h.2: Avro / Protobuf surface reserved --------------------
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn avro_read_rejects_with_pointer_to_36h_3() {
+    async fn avro_read_without_sr_url_rejects_with_pointer() {
         let b = KafkaBackend::open("localhost:9092", Some("g1"))
             .unwrap()
             .with_payload_format(KafkaPayloadFormat::Avro);
         let err = match b.read_arrow_stream("any-topic").await {
-            Ok(_) => panic!("expected Avro read rejection"),
+            Ok(_) => panic!("expected schema_registry_url rejection"),
             Err(e) => e,
         };
         let msg = err.to_string();
-        assert!(msg.contains("Phase 36h.3"), "got: {msg}");
+        assert!(
+            msg.contains("schema_registry_url"),
+            "expected SR URL rejection; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn with_schema_registry_url_records_the_url() {
+        let b = KafkaBackend::open("localhost:9092", Some("g1"))
+            .unwrap()
+            .with_payload_format(KafkaPayloadFormat::Avro)
+            .with_schema_registry_url("http://localhost:8081");
+        assert_eq!(b.schema_registry_url(), Some("http://localhost:8081"));
+        assert_eq!(b.payload_format(), KafkaPayloadFormat::Avro);
+    }
+
+    #[test]
+    fn avro_value_to_json_unwraps_nullable_union() {
+        // Avro union { null, string } → JSON null or string.
+        let null_union =
+            apache_avro::types::Value::Union(0, Box::new(apache_avro::types::Value::Null));
+        assert_eq!(avro_value_to_json(&null_union), serde_json::Value::Null);
+        let string_union = apache_avro::types::Value::Union(
+            1,
+            Box::new(apache_avro::types::Value::String("hi".into())),
+        );
+        assert_eq!(
+            avro_value_to_json(&string_union),
+            serde_json::Value::String("hi".into())
+        );
+    }
+
+    #[test]
+    fn avro_value_to_json_record_becomes_object() {
+        let record = apache_avro::types::Value::Record(vec![
+            ("id".into(), apache_avro::types::Value::Long(7)),
+            (
+                "name".into(),
+                apache_avro::types::Value::String("alice".into()),
+            ),
+        ]);
+        let js = avro_value_to_json(&record);
+        let obj = js.as_object().expect("record → object");
+        assert_eq!(obj.get("id"), Some(&serde_json::json!(7)));
+        assert_eq!(
+            obj.get("name"),
+            Some(&serde_json::Value::String("alice".into()))
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
