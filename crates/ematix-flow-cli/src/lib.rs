@@ -409,6 +409,14 @@ pub struct ConsumeOptions {
     /// Prometheus registry. The server shares the pipeline's
     /// shutdown signal so both stop together.
     pub metrics_port: Option<u16>,
+    /// Externally-provided shutdown signal. When `None`,
+    /// [`run_consume_with`] installs the default SIGTERM/SIGINT
+    /// handler. Tests + library callers that want to drive
+    /// shutdown programmatically (without sending real signals)
+    /// pass `Some(signal)`. Use [`ShutdownSignal::new`] to create
+    /// the pair and keep the trigger end alive for the duration
+    /// of the run.
+    pub shutdown_signal: Option<ShutdownSignal>,
 }
 
 /// Run a single pipeline to completion (until shutdown). Used by
@@ -433,10 +441,18 @@ pub async fn run_consume_with(
     let pipeline_cfg = config.streaming_config(target_table);
     let pipeline = StreamingPipeline::new(source, target, pipeline_cfg);
 
-    // install_shutdown_handler returns (signal, JoinHandle); the
-    // handle drops at the end of this function — fine, the signal
-    // task lives until SIGTERM/SIGINT or the runtime tears down.
-    let (shutdown, _shutdown_handle) = install_shutdown_handler();
+    // Pick a shutdown source. Tests + programmatic callers can
+    // pass an external signal via ConsumeOptions; otherwise we
+    // install the default SIGTERM/SIGINT handler. The signal-
+    // listening task's JoinHandle (when we install) drops at the
+    // end of this function — fine, the runtime tears it down.
+    let (shutdown, _shutdown_handle) = match options.shutdown_signal.clone() {
+        Some(signal) => (signal, None),
+        None => {
+            let (s, h) = install_shutdown_handler();
+            (s, Some(h))
+        }
+    };
 
     // Optional metrics server. We give it its own ShutdownSignal
     // pair so the pipeline's exit (success OR error) can stop the

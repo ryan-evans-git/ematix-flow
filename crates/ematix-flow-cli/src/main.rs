@@ -111,7 +111,12 @@ async fn run_consume_cmd(
         restart_on_error = policy.enabled,
         "starting pipeline"
     );
-    let options = ConsumeOptions { metrics_port };
+    let options = ConsumeOptions {
+        metrics_port,
+        // Binary path: install_shutdown_handler manages SIGTERM /
+        // SIGINT internally.
+        shutdown_signal: None,
+    };
     if policy.enabled {
         // Single SIGTERM/SIGINT signal shared by the supervisor
         // (to break out of backoff sleeps early) and by the
