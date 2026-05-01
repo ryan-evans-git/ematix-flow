@@ -4714,6 +4714,58 @@ async fn eos_pipeline_kafka_to_kafka_round_trip() {
     );
 }
 
+// ----- Phase 37a: RabbitMQBackend ping ---------------------------------
+
+use ematix_flow_core::RabbitMQBackend;
+use testcontainers_modules::rabbitmq::RabbitMq;
+
+async fn start_rabbitmq() -> (testcontainers::ContainerAsync<RabbitMq>, String) {
+    let container = RabbitMq::default()
+        .start()
+        .await
+        .expect("failed to start rabbitmq testcontainer");
+    let host = container
+        .get_host()
+        .await
+        .expect("failed to read rabbitmq host")
+        .to_string();
+    let port = container
+        .get_host_port_ipv4(5672)
+        .await
+        .expect("failed to read rabbitmq port");
+    let amqp_url = format!("amqp://{host}:{port}");
+    (container, amqp_url)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker; run with `cargo test -- --ignored`"]
+async fn rabbitmq_backend_ping_against_official_image() {
+    let (_container, amqp_url) = start_rabbitmq().await;
+    let backend = RabbitMQBackend::open(&amqp_url).unwrap();
+    backend.ping().await.unwrap();
+    assert!(matches!(
+        backend.dialect(),
+        ematix_flow_core::backend::Dialect::Streaming { .. }
+    ));
+    let info = backend.connection_info();
+    // Default URL has no userinfo → "anonymous".
+    assert_eq!(info.user, "anonymous");
+    assert_eq!(info.dbname, amqp_url);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker; run with `cargo test -- --ignored`"]
+async fn rabbitmq_backend_ping_with_default_credentials() {
+    let (_container, base_url) = start_rabbitmq().await;
+    // Inject the default `guest:guest` credentials. The official
+    // image accepts these for localhost connections.
+    let amqp_url = base_url.replace("amqp://", "amqp://guest:guest@");
+    let backend = RabbitMQBackend::open(&amqp_url).unwrap();
+    backend.ping().await.unwrap();
+    let info = backend.connection_info();
+    assert_eq!(info.user, "guest");
+}
+
 // ----- Phase 36h.3.1: live Confluent Schema Registry round-trip ---------
 //
 // Spins up Apicurio's in-memory Confluent-compat Schema Registry

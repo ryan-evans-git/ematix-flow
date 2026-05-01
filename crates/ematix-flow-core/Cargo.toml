@@ -43,6 +43,7 @@ prometheus = { workspace = true }
 schema_registry_converter = { workspace = true }
 apache-avro = { workspace = true }
 protofish = { workspace = true }
+lapin = { workspace = true }
 
 [dev-dependencies]
 arrow-array.workspace = true
