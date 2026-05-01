@@ -3434,3 +3434,174 @@ async fn cross_backend_mysql_to_pg_arrow() {
         .unwrap();
     assert_eq!(count, 2);
 }
+
+// ----- Phase 34e: ObjectStore on S3 / MinIO -----------------------------
+
+use ematix_flow_core::ObjectStoreBackend;
+use ematix_flow_core::backend::ObjectFormat;
+use testcontainers::core::ExecCommand;
+use testcontainers_modules::minio::MinIO;
+
+const MINIO_ACCESS_KEY: &str = "minioadmin";
+const MINIO_SECRET_KEY: &str = "minioadmin";
+const MINIO_REGION: &str = "us-east-1";
+
+/// Start a MinIO container with a pre-created bucket. Returns the
+/// container guard (drop = stop), endpoint URL, and bucket name. The
+/// bucket is created by `mkdir -p /data/<bucket>` inside the container
+/// — minio's filesystem layout maps directories under `/data` to
+/// buckets, so this is the cheapest "CreateBucket" we can do without
+/// pulling in `aws-sdk-s3` for tests.
+async fn start_minio_with_bucket(bucket: &str) -> (testcontainers::ContainerAsync<MinIO>, String) {
+    let container = MinIO::default()
+        .start()
+        .await
+        .expect("failed to start minio testcontainer");
+    container
+        .exec(ExecCommand::new([
+            "mkdir",
+            "-p",
+            &format!("/data/{bucket}"),
+        ]))
+        .await
+        .expect("failed to mkdir bucket inside minio container");
+    let host = container
+        .get_host()
+        .await
+        .expect("failed to read host")
+        .to_string();
+    let port = container
+        .get_host_port_ipv4(9000)
+        .await
+        .expect("failed to read port");
+    let endpoint = format!("http://{host}:{port}");
+    (container, endpoint)
+}
+
+async fn minio_round_trip(format: ObjectFormat, bucket: &str) {
+    use arrow_array::{Int64Array, RecordBatch as RB, StringArray};
+    use arrow_schema::{DataType as Dt, Field as F, Schema as S};
+    use std::sync::Arc as A;
+
+    let (_container, endpoint) = start_minio_with_bucket(bucket).await;
+    let backend = ObjectStoreBackend::open_s3(
+        &endpoint,
+        bucket,
+        MINIO_REGION,
+        MINIO_ACCESS_KEY,
+        MINIO_SECRET_KEY,
+        format,
+    )
+    .unwrap();
+    backend.ping().await.unwrap();
+
+    let schema = A::new(S::new(vec![
+        F::new("id", Dt::Int64, true),
+        F::new("name", Dt::Utf8, true),
+    ]));
+    let batch = RB::try_new(
+        schema,
+        vec![
+            A::new(Int64Array::from(vec![1, 2, 3])),
+            A::new(StringArray::from(vec!["alice", "bob", "carol"])),
+        ],
+    )
+    .unwrap();
+    let stream = futures_util::stream::once(async move { Ok::<_, _>(batch) });
+    let stream: ematix_flow_core::backend::ArrowBatchStream = Box::pin(stream);
+
+    let target = TargetTable {
+        schema: "raw".into(),
+        name: "events".into(),
+    };
+    let n = backend
+        .write_arrow_stream(&target, stream, WriteMode::Append)
+        .await
+        .unwrap();
+    assert_eq!(n, 3, "wrote 3 rows on {format:?}");
+
+    let stream = backend.read_arrow_stream("raw/events").await.unwrap();
+    let batches: Vec<_> = stream.try_collect().await.unwrap();
+    let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total, 3, "round-tripped 3 rows on {format:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker; run with `cargo test -- --ignored`"]
+async fn minio_parquet_round_trip() {
+    minio_round_trip(ObjectFormat::Parquet, "test-parquet").await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker; run with `cargo test -- --ignored`"]
+async fn minio_csv_round_trip() {
+    minio_round_trip(ObjectFormat::Csv, "test-csv").await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker; run with `cargo test -- --ignored`"]
+async fn minio_jsonl_round_trip() {
+    minio_round_trip(ObjectFormat::JsonLines, "test-jsonl").await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker; run with `cargo test -- --ignored`"]
+async fn minio_orc_round_trip() {
+    minio_round_trip(ObjectFormat::Orc, "test-orc").await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker; run with `cargo test -- --ignored`"]
+async fn minio_truncate_clears_prefix() {
+    use arrow_array::{Int64Array, RecordBatch as RB, StringArray};
+    use arrow_schema::{DataType as Dt, Field as F, Schema as S};
+    use std::sync::Arc as A;
+
+    let (_c, endpoint) = start_minio_with_bucket("test-trunc").await;
+    let backend = ObjectStoreBackend::open_s3(
+        &endpoint,
+        "test-trunc",
+        MINIO_REGION,
+        MINIO_ACCESS_KEY,
+        MINIO_SECRET_KEY,
+        ObjectFormat::Parquet,
+    )
+    .unwrap();
+    let target = TargetTable {
+        schema: "raw".into(),
+        name: "events".into(),
+    };
+    let make_stream = || {
+        let schema = A::new(S::new(vec![
+            F::new("id", Dt::Int64, true),
+            F::new("name", Dt::Utf8, true),
+        ]));
+        let batch = RB::try_new(
+            schema,
+            vec![
+                A::new(Int64Array::from(vec![1, 2, 3])),
+                A::new(StringArray::from(vec!["a", "b", "c"])),
+            ],
+        )
+        .unwrap();
+        let s = futures_util::stream::once(async move { Ok::<_, _>(batch) });
+        let s: ematix_flow_core::backend::ArrowBatchStream = Box::pin(s);
+        s
+    };
+    backend
+        .write_arrow_stream(&target, make_stream(), WriteMode::Append)
+        .await
+        .unwrap();
+    backend
+        .write_arrow_stream(&target, make_stream(), WriteMode::Append)
+        .await
+        .unwrap();
+    backend
+        .write_arrow_stream(&target, make_stream(), WriteMode::Truncate)
+        .await
+        .unwrap();
+    let stream = backend.read_arrow_stream("raw/events").await.unwrap();
+    let batches: Vec<_> = stream.try_collect().await.unwrap();
+    let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total, 3, "old files removed by truncate on MinIO");
+}

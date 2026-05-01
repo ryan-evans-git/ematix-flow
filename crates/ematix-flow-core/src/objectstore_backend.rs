@@ -30,6 +30,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::StreamExt;
 use object_store::ObjectStore;
+use object_store::aws::AmazonS3Builder;
 use object_store::local::LocalFileSystem;
 use object_store::path::Path as ObjectPath;
 use parquet::arrow::AsyncArrowWriter;
@@ -90,6 +91,46 @@ impl ObjectStoreBackend {
 
     pub fn format(&self) -> ObjectFormat {
         self.format
+    }
+
+    /// Open an S3-backed store. `endpoint` is the full URL including
+    /// scheme (e.g. `http://localhost:9000` for MinIO,
+    /// `https://s3.amazonaws.com` for real AWS — but real-AWS users
+    /// usually leave endpoint empty and rely on region).
+    ///
+    /// HTTP endpoints (i.e. local MinIO) are allowed by enabling
+    /// `with_allow_http(true)` whenever the scheme is `http://`. AWS
+    /// itself only ever uses HTTPS.
+    ///
+    /// The bucket must already exist — `object_store` has no
+    /// `CreateBucket` primitive on the trait. Tests using MinIO can
+    /// create the bucket via `docker exec mkdir -p /data/<bucket>`.
+    pub fn open_s3(
+        endpoint: &str,
+        bucket: &str,
+        region: &str,
+        access_key: &str,
+        secret_key: &str,
+        format: ObjectFormat,
+    ) -> Result<Self, BackendError> {
+        let mut builder = AmazonS3Builder::new()
+            .with_endpoint(endpoint)
+            .with_bucket_name(bucket)
+            .with_region(region)
+            .with_access_key_id(access_key)
+            .with_secret_access_key(secret_key);
+        if endpoint.starts_with("http://") {
+            builder = builder.with_allow_http(true);
+        }
+        let s3 = builder
+            .build()
+            .map_err(|e| BackendError::Connection(format!("s3 build: {e}")))?;
+        Ok(Self {
+            store: Arc::new(s3),
+            format,
+            dsn: format!("s3://{bucket}@{endpoint}"),
+            base_label: format!("s3://{bucket}"),
+        })
     }
 }
 
