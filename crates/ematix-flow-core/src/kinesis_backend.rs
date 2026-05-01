@@ -45,22 +45,48 @@
 //!   - `WriteMode::Truncate` is rejected — Kinesis streams are
 //!     append-only; purging is an admin-API operation.
 //!
-//! ### Single-shard limit in 37c.2
-//! 37c.2 reads only the **first shard** returned by `ListShards`.
-//! Multi-shard fanout (parallel-drain across shards, merge into
-//! one stream) lands in 37c.3 alongside per-shard sequence-number
-//! checkpointing. Most LocalStack/dev streams are single-shard so
-//! this restriction doesn't bite the integration test; production
-//! callers that need multi-shard wait for 37c.3.
+//! ## What 37c.3 adds (multi-shard + checkpoints)
+//!   - Multi-shard fanout: `read_arrow_stream` drains **every**
+//!     shard returned by `ListShards`, not just the first. Each
+//!     shard gets its own `ShardCursor` (current iterator + pending
+//!     and committed sequence numbers).
+//!   - Per-shard sequence-number tracking. As records are pulled
+//!     the cursor's `pending_sequence_number` updates to the
+//!     highest seen.
+//!   - `commit_offsets()` (the `Backend`-trait hook used by the
+//!     streaming pipeline) advances each shard's
+//!     `committed_sequence_number = pending_sequence_number`. No
+//!     broker round-trip — Kinesis has no native checkpoint API,
+//!     so the framework manages it.
+//!   - `reset_to_committed_offsets()` invalidates the in-memory
+//!     iterators so the next `read_arrow_stream` rebuilds each
+//!     iterator via `AFTER_SEQUENCE_NUMBER` from the committed
+//!     position. This is the analog of "process restart from the
+//!     last commit" within a single backend lifetime.
 //!
-//! ## What lands in 37c.x
-//!   - 37c.3 — multi-shard fanout + sequence-number checkpoints
-//!     (manual ack equivalent). Track the highest sequence-number
-//!     per shard; `commit_offsets` advances a durable position so
-//!     restart resumes at the committed checkpoint instead of
-//!     `TRIM_HORIZON`.
-//!   - 37c.4 — DLQ via the streaming pipeline's app-level pattern
-//!     (the existing `write_arrow_stream` already supports it; just
+//! ### Manual-ack semantics (mirrors RabbitMQ 37a.3 / Pub/Sub 37b.3)
+//!
+//! Producer perspective:
+//!
+//! 1. read_arrow_stream → returns records, advances pending
+//! 2. process records (write to target)
+//! 3. On success: commit_offsets → pending → committed
+//! 4. On failure: reset_to_committed_offsets → next read re-bootstraps
+//!    from committed and re-delivers.
+//!
+//! ### What's still open
+//! Checkpoint state is **in-memory only**. If the backend drops
+//! without commit, the next process starts from `TRIM_HORIZON`
+//! (or wherever a fresh `KinesisBackend::open` would). Durable
+//! checkpoint storage (DynamoDB / file) is a documented follow-up;
+//! the streaming-pipeline-level contract still holds because the
+//! pipeline calls `commit_offsets` after every successful target
+//! write, and the framework's at-least-once guarantee is "no
+//! commit before durable target write".
+//!
+//! ## What lands in 37c.4
+//!   - DLQ via the streaming pipeline's app-level pattern (the
+//!     existing `write_arrow_stream` already supports it; just
 //!     point `dlq_target` at a separate Kinesis stream).
 //!
 //! ## Why a stream-bound constructor
@@ -71,6 +97,7 @@
 //! need to re-thread the name through every call. Cross-stream
 //! pipelines instantiate one `KinesisBackend` per stream.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -124,24 +151,40 @@ impl Default for KinesisBatchConfig {
     }
 }
 
-/// Persistent consumer session. Holds the current shard iterator so
-/// successive `read_arrow_stream` calls advance through the stream
-/// rather than re-reading from `TRIM_HORIZON` each time.
+/// Per-shard cursor state held in the consumer session.
+///
+/// Tracks three sequence-number-related slots:
+///   - `next_iterator` — the SDK's opaque iterator for the next
+///     `GetRecords` call. `None` means "rebuild from
+///     `committed_sequence_number` on the next read".
+///   - `pending_sequence_number` — highest sequence number observed
+///     since the last commit. Advances on every `GetRecords` that
+///     returns records.
+///   - `committed_sequence_number` — last committed checkpoint.
+///     Updated only by `commit_offsets`. Used to bootstrap a fresh
+///     iterator (via `AFTER_SEQUENCE_NUMBER`) when `next_iterator`
+///     is `None`.
+#[derive(Debug, Clone, Default)]
+struct ShardCursor {
+    next_iterator: Option<String>,
+    pending_sequence_number: Option<String>,
+    committed_sequence_number: Option<String>,
+}
+
+/// Persistent consumer session. Holds one cursor per shard so
+/// successive `read_arrow_stream` calls drain the whole stream and
+/// `commit_offsets` advances per-shard checkpoints.
 struct KinesisConsumerSession {
-    /// Shard the session is bound to. 37c.2 binds to the first shard
-    /// in `ListShards`; multi-shard fanout lands in 37c.3.
-    shard_id: String,
-    /// Current iterator. `None` means the shard has been read to
-    /// the end (rare for long-lived streams). Updated after each
-    /// `GetRecords` response.
-    next_shard_iterator: Option<String>,
+    /// `BTreeMap` for deterministic iteration order across shards
+    /// (lets the test assertions stay stable regardless of which
+    /// shard a record landed on).
+    cursors: BTreeMap<String, ShardCursor>,
 }
 
 impl std::fmt::Debug for KinesisConsumerSession {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("KinesisConsumerSession")
-            .field("shard_id", &self.shard_id)
-            .field("has_iterator", &self.next_shard_iterator.is_some())
+            .field("shard_count", &self.cursors.len())
             .finish_non_exhaustive()
     }
 }
@@ -282,6 +325,49 @@ impl KinesisBackend {
     /// shards, pick the first one, and request a `TRIM_HORIZON`
     /// shard iterator for it. The iterator will be auto-advanced
     /// across `read_arrow_stream` calls.
+    /// Phase 37c.3: number of shards with pending (uncommitted)
+    /// sequence numbers. Observability hook for tests + the
+    /// streaming pipeline. Returns 0 when no session has been
+    /// opened or every shard has been fully committed.
+    pub async fn pending_sequence_count(&self) -> usize {
+        self.consumer_session
+            .lock()
+            .await
+            .as_ref()
+            .map(|s| {
+                s.cursors
+                    .values()
+                    .filter(|c| c.pending_sequence_number.is_some())
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
+    /// Phase 37c.3: invalidate every shard's in-memory iterator and
+    /// drop pending (uncommitted) sequence numbers. The next
+    /// `read_arrow_stream` will rebuild iterators from the
+    /// committed checkpoint via `AFTER_SEQUENCE_NUMBER` (or
+    /// `TRIM_HORIZON` if the shard has never been committed).
+    ///
+    /// This is the analog of "process restart from the last commit"
+    /// within a single backend lifetime — handy for retry loops in
+    /// the streaming pipeline when the target write fails.
+    /// No-op if no session has been opened.
+    pub async fn reset_to_committed_offsets(&self) -> Result<(), BackendError> {
+        let mut session_lock = self.consumer_session.lock().await;
+        let Some(session) = session_lock.as_mut() else {
+            return Ok(());
+        };
+        for cursor in session.cursors.values_mut() {
+            cursor.next_iterator = None;
+            cursor.pending_sequence_number = None;
+        }
+        Ok(())
+    }
+
+    /// Open the persistent consumer session: list every shard in
+    /// the stream and create an empty `ShardCursor` for each (no
+    /// iterator yet — bootstrapped lazily on first read).
     async fn open_consumer_session(
         &self,
         client: &Client,
@@ -293,25 +379,43 @@ impl KinesisBackend {
             .await
             .map_err(|e| BackendError::Connection(format!("kinesis list_shards: {e}")))?;
         let shards = shards_resp.shards.unwrap_or_default();
-        let shard = shards.into_iter().next().ok_or_else(|| {
-            BackendError::Other(format!(
+        if shards.is_empty() {
+            return Err(BackendError::Other(format!(
                 "kinesis read_arrow_stream: stream `{}` has no shards",
                 self.stream_name
-            ))
-        })?;
-        let shard_id = shard.shard_id().to_string();
-        let iter_resp = client
+            )));
+        }
+        let mut cursors = BTreeMap::new();
+        for shard in shards {
+            cursors.insert(shard.shard_id().to_string(), ShardCursor::default());
+        }
+        Ok(KinesisConsumerSession { cursors })
+    }
+
+    /// Bootstrap a shard iterator from the cursor's committed
+    /// sequence number, falling back to `TRIM_HORIZON` for shards
+    /// that have never been committed.
+    async fn build_shard_iterator(
+        &self,
+        client: &Client,
+        shard_id: &str,
+        committed: Option<&str>,
+    ) -> Result<Option<String>, BackendError> {
+        let mut req = client
             .get_shard_iterator()
             .stream_name(&self.stream_name)
-            .shard_id(&shard_id)
-            .shard_iterator_type(ShardIteratorType::TrimHorizon)
+            .shard_id(shard_id);
+        req = match committed {
+            Some(seq) => req
+                .shard_iterator_type(ShardIteratorType::AfterSequenceNumber)
+                .starting_sequence_number(seq.to_string()),
+            None => req.shard_iterator_type(ShardIteratorType::TrimHorizon),
+        };
+        let resp = req
             .send()
             .await
             .map_err(|e| BackendError::Connection(format!("kinesis get_shard_iterator: {e}")))?;
-        Ok(KinesisConsumerSession {
-            shard_id,
-            next_shard_iterator: iter_resp.shard_iterator,
-        })
+        Ok(resp.shard_iterator)
     }
 
     /// Build a Kinesis SDK `Client` matching this backend's config.
@@ -435,40 +539,76 @@ impl Backend for KinesisBackend {
 
         let mut payloads: Vec<Vec<u8>> = Vec::new();
         let mut bytes_total: usize = 0;
-        let mut empty_polls = 0_u32;
         let limit = cfg.batch_size.min(10_000) as i32;
 
-        loop {
-            let Some(iterator) = session.next_shard_iterator.clone() else {
-                // Iterator exhausted (rare). Drop the session so a
-                // future call re-binds at TRIM_HORIZON; for 37c.2
-                // this matches the "auto-advance" contract.
-                break;
-            };
-            let resp = client
-                .get_records()
-                .shard_iterator(iterator)
-                .limit(limit)
-                .send()
-                .await
-                .map_err(|e| BackendError::Query(format!("kinesis get_records: {e}")))?;
-            // Always advance to the new iterator, even on empty
-            // responses — the AWS doc explicitly recommends this.
-            session.next_shard_iterator = resp.next_shard_iterator;
-
-            let records = resp.records;
-            if records.is_empty() {
-                empty_polls += 1;
-                if empty_polls > cfg.max_empty_polls {
-                    break;
+        // Drain each shard in turn (sequential fanout). Per shard:
+        // bootstrap iterator if needed, then loop GetRecords until
+        // we hit limits or max_empty_polls.
+        let shard_ids: Vec<String> = session.cursors.keys().cloned().collect();
+        for shard_id in shard_ids {
+            // Bootstrap iterator from committed checkpoint if the
+            // cursor doesn't already have one.
+            if session
+                .cursors
+                .get(&shard_id)
+                .and_then(|c| c.next_iterator.as_ref())
+                .is_none()
+            {
+                let committed = session
+                    .cursors
+                    .get(&shard_id)
+                    .and_then(|c| c.committed_sequence_number.clone());
+                let iter = self
+                    .build_shard_iterator(&client, &shard_id, committed.as_deref())
+                    .await?;
+                if let Some(c) = session.cursors.get_mut(&shard_id) {
+                    c.next_iterator = iter;
                 }
-                tokio::time::sleep(Duration::from_millis(cfg.idle_poll_ms)).await;
-                continue;
             }
-            for rec in records {
-                let data = rec.data.into_inner();
-                bytes_total += data.len();
-                payloads.push(data);
+
+            let mut empty_polls = 0_u32;
+            while let Some(iterator) = session
+                .cursors
+                .get(&shard_id)
+                .and_then(|c| c.next_iterator.clone())
+            {
+                let resp = client
+                    .get_records()
+                    .shard_iterator(iterator)
+                    .limit(limit)
+                    .send()
+                    .await
+                    .map_err(|e| BackendError::Query(format!("kinesis get_records: {e}")))?;
+                // Always advance the in-memory iterator (AWS docs
+                // explicitly recommend this even on empty responses).
+                if let Some(c) = session.cursors.get_mut(&shard_id) {
+                    c.next_iterator = resp.next_shard_iterator;
+                }
+
+                let records = resp.records;
+                if records.is_empty() {
+                    empty_polls += 1;
+                    if empty_polls > cfg.max_empty_polls {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(cfg.idle_poll_ms)).await;
+                    continue;
+                }
+
+                let mut last_seq: Option<String> = None;
+                for rec in records {
+                    last_seq = Some(rec.sequence_number().to_string());
+                    let data = rec.data.into_inner();
+                    bytes_total += data.len();
+                    payloads.push(data);
+                    if payloads.len() >= cfg.batch_size || bytes_total >= cfg.batch_bytes {
+                        break;
+                    }
+                }
+                if let (Some(c), Some(seq)) = (session.cursors.get_mut(&shard_id), last_seq) {
+                    c.pending_sequence_number = Some(seq);
+                }
+
                 if payloads.len() >= cfg.batch_size || bytes_total >= cfg.batch_bytes {
                     break;
                 }
@@ -683,6 +823,30 @@ impl Backend for KinesisBackend {
                 .into(),
         ))
     }
+
+    /// Advance each shard's `committed_sequence_number` to the
+    /// pending value. Mirrors Kafka 36e / RabbitMQ 37a.3 / Pub/Sub
+    /// 37b.3 — the framework's at-least-once primitive. No-op if
+    /// no consumer session has been opened or no shard has any
+    /// pending sequence number.
+    ///
+    /// Note: the committed checkpoint is in-memory only. Durable
+    /// checkpoint storage (DynamoDB / file) is a documented
+    /// follow-up; the streaming-pipeline contract still holds
+    /// in-process because the pipeline calls `commit_offsets`
+    /// after every successful target write.
+    async fn commit_offsets(&self) -> Result<(), BackendError> {
+        let mut session_lock = self.consumer_session.lock().await;
+        let Some(session) = session_lock.as_mut() else {
+            return Ok(());
+        };
+        for cursor in session.cursors.values_mut() {
+            if let Some(seq) = cursor.pending_sequence_number.take() {
+                cursor.committed_sequence_number = Some(seq);
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Best-effort parse of an endpoint URL into the `ConnectionInfo`
@@ -877,6 +1041,25 @@ mod tests {
             .unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("source_backend is required"), "got: {msg}");
+    }
+
+    /// 37c.3: commit_offsets is a no-op before any consumer
+    /// session has been opened. Lets pipelines call it
+    /// unconditionally.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn commit_offsets_noop_without_consumer_session() {
+        let b = KinesisBackend::open("s").unwrap();
+        b.commit_offsets().await.unwrap();
+        assert_eq!(b.pending_sequence_count().await, 0);
+    }
+
+    /// 37c.3: reset_to_committed_offsets is a no-op before any
+    /// session has been opened.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reset_to_committed_offsets_noop_without_consumer_session() {
+        let b = KinesisBackend::open("s").unwrap();
+        b.reset_to_committed_offsets().await.unwrap();
+        assert_eq!(b.pending_sequence_count().await, 0);
     }
 
     #[tokio::test(flavor = "multi_thread")]

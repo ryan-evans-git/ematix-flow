@@ -4881,6 +4881,183 @@ async fn kinesis_write_then_read_round_trip() {
     assert!(labels.contains(&"gamma".to_string()));
 }
 
+/// Phase 37c.3: drain → reset_to_committed_offsets (without
+/// commit) → drain again → assert the same records re-appear.
+/// Then commit → reset → drain → assert empty. Mirrors the
+/// RabbitMQ / Pub/Sub at-least-once tests.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker; run with `cargo test -- --ignored`"]
+async fn kinesis_uncommitted_offsets_redeliver_after_reset() {
+    use arrow_array::Int64Array;
+    use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+    use ematix_flow_core::backend::WriteMode;
+    use ematix_flow_core::kinesis_backend::KinesisBatchConfig;
+
+    let (_container, endpoint) = start_localstack().await;
+    let region = "us-east-1";
+    let stream = "redeliver-stream";
+    kinesis_create_stream(&endpoint, region, stream, 1).await;
+
+    // Produce 4 rows.
+    let producer = KinesisBackend::open(stream)
+        .unwrap()
+        .with_region(region)
+        .with_endpoint(endpoint.clone())
+        .with_static_credentials("fake", "fake");
+    let arrow_schema = Arc::new(ArrowSchema::new(vec![Field::new(
+        "id",
+        DataType::Int64,
+        false,
+    )]));
+    let batch = arrow_array::RecordBatch::try_new(
+        arrow_schema,
+        vec![Arc::new(Int64Array::from(vec![1_i64, 2, 3, 4]))],
+    )
+    .unwrap();
+    let target = ematix_flow_core::backend::TargetTable {
+        schema: "".into(),
+        name: "rd".into(),
+    };
+    let stream_arr: ematix_flow_core::backend::ArrowBatchStream =
+        Box::pin(futures_util::stream::once(async move {
+            Ok::<_, ematix_flow_core::BackendError>(batch)
+        }));
+    let n = producer
+        .write_arrow_stream(&target, stream_arr, WriteMode::Append)
+        .await
+        .unwrap();
+    assert_eq!(n, 4);
+
+    let consumer = KinesisBackend::open(stream)
+        .unwrap()
+        .with_region(region)
+        .with_endpoint(endpoint)
+        .with_static_credentials("fake", "fake")
+        .with_batch_config(KinesisBatchConfig {
+            batch_size: 100,
+            batch_bytes: 1 << 20,
+            max_empty_polls: 6,
+            idle_poll_ms: 300,
+        });
+
+    // First drain — see all 4 rows; pending updates but DON'T commit.
+    let stream_out = consumer.read_arrow_stream("any").await.unwrap();
+    let batches: Vec<_> = stream_out.try_collect().await.unwrap();
+    let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total, 4, "first drain saw all 4 rows");
+    assert!(
+        consumer.pending_sequence_count().await >= 1,
+        "expected pending sequence numbers"
+    );
+
+    // Reset → next read should rebuild the iterator from committed
+    // (which is None → falls back to TRIM_HORIZON) and see the
+    // same 4 rows again.
+    consumer.reset_to_committed_offsets().await.unwrap();
+    let stream_out = consumer.read_arrow_stream("any").await.unwrap();
+    let batches: Vec<_> = stream_out.try_collect().await.unwrap();
+    let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(
+        total, 4,
+        "after reset, second drain should see all 4 rows again, got {total}"
+    );
+
+    // This time commit → reset → drain should be empty.
+    consumer.commit_offsets().await.unwrap();
+    assert_eq!(consumer.pending_sequence_count().await, 0);
+    consumer.reset_to_committed_offsets().await.unwrap();
+    let stream_out = consumer.read_arrow_stream("any").await.unwrap();
+    let batches: Vec<_> = stream_out.try_collect().await.unwrap();
+    let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(
+        total, 0,
+        "after commit + reset the stream tail should be empty; got {total}"
+    );
+}
+
+/// Phase 37c.3: produce to a 2-shard stream → consume → assert all
+/// rows are seen across both shards. The single-shard limit from
+/// 37c.2 is gone; the consumer drains every shard.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker; run with `cargo test -- --ignored`"]
+async fn kinesis_multi_shard_drain_sees_all_rows() {
+    use arrow_array::Int64Array;
+    use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+    use ematix_flow_core::backend::WriteMode;
+    use ematix_flow_core::kinesis_backend::KinesisBatchConfig;
+
+    let (_container, endpoint) = start_localstack().await;
+    let region = "us-east-1";
+    let stream = "multi-shard-stream";
+    // 2 shards.
+    kinesis_create_stream(&endpoint, region, stream, 2).await;
+
+    // Produce 8 rows. Per-row partition key (assigned by
+    // write_arrow_stream as `<target.name>-<row-idx>`) hashes
+    // across the 2 shards, so both should receive records.
+    let producer = KinesisBackend::open(stream)
+        .unwrap()
+        .with_region(region)
+        .with_endpoint(endpoint.clone())
+        .with_static_credentials("fake", "fake");
+    let arrow_schema = Arc::new(ArrowSchema::new(vec![Field::new(
+        "id",
+        DataType::Int64,
+        false,
+    )]));
+    let batch = arrow_array::RecordBatch::try_new(
+        arrow_schema,
+        vec![Arc::new(Int64Array::from(vec![
+            10_i64, 20, 30, 40, 50, 60, 70, 80,
+        ]))],
+    )
+    .unwrap();
+    let target = ematix_flow_core::backend::TargetTable {
+        schema: "".into(),
+        name: "ms".into(),
+    };
+    let stream_arr: ematix_flow_core::backend::ArrowBatchStream =
+        Box::pin(futures_util::stream::once(async move {
+            Ok::<_, ematix_flow_core::BackendError>(batch)
+        }));
+    let n = producer
+        .write_arrow_stream(&target, stream_arr, WriteMode::Append)
+        .await
+        .unwrap();
+    assert_eq!(n, 8);
+
+    let consumer = KinesisBackend::open(stream)
+        .unwrap()
+        .with_region(region)
+        .with_endpoint(endpoint)
+        .with_static_credentials("fake", "fake")
+        .with_batch_config(KinesisBatchConfig {
+            batch_size: 100,
+            batch_bytes: 1 << 20,
+            max_empty_polls: 6,
+            idle_poll_ms: 300,
+        });
+    let stream_out = consumer.read_arrow_stream("any").await.unwrap();
+    let batches: Vec<_> = stream_out.try_collect().await.unwrap();
+    let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total, 8, "expected all 8 rows across both shards");
+
+    let mut ids: Vec<i64> = Vec::new();
+    for b in &batches {
+        let id_col = b
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        for i in 0..b.num_rows() {
+            ids.push(id_col.value(i));
+        }
+    }
+    ids.sort_unstable();
+    assert_eq!(ids, vec![10, 20, 30, 40, 50, 60, 70, 80]);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs Docker; run with `cargo test -- --ignored`"]
 async fn kinesis_read_empty_stream_returns_empty_stream() {
