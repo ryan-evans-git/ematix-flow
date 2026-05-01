@@ -42,7 +42,7 @@ from ematix_flow.normalize import lower, trim, empty_to_null, parse_timestamp
 
 @ematix.table(schema="analytics")
 class CustomerDim:
-    customer_id: Annotated[BigInt, pk()]
+    customer_id: Annotated[BigInt, pk()]    # ← keys live on the table
     email: Annotated[String[256] | None, lower(), trim(), empty_to_null()]
     name: Text | None
     updated_at: Annotated[TimestampTZ, parse_timestamp()]
@@ -51,12 +51,46 @@ class CustomerDim:
     target=CustomerDim,
     schedule="0 * * * *",
     mode="scd2",
-    keys=["customer_id"],
     compare_columns=["email", "name"],
+    # `keys=` omitted — the pipeline infers ["customer_id"] from
+    # `pk()` on the table. Override only if your merge keys
+    # differ from the declared primary key.
 )
 def sync_customers(conn):
     return "SELECT customer_id, email, name, updated_at FROM raw.customers"
 ```
+
+### How merge keys are resolved
+
+For `merge` and `scd2` pipelines, `keys=` is **optional**. The
+decorator picks them in this priority order, falling through on
+absence:
+
+1. Explicit `keys=("col_a", "col_b")` on `@ematix.pipeline` /
+   `pipeline.sync(keys=...)` — highest priority, silences any
+   warnings.
+2. `__merge_keys__ = ("col_a", "col_b")` class dunder on the
+   target — useful when the merge key isn't the primary key.
+3. First `natural_key()` group on the table — for SCD2 where the
+   business key (e.g. `customer_id`) is distinct from the
+   versioned primary key (e.g. `(customer_id, valid_from)`).
+4. Columns marked `pk()` — the default in the example above.
+
+When 2 or 3 resolve to keys that *differ* from `pk()`, the
+pipeline emits a `UserWarning` so you know what got picked. Pass
+explicit `keys=` to silence.
+
+For SCD2 specifically, the natural pattern is to leave the table
+PK as the business key (`customer_id` here) — the framework
+augments the table with `valid_from` / `valid_to` / `is_current` /
+`row_hash` columns and merges on `customer_id`. The PK becomes
+`(customer_id, valid_from)` after augmentation. You don't need to
+think about that unless you're hand-rolling DDL.
+
+`natural_key()` is for the orthogonal case where you have a
+*non-PK* column that should also be UNIQUE (e.g. `email`), or
+where you want SCD2 to key off something other than the declared
+`pk()` — see `help(natural_key)`.
 
 Fired from cron / k8s CronJob / GitHub Actions:
 

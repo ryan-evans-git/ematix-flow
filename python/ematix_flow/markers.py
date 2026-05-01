@@ -32,6 +32,21 @@ def pk(**options: Any) -> _PkMarker:
 
     Composite primary keys: place `pk()` on multiple columns; their
     declaration order becomes the PK column order.
+
+    Pipelines automatically use the PK columns as their merge keys
+    when `keys=` is omitted on `@ematix.pipeline` / `pipeline.sync`,
+    so you typically don't need to repeat the key list. The
+    resolution order is:
+
+      1. explicit `keys=("col_a", "col_b")` on the pipeline
+      2. ``__merge_keys__ = ("col_a", "col_b")`` class dunder on
+         the table
+      3. first ``natural_key()`` group on the table
+      4. ``pk()`` columns (this marker)
+
+    When a `natural_key()` or `__merge_keys__` resolution differs
+    from the declared PK, the pipeline emits a `UserWarning`. Pass
+    explicit `keys=` to silence.
     """
     return _PkMarker(options=frozenset(options.items()))
 
@@ -56,6 +71,29 @@ def natural_key(group: str = "") -> _NaturalKeyMarker:
     All `natural_key()` columns (no arg) join one constraint; columns
     sharing a group label join a separate constraint named after the
     label.
+
+    Two ways to use `natural_key()` in practice:
+
+    1. **As an additional UNIQUE constraint** on a non-PK column —
+       e.g. an external `email` field that must be unique even
+       though `customer_id` is the PK:
+
+           class Customer:
+               customer_id: Annotated[BigInt, pk()]
+               email: Annotated[String[256], natural_key()]
+
+    2. **As the SCD2 merge-key driver** when you want to be
+       explicit about which column the SCD2 merge keys off of
+       (rather than letting the framework infer from `pk()`).
+       For SCD2 the typical PK on the business-key column is
+       sufficient — augmentation adds `valid_from` automatically,
+       and the merge key inference picks `pk()`. Use
+       `natural_key()` here only when you have a non-PK business
+       key you want SCD2 to merge against.
+
+    When a pipeline omits `keys=`, the resolution order picks the
+    natural-key group ahead of `pk()` columns. See `pk()` for the
+    full resolution chain.
     """
     return _NaturalKeyMarker(group=group)
 
