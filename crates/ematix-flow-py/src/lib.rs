@@ -1,3 +1,5 @@
+mod kafka;
+
 use std::sync::{Arc, OnceLock};
 
 use ematix_flow_core::backend::{Backend, Dialect, PostgresBackend, TargetTable, WriteMode};
@@ -806,5 +808,6 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(run_pipeline_from_toml_str, m)?)?;
     m.add_function(wrap_pyfunction!(run_pipeline_from_path, m)?)?;
     m.add_class::<Connection>()?;
+    m.add_class::<kafka::PyKafkaBackend>()?;
     Ok(())
 }

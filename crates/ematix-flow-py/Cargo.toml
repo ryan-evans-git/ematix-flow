@@ -18,3 +18,6 @@ ematix-flow-core.workspace = true
 ematix-flow-cli.workspace = true
 tokio.workspace = true
 serde_json.workspace = true
+arrow.workspace = true
+arrow-array.workspace = true
+futures-util.workspace = true

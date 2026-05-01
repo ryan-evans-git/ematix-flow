@@ -256,6 +256,7 @@ dependencies = [
  "arrow-ipc",
  "arrow-json",
  "arrow-ord",
+ "arrow-pyarrow",
  "arrow-row",
  "arrow-schema",
  "arrow-select",
@@ -408,6 +409,18 @@ dependencies = [
  "arrow-data",
  "arrow-schema",
  "arrow-select",
+]
+
+[[package]]
+name = "arrow-pyarrow"
+version = "58.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e63351dc11981a316c828a6032a5021345bba882f68bc4a36c36825a50725089"
+dependencies = [
+ "arrow-array",
+ "arrow-data",
+ "arrow-schema",
+ "pyo3",
 ]
 
 [[package]]
@@ -3314,8 +3327,11 @@ dependencies = [
 name = "ematix-flow-py"
 version = "0.1.0"
 dependencies = [
+ "arrow",
+ "arrow-array",
  "ematix-flow-cli",
  "ematix-flow-core",
+ "futures-util",
  "pyo3",
  "serde_json",
  "tokio",
