@@ -3999,3 +3999,147 @@ async fn kafka_read_arrow_stream_rejects_empty_topic() {
     let msg = err.to_string();
     assert!(msg.contains("non-empty topic"), "got: {msg}");
 }
+
+// ----- Phase 36c: Kafka produce write_arrow_stream / run_append ----------
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker; run with `cargo test -- --ignored`"]
+async fn kafka_write_arrow_stream_produces_json_messages() {
+    use arrow_array::{Int64Array, RecordBatch as RB, StringArray};
+    use arrow_schema::{DataType as Dt, Field as F, Schema as S};
+
+    let (_container, bootstrap) = start_kafka().await;
+    let producer = KafkaBackend::open(&bootstrap, None).unwrap();
+
+    let schema = std::sync::Arc::new(S::new(vec![
+        F::new("id", Dt::Int64, true),
+        F::new("name", Dt::Utf8, true),
+    ]));
+    let batch = RB::try_new(
+        schema,
+        vec![
+            std::sync::Arc::new(Int64Array::from(vec![1, 2, 3])),
+            std::sync::Arc::new(StringArray::from(vec!["alice", "bob", "carol"])),
+        ],
+    )
+    .unwrap();
+    let stream = futures_util::stream::once(async move { Ok::<_, _>(batch) });
+    let stream: ematix_flow_core::backend::ArrowBatchStream = Box::pin(stream);
+
+    let target = TargetTable {
+        schema: "".into(),
+        name: "produce-test".into(),
+    };
+    let n = producer
+        .write_arrow_stream(&target, stream, WriteMode::Append)
+        .await
+        .unwrap();
+    assert_eq!(n, 3);
+
+    // Round-trip: read them back via the consumer (36b).
+    let consumer = KafkaBackend::open(&bootstrap, Some("produce-test-consume")).unwrap();
+    let stream = consumer.read_arrow_stream("produce-test").await.unwrap();
+    let batches: Vec<_> = stream.try_collect().await.unwrap();
+    let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total, 3);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker; run with `cargo test -- --ignored`"]
+async fn kafka_run_append_from_duckdb_to_topic() {
+    use arrow_array::Int64Array;
+
+    let (_container, bootstrap) = start_kafka().await;
+    let producer: Arc<dyn Backend> = Arc::new(KafkaBackend::open(&bootstrap, None).unwrap());
+    let source: Arc<dyn Backend> =
+        Arc::new(ematix_flow_core::DuckDBBackend::open(":memory:").unwrap());
+    source.execute("CREATE SCHEMA s").await.unwrap();
+    source
+        .execute("CREATE TABLE s.events (id BIGINT, name VARCHAR)")
+        .await
+        .unwrap();
+    source
+        .execute("INSERT INTO s.events VALUES (1, 'a'), (2, 'b'), (3, 'c')")
+        .await
+        .unwrap();
+
+    let spec = TableSpec {
+        schema: "".into(),
+        name: "appended-test".into(),
+        columns: vec![
+            ColumnSpec {
+                name: "id".into(),
+                ty: ColumnType::BigInt,
+                nullable: false,
+                primary_key: false,
+            },
+            ColumnSpec {
+                name: "name".into(),
+                ty: ColumnType::Text,
+                nullable: true,
+                primary_key: false,
+            },
+        ],
+        unique_constraints: vec![],
+        fingerprint: String::new(),
+    };
+    let r = producer
+        .run_append(
+            &spec,
+            "SELECT id, name FROM s.events ORDER BY id",
+            "k36c_run_append",
+            Some(source.as_ref()),
+            None,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+    assert_eq!(r.rows_inserted, 3);
+    assert!(r.path.contains("appended-test"), "got path: {}", r.path);
+    assert_eq!(r.status, "success");
+
+    // Verify on the consumer side.
+    let consumer = KafkaBackend::open(&bootstrap, Some("appended-test-consume")).unwrap();
+    let stream = consumer.read_arrow_stream("appended-test").await.unwrap();
+    let batches: Vec<_> = stream.try_collect().await.unwrap();
+    let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total, 3);
+
+    // Spot check a value.
+    let id = batches[0]
+        .column_by_name("id")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let mut ids: Vec<i64> = (0..id.len()).map(|i| id.value(i)).collect();
+    ids.sort_unstable();
+    assert_eq!(ids, vec![1, 2, 3]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn kafka_write_arrow_stream_rejects_truncate() {
+    use arrow_array::Int64Array;
+    use arrow_schema::{DataType as Dt, Field as F, Schema as S};
+
+    let backend = KafkaBackend::open("localhost:9092", None).unwrap();
+    let schema = std::sync::Arc::new(S::new(vec![F::new("x", Dt::Int64, true)]));
+    let batch = arrow_array::RecordBatch::try_new(
+        schema,
+        vec![std::sync::Arc::new(Int64Array::from(vec![1]))],
+    )
+    .unwrap();
+    let stream = futures_util::stream::once(async move { Ok::<_, _>(batch) });
+    let stream: ematix_flow_core::backend::ArrowBatchStream = Box::pin(stream);
+    let target = TargetTable {
+        schema: "".into(),
+        name: "any".into(),
+    };
+    let err = backend
+        .write_arrow_stream(&target, stream, WriteMode::Truncate)
+        .await
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("Truncate is not supported"), "got: {msg}");
+}

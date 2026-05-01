@@ -49,6 +49,8 @@ use rdkafka::Message;
 use rdkafka::admin::AdminClient;
 use rdkafka::client::DefaultClientContext;
 use rdkafka::consumer::{Consumer, StreamConsumer};
+use rdkafka::producer::{FutureProducer, FutureRecord};
+use rdkafka::util::Timeout;
 
 use crate::backend::{
     ArrowBatchStream, Backend, BackendError, DeleteHandling, Dialect, StrategyRunResult,
@@ -255,30 +257,146 @@ impl Backend for KafkaBackend {
         Ok(Box::pin(stream))
     }
 
+    /// Produce each Arrow row as a Kafka message to `target.name`
+    /// (the topic). Each batch is encoded as JSONL via arrow-json's
+    /// `LineDelimitedWriter`; lines are split and produced as
+    /// individual messages. `WriteMode::Truncate` is rejected — Kafka
+    /// topics aren't truncatable from a producer (delete-and-recreate
+    /// is an admin-tool operation).
+    ///
+    /// Limits in 36c — folded out in later sub-phases:
+    ///   - JSON-only payload encode (raw bytes / Avro / Protobuf land
+    ///     in 36h).
+    ///   - At-least-once delivery: messages are awaited individually,
+    ///     so a batch of N rows results in N awaited produces. Phase
+    ///     36j wires Kafka transactions for exactly-once semantics.
+    ///   - No partition keying yet — every message uses round-robin
+    ///     partitioning. A `with_message_key(...)` builder lands in
+    ///     36c+ once the keying contract is settled.
     async fn write_arrow_stream(
         &self,
-        _target: &TargetTable,
-        _stream: ArrowBatchStream,
-        _mode: WriteMode,
+        target: &TargetTable,
+        stream: ArrowBatchStream,
+        mode: WriteMode,
     ) -> Result<u64, BackendError> {
-        Err(BackendError::Other(
-            "Kafka write_arrow_stream lands in Phase 36c".into(),
-        ))
+        if mode == WriteMode::Truncate {
+            return Err(BackendError::Other(
+                "Kafka write_arrow_stream: Truncate is not supported on a topic. \
+                 Topics are append-only logs; to start fresh, delete and recreate \
+                 the topic via admin tools."
+                    .into(),
+            ));
+        }
+        let topic = target.name.trim();
+        if topic.is_empty() {
+            return Err(BackendError::Other(
+                "Kafka write_arrow_stream: target.name (topic) must be non-empty".into(),
+            ));
+        }
+        let producer: FutureProducer = self
+            .client_config()
+            .create()
+            .map_err(|e| BackendError::Connection(format!("kafka producer create: {e}")))?;
+
+        let mut s = stream;
+        let mut total: u64 = 0;
+        while let Some(batch) = futures_util::StreamExt::next(&mut s).await {
+            let batch = batch?;
+            if batch.num_rows() == 0 {
+                continue;
+            }
+            let payloads = encode_batch_as_jsonl_lines(&batch)?;
+            for payload in &payloads {
+                // The 5s timeout caps how long each produce can wait
+                // for broker ack. For real-AWS-MSK / Confluent Cloud
+                // this is generous; for slow networks the user
+                // should set `message.timeout.ms` on the underlying
+                // ClientConfig (future builder method).
+                producer
+                    .send(
+                        FutureRecord::<(), [u8]>::to(topic).payload(payload.as_slice()),
+                        Timeout::After(Duration::from_secs(5)),
+                    )
+                    .await
+                    .map_err(|(e, _msg)| {
+                        BackendError::Query(format!("kafka produce {topic}: {e}"))
+                    })?;
+                total += 1;
+            }
+        }
+        Ok(total)
     }
 
+    /// Produce-side run_append: read source rows via the source's
+    /// `read_arrow_stream`, encode each row as a JSON message,
+    /// produce to `spec.name` (the topic). Cross-backend by design —
+    /// `source_backend` is required.
+    ///
+    /// run_history is intentionally *not* persisted by this backend.
+    /// Kafka has no native sidecar for it (unlike PG / DuckDB /
+    /// SQLite / MySQL with their `ematix_flow.run_history` tables, or
+    /// ObjectStore / Delta with their JSONL sidecar files). Callers
+    /// who need durable run audit should layer a separate
+    /// observability backend; the StrategyRunResult is still returned
+    /// for in-process observability.
     async fn run_append(
         &self,
-        _spec: &TableSpec,
-        _source_query: &str,
-        _pipeline_name: &str,
-        _source_backend: Option<&dyn Backend>,
-        _incremental_column: Option<&str>,
-        _last_value_literal: Option<&str>,
-        _dry_run: bool,
+        spec: &TableSpec,
+        source_query: &str,
+        pipeline_name: &str,
+        source_backend: Option<&dyn Backend>,
+        incremental_column: Option<&str>,
+        last_value_literal: Option<&str>,
+        dry_run: bool,
     ) -> Result<StrategyRunResult, BackendError> {
-        Err(BackendError::Other(
-            "Kafka run_append lands in Phase 36c".into(),
-        ))
+        let source = source_backend.ok_or_else(|| {
+            BackendError::Other(
+                "Kafka run_append: source_backend is required \
+                 (Kafka is a target only — there is no same-backend path)"
+                    .into(),
+            )
+        })?;
+        // Watermark filter wraps the source SQL in the source's
+        // dialect. Kafka itself doesn't track watermarks (no
+        // queryable surface); users running incremental loads to
+        // Kafka must persist `last_value_literal` externally.
+        let watermark = incremental_column.map(|c| crate::meta::WatermarkConfig {
+            column: c.to_string(),
+            last_value_literal: last_value_literal.map(|s| s.to_string()),
+        });
+        let filtered_source =
+            crate::meta::wrap_with_watermark_filter(source_query, watermark.as_ref());
+
+        let run_id = uuid::Uuid::now_v7();
+        let target = TargetTable {
+            schema: spec.schema.clone(),
+            name: spec.name.clone(),
+        };
+        let inserted: u64 = if dry_run {
+            // Probe the source so a missing query / bad credentials
+            // surfaces; do not produce anything.
+            let _ = source.read_arrow_stream(&filtered_source).await?;
+            0
+        } else {
+            let stream = source.read_arrow_stream(&filtered_source).await?;
+            self.write_arrow_stream(&target, stream, WriteMode::Append)
+                .await?
+        };
+        Ok(StrategyRunResult {
+            run_id: run_id.to_string(),
+            rows_inserted: inserted as i64,
+            rows_updated: None,
+            rows_unchanged: None,
+            rows_closed: None,
+            status: if dry_run { "dry_run" } else { "success" }.into(),
+            // pipeline_name is logged here so per-pipeline routing is
+            // visible at the StrategyRunResult level even though we
+            // don't persist run_history rows for Kafka.
+            path: format!(
+                "cross_backend → kafka topic '{topic}' (pipeline={pipeline_name})",
+                topic = spec.name,
+            ),
+        })
     }
 
     async fn run_truncate(
@@ -438,6 +556,31 @@ fn decode_payloads_as_jsonl(payloads: Vec<Vec<u8>>) -> Result<Vec<RecordBatch>, 
         batches.push(b.map_err(|e| BackendError::Query(format!("kafka json batch: {e}")))?);
     }
     Ok(batches)
+}
+
+/// Encode a `RecordBatch` as JSONL bytes, then split on newlines so
+/// each row becomes its own payload for produce. The `Vec<Vec<u8>>`
+/// has one entry per row (matching `batch.num_rows()`).
+fn encode_batch_as_jsonl_lines(batch: &RecordBatch) -> Result<Vec<Vec<u8>>, BackendError> {
+    use arrow_json::LineDelimitedWriter;
+
+    let mut buf: Vec<u8> = Vec::with_capacity(batch.num_rows() * 64);
+    let mut writer = LineDelimitedWriter::new(&mut buf);
+    writer
+        .write(batch)
+        .map_err(|e| BackendError::Query(format!("kafka produce json encode: {e}")))?;
+    writer
+        .finish()
+        .map_err(|e| BackendError::Query(format!("kafka produce json finish: {e}")))?;
+    drop(writer);
+    // arrow-json terminates each row with `\n`; split-by-newline
+    // produces one trailing empty entry which we filter out.
+    let lines: Vec<Vec<u8>> = buf
+        .split(|&b| b == b'\n')
+        .filter(|l| !l.is_empty())
+        .map(|l| l.to_vec())
+        .collect();
+    Ok(lines)
 }
 
 /// Best-effort parse of "host:port,host:port,..." → (first_host, first_port).
