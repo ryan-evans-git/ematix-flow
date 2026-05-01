@@ -1144,3 +1144,203 @@ async fn duckdb_run_scd2_idempotent_when_no_changes() {
         "idempotent: no second version when nothing changed"
     );
 }
+
+// --- Phase 31d.1: DuckDB run_history -------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn duckdb_run_history_records_successful_append() {
+    let backend: Arc<dyn Backend> = Arc::new(DuckDBBackend::open(":memory:").unwrap());
+    backend.execute("CREATE SCHEMA src").await.unwrap();
+    backend.execute("CREATE SCHEMA wh").await.unwrap();
+    backend
+        .execute("CREATE TABLE src.events (event_id BIGINT, name VARCHAR)")
+        .await
+        .unwrap();
+    backend
+        .execute("INSERT INTO src.events VALUES (1, 'a'), (2, 'b'), (3, 'c')")
+        .await
+        .unwrap();
+    let target = augment_with_metadata(&TableSpec {
+        schema: "wh".into(),
+        name: "event_log".into(),
+        columns: vec![
+            ColumnSpec {
+                name: "event_id".into(),
+                ty: ColumnType::BigInt,
+                nullable: false,
+                primary_key: true,
+            },
+            ColumnSpec {
+                name: "name".into(),
+                ty: ColumnType::Text,
+                nullable: true,
+                primary_key: false,
+            },
+        ],
+        unique_constraints: Vec::new(),
+        fingerprint: String::new(),
+    });
+    backend
+        .execute(
+            "CREATE TABLE wh.event_log (\
+              event_id BIGINT, name VARCHAR, _loaded_at TIMESTAMPTZ, _batch_id UUID\
+            )",
+        )
+        .await
+        .unwrap();
+
+    backend
+        .run_append(
+            &target,
+            "SELECT event_id, name FROM src.events",
+            "duckdb_history_append",
+            None,
+            None,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+
+    use arrow_array::{Int64Array, StringArray};
+    let stream = backend
+        .read_arrow_stream(
+            "SELECT count(*)::BIGINT, \
+                    sum(CASE WHEN status='success' THEN 1 ELSE 0 END)::BIGINT, \
+                    max(rows_inserted) \
+             FROM ematix_flow.run_history \
+             WHERE pipeline_name='duckdb_history_append'",
+        )
+        .await
+        .unwrap();
+    let batches: Vec<_> = stream.try_collect().await.unwrap();
+    let count = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap()
+        .value(0);
+    let success = batches[0]
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap()
+        .value(0);
+    let rows_inserted = batches[0]
+        .column(2)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(count, 1, "exactly one history row for the run");
+    assert_eq!(success, 1, "status is 'success'");
+    assert_eq!(rows_inserted, 3);
+
+    // Mode + path + target identifiers correctly recorded.
+    let stream = backend
+        .read_arrow_stream(
+            "SELECT mode, path, target_schema, target_table FROM ematix_flow.run_history \
+             WHERE pipeline_name='duckdb_history_append'",
+        )
+        .await
+        .unwrap();
+    let batches: Vec<_> = stream.try_collect().await.unwrap();
+    let s = |i: usize| {
+        batches[0]
+            .column(i)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .value(0)
+            .to_string()
+    };
+    assert_eq!(s(0), "append");
+    assert_eq!(s(1), "same_db");
+    assert_eq!(s(2), "wh");
+    assert_eq!(s(3), "event_log");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn duckdb_run_history_records_failure_when_target_missing() {
+    let backend: Arc<dyn Backend> = Arc::new(DuckDBBackend::open(":memory:").unwrap());
+    backend.execute("CREATE SCHEMA src").await.unwrap();
+    backend
+        .execute("CREATE TABLE src.events (event_id BIGINT, name VARCHAR)")
+        .await
+        .unwrap();
+    backend
+        .execute("INSERT INTO src.events VALUES (1, 'a')")
+        .await
+        .unwrap();
+    let target = augment_with_metadata(&TableSpec {
+        schema: "wh".into(),
+        name: "missing_table".into(),
+        columns: vec![ColumnSpec {
+            name: "event_id".into(),
+            ty: ColumnType::BigInt,
+            nullable: false,
+            primary_key: true,
+        }],
+        unique_constraints: Vec::new(),
+        fingerprint: String::new(),
+    });
+    // Don't create wh.missing_table — the INSERT should fail.
+    let result = backend
+        .run_append(
+            &target,
+            "SELECT event_id FROM src.events",
+            "duckdb_history_failure",
+            None,
+            None,
+            None,
+            false,
+        )
+        .await;
+    assert!(result.is_err(), "run_append should fail on missing target");
+
+    use arrow_array::{Array, Int64Array, StringArray};
+    let stream = backend
+        .read_arrow_stream(
+            "SELECT count(*)::BIGINT, \
+                    sum(CASE WHEN status='failed' THEN 1 ELSE 0 END)::BIGINT \
+             FROM ematix_flow.run_history \
+             WHERE pipeline_name='duckdb_history_failure'",
+        )
+        .await
+        .unwrap();
+    let batches: Vec<_> = stream.try_collect().await.unwrap();
+    let count = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap()
+        .value(0);
+    let failed = batches[0]
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(count, 1);
+    assert_eq!(failed, 1, "status is 'failed' even when strategy errors");
+
+    // error_message is populated.
+    let stream = backend
+        .read_arrow_stream(
+            "SELECT error_message FROM ematix_flow.run_history \
+             WHERE pipeline_name='duckdb_history_failure'",
+        )
+        .await
+        .unwrap();
+    let batches: Vec<_> = stream.try_collect().await.unwrap();
+    let msg = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert!(!msg.is_null(0), "error_message should be set on failure");
+    assert!(
+        !msg.value(0).is_empty(),
+        "error_message should be non-empty"
+    );
+}

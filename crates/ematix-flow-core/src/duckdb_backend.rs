@@ -34,6 +34,38 @@ fn is_metadata_col(name: &str) -> bool {
     name == LOADED_AT_COL || name == BATCH_ID_COL
 }
 
+const META_SCHEMA: &str = "ematix_flow";
+const RUN_HISTORY_TABLE: &str = "run_history";
+
+/// SQL that lazy-creates the `ematix_flow.run_history` table on
+/// DuckDB. Mirrors the PG schema (see `pg::ensure_meta_schema`) but
+/// flattened into a single `CREATE TABLE IF NOT EXISTS` since DuckDB
+/// doesn't need the PG-style `ALTER TABLE … ADD COLUMN IF NOT EXISTS`
+/// upgrade pattern (no installed-base to migrate yet).
+fn ensure_meta_schema_sql() -> String {
+    format!(
+        "CREATE SCHEMA IF NOT EXISTS {META_SCHEMA}; \
+         CREATE TABLE IF NOT EXISTS {META_SCHEMA}.{RUN_HISTORY_TABLE} (\
+            run_id UUID PRIMARY KEY, \
+            parent_run_id UUID, \
+            pipeline_name VARCHAR NOT NULL, \
+            step_name VARCHAR, \
+            target_schema VARCHAR NOT NULL, \
+            target_table VARCHAR NOT NULL, \
+            mode VARCHAR NOT NULL, \
+            path VARCHAR NOT NULL, \
+            started_at TIMESTAMPTZ NOT NULL, \
+            finished_at TIMESTAMPTZ, \
+            status VARCHAR NOT NULL, \
+            rows_inserted BIGINT, \
+            rows_updated BIGINT, \
+            rows_unchanged BIGINT, \
+            error_message VARCHAR, \
+            metrics_json VARCHAR\
+         )"
+    )
+}
+
 /// DuckDB-native merge SQL builder. The PG `plan_merge_upsert` uses
 /// `WITH … AS MATERIALIZED` CTEs + a `RETURNING (xmax = 0)` trick to
 /// split inserts vs. updates; both are PG-specific. DuckDB doesn't
@@ -331,6 +363,124 @@ impl DuckDBBackend {
             Err(e) => Err(BackendError::Other(format!("duckdb task join: {e}"))),
         }
     }
+
+    /// Lazy-create `ematix_flow.run_history`. Idempotent.
+    async fn ensure_meta_schema(&self) -> Result<(), BackendError> {
+        self.with_conn_blocking(|c| {
+            c.execute_batch(&ensure_meta_schema_sql())
+                .map_err(|e| BackendError::Query(e.to_string()))
+        })
+        .await
+    }
+
+    async fn record_run_start(
+        &self,
+        run_id: Uuid,
+        pipeline_name: &str,
+        target_schema: &str,
+        target_table: &str,
+        mode: &str,
+        path: &str,
+    ) -> Result<(), BackendError> {
+        let pipeline_name = pipeline_name.to_string();
+        let target_schema = target_schema.to_string();
+        let target_table = target_table.to_string();
+        let mode = mode.to_string();
+        let path = path.to_string();
+        self.with_conn_blocking(move |c| {
+            // Bind via positional `?` params so the connection-mutex stays
+            // off the hot path; UUIDs go in as their string repr because
+            // the duckdb crate's ToSql isn't implemented for `uuid::Uuid`.
+            c.execute(
+                &format!(
+                    "INSERT INTO {META_SCHEMA}.{RUN_HISTORY_TABLE} \
+                     (run_id, pipeline_name, target_schema, target_table, \
+                      mode, path, started_at, status) \
+                     VALUES (?::uuid, ?, ?, ?, ?, ?, now(), 'running')"
+                ),
+                duckdb::params![
+                    run_id.to_string(),
+                    pipeline_name,
+                    target_schema,
+                    target_table,
+                    mode,
+                    path,
+                ],
+            )
+            .map_err(|e| BackendError::Query(e.to_string()))?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn record_run_success(
+        &self,
+        run_id: Uuid,
+        rows_inserted: i64,
+    ) -> Result<(), BackendError> {
+        self.with_conn_blocking(move |c| {
+            c.execute(
+                &format!(
+                    "UPDATE {META_SCHEMA}.{RUN_HISTORY_TABLE} \
+                     SET status='success', rows_inserted=?, finished_at=now() \
+                     WHERE run_id=?::uuid"
+                ),
+                duckdb::params![rows_inserted, run_id.to_string()],
+            )
+            .map_err(|e| BackendError::Query(e.to_string()))?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn record_run_success_merge(
+        &self,
+        run_id: Uuid,
+        rows_inserted: i64,
+        rows_updated: i64,
+        rows_unchanged: i64,
+    ) -> Result<(), BackendError> {
+        self.with_conn_blocking(move |c| {
+            c.execute(
+                &format!(
+                    "UPDATE {META_SCHEMA}.{RUN_HISTORY_TABLE} \
+                     SET status='success', rows_inserted=?, rows_updated=?, \
+                         rows_unchanged=?, finished_at=now() \
+                     WHERE run_id=?::uuid"
+                ),
+                duckdb::params![
+                    rows_inserted,
+                    rows_updated,
+                    rows_unchanged,
+                    run_id.to_string()
+                ],
+            )
+            .map_err(|e| BackendError::Query(e.to_string()))?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn record_run_failure(
+        &self,
+        run_id: Uuid,
+        error_message: &str,
+    ) -> Result<(), BackendError> {
+        let error_message = error_message.to_string();
+        self.with_conn_blocking(move |c| {
+            c.execute(
+                &format!(
+                    "UPDATE {META_SCHEMA}.{RUN_HISTORY_TABLE} \
+                     SET status='failed', error_message=?, finished_at=now() \
+                     WHERE run_id=?::uuid"
+                ),
+                duckdb::params![error_message, run_id.to_string()],
+            )
+            .map_err(|e| BackendError::Query(e.to_string()))?;
+            Ok(())
+        })
+        .await
+    }
 }
 
 #[async_trait]
@@ -452,7 +602,7 @@ impl Backend for DuckDBBackend {
         &self,
         spec: &TableSpec,
         source_query: &str,
-        _pipeline_name: &str,
+        pipeline_name: &str,
         source_backend: Option<&dyn Backend>,
         incremental_column: Option<&str>,
         _last_value_literal: Option<&str>,
@@ -475,7 +625,18 @@ impl Backend for DuckDBBackend {
         let run_id = Uuid::new_v4();
         let sql = substitute_batch_id(&plan.sql, &batch_id);
 
-        let inserted = self
+        self.ensure_meta_schema().await?;
+        self.record_run_start(
+            run_id,
+            pipeline_name,
+            &spec.schema,
+            &spec.name,
+            "append",
+            "same_db",
+        )
+        .await?;
+
+        let inserted_result: Result<u64, BackendError> = self
             .with_conn_blocking(move |c| {
                 if dry_run {
                     // DuckDB: wrap in a transaction we'll rollback.
@@ -494,7 +655,15 @@ impl Backend for DuckDBBackend {
                     Ok(n as u64)
                 }
             })
-            .await?;
+            .await;
+
+        match &inserted_result {
+            Ok(n) => self.record_run_success(run_id, *n as i64).await?,
+            Err(e) => {
+                let _ = self.record_run_failure(run_id, &e.to_string()).await;
+            }
+        }
+        let inserted = inserted_result?;
 
         Ok(StrategyRunResult {
             run_id: run_id.to_string(),
@@ -511,7 +680,7 @@ impl Backend for DuckDBBackend {
         &self,
         spec: &TableSpec,
         source_query: &str,
-        _pipeline_name: &str,
+        pipeline_name: &str,
         source_backend: Option<&dyn Backend>,
         dry_run: bool,
     ) -> Result<StrategyRunResult, BackendError> {
@@ -529,7 +698,18 @@ impl Backend for DuckDBBackend {
             .map(|s| substitute_batch_id(s, &batch_id))
             .collect();
 
-        let inserted = self
+        self.ensure_meta_schema().await?;
+        self.record_run_start(
+            run_id,
+            pipeline_name,
+            &spec.schema,
+            &spec.name,
+            "truncate",
+            "same_db",
+        )
+        .await?;
+
+        let inserted_result: Result<u64, BackendError> = self
             .with_conn_blocking(move |c| {
                 c.execute_batch("BEGIN")
                     .map_err(|e| BackendError::Query(e.to_string()))?;
@@ -549,7 +729,15 @@ impl Backend for DuckDBBackend {
                 }
                 Ok::<u64, BackendError>(last_n)
             })
-            .await?;
+            .await;
+
+        match &inserted_result {
+            Ok(n) => self.record_run_success(run_id, *n as i64).await?,
+            Err(e) => {
+                let _ = self.record_run_failure(run_id, &e.to_string()).await;
+            }
+        }
+        let inserted = inserted_result?;
 
         Ok(StrategyRunResult {
             run_id: run_id.to_string(),
@@ -568,8 +756,8 @@ impl Backend for DuckDBBackend {
         source_query: &str,
         keys: &[String],
         update_columns: &[String],
-        _pipeline_name: &str,
-        _mode_label: &str,
+        pipeline_name: &str,
+        mode_label: &str,
         source_backend: Option<&dyn Backend>,
         delete_handling: Option<DeleteHandling>,
         dry_run: bool,
@@ -588,12 +776,23 @@ impl Backend for DuckDBBackend {
         let run_id = Uuid::new_v4();
         let sql = duckdb_merge_sql(spec, source_query, keys, update_columns, &batch_id);
 
+        self.ensure_meta_schema().await?;
+        self.record_run_start(
+            run_id,
+            pipeline_name,
+            &spec.schema,
+            &spec.name,
+            mode_label,
+            "same_db",
+        )
+        .await?;
+
         // DuckDB's `INSERT ... ON CONFLICT DO UPDATE` returns the
         // affected-row count as inserts + updates summed (no easy way
         // to split without a follow-up query). Surface it as
         // rows_inserted for now; rows_updated tracking is a 31d
         // refinement.
-        let affected = self
+        let affected_result: Result<u64, BackendError> = self
             .with_conn_blocking(move |c| {
                 c.execute_batch("BEGIN")
                     .map_err(|e| BackendError::Query(e.to_string()))?;
@@ -609,7 +808,18 @@ impl Backend for DuckDBBackend {
                 }
                 Ok::<u64, BackendError>(n as u64)
             })
-            .await?;
+            .await;
+
+        match &affected_result {
+            Ok(n) => {
+                self.record_run_success_merge(run_id, *n as i64, 0, 0)
+                    .await?
+            }
+            Err(e) => {
+                let _ = self.record_run_failure(run_id, &e.to_string()).await;
+            }
+        }
+        let affected = affected_result?;
 
         Ok(StrategyRunResult {
             run_id: run_id.to_string(),
@@ -628,7 +838,7 @@ impl Backend for DuckDBBackend {
         source_query: &str,
         keys: &[String],
         compare_columns: &[String],
-        _pipeline_name: &str,
+        pipeline_name: &str,
         source_backend: Option<&dyn Backend>,
         delete_handling: Option<DeleteHandling>,
         event_timestamp_column: Option<&str>,
@@ -668,7 +878,18 @@ impl Backend for DuckDBBackend {
             &batch_id,
         );
 
-        let inserted = self
+        self.ensure_meta_schema().await?;
+        self.record_run_start(
+            run_id,
+            pipeline_name,
+            &spec.schema,
+            &spec.name,
+            "scd2",
+            "same_db",
+        )
+        .await?;
+
+        let inserted_result: Result<u64, BackendError> = self
             .with_conn_blocking(move |c| {
                 c.execute_batch("BEGIN")
                     .map_err(|e| BackendError::Query(e.to_string()))?;
@@ -697,7 +918,15 @@ impl Backend for DuckDBBackend {
                 }
                 Ok::<u64, BackendError>(inserted)
             })
-            .await?;
+            .await;
+
+        match &inserted_result {
+            Ok(n) => self.record_run_success(run_id, *n as i64).await?,
+            Err(e) => {
+                let _ = self.record_run_failure(run_id, &e.to_string()).await;
+            }
+        }
+        let inserted = inserted_result?;
 
         Ok(StrategyRunResult {
             run_id: run_id.to_string(),
