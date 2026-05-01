@@ -141,6 +141,12 @@ pub enum TargetConfig {
         bootstrap_servers: String,
         group_id: Option<String>,
         topic: String,
+        /// Phase 40.2: per-row Kafka message-key column. When set,
+        /// each batch row's value in this column becomes the
+        /// produced message's Kafka key. Column must be Utf8,
+        /// LargeUtf8, or Binary. Default (omitted): round-robin.
+        #[serde(default)]
+        message_key_column: Option<String>,
     },
     Rabbitmq {
         amqp_url: String,
@@ -165,6 +171,12 @@ pub enum TargetConfig {
     DeltaLocal {
         path: String,
         table: TableSpecConfig,
+        /// Phase 40.1: column names used for partitioned table
+        /// creation on first write. Empty (default) =
+        /// unpartitioned. Pre-existing tables retain their
+        /// layout; deltalake-rs validates + rejects mismatches.
+        #[serde(default)]
+        partition_by: Vec<String>,
     },
     /// S3-backed Delta table. Production deployments with
     /// concurrent writers should configure DynamoDB locking
@@ -181,6 +193,10 @@ pub enum TargetConfig {
         access_key_id: String,
         secret_access_key: String,
         table: TableSpecConfig,
+        /// Phase 40.1: column names used for partitioned table
+        /// creation on first write. See DeltaLocal for details.
+        #[serde(default)]
+        partition_by: Vec<String>,
     },
     /// Local-filesystem object store (parquet / csv / orc / jsonl).
     /// `path` is the root directory; `prefix` is the per-table
@@ -324,8 +340,12 @@ impl PipelineCliConfig {
                 bootstrap_servers,
                 group_id,
                 topic,
+                message_key_column,
             } => {
-                let b = KafkaBackend::open(bootstrap_servers, group_id.as_deref())?;
+                let mut b = KafkaBackend::open(bootstrap_servers, group_id.as_deref())?;
+                if let Some(col) = message_key_column {
+                    b = b.with_message_key_column(col);
+                }
                 Ok((
                     Arc::new(b),
                     TargetTable {
@@ -385,8 +405,15 @@ impl PipelineCliConfig {
                     name: partition_key_prefix.clone(),
                 },
             )),
-            TargetConfig::DeltaLocal { path, table } => {
-                let b = DeltaBackend::open_local(path)?;
+            TargetConfig::DeltaLocal {
+                path,
+                table,
+                partition_by,
+            } => {
+                let mut b = DeltaBackend::open_local(path)?;
+                if !partition_by.is_empty() {
+                    b = b.with_partition_columns(partition_by.clone());
+                }
                 Ok((Arc::new(b), table.into()))
             }
             TargetConfig::DeltaS3 {
@@ -397,8 +424,9 @@ impl PipelineCliConfig {
                 access_key_id,
                 secret_access_key,
                 table,
+                partition_by,
             } => {
-                let b = DeltaBackend::open_s3(
+                let mut b = DeltaBackend::open_s3(
                     endpoint,
                     bucket,
                     prefix,
@@ -406,6 +434,9 @@ impl PipelineCliConfig {
                     access_key_id,
                     secret_access_key,
                 )?;
+                if !partition_by.is_empty() {
+                    b = b.with_partition_columns(partition_by.clone());
+                }
                 Ok((Arc::new(b), table.into()))
             }
             TargetConfig::ObjectStoreLocal {
@@ -880,6 +911,7 @@ mod tests {
                 access_key_id,
                 secret_access_key,
                 table,
+                partition_by,
             } => {
                 assert_eq!(endpoint, "http://localhost:9000");
                 assert_eq!(bucket, "events");
@@ -888,8 +920,120 @@ mod tests {
                 assert_eq!(access_key_id, "minioadmin");
                 assert_eq!(secret_access_key, "minioadmin");
                 assert_eq!(table.name, "events");
+                assert!(partition_by.is_empty(), "default partition_by is empty");
             }
             other => panic!("expected DeltaS3, got {other:?}"),
+        }
+    }
+
+    /// Phase 40.1: TOML `partition_by` field carries through to
+    /// `TargetConfig::DeltaLocal`.
+    #[test]
+    fn parses_delta_local_with_partition_by() {
+        let toml = r#"
+            pipeline_name = "p"
+            source_query = "topic"
+
+            [source]
+            kind = "kafka"
+            bootstrap_servers = "localhost:9092"
+
+            [target]
+            kind = "delta_local"
+            path = "/tmp/events"
+            partition_by = ["year", "month"]
+
+            [target.table]
+            schema = "default"
+            name = "events"
+        "#;
+        let cfg = PipelineCliConfig::from_toml_str(toml).unwrap();
+        match &cfg.target {
+            TargetConfig::DeltaLocal { partition_by, .. } => {
+                assert_eq!(partition_by, &vec!["year".to_string(), "month".to_string()]);
+            }
+            other => panic!("expected DeltaLocal, got {other:?}"),
+        }
+    }
+
+    /// Phase 40.1: omitted `partition_by` defaults to empty.
+    #[test]
+    fn delta_local_partition_by_defaults_to_empty() {
+        let toml = r#"
+            pipeline_name = "p"
+            source_query = "topic"
+
+            [source]
+            kind = "kafka"
+            bootstrap_servers = "localhost:9092"
+
+            [target]
+            kind = "delta_local"
+            path = "/tmp/events"
+
+            [target.table]
+            name = "events"
+        "#;
+        let cfg = PipelineCliConfig::from_toml_str(toml).unwrap();
+        match &cfg.target {
+            TargetConfig::DeltaLocal { partition_by, .. } => assert!(partition_by.is_empty()),
+            other => panic!("expected DeltaLocal, got {other:?}"),
+        }
+    }
+
+    /// Phase 40.2: TOML `message_key_column` field on Kafka target.
+    #[test]
+    fn parses_kafka_target_with_message_key_column() {
+        let toml = r#"
+            pipeline_name = "p"
+            source_query = "src"
+
+            [source]
+            kind = "kafka"
+            bootstrap_servers = "localhost:9092"
+
+            [target]
+            kind = "kafka"
+            bootstrap_servers = "localhost:9092"
+            topic = "events"
+            message_key_column = "user_id"
+        "#;
+        let cfg = PipelineCliConfig::from_toml_str(toml).unwrap();
+        match &cfg.target {
+            TargetConfig::Kafka {
+                message_key_column, ..
+            } => {
+                assert_eq!(message_key_column.as_deref(), Some("user_id"));
+            }
+            other => panic!("expected Kafka, got {other:?}"),
+        }
+    }
+
+    /// Phase 40.2: omitted `message_key_column` defaults to None
+    /// (round-robin, pre-40.2 behavior).
+    #[test]
+    fn kafka_target_message_key_column_defaults_to_none() {
+        let toml = r#"
+            pipeline_name = "p"
+            source_query = "src"
+
+            [source]
+            kind = "kafka"
+            bootstrap_servers = "localhost:9092"
+
+            [target]
+            kind = "kafka"
+            bootstrap_servers = "localhost:9092"
+            topic = "events"
+        "#;
+        let cfg = PipelineCliConfig::from_toml_str(toml).unwrap();
+        match &cfg.target {
+            TargetConfig::Kafka {
+                message_key_column, ..
+            } => {
+                assert!(message_key_column.is_none());
+            }
+            other => panic!("expected Kafka, got {other:?}"),
         }
     }
 

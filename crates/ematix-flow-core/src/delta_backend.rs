@@ -77,6 +77,14 @@ pub struct DeltaBackend {
     /// the underlying object_store factory can authenticate. Empty
     /// for local FS; populated with `AWS_ACCESS_KEY_ID` etc. for S3.
     storage_options: HashMap<String, String>,
+    /// Phase 40.1: column names used for partitioned writes. Empty
+    /// = unpartitioned (the default + the only option pre-40.1).
+    /// Applied via `WriteBuilder::with_partition_columns` on first
+    /// write — Delta auto-creates the table with this layout if the
+    /// location is uninitialized. Subsequent writes to an
+    /// already-partitioned table must match the existing layout, or
+    /// deltalake-rs raises a clear error.
+    partition_columns: Vec<String>,
 }
 
 impl DeltaBackend {
@@ -103,6 +111,7 @@ impl DeltaBackend {
             base_label: abs.display().to_string(),
             store: Arc::new(store),
             storage_options: HashMap::new(),
+            partition_columns: Vec::new(),
         })
     }
 
@@ -181,7 +190,24 @@ impl DeltaBackend {
             base_label: format!("s3://{bucket}/{trimmed_prefix}"),
             store,
             storage_options: opts,
+            partition_columns: Vec::new(),
         })
+    }
+
+    /// Phase 40.1: configure partition columns for first-write
+    /// table creation. Pre-existing tables retain their layout;
+    /// deltalake-rs verifies + rejects mismatches at write time.
+    pub fn with_partition_columns(
+        mut self,
+        partition_columns: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.partition_columns = partition_columns.into_iter().map(|s| s.into()).collect();
+        self
+    }
+
+    /// Borrow the configured partition columns.
+    pub fn partition_columns(&self) -> &[String] {
+        &self.partition_columns
     }
 
     /// Open or uninitialized table at `url`, threading
@@ -630,9 +656,14 @@ impl Backend for DeltaBackend {
             WriteMode::Append => SaveMode::Append,
             WriteMode::Truncate => SaveMode::Overwrite,
         };
-        table
-            .write(batches)
-            .with_save_mode(save_mode)
+        let mut writer = table.write(batches).with_save_mode(save_mode);
+        if !self.partition_columns.is_empty() {
+            // Phase 40.1: only meaningful on the first write to a
+            // fresh location; deltalake-rs validates against an
+            // existing table's layout and errors clearly on mismatch.
+            writer = writer.with_partition_columns(self.partition_columns.clone());
+        }
+        writer
             .await
             .map_err(|e| BackendError::Query(format!("delta write: {e}")))?;
         Ok(total)
@@ -1333,6 +1364,27 @@ mod tests {
     use arrow_array::{Int64Array, StringArray};
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
     use std::sync::Arc;
+
+    /// Phase 40.1: with_partition_columns records the column list.
+    #[test]
+    fn with_partition_columns_records_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let b = DeltaBackend::open_local(dir.path())
+            .unwrap()
+            .with_partition_columns(["year", "month"]);
+        assert_eq!(
+            b.partition_columns(),
+            &["year".to_string(), "month".to_string()]
+        );
+    }
+
+    /// Phase 40.1: by default no partition columns (unpartitioned).
+    #[test]
+    fn partition_columns_default_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let b = DeltaBackend::open_local(dir.path()).unwrap();
+        assert!(b.partition_columns().is_empty());
+    }
 
     fn small_batch() -> RecordBatch {
         let schema = Arc::new(ArrowSchema::new(vec![

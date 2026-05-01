@@ -398,6 +398,13 @@ pub struct KafkaBackend {
     /// `Protobuf` (Phase 36h.5); ignored for JSON / RawBytes.
     /// Builder-set via `with_schema_registry_url`.
     schema_registry_url: Option<String>,
+    /// Phase 40.2: name of the Arrow column to use as the per-row
+    /// Kafka message key. `None` means round-robin (default sticky
+    /// partitioner) — matches pre-40.2 behavior. When set, the
+    /// column must exist in every produced batch and be a string-
+    /// compatible type (`Utf8`, `LargeUtf8`, or `Binary`); other
+    /// types raise a clear error at produce time.
+    message_key_column: Option<String>,
 }
 
 impl std::fmt::Debug for ConsumerSession {
@@ -436,7 +443,27 @@ impl KafkaBackend {
             delivery_semantics: KafkaDeliverySemantics::default(),
             producer_session: Arc::new(Mutex::new(ProducerSession::default())),
             schema_registry_url: None,
+            message_key_column: None,
         })
+    }
+
+    /// Phase 40.2: configure a per-row message-key column. When
+    /// set, `write_arrow_stream` extracts that column from each
+    /// `RecordBatch` and uses each value as the Kafka message
+    /// key — letting the broker route messages predictably to
+    /// partitions (downstream partition affinity, ordering by
+    /// key, log compaction).
+    ///
+    /// Supported column types: `Utf8`, `LargeUtf8`, `Binary`.
+    /// Other types raise at produce time.
+    pub fn with_message_key_column(mut self, column: impl Into<String>) -> Self {
+        self.message_key_column = Some(column.into());
+        self
+    }
+
+    /// Borrow the configured message-key column name (if any).
+    pub fn message_key_column(&self) -> Option<&str> {
+        self.message_key_column.as_deref()
     }
 
     /// Configure the Confluent Schema Registry URL used for Avro
@@ -749,10 +776,19 @@ impl KafkaBackend {
         // synchronously through `produce_payloads_to_topic`.
         let mut s = stream;
         let mut all_payloads: Vec<Vec<u8>> = Vec::new();
+        let mut all_keys: Vec<Vec<u8>> = Vec::new();
+        let key_col = self.message_key_column.clone();
         while let Some(batch) = futures_util::StreamExt::next(&mut s).await {
             let batch = batch?;
             if batch.num_rows() == 0 {
                 continue;
+            }
+            // Phase 40.2: pull keys before encoding so we error out
+            // on a missing/wrong-typed column without having paid
+            // the encode cost.
+            if let Some(col) = &key_col {
+                let mut keys = extract_message_keys(&batch, col)?;
+                all_keys.append(&mut keys);
             }
             let mut payloads = match self.payload_format {
                 KafkaPayloadFormat::Json => encode_batch_as_jsonl_lines(&batch)?,
@@ -789,8 +825,14 @@ impl KafkaBackend {
 
         // Produce-then-coordinate-then-commit. On any failure,
         // abort_transaction (best effort) and surface the error.
+        let keys_slice = if key_col.is_some() {
+            Some(all_keys.as_slice())
+        } else {
+            None
+        };
         let result = async {
-            let total = produce_payloads_to_topic(&producer, topic, &all_payloads).await?;
+            let total =
+                produce_payloads_to_topic(&producer, topic, &all_payloads, keys_slice).await?;
             // send_offsets_to_transaction only fires if the source
             // has both offsets and group metadata. A source without
             // a consumer session (e.g. a producer-only KafkaBackend
@@ -1330,6 +1372,12 @@ impl Backend for KafkaBackend {
             if batch.num_rows() == 0 {
                 continue;
             }
+            // Phase 40.2: extract per-row message keys before
+            // encoding so a missing column errors out cheaply.
+            let keys: Option<Vec<Vec<u8>>> = match &self.message_key_column {
+                Some(col) => Some(extract_message_keys(&batch, col)?),
+                None => None,
+            };
             let payloads = match self.payload_format {
                 KafkaPayloadFormat::Json => encode_batch_as_jsonl_lines(&batch)?,
                 KafkaPayloadFormat::RawBytes => encode_batch_as_raw_bytes(&batch)?,
@@ -1364,7 +1412,8 @@ impl Backend for KafkaBackend {
                     .map_err(|e| BackendError::Other(format!("kafka begin_transaction join: {e}")))?
                     .map_err(|e| BackendError::Query(format!("kafka begin_transaction: {e}")))?;
             }
-            let produce_result = produce_payloads_to_topic(&producer, topic, &payloads).await;
+            let produce_result =
+                produce_payloads_to_topic(&producer, topic, &payloads, keys.as_deref()).await;
             match produce_result {
                 Ok(n) => {
                     if transactional {
@@ -2303,23 +2352,120 @@ fn hex_nibble(c: u8) -> Result<u8, String> {
 /// successfully produced. Used by both the `AtLeastOnce` (no
 /// surrounding transaction) and `ExactlyOnce` (surrounding txn)
 /// produce paths in `write_arrow_stream`.
+///
+/// `keys`: when `Some`, must have one entry per `payloads` entry
+/// — each is used as the Kafka message key (Phase 40.2). When
+/// `None`, no key is set on the `FutureRecord` and the broker's
+/// default sticky partitioner picks a partition.
 async fn produce_payloads_to_topic(
     producer: &FutureProducer<EmatixKafkaContext>,
     topic: &str,
     payloads: &[Vec<u8>],
+    keys: Option<&[Vec<u8>]>,
 ) -> Result<u64, BackendError> {
+    if let Some(ks) = keys
+        && ks.len() != payloads.len()
+    {
+        return Err(BackendError::Other(format!(
+            "kafka produce {topic}: keys.len()={} != payloads.len()={}; \
+             internal invariant violation",
+            ks.len(),
+            payloads.len()
+        )));
+    }
     let mut total: u64 = 0;
-    for payload in payloads {
-        producer
-            .send(
-                FutureRecord::<(), [u8]>::to(topic).payload(payload.as_slice()),
-                Timeout::After(Duration::from_secs(5)),
-            )
-            .await
+    for (i, payload) in payloads.iter().enumerate() {
+        let timeout = Timeout::After(Duration::from_secs(5));
+        let send_result = match keys {
+            Some(ks) => {
+                producer
+                    .send(
+                        FutureRecord::<[u8], [u8]>::to(topic)
+                            .payload(payload.as_slice())
+                            .key(ks[i].as_slice()),
+                        timeout,
+                    )
+                    .await
+            }
+            None => {
+                producer
+                    .send(
+                        FutureRecord::<(), [u8]>::to(topic).payload(payload.as_slice()),
+                        timeout,
+                    )
+                    .await
+            }
+        };
+        send_result
             .map_err(|(e, _msg)| BackendError::Query(format!("kafka produce {topic}: {e}")))?;
         total += 1;
     }
     Ok(total)
+}
+
+/// Phase 40.2: extract per-row Kafka message keys from a
+/// `RecordBatch` column. Returns one `Vec<u8>` per row, with
+/// nulls becoming empty byte arrays (consistent with arrow-json
+/// null handling).
+///
+/// Supported column types: `Utf8`, `LargeUtf8`, `Binary`. Other
+/// types raise a `BackendError::Query` with a clear pointer.
+fn extract_message_keys(
+    batch: &RecordBatch,
+    column_name: &str,
+) -> Result<Vec<Vec<u8>>, BackendError> {
+    use arrow_array::{Array, BinaryArray, LargeStringArray, StringArray};
+
+    let column = batch.column_by_name(column_name).ok_or_else(|| {
+        BackendError::Query(format!(
+            "kafka produce: message_key_column `{column_name}` not present in batch \
+             (batch columns: {:?})",
+            batch
+                .schema()
+                .fields()
+                .iter()
+                .map(|f| f.name().clone())
+                .collect::<Vec<_>>()
+        ))
+    })?;
+    if let Some(arr) = column.as_any().downcast_ref::<StringArray>() {
+        return Ok((0..arr.len())
+            .map(|i| {
+                if arr.is_null(i) {
+                    Vec::new()
+                } else {
+                    arr.value(i).as_bytes().to_vec()
+                }
+            })
+            .collect());
+    }
+    if let Some(arr) = column.as_any().downcast_ref::<LargeStringArray>() {
+        return Ok((0..arr.len())
+            .map(|i| {
+                if arr.is_null(i) {
+                    Vec::new()
+                } else {
+                    arr.value(i).as_bytes().to_vec()
+                }
+            })
+            .collect());
+    }
+    if let Some(arr) = column.as_any().downcast_ref::<BinaryArray>() {
+        return Ok((0..arr.len())
+            .map(|i| {
+                if arr.is_null(i) {
+                    Vec::new()
+                } else {
+                    arr.value(i).to_vec()
+                }
+            })
+            .collect());
+    }
+    Err(BackendError::Query(format!(
+        "kafka produce: message_key_column `{column_name}` has unsupported type \
+         {:?}; expected Utf8, LargeUtf8, or Binary",
+        column.data_type()
+    )))
 }
 
 /// Encode a `RecordBatch` as JSONL bytes, then split on newlines so
@@ -3037,6 +3183,91 @@ mod tests {
         let b = KafkaBackend::open("localhost:9092", Some("g1")).unwrap();
         assert_eq!(config_get(&b, "transactional.id"), None);
         assert_eq!(config_get(&b, "enable.idempotence"), None);
+    }
+
+    /// Phase 40.2: with_message_key_column records the column name.
+    #[test]
+    fn with_message_key_column_records_value() {
+        let b = KafkaBackend::open("localhost:9092", None)
+            .unwrap()
+            .with_message_key_column("user_id");
+        assert_eq!(b.message_key_column(), Some("user_id"));
+    }
+
+    /// Phase 40.2: by default no key column → round-robin.
+    #[test]
+    fn message_key_column_default_is_none() {
+        let b = KafkaBackend::open("localhost:9092", None).unwrap();
+        assert!(b.message_key_column().is_none());
+    }
+
+    /// Phase 40.2: extract_message_keys handles a Utf8 column,
+    /// rendering nulls as empty bytes.
+    #[test]
+    fn extract_message_keys_utf8_column_with_nulls() {
+        use arrow_array::{Int64Array, StringArray};
+        use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("user", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1_i64, 2, 3])),
+                Arc::new(StringArray::from(vec![Some("alice"), None, Some("carol")])),
+            ],
+        )
+        .unwrap();
+        let keys = extract_message_keys(&batch, "user").unwrap();
+        assert_eq!(keys.len(), 3);
+        assert_eq!(keys[0], b"alice".to_vec());
+        assert_eq!(keys[1], Vec::<u8>::new());
+        assert_eq!(keys[2], b"carol".to_vec());
+    }
+
+    /// Phase 40.2: missing column raises a clear error.
+    #[test]
+    fn extract_message_keys_missing_column_errors() {
+        use arrow_array::Int64Array;
+        use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "id",
+            DataType::Int64,
+            false,
+        )]));
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1_i64]))]).unwrap();
+        let err = extract_message_keys(&batch, "user").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("not present in batch") && msg.contains("user"),
+            "got: {msg}"
+        );
+    }
+
+    /// Phase 40.2: unsupported column type raises a clear error.
+    #[test]
+    fn extract_message_keys_unsupported_type_errors() {
+        use arrow_array::Int64Array;
+        use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "user_id",
+            DataType::Int64,
+            false,
+        )]));
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1_i64, 2, 3]))])
+                .unwrap();
+        let err = extract_message_keys(&batch, "user_id").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unsupported type") && msg.contains("Utf8"),
+            "got: {msg}"
+        );
     }
 
     #[test]
