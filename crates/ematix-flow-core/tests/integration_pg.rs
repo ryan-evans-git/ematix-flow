@@ -3854,7 +3854,16 @@ use ematix_flow_core::KafkaBackend;
 use testcontainers_modules::kafka::apache::{KAFKA_PORT, Kafka};
 
 async fn start_kafka() -> (testcontainers::ContainerAsync<Kafka>, String) {
+    use testcontainers::ImageExt;
+    // The default apache:3.8 container only sets
+    // KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR=1; the
+    // transaction-state-log topic still defaults to RF=3 which is
+    // unsatisfiable on a single-broker setup, so any
+    // init_transactions() call hangs until timeout. Override here
+    // so Phase 36j tests pass alongside the rest.
     let container = Kafka::default()
+        .with_env_var("KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR", "1")
+        .with_env_var("KAFKA_TRANSACTION_STATE_LOG_MIN_ISR", "1")
         .start()
         .await
         .expect("failed to start kafka testcontainer");
@@ -4531,4 +4540,75 @@ async fn streaming_pipeline_routes_failed_batch_to_dlq() {
         dlq_rows, 3,
         "all 3 failed rows should have been routed to the DLQ"
     );
+}
+
+// ----- Phase 36j: Exactly-once produce ----------------------------------
+
+use ematix_flow_core::kafka_backend::KafkaDeliverySemantics;
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker; run with `cargo test -- --ignored`"]
+async fn kafka_exactly_once_produce_round_trip() {
+    use arrow_array::{Int64Array, RecordBatch as RB, StringArray};
+    use arrow_schema::{DataType as Dt, Field as F, Schema as S};
+
+    let (_container, bootstrap) = start_kafka().await;
+    let topic = "eos-produce-test";
+
+    // Random transactional id so re-running this test against the
+    // same broker doesn't fence by colliding with a prior id.
+    let transactional_id = format!(
+        "eos-test-{:x}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let producer = KafkaBackend::open(&bootstrap, None)
+        .unwrap()
+        .with_delivery_semantics(KafkaDeliverySemantics::ExactlyOnce { transactional_id });
+
+    // Produce two batches in one write_arrow_stream call. Each
+    // batch is wrapped in its own Kafka transaction.
+    let schema = std::sync::Arc::new(S::new(vec![
+        F::new("id", Dt::Int64, true),
+        F::new("name", Dt::Utf8, true),
+    ]));
+    let batch1 = RB::try_new(
+        schema.clone(),
+        vec![
+            std::sync::Arc::new(Int64Array::from(vec![1, 2])),
+            std::sync::Arc::new(StringArray::from(vec!["alice", "bob"])),
+        ],
+    )
+    .unwrap();
+    let batch2 = RB::try_new(
+        schema,
+        vec![
+            std::sync::Arc::new(Int64Array::from(vec![3])),
+            std::sync::Arc::new(StringArray::from(vec!["carol"])),
+        ],
+    )
+    .unwrap();
+    let batches = vec![batch1, batch2];
+    let stream = futures_util::stream::iter(batches.into_iter().map(Ok));
+    let stream: ematix_flow_core::backend::ArrowBatchStream = Box::pin(stream);
+
+    let target = TargetTable {
+        schema: "".into(),
+        name: topic.into(),
+    };
+    let n = producer
+        .write_arrow_stream(&target, stream, WriteMode::Append)
+        .await
+        .unwrap();
+    assert_eq!(n, 3);
+
+    // Verify the rows landed and are committed (read.committed ON
+    // by default for our consumer).
+    let consumer = KafkaBackend::open(&bootstrap, Some("eos-verify-grp")).unwrap();
+    let stream = consumer.read_arrow_stream(topic).await.unwrap();
+    let batches: Vec<_> = stream.try_collect().await.unwrap();
+    let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total, 3);
 }

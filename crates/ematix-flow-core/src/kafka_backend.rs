@@ -50,7 +50,7 @@ use rdkafka::Message;
 use rdkafka::admin::AdminClient;
 use rdkafka::client::{ClientContext, OAuthToken};
 use rdkafka::consumer::{CommitMode, Consumer, ConsumerContext, StreamConsumer};
-use rdkafka::producer::{FutureProducer, FutureRecord};
+use rdkafka::producer::{FutureProducer, FutureRecord, Producer};
 use rdkafka::topic_partition_list::{Offset, TopicPartitionList};
 use rdkafka::util::Timeout;
 
@@ -127,6 +127,65 @@ pub enum KafkaPayloadFormat {
 /// Column name used by the RawBytes decoder for the single Binary
 /// column it emits.
 const RAW_BYTES_COLUMN: &str = "payload";
+
+/// Producer-side delivery semantics for `write_arrow_stream`.
+///
+///   - `AtLeastOnce` (default): the existing per-row awaited produce
+///     path. A partial-batch failure surfaces with rows already on
+///     the topic; downstream consumers may see them.
+///   - `ExactlyOnce`: each `write_arrow_stream` batch is wrapped in
+///     a Kafka transaction (`begin_transaction` →
+///     produce all rows → `commit_transaction`, or
+///     `abort_transaction` on failure). Requires a unique
+///     `transactional_id`. Adds an extra round-trip per batch but
+///     gives all-or-nothing produce semantics.
+///
+/// Consumer-coordinated EOS via `send_offsets_to_transaction` (the
+/// full Kafka→Kafka read-process-write exactly-once flow) is a
+/// follow-up — see Phase 36j.2.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum KafkaDeliverySemantics {
+    #[default]
+    AtLeastOnce,
+    ExactlyOnce {
+        /// Unique-per-process transactional id. The broker fences
+        /// any prior producer using the same id, so reusing this
+        /// across multiple processes within the same time window
+        /// produces an `OperationNotPermitted` error from the
+        /// later-starting one.
+        transactional_id: String,
+    },
+}
+
+/// Cached producer + transactional-init state. Producers used in
+/// transactional mode must be reused across `write_arrow_stream`
+/// calls because:
+///   1. `init_transactions` is once-per-producer-lifetime, not
+///      once-per-transaction.
+///   2. Two producers with the same `transactional.id` are mutually
+///      exclusive at the broker level (the broker fences the older
+///      one), so a fresh handle per call would self-fence on the
+///      second call.
+///
+/// At-least-once mode also benefits from caching (avoids the cost
+/// of building a librdkafka client every batch) but functionally
+/// works either way.
+#[derive(Default)]
+struct ProducerSession {
+    producer: Option<Arc<FutureProducer<EmatixKafkaContext>>>,
+    /// Tracks whether init_transactions has been called on the
+    /// cached producer. Set true on first transactional write.
+    transactions_initialized: bool,
+}
+
+impl std::fmt::Debug for ProducerSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProducerSession")
+            .field("has_producer", &self.producer.is_some())
+            .field("transactions_initialized", &self.transactions_initialized)
+            .finish()
+    }
+}
 
 /// SCRAM mechanisms supported by librdkafka. Most cloud providers
 /// run SHA-512 by default; some self-hosted deployments still use
@@ -312,6 +371,14 @@ pub struct KafkaBackend {
     /// `write_arrow_stream`. Builder-set via `with_payload_format`;
     /// defaults to JSON.
     payload_format: KafkaPayloadFormat,
+    /// Producer-side delivery semantics. Builder-set via
+    /// `with_delivery_semantics`; defaults to `AtLeastOnce`.
+    delivery_semantics: KafkaDeliverySemantics,
+    /// Cached transactional producer state. Required for
+    /// `ExactlyOnce` because init_transactions is once-per-lifetime
+    /// and same-`transactional.id` producers are mutually exclusive
+    /// at the broker.
+    producer_session: Arc<Mutex<ProducerSession>>,
 }
 
 impl std::fmt::Debug for ConsumerSession {
@@ -347,7 +414,22 @@ impl KafkaBackend {
             consumer_session: Arc::new(Mutex::new(ConsumerSession::default())),
             auth: AuthMode::None,
             payload_format: KafkaPayloadFormat::default(),
+            delivery_semantics: KafkaDeliverySemantics::default(),
+            producer_session: Arc::new(Mutex::new(ProducerSession::default())),
         })
+    }
+
+    /// Override producer-side delivery semantics. Defaults to
+    /// `AtLeastOnce`. `ExactlyOnce { transactional_id }` wraps each
+    /// `write_arrow_stream` batch in a Kafka transaction.
+    pub fn with_delivery_semantics(mut self, semantics: KafkaDeliverySemantics) -> Self {
+        self.delivery_semantics = semantics;
+        self
+    }
+
+    /// Borrow the active delivery semantics (tests + introspection).
+    pub fn delivery_semantics(&self) -> &KafkaDeliverySemantics {
+        &self.delivery_semantics
     }
 
     /// Override the wire format for message payloads. JSON is the
@@ -509,6 +591,82 @@ impl KafkaBackend {
             .unwrap_or(0)
     }
 
+    /// Get (or lazily-create) the FutureProducer for this backend.
+    /// In `ExactlyOnce` mode the producer must be reused across
+    /// `write_arrow_stream` calls because (a) `init_transactions`
+    /// is once-per-producer-lifetime, and (b) two producers with
+    /// the same `transactional.id` are mutually fenced at the
+    /// broker. `AtLeastOnce` mode also caches for cheaper repeated
+    /// writes.
+    async fn acquire_producer(
+        &self,
+    ) -> Result<Arc<FutureProducer<EmatixKafkaContext>>, BackendError> {
+        // Fast path: producer exists and (for ExactlyOnce)
+        // transactions are already initialized.
+        let needs_setup = {
+            let session = self
+                .producer_session
+                .lock()
+                .map_err(|e| BackendError::Other(format!("kafka producer lock: {e}")))?;
+            match &session.producer {
+                Some(p) => {
+                    let need_init = matches!(
+                        &self.delivery_semantics,
+                        KafkaDeliverySemantics::ExactlyOnce { .. }
+                    ) && !session.transactions_initialized;
+                    if !need_init {
+                        return Ok(Arc::clone(p));
+                    }
+                    // Reuse existing handle but still need to run
+                    // init_transactions on it.
+                    Some(Arc::clone(p))
+                }
+                None => None,
+            }
+        };
+
+        let producer = match needs_setup {
+            Some(p) => p,
+            None => {
+                let producer: FutureProducer<EmatixKafkaContext> = self
+                    .client_config()
+                    .create_with_context(self.build_context())
+                    .map_err(|e| BackendError::Connection(format!("kafka producer create: {e}")))?;
+                Arc::new(producer)
+            }
+        };
+
+        // Run init_transactions for ExactlyOnce mode. Sync FFI →
+        // spawn_blocking. 30s is the librdkafka-recommended timeout
+        // for transactional bootstrap (broker registers the
+        // transactional.id, fences any prior producer using it).
+        if matches!(
+            &self.delivery_semantics,
+            KafkaDeliverySemantics::ExactlyOnce { .. }
+        ) {
+            let p = Arc::clone(&producer);
+            tokio::task::spawn_blocking(move || {
+                p.init_transactions(Timeout::After(Duration::from_secs(30)))
+            })
+            .await
+            .map_err(|e| BackendError::Other(format!("kafka init_transactions join: {e}")))?
+            .map_err(|e| BackendError::Query(format!("kafka init_transactions: {e}")))?;
+        }
+
+        let mut session = self
+            .producer_session
+            .lock()
+            .map_err(|e| BackendError::Other(format!("kafka producer lock: {e}")))?;
+        session.producer = Some(Arc::clone(&producer));
+        if matches!(
+            &self.delivery_semantics,
+            KafkaDeliverySemantics::ExactlyOnce { .. }
+        ) {
+            session.transactions_initialized = true;
+        }
+        Ok(producer)
+    }
+
     /// Get (or lazily-create) the StreamConsumer for `topic`. If the
     /// session is already subscribed to a different topic, drop the
     /// old consumer (and pending offsets — uncommitted reads on the
@@ -641,6 +799,14 @@ impl KafkaBackend {
                 config.set("security.protocol", "SASL_SSL");
                 config.set("sasl.mechanism", "OAUTHBEARER");
             }
+        }
+        // Phase 36j: producer-side transactional config. ExactlyOnce
+        // requires transactional.id + idempotence + acks=all (the
+        // broker enforces these prerequisites).
+        if let KafkaDeliverySemantics::ExactlyOnce { transactional_id } = &self.delivery_semantics {
+            config.set("transactional.id", transactional_id);
+            config.set("enable.idempotence", "true");
+            config.set("acks", "all");
         }
         config
     }
@@ -833,10 +999,11 @@ impl Backend for KafkaBackend {
                 "Kafka write_arrow_stream: target.name (topic) must be non-empty".into(),
             ));
         }
-        let producer: FutureProducer<EmatixKafkaContext> = self
-            .client_config()
-            .create_with_context(self.build_context())
-            .map_err(|e| BackendError::Connection(format!("kafka producer create: {e}")))?;
+        let producer = self.acquire_producer().await?;
+        let transactional = matches!(
+            &self.delivery_semantics,
+            KafkaDeliverySemantics::ExactlyOnce { .. }
+        );
 
         let mut s = stream;
         let mut total: u64 = 0;
@@ -849,22 +1016,51 @@ impl Backend for KafkaBackend {
                 KafkaPayloadFormat::Json => encode_batch_as_jsonl_lines(&batch)?,
                 KafkaPayloadFormat::RawBytes => encode_batch_as_raw_bytes(&batch)?,
             };
-            for payload in &payloads {
-                // The 5s timeout caps how long each produce can wait
-                // for broker ack. For real-AWS-MSK / Confluent Cloud
-                // this is generous; for slow networks the user
-                // should set `message.timeout.ms` on the underlying
-                // ClientConfig (future builder method).
-                producer
-                    .send(
-                        FutureRecord::<(), [u8]>::to(topic).payload(payload.as_slice()),
-                        Timeout::After(Duration::from_secs(5)),
-                    )
+            // ExactlyOnce: wrap the per-batch produce in a Kafka
+            // transaction so a partial-failure mid-batch aborts and
+            // no rows leak. The transaction is begun + committed
+            // synchronously via `spawn_blocking` (the underlying
+            // librdkafka calls block).
+            if transactional {
+                let p = Arc::clone(&producer);
+                tokio::task::spawn_blocking(move || p.begin_transaction())
                     .await
-                    .map_err(|(e, _msg)| {
-                        BackendError::Query(format!("kafka produce {topic}: {e}"))
-                    })?;
-                total += 1;
+                    .map_err(|e| BackendError::Other(format!("kafka begin_transaction join: {e}")))?
+                    .map_err(|e| BackendError::Query(format!("kafka begin_transaction: {e}")))?;
+            }
+            let produce_result = produce_payloads_to_topic(&producer, topic, &payloads).await;
+            match produce_result {
+                Ok(n) => {
+                    if transactional {
+                        let p = Arc::clone(&producer);
+                        tokio::task::spawn_blocking(move || {
+                            p.commit_transaction(Timeout::After(Duration::from_secs(30)))
+                        })
+                        .await
+                        .map_err(|e| {
+                            BackendError::Other(format!("kafka commit_transaction join: {e}"))
+                        })?
+                        .map_err(|e| {
+                            BackendError::Query(format!("kafka commit_transaction: {e}"))
+                        })?;
+                    }
+                    total += n;
+                }
+                Err(e) => {
+                    if transactional {
+                        // Best-effort abort; if the abort itself
+                        // fails (broker unreachable etc.) the
+                        // transaction is force-aborted on broker
+                        // timeout regardless. We surface the
+                        // original produce error.
+                        let p = Arc::clone(&producer);
+                        let _ = tokio::task::spawn_blocking(move || {
+                            p.abort_transaction(Timeout::After(Duration::from_secs(30)))
+                        })
+                        .await;
+                    }
+                    return Err(e);
+                }
             }
         }
         Ok(total)
@@ -1216,6 +1412,30 @@ fn encode_batch_as_raw_bytes(batch: &RecordBatch) -> Result<Vec<Vec<u8>>, Backen
     Ok(out)
 }
 
+/// Produce each `payload` to `topic` via `producer`, awaiting the
+/// broker ack per message. Returns the number of messages
+/// successfully produced. Used by both the `AtLeastOnce` (no
+/// surrounding transaction) and `ExactlyOnce` (surrounding txn)
+/// produce paths in `write_arrow_stream`.
+async fn produce_payloads_to_topic(
+    producer: &FutureProducer<EmatixKafkaContext>,
+    topic: &str,
+    payloads: &[Vec<u8>],
+) -> Result<u64, BackendError> {
+    let mut total: u64 = 0;
+    for payload in payloads {
+        producer
+            .send(
+                FutureRecord::<(), [u8]>::to(topic).payload(payload.as_slice()),
+                Timeout::After(Duration::from_secs(5)),
+            )
+            .await
+            .map_err(|(e, _msg)| BackendError::Query(format!("kafka produce {topic}: {e}")))?;
+        total += 1;
+    }
+    Ok(total)
+}
+
 /// Encode a `RecordBatch` as JSONL bytes, then split on newlines so
 /// each row becomes its own payload for produce. The `Vec<Vec<u8>>`
 /// has one entry per row (matching `batch.num_rows()`).
@@ -1471,6 +1691,41 @@ mod tests {
         let err = encode_batch_as_raw_bytes(&batch).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("type Binary"), "got: {msg}");
+    }
+
+    // --- Phase 36j: delivery semantics ------------------------------------
+
+    #[test]
+    fn delivery_semantics_default_is_at_least_once() {
+        let b = KafkaBackend::open("localhost:9092", Some("g1")).unwrap();
+        assert_eq!(*b.delivery_semantics(), KafkaDeliverySemantics::AtLeastOnce);
+    }
+
+    #[test]
+    fn with_delivery_semantics_exactly_once_sets_kafka_keys() {
+        let b = KafkaBackend::open("localhost:9092", Some("g1"))
+            .unwrap()
+            .with_delivery_semantics(KafkaDeliverySemantics::ExactlyOnce {
+                transactional_id: "p-tx-1".into(),
+            });
+        // transactional.id + idempotence + acks=all are all
+        // prerequisites the broker enforces for transactions.
+        assert_eq!(
+            config_get(&b, "transactional.id").as_deref(),
+            Some("p-tx-1")
+        );
+        assert_eq!(
+            config_get(&b, "enable.idempotence").as_deref(),
+            Some("true")
+        );
+        assert_eq!(config_get(&b, "acks").as_deref(), Some("all"));
+    }
+
+    #[test]
+    fn with_delivery_semantics_at_least_once_leaves_keys_unset() {
+        let b = KafkaBackend::open("localhost:9092", Some("g1")).unwrap();
+        assert_eq!(config_get(&b, "transactional.id"), None);
+        assert_eq!(config_get(&b, "enable.idempotence"), None);
     }
 
     #[test]
