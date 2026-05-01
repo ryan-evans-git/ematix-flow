@@ -4739,6 +4739,175 @@ async fn start_localstack() -> (testcontainers::ContainerAsync<LocalStack>, Stri
     (container, endpoint)
 }
 
+/// Helper: create a Kinesis stream on LocalStack with a given
+/// shard count, then wait for it to become ACTIVE. The Kinesis SDK
+/// doesn't auto-create streams; producing to or consuming from a
+/// nonexistent stream errors out.
+async fn kinesis_create_stream(endpoint: &str, region: &str, stream_name: &str, shard_count: i32) {
+    use aws_config::BehaviorVersion;
+    use aws_credential_types::Credentials;
+    use aws_sdk_kinesis::Client;
+    use aws_sdk_kinesis::config::Region;
+    use aws_sdk_kinesis::types::{StreamMode, StreamModeDetails, StreamStatus};
+
+    let cfg = aws_config::defaults(BehaviorVersion::latest())
+        .region(Region::new(region.to_string()))
+        .endpoint_url(endpoint)
+        .credentials_provider(Credentials::new("fake", "fake", None, None, "test"))
+        .load()
+        .await;
+    let client = Client::new(&cfg);
+
+    client
+        .create_stream()
+        .stream_name(stream_name)
+        .shard_count(shard_count)
+        .stream_mode_details(
+            StreamModeDetails::builder()
+                .stream_mode(StreamMode::Provisioned)
+                .build()
+                .expect("StreamModeDetails build"),
+        )
+        .send()
+        .await
+        .expect("create_stream");
+
+    // Poll up to ~10s for the stream to go ACTIVE.
+    for _ in 0..40 {
+        let resp = client
+            .describe_stream_summary()
+            .stream_name(stream_name)
+            .send()
+            .await
+            .expect("describe_stream_summary");
+        let status = resp
+            .stream_description_summary()
+            .map(|s| s.stream_status().clone())
+            .unwrap_or(StreamStatus::Creating);
+        if status == StreamStatus::Active {
+            return;
+        }
+        tokio::time::sleep(StdDuration::from_millis(250)).await;
+    }
+    panic!("stream {stream_name} did not become ACTIVE within timeout");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker; run with `cargo test -- --ignored`"]
+async fn kinesis_write_then_read_round_trip() {
+    use arrow_array::{Int64Array, StringArray};
+    use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+    use ematix_flow_core::backend::WriteMode;
+    use ematix_flow_core::kinesis_backend::KinesisBatchConfig;
+
+    let (_container, endpoint) = start_localstack().await;
+    let region = "us-east-1";
+    let stream = "rt-stream";
+    kinesis_create_stream(&endpoint, region, stream, 1).await;
+
+    // Produce 3 rows.
+    let producer = KinesisBackend::open(stream)
+        .unwrap()
+        .with_region(region)
+        .with_endpoint(endpoint.clone())
+        .with_static_credentials("fake", "fake");
+    let arrow_schema = Arc::new(ArrowSchema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("label", DataType::Utf8, false),
+    ]));
+    let batch = arrow_array::RecordBatch::try_new(
+        arrow_schema,
+        vec![
+            Arc::new(Int64Array::from(vec![1_i64, 2, 3])),
+            Arc::new(StringArray::from(vec!["alpha", "beta", "gamma"])),
+        ],
+    )
+    .unwrap();
+    let target = ematix_flow_core::backend::TargetTable {
+        schema: "".into(),
+        name: "rt".into(),
+    };
+    let stream_arr: ematix_flow_core::backend::ArrowBatchStream =
+        Box::pin(futures_util::stream::once(async move {
+            Ok::<_, ematix_flow_core::BackendError>(batch)
+        }));
+    let n = producer
+        .write_arrow_stream(&target, stream_arr, WriteMode::Append)
+        .await
+        .unwrap();
+    assert_eq!(n, 3);
+
+    // Consume.
+    let consumer = KinesisBackend::open(stream)
+        .unwrap()
+        .with_region(region)
+        .with_endpoint(endpoint)
+        .with_static_credentials("fake", "fake")
+        .with_batch_config(KinesisBatchConfig {
+            batch_size: 100,
+            batch_bytes: 1 << 20,
+            max_empty_polls: 8, // LocalStack can take a beat to populate the shard
+            idle_poll_ms: 300,
+        });
+    let stream_out = consumer.read_arrow_stream("any").await.unwrap();
+    let batches: Vec<_> = stream_out.try_collect().await.unwrap();
+    let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total, 3, "expected 3 rows; got {total}");
+
+    let mut ids: Vec<i64> = Vec::new();
+    let mut labels: Vec<String> = Vec::new();
+    for b in &batches {
+        let id_col = b
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let lb_col = b
+            .column_by_name("label")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        for i in 0..b.num_rows() {
+            ids.push(id_col.value(i));
+            labels.push(lb_col.value(i).to_string());
+        }
+    }
+    ids.sort_unstable();
+    assert_eq!(ids, vec![1, 2, 3]);
+    assert!(labels.contains(&"alpha".to_string()));
+    assert!(labels.contains(&"beta".to_string()));
+    assert!(labels.contains(&"gamma".to_string()));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker; run with `cargo test -- --ignored`"]
+async fn kinesis_read_empty_stream_returns_empty_stream() {
+    use ematix_flow_core::kinesis_backend::KinesisBatchConfig;
+
+    let (_container, endpoint) = start_localstack().await;
+    let region = "us-east-1";
+    let stream = "empty-stream";
+    kinesis_create_stream(&endpoint, region, stream, 1).await;
+
+    let consumer = KinesisBackend::open(stream)
+        .unwrap()
+        .with_region(region)
+        .with_endpoint(endpoint)
+        .with_static_credentials("fake", "fake")
+        .with_batch_config(KinesisBatchConfig {
+            batch_size: 100,
+            batch_bytes: 1 << 20,
+            max_empty_polls: 1,
+            idle_poll_ms: 100,
+        });
+    let stream_out = consumer.read_arrow_stream("any").await.unwrap();
+    let batches: Vec<_> = stream_out.try_collect().await.unwrap();
+    let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total, 0);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs Docker; run with `cargo test -- --ignored`"]
 async fn kinesis_backend_ping_against_localstack() {
