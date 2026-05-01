@@ -23,7 +23,10 @@ use crate::backend::{
     ArrowBatchStream, Backend, BackendError, DeleteHandling, Dialect, StrategyRunResult,
     TargetTable, WriteMode,
 };
-use crate::meta::{WatermarkConfig, build_hard_delete_sql, wrap_with_watermark_filter};
+use crate::meta::{
+    WatermarkConfig, build_hard_delete_sql, build_scd2_close_missing_sql,
+    wrap_with_watermark_filter,
+};
 use crate::pg::ConnectionInfo;
 use crate::strategy::append::{BATCH_ID_COL, LOADED_AT_COL, plan_same_db_append};
 use crate::strategy::scd2::{IS_CURRENT_COL, ROW_HASH_COL, VALID_FROM_COL, VALID_TO_COL};
@@ -138,6 +141,22 @@ fn duckdb_merge_sql(
 /// user input).
 fn substitute_batch_id(sql: &str, batch_id: &Uuid) -> String {
     sql.replace("$1::uuid", &format!("'{}'::uuid", batch_id))
+}
+
+/// DuckDB equivalent of `meta::build_scd2_ttl_expire_sql`. PG uses
+/// `make_interval(secs => N)` and TIMESTAMPTZ - INTERVAL arithmetic;
+/// DuckDB's `(TIMESTAMP WITH TIME ZONE, INTERVAL) -> ?` overload
+/// doesn't exist, so we compare epoch seconds instead.
+fn duckdb_scd2_ttl_expire_sql(target_schema: &str, target_table: &str, ttl_seconds: i64) -> String {
+    format!(
+        "UPDATE {schema}.{table} \
+         SET valid_to = now(), is_current = false \
+         WHERE is_current \
+           AND epoch(valid_from) < epoch(now()) - {ttl_seconds}",
+        schema = target_schema,
+        table = target_table,
+        ttl_seconds = ttl_seconds,
+    )
 }
 
 /// DuckDB equivalent of `pg::hash::postgres_digest_expression`.
@@ -978,15 +997,13 @@ impl Backend for DuckDBBackend {
                     .into(),
             ));
         }
-        if delete_handling.is_some() {
-            return Err(BackendError::Other(
-                "DuckDB run_scd2: handle_deletes not yet supported (Phase 31d)".into(),
-            ));
-        }
-        if ttl_seconds.is_some() {
-            return Err(BackendError::Other(
-                "DuckDB run_scd2: ttl_seconds not yet supported (Phase 31d)".into(),
-            ));
+        if let Some(dh) = delete_handling
+            && !matches!(dh, DeleteHandling::Soft)
+        {
+            return Err(BackendError::Other(format!(
+                "DuckDB run_scd2: only DeleteHandling::Soft is supported \
+                 (got {dh:?}); Hard is for merge"
+            )));
         }
         let batch_id = Uuid::new_v4();
         let run_id = Uuid::new_v4();
@@ -994,7 +1011,7 @@ impl Backend for DuckDBBackend {
         // across runs that share a connection. Hex of the run UUID
         // (no dashes) satisfies both.
         let run_token = run_id.simple().to_string();
-        let stmts = duckdb_scd2_statements(
+        let mut stmts = duckdb_scd2_statements(
             spec,
             source_query,
             keys,
@@ -1003,6 +1020,28 @@ impl Backend for DuckDBBackend {
             event_timestamp_column,
             &batch_id,
         );
+        // Soft-delete: close out current versions whose key is missing
+        // from the new source. Append to the statement list so it runs
+        // inside the same transaction as the SCD2 plan but after the
+        // INSERT (so newly added current rows don't get accidentally
+        // closed by their own absence in the join). The drop of the
+        // temp table stays last.
+        let drop_temp = stmts.pop().expect("plan ends with DROP TABLE");
+        if matches!(delete_handling, Some(DeleteHandling::Soft)) {
+            stmts.push(build_scd2_close_missing_sql(
+                &spec.schema,
+                &spec.name,
+                keys,
+                source_query,
+            ));
+        }
+        // TTL expiry: tombstone any current row whose valid_from has
+        // aged past the freshness window. Runs whether or not the
+        // user supplied soft-delete.
+        if let Some(ttl) = ttl_seconds {
+            stmts.push(duckdb_scd2_ttl_expire_sql(&spec.schema, &spec.name, ttl));
+        }
+        stmts.push(drop_temp);
 
         self.ensure_meta_schema().await?;
         self.record_run_start(

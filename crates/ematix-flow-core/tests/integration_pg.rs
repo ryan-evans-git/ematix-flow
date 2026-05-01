@@ -1667,3 +1667,189 @@ async fn duckdb_run_merge_handle_deletes_removes_missing_keys() {
     assert_eq!(total, 2, "row 3 deleted; only 1 + 2 remain");
     assert_eq!(row3, 0, "row 3 specifically gone");
 }
+
+// --- Phase 31d.4: DuckDB SCD2 handle_deletes + ttl_seconds ---------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn duckdb_run_scd2_soft_delete_closes_missing_keys() {
+    use ematix_flow_core::meta::DeleteHandling;
+    let backend: Arc<dyn Backend> = Arc::new(DuckDBBackend::open(":memory:").unwrap());
+    backend.execute("CREATE SCHEMA src").await.unwrap();
+    backend.execute("CREATE SCHEMA wh").await.unwrap();
+    backend
+        .execute("CREATE TABLE src.customers (customer_id BIGINT, email VARCHAR, name VARCHAR)")
+        .await
+        .unwrap();
+    backend
+        .execute(
+            "INSERT INTO src.customers VALUES \
+             (1, 'a@x.com', 'alice'), (2, 'b@x.com', 'bob')",
+        )
+        .await
+        .unwrap();
+    create_duckdb_scd2_target(&backend).await;
+    let target = duckdb_scd2_dim_spec();
+
+    // First load — both rows current.
+    backend
+        .run_scd2(
+            &target,
+            "SELECT customer_id, email, name FROM src.customers",
+            &["customer_id".into()],
+            &["email".into(), "name".into()],
+            "duckdb_soft_delete_test",
+            None,
+            None,
+            None,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+
+    // Drop bob from source.
+    backend
+        .execute("DELETE FROM src.customers WHERE customer_id = 2")
+        .await
+        .unwrap();
+    // Re-run with soft-delete.
+    backend
+        .run_scd2(
+            &target,
+            "SELECT customer_id, email, name FROM src.customers",
+            &["customer_id".into()],
+            &["email".into(), "name".into()],
+            "duckdb_soft_delete_test_2",
+            None,
+            Some(DeleteHandling::Soft),
+            None,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+
+    // Bob's current row got closed: is_current=false, valid_to set.
+    use arrow_array::Int64Array;
+    let stream = backend
+        .read_arrow_stream(
+            "SELECT \
+              sum(CASE WHEN customer_id = 2 AND is_current THEN 1 ELSE 0 END)::BIGINT, \
+              sum(CASE WHEN customer_id = 2 AND NOT is_current AND valid_to IS NOT NULL THEN 1 ELSE 0 END)::BIGINT, \
+              sum(CASE WHEN customer_id = 1 AND is_current THEN 1 ELSE 0 END)::BIGINT \
+             FROM wh.customer_dim",
+        )
+        .await
+        .unwrap();
+    let batches: Vec<_> = stream.try_collect().await.unwrap();
+    let bob_current = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap()
+        .value(0);
+    let bob_closed = batches[0]
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap()
+        .value(0);
+    let alice_current = batches[0]
+        .column(2)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(bob_current, 0, "bob's current row was closed");
+    assert_eq!(bob_closed, 1, "bob has exactly one closed row");
+    assert_eq!(alice_current, 1, "alice still current");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn duckdb_run_scd2_ttl_expires_stale_current_rows() {
+    let backend: Arc<dyn Backend> = Arc::new(DuckDBBackend::open(":memory:").unwrap());
+    backend.execute("CREATE SCHEMA src").await.unwrap();
+    backend.execute("CREATE SCHEMA wh").await.unwrap();
+    backend
+        .execute("CREATE TABLE src.customers (customer_id BIGINT, email VARCHAR, name VARCHAR)")
+        .await
+        .unwrap();
+    backend
+        .execute("INSERT INTO src.customers VALUES (1, 'a@x.com', 'alice')")
+        .await
+        .unwrap();
+    create_duckdb_scd2_target(&backend).await;
+    let target = duckdb_scd2_dim_spec();
+
+    // First load with ttl=600s — alice's valid_from = now(), so she's
+    // not stale yet.
+    backend
+        .run_scd2(
+            &target,
+            "SELECT customer_id, email, name FROM src.customers",
+            &["customer_id".into()],
+            &["email".into(), "name".into()],
+            "duckdb_ttl_test_1",
+            None,
+            None,
+            None,
+            Some(600),
+            false,
+        )
+        .await
+        .unwrap();
+
+    // Force-age alice's valid_from beyond the TTL window.
+    backend
+        .execute(
+            "UPDATE wh.customer_dim SET valid_from = now() - INTERVAL '2 hours' \
+             WHERE customer_id = 1",
+        )
+        .await
+        .unwrap();
+
+    // Re-run with same source: TTL expiry should close alice's current
+    // version even though her data hasn't changed (no new version
+    // inserted, just tombstone).
+    backend
+        .run_scd2(
+            &target,
+            "SELECT customer_id, email, name FROM src.customers",
+            &["customer_id".into()],
+            &["email".into(), "name".into()],
+            "duckdb_ttl_test_2",
+            None,
+            None,
+            None,
+            Some(600),
+            false,
+        )
+        .await
+        .unwrap();
+
+    use arrow_array::Int64Array;
+    let stream = backend
+        .read_arrow_stream(
+            "SELECT \
+              sum(CASE WHEN is_current THEN 1 ELSE 0 END)::BIGINT, \
+              sum(CASE WHEN NOT is_current AND valid_to IS NOT NULL THEN 1 ELSE 0 END)::BIGINT \
+             FROM wh.customer_dim",
+        )
+        .await
+        .unwrap();
+    let batches: Vec<_> = stream.try_collect().await.unwrap();
+    let currents = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap()
+        .value(0);
+    let closed = batches[0]
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(currents, 0, "alice's current row was TTL-expired");
+    assert_eq!(closed, 1, "exactly one closed row from the TTL sweep");
+}
