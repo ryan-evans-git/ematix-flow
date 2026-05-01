@@ -60,6 +60,86 @@ def sync_customers(conn):
     return "SELECT customer_id, email, name, updated_at FROM raw.customers"
 ```
 
+### Where does the data come from / go to?
+
+In the example above:
+
+| Element | What | Where it's configured |
+|--|--|--|
+| The target table | `analytics.customer_dim` | `schema=` on `@ematix.table` + the class name (snake-cased: `CustomerDim` → `customer_dim`). Override the table name with `@ematix.table(schema=..., name="...")`. |
+| The source table | `raw.customers` | The SQL string returned from `sync_customers(conn)`. Could equally well be a join, a subquery with filters, etc. |
+| The database | The connection named `default` | The `conn` parameter is implicitly the *source* connection, resolved from the connection registry (see below). |
+
+By default, source and target use the same connection (same DB → same-DB
+fast path: `INSERT … SELECT`). To cross databases, name them
+explicitly:
+
+```python
+@ematix.pipeline(
+    target=CustomerDim,
+    schedule="0 * * * *",
+    mode="scd2",
+    compare_columns=["email", "name"],
+    source_connection="raw_db",       # ← named connection
+    target_connection="warehouse",    # ← named connection
+)
+def sync_customers(conn):
+    # `conn` here is the SOURCE connection (raw_db).
+    return "SELECT customer_id, email, name, updated_at FROM customers"
+```
+
+When `source_connection != target_connection`, the framework switches
+to the cross-DB Arrow path: read source rows as Arrow batches, stream
+them into the target. No `COPY BINARY` shortcut, but no row-by-row
+`INSERT` either.
+
+### Configuring connections
+
+A connection name like `"raw_db"` resolves through this chain (highest
+priority first):
+
+1. Env var **`EMATIX_FLOW_DSN_RAW_DB`** (uppercased), e.g.
+   `EMATIX_FLOW_DSN_RAW_DB=postgres://user:pw@host/db`.
+2. Env var **`EMATIX_FLOW_DSN`** — only for the connection literally
+   named `default`.
+3. Project file **`./.ematix-flow.toml`** in the working directory:
+   ```toml
+   [connections.raw_db]
+   url = "postgres://user:${RAW_DB_PASSWORD}@host/raw"
+
+   [connections.warehouse]
+   url = "postgres://${WAREHOUSE_DSN}"
+   ```
+4. User file **`~/.ematix-flow/connections.toml`** (same shape).
+5. Inline **`config.connect(url=...)`** as a low-level escape hatch.
+
+TOML values support `${VAR}` env-var interpolation, so secrets can stay
+out of files. Inspect what got picked with `flow connections list` /
+`flow connections check warehouse`.
+
+### Two function signatures
+
+The pipeline-decorated function can take 0 or 1 args:
+
+| Signature | When to use | What `conn` is |
+|--|--|--|
+| `def sync(conn): return "SELECT …"` | Source SQL needs computed dynamically (filters, dates, etc.) | The source connection (the active `_core.Connection`). |
+| `def sync(): pass` | Static source. Pair with `source_table="raw.customers"` on the decorator and an optional `column_map={"target_col": "source_col", ...}`. | n/a. |
+
+The static form lets you skip writing `SELECT *` boilerplate:
+
+```python
+@ematix.pipeline(
+    target=CustomerDim,
+    schedule="0 * * * *",
+    mode="scd2",
+    source_table="raw.customers",  # framework synthesizes SELECT
+    compare_columns=["email", "name"],
+)
+def sync_customers():
+    pass
+```
+
 ### How merge keys are resolved
 
 For `merge` and `scd2` pipelines, `keys=` is **optional**. The
