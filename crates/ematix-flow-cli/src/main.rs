@@ -8,7 +8,9 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
+use ematix_flow_cli::supervisor::{RestartPolicy, run_supervised_consume};
 use ematix_flow_cli::{CliError, ConsumeOptions, PipelineCliConfig, run_consume_with};
+use ematix_flow_core::streaming::install_shutdown_handler;
 use tracing::{error, info};
 
 #[derive(Debug, Parser)]
@@ -37,6 +39,28 @@ enum Commands {
         /// signal so both stop together.
         #[arg(long, value_name = "PORT")]
         metrics_port: Option<u16>,
+        /// Restart the pipeline on error with exponential backoff.
+        /// Off by default (CI / Kubernetes / systemd typically
+        /// supervise externally). When on, see the tuning flags
+        /// below for backoff schedule + restart cap.
+        #[arg(long)]
+        restart_on_error: bool,
+        /// First backoff sleep (ms) after an error. Doubles each
+        /// subsequent failure up to `--max-backoff-ms`.
+        #[arg(long, value_name = "MS", default_value_t = 1_000)]
+        initial_backoff_ms: u64,
+        /// Maximum backoff sleep (ms) between retries.
+        #[arg(long, value_name = "MS", default_value_t = 60_000)]
+        max_backoff_ms: u64,
+        /// Cap on consecutive restarts. Resets to zero after a run
+        /// that lasted at least `--reset-backoff-after-secs`. Omit
+        /// for unlimited.
+        #[arg(long, value_name = "N")]
+        max_restarts: Option<u32>,
+        /// If a run lasted at least this long before erroring,
+        /// reset the consecutive-restart counter and the backoff.
+        #[arg(long, value_name = "SECS", default_value_t = 60)]
+        reset_backoff_after_secs: u64,
     },
 }
 
@@ -49,19 +73,34 @@ async fn main() -> ExitCode {
         Commands::Consume {
             config,
             metrics_port,
-        } => match run_consume_cmd(&config, metrics_port).await {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(e) => {
-                error!(error = %e, "flow consume failed");
-                ExitCode::from(1)
+            restart_on_error,
+            initial_backoff_ms,
+            max_backoff_ms,
+            max_restarts,
+            reset_backoff_after_secs,
+        } => {
+            let policy = RestartPolicy {
+                enabled: restart_on_error,
+                initial_backoff_ms,
+                max_backoff_ms,
+                max_restarts,
+                reset_after_secs: reset_backoff_after_secs,
+            };
+            match run_consume_cmd(&config, metrics_port, policy).await {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    error!(error = %e, "flow consume failed");
+                    ExitCode::from(1)
+                }
             }
-        },
+        }
     }
 }
 
 async fn run_consume_cmd(
     path: &std::path::Path,
     metrics_port: Option<u16>,
+    policy: RestartPolicy,
 ) -> Result<(), CliError> {
     let cfg = PipelineCliConfig::from_path(path)?;
     info!(
@@ -69,15 +108,32 @@ async fn run_consume_cmd(
         source_query = cfg.source_query.as_str(),
         idle_pause_ms = cfg.idle_pause_ms,
         metrics_port = ?metrics_port,
+        restart_on_error = policy.enabled,
         "starting pipeline"
     );
-    let metrics = run_consume_with(cfg, ConsumeOptions { metrics_port }).await?;
-    info!(
-        total_rows = metrics.total_rows,
-        iterations = metrics.iterations,
-        shutdown_triggered = metrics.shutdown_triggered,
-        "pipeline exited cleanly"
-    );
+    let options = ConsumeOptions { metrics_port };
+    if policy.enabled {
+        // Single SIGTERM/SIGINT signal shared by the supervisor
+        // (to break out of backoff sleeps early) and by the
+        // wrapped pipeline (so an in-flight run also drains).
+        let (shutdown, _shutdown_handle) = install_shutdown_handler();
+        let summary = run_supervised_consume(cfg, options, policy, shutdown).await?;
+        info!(
+            total_runs = summary.total_runs,
+            error_restarts = summary.error_restarts,
+            backoff_history_ms = ?summary.backoff_history_ms,
+            final_total_rows = summary.final_metrics.as_ref().map(|m| m.total_rows),
+            "supervisor exited cleanly"
+        );
+    } else {
+        let metrics = run_consume_with(cfg, options).await?;
+        info!(
+            total_rows = metrics.total_rows,
+            iterations = metrics.iterations,
+            shutdown_triggered = metrics.shutdown_triggered,
+            "pipeline exited cleanly"
+        );
+    }
     Ok(())
 }
 

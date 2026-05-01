@@ -14,12 +14,14 @@
 //!     RabbitMQ / Pub/Sub / Kinesis / Delta-local as targets.
 //!     S3-backed Delta + the `ObjectStore` formats are deferred to a
 //!     follow-up sub-phase.
-//!   - **CLI.2 (this commit)** — `/metrics` HTTP endpoint exposing
-//!     the pipeline's Prometheus registry. Opt in with
-//!     `--metrics-port <PORT>`. Server shares the pipeline's
-//!     shutdown signal so both stop together.
-//!   - **CLI.3** — Process-level supervisor: restart-on-crash with
-//!     exponential backoff, multi-pipeline concurrency.
+//!   - **CLI.2** — `/metrics` HTTP endpoint exposing the pipeline's
+//!     Prometheus registry. Opt in with `--metrics-port <PORT>`.
+//!     Server shares the pipeline's shutdown signal so both stop
+//!     together.
+//!   - **CLI.3 (this commit)** — Process-level supervisor:
+//!     restart-on-crash with exponential backoff. Opt in with
+//!     `--restart-on-error` plus tuning flags. See
+//!     [`crate::supervisor`].
 //!
 //! ## TOML config shape
 //! ```toml
@@ -53,6 +55,7 @@ use ematix_flow_core::streaming::{
 };
 
 pub mod metrics_server;
+pub mod supervisor;
 use ematix_flow_core::{
     DeltaBackend, DuckDBBackend, KafkaBackend, KinesisBackend, MySQLBackend, PostgresBackend,
     PubSubBackend, RabbitMQBackend, SQLiteBackend,
