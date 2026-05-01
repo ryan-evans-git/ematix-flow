@@ -26,8 +26,13 @@ deadpool-postgres = "0.14"
 uuid = { version = "1", features = ["v4"] }
 futures-util = "0.3"
 bytes = "1"
-arrow-array = "55"
-arrow-schema = "55"
+arrow-array = "56"
+arrow-schema = "56"
+# DuckDB pinned so the bundled C source matches the arrow-array version.
+# `bundled` compiles DuckDB from source on the first build (~3-5 min,
+# one-time); subsequent builds are cached. This avoids depending on a
+# system DuckDB install for CI.
+duckdb = { version = "1.4", features = ["bundled", "appender-arrow"] }
 testcontainers = "0.27"
 testcontainers-modules = { version = "0.15", features = ["postgres"] }
 

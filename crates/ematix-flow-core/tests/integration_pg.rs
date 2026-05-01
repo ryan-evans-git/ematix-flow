@@ -7,6 +7,7 @@
 
 use std::sync::Arc;
 
+use ematix_flow_core::DuckDBBackend;
 use ematix_flow_core::backend::{
     Backend, Dialect, PostgresBackend, StrategyRunResult, TargetTable, WriteMode,
 };
@@ -344,6 +345,108 @@ async fn arrow_round_trip_via_backend_trait() {
         .await
         .unwrap();
     assert_eq!(null_count, 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker; run with `cargo test -- --ignored`"]
+async fn cross_backend_pg_to_duckdb_arrow() {
+    // Phase 31a's headline test: drive an Arrow stream from a real
+    // Postgres source into an in-memory DuckDB target. This is the
+    // first cross-dialect dispatch in the framework.
+    use futures_util::TryStreamExt;
+
+    let (_container, url) = start_postgres().await;
+    let pg_pool = Arc::new(PgPool::connect(&url).await.unwrap());
+    let pg: Arc<dyn Backend> = Arc::new(PostgresBackend::new(pg_pool.clone(), url.clone()));
+    let duck: Arc<dyn Backend> = Arc::new(DuckDBBackend::open(":memory:").unwrap());
+
+    // Seed the PG side.
+    pg.execute("CREATE SCHEMA cb_src").await.unwrap();
+    pg.execute("CREATE TABLE cb_src.events (id BIGINT, name TEXT, score DOUBLE PRECISION)")
+        .await
+        .unwrap();
+    pg.execute(
+        "INSERT INTO cb_src.events VALUES \
+         (1, 'alice', 1.5), (2, 'bob', 2.5), (3, NULL, 3.5)",
+    )
+    .await
+    .unwrap();
+
+    // Set up the DuckDB target.
+    duck.execute("CREATE SCHEMA duck_dst").await.unwrap();
+    duck.execute("CREATE TABLE duck_dst.events (id BIGINT, name VARCHAR, score DOUBLE)")
+        .await
+        .unwrap();
+
+    // Cross-dialect: PG dialect != DuckDB dialect → must go through
+    // Arrow streaming.
+    assert_ne!(pg.dialect(), duck.dialect());
+
+    // Read from PG, write to DuckDB.
+    let stream = pg
+        .read_arrow_stream("SELECT id, name, score FROM cb_src.events ORDER BY id")
+        .await
+        .unwrap();
+    let target = TargetTable {
+        schema: "duck_dst".into(),
+        name: "events".into(),
+    };
+    let written = duck
+        .write_arrow_stream(&target, stream, WriteMode::Append)
+        .await
+        .unwrap();
+    assert_eq!(written, 3);
+
+    // Verify by reading back from DuckDB.
+    let verify_stream = duck
+        .read_arrow_stream("SELECT id, name, score FROM duck_dst.events ORDER BY id")
+        .await
+        .unwrap();
+    let verify_batches: Vec<_> = verify_stream.try_collect().await.unwrap();
+    let total: usize = verify_batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total, 3);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker; run with `cargo test -- --ignored`"]
+async fn cross_backend_duckdb_to_pg_arrow() {
+    // Reverse direction: DuckDB source → PG target.
+    let (_container, url) = start_postgres().await;
+    let pg_pool = Arc::new(PgPool::connect(&url).await.unwrap());
+    let pg: Arc<dyn Backend> = Arc::new(PostgresBackend::new(pg_pool.clone(), url.clone()));
+    let duck: Arc<dyn Backend> = Arc::new(DuckDBBackend::open(":memory:").unwrap());
+
+    duck.execute("CREATE SCHEMA src").await.unwrap();
+    duck.execute("CREATE TABLE src.t (id BIGINT, label VARCHAR)")
+        .await
+        .unwrap();
+    duck.execute("INSERT INTO src.t VALUES (10, 'x'), (20, 'y')")
+        .await
+        .unwrap();
+
+    pg.execute("CREATE SCHEMA dst").await.unwrap();
+    pg.execute("CREATE TABLE dst.t (id BIGINT, label TEXT)")
+        .await
+        .unwrap();
+
+    let stream = duck
+        .read_arrow_stream("SELECT id, label FROM src.t ORDER BY id")
+        .await
+        .unwrap();
+    let target = TargetTable {
+        schema: "dst".into(),
+        name: "t".into(),
+    };
+    let written = pg
+        .write_arrow_stream(&target, stream, WriteMode::Append)
+        .await
+        .unwrap();
+    assert_eq!(written, 2);
+    let count = pg_pool
+        .fetch_scalar_int("SELECT count(*)::int FROM dst.t")
+        .await
+        .unwrap();
+    assert_eq!(count, 2);
 }
 
 #[tokio::test(flavor = "multi_thread")]

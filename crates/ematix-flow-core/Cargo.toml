@@ -25,6 +25,7 @@ bytes.workspace = true
 async-trait = "0.1"
 arrow-array = { workspace = true }
 arrow-schema = { workspace = true }
+duckdb = { workspace = true }
 
 [dev-dependencies]
 testcontainers.workspace = true
