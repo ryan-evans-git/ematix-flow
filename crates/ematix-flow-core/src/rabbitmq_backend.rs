@@ -1,13 +1,10 @@
-//! Phase 37a: RabbitMQ backend skeleton.
+//! Phase 37a: RabbitMQ backend.
 //!
 //! Wraps `lapin` (pure-rust AMQP 0.9.1 client) as a `Backend` so the
 //! same trait surface drives RabbitMQ pipelines that already drives
-//! Kafka, the DB / object-store / Delta backends. 37a covers the
-//! connection-level surface only — `read_arrow_stream` /
-//! `write_arrow_stream` and the strategy executors are stubbed and
-//! land in 37a.x.
+//! Kafka, the DB / object-store / Delta backends.
 //!
-//! ## What 37a ships
+//! ## What 37a ships (skeleton + ping)
 //!   - `RabbitMQBackend::open(amqp_url)` — wraps an AMQP URI of the
 //!     form `amqp://user:pass@host:port/vhost`.
 //!   - `dialect()` → `Dialect::Streaming { kind: RabbitMQ }`.
@@ -16,12 +13,25 @@
 //!   - `ping()` opens a connection, declares a channel, closes both,
 //!     all under a short timeout.
 //!   - `execute()` rejects: AMQP has no SQL surface.
-//!   - All five strategy executors stub with phase-marker errors,
-//!     mirroring the Kafka skeleton's rejection patterns.
+//!
+//! ## What 37a.2 adds (Arrow IO)
+//!   - `read_arrow_stream(queue)` — drains the queue via
+//!     `basic_consume` until idle (no message for `idle_timeout_ms`)
+//!     or the size/byte/window limits in `RabbitBatchConfig` fire.
+//!     Decodes each payload as JSON and concatenates rows into one
+//!     `RecordBatch` via arrow-json. Auto-ack is on; manual ack with
+//!     at-least-once semantics lands in 37a.3.
+//!   - `write_arrow_stream(target, ...)` — encodes each row as JSONL
+//!     and produces via `basic_publish` to the default exchange with
+//!     `routing_key = target.name`. Default-exchange routing means
+//!     `target.name` is the destination queue. Custom exchanges land
+//!     in 37a.x once the routing-key contract is settled.
+//!   - `WriteMode::Truncate` is rejected — queues are append-style
+//!     streams; purging is an admin operation.
 //!
 //! ## What lands in 37a.x
-//!   - 37a.2 — Arrow IO (consume/produce against a queue/exchange).
-//!   - 37a.3 — manual ack with at-least-once delivery semantics.
+//!   - 37a.3 — manual ack with at-least-once delivery semantics
+//!     (mirrors Kafka manual offset commits, 36e).
 //!   - 37a.4 — DLQ via dead-letter exchange.
 //!   - 37a.5 — auth providers (TLS, SASL EXTERNAL, plain login —
 //!     `lapin` already supports them through the URI scheme; expose
@@ -37,14 +47,42 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
-use lapin::{Connection, ConnectionProperties};
+use futures_util::StreamExt;
+use lapin::options::{BasicConsumeOptions, BasicPublishOptions};
+use lapin::types::FieldTable;
+use lapin::{BasicProperties, Connection, ConnectionProperties};
 
 use crate::backend::{
     ArrowBatchStream, Backend, BackendError, DeleteHandling, Dialect, StrategyRunResult,
     StreamingKind, TargetTable, WriteMode,
 };
+use crate::kafka_backend::{decode_payloads_as_jsonl, encode_batch_as_jsonl_lines};
 use crate::pg::ConnectionInfo;
 use crate::types::TableSpec;
+
+/// Per-call drain limits for `read_arrow_stream`. First trigger
+/// flushes — the consumer returns whatever it has accumulated and
+/// callers can call `read_arrow_stream` again to continue.
+#[derive(Debug, Clone)]
+pub struct RabbitBatchConfig {
+    /// Max number of messages per call.
+    pub batch_size: usize,
+    /// Max bytes accumulated per call.
+    pub batch_bytes: usize,
+    /// Idle timeout (ms): if no message arrives within this window,
+    /// the call returns whatever it has (possibly empty).
+    pub idle_timeout_ms: u64,
+}
+
+impl Default for RabbitBatchConfig {
+    fn default() -> Self {
+        Self {
+            batch_size: 1000,
+            batch_bytes: 16 * 1024 * 1024, // 16 MiB
+            idle_timeout_ms: 2_000,
+        }
+    }
+}
 
 /// RabbitMQ-backed implementation of `Backend`.
 ///
@@ -56,6 +94,13 @@ use crate::types::TableSpec;
 pub struct RabbitMQBackend {
     /// Full AMQP URI (`amqp://user:pass@host:port/vhost`).
     amqp_url: String,
+    /// Per-call consumer drain limits. Builder-set via
+    /// `with_batch_config`.
+    batch_config: RabbitBatchConfig,
+    /// Stable consumer tag prefix for `basic_consume`. Defaults to
+    /// "ematix-flow-consumer". Mostly informational for management
+    /// UIs.
+    consumer_tag: String,
 }
 
 impl RabbitMQBackend {
@@ -77,12 +122,38 @@ impl RabbitMQBackend {
                 "rabbitmq backend: amqp_url must start with `amqp://` or `amqps://`; got: {amqp_url}"
             )));
         }
-        Ok(Self { amqp_url })
+        Ok(Self {
+            amqp_url,
+            batch_config: RabbitBatchConfig::default(),
+            consumer_tag: "ematix-flow-consumer".to_string(),
+        })
+    }
+
+    /// Override the per-call drain limits used by `read_arrow_stream`.
+    pub fn with_batch_config(mut self, cfg: RabbitBatchConfig) -> Self {
+        self.batch_config = cfg;
+        self
+    }
+
+    /// Override the consumer tag prefix used by `basic_consume`.
+    pub fn with_consumer_tag(mut self, tag: impl Into<String>) -> Self {
+        self.consumer_tag = tag.into();
+        self
     }
 
     /// Borrow the configured AMQP URL.
     pub fn amqp_url(&self) -> &str {
         &self.amqp_url
+    }
+
+    /// Borrow the active batch config.
+    pub fn batch_config(&self) -> &RabbitBatchConfig {
+        &self.batch_config
+    }
+
+    /// Borrow the consumer tag prefix.
+    pub fn consumer_tag(&self) -> &str {
+        &self.consumer_tag
     }
 }
 
@@ -150,44 +221,208 @@ impl Backend for RabbitMQBackend {
         ))
     }
 
-    /// Arrow consume — stub for 37a.2.
-    async fn read_arrow_stream(&self, _query: &str) -> Result<ArrowBatchStream, BackendError> {
-        Err(BackendError::Other(
-            "RabbitMQ read_arrow_stream: lands in Phase 37a.2 (queue → \
-             Arrow batches via lapin's basic_consume + arrow-json)"
-                .into(),
-        ))
+    /// Subscribe to `query` (the queue name) via `basic_consume`,
+    /// drain messages until idle for `batch_config.idle_timeout_ms`
+    /// or one of the batch_size / batch_bytes limits is hit. Each
+    /// payload is decoded as a single JSON object and rows are
+    /// concatenated into one Arrow `RecordBatch`. Schema is inferred
+    /// from the first 1024 messages (arrow-json default).
+    ///
+    /// Returns an empty stream if the queue is empty (idle timeout
+    /// fires immediately).
+    ///
+    /// Limits in 37a.2 — folded out in later sub-phases:
+    ///   - JSON-only payload decode (raw bytes / Avro / Protobuf
+    ///     land later, mirroring Kafka's 36h trajectory).
+    ///   - Auto-ack: messages are acked at delivery rather than
+    ///     after a durable target write. 37a.3 wires manual ack
+    ///     through the strategy executors.
+    ///   - Single-shot drain: each call opens a fresh connection +
+    ///     channel and tears them down before returning. The long-
+    ///     running supervised-consumer pattern (Kafka 36g) will
+    ///     reuse a persistent channel.
+    async fn read_arrow_stream(&self, query: &str) -> Result<ArrowBatchStream, BackendError> {
+        let queue = query.trim();
+        if queue.is_empty() {
+            return Err(BackendError::Other(
+                "RabbitMQ read_arrow_stream: query argument must be a non-empty queue name".into(),
+            ));
+        }
+
+        let conn = Connection::connect(&self.amqp_url, ConnectionProperties::default())
+            .await
+            .map_err(|e| BackendError::Connection(format!("rabbitmq connect: {e}")))?;
+        let channel = conn
+            .create_channel()
+            .await
+            .map_err(|e| BackendError::Connection(format!("rabbitmq channel: {e}")))?;
+
+        let opts = BasicConsumeOptions {
+            no_ack: true, // 37a.2: auto-ack; manual ack lands in 37a.3.
+            ..BasicConsumeOptions::default()
+        };
+        let mut consumer = channel
+            .basic_consume(queue, &self.consumer_tag, opts, FieldTable::default())
+            .await
+            .map_err(|e| BackendError::Query(format!("rabbitmq basic_consume {queue}: {e}")))?;
+
+        let cfg = self.batch_config.clone();
+        let idle = Duration::from_millis(cfg.idle_timeout_ms);
+        let mut payloads: Vec<Vec<u8>> = Vec::new();
+        let mut bytes_total: usize = 0;
+        loop {
+            match tokio::time::timeout(idle, consumer.next()).await {
+                Ok(Some(Ok(delivery))) => {
+                    bytes_total += delivery.data.len();
+                    payloads.push(delivery.data);
+                    if payloads.len() >= cfg.batch_size || bytes_total >= cfg.batch_bytes {
+                        break;
+                    }
+                }
+                Ok(Some(Err(e))) => {
+                    let _ = channel.close(0, "drain error").await;
+                    let _ = conn.close(0, "drain error").await;
+                    return Err(BackendError::Query(format!("rabbitmq consume: {e}")));
+                }
+                // Stream ended (channel closed) or idle timeout — flush.
+                Ok(None) | Err(_) => break,
+            }
+        }
+        // Best-effort tear-down. If close fails we still have the
+        // payloads; drop will GC the connection.
+        let _ = channel.close(0, "ematix-flow drain done").await;
+        let _ = conn.close(0, "ematix-flow drain done").await;
+
+        if payloads.is_empty() {
+            let stream = futures_util::stream::empty();
+            return Ok(Box::pin(stream));
+        }
+        let batches = decode_payloads_as_jsonl(payloads)?;
+        let stream = futures_util::stream::iter(batches.into_iter().map(Ok));
+        Ok(Box::pin(stream))
     }
 
-    /// Arrow produce — stub for 37a.2.
+    /// Produce each Arrow row as an AMQP message to the default
+    /// exchange with `routing_key = target.name` — i.e., publish
+    /// directly to a queue with that name. Each batch is encoded as
+    /// JSONL and split row-wise; one `basic_publish` per row.
+    /// `WriteMode::Truncate` is rejected — queues aren't truncatable
+    /// from a producer.
+    ///
+    /// Limits in 37a.2 — folded out in later sub-phases:
+    ///   - JSON-only payload encode (mirrors Kafka 36h).
+    ///   - Default exchange only — `target.name` is the queue name.
+    ///     Custom exchange + routing-key support lands in a 37a.x
+    ///     follow-up once the contract is settled.
+    ///   - No publisher confirms — basic_publish returns once the
+    ///     local send completes. 37a.3 wires confirms + manual-ack
+    ///     coordination on the consume side.
     async fn write_arrow_stream(
         &self,
-        _target: &TargetTable,
-        _stream: ArrowBatchStream,
-        _mode: WriteMode,
+        target: &TargetTable,
+        stream: ArrowBatchStream,
+        mode: WriteMode,
     ) -> Result<u64, BackendError> {
-        Err(BackendError::Other(
-            "RabbitMQ write_arrow_stream: lands in Phase 37a.2 \
-             (Arrow batches → exchange via lapin's basic_publish)"
-                .into(),
-        ))
+        if mode == WriteMode::Truncate {
+            return Err(BackendError::Other(
+                "RabbitMQ write_arrow_stream: Truncate is not supported on a queue. \
+                 Queues are append-style streams; to start fresh, purge or delete \
+                 the queue via the RabbitMQ management API or admin tools."
+                    .into(),
+            ));
+        }
+        let queue = target.name.trim();
+        if queue.is_empty() {
+            return Err(BackendError::Other(
+                "RabbitMQ write_arrow_stream: target.name (queue) must be non-empty".into(),
+            ));
+        }
+
+        let conn = Connection::connect(&self.amqp_url, ConnectionProperties::default())
+            .await
+            .map_err(|e| BackendError::Connection(format!("rabbitmq connect: {e}")))?;
+        let channel = conn
+            .create_channel()
+            .await
+            .map_err(|e| BackendError::Connection(format!("rabbitmq channel: {e}")))?;
+
+        let mut s = stream;
+        let mut total: u64 = 0;
+        while let Some(batch) = s.next().await {
+            let batch = batch?;
+            if batch.num_rows() == 0 {
+                continue;
+            }
+            let payloads = encode_batch_as_jsonl_lines(&batch)?;
+            for payload in &payloads {
+                channel
+                    .basic_publish(
+                        "", // default exchange
+                        queue,
+                        BasicPublishOptions::default(),
+                        payload,
+                        BasicProperties::default(),
+                    )
+                    .await
+                    .map_err(|e| {
+                        BackendError::Query(format!("rabbitmq basic_publish {queue}: {e}"))
+                    })?;
+                total += 1;
+            }
+        }
+        let _ = channel.close(0, "ematix-flow write done").await;
+        let _ = conn.close(0, "ematix-flow write done").await;
+        Ok(total)
     }
 
+    /// Cross-backend produce-side run_append: read source rows via
+    /// the source's `read_arrow_stream`, produce them to `spec.name`
+    /// (the queue) via `write_arrow_stream`. Mirrors the Kafka
+    /// produce-side run_append shape (cross-backend by design;
+    /// `source_backend` is required).
     async fn run_append(
         &self,
-        _spec: &TableSpec,
-        _source_query: &str,
+        spec: &TableSpec,
+        source_query: &str,
         _pipeline_name: &str,
-        _source_backend: Option<&dyn Backend>,
+        source_backend: Option<&dyn Backend>,
         _incremental_column: Option<&str>,
         _last_value_literal: Option<&str>,
-        _dry_run: bool,
+        dry_run: bool,
     ) -> Result<StrategyRunResult, BackendError> {
-        Err(BackendError::Other(
-            "RabbitMQ run_append: lands in Phase 37a.2+ once \
-             write_arrow_stream is implemented"
-                .into(),
-        ))
+        let source = source_backend.ok_or_else(|| {
+            BackendError::Other(
+                "RabbitMQ run_append: source_backend is required (cross-backend produce)".into(),
+            )
+        })?;
+        if dry_run {
+            return Ok(StrategyRunResult {
+                run_id: String::new(),
+                rows_inserted: 0,
+                rows_updated: None,
+                rows_unchanged: None,
+                rows_closed: None,
+                status: "dry-run".into(),
+                path: format!("rabbitmq:{}", spec.name),
+            });
+        }
+        let target = TargetTable {
+            schema: spec.schema.clone(),
+            name: spec.name.clone(),
+        };
+        let stream = source.read_arrow_stream(source_query).await?;
+        let n = self
+            .write_arrow_stream(&target, stream, WriteMode::Append)
+            .await?;
+        Ok(StrategyRunResult {
+            run_id: String::new(),
+            rows_inserted: n as i64,
+            rows_updated: None,
+            rows_unchanged: None,
+            rows_closed: None,
+            status: "ok".into(),
+            path: format!("rabbitmq:{}", spec.name),
+        })
     }
 
     /// `Truncate` on a queue/exchange isn't a producer-side
@@ -392,18 +627,18 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn read_arrow_stream_rejects_with_pointer_to_37a_2() {
+    async fn read_arrow_stream_rejects_empty_queue_name() {
         let b = RabbitMQBackend::open("amqp://localhost").unwrap();
-        let err = match b.read_arrow_stream("any-queue").await {
-            Ok(_) => panic!("expected stub rejection"),
+        let err = match b.read_arrow_stream("   ").await {
+            Ok(_) => panic!("expected empty-queue rejection"),
             Err(e) => e,
         };
         let msg = err.to_string();
-        assert!(msg.contains("Phase 37a.2"), "got: {msg}");
+        assert!(msg.contains("non-empty queue name"), "got: {msg}");
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn write_arrow_stream_rejects_with_pointer_to_37a_2() {
+    async fn write_arrow_stream_truncate_rejects() {
         let b = RabbitMQBackend::open("amqp://localhost").unwrap();
         let target = TargetTable {
             schema: "".into(),
@@ -411,11 +646,96 @@ mod tests {
         };
         let stream = Box::pin(futures_util::stream::empty());
         let err = b
+            .write_arrow_stream(&target, stream, WriteMode::Truncate)
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("Truncate is not supported"), "got: {msg}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn write_arrow_stream_rejects_empty_queue_name() {
+        let b = RabbitMQBackend::open("amqp://localhost").unwrap();
+        let target = TargetTable {
+            schema: "".into(),
+            name: "   ".into(),
+        };
+        let stream = Box::pin(futures_util::stream::empty());
+        let err = b
             .write_arrow_stream(&target, stream, WriteMode::Append)
             .await
             .unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("Phase 37a.2"), "got: {msg}");
+        assert!(msg.contains("must be non-empty"), "got: {msg}");
+    }
+
+    #[test]
+    fn batch_config_defaults_are_reasonable() {
+        let cfg = RabbitBatchConfig::default();
+        assert!(cfg.batch_size >= 100);
+        assert!(cfg.batch_bytes >= 1 << 20);
+        assert!(cfg.idle_timeout_ms >= 500);
+    }
+
+    #[test]
+    fn with_batch_config_overrides_default() {
+        let b = RabbitMQBackend::open("amqp://localhost")
+            .unwrap()
+            .with_batch_config(RabbitBatchConfig {
+                batch_size: 7,
+                batch_bytes: 99,
+                idle_timeout_ms: 11,
+            });
+        assert_eq!(b.batch_config().batch_size, 7);
+        assert_eq!(b.batch_config().batch_bytes, 99);
+        assert_eq!(b.batch_config().idle_timeout_ms, 11);
+    }
+
+    #[test]
+    fn with_consumer_tag_overrides_default() {
+        let b = RabbitMQBackend::open("amqp://localhost")
+            .unwrap()
+            .with_consumer_tag("my-tag");
+        assert_eq!(b.consumer_tag(), "my-tag");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn run_append_requires_source_backend() {
+        let b = RabbitMQBackend::open("amqp://localhost").unwrap();
+        let spec = TableSpec {
+            schema: "".into(),
+            name: "q".into(),
+            columns: vec![],
+            unique_constraints: vec![],
+            fingerprint: String::new(),
+        };
+        let err = b
+            .run_append(&spec, "x", "p", None, None, None, false)
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("source_backend is required"), "got: {msg}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn run_append_dry_run_returns_zero_inserts_without_io() {
+        let b = RabbitMQBackend::open("amqp://localhost").unwrap();
+        let spec = TableSpec {
+            schema: "".into(),
+            name: "q".into(),
+            columns: vec![],
+            unique_constraints: vec![],
+            fingerprint: String::new(),
+        };
+        // Construct a noop "source" via the rabbit backend itself —
+        // dry_run skips IO before it actually calls the source.
+        let other = RabbitMQBackend::open("amqp://localhost").unwrap();
+        let res = b
+            .run_append(&spec, "x", "p", Some(&other), None, None, true)
+            .await
+            .unwrap();
+        assert_eq!(res.rows_inserted, 0);
+        assert_eq!(res.status, "dry-run");
     }
 
     #[tokio::test(flavor = "multi_thread")]

@@ -1656,7 +1656,7 @@ async fn drain_consumer(
 /// `infer_json_schema_from_seekable` can run a single pass. Returns
 /// the full RecordBatch list — typically one batch for a moderate
 /// drain; arrow-json may chunk if the buffer is large.
-fn decode_payloads_as_jsonl(payloads: Vec<Vec<u8>>) -> Result<Vec<RecordBatch>, BackendError> {
+pub fn decode_payloads_as_jsonl(payloads: Vec<Vec<u8>>) -> Result<Vec<RecordBatch>, BackendError> {
     use arrow_json::ReaderBuilder;
     use arrow_json::reader::infer_json_schema_from_seekable;
 
@@ -2325,7 +2325,7 @@ async fn produce_payloads_to_topic(
 /// Encode a `RecordBatch` as JSONL bytes, then split on newlines so
 /// each row becomes its own payload for produce. The `Vec<Vec<u8>>`
 /// has one entry per row (matching `batch.num_rows()`).
-fn encode_batch_as_jsonl_lines(batch: &RecordBatch) -> Result<Vec<Vec<u8>>, BackendError> {
+pub fn encode_batch_as_jsonl_lines(batch: &RecordBatch) -> Result<Vec<Vec<u8>>, BackendError> {
     use arrow_json::LineDelimitedWriter;
 
     let mut buf: Vec<u8> = Vec::with_capacity(batch.num_rows() * 64);

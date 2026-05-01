@@ -4766,6 +4766,133 @@ async fn rabbitmq_backend_ping_with_default_credentials() {
     assert_eq!(info.user, "guest");
 }
 
+// ----- Phase 37a.2: RabbitMQ Arrow IO round-trip -----------------------
+
+/// Helper: declare a queue (durable=false, exclusive=false, auto_delete=false)
+/// using a one-shot lapin connection. Required because `basic_publish` to
+/// the default exchange routes to `routing_key` only if a queue with that
+/// name exists; otherwise the broker silently drops the message.
+async fn declare_rabbitmq_queue(amqp_url: &str, queue: &str) {
+    use lapin::options::QueueDeclareOptions;
+    use lapin::types::FieldTable;
+    use lapin::{Connection, ConnectionProperties};
+
+    let conn = Connection::connect(amqp_url, ConnectionProperties::default())
+        .await
+        .expect("declare connect");
+    let channel = conn.create_channel().await.expect("declare channel");
+    channel
+        .queue_declare(queue, QueueDeclareOptions::default(), FieldTable::default())
+        .await
+        .expect("queue_declare");
+    let _ = channel.close(0, "declare done").await;
+    let _ = conn.close(0, "declare done").await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker; run with `cargo test -- --ignored`"]
+async fn rabbitmq_write_then_read_round_trip() {
+    use arrow_array::{Int64Array, StringArray};
+    use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+    use ematix_flow_core::backend::WriteMode;
+    use ematix_flow_core::rabbitmq_backend::RabbitBatchConfig;
+
+    let (_container, amqp_url) = start_rabbitmq().await;
+    let queue = "rt-queue";
+    declare_rabbitmq_queue(&amqp_url, queue).await;
+
+    // Produce 3 rows.
+    let producer = RabbitMQBackend::open(&amqp_url).unwrap();
+    let arrow_schema = Arc::new(ArrowSchema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("label", DataType::Utf8, false),
+    ]));
+    let batch = arrow_array::RecordBatch::try_new(
+        arrow_schema,
+        vec![
+            Arc::new(Int64Array::from(vec![1_i64, 2, 3])),
+            Arc::new(StringArray::from(vec!["alpha", "beta", "gamma"])),
+        ],
+    )
+    .unwrap();
+    let target = ematix_flow_core::backend::TargetTable {
+        schema: "".into(),
+        name: queue.into(),
+    };
+    let stream: ematix_flow_core::backend::ArrowBatchStream =
+        Box::pin(futures_util::stream::once(async move {
+            Ok::<_, ematix_flow_core::BackendError>(batch)
+        }));
+    let n = producer
+        .write_arrow_stream(&target, stream, WriteMode::Append)
+        .await
+        .unwrap();
+    assert_eq!(n, 3);
+
+    // Consume — give the broker a beat to deliver before draining.
+    let consumer = RabbitMQBackend::open(&amqp_url)
+        .unwrap()
+        .with_batch_config(RabbitBatchConfig {
+            batch_size: 100,
+            batch_bytes: 1 << 20,
+            // Slightly longer than default — flake-resistant under
+            // shared CI runners.
+            idle_timeout_ms: 3_000,
+        });
+    let stream = consumer.read_arrow_stream(queue).await.unwrap();
+    let batches: Vec<_> = stream.try_collect().await.unwrap();
+    let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total, 3, "expected 3 rows; got {total}");
+
+    let mut ids: Vec<i64> = Vec::new();
+    let mut labels: Vec<String> = Vec::new();
+    for b in &batches {
+        let id_col = b
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let lb_col = b
+            .column_by_name("label")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        for i in 0..b.num_rows() {
+            ids.push(id_col.value(i));
+            labels.push(lb_col.value(i).to_string());
+        }
+    }
+    ids.sort_unstable();
+    assert_eq!(ids, vec![1, 2, 3]);
+    assert!(labels.contains(&"alpha".to_string()));
+    assert!(labels.contains(&"beta".to_string()));
+    assert!(labels.contains(&"gamma".to_string()));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker; run with `cargo test -- --ignored`"]
+async fn rabbitmq_read_empty_queue_returns_empty_stream() {
+    use ematix_flow_core::rabbitmq_backend::RabbitBatchConfig;
+
+    let (_container, amqp_url) = start_rabbitmq().await;
+    let queue = "empty-queue";
+    declare_rabbitmq_queue(&amqp_url, queue).await;
+
+    let consumer = RabbitMQBackend::open(&amqp_url)
+        .unwrap()
+        .with_batch_config(RabbitBatchConfig {
+            batch_size: 100,
+            batch_bytes: 1 << 20,
+            idle_timeout_ms: 500,
+        });
+    let stream = consumer.read_arrow_stream(queue).await.unwrap();
+    let batches: Vec<_> = stream.try_collect().await.unwrap();
+    let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total, 0);
+}
+
 // ----- Phase 36h.3.1: live Confluent Schema Registry round-trip ---------
 //
 // Spins up Apicurio's in-memory Confluent-compat Schema Registry
