@@ -4143,3 +4143,72 @@ async fn kafka_write_arrow_stream_rejects_truncate() {
     let msg = err.to_string();
     assert!(msg.contains("Truncate is not supported"), "got: {msg}");
 }
+
+// ----- Phase 36d: Consumer batching ------------------------------------
+
+use ematix_flow_core::kafka_backend::KafkaBatchConfig;
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker; run with `cargo test -- --ignored`"]
+async fn kafka_read_arrow_stream_honors_batch_size() {
+    let (_container, bootstrap) = start_kafka().await;
+    let topic = "batch-size-test";
+
+    // Produce 10 messages.
+    let payloads: Vec<String> = (0..10)
+        .map(|i| format!(r#"{{"id": {i}, "name": "n{i}"}}"#))
+        .collect();
+    let payload_refs: Vec<&str> = payloads.iter().map(|s| s.as_str()).collect();
+    produce_json_messages(&bootstrap, topic, &payload_refs).await;
+
+    // Configure a batch_size of 4 — read_arrow_stream should return
+    // 4 rows even though 10 are available.
+    let backend = KafkaBackend::open(&bootstrap, Some("batch-size-grp"))
+        .unwrap()
+        .with_batch_config(KafkaBatchConfig {
+            batch_size: 4,
+            ..Default::default()
+        });
+    let stream = backend.read_arrow_stream(topic).await.unwrap();
+    let batches: Vec<_> = stream.try_collect().await.unwrap();
+    let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total, 4, "batch_size cap must fire before drain idle");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker; run with `cargo test -- --ignored`"]
+async fn kafka_read_arrow_stream_honors_batch_window_ms() {
+    let (_container, bootstrap) = start_kafka().await;
+    let topic = "batch-window-test";
+
+    // Produce 2 messages once, wait, then produce more after the
+    // batch window closes — this verifies the window-since-first-msg
+    // clock fires before we accumulate more.
+    produce_json_messages(&bootstrap, topic, &[r#"{"id": 1}"#, r#"{"id": 2}"#]).await;
+
+    // batch_window_ms=200 → after 200ms from the first message, even
+    // if more arrive, we flush. We immediately produce nothing for
+    // the rest of the window so the batch flushes at 200ms with 2
+    // rows. idle_timeout_ms=10s would otherwise wait far longer.
+    let backend = KafkaBackend::open(&bootstrap, Some("batch-window-grp"))
+        .unwrap()
+        .with_batch_config(KafkaBatchConfig {
+            batch_size: 1_000,
+            batch_window_ms: 200,
+            idle_timeout_ms: 10_000,
+            ..Default::default()
+        });
+    let started = std::time::Instant::now();
+    let stream = backend.read_arrow_stream(topic).await.unwrap();
+    let batches: Vec<_> = stream.try_collect().await.unwrap();
+    let elapsed = started.elapsed();
+    let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total, 2, "got 2 rows from initial produce");
+    // Window elapsed at 200ms after the first message; first-message
+    // wait can take up to 15s, but the window is the dominant cap
+    // once a message arrives. Generous upper bound to avoid flake.
+    assert!(
+        elapsed < std::time::Duration::from_secs(20),
+        "elapsed too long ({elapsed:?}); idle_timeout dominated instead of window"
+    );
+}

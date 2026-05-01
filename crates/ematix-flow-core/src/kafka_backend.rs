@@ -59,6 +59,43 @@ use crate::backend::{
 use crate::pg::ConnectionInfo;
 use crate::types::TableSpec;
 
+/// Per-batch limits for `read_arrow_stream`. The drain loop closes
+/// the current batch and returns as soon as **any** of these
+/// triggers fires:
+///   - `batch_size` messages received,
+///   - `batch_bytes` of payload accumulated (sum of message lengths),
+///   - `batch_window_ms` elapsed since the first message in the
+///     batch arrived (latency cap — useful for low-volume topics),
+///   - `idle_timeout_ms` elapsed without a new message (drain done).
+///
+/// `idle_timeout_ms` is the only trigger that can fire on an empty
+/// batch — that's how a `read_arrow_stream` against a quiet topic
+/// returns an empty stream rather than blocking forever.
+///
+/// Defaults are tuned for one-shot `read_arrow_stream` calls (rather
+/// than the long-running consumer in 36g): generous size and bytes
+/// caps, a 5s window, a 5s idle timeout. The first-message wait is
+/// still bumped to 15s internally so a fresh broker has time to
+/// rebalance — that's a separate clock from these batch limits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KafkaBatchConfig {
+    pub batch_size: usize,
+    pub batch_bytes: usize,
+    pub batch_window_ms: u64,
+    pub idle_timeout_ms: u64,
+}
+
+impl Default for KafkaBatchConfig {
+    fn default() -> Self {
+        Self {
+            batch_size: 100_000,
+            batch_bytes: 16 * 1024 * 1024, // 16 MiB
+            batch_window_ms: 5_000,
+            idle_timeout_ms: 5_000,
+        }
+    }
+}
+
 /// Kafka-backed implementation of `Backend`.
 ///
 /// Holds a librdkafka `ClientConfig` rather than a long-lived
@@ -74,6 +111,9 @@ pub struct KafkaBackend {
     /// Consumer group_id. `None` means this backend is producer-only.
     /// Populated for `read_arrow_stream` callers in 36b.
     group_id: Option<String>,
+    /// Batch limits applied by `read_arrow_stream`. Builder-set via
+    /// `with_batch_config`; defaults match `KafkaBatchConfig::default`.
+    batch_config: KafkaBatchConfig,
 }
 
 impl KafkaBackend {
@@ -95,7 +135,23 @@ impl KafkaBackend {
         Ok(Self {
             bootstrap_servers,
             group_id: group_id.map(|s| s.to_string()),
+            batch_config: KafkaBatchConfig::default(),
         })
+    }
+
+    /// Override the batch limits applied by `read_arrow_stream`.
+    /// Builder-style, so call sites can do
+    /// `KafkaBackend::open(...)?.with_batch_config(KafkaBatchConfig {
+    ///     batch_size: 1024, batch_window_ms: 200, ..Default::default()
+    /// })`.
+    pub fn with_batch_config(mut self, config: KafkaBatchConfig) -> Self {
+        self.batch_config = config;
+        self
+    }
+
+    /// Borrow the active batch config (tests + 36g supervisor read it).
+    pub fn batch_config(&self) -> KafkaBatchConfig {
+        self.batch_config
     }
 
     /// Build a fresh `ClientConfig` populated with this backend's
@@ -247,7 +303,7 @@ impl Backend for KafkaBackend {
             .map_err(|e| BackendError::Connection(format!("kafka subscribe {topic}: {e}")))?;
 
         // Drain the consumer into a Vec<Vec<u8>> of payloads.
-        let payloads = drain_consumer(&consumer).await?;
+        let payloads = drain_consumer(&consumer, &self.batch_config).await?;
         if payloads.is_empty() {
             let stream = futures_util::stream::empty();
             return Ok(Box::pin(stream));
@@ -470,42 +526,68 @@ impl Backend for KafkaBackend {
 /// larger than the subsequent-message one.
 const READ_FIRST_MESSAGE_TIMEOUT_SECS: u64 = 15;
 
-/// How long to wait without a new message before declaring the
-/// batch-read drained, after the first message has arrived.
-/// `recv()` blocks until a message arrives, so we wrap it in a
-/// tokio timeout. A long-running streaming consumer (36g) doesn't
-/// use this path.
-const READ_IDLE_TIMEOUT_SECS: u64 = 5;
-
-/// Maximum messages collected per `read_arrow_stream` call. Cap
-/// keeps the in-memory accumulator bounded for unbounded topics.
-/// Larger reads should drive the streaming-consumer path (36g)
-/// where backpressure + checkpointing are first-class.
-const READ_MAX_MESSAGES: usize = 100_000;
-
-/// Drain `consumer` into a `Vec<Vec<u8>>` of payloads. Stops at
-/// `READ_IDLE_TIMEOUT_SECS` of silence, or after `READ_MAX_MESSAGES`
-/// messages, whichever comes first. Messages with no payload (Kafka
-/// tombstones) are skipped — they're meaningful for compacted topics
-/// but don't carry a row to decode.
-async fn drain_consumer(consumer: &StreamConsumer) -> Result<Vec<Vec<u8>>, BackendError> {
+/// Drain `consumer` into a `Vec<Vec<u8>>` of payloads, honoring the
+/// batch limits in `cfg`. Returns when **any** of these fires:
+///   - `cfg.batch_size` messages received,
+///   - `cfg.batch_bytes` total payload bytes accumulated,
+///   - `cfg.batch_window_ms` elapsed since the first message arrived
+///     (latency cap — independent of the idle timer),
+///   - `cfg.idle_timeout_ms` elapsed without a new message.
+///
+/// Messages with no payload (Kafka tombstones) are skipped — they're
+/// meaningful for compacted topics but don't carry a row to decode,
+/// and they don't tick `batch_size` or `batch_bytes`.
+///
+/// First-message wait is independently bumped to
+/// `READ_FIRST_MESSAGE_TIMEOUT_SECS` so a fresh broker has time to
+/// rebalance and assign partitions. The user-provided
+/// `batch_window_ms` clock starts on the first received message,
+/// not on subscribe.
+async fn drain_consumer(
+    consumer: &StreamConsumer,
+    cfg: &KafkaBatchConfig,
+) -> Result<Vec<Vec<u8>>, BackendError> {
     let mut payloads: Vec<Vec<u8>> = Vec::new();
-    while payloads.len() < READ_MAX_MESSAGES {
-        // First-message timeout is generous (group rebalance + offset
-        // fetch can take several seconds on a fresh broker);
-        // subsequent timeouts are tight because we're "draining" a
-        // known-active stream.
-        let timeout_secs = if payloads.is_empty() {
-            READ_FIRST_MESSAGE_TIMEOUT_SECS
+    let mut total_bytes: usize = 0;
+    let mut window_start: Option<std::time::Instant> = None;
+
+    while payloads.len() < cfg.batch_size {
+        // Compute the per-recv timeout. Three clocks are in play:
+        //   1. First-message wait: generous, swallows rebalance.
+        //   2. Idle timeout: tight, stops drain when topic is quiet.
+        //   3. Batch window: caps total time-from-first-message, so
+        //      a low-rate topic still flushes a small batch promptly.
+        let recv_timeout = if payloads.is_empty() {
+            Duration::from_secs(READ_FIRST_MESSAGE_TIMEOUT_SECS)
         } else {
-            READ_IDLE_TIMEOUT_SECS
+            // Take the smaller of (idle_timeout, remaining window).
+            let idle = Duration::from_millis(cfg.idle_timeout_ms);
+            match window_start {
+                Some(start) => {
+                    let elapsed = start.elapsed();
+                    let total = Duration::from_millis(cfg.batch_window_ms);
+                    let remaining = total.saturating_sub(elapsed);
+                    if remaining.is_zero() {
+                        break; // window already exhausted
+                    }
+                    idle.min(remaining)
+                }
+                None => idle,
+            }
         };
         let recv_fut = consumer.recv();
-        let msg = tokio::time::timeout(Duration::from_secs(timeout_secs), recv_fut).await;
+        let msg = tokio::time::timeout(recv_timeout, recv_fut).await;
         match msg {
             Ok(Ok(borrowed)) => {
                 if let Some(payload) = borrowed.payload() {
+                    if window_start.is_none() {
+                        window_start = Some(std::time::Instant::now());
+                    }
+                    total_bytes += payload.len();
                     payloads.push(payload.to_vec());
+                    if total_bytes >= cfg.batch_bytes {
+                        break;
+                    }
                 }
             }
             Ok(Err(e)) => {
@@ -520,7 +602,7 @@ async fn drain_consumer(consumer: &StreamConsumer) -> Result<Vec<Vec<u8>>, Backe
                 }
                 return Err(BackendError::Query(format!("kafka recv: {e}")));
             }
-            Err(_elapsed) => break, // idle timeout → stop
+            Err(_elapsed) => break, // idle / window timeout → flush
         }
     }
     Ok(payloads)
@@ -631,6 +713,29 @@ mod tests {
         assert_eq!(b.bootstrap_servers(), "localhost:9092");
         assert_eq!(b.group_id(), Some("g1"));
         assert_eq!(b.dsn().as_deref(), Some("localhost:9092"));
+    }
+
+    #[test]
+    fn batch_config_default_is_reasonable() {
+        let cfg = KafkaBatchConfig::default();
+        assert_eq!(cfg.batch_size, 100_000);
+        assert_eq!(cfg.batch_bytes, 16 * 1024 * 1024);
+        assert_eq!(cfg.batch_window_ms, 5_000);
+        assert_eq!(cfg.idle_timeout_ms, 5_000);
+    }
+
+    #[test]
+    fn with_batch_config_overrides_defaults() {
+        let custom = KafkaBatchConfig {
+            batch_size: 50,
+            batch_bytes: 1024,
+            batch_window_ms: 250,
+            idle_timeout_ms: 1_000,
+        };
+        let b = KafkaBackend::open("localhost:9092", Some("g1"))
+            .unwrap()
+            .with_batch_config(custom);
+        assert_eq!(b.batch_config(), custom);
     }
 
     #[test]
