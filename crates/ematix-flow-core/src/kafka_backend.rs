@@ -98,6 +98,36 @@ impl Default for KafkaBatchConfig {
     }
 }
 
+/// Wire format for Kafka message payloads. Selected via
+/// `KafkaBackend::with_payload_format`. JSON is the default and the
+/// only one we ship full encode + decode for in 36h; `RawBytes`
+/// covers the "produce raw application bytes / consume into a single
+/// Binary column" pattern.
+///
+/// Avro and Protobuf land in 36h.2 — they require Confluent Schema
+/// Registry integration (schema fetch + magic-byte framing) which is
+/// its own sub-phase.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum KafkaPayloadFormat {
+    /// One JSON object per message. Decodes to N rows with the
+    /// inferred schema; encodes each Arrow row as a JSON object.
+    /// This is the default — matches what most pipeline builders
+    /// reach for first.
+    #[default]
+    Json,
+    /// Each message body is a single opaque blob. On read, every
+    /// message becomes one row with a single `payload` column of
+    /// type Binary. On write, the source must produce exactly one
+    /// Binary-typed column; each row's value is sent as one
+    /// message payload (column name doesn't matter — only its
+    /// type).
+    RawBytes,
+}
+
+/// Column name used by the RawBytes decoder for the single Binary
+/// column it emits.
+const RAW_BYTES_COLUMN: &str = "payload";
+
 /// SCRAM mechanisms supported by librdkafka. Most cloud providers
 /// run SHA-512 by default; some self-hosted deployments still use
 /// SHA-256.
@@ -278,6 +308,10 @@ pub struct KafkaBackend {
     /// populated by the `with_sasl_plain` / `with_sasl_scram` /
     /// `with_tls` / `with_msk_iam` builder methods.
     auth: AuthMode,
+    /// Payload wire format applied by `read_arrow_stream` /
+    /// `write_arrow_stream`. Builder-set via `with_payload_format`;
+    /// defaults to JSON.
+    payload_format: KafkaPayloadFormat,
 }
 
 impl std::fmt::Debug for ConsumerSession {
@@ -312,7 +346,22 @@ impl KafkaBackend {
             batch_config: KafkaBatchConfig::default(),
             consumer_session: Arc::new(Mutex::new(ConsumerSession::default())),
             auth: AuthMode::None,
+            payload_format: KafkaPayloadFormat::default(),
         })
+    }
+
+    /// Override the wire format for message payloads. JSON is the
+    /// default; `RawBytes` is the other 36h-supported variant. Avro
+    /// and Protobuf are placeholders today and rejected at runtime
+    /// with a pointer to 36h.2.
+    pub fn with_payload_format(mut self, format: KafkaPayloadFormat) -> Self {
+        self.payload_format = format;
+        self
+    }
+
+    /// Borrow the active payload format (tests + introspection).
+    pub fn payload_format(&self) -> KafkaPayloadFormat {
+        self.payload_format
     }
 
     /// SASL/PLAIN over TLS — Confluent Cloud's primary auth mode and
@@ -740,7 +789,10 @@ impl Backend for KafkaBackend {
             let stream = futures_util::stream::empty();
             return Ok(Box::pin(stream));
         }
-        let batches = decode_payloads_as_jsonl(payloads)?;
+        let batches = match self.payload_format {
+            KafkaPayloadFormat::Json => decode_payloads_as_jsonl(payloads)?,
+            KafkaPayloadFormat::RawBytes => decode_payloads_as_raw_bytes(payloads)?,
+        };
         let stream = futures_util::stream::iter(batches.into_iter().map(Ok));
         Ok(Box::pin(stream))
     }
@@ -793,7 +845,10 @@ impl Backend for KafkaBackend {
             if batch.num_rows() == 0 {
                 continue;
             }
-            let payloads = encode_batch_as_jsonl_lines(&batch)?;
+            let payloads = match self.payload_format {
+                KafkaPayloadFormat::Json => encode_batch_as_jsonl_lines(&batch)?,
+                KafkaPayloadFormat::RawBytes => encode_batch_as_raw_bytes(&batch)?,
+            };
             for payload in &payloads {
                 // The 5s timeout caps how long each produce can wait
                 // for broker ack. For real-AWS-MSK / Confluent Cloud
@@ -1096,6 +1151,71 @@ fn decode_payloads_as_jsonl(payloads: Vec<Vec<u8>>) -> Result<Vec<RecordBatch>, 
     Ok(batches)
 }
 
+/// Decode a Vec of message payloads under the `RawBytes` format:
+/// one row per message, one column ("payload", Binary) carrying the
+/// opaque blob. Tombstones (zero-byte payloads on the read path are
+/// already filtered upstream as None) reach this function as
+/// already-collected `Vec<u8>`s.
+fn decode_payloads_as_raw_bytes(payloads: Vec<Vec<u8>>) -> Result<Vec<RecordBatch>, BackendError> {
+    use arrow_array::BinaryArray;
+    use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+
+    if payloads.is_empty() {
+        return Ok(Vec::new());
+    }
+    let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+        RAW_BYTES_COLUMN,
+        DataType::Binary,
+        false,
+    )]));
+    let payload_refs: Vec<&[u8]> = payloads.iter().map(|p| p.as_slice()).collect();
+    let array = BinaryArray::from_vec(payload_refs);
+    let batch = RecordBatch::try_new(schema, vec![Arc::new(array)])
+        .map_err(|e| BackendError::Query(format!("kafka raw_bytes record_batch: {e}")))?;
+    Ok(vec![batch])
+}
+
+/// Encode a `RecordBatch` for the `RawBytes` format. The batch must
+/// have **exactly one** column of type Binary (the column name is
+/// not significant). Each row's value is one outgoing payload —
+/// nulls become empty payloads (matching Kafka tombstone semantics
+/// on the produce side).
+fn encode_batch_as_raw_bytes(batch: &RecordBatch) -> Result<Vec<Vec<u8>>, BackendError> {
+    use arrow_array::Array;
+    use arrow_array::BinaryArray;
+    use arrow_schema::DataType;
+
+    if batch.num_columns() != 1 {
+        return Err(BackendError::Query(format!(
+            "kafka write_arrow_stream RawBytes: expected 1 column, got {}",
+            batch.num_columns()
+        )));
+    }
+    let column = batch.column(0);
+    if !matches!(column.data_type(), DataType::Binary) {
+        return Err(BackendError::Query(format!(
+            "kafka write_arrow_stream RawBytes: expected single column of \
+             type Binary, got {:?}",
+            column.data_type()
+        )));
+    }
+    let bin = column
+        .as_any()
+        .downcast_ref::<BinaryArray>()
+        .ok_or_else(|| {
+            BackendError::Query("kafka raw_bytes: BinaryArray downcast failed".into())
+        })?;
+    let mut out: Vec<Vec<u8>> = Vec::with_capacity(batch.num_rows());
+    for i in 0..bin.len() {
+        if bin.is_null(i) {
+            out.push(Vec::new());
+        } else {
+            out.push(bin.value(i).to_vec());
+        }
+    }
+    Ok(out)
+}
+
 /// Encode a `RecordBatch` as JSONL bytes, then split on newlines so
 /// each row becomes its own payload for produce. The `Vec<Vec<u8>>`
 /// has one entry per row (matching `batch.num_rows()`).
@@ -1280,6 +1400,103 @@ mod tests {
         let b = KafkaBackend::open("localhost:9092", Some("g1")).unwrap();
         assert_eq!(config_get(&b, "security.protocol"), None);
         assert_eq!(config_get(&b, "sasl.mechanism"), None);
+    }
+
+    // --- Phase 36h: payload format dispatch -------------------------------
+
+    #[test]
+    fn payload_format_default_is_json() {
+        let b = KafkaBackend::open("localhost:9092", Some("g1")).unwrap();
+        assert_eq!(b.payload_format(), KafkaPayloadFormat::Json);
+    }
+
+    #[test]
+    fn with_payload_format_overrides_default() {
+        let b = KafkaBackend::open("localhost:9092", Some("g1"))
+            .unwrap()
+            .with_payload_format(KafkaPayloadFormat::RawBytes);
+        assert_eq!(b.payload_format(), KafkaPayloadFormat::RawBytes);
+    }
+
+    #[test]
+    fn raw_bytes_decode_emits_one_binary_column_per_message() {
+        let payloads = vec![b"a".to_vec(), b"bb".to_vec(), b"".to_vec()];
+        let batches = decode_payloads_as_raw_bytes(payloads).unwrap();
+        assert_eq!(batches.len(), 1);
+        let b = &batches[0];
+        assert_eq!(b.num_rows(), 3);
+        assert_eq!(b.num_columns(), 1);
+        let arr = b
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow_array::BinaryArray>()
+            .unwrap();
+        assert_eq!(arr.value(0), b"a");
+        assert_eq!(arr.value(1), b"bb");
+        assert_eq!(arr.value(2), b"");
+    }
+
+    #[test]
+    fn raw_bytes_encode_rejects_multi_column_batch() {
+        use arrow_array::{BinaryArray, Int64Array};
+        use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("k", DataType::Binary, false),
+            Field::new("v", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(BinaryArray::from_vec(vec![b"a"])),
+                Arc::new(Int64Array::from(vec![1])),
+            ],
+        )
+        .unwrap();
+        let err = encode_batch_as_raw_bytes(&batch).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("expected 1 column"), "got: {msg}");
+    }
+
+    #[test]
+    fn raw_bytes_encode_rejects_non_binary_column() {
+        use arrow_array::Int64Array;
+        use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "v",
+            DataType::Int64,
+            false,
+        )]));
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1, 2]))]).unwrap();
+        let err = encode_batch_as_raw_bytes(&batch).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("type Binary"), "got: {msg}");
+    }
+
+    #[test]
+    fn raw_bytes_encode_round_trips_payloads() {
+        use arrow_array::BinaryArray;
+        use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "data",
+            DataType::Binary,
+            true,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(BinaryArray::from_iter([
+                Some(b"alpha".as_slice()),
+                None,
+                Some(b"gamma".as_slice()),
+            ]))],
+        )
+        .unwrap();
+        let payloads = encode_batch_as_raw_bytes(&batch).unwrap();
+        // null becomes empty payload.
+        assert_eq!(
+            payloads,
+            vec![b"alpha".to_vec(), Vec::<u8>::new(), b"gamma".to_vec()]
+        );
     }
 
     /// Phase 36f.2: build_context() captures the MSK region for the

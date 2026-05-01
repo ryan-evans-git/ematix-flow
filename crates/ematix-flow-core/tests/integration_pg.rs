@@ -4381,3 +4381,69 @@ async fn streaming_pipeline_kafka_to_sqlite_end_to_end() {
         .value(0);
     assert_eq!(n, 7);
 }
+
+// ----- Phase 36h: payload format (RawBytes round-trip) ------------------
+
+use ematix_flow_core::kafka_backend::KafkaPayloadFormat;
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker; run with `cargo test -- --ignored`"]
+async fn kafka_raw_bytes_round_trip() {
+    use arrow_array::Array;
+    use arrow_array::BinaryArray;
+    use arrow_schema::{DataType as Dt, Field as F, Schema as S};
+
+    let (_container, bootstrap) = start_kafka().await;
+    let topic = "raw-bytes-test";
+
+    // Producer side: a 1-column Binary RecordBatch with three rows.
+    let producer = KafkaBackend::open(&bootstrap, None)
+        .unwrap()
+        .with_payload_format(KafkaPayloadFormat::RawBytes);
+    let schema = std::sync::Arc::new(S::new(vec![F::new("payload", Dt::Binary, false)]));
+    let batch = arrow_array::RecordBatch::try_new(
+        schema,
+        vec![std::sync::Arc::new(BinaryArray::from_vec(vec![
+            b"\x01\x02\x03",
+            b"hello world",
+            b"\xff",
+        ]))],
+    )
+    .unwrap();
+    let stream = futures_util::stream::once(async move { Ok::<_, _>(batch) });
+    let stream: ematix_flow_core::backend::ArrowBatchStream = Box::pin(stream);
+    let target = TargetTable {
+        schema: "".into(),
+        name: topic.into(),
+    };
+    let n = producer
+        .write_arrow_stream(&target, stream, WriteMode::Append)
+        .await
+        .unwrap();
+    assert_eq!(n, 3);
+
+    // Consumer side: same format yields one row per message with a
+    // single Binary column.
+    let consumer = KafkaBackend::open(&bootstrap, Some("raw-bytes-grp"))
+        .unwrap()
+        .with_payload_format(KafkaPayloadFormat::RawBytes);
+    let stream = consumer.read_arrow_stream(topic).await.unwrap();
+    let batches: Vec<_> = stream.try_collect().await.unwrap();
+    let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total, 3);
+
+    // Byte-level round trip — bytes flow through unchanged.
+    let arr = batches[0]
+        .column_by_name("payload")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<BinaryArray>()
+        .unwrap();
+    let mut got: Vec<&[u8]> = (0..arr.len()).map(|i| arr.value(i)).collect();
+    // Order across partitions isn't guaranteed; sort for stable
+    // comparison.
+    got.sort();
+    let mut expected: Vec<&[u8]> = vec![b"\x01\x02\x03", b"hello world", b"\xff"];
+    expected.sort();
+    assert_eq!(got, expected);
+}
