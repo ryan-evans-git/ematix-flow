@@ -59,10 +59,22 @@
 //!     must target the same subscription. Multi-subscription fanout
 //!     would need separate `PubSubBackend` instances.
 //!
-//! ## What lands in 37b.x
-//!   - 37b.4 — DLQ via the Pub/Sub-native dead-letter-policy
-//!     attached at subscription declaration time + `nack_pending()`
-//!     to drop currently-leased deliveries to the DLT topic.
+//! ## What 37b.4 adds (DLQ)
+//!   - `nack_pending()` — drain every retained handler and drop
+//!     them. The SDK's `Handler::Drop` impl nacks the underlying
+//!     ack_id, so the broker schedules immediate redelivery (vs
+//!     waiting for the ~10s ack-deadline to expire).
+//!   - The streaming-pipeline-level DLQ pattern (write a failed
+//!     batch to a DLQ topic via `source.write_arrow_stream`)
+//!     already works for Pub/Sub via the `write_arrow_stream` we
+//!     ship in 37b.2 — `dlq_target.name` is the topic name; auto-
+//!     qualification with the project_id lets bare names route.
+//!
+//! ### Two DLQ modes for Pub/Sub
+//! | mode | what it does | when to use |
+//! |--|--|--|
+//! | App-level | StreamingPipeline writes the failed batch's rows to a separate topic via the source backend's `write_arrow_stream`, then commits. | Cross-pipeline DLQ replay: re-consume the DLQ topic identically to the primary. |
+//! | Broker-level | `nack_pending()` triggers redelivery. With the subscription declared with `dead_letter_policy.dead_letter_topic = projects/.../topics/<dlt>` and `max_delivery_attempts = N`, after N nacks the broker auto-routes the message to the DLT and acks it from the original subscription. | Native Pub/Sub DLQ; observability via Pub/Sub admin tooling. |
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -209,6 +221,29 @@ impl PubSubBackend {
             .as_ref()
             .map(|s| s.pending_handlers.len())
             .unwrap_or(0)
+    }
+
+    /// Phase 37b.4: drain every retained handler and drop them.
+    /// The SDK's `Handler::Drop` impl nacks the underlying ack_id,
+    /// so the broker schedules immediate redelivery. Combined with
+    /// a subscription declared with `dead_letter_policy`
+    /// (configured at subscription-create time, not by the
+    /// framework), after `max_delivery_attempts` nacks the broker
+    /// auto-routes the message to the DLT topic and acks it from
+    /// the original subscription.
+    ///
+    /// No-op if no consumer session has been opened or no handlers
+    /// are pending.
+    pub async fn nack_pending(&self) -> Result<(), BackendError> {
+        let mut session_lock = self.consumer_session.lock().await;
+        let Some(session) = session_lock.as_mut() else {
+            return Ok(());
+        };
+        let drained = std::mem::take(&mut session.pending_handlers);
+        // Each Handler nacks on drop; explicit drop here so the
+        // intent is unambiguous in code review.
+        drop(drained);
+        Ok(())
     }
 
     /// Override the per-call drain limits used by `read_arrow_stream`.
@@ -928,6 +963,16 @@ mod tests {
     async fn commit_offsets_noop_without_consumer_session() {
         let b = PubSubBackend::open("p").unwrap();
         b.commit_offsets().await.unwrap();
+        assert_eq!(b.pending_handler_count().await, 0);
+    }
+
+    /// 37b.4: nack_pending is a no-op before any consumer session
+    /// has been opened, and is idempotent across repeated calls.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn nack_pending_noop_without_consumer_session() {
+        let b = PubSubBackend::open("p").unwrap();
+        b.nack_pending().await.unwrap();
+        b.nack_pending().await.unwrap();
         assert_eq!(b.pending_handler_count().await, 0);
     }
 
