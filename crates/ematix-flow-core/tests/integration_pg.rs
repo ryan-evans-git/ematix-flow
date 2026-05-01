@@ -2781,3 +2781,362 @@ async fn mysql_run_merge_handle_deletes_removes_missing_keys() {
     assert_eq!(total, 2);
     assert_eq!(row3, 0, "row 3 hard-deleted");
 }
+
+// ----- Phase 33d: MySQL run_scd2 -----------------------------------------
+
+fn mysql_scd2_dim_spec() -> TableSpec {
+    augment_with_scd2(&TableSpec {
+        schema: "test".into(),
+        name: "customer_dim".into(),
+        columns: vec![
+            ColumnSpec {
+                name: "customer_id".into(),
+                ty: ColumnType::BigInt,
+                nullable: false,
+                primary_key: true,
+            },
+            ColumnSpec {
+                name: "email".into(),
+                ty: ColumnType::Text,
+                nullable: false,
+                primary_key: false,
+            },
+            ColumnSpec {
+                name: "name".into(),
+                ty: ColumnType::Text,
+                nullable: true,
+                primary_key: false,
+            },
+        ],
+        unique_constraints: Vec::new(),
+        fingerprint: String::new(),
+    })
+}
+
+async fn mysql_scd2_setup() -> (testcontainers::ContainerAsync<Mysql>, Arc<dyn Backend>) {
+    let (container, url) = start_mysql().await;
+    let b: Arc<dyn Backend> = Arc::new(MySQLBackend::open(&url).unwrap());
+    b.execute(
+        "CREATE TABLE src_customers (customer_id BIGINT, email VARCHAR(255), name VARCHAR(255))",
+    )
+    .await
+    .unwrap();
+    b.execute(
+        "CREATE TABLE customer_dim (\
+            customer_id BIGINT NOT NULL, \
+            email VARCHAR(255), \
+            name VARCHAR(255), \
+            valid_from DATETIME(6) NOT NULL, \
+            valid_to DATETIME(6) NULL, \
+            is_current TINYINT(1) NOT NULL, \
+            row_hash VARBINARY(32) NOT NULL, \
+            _loaded_at DATETIME(6) NOT NULL, \
+            _batch_id CHAR(36) NOT NULL, \
+            PRIMARY KEY (customer_id, valid_from)\
+        ) ENGINE=InnoDB",
+    )
+    .await
+    .unwrap();
+    (container, b)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker; run with `cargo test -- --ignored`"]
+async fn mysql_run_scd2_first_load_inserts_all_current() {
+    use arrow_array::Int64Array;
+
+    let (_c, b) = mysql_scd2_setup().await;
+    b.execute(
+        "INSERT INTO src_customers VALUES \
+         (1, 'a@x.com', 'alice'), (2, 'b@x.com', 'bob'), (3, 'c@x.com', NULL)",
+    )
+    .await
+    .unwrap();
+    let target = mysql_scd2_dim_spec();
+    b.run_scd2(
+        &target,
+        "SELECT customer_id, email, name FROM src_customers",
+        &["customer_id".into()],
+        &["email".into(), "name".into()],
+        "mysql_scd2_first",
+        None,
+        None,
+        None,
+        None,
+        false,
+    )
+    .await
+    .unwrap();
+
+    let s = b
+        .read_arrow_stream(
+            "SELECT count(*), \
+                    CAST(sum(CASE WHEN is_current=1 THEN 1 ELSE 0 END) AS SIGNED), \
+                    CAST(sum(CASE WHEN valid_to IS NULL THEN 1 ELSE 0 END) AS SIGNED) \
+             FROM customer_dim",
+        )
+        .await
+        .unwrap();
+    let batches: Vec<_> = s.try_collect().await.unwrap();
+    let col = |i: usize| {
+        batches[0]
+            .column(i)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0)
+    };
+    assert_eq!(col(0), 3);
+    assert_eq!(col(1), 3);
+    assert_eq!(col(2), 3);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker; run with `cargo test -- --ignored`"]
+async fn mysql_run_scd2_second_load_closes_changed_row() {
+    use arrow_array::Int64Array;
+
+    let (_c, b) = mysql_scd2_setup().await;
+    b.execute("INSERT INTO src_customers VALUES (1, 'a@x.com', 'alice'), (2, 'b@x.com', 'bob')")
+        .await
+        .unwrap();
+    let target = mysql_scd2_dim_spec();
+    b.run_scd2(
+        &target,
+        "SELECT customer_id, email, name FROM src_customers",
+        &["customer_id".into()],
+        &["email".into(), "name".into()],
+        "mysql_scd2_a",
+        None,
+        None,
+        None,
+        None,
+        false,
+    )
+    .await
+    .unwrap();
+
+    b.execute("UPDATE src_customers SET email = 'b2@x.com' WHERE customer_id = 2")
+        .await
+        .unwrap();
+    b.run_scd2(
+        &target,
+        "SELECT customer_id, email, name FROM src_customers",
+        &["customer_id".into()],
+        &["email".into(), "name".into()],
+        "mysql_scd2_b",
+        None,
+        None,
+        None,
+        None,
+        false,
+    )
+    .await
+    .unwrap();
+
+    let s = b
+        .read_arrow_stream(
+            "SELECT count(*), \
+                    CAST(sum(CASE WHEN is_current=1 THEN 1 ELSE 0 END) AS SIGNED), \
+                    CAST(sum(CASE WHEN customer_id=2 AND is_current=1 THEN 1 ELSE 0 END) AS SIGNED), \
+                    CAST(sum(CASE WHEN customer_id=2 AND is_current=0 THEN 1 ELSE 0 END) AS SIGNED) \
+             FROM customer_dim",
+        )
+        .await
+        .unwrap();
+    let batches: Vec<_> = s.try_collect().await.unwrap();
+    let col = |i: usize| {
+        batches[0]
+            .column(i)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0)
+    };
+    assert_eq!(col(0), 3);
+    assert_eq!(col(1), 2);
+    assert_eq!(col(2), 1, "exactly one current bob");
+    assert_eq!(col(3), 1, "exactly one closed bob");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker; run with `cargo test -- --ignored`"]
+async fn mysql_run_scd2_idempotent_when_no_changes() {
+    use arrow_array::Int64Array;
+
+    let (_c, b) = mysql_scd2_setup().await;
+    b.execute("INSERT INTO src_customers VALUES (1, 'a@x.com', 'alice')")
+        .await
+        .unwrap();
+    let target = mysql_scd2_dim_spec();
+    for tag in ["mysql_scd2_idem_1", "mysql_scd2_idem_2"] {
+        b.run_scd2(
+            &target,
+            "SELECT customer_id, email, name FROM src_customers",
+            &["customer_id".into()],
+            &["email".into(), "name".into()],
+            tag,
+            None,
+            None,
+            None,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+    }
+    let s = b
+        .read_arrow_stream("SELECT count(*) FROM customer_dim")
+        .await
+        .unwrap();
+    let batches: Vec<_> = s.try_collect().await.unwrap();
+    let total = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(total, 1, "second run inserts nothing");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker; run with `cargo test -- --ignored`"]
+async fn mysql_run_scd2_soft_delete_closes_missing_keys() {
+    use arrow_array::Int64Array;
+    use ematix_flow_core::meta::DeleteHandling;
+
+    let (_c, b) = mysql_scd2_setup().await;
+    b.execute("INSERT INTO src_customers VALUES (1, 'a@x.com', 'alice'), (2, 'b@x.com', 'bob'), (3, 'c@x.com', 'cat')")
+        .await
+        .unwrap();
+    let target = mysql_scd2_dim_spec();
+    b.run_scd2(
+        &target,
+        "SELECT customer_id, email, name FROM src_customers",
+        &["customer_id".into()],
+        &["email".into(), "name".into()],
+        "mysql_scd2_soft_a",
+        None,
+        None,
+        None,
+        None,
+        false,
+    )
+    .await
+    .unwrap();
+
+    // Drop customer_id=3 from source, expect soft-delete.
+    b.execute("DELETE FROM src_customers WHERE customer_id = 3")
+        .await
+        .unwrap();
+    b.run_scd2(
+        &target,
+        "SELECT customer_id, email, name FROM src_customers",
+        &["customer_id".into()],
+        &["email".into(), "name".into()],
+        "mysql_scd2_soft_b",
+        None,
+        Some(DeleteHandling::Soft),
+        None,
+        None,
+        false,
+    )
+    .await
+    .unwrap();
+
+    let s = b
+        .read_arrow_stream(
+            "SELECT \
+                CAST(sum(CASE WHEN customer_id=3 AND is_current=1 THEN 1 ELSE 0 END) AS SIGNED), \
+                CAST(sum(CASE WHEN customer_id=3 AND is_current=0 THEN 1 ELSE 0 END) AS SIGNED), \
+                CAST(sum(CASE WHEN customer_id IN (1,2) AND is_current=1 THEN 1 ELSE 0 END) AS SIGNED) \
+             FROM customer_dim",
+        )
+        .await
+        .unwrap();
+    let batches: Vec<_> = s.try_collect().await.unwrap();
+    let col = |i: usize| {
+        batches[0]
+            .column(i)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0)
+    };
+    assert_eq!(col(0), 0, "row 3 no longer current");
+    assert_eq!(col(1), 1, "row 3 has one closed version");
+    assert_eq!(col(2), 2, "rows 1+2 still current");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker; run with `cargo test -- --ignored`"]
+async fn mysql_run_scd2_ttl_expires_stale_current() {
+    use arrow_array::Int64Array;
+
+    let (_c, b) = mysql_scd2_setup().await;
+    b.execute("INSERT INTO src_customers VALUES (1, 'a@x.com', 'alice')")
+        .await
+        .unwrap();
+    let target = mysql_scd2_dim_spec();
+    // First load → 1 current row, valid_from = NOW(6).
+    b.run_scd2(
+        &target,
+        "SELECT customer_id, email, name FROM src_customers",
+        &["customer_id".into()],
+        &["email".into(), "name".into()],
+        "mysql_scd2_ttl",
+        None,
+        None,
+        None,
+        None,
+        false,
+    )
+    .await
+    .unwrap();
+    // Backdate the valid_from to 2 hours ago, then run a no-change SCD2
+    // with ttl_seconds=3600. The TTL pass should tombstone the current
+    // row even though nothing in the source changed.
+    b.execute(
+        "UPDATE customer_dim SET valid_from = NOW(6) - INTERVAL 2 HOUR WHERE customer_id = 1",
+    )
+    .await
+    .unwrap();
+    b.run_scd2(
+        &target,
+        "SELECT customer_id, email, name FROM src_customers",
+        &["customer_id".into()],
+        &["email".into(), "name".into()],
+        "mysql_scd2_ttl_2",
+        None,
+        None,
+        None,
+        Some(3600),
+        false,
+    )
+    .await
+    .unwrap();
+
+    let s = b
+        .read_arrow_stream(
+            "SELECT CAST(sum(CASE WHEN is_current=1 THEN 1 ELSE 0 END) AS SIGNED), \
+                    CAST(sum(CASE WHEN is_current=0 THEN 1 ELSE 0 END) AS SIGNED) \
+             FROM customer_dim",
+        )
+        .await
+        .unwrap();
+    let batches: Vec<_> = s.try_collect().await.unwrap();
+    let cur = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap()
+        .value(0);
+    let closed = batches[0]
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(cur, 0, "stale row tombstoned");
+    assert_eq!(closed, 1);
+}

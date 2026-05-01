@@ -47,9 +47,260 @@ use crate::backend::{
 use crate::meta::{WatermarkConfig, build_hard_delete_sql, wrap_with_watermark_filter};
 use crate::pg::ConnectionInfo;
 use crate::strategy::append::{BATCH_ID_COL, LOADED_AT_COL, plan_same_db_append};
+use crate::strategy::scd2::{IS_CURRENT_COL, ROW_HASH_COL, VALID_FROM_COL, VALID_TO_COL};
 use crate::strategy::truncate::plan_truncate_replace;
 use crate::types::TableSpec;
 use uuid::Uuid;
+
+const MYSQL_NOW: &str = "NOW(6)";
+
+/// MySQL equivalent of `pg::hash::postgres_digest_expression`. PG uses
+/// pgcrypto `digest(text, 'sha256')` returning BYTEA; DuckDB uses
+/// `unhex(sha256(varchar))`; SQLite uses a registered Rust UDF.
+/// MySQL has built-in `SHA2(text, 256)` returning a hex VARCHAR;
+/// `UNHEX(...)` converts it to BINARY(32) so row_hash storage is
+/// consistent across backends.
+///
+/// Null-safe concatenation uses `CHAR(0) || 'NULL' || CHAR(0)` as the
+/// null sentinel and `CHAR(1)` as the inter-column separator, matching
+/// the other backends. MySQL's `||` is logical OR by default — we use
+/// `CONCAT(...)` instead.
+fn mysql_digest_expression(columns: &[String], prefix: &str) -> String {
+    let parts: Vec<String> = columns
+        .iter()
+        .map(|c| {
+            format!(
+                "COALESCE(CAST({prefix}{c} AS CHAR), CONCAT(CHAR(0), 'NULL', CHAR(0)))",
+                prefix = prefix,
+                c = c,
+            )
+        })
+        .collect();
+    let mut concat_args: Vec<String> = Vec::with_capacity(parts.len() * 2);
+    for (i, p) in parts.iter().enumerate() {
+        if i > 0 {
+            concat_args.push("CHAR(1)".into());
+        }
+        concat_args.push(p.clone());
+    }
+    format!("UNHEX(SHA2(CONCAT({}), 256))", concat_args.join(", "))
+}
+
+/// MySQL-specific SCD2 statement builder. Mirrors `sqlite_scd2_statements`
+/// but emits SQL MySQL accepts:
+///   - `is_current` is `1`/`0` (MySQL bool = TINYINT(1)).
+///   - `now()` → `NOW(6)`.
+///   - `digest(…, 'sha256')` → `UNHEX(SHA2(…, 256))`.
+///   - `DISTINCT ON (keys) … ORDER BY ts DESC` → `ROW_NUMBER()` subquery.
+///   - Temp table: `CREATE TEMPORARY TABLE` (connection-scoped); we
+///     DROP explicitly at the end of the plan, and the executor holds
+///     one connection throughout so the temp survives between stmts.
+///   - `$1::uuid` substituted to a literal up-front.
+///   - Correlated UPDATE for event-time close-out uses MySQL's multi-
+///     table UPDATE (`UPDATE t JOIN c ON … SET t.x = c.y`) — MySQL
+///     doesn't support `UPDATE … FROM`.
+fn mysql_scd2_statements(
+    target: &TableSpec,
+    source_query: &str,
+    keys: &[String],
+    compare_columns: &[String],
+    run_token: &str,
+    event_ts_column: Option<&str>,
+    batch_id: &Uuid,
+) -> Vec<String> {
+    let user_columns: Vec<String> = target
+        .columns
+        .iter()
+        .filter(|c| {
+            let n = c.name.as_str();
+            n != VALID_FROM_COL
+                && n != VALID_TO_COL
+                && n != IS_CURRENT_COL
+                && n != ROW_HASH_COL
+                && n != LOADED_AT_COL
+                && n != BATCH_ID_COL
+        })
+        .map(|c| c.name.clone())
+        .collect();
+    let has_metadata = target
+        .columns
+        .iter()
+        .any(|c| c.name == LOADED_AT_COL || c.name == BATCH_ID_COL);
+
+    let stage = format!("_scd2_changed_{run_token}");
+    let digest_expr = mysql_digest_expression(compare_columns, "");
+    let key_tuple: String = keys.join(", ");
+    let t_tuple: String = keys
+        .iter()
+        .map(|k| format!("t.{k}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let src_tuple: String = keys
+        .iter()
+        .map(|k| format!("src.{k}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let join_clause = format!("({t_tuple}) = ({src_tuple})");
+    let table_ref = qualified(&target.schema, &target.name);
+
+    let src_select = match event_ts_column {
+        Some(ets) => format!(
+            "SELECT * FROM (\
+               SELECT {user_cols}, {ets} AS _event_ts, \
+                      {digest_expr} AS _row_hash, \
+                      ROW_NUMBER() OVER (PARTITION BY {keys} ORDER BY {ets} DESC) AS _rn \
+               FROM ({source}) q \
+             ) ranked WHERE _rn = 1",
+            user_cols = user_columns.join(", "),
+            ets = ets,
+            digest_expr = digest_expr,
+            keys = key_tuple,
+            source = source_query,
+        ),
+        None => format!(
+            "SELECT {user_cols}, {digest_expr} AS _row_hash FROM ({source}) q",
+            user_cols = user_columns.join(", "),
+            digest_expr = digest_expr,
+            source = source_query,
+        ),
+    };
+
+    // MySQL `CREATE TEMPORARY TABLE … AS SELECT` is supported and
+    // creates a connection-scoped table that survives until DROP or
+    // disconnect. We drop explicitly at the end of the plan.
+    //
+    // The CTE-style `WITH src AS (…)` works on MySQL 8+, but the
+    // outer `… SELECT src.* FROM src LEFT JOIN …` form translates
+    // 1:1 from SQLite/DuckDB.
+    let create_temp = format!(
+        "CREATE TEMPORARY TABLE {stage} AS \
+         WITH src AS ( {src_select} ) \
+         SELECT src.* FROM src \
+         LEFT JOIN {table_ref} t \
+             ON {join_clause} AND t.{is_current_col} = 1 \
+         WHERE t.{row_hash_col} IS NULL OR t.{row_hash_col} <> src._row_hash",
+        stage = stage,
+        src_select = src_select,
+        table_ref = table_ref,
+        join_clause = join_clause,
+        is_current_col = IS_CURRENT_COL,
+        row_hash_col = ROW_HASH_COL,
+    );
+
+    let close_out = match event_ts_column {
+        Some(_) => {
+            // MySQL multi-table UPDATE: `UPDATE t JOIN c ON … SET …`.
+            // Each row's valid_to gets the corresponding stage row's
+            // _event_ts.
+            let join: String = keys
+                .iter()
+                .map(|k| format!("t.{k} = c.{k}"))
+                .collect::<Vec<_>>()
+                .join(" AND ");
+            format!(
+                "UPDATE {table_ref} AS t \
+                 JOIN {stage} c \
+                   ON {join} \
+                 SET t.{valid_to} = c._event_ts, t.{is_current} = 0 \
+                 WHERE t.{is_current} = 1",
+                table_ref = table_ref,
+                valid_to = VALID_TO_COL,
+                is_current = IS_CURRENT_COL,
+                stage = stage,
+                join = join,
+            )
+        }
+        None => format!(
+            "UPDATE {table_ref} \
+             SET {valid_to} = {now}, {is_current} = 0 \
+             WHERE {is_current} = 1 AND ({keys}) IN (SELECT {keys} FROM {stage})",
+            table_ref = table_ref,
+            valid_to = VALID_TO_COL,
+            is_current = IS_CURRENT_COL,
+            keys = key_tuple,
+            stage = stage,
+            now = MYSQL_NOW,
+        ),
+    };
+
+    let mut insert_cols: Vec<String> = user_columns.clone();
+    insert_cols.push(VALID_FROM_COL.into());
+    insert_cols.push(VALID_TO_COL.into());
+    insert_cols.push(IS_CURRENT_COL.into());
+    insert_cols.push(ROW_HASH_COL.into());
+    let mut select_exprs: Vec<String> = user_columns.clone();
+    let valid_from_expr: String = match event_ts_column {
+        Some(_) => "_event_ts".into(),
+        None => MYSQL_NOW.into(),
+    };
+    select_exprs.push(valid_from_expr);
+    select_exprs.push("NULL".into());
+    select_exprs.push("1".into());
+    select_exprs.push("_row_hash".into());
+    if has_metadata {
+        insert_cols.push(LOADED_AT_COL.into());
+        insert_cols.push(BATCH_ID_COL.into());
+        select_exprs.push(MYSQL_NOW.into());
+        select_exprs.push(format!("'{batch_id}'"));
+    }
+    let insert_new = format!(
+        "INSERT INTO {table_ref} ({insert_cols}) \
+         SELECT {select_exprs} FROM {stage}",
+        table_ref = table_ref,
+        insert_cols = insert_cols.join(", "),
+        select_exprs = select_exprs.join(", "),
+        stage = stage,
+    );
+
+    let drop_temp = format!("DROP TEMPORARY TABLE {stage}");
+
+    vec![create_temp, close_out, insert_new, drop_temp]
+}
+
+/// MySQL-specific soft-delete (close-missing). Mirrors
+/// `meta::build_scd2_close_missing_sql` but with MySQL literals
+/// (`is_current = 0/1`, `NOW(6)`).
+fn mysql_scd2_close_missing_sql(
+    target_schema: &str,
+    target_table: &str,
+    keys: &[String],
+    source_keys_query: &str,
+) -> String {
+    let key_tuple = keys.join(", ");
+    let table_ref = qualified(target_schema, target_table);
+    format!(
+        "UPDATE {table_ref} \
+         SET {valid_to} = {now}, {is_current} = 0 \
+         WHERE {is_current} = 1 \
+           AND ({key_tuple}) NOT IN (SELECT {key_tuple} FROM ({source}) _del)",
+        table_ref = table_ref,
+        valid_to = VALID_TO_COL,
+        is_current = IS_CURRENT_COL,
+        now = MYSQL_NOW,
+        key_tuple = key_tuple,
+        source = source_keys_query,
+    )
+}
+
+/// MySQL-specific TTL expiry. PG uses `make_interval(secs => N)` and
+/// TIMESTAMPTZ - INTERVAL arithmetic; DuckDB compares `epoch(...)`;
+/// SQLite uses `strftime('%s', ...)`. MySQL has `UNIX_TIMESTAMP(...)`
+/// which returns DECIMAL(20,6) for sub-second precision.
+fn mysql_scd2_ttl_expire_sql(target_schema: &str, target_table: &str, ttl_seconds: i64) -> String {
+    let table_ref = qualified(target_schema, target_table);
+    format!(
+        "UPDATE {table_ref} \
+         SET {valid_to} = {now}, {is_current} = 0 \
+         WHERE {is_current} = 1 \
+           AND UNIX_TIMESTAMP({valid_from}) < UNIX_TIMESTAMP(NOW(6)) - {ttl_seconds}",
+        table_ref = table_ref,
+        valid_to = VALID_TO_COL,
+        valid_from = VALID_FROM_COL,
+        is_current = IS_CURRENT_COL,
+        now = MYSQL_NOW,
+        ttl_seconds = ttl_seconds,
+    )
+}
 
 fn is_metadata_col(name: &str) -> bool {
     name == LOADED_AT_COL || name == BATCH_ID_COL
@@ -1307,20 +1558,143 @@ impl Backend for MySQLBackend {
 
     async fn run_scd2(
         &self,
-        _spec: &TableSpec,
-        _source_query: &str,
-        _keys: &[String],
-        _compare_columns: &[String],
-        _pipeline_name: &str,
-        _source_backend: Option<&dyn Backend>,
-        _delete_handling: Option<DeleteHandling>,
-        _event_timestamp_column: Option<&str>,
-        _ttl_seconds: Option<i64>,
-        _dry_run: bool,
+        spec: &TableSpec,
+        source_query: &str,
+        keys: &[String],
+        compare_columns: &[String],
+        pipeline_name: &str,
+        source_backend: Option<&dyn Backend>,
+        delete_handling: Option<DeleteHandling>,
+        event_timestamp_column: Option<&str>,
+        ttl_seconds: Option<i64>,
+        dry_run: bool,
     ) -> Result<StrategyRunResult, BackendError> {
-        Err(BackendError::Other(
-            "MySQL run_scd2 lands in Phase 33d".into(),
-        ))
+        if source_backend.is_some() {
+            return Err(BackendError::Other(
+                "MySQL cross-backend run_scd2 goes through the Arrow bridge".into(),
+            ));
+        }
+        if let Some(dh) = delete_handling
+            && !matches!(dh, DeleteHandling::Soft)
+        {
+            return Err(BackendError::Other(format!(
+                "MySQL run_scd2: only DeleteHandling::Soft is supported (got {dh:?}); \
+                 Hard is for merge"
+            )));
+        }
+        let batch_id = Uuid::new_v4();
+        let run_id = Uuid::new_v4();
+        let run_token = run_id.simple().to_string();
+        let mut stmts = mysql_scd2_statements(
+            spec,
+            source_query,
+            keys,
+            compare_columns,
+            &run_token,
+            event_timestamp_column,
+            &batch_id,
+        );
+        // Insert soft-delete + TTL between the SCD2 INSERT and the DROP
+        // so newly inserted current rows aren't tombstoned by their own
+        // absence in the keys-NOT-IN-source filter.
+        let drop_temp = stmts.pop().expect("plan ends with DROP TEMPORARY TABLE");
+        if matches!(delete_handling, Some(DeleteHandling::Soft)) {
+            stmts.push(mysql_scd2_close_missing_sql(
+                &spec.schema,
+                &spec.name,
+                keys,
+                source_query,
+            ));
+        }
+        if let Some(ttl) = ttl_seconds {
+            stmts.push(mysql_scd2_ttl_expire_sql(&spec.schema, &spec.name, ttl));
+        }
+        stmts.push(drop_temp);
+
+        self.ensure_meta_schema().await?;
+        self.record_run_start(
+            run_id,
+            pipeline_name,
+            &spec.schema,
+            &spec.name,
+            "scd2",
+            "same_db",
+        )
+        .await?;
+
+        // All SCD2 stmts share a single connection because the TEMP
+        // TABLE in MySQL is connection-scoped and would not be visible
+        // across pool checkouts. We never call `get_conn()` again
+        // inside this block.
+        let inserted_result: Result<u64, BackendError> = async {
+            let mut conn = self
+                .pool
+                .get_conn()
+                .await
+                .map_err(|e| BackendError::Connection(e.to_string()))?;
+            conn.query_drop("START TRANSACTION")
+                .await
+                .map_err(|e| BackendError::Query(e.to_string()))?;
+            let mut inserted: u64 = 0;
+            for (idx, sql) in stmts.iter().enumerate() {
+                let result = conn.query_iter(sql).await;
+                let r = match result {
+                    Ok(r) => r,
+                    Err(e) => {
+                        let _ = conn.query_drop("ROLLBACK").await;
+                        // Best-effort drop the temp table if we got past
+                        // the create — keeps the connection clean for
+                        // pool reuse.
+                        let _ = conn
+                            .query_drop(format!(
+                                "DROP TEMPORARY TABLE IF EXISTS _scd2_changed_{run_token}"
+                            ))
+                            .await;
+                        return Err(BackendError::Query(format!(
+                            "scd2 stmt {idx} failed: {e}; sql={sql}"
+                        )));
+                    }
+                };
+                let n = r.affected_rows();
+                r.drop_result()
+                    .await
+                    .map_err(|e| BackendError::Query(e.to_string()))?;
+                if idx == 2 {
+                    // The third statement is the INSERT INTO target; its
+                    // affected_rows is the rows_inserted count.
+                    inserted = n;
+                }
+            }
+            if dry_run {
+                conn.query_drop("ROLLBACK")
+                    .await
+                    .map_err(|e| BackendError::Query(e.to_string()))?;
+            } else {
+                conn.query_drop("COMMIT")
+                    .await
+                    .map_err(|e| BackendError::Query(e.to_string()))?;
+            }
+            Ok(inserted)
+        }
+        .await;
+
+        match &inserted_result {
+            Ok(n) => self.record_run_success(run_id, *n as i64).await?,
+            Err(e) => {
+                let _ = self.record_run_failure(run_id, &e.to_string()).await;
+            }
+        }
+        let inserted = inserted_result?;
+
+        Ok(StrategyRunResult {
+            run_id: run_id.to_string(),
+            rows_inserted: inserted as i64,
+            rows_updated: None,
+            rows_unchanged: None,
+            rows_closed: None,
+            status: if dry_run { "dry_run" } else { "success" }.into(),
+            path: "same_db".into(),
+        })
     }
 }
 
