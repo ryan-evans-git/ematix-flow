@@ -46,8 +46,62 @@ use crate::backend::{
     ArrowBatchStream, Backend, BackendError, DeleteHandling, Dialect, StrategyRunResult,
     TargetTable, WriteMode,
 };
+use crate::meta::{WatermarkConfig, wrap_with_watermark_filter};
 use crate::pg::ConnectionInfo;
+use crate::strategy::append::{BATCH_ID_COL, plan_same_db_append};
+use crate::strategy::truncate::plan_truncate_replace;
 use crate::types::TableSpec;
+use uuid::Uuid;
+
+const META_RUN_HISTORY: &str = "ematix_flow_run_history";
+const META_WATERMARKS: &str = "ematix_flow_watermarks";
+
+/// SQL that lazy-creates the meta tables on SQLite. SQLite has no
+/// first-class schemas, so we live in `main` with a `ematix_flow_`
+/// prefix. UUID columns become TEXT (stored as canonical hyphenated
+/// hex); TIMESTAMPTZ becomes TEXT (ISO-8601 with `'Z'` suffix).
+fn ensure_meta_schema_sql() -> String {
+    format!(
+        "CREATE TABLE IF NOT EXISTS {META_RUN_HISTORY} (\
+            run_id TEXT PRIMARY KEY, \
+            parent_run_id TEXT, \
+            pipeline_name TEXT NOT NULL, \
+            step_name TEXT, \
+            target_schema TEXT NOT NULL, \
+            target_table TEXT NOT NULL, \
+            mode TEXT NOT NULL, \
+            path TEXT NOT NULL, \
+            started_at TEXT NOT NULL, \
+            finished_at TEXT, \
+            status TEXT NOT NULL, \
+            rows_inserted INTEGER, \
+            rows_updated INTEGER, \
+            rows_unchanged INTEGER, \
+            error_message TEXT, \
+            metrics_json TEXT\
+         ); \
+         CREATE TABLE IF NOT EXISTS {META_WATERMARKS} (\
+            pipeline_name TEXT PRIMARY KEY, \
+            column_name TEXT NOT NULL, \
+            last_value TEXT NOT NULL, \
+            updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))\
+         )"
+    )
+}
+
+/// SQLite-specific substitutions. The PG-shaped planners emit three
+/// constructs SQLite rejects: `now()` (function), `$1::uuid` (cast +
+/// non-existent UUID type), and `TRUNCATE TABLE …` (no such
+/// statement). Each is replaced inline before execution. UUIDs are
+/// stored as TEXT (canonical hyphenated hex).
+fn sqlite_substitute(sql: &str, batch_id: &Uuid) -> String {
+    let trimmed = sql.trim_start();
+    if let Some(rest) = trimmed.strip_prefix("TRUNCATE TABLE ") {
+        return format!("DELETE FROM {rest}");
+    }
+    sql.replace("now()", "strftime('%Y-%m-%dT%H:%M:%fZ', 'now')")
+        .replace("$1::uuid", &format!("'{batch_id}'"))
+}
 
 /// SQLite-backed implementation of `Backend`.
 ///
@@ -93,6 +147,186 @@ impl SQLiteBackend {
             Ok(r) => r,
             Err(e) => Err(BackendError::Other(format!("sqlite task join: {e}"))),
         }
+    }
+
+    async fn ensure_meta_schema(&self) -> Result<(), BackendError> {
+        self.with_conn_blocking(|c| {
+            c.execute_batch(&ensure_meta_schema_sql())
+                .map_err(|e| BackendError::Query(e.to_string()))
+        })
+        .await
+    }
+
+    async fn record_run_start(
+        &self,
+        run_id: Uuid,
+        pipeline_name: &str,
+        target_schema: &str,
+        target_table: &str,
+        mode: &str,
+        path: &str,
+    ) -> Result<(), BackendError> {
+        let pipeline_name = pipeline_name.to_string();
+        let target_schema = target_schema.to_string();
+        let target_table = target_table.to_string();
+        let mode = mode.to_string();
+        let path = path.to_string();
+        self.with_conn_blocking(move |c| {
+            c.execute(
+                &format!(
+                    "INSERT INTO {META_RUN_HISTORY} \
+                     (run_id, pipeline_name, target_schema, target_table, mode, path, \
+                      started_at, status) \
+                     VALUES (?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), \
+                             'running')"
+                ),
+                rusqlite::params![
+                    run_id.to_string(),
+                    pipeline_name,
+                    target_schema,
+                    target_table,
+                    mode,
+                    path,
+                ],
+            )
+            .map_err(|e| BackendError::Query(e.to_string()))?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn record_run_success(
+        &self,
+        run_id: Uuid,
+        rows_inserted: i64,
+    ) -> Result<(), BackendError> {
+        self.with_conn_blocking(move |c| {
+            c.execute(
+                &format!(
+                    "UPDATE {META_RUN_HISTORY} \
+                     SET status='success', rows_inserted=?, \
+                         finished_at=strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
+                     WHERE run_id=?"
+                ),
+                rusqlite::params![rows_inserted, run_id.to_string()],
+            )
+            .map_err(|e| BackendError::Query(e.to_string()))?;
+            Ok(())
+        })
+        .await
+    }
+
+    #[allow(dead_code)] // wired in 32c
+    async fn record_run_success_merge(
+        &self,
+        run_id: Uuid,
+        rows_inserted: i64,
+        rows_updated: i64,
+        rows_unchanged: i64,
+    ) -> Result<(), BackendError> {
+        self.with_conn_blocking(move |c| {
+            c.execute(
+                &format!(
+                    "UPDATE {META_RUN_HISTORY} \
+                     SET status='success', rows_inserted=?, rows_updated=?, \
+                         rows_unchanged=?, \
+                         finished_at=strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
+                     WHERE run_id=?"
+                ),
+                rusqlite::params![
+                    rows_inserted,
+                    rows_updated,
+                    rows_unchanged,
+                    run_id.to_string()
+                ],
+            )
+            .map_err(|e| BackendError::Query(e.to_string()))?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn record_run_failure(
+        &self,
+        run_id: Uuid,
+        error_message: &str,
+    ) -> Result<(), BackendError> {
+        let error_message = error_message.to_string();
+        self.with_conn_blocking(move |c| {
+            c.execute(
+                &format!(
+                    "UPDATE {META_RUN_HISTORY} \
+                     SET status='failed', error_message=?, \
+                         finished_at=strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
+                     WHERE run_id=?"
+                ),
+                rusqlite::params![error_message, run_id.to_string()],
+            )
+            .map_err(|e| BackendError::Query(e.to_string()))?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Compute MAX(<column>) over rows just inserted in this batch and
+    /// UPSERT into the watermarks table. SQLite supports
+    /// `INSERT … ON CONFLICT … DO UPDATE` since 3.24, and the bundled
+    /// rusqlite SQLite is well past that. NULL MAX is a no-op so a
+    /// stale watermark survives a zero-row run.
+    async fn advance_watermark(
+        &self,
+        target: &TableSpec,
+        batch_id: Uuid,
+        pipeline_name: &str,
+        watermark: &WatermarkConfig,
+    ) -> Result<(), BackendError> {
+        let target_schema = target.schema.clone();
+        let target_table = target.name.clone();
+        let pipeline_name = pipeline_name.to_string();
+        let column = watermark.column.clone();
+        self.with_conn_blocking(move |c| {
+            // Schema is always 'main' or empty — qualifying with 'main.'
+            // works either way. Cast the watermark value to TEXT so
+            // every type round-trips through last_value.
+            let max_sql = format!(
+                "SELECT CAST(MAX({col}) AS TEXT) FROM {schema}.{table} \
+                 WHERE {batch_id_col} = ?",
+                col = column,
+                schema = if target_schema.is_empty() {
+                    "main"
+                } else {
+                    &target_schema
+                },
+                table = target_table,
+                batch_id_col = BATCH_ID_COL,
+            );
+            let mut stmt = c
+                .prepare(&max_sql)
+                .map_err(|e| BackendError::Query(e.to_string()))?;
+            let max_value: Option<String> = stmt
+                .query_row(rusqlite::params![batch_id.to_string()], |r| r.get(0))
+                .map_err(|e| BackendError::Query(e.to_string()))?;
+            drop(stmt);
+
+            let Some(value) = max_value else {
+                return Ok(());
+            };
+            c.execute(
+                &format!(
+                    "INSERT INTO {META_WATERMARKS} \
+                     (pipeline_name, column_name, last_value, updated_at) \
+                     VALUES (?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')) \
+                     ON CONFLICT (pipeline_name) DO UPDATE SET \
+                       column_name = excluded.column_name, \
+                       last_value = excluded.last_value, \
+                       updated_at = excluded.updated_at"
+                ),
+                rusqlite::params![pipeline_name, column, value],
+            )
+            .map_err(|e| BackendError::Query(e.to_string()))?;
+            Ok(())
+        })
+        .await
     }
 }
 
@@ -452,30 +686,161 @@ impl Backend for SQLiteBackend {
 
     async fn run_append(
         &self,
-        _spec: &TableSpec,
-        _source_query: &str,
-        _pipeline_name: &str,
-        _source_backend: Option<&dyn Backend>,
-        _incremental_column: Option<&str>,
-        _last_value_literal: Option<&str>,
-        _dry_run: bool,
+        spec: &TableSpec,
+        source_query: &str,
+        pipeline_name: &str,
+        source_backend: Option<&dyn Backend>,
+        incremental_column: Option<&str>,
+        last_value_literal: Option<&str>,
+        dry_run: bool,
     ) -> Result<StrategyRunResult, BackendError> {
-        Err(BackendError::Other(
-            "SQLite run_append: not implemented in Phase 32a (lands in 32b)".into(),
-        ))
+        if source_backend.is_some() {
+            return Err(BackendError::Other(
+                "SQLite cross-backend run_append goes through the Arrow streaming bridge \
+                 (cross_backend_arrow_sync); same-backend only here"
+                    .into(),
+            ));
+        }
+        require_main_schema(&spec.schema)?;
+        let watermark = incremental_column.map(|c| WatermarkConfig {
+            column: c.to_string(),
+            last_value_literal: last_value_literal.map(|s| s.to_string()),
+        });
+        let filtered_source = wrap_with_watermark_filter(source_query, watermark.as_ref());
+        let plan = plan_same_db_append(spec, &filtered_source);
+        let batch_id = Uuid::new_v4();
+        let run_id = Uuid::new_v4();
+        let sql = sqlite_substitute(&plan.sql, &batch_id);
+
+        self.ensure_meta_schema().await?;
+        self.record_run_start(
+            run_id,
+            pipeline_name,
+            &spec.schema,
+            &spec.name,
+            "append",
+            "same_db",
+        )
+        .await?;
+
+        let inserted_result: Result<u64, BackendError> = self
+            .with_conn_blocking(move |c| {
+                if dry_run {
+                    c.execute_batch("BEGIN")
+                        .map_err(|e| BackendError::Query(e.to_string()))?;
+                    let n = c
+                        .execute(&sql, [])
+                        .map_err(|e| BackendError::Query(e.to_string()))?;
+                    c.execute_batch("ROLLBACK")
+                        .map_err(|e| BackendError::Query(e.to_string()))?;
+                    Ok::<u64, BackendError>(n as u64)
+                } else {
+                    let n = c
+                        .execute(&sql, [])
+                        .map_err(|e| BackendError::Query(e.to_string()))?;
+                    Ok(n as u64)
+                }
+            })
+            .await;
+
+        match &inserted_result {
+            Ok(n) => {
+                self.record_run_success(run_id, *n as i64).await?;
+                if !dry_run && let Some(wc) = watermark.as_ref() {
+                    self.advance_watermark(spec, batch_id, pipeline_name, wc)
+                        .await?;
+                }
+            }
+            Err(e) => {
+                let _ = self.record_run_failure(run_id, &e.to_string()).await;
+            }
+        }
+        let inserted = inserted_result?;
+
+        Ok(StrategyRunResult {
+            run_id: run_id.to_string(),
+            rows_inserted: inserted as i64,
+            rows_updated: None,
+            rows_unchanged: None,
+            rows_closed: None,
+            status: if dry_run { "dry_run" } else { "success" }.into(),
+            path: "same_db".into(),
+        })
     }
 
     async fn run_truncate(
         &self,
-        _spec: &TableSpec,
-        _source_query: &str,
-        _pipeline_name: &str,
-        _source_backend: Option<&dyn Backend>,
-        _dry_run: bool,
+        spec: &TableSpec,
+        source_query: &str,
+        pipeline_name: &str,
+        source_backend: Option<&dyn Backend>,
+        dry_run: bool,
     ) -> Result<StrategyRunResult, BackendError> {
-        Err(BackendError::Other(
-            "SQLite run_truncate: not implemented in Phase 32a (lands in 32b)".into(),
-        ))
+        if source_backend.is_some() {
+            return Err(BackendError::Other(
+                "SQLite cross-backend run_truncate goes through the Arrow bridge".into(),
+            ));
+        }
+        require_main_schema(&spec.schema)?;
+        let plan = plan_truncate_replace(spec, source_query);
+        let batch_id = Uuid::new_v4();
+        let run_id = Uuid::new_v4();
+        let stmts: Vec<String> = plan
+            .statements
+            .iter()
+            .map(|s| sqlite_substitute(s, &batch_id))
+            .collect();
+
+        self.ensure_meta_schema().await?;
+        self.record_run_start(
+            run_id,
+            pipeline_name,
+            &spec.schema,
+            &spec.name,
+            "truncate",
+            "same_db",
+        )
+        .await?;
+
+        let inserted_result: Result<u64, BackendError> = self
+            .with_conn_blocking(move |c| {
+                c.execute_batch("BEGIN")
+                    .map_err(|e| BackendError::Query(e.to_string()))?;
+                let mut last_n: u64 = 0;
+                for s in &stmts {
+                    let n = c
+                        .execute(s, [])
+                        .map_err(|e| BackendError::Query(e.to_string()))?;
+                    last_n = n as u64;
+                }
+                if dry_run {
+                    c.execute_batch("ROLLBACK")
+                        .map_err(|e| BackendError::Query(e.to_string()))?;
+                } else {
+                    c.execute_batch("COMMIT")
+                        .map_err(|e| BackendError::Query(e.to_string()))?;
+                }
+                Ok::<u64, BackendError>(last_n)
+            })
+            .await;
+
+        match &inserted_result {
+            Ok(n) => self.record_run_success(run_id, *n as i64).await?,
+            Err(e) => {
+                let _ = self.record_run_failure(run_id, &e.to_string()).await;
+            }
+        }
+        let inserted = inserted_result?;
+
+        Ok(StrategyRunResult {
+            run_id: run_id.to_string(),
+            rows_inserted: inserted as i64,
+            rows_updated: None,
+            rows_unchanged: None,
+            rows_closed: None,
+            status: if dry_run { "dry_run" } else { "success" }.into(),
+            path: "same_db".into(),
+        })
     }
 
     async fn run_merge(
@@ -668,5 +1033,332 @@ mod tests {
             err.to_string().contains("does not yet support schema"),
             "expected helpful error, got: {err}"
         );
+    }
+
+    // --- Phase 32b: run_append + run_truncate + run_history --------------
+
+    use crate::strategy::append::augment_with_metadata;
+    use crate::types::{ColumnSpec, ColumnType, TableSpec};
+    use std::sync::Arc as StdArc;
+
+    fn sqlite_event_log_spec() -> TableSpec {
+        augment_with_metadata(&TableSpec {
+            schema: "main".into(),
+            name: "event_log".into(),
+            columns: vec![
+                ColumnSpec {
+                    name: "event_id".into(),
+                    ty: ColumnType::BigInt,
+                    nullable: false,
+                    primary_key: true,
+                },
+                ColumnSpec {
+                    name: "name".into(),
+                    ty: ColumnType::Text,
+                    nullable: true,
+                    primary_key: false,
+                },
+            ],
+            unique_constraints: Vec::new(),
+            fingerprint: String::new(),
+        })
+    }
+
+    async fn make_backend_with_event_log() -> StdArc<dyn Backend> {
+        let b: StdArc<dyn Backend> = StdArc::new(SQLiteBackend::open(":memory:").unwrap());
+        b.execute("CREATE TABLE src_events (event_id INTEGER, name TEXT)")
+            .await
+            .unwrap();
+        b.execute(
+            "CREATE TABLE event_log (\
+              event_id INTEGER, name TEXT, _loaded_at TEXT, _batch_id TEXT\
+            )",
+        )
+        .await
+        .unwrap();
+        b
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sqlite_run_append_inserts_rows_and_records_history() {
+        let b = make_backend_with_event_log().await;
+        b.execute("INSERT INTO src_events VALUES (1, 'a'), (2, 'b'), (3, 'c')")
+            .await
+            .unwrap();
+        let target = sqlite_event_log_spec();
+        let result = b
+            .run_append(
+                &target,
+                "SELECT event_id, name FROM src_events",
+                "sqlite_append_test",
+                None,
+                None,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.rows_inserted, 3);
+        assert_eq!(result.path, "same_db");
+        assert_eq!(result.status, "success");
+
+        use futures_util::TryStreamExt;
+        let s = b
+            .read_arrow_stream(
+                "SELECT count(*), \
+                        sum(CASE WHEN status='success' THEN 1 ELSE 0 END), \
+                        max(rows_inserted) \
+                 FROM ematix_flow_run_history \
+                 WHERE pipeline_name='sqlite_append_test'",
+            )
+            .await
+            .unwrap();
+        let batches: Vec<_> = s.try_collect().await.unwrap();
+        let count = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0);
+        let success = batches[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0);
+        let rows_inserted = batches[0]
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0);
+        assert_eq!(count, 1);
+        assert_eq!(success, 1);
+        assert_eq!(rows_inserted, 3);
+
+        // Target row count.
+        let s = b
+            .read_arrow_stream("SELECT count(*) FROM event_log")
+            .await
+            .unwrap();
+        let batches: Vec<_> = s.try_collect().await.unwrap();
+        let total = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0);
+        assert_eq!(total, 3);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sqlite_run_truncate_replaces_target() {
+        let b = make_backend_with_event_log().await;
+        b.execute(
+            "INSERT INTO event_log VALUES \
+             (99, 'old', '2024-01-01T00:00:00Z', '00000000-0000-0000-0000-000000000000')",
+        )
+        .await
+        .unwrap();
+        b.execute("INSERT INTO src_events VALUES (1, 'a')")
+            .await
+            .unwrap();
+        let target = sqlite_event_log_spec();
+        let r = b
+            .run_truncate(
+                &target,
+                "SELECT event_id, name FROM src_events",
+                "sqlite_truncate_test",
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.rows_inserted, 1);
+        assert_eq!(r.status, "success");
+
+        use futures_util::TryStreamExt;
+        let s = b
+            .read_arrow_stream("SELECT count(*), max(event_id) FROM event_log")
+            .await
+            .unwrap();
+        let batches: Vec<_> = s.try_collect().await.unwrap();
+        let total = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0);
+        let max_id = batches[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0);
+        assert_eq!(total, 1, "old row 99 was truncated");
+        assert_eq!(max_id, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sqlite_run_append_records_failure_when_target_missing() {
+        let b: StdArc<dyn Backend> = StdArc::new(SQLiteBackend::open(":memory:").unwrap());
+        b.execute("CREATE TABLE src_events (event_id INTEGER)")
+            .await
+            .unwrap();
+        b.execute("INSERT INTO src_events VALUES (1)")
+            .await
+            .unwrap();
+        // event_log table missing on purpose.
+        let target = augment_with_metadata(&TableSpec {
+            schema: "main".into(),
+            name: "missing_table".into(),
+            columns: vec![ColumnSpec {
+                name: "event_id".into(),
+                ty: ColumnType::BigInt,
+                nullable: false,
+                primary_key: true,
+            }],
+            unique_constraints: Vec::new(),
+            fingerprint: String::new(),
+        });
+        let result = b
+            .run_append(
+                &target,
+                "SELECT event_id FROM src_events",
+                "sqlite_failure_test",
+                None,
+                None,
+                None,
+                false,
+            )
+            .await;
+        assert!(result.is_err());
+
+        use futures_util::TryStreamExt;
+        let s = b
+            .read_arrow_stream(
+                "SELECT count(*), sum(CASE WHEN status='failed' THEN 1 ELSE 0 END) \
+                 FROM ematix_flow_run_history \
+                 WHERE pipeline_name='sqlite_failure_test'",
+            )
+            .await
+            .unwrap();
+        let batches: Vec<_> = s.try_collect().await.unwrap();
+        let total = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0);
+        let failed = batches[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0);
+        assert_eq!(total, 1);
+        assert_eq!(failed, 1, "failure recorded");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sqlite_run_append_incremental_filters_and_advances_watermark() {
+        let b: StdArc<dyn Backend> = StdArc::new(SQLiteBackend::open(":memory:").unwrap());
+        b.execute("CREATE TABLE src_events (event_id INTEGER, ts INTEGER)")
+            .await
+            .unwrap();
+        b.execute(
+            "CREATE TABLE event_log (\
+              event_id INTEGER, ts INTEGER, _loaded_at TEXT, _batch_id TEXT\
+            )",
+        )
+        .await
+        .unwrap();
+        b.execute("INSERT INTO src_events VALUES (1, 100), (2, 200), (3, 300)")
+            .await
+            .unwrap();
+        let target = augment_with_metadata(&TableSpec {
+            schema: "main".into(),
+            name: "event_log".into(),
+            columns: vec![
+                ColumnSpec {
+                    name: "event_id".into(),
+                    ty: ColumnType::BigInt,
+                    nullable: false,
+                    primary_key: true,
+                },
+                ColumnSpec {
+                    name: "ts".into(),
+                    ty: ColumnType::BigInt,
+                    nullable: false,
+                    primary_key: false,
+                },
+            ],
+            unique_constraints: Vec::new(),
+            fingerprint: String::new(),
+        });
+
+        // Cold start.
+        let r1 = b
+            .run_append(
+                &target,
+                "SELECT event_id, ts FROM src_events",
+                "sqlite_incr",
+                None,
+                Some("ts"),
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(r1.rows_inserted, 3);
+
+        // Watermark advanced to 300.
+        use futures_util::TryStreamExt;
+        let s = b
+            .read_arrow_stream(
+                "SELECT last_value FROM ematix_flow_watermarks WHERE pipeline_name='sqlite_incr'",
+            )
+            .await
+            .unwrap();
+        let batches: Vec<_> = s.try_collect().await.unwrap();
+        let last = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .value(0)
+            .to_string();
+        assert_eq!(last, "300");
+
+        // Hot start with literal: only ts > 300 passes.
+        b.execute("INSERT INTO src_events VALUES (4, 400), (5, 500), (6, 150)")
+            .await
+            .unwrap();
+        let r2 = b
+            .run_append(
+                &target,
+                "SELECT event_id, ts FROM src_events",
+                "sqlite_incr",
+                None,
+                Some("ts"),
+                Some("300"),
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(r2.rows_inserted, 2);
+
+        let s = b
+            .read_arrow_stream("SELECT count(*) FROM event_log")
+            .await
+            .unwrap();
+        let batches: Vec<_> = s.try_collect().await.unwrap();
+        let total = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0);
+        assert_eq!(total, 5);
     }
 }
