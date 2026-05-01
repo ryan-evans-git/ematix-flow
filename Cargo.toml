@@ -59,7 +59,7 @@ mysql_async = { version = "0.36", default-features = false, features = ["minimal
 # from the same arrow-rs major track as our pinned ones. `rustls`
 # feature is required (deltalake compile_errors without one of
 # rustls/native-tls).
-deltalake = { version = "0.32", default-features = false, features = ["rustls", "datafusion"] }
+deltalake = { version = "0.32", default-features = false, features = ["rustls", "datafusion", "s3"] }
 # `url` is needed to construct deltalake's `Url` parameter; deltalake
 # doesn't re-export it. Already pulled in transitively, so this just
 # brings it into the workspace's direct namespace.

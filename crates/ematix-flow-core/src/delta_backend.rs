@@ -28,6 +28,7 @@
 //! Delta tables at sibling prefixes are independent commit streams.
 //! Putting them under a single root is just filesystem convention.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -41,8 +42,10 @@ use deltalake::protocol::SaveMode;
 use futures_util::{StreamExt, TryStreamExt};
 use object_store::ObjectStore;
 use object_store::ObjectStoreExt;
+use object_store::aws::AmazonS3Builder;
 use object_store::local::LocalFileSystem;
 use object_store::path::Path as ObjectPath;
+use object_store::prefix::PrefixStore;
 use url::Url;
 
 use crate::backend::{
@@ -60,15 +63,20 @@ use crate::types::TableSpec;
 /// Storage credentials for cloud backends (S3/Azure/GCS) land in
 /// 35f via storage_options on construction.
 pub struct DeltaBackend {
-    /// Absolute `file://` URL to the root directory holding all
-    /// target tables. Used to build per-target URLs.
+    /// Absolute URL to the root directory holding all target tables
+    /// (`file://...` for local, `s3://bucket/prefix/` for cloud).
+    /// Used to build per-target URLs.
     root_url: Url,
     /// Display-only label for `connection_info` and logs.
     base_label: String,
     /// Sidecar object store rooted at the same location, used for
-    /// run_history JSONL writes. Phase 35f will swap in S3/Azure/GCS
-    /// for cloud roots; 35b–e use `LocalFileSystem`.
+    /// run_history JSONL writes. `LocalFileSystem` for local roots;
+    /// `AmazonS3` for S3-compatible roots.
     store: Arc<dyn ObjectStore>,
+    /// Storage options handed to deltalake's `DeltaTableBuilder` so
+    /// the underlying object_store factory can authenticate. Empty
+    /// for local FS; populated with `AWS_ACCESS_KEY_ID` etc. for S3.
+    storage_options: HashMap<String, String>,
 }
 
 impl DeltaBackend {
@@ -94,7 +102,120 @@ impl DeltaBackend {
             root_url,
             base_label: abs.display().to_string(),
             store: Arc::new(store),
+            storage_options: HashMap::new(),
         })
+    }
+
+    /// Open an S3-backed Delta root at `s3://<bucket>/<prefix>/`.
+    /// `endpoint` is the full URL (e.g. `http://localhost:9000` for
+    /// MinIO; empty string for real AWS). `prefix` may be empty to use
+    /// the bucket root.
+    ///
+    /// Sets `AWS_S3_ALLOW_UNSAFE_RENAME=true` because S3 has no atomic
+    /// rename and deltalake's default policy refuses to write without
+    /// either (a) DynamoDB locking or (b) an explicit opt-in. For
+    /// single-writer test/dev workloads against MinIO this is fine;
+    /// prod deployments with concurrent writers should configure the
+    /// DynamoDB locking provider directly via `with_storage_option`.
+    pub fn open_s3(
+        endpoint: &str,
+        bucket: &str,
+        prefix: &str,
+        region: &str,
+        access_key: &str,
+        secret_key: &str,
+    ) -> Result<Self, BackendError> {
+        // deltalake-aws's S3LogStore registers itself when the
+        // `s3` feature is on (via the `#[ctor]` block in
+        // deltalake/lib.rs). It only needs to run once per process
+        // — calling it more times is a no-op.
+        deltalake::aws::register_handlers(None);
+
+        let trimmed_prefix = prefix.trim_matches('/');
+        let url_str = if trimmed_prefix.is_empty() {
+            format!("s3://{bucket}/")
+        } else {
+            format!("s3://{bucket}/{trimmed_prefix}/")
+        };
+        let root_url = Url::parse(&url_str)
+            .map_err(|e| BackendError::Connection(format!("delta s3 url: {e}")))?;
+
+        // Build the sidecar object_store with the same creds.
+        let mut s3_builder = AmazonS3Builder::new()
+            .with_endpoint(endpoint)
+            .with_bucket_name(bucket)
+            .with_region(region)
+            .with_access_key_id(access_key)
+            .with_secret_access_key(secret_key);
+        if endpoint.starts_with("http://") {
+            s3_builder = s3_builder.with_allow_http(true);
+        }
+        let s3 = s3_builder
+            .build()
+            .map_err(|e| BackendError::Connection(format!("delta s3 sidecar: {e}")))?;
+        // Wrap with a prefix so sidecar `put`/`list` are relative to
+        // the same `<bucket>/<prefix>/` namespace as Delta tables.
+        let store: Arc<dyn ObjectStore> = if trimmed_prefix.is_empty() {
+            Arc::new(s3)
+        } else {
+            Arc::new(PrefixStore::new(s3, trimmed_prefix))
+        };
+
+        // Storage options threaded into `DeltaTableBuilder`. Keys are
+        // the conventional environment-style names that deltalake-aws
+        // recognizes.
+        let mut opts: HashMap<String, String> = HashMap::new();
+        opts.insert("AWS_ACCESS_KEY_ID".into(), access_key.into());
+        opts.insert("AWS_SECRET_ACCESS_KEY".into(), secret_key.into());
+        opts.insert("AWS_REGION".into(), region.into());
+        if !endpoint.is_empty() {
+            opts.insert("AWS_ENDPOINT_URL".into(), endpoint.into());
+        }
+        if endpoint.starts_with("http://") {
+            opts.insert("AWS_ALLOW_HTTP".into(), "true".into());
+        }
+        opts.insert("AWS_S3_ALLOW_UNSAFE_RENAME".into(), "true".into());
+
+        Ok(Self {
+            root_url,
+            base_label: format!("s3://{bucket}/{trimmed_prefix}"),
+            store,
+            storage_options: opts,
+        })
+    }
+
+    /// Open or uninitialized table at `url`, threading
+    /// `self.storage_options` so cloud-backed roots authenticate.
+    /// Mirrors the free-function helper from 35b–e but as a method
+    /// so the credentials travel with `&self`.
+    async fn open_table(&self, url: Url) -> Result<DeltaTable, BackendError> {
+        if url.scheme() == "file"
+            && let Ok(path) = url.to_file_path()
+        {
+            std::fs::create_dir_all(&path).map_err(|e| {
+                BackendError::Connection(format!(
+                    "creating delta table dir {}: {e}",
+                    path.display()
+                ))
+            })?;
+        }
+        let mut builder = DeltaTableBuilder::from_url(url.clone())
+            .map_err(|e| BackendError::Connection(format!("delta builder {url}: {e}")))?;
+        if !self.storage_options.is_empty() {
+            builder = builder.with_storage_options(self.storage_options.clone());
+        }
+        let mut table = builder
+            .build()
+            .map_err(|e| BackendError::Connection(format!("delta builder {url}: {e}")))?;
+        match table.load().await {
+            Ok(_) => {}
+            Err(DeltaTableError::NotATable(_)) => {}
+            Err(e) if e.to_string().contains("Path does not exist") => {}
+            Err(e) => {
+                return Err(BackendError::Connection(format!("delta load {url}: {e}")));
+            }
+        }
+        Ok(table)
     }
 
     /// Build the per-target table URL by joining `<schema>/<name>`
@@ -386,45 +507,9 @@ fn iso8601_now_micros() -> i64 {
         .unwrap_or(0)
 }
 
-/// Build a `DeltaTable` for `url` and try to load its log. If the
-/// location isn't yet a Delta table (`NotATable`) or doesn't exist
-/// at all, return the uninitialized table so callers can run
-/// `WriteBuilder` against it to create on first write. Any other
-/// load failure (corrupt log, permission error) propagates.
-///
-/// For local-FS URLs we pre-create the directory because deltalake's
-/// kernel layer reports a "Path does not exist" error rather than
-/// `NotATable` for a missing local directory. Cloud backends (S3 et
-/// al.) treat missing prefixes as empty without this dance.
-async fn open_or_uninit_delta_table(url: Url) -> Result<DeltaTable, BackendError> {
-    if url.scheme() == "file" {
-        if let Ok(path) = url.to_file_path() {
-            std::fs::create_dir_all(&path).map_err(|e| {
-                BackendError::Connection(format!(
-                    "creating delta table dir {}: {e}",
-                    path.display()
-                ))
-            })?;
-        }
-    }
-    let mut table = DeltaTableBuilder::from_url(url.clone())
-        .map_err(|e| BackendError::Connection(format!("delta builder {url}: {e}")))?
-        .build()
-        .map_err(|e| BackendError::Connection(format!("delta builder {url}: {e}")))?;
-    match table.load().await {
-        Ok(_) => {}
-        Err(DeltaTableError::NotATable(_)) => {}
-        // The kernel-side error for "no _delta_log/ here yet" is a
-        // generic message; match by substring rather than enum
-        // variant since deltalake-core's error type doesn't expose a
-        // dedicated variant for it.
-        Err(e) if e.to_string().contains("Path does not exist") => {}
-        Err(e) => {
-            return Err(BackendError::Connection(format!("delta load {url}: {e}")));
-        }
-    }
-    Ok(table)
-}
+// (Phase 35b–e had a free-function version of `open_table` that didn't
+// thread storage_options. 35f replaces it with a method on
+// DeltaBackend so credentials travel with `&self` for cloud roots.)
 
 #[async_trait]
 impl Backend for DeltaBackend {
@@ -446,18 +531,25 @@ impl Backend for DeltaBackend {
     }
 
     async fn ping(&self) -> Result<(), BackendError> {
-        // Liveness check for a local-FS root: the directory exists
-        // and is readable. A failed canonicalize already happened at
-        // open() time, so this is mostly a "did it disappear" probe.
-        let path = self
-            .root_url
-            .to_file_path()
-            .map_err(|_| BackendError::Connection("delta root url has no file path".into()))?;
-        if !path.is_dir() {
-            return Err(BackendError::Connection(format!(
-                "delta root no longer exists: {}",
-                path.display()
-            )));
+        // Local roots: the directory still exists. Cloud roots: list
+        // the prefix — a connection / permission failure surfaces
+        // here even when the prefix is empty.
+        if self.root_url.scheme() == "file" {
+            let path = self
+                .root_url
+                .to_file_path()
+                .map_err(|_| BackendError::Connection("delta root url has no file path".into()))?;
+            if !path.is_dir() {
+                return Err(BackendError::Connection(format!(
+                    "delta root no longer exists: {}",
+                    path.display()
+                )));
+            }
+            return Ok(());
+        }
+        let mut listing = self.store.list(None);
+        if let Some(item) = futures_util::StreamExt::next(&mut listing).await {
+            item.map_err(|e| BackendError::Connection(format!("delta ping list: {e}")))?;
         }
         Ok(())
     }
@@ -488,7 +580,7 @@ impl Backend for DeltaBackend {
             _ => unreachable!("splitn(2) yields 1 or 2 elements"),
         };
         let url = self.table_url(schema, name)?;
-        let table = open_or_uninit_delta_table(url.clone()).await?;
+        let table = self.open_table(url.clone()).await?;
         // Uninitialized tables (never written to, or only dry-run
         // writes have happened) carry `version() == None`. Treat them
         // as logically empty rather than erroring on `scan_table`
@@ -533,7 +625,7 @@ impl Backend for DeltaBackend {
         }
         let total: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
         let url = self.table_url(&target.schema, &target.name)?;
-        let table = open_or_uninit_delta_table(url.clone()).await?;
+        let table = self.open_table(url.clone()).await?;
         let save_mode = match mode {
             WriteMode::Append => SaveMode::Append,
             WriteMode::Truncate => SaveMode::Overwrite,
@@ -732,7 +824,7 @@ impl Backend for DeltaBackend {
                 (0, 0, 0, "success")
             } else {
                 let url = self.table_url(&spec.schema, &spec.name)?;
-                let table = open_or_uninit_delta_table(url.clone()).await?;
+                let table = self.open_table(url.clone()).await?;
                 if table.version().is_none() {
                     return Err(BackendError::Other(format!(
                         "Delta run_merge: target table {url} is uninitialized; \
@@ -985,7 +1077,7 @@ impl Backend for DeltaBackend {
         let source_with_hash = augment_with_row_hash(&source_batches, compare_columns)?;
 
         let url = self.table_url(&spec.schema, &spec.name)?;
-        let table = open_or_uninit_delta_table(url.clone()).await?;
+        let table = self.open_table(url.clone()).await?;
 
         let inserted_count: u64;
         let mut closed_count: u64 = 0;
@@ -997,7 +1089,7 @@ impl Backend for DeltaBackend {
             // appended.
             let with_scd2 = augment_with_scd2_cols(&source_with_hash, now_micros)?;
             let total: u64 = with_scd2.iter().map(|b| b.num_rows() as u64).sum();
-            let target = open_or_uninit_delta_table(url.clone()).await?;
+            let target = self.open_table(url.clone()).await?;
             target
                 .write(with_scd2)
                 .with_save_mode(SaveMode::Append)
@@ -1017,7 +1109,7 @@ impl Backend for DeltaBackend {
             // URL, run scan_table to get an Arrow stream, filter to
             // is_current=true rows in DataFusion, and collect.
             let scan_url = url.clone();
-            let scan_table = open_or_uninit_delta_table(scan_url).await?;
+            let scan_table = self.open_table(scan_url).await?;
             let target_current_batches: Vec<RecordBatch> = if scan_table.version().is_none() {
                 vec![]
             } else {
@@ -1128,7 +1220,7 @@ impl Backend for DeltaBackend {
                 // but the simpler path is the DataFusion SQL form
                 // `to_timestamp_micros(<int>)`.
                 let now_lit = format!("to_timestamp_micros({now_micros})");
-                let target_for_close = open_or_uninit_delta_table(url.clone()).await?;
+                let target_for_close = self.open_table(url.clone()).await?;
                 let (_t, m) = target_for_close
                     .merge(close_df, predicate.as_str())
                     .with_source_alias("source")
@@ -1144,7 +1236,7 @@ impl Backend for DeltaBackend {
 
                 // Pass 2: append new versions for the changed rows.
                 let with_scd2 = augment_with_scd2_cols(&changed_batches, now_micros)?;
-                let target_for_insert = open_or_uninit_delta_table(url.clone()).await?;
+                let target_for_insert = self.open_table(url.clone()).await?;
                 target_for_insert
                     .write(with_scd2)
                     .with_save_mode(SaveMode::Append)
@@ -1172,7 +1264,7 @@ impl Backend for DeltaBackend {
                 .collect::<Vec<_>>()
                 .join(" AND ");
             let now_lit = format!("to_timestamp_micros({now_micros})");
-            let target_for_soft = open_or_uninit_delta_table(url.clone()).await?;
+            let target_for_soft = self.open_table(url.clone()).await?;
             let (_t, m) = target_for_soft
                 .merge(df, predicate.as_str())
                 .with_source_alias("source")
@@ -1195,7 +1287,7 @@ impl Backend for DeltaBackend {
                 "{IS_CURRENT_COL} = true AND {VALID_FROM_COL} < to_timestamp_micros({threshold_micros})"
             );
             let now_lit = format!("to_timestamp_micros({now_micros})");
-            let target_for_ttl = open_or_uninit_delta_table(url.clone()).await?;
+            let target_for_ttl = self.open_table(url.clone()).await?;
             let (_t, m) = target_for_ttl
                 .update()
                 .with_predicate(predicate.as_str())

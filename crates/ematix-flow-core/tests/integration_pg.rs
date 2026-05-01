@@ -3605,3 +3605,245 @@ async fn minio_truncate_clears_prefix() {
     let total: usize = batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(total, 3, "old files removed by truncate on MinIO");
 }
+
+// ----- Phase 35f: Delta on MinIO ----------------------------------------
+
+use ematix_flow_core::DeltaBackend;
+use ematix_flow_core::types::{ColumnSpec as Cs2, ColumnType as Ct2};
+
+const DELTA_S3_REGION: &str = "us-east-1";
+
+fn delta_test_spec() -> TableSpec {
+    TableSpec {
+        schema: "raw".into(),
+        name: "events".into(),
+        columns: vec![
+            Cs2 {
+                name: "id".into(),
+                ty: Ct2::BigInt,
+                nullable: false,
+                primary_key: false,
+            },
+            Cs2 {
+                name: "name".into(),
+                ty: Ct2::Text,
+                nullable: true,
+                primary_key: false,
+            },
+        ],
+        unique_constraints: vec![],
+        fingerprint: String::new(),
+    }
+}
+
+async fn duckdb_with_simple_events() -> Arc<dyn Backend> {
+    let duck: Arc<dyn Backend> =
+        Arc::new(ematix_flow_core::DuckDBBackend::open(":memory:").unwrap());
+    duck.execute("CREATE SCHEMA s").await.unwrap();
+    duck.execute("CREATE TABLE s.events (id BIGINT, name VARCHAR)")
+        .await
+        .unwrap();
+    duck.execute("INSERT INTO s.events VALUES (1, 'a'), (2, 'b'), (3, 'c')")
+        .await
+        .unwrap();
+    duck
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker; run with `cargo test -- --ignored`"]
+async fn delta_minio_run_append_round_trip() {
+    use arrow_array::Int64Array;
+
+    let bucket = "delta-append";
+    let (_container, endpoint) = start_minio_with_bucket(bucket).await;
+    let target = DeltaBackend::open_s3(
+        &endpoint,
+        bucket,
+        "",
+        DELTA_S3_REGION,
+        MINIO_ACCESS_KEY,
+        MINIO_SECRET_KEY,
+    )
+    .unwrap();
+    target.ping().await.unwrap();
+    let source = duckdb_with_simple_events().await;
+    let spec = delta_test_spec();
+
+    let r = target
+        .run_append(
+            &spec,
+            "SELECT id, name FROM s.events ORDER BY id",
+            "minio_delta_append",
+            Some(source.as_ref()),
+            None,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+    assert_eq!(r.rows_inserted, 3);
+    assert_eq!(r.status, "success");
+
+    let stream = target.read_arrow_stream("raw/events").await.unwrap();
+    let batches: Vec<_> = stream.try_collect().await.unwrap();
+    let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total, 3);
+
+    // Spot-check row contents — the bigint column round-tripped.
+    let id = batches[0]
+        .column_by_name("id")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let mut ids: Vec<i64> = (0..id.len()).map(|i| id.value(i)).collect();
+    ids.sort_unstable();
+    assert_eq!(ids, vec![1, 2, 3]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker; run with `cargo test -- --ignored`"]
+async fn delta_minio_run_truncate_replaces() {
+    let bucket = "delta-trunc";
+    let (_container, endpoint) = start_minio_with_bucket(bucket).await;
+    let target = DeltaBackend::open_s3(
+        &endpoint,
+        bucket,
+        "",
+        DELTA_S3_REGION,
+        MINIO_ACCESS_KEY,
+        MINIO_SECRET_KEY,
+    )
+    .unwrap();
+    let source = duckdb_with_simple_events().await;
+    let spec = delta_test_spec();
+
+    // Two appends → 6 rows in two commits.
+    for tag in ["s3_a", "s3_b"] {
+        target
+            .run_append(
+                &spec,
+                "SELECT id, name FROM s.events ORDER BY id",
+                tag,
+                Some(source.as_ref()),
+                None,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+    }
+    let r = target
+        .run_truncate(
+            &spec,
+            "SELECT id, name FROM s.events ORDER BY id",
+            "s3_trunc",
+            Some(source.as_ref()),
+            false,
+        )
+        .await
+        .unwrap();
+    assert_eq!(r.rows_inserted, 3);
+
+    let stream = target.read_arrow_stream("raw/events").await.unwrap();
+    let batches: Vec<_> = stream.try_collect().await.unwrap();
+    let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total, 3, "Overwrite replaced both seed commits on S3");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker; run with `cargo test -- --ignored`"]
+async fn delta_minio_run_merge_inserts_and_updates() {
+    let bucket = "delta-merge";
+    let (_container, endpoint) = start_minio_with_bucket(bucket).await;
+    let target = DeltaBackend::open_s3(
+        &endpoint,
+        bucket,
+        "",
+        DELTA_S3_REGION,
+        MINIO_ACCESS_KEY,
+        MINIO_SECRET_KEY,
+    )
+    .unwrap();
+    let source = duckdb_with_simple_events().await;
+    let spec = delta_test_spec();
+    // Seed.
+    target
+        .run_append(
+            &spec,
+            "SELECT id, name FROM s.events ORDER BY id",
+            "seed",
+            Some(source.as_ref()),
+            None,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+    // Mutate source: id=2 changes, id=4 added.
+    source
+        .execute("UPDATE s.events SET name = 'b-updated' WHERE id = 2")
+        .await
+        .unwrap();
+    source
+        .execute("INSERT INTO s.events VALUES (4, 'd')")
+        .await
+        .unwrap();
+    let r = target
+        .run_merge(
+            &spec,
+            "SELECT id, name FROM s.events ORDER BY id",
+            &["id".into()],
+            &["name".into()],
+            "s3_merge",
+            "merge",
+            Some(source.as_ref()),
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+    assert_eq!(r.rows_inserted, 1, "id=4 inserted");
+    assert_eq!(r.rows_updated, Some(1), "id=2 updated");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker; run with `cargo test -- --ignored`"]
+async fn delta_minio_run_scd2_first_load() {
+    let bucket = "delta-scd2";
+    let (_container, endpoint) = start_minio_with_bucket(bucket).await;
+    let target = DeltaBackend::open_s3(
+        &endpoint,
+        bucket,
+        "",
+        DELTA_S3_REGION,
+        MINIO_ACCESS_KEY,
+        MINIO_SECRET_KEY,
+    )
+    .unwrap();
+    let source = duckdb_with_simple_events().await;
+    let spec = delta_test_spec();
+    let r = target
+        .run_scd2(
+            &spec,
+            "SELECT id, name FROM s.events ORDER BY id",
+            &["id".into()],
+            &["name".into()],
+            "s3_scd2_first",
+            Some(source.as_ref()),
+            None,
+            None,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+    assert_eq!(r.rows_inserted, 3);
+    assert_eq!(r.rows_closed, Some(0));
+
+    // Read back: 3 rows, all current.
+    let stream = target.read_arrow_stream("raw/events").await.unwrap();
+    let batches: Vec<_> = stream.try_collect().await.unwrap();
+    let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total, 3);
+}
