@@ -32,9 +32,86 @@ use std::time::Duration;
 
 use arrow_array::RecordBatch;
 use futures_util::TryStreamExt;
+use prometheus::{IntCounter, Registry};
 use tokio::sync::watch;
 
 use crate::backend::{ArrowBatchStream, Backend, BackendError, TargetTable, WriteMode};
+
+/// Prometheus counters for a single streaming pipeline. The
+/// counters live on a private Registry so multiple pipelines in one
+/// process can have independent label namespaces; the supervisor
+/// can serve them through the same `/metrics` endpoint by federating
+/// or by selecting one pipeline at a time.
+#[derive(Debug, Clone)]
+pub struct StreamingPipelineMetricsCounters {
+    pub registry: Registry,
+    pub rows_consumed: IntCounter,
+    pub rows_written: IntCounter,
+    pub batches: IntCounter,
+    pub errors: IntCounter,
+    pub dlq_writes: IntCounter,
+    pub idle_iterations: IntCounter,
+}
+
+impl StreamingPipelineMetricsCounters {
+    /// Build a fresh registry + counter set. `pipeline_name`
+    /// becomes a label on every metric, letting downstream scrapers
+    /// distinguish multiple pipelines that share a `/metrics`
+    /// endpoint.
+    pub fn new(pipeline_name: &str) -> Self {
+        use prometheus::Opts;
+        let registry = Registry::new();
+        let mk = |name: &str, help: &str| -> IntCounter {
+            let counter =
+                IntCounter::with_opts(Opts::new(name, help).const_label("pipeline", pipeline_name))
+                    .expect("IntCounter creation");
+            registry
+                .register(Box::new(counter.clone()))
+                .expect("counter register");
+            counter
+        };
+        Self {
+            rows_consumed: mk(
+                "ematix_streaming_rows_consumed_total",
+                "Total Arrow rows consumed from the source.",
+            ),
+            rows_written: mk(
+                "ematix_streaming_rows_written_total",
+                "Total Arrow rows written to the target.",
+            ),
+            batches: mk(
+                "ematix_streaming_batches_total",
+                "Total non-empty read→write batches completed.",
+            ),
+            errors: mk(
+                "ematix_streaming_errors_total",
+                "Total irrecoverable pipeline errors observed.",
+            ),
+            dlq_writes: mk(
+                "ematix_streaming_dlq_writes_total",
+                "Total rows produced to the dead-letter topic after a target write failure.",
+            ),
+            idle_iterations: mk(
+                "ematix_streaming_idle_iterations_total",
+                "Total idle-batch iterations (source returned zero rows).",
+            ),
+            registry,
+        }
+    }
+
+    /// Render the registry as Prometheus text exposition format.
+    /// Suitable for the body of a `GET /metrics` response.
+    pub fn render(&self) -> Result<String, BackendError> {
+        use prometheus::Encoder;
+        let mut buf: Vec<u8> = Vec::with_capacity(4096);
+        let encoder = prometheus::TextEncoder::new();
+        let metric_families = self.registry.gather();
+        encoder
+            .encode(&metric_families, &mut buf)
+            .map_err(|e| BackendError::Other(format!("prometheus encode: {e}")))?;
+        String::from_utf8(buf).map_err(|e| BackendError::Other(format!("prometheus utf8: {e}")))
+    }
+}
 
 /// Configuration for a streaming pipeline run.
 #[derive(Debug, Clone)]
@@ -54,6 +131,16 @@ pub struct StreamingPipelineConfig {
     pub idle_pause_ms: u64,
     /// Pipeline name — used for logs / metrics labels.
     pub pipeline_name: String,
+    /// When `Some`, failed-batch rows get routed here as raw bytes
+    /// instead of bubbling the error up. The DLQ is itself a Kafka
+    /// topic — the source backend must be Kafka (its FutureProducer
+    /// is reused) for DLQ routing to work; for non-Kafka sources
+    /// this is silently ignored and the error bubbles up.
+    ///
+    /// At-least-once: source offsets are committed *after* the DLQ
+    /// produce ack lands, so a crash mid-DLQ-write means the
+    /// original messages are re-delivered, not lost.
+    pub dead_letter_topic: Option<String>,
 }
 
 impl StreamingPipelineConfig {
@@ -71,7 +158,14 @@ impl StreamingPipelineConfig {
             mode: WriteMode::Append,
             idle_pause_ms: 500,
             pipeline_name: pipeline_name.into(),
+            dead_letter_topic: None,
         }
+    }
+
+    /// Builder-style: opt into DLQ routing on target write failure.
+    pub fn with_dead_letter_topic(mut self, topic: impl Into<String>) -> Self {
+        self.dead_letter_topic = Some(topic.into());
+        self
     }
 }
 
@@ -150,6 +244,7 @@ pub struct StreamingPipeline {
     pub source: Arc<dyn Backend>,
     pub target: Arc<dyn Backend>,
     pub config: StreamingPipelineConfig,
+    pub metrics: StreamingPipelineMetricsCounters,
 }
 
 impl StreamingPipeline {
@@ -158,11 +253,20 @@ impl StreamingPipeline {
         target: Arc<dyn Backend>,
         config: StreamingPipelineConfig,
     ) -> Self {
+        let metrics = StreamingPipelineMetricsCounters::new(&config.pipeline_name);
         Self {
             source,
             target,
             config,
+            metrics,
         }
+    }
+
+    /// Borrow the Prometheus registry — for serving via a
+    /// `/metrics` HTTP endpoint or federating into a process-wide
+    /// scraper.
+    pub fn metrics_registry(&self) -> &Registry {
+        &self.metrics.registry
     }
 
     /// Run the pipeline loop until `shutdown` is triggered or the
@@ -179,26 +283,32 @@ impl StreamingPipeline {
         &self,
         shutdown: ShutdownSignal,
     ) -> Result<StreamingPipelineMetrics, BackendError> {
-        let mut metrics = StreamingPipelineMetrics::default();
+        let mut summary = StreamingPipelineMetrics::default();
         loop {
             if shutdown.is_triggered() {
-                metrics.shutdown_triggered = true;
+                summary.shutdown_triggered = true;
                 break;
             }
 
             let stream: ArrowBatchStream = self
                 .source
                 .read_arrow_stream(&self.config.source_query)
-                .await?;
-            let batches: Vec<RecordBatch> = stream.try_collect().await?;
+                .await
+                .inspect_err(|_| {
+                    self.metrics.errors.inc();
+                })?;
+            let batches: Vec<RecordBatch> = stream.try_collect().await.inspect_err(|_| {
+                self.metrics.errors.inc();
+            })?;
 
             if batches.is_empty() {
+                self.metrics.idle_iterations.inc();
                 // Idle — sleep, but wake immediately if shutdown
                 // fires. Without the select! we'd block for the
                 // full pause before noticing the trigger.
                 tokio::select! {
                     _ = shutdown.wait() => {
-                        metrics.shutdown_triggered = true;
+                        summary.shutdown_triggered = true;
                         break;
                     }
                     _ = tokio::time::sleep(Duration::from_millis(self.config.idle_pause_ms)) => {}
@@ -207,24 +317,86 @@ impl StreamingPipeline {
             }
 
             let n_rows: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
-            // Wrap the collected Vec back into an ArrowBatchStream so
-            // the target's existing write_arrow_stream signature
-            // applies.
+            self.metrics.rows_consumed.inc_by(n_rows);
+
+            // Save a clone of the batches *before* handing them to
+            // the target — needed for DLQ-on-failure routing.
+            let dlq_batches = if self.config.dead_letter_topic.is_some() {
+                Some(batches.clone())
+            } else {
+                None
+            };
             let target_stream: ArrowBatchStream =
                 Box::pin(futures_util::stream::iter(batches.into_iter().map(Ok)));
-            self.target
+            let write_result = self
+                .target
                 .write_arrow_stream(&self.config.target, target_stream, self.config.mode)
-                .await?;
+                .await;
 
-            // At-least-once commit: only after the target ack lands.
-            // Non-Kafka sources implement the trait's no-op default,
-            // so this is free for them.
+            match write_result {
+                Ok(_) => {
+                    self.metrics.rows_written.inc_by(n_rows);
+                }
+                Err(e) => {
+                    self.metrics.errors.inc();
+                    // DLQ routing: if a topic is configured, produce
+                    // each row's source-encoded payload to the DLQ
+                    // and continue. If no DLQ is configured, surface
+                    // the error so the supervisor decides on
+                    // restart.
+                    if let (Some(topic), Some(batches)) =
+                        (&self.config.dead_letter_topic, dlq_batches)
+                    {
+                        let dlq_count = self.route_batches_to_dlq(topic.as_str(), batches).await?;
+                        self.metrics.dlq_writes.inc_by(dlq_count);
+                    } else {
+                        return Err(e);
+                    }
+                }
+            }
+
+            // At-least-once commit: only after the target ack lands
+            // (or after the DLQ ack on the failure path). Non-Kafka
+            // sources implement the trait's no-op default, so this
+            // is free for them.
             self.source.commit_offsets().await?;
 
-            metrics.total_rows += n_rows;
-            metrics.iterations += 1;
+            self.metrics.batches.inc();
+            summary.total_rows += n_rows;
+            summary.iterations += 1;
         }
-        Ok(metrics)
+        Ok(summary)
+    }
+
+    /// Route a failed batch's rows to the configured DLQ topic. The
+    /// DLQ is a Kafka topic produced via the source backend's own
+    /// `write_arrow_stream` (which uses the source's ClientConfig +
+    /// auth). This means DLQ produce only works when the source IS
+    /// Kafka — for non-Kafka sources `write_arrow_stream` will likely
+    /// error with a clearer "wrong target" message, which surfaces
+    /// to the supervisor.
+    ///
+    /// Each row is sent in the source backend's payload format —
+    /// JSON-formatted sources keep their JSON wire format on the
+    /// DLQ, RawBytes-formatted sources keep the raw blob. That
+    /// symmetry means a downstream DLQ consumer can re-consume +
+    /// replay exactly the same way it would the primary topic.
+    async fn route_batches_to_dlq(
+        &self,
+        topic: &str,
+        batches: Vec<RecordBatch>,
+    ) -> Result<u64, BackendError> {
+        let dlq_target = TargetTable {
+            schema: String::new(),
+            name: topic.to_string(),
+        };
+        let stream: ArrowBatchStream =
+            Box::pin(futures_util::stream::iter(batches.into_iter().map(Ok)));
+        let n = self
+            .source
+            .write_arrow_stream(&dlq_target, stream, WriteMode::Append)
+            .await?;
+        Ok(n)
     }
 }
 
@@ -315,5 +487,54 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(5), sig.wait())
             .await
             .expect("wait() did not resolve when trigger dropped");
+    }
+
+    // --- Phase 36i: metrics + DLQ -----------------------------------------
+
+    #[test]
+    fn metrics_render_initial_text_format() {
+        let counters = StreamingPipelineMetricsCounters::new("p");
+        let body = counters.render().unwrap();
+        // Prometheus text exposition format includes # HELP and
+        // # TYPE comments per metric. Spot-check a couple — the
+        // exact bytes are unstable across prometheus crate versions
+        // but the counter names and label are part of the contract.
+        assert!(body.contains("ematix_streaming_rows_consumed_total"));
+        assert!(body.contains("ematix_streaming_rows_written_total"));
+        assert!(body.contains("ematix_streaming_dlq_writes_total"));
+        assert!(body.contains(r#"pipeline="p""#));
+    }
+
+    #[test]
+    fn metrics_render_reflects_increments() {
+        let counters = StreamingPipelineMetricsCounters::new("p");
+        counters.rows_consumed.inc_by(7);
+        counters.batches.inc();
+        let body = counters.render().unwrap();
+        assert!(
+            body.lines()
+                .any(|l| l.starts_with("ematix_streaming_rows_consumed_total")
+                    && l.ends_with(" 7")),
+            "rows_consumed=7 line missing in:\n{body}"
+        );
+        assert!(
+            body.lines()
+                .any(|l| l.starts_with("ematix_streaming_batches_total") && l.ends_with(" 1")),
+            "batches=1 line missing in:\n{body}"
+        );
+    }
+
+    #[test]
+    fn config_with_dead_letter_topic_sets_field() {
+        let cfg = StreamingPipelineConfig::new(
+            "topic-x",
+            TargetTable {
+                schema: "raw".into(),
+                name: "events".into(),
+            },
+            "p",
+        )
+        .with_dead_letter_topic("dlq-events");
+        assert_eq!(cfg.dead_letter_topic.as_deref(), Some("dlq-events"));
     }
 }

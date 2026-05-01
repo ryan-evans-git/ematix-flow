@@ -4447,3 +4447,88 @@ async fn kafka_raw_bytes_round_trip() {
     expected.sort();
     assert_eq!(got, expected);
 }
+
+// ----- Phase 36i: DLQ end-to-end ---------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker; run with `cargo test -- --ignored`"]
+async fn streaming_pipeline_routes_failed_batch_to_dlq() {
+    let (_container, bootstrap) = start_kafka().await;
+    let primary_topic = "dlq-primary";
+    let dlq_topic = "dlq-dead-letters";
+
+    // Produce 3 JSON messages to the primary topic.
+    produce_json_messages(
+        &bootstrap,
+        primary_topic,
+        &[
+            r#"{"id": 1, "name": "alice"}"#,
+            r#"{"id": 2, "name": "bob"}"#,
+            r#"{"id": 3, "name": "carol"}"#,
+        ],
+    )
+    .await;
+
+    // Source: Kafka, JSON-formatted, tight batch. Same handle is the
+    // DLQ producer.
+    let source: Arc<dyn Backend> = Arc::new(
+        ematix_flow_core::KafkaBackend::open(&bootstrap, Some("dlq-test-grp"))
+            .unwrap()
+            .with_batch_config(ematix_flow_core::kafka_backend::KafkaBatchConfig {
+                batch_size: 100,
+                idle_timeout_ms: 1_500,
+                batch_window_ms: 5_000,
+                ..Default::default()
+            }),
+    );
+
+    // Target: SQLite with a schema mismatch — only allows column `x`,
+    // so any insert from `{id, name}` data fails.
+    let target_backend: Arc<dyn Backend> =
+        Arc::new(ematix_flow_core::SQLiteBackend::open(":memory:").unwrap());
+    target_backend
+        .execute("CREATE TABLE wrong_schema (x INTEGER)")
+        .await
+        .unwrap();
+
+    let cfg = StreamingPipelineConfig::new(
+        primary_topic,
+        TargetTable {
+            schema: "main".into(),
+            name: "wrong_schema".into(),
+        },
+        "dlq-test",
+    )
+    .with_dead_letter_topic(dlq_topic);
+
+    let pipeline = StreamingPipeline::new(source, target_backend, cfg);
+
+    let (sig, trigger) = ShutdownSignal::new();
+    let pipeline_handle = tokio::spawn(async move { pipeline.run(sig).await });
+
+    // Wait long enough for the pipeline to consume + fail + DLQ +
+    // commit + reach the next idle iteration where it'll find
+    // nothing left.
+    tokio::time::sleep(std::time::Duration::from_secs(8)).await;
+    trigger.trigger();
+    let metrics = pipeline_handle.await.unwrap().unwrap();
+
+    assert!(metrics.shutdown_triggered);
+    assert!(
+        metrics.total_rows >= 3,
+        "got {} total_rows; expected at least 3",
+        metrics.total_rows
+    );
+
+    // Read back the DLQ topic via a separate consumer. The DLQ rows
+    // are JSON (the source's payload format), one per original row.
+    let dlq_consumer =
+        ematix_flow_core::KafkaBackend::open(&bootstrap, Some("dlq-verify-grp")).unwrap();
+    let stream = dlq_consumer.read_arrow_stream(dlq_topic).await.unwrap();
+    let batches: Vec<_> = stream.try_collect().await.unwrap();
+    let dlq_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(
+        dlq_rows, 3,
+        "all 3 failed rows should have been routed to the DLQ"
+    );
+}

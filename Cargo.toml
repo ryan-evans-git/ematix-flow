@@ -75,6 +75,9 @@ aws-msk-iam-sasl-signer = "1"
 # of aws-msk-iam-sasl-signer; we declare it directly here so the
 # import isn't accidental.
 aws-types = "1"
+# Prometheus metrics (Phase 36i). Process-side counters for streaming
+# pipelines; exposed via a tiny built-in /metrics HTTP endpoint.
+prometheus = "0.14"
 # `url` is needed to construct deltalake's `Url` parameter; deltalake
 # doesn't re-export it. Already pulled in transitively, so this just
 # brings it into the workspace's direct namespace.
