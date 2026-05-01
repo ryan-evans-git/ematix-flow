@@ -224,12 +224,33 @@ impl ScramMechanism {
 /// bundle); `cert_location` and `key_location` are the client cert
 /// and its private key. `key_password` is for password-protected
 /// keys.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct TlsAuth {
     pub ca_location: String,
     pub cert_location: String,
     pub key_location: String,
     pub key_password: Option<String>,
+}
+
+/// Hand-written `Debug` for `TlsAuth` that redacts `key_password`
+/// (a private-key passphrase). The cert/key/ca *paths* are
+/// non-secret and remain visible.
+impl std::fmt::Debug for TlsAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TlsAuth")
+            .field("ca_location", &self.ca_location)
+            .field("cert_location", &self.cert_location)
+            .field("key_location", &self.key_location)
+            .field(
+                "key_password",
+                &if self.key_password.is_some() {
+                    "<redacted>"
+                } else {
+                    "None"
+                },
+            )
+            .finish()
+    }
 }
 
 /// Auth-provider state on `KafkaBackend`. Each variant maps to a
@@ -241,7 +262,7 @@ pub struct TlsAuth {
 /// The framework treats Confluent Cloud, self-hosted SASL, AWS MSK,
 /// and mTLS-enabled deployments as sibling first-class auth modes —
 /// none privileged in the API.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 enum AuthMode {
     /// No auth. SASL_PLAINTEXT or PLAINTEXT depending on whether
     /// the broker speaks TLS — but for `None` we leave
@@ -266,6 +287,51 @@ enum AuthMode {
     /// `generate_oauth_token` callback that mints MSK IAM tokens
     /// via SigV4 and refreshes them at ~80% of TTL.
     MskIam { region: String },
+}
+
+/// Hand-written `Debug` for `AuthMode` that redacts every secret-
+/// bearing field. Logging an `AuthMode` (directly or via the
+/// owning `KafkaBackend`) won't leak passwords, key passwords, or
+/// any other confidential bits — just the auth-mode shape +
+/// non-secret labels (username, mechanism, region).
+impl std::fmt::Debug for AuthMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AuthMode::None => f.write_str("None"),
+            AuthMode::SaslPlain { username, .. } => f
+                .debug_struct("SaslPlain")
+                .field("username", username)
+                .field("password", &"<redacted>")
+                .finish(),
+            AuthMode::SaslScram {
+                mechanism,
+                username,
+                ..
+            } => f
+                .debug_struct("SaslScram")
+                .field("mechanism", mechanism)
+                .field("username", username)
+                .field("password", &"<redacted>")
+                .finish(),
+            AuthMode::Tls(tls) => f
+                .debug_struct("Tls")
+                .field("ca_location", &tls.ca_location)
+                .field("cert_location", &tls.cert_location)
+                .field("key_location", &tls.key_location)
+                .field(
+                    "key_password",
+                    &if tls.key_password.is_some() {
+                        "<redacted>"
+                    } else {
+                        "None"
+                    },
+                )
+                .finish(),
+            AuthMode::MskIam { region } => {
+                f.debug_struct("MskIam").field("region", region).finish()
+            }
+        }
+    }
 }
 
 /// Custom librdkafka client context that overrides
@@ -3183,6 +3249,56 @@ mod tests {
         let b = KafkaBackend::open("localhost:9092", Some("g1")).unwrap();
         assert_eq!(config_get(&b, "transactional.id"), None);
         assert_eq!(config_get(&b, "enable.idempotence"), None);
+    }
+
+    /// Credential-safety: SASL/PLAIN password must not appear in
+    /// Debug output. The framework relies on this when callers
+    /// log `info!(?backend, ...)` or `error!(?cfg, ...)` for
+    /// observability.
+    #[test]
+    fn debug_redacts_sasl_plain_password() {
+        let b = KafkaBackend::open("localhost:9092", None)
+            .unwrap()
+            .with_sasl_plain("alice", "s3cret-password-do-not-leak");
+        let s = format!("{b:?}");
+        assert!(
+            !s.contains("s3cret-password-do-not-leak"),
+            "Debug leaks SASL/PLAIN password: {s}"
+        );
+        assert!(s.contains("<redacted>"), "expected <redacted> marker: {s}");
+        assert!(s.contains("alice"), "username should remain visible: {s}");
+    }
+
+    /// Same credential-safety check for SASL/SCRAM.
+    #[test]
+    fn debug_redacts_sasl_scram_password() {
+        let b = KafkaBackend::open("localhost:9092", None)
+            .unwrap()
+            .with_sasl_scram(ScramMechanism::Sha512, "alice", "scram-secret-do-not-leak");
+        let s = format!("{b:?}");
+        assert!(
+            !s.contains("scram-secret-do-not-leak"),
+            "Debug leaks SASL/SCRAM password: {s}"
+        );
+        assert!(s.contains("Sha512"), "mechanism should remain visible: {s}");
+    }
+
+    /// TlsAuth's `key_password` is a private-key passphrase —
+    /// also redacted; cert/key/ca paths stay visible.
+    #[test]
+    fn debug_redacts_tls_key_password() {
+        let tls = TlsAuth {
+            ca_location: "/etc/ca.pem".into(),
+            cert_location: "/etc/client.crt".into(),
+            key_location: "/etc/client.key".into(),
+            key_password: Some("private-key-passphrase".into()),
+        };
+        let s = format!("{tls:?}");
+        assert!(
+            !s.contains("private-key-passphrase"),
+            "TlsAuth Debug leaks key_password: {s}"
+        );
+        assert!(s.contains("/etc/ca.pem"), "ca path should be visible: {s}");
     }
 
     /// Phase 40.2: with_message_key_column records the column name.

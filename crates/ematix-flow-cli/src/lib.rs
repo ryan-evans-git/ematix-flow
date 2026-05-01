@@ -62,8 +62,38 @@ use ematix_flow_core::{
 };
 use serde::Deserialize;
 
+/// Strip the password segment of a `scheme://user:password@host`
+/// URL for display. Returns the URL unchanged if no userinfo or
+/// no password segment is present.
+///
+/// Used by the redacting `Debug` impls on `SourceConfig` /
+/// `TargetConfig` so logging a `PipelineCliConfig` (directly or
+/// transitively via tracing's `?value` field) doesn't leak
+/// credentials to log aggregators.
+fn redact_db_url(url: &str) -> String {
+    // Find scheme separator.
+    let Some(scheme_end) = url.find("://") else {
+        return url.to_string();
+    };
+    let (scheme, rest) = url.split_at(scheme_end + 3); // include "://"
+    let (authority, tail) = match rest.split_once('/') {
+        Some((a, t)) => (a, format!("/{t}")),
+        None => (rest, String::new()),
+    };
+    let (userinfo, host) = match authority.split_once('@') {
+        Some((u, h)) => (u, h),
+        None => return url.to_string(),
+    };
+    let user = userinfo.split(':').next().unwrap_or(userinfo);
+    if user.is_empty() {
+        format!("{scheme}<redacted>@{host}{tail}")
+    } else {
+        format!("{scheme}{user}:<redacted>@{host}{tail}")
+    }
+}
+
 /// Top-level pipeline config loaded from a TOML file.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct PipelineCliConfig {
     /// Used for log lines + Prometheus labels.
     pub pipeline_name: String,
@@ -90,7 +120,7 @@ fn default_idle_pause_ms() -> u64 {
 
 /// Source backend variants. Tagged on `kind` so TOML reads
 /// naturally with `[source]` + `kind = "..."`.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SourceConfig {
     Kafka {
@@ -118,7 +148,7 @@ pub enum SourceConfig {
 /// Target backend variants. Includes both the OLTP/OLAP / Delta /
 /// ObjectStore destinations (the typical streaming sink) and the
 /// streaming backends themselves (for stream→stream pipelines).
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TargetConfig {
     Postgres {
@@ -217,6 +247,214 @@ pub enum TargetConfig {
         format: ObjectFormatConfig,
         prefix: String,
     },
+}
+
+// ---- Redacting Debug impls (credential safety) -----------------
+//
+// SourceConfig / TargetConfig / PipelineCliConfig deliberately do
+// NOT derive Debug. The decoded TOML carries `url`, `amqp_url`,
+// `access_key_id`, and `secret_access_key` fields — printing any
+// of them through tracing's `?value` field would leak the
+// credential into log aggregators. The hand-written impls below
+// redact every secret-bearing field while keeping the
+// non-secret bits visible for debuggability.
+
+impl std::fmt::Debug for PipelineCliConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PipelineCliConfig")
+            .field("pipeline_name", &self.pipeline_name)
+            .field("source_query", &self.source_query)
+            .field("idle_pause_ms", &self.idle_pause_ms)
+            .field("dead_letter_topic", &self.dead_letter_topic)
+            .field("source", &self.source)
+            .field("target", &self.target)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for SourceConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SourceConfig::Kafka {
+                bootstrap_servers,
+                group_id,
+            } => f
+                .debug_struct("Kafka")
+                .field("bootstrap_servers", bootstrap_servers)
+                .field("group_id", group_id)
+                .finish(),
+            SourceConfig::Rabbitmq { amqp_url } => f
+                .debug_struct("Rabbitmq")
+                .field("amqp_url", &redact_db_url(amqp_url))
+                .finish(),
+            SourceConfig::Pubsub {
+                project_id,
+                endpoint,
+                anonymous_auth,
+            } => f
+                .debug_struct("Pubsub")
+                .field("project_id", project_id)
+                .field("endpoint", endpoint)
+                .field("anonymous_auth", anonymous_auth)
+                .finish(),
+            SourceConfig::Kinesis {
+                stream_name,
+                region,
+                endpoint,
+                access_key_id,
+                secret_access_key,
+            } => f
+                .debug_struct("Kinesis")
+                .field("stream_name", stream_name)
+                .field("region", region)
+                .field("endpoint", endpoint)
+                .field(
+                    "access_key_id",
+                    &access_key_id.as_ref().map(|_| "<redacted>"),
+                )
+                .field(
+                    "secret_access_key",
+                    &secret_access_key.as_ref().map(|_| "<redacted>"),
+                )
+                .finish(),
+        }
+    }
+}
+
+impl std::fmt::Debug for TargetConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TargetConfig::Postgres { url, table } => f
+                .debug_struct("Postgres")
+                .field("url", &redact_db_url(url))
+                .field("table", table)
+                .finish(),
+            TargetConfig::Mysql { url, table } => f
+                .debug_struct("Mysql")
+                .field("url", &redact_db_url(url))
+                .field("table", table)
+                .finish(),
+            TargetConfig::Sqlite { path, table } => f
+                .debug_struct("Sqlite")
+                .field("path", path)
+                .field("table", table)
+                .finish(),
+            TargetConfig::Duckdb { path, table } => f
+                .debug_struct("Duckdb")
+                .field("path", path)
+                .field("table", table)
+                .finish(),
+            TargetConfig::Kafka {
+                bootstrap_servers,
+                group_id,
+                topic,
+                message_key_column,
+            } => f
+                .debug_struct("Kafka")
+                .field("bootstrap_servers", bootstrap_servers)
+                .field("group_id", group_id)
+                .field("topic", topic)
+                .field("message_key_column", message_key_column)
+                .finish(),
+            TargetConfig::Rabbitmq { amqp_url, queue } => f
+                .debug_struct("Rabbitmq")
+                .field("amqp_url", &redact_db_url(amqp_url))
+                .field("queue", queue)
+                .finish(),
+            TargetConfig::Pubsub {
+                project_id,
+                endpoint,
+                anonymous_auth,
+                topic,
+            } => f
+                .debug_struct("Pubsub")
+                .field("project_id", project_id)
+                .field("endpoint", endpoint)
+                .field("anonymous_auth", anonymous_auth)
+                .field("topic", topic)
+                .finish(),
+            TargetConfig::Kinesis {
+                stream_name,
+                region,
+                endpoint,
+                access_key_id,
+                secret_access_key,
+                partition_key_prefix,
+            } => f
+                .debug_struct("Kinesis")
+                .field("stream_name", stream_name)
+                .field("region", region)
+                .field("endpoint", endpoint)
+                .field(
+                    "access_key_id",
+                    &access_key_id.as_ref().map(|_| "<redacted>"),
+                )
+                .field(
+                    "secret_access_key",
+                    &secret_access_key.as_ref().map(|_| "<redacted>"),
+                )
+                .field("partition_key_prefix", partition_key_prefix)
+                .finish(),
+            TargetConfig::DeltaLocal {
+                path,
+                table,
+                partition_by,
+            } => f
+                .debug_struct("DeltaLocal")
+                .field("path", path)
+                .field("table", table)
+                .field("partition_by", partition_by)
+                .finish(),
+            TargetConfig::DeltaS3 {
+                endpoint,
+                bucket,
+                prefix,
+                region,
+                access_key_id: _,
+                secret_access_key: _,
+                table,
+                partition_by,
+            } => f
+                .debug_struct("DeltaS3")
+                .field("endpoint", endpoint)
+                .field("bucket", bucket)
+                .field("prefix", prefix)
+                .field("region", region)
+                .field("access_key_id", &"<redacted>")
+                .field("secret_access_key", &"<redacted>")
+                .field("table", table)
+                .field("partition_by", partition_by)
+                .finish(),
+            TargetConfig::ObjectStoreLocal {
+                path,
+                format,
+                prefix,
+            } => f
+                .debug_struct("ObjectStoreLocal")
+                .field("path", path)
+                .field("format", format)
+                .field("prefix", prefix)
+                .finish(),
+            TargetConfig::ObjectStoreS3 {
+                endpoint,
+                bucket,
+                region,
+                access_key_id: _,
+                secret_access_key: _,
+                format,
+                prefix,
+            } => f
+                .debug_struct("ObjectStoreS3")
+                .field("endpoint", endpoint)
+                .field("bucket", bucket)
+                .field("region", region)
+                .field("access_key_id", &"<redacted>")
+                .field("secret_access_key", &"<redacted>")
+                .field("format", format)
+                .field("prefix", prefix)
+                .finish(),
+        }
+    }
 }
 
 /// CLI-side mirror of [`ObjectFormat`]. Defined separately so we
@@ -928,6 +1166,152 @@ mod tests {
 
     /// Phase 40.1: TOML `partition_by` field carries through to
     /// `TargetConfig::DeltaLocal`.
+    /// Credential safety: Debug on `PipelineCliConfig` must redact
+    /// every secret field. This is what `info!(?cfg, ...)` /
+    /// `error!(?cfg, ...)` would render through tracing — those
+    /// outputs go to log aggregators and must not include
+    /// passwords, access keys, etc.
+    #[test]
+    fn debug_redacts_postgres_url_password() {
+        let toml = r#"
+            pipeline_name = "p"
+            source_query = "events"
+
+            [source]
+            kind = "kafka"
+            bootstrap_servers = "localhost:9092"
+
+            [target]
+            kind = "postgres"
+            url = "postgres://alice:DO_NOT_LEAK@host/db"
+
+            [target.table]
+            name = "t"
+        "#;
+        let cfg = PipelineCliConfig::from_toml_str(toml).unwrap();
+        let s = format!("{cfg:?}");
+        assert!(!s.contains("DO_NOT_LEAK"), "Debug leaked password: {s}");
+        assert!(s.contains("<redacted>"), "expected <redacted> marker: {s}");
+        assert!(s.contains("alice"), "username should remain: {s}");
+        assert!(s.contains("host"), "host should remain: {s}");
+    }
+
+    #[test]
+    fn debug_redacts_rabbitmq_amqp_url_password() {
+        let toml = r#"
+            pipeline_name = "p"
+            source_query = "q"
+
+            [source]
+            kind = "rabbitmq"
+            amqp_url = "amqp://guest:DO_NOT_LEAK@broker.local/vh"
+
+            [target]
+            kind = "sqlite"
+            path = ":memory:"
+
+            [target.table]
+            name = "t"
+        "#;
+        let cfg = PipelineCliConfig::from_toml_str(toml).unwrap();
+        let s = format!("{cfg:?}");
+        assert!(
+            !s.contains("DO_NOT_LEAK"),
+            "Debug leaked AMQP password: {s}"
+        );
+        assert!(s.contains("guest"), "username should remain: {s}");
+    }
+
+    #[test]
+    fn debug_redacts_kinesis_static_credentials() {
+        let toml = r#"
+            pipeline_name = "p"
+            source_query = "any"
+
+            [source]
+            kind = "kinesis"
+            stream_name = "events"
+            region = "us-east-1"
+            access_key_id = "AKIA_DO_NOT_LEAK"
+            secret_access_key = "SECRET_DO_NOT_LEAK"
+
+            [target]
+            kind = "sqlite"
+            path = ":memory:"
+
+            [target.table]
+            name = "t"
+        "#;
+        let cfg = PipelineCliConfig::from_toml_str(toml).unwrap();
+        let s = format!("{cfg:?}");
+        assert!(!s.contains("AKIA_DO_NOT_LEAK"), "Debug leaked AK: {s}");
+        assert!(!s.contains("SECRET_DO_NOT_LEAK"), "Debug leaked SK: {s}");
+        assert!(
+            s.contains("us-east-1"),
+            "non-secret region should remain: {s}"
+        );
+    }
+
+    #[test]
+    fn debug_redacts_delta_s3_credentials() {
+        let toml = r#"
+            pipeline_name = "p"
+            source_query = "topic"
+
+            [source]
+            kind = "kafka"
+            bootstrap_servers = "localhost:9092"
+
+            [target]
+            kind = "delta_s3"
+            endpoint = "http://localhost:9000"
+            bucket = "events"
+            region = "us-east-1"
+            access_key_id = "AKIA_DELTA_DO_NOT_LEAK"
+            secret_access_key = "SECRET_DELTA_DO_NOT_LEAK"
+
+            [target.table]
+            name = "events"
+        "#;
+        let cfg = PipelineCliConfig::from_toml_str(toml).unwrap();
+        let s = format!("{cfg:?}");
+        assert!(
+            !s.contains("AKIA_DELTA_DO_NOT_LEAK"),
+            "Debug leaked Delta S3 AK: {s}"
+        );
+        assert!(
+            !s.contains("SECRET_DELTA_DO_NOT_LEAK"),
+            "Debug leaked Delta S3 SK: {s}"
+        );
+        assert!(s.contains("events"), "bucket should remain: {s}");
+    }
+
+    #[test]
+    fn redact_db_url_handles_common_shapes() {
+        // No userinfo → unchanged.
+        assert_eq!(
+            redact_db_url("postgres://localhost/mydb"),
+            "postgres://localhost/mydb"
+        );
+        // With password → redacted.
+        assert_eq!(
+            redact_db_url("postgres://alice:s3cret@host:5432/db"),
+            "postgres://alice:<redacted>@host:5432/db"
+        );
+        // mysql:// works the same way.
+        assert_eq!(
+            redact_db_url("mysql://u:p@host:3306/db"),
+            "mysql://u:<redacted>@host:3306/db"
+        );
+        // Username-only userinfo.
+        assert_eq!(
+            redact_db_url("postgres://justuser@host/db"),
+            "postgres://justuser:<redacted>@host/db"
+        );
+        // Schemeless string passes through.
+        assert_eq!(redact_db_url("nothing"), "nothing");
+    }
+
     #[test]
     fn parses_delta_local_with_partition_by() {
         let toml = r#"

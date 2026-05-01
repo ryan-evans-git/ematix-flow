@@ -171,10 +171,46 @@ pub struct RabbitMQBackend {
 impl std::fmt::Debug for RabbitMQBackend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RabbitMQBackend")
-            .field("amqp_url", &self.amqp_url)
+            // The AMQP URL has the form
+            // `amqp://user:password@host:port/vhost`. Redact the
+            // password segment so logging the backend doesn't leak
+            // the credential. Username + host + vhost stay visible
+            // for debuggability.
+            .field("amqp_url", &redact_amqp_url(&self.amqp_url))
             .field("batch_config", &self.batch_config)
             .field("consumer_tag", &self.consumer_tag)
             .finish_non_exhaustive()
+    }
+}
+
+/// Strip the password segment of an AMQP URL for display.
+/// `amqp://user:pw@host/vhost` → `amqp://user:<redacted>@host/vhost`.
+/// URLs without credentials are returned unchanged. Keeps the rest
+/// of the URL intact for debuggability.
+fn redact_amqp_url(url: &str) -> String {
+    let (scheme, rest) = if let Some(r) = url.strip_prefix("amqp://") {
+        ("amqp://", r)
+    } else if let Some(r) = url.strip_prefix("amqps://") {
+        ("amqps://", r)
+    } else {
+        return url.to_string();
+    };
+    let (authority, tail) = match rest.split_once('/') {
+        Some((a, t)) => (a, format!("/{t}")),
+        None => (rest, String::new()),
+    };
+    let (userinfo, host) = match authority.split_once('@') {
+        Some((u, h)) => (Some(u), h),
+        None => return url.to_string(),
+    };
+    let user = match userinfo {
+        Some(u) => u.split(':').next().unwrap_or(u),
+        None => "",
+    };
+    if user.is_empty() {
+        format!("{scheme}<redacted>@{host}{tail}")
+    } else {
+        format!("{scheme}{user}:<redacted>@{host}{tail}")
     }
 }
 
@@ -903,6 +939,45 @@ mod tests {
             .unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("source_backend is required"), "got: {msg}");
+    }
+
+    /// Credential-safety: Debug must redact the password segment
+    /// of the amqp_url so logs don't leak it. Username + host stay
+    /// visible.
+    #[test]
+    fn debug_redacts_amqp_password() {
+        let b = RabbitMQBackend::open("amqp://alice:s3cret@broker.local:5672/%2f").unwrap();
+        let s = format!("{b:?}");
+        assert!(!s.contains("s3cret"), "Debug leaks password: {s}");
+        assert!(s.contains("alice"), "Debug should keep username: {s}");
+        assert!(s.contains("broker.local"), "Debug should keep host: {s}");
+        assert!(s.contains("<redacted>"), "expected <redacted> marker: {s}");
+    }
+
+    #[test]
+    fn redact_amqp_url_handles_common_shapes() {
+        // No credentials → unchanged.
+        assert_eq!(
+            redact_amqp_url("amqp://localhost:5672/"),
+            "amqp://localhost:5672/"
+        );
+        // With credentials → password redacted.
+        assert_eq!(
+            redact_amqp_url("amqp://alice:s3cret@host:5672/vh"),
+            "amqp://alice:<redacted>@host:5672/vh"
+        );
+        // amqps stays amqps.
+        assert_eq!(
+            redact_amqp_url("amqps://u:p@host"),
+            "amqps://u:<redacted>@host"
+        );
+        // Username-only userinfo.
+        assert_eq!(
+            redact_amqp_url("amqp://justuser@host/v"),
+            "amqp://justuser:<redacted>@host/v"
+        );
+        // Non-AMQP scheme passes through (defensive).
+        assert_eq!(redact_amqp_url("http://x"), "http://x");
     }
 
     /// 37a.3: commit_offsets is a no-op before any consumer session
