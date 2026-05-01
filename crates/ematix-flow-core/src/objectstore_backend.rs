@@ -30,6 +30,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::StreamExt;
 use object_store::ObjectStore;
+use object_store::ObjectStoreExt;
 use object_store::aws::AmazonS3Builder;
 use object_store::local::LocalFileSystem;
 use object_store::path::Path as ObjectPath;
@@ -452,12 +453,11 @@ async fn read_orc_under_prefix(
 
 /// Write a stream of Arrow batches as one ORC file at `path`.
 ///
-/// orc-rust 0.6's `ArrowWriter::close` consumes the writer and offers
-/// no `into_inner`, so we hand it a shared `Arc<Mutex<Vec<u8>>>`
-/// wrapper that impls `std::io::Write`. After close drops the writer
-/// (the Arc clone it owned), the original Arc is unique and we can
-/// take ownership of the Vec for the PUT. orc-rust 0.7+ adds
-/// `into_inner` and would let us drop this wrapper.
+/// `ArrowWriter::close` consumes the writer and offers no `into_inner`
+/// (verified through orc-rust 0.8), so we hand it a shared
+/// `Arc<Mutex<Vec<u8>>>` wrapper that impls `std::io::Write`. After
+/// close drops the writer (and the Arc clone it owned), the original
+/// Arc is unique and we can take ownership of the Vec for the PUT.
 async fn write_orc_at_path(
     store: &Arc<dyn ObjectStore>,
     path: ObjectPath,
@@ -491,9 +491,9 @@ async fn write_orc_at_path(
     }
 
     // Scope the !Send writer in an inner block so it's dropped before
-    // the next await — orc-rust 0.6's ArrowWriter holds a
-    // `dyn ColumnStripeEncoder` without `Send`, which would otherwise
-    // poison this future's Send bound.
+    // the next await — orc-rust's ArrowWriter holds a
+    // `dyn ColumnStripeEncoder` without `Send` (still true through
+    // 0.8), which would otherwise poison this future's Send bound.
     let (buf, total) = {
         let inner: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::with_capacity(64 * 1024)));
         let mut writer = ArrowWriterBuilder::new(SharedBuf(inner.clone()), schema)

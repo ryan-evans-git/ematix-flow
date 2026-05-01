@@ -26,26 +26,26 @@ deadpool-postgres = "0.14"
 uuid = { version = "1", features = ["v4", "v7"] }
 futures-util = "0.3"
 bytes = "1"
-arrow-array = "56"
-arrow-schema = "56"
-arrow-csv = "56"
-arrow-json = "56"
-# orc-rust 0.6 is the last release pinned to arrow 56.x. 0.7+ moved to
-# arrow 57/58, which would conflict with our pinned 56 ABI (RecordBatch
-# would be a different type across crates). Bumping the whole workspace
-# to arrow 58 is its own future phase; until then, 0.6.3 covers ORC.
-orc-rust = { version = "0.6", default-features = false }
-# Apache Arrow object_store + parquet — kept on the same major version
-# track as arrow-array (56.x) so the Arrow ABI matches across crates.
-object_store = { version = "0.12", features = ["aws"] }
-parquet = { version = "56", features = ["arrow", "async", "object_store"] }
+arrow-array = "58"
+arrow-schema = "58"
+arrow-csv = "58"
+arrow-json = "58"
+# orc-rust 0.8 (and onward) tracks arrow 58. Phase 35a workspace bump
+# brought us here so deltalake / iceberg can share the ABI. 0.8 also
+# adds `into_inner` on ArrowWriter, dropping the `Arc<Mutex<Vec<u8>>>`
+# wrapper we needed on 0.6.
+orc-rust = { version = "0.8", default-features = false }
+# Apache Arrow object_store + parquet — kept on the same major track
+# as arrow-array (58.x) so the Arrow ABI matches across crates.
+object_store = { version = "0.13", features = ["aws"] }
+parquet = { version = "58", features = ["arrow", "async", "object_store"] }
 # Add UUIDv7 feature for sortable file names (`<prefix>/<uuid7>.parquet`).
 # Already in the workspace at v1; the v7 feature is a flag flip.
-# DuckDB pinned so the bundled C source matches the arrow-array version.
-# `bundled` compiles DuckDB from source on the first build (~3-5 min,
-# one-time); subsequent builds are cached. This avoids depending on a
-# system DuckDB install for CI.
-duckdb = { version = "1.4", features = ["bundled", "appender-arrow"] }
+# DuckDB switched to calendar-versioned releases (1.X.Y → 1.YYYYMM.Z).
+# 1.10502 is the first release on arrow 58; older 1.4 is on arrow 56.
+# `bundled` compiles DuckDB from source on the first build (~3–5 min,
+# one-time); subsequent builds are cached.
+duckdb = { version = "1.10502", features = ["bundled", "appender-arrow"] }
 # `bundled` compiles SQLite from source so we don't depend on a system
 # install. `chrono` enables ToSql for chrono types (used for ISO-8601
 # timestamps); `uuid` enables ToSql for uuid::Uuid. Arrow conversion is
