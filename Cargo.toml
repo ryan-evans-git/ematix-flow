@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "crates/ematix-flow-core",
     "crates/ematix-flow-py",
+    "crates/ematix-flow-cli",
 ]
 
 [workspace.package]
@@ -116,6 +117,11 @@ google-cloud-auth = { version = "1", default-features = false }
 aws-sdk-kinesis = { version = "1", default-features = false, features = ["rt-tokio", "rustls"] }
 aws-config = { version = "1", default-features = false, features = ["rt-tokio", "rustls", "behavior-version-latest"] }
 aws-credential-types = { version = "1", default-features = false }
+# CLI deps (Phase 38 / `flow` binary).
+clap = { version = "4", features = ["derive"] }
+toml = "0.9"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 # `url` is needed to construct deltalake's `Url` parameter; deltalake
 # doesn't re-export it. Already pulled in transitively, so this just
 # brings it into the workspace's direct namespace.
