@@ -36,6 +36,7 @@ object_store = { workspace = true }
 parquet = { workspace = true }
 deltalake = { workspace = true }
 url = { workspace = true }
+rdkafka = { workspace = true }
 
 [dev-dependencies]
 arrow-array.workspace = true

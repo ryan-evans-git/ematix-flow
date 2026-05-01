@@ -316,15 +316,26 @@ Q2 → B. **Real differentiator.** The big phase.
     commit offset → exit.
 - Consumer batching: configurable `batch_size`, `batch_window_ms`,
   `batch_bytes` — flush whichever fires first.
-- **MSK IAM auth renewal (locked design constraint)**:
-  - Use `oauthbearer_token_refresh_cb` to refresh tokens proactively
-    (~80% of TTL), never reactively on auth failure.
-  - **Manual offset commits only** (`enable.auto.commit=false`) so a
-    disconnect during auth renewal can't accidentally commit offsets
-    for messages we haven't actually written.
-  - Test specifically: pause consumer, force token refresh, resume —
-    verify zero message loss and exactly-once delivery semantics.
-  - Document the MSK IAM gotcha prominently in CLI help and quickstart.
+- **Auth providers** — all first-class, builder-method on
+  `KafkaBackend`. The framework targets multiple Kafka deployments
+  (Confluent Cloud, self-hosted, AWS MSK, GCP Pub/Sub Lite over
+  Kafka, etc.); none privileged in the API.
+  - `with_sasl_plain(username, password)` — Confluent Cloud, common
+    self-hosted SASL setups.
+  - `with_sasl_scram(mechanism, username, password)` — SCRAM-SHA-256
+    / SCRAM-SHA-512.
+  - `with_tls(cert_path, key_path, ca_path)` — mTLS / cert-based.
+  - `with_msk_iam(region)` — AWS MSK IAM only. Internally uses
+    `oauthbearer_token_refresh_cb` to refresh tokens proactively
+    (~80% of TTL), never reactively on auth failure. Document the
+    MSK gotcha prominently in CLI help and the quickstart.
+  - **Manual offset commits only** (`enable.auto.commit=false`) — set
+    by the framework regardless of auth provider, so a disconnect
+    during *any* auth renewal can't accidentally commit offsets for
+    messages we haven't actually written.
+  - Test specifically (MSK IAM lane): pause consumer, force token
+    refresh, resume — verify zero message loss and exactly-once
+    delivery semantics.
 - Delivery semantics: `delivery="at_least_once"` (default) or
   `delivery="exactly_once"` (uses Kafka transactions; trades throughput
   for correctness).

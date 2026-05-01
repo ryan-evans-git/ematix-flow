@@ -3847,3 +3847,50 @@ async fn delta_minio_run_scd2_first_load() {
     let total: usize = batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(total, 3);
 }
+
+// ----- Phase 36a: Kafka skeleton + ping ---------------------------------
+
+use ematix_flow_core::KafkaBackend;
+use testcontainers_modules::kafka::apache::{KAFKA_PORT, Kafka};
+
+async fn start_kafka() -> (testcontainers::ContainerAsync<Kafka>, String) {
+    let container = Kafka::default()
+        .start()
+        .await
+        .expect("failed to start kafka testcontainer");
+    let host = container
+        .get_host()
+        .await
+        .expect("failed to read kafka host")
+        .to_string();
+    let port = container
+        .get_host_port_ipv4(KAFKA_PORT)
+        .await
+        .expect("failed to read kafka port");
+    let bootstrap = format!("{host}:{port}");
+    (container, bootstrap)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker; run with `cargo test -- --ignored`"]
+async fn kafka_backend_ping_against_apache() {
+    let (_container, bootstrap) = start_kafka().await;
+    let backend = KafkaBackend::open(&bootstrap, None).unwrap();
+    backend.ping().await.unwrap();
+    assert!(matches!(
+        backend.dialect(),
+        ematix_flow_core::backend::Dialect::Streaming { .. }
+    ));
+    let info = backend.connection_info();
+    assert_eq!(info.user, "producer", "no group_id → producer label");
+    assert_eq!(info.dbname, bootstrap);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker; run with `cargo test -- --ignored`"]
+async fn kafka_backend_ping_consumer_group() {
+    let (_container, bootstrap) = start_kafka().await;
+    let backend = KafkaBackend::open(&bootstrap, Some("test-group")).unwrap();
+    backend.ping().await.unwrap();
+    assert_eq!(backend.connection_info().user, "test-group");
+}
