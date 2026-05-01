@@ -29,14 +29,20 @@
 //! Putting them under a single root is just filesystem convention.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use arrow_array::RecordBatch;
 use async_trait::async_trait;
+use bytes::Bytes;
 use deltalake::DeltaTable;
 use deltalake::DeltaTableBuilder;
 use deltalake::errors::DeltaTableError;
 use deltalake::protocol::SaveMode;
 use futures_util::{StreamExt, TryStreamExt};
+use object_store::ObjectStore;
+use object_store::ObjectStoreExt;
+use object_store::local::LocalFileSystem;
+use object_store::path::Path as ObjectPath;
 use url::Url;
 
 use crate::backend::{
@@ -58,6 +64,10 @@ pub struct DeltaBackend {
     root_url: Url,
     /// Display-only label for `connection_info` and logs.
     base_label: String,
+    /// Sidecar object store rooted at the same location, used for
+    /// run_history JSONL writes. Phase 35f will swap in S3/Azure/GCS
+    /// for cloud roots; 35b–e use `LocalFileSystem`.
+    store: Arc<dyn ObjectStore>,
 }
 
 impl DeltaBackend {
@@ -77,9 +87,12 @@ impl DeltaBackend {
         let url_str = format!("file://{}/", abs.display());
         let root_url = Url::parse(&url_str)
             .map_err(|e| BackendError::Connection(format!("delta root url: {e}")))?;
+        let store = LocalFileSystem::new_with_prefix(&abs)
+            .map_err(|e| BackendError::Connection(format!("delta sidecar fs: {e}")))?;
         Ok(Self {
             root_url,
             base_label: abs.display().to_string(),
+            store: Arc::new(store),
         })
     }
 
@@ -96,6 +109,69 @@ impl DeltaBackend {
             .join(&rel)
             .map_err(|e| BackendError::Connection(format!("delta table url: {e}")))
     }
+}
+
+/// Path prefix under the Delta root where run_history JSONL events
+/// are written. One file per run, named by run_id, mirroring
+/// `objectstore_backend::RUN_HISTORY_PREFIX`. Lives next to the
+/// data tables — leading underscore so the Delta log scan never sees
+/// it (and `read_arrow_stream("_ematix_flow/...")` would explicitly
+/// look for it as a Delta table, which it isn't).
+const RUN_HISTORY_PREFIX: &str = "_ematix_flow/run_history";
+
+/// ISO-8601 "now" with millisecond precision and a `Z` suffix. Same
+/// shape as `objectstore_backend::chrono_compat_iso8601_now`; kept
+/// local to avoid a cross-module import for one routine.
+fn iso8601_now() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let since_epoch = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    let total_secs = since_epoch.as_secs() as i64;
+    let millis = since_epoch.subsec_millis();
+    let days = total_secs.div_euclid(86_400);
+    let time_secs = total_secs.rem_euclid(86_400);
+    let h = time_secs / 3600;
+    let mi = (time_secs % 3600) / 60;
+    let s = time_secs % 60;
+    let (y, mo, d) = civil_from_days(days);
+    format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}.{millis:03}Z")
+}
+
+/// Howard Hinnant's chrono::civil_from_days. Same as the helper in
+/// `mysql_backend.rs` and `objectstore_backend.rs`.
+fn civil_from_days(z: i64) -> (i32, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y as i32, m as u32, d as u32)
+}
+
+/// Append a run-history event as one-line JSON at
+/// `_ematix_flow/run_history/<run_id>.jsonl`. One file per run keeps
+/// concurrent runs conflict-free without needing append-blob
+/// semantics. Same protocol the ObjectStoreBackend uses.
+async fn record_run_event(
+    store: &Arc<dyn ObjectStore>,
+    run_id: &uuid::Uuid,
+    event: &serde_json::Value,
+) -> Result<(), BackendError> {
+    let path = ObjectPath::from(format!("{RUN_HISTORY_PREFIX}/{}.jsonl", run_id.simple()));
+    let mut bytes = serde_json::to_vec(event)
+        .map_err(|e| BackendError::Other(format!("delta run-history serialize: {e}")))?;
+    bytes.push(b'\n');
+    store
+        .put(&path, Bytes::from(bytes).into())
+        .await
+        .map_err(|e| BackendError::Connection(format!("delta run-history put: {e}")))?;
+    Ok(())
 }
 
 /// Build a `DeltaTable` for `url` and try to load its log. If the
@@ -201,6 +277,16 @@ impl Backend for DeltaBackend {
         };
         let url = self.table_url(schema, name)?;
         let table = open_or_uninit_delta_table(url.clone()).await?;
+        // Uninitialized tables (never written to, or only dry-run
+        // writes have happened) carry `version() == None`. Treat them
+        // as logically empty rather than erroring on `scan_table`
+        // ("No files in log segment") — that matches how DB backends
+        // respond to SELECT-from-empty and how ObjectStoreBackend
+        // handles an empty prefix.
+        if table.version().is_none() {
+            let empty = futures_util::stream::empty();
+            return Ok(Box::pin(empty));
+        }
         let (_table, df_stream) = table
             .scan_table()
             .await
@@ -250,30 +336,135 @@ impl Backend for DeltaBackend {
 
     async fn run_append(
         &self,
-        _spec: &TableSpec,
-        _source_query: &str,
-        _pipeline_name: &str,
-        _source_backend: Option<&dyn Backend>,
-        _incremental_column: Option<&str>,
-        _last_value_literal: Option<&str>,
-        _dry_run: bool,
+        spec: &TableSpec,
+        source_query: &str,
+        pipeline_name: &str,
+        source_backend: Option<&dyn Backend>,
+        incremental_column: Option<&str>,
+        last_value_literal: Option<&str>,
+        dry_run: bool,
     ) -> Result<StrategyRunResult, BackendError> {
-        Err(BackendError::Other(
-            "Delta run_append lands in Phase 35c".into(),
-        ))
+        let source = source_backend.ok_or_else(|| {
+            BackendError::Other(
+                "Delta run_append: source_backend is required \
+                 (Delta is a target only — there is no same-DB path \
+                 because Delta has no SQL source surface from this \
+                 backend; cross-Delta copies will land in 35f)"
+                    .into(),
+            )
+        })?;
+        // Watermark filter wraps the source SQL in the source's
+        // dialect. Delta itself doesn't track watermarks (the natural
+        // surface is the data layer); users running incremental loads
+        // to Delta must persist `last_value_literal` externally.
+        let watermark = incremental_column.map(|c| crate::meta::WatermarkConfig {
+            column: c.to_string(),
+            last_value_literal: last_value_literal.map(|s| s.to_string()),
+        });
+        let filtered_source =
+            crate::meta::wrap_with_watermark_filter(source_query, watermark.as_ref());
+
+        let run_id = uuid::Uuid::now_v7();
+        let started_at = iso8601_now();
+        let target = TargetTable {
+            schema: spec.schema.clone(),
+            name: spec.name.clone(),
+        };
+
+        let inserted: u64 = if dry_run {
+            // Probe the source so a missing query / bad credentials
+            // surfaces; do not write to Delta.
+            let _ = source.read_arrow_stream(&filtered_source).await?;
+            0
+        } else {
+            let stream = source.read_arrow_stream(&filtered_source).await?;
+            self.write_arrow_stream(&target, stream, WriteMode::Append)
+                .await?
+        };
+        let finished_at = iso8601_now();
+        let event = serde_json::json!({
+            "run_id": run_id.to_string(),
+            "pipeline_name": pipeline_name,
+            "target_schema": spec.schema,
+            "target_table": spec.name,
+            "mode": "append",
+            "path": "cross_backend",
+            "started_at": started_at,
+            "finished_at": finished_at,
+            "status": if dry_run { "dry_run" } else { "success" },
+            "rows_inserted": inserted,
+            "format": "delta",
+        });
+        record_run_event(&self.store, &run_id, &event).await?;
+
+        Ok(StrategyRunResult {
+            run_id: run_id.to_string(),
+            rows_inserted: inserted as i64,
+            rows_updated: None,
+            rows_unchanged: None,
+            rows_closed: None,
+            status: if dry_run { "dry_run" } else { "success" }.into(),
+            path: "cross_backend".into(),
+        })
     }
 
     async fn run_truncate(
         &self,
-        _spec: &TableSpec,
-        _source_query: &str,
-        _pipeline_name: &str,
-        _source_backend: Option<&dyn Backend>,
-        _dry_run: bool,
+        spec: &TableSpec,
+        source_query: &str,
+        pipeline_name: &str,
+        source_backend: Option<&dyn Backend>,
+        dry_run: bool,
     ) -> Result<StrategyRunResult, BackendError> {
-        Err(BackendError::Other(
-            "Delta run_truncate lands in Phase 35c".into(),
-        ))
+        let source = source_backend.ok_or_else(|| {
+            BackendError::Other(
+                "Delta run_truncate: source_backend is required \
+                 (Delta is a target only)"
+                    .into(),
+            )
+        })?;
+        let run_id = uuid::Uuid::now_v7();
+        let started_at = iso8601_now();
+        let target = TargetTable {
+            schema: spec.schema.clone(),
+            name: spec.name.clone(),
+        };
+
+        let inserted: u64 = if dry_run {
+            // Touch source but do not overwrite — Delta's Overwrite
+            // mode is a real commit and not safely reversible.
+            let _ = source.read_arrow_stream(source_query).await?;
+            0
+        } else {
+            let stream = source.read_arrow_stream(source_query).await?;
+            self.write_arrow_stream(&target, stream, WriteMode::Truncate)
+                .await?
+        };
+        let finished_at = iso8601_now();
+        let event = serde_json::json!({
+            "run_id": run_id.to_string(),
+            "pipeline_name": pipeline_name,
+            "target_schema": spec.schema,
+            "target_table": spec.name,
+            "mode": "truncate",
+            "path": "cross_backend",
+            "started_at": started_at,
+            "finished_at": finished_at,
+            "status": if dry_run { "dry_run" } else { "success" },
+            "rows_inserted": inserted,
+            "format": "delta",
+        });
+        record_run_event(&self.store, &run_id, &event).await?;
+
+        Ok(StrategyRunResult {
+            run_id: run_id.to_string(),
+            rows_inserted: inserted as i64,
+            rows_updated: None,
+            rows_unchanged: None,
+            rows_closed: None,
+            status: if dry_run { "dry_run" } else { "success" }.into(),
+            path: "cross_backend".into(),
+        })
     }
 
     async fn run_merge(
@@ -413,6 +604,196 @@ mod tests {
         let err = backend.execute("anything").await.unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("no execute() surface"), "got: {msg}");
+    }
+
+    // --- Phase 35c: run_append + run_truncate (DuckDB → Delta) ----------
+
+    use crate::DuckDBBackend;
+
+    async fn duckdb_with_events() -> Arc<dyn Backend> {
+        let duck: Arc<dyn Backend> = Arc::new(DuckDBBackend::open(":memory:").unwrap());
+        duck.execute("CREATE SCHEMA s").await.unwrap();
+        duck.execute("CREATE TABLE s.events (id BIGINT, name VARCHAR)")
+            .await
+            .unwrap();
+        duck.execute("INSERT INTO s.events VALUES (1, 'a'), (2, 'b'), (3, 'c')")
+            .await
+            .unwrap();
+        duck
+    }
+
+    fn small_table_spec() -> TableSpec {
+        use crate::types::{ColumnSpec, ColumnType};
+        TableSpec {
+            schema: "raw".into(),
+            name: "events".into(),
+            columns: vec![
+                ColumnSpec {
+                    name: "id".into(),
+                    ty: ColumnType::BigInt,
+                    nullable: false,
+                    primary_key: false,
+                },
+                ColumnSpec {
+                    name: "name".into(),
+                    ty: ColumnType::Text,
+                    nullable: true,
+                    primary_key: false,
+                },
+            ],
+            unique_constraints: vec![],
+            fingerprint: String::new(),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn delta_run_append_from_duckdb_writes_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let target_backend = DeltaBackend::open_local(dir.path()).unwrap();
+        let source = duckdb_with_events().await;
+        let spec = small_table_spec();
+
+        let result = target_backend
+            .run_append(
+                &spec,
+                "SELECT id, name FROM s.events ORDER BY id",
+                "p35c_append",
+                Some(source.as_ref()),
+                None,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.rows_inserted, 3);
+        assert_eq!(result.status, "success");
+        assert_eq!(result.path, "cross_backend");
+
+        // Read back via the same backend.
+        let stream = target_backend
+            .read_arrow_stream("raw/events")
+            .await
+            .unwrap();
+        let batches: Vec<RecordBatch> = futures_util::TryStreamExt::try_collect(stream)
+            .await
+            .unwrap();
+        let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, 3);
+
+        // run_history sidecar: exactly one JSONL file.
+        let mut listing = target_backend
+            .store
+            .list(Some(&ObjectPath::from("_ematix_flow/run_history")));
+        let mut history_count = 0;
+        while futures_util::StreamExt::next(&mut listing).await.is_some() {
+            history_count += 1;
+        }
+        assert_eq!(history_count, 1, "exactly one run_history event");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn delta_run_truncate_from_duckdb_replaces_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let target_backend = DeltaBackend::open_local(dir.path()).unwrap();
+        let source = duckdb_with_events().await;
+        let spec = small_table_spec();
+
+        // Two appends seed the table with 6 rows in two commits.
+        for tag in ["t35c_a", "t35c_b"] {
+            target_backend
+                .run_append(
+                    &spec,
+                    "SELECT id, name FROM s.events ORDER BY id",
+                    tag,
+                    Some(source.as_ref()),
+                    None,
+                    None,
+                    false,
+                )
+                .await
+                .unwrap();
+        }
+        // Truncate replaces with 3 rows in a fresh Overwrite commit.
+        let result = target_backend
+            .run_truncate(
+                &spec,
+                "SELECT id, name FROM s.events ORDER BY id",
+                "t35c_trunc",
+                Some(source.as_ref()),
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.rows_inserted, 3);
+        assert_eq!(result.status, "success");
+
+        let stream = target_backend
+            .read_arrow_stream("raw/events")
+            .await
+            .unwrap();
+        let batches: Vec<RecordBatch> = futures_util::TryStreamExt::try_collect(stream)
+            .await
+            .unwrap();
+        let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, 3, "Overwrite save_mode replaced the prior commits");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn delta_run_append_dry_run_does_not_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let target_backend = DeltaBackend::open_local(dir.path()).unwrap();
+        let source = duckdb_with_events().await;
+        let spec = small_table_spec();
+
+        let result = target_backend
+            .run_append(
+                &spec,
+                "SELECT id, name FROM s.events ORDER BY id",
+                "p35c_dry",
+                Some(source.as_ref()),
+                None,
+                None,
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.status, "dry_run");
+        assert_eq!(result.rows_inserted, 0);
+
+        // Delta table at raw/events doesn't exist yet (no write
+        // happened); read should return zero rows.
+        let stream = target_backend
+            .read_arrow_stream("raw/events")
+            .await
+            .unwrap();
+        let batches: Vec<RecordBatch> = futures_util::TryStreamExt::try_collect(stream)
+            .await
+            .unwrap();
+        let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, 0);
+
+        // Run-history event still recorded (audit trail).
+        let mut listing = target_backend
+            .store
+            .list(Some(&ObjectPath::from("_ematix_flow/run_history")));
+        let mut history_count = 0;
+        while futures_util::StreamExt::next(&mut listing).await.is_some() {
+            history_count += 1;
+        }
+        assert_eq!(history_count, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn delta_run_append_rejects_missing_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = DeltaBackend::open_local(dir.path()).unwrap();
+        let spec = small_table_spec();
+        let err = backend
+            .run_append(&spec, "ignored", "p", None, None, None, false)
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("source_backend is required"), "got: {msg}");
     }
 
     #[tokio::test(flavor = "multi_thread")]
