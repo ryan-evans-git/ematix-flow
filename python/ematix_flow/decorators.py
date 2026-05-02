@@ -1480,6 +1480,36 @@ class _EmatixNamespace:
 
         return decorate
 
+    @staticmethod
+    def connection(cls: type) -> Any:
+        """Π.1: register a typed streaming connection from a declarative class.
+
+        The class body declares the connection's fields (``kind``,
+        ``bootstrap_servers``, etc.); the decorator builds the
+        appropriate :class:`Connection` subclass instance, registers
+        it under the class name, and *returns the instance* — so
+        the user's module-level ``kafka_prod`` binding becomes the
+        typed connection itself.
+
+        Example::
+
+            from ematix_flow import ematix
+
+            @ematix.connection
+            class kafka_prod:
+                kind = "kafka"
+                bootstrap_servers = "${KAFKA_BOOTSTRAP}"
+                group_id = "ematix-flow"
+
+        For instance-based registration (no decorator), use
+        :func:`ematix_flow.register_connection` directly.
+        """
+        # Imported lazily so importing decorators doesn't require
+        # connections.py at parse time.
+        from ematix_flow import connections as _conn_mod
+
+        return _conn_mod.connection(cls)
+
 
 ematix = _EmatixNamespace()
 
