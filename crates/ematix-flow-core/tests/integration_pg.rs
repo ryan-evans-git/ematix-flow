@@ -4331,7 +4331,7 @@ async fn streaming_pipeline_kafka_to_sqlite_end_to_end() {
         "stream-test",
     );
 
-    let pipeline = StreamingPipeline::new(source, Arc::clone(&target_backend), config);
+    let pipeline = StreamingPipeline::new_single(source, Arc::clone(&target_backend), config);
 
     // Drive the pipeline; trigger shutdown after a short delay so it
     // gets a chance to drain the topic. 5 seconds covers Kafka
@@ -4510,7 +4510,7 @@ async fn streaming_pipeline_routes_failed_batch_to_dlq() {
     )
     .with_dead_letter_topic(dlq_topic);
 
-    let pipeline = StreamingPipeline::new(source, target_backend, cfg);
+    let pipeline = StreamingPipeline::new_single(source, target_backend, cfg);
 
     let (sig, trigger) = ShutdownSignal::new();
     let pipeline_handle = tokio::spawn(async move { pipeline.run(sig).await });

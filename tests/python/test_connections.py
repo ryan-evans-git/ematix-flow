@@ -478,3 +478,128 @@ class TestSymmetry:
         )
         # bootstrap_servers appears in both [source] and [target].
         assert toml.count('bootstrap_servers = "b:9092"') == 2
+
+
+# ---------- Π.4a-4: multi-target API -------------------------------
+
+
+class TestMultiTarget:
+    """run_streaming_pipeline accepts targets=[Target(...), ...]
+    and emits the [[targets]] TOML shape for multi-target fan-out."""
+
+    def test_target_dataclass_exposed_from_package(self):
+        from ematix_flow import Target
+
+        warehouse = PostgresConnection(name="wh", url="postgres://app@host/db")
+        t = Target(connection=warehouse, table=("public", "events"))
+        assert t.connection is warehouse
+        assert t.table == ("public", "events")
+        # Defaults — every other placement field is None / empty.
+        assert t.topic is None
+        assert t.partition_by is None
+
+    def test_two_targets_emits_array_of_tables(self):
+        from ematix_flow import Target
+        from ematix_flow.streaming import _build_toml_multi
+
+        src = KafkaConnection(name="src", bootstrap_servers="b:9092", group_id="g")
+        wh = PostgresConnection(name="wh", url="postgres://app@host/db")
+        lake = DeltaLocalConnection(name="lake", path="/data/lake")
+        toml = _build_toml_multi(
+            name="fanout",
+            source=src,
+            source_query="events",
+            targets=[
+                Target(connection=wh, table=("public", "events")),
+                Target(
+                    connection=lake,
+                    table=("default", "events_archive"),
+                    partition_by=["year", "month"],
+                ),
+            ],
+            idle_pause_ms=500,
+            dead_letter_topic=None,
+        )
+        # Multi-target emits [[targets]] (an array of tables in TOML).
+        assert toml.count("[[targets]]") == 2
+        # The single-target shape should not appear.
+        assert "[target]\n" not in toml
+        # First target is Postgres, second is delta_local.
+        assert 'kind = "postgres"' in toml
+        assert 'kind = "delta_local"' in toml
+        assert 'partition_by = ["year", "month"]' in toml
+        # Per-target table blocks bind to the latest [[targets]].
+        assert toml.count("[targets.table]") == 2
+
+    def test_single_target_via_targets_list_keeps_back_compat_shape(self):
+        # A 1-element targets list should still emit the legacy
+        # `[target]` block — the Rust runner accepts both forms,
+        # but keeping the smaller TOML for the single-target case
+        # is what callers expect.
+        from ematix_flow import Target
+        from ematix_flow.streaming import _build_toml_multi
+
+        src = KafkaConnection(name="src", bootstrap_servers="b:9092")
+        wh = PostgresConnection(name="wh", url="postgres://app@host/db")
+        toml = _build_toml_multi(
+            name="single",
+            source=src,
+            source_query="events",
+            targets=[Target(connection=wh, table=("public", "events"))],
+            idle_pause_ms=500,
+            dead_letter_topic=None,
+        )
+        assert "[[targets]]" not in toml
+        assert "[target]" in toml
+        assert "[target.table]" in toml
+
+    def test_run_streaming_pipeline_rejects_target_and_targets_together(self):
+        from ematix_flow import Target
+        from ematix_flow.streaming import run_streaming_pipeline
+
+        src = KafkaConnection(name="src", bootstrap_servers="b:9092")
+        wh = PostgresConnection(name="wh", url="postgres://app@host/db")
+        with pytest.raises(ValueError, match="target.*targets"):
+            run_streaming_pipeline(
+                name="bad",
+                source=src,
+                source_query="events",
+                target=wh,
+                target_table=("public", "events"),
+                targets=[Target(connection=wh, table=("public", "events"))],
+            )
+
+    def test_run_streaming_pipeline_rejects_neither_target_nor_targets(self):
+        from ematix_flow.streaming import run_streaming_pipeline
+
+        src = KafkaConnection(name="src", bootstrap_servers="b:9092")
+        with pytest.raises(ValueError, match="target"):
+            run_streaming_pipeline(
+                name="bad",
+                source=src,
+                source_query="events",
+            )
+
+    def test_target_resolves_string_connection_name_via_registry(self):
+        from ematix_flow import Target
+        from ematix_flow.streaming import _build_toml_multi
+
+        # Register a connection so a string name resolves.
+        warehouse = PostgresConnection(
+            name="warehouse_prod", url="postgres://app@host/db"
+        )
+        register_connection(warehouse)
+
+        src = KafkaConnection(name="src", bootstrap_servers="b:9092")
+        toml = _build_toml_multi(
+            name="byname",
+            source=src,
+            source_query="events",
+            targets=[
+                # String references resolve against the registry.
+                Target(connection="warehouse_prod", table=("public", "events")),
+            ],
+            idle_pause_ms=500,
+            dead_letter_topic=None,
+        )
+        assert 'url = "postgres://app@host/db"' in toml

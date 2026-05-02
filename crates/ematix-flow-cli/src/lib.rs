@@ -93,6 +93,15 @@ fn redact_db_url(url: &str) -> String {
 }
 
 /// Top-level pipeline config loaded from a TOML file.
+///
+/// Targets accept two surfaces:
+/// 1. **`[target]`** — single-target shorthand (the v0.1 form).
+/// 2. **`[[targets]]`** — array of targets (Π.4a multi-target
+///    fan-out). Each entry has the same shape as the single
+///    `[target]` block.
+///
+/// Exactly one of the two must be set. Use [`Self::targets`] to
+/// read in a form-agnostic way.
 #[derive(Clone, Deserialize)]
 pub struct PipelineCliConfig {
     /// Used for log lines + Prometheus labels.
@@ -110,8 +119,13 @@ pub struct PipelineCliConfig {
     pub dead_letter_topic: Option<String>,
     /// Source backend.
     pub source: SourceConfig,
-    /// Target backend.
-    pub target: TargetConfig,
+    /// Single-target form. Mutually exclusive with `targets`.
+    #[serde(default)]
+    pub target: Option<TargetConfig>,
+    /// Multi-target form (Π.4a). Mutually exclusive with `target`.
+    /// Default = empty Vec.
+    #[serde(default)]
+    pub targets: Vec<TargetConfig>,
 }
 
 fn default_idle_pause_ms() -> u64 {
@@ -268,6 +282,7 @@ impl std::fmt::Debug for PipelineCliConfig {
             .field("dead_letter_topic", &self.dead_letter_topic)
             .field("source", &self.source)
             .field("target", &self.target)
+            .field("targets", &self.targets)
             .finish()
     }
 }
@@ -495,7 +510,9 @@ pub struct TableSpecConfig {
 impl PipelineCliConfig {
     /// Parse a TOML config from a string.
     pub fn from_toml_str(s: &str) -> Result<Self, ConfigError> {
-        toml::from_str(s).map_err(|e| ConfigError::Parse(e.to_string()))
+        let cfg: Self = toml::from_str(s).map_err(|e| ConfigError::Parse(e.to_string()))?;
+        cfg.validate_target_shape()?;
+        Ok(cfg)
     }
 
     /// Read + parse a TOML config from a file path.
@@ -504,6 +521,27 @@ impl PipelineCliConfig {
         let s = std::fs::read_to_string(path)
             .map_err(|e| ConfigError::Io(format!("read {}: {e}", path.display())))?;
         Self::from_toml_str(&s)
+    }
+
+    /// Form-agnostic accessor: returns the single `[target]` as a
+    /// 1-element slice or the full `[[targets]]` array.
+    pub fn targets(&self) -> Vec<&TargetConfig> {
+        if let Some(t) = &self.target {
+            return vec![t];
+        }
+        self.targets.iter().collect()
+    }
+
+    fn validate_target_shape(&self) -> Result<(), ConfigError> {
+        match (self.target.is_some(), !self.targets.is_empty()) {
+            (true, true) => Err(ConfigError::Parse(
+                "pipeline config sets both `target` and `targets` — pick one form".into(),
+            )),
+            (false, false) => Err(ConfigError::Parse(
+                "pipeline config has no target: set `[target]` or `[[targets]]`".into(),
+            )),
+            _ => Ok(()),
+        }
     }
 
     /// Convert the source variant to a concrete `Arc<dyn Backend>`.
@@ -555,8 +593,38 @@ impl PipelineCliConfig {
     ///
     /// Streaming-sink targets (Kafka / Pub/Sub / Kinesis / RabbitMQ)
     /// project their per-kind name field onto `TargetTable.name`.
+    ///
+    /// When the config uses `[[targets]]`, this returns the first
+    /// element. Multi-target callers should use
+    /// [`Self::build_targets`] (Vec-returning) instead.
     pub async fn build_target(&self) -> Result<(Arc<dyn Backend>, TargetTable), BackendError> {
-        match &self.target {
+        self.build_targets()
+            .await?
+            .into_iter()
+            .next()
+            .ok_or_else(|| BackendError::Other("no target configured".into()))
+    }
+
+    /// Π.4a-2: build every configured target. Returns one
+    /// (backend, target_table) pair per `[[targets]]` entry, or a
+    /// single-element Vec when the legacy `[target]` form is used.
+    /// Targets are constructed sequentially so a single
+    /// connection-time failure short-circuits before the framework
+    /// holds half-initialized handles.
+    pub async fn build_targets(
+        &self,
+    ) -> Result<Vec<(Arc<dyn Backend>, TargetTable)>, BackendError> {
+        let mut out: Vec<(Arc<dyn Backend>, TargetTable)> = Vec::new();
+        for target in self.targets() {
+            out.push(Self::build_one_target(target).await?);
+        }
+        Ok(out)
+    }
+
+    async fn build_one_target(
+        target: &TargetConfig,
+    ) -> Result<(Arc<dyn Backend>, TargetTable), BackendError> {
+        match target {
             TargetConfig::Postgres { url, table } => {
                 let pool = PgPool::connect(url).await?;
                 let b = PostgresBackend::new(Arc::new(pool), url.clone());
@@ -822,9 +890,17 @@ pub async fn run_consume_with(
     options: ConsumeOptions,
 ) -> Result<StreamingPipelineMetrics, CliError> {
     let source = config.build_source()?;
-    let (target, target_table) = config.build_target().await?;
-    let pipeline_cfg = config.streaming_config(target_table);
-    let pipeline = StreamingPipeline::new(source, target, pipeline_cfg);
+    let targets = config.build_targets().await?;
+    // streaming_config still wants a single TargetTable for back-
+    // compat. Use the first target's — it's the historical shape
+    // when only one target is configured, and unused on the multi-
+    // target hot path (the pipeline iterates `self.targets`).
+    let primary_table = targets
+        .first()
+        .map(|(_, t)| t.clone())
+        .ok_or_else(|| CliError::Runtime("no target configured".into()))?;
+    let pipeline_cfg = config.streaming_config(primary_table);
+    let pipeline = StreamingPipeline::new(source, targets, pipeline_cfg);
 
     // Pick a shutdown source. Tests + programmatic callers can
     // pass an external signal via ConsumeOptions; otherwise we
@@ -915,7 +991,7 @@ mod tests {
             }
             other => panic!("expected Kafka source, got {other:?}"),
         }
-        match &cfg.target {
+        match cfg.target.as_ref().unwrap() {
             TargetConfig::Postgres { url, table } => {
                 assert_eq!(url, "postgres://localhost/mydb");
                 assert_eq!(table.schema, "public");
@@ -997,7 +1073,7 @@ mod tests {
             topic = "out-topic"
         "#;
         let cfg = PipelineCliConfig::from_toml_str(toml).unwrap();
-        match (&cfg.source, &cfg.target) {
+        match (&cfg.source, cfg.target.as_ref().unwrap()) {
             (
                 SourceConfig::Rabbitmq { amqp_url },
                 TargetConfig::Kafka {
@@ -1140,7 +1216,7 @@ mod tests {
             name = "events"
         "#;
         let cfg = PipelineCliConfig::from_toml_str(toml).unwrap();
-        match &cfg.target {
+        match cfg.target.as_ref().unwrap() {
             TargetConfig::DeltaS3 {
                 endpoint,
                 bucket,
@@ -1332,7 +1408,7 @@ mod tests {
             name = "events"
         "#;
         let cfg = PipelineCliConfig::from_toml_str(toml).unwrap();
-        match &cfg.target {
+        match cfg.target.as_ref().unwrap() {
             TargetConfig::DeltaLocal { partition_by, .. } => {
                 assert_eq!(partition_by, &vec!["year".to_string(), "month".to_string()]);
             }
@@ -1359,7 +1435,7 @@ mod tests {
             name = "events"
         "#;
         let cfg = PipelineCliConfig::from_toml_str(toml).unwrap();
-        match &cfg.target {
+        match cfg.target.as_ref().unwrap() {
             TargetConfig::DeltaLocal { partition_by, .. } => assert!(partition_by.is_empty()),
             other => panic!("expected DeltaLocal, got {other:?}"),
         }
@@ -1383,7 +1459,7 @@ mod tests {
             message_key_column = "user_id"
         "#;
         let cfg = PipelineCliConfig::from_toml_str(toml).unwrap();
-        match &cfg.target {
+        match cfg.target.as_ref().unwrap() {
             TargetConfig::Kafka {
                 message_key_column, ..
             } => {
@@ -1411,7 +1487,7 @@ mod tests {
             topic = "events"
         "#;
         let cfg = PipelineCliConfig::from_toml_str(toml).unwrap();
-        match &cfg.target {
+        match cfg.target.as_ref().unwrap() {
             TargetConfig::Kafka {
                 message_key_column, ..
             } => {
@@ -1447,7 +1523,7 @@ mod tests {
                 "#
             );
             let cfg = PipelineCliConfig::from_toml_str(&toml).unwrap();
-            match &cfg.target {
+            match cfg.target.as_ref().unwrap() {
                 TargetConfig::ObjectStoreLocal {
                     path,
                     format,
@@ -1485,7 +1561,7 @@ mod tests {
             prefix = "raw"
         "#;
         let cfg = PipelineCliConfig::from_toml_str(toml).unwrap();
-        match &cfg.target {
+        match cfg.target.as_ref().unwrap() {
             TargetConfig::ObjectStoreS3 {
                 endpoint,
                 bucket,
@@ -1530,7 +1606,7 @@ mod tests {
             name = "events"
         "#;
         let cfg = PipelineCliConfig::from_toml_str(toml).unwrap();
-        match &cfg.target {
+        match cfg.target.as_ref().unwrap() {
             TargetConfig::DeltaS3 { prefix, .. } => assert_eq!(prefix, ""),
             other => panic!("expected DeltaS3, got {other:?}"),
         }
@@ -1543,5 +1619,186 @@ mod tests {
         std::fs::write(&path, kafka_to_pg_toml()).unwrap();
         let cfg = PipelineCliConfig::from_path(&path).unwrap();
         assert_eq!(cfg.pipeline_name, "events-to-pg");
+    }
+
+    // --- Π.4a-2: build_targets returns a Vec ------------------------------
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn build_targets_returns_one_for_single_target_form() {
+        // Use an in-memory backend so the test doesn't need a live
+        // service. The schema layer is what we're verifying here.
+        let toml = r#"
+            pipeline_name = "p"
+            source_query = "events"
+
+            [source]
+            kind = "kafka"
+            bootstrap_servers = "localhost:9092"
+
+            [target]
+            kind = "duckdb"
+            path = ":memory:"
+            [target.table]
+            schema = ""
+            name = "events"
+        "#;
+        let cfg = PipelineCliConfig::from_toml_str(toml).unwrap();
+        let built = cfg
+            .build_targets()
+            .await
+            .expect("build_targets should succeed for in-memory backend");
+        assert_eq!(built.len(), 1);
+        assert_eq!(built[0].1.name, "events");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn build_targets_returns_one_per_array_entry() {
+        let toml = r#"
+            pipeline_name = "fanout"
+            source_query = "events"
+
+            [source]
+            kind = "kafka"
+            bootstrap_servers = "localhost:9092"
+
+            [[targets]]
+            kind = "duckdb"
+            path = ":memory:"
+            [targets.table]
+            schema = ""
+            name = "events"
+
+            [[targets]]
+            kind = "sqlite"
+            path = ":memory:"
+            [targets.table]
+            schema = ""
+            name = "events_archive"
+        "#;
+        let cfg = PipelineCliConfig::from_toml_str(toml).unwrap();
+        let built = cfg
+            .build_targets()
+            .await
+            .expect("build_targets should succeed for in-memory backends");
+        assert_eq!(built.len(), 2);
+        assert_eq!(built[0].1.name, "events");
+        assert_eq!(built[1].1.name, "events_archive");
+    }
+
+    // --- Π.4a: multi-target [[targets]] schema ----------------------------
+
+    #[test]
+    fn parses_multi_target_array_form() {
+        let toml = r#"
+            pipeline_name = "fanout"
+            source_query = "events"
+
+            [source]
+            kind = "kafka"
+            bootstrap_servers = "localhost:9092"
+
+            [[targets]]
+            kind = "postgres"
+            url = "postgres://localhost/wh"
+            [targets.table]
+            schema = "public"
+            name = "events"
+
+            [[targets]]
+            kind = "delta_local"
+            path = "/tmp/lake"
+            partition_by = ["year", "month"]
+            [targets.table]
+            schema = ""
+            name = "events_archive"
+        "#;
+        let cfg = PipelineCliConfig::from_toml_str(toml).unwrap();
+        let targets = cfg.targets();
+        assert_eq!(targets.len(), 2, "expected 2 targets");
+        match &targets[0] {
+            TargetConfig::Postgres { url, table } => {
+                assert_eq!(url, "postgres://localhost/wh");
+                assert_eq!(table.schema, "public");
+                assert_eq!(table.name, "events");
+            }
+            other => panic!("expected Postgres at [0], got {other:?}"),
+        }
+        match &targets[1] {
+            TargetConfig::DeltaLocal {
+                path,
+                table,
+                partition_by,
+            } => {
+                assert_eq!(path, "/tmp/lake");
+                assert_eq!(table.name, "events_archive");
+                assert_eq!(partition_by, &vec!["year".to_string(), "month".to_string()]);
+            }
+            other => panic!("expected DeltaLocal at [1], got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn single_target_form_still_works_via_targets_accessor() {
+        // Existing TOMLs with `[target]` keep parsing; the unified
+        // `targets()` accessor returns a one-element slice.
+        let cfg = PipelineCliConfig::from_toml_str(kafka_to_pg_toml()).unwrap();
+        let targets = cfg.targets();
+        assert_eq!(targets.len(), 1);
+        match &targets[0] {
+            TargetConfig::Postgres { url, .. } => {
+                assert_eq!(url, "postgres://localhost/mydb");
+            }
+            other => panic!("expected Postgres, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_both_target_and_targets_set() {
+        let toml = r#"
+            pipeline_name = "p"
+            source_query = "events"
+
+            [source]
+            kind = "kafka"
+            bootstrap_servers = "localhost:9092"
+
+            [target]
+            kind = "postgres"
+            url = "postgres://localhost/wh"
+            [target.table]
+            name = "t"
+
+            [[targets]]
+            kind = "postgres"
+            url = "postgres://localhost/wh"
+            [targets.table]
+            name = "t"
+        "#;
+        let err = PipelineCliConfig::from_toml_str(toml)
+            .expect_err("expected ConfigError when both forms present");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("target") && msg.contains("targets"),
+            "error should mention both forms: {msg}"
+        );
+    }
+
+    #[test]
+    fn rejects_neither_target_nor_targets_set() {
+        let toml = r#"
+            pipeline_name = "p"
+            source_query = "events"
+
+            [source]
+            kind = "kafka"
+            bootstrap_servers = "localhost:9092"
+        "#;
+        let err = PipelineCliConfig::from_toml_str(toml)
+            .expect_err("expected ConfigError when no target form present");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("target"),
+            "error should mention missing target: {msg}"
+        );
     }
 }

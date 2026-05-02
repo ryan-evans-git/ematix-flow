@@ -243,7 +243,10 @@ impl ShutdownSignal {
 /// the SIGTERM handler in another).
 pub struct StreamingPipeline {
     pub source: Arc<dyn Backend>,
-    pub target: Arc<dyn Backend>,
+    /// Π.4a: each pipeline iteration fans the source's batches out
+    /// to **every** entry here. A 1-element Vec is the historical
+    /// single-target shape; >1 entry is multi-target fan-out.
+    pub targets: Vec<(Arc<dyn Backend>, TargetTable)>,
     pub config: StreamingPipelineConfig,
     pub metrics: StreamingPipelineMetricsCounters,
 }
@@ -251,16 +254,29 @@ pub struct StreamingPipeline {
 impl StreamingPipeline {
     pub fn new(
         source: Arc<dyn Backend>,
-        target: Arc<dyn Backend>,
+        targets: Vec<(Arc<dyn Backend>, TargetTable)>,
         config: StreamingPipelineConfig,
     ) -> Self {
         let metrics = StreamingPipelineMetricsCounters::new(&config.pipeline_name);
         Self {
             source,
-            target,
+            targets,
             config,
             metrics,
         }
+    }
+
+    /// Single-target convenience: pulls the table from
+    /// `config.target` and wraps it in a one-element targets Vec.
+    /// Lets v0.1-shaped callers keep their `(source, target,
+    /// config)` shape without manually building the Vec.
+    pub fn new_single(
+        source: Arc<dyn Backend>,
+        target: Arc<dyn Backend>,
+        config: StreamingPipelineConfig,
+    ) -> Self {
+        let table = config.target.clone();
+        Self::new(source, vec![(target, table)], config)
     }
 
     /// Borrow the Prometheus registry — for serving via a
@@ -320,34 +336,40 @@ impl StreamingPipeline {
             let n_rows: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
             self.metrics.rows_consumed.inc_by(n_rows);
 
-            // Save a clone of the batches *before* handing them to
-            // the target — needed for DLQ-on-failure routing.
-            let dlq_batches = if self.config.dead_letter_topic.is_some() {
-                Some(batches.clone())
-            } else {
-                None
-            };
-            let target_stream: ArrowBatchStream =
-                Box::pin(futures_util::stream::iter(batches.into_iter().map(Ok)));
-            let write_result = self
-                .target
-                .write_arrow_stream(&self.config.target, target_stream, self.config.mode)
-                .await;
+            // Π.4a: fan out to every target concurrently. Each
+            // target gets its own RecordBatch stream cloned from
+            // the source's batches. `join_all` (not try_join_all)
+            // runs every write to completion so we have full
+            // visibility into which targets succeeded — needed
+            // for the DLQ branch + for diagnostics on failure.
+            let writes = self.targets.iter().map(|(backend, table)| {
+                let batches_for_target: Vec<RecordBatch> = batches.clone();
+                let target_stream: ArrowBatchStream = Box::pin(futures_util::stream::iter(
+                    batches_for_target.into_iter().map(Ok),
+                ));
+                let mode = self.config.mode;
+                async move { backend.write_arrow_stream(table, target_stream, mode).await }
+            });
+            let results: Vec<Result<u64, BackendError>> =
+                futures_util::future::join_all(writes).await;
 
-            match write_result {
-                Ok(_) => {
+            let first_err: Option<BackendError> = results.into_iter().find_map(|r| r.err());
+            match first_err {
+                None => {
                     self.metrics.rows_written.inc_by(n_rows);
                 }
-                Err(e) => {
+                Some(e) => {
                     self.metrics.errors.inc();
                     // DLQ routing: if a topic is configured, produce
                     // each row's source-encoded payload to the DLQ
-                    // and continue. If no DLQ is configured, surface
-                    // the error so the supervisor decides on
-                    // restart.
-                    if let (Some(topic), Some(batches)) =
-                        (&self.config.dead_letter_topic, dlq_batches)
-                    {
+                    // and continue. With multi-target the DLQ runs
+                    // when *any* target failed; targets that already
+                    // succeeded keep their writes (data is in those
+                    // sinks plus the DLQ — partial-success is the
+                    // accepted trade for at-least-once across N
+                    // sinks). No DLQ ⇒ surface the first failure
+                    // and skip the offset commit.
+                    if let Some(topic) = &self.config.dead_letter_topic {
                         let dlq_count = self.route_batches_to_dlq(topic.as_str(), batches).await?;
                         self.metrics.dlq_writes.inc_by(dlq_count);
                     } else {
@@ -689,5 +711,269 @@ mod tests {
         )
         .with_dead_letter_topic("dlq-events");
         assert_eq!(cfg.dead_letter_topic.as_deref(), Some("dlq-events"));
+    }
+
+    // --- Π.4a-3: multi-target fan-out -------------------------------------
+
+    mod multi_target {
+        use super::*;
+        use crate::backend::{
+            ArrowBatchStream, Backend, BackendError, Dialect, StrategyRunResult, TargetTable,
+            WriteMode,
+        };
+        use crate::pg::ConnectionInfo;
+        use arrow_array::{Int32Array, RecordBatch};
+        use arrow_schema::{DataType, Field, Schema};
+        use async_trait::async_trait;
+        use std::sync::Mutex;
+
+        /// Test backend: records writes for assertions; emits a
+        /// scripted sequence of read batches; can be configured to
+        /// fail its next write. Connection-info / strategy methods
+        /// panic — they shouldn't be invoked by `StreamingPipeline`.
+        struct TestBackend {
+            label: String,
+            // Source side: pop a batch list per `read_arrow_stream`
+            // call; empty when the script is exhausted.
+            scripted_reads: Mutex<Vec<Vec<RecordBatch>>>,
+            // Target side: records (table.name, n_rows) per write.
+            writes: Mutex<Vec<(String, usize)>>,
+            // When true, the next `write_arrow_stream` returns Err.
+            fail_next_write: Mutex<bool>,
+            // Increments on every commit_offsets call.
+            commits: Mutex<u32>,
+        }
+
+        impl TestBackend {
+            fn new(label: &str) -> Self {
+                Self {
+                    label: label.into(),
+                    scripted_reads: Mutex::new(Vec::new()),
+                    writes: Mutex::new(Vec::new()),
+                    fail_next_write: Mutex::new(false),
+                    commits: Mutex::new(0),
+                }
+            }
+
+            fn enqueue_read(&self, batches: Vec<RecordBatch>) {
+                self.scripted_reads.lock().unwrap().push(batches);
+            }
+
+            fn fail_next(&self) {
+                *self.fail_next_write.lock().unwrap() = true;
+            }
+
+            fn writes(&self) -> Vec<(String, usize)> {
+                self.writes.lock().unwrap().clone()
+            }
+
+            fn commit_count(&self) -> u32 {
+                *self.commits.lock().unwrap()
+            }
+        }
+
+        #[async_trait]
+        impl Backend for TestBackend {
+            fn dialect(&self) -> Dialect {
+                Dialect::Postgres
+            }
+            fn connection_info(&self) -> ConnectionInfo {
+                ConnectionInfo {
+                    host: self.label.clone(),
+                    port: 0,
+                    dbname: self.label.clone(),
+                    user: "test".into(),
+                }
+            }
+            fn dsn(&self) -> Option<String> {
+                None
+            }
+            async fn ping(&self) -> Result<(), BackendError> {
+                Ok(())
+            }
+            async fn execute(&self, _statement: &str) -> Result<u64, BackendError> {
+                Ok(0)
+            }
+            async fn read_arrow_stream(
+                &self,
+                _query: &str,
+            ) -> Result<ArrowBatchStream, BackendError> {
+                let next = if self.scripted_reads.lock().unwrap().is_empty() {
+                    Vec::new()
+                } else {
+                    self.scripted_reads.lock().unwrap().remove(0)
+                };
+                Ok(Box::pin(futures_util::stream::iter(
+                    next.into_iter().map(Ok),
+                )))
+            }
+            async fn write_arrow_stream(
+                &self,
+                target: &TargetTable,
+                stream: ArrowBatchStream,
+                _mode: WriteMode,
+            ) -> Result<u64, BackendError> {
+                let batches: Vec<RecordBatch> = stream.try_collect().await?;
+                let n: usize = batches.iter().map(|b| b.num_rows()).sum();
+                if std::mem::replace(&mut *self.fail_next_write.lock().unwrap(), false) {
+                    return Err(BackendError::Other(format!(
+                        "{}: scripted write failure",
+                        self.label
+                    )));
+                }
+                self.writes.lock().unwrap().push((target.name.clone(), n));
+                Ok(n as u64)
+            }
+            async fn run_append(
+                &self,
+                _spec: &crate::types::TableSpec,
+                _source_query: &str,
+                _pipeline_name: &str,
+                _source_backend: Option<&dyn Backend>,
+                _incremental_column: Option<&str>,
+                _last_value_literal: Option<&str>,
+                _dry_run: bool,
+            ) -> Result<StrategyRunResult, BackendError> {
+                unreachable!("TestBackend::run_append")
+            }
+            async fn run_truncate(
+                &self,
+                _spec: &crate::types::TableSpec,
+                _source_query: &str,
+                _pipeline_name: &str,
+                _source_backend: Option<&dyn Backend>,
+                _dry_run: bool,
+            ) -> Result<StrategyRunResult, BackendError> {
+                unreachable!("TestBackend::run_truncate")
+            }
+            async fn run_merge(
+                &self,
+                _spec: &crate::types::TableSpec,
+                _source_query: &str,
+                _keys: &[String],
+                _update_columns: &[String],
+                _pipeline_name: &str,
+                _mode_label: &str,
+                _source_backend: Option<&dyn Backend>,
+                _delete_handling: Option<crate::backend::DeleteHandling>,
+                _dry_run: bool,
+            ) -> Result<StrategyRunResult, BackendError> {
+                unreachable!("TestBackend::run_merge")
+            }
+            async fn run_scd2(
+                &self,
+                _spec: &crate::types::TableSpec,
+                _source_query: &str,
+                _keys: &[String],
+                _compare_columns: &[String],
+                _pipeline_name: &str,
+                _source_backend: Option<&dyn Backend>,
+                _delete_handling: Option<crate::backend::DeleteHandling>,
+                _event_timestamp_column: Option<&str>,
+                _ttl_seconds: Option<i64>,
+                _dry_run: bool,
+            ) -> Result<StrategyRunResult, BackendError> {
+                unreachable!("TestBackend::run_scd2")
+            }
+            async fn commit_offsets(&self) -> Result<(), BackendError> {
+                *self.commits.lock().unwrap() += 1;
+                Ok(())
+            }
+        }
+
+        fn one_row_batch(n: i32) -> RecordBatch {
+            let schema = Schema::new(vec![Field::new("v", DataType::Int32, false)]);
+            let arr = Int32Array::from(vec![n]);
+            RecordBatch::try_new(Arc::new(schema), vec![Arc::new(arr)]).unwrap()
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn fan_out_writes_each_batch_to_every_target() {
+            let source = Arc::new(TestBackend::new("src"));
+            // Source emits one non-empty batch on the first read,
+            // then empty (idle) on subsequent reads.
+            source.enqueue_read(vec![one_row_batch(1), one_row_batch(2)]);
+
+            let target_a = Arc::new(TestBackend::new("a"));
+            let target_b = Arc::new(TestBackend::new("b"));
+            let table_a = TargetTable {
+                schema: "".into(),
+                name: "warehouse_events".into(),
+            };
+            let table_b = TargetTable {
+                schema: "".into(),
+                name: "lake_events".into(),
+            };
+
+            let cfg = StreamingPipelineConfig::new("topic", table_a.clone(), "p");
+            let pipeline = StreamingPipeline::new(
+                source.clone() as Arc<dyn Backend>,
+                vec![
+                    (target_a.clone() as Arc<dyn Backend>, table_a),
+                    (target_b.clone() as Arc<dyn Backend>, table_b),
+                ],
+                cfg,
+            );
+
+            let (sig, trigger) = ShutdownSignal::new();
+            // Trigger shutdown after a brief delay so the loop runs
+            // at least once but exits promptly.
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                trigger.trigger();
+            });
+            let summary = pipeline.run(sig).await.expect("pipeline.run");
+
+            assert_eq!(target_a.writes(), vec![("warehouse_events".into(), 2)]);
+            assert_eq!(target_b.writes(), vec![("lake_events".into(), 2)]);
+            assert!(summary.shutdown_triggered);
+            assert_eq!(summary.total_rows, 2);
+            assert_eq!(source.commit_count(), 1, "exactly one offset commit");
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn target_failure_skips_offset_commit_when_no_dlq() {
+            let source = Arc::new(TestBackend::new("src"));
+            source.enqueue_read(vec![one_row_batch(1)]);
+
+            let target_a = Arc::new(TestBackend::new("a"));
+            let target_b = Arc::new(TestBackend::new("b"));
+            target_b.fail_next();
+
+            let table_a = TargetTable {
+                schema: "".into(),
+                name: "warehouse_events".into(),
+            };
+            let table_b = TargetTable {
+                schema: "".into(),
+                name: "lake_events".into(),
+            };
+
+            let cfg = StreamingPipelineConfig::new("topic", table_a.clone(), "p");
+            let pipeline = StreamingPipeline::new(
+                source.clone() as Arc<dyn Backend>,
+                vec![
+                    (target_a.clone() as Arc<dyn Backend>, table_a),
+                    (target_b.clone() as Arc<dyn Backend>, table_b),
+                ],
+                cfg,
+            );
+
+            let (sig, _trigger) = ShutdownSignal::new();
+            let err = pipeline
+                .run(sig)
+                .await
+                .expect_err("expected pipeline.run to surface target B's error");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("scripted write failure"),
+                "unexpected error: {msg}"
+            );
+            assert_eq!(
+                source.commit_count(),
+                0,
+                "offsets must NOT advance on target failure when no DLQ configured"
+            );
+        }
     }
 }

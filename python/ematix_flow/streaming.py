@@ -51,17 +51,13 @@ Example (Π.1, decorator-based):
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass, field
 from typing import Any, Optional, Union
 
 from ematix_flow._core import (
     run_pipeline_from_path,
     run_pipeline_from_toml_str,
 )
-
-# `PipelineMetrics` is the dict shape returned by the Rust runner:
-# {"total_rows": int, "iterations": int, "shutdown_triggered": bool}.
-# Kept as a type alias so callers can annotate against it.
-PipelineMetrics = dict[str, Any]
 from ematix_flow.connections import (
     Connection,
     DeltaLocalConnection,
@@ -80,10 +76,40 @@ from ematix_flow.connections import (
     resolve,
 )
 
+# `PipelineMetrics` is the dict shape returned by the Rust runner:
+# {"total_rows": int, "iterations": int, "shutdown_triggered": bool}.
+# Kept as a type alias so callers can annotate against it.
+PipelineMetrics = dict[str, Any]
+
+
+@dataclass(frozen=True)
+class Target:
+    """Π.4a: one entry in a multi-target fan-out pipeline.
+
+    Bundles a connection (or registered name) with its per-kind
+    placement spec — ``table`` for DB / Delta targets, ``topic`` /
+    ``queue`` / ``partition_key_prefix`` for streaming targets, etc.
+    Pass a ``list[Target]`` as ``targets=`` to
+    :func:`run_streaming_pipeline` to fan a single source's
+    batches out to multiple sinks; the framework writes to every
+    target before advancing source offsets.
+    """
+
+    connection: Union[Connection, str]
+    table: Optional[tuple[str, str]] = None
+    topic: Optional[str] = None
+    queue: Optional[str] = None
+    partition_key_prefix: Optional[str] = None
+    prefix: Optional[str] = None
+    message_key_column: Optional[str] = None
+    partition_by: Optional[list[str]] = field(default=None)
+
+
 __all__ = [
     "run_pipeline",
     "run_streaming_pipeline",
     "PipelineMetrics",
+    "Target",
 ]
 
 
@@ -122,60 +148,86 @@ def run_streaming_pipeline(
     name: str,
     source: Union[Connection, str],
     source_query: str,
-    target: Union[Connection, str],
-    # Per-target placement specifics. Exactly one of these applies
-    # depending on the target connection's kind:
+    target: Optional[Union[Connection, str]] = None,
+    # Single-target placement (legacy shape; mutually exclusive with
+    # ``targets=``). Exactly one of these applies depending on the
+    # target connection's kind:
     target_table: Optional[tuple[str, str]] = None,
     target_topic: Optional[str] = None,
     target_queue: Optional[str] = None,
     target_partition_key_prefix: Optional[str] = None,
     target_prefix: Optional[str] = None,
-    # Optional knobs:
     target_message_key_column: Optional[str] = None,
     target_partition_by: Optional[list[str]] = None,
+    # Π.4a multi-target: list of typed Target specs. Mutually
+    # exclusive with the single ``target=`` shape above.
+    targets: Optional[list[Target]] = None,
     idle_pause_ms: int = 500,
     dead_letter_topic: Optional[str] = None,
     metrics_port: Optional[int] = None,
 ) -> PipelineMetrics:
     """Run a streaming pipeline driven by typed :class:`Connection` objects.
 
-    ``source`` and ``target`` accept either a :class:`Connection`
-    instance (recommended — no string lookup) or a registry name
-    string (resolved via :func:`get_connection`).
+    ``source`` accepts either a :class:`Connection` instance
+    (recommended — no string lookup) or a registry name string
+    (resolved via :func:`get_connection`).
 
-    Per-target-kind placement args (provide exactly the one matching
-    your target's kind):
+    **Single-target (legacy shape).** Pass ``target=`` plus the
+    placement kwarg matching your target's kind:
 
     - DB targets (Postgres / MySQL / SQLite / DuckDB / Delta\\*):
       ``target_table=(schema, name)``.
     - Kafka target: ``target_topic="..."``; optional
       ``target_message_key_column="user_id"``.
     - RabbitMQ target: ``target_queue="..."``.
-    - Pub/Sub target: ``target_topic="..."`` (bare or fully-qualified).
+    - Pub/Sub target: ``target_topic="..."``.
     - Kinesis target: ``target_partition_key_prefix="..."``.
     - Object store: ``target_prefix="..."``.
-    - Delta\\* targets also accept ``target_partition_by=["year", "month"]``.
+    - Delta\\* targets also accept
+      ``target_partition_by=["year", "month"]``.
 
-    All other arguments mirror :func:`run_pipeline`. The pipeline
-    runs on the same Rust runtime; this entry point just builds the
-    TOML config from the typed connections + per-pipeline params
-    and delegates.
+    **Multi-target (Π.4a).** Pass ``targets=[Target(...), ...]`` to
+    fan one source's batches out to N sinks. Each ``Target`` carries
+    its connection plus the placement field for that sink's kind.
+    The pipeline writes to every target before advancing source
+    offsets — at-least-once across the fan-out.
+
+    The two forms are mutually exclusive; pass one or the other.
     """
-    src_conn = source if isinstance(source, Connection) else get_connection(source)
-    tgt_conn = target if isinstance(target, Connection) else get_connection(target)
+    if target is not None and targets is not None:
+        raise ValueError(
+            "run_streaming_pipeline: pass `target=` or `targets=`, not both"
+        )
+    if target is None and not targets:
+        raise ValueError(
+            "run_streaming_pipeline: a target is required — set `target=` "
+            "(single-target shape) or `targets=[Target(...), ...]` (multi-target)"
+        )
 
-    toml = _build_toml(
+    src_conn = source if isinstance(source, Connection) else get_connection(source)
+
+    if targets is not None:
+        target_specs: list[Target] = list(targets)
+    else:
+        # Legacy shape: collapse the flat kwargs into a single Target.
+        target_specs = [
+            Target(
+                connection=target,  # type: ignore[arg-type]
+                table=target_table,
+                topic=target_topic,
+                queue=target_queue,
+                partition_key_prefix=target_partition_key_prefix,
+                prefix=target_prefix,
+                message_key_column=target_message_key_column,
+                partition_by=target_partition_by,
+            )
+        ]
+
+    toml = _build_toml_multi(
         name=name,
         source=src_conn,
         source_query=source_query,
-        target=tgt_conn,
-        target_table=target_table,
-        target_topic=target_topic,
-        target_queue=target_queue,
-        target_partition_key_prefix=target_partition_key_prefix,
-        target_prefix=target_prefix,
-        target_message_key_column=target_message_key_column,
-        target_partition_by=target_partition_by,
+        targets=target_specs,
         idle_pause_ms=idle_pause_ms,
         dead_letter_topic=dead_letter_topic,
     )
@@ -201,14 +253,53 @@ def _build_toml(
     idle_pause_ms: int,
     dead_letter_topic: Optional[str],
 ) -> str:
-    """Serialize a pipeline shape into the existing TOML config format.
+    """Single-target back-compat shim. Wraps the flat kwargs into a
+    one-element ``[Target(...)]`` and delegates to
+    :func:`_build_toml_multi`."""
+    return _build_toml_multi(
+        name=name,
+        source=source,
+        source_query=source_query,
+        targets=[
+            Target(
+                connection=target,
+                table=target_table,
+                topic=target_topic,
+                queue=target_queue,
+                partition_key_prefix=target_partition_key_prefix,
+                prefix=target_prefix,
+                message_key_column=target_message_key_column,
+                partition_by=target_partition_by,
+            )
+        ],
+        idle_pause_ms=idle_pause_ms,
+        dead_letter_topic=dead_letter_topic,
+    )
 
-    The existing Rust runner consumes TOML; this stays the
-    transport for now. A future commit may add a direct
-    connection-object Rust API and skip the TOML round-trip — that
-    would save ~1ms at startup but is invisible at the per-batch
-    layer.
+
+def _build_toml_multi(
+    *,
+    name: str,
+    source: Connection,
+    source_query: str,
+    targets: list[Target],
+    idle_pause_ms: int,
+    dead_letter_topic: Optional[str],
+) -> str:
+    """Π.4a: serialize a pipeline shape into the TOML config format.
+
+    Single target → emits ``[target]`` + ``[target.table]`` (the
+    legacy compact shape). Two or more targets → emits one
+    ``[[targets]]`` block per spec. The Rust runner accepts both
+    forms (Π.4a-1).
+
+    The TOML round-trip is the transport between the Python facade
+    and the Rust runner. It happens once at pipeline start; per-
+    batch work stays pure Rust.
     """
+    if not targets:
+        raise ValueError("_build_toml_multi: targets must be non-empty")
+
     lines: list[str] = [
         f"pipeline_name = {_q(name)}",
         f"source_query = {_q(source_query)}",
@@ -221,31 +312,71 @@ def _build_toml(
     lines.append("[source]")
     lines.extend(_source_fields(source))
 
-    lines.append("")
-    lines.append("[target]")
-    lines.extend(
-        _target_fields(
-            target,
-            target_table=target_table,
-            target_topic=target_topic,
-            target_queue=target_queue,
-            target_partition_key_prefix=target_partition_key_prefix,
-            target_prefix=target_prefix,
-            target_message_key_column=target_message_key_column,
-            target_partition_by=target_partition_by,
-        )
+    if len(targets) == 1:
+        lines.extend(_emit_single_target_block(targets[0]))
+    else:
+        for spec in targets:
+            lines.extend(_emit_targets_array_entry(spec))
+
+    return "\n".join(lines) + "\n"
+
+
+def _resolve_target_connection(spec: Target) -> Connection:
+    return (
+        spec.connection
+        if isinstance(spec.connection, Connection)
+        else get_connection(spec.connection)
     )
 
-    if target_table is not None:
-        # DB-style targets need [target.table]; emit it after the
-        # main [target] table.
-        schema, table = target_table
+
+def _emit_single_target_block(spec: Target) -> list[str]:
+    """Emit `[target]` (+ `[target.table]` for DB-shaped sinks)."""
+    conn = _resolve_target_connection(spec)
+    lines: list[str] = ["", "[target]"]
+    lines.extend(
+        _target_fields(
+            conn,
+            target_table=spec.table,
+            target_topic=spec.topic,
+            target_queue=spec.queue,
+            target_partition_key_prefix=spec.partition_key_prefix,
+            target_prefix=spec.prefix,
+            target_message_key_column=spec.message_key_column,
+            target_partition_by=spec.partition_by,
+        )
+    )
+    if spec.table is not None:
+        schema, table = spec.table
         lines.append("")
         lines.append("[target.table]")
         lines.append(f"schema = {_q(schema)}")
         lines.append(f"name = {_q(table)}")
+    return lines
 
-    return "\n".join(lines) + "\n"
+
+def _emit_targets_array_entry(spec: Target) -> list[str]:
+    """Emit one `[[targets]]` block for the multi-target shape."""
+    conn = _resolve_target_connection(spec)
+    lines: list[str] = ["", "[[targets]]"]
+    lines.extend(
+        _target_fields(
+            conn,
+            target_table=spec.table,
+            target_topic=spec.topic,
+            target_queue=spec.queue,
+            target_partition_key_prefix=spec.partition_key_prefix,
+            target_prefix=spec.prefix,
+            target_message_key_column=spec.message_key_column,
+            target_partition_by=spec.partition_by,
+        )
+    )
+    if spec.table is not None:
+        schema, table = spec.table
+        lines.append("")
+        lines.append("[targets.table]")
+        lines.append(f"schema = {_q(schema)}")
+        lines.append(f"name = {_q(table)}")
+    return lines
 
 
 def _source_fields(conn: Connection) -> list[str]:
