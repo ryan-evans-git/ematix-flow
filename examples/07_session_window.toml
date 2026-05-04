@@ -1,0 +1,78 @@
+# Per-user session windows on a Kafka topic.
+#
+# Sessions are gap-based: each user_id's events bucket into
+# variable-length sessions separated by `gap_ms` of inactivity.
+# `max_session_duration_ms` is a hard ceiling — the cap fires
+# even under `late_data = "reopen"` retention.
+#
+# State is persisted to Postgres via the `[state_store]` block.
+# Each emit commits state + Kafka offsets in one transaction; on
+# restart the pipeline calls `StateStore::load`, rehydrates the
+# per-key session map, and `seek_to`s each Kafka source so the
+# next read resumes from the committed offset.
+#
+# Requires:
+#   - Local Kafka with the `events` topic (JSON: user_id, page,
+#     _event_ts).
+#   - Local Postgres for the warehouse + state store. Same DB or
+#     separate — they don't have to be on the same instance.
+#
+# Run:
+#   flow consume examples/07_session_window.toml --metrics-port 9100
+
+pipeline_name = "user-sessions"
+source_query  = "events"
+idle_pause_ms = 500
+
+[source]
+kind              = "kafka"
+bootstrap_servers = "localhost:9092"
+group_id          = "ematix-flow"
+
+[target]
+kind = "postgres"
+url  = "postgres://postgres:postgres@localhost/postgres"
+
+# Idempotent target: the framework MERGEs by
+# (group_keys..., session_id) so re-emitted sessions absorb
+# duplicates without double-counting.
+[target.table]
+schema = "public"
+name   = "user_sessions"
+
+[transform]
+sql = """
+    SELECT
+        user_id,
+        page,
+        arrow_cast(_event_ts, 'Timestamp(Microsecond, None)') AS _event_ts
+    FROM source
+"""
+
+[transform.window]
+kind                       = "session"
+gap_ms                     = 300000        # 5-min idle = session boundary
+max_session_duration_ms    = 86400000      # 24h hard cap (mandatory)
+group_by                   = ["user_id"]   # required non-empty
+max_groups_per_window      = 1000000
+late_data                  = "drop"
+
+[[transform.window.aggregations]]
+agg = "count"
+as  = "events"
+
+[[transform.window.aggregations]]
+agg    = "first"
+column = "page"
+as     = "entry_page"
+
+[[transform.window.aggregations]]
+agg    = "last"
+column = "page"
+as     = "exit_page"
+
+[state_store]
+kind                    = "postgres"
+url                     = "postgres://postgres:postgres@localhost/postgres"
+schema                  = "public"
+checkpoint_interval_ms  = 60000        # 60s dirty-only floor (parsed; ticker is P1.8)

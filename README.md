@@ -4,33 +4,58 @@
 > pipelines — Rust core, Python API. Multi-backend (Postgres, MySQL,
 > SQLite, DuckDB, Object Stores, Delta Lake) with streaming sources
 > (Kafka, RabbitMQ, GCP Pub/Sub, AWS Kinesis), Schema-Registry-aware
-> Avro/Protobuf, manual-ack at-least-once, and a `flow consume` CLI
-> with Prometheus metrics + supervised restart.
+> Avro/Protobuf, manual-ack at-least-once, mid-stream SQL transforms
+> + tumbling/hopping/session windows + keyed time-windowed
+> stream-stream joins backed by a Postgres-durable state store, and
+> a `flow consume` CLI with Prometheus metrics + supervised restart.
 
-**Status: alpha.** Core scope shipped through Phase 38; on PyPI as
-`ematix-flow` once wheel-build CI tasks land. ~296 Rust core unit
-tests + 23 CLI unit tests + ~30 Docker integration tests across all
-backends, plus the original Python test suite. clippy + fmt clean
-on stable Rust.
+**Status: alpha.** Core scope shipped through Phase 39.5b. On PyPI as
+`ematix-flow` once wheel-build CI tasks land (see [`docs/ROADMAP.md`](docs/ROADMAP.md)
+for what's left).
+
+**Tests** (workspace-wide):
+- 459 Rust core lib unit tests
+- 108 Rust CLI lib unit tests
+- ~80 Rust testcontainers integration tests (`--ignored`; opt-in Docker)
+- 376 default Python tests + ~196 testcontainers-gated Python tests
+
+clippy + fmt clean on stable Rust.
 
 ## What it is
 
-Two complementary surfaces in one repo:
+Three complementary surfaces in one repo:
 
 1. **Declarative table management for Postgres** (the original v0.1
    scope). Decorator-driven schemas, normalization markers, SCD2 with
    event-time, run history, watermarks, post-load transforms, polars/
    pandas/pyspark interop, ML feature store. **Stable.**
 
-2. **Multi-backend streaming pipelines** (Phases 30-38, post-v0.1).
+2. **Multi-backend streaming pipelines** (Phases 30–38, post-v0.1).
    Source from any of 4 streaming backends, write to any of 6
    storage backends, with manual offset commits, dead-letter
    patterns, Confluent Schema Registry support, and a long-running
-   `flow consume` daemon binary. **Recently shipped.**
+   `flow consume` daemon binary. **Stable.**
 
-Both share a common Rust core that does Arrow record-batch IO under
-the hood; bridging from streaming to a target table is an Arrow path
-end-to-end.
+3. **Stream processing** (Phase 39). DataFusion-backed mid-stream SQL
+   transforms (filter / project / cast / lookup-join), tumbling /
+   hopping / session windows with watermark-driven emit + late-data
+   handling, keyed time-windowed stream-stream inner joins backed by
+   a durable Postgres `StateStore` for crash-recoverable state +
+   atomic offset commits. **Recently shipped.**
+
+All three share a common Rust core that does Arrow record-batch IO
+under the hood; bridging from streaming to a target table is an Arrow
+path end-to-end.
+
+→ For a step-by-step walkthrough of every surface, see
+**[`docs/USER_GUIDE.md`](docs/USER_GUIDE.md)**.
+
+→ For runnable examples (one per strategy + streaming + windowed +
+session + join), see **[`examples/`](examples/)**.
+
+→ For what's left to ship, see **[`docs/ROADMAP.md`](docs/ROADMAP.md)**.
+
+→ For cutting a release, see **[`docs/RELEASE.md`](docs/RELEASE.md)**.
 
 ## Quickstart 1: declarative Postgres pipeline (v0.1)
 
@@ -116,6 +141,77 @@ priority first):
 TOML values support `${VAR}` env-var interpolation, so secrets can stay
 out of files. Inspect what got picked with `flow connections list` /
 `flow connections check warehouse`.
+
+### Declaring connections in code (decorator)
+
+Beyond env vars and TOML files, connections can also live in your
+Python module — useful when you want the pipeline definition and its
+DB handle in the same file, or when you want IDE autocomplete on
+connection fields. Two interchangeable shapes:
+
+```python
+from ematix_flow import (
+    ematix,                     # the decorator namespace
+    PostgresConnection,
+    KafkaConnection,
+    SchemaRegistryConnection,
+    register_connection,
+)
+
+# 1. Decorator form — class body declares the fields, the decorator
+#    builds + registers a typed connection instance under the class
+#    name. Module-level `warehouse` is now a PostgresConnection
+#    instance, registered as "warehouse" in the runtime registry.
+@ematix.connection
+class warehouse:
+    kind = "postgres"
+    url = "${WAREHOUSE_DSN}"     # ${VAR} interpolates at use time
+
+@ematix.connection
+class kafka_prod:
+    kind = "kafka"
+    bootstrap_servers = "${KAFKA_BOOTSTRAP}"
+    group_id = "ematix-flow"
+    sasl_plain_username = "${KAFKA_USER}"
+    sasl_plain_password = "${KAFKA_PASS}"
+
+@ematix.connection
+class sr_prod:
+    kind = "schema_registry"
+    url = "${SR_URL}"
+
+# 2. Instance form — same effect; useful when the connection has to
+#    be built dynamically (e.g. from an environment-driven dict).
+warehouse_2 = register_connection(
+    PostgresConnection(name="warehouse_2", url="postgres://localhost/wh"),
+)
+
+# Pass the instance directly to a pipeline:
+@ematix.pipeline(
+    target=CustomerDim,
+    schedule="0 * * * *",
+    mode="scd2",
+    target_connection="warehouse",   # name reference; resolves through registry
+)
+def sync_customers(conn):
+    return "SELECT customer_id, email, name, updated_at FROM raw.customers"
+```
+
+Credentials redact in `repr()` by field-name match (`password`,
+`secret`, `secret_access_key`, anything containing `_password`, AMQP
+URL passwords, etc.) — printing a connection in a notebook won't
+spill secrets. The same `@ematix.connection` shape supports every
+typed connection: `KafkaConnection`, `RabbitMQConnection`,
+`PubSubConnection`, `KinesisConnection`, `SchemaRegistryConnection`,
+`PostgresConnection`, `MySQLConnection`, `SQLiteConnection`,
+`DuckDBConnection`, `DeltaLocalConnection`, `DeltaS3Connection`,
+`ObjectStoreLocalConnection`, `ObjectStoreS3Connection`.
+
+> **Schema Registry as a connection** (Π.1). `KafkaConnection` accepts
+> either an inline `schema_registry_url="..."` shorthand or a
+> `schema_registry=sr_prod` reference (instance or registered name)
+> for Avro/Protobuf pipelines, so SR config lives in the same
+> credential-redacting registry as everything else.
 
 ### Two function signatures
 
@@ -228,6 +324,204 @@ cargo run --release --bin flow -- consume pipeline.toml \
     --max-backoff-ms 30000
 ```
 
+### Or skip the TOML entirely (Π.3 typed-Python form)
+
+`@ematix.streaming_pipeline` declares the pipeline alongside its
+connections, then `flow consume --module my_pipelines events_to_pg`
+loads the module, looks the pipeline up by name, and runs it. No
+TOML round-trip in user code:
+
+```python
+# my_pipelines.py
+from ematix_flow import ematix
+
+@ematix.connection
+class kafka_prod:
+    kind = "kafka"
+    bootstrap_servers = "${KAFKA_BOOTSTRAP}"
+    group_id = "ematix-flow"
+
+@ematix.connection
+class warehouse:
+    kind = "postgres"
+    url = "${WAREHOUSE_DSN}"
+
+@ematix.streaming_pipeline(
+    name="events_to_pg",
+    source=kafka_prod,
+    source_query="events",
+    target=warehouse,
+    target_table=("public", "events"),
+)
+def events_to_pg():
+    pass
+```
+
+```sh
+flow consume      --module my_pipelines events_to_pg --metrics-port 9100
+flow consume-list --module my_pipelines
+```
+
+The framework renders the equivalent TOML internally and hands it to
+the same Rust runtime the TOML form uses — same at-least-once
+guarantees, same Prometheus metrics, same `--restart-on-error`.
+
+## Quickstart 3: stream processing (windows + sessions + joins)
+
+Phase 39 layers stateful transforms onto the streaming pipeline. The
+canonical shapes:
+
+**Tumbling window aggregation** (count events per user per minute):
+
+```python
+from ematix_flow import (
+    Aggregation, Window, run_streaming_pipeline,
+    KafkaConnection, PostgresConnection,
+)
+
+run_streaming_pipeline(
+    name="events-per-min",
+    source=KafkaConnection(name="src", bootstrap_servers="localhost:9092",
+                           group_id="ematix-flow"),
+    source_query="events",
+    target=PostgresConnection(name="warehouse", url="postgres://localhost/wh"),
+    target_table=("public", "events_per_min"),
+    transform_sql="SELECT user_id, _event_ts FROM source",
+    window=Window(
+        kind="tumbling",
+        duration_ms=60_000,
+        group_by=("user_id",),
+        max_groups_per_window=1_000_000,
+        aggregations=[Aggregation(agg="count", as_="n")],
+    ),
+)
+```
+
+**Session window** (per-user activity sessions, 5-minute idle gap):
+
+```python
+from ematix_flow import StateStore  # new in 39.5a
+
+run_streaming_pipeline(
+    name="user-sessions",
+    source=KafkaConnection(name="src", bootstrap_servers="localhost:9092",
+                           group_id="ematix-flow"),
+    source_query="events",
+    target=PostgresConnection(name="warehouse", url="postgres://localhost/wh"),
+    target_table=("public", "user_sessions"),
+    transform_sql="SELECT user_id, page, _event_ts FROM source",
+    window=Window(
+        kind="session",
+        gap_ms=300_000,                   # 5 min idle = session boundary
+        max_session_duration_ms=86_400_000,  # 24h hard cap
+        group_by=("user_id",),
+        max_groups_per_window=1_000_000,
+        aggregations=[
+            Aggregation(agg="count", as_="events"),
+            Aggregation(agg="first", column="page", as_="entry_page"),
+            Aggregation(agg="last", column="page", as_="exit_page"),
+        ],
+    ),
+    # State persistence is mandatory for sessions — Postgres-backed
+    # `StateStore` handles atomic per-emit state + Kafka offsets
+    # commits. Restart-safe out of the box.
+    state_store=StateStore(
+        kind="postgres",
+        url="postgres://localhost/ematix_state",
+    ),
+)
+```
+
+**Stream-stream join** (orders + payments within a 5-minute window).
+Driven from typed Python via `sources=[Source(...)]`:
+
+```python
+from ematix_flow import Join, Source
+
+run_streaming_pipeline(
+    name="orders-payments",
+    sources=[
+        Source(connection=KafkaConnection(name="orders_k",   bootstrap_servers="localhost:9092", group_id="ematix-flow"),
+               query="orders"),
+        Source(connection=KafkaConnection(name="payments_k", bootstrap_servers="localhost:9092", group_id="ematix-flow"),
+               query="payments"),
+    ],
+    target=PostgresConnection(name="warehouse", url="postgres://localhost/wh"),
+    target_table=("public", "orders_with_payments"),
+    join=Join(
+        left_source="orders",
+        right_source="payments",
+        left_keys=("order_id",),
+        right_keys=("order_id",),
+        time_window_ms=300_000,                # ±5 min symmetric window
+    ),
+    state_store=StateStore(kind="postgres", url="postgres://localhost/ematix_state"),
+)
+```
+
+LEFT / RIGHT / FULL outer joins (`Join(... kind="left_outer")`),
+`late_data="reopen"` for retained-buffer late-row matching, and
+asymmetric time windows (`min_delta_ms` / `max_delta_ms`) all work
+through the same shape.
+
+### Advanced knobs (Π.1)
+
+Every advanced streaming knob is now drivable from typed Python — no
+TOML required:
+
+```python
+from ematix_flow import Watermark
+
+run_streaming_pipeline(
+    name="events-clean",
+    source=kafka_prod, source_query="events",
+    target=warehouse, target_table=("public", "events"),
+    transform_sql="SELECT user_id, payload, _event_ts FROM source",
+    # Π.1: per-batch error policy. "fail" (default) | "drop" | "dlq".
+    transform_on_error="dlq",
+    dead_letter_topic="events-failed",
+    # Π.1: tune per-source watermark slack + idleness without TOML.
+    watermark=Watermark(lateness_ms=5_000, source_idleness_ms=120_000),
+)
+```
+
+### Object-store target with compression (Π.1.4)
+
+```python
+from ematix_flow import ObjectStoreS3Connection, Target
+
+lake = ObjectStoreS3Connection(
+    name="lake",
+    endpoint="https://s3.amazonaws.com",
+    bucket="ematix-archive",
+    region="us-east-1",
+    access_key_id="${AWS_ACCESS_KEY_ID}",
+    secret_access_key="${AWS_SECRET_ACCESS_KEY}",
+    format="parquet",
+)
+
+run_streaming_pipeline(
+    name="events_archive",
+    source=kafka_prod, source_query="events",
+    targets=[
+        Target(
+            connection=lake,
+            prefix="events/raw",
+            parquet_compression="zstd",   # or "snappy" / "gzip" / "uncompressed"
+        ),
+    ],
+)
+```
+
+CSV targets accept `csv_delimiter=";"` and `csv_header=False`. The
+typed-Python boundary catches misconfigurations early (e.g. setting
+`parquet_compression` on a CSV target raises before TOML round-trip).
+
+Full walkthroughs for each shape (windows, sessions, joins) —
+including late-data semantics, recovery behavior on restart, and
+the Prometheus metrics emitted — live in
+[`docs/USER_GUIDE.md`](docs/USER_GUIDE.md).
+
 ## Backend matrix
 
 | Backend | Source | Target | DDL planning | Strategy executors (append/merge/scd2/truncate) |
@@ -314,7 +608,7 @@ The same pattern works for `RabbitMQBackend`, `PubSubBackend`,
 - **Connections**: env vars (`EMATIX_FLOW_DSN_<NAME>`) +
   `~/.ematix-flow/connections.toml`.
 
-### Post-v0.1 (multi-backend + streaming) — recently shipped
+### Post-v0.1 (multi-backend + streaming) — stable
 - **DB backends** (Phases 31-33): MySQL, SQLite, DuckDB — same
   strategy executor surface as Postgres; cross-DB Arrow streaming
   bridge between any pair.
@@ -331,6 +625,63 @@ The same pattern works for `RabbitMQBackend`, `PubSubBackend`,
   in-process runner; pyclass wrappers for each streaming backend
   with PyArrow record-batch IO; sync iterator
   (`ArrowBatchIter`) for lazy batch consumption.
+
+### Stream processing (Phase 39) — recently shipped
+- **SQL transforms** (39.1–39.3): mid-stream `SELECT` via
+  DataFusion. Filter / project / cast / lookup-join. Static lookups
+  loaded from any DB backend at startup; `refresh_interval_ms` per
+  lookup runs a background refresh task with atomic `MemTable` swap.
+- **Tumbling + hopping windows** (39.4): 9 aggregators including
+  HLL+ approximate `count_distinct`. `late_data = "drop"` and
+  `"reopen"` (with `allowed_lateness_ms` retention + re-emit on
+  dirty). Idle-tick emission. Per-window `max_groups_per_window`
+  fail-loud cap. Multi-source `min`-with-idleness watermark.
+- **Session windows + durable `StateStore`** (39.5a): gap-based
+  per-key sessions with mandatory `max_session_duration_ms` hard
+  cap; out-of-order session merging under `Reopen`; Postgres- or
+  in-memory-backed `StateStore` with postcard wire format and
+  forward-only state-version migrations; per-emit atomic
+  state+offsets commit; `seek_to` on Kafka source for crash-safe
+  resume. Each pipeline rehydrates per-key session state on startup
+  via `StateStore::load`.
+- **Stream-stream join** (39.5b): keyed time-windowed inner join.
+  Two `[[sources]]` (left + right) with per-side per-key buffers
+  and watermark-driven retention; emit on every match within
+  `time_window_ms`. Reuses the 39.5a `StateStore` (side-prefixed
+  keys, postcard `BufferedRow` blobs). Per-source `BatchContext::source_id`
+  routes batches to the correct side.
+
+### Recent additions (Π.1 / Π.3 / Π.1.4)
+
+- **`SchemaRegistryConnection`** (Π.1): SR config lives in the
+  typed-connection registry, redacted in `repr()`, resolvable by
+  name. `KafkaConnection.schema_registry=sr_prod` for typed
+  reference; the legacy inline `schema_registry_url=...` shorthand
+  still works.
+- **Kafka SR + `payload_format` plumbed through the streaming TOML
+  emitter**: the Avro / Protobuf path is now usable end-to-end via
+  `run_streaming_pipeline` and `@ematix.streaming_pipeline` (was
+  silently dropped before).
+- **`flow consume --module my_pipelines <name>`** (Π.3): load
+  streaming pipelines from a Python module instead of TOML; the
+  `@ematix.streaming_pipeline` decorator registers by name; the
+  CLI imports the module, renders the equivalent TOML internally,
+  and hands off to the same Rust runner. `flow consume-list
+  --module my_pipelines` lists registered pipelines.
+- **`Watermark(lateness_ms=, source_idleness_ms=)`** (Π.1): tune
+  watermark slack + per-source idleness from the typed-Python
+  surface (was hardcoded to defaults). Maps to a `[watermark]`
+  TOML block on the runner side.
+- **`transform_on_error = "fail" | "drop" | "dlq"`** (Π.1):
+  per-batch error policy on `run_streaming_pipeline` /
+  `@ematix.streaming_pipeline` (DLQ reuses the existing
+  `dead_letter_topic` plumbing).
+- **Object-store per-format write options** (Π.1.4): Parquet
+  compression (`uncompressed | snappy | gzip | zstd`), CSV
+  delimiter, CSV header on `Target` — picks up production-grade
+  compression without leaving Python. The typed-Python boundary
+  rejects mis-shaped combos (e.g. `parquet_compression` on a CSV
+  target) before TOML round-trip.
 
 ## Install
 
@@ -382,30 +733,45 @@ pytest -m spark                           # opt-in Spark E2E
 
 ## Roadmap
 
-The original v0.1 scope (Phases 0–14) and a substantial post-v0.1
-extension set (Phases 15–38, plus Python bindings catch-up Py.1-.6)
-are all shipped. See [`docs/IMPLEMENTATION_PLAN.md`](docs/IMPLEMENTATION_PLAN.md)
-for the original phase log and the design docs:
+Phases 0–14 (v0.1), 15–38 (multi-backend + streaming), Py.1–Py.6
+(Python streaming bindings), and 39.1–39.5b (SQL transforms,
+windows, sessions, stream-stream join) are all shipped.
+
+See **[`docs/ROADMAP.md`](docs/ROADMAP.md)** for the consolidated
+"what's left" punch list (release polish, deferred-feature
+extensions, open design questions).
+
+Phase plans:
 
 - **[`docs/PRD.md`](docs/PRD.md)** — original v0.1 product spec
+- **[`docs/IMPLEMENTATION_PLAN.md`](docs/IMPLEMENTATION_PLAN.md)** —
+  Phases 0–14 phase log
 - **[`docs/MULTI_BACKEND_PLAN.md`](docs/MULTI_BACKEND_PLAN.md)** —
-  Phases 30-37 (multi-DB + streaming)
+  Phases 30–38 (multi-DB + streaming + CLI)
 - **[`docs/ERGONOMICS_PLAN.md`](docs/ERGONOMICS_PLAN.md)** — decorator
-  API design
+  API design (Phases 21–25)
 - **[`docs/NORMALIZATION_TRANSFORMS_PLAN.md`](docs/NORMALIZATION_TRANSFORMS_PLAN.md)**
   — Phases 26–28
 - **[`docs/ML_FEATURE_STORE_PLAN.md`](docs/ML_FEATURE_STORE_PLAN.md)** —
   Phases 15–20
-
-Future-phase / deferred design docs (capture both the design and the
-"why we haven't built it"):
-
 - **[`docs/SQL_TRANSFORMS_PLAN.md`](docs/SQL_TRANSFORMS_PLAN.md)** —
-  Phase 39, DataFusion-backed mid-stream SQL transforms. Designed but
-  unbuilt; awaiting a concrete user need.
+  Phase 39 stream-processing umbrella
+- **[`docs/PHASE_39_4_WINDOWS.md`](docs/PHASE_39_4_WINDOWS.md)** —
+  tumbling + hopping windows
+- **[`docs/PHASE_39_5_SESSIONS.md`](docs/PHASE_39_5_SESSIONS.md)** —
+  session windows + `StateStore` foundation
+- **[`docs/PHASE_39_5B_JOINS.md`](docs/PHASE_39_5B_JOINS.md)** —
+  keyed time-windowed stream-stream join
+
+Deferred design docs (capture both the design and the "why we
+haven't built it"):
+
+- **[`docs/UNIFIED_PIPELINE_API.md`](docs/UNIFIED_PIPELINE_API.md)** —
+  consolidating the v0.1 decorator and streaming TOML onto one
+  declaration surface. Design only.
 - **[`docs/ICEBERG_PLAN.md`](docs/ICEBERG_PLAN.md)** — Iceberg
-  backend. Deferred because `iceberg` 0.x still pins arrow 57 vs our
-  arrow 58. Delta covers the use case today.
+  backend. Deferred because `iceberg-rust` 0.x still pins arrow 57
+  vs our arrow 58. Delta covers the use case today.
 
 ## License
 

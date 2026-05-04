@@ -28,6 +28,9 @@ env/
 # Maturin
 wheels/
 
+# mkdocs build output (deployed by .github/workflows/docs.yml)
+/site/
+
 # IDE / editor
 .idea/
 .vscode/

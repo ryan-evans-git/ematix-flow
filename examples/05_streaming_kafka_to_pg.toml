@@ -1,0 +1,39 @@
+# Streaming pipeline: Kafka topic -> Postgres table.
+#
+# Drains the `events` Kafka topic in batches, writing each batch
+# into `public.events`. At-least-once semantics: source offsets
+# advance only after the target write lands.
+#
+# Run:
+#   flow consume examples/05_streaming_kafka_to_pg.toml \
+#       --metrics-port 9100 \
+#       --restart-on-error
+#
+# Or from Python:
+#   from ematix_flow import run_pipeline
+#   run_pipeline(config="examples/05_streaming_kafka_to_pg.toml",
+#                metrics_port=9100)
+
+pipeline_name = "events-to-pg"
+source_query  = "events"
+idle_pause_ms = 500
+
+[source]
+kind              = "kafka"
+bootstrap_servers = "localhost:9092"
+group_id          = "ematix-flow"
+# payload_format = "json"            # default; "avro" / "protobuf" supported
+# schema_registry_url = "http://localhost:8081"
+
+[target]
+kind = "postgres"
+url  = "postgres://postgres:postgres@localhost/postgres"
+
+[target.table]
+schema = "public"
+name   = "events"
+
+# Optional dead-letter topic — failed batch rows go here as
+# raw bytes. Source offsets only advance after the DLQ write
+# acks (when this fires) or the target write acks (normal).
+# dead_letter_topic = "events-failed"

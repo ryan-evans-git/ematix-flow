@@ -1,0 +1,87 @@
+site_name: ematix-flow
+site_description: >
+  Declarative table management, load strategies, and streaming
+  pipelines — Rust core, Python API.
+site_url: https://ryan-evans-git.github.io/ematix-flow/
+repo_url: https://github.com/ryan-evans-git/ematix-flow
+repo_name: ryan-evans-git/ematix-flow
+edit_uri: edit/main/docs/
+
+# `docs_dir` matches the existing on-disk layout. The README at the
+# repo root becomes the site index via the `extra-files` plugin
+# below; everything under docs/ is served at /<basename>/.
+docs_dir: docs
+
+theme:
+  name: material
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - navigation.indexes
+    - navigation.top
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+    - content.action.edit
+
+markdown_extensions:
+  - admonition
+  - pymdownx.details
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - pymdownx.tasklist:
+      custom_checkbox: true
+  - tables
+  - toc:
+      permalink: true
+
+plugins:
+  - search
+  # `include-readme`-style plugin would let the repo README serve
+  # as the index. Skipped on first cut to keep the plugin set
+  # small; an `index.md` shim under docs/ does the same job.
+
+nav:
+  - Home: index.md
+  - User guide: USER_GUIDE.md
+  - Roadmap: ROADMAP.md
+  - Cutting a release: RELEASE.md
+
+  - Reference designs:
+    - PRD (v0.1): PRD.md
+    - Implementation plan: IMPLEMENTATION_PLAN.md
+    - Multi-backend: MULTI_BACKEND_PLAN.md
+    - Ergonomics (decorator API): ERGONOMICS_PLAN.md
+    - ML feature store: ML_FEATURE_STORE_PLAN.md
+    - Normalization + transforms: NORMALIZATION_TRANSFORMS_PLAN.md
+
+  - Phase 39 — stream processing:
+    - SQL transforms umbrella: SQL_TRANSFORMS_PLAN.md
+    - Tumbling + hopping windows: PHASE_39_4_WINDOWS.md
+    - Session windows + StateStore: PHASE_39_5_SESSIONS.md
+    - Stream-stream join: PHASE_39_5B_JOINS.md
+
+  - Future / deferred:
+    - Unified pipeline API: UNIFIED_PIPELINE_API.md
+    - Iceberg backend: ICEBERG_PLAN.md
+    - CI/CD plan: CICD_PLAN.md

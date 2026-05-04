@@ -721,6 +721,29 @@ impl Backend for PubSubBackend {
         }
         Ok(())
     }
+
+    /// Phase 39.5a P1.7a: Pub/Sub uses broker-tracked offsets via
+    /// the per-message ack stream. There's no client-side offset to
+    /// stash — the subscription's ack horizon is the source of
+    /// truth. Reporting `true` lets stateful (session/join)
+    /// pipelines accept Pub/Sub as a source; `seek_to` is a no-op
+    /// because the broker already knows where we are.
+    fn supports_seek_to(&self) -> bool {
+        true
+    }
+
+    async fn seek_to(&self, _offset_bytes: &[u8]) -> Result<(), BackendError> {
+        // No-op. Subscription `seek` exists in the Pub/Sub API but
+        // is destructive (rewinds the ack horizon for every
+        // consumer of the subscription); we never call it. On
+        // restart unacked messages re-deliver automatically.
+        Ok(())
+    }
+
+    // `offset_snapshot()` keeps the trait default `Ok(None)` —
+    // there's nothing client-side to commit to the StateStore.
+    // The subscription's broker-tracked ack horizon advances when
+    // `commit_offsets()` fires.
 }
 
 /// Best-effort parse of a Pub/Sub endpoint URL into the

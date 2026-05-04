@@ -1,0 +1,205 @@
+name: release
+
+# Triggers:
+#   - `v*` git tags push to PyPI (production release).
+#   - `workflow_dispatch` manually (test wheel build without
+#     publishing — useful for verifying a matrix change before
+#     cutting a tag).
+#
+# PyPI trusted-publishing setup (required, one-time):
+# https://docs.pypi.org/trusted-publishers/
+#   1. On https://pypi.org/manage/project/ematix-flow/settings/publishing/
+#      add a pending publisher: Owner = ryan-evans-git, Repo = ematix-flow,
+#      Workflow = release.yml, Environment = pypi.
+#   2. After the first publish from this workflow, the trusted-publisher
+#      record becomes permanent.
+#
+# Wheel-build philosophy:
+#   - One wheel per (OS, arch, Python). Linux uses the manylinux2014
+#     container so wheels run on every glibc-2.17+ system.
+#   - macOS builds two arches: aarch64 (Apple Silicon) and x86_64
+#     (Intel). One wheel per arch — universal2 wheels are skipped
+#     because the maturin pyarrow ABI link blows up on universal2.
+#   - Windows: NOT BUILT. Per the PRD this is intentional — librdkafka
+#     + the deltalake stack don't support Windows in the workspace's
+#     pinned versions. Add a Windows job here when those land.
+#   - Source distribution (sdist) is built once on Linux and includes
+#     the full Rust workspace so `pip install --no-binary` works.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-linux:
+    name: linux-x86_64 wheels (py${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Build wheel (manylinux2014)
+        uses: PyO3/maturin-action@v1
+        with:
+          # `manylinux: auto` resolves to manylinux2014 for x86_64 ≥
+          # py3.10. Matches our `requires-python = ">=3.10"`.
+          target: x86_64-unknown-linux-gnu
+          manylinux: auto
+          # `--release` matches the prod profile (`lto = "thin"`,
+          # `codegen-units = 1` per workspace Cargo.toml).
+          # `--strip` is implied by [tool.maturin] strip = true.
+          args: --release --interpreter python${{ matrix.python }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-linux-x86_64-py${{ matrix.python }}
+          path: target/wheels/*.whl
+          if-no-files-found: error
+
+  build-macos:
+    name: macos-${{ matrix.arch }} wheels (py${{ matrix.python }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Apple Silicon: native build on arm64 runner — fastest +
+          # avoids cross-link headaches with librdkafka's cmake
+          # build.
+          - arch: aarch64
+            runner: macos-14
+            target: aarch64-apple-darwin
+            python: "3.10"
+          - arch: aarch64
+            runner: macos-14
+            target: aarch64-apple-darwin
+            python: "3.11"
+          - arch: aarch64
+            runner: macos-14
+            target: aarch64-apple-darwin
+            python: "3.12"
+          - arch: aarch64
+            runner: macos-14
+            target: aarch64-apple-darwin
+            python: "3.13"
+          # Intel: build on Intel runner. (Cross-compiling x86_64 ->
+          # arm64 is reasonable; the reverse is not for our deps.)
+          - arch: x86_64
+            runner: macos-13
+            target: x86_64-apple-darwin
+            python: "3.10"
+          - arch: x86_64
+            runner: macos-13
+            target: x86_64-apple-darwin
+            python: "3.11"
+          - arch: x86_64
+            runner: macos-13
+            target: x86_64-apple-darwin
+            python: "3.12"
+          - arch: x86_64
+            runner: macos-13
+            target: x86_64-apple-darwin
+            python: "3.13"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          args: --release --interpreter python${{ matrix.python }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-macos-${{ matrix.arch }}-py${{ matrix.python }}
+          path: target/wheels/*.whl
+          if-no-files-found: error
+
+  build-sdist:
+    name: source distribution
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build sdist
+        uses: PyO3/maturin-action@v1
+        with:
+          # `--out target/wheels` lands the .tar.gz next to the
+          # wheels for the same upload-artifact path glob.
+          command: sdist
+          args: --out target/wheels
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: target/wheels/*.tar.gz
+          if-no-files-found: error
+
+  publish:
+    name: publish to PyPI
+    # Publish only when the workflow was triggered by a tag push; a
+    # manual workflow_dispatch run still builds + uploads artifacts
+    # to the run summary so you can verify before tagging.
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build-linux, build-macos, build-sdist]
+    runs-on: ubuntu-latest
+
+    # The `pypi` environment ties this job to the trusted-publisher
+    # record on PyPI. A second environment (`testpypi`) for dry-runs
+    # is sketched in the README but not wired here yet.
+    environment:
+      name: pypi
+      url: https://pypi.org/p/ematix-flow
+
+    permissions:
+      # Mandatory for trusted publishing — `pypa/gh-action-pypi-publish`
+      # mints a short-lived token from this OIDC claim.
+      id-token: write
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          # No `name:` filter — pull every wheel + sdist.
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -la dist/
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          # `packages-dir` defaults to `dist/` which matches our
+          # `download-artifact` path. Skipping `repository-url`
+          # publishes to https://pypi.org by default.
+          skip-existing: true

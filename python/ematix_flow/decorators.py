@@ -1481,6 +1481,108 @@ class _EmatixNamespace:
         return decorate
 
     @staticmethod
+    def streaming_pipeline(
+        *,
+        name: str,
+        source: Any = None,
+        source_query: str | None = None,
+        sources: list[Any] | None = None,
+        target: Any = None,
+        target_table: tuple[str, str] | None = None,
+        target_topic: str | None = None,
+        target_queue: str | None = None,
+        target_partition_key_prefix: str | None = None,
+        target_prefix: str | None = None,
+        target_message_key_column: str | None = None,
+        target_partition_by: list[str] | None = None,
+        targets: list[Any] | None = None,
+        idle_pause_ms: int = 500,
+        dead_letter_topic: str | None = None,
+        transform_sql: str | None = None,
+        lookups: dict[str, Any] | None = None,
+        window: Any = None,
+        join: Any = None,
+        state_store: Any = None,
+        transform_on_error: str | None = None,
+        watermark: Any = None,
+        metrics_port: int | None = None,
+    ):
+        """Phase 39 / Π.4b: function decorator that wires a streaming
+        pipeline declaratively.
+
+        The decorator captures every kwarg at definition time and
+        registers the pipeline by ``name``; calling the decorated
+        function (with no arguments) runs the pipeline by delegating
+        to :func:`ematix_flow.streaming.run_streaming_pipeline`. The
+        decorated function's body is currently unused (reserved for
+        future hooks like Python-side pre/post callbacks). It must
+        accept zero arguments.
+
+        Mirrors the kwargs of ``run_streaming_pipeline`` exactly:
+        same source / target / multi-target / transform / lookup
+        surface. See :class:`ematix_flow.streaming.Lookup` for the
+        ``lookups=`` shape (Phase 39.2/39.3).
+
+        Returns the decorated function unchanged in arity (still
+        zero-arg) but with its call routed through the runner. The
+        runner's metrics dict is the function's return value, so
+        ``my_pipeline()`` is shorthand for
+        ``run_streaming_pipeline(...)`` with the captured kwargs.
+        """
+        captured = {
+            "name": name,
+            "source": source,
+            "source_query": source_query,
+            "sources": sources,
+            "target": target,
+            "target_table": target_table,
+            "target_topic": target_topic,
+            "target_queue": target_queue,
+            "target_partition_key_prefix": target_partition_key_prefix,
+            "target_prefix": target_prefix,
+            "target_message_key_column": target_message_key_column,
+            "target_partition_by": target_partition_by,
+            "targets": targets,
+            "idle_pause_ms": idle_pause_ms,
+            "dead_letter_topic": dead_letter_topic,
+            "transform_sql": transform_sql,
+            "lookups": lookups,
+            "window": window,
+            "join": join,
+            "state_store": state_store,
+            "transform_on_error": transform_on_error,
+            "watermark": watermark,
+            "metrics_port": metrics_port,
+        }
+
+        def decorate(fn: Callable[..., Any]):
+            arity = _signature_arity(fn)
+            if arity != 0:
+                raise TypeError(
+                    f"@ematix.streaming_pipeline-decorated function must take 0 "
+                    f"arguments; {fn.__name__} takes {arity}"
+                )
+
+            @functools.wraps(fn)
+            def wrapped() -> Any:
+                from ematix_flow.streaming import run_streaming_pipeline
+
+                # Hand off — the decorator is purely ergonomic.
+                return run_streaming_pipeline(**captured)
+
+            wrapped.__ematix_streaming_pipeline__ = captured  # type: ignore[attr-defined]
+
+            # Π.3: register by name so `flow consume --module M name`
+            # can look the pipeline up after importing the user's
+            # module.
+            from ematix_flow.streaming import register_streaming_pipeline
+
+            register_streaming_pipeline(name, captured)
+            return wrapped
+
+        return decorate
+
+    @staticmethod
     def connection(cls: type) -> Any:
         """Π.1: register a typed streaming connection from a declarative class.
 

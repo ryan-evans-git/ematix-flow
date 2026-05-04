@@ -3975,6 +3975,693 @@ async fn kafka_read_arrow_stream_consumes_json_messages() {
     );
 }
 
+/// Phase 39.5a PR 3 slice 3.5: end-to-end session-window
+/// crash-recovery. A first pipeline ingests rows for two users via
+/// Kafka + a session-windowed transform + Postgres `StateStore`,
+/// commits state mid-stream, then "crashes". A second pipeline is
+/// constructed against the same Kafka topic + same Postgres state
+/// store + same pipeline name. Call `load_state` to rehydrate +
+/// seek_to. Produce more rows. The session count should reflect
+/// both the pre-crash and post-crash rows — i.e. recovery
+/// preserved the in-flight session.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker; run with `cargo test -- --ignored`"]
+async fn session_pipeline_crash_recovers_committed_state() {
+    use std::sync::Arc;
+
+    use arrow_array::Int64Array;
+    use ematix_flow_core::backend::Backend;
+    use ematix_flow_core::state_store::{PostgresStateStore, StateStore};
+    use ematix_flow_core::transform::{BatchTransform, LazySqlTransform};
+    use ematix_flow_core::windowed::{
+        AggKind, AggregationSpec, LateDataPolicy, WindowConfig, WindowKind,
+        WindowedAggregateTransform,
+    };
+
+    let (_kafka_container, bootstrap) = start_kafka().await;
+    let (_pg_container, pg_url) = start_postgres().await;
+    let topic = "phase-39-5a-pr3-recovery";
+    let pipeline_name = "p-session-recovery";
+
+    let store = PostgresStateStore::connect(&pg_url, "public")
+        .await
+        .unwrap();
+    store.ensure_schema().await.unwrap();
+
+    fn make_session_config() -> WindowConfig {
+        WindowConfig {
+            kind: WindowKind::Session,
+            duration_ms: 0,
+            hop_ms: 0,
+            // 1h gap, 24h cap — wide enough that messages produced
+            // a few seconds apart definitely stay in one session.
+            gap_ms: Some(3_600_000),
+            max_session_duration_ms: Some(86_400_000),
+            event_time_column: "_event_ts".into(),
+            group_by: vec!["user_id".into()],
+            aggregations: vec![AggregationSpec::new(AggKind::CountStar, None, "n")],
+            late_data: LateDataPolicy::Drop,
+            max_groups_per_window: 100,
+            window_start_column: "window_start".into(),
+            window_end_column: "window_end".into(),
+            session_id_column: "session_id".into(),
+        }
+    }
+
+    // ---- Pipeline 1: ingest 3 rows for user_id=1 + commit ----
+    produce_json_messages(
+        &bootstrap,
+        topic,
+        &[
+            r#"{"user_id": 1, "_event_ts": 1700000000000000}"#,
+            r#"{"user_id": 1, "_event_ts": 1700000001000000}"#,
+            r#"{"user_id": 1, "_event_ts": 1700000002000000}"#,
+        ],
+    )
+    .await;
+
+    let kafka1: Arc<dyn Backend> =
+        Arc::new(KafkaBackend::open(&bootstrap, Some("g-recover-1")).unwrap());
+    let stream = kafka1.read_arrow_stream(topic).await.unwrap();
+    let batches: Vec<_> = stream.try_collect().await.unwrap();
+    assert!(
+        batches.iter().map(|b| b.num_rows()).sum::<usize>() >= 3,
+        "first pipeline should read all 3 messages"
+    );
+
+    // Inner SQL pre-stage casts the JSON-decoded `_event_ts`
+    // (Int64) into Timestamp(Microsecond) so the windowed
+    // transform can use it as the event-time column.
+    let cast_sql = "SELECT user_id, arrow_cast(_event_ts, 'Timestamp(Microsecond, None)') AS _event_ts FROM source";
+    let inner1: Arc<LazySqlTransform> = Arc::new(LazySqlTransform::new(cast_sql.to_string()));
+    let transform1 = WindowedAggregateTransform::new(make_session_config(), Some(inner1)).unwrap();
+    use ematix_flow_core::transform::BatchContext;
+    for b in &batches {
+        let _ = transform1
+            .transform(
+                b.clone(),
+                &BatchContext {
+                    global_wm: Some(0),
+                    source_id: None,
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    // Commit state + offsets for the in-flight session.
+    use ematix_flow_core::state_store::CommitSnapshot;
+    let (state_upserts, state_deletes) = transform1.take_state_commit().await.unwrap();
+    assert_eq!(state_upserts.len(), 1, "one user_id touched → one upsert");
+    let mut offsets = std::collections::HashMap::new();
+    let off_bytes = kafka1.offset_snapshot().await.unwrap().unwrap();
+    offsets.insert(topic.to_string(), off_bytes);
+    store
+        .commit(
+            pipeline_name,
+            CommitSnapshot {
+                state_upserts,
+                state_deletes,
+                offsets,
+                state_version: ematix_flow_core::session_blob::STATE_BLOB_VERSION,
+            },
+        )
+        .await
+        .unwrap();
+
+    // ---- Pipeline 2: fresh transform + fresh kafka consumer ----
+    let kafka2: Arc<dyn Backend> =
+        Arc::new(KafkaBackend::open(&bootstrap, Some("g-recover-2-fresh")).unwrap());
+    let inner2: Arc<LazySqlTransform> = Arc::new(LazySqlTransform::new(cast_sql.to_string()));
+    let transform2 = WindowedAggregateTransform::new(make_session_config(), Some(inner2)).unwrap();
+
+    // Recover state + apply seek_to.
+    let recovered = store.load(pipeline_name).await.unwrap();
+    transform2
+        .recover_state(&recovered.state_by_key)
+        .await
+        .unwrap();
+    let off_bytes = recovered.offsets.get(topic).unwrap();
+    kafka2.seek_to(off_bytes).await.unwrap();
+
+    // Produce 2 more rows; pipeline 2 reads + ingests + emits.
+    produce_json_messages(
+        &bootstrap,
+        topic,
+        &[
+            r#"{"user_id": 1, "_event_ts": 1700000003000000}"#,
+            r#"{"user_id": 1, "_event_ts": 1700000004000000}"#,
+        ],
+    )
+    .await;
+    let stream = kafka2.read_arrow_stream(topic).await.unwrap();
+    let batches: Vec<_> = stream.try_collect().await.unwrap();
+    let post_recover_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(
+        post_recover_rows, 2,
+        "post-recover read should yield only the 2 new messages, not all 5"
+    );
+    for b in batches {
+        let _ = transform2
+            .transform(
+                b,
+                &BatchContext {
+                    global_wm: Some(0),
+                    source_id: None,
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    // Drive an emit. With a 1h gap, advance wm well past the
+    // session's last_event_ts + gap.
+    let out = transform2
+        .on_idle_tick(&BatchContext {
+            global_wm: Some(1_700_000_000_000_000 + 10_000_000_000),
+            source_id: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(out.len(), 1);
+    let b = &out[0];
+    assert_eq!(b.num_rows(), 1, "single recovered+extended session");
+    let n = b
+        .column_by_name("n")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(
+        n, 5,
+        "session count must reflect 3 pre-crash + 2 post-recover rows"
+    );
+}
+
+/// Phase 39.5a P1.11: end-to-end stream-stream join crash-recovery.
+/// Produce 1 left-side row to Kafka, ingest it through pipeline 1,
+/// commit state via the production `pipeline.commit_state(store)`
+/// path (NOT a hand-rolled `store.commit(...)` call — this exercises
+/// the same `Arc<dyn BatchTransform>` trait-dispatch path that
+/// real production pipelines hit). Then "crash": construct a fresh
+/// pipeline 2 against the same Postgres state-store + same pipeline
+/// name, call `pipeline.load_state(store)` (production path), then
+/// produce a matching right-side row. The recovered left buffer
+/// must produce a join match.
+///
+/// Doubles as a regression test for the
+/// `take_state_commit` / `recover_state` trait-dispatch fix.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker; run with `cargo test -- --ignored`"]
+async fn join_pipeline_crash_recovers_committed_state() {
+    use std::sync::Arc;
+
+    use ematix_flow_core::SQLiteBackend;
+    use ematix_flow_core::backend::Backend;
+    use ematix_flow_core::join::{
+        JoinConfig, JoinKind, JoinLateDataPolicy, TimeWindowedJoinTransform,
+    };
+    use ematix_flow_core::state_store::PostgresStateStore;
+    use ematix_flow_core::streaming::{StreamingPipeline, StreamingPipelineConfig};
+    use ematix_flow_core::transform::{BatchTransform, LazySqlTransform};
+
+    let (_kafka_container, bootstrap) = start_kafka().await;
+    let (_pg_container, pg_url) = start_postgres().await;
+    let left_topic = "phase-39-5b-p1-11-orders";
+    let right_topic = "phase-39-5b-p1-11-payments";
+    let pipeline_name = "p-join-recovery";
+
+    let store = Arc::new(
+        PostgresStateStore::connect(&pg_url, "public")
+            .await
+            .unwrap(),
+    );
+    store.ensure_schema().await.unwrap();
+
+    fn make_join_cfg(left: &str, right: &str) -> JoinConfig {
+        JoinConfig {
+            kind: JoinKind::Inner,
+            left_source: left.into(),
+            right_source: right.into(),
+            left_keys: vec!["order_id".into()],
+            right_keys: vec!["order_id".into()],
+            time_window_ms: 60_000,
+            min_delta_ms: None,
+            max_delta_ms: None,
+            event_time_column: "_event_ts".into(),
+            late_data: JoinLateDataPolicy::Drop,
+            left_column_prefix: "left_".into(),
+            right_column_prefix: "right_".into(),
+        }
+    }
+
+    // ---- Pipeline 1: ingest one left row, commit via pipeline.commit_state ----
+    produce_json_messages(
+        &bootstrap,
+        left_topic,
+        &[r#"{"order_id": 99, "_event_ts": 1700000000000000}"#],
+    )
+    .await;
+
+    let kafka_left_1: Arc<dyn Backend> =
+        Arc::new(KafkaBackend::open(&bootstrap, Some("g-join-l-1")).unwrap());
+    let kafka_right_1: Arc<dyn Backend> =
+        Arc::new(KafkaBackend::open(&bootstrap, Some("g-join-r-1")).unwrap());
+
+    // SQL pre-stage isn't available for joins (the [transform.join]
+    // block forbids it). Cast _event_ts via a shim transform fed
+    // directly into the join.
+    let join_cfg = make_join_cfg(left_topic, right_topic);
+    let join_transform: Arc<dyn BatchTransform> =
+        Arc::new(TimeWindowedJoinTransform::new(join_cfg).unwrap());
+
+    let target_backend: Arc<dyn Backend> = Arc::new(SQLiteBackend::open(":memory:").unwrap());
+    let target = TargetTable {
+        schema: "".into(),
+        name: "joined".into(),
+    };
+    let cfg1 = StreamingPipelineConfig::new("", target.clone(), pipeline_name)
+        .with_state_store(Arc::clone(&store) as Arc<dyn ematix_flow_core::state_store::StateStore>)
+        .with_transform(Arc::clone(&join_transform));
+    let pipeline1 = StreamingPipeline::new_multi_source(
+        vec![
+            (Arc::clone(&kafka_left_1), left_topic.to_string()),
+            (Arc::clone(&kafka_right_1), right_topic.to_string()),
+        ],
+        vec![(target_backend, target.clone())],
+        cfg1,
+    );
+
+    // Drive one read on each source to feed the transform.
+    use arrow_array::cast::AsArray;
+    use ematix_flow_core::transform::BatchContext;
+    use futures_util::TryStreamExt;
+    let stream = kafka_left_1.read_arrow_stream(left_topic).await.unwrap();
+    let batches: Vec<_> = stream.try_collect().await.unwrap();
+    // Cast _event_ts (Int64 → Timestamp(us)) then feed to the join.
+    let cast_sql = "SELECT order_id, arrow_cast(_event_ts, 'Timestamp(Microsecond, None)') AS _event_ts FROM source";
+    let inner: Arc<LazySqlTransform> = Arc::new(LazySqlTransform::new(cast_sql.to_string()));
+    for b in batches {
+        let casted = inner.transform(b, &BatchContext::default()).await.unwrap();
+        for cb in casted {
+            join_transform
+                .transform(
+                    cb,
+                    &BatchContext {
+                        global_wm: Some(0),
+                        source_id: Some(left_topic.to_string()),
+                    },
+                )
+                .await
+                .unwrap();
+        }
+    }
+
+    // Commit through the production path. This exercises
+    // `commit_state` → `take_state_commit` via `Arc<dyn BatchTransform>`
+    // — the regression slot for the P1.8 trait-dispatch fix.
+    let (n_upserts, n_deletes, n_offsets) = pipeline1.commit_state(store.as_ref()).await.unwrap();
+    assert_eq!(n_upserts, 1, "left buffer dirty key → 1 upsert");
+    assert_eq!(n_deletes, 0);
+    assert_eq!(
+        n_offsets, 1,
+        "left source offset_snapshot → 1 (right source idle, no read)"
+    );
+
+    // ---- Pipeline 2: fresh transform + fresh kafka. load_state recovers. ----
+    let kafka_left_2: Arc<dyn Backend> =
+        Arc::new(KafkaBackend::open(&bootstrap, Some("g-join-l-2")).unwrap());
+    let kafka_right_2: Arc<dyn Backend> =
+        Arc::new(KafkaBackend::open(&bootstrap, Some("g-join-r-2")).unwrap());
+    let join_transform2: Arc<dyn BatchTransform> =
+        Arc::new(TimeWindowedJoinTransform::new(make_join_cfg(left_topic, right_topic)).unwrap());
+    let cfg2 = StreamingPipelineConfig::new("", target.clone(), pipeline_name)
+        .with_state_store(Arc::clone(&store) as Arc<dyn ematix_flow_core::state_store::StateStore>)
+        .with_transform(Arc::clone(&join_transform2));
+    let pipeline2 = StreamingPipeline::new_multi_source(
+        vec![
+            (Arc::clone(&kafka_left_2), left_topic.to_string()),
+            (Arc::clone(&kafka_right_2), right_topic.to_string()),
+        ],
+        vec![(
+            Arc::new(SQLiteBackend::open(":memory:").unwrap()) as Arc<dyn Backend>,
+            target,
+        )],
+        cfg2,
+    );
+
+    // load_state goes through `recover_state` on `Arc<dyn BatchTransform>`
+    // — the other trait-dispatch slot.
+    pipeline2.load_state(store.as_ref()).await.unwrap();
+
+    // Produce the right-side match + a schema-nudge left batch
+    // (since first-emit needs both schemas captured locally; the
+    // recovered left buffer doesn't carry a live schema).
+    produce_json_messages(
+        &bootstrap,
+        left_topic,
+        &[r#"{"order_id": 999999, "_event_ts": 9000000000000000}"#],
+    )
+    .await;
+    produce_json_messages(
+        &bootstrap,
+        right_topic,
+        &[r#"{"order_id": 99, "_event_ts": 1700000005000000}"#],
+    )
+    .await;
+
+    // The fresh kafka_left_2 starts from beginning of topic by group_id
+    // default; pipeline2.load_state seeks past it. Read what's left
+    // (the schema-nudge row).
+    let stream = kafka_left_2.read_arrow_stream(left_topic).await.unwrap();
+    let batches: Vec<_> = stream.try_collect().await.unwrap();
+    for b in batches {
+        let casted = inner.transform(b, &BatchContext::default()).await.unwrap();
+        for cb in casted {
+            let _ = join_transform2
+                .transform(
+                    cb,
+                    &BatchContext {
+                        global_wm: Some(0),
+                        source_id: Some(left_topic.to_string()),
+                    },
+                )
+                .await
+                .unwrap();
+        }
+    }
+
+    // Right side matches the recovered left row.
+    let stream = kafka_right_2.read_arrow_stream(right_topic).await.unwrap();
+    let batches: Vec<_> = stream.try_collect().await.unwrap();
+    let mut matched_rows = 0;
+    for b in batches {
+        let casted = inner.transform(b, &BatchContext::default()).await.unwrap();
+        for cb in casted {
+            let out = join_transform2
+                .transform(
+                    cb,
+                    &BatchContext {
+                        global_wm: Some(0),
+                        source_id: Some(right_topic.to_string()),
+                    },
+                )
+                .await
+                .unwrap();
+            for ob in out {
+                let order_id = ob
+                    .column_by_name("left_order_id")
+                    .unwrap()
+                    .as_primitive::<arrow_array::types::Int64Type>();
+                for i in 0..ob.num_rows() {
+                    if order_id.value(i) == 99 {
+                        matched_rows += 1;
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(
+        matched_rows, 1,
+        "post-restart right row joined against recovered left buffer for order_id=99"
+    );
+}
+
+/// Phase 39.5a slice 1.6: end-to-end pipeline state-load on
+/// startup. Produce 5 messages, run a first pipeline that consumes
+/// 5 of them (advancing pending offsets to 5 = next-to-consume),
+/// commit those offsets to a Postgres `StateStore`. Then construct
+/// a *fresh* pipeline against the same topic + same pipeline name,
+/// call `load_state`, produce 3 more messages, read — must see
+/// exactly the new 3, not the original 5.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker; run with `cargo test -- --ignored`"]
+async fn pipeline_load_state_resumes_from_committed_offset() {
+    use arrow_array::Int64Array;
+    use ematix_flow_core::SQLiteBackend;
+    use ematix_flow_core::backend::Backend;
+    use ematix_flow_core::state_store::{CommitSnapshot, PostgresStateStore, StateStore};
+    use ematix_flow_core::streaming::{StreamingPipeline, StreamingPipelineConfig};
+
+    let (_kafka_container, bootstrap) = start_kafka().await;
+    let (_pg_container, pg_url) = start_postgres().await;
+    let topic = "phase-39-5a-slice-16";
+    let pipeline_name = "p-resume";
+
+    // Set up the state store (Postgres) once and ensure schema.
+    let store = PostgresStateStore::connect(&pg_url, "public")
+        .await
+        .unwrap();
+    store.ensure_schema().await.unwrap();
+
+    // ---- pipeline 1: produce 5, consume them, commit offsets ----
+    produce_json_messages(
+        &bootstrap,
+        topic,
+        &[
+            r#"{"id": 1}"#,
+            r#"{"id": 2}"#,
+            r#"{"id": 3}"#,
+            r#"{"id": 4}"#,
+            r#"{"id": 5}"#,
+        ],
+    )
+    .await;
+    let backend1: Arc<dyn Backend> =
+        Arc::new(KafkaBackend::open(&bootstrap, Some("g-resume")).unwrap());
+    let stream = backend1.read_arrow_stream(topic).await.unwrap();
+    let batches: Vec<_> = stream.try_collect().await.unwrap();
+    assert_eq!(
+        batches.iter().map(|b| b.num_rows()).sum::<usize>(),
+        5,
+        "first pipeline should see all 5 messages"
+    );
+
+    // Snapshot offsets and commit to the state store. In PR 3 this
+    // is wrapped behind `pipeline.commit_state(...)`; for PR 1 the
+    // test does it manually.
+    let offset_bytes = backend1
+        .offset_snapshot()
+        .await
+        .unwrap()
+        .expect("after consuming non-empty batches, offset_snapshot must produce bytes");
+    let mut offsets = std::collections::HashMap::new();
+    offsets.insert(topic.to_string(), offset_bytes);
+    store
+        .commit(
+            pipeline_name,
+            CommitSnapshot {
+                offsets,
+                state_version: 1,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    // ---- produce 3 more messages then construct pipeline 2 ----
+    produce_json_messages(
+        &bootstrap,
+        topic,
+        &[r#"{"id": 6}"#, r#"{"id": 7}"#, r#"{"id": 8}"#],
+    )
+    .await;
+
+    let backend2: Arc<dyn Backend> =
+        Arc::new(KafkaBackend::open(&bootstrap, Some("g-resume-fresh")).unwrap());
+    // SQLite target — irrelevant; pipeline construction needs one
+    // but we never call `run`, only `load_state` + read directly.
+    let target_backend: Arc<dyn Backend> = Arc::new(SQLiteBackend::open(":memory:").unwrap());
+    let target = TargetTable {
+        schema: "".into(),
+        name: "ignored".into(),
+    };
+    let mut config = StreamingPipelineConfig::new(topic, target.clone(), pipeline_name);
+    config.idle_pause_ms = 100;
+    let pipeline2 = StreamingPipeline::new(
+        Arc::clone(&backend2),
+        vec![(target_backend, target)],
+        config,
+    );
+
+    // The whole point of the slice: load committed state and apply
+    // seek_to per source. After this call, backend2's next
+    // read_arrow_stream resumes from offset 5.
+    let recovered = pipeline2.load_state(&store).await.unwrap();
+    assert_eq!(
+        recovered.offsets.len(),
+        1,
+        "recovered state must include the committed source offset"
+    );
+
+    // Read — should only see the new 3 messages (ids 6,7,8), not
+    // the original 5.
+    let stream = backend2.read_arrow_stream(topic).await.unwrap();
+    let batches: Vec<_> = stream.try_collect().await.unwrap();
+    let mut ids: Vec<i64> = Vec::new();
+    for batch in &batches {
+        let id = batch
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        for i in 0..id.len() {
+            ids.push(id.value(i));
+        }
+    }
+    ids.sort();
+    assert_eq!(
+        ids,
+        vec![6, 7, 8],
+        "post-recover pipeline must skip messages 1-5 already committed in StateStore"
+    );
+}
+
+/// Phase 39.5a slice 1.6: `load_state` is a no-op for a pipeline
+/// that has no committed state — first run must work normally
+/// against an empty `StateStore`.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker; run with `cargo test -- --ignored`"]
+async fn pipeline_load_state_with_empty_store_is_noop() {
+    use ematix_flow_core::SQLiteBackend;
+    use ematix_flow_core::backend::Backend;
+    use ematix_flow_core::state_store::PostgresStateStore;
+    use ematix_flow_core::streaming::{StreamingPipeline, StreamingPipelineConfig};
+
+    let (_kafka_container, bootstrap) = start_kafka().await;
+    let (_pg_container, pg_url) = start_postgres().await;
+    let topic = "phase-39-5a-empty-store";
+
+    let store = PostgresStateStore::connect(&pg_url, "public")
+        .await
+        .unwrap();
+    store.ensure_schema().await.unwrap();
+
+    let backend: Arc<dyn Backend> =
+        Arc::new(KafkaBackend::open(&bootstrap, Some("g-empty")).unwrap());
+    let target_backend: Arc<dyn Backend> = Arc::new(SQLiteBackend::open(":memory:").unwrap());
+    let target = TargetTable {
+        schema: "".into(),
+        name: "ignored".into(),
+    };
+    let pipeline = StreamingPipeline::new(
+        Arc::clone(&backend),
+        vec![(target_backend, target.clone())],
+        StreamingPipelineConfig::new(topic, target, "fresh-pipeline"),
+    );
+
+    let recovered = pipeline.load_state(&store).await.unwrap();
+    assert!(
+        recovered.offsets.is_empty(),
+        "fresh pipeline name must recover empty offsets"
+    );
+
+    // The Kafka backend must not have stashed any seek directives
+    // — the next read should come from `subscribe`, not `assign`.
+    let stream = backend.read_arrow_stream(topic).await.unwrap();
+    let batches: Vec<_> = stream.try_collect().await.unwrap();
+    assert_eq!(
+        batches.iter().map(|b| b.num_rows()).sum::<usize>(),
+        0,
+        "empty topic + empty state = empty read"
+    );
+}
+
+/// Phase 39.5a slice 1.5: end-to-end `seek_to` on Kafka. Produce 5
+/// messages to a single-partition topic, hand a `seek_to` payload
+/// pointing at offset 2, then read — must receive only messages
+/// 3 / 4 / 5 (i.e. starting from offset 2).
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker; run with `cargo test -- --ignored`"]
+async fn kafka_seek_to_resumes_from_committed_offset() {
+    use arrow_array::Int64Array;
+    use std::collections::HashMap;
+
+    let (_container, bootstrap) = start_kafka().await;
+    let topic = "seek-test";
+    produce_json_messages(
+        &bootstrap,
+        topic,
+        &[
+            r#"{"id": 1}"#,
+            r#"{"id": 2}"#,
+            r#"{"id": 3}"#,
+            r#"{"id": 4}"#,
+            r#"{"id": 5}"#,
+        ],
+    )
+    .await;
+
+    let backend = KafkaBackend::open(&bootstrap, Some("seek-test-fresh")).unwrap();
+
+    // Hand-encode a seek payload via the same wire format the
+    // backend expects from `StateStore` — offset 2 means "next
+    // message to consume is offset 2", which is the third message.
+    let payload = {
+        let mut m = HashMap::new();
+        m.insert(0_i32, 2_i64);
+        encode_kafka_offsets_for_test(&m)
+    };
+    backend.seek_to(&payload).await.unwrap();
+
+    let stream = backend.read_arrow_stream(topic).await.unwrap();
+    let batches: Vec<_> = stream.try_collect().await.unwrap();
+    let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(
+        total, 3,
+        "seek_to(offset=2) on 5-msg topic must yield 3 messages (offsets 2,3,4)"
+    );
+
+    let mut ids: Vec<i64> = Vec::new();
+    for batch in &batches {
+        let id = batch
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        for i in 0..id.len() {
+            ids.push(id.value(i));
+        }
+    }
+    ids.sort();
+    assert_eq!(ids, vec![3, 4, 5]);
+
+    // Snapshot the post-read pending offsets through the trait — the
+    // backend should have advanced past offset 4 (last consumed) +1
+    // = 5 (next-to-consume).
+    let snap = backend.offset_snapshot().await.unwrap().unwrap();
+    let decoded = decode_kafka_offsets_for_test(&snap);
+    assert_eq!(
+        decoded.get(&0_i32),
+        Some(&5_i64),
+        "post-read offset must point at next-to-consume = 5"
+    );
+}
+
+/// Test-only re-export of the encoding helpers — they're
+/// `pub(crate)` on the source side so external test crates can
+/// reach them through this trampoline (without making them part
+/// of the public API).
+fn encode_kafka_offsets_for_test(offsets: &std::collections::HashMap<i32, i64>) -> Vec<u8> {
+    // Match the v=1 JSON shape the backend emits.
+    let pairs: std::collections::BTreeMap<i32, i64> =
+        offsets.iter().map(|(p, o)| (*p, *o)).collect();
+    let payload = serde_json::json!({ "v": 1, "partitions": pairs });
+    serde_json::to_vec(&payload).unwrap()
+}
+
+fn decode_kafka_offsets_for_test(bytes: &[u8]) -> std::collections::HashMap<i32, i64> {
+    let v: serde_json::Value = serde_json::from_slice(bytes).unwrap();
+    let partitions = v.get("partitions").unwrap().as_object().unwrap();
+    partitions
+        .iter()
+        .map(|(k, v)| (k.parse::<i32>().unwrap(), v.as_i64().unwrap()))
+        .collect()
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs Docker; run with `cargo test -- --ignored`"]
 async fn kafka_read_arrow_stream_empty_topic() {
@@ -6176,7 +6863,9 @@ async fn kafka_avro_sr_round_trip() {
     use arrow_array::{Int64Array, StringArray};
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
     use ematix_flow_core::backend::WriteMode;
-    use ematix_flow_core::kafka_backend::{KafkaPayloadFormat, encode_batch_as_avro};
+    use ematix_flow_core::kafka_backend::{
+        KafkaPayloadFormat, SrAuth, encode_batch_as_avro,
+    };
 
     let (_container, sr_url) = start_apicurio_registry().await;
 
@@ -6228,7 +6917,7 @@ async fn kafka_avro_sr_round_trip() {
     )
     .unwrap();
 
-    let payloads = encode_batch_as_avro(&batch, topic, &sr_url)
+    let payloads = encode_batch_as_avro(&batch, topic, &SrAuth::new(&sr_url))
         .await
         .expect("encode_batch_as_avro");
     assert_eq!(payloads.len(), 3);
@@ -6240,7 +6929,7 @@ async fn kafka_avro_sr_round_trip() {
 
     // Decode round-trip via our decoder helper.
     use ematix_flow_core::kafka_backend::decode_payloads_as_avro;
-    let batches = decode_payloads_as_avro(payloads, &sr_url)
+    let batches = decode_payloads_as_avro(payloads, &SrAuth::new(&sr_url))
         .await
         .expect("decode_payloads_as_avro");
     let total: usize = batches.iter().map(|b| b.num_rows()).sum();
@@ -6280,7 +6969,9 @@ async fn kafka_avro_sr_round_trip() {
 async fn kafka_protobuf_sr_round_trip() {
     use arrow_array::{Int64Array, StringArray};
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
-    use ematix_flow_core::kafka_backend::{decode_payloads_as_protobuf, encode_batch_as_protobuf};
+    use ematix_flow_core::kafka_backend::{
+        SrAuth, decode_payloads_as_protobuf, encode_batch_as_protobuf,
+    };
 
     let (_container, sr_url) = start_apicurio_registry().await;
 
@@ -6340,7 +7031,7 @@ async fn kafka_protobuf_sr_round_trip() {
     )
     .unwrap();
 
-    let payloads = encode_batch_as_protobuf(&batch, topic, &sr_url)
+    let payloads = encode_batch_as_protobuf(&batch, topic, &SrAuth::new(&sr_url))
         .await
         .expect("encode_batch_as_protobuf");
     assert_eq!(payloads.len(), 3);
@@ -6350,7 +7041,7 @@ async fn kafka_protobuf_sr_round_trip() {
     }
 
     // Decode round-trip.
-    let batches = decode_payloads_as_protobuf(payloads, &sr_url)
+    let batches = decode_payloads_as_protobuf(payloads, &SrAuth::new(&sr_url))
         .await
         .expect("decode_payloads_as_protobuf");
     let total: usize = batches.iter().map(|b| b.num_rows()).sum();

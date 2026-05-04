@@ -847,6 +847,105 @@ impl Backend for KinesisBackend {
         }
         Ok(())
     }
+
+    /// Phase 39.5a P1.7b: Kinesis exposes seek-to via per-shard
+    /// sequence numbers. The next `read_arrow_stream` call rebuilds
+    /// shard iterators using `ShardIteratorType=AFTER_SEQUENCE_NUMBER`
+    /// + the recovered checkpoint, resuming consumption from that
+    /// point. Stateful (session/join) pipelines now accept Kinesis
+    /// as a source.
+    fn supports_seek_to(&self) -> bool {
+        true
+    }
+
+    /// Decode the wire format `{"v": 1, "shards": {"shard_id":
+    /// "seq_num"}}` and stash the per-shard committed checkpoints
+    /// in the consumer session. The session may not yet exist (the
+    /// pipeline calls `seek_to` before the first `read_arrow_stream`
+    /// in the recovery path); create it lazily here so the cursor
+    /// state survives for the next consumer-open call.
+    async fn seek_to(&self, offset_bytes: &[u8]) -> Result<(), BackendError> {
+        let parsed = decode_kinesis_offsets(offset_bytes)?;
+        let mut session_lock = self.consumer_session.lock().await;
+        let session = session_lock.get_or_insert_with(|| KinesisConsumerSession {
+            cursors: BTreeMap::new(),
+        });
+        for (shard_id, seq) in parsed {
+            // For each recovered shard: install the committed
+            // sequence + clear next_iterator + pending. The
+            // consumer-open path below sees committed_sequence_number
+            // is Some and bootstraps via AFTER_SEQUENCE_NUMBER.
+            let cursor = session.cursors.entry(shard_id).or_default();
+            cursor.committed_sequence_number = Some(seq);
+            cursor.next_iterator = None;
+            cursor.pending_sequence_number = None;
+        }
+        Ok(())
+    }
+
+    /// Capture per-shard committed sequence numbers as opaque
+    /// bytes for `StateStore.commit`. Returns `None` when no
+    /// consumer session is active or no cursor has been
+    /// committed yet — caller skips this source from the snapshot.
+    async fn offset_snapshot(&self) -> Result<Option<Vec<u8>>, BackendError> {
+        let session_lock = self.consumer_session.lock().await;
+        let Some(session) = session_lock.as_ref() else {
+            return Ok(None);
+        };
+        let mut shards: BTreeMap<String, String> = BTreeMap::new();
+        for (shard_id, cursor) in &session.cursors {
+            // Prefer pending (most recent) but fall back to
+            // committed so a snapshot taken between commits still
+            // captures the in-flight position. This matches the
+            // Kafka backend's pending_offsets-as-source-of-truth.
+            if let Some(seq) = cursor
+                .pending_sequence_number
+                .as_ref()
+                .or(cursor.committed_sequence_number.as_ref())
+            {
+                shards.insert(shard_id.clone(), seq.clone());
+            }
+        }
+        if shards.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(encode_kinesis_offsets(&shards)?))
+    }
+}
+
+// =====================================================================
+// Phase 39.5a P1.7b: opaque per-shard sequence-number wire format.
+// =====================================================================
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct KinesisOffsetSnapshotV1 {
+    v: u32,
+    shards: BTreeMap<String, String>,
+}
+
+pub(crate) fn encode_kinesis_offsets(
+    shards: &BTreeMap<String, String>,
+) -> Result<Vec<u8>, BackendError> {
+    let snap = KinesisOffsetSnapshotV1 {
+        v: 1,
+        shards: shards.clone(),
+    };
+    serde_json::to_vec(&snap)
+        .map_err(|e| BackendError::Other(format!("kinesis offset encode: {e}")))
+}
+
+pub(crate) fn decode_kinesis_offsets(
+    bytes: &[u8],
+) -> Result<BTreeMap<String, String>, BackendError> {
+    let snap: KinesisOffsetSnapshotV1 = serde_json::from_slice(bytes)
+        .map_err(|e| BackendError::Other(format!("kinesis offset decode: {e}")))?;
+    if snap.v != 1 {
+        return Err(BackendError::Other(format!(
+            "kinesis offset payload v={} not supported (this build understands v=1)",
+            snap.v
+        )));
+    }
+    Ok(snap.shards)
 }
 
 /// Best-effort parse of an endpoint URL into the `ConnectionInfo`
@@ -1060,6 +1159,83 @@ mod tests {
         let b = KinesisBackend::open("s").unwrap();
         b.reset_to_committed_offsets().await.unwrap();
         assert_eq!(b.pending_sequence_count().await, 0);
+    }
+
+    // ----- P1.7b Kinesis seek_to + offset_snapshot -----
+
+    #[test]
+    fn kinesis_offsets_roundtrip_through_codec() {
+        let mut shards: BTreeMap<String, String> = BTreeMap::new();
+        shards.insert("shardId-000000000000".into(), "49600000000000000000".into());
+        shards.insert("shardId-000000000001".into(), "49600000000000000001".into());
+        let bytes = encode_kinesis_offsets(&shards).unwrap();
+        let back = decode_kinesis_offsets(&bytes).unwrap();
+        assert_eq!(back, shards);
+    }
+
+    #[test]
+    fn kinesis_decode_rejects_unknown_payload_version() {
+        let payload = br#"{"v":99,"shards":{}}"#;
+        let err = decode_kinesis_offsets(payload).unwrap_err();
+        assert!(err.to_string().contains("v=99"), "got: {err}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn kinesis_supports_seek_to_reports_true() {
+        let b = KinesisBackend::open("s").unwrap();
+        assert!(b.supports_seek_to());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn kinesis_offset_snapshot_returns_none_before_session() {
+        let b = KinesisBackend::open("s").unwrap();
+        assert!(b.offset_snapshot().await.unwrap().is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn kinesis_seek_to_stashes_committed_sequence_per_shard() {
+        let b = KinesisBackend::open("s").unwrap();
+        let mut shards: BTreeMap<String, String> = BTreeMap::new();
+        shards.insert("shardId-000000000000".into(), "49600000000000000000".into());
+        shards.insert("shardId-000000000001".into(), "49600000000000000042".into());
+        let payload = encode_kinesis_offsets(&shards).unwrap();
+        b.seek_to(&payload).await.unwrap();
+
+        // Inspect the stashed cursor map directly — same module so
+        // private fields are reachable.
+        let session = b.consumer_session.lock().await;
+        let session = session.as_ref().expect("seek_to must create the session");
+        assert_eq!(session.cursors.len(), 2);
+        let c0 = session.cursors.get("shardId-000000000000").unwrap();
+        assert_eq!(
+            c0.committed_sequence_number.as_deref(),
+            Some("49600000000000000000")
+        );
+        // next_iterator cleared so next read rebuilds via
+        // AFTER_SEQUENCE_NUMBER.
+        assert!(c0.next_iterator.is_none());
+        assert!(c0.pending_sequence_number.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn kinesis_offset_snapshot_after_seek_roundtrips() {
+        // Round-trip: seek with payload P → snapshot returns
+        // bytes that decode to the same shard map.
+        let b = KinesisBackend::open("s").unwrap();
+        let mut shards: BTreeMap<String, String> = BTreeMap::new();
+        shards.insert("shard-0".into(), "seq-100".into());
+        let payload = encode_kinesis_offsets(&shards).unwrap();
+        b.seek_to(&payload).await.unwrap();
+        let snap = b.offset_snapshot().await.unwrap().unwrap();
+        let back = decode_kinesis_offsets(&snap).unwrap();
+        assert_eq!(back, shards);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn kinesis_seek_to_with_garbage_bytes_returns_error() {
+        let b = KinesisBackend::open("s").unwrap();
+        let err = b.seek_to(b"not-json").await.unwrap_err();
+        assert!(err.to_string().contains("decode"));
     }
 
     #[tokio::test(flavor = "multi_thread")]

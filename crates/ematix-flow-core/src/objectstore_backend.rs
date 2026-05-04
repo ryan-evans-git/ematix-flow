@@ -42,7 +42,7 @@ use uuid::Uuid;
 
 use crate::backend::{
     ArrowBatchStream, Backend, BackendError, DeleteHandling, Dialect, ObjectFormat,
-    StrategyRunResult, TargetTable, WriteMode,
+    ObjectWriteOptions, ParquetCompression, StrategyRunResult, TargetTable, WriteMode,
 };
 use crate::pg::ConnectionInfo;
 use crate::types::TableSpec;
@@ -67,6 +67,10 @@ pub struct ObjectStoreBackend {
     /// Display-only base path for human-friendly identification (logs,
     /// `connection_info`). Not used for routing.
     base_label: String,
+    /// Π.1.4: per-format write-time options (Parquet compression,
+    /// CSV delimiter / header). Read paths don't consult this — the
+    /// underlying readers infer codec / delimiter from file metadata.
+    write_options: ObjectWriteOptions,
 }
 
 impl ObjectStoreBackend {
@@ -88,7 +92,24 @@ impl ObjectStoreBackend {
             format,
             dsn: format!("file://{}", root.display()),
             base_label: root.display().to_string(),
+            write_options: ObjectWriteOptions::default(),
         })
+    }
+
+    /// Π.1.4: override the per-format write options. The defaults
+    /// (built from [`ObjectWriteOptions::default`]) match the
+    /// historical pre-Π.1.4 behavior — Parquet uncompressed, CSV
+    /// comma-delimited with header. Use to opt in to compression or
+    /// switch CSV framing.
+    pub fn with_write_options(mut self, options: ObjectWriteOptions) -> Self {
+        self.write_options = options;
+        self
+    }
+
+    /// Read access to the configured write options. Mainly for tests +
+    /// logging.
+    pub fn write_options(&self) -> &ObjectWriteOptions {
+        &self.write_options
     }
 
     /// Borrow the underlying object store. Used by tests and (later)
@@ -138,6 +159,7 @@ impl ObjectStoreBackend {
             format,
             dsn: format!("s3://{bucket}@{endpoint}"),
             base_label: format!("s3://{bucket}"),
+            write_options: ObjectWriteOptions::default(),
         })
     }
 }
@@ -214,6 +236,7 @@ async fn write_parquet_at_path(
     store: &Arc<dyn ObjectStore>,
     path: ObjectPath,
     mut stream: ArrowBatchStream,
+    options: &ObjectWriteOptions,
 ) -> Result<u64, BackendError> {
     // Buffer batches in memory first — keeps Phase 34a simple. Streaming
     // multipart upload via `object_store::buffered::BufWriter` is a
@@ -231,7 +254,11 @@ async fn write_parquet_at_path(
     // writes to anything implementing AsyncWrite; we use a Vec<u8>
     // wrapped in a Compat shim via `tokio::io::AsyncWriteExt`.
     let mut buf: Vec<u8> = Vec::with_capacity(64 * 1024);
-    let props = WriterProperties::builder().build();
+    let mut props_builder = WriterProperties::builder();
+    if let Some(codec) = options.parquet_compression {
+        props_builder = props_builder.set_compression(parquet_compression_to_codec(codec));
+    }
+    let props = props_builder.build();
     let mut writer = AsyncArrowWriter::try_new(&mut buf, schema.clone(), Some(props))
         .map_err(|e| BackendError::Query(format!("parquet writer init: {e}")))?;
     let mut total: u64 = 0;
@@ -305,6 +332,7 @@ async fn write_csv_at_path(
     store: &Arc<dyn ObjectStore>,
     path: ObjectPath,
     mut stream: ArrowBatchStream,
+    options: &ObjectWriteOptions,
 ) -> Result<u64, BackendError> {
     let mut batches: Vec<RecordBatch> = Vec::new();
     while let Some(b) = stream.next().await {
@@ -314,9 +342,12 @@ async fn write_csv_at_path(
         return Ok(0);
     }
     let mut buf: Vec<u8> = Vec::with_capacity(64 * 1024);
-    let mut writer = arrow_csv::WriterBuilder::new()
-        .with_header(true)
-        .build(&mut buf);
+    let header = options.csv_header.unwrap_or(true);
+    let mut builder = arrow_csv::WriterBuilder::new().with_header(header);
+    if let Some(d) = options.csv_delimiter {
+        builder = builder.with_delimiter(d);
+    }
+    let mut writer = builder.build(&mut buf);
     let mut total: u64 = 0;
     for batch in &batches {
         total += batch.num_rows() as u64;
@@ -331,6 +362,19 @@ async fn write_csv_at_path(
         .await
         .map_err(|e| BackendError::Connection(format!("put {path}: {e}")))?;
     Ok(total)
+}
+
+/// Π.1.4: map our narrow `ParquetCompression` enum to the parquet
+/// crate's wide `Compression`. ZSTD level defaults to 3 — the
+/// parquet crate's recommended default.
+fn parquet_compression_to_codec(codec: ParquetCompression) -> parquet::basic::Compression {
+    use parquet::basic::{Compression, GzipLevel, ZstdLevel};
+    match codec {
+        ParquetCompression::Uncompressed => Compression::UNCOMPRESSED,
+        ParquetCompression::Snappy => Compression::SNAPPY,
+        ParquetCompression::Gzip => Compression::GZIP(GzipLevel::default()),
+        ParquetCompression::Zstd => Compression::ZSTD(ZstdLevel::default()),
+    }
 }
 
 /// Read all JSONL files (newline-delimited JSON) under `prefix` and
@@ -679,8 +723,12 @@ impl Backend for ObjectStoreBackend {
         }
         let path = new_object_path(&prefix, ext_for_format(self.format));
         match self.format {
-            ObjectFormat::Parquet => write_parquet_at_path(&self.store, path, stream).await,
-            ObjectFormat::Csv => write_csv_at_path(&self.store, path, stream).await,
+            ObjectFormat::Parquet => {
+                write_parquet_at_path(&self.store, path, stream, &self.write_options).await
+            }
+            ObjectFormat::Csv => {
+                write_csv_at_path(&self.store, path, stream, &self.write_options).await
+            }
             ObjectFormat::JsonLines => write_jsonl_at_path(&self.store, path, stream).await,
             ObjectFormat::Orc => write_orc_at_path(&self.store, path, stream).await,
         }
@@ -892,6 +940,144 @@ mod tests {
         Box::pin(futures_util::stream::once(async move {
             Ok::<_, BackendError>(batch)
         }))
+    }
+
+    /// Π.1.4: Parquet writes round-trip through every supported
+    /// compression codec. This is the contract the typed-Python
+    /// `Target(parquet_compression=...)` field rides on.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn parquet_round_trips_through_each_compression() {
+        use crate::backend::ParquetCompression;
+
+        // Repetitive data so the compressed file actually shrinks
+        // measurably vs uncompressed — gives the test something to
+        // assert on beyond "didn't crash".
+        fn repetitive_batch() -> RecordBatch {
+            let schema = Arc::new(ArrowSchema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("payload", DataType::Utf8, false),
+            ]));
+            let ids: Vec<i64> = (0..2_000).collect();
+            let payloads: Vec<&'static str> = (0..2_000)
+                .map(|_| "the quick brown fox jumps over the lazy dog")
+                .collect();
+            RecordBatch::try_new(
+                schema,
+                vec![
+                    Arc::new(Int64Array::from(ids)),
+                    Arc::new(StringArray::from(payloads)),
+                ],
+            )
+            .unwrap()
+        }
+
+        let mut sizes: std::collections::BTreeMap<&'static str, u64> =
+            std::collections::BTreeMap::new();
+        for (label, codec) in [
+            ("uncompressed", ParquetCompression::Uncompressed),
+            ("snappy", ParquetCompression::Snappy),
+            ("gzip", ParquetCompression::Gzip),
+            ("zstd", ParquetCompression::Zstd),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let backend = ObjectStoreBackend::open_local(dir.path(), ObjectFormat::Parquet)
+                .unwrap()
+                .with_write_options(ObjectWriteOptions {
+                    parquet_compression: Some(codec),
+                    ..Default::default()
+                });
+            let target = TargetTable {
+                schema: "raw".into(),
+                name: "events".into(),
+            };
+            let n = backend
+                .write_arrow_stream(
+                    &target,
+                    arrow_stream_for(repetitive_batch()),
+                    WriteMode::Append,
+                )
+                .await
+                .unwrap();
+            assert_eq!(n, 2_000, "{label}: row count");
+
+            // Round-trip read — Parquet readers handle compression
+            // transparently from file metadata.
+            let stream = backend.read_arrow_stream("raw/events").await.unwrap();
+            let batches: Vec<RecordBatch> = futures_util::TryStreamExt::try_collect(stream)
+                .await
+                .unwrap();
+            let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+            assert_eq!(total, 2_000, "{label}: read-back row count");
+
+            // Capture the on-disk size for the codec compare below.
+            let mut listing = backend.store().list(Some(&ObjectPath::from("raw/events")));
+            let mut size = 0u64;
+            while let Some(meta) = listing.next().await {
+                size += meta.unwrap().size;
+            }
+            sizes.insert(label, size);
+        }
+
+        // Sanity-check: each non-trivial codec actually compressed the
+        // file. Strict inequality — they should beat raw bytes by a
+        // healthy margin on the repetitive corpus above.
+        let raw = sizes["uncompressed"];
+        for codec in ["snappy", "gzip", "zstd"] {
+            let compressed = sizes[codec];
+            assert!(
+                compressed < raw,
+                "{codec} = {compressed} bytes vs uncompressed = {raw} bytes — \
+                 expected compression to actually reduce size"
+            );
+        }
+    }
+
+    /// Π.1.4: CSV writes honor user-set `csv_delimiter` + `csv_header`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn csv_honors_delimiter_and_header_options() {
+        use object_store::path::Path as ObjectPath2;
+
+        let dir = tempfile::tempdir().unwrap();
+        let backend = ObjectStoreBackend::open_local(dir.path(), ObjectFormat::Csv)
+            .unwrap()
+            .with_write_options(ObjectWriteOptions {
+                csv_delimiter: Some(b';'),
+                csv_header: Some(false),
+                ..Default::default()
+            });
+        let target = TargetTable {
+            schema: "raw".into(),
+            name: "events".into(),
+        };
+        backend
+            .write_arrow_stream(&target, arrow_stream_for(small_batch()), WriteMode::Append)
+            .await
+            .unwrap();
+
+        // Pull the raw bytes back so we can inspect framing — bypass
+        // read_arrow_stream because that re-infers schema and would
+        // hide the delimiter/header choice.
+        let mut listing = backend.store().list(Some(&ObjectPath2::from("raw/events")));
+        let entry = listing.next().await.unwrap().unwrap();
+        let bytes = backend
+            .store()
+            .get(&entry.location)
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        let text = std::str::from_utf8(&bytes).unwrap();
+        // Header was suppressed → first line is data; uses ';' not ','.
+        assert!(
+            !text.starts_with("id;name") && !text.starts_with("id,name"),
+            "header should not be present, got: {text:?}"
+        );
+        assert!(text.contains(";"), "delimiter should be ';', got: {text:?}");
+        assert!(
+            !text.contains("id,name"),
+            "should not contain comma-delimited header, got: {text:?}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

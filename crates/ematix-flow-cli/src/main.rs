@@ -11,7 +11,7 @@ use clap::{Parser, Subcommand};
 use ematix_flow_cli::supervisor::{RestartPolicy, run_supervised_consume};
 use ematix_flow_cli::{CliError, ConsumeOptions, PipelineCliConfig, run_consume_with};
 use ematix_flow_core::streaming::install_shutdown_handler;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -103,6 +103,7 @@ async fn run_consume_cmd(
     policy: RestartPolicy,
 ) -> Result<(), CliError> {
     let cfg = PipelineCliConfig::from_path(path)?;
+    emit_inline_credential_deprecations(&cfg);
     info!(
         pipeline_name = cfg.pipeline_name.as_str(),
         source_query = cfg.source_query.as_str(),
@@ -140,6 +141,33 @@ async fn run_consume_cmd(
         );
     }
     Ok(())
+}
+
+/// Π.5: surface inline-credential findings as `tracing::warn!`
+/// lines so users see the migration pointer toward the connection
+/// registry. Silenced by `EMATIX_FLOW_NO_DEPRECATION=1` so CI runs
+/// that intentionally use the legacy TOML form aren't noisy.
+fn emit_inline_credential_deprecations(cfg: &PipelineCliConfig) {
+    if std::env::var_os("EMATIX_FLOW_NO_DEPRECATION").is_some() {
+        return;
+    }
+    let findings = cfg.inline_credential_findings();
+    if findings.is_empty() {
+        return;
+    }
+    warn!(
+        pipeline_name = cfg.pipeline_name.as_str(),
+        count = findings.len(),
+        "DEPRECATION: this TOML config carries inline credentials. \
+         The inline-credentials TOML loader is scheduled for removal one \
+         minor release after the warning lands. Migrate to \
+         `flow consume --module my_pipelines <name>` + the connection \
+         registry; see docs/UNIFIED_PIPELINE_API.md. \
+         Set EMATIX_FLOW_NO_DEPRECATION=1 to silence this warning."
+    );
+    for finding in &findings {
+        warn!(detail = finding.as_str(), "inline credential");
+    }
 }
 
 fn init_tracing() {

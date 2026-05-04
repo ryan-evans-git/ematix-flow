@@ -1,0 +1,66 @@
+# Keyed time-windowed stream-stream inner join.
+#
+# Joins the `orders` topic against the `payments` topic on
+# `order_id`, emitting one combined row per (order, payment) pair
+# whose event-times fall within 5 minutes of each other.
+#
+# Per-side per-key buffers retain rows until
+# `wm > entry.event_ts + time_window_ms`. State is durable via
+# the `[state_store]` block; each emit commits left + right
+# buffers + both sources' Kafka offsets atomically.
+#
+# Requires:
+#   - Local Kafka with `orders` and `payments` topics. Both should
+#     produce JSON carrying `order_id` and `_event_ts`.
+#   - Local Postgres for the warehouse + state store.
+#
+# Run:
+#   flow consume examples/08_stream_join.toml --metrics-port 9100
+
+pipeline_name = "orders-payments"
+idle_pause_ms = 500
+
+# Multi-source form. `query` here is the source identifier the
+# join transform routes on — match it against `left_source` /
+# `right_source` below.
+[[sources]]
+query             = "orders"
+kind              = "kafka"
+bootstrap_servers = "localhost:9092"
+group_id          = "ematix-flow"
+
+[[sources]]
+query             = "payments"
+kind              = "kafka"
+bootstrap_servers = "localhost:9092"
+group_id          = "ematix-flow"
+
+[target]
+kind = "postgres"
+url  = "postgres://postgres:postgres@localhost/postgres"
+
+[target.table]
+schema = "public"
+name   = "orders_with_payments"
+
+# `[transform]` must be present so `[transform.join]` can attach
+# even though there's no SQL pre-stage (joins consume the two
+# sources directly).
+[transform]
+sql = ""
+
+[transform.join]
+kind             = "stream_stream_join"
+left_source      = "orders"               # matches sources[0].query
+right_source     = "payments"             # matches sources[1].query
+left_keys        = ["order_id"]
+right_keys       = ["order_id"]
+time_window_ms   = 300000                 # |orders.ts - payments.ts| ≤ 5 min
+event_time_column = "_event_ts"
+late_data        = "drop"
+left_column_prefix  = "left_"
+right_column_prefix = "right_"
+
+[state_store]
+kind = "postgres"
+url  = "postgres://postgres:postgres@localhost/postgres"

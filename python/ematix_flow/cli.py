@@ -97,6 +97,45 @@ def _cmd_run(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_consume(args: argparse.Namespace) -> int:
+    """Π.3: load a streaming pipeline from a Python module by name
+    and hand its rendered TOML to the Rust streaming runner.
+
+    The user's module decorates pipelines via
+    ``@ematix.streaming_pipeline(name="...", ...)``; the decorator
+    registers them by name. This CLI imports the module (which fires
+    every decorator), looks the named pipeline up, and renders the
+    TOML the existing Rust ``flow consume <toml>`` runtime parses.
+    """
+    from ematix_flow import streaming
+
+    _import_user_module(args.module)
+    try:
+        toml = streaming.render_streaming_pipeline_toml(args.name)
+    except KeyError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+    result = streaming.run_pipeline(
+        config_str=toml, metrics_port=args.metrics_port
+    )
+    print(json.dumps(result, default=str))
+    return 0
+
+
+def _cmd_consume_list(args: argparse.Namespace) -> int:
+    """Π.3: list streaming pipelines registered by the imported module."""
+    from ematix_flow import streaming
+
+    _import_user_module(args.module)
+    names = streaming.list_streaming_pipelines()
+    if args.format == "json":
+        print(json.dumps({"pipelines": names}))
+        return 0
+    for name in names:
+        print(name)
+    return 0
+
+
 def _cmd_run_due(args: argparse.Namespace) -> int:
     _import_user_module(args.module)
     now = _parse_iso(args.now) if args.now else datetime.now(timezone.utc)
@@ -252,6 +291,42 @@ def main(argv: list[str] | None = None) -> int:
     run_p.add_argument("--module", required=True)
     run_p.add_argument("name", help="pipeline name (matches @register(name=...))")
     run_p.set_defaults(func=_cmd_run)
+
+    # Π.3: streaming-pipeline subcommands. `consume` runs a single
+    # pipeline by name; `consume-list` lists what the imported module
+    # registers.
+    consume_p = sub.add_parser(
+        "consume",
+        help="run a streaming pipeline declared via "
+        "@ematix.streaming_pipeline by name",
+    )
+    consume_p.add_argument(
+        "--module",
+        required=True,
+        help="dotted module path that registers streaming pipelines",
+    )
+    consume_p.add_argument(
+        "name",
+        help="streaming pipeline name "
+        "(matches @ematix.streaming_pipeline(name=...))",
+    )
+    consume_p.add_argument(
+        "--metrics-port",
+        type=int,
+        default=None,
+        help="if set, expose Prometheus metrics on 127.0.0.1:<PORT>/metrics",
+    )
+    consume_p.set_defaults(func=_cmd_consume)
+
+    consume_list_p = sub.add_parser(
+        "consume-list",
+        help="list streaming pipelines registered by the imported module",
+    )
+    consume_list_p.add_argument("--module", required=True)
+    consume_list_p.add_argument(
+        "--format", choices=["text", "json"], default="text"
+    )
+    consume_list_p.set_defaults(func=_cmd_consume_list)
 
     due_p = sub.add_parser(
         "run-due", help="run pipelines whose schedule fires in (now-interval, now]"

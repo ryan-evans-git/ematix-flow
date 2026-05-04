@@ -92,7 +92,7 @@ from __future__ import annotations
 import os
 import re
 from dataclasses import dataclass, field, fields
-from typing import Any, Optional
+from typing import Any, Optional, Union
 
 __all__ = [
     "Connection",
@@ -100,6 +100,7 @@ __all__ = [
     "RabbitMQConnection",
     "PubSubConnection",
     "KinesisConnection",
+    "SchemaRegistryConnection",
     "PostgresConnection",
     "MySQLConnection",
     "SQLiteConnection",
@@ -235,6 +236,34 @@ class Connection:
 
 
 @dataclass(repr=False)
+class SchemaRegistryConnection(Connection):
+    """Confluent-style Schema Registry handle (Π.1).
+
+    Pass either an instance or its registered name to
+    ``KafkaConnection(schema_registry=...)`` so SR config lives in
+    the typed-connection registry alongside every other credential
+    instead of inline in the streaming TOML.
+
+    ``basic_auth_user`` / ``basic_auth_password`` are accepted on
+    the dataclass but the Rust runtime can't yet apply them — the
+    streaming TOML emitter raises ``NotImplementedError`` if they
+    reach the emit step. Plumbing through ``SrSettings::new_basic_auth``
+    is a small Rust-core follow-up.
+    """
+
+    url: str = ""
+    basic_auth_user: Optional[str] = None
+    basic_auth_password: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        self.kind = "schema_registry"
+        if not self.url:
+            raise ValueError(
+                f"SchemaRegistryConnection({self.name!r}): url is required"
+            )
+
+
+@dataclass(repr=False)
 class KafkaConnection(Connection):
     """Kafka cluster handle.
 
@@ -246,6 +275,10 @@ class KafkaConnection(Connection):
     group_id: Optional[str] = None
     payload_format: Optional[str] = None  # "json" | "raw_bytes" | "avro" | "protobuf"
     schema_registry_url: Optional[str] = None
+    # Π.1: typed Schema Registry reference. Accepts a
+    # `SchemaRegistryConnection` instance or a registered SR name
+    # string. Mutually exclusive with `schema_registry_url=`.
+    schema_registry: Optional[Union[str, "SchemaRegistryConnection"]] = None
     sasl_plain_username: Optional[str] = None
     sasl_plain_password: Optional[str] = None
     sasl_scram_username: Optional[str] = None
@@ -257,6 +290,12 @@ class KafkaConnection(Connection):
         self.kind = "kafka"
         if not self.bootstrap_servers:
             raise ValueError(f"KafkaConnection({self.name!r}): bootstrap_servers is required")
+        if self.schema_registry is not None and self.schema_registry_url is not None:
+            raise ValueError(
+                f"KafkaConnection({self.name!r}): set either "
+                "`schema_registry=` (typed SR connection or name) OR the "
+                "legacy `schema_registry_url=` shorthand, not both"
+            )
 
 
 @dataclass(repr=False)
@@ -441,6 +480,7 @@ _KIND_FACTORIES: dict[str, type] = {
     "rabbitmq": RabbitMQConnection,
     "pubsub": PubSubConnection,
     "kinesis": KinesisConnection,
+    "schema_registry": SchemaRegistryConnection,
     "postgres": PostgresConnection,
     "mysql": MySQLConnection,
     "sqlite": SQLiteConnection,

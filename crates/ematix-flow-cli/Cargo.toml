@@ -29,6 +29,10 @@ async-trait = "0.1"
 thiserror.workspace = true
 axum = { workspace = true }
 prometheus = { workspace = true }
+# Π.4b-3: lookup-load helper streams Arrow batches into MemTables.
+arrow-array = { workspace = true }
+arrow-schema = { workspace = true }
+futures-util = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

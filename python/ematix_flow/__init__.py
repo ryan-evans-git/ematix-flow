@@ -18,6 +18,7 @@ from ematix_flow.connections import (
     PostgresConnection,
     PubSubConnection,
     RabbitMQConnection,
+    SchemaRegistryConnection,
     SQLiteConnection,
     get_connection,
     register_connection,
@@ -25,7 +26,18 @@ from ematix_flow.connections import (
 )
 from ematix_flow.decorators import ematix
 from ematix_flow.markers import natural_key, nullable, pk
-from ematix_flow.streaming import Target, run_pipeline, run_streaming_pipeline
+from ematix_flow.streaming import (
+    Aggregation,
+    Join,
+    Lookup,
+    Source,
+    StateStore,
+    Target,
+    Watermark,
+    Window,
+    run_pipeline,
+    run_streaming_pipeline,
+)
 
 __version__ = "0.1.0"
 
@@ -43,6 +55,7 @@ __all__ = [
     "get_connection",
     "KafkaConnection",
     "KinesisConnection",
+    "Lookup",
     "MySQLConnection",
     "natural_key",
     "nullable",
@@ -52,11 +65,18 @@ __all__ = [
     "PostgresConnection",
     "PubSubConnection",
     "RabbitMQConnection",
+    "SchemaRegistryConnection",
+    "Aggregation",
+    "Join",
     "register_connection",
     "registered_connections",
     "run_pipeline",
     "run_streaming_pipeline",
+    "Source",
     "SQLiteConnection",
+    "StateStore",
     "streaming",
     "Target",
+    "Watermark",
+    "Window",
 ]

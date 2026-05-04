@@ -60,6 +60,42 @@ pub enum ObjectFormat {
     JsonLines,
 }
 
+/// Per-format write-time options. Defaults match the historical
+/// pre-Π.1.4 behavior: Parquet uncompressed, CSV with comma delimiter
+/// + header row. Pass via [`ObjectStoreBackend::with_write_options`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+pub struct ObjectWriteOptions {
+    /// Compression codec for Parquet writes. `None` keeps the
+    /// historical default (UNCOMPRESSED). Only consulted when the
+    /// backend's [`ObjectFormat`] is `Parquet`.
+    pub parquet_compression: Option<ParquetCompression>,
+    /// CSV column delimiter (single byte). `None` = comma. Used only
+    /// when the backend's format is `Csv`.
+    pub csv_delimiter: Option<u8>,
+    /// Whether to write a header row in CSV output. `None` = true.
+    /// Used only when the backend's format is `Csv`.
+    pub csv_header: Option<bool>,
+}
+
+/// Parquet compression codec. Subset of the parquet crate's
+/// `Compression` enum exposed at our backend boundary — kept narrow
+/// because the wider set (LZO, BROTLI, LZ4, LZ4_RAW) is rarely
+/// asked for in production. Each variant maps to a single
+/// `parquet::basic::Compression` value at write time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ParquetCompression {
+    /// No compression. Same as today's default.
+    Uncompressed,
+    /// Hadoop-ecosystem default. Fast encode/decode, ~30% ratio for
+    /// typical analytics data.
+    Snappy,
+    /// Universal compatibility. Slower than Snappy, similar ratio.
+    Gzip,
+    /// Modern best-in-class. ZstdLevel(3) — the parquet crate's
+    /// default level, balanced encode speed vs ratio.
+    Zstd,
+}
+
 /// Streaming source/sink kind (Phase 36–37).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum StreamingKind {
@@ -308,6 +344,54 @@ pub trait Backend: Send + Sync {
     /// is the at-least-once primitive used by `StreamingPipeline`.
     async fn commit_offsets(&self) -> Result<(), BackendError> {
         Ok(())
+    }
+
+    /// Phase 39.5a: does this backend round-trip an offset blob
+    /// through [`seek_to`] / [`offset_snapshot`]?
+    ///
+    /// Pipelines configured with sessions or stream-stream joins
+    /// fail at config-load if any source backend reports `false`,
+    /// because a `StateStore`-backed pipeline must be able to
+    /// resume from its committed offset on restart.
+    ///
+    /// [`seek_to`]: Backend::seek_to
+    /// [`offset_snapshot`]: Backend::offset_snapshot
+    fn supports_seek_to(&self) -> bool {
+        false
+    }
+
+    /// Phase 39.5a: rewind the read position to a previously
+    /// committed offset. Called once at pipeline startup, before
+    /// the first `read_arrow_stream`, with the bytes loaded from
+    /// `StateStore`.
+    ///
+    /// `offset_bytes` is opaque to the rest of the framework — the
+    /// backend that wrote them via [`offset_snapshot`] is the only
+    /// thing that knows the format. For Kafka it's a JSON
+    /// partition→offset map; other backends pick their own.
+    ///
+    /// Default impl returns an error so config-load can probe and
+    /// reject session/join pipelines on backends that haven't
+    /// opted in.
+    ///
+    /// [`offset_snapshot`]: Backend::offset_snapshot
+    async fn seek_to(&self, _offset_bytes: &[u8]) -> Result<(), BackendError> {
+        Err(BackendError::Other(format!(
+            "backend dialect {:?} does not support seek_to (state persistence)",
+            self.dialect()
+        )))
+    }
+
+    /// Phase 39.5a: capture the current read position as opaque
+    /// bytes suitable for handing to `StateStore.commit`. Returns
+    /// `None` if no offset has advanced since the last commit (or
+    /// since startup) — callers skip the source from the snapshot.
+    ///
+    /// Default impl returns `None`, matching the default `seek_to`
+    /// "not supported": a non-streaming backend has nothing to
+    /// snapshot.
+    async fn offset_snapshot(&self) -> Result<Option<Vec<u8>>, BackendError> {
+        Ok(None)
     }
 }
 

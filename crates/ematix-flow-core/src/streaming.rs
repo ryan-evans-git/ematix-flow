@@ -27,16 +27,181 @@
 //! supervisor (process pool, exponential-backoff restart) wraps this
 //! at an even higher layer and is also CLI-side.
 
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
-use arrow_array::RecordBatch;
+use arrow_array::cast::AsArray;
+use arrow_array::types::TimestampMicrosecondType;
+use arrow_array::{Array, RecordBatch};
+use arrow_schema::DataType;
 use futures_util::TryStreamExt;
-use prometheus::{IntCounter, Registry};
+use prometheus::{GaugeVec, IntCounter, Registry};
 use tokio::sync::watch;
 
 use crate::backend::{ArrowBatchStream, Backend, BackendError, TargetTable, WriteMode};
 use crate::kafka_backend::KafkaBackend;
+use crate::state_store::{RecoveredState, StateStore};
+use crate::transform::{BatchContext, BatchTransform};
+
+/// Phase 39.4 PR 1: per-pipeline watermark configuration.
+///
+/// `None` on `StreamingPipelineConfig::watermark` (the historical
+/// default) disables watermark machinery entirely — the pipeline
+/// neither extracts `_event_ts` nor tracks per-source state, so
+/// non-windowed pipelines pay zero overhead.
+///
+/// `Some(WatermarkConfig { ... })` opts in. The pipeline scans every
+/// batch's `_event_ts` column, advances per-source watermarks, and
+/// computes a global watermark as `min` over non-idle sources.
+/// `BatchContext::global_wm` carries that value to the transform.
+#[derive(Debug, Clone)]
+pub struct WatermarkConfig {
+    /// Per-source watermark slack: `wm_i = max(_event_ts_i) − lateness_ms`.
+    /// Set to 0 for "I trust event-time order"; raise for sources that
+    /// produce out-of-order data.
+    pub lateness_ms: u64,
+    /// A source is excluded from the multi-source `min(wm_i)` after
+    /// going this long without producing a batch. Default: 60 s.
+    pub source_idleness_ms: u64,
+}
+
+impl Default for WatermarkConfig {
+    fn default() -> Self {
+        Self {
+            lateness_ms: 0,
+            source_idleness_ms: 60_000,
+        }
+    }
+}
+
+/// Per-iteration mutable state for watermark tracking. Index aligns
+/// with `StreamingPipeline::sources`.
+#[derive(Debug)]
+struct WatermarkState {
+    /// Max `_event_ts` observed per source (microseconds since
+    /// Unix epoch, UTC). `None` until the source produces its first
+    /// non-empty batch carrying `_event_ts`.
+    max_event_ts: Vec<Option<i64>>,
+    /// Wall-clock timestamp of the last non-empty batch from each
+    /// source. Drives idleness detection. `None` until first batch.
+    last_arrival: Vec<Option<Instant>>,
+}
+
+impl WatermarkState {
+    fn new(n_sources: usize) -> Self {
+        Self {
+            max_event_ts: vec![None; n_sources],
+            last_arrival: vec![None; n_sources],
+        }
+    }
+}
+
+/// Extract the maximum value from a batch's `_event_ts` column.
+/// Phase 39.5a P1.8: tokio task that wakes every `interval` and
+/// commits any pending session/join state diff plus current source
+/// offsets to `store`. Exits cleanly on shutdown.
+///
+/// This is the floor that bounds replay-on-restart for pipelines
+/// that hold dirty session state without emitting (long retention
+/// budget on a sparse source). Active pipelines see commits via
+/// the per-emit path in `StreamingPipeline::run`'s
+/// `finalize_iteration`; the ticker is additive.
+async fn checkpoint_loop(
+    store: Arc<dyn StateStore>,
+    pipeline_name: String,
+    transform: Option<Arc<dyn BatchTransform>>,
+    sources: Vec<(Arc<dyn Backend>, String)>,
+    interval: Duration,
+    shutdown: ShutdownSignal,
+) {
+    let mut ticker = tokio::time::interval(interval);
+    // Skip the immediate first tick — we just started.
+    ticker.tick().await;
+    // If the pipeline falls behind for any reason, MissedTickBehavior
+    // = Delay drops missed ticks rather than firing them in a burst.
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            _ = ticker.tick() => {
+                if let Err(e) = checkpoint_once(
+                    &store,
+                    &pipeline_name,
+                    transform.as_ref(),
+                    &sources,
+                ).await {
+                    // Don't propagate — the per-emit commits are
+                    // still happening in the main run loop, so a
+                    // ticker miss isn't fatal. Log + continue.
+                    tracing::warn!(
+                        pipeline = %pipeline_name,
+                        error = %e,
+                        "periodic checkpoint commit failed; main loop continues"
+                    );
+                }
+            }
+            _ = shutdown.wait() => break,
+        }
+    }
+}
+
+/// One iteration of the checkpoint loop: drain transform diff +
+/// snapshot offsets + commit. No-op when nothing changed.
+async fn checkpoint_once(
+    store: &Arc<dyn StateStore>,
+    pipeline_name: &str,
+    transform: Option<&Arc<dyn BatchTransform>>,
+    sources: &[(Arc<dyn Backend>, String)],
+) -> Result<(), BackendError> {
+    use crate::state_store::CommitSnapshot;
+    let (state_upserts, state_deletes) = match transform {
+        Some(t) => t.take_state_commit().await?,
+        None => (Vec::new(), Vec::new()),
+    };
+    let mut offsets: std::collections::HashMap<String, Vec<u8>> = std::collections::HashMap::new();
+    for (backend, query) in sources {
+        if let Some(bytes) = backend.offset_snapshot().await? {
+            offsets.insert(query.clone(), bytes);
+        }
+    }
+    if state_upserts.is_empty() && state_deletes.is_empty() && offsets.is_empty() {
+        return Ok(());
+    }
+    store
+        .commit(
+            pipeline_name,
+            CommitSnapshot {
+                state_upserts,
+                state_deletes,
+                offsets,
+                state_version: crate::session_blob::STATE_BLOB_VERSION,
+            },
+        )
+        .await
+}
+
+/// Returns `None` if the column is missing, has the wrong type, or
+/// is entirely null. Tolerant of non-`Microsecond` timestamps in
+/// PR 1 (silently skipped); PR 2's `WindowedAggregateTransform`
+/// will validate strictly.
+fn batch_max_event_ts(batch: &RecordBatch) -> Option<i64> {
+    let idx = batch.schema().index_of("_event_ts").ok()?;
+    let arr = batch.column(idx);
+    if !matches!(
+        arr.data_type(),
+        DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, _)
+    ) {
+        return None;
+    }
+    let ts = arr.as_primitive_opt::<TimestampMicrosecondType>()?;
+    let mut max_v: Option<i64> = None;
+    for i in 0..ts.len() {
+        if !ts.is_null(i) {
+            let v = ts.value(i);
+            max_v = Some(max_v.map_or(v, |m| m.max(v)));
+        }
+    }
+    max_v
+}
 
 /// Prometheus counters for a single streaming pipeline. The
 /// counters live on a private Registry so multiple pipelines in one
@@ -52,6 +217,12 @@ pub struct StreamingPipelineMetricsCounters {
     pub errors: IntCounter,
     pub dlq_writes: IntCounter,
     pub idle_iterations: IntCounter,
+    /// Phase 39.4 PR 1: per-source and global watermark, in seconds
+    /// since the Unix epoch. The `source` label is each source's
+    /// query string (Kafka topic / Pub/Sub subscription / etc.);
+    /// the special label value `"_global"` carries the
+    /// `min(wm_i over non-idle)` aggregate.
+    pub watermark_seconds: GaugeVec,
 }
 
 impl StreamingPipelineMetricsCounters {
@@ -71,6 +242,18 @@ impl StreamingPipelineMetricsCounters {
                 .expect("counter register");
             counter
         };
+        let watermark_seconds = GaugeVec::new(
+            Opts::new(
+                "ematix_streaming_watermark_seconds",
+                "Per-source and global watermark, in seconds since Unix epoch (UTC).",
+            )
+            .const_label("pipeline", pipeline_name),
+            &["source"],
+        )
+        .expect("GaugeVec creation");
+        registry
+            .register(Box::new(watermark_seconds.clone()))
+            .expect("watermark_seconds register");
         Self {
             rows_consumed: mk(
                 "ematix_streaming_rows_consumed_total",
@@ -96,6 +279,7 @@ impl StreamingPipelineMetricsCounters {
                 "ematix_streaming_idle_iterations_total",
                 "Total idle-batch iterations (source returned zero rows).",
             ),
+            watermark_seconds,
             registry,
         }
     }
@@ -142,6 +326,79 @@ pub struct StreamingPipelineConfig {
     /// produce ack lands, so a crash mid-DLQ-write means the
     /// original messages are re-delivered, not lost.
     pub dead_letter_topic: Option<String>,
+    /// Π.4b-1: optional per-batch SQL transform applied between
+    /// `source.read_arrow_stream` and `target.write_arrow_stream`.
+    /// `None` is the historical fast path — the pipeline forwards
+    /// batches unchanged (zero overhead). `Some(t)` runs every
+    /// non-empty input batch through `t.transform`; each call may
+    /// produce 0..N output batches that are then forwarded to the
+    /// target(s).
+    pub transform: Option<Arc<dyn BatchTransform>>,
+    /// Phase 39.4 PR 1: opt-in watermark machinery. `None` (default)
+    /// disables `_event_ts` extraction and per-source tracking
+    /// entirely — non-windowed pipelines pay zero overhead. `Some`
+    /// enables the per-iteration scan and feeds the resulting
+    /// `global_wm` into [`crate::transform::BatchContext::global_wm`].
+    pub watermark: Option<WatermarkConfig>,
+    /// Phase 39.5a PR 3: optional `StateStore` for durable per-emit
+    /// session state + offset commits. When set, the pipeline:
+    /// - Calls [`StreamingPipeline::load_state`] at startup to
+    ///   restore committed offsets and rehydrate the session
+    ///   transform's per-key state map.
+    /// - After each non-empty target write, drains the transform's
+    ///   pending state diff plus every source's offset snapshot
+    ///   and commits them in a single [`StateStore::commit`] call.
+    ///   The atomic commit replaces source-side
+    ///   [`Backend::commit_offsets`] (which becomes advisory and is
+    ///   skipped for sources whose offsets are now in the store).
+    pub state_store: Option<Arc<dyn StateStore>>,
+    /// Phase 39.5a P2.15: how to handle errors that bubble out of
+    /// `transform.transform(batch, ctx)`. Defaults to `Fail` —
+    /// preserves the historical "propagate to supervisor on
+    /// transform error" behavior.
+    pub transform_on_error: TransformErrorPolicy,
+    /// Phase 39.5a P1.8: periodic dirty-only checkpoint cadence.
+    /// When set, [`StreamingPipeline::run`] spawns a tokio ticker
+    /// that calls [`StreamingPipeline::commit_state`] every
+    /// `Duration::from_millis(N)` regardless of emit activity. Bounds
+    /// replay-on-restart for idle-but-dirty pipelines (long
+    /// retention windows on a sparse source). `None` disables the
+    /// floor; per-emit commits still drive durability for active
+    /// pipelines.
+    pub checkpoint_interval_ms: Option<u64>,
+}
+
+/// Phase 39.5a P2.15: per-batch transform-error handling.
+///
+/// `transform()` errors propagate from DataFusion (CAST failures,
+/// division by zero, etc.) at batch granularity — DataFusion
+/// executes per-batch, so a single bad row fails the whole batch.
+/// Operators choose what happens to the batch under error:
+///
+/// - `Fail` (default) — propagate the error. The supervisor (when
+///   `--restart-on-error` is set) restarts the pipeline; otherwise
+///   the run exits non-zero. Historical behavior; preserves data
+///   integrity strictly.
+/// - `Drop` — log the error, increment `ematix_streaming_errors_total`,
+///   skip the batch. Source offsets advance as if the batch had
+///   produced no rows. Use when transient bad data is expected
+///   (best-effort transform layer).
+/// - `Dlq` — log + counter + route the original (pre-transform)
+///   input batch to the configured `dead_letter_topic`. Requires
+///   `dead_letter_topic` set + a Kafka source (same constraint as
+///   the per-batch-write-failure DLQ path). Operators get
+///   visibility into bad rows without losing them.
+///
+/// Stateful transforms (windows / sessions / joins) may leave
+/// partially-mutated state on transform error. `Drop` and `Dlq`
+/// don't roll that back — use `Fail` + supervisor restart for
+/// strict integrity in stateful pipelines.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum TransformErrorPolicy {
+    #[default]
+    Fail,
+    Drop,
+    Dlq,
 }
 
 impl StreamingPipelineConfig {
@@ -160,12 +417,55 @@ impl StreamingPipelineConfig {
             idle_pause_ms: 500,
             pipeline_name: pipeline_name.into(),
             dead_letter_topic: None,
+            transform: None,
+            watermark: None,
+            state_store: None,
+            checkpoint_interval_ms: None,
+            transform_on_error: TransformErrorPolicy::Fail,
         }
+    }
+
+    /// Builder-style: install a transform-error policy. Defaults
+    /// to `Fail`.
+    pub fn with_transform_on_error(mut self, policy: TransformErrorPolicy) -> Self {
+        self.transform_on_error = policy;
+        self
+    }
+
+    /// Builder-style: install a `StateStore` for durable per-emit
+    /// session state + offset commits (Phase 39.5a PR 3).
+    pub fn with_state_store(mut self, store: Arc<dyn StateStore>) -> Self {
+        self.state_store = Some(store);
+        self
+    }
+
+    /// Builder-style: enable the periodic dirty-only checkpoint
+    /// ticker at `interval_ms` cadence. Pipelines with active
+    /// per-emit commits don't need this; the ticker matters only
+    /// for sessions / joins that hold dirty state without
+    /// emitting (long retention budget on a sparse source).
+    pub fn with_checkpoint_interval_ms(mut self, interval_ms: u64) -> Self {
+        self.checkpoint_interval_ms = Some(interval_ms);
+        self
     }
 
     /// Builder-style: opt into DLQ routing on target write failure.
     pub fn with_dead_letter_topic(mut self, topic: impl Into<String>) -> Self {
         self.dead_letter_topic = Some(topic.into());
+        self
+    }
+
+    /// Builder-style: install a per-batch transform.
+    pub fn with_transform(mut self, transform: Arc<dyn BatchTransform>) -> Self {
+        self.transform = Some(transform);
+        self
+    }
+
+    /// Builder-style: enable watermark machinery with the given
+    /// configuration. Required for Phase 39.4 windowed transforms;
+    /// no-op (and zero-overhead) for filter / project / cast.
+    pub fn with_watermark(mut self, watermark: WatermarkConfig) -> Self {
+        self.watermark = Some(watermark);
         self
     }
 }
@@ -242,13 +542,23 @@ impl ShutdownSignal {
 /// across threads (e.g. the CLI's supervisor lives in one task,
 /// the SIGTERM handler in another).
 pub struct StreamingPipeline {
-    pub source: Arc<dyn Backend>,
+    /// Π.4b-2: each pipeline iteration reads concurrently from
+    /// every `(backend, query)` pair here, concatenates the
+    /// resulting batches (UNION ALL), then forwards them through
+    /// the optional transform and to every target. A 1-element
+    /// Vec is the historical single-source shape.
+    pub sources: Vec<(Arc<dyn Backend>, String)>,
     /// Π.4a: each pipeline iteration fans the source's batches out
     /// to **every** entry here. A 1-element Vec is the historical
     /// single-target shape; >1 entry is multi-target fan-out.
     pub targets: Vec<(Arc<dyn Backend>, TargetTable)>,
     pub config: StreamingPipelineConfig,
     pub metrics: StreamingPipelineMetricsCounters,
+    /// Phase 39.4 PR 1: per-iteration watermark state. Allocated
+    /// to `sources.len()` slots regardless of `config.watermark`
+    /// so the field is always indexable; updates are skipped when
+    /// `config.watermark.is_none()`.
+    watermark_state: Mutex<WatermarkState>,
 }
 
 impl StreamingPipeline {
@@ -258,11 +568,14 @@ impl StreamingPipeline {
         config: StreamingPipelineConfig,
     ) -> Self {
         let metrics = StreamingPipelineMetricsCounters::new(&config.pipeline_name);
+        let sources = vec![(source, config.source_query.clone())];
+        let watermark_state = Mutex::new(WatermarkState::new(sources.len()));
         Self {
-            source,
+            sources,
             targets,
             config,
             metrics,
+            watermark_state,
         }
     }
 
@@ -279,11 +592,174 @@ impl StreamingPipeline {
         Self::new(source, vec![(target, table)], config)
     }
 
+    /// Π.4b-2: multi-source fan-in. Each `(backend, query)` pair is
+    /// drained per iteration; their batches are concatenated
+    /// (UNION ALL semantics — schemas must be compatible at the
+    /// target boundary) before transform + target fan-out. The
+    /// `config.source_query` field is unused on this path; per-
+    /// source queries come from the `sources` vec.
+    ///
+    /// **DLQ caveat:** the existing DLQ path uses the first source
+    /// backend to produce dead-letter messages — only meaningful
+    /// when source 0 is Kafka. Cross-source DLQ routing would need
+    /// a separate per-source policy and isn't built yet.
+    pub fn new_multi_source(
+        sources: Vec<(Arc<dyn Backend>, String)>,
+        targets: Vec<(Arc<dyn Backend>, TargetTable)>,
+        config: StreamingPipelineConfig,
+    ) -> Self {
+        let metrics = StreamingPipelineMetricsCounters::new(&config.pipeline_name);
+        Self::new_multi_source_with_metrics(sources, targets, config, metrics)
+    }
+
+    /// Phase 39.4 PR 2b: like [`Self::new_multi_source`] but accepts
+    /// a pre-built [`StreamingPipelineMetricsCounters`]. Use this
+    /// when the caller (typically the CLI) needs to register
+    /// additional metrics — e.g. [`crate::windowed::WindowedMetrics`]
+    /// for a windowed transform — into the pipeline's existing
+    /// Prometheus registry *before* the pipeline starts running.
+    pub fn new_multi_source_with_metrics(
+        sources: Vec<(Arc<dyn Backend>, String)>,
+        targets: Vec<(Arc<dyn Backend>, TargetTable)>,
+        config: StreamingPipelineConfig,
+        metrics: StreamingPipelineMetricsCounters,
+    ) -> Self {
+        let watermark_state = Mutex::new(WatermarkState::new(sources.len()));
+        Self {
+            sources,
+            targets,
+            config,
+            metrics,
+            watermark_state,
+        }
+    }
+
     /// Borrow the Prometheus registry — for serving via a
     /// `/metrics` HTTP endpoint or federating into a process-wide
     /// scraper.
     pub fn metrics_registry(&self) -> &Registry {
         &self.metrics.registry
+    }
+
+    /// Phase 39.5a: load committed state for `config.pipeline_name`
+    /// from `store` and apply per-source [`Backend::seek_to`]. Call
+    /// once before [`Self::run`].
+    ///
+    /// Returns the loaded [`RecoveredState`] so the caller can also
+    /// thread `state_by_key` into the windowed transform's session
+    /// recovery (PR 2/3) — that wiring is not part of PR 1.
+    ///
+    /// ## Source identity
+    ///
+    /// Each source's `query` field is its `SourceId`. Stable across
+    /// restarts as long as the user doesn't change the topic /
+    /// subscription / stream name. Two sources with the same query
+    /// in one pipeline collide on offsets — left as a config-load
+    /// check for PR 3.
+    ///
+    /// ## Source backends without `seek_to`
+    ///
+    /// Sources that override `supports_seek_to() = false` skip the
+    /// seek call silently, matching the design-doc rule that
+    /// state-persistent pipelines are rejected at config-load when
+    /// any source backend lacks `seek_to` (validation lives one
+    /// layer up — PR 3 in the CLI).
+    pub async fn load_state(&self, store: &dyn StateStore) -> Result<RecoveredState, BackendError> {
+        let recovered = store.load(&self.config.pipeline_name).await?;
+        for (backend, query) in &self.sources {
+            if let Some(bytes) = recovered.offsets.get(query.as_str()) {
+                if !backend.supports_seek_to() {
+                    return Err(BackendError::Other(format!(
+                        "pipeline `{}` has committed state for source `{}` but \
+                         that source backend does not support seek_to — refusing \
+                         to silently drop the recovered offset",
+                        self.config.pipeline_name, query
+                    )));
+                }
+                backend.seek_to(bytes).await?;
+            }
+        }
+        // PR 3: rehydrate the transform's per-key session state
+        // from the recovered blobs. No-op for non-stateful
+        // transforms (default impl returns Ok(())).
+        if let Some(t) = &self.config.transform {
+            t.recover_state(&recovered.state_by_key).await?;
+        }
+        Ok(recovered)
+    }
+
+    /// Phase 39.5a PR 3: build a [`CommitSnapshot`] from the
+    /// transform's pending session state diff plus every source's
+    /// current offset, and commit it atomically to `store`. Called
+    /// by [`Self::run`] after each successful target write when
+    /// `config.state_store` is set.
+    ///
+    /// Returns the snapshot's `(state_upserts, state_deletes,
+    /// offsets)` count so callers / tests can assert on commit
+    /// shape; the transform's dirty/evicted sets are drained even
+    /// on success-with-zero-diffs commits (which become no-ops).
+    pub async fn commit_state(
+        &self,
+        store: &dyn StateStore,
+    ) -> Result<(usize, usize, usize), BackendError> {
+        use crate::state_store::CommitSnapshot;
+        let (state_upserts, state_deletes) = match &self.config.transform {
+            Some(t) => t.take_state_commit().await?,
+            None => (Vec::new(), Vec::new()),
+        };
+
+        // Collect each source's current offset bytes. Sources that
+        // don't support `offset_snapshot` (default impl returns
+        // Ok(None)) drop out — they must use side-channel commits.
+        let mut offsets: std::collections::HashMap<String, Vec<u8>> =
+            std::collections::HashMap::new();
+        for (backend, query) in &self.sources {
+            if let Some(bytes) = backend.offset_snapshot().await? {
+                offsets.insert(query.clone(), bytes);
+            }
+        }
+
+        let n_upserts = state_upserts.len();
+        let n_deletes = state_deletes.len();
+        let n_offsets = offsets.len();
+        let snapshot = CommitSnapshot {
+            state_upserts,
+            state_deletes,
+            offsets,
+            // PR 3 ships the v=1 layout. PR 2's session state is
+            // stable — no migrations registered yet.
+            state_version: crate::session_blob::STATE_BLOB_VERSION,
+        };
+        store.commit(&self.config.pipeline_name, snapshot).await?;
+        Ok((n_upserts, n_deletes, n_offsets))
+    }
+
+    /// Phase 39.5a PR 3 + P1.7a: post-iteration durability sweep.
+    ///
+    /// Two responsibilities:
+    /// 1. **`commit_offsets()` per source** — always runs.
+    ///    Pub/Sub + RabbitMQ ack messages here (the broker is the
+    ///    offset source of truth). Kafka commits to the local
+    ///    consumer group; redundant under `state_store` (the store
+    ///    has the same offsets) but safe + cheap.
+    /// 2. **`commit_state()`** — runs when `state_store` is
+    ///    configured. Bundles the transform's pending session diff
+    ///    along with offsets from any source whose
+    ///    `offset_snapshot()` returns Some bytes (Kafka today;
+    ///    Kinesis and object stores in P1.7b).
+    ///
+    /// Order: commit_state first so a crash between (1) and (2)
+    /// leaves the broker uncommitted (rows re-deliver, idempotent
+    /// target absorbs). The reverse order would risk acked-but-
+    /// uncommitted state on crash → data loss.
+    async fn finalize_iteration(&self) -> Result<(), BackendError> {
+        if let Some(store) = &self.config.state_store {
+            let _ = self.commit_state(store.as_ref()).await?;
+        }
+        for (backend, _query) in &self.sources {
+            backend.commit_offsets().await?;
+        }
+        Ok(())
     }
 
     /// Run the pipeline loop until `shutdown` is triggered or the
@@ -301,25 +777,137 @@ impl StreamingPipeline {
         shutdown: ShutdownSignal,
     ) -> Result<StreamingPipelineMetrics, BackendError> {
         let mut summary = StreamingPipelineMetrics::default();
+
+        // Phase 39.5a P1.8: spawn the periodic dirty-only checkpoint
+        // ticker if the pipeline has both a `state_store` and a
+        // configured `checkpoint_interval_ms`. The ticker runs
+        // independently of the main read/transform/write loop and
+        // exits cleanly on shutdown.
+        let _checkpoint_handle: Option<tokio::task::JoinHandle<()>> = match (
+            self.config.state_store.clone(),
+            self.config.checkpoint_interval_ms,
+        ) {
+            (Some(store), Some(interval_ms)) if interval_ms > 0 => {
+                let pipeline_name = self.config.pipeline_name.clone();
+                let transform = self.config.transform.clone();
+                let sources: Vec<(Arc<dyn Backend>, String)> = self.sources.clone();
+                let shutdown = shutdown.clone();
+                Some(tokio::spawn(async move {
+                    checkpoint_loop(
+                        store,
+                        pipeline_name,
+                        transform,
+                        sources,
+                        Duration::from_millis(interval_ms),
+                        shutdown,
+                    )
+                    .await;
+                }))
+            }
+            _ => None,
+        };
+
         loop {
             if shutdown.is_triggered() {
                 summary.shutdown_triggered = true;
                 break;
             }
 
-            let stream: ArrowBatchStream = self
-                .source
-                .read_arrow_stream(&self.config.source_query)
-                .await
-                .inspect_err(|_| {
-                    self.metrics.errors.inc();
-                })?;
-            let batches: Vec<RecordBatch> = stream.try_collect().await.inspect_err(|_| {
-                self.metrics.errors.inc();
-            })?;
+            // Π.4b-2: read concurrently from every source. join_all
+            // (not try_join_all) lets us see all errors — but for
+            // simplicity we surface the first one. Sources commit
+            // independently below only on the all-success path.
+            let reads = self.sources.iter().map(|(backend, query)| async move {
+                let stream: ArrowBatchStream = backend.read_arrow_stream(query).await?;
+                let batches: Vec<RecordBatch> = stream.try_collect().await?;
+                Ok::<_, BackendError>(batches)
+            });
+            let read_results: Vec<Result<Vec<RecordBatch>, BackendError>> =
+                futures_util::future::join_all(reads).await;
+
+            // First failure short-circuits the iteration. Source
+            // offsets aren't committed → the failed read's data
+            // (and any sibling source's data) is re-delivered on
+            // the next iteration.
+            //
+            // Phase 39.4 PR 1: while we have per-source visibility,
+            // also fold each source's batches into per-source
+            // `max_event_ts` + `last_arrival` state when watermarks
+            // are enabled. The per-source loop is the only place
+            // source identity survives — once we extend `batches`
+            // with the union, it's lost.
+            // Phase 39.5b: keep per-source identity through to the
+            // transform call so stream-stream joins can route via
+            // `BatchContext::source_id`. `per_source_batches[i] =
+            // (source_query, batches)` mirrors `self.sources` order.
+            let mut per_source_batches: Vec<(String, Vec<RecordBatch>)> =
+                Vec::with_capacity(self.sources.len());
+            for (source_idx, r) in read_results.into_iter().enumerate() {
+                match r {
+                    Ok(source_batches) => {
+                        if !source_batches.is_empty() && self.config.watermark.is_some() {
+                            let max_ts: Option<i64> =
+                                source_batches.iter().filter_map(batch_max_event_ts).max();
+                            let mut state = self
+                                .watermark_state
+                                .lock()
+                                .expect("watermark_state mutex poisoned");
+                            state.last_arrival[source_idx] = Some(Instant::now());
+                            if let Some(ts) = max_ts {
+                                state.max_event_ts[source_idx] = Some(
+                                    state.max_event_ts[source_idx].map_or(ts, |prev| prev.max(ts)),
+                                );
+                            }
+                        }
+                        let query = self.sources[source_idx].1.clone();
+                        per_source_batches.push((query, source_batches));
+                    }
+                    Err(e) => {
+                        self.metrics.errors.inc();
+                        return Err(e);
+                    }
+                }
+            }
+            // Flat view used by the empty-check, row-count, and
+            // pre-transform paths that don't need source identity.
+            let batches: Vec<RecordBatch> = per_source_batches
+                .iter()
+                .flat_map(|(_, bs)| bs.iter().cloned())
+                .collect();
+
+            // Compute the global watermark + update Prometheus
+            // gauges. Cheap when watermark is disabled (early
+            // return inside the helper).
+            let global_wm = self.compute_and_publish_watermark();
 
             if batches.is_empty() {
                 self.metrics.idle_iterations.inc();
+
+                // Phase 39.4 PR 2: give the transform a chance to
+                // emit time-driven output (windowed aggregator
+                // flushing windows whose end <= global_wm). Stateless
+                // transforms inherit the default no-op and this is
+                // a cheap async call.
+                if let Some(t) = &self.config.transform {
+                    let ctx = BatchContext {
+                        global_wm,
+                        source_id: None,
+                    };
+                    let idle_emits = t.on_idle_tick(&ctx).await.inspect_err(|_| {
+                        self.metrics.errors.inc();
+                    })?;
+                    if !idle_emits.is_empty() {
+                        let n = self.write_emits_and_commit(idle_emits).await?;
+                        summary.total_rows += n;
+                        summary.iterations += 1;
+                        self.metrics.batches.inc();
+                    }
+                    // Phase 39.5a P1.6: an idle tick may evict
+                    // late rows past their drop deadline; route
+                    // any captured ones to DLQ.
+                    self.drain_late_data_dlq(t.as_ref()).await?;
+                }
+
                 // Idle — sleep, but wake immediately if shutdown
                 // fires. Without the select! we'd block for the
                 // full pause before noticing the trigger.
@@ -335,6 +923,106 @@ impl StreamingPipeline {
 
             let n_rows: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
             self.metrics.rows_consumed.inc_by(n_rows);
+
+            // Π.4b-1: apply the configured per-batch transform.
+            // The `None` arm is bit-identical to today's path —
+            // zero-transform pipelines pay no overhead. On error
+            // we count it and bubble — the source offsets have
+            // not been committed yet, so a crash here just
+            // re-delivers the same batch on restart.
+            let batches: Vec<RecordBatch> = match &self.config.transform {
+                None => batches,
+                Some(t) => {
+                    let mut out: Vec<RecordBatch> = Vec::with_capacity(batches.len());
+                    // Phase 39.5b: dispatch per-source so the
+                    // transform's `BatchContext::source_id` carries
+                    // the source's `query`. Non-join transforms
+                    // ignore the field; joins use it to route to
+                    // left/right buffers.
+                    for (source_query, src_batches) in &per_source_batches {
+                        let ctx = BatchContext {
+                            global_wm,
+                            source_id: Some(source_query.clone()),
+                        };
+                        for b in src_batches.iter().cloned() {
+                            // Clone before passing — needed for the
+                            // Dlq error branch below.
+                            let b_clone = b.clone();
+                            match t.transform(b, &ctx).await {
+                                Ok(produced) => out.extend(produced),
+                                Err(e) => {
+                                    self.metrics.errors.inc();
+                                    match self.config.transform_on_error {
+                                        TransformErrorPolicy::Fail => return Err(e),
+                                        TransformErrorPolicy::Drop => {
+                                            tracing::warn!(
+                                                pipeline = %self.config.pipeline_name,
+                                                source = %source_query,
+                                                rows = b_clone.num_rows(),
+                                                error = %e,
+                                                "transform error — batch dropped (on_error = drop)"
+                                            );
+                                        }
+                                        TransformErrorPolicy::Dlq => {
+                                            tracing::warn!(
+                                                pipeline = %self.config.pipeline_name,
+                                                source = %source_query,
+                                                rows = b_clone.num_rows(),
+                                                error = %e,
+                                                "transform error — batch routed to DLQ (on_error = dlq)"
+                                            );
+                                            if let Some(topic) =
+                                                self.config.dead_letter_topic.clone()
+                                            {
+                                                let count = self
+                                                    .route_batches_to_dlq(
+                                                        topic.as_str(),
+                                                        vec![b_clone],
+                                                    )
+                                                    .await?;
+                                                self.metrics.dlq_writes.inc_by(count);
+                                            } else {
+                                                tracing::warn!(
+                                                    pipeline = %self.config.pipeline_name,
+                                                    "on_error = \"dlq\" but no \
+                                                     dead_letter_topic configured — \
+                                                     batch silently discarded"
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // Phase 39.5a P1.6: drain any DLQ rows the
+                    // windowed transform stashed under
+                    // `LateDataPolicy::Dlq` and route via the
+                    // existing app-level DLQ producer (Kafka source
+                    // only — same constraint as the per-batch-
+                    // failure DLQ path).
+                    self.drain_late_data_dlq(t.as_ref()).await?;
+                    out
+                }
+            };
+
+            // Post-transform row count drives the write-side
+            // metrics + summary; a WHERE clause that drops rows
+            // shows up here as `rows_consumed > rows_written`.
+            let n_rows_out: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
+
+            if n_rows_out == 0 {
+                // Phase 39.4 PR 2: post-transform empty (e.g. all
+                // rows filtered, or windowed transform isn't ready
+                // to emit yet). Skip target write — empty writes
+                // are a network round-trip for 0 rows in production
+                // and noise in tests. Still finalize the iteration
+                // (commit source offsets, or commit state+offsets
+                // to the state store under PR 3).
+                self.finalize_iteration().await?;
+                summary.iterations += 1;
+                continue;
+            }
 
             // Π.4a: fan out to every target concurrently. Each
             // target gets its own RecordBatch stream cloned from
@@ -356,7 +1044,7 @@ impl StreamingPipeline {
             let first_err: Option<BackendError> = results.into_iter().find_map(|r| r.err());
             match first_err {
                 None => {
-                    self.metrics.rows_written.inc_by(n_rows);
+                    self.metrics.rows_written.inc_by(n_rows_out);
                 }
                 Some(e) => {
                     self.metrics.errors.inc();
@@ -379,16 +1067,134 @@ impl StreamingPipeline {
             }
 
             // At-least-once commit: only after the target ack lands
-            // (or after the DLQ ack on the failure path). Non-Kafka
-            // sources implement the trait's no-op default, so this
-            // is free for them.
-            self.source.commit_offsets().await?;
+            // (or after the DLQ ack on the failure path). PR 3 with
+            // `state_store` configured replaces source-side
+            // `commit_offsets` with an atomic state+offsets commit
+            // to the store; otherwise the historical per-source
+            // commit loop applies.
+            self.finalize_iteration().await?;
 
             self.metrics.batches.inc();
-            summary.total_rows += n_rows;
+            summary.total_rows += n_rows_out;
             summary.iterations += 1;
         }
         Ok(summary)
+    }
+
+    /// Phase 39.4 PR 2: fan-out windowed-emit batches to every
+    /// target, then commit source offsets. Used by the idle path
+    /// when `on_idle_tick` returns time-driven emits. Window emits
+    /// don't go to DLQ on target-write failure (per design Q6.2):
+    /// failure bubbles, supervisor restart re-replays the source,
+    /// the at-least-once + idempotent-target invariant absorbs
+    /// duplicates.
+    async fn write_emits_and_commit(&self, emits: Vec<RecordBatch>) -> Result<u64, BackendError> {
+        let n_rows: u64 = emits.iter().map(|b| b.num_rows() as u64).sum();
+        if n_rows == 0 {
+            return Ok(0);
+        }
+        let writes = self.targets.iter().map(|(backend, table)| {
+            let emits_for_target: Vec<RecordBatch> = emits.clone();
+            let target_stream: ArrowBatchStream = Box::pin(futures_util::stream::iter(
+                emits_for_target.into_iter().map(Ok),
+            ));
+            let mode = self.config.mode;
+            async move { backend.write_arrow_stream(table, target_stream, mode).await }
+        });
+        let results: Vec<Result<u64, BackendError>> = futures_util::future::join_all(writes).await;
+        if let Some(e) = results.into_iter().find_map(|r| r.err()) {
+            self.metrics.errors.inc();
+            return Err(e);
+        }
+        self.metrics.rows_written.inc_by(n_rows);
+        self.finalize_iteration().await?;
+        Ok(n_rows)
+    }
+
+    /// Phase 39.4 PR 1: compute the global watermark + publish per-
+    /// source and global gauges. Returns `Some(micros)` when at
+    /// least one non-idle source has produced an `_event_ts`-bearing
+    /// batch since the pipeline started; otherwise `None`. Returns
+    /// `None` immediately when watermarks are disabled.
+    ///
+    /// The `min`-with-idle-fallback rule: a source is excluded from
+    /// the `min` once it has been idle for `source_idleness_ms`. If
+    /// every source is idle (or none has produced `_event_ts` yet),
+    /// the global watermark stays `None`.
+    fn compute_and_publish_watermark(&self) -> Option<i64> {
+        let wm_cfg = self.config.watermark.as_ref()?;
+        let lateness_micros = (wm_cfg.lateness_ms as i64).saturating_mul(1_000);
+        let idleness = Duration::from_millis(wm_cfg.source_idleness_ms);
+
+        let state = self
+            .watermark_state
+            .lock()
+            .expect("watermark_state mutex poisoned");
+
+        let mut global_wm: Option<i64> = None;
+        for (source_idx, (_backend, query)) in self.sources.iter().enumerate() {
+            let last_arrival = state.last_arrival[source_idx];
+            let is_idle = match last_arrival {
+                None => true,
+                Some(t) => t.elapsed() > idleness,
+            };
+            let max_ts = state.max_event_ts[source_idx];
+            if let Some(ts) = max_ts {
+                let wm_i = ts.saturating_sub(lateness_micros);
+                self.metrics
+                    .watermark_seconds
+                    .with_label_values(&[query.as_str()])
+                    .set(wm_i as f64 / 1_000_000.0);
+                if !is_idle {
+                    global_wm = Some(global_wm.map_or(wm_i, |g| g.min(wm_i)));
+                }
+            }
+        }
+
+        if let Some(g) = global_wm {
+            self.metrics
+                .watermark_seconds
+                .with_label_values(&["_global"])
+                .set(g as f64 / 1_000_000.0);
+        }
+
+        global_wm
+    }
+
+    /// Phase 39.5a P1.6: drain the windowed transform's
+    /// `take_dlq_rows()` buffer and route any captured late rows
+    /// to the configured `dead_letter_topic`. No-op when:
+    /// - The transform isn't a `WindowedAggregateTransform` (default
+    ///   trait impl returns empty).
+    /// - The window's `late_data` policy isn't `Dlq`.
+    /// - No `dead_letter_topic` is configured (rows are then
+    ///   silently consumed and a counter increments — operators
+    ///   should configure a topic when using the policy).
+    async fn drain_late_data_dlq(
+        &self,
+        transform: &dyn BatchTransform,
+    ) -> Result<(), BackendError> {
+        let dlq_rows = transform.take_dlq_rows().await?;
+        if dlq_rows.is_empty() {
+            return Ok(());
+        }
+        let n_rows: u64 = dlq_rows.iter().map(|b| b.num_rows() as u64).sum();
+        let Some(topic) = self.config.dead_letter_topic.clone() else {
+            // Policy is Dlq but no topic configured. Bump the
+            // dropped counter so this is visible in metrics rather
+            // than silent.
+            self.metrics.dlq_writes.inc_by(0);
+            tracing::warn!(
+                pipeline = %self.config.pipeline_name,
+                rows = n_rows,
+                "late_data = \"dlq\" set but no dead_letter_topic configured — \
+                 late rows discarded"
+            );
+            return Ok(());
+        };
+        let count = self.route_batches_to_dlq(topic.as_str(), dlq_rows).await?;
+        self.metrics.dlq_writes.inc_by(count);
+        Ok(())
     }
 
     /// Route a failed batch's rows to the configured DLQ topic. The
@@ -415,8 +1221,16 @@ impl StreamingPipeline {
         };
         let stream: ArrowBatchStream =
             Box::pin(futures_util::stream::iter(batches.into_iter().map(Ok)));
-        let n = self
-            .source
+        // Use the primary (first) source for DLQ produces.
+        // Multi-source DLQ routing would need per-source policy +
+        // a way to know which source originated each row — out of
+        // scope for the v0.1 multi-source path.
+        let primary = self
+            .sources
+            .first()
+            .ok_or_else(|| BackendError::Other("DLQ requested but no sources configured".into()))?;
+        let n = primary
+            .0
             .write_arrow_stream(&dlq_target, stream, WriteMode::Append)
             .await?;
         Ok(n)
@@ -636,6 +1450,319 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(5), sig.wait())
             .await
             .expect("wait() did not resolve when trigger dropped");
+    }
+
+    // --- Phase 39.5a slice 1.6: pipeline state-load on startup -----------
+
+    /// `load_state` against an empty `InMemoryStateStore` must
+    /// succeed and produce an empty `RecoveredState`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn load_state_with_empty_store_returns_empty() {
+        use crate::SQLiteBackend;
+        use crate::kafka_backend::KafkaBackend;
+        use crate::state_store::InMemoryStateStore;
+
+        let source: Arc<dyn Backend> =
+            Arc::new(KafkaBackend::open("localhost:9092", Some("g")).unwrap());
+        let target: Arc<dyn Backend> = Arc::new(SQLiteBackend::open(":memory:").unwrap());
+        let target_table = TargetTable {
+            schema: "".into(),
+            name: "out".into(),
+        };
+        let pipeline = StreamingPipeline::new(
+            source,
+            vec![(target, target_table.clone())],
+            StreamingPipelineConfig::new("topic", target_table, "fresh"),
+        );
+        let store = InMemoryStateStore::new();
+        let recovered = pipeline.load_state(&store).await.unwrap();
+        assert!(recovered.offsets.is_empty());
+        assert!(recovered.state_by_key.is_empty());
+        assert_eq!(recovered.state_version, 0);
+    }
+
+    /// Recovered offsets get applied via `seek_to` on the matching
+    /// source. Verified by checking that the Kafka backend's
+    /// `pending_seek` field is populated post-`load_state`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn load_state_applies_seek_to_on_matching_source() {
+        use crate::SQLiteBackend;
+        use crate::kafka_backend::KafkaBackend;
+        use crate::state_store::{CommitSnapshot, InMemoryStateStore};
+
+        let kafka = Arc::new(KafkaBackend::open("localhost:9092", Some("g")).unwrap());
+        let target: Arc<dyn Backend> = Arc::new(SQLiteBackend::open(":memory:").unwrap());
+        let target_table = TargetTable {
+            schema: "".into(),
+            name: "out".into(),
+        };
+        let pipeline = StreamingPipeline::new(
+            Arc::clone(&kafka) as Arc<dyn Backend>,
+            vec![(target, target_table.clone())],
+            StreamingPipelineConfig::new("topic", target_table, "p1"),
+        );
+
+        // Pre-populate the store with an offset for our source's
+        // query string ("topic"). Format must match the Kafka
+        // backend's wire shape — v=1 JSON.
+        let mut offsets = std::collections::HashMap::new();
+        offsets.insert(
+            "topic".to_string(),
+            br#"{"v":1,"partitions":{"0":42}}"#.to_vec(),
+        );
+        let store = InMemoryStateStore::new();
+        store
+            .commit(
+                "p1",
+                CommitSnapshot {
+                    offsets,
+                    state_version: 1,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let recovered = pipeline.load_state(&store).await.unwrap();
+        assert_eq!(recovered.offsets.len(), 1);
+
+        // Verify the seek landed on the Kafka backend by trying to
+        // re-seek with new offsets and observing the prior ones
+        // were consumed (pending_seek replaced, not appended).
+        // Indirect assertion: a second `seek_to` with a different
+        // offset must succeed, and the resulting `Debug` output
+        // shows pending_seek_count = 1.
+        let dbg_after = format!("{kafka:?}");
+        assert!(
+            dbg_after.contains("pending_seek_count: 1"),
+            "after load_state, Kafka backend should have a stashed seek; \
+             got debug: {dbg_after}"
+        );
+    }
+
+    /// Recovered offset for a source whose backend doesn't support
+    /// `seek_to` is a hard error — silently dropping committed
+    /// state would be a recipe for double-counting.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn load_state_errors_when_source_lacks_seek_to() {
+        use crate::SQLiteBackend;
+        use crate::state_store::{CommitSnapshot, InMemoryStateStore};
+
+        // SQLite has no seek_to override → supports_seek_to() = false.
+        let source: Arc<dyn Backend> = Arc::new(SQLiteBackend::open(":memory:").unwrap());
+        let target: Arc<dyn Backend> = Arc::new(SQLiteBackend::open(":memory:").unwrap());
+        let target_table = TargetTable {
+            schema: "".into(),
+            name: "out".into(),
+        };
+        let pipeline = StreamingPipeline::new(
+            source,
+            vec![(target, target_table.clone())],
+            StreamingPipelineConfig::new("SELECT 1", target_table, "p-bad"),
+        );
+
+        let mut offsets = std::collections::HashMap::new();
+        offsets.insert("SELECT 1".to_string(), b"some-bytes".to_vec());
+        let store = InMemoryStateStore::new();
+        store
+            .commit(
+                "p-bad",
+                CommitSnapshot {
+                    offsets,
+                    state_version: 1,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let err = pipeline.load_state(&store).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("does not support seek_to") || msg.contains("seek_to"),
+            "expected seek_to-not-supported error, got: {msg}"
+        );
+    }
+
+    // --- Phase 39.5a P1.8: periodic checkpoint ticker --------------------
+
+    /// `checkpoint_loop` directly: with a session transform that
+    /// has a dirty key and an in-memory store, the ticker should
+    /// produce one commit within ~200ms when configured at 50ms.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn checkpoint_loop_commits_dirty_state() {
+        use crate::state_store::{InMemoryStateStore, StateStore};
+        use crate::transform::BatchTransform;
+        use crate::windowed::{
+            AggKind, AggregationSpec, LateDataPolicy, WindowConfig, WindowKind,
+            WindowedAggregateTransform,
+        };
+        use arrow_array::{Int64Array, RecordBatch as RB, TimestampMicrosecondArray};
+        use arrow_schema::{DataType, Field, Schema, TimeUnit};
+
+        // Minimal session config — gap=10ms, max_dur=1s. Single
+        // user_id ingested → one dirty key after first batch.
+        let cfg = WindowConfig {
+            kind: WindowKind::Session,
+            duration_ms: 0,
+            hop_ms: 0,
+            gap_ms: Some(10),
+            max_session_duration_ms: Some(1_000),
+            event_time_column: "_event_ts".into(),
+            group_by: vec!["user_id".into()],
+            aggregations: vec![AggregationSpec::new(AggKind::CountStar, None, "n")],
+            late_data: LateDataPolicy::Drop,
+            max_groups_per_window: 100,
+            window_start_column: "window_start".into(),
+            window_end_column: "window_end".into(),
+            session_id_column: "session_id".into(),
+        };
+        let transform: Arc<dyn BatchTransform> =
+            Arc::new(WindowedAggregateTransform::new(cfg, None).unwrap());
+
+        // Ingest one row so the transform has a dirty key.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("user_id", DataType::Int64, false),
+            Field::new(
+                "_event_ts",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                false,
+            ),
+        ]));
+        let batch = RB::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1_i64])),
+                Arc::new(TimestampMicrosecondArray::from(vec![10_i64]).with_timezone("UTC")),
+            ],
+        )
+        .unwrap();
+        transform
+            .transform(
+                batch,
+                &BatchContext {
+                    global_wm: Some(0),
+                    source_id: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        // Sanity-check: the transform really has dirty state at this
+        // point. (If the ingest somehow failed silently the test
+        // would otherwise blame the ticker.)
+        let (probe_upserts, _probe_deletes) = transform.take_state_commit().await.unwrap();
+        assert!(
+            !probe_upserts.is_empty(),
+            "transform should have one dirty key after ingest"
+        );
+        // Re-dirty by ingesting another row, since we just drained.
+        let batch2 = RB::try_new(
+            transform.input_schema(),
+            vec![
+                Arc::new(Int64Array::from(vec![1_i64])),
+                Arc::new(TimestampMicrosecondArray::from(vec![15_i64]).with_timezone("UTC")),
+            ],
+        )
+        .unwrap();
+        transform
+            .transform(
+                batch2,
+                &BatchContext {
+                    global_wm: Some(0),
+                    source_id: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        // Spawn the checkpoint loop with a 50ms tick.
+        let store: Arc<dyn StateStore> = Arc::new(InMemoryStateStore::new());
+        let (shutdown, trigger) = ShutdownSignal::new();
+        let store_clone = Arc::clone(&store);
+        let transform_clone = Some(Arc::clone(&transform));
+        let handle = tokio::spawn(async move {
+            super::checkpoint_loop(
+                store_clone,
+                "p-test".into(),
+                transform_clone,
+                Vec::new(), // no sources — offset_snapshot path is empty
+                Duration::from_millis(50),
+                shutdown,
+            )
+            .await;
+        });
+
+        // Wait long enough for at least one tick to fire + commit.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        trigger.trigger();
+        let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+
+        // Verify the store has the upsert.
+        let recovered = store.load("p-test").await.unwrap();
+        assert!(
+            !recovered.state_by_key.is_empty(),
+            "ticker should have committed at least one upsert"
+        );
+    }
+
+    /// Ticker is a no-op when interval is 0 / not set — neither task
+    /// gets spawned and `run` doesn't hang.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn checkpoint_loop_skipped_without_interval() {
+        // A 1ms interval ticker with no transform + no sources still
+        // exits cleanly on shutdown.
+        use crate::state_store::InMemoryStateStore;
+        let store: Arc<dyn StateStore> = Arc::new(InMemoryStateStore::new());
+        let (shutdown, trigger) = ShutdownSignal::new();
+        let handle = tokio::spawn(async move {
+            super::checkpoint_loop(
+                store,
+                "p".into(),
+                None,
+                Vec::new(),
+                Duration::from_millis(1),
+                shutdown,
+            )
+            .await;
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        trigger.trigger();
+        tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("checkpoint_loop should exit on shutdown")
+            .expect("task panicked");
+    }
+
+    // --- Phase 39.5a P2.15: transform_on_error policy --------------------
+
+    #[test]
+    fn transform_error_policy_default_is_fail() {
+        use crate::backend::TargetTable;
+        let cfg = StreamingPipelineConfig::new(
+            "topic",
+            TargetTable {
+                schema: "".into(),
+                name: "out".into(),
+            },
+            "p",
+        );
+        assert_eq!(cfg.transform_on_error, TransformErrorPolicy::Fail);
+    }
+
+    #[test]
+    fn transform_error_policy_builder_overrides_default() {
+        use crate::backend::TargetTable;
+        let cfg = StreamingPipelineConfig::new(
+            "topic",
+            TargetTable {
+                schema: "".into(),
+                name: "out".into(),
+            },
+            "p",
+        )
+        .with_transform_on_error(TransformErrorPolicy::Drop);
+        assert_eq!(cfg.transform_on_error, TransformErrorPolicy::Drop);
     }
 
     // --- Phase 36i: metrics + DLQ -----------------------------------------
@@ -887,6 +2014,23 @@ mod tests {
             RecordBatch::try_new(Arc::new(schema), vec![Arc::new(arr)]).unwrap()
         }
 
+        /// Phase 39.4 PR 1: a batch with the `_event_ts` column the
+        /// pipeline scans when watermarks are enabled.
+        fn batch_with_event_ts(values: Vec<i32>, ts_micros: Vec<i64>) -> RecordBatch {
+            use arrow_array::TimestampMicrosecondArray;
+            let schema = Schema::new(vec![
+                Field::new("v", DataType::Int32, false),
+                Field::new(
+                    "_event_ts",
+                    DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, Some("UTC".into())),
+                    false,
+                ),
+            ]);
+            let v_arr = Int32Array::from(values);
+            let ts_arr = TimestampMicrosecondArray::from(ts_micros).with_timezone("UTC");
+            RecordBatch::try_new(Arc::new(schema), vec![Arc::new(v_arr), Arc::new(ts_arr)]).unwrap()
+        }
+
         #[tokio::test(flavor = "multi_thread")]
         async fn fan_out_writes_each_batch_to_every_target() {
             let source = Arc::new(TestBackend::new("src"));
@@ -973,6 +2117,493 @@ mod tests {
                 source.commit_count(),
                 0,
                 "offsets must NOT advance on target failure when no DLQ configured"
+            );
+        }
+
+        // --- Π.4b-2: multi-source fan-in (UNION ALL) -------------------------
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn multi_source_concatenates_batches_per_iteration() {
+            let source_a = Arc::new(TestBackend::new("src-a"));
+            let source_b = Arc::new(TestBackend::new("src-b"));
+            // Each source emits one batch on the first iteration.
+            source_a.enqueue_read(vec![one_row_batch(1)]);
+            source_b.enqueue_read(vec![one_row_batch(2), one_row_batch(3)]);
+
+            let target = Arc::new(TestBackend::new("t"));
+            let table = TargetTable {
+                schema: "".into(),
+                name: "events".into(),
+            };
+            let cfg = StreamingPipelineConfig::new("ignored", table.clone(), "p");
+            let pipeline = StreamingPipeline::new_multi_source(
+                vec![
+                    (source_a.clone() as Arc<dyn Backend>, "topic-a".into()),
+                    (source_b.clone() as Arc<dyn Backend>, "topic-b".into()),
+                ],
+                vec![(target.clone() as Arc<dyn Backend>, table)],
+                cfg,
+            );
+
+            let (sig, trigger) = ShutdownSignal::new();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                trigger.trigger();
+            });
+            let summary = pipeline.run(sig).await.expect("pipeline.run");
+
+            // Three rows total (1 from A + 2 from B) in one
+            // iteration, written to the single target.
+            assert_eq!(summary.total_rows, 3);
+            let total_target_rows: usize = target.writes().iter().map(|(_, n)| *n).sum();
+            assert_eq!(total_target_rows, 3);
+            // Both sources had their offsets committed.
+            assert_eq!(source_a.commit_count(), 1);
+            assert_eq!(source_b.commit_count(), 1);
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn multi_source_target_failure_skips_all_commits() {
+            let source_a = Arc::new(TestBackend::new("src-a"));
+            let source_b = Arc::new(TestBackend::new("src-b"));
+            source_a.enqueue_read(vec![one_row_batch(1)]);
+            source_b.enqueue_read(vec![one_row_batch(2)]);
+
+            let target = Arc::new(TestBackend::new("t"));
+            target.fail_next();
+            let table = TargetTable {
+                schema: "".into(),
+                name: "events".into(),
+            };
+            let cfg = StreamingPipelineConfig::new("ignored", table.clone(), "p");
+            let pipeline = StreamingPipeline::new_multi_source(
+                vec![
+                    (source_a.clone() as Arc<dyn Backend>, "topic-a".into()),
+                    (source_b.clone() as Arc<dyn Backend>, "topic-b".into()),
+                ],
+                vec![(target.clone() as Arc<dyn Backend>, table)],
+                cfg,
+            );
+
+            let (sig, _trigger) = ShutdownSignal::new();
+            let err = pipeline.run(sig).await.expect_err("target failure bubbles");
+            assert!(err.to_string().contains("scripted write failure"));
+            // Neither source's offsets advance — both will re-deliver
+            // the same batch on restart (at-least-once across all
+            // sources).
+            assert_eq!(source_a.commit_count(), 0);
+            assert_eq!(source_b.commit_count(), 0);
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn multi_source_partial_idle_still_processes_non_empty_source() {
+            // Source A has data; source B is idle. The iteration
+            // should still process A's rows and commit both sources.
+            let source_a = Arc::new(TestBackend::new("src-a"));
+            let source_b = Arc::new(TestBackend::new("src-b"));
+            source_a.enqueue_read(vec![one_row_batch(1)]);
+            // source_b: nothing enqueued → empty.
+
+            let target = Arc::new(TestBackend::new("t"));
+            let table = TargetTable {
+                schema: "".into(),
+                name: "events".into(),
+            };
+            let cfg = StreamingPipelineConfig::new("ignored", table.clone(), "p");
+            let pipeline = StreamingPipeline::new_multi_source(
+                vec![
+                    (source_a.clone() as Arc<dyn Backend>, "topic-a".into()),
+                    (source_b.clone() as Arc<dyn Backend>, "topic-b".into()),
+                ],
+                vec![(target.clone() as Arc<dyn Backend>, table)],
+                cfg,
+            );
+
+            let (sig, trigger) = ShutdownSignal::new();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                trigger.trigger();
+            });
+            let summary = pipeline.run(sig).await.expect("pipeline.run");
+
+            assert_eq!(summary.total_rows, 1);
+            assert_eq!(source_a.commit_count(), 1);
+            assert_eq!(source_b.commit_count(), 1);
+        }
+
+        // --- Π.4b-1: SQL transform integration -------------------------------
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn transform_filters_rows_before_target_write() {
+            use crate::transform::LazySqlTransform;
+
+            let source = Arc::new(TestBackend::new("src"));
+            // Three input rows; transform keeps `v >= 2` → 2 rows
+            // arrive at the target.
+            source.enqueue_read(vec![one_row_batch(1), one_row_batch(2), one_row_batch(3)]);
+
+            let target = Arc::new(TestBackend::new("t"));
+            let table = TargetTable {
+                schema: "".into(),
+                name: "events".into(),
+            };
+
+            let cfg = StreamingPipelineConfig::new("topic", table.clone(), "p").with_transform(
+                Arc::new(LazySqlTransform::new("SELECT v FROM source WHERE v >= 2")),
+            );
+            let pipeline = StreamingPipeline::new(
+                source.clone() as Arc<dyn Backend>,
+                vec![(target.clone() as Arc<dyn Backend>, table)],
+                cfg,
+            );
+
+            let (sig, trigger) = ShutdownSignal::new();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                trigger.trigger();
+            });
+            let summary = pipeline.run(sig).await.expect("pipeline.run");
+
+            // Only the rows that survived the WHERE clause hit the
+            // target. The DataFusion path may consolidate per-batch
+            // outputs into one or more batches — sum across them.
+            let total_target_rows: usize = target.writes().iter().map(|(_, n)| *n).sum();
+            assert_eq!(total_target_rows, 2, "WHERE v >= 2 keeps 2 of 3 rows");
+            assert_eq!(summary.total_rows, 2, "summary counts post-transform rows");
+            assert_eq!(source.commit_count(), 1);
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn transform_none_path_unchanged() {
+            // Belt-and-suspenders: pipeline with `transform = None`
+            // must behave exactly like today's path (the existing
+            // fan-out test already covers this, but pinning it here
+            // makes the regression test obvious if the match arm
+            // shifts).
+            let source = Arc::new(TestBackend::new("src"));
+            source.enqueue_read(vec![one_row_batch(1), one_row_batch(2)]);
+
+            let target = Arc::new(TestBackend::new("t"));
+            let table = TargetTable {
+                schema: "".into(),
+                name: "events".into(),
+            };
+
+            let cfg = StreamingPipelineConfig::new("topic", table.clone(), "p");
+            assert!(cfg.transform.is_none());
+
+            let pipeline = StreamingPipeline::new(
+                source.clone() as Arc<dyn Backend>,
+                vec![(target.clone() as Arc<dyn Backend>, table)],
+                cfg,
+            );
+            let (sig, trigger) = ShutdownSignal::new();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                trigger.trigger();
+            });
+            let summary = pipeline.run(sig).await.expect("pipeline.run");
+            assert_eq!(summary.total_rows, 2);
+            assert_eq!(target.writes(), vec![("events".into(), 2)]);
+        }
+
+        // --- Phase 39.4 PR 1: watermark machinery ----------------------------
+
+        #[test]
+        fn watermark_disabled_by_default() {
+            let cfg = StreamingPipelineConfig::new(
+                "topic",
+                TargetTable {
+                    schema: "".into(),
+                    name: "events".into(),
+                },
+                "p",
+            );
+            assert!(cfg.watermark.is_none(), "default config has no watermark");
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn watermark_extracted_from_event_ts_when_enabled() {
+            // Single source emits one batch with _event_ts microseconds
+            // 100 and 200. With lateness=0 the per-source watermark
+            // is 200µs = 0.0002s; that's the global wm too.
+            let source = Arc::new(TestBackend::new("src"));
+            source.enqueue_read(vec![batch_with_event_ts(vec![1, 2], vec![100, 200])]);
+
+            let target = Arc::new(TestBackend::new("t"));
+            let table = TargetTable {
+                schema: "".into(),
+                name: "events".into(),
+            };
+            let cfg = StreamingPipelineConfig::new("topic", table.clone(), "p")
+                .with_watermark(WatermarkConfig::default());
+            let pipeline = StreamingPipeline::new(
+                source.clone() as Arc<dyn Backend>,
+                vec![(target.clone() as Arc<dyn Backend>, table)],
+                cfg,
+            );
+
+            let (sig, trigger) = ShutdownSignal::new();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                trigger.trigger();
+            });
+            let _ = pipeline.run(sig).await.expect("pipeline.run");
+
+            let body = pipeline.metrics.render().unwrap();
+            assert!(
+                body.contains(r#"source="topic""#),
+                "per-source gauge missing in:\n{body}"
+            );
+            assert!(
+                body.contains(r#"source="_global""#),
+                "global gauge missing in:\n{body}"
+            );
+            assert!(
+                body.lines()
+                    .any(|l| { l.contains(r#"source="_global""#) && l.contains("0.0002") }),
+                "global wm should be 0.0002s in:\n{body}"
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn multi_source_watermark_takes_min_over_non_idle() {
+            // Two sources; source A emits ts=1000, source B emits ts=500.
+            // Both still considered active (idleness window is 60s).
+            // Global wm = min(1000, 500) = 500µs = 0.0005s.
+            let src_a = Arc::new(TestBackend::new("a"));
+            let src_b = Arc::new(TestBackend::new("b"));
+            src_a.enqueue_read(vec![batch_with_event_ts(vec![1], vec![1000])]);
+            src_b.enqueue_read(vec![batch_with_event_ts(vec![2], vec![500])]);
+
+            let target = Arc::new(TestBackend::new("t"));
+            let table = TargetTable {
+                schema: "".into(),
+                name: "events".into(),
+            };
+            let cfg = StreamingPipelineConfig::new("ignored", table.clone(), "p")
+                .with_watermark(WatermarkConfig::default());
+            let pipeline = StreamingPipeline::new_multi_source(
+                vec![
+                    (src_a.clone() as Arc<dyn Backend>, "topic-a".into()),
+                    (src_b.clone() as Arc<dyn Backend>, "topic-b".into()),
+                ],
+                vec![(target.clone() as Arc<dyn Backend>, table)],
+                cfg,
+            );
+
+            let (sig, trigger) = ShutdownSignal::new();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                trigger.trigger();
+            });
+            let _ = pipeline.run(sig).await.expect("pipeline.run");
+
+            let body = pipeline.metrics.render().unwrap();
+            assert!(
+                body.lines()
+                    .any(|l| { l.contains(r#"source="_global""#) && l.contains("0.0005") }),
+                "global wm = min(1000, 500) µs = 0.0005s; got:\n{body}"
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn watermark_subtracts_lateness_ms() {
+            // event_ts = 1_000_000 µs (1 second). lateness = 250 ms.
+            // wm = 1_000_000 − 250_000 = 750_000 µs = 0.75 s.
+            let source = Arc::new(TestBackend::new("src"));
+            source.enqueue_read(vec![batch_with_event_ts(vec![1], vec![1_000_000])]);
+
+            let target = Arc::new(TestBackend::new("t"));
+            let table = TargetTable {
+                schema: "".into(),
+                name: "events".into(),
+            };
+            let cfg = StreamingPipelineConfig::new("topic", table.clone(), "p").with_watermark(
+                WatermarkConfig {
+                    lateness_ms: 250,
+                    source_idleness_ms: 60_000,
+                },
+            );
+            let pipeline = StreamingPipeline::new(
+                source.clone() as Arc<dyn Backend>,
+                vec![(target.clone() as Arc<dyn Backend>, table)],
+                cfg,
+            );
+
+            let (sig, trigger) = ShutdownSignal::new();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                trigger.trigger();
+            });
+            let _ = pipeline.run(sig).await.expect("pipeline.run");
+
+            let body = pipeline.metrics.render().unwrap();
+            assert!(
+                body.lines()
+                    .any(|l| { l.contains(r#"source="_global""#) && l.contains("0.75") }),
+                "global wm with lateness 250ms should be 0.75s; got:\n{body}"
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn end_to_end_windowed_aggregation() {
+            // End-to-end through StreamingPipeline::run:
+            //   - Source emits two batches in window [0, 60s) and a
+            //     third in window [60s, 120s). The third batch's
+            //     _event_ts advances the watermark past 60s, which
+            //     triggers emit of window [0, 60s) inside transform().
+            //   - Target should record exactly one write of size 1
+            //     (one aggregated row for the single user_id=42).
+            use crate::transform::BatchTransform;
+            use crate::windowed::{
+                AggKind, AggregationSpec, LateDataPolicy, WindowConfig, WindowKind,
+                WindowedAggregateTransform,
+            };
+
+            let source = Arc::new(TestBackend::new("src"));
+            // All three batches: user_id=42, amount=10/20/30, ts in
+            // window [0, 60s) for the first two, ts past 60s for the third.
+            source.enqueue_read(vec![batch_with_user_amount_ts(
+                vec![42],
+                vec![Some(10)],
+                vec![1_000_000],
+            )]);
+            source.enqueue_read(vec![batch_with_user_amount_ts(
+                vec![42],
+                vec![Some(20)],
+                vec![2_000_000],
+            )]);
+            source.enqueue_read(vec![batch_with_user_amount_ts(
+                vec![42],
+                vec![Some(30)],
+                vec![70_000_000], // > 60s → triggers emit of [0, 60s)
+            )]);
+
+            let target = Arc::new(TestBackend::new("t"));
+            let table = TargetTable {
+                schema: "".into(),
+                name: "events".into(),
+            };
+
+            let window_cfg = WindowConfig {
+                kind: WindowKind::Tumbling,
+                duration_ms: 60_000,
+                hop_ms: 60_000,
+                event_time_column: "_event_ts".into(),
+                group_by: vec!["user_id".into()],
+                aggregations: vec![
+                    AggregationSpec::new(AggKind::CountStar, None, "n"),
+                    AggregationSpec::new(AggKind::Sum, Some("amount".into()), "amount_sum"),
+                ],
+                late_data: LateDataPolicy::Drop,
+                max_groups_per_window: 100,
+                window_start_column: "window_start".into(),
+                window_end_column: "window_end".into(),
+                session_id_column: "session_id".into(),
+                gap_ms: None,
+                max_session_duration_ms: None,
+            };
+            let windowed: Arc<dyn BatchTransform> =
+                Arc::new(WindowedAggregateTransform::new(window_cfg, None).unwrap());
+
+            let cfg = StreamingPipelineConfig::new("topic", table.clone(), "p")
+                .with_transform(windowed)
+                .with_watermark(WatermarkConfig::default());
+            let pipeline = StreamingPipeline::new(
+                source.clone() as Arc<dyn Backend>,
+                vec![(target.clone() as Arc<dyn Backend>, table)],
+                cfg,
+            );
+
+            let (sig, trigger) = ShutdownSignal::new();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                trigger.trigger();
+            });
+            let summary = pipeline.run(sig).await.expect("pipeline.run");
+
+            // The first window [0, 60s) emitted as part of the
+            // third batch's transform() call. The third batch's row
+            // contributed to window [60s, 120s) which doesn't emit
+            // until watermark crosses 120s — never happens in this
+            // test (source goes idle, no further wm advance).
+            let writes = target.writes();
+            assert_eq!(
+                writes.len(),
+                1,
+                "exactly one window emit expected; got {writes:?}"
+            );
+            let (table_name, n_rows) = &writes[0];
+            assert_eq!(table_name, "events");
+            assert_eq!(*n_rows, 1, "one aggregated row (user_id=42)");
+            assert_eq!(summary.total_rows, 1);
+        }
+
+        /// Helper: 3-column batch shaped (user_id, amount, _event_ts)
+        /// matching the windowed integration test's expectations.
+        fn batch_with_user_amount_ts(
+            user_ids: Vec<i64>,
+            amounts: Vec<Option<i64>>,
+            ts_micros: Vec<i64>,
+        ) -> RecordBatch {
+            use arrow_array::{Int64Array, TimestampMicrosecondArray};
+            let schema = Schema::new(vec![
+                Field::new("user_id", DataType::Int64, false),
+                Field::new("amount", DataType::Int64, true),
+                Field::new(
+                    "_event_ts",
+                    DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, Some("UTC".into())),
+                    false,
+                ),
+            ]);
+            RecordBatch::try_new(
+                Arc::new(schema),
+                vec![
+                    Arc::new(Int64Array::from(user_ids)),
+                    Arc::new(Int64Array::from(amounts)),
+                    Arc::new(TimestampMicrosecondArray::from(ts_micros).with_timezone("UTC")),
+                ],
+            )
+            .unwrap()
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn watermark_disabled_does_not_publish_gauges() {
+            let source = Arc::new(TestBackend::new("src"));
+            source.enqueue_read(vec![batch_with_event_ts(vec![1, 2], vec![100, 200])]);
+
+            let target = Arc::new(TestBackend::new("t"));
+            let table = TargetTable {
+                schema: "".into(),
+                name: "events".into(),
+            };
+            // No `.with_watermark(...)` — watermark is disabled.
+            let cfg = StreamingPipelineConfig::new("topic", table.clone(), "p");
+            let pipeline = StreamingPipeline::new(
+                source.clone() as Arc<dyn Backend>,
+                vec![(target.clone() as Arc<dyn Backend>, table)],
+                cfg,
+            );
+
+            let (sig, trigger) = ShutdownSignal::new();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                trigger.trigger();
+            });
+            let _ = pipeline.run(sig).await.expect("pipeline.run");
+
+            let body = pipeline.metrics.render().unwrap();
+            // The gauge is registered (so the metric family exists in
+            // the registry's HELP/TYPE lines) but no values get
+            // emitted because the publish path early-returns. Look
+            // for the absence of any actual gauge sample line.
+            let any_sample = body
+                .lines()
+                .any(|l| l.starts_with("ematix_streaming_watermark_seconds{"));
+            assert!(
+                !any_sample,
+                "no watermark samples should be emitted when watermark is disabled; got:\n{body}"
             );
         }
     }

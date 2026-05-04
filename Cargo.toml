@@ -67,6 +67,11 @@ mysql_async = { version = "0.36", default-features = false, features = ["minimal
 # feature is required (deltalake compile_errors without one of
 # rustls/native-tls).
 deltalake = { version = "0.32", default-features = false, features = ["rustls", "datafusion", "s3"] }
+# DataFusion (Π.4b-1: SQL transforms + stream-table joins). Pinned
+# to the same minor as deltalake's transitive dep so they share one
+# arrow ABI. Adding as a direct dep so we can use SessionContext /
+# MemTable / DataFrame APIs from the transform layer.
+datafusion = { version = "53.1", default-features = false, features = ["parquet"] }
 # Kafka (Phase 36). FFI to librdkafka. The `cmake-build` feature
 # compiles librdkafka from source (slow first build, but no system
 # library required) — keeps CI portable. Default features (libz,
@@ -136,6 +141,17 @@ axum = { version = "0.8", default-features = false, features = ["tokio", "http1"
 # doesn't re-export it. Already pulled in transitively, so this just
 # brings it into the workspace's direct namespace.
 url = "2"
+# Criterion bench harness (Phase 39.1 acceptance criteria for the
+# transform layer — see docs/SQL_TRANSFORMS_PLAN.md).
+criterion = { version = "0.5", default-features = false, features = ["async_tokio"] }
+# Phase 39.4 PR 2b: HyperLogLog+ approximate distinct counting for
+# `count_distinct` aggregator. ~16 KB sketch per group at p=14;
+# ~0.81% standard error. Pure Rust; no external service.
+hyperloglogplus = "0.4"
+# Phase 39.5a PR 3: postcard for serializing per-key session state
+# blobs into the StateStore. Compact (within a few % of bincode),
+# schema-stable (explicit append-only field rules), pure Rust.
+postcard = { version = "1", features = ["alloc"] }
 
 [profile.release]
 lto = "thin"

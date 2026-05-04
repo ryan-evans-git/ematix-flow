@@ -499,7 +499,7 @@ class TestMultiTarget:
         assert t.partition_by is None
 
     def test_two_targets_emits_array_of_tables(self):
-        from ematix_flow import Target
+        from ematix_flow import Source, Target
         from ematix_flow.streaming import _build_toml_multi
 
         src = KafkaConnection(name="src", bootstrap_servers="b:9092", group_id="g")
@@ -507,8 +507,7 @@ class TestMultiTarget:
         lake = DeltaLocalConnection(name="lake", path="/data/lake")
         toml = _build_toml_multi(
             name="fanout",
-            source=src,
-            source_query="events",
+            sources=[Source(connection=src, query="events")],
             targets=[
                 Target(connection=wh, table=("public", "events")),
                 Target(
@@ -536,15 +535,14 @@ class TestMultiTarget:
         # `[target]` block — the Rust runner accepts both forms,
         # but keeping the smaller TOML for the single-target case
         # is what callers expect.
-        from ematix_flow import Target
+        from ematix_flow import Source, Target
         from ematix_flow.streaming import _build_toml_multi
 
         src = KafkaConnection(name="src", bootstrap_servers="b:9092")
         wh = PostgresConnection(name="wh", url="postgres://app@host/db")
         toml = _build_toml_multi(
             name="single",
-            source=src,
-            source_query="events",
+            sources=[Source(connection=src, query="events")],
             targets=[Target(connection=wh, table=("public", "events"))],
             idle_pause_ms=500,
             dead_letter_topic=None,
@@ -581,7 +579,7 @@ class TestMultiTarget:
             )
 
     def test_target_resolves_string_connection_name_via_registry(self):
-        from ematix_flow import Target
+        from ematix_flow import Source, Target
         from ematix_flow.streaming import _build_toml_multi
 
         # Register a connection so a string name resolves.
@@ -593,8 +591,7 @@ class TestMultiTarget:
         src = KafkaConnection(name="src", bootstrap_servers="b:9092")
         toml = _build_toml_multi(
             name="byname",
-            source=src,
-            source_query="events",
+            sources=[Source(connection=src, query="events")],
             targets=[
                 # String references resolve against the registry.
                 Target(connection="warehouse_prod", table=("public", "events")),

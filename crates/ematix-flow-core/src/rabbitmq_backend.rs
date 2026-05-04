@@ -712,6 +712,19 @@ impl Backend for RabbitMQBackend {
             .map_err(|e| BackendError::Query(format!("rabbitmq basic_ack: {e}")))?;
         Ok(())
     }
+
+    /// Phase 39.5a P1.7a: RabbitMQ uses broker-tracked offsets via
+    /// `basic_ack` / `basic_nack`. Acked messages are removed; on
+    /// restart the unacked tail is automatically re-delivered.
+    /// There's no seek primitive — and no need for one. Reporting
+    /// `true` lets stateful pipelines accept RabbitMQ as a source.
+    fn supports_seek_to(&self) -> bool {
+        true
+    }
+
+    async fn seek_to(&self, _offset_bytes: &[u8]) -> Result<(), BackendError> {
+        Ok(())
+    }
 }
 
 /// Best-effort parse of `amqp://user:pass@host:port/vhost` into the

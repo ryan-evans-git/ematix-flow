@@ -415,6 +415,14 @@ struct ConsumerSession {
     /// offset of the *next* message to consume (i.e. last consumed
     /// offset + 1) — that's what the Kafka commit protocol wants.
     pending_offsets: HashMap<i32, i64>,
+    /// Phase 39.5a: per-partition seek targets stashed by
+    /// [`KafkaBackend::seek_to`] before the consumer is opened. When
+    /// `Some`, [`KafkaBackend::acquire_consumer_for`] uses
+    /// `assign + seek` instead of `subscribe` so the new consumer
+    /// resumes from exactly these positions. Cleared after the
+    /// consumer applies them; a subsequent `subscribe` path reverts
+    /// to dynamic group-rebalance behavior.
+    pending_seek: Option<HashMap<i32, i64>>,
 }
 
 /// Kafka-backed implementation of `Backend`.
@@ -464,6 +472,12 @@ pub struct KafkaBackend {
     /// `Protobuf` (Phase 36h.5); ignored for JSON / RawBytes.
     /// Builder-set via `with_schema_registry_url`.
     schema_registry_url: Option<String>,
+    /// Optional Schema Registry basic-auth credentials. Set via
+    /// `with_schema_registry_basic_auth(user, password)`. Confluent
+    /// Cloud uses an API key (username) + API secret (password)
+    /// pair here. Wrapper type carries a custom Debug impl so the
+    /// password redacts when KafkaBackend is `{:?}`-printed.
+    schema_registry_basic_auth: Option<SrBasicAuth>,
     /// Phase 40.2: name of the Arrow column to use as the per-row
     /// Kafka message key. `None` means round-robin (default sticky
     /// partitioner) — matches pre-40.2 behavior. When set, the
@@ -479,6 +493,10 @@ impl std::fmt::Debug for ConsumerSession {
         f.debug_struct("ConsumerSession")
             .field("subscribed_topic", &self.subscribed_topic)
             .field("pending_offsets_count", &self.pending_offsets.len())
+            .field(
+                "pending_seek_count",
+                &self.pending_seek.as_ref().map(|m| m.len()).unwrap_or(0),
+            )
             .finish()
     }
 }
@@ -509,6 +527,7 @@ impl KafkaBackend {
             delivery_semantics: KafkaDeliverySemantics::default(),
             producer_session: Arc::new(Mutex::new(ProducerSession::default())),
             schema_registry_url: None,
+            schema_registry_basic_auth: None,
             message_key_column: None,
         })
     }
@@ -535,8 +554,9 @@ impl KafkaBackend {
     /// Configure the Confluent Schema Registry URL used for Avro
     /// (36h.3) and Protobuf (36h.5) payload formats. The URL is the
     /// SR REST endpoint, e.g. `http://localhost:8081` or
-    /// `https://psrc-xxxxx.us-east-2.aws.confluent.cloud`.
-    /// Authenticated SR (HTTP Basic) is a future-phase enhancement.
+    /// `https://psrc-xxxxx.us-east-2.aws.confluent.cloud`. Pair with
+    /// [`Self::with_schema_registry_basic_auth`] for SRs that
+    /// require authentication (Confluent Cloud, etc.).
     pub fn with_schema_registry_url(mut self, url: impl Into<String>) -> Self {
         self.schema_registry_url = Some(url.into());
         self
@@ -545,6 +565,54 @@ impl KafkaBackend {
     /// Borrow the configured Schema Registry URL.
     pub fn schema_registry_url(&self) -> Option<&str> {
         self.schema_registry_url.as_deref()
+    }
+
+    /// Π.1 follow-up: configure HTTP Basic auth on the Schema
+    /// Registry client. Confluent Cloud's API-key / API-secret pair
+    /// goes here. The credentials are passed to
+    /// `SrSettings::set_basic_authorization` whenever the framework
+    /// constructs an SR client (Avro / Protobuf encode + decode
+    /// paths).
+    pub fn with_schema_registry_basic_auth(
+        mut self,
+        username: impl Into<String>,
+        password: impl Into<String>,
+    ) -> Self {
+        self.schema_registry_basic_auth = Some(SrBasicAuth {
+            username: username.into(),
+            password: password.into(),
+        });
+        self
+    }
+
+    /// Borrow the configured SR basic-auth credentials. Tests +
+    /// introspection only; production code path goes through
+    /// `Self::sr_auth()`.
+    pub fn schema_registry_basic_auth(&self) -> Option<(&str, &str)> {
+        self.schema_registry_basic_auth
+            .as_ref()
+            .map(|a| (a.username.as_str(), a.password.as_str()))
+    }
+
+    /// Build the `SrAuth` value the helper functions consume. Errors
+    /// when called without a configured SR URL — callers should
+    /// only invoke once they've validated the payload format
+    /// requires SR.
+    pub(crate) fn sr_auth(&self) -> Result<SrAuth, BackendError> {
+        let url = self.schema_registry_url.as_ref().ok_or_else(|| {
+            BackendError::Other(
+                "internal: sr_auth() called without a configured \
+                 schema_registry_url"
+                    .into(),
+            )
+        })?;
+        Ok(SrAuth {
+            url: url.clone(),
+            basic_auth: self
+                .schema_registry_basic_auth
+                .as_ref()
+                .map(|a| (a.username.clone(), a.password.clone())),
+        })
     }
 
     /// Override producer-side delivery semantics. Defaults to
@@ -860,20 +928,10 @@ impl KafkaBackend {
                 KafkaPayloadFormat::Json => encode_batch_as_jsonl_lines(&batch)?,
                 KafkaPayloadFormat::RawBytes => encode_batch_as_raw_bytes(&batch)?,
                 KafkaPayloadFormat::Avro => {
-                    encode_batch_as_avro(
-                        &batch,
-                        topic,
-                        self.schema_registry_url.as_ref().expect("checked above"),
-                    )
-                    .await?
+                    encode_batch_as_avro(&batch, topic, &self.sr_auth()?).await?
                 }
                 KafkaPayloadFormat::Protobuf => {
-                    encode_batch_as_protobuf(
-                        &batch,
-                        topic,
-                        self.schema_registry_url.as_ref().expect("checked above"),
-                    )
-                    .await?
+                    encode_batch_as_protobuf(&batch, topic, &self.sr_auth()?).await?
                 }
             };
             all_payloads.append(&mut payloads);
@@ -1052,9 +1110,36 @@ impl KafkaBackend {
             let consumer: StreamConsumer<EmatixKafkaContext> = config
                 .create_with_context(context)
                 .map_err(|e| BackendError::Connection(format!("kafka consumer create: {e}")))?;
-            consumer
-                .subscribe(&[topic])
-                .map_err(|e| BackendError::Connection(format!("kafka subscribe {topic}: {e}")))?;
+            // Phase 39.5a: if `seek_to` stashed a per-partition seek
+            // map, replace the dynamic `subscribe` path with explicit
+            // `assign + seek` so the new consumer resumes from
+            // exactly the recovered offsets. Otherwise fall back to
+            // the regular consumer-group subscribe.
+            if let Some(seek_map) = session.pending_seek.take() {
+                let mut tpl = TopicPartitionList::new();
+                for (partition, offset) in &seek_map {
+                    tpl.add_partition_offset(topic, *partition, Offset::Offset(*offset))
+                        .map_err(|e| {
+                            BackendError::Connection(format!(
+                                "kafka seek_to tpl partition={partition}: {e}"
+                            ))
+                        })?;
+                }
+                consumer.assign(&tpl).map_err(|e| {
+                    BackendError::Connection(format!("kafka assign for seek_to {topic}: {e}"))
+                })?;
+                // `assign` already positions to the offsets in the
+                // TPL; an explicit `seek` would be redundant. We
+                // skip subscribe entirely on this path — group
+                // rebalance is bypassed by design (open question in
+                // PHASE_39_5_SESSIONS.md "seek_to semantics for
+                // sources with replication or partition
+                // reassignment").
+            } else {
+                consumer.subscribe(&[topic]).map_err(|e| {
+                    BackendError::Connection(format!("kafka subscribe {topic}: {e}"))
+                })?;
+            }
             session.consumer = Some(Arc::new(consumer));
             session.subscribed_topic = Some(topic.to_string());
             session.pending_offsets.clear();
@@ -1344,19 +1429,11 @@ impl Backend for KafkaBackend {
             KafkaPayloadFormat::RawBytes => decode_payloads_as_raw_bytes(payloads)?,
             KafkaPayloadFormat::Avro => {
                 // schema_registry_url presence already validated above.
-                decode_payloads_as_avro(
-                    payloads,
-                    self.schema_registry_url.as_ref().expect("checked above"),
-                )
-                .await?
+                decode_payloads_as_avro(payloads, &self.sr_auth()?).await?
             }
             KafkaPayloadFormat::Protobuf => {
                 // schema_registry_url presence already validated above.
-                decode_payloads_as_protobuf(
-                    payloads,
-                    self.schema_registry_url.as_ref().expect("checked above"),
-                )
-                .await?
+                decode_payloads_as_protobuf(payloads, &self.sr_auth()?).await?
             }
         };
         let stream = futures_util::stream::iter(batches.into_iter().map(Ok));
@@ -1449,21 +1526,11 @@ impl Backend for KafkaBackend {
                 KafkaPayloadFormat::RawBytes => encode_batch_as_raw_bytes(&batch)?,
                 KafkaPayloadFormat::Avro => {
                     // schema_registry_url presence already validated above.
-                    encode_batch_as_avro(
-                        &batch,
-                        topic,
-                        self.schema_registry_url.as_ref().expect("checked above"),
-                    )
-                    .await?
+                    encode_batch_as_avro(&batch, topic, &self.sr_auth()?).await?
                 }
                 KafkaPayloadFormat::Protobuf => {
                     // schema_registry_url presence already validated above.
-                    encode_batch_as_protobuf(
-                        &batch,
-                        topic,
-                        self.schema_registry_url.as_ref().expect("checked above"),
-                    )
-                    .await?
+                    encode_batch_as_protobuf(&batch, topic, &self.sr_auth()?).await?
                 }
             };
             // ExactlyOnce: wrap the per-batch produce in a Kafka
@@ -1664,6 +1731,92 @@ impl Backend for KafkaBackend {
         // 36e API surface) and that's intentional.
         Self::commit_offsets(self).await
     }
+
+    fn supports_seek_to(&self) -> bool {
+        true
+    }
+
+    /// Phase 39.5a: stash a per-partition seek map decoded from
+    /// `offset_bytes`. The next `read_arrow_stream` call (which
+    /// drives `acquire_consumer_for`) sees this and uses
+    /// `assign + seek` instead of `subscribe`, restoring exact
+    /// per-partition positions from a `StateStore`-recovered offset.
+    ///
+    /// Calling `seek_to` on an already-active consumer drops the
+    /// consumer so the next read re-creates it with the new
+    /// positions.
+    async fn seek_to(&self, offset_bytes: &[u8]) -> Result<(), BackendError> {
+        let parsed = decode_kafka_offsets(offset_bytes)?;
+        let mut session = self
+            .consumer_session
+            .lock()
+            .map_err(|e| BackendError::Other(format!("kafka consumer lock: {e}")))?;
+        // Drop any active consumer — its subscribe/assign state is
+        // now stale relative to the recovered offsets. The next
+        // `acquire_consumer_for` call will rebuild with the seek
+        // map applied.
+        session.consumer = None;
+        session.subscribed_topic = None;
+        session.pending_offsets.clear();
+        session.pending_seek = Some(parsed);
+        Ok(())
+    }
+
+    /// Phase 39.5a: hand the current per-partition pending offsets
+    /// back as JSON-encoded bytes for `StateStore.commit`. Returns
+    /// `None` when no offsets have advanced since startup or the
+    /// last commit — caller skips this source from the snapshot.
+    async fn offset_snapshot(&self) -> Result<Option<Vec<u8>>, BackendError> {
+        let session = self
+            .consumer_session
+            .lock()
+            .map_err(|e| BackendError::Other(format!("kafka consumer lock: {e}")))?;
+        if session.pending_offsets.is_empty() {
+            return Ok(None);
+        }
+        let bytes = encode_kafka_offsets(&session.pending_offsets)?;
+        Ok(Some(bytes))
+    }
+}
+
+// =====================================================================
+// Phase 39.5a: opaque offset encoding for `StateStore`.
+//
+// State-store consumers see `Vec<u8>`; the format below is internal
+// to this backend. JSON keeps the bytes debuggable in the database
+// (e.g., `bytea_to_text` in psql) at negligible size cost — a typical
+// session pipeline tracks O(10) partitions.
+// =====================================================================
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct KafkaOffsetSnapshotV1 {
+    /// Schema discriminator. Kept distinct from `state_store`'s
+    /// `state_version` because the offset payload is owned by the
+    /// source backend, not the windowed transform.
+    v: u32,
+    /// `partition → next-offset-to-consume`. Same convention as
+    /// Kafka's commit protocol (last-consumed + 1).
+    partitions: std::collections::BTreeMap<i32, i64>,
+}
+
+pub(crate) fn encode_kafka_offsets(offsets: &HashMap<i32, i64>) -> Result<Vec<u8>, BackendError> {
+    let snap = KafkaOffsetSnapshotV1 {
+        v: 1,
+        partitions: offsets.iter().map(|(p, o)| (*p, *o)).collect(),
+    };
+    serde_json::to_vec(&snap).map_err(|e| BackendError::Other(format!("kafka offset encode: {e}")))
+}
+
+pub(crate) fn decode_kafka_offsets(bytes: &[u8]) -> Result<HashMap<i32, i64>, BackendError> {
+    let snap: KafkaOffsetSnapshotV1 = serde_json::from_slice(bytes)
+        .map_err(|e| BackendError::Other(format!("kafka offset decode: {e}")))?;
+    if snap.v != 1 {
+        return Err(BackendError::Other(format!(
+            "kafka offset payload v={} not supported (this build understands v=1)",
+            snap.v
+        )));
+    }
+    Ok(snap.partitions.into_iter().collect())
 }
 
 /// How long to wait for the first message after subscribing. The
@@ -1877,14 +2030,73 @@ fn encode_batch_as_raw_bytes(batch: &RecordBatch) -> Result<Vec<Vec<u8>>, Backen
 /// JSON path), but Avro Decimal / Fixed types lose strict typing
 /// (round-trip via stringification). Strict-typed Avro→Arrow with
 /// schema-driven Arrow builders is a follow-up.
+/// Π.1 follow-up: SR basic-auth credentials with a Debug impl that
+/// redacts the password. Wrapper around `(username, password)` so
+/// the redaction is automatic anywhere this lands inside a
+/// `#[derive(Debug)]` struct.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SrBasicAuth {
+    pub username: String,
+    pub password: String,
+}
+
+impl std::fmt::Debug for SrBasicAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SrBasicAuth")
+            .field("username", &self.username)
+            .field("password", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Π.1 follow-up: bundle the SR URL with optional HTTP Basic auth
+/// so the four SR helper functions take a single value rather than
+/// growing twin `Option<&str>` parameters at every signature.
+/// Construct via `KafkaBackend::sr_auth()`.
+#[derive(Debug, Clone)]
+pub struct SrAuth {
+    /// SR REST endpoint, e.g. `http://localhost:8081`.
+    pub url: String,
+    /// Optional `(username, password)`; Confluent Cloud uses
+    /// (API-key, API-secret).
+    pub basic_auth: Option<(String, String)>,
+}
+
+impl SrAuth {
+    /// Convenience for tests + non-Backend callers.
+    pub fn new(url: impl Into<String>) -> Self {
+        Self {
+            url: url.into(),
+            basic_auth: None,
+        }
+    }
+
+    /// Build the `SrSettings` consumed by the schema_registry_converter
+    /// crate. Falls back to `SrSettings::new(url)` when no basic auth
+    /// is set so the unauthenticated path stays a single allocation.
+    pub(crate) fn build_sr_settings(
+        &self,
+    ) -> Result<schema_registry_converter::async_impl::schema_registry::SrSettings, BackendError>
+    {
+        use schema_registry_converter::async_impl::schema_registry::SrSettings;
+        if let Some((user, password)) = &self.basic_auth {
+            SrSettings::new_builder(self.url.clone())
+                .set_basic_authorization(user, Some(password))
+                .build()
+                .map_err(|e| BackendError::Other(format!("sr settings build: {e}")))
+        } else {
+            Ok(SrSettings::new(self.url.clone()))
+        }
+    }
+}
+
 pub async fn decode_payloads_as_avro(
     payloads: Vec<Vec<u8>>,
-    schema_registry_url: &str,
+    sr: &SrAuth,
 ) -> Result<Vec<RecordBatch>, BackendError> {
     use schema_registry_converter::async_impl::easy_avro::EasyAvroDecoder;
-    use schema_registry_converter::async_impl::schema_registry::SrSettings;
 
-    let sr_settings = SrSettings::new(schema_registry_url.to_string());
+    let sr_settings = sr.build_sr_settings()?;
     let decoder = EasyAvroDecoder::new(sr_settings);
 
     let mut json_payloads: Vec<Vec<u8>> = Vec::with_capacity(payloads.len());
@@ -1976,12 +2188,11 @@ fn avro_value_to_json(value: &apache_avro::types::Value) -> serde_json::Value {
 /// Strict-typed Protobuf→Arrow is a future follow-up.
 pub async fn decode_payloads_as_protobuf(
     payloads: Vec<Vec<u8>>,
-    schema_registry_url: &str,
+    sr: &SrAuth,
 ) -> Result<Vec<RecordBatch>, BackendError> {
     use schema_registry_converter::async_impl::easy_proto_decoder::EasyProtoDecoder;
-    use schema_registry_converter::async_impl::schema_registry::SrSettings;
 
-    let sr_settings = SrSettings::new(schema_registry_url.to_string());
+    let sr_settings = sr.build_sr_settings()?;
     let decoder = EasyProtoDecoder::new(sr_settings);
 
     let mut json_payloads: Vec<Vec<u8>> = Vec::with_capacity(payloads.len());
@@ -2151,12 +2362,10 @@ fn packed_array_to_json(packed: &protofish::decode::PackedArray) -> Vec<serde_js
 pub async fn encode_batch_as_protobuf(
     batch: &RecordBatch,
     topic: &str,
-    schema_registry_url: &str,
+    sr: &SrAuth,
 ) -> Result<Vec<Vec<u8>>, BackendError> {
     use schema_registry_converter::async_impl::easy_proto_raw::EasyProtoRawEncoder;
-    use schema_registry_converter::async_impl::schema_registry::{
-        SrSettings, get_schema_by_subject,
-    };
+    use schema_registry_converter::async_impl::schema_registry::get_schema_by_subject;
     use schema_registry_converter::proto_resolver::MessageResolver;
     use schema_registry_converter::schema_registry_common::SubjectNameStrategy;
 
@@ -2178,7 +2387,7 @@ pub async fn encode_batch_as_protobuf(
         rows.push(v);
     }
 
-    let sr_settings = SrSettings::new(schema_registry_url.to_string());
+    let sr_settings = sr.build_sr_settings()?;
     let strategy = SubjectNameStrategy::TopicNameStrategy(topic.to_string(), false);
 
     // Fetch the .proto schema source so we can build MessageValues.
@@ -2576,10 +2785,9 @@ pub fn encode_batch_as_jsonl_lines(batch: &RecordBatch) -> Result<Vec<Vec<u8>>, 
 pub async fn encode_batch_as_avro(
     batch: &RecordBatch,
     topic: &str,
-    schema_registry_url: &str,
+    sr: &SrAuth,
 ) -> Result<Vec<Vec<u8>>, BackendError> {
     use schema_registry_converter::async_impl::easy_avro::EasyAvroEncoder;
-    use schema_registry_converter::async_impl::schema_registry::SrSettings;
     use schema_registry_converter::schema_registry_common::SubjectNameStrategy;
 
     // Render to JSONL once, parse each line into a serde_json::Value.
@@ -2600,7 +2808,7 @@ pub async fn encode_batch_as_avro(
         rows.push(v);
     }
 
-    let sr_settings = SrSettings::new(schema_registry_url.to_string());
+    let sr_settings = sr.build_sr_settings()?;
     let encoder = EasyAvroEncoder::new(sr_settings);
     // Subject "<topic>-value" — the standard Confluent default. Key
     // subjects ("<topic>-key") aren't relevant: we don't produce
@@ -2655,6 +2863,80 @@ mod tests {
         assert!(msg.contains("bootstrap_servers"), "got: {msg}");
     }
 
+    // ----- Phase 39.5a slice 1.5: seek_to + offset codec -----
+
+    #[test]
+    fn kafka_offsets_roundtrip_through_codec() {
+        let mut original = HashMap::new();
+        original.insert(0_i32, 100_i64);
+        original.insert(1, 50);
+        original.insert(7, 99_999);
+
+        let bytes = encode_kafka_offsets(&original).unwrap();
+        let decoded = decode_kafka_offsets(&bytes).unwrap();
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn decode_rejects_unknown_payload_version() {
+        // Hand-roll a v=2 payload — the decoder only knows v=1.
+        let payload = br#"{"v":2,"partitions":{"0":1}}"#;
+        let err = decode_kafka_offsets(payload).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("v=2"),
+            "should mention the unsupported version: {msg}"
+        );
+    }
+
+    #[test]
+    fn decode_rejects_garbage_bytes() {
+        let err = decode_kafka_offsets(b"not json").unwrap_err();
+        assert!(err.to_string().contains("decode"));
+    }
+
+    #[test]
+    fn kafka_backend_reports_supports_seek_to() {
+        let b = KafkaBackend::open("localhost:9092", Some("g")).unwrap();
+        assert!(b.supports_seek_to(), "Kafka must opt in to seek_to");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn offset_snapshot_returns_none_before_any_read() {
+        let b = KafkaBackend::open("localhost:9092", Some("g")).unwrap();
+        assert!(b.offset_snapshot().await.unwrap().is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn seek_to_stashes_decoded_offsets_for_next_consumer() {
+        // No real broker is contacted here — `seek_to` just decodes
+        // and stashes; consumer creation is lazy.
+        let b = KafkaBackend::open("localhost:9092", Some("g")).unwrap();
+        let mut offsets = HashMap::new();
+        offsets.insert(0_i32, 42_i64);
+        offsets.insert(1, 7);
+        let payload = encode_kafka_offsets(&offsets).unwrap();
+        b.seek_to(&payload).await.unwrap();
+
+        // Inspect the session directly: the pending_seek field is
+        // private but the test is in the same module, so we can
+        // reach in.
+        let session = b.consumer_session.lock().unwrap();
+        let stashed = session
+            .pending_seek
+            .as_ref()
+            .expect("pending_seek must be Some after seek_to");
+        assert_eq!(stashed.get(&0_i32), Some(&42_i64));
+        assert_eq!(stashed.get(&1_i32), Some(&7_i64));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn seek_to_with_garbage_bytes_returns_error() {
+        let b = KafkaBackend::open("localhost:9092", Some("g")).unwrap();
+        let err = b.seek_to(b"not-json").await.unwrap_err();
+        assert!(err.to_string().contains("decode"));
+    }
+
     #[test]
     fn open_succeeds_and_carries_dialect() {
         let b = KafkaBackend::open("localhost:9092", Some("g1")).unwrap();
@@ -2667,6 +2949,57 @@ mod tests {
         assert_eq!(b.bootstrap_servers(), "localhost:9092");
         assert_eq!(b.group_id(), Some("g1"));
         assert_eq!(b.dsn().as_deref(), Some("localhost:9092"));
+    }
+
+    /// Π.1 follow-up: SR basic auth round-trips through the builder
+    /// and `sr_auth()` produces an `SrAuth` that carries it.
+    #[test]
+    fn with_schema_registry_basic_auth_round_trips() {
+        let backend = KafkaBackend::open("localhost:9092", None)
+            .unwrap()
+            .with_schema_registry_url("http://sr.example.com")
+            .with_schema_registry_basic_auth("api-key", "api-secret");
+
+        // Public accessor exposes the (user, password) pair as
+        // borrowed strings.
+        let (u, p) = backend.schema_registry_basic_auth().expect("set");
+        assert_eq!(u, "api-key");
+        assert_eq!(p, "api-secret");
+
+        // sr_auth() bundles URL + auth.
+        let auth = backend.sr_auth().expect("URL set");
+        assert_eq!(auth.url, "http://sr.example.com");
+        assert_eq!(
+            auth.basic_auth,
+            Some(("api-key".to_string(), "api-secret".to_string()))
+        );
+    }
+
+    /// Without `with_schema_registry_basic_auth`, `sr_auth()` carries
+    /// `None` for the credentials and `build_sr_settings()` falls
+    /// through to the unauthenticated `SrSettings::new` path.
+    #[test]
+    fn sr_auth_without_basic_auth_is_unauthenticated() {
+        let backend = KafkaBackend::open("localhost:9092", None)
+            .unwrap()
+            .with_schema_registry_url("http://sr:8081");
+        let auth = backend.sr_auth().expect("URL set");
+        assert!(auth.basic_auth.is_none());
+        // Build call should succeed (no auth → SrSettings::new).
+        auth.build_sr_settings().expect("settings build");
+    }
+
+    #[test]
+    fn debug_redacts_schema_registry_basic_auth_password() {
+        let backend = KafkaBackend::open("localhost:9092", None)
+            .unwrap()
+            .with_schema_registry_url("http://sr:8081")
+            .with_schema_registry_basic_auth("api-key", "secret-do-not-leak");
+        let dbg = format!("{backend:?}");
+        assert!(
+            !dbg.contains("secret-do-not-leak"),
+            "Debug leaked SR password: {dbg}"
+        );
     }
 
     #[test]
@@ -2959,7 +3292,7 @@ mod tests {
             RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1i64, 2, 3]))])
                 .unwrap();
         // Port 1 is "tcpmux"; effectively guaranteed to refuse.
-        let err = encode_batch_as_avro(&batch, "heartbeat", "http://127.0.0.1:1")
+        let err = encode_batch_as_avro(&batch, "heartbeat", &SrAuth::new("http://127.0.0.1:1"))
             .await
             .unwrap_err();
         let msg = err.to_string();
@@ -3055,7 +3388,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn protobuf_decode_unreachable_sr_returns_clean_error() {
         let payloads = vec![vec![0x00, 0x00, 0x00, 0x00, 0x01, 0x08, 0x65]];
-        let err = decode_payloads_as_protobuf(payloads, "http://127.0.0.1:1")
+        let err = decode_payloads_as_protobuf(payloads, &SrAuth::new("http://127.0.0.1:1"))
             .await
             .unwrap_err();
         let msg = err.to_string();
@@ -3185,7 +3518,7 @@ mod tests {
         )]));
         let batch =
             RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1i64, 2]))]).unwrap();
-        let err = encode_batch_as_protobuf(&batch, "heartbeat", "http://127.0.0.1:1")
+        let err = encode_batch_as_protobuf(&batch, "heartbeat", &SrAuth::new("http://127.0.0.1:1"))
             .await
             .unwrap_err();
         let msg = err.to_string();
