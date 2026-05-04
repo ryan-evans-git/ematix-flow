@@ -3408,6 +3408,7 @@ dependencies = [
  "rdkafka",
  "reqwest 0.12.28",
  "rusqlite",
+ "sasl2-sys",
  "schema_registry_converter",
  "serde",
  "serde_json",
@@ -7045,6 +7046,7 @@ dependencies = [
  "cc",
  "duct",
  "libc",
+ "openssl-sys",
  "pkg-config",
 ]
 

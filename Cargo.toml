@@ -77,6 +77,17 @@ datafusion = { version = "53.1", default-features = false, features = ["parquet"
 # library required) — keeps CI portable. Default features (libz,
 # tokio) cover gzip + tokio integration.
 rdkafka = { version = "0.39", features = ["cmake-build", "ssl", "sasl"] }
+# rdkafka's `sasl` feature pulls in `sasl2-sys` (transitively via
+# rdkafka-sys's `gssapi` feature → `sasl2-sys`). Without explicit
+# vendoring, that crate's build script looks for system libsasl2
+# (libsasl2-dev on Debian, cyrus-sasl-devel on RHEL) at compile
+# time — which fails inside the manylinux2014 wheel-build
+# container. Declaring sasl2-sys here as a direct dep with the
+# `plain` + `scram` features (each transitively activates
+# `vendored`) tells the resolver to bundle libsasl2 statically
+# into the wheel, with PLAIN + SCRAM mechanisms compiled in. No
+# runtime libsasl2 install required on consumer machines.
+sasl2-sys = { version = "0.1.22", features = ["plain", "scram"] }
 # AWS MSK IAM token signer (Phase 36f). librdkafka itself doesn't
 # know how to mint MSK IAM tokens — it asks the rust-side via the
 # OAUTHBEARER refresh callback, and we hand it back a presigned

@@ -38,6 +38,12 @@ deltalake = { workspace = true }
 datafusion = { workspace = true }
 url = { workspace = true }
 rdkafka = { workspace = true }
+# Direct dep so the resolver activates the `vendored` (via `plain`
+# + `scram`) features on the same `sasl2-sys` instance that
+# `rdkafka-sys` pulls in transitively. Without this, sasl2-sys's
+# build script searches for a system libsasl2 at compile time and
+# fails inside the manylinux2014 wheel-build container.
+sasl2-sys = { workspace = true }
 aws-msk-iam-sasl-signer = { workspace = true }
 aws-types = { workspace = true }
 prometheus = { workspace = true }
