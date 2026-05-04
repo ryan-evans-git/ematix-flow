@@ -2093,7 +2093,7 @@ impl WindowedAggregateTransform {
                     for other in absorbed {
                         base.start_ts = base.start_ts.min(other.start_ts);
                         base.last_event_ts = base.last_event_ts.max(other.last_event_ts);
-                        for (a, b) in base.accs.iter_mut().zip(other.accs.into_iter()) {
+                        for (a, b) in base.accs.iter_mut().zip(other.accs) {
                             a.combine(b)?;
                         }
                         if other.emitted {

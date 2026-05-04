@@ -237,9 +237,8 @@ fn bench_lookup_load_construction(c: &mut Criterion) {
     // build a fresh transform every iteration — that's the
     // point-in-time work the pipeline does at startup.
     c.bench_function("lookup_load_10k_x_10cols_register_and_plan", |b| {
-        b.to_async(&rt).iter_with_setup(
-            build_ten_thousand_row_lookup,
-            |lookup| {
+        b.to_async(&rt)
+            .iter_with_setup(build_ten_thousand_row_lookup, |lookup| {
                 let schema = schema.clone();
                 async move {
                     let t = DataFusionTransform::new_with_lookups(
@@ -251,8 +250,7 @@ fn bench_lookup_load_construction(c: &mut Criterion) {
                     .unwrap();
                     std::hint::black_box(t);
                 }
-            },
-        )
+            })
     });
 }
 

@@ -6863,9 +6863,7 @@ async fn kafka_avro_sr_round_trip() {
     use arrow_array::{Int64Array, StringArray};
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
     use ematix_flow_core::backend::WriteMode;
-    use ematix_flow_core::kafka_backend::{
-        KafkaPayloadFormat, SrAuth, encode_batch_as_avro,
-    };
+    use ematix_flow_core::kafka_backend::{KafkaPayloadFormat, SrAuth, encode_batch_as_avro};
 
     let (_container, sr_url) = start_apicurio_registry().await;
 
