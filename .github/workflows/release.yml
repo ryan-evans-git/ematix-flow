@@ -15,6 +15,9 @@ name: release
 #      record becomes permanent.
 #
 # Wheel-build philosophy:
+#   - 6 wheels per release: linux-x86_64 × {py3.11, py3.12, py3.13}
+#     and macos-aarch64 × {py3.11, py3.12, py3.13}. Plus one sdist
+#     for every other (OS, arch, Python) combination.
 #   - One wheel per (OS, arch, Python). Linux uses the manylinux2014
 #     container so wheels run on every glibc-2.17+ system.
 #   - macOS: aarch64 (Apple Silicon) only. Intel Mac wheels were
@@ -47,7 +50,14 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python: ["3.10", "3.11", "3.12", "3.13"]
+        # Python 3.10 wheels were dropped to halve the macOS billing
+        # burn (each macos-aarch64 wheel build is 10× billed minutes
+        # on private repos). 3.10 users `pip install` from the sdist
+        # — needs Rust + cmake locally; one extra step. `pyproject.toml`
+        # still declares `requires-python = ">=3.10"`, so the sdist
+        # fall-through is the supported path. Re-add 3.10 here once
+        # the repo goes public + minutes go unlimited.
+        python: ["3.11", "3.12", "3.13"]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -85,11 +95,8 @@ jobs:
           # Apple Silicon: native build on arm64 runner — fastest +
           # avoids cross-link headaches with librdkafka's cmake
           # build. Intel Mac wheels are intentionally not built;
-          # see the top-of-file comment.
-          - arch: aarch64
-            runner: macos-14
-            target: aarch64-apple-darwin
-            python: "3.10"
+          # see the top-of-file comment. Python 3.10 also dropped —
+          # see the matching note on the `build-linux` matrix above.
           - arch: aarch64
             runner: macos-14
             target: aarch64-apple-darwin

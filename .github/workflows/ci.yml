@@ -1,5 +1,12 @@
 name: ci
 
+# Linux-only matrix on purpose: macOS GitHub-hosted runners are
+# billed at 10× the Linux rate for private repos, and ci.yml runs
+# on every push + PR. The release.yml workflow still builds macOS
+# (Apple Silicon) wheels — that's where macOS coverage actually
+# matters. Until the repo goes public (free unlimited Actions
+# minutes), this matrix stays linux-only.
+
 on:
   push:
     branches: [main, master]
@@ -15,12 +22,8 @@ env:
 
 jobs:
   rust:
-    name: rust (${{ matrix.os }})
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
+    name: rust (ubuntu-latest)
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -32,13 +35,12 @@ jobs:
       - run: cargo test --workspace --all-targets
 
   python:
-    name: python (${{ matrix.os }}, py${{ matrix.python }})
+    name: python (ubuntu-latest, py${{ matrix.python }})
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
         python: ["3.11", "3.12"]
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
