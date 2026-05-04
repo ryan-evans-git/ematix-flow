@@ -178,6 +178,21 @@ First public release.
 
 clippy + fmt clean on stable Rust.
 
+### Wheel matrix
+
+- **Linux x86_64** (manylinux2014) — Python 3.10 / 3.11 / 3.12 / 3.13.
+- **macOS aarch64** (Apple Silicon) — Python 3.10 / 3.11 / 3.12 / 3.13.
+- **Source distribution** — included for every other platform
+  (Intel Mac, Linux aarch64, etc.). `pip install ematix-flow` falls
+  through to the sdist; needs Rust + cmake locally for the build.
+- **Windows + Intel Mac wheels are intentionally not built.** The
+  Windows decision is structural (librdkafka + deltalake don't
+  support Windows on pinned versions). Intel Mac wheels are dropped
+  because GitHub's macos-13 runner pool is being phased out and
+  wait times block releases; Apple Silicon covers every Mac shipped
+  since Nov 2020 and `pip install --no-binary` from sdist works for
+  Intel-Mac holdouts.
+
 ### Known limitations
 
 See [`docs/ROADMAP.md`](docs/ROADMAP.md) for the full list.

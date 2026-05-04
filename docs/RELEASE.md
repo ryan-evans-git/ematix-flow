@@ -73,8 +73,9 @@ git push origin v0.1.0
 The `release.yml` workflow fires on tag push:
 
 1. Builds wheels for Linux x86_64 (manylinux2014) and macOS
-   aarch64 + x86_64, across Python 3.10 / 3.11 / 3.12 / 3.13 — 12
-   wheels total.
+   aarch64, across Python 3.10 / 3.11 / 3.12 / 3.13 — 8 wheels
+   total. (Intel Mac wheels were dropped — see the top-of-file
+   comment in `release.yml`. Intel-Mac users install from sdist.)
 2. Builds the source distribution.
 3. Uploads everything to <https://pypi.org/p/ematix-flow> via
    trusted publishing (no API token required).

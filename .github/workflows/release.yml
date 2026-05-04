@@ -17,9 +17,15 @@ name: release
 # Wheel-build philosophy:
 #   - One wheel per (OS, arch, Python). Linux uses the manylinux2014
 #     container so wheels run on every glibc-2.17+ system.
-#   - macOS builds two arches: aarch64 (Apple Silicon) and x86_64
-#     (Intel). One wheel per arch — universal2 wheels are skipped
-#     because the maturin pyarrow ABI link blows up on universal2.
+#   - macOS: aarch64 (Apple Silicon) only. Intel Mac wheels were
+#     dropped from the matrix because GitHub's macos-13 (Intel)
+#     runners are progressively being phased out — wait times are
+#     unreliable enough that they'd block every release. Apple
+#     Silicon covers every Mac shipped since Nov 2020. Intel-Mac
+#     users can still `pip install ematix-flow` from the sdist
+#     (needs Rust + cmake locally; one extra step). Re-add a
+#     macos-13 matrix block here if Intel-Mac demand resurfaces or
+#     a `macos-13-large` runner becomes generally available.
 #   - Windows: NOT BUILT. Per the PRD this is intentional — librdkafka
 #     + the deltalake stack don't support Windows in the workspace's
 #     pinned versions. Add a Windows job here when those land.
@@ -78,7 +84,8 @@ jobs:
         include:
           # Apple Silicon: native build on arm64 runner — fastest +
           # avoids cross-link headaches with librdkafka's cmake
-          # build.
+          # build. Intel Mac wheels are intentionally not built;
+          # see the top-of-file comment.
           - arch: aarch64
             runner: macos-14
             target: aarch64-apple-darwin
@@ -94,24 +101,6 @@ jobs:
           - arch: aarch64
             runner: macos-14
             target: aarch64-apple-darwin
-            python: "3.13"
-          # Intel: build on Intel runner. (Cross-compiling x86_64 ->
-          # arm64 is reasonable; the reverse is not for our deps.)
-          - arch: x86_64
-            runner: macos-13
-            target: x86_64-apple-darwin
-            python: "3.10"
-          - arch: x86_64
-            runner: macos-13
-            target: x86_64-apple-darwin
-            python: "3.11"
-          - arch: x86_64
-            runner: macos-13
-            target: x86_64-apple-darwin
-            python: "3.12"
-          - arch: x86_64
-            runner: macos-13
-            target: x86_64-apple-darwin
             python: "3.13"
     steps:
       - uses: actions/checkout@v4
