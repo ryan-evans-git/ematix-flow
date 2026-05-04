@@ -46,10 +46,21 @@ jobs:
           python-version: ${{ matrix.python }}
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # `maturin develop` requires an active virtualenv (it refuses
+      # to install into the system Python). Create one + persist its
+      # bin/ on PATH and VIRTUAL_ENV across subsequent steps via
+      # $GITHUB_PATH / $GITHUB_ENV so every later `python` /
+      # `pip` / `maturin` / `pytest` invocation resolves through it.
+      - name: Set up venv
+        shell: bash
+        run: |
+          python -m venv .venv
+          echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
+          echo "VIRTUAL_ENV=$PWD/.venv" >> "$GITHUB_ENV"
       - name: Install dev deps
         run: |
           python -m pip install --upgrade pip
-          pip install 'maturin>=1.7' pytest ruff
+          pip install 'maturin>=1.7' pytest 'pytest-asyncio>=0.23' ruff
       - name: Build extension
         run: maturin develop --release
       - name: Lint
