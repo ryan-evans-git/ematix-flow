@@ -336,7 +336,7 @@ pub fn open_arc(cfg: DistributedConfig) -> Result<Arc<dyn Backend>, BackendError
 
 use arrow_schema::SchemaRef;
 use datafusion::datasource::MemTable;
-use ematix_flow_core::transform::{BatchContext, BatchTransform};
+use ematix_flow_core::transform::{BatchContext, BatchTransform, LookupTable};
 
 /// A `BatchTransform` that runs the configured SQL through a
 /// `DistributedBackend`'s `SessionContext`. Per call:
@@ -362,6 +362,13 @@ use ematix_flow_core::transform::{BatchContext, BatchTransform};
 pub struct DistributedSqlTransform {
     sql: String,
     backend: Arc<DistributedBackend>,
+    /// Σ.B follow-up: static lookup tables, registered alongside
+    /// `source` on the first `transform()` call. The
+    /// `DistributedPhysicalOptimizerRule` plans small lookups as
+    /// broadcast joins, so each peer worker receives the full
+    /// lookup data via Arrow Flight rather than needing a local
+    /// copy. Empty `Vec` = no lookups (the common case).
+    lookups: Vec<LookupTable>,
     schemas: tokio::sync::OnceCell<DistributedSqlSchemas>,
 }
 
@@ -387,6 +394,27 @@ impl DistributedSqlTransform {
         Self {
             sql: sql.into(),
             backend,
+            lookups: Vec::new(),
+            schemas: tokio::sync::OnceCell::new(),
+        }
+    }
+
+    /// Σ.B follow-up: build with one or more static lookup tables.
+    /// Each is registered as a table in the backend's
+    /// `SessionContext` on the first `transform()` call (alongside
+    /// `source`); the SQL can reference them by their `LookupTable::name`.
+    /// Lookups travel to peer workers via Arrow Flight as part of
+    /// the distributed plan — `DistributedPhysicalOptimizerRule`
+    /// emits broadcast joins for small enough tables.
+    pub fn new_with_lookups(
+        sql: impl Into<String>,
+        backend: Arc<DistributedBackend>,
+        lookups: Vec<LookupTable>,
+    ) -> Self {
+        Self {
+            sql: sql.into(),
+            backend,
+            lookups,
             schemas: tokio::sync::OnceCell::new(),
         }
     }
@@ -397,6 +425,17 @@ impl DistributedSqlTransform {
     pub fn open(sql: impl Into<String>, cfg: DistributedConfig) -> Result<Self, BackendError> {
         let backend = Arc::new(DistributedBackend::open(cfg)?);
         Ok(Self::new(sql, backend))
+    }
+
+    /// Σ.B follow-up: convenience constructor that builds a fresh
+    /// backend + attaches lookups in one call.
+    pub fn open_with_lookups(
+        sql: impl Into<String>,
+        cfg: DistributedConfig,
+        lookups: Vec<LookupTable>,
+    ) -> Result<Self, BackendError> {
+        let backend = Arc::new(DistributedBackend::open(cfg)?);
+        Ok(Self::new_with_lookups(sql, backend, lookups))
     }
 
     /// Borrow the SQL — for diagnostics + log lines.
@@ -445,6 +484,27 @@ impl BatchTransform for DistributedSqlTransform {
             .map_err(|e| BackendError::Query(format!("memtable: {e}")))?;
         ctx.register_table("source", Arc::new(mem))
             .map_err(|e| BackendError::Query(format!("register source: {e}")))?;
+
+        // Σ.B follow-up: register lookups on first call. Lookups are
+        // static data; we register once and let DataFusion +
+        // DistributedPhysicalOptimizerRule handle distribution
+        // (broadcast joins ship the table data to each peer over
+        // Arrow Flight). Subsequent calls reuse the registration.
+        // `schemas.initialized()` doubles as the "first-call"
+        // sentinel here — true after the first successful
+        // transform; no-op after that.
+        if !self.schemas.initialized() {
+            for lookup in &self.lookups {
+                let mem = MemTable::try_new(lookup.schema.clone(), vec![lookup.batches.clone()])
+                    .map_err(|e| {
+                        BackendError::Query(format!("lookup {:?} memtable: {e}", lookup.name))
+                    })?;
+                ctx.register_table(&lookup.name, Arc::new(mem))
+                    .map_err(|e| {
+                        BackendError::Query(format!("register lookup {:?}: {e}", lookup.name))
+                    })?;
+            }
+        }
 
         let df = ctx
             .sql(&self.sql)
@@ -638,6 +698,72 @@ mod tests {
         assert!(xform.schemas.initialized());
         assert_eq!(xform.input_schema().fields().len(), 1);
         assert_eq!(xform.output_schema().fields()[0].name(), "doubled");
+    }
+
+    /// Σ.B follow-up: lookups visible to the SQL on the
+    /// coordinator's session. Empty-peers degenerate cluster keeps
+    /// the test offline; the cross-pod variant lives in
+    /// `tests/cross_pod.rs`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn distributed_sql_transform_supports_lookups_on_coordinator() {
+        use datafusion::arrow::array::{Int64Array, StringArray};
+        use datafusion::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+        use datafusion::arrow::record_batch::RecordBatch;
+        use ematix_flow_core::transform::{BatchContext, BatchTransform, LookupTable};
+        use std::sync::Arc;
+
+        // Lookup: 3 country rows.
+        let lookup_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("country", DataType::Utf8, false),
+        ]));
+        let lookup_batch = RecordBatch::try_new(
+            lookup_schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 3])),
+                Arc::new(StringArray::from(vec!["US", "UK", "JP"])),
+            ],
+        )
+        .unwrap();
+        let lookup = LookupTable {
+            name: "users".into(),
+            schema: lookup_schema,
+            batches: vec![lookup_batch],
+        };
+
+        // Source: 3 user_id rows.
+        let source_schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "user_id",
+            DataType::Int64,
+            false,
+        )]));
+        let source_batch = RecordBatch::try_new(
+            source_schema,
+            vec![Arc::new(Int64Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+
+        // Transform joins source × lookup on user_id = id.
+        let xform = DistributedSqlTransform::open_with_lookups(
+            "SELECT s.user_id, u.country FROM source s JOIN users u ON s.user_id = u.id ORDER BY s.user_id",
+            DistributedConfig::default(),
+            vec![lookup],
+        )
+        .unwrap();
+
+        let result = xform
+            .transform(source_batch, &BatchContext::default())
+            .await
+            .expect("run");
+        assert_eq!(result.len(), 1, "single batch");
+        let countries = result[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("Utf8");
+        assert_eq!(countries.value(0), "US");
+        assert_eq!(countries.value(1), "UK");
+        assert_eq!(countries.value(2), "JP");
     }
 
     /// Schema accessors panic before first transform — same lazy-

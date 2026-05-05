@@ -13,7 +13,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use datafusion::arrow::array::{Int64Array, RecordBatch};
+use datafusion::arrow::array::{Array, Int64Array, RecordBatch};
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::datasource::MemTable;
 use datafusion_distributed::{DefaultSessionBuilder, Worker};
@@ -101,6 +101,82 @@ async fn distributed_sql_transform_runs_against_three_workers() {
         .downcast_ref::<Int64Array>()
         .expect("Int64");
     assert_eq!(arr.value(0), 55, "expected SUM(1..10) = 55");
+
+    workers.abort_all();
+}
+
+/// Σ.B follow-up: lookup tables ship to peer workers via Arrow
+/// Flight as part of the distributed plan. Confirms the
+/// `DistributedSqlTransform::open_with_lookups` path produces
+/// correct results across 2 in-process workers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn distributed_sql_transform_lookups_ship_to_peers() {
+    use datafusion::arrow::array::{Int64Array, StringArray};
+    use datafusion::arrow::datatypes::{DataType, Field};
+    use ematix_flow_core::transform::{BatchTransform, LookupTable};
+
+    let (peers, mut workers) = spawn_workers(2).await;
+
+    // Lookup: 3 (id, country) rows.
+    let lookup_schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("country", DataType::Utf8, false),
+    ]));
+    let lookup_batch = RecordBatch::try_new(
+        lookup_schema.clone(),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 2, 3])),
+            Arc::new(StringArray::from(vec!["US", "UK", "JP"])),
+        ],
+    )
+    .unwrap();
+    let lookup = LookupTable {
+        name: "users".into(),
+        schema: lookup_schema,
+        batches: vec![lookup_batch],
+    };
+
+    let source_schema = Arc::new(Schema::new(vec![Field::new(
+        "user_id",
+        DataType::Int64,
+        false,
+    )]));
+    let source_batch = RecordBatch::try_new(
+        source_schema,
+        vec![Arc::new(Int64Array::from(vec![1, 2, 3]))],
+    )
+    .unwrap();
+
+    let xform = ematix_flow_distributed::DistributedSqlTransform::open_with_lookups(
+        "SELECT s.user_id, u.country FROM source s JOIN users u \
+         ON s.user_id = u.id ORDER BY s.user_id",
+        DistributedConfig { peers },
+        vec![lookup],
+    )
+    .expect("open");
+
+    let result = xform
+        .transform(source_batch, &BatchContext::default())
+        .await
+        .expect("transform");
+    assert!(!result.is_empty(), "non-empty result");
+    let total: usize = result.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total, 3, "3 joined rows");
+    // First batch should carry the JP row at index 2 (sorted by user_id).
+    let countries: Vec<String> = result
+        .iter()
+        .flat_map(|b| {
+            let arr = b
+                .column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("Utf8");
+            (0..arr.len())
+                .map(|i| arr.value(i).to_string())
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    assert_eq!(countries, vec!["US", "UK", "JP"]);
 
     workers.abort_all();
 }

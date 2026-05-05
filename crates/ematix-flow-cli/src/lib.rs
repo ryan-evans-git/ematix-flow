@@ -2510,28 +2510,26 @@ impl PipelineCliConfig {
                         let cfg = ematix_flow_core::backend::DistributedConfig {
                             peers: t.peers.clone(),
                         };
+                        // Σ.B follow-up: lookups now thread through to
+                        // the distributed transform. Each lookup is
+                        // registered on the coordinator's
+                        // `SessionContext`; broadcast-join optimization
+                        // ships the data to peer workers via Arrow
+                        // Flight as part of the distributed plan.
                         let xform =
-                            ematix_flow_distributed::DistributedSqlTransform::open(sql, cfg)
-                                .expect(
-                                    "DistributedSqlTransform: peer URLs already validated at \
+                            ematix_flow_distributed::DistributedSqlTransform::open_with_lookups(
+                                sql,
+                                cfg,
+                                lookups.clone(),
+                            )
+                            .expect(
+                                "DistributedSqlTransform: peer URLs already validated at \
                                  config-load",
-                                );
+                            );
                         Some(Arc::new(xform))
                     }
                     _ => None,
                 };
-            // `inner_distributed` only carries lookup data via the
-            // backend's session; PR 2 commit 5 doesn't yet thread
-            // `lookups` into `DistributedSqlTransform`. Reject the
-            // combination here so users hit a clear error rather
-            // than silent dropping of lookups.
-            if engine_is_distributed && !lookups.is_empty() {
-                panic!(
-                    "[transform] engine = \"distributed\" + transform.lookups is \
-                     not yet supported. Lookups would need cross-pod registration; \
-                     lands as a Σ.B follow-up. Use engine = \"datafusion\" today."
-                );
-            }
             // Windowed / join wrapper, if configured. Otherwise the
             // SQL pre-stage IS the transform.
             let wrapped: Arc<dyn BatchTransform> = if let Some(join_toml) = &t.join {

@@ -110,5 +110,7 @@ cargo test -p ematix-flow-distributed --test cross_pod
   `[transform.window]` + `[transform.join]` at config-load. Rooting
   the windowed/joined wrappers' types in `Arc<dyn BatchTransform>`
   is a Σ.B follow-up.
-- **No lookups.** `engine = "distributed"` + `transform.lookups` is
-  rejected (would need cross-pod table registration).
+- ~~**No lookups.**~~ ✓ Lookups now ship to peer workers via Arrow
+  Flight as part of the distributed plan (broadcast joins).
+  Configure `[transform.lookups.<name>]` blocks alongside
+  `engine = "distributed"`; they Just Work.
