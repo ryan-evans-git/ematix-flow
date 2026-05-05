@@ -134,11 +134,78 @@ async fn backend_from_config_constructs_duckdb_in_memory() {
 async fn backend_from_config_constructs_kinesis_offline() {
     let cfg = BackendConfig::Kinesis(KinesisConfig {
         stream_name: "events".into(),
+        region: None,
+        endpoint: None,
+        static_credentials: None,
+        batch_config: None,
     });
     let backend = backend_from_config(cfg).await.expect("construct");
     match backend.config() {
         BackendConfig::Kinesis(c) => assert_eq!(c.stream_name, "events"),
         other => panic!("expected Kinesis, got {other:?}"),
+    }
+}
+
+/// Σ.B follow-up: full builder-state round-trip for Kinesis.
+/// region / endpoint / static_credentials / batch_config all
+/// preserved through serde JSON + reconstruction.
+#[tokio::test]
+async fn backend_from_config_kinesis_round_trips_builder_state() {
+    use ematix_flow_core::backend::KinesisStaticCredentials;
+    use ematix_flow_core::kinesis_backend::KinesisBatchConfig;
+
+    let original = BackendConfig::Kinesis(KinesisConfig {
+        stream_name: "events".into(),
+        region: Some("us-west-2".into()),
+        endpoint: Some("http://localhost:4566".into()),
+        static_credentials: Some(KinesisStaticCredentials {
+            access_key_id: "test-key".into(),
+            secret_access_key: "test-secret".into(),
+        }),
+        batch_config: Some(KinesisBatchConfig {
+            batch_size: 500,
+            batch_bytes: 4 * 1024 * 1024,
+            max_empty_polls: 3,
+            idle_poll_ms: 100,
+        }),
+    });
+
+    // 1) Serde round-trip lossless.
+    let json = serde_json::to_string(&original).unwrap();
+    let recovered: BackendConfig = serde_json::from_str(&json).unwrap();
+    let inner = match recovered {
+        BackendConfig::Kinesis(c) => c,
+        other => panic!("expected Kinesis, got {other:?}"),
+    };
+    assert_eq!(inner.region.as_deref(), Some("us-west-2"));
+    assert_eq!(inner.endpoint.as_deref(), Some("http://localhost:4566"));
+    let creds = inner.static_credentials.as_ref().unwrap();
+    assert_eq!(creds.access_key_id, "test-key");
+    assert_eq!(creds.secret_access_key, "test-secret");
+    let batch = inner.batch_config.as_ref().unwrap();
+    assert_eq!(batch.batch_size, 500);
+    assert_eq!(batch.max_empty_polls, 3);
+
+    // 2) backend_from_config applies all four builder knobs.
+    let backend = backend_from_config(BackendConfig::Kinesis(inner))
+        .await
+        .expect("construct");
+
+    // 3) backend.config() round-trips back to the same surface.
+    match backend.config() {
+        BackendConfig::Kinesis(c) => {
+            assert_eq!(c.stream_name, "events");
+            assert_eq!(c.region.as_deref(), Some("us-west-2"));
+            assert_eq!(c.endpoint.as_deref(), Some("http://localhost:4566"));
+            let creds = c.static_credentials.as_ref().unwrap();
+            assert_eq!(creds.access_key_id, "test-key");
+            // backend.config() always emits a batch_config (no longer
+            // None-when-default); verify the values round-tripped.
+            let bc = c.batch_config.as_ref().unwrap();
+            assert_eq!(bc.batch_size, 500);
+            assert_eq!(bc.idle_poll_ms, 100);
+        }
+        other => panic!("expected Kinesis config, got {other:?}"),
     }
 }
 

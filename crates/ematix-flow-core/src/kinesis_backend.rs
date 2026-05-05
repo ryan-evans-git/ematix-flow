@@ -126,7 +126,7 @@ use crate::types::TableSpec;
 /// The defaults are tuned for AWS Kinesis: `batch_size` is capped
 /// at 10_000 by the `GetRecords` API, but in practice 1000 is
 /// plenty per call and lets the framework fan out batches.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct KinesisBatchConfig {
     /// Max records per call. Clamped to 10_000 (the AWS limit).
     pub batch_size: usize,
@@ -474,18 +474,22 @@ impl Backend for KinesisBackend {
     }
 
     fn config(&self) -> crate::backend::BackendConfig {
-        // Σ.B PR 1 commit d: constructor-args only (region /
-        // endpoint / static_credentials / batch_config land in
-        // Σ.B PR 2). Panic if any builder-set state is non-default.
-        if self.region.is_some() || self.endpoint.is_some() || self.static_credentials.is_some() {
-            panic!(
-                "KinesisBackend::config() called on an instance with non-default builder \
-                 state (region / endpoint / static credentials). Full round-trip ships \
-                 in Σ.B PR 2 — see docs/PHASE_SIGMA_B_TRAIT_SPIKE.md."
-            );
-        }
+        // Σ.B follow-up: full builder-state round-trip. region /
+        // endpoint / static_credentials / batch_config all carry
+        // back to the BackendConfig. The `KinesisBatchConfig` is
+        // wrapped in `Some(...)` only when it differs from the
+        // default — keeps the JSON minimal for the common case.
         crate::backend::BackendConfig::Kinesis(crate::backend::KinesisConfig {
             stream_name: self.stream_name.clone(),
+            region: self.region.clone(),
+            endpoint: self.endpoint.clone(),
+            static_credentials: self.static_credentials.as_ref().map(|c| {
+                crate::backend::KinesisStaticCredentials {
+                    access_key_id: c.access_key_id.clone(),
+                    secret_access_key: c.secret_access_key.clone(),
+                }
+            }),
+            batch_config: Some(self.batch_config.clone()),
         })
     }
 

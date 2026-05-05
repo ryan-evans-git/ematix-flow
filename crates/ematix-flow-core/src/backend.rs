@@ -605,6 +605,40 @@ pub struct KafkaConfig {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct KinesisConfig {
     pub stream_name: String,
+
+    /// Σ.B follow-up: pin the AWS region (overrides credential-
+    /// chain resolution). `None` = use AWS SDK's default
+    /// resolution (env, IMDS, shared config).
+    #[serde(default)]
+    pub region: Option<String>,
+
+    /// Override the regional endpoint. Required for LocalStack
+    /// (`http://localhost:4566`); leave `None` for real AWS.
+    #[serde(default)]
+    pub endpoint: Option<String>,
+
+    /// Static AWS credentials. `None` falls back to the AWS
+    /// credential chain (env, IMDS, shared config). Inline
+    /// credentials per the spike's locked decision; same trust
+    /// boundary as Postgres DSN passwords.
+    #[serde(default)]
+    pub static_credentials: Option<KinesisStaticCredentials>,
+
+    /// Per-call drain limits for `read_arrow_stream`. `None` =
+    /// `KinesisBatchConfig::default()` (1000 records / 16 MiB /
+    /// 1 empty-poll budget / 250ms idle sleep).
+    #[serde(default)]
+    pub batch_config: Option<crate::kinesis_backend::KinesisBatchConfig>,
+}
+
+/// Σ.B follow-up: serializable mirror of the private
+/// `kinesis_backend::StaticAwsCredentials`. Public so it can ride
+/// inside [`KinesisConfig`]; the inner `kinesis_backend` keeps its
+/// own private struct for the live state.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct KinesisStaticCredentials {
+    pub access_key_id: String,
+    pub secret_access_key: String,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -734,9 +768,26 @@ pub async fn backend_from_config(
         BackendConfig::Kafka(c) => Ok(std::sync::Arc::new(
             crate::kafka_backend::KafkaBackend::open(c.bootstrap_servers, c.group_id.as_deref())?,
         )),
-        BackendConfig::Kinesis(c) => Ok(std::sync::Arc::new(
-            crate::kinesis_backend::KinesisBackend::open(c.stream_name)?,
-        )),
+        BackendConfig::Kinesis(c) => {
+            // Σ.B follow-up: apply the optional builder-state knobs
+            // before handing back the backend. Each is a no-op if
+            // the corresponding field is `None`/empty.
+            let mut backend = crate::kinesis_backend::KinesisBackend::open(c.stream_name)?;
+            if let Some(region) = c.region {
+                backend = backend.with_region(region);
+            }
+            if let Some(endpoint) = c.endpoint {
+                backend = backend.with_endpoint(endpoint);
+            }
+            if let Some(creds) = c.static_credentials {
+                backend =
+                    backend.with_static_credentials(creds.access_key_id, creds.secret_access_key);
+            }
+            if let Some(batch) = c.batch_config {
+                backend = backend.with_batch_config(batch);
+            }
+            Ok(std::sync::Arc::new(backend))
+        }
         BackendConfig::PubSub(c) => Ok(std::sync::Arc::new(
             crate::pubsub_backend::PubSubBackend::open(c.project_id)?,
         )),
