@@ -18,6 +18,15 @@
 #
 # Tear down:
 #   docker compose -f examples/distributed-cluster/docker-compose.yml down
+#
+# Σ.C prep: each worker mounts the repo's `examples/tpch/data` at
+# `/data` so a coordinator process running on the host can register
+# Parquet via the same path the workers see. Works for the TPC-H
+# bench harness when it's pointed at this stack via
+# `EMATIX_DISTRIBUTED_PEERS=http://localhost:50051,...` —
+# coordinator must use `TPCH_DATA_DIR=/data/sfN` (or symlink the
+# repo path so `/data/sfN/*.parquet` resolves on both sides).
+# Single-host: this is multi-process distributed, NOT cross-host.
 
 services:
   flow-worker-01:
@@ -27,6 +36,8 @@ services:
     image: ematix-flow-worker:latest
     ports:
       - "50051:50051"
+    volumes:
+      - ../tpch/data:/data:ro
     networks:
       - flow-cluster
 
@@ -36,6 +47,8 @@ services:
       - flow-worker-01
     ports:
       - "50052:50051"
+    volumes:
+      - ../tpch/data:/data:ro
     networks:
       - flow-cluster
 
@@ -45,6 +58,8 @@ services:
       - flow-worker-01
     ports:
       - "50053:50051"
+    volumes:
+      - ../tpch/data:/data:ro
     networks:
       - flow-cluster
 

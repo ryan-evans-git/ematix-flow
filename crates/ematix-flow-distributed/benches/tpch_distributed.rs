@@ -19,16 +19,33 @@
 //!
 //! Environment knobs:
 //!   - `TPCH_DATA_DIR` — Parquet directory (default
-//!     `<workspace>/examples/tpch/data/sf1`)
+//!     `<workspace>/examples/tpch/data/sf1`). The bench's group
+//!     label inherits the SF tag from this path's basename when it
+//!     matches `sf<N>`, falling back to `custom` otherwise.
 //!   - `TPCH_MEASUREMENT_TIME_S` — criterion measurement window per
 //!     query (default 20s)
+//!   - `EMATIX_DISTRIBUTED_PEERS` — comma-separated list of external
+//!     peer URLs to target instead of spawning in-process workers.
+//!     Set this when you want to bench against the docker-compose
+//!     stack at `examples/distributed-cluster/`. The in-process
+//!     `distributed_of_one` baseline still runs alongside; only
+//!     Configuration B (the multi-worker case) switches to the
+//!     external peers. **Honest framing**: docker-compose is
+//!     single-host (loopback network, shared kernel/CPU/memory) —
+//!     the numbers measure multi-process distributed-plan overhead,
+//!     not cross-host scaling.
 //!
 //! Generate data first:
 //!     cargo run --release -p ematix-flow-core --example tpch_generate -- \
 //!         --sf 1 --out examples/tpch/data/sf1
 //!
-//! Then run:
+//! Then run, in-process workers (default):
 //!     cargo bench -p ematix-flow-distributed --bench tpch_distributed
+//!
+//! Or against the docker-compose 3-worker stack:
+//!     docker compose -f examples/distributed-cluster/docker-compose.yml up -d
+//!     EMATIX_DISTRIBUTED_PEERS=http://localhost:50051,http://localhost:50052,http://localhost:50053 \
+//!         cargo bench -p ematix-flow-distributed --bench tpch_distributed
 //!
 //! Plan: `docs/PHASE_SIGMA_PLAN.md` Σ.C.
 
@@ -68,6 +85,40 @@ fn data_dir() -> PathBuf {
         .and_then(|p| p.parent())
         .map(|root| root.join("examples/tpch/data/sf1"))
         .unwrap_or_else(|| PathBuf::from("examples/tpch/data/sf1"))
+}
+
+/// Derive an SF tag (`sf1`, `sf10`, `sf100`, ...) from the data dir
+/// basename so bench group labels reflect what was actually run.
+/// Falls back to `custom` for paths that don't match `sf<N>`.
+fn sf_tag(dir: &Path) -> String {
+    let basename = dir.file_name().and_then(|s| s.to_str()).unwrap_or("custom");
+    if basename.starts_with("sf")
+        && basename.len() > 2
+        && basename[2..].chars().all(|c| c.is_ascii_digit())
+    {
+        basename.to_string()
+    } else {
+        "custom".to_string()
+    }
+}
+
+/// Σ.C PR 2 prep: external peer URLs override the in-process worker
+/// spawn for Configuration B. Comma-separated list, parsed as-is —
+/// validation happens at `DistributedBackend::open`. Returns `None`
+/// when the env var is unset or empty.
+fn external_peers() -> Option<Vec<String>> {
+    let raw = std::env::var("EMATIX_DISTRIBUTED_PEERS").ok()?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(
+        trimmed
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect(),
+    )
 }
 
 async fn register_tpch(ctx: &SessionContext, dir: &Path) {
@@ -149,15 +200,30 @@ fn measurement_time() -> Duration {
 fn bench_distributed(c: &mut Criterion) {
     let rt = Runtime::new().expect("runtime");
     let dir = data_dir();
+    let sf = sf_tag(&dir);
+    let external = external_peers();
     println!("==> TPC-H distributed bench data dir: {}", dir.display());
+    println!("==> SF tag (group label): {sf}");
+    if let Some(peers) = external.as_ref() {
+        println!(
+            "==> Configuration B targets external peers ({}): {:?}\n    \
+             (single-host docker-compose / k8s = multi-process, NOT \
+             cross-host)",
+            peers.len(),
+            peers
+        );
+    } else {
+        println!("==> Configuration B uses 3 in-process workers (loopback)");
+    }
 
     let queries: &[(&str, &str)] = &[("q01", Q1), ("q03", Q3), ("q06", Q6), ("q19", Q19)];
 
     // --- Configuration A: distributed-of-one (peers = []) ---
     {
         let (backend, _) = rt.block_on(build_backend_with_workers(&rt, vec![]));
+        let group_name = format!("tpch_{sf}_distributed_of_one");
         for (name, sql) in queries {
-            let mut group = c.benchmark_group("tpch_sf1_distributed_of_one");
+            let mut group = c.benchmark_group(&group_name);
             group.sample_size(10).measurement_time(measurement_time());
             group.bench_function(*name, |b| {
                 b.iter(|| {
@@ -169,19 +235,29 @@ fn bench_distributed(c: &mut Criterion) {
         }
     }
 
-    // --- Configuration B: 3 in-process workers ---
+    // --- Configuration B: 3 in-process workers OR external peers ---
     {
-        let peers = rt.block_on(async {
-            let (urls, set) = spawn_workers(3).await;
-            // Leak the JoinSet for the duration of the bench — it
-            // owns the worker tasks; dropping it would cancel them.
-            // Bench process exits on completion; OS cleans up.
-            std::mem::forget(set);
-            urls
-        });
+        let (peers, group_name) = match external {
+            Some(peers) => {
+                let n = peers.len();
+                (peers, format!("tpch_{sf}_distributed_external_{n}_peers"))
+            }
+            None => {
+                let urls = rt.block_on(async {
+                    let (urls, set) = spawn_workers(3).await;
+                    // Leak the JoinSet for the duration of the
+                    // bench — it owns the worker tasks; dropping it
+                    // would cancel them. Bench process exits on
+                    // completion; OS cleans up.
+                    std::mem::forget(set);
+                    urls
+                });
+                (urls, format!("tpch_{sf}_distributed_3_workers"))
+            }
+        };
         let (backend, _) = rt.block_on(build_backend_with_workers(&rt, peers));
         for (name, sql) in queries {
-            let mut group = c.benchmark_group("tpch_sf1_distributed_3_workers");
+            let mut group = c.benchmark_group(&group_name);
             group.sample_size(10).measurement_time(measurement_time());
             group.bench_function(*name, |b| {
                 b.iter(|| {
