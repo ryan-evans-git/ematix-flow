@@ -10,6 +10,207 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Nothing pending — see [`docs/ROADMAP.md`](docs/ROADMAP.md) for the
 prioritized list of remaining work.
 
+## [0.2.0] — 2026-05-05
+
+The Σ release. Adds distributed batch SQL via a peer-to-peer
+worker mesh, a SQL dialect translator, and the public benchmark
+artifact comparing ematix-flow against PySpark on TPC-H.
+
+> **Headline:** at SF=1, single-node DataFusion (via ematix-flow)
+> is **5.87× faster than PySpark `local[*]`** geomean across all
+> 22 TPC-H queries (range 1.78× to 16.74×). At SF=10 on the
+> representative set, geomean **3.3× faster**. Same M3 Pro, same
+> Snappy Parquet, same SQL. Single-host only — cross-host
+> distributed-plan numbers stay deferred (no real cluster
+> hardware in this project's runway). Full method + per-query
+> bootstrap CIs in [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md).
+
+### Added
+
+#### Σ.A1 — single-node DataFusion baseline + TPC-H harness
+
+- `tpch_generate` example: pure-Rust SF=1/10/100/1000 Parquet
+  generator via `tpchgen 2.0.2`. Idempotent; data dir is
+  `.gitignore`d.
+- `tpch_extract_queries` example: dumps all 22 TPC-H spec
+  queries to `examples/tpch/queries/qNN.sql` with the
+  canonical TPC-H validation-set parameters substituted in.
+  One-source-of-truth for both the Rust + PySpark bench
+  harnesses.
+- `tpch_22_audit` example: plans + executes all 22 against
+  SF=1, reports per-query rows + timings. Confirms 22/22
+  queries plan + execute on DataFusion 53.1 with no SQL-
+  surface gaps.
+- `cargo bench -p ematix-flow-core --bench tpch`: criterion
+  harness covering all 22 TPC-H queries (was 4 in 0.1.0).
+  Group label derived from data-dir basename (`sf1`, `sf10`,
+  ...) so multi-SF runs don't clobber each other's history.
+- `tpch_q6_tune` example: extended with MemTable isolation +
+  EXPLAIN ANALYZE breakdown. Localises the original 1.82×
+  Polars-on-Q6 gap to parquet decode (not aggregate compute);
+  DataFusion's aggregate is faster than Polars's once decode
+  is amortised.
+- `scripts/bench-tpch-pyspark.py`: PySpark `local[*]` bench
+  driver covering all 22 queries; works on JDK 17 / 21 / 23.
+- `scripts/bench-tpch-polars.py`: Polars head-to-head on the
+  same hardware.
+
+#### Σ.A2 — SQL dialect translator
+
+- `[transform] dialect = "datafusion" | "spark" | "duckdb"`
+  (default `"datafusion"`, zero-cost passthrough). Translates
+  source SQL → DataFusion SQL via `sqlparser`-rs.
+- Spark dialect: function-name remap (~50 entries),
+  `LATERAL VIEW EXPLODE → UNNEST`, `INTERVAL` literal rewrites,
+  window-frame syntax. **103/103 PASS** on the canonical Apache
+  Spark TPC-DS suite (no plan-time failures, no translate
+  failures).
+- DuckDB dialect: function-name remap. Audit shows DuckDB →
+  DataFusion is essentially a no-op for the canonical query
+  surface; translator value-add is on user-explicit DuckDB-isms
+  (currently just `list_value`).
+
+#### Σ.B — distributed batch SQL
+
+The big addition. Peer-to-peer distributed execution across
+ematix-flow processes; no separate scheduler/executor binaries,
+no cluster service to operate.
+
+- `crates/ematix-flow-distributed`: library + `flow-worker`
+  binary (`cargo run --bin flow-worker -- --port 50051`).
+  Built on [`datafusion-distributed 1.0`](https://crates.io/crates/datafusion-distributed)
+  (originally specced against Apache Ballista; pivoted mid-
+  implementation when Ballista's DataFusion ^52 pin collided
+  with the workspace's DataFusion 53 — see
+  [`docs/PHASE_SIGMA_B_TRAIT_SPIKE.md`](docs/PHASE_SIGMA_B_TRAIT_SPIKE.md)
+  PR 2 pivot block).
+- `[transform] engine = "datafusion" | "distributed"` +
+  `peers = ["http://flow-01:50051", ...]`. Default is
+  `"datafusion"` (in-process, unchanged from 0.1.0).
+- `BackendConfig` tagged-enum + `Backend::config()` trait
+  method + `backend_from_config(cfg)` reverse constructor.
+  All 10 in-tree backends migrated. **Connector trait
+  refactor** absorbs Σ.A2 + Σ.B + Σ.D-prep needs in one
+  pre-1.0 breaking change (allowed under SemVer ≥0.x).
+- Cross-pod `transform.lookups`: lookup tables registered on
+  the coordinator are auto-broadcast to peer workers via
+  Arrow Flight. Configure
+  `[transform.lookups.<name>]` blocks alongside
+  `engine = "distributed"` — they Just Work.
+- TLS / mTLS for the worker mesh: `flow-worker` accepts
+  `--tls-cert PATH --tls-key PATH [--tls-client-ca PATH]`;
+  coordinator-side configurable via `[transform.tls]` TOML
+  block (CA bundle + optional client identity for mTLS +
+  optional SNI override) round-tripped through
+  `BackendConfig`.
+- Window+distributed and join+distributed combos rejected at
+  config-load with a clear error pointing at the workaround
+  (typed wrappers still hard-pin to in-process `LazySqlTransform`).
+- Streaming-backend builder-state round-trip (Kafka, Kinesis,
+  PubSub, RabbitMQ): `BackendConfig` carries every builder
+  knob (auth, payload format, delivery semantics, batch
+  config, etc.) so a backend reconstructed from JSON matches
+  the original instance bit-for-bit.
+- `examples/distributed-cluster/` docker-compose stack: 3
+  `flow-worker` peers + Parquet volume mount, with optional
+  `EMATIX_DISTRIBUTED_PEERS` env-var hook on the bench harness
+  for pointing it at the compose stack.
+
+#### Σ.C — TPC-H head-to-head vs PySpark
+
+- `docs/BENCHMARKS.md` Σ.C extension: 22-query SF=1 single-
+  node DataFusion-vs-PySpark head-to-head. **5.87× geomean
+  DataFusion speedup** (range 1.78× Q19 to 16.74× Q22).
+  21/22 queries see a ≥3× DataFusion win.
+- Σ.C PR 2 SF=10 multi-process baseline: 3 in-process
+  workers + docker-compose stack target. **3.3× geomean
+  DataFusion-over-PySpark** on the representative set
+  (Q1/Q3/Q6/Q19). Distributed-of-one and 3-worker configs
+  within ±13% of single-node DataFusion (multi-host scaling
+  story stays deferred — single-host loopback gives no
+  hardware isolation).
+- Top-of-`BENCHMARKS.md` paste-into-HN TL;DR header.
+- `infra/cloud-init-worker.sh` + `infra/README.md`: AWS EC2
+  bootstrap recipe for users with cluster access (retained
+  but no longer canonical — this project's published numbers
+  are M3 Pro single-host).
+- `scripts/tpch-bench-multi.sh` + `scripts/tpch-bench-multi-summarize.py`:
+  multi-engine driver feeding criterion + PySpark output to
+  a markdown comparison table.
+
+#### Σ.D — distributed streaming spike
+
+- [`docs/PHASE_SIGMA_D_SPIKE.md`](docs/PHASE_SIGMA_D_SPIKE.md):
+  research-level evaluation of four candidate paths (Arroyo,
+  RisingWave, Denormalized, DIY on Arrow Flight + the
+  existing `state_store/`). Recommendation: **defer Σ.D
+  until demand**. Watching brief on Denormalized (right
+  architectural shape, pre-1.0 / 0 releases). Trigger
+  conditions documented for picking Σ.D back up.
+
+### Changed
+
+- `Backend` trait: gains `'static` bound + `fn config(&self) -> BackendConfig`
+  method. **API-breaking for out-of-tree backend implementations**
+  (pre-1.0 SemVer; allowed). All 10 in-tree backends migrated.
+- `as_postgres()` doc-hidden + contract-pinned (PostgresBackend's
+  cross-DB COPY BINARY fast path retained as an internal
+  escape hatch; full removal stays a deferred follow-up).
+- Workspace DataFusion bump: 53.0 → 53.1 (no API change; perf
+  + bugfix release).
+
+### Tests
+
+- 22-query TPC-H audit: 22/22 PASS at SF=1.
+- 103-query TPC-DS Spark-dialect audit: 103/103 PASS plan-
+  time.
+- `crates/ematix-flow-distributed/tests/cross_pod.rs`: in-
+  process N-worker integration tests covering distributed
+  SQL transform + cross-pod lookup broadcast.
+- `crates/ematix-flow-distributed/tests/cross_pod_tls.rs`:
+  end-to-end TLS test using `rcgen` to mint a self-signed
+  CA + leaf cert per run; covers both server-auth and mTLS
+  paths.
+- Backend config scaffold: 27 round-trip tests across all
+  10 backends + the distributed config + TLS config.
+- 124 unit tests in `crates/ematix-flow-cli`, including
+  4 tests pinning the Σ.B follow-up's window+distributed /
+  join+distributed config-load rejection contract.
+
+### Known limitations
+
+- **Cross-host distributed numbers are deferred.** All
+  benchmarks are single-host (loopback network, shared
+  kernel/CPU/memory/disk). Real cross-host scaling claims
+  need network-separated hardware (homelab k3s, rented
+  bare-metal); the `infra/` recipe still works for AWS
+  users.
+- **Σ.D streaming is deferred** — see the spike doc.
+  Single-node streaming (Phase 39.4 / 39.5 / 39.5b) is
+  unchanged from 0.1.0.
+- **Static peer membership only.** `StaticWorkerResolver`
+  carries a fixed `Vec<Url>`. Dynamic membership (k8s pods
+  via DNS, service-mesh integration) is a follow-up.
+- **`as_postgres()` escape hatch retained.** PG ↔ PG
+  cross-DB COPY BINARY fast path stays internal-by-
+  convention; full removal is a deferred follow-up.
+
+### Migration from 0.1.0
+
+For users of in-tree connectors only:
+
+- No code changes. `[transform] engine` defaults to
+  `"datafusion"` (the 0.1.0 behaviour). Distributed execution
+  is opt-in via `engine = "distributed"` + `peers = [...]`.
+
+For out-of-tree connector implementors:
+
+- The `Backend` trait now requires `'static` and a
+  `fn config(&self) -> BackendConfig` method. Add a config
+  variant to `BackendConfig` for your backend (or fork). See
+  [`docs/PHASE_SIGMA_B_TRAIT_SPIKE.md`](docs/PHASE_SIGMA_B_TRAIT_SPIKE.md)
+  for the full trait shape + rationale.
+
 ## [0.1.0] — 2026-05-04
 
 First public release.
