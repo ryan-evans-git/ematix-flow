@@ -735,12 +735,26 @@ these numbers alone — that requires real cross-host hardware
 
 ---
 
-## Σ.D — distributed streaming (gated on spike)
+## Σ.D — distributed streaming (deferred until demand)
+
+> **Status (2026-05-05): deferred.** The research-level spike
+> [`docs/PHASE_SIGMA_D_SPIKE.md`](PHASE_SIGMA_D_SPIKE.md)
+> evaluated four candidate paths (Arroyo, RisingWave, Denormalized,
+> DIY) and recommended deferring Σ.D until either a concrete
+> workload demands per-key state larger than a single host can
+> hold, or Denormalized cuts a 1.0 release. Findings in brief:
+> Arroyo's embeddability regressed (Cloudflare 2025 acquisition);
+> RisingWave is sidecar-only (Postgres-wire protocol, separate
+> cluster); Denormalized is the right architectural shape but
+> pre-1.0 / 0 releases; DIY on Arrow Flight + state_store is 12-20
+> weeks of bounded-but-real engineering. The decision artifact
+> below is preserved for the engineering decomposition; the strategic
+> "build now" trigger lives in the spike doc.
 
 **PR scope.** Spike is 2 weeks; implementation is 4–20 weeks
 depending on the spike outcome. Total Σ.D: 6–22 weeks.
 
-### Spike (week 1–2) — Arroyo + RisingWave evaluation
+### Spike (week 1–2) — Arroyo + RisingWave evaluation *(closed; see [PHASE_SIGMA_D_SPIKE.md](PHASE_SIGMA_D_SPIKE.md))*
 
 Two-week dedicated investigation, no PRs landing in this window.
 Output is `docs/PHASE_SIGMA_D_SPIKE.md` documenting:
