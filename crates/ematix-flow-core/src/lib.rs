@@ -5,6 +5,11 @@
 pub mod backend;
 pub mod ddl;
 pub mod delta_backend;
+// Σ.A2 PR 1: SQL dialect translator. Namespaced (`ematix_flow_core::
+// dialect::Dialect`) so it doesn't collide with `backend::Dialect`,
+// which names backend kinds (Postgres / MySQL / Kafka / …) rather
+// than SQL surfaces.
+pub mod dialect;
 pub mod duckdb_backend;
 pub mod hash;
 pub mod join;

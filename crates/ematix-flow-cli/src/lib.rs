@@ -425,6 +425,22 @@ pub struct TransformConfig {
     /// `streaming::TransformErrorPolicy` for full semantics.
     #[serde(default = "default_transform_on_error")]
     pub on_error: String,
+
+    /// Σ.A2 PR 1: source SQL dialect of the `sql` field. Translated
+    /// to DataFusion's native dialect before being handed to the
+    /// transform layer. Accepted values: `"datafusion"` (default,
+    /// pass-through), `"spark"`, `"duckdb"`. See
+    /// `ematix_flow_core::dialect` + `docs/PHASE_SIGMA_PLAN.md` Σ.A2.
+    ///
+    /// Today only `"datafusion"` is fully wired; `"spark"` and
+    /// `"duckdb"` parse here but will panic at pipeline-build time
+    /// with a clear "translator not yet implemented" pointer until
+    /// PRs 2 / 5 of Σ.A2 land. Validation of the string into the
+    /// typed `Dialect` enum happens at config-load via
+    /// `validate_transform_dialect`, so unknown values fail fast
+    /// without reaching the panic site.
+    #[serde(default)]
+    pub dialect: Option<String>,
 }
 
 fn default_transform_on_error() -> String {
@@ -1625,8 +1641,26 @@ impl PipelineCliConfig {
         cfg.validate_state_store_session_pairing()?;
         cfg.validate_join_config()?;
         cfg.validate_transform_on_error()?;
+        cfg.validate_transform_dialect()?;
         cfg.warn_on_stateful_in_memory_store();
         Ok(cfg)
+    }
+
+    /// Σ.A2 PR 1: validate `[transform] dialect` parses into a known
+    /// [`ematix_flow_core::dialect::Dialect`] variant. Doesn't run the
+    /// translator — that happens at pipeline-build time. Failing fast
+    /// here means a typo (`dialect = "trinos"`) errors at config load
+    /// rather than at first batch.
+    fn validate_transform_dialect(&self) -> Result<(), ConfigError> {
+        let Some(t) = &self.transform else {
+            return Ok(());
+        };
+        let Some(s) = t.dialect.as_deref() else {
+            return Ok(());
+        };
+        s.parse::<ematix_flow_core::dialect::Dialect>()
+            .map(|_| ())
+            .map_err(|e| ConfigError::Parse(format!("[transform] {e}")))
     }
 
     /// Phase 39.5a P2.15: validate `[transform] on_error` value.
@@ -2340,9 +2374,23 @@ impl PipelineCliConfig {
             let inner_sql: Option<Arc<LazySqlTransform>> = if t.sql.is_empty() {
                 None
             } else {
+                // Σ.A2 PR 1: translate from the source dialect into
+                // DataFusion's native dialect before handing the SQL
+                // to the transform layer. Default `None`/`"datafusion"`
+                // is pass-through (zero-cost). `validate_transform_
+                // dialect` already rejected unknown strings at config
+                // load; the only failure path here is `Spark` /
+                // `DuckDb`'s NotImplemented stub (PR 2 / 5 land them).
+                let dialect: ematix_flow_core::dialect::Dialect = t
+                    .dialect
+                    .as_deref()
+                    .unwrap_or("datafusion")
+                    .parse()
+                    .expect("dialect string already validated at config-load");
+                let translated = ematix_flow_core::dialect::translate(&t.sql, dialect)
+                    .expect("dialect translation failed (Σ.A2 PR 2/5 fills the gap)");
                 Some(Arc::new(LazySqlTransform::new_with_lookups(
-                    t.sql.clone(),
-                    lookups,
+                    translated, lookups,
                 )))
             };
             // Windowed / join wrapper, if configured. Otherwise the
@@ -3399,6 +3447,135 @@ mod tests {
         "#;
         let cfg = PipelineCliConfig::from_toml_str(toml).unwrap();
         assert_eq!(cfg.transform.as_ref().unwrap().on_error, "fail");
+    }
+
+    // ----- Σ.A2 PR 1: dialect selector -----
+
+    /// `dialect = "spark"` round-trips through TOML parsing today;
+    /// the actual translator is wired up in Σ.A2 PR 2. PR 1 only
+    /// guarantees that the field is recognized + validated.
+    #[test]
+    fn transform_dialect_parses_from_toml() {
+        let toml = r#"
+            pipeline_name = "p"
+            source_query = "events"
+
+            [source]
+            kind = "kafka"
+            bootstrap_servers = "localhost:9092"
+
+            [target]
+            kind = "sqlite"
+            path = ":memory:"
+
+            [target.table]
+            name = "out"
+
+            [transform]
+            sql = "SELECT user_id FROM source"
+            dialect = "spark"
+        "#;
+        let cfg = PipelineCliConfig::from_toml_str(toml).unwrap();
+        assert_eq!(
+            cfg.transform.as_ref().unwrap().dialect.as_deref(),
+            Some("spark")
+        );
+    }
+
+    /// Default — `dialect` field absent — leaves `Option::None` on
+    /// the typed config. The build path treats that the same as
+    /// `"datafusion"` (pass-through translator).
+    #[test]
+    fn transform_dialect_defaults_to_none() {
+        let toml = r#"
+            pipeline_name = "p"
+            source_query = "events"
+
+            [source]
+            kind = "kafka"
+            bootstrap_servers = "localhost:9092"
+
+            [target]
+            kind = "sqlite"
+            path = ":memory:"
+
+            [target.table]
+            name = "out"
+
+            [transform]
+            sql = "SELECT user_id FROM source"
+        "#;
+        let cfg = PipelineCliConfig::from_toml_str(toml).unwrap();
+        assert!(cfg.transform.as_ref().unwrap().dialect.is_none());
+    }
+
+    /// Unknown dialect strings fail at config-load with a message
+    /// listing the valid options. No need to wait until pipeline
+    /// build for a typo to surface.
+    #[test]
+    fn transform_dialect_rejects_unknown_at_config_load() {
+        let toml = r#"
+            pipeline_name = "p"
+            source_query = "events"
+
+            [source]
+            kind = "kafka"
+            bootstrap_servers = "localhost:9092"
+
+            [target]
+            kind = "sqlite"
+            path = ":memory:"
+
+            [target.table]
+            name = "out"
+
+            [transform]
+            sql = "SELECT user_id FROM source"
+            dialect = "trino"
+        "#;
+        let err = PipelineCliConfig::from_toml_str(toml).expect_err("trino unsupported");
+        let msg = format!("{err}");
+        assert!(msg.contains("trino"), "must echo bad input; got: {msg}");
+        // Must list at least one valid option so the operator can fix
+        // it without leaving the error.
+        assert!(
+            msg.contains("datafusion") || msg.contains("spark") || msg.contains("duckdb"),
+            "must list valid dialects; got: {msg}"
+        );
+    }
+
+    /// Pass-through dialect (`"datafusion"`) builds the streaming
+    /// config without surprises. Round-trips the SQL unchanged.
+    #[test]
+    fn transform_dialect_datafusion_passthrough_builds_pipeline() {
+        let toml = r#"
+            pipeline_name = "p"
+            source_query = "events"
+
+            [source]
+            kind = "kafka"
+            bootstrap_servers = "localhost:9092"
+
+            [target]
+            kind = "sqlite"
+            path = ":memory:"
+
+            [target.table]
+            name = "out"
+
+            [transform]
+            sql = "SELECT user_id FROM source"
+            dialect = "datafusion"
+        "#;
+        let cfg = PipelineCliConfig::from_toml_str(toml).unwrap();
+        // Build the streaming config — this exercises the translate()
+        // call in the build path. Pass-through must not panic.
+        let table = TargetTable {
+            schema: "".into(),
+            name: "out".into(),
+        };
+        let scfg = cfg.streaming_config_with_lookups(table, Vec::new());
+        assert!(scfg.transform.is_some());
     }
 
     #[test]
