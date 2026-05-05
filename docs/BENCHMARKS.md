@@ -80,6 +80,51 @@ Why DataFusion wins by this margin on these workloads:
 Row counts match exactly across both engines (Q1: 4, Q3: 10, Q6: 1,
 Q19: 1) — confirms the SQL produces equivalent results on both.
 
+### Σ.A1 PR 4 follow-up: vs Polars (2026-05-05)
+
+Polars is the closest peer to DataFusion in positioning (Rust under
+Python, in-process, vectorized), so a head-to-head matters even
+though both engines are single-node only. Same M3 Pro / SF=1 /
+Parquet / .sql files. Polars 1.40.1 via `polars.SQLContext`. Median
+of 3 trials after 1 discarded warm-up.
+
+| Query | DataFusion (ms) | Polars (ms) | PySpark (ms) | DF/Polars | Polars/PySpark | rows |
+|---|---|---|---|---|---|---|
+| Q1  | 48.7 | **FAIL**  | 192.6 | — | — | — |
+| Q3  | 34.6 |  46.8     | 235.5 | 0.739 (DF 1.35× faster) | 0.199 (Polars 5.0× faster than Spark) | 10 |
+| Q6  | 18.2 | **10.0**  |  64.2 | **1.82 (Polars 1.82× faster)** | 0.156 (Polars 6.4× faster than Spark) | 1 |
+| Q19 | 38.0 | 366.3     | 130.8 | 0.104 (DF 9.6× faster) | 2.800 (Polars 2.8× **slower** than Spark) | 1 |
+
+**Audit findings — surface for Σ.A2 dialect translator:**
+
+- **Q1 fails on Polars**:
+  `SQLSyntaxError: unsupported interval syntax ('INTERVAL '90' DAY')`.
+  TPC-H spec uses `INTERVAL` literals; Polars's SQL parser is younger
+  and doesn't yet accept them. A Polars-targeted dialect translator
+  would rewrite `DATE 'X' - INTERVAL 'N' DAY` → `DATE 'X-N-days'`
+  (concrete literal). Σ.A2 future work.
+- **Q19 collapses on Polars** (9.6× slower than DataFusion, 2.8×
+  slower than PySpark). The 3-clause disjunctive `WHERE (... OR ... OR
+  ...)` over a 2-way join apparently doesn't simplify into something
+  Polars's optimizer can vectorize. Worth a docs.rs investigation
+  but not a Σ.A1 blocker — DataFusion handles this cleanly.
+
+**Where Polars wins**: Q6 (vectorized filter + single sum) beats
+DataFusion 1.82×. Polars's tight scan-+-aggregate loop is well-tuned
+for this workload shape. Same-engine-family Polars-vs-DataFusion is
+close (~10–80 ms swings); DataFusion's win on the suite comes from
+SQL coverage + complex-query robustness, not raw scan speed.
+
+**Net for the Σ.A1 rep set**:
+- DataFusion: clean wins on Q1 (Polars fails), Q3 (1.35×), Q19 (9.6×).
+- DataFusion: loses to Polars on Q6 (1.82× the wrong way).
+- Both crush PySpark by 3–6× single-node, except Polars's Q19
+  collapse where Spark's optimizer gets a rare win.
+
+This makes the case for ematix-flow's positioning: same-class single-
+node performance to Polars on hot loops, broader SQL surface,
+distributed scaling path via Σ.B (Polars has no distributed story).
+
 ### JDK note
 
 PySpark 4.x officially supports JDK 17 / 21. Homebrew's `openjdk`
@@ -110,6 +155,9 @@ python scripts/bench-tpch-pyspark.py
 #    your host's DataFusion numbers if you've re-baselined; the
 #    DF/PySpark ratio in the output table assumes M3-Pro DF numbers
 #    by default.
+
+# 5. Polars sibling: no Java needed.
+python scripts/bench-tpch-polars.py
 ```
 
 If running on Linux x86_64 EC2 m6i.4xlarge for Σ.C, both columns
