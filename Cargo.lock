@@ -3464,6 +3464,7 @@ dependencies = [
  "axum",
  "clap",
  "ematix-flow-core",
+ "ematix-flow-distributed",
  "futures-util",
  "prometheus",
  "rdkafka",

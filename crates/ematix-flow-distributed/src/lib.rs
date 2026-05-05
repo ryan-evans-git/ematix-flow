@@ -330,6 +330,151 @@ pub fn open_arc(cfg: DistributedConfig) -> Result<Arc<dyn Backend>, BackendError
     Ok(Arc::new(DistributedBackend::open(cfg)?))
 }
 
+// ---------------------------------------------------------------
+// Σ.B PR 2 commit 5: DistributedSqlTransform.
+// ---------------------------------------------------------------
+
+use arrow_schema::SchemaRef;
+use datafusion::datasource::MemTable;
+use ematix_flow_core::transform::{BatchContext, BatchTransform};
+
+/// A `BatchTransform` that runs the configured SQL through a
+/// `DistributedBackend`'s `SessionContext`. Per call:
+///
+///   1. Register the input `RecordBatch` as a temp table named
+///      `source` in the backend's session.
+///   2. Run the user's SQL via the session.
+///   3. Drain the result stream into `Vec<RecordBatch>`.
+///   4. Deregister `source` so the next batch can re-register
+///      with potentially different cardinality.
+///
+/// The first call captures the input + output schemas. Subsequent
+/// calls assert input compatibility and return the cached output
+/// schema in `output_schema()`. Same lazy-init pattern as
+/// `LazySqlTransform`.
+///
+/// Every transform owns its own `DistributedBackend` so the
+/// per-call `register_table("source", ...)` doesn't race with
+/// concurrent transforms on a shared session. Avoiding shared-
+/// session contention costs one extra session per transform; the
+/// session is lightweight (no live network connections until the
+/// first execute).
+pub struct DistributedSqlTransform {
+    sql: String,
+    backend: Arc<DistributedBackend>,
+    schemas: tokio::sync::OnceCell<DistributedSqlSchemas>,
+}
+
+struct DistributedSqlSchemas {
+    input: SchemaRef,
+    output: SchemaRef,
+}
+
+impl std::fmt::Debug for DistributedSqlTransform {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DistributedSqlTransform")
+            .field("sql", &self.sql)
+            .field("peer_count", &self.backend.peers().len())
+            .field("initialized", &self.schemas.initialized())
+            .finish()
+    }
+}
+
+impl DistributedSqlTransform {
+    /// Build from SQL + a constructed `DistributedBackend`. Schemas
+    /// are captured on the first `transform()` call.
+    pub fn new(sql: impl Into<String>, backend: Arc<DistributedBackend>) -> Self {
+        Self {
+            sql: sql.into(),
+            backend,
+            schemas: tokio::sync::OnceCell::new(),
+        }
+    }
+
+    /// Convenience: build a fresh backend from `cfg` + wrap it in
+    /// the transform. Validates peer URLs eagerly via the backend's
+    /// `open` constructor.
+    pub fn open(sql: impl Into<String>, cfg: DistributedConfig) -> Result<Self, BackendError> {
+        let backend = Arc::new(DistributedBackend::open(cfg)?);
+        Ok(Self::new(sql, backend))
+    }
+
+    /// Borrow the SQL — for diagnostics + log lines.
+    pub fn sql(&self) -> &str {
+        &self.sql
+    }
+}
+
+#[async_trait]
+impl BatchTransform for DistributedSqlTransform {
+    fn input_schema(&self) -> SchemaRef {
+        self.schemas
+            .get()
+            .expect(
+                "DistributedSqlTransform::input_schema called before first \
+                 transform() — schema is captured on first batch",
+            )
+            .input
+            .clone()
+    }
+
+    fn output_schema(&self) -> SchemaRef {
+        self.schemas
+            .get()
+            .expect(
+                "DistributedSqlTransform::output_schema called before first \
+                 transform() — schema is captured on first batch",
+            )
+            .output
+            .clone()
+    }
+
+    async fn transform(
+        &self,
+        input: datafusion::arrow::array::RecordBatch,
+        _ctx: &BatchContext,
+    ) -> Result<Vec<datafusion::arrow::array::RecordBatch>, BackendError> {
+        let input_schema = input.schema();
+        let ctx = self.backend.session_context().await.clone();
+
+        // Register the batch as a fresh `source` table. Deregister
+        // anything previously bound under that name first so a
+        // schema change on a later batch doesn't conflict.
+        let _ = ctx.deregister_table("source");
+        let mem = MemTable::try_new(input_schema.clone(), vec![vec![input]])
+            .map_err(|e| BackendError::Query(format!("memtable: {e}")))?;
+        ctx.register_table("source", Arc::new(mem))
+            .map_err(|e| BackendError::Query(format!("register source: {e}")))?;
+
+        let df = ctx
+            .sql(&self.sql)
+            .await
+            .map_err(|e| BackendError::Query(format!("plan: {e}")))?;
+        let stream = df
+            .execute_stream()
+            .await
+            .map_err(|e| BackendError::Query(format!("execute: {e}")))?;
+        let batches: Vec<datafusion::arrow::array::RecordBatch> = stream
+            .map_err(|e| BackendError::Query(format!("stream: {e}")))
+            .try_collect()
+            .await?;
+
+        // Cache schemas on first successful call.
+        if !self.schemas.initialized() {
+            let output_schema = batches
+                .first()
+                .map(|b| b.schema())
+                .unwrap_or_else(|| input_schema.clone());
+            let _ = self.schemas.set(DistributedSqlSchemas {
+                input: input_schema,
+                output: output_schema,
+            });
+        }
+
+        Ok(batches)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -450,6 +595,60 @@ mod tests {
             .downcast_ref::<Int64Array>()
             .expect("Int64 sum");
         assert_eq!(arr.value(0), 15);
+    }
+
+    /// Σ.B PR 2 commit 5: DistributedSqlTransform end-to-end.
+    /// Empty-peers degenerate cluster; tests run plain DataFusion
+    /// locally through the trait surface. Real cross-pod execution
+    /// is exercised by the docker-compose integration test in a
+    /// follow-up commit.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn distributed_sql_transform_runs_locally() {
+        use datafusion::arrow::array::Int64Array;
+        use datafusion::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+        use datafusion::arrow::record_batch::RecordBatch;
+        use ematix_flow_core::transform::{BatchContext, BatchTransform};
+        use std::sync::Arc;
+
+        let xform = DistributedSqlTransform::open(
+            "SELECT n * 2 AS doubled FROM source",
+            DistributedConfig::default(),
+        )
+        .unwrap();
+
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "n",
+            DataType::Int64,
+            false,
+        )]));
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1, 2, 3]))]).unwrap();
+
+        let ctx = BatchContext::default();
+        let out = xform.transform(batch, &ctx).await.expect("run");
+        assert_eq!(out.len(), 1);
+        let arr = out[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("Int64");
+        assert_eq!(arr.values(), &[2, 4, 6]);
+
+        // Schemas now cached.
+        assert!(xform.schemas.initialized());
+        assert_eq!(xform.input_schema().fields().len(), 1);
+        assert_eq!(xform.output_schema().fields()[0].name(), "doubled");
+    }
+
+    /// Schema accessors panic before first transform — same lazy-
+    /// init contract as LazySqlTransform.
+    #[test]
+    #[should_panic(expected = "before first transform")]
+    fn distributed_sql_transform_schema_panics_before_first_call() {
+        let xform =
+            DistributedSqlTransform::open("SELECT * FROM source", DistributedConfig::default())
+                .unwrap();
+        let _ = xform.input_schema();
     }
 
     /// Σ.B PR 2 commit 2: full round-trip through the shared

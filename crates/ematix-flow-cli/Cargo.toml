@@ -18,6 +18,9 @@ path = "src/lib.rs"
 
 [dependencies]
 ematix-flow-core.workspace = true
+# Σ.B PR 2 commit 5: CLI builds DistributedSqlTransform when
+# `[transform] engine = "distributed"` is selected.
+ematix-flow-distributed.workspace = true
 clap = { workspace = true }
 toml = { workspace = true }
 tokio = { workspace = true }

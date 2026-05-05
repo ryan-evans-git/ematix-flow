@@ -1726,19 +1726,30 @@ impl PipelineCliConfig {
                 ))
             })?;
         }
-        // Σ.B PR 2 commit 4: actual SQL routing through the
-        // distributed backend lands in commit 5 alongside the
-        // docker-compose example. Until then, log a warning so a
-        // user who picks `engine = "distributed"` knows their config
-        // parsed but isn't doing anything different yet.
+        // Σ.B PR 2 commit 5: distributed engine doesn't yet
+        // wrap windowed / joined transforms (those wrappers are
+        // hard-typed against `LazySqlTransform`). Reject the
+        // combination at config-load with a clear error pointing
+        // at the follow-up.
         if engine_is_distributed {
-            tracing::warn!(
-                peer_count = t.peers.len(),
-                "[transform] engine = \"distributed\" is accepted but the \
-                 pipeline-build path still routes through in-process \
-                 DataFusion. Real distributed execution lands in Σ.B PR 2 \
-                 commit 5 (see docs/PHASE_SIGMA_PLAN.md)."
-            );
+            if t.window.is_some() {
+                return Err(ConfigError::Parse(
+                    "[transform] engine = \"distributed\" is not yet supported with \
+                     [transform.window]. The windowed-aggregator wrapper currently \
+                     hard-types against the in-process LazySqlTransform; lifting \
+                     that constraint is a Σ.B follow-up. Use engine = \"datafusion\" \
+                     for windowed transforms today."
+                        .into(),
+                ));
+            }
+            if t.join.is_some() {
+                return Err(ConfigError::Parse(
+                    "[transform] engine = \"distributed\" is not yet supported with \
+                     [transform.join]. Lift the constraint as a Σ.B follow-up. Use \
+                     engine = \"datafusion\" for joined transforms today."
+                        .into(),
+                ));
+            }
         }
         Ok(())
     }
@@ -2451,28 +2462,76 @@ impl PipelineCliConfig {
             // SQL pre-stage. Empty `sql` means "no pre-stage" — only
             // valid when a window block is configured (windowed
             // transform doesn't require a SQL inner).
-            let inner_sql: Option<Arc<LazySqlTransform>> = if t.sql.is_empty() {
+            let engine_is_distributed = t.engine.as_deref() == Some("distributed");
+            // The translator runs regardless of engine — the SQL
+            // dialect is upstream of where execution happens.
+            let translated_sql: Option<String> = if t.sql.is_empty() {
                 None
             } else {
                 // Σ.A2 PR 1: translate from the source dialect into
                 // DataFusion's native dialect before handing the SQL
-                // to the transform layer. Default `None`/`"datafusion"`
-                // is pass-through (zero-cost). `validate_transform_
-                // dialect` already rejected unknown strings at config
-                // load; the only failure path here is `Spark` /
-                // `DuckDb`'s NotImplemented stub (PR 2 / 5 land them).
+                // to the transform layer.
                 let dialect: ematix_flow_core::dialect::Dialect = t
                     .dialect
                     .as_deref()
                     .unwrap_or("datafusion")
                     .parse()
                     .expect("dialect string already validated at config-load");
-                let translated = ematix_flow_core::dialect::translate(&t.sql, dialect)
-                    .expect("dialect translation failed (Σ.A2 PR 2/5 fills the gap)");
-                Some(Arc::new(LazySqlTransform::new_with_lookups(
-                    translated, lookups,
-                )))
+                Some(
+                    ematix_flow_core::dialect::translate(&t.sql, dialect)
+                        .expect("dialect translation failed (Σ.A2 PR 2/5 fills the gap)"),
+                )
             };
+            // Σ.B PR 2 commit 5: route the SQL pre-stage through
+            // either the in-process `LazySqlTransform` or the
+            // peer-distributed `DistributedSqlTransform` based on
+            // `[transform] engine`. validate_transform_engine
+            // already locked out window/join + distributed combos
+            // and rejected unknown engine strings.
+            let inner_sql: Option<Arc<LazySqlTransform>> =
+                match (translated_sql.as_ref(), engine_is_distributed) {
+                    (None, _) => None,
+                    (Some(_sql), true) => {
+                        // Distributed path lives in a separate branch
+                        // because it produces an `Arc<dyn BatchTransform>`
+                        // rather than `Arc<LazySqlTransform>` (the
+                        // typed-ness `WindowedAggregateTransform` needs).
+                        // None here, populated below.
+                        None
+                    }
+                    (Some(sql), false) => Some(Arc::new(LazySqlTransform::new_with_lookups(
+                        sql.clone(),
+                        lookups.clone(),
+                    ))),
+                };
+            let inner_distributed: Option<Arc<dyn BatchTransform>> =
+                match (translated_sql, engine_is_distributed) {
+                    (Some(sql), true) => {
+                        let cfg = ematix_flow_core::backend::DistributedConfig {
+                            peers: t.peers.clone(),
+                        };
+                        let xform =
+                            ematix_flow_distributed::DistributedSqlTransform::open(sql, cfg)
+                                .expect(
+                                    "DistributedSqlTransform: peer URLs already validated at \
+                                 config-load",
+                                );
+                        Some(Arc::new(xform))
+                    }
+                    _ => None,
+                };
+            // `inner_distributed` only carries lookup data via the
+            // backend's session; PR 2 commit 5 doesn't yet thread
+            // `lookups` into `DistributedSqlTransform`. Reject the
+            // combination here so users hit a clear error rather
+            // than silent dropping of lookups.
+            if engine_is_distributed && !lookups.is_empty() {
+                panic!(
+                    "[transform] engine = \"distributed\" + transform.lookups is \
+                     not yet supported. Lookups would need cross-pod registration; \
+                     lands as a Σ.B follow-up. Use engine = \"datafusion\" today."
+                );
+            }
             // Windowed / join wrapper, if configured. Otherwise the
             // SQL pre-stage IS the transform.
             let wrapped: Arc<dyn BatchTransform> = if let Some(join_toml) = &t.join {
@@ -2485,9 +2544,14 @@ impl PipelineCliConfig {
                 Arc::new(jt)
             } else {
                 match &t.window {
-                    None => match inner_sql {
-                        Some(t) => t,
-                        None => {
+                    None => match (inner_sql, inner_distributed) {
+                        // Σ.B PR 2 commit 5: prefer the distributed
+                        // transform when engine = "distributed";
+                        // validate_transform_engine has already
+                        // rejected the windowed + distributed combo.
+                        (_, Some(d)) => d,
+                        (Some(t), None) => t,
+                        (None, None) => {
                             // Empty SQL + no window + no join: nothing
                             // to do — skip transform attachment.
                             return cfg;
