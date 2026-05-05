@@ -714,7 +714,8 @@ impl Backend for DuckDBBackend {
         if source_backend.is_some() {
             return Err(BackendError::Other(
                 "DuckDB cross-backend run_append goes through the Arrow streaming \
-                 bridge (cross_backend_arrow_sync); same-backend only here"
+                 bridge (route via source.read_arrow_stream + \
+                 target.write_arrow_stream); same-backend only here"
                     .into(),
             ));
         }
@@ -999,7 +1000,8 @@ impl Backend for DuckDBBackend {
         if source_backend.is_some() {
             return Err(BackendError::Other(
                 "DuckDB cross-backend run_scd2 goes through the Arrow bridge \
-                 (cross_backend_arrow_sync); same-backend only here"
+                 (route via source.read_arrow_stream + target.write_arrow_stream); \
+                 same-backend only here"
                     .into(),
             ));
         }

@@ -1246,7 +1246,8 @@ impl Backend for MySQLBackend {
         if source_backend.is_some() {
             return Err(BackendError::Other(
                 "MySQL cross-backend run_append goes through the Arrow streaming \
-                 bridge (cross_backend_arrow_sync); same-backend only here"
+                 bridge (route via source.read_arrow_stream + \
+                 target.write_arrow_stream); same-backend only here"
                     .into(),
             ));
         }

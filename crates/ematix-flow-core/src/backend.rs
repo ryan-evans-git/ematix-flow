@@ -276,11 +276,30 @@ pub trait Backend: Send + Sync + 'static {
     /// is connectable.
     async fn ping(&self) -> Result<(), BackendError>;
 
-    /// Phase 30d: optional escape hatch for backends that need to peek
-    /// at a same-dialect peer's underlying Postgres pool (used by the
-    /// existing PG ↔ PG cross-DB COPY BINARY path). Returning `None` is
-    /// fine for backends that don't need this; callers must always
-    /// handle that case.
+    /// **Internal escape hatch — not a stable extension point.**
+    ///
+    /// Returns the underlying Postgres pool when (and only when) the
+    /// implementing backend is `PostgresBackend`. The single caller
+    /// is `PostgresBackend`'s own strategy executors, which use this
+    /// to take the COPY BINARY fast path on PG → PG cross-DB
+    /// transfers (`run_append_cross_db` / `run_truncate_cross_db` /
+    /// `run_merge_cross_db` / `run_scd2_cross_db` in `pg.rs`).
+    ///
+    /// Out-of-tree implementors must not override this — it lives on
+    /// the public trait only because PostgresBackend's executors
+    /// receive their source as `&dyn Backend` and need a way to
+    /// recognise a same-dialect peer. A future refactor (Σ.B
+    /// follow-up `docs/PHASE_SIGMA_PLAN.md`) will move the dispatch
+    /// behind a `BackendConfig`-discriminant check + private
+    /// downcast so this method can leave the trait entirely; until
+    /// then, treat this as `pub(crate)` even though Rust visibility
+    /// can't enforce that on a trait method.
+    ///
+    /// Σ.B follow-up: doc-hidden so the method doesn't appear in
+    /// the rustdoc-rendered public API. The `#[allow(...)]` on the
+    /// PostgresBackend impl override silences the corresponding
+    /// missing-docs lint without re-exposing the method.
+    #[doc(hidden)]
     fn as_postgres(&self) -> Option<&PgPool> {
         None
     }
@@ -1046,6 +1065,10 @@ impl Backend for PostgresBackend {
         })
     }
 
+    // Σ.B follow-up: see the trait-method docs — this is the one
+    // legitimate override. PostgresBackend's strategy executors
+    // pattern-match on this to recognise a same-dialect peer source
+    // and take the COPY BINARY fast path.
     fn as_postgres(&self) -> Option<&PgPool> {
         Some(&self.pool)
     }
@@ -1090,9 +1113,11 @@ impl Backend for PostgresBackend {
             Some(src) => {
                 let src_pool = src.as_postgres().ok_or_else(|| {
                     BackendError::Other(
-                        "Phase 30d: Postgres run_append cross-backend currently \
-                         requires both endpoints to be Postgres; for cross-dialect \
-                         use cross_backend_arrow_sync (Phase 30c)"
+                        "Postgres run_append cross-backend requires both \
+                         endpoints to be Postgres (uses COPY BINARY fast \
+                         path). For cross-dialect transfers, route through \
+                         the source's read_arrow_stream + target's \
+                         write_arrow_stream directly."
                             .into(),
                     )
                 })?;
@@ -1130,8 +1155,11 @@ impl Backend for PostgresBackend {
             Some(src) => {
                 let src_pool = src.as_postgres().ok_or_else(|| {
                     BackendError::Other(
-                        "Phase 30d: Postgres run_truncate cross-backend requires \
-                         both endpoints to be Postgres"
+                        "Postgres run_truncate cross-backend requires both \
+                         endpoints to be Postgres (uses COPY BINARY fast \
+                         path). For cross-dialect transfers, route through \
+                         the source's read_arrow_stream + target's \
+                         write_arrow_stream directly."
                             .into(),
                     )
                 })?;
@@ -1176,8 +1204,11 @@ impl Backend for PostgresBackend {
             Some(src) => {
                 let src_pool = src.as_postgres().ok_or_else(|| {
                     BackendError::Other(
-                        "Phase 30d: Postgres run_merge cross-backend requires \
-                         both endpoints to be Postgres"
+                        "Postgres run_merge cross-backend requires both \
+                         endpoints to be Postgres (uses COPY BINARY fast \
+                         path). For cross-dialect transfers, route through \
+                         the source's read_arrow_stream + target's \
+                         write_arrow_stream directly."
                             .into(),
                     )
                 })?;
@@ -1233,8 +1264,11 @@ impl Backend for PostgresBackend {
             Some(src) => {
                 let src_pool = src.as_postgres().ok_or_else(|| {
                     BackendError::Other(
-                        "Phase 30d: Postgres run_scd2 cross-backend requires \
-                         both endpoints to be Postgres"
+                        "Postgres run_scd2 cross-backend requires both \
+                         endpoints to be Postgres (uses COPY BINARY fast \
+                         path). For cross-dialect transfers, route through \
+                         the source's read_arrow_stream + target's \
+                         write_arrow_stream directly."
                             .into(),
                     )
                 })?;

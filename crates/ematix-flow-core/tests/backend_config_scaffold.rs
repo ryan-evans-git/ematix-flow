@@ -262,6 +262,45 @@ async fn backend_from_config_constructs_duckdb_in_memory() {
     }
 }
 
+/// Σ.B follow-up: lock down the `as_postgres()` escape-hatch
+/// contract. The trait method is `#[doc(hidden)]` and intended for
+/// PostgresBackend's strategy executors only. Every non-PG backend
+/// must inherit the default `None` impl — anything else means a new
+/// override slipped past review and has effectively re-leaked the
+/// abstraction.
+///
+/// Doesn't try to assert the PostgresBackend `Some(...)` half: that
+/// requires a live Postgres pool (covered by integration tests in
+/// `tests/integration_pg.rs`), and the failure mode for the override
+/// going missing is a different test.
+#[tokio::test]
+async fn as_postgres_returns_none_for_every_non_postgres_backend() {
+    // SQLite, DuckDB are the simplest in-memory backends to spin up
+    // without containers. Together they cover both the "C-extension
+    // wrapped" and "pure-rust embedded" branches; anything that
+    // overrides as_postgres in either of them is the regression we
+    // want to catch.
+    let sqlite = backend_from_config(BackendConfig::Sqlite(SqliteConfig {
+        location: ":memory:".into(),
+    }))
+    .await
+    .expect("sqlite");
+    assert!(
+        sqlite.as_postgres().is_none(),
+        "SqliteBackend must inherit the trait-default None impl"
+    );
+
+    let duckdb = backend_from_config(BackendConfig::DuckDb(DuckDbConfig {
+        location: ":memory:".into(),
+    }))
+    .await
+    .expect("duckdb");
+    assert!(
+        duckdb.as_postgres().is_none(),
+        "DuckDbBackend must inherit the trait-default None impl"
+    );
+}
+
 /// Streaming-backend constructors that don't reach a remote service
 /// can be exercised without TestContainers. Kinesis / PubSub /
 /// RabbitMQ all defer the real connection to `ping()` / first IO,
