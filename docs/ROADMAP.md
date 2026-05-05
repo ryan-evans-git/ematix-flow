@@ -83,6 +83,34 @@ this is the consolidated punch list.
 27. **Windows interaction:** revisit the lookup-schema-drift handling once windows compose with refreshing lookups in production. Source: `docs/SQL_TRANSFORMS_PLAN.md`.
 28. **Object-store as a streaming source.** The `ObjectStoreBackend` is batch-only via `read_arrow_stream` today; not exposed through `StreamingPipeline`'s consumer loop nor in CLI's `SourceConfig`. Adding a streaming-source variant would unlock new patterns (incremental Parquet ingest from S3 prefix) and would also be the trigger to land per-file-offset `seek_to` (deferred from P1.7b).
 
+### P5 — Phase Σ: distributed compute (scale SQL like PySpark, footprint like ematix-flow)
+
+Goal: stand alongside PySpark on batch SQL throughput at <20% of PySpark's image size, then extend to distributed streaming. Built on DataFusion (already a workspace dep); no JVM, no shuffle service to install. A→C is a coherent batch-distributed delivery (~7–13 weeks). D is bigger and gated on a build-vs-adopt spike.
+
+29. **Σ.A1 — single-node DataFusion baseline + TPC-H harness.** Audit `crates/ematix-flow-core/src/transform.rs` for SQL-surface gaps PySpark users hit (window functions, complex types, `EXPLAIN`/`EXPLAIN ANALYZE`); close must-haves. Wire TPC-H Parquet loaders into `examples/tpch/`. Add `criterion` benches for Q1/Q3/Q6/Q19 at SF=1, committed to `docs/BENCHMARKS.md`. Acceptance: all four queries beat single-node PySpark on the same hardware. Effort: 1–2 wk. Standalone value (better single-node SQL) regardless of B/C/D.
+
+30. **Σ.A2 — SQL dialect selector + translation layer.** User config: `[transform] dialect = "datafusion" | "spark" | "duckdb"` (defaults to `datafusion`, zero-cost passthrough). Translator built on `sqlparser-rs` (already in DataFusion's tree): parse source dialect → AST rewrite → emit DataFusion SQL. Initial scope: function-name remap (`current_timestamp`/`now`, `from_unixtime`, …), `LATERAL VIEW EXPLODE` → `UNNEST`, window-frame syntax, complex-type literals. Diagnostics on unsupported nodes ("function `transform_keys` not yet translated; rewrite as …"). Acceptance: ≥80% of TPC-DS executes under `dialect = "spark"` with documented gaps for the rest. Postgres/Trino dialects on demand. Effort: 2–3 wk. Validates dialect handling on single-node before B distributes it.
+
+31. **Σ.B — Ballista backend.** New `crates/ematix-flow-ballista` with `flow-scheduler` + `flow-executor` binaries (statically linked Rust, ~30 MB scheduler + ~70 MB executor). New `BallistaBackend` peer to in-process DataFusion; selection via `[transform] engine = "datafusion" | "ballista"` + `ballista_scheduler_url`. **Connector trait refactor lands here** (one breaking change absorbing all Ballista + dialect + state-store needs at once — pre-1.0 budget approved). Connectors must serialize over Arrow Flight: connection-pool / SR-cache state instantiated lazily on the executor side from URL config, not shipped. `examples/ballista-cluster/` docker-compose: scheduler + 3 executors + MinIO. CI integration test on tag pushes only (slow). Acceptance: cluster image ≤150 MB total; SF=10 across 3 executors faster than 1-node DataFusion; killing one executor mid-query → retry + complete. Risks: Ballista is 0.x, pin tightly; streaming SQL out of scope (handled in Σ.D). Effort: 3–6 wk.
+
+32. **Σ.C — TPC-H head-to-head vs PySpark.** Three configurations on identical hardware (`m6i.4xlarge` × 4 nodes recommended): PySpark on 3 executors / ematix-flow-ballista on 3 executors / single-node DataFusion control. Full TPC-H suite (22 queries) at SF=10 + SF=100. Record wall time, peak RSS per node, total network bytes shuffled, total disk read; 5 trials, median + P95. Output: `docs/BENCHMARKS.md` head-to-head table + `scripts/tpch-bench.sh` reproduction script + blog-post-ready summary. Acceptance: median latency Ballista ≤ PySpark across the suite; geomean memory ≤ 50% of Spark's; cluster image ≤ 20% of Spark image. Document any TPC-H queries Ballista doesn't yet run (correlated subqueries, certain CTEs); file upstream. Effort: 1–2 wk.
+
+33. **Σ.D — distributed streaming (build-vs-adopt spike → implementation).** Much bigger than Σ.B — effectively rebuilding Flink in Rust if done from scratch. **Week-1 spike**: evaluate [Arroyo](https://github.com/ArroyoSystems/arroyo) and [RisingWave](https://github.com/risingwavelabs/risingwave) as embeddable backends. Both are Rust + Arrow + DataFusion-aware; Arroyo is closer to a library shape. If Arroyo integrates cleanly: 4–6 wk to wire it as a new streaming backend behind `[streaming] engine = "in-process" | "arroyo"`. If not viable: build directly on Arrow Flight + the existing `state_store/` partitioned tier (12–20 wk). Required pieces either way: distributed state (partitioned + replicated build-out of Phase 39.5), watermark propagation across shuffle boundaries (Flink's "min across input channels"), Chandy-Lamport-style checkpoint barriers for exactly-once recovery, continuous shuffle for streams (key-partitioned re-routing), credit-based backpressure. Streaming pipelines in Σ.B stay partition-parallel — Σ.D is what unlocks distributed shuffle for windowed joins / global aggregations across all keys. Effort: 12–20 wk (mid-range if Arroyo works; high end if DIY).
+
+**Σ-block sizing summary:**
+
+| Sub-phase | Effort | Calendar | Validates |
+|---|---|---|---|
+| Σ.A1 | 1 dev | 1–2 wk | DataFusion single-node ≥ PySpark single-node |
+| Σ.A2 | 1 dev | 2–3 wk | Spark dialect runs on ematix-flow without rewrites |
+| Σ.B | 1 dev | 3–6 wk | Distributed batch SQL works at <150 MB image |
+| Σ.C | 1 dev | 1–2 wk | Public-facing benchmark vs PySpark |
+| Σ.D | 1 dev | 12–20 wk | Distributed streaming SQL (gated on spike) |
+| **A1–C only** | | **~7–13 wk** | Production-ready vs Spark batch |
+| **A1–D** | | **~19–33 wk** | Production-ready vs Spark batch + streaming |
+
+Recommendation: ship Σ.A–C first; Σ.D triggers after the batch claim is benchmarked + announced.
+
 ---
 
 ## What this roadmap intentionally doesn't cover
