@@ -8,8 +8,11 @@ one. What's the unified trait shape that absorbs all three needs in a
 single rework?
 
 **Status.** Concrete proposal + 6 sub-questions; **all 6 locked
-2026-05-05** (see "Locked decisions" section near the bottom). Σ.B
-PR 1 is now fully scoped and unblocked once v0.1.0 publishes.
+2026-05-05**. Σ.B PR 1 shipped (4 commits a/b/c/d, all 10 backends
+migrated). PR 2 pivoted from Ballista to `datafusion-distributed`
+(2026-05-05) — see the "PR 2 distributed-engine pivot" section near
+the bottom for rationale. The trait-shape decisions are unaffected
+by the pivot.
 
 ---
 
@@ -356,6 +359,65 @@ d. Migrate streaming backends (Kafka, Kinesis, Pub/Sub, RabbitMQ).
 
 Plus the round-trip integration test described in "Acceptance test
 for the refactor" above, run against every backend kind.
+
+---
+
+## PR 2 distributed-engine pivot (2026-05-05): `datafusion-distributed` over Ballista
+
+The original spike named **Apache Ballista** as the distributed engine
+behind `BallistaBackend`. By the time PR 2 opened, two facts surfaced
+that flipped the choice to **`datafusion-distributed`** (the
+`datafusion-contrib` library).
+
+**Trigger 1 — DataFusion version pin.** Ballista 52.0.0 (latest at
+PR-2 time) pins `datafusion = "^52"`. The workspace is on
+`datafusion = "53.1"`, driven by Σ.A1 + Σ.A2 + the orc-rust /
+deltalake / parquet 58 ABI track. Adopting Ballista would force a
+workspace-wide downgrade that unwinds all of Σ.A. The spike's own
+"pin tight to DataFusion's transitive version" guideline rules out
+that path.
+
+**Trigger 2 — better architectural fit.** Ballista's shape is
+scheduler-process + executor-process, similar to YARN. The Σ block's
+pitch ("scale SQL like PySpark, *footprint like ematix-flow*") is
+better served by the `datafusion-distributed` model, where any
+process linking the library can act as either a coordinator or a
+worker. No new binaries to ship; no separate cluster service to
+operate. From upstream's README:
+
+> No coordinator-worker architecture. To keep infrastructure simple,
+> any node can act as a coordinator or a worker.
+
+**What this changes:**
+
+| Original (Ballista) | After pivot (`datafusion-distributed`) |
+|---|---|
+| `crates/ematix-flow-ballista` with `flow-scheduler` + `flow-executor` binaries | `crates/ematix-flow-distributed` library only — no new binaries |
+| Cluster image budget ≤150 MB total | Each ematix-flow pod is self-contained; no separate cluster image |
+| `examples/ballista-cluster/` docker-compose with scheduler + 3 executors + MinIO | `examples/distributed-cluster/` showing N peer pods + cross-pod Arrow Flight |
+| `ballista 0.12` workspace dep (per the original spike) | `datafusion-distributed 1.0` workspace dep (DataFusion-53-aligned) |
+| `[transform] engine = "ballista"` config | `[transform] engine = "distributed"` config |
+
+**What this does NOT change:**
+
+- All 6 locked trait-shape decisions stay. They're upstream of the
+  distributed-engine choice (BackendConfig + JSON wire format +
+  closed registry + `partitioning_hint` shape + strategy-methods-
+  over-distributed).
+- Σ.B PR 1 (the connector-trait refactor) is unaffected; it
+  shipped before the engine choice surfaced.
+- Σ.C's TPC-H head-to-head benchmark goal (vs. PySpark) is
+  unaffected; `datafusion-distributed` already has TPC-H SF=1 +
+  SF=10 benchmarks published, so we have a comparison shape.
+- Σ.D's distributed-streaming work is unaffected — `datafusion-
+  distributed` is batch-only, same as Ballista.
+
+**Open question still parked:** if a user surfaces a real need for
+the Ballista-style scheduler service (e.g., for a multi-tenant
+shared cluster), we can add `BallistaBackend` as a peer of
+`DistributedBackend`. Both can coexist — different deployment
+models for different workloads. Not on the roadmap until a user
+asks.
 
 ---
 

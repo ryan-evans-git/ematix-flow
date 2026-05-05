@@ -433,7 +433,27 @@ PR 4.5 fills more gaps before PR 5.
 
 ---
 
-## Σ.B — Optional `BallistaBackend`
+## Σ.B — Optional `DistributedBackend`
+
+> **2026-05-05 update**: Σ.B pivoted from **Ballista** to
+> **`datafusion-distributed`** at PR 2 — the DataFusion-version pin
+> for Ballista 52 (DF ^52) is incompatible with the workspace's DF
+> 53.1, and the library-only model of `datafusion-distributed`
+> better matches the "footprint like ematix-flow" pitch (no
+> separate scheduler/executor binaries to ship). The locked
+> trait-shape decisions in `docs/PHASE_SIGMA_B_TRAIT_SPIKE.md`
+> stay; PR 2 deliverables shrink (no docker-compose with separate
+> scheduler+executors, no scheduler-process to operate). See the
+> spike doc's "PR 2 distributed-engine pivot" section for the
+> rationale + side-by-side comparison.
+>
+> **PR 1 status**: shipped (4 commits a/b/c/d, 2026-05-05). All 10
+> backends migrate to `BackendConfig` + `Backend::config()` +
+> `backend_from_config`. Streaming-backend builder-state round-trip
+> deferred to Σ.B PR 2 follow-up; `as_postgres()` removal still
+> deferred. The PR-numbered subsections below were written
+> pre-pivot — read each "Ballista" reference as
+> "datafusion-distributed" until this section is rewritten.
 
 **PR scope.** Estimated 7 PRs, ~3–6 weeks total. The connector-trait
 refactor is the biggest single chunk; line up all the Σ-block needs
