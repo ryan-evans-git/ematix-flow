@@ -237,6 +237,92 @@ fn spark_empty_string_returns_empty() {
     );
 }
 
+// --- Σ.A2 PR 3 structural rewrites --------------------------------
+
+/// `array(1, 2, 3)` Spark idiom. DataFusion has no `array(...)`
+/// function — uses `make_array(...)` for the same purpose. This is
+/// technically a name remap (added to PR 2's table) but lives in the
+/// PR 3 audit because the failure surfaced via the e2e harness.
+#[test]
+fn spark_array_constructor_becomes_make_array() {
+    let out = spark_to_df("SELECT array(1, 2, 3) AS a");
+    let lo = out.to_lowercase();
+    assert!(
+        lo.contains("make_array("),
+        "array() → make_array(); got: {out}"
+    );
+}
+
+#[test]
+fn spark_array_constructor_inside_complex_expression() {
+    let out = spark_to_df("SELECT id, array(price, tax) AS pair FROM orders");
+    assert!(out.to_lowercase().contains("make_array("));
+}
+
+/// `LATERAL VIEW EXPLODE(items) v AS item` — Spark's array-unnest
+/// pattern. The translator wraps the FROM relation in a derived
+/// subquery that adds `unnest(items) AS item` to the projection.
+/// DataFusion 53 rejects the more idiomatic `CROSS JOIN UNNEST(...)`
+/// form with an `OuterReferenceColumn` physical-plan error; the
+/// wrapped-subquery shape is what actually executes (verified via
+/// `examples/df_unnest_probe.rs`).
+#[test]
+fn spark_lateral_view_explode_becomes_subquery_unnest() {
+    let out = spark_to_df("SELECT id, item FROM orders LATERAL VIEW EXPLODE(items) v AS item");
+    let lo = out.to_lowercase();
+    assert!(
+        lo.contains("unnest(items)"),
+        "must emit unnest(items) in the wrapped subquery; got: {out}"
+    );
+    assert!(
+        !lo.contains("lateral view"),
+        "lateral view must be removed from emitted SQL; got: {out}"
+    );
+    assert!(lo.contains("item"), "column alias preserved; got: {out}");
+}
+
+#[test]
+fn spark_lateral_view_explode_chains_multiple() {
+    // Two stacked LATERAL VIEWs — both must convert. With the wrap-
+    // in-subquery shape each LV nests one level deeper.
+    let out = spark_to_df(
+        "SELECT * FROM t \
+         LATERAL VIEW EXPLODE(a) va AS x \
+         LATERAL VIEW EXPLODE(b) vb AS y",
+    );
+    let lo = out.to_lowercase();
+    assert_eq!(
+        lo.matches("unnest(a)").count(),
+        1,
+        "first lateral view → unnest(a); got: {out}"
+    );
+    assert_eq!(
+        lo.matches("unnest(b)").count(),
+        1,
+        "second lateral view → unnest(b); got: {out}"
+    );
+    assert!(!lo.contains("lateral view"));
+}
+
+#[test]
+fn spark_lateral_view_outer_is_rejected_with_clear_error() {
+    // LATERAL VIEW OUTER preserves rows when the array is empty
+    // (Spark's left-outer-join semantics). DataFusion's UNNEST
+    // doesn't have a built-in equivalent — the user has to write
+    // a CASE+UNION manually. Refuse with a clear error rather than
+    // silently emit incorrect SQL.
+    let result = ematix_flow_core::dialect::translate(
+        "SELECT * FROM t LATERAL VIEW OUTER EXPLODE(a) v AS x",
+        ematix_flow_core::dialect::Dialect::Spark,
+    );
+    let err = result.expect_err("OUTER must error");
+    let msg = format!("{err}");
+    assert!(
+        msg.to_lowercase().contains("outer"),
+        "error must mention OUTER; got: {msg}"
+    );
+}
+
 // --- TPC-H representative queries (the four Σ.A1 ran) --------------
 //
 // These confirm the translator doesn't break TPC-H Spark SQL. We're

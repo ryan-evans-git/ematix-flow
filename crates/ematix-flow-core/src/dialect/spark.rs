@@ -27,8 +27,9 @@
 //! tells the user exactly what to rewrite.
 
 use sqlparser::ast::{
-    Expr, FunctionArg, FunctionArgExpr, FunctionArgumentList, FunctionArguments, Ident, ObjectName,
-    ObjectNamePart, Statement, VisitMut, VisitorMut,
+    Expr, Function, FunctionArg, FunctionArgExpr, FunctionArgumentList, FunctionArguments, Ident,
+    ObjectName, ObjectNamePart, Query, Select, SelectItem, SetExpr, Statement, TableAlias,
+    TableFactor, TableWithJoins, VisitMut, VisitorMut, WildcardAdditionalOptions,
 };
 use sqlparser::dialect::DatabricksDialect;
 use sqlparser::parser::Parser;
@@ -62,10 +63,15 @@ const SPARK_TO_DF: &[(&str, &str)] = &[
     // more idiomatic in DataFusion. Both 0-arg, both return the
     // same `Timestamp`.
     ("current_timestamp", "now"),
+    // Σ.A2 PR 3 audit finding: Spark's `array(1, 2, 3)` constructor
+    // doesn't exist in DataFusion 53 (only `make_array(...)`). Pure
+    // name remap — same N-arg signature, same return shape (List).
+    ("array", "make_array"),
 ];
 
 /// Parse `sql` as Spark/Databricks SQL, walk the AST applying the
-/// `SPARK_TO_DF` remap + the `expr(x)` strip, re-emit as DataFusion-
+/// `SPARK_TO_DF` remap + the `expr(x)` strip + the LATERAL VIEW
+/// EXPLODE → CROSS JOIN UNNEST rewrite, re-emit as DataFusion-
 /// compatible SQL.
 pub(super) fn translate(sql: &str) -> Result<String, DialectError> {
     if sql.trim().is_empty() {
@@ -79,6 +85,18 @@ pub(super) fn translate(sql: &str) -> Result<String, DialectError> {
     let dialect = DatabricksDialect {};
     let mut statements: Vec<Statement> =
         Parser::parse_sql(&dialect, sql).map_err(|e| DialectError::ParseError(e.to_string()))?;
+
+    // Σ.A2 PR 3: rewrite LATERAL VIEW EXPLODE into CROSS JOIN UNNEST
+    // *before* the FunctionRenamer descends. The renamer's only job
+    // is per-Expr substitution; the lateral-view rewrite is a
+    // FROM-clause restructuring better expressed as a separate pass.
+    let mut lateral_rewriter = LateralViewRewriter { error: None };
+    for stmt in &mut statements {
+        let _: std::ops::ControlFlow<()> = stmt.visit(&mut lateral_rewriter);
+    }
+    if let Some(err) = lateral_rewriter.error {
+        return Err(err);
+    }
 
     let mut renamer = FunctionRenamer;
     for stmt in &mut statements {
@@ -182,4 +200,226 @@ fn object_name_eq_ignore_case(name: &ObjectName, target: &str) -> bool {
         name.0.as_slice(),
         [ObjectNamePart::Identifier(id)] if id.value.eq_ignore_ascii_case(target)
     )
+}
+
+/// Σ.A2 PR 3: rewrites `Select.lateral_views` (Spark/Databricks/Hive
+/// `LATERAL VIEW EXPLODE(arr) v AS x`) into a wrapped subquery
+/// `FROM (SELECT *, unnest(arr) AS x FROM <orig>) sub`. DataFusion 53
+/// supports the projection-form `unnest(...)` but rejects
+/// `CROSS JOIN UNNEST(...)` with an `OuterReferenceColumn` physical-
+/// plan error — the wrap-in-subquery shape works around that
+/// limitation. See `examples/df_unnest_probe.rs` for the empirical
+/// finding.
+///
+/// Multiple stacked lateral views chain by re-entering the visitor
+/// on the wrapped query: each LATERAL VIEW wraps the previous result
+/// in another subquery, matching Spark's apply-in-order semantics.
+///
+/// `LATERAL VIEW OUTER` (which preserves rows when the array is
+/// empty) doesn't have a built-in DataFusion equivalent — DataFusion's
+/// UNNEST drops empty-array rows. Rather than emit subtly-wrong SQL,
+/// we capture an error in `self.error` and let the caller bail.
+struct LateralViewRewriter {
+    /// Set when an unsupported LATERAL VIEW shape is encountered.
+    /// Captured here rather than returned via `ControlFlow::Break`
+    /// because the visitor's `Break` type is `()` (matches the
+    /// `FunctionRenamer` for symmetry); checking after the visit
+    /// finishes is just as effective.
+    error: Option<DialectError>,
+}
+
+impl VisitorMut for LateralViewRewriter {
+    type Break = ();
+
+    fn pre_visit_query(&mut self, query: &mut Query) -> std::ops::ControlFlow<Self::Break> {
+        let SetExpr::Select(select) = query.body.as_mut() else {
+            return std::ops::ControlFlow::Continue(());
+        };
+        if select.lateral_views.is_empty() {
+            return std::ops::ControlFlow::Continue(());
+        }
+        // Need a FROM relation to wrap. `FROM (VALUES ...) LATERAL
+        // VIEW ...` is rare but legal in Spark; for the empty-FROM
+        // edge case we'd need a synthetic single-row relation.
+        // Defer until a user surfaces it.
+        if select.from.is_empty() {
+            self.error = Some(DialectError::ParseError(
+                "LATERAL VIEW with no FROM relation is not supported by the \
+                 Spark→DataFusion translator yet"
+                    .into(),
+            ));
+            return std::ops::ControlFlow::Break(());
+        }
+
+        // Take ownership of the lateral views; clear the field on
+        // `select` so re-emission doesn't include the original Spark
+        // syntax. Process each LV in document order — each wraps the
+        // previous result.
+        let lateral_views = std::mem::take(&mut select.lateral_views);
+
+        for lv in lateral_views {
+            if lv.outer {
+                self.error = Some(DialectError::ParseError(
+                    "LATERAL VIEW OUTER has no direct DataFusion equivalent \
+                     (DataFusion's UNNEST drops empty-array rows). \
+                     Rewrite as CASE + UNION manually if outer-join semantics \
+                     are required."
+                        .into(),
+                ));
+                return std::ops::ControlFlow::Break(());
+            }
+
+            let array_expr = match extract_explode_arg(&lv.lateral_view) {
+                Some(e) => e,
+                None => {
+                    self.error = Some(DialectError::ParseError(format!(
+                        "LATERAL VIEW {} is not yet supported \
+                         (only EXPLODE(arr) translates today)",
+                        lv.lateral_view
+                    )));
+                    return std::ops::ControlFlow::Break(());
+                }
+            };
+
+            // Spark allows multiple column aliases (`LATERAL VIEW
+            // POSEXPLODE(arr) v AS pos, val` produces two columns).
+            // Plain EXPLODE has exactly one alias; reject anything
+            // else for now.
+            if lv.lateral_col_alias.len() != 1 {
+                self.error = Some(DialectError::ParseError(format!(
+                    "LATERAL VIEW with {} column aliases is not yet supported \
+                     (EXPLODE has one; POSEXPLODE has two and lands later)",
+                    lv.lateral_col_alias.len()
+                )));
+                return std::ops::ControlFlow::Break(());
+            }
+            let col_alias = lv.lateral_col_alias.into_iter().next().unwrap();
+
+            // Build the inner SELECT that wraps the existing FROM:
+            //     SELECT *, unnest(<array_expr>) AS <col_alias>
+            //     FROM <previous from>
+            //
+            // sqlparser's `Select::default()` would be cleaner if it
+            // existed; building manually keeps the visible fields
+            // explicit + makes the unused-default options auditable.
+            let inner_select = Select {
+                select_token: sqlparser::tokenizer::TokenWithSpan::wrap(
+                    sqlparser::tokenizer::Token::SemiColon,
+                )
+                .into(),
+                distinct: None,
+                top: None,
+                top_before_distinct: false,
+                optimizer_hint: None,
+                projection: vec![
+                    SelectItem::Wildcard(WildcardAdditionalOptions::default()),
+                    SelectItem::ExprWithAlias {
+                        expr: Expr::Function(make_unnest(array_expr)),
+                        alias: col_alias.clone(),
+                    },
+                ],
+                exclude: None,
+                into: None,
+                from: std::mem::take(&mut select.from),
+                lateral_views: Vec::new(),
+                prewhere: None,
+                selection: None,
+                group_by: sqlparser::ast::GroupByExpr::Expressions(vec![], vec![]),
+                cluster_by: Vec::new(),
+                distribute_by: Vec::new(),
+                sort_by: Vec::new(),
+                having: None,
+                named_window: Vec::new(),
+                qualify: None,
+                window_before_qualify: false,
+                value_table_mode: None,
+                connect_by: Vec::new(),
+                flavor: sqlparser::ast::SelectFlavor::Standard,
+                select_modifiers: Some(sqlparser::ast::SelectModifiers::default()),
+            };
+
+            let inner_query = Query {
+                with: None,
+                body: Box::new(SetExpr::Select(Box::new(inner_select))),
+                order_by: None,
+                limit_clause: None,
+                fetch: None,
+                locks: Vec::new(),
+                for_clause: None,
+                settings: None,
+                format_clause: None,
+                pipe_operators: Vec::new(),
+            };
+
+            // The wrapper alias is whatever the lateral view named
+            // (`v` in `LATERAL VIEW EXPLODE(arr) v AS x`). Falling
+            // back to a synthetic name if the lateral view didn't
+            // declare one (rare; sqlparser parses an Ident for it).
+            let wrapper_alias_name = lv
+                .lateral_view_name
+                .0
+                .first()
+                .and_then(|p| match p {
+                    ObjectNamePart::Identifier(id) => Some(id.clone()),
+                    _ => None,
+                })
+                .unwrap_or_else(|| Ident::new("__sigma_lv_wrap"));
+
+            let derived = TableFactor::Derived {
+                lateral: false,
+                subquery: Box::new(inner_query),
+                alias: Some(TableAlias {
+                    explicit: true,
+                    name: wrapper_alias_name,
+                    columns: Vec::new(),
+                }),
+                sample: None,
+            };
+
+            select.from = vec![TableWithJoins {
+                relation: derived,
+                joins: Vec::new(),
+            }];
+        }
+
+        std::ops::ControlFlow::Continue(())
+    }
+}
+
+/// Build `unnest(arr)` as a sqlparser `Function`.
+fn make_unnest(arr: Expr) -> Function {
+    Function {
+        name: ObjectName(vec![ObjectNamePart::Identifier(Ident::new("unnest"))]),
+        uses_odbc_syntax: false,
+        parameters: FunctionArguments::None,
+        args: FunctionArguments::List(FunctionArgumentList {
+            duplicate_treatment: None,
+            args: vec![FunctionArg::Unnamed(FunctionArgExpr::Expr(arr))],
+            clauses: Vec::new(),
+        }),
+        filter: None,
+        null_treatment: None,
+        over: None,
+        within_group: Vec::new(),
+    }
+}
+
+/// If `expr` is `EXPLODE(arr)`, return `arr`. Otherwise `None`.
+fn extract_explode_arg(expr: &Expr) -> Option<Expr> {
+    let Expr::Function(func) = expr else {
+        return None;
+    };
+    if !object_name_eq_ignore_case(&func.name, "explode") {
+        return None;
+    }
+    let FunctionArguments::List(FunctionArgumentList { args, .. }) = &func.args else {
+        return None;
+    };
+    if args.len() != 1 {
+        return None;
+    }
+    match &args[0] {
+        FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Some(e.clone()),
+        _ => None,
+    }
 }

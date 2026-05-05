@@ -111,3 +111,4 @@ path = "examples/tpch_generate.rs"
 [[example]]
 name = "tpch_q6_tune"
 path = "examples/tpch_q6_tune.rs"
+
