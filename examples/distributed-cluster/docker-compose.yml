@@ -37,7 +37,12 @@ services:
     ports:
       - "50051:50051"
     volumes:
-      - ../tpch/data:/data:ro
+      # Mount the host's tpch/data at the same absolute path inside
+      # the container. Avoids the symlink dance — coordinator (host)
+      # and workers (container) reference the same path string. The
+      # default value lets you `docker compose up` without exporting
+      # the env var.
+      - ${TPCH_HOST_DATA_DIR:-../tpch/data}:${TPCH_HOST_DATA_DIR:-/data}:ro
     networks:
       - flow-cluster
 
@@ -48,7 +53,12 @@ services:
     ports:
       - "50052:50051"
     volumes:
-      - ../tpch/data:/data:ro
+      # Mount the host's tpch/data at the same absolute path inside
+      # the container. Avoids the symlink dance — coordinator (host)
+      # and workers (container) reference the same path string. The
+      # default value lets you `docker compose up` without exporting
+      # the env var.
+      - ${TPCH_HOST_DATA_DIR:-../tpch/data}:${TPCH_HOST_DATA_DIR:-/data}:ro
     networks:
       - flow-cluster
 
@@ -59,7 +69,12 @@ services:
     ports:
       - "50053:50051"
     volumes:
-      - ../tpch/data:/data:ro
+      # Mount the host's tpch/data at the same absolute path inside
+      # the container. Avoids the symlink dance — coordinator (host)
+      # and workers (container) reference the same path string. The
+      # default value lets you `docker compose up` without exporting
+      # the env var.
+      - ${TPCH_HOST_DATA_DIR:-../tpch/data}:${TPCH_HOST_DATA_DIR:-/data}:ro
     networks:
       - flow-cluster
 

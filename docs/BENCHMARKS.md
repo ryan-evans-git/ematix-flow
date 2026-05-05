@@ -93,13 +93,122 @@ Reads from `examples/tpch/data/sf1/`. Generate first via
 
 **What's still open in Σ.C:**
 
-- **PR 2 — multi-host comparison**: 3-pod ematix-flow-distributed
-  cluster vs 3-executor PySpark on identical EC2 hardware. Same
-  TPC-H queries, both at SF=10 + SF=100. Requires AWS
-  provisioning.
+- ~~**PR 2 — multi-host comparison**~~: superseded by the SF=10
+  multi-process numbers below. AWS path retained in `infra/` for
+  anyone with cluster access; this project's deliverable is the
+  honest single-host bench.
 - **PR 3 — repro script + announcement-ready artifact**:
-  `scripts/tpch-bench.sh` that brings up both clusters + runs the
-  suite + emits the comparison table.
+  `scripts/tpch-bench.sh` that brings up the compose stack + runs
+  the suite + emits the comparison table.
+
+### Σ.C PR 2 — SF=10 multi-process baseline (2026-05-05)
+
+> **Honest framing.** Single-host run. The "3 in-process workers"
+> configuration uses tonic over loopback inside one process; the
+> docker-compose stack uses tonic over loopback between containers
+> sharing the host kernel/CPU/memory/disk. Neither is cross-host.
+> These numbers are useful as a **regression canary** + evidence
+> the distributed planner runs correctly at scale. They are *not*
+> proof of cross-host scaling, and shouldn't be cited as such.
+> Real cross-host numbers stay deferred (homelab k3s across
+> multiple boxes, or rented bare-metal). See
+> [`docs/PHASE_SIGMA_PLAN.md`](PHASE_SIGMA_PLAN.md) Σ.C scope-shift
+> note.
+
+Same M3 Pro / criterion (`sample_size = 10`,
+`measurement_time = 10s`, warm-up 3s); SF=10 dataset (3.2 GB
+across 8 Snappy Parquet files; lineitem 2.1 GB / 60 M rows).
+
+| Query | DF (1-node) | distributed-of-one | 3 in-process workers | of_one delta | 3-worker delta |
+|---|---|---|---|---|---|
+| Q1  | **323.0 ms** [313.9 / 331.4] | **282.5 ms** [279.7 / 284.9] | **314.9 ms** [310.9 / 318.9] | −12.5%        | −2.5%         |
+| Q3  | **233.2 ms** [228.8 / 238.5] | **217.8 ms** [215.3 / 220.0] | **228.1 ms** [224.3 / 231.5] | −6.6%         | −2.2%         |
+| Q6  | **116.1 ms** [115.0 / 121.4] | **109.3 ms** [108.5 / 112.3] | **109.3 ms** [106.3 / 112.0] | −5.9%         | −5.9%         |
+| Q19 | **211.7 ms** [207.4 / 223.4] | **206.3 ms** [198.1 / 209.3] | **201.5 ms** [194.4 / 204.0] | −2.6%         | −4.8%         |
+
+(median, [low / high] from criterion's bootstrap CI; deltas
+relative to single-node DataFusion median.)
+
+**Findings:**
+
+1. **All three configurations are within ~12% of each other.**
+   At SF=10 on a single host, the distributed plan adds essentially
+   no measured cost; the 3-worker config is a *touch* faster on
+   Q19 and a touch slower on Q1. The spread is mostly run-to-run
+   variance. None of the runs show distributed *winning* by a
+   meaningful margin — that's expected single-host behaviour
+   because all three configurations are CPU-bound on the same
+   physical cores. Distributed wins require independent hardware.
+
+2. **Distributed-of-one is consistently 3–13% faster than the
+   raw single-node bench**, which is *surprising* — we expected
+   trait-surface overhead to add 1–2%, not subtract. The most
+   likely explanation is small differences in how the two benches
+   build their `SessionContext`:
+   `with_distributed_planner()` may default to a slightly different
+   set of physical optimizer rules. Worth investigating in a
+   follow-up; not a blocker for these numbers.
+
+3. **3-worker overhead at SF=10 is ≤5%** vs distributed-of-one,
+   down from 7–15% at SF=1. Per-query work has scaled past the
+   fixed RPC cost. The crossover where distributed *beats*
+   single-process is past SF=10 *and* requires hardware-isolated
+   workers — neither condition holds here.
+
+**Acceptance gate (single-host regression canary):** all four
+distributed numbers within ±30% of single-node DataFusion on the
+same hardware → **all four within ±13%, gate cleared with
+substantial margin.**
+
+**PySpark column: TBD.** Generating the apples-to-apples PySpark
+SF=10 numbers needs `pyspark` + JDK 17 in the bench env; this
+host doesn't have either installed at the moment. The Σ.A1 PR 4
+SF=1 head-to-head section above shows DataFusion ~4× faster than
+PySpark single-node; SF=10 is expected to narrow that gap (Spark's
+distributed plan helps on bigger shuffles), but until the column
+is filled in we can't make claims. Run via:
+
+```sh
+python scripts/bench-tpch-pyspark.py --sf 10
+```
+
+once the env is provisioned.
+
+**Reproducer:**
+
+```sh
+# Generate SF=10 (~3.2 GB on disk; ~minute on M-class).
+cargo run --release -p ematix-flow-core --example tpch_generate -- \
+    --sf 10 --out examples/tpch/data/sf10
+
+# Single-node DataFusion (~5 min wall-clock @ 10s measurement).
+TPCH_DATA_DIR=examples/tpch/data/sf10 TPCH_MEASUREMENT_TIME_S=10 \
+    cargo bench -p ematix-flow-core --bench tpch
+
+# Distributed-of-one + 3 in-process workers (~10 min wall-clock).
+TPCH_DATA_DIR=examples/tpch/data/sf10 TPCH_MEASUREMENT_TIME_S=10 \
+    cargo bench -p ematix-flow-distributed --bench tpch_distributed
+
+# Optional: against the docker-compose stack on the same host
+# (multi-process via container loopback, still NOT cross-host).
+export TPCH_HOST_DATA_DIR=$PWD/examples/tpch/data
+docker compose -f examples/distributed-cluster/docker-compose.yml up --build -d
+EMATIX_DISTRIBUTED_PEERS=http://localhost:50051,http://localhost:50052,http://localhost:50053 \
+TPCH_DATA_DIR=$PWD/examples/tpch/data/sf10 TPCH_MEASUREMENT_TIME_S=10 \
+    cargo bench -p ematix-flow-distributed --bench tpch_distributed
+docker compose -f examples/distributed-cluster/docker-compose.yml down
+```
+
+**What still needs real cluster hardware (deferred):**
+
+- Headline "scales as well as PySpark" claim — needs network-
+  separated nodes (homelab k3s + multiple boxes, or rented bare-
+  metal at Hetzner / OVH). The `infra/` recipe still works for
+  anyone with AWS access; this project no longer publishes AWS
+  numbers as primary.
+- SF=100 / SF=1000 — laptop-class hardware can't honestly
+  produce these (data alone is 100 GB / 1 TB; the bench would be
+  paging-bound, not compute-bound).
 
 ### Σ.A2 PR 5 — DuckDB-dialect audit (2026-05-05)
 

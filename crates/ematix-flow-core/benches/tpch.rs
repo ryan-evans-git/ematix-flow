@@ -119,16 +119,34 @@ fn measurement_time_for(query: &str) -> Duration {
     }
 }
 
+/// Derive an SF tag (`sf1`, `sf10`, `sf100`, ...) from the data dir
+/// basename so bench group labels reflect what was actually run.
+/// Falls back to `custom` for paths that don't match `sf<N>`.
+fn sf_tag(dir: &std::path::Path) -> String {
+    let basename = dir.file_name().and_then(|s| s.to_str()).unwrap_or("custom");
+    if basename.starts_with("sf")
+        && basename.len() > 2
+        && basename[2..].chars().all(|c| c.is_ascii_digit())
+    {
+        basename.to_string()
+    } else {
+        "custom".to_string()
+    }
+}
+
 fn bench_tpch(c: &mut Criterion) {
     let rt = Runtime::new().expect("build tokio runtime");
     let dir = data_dir();
+    let sf = sf_tag(&dir);
     println!("==> TPC-H bench data dir: {}", dir.display());
+    println!("==> SF tag (group label): {sf}");
     let ctx = rt.block_on(build_session(&rt, &dir));
 
     let queries: &[(&str, &str)] = &[("q01", Q1), ("q03", Q3), ("q06", Q6), ("q19", Q19)];
+    let group_name = format!("tpch_{sf}");
 
     for (name, sql) in queries {
-        let mut group = c.benchmark_group("tpch_sf1");
+        let mut group = c.benchmark_group(&group_name);
         group
             .sample_size(10)
             .measurement_time(measurement_time_for(name));
