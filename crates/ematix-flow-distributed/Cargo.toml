@@ -27,7 +27,12 @@ futures-util = { workspace = true }
 # Σ.B PR 3: hosts `Worker::into_worker_server()` from the
 # `flow-worker` binary so peer pods can serve distributed-plan
 # stages.
-tonic = { workspace = true }
+#
+# Σ.B follow-up: `tls-ring` enables Server::tls_config /
+# ClientTlsConfig / Identity / Certificate. We pick the ring
+# crypto provider over aws-lc for the lighter build and the
+# pure-Rust dep tree.
+tonic = { workspace = true, features = ["tls-ring"] }
 
 [[bin]]
 name = "flow-worker"
@@ -41,6 +46,10 @@ tempfile = "3"
 tokio-stream = { version = "0.1", features = ["net"] }
 # Σ.C PR 1: TPC-H bench harness for the distributed path.
 criterion = { workspace = true }
+# Σ.B follow-up: generate self-signed CA + server + client certs
+# in-process for the TLS cross-pod test. Avoids checking PEM
+# fixtures into the repo and keeps the test hermetic.
+rcgen = "0.14"
 
 [[bench]]
 name = "tpch_distributed"

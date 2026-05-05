@@ -119,7 +119,9 @@ async fn build_backend_with_workers(
     peers: Vec<String>,
 ) -> (Arc<DistributedBackend>, Option<JoinSet<()>>) {
     let _enter = rt.enter();
-    let backend = Arc::new(DistributedBackend::open(DistributedConfig { peers }).expect("backend"));
+    let backend = Arc::new(
+        DistributedBackend::open(DistributedConfig { peers, tls: None }).expect("backend"),
+    );
     register_tpch(backend.session_context().await, &data_dir()).await;
     (backend, None)
 }

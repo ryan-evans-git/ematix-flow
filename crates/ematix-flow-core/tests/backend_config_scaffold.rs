@@ -402,16 +402,23 @@ fn distributed_config_round_trips_with_peer_urls() {
             "http://flow-01.cluster.local:50051".into(),
             "http://flow-02.cluster.local:50051".into(),
         ],
+        tls: None,
     });
     let json = serde_json::to_string(&cfg).expect("serialize");
     assert!(json.contains(r#""kind":"distributed""#));
     assert!(json.contains("flow-01.cluster.local"));
+    // `skip_serializing_if` keeps the JSON minimal when TLS is off.
+    assert!(
+        !json.contains(r#""tls""#),
+        "tls=None must serialize cleanly: {json}"
+    );
 
     let recovered: BackendConfig = serde_json::from_str(&json).expect("deserialize");
     match recovered {
         BackendConfig::Distributed(c) => {
             assert_eq!(c.peers.len(), 2);
             assert_eq!(c.peers[0], "http://flow-01.cluster.local:50051");
+            assert!(c.tls.is_none());
         }
         other => panic!("expected Distributed, got {other:?}"),
     }
@@ -426,7 +433,7 @@ fn distributed_config_default_has_empty_peers() {
     let recovered: BackendConfig = serde_json::from_str(&json).unwrap();
     assert!(matches!(
         recovered,
-        BackendConfig::Distributed(DistributedConfig { ref peers }) if peers.is_empty()
+        BackendConfig::Distributed(DistributedConfig { ref peers, .. }) if peers.is_empty()
     ));
 }
 
@@ -438,6 +445,7 @@ fn distributed_config_default_has_empty_peers() {
 async fn backend_from_config_distributed_points_at_distributed_crate() {
     let cfg = BackendConfig::Distributed(DistributedConfig {
         peers: vec!["http://localhost:50051".into()],
+        tls: None,
     });
     match backend_from_config(cfg).await {
         Ok(_) => panic!("Distributed should not construct via core"),
@@ -452,6 +460,47 @@ async fn backend_from_config_distributed_points_at_distributed_crate() {
                 "must name the crate; got: {msg}"
             );
         }
+    }
+}
+
+/// Σ.B follow-up: TLS config (CA bundle + optional mTLS identity +
+/// optional SNI override) round-trips through serde JSON when set.
+/// The carrier is paths-only; the distributed crate loads the PEM
+/// files lazily when building the channel resolver.
+#[test]
+fn distributed_config_round_trips_with_tls() {
+    use ematix_flow_core::backend::{DistributedClientIdentityConfig, DistributedTlsConfig};
+
+    let cfg = BackendConfig::Distributed(DistributedConfig {
+        peers: vec!["https://flow-01.cluster.local:50051".into()],
+        tls: Some(DistributedTlsConfig {
+            ca_cert_pem_path: "/etc/ematix-flow/tls/ca.pem".into(),
+            client_identity: Some(DistributedClientIdentityConfig {
+                cert_pem_path: "/etc/ematix-flow/tls/coordinator.pem".into(),
+                key_pem_path: "/etc/ematix-flow/tls/coordinator.key".into(),
+            }),
+            domain_name_override: Some("flow.cluster.local".into()),
+        }),
+    });
+    let json = serde_json::to_string(&cfg).expect("serialize");
+    assert!(json.contains(r#""tls""#), "tls field must surface: {json}");
+    assert!(json.contains("ca.pem"));
+    assert!(json.contains("coordinator.key"));
+
+    let recovered: BackendConfig = serde_json::from_str(&json).unwrap();
+    match recovered {
+        BackendConfig::Distributed(c) => {
+            let tls = c.tls.expect("tls present");
+            assert_eq!(tls.ca_cert_pem_path, "/etc/ematix-flow/tls/ca.pem");
+            let id = tls.client_identity.expect("client identity");
+            assert_eq!(id.cert_pem_path, "/etc/ematix-flow/tls/coordinator.pem");
+            assert_eq!(id.key_pem_path, "/etc/ematix-flow/tls/coordinator.key");
+            assert_eq!(
+                tls.domain_name_override.as_deref(),
+                Some("flow.cluster.local")
+            );
+        }
+        other => panic!("expected Distributed, got {other:?}"),
     }
 }
 

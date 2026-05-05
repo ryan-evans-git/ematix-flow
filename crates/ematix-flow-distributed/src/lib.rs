@@ -48,7 +48,7 @@ use datafusion::prelude::SessionContext;
 use datafusion_distributed::{DistributedExt, DistributedPhysicalOptimizerRule, WorkerResolver};
 use ematix_flow_core::backend::{
     ArrowBatchStream, Backend, BackendConfig, BackendError, DeleteHandling, Dialect,
-    DistributedConfig, StrategyRunResult, TargetTable, WriteMode,
+    DistributedConfig, DistributedTlsConfig, StrategyRunResult, TargetTable, WriteMode,
 };
 use ematix_flow_core::pg::ConnectionInfo;
 use ematix_flow_core::types::TableSpec;
@@ -88,6 +88,9 @@ pub struct DistributedBackend {
     /// Validated peer URLs. Stored as `Url` so URL re-parsing
     /// errors surface at construction, not at first execute.
     peers: Vec<Url>,
+    /// Σ.B follow-up: client-side TLS config carried verbatim from
+    /// `DistributedConfig`. `None` keeps plain-HTTP behaviour.
+    tls: Option<DistributedTlsConfig>,
     /// Lazily-built DataFusion session. `OnceCell` so the first
     /// access constructs + caches; subsequent calls reuse without
     /// re-running the builder.
@@ -119,6 +122,7 @@ impl DistributedBackend {
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
             peers,
+            tls: cfg.tls,
             ctx: Arc::new(OnceCell::new()),
         })
     }
@@ -147,12 +151,29 @@ impl DistributedBackend {
         let resolver = StaticWorkerResolver {
             urls: self.peers.clone(),
         };
-        let state = SessionStateBuilder::new()
+        let mut builder = SessionStateBuilder::new()
             .with_default_features()
             .with_physical_optimizer_rule(Arc::new(DistributedPhysicalOptimizerRule))
-            .with_distributed_worker_resolver(resolver)
-            .build();
-        Arc::new(SessionContext::from(state))
+            .with_distributed_worker_resolver(resolver);
+        // Σ.B follow-up: install the TLS-aware channel resolver
+        // when a TLS config is present. `TlsChannelResolver::new`
+        // loads the PEM files eagerly so config errors surface here
+        // (at first session build) rather than at first peer dial.
+        // A bad PEM at this point is fatal — the build_context call
+        // path doesn't return Result, so we panic with the loader
+        // error. Operators get the same diagnostic they'd get from
+        // `flow-worker --tls-cert ... --tls-key ...` failing fast.
+        if let Some(tls_cfg) = &self.tls {
+            let resolver = tls::TlsChannelResolver::new(tls_cfg.clone()).unwrap_or_else(|e| {
+                panic!(
+                    "DistributedBackend: failed to load client TLS material from \
+                     DistributedTlsConfig: {e}. Check `ca_cert_pem_path` + \
+                     `client_identity` paths point at readable PEM files."
+                )
+            });
+            builder = builder.with_distributed_channel_resolver(resolver);
+        }
+        Arc::new(SessionContext::from(builder.build()))
     }
 }
 
@@ -204,6 +225,7 @@ impl Backend for DistributedBackend {
     fn config(&self) -> BackendConfig {
         BackendConfig::Distributed(DistributedConfig {
             peers: self.peers.iter().map(|u| u.to_string()).collect(),
+            tls: self.tls.clone(),
         })
     }
 
@@ -535,6 +557,161 @@ impl BatchTransform for DistributedSqlTransform {
     }
 }
 
+// ---------------------------------------------------------------
+// Σ.B follow-up: TLS support for coordinator ↔ worker traffic.
+// ---------------------------------------------------------------
+
+pub mod tls {
+    //! TLS plumbing for the worker mesh. Two surfaces:
+    //!
+    //! - [`load_server_tls_config`]: read PEM files from disk and
+    //!   build a `tonic::transport::ServerTlsConfig` for the
+    //!   `flow-worker` binary's `Server::tls_config(...)` call.
+    //!   When `client_ca_pem_path` is `Some`, the worker requires
+    //!   client certs (mTLS); otherwise it terminates a one-way
+    //!   server-auth TLS handshake.
+    //!
+    //! - [`TlsChannelResolver`]: a `datafusion_distributed::ChannelResolver`
+    //!   that wraps each peer URL in a TLS-enabled tonic `Channel`.
+    //!   Mirrors `DefaultChannelResolver`'s per-URL channel cache so
+    //!   we don't redo the TLS handshake on every gRPC method call.
+    //!
+    //! Both surfaces consume the same `DistributedTlsConfig` shape
+    //! that lives in core, so a coordinator's `BackendConfig` JSON
+    //! and a worker's CLI flags describe the same trust boundary
+    //! from opposite ends.
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
+    use async_trait::async_trait;
+    use datafusion::common::DataFusionError;
+    use datafusion_distributed::{
+        BoxCloneSyncChannel, ChannelResolver, WorkerServiceClient, create_worker_client,
+    };
+    use ematix_flow_core::backend::{BackendError, DistributedTlsConfig};
+    use tonic::transport::{Certificate, Channel, ClientTlsConfig, Identity, ServerTlsConfig};
+    use url::Url;
+
+    /// Read PEM files from disk and assemble a `ServerTlsConfig`
+    /// for `tonic::transport::Server::tls_config(...)`.
+    ///
+    /// `client_ca_pem_path = Some(...)` opts the worker into mTLS:
+    /// inbound clients (the coordinator) must present a cert chain
+    /// signed by the named CA. `None` keeps server-auth-only TLS,
+    /// where the channel is encrypted but anyone who can reach the
+    /// port can connect. Pick mTLS when the workers are reachable
+    /// from outside the trusted network zone.
+    pub fn load_server_tls_config(
+        cert_pem_path: &str,
+        key_pem_path: &str,
+        client_ca_pem_path: Option<&str>,
+    ) -> Result<ServerTlsConfig, BackendError> {
+        let cert = std::fs::read(cert_pem_path)
+            .map_err(|e| BackendError::Other(format!("read tls cert {cert_pem_path:?}: {e}")))?;
+        let key = std::fs::read(key_pem_path)
+            .map_err(|e| BackendError::Other(format!("read tls key {key_pem_path:?}: {e}")))?;
+        let identity = Identity::from_pem(cert, key);
+        let mut cfg = ServerTlsConfig::new().identity(identity);
+        if let Some(ca_path) = client_ca_pem_path {
+            let ca = std::fs::read(ca_path)
+                .map_err(|e| BackendError::Other(format!("read client-ca {ca_path:?}: {e}")))?;
+            cfg = cfg.client_ca_root(Certificate::from_pem(ca));
+        }
+        Ok(cfg)
+    }
+
+    /// `ChannelResolver` that builds TLS-enabled tonic channels and
+    /// caches them per URL. Mirrors `DefaultChannelResolver`'s shape
+    /// (5-min TTI cache; per-URL one-shot connect) but threads a
+    /// `ClientTlsConfig` derived from `DistributedTlsConfig` into
+    /// each `Endpoint::tls_config` call.
+    #[derive(Clone)]
+    pub struct TlsChannelResolver {
+        client_tls: ClientTlsConfig,
+        // tonic `Channel` is cheap to clone (it's an Arc inside).
+        // Cache keyed by URL so we pay the TLS handshake once per
+        // peer regardless of method-call volume.
+        cache: Arc<Mutex<HashMap<Url, Channel>>>,
+    }
+
+    impl TlsChannelResolver {
+        /// Eagerly load the CA + (optional) client identity from
+        /// disk. Failing here means the operator's TLS paths are
+        /// wrong; the error propagates to the caller (`build_context`)
+        /// which turns it into a backend-construction failure.
+        pub fn new(cfg: DistributedTlsConfig) -> Result<Self, BackendError> {
+            let ca_bytes = std::fs::read(&cfg.ca_cert_pem_path).map_err(|e| {
+                BackendError::Other(format!("read ca cert {:?}: {e}", cfg.ca_cert_pem_path))
+            })?;
+            let mut client_tls =
+                ClientTlsConfig::new().ca_certificate(Certificate::from_pem(ca_bytes));
+            if let Some(domain) = cfg.domain_name_override.as_ref() {
+                client_tls = client_tls.domain_name(domain.clone());
+            }
+            if let Some(id) = cfg.client_identity.as_ref() {
+                let cert = std::fs::read(&id.cert_pem_path).map_err(|e| {
+                    BackendError::Other(format!("read client cert {:?}: {e}", id.cert_pem_path))
+                })?;
+                let key = std::fs::read(&id.key_pem_path).map_err(|e| {
+                    BackendError::Other(format!("read client key {:?}: {e}", id.key_pem_path))
+                })?;
+                client_tls = client_tls.identity(Identity::from_pem(cert, key));
+            }
+            // Static-membership clusters have a small fixed peer
+            // count, so a simple HashMap suffices. Dynamic-membership
+            // clusters (k8s pod churn) would warrant a TTI-evicting
+            // cache like upstream's `DefaultChannelResolver`; that's
+            // a follow-up if it becomes a problem in practice.
+            Ok(Self {
+                client_tls,
+                cache: Arc::new(Mutex::new(HashMap::new())),
+            })
+        }
+
+        async fn build_channel(&self, url: &Url) -> Result<Channel, DataFusionError> {
+            let endpoint = Channel::from_shared(url.to_string()).map_err(|e| {
+                DataFusionError::Configuration(format!(
+                    "TlsChannelResolver: invalid peer URL {url}: {e}"
+                ))
+            })?;
+            let endpoint = endpoint.tls_config(self.client_tls.clone()).map_err(|e| {
+                DataFusionError::Configuration(format!(
+                    "TlsChannelResolver: tls_config for {url}: {e}"
+                ))
+            })?;
+            endpoint.connect().await.map_err(|e| {
+                DataFusionError::Execution(format!("TlsChannelResolver: connect to {url}: {e}"))
+            })
+        }
+    }
+
+    #[async_trait]
+    impl ChannelResolver for TlsChannelResolver {
+        async fn get_worker_client_for_url(
+            &self,
+            url: &Url,
+        ) -> Result<WorkerServiceClient<BoxCloneSyncChannel>, DataFusionError> {
+            // Cache lookup is cheap; the slow path is only taken on
+            // the first call per URL.
+            if let Some(channel) = self
+                .cache
+                .lock()
+                .expect("TlsChannelResolver cache mutex poisoned")
+                .get(url)
+                .cloned()
+            {
+                return Ok(create_worker_client(BoxCloneSyncChannel::new(channel)));
+            }
+            let channel = self.build_channel(url).await?;
+            self.cache
+                .lock()
+                .expect("TlsChannelResolver cache mutex poisoned")
+                .insert(url.clone(), channel.clone());
+            Ok(create_worker_client(BoxCloneSyncChannel::new(channel)))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -550,6 +727,7 @@ mod tests {
     fn open_validates_peer_urls_at_construction() {
         let cfg = DistributedConfig {
             peers: vec!["not a url".into()],
+            tls: None,
         };
         let err = DistributedBackend::open(cfg).expect_err("bad URL must fail");
         assert!(format!("{err}").to_lowercase().contains("peer"));
@@ -562,6 +740,7 @@ mod tests {
                 "http://flow-01.cluster.local:50051".into(),
                 "http://flow-02.cluster.local:50051".into(),
             ],
+            tls: None,
         };
         let backend = DistributedBackend::open(cfg).expect("open");
         assert_eq!(backend.peers().len(), 2);
@@ -575,6 +754,7 @@ mod tests {
     fn dsn_concatenates_peers() {
         let backend = DistributedBackend::open(DistributedConfig {
             peers: vec!["http://a:1".into(), "http://b:2".into()],
+            tls: None,
         })
         .unwrap();
         let dsn = backend.dsn().unwrap();
@@ -784,6 +964,7 @@ mod tests {
     fn config_method_round_trips_through_serde() {
         let original = DistributedBackend::open(DistributedConfig {
             peers: vec!["http://a:50051".into(), "http://b:50051".into()],
+            tls: None,
         })
         .unwrap();
 

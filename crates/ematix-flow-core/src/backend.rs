@@ -763,6 +763,56 @@ pub struct DistributedConfig {
     /// Peer worker URLs (e.g. `http://flow-01.cluster.local:50051`).
     /// Empty = single-worker degenerate cluster.
     pub peers: Vec<String>,
+    /// Σ.B follow-up: TLS settings for coordinator → worker
+    /// connections. `None` (default) keeps the historical plain-HTTP
+    /// behaviour. When set, the distributed crate's
+    /// `TlsChannelResolver` is wired into the SessionContext so all
+    /// outbound peer dials are TLS-encrypted. Server-side TLS for
+    /// the worker is configured separately via `flow-worker`'s
+    /// `--tls-cert` / `--tls-key` flags — both ends must agree.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls: Option<DistributedTlsConfig>,
+}
+
+/// Σ.B follow-up: client-side TLS knobs for talking to peer workers.
+///
+/// Carries paths only — no PEM bytes. Loaded lazily when the
+/// distributed crate constructs the channel resolver, so a stale
+/// path surfaces at first peer dial rather than at config-load (the
+/// files might not exist yet during dry-run validation).
+///
+/// Lives in core so the `BackendConfig::Distributed` round-trip is
+/// pure-data; tonic's `ClientTlsConfig` (which would force a tonic
+/// dep on core) is built in the distributed crate from these
+/// fields.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct DistributedTlsConfig {
+    /// PEM file containing the CA bundle that signed the workers'
+    /// server certificates. Required for any TLS configuration —
+    /// without it, peer-cert verification has no anchor.
+    pub ca_cert_pem_path: String,
+    /// Optional client identity for mutual TLS (mTLS). When set,
+    /// the coordinator presents this cert/key pair to workers; the
+    /// workers must have been launched with `--tls-client-ca` for
+    /// the verification to succeed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_identity: Option<DistributedClientIdentityConfig>,
+    /// Optional override for the SNI / hostname used during peer
+    /// cert verification. Defaults to the host portion of each peer
+    /// URL when `None` — the override is only needed when peer URLs
+    /// reference a load balancer or IP that doesn't match the
+    /// certificate's CN/SAN.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain_name_override: Option<String>,
+}
+
+/// Σ.B follow-up: client identity for mutual TLS to peer workers.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct DistributedClientIdentityConfig {
+    /// Path to the coordinator's PEM-encoded client certificate.
+    pub cert_pem_path: String,
+    /// Path to the coordinator's PEM-encoded private key.
+    pub key_pem_path: String,
 }
 
 /// Σ.D-ready partitioning-hint placeholder. Return type for

@@ -65,6 +65,7 @@ async fn distributed_sql_transform_runs_against_three_workers() {
     let backend = Arc::new(
         DistributedBackend::open(DistributedConfig {
             peers: peers.clone(),
+            tls: None,
         })
         .expect("backend"),
     );
@@ -150,7 +151,7 @@ async fn distributed_sql_transform_lookups_ship_to_peers() {
     let xform = ematix_flow_distributed::DistributedSqlTransform::open_with_lookups(
         "SELECT s.user_id, u.country FROM source s JOIN users u \
          ON s.user_id = u.id ORDER BY s.user_id",
-        DistributedConfig { peers },
+        DistributedConfig { peers, tls: None },
         vec![lookup],
     )
     .expect("open");
@@ -191,7 +192,7 @@ async fn distributed_sql_transform_open_against_two_workers() {
 
     let xform = DistributedSqlTransform::open(
         "SELECT SUM(n) AS total FROM source",
-        DistributedConfig { peers },
+        DistributedConfig { peers, tls: None },
     )
     .expect("open");
 

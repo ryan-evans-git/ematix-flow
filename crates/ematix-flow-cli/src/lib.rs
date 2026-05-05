@@ -2509,6 +2509,10 @@ impl PipelineCliConfig {
                     (Some(sql), true) => {
                         let cfg = ematix_flow_core::backend::DistributedConfig {
                             peers: t.peers.clone(),
+                            // TLS via [transform.tls] TOML is a Σ.B
+                            // follow-up — programmatic callers can
+                            // populate `DistributedTlsConfig` today.
+                            tls: None,
                         };
                         // Σ.B follow-up: lookups now thread through to
                         // the distributed transform. Each lookup is
