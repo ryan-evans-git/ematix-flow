@@ -3868,6 +3868,119 @@ mod tests {
         assert!(format!("{err}").contains("engine"));
     }
 
+    /// Σ.B follow-up: the windowed-aggregator wrapper hard-types
+    /// against the in-process `LazySqlTransform`, so combining it
+    /// with `engine = "distributed"` would silently drop the
+    /// distributed plan. Reject at config-load with a message that
+    /// names both knobs and points at the workaround.
+    #[test]
+    fn transform_engine_rejects_distributed_with_window() {
+        let toml = r#"
+            pipeline_name = "p"
+            source_query = "events"
+
+            [source]
+            kind = "kafka"
+            bootstrap_servers = "localhost:9092"
+
+            [target]
+            kind = "sqlite"
+            path = ":memory:"
+
+            [target.table]
+            name = "events_per_min"
+
+            [transform]
+            sql = "SELECT user_id, amount, _event_ts FROM source"
+            engine = "distributed"
+            peers = ["http://flow-01.cluster.local:50051"]
+
+            [transform.window]
+            kind = "tumbling"
+            duration_ms = 60000
+            event_time_column = "_event_ts"
+            group_by = ["user_id"]
+            late_data = "drop"
+            max_groups_per_window = 1000
+
+            [[transform.window.aggregations]]
+            agg = "count"
+            as = "n"
+        "#;
+        let err = PipelineCliConfig::from_toml_str(toml)
+            .expect_err("window + distributed must be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("distributed"),
+            "must name the engine knob; got: {msg}"
+        );
+        assert!(
+            msg.contains("window"),
+            "must name the conflicting block; got: {msg}"
+        );
+        assert!(
+            msg.contains("datafusion"),
+            "must point at the workaround engine; got: {msg}"
+        );
+    }
+
+    /// Σ.B follow-up: same hard-typing constraint for the join
+    /// wrapper. Reject at config-load instead of failing late
+    /// during pipeline construction.
+    #[test]
+    fn transform_engine_rejects_distributed_with_join() {
+        let toml = r#"
+            pipeline_name = "p"
+
+            [[sources]]
+            query = "orders"
+            kind = "kafka"
+            bootstrap_servers = "localhost:9092"
+
+            [[sources]]
+            query = "payments"
+            kind = "kafka"
+            bootstrap_servers = "localhost:9092"
+
+            [target]
+            kind = "sqlite"
+            path = ":memory:"
+
+            [target.table]
+            name = "out"
+
+            [transform]
+            engine = "distributed"
+            peers = ["http://flow-01.cluster.local:50051"]
+
+            [transform.join]
+            kind = "stream_stream_join"
+            left_source = "orders"
+            right_source = "payments"
+            left_keys = ["k"]
+            right_keys = ["k"]
+            time_window_ms = 1000
+
+            [state_store]
+            kind = "in_memory"
+        "#;
+        let err = PipelineCliConfig::from_toml_str(toml)
+            .expect_err("join + distributed must be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("distributed"),
+            "must name the engine knob; got: {msg}"
+        );
+        assert!(
+            msg.contains("join"),
+            "must name the conflicting block; got: {msg}"
+        );
+        assert!(
+            msg.contains("datafusion"),
+            "must point at the workaround engine; got: {msg}"
+        );
+    }
+
     #[test]
     fn parses_dlq_late_data() {
         // Phase 39.5a P1.6: late_data = "dlq" is now supported.
