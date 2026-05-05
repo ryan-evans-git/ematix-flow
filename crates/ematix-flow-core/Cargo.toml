@@ -75,7 +75,19 @@ criterion = { workspace = true }
 # path. Pinned to the same major track as arrow-array so the ABI
 # matches.
 arrow-select = "58"
+# Σ.A1 PR 1: TPC-H generator + reference answers (used by the
+# `tpch_smoke` integration test and the `tpch_generate` example).
+# See workspace.dependencies for full rationale.
+tpchgen = { workspace = true }
 
 [[bench]]
 name = "transform"
 harness = false
+
+# Σ.A1 PR 1: bulk Parquet generator binary for the TPC-H benchmark
+# harness. Idempotent — regenerates only if the target file is
+# missing. SF=1 → ~1 GB compressed; SF=10 → ~10 GB. See
+# `docs/PHASE_SIGMA_PLAN.md` Σ.A1 for the surrounding plan.
+[[example]]
+name = "tpch_generate"
+path = "examples/tpch_generate.rs"

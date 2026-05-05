@@ -180,6 +180,21 @@ hyperloglogplus = "0.4"
 # blobs into the StateStore. Compact (within a few % of bincode),
 # schema-stable (explicit append-only field rules), pure Rust.
 postcard = { version = "1", features = ["alloc"] }
+# Σ.A1 PR 1: TPC-H benchmark data generator. Pure Rust, byte-for-byte
+# compatible with the TPC.org reference `dbgen` (verified per-checkin
+# upstream). Includes Q1–Q22 reference answers at SF=1 for smoke-test
+# correctness gates. Used only by tests, benches, and the generator
+# example binary; not in the runtime path.
+#
+# We deliberately use only the core `tpchgen` crate (no arrow deps),
+# not `tpchgen-arrow`: tpchgen-arrow 2.0.2 pins `arrow ^57.1`, but the
+# workspace is on the arrow 58 ABI track (driven by orc-rust 0.8 +
+# deltalake 0.32 + parquet 58). Mixing arrow majors fails at the
+# `RecordBatch` type boundary. We pay ~10–20s extra at SF=1 to route
+# through `tpchgen::csv` → `arrow_csv::ReaderBuilder` (our pinned
+# arrow-csv 58); fine for the smoke test. Re-evaluate when
+# tpchgen-arrow lands an arrow-58 release.
+tpchgen = "2"
 
 [profile.release]
 lto = "thin"

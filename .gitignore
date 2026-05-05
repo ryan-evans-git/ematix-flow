@@ -31,6 +31,11 @@ wheels/
 # mkdocs build output (deployed by .github/workflows/docs.yml)
 /site/
 
+# Σ.A1: TPC-H benchmark data (regenerated via
+# `cargo run --release -p ematix-flow-core --example tpch_generate`).
+# SF=1 is ~1 GB; SF=10 ~10 GB; SF=100 ~100 GB. Never commit.
+/examples/tpch/data/
+
 # IDE / editor
 .idea/
 .vscode/
