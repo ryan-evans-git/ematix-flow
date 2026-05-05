@@ -82,7 +82,8 @@ def test_pipeline_sync_uses_native_path_when_dialects_match(monkeypatch, pg_url)
     exercise the cross-backend path when DuckDB lands."""
     from typing import Annotated
 
-    from ematix_flow import ematix, pipeline as p, pk
+    from ematix_flow import ematix, pk
+    from ematix_flow import pipeline as p
     from ematix_flow.types import BigInt, Text
 
     conn = _setup_pg(pg_url)
@@ -115,7 +116,8 @@ def test_pipeline_sync_routes_through_arrow_when_dialects_differ(
     Phase 31 (DuckDB) will look from Python's perspective."""
     from typing import Annotated
 
-    from ematix_flow import ematix, pipeline as p, pk
+    from ematix_flow import ematix, pk
+    from ematix_flow import pipeline as p
     from ematix_flow.types import BigInt, Text
 
     conn = _setup_pg(pg_url)

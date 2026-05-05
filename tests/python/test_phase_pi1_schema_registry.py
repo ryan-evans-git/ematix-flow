@@ -18,7 +18,6 @@ Two coupled changes covered here:
 
 from __future__ import annotations
 
-import os
 from collections.abc import Iterator
 
 import pytest

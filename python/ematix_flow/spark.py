@@ -19,13 +19,11 @@ The Postgres JDBC jar is not bundled. Users typically wire it in via
 
 from __future__ import annotations
 
-import io
 import uuid
 from typing import Any
 from urllib.parse import parse_qsl, urlparse
 
 from ematix_flow import _core
-
 
 # --- DSN → JDBC URL --------------------------------------------------------
 

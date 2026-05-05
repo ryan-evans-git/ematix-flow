@@ -29,7 +29,6 @@ import pytest
 
 import ematix_flow.spark as spark_mod
 
-
 # --- DSN → JDBC URL conversion -------------------------------------------
 
 
@@ -199,7 +198,8 @@ def test_write_spark_df_inferred_append_round_trip(pg_url):
 def test_write_spark_df_managed_table_merge(pg_url):
     """ManagedTable path: write_spark_df runs through the strategy executor
     so merge mode works identically to the polars/pandas helper."""
-    from ematix_flow import ematix, pipeline as p, pk
+    from ematix_flow import ematix, pk
+    from ematix_flow import pipeline as p
     from ematix_flow.types import BigInt, Text
 
     conn = _seed_and_setup(pg_url)

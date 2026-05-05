@@ -17,7 +17,6 @@ from ematix_flow.source import Source
 from ematix_flow.table import ManagedTable
 from ematix_flow.types import BigInt, Column, String, Text
 
-
 # --- pure (no DB) ------------------------------------------------------------
 
 

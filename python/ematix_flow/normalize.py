@@ -434,7 +434,7 @@ class _Round:
         return f"round({col}, {self.precision})"
 
 
-def round(precision: int) -> _Round:  # noqa: A001 — intentional shadowing within this namespace
+def round(precision: int) -> _Round:
     return _Round(precision=precision)
 
 

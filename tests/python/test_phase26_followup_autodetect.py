@@ -10,12 +10,13 @@ care about disambiguation.
 catalogue formats.
 """
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Annotated
 
 import pytest
 
-from ematix_flow import _core, ematix, pipeline as p, pk
+from ematix_flow import _core, ematix, pk
+from ematix_flow import pipeline as p
 from ematix_flow.normalize import (
     DEFAULT_DATE_FORMATS,
     DEFAULT_TIMESTAMP_FORMATS,
@@ -23,7 +24,6 @@ from ematix_flow.normalize import (
     parse_timestamp,
 )
 from ematix_flow.types import BigInt, TimestampTZ
-
 
 # --- unit shape ----------------------------------------------------------
 
@@ -53,7 +53,7 @@ def test_parse_timestamp_no_args_compiles_multi_format_case():
 
 def test_parse_timestamp_no_args_with_on_failure_default():
     pt = parse_timestamp(
-        on_failure="default", default=datetime(2026, 1, 1, tzinfo=timezone.utc)
+        on_failure="default", default=datetime(2026, 1, 1, tzinfo=UTC)
     )
     sql = pt.to_sql("ts")
     assert sql.startswith("COALESCE(")

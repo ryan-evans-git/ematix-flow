@@ -40,9 +40,11 @@ def _seed_source(
         f")"
     )
     if rows:
-        values = ", ".join(
-            f"({i}, '{e}', {'NULL' if n is None else f'\'{n}\''})" for i, e, n in rows
-        )
+        def _fmt(i: int, e: str, n: str | None) -> str:
+            n_sql = "NULL" if n is None else f"'{n}'"
+            return f"({i}, '{e}', {n_sql})"
+
+        values = ", ".join(_fmt(i, e, n) for i, e, n in rows)
         conn.execute(f"INSERT INTO {schema}.src_customers VALUES {values}")
 
 

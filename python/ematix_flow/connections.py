@@ -80,7 +80,8 @@ pipeline object) is safe:
 
 ```python
 >>> repr(kafka_prod)
-"KafkaConnection(name='kafka_prod', bootstrap_servers='localhost:9092', sasl_plain_password='<redacted>', ...)"
+"KafkaConnection(name='kafka_prod', bootstrap_servers='localhost:9092',
+sasl_plain_password='<redacted>', ...)"
 ```
 
 The Rust ``Debug`` impls for the same backends already redact (see
@@ -92,30 +93,30 @@ from __future__ import annotations
 import os
 import re
 from dataclasses import dataclass, field, fields
-from typing import Any, Optional, Union
+from typing import Any
 
 __all__ = [
     "Connection",
-    "KafkaConnection",
-    "RabbitMQConnection",
-    "PubSubConnection",
-    "KinesisConnection",
-    "SchemaRegistryConnection",
-    "PostgresConnection",
-    "MySQLConnection",
-    "SQLiteConnection",
-    "DuckDBConnection",
     "DeltaLocalConnection",
     "DeltaS3Connection",
+    "DuckDBConnection",
+    "KafkaConnection",
+    "KinesisConnection",
+    "MySQLConnection",
     "ObjectStoreLocalConnection",
     "ObjectStoreS3Connection",
-    "register_connection",
-    "get_connection",
-    "registered_connections",
+    "PostgresConnection",
+    "PubSubConnection",
+    "RabbitMQConnection",
+    "SQLiteConnection",
+    "SchemaRegistryConnection",
     "clear_registry",
     "connection",
-    "resolve",
+    "get_connection",
     "redact",
+    "register_connection",
+    "registered_connections",
+    "resolve",
 ]
 
 # Same env-var pattern the v0.1 connection registry uses
@@ -140,7 +141,7 @@ _SECRET_FIELDS = frozenset(
 )
 
 
-def resolve(value: Optional[str]) -> Optional[str]:
+def resolve(value: str | None) -> str | None:
     """Replace ``${VAR}`` references with ``os.environ[VAR]``.
 
     Returns ``None`` unchanged. Raises ``KeyError`` (with a clear
@@ -252,8 +253,8 @@ class SchemaRegistryConnection(Connection):
     """
 
     url: str = ""
-    basic_auth_user: Optional[str] = None
-    basic_auth_password: Optional[str] = None
+    basic_auth_user: str | None = None
+    basic_auth_password: str | None = None
 
     def __post_init__(self) -> None:
         self.kind = "schema_registry"
@@ -272,19 +273,19 @@ class KafkaConnection(Connection):
     """
 
     bootstrap_servers: str = ""
-    group_id: Optional[str] = None
-    payload_format: Optional[str] = None  # "json" | "raw_bytes" | "avro" | "protobuf"
-    schema_registry_url: Optional[str] = None
+    group_id: str | None = None
+    payload_format: str | None = None  # "json" | "raw_bytes" | "avro" | "protobuf"
+    schema_registry_url: str | None = None
     # Π.1: typed Schema Registry reference. Accepts a
     # `SchemaRegistryConnection` instance or a registered SR name
     # string. Mutually exclusive with `schema_registry_url=`.
-    schema_registry: Optional[Union[str, "SchemaRegistryConnection"]] = None
-    sasl_plain_username: Optional[str] = None
-    sasl_plain_password: Optional[str] = None
-    sasl_scram_username: Optional[str] = None
-    sasl_scram_password: Optional[str] = None
-    sasl_scram_mechanism: Optional[str] = None  # "sha-256" | "sha-512"
-    msk_iam_region: Optional[str] = None
+    schema_registry: str | SchemaRegistryConnection | None = None
+    sasl_plain_username: str | None = None
+    sasl_plain_password: str | None = None
+    sasl_scram_username: str | None = None
+    sasl_scram_password: str | None = None
+    sasl_scram_mechanism: str | None = None  # "sha-256" | "sha-512"
+    msk_iam_region: str | None = None
 
     def __post_init__(self) -> None:
         self.kind = "kafka"
@@ -303,7 +304,7 @@ class RabbitMQConnection(Connection):
     """RabbitMQ broker handle (AMQP 0.9.1)."""
 
     amqp_url: str = ""
-    consumer_tag: Optional[str] = None
+    consumer_tag: str | None = None
 
     def __post_init__(self) -> None:
         self.kind = "rabbitmq"
@@ -316,7 +317,7 @@ class PubSubConnection(Connection):
     """GCP Pub/Sub project handle."""
 
     project_id: str = ""
-    endpoint: Optional[str] = None  # e.g. http://localhost:8085 for emulator
+    endpoint: str | None = None  # e.g. http://localhost:8085 for emulator
     anonymous_auth: bool = False  # True for emulator; production uses ADC
 
     def __post_init__(self) -> None:
@@ -330,10 +331,10 @@ class KinesisConnection(Connection):
     """AWS Kinesis stream handle."""
 
     stream_name: str = ""
-    region: Optional[str] = None
-    endpoint: Optional[str] = None  # e.g. http://localhost:4566 for LocalStack
-    access_key_id: Optional[str] = None
-    secret_access_key: Optional[str] = None
+    region: str | None = None
+    endpoint: str | None = None  # e.g. http://localhost:4566 for LocalStack
+    access_key_id: str | None = None
+    secret_access_key: str | None = None
 
     def __post_init__(self) -> None:
         self.kind = "kinesis"

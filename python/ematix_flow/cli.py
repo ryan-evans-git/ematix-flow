@@ -18,10 +18,11 @@ import argparse
 import importlib
 import json
 import sys
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
-from ematix_flow import config, pipeline as p
+from ematix_flow import config
+from ematix_flow import pipeline as p
 
 
 def _parse_iso(s: str) -> datetime:
@@ -138,9 +139,9 @@ def _cmd_consume_list(args: argparse.Namespace) -> int:
 
 def _cmd_run_due(args: argparse.Namespace) -> int:
     _import_user_module(args.module)
-    now = _parse_iso(args.now) if args.now else datetime.now(timezone.utc)
+    now = _parse_iso(args.now) if args.now else datetime.now(UTC)
     if now.tzinfo is None:
-        now = now.replace(tzinfo=timezone.utc)
+        now = now.replace(tzinfo=UTC)
     results: list[dict[str, Any]] = []
     failed: list[dict[str, str]] = []
     for sp in p.list_pipelines():
@@ -149,7 +150,7 @@ def _cmd_run_due(args: argparse.Namespace) -> int:
         print(f"firing: {sp.name}", file=sys.stderr)
         try:
             r = sp.fn()
-        except Exception as e:  # noqa: BLE001 — surface and continue
+        except Exception as e:
             print(f"failed: {sp.name}: {e}", file=sys.stderr)
             failed.append({"pipeline": sp.name, "error": str(e)})
             continue

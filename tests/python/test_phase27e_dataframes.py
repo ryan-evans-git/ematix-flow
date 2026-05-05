@@ -86,8 +86,9 @@ def test_read_df_invalid_prefer_raises(pg_url):
 
 
 def test_write_df_polars_with_managed_table_merge(pg_url):
-    import ematix_flow.df  # noqa: F401
     import polars as pl
+
+    import ematix_flow.df  # noqa: F401
 
     conn = _setup_pg(pg_url)
 
@@ -122,8 +123,9 @@ def test_write_df_polars_with_managed_table_merge(pg_url):
 
 
 def test_write_df_pandas_with_managed_table_append(pg_url):
-    import ematix_flow.df  # noqa: F401
     import pandas as pd
+
+    import ematix_flow.df  # noqa: F401
 
     conn = _setup_pg(pg_url)
 
@@ -140,8 +142,9 @@ def test_write_df_pandas_with_managed_table_append(pg_url):
 
 
 def test_write_df_managed_table_truncate_replaces_all(pg_url):
-    import ematix_flow.df  # noqa: F401
     import polars as pl
+
+    import ematix_flow.df  # noqa: F401
 
     conn = _setup_pg(pg_url)
 
@@ -172,8 +175,9 @@ def test_write_df_managed_table_truncate_replaces_all(pg_url):
 
 
 def test_write_df_inferred_creates_table_from_polars(pg_url):
-    import ematix_flow.df  # noqa: F401
     import polars as pl
+
+    import ematix_flow.df  # noqa: F401
 
     conn = _setup_pg(pg_url)
 
@@ -187,8 +191,9 @@ def test_write_df_inferred_creates_table_from_polars(pg_url):
 
 def test_write_df_inferred_no_metadata_columns_added(pg_url):
     """Q8.2 γ: inferred path takes the df as-is — no _loaded_at / _batch_id."""
-    import ematix_flow.df  # noqa: F401
     import pandas as pd
+
+    import ematix_flow.df  # noqa: F401
 
     conn = _setup_pg(pg_url)
     df = pd.DataFrame({"a": [1, 2], "b": ["x", "y"]})

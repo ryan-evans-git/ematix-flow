@@ -1,6 +1,7 @@
 """Type stubs for the Rust extension module `ematix_flow._core`."""
 
-from typing import Any, Iterable, Iterator, TypedDict
+from collections.abc import Iterable, Iterator
+from typing import TypedDict
 
 import pyarrow as pa
 
@@ -17,7 +18,7 @@ class ArrowBatchIter(Iterator[pa.RecordBatch]):
     streaming-backend pyclasses.
     """
 
-    def __iter__(self) -> "ArrowBatchIter": ...
+    def __iter__(self) -> ArrowBatchIter: ...
     def __next__(self) -> pa.RecordBatch: ...
 
 def core_version() -> str: ...
@@ -82,7 +83,7 @@ class KafkaBackend:
         batch_bytes: int | None = None,
         batch_window_ms: int | None = None,
         idle_timeout_ms: int | None = None,
-    ) -> "KafkaBackend":
+    ) -> KafkaBackend:
         """Build a KafkaBackend.
 
         ``payload_format``: ``"json"`` (default), ``"raw_bytes"``,
@@ -152,7 +153,7 @@ class RabbitMQBackend:
         batch_size: int | None = None,
         batch_bytes: int | None = None,
         idle_timeout_ms: int | None = None,
-    ) -> "RabbitMQBackend": ...
+    ) -> RabbitMQBackend: ...
     def ping(self) -> None: ...
     def read_arrow_stream(self, query: str) -> list[pa.RecordBatch]:
         """Drain ``query`` (queue name) into PyArrow RecordBatches.
@@ -202,7 +203,7 @@ class PubSubBackend:
         batch_size: int | None = None,
         batch_bytes: int | None = None,
         idle_timeout_ms: int | None = None,
-    ) -> "PubSubBackend": ...
+    ) -> PubSubBackend: ...
     def ping(self) -> None: ...
     def read_arrow_stream(self, query: str) -> list[pa.RecordBatch]:
         """Drain a subscription into PyArrow RecordBatches.
@@ -258,7 +259,7 @@ class KinesisBackend:
         batch_bytes: int | None = None,
         max_empty_polls: int | None = None,
         idle_poll_ms: int | None = None,
-    ) -> "KinesisBackend": ...
+    ) -> KinesisBackend: ...
     def ping(self) -> None: ...
     def read_arrow_stream(self, query: str) -> list[pa.RecordBatch]:
         """Drain every shard into PyArrow RecordBatches.

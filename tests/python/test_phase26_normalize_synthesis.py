@@ -11,8 +11,8 @@ import pytest
 from ematix_flow import ematix, pk
 from ematix_flow.normalize import (
     apply_normalization,
-    default,
     deduplicate_by,
+    default,
     derive,
     empty_to_null,
     filter_where,
@@ -23,7 +23,6 @@ from ematix_flow.normalize import (
     trim,
 )
 from ematix_flow.types import BigInt, String, Text, TimestampTZ
-
 
 # --- table decorator collects normalizers ---------------------------------
 

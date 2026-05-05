@@ -14,7 +14,7 @@ from collections.abc import Iterator
 
 import pytest
 
-from ematix_flow import KafkaConnection, SQLiteConnection, register_connection
+from ematix_flow import KafkaConnection, SQLiteConnection
 from ematix_flow.connections import clear_registry
 
 

@@ -7,10 +7,9 @@ applies. Tests below pin every marker in the §3.3 catalogue.
 
 from __future__ import annotations
 
-from datetime import date, datetime, timezone
+from datetime import UTC, date, datetime
 
 import pytest
-
 
 # --- string ---------------------------------------------------------------
 
@@ -132,7 +131,7 @@ def test_parse_timestamp_on_failure_default_uses_coalesce():
     sql = parse_timestamp(
         format="YYYY-MM-DD",
         on_failure="default",
-        default=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        default=datetime(2026, 1, 1, tzinfo=UTC),
     ).to_sql("ts")
     assert sql.startswith("COALESCE(")
     assert "2026-01-01T00:00:00+00:00'::timestamptz" in sql
@@ -295,7 +294,7 @@ def test_default_date_with_cast():
 def test_default_datetime_with_cast():
     from ematix_flow.normalize import default
 
-    sql = default(datetime(2026, 1, 1, tzinfo=timezone.utc)).to_sql("ts")
+    sql = default(datetime(2026, 1, 1, tzinfo=UTC)).to_sql("ts")
     assert sql == "COALESCE(ts, '2026-01-01T00:00:00+00:00'::timestamptz)"
 
 

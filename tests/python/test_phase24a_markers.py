@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import pytest
-
 from ematix_flow import natural_key, nullable, pk
 
 

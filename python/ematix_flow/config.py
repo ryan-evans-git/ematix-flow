@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import os
 import re
-import sys
 import tomllib
 from pathlib import Path
 from typing import Any
@@ -214,9 +213,9 @@ def check_connection(name: str) -> tuple[bool, str]:
 
 
 __all__ = [
-    "resolve_dsn",
+    "check_connection",
     "connect",
     "list_connections",
+    "resolve_dsn",
     "set_connection",
-    "check_connection",
 ]

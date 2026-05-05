@@ -2,16 +2,13 @@
 
 from __future__ import annotations
 
-import json
 import uuid
-from typing import Any
 
 import pytest
 
 from ematix_flow import _core
 from ematix_flow.table import ManagedTable
 from ematix_flow.types import BigInt, Column, Date, Numeric, Text
-
 
 # --- pure (no DB) ----------------------------------------------------------
 

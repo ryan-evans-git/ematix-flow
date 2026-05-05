@@ -9,12 +9,12 @@ metrics_json.
 also be referenced in transforms_post.
 """
 
-import json
 from typing import Annotated
 
 import pytest
 
-from ematix_flow import _core, ematix, pipeline as p, pk
+from ematix_flow import _core, ematix, pk
+from ematix_flow import pipeline as p
 from ematix_flow.types import BigInt, Text
 
 pytestmark = pytest.mark.integration

@@ -27,8 +27,9 @@ def _setup_pg(pg_url: str):
 
 
 def test_inferred_write_df_truncate_replaces_rows(pg_url):
-    import ematix_flow.df  # noqa: F401
     import polars as pl
+
+    import ematix_flow.df  # noqa: F401
 
     conn = _setup_pg(pg_url)
     df_initial = pl.DataFrame({"id": [1, 2, 3], "label": ["a", "b", "c"]})
@@ -50,8 +51,9 @@ def test_inferred_write_df_truncate_replaces_rows(pg_url):
 
 
 def test_inferred_write_df_merge_upserts_with_explicit_keys(pg_url):
-    import ematix_flow.df  # noqa: F401
     import polars as pl
+
+    import ematix_flow.df  # noqa: F401
 
     conn = _setup_pg(pg_url)
     conn.execute(
@@ -83,8 +85,9 @@ def test_inferred_write_df_merge_upserts_with_explicit_keys(pg_url):
 
 
 def test_inferred_write_df_merge_requires_keys(pg_url):
-    import ematix_flow.df  # noqa: F401
     import polars as pl
+
+    import ematix_flow.df  # noqa: F401
 
     conn = _setup_pg(pg_url)
     df = pl.DataFrame({"id": [1], "name": ["a"]})
@@ -93,8 +96,9 @@ def test_inferred_write_df_merge_requires_keys(pg_url):
 
 
 def test_inferred_write_df_scd1_alias_works(pg_url):
-    import ematix_flow.df  # noqa: F401
     import polars as pl
+
+    import ematix_flow.df  # noqa: F401
 
     conn = _setup_pg(pg_url)
     conn.execute(
@@ -112,8 +116,9 @@ def test_inferred_write_df_scd1_alias_works(pg_url):
 
 
 def test_inferred_write_df_merge_unknown_key_raises(pg_url):
-    import ematix_flow.df  # noqa: F401
     import polars as pl
+
+    import ematix_flow.df  # noqa: F401
 
     conn = _setup_pg(pg_url)
     df = pl.DataFrame({"id": [1], "name": ["a"]})
@@ -125,8 +130,9 @@ def test_inferred_write_df_merge_unknown_key_raises(pg_url):
 
 
 def test_inferred_write_df_scd2_rejected(pg_url):
-    import ematix_flow.df  # noqa: F401
     import polars as pl
+
+    import ematix_flow.df  # noqa: F401
 
     conn = _setup_pg(pg_url)
     df = pl.DataFrame({"id": [1], "name": ["a"]})
@@ -138,8 +144,9 @@ def test_inferred_write_df_scd2_rejected(pg_url):
 
 
 def test_inferred_write_df_truncate_pandas(pg_url):
-    import ematix_flow.df  # noqa: F401
     import pandas as pd
+
+    import ematix_flow.df  # noqa: F401
 
     conn = _setup_pg(pg_url)
     conn.write_df(pd.DataFrame({"a": [1, 2]}), "warehouse.t", mode="append")

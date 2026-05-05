@@ -23,7 +23,6 @@ from __future__ import annotations
 
 import csv
 import io
-import json
 import uuid
 from typing import Any, Literal
 
@@ -280,13 +279,14 @@ def _stage_df_to_temp_table(
     if _HAS_ADBC:
         # ADBC's create_append mode infers the table schema from the
         # Arrow table; we don't need to spell out column types.
-        arrow_table = _df_to_arrow_table(df.select(columns) if kind == "polars" else df[columns], kind)
+        df_subset = df.select(columns) if kind == "polars" else df[columns]
+        arrow_table = _df_to_arrow_table(df_subset, kind)
         _adbc_ingest(conn_dsn, "public", temp_name, arrow_table, mode="create_append")
         return temp_name
 
     # Fallback: CSV COPY via psycopg2.
     psycopg2 = _require_psycopg2()
-    cols_decl = ", ".join(f'"{c}" {t}' for c, t in zip(columns, pg_types))
+    cols_decl = ", ".join(f'"{c}" {t}' for c, t in zip(columns, pg_types, strict=False))
     pg = psycopg2.connect(conn_dsn)
     try:
         pg.autocommit = True
@@ -346,7 +346,8 @@ def _write_df_managed(
         from ematix_flow import pipeline as _p
         from ematix_flow.source import Source as _Source
 
-        source_sql = f'SELECT {", ".join(chr(34) + c + chr(34) for c in declared)} FROM "{temp_name}"'
+        _quoted_cols = ", ".join(chr(34) + c + chr(34) for c in declared)
+        source_sql = f'SELECT {_quoted_cols} FROM "{temp_name}"'
         source_obj = _Source.postgres_query(self, source_sql)
         result = _p.sync(
             target=target,

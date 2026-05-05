@@ -17,8 +17,9 @@ import json
 import re
 import sys
 import types as _types
-from dataclasses import dataclass, field
-from typing import Any, Callable, Union, get_args, get_origin
+from collections.abc import Callable
+from dataclasses import dataclass
+from typing import Any, Union, get_args, get_origin
 
 from ematix_flow.markers import (
     _NaturalKeyMarker,
@@ -27,7 +28,6 @@ from ematix_flow.markers import (
 )
 from ematix_flow.table import ManagedTable
 from ematix_flow.types import Column, ColumnType, _Nullable
-
 
 _SNAKE_CASE_BOUNDARY = re.compile(r"(.)([A-Z][a-z]+)")
 _SNAKE_CASE_LOWER_UPPER = re.compile(r"([a-z0-9])([A-Z])")
@@ -281,7 +281,6 @@ def _build_preview(
     For dry_run (dry_run=True): not implemented in this commit; raises
     NotImplementedError for now (lands in the Phase 25 dry_run commit).
     """
-    from ematix_flow import _core, pipeline as _p
     from ematix_flow.preview import PreviewResult, TargetPlan
 
     if dry_run:
@@ -309,7 +308,7 @@ def _build_preview(
     notes: list[str] = []
 
     src_name, src_info = _connection_info_safe(source_connection)
-    tgt_name, tgt_info = _connection_info_safe(target_connection)
+    _tgt_name, tgt_info = _connection_info_safe(target_connection)
     if source_connection and src_info is None:
         notes.append(
             f"source connection {source_connection!r} not currently configured"
@@ -514,11 +513,18 @@ def _plan_one_target(
             compare_resolved = list(compare_columns)
             compare_reason = "from explicit compare_columns="
         else:
+            _scd_metadata = (
+                "_loaded_at",
+                "_batch_id",
+                "valid_from",
+                "valid_to",
+                "is_current",
+                "row_hash",
+            )
             compare_resolved = [
                 c
                 for c in declared
-                if c not in resolved_keys
-                and c not in ("_loaded_at", "_batch_id", "valid_from", "valid_to", "is_current", "row_hash")
+                if c not in resolved_keys and c not in _scd_metadata
             ]
             compare_reason = "auto-derived (non-key non-metadata)"
     elif mode in ("merge", "scd1"):
@@ -526,15 +532,21 @@ def _plan_one_target(
             compare_resolved = list(update_columns)
             compare_reason = "from explicit update_columns="
         else:
+            _merge_metadata = ("_loaded_at", "_batch_id")
             compare_resolved = [
-                c for c in declared if c not in resolved_keys and c not in ("_loaded_at", "_batch_id")
+                c
+                for c in declared
+                if c not in resolved_keys and c not in _merge_metadata
             ]
             compare_reason = "auto-derived (non-key non-metadata)"
 
     # Path decision: if source_connection != target_connection, cross-DB.
     if source_connection is not None and source_connection != target_connection_name:
         path = "cross_db"
-        path_reason = f"source connection {source_connection!r} != target {target_connection_name!r}"
+        path_reason = (
+            f"source connection {source_connection!r} != "
+            f"target {target_connection_name!r}"
+        )
     else:
         path = "same_db"
         path_reason = "source and target use the same connection"
@@ -794,7 +806,6 @@ def _execute_dry_run(
     suppress others' errors (matches the locked plan §3.5).
     """
     from ematix_flow import pipeline as _p
-    from ematix_flow.preview import PreviewResult
     from ematix_flow.source import Source as _Source
 
     # Start from the standard preview plan.

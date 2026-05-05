@@ -35,7 +35,7 @@ def _try_import(name: str):
 
 def _require_psycopg2():
     try:
-        import psycopg2  # noqa: F401
+        import psycopg2
         from psycopg2.extras import RealDictCursor  # noqa: F401
     except ImportError as e:
         raise ImportError(
@@ -133,7 +133,7 @@ def training_set(
 
     # Detect collisions and prefix where needed.
     counts: dict[str, int] = {}
-    for fv, cols in fv_columns.items():
+    for cols in fv_columns.values():
         for c in cols:
             counts[c] = counts.get(c, 0) + 1
     aliases: dict[type, dict[str, str]] = {}
@@ -147,7 +147,7 @@ def training_set(
 
     # Build the SQL — one LATERAL per FV.
     spine_cols_ordered = sorted(spine_keys)  # deterministic ordering
-    spine_values_cols = ["_s_idx"] + spine_cols_ordered
+    spine_values_cols = ["_s_idx", *spine_cols_ordered]
     placeholders_per_row = "(" + ", ".join(["%s"] * len(spine_values_cols)) + ")"
     values_sql = ", ".join([placeholders_per_row] * len(spine))
     spine_alias_cols_sql = ", ".join(

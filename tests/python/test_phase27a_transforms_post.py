@@ -10,14 +10,12 @@ load, set for transforms). status broadens to include
 "transform_started" / "transform_success" / "transform_failed".
 """
 
-import subprocess
-import sys
-import textwrap
 from typing import Annotated
 
 import pytest
 
-from ematix_flow import _core, ematix, pipeline as p, pk
+from ematix_flow import _core, ematix, pk
+from ematix_flow import pipeline as p
 from ematix_flow.types import BigInt, Text
 
 pytestmark = pytest.mark.integration

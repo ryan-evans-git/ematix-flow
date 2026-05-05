@@ -9,13 +9,13 @@ booleans, etc.).
 Falls back to the CSV path automatically when ADBC is missing.
 """
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Annotated
 
 import pytest
 
 from ematix_flow import _core, ematix, pk
-from ematix_flow.types import BigInt, Numeric, Text, TimestampTZ
+from ematix_flow.types import BigInt, Numeric, TimestampTZ
 
 pytestmark = pytest.mark.integration
 
@@ -41,8 +41,9 @@ def _adbc_available() -> bool:
 def test_write_df_uses_adbc_binary_path_when_available(pg_url):
     """When ADBC is installed, write_df should use it transparently and
     produce the same results as the CSV path."""
-    import ematix_flow.df as df_mod  # noqa: F401
     import polars as pl
+
+    import ematix_flow.df as df_mod  # noqa: F401
 
     conn = _setup_pg(pg_url)
 
@@ -57,9 +58,9 @@ def test_write_df_uses_adbc_binary_path_when_available(pg_url):
             "id": [1, 2, 3],
             "score": [10.50, 20.75, 30.99],
             "ts": [
-                datetime(2026, 1, 1, tzinfo=timezone.utc),
-                datetime(2026, 1, 2, tzinfo=timezone.utc),
-                datetime(2026, 1, 3, tzinfo=timezone.utc),
+                datetime(2026, 1, 1, tzinfo=UTC),
+                datetime(2026, 1, 2, tzinfo=UTC),
+                datetime(2026, 1, 3, tzinfo=UTC),
             ],
         }
     )
@@ -77,8 +78,9 @@ def test_write_df_uses_adbc_binary_path_when_available(pg_url):
 @pytest.mark.skipif(not _adbc_available(), reason="ADBC required")
 def test_write_df_inferred_path_uses_adbc(pg_url):
     """The inferred (no target=) path also benefits from ADBC."""
-    import ematix_flow.df as df_mod  # noqa: F401
     import polars as pl
+
+    import ematix_flow.df as df_mod  # noqa: F401
 
     conn = _setup_pg(pg_url)
     df = pl.DataFrame({"id": [1, 2], "label": ["a", "b"]})
@@ -89,8 +91,9 @@ def test_write_df_inferred_path_uses_adbc(pg_url):
 @pytest.mark.skipif(not _adbc_available(), reason="ADBC required")
 def test_write_df_inferred_merge_uses_adbc(pg_url):
     """Inferred merge path: ADBC for staging + ON CONFLICT for upsert."""
-    import ematix_flow.df as df_mod  # noqa: F401
     import polars as pl
+
+    import ematix_flow.df as df_mod  # noqa: F401
 
     conn = _setup_pg(pg_url)
     conn.execute(
@@ -111,8 +114,9 @@ def test_write_df_inferred_merge_uses_adbc(pg_url):
 
 def test_write_df_csv_fallback_works_without_adbc(monkeypatch, pg_url):
     """Force-disable ADBC at import time and verify the CSV path still works."""
-    import ematix_flow.df as df_mod
     import polars as pl
+
+    import ematix_flow.df as df_mod
 
     monkeypatch.setattr(df_mod, "_HAS_ADBC", False, raising=False)
 
@@ -128,8 +132,9 @@ def test_write_df_pandas_with_adbc(pg_url):
     """ADBC works with pandas DataFrames too via pyarrow conversion."""
     if not _adbc_available():
         pytest.skip("ADBC required")
-    import ematix_flow.df as df_mod  # noqa: F401
     import pandas as pd
+
+    import ematix_flow.df as df_mod  # noqa: F401
 
     conn = _setup_pg(pg_url)
     df = pd.DataFrame({"id": [10, 20], "name": ["pa", "pb"]})

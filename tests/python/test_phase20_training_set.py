@@ -10,12 +10,13 @@ support and DataFrame output. Requires the `[df]` extra (psycopg2 +
 polars or pandas).
 """
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Annotated
 
 import pytest
 
-from ematix_flow import _core, ematix, pipeline as p, pk
+from ematix_flow import _core, ematix, pk
+from ematix_flow import pipeline as p
 from ematix_flow.types import BigInt, Numeric, TimestampTZ
 
 pytestmark = pytest.mark.integration
@@ -116,9 +117,9 @@ def test_training_set_polars_default(monkeypatch, pg_url):
     UserFeatures, ItemFeatures = _seed_two_feature_views(conn, monkeypatch, pg_url)
 
     spine = [
-        {"user_id": 1, "item_id": 100, "as_of": datetime(2026, 1, 7, tzinfo=timezone.utc)},  # uf=100, if=10
-        {"user_id": 1, "item_id": 100, "as_of": datetime(2026, 1, 12, tzinfo=timezone.utc)},  # uf=200, if=10
-        {"user_id": 1, "item_id": 100, "as_of": datetime(2026, 1, 20, tzinfo=timezone.utc)},  # uf=200, if=20
+        {"user_id": 1, "item_id": 100, "as_of": datetime(2026, 1, 7, tzinfo=UTC)},  # uf=100, if=10
+        {"user_id": 1, "item_id": 100, "as_of": datetime(2026, 1, 12, tzinfo=UTC)},  # uf=200, if=10
+        {"user_id": 1, "item_id": 100, "as_of": datetime(2026, 1, 20, tzinfo=UTC)},  # uf=200, if=20
     ]
     df = ematix.training_set(
         conn,
@@ -144,7 +145,7 @@ def test_training_set_pandas(monkeypatch, pg_url):
     UserFeatures, ItemFeatures = _seed_two_feature_views(conn, monkeypatch, pg_url)
 
     spine = [
-        {"user_id": 1, "item_id": 100, "as_of": datetime(2026, 1, 7, tzinfo=timezone.utc)},
+        {"user_id": 1, "item_id": 100, "as_of": datetime(2026, 1, 7, tzinfo=UTC)},
     ]
     df = ematix.training_set(
         conn,
@@ -165,7 +166,7 @@ def test_training_set_disambiguates_collisions(monkeypatch, pg_url):
     UserFeatures, ItemFeatures = _seed_two_feature_views(conn, monkeypatch, pg_url)
 
     spine = [
-        {"user_id": 1, "item_id": 100, "as_of": datetime(2026, 1, 12, tzinfo=timezone.utc)},
+        {"user_id": 1, "item_id": 100, "as_of": datetime(2026, 1, 12, tzinfo=UTC)},
     ]
     df = ematix.training_set(
         conn,
@@ -201,7 +202,7 @@ def test_training_set_single_fv_uses_all_non_meta_columns_by_default(
     UserFeatures, _ = _seed_two_feature_views(conn, monkeypatch, pg_url)
 
     spine = [
-        {"user_id": 1, "as_of": datetime(2026, 1, 12, tzinfo=timezone.utc)},
+        {"user_id": 1, "as_of": datetime(2026, 1, 12, tzinfo=UTC)},
     ]
     df = ematix.training_set(
         conn, spine=spine, feature_views=[UserFeatures]
@@ -222,7 +223,7 @@ def test_training_set_rejects_fv_without_matching_entity_keys_in_spine(
 
     # Spine has user_id but not item_id → ItemFeatures can't join.
     spine = [
-        {"user_id": 1, "as_of": datetime(2026, 1, 12, tzinfo=timezone.utc)},
+        {"user_id": 1, "as_of": datetime(2026, 1, 12, tzinfo=UTC)},
     ]
     with pytest.raises(ValueError, match="item_id"):
         ematix.training_set(
@@ -236,7 +237,7 @@ def test_training_set_no_feature_views_raises(monkeypatch, pg_url):
 
     with pytest.raises(ValueError, match="feature_views"):
         ematix.training_set(
-            conn, spine=[{"x": 1, "as_of": datetime(2026, 1, 1, tzinfo=timezone.utc)}],
+            conn, spine=[{"x": 1, "as_of": datetime(2026, 1, 1, tzinfo=UTC)}],
             feature_views=[],
         )
 
@@ -252,6 +253,6 @@ def test_training_set_rejects_non_feature_view(monkeypatch, pg_url):
     with pytest.raises(TypeError, match="FeatureView"):
         ematix.training_set(
             conn,
-            spine=[{"id": 1, "as_of": datetime(2026, 1, 1, tzinfo=timezone.utc)}],
+            spine=[{"id": 1, "as_of": datetime(2026, 1, 1, tzinfo=UTC)}],
             feature_views=[PlainTable],
         )

@@ -8,21 +8,16 @@ the default lane.
 
 from __future__ import annotations
 
-import os
-
 import pytest
 
 from ematix_flow import (
     DeltaLocalConnection,
     DeltaS3Connection,
-    DuckDBConnection,
     KafkaConnection,
     KinesisConnection,
-    MySQLConnection,
     ObjectStoreLocalConnection,
     ObjectStoreS3Connection,
     PostgresConnection,
-    PubSubConnection,
     RabbitMQConnection,
     SQLiteConnection,
     ematix,
@@ -120,7 +115,7 @@ class TestRegistry:
 class TestDecorator:
     def test_class_decorator_registers_kafka(self):
         @ematix.connection
-        class kafka_prod:  # noqa: N801 — name-as-id is intentional
+        class kafka_prod:
             kind = "kafka"
             bootstrap_servers = "localhost:9092"
             group_id = "ematix-flow"
@@ -133,7 +128,7 @@ class TestDecorator:
 
     def test_class_decorator_postgres(self):
         @ematix.connection
-        class warehouse:  # noqa: N801
+        class warehouse:
             kind = "postgres"
             url = "postgres://app@localhost/main"
 
@@ -142,7 +137,7 @@ class TestDecorator:
 
     def test_class_decorator_overrides_name(self):
         @ematix.connection
-        class warehouse:  # noqa: N801
+        class warehouse:
             name = "real_dw"
             kind = "postgres"
             url = "postgres://app@localhost/main"
@@ -154,14 +149,14 @@ class TestDecorator:
         with pytest.raises(TypeError, match="must declare a `kind`"):
 
             @ematix.connection
-            class missing_kind:  # noqa: N801
+            class missing_kind:
                 url = "postgres://x/y"
 
     def test_class_decorator_unknown_kind(self):
         with pytest.raises(TypeError, match="unknown kind"):
 
             @ematix.connection
-            class bogus:  # noqa: N801
+            class bogus:
                 kind = "wormhole"
 
     def test_decorator_rejects_non_class(self):
@@ -176,7 +171,7 @@ class TestDecorator:
         with pytest.raises(ValueError, match="bootstrap_servers is required"):
 
             @ematix.connection
-            class incomplete:  # noqa: N801
+            class incomplete:
                 kind = "kafka"
 
 

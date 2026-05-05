@@ -19,7 +19,6 @@ from ematix_flow import (
     ObjectStoreLocalConnection,
     Source,
     Target,
-    register_connection,
 )
 from ematix_flow.connections import clear_registry
 

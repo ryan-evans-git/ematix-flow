@@ -52,7 +52,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
-from typing import Any, Optional, Union
+from typing import Any
 
 from ematix_flow._core import (
     run_pipeline_from_path,
@@ -96,22 +96,22 @@ class Target:
     target before advancing source offsets.
     """
 
-    connection: Union[Connection, str]
-    table: Optional[tuple[str, str]] = None
-    topic: Optional[str] = None
-    queue: Optional[str] = None
-    partition_key_prefix: Optional[str] = None
-    prefix: Optional[str] = None
-    message_key_column: Optional[str] = None
-    partition_by: Optional[list[str]] = field(default=None)
+    connection: Connection | str
+    table: tuple[str, str] | None = None
+    topic: str | None = None
+    queue: str | None = None
+    partition_key_prefix: str | None = None
+    prefix: str | None = None
+    message_key_column: str | None = None
+    partition_by: list[str] | None = field(default=None)
     # Π.1.4: object-store per-format write options. Only consulted
     # for ObjectStoreLocalConnection / ObjectStoreS3Connection
     # targets; ignored for other kinds. Use Parquet compression in
     # production unless you have a specific reason to keep raw
     # bytes — `"zstd"` is a strong default.
-    parquet_compression: Optional[str] = None  # "uncompressed" | "snappy" | "gzip" | "zstd"
-    csv_delimiter: Optional[str] = None  # single-character string
-    csv_header: Optional[bool] = None
+    parquet_compression: str | None = None  # "uncompressed" | "snappy" | "gzip" | "zstd"
+    csv_delimiter: str | None = None  # single-character string
+    csv_header: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -129,7 +129,7 @@ class Source:
     Python form for stream-stream joins instead of raw TOML.
     """
 
-    connection: Union[Connection, str]
+    connection: Connection | str
     query: str
 
 
@@ -149,7 +149,7 @@ class Aggregation:
 
     agg: str
     as_: str
-    column: Optional[str] = None
+    column: str | None = None
 
 
 @dataclass(frozen=True)
@@ -180,13 +180,13 @@ class Window:
     kind: str
     aggregations: list[Aggregation]
     duration_ms: int = 0
-    hop_ms: Optional[int] = None
-    gap_ms: Optional[int] = None
-    max_session_duration_ms: Optional[int] = None
+    hop_ms: int | None = None
+    gap_ms: int | None = None
+    max_session_duration_ms: int | None = None
     event_time_column: str = "_event_ts"
     group_by: tuple[str, ...] = ()
     late_data: str = "drop"
-    allowed_lateness_ms: Optional[int] = None
+    allowed_lateness_ms: int | None = None
     max_groups_per_window: int = 1_000_000
     window_start_column: str = "window_start"
     window_end_column: str = "window_end"
@@ -236,11 +236,11 @@ class Join:
     right_keys: tuple[str, ...]
     time_window_ms: int = 0
     kind: str = "inner"
-    min_delta_ms: Optional[int] = None
-    max_delta_ms: Optional[int] = None
+    min_delta_ms: int | None = None
+    max_delta_ms: int | None = None
     event_time_column: str = "_event_ts"
     late_data: str = "drop"
-    allowed_lateness_ms: Optional[int] = None
+    allowed_lateness_ms: int | None = None
     left_column_prefix: str = "left_"
     right_column_prefix: str = "right_"
 
@@ -263,7 +263,7 @@ class StateStore:
     """
 
     kind: str
-    url: Optional[str] = None
+    url: str | None = None
     schema: str = "public"
     checkpoint_interval_ms: int = 60_000
 
@@ -288,10 +288,10 @@ class Lookup:
     name visible in the transform SQL.
     """
 
-    connection: Union[Connection, str]
+    connection: Connection | str
     table: str
     schema: str = ""
-    refresh_interval_ms: Optional[int] = None
+    refresh_interval_ms: int | None = None
 
 
 __all__ = [
@@ -335,8 +335,8 @@ class Watermark:
       pipeline's watermark.
     """
 
-    lateness_ms: Optional[int] = None
-    source_idleness_ms: Optional[int] = None
+    lateness_ms: int | None = None
+    source_idleness_ms: int | None = None
 
     def __post_init__(self) -> None:
         if self.lateness_ms is not None and self.lateness_ms < 0:
@@ -380,7 +380,7 @@ def register_streaming_pipeline(name: str, captured: dict[str, Any]) -> None:
     _STREAMING_PIPELINES[name] = captured
 
 
-def get_streaming_pipeline(name: str) -> Optional[dict[str, Any]]:
+def get_streaming_pipeline(name: str) -> dict[str, Any] | None:
     """Return the captured kwargs for a registered streaming pipeline,
     or ``None`` if no pipeline with that name was registered."""
     return _STREAMING_PIPELINES.get(name)
@@ -463,38 +463,38 @@ def run_streaming_pipeline(
     name: str,
     # Single-source form (legacy + most-common). Mutually
     # exclusive with ``sources=``.
-    source: Optional[Union[Connection, str]] = None,
-    source_query: Optional[str] = None,
+    source: Connection | str | None = None,
+    source_query: str | None = None,
     # Phase 39.5b P2.18: typed multi-source form. Mutually
     # exclusive with the single ``source=``/``source_query=`` pair
     # above. Required for stream-stream joins (each `Source.query`
     # becomes the per-source `BatchContext.source_id` the join
     # routes on).
-    sources: Optional[list[Source]] = None,
-    target: Optional[Union[Connection, str]] = None,
+    sources: list[Source] | None = None,
+    target: Connection | str | None = None,
     # Single-target placement (legacy shape; mutually exclusive with
     # ``targets=``). Exactly one of these applies depending on the
     # target connection's kind:
-    target_table: Optional[tuple[str, str]] = None,
-    target_topic: Optional[str] = None,
-    target_queue: Optional[str] = None,
-    target_partition_key_prefix: Optional[str] = None,
-    target_prefix: Optional[str] = None,
-    target_message_key_column: Optional[str] = None,
-    target_partition_by: Optional[list[str]] = None,
+    target_table: tuple[str, str] | None = None,
+    target_topic: str | None = None,
+    target_queue: str | None = None,
+    target_partition_key_prefix: str | None = None,
+    target_prefix: str | None = None,
+    target_message_key_column: str | None = None,
+    target_partition_by: list[str] | None = None,
     # Π.4a multi-target: list of typed Target specs. Mutually
     # exclusive with the single ``target=`` shape above.
-    targets: Optional[list[Target]] = None,
+    targets: list[Target] | None = None,
     idle_pause_ms: int = 500,
-    dead_letter_topic: Optional[str] = None,
-    transform_sql: Optional[str] = None,
-    lookups: Optional[dict[str, Lookup]] = None,
-    window: Optional[Window] = None,
-    join: Optional["Join"] = None,
-    state_store: Optional["StateStore"] = None,
-    transform_on_error: Optional[str] = None,
-    watermark: Optional["Watermark"] = None,
-    metrics_port: Optional[int] = None,
+    dead_letter_topic: str | None = None,
+    transform_sql: str | None = None,
+    lookups: dict[str, Lookup] | None = None,
+    window: Window | None = None,
+    join: Join | None = None,
+    state_store: StateStore | None = None,
+    transform_on_error: str | None = None,
+    watermark: Watermark | None = None,
+    metrics_port: int | None = None,
 ) -> PipelineMetrics:
     """Run a streaming pipeline driven by typed :class:`Connection` objects.
 
@@ -560,28 +560,28 @@ def run_streaming_pipeline(
 def _run_streaming_pipeline_emit_toml(
     *,
     name: str,
-    source: Optional[Union[Connection, str]] = None,
-    source_query: Optional[str] = None,
-    sources: Optional[list[Source]] = None,
-    target: Optional[Union[Connection, str]] = None,
-    target_table: Optional[tuple[str, str]] = None,
-    target_topic: Optional[str] = None,
-    target_queue: Optional[str] = None,
-    target_partition_key_prefix: Optional[str] = None,
-    target_prefix: Optional[str] = None,
-    target_message_key_column: Optional[str] = None,
-    target_partition_by: Optional[list[str]] = None,
-    targets: Optional[list[Target]] = None,
+    source: Connection | str | None = None,
+    source_query: str | None = None,
+    sources: list[Source] | None = None,
+    target: Connection | str | None = None,
+    target_table: tuple[str, str] | None = None,
+    target_topic: str | None = None,
+    target_queue: str | None = None,
+    target_partition_key_prefix: str | None = None,
+    target_prefix: str | None = None,
+    target_message_key_column: str | None = None,
+    target_partition_by: list[str] | None = None,
+    targets: list[Target] | None = None,
     idle_pause_ms: int = 500,
-    dead_letter_topic: Optional[str] = None,
-    transform_sql: Optional[str] = None,
-    lookups: Optional[dict[str, Lookup]] = None,
-    window: Optional[Window] = None,
-    join: Optional["Join"] = None,
-    state_store: Optional["StateStore"] = None,
-    transform_on_error: Optional[str] = None,
-    watermark: Optional["Watermark"] = None,
-    metrics_port: Optional[int] = None,  # accepted+ignored — not in TOML
+    dead_letter_topic: str | None = None,
+    transform_sql: str | None = None,
+    lookups: dict[str, Lookup] | None = None,
+    window: Window | None = None,
+    join: Join | None = None,
+    state_store: StateStore | None = None,
+    transform_on_error: str | None = None,
+    watermark: Watermark | None = None,
+    metrics_port: int | None = None,  # accepted+ignored — not in TOML
 ) -> str:
     """Validate the kwargs and emit the equivalent TOML the Rust
     runner already parses. Shared between
@@ -696,20 +696,20 @@ def _build_toml(
     source: Connection,
     source_query: str,
     target: Connection,
-    target_table: Optional[tuple[str, str]],
-    target_topic: Optional[str],
-    target_queue: Optional[str],
-    target_partition_key_prefix: Optional[str],
-    target_prefix: Optional[str],
-    target_message_key_column: Optional[str],
-    target_partition_by: Optional[list[str]],
+    target_table: tuple[str, str] | None,
+    target_topic: str | None,
+    target_queue: str | None,
+    target_partition_key_prefix: str | None,
+    target_prefix: str | None,
+    target_message_key_column: str | None,
+    target_partition_by: list[str] | None,
     idle_pause_ms: int,
-    dead_letter_topic: Optional[str],
-    transform_sql: Optional[str] = None,
-    lookups: Optional[dict[str, Lookup]] = None,
-    window: Optional[Window] = None,
-    join: Optional["Join"] = None,
-    state_store: Optional["StateStore"] = None,
+    dead_letter_topic: str | None,
+    transform_sql: str | None = None,
+    lookups: dict[str, Lookup] | None = None,
+    window: Window | None = None,
+    join: Join | None = None,
+    state_store: StateStore | None = None,
 ) -> str:
     """Single-source / single-target back-compat shim. Wraps the
     flat kwargs into a one-element ``[Source]`` + one-element
@@ -745,14 +745,14 @@ def _build_toml_multi(
     sources: list[Source],
     targets: list[Target],
     idle_pause_ms: int,
-    dead_letter_topic: Optional[str],
-    transform_sql: Optional[str] = None,
-    lookups: Optional[dict[str, Lookup]] = None,
-    window: Optional[Window] = None,
-    join: Optional["Join"] = None,
-    state_store: Optional["StateStore"] = None,
-    transform_on_error: Optional[str] = None,
-    watermark: Optional["Watermark"] = None,
+    dead_letter_topic: str | None,
+    transform_sql: str | None = None,
+    lookups: dict[str, Lookup] | None = None,
+    window: Window | None = None,
+    join: Join | None = None,
+    state_store: StateStore | None = None,
+    transform_on_error: str | None = None,
+    watermark: Watermark | None = None,
 ) -> str:
     """Π.4a / P2.18: serialize a pipeline shape into the TOML
     config format.
@@ -839,7 +839,7 @@ def _build_toml_multi(
     return "\n".join(lines) + "\n"
 
 
-def _emit_watermark_block(wm: "Watermark") -> list[str]:
+def _emit_watermark_block(wm: Watermark) -> list[str]:
     """Emit a `[watermark]` TOML block — only the fields the user
     set, so the Rust core's defaults stay authoritative for anything
     omitted."""
@@ -853,11 +853,11 @@ def _emit_watermark_block(wm: "Watermark") -> list[str]:
 
 def _emit_transform_block(
     transform_sql: str,
-    lookups: Optional[dict[str, Lookup]],
-    window: Optional[Window] = None,
-    join: Optional["Join"] = None,
+    lookups: dict[str, Lookup] | None,
+    window: Window | None = None,
+    join: Join | None = None,
     *,
-    on_error: Optional[str] = None,
+    on_error: str | None = None,
 ) -> list[str]:
     """Emit `[transform]` plus one `[transform.lookups.<name>]`
     block per entry, plus optional `[transform.window]` +
@@ -969,7 +969,7 @@ def _emit_window_block(window: Window) -> list[str]:
     return lines
 
 
-def _emit_join_block(join: "Join") -> list[str]:
+def _emit_join_block(join: Join) -> list[str]:
     """Phase 39.5b: emit ``[transform.join]``.
 
     Handles inner / left_outer / right_outer / full_outer (P2.12),
@@ -1045,7 +1045,7 @@ def _emit_join_block(join: "Join") -> list[str]:
     return lines
 
 
-def _emit_state_store_block(state_store: "StateStore") -> list[str]:
+def _emit_state_store_block(state_store: StateStore) -> list[str]:
     """Phase 39.5a PR 3: emit the top-level ``[state_store]`` block."""
     if state_store.kind not in ("postgres", "in_memory"):
         raise ValueError(
@@ -1172,7 +1172,7 @@ def _emit_targets_array_entry(spec: Target) -> list[str]:
 
 def _resolve_kafka_schema_registry(
     conn: KafkaConnection,
-) -> Optional[SchemaRegistryConnection]:
+) -> SchemaRegistryConnection | None:
     """Π.1: collapse ``KafkaConnection.schema_registry`` (typed) and
     ``schema_registry_url`` (legacy inline) into a single resolved
     ``SchemaRegistryConnection``, or ``None`` if SR isn't configured.
@@ -1299,24 +1299,27 @@ def _kafka_auth_lines(conn: KafkaConnection) -> list[str]:
 def _source_fields(conn: Connection) -> list[str]:
     """Emit the `kind = ...` line + per-kind fields for [source]."""
     if isinstance(conn, KafkaConnection):
-        out = ['kind = "kafka"']
-        out.append(f"bootstrap_servers = {_q(_resolve_required(conn.bootstrap_servers, 'bootstrap_servers'))}")
+        bootstrap = _resolve_required(conn.bootstrap_servers, "bootstrap_servers")
+        out = ['kind = "kafka"', f"bootstrap_servers = {_q(bootstrap)}"]
         if conn.group_id is not None:
             out.append(f"group_id = {_q(resolve(conn.group_id))}")
         out.extend(_kafka_payload_and_sr_lines(conn))
         out.extend(_kafka_auth_lines(conn))
         return out
     if isinstance(conn, RabbitMQConnection):
-        return ['kind = "rabbitmq"', f"amqp_url = {_q(_resolve_required(conn.amqp_url, 'amqp_url'))}"]
+        amqp_url = _resolve_required(conn.amqp_url, "amqp_url")
+        return ['kind = "rabbitmq"', f"amqp_url = {_q(amqp_url)}"]
     if isinstance(conn, PubSubConnection):
-        out = ['kind = "pubsub"', f"project_id = {_q(_resolve_required(conn.project_id, 'project_id'))}"]
+        project_id = _resolve_required(conn.project_id, "project_id")
+        out = ['kind = "pubsub"', f"project_id = {_q(project_id)}"]
         if conn.endpoint:
             out.append(f"endpoint = {_q(resolve(conn.endpoint))}")
         if conn.anonymous_auth:
             out.append("anonymous_auth = true")
         return out
     if isinstance(conn, KinesisConnection):
-        out = ['kind = "kinesis"', f"stream_name = {_q(_resolve_required(conn.stream_name, 'stream_name'))}"]
+        stream_name = _resolve_required(conn.stream_name, "stream_name")
+        out = ['kind = "kinesis"', f"stream_name = {_q(stream_name)}"]
         if conn.region:
             out.append(f"region = {_q(resolve(conn.region))}")
         if conn.endpoint:
@@ -1338,16 +1341,16 @@ _VALID_PARQUET_COMPRESSION = ("uncompressed", "snappy", "gzip", "zstd")
 def _target_fields(
     conn: Connection,
     *,
-    target_table: Optional[tuple[str, str]],
-    target_topic: Optional[str],
-    target_queue: Optional[str],
-    target_partition_key_prefix: Optional[str],
-    target_prefix: Optional[str],
-    target_message_key_column: Optional[str],
-    target_partition_by: Optional[list[str]],
-    parquet_compression: Optional[str] = None,
-    csv_delimiter: Optional[str] = None,
-    csv_header: Optional[bool] = None,
+    target_table: tuple[str, str] | None,
+    target_topic: str | None,
+    target_queue: str | None,
+    target_partition_key_prefix: str | None,
+    target_prefix: str | None,
+    target_message_key_column: str | None,
+    target_partition_by: list[str] | None,
+    parquet_compression: str | None = None,
+    csv_delimiter: str | None = None,
+    csv_header: bool | None = None,
 ) -> list[str]:
     """Emit the `kind = ...` line + per-kind fields for [target]."""
 
@@ -1373,9 +1376,10 @@ def _target_fields(
         return ['kind = "duckdb"', f"path = {_q(_resolve_required(conn.path, 'path'))}"]
     if isinstance(conn, KafkaConnection):
         topic = need("target_topic", target_topic)
+        bootstrap = _resolve_required(conn.bootstrap_servers, "bootstrap_servers")
         out = [
             'kind = "kafka"',
-            f"bootstrap_servers = {_q(_resolve_required(conn.bootstrap_servers, 'bootstrap_servers'))}",
+            f"bootstrap_servers = {_q(bootstrap)}",
             f"topic = {_q(topic)}",
         ]
         if conn.group_id is not None:
@@ -1433,8 +1437,14 @@ def _target_fields(
             f"endpoint = {_q(_resolve_required(conn.endpoint, 'endpoint'))}",
             f"bucket = {_q(_resolve_required(conn.bucket, 'bucket'))}",
             f"region = {_q(_resolve_required(conn.region, 'region'))}",
-            f"access_key_id = {_q(_resolve_required(conn.access_key_id, 'access_key_id'))}",
-            f"secret_access_key = {_q(_resolve_required(conn.secret_access_key, 'secret_access_key'))}",
+            (
+                "access_key_id = "
+                f"{_q(_resolve_required(conn.access_key_id, 'access_key_id'))}"
+            ),
+            (
+                "secret_access_key = "
+                f"{_q(_resolve_required(conn.secret_access_key, 'secret_access_key'))}"
+            ),
         ]
         if conn.prefix:
             out.append(f"prefix = {_q(resolve(conn.prefix))}")
@@ -1465,8 +1475,14 @@ def _target_fields(
             f"endpoint = {_q(_resolve_required(conn.endpoint, 'endpoint'))}",
             f"bucket = {_q(_resolve_required(conn.bucket, 'bucket'))}",
             f"region = {_q(_resolve_required(conn.region, 'region'))}",
-            f"access_key_id = {_q(_resolve_required(conn.access_key_id, 'access_key_id'))}",
-            f"secret_access_key = {_q(_resolve_required(conn.secret_access_key, 'secret_access_key'))}",
+            (
+                "access_key_id = "
+                f"{_q(_resolve_required(conn.access_key_id, 'access_key_id'))}"
+            ),
+            (
+                "secret_access_key = "
+                f"{_q(_resolve_required(conn.secret_access_key, 'secret_access_key'))}"
+            ),
             f"format = {_q(conn.format)}",
             f"prefix = {_q(prefix)}",
         ]
@@ -1484,9 +1500,9 @@ def _target_fields(
 
 def _object_store_format_lines(
     format_kind: str,
-    parquet_compression: Optional[str],
-    csv_delimiter: Optional[str],
-    csv_header: Optional[bool],
+    parquet_compression: str | None,
+    csv_delimiter: str | None,
+    csv_header: bool | None,
 ) -> list[str]:
     """Π.1.4: emit the per-format option lines for object-store
     targets, with shape-correctness checks at the typed-Python
@@ -1530,7 +1546,9 @@ def _resolve_required(value: str, label: str) -> str:
     """Resolve env vars; treat empty/None as missing required field."""
     resolved = resolve(value)
     if not resolved:
-        raise ValueError(f"connection field {label!r} resolves to empty after ${{VAR}} interpolation")
+        raise ValueError(
+            f"connection field {label!r} resolves to empty after ${{VAR}} interpolation"
+        )
     return resolved
 
 

@@ -142,7 +142,7 @@ def render_text(result: PreviewResult, *, verbose: bool = False, use_color: bool
                 f"{status}"
             )
         console.print()
-        console.print(f"[dim]--verbose for SQL plans per target[/]")
+        console.print("[dim]--verbose for SQL plans per target[/]")
     else:
         # Verbose / single-target.
         for i, t in enumerate(result.targets):
@@ -166,7 +166,7 @@ def render_text(result: PreviewResult, *, verbose: bool = False, use_color: bool
                         )
                     else:
                         col_lines.append(f"    {col['name']}")
-                console.print(f"  [dim]Columns:[/]")
+                console.print("  [dim]Columns:[/]")
                 for line in col_lines:
                     console.print(line)
             if t.merge_keys:

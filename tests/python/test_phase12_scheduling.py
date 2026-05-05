@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import sys
 import textwrap
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -73,27 +73,27 @@ def test_register_duplicate_name_raises() -> None:
 
 def test_is_due_true_when_cron_fires_in_window() -> None:
     """Hourly cron fires at HH:00; with now=12:00 and interval=60s, due."""
-    now = datetime(2026, 4, 30, 12, 0, 0, tzinfo=timezone.utc)
+    now = datetime(2026, 4, 30, 12, 0, 0, tzinfo=UTC)
     assert p.is_due("0 * * * *", now, 60) is True
 
 
 def test_is_due_false_when_cron_does_not_fire_in_window() -> None:
     """Hourly cron fires at HH:00; with now=12:30, not in (12:29, 12:30]."""
-    now = datetime(2026, 4, 30, 12, 30, 0, tzinfo=timezone.utc)
+    now = datetime(2026, 4, 30, 12, 30, 0, tzinfo=UTC)
     assert p.is_due("0 * * * *", now, 60) is False
 
 
 def test_is_due_daily_cron_at_midnight() -> None:
-    midnight = datetime(2026, 4, 30, 0, 0, 0, tzinfo=timezone.utc)
-    one_minute_in = datetime(2026, 4, 30, 0, 0, 30, tzinfo=timezone.utc)
-    noon = datetime(2026, 4, 30, 12, 0, 0, tzinfo=timezone.utc)
+    midnight = datetime(2026, 4, 30, 0, 0, 0, tzinfo=UTC)
+    one_minute_in = datetime(2026, 4, 30, 0, 0, 30, tzinfo=UTC)
+    noon = datetime(2026, 4, 30, 12, 0, 0, tzinfo=UTC)
     assert p.is_due("0 0 * * *", midnight, 60) is True
     assert p.is_due("0 0 * * *", one_minute_in, 60) is True
     assert p.is_due("0 0 * * *", noon, 60) is False
 
 
 def test_is_due_invalid_cron_string_raises() -> None:
-    now = datetime(2026, 4, 30, 12, 0, 0, tzinfo=timezone.utc)
+    now = datetime(2026, 4, 30, 12, 0, 0, tzinfo=UTC)
     with pytest.raises(ValueError):
         p.is_due("not a cron expression", now, 60)
 

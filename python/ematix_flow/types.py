@@ -80,7 +80,7 @@ class String(ColumnType):
     def to_spec(self) -> dict[str, Any]:
         return {"kind": "string", "length": self.length}
 
-    def __class_getitem__(cls, length: int) -> "String":
+    def __class_getitem__(cls, length: int) -> String:
         # Phase 24a: `String[256]` evaluates to `String(256)` so the type
         # reads cleanly inside `Annotated[...]`.
         return cls(length)
@@ -96,7 +96,7 @@ class Numeric(ColumnType):
     def to_spec(self) -> dict[str, Any]:
         return {"kind": "numeric", "precision": self.precision, "scale": self.scale}
 
-    def __class_getitem__(cls, params: tuple[int, int]) -> "Numeric":
+    def __class_getitem__(cls, params: tuple[int, int]) -> Numeric:
         # Phase 24a: `Numeric[12, 2]` evaluates to `Numeric(12, 2)`.
         if not isinstance(params, tuple) or len(params) != 2:
             raise TypeError(

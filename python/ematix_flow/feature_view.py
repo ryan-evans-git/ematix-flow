@@ -35,7 +35,7 @@ _META_COLS = ("_loaded_at", "_batch_id", "valid_from", "valid_to", "is_current",
 
 def _require_psycopg2():
     try:
-        import psycopg2  # noqa: F401
+        import psycopg2
         from psycopg2.extras import RealDictCursor  # noqa: F401
     except ImportError as e:
         raise ImportError(
@@ -204,8 +204,8 @@ class FeatureView(ManagedTable):
 
         # Build a VALUES-shaped spine table. A leading "_s_idx" preserves
         # caller-supplied order so the result rows align 1:1 with `spine`.
-        spine_cols = keys + ["as_of"]
-        all_cols = ["_s_idx"] + spine_cols
+        spine_cols = [*keys, "as_of"]
+        all_cols = ["_s_idx", *spine_cols]
         placeholders_per_row = "(" + ", ".join(["%s"] * len(all_cols)) + ")"
         values_sql = ", ".join([placeholders_per_row] * len(spine))
         spine_alias_cols = ", ".join(

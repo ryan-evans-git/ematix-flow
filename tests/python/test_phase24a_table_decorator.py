@@ -16,7 +16,6 @@ from ematix_flow import ematix, natural_key, pk
 from ematix_flow.table import ManagedTable
 from ematix_flow.types import BigInt, Boolean, Column, Date, Numeric, String, Text
 
-
 # --- basic shape ------------------------------------------------------------
 
 

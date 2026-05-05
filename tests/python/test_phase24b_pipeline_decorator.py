@@ -15,8 +15,8 @@ from typing import Annotated, Any
 
 import pytest
 
-from ematix_flow import _core, ematix, pipeline as p, pk
-from ematix_flow.source import Source
+from ematix_flow import _core, ematix, pk
+from ematix_flow import pipeline as p
 from ematix_flow.types import BigInt, String, Text
 
 

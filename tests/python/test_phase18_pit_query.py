@@ -12,12 +12,13 @@ Both walk the SCD2 valid_from/valid_to history; works against any
 Requires `pip install ematix-flow[df]` for psycopg2.
 """
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime
 from typing import Annotated
 
 import pytest
 
-from ematix_flow import _core, ematix, pipeline as p, pk
+from ematix_flow import _core, ematix, pk
+from ematix_flow import pipeline as p
 from ematix_flow.types import BigInt, Numeric, TimestampTZ
 
 pytestmark = pytest.mark.integration
@@ -99,7 +100,7 @@ def test_point_in_time_returns_version_at_as_of(monkeypatch, pg_url):
     UserFeatures = _seed_three_versions(conn, monkeypatch, pg_url)
 
     # Query between v2 and v3 → should return v2 (score=200).
-    as_of = datetime(2026, 1, 10, tzinfo=timezone.utc)
+    as_of = datetime(2026, 1, 10, tzinfo=UTC)
     row = UserFeatures.point_in_time(conn, entity_keys={"user_id": 1}, as_of=as_of)
     assert row is not None
     assert int(row["user_id"]) == 1
@@ -116,7 +117,7 @@ def test_point_in_time_returns_first_version_at_its_valid_from(
     row = UserFeatures.point_in_time(
         conn,
         entity_keys={"user_id": 1},
-        as_of=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        as_of=datetime(2026, 1, 1, tzinfo=UTC),
     )
     assert float(row["score"]) == 100.0
 
@@ -128,7 +129,7 @@ def test_point_in_time_returns_none_before_first_version(monkeypatch, pg_url):
     row = UserFeatures.point_in_time(
         conn,
         entity_keys={"user_id": 1},
-        as_of=datetime(2025, 1, 1, tzinfo=timezone.utc),
+        as_of=datetime(2025, 1, 1, tzinfo=UTC),
     )
     assert row is None
 
@@ -140,7 +141,7 @@ def test_point_in_time_returns_latest_when_as_of_after_all(monkeypatch, pg_url):
     row = UserFeatures.point_in_time(
         conn,
         entity_keys={"user_id": 1},
-        as_of=datetime(2027, 1, 1, tzinfo=timezone.utc),
+        as_of=datetime(2027, 1, 1, tzinfo=UTC),
     )
     assert float(row["score"]) == 300.0
 
@@ -152,7 +153,7 @@ def test_point_in_time_unknown_entity_returns_none(monkeypatch, pg_url):
     row = UserFeatures.point_in_time(
         conn,
         entity_keys={"user_id": 999},
-        as_of=datetime(2026, 1, 10, tzinfo=timezone.utc),
+        as_of=datetime(2026, 1, 10, tzinfo=UTC),
     )
     assert row is None
 
@@ -164,7 +165,7 @@ def test_point_in_time_columns_subset(monkeypatch, pg_url):
     row = UserFeatures.point_in_time(
         conn,
         entity_keys={"user_id": 1},
-        as_of=datetime(2026, 1, 10, tzinfo=timezone.utc),
+        as_of=datetime(2026, 1, 10, tzinfo=UTC),
         columns=["score"],
     )
     assert "score" in row
@@ -180,7 +181,7 @@ def test_point_in_time_rejects_missing_entity_key(monkeypatch, pg_url):
         UserFeatures.point_in_time(
             conn,
             entity_keys={},
-            as_of=datetime(2026, 1, 10, tzinfo=timezone.utc),
+            as_of=datetime(2026, 1, 10, tzinfo=UTC),
         )
 
 
@@ -192,7 +193,7 @@ def test_point_in_time_rejects_unknown_key(monkeypatch, pg_url):
         UserFeatures.point_in_time(
             conn,
             entity_keys={"user_id": 1, "device_id": "abc"},
-            as_of=datetime(2026, 1, 10, tzinfo=timezone.utc),
+            as_of=datetime(2026, 1, 10, tzinfo=UTC),
         )
 
 
@@ -204,10 +205,10 @@ def test_historical_features_lateral_asof_join(monkeypatch, pg_url):
     UserFeatures = _seed_three_versions(conn, monkeypatch, pg_url)
 
     spine = [
-        {"user_id": 1, "as_of": datetime(2026, 1, 3, tzinfo=timezone.utc)},  # v1
-        {"user_id": 1, "as_of": datetime(2026, 1, 10, tzinfo=timezone.utc)},  # v2
-        {"user_id": 1, "as_of": datetime(2026, 1, 20, tzinfo=timezone.utc)},  # v3
-        {"user_id": 999, "as_of": datetime(2026, 1, 10, tzinfo=timezone.utc)},  # none
+        {"user_id": 1, "as_of": datetime(2026, 1, 3, tzinfo=UTC)},  # v1
+        {"user_id": 1, "as_of": datetime(2026, 1, 10, tzinfo=UTC)},  # v2
+        {"user_id": 1, "as_of": datetime(2026, 1, 20, tzinfo=UTC)},  # v3
+        {"user_id": 999, "as_of": datetime(2026, 1, 10, tzinfo=UTC)},  # none
     ]
     rows = UserFeatures.historical_features(conn, spine=spine, columns=["score"])
     assert len(rows) == 4

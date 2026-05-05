@@ -112,10 +112,10 @@ def nullable() -> _NullableMarker:
 
 
 __all__ = [
-    "pk",
-    "natural_key",
-    "nullable",
-    "_PkMarker",
     "_NaturalKeyMarker",
     "_NullableMarker",
+    "_PkMarker",
+    "natural_key",
+    "nullable",
+    "pk",
 ]
