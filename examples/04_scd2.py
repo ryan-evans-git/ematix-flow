@@ -16,15 +16,24 @@ up with:
         --name ematix-pg postgres:16
 
 Run:
-    EMATIX_FLOW_DSN_DEFAULT=postgres://postgres:postgres@localhost/postgres \\
+    EMATIX_FLOW_DSN=postgres://postgres:postgres@localhost/postgres \\
         python examples/04_scd2.py
 """
 
 from typing import Annotated
 
 from ematix_flow import ematix, pk
+from ematix_flow.connections import PostgresConnection, register_connection
 from ematix_flow.normalize import lower, parse_timestamp, trim
 from ematix_flow.types import BigInt, String, Text, TimestampTZ
+
+# Connection registration — see `01_append.py` for the rationale.
+register_connection(
+    PostgresConnection(
+        name="warehouse",
+        url="${EMATIX_FLOW_DSN}",
+    )
+)
 
 
 @ematix.table(schema="analytics")
@@ -38,7 +47,9 @@ class CustomerDim:
 
 
 @ematix.pipeline(
-    target=CustomerDim, schedule=None,
+    target=CustomerDim,
+    target_connection="warehouse",
+    schedule=None,
     mode="scd2",
     compare_columns=["email", "name"],
     event_timestamp_column="updated_at",
@@ -55,8 +66,8 @@ def sync_customers(conn):
 
 
 if __name__ == "__main__":
-    # Connection picked up from EMATIX_FLOW_DSN_DEFAULT or
-    # ./.ematix-flow.toml — see docs/USER_GUIDE.md "Connections".
     metrics = sync_customers.run()
-    print(f"SCD2 sync: inserted {metrics.rows_inserted}, "
-          f"closed {metrics.rows_closed} versions.")
+    print(
+        f"SCD2 sync: inserted {metrics.rows_inserted}, "
+        f"closed {metrics.rows_closed} versions."
+    )

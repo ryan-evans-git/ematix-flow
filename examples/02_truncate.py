@@ -14,7 +14,20 @@ Run:
 from typing import Annotated
 
 from ematix_flow import ematix, pk
+from ematix_flow.connections import PostgresConnection, register_connection
 from ematix_flow.types import BigInt, String, Text
+
+# Same connection-registration pattern as `01_append.py` — see that
+# example for the rationale (named handle, lazy env interpolation,
+# safe-to-log repr). `docs/USER_GUIDE.md` "Connections" has the full
+# surface (env-driven defaults, the `@ematix.connection` declarative
+# form, multi-warehouse pipelines, etc.).
+register_connection(
+    PostgresConnection(
+        name="warehouse",
+        url="${EMATIX_FLOW_DSN}",
+    )
+)
 
 
 @ematix.table(schema="analytics")
@@ -24,7 +37,12 @@ class Country:
     name: Text
 
 
-@ematix.pipeline(target=Country, schedule=None, mode="truncate")
+@ematix.pipeline(
+    target=Country,
+    target_connection="warehouse",
+    schedule=None,
+    mode="truncate",
+)
 def refresh_countries(conn):
     return """
         SELECT 1::bigint AS country_id, 'US' AS code, 'United States'  AS name

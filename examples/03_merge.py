@@ -14,8 +14,17 @@ Run:
 from typing import Annotated
 
 from ematix_flow import ematix, pk
+from ematix_flow.connections import PostgresConnection, register_connection
 from ematix_flow.normalize import lower, trim
 from ematix_flow.types import BigInt, String, Text
+
+# Connection registration — see `01_append.py` for the rationale.
+register_connection(
+    PostgresConnection(
+        name="warehouse",
+        url="${EMATIX_FLOW_DSN}",
+    )
+)
 
 
 @ematix.table(schema="analytics")
@@ -27,6 +36,7 @@ class Customer:
 
 @ematix.pipeline(
     target=Customer,
+    target_connection="warehouse",
     schedule=None,
     mode="merge",
     compare_columns=["email", "name"],
@@ -49,5 +59,7 @@ if __name__ == "__main__":
 
     # Second run with the same source: rows match, no churn.
     m = sync_customers.run()
-    print(f"Run 2: inserted {m.rows_inserted}, updated {m.rows_updated}, "
-          f"unchanged {m.rows_unchanged}")
+    print(
+        f"Run 2: inserted {m.rows_inserted}, updated {m.rows_updated}, "
+        f"unchanged {m.rows_unchanged}"
+    )
