@@ -64,12 +64,30 @@ fn backend_config_sqlite_round_trips_with_location() {
     ));
 }
 
+/// Helper: construct a KafkaConfig with everything-default builder
+/// state. The Σ.B follow-up extended the struct to seven optional
+/// builder-state fields; tests that don't care about them use this
+/// helper to keep the noise down.
+fn kafka_config_minimal(bootstrap: &str, group_id: Option<&str>) -> KafkaConfig {
+    KafkaConfig {
+        bootstrap_servers: bootstrap.into(),
+        group_id: group_id.map(|s| s.into()),
+        auth: None,
+        payload_format: None,
+        delivery_semantics: None,
+        schema_registry_url: None,
+        schema_registry_basic_auth: None,
+        message_key_column: None,
+        batch_config: None,
+    }
+}
+
 #[test]
 fn kafka_config_round_trips_with_constructor_args() {
-    let cfg = BackendConfig::Kafka(KafkaConfig {
-        bootstrap_servers: "broker1:9092,broker2:9092".into(),
-        group_id: Some("ematix-readers".into()),
-    });
+    let cfg = BackendConfig::Kafka(kafka_config_minimal(
+        "broker1:9092,broker2:9092",
+        Some("ematix-readers"),
+    ));
     let json = serde_json::to_string(&cfg).expect("serialize");
     let recovered: BackendConfig = serde_json::from_str(&json).expect("deserialize");
     match recovered {
@@ -83,16 +101,135 @@ fn kafka_config_round_trips_with_constructor_args() {
 
 #[test]
 fn kafka_config_producer_only_has_no_group_id() {
-    let cfg = BackendConfig::Kafka(KafkaConfig {
-        bootstrap_servers: "broker:9092".into(),
-        group_id: None,
-    });
+    let cfg = BackendConfig::Kafka(kafka_config_minimal("broker:9092", None));
     let json = serde_json::to_string(&cfg).unwrap();
     let recovered: BackendConfig = serde_json::from_str(&json).unwrap();
     assert!(matches!(
         recovered,
         BackendConfig::Kafka(KafkaConfig { ref group_id, .. }) if group_id.is_none()
     ));
+}
+
+/// Σ.B follow-up: full Kafka builder-state round-trip. Exercises
+/// the auth + payload format + SR config + delivery semantics +
+/// message-key column + batch config fields end-to-end through
+/// serde JSON. backend_from_config() construction is exercised in
+/// `kafka_backend_from_config_applies_sasl_plain_auth` below.
+#[test]
+fn kafka_config_full_builder_state_round_trips_through_serde() {
+    use ematix_flow_core::backend::KafkaAuthConfig;
+    use ematix_flow_core::kafka_backend::{
+        KafkaBatchConfig, KafkaDeliverySemantics, KafkaPayloadFormat, ScramMechanism, SrBasicAuth,
+    };
+
+    let original = BackendConfig::Kafka(KafkaConfig {
+        bootstrap_servers: "broker1:9092".into(),
+        group_id: Some("readers".into()),
+        auth: Some(KafkaAuthConfig::SaslScram {
+            mechanism: ScramMechanism::Sha512,
+            username: "app".into(),
+            password: "s3cret".into(),
+        }),
+        payload_format: Some(KafkaPayloadFormat::Avro),
+        delivery_semantics: Some(KafkaDeliverySemantics::ExactlyOnce {
+            transactional_id: "ematix-flow-tx-01".into(),
+        }),
+        schema_registry_url: Some("https://sr.confluent.cloud".into()),
+        schema_registry_basic_auth: Some(SrBasicAuth {
+            username: "sr-user".into(),
+            password: "sr-pass".into(),
+        }),
+        message_key_column: Some("user_id".into()),
+        batch_config: Some(KafkaBatchConfig {
+            batch_size: 50_000,
+            batch_bytes: 8 * 1024 * 1024,
+            batch_window_ms: 1_000,
+            idle_timeout_ms: 2_000,
+        }),
+    });
+
+    let json = serde_json::to_string(&original).unwrap();
+    let recovered: BackendConfig = serde_json::from_str(&json).unwrap();
+    let inner = match recovered {
+        BackendConfig::Kafka(c) => c,
+        other => panic!("expected Kafka, got {other:?}"),
+    };
+
+    // Spot-check each field round-tripped.
+    match inner.auth.as_ref().unwrap() {
+        KafkaAuthConfig::SaslScram {
+            mechanism,
+            username,
+            password,
+        } => {
+            assert!(matches!(mechanism, ScramMechanism::Sha512));
+            assert_eq!(username, "app");
+            assert_eq!(password, "s3cret");
+        }
+        other => panic!("expected SaslScram, got {other:?}"),
+    }
+    assert!(matches!(
+        inner.payload_format,
+        Some(KafkaPayloadFormat::Avro)
+    ));
+    match inner.delivery_semantics.as_ref().unwrap() {
+        KafkaDeliverySemantics::ExactlyOnce { transactional_id } => {
+            assert_eq!(transactional_id, "ematix-flow-tx-01");
+        }
+        other => panic!("expected ExactlyOnce, got {other:?}"),
+    }
+    assert_eq!(
+        inner.schema_registry_url.as_deref(),
+        Some("https://sr.confluent.cloud")
+    );
+    let sra = inner.schema_registry_basic_auth.as_ref().unwrap();
+    assert_eq!(sra.username, "sr-user");
+    assert_eq!(sra.password, "sr-pass");
+    assert_eq!(inner.message_key_column.as_deref(), Some("user_id"));
+    let batch = inner.batch_config.as_ref().unwrap();
+    assert_eq!(batch.batch_size, 50_000);
+    assert_eq!(batch.batch_window_ms, 1_000);
+}
+
+/// Σ.B follow-up: backend_from_config(Kafka) applies the auth +
+/// other builder-state fields, and backend.config() round-trips
+/// them back. SASL/PLAIN is the simplest auth variant to verify
+/// without spinning up a real broker — librdkafka builds clients
+/// lazily so we can construct + inspect without a network round.
+#[tokio::test]
+async fn kafka_backend_from_config_applies_sasl_plain_auth() {
+    use ematix_flow_core::backend::KafkaAuthConfig;
+
+    let cfg = BackendConfig::Kafka(KafkaConfig {
+        bootstrap_servers: "broker:9092".into(),
+        group_id: Some("g".into()),
+        auth: Some(KafkaAuthConfig::SaslPlain {
+            username: "app".into(),
+            password: "pw".into(),
+        }),
+        payload_format: None,
+        delivery_semantics: None,
+        schema_registry_url: Some("http://sr:8081".into()),
+        schema_registry_basic_auth: None,
+        message_key_column: Some("user_id".into()),
+        batch_config: None,
+    });
+    let backend = backend_from_config(cfg).await.expect("construct");
+    let recovered = backend.config();
+    let c = match recovered {
+        BackendConfig::Kafka(c) => c,
+        other => panic!("expected Kafka, got {other:?}"),
+    };
+    assert_eq!(c.bootstrap_servers, "broker:9092");
+    match c.auth.as_ref().unwrap() {
+        KafkaAuthConfig::SaslPlain { username, password } => {
+            assert_eq!(username, "app");
+            assert_eq!(password, "pw");
+        }
+        other => panic!("expected SaslPlain, got {other:?}"),
+    }
+    assert_eq!(c.schema_registry_url.as_deref(), Some("http://sr:8081"));
+    assert_eq!(c.message_key_column.as_deref(), Some("user_id"));
 }
 
 // --- backend_from_config dispatch ---------------------------------

@@ -81,7 +81,7 @@ use crate::types::TableSpec;
 /// caps, a 5s window, a 5s idle timeout. The first-message wait is
 /// still bumped to 15s internally so a fresh broker has time to
 /// rebalance — that's a separate clock from these batch limits.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct KafkaBatchConfig {
     pub batch_size: usize,
     pub batch_bytes: usize,
@@ -114,7 +114,8 @@ impl Default for KafkaBatchConfig {
 /// Schema Registry by ID, decodes into the target's Arrow
 /// dialect; encode does the symmetric reverse + schema
 /// registration on first produce.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum KafkaPayloadFormat {
     /// One JSON object per message. Decodes to N rows with the
     /// inferred schema; encodes each Arrow row as a JSON object.
@@ -157,7 +158,8 @@ const RAW_BYTES_COLUMN: &str = "payload";
 /// Consumer-coordinated EOS via `send_offsets_to_transaction` (the
 /// full Kafka→Kafka read-process-write exactly-once flow) is a
 /// follow-up — see Phase 36j.2.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum KafkaDeliverySemantics {
     #[default]
     AtLeastOnce,
@@ -204,7 +206,8 @@ impl std::fmt::Debug for ProducerSession {
 /// SCRAM mechanisms supported by librdkafka. Most cloud providers
 /// run SHA-512 by default; some self-hosted deployments still use
 /// SHA-256.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ScramMechanism {
     Sha256,
     Sha512,
@@ -224,7 +227,7 @@ impl ScramMechanism {
 /// bundle); `cert_location` and `key_location` are the client cert
 /// and its private key. `key_password` is for password-protected
 /// keys.
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct TlsAuth {
     pub ca_location: String,
     pub cert_location: String,
@@ -262,6 +265,13 @@ impl std::fmt::Debug for TlsAuth {
 /// The framework treats Confluent Cloud, self-hosted SASL, AWS MSK,
 /// and mTLS-enabled deployments as sibling first-class auth modes —
 /// none privileged in the API.
+// Σ.B follow-up: `AuthMode` itself stays private (the live state
+// is internal to KafkaBackend), but the `From<&AuthMode> for
+// KafkaAuthConfig` impl below maps it to the public, serializable
+// `crate::backend::KafkaAuthConfig` so `Backend::config()` can
+// round-trip the auth surface. The reverse direction
+// (`KafkaAuthConfig` → builder calls) lives in `backend_from_config`
+// where it dispatches via the existing public with_* methods.
 #[derive(Clone, Default)]
 enum AuthMode {
     /// No auth. SASL_PLAINTEXT or PLAINTEXT depending on whether
@@ -287,6 +297,33 @@ enum AuthMode {
     /// `generate_oauth_token` callback that mints MSK IAM tokens
     /// via SigV4 and refreshes them at ~80% of TTL.
     MskIam { region: String },
+}
+
+impl From<&AuthMode> for crate::backend::KafkaAuthConfig {
+    fn from(am: &AuthMode) -> Self {
+        match am {
+            AuthMode::None => crate::backend::KafkaAuthConfig::None,
+            AuthMode::SaslPlain { username, password } => {
+                crate::backend::KafkaAuthConfig::SaslPlain {
+                    username: username.clone(),
+                    password: password.clone(),
+                }
+            }
+            AuthMode::SaslScram {
+                mechanism,
+                username,
+                password,
+            } => crate::backend::KafkaAuthConfig::SaslScram {
+                mechanism: *mechanism,
+                username: username.clone(),
+                password: password.clone(),
+            },
+            AuthMode::Tls(tls) => crate::backend::KafkaAuthConfig::Tls(tls.clone()),
+            AuthMode::MskIam { region } => crate::backend::KafkaAuthConfig::MskIam {
+                region: region.clone(),
+            },
+        }
+    }
 }
 
 /// Hand-written `Debug` for `AuthMode` that redacts every secret-
@@ -1297,30 +1334,22 @@ impl Backend for KafkaBackend {
     }
 
     fn config(&self) -> crate::backend::BackendConfig {
-        // Σ.B PR 1 commit d: constructor-args round-trip only.
-        // Builder-set state (auth, payload_format, schema_registry,
-        // delivery_semantics, message_key_column, batch_config)
-        // round-trip lands as a Σ.B PR 2 follow-up. Panic loudly
-        // if any non-default builder state is set so users hit a
-        // clear error instead of a silently degraded backend.
-        let has_non_default_state = !matches!(self.auth, AuthMode::None)
-            || !matches!(self.payload_format, KafkaPayloadFormat::Json)
-            || !matches!(self.delivery_semantics, KafkaDeliverySemantics::AtLeastOnce)
-            || self.schema_registry_url.is_some()
-            || self.schema_registry_basic_auth.is_some()
-            || self.message_key_column.is_some();
-        if has_non_default_state {
-            panic!(
-                "KafkaBackend::config() called on an instance with non-default builder \
-                 state (auth, payload format, schema registry, delivery semantics, or \
-                 message-key column). Constructor-args round-trip ships in Σ.B PR 1 \
-                 commit d; full builder-state round-trip lands in Σ.B PR 2 — see \
-                 docs/PHASE_SIGMA_B_TRAIT_SPIKE.md."
-            );
-        }
+        // Σ.B follow-up: full builder-state round-trip. Every
+        // configurable knob lands in the BackendConfig — auth,
+        // payload format, SR config, delivery semantics, message-
+        // key column, batch tuning. The internal AuthMode enum is
+        // mapped to the public KafkaAuthConfig mirror via the
+        // From impl below.
         crate::backend::BackendConfig::Kafka(crate::backend::KafkaConfig {
             bootstrap_servers: self.bootstrap_servers.clone(),
             group_id: self.group_id.clone(),
+            auth: Some((&self.auth).into()),
+            payload_format: Some(self.payload_format),
+            delivery_semantics: Some(self.delivery_semantics.clone()),
+            schema_registry_url: self.schema_registry_url.clone(),
+            schema_registry_basic_auth: self.schema_registry_basic_auth.clone(),
+            message_key_column: self.message_key_column.clone(),
+            batch_config: Some(self.batch_config),
         })
     }
 
@@ -2062,7 +2091,7 @@ fn encode_batch_as_raw_bytes(batch: &RecordBatch) -> Result<Vec<Vec<u8>>, Backen
 /// redacts the password. Wrapper around `(username, password)` so
 /// the redaction is automatic anywhere this lands inside a
 /// `#[derive(Debug)]` struct.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SrBasicAuth {
     pub username: String,
     pub password: String,

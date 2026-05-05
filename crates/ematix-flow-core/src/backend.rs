@@ -591,7 +591,14 @@ pub enum DeltaLocation {
 // backends panics if any non-default builder state has been set on
 // the live instance, with a pointer at the follow-up.
 
-/// Σ.B PR 1 commit d: Kafka constructor args.
+/// Σ.B PR 1 commit d + follow-up: Kafka backend config.
+///
+/// Constructor args (`bootstrap_servers`, `group_id`) ship in PR 1
+/// commit d. The Σ.B follow-up extends this struct with the rest
+/// of the builder-set state (auth, payload format, schema registry,
+/// delivery semantics, message-key column, batch tuning) so a
+/// fully-configured `KafkaBackend` round-trips through serde JSON
+/// + `backend_from_config`.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct KafkaConfig {
     /// `host1:9092,host2:9092` form expected by librdkafka.
@@ -600,6 +607,67 @@ pub struct KafkaConfig {
     /// a target).
     #[serde(default)]
     pub group_id: Option<String>,
+
+    /// Authentication mode. `None` = `KafkaAuthConfig::None`
+    /// (PLAINTEXT). Inline credentials per the spike's locked
+    /// decision; same trust boundary as Postgres DSN passwords.
+    #[serde(default)]
+    pub auth: Option<KafkaAuthConfig>,
+
+    /// Wire format for Kafka message payloads. `None` =
+    /// `KafkaPayloadFormat::Json` (the default).
+    #[serde(default)]
+    pub payload_format: Option<crate::kafka_backend::KafkaPayloadFormat>,
+
+    /// Producer-side delivery semantics. `None` =
+    /// `KafkaDeliverySemantics::AtLeastOnce` (the default).
+    #[serde(default)]
+    pub delivery_semantics: Option<crate::kafka_backend::KafkaDeliverySemantics>,
+
+    /// Confluent Schema Registry URL. Required for Avro / Protobuf
+    /// payload formats; ignored for JSON / RawBytes.
+    #[serde(default)]
+    pub schema_registry_url: Option<String>,
+
+    /// SR basic-auth credentials. Confluent Cloud uses an API key
+    /// (username) + API secret (password) pair here.
+    #[serde(default)]
+    pub schema_registry_basic_auth: Option<crate::kafka_backend::SrBasicAuth>,
+
+    /// Per-row Kafka message-key column. `None` = round-robin
+    /// (default sticky partitioner).
+    #[serde(default)]
+    pub message_key_column: Option<String>,
+
+    /// Per-call drain limits for `read_arrow_stream`. `None` =
+    /// `KafkaBatchConfig::default()`.
+    #[serde(default)]
+    pub batch_config: Option<crate::kafka_backend::KafkaBatchConfig>,
+}
+
+/// Σ.B follow-up: serializable mirror of the private
+/// `kafka_backend::AuthMode`. `KafkaBackend`'s with_sasl_plain /
+/// with_sasl_scram / with_tls / with_msk_iam builder methods
+/// take the same arguments these variants carry; `backend_from_
+/// config` invokes the right one based on the variant.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum KafkaAuthConfig {
+    /// No SASL — broker speaks PLAINTEXT.
+    None,
+    /// SASL/PLAIN over SSL. Confluent Cloud's primary auth mode.
+    SaslPlain { username: String, password: String },
+    /// SASL/SCRAM over SSL.
+    SaslScram {
+        mechanism: crate::kafka_backend::ScramMechanism,
+        username: String,
+        password: String,
+    },
+    /// mTLS — broker authenticates the client by certificate.
+    Tls(crate::kafka_backend::TlsAuth),
+    /// AWS MSK IAM. The Rust-side OAUTHBEARER refresh callback
+    /// mints SigV4 tokens for the named region.
+    MskIam { region: String },
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -765,9 +833,50 @@ pub async fn backend_from_config(
             }
             Ok(std::sync::Arc::new(backend))
         }
-        BackendConfig::Kafka(c) => Ok(std::sync::Arc::new(
-            crate::kafka_backend::KafkaBackend::open(c.bootstrap_servers, c.group_id.as_deref())?,
-        )),
+        BackendConfig::Kafka(c) => {
+            // Σ.B follow-up: full builder-state round-trip. Apply
+            // each optional knob in turn via the existing public
+            // with_* methods.
+            let mut backend = crate::kafka_backend::KafkaBackend::open(
+                c.bootstrap_servers,
+                c.group_id.as_deref(),
+            )?;
+            if let Some(auth) = c.auth {
+                backend = match auth {
+                    KafkaAuthConfig::None => backend,
+                    KafkaAuthConfig::SaslPlain { username, password } => {
+                        backend.with_sasl_plain(username, password)
+                    }
+                    KafkaAuthConfig::SaslScram {
+                        mechanism,
+                        username,
+                        password,
+                    } => backend.with_sasl_scram(mechanism, username, password),
+                    KafkaAuthConfig::Tls(tls) => backend.with_tls(tls),
+                    KafkaAuthConfig::MskIam { region } => backend.with_msk_iam(region),
+                };
+            }
+            if let Some(fmt) = c.payload_format {
+                backend = backend.with_payload_format(fmt);
+            }
+            if let Some(sem) = c.delivery_semantics {
+                backend = backend.with_delivery_semantics(sem);
+            }
+            if let Some(url) = c.schema_registry_url {
+                backend = backend.with_schema_registry_url(url);
+            }
+            if let Some(sr_auth) = c.schema_registry_basic_auth {
+                backend =
+                    backend.with_schema_registry_basic_auth(sr_auth.username, sr_auth.password);
+            }
+            if let Some(col) = c.message_key_column {
+                backend = backend.with_message_key_column(col);
+            }
+            if let Some(batch) = c.batch_config {
+                backend = backend.with_batch_config(batch);
+            }
+            Ok(std::sync::Arc::new(backend))
+        }
         BackendConfig::Kinesis(c) => {
             // Σ.B follow-up: apply the optional builder-state knobs
             // before handing back the backend. Each is a no-op if
