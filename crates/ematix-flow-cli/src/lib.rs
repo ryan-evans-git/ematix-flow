@@ -441,6 +441,30 @@ pub struct TransformConfig {
     /// without reaching the panic site.
     #[serde(default)]
     pub dialect: Option<String>,
+
+    /// Σ.B PR 2: execution engine for the SQL pre-stage. Accepted
+    /// values: `"datafusion"` (default, single-process; what every
+    /// pipeline used pre-Σ.B) or `"distributed"` (peer-to-peer
+    /// fan-out via `crates/ematix-flow-distributed`). `None` is
+    /// treated as `"datafusion"`.
+    ///
+    /// Validated at config-load via `validate_transform_engine`.
+    /// Σ.B PR 2 commit 4 only wires this through the parser +
+    /// validator; the pipeline-build path that actually swaps
+    /// `LazySqlTransform` for the distributed backend lands in
+    /// commit 5 alongside the docker-compose example. Until then
+    /// `engine = "distributed"` is accepted but logs a warning
+    /// pointing at the follow-up.
+    #[serde(default)]
+    pub engine: Option<String>,
+
+    /// Σ.B PR 2: peer worker URLs when `engine = "distributed"`.
+    /// Each entry is parsed with `url::Url` at config-load. Empty
+    /// is legal (degenerate single-worker cluster, useful for
+    /// local dev) but emits a warning. Ignored when
+    /// `engine != "distributed"`.
+    #[serde(default)]
+    pub peers: Vec<String>,
 }
 
 fn default_transform_on_error() -> String {
@@ -1642,6 +1666,7 @@ impl PipelineCliConfig {
         cfg.validate_join_config()?;
         cfg.validate_transform_on_error()?;
         cfg.validate_transform_dialect()?;
+        cfg.validate_transform_engine()?;
         cfg.warn_on_stateful_in_memory_store();
         Ok(cfg)
     }
@@ -1661,6 +1686,61 @@ impl PipelineCliConfig {
         s.parse::<ematix_flow_core::dialect::Dialect>()
             .map(|_| ())
             .map_err(|e| ConfigError::Parse(format!("[transform] {e}")))
+    }
+
+    /// Σ.B PR 2 commit 4: validate `[transform] engine` value and
+    /// peer-URL well-formedness. Accepted values: `"datafusion"` |
+    /// `"distributed"`. Empty / absent = `"datafusion"`. Each entry
+    /// in `peers` must be a parseable `url::Url`.
+    fn validate_transform_engine(&self) -> Result<(), ConfigError> {
+        let Some(t) = &self.transform else {
+            return Ok(());
+        };
+        if let Some(engine) = t.engine.as_deref() {
+            match engine {
+                "datafusion" | "distributed" => {}
+                other => {
+                    return Err(ConfigError::Parse(format!(
+                        "[transform] engine = {other:?} not supported \
+                         (use \"datafusion\" or \"distributed\")"
+                    )));
+                }
+            }
+        }
+        // `peers` only meaningful when engine = "distributed"; cross-
+        // validate so a stray peers list under engine = "datafusion"
+        // doesn't silently get ignored.
+        let engine_is_distributed = t.engine.as_deref() == Some("distributed");
+        if !t.peers.is_empty() && !engine_is_distributed {
+            return Err(ConfigError::Parse(
+                "[transform] peers = [...] is only meaningful when \
+                 engine = \"distributed\""
+                    .into(),
+            ));
+        }
+        // URL well-formedness — fail fast at config-load.
+        for (i, raw) in t.peers.iter().enumerate() {
+            url::Url::parse(raw).map_err(|e| {
+                ConfigError::Parse(format!(
+                    "[transform] peers[{i}] = {raw:?} is not a valid URL: {e}"
+                ))
+            })?;
+        }
+        // Σ.B PR 2 commit 4: actual SQL routing through the
+        // distributed backend lands in commit 5 alongside the
+        // docker-compose example. Until then, log a warning so a
+        // user who picks `engine = "distributed"` knows their config
+        // parsed but isn't doing anything different yet.
+        if engine_is_distributed {
+            tracing::warn!(
+                peer_count = t.peers.len(),
+                "[transform] engine = \"distributed\" is accepted but the \
+                 pipeline-build path still routes through in-process \
+                 DataFusion. Real distributed execution lands in Σ.B PR 2 \
+                 commit 5 (see docs/PHASE_SIGMA_PLAN.md)."
+            );
+        }
+        Ok(())
     }
 
     /// Phase 39.5a P2.15: validate `[transform] on_error` value.
@@ -3576,6 +3656,154 @@ mod tests {
         };
         let scfg = cfg.streaming_config_with_lookups(table, Vec::new());
         assert!(scfg.transform.is_some());
+    }
+
+    // ----- Σ.B PR 2 commit 4: distributed engine -----
+
+    #[test]
+    fn transform_engine_default_is_none() {
+        let toml = r#"
+            pipeline_name = "p"
+            source_query = "events"
+            [source]
+            kind = "kafka"
+            bootstrap_servers = "localhost:9092"
+            [target]
+            kind = "sqlite"
+            path = ":memory:"
+            [target.table]
+            name = "out"
+            [transform]
+            sql = "SELECT * FROM source"
+        "#;
+        let cfg = PipelineCliConfig::from_toml_str(toml).unwrap();
+        let t = cfg.transform.as_ref().unwrap();
+        assert!(t.engine.is_none());
+        assert!(t.peers.is_empty());
+    }
+
+    #[test]
+    fn transform_engine_datafusion_parses() {
+        let toml = r#"
+            pipeline_name = "p"
+            source_query = "events"
+            [source]
+            kind = "kafka"
+            bootstrap_servers = "localhost:9092"
+            [target]
+            kind = "sqlite"
+            path = ":memory:"
+            [target.table]
+            name = "out"
+            [transform]
+            sql = "SELECT * FROM source"
+            engine = "datafusion"
+        "#;
+        let cfg = PipelineCliConfig::from_toml_str(toml).unwrap();
+        assert_eq!(
+            cfg.transform.as_ref().unwrap().engine.as_deref(),
+            Some("datafusion")
+        );
+    }
+
+    #[test]
+    fn transform_engine_distributed_parses_with_peers() {
+        let toml = r#"
+            pipeline_name = "p"
+            source_query = "events"
+            [source]
+            kind = "kafka"
+            bootstrap_servers = "localhost:9092"
+            [target]
+            kind = "sqlite"
+            path = ":memory:"
+            [target.table]
+            name = "out"
+            [transform]
+            sql = "SELECT * FROM source"
+            engine = "distributed"
+            peers = [
+                "http://flow-01.cluster.local:50051",
+                "http://flow-02.cluster.local:50051",
+            ]
+        "#;
+        let cfg = PipelineCliConfig::from_toml_str(toml).unwrap();
+        let t = cfg.transform.as_ref().unwrap();
+        assert_eq!(t.engine.as_deref(), Some("distributed"));
+        assert_eq!(t.peers.len(), 2);
+    }
+
+    #[test]
+    fn transform_engine_rejects_unknown_at_config_load() {
+        let toml = r#"
+            pipeline_name = "p"
+            source_query = "events"
+            [source]
+            kind = "kafka"
+            bootstrap_servers = "localhost:9092"
+            [target]
+            kind = "sqlite"
+            path = ":memory:"
+            [target.table]
+            name = "out"
+            [transform]
+            sql = "SELECT * FROM source"
+            engine = "ballista"
+        "#;
+        let err = PipelineCliConfig::from_toml_str(toml).expect_err("ballista unknown");
+        let msg = format!("{err}");
+        assert!(msg.contains("ballista"), "echo bad input; got: {msg}");
+        assert!(
+            msg.contains("datafusion") || msg.contains("distributed"),
+            "list valid options; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn transform_engine_rejects_invalid_peer_url() {
+        let toml = r#"
+            pipeline_name = "p"
+            source_query = "events"
+            [source]
+            kind = "kafka"
+            bootstrap_servers = "localhost:9092"
+            [target]
+            kind = "sqlite"
+            path = ":memory:"
+            [target.table]
+            name = "out"
+            [transform]
+            sql = "SELECT * FROM source"
+            engine = "distributed"
+            peers = ["not a url"]
+        "#;
+        let err = PipelineCliConfig::from_toml_str(toml).expect_err("bad URL");
+        let msg = format!("{err}");
+        assert!(msg.contains("peers[0]"), "name the bad index; got: {msg}");
+    }
+
+    /// Cross-validation: peers under engine = "datafusion" is a
+    /// silent-no-op trap. Reject at config-load so the user knows
+    /// they need to set engine = "distributed".
+    #[test]
+    fn transform_engine_rejects_peers_without_distributed_engine() {
+        let toml = r#"
+            pipeline_name = "p"
+            source_query = "events"
+            [source]
+            kind = "kafka"
+            bootstrap_servers = "localhost:9092"
+            [target]
+            kind = "sqlite"
+            path = ":memory:"
+            [target.table]
+            name = "out"
+            [transform]
+            sql = "SELECT * FROM source"
+            peers = ["http://flow-01:50051"]
+        "#;
+        let err = PipelineCliConfig::from_toml_str(toml).expect_err("orphan peers");
+        assert!(format!("{err}").contains("engine"));
     }
 
     #[test]

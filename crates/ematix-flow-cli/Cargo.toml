@@ -33,6 +33,9 @@ prometheus = { workspace = true }
 arrow-array = { workspace = true }
 arrow-schema = { workspace = true }
 futures-util = { workspace = true }
+# Σ.B PR 2 commit 4: validating `[transform] peers = [...]` URL
+# well-formedness at config-load.
+url = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
