@@ -20,9 +20,10 @@
 //! Plan + spike: `docs/PHASE_SIGMA_PLAN.md` Σ.B + `docs/PHASE_SIGMA_B_TRAIT_SPIKE.md`.
 
 use ematix_flow_core::backend::{
-    BackendConfig, DeltaConfig, DeltaLocation, DuckDbConfig, MySqlConfig, ObjectFormat,
-    ObjectStoreConfig, ObjectStoreLocation, ObjectWriteOptions, ParquetCompression, PostgresConfig,
-    SqliteConfig, backend_from_config,
+    BackendConfig, DeltaConfig, DeltaLocation, DuckDbConfig, KafkaConfig, KinesisConfig,
+    MySqlConfig, ObjectFormat, ObjectStoreConfig, ObjectStoreLocation, ObjectWriteOptions,
+    ParquetCompression, PostgresConfig, PubSubConfig, RabbitMqConfig, SqliteConfig,
+    backend_from_config,
 };
 
 // --- JSON round-trip ----------------------------------------------
@@ -64,14 +65,34 @@ fn backend_config_sqlite_round_trips_with_location() {
 }
 
 #[test]
-fn backend_config_kafka_unit_variant_still_serializes() {
-    // Streaming variants (Kafka / Kinesis / Pub/Sub / RabbitMq) +
-    // ObjectStore + Delta stay as unit variants until commits c/d
-    // populate them. JSON-tagged unit variants emit just the
-    // discriminator.
-    let cfg = BackendConfig::Kafka;
-    let json = serde_json::to_string(&cfg).expect("serialize Kafka");
-    assert_eq!(json, r#"{"kind":"kafka"}"#);
+fn kafka_config_round_trips_with_constructor_args() {
+    let cfg = BackendConfig::Kafka(KafkaConfig {
+        bootstrap_servers: "broker1:9092,broker2:9092".into(),
+        group_id: Some("ematix-readers".into()),
+    });
+    let json = serde_json::to_string(&cfg).expect("serialize");
+    let recovered: BackendConfig = serde_json::from_str(&json).expect("deserialize");
+    match recovered {
+        BackendConfig::Kafka(c) => {
+            assert_eq!(c.bootstrap_servers, "broker1:9092,broker2:9092");
+            assert_eq!(c.group_id.as_deref(), Some("ematix-readers"));
+        }
+        other => panic!("expected Kafka, got {other:?}"),
+    }
+}
+
+#[test]
+fn kafka_config_producer_only_has_no_group_id() {
+    let cfg = BackendConfig::Kafka(KafkaConfig {
+        bootstrap_servers: "broker:9092".into(),
+        group_id: None,
+    });
+    let json = serde_json::to_string(&cfg).unwrap();
+    let recovered: BackendConfig = serde_json::from_str(&json).unwrap();
+    assert!(matches!(
+        recovered,
+        BackendConfig::Kafka(KafkaConfig { ref group_id, .. }) if group_id.is_none()
+    ));
 }
 
 // --- backend_from_config dispatch ---------------------------------
@@ -104,18 +125,46 @@ async fn backend_from_config_constructs_duckdb_in_memory() {
     }
 }
 
+/// Streaming-backend constructors that don't reach a remote service
+/// can be exercised without TestContainers. Kinesis / PubSub /
+/// RabbitMQ all defer the real connection to `ping()` / first IO,
+/// so building from config is synchronous + offline. Kafka's
+/// `open()` likewise builds librdkafka clients lazily.
 #[tokio::test]
-async fn backend_from_config_returns_not_implemented_for_kafka() {
-    // Streaming variants still error out — commit d will wire them.
-    match backend_from_config(BackendConfig::Kafka).await {
-        Ok(_) => panic!("Kafka should not yet be wired"),
-        Err(err) => {
-            let msg = format!("{err}");
-            assert!(
-                msg.to_lowercase().contains("not yet"),
-                "must signal incomplete migration; got: {msg}"
-            );
+async fn backend_from_config_constructs_kinesis_offline() {
+    let cfg = BackendConfig::Kinesis(KinesisConfig {
+        stream_name: "events".into(),
+    });
+    let backend = backend_from_config(cfg).await.expect("construct");
+    match backend.config() {
+        BackendConfig::Kinesis(c) => assert_eq!(c.stream_name, "events"),
+        other => panic!("expected Kinesis, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn backend_from_config_constructs_pubsub_offline() {
+    let cfg = BackendConfig::PubSub(PubSubConfig {
+        project_id: "demo-project".into(),
+    });
+    let backend = backend_from_config(cfg).await.expect("construct");
+    match backend.config() {
+        BackendConfig::PubSub(c) => assert_eq!(c.project_id, "demo-project"),
+        other => panic!("expected PubSub, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn backend_from_config_constructs_rabbitmq_offline() {
+    let cfg = BackendConfig::RabbitMq(RabbitMqConfig {
+        amqp_url: "amqp://guest:guest@localhost:5672/%2f".into(),
+    });
+    let backend = backend_from_config(cfg).await.expect("construct");
+    match backend.config() {
+        BackendConfig::RabbitMq(c) => {
+            assert_eq!(c.amqp_url, "amqp://guest:guest@localhost:5672/%2f");
         }
+        other => panic!("expected RabbitMq, got {other:?}"),
     }
 }
 

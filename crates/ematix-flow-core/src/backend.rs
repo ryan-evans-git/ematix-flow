@@ -459,10 +459,10 @@ pub enum BackendConfig {
     MySql(MySqlConfig),
     Sqlite(SqliteConfig),
     DuckDb(DuckDbConfig),
-    Kafka,
-    Kinesis,
-    PubSub,
-    RabbitMq,
+    Kafka(KafkaConfig),
+    Kinesis(KinesisConfig),
+    PubSub(PubSubConfig),
+    RabbitMq(RabbitMqConfig),
     Delta(DeltaConfig),
     ObjectStore(ObjectStoreConfig),
 }
@@ -570,6 +570,46 @@ pub enum DeltaLocation {
     },
 }
 
+// Σ.B PR 1 commit d: streaming backend configs.
+//
+// Scope is constructor-args-only: each `<Backend>Config` carries
+// the parameters passed to `open()`. Builder-state (auth, payload
+// format, SR config, batch tuning, partition keys) is *not* yet
+// captured in the config — that lands in a Σ.B PR 2 follow-up
+// once we know which knobs Ballista users actually need to ship.
+//
+// To prevent silent data loss, `Backend::config()` for these
+// backends panics if any non-default builder state has been set on
+// the live instance, with a pointer at the follow-up.
+
+/// Σ.B PR 1 commit d: Kafka constructor args.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct KafkaConfig {
+    /// `host1:9092,host2:9092` form expected by librdkafka.
+    pub bootstrap_servers: String,
+    /// Consumer group_id. `None` = producer-only backend (Kafka as
+    /// a target).
+    #[serde(default)]
+    pub group_id: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct KinesisConfig {
+    pub stream_name: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PubSubConfig {
+    pub project_id: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct RabbitMqConfig {
+    /// Full AMQP URL — `amqp://user:pass@host:port/vhost` or its
+    /// `amqps://` TLS counterpart.
+    pub amqp_url: String,
+}
+
 /// Σ.D-ready partitioning-hint placeholder. Return type for
 /// [`Backend::partitioning_hint`]; concrete shape (range / hash /
 /// per-source-partition) gets locked in Σ.D once the dominant
@@ -665,14 +705,18 @@ pub async fn backend_from_config(
             }
             Ok(std::sync::Arc::new(backend))
         }
-        not_yet @ (BackendConfig::Kafka
-        | BackendConfig::Kinesis
-        | BackendConfig::PubSub
-        | BackendConfig::RabbitMq) => Err(BackendError::Other(format!(
-            "backend_from_config({not_yet:?}) not yet implemented — \
-             Σ.B PR 1 commit d wires the streaming backends. \
-             See docs/PHASE_SIGMA_B_TRAIT_SPIKE.md."
-        ))),
+        BackendConfig::Kafka(c) => Ok(std::sync::Arc::new(
+            crate::kafka_backend::KafkaBackend::open(c.bootstrap_servers, c.group_id.as_deref())?,
+        )),
+        BackendConfig::Kinesis(c) => Ok(std::sync::Arc::new(
+            crate::kinesis_backend::KinesisBackend::open(c.stream_name)?,
+        )),
+        BackendConfig::PubSub(c) => Ok(std::sync::Arc::new(
+            crate::pubsub_backend::PubSubBackend::open(c.project_id)?,
+        )),
+        BackendConfig::RabbitMq(c) => Ok(std::sync::Arc::new(
+            crate::rabbitmq_backend::RabbitMQBackend::open(c.amqp_url)?,
+        )),
     }
 }
 

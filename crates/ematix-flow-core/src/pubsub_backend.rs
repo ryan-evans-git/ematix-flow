@@ -417,6 +417,22 @@ impl Backend for PubSubBackend {
         Some(format!("pubsub://{}", self.project_id))
     }
 
+    fn config(&self) -> crate::backend::BackendConfig {
+        // Σ.B PR 1 commit d: constructor args (project_id) only.
+        // Endpoint + anonymous_auth + batch_config round-trip ships
+        // in Σ.B PR 2.
+        if self.endpoint.is_some() || self.anonymous_auth {
+            panic!(
+                "PubSubBackend::config() called with non-default builder state \
+                 (endpoint / anonymous_auth). Full round-trip ships in Σ.B PR 2 — \
+                 see docs/PHASE_SIGMA_B_TRAIT_SPIKE.md."
+            );
+        }
+        crate::backend::BackendConfig::PubSub(crate::backend::PubSubConfig {
+            project_id: self.project_id.clone(),
+        })
+    }
+
     /// Construct a `TopicAdmin` client and list topics in the
     /// project — under a 5s timeout. Validates that the auth chain
     /// resolves and the endpoint is reachable, without requiring

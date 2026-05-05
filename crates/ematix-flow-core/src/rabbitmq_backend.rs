@@ -383,6 +383,21 @@ impl Backend for RabbitMQBackend {
         Some(self.amqp_url.clone())
     }
 
+    fn config(&self) -> crate::backend::BackendConfig {
+        // Σ.B PR 1 commit d: constructor args only. consumer_tag +
+        // batch_config round-trip ships in Σ.B PR 2.
+        if self.consumer_tag != "ematix-flow-consumer" {
+            panic!(
+                "RabbitMQBackend::config() called with a non-default consumer_tag. \
+                 Full round-trip ships in Σ.B PR 2 — see \
+                 docs/PHASE_SIGMA_B_TRAIT_SPIKE.md."
+            );
+        }
+        crate::backend::BackendConfig::RabbitMq(crate::backend::RabbitMqConfig {
+            amqp_url: self.amqp_url.clone(),
+        })
+    }
+
     /// Connect, open a channel, close — all under a short timeout.
     /// `lapin` validates the URI here for the first time; a malformed
     /// URI surfaces as `BackendError::Connection`.

@@ -1296,6 +1296,34 @@ impl Backend for KafkaBackend {
         Some(self.bootstrap_servers.clone())
     }
 
+    fn config(&self) -> crate::backend::BackendConfig {
+        // Σ.B PR 1 commit d: constructor-args round-trip only.
+        // Builder-set state (auth, payload_format, schema_registry,
+        // delivery_semantics, message_key_column, batch_config)
+        // round-trip lands as a Σ.B PR 2 follow-up. Panic loudly
+        // if any non-default builder state is set so users hit a
+        // clear error instead of a silently degraded backend.
+        let has_non_default_state = !matches!(self.auth, AuthMode::None)
+            || !matches!(self.payload_format, KafkaPayloadFormat::Json)
+            || !matches!(self.delivery_semantics, KafkaDeliverySemantics::AtLeastOnce)
+            || self.schema_registry_url.is_some()
+            || self.schema_registry_basic_auth.is_some()
+            || self.message_key_column.is_some();
+        if has_non_default_state {
+            panic!(
+                "KafkaBackend::config() called on an instance with non-default builder \
+                 state (auth, payload format, schema registry, delivery semantics, or \
+                 message-key column). Constructor-args round-trip ships in Σ.B PR 1 \
+                 commit d; full builder-state round-trip lands in Σ.B PR 2 — see \
+                 docs/PHASE_SIGMA_B_TRAIT_SPIKE.md."
+            );
+        }
+        crate::backend::BackendConfig::Kafka(crate::backend::KafkaConfig {
+            bootstrap_servers: self.bootstrap_servers.clone(),
+            group_id: self.group_id.clone(),
+        })
+    }
+
     /// Liveness check via metadata fetch on an `AdminClient`. A
     /// successful metadata response means: brokers reachable, auth
     /// (if any) negotiated, cluster ID retrievable.

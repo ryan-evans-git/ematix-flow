@@ -473,6 +473,22 @@ impl Backend for KinesisBackend {
         Some(format!("kinesis://{}", self.stream_name))
     }
 
+    fn config(&self) -> crate::backend::BackendConfig {
+        // Σ.B PR 1 commit d: constructor-args only (region /
+        // endpoint / static_credentials / batch_config land in
+        // Σ.B PR 2). Panic if any builder-set state is non-default.
+        if self.region.is_some() || self.endpoint.is_some() || self.static_credentials.is_some() {
+            panic!(
+                "KinesisBackend::config() called on an instance with non-default builder \
+                 state (region / endpoint / static credentials). Full round-trip ships \
+                 in Σ.B PR 2 — see docs/PHASE_SIGMA_B_TRAIT_SPIKE.md."
+            );
+        }
+        crate::backend::BackendConfig::Kinesis(crate::backend::KinesisConfig {
+            stream_name: self.stream_name.clone(),
+        })
+    }
+
     /// Build a Kinesis client and call `list_streams()` under a 5s
     /// timeout. Validates credentials + endpoint reachability
     /// without requiring the bound stream to exist.
