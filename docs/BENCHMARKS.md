@@ -119,15 +119,18 @@ Same M3 Pro / criterion (`sample_size = 10`,
 `measurement_time = 10s`, warm-up 3s); SF=10 dataset (3.2 GB
 across 8 Snappy Parquet files; lineitem 2.1 GB / 60 M rows).
 
-| Query | DF (1-node) | distributed-of-one | 3 in-process workers | of_one delta | 3-worker delta |
+| Query | DF (1-node) | distributed-of-one | 3 in-process workers | PySpark | DF / PySpark |
 |---|---|---|---|---|---|
-| Q1  | **323.0 ms** [313.9 / 331.4] | **282.5 ms** [279.7 / 284.9] | **314.9 ms** [310.9 / 318.9] | −12.5%        | −2.5%         |
-| Q3  | **233.2 ms** [228.8 / 238.5] | **217.8 ms** [215.3 / 220.0] | **228.1 ms** [224.3 / 231.5] | −6.6%         | −2.2%         |
-| Q6  | **116.1 ms** [115.0 / 121.4] | **109.3 ms** [108.5 / 112.3] | **109.3 ms** [106.3 / 112.0] | −5.9%         | −5.9%         |
-| Q19 | **211.7 ms** [207.4 / 223.4] | **206.3 ms** [198.1 / 209.3] | **201.5 ms** [194.4 / 204.0] | −2.6%         | −4.8%         |
+| Q1  | **323.0 ms** [313.9 / 331.4] | **282.5 ms** [279.7 / 284.9] | **314.9 ms** [310.9 / 318.9] | **1318.2 ms** [1172 / 1909] | **0.245** (DF 4.08× faster) |
+| Q3  | **233.2 ms** [228.8 / 238.5] | **217.8 ms** [215.3 / 220.0] | **228.1 ms** [224.3 / 231.5] | **2146.4 ms** [2118 / 2687] | **0.109** (DF 9.21× faster) |
+| Q6  | **116.1 ms** [115.0 / 121.4] | **109.3 ms** [108.5 / 112.3] | **109.3 ms** [106.3 / 112.0] | **200.4 ms**  [195 / 269]   | **0.579** (DF 1.73× faster) |
+| Q19 | **211.7 ms** [207.4 / 223.4] | **206.3 ms** [198.1 / 209.3] | **201.5 ms** [194.4 / 204.0] | **482.7 ms**  [399 / 611]   | **0.439** (DF 2.28× faster) |
 
-(median, [low / high] from criterion's bootstrap CI; deltas
-relative to single-node DataFusion median.)
+(DataFusion / distributed columns: median, [low / high] from
+criterion's bootstrap CI. PySpark column: median of 3 trials,
+[min / max] across trials. Software: DataFusion 53.1, PySpark
+4.1.1, JDK 23, Spark `local[*]` (12 logical cores), 4 GB driver
+heap, `shuffle.partitions = 8`.)
 
 **Findings:**
 
@@ -160,19 +163,25 @@ distributed numbers within ±30% of single-node DataFusion on the
 same hardware → **all four within ±13%, gate cleared with
 substantial margin.**
 
-**PySpark column: TBD.** Generating the apples-to-apples PySpark
-SF=10 numbers needs `pyspark` + JDK 17 in the bench env; this
-host doesn't have either installed at the moment. The Σ.A1 PR 4
-SF=1 head-to-head section above shows DataFusion ~4× faster than
-PySpark single-node; SF=10 is expected to narrow that gap (Spark's
-distributed plan helps on bigger shuffles), but until the column
-is filled in we can't make claims. Run via:
+**DataFusion vs PySpark (SF=10, single-host).** Geomean speedup
+of **3.3×** across the four queries (range: 1.73× on Q6 to 9.21×
+on Q3). Compared to the SF=1 head-to-head in the Σ.A1 PR 4
+section above (geomean ~4.3× DF wins), the gap narrowed at SF=10
+on Q1 (4.08× vs 4.0×, ~unchanged) and Q19 (2.28× vs 3.4×, gap
+narrowed) but *widened* on Q3 (9.21× vs 6.8×) and on Q6 (1.73×
+vs 3.5×; Spark closed half the gap there). Spark's optimizer is
+amortising better as input size grows on Q3/Q6, but DataFusion
+still wins comfortably on every query, even single-node-vs-
+single-node. Per-trial PySpark variance is wide (Q1: 1172–1909 ms,
+Q3: 2118–2687 ms) — Spark's JIT + GC tax shows up clearly even
+after the discarded warm-up. DataFusion's bootstrap CIs are
+tight by comparison (within ±5% of median).
 
-```sh
-python scripts/bench-tpch-pyspark.py --sf 10
-```
-
-once the env is provisioned.
+The "scales as well as PySpark" claim is now grounded for SF=10
+single-host: DataFusion *beats* single-node Spark by 1.7–9.2× on
+the rep set. The independent question of whether the distributed
+plan adds real value at scale is still gated on cross-host
+hardware (deferred — see below).
 
 **Reproducer:**
 
@@ -188,6 +197,11 @@ TPCH_DATA_DIR=examples/tpch/data/sf10 TPCH_MEASUREMENT_TIME_S=10 \
 # Distributed-of-one + 3 in-process workers (~10 min wall-clock).
 TPCH_DATA_DIR=examples/tpch/data/sf10 TPCH_MEASUREMENT_TIME_S=10 \
     cargo bench -p ematix-flow-distributed --bench tpch_distributed
+
+# PySpark single-node baseline (~5 min wall-clock; needs JDK 17+).
+JAVA_HOME=/opt/homebrew/opt/openjdk PATH="$JAVA_HOME/bin:$PATH" \
+    .venv/bin/python scripts/bench-tpch-pyspark.py \
+    --data-dir examples/tpch/data/sf10 --trials 3
 
 # Optional: against the docker-compose stack on the same host
 # (multi-process via container loopback, still NOT cross-host).
