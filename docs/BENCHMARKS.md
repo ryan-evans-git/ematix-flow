@@ -469,8 +469,8 @@ users explicitly use DuckDB-isms (currently just `list_value`); add
 new entries to `DUCKDB_TO_DF` as real-world queries surface gaps.
 
 Σ.A2 status after PR 5: all 5 sub-PRs done. Acceptance gates met
-(or vastly exceeded). Ready to start Σ.B (Ballista trait refactor)
-or pause to ship v0.1.0.
+(or vastly exceeded). Ready to start Σ.B (distributed-execution
+trait refactor) or pause to ship v0.1.0.
 
 ### Σ.A2 PR 4 — TPC-DS Spark-dialect audit (2026-05-05)
 
@@ -757,10 +757,14 @@ python scripts/bench-tpch-pyspark.py
 python scripts/bench-tpch-polars.py
 ```
 
-If running on Linux x86_64 EC2 m6i.4xlarge for Σ.C, both columns
-will need re-running. Σ.A1 numbers are the M3-Pro reference; Σ.C
-will land the canonical Linux numbers alongside Ballista cluster
-results.
+~~If running on Linux x86_64 EC2 m6i.4xlarge for Σ.C, both columns
+will need re-running.~~ **Superseded by the 2026-05-05 Σ.C scope
+shift** — AWS path retained in `infra/` but no longer canonical;
+M3 Pro is now the published-numbers reference. See
+[`docs/PHASE_SIGMA_PLAN.md`](PHASE_SIGMA_PLAN.md) Σ.C section for
+the scope-shift rationale and `Σ.C extension` above for the
+22-query SF=1 head-to-head against `datafusion-distributed`-based
+ematix-flow.
 
 ### Reproducing
 
@@ -797,9 +801,11 @@ Parquet file is missing.
 - **DataFusion / arrow upgrades.** Any version bump in
   `Cargo.toml`'s `datafusion` or `arrow-*` workspace deps. Diff
   against the baseline; flag regressions ≥10% in the PR body.
-- **Σ.B Ballista work.** Once a `BallistaBackend` exists, run the
-  same four queries against it and report side-by-side. Σ.C lands
-  the full 22-query head-to-head.
+- ~~**Σ.B Ballista work.**~~ **Σ.B distributed-execution work
+  (shipped 2026-05-05).** `DistributedBackend` lives in
+  `crates/ematix-flow-distributed/`; `tpch_distributed.rs`
+  bench runs the rep set against it. Σ.C extension lands the
+  full 22-query head-to-head against PySpark.
 
 ### Hardware variance
 

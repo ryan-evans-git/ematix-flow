@@ -1,7 +1,29 @@
 # Phase Σ — Distributed compute (scale SQL like PySpark)
 
-**Status:** drafted, not yet started. v0.1.0 must ship before Σ.A1 PR 1
-opens — see `docs/ROADMAP.md` P0 items.
+> **2026-05-05 — pre-pivot terminology preserved as historical
+> record.** This plan was authored when Σ.B was specced against
+> Apache Ballista. **Σ.B pivoted to
+> [`datafusion-distributed`](https://crates.io/crates/datafusion-distributed)
+> mid-implementation** when Ballista 52's DataFusion ^52 pin
+> collided with the workspace's DataFusion 53. Throughout the
+> body of this plan, read each "Ballista" reference as
+> "`datafusion-distributed`" and each `BallistaBackend` /
+> `ematix-flow-ballista` reference as `DistributedBackend` /
+> `ematix-flow-distributed`. The pivot rationale lives in the
+> Σ.B section's "PR 2 distributed-engine pivot" block (search
+> for `2026-05-05 update`) and in
+> [`docs/PHASE_SIGMA_B_TRAIT_SPIKE.md`](PHASE_SIGMA_B_TRAIT_SPIKE.md).
+> The pre-pivot PR-by-PR plan body (PRs 2–5) is retained verbatim
+> as historical context — actual implementation diverged from
+> those PRs (no separate scheduler/executor binaries, no
+> `flow-scheduler` daemon) per the pivot. Σ.A / Σ.B / Σ.C are
+> all shipped as of this date; Σ.D's spike is shipped + deferred
+> (see [`docs/PHASE_SIGMA_D_SPIKE.md`](PHASE_SIGMA_D_SPIKE.md)).
+
+**Status:** **Σ.A / Σ.B / Σ.C all shipped (2026-05-05); Σ.D deferred
+until demand.** v0.1.0 release path is unblocked. Original drafted-
+not-yet-started status is preserved in the body below; this banner
+captures the post-implementation reality.
 
 **Goal.** Make ematix-flow's batch SQL surface match or beat PySpark's
 performance at <20% of PySpark's image footprint, on the same
@@ -16,10 +38,12 @@ This phase ships across five sub-phases:
 - **Σ.A2** — User-config SQL dialect selector + AST-rewrite
   translator built on `sqlparser-rs`. Validates dialect handling on
   single-node before B distributes it.
-- **Σ.B** — Optional `BallistaBackend` peer to in-process DataFusion.
-  One-time connector-trait refactor lands here.
-- **Σ.C** — Three-way head-to-head benchmark: PySpark vs ematix-flow-
-  ballista vs single-node DataFusion. Public-facing artifact.
+- **Σ.B** — Optional `DistributedBackend` peer to in-process
+  DataFusion (built on `datafusion-distributed` after the
+  Ballista pivot). One-time connector-trait refactor lands here.
+- **Σ.C** — Three-way head-to-head benchmark: PySpark vs
+  ematix-flow-distributed vs single-node DataFusion. Public-
+  facing artifact.
 - **Σ.D** — Distributed streaming. Gated on a 2-week build-vs-adopt
   spike against [Arroyo](https://github.com/ArroyoSystems/arroyo) and
   [RisingWave](https://github.com/risingwavelabs/risingwave) before
@@ -47,14 +71,17 @@ support without distribution. Shipping A1–C gets you the public claim.
   surface against Spark. TPC-DS adds correlated subqueries + complex
   type stress that the Σ.A2 dialect translator hits before Σ.B does.
   Σ.C reports TPC-H; TPC-DS lands as a follow-up.
-- **Native cluster orchestration.** Ballista runs as scheduler +
-  executor binaries; we ship a docker-compose example, not a
-  Helm chart or Kubernetes operator. Cluster ops stays the user's
-  problem (same boundary as Spark on EMR, where Spark doesn't ship
-  the EMR control plane).
-- **Yanking `[transform] engine = "in-process"` once Ballista lands.**
-  In-process DataFusion stays the default forever. Ballista is opt-in
-  via config; small workloads benefit from skipping the network hop.
+- **Native cluster orchestration.** Distributed execution runs
+  as `flow-worker` peer processes; we ship a docker-compose
+  example (`examples/distributed-cluster/`), not a Helm chart or
+  Kubernetes operator. Cluster ops stays the user's problem
+  (same boundary as Spark on EMR, where Spark doesn't ship the
+  EMR control plane). *(Pre-pivot wording: "Ballista runs as
+  scheduler + executor binaries.")*
+- **Yanking `[transform] engine = "in-process"` once distributed
+  lands.** In-process DataFusion stays the default forever;
+  distributed is opt-in via config. Small workloads benefit
+  from skipping the network hop.
 
 ## What Σ does and doesn't speed up
 
@@ -84,7 +111,7 @@ async-I/O work in the existing backends, separate from this plan.
 | Σ.A1 | None directly; benchmark surface is Parquet-only. |
 | Σ.A2 | None. |
 | Σ.B  | **Yes for reads, capped by the database.** Range-partition reads (`SELECT … WHERE id BETWEEN x AND y`) across N executors give 5–20× on big tables, but you're paying for it in database load + connection pressure. The connector-trait refactor in Σ.B PR 1 is the right place to add async chunked reads + range-partition support uniformly across all DB backends — **side benefit: improves the single-node path too.** |
-| Σ.B  | **Writes scale only with idempotent targets.** MERGE / UPSERT keys allow per-executor parallel writes safely. Transactional inserts (append, no key) still want a single-writer pattern; documented in `examples/ballista-cluster/` patterns. |
+| Σ.B  | **Writes scale only with idempotent targets.** MERGE / UPSERT keys allow per-executor parallel writes safely. Transactional inserts (append, no key) still want a single-writer pattern; documented in `examples/distributed-cluster/` patterns. |
 | Σ.D  | None. |
 
 ### Streaming (Kafka / Pubsub / Kinesis / RabbitMQ)
@@ -111,8 +138,8 @@ These are not Σ's job; they need separate work if they're priorities:
   on consume; the ceiling is hardware. Improvements come from batch-
   size tuning + state-store write coalescing, not Σ.
 - **Cold-start time for the in-process path.** Today's `flow consume`
-  starts in <100 ms; Σ doesn't change this. Ballista cold-start is in
-  Σ.C's measurement scope (target ≤ 30% of Spark's).
+  starts in <100 ms; Σ doesn't change this. Distributed cold-start
+  is in Σ.C's measurement scope (target ≤ 30% of Spark's).
 
 ### Indirect spillover from Σ work
 
@@ -156,17 +183,16 @@ the distributed path:
                   └───────────────────┼──────────────────────┘
                                       │
                                       ▼ engine selector
-        in-process (default)                          ballista (opt-in)
+        in-process (default)                       distributed (opt-in)
                   │                                           │
                   ▼                                           ▼
         ┌────────────────────┐               ┌──────────────────────────────┐
-        │ DataFusion         │               │  Σ.B: BallistaBackend        │
-        │ SessionContext     │               │    flow-scheduler  (~30 MB)  │
-        │ (single-process)   │               │    flow-executor   (~70 MB)  │
-        │                    │               │  Arrow Flight shuffle        │
-        └────────────────────┘               │  hash-partitioned join       │
-                  │                          │  ┌──────┬──────┬──────┐      │
-                  │                          │  │ exec │ exec │ exec │      │
+        │ DataFusion         │               │  Σ.B: DistributedBackend     │
+        │ SessionContext     │               │    flow-worker × N (peers)   │
+        │ (single-process)   │               │    Arrow Flight shuffle      │
+        │                    │               │    hash-partitioned join     │
+        └────────────────────┘               │  ┌──────┬──────┬──────┐      │
+                  │                          │  │ peer │ peer │ peer │      │
                   │                          │  └──────┴──────┴──────┘      │
                   │                          │  partitioned state store ◀─── Σ.D
                   │                          └──────────────────────────────┘
@@ -180,9 +206,10 @@ the distributed path:
 ```
 
 The two new components are the **dialect translator** (Σ.A2) and the
-**Ballista backend** (Σ.B). Σ.A1 audits + benchmarks the existing
-single-node path so the rest of the block has a regression baseline.
-Σ.D extends the Ballista box leftward into streaming, replacing the
+**distributed backend** (Σ.B, built on `datafusion-distributed`
+post-pivot). Σ.A1 audits + benchmarks the existing single-node path
+so the rest of the block has a regression baseline. Σ.D extends
+the distributed box leftward into streaming, replacing the
 batch-bounded shuffle with a continuous one.
 
 ---
@@ -304,9 +331,10 @@ the canonical Linux host. If not — Σ.A1 PR 4.5 investigates before
 ### Σ.A1 deferred for follow-up
 
 - **TPC-H at SF=10 / SF=100.** Σ.A1 runs SF=1 only (laptop-friendly).
-  Larger scale factors land in Σ.C against multi-node Ballista, where
-  the comparison meaningfully tests shuffle perf — there's no point
-  benching SF=100 on a single node.
+  Σ.C extension landed SF=10 4-query rep-set numbers
+  (`ematix-flow-distributed` 3 in-process workers vs single-node
+  DataFusion vs PySpark `local[*]`); SF=100 still deferred (data
+  alone is 100 GB; needs real cluster hardware).
 - **TPC-DS suite.** Heavier dialect workout than TPC-H; lands in Σ.A2
   as the dialect translator's primary acceptance harness.
 - **Audit findings that need upstream fixes.** Some DataFusion
