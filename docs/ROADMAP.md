@@ -85,7 +85,7 @@ this is the consolidated punch list.
 
 ### P5 — Phase Σ: distributed compute (scale SQL like PySpark, footprint like ematix-flow)
 
-Goal: stand alongside PySpark on batch SQL throughput at <20% of PySpark's image size, then extend to distributed streaming. Built on DataFusion (already a workspace dep); no JVM, no shuffle service to install. A→C is a coherent batch-distributed delivery (~7–13 weeks). D is bigger and gated on a build-vs-adopt spike.
+Goal: stand alongside PySpark on batch SQL throughput at <20% of PySpark's image size, then extend to distributed streaming. Built on DataFusion (already a workspace dep); no JVM, no shuffle service to install. A→C is a coherent batch-distributed delivery (~7–13 weeks). D is bigger and gated on a build-vs-adopt spike. Per-PR plan + open design questions in [`docs/PHASE_SIGMA_PLAN.md`](PHASE_SIGMA_PLAN.md).
 
 29. **Σ.A1 — single-node DataFusion baseline + TPC-H harness.** Audit `crates/ematix-flow-core/src/transform.rs` for SQL-surface gaps PySpark users hit (window functions, complex types, `EXPLAIN`/`EXPLAIN ANALYZE`); close must-haves. Wire TPC-H Parquet loaders into `examples/tpch/`. Add `criterion` benches for Q1/Q3/Q6/Q19 at SF=1, committed to `docs/BENCHMARKS.md`. Acceptance: all four queries beat single-node PySpark on the same hardware. Effort: 1–2 wk. Standalone value (better single-node SQL) regardless of B/C/D.
 
