@@ -439,31 +439,57 @@ pub use crate::meta::DeleteHandling;
 // migration commit replaces a unit variant with its config struct.
 
 /// Serializable backend configuration. Tagged enum; `serde` emits
-/// `{"kind": "postgres", ...}` so the discriminator is human-
-/// readable (matches today's TOML config shape; JSON is a strict
-/// superset).
+/// `{"kind": "postgres", ...payload-fields}` so the discriminator
+/// is human-readable (matches today's TOML config shape; JSON is a
+/// strict superset).
 ///
-/// PR 1 variants are empty placeholders — the per-backend config
-/// payload lands in the migration commit for each kind:
-///   - DB backends: Σ.B PR 1 commit b
-///   - Object store / Delta: commit c
-///   - Streaming (Kafka / Kinesis / Pub/Sub / RabbitMQ): commit d
-///
-/// Add a payload only when the corresponding `<Backend>Config`
-/// struct + `Backend::config()` impl land together.
+/// Migration status per variant (Σ.B PR 1):
+///   - DB backends (Postgres / MySql / Sqlite / DuckDb): commit b
+///     populated; payload structs carry DSN / location
+///   - Object store + Delta: commit c (still unit placeholders)
+///   - Streaming (Kafka / Kinesis / Pub/Sub / RabbitMq): commit d
+///     (still unit placeholders)
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum BackendConfig {
-    Postgres,
-    MySql,
-    Sqlite,
-    DuckDb,
+    Postgres(PostgresConfig),
+    MySql(MySqlConfig),
+    Sqlite(SqliteConfig),
+    DuckDb(DuckDbConfig),
     Kafka,
     Kinesis,
     PubSub,
     RabbitMq,
     Delta,
     ObjectStore,
+}
+
+/// Σ.B PR 1 commit b: serializable Postgres config. The DSN carries
+/// credentials + host + port + dbname + sslmode in a single string,
+/// matching the existing `PgPool::connect` surface. Inline format
+/// per the spike's locked decision (env-var indirection lands later
+/// as a non-breaking addition).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PostgresConfig {
+    pub dsn: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct MySqlConfig {
+    /// `mysql://user:pass@host:port/db` URL.
+    pub dsn: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SqliteConfig {
+    /// `:memory:` for an ephemeral DB; an absolute path otherwise.
+    pub location: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct DuckDbConfig {
+    /// `:memory:` for an ephemeral DB; an absolute path otherwise.
+    pub location: String,
 }
 
 /// Σ.D-ready partitioning-hint placeholder. Return type for
@@ -485,17 +511,39 @@ pub struct KeyPartitioning {
 /// match-on-tag dispatch; out-of-tree backends fork (per the
 /// spike's locked decision).
 ///
-/// PR 1: every variant returns `NotImplementedYet` because the
-/// per-backend payloads + constructors land in commits b/c/d. Each
-/// migration commit fills in one or more arms.
+/// Migration status:
+///   - Postgres / MySql / Sqlite / DuckDb: wired in commit b
+///   - Object store / Delta: commit c — returns NotImplementedYet
+///   - Streaming (Kafka / Kinesis / Pub/Sub / RabbitMq): commit d
+///     — returns NotImplementedYet
 pub async fn backend_from_config(
     cfg: BackendConfig,
 ) -> Result<std::sync::Arc<dyn Backend>, BackendError> {
-    Err(BackendError::Other(format!(
-        "backend_from_config({cfg:?}) not yet implemented — \
-         Σ.B PR 1 commits b/c/d wire each backend kind. See \
-         docs/PHASE_SIGMA_B_TRAIT_SPIKE.md for the migration plan."
-    )))
+    match cfg {
+        BackendConfig::Postgres(c) => {
+            let pool = std::sync::Arc::new(PgPool::connect(&c.dsn).await?);
+            Ok(std::sync::Arc::new(PostgresBackend::new(pool, c.dsn)))
+        }
+        BackendConfig::MySql(c) => Ok(std::sync::Arc::new(
+            crate::mysql_backend::MySQLBackend::open(c.dsn)?,
+        )),
+        BackendConfig::Sqlite(c) => Ok(std::sync::Arc::new(
+            crate::sqlite_backend::SQLiteBackend::open(c.location)?,
+        )),
+        BackendConfig::DuckDb(c) => Ok(std::sync::Arc::new(
+            crate::duckdb_backend::DuckDBBackend::open(c.location)?,
+        )),
+        not_yet @ (BackendConfig::Kafka
+        | BackendConfig::Kinesis
+        | BackendConfig::PubSub
+        | BackendConfig::RabbitMq
+        | BackendConfig::Delta
+        | BackendConfig::ObjectStore) => Err(BackendError::Other(format!(
+            "backend_from_config({not_yet:?}) not yet implemented — \
+             Σ.B PR 1 commits c/d wire object-store + streaming backends. \
+             See docs/PHASE_SIGMA_B_TRAIT_SPIKE.md."
+        ))),
+    }
 }
 
 /// Postgres backend — wraps an existing `PgPool`. The first impl of the
@@ -528,6 +576,12 @@ impl Backend for PostgresBackend {
 
     fn dsn(&self) -> Option<String> {
         Some(self.dsn.clone())
+    }
+
+    fn config(&self) -> BackendConfig {
+        BackendConfig::Postgres(PostgresConfig {
+            dsn: self.dsn.clone(),
+        })
     }
 
     fn as_postgres(&self) -> Option<&PgPool> {

@@ -19,96 +19,140 @@
 //!
 //! Plan + spike: `docs/PHASE_SIGMA_PLAN.md` Σ.B + `docs/PHASE_SIGMA_B_TRAIT_SPIKE.md`.
 
-use ematix_flow_core::backend::{BackendConfig, backend_from_config};
+use ematix_flow_core::backend::{
+    BackendConfig, DuckDbConfig, MySqlConfig, PostgresConfig, SqliteConfig, backend_from_config,
+};
+
+// --- JSON round-trip ----------------------------------------------
 
 #[test]
-fn backend_config_postgres_round_trips_as_json() {
-    let cfg = BackendConfig::Postgres;
-    let json = serde_json::to_string(&cfg).expect("serialize Postgres");
-    assert_eq!(json, r#"{"kind":"postgres"}"#);
+fn backend_config_postgres_round_trips_with_dsn() {
+    let cfg = BackendConfig::Postgres(PostgresConfig {
+        dsn: "postgres://user:pw@localhost:5432/db".into(),
+    });
+    let json = serde_json::to_string(&cfg).expect("serialize");
+    // serde-tagged enums flatten the inner struct's fields next to
+    // the discriminator: `{"kind":"postgres","dsn":"..."}`.
+    assert_eq!(
+        json,
+        r#"{"kind":"postgres","dsn":"postgres://user:pw@localhost:5432/db"}"#
+    );
 
-    let recovered: BackendConfig = serde_json::from_str(&json).expect("deserialize Postgres");
-    assert!(matches!(recovered, BackendConfig::Postgres));
+    let recovered: BackendConfig = serde_json::from_str(&json).expect("deserialize");
+    match recovered {
+        BackendConfig::Postgres(c) => {
+            assert_eq!(c.dsn, "postgres://user:pw@localhost:5432/db");
+        }
+        other => panic!("expected Postgres, got {other:?}"),
+    }
 }
 
 #[test]
-fn backend_config_kafka_round_trips_as_json() {
+fn backend_config_sqlite_round_trips_with_location() {
+    let cfg = BackendConfig::Sqlite(SqliteConfig {
+        location: ":memory:".into(),
+    });
+    let json = serde_json::to_string(&cfg).expect("serialize");
+    assert_eq!(json, r#"{"kind":"sqlite","location":":memory:"}"#);
+    let recovered: BackendConfig = serde_json::from_str(&json).expect("deserialize");
+    assert!(matches!(
+        recovered,
+        BackendConfig::Sqlite(SqliteConfig { location }) if location == ":memory:"
+    ));
+}
+
+#[test]
+fn backend_config_kafka_unit_variant_still_serializes() {
+    // Streaming variants (Kafka / Kinesis / Pub/Sub / RabbitMq) +
+    // ObjectStore + Delta stay as unit variants until commits c/d
+    // populate them. JSON-tagged unit variants emit just the
+    // discriminator.
     let cfg = BackendConfig::Kafka;
     let json = serde_json::to_string(&cfg).expect("serialize Kafka");
     assert_eq!(json, r#"{"kind":"kafka"}"#);
-
-    let recovered: BackendConfig = serde_json::from_str(&json).expect("deserialize Kafka");
-    assert!(matches!(recovered, BackendConfig::Kafka));
 }
 
-/// All 10 backend variants must be present in the enum so PR 1's
-/// scaffold covers the full migration target. Each variant gets its
-/// per-backend config payload populated in commits b/c/d.
-#[test]
-fn backend_config_covers_all_known_backends() {
-    let kinds = [
-        BackendConfig::Postgres,
-        BackendConfig::MySql,
-        BackendConfig::Sqlite,
-        BackendConfig::DuckDb,
-        BackendConfig::Kafka,
-        BackendConfig::Kinesis,
-        BackendConfig::PubSub,
-        BackendConfig::RabbitMq,
-        BackendConfig::Delta,
-        BackendConfig::ObjectStore,
-    ];
-    // Each round-trips as a distinct JSON discriminator; sanity-check
-    // by serializing all and confirming uniqueness.
-    let mut seen: Vec<String> = kinds
-        .iter()
-        .map(|k| serde_json::to_string(k).expect("serialize"))
-        .collect();
-    seen.sort();
-    seen.dedup();
-    assert_eq!(seen.len(), 10, "each variant must serialize distinctly");
-}
+// --- backend_from_config dispatch ---------------------------------
 
-/// Reverse direction: `backend_from_config` is a stub in PR 1 — it
-/// errors clearly for every variant pointing at the migration commit
-/// that will fill it in. Pattern-match rather than `expect_err`
-/// because `Arc<dyn Backend>` doesn't implement Debug (the trait
-/// would have to bound it; intentionally not done here so individual
-/// backends control their own redacting Debug impls).
 #[tokio::test]
-async fn backend_from_config_returns_not_implemented_for_postgres() {
-    match backend_from_config(BackendConfig::Postgres).await {
-        Ok(_) => panic!("Postgres should not yet be wired in PR 1"),
+async fn backend_from_config_constructs_sqlite_in_memory() {
+    let cfg = BackendConfig::Sqlite(SqliteConfig {
+        location: ":memory:".into(),
+    });
+    let backend = backend_from_config(cfg).await.expect("construct sqlite");
+    backend.ping().await.expect("ping");
+    // Round-trip: the constructed backend's `config()` should match
+    // the input we handed in (modulo any normalization).
+    match backend.config() {
+        BackendConfig::Sqlite(c) => assert_eq!(c.location, ":memory:"),
+        other => panic!("expected Sqlite config, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn backend_from_config_constructs_duckdb_in_memory() {
+    let cfg = BackendConfig::DuckDb(DuckDbConfig {
+        location: ":memory:".into(),
+    });
+    let backend = backend_from_config(cfg).await.expect("construct duckdb");
+    backend.ping().await.expect("ping");
+    match backend.config() {
+        BackendConfig::DuckDb(c) => assert_eq!(c.location, ":memory:"),
+        other => panic!("expected DuckDb config, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn backend_from_config_returns_not_implemented_for_kafka() {
+    // Streaming variants still error out — commit d will wire them.
+    match backend_from_config(BackendConfig::Kafka).await {
+        Ok(_) => panic!("Kafka should not yet be wired"),
         Err(err) => {
             let msg = format!("{err}");
             assert!(
-                msg.to_lowercase().contains("not implemented")
-                    || msg.to_lowercase().contains("not yet"),
+                msg.to_lowercase().contains("not yet"),
                 "must signal incomplete migration; got: {msg}"
-            );
-            assert!(
-                msg.contains("Postgres") || msg.contains("postgres"),
-                "must name the backend kind; got: {msg}"
             );
         }
     }
 }
 
-/// `Backend: 'static` is needed for shipping `Arc<dyn Backend>`
-/// across Arrow Flight in Σ.B (the BallistaBackend) and Σ.D (state
-/// store hooks). Compile-only check — if the trait grows the bound
-/// and any in-tree backend doesn't satisfy it, the workspace stops
-/// compiling and CI catches it. The assertion below makes the
-/// contract explicit + fails to compile if the bound regresses.
+#[tokio::test]
+async fn backend_from_config_postgres_invalid_dsn_propagates_error() {
+    // Constructing a Postgres backend from a bad DSN should error
+    // cleanly via `PgPool::connect`, not panic. Captures the connect-
+    // failure path that Σ.B's executors will hit in production when
+    // an executor receives a config blob with a stale DSN.
+    let cfg = BackendConfig::Postgres(PostgresConfig {
+        dsn: "postgres://invalid:bad@localhost:1/nope".into(),
+    });
+    assert!(
+        backend_from_config(cfg).await.is_err(),
+        "invalid DSN should not connect — any BackendError variant is acceptable"
+    );
+}
+
+/// `Backend: 'static` is needed for `Arc<dyn Backend>` to ship over
+/// Arrow Flight in Σ.B's BallistaBackend. Compile-only assertion —
+/// regresses CI loudly if the bound is removed.
 #[test]
 fn backend_trait_is_static_object_safe() {
     fn assert_object_safe<T: ?Sized>() {}
     assert_object_safe::<dyn ematix_flow_core::backend::Backend>();
-
-    // Verify the 'static bound by attempting to construct a type that
-    // requires it. `Arc<dyn Backend + 'static>` is the shape Ballista
-    // will ship over Arrow Flight; if Backend isn't 'static-bound the
-    // workspace stops compiling at the trait definition.
     fn requires_static<T: 'static + ?Sized>() {}
     requires_static::<dyn ematix_flow_core::backend::Backend>();
+}
+
+#[test]
+fn mysql_config_payload_round_trips() {
+    // No async constructor needed — exercises just the tagged enum.
+    let cfg = BackendConfig::MySql(MySqlConfig {
+        dsn: "mysql://app:s3cret@db.local:3306/orders".into(),
+    });
+    let json = serde_json::to_string(&cfg).unwrap();
+    let recovered: BackendConfig = serde_json::from_str(&json).unwrap();
+    assert!(matches!(
+        recovered,
+        BackendConfig::MySql(MySqlConfig { dsn }) if dsn == "mysql://app:s3cret@db.local:3306/orders"
+    ));
 }

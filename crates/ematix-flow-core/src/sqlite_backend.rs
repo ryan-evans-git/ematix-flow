@@ -921,6 +921,12 @@ impl Backend for SQLiteBackend {
         Some(format!("sqlite://{}", self.location))
     }
 
+    fn config(&self) -> crate::backend::BackendConfig {
+        crate::backend::BackendConfig::Sqlite(crate::backend::SqliteConfig {
+            location: self.location.clone(),
+        })
+    }
+
     async fn ping(&self) -> Result<(), BackendError> {
         self.with_conn_blocking(|c| {
             c.execute_batch("SELECT 1")

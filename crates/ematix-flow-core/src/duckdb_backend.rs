@@ -601,6 +601,12 @@ impl Backend for DuckDBBackend {
         Some(format!("duckdb://{}", self.location))
     }
 
+    fn config(&self) -> crate::backend::BackendConfig {
+        crate::backend::BackendConfig::DuckDb(crate::backend::DuckDbConfig {
+            location: self.location.clone(),
+        })
+    }
+
     async fn ping(&self) -> Result<(), BackendError> {
         self.with_conn_blocking(|c| {
             c.execute_batch("SELECT 1")

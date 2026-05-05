@@ -1114,6 +1114,12 @@ impl Backend for MySQLBackend {
         Some(self.dsn.clone())
     }
 
+    fn config(&self) -> crate::backend::BackendConfig {
+        crate::backend::BackendConfig::MySql(crate::backend::MySqlConfig {
+            dsn: self.dsn.clone(),
+        })
+    }
+
     async fn ping(&self) -> Result<(), BackendError> {
         let mut conn = self
             .pool
