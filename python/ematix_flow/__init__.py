@@ -39,7 +39,23 @@ from ematix_flow.streaming import (
     run_streaming_pipeline,
 )
 
-__version__ = "0.1.0"
+# Read the installed-package version dynamically so a release bump
+# only needs to touch Cargo.toml + pyproject.toml — not this file.
+# Falls back to the Rust core's compile-time version if package
+# metadata isn't available (editable install before
+# `maturin develop`, partial install, etc.); both sources are
+# driven by `Cargo.toml` and `pyproject.toml`'s version fields.
+try:
+    from importlib.metadata import PackageNotFoundError as _PackageNotFoundError
+    from importlib.metadata import version as _pkg_version
+
+    try:
+        __version__ = _pkg_version("ematix-flow")
+    except _PackageNotFoundError:
+        __version__ = _core.core_version()
+    del _pkg_version, _PackageNotFoundError
+except ImportError:
+    __version__ = _core.core_version()
 
 __all__ = [
     "Aggregation",

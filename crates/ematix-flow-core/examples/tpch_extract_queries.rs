@@ -74,15 +74,30 @@ const SUBS: &[Sub] = &[
             ("date ':2' + interval '1' year", "date '1995-01-01'"),
         ],
     ),
-    // Q6: DATE='1994-01-01', DISCOUNT=0.06, QUANTITY=24
+    // Q6: DATE='1994-01-01', DISCOUNT=0.06, QUANTITY=24.
+    // The TPC-H spec form is `l_discount BETWEEN :2 - 0.01 AND
+    // :2 + 0.01` so a single discount parameter substitutes into
+    // both bounds. After substitution that's `0.06 - 0.01 AND
+    // 0.06 + 0.01`, which f64 rounds to `0.04999... AND
+    // 0.06999...` — and `0.06999...` is *just under* the literal
+    // 0.07, so `l_discount = 0.07` rows get silently excluded.
+    // (l_discount in lineitem.parquet is Float64; 0.07 stored
+    // there is `0.06999999999999999556...`, lexically equal to
+    // the upper bound but BETWEEN's right-side compare is `<=`,
+    // not `<`, and the upper-bound expression rounds *below*
+    // 0.07.) Pre-compute the bounds as literal `0.05 AND 0.07`
+    // so the canonical TPC-H Q6 reference revenue (123141078.23
+    // at SF=1) actually appears. tpch_smoke's in-process check
+    // uses the same literal-form Q6 for the same reason.
     Sub(
         6,
         &[
             ("l_shipdate >= date ':1'", "l_shipdate >= date '1994-01-01'"),
             ("date ':1' + interval '1' year", "date '1995-01-01'"),
-            ("l_discount between :2", "l_discount between 0.06"),
-            ("- 0.01 and :2", "- 0.01 and 0.06"),
-            ("+ 0.01", "+ 0.01"),
+            (
+                "l_discount between :2 - 0.01 and :2 + 0.01",
+                "l_discount between 0.05 and 0.07",
+            ),
             ("l_quantity < :3", "l_quantity < 24"),
         ],
     ),
