@@ -81,18 +81,18 @@ src = ["python", "tests/python"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
-# RUF002 / RUF003: "ambiguous unicode character in docstring/comment"
-# fires on em-dashes (—), smart-quotes, and similar punctuation we
-# use stylistically across both the comments and the user-facing
-# docstrings/error messages. They aren't ambiguous in our context;
-# this is a stylistic preference we've consciously made and the rule
-# would force a project-wide rewrite.
+# RUF001 / RUF002 / RUF003: "ambiguous unicode character in string /
+# docstring / comment" — fires on em-dashes (—), smart-quotes, and
+# multiplication sign (×) we use stylistically across the codebase
+# (e.g. `"3× faster"` in benchmark output strings). They aren't
+# ambiguous in our context; the rule would force a project-wide
+# rewrite for no readability gain.
 #
 # SIM105 (`contextlib.suppress` vs `try/except: pass`) and SIM108
 # (`if/else` vs ternary expression) are both pure-style preferences
 # the community is split on — neither is more correct, and forcing
 # them across the codebase produces churn without a readability win.
-ignore = ["RUF002", "RUF003", "SIM105", "SIM108"]
+ignore = ["RUF001", "RUF002", "RUF003", "SIM105", "SIM108"]
 
 [tool.ruff.lint.per-file-ignores]
 # Tests intentionally use looser conventions that the production code
