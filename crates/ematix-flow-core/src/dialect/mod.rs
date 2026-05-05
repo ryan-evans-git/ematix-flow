@@ -6,9 +6,11 @@
 //! into DataFusion-compatible SQL, and only then handed to
 //! `SessionContext::sql()`.
 //!
-//! Σ.A2 PR 1 (this commit): config surface, enum, error type, and
-//! pass-through translator for `Dialect::DataFusion`. Spark + DuckDB
-//! land in PRs 2–5 — for now they error with `NotImplemented`.
+//! Σ.A2 PR 1: config surface, enum, error type, pass-through for
+//! `Dialect::DataFusion`. Σ.A2 PR 2: Spark function-name remap via
+//! `sqlparser-rs` AST visit (this commit); structural rewrites
+//! (`LATERAL VIEW EXPLODE` → `UNNEST`, complex-type literals,
+//! window-frame syntax) are PR 3. DuckDB lands in PR 5.
 //!
 //! Public API:
 //! ```ignore
@@ -30,6 +32,8 @@
 use std::str::FromStr;
 
 use thiserror::Error;
+
+mod spark;
 
 /// SQL dialect of the input passed to [`translate`]. Output is always
 /// DataFusion's dialect (the workspace's native execution engine).
@@ -57,8 +61,7 @@ pub enum Dialect {
 #[derive(Debug, Error)]
 pub enum DialectError {
     /// Translator hasn't yet been implemented for this dialect.
-    /// Returned for `Spark` (until Σ.A2 PR 2) and `DuckDb` (until
-    /// Σ.A2 PR 5).
+    /// `DuckDb` returns this until Σ.A2 PR 5.
     #[error(
         "SQL translation for dialect {0:?} is not implemented yet. \
          Tracked under Σ.A2 — see docs/PHASE_SIGMA_PLAN.md. \
@@ -78,6 +81,12 @@ pub enum DialectError {
         found: String,
         valid: &'static [&'static str],
     },
+
+    /// `sqlparser` couldn't parse the input — invalid SQL syntax in
+    /// the source dialect. Wraps the underlying message so the user
+    /// sees the line + column from sqlparser's error.
+    #[error("SQL parse error: {0}")]
+    ParseError(String),
 }
 
 /// Stable list of dialect strings accepted by `Dialect::from_str`,
@@ -113,6 +122,7 @@ impl FromStr for Dialect {
 pub fn translate(sql: &str, from: Dialect) -> Result<String, DialectError> {
     match from {
         Dialect::DataFusion => Ok(sql.to_string()),
-        Dialect::Spark | Dialect::DuckDb => Err(DialectError::NotImplemented(from)),
+        Dialect::Spark => spark::translate(sql),
+        Dialect::DuckDb => Err(DialectError::NotImplemented(from)),
     }
 }

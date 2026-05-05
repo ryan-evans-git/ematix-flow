@@ -195,6 +195,14 @@ postcard = { version = "1", features = ["alloc"] }
 # arrow-csv 58); fine for the smoke test. Re-evaluate when
 # tpchgen-arrow lands an arrow-58 release.
 tpchgen = "2"
+# Σ.A2 PR 2: AST-rewrite SQL dialect translator. sqlparser 0.61 is
+# what DataFusion 53.1 pulls in transitively; promoted to a direct
+# workspace dep here so we can call `Parser::parse_sql(&dialect, sql)`
+# and re-emit via `Statement::to_string()`. The `visitor` feature
+# turns on the `VisitMut` derive macros for AST walkers. Pin tight
+# to DataFusion's transitive version — mismatched sqlparser majors
+# break ABI on shared AST types.
+sqlparser = { version = "0.61", features = ["visitor"] }
 
 [profile.release]
 lto = "thin"

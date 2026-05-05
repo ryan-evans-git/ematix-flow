@@ -32,21 +32,16 @@ fn datafusion_passthrough_handles_empty_input() {
     assert_eq!(out, "");
 }
 
+/// Σ.A2 PR 2 landed Spark — the function-name-remap surface.
+/// Pass-through cases (`SELECT 1`) succeed; complex Spark→DataFusion
+/// rewrites are exercised separately in `tests/dialect_spark.rs`.
 #[test]
-fn spark_dialect_errors_with_pr2_pointer() {
-    let err = translate("SELECT 1", Dialect::Spark).expect_err("spark not yet implemented");
-    let msg = format!("{err}");
+fn spark_dialect_translates_pass_through() {
+    let out = translate("SELECT 1", Dialect::Spark).expect("Spark passes through trivial SQL");
+    // sqlparser may normalize whitespace; the literal `1` survives.
     assert!(
-        msg.contains("Spark"),
-        "error message must name the dialect; got: {msg}"
-    );
-    assert!(
-        msg.to_lowercase().contains("not implemented") || msg.to_lowercase().contains("not yet"),
-        "error must signal not-yet-implemented; got: {msg}"
-    );
-    assert!(
-        matches!(err, DialectError::NotImplemented(Dialect::Spark)),
-        "must return the typed not-implemented variant"
+        out.contains('1'),
+        "Spark must round-trip `SELECT 1`; got: {out}"
     );
 }
 
