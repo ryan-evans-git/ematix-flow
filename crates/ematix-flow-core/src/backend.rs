@@ -227,8 +227,35 @@ impl From<crate::pg::Scd2RunResult> for StrategyRunResult {
 /// target backends at runtime.
 #[async_trait]
 #[allow(clippy::too_many_arguments)]
-pub trait Backend: Send + Sync {
+pub trait Backend: Send + Sync + 'static {
     fn dialect(&self) -> Dialect;
+
+    /// Σ.B PR 1: serializable form of this backend's constructor
+    /// args + builder kwargs. Round-trips through JSON. Must NOT
+    /// contain live connections, file descriptors, or runtime-
+    /// dependent state — those reconstruct lazily on the executor
+    /// side.
+    ///
+    /// Default impl panics; each backend overrides as it migrates
+    /// (Σ.B PR 1 commits b/c/d). Once all in-tree backends override,
+    /// the default goes away.
+    ///
+    /// See `docs/PHASE_SIGMA_B_TRAIT_SPIKE.md` for the rationale.
+    fn config(&self) -> BackendConfig {
+        unimplemented!(
+            "Backend::config() not yet implemented for {:?} — Σ.B PR 1 \
+             commits b/c/d migrate each backend kind",
+            self.dialect()
+        )
+    }
+
+    /// Σ.D-ready: can this backend partition reads of the given
+    /// `query` by some key? `None` means single-stream only.
+    /// Default returns `None`; Σ.D defines the override schema and
+    /// individual backends opt in.
+    fn partitioning_hint(&self, _query: &str) -> Option<KeyPartitioning> {
+        None
+    }
 
     /// `(host, port, dbname, user)` for DB-shaped backends; backend-
     /// specific identifying info for others (bucket name, broker list,
@@ -397,6 +424,79 @@ pub trait Backend: Send + Sync {
 
 /// Re-export for trait method signatures.
 pub use crate::meta::DeleteHandling;
+
+// ============================================================
+// Σ.B PR 1: BackendConfig scaffold + reverse-direction stub.
+// ============================================================
+//
+// Per `docs/PHASE_SIGMA_B_TRAIT_SPIKE.md`'s locked decisions:
+//   - Wire format: JSON
+//   - Closed registry (match-on-tag in `backend_from_config`)
+//   - Per-backend `<Backend>Config` payloads land in commits b/c/d
+//
+// PR 1 ships the surface; payloads are empty unit variants so the
+// enum compiles, serializes, and discriminates uniquely. Each
+// migration commit replaces a unit variant with its config struct.
+
+/// Serializable backend configuration. Tagged enum; `serde` emits
+/// `{"kind": "postgres", ...}` so the discriminator is human-
+/// readable (matches today's TOML config shape; JSON is a strict
+/// superset).
+///
+/// PR 1 variants are empty placeholders — the per-backend config
+/// payload lands in the migration commit for each kind:
+///   - DB backends: Σ.B PR 1 commit b
+///   - Object store / Delta: commit c
+///   - Streaming (Kafka / Kinesis / Pub/Sub / RabbitMQ): commit d
+///
+/// Add a payload only when the corresponding `<Backend>Config`
+/// struct + `Backend::config()` impl land together.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum BackendConfig {
+    Postgres,
+    MySql,
+    Sqlite,
+    DuckDb,
+    Kafka,
+    Kinesis,
+    PubSub,
+    RabbitMq,
+    Delta,
+    ObjectStore,
+}
+
+/// Σ.D-ready partitioning-hint placeholder. Return type for
+/// [`Backend::partitioning_hint`]; concrete shape (range / hash /
+/// per-source-partition) gets locked in Σ.D once the dominant
+/// pattern is known. PR 1 ships an empty struct so the trait
+/// method signature is stable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct KeyPartitioning {
+    /// Reserved for Σ.D — explicit unit field instead of a unit
+    /// struct so the type can grow new fields without breaking
+    /// callers that bind via field-init syntax.
+    #[doc(hidden)]
+    pub _reserved: (),
+}
+
+/// Reconstruct a backend from its serialized config. Closed
+/// match-on-tag dispatch; out-of-tree backends fork (per the
+/// spike's locked decision).
+///
+/// PR 1: every variant returns `NotImplementedYet` because the
+/// per-backend payloads + constructors land in commits b/c/d. Each
+/// migration commit fills in one or more arms.
+pub async fn backend_from_config(
+    cfg: BackendConfig,
+) -> Result<std::sync::Arc<dyn Backend>, BackendError> {
+    Err(BackendError::Other(format!(
+        "backend_from_config({cfg:?}) not yet implemented — \
+         Σ.B PR 1 commits b/c/d wire each backend kind. See \
+         docs/PHASE_SIGMA_B_TRAIT_SPIKE.md for the migration plan."
+    )))
+}
 
 /// Postgres backend — wraps an existing `PgPool`. The first impl of the
 /// trait; in 30a it's a thin delegation. Subsequent sub-commits move
