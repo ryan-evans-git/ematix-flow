@@ -1,0 +1,35 @@
+# Σ.B PR 3: distributed-cluster worker container.
+#
+# Builds the `flow-worker` binary from the workspace + drops it into
+# a slim base image. Each container exposes port 50051 by default;
+# override via `--port` in the docker-compose service.
+#
+# Usage:
+#   docker build -f examples/distributed-cluster/Dockerfile.worker -t ematix-flow-worker .
+#   docker run --rm -p 50051:50051 ematix-flow-worker
+
+FROM rust:1.85-slim AS build
+
+# librdkafka + openssl + curl headers — same set the manylinux wheel
+# build needs. Required because the workspace pulls in rdkafka /
+# openssl-sys / curl-sys transitively through other backends, and a
+# default-features build of the distributed crate still drags those
+# into the dep graph.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    pkg-config build-essential cmake \
+    libssl-dev libcurl4-openssl-dev libsasl2-dev perl \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+COPY . .
+RUN cargo build --release --bin flow-worker -p ematix-flow-distributed
+
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates libssl3 libcurl4 libsasl2-2 \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=build /src/target/release/flow-worker /usr/local/bin/flow-worker
+
+EXPOSE 50051
+ENTRYPOINT ["/usr/local/bin/flow-worker"]
+CMD ["--bind", "0.0.0.0", "--port", "50051"]

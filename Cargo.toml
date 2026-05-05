@@ -85,6 +85,11 @@ datafusion = { version = "53.1", default-features = false, features = ["parquet"
 # `docs/PHASE_SIGMA_B_TRAIT_SPIKE.md` "PR 2 distributed-engine
 # pivot" for the rationale.
 datafusion-distributed = "1"
+# Σ.B PR 3: gRPC transport for the `flow-worker` binary that hosts
+# `datafusion_distributed::Worker::into_worker_server()`. Pinned to
+# 0.14 to match the version datafusion-distributed 1.0 uses
+# transitively — sharing one tonic ABI across the workspace.
+tonic = { version = "0.14", features = ["transport"] }
 # Kafka (Phase 36). FFI to librdkafka. The `cmake-build` feature
 # compiles librdkafka from source (slow first build, but no system
 # library required) — keeps CI portable. Default features (libz,

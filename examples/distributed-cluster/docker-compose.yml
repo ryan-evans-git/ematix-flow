@@ -1,0 +1,53 @@
+# Σ.B PR 3: 3-worker distributed-execution cluster.
+#
+# Brings up three `flow-worker` peers on a private bridge network.
+# A coordinator process running outside the compose (your local
+# `flow consume` invocation, a Python pipeline, or anything that
+# constructs a `DistributedBackend`) connects via the published
+# ports.
+#
+# Usage:
+#   docker compose -f examples/distributed-cluster/docker-compose.yml up --build
+#
+# Then point a coordinator at:
+#   peers = [
+#     "http://localhost:50051",
+#     "http://localhost:50052",
+#     "http://localhost:50053",
+#   ]
+#
+# Tear down:
+#   docker compose -f examples/distributed-cluster/docker-compose.yml down
+
+services:
+  flow-worker-01:
+    build:
+      context: ../..
+      dockerfile: examples/distributed-cluster/Dockerfile.worker
+    image: ematix-flow-worker:latest
+    ports:
+      - "50051:50051"
+    networks:
+      - flow-cluster
+
+  flow-worker-02:
+    image: ematix-flow-worker:latest
+    depends_on:
+      - flow-worker-01
+    ports:
+      - "50052:50051"
+    networks:
+      - flow-cluster
+
+  flow-worker-03:
+    image: ematix-flow-worker:latest
+    depends_on:
+      - flow-worker-01
+    ports:
+      - "50053:50051"
+    networks:
+      - flow-cluster
+
+networks:
+  flow-cluster:
+    driver: bridge

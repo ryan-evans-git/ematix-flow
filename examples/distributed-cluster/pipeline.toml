@@ -1,0 +1,46 @@
+# Σ.B PR 3: sample distributed-cluster pipeline config.
+#
+# Runs a SQL transform against a Kafka source + writes to Postgres,
+# fanning the SQL out across the three worker pods declared in
+# `docker-compose.yml`.
+#
+# Bring up the workers with:
+#   docker compose -f examples/distributed-cluster/docker-compose.yml up --build
+#
+# Then run:
+#   flow consume examples/distributed-cluster/pipeline.toml
+#
+# Replace the `[source]` / `[target]` blocks with your own inputs +
+# outputs. The `[transform]` block is the load-bearing piece —
+# `engine = "distributed"` plus `peers = [...]` is what tells
+# ematix-flow to fan SQL across the cluster.
+
+pipeline_name = "distributed-demo"
+source_query = "events"
+
+[source]
+kind = "kafka"
+bootstrap_servers = "localhost:9092"
+
+[target]
+kind = "sqlite"
+path = ":memory:"
+
+[target.table]
+name = "rolled_up"
+
+[transform]
+sql = """
+    SELECT
+        user_id,
+        SUM(amount) AS total_amount,
+        COUNT(*)    AS event_count
+    FROM source
+    GROUP BY user_id
+"""
+engine = "distributed"
+peers = [
+    "http://localhost:50051",
+    "http://localhost:50052",
+    "http://localhost:50053",
+]

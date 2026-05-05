@@ -20,10 +20,22 @@ arrow-array = { workspace = true }
 arrow-schema = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net"] }
 tracing = { workspace = true }
 url = { workspace = true }
 futures-util = { workspace = true }
+# Σ.B PR 3: hosts `Worker::into_worker_server()` from the
+# `flow-worker` binary so peer pods can serve distributed-plan
+# stages.
+tonic = { workspace = true }
+
+[[bin]]
+name = "flow-worker"
+path = "src/bin/flow_worker.rs"
 
 [dev-dependencies]
 tempfile = "3"
+# Σ.B PR 3 integration test: spawn N in-process workers in the test
+# itself + bind to a free port via TcpListener, then connect a
+# coordinator. Avoids Docker dependency for the cross-pod test.
+tokio-stream = { version = "0.1", features = ["net"] }
