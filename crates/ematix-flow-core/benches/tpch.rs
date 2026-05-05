@@ -33,10 +33,103 @@ use datafusion::arrow::array::RecordBatch;
 use datafusion::prelude::SessionContext;
 use tokio::runtime::Runtime;
 
-const Q1: &str = include_str!("../../../examples/tpch/queries/q01.sql");
-const Q3: &str = include_str!("../../../examples/tpch/queries/q03.sql");
-const Q6: &str = include_str!("../../../examples/tpch/queries/q06.sql");
-const Q19: &str = include_str!("../../../examples/tpch/queries/q19.sql");
+/// Σ.C extension: full 22-query TPC-H suite. Each entry pairs the
+/// criterion bench label with the SQL body. Add a new query here +
+/// drop a `qNN.sql` under `examples/tpch/queries/` to extend; the
+/// bench loop iterates this slice. Source files are produced by
+/// `cargo run --release -p ematix-flow-core --example tpch_extract_queries`
+/// and the `tpch_22_audit` example confirms all 22 plan + execute
+/// against the SF=1 dataset.
+const TPCH_QUERIES: &[(&str, &str)] = &[
+    (
+        "q01",
+        include_str!("../../../examples/tpch/queries/q01.sql"),
+    ),
+    (
+        "q02",
+        include_str!("../../../examples/tpch/queries/q02.sql"),
+    ),
+    (
+        "q03",
+        include_str!("../../../examples/tpch/queries/q03.sql"),
+    ),
+    (
+        "q04",
+        include_str!("../../../examples/tpch/queries/q04.sql"),
+    ),
+    (
+        "q05",
+        include_str!("../../../examples/tpch/queries/q05.sql"),
+    ),
+    (
+        "q06",
+        include_str!("../../../examples/tpch/queries/q06.sql"),
+    ),
+    (
+        "q07",
+        include_str!("../../../examples/tpch/queries/q07.sql"),
+    ),
+    (
+        "q08",
+        include_str!("../../../examples/tpch/queries/q08.sql"),
+    ),
+    (
+        "q09",
+        include_str!("../../../examples/tpch/queries/q09.sql"),
+    ),
+    (
+        "q10",
+        include_str!("../../../examples/tpch/queries/q10.sql"),
+    ),
+    (
+        "q11",
+        include_str!("../../../examples/tpch/queries/q11.sql"),
+    ),
+    (
+        "q12",
+        include_str!("../../../examples/tpch/queries/q12.sql"),
+    ),
+    (
+        "q13",
+        include_str!("../../../examples/tpch/queries/q13.sql"),
+    ),
+    (
+        "q14",
+        include_str!("../../../examples/tpch/queries/q14.sql"),
+    ),
+    (
+        "q15",
+        include_str!("../../../examples/tpch/queries/q15.sql"),
+    ),
+    (
+        "q16",
+        include_str!("../../../examples/tpch/queries/q16.sql"),
+    ),
+    (
+        "q17",
+        include_str!("../../../examples/tpch/queries/q17.sql"),
+    ),
+    (
+        "q18",
+        include_str!("../../../examples/tpch/queries/q18.sql"),
+    ),
+    (
+        "q19",
+        include_str!("../../../examples/tpch/queries/q19.sql"),
+    ),
+    (
+        "q20",
+        include_str!("../../../examples/tpch/queries/q20.sql"),
+    ),
+    (
+        "q21",
+        include_str!("../../../examples/tpch/queries/q21.sql"),
+    ),
+    (
+        "q22",
+        include_str!("../../../examples/tpch/queries/q22.sql"),
+    ),
+];
 
 /// Tables registered against the DataFusion SessionContext. Order
 /// matches dependency depth (region → nation → supplier ... → lineitem)
@@ -108,14 +201,19 @@ fn measurement_time_for(query: &str) -> Duration {
     {
         return Duration::from_secs(s);
     }
-    // M3 Pro SF=1 measured timings (committed baseline 2026-05-05):
+    // M3 Pro SF=1 measured timings (2026-05-05 representative set):
     //   Q1 = 48.7 ms, Q3 = 34.6 ms, Q6 = 18.2 ms, Q19 = 38.0 ms.
-    // 20s windows give 400+ iterations per query — plenty for stable
-    // medians. Linux x86_64 m6i.4xlarge expected within ~2× of these.
+    // The Σ.C extension audit (`tpch_22_audit`) confirmed all 22
+    // queries plan + execute at SF=1 in 17–105 ms each. With 22
+    // queries × ~10s windows the suite runs in ~5 min wall-clock;
+    // any operator who wants tighter CIs can bump
+    // `TPCH_MEASUREMENT_TIME_S` from the env. The original 4
+    // representative queries keep their 15-20s windows for
+    // backward-compat with the 2026-05-05 baseline.
     match query {
         "q01" | "q03" | "q19" => Duration::from_secs(20),
         "q06" => Duration::from_secs(15),
-        _ => Duration::from_secs(20),
+        _ => Duration::from_secs(10),
     }
 }
 
@@ -142,10 +240,9 @@ fn bench_tpch(c: &mut Criterion) {
     println!("==> SF tag (group label): {sf}");
     let ctx = rt.block_on(build_session(&rt, &dir));
 
-    let queries: &[(&str, &str)] = &[("q01", Q1), ("q03", Q3), ("q06", Q6), ("q19", Q19)];
     let group_name = format!("tpch_{sf}");
 
-    for (name, sql) in queries {
+    for (name, sql) in TPCH_QUERIES {
         let mut group = c.benchmark_group(&group_name);
         group
             .sample_size(10)

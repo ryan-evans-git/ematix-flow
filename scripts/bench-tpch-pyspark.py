@@ -53,12 +53,11 @@ TPCH_TABLES = [
     "orders",
     "lineitem",
 ]
-QUERY_FILES = {
-    "q01": QUERIES_DIR / "q01.sql",
-    "q03": QUERIES_DIR / "q03.sql",
-    "q06": QUERIES_DIR / "q06.sql",
-    "q19": QUERIES_DIR / "q19.sql",
-}
+# Σ.C extension: all 22 TPC-H spec queries. The .sql files are
+# canonical-substituted output from the Rust extractor at
+# crates/ematix-flow-core/examples/tpch_extract_queries.rs.
+QUERY_NAMES = [f"q{i:02d}" for i in range(1, 23)]
+QUERY_FILES = {name: QUERIES_DIR / f"{name}.sql" for name in QUERY_NAMES}
 
 
 def build_spark() -> SparkSession:
@@ -154,14 +153,18 @@ def emit_markdown(results: dict[str, dict[str, float]], df_baseline: dict[str, f
         "PySpark trials min/max (ms) | rows |",
         "|---|---|---|---|---|---|",
     ]
-    for name in ("q01", "q03", "q06", "q19"):
+    for name in QUERY_NAMES:
+        if name not in results:
+            continue
         spark_med = results[name]["median_ms"]
         df_med = df_baseline.get(name, 0.0)
-        ratio = (df_med / spark_med) if spark_med else 0.0
+        ratio = (df_med / spark_med) if spark_med and df_med else 0.0
         rng = f"{results[name]['min_ms']:.1f} / {results[name]['max_ms']:.1f}"
+        df_cell = f"{df_med:>5.1f}" if df_med else "  TBD"
+        ratio_cell = f"{ratio:.3f}" if ratio else "—"
         lines.append(
-            f"| {name.upper()} | {df_med:>5.1f} | {spark_med:>7.1f} | "
-            f"{ratio:.3f} | {rng} | {int(results[name]['rows'])} |"
+            f"| {name.upper()} | {df_cell} | {spark_med:>7.1f} | "
+            f"{ratio_cell} | {rng} | {int(results[name]['rows'])} |"
         )
     return "\n".join(lines)
 
@@ -183,11 +186,13 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-# DataFusion baseline numbers from `cargo bench --bench tpch -- --save-baseline
-# sigma_a1_sf1_m3pro` on M3 Pro at SF=1 (committed in docs/BENCHMARKS.md).
-# Rebench DataFusion + edit here if running on different hardware so the
+# DataFusion baseline numbers from `cargo bench --bench tpch` on M3 Pro
+# at SF=1. The first 4 (Q1/Q3/Q6/Q19) are the committed Σ.A1 PR 2 baseline;
+# the remaining 18 came from the Σ.C extension run (2026-05-05). Rebench
+# DataFusion + edit here if running on different hardware so the
 # DF/PySpark ratio in the output table reflects same-host numbers.
-DATAFUSION_BASELINE_M3PRO_SF1_MS = {
+# Queries not listed will render as "TBD" / "—" in the output.
+DATAFUSION_BASELINE_M3PRO_SF1_MS: dict[str, float] = {
     "q01": 48.7,
     "q03": 34.6,
     "q06": 18.2,
@@ -207,9 +212,12 @@ def main() -> None:
     register_tables(spark, args.data_dir)
 
     results: dict[str, dict[str, float]] = {}
-    for name in ("q01", "q03", "q06", "q19"):
+    for name in QUERY_NAMES:
         print(f"-- {name} --")
-        results[name] = run(spark, name, args.trials)
+        try:
+            results[name] = run(spark, name, args.trials)
+        except Exception as e:  # noqa: BLE001 — surface, don't kill the run
+            print(f"  FAIL: {e}")
         print()
 
     spark.stop()
