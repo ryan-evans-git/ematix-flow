@@ -71,6 +71,11 @@ pub struct ObjectStoreBackend {
     /// CSV delimiter / header). Read paths don't consult this — the
     /// underlying readers infer codec / delimiter from file metadata.
     write_options: ObjectWriteOptions,
+    /// Σ.B PR 1: original location config, retained so
+    /// [`Backend::config`] can reconstruct an identical backend on
+    /// another node. Carries credentials in plaintext — same trust
+    /// boundary as the existing `dsn` field.
+    location: crate::backend::ObjectStoreLocation,
 }
 
 impl ObjectStoreBackend {
@@ -93,6 +98,9 @@ impl ObjectStoreBackend {
             dsn: format!("file://{}", root.display()),
             base_label: root.display().to_string(),
             write_options: ObjectWriteOptions::default(),
+            location: crate::backend::ObjectStoreLocation::Local {
+                root_dir: root.display().to_string(),
+            },
         })
     }
 
@@ -160,6 +168,13 @@ impl ObjectStoreBackend {
             dsn: format!("s3://{bucket}@{endpoint}"),
             base_label: format!("s3://{bucket}"),
             write_options: ObjectWriteOptions::default(),
+            location: crate::backend::ObjectStoreLocation::S3 {
+                endpoint: endpoint.to_string(),
+                bucket: bucket.to_string(),
+                region: region.to_string(),
+                access_key: access_key.to_string(),
+                secret_key: secret_key.to_string(),
+            },
         })
     }
 }
@@ -670,6 +685,14 @@ impl Backend for ObjectStoreBackend {
 
     fn dsn(&self) -> Option<String> {
         Some(self.dsn.clone())
+    }
+
+    fn config(&self) -> crate::backend::BackendConfig {
+        crate::backend::BackendConfig::ObjectStore(crate::backend::ObjectStoreConfig {
+            location: self.location.clone(),
+            format: self.format,
+            write_options: self.write_options.clone(),
+        })
     }
 
     /// For object stores, "ping" means: can we list the root? A failed

@@ -52,7 +52,8 @@ pub enum Dialect {
 }
 
 /// File format for raw object-storage targets (Phase 34).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ObjectFormat {
     Parquet,
     Csv,
@@ -63,7 +64,7 @@ pub enum ObjectFormat {
 /// Per-format write-time options. Defaults match the historical
 /// pre-Π.1.4 behavior: Parquet uncompressed, CSV with comma delimiter
 /// + header row. Pass via [`ObjectStoreBackend::with_write_options`].
-#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct ObjectWriteOptions {
     /// Compression codec for Parquet writes. `None` keeps the
     /// historical default (UNCOMPRESSED). Only consulted when the
@@ -82,7 +83,8 @@ pub struct ObjectWriteOptions {
 /// because the wider set (LZO, BROTLI, LZ4, LZ4_RAW) is rarely
 /// asked for in production. Each variant maps to a single
 /// `parquet::basic::Compression` value at write time.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ParquetCompression {
     /// No compression. Same as today's default.
     Uncompressed,
@@ -446,7 +448,8 @@ pub use crate::meta::DeleteHandling;
 /// Migration status per variant (Σ.B PR 1):
 ///   - DB backends (Postgres / MySql / Sqlite / DuckDb): commit b
 ///     populated; payload structs carry DSN / location
-///   - Object store + Delta: commit c (still unit placeholders)
+///   - Object store + Delta: commit c populated; payload covers
+///     local + S3 with sub-tagged location enums
 ///   - Streaming (Kafka / Kinesis / Pub/Sub / RabbitMq): commit d
 ///     (still unit placeholders)
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -460,8 +463,8 @@ pub enum BackendConfig {
     Kinesis,
     PubSub,
     RabbitMq,
-    Delta,
-    ObjectStore,
+    Delta(DeltaConfig),
+    ObjectStore(ObjectStoreConfig),
 }
 
 /// Σ.B PR 1 commit b: serializable Postgres config. The DSN carries
@@ -490,6 +493,81 @@ pub struct SqliteConfig {
 pub struct DuckDbConfig {
     /// `:memory:` for an ephemeral DB; an absolute path otherwise.
     pub location: String,
+}
+
+/// Σ.B PR 1 commit c: object-store config covering both local-FS
+/// and S3-compatible roots. The `location` discriminator lives
+/// inside this struct rather than on the parent `BackendConfig`
+/// because both `Local` and `S3` are still kind=`object_store` from
+/// the outer perspective — the local-vs-S3 distinction is
+/// implementation-internal to the object-store backend.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ObjectStoreConfig {
+    pub location: ObjectStoreLocation,
+    pub format: ObjectFormat,
+    /// Per-format write options (Parquet compression, CSV delimiter,
+    /// CSV header). Default = pre-Π.1.4 behavior (Parquet
+    /// uncompressed, CSV comma + header).
+    #[serde(default)]
+    pub write_options: ObjectWriteOptions,
+}
+
+/// Local-FS root vs. S3-compatible root for [`ObjectStoreConfig`].
+/// Inline credentials per the spike's locked decision.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ObjectStoreLocation {
+    Local {
+        /// Filesystem root path; created if missing on `open_local`.
+        root_dir: String,
+    },
+    S3 {
+        /// Full URL including scheme (`http://localhost:9000` for
+        /// MinIO, `https://s3.amazonaws.com` for AWS).
+        endpoint: String,
+        bucket: String,
+        region: String,
+        access_key: String,
+        secret_key: String,
+    },
+}
+
+/// Σ.B PR 1 commit c: Delta-Lake config. Same Local/S3 discriminator
+/// as [`ObjectStoreConfig`] but lives in its own struct because
+/// Delta carries `partition_columns` (a Delta-only knob) and lacks
+/// `format` (Delta tables are inherently Parquet under the hood).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct DeltaConfig {
+    pub location: DeltaLocation,
+    /// Phase 40.1: optional per-target partition columns. Only
+    /// applied on first-write table creation; preexisting tables
+    /// retain their declared layout.
+    #[serde(default)]
+    pub partition_columns: Vec<String>,
+}
+
+/// Local-FS root vs. S3-compatible root for [`DeltaConfig`]. The
+/// S3 variant adds an optional `prefix` (key prefix inside the
+/// bucket) that the [`ObjectStoreConfig::S3`] variant doesn't —
+/// Delta encodes the prefix in the URL it threads through
+/// `DeltaTableBuilder`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DeltaLocation {
+    Local {
+        root_dir: String,
+    },
+    S3 {
+        endpoint: String,
+        bucket: String,
+        /// Optional key prefix inside the bucket. `""` for bucket-
+        /// root tables.
+        #[serde(default)]
+        prefix: String,
+        region: String,
+        access_key: String,
+        secret_key: String,
+    },
 }
 
 /// Σ.D-ready partitioning-hint placeholder. Return type for
@@ -533,14 +611,66 @@ pub async fn backend_from_config(
         BackendConfig::DuckDb(c) => Ok(std::sync::Arc::new(
             crate::duckdb_backend::DuckDBBackend::open(c.location)?,
         )),
+        BackendConfig::ObjectStore(c) => {
+            let backend = match c.location {
+                ObjectStoreLocation::Local { root_dir } => {
+                    crate::objectstore_backend::ObjectStoreBackend::open_local(
+                        std::path::PathBuf::from(root_dir),
+                        c.format,
+                    )?
+                }
+                ObjectStoreLocation::S3 {
+                    endpoint,
+                    bucket,
+                    region,
+                    access_key,
+                    secret_key,
+                } => crate::objectstore_backend::ObjectStoreBackend::open_s3(
+                    &endpoint,
+                    &bucket,
+                    &region,
+                    &access_key,
+                    &secret_key,
+                    c.format,
+                )?,
+            }
+            .with_write_options(c.write_options);
+            Ok(std::sync::Arc::new(backend))
+        }
+        BackendConfig::Delta(c) => {
+            let mut backend = match c.location {
+                DeltaLocation::Local { root_dir } => {
+                    crate::delta_backend::DeltaBackend::open_local(std::path::PathBuf::from(
+                        root_dir,
+                    ))?
+                }
+                DeltaLocation::S3 {
+                    endpoint,
+                    bucket,
+                    prefix,
+                    region,
+                    access_key,
+                    secret_key,
+                } => crate::delta_backend::DeltaBackend::open_s3(
+                    &endpoint,
+                    &bucket,
+                    &prefix,
+                    &region,
+                    &access_key,
+                    &secret_key,
+                )?,
+            };
+            if !c.partition_columns.is_empty() {
+                backend = backend.with_partition_columns(c.partition_columns);
+            }
+            Ok(std::sync::Arc::new(backend))
+        }
         not_yet @ (BackendConfig::Kafka
         | BackendConfig::Kinesis
         | BackendConfig::PubSub
-        | BackendConfig::RabbitMq
-        | BackendConfig::Delta
-        | BackendConfig::ObjectStore) => Err(BackendError::Other(format!(
+        | BackendConfig::RabbitMq) => Err(BackendError::Other(format!(
             "backend_from_config({not_yet:?}) not yet implemented — \
-             Σ.B PR 1 commits c/d wire object-store + streaming backends. \
+             Σ.B PR 1 commit d wires the streaming backends. \
              See docs/PHASE_SIGMA_B_TRAIT_SPIKE.md."
         ))),
     }

@@ -85,6 +85,9 @@ pub struct DeltaBackend {
     /// already-partitioned table must match the existing layout, or
     /// deltalake-rs raises a clear error.
     partition_columns: Vec<String>,
+    /// Σ.B PR 1: original location config retained for round-trip
+    /// reconstruction via [`Backend::config`].
+    location: crate::backend::DeltaLocation,
 }
 
 impl DeltaBackend {
@@ -112,6 +115,9 @@ impl DeltaBackend {
             store: Arc::new(store),
             storage_options: HashMap::new(),
             partition_columns: Vec::new(),
+            location: crate::backend::DeltaLocation::Local {
+                root_dir: abs.display().to_string(),
+            },
         })
     }
 
@@ -191,6 +197,14 @@ impl DeltaBackend {
             store,
             storage_options: opts,
             partition_columns: Vec::new(),
+            location: crate::backend::DeltaLocation::S3 {
+                endpoint: endpoint.to_string(),
+                bucket: bucket.to_string(),
+                prefix: trimmed_prefix.to_string(),
+                region: region.to_string(),
+                access_key: access_key.to_string(),
+                secret_key: secret_key.to_string(),
+            },
         })
     }
 
@@ -554,6 +568,13 @@ impl Backend for DeltaBackend {
 
     fn dsn(&self) -> Option<String> {
         Some(self.root_url.to_string())
+    }
+
+    fn config(&self) -> crate::backend::BackendConfig {
+        crate::backend::BackendConfig::Delta(crate::backend::DeltaConfig {
+            location: self.location.clone(),
+            partition_columns: self.partition_columns.clone(),
+        })
     }
 
     async fn ping(&self) -> Result<(), BackendError> {

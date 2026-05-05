@@ -20,7 +20,9 @@
 //! Plan + spike: `docs/PHASE_SIGMA_PLAN.md` Σ.B + `docs/PHASE_SIGMA_B_TRAIT_SPIKE.md`.
 
 use ematix_flow_core::backend::{
-    BackendConfig, DuckDbConfig, MySqlConfig, PostgresConfig, SqliteConfig, backend_from_config,
+    BackendConfig, DeltaConfig, DeltaLocation, DuckDbConfig, MySqlConfig, ObjectFormat,
+    ObjectStoreConfig, ObjectStoreLocation, ObjectWriteOptions, ParquetCompression, PostgresConfig,
+    SqliteConfig, backend_from_config,
 };
 
 // --- JSON round-trip ----------------------------------------------
@@ -141,6 +143,127 @@ fn backend_trait_is_static_object_safe() {
     assert_object_safe::<dyn ematix_flow_core::backend::Backend>();
     fn requires_static<T: 'static + ?Sized>() {}
     requires_static::<dyn ematix_flow_core::backend::Backend>();
+}
+
+// --- Σ.B PR 1 commit c: object-store + Delta -----------------------
+
+#[test]
+fn object_store_local_config_round_trips_with_format() {
+    let cfg = BackendConfig::ObjectStore(ObjectStoreConfig {
+        location: ObjectStoreLocation::Local {
+            root_dir: "/tmp/exports".into(),
+        },
+        format: ObjectFormat::Parquet,
+        write_options: ObjectWriteOptions {
+            parquet_compression: Some(ParquetCompression::Snappy),
+            ..Default::default()
+        },
+    });
+    let json = serde_json::to_string(&cfg).expect("serialize");
+    let recovered: BackendConfig = serde_json::from_str(&json).expect("deserialize");
+    match recovered {
+        BackendConfig::ObjectStore(c) => {
+            assert!(matches!(
+                c.location,
+                ObjectStoreLocation::Local { ref root_dir } if root_dir == "/tmp/exports"
+            ));
+            assert!(matches!(c.format, ObjectFormat::Parquet));
+            assert_eq!(
+                c.write_options.parquet_compression,
+                Some(ParquetCompression::Snappy)
+            );
+        }
+        other => panic!("expected ObjectStore, got {other:?}"),
+    }
+}
+
+#[test]
+fn object_store_s3_config_round_trips() {
+    let cfg = BackendConfig::ObjectStore(ObjectStoreConfig {
+        location: ObjectStoreLocation::S3 {
+            endpoint: "http://localhost:9000".into(),
+            bucket: "warehouse".into(),
+            region: "us-east-1".into(),
+            access_key: "minio".into(),
+            secret_key: "minio123".into(),
+        },
+        format: ObjectFormat::Csv,
+        write_options: ObjectWriteOptions::default(),
+    });
+    let json = serde_json::to_string(&cfg).expect("serialize");
+    let recovered: BackendConfig = serde_json::from_str(&json).expect("deserialize");
+    if let BackendConfig::ObjectStore(c) = recovered
+        && let ObjectStoreLocation::S3 { bucket, region, .. } = c.location
+    {
+        assert_eq!(bucket, "warehouse");
+        assert_eq!(region, "us-east-1");
+    } else {
+        panic!("expected ObjectStore::S3");
+    }
+}
+
+#[tokio::test]
+async fn backend_from_config_constructs_local_object_store() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let cfg = BackendConfig::ObjectStore(ObjectStoreConfig {
+        location: ObjectStoreLocation::Local {
+            root_dir: tmp.path().to_string_lossy().into_owned(),
+        },
+        format: ObjectFormat::Parquet,
+        write_options: ObjectWriteOptions::default(),
+    });
+    let backend = backend_from_config(cfg).await.expect("construct");
+    backend.ping().await.expect("ping");
+    // Round-trip the config through the live backend.
+    match backend.config() {
+        BackendConfig::ObjectStore(c) => {
+            assert!(matches!(c.location, ObjectStoreLocation::Local { .. }));
+            assert!(matches!(c.format, ObjectFormat::Parquet));
+        }
+        other => panic!("expected ObjectStore config, got {other:?}"),
+    }
+}
+
+#[test]
+fn delta_local_config_round_trips_with_partition_columns() {
+    let cfg = BackendConfig::Delta(DeltaConfig {
+        location: DeltaLocation::Local {
+            root_dir: "/tmp/delta".into(),
+        },
+        partition_columns: vec!["year".into(), "month".into()],
+    });
+    let json = serde_json::to_string(&cfg).expect("serialize");
+    let recovered: BackendConfig = serde_json::from_str(&json).expect("deserialize");
+    match recovered {
+        BackendConfig::Delta(c) => {
+            assert!(matches!(
+                c.location,
+                DeltaLocation::Local { ref root_dir } if root_dir == "/tmp/delta"
+            ));
+            assert_eq!(c.partition_columns, vec!["year", "month"]);
+        }
+        other => panic!("expected Delta, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn backend_from_config_constructs_local_delta() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let cfg = BackendConfig::Delta(DeltaConfig {
+        location: DeltaLocation::Local {
+            root_dir: tmp.path().to_string_lossy().into_owned(),
+        },
+        partition_columns: Vec::new(),
+    });
+    let backend = backend_from_config(cfg).await.expect("construct");
+    backend.ping().await.expect("ping");
+    match backend.config() {
+        BackendConfig::Delta(c) => {
+            assert!(matches!(c.location, DeltaLocation::Local { .. }));
+            assert!(c.partition_columns.is_empty());
+        }
+        other => panic!("expected Delta config, got {other:?}"),
+    }
 }
 
 #[test]
