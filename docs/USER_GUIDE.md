@@ -1074,6 +1074,59 @@ Expected for at-least-once with non-idempotent targets. Use:
 
 ---
 
+## Interactive DataFrame work in Python
+
+ematix-flow's Python surface is shaped around **declarative
+pipelines** — `@ematix.streaming_pipeline` decorators, typed
+`Source` / `Target` config, the `flow consume` CLI. That's the
+right surface for "this pipeline runs every N seconds in
+production" but not for "I'm exploring data in a notebook" or
+"let me prototype a transform interactively before formalizing it".
+
+For that interactive use case, **`datafusion-python` is the natural
+complement**:
+
+```sh
+pip install datafusion
+```
+
+```python
+from datafusion import SessionContext
+
+ctx = SessionContext()
+ctx.register_parquet("orders", "examples/tpch/data/sf1/orders.parquet")
+df = ctx.sql("SELECT o_custkey, SUM(o_totalprice) AS total "
+             "FROM orders GROUP BY o_custkey ORDER BY total DESC LIMIT 10")
+print(df)              # pretty-print
+arrow = df.to_arrow_table()  # → pyarrow for downstream tooling
+pandas = df.to_pandas()      # if you want a DataFrame
+```
+
+It runs the same Apache DataFusion engine ematix-flow uses under
+the hood (`crates/ematix-flow-core` pins `datafusion = "53.1"`;
+`datafusion-python` tracks the same release line). So:
+
+- A SQL query that works in a `[transform]` block in your
+  pipeline TOML works identically in the interactive
+  `SessionContext`. Useful for iteration: prototype the SQL
+  interactively, then drop it into the pipeline.
+- Schemas + type coercion + window functions + the dialect-
+  translator-targeted SQL surface (Spark / DuckDB) all behave the
+  same. What `datafusion-python` accepts, `LazySqlTransform`
+  accepts.
+
+**Not the same thing** (worth being explicit):
+
+- `datafusion-python` ships its own DataFusion + Arrow as a wheel.
+  It's a separate process-level install from ematix-flow's wheel.
+  Mixing the two in one Python process is fine for normal use, but
+  if you're passing PyArrow tables across the boundary be aware
+  that they may go through one extra Arrow-IPC round-trip when
+  ABIs don't perfectly align.
+- ematix-flow's PyO3 layer (the `import ematix_flow` you already
+  use for `@ematix.streaming_pipeline`) doesn't depend on
+  `datafusion-python`. Installing one doesn't pull in the other.
+
 ## Where to read next
 
 - **[`docs/ROADMAP.md`](ROADMAP.md)** — what's left to ship and the
