@@ -56,6 +56,80 @@ support without distribution. Shipping A1–C gets you the public claim.
   In-process DataFusion stays the default forever. Ballista is opt-in
   via config; small workloads benefit from skipping the network hop.
 
+## What Σ does and doesn't speed up
+
+A common framing question is "will Σ make my reads / writes faster?"
+Σ scales work **across machines**, not **within a machine**. ematix-
+flow already beats PySpark single-node by ~2–4× on TPC-H (DataFusion's
+optimizer + vectorized executor + no JVM warmup); Σ.B's job is making
+sure that single-node lead doesn't disappear when workloads outgrow one
+box. If your goal is "make a single 100 GB Postgres read 5× faster on
+the same hardware," Σ alone is not the answer — that wants targeted
+async-I/O work in the existing backends, separate from this plan.
+
+### Object-store reads / writes
+
+| Sub-phase | Effect |
+|---|---|
+| Σ.A1 | Audits the existing scan path on TPC-H Parquet; surfaces any pessimal patterns. Fixes flow into single-node, free speedup. |
+| Σ.A2 | None (SQL parsing is sub-ms; not on the hot path). |
+| Σ.B  | **Yes — distributed scan.** 100 Parquet files across 4 executors → ~4× scan-bound speedup, capped by S3-prefix throughput limits and your egress bandwidth. Predicate pushdown into the scan is already DataFusion's strength. |
+| Σ.B  | **Writes are target-specific.** Per-executor file-per-partition (deterministic naming) works out of the box. Coordinated atomic commit needs target-side support — Delta Lake's transaction log handles it; raw object-store writes get documented patterns rather than a universal commit coordinator. |
+| Σ.D  | None for batch; streaming object-store sources/targets land if/when they exist (today object-store is batch-only — see ROADMAP P4 #28). |
+
+### Database reads / writes (Postgres / MySQL / SQLite / DuckDB)
+
+| Sub-phase | Effect |
+|---|---|
+| Σ.A1 | None directly; benchmark surface is Parquet-only. |
+| Σ.A2 | None. |
+| Σ.B  | **Yes for reads, capped by the database.** Range-partition reads (`SELECT … WHERE id BETWEEN x AND y`) across N executors give 5–20× on big tables, but you're paying for it in database load + connection pressure. The connector-trait refactor in Σ.B PR 1 is the right place to add async chunked reads + range-partition support uniformly across all DB backends — **side benefit: improves the single-node path too.** |
+| Σ.B  | **Writes scale only with idempotent targets.** MERGE / UPSERT keys allow per-executor parallel writes safely. Transactional inserts (append, no key) still want a single-writer pattern; documented in `examples/ballista-cluster/` patterns. |
+| Σ.D  | None. |
+
+### Streaming (Kafka / Pubsub / Kinesis / RabbitMQ)
+
+| Sub-phase | Effect |
+|---|---|
+| Σ.A1 | None — batch-only. |
+| Σ.A2 | None — batch-only. |
+| Σ.B  | None — batch-only. **Streaming is already partition-parallel today**: N Kafka partitions × N pods = N-way concurrency, achieved without any Σ work. |
+| Σ.D  | **Yes — distributed shuffle for streaming SQL.** Cross-partition windowed joins, global aggregations, and exactly-once across re-partition stop bottlenecking through one node's state. Per-partition throughput doesn't change (that's `rdkafka` / `parquet` / `object_store` raw speed). What unlocks: workloads where the *fan-out* of join keys exceeds one node's RAM. |
+
+### What Σ doesn't address
+
+These are not Σ's job; they need separate work if they're priorities:
+
+- **Single-node I/O microbenchmarks.** Reading a single 1 GB Parquet
+  file on one machine. DataFusion is already at par with PyArrow here;
+  improvements come from `parquet`-crate-level work, not from Σ.
+- **Database connection pooling efficiency.** Each backend's pool
+  config (deadpool-postgres, mysql_async) is tuned per backend.
+  Σ.B's connector-trait refactor consolidates the surface but doesn't
+  touch the pool internals.
+- **Streaming per-partition throughput.** `rdkafka` is near-line-rate
+  on consume; the ceiling is hardware. Improvements come from batch-
+  size tuning + state-store write coalescing, not Σ.
+- **Cold-start time for the in-process path.** Today's `flow consume`
+  starts in <100 ms; Σ doesn't change this. Ballista cold-start is in
+  Σ.C's measurement scope (target ≤ 30% of Spark's).
+
+### Indirect spillover from Σ work
+
+Each sub-phase produces fixes that benefit users who never enable
+the distributed path:
+
+- **Σ.A1 audit.** Running TPC-H Q1/Q3/Q6/Q19 will surface DataFusion
+  errata + transform.rs gaps. Fixes land in the single-node path.
+- **Σ.B PR 1 (connector-trait refactor).** Consolidates async I/O,
+  predicate pushdown, and range-partition support across all 12
+  backends. Single-node users benefit from any pushdown the trait
+  enables (e.g., projecting only requested columns through Postgres
+  COPY when the SQL only references 3 of 50 columns).
+- **Σ.B PR 6 (image-size budget).** Forces a `cargo bloat` audit;
+  any duplicated symbols across statically linked deps get fixed.
+  Wheel size shrinks for everyone.
+
 ## Architecture
 
 ```text
