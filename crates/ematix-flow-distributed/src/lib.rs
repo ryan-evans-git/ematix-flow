@@ -42,12 +42,18 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use datafusion::common::DataFusionError;
+use datafusion::execution::SessionStateBuilder;
+use datafusion::prelude::SessionContext;
+use datafusion_distributed::{DistributedExt, DistributedPhysicalOptimizerRule, WorkerResolver};
 use ematix_flow_core::backend::{
     ArrowBatchStream, Backend, BackendConfig, BackendError, DeleteHandling, Dialect,
     DistributedConfig, StrategyRunResult, TargetTable, WriteMode,
 };
 use ematix_flow_core::pg::ConnectionInfo;
 use ematix_flow_core::types::TableSpec;
+use futures_util::TryStreamExt;
+use tokio::sync::OnceCell;
 use url::Url;
 
 // Re-export so callers depending only on `ematix-flow-distributed`
@@ -56,14 +62,36 @@ use url::Url;
 // 1's pivot rationale).
 pub use ematix_flow_core::backend::DistributedConfig as Config;
 
+/// `WorkerResolver` impl backed by a static `Vec<Url>`. Suitable
+/// for fixed-membership clusters where peers are known at config-
+/// load time. Dynamic membership (k8s pods discovered via DNS,
+/// service-mesh integration) is a Σ.B follow-up.
+#[derive(Clone)]
+struct StaticWorkerResolver {
+    urls: Vec<Url>,
+}
+
+#[async_trait]
+impl WorkerResolver for StaticWorkerResolver {
+    fn get_urls(&self) -> Result<Vec<Url>, DataFusionError> {
+        Ok(self.urls.clone())
+    }
+}
+
 /// Backend that executes SQL transforms across a peer mesh of
-/// ematix-flow processes. PR 2's first commit ships the type +
-/// trait scaffold; the actual distributed-execution plumbing
-/// lands in follow-up commits.
+/// ematix-flow processes. Wraps a [`SessionContext`] that's built
+/// with `datafusion_distributed`'s `with_distributed_planner()`
+/// when at least one peer URL is configured; the empty-peers
+/// degenerate case falls back to a vanilla single-node
+/// `SessionContext` (handy for tests + dev).
 pub struct DistributedBackend {
     /// Validated peer URLs. Stored as `Url` so URL re-parsing
     /// errors surface at construction, not at first execute.
     peers: Vec<Url>,
+    /// Lazily-built DataFusion session. `OnceCell` so the first
+    /// access constructs + caches; subsequent calls reuse without
+    /// re-running the builder.
+    ctx: Arc<OnceCell<Arc<SessionContext>>>,
 }
 
 impl std::fmt::Debug for DistributedBackend {
@@ -89,12 +117,42 @@ impl DistributedBackend {
                     .map_err(|e| BackendError::Connection(format!("peer #{i} ({raw:?}): {e}")))
             })
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(Self { peers })
+        Ok(Self {
+            peers,
+            ctx: Arc::new(OnceCell::new()),
+        })
     }
 
     /// Borrow the configured peer URLs. Mainly for tests + logs.
     pub fn peers(&self) -> &[Url] {
         &self.peers
+    }
+
+    /// Lazily construct + return the session. Vanilla DataFusion
+    /// when peers is empty (degenerate single-worker case); fully
+    /// distributed-planner-enabled when peers has 1+ entries.
+    pub async fn session_context(&self) -> &Arc<SessionContext> {
+        self.ctx
+            .get_or_init(|| async { self.build_context() })
+            .await
+    }
+
+    fn build_context(&self) -> Arc<SessionContext> {
+        if self.peers.is_empty() {
+            // Empty-peers degenerate cluster: skip the distributed
+            // planner so the context can run plans locally without
+            // needing remote workers. Tests + dev use this path.
+            return Arc::new(SessionContext::new());
+        }
+        let resolver = StaticWorkerResolver {
+            urls: self.peers.clone(),
+        };
+        let state = SessionStateBuilder::new()
+            .with_default_features()
+            .with_physical_optimizer_rule(Arc::new(DistributedPhysicalOptimizerRule))
+            .with_distributed_worker_resolver(resolver)
+            .build();
+        Arc::new(SessionContext::from(state))
     }
 }
 
@@ -165,10 +223,27 @@ impl Backend for DistributedBackend {
         ))
     }
 
-    async fn read_arrow_stream(&self, _query: &str) -> Result<ArrowBatchStream, BackendError> {
-        Err(BackendError::Other(
-            "DistributedBackend::read_arrow_stream not yet implemented — Σ.B PR 2 follow-up".into(),
-        ))
+    async fn read_arrow_stream(&self, query: &str) -> Result<ArrowBatchStream, BackendError> {
+        // Delegate to the shared SessionContext. Caller is
+        // responsible for having registered any tables the query
+        // references (via `session_context().register_table(...)`
+        // or analogues). DataFusion plans + executes; with
+        // `peers.len() > 0` the planner injects ArrowFlightReadExec
+        // nodes and fans the work out across peers.
+        let ctx = self.session_context().await.clone();
+        let df = ctx
+            .sql(query)
+            .await
+            .map_err(|e| BackendError::Query(format!("plan: {e}")))?;
+        let stream = df
+            .execute_stream()
+            .await
+            .map_err(|e| BackendError::Query(format!("execute: {e}")))?;
+        // Adapt DataFusion's `SendableRecordBatchStream` (yields
+        // `Result<RecordBatch, DataFusionError>`) into the trait's
+        // `ArrowBatchStream` (yields `Result<RecordBatch, BackendError>`).
+        let mapped = stream.map_err(|e| BackendError::Query(format!("stream: {e}")));
+        Ok(Box::pin(mapped))
     }
 
     async fn write_arrow_stream(
@@ -328,6 +403,53 @@ mod tests {
                 .to_lowercase()
                 .contains("not yet implemented")
         );
+    }
+
+    /// Σ.B PR 2 commit 3: empty-peers degenerate cluster runs the
+    /// query through plain DataFusion locally. No network, no
+    /// remote workers; round-trips RecordBatches through the trait
+    /// surface. Smokes the full pipeline (build context → register
+    /// table → SQL plan → execute → collect) end-to-end.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn read_arrow_stream_runs_locally_with_no_peers() {
+        use datafusion::arrow::array::Int64Array;
+        use datafusion::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+        use datafusion::arrow::record_batch::RecordBatch;
+        use datafusion::datasource::MemTable;
+        use futures_util::TryStreamExt;
+        use std::sync::Arc;
+
+        let backend = DistributedBackend::open(DistributedConfig::default()).unwrap();
+        let ctx = backend.session_context().await.clone();
+
+        // Register a tiny in-memory table the SQL can reference.
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "n",
+            DataType::Int64,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![1, 2, 3, 4, 5]))],
+        )
+        .unwrap();
+        let mem_table = MemTable::try_new(schema, vec![vec![batch]]).unwrap();
+        ctx.register_table("nums", Arc::new(mem_table)).unwrap();
+
+        // Execute through the Backend trait surface.
+        let stream = backend
+            .read_arrow_stream("SELECT SUM(n) AS s FROM nums")
+            .await
+            .expect("plan + execute");
+        let collected: Vec<_> = stream.try_collect().await.expect("collect");
+
+        assert_eq!(collected.len(), 1, "single result batch");
+        let column = collected[0].column(0);
+        let arr = column
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("Int64 sum");
+        assert_eq!(arr.value(0), 15);
     }
 
     /// Σ.B PR 2 commit 2: full round-trip through the shared
