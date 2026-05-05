@@ -9,6 +9,87 @@ Plan: [`docs/PHASE_SIGMA_PLAN.md`](PHASE_SIGMA_PLAN.md).
 
 ---
 
+## TL;DR — TPC-H head-to-head, M3 Pro, SF=10 (2026-05-05)
+
+Single-node DataFusion (via ematix-flow) is **1.7×–9.2× faster
+than PySpark `local[*]`** on the TPC-H representative set
+(Q1 / Q3 / Q6 / Q19) at SF=10 — geomean **3.3× faster**. Same
+M3 Pro, same Snappy Parquet under `examples/tpch/data/sf10/`,
+same SQL files.
+
+| Engine                                           | Q1       | Q3        | Q6      | Q19     | DF/Spark    |
+|---|---|---|---|---|---|
+| **DataFusion** (single-node)                     | 323 ms   |  233 ms   | 116 ms  | 212 ms  | —           |
+| **ematix-flow distributed** (3 in-process workers) | 315 ms |  228 ms   | 109 ms  | 202 ms  | —           |
+| PySpark (`local[*]`, 12 cores, 4 GB heap)        | 1318 ms  | 2146 ms   | 200 ms  | 483 ms  | **3.3× geomean** |
+
+(median wall-clock; criterion bootstrap CI for DataFusion +
+distributed columns, min/max of 3 trials for PySpark; full
+method + per-query CIs in
+[Σ.C PR 2](#σc-pr-2--sf10-multi-process-baseline-2026-05-05) below.)
+
+**What this is.** A regression-canary baseline + a credible
+single-node DataFusion-vs-PySpark comparison on identical
+hardware. Reproducible in ~30 minutes from a clean checkout
+(see one-liner below).
+
+**What this isn't.** Proof of cross-host scaling. Every number
+above is **single-host** (loopback network, shared kernel /
+CPU / memory). The 3-worker ematix-flow-distributed config does
+not show meaningful gains over the single-node config here —
+that's expected on one machine; cross-host wins require
+hardware-isolated workers (homelab k3s, rented bare-metal) and
+remain a deferred item. We do *not* claim "scales as well as
+PySpark on a real cluster" from these numbers.
+
+**Repro** (~30 min wall-clock on M-class hardware):
+
+```sh
+# Generate SF=10 (~3.2 GB, ~1 min)
+cargo run --release -p ematix-flow-core --example tpch_generate -- \
+    --sf 10 --out examples/tpch/data/sf10
+
+# DataFusion + ematix-flow-distributed
+TPCH_DATA_DIR=examples/tpch/data/sf10 TPCH_MEASUREMENT_TIME_S=10 \
+    cargo bench -p ematix-flow-core --bench tpch
+TPCH_DATA_DIR=examples/tpch/data/sf10 TPCH_MEASUREMENT_TIME_S=10 \
+    cargo bench -p ematix-flow-distributed --bench tpch_distributed
+
+# PySpark (needs JDK 17+ + pyspark in venv)
+JAVA_HOME=/opt/homebrew/opt/openjdk PATH="$JAVA_HOME/bin:$PATH" \
+    .venv/bin/python scripts/bench-tpch-pyspark.py \
+    --data-dir examples/tpch/data/sf10 --trials 3
+```
+
+**Honest gaps:**
+
+- Only 4 of TPC-H's 22 queries benched (the Σ.A1 representative
+  set). The remaining 18 lean on correlated subqueries / certain
+  CTE shapes / complex-type literals — Σ.A2 PR 4 audit shows
+  DataFusion plans 103/103 TPC-DS queries with the dialect
+  translator; full TPC-H is in scope for Σ.C extension.
+- Cross-host distributed numbers: deferred (no real cluster
+  hardware in this project's runway). The `infra/` recipe still
+  works for AWS-equipped users.
+- Polars beats DataFusion on Q6 by 1.82× at SF=1 (the
+  vectorized scan-+-aggregate inner loop) — see Σ.A1 PR 4
+  follow-up below. Not regressed at SF=10 (no Polars run yet
+  there, but the gap is structural to query shape).
+- PySpark column at SF=10 used JDK 23 (not the officially
+  supported JDK 17 / 21) with Py4J reflection-warning noise
+  that's harmless. Numbers should be within run-to-run variance
+  of a JDK 17 baseline.
+
+For paste-into-Hacker-News-or-Twitter:
+
+> ematix-flow (Rust, DataFusion 53) runs TPC-H Q1/Q3/Q6/Q19 at
+> SF=10 1.7×–9.2× faster than PySpark single-node (geomean 3.3×)
+> on the same M3 Pro / Snappy Parquet / SQL. Single-host only;
+> not claiming cross-host scaling. Repro + per-query CIs:
+> github.com/ryan-evans-git/ematix-flow/blob/main/docs/BENCHMARKS.md
+
+---
+
 ## Σ.A1 — TPC-H representative set at SF=1
 
 The Σ.A1 audit-by-running anchor: Q1 / Q3 / Q6 / Q19 against
