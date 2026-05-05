@@ -126,13 +126,29 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
 
-      - name: Build wheel (manylinux2014)
+      - name: Build wheel (manylinux_2_28)
         uses: PyO3/maturin-action@v1
         with:
-          # `manylinux: auto` resolves to manylinux2014 for x86_64 ≥
-          # py3.10. Matches our `requires-python = ">=3.10"`.
+          # `manylinux: 2_28` resolves to manylinux_2_28
+          # (AlmaLinux 8 base, gcc 11+, glibc 2.28). Newer than the
+          # default manylinux2014 (CentOS 7, gcc 10) — required
+          # because DuckDB rejects manylinux2014's older C++ ABI
+          # ("DuckDB does not provide extensions for this (legacy)
+          # CXX ABI"), and librdkafka 2.12 + openssl-src have
+          # better support for newer compilers. Wheels built here
+          # require glibc ≥ 2.28 at runtime: covers Ubuntu 20.04+,
+          # Debian 11+, RHEL/AlmaLinux/Rocky 8+, Fedora 30+.
+          # Older systems (RHEL 7, Ubuntu 18.04) are EOL and
+          # excluded by design.
           target: x86_64-unknown-linux-gnu
-          manylinux: auto
+          manylinux: 2_28
+          # `before-script-linux` runs inside the manylinux_2_28
+          # container before the build. We need `perl-core` because
+          # openssl-sys with the `vendored` feature drives openssl's
+          # Configure script, which requires Perl modules
+          # (`IPC::Cmd` etc.) not in the minimal manylinux image.
+          before-script-linux: |
+            dnf install -y perl-core
           # `--release` matches the prod profile (`lto = "thin"`,
           # `codegen-units = 1` per workspace Cargo.toml).
           # `--strip` is implied by [tool.maturin] strip = true.

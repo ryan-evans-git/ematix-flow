@@ -49,7 +49,14 @@ workflow handles deployment.
 - [ ] Confirm `cargo fmt --all -- --check` and
       `cargo clippy --workspace --all-targets -- -D warnings` are clean.
 - [ ] Confirm `cargo audit` and `pip-audit --skip-editable`
-      pass locally (the CI's `verify` job runs both — see
+      pass locally
+- [ ] **Optional but recommended for production releases**: run
+      `bash scripts/local-manylinux-build.sh 3.12` to build a wheel
+      inside the same `quay.io/pypa/manylinux_2_28_x86_64` Docker
+      container the CI uses. Catches CI-only build failures
+      (missing C headers, glibc / C++ ABI mismatches, vendored-lib
+      breakage) without burning Actions minutes. Requires Docker
+      and ≥8 GB RAM allocated to it. (the CI's `verify` job runs both — see
       [`SECURITY.md`](https://github.com/ryan-evans-git/ematix-flow/blob/main/SECURITY.md) for what the gates check and
       the list of accepted advisories).
 - [ ] Bump `version` in `pyproject.toml`. Match the workspace

@@ -76,7 +76,24 @@ datafusion = { version = "53.1", default-features = false, features = ["parquet"
 # compiles librdkafka from source (slow first build, but no system
 # library required) — keeps CI portable. Default features (libz,
 # tokio) cover gzip + tokio integration.
-rdkafka = { version = "0.39", features = ["cmake-build", "ssl", "sasl"] }
+#
+# manylinux2014 is intentionally minimal — none of libsasl2-dev,
+# libcurl-dev, or libssl-dev are pre-installed. We vendor each:
+#
+# - `sasl2-sys/plain,scram` (declared as a separate workspace dep
+#   below) for libsasl2.
+# - `curl-static` here for libcurl. (Required because librdkafka
+#   2.12+'s `rdkafka_conf.c` does `#include <curl/curl.h>`
+#   unconditionally — even with cmake `-DWITH_CURL=0`. We don't
+#   actually use librdkafka's curl-based OIDC OAuth path; MSK IAM
+#   goes through `aws-msk-iam-sasl-signer`'s rust-side callback.
+#   The static curl satisfies the header requirement.)
+# - `ssl-vendored` for openssl (transitive via `openssl-sys/vendored`).
+#
+# Net effect: a fully self-contained wheel, no runtime libsasl2 /
+# libcurl / libssl dependencies on consumer machines. ~3–5MB
+# heavier wheel but equivalent in functionality.
+rdkafka = { version = "0.39", features = ["cmake-build", "ssl-vendored", "sasl", "curl-static"] }
 # rdkafka's `sasl` feature pulls in `sasl2-sys` (transitively via
 # rdkafka-sys's `gssapi` feature → `sasl2-sys`). Without explicit
 # vendoring, that crate's build script looks for system libsasl2
