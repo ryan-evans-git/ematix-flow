@@ -33,6 +33,41 @@ criterion's bootstrap CI. Saved as baseline `sigma_a1_sf1_m3pro`.
 | Q6  | **18.2 ms** | [18.2, 18.3]  | 1155 | scan + filter + single sum |
 | Q19 | **38.0 ms** | [37.4, 38.4]  | 605  | 2-way join + complex disjunctive WHERE |
 
+### Σ.A2 PR 5 — DuckDB-dialect audit (2026-05-05)
+
+DuckDB's SQL surface is closer to DataFusion's than Spark's (both
+inherit Postgres-style syntax + arrow-rs types). The translator's
+expected scope was a handful of function-name aliases; in practice
+the remap table has one entry: `list_value → make_array`.
+
+**Acceptance: ≥90% pass rate on TPC-H + curated set.**
+
+- TPC-H Q1/Q3/Q6/Q19 e2e through `dialect = "duckdb"` → DataFusion:
+  **4/4 PASS** (revenue + row count match TPC-H reference).
+- DuckDB unit tests (`tests/dialect_duckdb.rs`): **13/13 PASS** —
+  pass-through (basic SELECT, aggregates, joins, window, CTE, INTERVAL
+  literal), `list_value → make_array` remap, error paths.
+- TPC-DS suite under `dialect = "duckdb"` (same 103 Spark-canonical
+  queries from PR 4): **103/103 PASS**. DuckDB's parser is
+  permissive enough to accept Spark-style queries; the only DuckDB-
+  specific function (`list_value`) doesn't appear in TPC-DS.
+
+```sh
+cargo run --release -p ematix-flow-core --example tpcds_dialect_audit -- duckdb
+# === Σ.A2 dialect audit (DuckDb) ===
+# total:           103
+# PASS:            103 (100.0%)
+```
+
+**Implication**: DuckDB→DataFusion is essentially a no-op for the
+canonical query surface. Translator value-add is in cases where
+users explicitly use DuckDB-isms (currently just `list_value`); add
+new entries to `DUCKDB_TO_DF` as real-world queries surface gaps.
+
+Σ.A2 status after PR 5: all 5 sub-PRs done. Acceptance gates met
+(or vastly exceeded). Ready to start Σ.B (Ballista trait refactor)
+or pause to ship v0.1.0.
+
 ### Σ.A2 PR 4 — TPC-DS Spark-dialect audit (2026-05-05)
 
 Plan-only translator audit: each of the 103 official Apache Spark

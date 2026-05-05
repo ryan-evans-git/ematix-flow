@@ -33,6 +33,7 @@ use std::str::FromStr;
 
 use thiserror::Error;
 
+mod duckdb;
 mod spark;
 
 /// SQL dialect of the input passed to [`translate`]. Output is always
@@ -123,6 +124,6 @@ pub fn translate(sql: &str, from: Dialect) -> Result<String, DialectError> {
     match from {
         Dialect::DataFusion => Ok(sql.to_string()),
         Dialect::Spark => spark::translate(sql),
-        Dialect::DuckDb => Err(DialectError::NotImplemented(from)),
+        Dialect::DuckDb => duckdb::translate(sql),
     }
 }

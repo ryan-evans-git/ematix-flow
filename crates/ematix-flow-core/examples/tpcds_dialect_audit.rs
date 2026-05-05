@@ -1,7 +1,7 @@
-//! Σ.A2 PR 4: TPC-DS dialect-translator audit.
+//! Σ.A2 PR 4 / PR 5: TPC-DS dialect-translator audit.
 //!
 //! For each of the 99 official Apache Spark TPC-DS queries, run them
-//! through the Spark→DataFusion translator + DataFusion's planner
+//! through the chosen dialect translator + DataFusion's planner
 //! (no execution — TPC-DS data isn't needed). Categorize per-query:
 //!   - PASS: translator succeeded + DataFusion planned successfully
 //!   - TRANSLATE_FAIL: translator returned `DialectError`
@@ -9,7 +9,12 @@
 //!     the result (typically: function-name gap, syntax DataFusion
 //!     doesn't yet implement, type-coercion mismatch)
 //!
-//! Acceptance per `docs/PHASE_SIGMA_PLAN.md` Σ.A2 PR 4: ≥80% PASS.
+//! Acceptance gates per `docs/PHASE_SIGMA_PLAN.md`:
+//!   - Σ.A2 PR 4 (Spark dialect): ≥80% PASS
+//!   - Σ.A2 PR 5 (DuckDB dialect): ≥90% PASS on TPC-H + curated set
+//!     (TPC-DS isn't a primary acceptance surface for DuckDB but
+//!     useful as a signal — DuckDB's SQL is closer to the Spark
+//!     queries' shape than its own canonical TPC-DS)
 //!
 //! Output: a markdown summary table on stdout. Per-query failures
 //! logged to stderr with the underlying error so individual gaps
@@ -17,6 +22,9 @@
 //!
 //! Run:
 //!     cargo run --release -p ematix-flow-core --example tpcds_dialect_audit
+//!     cargo run --release -p ematix-flow-core --example tpcds_dialect_audit -- duckdb
+//!
+//! Defaults to `spark` if no argument is given.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -35,6 +43,14 @@ enum Outcome {
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
+    // Parse the dialect from argv. Default to Spark since the queries
+    // under `examples/tpcds/queries/spark/` are Spark-canonical.
+    let dialect_name: String = std::env::args().nth(1).unwrap_or_else(|| "spark".into());
+    let dialect: Dialect = dialect_name
+        .parse()
+        .unwrap_or_else(|e| panic!("--{dialect_name}: {e}"));
+    println!("==> dialect: {dialect:?}");
+
     let ctx = SessionContext::new();
     register_schema(&ctx).await;
 
@@ -64,7 +80,7 @@ async fn main() {
         // unambiguous.
         let sql = sql.trim().trim_end_matches(';').trim();
 
-        let outcome = match translate(sql, Dialect::Spark) {
+        let outcome = match translate(sql, dialect) {
             Err(e) => {
                 eprintln!("  {name}: TRANSLATE_FAIL — {e}");
                 (Outcome::TranslateFail, e.to_string())
@@ -103,7 +119,7 @@ async fn main() {
     let pass_rate = (pass as f64) / (total as f64) * 100.0;
 
     println!();
-    println!("=== Σ.A2 PR 4 audit ===");
+    println!("=== Σ.A2 dialect audit ({dialect:?}) ===");
     println!("total:           {total}");
     println!("PASS:            {pass} ({pass_rate:.1}%)");
     println!("TRANSLATE_FAIL:  {translate_fail}");

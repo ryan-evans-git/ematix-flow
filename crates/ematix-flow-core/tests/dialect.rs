@@ -14,7 +14,7 @@
 //! semantically, and unsupported dialects must error early with a
 //! clear, actionable message instead of producing surprising SQL.
 
-use ematix_flow_core::dialect::{Dialect, DialectError, translate};
+use ematix_flow_core::dialect::{Dialect, translate};
 
 #[test]
 fn datafusion_passthrough_returns_the_input_unchanged() {
@@ -45,10 +45,16 @@ fn spark_dialect_translates_pass_through() {
     );
 }
 
+/// Σ.A2 PR 5 landed DuckDB. Pass-through cases (`SELECT 1`) succeed;
+/// remap surface (e.g., `list_value`) is exercised in
+/// `tests/dialect_duckdb.rs`.
 #[test]
-fn duckdb_dialect_errors_with_pr5_pointer() {
-    let err = translate("SELECT 1", Dialect::DuckDb).expect_err("duckdb not yet implemented");
-    assert!(matches!(err, DialectError::NotImplemented(Dialect::DuckDb)));
+fn duckdb_dialect_translates_pass_through() {
+    let out = translate("SELECT 1", Dialect::DuckDb).expect("DuckDB passes through trivial SQL");
+    assert!(
+        out.contains('1'),
+        "DuckDB must round-trip `SELECT 1`; got: {out}"
+    );
 }
 
 #[test]
