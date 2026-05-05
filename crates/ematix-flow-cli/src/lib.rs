@@ -465,6 +465,46 @@ pub struct TransformConfig {
     /// `engine != "distributed"`.
     #[serde(default)]
     pub peers: Vec<String>,
+
+    /// Σ.B follow-up: TLS settings for coordinator → worker dials.
+    /// Only meaningful when `engine = "distributed"`. Cross-validated
+    /// at config-load — setting `[transform.tls]` under any other
+    /// engine is rejected so a misplaced block doesn't silently
+    /// produce plain-HTTP traffic.
+    #[serde(default)]
+    pub tls: Option<TransformTlsToml>,
+}
+
+/// `[transform.tls]` block — coordinator-side TLS knobs. Mirrors
+/// [`ematix_flow_core::backend::DistributedTlsConfig`] so the TOML
+/// surface and the programmatic surface stay in lockstep.
+#[derive(Clone, Debug, Deserialize)]
+pub struct TransformTlsToml {
+    /// PEM file with the CA bundle that signed the worker certs.
+    /// Required: without an anchor, peer-cert verification has
+    /// nothing to chain against.
+    pub ca_cert_pem_path: String,
+    /// Optional client identity for mutual TLS. When set, the
+    /// coordinator presents this cert/key pair on every peer
+    /// dial. The workers must have been launched with
+    /// `--tls-client-ca` for verification to succeed.
+    #[serde(default)]
+    pub client_identity: Option<TransformTlsClientIdentityToml>,
+    /// Optional override for the SNI / hostname checked during
+    /// peer cert verification. Defaults to the host portion of
+    /// each peer URL when omitted — set this only when peer URLs
+    /// reference a load balancer or IP that doesn't match the
+    /// certificate's CN/SAN.
+    #[serde(default)]
+    pub domain_name_override: Option<String>,
+}
+
+/// Client identity (cert + key) for mutual TLS to peer workers.
+/// Mirrors [`ematix_flow_core::backend::DistributedClientIdentityConfig`].
+#[derive(Clone, Debug, Deserialize)]
+pub struct TransformTlsClientIdentityToml {
+    pub cert_pem_path: String,
+    pub key_pem_path: String,
 }
 
 fn default_transform_on_error() -> String {
@@ -1718,6 +1758,16 @@ impl PipelineCliConfig {
                     .into(),
             ));
         }
+        // Σ.B follow-up: same shape for [transform.tls]. Without
+        // engine = "distributed" there's no coordinator → worker
+        // traffic to encrypt.
+        if t.tls.is_some() && !engine_is_distributed {
+            return Err(ConfigError::Parse(
+                "[transform.tls] is only meaningful when \
+                 engine = \"distributed\""
+                    .into(),
+            ));
+        }
         // URL well-formedness — fail fast at config-load.
         for (i, raw) in t.peers.iter().enumerate() {
             url::Url::parse(raw).map_err(|e| {
@@ -2509,10 +2559,18 @@ impl PipelineCliConfig {
                     (Some(sql), true) => {
                         let cfg = ematix_flow_core::backend::DistributedConfig {
                             peers: t.peers.clone(),
-                            // TLS via [transform.tls] TOML is a Σ.B
-                            // follow-up — programmatic callers can
-                            // populate `DistributedTlsConfig` today.
-                            tls: None,
+                            tls: t.tls.as_ref().map(|tls_toml| {
+                                ematix_flow_core::backend::DistributedTlsConfig {
+                                    ca_cert_pem_path: tls_toml.ca_cert_pem_path.clone(),
+                                    client_identity: tls_toml.client_identity.as_ref().map(|id| {
+                                        ematix_flow_core::backend::DistributedClientIdentityConfig {
+                                            cert_pem_path: id.cert_pem_path.clone(),
+                                            key_pem_path: id.key_pem_path.clone(),
+                                        }
+                                    }),
+                                    domain_name_override: tls_toml.domain_name_override.clone(),
+                                }
+                            }),
                         };
                         // Σ.B follow-up: lookups now thread through to
                         // the distributed transform. Each lookup is
@@ -3982,6 +4040,137 @@ mod tests {
         assert!(
             msg.contains("datafusion"),
             "must point at the workaround engine; got: {msg}"
+        );
+    }
+
+    /// Σ.B follow-up: [transform.tls] populates DistributedTlsConfig
+    /// end-to-end. Includes mTLS client identity + SNI override so
+    /// every TLS knob is exercised.
+    #[test]
+    fn transform_tls_block_round_trips_into_distributed_config() {
+        let toml = r#"
+            pipeline_name = "p"
+            source_query = "events"
+            [source]
+            kind = "kafka"
+            bootstrap_servers = "localhost:9092"
+            [target]
+            kind = "sqlite"
+            path = ":memory:"
+            [target.table]
+            name = "out"
+            [transform]
+            sql = "SELECT * FROM source"
+            engine = "distributed"
+            peers = ["https://flow-01.cluster.local:50051"]
+            [transform.tls]
+            ca_cert_pem_path = "/etc/ematix-flow/tls/ca.pem"
+            domain_name_override = "flow.cluster.local"
+            [transform.tls.client_identity]
+            cert_pem_path = "/etc/ematix-flow/tls/coordinator.pem"
+            key_pem_path = "/etc/ematix-flow/tls/coordinator.key"
+        "#;
+        let cfg = PipelineCliConfig::from_toml_str(toml).expect("parse");
+        let tls = cfg.transform.as_ref().unwrap().tls.as_ref().unwrap();
+        assert_eq!(tls.ca_cert_pem_path, "/etc/ematix-flow/tls/ca.pem");
+        assert_eq!(
+            tls.domain_name_override.as_deref(),
+            Some("flow.cluster.local")
+        );
+        let id = tls.client_identity.as_ref().unwrap();
+        assert_eq!(id.cert_pem_path, "/etc/ematix-flow/tls/coordinator.pem");
+        assert_eq!(id.key_pem_path, "/etc/ematix-flow/tls/coordinator.key");
+    }
+
+    /// CA path is the only required TLS field; the rest are
+    /// optional. A minimal block produces server-auth-only TLS.
+    #[test]
+    fn transform_tls_block_minimal_only_requires_ca_path() {
+        let toml = r#"
+            pipeline_name = "p"
+            source_query = "events"
+            [source]
+            kind = "kafka"
+            bootstrap_servers = "localhost:9092"
+            [target]
+            kind = "sqlite"
+            path = ":memory:"
+            [target.table]
+            name = "out"
+            [transform]
+            sql = "SELECT * FROM source"
+            engine = "distributed"
+            peers = ["https://flow-01.cluster.local:50051"]
+            [transform.tls]
+            ca_cert_pem_path = "/etc/ematix-flow/tls/ca.pem"
+        "#;
+        let cfg = PipelineCliConfig::from_toml_str(toml).expect("parse");
+        let tls = cfg.transform.as_ref().unwrap().tls.as_ref().unwrap();
+        assert_eq!(tls.ca_cert_pem_path, "/etc/ematix-flow/tls/ca.pem");
+        assert!(tls.client_identity.is_none());
+        assert!(tls.domain_name_override.is_none());
+    }
+
+    /// [transform.tls] under the in-process engine is a silent-no-op
+    /// trap; reject at config-load so the user knows they need
+    /// engine = "distributed".
+    #[test]
+    fn transform_tls_rejected_without_distributed_engine() {
+        let toml = r#"
+            pipeline_name = "p"
+            source_query = "events"
+            [source]
+            kind = "kafka"
+            bootstrap_servers = "localhost:9092"
+            [target]
+            kind = "sqlite"
+            path = ":memory:"
+            [target.table]
+            name = "out"
+            [transform]
+            sql = "SELECT * FROM source"
+            [transform.tls]
+            ca_cert_pem_path = "/etc/ematix-flow/tls/ca.pem"
+        "#;
+        let err = PipelineCliConfig::from_toml_str(toml).expect_err("orphan tls block must fail");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("transform.tls"),
+            "name the bad block; got: {msg}"
+        );
+        assert!(
+            msg.contains("distributed"),
+            "point at the engine knob; got: {msg}"
+        );
+    }
+
+    /// A missing `ca_cert_pem_path` is a hard parse failure (not a
+    /// validation error) since the field has no default. Lock that
+    /// down so a typo in the field name surfaces immediately.
+    #[test]
+    fn transform_tls_block_requires_ca_cert_path() {
+        let toml = r#"
+            pipeline_name = "p"
+            source_query = "events"
+            [source]
+            kind = "kafka"
+            bootstrap_servers = "localhost:9092"
+            [target]
+            kind = "sqlite"
+            path = ":memory:"
+            [target.table]
+            name = "out"
+            [transform]
+            sql = "SELECT * FROM source"
+            engine = "distributed"
+            peers = ["https://flow-01:50051"]
+            [transform.tls]
+            domain_name_override = "flow.cluster.local"
+        "#;
+        let err = PipelineCliConfig::from_toml_str(toml).expect_err("missing ca_cert_pem_path");
+        assert!(
+            format!("{err}").contains("ca_cert_pem_path"),
+            "must name the missing field; got: {err}"
         );
     }
 
