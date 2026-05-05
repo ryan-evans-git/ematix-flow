@@ -3545,6 +3545,7 @@ dependencies = [
  "arrow-array",
  "arrow-schema",
  "async-trait",
+ "criterion",
  "datafusion",
  "datafusion-distributed",
  "ematix-flow-core",

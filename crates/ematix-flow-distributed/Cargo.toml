@@ -39,3 +39,9 @@ tempfile = "3"
 # itself + bind to a free port via TcpListener, then connect a
 # coordinator. Avoids Docker dependency for the cross-pod test.
 tokio-stream = { version = "0.1", features = ["net"] }
+# Σ.C PR 1: TPC-H bench harness for the distributed path.
+criterion = { workspace = true }
+
+[[bench]]
+name = "tpch_distributed"
+harness = false

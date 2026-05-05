@@ -33,6 +33,74 @@ criterion's bootstrap CI. Saved as baseline `sigma_a1_sf1_m3pro`.
 | Q6  | **18.2 ms** | [18.2, 18.3]  | 1155 | scan + filter + single sum |
 | Q19 | **38.0 ms** | [37.4, 38.4]  | 605  | 2-way join + complex disjunctive WHERE |
 
+### Σ.C PR 1 — distributed batch SQL on the same TPC-H reps (2026-05-05)
+
+First public numbers for the `DistributedBackend` path.
+`crates/ematix-flow-distributed/benches/tpch_distributed.rs` runs
+the same Q1/Q3/Q6/Q19 reps as the Σ.A1 single-node bench, but
+through `DistributedBackend::read_arrow_stream`. Two
+configurations:
+
+- **distributed-of-one** (`peers = []`): degenerate single-worker
+  cluster. Vanilla DataFusion under the hood; isolates the trait-
+  surface cost of going through `DistributedBackend` vs raw
+  `SessionContext`.
+- **3 in-process workers**: spawns 3 tonic-served `Worker`s on
+  free localhost ports, points the coordinator at them via
+  `StaticWorkerResolver`. Exercises `DistributedPhysicalOptimizerRule`
+  + cross-"pod" Arrow Flight at the floor RPC cost.
+
+M3 Pro / SF=1 / criterion `sample_size = 10`,
+`measurement_time = 15s`:
+
+| Query | DF (1-node) | distributed-of-one | 3 in-process workers | of_one overhead | 3-worker overhead |
+|---|---|---|---|---|---|
+| Q1  | 48.7 ms | **48.9 ms** | **53.9 ms** | +0.4% | +10.7% |
+| Q3  | 34.6 ms | **34.8 ms** | **37.1 ms** | +0.6% | +7.2% |
+| Q6  | 18.2 ms | **18.5 ms** | **19.9 ms** | +1.6% | +9.3% |
+| Q19 | 38.0 ms | **38.3 ms** | **43.9 ms** | +0.8% | +15.5% |
+
+**Findings:**
+
+1. **Trait-surface overhead is ≤1.6%.** Going through
+   `DistributedBackend` instead of constructing a raw
+   `SessionContext` adds essentially no cost. Validates the Σ.B
+   design — the distributed code path costs nothing when no peers
+   are configured.
+
+2. **3-worker RPC overhead at SF=1 is 7–15%** — RPC + plan-
+   serialization cost dominates the work for queries that finish
+   in <50ms. This is the *floor* of distributed cost, not a real
+   workload result. Expected crossover (where distributed wins) is
+   at SF=10+ where per-query work scales past the fixed RPC cost.
+
+3. **Cross-host numbers require EC2.** This bench runs all 3
+   workers on the same machine, so RPC latency is loopback (~50µs).
+   Real cross-host m6i.4xlarge × 4 numbers add network latency
+   (~500µs intra-AZ) + I/O contention. They go in Σ.C PR 2 once
+   we have the cluster provisioned.
+
+**Reproducer:**
+
+```sh
+TPCH_MEASUREMENT_TIME_S=15 \
+  cargo bench -p ematix-flow-distributed --bench tpch_distributed
+```
+
+Reads from `examples/tpch/data/sf1/`. Generate first via
+`cargo run --release -p ematix-flow-core --example tpch_generate
+-- --sf 1 --out examples/tpch/data/sf1`.
+
+**What's still open in Σ.C:**
+
+- **PR 2 — multi-host comparison**: 3-pod ematix-flow-distributed
+  cluster vs 3-executor PySpark on identical EC2 hardware. Same
+  TPC-H queries, both at SF=10 + SF=100. Requires AWS
+  provisioning.
+- **PR 3 — repro script + announcement-ready artifact**:
+  `scripts/tpch-bench.sh` that brings up both clusters + runs the
+  suite + emits the comparison table.
+
 ### Σ.A2 PR 5 — DuckDB-dialect audit (2026-05-05)
 
 DuckDB's SQL surface is closer to DataFusion's than Spark's (both
