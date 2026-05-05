@@ -44,26 +44,17 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use ematix_flow_core::backend::{
     ArrowBatchStream, Backend, BackendConfig, BackendError, DeleteHandling, Dialect,
-    StrategyRunResult, TargetTable, WriteMode,
+    DistributedConfig, StrategyRunResult, TargetTable, WriteMode,
 };
 use ematix_flow_core::pg::ConnectionInfo;
 use ematix_flow_core::types::TableSpec;
-use serde::{Deserialize, Serialize};
 use url::Url;
 
-/// Σ.B PR 2: serializable config for [`DistributedBackend`].
-///
-/// Carries the list of peer worker URLs the local node should fan
-/// out to. Empty `peers` is legal — the local node executes the
-/// plan as a single worker (degenerate distributed-of-one); useful
-/// for tests + dev. Production deployments pass 1–N peer URLs.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct DistributedConfig {
-    /// Peer worker URLs (e.g. `http://flow-01.cluster.local:50051`).
-    /// Each must be parseable by `url::Url`. Validated on
-    /// construction in [`DistributedBackend::open`].
-    pub peers: Vec<String>,
-}
+// Re-export so callers depending only on `ematix-flow-distributed`
+// don't have to also import from `ematix-flow-core` for the config
+// type. The canonical definition lives in core (see Σ.B PR 2 commit
+// 1's pivot rationale).
+pub use ematix_flow_core::backend::DistributedConfig as Config;
 
 /// Backend that executes SQL transforms across a peer mesh of
 /// ematix-flow processes. PR 2's first commit ships the type +
@@ -153,20 +144,9 @@ impl Backend for DistributedBackend {
     }
 
     fn config(&self) -> BackendConfig {
-        // Σ.B PR 2: the Distributed variant doesn't yet exist on the
-        // shared `BackendConfig` enum — adding it requires editing
-        // ematix-flow-core, which lands in the next PR-2 commit when
-        // the distributed-execution wiring is real. For now, hand
-        // back the closest already-present discriminator (Postgres)
-        // so the call site doesn't panic; this is an intentional
-        // placeholder, exercised only by the trait-shape tests in
-        // this crate. Production callers don't reach this code path
-        // until the variant lands.
-        unimplemented!(
-            "DistributedBackend::config() not yet wired into the shared BackendConfig \
-             enum — lands in the next Σ.B PR 2 commit. See \
-             docs/PHASE_SIGMA_B_TRAIT_SPIKE.md."
-        )
+        BackendConfig::Distributed(DistributedConfig {
+            peers: self.peers.iter().map(|u| u.to_string()).collect(),
+        })
     }
 
     async fn ping(&self) -> Result<(), BackendError> {
@@ -348,5 +328,29 @@ mod tests {
                 .to_lowercase()
                 .contains("not yet implemented")
         );
+    }
+
+    /// Σ.B PR 2 commit 2: full round-trip through the shared
+    /// `BackendConfig` enum. Construct → `.config()` → serialize →
+    /// deserialize → construct again → assert peers match.
+    #[test]
+    fn config_method_round_trips_through_serde() {
+        let original = DistributedBackend::open(DistributedConfig {
+            peers: vec!["http://a:50051".into(), "http://b:50051".into()],
+        })
+        .unwrap();
+
+        let cfg = original.config();
+        let json = serde_json::to_string(&cfg).expect("serialize");
+        let recovered_cfg: BackendConfig = serde_json::from_str(&json).expect("deserialize");
+        let inner = match recovered_cfg {
+            BackendConfig::Distributed(c) => c,
+            other => panic!("expected Distributed, got {other:?}"),
+        };
+        let recovered_backend = DistributedBackend::open(inner).expect("rebuild");
+        assert_eq!(original.peers().len(), recovered_backend.peers().len());
+        for (a, b) in original.peers().iter().zip(recovered_backend.peers()) {
+            assert_eq!(a.as_str(), b.as_str());
+        }
     }
 }

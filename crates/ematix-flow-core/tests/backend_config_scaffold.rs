@@ -20,10 +20,10 @@
 //! Plan + spike: `docs/PHASE_SIGMA_PLAN.md` Σ.B + `docs/PHASE_SIGMA_B_TRAIT_SPIKE.md`.
 
 use ematix_flow_core::backend::{
-    BackendConfig, DeltaConfig, DeltaLocation, DuckDbConfig, KafkaConfig, KinesisConfig,
-    MySqlConfig, ObjectFormat, ObjectStoreConfig, ObjectStoreLocation, ObjectWriteOptions,
-    ParquetCompression, PostgresConfig, PubSubConfig, RabbitMqConfig, SqliteConfig,
-    backend_from_config,
+    BackendConfig, DeltaConfig, DeltaLocation, DistributedConfig, DuckDbConfig, KafkaConfig,
+    KinesisConfig, MySqlConfig, ObjectFormat, ObjectStoreConfig, ObjectStoreLocation,
+    ObjectWriteOptions, ParquetCompression, PostgresConfig, PubSubConfig, RabbitMqConfig,
+    SqliteConfig, backend_from_config,
 };
 
 // --- JSON round-trip ----------------------------------------------
@@ -151,6 +151,68 @@ async fn backend_from_config_constructs_pubsub_offline() {
     match backend.config() {
         BackendConfig::PubSub(c) => assert_eq!(c.project_id, "demo-project"),
         other => panic!("expected PubSub, got {other:?}"),
+    }
+}
+
+// --- Σ.B PR 2: distributed-execution config -----------------------
+
+#[test]
+fn distributed_config_round_trips_with_peer_urls() {
+    let cfg = BackendConfig::Distributed(DistributedConfig {
+        peers: vec![
+            "http://flow-01.cluster.local:50051".into(),
+            "http://flow-02.cluster.local:50051".into(),
+        ],
+    });
+    let json = serde_json::to_string(&cfg).expect("serialize");
+    assert!(json.contains(r#""kind":"distributed""#));
+    assert!(json.contains("flow-01.cluster.local"));
+
+    let recovered: BackendConfig = serde_json::from_str(&json).expect("deserialize");
+    match recovered {
+        BackendConfig::Distributed(c) => {
+            assert_eq!(c.peers.len(), 2);
+            assert_eq!(c.peers[0], "http://flow-01.cluster.local:50051");
+        }
+        other => panic!("expected Distributed, got {other:?}"),
+    }
+}
+
+#[test]
+fn distributed_config_default_has_empty_peers() {
+    let cfg = DistributedConfig::default();
+    assert!(cfg.peers.is_empty());
+    let wrapped = BackendConfig::Distributed(cfg);
+    let json = serde_json::to_string(&wrapped).unwrap();
+    let recovered: BackendConfig = serde_json::from_str(&json).unwrap();
+    assert!(matches!(
+        recovered,
+        BackendConfig::Distributed(DistributedConfig { ref peers }) if peers.is_empty()
+    ));
+}
+
+/// `backend_from_config(Distributed)` is intentionally a no-op in
+/// core to avoid a circular dep with `ematix-flow-distributed`.
+/// The error must point at the right constructor so users don't
+/// hunt for the cause.
+#[tokio::test]
+async fn backend_from_config_distributed_points_at_distributed_crate() {
+    let cfg = BackendConfig::Distributed(DistributedConfig {
+        peers: vec!["http://localhost:50051".into()],
+    });
+    match backend_from_config(cfg).await {
+        Ok(_) => panic!("Distributed should not construct via core"),
+        Err(err) => {
+            let msg = format!("{err}");
+            assert!(
+                msg.contains("DistributedBackend::open"),
+                "must point at the right constructor; got: {msg}"
+            );
+            assert!(
+                msg.contains("ematix_flow_distributed") || msg.contains("ematix-flow-distributed"),
+                "must name the crate; got: {msg}"
+            );
+        }
     }
 }
 

@@ -465,6 +465,15 @@ pub enum BackendConfig {
     RabbitMq(RabbitMqConfig),
     Delta(DeltaConfig),
     ObjectStore(ObjectStoreConfig),
+    /// Σ.B PR 2: distributed-execution backend
+    /// (`crates/ematix-flow-distributed`). The variant carries the
+    /// peer-URL list; backend reconstruction happens via that
+    /// crate's `DistributedBackend::open(cfg)` rather than via
+    /// `backend_from_config` — `ematix-flow-core` deliberately
+    /// doesn't depend on `ematix-flow-distributed` (would be a
+    /// circular dep), so this arm errors with a clear pointer at
+    /// the right constructor.
+    Distributed(DistributedConfig),
 }
 
 /// Σ.B PR 1 commit b: serializable Postgres config. The DSN carries
@@ -610,6 +619,23 @@ pub struct RabbitMqConfig {
     pub amqp_url: String,
 }
 
+/// Σ.B PR 2: distributed-execution backend config. Carries the
+/// peer-worker URL list; an empty list is the degenerate single-
+/// worker cluster (handy for tests).
+///
+/// The struct lives in `ematix-flow-core` so the
+/// [`BackendConfig::Distributed`] variant can carry it without
+/// `ematix-flow-core` depending on `ematix-flow-distributed` (which
+/// would create a circular dep — the distributed crate depends on
+/// core for the trait shape). Construction lives in the distributed
+/// crate via `DistributedBackend::open(cfg)`.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct DistributedConfig {
+    /// Peer worker URLs (e.g. `http://flow-01.cluster.local:50051`).
+    /// Empty = single-worker degenerate cluster.
+    pub peers: Vec<String>,
+}
+
 /// Σ.D-ready partitioning-hint placeholder. Return type for
 /// [`Backend::partitioning_hint`]; concrete shape (range / hash /
 /// per-source-partition) gets locked in Σ.D once the dominant
@@ -716,6 +742,14 @@ pub async fn backend_from_config(
         )),
         BackendConfig::RabbitMq(c) => Ok(std::sync::Arc::new(
             crate::rabbitmq_backend::RabbitMQBackend::open(c.amqp_url)?,
+        )),
+        BackendConfig::Distributed(_) => Err(BackendError::Other(
+            "backend_from_config(Distributed) is intentionally a no-op in core: \
+             ematix-flow-core doesn't depend on ematix-flow-distributed \
+             (would be a circular dep). Construct via \
+             `ematix_flow_distributed::DistributedBackend::open(cfg)` directly. \
+             See docs/PHASE_SIGMA_B_TRAIT_SPIKE.md."
+                .into(),
         )),
     }
 }
