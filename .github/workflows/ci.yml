@@ -37,16 +37,21 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      # `cargo audit` checks `Cargo.lock` against the RustSec
-      # advisory DB and fails on any non-ignored vulnerability.
-      # `.cargo/audit.toml` lists ignored advisory IDs with
-      # rationale. Unmaintained warnings (RUSTSEC-*-...) don't fail
-      # CI by default — that's the right behavior; we don't want
-      # noisy "this transitive dep was last updated 2 years ago"
-      # signals blocking a release.
-      - uses: rustsec/audit-check@v2.0.0
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Shell-based cargo audit instead of the `rustsec/audit-check`
+      # action — that one tries to post a GitHub Check Run, which
+      # needs `checks: write` permission. Granting that to the whole
+      # workflow expands the privilege surface; running the binary
+      # directly is just as effective. `cargo audit` checks
+      # `Cargo.lock` against the RustSec advisory DB and exits
+      # non-zero on any non-ignored vulnerability. `.cargo/audit.toml`
+      # lists ignored advisory IDs with rationale. Unmaintained
+      # warnings don't fail CI — they're informational.
+      - name: Install cargo-audit
+        run: cargo install --locked cargo-audit
+      - name: Run cargo audit
+        run: cargo audit
 
   python:
     name: python (ubuntu-latest, py${{ matrix.python }})

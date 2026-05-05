@@ -65,10 +65,16 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Rust tests
         run: cargo test --workspace --lib
-      - name: cargo audit (RustSec advisory DB)
-        uses: rustsec/audit-check@v2.0.0
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Install cargo-audit
+        # Shell install instead of `rustsec/audit-check` action
+        # because that action requires `checks: write` to post a
+        # check-run. Running the binary directly avoids the extra
+        # permission grant.
+        run: cargo install --locked cargo-audit
+      - name: Run cargo audit (RustSec advisory DB)
+        # `.cargo/audit.toml` carries the ignored-advisory list
+        # with rationale (see SECURITY.md).
+        run: cargo audit
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
