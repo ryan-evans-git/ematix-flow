@@ -44,8 +44,61 @@ permissions:
   contents: read
 
 jobs:
+  # Belt-and-suspenders gate: re-run the same checks the `ci`
+  # workflow runs on every push, but in-line here so we don't
+  # depend on a separate workflow's status. Wheels + sdist only
+  # build if this job passes; publish only fires if all wheels
+  # build. Keeps a "ship to PyPI on tag push" workflow from
+  # publishing untested code.
+  verify:
+    name: verify (fmt + clippy + test + audit + ruff + bandit + pip-audit)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Rust fmt
+        run: cargo fmt --all -- --check
+      - name: Rust clippy (-D warnings)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Rust tests
+        run: cargo test --workspace --lib
+      - name: cargo audit (RustSec advisory DB)
+        uses: rustsec/audit-check@v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Set up venv
+        shell: bash
+        run: |
+          python -m venv .venv
+          echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
+          echo "VIRTUAL_ENV=$PWD/.venv" >> "$GITHUB_ENV"
+      - name: Install dev deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install 'maturin>=1.7' pytest 'pytest-asyncio>=0.23' ruff bandit pip-audit
+      - name: Build extension
+        run: maturin develop --release
+      - name: Ruff
+        run: ruff check python tests
+      - name: Bandit (medium+ severity, no findings allowed)
+        run: bandit -r python -ll -c pyproject.toml
+      - name: pip-audit (Python deps)
+        # `--skip-editable` excludes the in-tree `ematix-flow`
+        # install. Default behavior still fails on any advisory in
+        # non-editable deps.
+        run: pip-audit --skip-editable
+      - name: Pytest
+        run: pytest
+
   build-linux:
     name: linux-x86_64 wheels (py${{ matrix.python }})
+    needs: verify
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -87,6 +140,7 @@ jobs:
 
   build-macos:
     name: macos-${{ matrix.arch }} wheels (py${{ matrix.python }})
+    needs: verify
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -136,6 +190,7 @@ jobs:
 
   build-sdist:
     name: source distribution
+    needs: verify
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

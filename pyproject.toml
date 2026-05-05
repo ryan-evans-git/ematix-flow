@@ -75,6 +75,30 @@ src = ["python", "tests/python"]
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
 
+[tool.bandit]
+# `tests/python` exercises framework-internal SQL builders + uses
+# fixture passwords like "s3cret"; bandit flags those at ~24 medium
+# severity. Skip the test tree from the security scan.
+exclude_dirs = ["tests"]
+skips = [
+    # B608 — "hardcoded SQL expressions". Every match is a framework
+    # SQL builder interpolating *identifiers* (schema / table /
+    # column names that come from `@ematix.table` declarations) and
+    # *pre-escaped literals* (watermark literal goes through
+    # `_build_last_value_literal`, which `''`-escapes the value and
+    # casts to a typed SQL type). Identifiers can't be parameterized
+    # in SQL — same architectural pattern as dbt / sqlmesh / every
+    # other ETL framework. Flagging here would be one warning per
+    # query builder forever.
+    "B608",
+    # B307 — `eval()` in `decorators.py::ematix.table` evaluates PEP
+    # 593 annotation strings (e.g. `"BigInt"`) in the user's own
+    # module globals. Same risk surface as `typing.get_type_hints`
+    # (which also evals string annotations). Trust boundary: the
+    # developer writing their own class — not external input.
+    "B307",
+]
+
 [tool.pytest.ini_options]
 testpaths = ["tests/python"]
 markers = [

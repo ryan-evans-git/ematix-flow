@@ -1,0 +1,37 @@
+# cargo-audit configuration.
+#
+# Run with: `cargo audit` (uses this file automatically when present
+# under `.cargo/`).
+#
+# `ignore = [...]` lists advisory IDs the audit will not fail on.
+# Every entry MUST be accompanied by a comment explaining (a) why it
+# can't be patched and (b) why we accept the risk for our use case.
+# Re-evaluate ignores quarterly or whenever a parent dep upgrades.
+
+[advisories]
+ignore = [
+    # ----------------------------------------------------------------
+    # Three advisories in `rustls-webpki 0.101.7`, all transitive via
+    # the AWS SDK Rust crates' `legacy-rustls = "^0.21"` constraint
+    # inside `aws-smithy-http-client`. We pull this in via
+    # `aws-msk-iam-sasl-signer` (Kafka MSK IAM auth, Phase 36f).
+    # `rustls-webpki 0.103+` is the fix line; reaching it requires
+    # AWS SDK Rust to retire its `legacy-rustls` flag, which has not
+    # happened as of this audit. Tracking upstream:
+    # https://github.com/awslabs/aws-sdk-rust/issues
+    #
+    # Risk assessment for our pipeline use case (Kafka SASL auth):
+    # - RUSTSEC-2026-0104: panic during CRL parsing. Kafka brokers
+    #   rarely serve CRLs in their TLS chain; OCSP-stapling /
+    #   short-lived certs are the norm. Reachable only on a
+    #   broker-controlled cert path.
+    # - RUSTSEC-2026-0098 / -0099: name constraint matching edge
+    #   cases on URI / wildcard names. Constraint extensions are
+    #   uncommon in commercial CA chains used for managed Kafka
+    #   (Confluent Cloud, AWS MSK, etc.).
+    # Net: not blocker-grade for our threat model. Re-audit on every
+    # AWS SDK Rust major bump.
+    "RUSTSEC-2026-0104",
+    "RUSTSEC-2026-0098",
+    "RUSTSEC-2026-0099",
+]

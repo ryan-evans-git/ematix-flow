@@ -48,6 +48,10 @@ workflow handles deployment.
 - [ ] Confirm `pytest tests/python` passes locally.
 - [ ] Confirm `cargo fmt --all -- --check` and
       `cargo clippy --workspace --all-targets -- -D warnings` are clean.
+- [ ] Confirm `cargo audit` and `pip-audit --skip-editable`
+      pass locally (the CI's `verify` job runs both — see
+      [`SECURITY.md`](https://github.com/ryan-evans-git/ematix-flow/blob/main/SECURITY.md) for what the gates check and
+      the list of accepted advisories).
 - [ ] Bump `version` in `pyproject.toml`. Match the workspace
       version in the root `Cargo.toml`'s `[workspace.package]` block.
 - [ ] Add a new `## [X.Y.Z] — YYYY-MM-DD` section at the top of
@@ -72,7 +76,11 @@ git push origin v0.1.0
 
 The `release.yml` workflow fires on tag push:
 
-1. Builds wheels for Linux x86_64 (manylinux2014) and macOS
+1. Runs the `verify` job: rustfmt + clippy + tests + cargo audit +
+   ruff + bandit + pip-audit + pytest. Wheels and the sdist only
+   build if this passes — see [`SECURITY.md`](https://github.com/ryan-evans-git/ematix-flow/blob/main/SECURITY.md) for
+   the per-tool gate spec.
+2. Builds wheels for Linux x86_64 (manylinux2014) and macOS
    aarch64, across Python 3.11 / 3.12 / 3.13 — 6 wheels
    total. (Intel Mac + Python 3.10 wheels were dropped — see the
    top-of-file comment in `release.yml`. Those users install from
