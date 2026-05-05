@@ -779,6 +779,10 @@ sub-phase.
    dialect needs + Σ.B's serializability + Σ.D's eventual state-
    store hooks) before writing PR 1. One breaking change is
    fine; two is twice the migration pain.
+   **Spike output:** [`docs/PHASE_SIGMA_B_TRAIT_SPIKE.md`](PHASE_SIGMA_B_TRAIT_SPIKE.md)
+   proposes a `BackendConfig` tagged enum + `backend_from_config()`
+   free function pattern, with 6 sub-questions and recommended
+   defaults. ~3-week migration spread across 4 commits.
 
 ### Σ.C
 
