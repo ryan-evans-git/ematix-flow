@@ -597,71 +597,141 @@ behavior documented in `docs/BENCHMARKS.md`.
 
 **PR scope.** Estimated 3 PRs, ~1–2 weeks total.
 
-### PR 1 — bench harness for the three configurations
+> **Scope shift (2026-05-05).** Original Σ.C plan called for a
+> 4×`m6i.4xlarge` AWS cluster as the canonical bench machine. This
+> project is no longer deploying to AWS — Σ.C's primary deliverable
+> is now docker-compose multi-process numbers on developer hardware,
+> with the AWS recipe (`infra/`, `scripts/tpch-bench-multi.sh`)
+> retained as an alternative path for anyone who *does* have cluster
+> access. The "Ballista" name throughout the original section is
+> obsolete — the engine pivoted to `datafusion-distributed` (see
+> Σ.B note above + spike doc). Honest framing: docker-compose on
+> one host shares kernel/CPU/memory/disk and uses loopback
+> networking — these numbers measure multi-process distributed-plan
+> overhead, not cross-host scaling. Real cross-host claims need
+> network-separated hardware (homelab k3s, rented bare-metal) and
+> remain a deferred item.
 
-- `scripts/bench-tpch-three-way.sh` — runs all 22 TPC-H queries
-  against:
-  1. PySpark on local cluster (3 executors, JDK 17, Spark 3.5.x)
-  2. ematix-flow-ballista on local cluster (3 executors)
-  3. ematix-flow single-node DataFusion (control)
-- Each configuration runs 5 trials per query; median + P95 reported.
-- Hardware target: AWS EC2 `m6i.4xlarge` × 4 nodes (1 driver + 3
-  executors). Recommend running on a fresh spot fleet to avoid
-  noisy-neighbor effects.
-- Output: `bench-results.json` with full per-query / per-trial
-  breakdown.
+### PR 1 — bench harness for the distributed-execution path *(shipped)*
 
-### PR 2 — analysis + write-up
+- `crates/ematix-flow-distributed/benches/tpch_distributed.rs`
+  routes Q1 / Q3 / Q6 / Q19 through `DistributedBackend` under two
+  configurations per run:
+  1. `distributed_of_one` (`peers = []`) — degenerate single-worker
+     cluster, measures trait-surface overhead vs raw `SessionContext`
+  2. `distributed_3_workers` (in-process tonic on free localhost
+     ports) — exercises the `DistributedPhysicalOptimizerRule`-
+     wrapped plan + Arrow Flight shuffle
+- Reads from `examples/tpch/data/sf<N>/*.parquet` generated via
+  `cargo run --release -p ematix-flow-core --example tpch_generate`.
+- Group labels derive `sf<N>` tag from the data dir basename so
+  runs at different scale factors don't collide.
+- Single-node DataFusion control bench lives in
+  `crates/ematix-flow-core/benches/tpch.rs` (Σ.A1 PR 2; same data
+  dir, different harness).
+- PySpark baseline harness: `scripts/bench-tpch-pyspark.py`
+  (shipped in PR 2 prep below). Runs on the same hardware for
+  apples-to-apples.
 
-- `scripts/bench-tpch-summarize.py` — reads `bench-results.json`,
-  produces the head-to-head table for `docs/BENCHMARKS.md`:
+### PR 2 — multi-process baseline numbers + write-up *(in progress)*
 
-  ```
-  | Q  | PySpark median | Ballista median | DF (1-node) | Ballista vs Spark |
-  | -- | -------------- | --------------- | ----------- | ----------------- |
-  | 1  | 12.3s          |  4.7s           |  9.1s       | 2.6× faster       |
-  ```
+#### PR 2 prep (shipped 2026-05-05)
 
-- Memory footprint per executor (measured via `kubectl top` or
-  `docker stats`): geomean and max.
-- Network bytes shuffled: from Spark's UI / Ballista's metrics
-  endpoint.
-- Disk read total: from `iostat` snapshots.
-- Cluster image total: docker image inspect.
-- Cold-start time: time from `docker-compose up` to first query
-  ready.
+- `infra/cloud-init-worker.sh` + `infra/README.md` — manual EC2
+  provisioning recipe (4× `m6i.4xlarge`, security groups, TPC-H
+  data staging). Retained for anyone with AWS access; **not** the
+  primary path.
+- `scripts/tpch-bench-multi.sh` — driver that runs the three
+  benches against pre-provisioned hardware and feeds output to
+  the summarizer.
+- `scripts/tpch-bench-multi-summarize.py` — produces the
+  comparison markdown table from criterion + PySpark output.
+- `examples/distributed-cluster/docker-compose.yml` mounts
+  `examples/tpch/data` read-only at `/data` in every worker so
+  a host coordinator can register Parquet via the same path the
+  workers see. Added 2026-05-05.
+- `tpch_distributed.rs` honours `EMATIX_DISTRIBUTED_PEERS`
+  (comma-separated URLs) — point it at the docker-compose stack
+  instead of in-process workers. Added 2026-05-05.
 
-### PR 3 — repro script + announcement-ready artifact
+#### PR 2 publish (pending)
 
-- `scripts/tpch-bench.sh` is a one-command end-to-end reproducer:
-  spins up both clusters, runs the suite, generates the summary
-  table. Documented in the doc itself + linked from the README.
-- Blog-post-ready summary: `docs/BENCHMARKS.md` gets a top-of-file
-  header table that's safe to paste into Hacker News / Twitter.
-- Honest gaps section: any TPC-H queries that don't run on Ballista
-  (correlated subqueries, certain CTEs) listed with workarounds.
-  We're claiming "scales as well as Spark on the queries it
-  supports," not "100% TPC-H coverage on day one."
+Run the harness on developer hardware:
+
+1. `cargo bench -p ematix-flow-core --bench tpch` — single-node
+   DataFusion control
+2. `docker compose -f examples/distributed-cluster/docker-compose.yml up -d`
+3. `EMATIX_DISTRIBUTED_PEERS=http://localhost:50051,...,:50053`
+   `TPCH_DATA_DIR=/data/sf10`
+   `cargo bench -p ematix-flow-distributed --bench tpch_distributed`
+4. `python scripts/bench-tpch-pyspark.py --sf 10` for the PySpark
+   baseline on the same hardware
+5. Feed output through `scripts/tpch-bench-multi-summarize.py`
+
+Publish `docs/BENCHMARKS.md` with:
+
+- Three-way table (DataFusion / distributed-on-compose / PySpark)
+  for Q1 / Q3 / Q6 / Q19 at SF=1 + SF=10
+- Per-query median + P95 from criterion / PySpark output
+- Memory / image-size / cold-start columns measured on the same
+  developer hardware (`docker stats` for memory, `docker image
+  inspect` for image size)
+- **Disclaimer banner** on every header pinning "single-host,
+  multi-process, NOT cross-host" so blog-post readers don't
+  miscite the numbers
+- Honest gaps: any TPC-H queries that don't run on
+  ematix-flow-distributed listed with workarounds
 
 **Acceptance.**
-- Median query latency: Ballista ≤ PySpark on ≥18 of 22 queries.
-  (Allow up to 4 query losses to absorb DataFusion's known
-  optimizer gaps without invalidating the headline claim.)
-- Geomean executor memory: Ballista ≤ 50% of Spark.
-- Cluster image size: Ballista ≤ 20% of Spark image.
-- Cold-start time: Ballista ≤ 30% of Spark cold-start.
+
+- Median Q1 / Q3 / Q6 / Q19 latency: ematix-flow-distributed
+  numbers within 30% of single-node DataFusion on the same
+  hardware. Distributed planning has overhead at SF=1; small
+  spread is expected. This is a regression-canary, not a
+  scaling claim.
+- Geomean per-process memory: flow-worker ≤ 50% of a Spark
+  executor's footprint on the same hardware.
+- Worker image size: flow-worker image ≤ 20% of Spark image.
+- Cold-start time: docker-compose stack up to first query
+  ≤ 30% of equivalent Spark stack.
+
+The "scales as well as PySpark" headline cannot be made from
+these numbers alone — that requires real cross-host hardware
+(deferred, see below).
+
+### PR 3 — announcement + repro instructions
+
+- `docs/BENCHMARKS.md` becomes the source of truth: paste-into-
+  Hacker-News header, plus per-query breakdown + reproducibility
+  appendix (exact docker-compose / cargo / pyspark commands).
+- AWS recipe (`infra/README.md`) gets a callout in the appendix
+  so anyone who *does* have cluster hardware can produce real
+  cross-host numbers — those land as a follow-up if/when someone
+  runs them.
+- Top-of-file disclaimer makes the single-host framing impossible
+  to miss.
+- Honest gaps section: TPC-H queries that don't run on
+  ematix-flow-distributed (correlated subqueries, certain CTEs)
+  listed with workarounds. We claim "small footprint + correct
+  distributed plans on the queries it supports," not "100%
+  TPC-H coverage day one" and not "cross-host scaling proof."
 
 ### Σ.C deferred for follow-up
 
-- **TPC-DS at SF=10 / SF=100.** TPC-DS is a heavier workout than
-  TPC-H but published Spark numbers are sparser. Lands as a
-  follow-up.
-- **Larger scale factors (SF=1000).** Tests shuffle perf at a
-  serious size; needs a bigger spot fleet. Lands when somebody is
-  paying for the AWS bill.
-- **Multi-cloud benchmark numbers.** Σ.C runs on AWS EC2 only.
-  GCP / Azure numbers are reproducible via the script but not part
-  of the headline.
+- **Real cross-host numbers.** The publishable "scales as well as
+  PySpark" claim needs network-separated hardware (homelab k3s
+  across multiple boxes, or rented bare-metal at Hetzner / OVH).
+  The `infra/` recipe still works for AWS users; this project's
+  primary path is docker-compose. Lands when a contributor runs
+  the harness on real cluster hardware.
+- **TPC-DS at any scale factor.** TPC-DS is a heavier workout
+  than TPC-H but published Spark numbers are sparser. Follow-up.
+- **Larger scale factors (SF=100 / SF=1000).** SF=10 is the
+  practical ceiling for laptop-class hardware (data alone is
+  ~10 GB; SF=100 is ~100 GB and exceeds typical dev memory).
+  Larger factors need real cluster hardware + budget.
+- **Multi-cloud benchmark numbers.** Out of scope until there's
+  a primary cloud target — and there isn't one.
 
 ---
 
@@ -770,9 +840,13 @@ sub-phase.
    (same Rust version → same bytes); `dbgen` is the canonical
    reference. Spike in PR 1 to decide.
 2. **Bench machine canonicalization.** `docs/BENCHMARKS.md` numbers
-   need to be from a stable hardware target. AWS EC2 `m6i.4xlarge`
-   is the default; Apple Silicon M1 numbers reported separately as
-   "developer-laptop reference."
+   need to be from a stable hardware target. **Resolved 2026-05-05.**
+   This project is not deploying to AWS, so the canonical bench
+   machine is developer hardware (Apple Silicon M-series Mac, ≥32 GB
+   RAM) running the docker-compose 3-worker stack — the AWS EC2
+   `m6i.4xlarge` recipe in `infra/` is retained but is no longer
+   the canonical target. See Σ.C below for the honest single-host
+   framing.
 
 ### Σ.A2
 
