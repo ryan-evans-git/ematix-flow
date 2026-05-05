@@ -99,3 +99,10 @@ harness = false
 [[example]]
 name = "tpch_generate"
 path = "examples/tpch_generate.rs"
+
+# Σ.A1 PR 4 follow-up: SessionConfig sweep for Q6, used to identify
+# which knobs close the Polars-vs-DataFusion 1.82× gap. The winning
+# config gets baked into `benches/tpch.rs`.
+[[example]]
+name = "tpch_q6_tune"
+path = "examples/tpch_q6_tune.rs"

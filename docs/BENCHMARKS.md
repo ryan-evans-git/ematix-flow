@@ -115,6 +115,40 @@ for this workload shape. Same-engine-family Polars-vs-DataFusion is
 close (~10–80 ms swings); DataFusion's win on the suite comes from
 SQL coverage + complex-query robustness, not raw scan speed.
 
+#### Q6 tuning audit (2026-05-05)
+
+We swept `SessionConfig` knobs to see if any close the Polars gap on
+Q6. None do; in fact the in-decoder filter knobs make it worse.
+Reproducer: `cargo run --release -p ematix-flow-core --example
+tpch_q6_tune`.
+
+| Config | Median (ms) |
+|---|---|
+| default | 16.9 |
+| + `target_partitions=12` | 17.2 |
+| + `repartition_file_scans=true` | 17.1 |
+| + `parquet.pushdown_filters=true` | **28.3** (worse) |
+| + `parquet.reorder_filters=true` | **62.9** (much worse) |
+
+`target_partitions` is already at `num_cpus::get()` by default;
+DataFusion already splits the Parquet into 12 byte-range scan groups
+automatically (visible in the EXPLAIN as
+`file_groups={12 groups: [[…0..17M], …]}`). The Q6 predicates are
+cheap enough to evaluate post-decode on Arrow batches; pushing them
+into the Parquet decoder pays a per-batch filter-mask cost without
+recovering it.
+
+**Implications for the bench harness + Σ.B work:**
+- Keep the criterion bench's `SessionContext::new()` (no custom
+  config). The defaults are right.
+- **Do not** globally enable `pushdown_filters` — it hurts simple-
+  aggregate queries like Q6.
+- Polars's 1.82× edge on Q6 is hand-tuned vectorized inner loops,
+  not a config gap. Closing it from here would need profiling
+  DataFusion's vectorized aggregate path + likely upstream PRs.
+  Out of scope for Σ.A1; revisit if Σ.C's TPC-H suite shows
+  systematic per-query gaps.
+
 **Net for the Σ.A1 rep set**:
 - DataFusion: clean wins on Q1 (Polars fails), Q3 (1.35×), Q19 (9.6×).
 - DataFusion: loses to Polars on Q6 (1.82× the wrong way).
