@@ -33,6 +33,56 @@ criterion's bootstrap CI. Saved as baseline `sigma_a1_sf1_m3pro`.
 | Q6  | **18.2 ms** | [18.2, 18.3]  | 1155 | scan + filter + single sum |
 | Q19 | **38.0 ms** | [37.4, 38.4]  | 605  | 2-way join + complex disjunctive WHERE |
 
+### Σ.A2 PR 4 — TPC-DS Spark-dialect audit (2026-05-05)
+
+Plan-only translator audit: each of the 103 official Apache Spark
+TPC-DS queries (99 numbered + 4 a/b variants like `q14a`, `q23a`)
+fed through `dialect::translate(_, Dialect::Spark)`, output handed
+to a `SessionContext` registered with the canonical TPC-DS schema
+(24 tables, types translated `CHAR(N) → VARCHAR`). DataFusion's
+`create_physical_plan` exercises the planner. No data; no execution.
+
+```text
+=== Σ.A2 PR 4 audit ===
+total:           103
+PASS:            103 (100.0%)
+TRANSLATE_FAIL:  0
+PLAN_FAIL:       0
+
+acceptance gate: ≥80% PASS — MET
+```
+
+**Headline: 100% PASS, no findings.** PR 2's function-name remap +
+PR 3's LATERAL VIEW EXPLODE rewrite + DataFusion 53's native SQL
+surface together cover the entire TPC-DS Spark dialect. The plan's
+speculative concerns (correlated subqueries, complex-type literals,
+window-frame INTERVAL syntax) all just work — either the queries
+don't lean on those constructs, or DataFusion accepts them as-is.
+
+**Audit reproducer:**
+
+```sh
+cargo run --release -p ematix-flow-core --example tpcds_dialect_audit
+```
+
+Reads `examples/tpcds/queries/spark/q*.sql` (Apache-Spark-canonical)
+and `examples/tpcds/schema.sql` (auto-generated from
+`apache/spark`'s `TPCDSSchema.scala`). Per-query failures land on
+stderr with the underlying error; clusters by error-message-prefix
+in the summary so common root causes are obvious.
+
+**What this implies for Σ.A2:**
+
+- PR 4's "iterate on translator gaps until ≥80%" task is a no-op
+  for the canonical TPC-DS suite. Any future translator work
+  triggers from real-world user queries that surface idioms the
+  audit didn't catch.
+- The 103 .sql files stay in the repo as a regression suite — any
+  future change to the dialect translator or DataFusion bump gets
+  re-checked against them via `tpcds_dialect_audit`.
+- Σ.A2 acceptance is met. PR 5 (DuckDB dialect) is the next
+  remaining sub-phase work item.
+
 ### Σ.A1 audit findings
 
 **None.** All four queries execute cleanly through DataFusion 53.1

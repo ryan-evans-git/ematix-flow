@@ -112,3 +112,11 @@ path = "examples/tpch_generate.rs"
 name = "tpch_q6_tune"
 path = "examples/tpch_q6_tune.rs"
 
+# Σ.A2 PR 4: TPC-DS dialect-translator audit. Plan-only check —
+# translates each of the 99 official Spark TPC-DS queries through
+# `dialect = "spark"`, hands the output to DataFusion's planner,
+# reports per-query PASS / TRANSLATE_FAIL / PLAN_FAIL.
+[[example]]
+name = "tpcds_dialect_audit"
+path = "examples/tpcds_dialect_audit.rs"
+
