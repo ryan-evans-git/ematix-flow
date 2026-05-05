@@ -7,8 +7,9 @@ addressed in a later refactor, mean two breaking changes instead of
 one. What's the unified trait shape that absorbs all three needs in a
 single rework?
 
-**Output.** Concrete proposal + 6 open questions to resolve before
-opening Σ.B PR 1.
+**Status.** Concrete proposal + 6 sub-questions; **all 6 locked
+2026-05-05** (see "Locked decisions" section near the bottom). Σ.B
+PR 1 is now fully scoped and unblocked once v0.1.0 publishes.
 
 ---
 
@@ -277,7 +278,92 @@ function per backend kind; CI matrix covers each.
 
 ---
 
-## Open questions to resolve before Σ.B PR 1
+## Locked decisions (2026-05-05)
+
+All 6 sub-questions resolved per the recommended defaults below.
+Σ.B PR 1 implementer takes these as the contract; deviations require
+a new spike commit referencing this section.
+
+1. **Wire format: JSON.** Locked.
+   - Rationale: human-readable, debuggable in CI logs, matches the
+     existing TOML config shape (JSON is a strict superset). Config
+     blobs are a few KB; debug-ability beats wire-size.
+   - Postcard considered + rejected — ~2× smaller but binary-only;
+     not worth losing inspectability over a few KB per backend.
+
+2. **Credentials in config blob: inline today.** Locked.
+   - `PostgresConfig { dsn: "postgres://user:pass@host" }`. Same
+     handling as today; no in-band redaction.
+   - Lock down via TLS at the Arrow Flight transport layer. Document
+     the threat model in `docs/SECURITY.md` as part of Σ.B PR 1.
+   - Env-var indirection (`${PASSWORD}` resolved on the executor)
+     ships as a follow-up after a user requests it. Non-breaking
+     addition: a string starting with `$` triggers the resolver.
+
+3. **`as_postgres()` escape hatch: remove in PR 1.** Locked.
+   - The cross-DB Arrow path (Phase 30b/c) is production-tested.
+     The PG-↔-PG COPY BINARY fast path is a micro-optimization
+     that complicates serialization (can't ship a `PgPool`
+     reference over the wire).
+   - Removing forces the universal Arrow path — which is what
+     Ballista uses anyway. Single code path is easier to reason
+     about + benchmark.
+   - If a regression surfaces in TPC-H Σ.A1 numbers, revisit by
+     adding a same-process fast path *inside* `read_arrow_stream`
+     (peek at runtime type, no trait surface change).
+
+4. **Out-of-tree backend registry: closed (match-on-tag) for now.**
+   Locked.
+   - Σ.B's `backend_from_config` is a closed match. Users wanting
+     custom backends fork — same as `parquet-rs` and `arrow-rs`.
+   - Open registry via `inventory` or `linkme` is non-breaking to
+     add later: replace the closed match with a registry lookup;
+     in-tree backends register themselves; third parties get the
+     same hook.
+   - Revisit timing: when a real user asks. Don't ship abstractions
+     ahead of demand.
+
+5. **`partitioning_hint` shape: default-`None` in Σ.B PR 1.**
+   Locked.
+   - Method exists on the trait; default returns `None`. No
+     backend overrides in Σ.B.
+   - Semantics + override shape locked in Σ.D once we know whether
+     range partitioning, hash partitioning, or per-source-partition
+     is the dominant pattern.
+
+6. **Strategy methods over Ballista: scheduler reconstructs both
+   backends; ships live `Arc<dyn Backend>` references.** Locked.
+   - `run_append` / `run_merge` / `run_scd2` keep their current
+     signatures (`Option<&dyn Backend>` for the source).
+   - Scheduler-side: `backend_from_config(target_cfg)` +
+     `backend_from_config(source_cfg)` happen on the scheduler
+     before dispatch.
+   - Executor-side strategies don't see the config blobs — they
+     get the same trait references they have today.
+   - Net effect: zero change to the strategy interface; all the
+     serialization complexity is contained in the scheduler.
+
+### Implications for Σ.B PR 1
+
+With these locked, the migration plan in the previous section
+("Σ.B PR 1 commit plan") is final:
+
+a. Trait scaffold (`BackendConfig` enum, `fn config()` method,
+   `backend_from_config` stub, `as_postgres` removed).
+b. Migrate DB backends (Postgres, MySQL, SQLite, DuckDB).
+c. Migrate object-store + delta backends.
+d. Migrate streaming backends (Kafka, Kinesis, Pub/Sub, RabbitMQ).
+
+Plus the round-trip integration test described in "Acceptance test
+for the refactor" above, run against every backend kind.
+
+---
+
+## Original sub-question prose (preserved for reference)
+
+The recommendations below were the spike's original analysis; the
+locked decisions above are the load-bearing record. Kept here so the
+reasoning chain is auditable.
 
 1. **Wire format: JSON or postcard?** JSON is human-readable, debuggable,
    matches today's TOML config shape, and is universal across the
@@ -353,13 +439,16 @@ function per backend kind; CI matrix covers each.
 
 ## Recommendation
 
-Lock answers to all 6 questions above (or accept the recommended
-defaults), then open Σ.B PR 1 with the 4-commit plan. Estimated
-effort: **3 weeks for one engineer**, mostly mechanical migration of
-11 backends to the `Config` shape. After PR 1 lands, Σ.B PR 2
-(`ematix-flow-ballista` crate) can start in parallel with Σ.A1 / Σ.A2
-work since it doesn't touch backend internals further.
+All 6 sub-questions are locked (see "Locked decisions" above).
+Σ.B PR 1 is fully scoped: the 4-commit plan in "Σ.B PR 1 commit plan"
+above is the implementation contract. Estimated effort: **3 weeks for
+one engineer**, mostly mechanical migration of 11 backends to the
+`Config` shape.
 
-Next: confirm the recommended defaults and queue Σ.B PR 1 as the
-first concrete piece of distributed-compute work after v0.1.0
-publishes.
+After PR 1 lands, Σ.B PR 2 (`ematix-flow-ballista` crate) can start
+in parallel with Σ.A1 / Σ.A2 work since it doesn't touch backend
+internals further.
+
+Σ.B PR 1 is queued behind v0.1.0 publishing. As soon as the wheels
+are on PyPI, this is the first piece of distributed-compute work to
+open.

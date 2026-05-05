@@ -775,14 +775,14 @@ sub-phase.
    extra), or as a separate `ematix-flow-ballista` PyPI package?
    Two-package model is cleaner separation of concerns; one-package
    is simpler for users. Decide before PR 2.
-6. **Connector-trait refactor scope.** Lock the trait shape (Σ.A2's
-   dialect needs + Σ.B's serializability + Σ.D's eventual state-
-   store hooks) before writing PR 1. One breaking change is
-   fine; two is twice the migration pain.
-   **Spike output:** [`docs/PHASE_SIGMA_B_TRAIT_SPIKE.md`](PHASE_SIGMA_B_TRAIT_SPIKE.md)
-   proposes a `BackendConfig` tagged enum + `backend_from_config()`
-   free function pattern, with 6 sub-questions and recommended
-   defaults. ~3-week migration spread across 4 commits.
+6. **Connector-trait refactor scope.** ~~Open question~~ **Resolved 2026-05-05.**
+   Trait shape locked in [`docs/PHASE_SIGMA_B_TRAIT_SPIKE.md`](PHASE_SIGMA_B_TRAIT_SPIKE.md):
+   `BackendConfig` tagged enum (Serialize + Deserialize) + new
+   `fn config(&self) -> BackendConfig` method on the trait + free
+   function `backend_from_config(cfg) -> Arc<dyn Backend>`. All 6
+   sub-questions decided per the spike's recommended defaults;
+   `as_postgres()` escape hatch removed in PR 1 to force the
+   universal Arrow path. ~3-week migration across 4 staged commits.
 
 ### Σ.C
 
