@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "ematix-flow"
-version = "0.2.0"
+version = "0.1.0"
 description = "Declarative table management and load strategies (SCD1/SCD2/append/merge) for Postgres, with a Rust core."
 readme = "README.md"
 requires-python = ">=3.10"
