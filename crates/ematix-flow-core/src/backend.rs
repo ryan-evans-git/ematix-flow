@@ -712,6 +712,22 @@ pub struct KinesisStaticCredentials {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PubSubConfig {
     pub project_id: String,
+
+    /// Σ.B follow-up: gRPC endpoint override. `None` = default
+    /// `https://pubsub.googleapis.com`. Set to
+    /// `http://localhost:8085` for the gcloud emulator.
+    #[serde(default)]
+    pub endpoint: Option<String>,
+
+    /// Use anonymous credentials (no auth headers). Required for
+    /// the emulator path. Default `false`.
+    #[serde(default)]
+    pub anonymous_auth: bool,
+
+    /// Per-call drain limits for `read_arrow_stream`. `None` =
+    /// `PubSubBatchConfig::default()`.
+    #[serde(default)]
+    pub batch_config: Option<crate::pubsub_backend::PubSubBatchConfig>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -719,6 +735,17 @@ pub struct RabbitMqConfig {
     /// Full AMQP URL — `amqp://user:pass@host:port/vhost` or its
     /// `amqps://` TLS counterpart.
     pub amqp_url: String,
+
+    /// Σ.B follow-up: stable consumer-tag prefix used by
+    /// `basic_consume`. `None` = `"ematix-flow-consumer"`. Mostly
+    /// informational for management-UI displays.
+    #[serde(default)]
+    pub consumer_tag: Option<String>,
+
+    /// Per-call drain limits for `read_arrow_stream`. `None` =
+    /// `RabbitBatchConfig::default()`.
+    #[serde(default)]
+    pub batch_config: Option<crate::rabbitmq_backend::RabbitBatchConfig>,
 }
 
 /// Σ.B PR 2: distributed-execution backend config. Carries the
@@ -897,12 +924,29 @@ pub async fn backend_from_config(
             }
             Ok(std::sync::Arc::new(backend))
         }
-        BackendConfig::PubSub(c) => Ok(std::sync::Arc::new(
-            crate::pubsub_backend::PubSubBackend::open(c.project_id)?,
-        )),
-        BackendConfig::RabbitMq(c) => Ok(std::sync::Arc::new(
-            crate::rabbitmq_backend::RabbitMQBackend::open(c.amqp_url)?,
-        )),
+        BackendConfig::PubSub(c) => {
+            let mut backend = crate::pubsub_backend::PubSubBackend::open(c.project_id)?;
+            if let Some(endpoint) = c.endpoint {
+                backend = backend.with_endpoint(endpoint);
+            }
+            if c.anonymous_auth {
+                backend = backend.with_anonymous_auth();
+            }
+            if let Some(batch) = c.batch_config {
+                backend = backend.with_batch_config(batch);
+            }
+            Ok(std::sync::Arc::new(backend))
+        }
+        BackendConfig::RabbitMq(c) => {
+            let mut backend = crate::rabbitmq_backend::RabbitMQBackend::open(c.amqp_url)?;
+            if let Some(tag) = c.consumer_tag {
+                backend = backend.with_consumer_tag(tag);
+            }
+            if let Some(batch) = c.batch_config {
+                backend = backend.with_batch_config(batch);
+            }
+            Ok(std::sync::Arc::new(backend))
+        }
         BackendConfig::Distributed(_) => Err(BackendError::Other(
             "backend_from_config(Distributed) is intentionally a no-op in core: \
              ematix-flow-core doesn't depend on ematix-flow-distributed \

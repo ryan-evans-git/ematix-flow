@@ -101,7 +101,7 @@ use crate::types::TableSpec;
 /// flushes — the consumer returns whatever it has accumulated and
 /// callers can call `read_arrow_stream` again to continue. Mirrors
 /// `RabbitBatchConfig`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PubSubBatchConfig {
     /// Max number of messages per call.
     pub batch_size: usize,
@@ -418,18 +418,12 @@ impl Backend for PubSubBackend {
     }
 
     fn config(&self) -> crate::backend::BackendConfig {
-        // Σ.B PR 1 commit d: constructor args (project_id) only.
-        // Endpoint + anonymous_auth + batch_config round-trip ships
-        // in Σ.B PR 2.
-        if self.endpoint.is_some() || self.anonymous_auth {
-            panic!(
-                "PubSubBackend::config() called with non-default builder state \
-                 (endpoint / anonymous_auth). Full round-trip ships in Σ.B PR 2 — \
-                 see docs/PHASE_SIGMA_B_TRAIT_SPIKE.md."
-            );
-        }
+        // Σ.B follow-up: full builder-state round-trip.
         crate::backend::BackendConfig::PubSub(crate::backend::PubSubConfig {
             project_id: self.project_id.clone(),
+            endpoint: self.endpoint.clone(),
+            anonymous_auth: self.anonymous_auth,
+            batch_config: Some(self.batch_config.clone()),
         })
     }
 

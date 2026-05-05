@@ -350,10 +350,45 @@ async fn backend_from_config_kinesis_round_trips_builder_state() {
 async fn backend_from_config_constructs_pubsub_offline() {
     let cfg = BackendConfig::PubSub(PubSubConfig {
         project_id: "demo-project".into(),
+        endpoint: None,
+        anonymous_auth: false,
+        batch_config: None,
     });
     let backend = backend_from_config(cfg).await.expect("construct");
     match backend.config() {
         BackendConfig::PubSub(c) => assert_eq!(c.project_id, "demo-project"),
+        other => panic!("expected PubSub, got {other:?}"),
+    }
+}
+
+/// Σ.B follow-up: full PubSub builder-state round-trip. emulator
+/// path = endpoint + anonymous_auth, plus a tweaked batch_config.
+#[tokio::test]
+async fn backend_from_config_pubsub_round_trips_emulator_state() {
+    use ematix_flow_core::pubsub_backend::PubSubBatchConfig;
+
+    let cfg = BackendConfig::PubSub(PubSubConfig {
+        project_id: "demo-project".into(),
+        endpoint: Some("http://localhost:8085".into()),
+        anonymous_auth: true,
+        batch_config: Some(PubSubBatchConfig {
+            batch_size: 200,
+            batch_bytes: 1024 * 1024,
+            idle_timeout_ms: 50,
+        }),
+    });
+    let json = serde_json::to_string(&cfg).unwrap();
+    let recovered: BackendConfig = serde_json::from_str(&json).unwrap();
+    let backend = backend_from_config(recovered).await.expect("construct");
+    match backend.config() {
+        BackendConfig::PubSub(c) => {
+            assert_eq!(c.project_id, "demo-project");
+            assert_eq!(c.endpoint.as_deref(), Some("http://localhost:8085"));
+            assert!(c.anonymous_auth);
+            let bc = c.batch_config.as_ref().unwrap();
+            assert_eq!(bc.batch_size, 200);
+            assert_eq!(bc.idle_timeout_ms, 50);
+        }
         other => panic!("expected PubSub, got {other:?}"),
     }
 }
@@ -424,11 +459,45 @@ async fn backend_from_config_distributed_points_at_distributed_crate() {
 async fn backend_from_config_constructs_rabbitmq_offline() {
     let cfg = BackendConfig::RabbitMq(RabbitMqConfig {
         amqp_url: "amqp://guest:guest@localhost:5672/%2f".into(),
+        consumer_tag: None,
+        batch_config: None,
     });
     let backend = backend_from_config(cfg).await.expect("construct");
     match backend.config() {
         BackendConfig::RabbitMq(c) => {
             assert_eq!(c.amqp_url, "amqp://guest:guest@localhost:5672/%2f");
+            // Default consumer_tag rides through as None — keeps the
+            // JSON minimal for the common case.
+            assert!(c.consumer_tag.is_none());
+        }
+        other => panic!("expected RabbitMq, got {other:?}"),
+    }
+}
+
+/// Σ.B follow-up: full RabbitMQ builder-state round-trip. Custom
+/// consumer_tag + tweaked batch_config preserved end-to-end.
+#[tokio::test]
+async fn backend_from_config_rabbitmq_round_trips_builder_state() {
+    use ematix_flow_core::rabbitmq_backend::RabbitBatchConfig;
+
+    let cfg = BackendConfig::RabbitMq(RabbitMqConfig {
+        amqp_url: "amqp://guest:guest@localhost:5672/%2f".into(),
+        consumer_tag: Some("ematix-prod-east".into()),
+        batch_config: Some(RabbitBatchConfig {
+            batch_size: 4_096,
+            batch_bytes: 4 * 1024 * 1024,
+            idle_timeout_ms: 1_000,
+        }),
+    });
+    let json = serde_json::to_string(&cfg).unwrap();
+    let recovered: BackendConfig = serde_json::from_str(&json).unwrap();
+    let backend = backend_from_config(recovered).await.expect("construct");
+    match backend.config() {
+        BackendConfig::RabbitMq(c) => {
+            assert_eq!(c.consumer_tag.as_deref(), Some("ematix-prod-east"));
+            let bc = c.batch_config.as_ref().unwrap();
+            assert_eq!(bc.batch_size, 4_096);
+            assert_eq!(bc.idle_timeout_ms, 1_000);
         }
         other => panic!("expected RabbitMq, got {other:?}"),
     }

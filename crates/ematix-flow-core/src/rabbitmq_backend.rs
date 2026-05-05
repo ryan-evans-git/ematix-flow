@@ -100,7 +100,7 @@ use crate::types::TableSpec;
 /// Per-call drain limits for `read_arrow_stream`. First trigger
 /// flushes — the consumer returns whatever it has accumulated and
 /// callers can call `read_arrow_stream` again to continue.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RabbitBatchConfig {
     /// Max number of messages per call.
     pub batch_size: usize,
@@ -384,17 +384,19 @@ impl Backend for RabbitMQBackend {
     }
 
     fn config(&self) -> crate::backend::BackendConfig {
-        // Σ.B PR 1 commit d: constructor args only. consumer_tag +
-        // batch_config round-trip ships in Σ.B PR 2.
-        if self.consumer_tag != "ematix-flow-consumer" {
-            panic!(
-                "RabbitMQBackend::config() called with a non-default consumer_tag. \
-                 Full round-trip ships in Σ.B PR 2 — see \
-                 docs/PHASE_SIGMA_B_TRAIT_SPIKE.md."
-            );
-        }
+        // Σ.B follow-up: full builder-state round-trip. The default
+        // `consumer_tag` "ematix-flow-consumer" rides through as a
+        // None so the JSON stays minimal in the common case;
+        // populated only when the operator overrides it.
+        let consumer_tag_default = self.consumer_tag == "ematix-flow-consumer";
         crate::backend::BackendConfig::RabbitMq(crate::backend::RabbitMqConfig {
             amqp_url: self.amqp_url.clone(),
+            consumer_tag: if consumer_tag_default {
+                None
+            } else {
+                Some(self.consumer_tag.clone())
+            },
+            batch_config: Some(self.batch_config.clone()),
         })
     }
 
