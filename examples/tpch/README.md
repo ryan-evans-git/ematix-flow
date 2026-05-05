@@ -42,7 +42,34 @@ cargo test -p ematix-flow-core --test tpch_smoke --release
 
 Hermetic: generates LineItem in-process, registers it with DataFusion,
 runs Q6, asserts revenue matches the TPC-H reference value. Doesn't
-read from `data/sfN/` — those are for the criterion benches in PR 2.
+read from `data/sfN/` — those are for the criterion benches.
+
+## Run the criterion benches
+
+Reads from generated Parquet under `data/sf1/` (must run the generator
+above first) and benchmarks Q1 / Q3 / Q6 / Q19:
+
+```sh
+# Full suite (~90s wall-clock at default measurement_time=20s).
+cargo bench -p ematix-flow-core --bench tpch
+
+# Single query for fast iteration.
+cargo bench -p ematix-flow-core --bench tpch -- q06
+
+# Save / compare against a named baseline.
+cargo bench -p ematix-flow-core --bench tpch -- --save-baseline mine
+cargo bench -p ematix-flow-core --bench tpch -- --baseline mine
+```
+
+Tunable env vars:
+- `TPCH_DATA_DIR` — path to the SF=1 directory if you've put it
+  somewhere other than `examples/tpch/data/sf1`.
+- `TPCH_MEASUREMENT_TIME_S` — override criterion's per-query
+  measurement window (default 20s/30s/60s depending on query).
+  Useful for fast iteration (`=5`) or CI noise mitigation (`=120`).
+
+Σ.A1 baseline numbers + acceptance criteria + when-to-re-run guidance
+live in [`docs/BENCHMARKS.md`](../../docs/BENCHMARKS.md).
 
 ## Queries
 
@@ -53,11 +80,13 @@ human-readable `.sql`:
 
 | File | Use site |
 |---|---|
-| `q06.sql` | Σ.A1 PR 1 smoke test |
+| `q01.sql` | Σ.A1 PR 2 criterion bench |
+| `q03.sql` | Σ.A1 PR 2 criterion bench |
+| `q06.sql` | Σ.A1 PR 1 smoke test + PR 2 criterion bench |
+| `q19.sql` | Σ.A1 PR 2 criterion bench |
 
-PR 2 will add `q01.sql`, `q03.sql`, `q19.sql` for the criterion
-benches. The remaining 18 queries live in `tpchgen` until Σ.C runs the
-full suite.
+The remaining 18 queries live in `tpchgen::q_and_a::queries::Q*` until
+Σ.A2 / Σ.C exercises the full TPC-H suite.
 
 ## Reference answers
 

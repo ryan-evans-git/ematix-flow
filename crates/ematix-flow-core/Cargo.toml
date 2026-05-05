@@ -84,6 +84,14 @@ tpchgen = { workspace = true }
 name = "transform"
 harness = false
 
+# Σ.A1 PR 2: TPC-H bench harness for Q1/Q3/Q6/Q19 at SF=1. Reads
+# Parquet from `examples/tpch/data/sf1/` (or `$TPCH_DATA_DIR`); fails
+# fast if the data isn't generated. See `crates/ematix-flow-core/
+# benches/tpch.rs` top-of-file comment for measurement-window tuning.
+[[bench]]
+name = "tpch"
+harness = false
+
 # Σ.A1 PR 1: bulk Parquet generator binary for the TPC-H benchmark
 # harness. Idempotent — regenerates only if the target file is
 # missing. SF=1 → ~1 GB compressed; SF=10 → ~10 GB. See
