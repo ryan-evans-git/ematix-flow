@@ -1066,14 +1066,18 @@ counters under `pipeline=<name>`:
 
 ### Multi-target reach
 
-Δ ships **Postgres only** today.
-[`Backend::run_cdc`](https://docs.rs/ematix-flow-core/latest/ematix_flow_core/backend/trait.Backend.html#method.run_cdc)'s
-default impl errors with a "not implemented for this dialect"
-message; non-Postgres targets fail-fast. Delta Lake (highest
-leverage; native MERGE), DuckDB / SQLite / MySQL (easy SQL ports),
-object stores, and streaming targets are catalogued as Phase Δ
-extensions in
-[`docs/PHASE_DELTA_CDC_PLAN.md`](PHASE_DELTA_CDC_PLAN.md#phase-δ-extensions).
+| Target | Status | Notes |
+|---|---|---|
+| **Postgres** | Shipped (Δ PR 3 + 4 + 5 + 5.5) | Full per-event apply with idempotency gate, schema-evolution detection, and streaming-runtime dispatch. |
+| **Delta Lake** | Shipped (Δ.X1 PR 1) | Single-MERGE-per-batch via `DeltaOps::merge`; within-batch dedupe by newest ts; auto-schema-evolution under Skip policy. Direct `Backend::run_cdc` calls work; streaming-runtime auto-dispatch waits on Δ.X1.2 (PK reflection through Delta table properties). |
+| **DuckDB / SQLite / MySQL** | Catalogued (Δ.X2) | Same per-event-statement shape as Postgres; differs only in UPSERT keyword + JSON-extract primitive. ~1–2 days each. |
+| **Object stores** | Deferred (Δ.X3) | Parquet / CSV / JSON / ORC are immutable — recommend Delta-on-S3 (Δ.X1) instead. |
+
+Default `Backend::run_cdc` impl errors with a clear "not
+implemented for this dialect" message on backends without a
+concrete implementation, so misconfiguration fails fast.
+[`docs/PHASE_DELTA_CDC_PLAN.md`](PHASE_DELTA_CDC_PLAN.md#phase-δ-extensions)
+catalogues every extension's design + effort estimate.
 
 ---
 

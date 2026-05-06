@@ -65,6 +65,36 @@ Multi-target reach (Delta Lake, DuckDB / SQLite / MySQL, object
 stores, streaming targets) is catalogued as Phase Δ extensions
 and unshipped — see the plan's "Phase Δ extensions" section.
 
+- **Δ.X1 PR 1 — Delta Lake CDC target.** Single-MERGE-per-batch
+  CDC apply on `DeltaBackend` via `deltalake::DeltaOps::merge`.
+  Three branches dispatch on a synthesized `__op` Utf8 column:
+  `when_matched_delete` for `__op = 'd'`, `when_matched_update`
+  for c/u/r overwrite, `when_not_matched_insert` for the
+  INSERT-when-absent path. Within-batch dedupe by primary key
+  keeps the highest-`ts_ms` event so `c` then `u` for the same
+  row collapses to one INSERT carrying the post-image of the `u`.
+  - Schema evolution: `Skip` rides Delta's
+    `with_merge_schema(true)` for auto-evolution (cleaner than
+    Postgres's "warn + drop"); `Fail` pre-flights against the
+    spec and aborts before MERGE with the offending column named.
+  - Soft-delete: replaces `when_matched_delete` with a
+    `when_matched_update` that flips the configured column to
+    `current_timestamp()`. Reported as `updates`, not `deletes`.
+  - Reflection: `Backend::reflect_table_spec` on `DeltaBackend`
+    returns columns from Delta's Arrow schema. PK info is **not**
+    surfaced — Delta tables don't carry PK constraints natively
+    and the kernel crate gates `Metadata.configuration` behind an
+    `internal_api` macro. Direct callers of `Backend::run_cdc`
+    (hand-built `TableSpec` with PK info) work; streaming-runtime
+    auto-dispatch waits on Δ.X1.2.
+  - Tests: 4 new tempdir-rooted unit tests cover multi-batch
+    dispatch counters, within-batch dedupe, soft-delete, and
+    Fail-policy abort.
+  - Residual gaps documented inline: between-batch idempotency
+    (Δ.X1.1 — needs `_cdc_last_ts` hidden column or sidecar
+    table), PK reflection (Δ.X1.2), Numeric column-type support
+    on the source-batch path.
+
 ## [0.1.2] — 2026-05-06
 
 Documentation polish only. **No functional changes** — the wheel
