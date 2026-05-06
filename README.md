@@ -1,13 +1,16 @@
 # ematix-flow
 
 > Declarative table management, load strategies, and streaming
-> pipelines — Rust core, Python API. Multi-backend (Postgres, MySQL,
-> SQLite, DuckDB, Object Stores, Delta Lake) with streaming sources
-> (Kafka, RabbitMQ, GCP Pub/Sub, AWS Kinesis), Schema-Registry-aware
-> Avro/Protobuf, manual-ack at-least-once, mid-stream SQL transforms
-> + tumbling/hopping/session windows + keyed time-windowed
-> stream-stream joins backed by a Postgres-durable state store, and
-> a `flow consume` CLI with Prometheus metrics + supervised restart.
+> pipelines — Rust core, Python API. Multi-backend across SQL
+> databases (Postgres, MySQL, SQLite, DuckDB), object stores +
+> Delta Lake (Parquet, CSV, JSON, ORC — local FS or S3), and
+> streaming sources (Kafka, RabbitMQ, GCP Pub/Sub, AWS Kinesis)
+> with Schema-Registry-aware Avro/Protobuf, manual-ack at-least-
+> once, mid-stream SQL transforms + tumbling/hopping/session
+> windows + keyed time-windowed stream-stream joins backed by a
+> Postgres- or in-memory-durable state store, optional distributed
+> batch SQL via the bundled `flow-worker` peer mesh, and a
+> `flow consume` CLI with Prometheus metrics + supervised restart.
 
 **Status: alpha.** Core scope shipped through Phase 39.5b. On PyPI as
 `ematix-flow` once wheel-build CI tasks land (see [`docs/ROADMAP.md`](docs/ROADMAP.md)

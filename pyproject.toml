@@ -5,14 +5,25 @@ build-backend = "maturin"
 [project]
 name = "ematix-flow"
 version = "0.1.0"
-description = "Declarative table management and load strategies (SCD1/SCD2/append/merge) for Postgres, with a Rust core."
+description = "Declarative table management + load strategies (append / truncate / merge / SCD1 / SCD2) for SQL databases (Postgres, MySQL, SQLite, DuckDB), object stores + Delta Lake (Parquet / CSV / JSON / ORC, local FS or S3), and streaming sources (Kafka, RabbitMQ, Pub/Sub, Kinesis). Rust core, Python API."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "Apache-2.0" }
 authors = [
     { name = "Ryan Evans", email = "ryanevans23@gmail.com" },
 ]
-keywords = ["data-engineering", "etl", "elt", "scd", "postgres", "data-pipeline"]
+keywords = [
+    "data-engineering",
+    "etl",
+    "elt",
+    "scd",
+    "data-pipeline",
+    "datafusion",
+    "delta-lake",
+    "parquet",
+    "kafka",
+    "postgres",
+]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
