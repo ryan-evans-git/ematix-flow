@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "ematix-flow"
-version = "0.1.1"
+version = "0.1.2"
 description = "Declarative ETL/ELT + streaming pipelines on a Rust + Apache Arrow core. Append / merge / SCD2 strategies across SQL databases (Postgres, MySQL, SQLite, DuckDB), object stores + Delta Lake (Parquet, CSV, JSON, ORC), and streaming sources (Kafka, RabbitMQ, Pub/Sub, Kinesis) — one decorator-driven API. 5.87× faster than single-node PySpark on TPC-H."
 readme = "README.md"
 requires-python = ">=3.10"

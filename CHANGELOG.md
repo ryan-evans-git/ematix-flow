@@ -10,6 +10,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Nothing pending — see [`docs/ROADMAP.md`](docs/ROADMAP.md) for the
 prioritized list of remaining work.
 
+## [0.1.2] — 2026-05-06
+
+Documentation polish only. **No functional changes** — the wheel
++ sdist contents are bit-equivalent to v0.1.1 modulo the embedded
+README. Cut so the PyPI project page picks up two specific
+clarifications + the SEO scaffolding shipped between releases.
+
+### Changed
+
+- README Quickstart 1 now shows explicit connection wiring at
+  the top of the snippet (`@ematix.connection class warehouse:
+  kind = "postgres"; url = "${EMATIX_FLOW_DSN}"` plus
+  `target_connection="warehouse"` on the pipeline). The
+  previous version started directly with `@ematix.table` and
+  the `conn` argument arrived without a visible source —
+  readers had to scroll to the "Configuring connections"
+  section below to figure out where the DB handle came from.
+- README's "Multi-backend, write once" bullet no longer
+  implies TOML is the only switching mechanism. Both the
+  decorator (`target_connection=` argument) and the TOML
+  field compile to the same `BackendConfig` enum + identical
+  Rust execution path; pick whichever fits the workflow.
+  The previous wording read "Switching the target of a
+  pipeline is a TOML one-liner" — accurate but misleading.
+
+### Added (infrastructure)
+
+- `overrides/main.html` mkdocs partial template wired via
+  `theme.custom_dir: overrides` in `mkdocs.yml`. Reserves
+  `<head>` slots for Google Search Console + Bing Webmaster
+  verification meta tags, currently commented out via Jinja
+  `{# … #}` syntax (so the deployed HTML stays empty until
+  real tokens land).
+- `docs/googleaa93d0535024bf3c.html` — Google Search Console
+  verification file. Served at the site root via mkdocs's
+  static-passthrough; Google fetches it to confirm ownership
+  of the GitHub Pages docs site.
+
 ## [0.1.1] — 2026-05-06
 
 Metadata + documentation polish only. **No functional changes** —
