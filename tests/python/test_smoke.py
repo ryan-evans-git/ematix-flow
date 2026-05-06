@@ -4,7 +4,6 @@ import re
 
 import ematix_flow
 
-
 # A SemVer-compatible version string. Locks down the shape of
 # `__version__` without hardcoding the literal — that way a release
 # bump only needs to touch Cargo.toml + pyproject.toml, not this
