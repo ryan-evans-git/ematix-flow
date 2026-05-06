@@ -33,8 +33,12 @@ and per-query numbers.
   SQLite, DuckDB), object stores + Delta Lake (Parquet, CSV,
   JSON, ORC — local FS or S3), and streaming sources (Kafka,
   RabbitMQ, GCP Pub/Sub, AWS Kinesis) all live behind one
-  `Backend` trait. Switching the target of a pipeline is a TOML
-  one-liner; the SQL stays the same.
+  `Backend` trait. Switch a pipeline's target by changing one
+  line — either the decorator's `target_connection=` argument
+  or, if you prefer config-as-data, a TOML field. Both
+  surfaces compile to the same backend descriptor and run the
+  identical Rust execution path; pick whichever fits the
+  workflow. The SQL stays the same.
 
 - **Correct by default.** Watermarks restart-safe via row-level
   advance-after-commit. Stateful streaming windows and joins
