@@ -1,54 +1,112 @@
 # ematix-flow
 
-> Declarative table management, load strategies, and streaming
-> pipelines — Rust core, Python API. Multi-backend across SQL
-> databases (Postgres, MySQL, SQLite, DuckDB), object stores +
-> Delta Lake (Parquet, CSV, JSON, ORC — local FS or S3), and
-> streaming sources (Kafka, RabbitMQ, GCP Pub/Sub, AWS Kinesis)
-> with Schema-Registry-aware Avro/Protobuf, manual-ack at-least-
-> once, mid-stream SQL transforms + tumbling/hopping/session
-> windows + keyed time-windowed stream-stream joins backed by a
-> Postgres- or in-memory-durable state store, optional distributed
-> batch SQL via the bundled `flow-worker` peer mesh, and a
-> `flow consume` CLI with Prometheus metrics + supervised restart.
+**Declarative ETL/ELT + streaming pipelines, multi-backend, on a
+Rust + Apache Arrow core.** A single Python decorator declares a
+target table; another declares the load. Append, truncate,
+merge, and SCD2 strategies run against SQL databases, object
+stores, Delta Lake, or live streams without rewriting the
+pipeline. **5.87× faster than PySpark `local[*]` geomean across
+all 22 TPC-H queries** at SF=1 — see
+[`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) for the full method
+and per-query numbers.
 
-**Status: alpha.** Core scope shipped through Phase 39.5b. On PyPI as
-`ematix-flow` once wheel-build CI tasks land (see [`docs/ROADMAP.md`](docs/ROADMAP.md)
-for what's left).
+> Status: **v0.1.0 on PyPI** as `ematix-flow` (2026-05-05).
+> All four surfaces below are shipped. See
+> [`docs/ROADMAP.md`](docs/ROADMAP.md) for what's deferred.
 
-**Tests** (workspace-wide):
-- 459 Rust core lib unit tests
-- 108 Rust CLI lib unit tests
-- ~80 Rust testcontainers integration tests (`--ignored`; opt-in Docker)
-- 376 default Python tests + ~196 testcontainers-gated Python tests
+## Why ematix-flow
 
-clippy + fmt clean on stable Rust.
+- **Declarative, not framework boilerplate.**
+  `@ematix.table` + `@ematix.pipeline` is the whole API surface
+  for a typical pipeline. Schemas, primary keys, compare columns,
+  SCD2 event-time, watermarks — all PEP-593 type-annotated. No DAG
+  plumbing, no scheduler stub, no per-source connector wiring.
+
+- **One binary, one dependency tree.** Distributed as a Rust
+  library with Python bindings (~150 MB image including all 10
+  backends). No JVM, no separate scheduler/executor processes,
+  no cluster service to operate. Distributed batch SQL is
+  *opt-in* via a peer-to-peer worker mesh — not a top-down
+  cluster manager you have to deploy.
+
+- **Multi-backend, write once.** SQL databases (Postgres, MySQL,
+  SQLite, DuckDB), object stores + Delta Lake (Parquet, CSV,
+  JSON, ORC — local FS or S3), and streaming sources (Kafka,
+  RabbitMQ, GCP Pub/Sub, AWS Kinesis) all live behind one
+  `Backend` trait. Switching the target of a pipeline is a TOML
+  one-liner; the SQL stays the same.
+
+- **Correct by default.** Watermarks restart-safe via row-level
+  advance-after-commit. Stateful streaming windows and joins
+  serialize their per-key state to a durable `StateStore`
+  (Postgres or in-memory) with **atomic state + offset commits**
+  on every emit. Manual-ack at-least-once across all four
+  streaming sources; Kafka exactly-once via transactions.
+
+- **Faster than single-node PySpark, with a real distributed
+  story when you need it.** SF=1 TPC-H (M3 Pro, 22 queries):
+  DataFusion via ematix-flow beats PySpark `local[*]` by a
+  geomean of **5.87×** (range 1.78× to 16.74×). At SF=10 on the
+  representative set: **3.3× geomean**. Distributed batch SQL
+  across ematix-flow processes is available today via the
+  bundled `flow-worker` peer mesh; cross-host scaling claims are
+  honestly framed as deferred (no cluster hardware in this
+  project's runway — see BENCHMARKS.md).
 
 ## What it is
 
-Three complementary surfaces in one repo:
+Four complementary surfaces in one repo, all sharing a Rust +
+Apache Arrow core. Data moves through Arrow record batches end-
+to-end — no row-by-row serialization, no JVM hop, no
+intermediate file roundtrip.
 
-1. **Declarative table management for Postgres** (the original v0.1
-   scope). Decorator-driven schemas, normalization markers, SCD2 with
-   event-time, run history, watermarks, post-load transforms, polars/
-   pandas/pyspark interop, ML feature store. **Stable.**
+1. **Declarative table management** *(Phases 0–25)*. Decorator-
+   driven schemas with PEP-593 type annotations + normalization
+   markers (`trim`, `lower`, `parse_timestamp`, `regex_replace`,
+   ...), SCD2 with event-time, run history, watermarks, post-
+   load transforms, polars / pandas / pyspark interop, ML
+   feature store. The original v0.1 scope.
 
-2. **Multi-backend streaming pipelines** (Phases 30–38, post-v0.1).
-   Source from any of 4 streaming backends, write to any of 6
-   storage backends, with manual offset commits, dead-letter
-   patterns, Confluent Schema Registry support, and a long-running
-   `flow consume` daemon binary. **Stable.**
+2. **Multi-backend pipelines** *(Phases 30–38)*. Source from
+   any of 4 streaming backends, write to any of 10 storage
+   backends. Manual offset commits, app-level + broker-level
+   dead-letter patterns, Confluent Schema Registry-aware
+   Avro/Protobuf, long-running `flow consume` daemon with
+   Prometheus metrics + supervised restart, `flow consume
+   --module` typed-Python pipeline registry.
 
-3. **Stream processing** (Phase 39). DataFusion-backed mid-stream SQL
-   transforms (filter / project / cast / lookup-join), tumbling /
-   hopping / session windows with watermark-driven emit + late-data
-   handling, keyed time-windowed stream-stream inner joins backed by
-   a durable Postgres `StateStore` for crash-recoverable state +
-   atomic offset commits. **Recently shipped.**
+3. **Stream processing** *(Phase 39)*. DataFusion-backed mid-
+   stream SQL transforms (filter / project / cast / lookup-
+   join), tumbling / hopping / session windows with watermark-
+   driven emit + late-data handling (`drop` / `reopen` /
+   `dlq`), keyed time-windowed stream-stream joins (inner +
+   outer + retained-buffer reopen for late matches). Per-key
+   state persists to a durable `StateStore` with atomic
+   state+offset commits across crashes.
 
-All three share a common Rust core that does Arrow record-batch IO
-under the hood; bridging from streaming to a target table is an Arrow
-path end-to-end.
+4. **Distributed batch SQL** *(Σ.B)*. Optional peer-to-peer
+   distributed execution via the bundled `flow-worker` binary;
+   set `[transform] engine = "distributed"` + `peers = [...]`
+   and the SQL fans out across processes via Apache Arrow
+   Flight. mTLS for the worker mesh, cross-pod lookup
+   broadcast, no separate cluster service. SQL dialect
+   translator (Spark / DuckDB → DataFusion) makes existing
+   queries portable without rewrites — 103/103 PASS on the
+   canonical Apache Spark TPC-DS suite.
+
+**Test surface (workspace-wide, every PR):**
+
+- 459 Rust core unit tests
+- 124 Rust CLI unit tests + 27 backend-config scaffold round-
+  trip tests across all 10 backends + distributed + TLS config
+- ~80 Rust testcontainers integration tests (Docker-gated)
+- 376 default Python tests + ~196 testcontainers-gated Python
+  tests
+- 22-query TPC-H audit: **22/22 PASS** at SF=1
+- 103-query TPC-DS Spark-dialect audit: **103/103 PASS** plan-time
+
+clippy + fmt clean on stable Rust; `cargo audit` green against
+RustSec; ruff + bandit + pip-audit green on the Python side.
 
 → For a step-by-step walkthrough of every surface, see
 **[`docs/USER_GUIDE.md`](docs/USER_GUIDE.md)**.
