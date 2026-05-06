@@ -1160,7 +1160,7 @@ impl PgPool {
         pipeline_name: &str,
         skipped: i64,
     ) -> Result<crate::backend::CdcRunResult, PgError> {
-        use crate::cdc::{CdcOp, DeleteMode};
+        use crate::cdc::{CdcOp, DeleteMode, SchemaEvolutionPolicy};
         use serde_json::Value;
 
         // The idempotency gate writes into ematix_flow.cdc_idempotency.
@@ -1310,6 +1310,20 @@ impl PgPool {
         let mut batch_seen_ts: std::collections::HashMap<String, i64> =
             std::collections::HashMap::new();
 
+        // Phase Δ PR 5: schema-evolution detection. Pre-compute
+        // the set of column names the target declares; any
+        // `after`-payload key outside that set is "drift". The
+        // policy decides whether to warn (Skip — Postgres's
+        // jsonb_populate_record already discards the value) or
+        // raise (Fail — abort the whole batch transactionally).
+        let valid_cols: std::collections::HashSet<&str> = target_spec
+            .columns
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect();
+        let mut warned_unknown: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+
         for event in events {
             // Resolve a stable pk JSON for the gate: Create/Read/
             // Update use event.after[pk_col]; Delete falls back to
@@ -1341,6 +1355,43 @@ impl PgPool {
                     continue;
                 }
                 batch_seen_ts.insert(canon, ts_ms);
+            }
+
+            // Phase Δ PR 5: schema-evolution check. Walk the
+            // `after` payload and compare each key to the
+            // target's declared columns. Skip warns + applies
+            // (Postgres ignores the unknown key); Fail aborts
+            // the batch via PgError::Other and the tx Drop on
+            // unwind rolls back any earlier writes in this batch.
+            if let Some(after_map) = event.after.as_ref() {
+                for k in after_map.keys() {
+                    if valid_cols.contains(k.as_str()) {
+                        continue;
+                    }
+                    match cdc_config.schema_evolution {
+                        SchemaEvolutionPolicy::Skip => {
+                            // Warn-once-per-column-per-batch.
+                            // The HashSet entry doubles as the
+                            // dedup key.
+                            if warned_unknown.insert(k.clone()) {
+                                tracing::warn!(
+                                    target: "ematix_flow::cdc",
+                                    pipeline = pipeline_name,
+                                    column = k.as_str(),
+                                    "CDC envelope carries unknown column; row applied without it (SchemaEvolutionPolicy::Skip)",
+                                );
+                            }
+                        }
+                        SchemaEvolutionPolicy::Fail => {
+                            return Err(PgError::Other(format!(
+                                "schema evolution: unknown column '{k}' in `after` payload \
+                                 for pipeline '{pipeline_name}' \
+                                 (SchemaEvolutionPolicy::Fail) — \
+                                 add the column to the target table or switch to Skip"
+                            )));
+                        }
+                    }
+                }
             }
 
             match event.op {

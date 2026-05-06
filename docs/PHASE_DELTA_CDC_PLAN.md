@@ -344,15 +344,43 @@ is a Postgres-only gain today). Out-of-order tolerance window
 yet wired — PR 4's gate is strict-monotonic; PR 5 will add the
 warn-on-backwards path.
 
-### PR 5 — schema evolution detection (3 days)
+### PR 5 — schema-evolution detection (3 days) — **shipped**
 
-- `SchemaEvolutionPolicy::Skip` default — warn once per unknown
-  column, omit from applied DDL.
-- `Fail` policy for strict deployments.
-- Open: `AlterTable` policy — Postgres only on first cut;
-  Delta + object-store deferred.
-- Tests: introduce a new column in the `after` payload mid-test,
-  assert Skip warns + omits, Fail errors out.
+Drift check between the idempotency gate and the data dispatch:
+walk the `after` payload's keys against the target's declared
+columns, dispatch on `SchemaEvolutionPolicy`. Postgres's
+`jsonb_populate_record` already discards unknown JSON keys, so
+`Skip`'s "omit and apply" half is free — what PR 5 adds is the
+warn-once log line so silent column drops are visible to
+operators.
+
+- `SchemaEvolutionPolicy::Skip` (default): `tracing::warn!` once
+  per (column, batch) pair under `target = "ematix_flow::cdc"`,
+  with `pipeline` + `column` structured fields. Row applies; the
+  unknown column is dropped by Postgres's coercion path.
+- `SchemaEvolutionPolicy::Fail`: returns `PgError::Other` with a
+  message naming the offending column + the policy + a hint
+  ("add the column to the target table or switch to Skip"). The
+  outer transaction is rolled back via `Drop`, so any earlier
+  events in the same batch are not persisted — strict mode is
+  truly all-or-nothing.
+- The per-batch HashSet of warned-columns means a batch with 1000
+  events under one drift column produces one warn line, not
+  1000. Across batches the warn fires once per batch (acceptable
+  signal-to-noise; can refine to per-pipeline-lifetime if real-
+  world log volume becomes a problem).
+- `AlterTable` policy still deferred. Per-target ALTER plumbing
+  varies enough by backend that bundling it into PR 5 would have
+  doubled the surface — Δ.X1 (Delta) doesn't even use
+  `ALTER TABLE` syntax.
+
+Tests landed (testcontainers, `--ignored`):
+- `cdc_postgres_schema_skip_keeps_pipeline_running` — `phone`
+  column in `after` not on target → row applies, only declared
+  columns persisted.
+- `cdc_postgres_schema_fail_aborts_batch` — first event clean,
+  second event drifts; whole batch rolled back, target stays
+  empty, error message names `phone`.
 
 ### PR 6 — docs + Debezium-via-testcontainers example (3–4 days)
 

@@ -48,8 +48,21 @@
 //!   so Kafka redeliveries are visible in metrics rather than
 //!   silently absorbed.
 //!
-//! Still to come: schema-evolution detection (PR 5), end-to-end
-//! Debezium-via-testcontainers example (PR 6).
+//! **PR 5** — schema-evolution detection:
+//! - Per-event `after`-payload keys checked against the target's
+//!   declared column set. [`SchemaEvolutionPolicy::Skip`] (default)
+//!   emits a single `tracing::warn!` per drift column per batch,
+//!   then lets Postgres's `jsonb_populate_record` discard the
+//!   unknown key. [`SchemaEvolutionPolicy::Fail`] returns an
+//!   error naming the column + the policy, rolling back the
+//!   whole batch transactionally.
+//! - `AlterTable` policy remains deferred — bundling per-target
+//!   `ALTER TABLE` plumbing into PR 5 would have doubled the
+//!   surface, and Δ.X1 (Delta) doesn't use `ALTER TABLE` syntax
+//!   at all.
+//!
+//! Still to come: end-to-end Debezium-via-testcontainers
+//! example (PR 6).
 //!
 //! Plan: `docs/PHASE_DELTA_CDC_PLAN.md`.
 
