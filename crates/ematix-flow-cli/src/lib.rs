@@ -473,6 +473,97 @@ pub struct TransformConfig {
     /// produce plain-HTTP traffic.
     #[serde(default)]
     pub tls: Option<TransformTlsToml>,
+
+    /// Phase Δ — CDC source mode (PR 1: scaffolding). When set,
+    /// the streaming pipeline interprets the source as a CDC
+    /// envelope (Debezium / Maxwell / custom) and dispatches each
+    /// event to the right per-op strategy on the target. Mutually
+    /// exclusive with `[transform.window]` and `[transform.join]`
+    /// — CDC is a different way of *applying* input, not a
+    /// transformation that windows over time. Cross-validated at
+    /// config-load.
+    ///
+    /// Execution path lands in PRs 2–5; PR 1 ships only the
+    /// config plumbing + cross-validation. See
+    /// `docs/PHASE_DELTA_CDC_PLAN.md`.
+    #[serde(default)]
+    pub cdc: Option<CdcConfigToml>,
+}
+
+/// `[transform.cdc]` block — flat TOML surface that lowers to
+/// [`ematix_flow_core::cdc::CdcConfig`]. Mirrors the typed-Python
+/// `CDC(...)` dataclass field-for-field so the two surfaces stay
+/// in lockstep.
+///
+/// Minimum block for a Debezium pipeline:
+///
+/// ```toml
+/// [transform.cdc]
+/// envelope = "debezium"
+/// ```
+///
+/// All other fields default from the canonical envelope mapping;
+/// override individually when needed.
+#[derive(Clone, Debug, Deserialize)]
+pub struct CdcConfigToml {
+    /// `"debezium"` | `"maxwell"` | `"custom"`. The first two
+    /// auto-fill every field path from the spec; `"custom"`
+    /// requires explicit values for `op_field`, `after_field`,
+    /// `key_field`, plus a non-empty `op_map`.
+    pub envelope: String,
+
+    /// Override for the canonical op-discriminator path. Default
+    /// from `envelope`.
+    #[serde(default)]
+    pub op_field: Option<String>,
+
+    /// Override for the pre-image path. Default from `envelope`;
+    /// explicitly setting an empty string is rejected.
+    #[serde(default)]
+    pub before_field: Option<String>,
+
+    /// Override for the post-image path.
+    #[serde(default)]
+    pub after_field: Option<String>,
+
+    /// Override for the per-event PK extraction path.
+    #[serde(default)]
+    pub key_field: Option<String>,
+
+    /// Override for the per-event timestamp path. `None`
+    /// disables the per-key idempotency state — Kafka redelivery
+    /// may double-apply.
+    #[serde(default)]
+    pub ts_field: Option<String>,
+
+    /// Wire-format op string → canonical CDC op name. Pass
+    /// values from the set `"create"` / `"update"` / `"delete"` /
+    /// `"read"`; the executor canonicalises. Custom envelopes
+    /// must supply this; built-in envelopes' canonical mapping
+    /// merges with whatever the user provides (user's overrides
+    /// win on collisions).
+    #[serde(default)]
+    pub op_map: BTreeMap<String, String>,
+
+    /// `"hard"` (default) — DELETE rows on Delete ops.
+    /// `"soft"` — UPDATE a column instead. Pair with
+    /// `soft_delete_column = "..."`.
+    #[serde(default)]
+    pub delete_mode: Option<String>,
+
+    /// Required when `delete_mode = "soft"`.
+    #[serde(default)]
+    pub soft_delete_column: Option<String>,
+
+    /// `"skip"` (default — warn + omit unknown columns) or
+    /// `"fail"` (raise on first unknown column).
+    #[serde(default)]
+    pub schema_evolution: Option<String>,
+
+    /// Per-key out-of-order tolerance in milliseconds. Defaults
+    /// to 5000 (5 seconds).
+    #[serde(default)]
+    pub out_of_order_tolerance_ms: Option<i64>,
 }
 
 /// `[transform.tls]` block — coordinator-side TLS knobs. Mirrors
@@ -809,6 +900,109 @@ fn join_toml_to_core(t: &JoinConfigToml) -> Result<ematix_flow_core::join::JoinC
         left_column_prefix: t.left_column_prefix.clone(),
         right_column_prefix: t.right_column_prefix.clone(),
     })
+}
+
+/// Lower a `[transform.cdc]` TOML block to the typed
+/// [`ematix_flow_core::cdc::CdcConfig`]. Resolves the named
+/// envelope into its canonical field mapping, then layers the
+/// user's per-field overrides on top.
+///
+/// Errors out at config-load on:
+/// - unknown envelope strings
+/// - unknown delete-mode / schema-evolution strings
+/// - `delete_mode = "soft"` without `soft_delete_column`
+/// - `envelope = "custom"` without all required field paths
+/// - unknown CDC-op names in `op_map`
+fn cdc_toml_to_core(t: &CdcConfigToml) -> Result<ematix_flow_core::cdc::CdcConfig, String> {
+    use ematix_flow_core::cdc::{
+        CdcConfig, CdcOp, DeleteMode, EnvelopeKind, SchemaEvolutionPolicy,
+    };
+
+    let envelope = match t.envelope.as_str() {
+        "debezium" => EnvelopeKind::Debezium,
+        "maxwell" => EnvelopeKind::Maxwell,
+        "custom" => EnvelopeKind::Custom,
+        other => {
+            return Err(format!(
+                "[transform.cdc] envelope = {other:?} not supported \
+                 (use \"debezium\", \"maxwell\", or \"custom\")"
+            ));
+        }
+    };
+
+    // Start from the canonical mapping; layer overrides on top.
+    let mut cfg = CdcConfig::for_envelope(envelope);
+
+    if let Some(v) = &t.op_field {
+        cfg.op_field = v.clone();
+    }
+    if let Some(v) = &t.before_field {
+        cfg.before_field = if v.is_empty() { None } else { Some(v.clone()) };
+    }
+    if let Some(v) = &t.after_field {
+        cfg.after_field = v.clone();
+    }
+    if let Some(v) = &t.key_field {
+        cfg.key_field = v.clone();
+    }
+    if let Some(v) = &t.ts_field {
+        cfg.ts_field = if v.is_empty() { None } else { Some(v.clone()) };
+    }
+
+    // Merge user-supplied op_map entries on top of the canonical
+    // mapping. User wins on collisions — useful when a backend
+    // ships a non-standard op string.
+    for (wire_op, canonical_str) in &t.op_map {
+        let canonical = match canonical_str.as_str() {
+            "create" => CdcOp::Create,
+            "update" => CdcOp::Update,
+            "delete" => CdcOp::Delete,
+            "read" => CdcOp::Read,
+            other => {
+                return Err(format!(
+                    "[transform.cdc] op_map[{wire_op:?}] = {other:?} not supported \
+                     (use \"create\", \"update\", \"delete\", or \"read\")"
+                ));
+            }
+        };
+        cfg.op_map.insert(wire_op.clone(), canonical);
+    }
+
+    cfg.delete_mode = match t.delete_mode.as_deref() {
+        None | Some("hard") => DeleteMode::Hard,
+        Some("soft") => {
+            let column = t.soft_delete_column.clone().ok_or_else(|| {
+                "[transform.cdc] delete_mode = \"soft\" requires \
+                 soft_delete_column = \"<target column name>\""
+                    .to_string()
+            })?;
+            DeleteMode::Soft { column }
+        }
+        Some(other) => {
+            return Err(format!(
+                "[transform.cdc] delete_mode = {other:?} not supported \
+                 (use \"hard\" or \"soft\")"
+            ));
+        }
+    };
+
+    cfg.schema_evolution = match t.schema_evolution.as_deref() {
+        None | Some("skip") => SchemaEvolutionPolicy::Skip,
+        Some("fail") => SchemaEvolutionPolicy::Fail,
+        Some(other) => {
+            return Err(format!(
+                "[transform.cdc] schema_evolution = {other:?} not supported \
+                 (use \"skip\" or \"fail\")"
+            ));
+        }
+    };
+
+    if let Some(v) = t.out_of_order_tolerance_ms {
+        cfg.out_of_order_tolerance_ms = v;
+    }
+
+    cfg.validate().map_err(|e| e.to_string())?;
+    Ok(cfg)
 }
 
 fn default_checkpoint_interval_ms() -> u64 {
@@ -1707,8 +1901,48 @@ impl PipelineCliConfig {
         cfg.validate_transform_on_error()?;
         cfg.validate_transform_dialect()?;
         cfg.validate_transform_engine()?;
+        cfg.validate_transform_cdc()?;
         cfg.warn_on_stateful_in_memory_store();
         Ok(cfg)
+    }
+
+    /// Phase Δ PR 1: validate `[transform.cdc]` block.
+    /// Cross-validates against `[transform.window]` /
+    /// `[transform.join]` (mutually exclusive — CDC is a
+    /// different way of *applying* input, not a transformation
+    /// over time) and lowers the TOML block to the typed
+    /// `CdcConfig` to fail-fast on bad envelope strings, missing
+    /// custom-envelope fields, etc.
+    fn validate_transform_cdc(&self) -> Result<(), ConfigError> {
+        let Some(t) = &self.transform else {
+            return Ok(());
+        };
+        let Some(cdc_toml) = &t.cdc else {
+            return Ok(());
+        };
+        if t.window.is_some() {
+            return Err(ConfigError::Parse(
+                "[transform.cdc] is mutually exclusive with [transform.window] \
+                 — CDC applies per-event change semantics; windowed aggregation \
+                 buffers events into time windows. Pick one."
+                    .into(),
+            ));
+        }
+        if t.join.is_some() {
+            return Err(ConfigError::Parse(
+                "[transform.cdc] is mutually exclusive with [transform.join] \
+                 — CDC consumes a single source's change envelopes; \
+                 stream-stream join expects two sources of regular events. \
+                 Pick one."
+                    .into(),
+            ));
+        }
+        // Lower the TOML block to the typed core config to surface
+        // any field-shape errors at config-load. The lowered value
+        // is discarded here — pipeline-build does the same lowering
+        // at use site (PR 3).
+        cdc_toml_to_core(cdc_toml).map_err(ConfigError::Parse)?;
+        Ok(())
     }
 
     /// Σ.A2 PR 1: validate `[transform] dialect` parses into a known
@@ -4171,6 +4405,278 @@ mod tests {
         assert!(
             format!("{err}").contains("ca_cert_pem_path"),
             "must name the missing field; got: {err}"
+        );
+    }
+
+    // Phase Δ PR 1 — `[transform.cdc]` scaffolding tests.
+    // No execution path yet; these lock the parser + cross-
+    // validation contract that PRs 2-5 build on.
+
+    /// Minimal Debezium block: `envelope = "debezium"` is the
+    /// whole config; canonical field paths fill in from the
+    /// envelope.
+    #[test]
+    fn cdc_block_minimal_debezium_parses() {
+        let toml = r#"
+            pipeline_name = "p"
+            source_query = "dbserver1.public.customers"
+            [source]
+            kind = "kafka"
+            bootstrap_servers = "localhost:9092"
+            [target]
+            kind = "sqlite"
+            path = ":memory:"
+            [target.table]
+            name = "customer_mirror"
+            [transform]
+            sql = ""
+            [transform.cdc]
+            envelope = "debezium"
+        "#;
+        let cfg = PipelineCliConfig::from_toml_str(toml).expect("parse");
+        let cdc = cfg.transform.as_ref().unwrap().cdc.as_ref().unwrap();
+        assert_eq!(cdc.envelope, "debezium");
+        // No overrides supplied; the rest of the canonical mapping
+        // lives in the lowered `CdcConfig` (validated in core unit
+        // tests).
+        assert!(cdc.op_field.is_none());
+        assert!(cdc.after_field.is_none());
+    }
+
+    /// Maxwell shorthand same shape — `envelope = "maxwell"` and
+    /// the canonical mapping fills in.
+    #[test]
+    fn cdc_block_minimal_maxwell_parses() {
+        let toml = r#"
+            pipeline_name = "p"
+            source_query = "maxwell"
+            [source]
+            kind = "kafka"
+            bootstrap_servers = "localhost:9092"
+            [target]
+            kind = "sqlite"
+            path = ":memory:"
+            [target.table]
+            name = "users"
+            [transform]
+            sql = ""
+            [transform.cdc]
+            envelope = "maxwell"
+        "#;
+        let cfg = PipelineCliConfig::from_toml_str(toml).expect("parse");
+        let cdc = cfg.transform.as_ref().unwrap().cdc.as_ref().unwrap();
+        assert_eq!(cdc.envelope, "maxwell");
+    }
+
+    /// Custom envelope with full per-field overrides + soft-delete +
+    /// strict schema-evolution + a non-default out-of-order tolerance.
+    /// Locks the full surface in case any field gets renamed.
+    #[test]
+    fn cdc_block_custom_envelope_with_overrides_parses() {
+        let toml = r#"
+            pipeline_name = "p"
+            source_query = "events"
+            [source]
+            kind = "kafka"
+            bootstrap_servers = "localhost:9092"
+            [target]
+            kind = "sqlite"
+            path = ":memory:"
+            [target.table]
+            name = "out"
+            [transform]
+            sql = ""
+            [transform.cdc]
+            envelope = "custom"
+            op_field = "action"
+            before_field = "old_state"
+            after_field = "new_state"
+            key_field = "new_state.id"
+            ts_field = "changed_at_ms"
+            delete_mode = "soft"
+            soft_delete_column = "deleted_at"
+            schema_evolution = "fail"
+            out_of_order_tolerance_ms = 60000
+            op_map = { INSERT = "create", UPDATE = "update", DELETE = "delete" }
+        "#;
+        let cfg = PipelineCliConfig::from_toml_str(toml).expect("parse");
+        let cdc = cfg.transform.as_ref().unwrap().cdc.as_ref().unwrap();
+        assert_eq!(cdc.envelope, "custom");
+        assert_eq!(cdc.op_field.as_deref(), Some("action"));
+        assert_eq!(cdc.after_field.as_deref(), Some("new_state"));
+        assert_eq!(cdc.delete_mode.as_deref(), Some("soft"));
+        assert_eq!(cdc.soft_delete_column.as_deref(), Some("deleted_at"));
+        assert_eq!(cdc.schema_evolution.as_deref(), Some("fail"));
+        assert_eq!(cdc.out_of_order_tolerance_ms, Some(60_000));
+        assert_eq!(cdc.op_map.get("INSERT").map(String::as_str), Some("create"));
+    }
+
+    /// Mutually exclusive with `[transform.window]`. The fail-fast
+    /// message names both blocks + tells the user to pick one.
+    #[test]
+    fn cdc_block_rejected_with_window() {
+        let toml = r#"
+            pipeline_name = "p"
+            source_query = "events"
+            [source]
+            kind = "kafka"
+            bootstrap_servers = "localhost:9092"
+            [target]
+            kind = "sqlite"
+            path = ":memory:"
+            [target.table]
+            name = "out"
+            [transform]
+            sql = "SELECT user_id, _event_ts FROM source"
+            [transform.cdc]
+            envelope = "debezium"
+            [transform.window]
+            kind = "tumbling"
+            duration_ms = 60000
+            event_time_column = "_event_ts"
+            group_by = ["user_id"]
+            late_data = "drop"
+            max_groups_per_window = 1000
+            [[transform.window.aggregations]]
+            agg = "count"
+            as = "n"
+        "#;
+        let err =
+            PipelineCliConfig::from_toml_str(toml).expect_err("cdc + window must be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("transform.cdc"),
+            "must name cdc block; got: {msg}"
+        );
+        assert!(
+            msg.contains("transform.window"),
+            "must name window block; got: {msg}"
+        );
+        assert!(
+            msg.contains("mutually exclusive"),
+            "must say mutually exclusive; got: {msg}"
+        );
+    }
+
+    /// Same shape for `[transform.join]`.
+    #[test]
+    fn cdc_block_rejected_with_join() {
+        let toml = r#"
+            pipeline_name = "p"
+            [[sources]]
+            query = "left"
+            kind = "kafka"
+            bootstrap_servers = "localhost:9092"
+            [[sources]]
+            query = "right"
+            kind = "kafka"
+            bootstrap_servers = "localhost:9092"
+            [target]
+            kind = "sqlite"
+            path = ":memory:"
+            [target.table]
+            name = "out"
+            [transform]
+            [transform.cdc]
+            envelope = "debezium"
+            [transform.join]
+            kind = "stream_stream_join"
+            left_source = "left"
+            right_source = "right"
+            left_keys = ["k"]
+            right_keys = ["k"]
+            time_window_ms = 1000
+            [state_store]
+            kind = "in_memory"
+        "#;
+        let err = PipelineCliConfig::from_toml_str(toml).expect_err("cdc + join must be rejected");
+        let msg = format!("{err}");
+        assert!(msg.contains("transform.cdc"));
+        assert!(msg.contains("transform.join"));
+        assert!(msg.contains("mutually exclusive"));
+    }
+
+    /// Unknown envelope string → fail-fast at config-load.
+    #[test]
+    fn cdc_block_rejects_unknown_envelope() {
+        let toml = r#"
+            pipeline_name = "p"
+            source_query = "events"
+            [source]
+            kind = "kafka"
+            bootstrap_servers = "localhost:9092"
+            [target]
+            kind = "sqlite"
+            path = ":memory:"
+            [target.table]
+            name = "out"
+            [transform]
+            sql = ""
+            [transform.cdc]
+            envelope = "outbox"
+        "#;
+        let err = PipelineCliConfig::from_toml_str(toml).expect_err("unknown envelope");
+        let msg = format!("{err}");
+        assert!(msg.contains("outbox"), "echo bad input; got: {msg}");
+        assert!(
+            msg.contains("debezium") && msg.contains("maxwell") && msg.contains("custom"),
+            "list valid options; got: {msg}"
+        );
+    }
+
+    /// `delete_mode = "soft"` requires `soft_delete_column`.
+    #[test]
+    fn cdc_block_soft_delete_requires_column() {
+        let toml = r#"
+            pipeline_name = "p"
+            source_query = "events"
+            [source]
+            kind = "kafka"
+            bootstrap_servers = "localhost:9092"
+            [target]
+            kind = "sqlite"
+            path = ":memory:"
+            [target.table]
+            name = "out"
+            [transform]
+            sql = ""
+            [transform.cdc]
+            envelope = "debezium"
+            delete_mode = "soft"
+        "#;
+        let err = PipelineCliConfig::from_toml_str(toml).expect_err("soft delete without column");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("soft_delete_column"),
+            "must name the missing field; got: {msg}"
+        );
+    }
+
+    /// Custom envelope without full field paths → fail-fast.
+    #[test]
+    fn cdc_block_custom_envelope_requires_field_paths() {
+        let toml = r#"
+            pipeline_name = "p"
+            source_query = "events"
+            [source]
+            kind = "kafka"
+            bootstrap_servers = "localhost:9092"
+            [target]
+            kind = "sqlite"
+            path = ":memory:"
+            [target.table]
+            name = "out"
+            [transform]
+            sql = ""
+            [transform.cdc]
+            envelope = "custom"
+            # no op_field / after_field / key_field / op_map → invalid
+        "#;
+        let err = PipelineCliConfig::from_toml_str(toml).expect_err("custom envelope skeleton");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("custom") && (msg.contains("op_field") || msg.contains("op_map")),
+            "must point at the missing field(s); got: {msg}"
         );
     }
 

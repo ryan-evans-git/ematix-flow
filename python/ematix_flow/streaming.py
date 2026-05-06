@@ -246,6 +246,108 @@ class Join:
 
 
 @dataclass(frozen=True)
+class CDC:
+    """Phase Δ — change-data-capture source-mode config for the
+    ``[transform.cdc]`` TOML block.
+
+    The streaming pipeline interprets the source as a CDC envelope
+    (Debezium / Maxwell / custom) and dispatches each event to the
+    matching per-op strategy on the target — INSERT on ``c`` /
+    ``r``, UPDATE on ``u``, DELETE (or soft-delete column flip)
+    on ``d``.
+
+    The simplest form picks a built-in envelope and accepts
+    every default::
+
+        @ematix.streaming_pipeline(
+            source="kafka_prod",
+            source_query="dbserver1.public.customers",
+            target=CustomerMirror,
+            target_connection="warehouse",
+            cdc=CDC(envelope="debezium"),
+        )
+        def mirror_customers(): ...
+
+    Override individual fields when the upstream wire format
+    diverges from the spec, or pick ``envelope="custom"`` and
+    supply every required path explicitly. ``op_map`` maps
+    upstream op strings to the four canonical CDC ops:
+    ``"create"``, ``"update"``, ``"delete"``, ``"read"``.
+
+    Mutually exclusive with :class:`Window` and :class:`Join` at
+    config-load — CDC applies per-event change semantics; both
+    of those buffer events into time windows. The CLI rejects
+    the combination with a clear error.
+
+    Configurable via this dataclass on the
+    ``@ematix.streaming_pipeline`` decorator OR via the
+    ``[transform.cdc]`` TOML block. Both surfaces compile to the
+    same internal ``CdcConfig`` Rust struct + execution path; pick
+    whichever fits the workflow.
+
+    Plan: ``docs/PHASE_DELTA_CDC_PLAN.md``.
+    """
+
+    envelope: str = "debezium"
+    op_field: str | None = None
+    before_field: str | None = None
+    after_field: str | None = None
+    key_field: str | None = None
+    ts_field: str | None = None
+    op_map: dict[str, str] | None = None
+    delete_mode: str = "hard"
+    soft_delete_column: str | None = None
+    schema_evolution: str = "skip"
+    out_of_order_tolerance_ms: int = 5_000
+
+    def __post_init__(self) -> None:
+        # Lock the upfront contract so mistakes surface at
+        # decoration time, not at first batch. The Rust core's
+        # `cdc_toml_to_core` does the deeper validation; here
+        # we catch only the obvious shape issues so a typo in
+        # `envelope=` doesn't silently use Debezium defaults.
+        if self.envelope not in ("debezium", "maxwell", "custom"):
+            raise ValueError(
+                f"CDC envelope must be 'debezium' | 'maxwell' | 'custom'; "
+                f"got {self.envelope!r}"
+            )
+        if self.delete_mode not in ("hard", "soft"):
+            raise ValueError(
+                f"CDC delete_mode must be 'hard' or 'soft'; got "
+                f"{self.delete_mode!r}"
+            )
+        if self.delete_mode == "soft" and not self.soft_delete_column:
+            raise ValueError(
+                "CDC delete_mode='soft' requires soft_delete_column "
+                "(the target column to flip)"
+            )
+        if self.schema_evolution not in ("skip", "fail"):
+            raise ValueError(
+                f"CDC schema_evolution must be 'skip' or 'fail'; got "
+                f"{self.schema_evolution!r}"
+            )
+        if self.envelope == "custom":
+            # Custom envelope requires explicit field paths +
+            # op_map. Built-in envelopes' canonical mapping fills
+            # these in via the Rust core lowering, so they can be
+            # left None on the dataclass.
+            missing: list[str] = []
+            if not self.op_field:
+                missing.append("op_field")
+            if not self.after_field:
+                missing.append("after_field")
+            if not self.key_field:
+                missing.append("key_field")
+            if not self.op_map:
+                missing.append("op_map")
+            if missing:
+                raise ValueError(
+                    f"CDC envelope='custom' requires {', '.join(missing)} "
+                    f"to be set explicitly"
+                )
+
+
+@dataclass(frozen=True)
 class StateStore:
     """Phase 39.5a PR 3: durable per-pipeline state-store config.
 

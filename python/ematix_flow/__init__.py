@@ -27,6 +27,7 @@ from ematix_flow.connections import (
 from ematix_flow.decorators import ematix
 from ematix_flow.markers import natural_key, nullable, pk
 from ematix_flow.streaming import (
+    CDC,
     Aggregation,
     Join,
     Lookup,
@@ -58,6 +59,7 @@ except ImportError:
     __version__ = _core.core_version()
 
 __all__ = [
+    "CDC",
     "Aggregation",
     "Connection",
     "DeltaLocalConnection",
