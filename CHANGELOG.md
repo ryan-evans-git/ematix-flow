@@ -7,8 +7,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-Nothing pending — see [`docs/ROADMAP.md`](docs/ROADMAP.md) for the
-prioritized list of remaining work.
+### Added
+
+- **Phase Δ — CDC source mode**. Streaming pipelines can now
+  treat each Kafka batch as a CDC envelope and apply per-event
+  changes to a Postgres mirror table.
+  - `[transform.cdc]` TOML block + `CDC(envelope="debezium")`
+    Python dataclass — peer-equivalent paths into the same
+    `CdcConfig`. Mutually exclusive with `[transform.window]` /
+    `[transform.join]` / a SQL pre-stage; cross-validated at
+    config-load.
+  - Debezium + Maxwell + custom envelopes. Custom requires every
+    field path + `op_map` set explicitly; the validator names
+    what's missing.
+  - `Backend::run_cdc` trait method + Postgres impl. Per-batch
+    transactional with prepared-statement reuse across same-op
+    events; UPSERT / UPDATE / DELETE all coerce JSON → row types
+    via `jsonb_populate_record(NULL::<table>, $1::jsonb)`.
+    `delete_mode = "soft"` flips a configured column instead of
+    DELETE.
+  - **Idempotency gate**: per-`(pipeline, pk_json)` last-seen-ts
+    tracked in `ematix_flow.cdc_idempotency`. Single-round-trip
+    `INSERT … ON CONFLICT DO UPDATE … WHERE … RETURNING 1`
+    inside the executor's transaction — Kafka redeliveries are
+    suppressed atomically with the data write. Surfaced via
+    `ematix_streaming_cdc_idempotent_skipped_total` so absorbed
+    redeliveries are visible to operators.
+  - **Schema-evolution detection**: default `Skip` warns once
+    per drift column per batch then lets Postgres's coercion
+    discard the unknown key; `Fail` returns an error and rolls
+    the batch back transactionally. `AlterTable` deferred — see
+    plan.
+  - **Streaming-runtime dispatch wiring**: when `[transform.cdc]`
+    is set, the per-batch loop routes through `Backend::run_cdc`
+    instead of the universal `write_arrow_stream` append path.
+    Target schemas are reflected once at startup via the new
+    `Backend::reflect_table_spec` trait method (Postgres impl
+    via `information_schema.columns`); non-CDC pipelines never
+    pay the reflection round-trip.
+  - **Five new Prometheus counters** under `pipeline=<name>`:
+    `ematix_streaming_cdc_creates_total`,
+    `ematix_streaming_cdc_updates_total`,
+    `ematix_streaming_cdc_deletes_total`,
+    `ematix_streaming_cdc_skipped_total`,
+    `ematix_streaming_cdc_idempotent_skipped_total`.
+  - **`examples/cdc-debezium/`**: docker-compose stack
+    (Postgres source + Debezium + Kafka + Postgres mirror) with
+    a connector-registration helper and a step-by-step README.
+  - **`docs/USER_GUIDE.md` § "CDC source mode (Δ)"**: full
+    surface — TOML + Python + envelopes + cross-validation +
+    metrics + multi-target reach.
+  - Plan: [`docs/PHASE_DELTA_CDC_PLAN.md`](docs/PHASE_DELTA_CDC_PLAN.md).
+    PRs 1–6 shipped + a PR 5.5 ("wire dispatch into the runtime")
+    that filled a gap discovered during PR 6 scoping.
+
+Multi-target reach (Delta Lake, DuckDB / SQLite / MySQL, object
+stores, streaming targets) is catalogued as Phase Δ extensions
+and unshipped — see the plan's "Phase Δ extensions" section.
 
 ## [0.1.2] — 2026-05-06
 

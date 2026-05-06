@@ -66,3 +66,19 @@ fn stream_join_parses() {
         "join pipeline must declare state_store"
     );
 }
+
+/// Phase Δ PR 6: the CDC demo's pipeline.toml must parse — its
+/// validity is part of the user-facing contract.
+#[test]
+fn cdc_debezium_pipeline_parses() {
+    let cfg = parse_example("cdc-debezium/pipeline.toml");
+    assert_eq!(cfg.pipeline_name, "cdc-mirror-customers");
+    assert_eq!(cfg.source_query, "dbz.public.customers");
+    let cdc = cfg
+        .transform
+        .as_ref()
+        .and_then(|t| t.cdc.as_ref())
+        .expect("cdc-debezium example must declare [transform.cdc]");
+    assert_eq!(cdc.envelope, "debezium");
+    assert_eq!(cdc.key_field.as_deref(), Some("after.id"));
+}

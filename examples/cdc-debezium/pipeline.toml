@@ -1,0 +1,48 @@
+# Phase Δ PR 6: ematix-flow CDC consumer config for the
+# Debezium demo stack.
+#
+# Reads change events Debezium publishes to
+# `dbz.public.customers` and applies them to `public.customers`
+# on the `pg-target` Postgres mirror. Runs on the host; connects
+# to the compose stack via the published ports
+# (`localhost:9094` for Kafka, `localhost:5434` for the target).
+#
+# Run:
+#   flow consume examples/cdc-debezium/pipeline.toml \
+#       --metrics-port 9100
+#
+# Then drive change events on the source Postgres to watch them
+# propagate. See `examples/cdc-debezium/README.md` for the full
+# walkthrough.
+
+pipeline_name = "cdc-mirror-customers"
+source_query  = "dbz.public.customers"
+idle_pause_ms = 200
+
+[source]
+kind              = "kafka"
+bootstrap_servers = "localhost:9094"
+group_id          = "ematix-flow-cdc-demo"
+
+[target]
+kind = "postgres"
+url  = "postgres://postgres:postgres@localhost:5434/target"
+
+[target.table]
+schema = "public"
+name   = "customers"
+
+# Phase Δ: interpret each Kafka payload as a Debezium-shaped CDC
+# envelope and apply it to the target via `Backend::run_cdc`. The
+# `for_envelope("debezium")` mapping populates the field paths
+# (op / before / after / source.ts_ms); only `key_field` needs an
+# explicit value because the PK column name is table-specific.
+[transform.cdc]
+envelope  = "debezium"
+key_field = "after.id"
+
+# Default field-level knobs (shown for documentation; remove the
+# block to accept defaults):
+#   delete_mode               = "hard"            # "soft" → flip a column instead
+#   schema_evolution          = "skip"            # "fail" → abort batch on drift
+#   out_of_order_tolerance_ms = 5000              # PR 4 strict-monotonic gate

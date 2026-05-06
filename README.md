@@ -749,6 +749,27 @@ The same pattern works for `RabbitMQBackend`, `PubSubBackend`,
   keys, postcard `BufferedRow` blobs). Per-source `BatchContext::source_id`
   routes batches to the correct side.
 
+### CDC source mode (Phase Δ) — recently shipped
+
+- **Per-event apply** (Δ PR 1–3): `[transform.cdc]` /
+  `CDC(envelope="debezium")` interprets each Kafka payload as a
+  CDC envelope (Debezium / Maxwell / custom shape) and routes
+  through `Backend::run_cdc` for per-op transactional dispatch.
+  Postgres target supported today; Delta + DuckDB + MySQL are
+  catalogued as Phase Δ extensions.
+- **Per-PK idempotency gate** (Δ PR 4): `INSERT … ON CONFLICT
+  DO UPDATE … WHERE existing.last_seen_ts_ms < EXCLUDED…
+  RETURNING 1` against `ematix_flow.cdc_idempotency`, atomic
+  with the data write — Kafka redeliveries become a no-op
+  without trusting source idempotency.
+- **Schema-evolution policy** (Δ PR 5): `Skip` (default) warns +
+  drops unknown columns; `Fail` aborts the batch on first drift
+  for teams that gate releases on schema sync.
+- **End-to-end demo** (Δ PR 6): `examples/cdc-debezium/`
+  docker-compose stack (Postgres source + Debezium + Kafka +
+  Postgres mirror) with a step-by-step walkthrough.
+  See [`docs/USER_GUIDE.md` § "CDC source mode (Δ)"](docs/USER_GUIDE.md#cdc-source-mode-δ).
+
 ### Recent additions (Π.1 / Π.3 / Π.1.4)
 
 - **`SchemaRegistryConnection`** (Π.1): SR config lives in the

@@ -914,6 +914,169 @@ once, rendered into the TOML the runtime parses.
 
 ---
 
+## CDC source mode (Δ)
+
+Phase Δ adds change-data-capture as a *consumption mode* on the
+streaming pipeline. Instead of treating each Kafka batch as
+"append every row to the target," the runtime decodes each
+message as a CDC envelope (Debezium / Maxwell / a custom shape)
+and applies the resulting `c` / `u` / `d` / `r` operation to a
+**mirror** table.
+
+End-to-end example: [`examples/cdc-debezium`](../examples/cdc-debezium/README.md)
+— Postgres → Debezium → Kafka → ematix-flow → Postgres mirror.
+
+### What it looks like
+
+**TOML**:
+
+```toml
+pipeline_name = "cdc-mirror-customers"
+source_query  = "dbz.public.customers"
+
+[source]
+kind              = "kafka"
+bootstrap_servers = "localhost:9094"
+group_id          = "ematix-flow-cdc"
+
+[target]
+kind = "postgres"
+url  = "postgres://postgres:postgres@localhost:5434/target"
+
+[target.table]
+schema = "public"
+name   = "customers"
+
+[transform.cdc]
+envelope  = "debezium"
+key_field = "after.id"
+```
+
+**Python** (decorator surface):
+
+```python
+import ematix_flow as ematix
+from ematix_flow import CDC
+
+@ematix.connection
+class warehouse:
+    kind = "postgres"
+    url  = "${EMATIX_FLOW_TARGET_DSN}"
+
+@ematix.table(connection="warehouse")
+class customers:
+    schema = "public"
+    name   = "customers"
+    primary_key = ["id"]
+
+@ematix.streaming_pipeline(
+    name="cdc-mirror-customers",
+    source_kind="kafka",
+    source_query="dbz.public.customers",
+    bootstrap_servers="localhost:9094",
+    group_id="ematix-flow-cdc",
+    target=customers,
+    cdc=CDC(envelope="debezium", key_field="after.id"),
+)
+def mirror_customers(): ...
+```
+
+The two surfaces lower to the same `CdcConfig` struct in the
+Rust core — pick whichever fits your workflow. `CDC(...)` is a
+frozen dataclass; field-for-field equivalent to `[transform.cdc]`.
+
+### Supported envelopes
+
+| `envelope` | Defaults populate |
+|---|---|
+| `"debezium"` | `op_field="op"`, `before/after`, `source.ts_ms`, `op_map = {c → Create, u → Update, d → Delete, r → Read}` |
+| `"maxwell"`  | `op_field="type"`, `data` (after) + `old` (before), `ts` (auto-scales seconds → ms), `op_map = {insert → Create, update → Update, delete → Delete}` |
+| `"custom"`   | Every field path + `op_map` must be set explicitly; the validator names what's missing |
+
+For Debezium / Maxwell, `key_field` is the only required
+override since the PK column name is table-specific. Common
+form: `after.<pk_col>`. The parser falls back to
+`before.<pk_col>` for delete events whose `after` is null.
+
+### What happens per batch
+
+1. Source backend reads a Kafka batch.
+2. Streaming runtime sees `[transform.cdc]` set → routes through
+   `Backend::run_cdc` instead of the universal append path.
+3. `events_from_batch` walks the batch and resolves each row to
+   a `CdcEvent { op, key, ts_ms, before, after }`. Tombstones
+   (`payload = null`) and parse errors counted as `skipped`.
+4. The Postgres executor opens one transaction per batch; per
+   event, in order:
+   - **Idempotency gate**. `INSERT … ON CONFLICT DO UPDATE …
+     WHERE existing.last_seen_ts_ms < EXCLUDED.last_seen_ts_ms
+     RETURNING 1` against `ematix_flow.cdc_idempotency`. Empty
+     RETURNING = redelivery; the executor skips the data write
+     and bumps `idempotent_skipped`. Strict-monotonic per
+     `(pipeline_name, pk)`. Events with `ts_ms = None` bypass
+     the gate (no-idempotency mode).
+   - **Schema-evolution check**. Keys in `after` not in the
+     target's reflected column set go through the configured
+     policy: `"skip"` (default) warns once per drift column per
+     batch then lets Postgres's `jsonb_populate_record` discard
+     the unknown key; `"fail"` returns an error and rolls back
+     the whole batch.
+   - **Apply**. UPSERT for `c`/`r`, UPDATE for `u`, DELETE for
+     `d` (or column-flip when `delete_mode = "soft"`). All three
+     paths use `jsonb_populate_record(NULL::<table>, $1::jsonb)`
+     so type coercion is identical.
+5. Single transaction commit; source offsets advance only after
+   the target commit succeeds (at-least-once with executor-side
+   idempotent suppression of redeliveries).
+
+### Configurable knobs
+
+| Field | Default | Meaning |
+|---|---|---|
+| `envelope` | required | `"debezium"` / `"maxwell"` / `"custom"` |
+| `key_field` | required for canonical envelopes | JSON path to PK in the envelope (e.g. `"after.id"`) |
+| `delete_mode` | `"hard"` | `"soft"` flips a configured `soft_delete_column` to NOW() instead of DELETE |
+| `soft_delete_column` | — | Required when `delete_mode = "soft"` |
+| `schema_evolution` | `"skip"` | `"fail"` aborts the batch on first unknown column |
+| `out_of_order_tolerance_ms` | `5000` | Reserved for future warn-on-backwards window — the gate is strict-monotonic today |
+
+### Cross-validation
+
+`[transform.cdc]` is mutually exclusive with:
+- `[transform.window]` (CDC consumes envelopes per-event, windowing them would break the apply contract)
+- `[transform.join]` (joins consume two flat streams, not envelopes)
+- `[transform.sql]` (a SQL pre-stage projecting envelope columns would lose the original op-/before-/after-shape)
+
+The CLI's `validate_transform_cdc` enforces this at config-load
+so the runtime never sees an inconsistent combination.
+
+### Metrics
+
+Pipelines with `[transform.cdc]` set surface five extra Prometheus
+counters under `pipeline=<name>`:
+
+- `ematix_streaming_cdc_creates_total` — `c` + `r` ops applied.
+- `ematix_streaming_cdc_updates_total` — `u` ops applied.
+- `ematix_streaming_cdc_deletes_total` — `d` ops applied (hard or soft).
+- `ematix_streaming_cdc_skipped_total` — tombstones + parse failures.
+- `ematix_streaming_cdc_idempotent_skipped_total` — events
+  rejected by the per-PK last-seen-ts gate (Kafka redeliveries).
+  Watch this counter — a steady non-zero rate indicates upstream
+  redelivery noise that the gate is absorbing.
+
+### Multi-target reach
+
+Δ ships **Postgres only** today.
+[`Backend::run_cdc`](https://docs.rs/ematix-flow-core/latest/ematix_flow_core/backend/trait.Backend.html#method.run_cdc)'s
+default impl errors with a "not implemented for this dialect"
+message; non-Postgres targets fail-fast. Delta Lake (highest
+leverage; native MERGE), DuckDB / SQLite / MySQL (easy SQL ports),
+object stores, and streaming targets are catalogued as Phase Δ
+extensions in
+[`docs/PHASE_DELTA_CDC_PLAN.md`](PHASE_DELTA_CDC_PLAN.md#phase-δ-extensions).
+
+---
+
 ## Operations
 
 ### Prometheus metrics
