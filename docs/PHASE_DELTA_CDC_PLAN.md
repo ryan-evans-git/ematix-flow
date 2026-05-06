@@ -366,11 +366,12 @@ incremental value:
    + add a `tracing::warn!` if a per-key ts goes backwards by
    more than `out_of_order_tolerance_ms` (configurable; default
    `5000`).
-4. **Cross-DB `run_cdc`.** PR 3 lands Postgres-target only.
-   Delta / object-store / DuckDB / SQLite as follow-ups —
-   straightforward for DBs that support DELETE / UPDATE; Delta
-   uses MERGE; object-stores need a Hive-style overwrite-by-key
-   pattern (limited usefulness, may stay deferred).
+4. ~~**Cross-DB `run_cdc`.**~~ **Resolved during planning.** PR 3
+   lands Postgres-target only. Other targets follow per-backend;
+   per-target effort + design tradeoffs documented in the
+   "Phase Δ extensions" section below (Delta is highest-leverage
+   next; SQL targets are easy ports; object stores are different
+   problem shape).
 
 ---
 
@@ -393,6 +394,156 @@ incremental value:
   drop deletes"). Today's mid-stream SQL transform can do this
   cleanly via `WHERE op != 'd'` on the post-CDC envelope; no
   separate filter knob needed in `CdcConfig`.
+
+---
+
+## Phase Δ extensions — multi-target follow-ups
+
+PR 3 ships Postgres-only. The trait method [`Backend::run_cdc`]
+defaults to a clear "not yet implemented for this dialect" error
+on every other backend, so existing pipelines don't break — they
+just can't use `mode = "cdc"` against non-Postgres targets until
+the corresponding extension lands.
+
+This section catalogues the per-target follow-ups, ordered by
+leverage. Each is a separate PR; none are blocked on each other.
+The 6-PR core plan above completes Phase Δ for the Postgres
+target; everything below is the multi-target build-out.
+
+### Δ.X1 — Delta Lake target *(highest leverage, ~3-4 days)*
+
+**Why first.** Delta's native `MERGE INTO ... USING ... WHEN
+MATCHED ... WHEN NOT MATCHED ...` is *exactly* the right shape
+for CDC. The whole batch becomes a single MERGE statement; per-op
+dispatch + transactional commit are absorbed by Delta's
+transaction log automatically. Conceptually cleaner than the
+Postgres per-event-statement loop. CDC → Delta is also one of
+the most common analytics patterns in the wild — many teams want
+their Postgres source mirrored into a Delta lakehouse for
+downstream warehouse queries.
+
+**Shape.** A single MERGE per CDC batch:
+
+```sql
+MERGE INTO target t USING source_batch s ON t.<pk> = s.<pk>
+WHEN MATCHED AND s.__op = 'd'              THEN DELETE
+WHEN MATCHED                                THEN UPDATE SET *
+WHEN NOT MATCHED AND s.__op IN ('c', 'r')  THEN INSERT *
+```
+
+For soft-delete: `WHEN MATCHED AND s.__op = 'd' THEN UPDATE SET
+deleted_at = current_timestamp()` instead of the DELETE branch.
+
+**Implementation.** `deltalake::DeltaOps::merge` exposes the
+MERGE primitive. The CDC executor builds an in-memory Arrow
+`RecordBatch` of the post-image rows + a synthesized `__op`
+column, hands it to `merge`, lets Delta absorb. No per-event
+loop; no per-statement prepared overhead. ACID via Delta's
+transaction log instead of a Postgres transaction.
+
+**Schema evolution.** Delta's `mergeSchema = true` flag does
+the right thing for the `Skip` policy automatically (new columns
+in the source become new columns in the target). Better than
+Postgres's "warn + skip" — Delta auto-evolves.
+
+**Effort.** ~3–4 days. Most of it is wiring `DeltaOps::merge` +
+the `__op` column synthesis; the executor surface is much
+smaller than the per-op-statement Postgres path.
+
+### Δ.X2 — DuckDB / SQLite / MySQL targets *(easy ports, ~1-2 days each)*
+
+Same architectural shape as PostgresBackend's `run_cdc` — single
+JSON parameter per event, dialect-specific UPSERT / UPDATE /
+DELETE templates. The only differences:
+
+| Target | UPSERT syntax | JSON-to-row helper | Notes |
+|---|---|---|---|
+| **DuckDB** | `INSERT … ON CONFLICT (pk) DO UPDATE SET …` (identical to Postgres) | `json_extract` per column, or `STRUCT_PACK` | No `jsonb_populate_record` analog — bind per-column. |
+| **SQLite** | `INSERT … ON CONFLICT(pk) DO UPDATE SET …` (3.24+) | `json_extract` per column | Single-writer transactions; no concurrent CDC pipelines per file. |
+| **MySQL** | `INSERT … ON DUPLICATE KEY UPDATE …` | `JSON_EXTRACT` per column, or `JSON_TABLE` | Different keyword, same semantics. PK type strictness is stricter than Postgres. |
+
+Each port is ~1-2 days: lift the SQL templates, swap the
+identifier-quoting helper, swap the JSON extraction primitive.
+Same `Backend::run_cdc` trait method, three new concrete impls.
+Tests follow the same `tests/integration_*.rs` testcontainers
+pattern that Postgres uses.
+
+**Per-column type dispatch.** Without `jsonb_populate_record` we
+hand-roll a column-type → Rust-type binding table:
+
+| Column type | Rust binding |
+|---|---|
+| `BIGINT` / `INTEGER` | `i64` |
+| `TEXT` / `VARCHAR` | `&str` |
+| `BOOLEAN` | `bool` |
+| `TIMESTAMPTZ` | `chrono::DateTime<Utc>` |
+| `NUMERIC` | `rust_decimal::Decimal` |
+| `JSONB` | `serde_json::Value` |
+| `BYTEA` | `&[u8]` |
+
+The dispatch table is shared between DuckDB / SQLite / MySQL —
+one helper module under `crates/ematix-flow-core/src/cdc/`. ~80
+lines, written once, used three times.
+
+### Δ.X3 — Object stores *(different problem shape; recommend deferring)*
+
+Object stores can't UPDATE or DELETE in place — Parquet / CSV /
+JSON / ORC files are immutable. Three honest options if a user
+wants CDC into object storage:
+
+1. **Append-only event log.** Write each CDC event as a row with
+   synthesized `__op`, `__source_ts_ms` columns. Live state
+   computed downstream via window-by-PK. Cheap to implement
+   (~2 days), pushes complexity to readers + costs full-table
+   scan to materialize current state.
+2. **Periodic compaction.** Stream events to per-partition
+   files, compact on a schedule into a current-state snapshot.
+   Adds an orchestration layer (~1 week); fights with object
+   store's immutability rather than embracing it.
+3. **Defer.** Tell users who want CDC → object store that Delta
+   on S3 (Δ.X1 above) is the right answer — Delta sits on
+   object stores anyway and gives them transactional MERGE for
+   free.
+
+**Recommendation.** Default to (3). Land an "object store
+limitation" callout in the docs alongside the Δ.X1 Delta target;
+revisit if a user with a concrete (1) or (2) workflow shows up.
+The "append-only event log" pattern is easy enough to build
+ad-hoc with the existing transform pre-stage + object-store
+target without needing first-class CDC support.
+
+### Δ.X4 — Streaming targets *(out of scope; outbound CDC)*
+
+CDC into a Kafka / RabbitMQ / Pub/Sub / Kinesis target = re-emit
+change events. That's outbound CDC — different problem entirely;
+explicitly out of scope per the "Out of scope / deferred"
+section above. If that need surfaces it warrants its own phase
+plan (Phase Δ-out / Φ); not a Phase Δ extension.
+
+### Δ.X5 — Distributed batch SQL target *(N/A)*
+
+Σ.B's `DistributedBackend` is a batch SQL executor over peer
+ematix-flow workers — not a row-storage target. CDC + distributed
+batch don't compose meaningfully. The trait method's default
+"not yet implemented" error is the right behaviour.
+
+### Suggested ordering
+
+1. **Δ.X1 Delta** — highest user-value next step. CDC → Delta
+   is a real analytics pattern; native MERGE is the cleanest fit.
+2. **Δ.X2 SQL ports** — pick whichever target a user asks for
+   first. Each is ~1-2 days; the per-column dispatch table is
+   shared so the second + third are cheaper than the first.
+3. **Δ.X3 Object stores** — defer until demand surfaces.
+4. **Δ.X4 / Δ.X5** — out of scope; revisit if/when the ground
+   shifts.
+
+After Δ.X1 + Δ.X2 land, every SQL target ematix-flow supports +
+Delta would be CDC-capable. That covers the realistic set of
+"what target do users actually want their CDC events written to"
+(Postgres mirrors, Delta lakehouses, occasional MySQL / SQLite /
+DuckDB analytics tables). The coverage gap closes ~95% with
+roughly two weeks of total effort.
 
 ---
 
