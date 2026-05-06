@@ -65,27 +65,57 @@ jobs:
     name: wait for ci.yml on this SHA
     runs-on: ubuntu-latest
     steps:
-      - name: Wait for ci.yml rust job
-        uses: lewagon/wait-on-check-action@v1.3.4
-        with:
-          ref: ${{ github.sha }}
-          check-name: rust (ubuntu-latest)
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-          wait-interval: 20
-      - name: Wait for ci.yml audit-rust job
-        uses: lewagon/wait-on-check-action@v1.3.4
-        with:
-          ref: ${{ github.sha }}
-          check-name: cargo audit (RustSec advisory DB)
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-          wait-interval: 20
-      - name: Wait for ci.yml python 3.12 job
-        uses: lewagon/wait-on-check-action@v1.3.4
-        with:
-          ref: ${{ github.sha }}
-          check-name: python (ubuntu-latest, py3.12)
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-          wait-interval: 20
+      # Why a shell loop instead of `lewagon/wait-on-check-action`:
+      # the action queries the Checks API immediately on entry and
+      # exits with failure if the named check doesn't already exist.
+      # On a tag-push that fires concurrently with a main-push (the
+      # typical `git push origin main && git push origin v0.x.0`
+      # sequence), there's a 30-60s window where release.yml's
+      # await-ci is running but ci.yml hasn't registered its job
+      # checks yet — race condition, the action loses every time.
+      #
+      # The shell loop below queries the workflow-runs API for
+      # ci.yml on the same SHA. Returns empty until ci.yml fires;
+      # then polls until the run completes; treats `success` and
+      # `skipped` as green; everything else fails the release.
+      - name: Wait for ci.yml workflow on this SHA
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          SHA="${{ github.sha }}"
+          REPO="${{ github.repository }}"
+          DEADLINE=$((SECONDS + 1800))  # 30-min cap
+          echo "Waiting for ci.yml on $SHA..."
+          while [ $SECONDS -lt $DEADLINE ]; do
+            run_json=$(gh api \
+              "repos/$REPO/actions/workflows/ci.yml/runs?head_sha=$SHA&per_page=1" \
+              --jq '.workflow_runs[0] // empty' || true)
+            if [ -z "$run_json" ]; then
+              echo "  no ci.yml run yet for $SHA, retrying in 20s..."
+              sleep 20
+              continue
+            fi
+            status=$(echo "$run_json" | jq -r '.status')
+            conclusion=$(echo "$run_json" | jq -r '.conclusion // ""')
+            run_id=$(echo "$run_json" | jq -r '.id')
+            echo "  ci.yml run $run_id: status=$status conclusion=$conclusion"
+            if [ "$status" = "completed" ]; then
+              case "$conclusion" in
+                success|skipped)
+                  echo "ci.yml passed; proceeding to wheel matrix"
+                  exit 0
+                  ;;
+                *)
+                  echo "ci.yml conclusion=$conclusion — refusing to publish"
+                  exit 1
+                  ;;
+              esac
+            fi
+            sleep 20
+          done
+          echo "timeout waiting for ci.yml on $SHA"
+          exit 1
 
   build-linux:
     name: linux-x86_64 wheels (py${{ matrix.python }})
