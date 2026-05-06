@@ -298,16 +298,51 @@ incremental value:
   payloads, Postgres target → assert inserts, updates, deletes
   apply correctly.
 
-### PR 4 — idempotency via StateStore (3–4 days)
+### PR 4 — idempotency gate (3–4 days) — **shipped**
 
-- `cdc::<pipeline>::<pk>` prefix; `CdcKeyState` payload;
-  postcard ser/de.
-- StateStore reads on first-seen-key (cold-cache), in-memory
-  cache for the lifetime of the pipeline run.
-- Atomic commit: state writes + data writes in one transaction
-  (Postgres) or two-phase (Delta / object-store, follow-up).
-- Crash-recovery integration test: kill mid-batch, restart,
-  assert no double-apply.
+Per-PK last-seen-`ts_ms` admission gate, atomic with the data
+write. Implementation diverged from the original "via StateStore"
+sketch — the existing `StateStore::commit` opens its own
+transaction internally, so it can't share a Postgres transaction
+with the data writes the gate is supposed to be atomic with. CDC
+state is also a different shape from windowed/session/join state
+(a single `i64` per key, not an arbitrary postcard blob), so
+re-using the durable layer would have meant trait surgery + a
+weaker correctness story. Landed shape:
+
+- New table `ematix_flow.cdc_idempotency (pipeline_name, pk_json,
+  last_seen_ts_ms)` lazy-created via `ensure_meta_schema()`.
+- Single-round-trip gate: `INSERT … ON CONFLICT DO UPDATE …
+  WHERE existing.last_seen_ts_ms < EXCLUDED.last_seen_ts_ms
+  RETURNING 1`. RETURNING-clause non-emptiness is the admission
+  verdict — empty result = redelivery, skip the data write.
+- Gate writes + data writes share the executor's per-batch
+  Postgres transaction → atomic across the entire batch. A crash
+  at any point leaves gate + target consistent.
+- In-batch cache (`HashMap<canonical_pk, last_admitted_ts>`) so
+  multiple events for the same PK in the same batch don't
+  re-hit the gate.
+- Events with `ts_ms = None` bypass the gate (documented
+  no-idempotency mode — user opted out by not configuring a
+  `ts_field`).
+- New `CdcRunResult.idempotent_skipped: i64` counter so
+  redeliveries are visible in metrics, not silent.
+
+Tests landed (testcontainers, `--ignored`):
+- `cdc_postgres_redelivery_is_idempotent` — apply same 3-event
+  batch twice → second run reports `idempotent_skipped = 3`.
+- `cdc_postgres_idempotency_survives_pool_restart` — apply,
+  drop the entire pool, reconnect, replay → second apply blocks
+  on durable on-disk state.
+- `cdc_postgres_idempotency_keyed_per_pipeline` — same PK +
+  ts_ms under two pipeline names is two distinct gate entries.
+
+Deferred to PR 5 + later: cross-target idempotency (Delta MERGE
+is naturally idempotent on equal post-images; the per-PK ts gate
+is a Postgres-only gain today). Out-of-order tolerance window
+(`out_of_order_tolerance_ms`) is configured + accepted but not
+yet wired — PR 4's gate is strict-monotonic; PR 5 will add the
+warn-on-backwards path.
 
 ### PR 5 — schema evolution detection (3 days)
 

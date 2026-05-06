@@ -178,14 +178,16 @@ pub struct StrategyRunResult {
     pub path: String,
 }
 
-/// Phase Δ PR 3: result of one CDC batch's apply.
+/// Phase Δ PR 3 + PR 4: result of one CDC batch's apply.
 ///
 /// `creates` covers `c` and `r` (snapshot Read) ops — both UPSERT-
 /// shaped so they share a counter. `skipped` counts tombstones +
 /// rows that failed envelope-parse (the latter still log a
-/// warning so they aren't silent). The metrics path mirrors
-/// [`StrategyRunResult`] so the streaming pipeline can fold both
-/// into the same observability surface.
+/// warning so they aren't silent). `idempotent_skipped` (PR 4)
+/// counts events rejected by the per-PK last-seen-ts gate — i.e.
+/// Kafka redeliveries that the executor has already applied. The
+/// metrics path mirrors [`StrategyRunResult`] so the streaming
+/// pipeline can fold both into the same observability surface.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CdcRunResult {
     pub run_id: String,
@@ -198,6 +200,10 @@ pub struct CdcRunResult {
     /// Tombstones + parse failures. Always counted; never errors
     /// the run.
     pub skipped: i64,
+    /// Events whose `(pipeline, pk)` already had a last-seen ts
+    /// at or beyond `event.ts_ms` in `ematix_flow.cdc_idempotency`.
+    /// Indicates an at-least-once redelivery the gate suppressed.
+    pub idempotent_skipped: i64,
 }
 
 impl From<crate::pg::AppendRunResult> for StrategyRunResult {

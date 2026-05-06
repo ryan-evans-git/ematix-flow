@@ -154,6 +154,7 @@ pub struct Scd2RunResult {
 const META_SCHEMA: &str = "ematix_flow";
 const RUN_HISTORY_TABLE: &str = "run_history";
 const WATERMARKS_TABLE: &str = "watermarks";
+const CDC_IDEMPOTENCY_TABLE: &str = "cdc_idempotency";
 
 #[derive(Debug, Clone)]
 pub struct WatermarkRow {
@@ -481,6 +482,21 @@ impl PgPool {
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
             )"
         );
+        // Phase Δ PR 4: per-PK last-seen ts gate for CDC apply.
+        // `pk_json` is JSONB so scalar + composite PKs share a
+        // representation, and JSONB content equality is the
+        // primary-key match. The (pipeline_name, pk_json) tuple is
+        // the lookup key — same source row keyed by two pipelines
+        // is two distinct gate entries.
+        let create_cdc_idempotency = format!(
+            "CREATE TABLE IF NOT EXISTS {META_SCHEMA}.{CDC_IDEMPOTENCY_TABLE} (
+                pipeline_name   TEXT NOT NULL,
+                pk_json         JSONB NOT NULL,
+                last_seen_ts_ms BIGINT NOT NULL,
+                updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+                PRIMARY KEY (pipeline_name, pk_json)
+            )"
+        );
         self.execute_in_transaction(&[
             create_schema,
             create_table,
@@ -490,6 +506,7 @@ impl PgPool {
             alter_step_name,
             alter_metrics_json,
             create_watermarks,
+            create_cdc_idempotency,
         ])
         .await
     }
@@ -1106,7 +1123,7 @@ impl PgPool {
         }
     }
 
-    /// Phase Δ PR 3: apply CDC events to a Postgres target.
+    /// Phase Δ PR 3 + PR 4: apply CDC events to a Postgres target.
     ///
     /// Per-batch transactional. Builds three SQL templates per
     /// target table — UPSERT, UPDATE, DELETE — and re-uses the
@@ -1121,11 +1138,20 @@ impl PgPool {
     /// machinery the existing `run_merge_same_db` relies on for
     /// staging-table → target bulk-copy.
     ///
-    /// Idempotency (last-seen-ts per PK) is wired in PR 4.
-    /// Schema-evolution detection in PR 5. PR 3 ships at-least-
-    /// once apply with bit-equivalent post-image semantics; idem-
-    /// potent targets (anything keyed by PK + UPSERT-shaped) are
-    /// safe under Kafka redelivery already.
+    /// **Idempotency (PR 4):** every event with a non-null
+    /// `ts_ms` first hits an INSERT … ON CONFLICT DO UPDATE
+    /// WHERE last_seen_ts_ms < EXCLUDED.last_seen_ts_ms RETURNING
+    /// gate against `ematix_flow.cdc_idempotency`. The gate's
+    /// RETURNING-clause non-emptiness is the admission verdict;
+    /// a redelivery (event ts_ms ≤ stored) returns no row and the
+    /// data write is skipped. Gate writes + data writes share the
+    /// outer transaction, so a crash anywhere mid-batch leaves
+    /// gate + target consistent. Events with `ts_ms = None`
+    /// bypass the gate (no-idempotency mode) — the user trades
+    /// duplicate suppression for a config-time choice not to map
+    /// a `ts_field`.
+    ///
+    /// Schema-evolution detection lands in PR 5.
     pub async fn run_cdc(
         &self,
         target_spec: &crate::types::TableSpec,
@@ -1137,7 +1163,11 @@ impl PgPool {
         use crate::cdc::{CdcOp, DeleteMode};
         use serde_json::Value;
 
-        let _ = pipeline_name; // PR 4 uses this for state-store keying.
+        // The idempotency gate writes into ematix_flow.cdc_idempotency.
+        // Lazy-create the meta schema once per call so a brand-new
+        // database doesn't fail the gate's INSERT on missing table.
+        // No-op after the first run.
+        self.ensure_meta_schema().await?;
 
         let run_id = Uuid::new_v4();
 
@@ -1230,9 +1260,28 @@ impl PgPool {
 
         let pk_col_name = pk_col.name.clone();
 
+        // Phase Δ PR 4: per-PK admission gate. Cheaper than
+        // SELECT-then-INSERT because the ON CONFLICT path collapses
+        // to a single round-trip; RETURNING tells us whether the
+        // ts comparison admitted the row. We also keep a tiny
+        // in-batch cache so multiple events for the same PK in
+        // the same batch don't re-hit the gate.
+        let gate_sql = format!(
+            "INSERT INTO {META_SCHEMA}.{CDC_IDEMPOTENCY_TABLE} \
+                 (pipeline_name, pk_json, last_seen_ts_ms, updated_at) \
+             VALUES ($1::text, $2::jsonb, $3::bigint, NOW()) \
+             ON CONFLICT (pipeline_name, pk_json) DO UPDATE \
+                 SET last_seen_ts_ms = EXCLUDED.last_seen_ts_ms, \
+                     updated_at = EXCLUDED.updated_at \
+                 WHERE {META_SCHEMA}.{CDC_IDEMPOTENCY_TABLE}.last_seen_ts_ms \
+                       < EXCLUDED.last_seen_ts_ms \
+             RETURNING 1"
+        );
+
         let mut creates = 0i64;
         let mut updates = 0i64;
         let mut deletes = 0i64;
+        let mut idempotent_skipped = 0i64;
 
         let mut client = self
             .pool
@@ -1251,8 +1300,49 @@ impl PgPool {
             Some(tx.prepare(&update_sql).await?)
         };
         let delete_stmt = tx.prepare(&delete_sql).await?;
+        let gate_stmt = tx.prepare(&gate_sql).await?;
+
+        // In-batch fast path: when several events arrive for the
+        // same PK + same/older ts_ms within a single batch, only
+        // the first hits the gate; subsequent dupes are skipped
+        // in-process. Maps canonical-JSON pk → high-watermark we
+        // already admitted within *this* batch.
+        let mut batch_seen_ts: std::collections::HashMap<String, i64> =
+            std::collections::HashMap::new();
 
         for event in events {
+            // Resolve a stable pk JSON for the gate: Create/Read/
+            // Update use event.after[pk_col]; Delete falls back to
+            // event.key (the parser already handled the after→
+            // before key fallback for deletes).
+            let pk_value: Value = match event.op {
+                CdcOp::Delete => event.key.clone(),
+                _ => match event.after.as_ref().and_then(|m| m.get(&pk_col_name)) {
+                    Some(v) => v.clone(),
+                    None => event.key.clone(),
+                },
+            };
+
+            // Idempotency gate. `ts_ms = None` events skip the
+            // gate entirely (documented "no-idempotency" mode).
+            if let Some(ts_ms) = event.ts_ms {
+                let canon = serde_json::to_string(&pk_value).unwrap_or_default();
+                if let Some(&prev) = batch_seen_ts.get(&canon)
+                    && ts_ms <= prev
+                {
+                    idempotent_skipped += 1;
+                    continue;
+                }
+                let admitted = tx
+                    .query(&gate_stmt, &[&pipeline_name, &pk_value, &ts_ms])
+                    .await?;
+                if admitted.is_empty() {
+                    idempotent_skipped += 1;
+                    continue;
+                }
+                batch_seen_ts.insert(canon, ts_ms);
+            }
+
             match event.op {
                 CdcOp::Create | CdcOp::Read => {
                     // Use the after-image as the row JSON. If
@@ -1301,6 +1391,7 @@ impl PgPool {
             updates,
             deletes,
             skipped,
+            idempotent_skipped,
         })
     }
 

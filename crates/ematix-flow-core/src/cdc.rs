@@ -36,8 +36,20 @@
 //!   overrides with a transactional per-op apply that uses
 //!   `jsonb_populate_record` for type-safe JSON → row coercion.
 //!
-//! Still to come: idempotency via the StateStore (PR 4), schema-
-//! evolution detection (PR 5).
+//! **PR 4** — per-PK idempotency gate:
+//! - `ematix_flow.cdc_idempotency` table tracks `(pipeline,
+//!   pk_json) → last_seen_ts_ms`. The CDC executor admits an
+//!   event only when its `ts_ms` exceeds the stored value, via
+//!   a single-round-trip `INSERT … ON CONFLICT DO UPDATE …
+//!   RETURNING` gate that runs inside the same Postgres
+//!   transaction as the data write — so a crash mid-batch
+//!   leaves gate + target consistent.
+//! - Surfaced on [`crate::backend::CdcRunResult::idempotent_skipped`]
+//!   so Kafka redeliveries are visible in metrics rather than
+//!   silently absorbed.
+//!
+//! Still to come: schema-evolution detection (PR 5), end-to-end
+//! Debezium-via-testcontainers example (PR 6).
 //!
 //! Plan: `docs/PHASE_DELTA_CDC_PLAN.md`.
 
