@@ -121,22 +121,29 @@ fn external_peers() -> Option<Vec<String>> {
     )
 }
 
-async fn register_tpch(ctx: &SessionContext, dir: &Path) {
+/// Returns `false` when the SF=1 Parquet directory is missing —
+/// CI doesn't generate the data and `cargo test --workspace
+/// --all-targets` runs the criterion bench harness's `main()`.
+/// Callers handle `false` by `eprintln!`-skipping + early-returning
+/// from `bench_distributed`.
+async fn register_tpch(ctx: &SessionContext, dir: &Path) -> bool {
     for table in TPCH_TABLES {
         let path = dir.join(format!("{table}.parquet"));
         if !path.exists() {
-            panic!(
-                "TPC-H Parquet missing: {}\nGenerate first:\n  \
-                 cargo run --release -p ematix-flow-core --example tpch_generate -- \\\n\
-                 \t    --sf 1 --out {}",
+            eprintln!(
+                "skip: TPC-H Parquet missing at {}; generate via\n  \
+                 cargo run --release -p ematix-flow-core --example tpch_generate -- \
+                 --sf 1 --out {}",
                 path.display(),
                 dir.display()
             );
+            return false;
         }
         ctx.register_parquet(*table, path.to_str().unwrap(), Default::default())
             .await
             .unwrap_or_else(|e| panic!("register {table}: {e}"));
     }
+    true
 }
 
 /// Spawn `n` tonic-served `Worker`s on free localhost ports in the
@@ -168,13 +175,15 @@ async fn spawn_workers(n: usize) -> (Vec<String>, JoinSet<()>) {
 async fn build_backend_with_workers(
     rt: &Runtime,
     peers: Vec<String>,
-) -> (Arc<DistributedBackend>, Option<JoinSet<()>>) {
+) -> Option<Arc<DistributedBackend>> {
     let _enter = rt.enter();
     let backend = Arc::new(
         DistributedBackend::open(DistributedConfig { peers, tls: None }).expect("backend"),
     );
-    register_tpch(backend.session_context().await, &data_dir()).await;
-    (backend, None)
+    if !register_tpch(backend.session_context().await, &data_dir()).await {
+        return None;
+    }
+    Some(backend)
 }
 
 fn run_query(rt: &Runtime, backend: &DistributedBackend, sql: &str) -> Vec<RecordBatch> {
@@ -220,7 +229,9 @@ fn bench_distributed(c: &mut Criterion) {
 
     // --- Configuration A: distributed-of-one (peers = []) ---
     {
-        let (backend, _) = rt.block_on(build_backend_with_workers(&rt, vec![]));
+        let Some(backend) = rt.block_on(build_backend_with_workers(&rt, vec![])) else {
+            return;
+        };
         let group_name = format!("tpch_{sf}_distributed_of_one");
         for (name, sql) in queries {
             let mut group = c.benchmark_group(&group_name);
@@ -255,7 +266,9 @@ fn bench_distributed(c: &mut Criterion) {
                 (urls, format!("tpch_{sf}_distributed_3_workers"))
             }
         };
-        let (backend, _) = rt.block_on(build_backend_with_workers(&rt, peers));
+        let Some(backend) = rt.block_on(build_backend_with_workers(&rt, peers)) else {
+            return;
+        };
         for (name, sql) in queries {
             let mut group = c.benchmark_group(&group_name);
             group.sample_size(10).measurement_time(measurement_time());

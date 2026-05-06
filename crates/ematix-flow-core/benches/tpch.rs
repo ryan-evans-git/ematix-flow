@@ -157,30 +157,33 @@ fn data_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("examples/tpch/data/sf1"))
 }
 
-/// Build a SessionContext with all 8 TPC-H tables registered against
-/// their Parquet files. Panics with a clear message if any file is
-/// missing (run `cargo run --release --example tpch_generate -- --sf
-/// 1 --out examples/tpch/data/sf1` to populate).
-async fn build_session(rt: &Runtime, dir: &Path) -> SessionContext {
+/// Build a SessionContext with all 8 TPC-H tables registered.
+/// Returns `None` when the SF=1 Parquet directory is missing —
+/// CI doesn't generate the data (it's `.gitignore`d) and
+/// `cargo test --workspace --all-targets` runs the criterion bench
+/// harness's `main()`, so a panic here would fail every CI run.
+/// `cargo bench` against a fresh checkout still gets a clear
+/// `eprintln!` skip line + early return.
+async fn build_session(rt: &Runtime, dir: &Path) -> Option<SessionContext> {
     let _enter = rt.enter();
     let ctx = SessionContext::new();
     for table in TPCH_TABLES {
         let path = dir.join(format!("{table}.parquet"));
         if !path.exists() {
-            panic!(
-                "TPC-H Parquet missing: {}\n\
-                 Generate first:\n\
-                 \tcargo run --release -p ematix-flow-core --example tpch_generate -- \\\n\
-                 \t    --sf 1 --out {}",
+            eprintln!(
+                "skip: TPC-H Parquet missing at {}; generate via\n  \
+                 cargo run --release -p ematix-flow-core --example tpch_generate -- \
+                 --sf 1 --out {}",
                 path.display(),
                 dir.display()
             );
+            return None;
         }
         ctx.register_parquet(*table, path.to_str().unwrap(), Default::default())
             .await
             .unwrap_or_else(|e| panic!("register {table}: {e}"));
     }
-    ctx
+    Some(ctx)
 }
 
 fn run_query(rt: &Runtime, ctx: &SessionContext, sql: &str) -> Vec<RecordBatch> {
@@ -238,7 +241,9 @@ fn bench_tpch(c: &mut Criterion) {
     let sf = sf_tag(&dir);
     println!("==> TPC-H bench data dir: {}", dir.display());
     println!("==> SF tag (group label): {sf}");
-    let ctx = rt.block_on(build_session(&rt, &dir));
+    let Some(ctx) = rt.block_on(build_session(&rt, &dir)) else {
+        return;
+    };
 
     let group_name = format!("tpch_{sf}");
 
