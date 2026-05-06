@@ -10,6 +10,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Nothing pending — see [`docs/ROADMAP.md`](docs/ROADMAP.md) for the
 prioritized list of remaining work.
 
+## [0.1.1] — 2026-05-06
+
+Metadata + documentation polish only. **No functional changes** —
+the wheel + sdist contents are bit-equivalent to v0.1.0 modulo
+the embedded `pyproject.toml` / `Cargo.toml` description fields
+and the README. Cut so the PyPI project page reflects the
+corrected pitch (v0.1.0's PyPI metadata is locked once published).
+
+### Changed
+
+- Package descriptions no longer single out Postgres. The
+  pyproject `description` and the `ematix-flow-core` crate
+  `description` now name the full backend surface — SQL
+  databases (Postgres, MySQL, SQLite, DuckDB), object stores +
+  Delta Lake (Parquet, CSV, JSON, ORC, local FS or S3), and
+  streaming sources (Kafka, RabbitMQ, Pub/Sub, Kinesis) — and
+  cite the 5.87× SF=1 22-query TPC-H DataFusion-vs-PySpark
+  geomean.
+- `pyproject.toml` keywords broadened: dropped Postgres-only
+  framing, added `datafusion`, `delta-lake`, `parquet`,
+  `kafka`, `data-pipeline`.
+- README headline rewritten to lead with *why* (declarative,
+  single-binary footprint, multi-backend write-once, correct by
+  default, faster than PySpark single-node) before the feature
+  inventory. New "Why ematix-flow" section. "What it is"
+  expanded from three to four surfaces — Σ.B distributed batch
+  SQL was missing.
+- Stale "Status: alpha" + "On PyPI once wheel-build CI tasks
+  land" lines removed; replaced with current "v0.1.0 on PyPI"
+  status.
+
 ## [0.1.0] — 2026-05-05
 
 First public release.
