@@ -42,69 +42,54 @@ on:
 
 permissions:
   contents: read
+  # `actions: read` is required by `lewagon/wait-on-check-action`
+  # to query the Checks API on the current SHA.
+  actions: read
 
 jobs:
-  # Belt-and-suspenders gate: re-run the same checks the `ci`
-  # workflow runs on every push, but in-line here so we don't
-  # depend on a separate workflow's status. Wheels + sdist only
-  # build if this job passes; publish only fires if all wheels
-  # build. Keeps a "ship to PyPI on tag push" workflow from
-  # publishing untested code.
-  verify:
-    name: verify (fmt + clippy + test + audit + ruff + bandit + pip-audit)
+  # Gate the wheel matrix on `ci.yml` succeeding for the SAME SHA.
+  # Tag pushes typically follow a `git push origin main && git push
+  # origin v0.x.0` sequence — both events fire on the same commit,
+  # so ci.yml is in flight (or already done) by the time release.yml
+  # reaches this job. Waiting for it is meaningfully cheaper than
+  # the prior `verify` job, which re-ran the same fmt + clippy +
+  # test + audit + ruff + bandit + pip-audit checks ci.yml just
+  # finished — ~10–15 min duplicated work per release.
+  #
+  # Tradeoff: a `workflow_dispatch` trigger on a SHA where ci.yml
+  # didn't run will hit the action's timeout (default 600s). The
+  # operator's recovery is to push to main first to trigger ci.yml,
+  # then dispatch. This is the rare path; the tag-push flow is the
+  # default.
+  await-ci:
+    name: wait for ci.yml on this SHA
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Wait for ci.yml rust job
+        uses: lewagon/wait-on-check-action@v1.3.4
         with:
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
-      - name: Rust fmt
-        run: cargo fmt --all -- --check
-      - name: Rust clippy (-D warnings)
-        run: cargo clippy --workspace --all-targets -- -D warnings
-      - name: Rust tests
-        run: cargo test --workspace --lib
-      - name: Install cargo-audit
-        # Shell install instead of `rustsec/audit-check` action
-        # because that action requires `checks: write` to post a
-        # check-run. Running the binary directly avoids the extra
-        # permission grant.
-        run: cargo install --locked cargo-audit
-      - name: Run cargo audit (RustSec advisory DB)
-        # `.cargo/audit.toml` carries the ignored-advisory list
-        # with rationale (see SECURITY.md).
-        run: cargo audit
-      - uses: actions/setup-python@v5
+          ref: ${{ github.sha }}
+          check-name: rust (ubuntu-latest)
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+          wait-interval: 20
+      - name: Wait for ci.yml audit-rust job
+        uses: lewagon/wait-on-check-action@v1.3.4
         with:
-          python-version: "3.12"
-      - name: Set up venv
-        shell: bash
-        run: |
-          python -m venv .venv
-          echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
-          echo "VIRTUAL_ENV=$PWD/.venv" >> "$GITHUB_ENV"
-      - name: Install dev deps
-        run: |
-          python -m pip install --upgrade pip
-          pip install 'maturin>=1.7' pytest 'pytest-asyncio>=0.23' ruff bandit pip-audit
-      - name: Build extension
-        run: maturin develop --release
-      - name: Ruff
-        run: ruff check python tests
-      - name: Bandit (medium+ severity, no findings allowed)
-        run: bandit -r python -ll -c pyproject.toml
-      - name: pip-audit (Python deps)
-        # `--skip-editable` excludes the in-tree `ematix-flow`
-        # install. Default behavior still fails on any advisory in
-        # non-editable deps.
-        run: pip-audit --skip-editable
-      - name: Pytest
-        run: pytest
+          ref: ${{ github.sha }}
+          check-name: cargo audit (RustSec advisory DB)
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+          wait-interval: 20
+      - name: Wait for ci.yml python 3.12 job
+        uses: lewagon/wait-on-check-action@v1.3.4
+        with:
+          ref: ${{ github.sha }}
+          check-name: python (ubuntu-latest, py3.12)
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+          wait-interval: 20
 
   build-linux:
     name: linux-x86_64 wheels (py${{ matrix.python }})
-    needs: verify
+    needs: await-ci
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -153,6 +138,12 @@ jobs:
           # `codegen-units = 1` per workspace Cargo.toml).
           # `--strip` is implied by [tool.maturin] strip = true.
           args: --release --interpreter python${{ matrix.python }}
+          # sccache: maturin-action installs sccache inside the
+          # manylinux container + sets RUSTC_WRAPPER. Backed by
+          # GitHub Actions cache (no S3 needed). Saves ~5-10 min
+          # on cold builds (full Rust dep tree compile) and is a
+          # near-no-op when the cache is warm.
+          sccache: true
 
       - uses: actions/upload-artifact@v4
         with:
@@ -162,7 +153,7 @@ jobs:
 
   build-macos:
     name: macos-${{ matrix.arch }} wheels (py${{ matrix.python }})
-    needs: verify
+    needs: await-ci
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -203,6 +194,10 @@ jobs:
         with:
           target: ${{ matrix.target }}
           args: --release --interpreter python${{ matrix.python }}
+          # See the comment in build-linux for sccache rationale.
+          # On macOS aarch64 sccache wraps the host rustc directly
+          # (no container), which is straightforwardly fast.
+          sccache: true
 
       - uses: actions/upload-artifact@v4
         with:
@@ -212,7 +207,7 @@ jobs:
 
   build-sdist:
     name: source distribution
-    needs: verify
+    needs: await-ci
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
