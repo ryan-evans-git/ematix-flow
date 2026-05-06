@@ -136,6 +136,7 @@ impl From<PgError> for BackendError {
             PgError::Pool(s) => BackendError::Connection(s),
             // Reuse the PG error's already-formatted DB message.
             PgError::Postgres(_) => BackendError::Query(err.to_string()),
+            PgError::Other(s) => BackendError::Other(s),
         }
     }
 }
@@ -175,6 +176,28 @@ pub struct StrategyRunResult {
     pub rows_closed: Option<i64>,
     pub status: String,
     pub path: String,
+}
+
+/// Phase Δ PR 3: result of one CDC batch's apply.
+///
+/// `creates` covers `c` and `r` (snapshot Read) ops — both UPSERT-
+/// shaped so they share a counter. `skipped` counts tombstones +
+/// rows that failed envelope-parse (the latter still log a
+/// warning so they aren't silent). The metrics path mirrors
+/// [`StrategyRunResult`] so the streaming pipeline can fold both
+/// into the same observability surface.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CdcRunResult {
+    pub run_id: String,
+    /// Successful INSERT/UPSERT applications (`Create` + `Read`).
+    pub creates: i64,
+    /// Successful UPDATE applications.
+    pub updates: i64,
+    /// Successful DELETE / soft-delete applications.
+    pub deletes: i64,
+    /// Tombstones + parse failures. Always counted; never errors
+    /// the run.
+    pub skipped: i64,
 }
 
 impl From<crate::pg::AppendRunResult> for StrategyRunResult {
@@ -392,6 +415,43 @@ pub trait Backend: Send + Sync + 'static {
     /// is the at-least-once primitive used by `StreamingPipeline`.
     async fn commit_offsets(&self) -> Result<(), BackendError> {
         Ok(())
+    }
+
+    /// Phase Δ PR 3: apply one batch of CDC events to the target
+    /// table.
+    ///
+    /// The streaming pipeline reads `RecordBatch`es from a Kafka
+    /// source, hands each batch to this method, and the
+    /// implementation:
+    ///
+    /// 1. Converts each row to JSON via [`crate::cdc::batch_to_json_rows`].
+    /// 2. Resolves each JSON row to a [`crate::cdc::CdcEvent`] via
+    ///    [`crate::cdc::parse_event`] (PR 2). Tombstones return
+    ///    `Ok(None)` and bump `skipped`; parse errors are logged
+    ///    + counted as `skipped` (the streaming pipeline's
+    ///    `transform_on_error` policy decides whether to fail
+    ///    the batch instead).
+    /// 3. Groups by op + applies each per-op group transactionally
+    ///    via the backend's native UPSERT / UPDATE / DELETE.
+    /// 4. Returns a [`CdcRunResult`] with per-op counts.
+    ///
+    /// Default implementation: returns a `BackendError::Other`
+    /// pointing at the relevant phase doc. Postgres implements
+    /// this concretely; other targets will land in PR 6 +
+    /// follow-ups per `docs/PHASE_DELTA_CDC_PLAN.md`.
+    async fn run_cdc(
+        &self,
+        _spec: &crate::types::TableSpec,
+        _batch: RecordBatch,
+        _cdc_config: &crate::cdc::CdcConfig,
+        _pipeline_name: &str,
+    ) -> Result<CdcRunResult, BackendError> {
+        Err(BackendError::Other(format!(
+            "run_cdc is not yet implemented for backend dialect = {:?}. \
+             Phase Δ PR 3 lands the Postgres impl; other targets in \
+             PR 6 + follow-ups (docs/PHASE_DELTA_CDC_PLAN.md).",
+            self.dialect()
+        )))
     }
 
     /// Phase 39.5a: does this backend round-trip an offset blob
@@ -1289,6 +1349,52 @@ impl Backend for PostgresBackend {
                 Ok(outcome.into())
             }
         }
+    }
+
+    /// Phase Δ PR 3: Postgres-target CDC apply. Decodes the
+    /// RecordBatch via [`crate::cdc::events_from_batch`], routes
+    /// each parsed event to [`crate::pg::PgPool::run_cdc`] for
+    /// per-op transactional dispatch, and surfaces the resulting
+    /// counts. Tombstones + parse errors are counted as `skipped`
+    /// here so the executor itself stays purely about target-side
+    /// SQL execution.
+    async fn run_cdc(
+        &self,
+        spec: &crate::types::TableSpec,
+        batch: RecordBatch,
+        cdc_config: &crate::cdc::CdcConfig,
+        pipeline_name: &str,
+    ) -> Result<CdcRunResult, BackendError> {
+        use crate::cdc::ParsedRow;
+
+        let parsed = crate::cdc::events_from_batch(&batch, cdc_config)?;
+        let mut events = Vec::with_capacity(parsed.len());
+        let mut skipped: i64 = 0;
+        for row in parsed {
+            match row {
+                ParsedRow::Event(e) => events.push(e),
+                ParsedRow::Tombstone => skipped += 1,
+                ParsedRow::ParseError(e) => {
+                    // Soft-fail per row. The streaming pipeline's
+                    // `transform_on_error` policy can promote this
+                    // to a hard failure if the user wants strict
+                    // mode; for now the parse-failed row is
+                    // surfaced via the `skipped` counter and a
+                    // warn line so operators can see it.
+                    tracing::warn!(
+                        target: "ematix_flow::cdc",
+                        error = %e,
+                        pipeline = pipeline_name,
+                        "CDC envelope parse failed; row skipped",
+                    );
+                    skipped += 1;
+                }
+            }
+        }
+        self.pool
+            .run_cdc(spec, events, cdc_config, pipeline_name, skipped)
+            .await
+            .map_err(|e| BackendError::Other(e.to_string()))
     }
 
     async fn read_arrow_stream(&self, query: &str) -> Result<ArrowBatchStream, BackendError> {

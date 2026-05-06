@@ -27,9 +27,17 @@
 //!   delete-side key fallback (`after.id` → `before.id`), and
 //!   Maxwell's seconds-vs-milliseconds timestamp wart.
 //!
-//! Still to come: per-op dispatch via `Backend::run_cdc` (PR 3),
-//! idempotency via the StateStore (PR 4), schema-evolution
-//! detection (PR 5).
+//! **PR 3** — RecordBatch → events bridge + Postgres executor:
+//! - [`batch_to_json_rows`] / [`events_from_batch`] — convert
+//!   the Kafka source's Arrow output to per-row [`ParsedRow`]
+//!   for the executor.
+//! - `Backend::run_cdc` trait method (default: returns a
+//!   "not yet implemented for this dialect" error). PostgresBackend
+//!   overrides with a transactional per-op apply that uses
+//!   `jsonb_populate_record` for type-safe JSON → row coercion.
+//!
+//! Still to come: idempotency via the StateStore (PR 4), schema-
+//! evolution detection (PR 5).
 //!
 //! Plan: `docs/PHASE_DELTA_CDC_PLAN.md`.
 
@@ -568,6 +576,102 @@ fn json_type_name(v: &Value) -> &'static str {
     }
 }
 
+// =================================================================
+// Phase Δ PR 3 — RecordBatch → JSON rows bridge + event lifter
+// =================================================================
+
+use crate::backend::BackendError;
+use arrow_array::RecordBatch;
+use std::io::Cursor;
+
+/// Convert a `RecordBatch` to a `Vec<Map<String, Value>>` —
+/// one JSON object per row. Bridges the Kafka source's Arrow
+/// output to the parser's JSON input.
+///
+/// Implementation: serializes the batch to JSON-Lines via
+/// `arrow_json::LineDelimitedWriter`, then re-parses each line
+/// as a `serde_json::Value`. The double-pass costs one extra
+/// allocation per row but keeps the parser independent of Arrow's
+/// type system — adding a new wire format (Avro-with-logical-
+/// types, Protobuf-with-extensions) doesn't require changing the
+/// parser.
+///
+/// Throughput: at typical CDC volumes (1-10 K events/s) the JSON
+/// roundtrip is well under the per-batch budget; target-side
+/// commits dominate. If a profile shows this as a hot path, the
+/// fix is a direct Arrow → `serde_json::Value` walker that skips
+/// the intermediate UTF-8 — but premature optimisation.
+pub fn batch_to_json_rows(
+    batch: &RecordBatch,
+) -> Result<Vec<serde_json::Map<String, Value>>, BackendError> {
+    let mut buf: Vec<u8> = Vec::new();
+    {
+        let mut writer = arrow_json::LineDelimitedWriter::new(&mut buf);
+        writer
+            .write(batch)
+            .map_err(|e| BackendError::Other(format!("cdc batch → json: {e}")))?;
+        writer
+            .finish()
+            .map_err(|e| BackendError::Other(format!("cdc batch → json finish: {e}")))?;
+    }
+
+    let mut rows = Vec::with_capacity(batch.num_rows());
+    let cursor = Cursor::new(&buf);
+    for line_result in std::io::BufRead::lines(std::io::BufReader::new(cursor)) {
+        let line =
+            line_result.map_err(|e| BackendError::Other(format!("cdc batch → json read: {e}")))?;
+        if line.is_empty() {
+            // Trailing newline from LineDelimitedWriter.
+            continue;
+        }
+        let value: Value = serde_json::from_str(&line)
+            .map_err(|e| BackendError::Other(format!("cdc batch → json parse: {e}")))?;
+        match value {
+            Value::Object(map) => rows.push(map),
+            other => {
+                return Err(BackendError::Other(format!(
+                    "cdc batch → json: expected each row to serialize as a JSON \
+                     object, got {}",
+                    json_type_name(&other)
+                )));
+            }
+        }
+    }
+    Ok(rows)
+}
+
+/// One row's parse outcome. Lets the executor distinguish events
+/// (apply), tombstones (skip silently), and parse errors (skip
+/// + count + log).
+#[derive(Debug)]
+pub enum ParsedRow {
+    /// A real change event the executor applies to the target.
+    Event(CdcEvent),
+    /// Tombstone or empty-row pattern — caller skips.
+    Tombstone,
+    /// Envelope parse failed. The executor counts these as
+    /// `skipped` and logs a warning. Held for the executor to
+    /// surface in metrics or DLQ-routing.
+    ParseError(CdcParseError),
+}
+
+/// Convert a RecordBatch directly into per-row parse outcomes,
+/// chaining [`batch_to_json_rows`] + [`parse_event`].
+pub fn events_from_batch(
+    batch: &RecordBatch,
+    cfg: &CdcConfig,
+) -> Result<Vec<ParsedRow>, BackendError> {
+    let rows = batch_to_json_rows(batch)?;
+    Ok(rows
+        .into_iter()
+        .map(|row| match parse_event(&row, cfg) {
+            Ok(Some(event)) => ParsedRow::Event(event),
+            Ok(None) => ParsedRow::Tombstone,
+            Err(e) => ParsedRow::ParseError(e),
+        })
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1000,5 +1104,131 @@ mod tests {
 
         let event = parse_event(&row, &cfg).unwrap().expect("non-tombstone");
         assert!(event.ts_ms.is_none());
+    }
+
+    // -------------------------------------------------------------
+    // PR 3 — RecordBatch → JSON rows + events_from_batch tests.
+    //
+    // Build small RecordBatches by encoding hand-crafted JSON
+    // through arrow-json's reader (the inverse of what
+    // batch_to_json_rows does on the way back out). Round-trip
+    // exercises the Arrow ↔ JSON conversion + the parser
+    // chained together — the same code path the PR 3 Postgres
+    // executor uses on every Kafka batch.
+    // -------------------------------------------------------------
+
+    use arrow_array::RecordBatch;
+    use std::io::Cursor;
+    use std::sync::Arc;
+
+    fn batch_from_json_objects(rows: &[Map<String, Value>]) -> RecordBatch {
+        // Serialize each row to JSON-lines, then re-decode through
+        // arrow-json's schema-inferring reader. This is the
+        // canonical "round-trip JSON through Arrow" idiom that
+        // mirrors how the Kafka source decodes JSON payloads.
+        let mut buf = Vec::new();
+        for row in rows {
+            buf.extend(serde_json::to_string(row).unwrap().bytes());
+            buf.push(b'\n');
+        }
+
+        // Infer schema then read.
+        let mut sniff = Cursor::new(&buf);
+        let (schema, _) = arrow_json::reader::infer_json_schema_from_seekable(&mut sniff, None)
+            .expect("infer schema");
+        let cursor = Cursor::new(&buf);
+        arrow_json::ReaderBuilder::new(Arc::new(schema))
+            .build(cursor)
+            .expect("build reader")
+            .next()
+            .expect("at least one batch")
+            .expect("decode ok")
+    }
+
+    #[test]
+    fn batch_to_json_rows_round_trips_single_row() {
+        let original = vec![debezium_insert_row()];
+        let batch = batch_from_json_objects(&original);
+        let recovered = batch_to_json_rows(&batch).expect("convert");
+        assert_eq!(recovered.len(), 1);
+        // The arrow-json round-trip preserves the structure but
+        // may shuffle field ordering inside structs — compare by
+        // deep equivalence rather than literal byte equality.
+        let expected_after = original[0].get("after").unwrap();
+        let recovered_after = Value::Object(recovered[0].clone())
+            .get("after")
+            .cloned()
+            .unwrap();
+        assert_eq!(*expected_after, recovered_after);
+    }
+
+    #[test]
+    fn batch_to_json_rows_round_trips_multi_row() {
+        let original = vec![
+            debezium_insert_row(),
+            debezium_update_row(),
+            debezium_snapshot_row(),
+        ];
+        let batch = batch_from_json_objects(&original);
+        let recovered = batch_to_json_rows(&batch).expect("convert");
+        assert_eq!(recovered.len(), 3);
+        // Ops survive the round-trip — that's the load-bearing
+        // assertion for PR 3's executor (the parser keys off it).
+        assert_eq!(recovered[0].get("op"), Some(&json!("c")));
+        assert_eq!(recovered[1].get("op"), Some(&json!("u")));
+        assert_eq!(recovered[2].get("op"), Some(&json!("r")));
+    }
+
+    #[test]
+    fn events_from_batch_chains_decode_and_parse() {
+        // Three Debezium events in one batch: insert + update +
+        // snapshot read. The full PR 3 executor's input shape.
+        let cfg = debezium_cfg_with_pk("id");
+        let original = vec![
+            debezium_insert_row(),
+            debezium_update_row(),
+            debezium_snapshot_row(),
+        ];
+        let batch = batch_from_json_objects(&original);
+        let parsed = events_from_batch(&batch, &cfg).expect("convert + parse");
+        assert_eq!(parsed.len(), 3);
+        for row in &parsed {
+            assert!(
+                matches!(row, ParsedRow::Event(_)),
+                "every Debezium-shaped row should parse to an Event, got {row:?}"
+            );
+        }
+        let ops: Vec<CdcOp> = parsed
+            .iter()
+            .map(|r| match r {
+                ParsedRow::Event(e) => e.op,
+                _ => unreachable!(),
+            })
+            .collect();
+        assert_eq!(ops, vec![CdcOp::Create, CdcOp::Update, CdcOp::Read]);
+    }
+
+    #[test]
+    fn events_from_batch_surfaces_parse_errors_per_row() {
+        // Mix a valid INSERT with a row whose `op` is unknown.
+        // The executor needs to see both parse outcomes from one
+        // call so it can apply the valid event + count the bad
+        // one as `skipped`.
+        let cfg = debezium_cfg_with_pk("id");
+        let mut bad = debezium_insert_row();
+        bad.insert("op".into(), json!("WAT"));
+        let original = vec![debezium_insert_row(), bad];
+        let batch = batch_from_json_objects(&original);
+        let parsed = events_from_batch(&batch, &cfg).expect("convert");
+        assert_eq!(parsed.len(), 2);
+        assert!(matches!(parsed[0], ParsedRow::Event(_)));
+        assert!(
+            matches!(
+                &parsed[1],
+                ParsedRow::ParseError(CdcParseError::UnknownOp { .. })
+            ),
+            "second row should surface UnknownOp; got {:?}",
+            parsed[1]
+        );
     }
 }

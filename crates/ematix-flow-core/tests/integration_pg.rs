@@ -7070,3 +7070,394 @@ async fn kafka_protobuf_sr_round_trip() {
     assert!(labels.contains(&"beta".to_string()));
     assert!(labels.contains(&"gamma".to_string()));
 }
+
+// ====================================================================
+// Phase Δ PR 3 — CDC executor end-to-end against a real Postgres.
+// ====================================================================
+//
+// `PostgresBackend::run_cdc` takes a Kafka-source-style RecordBatch
+// of Debezium-shaped events and applies them via per-op SQL
+// (UPSERT / UPDATE / DELETE). These tests exercise the full path:
+// build a batch from hand-crafted Debezium JSON, run it against a
+// fresh Postgres container, assert the target rows match the
+// expected post-apply state.
+
+fn cdc_target_spec() -> TableSpec {
+    // No `augment_with_metadata` — CDC targets are application
+    // tables, not append-style log tables. The user's schema
+    // owns the column set.
+    TableSpec {
+        schema: "mirror".into(),
+        name: "customers".into(),
+        columns: vec![
+            ColumnSpec {
+                name: "id".into(),
+                ty: ColumnType::BigInt,
+                nullable: false,
+                primary_key: true,
+            },
+            ColumnSpec {
+                name: "email".into(),
+                ty: ColumnType::Text,
+                nullable: true,
+                primary_key: false,
+            },
+            ColumnSpec {
+                name: "name".into(),
+                ty: ColumnType::Text,
+                nullable: true,
+                primary_key: false,
+            },
+        ],
+        unique_constraints: Vec::new(),
+        fingerprint: String::new(),
+    }
+}
+
+/// Helper: encode a list of Debezium-shaped JSON rows as a
+/// schema-inferred RecordBatch. Mirrors what the Kafka source's
+/// JSON-payload decoder produces; the CDC executor calls
+/// `events_from_batch` on whatever shape arrives.
+fn record_batch_from_json(
+    rows: &[serde_json::Map<String, serde_json::Value>],
+) -> arrow_array::RecordBatch {
+    use std::io::Cursor;
+    let mut buf = Vec::new();
+    for row in rows {
+        buf.extend(serde_json::to_string(row).unwrap().bytes());
+        buf.push(b'\n');
+    }
+    let mut sniff = Cursor::new(&buf);
+    let (schema, _) =
+        arrow_json::reader::infer_json_schema_from_seekable(&mut sniff, None).expect("schema");
+    let cursor = Cursor::new(&buf);
+    let mut reader = arrow_json::ReaderBuilder::new(Arc::new(schema))
+        .build(cursor)
+        .expect("reader");
+    reader
+        .next()
+        .expect("at least one batch")
+        .expect("decode ok")
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker; run with `cargo test -- --ignored`"]
+async fn cdc_postgres_applies_insert_update_delete_in_one_batch() {
+    use ematix_flow_core::cdc::{CdcConfig, EnvelopeKind};
+    use serde_json::json;
+
+    let (_container, url) = start_postgres().await;
+    let pool = PgPool::connect(&url).await.unwrap();
+
+    pool.execute("CREATE SCHEMA mirror").await.unwrap();
+    pool.execute(
+        "CREATE TABLE mirror.customers (\
+            id     BIGINT PRIMARY KEY,\
+            email  TEXT,\
+            name   TEXT\
+         )",
+    )
+    .await
+    .unwrap();
+
+    let backend = PostgresBackend::new(Arc::new(pool), url.clone());
+    let spec = cdc_target_spec();
+
+    let mut cdc_cfg = CdcConfig::for_envelope(EnvelopeKind::Debezium);
+    cdc_cfg.key_field = "after.id".into();
+
+    // Three events in one batch:
+    //   1. INSERT id=1
+    //   2. INSERT id=2
+    //   3. UPDATE id=1 (rename)
+    //   4. DELETE id=2
+    let rows = vec![
+        json!({
+            "before": null,
+            "after": {"id": 1, "email": "alice@example.com", "name": "Alice"},
+            "source": {"ts_ms": 1_700_000_000_001_i64},
+            "op": "c",
+            "ts_ms": 1_700_000_000_001_i64,
+        })
+        .as_object()
+        .unwrap()
+        .clone(),
+        json!({
+            "before": null,
+            "after": {"id": 2, "email": "bob@example.com", "name": "Bob"},
+            "source": {"ts_ms": 1_700_000_000_002_i64},
+            "op": "c",
+            "ts_ms": 1_700_000_000_002_i64,
+        })
+        .as_object()
+        .unwrap()
+        .clone(),
+        json!({
+            "before": {"id": 1, "email": "alice@example.com", "name": "Alice"},
+            "after":  {"id": 1, "email": "alice@example.com", "name": "Alice Smith"},
+            "source": {"ts_ms": 1_700_000_005_000_i64},
+            "op": "u",
+            "ts_ms": 1_700_000_005_000_i64,
+        })
+        .as_object()
+        .unwrap()
+        .clone(),
+        json!({
+            "before": {"id": 2, "email": "bob@example.com", "name": "Bob"},
+            "after":  null,
+            "source": {"ts_ms": 1_700_000_010_000_i64},
+            "op": "d",
+            "ts_ms": 1_700_000_010_000_i64,
+        })
+        .as_object()
+        .unwrap()
+        .clone(),
+    ];
+    let batch = record_batch_from_json(&rows);
+
+    let result = backend
+        .run_cdc(&spec, batch, &cdc_cfg, "test_cdc_pipeline")
+        .await
+        .expect("run_cdc");
+
+    assert_eq!(result.creates, 2, "two inserts applied");
+    assert_eq!(result.updates, 1, "one update applied");
+    assert_eq!(result.deletes, 1, "one delete applied");
+    assert_eq!(result.skipped, 0, "no tombstones / parse errors");
+
+    // Verify post-state: only id=1 (with the renamed value) survives.
+    // Verification connection — separate from the backend's own
+    // pool so we don't fight with any in-flight transaction state.
+    let verify_pool = PgPool::connect(&url).await.unwrap();
+    let client = verify_pool.raw_pool_for_tests().get().await.unwrap();
+    let rows = client
+        .query(
+            "SELECT id, email, name FROM mirror.customers ORDER BY id",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1, "id=2 was deleted, id=1 remains");
+    let id: i64 = rows[0].get(0);
+    let email: String = rows[0].get(1);
+    let name: String = rows[0].get(2);
+    assert_eq!(id, 1);
+    assert_eq!(email, "alice@example.com");
+    assert_eq!(name, "Alice Smith", "update applied");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker; run with `cargo test -- --ignored`"]
+async fn cdc_postgres_soft_delete_flips_column() {
+    use ematix_flow_core::cdc::{CdcConfig, DeleteMode, EnvelopeKind};
+    use serde_json::json;
+
+    let (_container, url) = start_postgres().await;
+    let pool = PgPool::connect(&url).await.unwrap();
+
+    pool.execute("CREATE SCHEMA mirror").await.unwrap();
+    pool.execute(
+        "CREATE TABLE mirror.customers (\
+            id          BIGINT PRIMARY KEY,\
+            email       TEXT,\
+            name        TEXT,\
+            deleted_at  TIMESTAMPTZ\
+         )",
+    )
+    .await
+    .unwrap();
+
+    let backend = PostgresBackend::new(Arc::new(pool), url.clone());
+    let spec = TableSpec {
+        schema: "mirror".into(),
+        name: "customers".into(),
+        columns: vec![
+            ColumnSpec {
+                name: "id".into(),
+                ty: ColumnType::BigInt,
+                nullable: false,
+                primary_key: true,
+            },
+            ColumnSpec {
+                name: "email".into(),
+                ty: ColumnType::Text,
+                nullable: true,
+                primary_key: false,
+            },
+            ColumnSpec {
+                name: "name".into(),
+                ty: ColumnType::Text,
+                nullable: true,
+                primary_key: false,
+            },
+            ColumnSpec {
+                name: "deleted_at".into(),
+                ty: ColumnType::TimestampTz,
+                nullable: true,
+                primary_key: false,
+            },
+        ],
+        unique_constraints: Vec::new(),
+        fingerprint: String::new(),
+    };
+
+    let mut cdc_cfg = CdcConfig::for_envelope(EnvelopeKind::Debezium);
+    cdc_cfg.key_field = "after.id".into();
+    cdc_cfg.delete_mode = DeleteMode::Soft {
+        column: "deleted_at".into(),
+    };
+
+    let rows = vec![
+        json!({
+            "before": null,
+            "after": {"id": 99, "email": "x@example.com", "name": "X", "deleted_at": null},
+            "source": {"ts_ms": 1_700_000_000_001_i64},
+            "op": "c",
+            "ts_ms": 1_700_000_000_001_i64,
+        })
+        .as_object()
+        .unwrap()
+        .clone(),
+        json!({
+            "before": {"id": 99, "email": "x@example.com", "name": "X"},
+            "after":  null,
+            "source": {"ts_ms": 1_700_000_010_000_i64},
+            "op": "d",
+            "ts_ms": 1_700_000_010_000_i64,
+        })
+        .as_object()
+        .unwrap()
+        .clone(),
+    ];
+    let batch = record_batch_from_json(&rows);
+
+    let result = backend
+        .run_cdc(&spec, batch, &cdc_cfg, "test_cdc_soft")
+        .await
+        .expect("run_cdc");
+
+    assert_eq!(result.creates, 1);
+    assert_eq!(result.deletes, 1);
+
+    // Soft delete: row still exists, but deleted_at is set.
+    // Verification connection — separate from the backend's own
+    // pool so we don't fight with any in-flight transaction state.
+    let verify_pool = PgPool::connect(&url).await.unwrap();
+    let client = verify_pool.raw_pool_for_tests().get().await.unwrap();
+    let rows = client
+        .query(
+            "SELECT id, deleted_at IS NOT NULL FROM mirror.customers WHERE id = 99",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1, "soft delete preserves the row");
+    let id: i64 = rows[0].get(0);
+    let is_deleted: bool = rows[0].get(1);
+    assert_eq!(id, 99);
+    assert!(is_deleted, "deleted_at was flipped");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker; run with `cargo test -- --ignored`"]
+async fn cdc_postgres_skips_tombstones_and_parse_errors() {
+    use ematix_flow_core::cdc::{CdcConfig, EnvelopeKind};
+    use serde_json::json;
+
+    let (_container, url) = start_postgres().await;
+    let pool = PgPool::connect(&url).await.unwrap();
+
+    pool.execute("CREATE SCHEMA mirror").await.unwrap();
+    pool.execute(
+        "CREATE TABLE mirror.customers (\
+            id     BIGINT PRIMARY KEY,\
+            name   TEXT\
+         )",
+    )
+    .await
+    .unwrap();
+
+    let backend = PostgresBackend::new(Arc::new(pool), url.clone());
+    let spec = TableSpec {
+        schema: "mirror".into(),
+        name: "customers".into(),
+        columns: vec![
+            ColumnSpec {
+                name: "id".into(),
+                ty: ColumnType::BigInt,
+                nullable: false,
+                primary_key: true,
+            },
+            ColumnSpec {
+                name: "name".into(),
+                ty: ColumnType::Text,
+                nullable: true,
+                primary_key: false,
+            },
+        ],
+        unique_constraints: Vec::new(),
+        fingerprint: String::new(),
+    };
+
+    let mut cdc_cfg = CdcConfig::for_envelope(EnvelopeKind::Debezium);
+    cdc_cfg.key_field = "after.id".into();
+
+    // Mix: one valid INSERT + one row with an unknown op (parse
+    // error) + one valid INSERT. The batch's tombstone case is
+    // covered separately in the unit tests because empty-row
+    // payloads can't round-trip through arrow-json's schema
+    // inference (no fields → no schema). Here we focus on the
+    // parse-error skip path the executor hits in production.
+    let rows = vec![
+        json!({
+            "before": null,
+            "after":  {"id": 1, "name": "ok-1"},
+            "source": {"ts_ms": 1_700_000_000_001_i64},
+            "op": "c",
+            "ts_ms": 1_700_000_000_001_i64,
+        })
+        .as_object()
+        .unwrap()
+        .clone(),
+        json!({
+            "before": null,
+            "after":  {"id": 99, "name": "bad"},
+            "source": {"ts_ms": 1_700_000_000_002_i64},
+            "op": "WAT",   // unknown op
+            "ts_ms": 1_700_000_000_002_i64,
+        })
+        .as_object()
+        .unwrap()
+        .clone(),
+        json!({
+            "before": null,
+            "after":  {"id": 2, "name": "ok-2"},
+            "source": {"ts_ms": 1_700_000_000_003_i64},
+            "op": "c",
+            "ts_ms": 1_700_000_000_003_i64,
+        })
+        .as_object()
+        .unwrap()
+        .clone(),
+    ];
+    let batch = record_batch_from_json(&rows);
+
+    let result = backend
+        .run_cdc(&spec, batch, &cdc_cfg, "test_cdc_skip")
+        .await
+        .expect("run_cdc");
+
+    assert_eq!(result.creates, 2, "two valid inserts applied");
+    assert_eq!(result.skipped, 1, "the WAT-op row counted as skipped");
+
+    // Verification connection — separate from the backend's own
+    // pool so we don't fight with any in-flight transaction state.
+    let verify_pool = PgPool::connect(&url).await.unwrap();
+    let client = verify_pool.raw_pool_for_tests().get().await.unwrap();
+    let row_count: i64 = client
+        .query_one("SELECT COUNT(*)::bigint FROM mirror.customers", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(row_count, 2, "id=99 with bad op was not applied");
+}

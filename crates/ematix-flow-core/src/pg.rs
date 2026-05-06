@@ -32,6 +32,11 @@ pub enum PgError {
     Postgres(#[from] tokio_postgres::Error),
     #[error("pool error: {0}")]
     Pool(String),
+    /// Generic / catch-all for cases where the Postgres impl
+    /// surfaces a logical error that isn't a driver / pool /
+    /// URL parse failure (e.g. CDC target with no PK column).
+    #[error("{0}")]
+    Other(String),
 }
 
 /// `tokio_postgres::Error`'s default Display strips the DB error message
@@ -94,6 +99,23 @@ pub fn same_database(a: &str, b: &str) -> Result<bool, PgError> {
     Ok(parse_url(a)? == parse_url(b)?)
 }
 
+/// Wrap a Postgres identifier in double quotes, escaping any
+/// embedded double-quote characters by doubling them. Safe to use
+/// with reserved words, mixed-case names, or names containing
+/// special characters. Mirrors `pg_catalog.quote_ident()`.
+fn quote_ident(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for ch in s.chars() {
+        if ch == '"' {
+            out.push('"');
+        }
+        out.push(ch);
+    }
+    out.push('"');
+    out
+}
+
 #[derive(Clone)]
 pub struct PgPool {
     pool: Pool,
@@ -149,6 +171,15 @@ impl PgPool {
     /// `crate::backend::PostgresBackend` to acquire clients without
     /// exposing deadpool internals on the public API.
     pub(crate) fn raw_pool(&self) -> &Pool {
+        &self.pool
+    }
+
+    /// Test-only accessor. Same as [`Self::raw_pool`] but visible
+    /// to integration tests in `tests/`. Not part of the stable
+    /// API; library callers should go through [`Self::execute`] /
+    /// [`Self::fetch_scalar_int`] / the strategy executors.
+    #[doc(hidden)]
+    pub fn raw_pool_for_tests(&self) -> &Pool {
         &self.pool
     }
 
@@ -1073,6 +1104,204 @@ impl PgPool {
                 Err(err)
             }
         }
+    }
+
+    /// Phase Δ PR 3: apply CDC events to a Postgres target.
+    ///
+    /// Per-batch transactional. Builds three SQL templates per
+    /// target table — UPSERT, UPDATE, DELETE — and re-uses the
+    /// prepared statements across all events of the same op
+    /// within the batch. Single transaction; atomic across all
+    /// events.
+    ///
+    /// Uses Postgres's [`jsonb_populate_record`] for JSON → row
+    /// type coercion: bind a single `JSONB` parameter per event
+    /// and let the database handle int / timestamp / numeric
+    /// casts according to the target's actual column types. Same
+    /// machinery the existing `run_merge_same_db` relies on for
+    /// staging-table → target bulk-copy.
+    ///
+    /// Idempotency (last-seen-ts per PK) is wired in PR 4.
+    /// Schema-evolution detection in PR 5. PR 3 ships at-least-
+    /// once apply with bit-equivalent post-image semantics; idem-
+    /// potent targets (anything keyed by PK + UPSERT-shaped) are
+    /// safe under Kafka redelivery already.
+    pub async fn run_cdc(
+        &self,
+        target_spec: &crate::types::TableSpec,
+        events: Vec<crate::cdc::CdcEvent>,
+        cdc_config: &crate::cdc::CdcConfig,
+        pipeline_name: &str,
+        skipped: i64,
+    ) -> Result<crate::backend::CdcRunResult, PgError> {
+        use crate::cdc::{CdcOp, DeleteMode};
+        use serde_json::Value;
+
+        let _ = pipeline_name; // PR 4 uses this for state-store keying.
+
+        let run_id = Uuid::new_v4();
+
+        // Pre-compute per-target SQL templates. These don't change
+        // per event; each per-event call binds the row JSON.
+        let pk_col = target_spec
+            .columns
+            .iter()
+            .find(|c| c.primary_key)
+            .ok_or_else(|| {
+                PgError::Other(format!(
+                    "run_cdc: target {}.{} has no primary-key column \
+                     (PR 3 supports single-PK targets only; multi-PK \
+                     is a follow-up)",
+                    target_spec.schema, target_spec.name
+                ))
+            })?;
+        let qualified = format!(
+            "{}.{}",
+            quote_ident(&target_spec.schema),
+            quote_ident(&target_spec.name)
+        );
+        let non_pk_cols: Vec<&str> = target_spec
+            .columns
+            .iter()
+            .filter(|c| !c.primary_key)
+            .map(|c| c.name.as_str())
+            .collect();
+
+        // UPSERT for Create / Read.
+        let upsert_set_clause = non_pk_cols
+            .iter()
+            .map(|c| format!("{c} = EXCLUDED.{c}", c = quote_ident(c)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let upsert_sql = if non_pk_cols.is_empty() {
+            // PK-only table: nothing to update on conflict, just
+            // drop the row (DO NOTHING).
+            format!(
+                "INSERT INTO {qualified} \
+                 SELECT * FROM jsonb_populate_record(NULL::{qualified}, $1::jsonb) \
+                 ON CONFLICT ({pk}) DO NOTHING",
+                pk = quote_ident(&pk_col.name),
+            )
+        } else {
+            format!(
+                "INSERT INTO {qualified} \
+                 SELECT * FROM jsonb_populate_record(NULL::{qualified}, $1::jsonb) \
+                 ON CONFLICT ({pk}) DO UPDATE SET {upsert_set_clause}",
+                pk = quote_ident(&pk_col.name),
+            )
+        };
+
+        // UPDATE — re-uses jsonb_populate_record so types coerce
+        // identically to the UPSERT path.
+        let update_sql = if non_pk_cols.is_empty() {
+            // PK-only table: UPDATE is a no-op.
+            String::new()
+        } else {
+            let set = non_pk_cols
+                .iter()
+                .map(|c| format!("{c} = e.{c}", c = quote_ident(c)))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "UPDATE {qualified} AS t SET {set} \
+                 FROM jsonb_populate_record(NULL::{qualified}, $1::jsonb) AS e \
+                 WHERE t.{pk} = e.{pk}",
+                pk = quote_ident(&pk_col.name),
+            )
+        };
+
+        // DELETE — hard or soft per cdc_config.delete_mode. We
+        // build the WHERE-clause PK lookup via jsonb_populate_record
+        // so the type coercion is identical to the upsert / update
+        // paths (no surprise int-vs-string mismatch on DELETE).
+        let delete_sql = match &cdc_config.delete_mode {
+            DeleteMode::Hard => format!(
+                "DELETE FROM {qualified} \
+                 WHERE {pk} = (SELECT {pk} FROM jsonb_populate_record(NULL::{qualified}, $1::jsonb))",
+                pk = quote_ident(&pk_col.name),
+            ),
+            DeleteMode::Soft { column } => format!(
+                "UPDATE {qualified} SET {col} = NOW() \
+                 WHERE {pk} = (SELECT {pk} FROM jsonb_populate_record(NULL::{qualified}, $1::jsonb))",
+                pk = quote_ident(&pk_col.name),
+                col = quote_ident(column),
+            ),
+        };
+
+        let pk_col_name = pk_col.name.clone();
+
+        let mut creates = 0i64;
+        let mut updates = 0i64;
+        let mut deletes = 0i64;
+
+        let mut client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| PgError::Pool(e.to_string()))?;
+        let tx = client.transaction().await?;
+
+        // Prepare each op's statement once per batch. Re-using
+        // the prepared statement across N events of the same op
+        // is the standard at-least-once-with-PK throughput pattern.
+        let upsert_stmt = tx.prepare(&upsert_sql).await?;
+        let update_stmt = if update_sql.is_empty() {
+            None
+        } else {
+            Some(tx.prepare(&update_sql).await?)
+        };
+        let delete_stmt = tx.prepare(&delete_sql).await?;
+
+        for event in events {
+            match event.op {
+                CdcOp::Create | CdcOp::Read => {
+                    // Use the after-image as the row JSON. If
+                    // missing (shouldn't happen for create/read),
+                    // the row is malformed; skip + count.
+                    let after = match event.after {
+                        Some(map) => Value::Object(map),
+                        None => continue,
+                    };
+                    tx.execute(&upsert_stmt, &[&after]).await?;
+                    creates += 1;
+                }
+                CdcOp::Update => {
+                    let Some(stmt) = update_stmt.as_ref() else {
+                        // PK-only table: UPDATE is a no-op; count
+                        // it for visibility but don't fail.
+                        updates += 1;
+                        continue;
+                    };
+                    let after = match event.after {
+                        Some(map) => Value::Object(map),
+                        None => continue,
+                    };
+                    tx.execute(stmt, &[&after]).await?;
+                    updates += 1;
+                }
+                CdcOp::Delete => {
+                    // Synthesize a single-key object so the
+                    // jsonb_populate_record cast path is identical
+                    // to upsert/update — no separate type-binding
+                    // path for DELETE.
+                    let mut key_obj = serde_json::Map::new();
+                    key_obj.insert(pk_col_name.clone(), event.key);
+                    let key_json = Value::Object(key_obj);
+                    tx.execute(&delete_stmt, &[&key_json]).await?;
+                    deletes += 1;
+                }
+            }
+        }
+
+        tx.commit().await?;
+
+        Ok(crate::backend::CdcRunResult {
+            run_id: run_id.to_string(),
+            creates,
+            updates,
+            deletes,
+            skipped,
+        })
     }
 
     /// Lazy-create the pgcrypto extension. SCD2 needs `digest()`. On
