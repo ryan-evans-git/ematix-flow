@@ -138,12 +138,6 @@ jobs:
           # `codegen-units = 1` per workspace Cargo.toml).
           # `--strip` is implied by [tool.maturin] strip = true.
           args: --release --interpreter python${{ matrix.python }}
-          # sccache: maturin-action installs sccache inside the
-          # manylinux container + sets RUSTC_WRAPPER. Backed by
-          # GitHub Actions cache (no S3 needed). Saves ~5-10 min
-          # on cold builds (full Rust dep tree compile) and is a
-          # near-no-op when the cache is warm.
-          sccache: true
 
       - uses: actions/upload-artifact@v4
         with:
@@ -194,10 +188,6 @@ jobs:
         with:
           target: ${{ matrix.target }}
           args: --release --interpreter python${{ matrix.python }}
-          # See the comment in build-linux for sccache rationale.
-          # On macOS aarch64 sccache wraps the host rustc directly
-          # (no container), which is straightforwardly fast.
-          sccache: true
 
       - uses: actions/upload-artifact@v4
         with:
