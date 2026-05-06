@@ -92,8 +92,32 @@ and unshipped — see the plan's "Phase Δ extensions" section.
     Fail-policy abort.
   - Residual gaps documented inline: between-batch idempotency
     (Δ.X1.1 — needs `_cdc_last_ts` hidden column or sidecar
-    table), PK reflection (Δ.X1.2), Numeric column-type support
-    on the source-batch path.
+    table), Numeric column-type support on the source-batch path.
+- **Δ.X1.2 — user-declared PK threading for streaming-runtime
+  CDC dispatch.** The Δ.X1 PR 1 reflect path returns Delta
+  columns with `primary_key = false` (Delta tables don't carry
+  PK constraints natively, and the kernel crate's
+  `Metadata.configuration` is gated behind an `internal_api`
+  macro). Δ.X1.2 routes around it: users declare the PK on the
+  target spec and the streaming runtime augments the reflected
+  spec before dispatching to `Backend::run_cdc`. Three
+  equivalent surfaces:
+  - `[target.table].primary_key = ["id"]` TOML field on every
+    table-bearing target kind (Postgres / MySQL / SQLite /
+    DuckDB / DeltaLocal / DeltaS3). Lowering hooks land via
+    `PipelineCliConfig::target_primary_keys()`.
+  - `Target(primary_key=["id"])` field on the typed-Python
+    streaming spec; emitter writes it into the rendered TOML.
+  - `target_primary_key=["id"]` kwarg on
+    `run_streaming_pipeline` for the legacy single-target shape.
+  - `StreamingPipeline::ensure_cdc_target_specs` validates each
+    declared column against the live reflected schema and fails
+    loud on a typo, naming the offending column.
+  - 2 new dispatch-wiring unit tests cover augmentation +
+    typo-detection. CLI parse test locks the new TOML field.
+  - Postgres CDC unaffected: declaration is optional; reflection
+    already surfaces PK info, augmentation matches existing PK
+    flags rather than overriding them.
 
 ## [0.1.2] — 2026-05-06
 

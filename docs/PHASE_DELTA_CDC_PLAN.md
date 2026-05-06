@@ -533,18 +533,35 @@ not atomic). Tracked as **Δ.X1.1**. Non-issue when the source's
 per-PK ordering is preserved — Kafka with Debezium's default
 partition-by-PK gives this for free.
 
-**Streaming-runtime dispatch — partial.** `Backend::run_cdc` is
-fully wired and tested. `Backend::reflect_table_spec` returns
-columns from Delta's schema but reports `primary_key = false` on
-every column because the kernel crate gates `Metadata.configuration`
-behind an `internal_api` macro that's not in the public surface.
-Direct callers (handing `run_cdc` a hand-built `TableSpec` with
-PK info) work; streaming-runtime auto-dispatch via `flow consume`
-errors with the clear "no primary-key column" message until
-**Δ.X1.2** lands either a JSON-roundtrip route through
-`serde_json::to_value(&metadata)` OR a side channel that threads
-the user's `@ematix.table(primary_key=...)` declaration through
-to the executor.
+**Streaming-runtime dispatch — fully wired (Δ.X1.2 shipped).**
+`Backend::run_cdc` and `Backend::reflect_table_spec` both work
+end-to-end via `flow consume`. Δ.X1.2 added a side channel for
+PK info instead of going through Delta's metadata JSON:
+
+- New `[target.table].primary_key = ["id"]` TOML field on
+  `TableSpecConfig`. Parses on every backend with a `table` —
+  Postgres, MySQL, SQLite, DuckDB, DeltaLocal, DeltaS3.
+- `PipelineCliConfig::target_primary_keys()` returns one PK list
+  per target (parallel to `targets()`); the streaming-config
+  lowering threads it into the new
+  `StreamingPipelineConfig.target_primary_keys` field.
+- `StreamingPipeline::ensure_cdc_target_specs` augments the
+  reflected spec by flipping `primary_key = true` on columns
+  named in the user's declaration. A typo'd column name fails
+  loud — the augmentation step validates declared columns
+  against the reflected schema and returns a clear error
+  pointing at the TOML / decorator field.
+- Python: new `Target(primary_key=[...])` field on the streaming
+  dataclass + new `target_primary_key=[...]` kwarg on
+  `run_streaming_pipeline` + render emitter writes the PK list
+  into `[target.table].primary_key`. Both single- and multi-
+  target paths covered.
+
+Postgres CDC is unaffected: `information_schema` already
+surfaces PK info, so `target_primary_keys` is empty by default
+and the reflection path Just Works. Users can still declare PKs
+in TOML for documentation purposes; the augmentation step
+matches existing PK flags rather than overriding them.
 
 **Coverage that landed.**
 - `delta_cdc_inserts_updates_deletes_across_batches` — c/u/d each

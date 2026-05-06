@@ -404,6 +404,24 @@ pub struct StreamingPipelineConfig {
     /// shape — windowing or SQL-projecting the envelope before
     /// applying it would break the per-event semantics).
     pub cdc: Option<crate::cdc::CdcConfig>,
+    /// Δ.X1.2: per-target primary-key column lists. Indexed in
+    /// parallel with the pipeline's `targets` vec — `target_primary_keys[i]`
+    /// declares the PK columns for `targets[i]`. When the entry
+    /// is non-empty, the streaming runtime augments
+    /// [`Backend::reflect_table_spec`]'s output by marking those
+    /// columns as PK on the spec it hands to
+    /// [`Backend::run_cdc`]. When the entry is empty, the
+    /// reflected spec is used verbatim (Postgres path —
+    /// `information_schema` already surfaces PK constraints).
+    ///
+    /// Required for backends that can't reflect PK info natively
+    /// (Delta tables don't carry PK constraints; the Δ.X1 PR 1
+    /// reflect impl reports `primary_key = false` on every
+    /// column). The user supplies it via the
+    /// `[target.table].primary_key` TOML field, the
+    /// `@ematix.table(primary_key=...)` decorator, or
+    /// `StreamingPipelineConfig::with_target_primary_keys`.
+    pub target_primary_keys: Vec<Vec<String>>,
 }
 
 /// Phase 39.5a P2.15: per-batch transform-error handling.
@@ -461,6 +479,7 @@ impl StreamingPipelineConfig {
             checkpoint_interval_ms: None,
             transform_on_error: TransformErrorPolicy::Fail,
             cdc: None,
+            target_primary_keys: Vec::new(),
         }
     }
 
@@ -470,6 +489,17 @@ impl StreamingPipelineConfig {
     /// PR 5.5.
     pub fn with_cdc(mut self, cdc: crate::cdc::CdcConfig) -> Self {
         self.cdc = Some(cdc);
+        self
+    }
+
+    /// Builder-style (Δ.X1.2): per-target user-declared primary
+    /// keys. The streaming runtime applies these atop the
+    /// reflected spec before calling
+    /// [`Backend::run_cdc`] — required for Delta and any other
+    /// backend that can't surface PK info via reflection.
+    /// Indexed in parallel with the pipeline's `targets`.
+    pub fn with_target_primary_keys(mut self, pks: Vec<Vec<String>>) -> Self {
+        self.target_primary_keys = pks;
         self
     }
 
@@ -701,14 +731,51 @@ impl StreamingPipeline {
     /// once. Called from the CDC dispatch branch on the first
     /// non-empty batch; subsequent batches reuse the cached
     /// `Vec<TableSpec>`. Order matches `self.targets`.
+    ///
+    /// Δ.X1.2: after reflection, augment each spec with the
+    /// user-declared `target_primary_keys[i]` (when set) — Delta
+    /// and other backends that can't surface PK info natively
+    /// rely on this path so `Backend::run_cdc` sees a usable
+    /// spec.
     async fn ensure_cdc_target_specs(
         &self,
     ) -> Result<&Vec<crate::types::TableSpec>, BackendError> {
         self.cdc_target_specs
             .get_or_try_init(|| async {
                 let mut out = Vec::with_capacity(self.targets.len());
-                for (backend, table) in &self.targets {
-                    let spec = backend.reflect_table_spec(table).await?;
+                for (i, (backend, table)) in self.targets.iter().enumerate() {
+                    let mut spec = backend.reflect_table_spec(table).await?;
+                    if let Some(declared) = self.config.target_primary_keys.get(i)
+                        && !declared.is_empty()
+                    {
+                        // Validate every declared PK column exists
+                        // in the reflected schema before mutating —
+                        // a typo'd column name should fail loud,
+                        // not silently devolve to "no PK detected"
+                        // at the run_cdc level.
+                        for pk in declared {
+                            if !spec.columns.iter().any(|c| &c.name == pk) {
+                                return Err(BackendError::Other(format!(
+                                    "target_primary_keys declares column '{pk}' \
+                                     for {schema}.{name}, but reflect_table_spec \
+                                     returned no such column. Check the \
+                                     `[target.table].primary_key` TOML field or \
+                                     `@ematix.table(primary_key=...)` decorator \
+                                     against the live target schema.",
+                                    schema = table.schema,
+                                    name = table.name,
+                                )));
+                            }
+                        }
+                        // Apply: any column whose name is in the
+                        // declared list flips primary_key=true,
+                        // overriding whatever reflection produced.
+                        for col in spec.columns.iter_mut() {
+                            if declared.iter().any(|n| n == &col.name) {
+                                col.primary_key = true;
+                            }
+                        }
+                    }
                     out.push(spec);
                 }
                 Ok::<_, BackendError>(out)
@@ -2021,6 +2088,11 @@ mod tests {
             // spec via `set_table_spec`; otherwise the trait
             // default ("not implemented") fires.
             table_spec: Mutex<Option<crate::types::TableSpec>>,
+            // Δ.X1.2: PK-column names from the spec each run_cdc
+            // call received. Empty inner Vec = no PK on the spec
+            // (the case Δ.X1.2 routes around for Delta-style
+            // backends that can't reflect PKs).
+            cdc_call_pk_names: Mutex<Vec<Vec<String>>>,
         }
 
         impl TestBackend {
@@ -2034,6 +2106,7 @@ mod tests {
                     cdc_calls: Mutex::new(Vec::new()),
                     cdc_result: Mutex::new(crate::backend::CdcRunResult::default()),
                     table_spec: Mutex::new(None),
+                    cdc_call_pk_names: Mutex::new(Vec::new()),
                 }
             }
 
@@ -2063,6 +2136,10 @@ mod tests {
 
             fn set_table_spec(&self, spec: crate::types::TableSpec) {
                 *self.table_spec.lock().unwrap() = Some(spec);
+            }
+
+            fn cdc_call_pk_names(&self) -> Vec<Vec<String>> {
+                self.cdc_call_pk_names.lock().unwrap().clone()
             }
         }
 
@@ -2176,7 +2253,7 @@ mod tests {
 
             async fn run_cdc(
                 &self,
-                _spec: &crate::types::TableSpec,
+                spec: &crate::types::TableSpec,
                 batch: RecordBatch,
                 _cdc_config: &crate::cdc::CdcConfig,
                 _pipeline_name: &str,
@@ -2185,6 +2262,13 @@ mod tests {
                     .lock()
                     .unwrap()
                     .push((self.label.clone(), batch.num_rows()));
+                let pks: Vec<String> = spec
+                    .columns
+                    .iter()
+                    .filter(|c| c.primary_key)
+                    .map(|c| c.name.clone())
+                    .collect();
+                self.cdc_call_pk_names.lock().unwrap().push(pks);
                 Ok(self.cdc_result.lock().unwrap().clone())
             }
 
@@ -2946,6 +3030,137 @@ mod tests {
             assert!(
                 target.cdc_calls().is_empty(),
                 "no CDC apply attempted when reflection fails"
+            );
+        }
+
+        /// Δ.X1.2: when a target's `reflect_table_spec` returns
+        /// columns with `primary_key = false` (the Delta case —
+        /// Delta tables don't carry PK constraints), the user's
+        /// declared `target_primary_keys` augments the reflected
+        /// spec before it's handed to `run_cdc`. Without this
+        /// path, Delta-style backends are unusable from the
+        /// streaming runtime.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn cdc_dispatch_augments_pk_from_user_declaration() {
+            use crate::backend::CdcRunResult;
+            use crate::cdc::{CdcConfig, EnvelopeKind};
+            use crate::types::{ColumnSpec, ColumnType, TableSpec};
+
+            let source = Arc::new(TestBackend::new("src"));
+            source.enqueue_read(vec![one_row_batch(1)]);
+
+            let target = Arc::new(TestBackend::new("mirror"));
+            // Delta-style reflection: every column reports
+            // primary_key = false because the backend can't see
+            // PK constraints natively.
+            target.set_table_spec(TableSpec {
+                schema: "public".into(),
+                name: "customers".into(),
+                columns: vec![
+                    ColumnSpec {
+                        name: "id".into(),
+                        ty: ColumnType::BigInt,
+                        nullable: false,
+                        primary_key: false,
+                    },
+                    ColumnSpec {
+                        name: "email".into(),
+                        ty: ColumnType::Text,
+                        nullable: true,
+                        primary_key: false,
+                    },
+                ],
+                unique_constraints: Vec::new(),
+                fingerprint: String::new(),
+            });
+            target.set_cdc_result(CdcRunResult {
+                run_id: "fake".into(),
+                creates: 1,
+                ..Default::default()
+            });
+
+            let table = TargetTable {
+                schema: "public".into(),
+                name: "customers".into(),
+            };
+            let cdc = CdcConfig::for_envelope(EnvelopeKind::Debezium);
+            let cfg = StreamingPipelineConfig::new("topic", table.clone(), "p")
+                .with_cdc(cdc)
+                .with_target_primary_keys(vec![vec!["id".to_string()]]);
+            let pipeline = StreamingPipeline::new(
+                source as Arc<dyn Backend>,
+                vec![(target.clone() as Arc<dyn Backend>, table)],
+                cfg,
+            );
+
+            let (sig, trigger) = ShutdownSignal::new();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                trigger.trigger();
+            });
+            pipeline.run(sig).await.expect("pipeline.run");
+
+            let pk_names = target.cdc_call_pk_names();
+            assert_eq!(
+                pk_names,
+                vec![vec!["id".to_string()]],
+                "user-declared PK must be applied to the spec before run_cdc \
+                 even though reflect_table_spec returned no PK columns"
+            );
+        }
+
+        /// Δ.X1.2: a user-declared PK column that doesn't match
+        /// any reflected column is a config error — fail loud,
+        /// not silent. Otherwise typos hide as "no PK detected".
+        #[tokio::test(flavor = "multi_thread")]
+        async fn cdc_dispatch_errors_when_declared_pk_missing_from_schema() {
+            use crate::cdc::{CdcConfig, EnvelopeKind};
+            use crate::types::{ColumnSpec, ColumnType, TableSpec};
+
+            let source = Arc::new(TestBackend::new("src"));
+            source.enqueue_read(vec![one_row_batch(1)]);
+
+            let target = Arc::new(TestBackend::new("mirror"));
+            target.set_table_spec(TableSpec {
+                schema: "public".into(),
+                name: "customers".into(),
+                columns: vec![ColumnSpec {
+                    name: "id".into(),
+                    ty: ColumnType::BigInt,
+                    nullable: false,
+                    primary_key: false,
+                }],
+                unique_constraints: Vec::new(),
+                fingerprint: String::new(),
+            });
+
+            let table = TargetTable {
+                schema: "public".into(),
+                name: "customers".into(),
+            };
+            let cdc = CdcConfig::for_envelope(EnvelopeKind::Debezium);
+            let cfg = StreamingPipelineConfig::new("topic", table.clone(), "p")
+                .with_cdc(cdc)
+                .with_target_primary_keys(vec![vec!["customer_id".to_string()]]);
+            let pipeline = StreamingPipeline::new(
+                source as Arc<dyn Backend>,
+                vec![(target.clone() as Arc<dyn Backend>, table)],
+                cfg,
+            );
+
+            let (sig, _trigger) = ShutdownSignal::new();
+            let err = pipeline
+                .run(sig)
+                .await
+                .expect_err("typo'd PK declaration must error");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("customer_id"),
+                "error must name the missing PK column, got: {msg}"
+            );
+            assert!(
+                target.cdc_calls().is_empty(),
+                "no CDC apply attempted when PK declaration is invalid"
             );
         }
     }

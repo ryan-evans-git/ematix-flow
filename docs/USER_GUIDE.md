@@ -1040,6 +1040,48 @@ form: `after.<pk_col>`. The parser falls back to
 | `schema_evolution` | `"skip"` | `"fail"` aborts the batch on first unknown column |
 | `out_of_order_tolerance_ms` | `5000` | Reserved for future warn-on-backwards window — the gate is strict-monotonic today |
 
+### Declaring the target's primary key
+
+CDC needs to know which columns make up the target table's
+primary key — that's what the apply layer joins on. For
+**Postgres** targets, `information_schema` surfaces PK info via
+reflection automatically; you don't need to declare anything.
+
+For **Delta Lake** (and any other target whose schema doesn't
+carry PK constraints) you must declare the PK on the target.
+Three equivalent paths:
+
+```toml
+# 1. TOML
+[target.table]
+schema      = "default"
+name        = "customers"
+primary_key = ["id"]
+```
+
+```python
+# 2. Typed-Python multi-target
+from ematix_flow.streaming import Target
+targets = [
+    Target(connection=lake, table=("default", "customers"), primary_key=["id"]),
+]
+```
+
+```python
+# 3. Typed-Python single-target legacy kwargs
+run_streaming_pipeline(
+    target=lake, target_table=("default", "customers"),
+    target_primary_key=["id"],
+    ...
+)
+```
+
+The streaming runtime augments the reflected schema with this
+declaration before dispatching to `Backend::run_cdc`. A
+typo'd column name (one that doesn't exist in the live target)
+fails loud at startup with a message naming the offending
+column.
+
 ### Cross-validation
 
 `[transform.cdc]` is mutually exclusive with:
@@ -1069,7 +1111,7 @@ counters under `pipeline=<name>`:
 | Target | Status | Notes |
 |---|---|---|
 | **Postgres** | Shipped (Δ PR 3 + 4 + 5 + 5.5) | Full per-event apply with idempotency gate, schema-evolution detection, and streaming-runtime dispatch. |
-| **Delta Lake** | Shipped (Δ.X1 PR 1) | Single-MERGE-per-batch via `DeltaOps::merge`; within-batch dedupe by newest ts; auto-schema-evolution under Skip policy. Direct `Backend::run_cdc` calls work; streaming-runtime auto-dispatch waits on Δ.X1.2 (PK reflection through Delta table properties). |
+| **Delta Lake** | Shipped (Δ.X1 PR 1 + Δ.X1.2) | Single-MERGE-per-batch via `DeltaOps::merge`; within-batch dedupe by newest ts; auto-schema-evolution under Skip policy. Streaming-runtime dispatch via `flow consume` works end-to-end — declare the PK on `[target.table].primary_key = [...]` (Delta tables don't carry PK constraints natively). |
 | **DuckDB / SQLite / MySQL** | Catalogued (Δ.X2) | Same per-event-statement shape as Postgres; differs only in UPSERT keyword + JSON-extract primitive. ~1–2 days each. |
 | **Object stores** | Deferred (Δ.X3) | Parquet / CSV / JSON / ORC are immutable — recommend Delta-on-S3 (Δ.X1) instead. |
 

@@ -1879,12 +1879,24 @@ impl From<ObjectFormatConfig> for ObjectFormat {
 }
 
 /// `(schema, name)` pair used by DB targets. Maps onto
-/// [`TargetTable`].
+/// [`TargetTable`]. Δ.X1.2 added the optional `primary_key`
+/// field so users can declare PK columns when reflecting from
+/// backends that can't surface them natively (Delta tables don't
+/// carry PK constraints).
 #[derive(Debug, Clone, Deserialize)]
 pub struct TableSpecConfig {
     #[serde(default)]
     pub schema: String,
     pub name: String,
+    /// Δ.X1.2: optional user-declared primary-key column list.
+    /// Required for CDC pipelines whose target backend can't
+    /// surface PK info via reflection (Delta, object stores).
+    /// Ignored for Postgres CDC, where `information_schema`
+    /// already provides PK info — but specifying it does no
+    /// harm: the reflected spec already has those columns
+    /// flagged.
+    #[serde(default)]
+    pub primary_key: Vec<String>,
 }
 
 impl PipelineCliConfig {
@@ -2281,6 +2293,27 @@ impl PipelineCliConfig {
             return vec![t];
         }
         self.targets.iter().collect()
+    }
+
+    /// Δ.X1.2: per-target user-declared primary-key column lists,
+    /// in the same order as [`Self::targets`]. Empty inner Vec
+    /// for targets without a table (Kafka / RabbitMQ / Pub/Sub /
+    /// Kinesis / object stores) or for tables that didn't declare
+    /// `primary_key` in the TOML — the streaming runtime falls
+    /// back to the reflected spec in those cases.
+    pub fn target_primary_keys(&self) -> Vec<Vec<String>> {
+        self.targets()
+            .iter()
+            .map(|t| match t {
+                TargetConfig::Postgres { table, .. }
+                | TargetConfig::Mysql { table, .. }
+                | TargetConfig::Sqlite { table, .. }
+                | TargetConfig::Duckdb { table, .. }
+                | TargetConfig::DeltaLocal { table, .. }
+                | TargetConfig::DeltaS3 { table, .. } => table.primary_key.clone(),
+                _ => Vec::new(),
+            })
+            .collect()
     }
 
     /// Π.5: enumerate inline-credential patterns in this config that
@@ -2755,6 +2788,16 @@ impl PipelineCliConfig {
                 let cdc_core = cdc_toml_to_core(cdc_toml)
                     .expect("CDC config translation already validated at config-load");
                 cfg = cfg.with_cdc(cdc_core);
+                // Δ.X1.2: thread per-target user-declared PKs
+                // through. Required for Delta CDC (Delta tables
+                // don't carry PK constraints natively); harmless
+                // for Postgres CDC (Postgres reflects PK info
+                // natively — declared list either matches or
+                // gets validated against the live schema).
+                let pks = self.target_primary_keys();
+                if pks.iter().any(|p| !p.is_empty()) {
+                    cfg = cfg.with_target_primary_keys(pks);
+                }
                 return cfg;
             }
             // SQL pre-stage. Empty `sql` means "no pre-stage" — only
