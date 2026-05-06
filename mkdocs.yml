@@ -14,6 +14,12 @@ docs_dir: docs
 
 theme:
   name: material
+  # Custom partial template overrides (live in /overrides/). Used
+  # to inject Google Search Console + Bing Webmaster verification
+  # meta tags into <head> — see overrides/main.html for the
+  # one-time setup steps. Tokens are commented out by default so
+  # the deployed HTML is clean until real values land.
+  custom_dir: overrides
   palette:
     - media: "(prefers-color-scheme: light)"
       scheme: default
