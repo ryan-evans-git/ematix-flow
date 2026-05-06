@@ -8,8 +8,9 @@
 //! `[transform.cdc]` TOML block — peer-equivalent paths into
 //! this same struct.
 //!
-//! ## What ships in PR 1 (this commit): scaffolding only
+//! ## What ships so far
 //!
+//! **PR 1** — config scaffolding:
 //! - [`CdcConfig`] struct + the [`EnvelopeKind`] / [`CdcOp`] /
 //!   [`DeleteMode`] / [`SchemaEvolutionPolicy`] enums.
 //! - Canonical field-mapping defaults for Debezium and Maxwell
@@ -18,9 +19,17 @@
 //!   through the same `BackendConfig` round-trip the rest of
 //!   the connector trait uses.
 //!
-//! Execution (per-op dispatch via [`Backend::run_cdc`],
-//! envelope parsing, idempotency via the StateStore, schema
-//! evolution detection) lands in PRs 2–5 per the plan.
+//! **PR 2** — envelope parser:
+//! - [`CdcEvent`] — the post-resolution event shape (op + key +
+//!   ts + before/after JSON objects) the PR 3 executor consumes.
+//! - [`parse_event`] — pure function from a decoded JSON row
+//!   to a [`CdcEvent`]. Handles tombstones (returns `None`),
+//!   delete-side key fallback (`after.id` → `before.id`), and
+//!   Maxwell's seconds-vs-milliseconds timestamp wart.
+//!
+//! Still to come: per-op dispatch via `Backend::run_cdc` (PR 3),
+//! idempotency via the StateStore (PR 4), schema-evolution
+//! detection (PR 5).
 //!
 //! Plan: `docs/PHASE_DELTA_CDC_PLAN.md`.
 
@@ -320,6 +329,245 @@ impl Default for CdcConfig {
     }
 }
 
+// =================================================================
+// Phase Δ PR 2 — envelope parser
+// =================================================================
+//
+// Operates on `serde_json::Value` rows so it's independent of the
+// upstream wire format (Avro / JSON / Protobuf all decode to JSON-
+// equivalent structs once SR-aware decoding has happened in the
+// Kafka source). The PR 3 executor reads RecordBatches off the
+// streaming source, converts each row to `serde_json::Map<String,
+// Value>` via `arrow_json`, then feeds the row here.
+
+use serde_json::{Map, Value};
+
+/// One parsed CDC event, post envelope-resolution. The PR 3
+/// executor consumes these — groups by op, dispatches to the
+/// per-op strategy executor, and atomically commits the
+/// resulting target writes alongside the StateStore offset.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CdcEvent {
+    /// Canonicalised operation. The wire-format op string was
+    /// looked up in [`CdcConfig::op_map`] to produce this.
+    pub op: CdcOp,
+    /// Primary-key value extracted from the configured `key_field`.
+    /// Stored as JSON so composite keys (objects) and scalar keys
+    /// share a representation. The executor uses this verbatim as
+    /// the StateStore lookup key + the target-side WHERE clause
+    /// value.
+    pub key: Value,
+    /// Per-event timestamp from `ts_field`, in milliseconds. `None`
+    /// when the config doesn't have a `ts_field` set, OR when the
+    /// resolved value isn't a number; the executor falls back to
+    /// processing time for idempotency in that case (with a
+    /// `tracing::warn!`).
+    pub ts_ms: Option<i64>,
+    /// Post-image (the `after` payload). For `Delete` ops with no
+    /// `after` payload (Debezium delete records have null `after`)
+    /// this is `None` and the executor reads from `before` instead.
+    pub after: Option<Map<String, Value>>,
+    /// Pre-image (the `before` payload). `None` for inserts /
+    /// snapshot reads where the source row didn't exist before.
+    pub before: Option<Map<String, Value>>,
+}
+
+/// Errors specific to envelope parsing. Distinct from
+/// [`crate::backend::BackendError`] so the executor can choose to
+/// handle parse errors differently from backend errors (e.g.
+/// route to DLQ instead of failing the pipeline).
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum CdcParseError {
+    /// The configured `op_field` path didn't resolve to a string,
+    /// or resolved to a string not present in `op_map`.
+    #[error("CDC envelope: op_field {path:?} → {value:?} not in op_map")]
+    UnknownOp { path: String, value: String },
+
+    /// A path required to extract data didn't resolve (e.g.
+    /// `key_field = "after.id"` but the row has no `after` column,
+    /// or the `after` struct has no `id` field). Different from
+    /// "resolved-but-null" — that's allowed for optional paths.
+    #[error("CDC envelope: required path {path:?} not present in row")]
+    MissingPath { path: String },
+
+    /// A path resolved but the value's type is wrong for the
+    /// expected use (e.g. `op_field` resolved to a number).
+    #[error("CDC envelope: path {path:?} resolved to wrong type ({reason})")]
+    WrongType { path: String, reason: String },
+}
+
+/// Parse one decoded row into a [`CdcEvent`].
+///
+/// Returns:
+/// - `Ok(Some(event))` — successful parse, executor applies it.
+/// - `Ok(None)` — tombstone (Debezium emits a record with a null
+///   value after each delete). Executor skips.
+/// - `Err(...)` — malformed envelope (unknown op, missing
+///   required field). Executor's `transform_on_error` policy
+///   decides: fail the pipeline / drop the row / route to DLQ.
+///
+/// Path semantics: dot-delimited dot-paths like `"after.id"` walk
+/// nested JSON objects. A leaf value of `null` is *not* a missing
+/// path — `Value::Null` is preserved (the executor uses it for
+/// nullable column INSERTs). Missing keys mid-path raise
+/// [`CdcParseError::MissingPath`].
+pub fn parse_event(
+    row: &Map<String, Value>,
+    cfg: &CdcConfig,
+) -> Result<Option<CdcEvent>, CdcParseError> {
+    // Tombstone detection: a row that's empty (post-delete null
+    // payload from Debezium, decoded as an empty map by the
+    // upstream JSON layer) skips. We don't trust just `op` being
+    // missing because some Avro decoders emit `op = ""` on
+    // tombstones — empty-row check is the most reliable signal.
+    if row.is_empty() {
+        return Ok(None);
+    }
+
+    let row_value = Value::Object(row.clone());
+
+    // Extract op. The op_field path *must* resolve to a string.
+    let op_value =
+        resolve_path(&row_value, &cfg.op_field).ok_or_else(|| CdcParseError::MissingPath {
+            path: cfg.op_field.clone(),
+        })?;
+    let op_str = op_value.as_str().ok_or_else(|| CdcParseError::WrongType {
+        path: cfg.op_field.clone(),
+        reason: format!("expected string, got {}", json_type_name(op_value)),
+    })?;
+    let op = cfg
+        .op_map
+        .get(op_str)
+        .copied()
+        .ok_or_else(|| CdcParseError::UnknownOp {
+            path: cfg.op_field.clone(),
+            value: op_str.to_string(),
+        })?;
+
+    // Extract after. Required path, but Delete ops legitimately
+    // have null/missing after — try both before/after for the key
+    // extraction below.
+    let after = extract_object_at(&row_value, &cfg.after_field);
+
+    // Extract before — optional even if `before_field` is set,
+    // because inserts have null before.
+    let before = cfg
+        .before_field
+        .as_deref()
+        .and_then(|p| extract_object_at(&row_value, p));
+
+    // Extract key. For deletes with null `after`, fall back to
+    // the same path on `before` — the canonical Debezium form
+    // ships PK in both pre- and post-image. The fallback only
+    // kicks in when the original key_field path resolves to
+    // null/missing AND we have a before image.
+    let key = match resolve_path(&row_value, &cfg.key_field) {
+        Some(v) if !v.is_null() => v.clone(),
+        _ => {
+            // Try the equivalent before-side path. Debezium's
+            // canonical key_field is `"after.id"` — for deletes
+            // we want `"before.id"`. Substitute the path's first
+            // segment if before_field is configured.
+            if let (Some(before_root), Some((_, rest))) =
+                (cfg.before_field.as_deref(), cfg.key_field.split_once('.'))
+            {
+                let fallback_path = format!("{before_root}.{rest}");
+                resolve_path(&row_value, &fallback_path)
+                    .filter(|v| !v.is_null())
+                    .cloned()
+                    .ok_or_else(|| CdcParseError::MissingPath {
+                        path: cfg.key_field.clone(),
+                    })?
+            } else {
+                return Err(CdcParseError::MissingPath {
+                    path: cfg.key_field.clone(),
+                });
+            }
+        }
+    };
+
+    // Extract ts. Optional. Best-effort numeric coercion: integer
+    // ms (Debezium), integer seconds (Maxwell — auto-coerced to ms
+    // by multiplying), or string-encoded number. Anything we can't
+    // coerce to i64 yields `None` so the executor falls back to
+    // processing time.
+    let ts_ms = cfg.ts_field.as_deref().and_then(|p| {
+        let v = resolve_path(&row_value, p)?;
+        match v {
+            Value::Number(n) => {
+                let ms = n.as_i64()?;
+                // Maxwell ships seconds; Debezium ms. Heuristic:
+                // values < 10^11 (≈ 5138 AD in seconds) are likely
+                // seconds, scale up. Values ≥ 10^11 stay ms.
+                if ms < 100_000_000_000 {
+                    Some(ms.checked_mul(1_000)?)
+                } else {
+                    Some(ms)
+                }
+            }
+            Value::String(s) => s.parse().ok(),
+            _ => None,
+        }
+    });
+
+    Ok(Some(CdcEvent {
+        op,
+        key,
+        ts_ms,
+        after,
+        before,
+    }))
+}
+
+/// Walk a dot-delimited path through a `serde_json::Value`.
+/// Returns `None` if any segment is missing or a non-object is
+/// indexed; returns `Some(&Value::Null)` if a segment resolves to
+/// an explicit JSON null. The caller distinguishes the two — for
+/// required paths a missing segment is an error, but a
+/// resolved-null is a legitimate value.
+fn resolve_path<'a>(root: &'a Value, path: &str) -> Option<&'a Value> {
+    let mut current = root;
+    for segment in path.split('.') {
+        if segment.is_empty() {
+            return None;
+        }
+        match current {
+            Value::Object(map) => match map.get(segment) {
+                Some(v) => current = v,
+                None => return None,
+            },
+            // Indexing into a non-object (or null) — path doesn't
+            // resolve. The executor reports this as a parse error
+            // for required fields.
+            _ => return None,
+        }
+    }
+    Some(current)
+}
+
+/// Resolve a path expected to point at a JSON object (struct).
+/// Returns `None` if the path is missing OR resolves to null OR
+/// resolves to a non-object value. This is the right shape for
+/// `before` / `after` extraction since both should be either a
+/// struct or absent.
+fn extract_object_at(root: &Value, path: &str) -> Option<Map<String, Value>> {
+    match resolve_path(root, path)? {
+        Value::Object(map) => Some(map.clone()),
+        _ => None,
+    }
+}
+
+fn json_type_name(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "null",
+        Value::Bool(_) => "bool",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -438,5 +686,319 @@ mod tests {
     fn out_of_order_tolerance_default_5s() {
         let cfg = CdcConfig::default();
         assert_eq!(cfg.out_of_order_tolerance_ms, 5_000);
+    }
+
+    // -------------------------------------------------------------
+    // PR 2 — envelope-parser tests.
+    //
+    // Hand-crafted JSON values representative of real Debezium /
+    // Maxwell payloads. The PR 3 executor will exercise the
+    // Arrow-row → JSON conversion separately; these tests pin the
+    // envelope-resolution logic in isolation.
+    // -------------------------------------------------------------
+
+    use serde_json::json;
+
+    fn debezium_insert_row() -> Map<String, Value> {
+        // Canonical Debezium INSERT for a Postgres source.
+        json!({
+            "before": null,
+            "after": {"id": 42, "email": "alice@example.com", "name": "Alice"},
+            "source": {"ts_ms": 1_700_000_000_000_i64, "db": "shop", "table": "customers"},
+            "op": "c",
+            "ts_ms": 1_700_000_000_001_i64,
+        })
+        .as_object()
+        .unwrap()
+        .clone()
+    }
+
+    fn debezium_update_row() -> Map<String, Value> {
+        json!({
+            "before": {"id": 42, "email": "alice@example.com", "name": "Alice"},
+            "after": {"id": 42, "email": "alice@example.com", "name": "Alice Smith"},
+            "source": {"ts_ms": 1_700_000_005_000_i64, "db": "shop", "table": "customers"},
+            "op": "u",
+            "ts_ms": 1_700_000_005_001_i64,
+        })
+        .as_object()
+        .unwrap()
+        .clone()
+    }
+
+    fn debezium_delete_row() -> Map<String, Value> {
+        // Debezium delete: `after` is null, `before` carries the
+        // old row (including the PK).
+        json!({
+            "before": {"id": 42, "email": "alice@example.com", "name": "Alice Smith"},
+            "after": null,
+            "source": {"ts_ms": 1_700_000_010_000_i64, "db": "shop", "table": "customers"},
+            "op": "d",
+            "ts_ms": 1_700_000_010_001_i64,
+        })
+        .as_object()
+        .unwrap()
+        .clone()
+    }
+
+    fn debezium_snapshot_row() -> Map<String, Value> {
+        // Debezium emits `r` while replaying the initial snapshot.
+        json!({
+            "before": null,
+            "after": {"id": 1, "email": "first@example.com", "name": "First"},
+            "source": {"ts_ms": 1_700_000_000_000_i64, "snapshot": "true"},
+            "op": "r",
+            "ts_ms": 1_700_000_000_000_i64,
+        })
+        .as_object()
+        .unwrap()
+        .clone()
+    }
+
+    fn debezium_cfg_with_pk(pk: &str) -> CdcConfig {
+        let mut cfg = CdcConfig::for_envelope(EnvelopeKind::Debezium);
+        cfg.key_field = format!("after.{pk}");
+        cfg
+    }
+
+    #[test]
+    fn parse_debezium_insert() {
+        let cfg = debezium_cfg_with_pk("id");
+        let row = debezium_insert_row();
+        let event = parse_event(&row, &cfg).unwrap().expect("non-tombstone");
+        assert_eq!(event.op, CdcOp::Create);
+        assert_eq!(event.key, json!(42));
+        assert_eq!(event.ts_ms, Some(1_700_000_000_000));
+        let after = event.after.expect("after present");
+        assert_eq!(after.get("name"), Some(&json!("Alice")));
+        assert!(event.before.is_none(), "INSERT has no before image");
+    }
+
+    #[test]
+    fn parse_debezium_update() {
+        let cfg = debezium_cfg_with_pk("id");
+        let row = debezium_update_row();
+        let event = parse_event(&row, &cfg).unwrap().expect("non-tombstone");
+        assert_eq!(event.op, CdcOp::Update);
+        assert_eq!(event.key, json!(42));
+        let before = event.before.expect("before present on update");
+        assert_eq!(before.get("name"), Some(&json!("Alice")));
+        let after = event.after.expect("after present on update");
+        assert_eq!(after.get("name"), Some(&json!("Alice Smith")));
+    }
+
+    #[test]
+    fn parse_debezium_delete_falls_back_to_before_for_key() {
+        let cfg = debezium_cfg_with_pk("id");
+        let row = debezium_delete_row();
+        let event = parse_event(&row, &cfg).unwrap().expect("non-tombstone");
+        assert_eq!(event.op, CdcOp::Delete);
+        // key_field = "after.id" but `after` is null on delete →
+        // parser falls back to `before.id`. Lock the contract.
+        assert_eq!(event.key, json!(42));
+        assert!(event.after.is_none(), "DELETE has null after");
+        let before = event.before.expect("before present on delete");
+        assert_eq!(before.get("id"), Some(&json!(42)));
+    }
+
+    #[test]
+    fn parse_debezium_snapshot_read_routes_to_read_op() {
+        let cfg = debezium_cfg_with_pk("id");
+        let row = debezium_snapshot_row();
+        let event = parse_event(&row, &cfg).unwrap().expect("non-tombstone");
+        assert_eq!(event.op, CdcOp::Read, "snapshot row maps to Read");
+        assert_eq!(event.key, json!(1));
+    }
+
+    #[test]
+    fn parse_tombstone_returns_none() {
+        // Tombstone after delete — empty payload after upstream
+        // null-payload decode. Parser returns None; executor skips.
+        let cfg = debezium_cfg_with_pk("id");
+        let row = Map::new();
+        let result = parse_event(&row, &cfg).unwrap();
+        assert!(result.is_none(), "tombstone → Ok(None)");
+    }
+
+    #[test]
+    fn parse_unknown_op_string_errors() {
+        let cfg = debezium_cfg_with_pk("id");
+        let mut row = debezium_insert_row();
+        row.insert("op".into(), json!("WAT"));
+        let err = parse_event(&row, &cfg).unwrap_err();
+        match err {
+            CdcParseError::UnknownOp { value, .. } => assert_eq!(value, "WAT"),
+            other => panic!("expected UnknownOp, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_op_with_wrong_type_errors() {
+        let cfg = debezium_cfg_with_pk("id");
+        let mut row = debezium_insert_row();
+        row.insert("op".into(), json!(42)); // op as number, not string
+        let err = parse_event(&row, &cfg).unwrap_err();
+        match err {
+            CdcParseError::WrongType { path, reason } => {
+                assert_eq!(path, "op");
+                assert!(reason.contains("number"), "reason: {reason}");
+            }
+            other => panic!("expected WrongType, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_missing_op_field_errors() {
+        let cfg = debezium_cfg_with_pk("id");
+        let mut row = debezium_insert_row();
+        row.remove("op");
+        let err = parse_event(&row, &cfg).unwrap_err();
+        match err {
+            CdcParseError::MissingPath { path } => assert_eq!(path, "op"),
+            other => panic!("expected MissingPath, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_maxwell_envelope() {
+        // Maxwell INSERT shape:
+        //   { type: "insert", database: "shop", table: "customers",
+        //     ts: 1700000000, data: {id:1, name:"x"} }
+        // Note: ts in seconds, not ms — parser auto-scales.
+        let cfg = CdcConfig::for_envelope(EnvelopeKind::Maxwell);
+        let row = json!({
+            "type": "insert",
+            "database": "shop",
+            "table": "customers",
+            "ts": 1_700_000_000_i64,
+            "data": {"id": 7, "name": "Maxine"},
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+
+        let event = parse_event(&row, &cfg).unwrap().expect("non-tombstone");
+        assert_eq!(event.op, CdcOp::Create);
+        assert_eq!(event.key, json!(7));
+        // Maxwell ships seconds; parser scales to ms.
+        assert_eq!(event.ts_ms, Some(1_700_000_000_000));
+        let after = event.after.expect("data present");
+        assert_eq!(after.get("name"), Some(&json!("Maxine")));
+    }
+
+    #[test]
+    fn parse_maxwell_update_with_old_image() {
+        let cfg = CdcConfig::for_envelope(EnvelopeKind::Maxwell);
+        let row = json!({
+            "type": "update",
+            "database": "shop",
+            "table": "customers",
+            "ts": 1_700_000_005_i64,
+            "data": {"id": 7, "name": "Maxine Smith"},
+            "old":  {"name": "Maxine"},
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+
+        let event = parse_event(&row, &cfg).unwrap().expect("non-tombstone");
+        assert_eq!(event.op, CdcOp::Update);
+        assert_eq!(event.before.unwrap().get("name"), Some(&json!("Maxine")));
+        assert_eq!(
+            event.after.unwrap().get("name"),
+            Some(&json!("Maxine Smith"))
+        );
+    }
+
+    #[test]
+    fn parse_custom_envelope_with_explicit_paths() {
+        // Pretend we have an in-house CDC format that ships
+        // changes as `{action: "INSERT", new_state: {...}, ...}`.
+        let mut cfg = CdcConfig::for_envelope(EnvelopeKind::Custom);
+        cfg.op_field = "action".into();
+        cfg.before_field = Some("old_state".into());
+        cfg.after_field = "new_state".into();
+        cfg.key_field = "new_state.id".into();
+        cfg.ts_field = Some("changed_at_ms".into());
+        cfg.op_map.insert("INSERT".into(), CdcOp::Create);
+        cfg.op_map.insert("UPDATE".into(), CdcOp::Update);
+        cfg.op_map.insert("DELETE".into(), CdcOp::Delete);
+        cfg.validate().unwrap();
+
+        let row = json!({
+            "action": "INSERT",
+            "old_state": null,
+            "new_state": {"id": "u-001", "value": 1},
+            "changed_at_ms": 1_700_000_000_999_i64,
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+
+        let event = parse_event(&row, &cfg).unwrap().expect("non-tombstone");
+        assert_eq!(event.op, CdcOp::Create);
+        assert_eq!(event.key, json!("u-001"));
+        assert_eq!(event.ts_ms, Some(1_700_000_000_999));
+    }
+
+    #[test]
+    fn parse_path_resolution_handles_deep_nesting() {
+        // Some custom envelopes nest the op deeper. The dot-path
+        // resolver should handle arbitrary depth.
+        let mut cfg = CdcConfig::for_envelope(EnvelopeKind::Custom);
+        cfg.op_field = "envelope.metadata.op".into();
+        cfg.after_field = "payload.data".into();
+        cfg.key_field = "payload.data.id".into();
+        cfg.before_field = None;
+        cfg.ts_field = None;
+        cfg.op_map.insert("ins".into(), CdcOp::Create);
+        cfg.validate().unwrap();
+
+        let row = json!({
+            "envelope": {"metadata": {"op": "ins"}},
+            "payload": {"data": {"id": 99, "name": "deep"}},
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+
+        let event = parse_event(&row, &cfg).unwrap().expect("non-tombstone");
+        assert_eq!(event.op, CdcOp::Create);
+        assert_eq!(event.key, json!(99));
+        assert!(event.ts_ms.is_none(), "no ts_field configured → None");
+    }
+
+    #[test]
+    fn parse_ts_string_encoded_number_accepted() {
+        let mut cfg = CdcConfig::for_envelope(EnvelopeKind::Debezium);
+        cfg.key_field = "after.id".into();
+        let mut row = debezium_insert_row();
+        // Some Avro decoders emit ts_ms as a string. Parser
+        // tolerates that.
+        row.get_mut("source")
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .insert("ts_ms".into(), json!("1700000000000"));
+
+        let event = parse_event(&row, &cfg).unwrap().expect("non-tombstone");
+        assert_eq!(event.ts_ms, Some(1_700_000_000_000));
+    }
+
+    #[test]
+    fn parse_ts_unparseable_value_yields_none() {
+        // Parser is lenient about ts_field — unparseable values
+        // yield None; the executor falls back to processing time.
+        let mut cfg = CdcConfig::for_envelope(EnvelopeKind::Debezium);
+        cfg.key_field = "after.id".into();
+        let mut row = debezium_insert_row();
+        row.get_mut("source")
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .insert("ts_ms".into(), json!("not a number"));
+
+        let event = parse_event(&row, &cfg).unwrap().expect("non-tombstone");
+        assert!(event.ts_ms.is_none());
     }
 }
