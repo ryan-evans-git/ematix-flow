@@ -126,9 +126,21 @@ session + join), see **[`examples/`](examples/)**.
 
 ```python
 from typing import Annotated
-from ematix_flow import ematix, pk
+from ematix_flow import ematix, pk, register_connection
 from ematix_flow.types import BigInt, String, Text, TimestampTZ
 from ematix_flow.normalize import lower, trim, empty_to_null, parse_timestamp
+
+# Connection: declared in code via the `@ematix.connection` class-
+# body decorator. `${VAR}` interpolates from the environment at
+# backend-build time (so changing the env between definition and
+# run picks up the new value). `repr()` redacts secrets.
+# Alternatives — env-var only, project TOML file, or
+# `register_connection(PostgresConnection(...))` — are documented
+# below. All three feed the same registry.
+@ematix.connection
+class warehouse:
+    kind = "postgres"
+    url = "${EMATIX_FLOW_DSN}"
 
 @ematix.table(schema="analytics")
 class CustomerDim:
@@ -139,6 +151,7 @@ class CustomerDim:
 
 @ematix.pipeline(
     target=CustomerDim,
+    target_connection="warehouse",   # ← references the @ematix.connection above
     schedule="0 * * * *",
     mode="scd2",
     compare_columns=["email", "name"],
@@ -158,7 +171,13 @@ In the example above:
 |--|--|--|
 | The target table | `analytics.customer_dim` | `schema=` on `@ematix.table` + the class name (snake-cased: `CustomerDim` → `customer_dim`). Override the table name with `@ematix.table(schema=..., name="...")`. |
 | The source table | `raw.customers` | The SQL string returned from `sync_customers(conn)`. Could equally well be a join, a subquery with filters, etc. |
-| The database | The connection named `default` | The `conn` parameter is implicitly the *source* connection, resolved from the connection registry (see below). |
+| The database | The connection named `warehouse` | The `@ematix.connection` block at the top of the file registers it; `target_connection="warehouse"` on `@ematix.pipeline` references it by name. The `conn` parameter passed to `sync_customers` is the resolved *source* connection (defaults to the same as target unless `source_connection=` is set). |
+
+`target_connection=` is omittable. When omitted, the framework
+looks up the connection literally named `default` (which the
+env var `EMATIX_FLOW_DSN` populates) — handy for one-off
+scripts, but the explicit form above keeps the wiring obvious
+in code review.
 
 By default, source and target use the same connection (same DB → same-DB
 fast path: `INSERT … SELECT`). To cross databases, name them
