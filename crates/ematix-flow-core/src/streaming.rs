@@ -223,6 +223,16 @@ pub struct StreamingPipelineMetricsCounters {
     /// the special label value `"_global"` carries the
     /// `min(wm_i over non-idle)` aggregate.
     pub watermark_seconds: GaugeVec,
+    /// Phase Δ PR 5.5: CDC apply path counters. Zero on pipelines
+    /// without `[transform.cdc]` configured.
+    pub cdc_creates: IntCounter,
+    pub cdc_updates: IntCounter,
+    pub cdc_deletes: IntCounter,
+    /// Tombstones + envelope-parse failures.
+    pub cdc_skipped: IntCounter,
+    /// Events rejected by the per-PK last-seen-ts gate (PR 4) —
+    /// i.e. Kafka redeliveries that the executor already applied.
+    pub cdc_idempotent_skipped: IntCounter,
 }
 
 impl StreamingPipelineMetricsCounters {
@@ -278,6 +288,26 @@ impl StreamingPipelineMetricsCounters {
             idle_iterations: mk(
                 "ematix_streaming_idle_iterations_total",
                 "Total idle-batch iterations (source returned zero rows).",
+            ),
+            cdc_creates: mk(
+                "ematix_streaming_cdc_creates_total",
+                "Phase Δ: CDC INSERT/UPSERT applies (Create + Read ops).",
+            ),
+            cdc_updates: mk(
+                "ematix_streaming_cdc_updates_total",
+                "Phase Δ: CDC UPDATE applies.",
+            ),
+            cdc_deletes: mk(
+                "ematix_streaming_cdc_deletes_total",
+                "Phase Δ: CDC DELETE / soft-delete applies.",
+            ),
+            cdc_skipped: mk(
+                "ematix_streaming_cdc_skipped_total",
+                "Phase Δ: CDC tombstones + envelope-parse failures.",
+            ),
+            cdc_idempotent_skipped: mk(
+                "ematix_streaming_cdc_idempotent_skipped_total",
+                "Phase Δ: CDC events filtered by the per-PK last-seen-ts gate (Kafka redeliveries).",
             ),
             watermark_seconds,
             registry,
@@ -366,6 +396,14 @@ pub struct StreamingPipelineConfig {
     /// floor; per-emit commits still drive durability for active
     /// pipelines.
     pub checkpoint_interval_ms: Option<u64>,
+    /// Phase Δ PR 5.5: when `Some`, every batch is interpreted as
+    /// CDC envelopes (per [`crate::cdc::CdcConfig`]) and applied
+    /// via [`Backend::run_cdc`] instead of the universal
+    /// `write_arrow_stream` path. Mutually exclusive with
+    /// `transform` (CDC is itself a *transformation* of input
+    /// shape — windowing or SQL-projecting the envelope before
+    /// applying it would break the per-event semantics).
+    pub cdc: Option<crate::cdc::CdcConfig>,
 }
 
 /// Phase 39.5a P2.15: per-batch transform-error handling.
@@ -422,7 +460,17 @@ impl StreamingPipelineConfig {
             state_store: None,
             checkpoint_interval_ms: None,
             transform_on_error: TransformErrorPolicy::Fail,
+            cdc: None,
         }
+    }
+
+    /// Builder-style: opt the pipeline into CDC apply mode. Each
+    /// batch is parsed as `cdc.envelope`-shaped change events and
+    /// applied to every target via [`Backend::run_cdc`]. Phase Δ
+    /// PR 5.5.
+    pub fn with_cdc(mut self, cdc: crate::cdc::CdcConfig) -> Self {
+        self.cdc = Some(cdc);
+        self
     }
 
     /// Builder-style: install a transform-error policy. Defaults
@@ -559,6 +607,12 @@ pub struct StreamingPipeline {
     /// so the field is always indexable; updates are skipped when
     /// `config.watermark.is_none()`.
     watermark_state: Mutex<WatermarkState>,
+    /// Phase Δ PR 5.5: cached reflected `TableSpec` per target,
+    /// indexed parallel to `targets`. Populated lazily on the
+    /// first non-empty CDC batch via [`Backend::reflect_table_spec`]
+    /// so non-CDC pipelines never pay the reflection round-trip.
+    /// Empty when `config.cdc.is_none()`.
+    cdc_target_specs: tokio::sync::OnceCell<Vec<crate::types::TableSpec>>,
 }
 
 impl StreamingPipeline {
@@ -576,6 +630,7 @@ impl StreamingPipeline {
             config,
             metrics,
             watermark_state,
+            cdc_target_specs: tokio::sync::OnceCell::new(),
         }
     }
 
@@ -631,6 +686,7 @@ impl StreamingPipeline {
             config,
             metrics,
             watermark_state,
+            cdc_target_specs: tokio::sync::OnceCell::new(),
         }
     }
 
@@ -639,6 +695,25 @@ impl StreamingPipeline {
     /// scraper.
     pub fn metrics_registry(&self) -> &Registry {
         &self.metrics.registry
+    }
+
+    /// Phase Δ PR 5.5: lazy reflect each target's column set
+    /// once. Called from the CDC dispatch branch on the first
+    /// non-empty batch; subsequent batches reuse the cached
+    /// `Vec<TableSpec>`. Order matches `self.targets`.
+    async fn ensure_cdc_target_specs(
+        &self,
+    ) -> Result<&Vec<crate::types::TableSpec>, BackendError> {
+        self.cdc_target_specs
+            .get_or_try_init(|| async {
+                let mut out = Vec::with_capacity(self.targets.len());
+                for (backend, table) in &self.targets {
+                    let spec = backend.reflect_table_spec(table).await?;
+                    out.push(spec);
+                }
+                Ok::<_, BackendError>(out)
+            })
+            .await
     }
 
     /// Phase 39.5a: load committed state for `config.pipeline_name`
@@ -1024,26 +1099,89 @@ impl StreamingPipeline {
                 continue;
             }
 
-            // Π.4a: fan out to every target concurrently. Each
-            // target gets its own RecordBatch stream cloned from
-            // the source's batches. `join_all` (not try_join_all)
-            // runs every write to completion so we have full
-            // visibility into which targets succeeded — needed
-            // for the DLQ branch + for diagnostics on failure.
-            let writes = self.targets.iter().map(|(backend, table)| {
-                let batches_for_target: Vec<RecordBatch> = batches.clone();
-                let target_stream: ArrowBatchStream = Box::pin(futures_util::stream::iter(
-                    batches_for_target.into_iter().map(Ok),
-                ));
-                let mode = self.config.mode;
-                async move { backend.write_arrow_stream(table, target_stream, mode).await }
-            });
-            let results: Vec<Result<u64, BackendError>> =
-                futures_util::future::join_all(writes).await;
+            // Phase Δ PR 5.5: when `[transform.cdc]` is configured
+            // we route each batch through `Backend::run_cdc`
+            // (per-event CDC apply) instead of the universal
+            // `write_arrow_stream` append path. Reflects target
+            // schemas once on the first non-empty batch — non-CDC
+            // pipelines never pay the reflection round-trip.
+            let first_err: Option<BackendError> = if let Some(cdc) = self.config.cdc.as_ref() {
+                let specs = match self.ensure_cdc_target_specs().await {
+                    Ok(specs) => specs,
+                    Err(e) => {
+                        self.metrics.errors.inc();
+                        return Err(e);
+                    }
+                };
+                let runs = self
+                    .targets
+                    .iter()
+                    .zip(specs.iter())
+                    .map(|((backend, _table), spec)| {
+                        let batches_for_target: Vec<RecordBatch> = batches.clone();
+                        let pipeline_name = self.config.pipeline_name.clone();
+                        async move {
+                            let mut total = crate::backend::CdcRunResult::default();
+                            for batch in batches_for_target {
+                                let r = backend
+                                    .run_cdc(spec, batch, cdc, &pipeline_name)
+                                    .await?;
+                                total.creates += r.creates;
+                                total.updates += r.updates;
+                                total.deletes += r.deletes;
+                                total.skipped += r.skipped;
+                                total.idempotent_skipped += r.idempotent_skipped;
+                            }
+                            Ok::<_, BackendError>(total)
+                        }
+                    });
+                let results: Vec<Result<crate::backend::CdcRunResult, BackendError>> =
+                    futures_util::future::join_all(runs).await;
+                let mut first_err: Option<BackendError> = None;
+                for r in results {
+                    match r {
+                        Ok(t) => {
+                            self.metrics.cdc_creates.inc_by(t.creates as u64);
+                            self.metrics.cdc_updates.inc_by(t.updates as u64);
+                            self.metrics.cdc_deletes.inc_by(t.deletes as u64);
+                            self.metrics.cdc_skipped.inc_by(t.skipped as u64);
+                            self.metrics
+                                .cdc_idempotent_skipped
+                                .inc_by(t.idempotent_skipped as u64);
+                        }
+                        Err(e) if first_err.is_none() => first_err = Some(e),
+                        Err(_) => {}
+                    }
+                }
+                first_err
+            } else {
+                // Π.4a historical path: fan out the batches through
+                // the universal Arrow append. Each target gets its
+                // own RecordBatch stream cloned from the source's
+                // batches. `join_all` (not try_join_all) runs every
+                // write to completion so we have full visibility
+                // into which targets succeeded — needed for the
+                // DLQ branch + for diagnostics on failure.
+                let writes = self.targets.iter().map(|(backend, table)| {
+                    let batches_for_target: Vec<RecordBatch> = batches.clone();
+                    let target_stream: ArrowBatchStream = Box::pin(
+                        futures_util::stream::iter(batches_for_target.into_iter().map(Ok)),
+                    );
+                    let mode = self.config.mode;
+                    async move { backend.write_arrow_stream(table, target_stream, mode).await }
+                });
+                let results: Vec<Result<u64, BackendError>> =
+                    futures_util::future::join_all(writes).await;
+                results.into_iter().find_map(|r| r.err())
+            };
 
-            let first_err: Option<BackendError> = results.into_iter().find_map(|r| r.err());
             match first_err {
                 None => {
+                    // CDC counters above already record per-op
+                    // counts; for the universal path this is total
+                    // rows written. The two paths share
+                    // `rows_written` for the legacy "anything
+                    // landed at the target?" gauge.
                     self.metrics.rows_written.inc_by(n_rows_out);
                 }
                 Some(e) => {
@@ -1869,6 +2007,20 @@ mod tests {
             fail_next_write: Mutex<bool>,
             // Increments on every commit_offsets call.
             commits: Mutex<u32>,
+            // Phase Δ PR 5.5: each CDC dispatch records the per-call
+            // (table.name, batch row count) here; non-CDC pipelines
+            // never write to it. Lets the dispatch wiring be
+            // verified without spinning up testcontainers.
+            cdc_calls: Mutex<Vec<(String, usize)>>,
+            // Synthetic per-call result the stub returns. Defaults
+            // to a zero-row "all skipped" result; tests that care
+            // about counter propagation override via `set_cdc_result`.
+            cdc_result: Mutex<crate::backend::CdcRunResult>,
+            // Synthetic schema returned by `reflect_table_spec`.
+            // Tests that exercise the CDC dispatch path supply a
+            // spec via `set_table_spec`; otherwise the trait
+            // default ("not implemented") fires.
+            table_spec: Mutex<Option<crate::types::TableSpec>>,
         }
 
         impl TestBackend {
@@ -1879,6 +2031,9 @@ mod tests {
                     writes: Mutex::new(Vec::new()),
                     fail_next_write: Mutex::new(false),
                     commits: Mutex::new(0),
+                    cdc_calls: Mutex::new(Vec::new()),
+                    cdc_result: Mutex::new(crate::backend::CdcRunResult::default()),
+                    table_spec: Mutex::new(None),
                 }
             }
 
@@ -1896,6 +2051,18 @@ mod tests {
 
             fn commit_count(&self) -> u32 {
                 *self.commits.lock().unwrap()
+            }
+
+            fn cdc_calls(&self) -> Vec<(String, usize)> {
+                self.cdc_calls.lock().unwrap().clone()
+            }
+
+            fn set_cdc_result(&self, result: crate::backend::CdcRunResult) {
+                *self.cdc_result.lock().unwrap() = result;
+            }
+
+            fn set_table_spec(&self, spec: crate::types::TableSpec) {
+                *self.table_spec.lock().unwrap() = Some(spec);
             }
         }
 
@@ -2005,6 +2172,33 @@ mod tests {
             async fn commit_offsets(&self) -> Result<(), BackendError> {
                 *self.commits.lock().unwrap() += 1;
                 Ok(())
+            }
+
+            async fn run_cdc(
+                &self,
+                _spec: &crate::types::TableSpec,
+                batch: RecordBatch,
+                _cdc_config: &crate::cdc::CdcConfig,
+                _pipeline_name: &str,
+            ) -> Result<crate::backend::CdcRunResult, BackendError> {
+                self.cdc_calls
+                    .lock()
+                    .unwrap()
+                    .push((self.label.clone(), batch.num_rows()));
+                Ok(self.cdc_result.lock().unwrap().clone())
+            }
+
+            async fn reflect_table_spec(
+                &self,
+                target: &TargetTable,
+            ) -> Result<crate::types::TableSpec, BackendError> {
+                match self.table_spec.lock().unwrap().clone() {
+                    Some(spec) => Ok(spec),
+                    None => Err(BackendError::Other(format!(
+                        "TestBackend({}): no table_spec set for target {}.{}",
+                        self.label, target.schema, target.name
+                    ))),
+                }
             }
         }
 
@@ -2604,6 +2798,154 @@ mod tests {
             assert!(
                 !any_sample,
                 "no watermark samples should be emitted when watermark is disabled; got:\n{body}"
+            );
+        }
+
+        /// Phase Δ PR 5.5: when `[transform.cdc]` is configured, the
+        /// streaming pipeline routes each batch through
+        /// `Backend::run_cdc` instead of `write_arrow_stream`. This
+        /// test asserts the dispatch wiring + the per-counter metric
+        /// fold-in. Real Postgres execution of `run_cdc` is covered
+        /// by `tests/integration_pg.rs`.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn cdc_dispatch_routes_to_run_cdc() {
+            use crate::backend::CdcRunResult;
+            use crate::cdc::{CdcConfig, EnvelopeKind};
+            use crate::types::{ColumnSpec, ColumnType, TableSpec};
+
+            let source = Arc::new(TestBackend::new("src"));
+            // Two scripted batches → two CDC dispatches expected.
+            source.enqueue_read(vec![one_row_batch(1)]);
+            source.enqueue_read(vec![one_row_batch(2)]);
+
+            let target = Arc::new(TestBackend::new("mirror"));
+            target.set_table_spec(TableSpec {
+                schema: "public".into(),
+                name: "customers".into(),
+                columns: vec![ColumnSpec {
+                    name: "id".into(),
+                    ty: ColumnType::BigInt,
+                    nullable: false,
+                    primary_key: true,
+                }],
+                unique_constraints: Vec::new(),
+                fingerprint: String::new(),
+            });
+            // Per-call result the stub returns. Mix of every counter
+            // so we can verify each one folds into the pipeline's
+            // metrics.
+            target.set_cdc_result(CdcRunResult {
+                run_id: "fake".into(),
+                creates: 3,
+                updates: 2,
+                deletes: 1,
+                skipped: 4,
+                idempotent_skipped: 5,
+            });
+
+            let table = TargetTable {
+                schema: "public".into(),
+                name: "customers".into(),
+            };
+            let cdc = CdcConfig::for_envelope(EnvelopeKind::Debezium);
+            let cfg = StreamingPipelineConfig::new("topic", table.clone(), "p").with_cdc(cdc);
+            let pipeline = StreamingPipeline::new(
+                source.clone() as Arc<dyn Backend>,
+                vec![(target.clone() as Arc<dyn Backend>, table)],
+                cfg,
+            );
+
+            let (sig, trigger) = ShutdownSignal::new();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                trigger.trigger();
+            });
+            let summary = pipeline.run(sig).await.expect("pipeline.run");
+
+            // Two scripted batches → two run_cdc invocations on the
+            // target. write_arrow_stream must not have been called.
+            assert_eq!(
+                target.cdc_calls(),
+                vec![("mirror".into(), 1), ("mirror".into(), 1)],
+                "every CDC batch routed through run_cdc"
+            );
+            assert!(
+                target.writes().is_empty(),
+                "CDC pipeline must not fall through to write_arrow_stream"
+            );
+            assert!(summary.shutdown_triggered);
+
+            // Counters fold across both dispatches: each call
+            // returned the same (3, 2, 1, 4, 5) shape, two calls →
+            // doubled.
+            let body = pipeline.metrics.render().unwrap();
+            assert!(
+                body.contains("ematix_streaming_cdc_creates_total")
+                    && body.contains(" 6"),
+                "creates counter not visible in metrics body:\n{body}"
+            );
+            assert!(
+                body.contains("ematix_streaming_cdc_updates_total")
+                    && body.contains(" 4"),
+                "updates counter not visible:\n{body}"
+            );
+            assert!(
+                body.contains("ematix_streaming_cdc_deletes_total")
+                    && body.contains(" 2"),
+                "deletes counter not visible:\n{body}"
+            );
+            assert!(
+                body.contains("ematix_streaming_cdc_idempotent_skipped_total")
+                    && body.contains(" 10"),
+                "idempotent_skipped counter not visible:\n{body}"
+            );
+            assert!(
+                body.contains("ematix_streaming_cdc_skipped_total")
+                    && body.contains(" 8"),
+                "skipped counter not visible:\n{body}"
+            );
+        }
+
+        /// Phase Δ PR 5.5: a CDC pipeline whose target backend
+        /// can't reflect its schema (default trait impl error)
+        /// must surface that as a pipeline error, not silently
+        /// fall through to the universal write path.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn cdc_dispatch_errors_when_target_cant_reflect() {
+            use crate::cdc::{CdcConfig, EnvelopeKind};
+
+            let source = Arc::new(TestBackend::new("src"));
+            source.enqueue_read(vec![one_row_batch(1)]);
+
+            // Target deliberately has no table_spec configured →
+            // `reflect_table_spec` returns Err.
+            let target = Arc::new(TestBackend::new("mirror"));
+
+            let table = TargetTable {
+                schema: "public".into(),
+                name: "customers".into(),
+            };
+            let cdc = CdcConfig::for_envelope(EnvelopeKind::Debezium);
+            let cfg = StreamingPipelineConfig::new("topic", table.clone(), "p").with_cdc(cdc);
+            let pipeline = StreamingPipeline::new(
+                source as Arc<dyn Backend>,
+                vec![(target.clone() as Arc<dyn Backend>, table)],
+                cfg,
+            );
+
+            let (sig, _trigger) = ShutdownSignal::new();
+            let err = pipeline
+                .run(sig)
+                .await
+                .expect_err("reflection failure must surface");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("no table_spec set"),
+                "expected reflection-failure message, got: {msg}"
+            );
+            assert!(
+                target.cdc_calls().is_empty(),
+                "no CDC apply attempted when reflection fails"
             );
         }
     }

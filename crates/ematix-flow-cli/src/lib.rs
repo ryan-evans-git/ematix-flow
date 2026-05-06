@@ -2743,6 +2743,20 @@ impl PipelineCliConfig {
             cfg = cfg.with_dead_letter_topic(dlt.clone());
         }
         if let Some(t) = &self.transform {
+            // Phase Δ PR 5.5: CDC apply mode is mutually exclusive
+            // with `sql` / `window` / `join` (validated at TOML
+            // parse time), so when `[transform.cdc]` is set we
+            // lower the CDC config and skip the SQL/transform
+            // wiring entirely. Watermark + on_error are still
+            // valid knobs (handled outside this branch); the
+            // transform pipeline just doesn't have an inner stage
+            // because CDC consumes envelopes directly.
+            if let Some(cdc_toml) = &t.cdc {
+                let cdc_core = cdc_toml_to_core(cdc_toml)
+                    .expect("CDC config translation already validated at config-load");
+                cfg = cfg.with_cdc(cdc_core);
+                return cfg;
+            }
             // SQL pre-stage. Empty `sql` means "no pre-stage" — only
             // valid when a window block is configured (windowed
             // transform doesn't require a SQL inner).

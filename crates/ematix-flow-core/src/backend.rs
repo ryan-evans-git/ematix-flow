@@ -460,6 +460,28 @@ pub trait Backend: Send + Sync + 'static {
         )))
     }
 
+    /// Phase Δ PR 5.5: reflect a target table's column set + PK
+    /// from the live database. The streaming-pipeline runtime calls
+    /// this once per CDC target at startup so the per-batch
+    /// `run_cdc` dispatch has a real `TableSpec` (with columns) to
+    /// hand the executor. Schema-evolution detection (PR 5)
+    /// compares incoming `after`-payload keys against the columns
+    /// returned here.
+    ///
+    /// Default impl errors with a backend-dialect-specific
+    /// message; only Postgres ships an implementation today.
+    async fn reflect_table_spec(
+        &self,
+        _target: &TargetTable,
+    ) -> Result<crate::types::TableSpec, BackendError> {
+        Err(BackendError::Other(format!(
+            "reflect_table_spec is not implemented for backend dialect = {:?}. \
+             CDC apply mode requires a target backend that can introspect its \
+             table schema; today only Postgres qualifies (Phase Δ PR 5.5).",
+            self.dialect()
+        )))
+    }
+
     /// Phase 39.5a: does this backend round-trip an offset blob
     /// through [`seek_to`] / [`offset_snapshot`]?
     ///
@@ -1401,6 +1423,48 @@ impl Backend for PostgresBackend {
             .run_cdc(spec, events, cdc_config, pipeline_name, skipped)
             .await
             .map_err(|e| BackendError::Other(e.to_string()))
+    }
+
+    /// Phase Δ PR 5.5: hand the streaming runtime a real
+    /// [`TableSpec`] for the target. Reads `information_schema`
+    /// via the existing reflection helper + carries the column
+    /// set, types, nullability, and PK flags through.
+    async fn reflect_table_spec(
+        &self,
+        target: &TargetTable,
+    ) -> Result<crate::types::TableSpec, BackendError> {
+        let reflected = self
+            .pool
+            .read_existing_columns(&target.schema, &target.name)
+            .await
+            .map_err(|e| BackendError::Other(e.to_string()))?;
+        if reflected.is_empty() {
+            return Err(BackendError::Other(format!(
+                "reflect_table_spec: target {}.{} has no columns — \
+                 either the table doesn't exist or the connecting role \
+                 lacks information_schema.columns visibility",
+                target.schema, target.name
+            )));
+        }
+        let columns: Vec<crate::types::ColumnSpec> = reflected
+            .into_iter()
+            .map(|c| crate::types::ColumnSpec {
+                name: c.name,
+                ty: c.ty,
+                nullable: c.nullable,
+                primary_key: c.primary_key,
+            })
+            .collect();
+        Ok(crate::types::TableSpec {
+            schema: target.schema.clone(),
+            name: target.name.clone(),
+            columns,
+            // CDC apply doesn't consult uniques; PR 5.5 leaves them
+            // empty. Schema-evolution / drift compare uses the
+            // declared column set only.
+            unique_constraints: Vec::new(),
+            fingerprint: String::new(),
+        })
     }
 
     async fn read_arrow_stream(&self, query: &str) -> Result<ArrowBatchStream, BackendError> {
