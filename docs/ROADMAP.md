@@ -113,6 +113,206 @@ Goal: stand alongside PySpark on batch SQL throughput at <20% of PySpark's image
 
 Recommendation: ship Σ.A–C first; Σ.D triggers after the batch claim is benchmarked + announced.
 
+### P6 — Phase Ω: orchestration + status UI
+
+Goal: turn ematix-flow from "a library you call from your scheduler"
+into a self-hosting orchestrator-lite that handles dependency
+ordering, retry policy, and live status visibility — without
+bringing in Airflow. The streaming consumer already has a Prometheus
+`/metrics` endpoint and `--restart-on-error` supervisor; this phase
+generalizes both to batch pipelines and adds a human-facing surface.
+
+Plan + open questions are draft-only at the moment; implementation
+gated on the remaining items in **§Decisions and open questions**
+below. The first round of decisions has landed (D1: append-only
+`RunLog` with local-file + shared backends, lease-based cluster
+recovery for idempotent tasks); other questions still open. Items
+sized assuming the remaining opens land at "smallest reasonable
+choice" (Alerter trait, manual-restart path (a), pipeline-level
+granularity in v1).
+
+35. **Ω.1 — Pipeline dependencies (DAG).** Decorator-level
+    `depends_on=[upstream_pipeline]` (or `[pipeline.depends_on]` TOML).
+    Build a DAG at registration time; reject cycles with a clear error
+    pointing at both ends of the cycle. A pipeline's downstream is
+    eligible to run only when its declared upstreams' most-recent
+    runs succeeded inside a freshness window (`upstream_freshness=`,
+    default unbounded). Single-process scope first; cross-process
+    dependency negotiation follows in Ω.4 if/when needed. Effort:
+    ~1.5 wk.
+
+36. **Ω.2 — Declarative retry policy.** Per-pipeline (and per-step
+    once Ω.5 lands) retry config: `retries=N`, `retry_backoff_ms`,
+    `retry_max_total_ms`, `retry_on=[ErrorKind, ...]`. Exponential
+    backoff with jitter; bounded by both attempt count and total
+    wall-time. Generalizes the existing streaming `--restart-on-error`
+    supervisor to batch pipelines and exposes the policy
+    declaratively rather than as a CLI flag. Effort: ~1 wk.
+
+37. **Ω.3 — Status UI (HTTP server + JSON API).** A built-in server
+    on a configurable port (e.g. `flow status --port 8080`) showing
+    live pipeline + step status: which pipelines are running /
+    queued / blocked-on-dependency / failed; per-step state for the
+    active run; last-N runs per pipeline. Same process as the
+    runner — no separate daemon. JSON API behind the HTML so external
+    dashboards can consume the same data. Defaults to `127.0.0.1`
+    bind; explicit `--bind 0.0.0.0` opt-in; no in-tree auth in v1
+    (relegate to fronting reverse proxy — same model as the existing
+    Prometheus `/metrics`). Effort: ~2 wk.
+
+#### Decisions and open questions
+
+The first round of decisions has landed in this draft; remaining
+items are still open. Recorded inline below so the trail of "why
+the design landed where it did" stays in one place.
+
+- **Ω.D1 — Run-history persistence: append-only `RunLog` with two
+  backends (DECIDED).** Mental model is a simple state file: every
+  task transition (`started`, `succeeded`, `failed`) is appended as
+  a record. On startup, the runtime scans the log; any entry with a
+  `started` event but no matching termination is presumed failed
+  (the worker process didn't get a chance to write the
+  termination). New `RunLog` trait with two reference impls:
+
+  - **`LocalFileRunLog`** — JSONL appended to a local file. Single-
+    pod / dev. Crash-recovery does the "presume in-progress = failed"
+    sweep on startup. Works on any filesystem; no shared
+    dependency. Default for single-process deployments.
+
+  - **`SharedRunLog`** — backed by the existing `StateStore`
+    (Postgres reference impl already shipped). Required for
+    cluster-aware recovery (next bullet). Same append-only mental
+    model, just sitting in a shared table instead of a local file.
+
+  Cluster-aware recovery is the differentiator. When multiple pods
+  run the same `flow` daemon and one crashes mid-task, the peers
+  must notice and take over rather than mark the task failed. This
+  needs a **lease + heartbeat** mechanism on top of `SharedRunLog`:
+
+  - A worker claims a task by writing `started by <worker-id>` with
+    a lease `expires_at = now() + lease_ttl`.
+  - The worker heartbeats by extending `expires_at` periodically
+    (default ~1/3 of `lease_ttl`).
+  - Peers see expired leases for tasks still in `started` state and
+    re-claim them, writing `resumed by <new-worker-id>`. The task's
+    final outcome attributes to whichever worker writes the
+    termination record.
+  - Hard requirement: only auto-resume tasks declared
+    `idempotent=true`. Non-idempotent tasks (e.g. "send an alert
+    email") get marked failed instead of resumed. Default depends
+    on strategy — `merge` / `scd2` / streaming are safe to
+    auto-mark idempotent; `append` is not.
+
+  Reuse the existing Σ.B peer mesh as the discovery substrate
+  (workers already know about each other for distributed batch
+  SQL); the lease state lives in `SharedRunLog`, not in mesh
+  metadata.
+
+  Sub-questions remaining inside this decision:
+
+  - **D1.a — Lease TTL default.** Tradeoff: shorter = faster
+    recovery, but heartbeat overhead + risk of legitimate-but-slow
+    tasks losing their lease to a peer. Common range: 30s–5min.
+    Probably configurable per pipeline with a 60s global default.
+  - **D1.b — RunLog rotation / retention.** Append-only files grow.
+    Need a knob (`max_age_days` / `max_records` / size-based
+    rotation). Retention is also what powers the UI's "history"
+    panel — too short and the UI is empty after a week.
+  - **D1.c — `LocalFileRunLog` format.** JSONL is simplest + greppable
+    + diffable. SQLite is queryable but adds a dep. Lean JSONL.
+  - **D1.d — Idempotency declaration surface.** Pipeline-level
+    `idempotent=True` decorator field, or auto-derive from the
+    declared mode (`merge`/`scd2` → True, `append` → False)? Probably
+    auto-derive with an explicit override knob.
+
+- **Ω.Q2 — Restart-from-failure (partly answered by D1).** The Ω.D1
+  decision lands the substrate (cluster-aware lease-based resumption
+  for idempotent tasks). What's still open is **manual** restart-
+  from-failure: a user explicitly asks the runtime to replay a run
+  that already terminated as `failed`. For streaming pipelines this
+  works for free (offsets + StateStore + watermarks resume the
+  consumer where it left off). For batch:
+
+  - **Idempotent strategies (`merge` / `scd2`):** "manual restart"
+    is just "run again" — same SQL, same target, same keys. No
+    extra infra needed.
+  - **Non-idempotent strategies (`append`):** restart-from-failure
+    is genuinely hard — re-running appends would duplicate rows.
+    Two paths: (a) refuse manual restart for `append` pipelines,
+    point users at a `truncate + append` recipe, or (b) land step-
+    level batch checkpointing (write intermediate Arrow batches to
+    object store, fingerprint inputs, resume from the last
+    successful checkpoint).
+
+  Open: take path (a) for v1 (consistent with the auto-recovery
+  decision in D1, ships in days) or land (b) as part of this phase
+  (~3–4 wk additional)? Recommendation: (a) for v1, (b) as a
+  follow-up phase with its own design doc.
+
+- **Ω.Q3 — Alert transport surface.** On run failure (and optionally
+  success), send an alert via a configurable transport. Candidate
+  transports: Slack webhook, generic HTTP webhook, email (SMTP),
+  PagerDuty Events API. Open: ship transports in-tree (each adds a
+  dep + maintenance surface) or expose an `Alerter` trait + a
+  reference webhook impl + a docs page on how to plug in others?
+  Recommendation leans trait — keeps the dependency tree minimal
+  and matches the `Backend` / `StateStore` extensibility pattern
+  already in the codebase.
+
+- **Ω.Q4 — Re-alert on stuck failures (unblocked by D1).** Now that
+  D1 lands a `RunLog` regardless of cluster mode, "we already
+  alerted at T0" can be tracked in the same log as another event
+  type (`alerted`, with the alert config snapshot). Re-alert
+  becomes: "every `realert_after` interval, scan for runs in
+  `failed` state whose most-recent `alerted` event is older than
+  the threshold, and re-fire." No separate alert-state surface
+  needed. Effort: <1 wk on top of D1 + Q3.
+
+- **Ω.Q5 — Step-level granularity.** Items 35–37 above are
+  pipeline-level. The user-facing pitch ("see the status of
+  individual steps of the pipeline") implies step-level too —
+  meaning every transform, every emit, every commit ought to be a
+  named step the UI can show. That's a meaningful refactor: today's
+  pipeline runs are mostly atomic from a status-tracking point of
+  view. Open: in v1, expose pipeline-level only and label this as
+  follow-up; or land step decomposition + per-step retry / alert
+  hooks together? Strong tension between "ship something useful
+  fast" and "build the surface users actually asked for."
+
+- **Ω.Q6 — UI-vs-flow-worker overlap.** Phase Σ.B already ships
+  `flow-worker` as a peer in the distributed batch mesh. The Ω.3
+  status server is a separate concern but shares some plumbing
+  (process registry, metrics endpoint). Open: merge the two so
+  there's exactly one daemon binary, or keep `flow status` as a
+  distinct subcommand?
+
+#### Sizing summary (post-D1; remaining open questions in smallest-choice form)
+
+| Sub-phase | Effort | Calendar | Validates |
+|---|---|---|---|
+| Ω.1 | 1 dev | 1–2 wk | DAG-aware scheduling without Airflow |
+| Ω.2 | 1 dev | ~1 wk | Declarative retries on batch + streaming |
+| Ω.3 | 1 dev | 2–3 wk | Built-in pipeline status UI |
+| Ω.D1a | 1 dev | ~1 wk | `LocalFileRunLog` (JSONL append + presume-failed-on-restart sweep) |
+| Ω.D1b | 1 dev | 2–3 wk | `SharedRunLog` + lease/heartbeat for cluster failover |
+| Ω.Q2 (manual restart) | 1 dev | <1 wk | Manual restart-from-failure for idempotent strategies (path (a)) |
+| Ω.Q3 | 1 dev | 1 wk | Alerter trait + reference webhook impl |
+| Ω.Q4 | 1 dev | <1 wk | Re-alert on stuck failures (rides on D1) |
+| Ω.Q5 | 1 dev | 3–4 wk | Step-level decomposition (if landed in v1) |
+| **Single-pod v1** (Ω.1–3 + D1a + Q2(a) + Q3 + Q4) | | **~7–9 wk** | Full orchestration + UI + history + alerts on a single host |
+| **Cluster v1** (above + D1b) | | **~10–12 wk** | Above + cluster-aware lease-based recovery |
+| **+ step-level UI** (Q5) | | **~13–16 wk** | All the above + per-step status / per-step retry hooks |
+| **+ batch step-checkpointing** (Q2 path b) | | **~17–20 wk** | Restart-from-failure works for `append` too |
+
+Recommendation: ship the **single-pod v1** as the first cut (Ω.1–3
++ `LocalFileRunLog` + path (a) restart + Alerter trait + re-alert).
+That's the standalone orchestrator-lite users can adopt today. The
+cluster bits (`SharedRunLog` + lease) follow as Ω.D1b once the
+single-pod surface is exercised in production. Q5 (step-level
+decomposition) and Q2 path (b) (batch step checkpointing) are
+follow-up phases — neither is on the critical path for the asked-
+for feature.
+
 ---
 
 ## What this roadmap intentionally doesn't cover
