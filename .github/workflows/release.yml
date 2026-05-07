@@ -15,9 +15,9 @@ name: release
 #      record becomes permanent.
 #
 # Wheel-build philosophy:
-#   - 6 wheels per release: linux-x86_64 × {py3.11, py3.12, py3.13}
-#     and macos-aarch64 × {py3.11, py3.12, py3.13}. Plus one sdist
-#     for every other (OS, arch, Python) combination.
+#   - 8 wheels per release: linux-x86_64 × {py3.11, py3.12, py3.13,
+#     py3.14} and macos-aarch64 × {py3.11, py3.12, py3.13, py3.14}.
+#     Plus one sdist for every other (OS, arch, Python) combination.
 #   - One wheel per (OS, arch, Python). Linux uses the manylinux2014
 #     container so wheels run on every glibc-2.17+ system.
 #   - macOS: aarch64 (Apple Silicon) only. Intel Mac wheels were
@@ -131,7 +131,9 @@ jobs:
         # still declares `requires-python = ">=3.10"`, so the sdist
         # fall-through is the supported path. Re-add 3.10 here once
         # the repo goes public + minutes go unlimited.
-        python: ["3.11", "3.12", "3.13"]
+        # Python 3.14 (stable Oct 2025) added 2026-05; pyo3 0.28
+        # already supports the 3.14 ABI.
+        python: ["3.11", "3.12", "3.13", "3.14"]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -200,6 +202,10 @@ jobs:
             runner: macos-14
             target: aarch64-apple-darwin
             python: "3.13"
+          - arch: aarch64
+            runner: macos-14
+            target: aarch64-apple-darwin
+            python: "3.14"
     steps:
       - uses: actions/checkout@v4
         with:
