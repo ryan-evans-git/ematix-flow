@@ -81,7 +81,7 @@ jobs:
       - name: Install dev deps
         run: |
           python -m pip install --upgrade pip
-          pip install 'maturin>=1.7' pytest 'pytest-asyncio>=0.23' ruff bandit pip-audit
+          pip install 'maturin>=1.7' pytest 'pytest-asyncio>=0.23' ruff bandit pip-audit pip-licenses
       - name: Build extension
         run: maturin develop --release
       - name: Lint
@@ -96,5 +96,36 @@ jobs:
         # `--strict` would treat the editable skip itself as a
         # failure, which we don't want.
         run: pip-audit --skip-editable
+      - name: License check (block GPL/AGPL/SSPL/BUSL/Elastic/Commons Clause)
+        # Substring match against each Python dep's declared license
+        # string. Exact forms picked to avoid false-matching LGPL
+        # (weak-copyleft, OK for runtime/dynamic linking) or MPL
+        # (file-level copyleft, currently allowed). Tighten by adding
+        # entries to the list if policy changes. Runs after `maturin
+        # develop` so every transitive runtime + dev dep is resolved.
+        run: |
+          pip-licenses --fail-on="GPL-2.0;GPL-3.0;GPLv2;GPLv3;AGPL;Affero;SSPL;Server Side Public;BUSL;Business Source;Elastic License;Commons Clause"
       - name: Test
         run: pytest
+
+  license-rust:
+    name: license check (rust deps)
+    runs-on: ubuntu-latest
+    # Independent of the rust + audit jobs so a license regression
+    # surfaces with a distinct check name. Uses cargo-deny because it
+    # parses SPDX expressions correctly (handles `OR` / `AND` /
+    # `WITH`) — a substring grep over `cargo-license` output would
+    # mis-classify dual-licensed crates.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-deny
+        run: cargo install --locked cargo-deny
+      - name: Run cargo deny check licenses
+        # `deny.toml` at the repo root lists the forbidden SPDX IDs
+        # (GPL/AGPL/SSPL/BUSL/Elastic/Commons-Clause) and the allowed
+        # set. Only the `licenses` table is enforced here; the
+        # advisories table is covered by the separate `audit-rust`
+        # job, and `bans`/`sources` are left at defaults.
+        run: cargo deny check licenses

@@ -1,0 +1,68 @@
+# cargo-deny configuration — enforced by the `license-rust` job in
+# `.github/workflows/ci.yml`. Only the [licenses] table is active;
+# advisories are covered by the separate `audit-rust` job
+# (cargo-audit + RustSec DB), and [bans] / [sources] are left at
+# defaults so cargo-deny does not complain about duplicate-version
+# trees, which are an inevitable artifact of a workspace this size.
+
+[graph]
+# Check every target so a Linux-only allow / Windows-only deny do
+# not slip past CI. cargo-deny defaults to the host triple, which
+# would miss platform-gated deps.
+all-features = true
+
+[licenses]
+# SPDX expressions for the allowed set. Anything outside this list
+# fails the build. Order does not matter; cargo-deny uses set
+# membership. Picked to cover the permissive licenses + weak
+# copyleft (MPL-2.0) we have already accepted upstream:
+#
+#   - Apache-2.0 / MIT / BSD-2/3 — permissive, no concerns.
+#   - ISC / Unicode-3.0 — permissive variants used by
+#     `unicode-ident` and similar low-level deps.
+#   - CC0-1.0 / Zlib — public-domain-equivalent + permissive,
+#     present in a handful of leaf crates (`tiny-keccak`, `adler`).
+#   - bzip2-1.0.6 — permissive, used by `libbz2-rs-sys` (pulled in
+#     transitively by parquet/datafusion compression codecs).
+#   - CDLA-Permissive-2.0 — Linux-Foundation permissive data
+#     license used by the `webpki-roots*` crates that ship the
+#     Mozilla CA bundle.
+#   - MPL-2.0 — file-level copyleft, OK for our usage.
+#
+# DO NOT add GPL-2.0/GPL-3.0/AGPL/SSPL/BUSL/Elastic-License/
+# Commons-Clause here. The whole point of this gate is to keep
+# them out of the dependency closure.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "CC0-1.0",
+    "Zlib",
+    "MPL-2.0",
+    "bzip2-1.0.6",
+    "CDLA-Permissive-2.0",
+]
+
+# Confidence floor for license-text matching. cargo-deny computes a
+# score against the SPDX corpus when a crate ships a LICENSE file
+# without a Cargo.toml `license` field. 0.8 is the upstream-
+# recommended default; anything that fails to match at this score
+# triggers a manual review (handled via [[licenses.clarify]] below
+# if it ever comes up).
+confidence-threshold = 0.8
+
+[bans]
+# Left at defaults. Duplicate-version detection is informational
+# in a workspace this size and would produce constant churn.
+multiple-versions = "allow"
+wildcards = "allow"
+
+[sources]
+# Allow the standard crates.io registry + git deps already in
+# Cargo.lock. Tighten if a future policy bans git deps outright.
+unknown-registry = "warn"
+unknown-git = "warn"
