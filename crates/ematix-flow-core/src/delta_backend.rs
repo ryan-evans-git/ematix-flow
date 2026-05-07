@@ -3295,4 +3295,233 @@ mod tests {
             "error must name the offending column, got: {msg}"
         );
     }
+
+    // ----------------------------------------------------------
+    // Coverage backfill round 3 — pure-function helpers in
+    // delta_backend.rs. Each test below pins a small surface that
+    // didn't show up under the executor-level tests (no MERGE
+    // happens to drive these specific paths) but is reachable
+    // unit-style with no infrastructure.
+    // ----------------------------------------------------------
+
+    /// `arrow_to_column_type` covers every mapped Arrow data type
+    /// it knows about, plus the catch-all Text fallback for
+    /// unmapped types. The reflect_table_spec tests only exercise
+    /// the common Utf8 / Int64 mappings; this one round-trips the
+    /// rest.
+    #[test]
+    fn arrow_to_column_type_covers_every_mapped_variant() {
+        use crate::types::ColumnType;
+        use arrow_schema::DataType;
+
+        assert_eq!(arrow_to_column_type(&DataType::Int8), ColumnType::SmallInt);
+        assert_eq!(arrow_to_column_type(&DataType::Int16), ColumnType::SmallInt);
+        assert_eq!(arrow_to_column_type(&DataType::Int32), ColumnType::Integer);
+        assert_eq!(arrow_to_column_type(&DataType::Int64), ColumnType::BigInt);
+        assert_eq!(arrow_to_column_type(&DataType::Float32), ColumnType::Float);
+        assert_eq!(arrow_to_column_type(&DataType::Float64), ColumnType::Double);
+        assert_eq!(arrow_to_column_type(&DataType::Boolean), ColumnType::Boolean);
+        assert_eq!(arrow_to_column_type(&DataType::Utf8), ColumnType::Text);
+        assert_eq!(arrow_to_column_type(&DataType::LargeUtf8), ColumnType::Text);
+        assert_eq!(arrow_to_column_type(&DataType::Binary), ColumnType::Bytes);
+        assert_eq!(
+            arrow_to_column_type(&DataType::LargeBinary),
+            ColumnType::Bytes
+        );
+        assert_eq!(arrow_to_column_type(&DataType::Date32), ColumnType::Date);
+        assert_eq!(arrow_to_column_type(&DataType::Date64), ColumnType::Date);
+        assert_eq!(
+            arrow_to_column_type(&DataType::Timestamp(
+                arrow_schema::TimeUnit::Microsecond,
+                None
+            )),
+            ColumnType::Timestamp
+        );
+        assert_eq!(
+            arrow_to_column_type(&DataType::Timestamp(
+                arrow_schema::TimeUnit::Microsecond,
+                Some("UTC".into())
+            )),
+            ColumnType::TimestampTz
+        );
+        // Catch-all fallback for unmapped DataTypes (decimals,
+        // structs, lists, etc.) — surfaces as Text. Locks the
+        // permissive choice so a future version that errors
+        // instead produces a loud diff.
+        assert_eq!(
+            arrow_to_column_type(&DataType::Decimal128(10, 2)),
+            ColumnType::Text
+        );
+    }
+
+    /// `column_type_to_arrow` covers every mapped `ColumnType`
+    /// plus the explicit Numeric error path.
+    #[test]
+    fn column_type_to_arrow_round_trips_every_mapped_variant() {
+        use crate::types::ColumnType;
+        use arrow_schema::DataType;
+
+        assert_eq!(
+            column_type_to_arrow(&ColumnType::SmallInt).unwrap(),
+            DataType::Int16
+        );
+        assert_eq!(
+            column_type_to_arrow(&ColumnType::Integer).unwrap(),
+            DataType::Int32
+        );
+        assert_eq!(
+            column_type_to_arrow(&ColumnType::BigInt).unwrap(),
+            DataType::Int64
+        );
+        assert_eq!(
+            column_type_to_arrow(&ColumnType::Float).unwrap(),
+            DataType::Float32
+        );
+        assert_eq!(
+            column_type_to_arrow(&ColumnType::Double).unwrap(),
+            DataType::Float64
+        );
+        assert_eq!(
+            column_type_to_arrow(&ColumnType::Boolean).unwrap(),
+            DataType::Boolean
+        );
+        assert_eq!(
+            column_type_to_arrow(&ColumnType::Text).unwrap(),
+            DataType::Utf8
+        );
+        assert_eq!(
+            column_type_to_arrow(&ColumnType::String { length: 64 }).unwrap(),
+            DataType::Utf8
+        );
+        assert_eq!(
+            column_type_to_arrow(&ColumnType::Json).unwrap(),
+            DataType::Utf8
+        );
+        assert_eq!(
+            column_type_to_arrow(&ColumnType::Jsonb).unwrap(),
+            DataType::Utf8
+        );
+        assert_eq!(
+            column_type_to_arrow(&ColumnType::Uuid).unwrap(),
+            DataType::Utf8
+        );
+        assert_eq!(
+            column_type_to_arrow(&ColumnType::Bytes).unwrap(),
+            DataType::Binary
+        );
+        assert_eq!(
+            column_type_to_arrow(&ColumnType::Date).unwrap(),
+            DataType::Date32
+        );
+        assert_eq!(
+            column_type_to_arrow(&ColumnType::Timestamp).unwrap(),
+            DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None)
+        );
+        assert_eq!(
+            column_type_to_arrow(&ColumnType::TimestampTz).unwrap(),
+            DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, Some("UTC".into()))
+        );
+
+        // Numeric is explicitly unsupported in Δ.X1 PR 1; the
+        // error message points users at the Double/Text workaround.
+        let err = column_type_to_arrow(&ColumnType::Numeric {
+            precision: 18,
+            scale: 4,
+        })
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("Numeric"), "got: {msg}");
+        assert!(msg.contains("Δ.X1") || msg.contains("not yet supported"));
+    }
+
+    /// `schema_empty_columns` produces a zero-row Arc<dyn Array>
+    /// for every DataType in the input schema, matching shape +
+    /// length 0. The catch-all branch (any unmapped DataType
+    /// devolves to a zero-row StringArray) is locked too.
+    #[test]
+    fn schema_empty_columns_returns_zero_row_arrays_for_each_field() {
+        use arrow_schema::{DataType, Field, Schema as ArrowSchema, TimeUnit};
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("i16", DataType::Int16, true),
+            Field::new("i32", DataType::Int32, true),
+            Field::new("i64", DataType::Int64, true),
+            Field::new("f32", DataType::Float32, true),
+            Field::new("f64", DataType::Float64, true),
+            Field::new("b", DataType::Boolean, true),
+            Field::new("s", DataType::Utf8, true),
+            // Unmapped DataType → catch-all branch.
+            Field::new("ts", DataType::Timestamp(TimeUnit::Microsecond, None), true),
+        ]));
+        let cols = schema_empty_columns(&schema);
+        assert_eq!(cols.len(), 8);
+        for col in &cols {
+            assert_eq!(col.len(), 0, "every empty-batch column has zero rows");
+        }
+    }
+
+    /// `canonical_pk_string` round-trips the three branches:
+    /// single-PK fast path (1), composite-PK Object branch (2),
+    /// composite-PK with a missing key (the "null" fallback).
+    #[test]
+    fn canonical_pk_string_covers_every_branch() {
+        use crate::cdc::{CdcEvent, CdcOp};
+        use serde_json::{Map, Value, json};
+
+        // Single PK — returns event.key.to_string() directly.
+        let single = CdcEvent {
+            op: CdcOp::Create,
+            key: json!(42),
+            ts_ms: Some(1),
+            after: None,
+            before: None,
+        };
+        assert_eq!(canonical_pk_string(&single, &["id".to_string()]), "42");
+
+        // Composite PK with all keys present — joins values
+        // with U+001F (the unit separator).
+        let mut k = Map::new();
+        k.insert("tenant_id".into(), Value::Number(7.into()));
+        k.insert("id".into(), Value::Number(3.into()));
+        let composite = CdcEvent {
+            op: CdcOp::Update,
+            key: Value::Object(k),
+            ts_ms: Some(2),
+            after: None,
+            before: None,
+        };
+        let pk_cols = vec!["tenant_id".to_string(), "id".to_string()];
+        let canon = canonical_pk_string(&composite, &pk_cols);
+        assert!(canon.contains('\u{1f}'), "composite uses unit-separator joiner");
+        assert!(canon.contains('7') && canon.contains('3'));
+
+        // Composite PK with one column missing — that column
+        // serialises to "null".
+        let mut k2 = Map::new();
+        k2.insert("tenant_id".into(), Value::Number(11.into()));
+        let partial = CdcEvent {
+            op: CdcOp::Delete,
+            key: Value::Object(k2),
+            ts_ms: Some(3),
+            after: None,
+            before: None,
+        };
+        let canon = canonical_pk_string(&partial, &pk_cols);
+        assert!(canon.contains("null"), "missing PK column → \"null\"; got: {canon}");
+
+        // Composite-style pk_cols but key is a scalar (parser
+        // produces this shape for delete events with a scalar
+        // before-image PK). Falls through to the bottom branch.
+        let scalar_with_composite_cols = CdcEvent {
+            op: CdcOp::Delete,
+            key: json!(99),
+            ts_ms: None,
+            after: None,
+            before: None,
+        };
+        assert_eq!(
+            canonical_pk_string(&scalar_with_composite_cols, &pk_cols),
+            "99"
+        );
+    }
 }
