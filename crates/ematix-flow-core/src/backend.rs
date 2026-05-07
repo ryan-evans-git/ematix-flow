@@ -1948,6 +1948,194 @@ mod tests {
         assert!(matches!(pool_err, BackendError::Connection(_)));
     }
 
+    /// Coverage backfill: locks the remaining `From<PgError>` arms
+    /// — `Other` flows to `BackendError::Other` (the catch-all
+    /// kind), preserving the message verbatim.
+    #[test]
+    fn pg_error_other_maps_to_backend_other() {
+        let other_err: BackendError =
+            PgError::Other("CDC target has no PK".into()).into();
+        match other_err {
+            BackendError::Other(msg) => {
+                assert!(msg.contains("CDC target has no PK"));
+            }
+            _ => panic!("PgError::Other should map to BackendError::Other"),
+        }
+    }
+
+    /// `From<AppendRunResult>` projects fields through with the
+    /// strategy-result shape: rows_inserted carries through;
+    /// rows_updated / rows_closed are `None` for an append.
+    #[test]
+    fn append_run_result_projects_to_strategy_run_result() {
+        let appended = crate::pg::AppendRunResult {
+            run_id: "r1".into(),
+            rows_inserted: 42,
+            status: "success".into(),
+            path: "same_db".into(),
+        };
+        let s: StrategyRunResult = appended.into();
+        assert_eq!(s.run_id, "r1");
+        assert_eq!(s.rows_inserted, 42);
+        assert_eq!(s.rows_updated, None);
+        assert_eq!(s.rows_unchanged, None);
+        assert_eq!(s.rows_closed, None);
+        assert_eq!(s.status, "success");
+        assert_eq!(s.path, "same_db");
+    }
+
+    /// `From<MergeRunResult>` projects insert + update + unchanged
+    /// counts (rows_closed stays `None`).
+    #[test]
+    fn merge_run_result_projects_to_strategy_run_result() {
+        let merged = crate::pg::MergeRunResult {
+            run_id: "r2".into(),
+            rows_inserted: 5,
+            rows_updated: 3,
+            rows_unchanged: 2,
+            status: "success".into(),
+            path: "cross_db".into(),
+        };
+        let s: StrategyRunResult = merged.into();
+        assert_eq!(s.rows_inserted, 5);
+        assert_eq!(s.rows_updated, Some(3));
+        assert_eq!(s.rows_unchanged, Some(2));
+        assert_eq!(s.rows_closed, None);
+    }
+
+    /// `From<Scd2RunResult>` projects insert + closed counts.
+    #[test]
+    fn scd2_run_result_projects_to_strategy_run_result() {
+        let scd2 = crate::pg::Scd2RunResult {
+            run_id: "r3".into(),
+            rows_inserted: 11,
+            rows_closed: 7,
+            status: "success".into(),
+            path: "same_db".into(),
+        };
+        let s: StrategyRunResult = scd2.into();
+        assert_eq!(s.rows_inserted, 11);
+        assert_eq!(s.rows_closed, Some(7));
+        // SCD2 doesn't report row-by-row updates separately —
+        // the projection leaves them None.
+        assert_eq!(s.rows_updated, None);
+        assert_eq!(s.rows_unchanged, None);
+    }
+
+    /// Default `Backend::run_cdc` impl errors with a clear
+    /// "not implemented" message that names the dialect — picked
+    /// up by the streaming runtime when an unsupported target is
+    /// configured. Verified against DuckDB, which doesn't override.
+    #[tokio::test]
+    async fn default_run_cdc_errors_with_dialect_name() {
+        use crate::DuckDBBackend;
+        use crate::types::{ColumnSpec, ColumnType, TableSpec};
+
+        let backend = DuckDBBackend::open(":memory:").unwrap();
+        let spec = TableSpec {
+            schema: "main".into(),
+            name: "t".into(),
+            columns: vec![ColumnSpec {
+                name: "id".into(),
+                ty: ColumnType::BigInt,
+                nullable: false,
+                primary_key: true,
+            }],
+            unique_constraints: vec![],
+            fingerprint: String::new(),
+        };
+        let cdc_cfg = crate::cdc::CdcConfig::for_envelope(
+            crate::cdc::EnvelopeKind::Debezium,
+        );
+        // Build a 0-row RecordBatch — the default impl returns
+        // before parsing, so the batch shape is irrelevant.
+        let arrow_schema = std::sync::Arc::new(arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("op", arrow_schema::DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::new_empty(arrow_schema);
+        let err = backend
+            .run_cdc(&spec, batch, &cdc_cfg, "p")
+            .await
+            .expect_err("default run_cdc must error");
+        let msg = err.to_string();
+        assert!(msg.contains("DuckDB"), "must name the dialect, got: {msg}");
+        assert!(msg.contains("not yet implemented"), "got: {msg}");
+    }
+
+    /// Default `Backend::reflect_table_spec` impl errors with a
+    /// "not implemented for backend dialect" message that names
+    /// the dialect.
+    #[tokio::test]
+    async fn default_reflect_table_spec_errors_with_dialect_name() {
+        use crate::DuckDBBackend;
+
+        let backend = DuckDBBackend::open(":memory:").unwrap();
+        let target = TargetTable {
+            schema: "main".into(),
+            name: "t".into(),
+        };
+        let err = backend
+            .reflect_table_spec(&target)
+            .await
+            .expect_err("default reflect_table_spec must error");
+        let msg = err.to_string();
+        assert!(msg.contains("DuckDB"), "must name the dialect, got: {msg}");
+        assert!(msg.contains("not implemented"), "got: {msg}");
+    }
+
+    /// Default `Backend::seek_to` errors with a "does not support
+    /// seek_to" message — the config-load probe relies on this so
+    /// session/join pipelines fail loud against unsupported sources.
+    #[tokio::test]
+    async fn default_seek_to_errors_with_clear_message() {
+        use crate::DuckDBBackend;
+
+        let backend = DuckDBBackend::open(":memory:").unwrap();
+        let err = backend
+            .seek_to(&[1, 2, 3])
+            .await
+            .expect_err("default seek_to must error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("seek_to"),
+            "error must mention seek_to, got: {msg}"
+        );
+        assert!(msg.contains("DuckDB"), "must name the dialect, got: {msg}");
+    }
+
+    /// Default `Backend::offset_snapshot` returns `Ok(None)` —
+    /// non-streaming backends have nothing to snapshot.
+    #[tokio::test]
+    async fn default_offset_snapshot_returns_none() {
+        use crate::DuckDBBackend;
+
+        let backend = DuckDBBackend::open(":memory:").unwrap();
+        let snap = backend.offset_snapshot().await.expect("must not error");
+        assert!(snap.is_none());
+    }
+
+    /// Default `Backend::commit_offsets` is a no-op `Ok(())`.
+    /// Most backends have no committed-offset notion; only Kafka
+    /// overrides.
+    #[tokio::test]
+    async fn default_commit_offsets_is_noop() {
+        use crate::DuckDBBackend;
+
+        let backend = DuckDBBackend::open(":memory:").unwrap();
+        backend.commit_offsets().await.expect("default no-op");
+    }
+
+    /// Default `Backend::supports_seek_to` returns `false`. The
+    /// streaming runtime's pipeline-config validator probes this
+    /// to reject session/join configs against unsupported sources.
+    #[test]
+    fn default_supports_seek_to_returns_false() {
+        // SQLite as the example backend that doesn't override.
+        // Construction is `:memory:` so no infrastructure deps.
+        let backend = crate::SQLiteBackend::open(":memory:").unwrap();
+        assert!(!backend.supports_seek_to());
+    }
+
     #[test]
     fn dialect_variants_all_distinct() {
         // Sanity: the variants we'll dispatch over are all distinct.
