@@ -9,13 +9,20 @@ name: integration
 # unit-test path; this workflow carries the load-bearing 100+
 # ignored tests + the coverage gate.
 #
-# Coverage gate: `--fail-under-lines <FLOOR>`. Phase 1 measured
-# 84.84% locally with the same scope (excluding PyO3 wrappers
-# + entrypoint binaries — see `--ignore-filename-regex` below).
-# The floor is set at 84% to catch regressions while leaving a
-# small buffer for legitimate fluctuation. Path to 90%: backfill
-# `pg.rs` / `cli/lib.rs` / `windowed.rs` / `kafka_backend.rs`
-# (the four largest gaps); ratchet the floor up as those land.
+# Coverage gate: `--fail-under-lines <FLOOR>`. After 6 rounds of
+# unit-test backfill (cli/lib.rs, backend.rs, delta_backend.rs,
+# session_blob.rs, transform.rs, objectstore date helpers — 41
+# new tests in commits 18d62ed..bcff28b) local measurement is at
+# 86.54% lines with the same scope (excluding PyO3 wrappers +
+# entrypoint binaries). The floor is set at 86% — catches
+# regressions with a small buffer, locks the round-of-backfill
+# gains. Path to the user's 90% target: a Postgres testcontainer
+# test exercising every Arrow column type (Int16/Int32/Float32/
+# Boolean/Binary/Timestamp/JSONB/UUID etc) would close ~500 lines
+# at once across backend.rs + pg.rs + duckdb_backend.rs +
+# mysql_backend.rs's COPY-BINARY / per-type binding paths;
+# windowed.rs internal-state-machine edge cases close another
+# ~100. Ratchet the floor up as those land.
 #
 # What's excluded from the coverage denominator:
 #   - `ematix-flow-py/src/*.rs` — PyO3 wrappers exercised
@@ -90,15 +97,15 @@ jobs:
         run: |
           cargo llvm-cov --no-report --workspace --tests --no-fail-fast \
               -- --include-ignored
-      - name: Coverage summary + gate (≥ 84% lines)
-        # `--fail-under-lines 84` exits non-zero when total line
-        # coverage drops below 84%. The exclude regex matches the
-        # local Phase 1 measurement scope so the gate threshold
-        # stays apples-to-apples with what was measured.
+      - name: Coverage summary + gate (≥ 86% lines)
+        # `--fail-under-lines 86` exits non-zero when total line
+        # coverage drops below 86%. The exclude regex matches the
+        # local measurement scope so the gate threshold stays
+        # apples-to-apples with the documented baseline.
         run: |
           cargo llvm-cov report \
               --ignore-filename-regex '(ematix-flow-py/src/|main\.rs|flow_worker\.rs)' \
-              --fail-under-lines 84
+              --fail-under-lines 86
       - name: Coverage lcov export
         run: |
           cargo llvm-cov report \

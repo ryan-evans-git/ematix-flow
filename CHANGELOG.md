@@ -15,13 +15,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   100+ testcontainer-gated tests (Postgres CDC, MinIO/S3 Delta,
   cross-pod distributed, etc.) are exercised in CI for the first
   time — previously only the unit-test set ran via `ci.yml`.
-  - **Coverage gate**: `--fail-under-lines 84`. Phase 1 baseline
-    measured at 84.84% line coverage with the same scope
-    (excluding PyO3 wrappers + entrypoint binaries). Path to the
-    90% target documented inline: backfill `pg.rs` (48% / 733
-    missed lines), `cli/lib.rs` (85% / 765 missed), `windowed.rs`
-    (84% / 537 missed), `kafka_backend.rs` (80% / 448 missed),
-    then ratchet the floor up.
+  - **Coverage gate**: `--fail-under-lines 86`. After 6 rounds
+    of unit-test backfill (commits 18d62ed..bcff28b — 41 new
+    tests across cli/lib.rs, backend.rs, delta_backend.rs,
+    session_blob.rs, transform.rs, objectstore date helpers)
+    local measurement is at **86.54% line coverage** with the
+    same scope (excluding PyO3 wrappers + entrypoint binaries),
+    up from 84.84% baseline. The 86% gate locks those gains.
+    Path to the user-stated 90% target: a single Postgres
+    testcontainer test that runs append over every Arrow column
+    type would close ~500 lines simultaneously across
+    backend.rs's COPY-BINARY type-binding match arms + pg.rs +
+    duckdb_backend.rs + mysql_backend.rs; windowed.rs
+    internal-state-machine edge cases close another ~100.
+    Ratchet the floor as those land.
   - **Excluded from the coverage denominator**:
     `ematix-flow-py/src/*.rs` (PyO3 wrappers covered only via
     `pytest`, invisible to `cargo-llvm-cov`),
