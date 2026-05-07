@@ -737,9 +737,7 @@ impl StreamingPipeline {
     /// and other backends that can't surface PK info natively
     /// rely on this path so `Backend::run_cdc` sees a usable
     /// spec.
-    async fn ensure_cdc_target_specs(
-        &self,
-    ) -> Result<&Vec<crate::types::TableSpec>, BackendError> {
+    async fn ensure_cdc_target_specs(&self) -> Result<&Vec<crate::types::TableSpec>, BackendError> {
         self.cdc_target_specs
             .get_or_try_init(|| async {
                 let mut out = Vec::with_capacity(self.targets.len());
@@ -1180,28 +1178,27 @@ impl StreamingPipeline {
                         return Err(e);
                     }
                 };
-                let runs = self
-                    .targets
-                    .iter()
-                    .zip(specs.iter())
-                    .map(|((backend, _table), spec)| {
-                        let batches_for_target: Vec<RecordBatch> = batches.clone();
-                        let pipeline_name = self.config.pipeline_name.clone();
-                        async move {
-                            let mut total = crate::backend::CdcRunResult::default();
-                            for batch in batches_for_target {
-                                let r = backend
-                                    .run_cdc(spec, batch, cdc, &pipeline_name)
-                                    .await?;
-                                total.creates += r.creates;
-                                total.updates += r.updates;
-                                total.deletes += r.deletes;
-                                total.skipped += r.skipped;
-                                total.idempotent_skipped += r.idempotent_skipped;
+                let runs =
+                    self.targets
+                        .iter()
+                        .zip(specs.iter())
+                        .map(|((backend, _table), spec)| {
+                            let batches_for_target: Vec<RecordBatch> = batches.clone();
+                            let pipeline_name = self.config.pipeline_name.clone();
+                            async move {
+                                let mut total = crate::backend::CdcRunResult::default();
+                                for batch in batches_for_target {
+                                    let r =
+                                        backend.run_cdc(spec, batch, cdc, &pipeline_name).await?;
+                                    total.creates += r.creates;
+                                    total.updates += r.updates;
+                                    total.deletes += r.deletes;
+                                    total.skipped += r.skipped;
+                                    total.idempotent_skipped += r.idempotent_skipped;
+                                }
+                                Ok::<_, BackendError>(total)
                             }
-                            Ok::<_, BackendError>(total)
-                        }
-                    });
+                        });
                 let results: Vec<Result<crate::backend::CdcRunResult, BackendError>> =
                     futures_util::future::join_all(runs).await;
                 let mut first_err: Option<BackendError> = None;
@@ -1231,9 +1228,9 @@ impl StreamingPipeline {
                 // DLQ branch + for diagnostics on failure.
                 let writes = self.targets.iter().map(|(backend, table)| {
                     let batches_for_target: Vec<RecordBatch> = batches.clone();
-                    let target_stream: ArrowBatchStream = Box::pin(
-                        futures_util::stream::iter(batches_for_target.into_iter().map(Ok)),
-                    );
+                    let target_stream: ArrowBatchStream = Box::pin(futures_util::stream::iter(
+                        batches_for_target.into_iter().map(Ok),
+                    ));
                     let mode = self.config.mode;
                     async move { backend.write_arrow_stream(table, target_stream, mode).await }
                 });
@@ -2964,18 +2961,15 @@ mod tests {
             // doubled.
             let body = pipeline.metrics.render().unwrap();
             assert!(
-                body.contains("ematix_streaming_cdc_creates_total")
-                    && body.contains(" 6"),
+                body.contains("ematix_streaming_cdc_creates_total") && body.contains(" 6"),
                 "creates counter not visible in metrics body:\n{body}"
             );
             assert!(
-                body.contains("ematix_streaming_cdc_updates_total")
-                    && body.contains(" 4"),
+                body.contains("ematix_streaming_cdc_updates_total") && body.contains(" 4"),
                 "updates counter not visible:\n{body}"
             );
             assert!(
-                body.contains("ematix_streaming_cdc_deletes_total")
-                    && body.contains(" 2"),
+                body.contains("ematix_streaming_cdc_deletes_total") && body.contains(" 2"),
                 "deletes counter not visible:\n{body}"
             );
             assert!(
@@ -2984,8 +2978,7 @@ mod tests {
                 "idempotent_skipped counter not visible:\n{body}"
             );
             assert!(
-                body.contains("ematix_streaming_cdc_skipped_total")
-                    && body.contains(" 8"),
+                body.contains("ematix_streaming_cdc_skipped_total") && body.contains(" 8"),
                 "skipped counter not visible:\n{body}"
             );
         }

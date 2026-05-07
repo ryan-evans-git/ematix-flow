@@ -1397,10 +1397,7 @@ impl Backend for DeltaBackend {
     /// runtime as a side channel, OR adopt the JSON-roundtrip
     /// route through `serde_json::to_value(&metadata)` to read
     /// the configuration map from outside the kernel crate.
-    async fn reflect_table_spec(
-        &self,
-        target: &TargetTable,
-    ) -> Result<TableSpec, BackendError> {
+    async fn reflect_table_spec(&self, target: &TargetTable) -> Result<TableSpec, BackendError> {
         use deltalake::kernel::engine::arrow_conversion::TryIntoArrow as _;
 
         let url = self.table_url(&target.schema, &target.name)?;
@@ -1411,19 +1408,20 @@ impl Backend for DeltaBackend {
                  write at least one batch before pointing a CDC pipeline at it"
             )));
         }
-        let snapshot = table.snapshot().map_err(|e| {
-            BackendError::Other(format!("Delta reflect_table_spec snapshot: {e}"))
-        })?;
+        let snapshot = table
+            .snapshot()
+            .map_err(|e| BackendError::Other(format!("Delta reflect_table_spec snapshot: {e}")))?;
         let kernel_schema = snapshot.schema();
         // KernelSchemaRef is Arc<StructType>; the kernel crate
         // exposes a TryIntoArrow blanket impl that goes from
         // &StructType to ArrowSchema via TryFromKernel.
-        let arrow_schema: arrow_schema::Schema = kernel_schema
-            .as_ref()
-            .try_into_arrow()
-            .map_err(|e: arrow_schema::ArrowError| {
-                BackendError::Other(format!("Delta reflect_table_spec arrow conv: {e}"))
-            })?;
+        let arrow_schema: arrow_schema::Schema =
+            kernel_schema
+                .as_ref()
+                .try_into_arrow()
+                .map_err(|e: arrow_schema::ArrowError| {
+                    BackendError::Other(format!("Delta reflect_table_spec arrow conv: {e}"))
+                })?;
 
         let columns: Vec<crate::types::ColumnSpec> = arrow_schema
             .fields()
@@ -1593,8 +1591,7 @@ impl Backend for DeltaBackend {
         // only the PK populated still validate) + a synthesized
         // `__op` Utf8 column that the MERGE branches dispatch on.
         let arrow_schema = build_cdc_source_schema(spec)?;
-        let source_batch =
-            build_cdc_source_batch(arrow_schema.clone(), &events, &pk_cols)?;
+        let source_batch = build_cdc_source_batch(arrow_schema.clone(), &events, &pk_cols)?;
 
         // Open the target. Like run_merge, we require the table
         // to exist — initial schema bootstrap is the user's job
@@ -1610,9 +1607,8 @@ impl Backend for DeltaBackend {
 
         // Wrap the source batch in a DataFusion DataFrame —
         // deltalake's MergeBuilder consumes a DataFrame.
-        let memtable =
-            MemTable::try_new(arrow_schema.clone(), vec![vec![source_batch.clone()]])
-                .map_err(|e| BackendError::Query(format!("delta cdc memtable: {e}")))?;
+        let memtable = MemTable::try_new(arrow_schema.clone(), vec![vec![source_batch.clone()]])
+            .map_err(|e| BackendError::Query(format!("delta cdc memtable: {e}")))?;
         let ctx = SessionContext::new();
         let df = ctx
             .read_table(Arc::new(memtable))
@@ -1648,9 +1644,7 @@ impl Backend for DeltaBackend {
                 merge = merge
                     .when_matched_delete(|d| d.predicate("source.__op = 'd'"))
                     .map_err(|e| {
-                        BackendError::Query(format!(
-                            "delta cdc when_matched_delete: {e}"
-                        ))
+                        BackendError::Query(format!("delta cdc when_matched_delete: {e}"))
                     })?;
             }
             DeleteMode::Soft { column } => {
@@ -1679,9 +1673,7 @@ impl Backend for DeltaBackend {
                 }
                 u
             })
-            .map_err(|e| {
-                BackendError::Query(format!("delta cdc when_matched_update: {e}"))
-            })?;
+            .map_err(|e| BackendError::Query(format!("delta cdc when_matched_update: {e}")))?;
 
         // WHEN NOT MATCHED AND __op != 'd' → INSERT the post-
         // image. A delete event for an absent row falls through
@@ -1695,9 +1687,7 @@ impl Backend for DeltaBackend {
                 }
                 i
             })
-            .map_err(|e| {
-                BackendError::Query(format!("delta cdc when_not_matched_insert: {e}"))
-            })?;
+            .map_err(|e| BackendError::Query(format!("delta cdc when_not_matched_insert: {e}")))?;
 
         let (_table, metrics) = merge
             .await
@@ -1726,8 +1716,8 @@ impl Backend for DeltaBackend {
 /// dialect-specific bytes formats) are follow-ups when a user
 /// hits them.
 fn arrow_to_column_type(dt: &arrow_schema::DataType) -> crate::types::ColumnType {
-    use arrow_schema::DataType as DT;
     use crate::types::ColumnType as CT;
+    use arrow_schema::DataType as DT;
     match dt {
         DT::Int8 | DT::Int16 => CT::SmallInt,
         DT::Int32 => CT::Integer,
@@ -1750,9 +1740,7 @@ fn arrow_to_column_type(dt: &arrow_schema::DataType) -> crate::types::ColumnType
 /// Δ.X1: build the Arrow schema for the source RecordBatch the
 /// MERGE consumes — every spec column made nullable plus a
 /// non-null `__op` Utf8 column.
-fn build_cdc_source_schema(
-    spec: &TableSpec,
-) -> Result<Arc<arrow_schema::Schema>, BackendError> {
+fn build_cdc_source_schema(spec: &TableSpec) -> Result<Arc<arrow_schema::Schema>, BackendError> {
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
     let mut fields: Vec<Field> = Vec::with_capacity(spec.columns.len() + 1);
     for col in &spec.columns {
@@ -1775,8 +1763,8 @@ fn build_cdc_source_schema(
 fn column_type_to_arrow(
     ct: &crate::types::ColumnType,
 ) -> Result<arrow_schema::DataType, BackendError> {
-    use arrow_schema::{DataType, TimeUnit};
     use crate::types::ColumnType as CT;
+    use arrow_schema::{DataType, TimeUnit};
     Ok(match ct {
         CT::SmallInt => DataType::Int16,
         CT::Integer => DataType::Int32,
@@ -1788,9 +1776,7 @@ fn column_type_to_arrow(
         CT::Bytes => DataType::Binary,
         CT::Date => DataType::Date32,
         CT::Timestamp => DataType::Timestamp(TimeUnit::Microsecond, None),
-        CT::TimestampTz => {
-            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))
-        }
+        CT::TimestampTz => DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
         CT::Numeric { .. } => {
             return Err(BackendError::Other(
                 "Delta run_cdc: ColumnType::Numeric is not yet supported on the \
@@ -1848,10 +1834,7 @@ fn build_cdc_source_batch(
             CdcOp::Delete => "d",
             CdcOp::Read => "r",
         };
-        row.insert(
-            "__op".into(),
-            serde_json::Value::String(op_str.to_string()),
-        );
+        row.insert("__op".into(), serde_json::Value::String(op_str.to_string()));
         buf.extend(serde_json::to_string(&row).unwrap().bytes());
         buf.push(b'\n');
     }
@@ -1877,9 +1860,7 @@ fn build_cdc_source_batch(
 /// fallback. Inlined to avoid pulling in a heavier
 /// `arrow_array::create_empty_array` import path that varies
 /// across arrow_array versions.
-fn schema_empty_columns(
-    schema: &arrow_schema::Schema,
-) -> Vec<Arc<dyn arrow_array::Array>> {
+fn schema_empty_columns(schema: &arrow_schema::Schema) -> Vec<Arc<dyn arrow_array::Array>> {
     use arrow_schema::DataType as DT;
     schema
         .fields()
@@ -2895,28 +2876,43 @@ mod tests {
             .unwrap();
         // Delta's MERGE result-cast may produce LargeUtf8 instead
         // of Utf8 — handle both via a small visitor.
-        fn read_string_column(
-            batch: &RecordBatch,
-            idx: usize,
-        ) -> Vec<Option<String>> {
+        fn read_string_column(batch: &RecordBatch, idx: usize) -> Vec<Option<String>> {
             let col = batch.column(idx);
             match col.data_type() {
                 DataType::Utf8 => {
                     let s = col.as_string::<i32>();
                     (0..s.len())
-                        .map(|i| if s.is_null(i) { None } else { Some(s.value(i).to_string()) })
+                        .map(|i| {
+                            if s.is_null(i) {
+                                None
+                            } else {
+                                Some(s.value(i).to_string())
+                            }
+                        })
                         .collect()
                 }
                 DataType::LargeUtf8 => {
                     let s = col.as_string::<i64>();
                     (0..s.len())
-                        .map(|i| if s.is_null(i) { None } else { Some(s.value(i).to_string()) })
+                        .map(|i| {
+                            if s.is_null(i) {
+                                None
+                            } else {
+                                Some(s.value(i).to_string())
+                            }
+                        })
                         .collect()
                 }
                 DataType::Utf8View => {
                     let s = col.as_string_view();
                     (0..s.len())
-                        .map(|i| if s.is_null(i) { None } else { Some(s.value(i).to_string()) })
+                        .map(|i| {
+                            if s.is_null(i) {
+                                None
+                            } else {
+                                Some(s.value(i).to_string())
+                            }
+                        })
                         .collect()
                 }
                 other => panic!("unexpected string-column type from Delta read: {other:?}"),
@@ -3033,7 +3029,11 @@ mod tests {
         assert_eq!(
             surviving,
             vec![
-                (1, Some("alice@example.com".into()), Some("Alice Smith".into())),
+                (
+                    1,
+                    Some("alice@example.com".into()),
+                    Some("Alice Smith".into())
+                ),
                 (2, Some("bob@example.com".into()), Some("Bob".into())),
             ]
         );
@@ -3165,8 +3165,7 @@ mod tests {
                 Arc::new(Int64Array::from(vec![1i64])),
                 Arc::new(StringArray::from(vec![Some("alice@example.com")])),
                 Arc::new(
-                    TimestampMicrosecondArray::from(vec![None as Option<i64>])
-                        .with_timezone("UTC"),
+                    TimestampMicrosecondArray::from(vec![None as Option<i64>]).with_timezone("UTC"),
                 ),
             ],
         )
@@ -3212,17 +3211,15 @@ mod tests {
         let result = backend
             .run_cdc(
                 &spec,
-                cdc_record_batch_from_json(&[
-                    json!({
-                        "before": {"id": 1, "email": "alice@example.com"},
-                        "after":  null,
-                        "op": "d",
-                        "ts_ms": 1_700_000_000_500_i64,
-                    })
-                    .as_object()
-                    .unwrap()
-                    .clone(),
-                ]),
+                cdc_record_batch_from_json(&[json!({
+                    "before": {"id": 1, "email": "alice@example.com"},
+                    "after":  null,
+                    "op": "d",
+                    "ts_ms": 1_700_000_000_500_i64,
+                })
+                .as_object()
+                .unwrap()
+                .clone()]),
                 &cdc,
                 "test_delta_soft",
             )
@@ -3273,17 +3270,15 @@ mod tests {
         let err = backend
             .run_cdc(
                 &spec,
-                cdc_record_batch_from_json(&[
-                    json!({
-                        "before": null,
-                        "after": {"id": 1, "email": "a@x.com", "name": "A", "phone": "+1"},
-                        "op": "c",
-                        "ts_ms": 1_700_000_000_001_i64,
-                    })
-                    .as_object()
-                    .unwrap()
-                    .clone(),
-                ]),
+                cdc_record_batch_from_json(&[json!({
+                    "before": null,
+                    "after": {"id": 1, "email": "a@x.com", "name": "A", "phone": "+1"},
+                    "op": "c",
+                    "ts_ms": 1_700_000_000_001_i64,
+                })
+                .as_object()
+                .unwrap()
+                .clone()]),
                 &cdc,
                 "test_delta_fail",
             )
@@ -3320,7 +3315,10 @@ mod tests {
         assert_eq!(arrow_to_column_type(&DataType::Int64), ColumnType::BigInt);
         assert_eq!(arrow_to_column_type(&DataType::Float32), ColumnType::Float);
         assert_eq!(arrow_to_column_type(&DataType::Float64), ColumnType::Double);
-        assert_eq!(arrow_to_column_type(&DataType::Boolean), ColumnType::Boolean);
+        assert_eq!(
+            arrow_to_column_type(&DataType::Boolean),
+            ColumnType::Boolean
+        );
         assert_eq!(arrow_to_column_type(&DataType::Utf8), ColumnType::Text);
         assert_eq!(arrow_to_column_type(&DataType::LargeUtf8), ColumnType::Text);
         assert_eq!(arrow_to_column_type(&DataType::Binary), ColumnType::Bytes);
@@ -3492,7 +3490,10 @@ mod tests {
         };
         let pk_cols = vec!["tenant_id".to_string(), "id".to_string()];
         let canon = canonical_pk_string(&composite, &pk_cols);
-        assert!(canon.contains('\u{1f}'), "composite uses unit-separator joiner");
+        assert!(
+            canon.contains('\u{1f}'),
+            "composite uses unit-separator joiner"
+        );
         assert!(canon.contains('7') && canon.contains('3'));
 
         // Composite PK with one column missing — that column
@@ -3507,7 +3508,10 @@ mod tests {
             before: None,
         };
         let canon = canonical_pk_string(&partial, &pk_cols);
-        assert!(canon.contains("null"), "missing PK column → \"null\"; got: {canon}");
+        assert!(
+            canon.contains("null"),
+            "missing PK column → \"null\"; got: {canon}"
+        );
 
         // Composite-style pk_cols but key is a scalar (parser
         // produces this shape for delete events with a scalar

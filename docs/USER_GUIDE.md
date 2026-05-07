@@ -923,8 +923,10 @@ message as a CDC envelope (Debezium / Maxwell / a custom shape)
 and applies the resulting `c` / `u` / `d` / `r` operation to a
 **mirror** table.
 
-End-to-end example: [`examples/cdc-debezium`](../examples/cdc-debezium/README.md)
+End-to-end example: [`examples/cdc-debezium`](https://github.com/ryan-evans-git/ematix-flow/tree/main/examples/cdc-debezium)
 — Postgres → Debezium → Kafka → ematix-flow → Postgres mirror.
+(Absolute GitHub URL because the rendered docs site only serves `docs/`;
+relative links to `examples/` don't resolve in mkdocs-material.)
 
 ### What it looks like
 

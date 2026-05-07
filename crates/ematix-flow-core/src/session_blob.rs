@@ -528,12 +528,15 @@ mod tests {
             },
             AccState::MinI64(Some(7)),
             AccState::MinI64(None),
-            AccState::MinF64(Some(3.14)),
+            AccState::MinF64(Some(2.5)),
             AccState::MinF64(None),
             AccState::MaxI64(Some(42)),
             AccState::MaxF64(Some(99.9)),
             AccState::AvgI64 { sum: 100, count: 4 },
-            AccState::AvgF64 { sum: 10.0, count: 3 },
+            AccState::AvgF64 {
+                sum: 10.0,
+                count: 3,
+            },
             AccState::FirstI64 {
                 ts: Some(1000),
                 value: Some(7),
@@ -596,10 +599,13 @@ mod tests {
                 500,
                 emitted,
                 dirty,
-                vec![AccState::CountStar(1), AccState::SumF64 {
-                    sum: 7.5,
-                    any: true,
-                }],
+                vec![
+                    AccState::CountStar(1),
+                    AccState::SumF64 {
+                        sum: 7.5,
+                        any: true,
+                    },
+                ],
             );
             let bytes = encode_sessions(&[session]).unwrap();
             let back = decode_sessions(&bytes).unwrap();
@@ -621,7 +627,7 @@ mod tests {
     fn group_key_roundtrip_remaining_variants() {
         let key = GroupKey::from_values(vec![
             KeyValue::UInt64(12345),
-            KeyValue::Float64Bits(3.14_f64.to_bits()),
+            KeyValue::Float64Bits(2.5_f64.to_bits()),
             KeyValue::TsMicros(1_700_000_000_000_000),
         ]);
         let bytes = encode_group_key(&key).unwrap();

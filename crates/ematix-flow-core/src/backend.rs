@@ -1953,8 +1953,7 @@ mod tests {
     /// kind), preserving the message verbatim.
     #[test]
     fn pg_error_other_maps_to_backend_other() {
-        let other_err: BackendError =
-            PgError::Other("CDC target has no PK".into()).into();
+        let other_err: BackendError = PgError::Other("CDC target has no PK".into()).into();
         match other_err {
             BackendError::Other(msg) => {
                 assert!(msg.contains("CDC target has no PK"));
@@ -2044,14 +2043,15 @@ mod tests {
             unique_constraints: vec![],
             fingerprint: String::new(),
         };
-        let cdc_cfg = crate::cdc::CdcConfig::for_envelope(
-            crate::cdc::EnvelopeKind::Debezium,
-        );
+        let cdc_cfg = crate::cdc::CdcConfig::for_envelope(crate::cdc::EnvelopeKind::Debezium);
         // Build a 0-row RecordBatch — the default impl returns
         // before parsing, so the batch shape is irrelevant.
-        let arrow_schema = std::sync::Arc::new(arrow_schema::Schema::new(vec![
-            arrow_schema::Field::new("op", arrow_schema::DataType::Utf8, true),
-        ]));
+        let arrow_schema =
+            std::sync::Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+                "op",
+                arrow_schema::DataType::Utf8,
+                true,
+            )]));
         let batch = RecordBatch::new_empty(arrow_schema);
         let err = backend
             .run_cdc(&spec, batch, &cdc_cfg, "p")

@@ -8156,10 +8156,7 @@ mode   = "sketch"
             None,
         )
         .unwrap_err();
-        assert!(
-            err.to_string().contains("at most one"),
-            "got: {err}"
-        );
+        assert!(err.to_string().contains("at most one"), "got: {err}");
     }
 
     #[test]
@@ -8179,16 +8176,8 @@ mode   = "sketch"
     fn kafka_auth_scram_requires_user_password_mechanism() {
         // password+mechanism without username.
         let b = KafkaBackend::open("localhost:9092", None).unwrap();
-        let err = apply_kafka_auth(
-            b,
-            None,
-            None,
-            None,
-            Some("p"),
-            Some("sha-256"),
-            None,
-        )
-        .unwrap_err();
+        let err =
+            apply_kafka_auth(b, None, None, None, Some("p"), Some("sha-256"), None).unwrap_err();
         assert!(
             err.to_string().contains("sasl_scram_username"),
             "got: {err}"
@@ -8196,16 +8185,8 @@ mode   = "sketch"
 
         // username+mechanism without password.
         let b = KafkaBackend::open("localhost:9092", None).unwrap();
-        let err = apply_kafka_auth(
-            b,
-            None,
-            None,
-            Some("u"),
-            None,
-            Some("sha-256"),
-            None,
-        )
-        .unwrap_err();
+        let err =
+            apply_kafka_auth(b, None, None, Some("u"), None, Some("sha-256"), None).unwrap_err();
         assert!(
             err.to_string().contains("sasl_scram_password"),
             "got: {err}"
@@ -8223,16 +8204,8 @@ mode   = "sketch"
     #[test]
     fn kafka_auth_scram_rejects_unknown_mechanism() {
         let b = KafkaBackend::open("localhost:9092", None).unwrap();
-        let err = apply_kafka_auth(
-            b,
-            None,
-            None,
-            Some("u"),
-            Some("p"),
-            Some("md5"),
-            None,
-        )
-        .unwrap_err();
+        let err =
+            apply_kafka_auth(b, None, None, Some("u"), Some("p"), Some("md5"), None).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("md5"), "got: {msg}");
         assert!(msg.contains("sha-256") || msg.contains("supported"));
