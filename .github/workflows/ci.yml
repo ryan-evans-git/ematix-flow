@@ -58,7 +58,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python: ["3.11", "3.12"]
+        # Tests every Python version we ship a wheel for (see
+        # release.yml's build-linux/build-macos matrices). Keeping
+        # ci + release in lockstep prevents accidentally publishing
+        # a wheel for a Python the test suite has never run on.
+        python: ["3.11", "3.12", "3.13", "3.14"]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

@@ -7,8 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-Nothing pending — see [`docs/ROADMAP.md`](docs/ROADMAP.md) for the
-prioritized list of remaining work.
+### Added
+
+- Python 3.14 support. CI matrix and the wheel-build matrix in
+  `release.yml` now include `cp314-cp314` for both
+  `linux-x86_64` (manylinux_2_28) and `macos-aarch64` (Apple
+  Silicon). `pyproject.toml` carries the matching trove
+  classifier. Python 3.14 went stable in October 2025; pyo3 0.28
+  in the workspace already supports the 3.14 ABI. The next tag
+  push will publish 3.14 wheels and end the source-build fallback
+  for users on the current stable Python.
+
+### Changed
+
+- CI Python matrix expanded from `{3.11, 3.12}` to
+  `{3.11, 3.12, 3.13, 3.14}` so every Python we publish a wheel
+  for is covered by the test suite. Previously 3.13 wheels shipped
+  unexercised by CI.
 
 ## [0.1.2] — 2026-05-06
 
