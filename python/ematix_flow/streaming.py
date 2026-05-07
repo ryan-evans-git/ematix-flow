@@ -112,6 +112,12 @@ class Target:
     parquet_compression: str | None = None  # "uncompressed" | "snappy" | "gzip" | "zstd"
     csv_delimiter: str | None = None  # single-character string
     csv_header: bool | None = None
+    # Δ.X1.2: optional user-declared primary-key column list,
+    # emitted as ``[target.table].primary_key = [...]`` in the
+    # generated TOML. Required for CDC pipelines whose target
+    # backend can't surface PK info via reflection (Delta, object
+    # stores). Harmless on Postgres CDC.
+    primary_key: list[str] | None = None
 
 
 @dataclass(frozen=True)
@@ -584,6 +590,11 @@ def run_streaming_pipeline(
     target_prefix: str | None = None,
     target_message_key_column: str | None = None,
     target_partition_by: list[str] | None = None,
+    # Δ.X1.2: optional user-declared PK column list, emitted as
+    # ``[target.table].primary_key = [...]``. Required for CDC
+    # pipelines whose target backend can't surface PK info via
+    # reflection (Delta, object stores). Harmless on Postgres CDC.
+    target_primary_key: list[str] | None = None,
     # Π.4a multi-target: list of typed Target specs. Mutually
     # exclusive with the single ``target=`` shape above.
     targets: list[Target] | None = None,
@@ -644,6 +655,7 @@ def run_streaming_pipeline(
         target_prefix=target_prefix,
         target_message_key_column=target_message_key_column,
         target_partition_by=target_partition_by,
+        target_primary_key=target_primary_key,
         targets=targets,
         idle_pause_ms=idle_pause_ms,
         dead_letter_topic=dead_letter_topic,
@@ -673,6 +685,7 @@ def _run_streaming_pipeline_emit_toml(
     target_prefix: str | None = None,
     target_message_key_column: str | None = None,
     target_partition_by: list[str] | None = None,
+    target_primary_key: list[str] | None = None,
     targets: list[Target] | None = None,
     idle_pause_ms: int = 500,
     dead_letter_topic: str | None = None,
@@ -761,6 +774,7 @@ def _run_streaming_pipeline_emit_toml(
                 prefix=target_prefix,
                 message_key_column=target_message_key_column,
                 partition_by=target_partition_by,
+                primary_key=target_primary_key,
             )
         ]
 
@@ -1241,6 +1255,9 @@ def _emit_single_target_block(spec: Target) -> list[str]:
         lines.append("[target.table]")
         lines.append(f"schema = {_q(schema)}")
         lines.append(f"name = {_q(table)}")
+        if spec.primary_key:
+            pk_lits = ", ".join(_q(c) for c in spec.primary_key)
+            lines.append(f"primary_key = [{pk_lits}]")
     return lines
 
 
@@ -1269,6 +1286,9 @@ def _emit_targets_array_entry(spec: Target) -> list[str]:
         lines.append("[targets.table]")
         lines.append(f"schema = {_q(schema)}")
         lines.append(f"name = {_q(table)}")
+        if spec.primary_key:
+            pk_lits = ", ".join(_q(c) for c in spec.primary_key)
+            lines.append(f"primary_key = [{pk_lits}]")
     return lines
 
 

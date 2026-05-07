@@ -9,6 +9,157 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **CI: integration-tests + coverage gate workflow.**
+  `.github/workflows/integration.yml` runs `cargo llvm-cov`
+  across the whole workspace with `--include-ignored` so the
+  100+ testcontainer-gated tests (Postgres CDC, MinIO/S3 Delta,
+  cross-pod distributed, etc.) are exercised in CI for the first
+  time — previously only the unit-test set ran via `ci.yml`.
+  - **Coverage measurement (no hard gate yet)**. After 6 rounds
+    of unit-test backfill (commits 18d62ed..bcff28b — 41 new
+    tests across cli/lib.rs, backend.rs, delta_backend.rs,
+    session_blob.rs, transform.rs, objectstore date helpers)
+    local measurement is at **86.54% line coverage** with the
+    same scope (excluding PyO3 wrappers + entrypoint binaries),
+    up from 84.84% baseline. The user's stated target is 90%;
+    `--fail-under-lines` is deliberately NOT set on the workflow
+    until that threshold lands — enforcing a below-target floor
+    creates noise on PRs without bringing real correctness
+    benefit. The workflow runs cargo-llvm-cov, prints the
+    summary, and uploads the lcov artifact for human review.
+    Path to 90%: a single Postgres testcontainer test exercising
+    every Arrow column type closes ~500 lines simultaneously
+    across backend.rs/pg.rs/duckdb_backend.rs/mysql_backend.rs's
+    COPY-BINARY type-binding paths; windowed.rs internal-state
+    edges close another ~100.
+  - **paths-ignore filter**: the integration workflow skips
+    when only LICENSE / NOTICE / docs / markdown changes — so a
+    license-or-docs-only PR doesn't pay the 30-min testcontainer
+    spin-up cost.
+  - **Excluded from the coverage denominator**:
+    `ematix-flow-py/src/*.rs` (PyO3 wrappers covered only via
+    `pytest`, invisible to `cargo-llvm-cov`),
+    `cli/src/main.rs` and `distributed/src/bin/flow_worker.rs`
+    (process entrypoints — thin wrappers around library code
+    that *is* covered).
+  - **Triggers**: every PR + push to main + nightly schedule +
+    `workflow_dispatch`. Adding the
+    `integration tests + coverage (ubuntu-latest)` job to the
+    `main` branch's required-status-checks is the next step
+    after one successful run lands the check name in GitHub's
+    discoverable list.
+
+### Added
+
+- **Phase Δ — CDC source mode**. Streaming pipelines can now
+  treat each Kafka batch as a CDC envelope and apply per-event
+  changes to a Postgres mirror table.
+  - `[transform.cdc]` TOML block + `CDC(envelope="debezium")`
+    Python dataclass — peer-equivalent paths into the same
+    `CdcConfig`. Mutually exclusive with `[transform.window]` /
+    `[transform.join]` / a SQL pre-stage; cross-validated at
+    config-load.
+  - Debezium + Maxwell + custom envelopes. Custom requires every
+    field path + `op_map` set explicitly; the validator names
+    what's missing.
+  - `Backend::run_cdc` trait method + Postgres impl. Per-batch
+    transactional with prepared-statement reuse across same-op
+    events; UPSERT / UPDATE / DELETE all coerce JSON → row types
+    via `jsonb_populate_record(NULL::<table>, $1::jsonb)`.
+    `delete_mode = "soft"` flips a configured column instead of
+    DELETE.
+  - **Idempotency gate**: per-`(pipeline, pk_json)` last-seen-ts
+    tracked in `ematix_flow.cdc_idempotency`. Single-round-trip
+    `INSERT … ON CONFLICT DO UPDATE … WHERE … RETURNING 1`
+    inside the executor's transaction — Kafka redeliveries are
+    suppressed atomically with the data write. Surfaced via
+    `ematix_streaming_cdc_idempotent_skipped_total` so absorbed
+    redeliveries are visible to operators.
+  - **Schema-evolution detection**: default `Skip` warns once
+    per drift column per batch then lets Postgres's coercion
+    discard the unknown key; `Fail` returns an error and rolls
+    the batch back transactionally. `AlterTable` deferred — see
+    plan.
+  - **Streaming-runtime dispatch wiring**: when `[transform.cdc]`
+    is set, the per-batch loop routes through `Backend::run_cdc`
+    instead of the universal `write_arrow_stream` append path.
+    Target schemas are reflected once at startup via the new
+    `Backend::reflect_table_spec` trait method (Postgres impl
+    via `information_schema.columns`); non-CDC pipelines never
+    pay the reflection round-trip.
+  - **Five new Prometheus counters** under `pipeline=<name>`:
+    `ematix_streaming_cdc_creates_total`,
+    `ematix_streaming_cdc_updates_total`,
+    `ematix_streaming_cdc_deletes_total`,
+    `ematix_streaming_cdc_skipped_total`,
+    `ematix_streaming_cdc_idempotent_skipped_total`.
+  - **`examples/cdc-debezium/`**: docker-compose stack
+    (Postgres source + Debezium + Kafka + Postgres mirror) with
+    a connector-registration helper and a step-by-step README.
+  - **`docs/USER_GUIDE.md` § "CDC source mode (Δ)"**: full
+    surface — TOML + Python + envelopes + cross-validation +
+    metrics + multi-target reach.
+  - Plan: [`docs/PHASE_DELTA_CDC_PLAN.md`](docs/PHASE_DELTA_CDC_PLAN.md).
+    PRs 1–6 shipped + a PR 5.5 ("wire dispatch into the runtime")
+    that filled a gap discovered during PR 6 scoping.
+
+Multi-target reach (Delta Lake, DuckDB / SQLite / MySQL, object
+stores, streaming targets) is catalogued as Phase Δ extensions
+and unshipped — see the plan's "Phase Δ extensions" section.
+
+- **Δ.X1 PR 1 — Delta Lake CDC target.** Single-MERGE-per-batch
+  CDC apply on `DeltaBackend` via `deltalake::DeltaOps::merge`.
+  Three branches dispatch on a synthesized `__op` Utf8 column:
+  `when_matched_delete` for `__op = 'd'`, `when_matched_update`
+  for c/u/r overwrite, `when_not_matched_insert` for the
+  INSERT-when-absent path. Within-batch dedupe by primary key
+  keeps the highest-`ts_ms` event so `c` then `u` for the same
+  row collapses to one INSERT carrying the post-image of the `u`.
+  - Schema evolution: `Skip` rides Delta's
+    `with_merge_schema(true)` for auto-evolution (cleaner than
+    Postgres's "warn + drop"); `Fail` pre-flights against the
+    spec and aborts before MERGE with the offending column named.
+  - Soft-delete: replaces `when_matched_delete` with a
+    `when_matched_update` that flips the configured column to
+    `current_timestamp()`. Reported as `updates`, not `deletes`.
+  - Reflection: `Backend::reflect_table_spec` on `DeltaBackend`
+    returns columns from Delta's Arrow schema. PK info is **not**
+    surfaced — Delta tables don't carry PK constraints natively
+    and the kernel crate gates `Metadata.configuration` behind an
+    `internal_api` macro. Direct callers of `Backend::run_cdc`
+    (hand-built `TableSpec` with PK info) work; streaming-runtime
+    auto-dispatch waits on Δ.X1.2.
+  - Tests: 4 new tempdir-rooted unit tests cover multi-batch
+    dispatch counters, within-batch dedupe, soft-delete, and
+    Fail-policy abort.
+  - Residual gaps documented inline: between-batch idempotency
+    (Δ.X1.1 — needs `_cdc_last_ts` hidden column or sidecar
+    table), Numeric column-type support on the source-batch path.
+- **Δ.X1.2 — user-declared PK threading for streaming-runtime
+  CDC dispatch.** The Δ.X1 PR 1 reflect path returns Delta
+  columns with `primary_key = false` (Delta tables don't carry
+  PK constraints natively, and the kernel crate's
+  `Metadata.configuration` is gated behind an `internal_api`
+  macro). Δ.X1.2 routes around it: users declare the PK on the
+  target spec and the streaming runtime augments the reflected
+  spec before dispatching to `Backend::run_cdc`. Three
+  equivalent surfaces:
+  - `[target.table].primary_key = ["id"]` TOML field on every
+    table-bearing target kind (Postgres / MySQL / SQLite /
+    DuckDB / DeltaLocal / DeltaS3). Lowering hooks land via
+    `PipelineCliConfig::target_primary_keys()`.
+  - `Target(primary_key=["id"])` field on the typed-Python
+    streaming spec; emitter writes it into the rendered TOML.
+  - `target_primary_key=["id"]` kwarg on
+    `run_streaming_pipeline` for the legacy single-target shape.
+  - `StreamingPipeline::ensure_cdc_target_specs` validates each
+    declared column against the live reflected schema and fails
+    loud on a typo, naming the offending column.
+  - 2 new dispatch-wiring unit tests cover augmentation +
+    typo-detection. CLI parse test locks the new TOML field.
+  - Postgres CDC unaffected: declaration is optional; reflection
+    already surfaces PK info, augmentation matches existing PK
+    flags rather than overriding them.
 - Python 3.14 support. CI matrix and the wheel-build matrix in
   `release.yml` now include `cp314-cp314` for both
   `linux-x86_64` (manylinux_2_28) and `macos-aarch64` (Apple

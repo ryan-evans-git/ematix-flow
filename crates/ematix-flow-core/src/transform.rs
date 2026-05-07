@@ -1192,4 +1192,141 @@ mod tests {
         // points at the SQL parse step.
         assert!(err.to_string().to_lowercase().contains("sql"));
     }
+
+    // ----------------------------------------------------------
+    // Coverage backfill round 5 — small pure helpers in
+    // transform.rs that the existing transform-execution tests
+    // don't drive specific arms of.
+    // ----------------------------------------------------------
+
+    /// `schemas_equivalent` returns false on every difference
+    /// (length / name / data type / nullability) and true on
+    /// equality. The drift-check path uses this to decide
+    /// whether to surface a schema-mismatch error.
+    #[test]
+    fn schemas_equivalent_rejects_every_diff() {
+        use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+
+        let base = ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+        ]);
+        // Equal copy → true.
+        let equal = ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+        ]);
+        assert!(schemas_equivalent(&base, &equal));
+
+        // Different field count → false.
+        let shorter = ArrowSchema::new(vec![Field::new("id", DataType::Int64, false)]);
+        assert!(!schemas_equivalent(&base, &shorter));
+
+        // Renamed column → false.
+        let renamed = ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("user_name", DataType::Utf8, true),
+        ]);
+        assert!(!schemas_equivalent(&base, &renamed));
+
+        // Different data type → false.
+        let retyped = ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, true),
+        ]);
+        assert!(!schemas_equivalent(&base, &retyped));
+
+        // Different nullability → false.
+        let nullable_id = ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("name", DataType::Utf8, true),
+        ]);
+        assert!(!schemas_equivalent(&base, &nullable_id));
+
+        // Schema metadata differences are deliberately ignored
+        // (lookup-load paths often don't preserve the metadata).
+        let mut with_md = ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+        ]);
+        with_md = with_md.with_metadata(
+            [("provenance".to_string(), "lookup_load".to_string())]
+                .into_iter()
+                .collect(),
+        );
+        assert!(
+            schemas_equivalent(&base, &with_md),
+            "schema-metadata diffs are benign for equivalence"
+        );
+    }
+
+    /// `Debug` on `DataFusionTransform` renders the user-meaningful
+    /// fields by hand because `SessionContext` doesn't impl Debug.
+    /// Locks the rendered shape so refactors don't accidentally
+    /// drop a field.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn data_fusion_transform_debug_renders_user_fields() {
+        let t = DataFusionTransform::new("SELECT id FROM source", schema_id_name())
+            .await
+            .expect("construct transform");
+        let s = format!("{t:?}");
+        assert!(s.contains("DataFusionTransform"), "got: {s}");
+        assert!(s.contains("sql"), "Debug must include the SQL text");
+        assert!(
+            s.contains("trivial"),
+            "Debug must surface the trivial-projection flag"
+        );
+    }
+
+    /// `Debug` on `LazySqlTransform` includes the SQL + the
+    /// initialized flag + lookup names.
+    #[test]
+    fn lazy_sql_transform_debug_includes_initialized_flag() {
+        let t = LazySqlTransform::new("SELECT id FROM source");
+        let s = format!("{t:?}");
+        assert!(s.contains("LazySqlTransform"), "got: {s}");
+        assert!(s.contains("initialized"));
+        // Pre-build, the inner transform isn't constructed — so
+        // the rendered "initialized" must be `false`.
+        assert!(s.contains("false"), "uninitialized lazy transform: got {s}");
+    }
+
+    /// The trivial-projection detector rejects projections whose
+    /// inner plan has filters, a LIMIT, or a non-`source` table.
+    /// Each disqualifying condition routes through a separate
+    /// branch; this test trips each one.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn trivial_projection_rejects_filtered_or_limited_plans() {
+        // Filter clause disqualifies the trivial fast path.
+        let with_filter =
+            DataFusionTransform::new("SELECT id, name FROM source WHERE id > 0", schema_id_name())
+                .await
+                .expect("construct");
+        assert!(
+            !with_filter.is_trivial(),
+            "WHERE clause should disqualify the trivial bypass"
+        );
+
+        // LIMIT disqualifies.
+        let with_limit =
+            DataFusionTransform::new("SELECT id, name FROM source LIMIT 5", schema_id_name())
+                .await
+                .expect("construct");
+        assert!(
+            !with_limit.is_trivial(),
+            "LIMIT should disqualify the trivial bypass"
+        );
+
+        // A computed column disqualifies.
+        let with_expr = DataFusionTransform::new(
+            "SELECT id, name, id + 1 AS id_plus FROM source",
+            schema_id_name(),
+        )
+        .await
+        .expect("construct");
+        assert!(
+            !with_expr.is_trivial(),
+            "computed columns should disqualify the trivial bypass"
+        );
+    }
 }

@@ -66,3 +66,57 @@ fn stream_join_parses() {
         "join pipeline must declare state_store"
     );
 }
+
+/// Phase Δ PR 6: the CDC demo's pipeline.toml must parse — its
+/// validity is part of the user-facing contract.
+#[test]
+fn cdc_debezium_pipeline_parses() {
+    let cfg = parse_example("cdc-debezium/pipeline.toml");
+    assert_eq!(cfg.pipeline_name, "cdc-mirror-customers");
+    assert_eq!(cfg.source_query, "dbz.public.customers");
+    let cdc = cfg
+        .transform
+        .as_ref()
+        .and_then(|t| t.cdc.as_ref())
+        .expect("cdc-debezium example must declare [transform.cdc]");
+    assert_eq!(cdc.envelope, "debezium");
+    assert_eq!(cdc.key_field.as_deref(), Some("after.id"));
+}
+
+/// Δ.X1.2: `[target.table].primary_key` is the user-facing channel
+/// for declaring PKs on backends that can't surface them via
+/// reflection. Locks the parse + the lowering helper that the
+/// streaming runtime consumes.
+#[test]
+fn target_table_primary_key_threads_through() {
+    let toml = r#"
+pipeline_name = "cdc-mirror"
+source_query  = "dbz.public.customers"
+idle_pause_ms = 200
+
+[source]
+kind              = "kafka"
+bootstrap_servers = "localhost:9094"
+
+[target]
+kind = "delta_local"
+path = "/tmp/lake"
+
+[target.table]
+schema      = "default"
+name        = "customers"
+primary_key = ["id"]
+
+[transform.cdc]
+envelope  = "debezium"
+key_field = "after.id"
+"#;
+    let cfg = ematix_flow_cli::PipelineCliConfig::from_toml_str(toml)
+        .expect("delta-local + cdc + primary_key must parse");
+    let pks = cfg.target_primary_keys();
+    assert_eq!(
+        pks,
+        vec![vec!["id".to_string()]],
+        "user-declared PK threads through the lowering helper"
+    );
+}

@@ -298,26 +298,89 @@ incremental value:
   payloads, Postgres target → assert inserts, updates, deletes
   apply correctly.
 
-### PR 4 — idempotency via StateStore (3–4 days)
+### PR 4 — idempotency gate (3–4 days) — **shipped**
 
-- `cdc::<pipeline>::<pk>` prefix; `CdcKeyState` payload;
-  postcard ser/de.
-- StateStore reads on first-seen-key (cold-cache), in-memory
-  cache for the lifetime of the pipeline run.
-- Atomic commit: state writes + data writes in one transaction
-  (Postgres) or two-phase (Delta / object-store, follow-up).
-- Crash-recovery integration test: kill mid-batch, restart,
-  assert no double-apply.
+Per-PK last-seen-`ts_ms` admission gate, atomic with the data
+write. Implementation diverged from the original "via StateStore"
+sketch — the existing `StateStore::commit` opens its own
+transaction internally, so it can't share a Postgres transaction
+with the data writes the gate is supposed to be atomic with. CDC
+state is also a different shape from windowed/session/join state
+(a single `i64` per key, not an arbitrary postcard blob), so
+re-using the durable layer would have meant trait surgery + a
+weaker correctness story. Landed shape:
 
-### PR 5 — schema evolution detection (3 days)
+- New table `ematix_flow.cdc_idempotency (pipeline_name, pk_json,
+  last_seen_ts_ms)` lazy-created via `ensure_meta_schema()`.
+- Single-round-trip gate: `INSERT … ON CONFLICT DO UPDATE …
+  WHERE existing.last_seen_ts_ms < EXCLUDED.last_seen_ts_ms
+  RETURNING 1`. RETURNING-clause non-emptiness is the admission
+  verdict — empty result = redelivery, skip the data write.
+- Gate writes + data writes share the executor's per-batch
+  Postgres transaction → atomic across the entire batch. A crash
+  at any point leaves gate + target consistent.
+- In-batch cache (`HashMap<canonical_pk, last_admitted_ts>`) so
+  multiple events for the same PK in the same batch don't
+  re-hit the gate.
+- Events with `ts_ms = None` bypass the gate (documented
+  no-idempotency mode — user opted out by not configuring a
+  `ts_field`).
+- New `CdcRunResult.idempotent_skipped: i64` counter so
+  redeliveries are visible in metrics, not silent.
 
-- `SchemaEvolutionPolicy::Skip` default — warn once per unknown
-  column, omit from applied DDL.
-- `Fail` policy for strict deployments.
-- Open: `AlterTable` policy — Postgres only on first cut;
-  Delta + object-store deferred.
-- Tests: introduce a new column in the `after` payload mid-test,
-  assert Skip warns + omits, Fail errors out.
+Tests landed (testcontainers, `--ignored`):
+- `cdc_postgres_redelivery_is_idempotent` — apply same 3-event
+  batch twice → second run reports `idempotent_skipped = 3`.
+- `cdc_postgres_idempotency_survives_pool_restart` — apply,
+  drop the entire pool, reconnect, replay → second apply blocks
+  on durable on-disk state.
+- `cdc_postgres_idempotency_keyed_per_pipeline` — same PK +
+  ts_ms under two pipeline names is two distinct gate entries.
+
+Deferred to PR 5 + later: cross-target idempotency (Delta MERGE
+is naturally idempotent on equal post-images; the per-PK ts gate
+is a Postgres-only gain today). Out-of-order tolerance window
+(`out_of_order_tolerance_ms`) is configured + accepted but not
+yet wired — PR 4's gate is strict-monotonic; PR 5 will add the
+warn-on-backwards path.
+
+### PR 5 — schema-evolution detection (3 days) — **shipped**
+
+Drift check between the idempotency gate and the data dispatch:
+walk the `after` payload's keys against the target's declared
+columns, dispatch on `SchemaEvolutionPolicy`. Postgres's
+`jsonb_populate_record` already discards unknown JSON keys, so
+`Skip`'s "omit and apply" half is free — what PR 5 adds is the
+warn-once log line so silent column drops are visible to
+operators.
+
+- `SchemaEvolutionPolicy::Skip` (default): `tracing::warn!` once
+  per (column, batch) pair under `target = "ematix_flow::cdc"`,
+  with `pipeline` + `column` structured fields. Row applies; the
+  unknown column is dropped by Postgres's coercion path.
+- `SchemaEvolutionPolicy::Fail`: returns `PgError::Other` with a
+  message naming the offending column + the policy + a hint
+  ("add the column to the target table or switch to Skip"). The
+  outer transaction is rolled back via `Drop`, so any earlier
+  events in the same batch are not persisted — strict mode is
+  truly all-or-nothing.
+- The per-batch HashSet of warned-columns means a batch with 1000
+  events under one drift column produces one warn line, not
+  1000. Across batches the warn fires once per batch (acceptable
+  signal-to-noise; can refine to per-pipeline-lifetime if real-
+  world log volume becomes a problem).
+- `AlterTable` policy still deferred. Per-target ALTER plumbing
+  varies enough by backend that bundling it into PR 5 would have
+  doubled the surface — Δ.X1 (Delta) doesn't even use
+  `ALTER TABLE` syntax.
+
+Tests landed (testcontainers, `--ignored`):
+- `cdc_postgres_schema_skip_keeps_pipeline_running` — `phone`
+  column in `after` not on target → row applies, only declared
+  columns persisted.
+- `cdc_postgres_schema_fail_aborts_batch` — first event clean,
+  second event drifts; whole batch rolled back, target stays
+  empty, error message names `phone`.
 
 ### PR 6 — docs + Debezium-via-testcontainers example (3–4 days)
 
@@ -410,45 +473,112 @@ leverage. Each is a separate PR; none are blocked on each other.
 The 6-PR core plan above completes Phase Δ for the Postgres
 target; everything below is the multi-target build-out.
 
-### Δ.X1 — Delta Lake target *(highest leverage, ~3-4 days)*
+### Δ.X1 — Delta Lake target — **shipped (PR 1)**
 
-**Why first.** Delta's native `MERGE INTO ... USING ... WHEN
-MATCHED ... WHEN NOT MATCHED ...` is *exactly* the right shape
-for CDC. The whole batch becomes a single MERGE statement; per-op
-dispatch + transactional commit are absorbed by Delta's
-transaction log automatically. Conceptually cleaner than the
-Postgres per-event-statement loop. CDC → Delta is also one of
-the most common analytics patterns in the wild — many teams want
-their Postgres source mirrored into a Delta lakehouse for
-downstream warehouse queries.
+Single-MERGE-per-batch CDC apply on `DeltaBackend`. Real-world
+verified: 4 unit tests against tempdir-rooted Delta tables cover
+multi-op batches, within-batch dedupe, soft-delete, and the Fail
+schema-evolution policy.
 
-**Shape.** A single MERGE per CDC batch:
+**Shape that landed.** One `deltalake::DeltaOps::merge` call per
+batch with three clauses, registered in this order so the
+delete branch wins on `__op = 'd'`:
 
-```sql
-MERGE INTO target t USING source_batch s ON t.<pk> = s.<pk>
-WHEN MATCHED AND s.__op = 'd'              THEN DELETE
-WHEN MATCHED                                THEN UPDATE SET *
-WHEN NOT MATCHED AND s.__op IN ('c', 'r')  THEN INSERT *
+```rust
+table.merge(df, "target.<pk> = source.<pk>")
+    .with_source_alias("source")
+    .with_target_alias("target")
+    .with_merge_schema(skip_policy)             // Skip → auto-evolve
+    .when_matched_delete(|d| d.predicate("source.__op = 'd'"))?
+    .when_matched_update(|u| u.predicate("source.__op != 'd'")
+        .update("col1", "source.col1")...)?     // c / u / r overwrite
+    .when_not_matched_insert(|i| i.predicate("source.__op != 'd'")
+        .set("col1", "source.col1")...)?        // c / u / r insert
 ```
 
-For soft-delete: `WHEN MATCHED AND s.__op = 'd' THEN UPDATE SET
-deleted_at = current_timestamp()` instead of the DELETE branch.
+For soft-delete the first clause flips to `when_matched_update`
+with `predicate("source.__op = 'd'").update(soft_col,
+"current_timestamp()")` and the hard-delete clause is omitted —
+verified via `delta_cdc_soft_delete_flips_column`.
 
-**Implementation.** `deltalake::DeltaOps::merge` exposes the
-MERGE primitive. The CDC executor builds an in-memory Arrow
-`RecordBatch` of the post-image rows + a synthesized `__op`
-column, hands it to `merge`, lets Delta absorb. No per-event
-loop; no per-statement prepared overhead. ACID via Delta's
-transaction log instead of a Postgres transaction.
+**Source RecordBatch.** Built via Arrow's NDJSON reader against
+an explicit schema (every spec column made nullable + a non-null
+`__op` Utf8 column). For c/u/r events the row pulls from
+`event.after`; for d events the row carries only the PK from
+`event.key` and nulls elsewhere. NULL columns on delete rows are
+never persisted — `when_matched_delete` consumes them and the
+NOT MATCHED INSERT branch is gated by `__op != 'd'`.
 
-**Schema evolution.** Delta's `mergeSchema = true` flag does
-the right thing for the `Skip` policy automatically (new columns
-in the source become new columns in the target). Better than
-Postgres's "warn + skip" — Delta auto-evolves.
+**Within-batch ordering.** Pre-MERGE dedupe by primary key,
+keeping the event with the highest `ts_ms`. A `c` followed by a
+`u` for the same PK in one batch collapses to the post-image of
+the `u`. Test: `delta_cdc_within_batch_dedupes_by_newest_ts`.
 
-**Effort.** ~3–4 days. Most of it is wiring `DeltaOps::merge` +
-the `__op` column synthesis; the executor surface is much
-smaller than the per-op-statement Postgres path.
+**Schema evolution.** `Skip` → `with_merge_schema(true)`; Delta
+auto-evolves (cleaner than Postgres's "warn + drop"). `Fail` →
+pre-flight column comparison against the spec, returns an error
+that names the offending column. Tests: `delta_cdc_schema_fail_aborts`.
+
+**Between-batch idempotency — the residual gap.** PR 1 relies on
+MERGE's natural idempotency on equal post-images:
+
+- INSERT/UPDATE with equal post-image: row content unchanged → no-op.
+- DELETE of an absent row: when_matched_delete doesn't fire → no-op.
+
+The dangerous case PR 1 doesn't cover: an *older* event in a
+*later* batch clobbering newer state. Requires either a per-row
+`_cdc_last_ts` hidden column on the target (invasive — changes
+the user's mirror schema) or a sidecar Delta table (two MERGEs,
+not atomic). Tracked as **Δ.X1.1**. Non-issue when the source's
+per-PK ordering is preserved — Kafka with Debezium's default
+partition-by-PK gives this for free.
+
+**Streaming-runtime dispatch — fully wired (Δ.X1.2 shipped).**
+`Backend::run_cdc` and `Backend::reflect_table_spec` both work
+end-to-end via `flow consume`. Δ.X1.2 added a side channel for
+PK info instead of going through Delta's metadata JSON:
+
+- New `[target.table].primary_key = ["id"]` TOML field on
+  `TableSpecConfig`. Parses on every backend with a `table` —
+  Postgres, MySQL, SQLite, DuckDB, DeltaLocal, DeltaS3.
+- `PipelineCliConfig::target_primary_keys()` returns one PK list
+  per target (parallel to `targets()`); the streaming-config
+  lowering threads it into the new
+  `StreamingPipelineConfig.target_primary_keys` field.
+- `StreamingPipeline::ensure_cdc_target_specs` augments the
+  reflected spec by flipping `primary_key = true` on columns
+  named in the user's declaration. A typo'd column name fails
+  loud — the augmentation step validates declared columns
+  against the reflected schema and returns a clear error
+  pointing at the TOML / decorator field.
+- Python: new `Target(primary_key=[...])` field on the streaming
+  dataclass + new `target_primary_key=[...]` kwarg on
+  `run_streaming_pipeline` + render emitter writes the PK list
+  into `[target.table].primary_key`. Both single- and multi-
+  target paths covered.
+
+Postgres CDC is unaffected: `information_schema` already
+surfaces PK info, so `target_primary_keys` is empty by default
+and the reflection path Just Works. Users can still declare PKs
+in TOML for documentation purposes; the augmentation step
+matches existing PK flags rather than overriding them.
+
+**Coverage that landed.**
+- `delta_cdc_inserts_updates_deletes_across_batches` — c/u/d each
+  observable via the per-clause MergeMetrics counters.
+- `delta_cdc_within_batch_dedupes_by_newest_ts` — three sequential
+  ops on the same PK collapse to the highest-ts post-image.
+- `delta_cdc_soft_delete_flips_column` — soft-delete flips the
+  configured column instead of removing the row; reported as
+  `updates`, not `deletes`.
+- `delta_cdc_schema_fail_aborts` — Fail policy errors on first
+  unknown `after`-payload key with the column name in the message.
+
+**Numeric column types.** `ColumnType::Numeric { .. }` is
+deferred — the source-batch path needs a decimal-aware Arrow
+encoder beyond what's wired today. Workaround: model decimals as
+`Double` or `Text` on the mirror schema. Documented in the error
+the executor returns when Numeric columns appear.
 
 ### Δ.X2 — DuckDB / SQLite / MySQL targets *(easy ports, ~1-2 days each)*
 

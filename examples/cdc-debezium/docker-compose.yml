@@ -1,0 +1,144 @@
+# Phase Δ PR 6: end-to-end CDC demo stack.
+#
+# Layers (in dependency order):
+#
+#   pg-source   → Postgres with logical decoding enabled. Debezium
+#                 captures every INSERT / UPDATE / DELETE on
+#                 `public.customers` and publishes change events to
+#                 the `dbz.public.customers` Kafka topic.
+#
+#   kafka       → Single-broker Kafka (KRaft mode, no ZooKeeper).
+#                 Two listeners: INTERNAL://kafka:9092 for the
+#                 in-network `connect` service, EXTERNAL://localhost:9094
+#                 for the host process running `flow consume`.
+#
+#   connect     → Debezium 2.7. Registered after startup via the
+#                 connector config in `register-connector.json`.
+#
+#   pg-target   → Postgres mirror. The CDC pipeline applies events
+#                 here via `Backend::run_cdc` (Phase Δ PR 3 + 4 + 5).
+#                 Idempotency table `ematix_flow.cdc_idempotency`
+#                 lazy-creates on the first batch.
+#
+# Single-host: every service runs on the host's Docker daemon. The
+# ematix-flow consumer is intentionally NOT in this compose — run it
+# on the host with `flow consume pipeline.toml` so its logs +
+# metrics are visible without exec-ing into a container.
+#
+# Bring up:
+#   docker compose -f examples/cdc-debezium/docker-compose.yml up -d
+#   ./examples/cdc-debezium/register-connector.sh   # registers the
+#                                                   # Postgres connector
+#
+# Drive change events from another shell:
+#   docker compose -f examples/cdc-debezium/docker-compose.yml \
+#     exec pg-source psql -U postgres -d source \
+#     -c "INSERT INTO public.customers VALUES (3, 'c@example.com', 'Carol');"
+#
+# Run the ematix-flow consumer on the host:
+#   flow consume examples/cdc-debezium/pipeline.toml
+#
+# Verify on the target:
+#   docker compose -f examples/cdc-debezium/docker-compose.yml \
+#     exec pg-target psql -U postgres -d target \
+#     -c "SELECT * FROM public.customers;"
+#
+# Tear down:
+#   docker compose -f examples/cdc-debezium/docker-compose.yml down -v
+
+services:
+  pg-source:
+    image: postgres:16-alpine
+    container_name: ematix-cdc-pg-source
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: source
+    # `wal_level=logical` is the per-cluster knob Debezium needs;
+    # the postgres image's default `wal_level=replica` is not enough.
+    command:
+      - "postgres"
+      - "-c"
+      - "wal_level=logical"
+      - "-c"
+      - "max_wal_senders=4"
+      - "-c"
+      - "max_replication_slots=4"
+    ports:
+      - "5433:5432"
+    volumes:
+      - ./seed-source.sql:/docker-entrypoint-initdb.d/seed.sql:ro
+    networks:
+      - cdc-net
+
+  pg-target:
+    image: postgres:16-alpine
+    container_name: ematix-cdc-pg-target
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: target
+    ports:
+      - "5434:5432"
+    volumes:
+      - ./seed-target.sql:/docker-entrypoint-initdb.d/seed.sql:ro
+    networks:
+      - cdc-net
+
+  kafka:
+    image: apache/kafka:3.7.0
+    container_name: ematix-cdc-kafka
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      # Two listeners so the in-compose `connect` reaches the
+      # broker via `kafka:9092` while the host's `flow consume`
+      # reaches it via `localhost:9094`. A single advertised
+      # listener doesn't work — `connect` resolves `localhost` to
+      # itself, not the broker.
+      KAFKA_LISTENERS: "INTERNAL://0.0.0.0:9092,EXTERNAL://0.0.0.0:9094,CONTROLLER://0.0.0.0:9093"
+      KAFKA_ADVERTISED_LISTENERS: "INTERNAL://kafka:9092,EXTERNAL://localhost:9094"
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "CONTROLLER:PLAINTEXT,INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT"
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: "1@kafka:9093"
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      CLUSTER_ID: "MkU3OEVBNTcwNTJENDM2Qk"
+    ports:
+      - "9094:9094"
+    networks:
+      - cdc-net
+
+  connect:
+    image: debezium/connect:2.7.3.Final
+    container_name: ematix-cdc-connect
+    depends_on:
+      - kafka
+      - pg-source
+    environment:
+      BOOTSTRAP_SERVERS: kafka:9092
+      GROUP_ID: ematix-cdc-connect
+      CONFIG_STORAGE_TOPIC: connect_configs
+      OFFSET_STORAGE_TOPIC: connect_offsets
+      STATUS_STORAGE_TOPIC: connect_statuses
+      # JSON without inline schemas. `ematix-flow`'s Debezium parser
+      # consumes the unwrapped envelope directly (`op`, `before`,
+      # `after`, `source.ts_ms`); the schema-wrapped variant would
+      # nest payload one level deeper and break the default field
+      # paths.
+      KEY_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      VALUE_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      KEY_CONVERTER_SCHEMAS_ENABLE: "false"
+      VALUE_CONVERTER_SCHEMAS_ENABLE: "false"
+    ports:
+      - "8083:8083"
+    networks:
+      - cdc-net
+
+networks:
+  cdc-net:
+    driver: bridge

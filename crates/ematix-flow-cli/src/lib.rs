@@ -1879,12 +1879,24 @@ impl From<ObjectFormatConfig> for ObjectFormat {
 }
 
 /// `(schema, name)` pair used by DB targets. Maps onto
-/// [`TargetTable`].
+/// [`TargetTable`]. Δ.X1.2 added the optional `primary_key`
+/// field so users can declare PK columns when reflecting from
+/// backends that can't surface them natively (Delta tables don't
+/// carry PK constraints).
 #[derive(Debug, Clone, Deserialize)]
 pub struct TableSpecConfig {
     #[serde(default)]
     pub schema: String,
     pub name: String,
+    /// Δ.X1.2: optional user-declared primary-key column list.
+    /// Required for CDC pipelines whose target backend can't
+    /// surface PK info via reflection (Delta, object stores).
+    /// Ignored for Postgres CDC, where `information_schema`
+    /// already provides PK info — but specifying it does no
+    /// harm: the reflected spec already has those columns
+    /// flagged.
+    #[serde(default)]
+    pub primary_key: Vec<String>,
 }
 
 impl PipelineCliConfig {
@@ -2281,6 +2293,27 @@ impl PipelineCliConfig {
             return vec![t];
         }
         self.targets.iter().collect()
+    }
+
+    /// Δ.X1.2: per-target user-declared primary-key column lists,
+    /// in the same order as [`Self::targets`]. Empty inner Vec
+    /// for targets without a table (Kafka / RabbitMQ / Pub/Sub /
+    /// Kinesis / object stores) or for tables that didn't declare
+    /// `primary_key` in the TOML — the streaming runtime falls
+    /// back to the reflected spec in those cases.
+    pub fn target_primary_keys(&self) -> Vec<Vec<String>> {
+        self.targets()
+            .iter()
+            .map(|t| match t {
+                TargetConfig::Postgres { table, .. }
+                | TargetConfig::Mysql { table, .. }
+                | TargetConfig::Sqlite { table, .. }
+                | TargetConfig::Duckdb { table, .. }
+                | TargetConfig::DeltaLocal { table, .. }
+                | TargetConfig::DeltaS3 { table, .. } => table.primary_key.clone(),
+                _ => Vec::new(),
+            })
+            .collect()
     }
 
     /// Π.5: enumerate inline-credential patterns in this config that
@@ -2743,6 +2776,30 @@ impl PipelineCliConfig {
             cfg = cfg.with_dead_letter_topic(dlt.clone());
         }
         if let Some(t) = &self.transform {
+            // Phase Δ PR 5.5: CDC apply mode is mutually exclusive
+            // with `sql` / `window` / `join` (validated at TOML
+            // parse time), so when `[transform.cdc]` is set we
+            // lower the CDC config and skip the SQL/transform
+            // wiring entirely. Watermark + on_error are still
+            // valid knobs (handled outside this branch); the
+            // transform pipeline just doesn't have an inner stage
+            // because CDC consumes envelopes directly.
+            if let Some(cdc_toml) = &t.cdc {
+                let cdc_core = cdc_toml_to_core(cdc_toml)
+                    .expect("CDC config translation already validated at config-load");
+                cfg = cfg.with_cdc(cdc_core);
+                // Δ.X1.2: thread per-target user-declared PKs
+                // through. Required for Delta CDC (Delta tables
+                // don't carry PK constraints natively); harmless
+                // for Postgres CDC (Postgres reflects PK info
+                // natively — declared list either matches or
+                // gets validated against the live schema).
+                let pks = self.target_primary_keys();
+                if pks.iter().any(|p| !p.is_empty()) {
+                    cfg = cfg.with_target_primary_keys(pks);
+                }
+                return cfg;
+            }
             // SQL pre-stage. Empty `sql` means "no pre-stage" — only
             // valid when a window block is configured (windowed
             // transform doesn't require a SQL inner).
@@ -7626,5 +7683,611 @@ mod tests {
             r.state_by_key.get(b"k".as_slice()).map(|v| v.as_slice()),
             Some(&b"v"[..])
         );
+    }
+
+    // ----------------------------------------------------------
+    // Backfill round (push line coverage toward 90% on cli/lib.rs).
+    // Each test below targets a previously-uncovered line range
+    // surfaced by `cargo llvm-cov report --json`.
+    // ----------------------------------------------------------
+
+    /// Locks the Debug impls for every `SourceConfig` variant so a
+    /// future refactor that changes the redaction shape produces a
+    /// loud diff. Kafka's Debug carries explicit redaction for SASL
+    /// passwords + SR basic-auth password; the others are a single
+    /// trivial branch each.
+    #[test]
+    fn source_config_debug_covers_all_variants() {
+        let kafka = SourceConfig::Kafka {
+            bootstrap_servers: "broker:9092".into(),
+            group_id: Some("g".into()),
+            payload_format: Some("json".into()),
+            schema_registry_url: Some("http://sr".into()),
+            schema_registry_basic_auth_user: Some("u".into()),
+            schema_registry_basic_auth_password: Some("p".into()),
+            sasl_plain_username: Some("u".into()),
+            sasl_plain_password: Some("secret".into()),
+            sasl_scram_username: Some("u2".into()),
+            sasl_scram_password: Some("secret2".into()),
+            sasl_scram_mechanism: Some("sha-256".into()),
+            msk_iam_region: Some("us-east-1".into()),
+        };
+        let s = format!("{kafka:?}");
+        assert!(s.contains("Kafka"));
+        // Any password field that appears in plaintext is a leak.
+        assert!(
+            !s.contains("secret"),
+            "Debug for SourceConfig::Kafka must redact passwords; got: {s}"
+        );
+
+        let pubsub = SourceConfig::Pubsub {
+            project_id: "proj".into(),
+            endpoint: Some("http://emu".into()),
+            anonymous_auth: true,
+        };
+        assert!(format!("{pubsub:?}").contains("Pubsub"));
+
+        let rabbit = SourceConfig::Rabbitmq {
+            amqp_url: "amqp://localhost".into(),
+        };
+        assert!(format!("{rabbit:?}").contains("Rabbitmq"));
+
+        let kinesis = SourceConfig::Kinesis {
+            stream_name: "s".into(),
+            region: Some("us-east-1".into()),
+            endpoint: Some("http://localstack".into()),
+            access_key_id: Some("AK".into()),
+            secret_access_key: Some("very-secret".into()),
+        };
+        let ks = format!("{kinesis:?}");
+        assert!(ks.contains("Kinesis"));
+        assert!(
+            !ks.contains("very-secret"),
+            "Debug for SourceConfig::Kinesis must redact secret_access_key"
+        );
+    }
+
+    /// Same shape for `TargetConfig`. Each variant has its own
+    /// Debug arm; iterating exercises each.
+    #[test]
+    fn target_config_debug_covers_all_variants() {
+        // Postgres / MySQL / SQLite / DuckDB share a small shape.
+        let pg = TargetConfig::Postgres {
+            url: "postgres://x@y/z".into(),
+            table: TableSpecConfig {
+                schema: "s".into(),
+                name: "n".into(),
+                primary_key: vec!["id".into()],
+            },
+        };
+        assert!(format!("{pg:?}").contains("Postgres"));
+
+        let mysql = TargetConfig::Mysql {
+            url: "mysql://x@y/z".into(),
+            table: TableSpecConfig {
+                schema: String::new(),
+                name: "t".into(),
+                primary_key: vec![],
+            },
+        };
+        assert!(format!("{mysql:?}").contains("Mysql"));
+
+        let sqlite = TargetConfig::Sqlite {
+            path: "/tmp/db.sqlite".into(),
+            table: TableSpecConfig {
+                schema: String::new(),
+                name: "t".into(),
+                primary_key: vec![],
+            },
+        };
+        assert!(format!("{sqlite:?}").contains("Sqlite"));
+
+        let duck = TargetConfig::Duckdb {
+            path: ":memory:".into(),
+            table: TableSpecConfig {
+                schema: String::new(),
+                name: "t".into(),
+                primary_key: vec![],
+            },
+        };
+        assert!(format!("{duck:?}").contains("Duckdb"));
+
+        // Kafka — must redact SASL passwords on the target side too.
+        let kafka = TargetConfig::Kafka {
+            bootstrap_servers: "broker:9092".into(),
+            group_id: None,
+            topic: "t".into(),
+            message_key_column: Some("user_id".into()),
+            payload_format: Some("avro".into()),
+            schema_registry_url: Some("http://sr".into()),
+            schema_registry_basic_auth_user: Some("u".into()),
+            schema_registry_basic_auth_password: Some("sr-secret".into()),
+            sasl_plain_username: Some("u".into()),
+            sasl_plain_password: Some("plain-secret".into()),
+            sasl_scram_username: None,
+            sasl_scram_password: None,
+            sasl_scram_mechanism: None,
+            msk_iam_region: None,
+        };
+        let ks = format!("{kafka:?}");
+        assert!(ks.contains("Kafka"));
+        assert!(
+            !ks.contains("plain-secret") && !ks.contains("sr-secret"),
+            "Debug for TargetConfig::Kafka must redact SASL/SR passwords"
+        );
+
+        let rabbit = TargetConfig::Rabbitmq {
+            amqp_url: "amqp://localhost".into(),
+            queue: "q".into(),
+        };
+        assert!(format!("{rabbit:?}").contains("Rabbitmq"));
+
+        let pubsub = TargetConfig::Pubsub {
+            project_id: "p".into(),
+            endpoint: None,
+            anonymous_auth: false,
+            topic: "t".into(),
+        };
+        assert!(format!("{pubsub:?}").contains("Pubsub"));
+
+        let kinesis = TargetConfig::Kinesis {
+            stream_name: "s".into(),
+            region: None,
+            endpoint: None,
+            access_key_id: Some("AK".into()),
+            secret_access_key: Some("kinesis-secret".into()),
+            partition_key_prefix: "p-".into(),
+        };
+        let ks2 = format!("{kinesis:?}");
+        assert!(ks2.contains("Kinesis"));
+        assert!(
+            !ks2.contains("kinesis-secret"),
+            "Debug for TargetConfig::Kinesis must redact secret_access_key"
+        );
+
+        let dl = TargetConfig::DeltaLocal {
+            path: "/tmp/lake".into(),
+            table: TableSpecConfig {
+                schema: String::new(),
+                name: "t".into(),
+                primary_key: vec![],
+            },
+            partition_by: vec!["year".into()],
+        };
+        assert!(format!("{dl:?}").contains("DeltaLocal"));
+
+        let ds3 = TargetConfig::DeltaS3 {
+            endpoint: "http://m".into(),
+            bucket: "b".into(),
+            prefix: "p".into(),
+            region: "us-east-1".into(),
+            access_key_id: "AK".into(),
+            secret_access_key: "delta-secret".into(),
+            table: TableSpecConfig {
+                schema: String::new(),
+                name: "t".into(),
+                primary_key: vec![],
+            },
+            partition_by: vec![],
+        };
+        let ds3s = format!("{ds3:?}");
+        assert!(ds3s.contains("DeltaS3"));
+        assert!(
+            !ds3s.contains("delta-secret"),
+            "Debug for TargetConfig::DeltaS3 must redact secret_access_key"
+        );
+
+        let ofs = TargetConfig::ObjectStoreLocal {
+            path: "/tmp/objs".into(),
+            format: ObjectFormatConfig::Parquet,
+            prefix: "p".into(),
+            parquet_compression: Some("zstd".into()),
+            csv_delimiter: None,
+            csv_header: None,
+        };
+        assert!(format!("{ofs:?}").contains("ObjectStoreLocal"));
+
+        let os3 = TargetConfig::ObjectStoreS3 {
+            endpoint: "http://m".into(),
+            bucket: "b".into(),
+            region: "us-east-1".into(),
+            access_key_id: "AK".into(),
+            secret_access_key: "objs3-secret".into(),
+            format: ObjectFormatConfig::Csv,
+            prefix: "p".into(),
+            parquet_compression: None,
+            csv_delimiter: Some(";".into()),
+            csv_header: Some(true),
+        };
+        let os3s = format!("{os3:?}");
+        assert!(os3s.contains("ObjectStoreS3"));
+        assert!(
+            !os3s.contains("objs3-secret"),
+            "Debug for TargetConfig::ObjectStoreS3 must redact secret_access_key"
+        );
+    }
+
+    /// Π.1 helper: parse_kafka_payload_format covers every accepted
+    /// string + the unknown-string error branch.
+    #[test]
+    fn parse_kafka_payload_format_covers_all_variants() {
+        assert!(matches!(
+            parse_kafka_payload_format("json").unwrap(),
+            KafkaPayloadFormat::Json
+        ));
+        assert!(matches!(
+            parse_kafka_payload_format("raw_bytes").unwrap(),
+            KafkaPayloadFormat::RawBytes
+        ));
+        assert!(matches!(
+            parse_kafka_payload_format("avro").unwrap(),
+            KafkaPayloadFormat::Avro
+        ));
+        assert!(matches!(
+            parse_kafka_payload_format("protobuf").unwrap(),
+            KafkaPayloadFormat::Protobuf
+        ));
+        let err = parse_kafka_payload_format("yaml").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("yaml"));
+        assert!(msg.contains("supported"));
+    }
+
+    /// Pipeline-shape validators: source and target must each have
+    /// exactly one form (`source` xor `sources`, `target` xor
+    /// `targets`). Locks every error branch so a refactor that
+    /// silently relaxes the rules produces a loud diff.
+    #[test]
+    fn source_shape_rejects_both_single_and_multi_forms() {
+        // Both `[source]` and `[[sources]]` set.
+        let toml = r#"
+pipeline_name = "p"
+source_query  = "q"
+
+[source]
+kind     = "rabbitmq"
+amqp_url = "amqp://localhost"
+
+[[sources]]
+query    = "q2"
+kind     = "rabbitmq"
+amqp_url = "amqp://localhost"
+
+[target]
+kind = "duckdb"
+path = ":memory:"
+
+[target.table]
+name = "t"
+"#;
+        let err = PipelineCliConfig::from_toml_str(toml).unwrap_err();
+        assert!(
+            err.to_string().contains("both `source` and `sources`"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn source_shape_rejects_neither_form() {
+        let toml = r#"
+pipeline_name = "p"
+source_query  = "q"
+
+[target]
+kind = "duckdb"
+path = ":memory:"
+
+[target.table]
+name = "t"
+"#;
+        let err = PipelineCliConfig::from_toml_str(toml).unwrap_err();
+        assert!(err.to_string().contains("no source"), "got: {err}");
+    }
+
+    #[test]
+    fn source_shape_rejects_single_form_without_query() {
+        // Single `[source]` form needs a non-empty `source_query`.
+        let toml = r#"
+pipeline_name = "p"
+source_query  = ""
+
+[source]
+kind     = "rabbitmq"
+amqp_url = "amqp://localhost"
+
+[target]
+kind = "duckdb"
+path = ":memory:"
+
+[target.table]
+name = "t"
+"#;
+        let err = PipelineCliConfig::from_toml_str(toml).unwrap_err();
+        assert!(
+            err.to_string().contains("source_query` is required"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn target_shape_rejects_both_single_and_multi_forms() {
+        let toml = r#"
+pipeline_name = "p"
+source_query  = "q"
+
+[source]
+kind     = "rabbitmq"
+amqp_url = "amqp://localhost"
+
+[target]
+kind = "duckdb"
+path = ":memory:"
+
+[target.table]
+name = "t"
+
+[[targets]]
+kind = "duckdb"
+path = ":memory:"
+
+[targets.table]
+name = "t2"
+"#;
+        let err = PipelineCliConfig::from_toml_str(toml).unwrap_err();
+        assert!(
+            err.to_string().contains("both `target` and `targets`"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn target_shape_rejects_neither_form() {
+        let toml = r#"
+pipeline_name = "p"
+source_query  = "q"
+
+[source]
+kind     = "rabbitmq"
+amqp_url = "amqp://localhost"
+"#;
+        let err = PipelineCliConfig::from_toml_str(toml).unwrap_err();
+        assert!(err.to_string().contains("no target"), "got: {err}");
+    }
+
+    /// Phase 39.4 PR 2b: aggregation parser unknown-name + unknown-
+    /// mode error branches were uncovered. These tests trip each.
+    #[test]
+    fn windowed_aggregation_rejects_unknown_agg_kind() {
+        let toml = r#"
+pipeline_name = "p"
+source_query  = "q"
+
+[source]
+kind     = "rabbitmq"
+amqp_url = "amqp://localhost"
+
+[target]
+kind = "duckdb"
+path = ":memory:"
+
+[target.table]
+name = "t"
+
+[transform]
+sql = "SELECT * FROM source"
+
+[transform.window]
+kind                   = "tumbling"
+duration_ms            = 60000
+max_groups_per_window  = 1000
+
+[[transform.window.aggregations]]
+agg    = "median"
+column = "x"
+as     = "x_med"
+"#;
+        let cfg = PipelineCliConfig::from_toml_str(toml)
+            .expect("config-load is permissive on aggregations — translation runs at build");
+        // The validator path that rejects unknown aggregations is
+        // `window_toml_to_core` (called from
+        // `streaming_config_with_lookups_and_metrics`). Drive it
+        // directly.
+        let win = cfg
+            .transform
+            .as_ref()
+            .and_then(|t| t.window.as_ref())
+            .expect("window block parsed");
+        let err = window_toml_to_core(win).unwrap_err();
+        assert!(err.contains("median"), "got: {err}");
+        assert!(err.contains("not supported"));
+    }
+
+    #[test]
+    fn windowed_count_distinct_rejects_unknown_mode() {
+        let toml = r#"
+pipeline_name = "p"
+source_query  = "q"
+
+[source]
+kind     = "rabbitmq"
+amqp_url = "amqp://localhost"
+
+[target]
+kind = "duckdb"
+path = ":memory:"
+
+[target.table]
+name = "t"
+
+[transform]
+sql = "SELECT * FROM source"
+
+[transform.window]
+kind                   = "tumbling"
+duration_ms            = 60000
+max_groups_per_window  = 1000
+
+[[transform.window.aggregations]]
+agg    = "count_distinct"
+column = "user_id"
+as     = "uniq_users"
+mode   = "sketch"
+"#;
+        let cfg = PipelineCliConfig::from_toml_str(toml).unwrap();
+        let win = cfg.transform.as_ref().unwrap().window.as_ref().unwrap();
+        let err = window_toml_to_core(win).unwrap_err();
+        assert!(err.contains("sketch"), "got: {err}");
+    }
+
+    /// Π.1 SASL: `apply_kafka_auth` rejects every "two-of-three"
+    /// auth-mode combination, plus partial-credential combos within
+    /// each mode. Each branch was uncovered.
+    #[test]
+    fn kafka_auth_rejects_multiple_modes_combined() {
+        let b = KafkaBackend::open("localhost:9092", None).unwrap();
+        // PLAIN + SCRAM both present.
+        let err = apply_kafka_auth(
+            b,
+            Some("u"),
+            Some("p"),
+            Some("u2"),
+            Some("p2"),
+            Some("sha-256"),
+            None,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("at most one"), "got: {err}");
+    }
+
+    #[test]
+    fn kafka_auth_plain_requires_both_user_and_password() {
+        // password without username.
+        let b = KafkaBackend::open("localhost:9092", None).unwrap();
+        let err = apply_kafka_auth(b, None, Some("p"), None, None, None, None).unwrap_err();
+        assert!(err.to_string().contains("sasl_plain"), "got: {err}");
+
+        // username without password.
+        let b = KafkaBackend::open("localhost:9092", None).unwrap();
+        let err = apply_kafka_auth(b, Some("u"), None, None, None, None, None).unwrap_err();
+        assert!(err.to_string().contains("sasl_plain"), "got: {err}");
+    }
+
+    #[test]
+    fn kafka_auth_scram_requires_user_password_mechanism() {
+        // password+mechanism without username.
+        let b = KafkaBackend::open("localhost:9092", None).unwrap();
+        let err =
+            apply_kafka_auth(b, None, None, None, Some("p"), Some("sha-256"), None).unwrap_err();
+        assert!(
+            err.to_string().contains("sasl_scram_username"),
+            "got: {err}"
+        );
+
+        // username+mechanism without password.
+        let b = KafkaBackend::open("localhost:9092", None).unwrap();
+        let err =
+            apply_kafka_auth(b, None, None, Some("u"), None, Some("sha-256"), None).unwrap_err();
+        assert!(
+            err.to_string().contains("sasl_scram_password"),
+            "got: {err}"
+        );
+
+        // username+password without mechanism.
+        let b = KafkaBackend::open("localhost:9092", None).unwrap();
+        let err = apply_kafka_auth(b, None, None, Some("u"), Some("p"), None, None).unwrap_err();
+        assert!(
+            err.to_string().contains("sasl_scram_mechanism"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn kafka_auth_scram_rejects_unknown_mechanism() {
+        let b = KafkaBackend::open("localhost:9092", None).unwrap();
+        let err =
+            apply_kafka_auth(b, None, None, Some("u"), Some("p"), Some("md5"), None).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("md5"), "got: {msg}");
+        assert!(msg.contains("sha-256") || msg.contains("supported"));
+    }
+
+    #[test]
+    fn kafka_auth_scram_accepts_alias_spellings() {
+        // Round-trip every accepted spelling so a refactor that
+        // changes the match arms produces a clear diff.
+        for mech in ["sha-256", "sha256", "SHA-256", "SHA256"] {
+            let b = KafkaBackend::open("localhost:9092", None).unwrap();
+            apply_kafka_auth(b, None, None, Some("u"), Some("p"), Some(mech), None)
+                .unwrap_or_else(|e| panic!("mech {mech:?} should be accepted: {e}"));
+        }
+        for mech in ["sha-512", "sha512", "SHA-512", "SHA512"] {
+            let b = KafkaBackend::open("localhost:9092", None).unwrap();
+            apply_kafka_auth(b, None, None, Some("u"), Some("p"), Some(mech), None)
+                .unwrap_or_else(|e| panic!("mech {mech:?} should be accepted: {e}"));
+        }
+    }
+
+    #[test]
+    fn kafka_auth_iam_takes_just_a_region() {
+        // MSK-IAM mode requires only the region.
+        let b = KafkaBackend::open("localhost:9092", None).unwrap();
+        apply_kafka_auth(b, None, None, None, None, None, Some("us-east-1"))
+            .expect("MSK-IAM with just region is accepted");
+    }
+
+    /// Π.5 inline-credential scanner: round-trip every detection
+    /// path so a refactor that changes the warning wording shows up
+    /// here.
+    #[test]
+    fn inline_credentials_findings_cover_typical_shapes() {
+        // Postgres URL with inline password.
+        let toml = r#"
+pipeline_name = "p"
+source_query  = "q"
+
+[source]
+kind     = "rabbitmq"
+amqp_url = "amqp://user:secret@localhost"
+
+[target]
+kind  = "postgres"
+url   = "postgres://postgres:hunter2@localhost/postgres"
+
+[target.table]
+schema = "public"
+name   = "t"
+"#;
+        let cfg = PipelineCliConfig::from_toml_str(toml).unwrap();
+        let findings = cfg.inline_credential_findings();
+        assert!(
+            !findings.is_empty(),
+            "inline-credential URLs must be flagged"
+        );
+        // Joined for grep convenience.
+        let joined = findings.join("|");
+        assert!(joined.contains("[target]") || joined.contains("Postgres"));
+    }
+
+    /// Δ.X1.2 helper: target_primary_keys() returns one entry per
+    /// configured target, with empty Vec for non-table targets.
+    /// Exercises the catch-all `_ => Vec::new()` arm.
+    #[test]
+    fn target_primary_keys_returns_empty_for_non_table_targets() {
+        let toml = r#"
+pipeline_name = "p"
+source_query  = "q"
+
+[source]
+kind     = "rabbitmq"
+amqp_url = "amqp://localhost"
+
+[target]
+kind  = "rabbitmq"
+amqp_url = "amqp://localhost"
+queue = "q"
+"#;
+        let cfg = PipelineCliConfig::from_toml_str(toml).unwrap();
+        let pks = cfg.target_primary_keys();
+        assert_eq!(pks, vec![Vec::<String>::new()]);
     }
 }

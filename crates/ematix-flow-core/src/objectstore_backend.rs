@@ -1618,4 +1618,64 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("source_backend is required"), "got: {msg}");
     }
+
+    // ----------------------------------------------------------
+    // Coverage backfill round 6 — pure date helpers in
+    // objectstore_backend.rs. The run_history JSONL emitter
+    // calls these to format the per-event timestamps; existing
+    // integration tests don't pin specific calendar dates, so
+    // the helper itself is uncovered.
+    // ----------------------------------------------------------
+
+    /// Howard Hinnant's `civil_from_days` is a pure function:
+    /// days-since-1970-01-01 → (year, month, day). Pin a few
+    /// known points so a refactor that off-by-ones the leap-year
+    /// math produces a loud diff.
+    #[test]
+    fn civil_from_days_maps_known_calendar_days() {
+        // Day 0 is the Unix epoch.
+        assert_eq!(civil_from_days(0), (1970, 1, 1));
+        // Day 1 = 1970-01-02.
+        assert_eq!(civil_from_days(1), (1970, 1, 2));
+        // Day 31 = 1970-02-01 (Jan has 31 days).
+        assert_eq!(civil_from_days(31), (1970, 2, 1));
+        // Day 365 = 1971-01-01 (1970 is not a leap year).
+        assert_eq!(civil_from_days(365), (1971, 1, 1));
+        // 2000-01-01 = 10957 days after epoch.
+        assert_eq!(civil_from_days(10957), (2000, 1, 1));
+        // 2000-02-29 = leap day 2000 (a centennial leap year).
+        assert_eq!(civil_from_days(11016), (2000, 2, 29));
+        // 2024-02-29 = another leap day, 24 years later.
+        // Verifies the algorithm handles common leap years.
+        assert_eq!(civil_from_days(19782), (2024, 2, 29));
+        // Pre-epoch: 1969-12-31 = -1 days from epoch.
+        assert_eq!(civil_from_days(-1), (1969, 12, 31));
+    }
+
+    /// `chrono_compat_iso8601_now` produces an ISO 8601 string
+    /// in UTC with millisecond precision + the trailing 'Z'.
+    /// Locks the format so a refactor that drops the milliseconds
+    /// or the time-zone marker surfaces here.
+    #[test]
+    fn chrono_compat_iso8601_format_is_stable() {
+        let s = chrono_compat_iso8601_now();
+        // Shape: YYYY-MM-DDTHH:MM:SS.mmmZ — exactly 24 chars.
+        assert_eq!(s.len(), 24, "got: {s:?}");
+        assert!(s.ends_with('Z'), "must end with Z (UTC marker), got: {s:?}");
+        assert_eq!(&s[4..5], "-");
+        assert_eq!(&s[7..8], "-");
+        assert_eq!(&s[10..11], "T");
+        assert_eq!(&s[13..14], ":");
+        assert_eq!(&s[16..17], ":");
+        assert_eq!(&s[19..20], ".");
+        // Every other character is a digit. Pin a few positions
+        // so a refactor that swaps to single-digit milliseconds
+        // (e.g. {millis} instead of {millis:03}) is caught.
+        for (i, c) in s.chars().enumerate() {
+            let expected_digit = !matches!(i, 4 | 7 | 10 | 13 | 16 | 19 | 23);
+            if expected_digit {
+                assert!(c.is_ascii_digit(), "char {i} = {c:?} should be a digit");
+            }
+        }
+    }
 }

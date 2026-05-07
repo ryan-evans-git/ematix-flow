@@ -36,8 +36,55 @@
 //!   overrides with a transactional per-op apply that uses
 //!   `jsonb_populate_record` for type-safe JSON → row coercion.
 //!
-//! Still to come: idempotency via the StateStore (PR 4), schema-
-//! evolution detection (PR 5).
+//! **PR 4** — per-PK idempotency gate:
+//! - `ematix_flow.cdc_idempotency` table tracks `(pipeline,
+//!   pk_json) → last_seen_ts_ms`. The CDC executor admits an
+//!   event only when its `ts_ms` exceeds the stored value, via
+//!   a single-round-trip `INSERT … ON CONFLICT DO UPDATE …
+//!   RETURNING` gate that runs inside the same Postgres
+//!   transaction as the data write — so a crash mid-batch
+//!   leaves gate + target consistent.
+//! - Surfaced on [`crate::backend::CdcRunResult::idempotent_skipped`]
+//!   so Kafka redeliveries are visible in metrics rather than
+//!   silently absorbed.
+//!
+//! **PR 5** — schema-evolution detection:
+//! - Per-event `after`-payload keys checked against the target's
+//!   declared column set. [`SchemaEvolutionPolicy::Skip`] (default)
+//!   emits a single `tracing::warn!` per drift column per batch,
+//!   then lets Postgres's `jsonb_populate_record` discard the
+//!   unknown key. [`SchemaEvolutionPolicy::Fail`] returns an
+//!   error naming the column + the policy, rolling back the
+//!   whole batch transactionally.
+//! - `AlterTable` policy remains deferred — bundling per-target
+//!   `ALTER TABLE` plumbing into PR 5 would have doubled the
+//!   surface, and Δ.X1 (Delta) doesn't use `ALTER TABLE` syntax
+//!   at all.
+//!
+//! **Δ.X1 PR 1** — Delta Lake target:
+//! - [`crate::delta_backend::DeltaBackend`] gains a concrete
+//!   `Backend::run_cdc` impl that applies a CDC batch via a
+//!   single `DeltaOps::merge` call. Three branches dispatch on
+//!   the synthesized `__op` Utf8 column: `when_matched_delete`
+//!   (or `when_matched_update` for soft-delete) for `__op = 'd'`,
+//!   `when_matched_update` for c/u/r overwrite, and
+//!   `when_not_matched_insert` for INSERT-when-absent.
+//! - Within-batch dedupe by primary key keeps the highest-`ts_ms`
+//!   event per PK, so a `c` then `u` for the same row collapses
+//!   to a single MERGE row carrying the post-image of the `u`.
+//! - `SchemaEvolutionPolicy::Skip` rides Delta's
+//!   `with_merge_schema(true)` for auto-evolution; `Fail`
+//!   pre-flights the `after` payload against the spec and
+//!   aborts before MERGE.
+//! - Between-batch idempotency relies on MERGE's natural
+//!   no-op-on-equal-post-image semantics — older-event-in-later-
+//!   batch is a documented Δ.X1.1 follow-up.
+//!
+//! Still to come: end-to-end Debezium-via-testcontainers
+//! example (PR 6 — already shipped for Postgres). DuckDB / SQLite
+//! / MySQL CDC targets (Δ.X2). Δ.X1.1 between-batch idempotency
+//! gate for Delta. Δ.X1.2 PK reflection from Delta table
+//! properties for streaming-runtime dispatch.
 //!
 //! Plan: `docs/PHASE_DELTA_CDC_PLAN.md`.
 

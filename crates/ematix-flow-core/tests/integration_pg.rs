@@ -7461,3 +7461,438 @@ async fn cdc_postgres_skips_tombstones_and_parse_errors() {
         .get(0);
     assert_eq!(row_count, 2, "id=99 with bad op was not applied");
 }
+
+/// Phase Δ PR 4: Kafka redelivery of the same CDC batch must be a
+/// no-op. The idempotency gate (per-PK last-seen ts_ms) lives in
+/// `ematix_flow.cdc_idempotency` and shares the executor's
+/// transaction so admit + apply are atomic.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker; run with `cargo test -- --ignored`"]
+async fn cdc_postgres_redelivery_is_idempotent() {
+    use ematix_flow_core::cdc::{CdcConfig, EnvelopeKind};
+    use serde_json::json;
+
+    let (_container, url) = start_postgres().await;
+    let pool = PgPool::connect(&url).await.unwrap();
+
+    pool.execute("CREATE SCHEMA mirror").await.unwrap();
+    pool.execute(
+        "CREATE TABLE mirror.customers (\
+            id     BIGINT PRIMARY KEY,\
+            email  TEXT,\
+            name   TEXT\
+         )",
+    )
+    .await
+    .unwrap();
+
+    let backend = PostgresBackend::new(Arc::new(pool), url.clone());
+    let spec = cdc_target_spec();
+
+    let mut cdc_cfg = CdcConfig::for_envelope(EnvelopeKind::Debezium);
+    cdc_cfg.key_field = "after.id".into();
+
+    let rows = vec![
+        json!({
+            "before": null,
+            "after": {"id": 1, "email": "alice@example.com", "name": "Alice"},
+            "source": {"ts_ms": 1_700_000_000_001_i64},
+            "op": "c",
+            "ts_ms": 1_700_000_000_001_i64,
+        })
+        .as_object()
+        .unwrap()
+        .clone(),
+        json!({
+            "before": null,
+            "after": {"id": 2, "email": "bob@example.com", "name": "Bob"},
+            "source": {"ts_ms": 1_700_000_000_002_i64},
+            "op": "c",
+            "ts_ms": 1_700_000_000_002_i64,
+        })
+        .as_object()
+        .unwrap()
+        .clone(),
+        json!({
+            "before": {"id": 1, "email": "alice@example.com", "name": "Alice"},
+            "after":  {"id": 1, "email": "alice@example.com", "name": "Alice Smith"},
+            "source": {"ts_ms": 1_700_000_005_000_i64},
+            "op": "u",
+            "ts_ms": 1_700_000_005_000_i64,
+        })
+        .as_object()
+        .unwrap()
+        .clone(),
+    ];
+
+    // First apply: all three events admitted.
+    let batch1 = record_batch_from_json(&rows);
+    let r1 = backend
+        .run_cdc(&spec, batch1, &cdc_cfg, "test_cdc_redelivery")
+        .await
+        .expect("first run_cdc");
+    assert_eq!(r1.creates, 2, "first delivery: two inserts applied");
+    assert_eq!(r1.updates, 1, "first delivery: one update applied");
+    assert_eq!(
+        r1.idempotent_skipped, 0,
+        "first delivery: nothing skipped — empty idempotency table"
+    );
+
+    // Second apply: same events, every one rejected by the gate.
+    let batch2 = record_batch_from_json(&rows);
+    let r2 = backend
+        .run_cdc(&spec, batch2, &cdc_cfg, "test_cdc_redelivery")
+        .await
+        .expect("second run_cdc");
+    assert_eq!(r2.creates, 0, "redelivery: no inserts applied");
+    assert_eq!(r2.updates, 0, "redelivery: no updates applied");
+    assert_eq!(r2.deletes, 0, "redelivery: no deletes applied");
+    assert_eq!(
+        r2.idempotent_skipped, 3,
+        "redelivery: all three events filtered by the idempotency gate"
+    );
+
+    // Verify post-state: id=1 has the renamed value (UPDATE applied
+    // once on first delivery), id=2 unchanged. No double-apply
+    // visible.
+    let verify_pool = PgPool::connect(&url).await.unwrap();
+    let client = verify_pool.raw_pool_for_tests().get().await.unwrap();
+    let rows = client
+        .query(
+            "SELECT id, email, name FROM mirror.customers ORDER BY id",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 2, "two rows survive — no doubles");
+    let id_1: i64 = rows[0].get(0);
+    let name_1: String = rows[0].get(2);
+    assert_eq!(id_1, 1);
+    assert_eq!(name_1, "Alice Smith", "renamed once, idempotently");
+}
+
+/// Phase Δ PR 4: idempotency state lives in Postgres, so a fresh
+/// pool / process restart still rejects redeliveries. This is the
+/// "kill mid-stream and restart" guarantee.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker; run with `cargo test -- --ignored`"]
+async fn cdc_postgres_idempotency_survives_pool_restart() {
+    use ematix_flow_core::cdc::{CdcConfig, EnvelopeKind};
+    use serde_json::json;
+
+    let (_container, url) = start_postgres().await;
+
+    // Phase 1: connect, apply, drop the pool entirely.
+    {
+        let pool = PgPool::connect(&url).await.unwrap();
+        pool.execute("CREATE SCHEMA mirror").await.unwrap();
+        pool.execute(
+            "CREATE TABLE mirror.customers (\
+                id     BIGINT PRIMARY KEY,\
+                email  TEXT,\
+                name   TEXT\
+             )",
+        )
+        .await
+        .unwrap();
+
+        let backend = PostgresBackend::new(Arc::new(pool), url.clone());
+        let spec = cdc_target_spec();
+        let mut cdc_cfg = CdcConfig::for_envelope(EnvelopeKind::Debezium);
+        cdc_cfg.key_field = "after.id".into();
+
+        let rows = vec![
+            json!({
+                "before": null,
+                "after": {"id": 7, "email": "g@example.com", "name": "Gus"},
+                "source": {"ts_ms": 1_700_000_100_000_i64},
+                "op": "c",
+                "ts_ms": 1_700_000_100_000_i64,
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+        ];
+        let batch = record_batch_from_json(&rows);
+        let r = backend
+            .run_cdc(&spec, batch, &cdc_cfg, "test_cdc_restart")
+            .await
+            .expect("first run_cdc");
+        assert_eq!(r.creates, 1);
+        assert_eq!(r.idempotent_skipped, 0);
+        // backend, pool, and PostgresBackend all dropped here.
+    }
+
+    // Phase 2: brand-new pool against the same Postgres. Replay
+    // the same event. The on-disk idempotency entry must reject it.
+    let pool = PgPool::connect(&url).await.unwrap();
+    let backend = PostgresBackend::new(Arc::new(pool), url.clone());
+    let spec = cdc_target_spec();
+    let mut cdc_cfg = CdcConfig::for_envelope(EnvelopeKind::Debezium);
+    cdc_cfg.key_field = "after.id".into();
+
+    let rows = vec![
+        json!({
+            "before": null,
+            "after": {"id": 7, "email": "g@example.com", "name": "Gus"},
+            "source": {"ts_ms": 1_700_000_100_000_i64},
+            "op": "c",
+            "ts_ms": 1_700_000_100_000_i64,
+        })
+        .as_object()
+        .unwrap()
+        .clone(),
+    ];
+    let batch = record_batch_from_json(&rows);
+    let r = backend
+        .run_cdc(&spec, batch, &cdc_cfg, "test_cdc_restart")
+        .await
+        .expect("second run_cdc");
+    assert_eq!(r.creates, 0, "redelivery after restart applied no inserts");
+    assert_eq!(r.idempotent_skipped, 1, "the replayed event was filtered");
+}
+
+/// Phase Δ PR 4: the idempotency gate keys on `(pipeline, pk_json)`
+/// — same PK + same ts_ms under a *different* pipeline name must
+/// not collide. Two independent pipelines mirror the same source
+/// table in different ways.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker; run with `cargo test -- --ignored`"]
+async fn cdc_postgres_idempotency_keyed_per_pipeline() {
+    use ematix_flow_core::cdc::{CdcConfig, EnvelopeKind};
+    use serde_json::json;
+
+    let (_container, url) = start_postgres().await;
+    let pool = PgPool::connect(&url).await.unwrap();
+    pool.execute("CREATE SCHEMA mirror").await.unwrap();
+    pool.execute(
+        "CREATE TABLE mirror.customers (\
+            id     BIGINT PRIMARY KEY,\
+            email  TEXT,\
+            name   TEXT\
+         )",
+    )
+    .await
+    .unwrap();
+
+    let backend = PostgresBackend::new(Arc::new(pool), url.clone());
+    let spec = cdc_target_spec();
+    let mut cdc_cfg = CdcConfig::for_envelope(EnvelopeKind::Debezium);
+    cdc_cfg.key_field = "after.id".into();
+
+    let row = json!({
+        "before": null,
+        "after": {"id": 11, "email": "h@example.com", "name": "Hera"},
+        "source": {"ts_ms": 1_700_000_200_000_i64},
+        "op": "c",
+        "ts_ms": 1_700_000_200_000_i64,
+    })
+    .as_object()
+    .unwrap()
+    .clone();
+
+    let r_a = backend
+        .run_cdc(
+            &spec,
+            record_batch_from_json(std::slice::from_ref(&row)),
+            &cdc_cfg,
+            "pipeline_A",
+        )
+        .await
+        .expect("pipeline A");
+    assert_eq!(r_a.creates, 1);
+    assert_eq!(r_a.idempotent_skipped, 0);
+
+    let r_b = backend
+        .run_cdc(
+            &spec,
+            record_batch_from_json(std::slice::from_ref(&row)),
+            &cdc_cfg,
+            "pipeline_B",
+        )
+        .await
+        .expect("pipeline B");
+    assert_eq!(
+        r_b.creates, 1,
+        "pipeline_B sees the event for the first time — its own keyspace"
+    );
+    assert_eq!(r_b.idempotent_skipped, 0);
+
+    // Same pipeline_A again → blocked.
+    let r_a2 = backend
+        .run_cdc(
+            &spec,
+            record_batch_from_json(&[row]),
+            &cdc_cfg,
+            "pipeline_A",
+        )
+        .await
+        .expect("pipeline A again");
+    assert_eq!(r_a2.creates, 0);
+    assert_eq!(r_a2.idempotent_skipped, 1);
+}
+
+/// Phase Δ PR 5: with `SchemaEvolutionPolicy::Skip` (the default),
+/// an event whose `after` payload introduces a column the target
+/// table does not declare keeps the pipeline running — the row
+/// applies with the unknown column omitted.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker; run with `cargo test -- --ignored`"]
+async fn cdc_postgres_schema_skip_keeps_pipeline_running() {
+    use ematix_flow_core::cdc::{CdcConfig, EnvelopeKind, SchemaEvolutionPolicy};
+    use serde_json::json;
+
+    let (_container, url) = start_postgres().await;
+    let pool = PgPool::connect(&url).await.unwrap();
+
+    pool.execute("CREATE SCHEMA mirror").await.unwrap();
+    pool.execute(
+        "CREATE TABLE mirror.customers (\
+            id     BIGINT PRIMARY KEY,\
+            email  TEXT,\
+            name   TEXT\
+         )",
+    )
+    .await
+    .unwrap();
+
+    let backend = PostgresBackend::new(Arc::new(pool), url.clone());
+    let spec = cdc_target_spec();
+
+    let mut cdc_cfg = CdcConfig::for_envelope(EnvelopeKind::Debezium);
+    cdc_cfg.key_field = "after.id".into();
+    cdc_cfg.schema_evolution = SchemaEvolutionPolicy::Skip;
+
+    // The event's `after` carries `phone` — a column the target
+    // does not declare. Skip policy says: warn, drop the unknown
+    // column, apply the rest of the row.
+    let rows = vec![
+        json!({
+            "before": null,
+            "after": {
+                "id": 42,
+                "email": "ivy@example.com",
+                "name": "Ivy",
+                "phone": "+1-555-0142",
+            },
+            "source": {"ts_ms": 1_700_000_300_000_i64},
+            "op": "c",
+            "ts_ms": 1_700_000_300_000_i64,
+        })
+        .as_object()
+        .unwrap()
+        .clone(),
+    ];
+    let batch = record_batch_from_json(&rows);
+
+    let result = backend
+        .run_cdc(&spec, batch, &cdc_cfg, "test_cdc_skip_drift")
+        .await
+        .expect("Skip policy must not error on unknown column");
+    assert_eq!(result.creates, 1, "row applied — phone discarded silently");
+
+    let verify_pool = PgPool::connect(&url).await.unwrap();
+    let client = verify_pool.raw_pool_for_tests().get().await.unwrap();
+    let rows = client
+        .query(
+            "SELECT id, email, name FROM mirror.customers ORDER BY id",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    let id: i64 = rows[0].get(0);
+    let email: String = rows[0].get(1);
+    let name: String = rows[0].get(2);
+    assert_eq!(id, 42);
+    assert_eq!(email, "ivy@example.com");
+    assert_eq!(name, "Ivy");
+}
+
+/// Phase Δ PR 5: with `SchemaEvolutionPolicy::Fail` the executor
+/// errors on the first unknown column and rolls back the whole
+/// batch — strict mode for teams that gate releases on schema sync.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker; run with `cargo test -- --ignored`"]
+async fn cdc_postgres_schema_fail_aborts_batch() {
+    use ematix_flow_core::cdc::{CdcConfig, EnvelopeKind, SchemaEvolutionPolicy};
+    use serde_json::json;
+
+    let (_container, url) = start_postgres().await;
+    let pool = PgPool::connect(&url).await.unwrap();
+
+    pool.execute("CREATE SCHEMA mirror").await.unwrap();
+    pool.execute(
+        "CREATE TABLE mirror.customers (\
+            id     BIGINT PRIMARY KEY,\
+            email  TEXT,\
+            name   TEXT\
+         )",
+    )
+    .await
+    .unwrap();
+
+    let backend = PostgresBackend::new(Arc::new(pool), url.clone());
+    let spec = cdc_target_spec();
+
+    let mut cdc_cfg = CdcConfig::for_envelope(EnvelopeKind::Debezium);
+    cdc_cfg.key_field = "after.id".into();
+    cdc_cfg.schema_evolution = SchemaEvolutionPolicy::Fail;
+
+    // Two events: the first is a clean insert, the second
+    // introduces a `phone` column. Fail policy must error and
+    // roll back the whole batch — neither row visible after.
+    let rows = vec![
+        json!({
+            "before": null,
+            "after": {"id": 1, "email": "alice@example.com", "name": "Alice"},
+            "source": {"ts_ms": 1_700_000_400_000_i64},
+            "op": "c",
+            "ts_ms": 1_700_000_400_000_i64,
+        })
+        .as_object()
+        .unwrap()
+        .clone(),
+        json!({
+            "before": null,
+            "after": {
+                "id": 2,
+                "email": "bob@example.com",
+                "name": "Bob",
+                "phone": "+1-555-0002",
+            },
+            "source": {"ts_ms": 1_700_000_400_001_i64},
+            "op": "c",
+            "ts_ms": 1_700_000_400_001_i64,
+        })
+        .as_object()
+        .unwrap()
+        .clone(),
+    ];
+    let batch = record_batch_from_json(&rows);
+
+    let err = backend
+        .run_cdc(&spec, batch, &cdc_cfg, "test_cdc_fail_drift")
+        .await
+        .expect_err("Fail policy must error on unknown column");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("phone"),
+        "error must name the offending column, got: {msg}"
+    );
+    assert!(
+        msg.to_lowercase().contains("schema") || msg.to_lowercase().contains("unknown"),
+        "error must signal schema drift, got: {msg}"
+    );
+
+    // Whole batch rolled back — id=1's clean INSERT must NOT
+    // be visible, since the FAIL on event 2 aborted the tx.
+    let verify_pool = PgPool::connect(&url).await.unwrap();
+    let client = verify_pool.raw_pool_for_tests().get().await.unwrap();
+    let row_count: i64 = client
+        .query_one("SELECT COUNT(*)::bigint FROM mirror.customers", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(row_count, 0, "Fail policy aborts the batch transactionally");
+}

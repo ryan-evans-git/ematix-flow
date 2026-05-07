@@ -914,6 +914,217 @@ once, rendered into the TOML the runtime parses.
 
 ---
 
+## CDC source mode (Δ)
+
+Phase Δ adds change-data-capture as a *consumption mode* on the
+streaming pipeline. Instead of treating each Kafka batch as
+"append every row to the target," the runtime decodes each
+message as a CDC envelope (Debezium / Maxwell / a custom shape)
+and applies the resulting `c` / `u` / `d` / `r` operation to a
+**mirror** table.
+
+End-to-end example: [`examples/cdc-debezium`](https://github.com/ryan-evans-git/ematix-flow/tree/main/examples/cdc-debezium)
+— Postgres → Debezium → Kafka → ematix-flow → Postgres mirror.
+(Absolute GitHub URL because the rendered docs site only serves `docs/`;
+relative links to `examples/` don't resolve in mkdocs-material.)
+
+### What it looks like
+
+**TOML**:
+
+```toml
+pipeline_name = "cdc-mirror-customers"
+source_query  = "dbz.public.customers"
+
+[source]
+kind              = "kafka"
+bootstrap_servers = "localhost:9094"
+group_id          = "ematix-flow-cdc"
+
+[target]
+kind = "postgres"
+url  = "postgres://postgres:postgres@localhost:5434/target"
+
+[target.table]
+schema = "public"
+name   = "customers"
+
+[transform.cdc]
+envelope  = "debezium"
+key_field = "after.id"
+```
+
+**Python** (decorator surface):
+
+```python
+import ematix_flow as ematix
+from ematix_flow import CDC
+
+@ematix.connection
+class warehouse:
+    kind = "postgres"
+    url  = "${EMATIX_FLOW_TARGET_DSN}"
+
+@ematix.table(connection="warehouse")
+class customers:
+    schema = "public"
+    name   = "customers"
+    primary_key = ["id"]
+
+@ematix.streaming_pipeline(
+    name="cdc-mirror-customers",
+    source_kind="kafka",
+    source_query="dbz.public.customers",
+    bootstrap_servers="localhost:9094",
+    group_id="ematix-flow-cdc",
+    target=customers,
+    cdc=CDC(envelope="debezium", key_field="after.id"),
+)
+def mirror_customers(): ...
+```
+
+The two surfaces lower to the same `CdcConfig` struct in the
+Rust core — pick whichever fits your workflow. `CDC(...)` is a
+frozen dataclass; field-for-field equivalent to `[transform.cdc]`.
+
+### Supported envelopes
+
+| `envelope` | Defaults populate |
+|---|---|
+| `"debezium"` | `op_field="op"`, `before/after`, `source.ts_ms`, `op_map = {c → Create, u → Update, d → Delete, r → Read}` |
+| `"maxwell"`  | `op_field="type"`, `data` (after) + `old` (before), `ts` (auto-scales seconds → ms), `op_map = {insert → Create, update → Update, delete → Delete}` |
+| `"custom"`   | Every field path + `op_map` must be set explicitly; the validator names what's missing |
+
+For Debezium / Maxwell, `key_field` is the only required
+override since the PK column name is table-specific. Common
+form: `after.<pk_col>`. The parser falls back to
+`before.<pk_col>` for delete events whose `after` is null.
+
+### What happens per batch
+
+1. Source backend reads a Kafka batch.
+2. Streaming runtime sees `[transform.cdc]` set → routes through
+   `Backend::run_cdc` instead of the universal append path.
+3. `events_from_batch` walks the batch and resolves each row to
+   a `CdcEvent { op, key, ts_ms, before, after }`. Tombstones
+   (`payload = null`) and parse errors counted as `skipped`.
+4. The Postgres executor opens one transaction per batch; per
+   event, in order:
+   - **Idempotency gate**. `INSERT … ON CONFLICT DO UPDATE …
+     WHERE existing.last_seen_ts_ms < EXCLUDED.last_seen_ts_ms
+     RETURNING 1` against `ematix_flow.cdc_idempotency`. Empty
+     RETURNING = redelivery; the executor skips the data write
+     and bumps `idempotent_skipped`. Strict-monotonic per
+     `(pipeline_name, pk)`. Events with `ts_ms = None` bypass
+     the gate (no-idempotency mode).
+   - **Schema-evolution check**. Keys in `after` not in the
+     target's reflected column set go through the configured
+     policy: `"skip"` (default) warns once per drift column per
+     batch then lets Postgres's `jsonb_populate_record` discard
+     the unknown key; `"fail"` returns an error and rolls back
+     the whole batch.
+   - **Apply**. UPSERT for `c`/`r`, UPDATE for `u`, DELETE for
+     `d` (or column-flip when `delete_mode = "soft"`). All three
+     paths use `jsonb_populate_record(NULL::<table>, $1::jsonb)`
+     so type coercion is identical.
+5. Single transaction commit; source offsets advance only after
+   the target commit succeeds (at-least-once with executor-side
+   idempotent suppression of redeliveries).
+
+### Configurable knobs
+
+| Field | Default | Meaning |
+|---|---|---|
+| `envelope` | required | `"debezium"` / `"maxwell"` / `"custom"` |
+| `key_field` | required for canonical envelopes | JSON path to PK in the envelope (e.g. `"after.id"`) |
+| `delete_mode` | `"hard"` | `"soft"` flips a configured `soft_delete_column` to NOW() instead of DELETE |
+| `soft_delete_column` | — | Required when `delete_mode = "soft"` |
+| `schema_evolution` | `"skip"` | `"fail"` aborts the batch on first unknown column |
+| `out_of_order_tolerance_ms` | `5000` | Reserved for future warn-on-backwards window — the gate is strict-monotonic today |
+
+### Declaring the target's primary key
+
+CDC needs to know which columns make up the target table's
+primary key — that's what the apply layer joins on. For
+**Postgres** targets, `information_schema` surfaces PK info via
+reflection automatically; you don't need to declare anything.
+
+For **Delta Lake** (and any other target whose schema doesn't
+carry PK constraints) you must declare the PK on the target.
+Three equivalent paths:
+
+```toml
+# 1. TOML
+[target.table]
+schema      = "default"
+name        = "customers"
+primary_key = ["id"]
+```
+
+```python
+# 2. Typed-Python multi-target
+from ematix_flow.streaming import Target
+targets = [
+    Target(connection=lake, table=("default", "customers"), primary_key=["id"]),
+]
+```
+
+```python
+# 3. Typed-Python single-target legacy kwargs
+run_streaming_pipeline(
+    target=lake, target_table=("default", "customers"),
+    target_primary_key=["id"],
+    ...
+)
+```
+
+The streaming runtime augments the reflected schema with this
+declaration before dispatching to `Backend::run_cdc`. A
+typo'd column name (one that doesn't exist in the live target)
+fails loud at startup with a message naming the offending
+column.
+
+### Cross-validation
+
+`[transform.cdc]` is mutually exclusive with:
+- `[transform.window]` (CDC consumes envelopes per-event, windowing them would break the apply contract)
+- `[transform.join]` (joins consume two flat streams, not envelopes)
+- `[transform.sql]` (a SQL pre-stage projecting envelope columns would lose the original op-/before-/after-shape)
+
+The CLI's `validate_transform_cdc` enforces this at config-load
+so the runtime never sees an inconsistent combination.
+
+### Metrics
+
+Pipelines with `[transform.cdc]` set surface five extra Prometheus
+counters under `pipeline=<name>`:
+
+- `ematix_streaming_cdc_creates_total` — `c` + `r` ops applied.
+- `ematix_streaming_cdc_updates_total` — `u` ops applied.
+- `ematix_streaming_cdc_deletes_total` — `d` ops applied (hard or soft).
+- `ematix_streaming_cdc_skipped_total` — tombstones + parse failures.
+- `ematix_streaming_cdc_idempotent_skipped_total` — events
+  rejected by the per-PK last-seen-ts gate (Kafka redeliveries).
+  Watch this counter — a steady non-zero rate indicates upstream
+  redelivery noise that the gate is absorbing.
+
+### Multi-target reach
+
+| Target | Status | Notes |
+|---|---|---|
+| **Postgres** | Shipped (Δ PR 3 + 4 + 5 + 5.5) | Full per-event apply with idempotency gate, schema-evolution detection, and streaming-runtime dispatch. |
+| **Delta Lake** | Shipped (Δ.X1 PR 1 + Δ.X1.2) | Single-MERGE-per-batch via `DeltaOps::merge`; within-batch dedupe by newest ts; auto-schema-evolution under Skip policy. Streaming-runtime dispatch via `flow consume` works end-to-end — declare the PK on `[target.table].primary_key = [...]` (Delta tables don't carry PK constraints natively). |
+| **DuckDB / SQLite / MySQL** | Catalogued (Δ.X2) | Same per-event-statement shape as Postgres; differs only in UPSERT keyword + JSON-extract primitive. ~1–2 days each. |
+| **Object stores** | Deferred (Δ.X3) | Parquet / CSV / JSON / ORC are immutable — recommend Delta-on-S3 (Δ.X1) instead. |
+
+Default `Backend::run_cdc` impl errors with a clear "not
+implemented for this dialect" message on backends without a
+concrete implementation, so misconfiguration fails fast.
+[`docs/PHASE_DELTA_CDC_PLAN.md`](PHASE_DELTA_CDC_PLAN.md#phase-δ-extensions)
+catalogues every extension's design + effort estimate.
+
+---
+
 ## Operations
 
 ### Prometheus metrics
