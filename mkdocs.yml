@@ -5,9 +5,8 @@ site_name: ematix-flow
 # doesn't override it. Keep this readable for non-engineers — it's
 # the line that decides whether someone clicks the SERP result.
 site_description: >
-  Move data between databases, files, and streaming sources from
-  Python — no Spark or Airflow cluster. Declarative loads, Rust
-  core, 5.87× faster than PySpark.
+  Move data between databases, files, and streams from Python.
+  5.87× faster than PySpark. No JVM needed.
 site_url: https://ryan-evans-git.github.io/ematix-flow/
 repo_url: https://github.com/ryan-evans-git/ematix-flow
 repo_name: ryan-evans-git/ematix-flow

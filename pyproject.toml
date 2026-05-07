@@ -5,7 +5,7 @@ build-backend = "maturin"
 [project]
 name = "ematix-flow"
 version = "0.1.2"
-description = "Move data between databases, files, and streaming sources from Python — no Spark or Airflow cluster. Declarative loads (append, merge, SCD2) across Postgres, MySQL, SQLite, DuckDB, S3 / Delta Lake, Kafka, Pub/Sub, Kinesis, RabbitMQ. Rust + Apache Arrow core, 5.87× faster than single-node PySpark on TPC-H."
+description = "Move data between databases, files, and streams from Python. 5.87× faster than PySpark. No JVM needed."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "Apache-2.0" }
