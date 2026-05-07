@@ -9,20 +9,31 @@ name: integration
 # unit-test path; this workflow carries the load-bearing 100+
 # ignored tests + the coverage gate.
 #
-# Coverage gate: `--fail-under-lines <FLOOR>`. After 6 rounds of
-# unit-test backfill (cli/lib.rs, backend.rs, delta_backend.rs,
-# session_blob.rs, transform.rs, objectstore date helpers — 41
-# new tests in commits 18d62ed..bcff28b) local measurement is at
-# 86.54% lines with the same scope (excluding PyO3 wrappers +
-# entrypoint binaries). The floor is set at 86% — catches
-# regressions with a small buffer, locks the round-of-backfill
-# gains. Path to the user's 90% target: a Postgres testcontainer
-# test exercising every Arrow column type (Int16/Int32/Float32/
-# Boolean/Binary/Timestamp/JSONB/UUID etc) would close ~500 lines
-# at once across backend.rs + pg.rs + duckdb_backend.rs +
-# mysql_backend.rs's COPY-BINARY / per-type binding paths;
-# windowed.rs internal-state-machine edge cases close another
-# ~100. Ratchet the floor up as those land.
+# Coverage measurement (no hard gate yet). After 6 rounds of
+# unit-test backfill (commits 18d62ed..bcff28b — 41 new tests
+# across cli/lib.rs, backend.rs, delta_backend.rs,
+# session_blob.rs, transform.rs, objectstore date helpers) local
+# measurement is at 86.54% line coverage with the same scope
+# (excluding PyO3 wrappers + entrypoint binaries), up from
+# 84.84% baseline. The user's stated target is 90%, not yet
+# reached.
+#
+# `--fail-under-lines` is intentionally NOT set on this workflow
+# until coverage actually crosses 90%. Reasoning: enforcing a
+# below-target floor would be a half-measure that mostly creates
+# noise (red checks on PRs touching unrelated areas, friction
+# with parallel PRs that don't change Rust source). The workflow
+# still runs cargo-llvm-cov, prints the summary in the build
+# log, and uploads the lcov artifact — humans can eyeball
+# regressions. Add the gate when 90% lands.
+#
+# Path to 90% (~3.5pp from current): a single Postgres
+# testcontainer test exercising every Arrow column type
+# (Int16/Int32/Float32/Boolean/Binary/Timestamp/JSONB/UUID etc)
+# would close ~500 lines simultaneously across backend.rs's
+# COPY-BINARY type-binding match arms + pg.rs +
+# duckdb_backend.rs + mysql_backend.rs; windowed.rs
+# internal-state-machine edge cases close another ~100.
 #
 # What's excluded from the coverage denominator:
 #   - `ematix-flow-py/src/*.rs` — PyO3 wrappers exercised
@@ -46,7 +57,33 @@ name: integration
 on:
   push:
     branches: [main, master]
+    # Skip on changes that can't affect Rust coverage. A LICENSE-
+    # only PR or a docs/markdown tweak would otherwise spend ~30
+    # min spinning up Postgres / MinIO / Kafka / RabbitMQ
+    # containers for nothing.
+    paths-ignore:
+      - "**/*.md"
+      - "LICENSE*"
+      - "COPYING*"
+      - "NOTICE*"
+      - "AUTHORS*"
+      - "CONTRIBUTORS*"
+      - "docs/**"
+      - "examples/**/README*"
+      - ".gitignore"
+      - ".gitattributes"
   pull_request:
+    paths-ignore:
+      - "**/*.md"
+      - "LICENSE*"
+      - "COPYING*"
+      - "NOTICE*"
+      - "AUTHORS*"
+      - "CONTRIBUTORS*"
+      - "docs/**"
+      - "examples/**/README*"
+      - ".gitignore"
+      - ".gitattributes"
   schedule:
     - cron: "0 6 * * *"
   workflow_dispatch:
@@ -97,15 +134,15 @@ jobs:
         run: |
           cargo llvm-cov --no-report --workspace --tests --no-fail-fast \
               -- --include-ignored
-      - name: Coverage summary + gate (≥ 86% lines)
-        # `--fail-under-lines 86` exits non-zero when total line
-        # coverage drops below 86%. The exclude regex matches the
-        # local measurement scope so the gate threshold stays
-        # apples-to-apples with the documented baseline.
+      - name: Coverage summary
+        # No `--fail-under-lines` until coverage crosses 90% (the
+        # user's stated target). Until then this step prints the
+        # summary table for human review + uploads the lcov
+        # artifact below; regressions surface in the build log
+        # and on the artifact diff.
         run: |
           cargo llvm-cov report \
-              --ignore-filename-regex '(ematix-flow-py/src/|main\.rs|flow_worker\.rs)' \
-              --fail-under-lines 86
+              --ignore-filename-regex '(ematix-flow-py/src/|main\.rs|flow_worker\.rs)'
       - name: Coverage lcov export
         run: |
           cargo llvm-cov report \

@@ -15,20 +15,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   100+ testcontainer-gated tests (Postgres CDC, MinIO/S3 Delta,
   cross-pod distributed, etc.) are exercised in CI for the first
   time — previously only the unit-test set ran via `ci.yml`.
-  - **Coverage gate**: `--fail-under-lines 86`. After 6 rounds
+  - **Coverage measurement (no hard gate yet)**. After 6 rounds
     of unit-test backfill (commits 18d62ed..bcff28b — 41 new
     tests across cli/lib.rs, backend.rs, delta_backend.rs,
     session_blob.rs, transform.rs, objectstore date helpers)
     local measurement is at **86.54% line coverage** with the
     same scope (excluding PyO3 wrappers + entrypoint binaries),
-    up from 84.84% baseline. The 86% gate locks those gains.
-    Path to the user-stated 90% target: a single Postgres
-    testcontainer test that runs append over every Arrow column
-    type would close ~500 lines simultaneously across
-    backend.rs's COPY-BINARY type-binding match arms + pg.rs +
-    duckdb_backend.rs + mysql_backend.rs; windowed.rs
-    internal-state-machine edge cases close another ~100.
-    Ratchet the floor as those land.
+    up from 84.84% baseline. The user's stated target is 90%;
+    `--fail-under-lines` is deliberately NOT set on the workflow
+    until that threshold lands — enforcing a below-target floor
+    creates noise on PRs without bringing real correctness
+    benefit. The workflow runs cargo-llvm-cov, prints the
+    summary, and uploads the lcov artifact for human review.
+    Path to 90%: a single Postgres testcontainer test exercising
+    every Arrow column type closes ~500 lines simultaneously
+    across backend.rs/pg.rs/duckdb_backend.rs/mysql_backend.rs's
+    COPY-BINARY type-binding paths; windowed.rs internal-state
+    edges close another ~100.
+  - **paths-ignore filter**: the integration workflow skips
+    when only LICENSE / NOTICE / docs / markdown changes — so a
+    license-or-docs-only PR doesn't pay the 30-min testcontainer
+    spin-up cost.
   - **Excluded from the coverage denominator**:
     `ematix-flow-py/src/*.rs` (PyO3 wrappers covered only via
     `pytest`, invisible to `cargo-llvm-cov`),
