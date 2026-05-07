@@ -508,4 +508,124 @@ mod tests {
         let back = decode_sessions(&bytes).unwrap();
         assert!(back.is_empty());
     }
+
+    /// Coverage backfill: round-trip every `AccState` variant
+    /// the blob layer supports. The existing tests cover
+    /// CountStar / FirstUtf8 / CountDistinctExact{Numeric,Utf8};
+    /// this one fills in the remaining 12 variants so a future
+    /// blob-shape change produces a loud diff per-arm.
+    #[test]
+    fn acc_state_blob_roundtrip_all_simple_variants() {
+        let cases = vec![
+            AccState::CountCol(99),
+            AccState::SumI64 {
+                sum: 1234,
+                any: true,
+            },
+            AccState::SumF64 {
+                sum: 12.5,
+                any: true,
+            },
+            AccState::MinI64(Some(7)),
+            AccState::MinI64(None),
+            AccState::MinF64(Some(3.14)),
+            AccState::MinF64(None),
+            AccState::MaxI64(Some(42)),
+            AccState::MaxF64(Some(99.9)),
+            AccState::AvgI64 { sum: 100, count: 4 },
+            AccState::AvgF64 { sum: 10.0, count: 3 },
+            AccState::FirstI64 {
+                ts: Some(1000),
+                value: Some(7),
+            },
+            AccState::FirstF64 {
+                ts: Some(2000),
+                value: Some(2.5),
+            },
+            AccState::LastI64 {
+                ts: Some(3000),
+                value: Some(11),
+            },
+            AccState::LastF64 {
+                ts: Some(4000),
+                value: Some(99.0),
+            },
+            AccState::LastUtf8 {
+                ts: Some(5000),
+                value: Some("end".into()),
+            },
+            // Edge-case: First/Last with no observation yet.
+            AccState::FirstI64 {
+                ts: None,
+                value: None,
+            },
+            AccState::LastUtf8 {
+                ts: None,
+                value: None,
+            },
+        ];
+
+        for state in cases {
+            let blob = AccStateBlob::from_state(&state)
+                .unwrap_or_else(|e| panic!("from_state on {state:?}: {e}"));
+            let bytes = postcard::to_allocvec(&blob).unwrap();
+            let back: AccStateBlob = postcard::from_bytes(&bytes).unwrap();
+            assert_eq!(blob, back, "postcard round-trip preserves blob shape");
+            // into_state must yield the same logical state. Use
+            // Debug equality as a coarse-but-honest comparator —
+            // AccState doesn't implement Eq directly because of
+            // the f64 / HLL variants.
+            let restored = back.into_state();
+            assert_eq!(
+                format!("{state:?}"),
+                format!("{restored:?}"),
+                "into_state round-trip"
+            );
+        }
+    }
+
+    /// `SessionState::into_blob` + `from_blob` round-trip when the
+    /// session has been emitted vs not, and dirty vs not — all
+    /// four combinations exercise the boolean fields the blob
+    /// layer transports verbatim.
+    #[test]
+    fn session_state_blob_emitted_dirty_combinations() {
+        for (emitted, dirty) in [(false, false), (true, false), (false, true), (true, true)] {
+            let session = SessionState::from_blob(
+                100,
+                500,
+                emitted,
+                dirty,
+                vec![AccState::CountStar(1), AccState::SumF64 {
+                    sum: 7.5,
+                    any: true,
+                }],
+            );
+            let bytes = encode_sessions(&[session]).unwrap();
+            let back = decode_sessions(&bytes).unwrap();
+            assert_eq!(back.len(), 1);
+            let s = &back[0];
+            assert_eq!(s.start_ts, 100);
+            assert_eq!(s.last_event_ts, 500);
+            assert_eq!(s.emitted, emitted, "emitted flag round-trips");
+            assert_eq!(s.dirty, dirty, "dirty flag round-trips");
+            assert_eq!(s.accs.len(), 2);
+        }
+    }
+
+    /// `GroupKey` blob layer covers each `KeyValue` variant.
+    /// The existing tests cover Int64 / Utf8 / Null; this one
+    /// adds the remaining UInt64 / Float64Bits / TsMicros so
+    /// every variant is round-tripped.
+    #[test]
+    fn group_key_roundtrip_remaining_variants() {
+        let key = GroupKey::from_values(vec![
+            KeyValue::UInt64(12345),
+            KeyValue::Float64Bits(3.14_f64.to_bits()),
+            KeyValue::TsMicros(1_700_000_000_000_000),
+        ]);
+        let bytes = encode_group_key(&key).unwrap();
+        let back = decode_group_key(&bytes).unwrap();
+        assert_eq!(back, key);
+    }
 }
