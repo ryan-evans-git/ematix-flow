@@ -25,14 +25,23 @@
      when no image. The image itself is left commented until a
      real social card asset (1200×630 PNG) lands in `docs/assets/`.
   #}
-  <meta property="og:title" content="{{ page.title | default(config.site_name) }}">
-  <meta property="og:description" content="{{ page.meta.description | default(config.site_description) | striptags }}">
-  <meta property="og:url" content="{{ page.canonical_url }}">
-  <meta property="og:type" content="{% if page.is_homepage %}website{% else %}article{% endif %}">
+  {# `page` is None in some non-page render contexts (the
+     404 template, search index, etc.). Guard each access so
+     mkdocs build --strict doesn't trip on
+     `'None' has no attribute 'meta'`. The fallbacks come from
+     `mkdocs.yml` (`site_name`, `site_description`, `site_url`). #}
+  {% set _og_title = (page.title if page else None) or config.site_name %}
+  {% set _og_desc = (page.meta.description if page and page.meta else None) or config.site_description %}
+  {% set _og_url = (page.canonical_url if page else None) or config.site_url %}
+  {% set _og_type = "website" if not page or page.is_homepage else "article" %}
+  <meta property="og:title" content="{{ _og_title }}">
+  <meta property="og:description" content="{{ _og_desc | striptags }}">
+  <meta property="og:url" content="{{ _og_url }}">
+  <meta property="og:type" content="{{ _og_type }}">
   <meta property="og:site_name" content="{{ config.site_name }}">
   <meta name="twitter:card" content="summary_large_image">
-  <meta name="twitter:title" content="{{ page.title | default(config.site_name) }}">
-  <meta name="twitter:description" content="{{ page.meta.description | default(config.site_description) | striptags }}">
+  <meta name="twitter:title" content="{{ _og_title }}">
+  <meta name="twitter:description" content="{{ _og_desc | striptags }}">
   {# <meta property="og:image" content="{{ config.site_url }}assets/social-card.png"> #}
   {# <meta name="twitter:image" content="{{ config.site_url }}assets/social-card.png"> #}
 
