@@ -1,7 +1,13 @@
 site_name: ematix-flow
+# Plain-English value line. Used as the default `<meta
+# name="description">` (Google search snippet, ~155 char budget)
+# AND as the fallback `og:description` if the per-page front-matter
+# doesn't override it. Keep this readable for non-engineers — it's
+# the line that decides whether someone clicks the SERP result.
 site_description: >
-  Declarative table management, load strategies, and streaming
-  pipelines — Rust core, Python API.
+  Move data between databases, files, and streaming sources from
+  Python — no Spark or Airflow cluster. Declarative loads, Rust
+  core, 5.87× faster than PySpark.
 site_url: https://ryan-evans-git.github.io/ematix-flow/
 repo_url: https://github.com/ryan-evans-git/ematix-flow
 repo_name: ryan-evans-git/ematix-flow

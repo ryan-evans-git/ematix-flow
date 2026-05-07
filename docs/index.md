@@ -1,13 +1,20 @@
 # ematix-flow
 
-> Declarative table management, load strategies, and streaming
-> pipelines — Rust core, Python API. Multi-backend (Postgres, MySQL,
-> SQLite, DuckDB, Object Stores, Delta Lake) with streaming sources
-> (Kafka, RabbitMQ, GCP Pub/Sub, AWS Kinesis), Schema-Registry-aware
-> Avro/Protobuf, manual-ack at-least-once, mid-stream SQL transforms
-> + tumbling/hopping/session windows + keyed time-windowed
-> stream-stream joins backed by a Postgres-durable state store, and
-> a `flow consume` CLI with Prometheus metrics + supervised restart.
+**The fast, declarative way to move data — without standing up
+Spark or Airflow.**
+
+ematix-flow is a Python library for moving data between
+databases (Postgres, MySQL, SQLite, DuckDB), files (Parquet,
+CSV, JSON, ORC, Delta Lake — local disk or S3), and streaming
+sources (Kafka, Pub/Sub, Kinesis, RabbitMQ). Declare a target
+table and a load strategy — append, merge, or slowly-changing
+dimension — and the Rust + Apache Arrow engine handles
+correctness: schema evolution, watermarks, at-least-once
+delivery, change-data-capture.
+
+**5.87× faster than single-node PySpark on TPC-H** (SF=1,
+geomean across all 22 queries). No JVM, no cluster, no
+scheduler — one `pip install`.
 
 ## Where to start
 

@@ -5,6 +5,37 @@
 {% block extrahead %}
   {{ super() }}
 
+  {# Open Graph + Twitter Card metadata. These render the preview
+     card you see when the URL is shared on Slack, Twitter / X,
+     LinkedIn, Discord, etc. Without them, those platforms fall
+     back to a bare URL with no title or description.
+
+     `og:title` / `og:description` use mkdocs-material's per-page
+     `page.title` and `page.meta.description` first, then fall
+     through to the site-level `site_name` / `config.site_description`
+     (set in `mkdocs.yml`). `og:url` uses `page.canonical_url` which
+     mkdocs-material populates from `site_url`.
+
+     `og:type` is `website` on the home page and `article` on
+     individual doc pages — that's what crawlers expect for
+     documentation hosting.
+
+     `twitter:card=summary_large_image` gives a wider preview
+     when an `og:image` is present; falls back to `summary` style
+     when no image. The image itself is left commented until a
+     real social card asset (1200×630 PNG) lands in `docs/assets/`.
+  #}
+  <meta property="og:title" content="{{ page.title | default(config.site_name) }}">
+  <meta property="og:description" content="{{ page.meta.description | default(config.site_description) | striptags }}">
+  <meta property="og:url" content="{{ page.canonical_url }}">
+  <meta property="og:type" content="{% if page.is_homepage %}website{% else %}article{% endif %}">
+  <meta property="og:site_name" content="{{ config.site_name }}">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="{{ page.title | default(config.site_name) }}">
+  <meta name="twitter:description" content="{{ page.meta.description | default(config.site_description) | striptags }}">
+  {# <meta property="og:image" content="{{ config.site_url }}assets/social-card.png"> #}
+  {# <meta name="twitter:image" content="{{ config.site_url }}assets/social-card.png"> #}
+
   {# Search-engine verification meta tags.
 
      1. Sign up at the appropriate console:
