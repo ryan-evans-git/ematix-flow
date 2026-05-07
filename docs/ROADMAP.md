@@ -113,6 +113,135 @@ Goal: stand alongside PySpark on batch SQL throughput at <20% of PySpark's image
 
 Recommendation: ship Σ.A–C first; Σ.D triggers after the batch claim is benchmarked + announced.
 
+### P6 — Phase Ω: orchestration + status UI
+
+Goal: turn ematix-flow from "a library you call from your scheduler"
+into a self-hosting orchestrator-lite that handles dependency
+ordering, retry policy, and live status visibility — without
+bringing in Airflow. The streaming consumer already has a Prometheus
+`/metrics` endpoint and `--restart-on-error` supervisor; this phase
+generalizes both to batch pipelines and adds a human-facing surface.
+
+Plan + open questions are draft-only at the moment; implementation
+gated on resolving the items in **§Open questions** below. Items
+sized assuming the open questions land at "smallest reasonable
+choice" (in-process state, opt-in persistence reusing `StateStore`,
+trait-based alerter).
+
+35. **Ω.1 — Pipeline dependencies (DAG).** Decorator-level
+    `depends_on=[upstream_pipeline]` (or `[pipeline.depends_on]` TOML).
+    Build a DAG at registration time; reject cycles with a clear error
+    pointing at both ends of the cycle. A pipeline's downstream is
+    eligible to run only when its declared upstreams' most-recent
+    runs succeeded inside a freshness window (`upstream_freshness=`,
+    default unbounded). Single-process scope first; cross-process
+    dependency negotiation follows in Ω.4 if/when needed. Effort:
+    ~1.5 wk.
+
+36. **Ω.2 — Declarative retry policy.** Per-pipeline (and per-step
+    once Ω.5 lands) retry config: `retries=N`, `retry_backoff_ms`,
+    `retry_max_total_ms`, `retry_on=[ErrorKind, ...]`. Exponential
+    backoff with jitter; bounded by both attempt count and total
+    wall-time. Generalizes the existing streaming `--restart-on-error`
+    supervisor to batch pipelines and exposes the policy
+    declaratively rather than as a CLI flag. Effort: ~1 wk.
+
+37. **Ω.3 — Status UI (HTTP server + JSON API).** A built-in server
+    on a configurable port (e.g. `flow status --port 8080`) showing
+    live pipeline + step status: which pipelines are running /
+    queued / blocked-on-dependency / failed; per-step state for the
+    active run; last-N runs per pipeline. Same process as the
+    runner — no separate daemon. JSON API behind the HTML so external
+    dashboards can consume the same data. Defaults to `127.0.0.1`
+    bind; explicit `--bind 0.0.0.0` opt-in; no in-tree auth in v1
+    (relegate to fronting reverse proxy — same model as the existing
+    Prometheus `/metrics`). Effort: ~2 wk.
+
+#### Open questions (gating decisions; no code yet)
+
+- **Ω.Q1 — Run-history persistence (opt-in).** Today's run history
+  is per-pipeline in the *target* schema (Postgres only). A unified,
+  cross-pipeline "runs" table is a different surface. Choices:
+  reuse the existing `StateStore` (Postgres + in-memory backends
+  already implemented) and add an `ematix_flow.run_history` table?
+  Or add SQLite as a third backend so users without Postgres get
+  durability? Retention policy needs a knob (`max_runs` /
+  `max_age_days`). Open: opt-in keeps the change non-breaking but
+  means the UI's "history" panel is empty by default — is that
+  acceptable, or should the UI persist a small in-memory ring
+  buffer (last-100) regardless of the persistent backend choice?
+
+- **Ω.Q2 — Restart-from-failure.** Replay a failed run resuming at
+  the failed step rather than from the top. Easy mental model, hard
+  semantics: requires every step to declare its inputs as a
+  deterministic function of upstream outputs (otherwise "restart at
+  step 5" can produce different results than "run all 5 steps
+  fresh"). For streaming pipelines this is already implicit (offsets
+  + StateStore + watermarks). For batch pipelines it needs every
+  step to either (a) be idempotent — already true for `merge` /
+  `scd2`, *not* true for `append` — or (b) checkpoint intermediate
+  Arrow batches to disk. Open: scope restart-from-failure to
+  idempotent strategies + streaming, or land step-level batch
+  checkpointing as part of this phase?
+
+- **Ω.Q3 — Alert transport surface.** On run failure (and optionally
+  success), send an alert via a configurable transport. Candidate
+  transports: Slack webhook, generic HTTP webhook, email (SMTP),
+  PagerDuty Events API. Open: ship transports in-tree (each adds a
+  dep + maintenance surface) or expose an `Alerter` trait + a
+  reference webhook impl + a docs page on how to plug in others?
+  Recommendation leans trait — keeps the dependency tree minimal
+  and matches the `Backend` / `StateStore` extensibility pattern
+  already in the codebase.
+
+- **Ω.Q4 — Re-alert on stuck failures.** If a pipeline has been in
+  `failed` state for longer than `realert_after=...`, re-fire the
+  alert. Coupling: requires the persistent run-history backend
+  (Ω.Q1) — there's no place to track "we already alerted at T0"
+  without it. Open: do we gate Ω.Q4 entirely on the user opting
+  into Ω.Q1, or build a separate small "alert state" table that
+  could exist independently of run history?
+
+- **Ω.Q5 — Step-level granularity.** Items 35–37 above are
+  pipeline-level. The user-facing pitch ("see the status of
+  individual steps of the pipeline") implies step-level too —
+  meaning every transform, every emit, every commit ought to be a
+  named step the UI can show. That's a meaningful refactor: today's
+  pipeline runs are mostly atomic from a status-tracking point of
+  view. Open: in v1, expose pipeline-level only and label this as
+  follow-up; or land step decomposition + per-step retry / alert
+  hooks together? Strong tension between "ship something useful
+  fast" and "build the surface users actually asked for."
+
+- **Ω.Q6 — UI-vs-flow-worker overlap.** Phase Σ.B already ships
+  `flow-worker` as a peer in the distributed batch mesh. The Ω.3
+  status server is a separate concern but shares some plumbing
+  (process registry, metrics endpoint). Open: merge the two so
+  there's exactly one daemon binary, or keep `flow status` as a
+  distinct subcommand?
+
+#### Sizing summary (assuming smallest-choice answers to Q1–Q6)
+
+| Sub-phase | Effort | Calendar | Validates |
+|---|---|---|---|
+| Ω.1 | 1 dev | 1–2 wk | DAG-aware scheduling without Airflow |
+| Ω.2 | 1 dev | ~1 wk | Declarative retries on batch + streaming |
+| Ω.3 | 1 dev | 2–3 wk | Built-in pipeline status UI |
+| Ω.Q1 | 1 dev | 1–2 wk | Persistent cross-pipeline run history |
+| Ω.Q2 | 1 dev | 2–4 wk | Restart-from-failure (size depends on (a) vs (b) above) |
+| Ω.Q3 | 1 dev | 1 wk | Alerter trait + reference webhook impl |
+| Ω.Q4 | 1 dev | <1 wk | Re-alert on stuck failures (depends on Q1) |
+| Ω.Q5 | 1 dev | 3–4 wk | Step-level decomposition (if landed in v1) |
+| **Ω.1–3 only** | | **~4–6 wk** | Orchestration + UI without persistence layer |
+| **Ω.1–3 + Q1+Q3+Q4** | | **~7–10 wk** | Above + history + alerts + re-alert |
+| **Full Ω including Q2 + Q5** | | **~12–18 wk** | Restart-from-failure + step-level UI |
+
+Recommendation: ship **Ω.1 + Ω.2 + Ω.3 + Q3** as the v1 of this
+phase (DAG + retries + UI + alerts via Alerter trait). Defer Q1 /
+Q2 / Q4 / Q5 to follow-ups; they're all valuable but each adds a
+new persistence or refactor surface that's worth its own design
+review. Q6 decides itself once Ω.3 starts wiring the status server.
+
 ---
 
 ## What this roadmap intentionally doesn't cover
