@@ -1,18 +1,32 @@
 # ematix-flow
 
-**Declarative ETL/ELT + streaming pipelines, multi-backend, on a
-Rust + Apache Arrow core.** A single Python decorator declares a
-target table; another declares the load. Append, truncate,
-merge, and SCD2 strategies run against SQL databases, object
-stores, Delta Lake, or live streams without rewriting the
-pipeline. **5.87× faster than PySpark `local[*]` geomean across
-all 22 TPC-H queries** at SF=1 — see
-[`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) for the full method
-and per-query numbers.
+**Move data between databases, files, and streams from Python.
+5.87× faster than PySpark. No JVM needed.**
 
-> Status: **v0.1.0 on PyPI** as `ematix-flow` (2026-05-05).
-> All four surfaces below are shipped. See
-> [`docs/ROADMAP.md`](docs/ROADMAP.md) for what's deferred.
+ematix-flow is a Python library for moving data between
+databases (Postgres, MySQL, SQLite, DuckDB), files (Parquet,
+CSV, JSON, ORC, Delta Lake — local disk or S3), and streaming
+sources (Kafka, Pub/Sub, Kinesis, RabbitMQ). Declare a target
+table and a load strategy — append, merge, or slowly-changing
+dimension — and the Rust + Apache Arrow engine handles the
+correctness work: schema evolution, watermarks, at-least-once
+delivery, change-data-capture.
+
+**How it compares.** No scheduler, no warehouse, no JVM, no
+cluster — one `pip install`. Benchmarks show ematix-flow at
+**5.87× the speed of single-node PySpark on TPC-H**
+(SF=1, geomean across all 22 queries — see
+[`docs/BENCHMARKS.md`](https://github.com/ryan-evans-git/ematix-flow/blob/main/docs/BENCHMARKS.md)).
+If you've been writing one-off pandas / SQL scripts, ematix-flow
+gives you correctness guarantees without the operational weight
+of Airflow + Spark; if you've been running Airflow + dbt,
+ematix-flow handles the load logic and streaming sources without
+the scheduler tier.
+
+> Status: **v0.1.2 on PyPI** as `ematix-flow`. All four surfaces
+> below are shipped. See
+> [`docs/ROADMAP.md`](https://github.com/ryan-evans-git/ematix-flow/blob/main/docs/ROADMAP.md)
+> for what's deferred.
 
 ## Why ematix-flow
 
