@@ -9,6 +9,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **CI: integration-tests + coverage gate workflow.**
+  `.github/workflows/integration.yml` runs `cargo llvm-cov`
+  across the whole workspace with `--include-ignored` so the
+  100+ testcontainer-gated tests (Postgres CDC, MinIO/S3 Delta,
+  cross-pod distributed, etc.) are exercised in CI for the first
+  time — previously only the unit-test set ran via `ci.yml`.
+  - **Coverage gate**: `--fail-under-lines 84`. Phase 1 baseline
+    measured at 84.84% line coverage with the same scope
+    (excluding PyO3 wrappers + entrypoint binaries). Path to the
+    90% target documented inline: backfill `pg.rs` (48% / 733
+    missed lines), `cli/lib.rs` (85% / 765 missed), `windowed.rs`
+    (84% / 537 missed), `kafka_backend.rs` (80% / 448 missed),
+    then ratchet the floor up.
+  - **Excluded from the coverage denominator**:
+    `ematix-flow-py/src/*.rs` (PyO3 wrappers covered only via
+    `pytest`, invisible to `cargo-llvm-cov`),
+    `cli/src/main.rs` and `distributed/src/bin/flow_worker.rs`
+    (process entrypoints — thin wrappers around library code
+    that *is* covered).
+  - **Triggers**: every PR + push to main + nightly schedule +
+    `workflow_dispatch`. Adding the
+    `integration tests + coverage (ubuntu-latest)` job to the
+    `main` branch's required-status-checks is the next step
+    after one successful run lands the check name in GitHub's
+    discoverable list.
+
+### Added
+
 - **Phase Δ — CDC source mode**. Streaming pipelines can now
   treat each Kafka batch as a CDC envelope and apply per-event
   changes to a Postgres mirror table.

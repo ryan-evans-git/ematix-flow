@@ -1,0 +1,115 @@
+name: integration
+
+# Runs the testcontainer-gated tests (`#[ignore]`'d in the per-test
+# attribute, run only with `--include-ignored`) plus produces a
+# real `cargo llvm-cov` coverage number that combines unit tests
+# + the Postgres / MySQL / MinIO / Kafka / RabbitMQ / Pub/Sub /
+# Kinesis integration suites. The fast `ci.yml` workflow runs
+# only the default test set so PR-feedback stays fast on the
+# unit-test path; this workflow carries the load-bearing 100+
+# ignored tests + the coverage gate.
+#
+# Coverage gate: `--fail-under-lines <FLOOR>`. Phase 1 measured
+# 84.84% locally with the same scope (excluding PyO3 wrappers
+# + entrypoint binaries — see `--ignore-filename-regex` below).
+# The floor is set at 84% to catch regressions while leaving a
+# small buffer for legitimate fluctuation. Path to 90%: backfill
+# `pg.rs` / `cli/lib.rs` / `windowed.rs` / `kafka_backend.rs`
+# (the four largest gaps); ratchet the floor up as those land.
+#
+# What's excluded from the coverage denominator:
+#   - `ematix-flow-py/src/*.rs` — PyO3 wrappers exercised
+#     exclusively from `pytest`, invisible to `cargo-llvm-cov`.
+#     Counting them against the gate would penalize the project
+#     for tests that exist (just not in this measurement).
+#   - `cli/main.rs` and `flow_worker.rs` — process entrypoints,
+#     thin wrappers around library code that *is* covered.
+#
+# Triggers:
+#   - Every PR — required-status-check candidate. The user asked
+#     for "PR to pass CI" gating on coverage, so PRs see the
+#     full integration sweep.
+#   - Every push to main / master — catches regressions
+#     post-merge even on direct pushes (Light branch protection
+#     allows direct push so integration coverage on push is
+#     load-bearing).
+#   - Nightly schedule — catches dep / flake drift.
+#   - workflow_dispatch — manual re-run.
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  schedule:
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: integration-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # Bound testcontainers' container-startup retries — the default
+  # surface produces noise when an image pull stalls.
+  TESTCONTAINERS_RYUK_DISABLED: "true"
+
+jobs:
+  integration-with-coverage:
+    name: integration tests + coverage (ubuntu-latest)
+    runs-on: ubuntu-latest
+    # Allow up to ~75 min: image pulls + sequential testcontainer
+    # startup add up. The 2-hour default would mask a hung suite.
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+      # cargo-llvm-cov ships precompiled binaries via this action,
+      # so installation is a single download instead of a 2-min
+      # `cargo install` build.
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Verify Docker is available
+        # The runner image preinstalls Docker; this is a fast
+        # sanity check so a missing daemon fails the job up front
+        # rather than every per-test container start.
+        run: docker info >/dev/null
+      - name: Run tests with coverage (unit + ignored integration)
+        # `--workspace --tests` runs every test target across
+        # every crate but skips benches (criterion's CLI rejects
+        # libtest's `--include-ignored`). `--include-ignored`
+        # (after `--`) runs both ignored and non-ignored tests in
+        # the same binary invocation, producing one combined
+        # coverage profile. `--no-report` defers report generation
+        # so the same profdata feeds both the gate-check and the
+        # lcov artifact below. `--no-fail-fast` lets us see every
+        # failure rather than halting on the first one.
+        run: |
+          cargo llvm-cov --no-report --workspace --tests --no-fail-fast \
+              -- --include-ignored
+      - name: Coverage summary + gate (≥ 84% lines)
+        # `--fail-under-lines 84` exits non-zero when total line
+        # coverage drops below 84%. The exclude regex matches the
+        # local Phase 1 measurement scope so the gate threshold
+        # stays apples-to-apples with what was measured.
+        run: |
+          cargo llvm-cov report \
+              --ignore-filename-regex '(ematix-flow-py/src/|main\.rs|flow_worker\.rs)' \
+              --fail-under-lines 84
+      - name: Coverage lcov export
+        run: |
+          cargo llvm-cov report \
+              --ignore-filename-regex '(ematix-flow-py/src/|main\.rs|flow_worker\.rs)' \
+              --lcov --output-path lcov.info
+      - name: Upload lcov artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: lcov-coverage
+          path: lcov.info
+          # 14 days is plenty for a "what changed?" comparison
+          # without bloating storage. Tweak if a longer window is
+          # ever useful.
+          retention-days: 14
