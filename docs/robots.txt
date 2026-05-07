@@ -1,0 +1,23 @@
+# Lives at docs/robots.txt → mkdocs copies it through to
+# https://ryan-evans-git.github.io/ematix-flow/robots.txt.
+#
+# `User-agent: *` + an empty `Disallow:` is the canonical "allow
+# all crawlers everywhere" pattern. The `Sitemap:` directive is a
+# discovery hint — Google, Bing, and others read robots.txt before
+# crawling and use any `Sitemap:` URLs they find here as an
+# additional source on top of explicit Search Console submissions.
+# The url MUST be absolute per the sitemaps protocol.
+#
+# Note that Google's sitemap fetcher actually reads robots.txt at
+# the *domain* root (`https://ryan-evans-git.github.io/robots.txt`),
+# not at the project subpath. We can't put a file there from this
+# repo (that path is owned by `ryan-evans-git.github.io` if it
+# exists as a separate user-pages repo, otherwise GitHub serves a
+# 404 HTML stub). This file at the project subpath still helps:
+# Bing reads subpath robots.txt for project-pages sites, and
+# tools that test sitemaps ad-hoc honor it.
+
+User-agent: *
+Disallow:
+
+Sitemap: https://ryan-evans-git.github.io/ematix-flow/sitemap.xml
