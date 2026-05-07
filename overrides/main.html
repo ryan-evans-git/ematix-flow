@@ -16,7 +16,12 @@
 
      3. The console will give you a token. Paste it into the
         matching content="..." below + uncomment the line by
-        removing the surrounding {# … #} Jinja comments.
+        removing the surrounding Jinja comment markers (the
+        opener at the start of the line and the matching closer
+        at the end). NOTE: do not write the literal three-char
+        closer in this comment block — Jinja comments do not
+        nest, and the first such closer terminates the outer
+        comment, leaking the rest as HTML body text.
 
      4. Push to main; the docs.yml workflow rebuilds + deploys.
         Click "Verify" in the console.
