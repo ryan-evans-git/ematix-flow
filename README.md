@@ -52,9 +52,8 @@ order you'd reach for each feature.
 pip install ematix-flow
 ```
 
-The core install ships every backend, the `flow` CLI binary, the
-`run_pipeline` / `run_streaming_pipeline` Python entrypoints, and
-all stateful streaming primitives. No JVM, no separate scheduler.
+The core install ships every backend, the `flow` CLI binary, and
+the `run_pipeline` / `run_streaming_pipeline` Python entrypoints.
 
 ### Optional extras
 
@@ -65,19 +64,8 @@ all stateful streaming primitives. No JVM, no separate scheduler.
 | `pyarrow` | Required for the streaming-backend `pyclass` wrappers (`KafkaBackend`, `KinesisBackend`, …) when you want batch-by-batch iteration in Python. | `pip install pyarrow` |
 
 The `flow` binary, `run_pipeline`, and the typed-Python streaming
-API work without any extras.
-
-### Development install
-
-```sh
-git clone https://github.com/ryan-evans-git/ematix-flow.git
-cd ematix-flow
-python -m venv .venv && source .venv/bin/activate
-pip install maturin
-maturin develop --release          # builds + installs the Python ext
-
-cargo build --release --bin flow   # CLI binary at target/release/flow
-```
+API work without any extras. To build from source, see
+[Development](#development) at the bottom.
 
 ---
 
