@@ -83,6 +83,38 @@ fn cdc_debezium_pipeline_parses() {
     assert_eq!(cdc.key_field.as_deref(), Some("after.id"));
 }
 
+/// Δ.X1 sibling demo to cdc-debezium: same Postgres+Debezium
+/// source, but lands rows in a local Delta Lake table via
+/// `[target] kind = "delta_local"`. Locks the example's parse +
+/// asserts the Δ.X1.2 user-declared PK threads through the
+/// lowering helper (Delta tables have no PK metadata to reflect,
+/// so the explicit `primary_key = ["id"]` field is required).
+#[test]
+fn cdc_delta_pipeline_parses() {
+    let cfg = parse_example("cdc-delta/pipeline.toml");
+    assert_eq!(cfg.pipeline_name, "cdc-mirror-customers-delta");
+    assert_eq!(cfg.source_query, "dbz.public.customers");
+
+    let cdc = cfg
+        .transform
+        .as_ref()
+        .and_then(|t| t.cdc.as_ref())
+        .expect("cdc-delta example must declare [transform.cdc]");
+    assert_eq!(cdc.envelope, "debezium");
+    assert_eq!(cdc.key_field.as_deref(), Some("after.id"));
+
+    // Δ.X1.2: PK threads through the lowering helper. Delta has
+    // no reflectable PK constraint, so this is the only path the
+    // streaming runtime gets the info it needs to dispatch
+    // run_cdc against this target.
+    let pks = cfg.target_primary_keys();
+    assert_eq!(
+        pks,
+        vec![vec!["id".to_string()]],
+        "cdc-delta example must declare [target.table].primary_key"
+    );
+}
+
 /// Δ.X1.2: `[target.table].primary_key` is the user-facing channel
 /// for declaring PKs on backends that can't surface them via
 /// reflection. Locks the parse + the lowering helper that the

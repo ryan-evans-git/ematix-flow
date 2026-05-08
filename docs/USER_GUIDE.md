@@ -923,10 +923,22 @@ message as a CDC envelope (Debezium / Maxwell / a custom shape)
 and applies the resulting `c` / `u` / `d` / `r` operation to a
 **mirror** table.
 
-End-to-end example: [`examples/cdc-debezium`](https://github.com/ryan-evans-git/ematix-flow/tree/main/examples/cdc-debezium)
-— Postgres → Debezium → Kafka → ematix-flow → Postgres mirror.
-(Absolute GitHub URL because the rendered docs site only serves `docs/`;
-relative links to `examples/` don't resolve in mkdocs-material.)
+End-to-end examples (the source half is identical; only the
+target differs, so they share the connector + seed SQL but use
+different Compose ports so they can run side-by-side):
+
+- [`examples/cdc-debezium`](https://github.com/ryan-evans-git/ematix-flow/tree/main/examples/cdc-debezium)
+  — Postgres → Debezium → Kafka → ematix-flow → **Postgres mirror**.
+- [`examples/cdc-delta`](https://github.com/ryan-evans-git/ematix-flow/tree/main/examples/cdc-delta)
+  — Postgres → Debezium → Kafka → ematix-flow → **Delta Lake (local)**.
+  Demonstrates the Δ.X1 single-MERGE-per-batch executor + the
+  Δ.X1.2 `[target.table].primary_key` field (required because
+  Delta tables don't carry PK metadata that reflection can pick
+  up).
+
+(Absolute GitHub URLs because the rendered docs site only serves
+`docs/`; relative links to `examples/` don't resolve in mkdocs-
+material.)
 
 ### What it looks like
 

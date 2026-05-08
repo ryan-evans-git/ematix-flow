@@ -1,0 +1,59 @@
+# End-to-end Delta CDC consumer config.
+#
+# Reads change events Debezium publishes to
+# `dbz.public.customers` and applies them to a local Delta Lake
+# table at `/tmp/ematix-flow-cdc-delta/customers`. Runs on the
+# host; connects to the compose stack via the published Kafka
+# port (`localhost:9095`).
+#
+# Run:
+#   flow consume examples/cdc-delta/pipeline.toml \
+#       --metrics-port 9101
+#
+# Then drive change events on the source Postgres to watch them
+# propagate. See `examples/cdc-delta/README.md` for the full
+# walkthrough.
+
+pipeline_name = "cdc-mirror-customers-delta"
+source_query  = "dbz.public.customers"
+idle_pause_ms = 200
+
+[source]
+kind              = "kafka"
+# Note the port 9095 — cdc-debezium uses 9094, this stack uses
+# 9095 so both demos can run side-by-side without colliding.
+bootstrap_servers = "localhost:9095"
+group_id          = "ematix-flow-cdc-delta-demo"
+
+[target]
+kind = "delta_local"
+# Host filesystem path. The directory + the `_delta_log/` are
+# created on the first batch's MERGE — `flow consume` doesn't
+# need it to exist up front. Wipe it between demo runs:
+#   rm -rf /tmp/ematix-flow-cdc-delta
+path = "/tmp/ematix-flow-cdc-delta"
+
+[target.table]
+name = "customers"
+# Δ.X1.2: Delta tables don't carry PK metadata that
+# `Backend::reflect_table_spec` can introspect (no foreign-key /
+# constraint catalog), so the streaming runtime falls back to
+# this declared list. The Postgres CDC variant doesn't need this
+# field — `information_schema.table_constraints` provides the
+# same info there. Required for any non-Postgres CDC target.
+primary_key = ["id"]
+
+# Phase Δ: interpret each Kafka payload as a Debezium-shaped CDC
+# envelope and apply it to the target via `Backend::run_cdc`.
+# The Delta executor (Δ.X1) collapses the per-row events into a
+# single `DeltaOps::merge` per batch (3 branches:
+# when_matched_delete / update / not_matched_insert), with
+# within-batch dedupe on `source.ts_ms`.
+[transform.cdc]
+envelope  = "debezium"
+key_field = "after.id"
+
+# Defaults shown for documentation; remove the block to accept them:
+#   delete_mode               = "hard"            # "soft" → flip a column instead
+#   schema_evolution          = "skip"            # "fail" → abort batch on drift
+#   out_of_order_tolerance_ms = 5000              # PR 4 strict-monotonic gate
