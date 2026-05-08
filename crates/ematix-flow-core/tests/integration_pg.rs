@@ -8112,3 +8112,357 @@ async fn arrow_round_trip_wide_type_coverage() {
         .unwrap();
     assert_eq!(null_count, 1, "null row preserved through round-trip");
 }
+
+// --- Cross-DB Postgres-to-Postgres COPY-binary executors ----------------
+//
+// These tests target the four `pg.rs` cross-DB executors that ship rows
+// from one Postgres instance to a different Postgres instance via
+// `COPY (binary)` on the source pipe-cat'd into `COPY FROM STDIN
+// (FORMAT binary)` on the target through a temp staging table:
+//
+//   - `run_append_cross_db`     (pg.rs:770)
+//   - `run_truncate_cross_db`   (pg.rs:946)
+//   - `run_merge_cross_db`      (pg.rs:1751)
+//   - `run_scd2_cross_db`       (pg.rs:1593)
+//
+// The same-DB tests above (e.g. `run_append_via_backend_trait_same_db`)
+// exercise the `INSERT … SELECT` fast path, which never enters this code
+// path. As of the post-PR-#9 coverage measurement, `pg.rs` was at 42.27%
+// region coverage with ~1199 missed regions concentrated in these four
+// executors; covering them is the dominant single-file move toward 90%.
+
+fn cross_db_target_spec() -> TableSpec {
+    augment_with_metadata(&TableSpec {
+        schema: "warehouse".into(),
+        name: "event_log".into(),
+        columns: vec![
+            ColumnSpec {
+                name: "event_id".into(),
+                ty: ColumnType::BigInt,
+                nullable: false,
+                primary_key: true,
+            },
+            ColumnSpec {
+                name: "name".into(),
+                ty: ColumnType::Text,
+                nullable: true,
+                primary_key: false,
+            },
+        ],
+        unique_constraints: Vec::new(),
+        fingerprint: String::new(),
+    })
+}
+
+fn cross_db_scd2_dim_spec() -> TableSpec {
+    augment_with_scd2(&TableSpec {
+        schema: "warehouse".into(),
+        name: "customer_dim".into(),
+        columns: vec![
+            ColumnSpec {
+                name: "customer_id".into(),
+                ty: ColumnType::BigInt,
+                nullable: false,
+                primary_key: true,
+            },
+            ColumnSpec {
+                name: "email".into(),
+                ty: ColumnType::Text,
+                nullable: false,
+                primary_key: false,
+            },
+            ColumnSpec {
+                name: "name".into(),
+                ty: ColumnType::Text,
+                nullable: true,
+                primary_key: false,
+            },
+        ],
+        unique_constraints: Vec::new(),
+        fingerprint: String::new(),
+    })
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker; run with `cargo test -- --ignored`"]
+async fn append_cross_db_copies_source_via_copy_binary() {
+    // Two distinct Postgres instances → forces the cross-DB path.
+    let (_src_container, src_url) = start_postgres().await;
+    let (_tgt_container, tgt_url) = start_postgres().await;
+    let source_pool = PgPool::connect(&src_url).await.unwrap();
+    let target_pool = PgPool::connect(&tgt_url).await.unwrap();
+
+    source_pool.execute("CREATE SCHEMA src").await.unwrap();
+    source_pool
+        .execute("CREATE TABLE src.events (event_id BIGINT, name TEXT)")
+        .await
+        .unwrap();
+    source_pool
+        .execute("INSERT INTO src.events VALUES (1, 'a'), (2, 'b'), (3, 'c')")
+        .await
+        .unwrap();
+
+    let target = cross_db_target_spec();
+    target_pool.ensure_table(&target).await.unwrap();
+
+    let result = target_pool
+        .run_append_cross_db(
+            &source_pool,
+            &target,
+            "SELECT event_id, name FROM src.events",
+            "rust_integration_append_cross",
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.rows_inserted, 3);
+    assert_eq!(result.path, "cross_db");
+
+    // Target row count proves COPY-binary actually shipped the data.
+    let row_count = target_pool
+        .fetch_scalar_int("SELECT count(*)::int FROM warehouse.event_log")
+        .await
+        .unwrap();
+    assert_eq!(row_count, 3);
+
+    // History row lands on the *target* side (target_pool owns the
+    // ematix_flow.run_history table).
+    let history_count = target_pool
+        .fetch_scalar_int(
+            "SELECT count(*)::int FROM ematix_flow.run_history \
+             WHERE pipeline_name = 'rust_integration_append_cross' \
+               AND status = 'success'",
+        )
+        .await
+        .unwrap();
+    assert_eq!(history_count, 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker; run with `cargo test -- --ignored`"]
+async fn truncate_cross_db_replaces_target_with_source() {
+    let (_src_container, src_url) = start_postgres().await;
+    let (_tgt_container, tgt_url) = start_postgres().await;
+    let source_pool = PgPool::connect(&src_url).await.unwrap();
+    let target_pool = PgPool::connect(&tgt_url).await.unwrap();
+
+    source_pool.execute("CREATE SCHEMA src").await.unwrap();
+    source_pool
+        .execute("CREATE TABLE src.events (event_id BIGINT, name TEXT)")
+        .await
+        .unwrap();
+    source_pool
+        .execute("INSERT INTO src.events VALUES (10, 'x'), (20, 'y')")
+        .await
+        .unwrap();
+
+    let target = cross_db_target_spec();
+    target_pool.ensure_table(&target).await.unwrap();
+
+    // Pre-populate target with stale data — TruncateReplace must wipe it.
+    target_pool
+        .execute(
+            "INSERT INTO warehouse.event_log (event_id, name, _loaded_at, _batch_id) \
+             VALUES (99, 'stale', now(), gen_random_uuid())",
+        )
+        .await
+        .unwrap();
+
+    let result = target_pool
+        .run_truncate_cross_db(
+            &source_pool,
+            &target,
+            "SELECT event_id, name FROM src.events",
+            "rust_integration_truncate_cross",
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.rows_inserted, 2);
+    assert_eq!(result.path, "cross_db");
+
+    // Stale row gone, only the 2 source rows remain.
+    let row_count = target_pool
+        .fetch_scalar_int("SELECT count(*)::int FROM warehouse.event_log")
+        .await
+        .unwrap();
+    assert_eq!(row_count, 2);
+    let stale = target_pool
+        .fetch_scalar_int("SELECT count(*)::int FROM warehouse.event_log WHERE event_id = 99")
+        .await
+        .unwrap();
+    assert_eq!(stale, 0, "TruncateReplace must wipe pre-existing rows");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker; run with `cargo test -- --ignored`"]
+async fn merge_cross_db_upserts_into_target() {
+    let (_src_container, src_url) = start_postgres().await;
+    let (_tgt_container, tgt_url) = start_postgres().await;
+    let source_pool = PgPool::connect(&src_url).await.unwrap();
+    let target_pool = PgPool::connect(&tgt_url).await.unwrap();
+
+    source_pool.execute("CREATE SCHEMA src").await.unwrap();
+    source_pool
+        .execute("CREATE TABLE src.events (event_id BIGINT, name TEXT)")
+        .await
+        .unwrap();
+    source_pool
+        .execute("INSERT INTO src.events VALUES (1, 'updated'), (2, 'new')")
+        .await
+        .unwrap();
+
+    let target = cross_db_target_spec();
+    target_pool.ensure_table(&target).await.unwrap();
+
+    // Pre-populate target with a row matching event_id=1; merge must
+    // update its name. event_id=2 is new and must be inserted.
+    target_pool
+        .execute(
+            "INSERT INTO warehouse.event_log (event_id, name, _loaded_at, _batch_id) \
+             VALUES (1, 'old', now(), gen_random_uuid())",
+        )
+        .await
+        .unwrap();
+
+    let result = target_pool
+        .run_merge_cross_db(
+            &source_pool,
+            &target,
+            "SELECT event_id, name FROM src.events",
+            &["event_id".to_string()],
+            &["name".to_string()],
+            "rust_integration_merge_cross",
+            "merge",
+            None,
+        )
+        .await
+        .unwrap();
+    // 1 update + 1 insert = 2 rows touched. The exact (inserted/updated)
+    // split depends on the executor's accounting — assert the total.
+    assert_eq!(
+        result.rows_inserted + result.rows_updated,
+        2,
+        "merge must produce 1 insert + 1 update; got inserted={} updated={}",
+        result.rows_inserted,
+        result.rows_updated
+    );
+
+    let row_count = target_pool
+        .fetch_scalar_int("SELECT count(*)::int FROM warehouse.event_log")
+        .await
+        .unwrap();
+    assert_eq!(row_count, 2);
+
+    // The pre-existing row's name was updated.
+    let raw = target_pool.raw_pool_for_tests().get().await.unwrap();
+    let updated_name: String = raw
+        .query_one(
+            "SELECT name FROM warehouse.event_log WHERE event_id = 1",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(updated_name, "updated");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker; run with `cargo test -- --ignored`"]
+async fn scd2_cross_db_first_load_inserts_all_current() {
+    let (_src_container, src_url) = start_postgres().await;
+    let (_tgt_container, tgt_url) = start_postgres().await;
+    let source_pool = PgPool::connect(&src_url).await.unwrap();
+    let target_pool = PgPool::connect(&tgt_url).await.unwrap();
+
+    source_pool.execute("CREATE SCHEMA src").await.unwrap();
+    source_pool
+        .execute("CREATE TABLE src.customers (customer_id BIGINT, email TEXT, name TEXT)")
+        .await
+        .unwrap();
+    source_pool
+        .execute(
+            "INSERT INTO src.customers VALUES \
+             (1, 'a@x.com', 'alice'), \
+             (2, 'b@x.com', 'bob'), \
+             (3, 'c@x.com', NULL)",
+        )
+        .await
+        .unwrap();
+
+    let target = cross_db_scd2_dim_spec();
+    target_pool.ensure_table(&target).await.unwrap();
+
+    let result = target_pool
+        .run_scd2_cross_db(
+            &source_pool,
+            &target,
+            "SELECT customer_id, email, name FROM src.customers",
+            &["customer_id".to_string()],
+            &["email".to_string(), "name".to_string()],
+            "rust_integration_scd2_cross",
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.rows_inserted, 3);
+    assert_eq!(result.path, "cross_db");
+
+    // All 3 rows current; none closed yet.
+    let current_count = target_pool
+        .fetch_scalar_int(
+            "SELECT count(*)::int FROM warehouse.customer_dim WHERE is_current = TRUE",
+        )
+        .await
+        .unwrap();
+    assert_eq!(current_count, 3);
+    let closed_count = target_pool
+        .fetch_scalar_int(
+            "SELECT count(*)::int FROM warehouse.customer_dim WHERE is_current = FALSE",
+        )
+        .await
+        .unwrap();
+    assert_eq!(closed_count, 0, "first SCD2 load closes nothing");
+
+    // Round 2: change customer_id=1's email; SCD2 must close the old row
+    // and insert a new current row.
+    source_pool
+        .execute("UPDATE src.customers SET email = 'a2@x.com' WHERE customer_id = 1")
+        .await
+        .unwrap();
+    let result2 = target_pool
+        .run_scd2_cross_db(
+            &source_pool,
+            &target,
+            "SELECT customer_id, email, name FROM src.customers",
+            &["customer_id".to_string()],
+            &["email".to_string(), "name".to_string()],
+            "rust_integration_scd2_cross",
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    // 1 row closed + 1 row inserted = 1 net change.
+    assert!(
+        result2.rows_inserted >= 1 || result2.rows_closed >= 1,
+        "second SCD2 load must close or insert at least one row; got {result2:?}"
+    );
+
+    // Now we should see exactly 1 closed version + 4 total (3 current + 1 closed).
+    let total = target_pool
+        .fetch_scalar_int("SELECT count(*)::int FROM warehouse.customer_dim")
+        .await
+        .unwrap();
+    assert_eq!(total, 4, "expected 3 current + 1 closed = 4 rows");
+    let closed_after = target_pool
+        .fetch_scalar_int(
+            "SELECT count(*)::int FROM warehouse.customer_dim \
+             WHERE is_current = FALSE AND customer_id = 1",
+        )
+        .await
+        .unwrap();
+    assert_eq!(closed_after, 1);
+}
