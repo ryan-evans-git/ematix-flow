@@ -2136,6 +2136,142 @@ mod tests {
         assert!(!backend.supports_seek_to());
     }
 
+    // ---- Pure helpers: quote_ident, pg_type_to_arrow, system_time_to_micros
+    //
+    // These three free functions in `backend.rs` are reachable only
+    // through `read_arrow_stream` / `write_arrow_stream` integration
+    // paths. The integration tests exercise the happy path; this
+    // section closes the per-arm match coverage and the error path.
+
+    #[test]
+    fn quote_ident_doubles_embedded_quotes() {
+        // pg_catalog.quote_ident() semantics: wrap in double-quotes,
+        // escape any embedded `"` by doubling.
+        assert_eq!(quote_ident("foo"), "\"foo\"");
+        assert_eq!(quote_ident("a\"b"), "\"a\"\"b\"");
+        assert_eq!(quote_ident("\"\"\""), "\"\"\"\"\"\"\"\""); // 3 quotes → 6 inside the wrapper
+        // Empty + space-containing names round-trip too.
+        assert_eq!(quote_ident(""), "\"\"");
+        assert_eq!(quote_ident("with space"), "\"with space\"");
+    }
+
+    #[test]
+    fn pg_type_to_arrow_maps_every_supported_oid() {
+        // Each match arm of `pg_type_to_arrow` corresponds to a
+        // tokio_postgres `Type` constant. Walk all supported OIDs
+        // explicitly so a future remap accidentally narrowing the
+        // type set surfaces here.
+        use tokio_postgres::types::Type as T;
+        assert!(matches!(
+            pg_type_to_arrow(&T::INT2).unwrap(),
+            DataType::Int16
+        ));
+        assert!(matches!(
+            pg_type_to_arrow(&T::INT4).unwrap(),
+            DataType::Int32
+        ));
+        assert!(matches!(
+            pg_type_to_arrow(&T::INT8).unwrap(),
+            DataType::Int64
+        ));
+        assert!(matches!(
+            pg_type_to_arrow(&T::FLOAT4).unwrap(),
+            DataType::Float32
+        ));
+        assert!(matches!(
+            pg_type_to_arrow(&T::FLOAT8).unwrap(),
+            DataType::Float64
+        ));
+        assert!(matches!(
+            pg_type_to_arrow(&T::BOOL).unwrap(),
+            DataType::Boolean
+        ));
+        assert!(matches!(
+            pg_type_to_arrow(&T::TEXT).unwrap(),
+            DataType::Utf8
+        ));
+        assert!(matches!(
+            pg_type_to_arrow(&T::VARCHAR).unwrap(),
+            DataType::Utf8
+        ));
+        assert!(matches!(
+            pg_type_to_arrow(&T::BPCHAR).unwrap(),
+            DataType::Utf8
+        ));
+        assert!(matches!(
+            pg_type_to_arrow(&T::BYTEA).unwrap(),
+            DataType::Binary
+        ));
+        assert!(matches!(
+            pg_type_to_arrow(&T::UUID).unwrap(),
+            DataType::Utf8
+        ));
+        assert!(matches!(
+            pg_type_to_arrow(&T::JSON).unwrap(),
+            DataType::Utf8
+        ));
+        assert!(matches!(
+            pg_type_to_arrow(&T::JSONB).unwrap(),
+            DataType::Utf8
+        ));
+        assert!(matches!(
+            pg_type_to_arrow(&T::TIMESTAMP).unwrap(),
+            DataType::Timestamp(TimeUnit::Microsecond, None)
+        ));
+        assert!(matches!(
+            pg_type_to_arrow(&T::TIMESTAMPTZ).unwrap(),
+            DataType::Timestamp(TimeUnit::Microsecond, None)
+        ));
+    }
+
+    #[test]
+    fn pg_type_to_arrow_errors_on_unsupported_oid() {
+        // The `_` arm returns BackendError::TypeMapping with a
+        // human-readable message that names the type. Use INTERVAL
+        // (oid 1186), which is in the tokio_postgres registry but
+        // not in our type map.
+        use tokio_postgres::types::Type as T;
+        let err = pg_type_to_arrow(&T::INTERVAL).expect_err("INTERVAL must be unsupported");
+        match err {
+            BackendError::TypeMapping(msg) => {
+                assert!(
+                    msg.contains("interval") || msg.contains("Interval"),
+                    "error must name the unsupported type, got: {msg}"
+                );
+                assert!(
+                    msg.contains("oid="),
+                    "error must include the OID for diagnostics, got: {msg}"
+                );
+                assert!(
+                    msg.contains("pg_type_to_arrow"),
+                    "error must point to the function that needs widening, got: {msg}"
+                );
+            }
+            other => panic!("expected TypeMapping, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn system_time_to_micros_handles_unix_epoch_anchor() {
+        use std::time::{Duration, UNIX_EPOCH};
+        // UNIX_EPOCH itself → 0 microseconds.
+        assert_eq!(system_time_to_micros(UNIX_EPOCH), 0);
+        // 1 second after epoch → 1_000_000 µs.
+        assert_eq!(
+            system_time_to_micros(UNIX_EPOCH + Duration::from_secs(1)),
+            1_000_000
+        );
+        // Sub-second precision preserved.
+        assert_eq!(
+            system_time_to_micros(UNIX_EPOCH + Duration::from_micros(123_456)),
+            123_456
+        );
+        // A "modern" timestamp round-trips: 2026-05-08T00:00:00Z =
+        // 1778198400 unix seconds = 1_778_198_400_000_000 µs.
+        let modern = UNIX_EPOCH + Duration::from_secs(1_778_198_400);
+        assert_eq!(system_time_to_micros(modern), 1_778_198_400_000_000);
+    }
+
     #[test]
     fn dialect_variants_all_distinct() {
         // Sanity: the variants we'll dispatch over are all distinct.
