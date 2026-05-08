@@ -182,18 +182,28 @@ class kafka_avro:
 Every source and target lives behind one `Backend` trait. Switch a
 pipeline's target by changing one line.
 
-| Backend | Source | Target | DDL planning | Strategy executors (append / merge / scd2 / truncate) | CDC target |
-|---|:--:|:--:|:--:|:--:|:--:|
-| Postgres | — | ✅ | ✅ | ✅ (native + COPY BINARY) | ✅ |
-| MySQL | — | ✅ | ✅ | ✅ (`ON DUPLICATE KEY`) | ✅ |
-| SQLite | — | ✅ | ✅ | ✅ | ✅ |
-| DuckDB | — | ✅ | ✅ | ✅ | ✅ |
-| Delta Lake (local + S3) | ✅ | ✅ | n/a | ✅ (DataFusion-backed `MERGE`) | ✅ |
-| Object stores (Parquet / CSV / ORC / JSONL, local + S3) | ✅ | ✅ | n/a | append + truncate | — *(see Δ.X3)* |
-| Kafka | ✅ | ✅ | n/a | append (cross-backend) | source role only |
-| RabbitMQ | ✅ | ✅ | n/a | append (cross-backend) | — |
-| GCP Pub/Sub | ✅ | ✅ | n/a | append (cross-backend) | — |
-| AWS Kinesis | ✅ | ✅ | n/a | append (cross-backend) | — |
+| Backend | Batch source | Streaming source | Target | DDL planning | Strategy executors (append / merge / scd2 / truncate) | CDC target |
+|---|:--:|:--:|:--:|:--:|:--:|:--:|
+| Postgres | ✅ | — | ✅ | ✅ | ✅ (native + COPY BINARY) | ✅ |
+| MySQL | ✅ | — | ✅ | ✅ | ✅ (`ON DUPLICATE KEY`) | ✅ |
+| SQLite | ✅ | — | ✅ | ✅ | ✅ | ✅ |
+| DuckDB | ✅ | — | ✅ | ✅ | ✅ | ✅ |
+| Delta Lake (local + S3) | ✅ | ✅ | ✅ | n/a | ✅ (DataFusion-backed `MERGE`) | ✅ |
+| Object stores (Parquet / CSV / ORC / JSONL, local + S3) | ✅ | ✅ | ✅ | n/a | append + truncate | — *(see Δ.X3)* |
+| Kafka | — | ✅ | ✅ | n/a | append (cross-backend) | source role only |
+| RabbitMQ | — | ✅ | ✅ | n/a | append (cross-backend) | — |
+| GCP Pub/Sub | — | ✅ | ✅ | n/a | append (cross-backend) | — |
+| AWS Kinesis | — | ✅ | ✅ | n/a | append (cross-backend) | — |
+
+**Batch source** = readable by `@ematix.pipeline` (the function
+returns a SQL string; the framework executes it against the
+source connection).
+**Streaming source** = tailable by `flow consume` /
+`@ematix.streaming_pipeline` (long-running consumer with manual
+offset commit / ack).
+**Target** = writable by either pipeline shape. Cross-backend
+moves stream Apache Arrow batches end-to-end — same-DB pairs
+take the `INSERT … SELECT` fast path automatically.
 
 ### Streaming source guarantees
 
