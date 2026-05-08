@@ -57,6 +57,11 @@ use uuid::Uuid;
 
 const META_RUN_HISTORY: &str = "ematix_flow_run_history";
 const META_WATERMARKS: &str = "ematix_flow_watermarks";
+/// Δ.X2: per-pipeline CDC idempotency table. Mirrors the PG /
+/// DuckDB layout but flattened into `main` since SQLite has no
+/// schemas (the prefix `ematix_flow_` keeps the meta surface
+/// distinct from user tables in the same database).
+const META_CDC_IDEMPOTENCY: &str = "ematix_flow_cdc_idempotency";
 
 /// SQL that lazy-creates the meta tables on SQLite. SQLite has no
 /// first-class schemas, so we live in `main` with a `ematix_flow_`
@@ -87,6 +92,13 @@ fn ensure_meta_schema_sql() -> String {
             column_name TEXT NOT NULL, \
             last_value TEXT NOT NULL, \
             updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))\
+         ); \
+         CREATE TABLE IF NOT EXISTS {META_CDC_IDEMPOTENCY} (\
+            pipeline_name TEXT NOT NULL, \
+            pk_json TEXT NOT NULL, \
+            last_seen_ts_ms INTEGER NOT NULL, \
+            updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')), \
+            PRIMARY KEY (pipeline_name, pk_json)\
          )"
     )
 }
@@ -902,6 +914,323 @@ fn arrow_value_to_sqlite_param(
     }
 }
 
+impl SQLiteBackend {
+    /// Δ.X2: SQLite CDC executor — applies a parsed batch of
+    /// `CdcEvent`s against `target_spec` inside a single
+    /// transaction.
+    ///
+    /// Lifecycle:
+    ///   1. Lazy-bootstrap the meta schema (so the idempotency
+    ///      table exists on first call).
+    ///   2. Schema-evolution `Fail` policy: pre-flight `after`
+    ///      payload keys against the spec; abort the whole batch
+    ///      on first unknown.
+    ///   3. Per-event in one transaction: hit the idempotency
+    ///      gate, then dispatch on `event.op` to UPSERT / DELETE
+    ///      / soft-delete via prepared statements that re-bind
+    ///      the JSON parameter per call.
+    ///
+    /// Differs from PG in that SQLite has no row-typed JSON
+    /// populate. Each upsert/delete uses `json_extract(?1, '$.col')`
+    /// per column; the JSON payload is bound once via the
+    /// `?1` indexed-parameter form.
+    pub async fn run_cdc_inner(
+        &self,
+        target_spec: &crate::types::TableSpec,
+        events: Vec<crate::cdc::CdcEvent>,
+        cdc_config: &crate::cdc::CdcConfig,
+        pipeline_name: &str,
+        skipped: i64,
+    ) -> Result<crate::backend::CdcRunResult, BackendError> {
+        use crate::cdc::{CdcOp, DeleteMode, SchemaEvolutionPolicy};
+
+        require_main_schema(&target_spec.schema)?;
+        self.ensure_meta_schema().await?;
+
+        // Single-PK only for the first cut (matches PG PR 3 scope).
+        let pk_col = target_spec
+            .columns
+            .iter()
+            .find(|c| c.primary_key)
+            .ok_or_else(|| {
+                BackendError::Other(format!(
+                    "SQLite run_cdc: target {}.{} has no primary-key column \
+                     (Δ.X2 v1 supports single-PK targets; declare PK on \
+                     @ematix.table or [target.table].primary_key)",
+                    target_spec.schema, target_spec.name
+                ))
+            })?;
+        let pk_name = pk_col.name.clone();
+
+        // Schema-evolution `Fail` policy: pre-flight check against
+        // the spec's columns. `Skip` quietly drops unknown columns
+        // at the lowering boundary (rest of the row applies).
+        if matches!(cdc_config.schema_evolution, SchemaEvolutionPolicy::Fail) {
+            let valid_cols: std::collections::HashSet<&str> = target_spec
+                .columns
+                .iter()
+                .map(|c| c.name.as_str())
+                .collect();
+            for event in &events {
+                if let Some(after) = event.after.as_ref() {
+                    for k in after.keys() {
+                        if !valid_cols.contains(k.as_str()) {
+                            return Err(BackendError::Other(format!(
+                                "schema evolution: unknown column '{k}' in `after` \
+                                 payload for pipeline '{pipeline_name}' on SQLite target \
+                                 {schema}.{name} (SchemaEvolutionPolicy::Fail) — \
+                                 add the column to the target table or switch to Skip",
+                                schema = target_spec.schema,
+                                name = target_spec.name,
+                            )));
+                        }
+                    }
+                }
+            }
+        }
+
+        let qualified = format!(
+            "\"{}\".\"{}\"",
+            target_spec.schema.replace('"', "\"\""),
+            target_spec.name.replace('"', "\"\""),
+        );
+        let user_cols: Vec<String> = target_spec.columns.iter().map(|c| c.name.clone()).collect();
+        let non_pk_cols: Vec<&str> = target_spec
+            .columns
+            .iter()
+            .filter(|c| !c.primary_key)
+            .map(|c| c.name.as_str())
+            .collect();
+
+        // Pre-build SQL templates. Each upsert/delete is bound
+        // with a single parameter (the JSON payload) at index ?1;
+        // SQLite's `?N` indexed form lets one bind serve many
+        // `json_extract` calls without re-marshalling the string.
+        let cols_csv = user_cols
+            .iter()
+            .map(|c| format!("\"{}\"", c.replace('"', "\"\"")))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let select_exprs = user_cols
+            .iter()
+            .map(|c| {
+                // SQLite's json_extract path uses '$.col'; column
+                // names with a literal `.` aren't supported here
+                // (consistent with PG/DuckDB CDC scope).
+                format!("json_extract(?1, '$.{}')", c.replace('\'', "''"))
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let upsert_sql = if non_pk_cols.is_empty() {
+            format!(
+                "INSERT INTO {qualified} ({cols_csv}) SELECT {select_exprs} \
+                 ON CONFLICT(\"{pk}\") DO NOTHING",
+                pk = pk_name.replace('"', "\"\""),
+            )
+        } else {
+            let set_clause = non_pk_cols
+                .iter()
+                .map(|c| {
+                    let q = c.replace('"', "\"\"");
+                    format!("\"{q}\" = excluded.\"{q}\"")
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "INSERT INTO {qualified} ({cols_csv}) SELECT {select_exprs} \
+                 ON CONFLICT(\"{pk}\") DO UPDATE SET {set_clause}",
+                pk = pk_name.replace('"', "\"\""),
+            )
+        };
+
+        // DELETE / soft-delete: pull the PK out of the same JSON
+        // payload via json_extract so the type coercion is
+        // identical to the upsert path.
+        let pk_json_path = format!("json_extract(?1, '$.{}')", pk_name.replace('\'', "''"));
+        let delete_sql = match &cdc_config.delete_mode {
+            DeleteMode::Hard => format!(
+                "DELETE FROM {qualified} WHERE \"{pk}\" = {pk_json_path}",
+                pk = pk_name.replace('"', "\"\""),
+            ),
+            DeleteMode::Soft { column } => format!(
+                "UPDATE {qualified} SET \"{col}\" = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
+                 WHERE \"{pk}\" = {pk_json_path}",
+                pk = pk_name.replace('"', "\"\""),
+                col = column.replace('"', "\"\""),
+            ),
+        };
+
+        // Idempotency gate. Same shape as PG / DuckDB: INSERT …
+        // ON CONFLICT DO UPDATE WHERE existing.last_seen_ts_ms <
+        // EXCLUDED.last_seen_ts_ms RETURNING 1. SQLite's
+        // RETURNING (3.35+) makes the empty-result-means-skip
+        // pattern reusable here.
+        let gate_sql = format!(
+            "INSERT INTO {META_CDC_IDEMPOTENCY} \
+                 (pipeline_name, pk_json, last_seen_ts_ms, updated_at) \
+             VALUES (?1, ?2, ?3, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')) \
+             ON CONFLICT(pipeline_name, pk_json) DO UPDATE \
+                 SET last_seen_ts_ms = excluded.last_seen_ts_ms, \
+                     updated_at = excluded.updated_at \
+                 WHERE {META_CDC_IDEMPOTENCY}.last_seen_ts_ms < excluded.last_seen_ts_ms \
+             RETURNING 1"
+        );
+
+        // Move owned values into the blocking task.
+        let pipeline_name_owned = pipeline_name.to_string();
+        let pk_name_owned = pk_name;
+        let events_owned = events;
+        let is_soft_delete = matches!(cdc_config.delete_mode, DeleteMode::Soft { .. });
+
+        let outcome: Result<(i64, i64, i64, i64), BackendError> = self
+            .with_conn_blocking(move |c| {
+                c.execute_batch("BEGIN")
+                    .map_err(|e| BackendError::Query(e.to_string()))?;
+
+                let result: Result<(i64, i64, i64, i64), BackendError> = (|| {
+                    let mut creates = 0i64;
+                    let mut updates = 0i64;
+                    let mut deletes = 0i64;
+                    let mut idempotent_skipped = 0i64;
+
+                    // In-batch gate cache: multiple events for the
+                    // same PK in this batch only hit the gate once.
+                    let mut gate_cache: std::collections::HashMap<String, i64> =
+                        std::collections::HashMap::new();
+
+                    let mut upsert_stmt = c
+                        .prepare(&upsert_sql)
+                        .map_err(|e| BackendError::Query(e.to_string()))?;
+                    let mut delete_stmt = c
+                        .prepare(&delete_sql)
+                        .map_err(|e| BackendError::Query(e.to_string()))?;
+                    let mut gate_stmt = c
+                        .prepare(&gate_sql)
+                        .map_err(|e| BackendError::Query(e.to_string()))?;
+
+                    for event in &events_owned {
+                        let payload_json: String = match event.op {
+                            CdcOp::Delete => {
+                                let mut m = serde_json::Map::new();
+                                m.insert(pk_name_owned.clone(), event.key.clone());
+                                serde_json::to_string(&m).unwrap()
+                            }
+                            _ => match event.after.as_ref() {
+                                Some(map) => serde_json::to_string(map).unwrap(),
+                                None => continue,
+                            },
+                        };
+
+                        if let Some(ts_ms) = event.ts_ms {
+                            let pk_canon = serde_json::to_string(&event.key).unwrap();
+                            let cache_hit = gate_cache.get(&pk_canon).copied();
+                            let admit = match cache_hit {
+                                Some(cached_ts) => {
+                                    if ts_ms > cached_ts {
+                                        gate_cache.insert(pk_canon.clone(), ts_ms);
+                                        true
+                                    } else {
+                                        false
+                                    }
+                                }
+                                None => {
+                                    let mut rows = gate_stmt
+                                        .query(rusqlite::params![
+                                            &pipeline_name_owned,
+                                            &pk_canon,
+                                            ts_ms,
+                                        ])
+                                        .map_err(|e| {
+                                            BackendError::Query(format!("sqlite cdc gate: {e}"))
+                                        })?;
+                                    let admitted = rows
+                                        .next()
+                                        .map_err(|e| {
+                                            BackendError::Query(format!(
+                                                "sqlite cdc gate read: {e}"
+                                            ))
+                                        })?
+                                        .is_some();
+                                    if admitted {
+                                        gate_cache.insert(pk_canon, ts_ms);
+                                    }
+                                    admitted
+                                }
+                            };
+                            if !admit {
+                                idempotent_skipped += 1;
+                                continue;
+                            }
+                        }
+
+                        match event.op {
+                            CdcOp::Create | CdcOp::Read => {
+                                let n = upsert_stmt
+                                    .execute(rusqlite::params![&payload_json])
+                                    .map_err(|e| {
+                                        BackendError::Query(format!("sqlite cdc upsert: {e}"))
+                                    })?;
+                                creates += n as i64;
+                            }
+                            CdcOp::Update => {
+                                let n = upsert_stmt
+                                    .execute(rusqlite::params![&payload_json])
+                                    .map_err(|e| {
+                                        BackendError::Query(format!(
+                                            "sqlite cdc update-as-upsert: {e}"
+                                        ))
+                                    })?;
+                                updates += n as i64;
+                            }
+                            CdcOp::Delete => {
+                                let n = delete_stmt
+                                    .execute(rusqlite::params![&payload_json])
+                                    .map_err(|e| {
+                                        BackendError::Query(format!("sqlite cdc delete: {e}"))
+                                    })?;
+                                // Soft-delete is wired through an
+                                // UPDATE, so the affected rows go
+                                // under `updates` — only hard-delete
+                                // bumps `deletes`.
+                                if is_soft_delete {
+                                    updates += n as i64;
+                                } else {
+                                    deletes += n as i64;
+                                }
+                            }
+                        }
+                    }
+
+                    Ok((creates, updates, deletes, idempotent_skipped))
+                })();
+
+                match result {
+                    Ok(counts) => {
+                        c.execute_batch("COMMIT")
+                            .map_err(|e| BackendError::Query(e.to_string()))?;
+                        Ok(counts)
+                    }
+                    Err(e) => {
+                        let _ = c.execute_batch("ROLLBACK");
+                        Err(e)
+                    }
+                }
+            })
+            .await;
+
+        let (creates, updates, deletes, idempotent_skipped) = outcome?;
+        let run_id = Uuid::new_v4();
+        Ok(crate::backend::CdcRunResult {
+            run_id: run_id.to_string(),
+            creates,
+            updates,
+            deletes,
+            skipped,
+            idempotent_skipped,
+        })
+    }
+}
+
 #[async_trait]
 impl Backend for SQLiteBackend {
     fn dialect(&self) -> Dialect {
@@ -1374,6 +1703,42 @@ impl Backend for SQLiteBackend {
             status: if dry_run { "dry_run" } else { "success" }.into(),
             path: "same_db".into(),
         })
+    }
+
+    /// Δ.X2: parse the incoming RecordBatch into CDC events, then
+    /// dispatch to `run_cdc_inner`. Same shape as the Postgres /
+    /// DuckDB trait-method wrappers — keeps the parse logic
+    /// identical so a soft-fail row (parse error) is reported in
+    /// the `skipped` counter rather than failing the whole batch.
+    async fn run_cdc(
+        &self,
+        spec: &crate::types::TableSpec,
+        batch: RecordBatch,
+        cdc_config: &crate::cdc::CdcConfig,
+        pipeline_name: &str,
+    ) -> Result<crate::backend::CdcRunResult, BackendError> {
+        use crate::cdc::ParsedRow;
+
+        let parsed = crate::cdc::events_from_batch(&batch, cdc_config)?;
+        let mut events = Vec::with_capacity(parsed.len());
+        let mut skipped: i64 = 0;
+        for row in parsed {
+            match row {
+                ParsedRow::Event(e) => events.push(e),
+                ParsedRow::Tombstone => skipped += 1,
+                ParsedRow::ParseError(e) => {
+                    tracing::warn!(
+                        target: "ematix_flow::cdc",
+                        error = %e,
+                        pipeline = pipeline_name,
+                        "SQLite CDC envelope parse failed; row skipped",
+                    );
+                    skipped += 1;
+                }
+            }
+        }
+        self.run_cdc_inner(spec, events, cdc_config, pipeline_name, skipped)
+            .await
     }
 }
 
@@ -2384,5 +2749,393 @@ mod tests {
             .value(0);
         assert_eq!(currents, 0, "TTL-expired");
         assert_eq!(closed, 1);
+    }
+
+    // ------------------------------------------------------------
+    // Phase Δ.X2 — CDC executor tests for SQLite. Mirror the
+    // DuckDB / Postgres / Delta CDC test matrix: c+u+d across two
+    // batches, redelivery dropped at the idempotency gate, Fail
+    // policy aborting on schema drift, and soft-delete column-flip.
+    // SQLite is in-memory so no testcontainer needed.
+    // ------------------------------------------------------------
+
+    fn sqlite_cdc_customers_spec() -> TableSpec {
+        use crate::types::{ColumnSpec, ColumnType};
+        TableSpec {
+            // SQLite has no first-class schemas — `main` is the
+            // only writable namespace without an ATTACH.
+            schema: "main".into(),
+            name: "customers".into(),
+            columns: vec![
+                ColumnSpec {
+                    name: "id".into(),
+                    ty: ColumnType::BigInt,
+                    nullable: false,
+                    primary_key: true,
+                },
+                ColumnSpec {
+                    name: "email".into(),
+                    ty: ColumnType::Text,
+                    nullable: true,
+                    primary_key: false,
+                },
+                ColumnSpec {
+                    name: "name".into(),
+                    ty: ColumnType::Text,
+                    nullable: true,
+                    primary_key: false,
+                },
+            ],
+            unique_constraints: vec![],
+            fingerprint: String::new(),
+        }
+    }
+
+    /// Encode a slice of CDC envelope JSON rows as a
+    /// schema-inferred RecordBatch — same shape as DuckDB's helper.
+    fn sqlite_cdc_record_batch_from_json(
+        rows: &[serde_json::Map<String, serde_json::Value>],
+    ) -> RecordBatch {
+        use std::io::Cursor;
+        use std::sync::Arc as StdArc;
+        let mut buf = Vec::new();
+        for row in rows {
+            buf.extend(serde_json::to_string(row).unwrap().bytes());
+            buf.push(b'\n');
+        }
+        let mut sniff = Cursor::new(&buf);
+        let (schema, _) =
+            arrow_json::reader::infer_json_schema_from_seekable(&mut sniff, None).expect("schema");
+        let cursor = Cursor::new(&buf);
+        let mut reader = arrow_json::ReaderBuilder::new(StdArc::new(schema))
+            .build(cursor)
+            .expect("reader");
+        reader
+            .next()
+            .expect("at least one batch")
+            .expect("decode ok")
+    }
+
+    async fn create_sqlite_cdc_target(backend: &std::sync::Arc<dyn Backend>) {
+        backend
+            .execute(
+                "CREATE TABLE customers (\
+                    id INTEGER PRIMARY KEY, \
+                    email TEXT, \
+                    name TEXT)",
+            )
+            .await
+            .unwrap();
+    }
+
+    /// Δ.X2 (SQLite): c / u / d each get a turn so the per-op
+    /// counters are observable independently.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sqlite_cdc_inserts_updates_deletes_across_batches() {
+        use crate::cdc::{CdcConfig, EnvelopeKind};
+        use serde_json::json;
+        use std::sync::Arc as StdArc;
+
+        let backend: StdArc<dyn Backend> = StdArc::new(SQLiteBackend::open(":memory:").unwrap());
+        create_sqlite_cdc_target(&backend).await;
+
+        let mut cdc = CdcConfig::for_envelope(EnvelopeKind::Debezium);
+        cdc.key_field = "after.id".into();
+        let spec = sqlite_cdc_customers_spec();
+
+        let r1 = backend
+            .run_cdc(
+                &spec,
+                sqlite_cdc_record_batch_from_json(&[
+                    json!({
+                        "before": null,
+                        "after": {"id": 1, "email": "alice@x", "name": "Alice"},
+                        "source": {"ts_ms": 100_i64},
+                        "op": "c",
+                        "ts_ms": 100_i64,
+                    })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+                    json!({
+                        "before": null,
+                        "after": {"id": 2, "email": "bob@x", "name": "Bob"},
+                        "source": {"ts_ms": 200_i64},
+                        "op": "c",
+                        "ts_ms": 200_i64,
+                    })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+                ]),
+                &cdc,
+                "sqlite_cdc_test",
+            )
+            .await
+            .expect("batch 1");
+        assert_eq!(r1.creates, 2, "two inserts in batch 1");
+        assert_eq!(r1.updates, 0);
+        assert_eq!(r1.deletes, 0);
+
+        let r2 = backend
+            .run_cdc(
+                &spec,
+                sqlite_cdc_record_batch_from_json(&[
+                    json!({
+                        "before": {"id": 1, "email": "alice@x", "name": "Alice"},
+                        "after":  {"id": 1, "email": "alice@x", "name": "Alice Smith"},
+                        "source": {"ts_ms": 300_i64},
+                        "op": "u",
+                        "ts_ms": 300_i64,
+                    })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+                    json!({
+                        "before": {"id": 2, "email": "bob@x", "name": "Bob"},
+                        "after":  null,
+                        "source": {"ts_ms": 400_i64},
+                        "op": "d",
+                        "ts_ms": 400_i64,
+                    })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+                ]),
+                &cdc,
+                "sqlite_cdc_test",
+            )
+            .await
+            .expect("batch 2");
+        assert_eq!(r2.updates, 1, "one update");
+        assert_eq!(r2.deletes, 1, "one delete");
+
+        use futures_util::TryStreamExt;
+        let stream = backend
+            .read_arrow_stream("SELECT id, name FROM customers ORDER BY id")
+            .await
+            .unwrap();
+        let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+        let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, 1, "exactly id=1 should remain");
+
+        let names = batches[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("name column is utf8");
+        assert_eq!(names.value(0), "Alice Smith");
+    }
+
+    /// Δ.X2 (SQLite): older-redelivery is dropped at the
+    /// idempotency gate. Same shape as the PG / DuckDB / Delta
+    /// idempotency tests — different dialect, same semantics.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sqlite_cdc_redelivery_is_idempotent() {
+        use crate::cdc::{CdcConfig, EnvelopeKind};
+        use serde_json::json;
+        use std::sync::Arc as StdArc;
+
+        let backend: StdArc<dyn Backend> = StdArc::new(SQLiteBackend::open(":memory:").unwrap());
+        create_sqlite_cdc_target(&backend).await;
+
+        let mut cdc = CdcConfig::for_envelope(EnvelopeKind::Debezium);
+        cdc.key_field = "after.id".into();
+        let spec = sqlite_cdc_customers_spec();
+
+        let _r1 = backend
+            .run_cdc(
+                &spec,
+                sqlite_cdc_record_batch_from_json(&[json!({
+                    "before": null,
+                    "after": {"id": 1, "email": "a@x", "name": "Alice v2"},
+                    "source": {"ts_ms": 200_i64},
+                    "op": "c",
+                    "ts_ms": 200_i64,
+                })
+                .as_object()
+                .unwrap()
+                .clone()]),
+                &cdc,
+                "sqlite_cdc_idem",
+            )
+            .await
+            .expect("batch 1");
+
+        let r2 = backend
+            .run_cdc(
+                &spec,
+                sqlite_cdc_record_batch_from_json(&[json!({
+                    "before": null,
+                    "after": {"id": 1, "email": "a@x", "name": "Alice v1"},
+                    "source": {"ts_ms": 100_i64},
+                    "op": "c",
+                    "ts_ms": 100_i64,
+                })
+                .as_object()
+                .unwrap()
+                .clone()]),
+                &cdc,
+                "sqlite_cdc_idem",
+            )
+            .await
+            .expect("batch 2");
+        assert_eq!(r2.creates, 0, "older redelivery must not apply");
+        assert_eq!(r2.updates, 0);
+        assert_eq!(
+            r2.idempotent_skipped, 1,
+            "idempotency gate must report the skip"
+        );
+
+        use futures_util::TryStreamExt;
+        let stream = backend
+            .read_arrow_stream("SELECT name FROM customers WHERE id = 1")
+            .await
+            .unwrap();
+        let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+        let arr = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(arr.value(0), "Alice v2");
+    }
+
+    /// Δ.X2 (SQLite): SchemaEvolutionPolicy::Fail must abort the
+    /// batch when an `after` payload carries a column missing on
+    /// the target spec.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sqlite_cdc_schema_fail_aborts() {
+        use crate::cdc::{CdcConfig, EnvelopeKind, SchemaEvolutionPolicy};
+        use serde_json::json;
+        use std::sync::Arc as StdArc;
+
+        let backend: StdArc<dyn Backend> = StdArc::new(SQLiteBackend::open(":memory:").unwrap());
+        create_sqlite_cdc_target(&backend).await;
+        let spec = sqlite_cdc_customers_spec();
+
+        let mut cdc = CdcConfig::for_envelope(EnvelopeKind::Debezium);
+        cdc.key_field = "after.id".into();
+        cdc.schema_evolution = SchemaEvolutionPolicy::Fail;
+
+        let err = backend
+            .run_cdc(
+                &spec,
+                sqlite_cdc_record_batch_from_json(&[json!({
+                    "before": null,
+                    "after": {"id": 1, "email": "a@x", "name": "A", "phone": "+1"},
+                    "op": "c",
+                    "ts_ms": 1_i64,
+                })
+                .as_object()
+                .unwrap()
+                .clone()]),
+                &cdc,
+                "sqlite_cdc_fail",
+            )
+            .await
+            .expect_err("Fail policy must error on unknown column");
+        assert!(
+            err.to_string().contains("phone"),
+            "error must name the offending column"
+        );
+    }
+
+    /// Δ.X2 (SQLite): soft-delete flips the configured column
+    /// instead of removing the row, and the affected rows are
+    /// counted as updates rather than deletes.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sqlite_cdc_soft_delete_flips_column() {
+        use crate::cdc::{CdcConfig, DeleteMode, EnvelopeKind};
+        use serde_json::json;
+        use std::sync::Arc as StdArc;
+
+        let backend: StdArc<dyn Backend> = StdArc::new(SQLiteBackend::open(":memory:").unwrap());
+        backend
+            .execute(
+                "CREATE TABLE customers (\
+                    id INTEGER PRIMARY KEY, \
+                    email TEXT, \
+                    name TEXT, \
+                    deleted_at TEXT)",
+            )
+            .await
+            .unwrap();
+
+        let mut spec = sqlite_cdc_customers_spec();
+        spec.columns.push(crate::types::ColumnSpec {
+            name: "deleted_at".into(),
+            ty: crate::types::ColumnType::TimestampTz,
+            nullable: true,
+            primary_key: false,
+        });
+
+        let mut cdc = CdcConfig::for_envelope(EnvelopeKind::Debezium);
+        cdc.key_field = "after.id".into();
+        cdc.delete_mode = DeleteMode::Soft {
+            column: "deleted_at".into(),
+        };
+
+        let _r1 = backend
+            .run_cdc(
+                &spec,
+                sqlite_cdc_record_batch_from_json(&[json!({
+                    "before": null,
+                    "after": {"id": 1, "email": "a@x", "name": "A", "deleted_at": null},
+                    "op": "c",
+                    "ts_ms": 100_i64,
+                })
+                .as_object()
+                .unwrap()
+                .clone()]),
+                &cdc,
+                "sqlite_cdc_soft",
+            )
+            .await
+            .unwrap();
+
+        let r2 = backend
+            .run_cdc(
+                &spec,
+                sqlite_cdc_record_batch_from_json(&[json!({
+                    "before": {"id": 1, "email": "a@x", "name": "A", "deleted_at": null},
+                    "after":  null,
+                    "op": "d",
+                    "ts_ms": 200_i64,
+                })
+                .as_object()
+                .unwrap()
+                .clone()]),
+                &cdc,
+                "sqlite_cdc_soft",
+            )
+            .await
+            .unwrap();
+        assert_eq!(r2.deletes, 0, "soft-delete must not increment deletes");
+        assert!(r2.updates >= 1, "soft-delete reports as an update");
+
+        use futures_util::TryStreamExt;
+        let stream = backend
+            .read_arrow_stream("SELECT id FROM customers WHERE id = 1")
+            .await
+            .unwrap();
+        let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+        let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, 1, "soft-delete preserves the row");
+
+        let stream = backend
+            .read_arrow_stream(
+                "SELECT count(*) FROM customers WHERE id = 1 AND deleted_at IS NOT NULL",
+            )
+            .await
+            .unwrap();
+        let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+        let n = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0);
+        assert_eq!(n, 1, "deleted_at must be populated");
     }
 }
