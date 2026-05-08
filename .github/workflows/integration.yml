@@ -129,10 +129,22 @@ jobs:
         # the same binary invocation, producing one combined
         # coverage profile. `--no-report` defers report generation
         # so the same profdata feeds both the gate-check and the
-        # lcov artifact below. `--no-fail-fast` lets us see every
-        # failure rather than halting on the first one.
+        # lcov artifact below.
+        #
+        # `--ignore-run-fail` (cargo-llvm-cov flag) instead of
+        # `--no-fail-fast` (cargo flag): we want a flaky
+        # testcontainer test (e.g. minio_orc_round_trip's
+        # occasional MinIO startup race) to NOT abort the
+        # downstream report-generation steps. The two flags are
+        # mutually exclusive — `--ignore-run-fail` wins because
+        # it covers both "keep going on individual test
+        # failures" and "still emit the coverage report when
+        # any test panicked," which is what we actually need
+        # for measurement-only mode. Real test failures still
+        # surface in the build log; the gate only kicks in once
+        # we add `--fail-under-regions=90` here.
         run: |
-          cargo llvm-cov --no-report --workspace --tests --no-fail-fast \
+          cargo llvm-cov --no-report --workspace --tests --ignore-run-fail \
               -- --include-ignored
       - name: Coverage summary
         # No `--fail-under-lines` until coverage crosses 90% (the
