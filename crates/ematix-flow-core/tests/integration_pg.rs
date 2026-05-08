@@ -8466,3 +8466,366 @@ async fn scd2_cross_db_first_load_inserts_all_current() {
         .unwrap();
     assert_eq!(closed_after, 1);
 }
+
+// ====================================================================
+// Phase Δ.X2 — MySQL CDC executor end-to-end against testcontainer.
+// ====================================================================
+//
+// Mirrors the four-corner DuckDB / SQLite test matrix: c+u+d across
+// two batches, older-redelivery dropped at the idempotency gate,
+// `Fail` policy aborting on schema drift, and soft-delete column-flip.
+// Each test is `#[ignore]` so a normal `cargo test` skips them; CI
+// runs them via `cargo test -- --ignored`.
+
+fn mysql_cdc_customers_spec() -> TableSpec {
+    TableSpec {
+        // testcontainers-modules' Mysql defaults to a `test` database.
+        schema: "test".into(),
+        name: "customers".into(),
+        columns: vec![
+            ColumnSpec {
+                name: "id".into(),
+                ty: ColumnType::BigInt,
+                nullable: false,
+                primary_key: true,
+            },
+            ColumnSpec {
+                name: "email".into(),
+                ty: ColumnType::Text,
+                nullable: true,
+                primary_key: false,
+            },
+            ColumnSpec {
+                name: "name".into(),
+                ty: ColumnType::Text,
+                nullable: true,
+                primary_key: false,
+            },
+        ],
+        unique_constraints: Vec::new(),
+        fingerprint: String::new(),
+    }
+}
+
+async fn create_mysql_cdc_target(
+    backend: &Arc<dyn Backend>,
+) -> Result<(), ematix_flow_core::backend::BackendError> {
+    backend
+        .execute(
+            "CREATE TABLE customers (\
+                id BIGINT NOT NULL PRIMARY KEY, \
+                email VARCHAR(255), \
+                name VARCHAR(255)\
+             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
+        )
+        .await
+        .map(|_| ())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker; run with `cargo test -- --ignored`"]
+async fn mysql_cdc_inserts_updates_deletes_across_batches() {
+    use arrow_array::{Int64Array, StringArray};
+    use ematix_flow_core::cdc::{CdcConfig, EnvelopeKind};
+    use serde_json::json;
+
+    let (_container, url) = start_mysql().await;
+    let backend: Arc<dyn Backend> = Arc::new(MySQLBackend::open(&url).unwrap());
+    create_mysql_cdc_target(&backend).await.unwrap();
+
+    let mut cdc_cfg = CdcConfig::for_envelope(EnvelopeKind::Debezium);
+    cdc_cfg.key_field = "after.id".into();
+    let spec = mysql_cdc_customers_spec();
+
+    let r1 = backend
+        .run_cdc(
+            &spec,
+            record_batch_from_json(&[
+                json!({
+                    "before": null,
+                    "after": {"id": 1, "email": "alice@x", "name": "Alice"},
+                    "source": {"ts_ms": 100_i64},
+                    "op": "c",
+                    "ts_ms": 100_i64,
+                })
+                .as_object()
+                .unwrap()
+                .clone(),
+                json!({
+                    "before": null,
+                    "after": {"id": 2, "email": "bob@x", "name": "Bob"},
+                    "source": {"ts_ms": 200_i64},
+                    "op": "c",
+                    "ts_ms": 200_i64,
+                })
+                .as_object()
+                .unwrap()
+                .clone(),
+            ]),
+            &cdc_cfg,
+            "mysql_cdc_test",
+        )
+        .await
+        .expect("batch 1");
+    assert_eq!(r1.creates, 2, "two inserts in batch 1");
+    assert_eq!(r1.updates, 0);
+    assert_eq!(r1.deletes, 0);
+
+    let r2 = backend
+        .run_cdc(
+            &spec,
+            record_batch_from_json(&[
+                json!({
+                    "before": {"id": 1, "email": "alice@x", "name": "Alice"},
+                    "after":  {"id": 1, "email": "alice@x", "name": "Alice Smith"},
+                    "source": {"ts_ms": 300_i64},
+                    "op": "u",
+                    "ts_ms": 300_i64,
+                })
+                .as_object()
+                .unwrap()
+                .clone(),
+                json!({
+                    "before": {"id": 2, "email": "bob@x", "name": "Bob"},
+                    "after":  null,
+                    "source": {"ts_ms": 400_i64},
+                    "op": "d",
+                    "ts_ms": 400_i64,
+                })
+                .as_object()
+                .unwrap()
+                .clone(),
+            ]),
+            &cdc_cfg,
+            "mysql_cdc_test",
+        )
+        .await
+        .expect("batch 2");
+    assert_eq!(r2.updates, 1, "one update");
+    assert_eq!(r2.deletes, 1, "one delete");
+
+    let stream = backend
+        .read_arrow_stream("SELECT id, name FROM customers ORDER BY id")
+        .await
+        .unwrap();
+    let batches: Vec<_> = stream.try_collect().await.unwrap();
+    let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total, 1, "exactly id=1 should remain");
+
+    let names = batches[0]
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("name column is utf8");
+    assert_eq!(names.value(0), "Alice Smith");
+    let _ids = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("id column is i64");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker; run with `cargo test -- --ignored`"]
+async fn mysql_cdc_redelivery_is_idempotent() {
+    use arrow_array::StringArray;
+    use ematix_flow_core::cdc::{CdcConfig, EnvelopeKind};
+    use serde_json::json;
+
+    let (_container, url) = start_mysql().await;
+    let backend: Arc<dyn Backend> = Arc::new(MySQLBackend::open(&url).unwrap());
+    create_mysql_cdc_target(&backend).await.unwrap();
+
+    let mut cdc_cfg = CdcConfig::for_envelope(EnvelopeKind::Debezium);
+    cdc_cfg.key_field = "after.id".into();
+    let spec = mysql_cdc_customers_spec();
+
+    let _r1 = backend
+        .run_cdc(
+            &spec,
+            record_batch_from_json(&[json!({
+                "before": null,
+                "after": {"id": 1, "email": "a@x", "name": "Alice v2"},
+                "source": {"ts_ms": 200_i64},
+                "op": "c",
+                "ts_ms": 200_i64,
+            })
+            .as_object()
+            .unwrap()
+            .clone()]),
+            &cdc_cfg,
+            "mysql_cdc_idem",
+        )
+        .await
+        .expect("batch 1");
+
+    let r2 = backend
+        .run_cdc(
+            &spec,
+            record_batch_from_json(&[json!({
+                "before": null,
+                "after": {"id": 1, "email": "a@x", "name": "Alice v1"},
+                "source": {"ts_ms": 100_i64},
+                "op": "c",
+                "ts_ms": 100_i64,
+            })
+            .as_object()
+            .unwrap()
+            .clone()]),
+            &cdc_cfg,
+            "mysql_cdc_idem",
+        )
+        .await
+        .expect("batch 2");
+    assert_eq!(r2.creates, 0, "older redelivery must not apply");
+    assert_eq!(r2.updates, 0);
+    assert_eq!(
+        r2.idempotent_skipped, 1,
+        "idempotency gate must report the skip"
+    );
+
+    let stream = backend
+        .read_arrow_stream("SELECT name FROM customers WHERE id = 1")
+        .await
+        .unwrap();
+    let batches: Vec<_> = stream.try_collect().await.unwrap();
+    let arr = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(arr.value(0), "Alice v2");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker; run with `cargo test -- --ignored`"]
+async fn mysql_cdc_schema_fail_aborts() {
+    use ematix_flow_core::cdc::{CdcConfig, EnvelopeKind, SchemaEvolutionPolicy};
+    use serde_json::json;
+
+    let (_container, url) = start_mysql().await;
+    let backend: Arc<dyn Backend> = Arc::new(MySQLBackend::open(&url).unwrap());
+    create_mysql_cdc_target(&backend).await.unwrap();
+    let spec = mysql_cdc_customers_spec();
+
+    let mut cdc_cfg = CdcConfig::for_envelope(EnvelopeKind::Debezium);
+    cdc_cfg.key_field = "after.id".into();
+    cdc_cfg.schema_evolution = SchemaEvolutionPolicy::Fail;
+
+    let err = backend
+        .run_cdc(
+            &spec,
+            record_batch_from_json(&[json!({
+                "before": null,
+                "after": {"id": 1, "email": "a@x", "name": "A", "phone": "+1"},
+                "op": "c",
+                "ts_ms": 1_i64,
+            })
+            .as_object()
+            .unwrap()
+            .clone()]),
+            &cdc_cfg,
+            "mysql_cdc_fail",
+        )
+        .await
+        .expect_err("Fail policy must error on unknown column");
+    assert!(
+        err.to_string().contains("phone"),
+        "error must name the offending column"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker; run with `cargo test -- --ignored`"]
+async fn mysql_cdc_soft_delete_flips_column() {
+    use arrow_array::Int64Array;
+    use ematix_flow_core::cdc::{CdcConfig, DeleteMode, EnvelopeKind};
+    use serde_json::json;
+
+    let (_container, url) = start_mysql().await;
+    let backend: Arc<dyn Backend> = Arc::new(MySQLBackend::open(&url).unwrap());
+    backend
+        .execute(
+            "CREATE TABLE customers (\
+                id BIGINT NOT NULL PRIMARY KEY, \
+                email VARCHAR(255), \
+                name VARCHAR(255), \
+                deleted_at DATETIME(6)\
+             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
+        )
+        .await
+        .unwrap();
+
+    let mut spec = mysql_cdc_customers_spec();
+    spec.columns.push(ColumnSpec {
+        name: "deleted_at".into(),
+        ty: ColumnType::TimestampTz,
+        nullable: true,
+        primary_key: false,
+    });
+
+    let mut cdc_cfg = CdcConfig::for_envelope(EnvelopeKind::Debezium);
+    cdc_cfg.key_field = "after.id".into();
+    cdc_cfg.delete_mode = DeleteMode::Soft {
+        column: "deleted_at".into(),
+    };
+
+    let _r1 = backend
+        .run_cdc(
+            &spec,
+            record_batch_from_json(&[json!({
+                "before": null,
+                "after": {"id": 1, "email": "a@x", "name": "A", "deleted_at": null},
+                "op": "c",
+                "ts_ms": 100_i64,
+            })
+            .as_object()
+            .unwrap()
+            .clone()]),
+            &cdc_cfg,
+            "mysql_cdc_soft",
+        )
+        .await
+        .unwrap();
+
+    let r2 = backend
+        .run_cdc(
+            &spec,
+            record_batch_from_json(&[json!({
+                "before": {"id": 1, "email": "a@x", "name": "A", "deleted_at": null},
+                "after":  null,
+                "op": "d",
+                "ts_ms": 200_i64,
+            })
+            .as_object()
+            .unwrap()
+            .clone()]),
+            &cdc_cfg,
+            "mysql_cdc_soft",
+        )
+        .await
+        .unwrap();
+    assert_eq!(r2.deletes, 0, "soft-delete must not increment deletes");
+    assert!(r2.updates >= 1, "soft-delete reports as an update");
+
+    let stream = backend
+        .read_arrow_stream("SELECT id FROM customers WHERE id = 1")
+        .await
+        .unwrap();
+    let batches: Vec<_> = stream.try_collect().await.unwrap();
+    let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total, 1, "soft-delete preserves the row");
+
+    let stream = backend
+        .read_arrow_stream("SELECT count(*) FROM customers WHERE id = 1 AND deleted_at IS NOT NULL")
+        .await
+        .unwrap();
+    let batches: Vec<_> = stream.try_collect().await.unwrap();
+    let n = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(n, 1, "deleted_at must be populated");
+}

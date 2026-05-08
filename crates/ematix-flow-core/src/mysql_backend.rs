@@ -375,6 +375,10 @@ fn mysql_merge_sql(
 const META_SCHEMA: &str = "ematix_flow";
 const RUN_HISTORY_TABLE: &str = "run_history";
 const WATERMARKS_TABLE: &str = "watermarks";
+/// Δ.X2: per-pipeline CDC idempotency table. Same shape as PG /
+/// DuckDB / SQLite — `(pipeline_name, pk_json)` PK, `last_seen_ts_ms`
+/// is the gate's monotonic-advance counter.
+const CDC_IDEMPOTENCY_TABLE: &str = "cdc_idempotency";
 
 /// SQL DDL that lazy-creates the `ematix_flow` database and the
 /// `run_history` + `watermarks` tables on MySQL. Returned as a list so
@@ -421,6 +425,21 @@ fn ensure_meta_schema_sql() -> Vec<String> {
                 column_name VARCHAR(255) NOT NULL, \
                 `last_value` VARCHAR(1024) NOT NULL, \
                 updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)\
+             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
+        ),
+        // pk_json is bounded by the InnoDB row-format key limit
+        // (3072 bytes for utf8mb4 with DYNAMIC); 768 chars × 4 bytes
+        // = 3072 leaves no headroom for `pipeline_name`'s share of
+        // the composite key, so we cap pk_json at 512 chars and
+        // pipeline_name at 191 (enough for any reasonable name and
+        // a hard limit InnoDB will accept under default settings).
+        format!(
+            "CREATE TABLE IF NOT EXISTS `{META_SCHEMA}`.`{CDC_IDEMPOTENCY_TABLE}` (\
+                pipeline_name VARCHAR(191) NOT NULL, \
+                pk_json VARCHAR(512) NOT NULL, \
+                last_seen_ts_ms BIGINT NOT NULL, \
+                updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6), \
+                PRIMARY KEY (pipeline_name, pk_json)\
              ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
         ),
     ]
@@ -663,6 +682,294 @@ impl MySQLBackend {
         .await
         .map_err(|e| BackendError::Query(e.to_string()))?;
         Ok(())
+    }
+
+    /// Δ.X2: MySQL CDC executor — applies a parsed batch of
+    /// `CdcEvent`s against `target_spec` inside a single
+    /// transaction.
+    ///
+    /// Lifecycle mirrors PG / DuckDB / SQLite:
+    ///   1. Lazy-bootstrap the meta schema (idempotency table on
+    ///      first call).
+    ///   2. Schema-evolution `Fail` policy: pre-flight `after`
+    ///      payload keys against the spec; abort the whole batch
+    ///      on first unknown.
+    ///   3. Per-event in one transaction: hit the idempotency
+    ///      gate, then dispatch on `event.op` to UPSERT / DELETE /
+    ///      soft-delete via prepared statements bound by named
+    ///      parameter (`:json`, `:pipeline_name`, etc.).
+    ///
+    /// MySQL specifics that diverge from the other ports:
+    ///   * No RETURNING — the gate is `INSERT ... ON DUPLICATE KEY
+    ///     UPDATE last_seen_ts_ms = IF(VALUES(...) > existing, ...)`
+    ///     and we read `affected_rows()`: 1 = fresh insert,
+    ///     2 = advanced update, 0 = no-op (existing >= incoming).
+    ///   * No `JSON_VALUE` on 5.7 / older 8.0 — extraction goes
+    ///     through `IF(JSON_TYPE(...) = 'NULL', NULL,
+    ///     JSON_UNQUOTE(JSON_EXTRACT(...)))` per column so JSON
+    ///     null round-trips as SQL NULL across all column types.
+    pub async fn run_cdc_inner(
+        &self,
+        target_spec: &crate::types::TableSpec,
+        events: Vec<crate::cdc::CdcEvent>,
+        cdc_config: &crate::cdc::CdcConfig,
+        pipeline_name: &str,
+        skipped: i64,
+    ) -> Result<crate::backend::CdcRunResult, BackendError> {
+        use crate::cdc::{CdcOp, DeleteMode, SchemaEvolutionPolicy};
+        use mysql_async::params;
+
+        self.ensure_meta_schema().await?;
+
+        // Single-PK only for the first cut (matches PG PR 3 scope).
+        let pk_col = target_spec
+            .columns
+            .iter()
+            .find(|c| c.primary_key)
+            .ok_or_else(|| {
+                BackendError::Other(format!(
+                    "MySQL run_cdc: target {}.{} has no primary-key column \
+                     (Δ.X2 v1 supports single-PK targets; declare PK on \
+                     @ematix.table or [target.table].primary_key)",
+                    target_spec.schema, target_spec.name
+                ))
+            })?;
+        let pk_name = pk_col.name.clone();
+
+        if matches!(cdc_config.schema_evolution, SchemaEvolutionPolicy::Fail) {
+            let valid_cols: std::collections::HashSet<&str> = target_spec
+                .columns
+                .iter()
+                .map(|c| c.name.as_str())
+                .collect();
+            for event in &events {
+                if let Some(after) = event.after.as_ref() {
+                    for k in after.keys() {
+                        if !valid_cols.contains(k.as_str()) {
+                            return Err(BackendError::Other(format!(
+                                "schema evolution: unknown column '{k}' in `after` \
+                                 payload for pipeline '{pipeline_name}' on MySQL target \
+                                 {schema}.{name} (SchemaEvolutionPolicy::Fail) — \
+                                 add the column to the target table or switch to Skip",
+                                schema = target_spec.schema,
+                                name = target_spec.name,
+                            )));
+                        }
+                    }
+                }
+            }
+        }
+
+        let qualified_target = qualified(&target_spec.schema, &target_spec.name);
+        let user_cols: Vec<String> = target_spec.columns.iter().map(|c| c.name.clone()).collect();
+        let non_pk_cols: Vec<&str> = target_spec
+            .columns
+            .iter()
+            .filter(|c| !c.primary_key)
+            .map(|c| c.name.as_str())
+            .collect();
+
+        // Per-column extraction expression. Returns SQL NULL when
+        // the JSON value is JSON null (rather than the string
+        // "null" that bare JSON_UNQUOTE would produce). Single
+        // template handles every column type — implicit cast
+        // takes care of numerics on INSERT.
+        let extract_expr = |col_name: &str| -> String {
+            let path = col_name.replace('\'', "''");
+            format!(
+                "IF(JSON_TYPE(JSON_EXTRACT(:json, '$.{path}')) = 'NULL', NULL, \
+                 JSON_UNQUOTE(JSON_EXTRACT(:json, '$.{path}')))"
+            )
+        };
+        let cols_csv = user_cols
+            .iter()
+            .map(|c| quote_ident(c))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let extract_csv = user_cols
+            .iter()
+            .map(|c| extract_expr(c))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        let upsert_sql = if non_pk_cols.is_empty() {
+            // PK-only target: ON DUPLICATE KEY UPDATE requires at
+            // least one assignment, so re-set the PK to itself
+            // (no-op).
+            format!(
+                "INSERT INTO {qualified_target} ({cols_csv}) VALUES ({extract_csv}) \
+                 ON DUPLICATE KEY UPDATE {pk} = {pk}",
+                pk = quote_ident(&pk_name),
+            )
+        } else {
+            let set_clause = non_pk_cols
+                .iter()
+                .map(|c| {
+                    let q = quote_ident(c);
+                    format!("{q} = VALUES({q})")
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "INSERT INTO {qualified_target} ({cols_csv}) VALUES ({extract_csv}) \
+                 ON DUPLICATE KEY UPDATE {set_clause}"
+            )
+        };
+
+        let pk_extract = extract_expr(&pk_name);
+        let delete_sql = match &cdc_config.delete_mode {
+            DeleteMode::Hard => format!(
+                "DELETE FROM {qualified_target} WHERE {pk} = {pk_extract}",
+                pk = quote_ident(&pk_name),
+            ),
+            DeleteMode::Soft { column } => format!(
+                "UPDATE {qualified_target} SET {col} = NOW(6) WHERE {pk} = {pk_extract}",
+                pk = quote_ident(&pk_name),
+                col = quote_ident(column),
+            ),
+        };
+
+        // Idempotency gate. No RETURNING — `affected_rows()`
+        // distinguishes fresh-insert (1) / advanced-update (2)
+        // from no-op (0). The IF() in the SET clauses keeps the
+        // update a no-op when incoming is older, which is what
+        // makes the "0 means reject" reading hold.
+        let gate_sql = format!(
+            "INSERT INTO `{META_SCHEMA}`.`{CDC_IDEMPOTENCY_TABLE}` \
+                 (pipeline_name, pk_json, last_seen_ts_ms, updated_at) \
+             VALUES (:pipeline_name, :pk_json, :ts_ms, NOW(6)) \
+             ON DUPLICATE KEY UPDATE \
+                 last_seen_ts_ms = IF(VALUES(last_seen_ts_ms) > last_seen_ts_ms, \
+                                      VALUES(last_seen_ts_ms), last_seen_ts_ms), \
+                 updated_at = IF(VALUES(last_seen_ts_ms) > last_seen_ts_ms, \
+                                 NOW(6), updated_at)"
+        );
+
+        let is_soft_delete = matches!(cdc_config.delete_mode, DeleteMode::Soft { .. });
+
+        let mut conn = self
+            .pool
+            .get_conn()
+            .await
+            .map_err(|e| BackendError::Connection(e.to_string()))?;
+        conn.query_drop("START TRANSACTION")
+            .await
+            .map_err(|e| BackendError::Query(e.to_string()))?;
+
+        let outcome: Result<(i64, i64, i64, i64), BackendError> = async {
+            let mut creates = 0i64;
+            let mut updates = 0i64;
+            let mut deletes = 0i64;
+            let mut idempotent_skipped = 0i64;
+
+            // In-batch gate cache: multiple events for the same
+            // PK in this batch only hit the gate once.
+            let mut gate_cache: std::collections::HashMap<String, i64> =
+                std::collections::HashMap::new();
+
+            for event in &events {
+                let payload_json: String = match event.op {
+                    CdcOp::Delete => {
+                        let mut m = serde_json::Map::new();
+                        m.insert(pk_name.clone(), event.key.clone());
+                        serde_json::to_string(&m).unwrap()
+                    }
+                    _ => match event.after.as_ref() {
+                        Some(map) => serde_json::to_string(map).unwrap(),
+                        None => continue,
+                    },
+                };
+
+                if let Some(ts_ms) = event.ts_ms {
+                    let pk_canon = serde_json::to_string(&event.key).unwrap();
+                    let cache_hit = gate_cache.get(&pk_canon).copied();
+                    let admit = match cache_hit {
+                        Some(cached_ts) => {
+                            if ts_ms > cached_ts {
+                                gate_cache.insert(pk_canon.clone(), ts_ms);
+                                true
+                            } else {
+                                false
+                            }
+                        }
+                        None => {
+                            conn.exec_drop(
+                                &gate_sql,
+                                params! {
+                                    "pipeline_name" => pipeline_name,
+                                    "pk_json" => pk_canon.clone(),
+                                    "ts_ms" => ts_ms,
+                                },
+                            )
+                            .await
+                            .map_err(|e| BackendError::Query(format!("mysql cdc gate: {e}")))?;
+                            // 1 = inserted, 2 = updated, 0 = no-op.
+                            let admitted = conn.affected_rows() > 0;
+                            if admitted {
+                                gate_cache.insert(pk_canon, ts_ms);
+                            }
+                            admitted
+                        }
+                    };
+                    if !admit {
+                        idempotent_skipped += 1;
+                        continue;
+                    }
+                }
+
+                match event.op {
+                    CdcOp::Create | CdcOp::Read => {
+                        conn.exec_drop(&upsert_sql, params! { "json" => payload_json.clone() })
+                            .await
+                            .map_err(|e| BackendError::Query(format!("mysql cdc upsert: {e}")))?;
+                        creates += 1;
+                    }
+                    CdcOp::Update => {
+                        conn.exec_drop(&upsert_sql, params! { "json" => payload_json.clone() })
+                            .await
+                            .map_err(|e| {
+                                BackendError::Query(format!("mysql cdc update-as-upsert: {e}"))
+                            })?;
+                        updates += 1;
+                    }
+                    CdcOp::Delete => {
+                        conn.exec_drop(&delete_sql, params! { "json" => payload_json.clone() })
+                            .await
+                            .map_err(|e| BackendError::Query(format!("mysql cdc delete: {e}")))?;
+                        let n = conn.affected_rows() as i64;
+                        if is_soft_delete {
+                            updates += n;
+                        } else {
+                            deletes += n;
+                        }
+                    }
+                }
+            }
+
+            Ok((creates, updates, deletes, idempotent_skipped))
+        }
+        .await;
+
+        match outcome {
+            Ok((creates, updates, deletes, idempotent_skipped)) => {
+                conn.query_drop("COMMIT")
+                    .await
+                    .map_err(|e| BackendError::Query(e.to_string()))?;
+                let run_id = Uuid::new_v4();
+                Ok(crate::backend::CdcRunResult {
+                    run_id: run_id.to_string(),
+                    creates,
+                    updates,
+                    deletes,
+                    skipped,
+                    idempotent_skipped,
+                })
+            }
+            Err(e) => {
+                let _ = conn.query_drop("ROLLBACK").await;
+                Err(e)
+            }
+        }
     }
 }
 
@@ -1702,6 +2009,43 @@ impl Backend for MySQLBackend {
             status: if dry_run { "dry_run" } else { "success" }.into(),
             path: "same_db".into(),
         })
+    }
+
+    /// Δ.X2: parse the incoming RecordBatch into CDC events, then
+    /// dispatch to `run_cdc_inner`. Same shape as the Postgres /
+    /// DuckDB / SQLite trait-method wrappers — keeps the parse
+    /// logic identical so a soft-fail row (parse error) is
+    /// reported in the `skipped` counter rather than failing the
+    /// whole batch.
+    async fn run_cdc(
+        &self,
+        spec: &crate::types::TableSpec,
+        batch: RecordBatch,
+        cdc_config: &crate::cdc::CdcConfig,
+        pipeline_name: &str,
+    ) -> Result<crate::backend::CdcRunResult, BackendError> {
+        use crate::cdc::ParsedRow;
+
+        let parsed = crate::cdc::events_from_batch(&batch, cdc_config)?;
+        let mut events = Vec::with_capacity(parsed.len());
+        let mut skipped: i64 = 0;
+        for row in parsed {
+            match row {
+                ParsedRow::Event(e) => events.push(e),
+                ParsedRow::Tombstone => skipped += 1,
+                ParsedRow::ParseError(e) => {
+                    tracing::warn!(
+                        target: "ematix_flow::cdc",
+                        error = %e,
+                        pipeline = pipeline_name,
+                        "MySQL CDC envelope parse failed; row skipped",
+                    );
+                    skipped += 1;
+                }
+            }
+        }
+        self.run_cdc_inner(spec, events, cdc_config, pipeline_name, skipped)
+            .await
     }
 }
 
