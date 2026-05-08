@@ -2024,14 +2024,19 @@ mod tests {
     /// Default `Backend::run_cdc` impl errors with a clear
     /// "not implemented" message that names the dialect — picked
     /// up by the streaming runtime when an unsupported target is
-    /// configured. Verified against SQLite, which doesn't override
-    /// the default yet (Δ.X2's SQLite port is still pending).
+    /// configured. Verified against ObjectStore (local file://),
+    /// which doesn't override the default: object stores have no
+    /// row-level CDC story by design and so are the natural
+    /// long-term home for this contract test as more SQL backends
+    /// light up native `run_cdc`.
     #[tokio::test]
     async fn default_run_cdc_errors_with_dialect_name() {
-        use crate::SQLiteBackend;
+        use crate::ObjectStoreBackend;
+        use crate::backend::ObjectFormat;
         use crate::types::{ColumnSpec, ColumnType, TableSpec};
 
-        let backend = SQLiteBackend::open(":memory:").unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let backend = ObjectStoreBackend::open_local(tmp.path(), ObjectFormat::Parquet).unwrap();
         let spec = TableSpec {
             schema: "main".into(),
             name: "t".into(),
@@ -2059,7 +2064,10 @@ mod tests {
             .await
             .expect_err("default run_cdc must error");
         let msg = err.to_string();
-        assert!(msg.contains("SQLite"), "must name the dialect, got: {msg}");
+        assert!(
+            msg.contains("ObjectStore"),
+            "must name the dialect, got: {msg}"
+        );
         assert!(msg.contains("not yet implemented"), "got: {msg}");
     }
 
