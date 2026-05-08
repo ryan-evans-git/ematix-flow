@@ -2024,13 +2024,14 @@ mod tests {
     /// Default `Backend::run_cdc` impl errors with a clear
     /// "not implemented" message that names the dialect — picked
     /// up by the streaming runtime when an unsupported target is
-    /// configured. Verified against DuckDB, which doesn't override.
+    /// configured. Verified against SQLite, which doesn't override
+    /// the default yet (Δ.X2's SQLite port is still pending).
     #[tokio::test]
     async fn default_run_cdc_errors_with_dialect_name() {
-        use crate::DuckDBBackend;
+        use crate::SQLiteBackend;
         use crate::types::{ColumnSpec, ColumnType, TableSpec};
 
-        let backend = DuckDBBackend::open(":memory:").unwrap();
+        let backend = SQLiteBackend::open(":memory:").unwrap();
         let spec = TableSpec {
             schema: "main".into(),
             name: "t".into(),
@@ -2058,7 +2059,7 @@ mod tests {
             .await
             .expect_err("default run_cdc must error");
         let msg = err.to_string();
-        assert!(msg.contains("DuckDB"), "must name the dialect, got: {msg}");
+        assert!(msg.contains("SQLite"), "must name the dialect, got: {msg}");
         assert!(msg.contains("not yet implemented"), "got: {msg}");
     }
 
