@@ -1454,13 +1454,24 @@ impl Backend for DeltaBackend {
     /// the newest post-image. A delete with the highest ts_ms for
     /// a PK wins over earlier UPDATEs.
     ///
-    /// **Between-batch idempotency**: relies on MERGE's natural
-    /// idempotency — UPDATE / INSERT with equal post-image is a
-    /// no-op, DELETE-of-absent-row is a no-op. The "older event in
-    /// a later batch clobbers newer state" case requires an
-    /// explicit per-row `_cdc_last_ts` gate, deferred to Δ.X1.1.
-    /// Non-issue when the source's per-PK ordering is preserved
-    /// (Kafka with Debezium's default partition-by-PK).
+    /// **Between-batch idempotency** (Δ.X1.1, opt-in): if the
+    /// target schema declares a column named `_cdc_last_ts`
+    /// (BIGINT / Int64), the executor treats it as a per-row
+    /// last-applied timestamp and gates every MERGE clause on
+    /// `source._cdc_last_ts > target._cdc_last_ts`
+    /// (null-safe — pre-existing rows from before the column
+    /// was added are treated as ts=NULL and accept any incoming
+    /// event). The source-batch construction populates the
+    /// column from each event's `source.ts_ms`. With the column
+    /// declared, an *older* redelivered event in a *later*
+    /// batch is dropped instead of clobbering newer state, and
+    /// the count is reported as `idempotent_skipped`.
+    /// Without the column declared (the default), the executor
+    /// falls back to MERGE's natural idempotency — UPDATE /
+    /// INSERT with equal post-image is a no-op, DELETE-of-
+    /// absent-row is a no-op — which is the right semantic when
+    /// the source preserves per-PK ordering (Kafka with
+    /// Debezium's default partition-by-PK gives this for free).
     ///
     /// **Schema evolution**: `Skip` policy uses Delta's
     /// `with_merge_schema(true)` — new columns in the source
@@ -1586,12 +1597,39 @@ impl Backend for DeltaBackend {
             });
         }
 
+        // Δ.X1.1: detect the opt-in `_cdc_last_ts` column. When the
+        // user declares it on the target spec, the source-batch
+        // construction populates it from each event's ts_ms and the
+        // MERGE clauses gate on `source._cdc_last_ts >
+        // target._cdc_last_ts`. Validate the type while we're here —
+        // BigInt is the only sensible choice (millisecond epoch); a
+        // user who accidentally declares it as Text gets a clear
+        // error rather than a silent fall-through.
+        let cdc_ts_gate = spec.columns.iter().any(|c| c.name == CDC_LAST_TS_COL);
+        if cdc_ts_gate {
+            let ts_col = spec.columns.iter().find(|c| c.name == CDC_LAST_TS_COL);
+            if let Some(c) = ts_col
+                && !matches!(c.ty, crate::types::ColumnType::BigInt)
+            {
+                return Err(BackendError::Other(format!(
+                    "Delta run_cdc: target column `{CDC_LAST_TS_COL}` must be BIGINT \
+                     (Int64) when used as the between-batch idempotency gate; \
+                     got {:?}",
+                    c.ty
+                )));
+            }
+        }
+        let events_in: i64 = events.len() as i64;
+
         // Phase 2 — build the source RecordBatch. Schema:
         // every spec column (forced-nullable so delete events with
         // only the PK populated still validate) + a synthesized
         // `__op` Utf8 column that the MERGE branches dispatch on.
+        // When `_cdc_last_ts` is declared, build_cdc_source_batch
+        // also populates it per-row from `event.ts_ms`.
         let arrow_schema = build_cdc_source_schema(spec)?;
-        let source_batch = build_cdc_source_batch(arrow_schema.clone(), &events, &pk_cols)?;
+        let source_batch =
+            build_cdc_source_batch(arrow_schema.clone(), &events, &pk_cols, cdc_ts_gate)?;
 
         // Open the target. Like run_merge, we require the table
         // to exist — initial schema bootstrap is the user's job
@@ -1635,24 +1673,52 @@ impl Backend for DeltaBackend {
                 SchemaEvolutionPolicy::Skip
             ));
 
+        // Δ.X1.1: when the gate is active, every when_matched
+        // predicate ANDs in `(target._cdc_last_ts IS NULL OR
+        // source._cdc_last_ts > target._cdc_last_ts)`. The IS NULL
+        // arm makes the rollout safe — pre-existing rows from
+        // before the column was added accept any first incoming
+        // event, then start gating from that ts forward. Sharing
+        // a single helper keeps every clause in lockstep.
+        let ts_gate_predicate = |op_pred: &str| -> String {
+            if cdc_ts_gate {
+                format!(
+                    "{op_pred} AND (target.{CDC_LAST_TS_COL} IS NULL OR \
+                     source.{CDC_LAST_TS_COL} > target.{CDC_LAST_TS_COL})"
+                )
+            } else {
+                op_pred.to_string()
+            }
+        };
+
         // WHEN MATCHED AND __op = 'd' branch. Hard mode deletes
         // the row; soft mode updates the configured column to
         // current_timestamp() instead. Register first so the
         // c/u/r update branch below doesn't shadow it.
         match &cdc_config.delete_mode {
             DeleteMode::Hard => {
+                let pred = ts_gate_predicate("source.__op = 'd'");
                 merge = merge
-                    .when_matched_delete(|d| d.predicate("source.__op = 'd'"))
+                    .when_matched_delete(|d| d.predicate(pred))
                     .map_err(|e| {
                         BackendError::Query(format!("delta cdc when_matched_delete: {e}"))
                     })?;
             }
             DeleteMode::Soft { column } => {
                 let soft_col = column.clone();
+                let pred = ts_gate_predicate("source.__op = 'd'");
                 merge = merge
                     .when_matched_update(|u| {
-                        u.predicate("source.__op = 'd'")
-                            .update(soft_col.as_str(), "current_timestamp()")
+                        let mut u = u
+                            .predicate(pred.clone())
+                            .update(soft_col.as_str(), "current_timestamp()");
+                        // Bump the ts gate too so a subsequent
+                        // older redelivery doesn't re-flip the
+                        // soft-delete column.
+                        if cdc_ts_gate {
+                            u = u.update(CDC_LAST_TS_COL, format!("source.{CDC_LAST_TS_COL}"));
+                        }
+                        u
                     })
                     .map_err(|e| {
                         BackendError::Query(format!(
@@ -1663,11 +1729,20 @@ impl Backend for DeltaBackend {
         }
 
         // WHEN MATCHED (general fallthrough) → c/u/r overwrite
-        // every user column from the source post-image.
+        // every user column from the source post-image. When the
+        // ts gate is active, the predicate also requires
+        // source._cdc_last_ts > target._cdc_last_ts so an older
+        // redelivery is dropped (counted in idempotent_skipped
+        // below).
+        //
+        // The user_cols loop already covers `_cdc_last_ts` when
+        // declared (it's a normal user column from the spec's POV)
+        // — the gate keeps the value strictly increasing on apply.
         let user_cols_for_update = user_cols.clone();
+        let pred_update = ts_gate_predicate("source.__op != 'd'");
         merge = merge
             .when_matched_update(|u| {
-                let mut u = u.predicate("source.__op != 'd'");
+                let mut u = u.predicate(pred_update);
                 for col in &user_cols_for_update {
                     u = u.update(col.as_str(), format!("source.{col}"));
                 }
@@ -1696,15 +1771,37 @@ impl Backend for DeltaBackend {
         // Map Delta's MergeMetrics back onto CdcRunResult. Delta
         // doesn't expose per-op CDC counts directly, so creates +
         // updates + deletes are derived from the per-MERGE-clause
-        // counters. `idempotent_skipped` is always 0 in PR 1 —
-        // Δ.X1.1 will populate it once the per-row ts gate lands.
+        // counters.
+        //
+        // Δ.X1.1: when the `_cdc_last_ts` gate is active,
+        // `idempotent_skipped` reports events that DIDN'T result
+        // in a target-row apply. This conflates two cases:
+        //   1. Older redelivery rejected by the ts gate (true
+        //      idempotent skip — the strict semantic the gate
+        //      delivers).
+        //   2. Delete event for a key that's not in the target
+        //      (when_matched_delete didn't fire — natural no-op
+        //      regardless of the gate).
+        // Both are non-applies; the consolidated counter is the
+        // useful telemetry signal. Without the gate, we leave it
+        // at 0 (the natural-idempotency case can't tell apply-as-
+        // no-op from non-apply through MergeMetrics alone, and
+        // claiming a number we can't verify is worse than zero).
+        let creates = metrics.num_target_rows_inserted as i64;
+        let updates = metrics.num_target_rows_updated as i64;
+        let deletes = metrics.num_target_rows_deleted as i64;
+        let idempotent_skipped = if cdc_ts_gate {
+            (events_in - creates - updates - deletes).max(0)
+        } else {
+            0
+        };
         Ok(crate::backend::CdcRunResult {
             run_id: run_id.to_string(),
-            creates: metrics.num_target_rows_inserted as i64,
-            updates: metrics.num_target_rows_updated as i64,
-            deletes: metrics.num_target_rows_deleted as i64,
+            creates,
+            updates,
+            deletes,
             skipped,
-            idempotent_skipped: 0,
+            idempotent_skipped,
         })
     }
 }
@@ -1740,6 +1837,15 @@ fn arrow_to_column_type(dt: &arrow_schema::DataType) -> crate::types::ColumnType
 /// Δ.X1: build the Arrow schema for the source RecordBatch the
 /// MERGE consumes — every spec column made nullable plus a
 /// non-null `__op` Utf8 column.
+/// Δ.X1.1: name of the per-row last-applied-timestamp column the
+/// Delta CDC executor recognizes for between-batch idempotency.
+/// When a target spec has a column with this exact name + type
+/// `BigInt`, the executor activates the strict gate (per the
+/// `Backend::run_cdc` doc on this file). Hidden in the sense that
+/// users only need to declare it on tables they want gated;
+/// without it the executor falls back to natural idempotency.
+const CDC_LAST_TS_COL: &str = "_cdc_last_ts";
+
 fn build_cdc_source_schema(spec: &TableSpec) -> Result<Arc<arrow_schema::Schema>, BackendError> {
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
     let mut fields: Vec<Field> = Vec::with_capacity(spec.columns.len() + 1);
@@ -1797,6 +1903,7 @@ fn build_cdc_source_batch(
     schema: Arc<arrow_schema::Schema>,
     events: &[crate::cdc::CdcEvent],
     pk_cols: &[String],
+    cdc_ts_gate: bool,
 ) -> Result<RecordBatch, BackendError> {
     use crate::cdc::CdcOp;
 
@@ -1835,6 +1942,23 @@ fn build_cdc_source_batch(
             CdcOp::Read => "r",
         };
         row.insert("__op".into(), serde_json::Value::String(op_str.to_string()));
+        // Δ.X1.1: when the target declares `_cdc_last_ts`, populate
+        // it from the event's source-side ts_ms. Override anything
+        // that happened to be in `after.<_cdc_last_ts>` — the
+        // executor owns this column. Events without ts_ms (rare —
+        // the parser populates it for every Debezium / Maxwell
+        // envelope variant) accept anything against a NULL gate
+        // value but won't update the gate forward.
+        if cdc_ts_gate {
+            match event.ts_ms {
+                Some(ts) => {
+                    row.insert(CDC_LAST_TS_COL.into(), serde_json::Value::from(ts));
+                }
+                None => {
+                    row.insert(CDC_LAST_TS_COL.into(), serde_json::Value::Null);
+                }
+            }
+        }
         buf.extend(serde_json::to_string(&row).unwrap().bytes());
         buf.push(b'\n');
     }
@@ -3288,6 +3412,274 @@ mod tests {
         assert!(
             msg.contains("phone"),
             "error must name the offending column, got: {msg}"
+        );
+    }
+
+    // ----------------------------------------------------------
+    // Δ.X1.1 — between-batch idempotency via opt-in
+    // `_cdc_last_ts` column. Helpers below mirror the
+    // cdc_customers_* helpers, just with the gate column added.
+    // ----------------------------------------------------------
+
+    fn cdc_customers_spec_with_ts_gate() -> TableSpec {
+        use crate::types::{ColumnSpec, ColumnType};
+        let mut spec = cdc_customers_spec();
+        spec.columns.push(ColumnSpec {
+            name: CDC_LAST_TS_COL.into(),
+            ty: ColumnType::BigInt,
+            nullable: true,
+            primary_key: false,
+        });
+        spec
+    }
+
+    /// Mirror of `seed_empty_customers_table` with the
+    /// `_cdc_last_ts` column added so the target schema accepts
+    /// the gated MERGE source.
+    async fn seed_empty_customers_table_with_ts_gate(backend: &DeltaBackend, target: &TargetTable) {
+        use arrow_array::{Int64Array, StringArray};
+        use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("email", DataType::Utf8, true),
+            Field::new("name", DataType::Utf8, true),
+            Field::new(CDC_LAST_TS_COL, DataType::Int64, true),
+        ]));
+        // Single-row seed at ts=0 — guarantees any real CDC event
+        // is "newer" against the gate, so the seed row gets cleanly
+        // handled by the first batch's events without special-
+        // casing it.
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![0i64])),
+                Arc::new(StringArray::from(vec![Some("seed@example.com")])),
+                Arc::new(StringArray::from(vec![Some("Seed")])),
+                Arc::new(Int64Array::from(vec![Some(0i64)])),
+            ],
+        )
+        .unwrap();
+        backend
+            .write_arrow_stream(target, arrow_stream_for(batch), WriteMode::Append)
+            .await
+            .unwrap();
+    }
+
+    /// Δ.X1.1: with the `_cdc_last_ts` gate active, an OLDER
+    /// redelivered event in a LATER batch must be dropped, not
+    /// applied. This is the failure mode Δ.X1's natural-
+    /// idempotency design intentionally didn't cover (an
+    /// `email='OLD'` event arriving after `email='NEW'` would
+    /// clobber NEW back to OLD without the gate).
+    ///
+    /// The test plays out:
+    ///   - Batch 1: id=1, email='alice@v2', ts=200 (the "newer" state).
+    ///   - Batch 2: id=1, email='alice@v1', ts=100 (an older event
+    ///     redelivered out-of-order).
+    ///
+    /// Expected: target stays at v2; batch 2 reports
+    /// idempotent_skipped=1 instead of an apply.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn delta_cdc_ts_gate_drops_older_redelivery() {
+        use crate::cdc::{CdcConfig, EnvelopeKind};
+        use serde_json::json;
+
+        let dir = tempfile::tempdir().unwrap();
+        let backend = DeltaBackend::open_local(dir.path()).unwrap();
+        let target = TargetTable {
+            schema: "mirror".into(),
+            name: "customers".into(),
+        };
+        seed_empty_customers_table_with_ts_gate(&backend, &target).await;
+
+        let mut cdc = CdcConfig::for_envelope(EnvelopeKind::Debezium);
+        cdc.key_field = "after.id".into();
+        let spec = cdc_customers_spec_with_ts_gate();
+
+        // Batch 1: apply the newer state (ts=200).
+        let r1 = backend
+            .run_cdc(
+                &spec,
+                cdc_record_batch_from_json(&[json!({
+                    "before": null,
+                    "after": {"id": 1, "email": "alice@v2", "name": "Alice"},
+                    "source": {"ts_ms": 200_i64},
+                    "op": "c",
+                    "ts_ms": 200_i64,
+                })
+                .as_object()
+                .unwrap()
+                .clone()]),
+                &cdc,
+                "test_ts_gate",
+            )
+            .await
+            .expect("batch 1");
+        assert_eq!(r1.creates, 1, "newer event applied");
+        assert_eq!(r1.idempotent_skipped, 0, "no skip on first apply");
+
+        // Batch 2: redeliver an older version of the same row.
+        // The ts gate must reject it — target stays at email='v2'.
+        let r2 = backend
+            .run_cdc(
+                &spec,
+                cdc_record_batch_from_json(&[json!({
+                    "before": null,
+                    "after": {"id": 1, "email": "alice@v1", "name": "Alice"},
+                    "source": {"ts_ms": 100_i64},
+                    "op": "c",
+                    "ts_ms": 100_i64,
+                })
+                .as_object()
+                .unwrap()
+                .clone()]),
+                &cdc,
+                "test_ts_gate",
+            )
+            .await
+            .expect("batch 2");
+        assert_eq!(r2.creates, 0, "no apply for older redelivery");
+        assert_eq!(r2.updates, 0);
+        assert_eq!(r2.deletes, 0);
+        assert_eq!(
+            r2.idempotent_skipped, 1,
+            "older event must be reported as idempotent_skipped"
+        );
+
+        // Verify the target row's email still says v2 (not v1).
+        let surviving = read_customers(&backend, &target).await;
+        let alice = surviving
+            .iter()
+            .find(|r| r.0 == 1)
+            .expect("id=1 must still be present");
+        assert_eq!(
+            alice.1.as_deref(),
+            Some("alice@v2"),
+            "older redelivery must not clobber newer state, got {alice:?}"
+        );
+    }
+
+    /// Δ.X1.1: complement to the test above — without the
+    /// `_cdc_last_ts` column declared, the executor falls back to
+    /// the natural-idempotency path. `idempotent_skipped` stays
+    /// at 0 (we don't claim a number we can't verify) and the
+    /// older event clobbers newer state, which is the documented
+    /// pre-X1.1 behavior. Locks the fact that the gate is opt-in:
+    /// users who don't add the column see no behavior change.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn delta_cdc_no_ts_gate_keeps_natural_idempotency() {
+        use crate::cdc::{CdcConfig, EnvelopeKind};
+        use serde_json::json;
+
+        let dir = tempfile::tempdir().unwrap();
+        let backend = DeltaBackend::open_local(dir.path()).unwrap();
+        let target = TargetTable {
+            schema: "mirror".into(),
+            name: "customers".into(),
+        };
+        seed_empty_customers_table(&backend, &target).await;
+
+        let mut cdc = CdcConfig::for_envelope(EnvelopeKind::Debezium);
+        cdc.key_field = "after.id".into();
+        let spec = cdc_customers_spec(); // no _cdc_last_ts column
+
+        let _r1 = backend
+            .run_cdc(
+                &spec,
+                cdc_record_batch_from_json(&[json!({
+                    "before": null,
+                    "after": {"id": 1, "email": "alice@v2", "name": "Alice"},
+                    "source": {"ts_ms": 200_i64},
+                    "op": "c",
+                    "ts_ms": 200_i64,
+                })
+                .as_object()
+                .unwrap()
+                .clone()]),
+                &cdc,
+                "test_no_gate",
+            )
+            .await
+            .expect("batch 1");
+
+        let r2 = backend
+            .run_cdc(
+                &spec,
+                cdc_record_batch_from_json(&[json!({
+                    "before": null,
+                    "after": {"id": 1, "email": "alice@v1", "name": "Alice"},
+                    "source": {"ts_ms": 100_i64},
+                    "op": "c",
+                    "ts_ms": 100_i64,
+                })
+                .as_object()
+                .unwrap()
+                .clone()]),
+                &cdc,
+                "test_no_gate",
+            )
+            .await
+            .expect("batch 2");
+        // Without the gate, nothing's filtered — the older event
+        // is applied. `idempotent_skipped` stays at 0.
+        assert_eq!(r2.idempotent_skipped, 0, "no gate → no skip count");
+    }
+
+    /// Δ.X1.1: declaring `_cdc_last_ts` as anything other than
+    /// BigInt is a configuration error — surface it loud at
+    /// MERGE-time rather than silently ignore the column.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn delta_cdc_ts_gate_rejects_non_bigint_column_type() {
+        use crate::cdc::{CdcConfig, EnvelopeKind};
+        use crate::types::{ColumnSpec, ColumnType};
+        use serde_json::json;
+
+        let dir = tempfile::tempdir().unwrap();
+        let backend = DeltaBackend::open_local(dir.path()).unwrap();
+        let target = TargetTable {
+            schema: "mirror".into(),
+            name: "customers".into(),
+        };
+        seed_empty_customers_table(&backend, &target).await;
+
+        let mut spec = cdc_customers_spec();
+        // Wrong type: Text instead of BigInt.
+        spec.columns.push(ColumnSpec {
+            name: CDC_LAST_TS_COL.into(),
+            ty: ColumnType::Text,
+            nullable: true,
+            primary_key: false,
+        });
+
+        let mut cdc = CdcConfig::for_envelope(EnvelopeKind::Debezium);
+        cdc.key_field = "after.id".into();
+
+        let err = backend
+            .run_cdc(
+                &spec,
+                cdc_record_batch_from_json(&[json!({
+                    "before": null,
+                    "after": {"id": 1, "email": "a@x.com", "name": "A"},
+                    "op": "c",
+                    "ts_ms": 1_i64,
+                })
+                .as_object()
+                .unwrap()
+                .clone()]),
+                &cdc,
+                "test_bad_ts_type",
+            )
+            .await
+            .expect_err("non-BigInt _cdc_last_ts must error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(CDC_LAST_TS_COL),
+            "error must name the column, got: {msg}"
+        );
+        assert!(
+            msg.to_lowercase().contains("bigint"),
+            "error must say BigInt is required, got: {msg}"
         );
     }
 
