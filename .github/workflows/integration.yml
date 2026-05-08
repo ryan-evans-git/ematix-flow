@@ -9,31 +9,32 @@ name: integration
 # unit-test path; this workflow carries the load-bearing 100+
 # ignored tests + the coverage gate.
 #
-# Coverage measurement (no hard gate yet). After 6 rounds of
-# unit-test backfill (commits 18d62ed..bcff28b — 41 new tests
-# across cli/lib.rs, backend.rs, delta_backend.rs,
-# session_blob.rs, transform.rs, objectstore date helpers) local
-# measurement is at 86.54% line coverage with the same scope
-# (excluding PyO3 wrappers + entrypoint binaries), up from
-# 84.84% baseline. The user's stated target is 90%, not yet
-# reached.
+# Coverage measurement + 86% region floor. PR-by-PR push:
 #
-# `--fail-under-lines` is intentionally NOT set on this workflow
-# until coverage actually crosses 90%. Reasoning: enforcing a
-# below-target floor would be a half-measure that mostly creates
-# noise (red checks on PRs touching unrelated areas, friction
-# with parallel PRs that don't change Rust source). The workflow
-# still runs cargo-llvm-cov, prints the summary in the build
-# log, and uploads the lcov artifact — humans can eyeball
-# regressions. Add the gate when 90% lands.
+#   84.84% → 86.54% (PR #7, rounds 1–6: 41 unit tests)
+#   86.54% → 87.78% (PR #10, cross-DB Postgres COPY-binary executors)
+#   87.78% → 88.09% (PR #11, MySQL + DuckDB pure-helper backfill)
+#   88.09% → 88.11% (PR #12, backend.rs helpers)
 #
-# Path to 90% (~3.5pp from current): a single Postgres
-# testcontainer test exercising every Arrow column type
-# (Int16/Int32/Float32/Boolean/Binary/Timestamp/JSONB/UUID etc)
-# would close ~500 lines simultaneously across backend.rs's
-# COPY-BINARY type-binding match arms + pg.rs +
-# duckdb_backend.rs + mysql_backend.rs; windowed.rs
-# internal-state-machine edge cases close another ~100.
+# Final measured number (post-PR-#12): 88.11% lines / 86.82%
+# regions, scope = workspace minus PyO3 wrappers + entrypoints.
+#
+# Gate set at `--fail-under-regions=86` (this PR): one full pp
+# below the actual measurement so transient measurement noise
+# (e.g. testcontainer flakes that legitimately bypass a code
+# path during a CI run) doesn't false-fail the gate. Real
+# regressions still trip — anything that reverts coverage by
+# more than a pp from the current floor.
+#
+# 90% stays the longer-horizon target. The remaining ~3.2pp gap
+# concentrates in `windowed.rs` (766 missed regions, internal
+# state-machine edges) and `kafka_backend.rs` (641 missed,
+# producer/EOS/SR error paths). Both need real-service
+# integration tests rather than helper unit tests — additional
+# pure-helper rounds hit a wall after PR #12 (test code adds to
+# denominator faster than production code adds to numerator).
+# Picking these up is gated on willingness to invest in
+# state-machine integration tests.
 #
 # What's excluded from the coverage denominator:
 #   - `ematix-flow-py/src/*.rs` — PyO3 wrappers exercised
@@ -141,20 +142,21 @@ jobs:
         # failures" and "still emit the coverage report when
         # any test panicked," which is what we actually need
         # for measurement-only mode. Real test failures still
-        # surface in the build log; the gate only kicks in once
-        # we add `--fail-under-regions=90` here.
+        # surface in the build log.
         run: |
           cargo llvm-cov --no-report --workspace --tests --ignore-run-fail \
               -- --include-ignored
-      - name: Coverage summary
-        # No `--fail-under-lines` until coverage crosses 90% (the
-        # user's stated target). Until then this step prints the
-        # summary table for human review + uploads the lcov
-        # artifact below; regressions surface in the build log
-        # and on the artifact diff.
+      - name: Coverage summary + 86% region floor
+        # `--fail-under-regions=86` enforces the floor identified
+        # at the top-of-file. Picked one pp below the actual
+        # measurement (86.82% post-PR-#12) so transient flake-
+        # induced misses don't false-fail. The summary still
+        # prints to the build log + the lcov artifact uploads
+        # for human review of per-file deltas.
         run: |
           cargo llvm-cov report \
-              --ignore-filename-regex '(ematix-flow-py/src/|main\.rs|flow_worker\.rs)'
+              --ignore-filename-regex '(ematix-flow-py/src/|main\.rs|flow_worker\.rs)' \
+              --fail-under-regions 86
       - name: Coverage lcov export
         run: |
           cargo llvm-cov report \
