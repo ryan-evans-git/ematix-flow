@@ -1762,4 +1762,222 @@ mod tests {
         let v = parse_naive_iso8601_us(&s).unwrap();
         assert_eq!(v, 1_718_454_896_789_012);
     }
+
+    // ---- mysql_async::Value → typed-helper conversions -------------------
+    //
+    // The integration tests above exercise the happy path for each helper
+    // through `read_arrow_stream`, but every helper has multiple match
+    // arms (per-variant accept + Bytes-string fallback + error path) that
+    // only fire for specific MySQL protocol shapes. Direct unit tests
+    // close those branches without spinning up a testcontainer.
+
+    use mysql_async::Value as MV;
+
+    #[test]
+    fn mysql_to_i64_accepts_int_uint_and_numeric_bytes() {
+        assert_eq!(mysql_to_i64(&MV::Int(42)).unwrap(), 42);
+        assert_eq!(mysql_to_i64(&MV::Int(-7)).unwrap(), -7);
+        assert_eq!(mysql_to_i64(&MV::UInt(100)).unwrap(), 100);
+        // UInt at full u64::MAX wraps as i64 — documented behavior, hits
+        // the `as i64` cast branch.
+        let _wraps = mysql_to_i64(&MV::UInt(u64::MAX)).unwrap();
+        assert_eq!(mysql_to_i64(&MV::Bytes(b"123".to_vec())).unwrap(), 123);
+        assert_eq!(mysql_to_i64(&MV::Bytes(b"-9".to_vec())).unwrap(), -9);
+    }
+
+    #[test]
+    fn mysql_to_i64_rejects_non_numeric_bytes_and_other_variants() {
+        assert!(mysql_to_i64(&MV::Bytes(b"abc".to_vec())).is_err());
+        assert!(mysql_to_i64(&MV::Bytes(vec![0xFF, 0xFE])).is_err()); // invalid utf-8
+        assert!(mysql_to_i64(&MV::Float(1.5)).is_err());
+        assert!(mysql_to_i64(&MV::NULL).is_err());
+    }
+
+    #[test]
+    fn mysql_to_f64_accepts_all_numeric_variants() {
+        assert_eq!(mysql_to_f64(&MV::Float(1.5)).unwrap(), 1.5);
+        assert_eq!(mysql_to_f64(&MV::Double(2.5)).unwrap(), 2.5);
+        assert_eq!(mysql_to_f64(&MV::Int(3)).unwrap(), 3.0);
+        assert_eq!(mysql_to_f64(&MV::UInt(4)).unwrap(), 4.0);
+        let parsed = mysql_to_f64(&MV::Bytes(b"5.25".to_vec())).unwrap();
+        assert!((parsed - 5.25).abs() < 1e-9);
+    }
+
+    #[test]
+    fn mysql_to_f64_rejects_non_numeric_bytes_and_other_variants() {
+        assert!(mysql_to_f64(&MV::Bytes(b"not a number".to_vec())).is_err());
+        assert!(mysql_to_f64(&MV::NULL).is_err());
+    }
+
+    #[test]
+    fn mysql_to_bool_accepts_int_uint_and_bytes() {
+        assert!(mysql_to_bool(&MV::Int(1)).unwrap());
+        assert!(!mysql_to_bool(&MV::Int(0)).unwrap());
+        assert!(mysql_to_bool(&MV::Int(-3)).unwrap()); // any non-zero
+        assert!(mysql_to_bool(&MV::UInt(2)).unwrap());
+        assert!(mysql_to_bool(&MV::Bytes(b"1".to_vec())).unwrap());
+        assert!(mysql_to_bool(&MV::Bytes(b"true".to_vec())).unwrap());
+        assert!(!mysql_to_bool(&MV::Bytes(b"0".to_vec())).unwrap());
+        assert!(!mysql_to_bool(&MV::Bytes(b"".to_vec())).unwrap());
+    }
+
+    #[test]
+    fn mysql_to_bool_rejects_other_variants() {
+        assert!(mysql_to_bool(&MV::Float(1.0)).is_err());
+        assert!(mysql_to_bool(&MV::NULL).is_err());
+    }
+
+    #[test]
+    fn mysql_to_string_handles_each_variant() {
+        assert_eq!(mysql_to_string(&MV::Bytes(b"hi".to_vec())).unwrap(), "hi");
+        assert_eq!(mysql_to_string(&MV::Int(42)).unwrap(), "42");
+        assert_eq!(mysql_to_string(&MV::UInt(100)).unwrap(), "100");
+        assert_eq!(mysql_to_string(&MV::Float(1.5)).unwrap(), "1.5");
+        assert_eq!(mysql_to_string(&MV::Double(2.5)).unwrap(), "2.5");
+        // Date variant — formatted as ISO8601-ish.
+        let s = mysql_to_string(&MV::Date(2024, 6, 15, 12, 34, 56, 789_012)).unwrap();
+        assert!(s.starts_with("2024-06-15T12:34:56"), "date repr: {s}");
+        assert!(s.contains("789012"), "microseconds preserved: {s}");
+    }
+
+    #[test]
+    fn mysql_to_string_rejects_invalid_utf8_and_other_variants() {
+        // Bytes that aren't valid UTF-8 — hits the from_utf8 error arm.
+        assert!(mysql_to_string(&MV::Bytes(vec![0xFF, 0xFE, 0xFD])).is_err());
+        assert!(mysql_to_string(&MV::NULL).is_err());
+    }
+
+    #[test]
+    fn mysql_to_binary_accepts_bytes_only() {
+        let raw = vec![0x00, 0xDE, 0xAD, 0xBE, 0xEF];
+        assert_eq!(mysql_to_binary(&MV::Bytes(raw.clone())).unwrap(), raw);
+        // Empty bytes are valid.
+        assert_eq!(
+            mysql_to_binary(&MV::Bytes(vec![])).unwrap(),
+            Vec::<u8>::new()
+        );
+        // Non-Bytes variants fail.
+        assert!(mysql_to_binary(&MV::Int(0)).is_err());
+        assert!(mysql_to_binary(&MV::NULL).is_err());
+    }
+
+    #[test]
+    fn mysql_to_timestamp_us_handles_date_variant_and_string_fallback() {
+        // Date variant: Y/M/D/h/m/s/us → microseconds since epoch.
+        let micros = mysql_to_timestamp_us(&MV::Date(1970, 1, 1, 0, 0, 0, 0)).unwrap();
+        assert_eq!(micros, 0);
+        let micros = mysql_to_timestamp_us(&MV::Date(2024, 6, 15, 12, 34, 56, 789_012)).unwrap();
+        // Sanity-check the round-trip through format_micros_as_mysql_datetime.
+        let s = format_micros_as_mysql_datetime(micros);
+        let reparsed = parse_naive_iso8601_us(&s).unwrap();
+        assert_eq!(reparsed, micros);
+
+        // Bytes string fallback (e.g. when the protocol returns text).
+        let micros =
+            mysql_to_timestamp_us(&MV::Bytes(b"2024-06-15 12:34:56.789012".to_vec())).unwrap();
+        assert!(micros > 0);
+    }
+
+    #[test]
+    fn mysql_to_timestamp_us_rejects_other_variants_and_bad_strings() {
+        assert!(mysql_to_timestamp_us(&MV::Int(0)).is_err());
+        assert!(mysql_to_timestamp_us(&MV::NULL).is_err());
+        // Non-parseable string.
+        assert!(mysql_to_timestamp_us(&MV::Bytes(b"not a date".to_vec())).is_err());
+    }
+
+    #[test]
+    fn mysql_value_is_null_recognizes_only_null_variant() {
+        assert!(mysql_value_is_null(&MV::NULL));
+        assert!(!mysql_value_is_null(&MV::Int(0)));
+        assert!(!mysql_value_is_null(&MV::Bytes(vec![])));
+    }
+
+    #[test]
+    fn is_metadata_col_classifies_only_append_metadata() {
+        // is_metadata_col is the *append* metadata predicate — only
+        // _loaded_at + _batch_id, NOT the SCD2 columns. The SCD2 metadata
+        // predicate lives in `crate::strategy::scd2::is_scd2_metadata`.
+        assert!(is_metadata_col("_loaded_at"));
+        assert!(is_metadata_col("_batch_id"));
+        // SCD2 columns are user-facing from this predicate's POV.
+        assert!(!is_metadata_col("valid_from"));
+        assert!(!is_metadata_col("is_current"));
+        // True user columns are also non-metadata.
+        assert!(!is_metadata_col("customer_id"));
+        assert!(!is_metadata_col("email"));
+    }
+
+    #[test]
+    fn mysql_substitute_replaces_pg_idioms_in_plan_sql() {
+        // The function rewrites Postgres-flavored idioms emitted by the
+        // shared `plan_*` helpers into MySQL-native syntax:
+        //   - `now()`     → `NOW(6)` (microsecond resolution)
+        //   - `$1::uuid`  → quoted UUID literal for the current batch
+        let batch = uuid::Uuid::new_v4();
+        let sql = "INSERT INTO t (id, _loaded_at, _batch_id) \
+                   VALUES (1, now(), $1::uuid)";
+        let out = mysql_substitute(sql, &batch);
+
+        assert!(
+            !out.contains("now()") && out.contains("NOW(6)"),
+            "now() → NOW(6) rewrite missing, got: {out}"
+        );
+        assert!(
+            !out.contains("$1::uuid") && out.contains(&format!("'{batch}'")),
+            "$1::uuid → '<batch>' rewrite missing, got: {out}"
+        );
+    }
+
+    #[test]
+    fn mysql_substitute_rewrites_truncate_to_delete() {
+        // mysql_substitute also rewrites TRUNCATE TABLE x → DELETE FROM x
+        // so the empty-then-load pair stays in one transaction (TRUNCATE
+        // auto-commits in MySQL).
+        let batch = uuid::Uuid::new_v4();
+        let out = mysql_substitute("TRUNCATE TABLE warehouse.event_log", &batch);
+        let lower = out.to_lowercase();
+        assert!(
+            lower.contains("delete from"),
+            "TRUNCATE → DELETE FROM rewrite missing, got: {out}"
+        );
+        assert!(
+            !lower.contains("truncate table"),
+            "original TRUNCATE TABLE must be removed, got: {out}"
+        );
+    }
+
+    #[test]
+    fn mysql_scd2_close_missing_sql_names_target_and_filters_current() {
+        let sql = mysql_scd2_close_missing_sql(
+            "wh",
+            "customer_dim",
+            &["customer_id".to_string()],
+            "SELECT customer_id FROM _ematix_stage_xyz",
+        );
+        let lower = sql.to_lowercase();
+        assert!(
+            lower.contains("`wh`.`customer_dim`"),
+            "SCD2 close-missing must target wh.customer_dim, got: {sql}"
+        );
+        assert!(
+            lower.contains("is_current"),
+            "SCD2 close-missing must filter on is_current, got: {sql}"
+        );
+        assert!(
+            lower.contains("_ematix_stage_xyz"),
+            "SCD2 close-missing must reference the staging-table query, got: {sql}"
+        );
+    }
+
+    #[test]
+    fn mysql_scd2_ttl_expire_sql_uses_ttl_seconds() {
+        let sql = mysql_scd2_ttl_expire_sql("wh", "customer_dim", 86400);
+        let lower = sql.to_lowercase();
+        assert!(lower.contains("86400"), "TTL seconds must appear: {sql}");
+        assert!(
+            lower.contains("is_current"),
+            "TTL expire must filter on is_current: {sql}"
+        );
+    }
 }

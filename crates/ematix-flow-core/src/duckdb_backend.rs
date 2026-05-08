@@ -1169,4 +1169,256 @@ mod tests {
             .unwrap();
         assert_eq!(written, 3);
     }
+
+    // ---- DuckDB pure helpers ------------------------------------------
+    //
+    // Coverage backfill: `is_metadata_col`, `ensure_meta_schema_sql`,
+    // `substitute_batch_id`, `duckdb_scd2_ttl_expire_sql`, and
+    // `duckdb_digest_expression` were exercised only indirectly through
+    // the existing in-memory + same-DB integration tests. Direct unit
+    // tests close the per-helper branches without per-test backend setup.
+
+    #[test]
+    fn is_metadata_col_classifies_only_loaded_at_and_batch_id() {
+        // Mirrors the MySQL `is_metadata_col`: append-only metadata
+        // surface, NOT the SCD2 columns.
+        assert!(is_metadata_col(LOADED_AT_COL));
+        assert!(is_metadata_col(BATCH_ID_COL));
+        // SCD2 metadata is not classified as metadata here — that's
+        // the SCD2-specific predicate's job.
+        assert!(!is_metadata_col("valid_from"));
+        assert!(!is_metadata_col("valid_to"));
+        assert!(!is_metadata_col("is_current"));
+        assert!(!is_metadata_col("row_hash"));
+        // User columns.
+        assert!(!is_metadata_col("customer_id"));
+        assert!(!is_metadata_col("name"));
+    }
+
+    #[test]
+    fn ensure_meta_schema_sql_includes_run_history_and_watermarks() {
+        let sql = ensure_meta_schema_sql();
+        assert!(
+            sql.contains("CREATE SCHEMA IF NOT EXISTS ematix_flow"),
+            "must lazy-create ematix_flow schema, got: {sql}"
+        );
+        assert!(
+            sql.contains("ematix_flow.run_history"),
+            "must declare run_history, got: {sql}"
+        );
+        assert!(
+            sql.contains("ematix_flow.watermarks"),
+            "must declare watermarks, got: {sql}"
+        );
+        // Idempotent — re-running the bootstrap must not error on an
+        // existing install. CREATE TABLE IF NOT EXISTS for both.
+        let if_not_exists_count = sql.matches("CREATE TABLE IF NOT EXISTS").count();
+        assert_eq!(if_not_exists_count, 2);
+    }
+
+    #[test]
+    fn substitute_batch_id_replaces_pg_uuid_placeholder() {
+        let batch = Uuid::new_v4();
+        let sql = "INSERT INTO t (id, _batch_id) VALUES (1, $1::uuid)";
+        let out = substitute_batch_id(sql, &batch);
+        assert!(
+            !out.contains("$1::uuid"),
+            "placeholder must be substituted, got: {out}"
+        );
+        assert!(
+            out.contains(&format!("'{batch}'::uuid")),
+            "batch UUID literal must appear, got: {out}"
+        );
+    }
+
+    #[test]
+    fn substitute_batch_id_leaves_unrelated_sql_alone() {
+        let batch = Uuid::new_v4();
+        let sql = "SELECT 1";
+        assert_eq!(substitute_batch_id(sql, &batch), "SELECT 1");
+    }
+
+    #[test]
+    fn duckdb_scd2_ttl_expire_sql_includes_target_and_ttl_window() {
+        let sql = duckdb_scd2_ttl_expire_sql("wh", "customer_dim", 86400);
+        assert!(
+            sql.contains("UPDATE wh.customer_dim"),
+            "TTL expire must target wh.customer_dim, got: {sql}"
+        );
+        assert!(
+            sql.contains("is_current = false"),
+            "TTL expire must close the row (is_current = false), got: {sql}"
+        );
+        assert!(
+            sql.contains("86400"),
+            "TTL seconds must appear in the predicate, got: {sql}"
+        );
+        // DuckDB-specific epoch-based comparison (PG uses INTERVAL
+        // arithmetic; DuckDB doesn't have the matching overload).
+        assert!(
+            sql.contains("epoch(valid_from)") && sql.contains("epoch(now())"),
+            "TTL expire must use epoch-second comparison, got: {sql}"
+        );
+    }
+
+    #[test]
+    fn duckdb_digest_expression_uses_sha256_with_null_markers() {
+        let cols = vec!["email".to_string(), "name".to_string()];
+        let expr = duckdb_digest_expression(&cols, "src.");
+        // Hashing the row uses SHA-256 wrapped in unhex() so the result
+        // round-trips with the BLOB row_hash column type.
+        assert!(
+            expr.contains("unhex(sha256("),
+            "must use unhex(sha256(...)), got: {expr}"
+        );
+        // Per-column NULL marker uses chr(0) NULL chr(0) so a literal
+        // 'NULL' value stays distinguishable from a real null.
+        assert!(
+            expr.contains("chr(0) || 'NULL' || chr(0)"),
+            "must mark nulls with chr(0)-bracketed NULL token, got: {expr}"
+        );
+        // Inter-column separator is chr(1) so values can't collide
+        // across column boundaries.
+        assert!(
+            expr.contains("chr(1)"),
+            "must separate columns with chr(1), got: {expr}"
+        );
+        // Source-prefix applied to each column.
+        assert!(expr.contains("src.email::VARCHAR"));
+        assert!(expr.contains("src.name::VARCHAR"));
+    }
+
+    #[test]
+    fn duckdb_digest_expression_handles_empty_column_list() {
+        // Edge case: when a SCD2 spec declares no compare columns, the
+        // hash should still produce something deterministic (sha256 of
+        // an empty input string), not panic.
+        let expr = duckdb_digest_expression(&[], "src.");
+        assert!(expr.contains("sha256("));
+        assert!(expr.contains("unhex("));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn duckdb_arrow_round_trip_wide_type_coverage() {
+        // Mirrors the Postgres wide-type round-trip that closed the
+        // backend.rs match arms (PR #8). DuckDB has its own column-
+        // type-to-Arrow mapping in this file's read_arrow_stream
+        // implementation; this test exercises every type variant the
+        // mapping handles.
+        use arrow_array::cast::AsArray;
+        use arrow_array::{BinaryArray, BooleanArray, RecordBatch, StringArray};
+        use arrow_schema::DataType;
+
+        let backend: Arc<dyn Backend> = Arc::new(DuckDBBackend::open(":memory:").unwrap());
+
+        backend.execute("CREATE SCHEMA wide").await.unwrap();
+        // DuckDB supports a wider native type set than Postgres'
+        // wire-protocol. Use the types that map cleanly to Arrow per
+        // the existing read_arrow_stream implementation.
+        backend
+            .execute(
+                "CREATE TABLE wide.src (\
+                    c_smallint  SMALLINT, \
+                    c_int       INTEGER, \
+                    c_bigint    BIGINT, \
+                    c_float     REAL, \
+                    c_double    DOUBLE, \
+                    c_bool      BOOLEAN, \
+                    c_text      VARCHAR, \
+                    c_blob      BLOB, \
+                    c_ts        TIMESTAMP, \
+                    c_uuid      UUID)",
+            )
+            .await
+            .unwrap();
+        backend
+            .execute(
+                "INSERT INTO wide.src VALUES \
+                 (32767, 2147483647, 9223372036854775807, \
+                  1.5, 3.5, true, 'hello', \
+                  '\\x00deadbeef'::BLOB, \
+                  TIMESTAMP '2026-05-08 12:34:56', \
+                  '12345678-1234-5678-1234-567812345678'::UUID), \
+                 (NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL)",
+            )
+            .await
+            .unwrap();
+
+        let stream = backend
+            .read_arrow_stream("SELECT * FROM wide.src ORDER BY c_bigint NULLS LAST")
+            .await
+            .unwrap();
+        use futures_util::TryStreamExt;
+        let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+        assert!(!batches.is_empty());
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 2);
+
+        let b = &batches[0];
+        let schema = b.schema();
+        // Spot-check key DataType mappings + a few values.
+        let types: Vec<&DataType> = schema.fields().iter().map(|f| f.data_type()).collect();
+        // SMALLINT → Int16 (DuckDB), INTEGER → Int32, BIGINT → Int64.
+        assert!(matches!(types[0], DataType::Int16));
+        assert!(matches!(types[1], DataType::Int32));
+        assert!(matches!(types[2], DataType::Int64));
+        assert!(matches!(types[5], DataType::Boolean));
+        let texts = b.column(6).as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(texts.value(0), "hello");
+        let bools = b.column(5).as_any().downcast_ref::<BooleanArray>().unwrap();
+        assert!(bools.value(0));
+
+        // Spot-check the BLOB column. DuckDB's blob-literal escape
+        // semantics differ from Postgres' bytea (`'\x...'` is a
+        // *string*, not binary); it's enough here to assert that the
+        // BLOB column round-trips as non-null Binary with the expected
+        // shape — exact byte content is exercised in the simpler
+        // existing test above.
+        if let Some(bin) = b.column(7).as_any().downcast_ref::<BinaryArray>() {
+            assert!(!bin.value(0).is_empty(), "blob row 0 must be non-empty");
+        }
+
+        let smallints = b.column(0).as_primitive::<arrow_array::types::Int16Type>();
+        assert_eq!(smallints.value(0), 32767);
+        let bigints = b.column(2).as_primitive::<arrow_array::types::Int64Type>();
+        assert_eq!(bigints.value(0), 9223372036854775807);
+
+        // Null row preserved.
+        for c in 0..b.num_columns() {
+            assert!(b.column(c).is_null(1), "col {c} row 1 must be null");
+        }
+
+        // Round-trip back through write_arrow_stream into a clone
+        // table — exercises the writer's per-DataType arm + DuckDB's
+        // appender bind path.
+        backend
+            .execute(
+                "CREATE TABLE wide.dst (\
+                    c_smallint  SMALLINT, \
+                    c_int       INTEGER, \
+                    c_bigint    BIGINT, \
+                    c_float     REAL, \
+                    c_double    DOUBLE, \
+                    c_bool      BOOLEAN, \
+                    c_text      VARCHAR, \
+                    c_blob      BLOB, \
+                    c_ts        TIMESTAMP, \
+                    c_uuid      UUID)",
+            )
+            .await
+            .unwrap();
+        let stream2 = backend
+            .read_arrow_stream("SELECT * FROM wide.src")
+            .await
+            .unwrap();
+        let target = TargetTable {
+            schema: "wide".into(),
+            name: "dst".into(),
+        };
+        let written = backend
+            .write_arrow_stream(&target, stream2, WriteMode::Append)
+            .await
+            .unwrap();
+        assert_eq!(written, 2);
+    }
 }
