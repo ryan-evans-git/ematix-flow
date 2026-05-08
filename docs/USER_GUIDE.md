@@ -1125,8 +1125,10 @@ counters under `pipeline=<name>`:
 | Target | Status | Notes |
 |---|---|---|
 | **Postgres** | Shipped (Δ PR 3 + 4 + 5 + 5.5) | Full per-event apply with idempotency gate, schema-evolution detection, and streaming-runtime dispatch. |
-| **Delta Lake** | Shipped (Δ.X1 PR 1 + Δ.X1.2) | Single-MERGE-per-batch via `DeltaOps::merge`; within-batch dedupe by newest ts; auto-schema-evolution under Skip policy. Streaming-runtime dispatch via `flow consume` works end-to-end — declare the PK on `[target.table].primary_key = [...]` (Delta tables don't carry PK constraints natively). |
-| **DuckDB / SQLite / MySQL** | Catalogued (Δ.X2) | Same per-event-statement shape as Postgres; differs only in UPSERT keyword + JSON-extract primitive. ~1–2 days each. |
+| **Delta Lake** | Shipped (Δ.X1 PR 1 + Δ.X1.2 + Δ.X1.1) | Single-MERGE-per-batch via `DeltaOps::merge`; within-batch dedupe by newest ts; auto-schema-evolution under Skip policy. Δ.X1.1 added an opt-in `_cdc_last_ts BIGINT` column for between-batch idempotency on top of the natural in-batch dedupe. Streaming-runtime dispatch via `flow consume` works end-to-end — declare the PK on `[target.table].primary_key = [...]` (Delta tables don't carry PK constraints natively). |
+| **DuckDB** | Shipped (Δ.X2) | Same per-event shape as Postgres; type coercion via `from_json(?, '<struct-spec>')`. In-memory + file-backed both work. |
+| **SQLite** | Shipped (Δ.X2) | Same per-event shape as Postgres; type coercion via `json_extract(?1, '$.col')` per column. `main` schema only (SQLite has no first-class schemas; multi-DB ATTACH is a future enhancement). |
+| **MySQL** | Shipped (Δ.X2) | Same per-event shape as Postgres; uses `INSERT ... ON DUPLICATE KEY UPDATE` and `IF(JSON_TYPE(...) = 'NULL', NULL, JSON_UNQUOTE(JSON_EXTRACT(...)))` to keep JSON null clean across all column types. No `RETURNING` — the idempotency gate reads `affected_rows()` (1=insert, 2=advance, 0=reject). |
 | **Object stores** | Deferred (Δ.X3) | Parquet / CSV / JSON / ORC are immutable — recommend Delta-on-S3 (Δ.X1) instead. |
 
 Default `Backend::run_cdc` impl errors with a clear "not
