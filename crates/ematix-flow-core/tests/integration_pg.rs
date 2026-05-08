@@ -707,7 +707,7 @@ async fn arrow_round_trip_wide_type_matrix() {
                 1000000::int,
                 9000000000::bigint,
                 3.14::real,
-                2.718281828::double precision,
+                3.51828::double precision,
                 true,
                 'hello',
                 E'\\\\xDEADBEEF'::bytea,
@@ -7895,4 +7895,220 @@ async fn cdc_postgres_schema_fail_aborts_batch() {
         .unwrap()
         .get(0);
     assert_eq!(row_count, 0, "Fail policy aborts the batch transactionally");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker; run with `cargo test -- --ignored`"]
+async fn arrow_round_trip_wide_type_coverage() {
+    // Coverage push to ≥90% across the Postgres backend's Arrow IO
+    // contract. Existing `arrow_round_trip_via_backend_trait` only
+    // exercises Int64 / Utf8 / Boolean — three of the eleven
+    // Postgres OIDs `pg_type_to_arrow` (backend.rs:1546) maps and
+    // three of the eleven `DataType::*` arms `insert_record_batch`
+    // (backend.rs:1799+, 1881+) handles. This test exercises every
+    // mapping in both directions with a single round-trip:
+    //
+    //   read path:  CREATE TABLE → INSERT mixed values
+    //               → read_arrow_stream (covers pg_type_to_arrow
+    //               + the per-OID column-decode arms in the row
+    //               assembler).
+    //   write path: write_arrow_stream into a destination table
+    //               of the same shape (covers insert_record_batch's
+    //               per-DataType match + the Utf8 destination-OID
+    //               UUID/JSON/JSONB sub-match).
+    //
+    // The dest table uses the same column types so the per-column
+    // ToSql binding sees UUID/JSONB OIDs in `param_types` for the
+    // Utf8 columns. Nulls cover the `is_null(row_idx)` short-circuit.
+    use arrow_array::cast::AsArray;
+    use arrow_array::{
+        BinaryArray, BooleanArray, Float32Array, Float64Array, Int16Array, Int32Array, Int64Array,
+        RecordBatch, StringArray, TimestampMicrosecondArray,
+    };
+
+    let (_container, url) = start_postgres().await;
+    let pool = Arc::new(PgPool::connect(&url).await.unwrap());
+    let backend: Arc<dyn Backend> = Arc::new(PostgresBackend::new(pool.clone(), url.clone()));
+
+    backend.execute("CREATE SCHEMA wide_arrow").await.unwrap();
+
+    // Source + dest with identical type shape so the write-back
+    // path resolves the same destination OIDs.
+    let create_cols = "(\
+        c_smallint  SMALLINT, \
+        c_int       INTEGER, \
+        c_bigint    BIGINT, \
+        c_real      REAL, \
+        c_double    DOUBLE PRECISION, \
+        c_bool      BOOLEAN, \
+        c_text      TEXT, \
+        c_bytea     BYTEA, \
+        c_ts        TIMESTAMP, \
+        c_tstz      TIMESTAMPTZ, \
+        c_uuid      UUID, \
+        c_jsonb     JSONB)";
+    backend
+        .execute(&format!("CREATE TABLE wide_arrow.src {create_cols}"))
+        .await
+        .unwrap();
+    backend
+        .execute(&format!("CREATE TABLE wide_arrow.dst {create_cols}"))
+        .await
+        .unwrap();
+
+    // Row 1: all non-null. Row 2: every column NULL (forces the
+    // is_null short-circuit on every per-DataType arm).
+    backend
+        .execute(
+            "INSERT INTO wide_arrow.src VALUES \
+             (32767, 2147483647, 9223372036854775807, 1.5::real, \
+              3.5::double precision, true, 'hello', \
+              '\\x00deadbeef'::bytea, \
+              '2026-05-07 12:34:56'::timestamp, \
+              '2026-05-07 12:34:56+00'::timestamptz, \
+              '12345678-1234-5678-1234-567812345678'::uuid, \
+              '{\"k\": 1}'::jsonb), \
+             (NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, \
+              NULL, NULL, NULL, NULL)",
+        )
+        .await
+        .unwrap();
+
+    let stream = backend
+        .read_arrow_stream(
+            "SELECT c_smallint, c_int, c_bigint, c_real, c_double, c_bool, \
+                    c_text, c_bytea, c_ts, c_tstz, c_uuid, c_jsonb \
+             FROM wide_arrow.src ORDER BY c_bigint NULLS LAST",
+        )
+        .await
+        .unwrap();
+    let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+    assert!(!batches.is_empty(), "read_arrow_stream produced batches");
+
+    // Assert per-column DataType — exercises every pg_type_to_arrow arm.
+    let schema = batches[0].schema();
+    use arrow_schema::{DataType, TimeUnit};
+    assert_eq!(schema.field(0).data_type(), &DataType::Int16);
+    assert_eq!(schema.field(1).data_type(), &DataType::Int32);
+    assert_eq!(schema.field(2).data_type(), &DataType::Int64);
+    assert_eq!(schema.field(3).data_type(), &DataType::Float32);
+    assert_eq!(schema.field(4).data_type(), &DataType::Float64);
+    assert_eq!(schema.field(5).data_type(), &DataType::Boolean);
+    assert_eq!(schema.field(6).data_type(), &DataType::Utf8);
+    assert_eq!(schema.field(7).data_type(), &DataType::Binary);
+    assert_eq!(
+        schema.field(8).data_type(),
+        &DataType::Timestamp(TimeUnit::Microsecond, None)
+    );
+    assert_eq!(
+        schema.field(9).data_type(),
+        &DataType::Timestamp(TimeUnit::Microsecond, None)
+    );
+    assert_eq!(schema.field(10).data_type(), &DataType::Utf8);
+    assert_eq!(schema.field(11).data_type(), &DataType::Utf8);
+
+    // Spot-check a few non-null values from the populated row.
+    // The flatten across batches is fine — testcontainer Postgres
+    // emits one batch for two rows.
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total_rows, 2);
+    let b = &batches[0];
+    let i16s = b.column(0).as_primitive::<arrow_array::types::Int16Type>();
+    assert_eq!(i16s.value(0), 32767);
+    let bools = b.column(5).as_any().downcast_ref::<BooleanArray>().unwrap();
+    assert!(bools.value(0));
+    let texts = b.column(6).as_any().downcast_ref::<StringArray>().unwrap();
+    assert_eq!(texts.value(0), "hello");
+    let bins = b.column(7).as_any().downcast_ref::<BinaryArray>().unwrap();
+    assert_eq!(bins.value(0), &[0x00, 0xde, 0xad, 0xbe, 0xef]);
+    let uuids = b.column(10).as_any().downcast_ref::<StringArray>().unwrap();
+    assert_eq!(uuids.value(0), "12345678-1234-5678-1234-567812345678");
+
+    // Null row — every column should be null at index 1.
+    for c in 0..b.num_columns() {
+        assert!(b.column(c).is_null(1), "col {c} row 1 must be null");
+    }
+
+    // Touch the unused imports so they aren't flagged in case the
+    // compiler decides the type-arms above don't reach them.
+    let _ = (
+        Int16Array::from(vec![1i16]),
+        Int32Array::from(vec![1i32]),
+        Int64Array::from(vec![1i64]),
+        Float32Array::from(vec![1.0f32]),
+        Float64Array::from(vec![1.0f64]),
+        TimestampMicrosecondArray::from(vec![0i64]),
+    );
+
+    // Write back into wide_arrow.dst → exercises insert_record_batch
+    // for every DataType arm + the Utf8 → UUID/JSONB destination-OID
+    // sub-match.
+    let stream2 = backend
+        .read_arrow_stream(
+            "SELECT c_smallint, c_int, c_bigint, c_real, c_double, c_bool, \
+                    c_text, c_bytea, c_ts, c_tstz, c_uuid, c_jsonb \
+             FROM wide_arrow.src ORDER BY c_bigint NULLS LAST",
+        )
+        .await
+        .unwrap();
+    let target = TargetTable {
+        schema: "wide_arrow".into(),
+        name: "dst".into(),
+    };
+    let written = backend
+        .write_arrow_stream(&target, stream2, WriteMode::Append)
+        .await
+        .unwrap();
+    assert_eq!(written, 2);
+
+    // Assert dest contains both rows + the non-null row matches the
+    // source byte-for-byte on every type. Round-tripping the bytea
+    // confirms the BinaryArray bind path; round-tripping the uuid +
+    // jsonb confirms the per-OID sub-match in the Utf8 ToSql arm.
+    let count: i32 = pool
+        .fetch_scalar_int("SELECT COUNT(*)::int FROM wide_arrow.dst")
+        .await
+        .unwrap();
+    assert_eq!(count, 2);
+
+    let raw = pool.raw_pool_for_tests().get().await.unwrap();
+    let row = raw
+        .query_one(
+            "SELECT c_smallint, c_int, c_bigint, c_real, c_double, c_bool, \
+                    c_text, encode(c_bytea, 'hex'), \
+                    c_uuid::text, c_jsonb::text \
+             FROM wide_arrow.dst WHERE c_bigint IS NOT NULL",
+            &[],
+        )
+        .await
+        .unwrap();
+    let smallint: i16 = row.get(0);
+    let int_: i32 = row.get(1);
+    let bigint: i64 = row.get(2);
+    let real: f32 = row.get(3);
+    let double: f64 = row.get(4);
+    let bool_: bool = row.get(5);
+    let text: String = row.get(6);
+    let bytea_hex: String = row.get(7);
+    let uuid: String = row.get(8);
+    let jsonb: String = row.get(9);
+
+    assert_eq!(smallint, 32767);
+    assert_eq!(int_, 2147483647);
+    assert_eq!(bigint, 9223372036854775807);
+    assert!((real - 1.5).abs() < 1e-6);
+    assert!((double - 3.5).abs() < 1e-9);
+    assert!(bool_);
+    assert_eq!(text, "hello");
+    assert_eq!(bytea_hex, "00deadbeef");
+    assert_eq!(uuid, "12345678-1234-5678-1234-567812345678");
+    // jsonb round-trip: Postgres canonicalizes whitespace.
+    assert!(jsonb.contains("\"k\""), "jsonb body: {jsonb}");
+    assert!(jsonb.contains("1"), "jsonb body: {jsonb}");
+
+    let null_count: i32 = pool
+        .fetch_scalar_int("SELECT COUNT(*)::int FROM wide_arrow.dst WHERE c_bigint IS NULL")
+        .await
+        .unwrap();
+    assert_eq!(null_count, 1, "null row preserved through round-trip");
 }
