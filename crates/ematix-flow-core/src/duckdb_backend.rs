@@ -42,10 +42,17 @@ const META_SCHEMA: &str = "ematix_flow";
 const RUN_HISTORY_TABLE: &str = "run_history";
 const WATERMARKS_TABLE: &str = "watermarks";
 
-/// SQL that lazy-creates the meta schema + `run_history` + `watermarks`
-/// on DuckDB. Mirrors the PG schema (see `pg::ensure_meta_schema`) but
-/// flattened since DuckDB doesn't need the PG-style `ALTER TABLE …
-/// ADD COLUMN IF NOT EXISTS` upgrade pattern (no installed-base yet).
+/// Δ.X2: per-PK admission gate, mirror of the PG
+/// `cdc_idempotency` table. Same `(pipeline, pk_json)` →
+/// `last_seen_ts_ms` schema; the SQL the run_cdc executor emits
+/// is identical bar dialect quirks.
+const CDC_IDEMPOTENCY_TABLE: &str = "cdc_idempotency";
+
+/// SQL that lazy-creates the meta schema + `run_history` +
+/// `watermarks` + `cdc_idempotency` on DuckDB. Mirrors the PG
+/// schema (see `pg::ensure_meta_schema`) but flattened since
+/// DuckDB doesn't need the PG-style `ALTER TABLE … ADD COLUMN IF
+/// NOT EXISTS` upgrade pattern (no installed-base yet).
 fn ensure_meta_schema_sql() -> String {
     format!(
         "CREATE SCHEMA IF NOT EXISTS {META_SCHEMA}; \
@@ -72,8 +79,44 @@ fn ensure_meta_schema_sql() -> String {
             column_name VARCHAR NOT NULL, \
             last_value VARCHAR NOT NULL, \
             updated_at TIMESTAMPTZ NOT NULL DEFAULT now()\
+         ); \
+         CREATE TABLE IF NOT EXISTS {META_SCHEMA}.{CDC_IDEMPOTENCY_TABLE} (\
+            pipeline_name VARCHAR NOT NULL, \
+            pk_json VARCHAR NOT NULL, \
+            last_seen_ts_ms BIGINT NOT NULL, \
+            updated_at TIMESTAMPTZ NOT NULL, \
+            PRIMARY KEY (pipeline_name, pk_json)\
          )"
     )
+}
+
+/// Δ.X2: DuckDB SQL type for the `from_json` structure spec
+/// (DuckDB's analog to Postgres's `jsonb_populate_record`). The
+/// per-target run_cdc executor builds a struct-spec string from
+/// the target's TableSpec and embeds it once; per-event JSON
+/// payloads then feed `from_json('{...}', '<struct-spec>')`.
+fn column_type_to_duckdb_sql(ct: &crate::types::ColumnType) -> String {
+    use crate::types::ColumnType as CT;
+    match ct {
+        CT::SmallInt => "SMALLINT".into(),
+        CT::Integer => "INTEGER".into(),
+        CT::BigInt => "BIGINT".into(),
+        CT::Float => "REAL".into(),
+        CT::Double => "DOUBLE".into(),
+        CT::Boolean => "BOOLEAN".into(),
+        // DuckDB has both VARCHAR and a dedicated JSON type. Carry
+        // text-shaped columns as VARCHAR — the same shape Delta's
+        // executor uses, and what `from_json` produces for `"VARCHAR"`
+        // structure entries.
+        CT::Text | CT::Json | CT::Jsonb => "VARCHAR".into(),
+        CT::String { length } => format!("VARCHAR({length})"),
+        CT::Uuid => "UUID".into(),
+        CT::Bytes => "BLOB".into(),
+        CT::Date => "DATE".into(),
+        CT::Timestamp => "TIMESTAMP".into(),
+        CT::TimestampTz => "TIMESTAMPTZ".into(),
+        CT::Numeric { precision, scale } => format!("DECIMAL({precision},{scale})"),
+    }
 }
 
 /// DuckDB-native merge SQL builder. The PG `plan_merge_upsert` uses
@@ -578,6 +621,353 @@ impl DuckDBBackend {
         })
         .await
     }
+
+    /// Δ.X2: per-event apply loop for DuckDB-target CDC.
+    ///
+    /// Same architectural shape as `pg::PgPool::run_cdc`:
+    ///   1. Lazy-create the meta schema (idempotency table lives
+    ///      under `ematix_flow.cdc_idempotency`).
+    ///   2. Schema-evolution `Fail` policy: pre-flight `after`
+    ///      payload keys against the spec; abort the whole batch
+    ///      on first unknown.
+    ///   3. Per-event in one transaction: hit the idempotency
+    ///      gate, then dispatch on `event.op` to UPSERT / DELETE
+    ///      / soft-delete via prepared statements that re-bind
+    ///      JSON parameters per call.
+    ///
+    /// Differs from PG in that DuckDB has no `jsonb_populate_record`.
+    /// We use DuckDB's `from_json('<json>', '<struct-spec>')` —
+    /// the struct-spec string is built once per batch from
+    /// `target_spec.columns` (`column_type_to_duckdb_sql`).
+    /// Per-event, the JSON payload is bound as a parameter.
+    pub async fn run_cdc_inner(
+        &self,
+        target_spec: &crate::types::TableSpec,
+        events: Vec<crate::cdc::CdcEvent>,
+        cdc_config: &crate::cdc::CdcConfig,
+        pipeline_name: &str,
+        skipped: i64,
+    ) -> Result<crate::backend::CdcRunResult, BackendError> {
+        use crate::cdc::{CdcOp, DeleteMode, SchemaEvolutionPolicy};
+
+        self.ensure_meta_schema().await?;
+
+        // Single-PK only for the first cut (matches PG PR 3 scope).
+        let pk_col = target_spec
+            .columns
+            .iter()
+            .find(|c| c.primary_key)
+            .ok_or_else(|| {
+                BackendError::Other(format!(
+                    "DuckDB run_cdc: target {}.{} has no primary-key column \
+                     (Δ.X2 v1 supports single-PK targets; declare PK on \
+                     @ematix.table or [target.table].primary_key)",
+                    target_spec.schema, target_spec.name
+                ))
+            })?;
+        let pk_name = pk_col.name.clone();
+
+        // Schema-evolution Fail policy: pre-flight check against
+        // the spec's columns. Skip relies on DuckDB's auto-add
+        // behavior on INSERT (matches PG PR 5's policy semantics).
+        if matches!(cdc_config.schema_evolution, SchemaEvolutionPolicy::Fail) {
+            let valid_cols: std::collections::HashSet<&str> = target_spec
+                .columns
+                .iter()
+                .map(|c| c.name.as_str())
+                .collect();
+            for event in &events {
+                if let Some(after) = event.after.as_ref() {
+                    for k in after.keys() {
+                        if !valid_cols.contains(k.as_str()) {
+                            return Err(BackendError::Other(format!(
+                                "schema evolution: unknown column '{k}' in `after` \
+                                 payload for pipeline '{pipeline_name}' on DuckDB target \
+                                 {schema}.{name} (SchemaEvolutionPolicy::Fail) — \
+                                 add the column to the target table or switch to Skip",
+                                schema = target_spec.schema,
+                                name = target_spec.name,
+                            )));
+                        }
+                    }
+                }
+            }
+        }
+
+        // Build the from_json struct-spec once. DuckDB's
+        // `from_json(text, '{"col": "TYPE", ...}')` parses + types
+        // every column to its target type, identically to how
+        // PG's `jsonb_populate_record(NULL::table, $1::jsonb)`
+        // round-trips through the table type.
+        let struct_spec = struct_spec_from_columns(target_spec);
+        let qualified = format!(
+            "\"{}\".\"{}\"",
+            target_spec.schema.replace('"', "\"\""),
+            target_spec.name.replace('"', "\"\""),
+        );
+        let user_cols: Vec<String> = target_spec.columns.iter().map(|c| c.name.clone()).collect();
+        let non_pk_cols: Vec<&str> = target_spec
+            .columns
+            .iter()
+            .filter(|c| !c.primary_key)
+            .map(|c| c.name.as_str())
+            .collect();
+
+        // Pre-build SQL templates. Each is parameterised on a
+        // single `?` (the JSON payload string); per-event we
+        // re-bind via the prepared statement.
+        // Alias the from_json struct then `.*` it through a
+        // subquery: DuckDB's parser doesn't accept
+        // `(from_json(...)).*` directly, but does accept
+        // `SELECT s.* FROM (SELECT from_json(...) AS s)`.
+        let select_struct = format!("SELECT s.* FROM (SELECT from_json(?, '{struct_spec}') AS s)");
+        let upsert_sql = if non_pk_cols.is_empty() {
+            // PK-only target: nothing to update on conflict.
+            format!(
+                "INSERT INTO {qualified} ({cols}) {select_struct} \
+                 ON CONFLICT (\"{pk}\") DO NOTHING",
+                cols = user_cols
+                    .iter()
+                    .map(|c| format!("\"{c}\""))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                pk = pk_name.replace('"', "\"\""),
+            )
+        } else {
+            let set_clause = non_pk_cols
+                .iter()
+                .map(|c| format!("\"{c}\" = EXCLUDED.\"{c}\""))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "INSERT INTO {qualified} ({cols}) {select_struct} \
+                 ON CONFLICT (\"{pk}\") DO UPDATE SET {set_clause}",
+                cols = user_cols
+                    .iter()
+                    .map(|c| format!("\"{c}\""))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                pk = pk_name.replace('"', "\"\""),
+            )
+        };
+
+        // DELETE — hard or soft per cdc_config.delete_mode. Pulls
+        // the PK out of the same `from_json` struct so the type
+        // coercion is identical to the upsert path.
+        let delete_sql = match &cdc_config.delete_mode {
+            DeleteMode::Hard => format!(
+                "DELETE FROM {qualified} WHERE \"{pk}\" = \
+                 (SELECT s.\"{pk}\" FROM (SELECT from_json(?, '{struct_spec}') AS s))",
+                pk = pk_name.replace('"', "\"\""),
+            ),
+            DeleteMode::Soft { column } => format!(
+                "UPDATE {qualified} SET \"{col}\" = current_timestamp \
+                 WHERE \"{pk}\" = \
+                 (SELECT s.\"{pk}\" FROM (SELECT from_json(?, '{struct_spec}') AS s))",
+                pk = pk_name.replace('"', "\"\""),
+                col = column.replace('"', "\"\""),
+            ),
+        };
+
+        // Idempotency gate. Same shape as PG: INSERT … ON
+        // CONFLICT DO UPDATE … WHERE existing.last_seen_ts_ms <
+        // EXCLUDED.last_seen_ts_ms RETURNING 1. Empty RETURNING
+        // = redelivery; the data write is skipped.
+        let gate_sql = format!(
+            "INSERT INTO {META_SCHEMA}.{CDC_IDEMPOTENCY_TABLE} \
+                 (pipeline_name, pk_json, last_seen_ts_ms, updated_at) \
+             VALUES (?, ?, ?, current_timestamp) \
+             ON CONFLICT (pipeline_name, pk_json) DO UPDATE \
+                 SET last_seen_ts_ms = EXCLUDED.last_seen_ts_ms, \
+                     updated_at = EXCLUDED.updated_at \
+                 WHERE {META_SCHEMA}.{CDC_IDEMPOTENCY_TABLE}.last_seen_ts_ms \
+                       < EXCLUDED.last_seen_ts_ms \
+             RETURNING 1"
+        );
+
+        // Move owned values into the blocking task.
+        let pipeline_name_owned = pipeline_name.to_string();
+        let pk_name_owned = pk_name;
+        let events_owned = events;
+        let is_soft_delete = matches!(cdc_config.delete_mode, DeleteMode::Soft { .. });
+
+        let outcome: Result<(i64, i64, i64, i64), BackendError> = self
+            .with_conn_blocking(move |c| {
+                c.execute_batch("BEGIN")
+                    .map_err(|e| BackendError::Query(e.to_string()))?;
+
+                let result: Result<(i64, i64, i64, i64), BackendError> = (|| {
+                    let mut creates = 0i64;
+                    let mut updates = 0i64;
+                    let mut deletes = 0i64;
+                    let mut idempotent_skipped = 0i64;
+
+                    // In-batch gate cache: multiple events for the
+                    // same PK in this batch only hit the gate once.
+                    let mut gate_cache: std::collections::HashMap<String, i64> =
+                        std::collections::HashMap::new();
+
+                    let mut upsert_stmt = c
+                        .prepare(&upsert_sql)
+                        .map_err(|e| BackendError::Query(e.to_string()))?;
+                    let mut delete_stmt = c
+                        .prepare(&delete_sql)
+                        .map_err(|e| BackendError::Query(e.to_string()))?;
+                    let mut gate_stmt = c
+                        .prepare(&gate_sql)
+                        .map_err(|e| BackendError::Query(e.to_string()))?;
+
+                    for event in &events_owned {
+                        // Build the JSON payload for the data write.
+                        // For c/r/u: serialize `after`.
+                        // For d: synthesize { pk: event.key }.
+                        let payload_json: String = match event.op {
+                            CdcOp::Delete => {
+                                let mut m = serde_json::Map::new();
+                                m.insert(pk_name_owned.clone(), event.key.clone());
+                                serde_json::to_string(&m).unwrap()
+                            }
+                            _ => match event.after.as_ref() {
+                                Some(map) => serde_json::to_string(map).unwrap(),
+                                None => continue,
+                            },
+                        };
+
+                        // Idempotency gate. ts_ms-less events bypass
+                        // (matches PG semantics — the user accepts
+                        // duplicate-suppression-off in that case).
+                        if let Some(ts_ms) = event.ts_ms {
+                            let pk_canon = serde_json::to_string(&event.key).unwrap();
+                            let cache_hit = gate_cache.get(&pk_canon).copied();
+                            let admit = match cache_hit {
+                                Some(cached_ts) => {
+                                    if ts_ms > cached_ts {
+                                        gate_cache.insert(pk_canon.clone(), ts_ms);
+                                        true
+                                    } else {
+                                        false
+                                    }
+                                }
+                                None => {
+                                    let mut rows = gate_stmt
+                                        .query(duckdb::params![
+                                            &pipeline_name_owned,
+                                            &pk_canon,
+                                            ts_ms,
+                                        ])
+                                        .map_err(|e| {
+                                            BackendError::Query(format!("duckdb cdc gate: {e}"))
+                                        })?;
+                                    let admitted = rows
+                                        .next()
+                                        .map_err(|e| {
+                                            BackendError::Query(format!(
+                                                "duckdb cdc gate read: {e}"
+                                            ))
+                                        })?
+                                        .is_some();
+                                    if admitted {
+                                        gate_cache.insert(pk_canon, ts_ms);
+                                    }
+                                    admitted
+                                }
+                            };
+                            if !admit {
+                                idempotent_skipped += 1;
+                                continue;
+                            }
+                        }
+
+                        match event.op {
+                            CdcOp::Create | CdcOp::Read => {
+                                let n = upsert_stmt
+                                    .execute(duckdb::params![&payload_json])
+                                    .map_err(|e| {
+                                        BackendError::Query(format!("duckdb cdc upsert: {e}"))
+                                    })?;
+                                creates += n as i64;
+                            }
+                            CdcOp::Update => {
+                                let n = upsert_stmt
+                                    .execute(duckdb::params![&payload_json])
+                                    .map_err(|e| {
+                                        BackendError::Query(format!(
+                                            "duckdb cdc update-as-upsert: {e}"
+                                        ))
+                                    })?;
+                                updates += n as i64;
+                            }
+                            CdcOp::Delete => {
+                                let n = delete_stmt
+                                    .execute(duckdb::params![&payload_json])
+                                    .map_err(|e| {
+                                        BackendError::Query(format!("duckdb cdc delete: {e}"))
+                                    })?;
+                                // Soft-delete is wired through an
+                                // UPDATE, so the affected rows
+                                // belong under `updates` — only
+                                // hard-delete increments `deletes`.
+                                if is_soft_delete {
+                                    updates += n as i64;
+                                } else {
+                                    deletes += n as i64;
+                                }
+                            }
+                        }
+                    }
+
+                    Ok((creates, updates, deletes, idempotent_skipped))
+                })();
+
+                match result {
+                    Ok(counts) => {
+                        c.execute_batch("COMMIT")
+                            .map_err(|e| BackendError::Query(e.to_string()))?;
+                        Ok(counts)
+                    }
+                    Err(e) => {
+                        let _ = c.execute_batch("ROLLBACK");
+                        Err(e)
+                    }
+                }
+            })
+            .await;
+
+        let (creates, updates, deletes, idempotent_skipped) = outcome?;
+        let run_id = Uuid::new_v4();
+        Ok(crate::backend::CdcRunResult {
+            run_id: run_id.to_string(),
+            creates,
+            updates,
+            deletes,
+            skipped,
+            idempotent_skipped,
+        })
+    }
+}
+
+/// Δ.X2: build the `from_json` structure-specifier for a target's
+/// columns. Output is the JSON-shaped `{"col": "TYPE", ...}` that
+/// DuckDB's `from_json` consumes; types come from
+/// `column_type_to_duckdb_sql`. Keeps the per-event SQL templates
+/// hot — the spec is built once per batch and embedded as a SQL
+/// literal, while only the JSON payload changes per event.
+fn struct_spec_from_columns(spec: &crate::types::TableSpec) -> String {
+    let mut buf = String::from("{");
+    let mut first = true;
+    for col in &spec.columns {
+        if !first {
+            buf.push_str(", ");
+        }
+        first = false;
+        buf.push_str(&format!(
+            "\"{}\": \"{}\"",
+            col.name.replace('"', "\\\""),
+            column_type_to_duckdb_sql(&col.ty)
+        ));
+    }
+    buf.push('}');
+    buf
 }
 
 #[async_trait]
@@ -1111,6 +1501,42 @@ impl Backend for DuckDBBackend {
             path: "same_db".into(),
         })
     }
+
+    /// Δ.X2: parse the incoming RecordBatch into CDC events, then
+    /// dispatch to `run_cdc_inner`. Same shape as the Postgres
+    /// trait-method wrapper — keeps the parse logic identical so a
+    /// soft-fail row (parse error) is reported in the `skipped`
+    /// counter rather than failing the whole batch.
+    async fn run_cdc(
+        &self,
+        spec: &crate::types::TableSpec,
+        batch: RecordBatch,
+        cdc_config: &crate::cdc::CdcConfig,
+        pipeline_name: &str,
+    ) -> Result<crate::backend::CdcRunResult, BackendError> {
+        use crate::cdc::ParsedRow;
+
+        let parsed = crate::cdc::events_from_batch(&batch, cdc_config)?;
+        let mut events = Vec::with_capacity(parsed.len());
+        let mut skipped: i64 = 0;
+        for row in parsed {
+            match row {
+                ParsedRow::Event(e) => events.push(e),
+                ParsedRow::Tombstone => skipped += 1,
+                ParsedRow::ParseError(e) => {
+                    tracing::warn!(
+                        target: "ematix_flow::cdc",
+                        error = %e,
+                        pipeline = pipeline_name,
+                        "DuckDB CDC envelope parse failed; row skipped",
+                    );
+                    skipped += 1;
+                }
+            }
+        }
+        self.run_cdc_inner(spec, events, cdc_config, pipeline_name, skipped)
+            .await
+    }
 }
 
 #[cfg(test)]
@@ -1210,10 +1636,16 @@ mod tests {
             sql.contains("ematix_flow.watermarks"),
             "must declare watermarks, got: {sql}"
         );
-        // Idempotent — re-running the bootstrap must not error on an
-        // existing install. CREATE TABLE IF NOT EXISTS for both.
+        // Δ.X2: cdc_idempotency is part of the same lazy bootstrap.
+        assert!(
+            sql.contains("ematix_flow.cdc_idempotency"),
+            "must declare cdc_idempotency, got: {sql}"
+        );
+        // Idempotent — re-running the bootstrap must not error on
+        // an existing install. CREATE TABLE IF NOT EXISTS for all
+        // three (run_history, watermarks, cdc_idempotency).
         let if_not_exists_count = sql.matches("CREATE TABLE IF NOT EXISTS").count();
-        assert_eq!(if_not_exists_count, 2);
+        assert_eq!(if_not_exists_count, 3);
     }
 
     #[test]
@@ -1420,5 +1852,400 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(written, 2);
+    }
+
+    // ------------------------------------------------------------
+    // Δ.X2: CDC executor for DuckDB targets. End-to-end coverage —
+    // c/u/d ops with idempotency gate + schema evolution + soft-
+    // delete. In-memory DuckDB so no testcontainer needed.
+    // ------------------------------------------------------------
+
+    fn duckdb_cdc_customers_spec() -> TableSpec {
+        use crate::types::{ColumnSpec, ColumnType};
+        TableSpec {
+            schema: "mirror".into(),
+            name: "customers".into(),
+            columns: vec![
+                ColumnSpec {
+                    name: "id".into(),
+                    ty: ColumnType::BigInt,
+                    nullable: false,
+                    primary_key: true,
+                },
+                ColumnSpec {
+                    name: "email".into(),
+                    ty: ColumnType::Text,
+                    nullable: true,
+                    primary_key: false,
+                },
+                ColumnSpec {
+                    name: "name".into(),
+                    ty: ColumnType::Text,
+                    nullable: true,
+                    primary_key: false,
+                },
+            ],
+            unique_constraints: vec![],
+            fingerprint: String::new(),
+        }
+    }
+
+    /// Helper: encode a slice of CDC envelope JSON rows as a
+    /// schema-inferred RecordBatch — the shape Kafka source's
+    /// JSON decoder produces. The CDC executor calls
+    /// `events_from_batch` on whatever shape arrives.
+    fn duckdb_cdc_record_batch_from_json(
+        rows: &[serde_json::Map<String, serde_json::Value>],
+    ) -> RecordBatch {
+        use std::io::Cursor;
+        let mut buf = Vec::new();
+        for row in rows {
+            buf.extend(serde_json::to_string(row).unwrap().bytes());
+            buf.push(b'\n');
+        }
+        let mut sniff = Cursor::new(&buf);
+        let (schema, _) =
+            arrow_json::reader::infer_json_schema_from_seekable(&mut sniff, None).expect("schema");
+        let cursor = Cursor::new(&buf);
+        let mut reader = arrow_json::ReaderBuilder::new(Arc::new(schema))
+            .build(cursor)
+            .expect("reader");
+        reader
+            .next()
+            .expect("at least one batch")
+            .expect("decode ok")
+    }
+
+    async fn create_duckdb_cdc_target(backend: &Arc<dyn Backend>) {
+        backend.execute("CREATE SCHEMA mirror").await.unwrap();
+        backend
+            .execute(
+                "CREATE TABLE mirror.customers (\
+                    id BIGINT PRIMARY KEY, \
+                    email VARCHAR, \
+                    name VARCHAR)",
+            )
+            .await
+            .unwrap();
+    }
+
+    /// Δ.X2: c / u / d each get a turn in their own batch so the
+    /// per-op counters are observable independently.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn duckdb_cdc_inserts_updates_deletes_across_batches() {
+        use crate::cdc::{CdcConfig, EnvelopeKind};
+        use serde_json::json;
+
+        let backend: Arc<dyn Backend> = Arc::new(DuckDBBackend::open(":memory:").unwrap());
+        create_duckdb_cdc_target(&backend).await;
+
+        let mut cdc = CdcConfig::for_envelope(EnvelopeKind::Debezium);
+        cdc.key_field = "after.id".into();
+        let spec = duckdb_cdc_customers_spec();
+
+        // Batch 1: two INSERTs.
+        let r1 = backend
+            .run_cdc(
+                &spec,
+                duckdb_cdc_record_batch_from_json(&[
+                    json!({
+                        "before": null,
+                        "after": {"id": 1, "email": "alice@x", "name": "Alice"},
+                        "source": {"ts_ms": 100_i64},
+                        "op": "c",
+                        "ts_ms": 100_i64,
+                    })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+                    json!({
+                        "before": null,
+                        "after": {"id": 2, "email": "bob@x", "name": "Bob"},
+                        "source": {"ts_ms": 200_i64},
+                        "op": "c",
+                        "ts_ms": 200_i64,
+                    })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+                ]),
+                &cdc,
+                "duckdb_cdc_test",
+            )
+            .await
+            .expect("batch 1");
+        assert_eq!(r1.creates, 2, "two inserts in batch 1");
+        assert_eq!(r1.updates, 0);
+        assert_eq!(r1.deletes, 0);
+
+        // Batch 2: UPDATE id=1, DELETE id=2.
+        let r2 = backend
+            .run_cdc(
+                &spec,
+                duckdb_cdc_record_batch_from_json(&[
+                    json!({
+                        "before": {"id": 1, "email": "alice@x", "name": "Alice"},
+                        "after":  {"id": 1, "email": "alice@x", "name": "Alice Smith"},
+                        "source": {"ts_ms": 300_i64},
+                        "op": "u",
+                        "ts_ms": 300_i64,
+                    })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+                    json!({
+                        "before": {"id": 2, "email": "bob@x", "name": "Bob"},
+                        "after":  null,
+                        "source": {"ts_ms": 400_i64},
+                        "op": "d",
+                        "ts_ms": 400_i64,
+                    })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+                ]),
+                &cdc,
+                "duckdb_cdc_test",
+            )
+            .await
+            .expect("batch 2");
+        assert_eq!(r2.updates, 1, "one update");
+        assert_eq!(r2.deletes, 1, "one delete");
+
+        // Verify final state.
+        let stream = backend
+            .read_arrow_stream("SELECT id, name FROM mirror.customers ORDER BY id")
+            .await
+            .unwrap();
+        use futures_util::TryStreamExt;
+        let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+        let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, 1, "exactly id=1 should remain");
+
+        let b = &batches[0];
+        let names = b.column(1).as_any();
+        let names = names
+            .downcast_ref::<arrow_array::StringArray>()
+            .expect("name column is utf8");
+        assert_eq!(names.value(0), "Alice Smith");
+    }
+
+    /// Δ.X2: an OLDER redelivered event in a LATER batch is
+    /// dropped at the idempotency gate. Lifted from the PG PR 4
+    /// idempotency test pattern — same gate, same SQL, different
+    /// dialect.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn duckdb_cdc_redelivery_is_idempotent() {
+        use crate::cdc::{CdcConfig, EnvelopeKind};
+        use serde_json::json;
+
+        let backend: Arc<dyn Backend> = Arc::new(DuckDBBackend::open(":memory:").unwrap());
+        create_duckdb_cdc_target(&backend).await;
+
+        let mut cdc = CdcConfig::for_envelope(EnvelopeKind::Debezium);
+        cdc.key_field = "after.id".into();
+        let spec = duckdb_cdc_customers_spec();
+
+        // Batch 1: insert id=1 at ts=200 with the "newer" name.
+        let _r1 = backend
+            .run_cdc(
+                &spec,
+                duckdb_cdc_record_batch_from_json(&[json!({
+                    "before": null,
+                    "after": {"id": 1, "email": "a@x", "name": "Alice v2"},
+                    "source": {"ts_ms": 200_i64},
+                    "op": "c",
+                    "ts_ms": 200_i64,
+                })
+                .as_object()
+                .unwrap()
+                .clone()]),
+                &cdc,
+                "duckdb_cdc_idem",
+            )
+            .await
+            .expect("batch 1");
+
+        // Batch 2: redeliver an OLDER version (ts=100). Gate must
+        // reject it; target stays at "Alice v2".
+        let r2 = backend
+            .run_cdc(
+                &spec,
+                duckdb_cdc_record_batch_from_json(&[json!({
+                    "before": null,
+                    "after": {"id": 1, "email": "a@x", "name": "Alice v1"},
+                    "source": {"ts_ms": 100_i64},
+                    "op": "c",
+                    "ts_ms": 100_i64,
+                })
+                .as_object()
+                .unwrap()
+                .clone()]),
+                &cdc,
+                "duckdb_cdc_idem",
+            )
+            .await
+            .expect("batch 2");
+        assert_eq!(r2.creates, 0, "older redelivery must not apply");
+        assert_eq!(r2.updates, 0);
+        assert_eq!(
+            r2.idempotent_skipped, 1,
+            "idempotency gate must report the skip"
+        );
+
+        // Confirm the target row still says v2.
+        let stream = backend
+            .read_arrow_stream("SELECT name FROM mirror.customers WHERE id = 1")
+            .await
+            .unwrap();
+        use futures_util::TryStreamExt;
+        let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+        let arr = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow_array::StringArray>()
+            .unwrap();
+        assert_eq!(arr.value(0), "Alice v2");
+    }
+
+    /// Δ.X2: SchemaEvolutionPolicy::Fail must abort the batch
+    /// when an `after` payload carries a column missing on the
+    /// target spec.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn duckdb_cdc_schema_fail_aborts() {
+        use crate::cdc::{CdcConfig, EnvelopeKind, SchemaEvolutionPolicy};
+        use serde_json::json;
+
+        let backend: Arc<dyn Backend> = Arc::new(DuckDBBackend::open(":memory:").unwrap());
+        create_duckdb_cdc_target(&backend).await;
+        let spec = duckdb_cdc_customers_spec();
+
+        let mut cdc = CdcConfig::for_envelope(EnvelopeKind::Debezium);
+        cdc.key_field = "after.id".into();
+        cdc.schema_evolution = SchemaEvolutionPolicy::Fail;
+
+        let err = backend
+            .run_cdc(
+                &spec,
+                duckdb_cdc_record_batch_from_json(&[json!({
+                    "before": null,
+                    "after": {"id": 1, "email": "a@x", "name": "A", "phone": "+1"},
+                    "op": "c",
+                    "ts_ms": 1_i64,
+                })
+                .as_object()
+                .unwrap()
+                .clone()]),
+                &cdc,
+                "duckdb_cdc_fail",
+            )
+            .await
+            .expect_err("Fail policy must error on unknown column");
+        assert!(
+            err.to_string().contains("phone"),
+            "error must name the offending column"
+        );
+    }
+
+    /// Δ.X2: soft-delete flips the configured column instead of
+    /// removing the row. Mirrors the PG / Delta soft-delete tests.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn duckdb_cdc_soft_delete_flips_column() {
+        use crate::cdc::{CdcConfig, DeleteMode, EnvelopeKind};
+        use serde_json::json;
+
+        let backend: Arc<dyn Backend> = Arc::new(DuckDBBackend::open(":memory:").unwrap());
+        backend.execute("CREATE SCHEMA mirror").await.unwrap();
+        backend
+            .execute(
+                "CREATE TABLE mirror.customers (\
+                    id BIGINT PRIMARY KEY, \
+                    email VARCHAR, \
+                    name VARCHAR, \
+                    deleted_at TIMESTAMPTZ)",
+            )
+            .await
+            .unwrap();
+
+        let mut spec = duckdb_cdc_customers_spec();
+        spec.columns.push(crate::types::ColumnSpec {
+            name: "deleted_at".into(),
+            ty: crate::types::ColumnType::TimestampTz,
+            nullable: true,
+            primary_key: false,
+        });
+
+        let mut cdc = CdcConfig::for_envelope(EnvelopeKind::Debezium);
+        cdc.key_field = "after.id".into();
+        cdc.delete_mode = DeleteMode::Soft {
+            column: "deleted_at".into(),
+        };
+
+        // Insert + soft-delete in two batches. The second batch's
+        // delete event should flip `deleted_at`, not remove the row.
+        let _r1 = backend
+            .run_cdc(
+                &spec,
+                duckdb_cdc_record_batch_from_json(&[json!({
+                    "before": null,
+                    "after": {"id": 1, "email": "a@x", "name": "A", "deleted_at": null},
+                    "op": "c",
+                    "ts_ms": 100_i64,
+                })
+                .as_object()
+                .unwrap()
+                .clone()]),
+                &cdc,
+                "duckdb_cdc_soft",
+            )
+            .await
+            .unwrap();
+
+        let r2 = backend
+            .run_cdc(
+                &spec,
+                duckdb_cdc_record_batch_from_json(&[json!({
+                    "before": {"id": 1, "email": "a@x", "name": "A", "deleted_at": null},
+                    "after":  null,
+                    "op": "d",
+                    "ts_ms": 200_i64,
+                })
+                .as_object()
+                .unwrap()
+                .clone()]),
+                &cdc,
+                "duckdb_cdc_soft",
+            )
+            .await
+            .unwrap();
+        assert_eq!(r2.deletes, 0, "soft-delete must not increment deletes");
+        // Soft-delete is wired through UPDATE, so the counter
+        // shows up under updates rather than deletes.
+        assert!(r2.updates >= 1, "soft-delete reports as an update");
+
+        // Row still present — but deleted_at populated.
+        let stream = backend
+            .read_arrow_stream("SELECT id FROM mirror.customers WHERE id = 1")
+            .await
+            .unwrap();
+        use futures_util::TryStreamExt;
+        let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+        let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, 1, "soft-delete preserves the row");
+
+        let stream = backend
+            .read_arrow_stream(
+                "SELECT count(*) FROM mirror.customers WHERE id = 1 AND deleted_at IS NOT NULL",
+            )
+            .await
+            .unwrap();
+        let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+        let n = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow_array::Int64Array>()
+            .unwrap()
+            .value(0);
+        assert_eq!(n, 1, "deleted_at must be populated");
     }
 }
