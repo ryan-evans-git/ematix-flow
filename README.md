@@ -755,19 +755,25 @@ The same pattern works for `RabbitMQBackend`, `PubSubBackend`,
   `CDC(envelope="debezium")` interprets each Kafka payload as a
   CDC envelope (Debezium / Maxwell / custom shape) and routes
   through `Backend::run_cdc` for per-op transactional dispatch.
-  Postgres target supported today; Delta + DuckDB + MySQL are
-  catalogued as Phase Δ extensions.
+  Targets supported today: **Postgres**, **Delta Lake** (Δ.X1 +
+  Δ.X1.1 + Δ.X1.2), **DuckDB** / **SQLite** / **MySQL** (Δ.X2).
+  Object stores stay deferred (Δ.X3) — recommend Delta-on-S3 for
+  CDC into object storage.
 - **Per-PK idempotency gate** (Δ PR 4): `INSERT … ON CONFLICT
   DO UPDATE … WHERE existing.last_seen_ts_ms < EXCLUDED…
   RETURNING 1` against `ematix_flow.cdc_idempotency`, atomic
   with the data write — Kafka redeliveries become a no-op
-  without trusting source idempotency.
+  without trusting source idempotency. The MySQL port reads
+  `affected_rows()` since MySQL has no `RETURNING`; same
+  semantics, different read path.
 - **Schema-evolution policy** (Δ PR 5): `Skip` (default) warns +
   drops unknown columns; `Fail` aborts the batch on first drift
   for teams that gate releases on schema sync.
-- **End-to-end demo** (Δ PR 6): `examples/cdc-debezium/`
-  docker-compose stack (Postgres source + Debezium + Kafka +
-  Postgres mirror) with a step-by-step walkthrough.
+- **End-to-end demos**:
+  - `examples/cdc-debezium/` (Δ PR 6) — Postgres source +
+    Debezium + Kafka + Postgres mirror.
+  - `examples/cdc-delta/` (Δ.X1 example) — same stack, but the
+    target is a local Delta Lake table via `kind = "delta_local"`.
   See [`docs/USER_GUIDE.md` § "CDC source mode (Δ)"](docs/USER_GUIDE.md#cdc-source-mode-δ).
 
 ### Recent additions (Π.1 / Π.3 / Π.1.4)
