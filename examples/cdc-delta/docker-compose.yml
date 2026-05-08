@@ -1,0 +1,136 @@
+# End-to-end Delta CDC example: stack identical to cdc-debezium
+# minus the `pg-target` service. The Delta target lives on the
+# host filesystem (configured in `pipeline.toml`), so there's no
+# downstream database to run.
+#
+# Layers (in dependency order):
+#
+#   pg-source   → Postgres with logical decoding enabled.
+#                 Debezium captures every INSERT / UPDATE / DELETE
+#                 on `public.customers` and publishes change events
+#                 to the `dbz.public.customers` Kafka topic.
+#
+#   kafka       → Single-broker Kafka (KRaft mode, no ZooKeeper).
+#                 Two listeners: INTERNAL://kafka:9092 for the
+#                 in-network `connect` service,
+#                 EXTERNAL://localhost:9094 for the host process
+#                 running `flow consume`.
+#
+#   connect     → Debezium 2.7. Registered after startup via the
+#                 connector config in `register-connector.json`.
+#
+# The Delta target is intentionally NOT in this compose. The
+# `flow consume` consumer runs on the host with `[target]
+# kind = "delta_local"` + a host filesystem path; the deltalake
+# crate writes Parquet files + the `_delta_log/` directly to
+# that path. No additional container needed.
+#
+# Bring up:
+#   docker compose -f examples/cdc-delta/docker-compose.yml up -d
+#   ./examples/cdc-delta/register-connector.sh
+#
+# Drive change events from another shell:
+#   docker compose -f examples/cdc-delta/docker-compose.yml \
+#     exec pg-source psql -U postgres -d source \
+#     -c "INSERT INTO public.customers VALUES (3, 'c@example.com', 'Carol');"
+#
+# Run the ematix-flow consumer on the host:
+#   flow consume examples/cdc-delta/pipeline.toml
+#
+# Verify on the target by reading the Delta table — for example,
+# with deltalake-python:
+#   python -c "from deltalake import DeltaTable; \
+#              import pyarrow as pa; \
+#              t = DeltaTable('/tmp/ematix-flow-cdc-delta/customers'); \
+#              print(t.to_pandas())"
+#
+# Tear down:
+#   docker compose -f examples/cdc-delta/docker-compose.yml down -v
+#   rm -rf /tmp/ematix-flow-cdc-delta
+
+services:
+  pg-source:
+    image: postgres:16-alpine
+    container_name: ematix-cdc-delta-pg-source
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: source
+    # `wal_level=logical` is the per-cluster knob Debezium needs;
+    # the postgres image's default `wal_level=replica` is not enough.
+    command:
+      - "postgres"
+      - "-c"
+      - "wal_level=logical"
+      - "-c"
+      - "max_wal_senders=4"
+      - "-c"
+      - "max_replication_slots=4"
+    ports:
+      - "5435:5432"
+    volumes:
+      - ./seed-source.sql:/docker-entrypoint-initdb.d/seed.sql:ro
+    networks:
+      - cdc-delta-net
+
+  kafka:
+    image: apache/kafka:3.7.0
+    container_name: ematix-cdc-delta-kafka
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      # Two listeners so the in-compose `connect` reaches the
+      # broker via `kafka:9092` while the host's `flow consume`
+      # reaches it via `localhost:9095`. A single advertised
+      # listener doesn't work — `connect` resolves `localhost` to
+      # itself, not the broker.
+      #
+      # Note the host port 9095 (vs. 9094 used by cdc-debezium).
+      # Lets you run both demos side-by-side without a port
+      # collision.
+      KAFKA_LISTENERS: "INTERNAL://0.0.0.0:9092,EXTERNAL://0.0.0.0:9095,CONTROLLER://0.0.0.0:9093"
+      KAFKA_ADVERTISED_LISTENERS: "INTERNAL://kafka:9092,EXTERNAL://localhost:9095"
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "CONTROLLER:PLAINTEXT,INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT"
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: "1@kafka:9093"
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      CLUSTER_ID: "MkU3OEVBNTcwNTJENDM2Qk"
+    ports:
+      - "9095:9095"
+    networks:
+      - cdc-delta-net
+
+  connect:
+    image: debezium/connect:2.7.3.Final
+    container_name: ematix-cdc-delta-connect
+    depends_on:
+      - kafka
+      - pg-source
+    environment:
+      BOOTSTRAP_SERVERS: kafka:9092
+      GROUP_ID: ematix-cdc-delta-connect
+      CONFIG_STORAGE_TOPIC: connect_configs
+      OFFSET_STORAGE_TOPIC: connect_offsets
+      STATUS_STORAGE_TOPIC: connect_statuses
+      # JSON without inline schemas. `ematix-flow`'s Debezium
+      # parser consumes the unwrapped envelope directly (`op`,
+      # `before`, `after`, `source.ts_ms`); the schema-wrapped
+      # variant would nest payload one level deeper and break the
+      # default field paths.
+      KEY_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      VALUE_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      KEY_CONVERTER_SCHEMAS_ENABLE: "false"
+      VALUE_CONVERTER_SCHEMAS_ENABLE: "false"
+    ports:
+      - "8084:8083"
+    networks:
+      - cdc-delta-net
+
+networks:
+  cdc-delta-net:
+    driver: bridge
