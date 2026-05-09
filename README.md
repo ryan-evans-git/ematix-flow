@@ -783,7 +783,17 @@ Per-PK idempotency gate (`ematix_flow.cdc_idempotency`) keeps
 Kafka redeliveries from double-applying. Schema-evolution policy
 (`Skip` / `Fail`) controls drift behaviour. Hard or soft delete
 (`delete_mode="soft", soft_delete_column="deleted_at"`).
-Supported targets: Postgres, Delta Lake, DuckDB, SQLite, MySQL.
+Supported targets: Postgres, Delta Lake (local + S3), DuckDB,
+SQLite, MySQL.
+
+**Raw object stores (S3 / GCS / Azure Parquet, CSV, JSON) are
+intentionally not CDC targets** — those file formats are
+immutable, so per-event UPDATE / DELETE has no clean shape. For
+CDC into object storage, use `DeltaS3Backend`: Delta sits on top
+of the same object stores and gives you transactional MERGE for
+free. The append-only "event log" pattern (one row per change
+event, materialise current state downstream) remains buildable
+ad-hoc with the existing transform stage + ObjectStore target.
 
 End-to-end demos:
 - [`examples/cdc-debezium/`](examples/cdc-debezium/) — Postgres

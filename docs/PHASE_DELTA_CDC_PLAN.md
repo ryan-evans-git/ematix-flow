@@ -635,11 +635,10 @@ The dispatch table is shared between DuckDB / SQLite / MySQL —
 one helper module under `crates/ematix-flow-core/src/cdc/`. ~80
 lines, written once, used three times.
 
-### Δ.X3 — Object stores *(different problem shape; recommend deferring)*
+### Δ.X3 — Object stores — **closed (deferred; recommend Delta-on-S3)**
 
 Object stores can't UPDATE or DELETE in place — Parquet / CSV /
-JSON / ORC files are immutable. Three honest options if a user
-wants CDC into object storage:
+JSON / ORC files are immutable. Three options were considered:
 
 1. **Append-only event log.** Write each CDC event as a row with
    synthesized `__op`, `__source_ts_ms` columns. Live state
@@ -655,12 +654,19 @@ wants CDC into object storage:
    object stores anyway and gives them transactional MERGE for
    free.
 
-**Recommendation.** Default to (3). Land an "object store
-limitation" callout in the docs alongside the Δ.X1 Delta target;
-revisit if a user with a concrete (1) or (2) workflow shows up.
-The "append-only event log" pattern is easy enough to build
-ad-hoc with the existing transform pre-stage + object-store
-target without needing first-class CDC support.
+**Decision.** Option (3). Δ.X1's `DeltaS3Backend` already covers
+the realistic "CDC into object storage" use case via transactional
+MERGE; raw Parquet/CSV/JSON CDC adds executor surface area that
+duplicates what Delta gives for free. The "append-only event log"
+pattern (option 1) remains buildable ad-hoc via the existing
+transform pre-stage + ObjectStore target without first-class CDC
+support — no executor work needed if a user wants it. Revisit
+this decision only if a concrete (1) or (2) workflow surfaces
+that Delta-on-S3 can't serve.
+
+User-facing callout lives in the README CDC section + the
+USER_GUIDE backend reach matrix, both pointing CDC-into-object-storage
+users at `DeltaS3Backend`.
 
 ### Δ.X4 — Streaming targets *(out of scope; outbound CDC)*
 
@@ -684,7 +690,8 @@ batch don't compose meaningfully. The trait method's default
 2. **Δ.X2 SQL ports** — pick whichever target a user asks for
    first. Each is ~1-2 days; the per-column dispatch table is
    shared so the second + third are cheaper than the first.
-3. **Δ.X3 Object stores** — defer until demand surfaces.
+3. **Δ.X3 Object stores** — closed: deferred. Delta-on-S3 (Δ.X1)
+   covers the realistic CDC-into-object-storage use case.
 4. **Δ.X4 / Δ.X5** — out of scope; revisit if/when the ground
    shifts.
 
