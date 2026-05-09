@@ -674,6 +674,54 @@ run_streaming_pipeline(
 )
 ```
 
+### Aggregating many source rows into one JSON-shaped target row
+
+When the target schema isn't 1:1 with the source — e.g. an
+`option_chain_snapshots(minute, strikes_json)` table where every
+row carries a JSON array of N contracts for that minute —
+DataFusion's `array_agg(named_struct(...))` does the pivot inside a
+single `transform_sql` pass. The framework's Postgres write path
+serializes Arrow `List<Struct<...>>` straight into a JSONB column,
+so no staging table or two-stage pipeline is needed.
+
+```python
+run_streaming_pipeline(
+    name="option-chain-snapshots",
+    source=s3,                                # CSV files under a watched prefix
+    source_query="raw/options/",
+    target=warehouse,                         # postgres
+    target_table=("marketdata", "option_chain_snapshots"),
+    transform_sql="""
+      SELECT
+        date_trunc('minute', ts) AS minute,
+        array_agg(named_struct(
+          'strike', strike,
+          'bid',    bid,
+          'ask',    ask
+        )) AS strikes_json
+      FROM source
+      WHERE underlying = 'SPXW' AND days_to_expiry = 0
+      GROUP BY 1
+    """,
+)
+```
+
+The mirror table:
+```sql
+CREATE TABLE marketdata.option_chain_snapshots (
+  minute        TIMESTAMPTZ NOT NULL,
+  strikes_json  JSONB NOT NULL  -- [{"strike": 4500, "bid": 1.25, "ask": 1.30}, ...]
+);
+```
+
+Same shape works for `MERGE` / `SCD2` / `Truncate` strategies via
+the strategy executor — the JSONB column round-trips like any other
+type. Per-row Python compute (e.g. live Black-Scholes delta over
+streaming vol/rate inputs) isn't expressible in DataFusion SQL today
+and would still need a Python post-stage; pre-computed lookups
+(`@ematix.lookup` against a static numeric table) work when the
+inputs are stable.
+
 ### Tumbling / hopping windows
 
 Nine aggregators including HLL+ approximate `count_distinct`.

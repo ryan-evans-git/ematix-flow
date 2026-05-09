@@ -8829,3 +8829,178 @@ async fn mysql_cdc_soft_delete_flips_column() {
         .value(0);
     assert_eq!(n, 1, "deleted_at must be populated");
 }
+
+// ====================================================================
+// User-facing pattern: aggregating N source rows into one JSON-shaped
+// target row (e.g. option_chain_snapshots.strikes_json — 60 contracts
+// per minute → one row per minute carrying a JSON array of contracts).
+//
+// Verifies that DataFusion's `array_agg(named_struct(...))` writes
+// directly into a Postgres JSONB column without staging — the
+// `arrow_to_json_value` helper in `backend.rs` recursively serializes
+// Arrow `List<Struct<...>>` into a JSON array of objects at insert
+// time. Covered by unit tests on the helper itself; this test pins
+// the end-to-end shape against a real Postgres instance.
+// ====================================================================
+
+/// User-feedback shape: pivot N row events grouped by minute into one
+/// row per minute carrying a JSON-list aggregate (`strikes_json`).
+/// This is the "polygon options" example — for each minute, every
+/// option contract becomes a JSON object inside a JSON array.
+///
+/// Pre-aggregation rows are mocked directly as a `List<Struct>`
+/// Arrow batch (the shape DataFusion's `array_agg(named_struct(...))`
+/// produces inside a `GROUP BY` plan). End-to-end semantics on
+/// the actual SQL pass through that aggregation are covered in
+/// the `transform.rs` unit tests; this test is the
+/// Arrow-to-Postgres half.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn pg_jsonb_accepts_list_of_struct_from_aggregate() {
+    use arrow_array::RecordBatch;
+    use arrow_array::TimestampMicrosecondArray;
+    use arrow_array::builder::{Float64Builder, Int64Builder, ListBuilder, StructBuilder};
+    use arrow_schema::{DataType, Field as ArrowField, Fields, Schema as ArrowSchema, TimeUnit};
+    use futures_util::stream;
+
+    let (_container, url) = start_postgres().await;
+    let pool = Arc::new(PgPool::connect(&url).await.unwrap());
+    let backend: Arc<dyn Backend> = Arc::new(PostgresBackend::new(pool.clone(), url.clone()));
+
+    backend.execute("CREATE SCHEMA marketdata").await.unwrap();
+    backend
+        .execute(
+            "CREATE TABLE marketdata.option_chain_snapshots (
+                minute TIMESTAMPTZ NOT NULL,
+                strikes_json JSONB NOT NULL
+            )",
+        )
+        .await
+        .unwrap();
+
+    // Build the post-`array_agg(named_struct(...))` shape directly.
+    let strikes_fields: Fields = vec![
+        ArrowField::new("strike", DataType::Int64, false),
+        ArrowField::new("bid", DataType::Float64, false),
+        ArrowField::new("ask", DataType::Float64, false),
+    ]
+    .into();
+    let strike_struct = ArrowField::new("item", DataType::Struct(strikes_fields.clone()), true);
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new(
+            "minute",
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            false,
+        ),
+        ArrowField::new(
+            "strikes_json",
+            DataType::List(Arc::new(strike_struct)),
+            false,
+        ),
+    ]));
+
+    let struct_builder = StructBuilder::new(
+        strikes_fields.clone(),
+        vec![
+            Box::new(Int64Builder::new()),
+            Box::new(Float64Builder::new()),
+            Box::new(Float64Builder::new()),
+        ],
+    );
+    let mut list_builder = ListBuilder::new(struct_builder);
+
+    // Minute 1: two strikes.
+    let sb = list_builder.values();
+    sb.field_builder::<Int64Builder>(0)
+        .unwrap()
+        .append_value(4500);
+    sb.field_builder::<Float64Builder>(1)
+        .unwrap()
+        .append_value(1.25);
+    sb.field_builder::<Float64Builder>(2)
+        .unwrap()
+        .append_value(1.30);
+    sb.append(true);
+    sb.field_builder::<Int64Builder>(0)
+        .unwrap()
+        .append_value(4505);
+    sb.field_builder::<Float64Builder>(1)
+        .unwrap()
+        .append_value(0.75);
+    sb.field_builder::<Float64Builder>(2)
+        .unwrap()
+        .append_value(0.85);
+    sb.append(true);
+    list_builder.append(true);
+
+    // Minute 2: one strike.
+    let sb = list_builder.values();
+    sb.field_builder::<Int64Builder>(0)
+        .unwrap()
+        .append_value(4500);
+    sb.field_builder::<Float64Builder>(1)
+        .unwrap()
+        .append_value(1.50);
+    sb.field_builder::<Float64Builder>(2)
+        .unwrap()
+        .append_value(1.60);
+    sb.append(true);
+    list_builder.append(true);
+
+    let strikes_array = Arc::new(list_builder.finish());
+    // Two minute timestamps: 2026-01-01T09:30:00Z and 2026-01-01T09:31:00Z.
+    let minute_array = Arc::new(
+        TimestampMicrosecondArray::from(vec![
+            Some(1_767_259_800_000_000_i64),
+            Some(1_767_259_860_000_000_i64),
+        ])
+        .with_timezone("UTC"),
+    );
+    let batch = RecordBatch::try_new(schema.clone(), vec![minute_array, strikes_array]).unwrap();
+
+    let target = TargetTable {
+        schema: "marketdata".into(),
+        name: "option_chain_snapshots".into(),
+    };
+    let written = backend
+        .write_arrow_stream(
+            &target,
+            Box::pin(stream::once(async move { Ok(batch) })),
+            WriteMode::Append,
+        )
+        .await
+        .unwrap();
+    assert_eq!(written, 2, "two minute-rows persisted");
+
+    // Verify the JSONB column round-trips: minute 1 is a JSON array
+    // of two objects; minute 2 is one object. Use Postgres's own
+    // jsonb_array_length so a wire-format mismatch surfaces as the
+    // assertion failing rather than a bytes-equal silently passing.
+    let strikes_lengths = pool
+        .fetch_scalar_int(
+            "SELECT SUM(jsonb_array_length(strikes_json))::int \
+             FROM marketdata.option_chain_snapshots",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        strikes_lengths, 3,
+        "two strikes + one strike across both minutes"
+    );
+
+    // Pin one specific value out so a column-name swap or scalar
+    // type-mapping regression in `arrow_to_json_value` would catch.
+    // Cast through ::int because `fetch_scalar_int` decodes int4.
+    let bid_4500_centicents = pool
+        .fetch_scalar_int(
+            "SELECT ((jsonb_path_query_array(strikes_json, \
+             '$[*] ? (@.strike == 4500)') -> 0 ->> 'bid')::numeric * 100)::int \
+             FROM marketdata.option_chain_snapshots ORDER BY minute LIMIT 1",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        bid_4500_centicents, 125,
+        "minute 1 strike-4500 bid round-trips as 1.25"
+    );
+}

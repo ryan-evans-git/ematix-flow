@@ -589,6 +589,98 @@ task reloads + atomically swaps the registered `MemTable`.
 The reserved table name `source` references the streaming source.
 Lookup names become other tables.
 
+### Aggregating many source rows into one JSON-shaped target row
+
+A common shape mismatch: the upstream is row-per-event (one row per
+options contract per minute) but the target column holds a JSON
+array of N events per group (one row per *minute*, with all
+contracts under it). Other frameworks make you stage the rows,
+GROUP BY in a second pipeline, then write the aggregate. ematix-flow
+handles this in one pass because DataFusion has `array_agg` +
+`named_struct`, and the Postgres write path serialises Arrow
+`List<Struct<...>>` directly into a `JSONB` column.
+
+```python
+from ematix_flow import (
+    ObjectStoreS3Connection,
+    PostgresConnection,
+    run_streaming_pipeline,
+)
+
+s3 = ObjectStoreS3Connection(
+    name="raw",
+    endpoint="https://files.example.com",
+    bucket="market-data",
+    region="us-east-1",
+    access_key_id="${S3_KEY}",
+    secret_access_key="${S3_SECRET}",
+    format="csv",
+)
+warehouse = PostgresConnection(
+    name="warehouse",
+    url="postgres://localhost/marketdata",
+)
+
+run_streaming_pipeline(
+    name="option-chain-snapshots",
+    source=s3,
+    source_query="raw/options/",                  # watched prefix
+    target=warehouse,
+    target_table=("marketdata", "option_chain_snapshots"),
+    transform_sql="""
+        SELECT
+          date_trunc('minute', ts) AS minute,
+          array_agg(named_struct(
+            'strike', strike,
+            'bid',    bid,
+            'ask',    ask
+          )) AS strikes_json
+        FROM source
+        WHERE underlying = 'SPXW' AND days_to_expiry = 0
+        GROUP BY 1
+    """,
+)
+```
+
+The target column is a real JSONB:
+
+```sql
+CREATE TABLE marketdata.option_chain_snapshots (
+  minute        TIMESTAMPTZ NOT NULL,
+  strikes_json  JSONB NOT NULL
+  -- example payload:
+  -- [
+  --   {"strike": 4500, "bid": 1.25, "ask": 1.30},
+  --   {"strike": 4505, "bid": 0.75, "ask": 0.85},
+  --   ...
+  -- ]
+);
+```
+
+**Type mapping.** `named_struct(field, value, ...)` produces an Arrow
+`Struct`; `array_agg(struct)` produces a `List<Struct>`. The
+PostgresBackend recognises a `List<...>` or `Struct<...>` column
+whose Postgres destination is `JSON` (oid 114) or `JSONB` (oid 3802)
+and recursively serialises:
+
+- Primitives → JSON primitives (Int*, Float*, Bool, Utf8).
+- `Timestamp(Microsecond, _)` → ISO-8601 UTC string.
+- `Binary` → lowercase hex (matches Postgres `to_jsonb(bytea)`).
+- `Float` NaN / Infinity → `null` (so a single bad row doesn't tank
+  a 10k-row batch).
+
+A `List` or `Struct` column targeting a non-JSON Postgres type is
+rejected with a clear error pointing at the column name.
+
+**When it doesn't fit.** The transform layer is SQL-only — DataFusion
+function set (`docs.rs/datafusion`) defines what's expressible.
+Per-row Python computation (e.g. live Black-Scholes delta with
+streaming vol/rate inputs) isn't first-class today: either
+pre-compute as a static `@ematix.lookup` table and `LEFT JOIN` it,
+or run a separate Python post-stage. The roadmap entry for
+"DataFusion UDFs through transform.rs" is open if a concrete
+workload surfaces.
+
 ### Tumbling window (39.4)
 
 Bucketed aggregations — count events per user per minute, no

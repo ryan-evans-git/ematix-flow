@@ -1733,6 +1733,167 @@ fn system_time_to_micros(t: std::time::SystemTime) -> i64 {
     }
 }
 
+/// Recursive Arrow → `serde_json::Value` for the Postgres JSONB write
+/// path. Handles the realistic shape of "GROUP BY + array_agg(named_struct(...))"
+/// pivots — Arrow `List<Struct<...>>` becomes a JSON array of objects.
+///
+/// Coverage: primitives (Int*/Float*/Bool/Utf8/Binary as base64),
+/// `Timestamp(Microsecond, _)` → ISO-8601 string, `List<T>` → array,
+/// `Struct<...>` → object. Nested combinations work via recursion.
+/// Unsupported types (e.g. Decimal128, FixedSizeBinary) return an
+/// error rather than silently emitting bad JSON.
+fn arrow_to_json_value(
+    array: &dyn arrow_array::Array,
+    row_idx: usize,
+) -> Result<serde_json::Value, BackendError> {
+    use arrow_array::{
+        Array, BinaryArray, BooleanArray, Float32Array, Float64Array, Int16Array, Int32Array,
+        Int64Array, ListArray, StringArray, StructArray, TimestampMicrosecondArray,
+    };
+    use serde_json::Value;
+
+    if array.is_null(row_idx) {
+        return Ok(Value::Null);
+    }
+    match array.data_type() {
+        DataType::Int16 => Ok(Value::from(
+            array
+                .as_any()
+                .downcast_ref::<Int16Array>()
+                .unwrap()
+                .value(row_idx),
+        )),
+        DataType::Int32 => Ok(Value::from(
+            array
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .value(row_idx),
+        )),
+        DataType::Int64 => Ok(Value::from(
+            array
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(row_idx),
+        )),
+        DataType::Float32 => {
+            let v = array
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .unwrap()
+                .value(row_idx);
+            // serde_json rejects NaN/Inf for Number; emit null so the
+            // JSONB column accepts the row instead of erroring.
+            Ok(serde_json::Number::from_f64(v as f64)
+                .map(Value::Number)
+                .unwrap_or(Value::Null))
+        }
+        DataType::Float64 => {
+            let v = array
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .unwrap()
+                .value(row_idx);
+            Ok(serde_json::Number::from_f64(v)
+                .map(Value::Number)
+                .unwrap_or(Value::Null))
+        }
+        DataType::Boolean => Ok(Value::Bool(
+            array
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .unwrap()
+                .value(row_idx),
+        )),
+        DataType::Utf8 => Ok(Value::String(
+            array
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .value(row_idx)
+                .to_string(),
+        )),
+        DataType::Binary => {
+            // JSON has no binary type; emit lowercase hex with no prefix.
+            // Postgres' `to_jsonb(bytea)` defaults to a Base16-style
+            // string representation — same shape, no base64 dep.
+            let bytes = array
+                .as_any()
+                .downcast_ref::<BinaryArray>()
+                .unwrap()
+                .value(row_idx);
+            let mut out = String::with_capacity(bytes.len() * 2);
+            for b in bytes {
+                out.push_str(&format!("{b:02x}"));
+            }
+            Ok(Value::String(out))
+        }
+        DataType::Timestamp(TimeUnit::Microsecond, _) => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<TimestampMicrosecondArray>()
+                .unwrap();
+            let micros = arr.value(row_idx);
+            // ISO-8601 with microsecond precision; matches what the
+            // Postgres JSONB driver emits for Timestamp values.
+            let secs = micros.div_euclid(1_000_000);
+            let nanos = (micros.rem_euclid(1_000_000) * 1_000) as u32;
+            let iso = format_iso8601_utc(secs, nanos);
+            Ok(Value::String(iso))
+        }
+        DataType::List(_) => {
+            let arr = array.as_any().downcast_ref::<ListArray>().unwrap();
+            let inner = arr.value(row_idx);
+            let mut out: Vec<Value> = Vec::with_capacity(inner.len());
+            for i in 0..inner.len() {
+                out.push(arrow_to_json_value(inner.as_ref(), i)?);
+            }
+            Ok(Value::Array(out))
+        }
+        DataType::Struct(fields) => {
+            let arr = array.as_any().downcast_ref::<StructArray>().unwrap();
+            let mut obj = serde_json::Map::with_capacity(fields.len());
+            for (idx, field) in fields.iter().enumerate() {
+                let child = arr.column(idx);
+                obj.insert(
+                    field.name().clone(),
+                    arrow_to_json_value(child.as_ref(), row_idx)?,
+                );
+            }
+            Ok(Value::Object(obj))
+        }
+        other => Err(BackendError::TypeMapping(format!(
+            "Arrow → Postgres JSONB: unsupported child type {other:?}"
+        ))),
+    }
+}
+
+/// Format `secs` (Unix seconds) + `nanos` (sub-second nanoseconds) as
+/// ISO-8601 UTC. Standalone helper so [`arrow_to_json_value`] doesn't
+/// pull in a chrono dep just for one format call. Year arithmetic
+/// uses the same Howard-Hinnant civil_from_days routine that
+/// `chrono_compat_iso8601_now` in `objectstore_backend.rs` uses.
+fn format_iso8601_utc(secs: i64, nanos: u32) -> String {
+    let days = secs.div_euclid(86_400);
+    let time_secs = secs.rem_euclid(86_400);
+    let h = time_secs / 3600;
+    let m = (time_secs % 3600) / 60;
+    let s = time_secs % 60;
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let mo = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if mo <= 2 { y + 1 } else { y };
+    let micros = nanos / 1_000;
+    format!("{y:04}-{mo:02}-{d:02}T{h:02}:{m:02}:{s:02}.{micros:06}Z")
+}
+
 async fn insert_record_batch(
     tx: &deadpool_postgres::Transaction<'_>,
     schema: &str,
@@ -1794,6 +1955,21 @@ async fn insert_record_batch(
         for (col_idx, field) in arrow_schema.fields().iter().enumerate() {
             let col = batch.column(col_idx);
             if col.is_null(row_idx) {
+                continue;
+            }
+            // Pivot-to-JSONB shortcut: when the destination column is
+            // JSON / JSONB (oid 114 / 3802) AND the source carries a
+            // List or Struct, recursively serialize via
+            // `arrow_to_json_value`. This is the path that makes
+            // `array_agg(named_struct(...))` from a `GROUP BY`
+            // transform write directly into a JSONB column without a
+            // staging table — see docs/USER_GUIDE.md "Aggregating
+            // many source rows into one JSON-shaped target row".
+            let dest_oid = param_types.get(col_idx).map(|t| t.oid());
+            if matches!(dest_oid, Some(114) | Some(3802))
+                && matches!(field.data_type(), DataType::List(_) | DataType::Struct(_))
+            {
+                owned_json[col_idx] = Some(arrow_to_json_value(col.as_ref(), row_idx)?);
                 continue;
             }
             match field.data_type() {
@@ -1894,6 +2070,26 @@ async fn insert_record_batch(
                 DataType::Timestamp(TimeUnit::Microsecond, _) => {
                     params.push(&owned_ts[col_idx] as ToSqlRef<'_>)
                 }
+                // List / Struct column targeting a JSON / JSONB Postgres
+                // column — bound via the serde_json::Value the
+                // pre-pass in this loop already populated. Targeting
+                // any non-JSONB column with List/Struct is a config
+                // error that the dest-oid match below surfaces.
+                DataType::List(_) | DataType::Struct(_) => {
+                    match param_types.get(col_idx).map(|t| t.oid()) {
+                        Some(114) | Some(3802) => params.push(&owned_json[col_idx] as ToSqlRef<'_>),
+                        _ => {
+                            return Err(BackendError::TypeMapping(format!(
+                                "Arrow → Postgres: column {} is {:?}, but the destination \
+                             Postgres type isn't JSON or JSONB. List/Struct columns are \
+                             only writable into JSONB targets — change the destination \
+                             column type or drop this column from the SELECT.",
+                                field.name(),
+                                field.data_type(),
+                            )));
+                        }
+                    }
+                }
                 _ => unreachable!(),
             }
         }
@@ -1909,6 +2105,133 @@ async fn insert_record_batch(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `arrow_to_json_value` collapses Arrow primitives into JSON
+    /// primitives. Smoke-only — the recursive cases below depend on
+    /// these working.
+    #[test]
+    fn arrow_to_json_value_handles_primitives() {
+        use arrow_array::{
+            BooleanArray, Float64Array, Int64Array, StringArray, TimestampMicrosecondArray,
+        };
+        let i = Int64Array::from(vec![Some(7_i64), None]);
+        assert_eq!(arrow_to_json_value(&i, 0).unwrap(), serde_json::json!(7));
+        assert_eq!(arrow_to_json_value(&i, 1).unwrap(), serde_json::Value::Null);
+
+        let f = Float64Array::from(vec![Some(1.5), Some(f64::NAN)]);
+        assert_eq!(arrow_to_json_value(&f, 0).unwrap(), serde_json::json!(1.5));
+        // NaN is not representable in JSON; emit null rather than
+        // erroring, so a single bad row doesn't tank a 10k-row batch.
+        assert_eq!(arrow_to_json_value(&f, 1).unwrap(), serde_json::Value::Null);
+
+        let b = BooleanArray::from(vec![Some(true)]);
+        assert_eq!(arrow_to_json_value(&b, 0).unwrap(), serde_json::json!(true));
+
+        let s = StringArray::from(vec![Some("hi")]);
+        assert_eq!(arrow_to_json_value(&s, 0).unwrap(), serde_json::json!("hi"));
+
+        // ISO 8601 round-trip — assert the format shape, not a
+        // specific calendar date (the year arithmetic is a hot
+        // path in its own right and exercised by other backends).
+        let ts = TimestampMicrosecondArray::from(vec![Some(1_778_438_400_000_000_i64)]);
+        let v = arrow_to_json_value(&ts, 0).unwrap();
+        let s = v.as_str().expect("timestamp serializes as string");
+        assert_eq!(s.len(), 27, "ISO 8601 with microsecond precision");
+        assert!(s.ends_with("Z"), "UTC suffix");
+        assert!(s.contains('T'), "date/time separator");
+        assert!(s.contains('.'), "fractional-second separator");
+    }
+
+    /// The realistic path: `array_agg(named_struct(...))` produces
+    /// `List<Struct<...>>`. Each row of the output List must serialize
+    /// to a JSON array of objects — that's what gets bound into a
+    /// JSONB column. This is the `option_chain_snapshots.strikes_json`
+    /// shape from real user feedback (60 contracts/min → one minute
+    /// row with a JSON list of contracts).
+    #[test]
+    fn arrow_to_json_value_serializes_list_of_struct_as_json_array() {
+        use arrow_array::builder::{Float64Builder, Int64Builder, ListBuilder, StructBuilder};
+        use arrow_schema::{Field as ArrowField, Fields};
+
+        let fields: Fields = vec![
+            ArrowField::new("strike", DataType::Int64, false),
+            ArrowField::new("bid", DataType::Float64, false),
+        ]
+        .into();
+        let struct_builder = StructBuilder::new(
+            fields.clone(),
+            vec![
+                Box::new(Int64Builder::new()),
+                Box::new(Float64Builder::new()),
+            ],
+        );
+        let mut list_builder = ListBuilder::new(struct_builder);
+
+        // Row 0: two contracts (strike=4500 bid=1.25, strike=4505 bid=0.75).
+        let sb = list_builder.values();
+        sb.field_builder::<Int64Builder>(0)
+            .unwrap()
+            .append_value(4500);
+        sb.field_builder::<Float64Builder>(1)
+            .unwrap()
+            .append_value(1.25);
+        sb.append(true);
+        sb.field_builder::<Int64Builder>(0)
+            .unwrap()
+            .append_value(4505);
+        sb.field_builder::<Float64Builder>(1)
+            .unwrap()
+            .append_value(0.75);
+        sb.append(true);
+        list_builder.append(true);
+
+        // Row 1: empty list (a quiet minute).
+        list_builder.append(true);
+
+        let arr = list_builder.finish();
+        assert_eq!(
+            arrow_to_json_value(&arr, 0).unwrap(),
+            serde_json::json!([
+                {"strike": 4500, "bid": 1.25},
+                {"strike": 4505, "bid": 0.75},
+            ])
+        );
+        assert_eq!(arrow_to_json_value(&arr, 1).unwrap(), serde_json::json!([]));
+    }
+
+    /// `Struct<...>` (no surrounding list) becomes a JSON object —
+    /// useful for "pivot one row's columns into a JSONB blob" without
+    /// the GROUP-BY shape.
+    #[test]
+    fn arrow_to_json_value_serializes_struct_as_json_object() {
+        use arrow_array::builder::{Int64Builder, StringBuilder, StructBuilder};
+        use arrow_schema::{Field as ArrowField, Fields};
+
+        let fields: Fields = vec![
+            ArrowField::new("id", DataType::Int64, false),
+            ArrowField::new("note", DataType::Utf8, true),
+        ]
+        .into();
+        let mut sb = StructBuilder::new(
+            fields.clone(),
+            vec![
+                Box::new(Int64Builder::new()),
+                Box::new(StringBuilder::new()),
+            ],
+        );
+        sb.field_builder::<Int64Builder>(0)
+            .unwrap()
+            .append_value(42);
+        sb.field_builder::<StringBuilder>(1)
+            .unwrap()
+            .append_value("hi");
+        sb.append(true);
+        let arr = sb.finish();
+        assert_eq!(
+            arrow_to_json_value(&arr, 0).unwrap(),
+            serde_json::json!({"id": 42, "note": "hi"})
+        );
+    }
 
     #[test]
     fn dialect_matches_is_strict_equality() {
