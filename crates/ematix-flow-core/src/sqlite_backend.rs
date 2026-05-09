@@ -2534,6 +2534,15 @@ mod tests {
         b.execute("UPDATE src_customers SET email = 'b2@x.com' WHERE customer_id = 2")
             .await
             .unwrap();
+        // SQLite's `strftime('%Y-%m-%dT%H:%M:%fZ', 'now')` is
+        // millisecond-precision. On a fast runner the two SCD2
+        // loads can land in the same ms — the second tries to
+        // insert (customer_id=2, valid_from=T) when the first
+        // already inserted (customer_id=2, valid_from=T) and the
+        // (customer_id, valid_from) PK fires. Production has
+        // natural gaps between SCD2 batches; tests don't, so a
+        // 2 ms sleep guarantees T_b > T_a.
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
         b.run_scd2(
             &target,
             "SELECT customer_id, email, name FROM src_customers",
