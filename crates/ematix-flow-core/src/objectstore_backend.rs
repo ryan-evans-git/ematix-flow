@@ -76,6 +76,14 @@ pub struct ObjectStoreBackend {
     /// another node. Carries credentials in plaintext — same trust
     /// boundary as the existing `dsn` field.
     location: crate::backend::ObjectStoreLocation,
+    /// P4 #28: streaming-source state. Tracks the highest object key
+    /// emitted so far; subsequent `read_arrow_stream` calls only
+    /// return files whose key sorts lexicographically GREATER than
+    /// this. UUIDv7 file naming gives deterministic time-ordered
+    /// keys, so `>` against the last-emitted key is a clean
+    /// "newer than last consumed" predicate. `None` = cold start
+    /// (next read returns everything under the prefix).
+    last_seen_object_key: Arc<std::sync::Mutex<Option<String>>>,
 }
 
 impl ObjectStoreBackend {
@@ -101,6 +109,7 @@ impl ObjectStoreBackend {
             location: crate::backend::ObjectStoreLocation::Local {
                 root_dir: root.display().to_string(),
             },
+            last_seen_object_key: Arc::new(std::sync::Mutex::new(None)),
         })
     }
 
@@ -175,6 +184,7 @@ impl ObjectStoreBackend {
                 access_key: access_key.to_string(),
                 secret_key: secret_key.to_string(),
             },
+            last_seen_object_key: Arc::new(std::sync::Mutex::new(None)),
         })
     }
 }
@@ -217,31 +227,54 @@ fn ext_for_format(format: ObjectFormat) -> &'static str {
 
 /// Read all files under `prefix` matching the backend's format and
 /// concatenate the Arrow batches they produce.
-async fn read_parquet_under_prefix(
+/// List object metas under `prefix` whose location ends with one of
+/// `extensions`. If `after_key` is `Some(key)`, only entries whose
+/// location string sorts strictly greater than `key` are returned.
+/// Result is sorted by location ascending — gives a deterministic
+/// ingestion order, which matters for the streaming-source path
+/// (P4 #28) where the highest-key emitted becomes the next call's
+/// `after_key`.
+async fn list_files_with_extension(
     store: &Arc<dyn ObjectStore>,
-    prefix: ObjectPath,
-) -> Result<Vec<RecordBatch>, BackendError> {
-    let mut listing = store.list(Some(&prefix));
-    let mut batches: Vec<RecordBatch> = Vec::new();
+    prefix: &ObjectPath,
+    extensions: &[&str],
+    after_key: Option<&str>,
+) -> Result<Vec<object_store::ObjectMeta>, BackendError> {
+    let mut listing = store.list(Some(prefix));
+    let mut metas: Vec<object_store::ObjectMeta> = Vec::new();
     while let Some(meta) = listing.next().await {
         let meta = meta.map_err(|e| BackendError::Connection(format!("list: {e}")))?;
-        if !meta.location.as_ref().ends_with(".parquet") {
-            // Skip non-Parquet siblings (manifest files, _SUCCESS markers,
-            // anything left over from other write attempts).
+        let loc = meta.location.as_ref();
+        if !extensions.iter().any(|ext| loc.ends_with(ext)) {
             continue;
         }
-        let reader = ParquetObjectReader::new(store.clone(), meta.location.clone())
-            .with_file_size(meta.size);
-        let stream_builder = ParquetRecordBatchStreamBuilder::new(reader)
-            .await
-            .map_err(|e| BackendError::Query(format!("parquet open: {e}")))?;
-        let mut stream = stream_builder
-            .build()
-            .map_err(|e| BackendError::Query(format!("parquet stream: {e}")))?;
-        while let Some(batch) = stream.next().await {
-            let batch = batch.map_err(|e| BackendError::Query(format!("parquet read: {e}")))?;
-            batches.push(batch);
+        if let Some(after) = after_key {
+            if loc <= after {
+                continue;
+            }
         }
+        metas.push(meta);
+    }
+    metas.sort_by(|a, b| a.location.as_ref().cmp(b.location.as_ref()));
+    Ok(metas)
+}
+
+/// Decode a single Parquet object into Arrow batches.
+async fn decode_parquet_file(
+    store: &Arc<dyn ObjectStore>,
+    meta: &object_store::ObjectMeta,
+) -> Result<Vec<RecordBatch>, BackendError> {
+    let reader =
+        ParquetObjectReader::new(store.clone(), meta.location.clone()).with_file_size(meta.size);
+    let stream_builder = ParquetRecordBatchStreamBuilder::new(reader)
+        .await
+        .map_err(|e| BackendError::Query(format!("parquet open: {e}")))?;
+    let mut stream = stream_builder
+        .build()
+        .map_err(|e| BackendError::Query(format!("parquet stream: {e}")))?;
+    let mut batches: Vec<RecordBatch> = Vec::new();
+    while let Some(batch) = stream.next().await {
+        batches.push(batch.map_err(|e| BackendError::Query(format!("parquet read: {e}")))?);
     }
     Ok(batches)
 }
@@ -307,41 +340,35 @@ async fn write_parquet_at_path(
 /// per file from the first 1024 records (arrow-csv's default cap).
 /// All files in the prefix should share a compatible schema; mismatched
 /// columns surface as errors when the second file's batches arrive.
-async fn read_csv_under_prefix(
+/// Decode a single CSV object. Header row assumed; schema inferred
+/// from the first 1024 records (arrow-csv's default cap).
+async fn decode_csv_file(
     store: &Arc<dyn ObjectStore>,
-    prefix: ObjectPath,
+    meta: &object_store::ObjectMeta,
 ) -> Result<Vec<RecordBatch>, BackendError> {
     use arrow_csv::reader::Format;
 
-    let mut listing = store.list(Some(&prefix));
+    let bytes = store
+        .get(&meta.location)
+        .await
+        .map_err(|e| BackendError::Connection(format!("get {}: {e}", meta.location)))?
+        .bytes()
+        .await
+        .map_err(|e| BackendError::Connection(format!("get bytes: {e}")))?;
+    // Two passes over the bytes: first to infer schema, second to
+    // build the typed reader. arrow-csv's Format consumes the
+    // reader, so we hand it a fresh Cursor each time.
+    let format = Format::default().with_header(true);
+    let (schema, _records_inferred) = format
+        .infer_schema(std::io::Cursor::new(&bytes), Some(1024))
+        .map_err(|e| BackendError::Query(format!("csv infer: {e}")))?;
+    let reader = arrow_csv::ReaderBuilder::new(Arc::new(schema))
+        .with_header(true)
+        .build(std::io::Cursor::new(bytes))
+        .map_err(|e| BackendError::Query(format!("csv reader build: {e}")))?;
     let mut batches: Vec<RecordBatch> = Vec::new();
-    while let Some(meta) = listing.next().await {
-        let meta = meta.map_err(|e| BackendError::Connection(format!("list: {e}")))?;
-        if !meta.location.as_ref().ends_with(".csv") {
-            continue;
-        }
-        let bytes = store
-            .get(&meta.location)
-            .await
-            .map_err(|e| BackendError::Connection(format!("get {}: {e}", meta.location)))?
-            .bytes()
-            .await
-            .map_err(|e| BackendError::Connection(format!("get bytes: {e}")))?;
-        // Two passes over the bytes: first to infer schema, second to
-        // build the typed reader. arrow-csv's Format consumes the
-        // reader, so we hand it a fresh Cursor each time.
-        let format = Format::default().with_header(true);
-        let (schema, _records_inferred) = format
-            .infer_schema(std::io::Cursor::new(&bytes), Some(1024))
-            .map_err(|e| BackendError::Query(format!("csv infer: {e}")))?;
-        let reader = arrow_csv::ReaderBuilder::new(Arc::new(schema))
-            .with_header(true)
-            .build(std::io::Cursor::new(bytes))
-            .map_err(|e| BackendError::Query(format!("csv reader build: {e}")))?;
-        for b in reader {
-            let b = b.map_err(|e| BackendError::Query(format!("csv batch: {e}")))?;
-            batches.push(b);
-        }
+    for b in reader {
+        batches.push(b.map_err(|e| BackendError::Query(format!("csv batch: {e}")))?);
     }
     Ok(batches)
 }
@@ -403,41 +430,31 @@ fn parquet_compression_to_codec(codec: ParquetCompression) -> parquet::basic::Co
 /// `infer_json_schema_from_seekable`, which seeks the reader back to
 /// the start so a single Cursor handles both passes (vs CSV which
 /// needs two fresh Cursors).
-async fn read_jsonl_under_prefix(
+/// Decode a single JSONL object. Schema inferred per file from the
+/// first 1024 records via `infer_json_schema_from_seekable`.
+async fn decode_jsonl_file(
     store: &Arc<dyn ObjectStore>,
-    prefix: ObjectPath,
+    meta: &object_store::ObjectMeta,
 ) -> Result<Vec<RecordBatch>, BackendError> {
     use arrow_json::ReaderBuilder;
     use arrow_json::reader::infer_json_schema_from_seekable;
 
-    let mut listing = store.list(Some(&prefix));
+    let bytes = store
+        .get(&meta.location)
+        .await
+        .map_err(|e| BackendError::Connection(format!("get {}: {e}", meta.location)))?
+        .bytes()
+        .await
+        .map_err(|e| BackendError::Connection(format!("get bytes: {e}")))?;
+    let mut cursor = std::io::Cursor::new(bytes.as_ref());
+    let (schema, _records_inferred) = infer_json_schema_from_seekable(&mut cursor, Some(1024))
+        .map_err(|e| BackendError::Query(format!("json infer: {e}")))?;
+    let reader = ReaderBuilder::new(Arc::new(schema))
+        .build(std::io::BufReader::new(cursor))
+        .map_err(|e| BackendError::Query(format!("json reader: {e}")))?;
     let mut batches: Vec<RecordBatch> = Vec::new();
-    while let Some(meta) = listing.next().await {
-        let meta = meta.map_err(|e| BackendError::Connection(format!("list: {e}")))?;
-        let loc = meta.location.as_ref();
-        // Accept both `.jsonl` (canonical) and `.json` (common alias).
-        if !loc.ends_with(".jsonl") && !loc.ends_with(".json") {
-            continue;
-        }
-        let bytes = store
-            .get(&meta.location)
-            .await
-            .map_err(|e| BackendError::Connection(format!("get {}: {e}", meta.location)))?
-            .bytes()
-            .await
-            .map_err(|e| BackendError::Connection(format!("get bytes: {e}")))?;
-        let mut cursor = std::io::Cursor::new(bytes.as_ref());
-        let (schema, _records_inferred) = infer_json_schema_from_seekable(&mut cursor, Some(1024))
-            .map_err(|e| BackendError::Query(format!("json infer: {e}")))?;
-        // `infer_json_schema_from_seekable` rewinds; the same Cursor
-        // works for the typed reader.
-        let reader = ReaderBuilder::new(Arc::new(schema))
-            .build(std::io::BufReader::new(cursor))
-            .map_err(|e| BackendError::Query(format!("json reader: {e}")))?;
-        for b in reader {
-            let b = b.map_err(|e| BackendError::Query(format!("json batch: {e}")))?;
-            batches.push(b);
-        }
+    for b in reader {
+        batches.push(b.map_err(|e| BackendError::Query(format!("json batch: {e}")))?);
     }
     Ok(batches)
 }
@@ -483,35 +500,28 @@ async fn write_jsonl_at_path(
 /// `orc-rust` 0.6 has a sync `ArrowReaderBuilder` that needs a
 /// `ChunkReader` (essentially `Read + Seek + len`); `Cursor<&[u8]>`
 /// satisfies that.
-async fn read_orc_under_prefix(
+/// Decode a single ORC object. orc-rust 0.6's `ChunkReader` impl
+/// works directly on `Bytes`, so we hand it the buffer without an
+/// intermediate Cursor.
+async fn decode_orc_file(
     store: &Arc<dyn ObjectStore>,
-    prefix: ObjectPath,
+    meta: &object_store::ObjectMeta,
 ) -> Result<Vec<RecordBatch>, BackendError> {
     use orc_rust::ArrowReaderBuilder;
 
-    let mut listing = store.list(Some(&prefix));
+    let bytes = store
+        .get(&meta.location)
+        .await
+        .map_err(|e| BackendError::Connection(format!("get {}: {e}", meta.location)))?
+        .bytes()
+        .await
+        .map_err(|e| BackendError::Connection(format!("get bytes: {e}")))?;
+    let reader = ArrowReaderBuilder::try_new(bytes)
+        .map_err(|e| BackendError::Query(format!("orc open: {e}")))?
+        .build();
     let mut batches: Vec<RecordBatch> = Vec::new();
-    while let Some(meta) = listing.next().await {
-        let meta = meta.map_err(|e| BackendError::Connection(format!("list: {e}")))?;
-        if !meta.location.as_ref().ends_with(".orc") {
-            continue;
-        }
-        let bytes = store
-            .get(&meta.location)
-            .await
-            .map_err(|e| BackendError::Connection(format!("get {}: {e}", meta.location)))?
-            .bytes()
-            .await
-            .map_err(|e| BackendError::Connection(format!("get bytes: {e}")))?;
-        // orc-rust's ChunkReader is implemented directly on `Bytes`,
-        // so we hand it the bytes without an intermediate Cursor.
-        let reader = ArrowReaderBuilder::try_new(bytes)
-            .map_err(|e| BackendError::Query(format!("orc open: {e}")))?
-            .build();
-        for b in reader {
-            let b = b.map_err(|e| BackendError::Query(format!("orc batch: {e}")))?;
-            batches.push(b);
-        }
+    for b in reader {
+        batches.push(b.map_err(|e| BackendError::Query(format!("orc batch: {e}")))?);
     }
     Ok(batches)
 }
@@ -653,6 +663,70 @@ async fn record_run_event(
     Ok(())
 }
 
+/// P4 #28: incremental streaming-source read. Lists objects under
+/// `prefix` whose location sorts strictly greater than `after_key`
+/// (deterministic ascending), decodes each per `format`, and
+/// returns `(batches, new_last_key)` where `new_last_key` is the
+/// highest emitted location string. Empty stream → `(vec![], None)`.
+async fn streaming_read_after(
+    store: &Arc<dyn ObjectStore>,
+    format: ObjectFormat,
+    prefix: &ObjectPath,
+    after_key: Option<&str>,
+) -> Result<(Vec<RecordBatch>, Option<String>), BackendError> {
+    let extensions: &[&str] = match format {
+        ObjectFormat::Parquet => &[".parquet"],
+        ObjectFormat::Csv => &[".csv"],
+        ObjectFormat::JsonLines => &[".jsonl", ".json"],
+        ObjectFormat::Orc => &[".orc"],
+    };
+    let metas = list_files_with_extension(store, prefix, extensions, after_key).await?;
+    let mut batches: Vec<RecordBatch> = Vec::new();
+    let mut new_last: Option<String> = None;
+    for meta in metas {
+        let key = meta.location.as_ref().to_string();
+        let file_batches = match format {
+            ObjectFormat::Parquet => decode_parquet_file(store, &meta).await?,
+            ObjectFormat::Csv => decode_csv_file(store, &meta).await?,
+            ObjectFormat::JsonLines => decode_jsonl_file(store, &meta).await?,
+            ObjectFormat::Orc => decode_orc_file(store, &meta).await?,
+        };
+        batches.extend(file_batches);
+        new_last = Some(key);
+    }
+    Ok((batches, new_last))
+}
+
+/// P4 #28: opaque per-source offset payload. Same wire-format
+/// pattern as `KafkaOffsetSnapshotV1`: versioned JSON, decoded by
+/// the source backend that wrote it. Carries the highest object
+/// key consumed; subsequent reads filter to keys > this.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ObjectStoreOffsetSnapshotV1 {
+    v: u32,
+    last_object_key: String,
+}
+
+pub(crate) fn encode_objectstore_offset(last_key: &str) -> Result<Vec<u8>, BackendError> {
+    serde_json::to_vec(&ObjectStoreOffsetSnapshotV1 {
+        v: 1,
+        last_object_key: last_key.to_string(),
+    })
+    .map_err(|e| BackendError::Other(format!("objectstore offset encode: {e}")))
+}
+
+pub(crate) fn decode_objectstore_offset(bytes: &[u8]) -> Result<String, BackendError> {
+    let snap: ObjectStoreOffsetSnapshotV1 = serde_json::from_slice(bytes)
+        .map_err(|e| BackendError::Other(format!("objectstore offset decode: {e}")))?;
+    if snap.v != 1 {
+        return Err(BackendError::Other(format!(
+            "objectstore offset payload v={} not supported (this build understands v=1)",
+            snap.v
+        )));
+    }
+    Ok(snap.last_object_key)
+}
+
 /// Delete every object under `prefix`. Used by `WriteMode::Truncate`.
 /// Walks the listing and issues per-object deletes — `object_store`
 /// has no atomic prefix-delete primitive (S3/Azure/GCS don't either,
@@ -729,15 +803,69 @@ impl Backend for ObjectStoreBackend {
     async fn read_arrow_stream(&self, query: &str) -> Result<ArrowBatchStream, BackendError> {
         // `query` is interpreted as a relative path prefix. Empty string
         // → read everything under the root.
+        //
+        // P4 #28: streaming-source semantics. `last_seen_object_key`
+        // is the highest object key consumed by any prior call on
+        // this backend (or restored from `seek_to` at startup). The
+        // first call returns everything (cold start); subsequent
+        // calls return only files whose location sorts strictly
+        // greater. Single-call batch use (the strategy executors,
+        // tests) sees no behavior change — the state is
+        // initialized to None and the fresh backend reads
+        // everything on its single call.
         let prefix = ObjectPath::from(query);
-        let batches = match self.format {
-            ObjectFormat::Parquet => read_parquet_under_prefix(&self.store, prefix).await?,
-            ObjectFormat::Csv => read_csv_under_prefix(&self.store, prefix).await?,
-            ObjectFormat::JsonLines => read_jsonl_under_prefix(&self.store, prefix).await?,
-            ObjectFormat::Orc => read_orc_under_prefix(&self.store, prefix).await?,
-        };
+        let after_key = self
+            .last_seen_object_key
+            .lock()
+            .map_err(|e| BackendError::Other(format!("objectstore seek lock: {e}")))?
+            .clone();
+        let (batches, new_last) =
+            streaming_read_after(&self.store, self.format, &prefix, after_key.as_deref()).await?;
+        if let Some(key) = new_last {
+            *self
+                .last_seen_object_key
+                .lock()
+                .map_err(|e| BackendError::Other(format!("objectstore seek lock: {e}")))? =
+                Some(key);
+        }
         let stream = futures_util::stream::iter(batches.into_iter().map(Ok));
         Ok(Box::pin(stream))
+    }
+
+    /// P4 #28: opt into the `StateStore`-backed resume path so
+    /// streaming pipelines using an object-store source can recover
+    /// committed offsets across restarts.
+    fn supports_seek_to(&self) -> bool {
+        true
+    }
+
+    /// P4 #28: rewind the read position to a previously committed
+    /// `last_object_key`. Subsequent `read_arrow_stream` calls only
+    /// emit files whose location sorts strictly greater.
+    async fn seek_to(&self, offset_bytes: &[u8]) -> Result<(), BackendError> {
+        let last_key = decode_objectstore_offset(offset_bytes)?;
+        *self
+            .last_seen_object_key
+            .lock()
+            .map_err(|e| BackendError::Other(format!("objectstore seek lock: {e}")))? =
+            Some(last_key);
+        Ok(())
+    }
+
+    /// P4 #28: capture the current high-water-mark object key as
+    /// JSON for `StateStore.commit`. Returns `None` if the backend
+    /// hasn't consumed any objects since startup or the last
+    /// commit-equivalent state restoration.
+    async fn offset_snapshot(&self) -> Result<Option<Vec<u8>>, BackendError> {
+        let snap = self
+            .last_seen_object_key
+            .lock()
+            .map_err(|e| BackendError::Other(format!("objectstore seek lock: {e}")))?
+            .clone();
+        match snap {
+            Some(key) => Ok(Some(encode_objectstore_offset(&key)?)),
+            None => Ok(None),
+        }
     }
 
     async fn write_arrow_stream(
@@ -969,6 +1097,147 @@ mod tests {
         Box::pin(futures_util::stream::once(async move {
             Ok::<_, BackendError>(batch)
         }))
+    }
+
+    /// P4 #28: streaming-source happy path. Successive
+    /// `read_arrow_stream` calls return only files that landed AFTER
+    /// the previous call's high-water mark — the building block for
+    /// "watch a prefix, ingest new Parquet as it arrives" pipelines.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn read_arrow_stream_only_emits_files_newer_than_last_seen() {
+        use futures_util::TryStreamExt;
+        let dir = tempfile::tempdir().unwrap();
+        let backend = ObjectStoreBackend::open_local(dir.path(), ObjectFormat::Parquet).unwrap();
+        let target = TargetTable {
+            schema: "raw".into(),
+            name: "events".into(),
+        };
+
+        // First write + read: 3 rows go in, 3 come out.
+        backend
+            .write_arrow_stream(&target, arrow_stream_for(small_batch()), WriteMode::Append)
+            .await
+            .unwrap();
+        let s = backend.read_arrow_stream("raw/events").await.unwrap();
+        let batches: Vec<RecordBatch> = s.try_collect().await.unwrap();
+        assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 3);
+
+        // Second read with no new files → empty stream. The streaming
+        // pipeline's idle-pause kicks in at this point in production.
+        let s = backend.read_arrow_stream("raw/events").await.unwrap();
+        let batches: Vec<RecordBatch> = s.try_collect().await.unwrap();
+        assert_eq!(
+            batches.iter().map(|b| b.num_rows()).sum::<usize>(),
+            0,
+            "second read with no new files must be empty"
+        );
+
+        // Write a fresh batch (UUIDv7 → newer key) and read again →
+        // only the new rows surface.
+        backend
+            .write_arrow_stream(&target, arrow_stream_for(small_batch()), WriteMode::Append)
+            .await
+            .unwrap();
+        let s = backend.read_arrow_stream("raw/events").await.unwrap();
+        let batches: Vec<RecordBatch> = s.try_collect().await.unwrap();
+        assert_eq!(
+            batches.iter().map(|b| b.num_rows()).sum::<usize>(),
+            3,
+            "third read must surface only the newly-written file"
+        );
+    }
+
+    /// P4 #28: `seek_to` rewinds the high-water mark so subsequent
+    /// reads start from a previously-committed key. Mirrors how
+    /// `StateStore` recovery wires up at pipeline startup. The
+    /// snapshot itself comes from a real `offset_snapshot` call —
+    /// this is the round-trip pattern, not a hand-rolled key.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn seek_to_resumes_from_previous_offset_snapshot() {
+        use futures_util::TryStreamExt;
+        let dir = tempfile::tempdir().unwrap();
+        let backend = ObjectStoreBackend::open_local(dir.path(), ObjectFormat::Parquet).unwrap();
+        let target = TargetTable {
+            schema: "raw".into(),
+            name: "events".into(),
+        };
+
+        // Write file 1, consume it, capture the snapshot.
+        backend
+            .write_arrow_stream(&target, arrow_stream_for(small_batch()), WriteMode::Append)
+            .await
+            .unwrap();
+        let _ = backend.read_arrow_stream("raw/events").await.unwrap();
+        let snap = backend
+            .offset_snapshot()
+            .await
+            .unwrap()
+            .expect("snapshot after first read");
+
+        // Tiny sleep so file 2's UUIDv7 sorts strictly after file 1's.
+        // UUIDv7 uses millisecond precision; back-to-back writes on a
+        // fast machine can collide on the millisecond and emit
+        // identical-prefix keys (only the random suffix differs, so
+        // ordering is non-deterministic). 2 ms guarantees separation.
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+
+        // New backend instance simulating a restart. Restore from
+        // the snapshot and read — only file 2 (yet to be written)
+        // should surface.
+        let backend2 = ObjectStoreBackend::open_local(dir.path(), ObjectFormat::Parquet).unwrap();
+        backend2.seek_to(&snap).await.unwrap();
+        backend2
+            .write_arrow_stream(&target, arrow_stream_for(small_batch()), WriteMode::Append)
+            .await
+            .unwrap();
+        let s = backend2.read_arrow_stream("raw/events").await.unwrap();
+        let batches: Vec<RecordBatch> = s.try_collect().await.unwrap();
+        assert_eq!(
+            batches.iter().map(|b| b.num_rows()).sum::<usize>(),
+            3,
+            "after seek_to, the restored backend must skip file 1 and surface only file 2"
+        );
+    }
+
+    /// P4 #28: `offset_snapshot` returns `None` until at least one
+    /// `read_arrow_stream` call has consumed something — matches the
+    /// Kafka backend's behavior so the snapshot path is uniform.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn offset_snapshot_is_none_until_first_consumption() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = ObjectStoreBackend::open_local(dir.path(), ObjectFormat::Parquet).unwrap();
+        assert!(backend.offset_snapshot().await.unwrap().is_none());
+
+        let target = TargetTable {
+            schema: "raw".into(),
+            name: "events".into(),
+        };
+        backend
+            .write_arrow_stream(&target, arrow_stream_for(small_batch()), WriteMode::Append)
+            .await
+            .unwrap();
+        let _ = backend.read_arrow_stream("raw/events").await.unwrap();
+        let snap = backend.offset_snapshot().await.unwrap().unwrap();
+        let key = decode_objectstore_offset(&snap).unwrap();
+        assert!(
+            key.starts_with("raw/events/") && key.ends_with(".parquet"),
+            "snapshot key {key:?} should be a parquet path under the target prefix"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn seek_to_with_garbage_bytes_returns_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = ObjectStoreBackend::open_local(dir.path(), ObjectFormat::Parquet).unwrap();
+        let err = backend.seek_to(b"not-json").await.unwrap_err();
+        assert!(err.to_string().contains("decode"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn supports_seek_to_returns_true() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = ObjectStoreBackend::open_local(dir.path(), ObjectFormat::Parquet).unwrap();
+        assert!(backend.supports_seek_to());
     }
 
     /// Π.1.4: Parquet writes round-trip through every supported
