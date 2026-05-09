@@ -812,6 +812,60 @@ mod tests {
         assert_eq!(out[0].schema().field(1).name(), "name");
     }
 
+    /// Σ.A1 audit: `EXPLAIN`/`EXPLAIN ANALYZE` must round-trip
+    /// cleanly through `DataFusionTransform` so users can ask "what
+    /// would this plan look like?" without bypassing the framework's
+    /// SQL pipeline. The transform's output_schema is whatever
+    /// DataFusion advertises for the EXPLAIN node — typically
+    /// `(plan_type Utf8, plan Utf8)`. We don't pin the exact field
+    /// names (DataFusion has churned them across releases); we
+    /// assert two `Utf8` columns and that at least one row is
+    /// produced.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn explain_select_round_trips() {
+        let t = DataFusionTransform::new("EXPLAIN SELECT id, name FROM source", schema_id_name())
+            .await
+            .expect("EXPLAIN construct");
+        assert!(
+            !t.is_trivial(),
+            "EXPLAIN must take the DataFusion path (no trivial-projection bypass)"
+        );
+        assert_eq!(t.output_schema().fields().len(), 2);
+        for f in t.output_schema().fields() {
+            assert_eq!(f.data_type(), &DataType::Utf8);
+        }
+        let out = t
+            .transform(batch_two_rows(), &BatchContext::default())
+            .await
+            .expect("EXPLAIN execute");
+        let total: usize = out.iter().map(|b| b.num_rows()).sum();
+        assert!(total >= 1, "EXPLAIN must emit at least one plan row");
+    }
+
+    /// Σ.A1 audit: `EXPLAIN ANALYZE` runs the plan and returns
+    /// per-stage metrics. Same shape as `EXPLAIN` from the framework's
+    /// perspective — two Utf8 columns — but with row count tied to
+    /// the executed plan's metrics. Smoke-only; we just need it to
+    /// not error.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn explain_analyze_select_round_trips() {
+        let t = DataFusionTransform::new(
+            "EXPLAIN ANALYZE SELECT id, name FROM source",
+            schema_id_name(),
+        )
+        .await
+        .expect("EXPLAIN ANALYZE construct");
+        let out = t
+            .transform(batch_two_rows(), &BatchContext::default())
+            .await
+            .expect("EXPLAIN ANALYZE execute");
+        let total: usize = out.iter().map(|b| b.num_rows()).sum();
+        assert!(
+            total >= 1,
+            "EXPLAIN ANALYZE must emit at least one metrics row"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn output_schema_matches_collected_batches() {
         let t = DataFusionTransform::new("SELECT name, id FROM source", schema_id_name())
