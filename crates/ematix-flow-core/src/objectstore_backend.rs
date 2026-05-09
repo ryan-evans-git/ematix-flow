@@ -247,40 +247,51 @@ async fn read_parquet_under_prefix(
 }
 
 /// Write a stream of Arrow batches as one Parquet file at `path`.
+///
+/// Streams batches straight to `object_store::buffered::BufWriter` —
+/// under its 10 MiB capacity the writer issues a single PUT, over
+/// it switches to multipart upload with bounded RSS regardless of
+/// total file size. Replaces the original "buffer everything in
+/// `Vec<u8>` then PUT" path that cost O(file-size) memory on >GB
+/// writes.
 async fn write_parquet_at_path(
     store: &Arc<dyn ObjectStore>,
     path: ObjectPath,
     mut stream: ArrowBatchStream,
     options: &ObjectWriteOptions,
 ) -> Result<u64, BackendError> {
-    // Buffer batches in memory first — keeps Phase 34a simple. Streaming
-    // multipart upload via `object_store::buffered::BufWriter` is a
-    // future optimization (matters for >GB inputs to S3).
-    let mut batches: Vec<RecordBatch> = Vec::new();
-    while let Some(b) = stream.next().await {
-        batches.push(b?);
-    }
-    if batches.is_empty() {
-        // No-op: don't create a zero-row file.
+    // Pull the first batch to learn the schema; an empty stream is
+    // a no-op (don't create a zero-row file).
+    let Some(first) = stream.next().await.transpose()? else {
         return Ok(0);
-    }
-    let schema = batches[0].schema();
-    // Encode to a Bytes buffer, then PUT in one call. AsyncArrowWriter
-    // writes to anything implementing AsyncWrite; we use a Vec<u8>
-    // wrapped in a Compat shim via `tokio::io::AsyncWriteExt`.
-    let mut buf: Vec<u8> = Vec::with_capacity(64 * 1024);
+    };
+    let schema = first.schema();
     let mut props_builder = WriterProperties::builder();
     if let Some(codec) = options.parquet_compression {
         props_builder = props_builder.set_compression(parquet_compression_to_codec(codec));
     }
     let props = props_builder.build();
-    let mut writer = AsyncArrowWriter::try_new(&mut buf, schema.clone(), Some(props))
+
+    // `AsyncArrowWriter::close()` calls `complete()` on the inner
+    // sink, which (via the `AsyncFileWriter`-for-`AsyncWrite`
+    // blanket impl in `parquet`) flushes + shuts the BufWriter down
+    // and commits the multipart upload. No explicit shutdown here
+    // — calling it twice trips BufWriter's `async fn resumed after
+    // completion` guard.
+    let sink = object_store::buffered::BufWriter::new(store.clone(), path);
+    let mut writer = AsyncArrowWriter::try_new(sink, schema, Some(props))
         .map_err(|e| BackendError::Query(format!("parquet writer init: {e}")))?;
-    let mut total: u64 = 0;
-    for batch in &batches {
+
+    let mut total: u64 = first.num_rows() as u64;
+    writer
+        .write(&first)
+        .await
+        .map_err(|e| BackendError::Query(format!("parquet write batch: {e}")))?;
+    while let Some(batch) = stream.next().await {
+        let batch = batch?;
         total += batch.num_rows() as u64;
         writer
-            .write(batch)
+            .write(&batch)
             .await
             .map_err(|e| BackendError::Query(format!("parquet write batch: {e}")))?;
     }
@@ -288,11 +299,6 @@ async fn write_parquet_at_path(
         .close()
         .await
         .map_err(|e| BackendError::Query(format!("parquet close: {e}")))?;
-    let bytes = Bytes::from(buf);
-    store
-        .put(&path, bytes.into())
-        .await
-        .map_err(|e| BackendError::Connection(format!("put {path}: {e}")))?;
     Ok(total)
 }
 
@@ -1053,6 +1059,97 @@ mod tests {
                  expected compression to actually reduce size"
             );
         }
+    }
+
+    /// P3 #25: Parquet writes that exceed `BufWriter`'s default
+    /// 10 MiB capacity must still round-trip cleanly. With the
+    /// streaming sink this exercises the multipart-upload path
+    /// (over-cap branch); with a single-PUT sink it would force
+    /// the whole file through one `put` call. Either way the
+    /// invariant the caller cares about is "file written, content
+    /// matches input."
+    #[tokio::test(flavor = "multi_thread")]
+    async fn parquet_round_trips_when_payload_exceeds_bufwriter_capacity() {
+        // ~12 MiB of raw arrow data: 200k rows × ~64 bytes/row.
+        // Per-row uniqueness defeats dictionary encoding so even
+        // Snappy can't squeeze the file under the 10 MiB BufWriter
+        // capacity threshold. We split into 20 batches of 10k rows
+        // each so the streaming write path actually iterates.
+        const BATCHES: usize = 20;
+        const ROWS_PER_BATCH: usize = 10_000;
+
+        fn batch(start: i64) -> RecordBatch {
+            let schema = Arc::new(ArrowSchema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("payload", DataType::Utf8, false),
+            ]));
+            let ids: Vec<i64> = (start..start + ROWS_PER_BATCH as i64).collect();
+            let payloads: Vec<String> = (start..start + ROWS_PER_BATCH as i64)
+                .map(|i| format!("payload-row-{i:020}-tail-padding-bytes"))
+                .collect();
+            RecordBatch::try_new(
+                schema,
+                vec![
+                    Arc::new(Int64Array::from(ids)),
+                    Arc::new(StringArray::from(payloads)),
+                ],
+            )
+            .unwrap()
+        }
+
+        let stream: ArrowBatchStream =
+            Box::pin(futures_util::stream::iter((0..BATCHES).map(|i| {
+                Ok::<_, BackendError>(batch((i * ROWS_PER_BATCH) as i64))
+            })));
+
+        let dir = tempfile::tempdir().unwrap();
+        let backend = ObjectStoreBackend::open_local(dir.path(), ObjectFormat::Parquet)
+            .unwrap()
+            .with_write_options(ObjectWriteOptions {
+                // Uncompressed keeps the on-disk size close to the
+                // raw arrow size, ensuring we cross the 10 MiB
+                // BufWriter capacity threshold.
+                parquet_compression: Some(crate::backend::ParquetCompression::Uncompressed),
+                ..Default::default()
+            });
+        let target = TargetTable {
+            schema: "raw".into(),
+            name: "events".into(),
+        };
+        let n = backend
+            .write_arrow_stream(&target, stream, WriteMode::Append)
+            .await
+            .unwrap();
+        assert_eq!(
+            n,
+            (BATCHES * ROWS_PER_BATCH) as u64,
+            "row count returned from write_arrow_stream"
+        );
+
+        // File is over BufWriter's 10 MiB threshold — sanity-check
+        // the on-disk size so a future regression that silently
+        // shrinks the test data (and stops exercising multipart)
+        // is caught immediately.
+        let mut listing = backend.store().list(Some(&ObjectPath::from("raw/events")));
+        let mut total_size = 0u64;
+        let mut file_count = 0;
+        while let Some(meta) = listing.next().await {
+            total_size += meta.unwrap().size;
+            file_count += 1;
+        }
+        assert_eq!(file_count, 1, "exactly one Parquet file written");
+        assert!(
+            total_size > 10 * 1024 * 1024,
+            "file = {total_size} bytes, expected > 10 MiB to exercise the \
+             BufWriter multipart path"
+        );
+
+        let stream = backend.read_arrow_stream("raw/events").await.unwrap();
+        let batches: Vec<RecordBatch> = futures_util::TryStreamExt::try_collect(stream)
+            .await
+            .unwrap();
+        let read_total: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(read_total, BATCHES * ROWS_PER_BATCH, "round-trip row count");
     }
 
     /// Π.1.4: CSV writes honor user-set `csv_delimiter` + `csv_header`.
