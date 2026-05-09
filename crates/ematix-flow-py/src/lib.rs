@@ -3,6 +3,7 @@ mod kafka;
 mod kinesis;
 mod pubsub;
 mod rabbitmq;
+mod udf;
 
 use std::sync::{Arc, OnceLock};
 
@@ -22,7 +23,7 @@ use tokio::runtime::Runtime;
 
 static RUNTIME: OnceLock<Runtime> = OnceLock::new();
 
-fn rt() -> &'static Runtime {
+pub(crate) fn rt() -> &'static Runtime {
     RUNTIME.get_or_init(|| {
         tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -811,11 +812,14 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(cross_backend_arrow_sync, m)?)?;
     m.add_function(wrap_pyfunction!(run_pipeline_from_toml_str, m)?)?;
     m.add_function(wrap_pyfunction!(run_pipeline_from_path, m)?)?;
+    m.add_function(wrap_pyfunction!(udf::make_python_udf, m)?)?;
+    m.add_function(wrap_pyfunction!(udf::_apply_python_udf_to_batch, m)?)?;
     m.add_class::<Connection>()?;
     m.add_class::<kafka::PyKafkaBackend>()?;
     m.add_class::<rabbitmq::PyRabbitMQBackend>()?;
     m.add_class::<pubsub::PyPubSubBackend>()?;
     m.add_class::<kinesis::PyKinesisBackend>()?;
     m.add_class::<arrow_iter::PyArrowBatchIter>()?;
+    m.add_class::<udf::PyUdfHandle>()?;
     Ok(())
 }
