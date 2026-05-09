@@ -92,9 +92,7 @@ def test_realistic_black_scholes_call_delta():
         ],
         names=["strike", "spot", "vol", "rate", "expiry"],
     )
-    out = apply_udf_to_batch(
-        bs_call_delta, batch, ["strike", "spot", "vol", "rate", "expiry"]
-    )
+    out = apply_udf_to_batch(bs_call_delta, batch, ["strike", "spot", "vol", "rate", "expiry"])
     deltas = out.to_pylist()
     # ATM ≈ 0.55, ITM > ATM, OTM < ATM. The exact values depend on
     # the cumulative-normal approximation — assert the qualitative
@@ -125,6 +123,6 @@ def test_unsupported_datatype_raises_at_decoration():
 
     with pytest.raises(ValueError, match="unsupported UDF DataType"):
 
-        @udf(args=("Decimal128",), returns="Float64")  # noqa: F811
+        @udf(args=("Decimal128",), returns="Float64")
         def bad(x):
             return x

@@ -23,8 +23,7 @@ from typing import Any
 
 from ematix_flow import _core
 
-
-__all__ = ["udf", "PythonScalarUdfHandle", "apply_udf_to_batch"]
+__all__ = ["PythonScalarUdfHandle", "apply_udf_to_batch", "udf"]
 
 
 # Re-export the PyO3 class so users can type-annotate against it.
@@ -96,6 +95,4 @@ def apply_udf_to_batch(
     once that wiring lands; this is the test harness for the round-trip
     until then.
     """
-    return _core._apply_python_udf_to_batch(
-        handle, batch, list(arg_columns), output_column
-    )
+    return _core._apply_python_udf_to_batch(handle, batch, list(arg_columns), output_column)
