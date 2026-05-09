@@ -1129,7 +1129,7 @@ counters under `pipeline=<name>`:
 | **DuckDB** | Shipped (Δ.X2) | Same per-event shape as Postgres; type coercion via `from_json(?, '<struct-spec>')`. In-memory + file-backed both work. |
 | **SQLite** | Shipped (Δ.X2) | Same per-event shape as Postgres; type coercion via `json_extract(?1, '$.col')` per column. `main` schema only (SQLite has no first-class schemas; multi-DB ATTACH is a future enhancement). |
 | **MySQL** | Shipped (Δ.X2) | Same per-event shape as Postgres; uses `INSERT ... ON DUPLICATE KEY UPDATE` and `IF(JSON_TYPE(...) = 'NULL', NULL, JSON_UNQUOTE(JSON_EXTRACT(...)))` to keep JSON null clean across all column types. No `RETURNING` — the idempotency gate reads `affected_rows()` (1=insert, 2=advance, 0=reject). |
-| **Object stores** | Deferred (Δ.X3) | Parquet / CSV / JSON / ORC are immutable — recommend Delta-on-S3 (Δ.X1) instead. |
+| **Object stores** | Closed: deferred (Δ.X3) | Parquet / CSV / JSON / ORC files are immutable — per-event UPDATE / DELETE has no clean shape. Use **`DeltaS3Backend`** (already shipped under Δ.X1) for CDC into object storage; Delta sits on the same S3 / GCS / Azure blobs and gives you transactional MERGE for free. The append-only "event log + downstream window-by-PK" pattern remains buildable via the existing transform stage + ObjectStore target without first-class CDC support. |
 
 Default `Backend::run_cdc` impl errors with a clear "not
 implemented for this dialect" message on backends without a
