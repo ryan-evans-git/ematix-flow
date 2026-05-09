@@ -224,15 +224,19 @@ enum Side {
 
 /// One buffered row, retained until the watermark passes its
 /// retention deadline.
+///
+/// `values` is held behind an `Arc` so a row that matches N
+/// opposite-side rows on emit pays N cheap pointer-clones instead
+/// of N deep `Vec<ScalarValue>` clones — the steady-state hot
+/// path documented in P3 #22 (criterion bench
+/// `join_steady_state_1000x1000_match_rate`). Wire format is
+/// unchanged: with serde's `rc` feature, `Arc<T>` round-trips as
+/// `T`, so the postcard buffer blob is byte-identical to the pre-Arc
+/// shape.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct BufferedRow {
     event_ts: i64,
-    /// Per-column values, indexed by the side's input schema. For
-    /// the join output we only need to read these out at emit
-    /// time; storing as `ArrayRef`s + a row index would be more
-    /// memory-efficient but harder to evict. PR 1 uses owned
-    /// scalars per row; revisit if profiling shows pressure.
-    values: Vec<ScalarValue>,
+    values: Arc<Vec<ScalarValue>>,
     /// Phase 39.5b P2.12: `true` once this row has matched any
     /// opposite-side row. Drives outer-join orphan-emit logic at
     /// eviction time. Default `false`; flipped to `true` on first
@@ -431,8 +435,9 @@ impl TimeWindowedJoinTransform {
                 let still_alive = wm <= r.event_ts + left_horizon;
                 if !still_alive && !r.matched && kind.emits_orphan_left() {
                     // Outer-join orphan: emit `(left_data, NULLs)`.
+                    // `Arc::clone` — no deep scalar copy.
                     orphans.push(EmittedRow {
-                        left: Some(r.values.clone()),
+                        left: Some(Arc::clone(&r.values)),
                         right: None,
                     });
                 }
@@ -460,7 +465,7 @@ impl TimeWindowedJoinTransform {
                 if !still_alive && !r.matched && kind.emits_orphan_right() {
                     orphans.push(EmittedRow {
                         left: None,
-                        right: Some(r.values.clone()),
+                        right: Some(Arc::clone(&r.values)),
                     });
                 }
                 still_alive
@@ -560,10 +565,14 @@ impl TimeWindowedJoinTransform {
             // Build the join key from the side's key columns.
             let key = GroupKey::from_row(&key_arrays, row)?;
 
-            // Snapshot the row's values for buffering + emit.
-            let values: Vec<ScalarValue> = (0..all_arrays.len())
-                .map(|c| extract_scalar(&all_arrays[c], row))
-                .collect::<Result<_, _>>()?;
+            // Snapshot the row's values for buffering + emit. Wrap
+            // in Arc so subsequent match emits and the buffer entry
+            // share one heap allocation.
+            let values: Arc<Vec<ScalarValue>> = Arc::new(
+                (0..all_arrays.len())
+                    .map(|c| extract_scalar(&all_arrays[c], row))
+                    .collect::<Result<Vec<_>, _>>()?,
+            );
 
             // Find matches against the OPPOSITE buffer.
             // P2.12: track whether THIS arriving row matched any
@@ -585,14 +594,15 @@ impl TimeWindowedJoinTransform {
                     };
                     if min_us <= dt && dt <= max_us {
                         // Order: left + right (regardless of which
-                        // side arrived first).
+                        // side arrived first). Both clones are
+                        // cheap `Arc::clone`s — no deep copy.
                         let (left_vals, right_vals) = match side {
-                            Side::Left => (&values, &opp_row.values),
-                            Side::Right => (&opp_row.values, &values),
+                            Side::Left => (Arc::clone(&values), Arc::clone(&opp_row.values)),
+                            Side::Right => (Arc::clone(&opp_row.values), Arc::clone(&values)),
                         };
                         emitted_rows.push(EmittedRow {
-                            left: Some(left_vals.clone()),
-                            right: Some(right_vals.clone()),
+                            left: Some(left_vals),
+                            right: Some(right_vals),
                         });
                         // P2.12: mark the opposite-side row matched
                         // so it doesn't fire an orphan-emit when it
@@ -833,10 +843,14 @@ impl BatchTransform for TimeWindowedJoinTransform {
 /// sides populated. Outer-join orphan emits leave the unmatched
 /// side as `None`, which `build_emit_batch` materializes as a
 /// row of NULLs for that side's columns.
+///
+/// Sides are `Arc<Vec<ScalarValue>>` references back to the
+/// `BufferedRow` they came from — a cheap `Arc::clone` per
+/// emitted row instead of a deep `Vec<ScalarValue>` clone (P3 #22).
 #[derive(Debug, Clone)]
 struct EmittedRow {
-    left: Option<Vec<ScalarValue>>,
-    right: Option<Vec<ScalarValue>>,
+    left: Option<Arc<Vec<ScalarValue>>>,
+    right: Option<Arc<Vec<ScalarValue>>>,
 }
 
 fn build_output_schema(
@@ -1955,16 +1969,16 @@ mod tests {
         let rows = vec![
             BufferedRow {
                 event_ts: 1234,
-                values: vec![
+                values: Arc::new(vec![
                     ScalarValue::Int64(7),
                     ScalarValue::Utf8("hello".into()),
                     ScalarValue::Null,
-                ],
+                ]),
                 matched: false,
             },
             BufferedRow {
                 event_ts: 5678,
-                values: vec![ScalarValue::Float64Bits(1.5_f64.to_bits())],
+                values: Arc::new(vec![ScalarValue::Float64Bits(1.5_f64.to_bits())]),
                 matched: true,
             },
         ];
