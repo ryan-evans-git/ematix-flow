@@ -210,14 +210,19 @@ pub struct DataFusionTransform {
     /// so contention is zero in practice — the lock is there for
     /// correctness against the refresh-task background loader.
     ctx: Option<Mutex<SessionContext>>,
-    /// Phase 39.5a P2.16: per-lookup schema captured at
-    /// `new_with_lookups` time. `refresh_lookup` cross-checks the
-    /// incoming batches' schema against the registered shape and
-    /// fails loud on drift — the cached SQL plan is bound to the
-    /// original column names + types, so silently swapping in
-    /// drifted data would error mid-batch on the next
-    /// `transform()` call rather than at refresh time.
-    lookup_schemas: std::collections::HashMap<String, SchemaRef>,
+    /// Per-lookup schema captured at `new_with_lookups` time and
+    /// updated by `refresh_lookup` when a graceful re-plan accepts
+    /// a drifted shape (P3 #24). `refresh_lookup` cross-checks each
+    /// refresh against the tracked shape; the cached SQL plan is
+    /// bound to the original column names + types, so a mismatch
+    /// triggers a tentative re-plan against the new shape and
+    /// either accepts (output schema unchanged) or rolls back with
+    /// a clear error.
+    ///
+    /// Mutex because `refresh_lookup(&self, ...)` mutates the entry
+    /// when accepting drift; the lock is held only briefly inside
+    /// the refresh body.
+    lookup_schemas: Mutex<std::collections::HashMap<String, SchemaRef>>,
 }
 
 impl std::fmt::Debug for DataFusionTransform {
@@ -330,7 +335,7 @@ impl DataFusionTransform {
             output_schema,
             trivial_indices,
             ctx,
-            lookup_schemas,
+            lookup_schemas: Mutex::new(lookup_schemas),
         })
     }
 
@@ -420,28 +425,6 @@ impl BatchTransform for DataFusionTransform {
                 "transform: cannot refresh reserved name `source`".into(),
             ));
         }
-        // Phase 39.5a P2.16: cross-check schema against the
-        // originally-registered lookup shape. The compiled SQL
-        // plan is bound to the original column names + types;
-        // silently swapping in a drifted `MemTable` would error
-        // mid-batch on the next `transform()` call. Detect drift
-        // here so the refresh task fails fast + the supervisor
-        // restart picks up a fresh plan.
-        let original = self.lookup_schemas.get(name).ok_or_else(|| {
-            BackendError::Other(format!(
-                "transform: refresh: lookup `{name}` is not registered"
-            ))
-        })?;
-        if !schemas_equivalent(original.as_ref(), schema.as_ref()) {
-            return Err(BackendError::Other(format!(
-                "transform: refresh `{name}` schema drift detected — \
-                 original {} fields vs incoming {} fields, or field types differ. \
-                 The cached SQL plan is bound to the original schema; restart the \
-                 pipeline to pick up the new shape.",
-                original.fields().len(),
-                schema.fields().len()
-            )));
-        }
         let ctx_lock = self.ctx.as_ref().ok_or_else(|| {
             BackendError::Other(
                 "transform: trivial-bypass path has no DataFusion ctx — \
@@ -450,26 +433,94 @@ impl BatchTransform for DataFusionTransform {
             )
         })?;
         let ctx = ctx_lock.lock().await;
-        let mem = MemTable::try_new(schema, vec![batches]).map_err(|e| {
+
+        let mut lookup_schemas = self.lookup_schemas.lock().await;
+        let original = lookup_schemas.get(name).cloned().ok_or_else(|| {
+            BackendError::Other(format!(
+                "transform: refresh: lookup `{name}` is not registered"
+            ))
+        })?;
+        let drifted = !schemas_equivalent(original.as_ref(), schema.as_ref());
+
+        let mem = MemTable::try_new(schema.clone(), vec![batches]).map_err(|e| {
             BackendError::Other(format!("transform: refresh `{name}` MemTable: {e}"))
         })?;
+
         // DataFusion's deregister_table returns Ok(None) silently
-        // when the table isn't registered. That's the wrong shape
-        // for refresh — we want a clean "unknown lookup" error
-        // rather than registering a stranger under that name. So
-        // check + return-on-miss explicitly.
-        let prior = ctx.deregister_table(name).map_err(|e| {
-            BackendError::Other(format!("transform: refresh `{name}` deregister: {e}"))
-        })?;
-        if prior.is_none() {
+        // when the table isn't registered. We want a clean "unknown
+        // lookup" error rather than registering a stranger under
+        // that name.
+        let prior = ctx
+            .deregister_table(name)
+            .map_err(|e| {
+                BackendError::Other(format!("transform: refresh `{name}` deregister: {e}"))
+            })?
+            .ok_or_else(|| {
+                BackendError::Other(format!(
+                    "transform: refresh: lookup `{name}` is not registered"
+                ))
+            })?;
+
+        if let Err(e) = ctx.register_table(name, Arc::new(mem)) {
+            // Restore the prior provider so the ctx isn't left
+            // empty. Errors here are best-effort.
+            let _ = ctx.register_table(name, prior);
             return Err(BackendError::Other(format!(
-                "transform: refresh: lookup `{name}` is not registered"
+                "transform: refresh `{name}` register: {e}"
             )));
         }
-        ctx.register_table(name, Arc::new(mem)).map_err(|e| {
-            BackendError::Other(format!("transform: refresh `{name}` register: {e}"))
-        })?;
-        Ok(())
+
+        if !drifted {
+            // Common path: same shape → nothing else to do.
+            return Ok(());
+        }
+
+        // P3 #24: graceful re-plan path. Drift is now allowed when
+        // the cached SQL still produces the same output shape after
+        // re-binding to the new lookup schema. Try planning + compare
+        // the new logical-plan output schema to the cached one.
+        let plan_result = ctx.sql(&self.sql).await;
+        let outcome: Result<(), String> = match plan_result {
+            Ok(df) => {
+                let new_output: SchemaRef = df.logical_plan().schema().inner().clone();
+                if schemas_equivalent(self.output_schema.as_ref(), new_output.as_ref()) {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "would change output schema from {} fields to {} fields",
+                        self.output_schema.fields().len(),
+                        new_output.fields().len()
+                    ))
+                }
+            }
+            Err(e) => Err(format!("re-plan failed: {e}")),
+        };
+
+        match outcome {
+            Ok(()) => {
+                tracing::info!(
+                    lookup = %name,
+                    original_fields = original.fields().len(),
+                    new_fields = schema.fields().len(),
+                    "transform: refresh `{name}` schema drift accepted — \
+                     output schema unchanged after re-plan"
+                );
+                lookup_schemas.insert(name.to_string(), schema);
+                Ok(())
+            }
+            Err(reason) => {
+                // Roll back to the prior MemTable so the pipeline
+                // keeps serving against the original-shape SQL until
+                // the supervisor restarts it.
+                let _ = ctx.deregister_table(name);
+                let _ = ctx.register_table(name, prior);
+                Err(BackendError::Other(format!(
+                    "transform: refresh `{name}` schema drift — {reason}. \
+                     The cached SQL plan is bound to the original schema; \
+                     restart the pipeline to pick up the new shape."
+                )))
+            }
+        }
     }
 }
 
@@ -973,12 +1024,12 @@ mod tests {
         );
     }
 
-    /// Phase 39.5a P2.16: refresh with a drifted schema (extra
-    /// column) is rejected before the swap, with a clear error.
-    /// Without this guard the cached SQL plan would error mid-
-    /// batch on the next `transform()` call.
+    /// P3 #24: extra lookup column that the SQL doesn't reference
+    /// is now *accepted* (output schema unchanged after re-plan).
+    /// Replaces the prior fail-loud behavior — restart-to-recover is
+    /// only required when the drift would actually change downstream.
     #[tokio::test(flavor = "multi_thread")]
-    async fn refresh_lookup_rejects_extra_column() {
+    async fn refresh_lookup_accepts_extra_unused_column() {
         let t = DataFusionTransform::new_with_lookups(
             "SELECT s.user_id, u.name \
              FROM source s INNER JOIN users u ON s.user_id = u.id",
@@ -988,7 +1039,52 @@ mod tests {
         .await
         .expect("construct transform");
 
-        // Drifted schema: original is (id, name) — add a third column.
+        // Add a `country` column the SQL doesn't reference; output
+        // shape is (user_id, name) regardless.
+        let drifted_schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, false),
+            Field::new("country", DataType::Utf8, false),
+        ]));
+        let drifted_batch = RecordBatch::try_new(
+            drifted_schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(StringArray::from(vec!["alice", "bob"])),
+                Arc::new(StringArray::from(vec!["us", "uk"])),
+            ],
+        )
+        .unwrap();
+        t.refresh_lookup("users", drifted_schema, vec![drifted_batch])
+            .await
+            .expect("graceful re-plan accepts an unused-column drift");
+
+        // Pipeline keeps serving — the SQL still produces the same
+        // (user_id, name) output shape.
+        let out = t
+            .transform(batch_events(), &BatchContext::default())
+            .await
+            .expect("post-drift transform succeeds");
+        let total: usize = out.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, 2);
+    }
+
+    /// P3 #24: drift that the SQL *does* surface (e.g. `SELECT u.*`)
+    /// must still fail — accepting it would change the output schema
+    /// the target was reflected against. Verifies the rollback leaves
+    /// the OLD lookup contents queryable so the pipeline keeps
+    /// running until the supervisor restarts it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn refresh_lookup_rejects_drift_that_changes_output_shape() {
+        let t = DataFusionTransform::new_with_lookups(
+            "SELECT s.user_id, u.* \
+             FROM source s INNER JOIN users u ON s.user_id = u.id",
+            schema_user_id_event(),
+            vec![users_lookup()],
+        )
+        .await
+        .expect("construct transform");
+
         let drifted_schema: SchemaRef = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int32, false),
             Field::new("name", DataType::Utf8, false),
@@ -1006,19 +1102,31 @@ mod tests {
         let err = t
             .refresh_lookup("users", drifted_schema, vec![drifted_batch])
             .await
-            .expect_err("drifted schema rejected");
+            .expect_err("output-changing drift rejected");
         let msg = err.to_string();
         assert!(msg.contains("drift"), "got: {msg}");
         assert!(
-            msg.contains("2 fields") && msg.contains("3 fields"),
-            "error should report field counts: {msg}"
+            msg.contains("output schema") || msg.contains("fields"),
+            "error should explain the output-shape change: {msg}"
         );
+
+        // Rollback: the OLD lookup is still registered, transform
+        // still works against the original-shape SQL.
+        let out = t
+            .transform(batch_events(), &BatchContext::default())
+            .await
+            .expect("post-rollback transform still succeeds");
+        let total: usize = out.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, 2);
     }
 
-    /// Phase 39.5a P2.16: refresh with the same shape but a
-    /// different field type is also drift.
+    /// P3 #24: type change on a join-key column that DataFusion can
+    /// absorb (Int32 → Int64 with implicit cast) is now accepted —
+    /// the output schema is unaffected since the SELECT only
+    /// references `s.user_id` (still Int32) and `u.name` (still Utf8).
+    /// The graceful re-plan path validates this end-to-end.
     #[tokio::test(flavor = "multi_thread")]
-    async fn refresh_lookup_rejects_field_type_change() {
+    async fn refresh_lookup_accepts_join_key_type_widening() {
         let t = DataFusionTransform::new_with_lookups(
             "SELECT s.user_id, u.name \
              FROM source s INNER JOIN users u ON s.user_id = u.id",
@@ -1028,7 +1136,6 @@ mod tests {
         .await
         .expect("construct transform");
 
-        // Same column count + names, but `id` is now Int64 not Int32.
         let drifted_schema: SchemaRef = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, false),
             Field::new("name", DataType::Utf8, false),
@@ -1041,11 +1148,63 @@ mod tests {
             ],
         )
         .unwrap();
+        t.refresh_lookup("users", drifted_schema, vec![drifted_batch])
+            .await
+            .expect("graceful re-plan accepts a join-key type widening");
+
+        let out = t
+            .transform(batch_events(), &BatchContext::default())
+            .await
+            .expect("post-drift transform succeeds");
+        let total: usize = out.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, 2);
+    }
+
+    /// P3 #24: type change on a column the SELECT *does* surface
+    /// changes the output schema — must still reject. Verifies the
+    /// rollback leaves the OLD lookup queryable so the pipeline
+    /// keeps serving until the supervisor restarts it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn refresh_lookup_rejects_type_change_on_selected_column() {
+        let t = DataFusionTransform::new_with_lookups(
+            "SELECT s.user_id, u.name \
+             FROM source s INNER JOIN users u ON s.user_id = u.id",
+            schema_user_id_event(),
+            vec![users_lookup()],
+        )
+        .await
+        .expect("construct transform");
+
+        // Original `name` is Utf8; the new shape stores it as a
+        // numeric. Output column `u.name` would change from Utf8 to
+        // Int64, breaking downstream targets reflected against the
+        // original.
+        let drifted_schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Int64, false),
+        ]));
+        let drifted_batch = RecordBatch::try_new(
+            drifted_schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(arrow_array::Int64Array::from(vec![100_i64, 200_i64])),
+            ],
+        )
+        .unwrap();
         let err = t
             .refresh_lookup("users", drifted_schema, vec![drifted_batch])
             .await
-            .expect_err("type change rejected");
+            .expect_err("output-changing type drift rejected");
         assert!(err.to_string().contains("drift"));
+
+        // Rollback verified: pipeline keeps serving the original SQL
+        // shape against the OLD lookup contents.
+        let out = t
+            .transform(batch_events(), &BatchContext::default())
+            .await
+            .expect("post-rollback transform still succeeds");
+        let total: usize = out.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, 2);
     }
 
     #[tokio::test(flavor = "multi_thread")]
