@@ -25,6 +25,7 @@ pub mod rabbitmq_backend;
 pub mod session_blob;
 pub mod spec;
 pub mod sqlite_backend;
+pub mod state_size;
 pub mod state_store;
 pub mod strategy;
 pub mod streaming;

@@ -1915,6 +1915,7 @@ impl PipelineCliConfig {
         cfg.validate_transform_engine()?;
         cfg.validate_transform_cdc()?;
         cfg.warn_on_stateful_in_memory_store();
+        cfg.warn_on_projected_window_state_size();
         Ok(cfg)
     }
 
@@ -2101,6 +2102,36 @@ impl PipelineCliConfig {
                 if has_session { "session window" } else { "stream-stream join" }
             );
         }
+    }
+
+    /// P3 #23: project the window's per-pipeline state-blob memory
+    /// footprint at config-load and emit a `tracing::warn!` if it
+    /// exceeds the threshold (default 1 GiB; override via the
+    /// `EMATIX_FLOW_STATE_SIZE_WARN_BYTES` env var). Pairs with the
+    /// existing fail-loud `max_groups_per_window` runtime cap — the
+    /// cap stops a runaway pipeline; this surfaces "you've configured
+    /// for ~2 GiB of resident state under load" upfront.
+    ///
+    /// Joins use the same module's helpers but currently lack a
+    /// declared per-pipeline max-key projection input — deferred
+    /// pending design (`docs/PHASE_39_5B_JOINS.md` open question).
+    fn warn_on_projected_window_state_size(&self) {
+        let Some(t) = &self.transform else {
+            return;
+        };
+        let Some(w) = &t.window else {
+            return;
+        };
+        // Re-use the same shape estimator the core crate uses on
+        // its `WindowConfig`. The TOML's `WindowConfigToml` is a
+        // structural mirror; lower it through the existing
+        // `window_toml_to_core` translator, ignore the validation
+        // error path (separate validators handle that).
+        let Ok(core_cfg) = window_toml_to_core(w) else {
+            return;
+        };
+        let projected = ematix_flow_core::state_size::project_window_state_bytes(&core_cfg);
+        ematix_flow_core::state_size::warn_if_exceeds_default(&self.pipeline_name, projected);
     }
 
     /// Phase 39.5b: cross-validation for `[transform.join]`.
