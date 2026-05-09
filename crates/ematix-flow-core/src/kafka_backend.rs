@@ -391,6 +391,14 @@ impl std::fmt::Debug for AuthMode {
 pub(crate) struct EmatixKafkaContext {
     msk_region: Option<String>,
     runtime: Option<tokio::runtime::Handle>,
+    /// P4 #26: per-partition recovered offsets to apply on the next
+    /// `Rebalance::Assign(tpl)`. Populated by `KafkaBackend::seek_to`,
+    /// shared with the backend so a `seek_to` call after a consumer
+    /// is built still reaches the active context. Entries are
+    /// removed from the map as they're consumed by `post_rebalance`,
+    /// so a later rebalance with broker-stored committed offsets
+    /// doesn't get clobbered by the original recovered offsets.
+    seek_map: Arc<std::sync::Mutex<HashMap<i32, i64>>>,
 }
 
 impl ClientContext for EmatixKafkaContext {
@@ -430,7 +438,61 @@ impl ClientContext for EmatixKafkaContext {
     }
 }
 
-impl ConsumerContext for EmatixKafkaContext {}
+impl ConsumerContext for EmatixKafkaContext {
+    /// P4 #26: bridge `seek_to`-recovered offsets into the
+    /// consumer-group rebalance protocol. Replaces the prior
+    /// "manual `assign + Offset::Offset(...)` at acquire time"
+    /// path with `subscribe()` + this callback — the result is
+    /// equivalent for single-worker pipelines (initial assign-all
+    /// rebalance triggers the seek), and correctly handles
+    /// partition reassignment when a future multi-worker setup
+    /// (Σ.D) joins or leaves the group mid-stream.
+    ///
+    /// Each entry is consumed (removed) the first time the
+    /// callback applies it, so a subsequent rebalance reads
+    /// broker-stored committed offsets instead of re-applying
+    /// the now-stale recovery point.
+    fn post_rebalance(
+        &self,
+        base_consumer: &rdkafka::consumer::BaseConsumer<Self>,
+        rebalance: &rdkafka::consumer::Rebalance<'_>,
+    ) {
+        let rdkafka::consumer::Rebalance::Assign(tpl) = rebalance else {
+            return;
+        };
+        let Ok(mut map) = self.seek_map.lock() else {
+            return;
+        };
+        if map.is_empty() {
+            return;
+        }
+        for elem in tpl.elements() {
+            let partition = elem.partition();
+            let Some(offset) = map.remove(&partition) else {
+                continue;
+            };
+            // Best-effort: a failed seek surfaces on the next
+            // poll as a Kafka error and the supervisor handles
+            // it. We don't want to panic from inside the
+            // librdkafka rebalance callback.
+            if let Err(e) = base_consumer.seek(
+                elem.topic(),
+                partition,
+                Offset::Offset(offset),
+                std::time::Duration::from_secs(5),
+            ) {
+                tracing::warn!(
+                    topic = %elem.topic(),
+                    partition,
+                    offset,
+                    error = %e,
+                    "kafka post_rebalance seek failed; partition will use \
+                     broker-stored committed offset (or auto.offset.reset)"
+                );
+            }
+        }
+    }
+}
 
 /// Lazy-initialized consumer session that persists across
 /// `read_arrow_stream` calls so that:
@@ -452,14 +514,6 @@ struct ConsumerSession {
     /// offset of the *next* message to consume (i.e. last consumed
     /// offset + 1) — that's what the Kafka commit protocol wants.
     pending_offsets: HashMap<i32, i64>,
-    /// Phase 39.5a: per-partition seek targets stashed by
-    /// [`KafkaBackend::seek_to`] before the consumer is opened. When
-    /// `Some`, [`KafkaBackend::acquire_consumer_for`] uses
-    /// `assign + seek` instead of `subscribe` so the new consumer
-    /// resumes from exactly these positions. Cleared after the
-    /// consumer applies them; a subsequent `subscribe` path reverts
-    /// to dynamic group-rebalance behavior.
-    pending_seek: Option<HashMap<i32, i64>>,
 }
 
 /// Kafka-backed implementation of `Backend`.
@@ -488,6 +542,12 @@ pub struct KafkaBackend {
     /// reused on subsequent calls within the same backend instance,
     /// committed by `commit_offsets`.
     consumer_session: Arc<Mutex<ConsumerSession>>,
+    /// P4 #26: shared per-partition seek map populated by
+    /// `seek_to(...)` and consumed by `EmatixKafkaContext::post_rebalance`.
+    /// Cloned (Arc) into every consumer/producer/admin context built
+    /// via `build_context()` — only the consumer's rebalance callback
+    /// reads it; producer/admin contexts hold an inert clone.
+    seek_map: Arc<std::sync::Mutex<HashMap<i32, i64>>>,
     /// Auth provider — `AuthMode::None` for unauthenticated clusters;
     /// populated by the `with_sasl_plain` / `with_sasl_scram` /
     /// `with_tls` / `with_msk_iam` builder methods.
@@ -530,10 +590,6 @@ impl std::fmt::Debug for ConsumerSession {
         f.debug_struct("ConsumerSession")
             .field("subscribed_topic", &self.subscribed_topic)
             .field("pending_offsets_count", &self.pending_offsets.len())
-            .field(
-                "pending_seek_count",
-                &self.pending_seek.as_ref().map(|m| m.len()).unwrap_or(0),
-            )
             .finish()
     }
 }
@@ -559,6 +615,7 @@ impl KafkaBackend {
             group_id: group_id.map(|s| s.to_string()),
             batch_config: KafkaBatchConfig::default(),
             consumer_session: Arc::new(Mutex::new(ConsumerSession::default())),
+            seek_map: Arc::new(std::sync::Mutex::new(HashMap::new())),
             auth: AuthMode::None,
             payload_format: KafkaPayloadFormat::default(),
             delivery_semantics: KafkaDeliverySemantics::default(),
@@ -1147,36 +1204,16 @@ impl KafkaBackend {
             let consumer: StreamConsumer<EmatixKafkaContext> = config
                 .create_with_context(context)
                 .map_err(|e| BackendError::Connection(format!("kafka consumer create: {e}")))?;
-            // Phase 39.5a: if `seek_to` stashed a per-partition seek
-            // map, replace the dynamic `subscribe` path with explicit
-            // `assign + seek` so the new consumer resumes from
-            // exactly the recovered offsets. Otherwise fall back to
-            // the regular consumer-group subscribe.
-            if let Some(seek_map) = session.pending_seek.take() {
-                let mut tpl = TopicPartitionList::new();
-                for (partition, offset) in &seek_map {
-                    tpl.add_partition_offset(topic, *partition, Offset::Offset(*offset))
-                        .map_err(|e| {
-                            BackendError::Connection(format!(
-                                "kafka seek_to tpl partition={partition}: {e}"
-                            ))
-                        })?;
-                }
-                consumer.assign(&tpl).map_err(|e| {
-                    BackendError::Connection(format!("kafka assign for seek_to {topic}: {e}"))
-                })?;
-                // `assign` already positions to the offsets in the
-                // TPL; an explicit `seek` would be redundant. We
-                // skip subscribe entirely on this path — group
-                // rebalance is bypassed by design (open question in
-                // PHASE_39_5_SESSIONS.md "seek_to semantics for
-                // sources with replication or partition
-                // reassignment").
-            } else {
-                consumer.subscribe(&[topic]).map_err(|e| {
-                    BackendError::Connection(format!("kafka subscribe {topic}: {e}"))
-                })?;
-            }
+            // P4 #26: always `subscribe()` — when `seek_to` has
+            // populated `self.seek_map`, the initial assign-all
+            // rebalance fires `EmatixKafkaContext::post_rebalance`
+            // which seeks each partition to its recovered offset
+            // before the consumer's first poll. New partitions not
+            // in the seek_map (e.g. broker added a partition) fall
+            // through to `auto.offset.reset = earliest`.
+            consumer
+                .subscribe(&[topic])
+                .map_err(|e| BackendError::Connection(format!("kafka subscribe {topic}: {e}")))?;
             session.consumer = Some(Arc::new(consumer));
             session.subscribed_topic = Some(topic.to_string());
             session.pending_offsets.clear();
@@ -1226,6 +1263,7 @@ impl KafkaBackend {
         EmatixKafkaContext {
             msk_region,
             runtime,
+            seek_map: Arc::clone(&self.seek_map),
         }
     }
 
@@ -1804,18 +1842,31 @@ impl Backend for KafkaBackend {
     /// positions.
     async fn seek_to(&self, offset_bytes: &[u8]) -> Result<(), BackendError> {
         let parsed = decode_kafka_offsets(offset_bytes)?;
+        // P4 #26: write the recovered offsets into the shared
+        // `seek_map` that every `EmatixKafkaContext` we build
+        // references. The next consumer's initial post_rebalance
+        // (or any subsequent rebalance — Σ.D multi-worker) reads
+        // from this map and seeks the assigned partitions.
+        {
+            let mut map = self
+                .seek_map
+                .lock()
+                .map_err(|e| BackendError::Other(format!("kafka seek_map lock: {e}")))?;
+            map.clear();
+            map.extend(parsed);
+        }
+        // Drop any active consumer — its assignment + offset state
+        // is stale relative to the recovered offsets. The next
+        // `acquire_consumer_for` rebuilds with a context that
+        // references the just-populated map; the broker-driven
+        // initial rebalance triggers post_rebalance and the seek.
         let mut session = self
             .consumer_session
             .lock()
             .map_err(|e| BackendError::Other(format!("kafka consumer lock: {e}")))?;
-        // Drop any active consumer — its subscribe/assign state is
-        // now stale relative to the recovered offsets. The next
-        // `acquire_consumer_for` call will rebuild with the seek
-        // map applied.
         session.consumer = None;
         session.subscribed_topic = None;
         session.pending_offsets.clear();
-        session.pending_seek = Some(parsed);
         Ok(())
     }
 
@@ -2965,9 +3016,12 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn seek_to_stashes_decoded_offsets_for_next_consumer() {
+    async fn seek_to_populates_shared_seek_map_for_post_rebalance() {
         // No real broker is contacted here — `seek_to` just decodes
-        // and stashes; consumer creation is lazy.
+        // the payload and writes to the shared `seek_map` Arc that
+        // every `EmatixKafkaContext` references. The actual seek
+        // happens later from inside `post_rebalance` once a consumer
+        // is built and its initial rebalance fires.
         let b = KafkaBackend::open("localhost:9092", Some("g")).unwrap();
         let mut offsets = HashMap::new();
         offsets.insert(0_i32, 42_i64);
@@ -2975,16 +3029,55 @@ mod tests {
         let payload = encode_kafka_offsets(&offsets).unwrap();
         b.seek_to(&payload).await.unwrap();
 
-        // Inspect the session directly: the pending_seek field is
-        // private but the test is in the same module, so we can
-        // reach in.
-        let session = b.consumer_session.lock().unwrap();
-        let stashed = session
-            .pending_seek
-            .as_ref()
-            .expect("pending_seek must be Some after seek_to");
-        assert_eq!(stashed.get(&0_i32), Some(&42_i64));
-        assert_eq!(stashed.get(&1_i32), Some(&7_i64));
+        let map = b.seek_map.lock().unwrap();
+        assert_eq!(map.get(&0_i32), Some(&42_i64));
+        assert_eq!(map.get(&1_i32), Some(&7_i64));
+    }
+
+    /// P4 #26: a follow-up `seek_to` overwrites the previous map
+    /// rather than merging. The contract is "treat each call as the
+    /// authoritative recovery point" — partial overrides would
+    /// silently leave stale offsets for partitions the new payload
+    /// dropped.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn seek_to_replaces_prior_seek_map() {
+        let b = KafkaBackend::open("localhost:9092", Some("g")).unwrap();
+        let mut first = HashMap::new();
+        first.insert(0_i32, 42_i64);
+        first.insert(1, 7);
+        b.seek_to(&encode_kafka_offsets(&first).unwrap())
+            .await
+            .unwrap();
+
+        let mut second = HashMap::new();
+        second.insert(2_i32, 99_i64);
+        b.seek_to(&encode_kafka_offsets(&second).unwrap())
+            .await
+            .unwrap();
+
+        let map = b.seek_map.lock().unwrap();
+        assert_eq!(map.len(), 1, "second seek_to replaces, doesn't merge");
+        assert_eq!(map.get(&2_i32), Some(&99_i64));
+    }
+
+    /// P4 #26: every context built by `KafkaBackend::build_context`
+    /// shares the same `seek_map` Arc. Verifies that a `seek_to`
+    /// after a context is built still reaches it (the rebalance
+    /// callback reads the latest map on the next assignment, even
+    /// if the context predates the call).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn build_context_clones_share_seek_map_with_backend() {
+        let b = KafkaBackend::open("localhost:9092", Some("g")).unwrap();
+        let ctx_before = b.build_context();
+        let mut offsets = HashMap::new();
+        offsets.insert(3_i32, 100_i64);
+        b.seek_to(&encode_kafka_offsets(&offsets).unwrap())
+            .await
+            .unwrap();
+        // The pre-`seek_to` context's seek_map sees the update via
+        // the shared Arc.
+        let m = ctx_before.seek_map.lock().unwrap();
+        assert_eq!(m.get(&3_i32), Some(&100_i64));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -3870,6 +3963,7 @@ mod tests {
         let ctx = EmatixKafkaContext {
             msk_region: Some("us-east-1".into()),
             runtime: None,
+            seek_map: Default::default(),
         };
         let err = match ctx.generate_oauth_token(None) {
             Ok(_) => panic!("expected error"),
