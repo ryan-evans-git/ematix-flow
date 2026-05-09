@@ -1097,9 +1097,10 @@ mod tests {
             .unwrap()
         }
 
-        let stream: ArrowBatchStream = Box::pin(futures_util::stream::iter(
-            (0..BATCHES).map(|i| Ok::<_, BackendError>(batch((i * ROWS_PER_BATCH) as i64))),
-        ));
+        let stream: ArrowBatchStream =
+            Box::pin(futures_util::stream::iter((0..BATCHES).map(|i| {
+                Ok::<_, BackendError>(batch((i * ROWS_PER_BATCH) as i64))
+            })));
 
         let dir = tempfile::tempdir().unwrap();
         let backend = ObjectStoreBackend::open_local(dir.path(), ObjectFormat::Parquet)
