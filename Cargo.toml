@@ -20,7 +20,7 @@ ematix-flow-core = { path = "crates/ematix-flow-core" }
 ematix-flow-cli = { path = "crates/ematix-flow-cli" }
 ematix-flow-distributed = { path = "crates/ematix-flow-distributed" }
 pyo3 = { version = "0.28", features = ["extension-module"] }
-serde = { version = "1", features = ["derive"] }
+serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
 thiserror = "2"
 sha2 = "0.10"

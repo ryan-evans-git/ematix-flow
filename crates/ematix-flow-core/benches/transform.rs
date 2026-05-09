@@ -22,6 +22,7 @@ use arrow_array::{BooleanArray, Int32Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use arrow_select::filter::filter_record_batch;
 use criterion::{Criterion, criterion_group, criterion_main};
+use ematix_flow_core::join::{JoinConfig, JoinKind, JoinLateDataPolicy, TimeWindowedJoinTransform};
 use ematix_flow_core::transform::{BatchContext, BatchTransform, DataFusionTransform, LookupTable};
 use ematix_flow_core::windowed::{
     AggKind, AggregationSpec, LateDataPolicy, WindowConfig, WindowKind, WindowedAggregateTransform,
@@ -374,6 +375,126 @@ fn bench_windowed_tumbling_emit(c: &mut Criterion) {
     );
 }
 
+/// P3 #22 baseline bench: stream-stream `TimeWindowedJoinTransform`.
+///
+/// The roadmap item ("columnar buffer storage for joins") proposes
+/// replacing the per-row `BufferedRow { values: Vec<ScalarValue> }`
+/// shape with `RecordBatch` references + row indices. The roadmap
+/// explicitly says "profile first" — these benches give us the
+/// before number to decide whether the refactor's worth doing.
+///
+/// Schema matches a realistic event-join: an Int64 join key, a
+/// Float64 metric, a 32-byte Utf8 column (per-row `String` heap
+/// alloc on extract — the most expensive `extract_scalar` branch),
+/// plus the required `_event_ts` column. Both sides are 1000 rows.
+fn build_join_batch(prefix: &'static str, key_offset: i64) -> RecordBatch {
+    use arrow_array::{Float64Array, Int64Array, TimestampMicrosecondArray};
+    let n: usize = 1000;
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("key", DataType::Int64, false),
+        Field::new("metric", DataType::Float64, false),
+        Field::new("note", DataType::Utf8, false),
+        Field::new(
+            "_event_ts",
+            DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, Some("UTC".into())),
+            false,
+        ),
+    ]));
+    let keys: Vec<i64> = (0..n as i64).map(|i| key_offset + (i % 100)).collect();
+    let metrics: Vec<f64> = (0..n).map(|i| (i as f64) * 1.5).collect();
+    let notes: Vec<String> = (0..n)
+        .map(|i| format!("{prefix}-row-{i:020}-padding"))
+        .collect();
+    // Spread timestamps across the 1s join window.
+    let ts: Vec<i64> = (0..n as i64).map(|i| i * 1000).collect();
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(keys)),
+            Arc::new(Float64Array::from(metrics)),
+            Arc::new(StringArray::from(notes)),
+            Arc::new(TimestampMicrosecondArray::from(ts).with_timezone("UTC")),
+        ],
+    )
+    .unwrap()
+}
+
+fn build_join_config() -> JoinConfig {
+    JoinConfig {
+        kind: JoinKind::Inner,
+        left_source: "left".into(),
+        right_source: "right".into(),
+        left_keys: vec!["key".into()],
+        right_keys: vec!["key".into()],
+        time_window_ms: 60_000,
+        min_delta_ms: None,
+        max_delta_ms: None,
+        event_time_column: "_event_ts".into(),
+        late_data: JoinLateDataPolicy::Drop,
+        left_column_prefix: "left_".into(),
+        right_column_prefix: "right_".into(),
+    }
+}
+
+/// 1000-row left batch ingested into an empty buffer. No emit (right
+/// side is empty). Stresses `extract_scalar` × 4 columns + the
+/// `BufferedRow { values: Vec<ScalarValue> }` allocation path —
+/// this is what the columnar refactor would target.
+fn bench_join_ingest_no_match(c: &mut Criterion) {
+    let rt = Runtime::new().unwrap();
+    c.bench_function("join_ingest_1000_rows_no_match", |b| {
+        b.to_async(&rt).iter_with_setup(
+            || {
+                let t = TimeWindowedJoinTransform::new(build_join_config()).unwrap();
+                (t, build_join_batch("L", 0))
+            },
+            |(t, batch)| async move {
+                let ctx = BatchContext {
+                    global_wm: None,
+                    source_id: Some("left".into()),
+                };
+                let out = t.transform(batch, &ctx).await.unwrap();
+                std::hint::black_box(out);
+            },
+        )
+    });
+}
+
+/// 1000 left + 1000 right with 100 distinct keys per side → each
+/// arriving right row matches every queued left row of the same key
+/// (10 matches/key). Exercises `BufferedRow` ingest, `values.clone()`
+/// per match, `EmittedRow` accumulation, and `build_emit_batch`'s
+/// per-column scalars-to-array materialisation.
+fn bench_join_ingest_high_match_rate(c: &mut Criterion) {
+    let rt = Runtime::new().unwrap();
+    c.bench_function("join_steady_state_1000x1000_match_rate", |b| {
+        b.to_async(&rt).iter_with_setup(
+            || {
+                let t = TimeWindowedJoinTransform::new(build_join_config()).unwrap();
+                let l = build_join_batch("L", 0);
+                let r = build_join_batch("R", 0);
+                (t, l, r)
+            },
+            |(t, l, r)| async move {
+                let ctx_l = BatchContext {
+                    global_wm: None,
+                    source_id: Some("left".into()),
+                };
+                let ctx_r = BatchContext {
+                    global_wm: None,
+                    source_id: Some("right".into()),
+                };
+                // Left first → buffered (no match yet, right is empty).
+                let _ = t.transform(l, &ctx_l).await.unwrap();
+                // Right next → every row matches every queued left
+                // with the same key.
+                let out = t.transform(r, &ctx_r).await.unwrap();
+                std::hint::black_box(out);
+            },
+        )
+    });
+}
+
 criterion_group!(
     benches,
     bench_baseline_clone,
@@ -385,5 +506,7 @@ criterion_group!(
     bench_lookup_load_construction,
     bench_windowed_tumbling_ingest,
     bench_windowed_tumbling_emit,
+    bench_join_ingest_no_match,
+    bench_join_ingest_high_match_rate,
 );
 criterion_main!(benches);
