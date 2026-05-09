@@ -672,14 +672,45 @@ and recursively serialises:
 A `List` or `Struct` column targeting a non-JSON Postgres type is
 rejected with a clear error pointing at the column name.
 
-**When it doesn't fit.** The transform layer is SQL-only — DataFusion
-function set (`docs.rs/datafusion`) defines what's expressible.
-Per-row Python computation (e.g. live Black-Scholes delta with
-streaming vol/rate inputs) isn't first-class today: either
-pre-compute as a static `@ematix.lookup` table and `LEFT JOIN` it,
-or run a separate Python post-stage. The roadmap entry for
-"DataFusion UDFs through transform.rs" is open if a concrete
-workload surfaces.
+**Functions DataFusion's stdlib doesn't cover** (cumulative-normal
+CDF for Black-Scholes deltas, custom hashing, financial day-count
+conventions, etc.) register as **scalar UDFs** through
+`DataFusionTransform::new_with_lookups_and_udfs(...)` /
+`LazySqlTransform::new_with_lookups_and_udfs(...)`. Each UDF is an
+`Arc<datafusion::logical_expr::ScalarUDF>` (re-exported as
+`ematix_flow_core::transform::ScalarUDF` for ergonomics). The cached
+SQL plan binds to them at construction time, so dropping the
+caller-side reference after registration is fine.
+
+```rust
+use std::sync::Arc;
+use ematix_flow_core::transform::{DataFusionTransform, ScalarUDF};
+use datafusion::logical_expr::{ScalarUDFImpl, Signature, Volatility};
+// ... implement ScalarUDFImpl for your UDF (see the AddOne example
+// in datafusion-expr's docs); then:
+let bs_delta = Arc::new(ScalarUDF::from(BsDelta::new()));
+let t = DataFusionTransform::new_with_lookups_and_udfs(
+    "SELECT minute, array_agg(named_struct(
+        'strike', strike,
+        'delta',  bs_delta(strike, spot, vol, rate, expiry)
+     )) AS strikes_json
+     FROM source GROUP BY 1",
+    input_schema,
+    Vec::new(),       // lookups
+    vec![bs_delta],   // UDFs
+).await?;
+```
+
+Two UDFs registering the same name is a config-load error — no
+silent shadowing of your own function.
+
+**Python UDFs** are not yet first-class. Pure-Rust UDFs work today
+(write the math in Rust, register at pipeline-construction time);
+Python `@ematix.udf` wrapping (per-batch via PyArrow round-trip) is
+the next iteration. For now, per-row Python computation has two
+escape hatches: pre-compute as a static `@ematix.lookup` table and
+`LEFT JOIN` it (works when the inputs are stable), or run a
+separate Python post-stage that consumes the framework's output.
 
 ### Tumbling window (39.4)
 
