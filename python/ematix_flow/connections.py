@@ -245,11 +245,13 @@ class SchemaRegistryConnection(Connection):
     the typed-connection registry alongside every other credential
     instead of inline in the streaming TOML.
 
-    ``basic_auth_user`` / ``basic_auth_password`` are accepted on
-    the dataclass but the Rust runtime can't yet apply them — the
-    streaming TOML emitter raises ``NotImplementedError`` if they
-    reach the emit step. Plumbing through ``SrSettings::new_basic_auth``
-    is a small Rust-core follow-up.
+    ``basic_auth_user`` / ``basic_auth_password`` are emitted as
+    ``schema_registry_basic_auth_{user,password}`` TOML fields and
+    consumed by the Rust runner via
+    ``KafkaBackend::with_schema_registry_basic_auth(...)``, which
+    feeds ``SrSettings::set_basic_authorization`` for every Avro /
+    Protobuf encode/decode against the registry. ``repr()`` redacts
+    the password.
     """
 
     url: str = ""
