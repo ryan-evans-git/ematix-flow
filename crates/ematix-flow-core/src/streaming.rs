@@ -1728,17 +1728,17 @@ mod tests {
         let recovered = pipeline.load_state(&store).await.unwrap();
         assert_eq!(recovered.offsets.len(), 1);
 
-        // Verify the seek landed on the Kafka backend by trying to
-        // re-seek with new offsets and observing the prior ones
-        // were consumed (pending_seek replaced, not appended).
-        // Indirect assertion: a second `seek_to` with a different
-        // offset must succeed, and the resulting `Debug` output
-        // shows pending_seek_count = 1.
+        // Verify the seek landed on the Kafka backend by checking
+        // the shared `seek_map` populated by `seek_to`. P4 #26
+        // moved this from a per-session `pending_seek` Option to a
+        // backend-level `Arc<Mutex<HashMap>>` shared with every
+        // `EmatixKafkaContext` for `post_rebalance` consumption.
+        // Debug renders the map, so we check for the offset itself.
         let dbg_after = format!("{kafka:?}");
         assert!(
-            dbg_after.contains("pending_seek_count: 1"),
-            "after load_state, Kafka backend should have a stashed seek; \
-             got debug: {dbg_after}"
+            dbg_after.contains("seek_map: Mutex { data: {0: 42}"),
+            "after load_state, Kafka backend should have populated \
+             seek_map; got debug: {dbg_after}"
         );
     }
 

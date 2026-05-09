@@ -413,10 +413,18 @@ same crash-recovery posture as 39.4 until PR 3 lands).
   Defer to PR 3 ops review.
 
 - **`seek_to` semantics for sources with replication or partition
-  reassignment.** Kafka rebalance mid-stream triggers
-  `assign+seek` again with new partition set; current offset
-  loaded from `StateStore` may not cover new partitions. Out of
-  scope for PR 1; flagged for follow-up.
+  reassignment.** *Resolved (P4 #26).* Kafka's `seek_to` no longer
+  uses manual `assign + Offset::Offset(...)` at consumer-acquire
+  time. The recovered per-partition map is held in a
+  backend-level `Arc<Mutex<HashMap<i32, i64>>>` shared with every
+  `EmatixKafkaContext`; `acquire_consumer_for` uses plain
+  `subscribe()`, and `EmatixKafkaContext::post_rebalance` consumes
+  the map on each `Rebalance::Assign(tpl)` — seeking known
+  partitions to their recovered offsets and letting the rest fall
+  through to `auto.offset.reset`. Single-worker pipelines are
+  unaffected (initial assign-all rebalance triggers the seek);
+  multi-worker setups (eventual Σ.D distributed streaming) inherit
+  correct partition-reassignment behavior for free.
 
 - **`InMemoryStateStore` as a production option.** Tests use it;
   ops sometimes want it for "I don't care about persistence,
