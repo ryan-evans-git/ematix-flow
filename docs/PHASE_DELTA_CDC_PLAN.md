@@ -580,7 +580,27 @@ encoder beyond what's wired today. Workaround: model decimals as
 `Double` or `Text` on the mirror schema. Documented in the error
 the executor returns when Numeric columns appear.
 
-### Δ.X2 — DuckDB / SQLite / MySQL targets *(easy ports, ~1-2 days each)*
+### Δ.X2 — DuckDB / SQLite / MySQL targets — **shipped**
+
+| Target | PR | Type-coercion primitive |
+|---|---|---|
+| DuckDB | #16 | `SELECT s.* FROM (SELECT from_json(?, '<spec>') AS s)` (subquery wrapping; DuckDB's parser refuses `(from_json(...)).*` directly before `ON CONFLICT`) |
+| SQLite | #17 | `json_extract(?1, '$.col')` per column with the `?1` indexed-parameter form so a single JSON bind serves every reference |
+| MySQL  | #18 | `IF(JSON_TYPE(JSON_EXTRACT(:json, '$.col')) = 'NULL', NULL, JSON_UNQUOTE(JSON_EXTRACT(:json, '$.col')))` per column — JSON-null guard keeps NULL semantics clean across nullable text + numeric columns |
+
+The per-backend executors all share the PG layout: lazy-bootstrap
+`<meta>.cdc_idempotency`, single-PK pre-flight, schema-evolution
+`Fail` pre-check, transactional per-event apply with an in-batch
+gate cache, and soft-delete dispatched through `UPDATE` with the
+affected rows accounting under `updates`. The MySQL gate diverges
+from the PG / DuckDB / SQLite shape in one place: no `RETURNING`,
+so the gate reads `affected_rows()` after a conditional
+`ON DUPLICATE KEY UPDATE` and treats `0` as reject.
+
+The original plan below predicted a per-column type-dispatch
+table; in practice the JSON-extract primitives above handled
+every column type cleanly via implicit casts — the dispatch table
+was never needed. Kept here for historical reference.
 
 Same architectural shape as PostgresBackend's `run_cdc` — single
 JSON parameter per event, dialect-specific UPSERT / UPDATE /
