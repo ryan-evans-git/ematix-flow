@@ -21,6 +21,7 @@ use async_trait::async_trait;
 use datafusion::datasource::MemTable;
 use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::LogicalPlan;
+pub use datafusion::logical_expr::ScalarUDF;
 use tokio::sync::{Mutex, OnceCell};
 
 use crate::backend::BackendError;
@@ -258,7 +259,43 @@ impl DataFusionTransform {
         input_schema: SchemaRef,
         lookups: Vec<LookupTable>,
     ) -> Result<Self, BackendError> {
+        Self::new_with_lookups_and_udfs(sql, input_schema, lookups, Vec::new()).await
+    }
+
+    /// Build a transform with custom scalar UDFs registered into the
+    /// SessionContext alongside any lookups. The escape hatch for
+    /// math + domain functions DataFusion's stdlib doesn't cover
+    /// (cumulative-normal CDF for Black-Scholes deltas, custom
+    /// hashing, financial day-count conventions, etc.).
+    ///
+    /// UDFs are owned by the transform — the cached SQL plan binds
+    /// to them at construction time, so dropping a reference to a
+    /// `ScalarUDF` in user code after registration is fine. Two
+    /// UDFs with the same name in the input slice raises an error;
+    /// duplicate-against-DataFusion's-builtin overrides the builtin
+    /// (DataFusion's documented behavior).
+    pub async fn new_with_lookups_and_udfs(
+        sql: &str,
+        input_schema: SchemaRef,
+        lookups: Vec<LookupTable>,
+        udfs: Vec<Arc<ScalarUDF>>,
+    ) -> Result<Self, BackendError> {
         let ctx = SessionContext::new();
+
+        // Register UDFs first so the SQL planner resolves any
+        // function references in the FROM-clause / column list to
+        // the user-supplied implementations rather than failing.
+        let mut udf_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for udf in &udfs {
+            let name = udf.name().to_string();
+            if !udf_seen.insert(name.clone()) {
+                return Err(BackendError::Other(format!(
+                    "transform: duplicate UDF name `{name}` — each UDF must register \
+                     under a unique name"
+                )));
+            }
+            ctx.register_udf((**udf).clone());
+        }
 
         // Register lookups first so the planner sees them when
         // resolving table names in the SQL.
@@ -564,6 +601,10 @@ pub struct LazySqlTransform {
     /// passed through to the inner `DataFusionTransform` on first
     /// build. Empty Vec = no lookups (plain filter/project/cast).
     lookups: Vec<LookupTable>,
+    /// Custom scalar UDFs registered into the inner transform's
+    /// `SessionContext` on first build. Same lifetime story as
+    /// `lookups` — held until first batch, then handed off.
+    udfs: Vec<Arc<ScalarUDF>>,
     inner: OnceCell<DataFusionTransform>,
 }
 
@@ -593,9 +634,24 @@ impl LazySqlTransform {
     /// `DataFusionTransform::new_with_lookups` along with the
     /// captured input schema.
     pub fn new_with_lookups(sql: impl Into<String>, lookups: Vec<LookupTable>) -> Self {
+        Self::new_with_lookups_and_udfs(sql, lookups, Vec::new())
+    }
+
+    /// Build with both static lookups + custom scalar UDFs. The
+    /// streaming-pipeline shape that needs UDFs in user-supplied
+    /// SQL (e.g. a `bs_delta(strike, spot, vol, rate, expiry)`
+    /// math function) registers them here at config-load time;
+    /// they're applied to the inner DataFusion `SessionContext` on
+    /// the first batch's schema.
+    pub fn new_with_lookups_and_udfs(
+        sql: impl Into<String>,
+        lookups: Vec<LookupTable>,
+        udfs: Vec<Arc<ScalarUDF>>,
+    ) -> Self {
         Self {
             sql: sql.into(),
             lookups,
+            udfs,
             inner: OnceCell::new(),
         }
     }
@@ -614,10 +670,11 @@ impl LazySqlTransform {
     async fn ensure_inner(&self, schema: SchemaRef) -> Result<&DataFusionTransform, BackendError> {
         self.inner
             .get_or_try_init(|| async {
-                DataFusionTransform::new_with_lookups(
+                DataFusionTransform::new_with_lookups_and_udfs(
                     &self.sql,
                     schema.clone(),
                     self.lookups.clone(),
+                    self.udfs.clone(),
                 )
                 .await
             })
@@ -810,6 +867,141 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].schema().field(0).name(), "user_id");
         assert_eq!(out[0].schema().field(1).name(), "name");
+    }
+
+    /// Custom scalar UDF support: a user-defined `add_one(Int32)`
+    /// must register into the SessionContext, plan through the SQL,
+    /// and execute against per-batch data — same path a
+    /// Black-Scholes-delta UDF would ride for the
+    /// option-chain-snapshot pivot example in the README. This is
+    /// the foundation for the "DataFusion UDFs through transform.rs"
+    /// roadmap item.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn scalar_udf_round_trips_through_transform_sql() {
+        use std::any::Any;
+        use std::sync::Arc;
+
+        use arrow_array::Int32Array;
+        use datafusion::common::Result as DfResult;
+        use datafusion::logical_expr::{
+            ColumnarValue, ScalarFunctionArgs, ScalarUDFImpl, Signature, Volatility,
+        };
+
+        #[derive(Debug, PartialEq, Eq, Hash)]
+        struct AddOne {
+            signature: Signature,
+        }
+
+        impl AddOne {
+            fn new() -> Self {
+                Self {
+                    signature: Signature::exact(vec![DataType::Int32], Volatility::Immutable),
+                }
+            }
+        }
+
+        impl ScalarUDFImpl for AddOne {
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+            fn name(&self) -> &str {
+                "add_one"
+            }
+            fn signature(&self) -> &Signature {
+                &self.signature
+            }
+            fn return_type(&self, _args: &[DataType]) -> DfResult<DataType> {
+                Ok(DataType::Int32)
+            }
+            fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DfResult<ColumnarValue> {
+                let array = args.args[0].clone().into_array(args.number_rows)?;
+                let arr = array
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .expect("add_one expects Int32 input");
+                let out: Int32Array = arr.iter().map(|v| v.map(|x| x + 1)).collect();
+                Ok(ColumnarValue::Array(Arc::new(out)))
+            }
+        }
+
+        let udf = Arc::new(ScalarUDF::from(AddOne::new()));
+        let t = DataFusionTransform::new_with_lookups_and_udfs(
+            "SELECT add_one(user_id) AS next_id FROM source",
+            schema_user_id_event(),
+            Vec::new(),
+            vec![udf],
+        )
+        .await
+        .expect("construct transform with UDF");
+        let out = t
+            .transform(batch_events(), &BatchContext::default())
+            .await
+            .expect("apply UDF");
+        assert_eq!(out.len(), 1);
+        let arr = out[0]
+            .column_by_name("next_id")
+            .expect("output has next_id column")
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("UDF returns Int32");
+        // batch_events has user_ids [1, 2, 99]; add_one → [2, 3, 100].
+        assert_eq!(arr.value(0), 2);
+        assert_eq!(arr.value(1), 3);
+        assert_eq!(arr.value(2), 100);
+    }
+
+    /// Two UDFs registered under the same name is a config error
+    /// caught at construction — surfacing it loud means a user
+    /// can't accidentally shadow their own function and wonder
+    /// why a Black-Scholes call returns the wrong number.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn duplicate_udf_names_rejected_at_construction() {
+        use std::any::Any;
+        use std::sync::Arc;
+
+        use datafusion::common::Result as DfResult;
+        use datafusion::logical_expr::{
+            ColumnarValue, ScalarFunctionArgs, ScalarUDFImpl, Signature, Volatility,
+        };
+
+        #[derive(Debug, PartialEq, Eq, Hash)]
+        struct Stub {
+            signature: Signature,
+        }
+        impl ScalarUDFImpl for Stub {
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+            fn name(&self) -> &str {
+                "noop"
+            }
+            fn signature(&self) -> &Signature {
+                &self.signature
+            }
+            fn return_type(&self, _: &[DataType]) -> DfResult<DataType> {
+                Ok(DataType::Int32)
+            }
+            fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DfResult<ColumnarValue> {
+                Ok(args.args[0].clone())
+            }
+        }
+
+        let make = || {
+            Arc::new(ScalarUDF::from(Stub {
+                signature: Signature::exact(vec![DataType::Int32], Volatility::Immutable),
+            }))
+        };
+        let err = DataFusionTransform::new_with_lookups_and_udfs(
+            "SELECT user_id FROM source",
+            schema_user_id_event(),
+            Vec::new(),
+            vec![make(), make()],
+        )
+        .await
+        .expect_err("duplicate UDF names rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("duplicate UDF name"), "got: {msg}");
+        assert!(msg.contains("noop"), "got: {msg}");
     }
 
     /// Σ.A1 audit: `EXPLAIN`/`EXPLAIN ANALYZE` must round-trip
