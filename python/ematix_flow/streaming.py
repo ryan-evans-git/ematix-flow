@@ -1451,9 +1451,39 @@ def _source_fields(conn: Connection) -> list[str]:
         if conn.secret_access_key:
             out.append(f"secret_access_key = {_q(resolve(conn.secret_access_key))}")
         return out
+    # P4 #28: object-store as a streaming source. The pipeline's
+    # `source_query` field carries the prefix to watch; the backend's
+    # `last_seen_object_key` high-water mark + state-store recovery
+    # provides at-least-once semantics. Format-specific write options
+    # (parquet_compression, csv_delimiter / csv_header) live on the
+    # target side and are not duplicated here — readers infer codec /
+    # delimiter from file metadata.
+    if isinstance(conn, ObjectStoreLocalConnection):
+        return [
+            'kind = "object_store_local"',
+            f"path = {_q(_resolve_required(conn.path, 'path'))}",
+            f"format = {_q(conn.format)}",
+        ]
+    if isinstance(conn, ObjectStoreS3Connection):
+        return [
+            'kind = "object_store_s3"',
+            f"endpoint = {_q(_resolve_required(conn.endpoint, 'endpoint'))}",
+            f"bucket = {_q(_resolve_required(conn.bucket, 'bucket'))}",
+            f"region = {_q(_resolve_required(conn.region, 'region'))}",
+            (
+                "access_key_id = "
+                f"{_q(_resolve_required(conn.access_key_id, 'access_key_id'))}"
+            ),
+            (
+                "secret_access_key = "
+                f"{_q(_resolve_required(conn.secret_access_key, 'secret_access_key'))}"
+            ),
+            f"format = {_q(conn.format)}",
+        ]
     raise ValueError(
         f"connection {conn.name!r} of kind {conn.kind!r} cannot be used as a source "
-        "(streaming sources: kafka, rabbitmq, pubsub, kinesis)"
+        "(streaming sources: kafka, rabbitmq, pubsub, kinesis, "
+        "object_store_local, object_store_s3)"
     )
 
 

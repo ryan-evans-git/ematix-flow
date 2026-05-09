@@ -162,6 +162,23 @@ fn scan_source_for_credentials(s: &SourceConfig, findings: &mut Vec<String>) {
                 );
             }
         }
+        SourceConfig::ObjectStoreLocal { .. } => {
+            // Local-filesystem source has no remote credential surface.
+        }
+        SourceConfig::ObjectStoreS3 {
+            access_key_id,
+            secret_access_key,
+            ..
+        } => {
+            if !access_key_id.is_empty() || !secret_access_key.is_empty() {
+                findings.push(
+                    "[source] S3-backed object store carries inline AWS \
+                     credentials — register an ObjectStoreS3Connection via \
+                     @ematix.connection (with `${VAR}` env-var interpolation)"
+                        .into(),
+                );
+            }
+        }
     }
 }
 
@@ -1407,6 +1424,25 @@ pub enum SourceConfig {
         access_key_id: Option<String>,
         secret_access_key: Option<String>,
     },
+    /// P4 #28: object store as a streaming source — watch a prefix
+    /// for new files (Parquet / CSV / JSONL / ORC) and ingest each
+    /// in turn. The streaming pipeline calls `read_arrow_stream(prefix)`
+    /// repeatedly; the backend's `last_seen_object_key` tracks the
+    /// high-water mark so each call returns only the files that
+    /// landed since. State-store recovery via the standard `seek_to`
+    /// path resumes from the previously-committed key.
+    ObjectStoreLocal {
+        path: String,
+        format: ObjectFormatConfig,
+    },
+    ObjectStoreS3 {
+        endpoint: String,
+        bucket: String,
+        region: String,
+        access_key_id: String,
+        secret_access_key: String,
+        format: ObjectFormatConfig,
+    },
 }
 
 /// Target backend variants. Includes both the OLTP/OLAP / Delta /
@@ -1665,6 +1701,26 @@ impl std::fmt::Debug for SourceConfig {
                     "secret_access_key",
                     &secret_access_key.as_ref().map(|_| "<redacted>"),
                 )
+                .finish(),
+            SourceConfig::ObjectStoreLocal { path, format } => f
+                .debug_struct("ObjectStoreLocal")
+                .field("path", path)
+                .field("format", format)
+                .finish(),
+            SourceConfig::ObjectStoreS3 {
+                endpoint,
+                bucket,
+                region,
+                format,
+                ..
+            } => f
+                .debug_struct("ObjectStoreS3")
+                .field("endpoint", endpoint)
+                .field("bucket", bucket)
+                .field("region", region)
+                .field("format", format)
+                .field("access_key_id", &"<redacted>")
+                .field("secret_access_key", &"<redacted>")
                 .finish(),
         }
     }
@@ -2298,6 +2354,11 @@ impl PipelineCliConfig {
                 // ack stream IS the offset.
                 SourceConfig::Pubsub { .. } => Ok(()),
                 SourceConfig::Rabbitmq { .. } => Ok(()),
+                // P4 #28: object-store sources track a per-prefix
+                // `last_seen_object_key` high-water mark; `seek_to`
+                // restores it from the StateStore snapshot.
+                SourceConfig::ObjectStoreLocal { .. } => Ok(()),
+                SourceConfig::ObjectStoreS3 { .. } => Ok(()),
             }
         };
         if let Some(s) = &self.source {
@@ -2489,6 +2550,28 @@ impl PipelineCliConfig {
                 access_key_id.as_deref(),
                 secret_access_key.as_deref(),
             )?)),
+            SourceConfig::ObjectStoreLocal { path, format } => {
+                let b = ObjectStoreBackend::open_local(path, (*format).into())?;
+                Ok(Arc::new(b))
+            }
+            SourceConfig::ObjectStoreS3 {
+                endpoint,
+                bucket,
+                region,
+                access_key_id,
+                secret_access_key,
+                format,
+            } => {
+                let b = ObjectStoreBackend::open_s3(
+                    endpoint,
+                    bucket,
+                    region,
+                    access_key_id,
+                    secret_access_key,
+                    (*format).into(),
+                )?;
+                Ok(Arc::new(b))
+            }
         }
     }
 
@@ -5311,6 +5394,153 @@ mod tests {
             }
             other => panic!("unexpected pair: {other:?}"),
         }
+    }
+
+    /// P4 #28: object-store-as-streaming-source variants parse from TOML.
+    #[test]
+    fn parses_object_store_local_source() {
+        let toml = r#"
+            pipeline_name = "watch_prefix"
+            source_query = "raw/events/"
+
+            [source]
+            kind = "object_store_local"
+            path = "/tmp/watched"
+            format = "parquet"
+
+            [target]
+            kind = "sqlite"
+            path = ":memory:"
+
+            [target.table]
+            name = "events"
+        "#;
+        let cfg = PipelineCliConfig::from_toml_str(toml).unwrap();
+        match cfg.source.as_ref().expect("source set") {
+            SourceConfig::ObjectStoreLocal { path, format } => {
+                assert_eq!(path, "/tmp/watched");
+                assert!(matches!(format, ObjectFormatConfig::Parquet));
+            }
+            other => panic!("expected ObjectStoreLocal source, got {other:?}"),
+        }
+        // Build the source — exercises `build_one_source` dispatch and
+        // confirms the supports_seek_to() override surfaces correctly
+        // through the trait object.
+        let backend = cfg.build_source().expect("build source");
+        assert!(backend.supports_seek_to());
+    }
+
+    #[test]
+    fn parses_object_store_s3_source() {
+        let toml = r#"
+            pipeline_name = "watch_s3"
+            source_query = "raw/events/"
+
+            [source]
+            kind = "object_store_s3"
+            endpoint = "http://localhost:9000"
+            bucket = "lake"
+            region = "us-east-1"
+            access_key_id = "minio"
+            secret_access_key = "minio123"
+            format = "jsonl"
+
+            [target]
+            kind = "sqlite"
+            path = ":memory:"
+
+            [target.table]
+            name = "events"
+        "#;
+        let cfg = PipelineCliConfig::from_toml_str(toml).unwrap();
+        match cfg.source.as_ref().expect("source set") {
+            SourceConfig::ObjectStoreS3 {
+                endpoint,
+                bucket,
+                region,
+                format,
+                ..
+            } => {
+                assert_eq!(endpoint, "http://localhost:9000");
+                assert_eq!(bucket, "lake");
+                assert_eq!(region, "us-east-1");
+                assert!(matches!(format, ObjectFormatConfig::JsonLines));
+            }
+            other => panic!("expected ObjectStoreS3 source, got {other:?}"),
+        }
+    }
+
+    /// P4 #28: object-store sources count as supporting `seek_to`,
+    /// so a `[state_store]` + session window pipeline pointed at one
+    /// passes the validator.
+    #[test]
+    fn object_store_source_passes_seek_to_validator() {
+        let toml = r#"
+            pipeline_name = "sess"
+            source_query = "raw/events/"
+
+            [source]
+            kind = "object_store_local"
+            path = "/tmp/watched"
+            format = "parquet"
+
+            [state_store]
+            kind = "in_memory"
+
+            [target]
+            kind = "sqlite"
+            path = ":memory:"
+
+            [target.table]
+            name = "events"
+
+            [transform.window]
+            kind = "session"
+            gap_ms = 30000
+            max_session_duration_ms = 120000
+            max_groups_per_window = 100
+            group_by = ["user_id"]
+
+            [[transform.window.aggregations]]
+            as = "n"
+            agg = "count_star"
+        "#;
+        // Should parse without rejecting on seek_to support.
+        PipelineCliConfig::from_toml_str(toml).expect("session + object-store source accepted");
+    }
+
+    /// P4 #28: S3 inline credentials surface as a finding from
+    /// `inline_credential_findings`, mirroring the target-side scan.
+    #[test]
+    fn object_store_s3_source_inline_credentials_flagged() {
+        let toml = r#"
+            pipeline_name = "watch_s3"
+            source_query = "raw/events/"
+
+            [source]
+            kind = "object_store_s3"
+            endpoint = "http://localhost:9000"
+            bucket = "lake"
+            region = "us-east-1"
+            access_key_id = "minio"
+            secret_access_key = "minio123"
+            format = "parquet"
+
+            [target]
+            kind = "sqlite"
+            path = ":memory:"
+
+            [target.table]
+            name = "events"
+        "#;
+        let cfg = PipelineCliConfig::from_toml_str(toml).unwrap();
+        let findings = cfg.inline_credential_findings();
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.contains("[source]") && f.contains("S3")),
+            "expected an inline-S3-creds finding from a [source] block; got: {findings:?}"
+        );
     }
 
     #[test]
