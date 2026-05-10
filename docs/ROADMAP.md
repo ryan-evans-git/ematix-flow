@@ -3,7 +3,7 @@
 What's been shipped, what's left, and the priority order. Compiled
 from the deferred sections of every phase plan in `docs/`.
 
-## Status snapshot (2026-05; Π.1 / Π.3 / Π.1.4 audit pass)
+## Status snapshot (2026-05-10; v0.2.0 cut)
 
 **Shipped:**
 
@@ -30,8 +30,15 @@ from the deferred sections of every phase plan in `docs/`.
 | Π.1 | `SchemaRegistryConnection` typed connection; `KafkaConnection.schema_registry=` (instance or registered name); Kafka `payload_format` + `schema_registry_url` plumbed through the streaming TOML emitter (was silently dropped before); `Watermark(lateness_ms=, source_idleness_ms=)` typed-Python knob + `[watermark]` TOML block; `transform_on_error="fail"\|"drop"\|"dlq"` exposed on `run_streaming_pipeline` / `@ematix.streaming_pipeline`. | `docs/UNIFIED_PIPELINE_API.md` |
 | Π.3 | `flow consume --module my_pipelines <name>` Python-loading CLI shape; `@ematix.streaming_pipeline` now registers into a process-global name-keyed registry; `render_streaming_pipeline_toml(name)` shared between the runner and the CLI's render path; `flow consume-list --module M` companion. Implemented in the Python `flow` entry point (no PyO3 added to the Rust CLI binary). | `docs/UNIFIED_PIPELINE_API.md` |
 | Π.1.4 | Object-store per-format write options end-to-end: `ParquetCompression` enum (`uncompressed`/`snappy`/`gzip`/`zstd`) + `ObjectWriteOptions` struct + `ObjectStoreBackend::with_write_options` builder; CSV `delimiter` + `header` honored on write; CLI TOML fields on `ObjectStoreLocal` / `ObjectStoreS3`; typed-Python `Target(parquet_compression=, csv_delimiter=, csv_header=)` with shape-correctness checks at the boundary. | (CLI section of `MULTI_BACKEND_PLAN.md`) |
+| Δ | **Phase Δ — CDC source mode.** Apply Debezium / Maxwell / custom-envelope CDC events to a target table with per-op semantics + idempotency-by-PK + schema-evolution detection. Per-batch transactional with prepared-statement reuse; `delete_mode = "soft"` flips a column instead of DELETE. Five Prometheus counters under `pipeline=<name>`. `examples/cdc-debezium/` docker-compose stack. | `docs/PHASE_DELTA_CDC_PLAN.md`, `docs/USER_GUIDE.md` |
+| Δ.X1 / Δ.X2 | **CDC executors across backends.** Single-MERGE-per-batch on Delta Lake; native per-op executors on MySQL, SQLite, DuckDB with shared idempotency gate + soft-delete + schema-evolution semantics. Δ.X1.1 `_cdc_last_ts` hidden-column path for between-batch idempotency on Delta. | `docs/PHASE_DELTA_CDC_PLAN.md` § "Phase Δ extensions" |
+| Π.4b–Π.5 | **Object-store as streaming source** (`last_seen_object_key` high-water-mark; UUIDv7-ordered keys; per-format decoders shared with the read-prefix path). **Π.5** unified streaming-API knobs: scalar `udfs=` + aggregate `aggregate_udfs=` on `run_streaming_pipeline`; inline-credential deprecation warnings on the legacy TOML loader. | `docs/PHASE_39_5_SESSIONS.md`, `docs/UNIFIED_PIPELINE_API.md` |
+| UDFs | **Python `@udf` (scalar) + `@udaf` (aggregate).** PyArrow zero-copy per-batch dispatch; scalar wraps a callable, aggregate wraps an Accumulator class with `update_batch`/`merge_batch`/`evaluate`/`state`. Pure-Rust escape hatch when GIL contention dominates. Threaded through `run_streaming_pipeline` to `LazySqlTransform`. | `README.md`, `docs/USER_GUIDE.md` |
+| Σ.A1 | **TPC-H single-node baseline + audit.** 22-query Apache Spark TPC-H suite plans + executes cleanly through DataFusion 53 with zero SQL-surface gaps. PySpark head-to-head at SF=1 (5.87× geomean) + SF=10 (3.3× geomean). | `docs/BENCHMARKS.md`, `docs/PHASE_SIGMA_PLAN.md` |
+| Σ.A2 | **SQL dialect translator.** `[transform] dialect = "datafusion"\|"spark"\|"duckdb"` selects an `sqlparser-rs`-based AST rewriter that emits DataFusion-compatible SQL. Spark surface: function-name remap + `LATERAL VIEW EXPLODE` → wrap-in-subquery `unnest`. DuckDB surface: function-name remap. **103/103 Spark TPC-DS PASS**, **103/103 DuckDB TPC-DS PASS**. | `crates/ematix-flow-core/src/dialect/`, `docs/PHASE_SIGMA_PLAN.md` |
+| Σ.B–Σ.C | **Distributed batch SQL.** `ematix-flow-distributed` crate + `flow-worker` binary; `[transform] engine = "distributed"` selects a peer-distributed `DataFusion` execution via Arrow Flight on top of `datafusion-distributed`. Full 22-query TPC-H clean at SF=1; cluster image ≤150 MB; mTLS shipped. | `docs/PHASE_SIGMA_PLAN.md` |
 
-**Tests at the time of writing:** 459 core lib + 108 CLI lib + 376 default Python (≈196 testcontainers-gated `@pytest.mark.integration`) + ~80 Rust testcontainers `--ignored`. All green on macOS aarch64. clippy + fmt clean on stable Rust.
+**Tests at the time of writing (v0.2.0 cut):** 583 core lib + 156 CLI lib + 12 distributed + 403 default Python (≈196 testcontainers-gated `@pytest.mark.integration`) + ~80 Rust testcontainers `--ignored`. All green on macOS aarch64. clippy + fmt clean on stable Rust.
 
 ---
 

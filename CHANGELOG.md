@@ -7,6 +7,83 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] — 2026-05-10
+
+Major feature release. **Headline**: Python `@udf` / `@udaf`
+decorators for in-pipeline UDFs, plus the full **Phase Δ**
+change-data-capture surface (Postgres, MySQL, SQLite, DuckDB,
+Delta Lake CDC executors), object-store as a streaming source,
+Σ.A2 SQL dialect translator (Spark / DuckDB → DataFusion, 103/103
+TPC-DS PASS), and Π.5 unified streaming-API knobs. 43 commits
+since v0.1.2.
+
+### Added
+
+- **Python `@udf` + `@udaf` decorators — user-defined functions
+  in `transform_sql`.** The full DataFusion UDF surface, now
+  Python-native. Closes the "what if my math isn't in DataFusion's
+  stdlib" gap (cumulative-normal CDF for Black-Scholes greeks,
+  volume-weighted average price, custom percentiles, financial
+  day-count conventions, …).
+  - `@ematix_flow.udf(args=..., returns=...)` wraps a Python
+    callable as a DataFusion `ScalarUDF`. Per-batch dispatch
+    through PyArrow zero-copy — one PyO3 GIL acquisition +
+    PyArrow round-trip per *batch* (typically thousands of rows),
+    so vectorised `numpy` / `pyarrow.compute` inside the
+    callable amortises the overhead. Argument and return types
+    are DataFusion `DataType` strings (`"Int64"`, `"Float64"`,
+    `"Utf8"`, `"Boolean"`, etc.); unsupported types raise
+    `ValueError` at decoration time. Mismatched call sites
+    surface at plan-compile time.
+  - `@ematix_flow.udaf(args=..., state=..., returns=...)` wraps
+    a Python *class* as a DataFusion `AggregateUDF`. DataFusion
+    instantiates one accumulator per group; the class must
+    expose `update_batch` / `merge_batch` / `evaluate` / `state`
+    methods matching the `Accumulator` trait. `evaluate()` and
+    `state()` return length-1 PyArrow Arrays of the declared
+    types so Rust can round-trip them back to `ScalarValue`
+    without per-type glue code. Useful errors when the returned
+    dtype doesn't match the declaration. VWAP is the canonical
+    example.
+  - `run_streaming_pipeline(udfs=[...], aggregate_udfs=[...])`
+    threads handles through the whole pipeline:
+    `PyHandle` → `Vec<Arc<ScalarUDF | AggregateUDF>>` →
+    `ConsumeOptions` → `streaming_config_with_lookups_udfs_aggregate_udfs_and_metrics`
+    → `LazySqlTransform::new_with_lookups_udfs_and_aggregate_udfs`
+    → `SessionContext::register_udf` / `register_udaf`.
+  - Pure-Rust escape hatch unchanged: implement `ScalarUDFImpl`
+    / `AggregateUDFImpl` and pass `Arc<…UDF>` directly into
+    `DataFusionTransform::new_with_lookups_udfs_and_aggregate_udfs`
+    or `LazySqlTransform`'s matching constructor. Same wire — no
+    GIL round-trip when contention dominates.
+  - Coverage: 7 scalar UDF tests + 7 aggregate UDF tests in
+    `tests/python/test_python_udf{,_udaf}.py` (Int round-trip,
+    multi-arg positional, realistic Black-Scholes call delta,
+    realistic VWAP over options ticks, naming, dtype-mismatch
+    diagnostics, `run_streaming_pipeline` kwarg surface check).
+    Rust unit tests in `transform.rs` cover the
+    `SessionContext::register_udf` / `register_udaf` path +
+    duplicate-name rejection at construction. CLI unit tests
+    (`streaming_config_threads_udfs_into_lazy_sql_transform` +
+    `streaming_config_threads_aggregate_udfs_into_lazy_sql_transform`)
+    lock the streaming wiring.
+  - README + `docs/USER_GUIDE.md` both lead with the
+    Black-Scholes example for `@udf` and the VWAP example for
+    `@udaf`. PRs #33–#40.
+
+### Changed
+
+- **CI: switched Python dep installs to `uv`.** `astral-sh/setup-uv@v4`
+  in `.github/workflows/ci.yml` + `.github/workflows/docs.yml`
+  with `enable-cache: true` and an explicit
+  `cache-dependency-glob` (the repo doesn't commit a `uv.lock`,
+  so the default `**/uv.lock` glob errored). Heavy scientific
+  wheels (numpy, pyarrow) install dramatically faster than pip.
+  `numpy` + `pyarrow>=15` are now pinned explicitly in the CI
+  install step — both were transitive deps of other CI tools
+  before, but the new UDF tests import them at module level so
+  the dependency is now declared.
+
 ### Added
 
 - **CI: integration-tests + coverage gate workflow.**
