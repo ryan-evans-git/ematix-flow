@@ -4,11 +4,19 @@ build-backend = "maturin"
 
 [project]
 name = "ematix-flow"
-version = "0.2.0"
+version = "0.2.1"
 description = "Move data between databases, files, and streams from Python. 5.87× faster than PySpark. No JVM needed."
 readme = "README.md"
 requires-python = ">=3.10"
-license = { text = "Apache-2.0" }
+# PEP 639 license metadata. The previous `license = { text = ... }`
+# form caused maturin to emit `License-File LICENSE` in the sdist
+# PKG-INFO without actually packaging the LICENSE file — PyPI
+# Warehouse rejected the v0.2.0 sdist with HTTP 400. PEP 639's
+# `license-files` is the canonical fix: maturin reads it,
+# includes the listed files in the sdist tarball, and the
+# resulting metadata is self-consistent.
+license = "Apache-2.0"
+license-files = ["LICENSE"]
 authors = [
     { name = "Ryan Evans", email = "ryanevans23@gmail.com" },
 ]

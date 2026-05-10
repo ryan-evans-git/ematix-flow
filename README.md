@@ -4,9 +4,13 @@
 between databases, files, and streaming sources. Rust + Apache
 Arrow under the hood.**
 
-> Status: **v0.1.2 on PyPI** as `ematix-flow`. All four
+> Status: **v0.2.1 on PyPI** as `ematix-flow`. All four
 > surfaces below — declarative pipelines, multi-backend, streaming,
-> stream processing — are shipped and stable.
+> stream processing — are shipped and stable. Python `@udf` /
+> `@udaf` decorators (PyArrow zero-copy), Phase Δ CDC across
+> Postgres / MySQL / SQLite / DuckDB / Delta Lake, object-store as
+> a streaming source, and the Spark / DuckDB → DataFusion dialect
+> translator (103/103 TPC-DS PASS) all land in 0.2.
 
 ematix-flow lets you declare a target table and a load strategy
 in Python; the framework handles schema evolution, watermarks,
