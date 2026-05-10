@@ -21,7 +21,7 @@ use async_trait::async_trait;
 use datafusion::datasource::MemTable;
 use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::LogicalPlan;
-pub use datafusion::logical_expr::ScalarUDF;
+pub use datafusion::logical_expr::{AggregateUDF, ScalarUDF};
 use tokio::sync::{Mutex, OnceCell};
 
 use crate::backend::BackendError;
@@ -280,6 +280,29 @@ impl DataFusionTransform {
         lookups: Vec<LookupTable>,
         udfs: Vec<Arc<ScalarUDF>>,
     ) -> Result<Self, BackendError> {
+        Self::new_with_lookups_udfs_and_aggregate_udfs(sql, input_schema, lookups, udfs, Vec::new())
+            .await
+    }
+
+    /// Build a transform with both scalar **and** aggregate UDFs.
+    /// Scalar UDFs cover per-row math (Black-Scholes delta, custom
+    /// hashing); aggregate UDFs cover per-group reductions (volume-
+    /// weighted average price, custom percentiles, distinct-by-
+    /// cardinality) that DataFusion's stdlib doesn't ship.
+    ///
+    /// Same lifetime story as `new_with_lookups_and_udfs`: both
+    /// kinds register on the inner `SessionContext` at construction
+    /// time; the cached SQL plan binds to them so dropping caller-
+    /// side references after the call is fine. Two UDFs of either
+    /// kind sharing a name is rejected at construction with a
+    /// pointer at the offending name.
+    pub async fn new_with_lookups_udfs_and_aggregate_udfs(
+        sql: &str,
+        input_schema: SchemaRef,
+        lookups: Vec<LookupTable>,
+        udfs: Vec<Arc<ScalarUDF>>,
+        aggregate_udfs: Vec<Arc<AggregateUDF>>,
+    ) -> Result<Self, BackendError> {
         let ctx = SessionContext::new();
 
         // Register UDFs first so the SQL planner resolves any
@@ -295,6 +318,22 @@ impl DataFusionTransform {
                 )));
             }
             ctx.register_udf((**udf).clone());
+        }
+
+        // Aggregate UDFs share the function namespace with scalar
+        // UDFs from a planner perspective, but DataFusion exposes a
+        // separate registration call. Track names independently so
+        // duplicate-name errors blame the right kind.
+        let mut udaf_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for udaf in &aggregate_udfs {
+            let name = udaf.name().to_string();
+            if !udaf_seen.insert(name.clone()) {
+                return Err(BackendError::Other(format!(
+                    "transform: duplicate aggregate UDF name `{name}` — each aggregate UDF \
+                     must register under a unique name"
+                )));
+            }
+            ctx.register_udaf((**udaf).clone());
         }
 
         // Register lookups first so the planner sees them when
@@ -605,6 +644,10 @@ pub struct LazySqlTransform {
     /// `SessionContext` on first build. Same lifetime story as
     /// `lookups` — held until first batch, then handed off.
     udfs: Vec<Arc<ScalarUDF>>,
+    /// Custom aggregate UDFs (the `@udaf` analog of `@udf`).
+    /// Registered alongside scalar UDFs on first build; held
+    /// until then via the same Arc-clone pattern.
+    aggregate_udfs: Vec<Arc<AggregateUDF>>,
     inner: OnceCell<DataFusionTransform>,
 }
 
@@ -648,10 +691,23 @@ impl LazySqlTransform {
         lookups: Vec<LookupTable>,
         udfs: Vec<Arc<ScalarUDF>>,
     ) -> Self {
+        Self::new_with_lookups_udfs_and_aggregate_udfs(sql, lookups, udfs, Vec::new())
+    }
+
+    /// Build with lookups + scalar UDFs + aggregate UDFs. The
+    /// aggregate-UDF analog of `@udaf` registers here so user SQL
+    /// can call them — `SELECT vwap(price, qty) FROM source GROUP BY 1`.
+    pub fn new_with_lookups_udfs_and_aggregate_udfs(
+        sql: impl Into<String>,
+        lookups: Vec<LookupTable>,
+        udfs: Vec<Arc<ScalarUDF>>,
+        aggregate_udfs: Vec<Arc<AggregateUDF>>,
+    ) -> Self {
         Self {
             sql: sql.into(),
             lookups,
             udfs,
+            aggregate_udfs,
             inner: OnceCell::new(),
         }
     }
@@ -670,11 +726,12 @@ impl LazySqlTransform {
     async fn ensure_inner(&self, schema: SchemaRef) -> Result<&DataFusionTransform, BackendError> {
         self.inner
             .get_or_try_init(|| async {
-                DataFusionTransform::new_with_lookups_and_udfs(
+                DataFusionTransform::new_with_lookups_udfs_and_aggregate_udfs(
                     &self.sql,
                     schema.clone(),
                     self.lookups.clone(),
                     self.udfs.clone(),
+                    self.aggregate_udfs.clone(),
                 )
                 .await
             })
@@ -1002,6 +1059,209 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("duplicate UDF name"), "got: {msg}");
         assert!(msg.contains("noop"), "got: {msg}");
+    }
+
+    /// Custom **aggregate** UDF support — the `bs_call_delta`
+    /// scalar UDF closes per-row math, but per-group aggregates
+    /// (volume-weighted average price, custom percentiles,
+    /// distinct-by-cardinality) need an `AggregateUDF`. A trivial
+    /// `sum_of_squares(Int64)` aggregator proves the wiring: same
+    /// `SessionContext::register_udaf` path that DataFusion's
+    /// builtins use, threaded through
+    /// `new_with_lookups_udfs_and_aggregate_udfs`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn aggregate_udf_round_trips_through_transform_sql() {
+        use std::any::Any;
+        use std::sync::Arc;
+
+        use arrow_array::Int64Array;
+        use datafusion::common::Result as DfResult;
+        use datafusion::common::ScalarValue;
+        use datafusion::logical_expr::function::{AccumulatorArgs, StateFieldsArgs};
+        use datafusion::logical_expr::{
+            Accumulator, AggregateUDF, AggregateUDFImpl, Signature, Volatility,
+        };
+        // sum_of_squares(Int64) → Int64. State is one Int64 (the
+        // running sum). Distinct from DataFusion's builtin SUM so
+        // we know the test is hitting the user-registered path.
+        #[derive(Debug, PartialEq, Eq, Hash)]
+        struct SumOfSquares {
+            signature: Signature,
+        }
+        impl SumOfSquares {
+            fn new() -> Self {
+                Self {
+                    signature: Signature::exact(vec![DataType::Int64], Volatility::Immutable),
+                }
+            }
+        }
+        impl AggregateUDFImpl for SumOfSquares {
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+            fn name(&self) -> &str {
+                "sum_of_squares"
+            }
+            fn signature(&self) -> &Signature {
+                &self.signature
+            }
+            fn return_type(&self, _arg_types: &[DataType]) -> DfResult<DataType> {
+                Ok(DataType::Int64)
+            }
+            fn accumulator(&self, _acc_args: AccumulatorArgs) -> DfResult<Box<dyn Accumulator>> {
+                Ok(Box::new(SumOfSquaresAcc { sum: 0 }))
+            }
+            fn state_fields(&self, args: StateFieldsArgs) -> DfResult<Vec<arrow_schema::FieldRef>> {
+                use arrow_schema::Field;
+                let n = args.name;
+                Ok(vec![Arc::new(Field::new(
+                    format!("{n}[sum]"),
+                    DataType::Int64,
+                    true,
+                ))])
+            }
+        }
+
+        #[derive(Debug)]
+        struct SumOfSquaresAcc {
+            sum: i64,
+        }
+        impl Accumulator for SumOfSquaresAcc {
+            fn update_batch(&mut self, values: &[arrow_array::ArrayRef]) -> DfResult<()> {
+                let arr = values[0]
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("Int64 input");
+                for v in arr.iter().flatten() {
+                    self.sum += v * v;
+                }
+                Ok(())
+            }
+            fn evaluate(&mut self) -> DfResult<ScalarValue> {
+                Ok(ScalarValue::Int64(Some(self.sum)))
+            }
+            fn size(&self) -> usize {
+                std::mem::size_of::<Self>()
+            }
+            fn state(&mut self) -> DfResult<Vec<ScalarValue>> {
+                Ok(vec![ScalarValue::Int64(Some(self.sum))])
+            }
+            fn merge_batch(&mut self, states: &[arrow_array::ArrayRef]) -> DfResult<()> {
+                let arr = states[0]
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("Int64 state");
+                for v in arr.iter().flatten() {
+                    self.sum += v;
+                }
+                Ok(())
+            }
+        }
+
+        let udaf = Arc::new(AggregateUDF::from(SumOfSquares::new()));
+        let t = DataFusionTransform::new_with_lookups_udfs_and_aggregate_udfs(
+            "SELECT sum_of_squares(user_id) AS sq FROM source",
+            schema_user_id_event(),
+            Vec::new(),
+            Vec::new(),
+            vec![udaf],
+        )
+        .await
+        .expect("construct transform with aggregate UDF");
+        let out = t
+            .transform(batch_events(), &BatchContext::default())
+            .await
+            .expect("apply aggregate UDF");
+        assert_eq!(out.len(), 1);
+        let arr = out[0]
+            .column_by_name("sq")
+            .expect("output has sq column")
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("aggregate emits Int64");
+        // batch_events user_ids = [1, 2, 99]; squares = [1, 4, 9801];
+        // sum_of_squares = 9806.
+        assert_eq!(arr.len(), 1, "aggregate collapses to one row");
+        assert_eq!(arr.value(0), 9806);
+    }
+
+    /// Two aggregate UDFs registered under the same name is a
+    /// config-load error — symmetric with the scalar-UDF check.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn duplicate_aggregate_udf_names_rejected_at_construction() {
+        use std::any::Any;
+        use std::sync::Arc;
+
+        use datafusion::common::Result as DfResult;
+        use datafusion::common::ScalarValue;
+        use datafusion::logical_expr::function::{AccumulatorArgs, StateFieldsArgs};
+        use datafusion::logical_expr::{
+            Accumulator, AggregateUDF, AggregateUDFImpl, Signature, Volatility,
+        };
+
+        #[derive(Debug, PartialEq, Eq, Hash)]
+        struct Stub {
+            signature: Signature,
+        }
+        impl AggregateUDFImpl for Stub {
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+            fn name(&self) -> &str {
+                "my_agg"
+            }
+            fn signature(&self) -> &Signature {
+                &self.signature
+            }
+            fn return_type(&self, _: &[DataType]) -> DfResult<DataType> {
+                Ok(DataType::Int64)
+            }
+            fn accumulator(&self, _acc_args: AccumulatorArgs) -> DfResult<Box<dyn Accumulator>> {
+                Ok(Box::new(Noop))
+            }
+            fn state_fields(&self, args: StateFieldsArgs) -> DfResult<Vec<arrow_schema::FieldRef>> {
+                use arrow_schema::Field;
+                Ok(vec![Arc::new(Field::new(args.name, DataType::Int64, true))])
+            }
+        }
+
+        #[derive(Debug)]
+        struct Noop;
+        impl Accumulator for Noop {
+            fn update_batch(&mut self, _values: &[arrow_array::ArrayRef]) -> DfResult<()> {
+                Ok(())
+            }
+            fn evaluate(&mut self) -> DfResult<ScalarValue> {
+                Ok(ScalarValue::Int64(Some(0)))
+            }
+            fn size(&self) -> usize {
+                0
+            }
+            fn state(&mut self) -> DfResult<Vec<ScalarValue>> {
+                Ok(vec![ScalarValue::Int64(Some(0))])
+            }
+            fn merge_batch(&mut self, _states: &[arrow_array::ArrayRef]) -> DfResult<()> {
+                Ok(())
+            }
+        }
+
+        let make = || {
+            Arc::new(AggregateUDF::from(Stub {
+                signature: Signature::exact(vec![DataType::Int64], Volatility::Immutable),
+            }))
+        };
+        let err = DataFusionTransform::new_with_lookups_udfs_and_aggregate_udfs(
+            "SELECT user_id FROM source",
+            schema_user_id_event(),
+            Vec::new(),
+            Vec::new(),
+            vec![make(), make()],
+        )
+        .await
+        .expect_err("duplicate aggregate UDF names rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("duplicate aggregate UDF name"), "got: {msg}");
+        assert!(msg.contains("my_agg"), "got: {msg}");
     }
 
     /// Σ.A1 audit: `EXPLAIN`/`EXPLAIN ANALYZE` must round-trip
