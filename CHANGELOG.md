@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1] — 2026-05-10
+
+Sdist-publish fix. **No functional code changes** — wheels remain
+bit-equivalent to v0.2.0; sdist now packages correctly so source-
+build platforms (Windows, Linux ARM/musl, macOS x86_64) install
+again. Cut because v0.2.0's PyPI publish job failed on the sdist
+upload with HTTP 400 (`License-File LICENSE does not exist in
+distribution file`) — the eight v0.2.0 wheels are live, but no
+v0.2.0 sdist.
+
+### Fixed
+
+- **Sdist now ships the `LICENSE` file**. `pyproject.toml`
+  switched from the deprecated `license = { text = "Apache-2.0" }`
+  form to PEP 639's `license = "Apache-2.0"` + `license-files =
+  ["LICENSE"]`. Maturin reads the latter, includes the listed
+  files in the sdist tarball, and emits matching `License-File:
+  LICENSE` + `License-Expression: Apache-2.0` in the sdist's
+  PKG-INFO. PyPI's PEP 639 metadata validation passes.
+
+  Locally verified: `maturin sdist` → tarball contains
+  `ematix_flow-0.2.1/LICENSE`, PKG-INFO declares `License-File:
+  LICENSE` matching the actual archive entry.
+
+### Changed
+
+- README "Status" line bumped to **v0.2.1 on PyPI** with a
+  one-line summary of what landed across the 0.2 series
+  (`@udf`/`@udaf`, Phase Δ CDC, object-store streaming source,
+  Σ.A2 dialect translator).
+
 ## [0.2.0] — 2026-05-10
 
 Major feature release. **Headline**: Python `@udf` / `@udaf`
