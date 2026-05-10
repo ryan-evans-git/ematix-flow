@@ -716,11 +716,69 @@ CREATE TABLE marketdata.option_chain_snapshots (
 
 Same shape works for `MERGE` / `SCD2` / `Truncate` strategies via
 the strategy executor — the JSONB column round-trips like any other
-type. Per-row Python compute (e.g. live Black-Scholes delta over
-streaming vol/rate inputs) isn't expressible in DataFusion SQL today
-and would still need a Python post-stage; pre-computed lookups
-(`@ematix.lookup` against a static numeric table) work when the
-inputs are stable.
+type.
+
+For functions DataFusion's stdlib doesn't cover (cumulative-normal
+CDF, custom hashing, day-count conventions), register a Python
+scalar UDF — covered in the next section.
+
+### Python UDFs (`@ematix_flow.udf`)
+
+Wrap a Python callable as a DataFusion scalar UDF and call it from
+`transform_sql`. Per-batch dispatch through PyArrow zero-copy: one
+GIL acquisition + PyArrow round-trip per batch (typically thousands
+of rows), so vectorised numpy / pyarrow.compute inside the callable
+amortises the overhead.
+
+```python
+import math
+
+import numpy as np
+import pyarrow as pa
+
+from ematix_flow import run_streaming_pipeline, udf
+
+
+@udf(args=("Float64", "Float64", "Float64", "Float64", "Float64"),
+     returns="Float64")
+def bs_call_delta(strike, spot, vol, rate, expiry):
+    # All five inputs arrive as PyArrow Float64 Arrays; convert
+    # once, do the math vectorised, ship a PyArrow Array back.
+    k = strike.to_numpy(zero_copy_only=False)
+    s = spot.to_numpy(zero_copy_only=False)
+    v = vol.to_numpy(zero_copy_only=False)
+    r = rate.to_numpy(zero_copy_only=False)
+    t = expiry.to_numpy(zero_copy_only=False)
+    d1 = (np.log(s / k) + (r + 0.5 * v * v) * t) / (v * np.sqrt(t))
+    cdf = 0.5 * (1.0 + np.vectorize(math.erf)(d1 / np.sqrt(2)))
+    return pa.array(cdf, type=pa.float64())
+
+
+run_streaming_pipeline(
+    name="option-chain-with-greeks",
+    source=s3, source_query="raw/options/",
+    target=warehouse, target_table=("marketdata", "option_chain_snapshots"),
+    transform_sql="""
+        SELECT
+          date_trunc('minute', ts) AS minute,
+          array_agg(named_struct(
+            'strike', strike,
+            'bid',    bid,
+            'ask',    ask,
+            'delta',  bs_call_delta(strike, spot, vol, rate, expiry)
+          )) AS strikes_json
+        FROM source
+        GROUP BY 1
+    """,
+    udfs=[bs_call_delta],
+)
+```
+
+Argument and return types are DataFusion `DataType` strings —
+`"Int64"`, `"Float64"`, `"Utf8"`, `"Boolean"`, etc. Mismatched call
+sites surface at plan-compile time as DataFusion type errors. Two
+UDFs registering under the same name is a config-load error — no
+silent shadowing.
 
 ### Tumbling / hopping windows
 
