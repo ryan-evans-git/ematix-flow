@@ -39,6 +39,11 @@ from ematix_flow.streaming import (
     run_pipeline,
     run_streaming_pipeline,
 )
+from ematix_flow.udaf import (
+    PythonAggregateUdfHandle,
+    apply_udaf_to_batch,
+    udaf,
+)
 from ematix_flow.udf import (
     PythonScalarUdfHandle,
     apply_udf_to_batch,
@@ -79,6 +84,7 @@ __all__ = [
     "ObjectStoreS3Connection",
     "PostgresConnection",
     "PubSubConnection",
+    "PythonAggregateUdfHandle",
     "PythonScalarUdfHandle",
     "RabbitMQConnection",
     "SQLiteConnection",
@@ -90,6 +96,7 @@ __all__ = [
     "Window",
     "__version__",
     "_core",
+    "apply_udaf_to_batch",
     "apply_udf_to_batch",
     "config",
     "connect",
@@ -104,5 +111,6 @@ __all__ = [
     "run_pipeline",
     "run_streaming_pipeline",
     "streaming",
+    "udaf",
     "udf",
 ]

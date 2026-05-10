@@ -202,7 +202,7 @@ pub(crate) fn make_python_udf(
 /// Small, opinionated DataType-string parser — the surface a Python
 /// `@ematix.udf` decorator needs without dragging in DataFusion's
 /// full SQL parser. Add cases as concrete UDFs surface them.
-fn parse_datatype(s: &str) -> PyResult<DataType> {
+pub(crate) fn parse_datatype(s: &str) -> PyResult<DataType> {
     use pyo3::exceptions::PyValueError;
     Ok(match s {
         "Int8" | "int8" => DataType::Int8,

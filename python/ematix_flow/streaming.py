@@ -609,6 +609,7 @@ def run_streaming_pipeline(
     watermark: Watermark | None = None,
     metrics_port: int | None = None,
     udfs: list | None = None,
+    aggregate_udfs: list | None = None,
 ) -> PipelineMetrics:
     """Run a streaming pipeline driven by typed :class:`Connection` objects.
 
@@ -661,6 +662,25 @@ def run_streaming_pipeline(
     UDFs are only consulted by the SQL pre-stage. Pure-CDC,
     pure-window-no-SQL, and pure-join pipelines silently ignore
     them — those code paths don't run a `LazySqlTransform`.
+
+    **Aggregate UDFs.** Pass ``aggregate_udfs=[handle, ...]`` for
+    per-group reductions DataFusion's stdlib doesn't ship (VWAP,
+    custom percentiles, distinct-by-cardinality with custom merge
+    semantics). Each handle is built via the ``@ematix_flow.udaf``
+    decorator (Accumulator class with ``update_batch``,
+    ``merge_batch``, ``evaluate``, ``state``)::
+
+        @udaf(args=("Float64", "Float64"),
+              state=("Float64", "Float64"),
+              returns="Float64")
+        class Vwap:
+            ...
+
+        run_streaming_pipeline(
+            ...,
+            transform_sql="SELECT vwap(price, qty) FROM source GROUP BY 1",
+            aggregate_udfs=[Vwap],
+        )
     """
     toml = _run_streaming_pipeline_emit_toml(
         name=name,
@@ -688,7 +708,7 @@ def run_streaming_pipeline(
         watermark=watermark,
         metrics_port=metrics_port,
     )
-    return run_pipeline_from_toml_str(toml, metrics_port, udfs)
+    return run_pipeline_from_toml_str(toml, metrics_port, udfs, aggregate_udfs)
 
 
 def _run_streaming_pipeline_emit_toml(
