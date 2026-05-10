@@ -49,3 +49,7 @@ rdkafka = { workspace = true }
 ematix-flow-core = { workspace = true }
 arrow-array = { workspace = true }
 futures-util = { workspace = true }
+# Π.5: tests construct trivial `ScalarUDFImpl` fixtures to verify
+# the streaming-pipeline UDF threading; the production crate
+# doesn't itself need a direct DataFusion dep.
+datafusion = { workspace = true }

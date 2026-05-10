@@ -117,6 +117,7 @@ async fn cli_e2e_kafka_to_sqlite_via_run_consume_with() {
     let options = ConsumeOptions {
         metrics_port: None, // metrics server validated by its own unit tests
         shutdown_signal: Some(signal),
+        ..Default::default()
     };
 
     // 5. Run the pipeline in a background task. Poll the SQLite
@@ -214,6 +215,7 @@ async fn cli_e2e_metrics_endpoint_serves_pipeline_counters() {
     let options = ConsumeOptions {
         metrics_port: Some(metrics_port),
         shutdown_signal: Some(signal),
+        ..Default::default()
     };
 
     let pipeline_handle = {

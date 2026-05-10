@@ -608,6 +608,7 @@ def run_streaming_pipeline(
     transform_on_error: str | None = None,
     watermark: Watermark | None = None,
     metrics_port: int | None = None,
+    udfs: list | None = None,
 ) -> PipelineMetrics:
     """Run a streaming pipeline driven by typed :class:`Connection` objects.
 
@@ -641,6 +642,25 @@ def run_streaming_pipeline(
     to fan in from N sources. Required for stream-stream joins —
     the ``Join`` references each source's ``query`` as
     ``left_source`` / ``right_source``.
+
+    **UDFs (Π.5).** Pass ``udfs=[handle, ...]`` to register custom
+    scalar UDFs on the SQL pre-stage. Each handle is built via the
+    ``@ematix_flow.udf`` decorator and is callable from
+    ``transform_sql``::
+
+        @udf(args=("Float64", "Float64"), returns="Float64")
+        def hypot(a, b):
+            ...
+
+        run_streaming_pipeline(
+            ...,
+            transform_sql="SELECT hypot(dx, dy) AS dist FROM source",
+            udfs=[hypot],
+        )
+
+    UDFs are only consulted by the SQL pre-stage. Pure-CDC,
+    pure-window-no-SQL, and pure-join pipelines silently ignore
+    them — those code paths don't run a `LazySqlTransform`.
     """
     toml = _run_streaming_pipeline_emit_toml(
         name=name,
@@ -668,7 +688,7 @@ def run_streaming_pipeline(
         watermark=watermark,
         metrics_port=metrics_port,
     )
-    return run_pipeline_from_toml_str(toml, metrics_port)
+    return run_pipeline_from_toml_str(toml, metrics_port, udfs)
 
 
 def _run_streaming_pipeline_emit_toml(

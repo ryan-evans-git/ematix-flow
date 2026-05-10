@@ -107,7 +107,7 @@ class TestTransformOnError:
 
         captured: dict[str, str] = {}
 
-        def fake_runner(toml: str, _port: int | None):
+        def fake_runner(toml: str, _port: int | None, _udfs: list | None = None):
             captured["toml"] = toml
             return {"total_rows": 0, "iterations": 0, "shutdown_triggered": False}
 
