@@ -3,6 +3,7 @@ mod kafka;
 mod kinesis;
 mod pubsub;
 mod rabbitmq;
+mod udaf;
 mod udf;
 
 use std::sync::{Arc, OnceLock};
@@ -731,16 +732,18 @@ fn cross_backend_arrow_sync(
 /// registered on the pipeline's SQL pre-stage `SessionContext`,
 /// callable from `transform_sql`.
 #[pyfunction]
-#[pyo3(signature = (toml_str, metrics_port=None, udfs=None))]
+#[pyo3(signature = (toml_str, metrics_port=None, udfs=None, aggregate_udfs=None))]
 fn run_pipeline_from_toml_str<'py>(
     py: Python<'py>,
     toml_str: &str,
     metrics_port: Option<u16>,
     udfs: Option<Vec<Py<udf::PyUdfHandle>>>,
+    aggregate_udfs: Option<Vec<Py<udaf::PyUdafHandle>>>,
 ) -> PyResult<Bound<'py, PyDict>> {
     let cfg = ematix_flow_cli::PipelineCliConfig::from_toml_str(toml_str)
         .map_err(|e| PyValueError::new_err(e.to_string()))?;
     let udf_arcs = unwrap_udf_handles(py, udfs);
+    let udaf_arcs = unwrap_udaf_handles(py, aggregate_udfs);
     let options = ematix_flow_cli::ConsumeOptions {
         metrics_port,
         // Python path: install_shutdown_handler manages SIGTERM /
@@ -750,12 +753,7 @@ fn run_pipeline_from_toml_str<'py>(
         // returns cleanly with shutdown_triggered=true.
         shutdown_signal: None,
         udfs: udf_arcs,
-        // Aggregate UDFs follow in the next iteration once the
-        // PyO3 `@udaf` wrapper lands; until then the streaming
-        // wiring exists at the Rust layer (CLI test
-        // `streaming_config_threads_aggregate_udfs_into_lazy_sql_transform`)
-        // but the Python facade doesn't surface them yet.
-        aggregate_udfs: Vec::new(),
+        aggregate_udfs: udaf_arcs,
     };
     let metrics = py
         .detach(|| {
@@ -773,21 +771,23 @@ fn run_pipeline_from_toml_str<'py>(
 /// path. Convenience wrapper around `run_pipeline_from_toml_str`
 /// that reads the file. Same return shape + error semantics.
 #[pyfunction]
-#[pyo3(signature = (path, metrics_port=None, udfs=None))]
+#[pyo3(signature = (path, metrics_port=None, udfs=None, aggregate_udfs=None))]
 fn run_pipeline_from_path<'py>(
     py: Python<'py>,
     path: &str,
     metrics_port: Option<u16>,
     udfs: Option<Vec<Py<udf::PyUdfHandle>>>,
+    aggregate_udfs: Option<Vec<Py<udaf::PyUdafHandle>>>,
 ) -> PyResult<Bound<'py, PyDict>> {
     let cfg = ematix_flow_cli::PipelineCliConfig::from_path(path)
         .map_err(|e| PyValueError::new_err(e.to_string()))?;
     let udf_arcs = unwrap_udf_handles(py, udfs);
+    let udaf_arcs = unwrap_udaf_handles(py, aggregate_udfs);
     let options = ematix_flow_cli::ConsumeOptions {
         metrics_port,
         shutdown_signal: None,
         udfs: udf_arcs,
-        aggregate_udfs: Vec::new(),
+        aggregate_udfs: udaf_arcs,
     };
     let metrics = py
         .detach(|| {
@@ -814,6 +814,19 @@ fn unwrap_udf_handles(
     udfs.unwrap_or_default()
         .into_iter()
         .map(|handle| std::sync::Arc::clone(&handle.borrow(py).udf))
+        .collect()
+}
+
+/// Symmetric helper for `@udaf` handles — pulls each
+/// `Arc<AggregateUDF>` out of a Python-owned `PythonAggregateUdfHandle`.
+fn unwrap_udaf_handles(
+    py: Python<'_>,
+    udafs: Option<Vec<Py<udaf::PyUdafHandle>>>,
+) -> Vec<std::sync::Arc<ematix_flow_core::transform::AggregateUDF>> {
+    udafs
+        .unwrap_or_default()
+        .into_iter()
+        .map(|handle| std::sync::Arc::clone(&handle.borrow(py).udaf))
         .collect()
 }
 
@@ -849,6 +862,8 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(run_pipeline_from_path, m)?)?;
     m.add_function(wrap_pyfunction!(udf::make_python_udf, m)?)?;
     m.add_function(wrap_pyfunction!(udf::_apply_python_udf_to_batch, m)?)?;
+    m.add_function(wrap_pyfunction!(udaf::make_python_udaf, m)?)?;
+    m.add_function(wrap_pyfunction!(udaf::_apply_python_udaf_to_batch, m)?)?;
     m.add_class::<Connection>()?;
     m.add_class::<kafka::PyKafkaBackend>()?;
     m.add_class::<rabbitmq::PyRabbitMQBackend>()?;
@@ -856,5 +871,6 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<kinesis::PyKinesisBackend>()?;
     m.add_class::<arrow_iter::PyArrowBatchIter>()?;
     m.add_class::<udf::PyUdfHandle>()?;
+    m.add_class::<udaf::PyUdafHandle>()?;
     Ok(())
 }
