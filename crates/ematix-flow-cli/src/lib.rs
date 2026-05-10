@@ -58,7 +58,9 @@ use ematix_flow_core::streaming::{
     ShutdownSignal, StreamingPipeline, StreamingPipelineConfig, StreamingPipelineMetrics,
     StreamingPipelineMetricsCounters, install_shutdown_handler,
 };
-use ematix_flow_core::transform::{BatchTransform, LazySqlTransform, LookupTable, ScalarUDF};
+use ematix_flow_core::transform::{
+    AggregateUDF, BatchTransform, LazySqlTransform, LookupTable, ScalarUDF,
+};
 use ematix_flow_core::windowed::{
     AggKind, AggregationSpec, CountDistinctMode, LateDataPolicy, WindowConfig, WindowKind,
     WindowedAggregateTransform, WindowedMetrics,
@@ -2863,7 +2865,13 @@ impl PipelineCliConfig {
         target: TargetTable,
         lookups: Vec<LookupTable>,
     ) -> StreamingPipelineConfig {
-        self.streaming_config_with_lookups_udfs_and_metrics(target, lookups, Vec::new(), None)
+        self.streaming_config_with_lookups_udfs_aggregate_udfs_and_metrics(
+            target,
+            lookups,
+            Vec::new(),
+            Vec::new(),
+            None,
+        )
     }
 
     /// Phase 39.4 PR 2b: like [`Self::streaming_config_with_lookups`]
@@ -2879,9 +2887,10 @@ impl PipelineCliConfig {
         lookups: Vec<LookupTable>,
         metrics_registry: Option<&prometheus::Registry>,
     ) -> StreamingPipelineConfig {
-        self.streaming_config_with_lookups_udfs_and_metrics(
+        self.streaming_config_with_lookups_udfs_aggregate_udfs_and_metrics(
             target,
             lookups,
+            Vec::new(),
             Vec::new(),
             metrics_registry,
         )
@@ -2903,6 +2912,26 @@ impl PipelineCliConfig {
         target: TargetTable,
         lookups: Vec<LookupTable>,
         udfs: Vec<Arc<ScalarUDF>>,
+        metrics_registry: Option<&prometheus::Registry>,
+    ) -> StreamingPipelineConfig {
+        self.streaming_config_with_lookups_udfs_aggregate_udfs_and_metrics(
+            target,
+            lookups,
+            udfs,
+            Vec::new(),
+            metrics_registry,
+        )
+    }
+
+    /// Same as [`Self::streaming_config_with_lookups_udfs_and_metrics`]
+    /// but also threads custom **aggregate** UDFs (the `@udaf`
+    /// analog) through to the inner [`LazySqlTransform`].
+    pub fn streaming_config_with_lookups_udfs_aggregate_udfs_and_metrics(
+        &self,
+        target: TargetTable,
+        lookups: Vec<LookupTable>,
+        udfs: Vec<Arc<ScalarUDF>>,
+        aggregate_udfs: Vec<Arc<AggregateUDF>>,
         metrics_registry: Option<&prometheus::Registry>,
     ) -> StreamingPipelineConfig {
         let mut cfg = StreamingPipelineConfig::new(
@@ -2980,13 +3009,14 @@ impl PipelineCliConfig {
                         // None here, populated below.
                         None
                     }
-                    (Some(sql), false) => {
-                        Some(Arc::new(LazySqlTransform::new_with_lookups_and_udfs(
+                    (Some(sql), false) => Some(Arc::new(
+                        LazySqlTransform::new_with_lookups_udfs_and_aggregate_udfs(
                             sql.clone(),
                             lookups.clone(),
                             udfs.clone(),
-                        )))
-                    }
+                            aggregate_udfs.clone(),
+                        ),
+                    )),
                 };
             let inner_distributed: Option<Arc<dyn BatchTransform>> =
                 match (translated_sql, engine_is_distributed) {
@@ -3363,6 +3393,13 @@ pub struct ConsumeOptions {
     /// boundary unwraps them; pure-Rust callers can construct
     /// them directly with `Arc::new(ScalarUDF::from(my_impl))`.
     pub udfs: Vec<Arc<ScalarUDF>>,
+    /// Custom **aggregate** UDFs registered on the SQL pre-stage —
+    /// the per-group analog of `udfs`. `SELECT vwap(price, qty)
+    /// FROM source GROUP BY 1` resolves through these. Same Python
+    /// → PyO3 unwrap path, separate Vec because DataFusion has
+    /// distinct registration calls (`register_udf` vs
+    /// `register_udaf`).
+    pub aggregate_udfs: Vec<Arc<AggregateUDF>>,
 }
 
 /// Run a single pipeline to completion (until shutdown). Used by
@@ -3407,10 +3444,11 @@ pub async fn run_consume_with(
     // then hand the same counters into `new_multi_source_with_metrics`
     // so we don't double-construct.
     let pipeline_metrics = StreamingPipelineMetricsCounters::new(&config.pipeline_name);
-    let mut pipeline_cfg = config.streaming_config_with_lookups_udfs_and_metrics(
+    let mut pipeline_cfg = config.streaming_config_with_lookups_udfs_aggregate_udfs_and_metrics(
         primary_table,
         lookups,
         options.udfs.clone(),
+        options.aggregate_udfs.clone(),
         Some(&pipeline_metrics.registry),
     );
     // Phase 39.5a PR 3: instantiate the StateStore (if configured)
@@ -3984,6 +4022,146 @@ mod tests {
             .downcast_ref::<Int32Array>()
             .expect("y is Int32");
         assert_eq!(y.values(), &[2, 3, 4]);
+    }
+
+    /// Aggregate-UDF analog of the scalar-UDF threading test —
+    /// the `@udaf` story has the same wiring obligation: a UDAF
+    /// passed through `streaming_config_with_lookups_udfs_aggregate_udfs_and_metrics`
+    /// must reach the inner `LazySqlTransform`. Builds a trivial
+    /// Int64 → Int64 `sum_of_squares` aggregator, threads it
+    /// through, and proves the resulting transform invokes it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn streaming_config_threads_aggregate_udfs_into_lazy_sql_transform() {
+        use std::any::Any;
+
+        use arrow_array::{ArrayRef, Int64Array};
+        use arrow_schema::{DataType, Field, Schema};
+        use datafusion::common::Result as DfResult;
+        use datafusion::common::ScalarValue;
+        use datafusion::logical_expr::function::{AccumulatorArgs, StateFieldsArgs};
+        use datafusion::logical_expr::{
+            Accumulator, AggregateUDF, AggregateUDFImpl, Signature, Volatility,
+        };
+        use ematix_flow_core::transform::BatchContext;
+
+        #[derive(Debug, PartialEq, Eq, Hash)]
+        struct SumOfSquares {
+            signature: Signature,
+        }
+        impl SumOfSquares {
+            fn new() -> Self {
+                Self {
+                    signature: Signature::exact(vec![DataType::Int64], Volatility::Immutable),
+                }
+            }
+        }
+        impl AggregateUDFImpl for SumOfSquares {
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+            fn name(&self) -> &str {
+                "sum_of_squares"
+            }
+            fn signature(&self) -> &Signature {
+                &self.signature
+            }
+            fn return_type(&self, _: &[DataType]) -> DfResult<DataType> {
+                Ok(DataType::Int64)
+            }
+            fn accumulator(&self, _: AccumulatorArgs) -> DfResult<Box<dyn Accumulator>> {
+                Ok(Box::new(SumOfSquaresAcc { sum: 0 }))
+            }
+            fn state_fields(&self, args: StateFieldsArgs) -> DfResult<Vec<arrow_schema::FieldRef>> {
+                Ok(vec![Arc::new(Field::new(
+                    format!("{}[sum]", args.name),
+                    DataType::Int64,
+                    true,
+                ))])
+            }
+        }
+
+        #[derive(Debug)]
+        struct SumOfSquaresAcc {
+            sum: i64,
+        }
+        impl Accumulator for SumOfSquaresAcc {
+            fn update_batch(&mut self, values: &[arrow_array::ArrayRef]) -> DfResult<()> {
+                let arr = values[0].as_any().downcast_ref::<Int64Array>().unwrap();
+                for v in arr.iter().flatten() {
+                    self.sum += v * v;
+                }
+                Ok(())
+            }
+            fn evaluate(&mut self) -> DfResult<ScalarValue> {
+                Ok(ScalarValue::Int64(Some(self.sum)))
+            }
+            fn size(&self) -> usize {
+                std::mem::size_of::<Self>()
+            }
+            fn state(&mut self) -> DfResult<Vec<ScalarValue>> {
+                Ok(vec![ScalarValue::Int64(Some(self.sum))])
+            }
+            fn merge_batch(&mut self, states: &[arrow_array::ArrayRef]) -> DfResult<()> {
+                let arr = states[0].as_any().downcast_ref::<Int64Array>().unwrap();
+                for v in arr.iter().flatten() {
+                    self.sum += v;
+                }
+                Ok(())
+            }
+        }
+
+        let toml = r#"
+            pipeline_name = "p"
+            source_query = "events"
+
+            [source]
+            kind = "kafka"
+            bootstrap_servers = "localhost:9092"
+
+            [target]
+            kind = "sqlite"
+            path = ":memory:"
+
+            [target.table]
+            name = "out"
+
+            [transform]
+            sql = "SELECT sum_of_squares(x) AS sq FROM source"
+        "#;
+        let cfg = PipelineCliConfig::from_toml_str(toml).unwrap();
+        let table = TargetTable {
+            schema: "".into(),
+            name: "out".into(),
+        };
+        let udaf: Arc<AggregateUDF> = Arc::new(AggregateUDF::from(SumOfSquares::new()));
+        let scfg = cfg.streaming_config_with_lookups_udfs_aggregate_udfs_and_metrics(
+            table,
+            Vec::new(),
+            Vec::new(),
+            vec![udaf],
+            None,
+        );
+        let xform = scfg
+            .transform
+            .as_ref()
+            .expect("SQL pre-stage transform attached");
+
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, true)]));
+        let arr: ArrayRef = Arc::new(Int64Array::from(vec![1i64, 2, 99]));
+        let batch = arrow_array::RecordBatch::try_new(schema, vec![arr]).unwrap();
+        let out = xform
+            .transform(batch, &BatchContext::default())
+            .await
+            .expect("transform with aggregate UDF");
+        assert_eq!(out.len(), 1);
+        let sq = out[0]
+            .column_by_name("sq")
+            .expect("output has sq")
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("sq is Int64");
+        // 1 + 4 + 9801 = 9806
+        assert_eq!(sq.value(0), 9806);
     }
 
     #[tokio::test(flavor = "multi_thread")]
