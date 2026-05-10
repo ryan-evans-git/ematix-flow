@@ -672,45 +672,107 @@ and recursively serialises:
 A `List` or `Struct` column targeting a non-JSON Postgres type is
 rejected with a clear error pointing at the column name.
 
-**Functions DataFusion's stdlib doesn't cover** (cumulative-normal
-CDF for Black-Scholes deltas, custom hashing, financial day-count
-conventions, etc.) register as **scalar UDFs** through
-`DataFusionTransform::new_with_lookups_and_udfs(...)` /
-`LazySqlTransform::new_with_lookups_and_udfs(...)`. Each UDF is an
+### Custom scalar UDFs (`@ematix_flow.udf`)
+
+Functions DataFusion's stdlib doesn't cover (cumulative-normal CDF
+for Black-Scholes deltas, custom hashing, financial day-count
+conventions, …) register as **scalar UDFs**. Two surfaces:
+
+**Python (recommended for most users).** Decorate a Python callable
+with `@udf` and pass it to `run_streaming_pipeline(udfs=[...])`. The
+decorator wraps the callable as a DataFusion `ScalarUDF` callable
+from any `transform_sql`:
+
+```python
+import math
+
+import numpy as np
+import pyarrow as pa
+
+from ematix_flow import run_streaming_pipeline, udf
+
+
+@udf(args=("Float64", "Float64", "Float64", "Float64", "Float64"),
+     returns="Float64")
+def bs_call_delta(strike, spot, vol, rate, expiry):
+    # All five inputs arrive as PyArrow Float64 Arrays once per
+    # batch (typically thousands of rows). Convert once, do the
+    # math vectorised, return a PyArrow Array.
+    k = strike.to_numpy(zero_copy_only=False)
+    s = spot.to_numpy(zero_copy_only=False)
+    v = vol.to_numpy(zero_copy_only=False)
+    r = rate.to_numpy(zero_copy_only=False)
+    t = expiry.to_numpy(zero_copy_only=False)
+    d1 = (np.log(s / k) + (r + 0.5 * v * v) * t) / (v * np.sqrt(t))
+    cdf = 0.5 * (1.0 + np.vectorize(math.erf)(d1 / np.sqrt(2)))
+    return pa.array(cdf, type=pa.float64())
+
+
+run_streaming_pipeline(
+    name="option-chain-with-greeks",
+    source=s3, source_query="raw/options/",
+    target=warehouse, target_table=("marketdata", "option_chain_snapshots"),
+    transform_sql="""
+        SELECT
+          date_trunc('minute', ts) AS minute,
+          array_agg(named_struct(
+            'strike', strike,
+            'bid',    bid,
+            'ask',    ask,
+            'delta',  bs_call_delta(strike, spot, vol, rate, expiry)
+          )) AS strikes_json
+        FROM source
+        GROUP BY 1
+    """,
+    udfs=[bs_call_delta],
+)
+```
+
+**Per-batch dispatch.** One PyO3 GIL acquisition + PyArrow
+round-trip per *batch*, not per row. For a 10k-row batch the
+overhead amortises across all rows; vectorise inside the callable
+(`numpy` / `pyarrow.compute`) — per-row Python loops will be slow.
+
+**Argument and return types** are DataFusion `DataType` strings:
+`"Int8"` … `"Int64"`, `"UInt8"` … `"UInt64"`, `"Float32"`,
+`"Float64"`, `"Boolean"`, `"Utf8"`, `"Binary"`. Other types raise
+`ValueError` at decoration time. Mismatched call sites in SQL
+surface at plan-compile time as DataFusion type errors. Two UDFs
+registering under the same name is a config-load error — no silent
+shadowing.
+
+**The optional `name=` kwarg** lets you decouple the SQL-side name
+from the Python identifier — useful when the Pythonic name (`erf`)
+collides with a DataFusion built-in or you want to shorten a
+namespaced helper:
+
+```python
+@udf(args=("Float64",), returns="Float64", name="black76_d1")
+def _b76_d1(x):
+    ...
+```
+
+**Pure-Rust (for callers who want to avoid the PyO3 round-trip).**
+The same wiring exists at the Rust layer. Each UDF is an
 `Arc<datafusion::logical_expr::ScalarUDF>` (re-exported as
-`ematix_flow_core::transform::ScalarUDF` for ergonomics). The cached
-SQL plan binds to them at construction time, so dropping the
-caller-side reference after registration is fine.
+`ematix_flow_core::transform::ScalarUDF` for ergonomics):
 
 ```rust
 use std::sync::Arc;
 use ematix_flow_core::transform::{DataFusionTransform, ScalarUDF};
 use datafusion::logical_expr::{ScalarUDFImpl, Signature, Volatility};
-// ... implement ScalarUDFImpl for your UDF (see the AddOne example
-// in datafusion-expr's docs); then:
+// ... implement ScalarUDFImpl for BsDelta; then:
 let bs_delta = Arc::new(ScalarUDF::from(BsDelta::new()));
 let t = DataFusionTransform::new_with_lookups_and_udfs(
-    "SELECT minute, array_agg(named_struct(
-        'strike', strike,
-        'delta',  bs_delta(strike, spot, vol, rate, expiry)
-     )) AS strikes_json
-     FROM source GROUP BY 1",
+    "SELECT bs_delta(strike, spot, vol, rate, expiry) FROM source",
     input_schema,
     Vec::new(),       // lookups
     vec![bs_delta],   // UDFs
 ).await?;
 ```
 
-Two UDFs registering the same name is a config-load error — no
-silent shadowing of your own function.
-
-**Python UDFs** are not yet first-class. Pure-Rust UDFs work today
-(write the math in Rust, register at pipeline-construction time);
-Python `@ematix.udf` wrapping (per-batch via PyArrow round-trip) is
-the next iteration. For now, per-row Python computation has two
-escape hatches: pre-compute as a static `@ematix.lookup` table and
-`LEFT JOIN` it (works when the inputs are stable), or run a
-separate Python post-stage that consumes the framework's output.
+The cached SQL plan binds to them at construction time, so dropping
+the caller-side reference after registration is fine.
 
 ### Tumbling window (39.4)
 
