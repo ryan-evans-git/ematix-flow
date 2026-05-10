@@ -774,6 +774,108 @@ let t = DataFusionTransform::new_with_lookups_and_udfs(
 The cached SQL plan binds to them at construction time, so dropping
 the caller-side reference after registration is fine.
 
+### Custom aggregate UDFs (`@ematix_flow.udaf`)
+
+For per-group reductions DataFusion's stdlib doesn't ship —
+volume-weighted average price, custom percentiles, distinct-by-
+cardinality with custom merge semantics — register a Python
+*class* via `@udaf` and pass it to
+`run_streaming_pipeline(aggregate_udfs=[...])`:
+
+```python
+import pyarrow as pa
+import pyarrow.compute as pc
+
+from ematix_flow import run_streaming_pipeline, udaf
+
+
+@udaf(
+    args=("Float64", "Float64"),
+    state=("Float64", "Float64"),   # running num + den
+    returns="Float64",
+    name="vwap",
+)
+class Vwap:
+    def __init__(self):
+        self.num = 0.0
+        self.den = 0.0
+
+    def update_batch(self, prices, qtys):
+        # Per-batch fold. Both args are PyArrow Float64 Arrays.
+        self.num += pc.sum(pc.multiply(prices, qtys)).as_py() or 0.0
+        self.den += pc.sum(qtys).as_py() or 0.0
+
+    def merge_batch(self, num_states, den_states):
+        # Merge K partial-state accumulators into this one. Each arg
+        # is a PyArrow Array of length K, one per declared `state` field.
+        self.num += pc.sum(num_states).as_py() or 0.0
+        self.den += pc.sum(den_states).as_py() or 0.0
+
+    def evaluate(self):
+        # Length-1 PyArrow Array of the declared `returns` type.
+        if self.den == 0:
+            return pa.array([None], type=pa.float64())
+        return pa.array([self.num / self.den], type=pa.float64())
+
+    def state(self):
+        # One length-1 PyArrow Array per declared `state` field, in
+        # declaration order. Same wire shape `merge_batch` consumes.
+        return (
+            pa.array([self.num], type=pa.float64()),
+            pa.array([self.den], type=pa.float64()),
+        )
+
+
+run_streaming_pipeline(
+    name="vwap-per-minute",
+    source=kafka_quotes, source_query="quotes",
+    target=warehouse, target_table=("marketdata", "vwap_per_minute"),
+    transform_sql="""
+        SELECT
+          date_trunc('minute', ts) AS minute,
+          vwap(price, qty)         AS vwap
+        FROM source
+        GROUP BY 1
+    """,
+    aggregate_udfs=[Vwap],
+)
+```
+
+**The four required methods** map to DataFusion's `Accumulator`
+trait:
+
+- `__init__(self)` — identity state. Called once per group.
+- `update_batch(self, *args)` — fold a batch's rows into state.
+  Receives one PyArrow Array per declared `args` entry. Use
+  `pyarrow.compute` / `numpy` for vectorised math — per-row
+  Python loops will be slow.
+- `merge_batch(self, *states)` — merge K partial-state
+  accumulators into this one (parallel-execution fan-in).
+  Receives one PyArrow Array per declared `state` field.
+- `evaluate(self)` — final result as a length-1 PyArrow Array of
+  the declared `returns` type.
+- `state(self)` — intermediate state for shuffle as a tuple of
+  length-1 PyArrow Arrays, one per declared `state` field.
+
+**Per-batch dispatch.** Same amortisation story as `@udf`: the
+GIL acquisition + PyArrow round-trip happen once per *batch*, so
+vectorise inside the methods. The accumulator instance survives
+across batches within the same group, so per-group state stays
+in Python land.
+
+**Type declarations.** `args` / `state` / `returns` are the same
+DataFusion `DataType` strings as scalar UDFs (`"Int64"`,
+`"Float64"`, `"Utf8"`, `"Boolean"`, etc.). Mismatched call sites
+surface at plan-compile time; mismatched `evaluate()` return
+dtype surfaces at first-emit with a pointer at the offending
+method.
+
+For aggregates whose per-group state genuinely doesn't fit the
+Python round-trip cost — high-cardinality streaming aggregations
+where the GIL contention dominates — the same `AggregateUDFImpl`
+trait is reachable from pure Rust (mirroring the scalar-UDF
+Rust path above).
+
 ### Tumbling window (39.4)
 
 Bucketed aggregations — count events per user per minute, no

@@ -780,6 +780,68 @@ sites surface at plan-compile time as DataFusion type errors. Two
 UDFs registering under the same name is a config-load error — no
 silent shadowing.
 
+### Python aggregate UDFs (`@ematix_flow.udaf`)
+
+For per-group reductions DataFusion's stdlib doesn't ship (VWAP,
+custom percentiles, distinct-by-cardinality), decorate a Python
+*class* with `@udaf` and pass it as `aggregate_udfs=`. The class
+must expose four methods — `update_batch`, `merge_batch`,
+`evaluate`, `state` — mirroring DataFusion's `Accumulator` trait.
+PyArrow zero-copy on the inputs, length-1 PyArrow Arrays on the
+outputs.
+
+```python
+import pyarrow as pa
+import pyarrow.compute as pc
+
+from ematix_flow import run_streaming_pipeline, udaf
+
+
+@udaf(args=("Float64", "Float64"),
+      state=("Float64", "Float64"),
+      returns="Float64", name="vwap")
+class Vwap:
+    def __init__(self):
+        self.num = 0.0
+        self.den = 0.0
+
+    def update_batch(self, prices, qtys):
+        self.num += pc.sum(pc.multiply(prices, qtys)).as_py() or 0.0
+        self.den += pc.sum(qtys).as_py() or 0.0
+
+    def merge_batch(self, num_states, den_states):
+        self.num += pc.sum(num_states).as_py() or 0.0
+        self.den += pc.sum(den_states).as_py() or 0.0
+
+    def evaluate(self):
+        if self.den == 0:
+            return pa.array([None], type=pa.float64())
+        return pa.array([self.num / self.den], type=pa.float64())
+
+    def state(self):
+        return (pa.array([self.num], type=pa.float64()),
+                pa.array([self.den], type=pa.float64()))
+
+
+run_streaming_pipeline(
+    name="vwap-per-minute",
+    source=kafka_quotes, source_query="quotes",
+    target=warehouse, target_table=("marketdata", "vwap_per_minute"),
+    transform_sql="""
+      SELECT date_trunc('minute', ts) AS minute,
+             vwap(price, qty)          AS vwap
+      FROM source GROUP BY 1
+    """,
+    aggregate_udfs=[Vwap],
+)
+```
+
+Per-batch dispatch (one GIL acquisition + PyArrow round-trip per
+batch, accumulator instance survives across batches within a
+group), vectorise with `pyarrow.compute` or `numpy` inside the
+methods. See the user guide for the full state-shape contract +
+the pure-Rust escape hatch when GIL contention dominates.
+
 ### Tumbling / hopping windows
 
 Nine aggregators including HLL+ approximate `count_distinct`.
