@@ -126,3 +126,25 @@ def test_unsupported_datatype_raises_at_decoration():
         @udf(args=("Decimal128",), returns="Float64")
         def bad(x):
             return x
+
+
+def test_run_streaming_pipeline_accepts_udfs_kwarg():
+    """Π.5 wiring: run_streaming_pipeline must accept ``udfs=[...]``.
+
+    Surface-only signature check. Running an actual streaming
+    pipeline from pytest is awkward — the runner blocks until
+    SIGTERM/SIGINT — so the end-to-end threading is verified by
+    the Rust-side ``streaming_config_threads_udfs_into_lazy_sql_transform``
+    test in ``crates/ematix-flow-cli``.
+    """
+    import inspect
+
+    from ematix_flow import run_streaming_pipeline
+
+    sig = inspect.signature(run_streaming_pipeline)
+    assert "udfs" in sig.parameters, (
+        "run_streaming_pipeline must expose a `udfs=` kwarg so users can "
+        "register @ematix.udf-decorated functions on the SQL pre-stage"
+    )
+    # Default `None` keeps every existing caller working unchanged.
+    assert sig.parameters["udfs"].default is None

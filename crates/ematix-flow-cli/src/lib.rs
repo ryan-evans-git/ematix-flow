@@ -58,7 +58,7 @@ use ematix_flow_core::streaming::{
     ShutdownSignal, StreamingPipeline, StreamingPipelineConfig, StreamingPipelineMetrics,
     StreamingPipelineMetricsCounters, install_shutdown_handler,
 };
-use ematix_flow_core::transform::{BatchTransform, LazySqlTransform, LookupTable};
+use ematix_flow_core::transform::{BatchTransform, LazySqlTransform, LookupTable, ScalarUDF};
 use ematix_flow_core::windowed::{
     AggKind, AggregationSpec, CountDistinctMode, LateDataPolicy, WindowConfig, WindowKind,
     WindowedAggregateTransform, WindowedMetrics,
@@ -2863,7 +2863,7 @@ impl PipelineCliConfig {
         target: TargetTable,
         lookups: Vec<LookupTable>,
     ) -> StreamingPipelineConfig {
-        self.streaming_config_with_lookups_and_metrics(target, lookups, None)
+        self.streaming_config_with_lookups_udfs_and_metrics(target, lookups, Vec::new(), None)
     }
 
     /// Phase 39.4 PR 2b: like [`Self::streaming_config_with_lookups`]
@@ -2877,6 +2877,32 @@ impl PipelineCliConfig {
         &self,
         target: TargetTable,
         lookups: Vec<LookupTable>,
+        metrics_registry: Option<&prometheus::Registry>,
+    ) -> StreamingPipelineConfig {
+        self.streaming_config_with_lookups_udfs_and_metrics(
+            target,
+            lookups,
+            Vec::new(),
+            metrics_registry,
+        )
+    }
+
+    /// Π.5: same as [`Self::streaming_config_with_lookups_and_metrics`]
+    /// but also threads a list of custom scalar UDFs through to the
+    /// inner [`LazySqlTransform`]. This is the entry point the Python
+    /// `run_streaming_pipeline(udfs=...)` kwarg lands on after the
+    /// PyO3 boundary unwraps each [`PythonScalarUdfHandle`] into a
+    /// [`ScalarUDF`].
+    ///
+    /// UDFs are only consulted by the SQL pre-stage (`[transform]
+    /// sql = "..."`). Pure-CDC, pure-window-no-SQL, and pure-join
+    /// pipelines ignore them — those code paths don't run a
+    /// `LazySqlTransform`.
+    pub fn streaming_config_with_lookups_udfs_and_metrics(
+        &self,
+        target: TargetTable,
+        lookups: Vec<LookupTable>,
+        udfs: Vec<Arc<ScalarUDF>>,
         metrics_registry: Option<&prometheus::Registry>,
     ) -> StreamingPipelineConfig {
         let mut cfg = StreamingPipelineConfig::new(
@@ -2954,10 +2980,13 @@ impl PipelineCliConfig {
                         // None here, populated below.
                         None
                     }
-                    (Some(sql), false) => Some(Arc::new(LazySqlTransform::new_with_lookups(
-                        sql.clone(),
-                        lookups.clone(),
-                    ))),
+                    (Some(sql), false) => {
+                        Some(Arc::new(LazySqlTransform::new_with_lookups_and_udfs(
+                            sql.clone(),
+                            lookups.clone(),
+                            udfs.clone(),
+                        )))
+                    }
                 };
             let inner_distributed: Option<Arc<dyn BatchTransform>> =
                 match (translated_sql, engine_is_distributed) {
@@ -3325,6 +3354,15 @@ pub struct ConsumeOptions {
     /// the pair and keep the trigger end alive for the duration
     /// of the run.
     pub shutdown_signal: Option<ShutdownSignal>,
+    /// Π.5: custom scalar UDFs registered on the pipeline's SQL
+    /// pre-stage. Threaded into the inner
+    /// [`LazySqlTransform`] via
+    /// [`PipelineCliConfig::streaming_config_with_lookups_udfs_and_metrics`].
+    /// The Python facade (`run_streaming_pipeline(udfs=...)`)
+    /// supplies these from `@ematix.udf` handles after the PyO3
+    /// boundary unwraps them; pure-Rust callers can construct
+    /// them directly with `Arc::new(ScalarUDF::from(my_impl))`.
+    pub udfs: Vec<Arc<ScalarUDF>>,
 }
 
 /// Run a single pipeline to completion (until shutdown). Used by
@@ -3369,9 +3407,10 @@ pub async fn run_consume_with(
     // then hand the same counters into `new_multi_source_with_metrics`
     // so we don't double-construct.
     let pipeline_metrics = StreamingPipelineMetricsCounters::new(&config.pipeline_name);
-    let mut pipeline_cfg = config.streaming_config_with_lookups_and_metrics(
+    let mut pipeline_cfg = config.streaming_config_with_lookups_udfs_and_metrics(
         primary_table,
         lookups,
+        options.udfs.clone(),
         Some(&pipeline_metrics.registry),
     );
     // Phase 39.5a PR 3: instantiate the StateStore (if configured)
@@ -3825,6 +3864,126 @@ mod tests {
         };
         let scfg = cfg.streaming_config_with_lookups(table, Vec::new());
         assert!(scfg.transform.is_some());
+    }
+
+    /// Π.5: UDFs registered on the streaming pipeline must thread
+    /// through `streaming_config_with_lookups_udfs_and_metrics` into
+    /// the inner `LazySqlTransform`, so user-supplied SQL inside
+    /// `transform_sql` can call them. Builds a minimal Kafka→SQLite
+    /// pipeline with `transform.sql = "SELECT add_one(x) FROM source"`,
+    /// passes a single Rust UDF, then invokes the resulting
+    /// `BatchTransform` against an in-memory batch.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn streaming_config_threads_udfs_into_lazy_sql_transform() {
+        use std::any::Any;
+
+        use arrow_array::{ArrayRef, Int32Array};
+        use arrow_schema::{DataType, Field, Schema};
+        use datafusion::common::Result as DfResult;
+        use datafusion::logical_expr::{
+            ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Volatility,
+        };
+        use ematix_flow_core::transform::BatchContext;
+
+        // Trivial Int32 → Int32 UDF: `add_one(x) = x + 1`. The point
+        // is to prove threading, not the math.
+        #[derive(Debug)]
+        struct AddOne {
+            signature: Signature,
+        }
+        impl AddOne {
+            fn new() -> Self {
+                Self {
+                    signature: Signature::exact(vec![DataType::Int32], Volatility::Immutable),
+                }
+            }
+        }
+        impl PartialEq for AddOne {
+            fn eq(&self, _other: &Self) -> bool {
+                true
+            }
+        }
+        impl Eq for AddOne {}
+        impl std::hash::Hash for AddOne {
+            fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+                "add_one".hash(state);
+            }
+        }
+        impl ScalarUDFImpl for AddOne {
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+            fn name(&self) -> &str {
+                "add_one"
+            }
+            fn signature(&self) -> &Signature {
+                &self.signature
+            }
+            fn return_type(&self, _: &[DataType]) -> DfResult<DataType> {
+                Ok(DataType::Int32)
+            }
+            fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DfResult<ColumnarValue> {
+                let arr = args.args[0]
+                    .clone()
+                    .into_array(args.number_rows)
+                    .expect("into_array");
+                let int = arr
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .expect("Int32 input");
+                let out: Int32Array = int.iter().map(|v| v.map(|x| x + 1)).collect();
+                Ok(ColumnarValue::Array(Arc::new(out)))
+            }
+        }
+
+        let toml = r#"
+            pipeline_name = "p"
+            source_query = "events"
+
+            [source]
+            kind = "kafka"
+            bootstrap_servers = "localhost:9092"
+
+            [target]
+            kind = "sqlite"
+            path = ":memory:"
+
+            [target.table]
+            name = "out"
+
+            [transform]
+            sql = "SELECT add_one(x) AS y FROM source"
+        "#;
+        let cfg = PipelineCliConfig::from_toml_str(toml).unwrap();
+        let table = TargetTable {
+            schema: "".into(),
+            name: "out".into(),
+        };
+        let udf: Arc<ScalarUDF> = Arc::new(ScalarUDF::from(AddOne::new()));
+        let scfg =
+            cfg.streaming_config_with_lookups_udfs_and_metrics(table, Vec::new(), vec![udf], None);
+        let xform = scfg
+            .transform
+            .as_ref()
+            .expect("SQL pre-stage transform attached");
+
+        // Run a single batch through the transform — the UDF must
+        // resolve at first-batch compile time.
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, true)]));
+        let arr: ArrayRef = Arc::new(Int32Array::from(vec![1, 2, 3]));
+        let batch = arrow_array::RecordBatch::try_new(schema, vec![arr]).unwrap();
+        let out = xform
+            .transform(batch, &BatchContext::default())
+            .await
+            .expect("transform with UDF");
+        assert_eq!(out.len(), 1);
+        let y = out[0]
+            .column_by_name("y")
+            .expect("output has y")
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("y is Int32");
+        assert_eq!(y.values(), &[2, 3, 4]);
     }
 
     #[tokio::test(flavor = "multi_thread")]

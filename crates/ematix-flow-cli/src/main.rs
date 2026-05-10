@@ -117,6 +117,10 @@ async fn run_consume_cmd(
         // Binary path: install_shutdown_handler manages SIGTERM /
         // SIGINT internally.
         shutdown_signal: None,
+        // No UDFs from the CLI binary path — only the Python
+        // facade (`run_streaming_pipeline(udfs=...)`) registers
+        // UDFs today. TOML can't carry callables.
+        udfs: Vec::new(),
     };
     if policy.enabled {
         // Single SIGTERM/SIGINT signal shared by the supervisor

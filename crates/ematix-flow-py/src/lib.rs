@@ -724,15 +724,23 @@ fn cross_backend_arrow_sync(
 /// HTTP endpoint on `127.0.0.1:<port>` for the pipeline's
 /// lifetime. Same shape as the `--metrics-port` flag on the
 /// `flow consume` CLI.
+///
+/// Π.5: `udfs` accepts a Python list of `PythonScalarUdfHandle`
+/// objects (built via the `@ematix.udf` decorator). Each handle
+/// is unwrapped into the underlying `Arc<ScalarUDF>` and
+/// registered on the pipeline's SQL pre-stage `SessionContext`,
+/// callable from `transform_sql`.
 #[pyfunction]
-#[pyo3(signature = (toml_str, metrics_port=None))]
+#[pyo3(signature = (toml_str, metrics_port=None, udfs=None))]
 fn run_pipeline_from_toml_str<'py>(
     py: Python<'py>,
     toml_str: &str,
     metrics_port: Option<u16>,
+    udfs: Option<Vec<Py<udf::PyUdfHandle>>>,
 ) -> PyResult<Bound<'py, PyDict>> {
     let cfg = ematix_flow_cli::PipelineCliConfig::from_toml_str(toml_str)
         .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    let udf_arcs = unwrap_udf_handles(py, udfs);
     let options = ematix_flow_cli::ConsumeOptions {
         metrics_port,
         // Python path: install_shutdown_handler manages SIGTERM /
@@ -741,6 +749,7 @@ fn run_pipeline_from_toml_str<'py>(
         // tokio's; on Ctrl-C the pipeline drains + this fn
         // returns cleanly with shutdown_triggered=true.
         shutdown_signal: None,
+        udfs: udf_arcs,
     };
     let metrics = py
         .detach(|| {
@@ -758,17 +767,20 @@ fn run_pipeline_from_toml_str<'py>(
 /// path. Convenience wrapper around `run_pipeline_from_toml_str`
 /// that reads the file. Same return shape + error semantics.
 #[pyfunction]
-#[pyo3(signature = (path, metrics_port=None))]
+#[pyo3(signature = (path, metrics_port=None, udfs=None))]
 fn run_pipeline_from_path<'py>(
     py: Python<'py>,
     path: &str,
     metrics_port: Option<u16>,
+    udfs: Option<Vec<Py<udf::PyUdfHandle>>>,
 ) -> PyResult<Bound<'py, PyDict>> {
     let cfg = ematix_flow_cli::PipelineCliConfig::from_path(path)
         .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    let udf_arcs = unwrap_udf_handles(py, udfs);
     let options = ematix_flow_cli::ConsumeOptions {
         metrics_port,
         shutdown_signal: None,
+        udfs: udf_arcs,
     };
     let metrics = py
         .detach(|| {
@@ -780,6 +792,22 @@ fn run_pipeline_from_path<'py>(
     dict.set_item("iterations", metrics.iterations)?;
     dict.set_item("shutdown_triggered", metrics.shutdown_triggered)?;
     Ok(dict)
+}
+
+/// Π.5: pull `Arc<ScalarUDF>` out of each Python-owned
+/// `PythonScalarUdfHandle`. Returns an empty Vec when `udfs` is
+/// `None` so callers don't need to special-case the "no UDFs"
+/// path. Borrows each handle for the duration of the unwrap (no
+/// clone of the underlying Python callable — the `Arc<ScalarUDF>`
+/// already owns a `Py<PyAny>` reference).
+fn unwrap_udf_handles(
+    py: Python<'_>,
+    udfs: Option<Vec<Py<udf::PyUdfHandle>>>,
+) -> Vec<std::sync::Arc<ematix_flow_core::transform::ScalarUDF>> {
+    udfs.unwrap_or_default()
+        .into_iter()
+        .map(|handle| std::sync::Arc::clone(&handle.borrow(py).udf))
+        .collect()
 }
 
 #[pyfunction]
