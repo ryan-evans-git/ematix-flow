@@ -69,23 +69,33 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
+      - uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
+          cache-dependency-glob: "pyproject.toml"
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       # `maturin develop` requires an active virtualenv (it refuses
-      # to install into the system Python). Create one + persist its
-      # bin/ on PATH and VIRTUAL_ENV across subsequent steps via
-      # $GITHUB_PATH / $GITHUB_ENV so every later `python` /
-      # `pip` / `maturin` / `pytest` invocation resolves through it.
+      # to install into the system Python). `uv venv` creates one
+      # ~10× faster than `python -m venv`; persist its bin/ on PATH
+      # and VIRTUAL_ENV across subsequent steps via $GITHUB_PATH /
+      # $GITHUB_ENV so every later `python` / `uv` / `maturin` /
+      # `pytest` invocation resolves through it.
       - name: Set up venv
         shell: bash
         run: |
-          python -m venv .venv
+          uv venv .venv --python ${{ matrix.python }}
           echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
           echo "VIRTUAL_ENV=$PWD/.venv" >> "$GITHUB_ENV"
       - name: Install dev deps
+        # uv is dramatically faster than pip on heavy scientific
+        # wheels (numpy, pyarrow, pandas) — it parallelises
+        # downloads and uses a local content-addressed cache. The
+        # `setup-uv` action's cache key is keyed on `pyproject.toml`
+        # so cross-job reruns hit the warm cache.
         run: |
-          python -m pip install --upgrade pip
-          pip install 'maturin>=1.7' pytest 'pytest-asyncio>=0.23' ruff bandit pip-audit pip-licenses
+          uv pip install 'maturin>=1.7' pytest 'pytest-asyncio>=0.23' \
+            ruff bandit pip-audit pip-licenses numpy 'pyarrow>=15'
       - name: Build extension
         run: maturin develop --release
       - name: Lint

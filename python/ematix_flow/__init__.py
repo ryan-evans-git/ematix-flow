@@ -39,6 +39,11 @@ from ematix_flow.streaming import (
     run_pipeline,
     run_streaming_pipeline,
 )
+from ematix_flow.udf import (
+    PythonScalarUdfHandle,
+    apply_udf_to_batch,
+    udf,
+)
 
 # Read the installed-package version dynamically so a release bump
 # only needs to touch Cargo.toml + pyproject.toml — not this file.
@@ -74,6 +79,7 @@ __all__ = [
     "ObjectStoreS3Connection",
     "PostgresConnection",
     "PubSubConnection",
+    "PythonScalarUdfHandle",
     "RabbitMQConnection",
     "SQLiteConnection",
     "SchemaRegistryConnection",
@@ -84,6 +90,7 @@ __all__ = [
     "Window",
     "__version__",
     "_core",
+    "apply_udf_to_batch",
     "config",
     "connect",
     "connections",
@@ -97,4 +104,5 @@ __all__ = [
     "run_pipeline",
     "run_streaming_pipeline",
     "streaming",
+    "udf",
 ]
