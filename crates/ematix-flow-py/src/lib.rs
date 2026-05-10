@@ -750,6 +750,12 @@ fn run_pipeline_from_toml_str<'py>(
         // returns cleanly with shutdown_triggered=true.
         shutdown_signal: None,
         udfs: udf_arcs,
+        // Aggregate UDFs follow in the next iteration once the
+        // PyO3 `@udaf` wrapper lands; until then the streaming
+        // wiring exists at the Rust layer (CLI test
+        // `streaming_config_threads_aggregate_udfs_into_lazy_sql_transform`)
+        // but the Python facade doesn't surface them yet.
+        aggregate_udfs: Vec::new(),
     };
     let metrics = py
         .detach(|| {
@@ -781,6 +787,7 @@ fn run_pipeline_from_path<'py>(
         metrics_port,
         shutdown_signal: None,
         udfs: udf_arcs,
+        aggregate_udfs: Vec::new(),
     };
     let metrics = py
         .detach(|| {

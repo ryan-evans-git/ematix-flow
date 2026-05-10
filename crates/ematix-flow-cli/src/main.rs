@@ -119,8 +119,10 @@ async fn run_consume_cmd(
         shutdown_signal: None,
         // No UDFs from the CLI binary path — only the Python
         // facade (`run_streaming_pipeline(udfs=...)`) registers
-        // UDFs today. TOML can't carry callables.
+        // UDFs today. TOML can't carry callables. Aggregate UDFs
+        // share the same Python-only constraint.
         udfs: Vec::new(),
+        aggregate_udfs: Vec::new(),
     };
     if policy.enabled {
         // Single SIGTERM/SIGINT signal shared by the supervisor
