@@ -42,6 +42,10 @@ jobs:
       - uses: astral-sh/setup-uv@v4
         with:
           enable-cache: true
+          # No uv.lock in this repo (we don't lock Python deps) —
+          # override the default `**/uv.lock` glob, which fails the
+          # action when no match is found.
+          cache-dependency-glob: ".github/workflows/docs.yml"
 
       - name: Install mkdocs
         run: |
