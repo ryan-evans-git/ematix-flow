@@ -50,6 +50,7 @@ order you'd reach for each feature.
 
 ---
 
+<a id="install"></a>
 ## Install
 
 ```sh
@@ -73,6 +74,7 @@ API work without any extras. To build from source, see
 
 ---
 
+<a id="connections"></a>
 ## Connections
 
 Connections are the first thing to set up. Every pipeline
@@ -181,6 +183,7 @@ class kafka_avro:
 
 ---
 
+<a id="backends"></a>
 ## Backends
 
 Every source and target lives behind one `Backend` trait. Switch a
@@ -236,6 +239,7 @@ change.
 
 ---
 
+<a id="pipelines"></a>
 ## Pipelines
 
 A pipeline binds a source query to a target table and a load
@@ -373,6 +377,7 @@ target don't block the others (configurable via
 
 ---
 
+<a id="modes"></a>
 ## Modes
 
 The load strategy. Set on `@ematix.pipeline(mode=...)`.
@@ -492,6 +497,7 @@ def ingest(conn): ...
 
 ---
 
+<a id="scheduling"></a>
 ## Scheduling
 
 Three ways to fire a pipeline.
@@ -539,6 +545,7 @@ Inspect via SQL or `flow runs list`.
 
 ---
 
+<a id="streaming-pipelines"></a>
 ## Streaming pipelines
 
 A long-running consumer that drains a source and writes batches
@@ -652,6 +659,7 @@ the others (configurable).
 
 ---
 
+<a id="stream-processing"></a>
 ## Stream processing
 
 Stateful transforms layered onto a streaming pipeline.
@@ -984,6 +992,7 @@ without rewrites.
 
 ---
 
+<a id="configuration-reference"></a>
 ## Configuration reference
 
 Selected knobs that don't fit any single section above. Every
@@ -1071,6 +1080,7 @@ flow connections set warehouse url=postgres://...
 
 ---
 
+<a id="cli"></a>
 ## CLI
 
 ```
@@ -1094,6 +1104,7 @@ enables the supervised-restart loop.
 
 ---
 
+<a id="python-api"></a>
 ## Python API
 
 For when you want to bypass the pipeline orchestration and use a
@@ -1128,6 +1139,7 @@ the [Install](#install) extras and the
 
 ---
 
+<a id="performance-and-comparisons"></a>
 ## Performance and comparisons
 
 ematix-flow uses DataFusion for in-process SQL and Apache Arrow
@@ -1161,6 +1173,7 @@ Full methodology, hardware, and per-query numbers:
 
 ---
 
+<a id="whats-shipped"></a>
 ## What's shipped
 
 All four surfaces are stable. See
@@ -1199,6 +1212,7 @@ RustSec; ruff + bandit + pip-audit green on the Python side.
 
 ---
 
+<a id="development"></a>
 ## Development
 
 ```sh
@@ -1228,6 +1242,7 @@ pytest -m spark                           # opt-in Spark E2E
 
 ---
 
+<a id="license"></a>
 ## License
 
 Apache-2.0
