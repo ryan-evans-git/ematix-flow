@@ -34,8 +34,8 @@ use std::any::Any;
 use std::sync::Arc;
 
 use datafusion::arrow::array::{
-    Array, ArrayRef, Date32Array, Float64Array, Float64Builder, Int64Builder,
-    RecordBatch, StringBuilder, StringViewArray,
+    Array, ArrayRef, Date32Array, Float64Array, Float64Builder, Int64Builder, RecordBatch,
+    StringBuilder, StringViewArray,
 };
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::common::{DataFusionError, Result as DfResult};
@@ -44,8 +44,7 @@ use datafusion::physical_expr::{EquivalenceProperties, Partitioning};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties,
-    SendableRecordBatchStream,
+    DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
 };
 use futures_util::stream::{self, TryStreamExt};
 
@@ -98,10 +97,7 @@ impl FusedFilterMultiAggExec {
     /// Build a Q1-shaped fused exec over `input`. Validates the child
     /// schema has the seven required columns by name with the expected
     /// types. Output schema is the canonical Q1 SELECT list (9 cols).
-    pub fn try_new_q1(
-        input: Arc<dyn ExecutionPlan>,
-        predicate: Q1Predicate,
-    ) -> DfResult<Self> {
+    pub fn try_new_q1(input: Arc<dyn ExecutionPlan>, predicate: Q1Predicate) -> DfResult<Self> {
         Self::validate_input_schema(&input.schema())?;
         let schema = Arc::new(Schema::new(vec![
             Field::new("l_returnflag", DataType::Utf8, false),
@@ -158,11 +154,7 @@ impl FusedFilterMultiAggExec {
 }
 
 impl DisplayAs for FusedFilterMultiAggExec {
-    fn fmt_as(
-        &self,
-        _t: DisplayFormatType,
-        f: &mut std::fmt::Formatter,
-    ) -> std::fmt::Result {
+    fn fmt_as(&self, _t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(
             f,
             "FusedFilterMultiAggExec(q1: shipdate<={})",
@@ -193,9 +185,7 @@ impl ExecutionPlan for FusedFilterMultiAggExec {
         mut children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
         let new_input = children.pop().ok_or_else(|| {
-            DataFusionError::Internal(
-                "FusedFilterMultiAggExec requires exactly 1 child".into(),
-            )
+            DataFusionError::Internal("FusedFilterMultiAggExec requires exactly 1 child".into())
         })?;
         Ok(Arc::new(Self::try_new_q1(new_input, self.predicate)?))
     }
@@ -318,11 +308,7 @@ fn run_fused_q1_parallel(
     })
 }
 
-fn run_fused_q1_shard(
-    batches: &[RecordBatch],
-    p: Q1Predicate,
-    idx: ColumnIndices,
-) -> [Q1Aggs; 5] {
+fn run_fused_q1_shard(batches: &[RecordBatch], p: Q1Predicate, idx: ColumnIndices) -> [Q1Aggs; 5] {
     let mut groups = [Q1Aggs::default(); 5];
     for batch in batches {
         let rflag = batch
@@ -406,10 +392,7 @@ const Q1_OUTPUT_ORDER: [(usize, &str, &str); 4] = [
     (0, "R", "F"),
 ];
 
-fn q1_groups_to_record_batch(
-    schema: SchemaRef,
-    groups: &[Q1Aggs; 5],
-) -> DfResult<RecordBatch> {
+fn q1_groups_to_record_batch(schema: SchemaRef, groups: &[Q1Aggs; 5]) -> DfResult<RecordBatch> {
     let mut rflag_b = StringBuilder::with_capacity(4, 4);
     let mut lstatus_b = StringBuilder::with_capacity(4, 4);
     let mut sum_qty_b = Float64Builder::with_capacity(4);
@@ -460,9 +443,7 @@ fn q1_groups_to_record_batch(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use datafusion::arrow::array::{
-        Date32Builder, Float64Builder, StringViewBuilder,
-    };
+    use datafusion::arrow::array::{Date32Builder, Float64Builder, StringViewBuilder};
     use datafusion::datasource::MemTable;
     use datafusion::prelude::SessionContext;
 
@@ -534,8 +515,13 @@ mod tests {
         let batch = make_test_batch(cutoff);
         let input = input_plan_from_batch(batch).await;
         let exec = Arc::new(
-            FusedFilterMultiAggExec::try_new_q1(input, Q1Predicate { shipdate_cutoff: cutoff })
-                .unwrap(),
+            FusedFilterMultiAggExec::try_new_q1(
+                input,
+                Q1Predicate {
+                    shipdate_cutoff: cutoff,
+                },
+            )
+            .unwrap(),
         );
 
         let session = SessionContext::new();
@@ -578,7 +564,11 @@ mod tests {
 
         assert_eq!(rflag.value(1), "N");
         assert_eq!(lstatus.value(1), "F");
-        assert!((sum_qty.value(1) - 30.0).abs() < 1e-9, "got {}", sum_qty.value(1));
+        assert!(
+            (sum_qty.value(1) - 30.0).abs() < 1e-9,
+            "got {}",
+            sum_qty.value(1)
+        );
         assert_eq!(count.value(1), 3);
 
         assert_eq!(rflag.value(2), "N");
@@ -611,10 +601,7 @@ mod tests {
             Field::new("l_shipdate", DataType::Date32, false),
         ]));
         let input = input_plan_with_schema(schema).await;
-        let res = FusedFilterMultiAggExec::try_new_q1(
-            input,
-            Q1Predicate { shipdate_cutoff: 0 },
-        );
+        let res = FusedFilterMultiAggExec::try_new_q1(input, Q1Predicate { shipdate_cutoff: 0 });
         let err = res.expect_err("missing l_tax should fail validation");
         let msg = format!("{err}");
         assert!(
@@ -636,10 +623,7 @@ mod tests {
             Field::new("l_shipdate", DataType::Date32, false),
         ]));
         let input = input_plan_with_schema(schema).await;
-        let res = FusedFilterMultiAggExec::try_new_q1(
-            input,
-            Q1Predicate { shipdate_cutoff: 0 },
-        );
+        let res = FusedFilterMultiAggExec::try_new_q1(input, Q1Predicate { shipdate_cutoff: 0 });
         let err = res.expect_err("Int64 returnflag should fail validation");
         let msg = format!("{err}");
         assert!(

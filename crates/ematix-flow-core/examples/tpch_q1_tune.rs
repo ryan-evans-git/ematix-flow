@@ -74,9 +74,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
-use datafusion::arrow::array::{
-    Array, Date32Array, Float64Array, RecordBatch, StringViewArray,
-};
+use datafusion::arrow::array::{Array, Date32Array, Float64Array, RecordBatch, StringViewArray};
 use datafusion::datasource::MemTable;
 use datafusion::prelude::{SessionConfig, SessionContext};
 use futures_util::TryStreamExt;
@@ -235,19 +233,44 @@ fn run_fused_q1_hardcoded_parallel(
 /// hardcoded 4-arm match: if HashMap parallel is competitive, the
 /// phase-3 generalization can keep the simple HashMap approach; if it
 /// loses meaningfully, the planner needs a per-shape perfect-hash path.
-fn run_fused_q1_hashmap(
-    batches: &[RecordBatch],
-    cutoff: i32,
-) -> HashMap<(u8, u8), Q1Aggs> {
+fn run_fused_q1_hashmap(batches: &[RecordBatch], cutoff: i32) -> HashMap<(u8, u8), Q1Aggs> {
     let mut groups: HashMap<(u8, u8), Q1Aggs> = HashMap::with_capacity(8);
     for batch in batches {
-        let rflag = batch.column(0).as_any().downcast_ref::<StringViewArray>().unwrap();
-        let lstatus = batch.column(1).as_any().downcast_ref::<StringViewArray>().unwrap();
-        let qty = batch.column(2).as_any().downcast_ref::<Float64Array>().unwrap();
-        let price = batch.column(3).as_any().downcast_ref::<Float64Array>().unwrap();
-        let disc = batch.column(4).as_any().downcast_ref::<Float64Array>().unwrap();
-        let tax = batch.column(5).as_any().downcast_ref::<Float64Array>().unwrap();
-        let ship = batch.column(6).as_any().downcast_ref::<Date32Array>().unwrap();
+        let rflag = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringViewArray>()
+            .unwrap();
+        let lstatus = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringViewArray>()
+            .unwrap();
+        let qty = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        let price = batch
+            .column(3)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        let disc = batch
+            .column(4)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        let tax = batch
+            .column(5)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        let ship = batch
+            .column(6)
+            .as_any()
+            .downcast_ref::<Date32Array>()
+            .unwrap();
         let qty_v = qty.values();
         let price_v = price.values();
         let disc_v = disc.values();
@@ -335,9 +358,7 @@ async fn make_ctx(cfg: SessionConfig, parquet: &str) -> SessionContext {
 /// Pre-decode lineitem into a MemTable projecting only the seven Q1
 /// columns. Returns both the context (for `bench_q1_default`) and the
 /// raw batch list (for the hand-written paths).
-async fn make_memtable_ctx(
-    parquet: &str,
-) -> (SessionContext, Vec<RecordBatch>) {
+async fn make_memtable_ctx(parquet: &str) -> (SessionContext, Vec<RecordBatch>) {
     let staging = SessionContext::new();
     staging
         .register_parquet("lineitem_pq", parquet, Default::default())
@@ -352,8 +373,13 @@ async fn make_memtable_ctx(
         .await
         .unwrap();
     let schema = Arc::new(df.schema().as_arrow().clone());
-    let batches: Vec<RecordBatch> =
-        df.execute_stream().await.unwrap().try_collect().await.unwrap();
+    let batches: Vec<RecordBatch> = df
+        .execute_stream()
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
     let total: usize = batches.iter().map(|b| b.num_rows()).sum();
     println!(
         "  (memtable preload: {} batches, {total} rows decoded once)",
@@ -367,7 +393,13 @@ async fn make_memtable_ctx(
 
 fn print_groups(label: &str, groups: &[Q1Aggs; 5]) {
     println!("  {label}");
-    for (g, name) in [(0, "(R,F)"), (1, "(N,F)"), (2, "(N,O)"), (3, "(A,F)"), (4, "(other)")] {
+    for (g, name) in [
+        (0, "(R,F)"),
+        (1, "(N,F)"),
+        (2, "(N,O)"),
+        (3, "(A,F)"),
+        (4, "(other)"),
+    ] {
         let a = &groups[g];
         if a.count == 0 {
             continue;
@@ -394,7 +426,9 @@ async fn main() {
     let parquet = parquet.to_str().unwrap();
     println!("==> Σ.D2: Q1 multi-aggregate fused-kernel prototype");
     println!("==> data: {parquet}");
-    println!("==> reference: DataFusion ~48.7 ms parquet (May 5) · Polars 40.9 / 35.2 ms parquet / MemTable");
+    println!(
+        "==> reference: DataFusion ~48.7 ms parquet (May 5) · Polars 40.9 / 35.2 ms parquet / MemTable"
+    );
     println!();
 
     println!("--- Section 1: DataFusion Q1, default config (parquet source) ---");
@@ -481,7 +515,9 @@ async fn main() {
     let fused: Arc<dyn ExecutionPlan> = Arc::new(
         FusedFilterMultiAggExec::try_new_q1(
             child,
-            Q1Predicate { shipdate_cutoff: cutoff },
+            Q1Predicate {
+                shipdate_cutoff: cutoff,
+            },
         )
         .unwrap(),
     );
