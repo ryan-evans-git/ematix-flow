@@ -633,8 +633,12 @@ recovering it.
 - **Do not** globally enable `pushdown_filters` — it hurts simple-
   aggregate queries like Q6.
 - ~~Polars's 1.82× edge on Q6 is hand-tuned vectorized inner
-  loops~~ — **inverted by the deep-dive below**. The gap is
-  parquet decode, not aggregate compute.
+  loops~~ — **the original deep-dive below inverted this, but the
+  inversion was itself wrong**: it compared Polars's *parquet*
+  number against DataFusion's *MemTable* number. The 2026-05-11
+  apples-to-apples re-run below puts Polars at 1.9 ms vs
+  DataFusion 5.96 ms on MemTable — Polars wins by 3.13×. The
+  edge IS the fused filter-+-sum inner loop, not parquet decode.
 
 #### Q6 deep dive: where does the 1.82× actually go? (2026-05-05)
 
@@ -721,6 +725,57 @@ operator timings on their hardware.
 This makes the case for ematix-flow's positioning: same-class single-
 node performance to Polars on hot loops, broader SQL surface,
 distributed scaling path via Σ.B (Polars has no distributed story).
+
+### Σ.A1 PR 4 follow-up redux: vs Polars apples-to-apples (2026-05-11)
+
+The 2026-05-05 Polars audit (above) had a methodology bug: it
+compared Polars's `scan_parquet().collect()` numbers against
+DataFusion's MemTable numbers. The 2026-05-11 re-run pins both
+engines to the same source shape per row, also adds the previously-
+missing memtable comparison, and unblocks the queries Polars's SQL
+parser rejects (Q1 `INTERVAL '90' DAY`; Q3 / Q19 implicit
+`FROM a, b, c` cross-joins) via side-by-side `.polars.sql`
+variants under `examples/tpch/queries/`. The variants are
+semantically identical to the canonical TPC-H text — the audit
+trail is in the file headers.
+
+Polars 1.40.1, 5-trial median after 1 warm-up:
+
+| Query | DataFusion parquet | Polars parquet | DataFusion MemTable | Polars MemTable |
+|---|---|---|---|---|
+| Q1  | 48.7  | **40.9** | n/a   | **35.2** |
+| Q3  | **34.6**  | 52.2 | n/a   | 35.6 (≈ parity) |
+| Q6  | 17.56 | **10.7** | 5.96  | **1.9** |
+| Q19 | **38.0**  | 387.1 | n/a   | 352.4 |
+
+(DataFusion Q1/Q3/Q19 parquet numbers are the May 5 baseline —
+deltas across re-runs on Q6 were within ±5% on idle host.)
+
+**Findings, corrected:**
+
+- **Q1 now passes.** A `.polars.sql` variant with the interval
+  resolved to a `DATE` literal runs in 40.9 ms parquet / 35.2 ms
+  MemTable. Polars wins Q1 by ~20%; close.
+- **Q3 / Q19 also need `.polars.sql` variants** (explicit JOINs).
+  Both still fall to DataFusion once they parse — Q3 by 1.51×,
+  Q19 by 10.2×.
+- **Q6 is genuinely Polars's win, and the May 5 deep-dive's
+  parquet-vs-MemTable comparison was apples to oranges.** Same
+  source on both sides, Polars hits 1.9 ms vs DataFusion 5.96 ms
+  — Polars 3.13×. The DataFusion EXPLAIN ANALYZE puts the
+  `AggregateExec` at 96 µs total but the `FilterExec` at 35.86 ms
+  of compute (across 14 parallel partitions). Polars apparently
+  fuses the filter + sum into one pass over the scan.
+
+**Where the engine gap is, concretely:** Q6 is `SUM(a * b) WHERE
+predicate(c, d, e)`. DataFusion materializes the filter mask in
+`FilterExec`, then `AggregateExec` walks the surviving rows.
+Polars (looks like) folds the predicate into the same Arrow
+kernel that does the multiply-+-sum, never materializing a
+selection vector. A DataFusion `FusedFilterSumExec` physical
+operator that does the same thing for the simple-filter-+-single-
+aggregate shape would close this gap. Scope is upstream-DataFusion
+work; tracked as a future spike.
 
 ### JDK note
 

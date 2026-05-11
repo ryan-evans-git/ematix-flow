@@ -50,6 +50,7 @@ order you'd reach for each feature.
 
 ---
 
+<a id="install"></a>
 ## Install
 
 ```sh
@@ -64,7 +65,7 @@ the `run_pipeline` / `run_streaming_pipeline` Python entrypoints.
 | Extra | What it adds | Install |
 |---|---|---|
 | `df` | DataFrame interop helpers (polars / pandas) for `to_polars()` / `to_pandas()` materialization. | `pip install "ematix-flow[df]"` then `pip install polars` (or `pandas`). |
-| `spark` | PySpark interop helpers (`to_pyspark()` / `from_pyspark()`). Pulls in PySpark + JVM JDBC. Heavy. | `pip install "ematix-flow[spark]"` |
+| `spark` | PySpark interop helpers (`to_pyspark()` / `from_pyspark()`). Heavy — pulls in PySpark + its JDBC dependency. | `pip install "ematix-flow[spark]"` |
 | `pyarrow` | Required for the streaming-backend `pyclass` wrappers (`KafkaBackend`, `KinesisBackend`, …) when you want batch-by-batch iteration in Python. | `pip install pyarrow` |
 
 The `flow` binary, `run_pipeline`, and the typed-Python streaming
@@ -73,6 +74,7 @@ API work without any extras. To build from source, see
 
 ---
 
+<a id="connections"></a>
 ## Connections
 
 Connections are the first thing to set up. Every pipeline
@@ -181,6 +183,7 @@ class kafka_avro:
 
 ---
 
+<a id="backends"></a>
 ## Backends
 
 Every source and target lives behind one `Backend` trait. Switch a
@@ -236,6 +239,7 @@ change.
 
 ---
 
+<a id="pipelines"></a>
 ## Pipelines
 
 A pipeline binds a source query to a target table and a load
@@ -373,6 +377,7 @@ target don't block the others (configurable via
 
 ---
 
+<a id="modes"></a>
 ## Modes
 
 The load strategy. Set on `@ematix.pipeline(mode=...)`.
@@ -492,6 +497,7 @@ def ingest(conn): ...
 
 ---
 
+<a id="scheduling"></a>
 ## Scheduling
 
 Three ways to fire a pipeline.
@@ -539,6 +545,7 @@ Inspect via SQL or `flow runs list`.
 
 ---
 
+<a id="streaming-pipelines"></a>
 ## Streaming pipelines
 
 A long-running consumer that drains a source and writes batches
@@ -652,6 +659,7 @@ the others (configurable).
 
 ---
 
+<a id="stream-processing"></a>
 ## Stream processing
 
 Stateful transforms layered onto a streaming pipeline.
@@ -984,6 +992,7 @@ without rewrites.
 
 ---
 
+<a id="configuration-reference"></a>
 ## Configuration reference
 
 Selected knobs that don't fit any single section above. Every
@@ -1071,6 +1080,7 @@ flow connections set warehouse url=postgres://...
 
 ---
 
+<a id="cli"></a>
 ## CLI
 
 ```
@@ -1094,6 +1104,7 @@ enables the supervised-restart loop.
 
 ---
 
+<a id="python-api"></a>
 ## Python API
 
 For when you want to bypass the pipeline orchestration and use a
@@ -1128,6 +1139,7 @@ the [Install](#install) extras and the
 
 ---
 
+<a id="performance-and-comparisons"></a>
 ## Performance and comparisons
 
 ematix-flow uses DataFusion for in-process SQL and Apache Arrow
@@ -1141,6 +1153,35 @@ for cross-backend I/O. Single-node TPC-H benchmarks (M3 Pro):
 22/22 PASS on TPC-H SF=1; 103/103 PASS on the canonical Apache
 Spark TPC-DS plan-time audit (Spark dialect → DataFusion via the
 built-in translator).
+
+**vs Polars** (closest peer — Rust under Python, in-process,
+vectorized — same M3 Pro / SF=1 / Parquet; Polars 1.40.1; 5-trial
+median after warm-up):
+
+| Query | DataFusion | Polars | Result |
+|---|---|---|---|
+| Q1 | 48.7 ms | 40.9 ms | Polars 1.19× — requires interval-literal rewrite for Polars's SQL parser |
+| Q3 | 34.6 ms | 52.2 ms | **DataFusion 1.51×** — requires explicit-JOIN rewrite for Polars's SQL parser |
+| Q6 | 17.6 ms | 10.7 ms | Polars 1.65× (tight fused filter-+-sum loop) — engine investigation open |
+| Q19 | 38.0 ms | 387.1 ms | **DataFusion 10.2×** — Polars's optimizer can't simplify the 3-clause OR over a 2-way join |
+
+Two honest takeaways:
+
+- DataFusion wins complex-query robustness (Q19's 10× swing is
+  representative; Polars's SQL surface is also stricter — three
+  of the four queries need a `.polars.sql` variant to parse).
+- Polars wins the simple scan-aggregate shape (Q6). DataFusion's
+  aggregate compute is already sub-millisecond; Polars's edge is
+  a fused filter-+-sum inner loop. A DataFusion-level kernel
+  fusion for that shape is an open investigation — see
+  [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) for the operator
+  breakdown.
+
+Both engines stay an order of magnitude ahead of single-node
+PySpark on every query. The case for ematix-flow vs Polars isn't
+raw scan speed — it's the load-tier surface on top (watermarks,
+atomic state, schema evolution, multi-target fan-out, CDC sources,
+streaming consumers).
 
 Distributed batch SQL across multiple ematix-flow processes is
 available via the bundled `flow-worker` peer mesh. Cross-host
@@ -1156,11 +1197,13 @@ Full methodology, hardware, and per-query numbers:
 |---|---|
 | One-off pandas / SQL scripts | Adds correctness guarantees (watermarks, atomic state, schema evolution) without the operational weight of Airflow + Spark. |
 | Airflow + dbt | Handles the load logic and streaming sources without a scheduler tier. Cron / k8s `CronJob` / GitHub Actions all fire `flow run-due` — no Airflow worker, no scheduler stub, no DAG plumbing. |
-| Kafka Connect + Debezium + custom sinks | First-class CDC source mode dispatches per-op transactionally to your existing target. No JVM connectors to operate. |
-| PySpark Structured Streaming (single-node) | Same SQL surface (DataFusion + Spark dialect translator), 5.87× faster geomean, no cluster manager, no JVM. |
+| Kafka Connect + Debezium + custom sinks | First-class CDC source mode dispatches per-op transactionally to your existing target. No separate connector tier to operate. |
+| PySpark Structured Streaming (single-node) | Same SQL surface (DataFusion + Spark dialect translator), 5.87× faster geomean, no cluster manager. |
+| Polars `read_*` + custom load logic | Comparable per-query performance on shared workloads; ematix-flow adds the load tier on top — watermarks, atomic state, schema evolution, multi-target fan-out, CDC sources, streaming. |
 
 ---
 
+<a id="whats-shipped"></a>
 ## What's shipped
 
 All four surfaces are stable. See
@@ -1199,6 +1242,7 @@ RustSec; ruff + bandit + pip-audit green on the Python side.
 
 ---
 
+<a id="development"></a>
 ## Development
 
 ```sh
@@ -1228,6 +1272,7 @@ pytest -m spark                           # opt-in Spark E2E
 
 ---
 
+<a id="license"></a>
 ## License
 
 Apache-2.0
