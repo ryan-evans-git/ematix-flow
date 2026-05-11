@@ -12,6 +12,11 @@ pub mod delta_backend;
 // than SQL surfaces.
 pub mod dialect;
 pub mod duckdb_backend;
+// Σ.E2: row-group-parallel parquet TableProvider that bypasses
+// DataFusion's `ParquetExec → DataSourceExec → RepartitionExec` stack.
+// See `fast_parquet.rs` for the day-2/day-3 probe results that
+// motivated this.
+pub mod fast_parquet;
 pub mod hash;
 pub mod join;
 pub mod kafka_backend;
