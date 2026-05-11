@@ -53,7 +53,7 @@ QUERY_FILES = {
 }
 
 
-def build_context(data_dir: Path) -> pl.SQLContext:
+def build_context(data_dir: Path, mode: str) -> pl.SQLContext:
     ctx = pl.SQLContext()
     for table in TPCH_TABLES:
         path = data_dir / f"{table}.parquet"
@@ -65,16 +65,47 @@ def build_context(data_dir: Path) -> pl.SQLContext:
                 "--example tpch_generate -- --sf 1 "
                 f"--out {data_dir}"
             )
-        # `scan_parquet` produces a LazyFrame so Polars can push down
-        # predicates + projections through the optimizer.
-        ctx.register(table, pl.scan_parquet(str(path)))
+        if mode == "parquet":
+            # `scan_parquet` keeps decode lazy so each `.collect()`
+            # re-reads the file. This is the cold/end-to-end shape;
+            # in production this is what `read_parquet(...).sql(...)`
+            # users hit on every query.
+            frame = pl.scan_parquet(str(path))
+        elif mode == "memtable":
+            # Decode once outside the timed loop and re-register the
+            # materialized DataFrame's lazy view. Mirrors DataFusion's
+            # `MemTable` bench in `examples/tpch_q6_tune.rs` — the
+            # comparison becomes engine compute, not parquet decoder.
+            # This is the shape an ematix-flow streaming pipeline
+            # already runs in (Arrow batches in memory between
+            # transform stages), so it's the production-representative
+            # number for the streaming surface, not a synthetic best
+            # case.
+            frame = pl.read_parquet(str(path)).lazy()
+        else:
+            sys.exit(f"unknown mode: {mode}")
+        ctx.register(table, frame)
     return ctx
 
 
 def load_query(name: str) -> str:
+    """Prefer a `<name>.polars.sql` sibling if it exists.
+
+    Polars's SQL parser (1.40.x) doesn't accept a handful of ANSI-SQL
+    constructs DataFusion does — `INTERVAL 'N' DAY` literals, implicit
+    `FROM a, b, c` cross-joins. For those queries we keep the canonical
+    TPC-H text in `<name>.sql` (used by DataFusion + PySpark) and ship
+    a side variant `<name>.polars.sql` that is semantically identical
+    but uses constructs Polars accepts (interval pre-resolved to a
+    `DATE`, implicit joins lifted into explicit `JOIN ... ON`). Each
+    sibling file documents the rewrite at the top so the equivalence
+    is auditable.
+    """
     path = QUERY_FILES[name]
-    raw = path.read_text()
-    return raw.strip().rstrip(";").strip()
+    polars_variant = path.with_suffix(".polars.sql")
+    chosen = polars_variant if polars_variant.exists() else path
+    sql = chosen.read_text().strip().rstrip(";").strip()
+    return sql
 
 
 def time_query(ctx: pl.SQLContext, sql: str) -> tuple[float, int]:
@@ -181,6 +212,18 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument("--data-dir", type=Path, default=DEFAULT_DATA_DIR)
     p.add_argument("--trials", type=int, default=3)
+    p.add_argument(
+        "--mode",
+        choices=["parquet", "memtable"],
+        default="parquet",
+        help=(
+            "parquet: lazy scan_parquet (re-decodes on every query — "
+            "cold/end-to-end shape). memtable: read_parquet once "
+            "outside the timed loop, register the materialized frame "
+            "(isolates engine compute from decoder; mirrors "
+            "DataFusion's MemTable bench)."
+        ),
+    )
     return p.parse_args()
 
 
@@ -189,10 +232,11 @@ def main() -> None:
 
     print(f"==> data dir: {args.data_dir}")
     print(f"==> trials per query: {args.trials} (after 1 warm-up)")
+    print(f"==> mode: {args.mode}")
     print(f"==> Polars {pl.__version__}")
     print()
 
-    ctx = build_context(args.data_dir)
+    ctx = build_context(args.data_dir, args.mode)
 
     results: dict[str, dict[str, float | str]] = {}
     for name in ("q01", "q03", "q06", "q19"):
