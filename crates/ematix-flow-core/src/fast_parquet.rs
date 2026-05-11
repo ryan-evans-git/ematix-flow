@@ -42,7 +42,9 @@ use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::catalog::{Session, TableProvider};
 use datafusion::common::stats::Precision;
-use datafusion::common::{DataFusionError, Result as DfResult, Statistics};
+use datafusion::common::{
+    ColumnStatistics, DataFusionError, Result as DfResult, ScalarValue, Statistics,
+};
 use datafusion::datasource::TableType;
 use datafusion::execution::TaskContext;
 use datafusion::logical_expr::Expr;
@@ -60,6 +62,129 @@ use futures_util::stream::{self};
 /// Per-probe sweet spot — see `examples/parquet_rs_granular.rs`.
 const DEFAULT_BATCH_SIZE: usize = 65_536;
 
+/// Aggregate per-row-group parquet statistics into a file-level
+/// `ColumnStatistics`. Returns one entry per Arrow field in `schema`,
+/// in field order.
+///
+/// We support primitive types where the parquet `Statistics` variant
+/// maps directly to a single Arrow `ScalarValue`: Int32, Int64,
+/// Float32, Float64, Boolean, plus Arrow's Date32 (parquet stores it
+/// as an Int32 with logical type Date). For other types (Utf8,
+/// nested, etc.) we emit `Precision::Absent`, matching DataFusion's
+/// `ColumnStatistics::new_unknown()`.
+///
+/// Aggregation rules:
+///   - `null_count`: sum across row groups (Exact iff every RG had Exact)
+///   - `min_value`:  min across row groups
+///   - `max_value`:  max across row groups
+fn aggregate_column_statistics(
+    meta: &datafusion::parquet::file::metadata::ParquetMetaData,
+    arrow_schema: &datafusion::arrow::datatypes::Schema,
+) -> Vec<ColumnStatistics> {
+    use datafusion::arrow::datatypes::DataType;
+    use datafusion::parquet::file::statistics::Statistics as PqStats;
+
+    let num_fields = arrow_schema.fields().len();
+    let mut out: Vec<ColumnStatistics> = (0..num_fields)
+        .map(|_| ColumnStatistics::new_unknown())
+        .collect();
+
+    // For each leaf column, fold its row-group stats into one
+    // ColumnStatistics. We match leaf order = field order for the
+    // flat TPC-H schemas this provider targets.
+    for (col_idx, field) in arrow_schema.fields().iter().enumerate() {
+        if col_idx >= meta.row_group(0).num_columns() {
+            continue; // shouldn't happen, but defensive
+        }
+        let arrow_ty = field.data_type();
+        let mut null_count: Option<i64> = Some(0);
+        let mut min_sv: Option<ScalarValue> = None;
+        let mut max_sv: Option<ScalarValue> = None;
+        let mut any_missing = false;
+
+        for rg_idx in 0..meta.num_row_groups() {
+            let col = meta.row_group(rg_idx).column(col_idx);
+            let Some(stats) = col.statistics() else {
+                any_missing = true;
+                null_count = None;
+                continue;
+            };
+            // Per-column null count: parquet exposes via `null_count_opt`.
+            if let (Some(nc), Some(curr)) = (stats.null_count_opt(), null_count) {
+                null_count = Some(curr.saturating_add(nc as i64));
+            } else {
+                null_count = None;
+            }
+
+            // Extract typed min/max if both ends are present.
+            let (rg_min, rg_max) = match (stats, arrow_ty) {
+                (PqStats::Int32(s), DataType::Int32) => match (s.min_opt(), s.max_opt()) {
+                    (Some(&lo), Some(&hi)) => (
+                        Some(ScalarValue::Int32(Some(lo))),
+                        Some(ScalarValue::Int32(Some(hi))),
+                    ),
+                    _ => (None, None),
+                },
+                (PqStats::Int32(s), DataType::Date32) => match (s.min_opt(), s.max_opt()) {
+                    (Some(&lo), Some(&hi)) => (
+                        Some(ScalarValue::Date32(Some(lo))),
+                        Some(ScalarValue::Date32(Some(hi))),
+                    ),
+                    _ => (None, None),
+                },
+                (PqStats::Int64(s), DataType::Int64) => match (s.min_opt(), s.max_opt()) {
+                    (Some(&lo), Some(&hi)) => (
+                        Some(ScalarValue::Int64(Some(lo))),
+                        Some(ScalarValue::Int64(Some(hi))),
+                    ),
+                    _ => (None, None),
+                },
+                (PqStats::Float(s), DataType::Float32) => match (s.min_opt(), s.max_opt()) {
+                    (Some(&lo), Some(&hi)) => (
+                        Some(ScalarValue::Float32(Some(lo))),
+                        Some(ScalarValue::Float32(Some(hi))),
+                    ),
+                    _ => (None, None),
+                },
+                (PqStats::Double(s), DataType::Float64) => match (s.min_opt(), s.max_opt()) {
+                    (Some(&lo), Some(&hi)) => (
+                        Some(ScalarValue::Float64(Some(lo))),
+                        Some(ScalarValue::Float64(Some(hi))),
+                    ),
+                    _ => (None, None),
+                },
+                _ => (None, None),
+            };
+
+            match (rg_min, &min_sv) {
+                (Some(v), None) => min_sv = Some(v),
+                (Some(v), Some(curr)) if v < *curr => min_sv = Some(v),
+                _ => {}
+            }
+            match (rg_max, &max_sv) {
+                (Some(v), None) => max_sv = Some(v),
+                (Some(v), Some(curr)) if v > *curr => max_sv = Some(v),
+                _ => {}
+            }
+        }
+
+        let null_precision = match (null_count, any_missing) {
+            (Some(n), false) => Precision::Exact(n.max(0) as usize),
+            _ => Precision::Absent,
+        };
+        out[col_idx] = ColumnStatistics {
+            null_count: null_precision,
+            max_value: max_sv.map(Precision::Exact).unwrap_or(Precision::Absent),
+            min_value: min_sv.map(Precision::Exact).unwrap_or(Precision::Absent),
+            sum_value: Precision::Absent,
+            distinct_count: Precision::Absent,
+            byte_size: Precision::Absent,
+        };
+    }
+
+    out
+}
+
 /// `TableProvider` over a single parquet file. Construction reads the
 /// file footer once to cache the Arrow schema, row-group count, and
 /// total row count; `scan()` returns a [`FastParquetExec`] whose
@@ -73,6 +198,10 @@ pub struct FastParquetTableProvider {
     num_row_groups: usize,
     num_rows: usize,
     parquet_schema: Arc<SchemaDescriptor>,
+    /// One entry per column in `schema` (field order). Populated from
+    /// parquet row-group stats at construction so we don't pay the
+    /// metadata-read cost on every scan.
+    column_stats: Arc<Vec<ColumnStatistics>>,
 }
 
 impl FastParquetTableProvider {
@@ -98,12 +227,14 @@ impl FastParquetTableProvider {
         // could declare a negative count; we treat that as zero).
         let num_rows = meta.file_metadata().num_rows().max(0) as usize;
         let parquet_schema: Arc<SchemaDescriptor> = builder.parquet_schema().clone().into();
+        let column_stats = Arc::new(aggregate_column_statistics(meta, &schema));
         Ok(Self {
             path,
             schema,
             num_row_groups,
             num_rows,
             parquet_schema,
+            column_stats,
         })
     }
 
@@ -188,12 +319,20 @@ impl TableProvider for FastParquetTableProvider {
             assignments[rg % num_partitions].push(rg);
         }
 
+        // Project the column-statistics vector to match the projected
+        // schema. ColumnStatistics are positional in field order.
+        let projected_col_stats: Vec<ColumnStatistics> = projected_indices
+            .iter()
+            .map(|&i| self.column_stats[i].clone())
+            .collect();
+
         let exec = FastParquetExec::try_new(
             self.path.clone(),
             projected_schema,
             projected_indices,
             assignments,
             self.num_rows,
+            projected_col_stats,
             self.parquet_schema.clone(),
         )?;
         Ok(Arc::new(exec))
@@ -215,6 +354,9 @@ pub struct FastParquetExec {
     assignments: Vec<Vec<usize>>,
     /// Total row count across the file (from parquet metadata).
     num_rows: usize,
+    /// Per-column file-level stats, aligned to `schema` field order.
+    /// Populated from parquet row-group statistics.
+    column_stats: Vec<ColumnStatistics>,
     parquet_schema: Arc<SchemaDescriptor>,
     properties: Arc<PlanProperties>,
 }
@@ -226,6 +368,7 @@ impl FastParquetExec {
         projection: Vec<usize>,
         assignments: Vec<Vec<usize>>,
         num_rows: usize,
+        column_stats: Vec<ColumnStatistics>,
         parquet_schema: Arc<SchemaDescriptor>,
     ) -> DfResult<Self> {
         let eq_props = EquivalenceProperties::new(schema.clone());
@@ -241,6 +384,7 @@ impl FastParquetExec {
             projection,
             assignments,
             num_rows,
+            column_stats,
             parquet_schema,
             properties,
         })
@@ -308,21 +452,18 @@ impl ExecutionPlan for FastParquetExec {
     }
 
     fn partition_statistics(&self, partition: Option<usize>) -> DfResult<Statistics> {
-        // Expose `num_rows` from parquet metadata so the planner can
-        // pick the right join build side. Without this, Q12's planner
-        // picked a 1.5M-row build side instead of the 30K-row
-        // post-filter lineitem build side (EXPLAIN-diagnosed
-        // regression — see commit message of `feat(Σ.E2): v1`).
-        //
-        // Column-level statistics (min/max/null_count) would unlock
-        // row-group pruning; that's the next v2 step.
+        // Expose num_rows + per-column min/max/null_count from parquet
+        // metadata so the planner can:
+        //   1. Pick the right join build side (Q12 EXPLAIN: planner
+        //      picked 1.5M-row orders instead of 30K-row post-filter
+        //      lineitem before stats were exposed).
+        //   2. Estimate filter selectivity against column min/max
+        //      (e.g. `l_shipdate >= '1994' AND < '1995'` over min=
+        //      '1992' max='1998' → ~14% selectivity, vs the default
+        //      blind ~10% guess).
         let mut stats = Statistics::new_unknown(&self.schema);
         let n = match partition {
             None => self.num_rows,
-            // Per-partition exact row count requires summing the
-            // row group row counts in this partition's assignment.
-            // For now, approximate via the global row count / num
-            // partitions — exact per-partition is a v2 follow-up.
             Some(i) => {
                 if i >= self.assignments.len() {
                     return Err(DataFusionError::Internal(format!(
@@ -334,6 +475,7 @@ impl ExecutionPlan for FastParquetExec {
             }
         };
         stats.num_rows = Precision::Exact(n);
+        stats.column_statistics = self.column_stats.clone();
         Ok(stats)
     }
 }
@@ -463,6 +605,54 @@ mod tests {
                 assert_eq!(n, 6_001_215, "exact row count from parquet metadata")
             }
             _ => panic!("expected Exact num_rows from FastParquetExec"),
+        }
+    }
+
+    /// Verify column min/max statistics flow through to the
+    /// ExecutionPlan. Required for the planner to estimate filter
+    /// selectivity (Q12 / Q19 regression cause in v2a).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn column_statistics_min_max_populated() {
+        use datafusion::common::ScalarValue;
+        use datafusion::common::stats::Precision;
+        use datafusion::prelude::SessionContext;
+        let Some(path) = lineitem_parquet() else {
+            eprintln!("TPC-H SF=1 data not generated; skipping test");
+            return;
+        };
+        let ctx = SessionContext::new();
+        let prov = FastParquetTableProvider::try_new(path).unwrap();
+        let state = ctx.state();
+        let exec = prov.scan(&state, None, &[], None).await.unwrap();
+        let stats = exec.partition_statistics(None).unwrap();
+        assert_eq!(stats.column_statistics.len(), 16, "16 lineitem cols");
+
+        // l_quantity is column 4, Float64. TPC-H lineitem quantities
+        // are integers 1-50 stored as doubles, so min=1, max=50.
+        let qty = &stats.column_statistics[4];
+        match &qty.min_value {
+            Precision::Exact(ScalarValue::Float64(Some(v))) => {
+                assert!((*v - 1.0).abs() < 1e-9, "l_quantity min = 1, got {v}")
+            }
+            other => panic!("expected Float64 min for l_quantity, got {other:?}"),
+        }
+        match &qty.max_value {
+            Precision::Exact(ScalarValue::Float64(Some(v))) => {
+                assert!((*v - 50.0).abs() < 1e-9, "l_quantity max = 50, got {v}")
+            }
+            other => panic!("expected Float64 max for l_quantity, got {other:?}"),
+        }
+
+        // l_shipdate is column 10, Date32. TPC-H ship dates span
+        // roughly 1992-01-02 through 1998-12-01.
+        let ship = &stats.column_statistics[10];
+        match &ship.min_value {
+            Precision::Exact(ScalarValue::Date32(Some(_))) => {}
+            other => panic!("expected Date32 min for l_shipdate, got {other:?}"),
+        }
+        match &ship.max_value {
+            Precision::Exact(ScalarValue::Date32(Some(_))) => {}
+            other => panic!("expected Date32 max for l_shipdate, got {other:?}"),
         }
     }
 
