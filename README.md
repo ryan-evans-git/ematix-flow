@@ -27,34 +27,34 @@ Arrow under the hood.**
 Every TPC-H query, four engines, same M3 Pro / SF=1 / Parquet,
 2026-05-11 baseline:
 
-| Query | PySpark `local[*]` | Polars (SQL) | DataFusion | **ematix-flow** | Note |
-|---|---:|---:|---:|---:|---|
-| Q1  | 208.8 |   39.28² |  48.84 | **3.06** | Σ.D2 fused multi-agg |
-| Q2  | 310.9 | FAIL¹    |  29.58 |  29.58   | DataFusion path |
-| Q3  | 368.5 |   44.57² |  37.30 |  37.30   | |
-| Q4  | 278.9 | FAIL¹    |  26.65 |  26.65   | |
-| Q5  | 377.6 |10935.93² |  51.84 |  51.84   | Polars regresses 211× on this 6-way join |
-| Q6  |  53.7 |   23.30  |  19.03 | **0.95** | Σ.D3 cranelift-JIT'd |
-| Q7  | 349.8 |  178.46² |  66.52 |  66.52   | |
-| Q8  | 220.9 |  106.87² |  50.53 |  50.53   | |
-| Q9  | 570.6 |   52.81² |  68.58 |  68.58   | ⚠ Polars 1.30× faster |
-| Q10 | 406.0 |   71.85² |  62.55 |  62.55   | |
-| Q11 | 148.5 | FAIL¹    |  22.18 |  22.18   | |
-| Q12 | 298.3 |   22.01² |  50.39 |  50.39   | ⚠ Polars 2.29× faster |
-| Q13 | 706.1 | FAIL¹    |  94.52 |  94.52   | |
-| Q14 | 132.1 |   12.53² |  27.21 |  27.21   | ⚠ Polars 2.17× faster |
-| Q15 | 146.3 | FAIL¹    |  30.30 |  30.30   | |
-| Q16 | 223.5 |   25.94² |  22.43 |  22.43   | |
-| Q17 | 303.9 | FAIL¹    |  61.99 |  61.99   | |
-| Q18 | 678.8 | FAIL¹    | 104.79 | 104.79   | |
-| Q19 | 109.9 |  392.14² |  56.02 |  56.02   | |
-| Q20 | 134.5 | FAIL¹    |  38.66 |  38.66   | |
-| Q21 | 706.5 | FAIL¹    |  85.77 |  85.77   | |
-| Q22 | 327.8 | FAIL¹    |  19.77 |  19.77   | |
+| Query |   Pandas³ | PySpark | Polars | DataFusion | **ematix-flow** | Note |
+|---|---:|---:|---:|---:|---:|---|
+| Q1  | 1086.05 | 208.8 |   39.28² |  48.84 | **3.06** | Σ.D2 fused multi-agg |
+| Q2  |    —    | 310.9 | FAIL¹    |  29.58 |  29.58   | |
+| Q3  |  675.26 | 368.5 |   44.57² |  37.30 |  37.30   | |
+| Q4  |    —    | 278.9 | FAIL¹    |  26.65 |  26.65   | |
+| Q5  |  454.66 | 377.6 |10935.93² |  51.84 |  51.84   | Polars regresses 211× on this 6-way join |
+| Q6  |  465.68 |  53.7 |   23.30  |  19.03 | **0.95** | Σ.D3 cranelift-JIT'd |
+| Q7  |    —    | 349.8 |  178.46² |  66.52 |  66.52   | |
+| Q8  |    —    | 220.9 |  106.87² |  50.53 |  50.53   | |
+| Q9  |    —    | 570.6 |   52.81² |  68.58 |  68.58   | ⚠ Polars 1.30× faster |
+| Q10 |  582.01 | 406.0 |   71.85² |  62.55 |  62.55   | |
+| Q11 |    —    | 148.5 | FAIL¹    |  22.18 |  22.18   | |
+| Q12 |  894.94 | 298.3 |   22.01² |  50.39 |  50.39   | ⚠ Polars 2.29× faster |
+| Q13 |    —    | 706.1 | FAIL¹    |  94.52 |  94.52   | |
+| Q14 |  458.27 | 132.1 |   12.53² |  27.21 |  27.21   | ⚠ Polars 2.17× faster |
+| Q15 |    —    | 146.3 | FAIL¹    |  30.30 |  30.30   | |
+| Q16 |    —    | 223.5 |   25.94² |  22.43 |  22.43   | |
+| Q17 |    —    | 303.9 | FAIL¹    |  61.99 |  61.99   | |
+| Q18 |    —    | 678.8 | FAIL¹    | 104.79 | 104.79   | |
+| Q19 |    —    | 109.9 |  392.14² |  56.02 |  56.02   | |
+| Q20 |    —    | 134.5 | FAIL¹    |  38.66 |  38.66   | |
+| Q21 |    —    | 706.5 | FAIL¹    |  85.77 |  85.77   | |
+| Q22 |    —    | 327.8 | FAIL¹    |  19.77 |  19.77   | |
 
 All times in milliseconds. 5-trial median for DataFusion / ematix-flow,
-3-trial median for PySpark (4.1.1 on JDK 23), 3-trial median for Polars
-(1.40.1).
+3-trial median for everything else (PySpark 4.1.1 on JDK 23, Polars
+1.40.1, pandas 3.0.2).
 
 - **Geomean: ematix-flow is 8.02× faster than single-node PySpark**
   across the 22-query suite — vs DataFusion-alone's 6.17×. The Σ.D-arc
@@ -76,6 +76,16 @@ All times in milliseconds. 5-trial median for DataFusion / ematix-flow,
   `examples/tpch/queries/q*.polars.sql` — implicit-FROM rewritten as
   explicit `JOIN ... ON`, plus interval literals pre-resolved.
   Semantically identical to the canonical TPC-H text.
+- ³ Pandas isn't a SQL engine; we time hand-translated DataFrame
+  operations (`pandas.read_parquet` + `merge` + `groupby`) on the
+  same SF=1 Parquet files. Each query is a fresh process so parquet
+  decode is included — matches an out-of-box pandas user's
+  experience. Queries shown as `—` weren't hand-translated; pandas
+  needs a per-query implementation. See
+  [`scripts/bench-tpch-pandas.py`](scripts/bench-tpch-pandas.py)
+  for the seven translations we did ship. Pandas is **17-490× slower
+  than ematix-flow** on the queries measured; geomean is **~36×
+  slower** across that subset.
 
 Full methodology + per-engine reproducers in
 [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md).
