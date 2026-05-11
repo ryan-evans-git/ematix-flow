@@ -464,6 +464,46 @@ async fn main() {
         print_groups("hand-written parallel results:", &g);
     }
     println!();
-    println!("==> Day-1 verdict: see medians above against the DataFusion Q1 default reading.");
-    println!("    If parallel hardcoded ≤ 5 ms, the Σ.D2 phase-1 lower bound is set.");
+
+    println!("--- Section 7: FusedFilterMultiAggExec (Σ.D2 phase-2 wrapped operator) ---");
+    use datafusion::physical_plan::ExecutionPlan;
+    use ematix_flow_core::fused_multi_agg::{FusedFilterMultiAggExec, Q1Predicate};
+
+    let logical = ctx_mem
+        .sql(
+            "SELECT l_returnflag, l_linestatus, l_quantity, \
+             l_extendedprice, l_discount, l_tax, l_shipdate \
+             FROM lineitem",
+        )
+        .await
+        .unwrap();
+    let child = logical.create_physical_plan().await.unwrap();
+    let fused: Arc<dyn ExecutionPlan> = Arc::new(
+        FusedFilterMultiAggExec::try_new_q1(
+            child,
+            Q1Predicate { shipdate_cutoff: cutoff },
+        )
+        .unwrap(),
+    );
+    let task_ctx = ctx_mem.task_ctx();
+    // Warm-up.
+    let mut s = fused.execute(0, task_ctx.clone()).unwrap();
+    let _ = s.try_next().await.unwrap();
+
+    let mut times = Vec::with_capacity(5);
+    for _ in 0..5 {
+        let mut s = fused.execute(0, task_ctx.clone()).unwrap();
+        let start = Instant::now();
+        let b = s.try_next().await.unwrap().expect("Q1 output batch");
+        times.push(start.elapsed().as_secs_f64() * 1000.0);
+        assert_eq!(b.num_rows(), 4, "Q1 output should have 4 groups");
+    }
+    times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    println!(
+        "  FusedFilterMultiAggExec (MemTable child, in DataFusion runtime)  median {:>6.2} ms  (min {:>5.2}  max {:>5.2})",
+        times[2], times[0], times[4],
+    );
+    println!();
+    println!("==> Phase-2 verdict: wrap overhead is the (Section 7 - Section 4) delta.");
+    println!("    Σ.D1 reference: wrap added 0.28 ms to a 0.96 ms floor.");
 }
