@@ -12,6 +12,11 @@ pub mod delta_backend;
 // than SQL surfaces.
 pub mod dialect;
 pub mod duckdb_backend;
+// Σ.D1: `FusedFilterSumExec` physical operator for the simple
+// `Aggregate(SUM) over Filter(predicate)` plan shape — closes the
+// Q6 gap vs Polars (1.0 ms hand-written / 1.9 ms Polars / 5.96 ms
+// today's DataFusion). See `fused.rs` header and issue #44.
+pub mod fused;
 pub mod hash;
 pub mod join;
 pub mod kafka_backend;
