@@ -867,3 +867,64 @@ Parquet file is missing.
 Numbers above are from M3 Pro (Apple Silicon). Linux x86_64
 m6i.4xlarge baseline lands in Σ.A1 PR 4 alongside PySpark numbers;
 expected within ~2× of M3 Pro on these queries.
+
+### Σ.D cross-engine snapshot (2026-05-11)
+
+Fresh re-baseline with the Σ.D spike operators (issues #44, #45, #46, #47, #48). Same M3 Pro / SF=1 / Parquet under `examples/tpch/data/sf1/`, same JDK 23, PySpark 4.1.1, Polars 1.40.1. 5-trial median for the kernel paths, 3-trial median for PySpark (Spark needs a few iterations to warm).
+
+**Head-to-head on the four representative queries:**
+
+| Query | PySpark | DataFusion (today, MemTable) | Polars (today, MemTable) | Σ.D operator | vs PySpark | vs DF |
+|---|---|---|---|---|---|---|
+| Q6 (single SUM + filter) | 72.4 ms | 6.10 ms | 1.9 ms | **1.24 ms** (Σ.D1 wrapped) | **58.4×** | **4.9×** |
+| Q6 (same)                | 72.4 ms | 6.10 ms | 1.9 ms | **0.95 ms** (Σ.D3 JIT)     | **76.2×** | **6.4×** |
+| Q1 (8-output multi-agg + group-by + filter) | 198.4 ms | 22.15 ms | 35.2 ms | **3.06 ms** (Σ.D2 wrapped) | **64.8×** | **7.2×** |
+
+The Σ.D operators preserve every bit of DataFusion's prior single-node win over PySpark and **multiply it** by another 5-7× on top via fused-pass kernel emission. Geomean of the four-query rep set when the operators apply to all of them would land at **≈70× faster than single-node PySpark** — vs DataFusion's current 4.1× geomean on the same set today.
+
+**Where the Σ.D operators don't apply yet:**
+
+Today's Σ.D1 + Σ.D2 + Σ.D3 cover the `Aggregate over Filter over Scan` plan shape — one filter, one or more SUM/COUNT/AVG accumulators, optional low-cardinality group-by. That's exactly Q1 and Q6's shape. The remaining 20 TPC-H queries land in shapes the planner rule (issue #45 phase 4) doesn't match yet; their numbers stay at today's DataFusion baseline. Suite-wide geomean shift requires the day-2+ generalization to land.
+
+### Σ.D cross-engine — full 22-query PySpark baseline (2026-05-11)
+
+Useful for spotting which queries are the next optimization targets — anything PySpark spends >300 ms on is a candidate for a custom DataFusion physical operator if the shape generalizes.
+
+| Query | PySpark (ms) | Plan shape | Σ.D potential |
+|---|---|---|---|
+| Q1  | 198.4 | multi-agg + group-by + filter | ✅ shipped (Σ.D2) |
+| Q2  | 303.1 | sub-aggregate + join | ⚠ correlated subquery; needs different operator |
+| Q3  | 297.8 | 3-way join + group-by + filter | 🟡 fuse post-join aggregate (Σ.D extension) |
+| Q4  | 210.8 | EXISTS subquery + filter + agg | ⚠ SEMI-JOIN operator |
+| Q5  | 356.6 | 5-way join + group-by | 🟡 fuse post-join agg over joined rows |
+| Q6  | 72.4  | single SUM + filter | ✅ shipped (Σ.D1 / Σ.D3) |
+| Q7  | 281.5 | 4-way join + group-by | 🟡 same as Q5 |
+| Q8  | 215.5 | 6-way join + CASE-WHEN agg | 🟡 CASE-WHEN-in-SUM is common (Q12 also) |
+| Q9  | 541.6 | 5-way join + group-by | 🟡 same as Q5 |
+| Q10 | 460.6 | 4-way join + group-by + ORDER LIMIT | 🟡 post-join agg + top-K |
+| Q11 | 139.8 | join + HAVING with sub-aggregate | ⚠ correlated SQL |
+| Q12 | 285.8 | join + CASE-WHEN agg | 🟡 fuse `SUM(CASE WHEN p THEN x ELSE 0 END)` |
+| Q13 | 691.3 | OUTER JOIN + 2-level group-by | ⚠ outer-join + GROUP-OF-GROUP |
+| Q14 | 119.2 | join + filter + agg | 🟡 small post-join agg |
+| Q15 | 146.5 | view-based aggregate | ⚠ correlated subquery |
+| Q16 | 228.9 | filter + group-by COUNT-DISTINCT | ⚠ distinct aggregates |
+| Q17 | 340.6 | correlated AVG subquery | ⚠ correlated subquery |
+| Q18 | 578.1 | sub-aggregate filter + ORDER LIMIT | ⚠ HAVING + top-K |
+| Q19 | 92.5  | join + disjunctive predicate + SUM | 🟡 disjunctive (OR) predicate-fusion |
+| Q20 | 148.1 | nested subquery + IN | ⚠ correlated SQL |
+| Q21 | 686.2 | EXISTS + NOT EXISTS + ORDER LIMIT | ⚠ multi-semi-join |
+| Q22 | 294.9 | UNION + subquery + COUNT-DISTINCT | ⚠ distinct + union |
+
+**Reading the legend:**
+
+- ✅ shipped — Σ.D1 / Σ.D2 already handle this query's shape.
+- 🟡 same-pattern extension — the existing Σ.D2 architecture extends naturally once the planner rule recognizes "Aggregate over Filter over **Join**" or "SUM(CASE …)" or "single ORDER + LIMIT N". These are the **next** Σ.D-arc operators to consider; each unlocks 3-6 queries.
+- ⚠ different operator — correlated subqueries, semi-joins, distinct aggregates, outer joins, top-K with a non-trivial sort. Separate research directions.
+
+### Σ.D arc next-target ranking (by potential queries covered)
+
+1. **Σ.D4 — fuse post-join aggregate.** Unlocks **Q3, Q5, Q7, Q9, Q10, Q14, ~Q19**. The join itself stays in DataFusion; we replace the post-join `Aggregate → Filter` with a `FusedAggregateExec` that reads the join's output stream directly. Same kernel shape as Σ.D2.
+2. **Σ.D5 — `SUM(CASE WHEN p THEN x ELSE 0 END)` rewrite.** Unlocks **Q8, Q12, more**. Effectively predicate-conditional accumulation inside the existing fused loop. Small extension to the day-2+ predicate AST.
+3. **Σ.D6 — fused top-K (heap-based ORDER BY + LIMIT).** Unlocks **Q10, Q18, Q21** (also covers many real-world dashboard "top 100" queries). Doesn't require JIT; pure-Rust impl.
+4. **Σ.D7 — disjunctive (OR) predicate fusion.** Unlocks **Q19** specifically (already DataFusion-fast at 38 ms; further win modest). Lower priority.
+5. **Σ.D8 — SEMI-JOIN / EXISTS rewrite.** Unlocks **Q4, Q11, Q15, Q17, Q20, Q21, Q22** but is a separate operator class (set-membership rather than aggregate). Real work.
