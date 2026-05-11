@@ -39,8 +39,7 @@ async fn main() {
 
     let ctx = SessionContext::new();
     for table in [
-        "region", "nation", "supplier", "customer", "part", "partsupp",
-        "orders", "lineitem",
+        "region", "nation", "supplier", "customer", "part", "partsupp", "orders", "lineitem",
     ] {
         let path = format!("{data_dir}/{table}.parquet");
         ctx.register_parquet(table, &path, Default::default())
@@ -53,7 +52,10 @@ async fn main() {
         let _: Vec<RecordBatch> = ctx.sql(Q14).await.unwrap().collect().await.unwrap();
     }
 
-    let sql = format!("EXPLAIN ANALYZE {}", Q14.trim().trim_end_matches(';').trim());
+    let sql = format!(
+        "EXPLAIN ANALYZE {}",
+        Q14.trim().trim_end_matches(';').trim()
+    );
     let plan: Vec<RecordBatch> = ctx.sql(&sql).await.unwrap().collect().await.unwrap();
     for batch in &plan {
         let plan_col = batch.column(1).as_string::<i32>();
@@ -74,14 +76,22 @@ async fn main() {
 
     for (label, cfg) in [
         ("default (target_partitions = ncpu)", SessionConfig::new()),
-        ("target_partitions = 1", SessionConfig::new().with_target_partitions(1)),
-        ("target_partitions = 2", SessionConfig::new().with_target_partitions(2)),
-        ("target_partitions = 4", SessionConfig::new().with_target_partitions(4)),
+        (
+            "target_partitions = 1",
+            SessionConfig::new().with_target_partitions(1),
+        ),
+        (
+            "target_partitions = 2",
+            SessionConfig::new().with_target_partitions(2),
+        ),
+        (
+            "target_partitions = 4",
+            SessionConfig::new().with_target_partitions(4),
+        ),
     ] {
         let ctx = SessionContext::new_with_config(cfg);
         for table in [
-            "region", "nation", "supplier", "customer", "part", "partsupp",
-            "orders", "lineitem",
+            "region", "nation", "supplier", "customer", "part", "partsupp", "orders", "lineitem",
         ] {
             let path = format!("{data_dir}/{table}.parquet");
             ctx.register_parquet(table, &path, Default::default())
