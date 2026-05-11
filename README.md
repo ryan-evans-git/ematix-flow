@@ -65,7 +65,7 @@ the `run_pipeline` / `run_streaming_pipeline` Python entrypoints.
 | Extra | What it adds | Install |
 |---|---|---|
 | `df` | DataFrame interop helpers (polars / pandas) for `to_polars()` / `to_pandas()` materialization. | `pip install "ematix-flow[df]"` then `pip install polars` (or `pandas`). |
-| `spark` | PySpark interop helpers (`to_pyspark()` / `from_pyspark()`). Pulls in PySpark + JVM JDBC. Heavy. | `pip install "ematix-flow[spark]"` |
+| `spark` | PySpark interop helpers (`to_pyspark()` / `from_pyspark()`). Heavy — pulls in PySpark + its JDBC dependency. | `pip install "ematix-flow[spark]"` |
 | `pyarrow` | Required for the streaming-backend `pyclass` wrappers (`KafkaBackend`, `KinesisBackend`, …) when you want batch-by-batch iteration in Python. | `pip install pyarrow` |
 
 The `flow` binary, `run_pipeline`, and the typed-Python streaming
