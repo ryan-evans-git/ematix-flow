@@ -109,9 +109,7 @@ impl Q3Aggs {
 
 type Q3Key = (i64, i32, i32); // (l_orderkey, o_orderdate, o_shippriority)
 
-fn run_fused_q3(
-    batches: &[RecordBatch],
-) -> HashMap<Q3Key, Q3Aggs> {
+fn run_fused_q3(batches: &[RecordBatch]) -> HashMap<Q3Key, Q3Aggs> {
     let mut groups: HashMap<Q3Key, Q3Aggs> = HashMap::with_capacity(16_384);
     for batch in batches {
         let orderkey = batch
@@ -149,7 +147,10 @@ fn run_fused_q3(
             } else if let Some(a) = sp_i32 {
                 a.value(i)
             } else {
-                panic!("o_shippriority is neither Int32 nor Int64: {:?}", sp_col.data_type())
+                panic!(
+                    "o_shippriority is neither Int32 nor Int64: {:?}",
+                    sp_col.data_type()
+                )
             }
         };
         for i in 0..batch.num_rows() {
@@ -163,10 +164,7 @@ fn run_fused_q3(
     groups
 }
 
-fn run_fused_q3_parallel(
-    batches: &[RecordBatch],
-    workers: usize,
-) -> HashMap<Q3Key, Q3Aggs> {
+fn run_fused_q3_parallel(batches: &[RecordBatch], workers: usize) -> HashMap<Q3Key, Q3Aggs> {
     let n = batches.len();
     let chunk = n.div_ceil(workers.max(1));
     std::thread::scope(|s| {
@@ -192,8 +190,7 @@ fn run_fused_q3_parallel(
 async fn make_parquet_ctx(parquet_dir: &str) -> SessionContext {
     let ctx = SessionContext::new();
     for table in [
-        "region", "nation", "supplier", "customer", "part", "partsupp",
-        "orders", "lineitem",
+        "region", "nation", "supplier", "customer", "part", "partsupp", "orders", "lineitem",
     ] {
         let path = format!("{parquet_dir}/{table}.parquet");
         ctx.register_parquet(table, &path, Default::default())

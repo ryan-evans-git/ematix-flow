@@ -52,10 +52,7 @@ const Q10_JOIN_SQL: &str = "
 /// fold each shard's groups into a bounded min-heap of size `top_n`.
 /// Top of the heap is the *smallest* revenue we'd evict; if a new
 /// group's revenue exceeds it we pop the smallest, push the new one.
-fn run_fused_q10_topk(
-    batches: &[RecordBatch],
-    top_n: usize,
-) -> Vec<(i64, f64)> {
+fn run_fused_q10_topk(batches: &[RecordBatch], top_n: usize) -> Vec<(i64, f64)> {
     // Phase A: aggregate.
     let mut groups: HashMap<i64, f64> = HashMap::with_capacity(16_384);
     for batch in batches {
@@ -118,8 +115,7 @@ fn run_fused_q10_topk(
 async fn make_parquet_ctx(parquet_dir: &str) -> SessionContext {
     let ctx = SessionContext::new();
     for table in [
-        "region", "nation", "supplier", "customer", "part", "partsupp",
-        "orders", "lineitem",
+        "region", "nation", "supplier", "customer", "part", "partsupp", "orders", "lineitem",
     ] {
         let path = format!("{parquet_dir}/{table}.parquet");
         ctx.register_parquet(table, &path, Default::default())
@@ -166,7 +162,12 @@ async fn main() {
 
     println!("--- Section 2: DataFusion Q10 + LIMIT 20 (parquet) ---");
     let limit_sql = format!("{} limit 20", Q10.trim().trim_end_matches(';'));
-    bench_sql("default SessionConfig, with explicit LIMIT 20", &ctx, &limit_sql).await;
+    bench_sql(
+        "default SessionConfig, with explicit LIMIT 20",
+        &ctx,
+        &limit_sql,
+    )
+    .await;
     println!();
 
     println!("--- Section 3: pre-join + DataFusion aggregate + top 20 ---");
@@ -181,7 +182,10 @@ async fn main() {
         .await
         .unwrap();
     let total: usize = joined.iter().map(|b| b.num_rows()).sum();
-    println!("  (joined: {} batches, {total} rows post-join)", joined.len());
+    println!(
+        "  (joined: {} batches, {total} rows post-join)",
+        joined.len()
+    );
     let mem = MemTable::try_new(schema, vec![joined.clone()]).unwrap();
     let mem_ctx = SessionContext::new();
     mem_ctx.register_table("joined", Arc::new(mem)).unwrap();

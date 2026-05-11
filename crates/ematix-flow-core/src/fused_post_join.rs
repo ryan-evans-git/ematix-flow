@@ -30,9 +30,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use datafusion::arrow::array::{
-    Array, ArrayRef, Date32Array, Date32Builder, Float64Array, Float64Builder,
-    Int32Array, Int32Builder, Int64Array, Int64Builder, RecordBatch, StringBuilder,
-    StringViewArray,
+    Array, ArrayRef, Date32Array, Date32Builder, Float64Array, Float64Builder, Int32Array,
+    Int32Builder, Int64Array, Int64Builder, RecordBatch, StringBuilder, StringViewArray,
 };
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::common::{DataFusionError, Result as DfResult};
@@ -41,8 +40,7 @@ use datafusion::physical_expr::{EquivalenceProperties, Partitioning};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties,
-    SendableRecordBatchStream,
+    DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
 };
 use futures_util::stream::{self, TryStreamExt};
 
@@ -74,10 +72,7 @@ pub struct FusedPostJoinExec {
 }
 
 impl FusedPostJoinExec {
-    pub fn try_new(
-        input: Arc<dyn ExecutionPlan>,
-        spec: FusedPostJoinSpec,
-    ) -> DfResult<Self> {
+    pub fn try_new(input: Arc<dyn ExecutionPlan>, spec: FusedPostJoinSpec) -> DfResult<Self> {
         validate_input_schema(&input.schema(), spec)?;
         let schema = output_schema(spec);
         let eq_props = EquivalenceProperties::new(schema.clone());
@@ -108,9 +103,11 @@ fn output_schema(spec: FusedPostJoinSpec) -> SchemaRef {
             Field::new("n_name", DataType::Utf8, false),
             Field::new("revenue", DataType::Float64, false),
         ])),
-        FusedPostJoinSpec::Q14 => Arc::new(Schema::new(vec![
-            Field::new("promo_revenue", DataType::Float64, false),
-        ])),
+        FusedPostJoinSpec::Q14 => Arc::new(Schema::new(vec![Field::new(
+            "promo_revenue",
+            DataType::Float64,
+            false,
+        )])),
     }
 }
 
@@ -168,11 +165,7 @@ fn validate_input_schema(schema: &SchemaRef, spec: FusedPostJoinSpec) -> DfResul
 }
 
 impl DisplayAs for FusedPostJoinExec {
-    fn fmt_as(
-        &self,
-        _t: DisplayFormatType,
-        f: &mut std::fmt::Formatter,
-    ) -> std::fmt::Result {
+    fn fmt_as(&self, _t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(f, "FusedPostJoinExec({:?})", self.spec)
     }
 }
@@ -199,9 +192,7 @@ impl ExecutionPlan for FusedPostJoinExec {
         mut children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
         let new_input = children.pop().ok_or_else(|| {
-            DataFusionError::Internal(
-                "FusedPostJoinExec requires exactly 1 child".into(),
-            )
+            DataFusionError::Internal("FusedPostJoinExec requires exactly 1 child".into())
         })?;
         Ok(Arc::new(Self::try_new(new_input, self.spec)?))
     }
@@ -472,9 +463,7 @@ mod tests {
     #[tokio::test]
     async fn q3_returns_grouped_revenue_sorted_desc() {
         let input = input_plan_from_batch(make_q3_batch()).await;
-        let exec = Arc::new(
-            FusedPostJoinExec::try_new(input, FusedPostJoinSpec::Q3).unwrap(),
-        );
+        let exec = Arc::new(FusedPostJoinExec::try_new(input, FusedPostJoinSpec::Q3).unwrap());
         let session = SessionContext::new();
         let mut stream = exec.execute(0, session.task_ctx()).unwrap();
         let out = stream.try_next().await.unwrap().expect("batch");
@@ -533,9 +522,7 @@ mod tests {
     #[tokio::test]
     async fn q14_returns_promo_revenue_ratio() {
         let input = input_plan_from_batch(make_q14_batch()).await;
-        let exec = Arc::new(
-            FusedPostJoinExec::try_new(input, FusedPostJoinSpec::Q14).unwrap(),
-        );
+        let exec = Arc::new(FusedPostJoinExec::try_new(input, FusedPostJoinSpec::Q14).unwrap());
         let session = SessionContext::new();
         let mut stream = exec.execute(0, session.task_ctx()).unwrap();
         let out = stream.try_next().await.unwrap().expect("batch");
@@ -547,10 +534,7 @@ mod tests {
             .downcast_ref::<Float64Array>()
             .unwrap()
             .value(0);
-        assert!(
-            (ratio - 40.0).abs() < 1e-9,
-            "expected 40.0%, got {ratio}",
-        );
+        assert!((ratio - 40.0).abs() < 1e-9, "expected 40.0%, got {ratio}",);
     }
 
     fn make_q5_batch() -> RecordBatch {
@@ -588,9 +572,7 @@ mod tests {
     #[tokio::test]
     async fn q5_returns_string_grouped_revenue_sorted_desc() {
         let input = input_plan_from_batch(make_q5_batch()).await;
-        let exec = Arc::new(
-            FusedPostJoinExec::try_new(input, FusedPostJoinSpec::Q5).unwrap(),
-        );
+        let exec = Arc::new(FusedPostJoinExec::try_new(input, FusedPostJoinSpec::Q5).unwrap());
         let session = SessionContext::new();
         let mut stream = exec.execute(0, session.task_ctx()).unwrap();
         let out = stream.try_next().await.unwrap().expect("batch");
@@ -631,10 +613,7 @@ mod tests {
         let input = input_plan_with_schema(schema).await;
         let err = FusedPostJoinExec::try_new(input, FusedPostJoinSpec::Q3)
             .expect_err("missing o_shippriority should fail");
-        assert!(
-            format!("{err}").contains("o_shippriority"),
-            "got: {err}",
-        );
+        assert!(format!("{err}").contains("o_shippriority"), "got: {err}",);
     }
 
     #[tokio::test]

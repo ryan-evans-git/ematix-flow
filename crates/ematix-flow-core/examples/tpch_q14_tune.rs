@@ -45,9 +45,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
-use datafusion::arrow::array::{
-    Array, Float64Array, RecordBatch, StringViewArray,
-};
+use datafusion::arrow::array::{Array, Float64Array, RecordBatch, StringViewArray};
 use datafusion::datasource::MemTable;
 use datafusion::prelude::SessionContext;
 use futures_util::TryStreamExt;
@@ -132,8 +130,7 @@ fn run_fused_q14_parallel(batches: &[RecordBatch], workers: usize) -> (f64, f64)
 async fn make_parquet_ctx(parquet_dir: &str) -> SessionContext {
     let ctx = SessionContext::new();
     for table in [
-        "region", "nation", "supplier", "customer", "part", "partsupp",
-        "orders", "lineitem",
+        "region", "nation", "supplier", "customer", "part", "partsupp", "orders", "lineitem",
     ] {
         let path = format!("{parquet_dir}/{table}.parquet");
         ctx.register_parquet(table, &path, Default::default())
