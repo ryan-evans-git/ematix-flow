@@ -421,9 +421,7 @@ async fn main() {
         "  hand-written fused filter+sum ({ncpu}-thread)              median {:>6.2} ms  (min {:>5.2}  max {:>5.2})",
         times_par[2], times_par[0], times_par[4],
     );
-    println!(
-        "  (sanity: revenue ≈ {answer:.4} — canonical Q6 SF=1 ≈ 123141078.2283)"
-    );
+    println!("  (sanity: revenue ≈ {answer:.4} — canonical Q6 SF=1 ≈ 123141078.2283)");
 
     // Section 5: Σ.D1 wrapped — drive the same hand-written fused
     // loop through `FusedFilterSumExec` (a real DataFusion

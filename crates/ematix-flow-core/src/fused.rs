@@ -25,9 +25,7 @@
 use std::any::Any;
 use std::sync::Arc;
 
-use datafusion::arrow::array::{
-    Array, ArrayRef, Date32Array, Float64Array, RecordBatch,
-};
+use datafusion::arrow::array::{Array, ArrayRef, Date32Array, Float64Array, RecordBatch};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::common::{DataFusionError, Result as DfResult};
 use datafusion::execution::TaskContext;
@@ -35,8 +33,7 @@ use datafusion::physical_expr::{EquivalenceProperties, Partitioning};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties,
-    SendableRecordBatchStream,
+    DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
 };
 use futures_util::stream::{self, TryStreamExt};
 
@@ -82,10 +79,7 @@ impl FusedFilterSumExec {
     /// Build a Q6-shaped fused exec over `input`. Validates that the child
     /// schema contains the four required columns by name with the expected
     /// types. Output schema is one column, `revenue: Float64`.
-    pub fn try_new_q6(
-        input: Arc<dyn ExecutionPlan>,
-        predicate: Q6Predicate,
-    ) -> DfResult<Self> {
+    pub fn try_new_q6(input: Arc<dyn ExecutionPlan>, predicate: Q6Predicate) -> DfResult<Self> {
         Self::validate_input_schema(&input.schema())?;
         let schema = Arc::new(Schema::new(vec![Field::new(
             "revenue",
@@ -132,11 +126,7 @@ impl FusedFilterSumExec {
 }
 
 impl DisplayAs for FusedFilterSumExec {
-    fn fmt_as(
-        &self,
-        _t: DisplayFormatType,
-        f: &mut std::fmt::Formatter,
-    ) -> std::fmt::Result {
+    fn fmt_as(&self, _t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         let p = &self.predicate;
         write!(
             f,
@@ -168,9 +158,7 @@ impl ExecutionPlan for FusedFilterSumExec {
         mut children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
         let new_input = children.pop().ok_or_else(|| {
-            DataFusionError::Internal(
-                "FusedFilterSumExec requires exactly 1 child".into(),
-            )
+            DataFusionError::Internal("FusedFilterSumExec requires exactly 1 child".into())
         })?;
         Ok(Arc::new(Self::try_new_q6(new_input, self.predicate)?))
     }
@@ -303,12 +291,7 @@ fn run_fused_shard(batches: &[RecordBatch], p: Q6Predicate, idx: ColumnIndices) 
             let s = ship_v[i];
             let d = disc_v[i];
             let q = qty_v[i];
-            if s >= p.date_lo
-                && s < p.date_hi
-                && d >= p.disc_lo
-                && d <= p.disc_hi
-                && q < p.qty_hi
-            {
+            if s >= p.date_lo && s < p.date_hi && d >= p.disc_lo && d <= p.disc_hi && q < p.qty_hi {
                 sum += price_v[i] * d;
             }
         }
