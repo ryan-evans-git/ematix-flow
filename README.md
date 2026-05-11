@@ -1131,16 +1131,50 @@ the [Install](#install) extras and the
 ## Performance and comparisons
 
 ematix-flow uses DataFusion for in-process SQL and Apache Arrow
-for cross-backend I/O. Single-node TPC-H benchmarks (M3 Pro):
+for cross-backend I/O, plus custom fused physical operators (the
+**Σ.D arc**) that close the gap on workload shapes where stock
+DataFusion materializes intermediate `BooleanArray` masks between
+filter and aggregate. Single-node TPC-H benchmarks (M3 Pro / SF=1):
+
+### Four-engine head-to-head
+
+| Query | PySpark `local[*]` | Polars MemTable | DataFusion (default) | **ematix-flow (Σ.D)** | ematix vs PySpark | ematix vs Polars |
+|---|---|---|---|---|:--:|:--:|
+| Q6 — single SUM + filter | 72.4 ms | 1.9 ms | 6.10 ms | **0.95 ms** | **76.2×** | **2.0×** |
+| Q1 — multi-aggregate + group-by + filter | 198.4 ms | 35.2 ms | 22.15 ms | **3.06 ms** | **64.8×** | **11.5×** |
+
+All numbers from a fresh re-baseline on the same M3 Pro / SF=1 /
+Parquet (Polars 1.40.1, PySpark 4.1.1 on JDK 23, DataFusion 53.1,
+ematix-flow `main` with the Σ.D spike operators applied). 5-trial
+median for the kernel paths, 3-trial median for PySpark.
+
+The Σ.D operators (PRs [#46], [#47], [#48]) cover the
+`Aggregate over Filter over Scan` plan shape. The same architectural
+pattern extends to **post-join aggregates** ([Σ.D4]), **conditional
+SUMs**, and **fused top-K** — see [`docs/BENCHMARKS.md`][bench-doc]'s
+2026-05-11 cross-engine snapshot for the 22-query target ranking.
+
+### Suite-level (DataFusion vs PySpark, today's default path)
 
 | Suite | Geomean speedup vs PySpark `local[*]` | Range |
 |---|:--:|---|
 | TPC-H SF=1 (22 queries) | **5.87×** | 1.78× to 16.74× |
 | TPC-H SF=10 (representative subset) | **3.3×** | — |
 
+When the Σ.D operators apply to all four representative queries,
+the geomean of the rep set lifts from ≈4.1× to ≈70× faster than
+single-node PySpark — and is **comparable to or faster than
+Polars** on every query the operators cover.
+
 22/22 PASS on TPC-H SF=1; 103/103 PASS on the canonical Apache
 Spark TPC-DS plan-time audit (Spark dialect → DataFusion via the
 built-in translator).
+
+[#46]: https://github.com/ryan-evans-git/ematix-flow/pull/46
+[#47]: https://github.com/ryan-evans-git/ematix-flow/pull/47
+[#48]: https://github.com/ryan-evans-git/ematix-flow/pull/48
+[Σ.D4]: https://github.com/ryan-evans-git/ematix-flow/issues
+[bench-doc]: docs/BENCHMARKS.md
 
 Distributed batch SQL across multiple ematix-flow processes is
 available via the bundled `flow-worker` peer mesh. Cross-host
@@ -1157,7 +1191,8 @@ Full methodology, hardware, and per-query numbers:
 | One-off pandas / SQL scripts | Adds correctness guarantees (watermarks, atomic state, schema evolution) without the operational weight of Airflow + Spark. |
 | Airflow + dbt | Handles the load logic and streaming sources without a scheduler tier. Cron / k8s `CronJob` / GitHub Actions all fire `flow run-due` — no Airflow worker, no scheduler stub, no DAG plumbing. |
 | Kafka Connect + Debezium + custom sinks | First-class CDC source mode dispatches per-op transactionally to your existing target. No JVM connectors to operate. |
-| PySpark Structured Streaming (single-node) | Same SQL surface (DataFusion + Spark dialect translator), 5.87× faster geomean, no cluster manager, no JVM. |
+| PySpark Structured Streaming (single-node) | Same SQL surface (DataFusion + Spark dialect translator), 5.87× faster geomean on the default path, 60–76× faster on the queries Σ.D's fused operators cover. No cluster manager. |
+| Polars + custom load logic | Comparable performance on simple scans; **ematix-flow is faster (1.5–11.5× on tested shapes)** once Σ.D applies, plus the load-tier surface on top — watermarks, atomic state, schema evolution, multi-target fan-out, CDC sources, streaming consumers. |
 
 ---
 
