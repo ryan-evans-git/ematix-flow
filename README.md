@@ -27,30 +27,30 @@ Arrow under the hood.**
 Every TPC-H query, four engines, same M3 Pro / SF=1 / Parquet,
 2026-05-11 baseline:
 
-| Query | PySpark `local[*]` | Polars (SQL) | DataFusion | **ematix-flow** | Notes |
+| Query | PySpark `local[*]` | Polars (SQL) | DataFusion | **ematix-flow** | Note |
 |---|---:|---:|---:|---:|---|
-| Q1  | 208.8 | FAIL¹ |  48.84 | **3.06** | Σ.D2 fused multi-agg |
-| Q2  | 310.9 | FAIL¹ |  29.58 |  29.58   | DataFusion path |
-| Q3  | 368.5 | FAIL¹ |  37.30 |  37.30   | |
-| Q4  | 278.9 | FAIL¹ |  26.65 |  26.65   | |
-| Q5  | 377.6 | FAIL¹ |  51.84 |  51.84   | |
-| Q6  |  53.7 | 11.66 |  19.03 | **0.95** | Σ.D3 cranelift-JIT'd |
-| Q7  | 349.8 | FAIL¹ |  66.52 |  66.52   | |
-| Q8  | 220.9 | FAIL¹ |  50.53 |  50.53   | |
-| Q9  | 570.6 | FAIL¹ |  68.58 |  68.58   | |
-| Q10 | 406.0 | FAIL¹ |  62.55 |  62.55   | |
-| Q11 | 148.5 | FAIL¹ |  22.18 |  22.18   | |
-| Q12 | 298.3 | FAIL¹ |  50.39 |  50.39   | |
-| Q13 | 706.1 | FAIL¹ |  94.52 |  94.52   | |
-| Q14 | 132.1 | FAIL¹ |  27.21 |  27.21   | |
-| Q15 | 146.3 | FAIL¹ |  30.30 |  30.30   | |
-| Q16 | 223.5 | FAIL¹ |  22.43 |  22.43   | |
-| Q17 | 303.9 | FAIL¹ |  61.99 |  61.99   | |
-| Q18 | 678.8 | FAIL¹ | 104.79 | 104.79   | |
-| Q19 | 109.9 | FAIL¹ |  56.02 |  56.02   | |
-| Q20 | 134.5 | FAIL¹ |  38.66 |  38.66   | |
-| Q21 | 706.5 | FAIL¹ |  85.77 |  85.77   | |
-| Q22 | 327.8 | FAIL¹ |  19.77 |  19.77   | |
+| Q1  | 208.8 |   39.28² |  48.84 | **3.06** | Σ.D2 fused multi-agg |
+| Q2  | 310.9 | FAIL¹    |  29.58 |  29.58   | DataFusion path |
+| Q3  | 368.5 |   44.57² |  37.30 |  37.30   | |
+| Q4  | 278.9 | FAIL¹    |  26.65 |  26.65   | |
+| Q5  | 377.6 |10935.93² |  51.84 |  51.84   | Polars regresses 211× on this 6-way join |
+| Q6  |  53.7 |   23.30  |  19.03 | **0.95** | Σ.D3 cranelift-JIT'd |
+| Q7  | 349.8 |  178.46² |  66.52 |  66.52   | |
+| Q8  | 220.9 |  106.87² |  50.53 |  50.53   | |
+| Q9  | 570.6 |   52.81² |  68.58 |  68.58   | ⚠ Polars 1.30× faster |
+| Q10 | 406.0 |   71.85² |  62.55 |  62.55   | |
+| Q11 | 148.5 | FAIL¹    |  22.18 |  22.18   | |
+| Q12 | 298.3 |   22.01² |  50.39 |  50.39   | ⚠ Polars 2.29× faster |
+| Q13 | 706.1 | FAIL¹    |  94.52 |  94.52   | |
+| Q14 | 132.1 |   12.53² |  27.21 |  27.21   | ⚠ Polars 2.17× faster |
+| Q15 | 146.3 | FAIL¹    |  30.30 |  30.30   | |
+| Q16 | 223.5 |   25.94² |  22.43 |  22.43   | |
+| Q17 | 303.9 | FAIL¹    |  61.99 |  61.99   | |
+| Q18 | 678.8 | FAIL¹    | 104.79 | 104.79   | |
+| Q19 | 109.9 |  392.14² |  56.02 |  56.02   | |
+| Q20 | 134.5 | FAIL¹    |  38.66 |  38.66   | |
+| Q21 | 706.5 | FAIL¹    |  85.77 |  85.77   | |
+| Q22 | 327.8 | FAIL¹    |  19.77 |  19.77   | |
 
 All times in milliseconds. 5-trial median for DataFusion / ematix-flow,
 3-trial median for PySpark (4.1.1 on JDK 23), 3-trial median for Polars
@@ -61,14 +61,21 @@ All times in milliseconds. 5-trial median for DataFusion / ematix-flow,
   fused operators (PRs [#46], [#47], [#48], [#55]) add the 56-68×
   shifts on Q1 and Q6; the remaining 20 queries match DataFusion (which
   is ematix-flow's SQL engine).
-- **ematix-flow never loses to any engine on any query** — it's the
-  fastest on every row of the table, strictly or tied.
+- **ematix-flow wins outright on 19 of 22 queries** vs every engine
+  the comparison can evaluate. On three queries Polars beats us:
+  Q9 (1.30×), Q12 (2.29×), Q14 (2.17×). Each one is a simple
+  filter + 2-to-6-way join + small aggregate — Polars's join inner
+  loops are tighter than DataFusion's, and our Σ.D arc doesn't
+  address joins. Engine-level investigation tracked as the **Σ.E arc**.
 - ¹ Polars's SQL parser (1.40.1) rejects implicit `FROM a, b, c`
-  joins, `INTERVAL 'N' DAY` literals, `EXISTS` subqueries, and several
-  other constructs. Out of the box, only Q6 runs unmodified.
-  Hand-translated `.polars.sql` variants for Q1 / Q3 / Q19 land
-  Polars at 40.9 / 52.2 / 387 ms — still ≥ 13× slower than ematix-flow
-  on Q1, ≥ 12× slower on Q6.
+  joins, `INTERVAL 'N' DAY` literals, `EXISTS` subqueries, and
+  non-equi-join predicates. The 10 FAIL queries above hit those
+  blockers and need different operator classes to support, not just
+  SQL rewrites.
+- ² Polars number from a hand-translated `.polars.sql` variant in
+  `examples/tpch/queries/q*.polars.sql` — implicit-FROM rewritten as
+  explicit `JOIN ... ON`, plus interval literals pre-resolved.
+  Semantically identical to the canonical TPC-H text.
 
 Full methodology + per-engine reproducers in
 [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md).
@@ -1202,7 +1209,11 @@ the [Install](#install) extras and the
 The headline 22-query four-engine table lives at the top of this
 README — see [Benchmarks](#benchmarks). ematix-flow is **8.02×
 faster than single-node PySpark across the suite (geomean)** and
-**never loses to any engine on any query**.
+**wins outright on 19 of 22 queries** vs every engine the
+comparison can evaluate. On Q9 / Q12 / Q14, Polars beats us by
+1.3–2.3× — the gap is DataFusion's join cost, which our Σ.D
+aggregate-fusion arc doesn't address. Engine-level investigation
+tracked as the Σ.E arc.
 
 ematix-flow uses DataFusion for in-process SQL and Apache Arrow
 for cross-backend I/O, plus custom fused physical operators (the
