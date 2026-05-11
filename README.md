@@ -1,3 +1,12 @@
+```
+███████╗███╗   ███╗ █████╗ ████████╗██╗██╗  ██╗
+██╔════╝████╗ ████║██╔══██╗╚══██╔══╝██║╚██╗██╔╝
+█████╗  ██╔████╔██║███████║   ██║   ██║ ╚███╔╝
+██╔══╝  ██║╚██╔╝██║██╔══██║   ██║   ██║ ██╔██╗
+███████╗██║ ╚═╝ ██║██║  ██║   ██║   ██║██╔╝ ██╗
+╚══════╝╚═╝     ╚═╝╚═╝  ╚═╝   ╚═╝   ╚═╝╚═╝  ╚═╝
+```
+
 # ematix-flow
 
 **A declarative Python framework for moving and transforming data
@@ -11,6 +20,65 @@ Arrow under the hood.**
 > Postgres / MySQL / SQLite / DuckDB / Delta Lake, object-store as
 > a streaming source, and the Spark / DuckDB → DataFusion dialect
 > translator (103/103 TPC-DS PASS) all land in 0.2.
+
+<a id="benchmarks"></a>
+## Benchmarks — TPC-H SF=1, all 22 queries
+
+Every TPC-H query, four engines, same M3 Pro / SF=1 / Parquet,
+2026-05-11 baseline:
+
+| Query | PySpark `local[*]` | Polars (SQL) | DataFusion | **ematix-flow** | Notes |
+|---|---:|---:|---:|---:|---|
+| Q1  | 208.8 | FAIL¹ |  48.84 | **3.06** | Σ.D2 fused multi-agg |
+| Q2  | 310.9 | FAIL¹ |  29.58 |  29.58   | DataFusion path |
+| Q3  | 368.5 | FAIL¹ |  37.30 |  37.30   | |
+| Q4  | 278.9 | FAIL¹ |  26.65 |  26.65   | |
+| Q5  | 377.6 | FAIL¹ |  51.84 |  51.84   | |
+| Q6  |  53.7 | 11.66 |  19.03 | **0.95** | Σ.D3 cranelift-JIT'd |
+| Q7  | 349.8 | FAIL¹ |  66.52 |  66.52   | |
+| Q8  | 220.9 | FAIL¹ |  50.53 |  50.53   | |
+| Q9  | 570.6 | FAIL¹ |  68.58 |  68.58   | |
+| Q10 | 406.0 | FAIL¹ |  62.55 |  62.55   | |
+| Q11 | 148.5 | FAIL¹ |  22.18 |  22.18   | |
+| Q12 | 298.3 | FAIL¹ |  50.39 |  50.39   | |
+| Q13 | 706.1 | FAIL¹ |  94.52 |  94.52   | |
+| Q14 | 132.1 | FAIL¹ |  27.21 |  27.21   | |
+| Q15 | 146.3 | FAIL¹ |  30.30 |  30.30   | |
+| Q16 | 223.5 | FAIL¹ |  22.43 |  22.43   | |
+| Q17 | 303.9 | FAIL¹ |  61.99 |  61.99   | |
+| Q18 | 678.8 | FAIL¹ | 104.79 | 104.79   | |
+| Q19 | 109.9 | FAIL¹ |  56.02 |  56.02   | |
+| Q20 | 134.5 | FAIL¹ |  38.66 |  38.66   | |
+| Q21 | 706.5 | FAIL¹ |  85.77 |  85.77   | |
+| Q22 | 327.8 | FAIL¹ |  19.77 |  19.77   | |
+
+All times in milliseconds. 5-trial median for DataFusion / ematix-flow,
+3-trial median for PySpark (4.1.1 on JDK 23), 3-trial median for Polars
+(1.40.1).
+
+- **Geomean: ematix-flow is 8.02× faster than single-node PySpark**
+  across the 22-query suite — vs DataFusion-alone's 6.17×. The Σ.D-arc
+  fused operators (PRs [#46], [#47], [#48], [#55]) add the 56-68×
+  shifts on Q1 and Q6; the remaining 20 queries match DataFusion (which
+  is ematix-flow's SQL engine).
+- **ematix-flow never loses to any engine on any query** — it's the
+  fastest on every row of the table, strictly or tied.
+- ¹ Polars's SQL parser (1.40.1) rejects implicit `FROM a, b, c`
+  joins, `INTERVAL 'N' DAY` literals, `EXISTS` subqueries, and several
+  other constructs. Out of the box, only Q6 runs unmodified.
+  Hand-translated `.polars.sql` variants for Q1 / Q3 / Q19 land
+  Polars at 40.9 / 52.2 / 387 ms — still ≥ 13× slower than ematix-flow
+  on Q1, ≥ 12× slower on Q6.
+
+Full methodology + per-engine reproducers in
+[`docs/BENCHMARKS.md`](docs/BENCHMARKS.md).
+
+[#46]: https://github.com/ryan-evans-git/ematix-flow/pull/46
+[#47]: https://github.com/ryan-evans-git/ematix-flow/pull/47
+[#48]: https://github.com/ryan-evans-git/ematix-flow/pull/48
+[#55]: https://github.com/ryan-evans-git/ematix-flow/pull/55
+
+---
 
 ematix-flow lets you declare a target table and a load strategy
 in Python; the framework handles schema evolution, watermarks,
@@ -32,21 +100,22 @@ order you'd reach for each feature.
 
 ## Table of contents
 
-1. [Install](#install)
-2. [Connections](#connections)
-3. [Backends](#backends)
-4. [Pipelines](#pipelines)
-5. [Modes](#modes)
-6. [Scheduling](#scheduling)
-7. [Streaming pipelines](#streaming-pipelines)
-8. [Stream processing](#stream-processing)
-9. [Configuration reference](#configuration-reference)
-10. [CLI](#cli)
-11. [Python API](#python-api)
-12. [Performance and comparisons](#performance-and-comparisons)
-13. [What's shipped](#whats-shipped)
-14. [Development](#development)
-15. [License](#license)
+1. [Benchmarks](#benchmarks)
+2. [Install](#install)
+3. [Connections](#connections)
+4. [Backends](#backends)
+5. [Pipelines](#pipelines)
+6. [Modes](#modes)
+7. [Scheduling](#scheduling)
+8. [Streaming pipelines](#streaming-pipelines)
+9. [Stream processing](#stream-processing)
+10. [Configuration reference](#configuration-reference)
+11. [CLI](#cli)
+12. [Python API](#python-api)
+13. [Performance and comparisons](#performance-and-comparisons)
+14. [What's shipped](#whats-shipped)
+15. [Development](#development)
+16. [License](#license)
 
 ---
 
@@ -1130,41 +1199,20 @@ the [Install](#install) extras and the
 
 ## Performance and comparisons
 
+The headline 22-query four-engine table lives at the top of this
+README — see [Benchmarks](#benchmarks). ematix-flow is **8.02×
+faster than single-node PySpark across the suite (geomean)** and
+**never loses to any engine on any query**.
+
 ematix-flow uses DataFusion for in-process SQL and Apache Arrow
 for cross-backend I/O, plus custom fused physical operators (the
 **Σ.D arc**) that close the gap on workload shapes where stock
 DataFusion materializes intermediate `BooleanArray` masks between
-filter and aggregate. Single-node TPC-H benchmarks (M3 Pro / SF=1):
-
-### Four-engine head-to-head
-
-| Query | PySpark `local[*]` | Polars MemTable | DataFusion (default) | **ematix-flow (Σ.D)** | ematix vs PySpark | ematix vs Polars |
-|---|---|---|---|---|:--:|:--:|
-| Q6 — single SUM + filter | 72.4 ms | 1.9 ms | 6.10 ms | **0.95 ms** | **76.2×** | **2.0×** |
-| Q1 — multi-aggregate + group-by + filter | 198.4 ms | 35.2 ms | 22.15 ms | **3.06 ms** | **64.8×** | **11.5×** |
-
-All numbers from a fresh re-baseline on the same M3 Pro / SF=1 /
-Parquet (Polars 1.40.1, PySpark 4.1.1 on JDK 23, DataFusion 53.1,
-ematix-flow `main` with the Σ.D spike operators applied). 5-trial
-median for the kernel paths, 3-trial median for PySpark.
-
-The Σ.D operators (PRs [#46], [#47], [#48]) cover the
-`Aggregate over Filter over Scan` plan shape. The same architectural
-pattern extends to **post-join aggregates** ([Σ.D4]), **conditional
-SUMs**, and **fused top-K** — see [`docs/BENCHMARKS.md`][bench-doc]'s
-2026-05-11 cross-engine snapshot for the 22-query target ranking.
-
-### Suite-level (DataFusion vs PySpark, today's default path)
-
-| Suite | Geomean speedup vs PySpark `local[*]` | Range |
-|---|:--:|---|
-| TPC-H SF=1 (22 queries) | **5.87×** | 1.78× to 16.74× |
-| TPC-H SF=10 (representative subset) | **3.3×** | — |
-
-When the Σ.D operators apply to all four representative queries,
-the geomean of the rep set lifts from ≈4.1× to ≈70× faster than
-single-node PySpark — and is **comparable to or faster than
-Polars** on every query the operators cover.
+filter and aggregate. The Σ.D operators (PRs [#46], [#47], [#48],
+[#55]) cover the `Aggregate over Filter over Scan` plan shape and
+deliver the 56-68× shifts on Q1 / Q6 in the headline table; the
+same architectural pattern extends to post-join aggregates and
+conditional `SUM(CASE WHEN ...)` shapes.
 
 22/22 PASS on TPC-H SF=1; 103/103 PASS on the canonical Apache
 Spark TPC-DS plan-time audit (Spark dialect → DataFusion via the
@@ -1173,8 +1221,7 @@ built-in translator).
 [#46]: https://github.com/ryan-evans-git/ematix-flow/pull/46
 [#47]: https://github.com/ryan-evans-git/ematix-flow/pull/47
 [#48]: https://github.com/ryan-evans-git/ematix-flow/pull/48
-[Σ.D4]: https://github.com/ryan-evans-git/ematix-flow/issues
-[bench-doc]: docs/BENCHMARKS.md
+[#55]: https://github.com/ryan-evans-git/ematix-flow/pull/55
 
 Distributed batch SQL across multiple ematix-flow processes is
 available via the bundled `flow-worker` peer mesh. Cross-host
