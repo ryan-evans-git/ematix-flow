@@ -1155,19 +1155,33 @@ Spark TPC-DS plan-time audit (Spark dialect → DataFusion via the
 built-in translator).
 
 **vs Polars** (closest peer — Rust under Python, in-process,
-vectorized — same M3 Pro / SF=1 / Parquet / .sql files; Polars
-1.40.1):
+vectorized — same M3 Pro / SF=1 / Parquet; Polars 1.40.1; 5-trial
+median after warm-up):
 
-| Query | DataFusion | Polars | Winner |
+| Query | DataFusion | Polars | Result |
 |---|---|---|---|
-| Q1 | 48.7 ms | **FAIL** (`INTERVAL` literal not accepted) | DataFusion |
-| Q3 | 34.6 ms | 46.8 ms | **DataFusion 1.35×** |
-| Q6 | 18.2 ms | 10.0 ms | **Polars 1.82×** (tight scan + sum) |
-| Q19 | 38.0 ms | 366.3 ms | **DataFusion 9.6×** (3-clause OR over a 2-way join) |
+| Q1 | 48.7 ms | 40.9 ms | Polars 1.19× — requires interval-literal rewrite for Polars's SQL parser |
+| Q3 | 34.6 ms | 52.2 ms | **DataFusion 1.51×** — requires explicit-JOIN rewrite for Polars's SQL parser |
+| Q6 | 17.6 ms | 10.7 ms | Polars 1.65× (tight fused filter-+-sum loop) — engine investigation open |
+| Q19 | 38.0 ms | 387.1 ms | **DataFusion 10.2×** — Polars's optimizer can't simplify the 3-clause OR over a 2-way join |
 
-DataFusion wins on suite coverage and complex-query robustness;
-Polars wins the simple scan-aggregate shapes. Both stay an order
-of magnitude ahead of single-node PySpark.
+Two honest takeaways:
+
+- DataFusion wins complex-query robustness (Q19's 10× swing is
+  representative; Polars's SQL surface is also stricter — three
+  of the four queries need a `.polars.sql` variant to parse).
+- Polars wins the simple scan-aggregate shape (Q6). DataFusion's
+  aggregate compute is already sub-millisecond; Polars's edge is
+  a fused filter-+-sum inner loop. A DataFusion-level kernel
+  fusion for that shape is an open investigation — see
+  [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) for the operator
+  breakdown.
+
+Both engines stay an order of magnitude ahead of single-node
+PySpark on every query. The case for ematix-flow vs Polars isn't
+raw scan speed — it's the load-tier surface on top (watermarks,
+atomic state, schema evolution, multi-target fan-out, CDC sources,
+streaming consumers).
 
 Distributed batch SQL across multiple ematix-flow processes is
 available via the bundled `flow-worker` peer mesh. Cross-host
