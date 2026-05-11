@@ -16,7 +16,6 @@
 //! Requires `examples/tpch/data/sf1/lineitem.parquet`.
 
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::time::Instant;
 
 use datafusion::arrow::array::{Array, Date32Array, Float64Array, RecordBatch};

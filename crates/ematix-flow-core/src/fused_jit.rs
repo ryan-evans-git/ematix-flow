@@ -8,7 +8,7 @@
 //! via cranelift-jit.
 //!
 //! The strategy: at plan-time the operator translates its `FusedPredicate`
-//! + aggregate spec into cranelift IR — comparisons unrolled inline, no
+//! and aggregate spec into cranelift IR — comparisons unrolled inline, no
 //! BooleanArray materialization, no per-row dispatch — then JITs to a
 //! function pointer. The execute-time hot loop is exactly the same shape
 //! as the hand-written Σ.D1 / Σ.D2 inner loops, just generated for the
@@ -78,7 +78,8 @@ impl Q6JitFn {
     ///   * `shipdate ∈ [1994-01-01=8766, 1995-01-01=9131)`
     ///   * `discount ∈ [0.05, 0.07]`
     ///   * `quantity < 24.0`
-    /// and the canonical SUM input `extprice * discount`.
+    ///
+    /// And the canonical SUM input `extprice * discount`.
     ///
     /// Returns a wrapper holding the JIT module + function pointer.
     pub fn try_build_q6_canonical() -> Result<Self, String> {
@@ -311,6 +312,12 @@ impl Q6JitFn {
     }
 }
 
+// SAFETY: the JIT module holds a leaked CodegenContext but the
+// emitted function pointer only reads from the input slices passed
+// at call time and writes to an out param. No shared mutable state.
+unsafe impl Send for Q6JitFn {}
+unsafe impl Sync for Q6JitFn {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -406,6 +413,3 @@ mod tests {
         );
     }
 }
-
-unsafe impl Send for Q6JitFn {}
-unsafe impl Sync for Q6JitFn {}
