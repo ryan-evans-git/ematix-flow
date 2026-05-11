@@ -1154,6 +1154,21 @@ for cross-backend I/O. Single-node TPC-H benchmarks (M3 Pro):
 Spark TPC-DS plan-time audit (Spark dialect → DataFusion via the
 built-in translator).
 
+**vs Polars** (closest peer — Rust under Python, in-process,
+vectorized — same M3 Pro / SF=1 / Parquet / .sql files; Polars
+1.40.1):
+
+| Query | DataFusion | Polars | Winner |
+|---|---|---|---|
+| Q1 | 48.7 ms | **FAIL** (`INTERVAL` literal not accepted) | DataFusion |
+| Q3 | 34.6 ms | 46.8 ms | **DataFusion 1.35×** |
+| Q6 | 18.2 ms | 10.0 ms | **Polars 1.82×** (tight scan + sum) |
+| Q19 | 38.0 ms | 366.3 ms | **DataFusion 9.6×** (3-clause OR over a 2-way join) |
+
+DataFusion wins on suite coverage and complex-query robustness;
+Polars wins the simple scan-aggregate shapes. Both stay an order
+of magnitude ahead of single-node PySpark.
+
 Distributed batch SQL across multiple ematix-flow processes is
 available via the bundled `flow-worker` peer mesh. Cross-host
 scaling claims are honestly framed as deferred — there's no
@@ -1168,8 +1183,9 @@ Full methodology, hardware, and per-query numbers:
 |---|---|
 | One-off pandas / SQL scripts | Adds correctness guarantees (watermarks, atomic state, schema evolution) without the operational weight of Airflow + Spark. |
 | Airflow + dbt | Handles the load logic and streaming sources without a scheduler tier. Cron / k8s `CronJob` / GitHub Actions all fire `flow run-due` — no Airflow worker, no scheduler stub, no DAG plumbing. |
-| Kafka Connect + Debezium + custom sinks | First-class CDC source mode dispatches per-op transactionally to your existing target. No JVM connectors to operate. |
-| PySpark Structured Streaming (single-node) | Same SQL surface (DataFusion + Spark dialect translator), 5.87× faster geomean, no cluster manager, no JVM. |
+| Kafka Connect + Debezium + custom sinks | First-class CDC source mode dispatches per-op transactionally to your existing target. No separate connector tier to operate. |
+| PySpark Structured Streaming (single-node) | Same SQL surface (DataFusion + Spark dialect translator), 5.87× faster geomean, no cluster manager. |
+| Polars `read_*` + custom load logic | Comparable per-query performance on shared workloads; ematix-flow adds the load tier on top — watermarks, atomic state, schema evolution, multi-target fan-out, CDC sources, streaming. |
 
 ---
 
