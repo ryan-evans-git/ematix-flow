@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Startup banner** on long-running CLI commands. `flow run`,
+  `flow consume`, and `flow run-due` now print an ANSI-shadow
+  "EMATIX" block-letter banner with version + tagline to **stderr**
+  on launch. JSON results on stdout are unaffected, so existing
+  `flow run … | jq` pipelines keep working. Suppressed by default
+  on non-TTY streams (CI logs, captured subprocesses); honors
+  `EMATIX_FLOW_NO_BANNER=1` to silence even on a TTY and
+  `EMATIX_FLOW_BANNER=1` to force on. Quick read-only subcommands
+  (`list`, `validate`, `preview`, `connections …`) stay quiet.
+
 ## [0.2.1] — 2026-05-10
 
 Sdist-publish fix. **No functional code changes** — wheels remain
