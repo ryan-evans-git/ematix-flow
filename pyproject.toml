@@ -5,7 +5,7 @@ build-backend = "maturin"
 [project]
 name = "ematix-flow"
 version = "0.2.1"
-description = "Move data between databases, files, and streams from Python. 5.87× faster than PySpark. No JVM needed."
+description = "Move data between databases, files, and streams from Python. Rust + Apache Arrow under the hood; 5.87× faster than single-node PySpark on TPC-H SF=1."
 readme = "README.md"
 requires-python = ">=3.10"
 # PEP 639 license metadata. The previous `license = { text = ... }`

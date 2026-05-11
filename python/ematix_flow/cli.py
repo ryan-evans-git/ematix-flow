@@ -23,6 +23,7 @@ from typing import Any
 
 from ematix_flow import config
 from ematix_flow import pipeline as p
+from ematix_flow._banner import print_banner
 
 
 def _parse_iso(s: str) -> datetime:
@@ -88,6 +89,7 @@ def _cmd_transform_run(args: argparse.Namespace) -> int:
 
 
 def _cmd_run(args: argparse.Namespace) -> int:
+    print_banner()
     _import_user_module(args.module)
     try:
         result = p.run_pipeline(args.name)
@@ -110,6 +112,7 @@ def _cmd_consume(args: argparse.Namespace) -> int:
     """
     from ematix_flow import streaming
 
+    print_banner()
     _import_user_module(args.module)
     try:
         toml = streaming.render_streaming_pipeline_toml(args.name)
@@ -138,6 +141,7 @@ def _cmd_consume_list(args: argparse.Namespace) -> int:
 
 
 def _cmd_run_due(args: argparse.Namespace) -> int:
+    print_banner()
     _import_user_module(args.module)
     now = _parse_iso(args.now) if args.now else datetime.now(UTC)
     if now.tzinfo is None:
