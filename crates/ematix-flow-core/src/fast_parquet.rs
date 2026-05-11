@@ -41,7 +41,8 @@ use async_trait::async_trait;
 use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::catalog::{Session, TableProvider};
-use datafusion::common::{DataFusionError, Result as DfResult};
+use datafusion::common::stats::Precision;
+use datafusion::common::{DataFusionError, Result as DfResult, Statistics};
 use datafusion::datasource::TableType;
 use datafusion::execution::TaskContext;
 use datafusion::logical_expr::Expr;
@@ -60,14 +61,17 @@ use futures_util::stream::{self};
 const DEFAULT_BATCH_SIZE: usize = 65_536;
 
 /// `TableProvider` over a single parquet file. Construction reads the
-/// file footer once to cache the Arrow schema and the row-group count;
-/// `scan()` returns a [`FastParquetExec`] whose partition count equals
-/// the number of row groups.
+/// file footer once to cache the Arrow schema, row-group count, and
+/// total row count; `scan()` returns a [`FastParquetExec`] whose
+/// partition count is `target_partitions` from the session config
+/// (which lets DataFusion match it to its hash-join parallelism
+/// without inserting a `RoundRobinBatch` repartition on top).
 #[derive(Debug, Clone)]
 pub struct FastParquetTableProvider {
     path: String,
     schema: SchemaRef,
     num_row_groups: usize,
+    num_rows: usize,
     parquet_schema: Arc<SchemaDescriptor>,
 }
 
@@ -87,12 +91,18 @@ impl FastParquetTableProvider {
             )
         })?;
         let schema = builder.schema().clone();
-        let num_row_groups = builder.metadata().num_row_groups();
+        let meta = builder.metadata();
+        let num_row_groups = meta.num_row_groups();
+        // num_rows is a global property of the file; parquet metadata
+        // exposes it as i64. Saturating-cast in case (a corrupt file
+        // could declare a negative count; we treat that as zero).
+        let num_rows = meta.file_metadata().num_rows().max(0) as usize;
         let parquet_schema: Arc<SchemaDescriptor> = builder.parquet_schema().clone().into();
         Ok(Self {
             path,
             schema,
             num_row_groups,
+            num_rows,
             parquet_schema,
         })
     }
@@ -102,10 +112,17 @@ impl FastParquetTableProvider {
         &self.path
     }
 
-    /// Number of row groups in the parquet file (= number of output
-    /// partitions when no projection prunes empty row groups).
+    /// Number of row groups in the parquet file. We round-robin these
+    /// across `target_partitions` worker partitions at scan time.
     pub fn num_row_groups(&self) -> usize {
         self.num_row_groups
+    }
+
+    /// Total rows across all row groups, as declared in the parquet
+    /// footer. Exposed via [`ExecutionPlan::statistics`] so the planner
+    /// can size hash tables and pick join build sides correctly.
+    pub fn num_rows(&self) -> usize {
+        self.num_rows
     }
 }
 
@@ -125,7 +142,7 @@ impl TableProvider for FastParquetTableProvider {
 
     async fn scan(
         &self,
-        _state: &dyn Session,
+        state: &dyn Session,
         projection: Option<&Vec<usize>>,
         _filters: &[Expr],
         _limit: Option<usize>,
@@ -146,28 +163,58 @@ impl TableProvider for FastParquetTableProvider {
         let projected_schema: SchemaRef =
             Arc::new(datafusion::arrow::datatypes::Schema::new(projected_fields));
 
+        // Partition count = min(num_row_groups, target_partitions).
+        //
+        // Why not `target_partitions` directly: when a parquet file
+        // has fewer row groups than CPUs (e.g. SF=1 lineitem has 6
+        // row groups; M3 Pro has 14 cores), reporting 14 partitions
+        // means 8 are empty. parquet-rs row-group readers can't be
+        // sub-divided cheaply, so the work is unbalanced — measured
+        // as a catastrophic regression in the day-5 bench (Q01 went
+        // from +8% to -48% just from this change).
+        //
+        // Why not `num_row_groups` directly (v1): if the file has
+        // more row groups than CPUs, we'd over-shard.
+        //
+        // The downside: when num_row_groups < target_partitions,
+        // DataFusion still adds a RoundRobinBatch above us. v3 work
+        // can split row groups into byte ranges to remove that.
+        let target_partitions = state.config().options().execution.target_partitions;
+        let num_partitions = self.num_row_groups.min(target_partitions).max(1);
+
+        // partition i gets row groups {i, i+N, i+2N, …} ∩ [0, num_row_groups).
+        let mut assignments: Vec<Vec<usize>> = vec![Vec::new(); num_partitions];
+        for rg in 0..self.num_row_groups {
+            assignments[rg % num_partitions].push(rg);
+        }
+
         let exec = FastParquetExec::try_new(
             self.path.clone(),
             projected_schema,
             projected_indices,
-            self.num_row_groups,
+            assignments,
+            self.num_rows,
             self.parquet_schema.clone(),
         )?;
         Ok(Arc::new(exec))
     }
 }
 
-/// `ExecutionPlan` over a parquet file with `num_row_groups` partitions.
-/// Each partition decodes exactly one row group, single-threaded, at
-/// `batch_size = 65_536`. The planner picks up the partitioning from
-/// `PlanProperties` and (because we report a fixed partition count)
-/// will not wrap us in a `RepartitionExec`.
+/// `ExecutionPlan` over a parquet file. Each output partition handles
+/// a (possibly empty) list of row groups; partitions read at
+/// `batch_size = 65_536`. Partition count is set at scan time to
+/// match `target_partitions` so DataFusion's planner doesn't need to
+/// add a `RoundRobinBatch` repartition on top.
 #[derive(Debug)]
 pub struct FastParquetExec {
     path: String,
     schema: SchemaRef,
     projection: Vec<usize>,
-    num_row_groups: usize,
+    /// For partition `i`, `assignments[i]` lists which parquet row
+    /// groups it reads. Empty assignments produce empty streams.
+    assignments: Vec<Vec<usize>>,
+    /// Total row count across the file (from parquet metadata).
+    num_rows: usize,
     parquet_schema: Arc<SchemaDescriptor>,
     properties: Arc<PlanProperties>,
 }
@@ -177,13 +224,14 @@ impl FastParquetExec {
         path: String,
         schema: SchemaRef,
         projection: Vec<usize>,
-        num_row_groups: usize,
+        assignments: Vec<Vec<usize>>,
+        num_rows: usize,
         parquet_schema: Arc<SchemaDescriptor>,
     ) -> DfResult<Self> {
         let eq_props = EquivalenceProperties::new(schema.clone());
         let properties = Arc::new(PlanProperties::new(
             eq_props,
-            Partitioning::UnknownPartitioning(num_row_groups.max(1)),
+            Partitioning::UnknownPartitioning(assignments.len().max(1)),
             EmissionType::Incremental,
             Boundedness::Bounded,
         ));
@@ -191,7 +239,8 @@ impl FastParquetExec {
             path,
             schema,
             projection,
-            num_row_groups,
+            assignments,
+            num_rows,
             parquet_schema,
             properties,
         })
@@ -200,10 +249,14 @@ impl FastParquetExec {
 
 impl DisplayAs for FastParquetExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        let total_rgs: usize = self.assignments.iter().map(|a| a.len()).sum();
         write!(
             f,
-            "FastParquetExec(path={}, row_groups={}, projection={:?})",
-            self.path, self.num_row_groups, self.projection,
+            "FastParquetExec(path={}, partitions={}, row_groups={}, projection={:?})",
+            self.path,
+            self.assignments.len(),
+            total_rgs,
+            self.projection,
         )
     }
 }
@@ -237,34 +290,70 @@ impl ExecutionPlan for FastParquetExec {
         partition: usize,
         _context: Arc<TaskContext>,
     ) -> DfResult<SendableRecordBatchStream> {
-        if partition >= self.num_row_groups {
-            return Err(DataFusionError::Internal(format!(
-                "FastParquetExec: partition {partition} out of range (num_row_groups={})",
-                self.num_row_groups
-            )));
-        }
+        let row_groups = self.assignments.get(partition).ok_or_else(|| {
+            DataFusionError::Internal(format!(
+                "FastParquetExec: partition {partition} out of range (num_partitions={})",
+                self.assignments.len()
+            ))
+        })?;
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             self.schema.clone(),
             build_partition_stream(
                 self.path.clone(),
                 self.projection.clone(),
                 self.parquet_schema.clone(),
-                partition,
+                row_groups.clone(),
             ),
         )))
     }
+
+    fn partition_statistics(&self, partition: Option<usize>) -> DfResult<Statistics> {
+        // Expose `num_rows` from parquet metadata so the planner can
+        // pick the right join build side. Without this, Q12's planner
+        // picked a 1.5M-row build side instead of the 30K-row
+        // post-filter lineitem build side (EXPLAIN-diagnosed
+        // regression — see commit message of `feat(Σ.E2): v1`).
+        //
+        // Column-level statistics (min/max/null_count) would unlock
+        // row-group pruning; that's the next v2 step.
+        let mut stats = Statistics::new_unknown(&self.schema);
+        let n = match partition {
+            None => self.num_rows,
+            // Per-partition exact row count requires summing the
+            // row group row counts in this partition's assignment.
+            // For now, approximate via the global row count / num
+            // partitions — exact per-partition is a v2 follow-up.
+            Some(i) => {
+                if i >= self.assignments.len() {
+                    return Err(DataFusionError::Internal(format!(
+                        "FastParquetExec::partition_statistics: partition {i} out of range"
+                    )));
+                }
+                let denom = self.assignments.len().max(1);
+                self.num_rows / denom
+            }
+        };
+        stats.num_rows = Precision::Exact(n);
+        Ok(stats)
+    }
 }
 
-/// Build the per-partition stream that decodes one row group on a
-/// blocking worker and yields its RecordBatches one at a time.
+/// Build the per-partition stream that decodes a list of row groups
+/// on a blocking worker and yields RecordBatches one at a time. An
+/// empty `row_groups` list produces an empty stream — needed because
+/// we now report `target_partitions` partitions, which may exceed
+/// `num_row_groups` for small files.
 fn build_partition_stream(
     path: String,
     projection: Vec<usize>,
     parquet_schema: Arc<SchemaDescriptor>,
-    row_group: usize,
+    row_groups: Vec<usize>,
 ) -> impl futures_util::Stream<Item = DfResult<RecordBatch>> + Send + 'static {
     use futures_util::StreamExt;
     let fut = async move {
+        if row_groups.is_empty() {
+            return Ok(Vec::new());
+        }
         tokio::task::spawn_blocking(move || -> DfResult<Vec<RecordBatch>> {
             let file = File::open(&path).map_err(|e| {
                 DataFusionError::External(
@@ -277,7 +366,7 @@ fn build_partition_stream(
             let mask = ProjectionMask::leaves(&parquet_schema, projection.iter().copied());
             let reader = builder
                 .with_projection(mask)
-                .with_row_groups(vec![row_group])
+                .with_row_groups(row_groups)
                 .with_batch_size(DEFAULT_BATCH_SIZE)
                 .build()
                 .map_err(|e| {
@@ -347,22 +436,34 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn scan_returns_one_partition_per_row_group() {
+    async fn scan_partition_count_is_min_of_rgs_and_target() {
         let Some(path) = lineitem_parquet() else {
             eprintln!("TPC-H SF=1 data not generated; skipping test");
             return;
         };
-        use datafusion::prelude::SessionContext;
-        let ctx = SessionContext::new();
+        use datafusion::prelude::{SessionConfig, SessionContext};
         let prov = FastParquetTableProvider::try_new(path).unwrap();
+
+        // Case 1: target=4, num_row_groups=6 → partitions=4 (target wins).
+        let ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(4));
         let state = ctx.state();
         let exec = prov.scan(&state, None, &[], None).await.unwrap();
-        assert_eq!(
-            exec.properties().partitioning.partition_count(),
-            6,
-            "one partition per row group"
-        );
-        assert_eq!(exec.schema().fields().len(), 16);
+        assert_eq!(exec.properties().partitioning.partition_count(), 4);
+
+        // Case 2: target=32, num_row_groups=6 → partitions=6 (RGs wins).
+        let ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(32));
+        let state = ctx.state();
+        let exec = prov.scan(&state, None, &[], None).await.unwrap();
+        assert_eq!(exec.properties().partitioning.partition_count(), 6);
+
+        // Statistics propagation: SF=1 lineitem = 6,001,215 rows.
+        let stats = exec.partition_statistics(None).unwrap();
+        match stats.num_rows {
+            datafusion::common::stats::Precision::Exact(n) => {
+                assert_eq!(n, 6_001_215, "exact row count from parquet metadata")
+            }
+            _ => panic!("expected Exact num_rows from FastParquetExec"),
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]
