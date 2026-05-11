@@ -42,26 +42,10 @@ fn extract_ptrs(b: &RecordBatch) -> BatchPtrs {
     // Column order matches the projection in `make_memtable_ctx` from
     // `tpch_q6_tune.rs`: 0=quantity, 1=extendedprice, 2=discount,
     // 3=shipdate.
-    let qty = b
-        .column(0)
-        .as_any()
-        .downcast_ref::<Float64Array>()
-        .unwrap();
-    let price = b
-        .column(1)
-        .as_any()
-        .downcast_ref::<Float64Array>()
-        .unwrap();
-    let disc = b
-        .column(2)
-        .as_any()
-        .downcast_ref::<Float64Array>()
-        .unwrap();
-    let ship = b
-        .column(3)
-        .as_any()
-        .downcast_ref::<Date32Array>()
-        .unwrap();
+    let qty = b.column(0).as_any().downcast_ref::<Float64Array>().unwrap();
+    let price = b.column(1).as_any().downcast_ref::<Float64Array>().unwrap();
+    let disc = b.column(2).as_any().downcast_ref::<Float64Array>().unwrap();
+    let ship = b.column(3).as_any().downcast_ref::<Date32Array>().unwrap();
     BatchPtrs {
         n: b.num_rows() as i64,
         shipdate: ship.values().as_ptr(),
@@ -77,7 +61,9 @@ fn run_jit_single_thread(jit: &Q6JitFn, ptrs: &[BatchPtrs]) -> f64 {
         // SAFETY: ptrs reference the underlying Arrow buffers held in
         // `batches`, which outlive this call.
         unsafe {
-            jit.run(p.n, p.shipdate, p.discount, p.quantity, p.extprice, &mut sum);
+            jit.run(
+                p.n, p.shipdate, p.discount, p.quantity, p.extprice, &mut sum,
+            );
         }
     }
     sum
@@ -196,7 +182,5 @@ async fn main() {
         "  Σ.D3 JIT, {ncpu}-thread                                       median {:>6.2} ms  (min {:>5.2}  max {:>5.2})",
         times[2], times[0], times[4],
     );
-    println!(
-        "  (sanity: revenue ≈ {warm:.4} — canonical Q6 SF=1 ≈ 123141078.2283)"
-    );
+    println!("  (sanity: revenue ≈ {warm:.4} — canonical Q6 SF=1 ≈ 123141078.2283)");
 }

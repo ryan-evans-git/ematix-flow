@@ -110,8 +110,8 @@ impl Q6JitFn {
             .set("opt_level", "speed")
             .map_err(|e| format!("flag opt_level: {e}"))?;
         let flags = settings::Flags::new(flag_builder);
-        let isa_builder = cranelift_native::builder()
-            .map_err(|e| format!("cranelift_native::builder: {e}"))?;
+        let isa_builder =
+            cranelift_native::builder().map_err(|e| format!("cranelift_native::builder: {e}"))?;
         let isa = isa_builder
             .finish(flags)
             .map_err(|e| format!("isa.finish: {e}"))?;
@@ -192,7 +192,9 @@ impl Q6JitFn {
         // ship >= date_lo  AND  ship < date_hi
         let lo_imm = builder.ins().iconst(types::I32, date_lo as i64);
         let hi_imm = builder.ins().iconst(types::I32, date_hi as i64);
-        let ge_lo = builder.ins().icmp(IntCC::SignedGreaterThanOrEqual, ship_v, lo_imm);
+        let ge_lo = builder
+            .ins()
+            .icmp(IntCC::SignedGreaterThanOrEqual, ship_v, lo_imm);
         let lt_hi = builder.ins().icmp(IntCC::SignedLessThan, ship_v, hi_imm);
         let pass_date = builder.ins().band(ge_lo, lt_hi);
 
@@ -324,8 +326,8 @@ mod tests {
         let quantity: Vec<f64> = vec![10.0, 10.0, 10.0, 10.0, 10.0, 24.0];
         let extprice: Vec<f64> = vec![100.0, 100.0, 100.0, 100.0, 100.0, 100.0];
 
-        let jit = Q6JitFn::try_build_q6_canonical()
-            .expect("Q6 JIT build should succeed on this host");
+        let jit =
+            Q6JitFn::try_build_q6_canonical().expect("Q6 JIT build should succeed on this host");
 
         let mut running: f64 = 0.0;
         // SAFETY: pointers backed by stack-owned Vec<T>, all len >= n.
