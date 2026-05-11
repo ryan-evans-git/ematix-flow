@@ -12,6 +12,13 @@ pub mod delta_backend;
 // than SQL surfaces.
 pub mod dialect;
 pub mod duckdb_backend;
+// Σ.D2: `FusedFilterMultiAggExec` — single-pass fused filter +
+// multi-aggregate + group-by physical operator. Day-1 prototype
+// (`examples/tpch_q1_tune.rs`) showed 3.08 ms on Q1 SF=1 / 14
+// threads vs DataFusion's 25.61 ms MemTable / 47.65 ms parquet
+// (15.5× faster) and Polars MemTable 35.2 ms (11.4× faster).
+// See `fused_multi_agg.rs` header and issue #45.
+pub mod fused_multi_agg;
 pub mod hash;
 pub mod join;
 pub mod kafka_backend;
