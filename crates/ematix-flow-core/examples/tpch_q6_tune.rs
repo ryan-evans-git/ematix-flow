@@ -470,7 +470,7 @@ async fn main() {
             .unwrap()
             .value(0);
         assert!(
-            (revenue - 123_141_078.2283).abs() < 1e-3,
+            (revenue - 123_141_078.228_3).abs() < 1e-3,
             "FusedFilterSumExec returned wrong revenue: {revenue}",
         );
     }
