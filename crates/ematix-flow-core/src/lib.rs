@@ -12,6 +12,13 @@ pub mod delta_backend;
 // than SQL surfaces.
 pub mod dialect;
 pub mod duckdb_backend;
+// Σ.D3: cranelift-JIT'd inner loop for the unified fused-aggregate
+// operator. See `fused_jit.rs` header and issue #45. Day-1 scaffold:
+// JIT'd Q6 predicate evaluator that hits the same kernel shape as
+// Σ.D1's hard-coded operator from a data-driven input. The full
+// generic IR emitter (any predicate AST, any agg spec, any group-by
+// shape) builds on this scaffold.
+pub mod fused_jit;
 pub mod hash;
 pub mod join;
 pub mod kafka_backend;
