@@ -343,17 +343,23 @@ impl TableProvider for FastParquetTableProvider {
         // Why not `target_partitions` directly: when a parquet file
         // has fewer row groups than CPUs (e.g. SF=1 lineitem has 6
         // row groups; M3 Pro has 14 cores), reporting 14 partitions
-        // means 8 are empty. parquet-rs row-group readers can't be
-        // sub-divided cheaply, so the work is unbalanced — measured
-        // as a catastrophic regression in the day-5 bench (Q01 went
-        // from +8% to -48% just from this change).
+        // means 8 are empty. Re-tested 2026-05-12 under current state
+        // (v4-streaming + mimalloc + Utf8View): even with the
+        // RoundRobinBatch shim that DataFusion inserts above us, the
+        // `min()` policy wins net. Reporting target_partitions
+        // directly improved Q14 SF=1 marginally (19→18 ms) but
+        // regressed Q15 SF=10 by 21 ppts and several SF=1 wins lost
+        // 5–10 ms each, because the planner over-schedules downstream
+        // work for the empty partitions (hash probe imbalance).
         //
         // Why not `num_row_groups` directly (v1): if the file has
         // more row groups than CPUs, we'd over-shard.
         //
-        // The downside: when num_row_groups < target_partitions,
-        // DataFusion still adds a RoundRobinBatch above us. v3 work
-        // can split row groups into byte ranges to remove that.
+        // The acknowledged downside: when num_row_groups < target
+        // _partitions, DataFusion still adds a RoundRobinBatch above
+        // us. Q14 SF=1 EXPLAIN ANALYZE shows it visible in the plan;
+        // it's only a few ms of fetch_time on small files and the
+        // alternative (empty partitions) was worse.
         let target_partitions = state.config().options().execution.target_partitions;
         let num_partitions = self.num_row_groups.min(target_partitions).max(1);
 
