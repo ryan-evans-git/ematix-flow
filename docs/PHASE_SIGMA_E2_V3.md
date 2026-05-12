@@ -38,48 +38,80 @@ expose value early.
 
 ### v3.1 — Static-predicate pushdown skeleton
 
-Goal: prove the `gather_filters_for_pushdown` wiring works.
-Translator handles `Column = Literal` for primitive types only.
+**Status (2026-05-12): scaffolding only, absorption disabled.**
+
+Goal was: prove the `gather_filters_for_pushdown` wiring works, with
+a tiny translator that handles `Column = Literal` for primitive types
+applied post-decode via `filter_record_batch`.
+
+Wiring landed cleanly and the plan-shape test passed (filters got
+absorbed, `FilterExec` removed). The perf result is what changed the
+plan: bench regressed from 14w/3l/1.10× to 13w/7l/1.04× even with
+narrow acceptance, and to 8w/11l/1.01× at smaller batches. EXPLAIN
+ANALYZE audit on Q01 localized the cost:
+
+- DataFusion's `FilterExec` is heavily pipelined and batch-size tuned
+  for downstream operators (hash aggregator, sort, etc).
+- Absorbing filters into `FastParquetExec`'s `spawn_blocking` decode
+  loop forces serialized decode→filter on the same thread, inflating
+  `RepartitionExec.fetch_time` 2.5× (270ms → 672ms on Q01).
+- 65K-row decode batches (our parquet sweet spot) make the downstream
+  hash aggregator's `time_calculating_group_ids` 3.5× slower vs the
+  8192-row batches DataFusion is tuned for. 8192 helps that, but
+  kills decode throughput on its own.
+
+**Lesson:** post-decode evaluation is the wrong primitive. The win
+shape requires either filtering *during* parquet decode (so we never
+materialize pruned rows and don't disturb downstream batch sizing) or
+*before* decode via row-group statistics pruning (where we skip work
+outright). The handful of queries v3.1 helped (Q12, Q18) were ones
+where DataFusion's own pipeline was already cold; the net was a
+regression.
+
+Where v3.1 lives now (kept as scaffolding for v3.2):
+
+- `FastParquetExec.pushdown_filters: Vec<Arc<dyn PhysicalExpr>>` field.
+- `handle_child_pushdown_result` override that *would* absorb filters
+  via `filter_is_supported`.
+- `filter_is_supported` returns `false` unconditionally as of v3.1.
+  v3.2 flips it to a real shape check.
+- `build_partition_stream` already takes `pushdown_filters` and would
+  apply them via `filter_record_batch` if any were stored.
+
+Tests:
+- `pushdown_count_correctness_string_eq` — passes (FilterExec carries).
+- `pushdown_count_correctness_int_eq` — passes (FilterExec carries).
+- `pushdown_unsupported_falls_back_correctly` — passes (LIKE rejected,
+  FilterExec applies).
+- `pushdown_plan_eliminates_filter_exec` — `#[ignore]`'d with a
+  pointer back to this doc. Re-engages as v3.2's first failing test.
+
+### v3.2 — Real decode-time pushdown via parquet-rs `with_row_filter`
+
+**Now scoped as the first shippable v3 PR.** v3.1's lesson absorbed:
+this PR is what makes pushdown net-positive, by ensuring the filter
+runs at decode time (no materialized pruned rows) instead of after.
 
 Scope:
-- Implement `gather_filters_for_pushdown` returning incoming filters
-  as `SupportsExact` for shapes we can handle, `Unsupported` otherwise.
-- Implement `handle_child_pushdown_result` to absorb supported
-  filters (so the planner removes the `FilterExec`).
-- Mini translator: `BinaryExpr(Column = Literal)` where the column
-  is a primitive type → parquet-rs `ArrowPredicate` via
-  `RowFilter::new`.
-- Apply via `ParquetRecordBatchReaderBuilder::with_row_filter`.
+- Re-engage `filter_is_supported` with the narrow `BinaryExpr(Column,
+  cmp, Literal)` shape from v3.1's experiment.
+- Translate accepted filters to parquet-rs `ArrowPredicate` via
+  `ArrowPredicateFn::new(projection_mask_for_predicate_cols, evaluator)`.
+- Pass via `ParquetRecordBatchReaderBuilder::with_row_filter`.
+- Handle the projection-vs-predicate-columns split: predicate may
+  reference a column not in the output projection (needs separate
+  projection mask + remapping the PhysicalExpr column indices).
+- Broaden translator to `and/or` combinations, `InListExpr`,
+  `BetweenExpr`. Decimal/Date literal coercion as needed for TPC-H.
 
 Failing tests (write first):
-- `pushdown_plan_eliminates_filter_exec` — `EXPLAIN SELECT ... WHERE l_shipmode = 'MAIL'`
-  on FastParquet should not contain `FilterExec` above the scan.
-- `pushdown_count_correctness` — `SELECT count(*) WHERE l_shipmode = 'MAIL'`
-  matches default DataFusion result.
-- `pushdown_unsupported_falls_back` — a shape we don't handle yet
-  (e.g. `l_shipmode LIKE 'M%'`) still produces correct results
-  (FilterExec stays).
+- `pushdown_plan_eliminates_filter_exec` — un-ignore the v3.1 test.
+- Q12 static filter perf: bench-style test that asserts FastParquet
+  on Q12 is now within 20% of default DataFusion (currently -36%).
+- Q14 static filter correctness against default.
+- Q19 static filter (complex OR-of-ANDs) correctness.
 
-Effort: ~1 week.
-
-### v3.2 — Full PhysicalExpr → ArrowPredicate translator
-
-Goal: cover the predicate shapes TPC-H actually uses.
-
-Scope:
-- `eq/lt/gt/lteq/gteq/not_eq/and/or` `BinaryExpr` combinations
-- `InListExpr` for small literal sets
-- `BetweenExpr`
-- Decimal coercion (TPC-H prices are `Decimal128(15,2)`)
-- Date literal coercion (`Date32`)
-- Utf8 / LargeUtf8 equality (deferred from v2b)
-
-Failing tests:
-- Q12 static filter shape: `l_shipmode IN ('MAIL','SHIP') AND l_receiptdate >= '1994-01-01' AND l_receiptdate < '1995-01-01'` correctness + plan shape.
-- Q14 static: `l_shipdate >= ... AND l_shipdate < ...`.
-- Q19 static: complex `(brand AND ship AND quantity) OR (brand AND ship AND quantity) OR ...`.
-
-Effort: ~1-2 weeks.
+Effort: ~2 weeks (absorbing v3.1's scope).
 
 ### v3.3 — Row-group statistics pruning
 

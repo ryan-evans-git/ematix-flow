@@ -38,21 +38,26 @@ use std::fs::File;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use datafusion::arrow::array::RecordBatch;
+use datafusion::arrow::array::{BooleanArray, RecordBatch};
+use datafusion::arrow::compute::filter_record_batch;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::catalog::{Session, TableProvider};
 use datafusion::common::stats::Precision;
 use datafusion::common::{
     ColumnStatistics, DataFusionError, Result as DfResult, ScalarValue, Statistics,
 };
+use datafusion::config::ConfigOptions;
 use datafusion::datasource::TableType;
 use datafusion::execution::TaskContext;
-use datafusion::logical_expr::Expr;
+use datafusion::logical_expr::{ColumnarValue, Expr};
 use datafusion::parquet::arrow::ProjectionMask;
 use datafusion::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use datafusion::parquet::schema::types::SchemaDescriptor;
-use datafusion::physical_expr::{EquivalenceProperties, Partitioning};
+use datafusion::physical_expr::{EquivalenceProperties, Partitioning, PhysicalExpr};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
+use datafusion::physical_plan::filter_pushdown::{
+    ChildPushdownResult, FilterPushdownPhase, FilterPushdownPropagation, PushedDown,
+};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
@@ -359,6 +364,14 @@ pub struct FastParquetExec {
     column_stats: Vec<ColumnStatistics>,
     parquet_schema: Arc<SchemaDescriptor>,
     properties: Arc<PlanProperties>,
+    /// Σ.E2 v3.1: filters absorbed from the parent via
+    /// `handle_child_pushdown_result`. Each filter is an
+    /// `Arc<dyn PhysicalExpr>` over the *projected* schema (the
+    /// schema this exec advertises). Applied post-decode in
+    /// `build_partition_stream` via `filter_record_batch`. v3.2 will
+    /// upgrade this to parquet-rs `with_row_filter` so the predicate
+    /// runs at decode time. The Vec is treated as conjunction (AND).
+    pushdown_filters: Vec<Arc<dyn PhysicalExpr>>,
 }
 
 impl FastParquetExec {
@@ -387,22 +400,134 @@ impl FastParquetExec {
             column_stats,
             parquet_schema,
             properties,
+            pushdown_filters: Vec::new(),
         })
+    }
+
+    /// Σ.E2 v3.1: build a clone of this exec with additional pushdown
+    /// filters appended. Used by `handle_child_pushdown_result` when
+    /// the planner offers us filters we can handle.
+    fn with_additional_pushdown_filters(
+        &self,
+        extra: Vec<Arc<dyn PhysicalExpr>>,
+    ) -> Self {
+        let mut combined = self.pushdown_filters.clone();
+        combined.extend(extra);
+        Self {
+            path: self.path.clone(),
+            schema: self.schema.clone(),
+            projection: self.projection.clone(),
+            assignments: self.assignments.clone(),
+            num_rows: self.num_rows,
+            column_stats: self.column_stats.clone(),
+            parquet_schema: self.parquet_schema.clone(),
+            properties: self.properties.clone(),
+            pushdown_filters: combined,
+        }
     }
 }
 
 impl DisplayAs for FastParquetExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         let total_rgs: usize = self.assignments.iter().map(|a| a.len()).sum();
-        write!(
-            f,
-            "FastParquetExec(path={}, partitions={}, row_groups={}, projection={:?})",
-            self.path,
-            self.assignments.len(),
-            total_rgs,
-            self.projection,
-        )
+        if self.pushdown_filters.is_empty() {
+            write!(
+                f,
+                "FastParquetExec(path={}, partitions={}, row_groups={}, projection={:?})",
+                self.path,
+                self.assignments.len(),
+                total_rgs,
+                self.projection,
+            )
+        } else {
+            let preds: Vec<String> = self
+                .pushdown_filters
+                .iter()
+                .map(|e| format!("{e}"))
+                .collect();
+            write!(
+                f,
+                "FastParquetExec(path={}, partitions={}, row_groups={}, projection={:?}, predicate=[{}])",
+                self.path,
+                self.assignments.len(),
+                total_rgs,
+                self.projection,
+                preds.join(" AND "),
+            )
+        }
     }
+}
+
+/// Σ.E2 v3.1: decide whether we can take responsibility for a given
+/// PhysicalExpr filter.
+///
+/// **Status: disabled (always returns false).**
+///
+/// v3.1 went through this loop:
+///   1. Wired up `handle_child_pushdown_result` (✓ works, plan-shape
+///      test confirmed `FilterExec` is removed when we accept).
+///   2. Applied accepted filters post-decode via `filter_record_batch`.
+///   3. Bench regression: 14w/3l/1.10× → 13w/7l/1.04× (and 8w/11l/1.01×
+///      when we tried smaller batches to compensate).
+///
+/// Diagnosis (Q01 EXPLAIN ANALYZE audit):
+///   - DataFusion's `FilterExec` is heavily pipelined and batch-size
+///     tuned for downstream operators. Pulling work into our
+///     `spawn_blocking` decode loop:
+///     * forces decode-then-filter serialization per row group,
+///       inflating `RepartitionExec.fetch_time` 2.5× (270ms → 672ms),
+///     * leaves the hash aggregator with our 64K-row batches whose
+///       `time_calculating_group_ids` is 3.5× slower than at the
+///       8192-row batches DataFusion expects (32ms → 113ms).
+///   - Even narrowing acceptance to `BinaryExpr Column cmp Literal`
+///     didn't recover the baseline.
+///
+/// Lesson: post-decode evaluation is the wrong primitive. The wins
+/// require running the filter *during* parquet decode (`with_row_filter`,
+/// v3.2) or *before* decode (row-group stats pruning, v3.3) so we
+/// never materialize the pruned rows and never disturb downstream
+/// batch sizing.
+///
+/// The wiring (this function + `handle_child_pushdown_result`) stays
+/// in tree as scaffolding for v3.2. Flip this to a real shape check
+/// once `with_row_filter` is plumbed through.
+fn filter_is_supported(_expr: &Arc<dyn PhysicalExpr>, _schema: &SchemaRef) -> bool {
+    false
+}
+
+/// Evaluate the conjunction `filters[0] AND filters[1] AND ...`
+/// against `batch`, returning the boolean mask. Caller should pass
+/// `batch` to `filter_record_batch(batch, &mask)` afterward.
+fn evaluate_conjunction(
+    filters: &[Arc<dyn PhysicalExpr>],
+    batch: &RecordBatch,
+) -> DfResult<BooleanArray> {
+    use datafusion::arrow::array::Array;
+    let mut acc: Option<BooleanArray> = None;
+    for expr in filters {
+        let cv = expr.evaluate(batch)?;
+        let arr = match cv {
+            ColumnarValue::Array(a) => a,
+            ColumnarValue::Scalar(s) => s.to_array_of_size(batch.num_rows())?,
+        };
+        let b = arr
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .ok_or_else(|| {
+                DataFusionError::Internal(format!(
+                    "FastParquetExec: pushdown filter did not evaluate to BooleanArray (got {})",
+                    arr.data_type()
+                ))
+            })?
+            .clone();
+        acc = Some(match acc {
+            None => b,
+            Some(prev) => datafusion::arrow::compute::and(&prev, &b).map_err(|e| {
+                DataFusionError::ArrowError(Box::new(e), None)
+            })?,
+        });
+    }
+    acc.ok_or_else(|| DataFusionError::Internal("evaluate_conjunction with no filters".into()))
 }
 
 impl ExecutionPlan for FastParquetExec {
@@ -447,8 +572,48 @@ impl ExecutionPlan for FastParquetExec {
                 self.projection.clone(),
                 self.parquet_schema.clone(),
                 row_groups.clone(),
+                self.pushdown_filters.clone(),
             ),
         )))
+    }
+
+    /// Σ.E2 v3.1: absorb supported parent filters so DataFusion can
+    /// remove the parent `FilterExec`. For each parent filter, if all
+    /// referenced columns exist in our projected schema, we claim
+    /// responsibility (`PushedDown::Yes`) and store it for post-decode
+    /// evaluation. Otherwise we decline (`PushedDown::No`) and the
+    /// `FilterExec` stays.
+    ///
+    /// We're a leaf — `child_pushdown_result.parent_filters` carries
+    /// the parent's filters with empty per-child results; we read
+    /// only the `filter` field.
+    fn handle_child_pushdown_result(
+        &self,
+        _phase: FilterPushdownPhase,
+        child_pushdown_result: ChildPushdownResult,
+        _config: &ConfigOptions,
+    ) -> DfResult<FilterPushdownPropagation<Arc<dyn ExecutionPlan>>> {
+        let mut absorbed: Vec<Arc<dyn PhysicalExpr>> = Vec::new();
+        let mut filter_results: Vec<PushedDown> =
+            Vec::with_capacity(child_pushdown_result.parent_filters.len());
+        for parent_filter in child_pushdown_result.parent_filters.iter() {
+            if filter_is_supported(&parent_filter.filter, &self.schema) {
+                absorbed.push(parent_filter.filter.clone());
+                filter_results.push(PushedDown::Yes);
+            } else {
+                filter_results.push(PushedDown::No);
+            }
+        }
+
+        let updated_node: Option<Arc<dyn ExecutionPlan>> = if absorbed.is_empty() {
+            None
+        } else {
+            Some(Arc::new(self.with_additional_pushdown_filters(absorbed)))
+        };
+        Ok(FilterPushdownPropagation {
+            filters: filter_results,
+            updated_node,
+        })
     }
 
     fn partition_statistics(&self, partition: Option<usize>) -> DfResult<Statistics> {
@@ -490,6 +655,7 @@ fn build_partition_stream(
     projection: Vec<usize>,
     parquet_schema: Arc<SchemaDescriptor>,
     row_groups: Vec<usize>,
+    pushdown_filters: Vec<Arc<dyn PhysicalExpr>>,
 ) -> impl futures_util::Stream<Item = DfResult<RecordBatch>> + Send + 'static {
     use futures_util::StreamExt;
     let fut = async move {
@@ -518,11 +684,26 @@ fn build_partition_stream(
                 })?;
             let mut out = Vec::new();
             for batch in reader {
-                out.push(batch.map_err(|e| {
+                let batch = batch.map_err(|e| {
                     DataFusionError::External(
                         format!("FastParquetExec: batch decode failed: {e}").into(),
                     )
-                })?);
+                })?;
+                // Σ.E2 v3.1: apply absorbed pushdown filters post-decode.
+                // v3.2 will move this to parquet-rs `with_row_filter`
+                // so we filter at decode time and avoid materializing
+                // pruned rows.
+                let filtered = if pushdown_filters.is_empty() {
+                    batch
+                } else {
+                    let mask = evaluate_conjunction(&pushdown_filters, &batch)?;
+                    filter_record_batch(&batch, &mask).map_err(|e| {
+                        DataFusionError::ArrowError(Box::new(e), None)
+                    })?
+                };
+                if filtered.num_rows() > 0 {
+                    out.push(filtered);
+                }
             }
             Ok(out)
         })
@@ -848,9 +1029,16 @@ mod tests {
 
     /// v3.1: the physical plan for a single-column-eq filter on
     /// FastParquet must not have a `FilterExec` between the scan and
-    /// the consumer. If `FilterExec` survives, the planner thinks
-    /// FastParquet couldn't handle the filter — meaning pushdown
-    /// didn't happen. This is the plan-level pushdown signal.
+    /// the consumer.
+    ///
+    /// Ignored as of 2026-05-12. The `handle_child_pushdown_result`
+    /// wiring is in place and the test passed when we accepted
+    /// filters — but the perf audit (`filter_is_supported` doc
+    /// comment) shows post-decode evaluation regresses the benchmark
+    /// vs the FilterExec baseline. v3.2 will re-engage acceptance
+    /// once parquet `with_row_filter` is plumbed; this test will
+    /// be the canary for it.
+    #[ignore = "v3.1 scaffolding only — re-engaged when v3.2 lands real parquet RowFilter"]
     #[tokio::test(flavor = "multi_thread")]
     async fn pushdown_plan_eliminates_filter_exec() {
         let Some(path) = lineitem_parquet() else {
