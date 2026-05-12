@@ -34,8 +34,41 @@ const TPCH_TABLES: &[&str] = &[
     "region", "nation", "supplier", "customer", "part", "partsupp", "orders", "lineitem",
 ];
 
+/// Build a `SessionConfig` that — when `TPCH_BENCH_COLLECT_LEFT=1` is
+/// set — raises the broadcast-join thresholds so DataFusion's
+/// `JoinSelection` rule picks `PartitionMode::CollectLeft` for small
+/// builds. Σ.E2 follow-up probe: Q14 SF=1 sits at 18 ms with
+/// FastParquet but Polars does 12.5 ms; the EXPLAIN ANALYZE points at
+/// hash-repartitioning the 200 K-row `part` table on every probe. If
+/// CollectLeft closes the gap, that motivates either bumping the
+/// default thresholds or having FastParquetTableProvider hint stats
+/// that fall under the threshold.
+fn session_config() -> datafusion::prelude::SessionConfig {
+    use datafusion::prelude::SessionConfig;
+    let cfg = SessionConfig::new();
+    if std::env::var("TPCH_BENCH_COLLECT_LEFT").ok().as_deref() == Some("1") {
+        // Targeted threshold: high enough for Q14's `part` build
+        // (200 K rows / 1.27 MB encoded) to qualify for CollectLeft,
+        // but low enough that Q18's `orders` build (1.5 M rows /
+        // ~14 MB encoded) stays Partitioned. The earlier attempt with
+        // 10 M-row / 256 MB thresholds regressed Q18 by 2.5× because
+        // forcing every probe partition to read a 1.5 M-row build hash
+        // table dwarfed the savings on small builds.
+        cfg.set_str(
+            "datafusion.optimizer.hash_join_single_partition_threshold",
+            "8388608", // 8 MB
+        )
+        .set_str(
+            "datafusion.optimizer.hash_join_single_partition_threshold_rows",
+            "500000",
+        )
+    } else {
+        cfg
+    }
+}
+
 async fn make_ctx_default(parquet_dir: &str) -> SessionContext {
-    let ctx = SessionContext::new();
+    let ctx = SessionContext::new_with_config(session_config());
     for table in TPCH_TABLES {
         let path = format!("{parquet_dir}/{table}.parquet");
         ctx.register_parquet(*table, &path, Default::default())
@@ -46,7 +79,7 @@ async fn make_ctx_default(parquet_dir: &str) -> SessionContext {
 }
 
 async fn make_ctx_fast(parquet_dir: &str) -> SessionContext {
-    let ctx = SessionContext::new();
+    let ctx = SessionContext::new_with_config(session_config());
     for table in TPCH_TABLES {
         let path = format!("{parquet_dir}/{table}.parquet");
         let prov = FastParquetTableProvider::try_new(path).unwrap();
