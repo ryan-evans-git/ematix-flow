@@ -36,6 +36,13 @@ pub mod fused_multi_agg;
 // generic IR emitter (any predicate AST, any agg spec, any group-by
 // shape) builds on this scaffold.
 pub mod fused_jit;
+// Σ.D4 + Σ.D5: `FusedPostJoinExec` — single-pass fused aggregate
+// over the output of a join. Wraps the Q3/Q5/Q14 day-1 prototype
+// kernels (5-8× faster than DataFusion's per-aggregate dispatch on
+// the agg step; modest end-to-end shift because these queries are
+// JOIN-bound). Substrate for the future cranelift-JIT-generalized
+// operator. See `fused_post_join.rs` header and issues #51, #52.
+pub mod fused_post_join;
 pub mod hash;
 pub mod join;
 pub mod kafka_backend;
