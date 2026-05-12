@@ -57,7 +57,7 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
 };
-use futures_util::stream::{self};
+use futures_util::stream::StreamExt;
 
 /// Per-probe sweet spot — see `examples/parquet_rs_granular.rs`.
 const DEFAULT_BATCH_SIZE: usize = 65_536;
@@ -480,64 +480,101 @@ impl ExecutionPlan for FastParquetExec {
     }
 }
 
-/// Build the per-partition stream that decodes a list of row groups
-/// on a blocking worker and yields RecordBatches one at a time. An
-/// empty `row_groups` list produces an empty stream — needed because
-/// we now report `target_partitions` partitions, which may exceed
-/// `num_row_groups` for small files.
+/// Build the per-partition stream that decodes a list of row groups on
+/// a blocking worker and yields each `RecordBatch` as it decodes. An
+/// empty `row_groups` list produces an empty stream.
+///
+/// v4-streaming: prior impl returned a `Vec<RecordBatch>` from
+/// `spawn_blocking`, so the partition's downstream operators saw a
+/// burst-after-silence pattern. The Σ.E2 SF=10 audit showed this added
+/// 1.7–2.5× to downstream `RepartitionExec.fetch_time`. Switching to a
+/// bounded mpsc channel + `blocking_send` lets each batch flow as it
+/// emerges; the bounded buffer also gives natural backpressure when the
+/// consumer is slower than the decoder.
 fn build_partition_stream(
     path: String,
     projection: Vec<usize>,
     parquet_schema: Arc<SchemaDescriptor>,
     row_groups: Vec<usize>,
 ) -> impl futures_util::Stream<Item = DfResult<RecordBatch>> + Send + 'static {
-    use futures_util::StreamExt;
-    let fut = async move {
-        if row_groups.is_empty() {
-            return Ok(Vec::new());
-        }
-        tokio::task::spawn_blocking(move || -> DfResult<Vec<RecordBatch>> {
-            let file = File::open(&path).map_err(|e| {
-                DataFusionError::External(
-                    format!("FastParquetExec: open `{path}` failed: {e}").into(),
-                )
-            })?;
-            let builder = ParquetRecordBatchReaderBuilder::try_new(file).map_err(|e| {
-                DataFusionError::External(format!("FastParquetExec: builder failed: {e}").into())
-            })?;
-            let mask = ProjectionMask::leaves(&parquet_schema, projection.iter().copied());
-            let reader = builder
-                .with_projection(mask)
-                .with_row_groups(row_groups)
-                .with_batch_size(DEFAULT_BATCH_SIZE)
-                .build()
-                .map_err(|e| {
+    // Empty fast-path: don't spawn a worker just to do nothing.
+    if row_groups.is_empty() {
+        return futures_util::stream::iter(Vec::<DfResult<RecordBatch>>::new()).left_stream();
+    }
+
+    // Channel capacity bounds how far the decoder can run ahead of
+    // consumption. 8 = enough buffering to absorb downstream stutter
+    // (RepartitionExec batching, hash-table grow events) without
+    // starving the consumer, small enough to bound peak memory.
+    let (tx, rx) = tokio::sync::mpsc::channel::<DfResult<RecordBatch>>(8);
+
+    tokio::task::spawn_blocking(move || {
+        let send_err = |tx: &tokio::sync::mpsc::Sender<DfResult<RecordBatch>>, e: DataFusionError| {
+            let _ = tx.blocking_send(Err(e));
+        };
+
+        let file = match File::open(&path) {
+            Ok(f) => f,
+            Err(e) => {
+                send_err(
+                    &tx,
+                    DataFusionError::External(
+                        format!("FastParquetExec: open `{path}` failed: {e}").into(),
+                    ),
+                );
+                return;
+            }
+        };
+        let builder = match ParquetRecordBatchReaderBuilder::try_new(file) {
+            Ok(b) => b,
+            Err(e) => {
+                send_err(
+                    &tx,
+                    DataFusionError::External(
+                        format!("FastParquetExec: builder failed: {e}").into(),
+                    ),
+                );
+                return;
+            }
+        };
+        let mask = ProjectionMask::leaves(&parquet_schema, projection.iter().copied());
+        let reader = match builder
+            .with_projection(mask)
+            .with_row_groups(row_groups)
+            .with_batch_size(DEFAULT_BATCH_SIZE)
+            .build()
+        {
+            Ok(r) => r,
+            Err(e) => {
+                send_err(
+                    &tx,
                     DataFusionError::External(
                         format!("FastParquetExec: reader build failed: {e}").into(),
-                    )
-                })?;
-            let mut out = Vec::new();
-            for batch in reader {
-                out.push(batch.map_err(|e| {
-                    DataFusionError::External(
-                        format!("FastParquetExec: batch decode failed: {e}").into(),
-                    )
-                })?);
+                    ),
+                );
+                return;
             }
-            Ok(out)
-        })
-        .await
-        .map_err(|e| {
-            DataFusionError::Execution(format!("FastParquetExec: blocking join failed: {e}"))
-        })?
-    };
-    stream::once(fut).flat_map(|res| {
-        let items: Vec<DfResult<RecordBatch>> = match res {
-            Ok(v) => v.into_iter().map(Ok).collect(),
-            Err(e) => vec![Err(e)],
         };
-        futures_util::stream::iter(items)
+
+        for batch in reader {
+            let item = batch.map_err(|e| {
+                DataFusionError::External(
+                    format!("FastParquetExec: batch decode failed: {e}").into(),
+                )
+            });
+            // blocking_send returns Err only when the receiver dropped —
+            // the consumer doesn't want more data, so stop decoding.
+            if tx.blocking_send(item).is_err() {
+                return;
+            }
+        }
+    });
+
+    // Adapt `Receiver` to `Stream` without pulling in `tokio-stream`.
+    futures_util::stream::unfold(rx, |mut rx| async move {
+        rx.recv().await.map(|item| (item, rx))
     })
+    .right_stream()
 }
 
 #[cfg(test)]
@@ -697,6 +734,75 @@ mod tests {
         assert_eq!(total_rows, 5);
         assert_eq!(batches[0].num_columns(), 1);
         assert_eq!(batches[0].schema().field(0).name(), "l_orderkey");
+    }
+
+    /// v4-streaming: per-partition stream must yield batches incrementally
+    /// (one per parquet read), not as a single burst after all row groups
+    /// have decoded.
+    ///
+    /// Why: with the old `spawn_blocking → Vec<RecordBatch>` shape, the
+    /// downstream `FilterExec` / `RepartitionExec` sat idle until every
+    /// row group in the partition's assignment finished decoding, then
+    /// processed a burst. The Σ.E2 SF=10 EXPLAIN ANALYZE attributed
+    /// 1.7–2.5× of the loss-query slowdown to this head-of-line block
+    /// (e.g. Q10 lineitem `RepartitionExec.fetch_time` was 3.07s vs DF
+    /// default's 1.22s — 2.5× higher).
+    ///
+    /// The behavioral invariant: time-to-first-batch must be much smaller
+    /// than total-decode-time when a partition has many batches. We pin a
+    /// loose ratio (0.5) so the assertion is robust to host noise.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn build_partition_stream_yields_batches_incrementally() {
+        use std::time::Instant;
+        use futures_util::StreamExt;
+        use datafusion::execution::TaskContext;
+        use datafusion::prelude::{SessionConfig, SessionContext};
+
+        let Some(path) = lineitem_parquet() else {
+            eprintln!("TPC-H SF=1 data not generated; skipping test");
+            return;
+        };
+        // target_partitions=1 forces all 6 RGs into one partition, so
+        // a Vec-materializing impl waits for all of them before yielding.
+        let ctx =
+            SessionContext::new_with_config(SessionConfig::new().with_target_partitions(1));
+        let state = ctx.state();
+        let prov = FastParquetTableProvider::try_new(path).unwrap();
+        let exec = prov.scan(&state, None, &[], None).await.unwrap();
+        let task_ctx = Arc::new(TaskContext::default());
+        let mut stream = exec.execute(0, task_ctx).unwrap();
+
+        let start = Instant::now();
+        let _first = stream
+            .next()
+            .await
+            .expect("at least one batch from non-empty file")
+            .expect("first batch decodes ok");
+        let first_batch_time = start.elapsed();
+
+        let mut count = 1usize;
+        while let Some(b) = stream.next().await {
+            b.expect("batch decodes ok");
+            count += 1;
+        }
+        let total_time = start.elapsed();
+
+        // SF=1 lineitem = 6,001,215 rows / 65,536 batch_size ≈ 92 batches.
+        // Allow generous slack for batch-size rounding at RG boundaries.
+        assert!(
+            (50..=200).contains(&count),
+            "expected ~92 batches from SF=1 lineitem, got {count}"
+        );
+
+        // Streaming property: first batch must arrive well before the
+        // last one. A Vec-materializing impl would fail this with ratio
+        // ≈ 1.0; the streaming impl typically hits ratio < 0.1.
+        let ratio = first_batch_time.as_secs_f64() / total_time.as_secs_f64();
+        assert!(
+            ratio < 0.5,
+            "first batch took {first_batch_time:?} but full scan {total_time:?} \
+             (ratio={ratio:.3}) — partition stream is not yielding incrementally"
+        );
     }
 
     /// Q6 plan-level check. With `FastParquetTableProvider` the result

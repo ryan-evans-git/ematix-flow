@@ -67,13 +67,16 @@ async fn main() {
         .parent()
         .unwrap()
         .join("examples/tpch/queries");
-    let data_dir = manifest
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .join("examples/tpch/data/sf1");
-    let data_dir = data_dir.to_str().unwrap();
+    let data_dir_buf = match std::env::var("TPCH_DATA_DIR") {
+        Ok(s) => PathBuf::from(s),
+        Err(_) => manifest
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("examples/tpch/data/sf1"),
+    };
+    let data_dir = data_dir_buf.to_str().unwrap();
     println!("==> DataFusion default vs FastParquetTableProvider (Σ.E2)");
     println!("==> M3 Pro / SF=1 / 5-trial median");
     println!("==> data: {data_dir}");
