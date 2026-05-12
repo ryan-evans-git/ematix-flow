@@ -17,6 +17,20 @@ pub mod duckdb_backend;
 // See `fast_parquet.rs` for the day-2/day-3 probe results that
 // motivated this.
 pub mod fast_parquet;
+// Σ.D2: `FusedFilterMultiAggExec` — single-pass fused filter +
+// multi-aggregate + group-by physical operator. Day-1 prototype
+// (`examples/tpch_q1_tune.rs`) showed 3.08 ms on Q1 SF=1 / 14
+// threads vs DataFusion's 25.61 ms MemTable / 47.65 ms parquet
+// (15.5× faster) and Polars MemTable 35.2 ms (11.4× faster).
+// See `fused_multi_agg.rs` header and issue #45.
+pub mod fused_multi_agg;
+// Σ.D3: cranelift-JIT'd inner loop for the unified fused-aggregate
+// operator. See `fused_jit.rs` header and issue #45. Day-1 scaffold:
+// JIT'd Q6 predicate evaluator that hits the same kernel shape as
+// Σ.D1's hard-coded operator from a data-driven input. The full
+// generic IR emitter (any predicate AST, any agg spec, any group-by
+// shape) builds on this scaffold.
+pub mod fused_jit;
 pub mod hash;
 pub mod join;
 pub mod kafka_backend;
