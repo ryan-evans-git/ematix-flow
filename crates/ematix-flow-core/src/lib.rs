@@ -17,6 +17,11 @@ pub mod duckdb_backend;
 // See `fast_parquet.rs` for the day-2/day-3 probe results that
 // motivated this.
 pub mod fast_parquet;
+// Σ.D1: `FusedFilterSumExec` physical operator for the simple
+// `Aggregate(SUM) over Filter(predicate)` plan shape — closes the
+// Q6 gap vs Polars (1.0 ms hand-written / 1.9 ms Polars / 5.96 ms
+// today's DataFusion). See `fused.rs` header and issue #44.
+pub mod fused;
 // Σ.D2: `FusedFilterMultiAggExec` — single-pass fused filter +
 // multi-aggregate + group-by physical operator. Day-1 prototype
 // (`examples/tpch_q1_tune.rs`) showed 3.08 ms on Q1 SF=1 / 14
