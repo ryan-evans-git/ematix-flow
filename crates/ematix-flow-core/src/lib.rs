@@ -19,6 +19,13 @@ pub mod duckdb_backend;
 // (15.5× faster) and Polars MemTable 35.2 ms (11.4× faster).
 // See `fused_multi_agg.rs` header and issue #45.
 pub mod fused_multi_agg;
+// Σ.D3: cranelift-JIT'd inner loop for the unified fused-aggregate
+// operator. See `fused_jit.rs` header and issue #45. Day-1 scaffold:
+// JIT'd Q6 predicate evaluator that hits the same kernel shape as
+// Σ.D1's hard-coded operator from a data-driven input. The full
+// generic IR emitter (any predicate AST, any agg spec, any group-by
+// shape) builds on this scaffold.
+pub mod fused_jit;
 pub mod hash;
 pub mod join;
 pub mod kafka_backend;

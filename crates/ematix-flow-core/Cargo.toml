@@ -36,6 +36,12 @@ object_store = { workspace = true }
 parquet = { workspace = true }
 deltalake = { workspace = true }
 datafusion = { workspace = true }
+cranelift = { workspace = true }
+cranelift-codegen = { workspace = true }
+cranelift-frontend = { workspace = true }
+cranelift-jit = { workspace = true }
+cranelift-module = { workspace = true }
+cranelift-native = { workspace = true }
 url = { workspace = true }
 rdkafka = { workspace = true }
 # Direct dep so the resolver activates the `vendored` (via `plain`
