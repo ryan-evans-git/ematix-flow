@@ -21,6 +21,9 @@ use datafusion::arrow::array::{Array, AsArray, RecordBatch};
 use datafusion::prelude::SessionContext;
 use ematix_flow_core::fast_parquet::FastParquetTableProvider;
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 const TPCH_TABLES: &[&str] = &[
     "region", "nation", "supplier", "customer", "part", "partsupp", "orders", "lineitem",
 ];
