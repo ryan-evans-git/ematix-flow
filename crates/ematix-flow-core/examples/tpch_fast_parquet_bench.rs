@@ -67,15 +67,20 @@ async fn main() {
         .parent()
         .unwrap()
         .join("examples/tpch/queries");
-    let data_dir = manifest
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .join("examples/tpch/data/sf1");
+    // TPCH_DATA_DIR overrides the default `examples/tpch/data/sf1`.
+    // Set e.g. `TPCH_DATA_DIR=examples/tpch/data/sf10` to bench at SF=10.
+    let data_dir = match std::env::var("TPCH_DATA_DIR") {
+        Ok(s) => PathBuf::from(s),
+        Err(_) => manifest
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("examples/tpch/data/sf1"),
+    };
     let data_dir = data_dir.to_str().unwrap();
     println!("==> DataFusion default vs FastParquetTableProvider (Σ.E2)");
-    println!("==> M3 Pro / SF=1 / 5-trial median");
+    println!("==> M3 Pro / 5-trial median");
     println!("==> data: {data_dir}");
     println!();
     println!("| Query | DataFusion (ms) | FastParquet (ms) | Δ % | rows | notes |");
