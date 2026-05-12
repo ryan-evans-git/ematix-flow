@@ -133,3 +133,11 @@ path = "examples/tpch_q6_tune.rs"
 name = "tpcds_dialect_audit"
 path = "examples/tpcds_dialect_audit.rs"
 
+# Σ.E2 diagnostic: compare the in-memory Arrow array layout of the
+# first batch from DataFusion's default parquet path vs the
+# `FastParquetTableProvider`. Used to test whether Q01's persistent
+# downstream slowdown comes from differing array encodings.
+[[example]]
+name = "fast_parquet_array_diff"
+path = "examples/fast_parquet_array_diff.rs"
+

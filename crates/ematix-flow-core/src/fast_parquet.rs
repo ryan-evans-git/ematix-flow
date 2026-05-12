@@ -49,18 +49,56 @@ use datafusion::datasource::TableType;
 use datafusion::execution::TaskContext;
 use datafusion::logical_expr::Expr;
 use datafusion::parquet::arrow::ProjectionMask;
-use datafusion::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use datafusion::parquet::arrow::arrow_reader::{
+    ArrowReaderOptions, ParquetRecordBatchReaderBuilder,
+};
 use datafusion::parquet::schema::types::SchemaDescriptor;
 use datafusion::physical_expr::{EquivalenceProperties, Partitioning};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
+use datafusion::physical_plan::metrics::{
+    BaselineMetrics, Count, ExecutionPlanMetricsSet, MetricBuilder, MetricsSet, Time,
+};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
 };
 use futures_util::stream::StreamExt;
 
-/// Per-probe sweet spot — see `examples/parquet_rs_granular.rs`.
+/// Per-probe sweet spot — see `examples/parquet_rs_granular.rs`. The
+/// Σ.E2 follow-up batch-size sweep (8K/16K/32K/65K across SF=1 and
+/// SF=10) confirmed 65K is the right default: Q13 strongly prefers it
+/// (+27% vs +18% at 8K), Q19's small advantage at 8K became moot once
+/// the Utf8View root cause was fixed.
 const DEFAULT_BATCH_SIZE: usize = 65_536;
+
+/// Replace `Utf8`/`LargeUtf8`/`Binary`/`LargeBinary` fields with their
+/// `*View` equivalents, leaving everything else untouched. Σ.E2 root-
+/// cause fix for Q01 SF=10: DataFusion's default parquet reader emits
+/// `Utf8View` for string columns, which lets downstream FilterExec /
+/// AggregatePartial use SIMD-optimised kernels over the 16-byte inline
+/// view layout. parquet-rs's `with_schema` hint promotes types
+/// per-field (see parquet-58.1.0 src/arrow/schema/primitive.rs apply
+/// _hint), so all we need to do is hand it a schema where the strings
+/// are already declared as views.
+fn promote_to_view_types(
+    schema: &datafusion::arrow::datatypes::Schema,
+) -> datafusion::arrow::datatypes::Schema {
+    use datafusion::arrow::datatypes::{DataType, Field};
+    let promoted: Vec<Field> = schema
+        .fields()
+        .iter()
+        .map(|f| {
+            let new_type = match f.data_type() {
+                DataType::Utf8 | DataType::LargeUtf8 => DataType::Utf8View,
+                DataType::Binary | DataType::LargeBinary => DataType::BinaryView,
+                other => other.clone(),
+            };
+            Field::new(f.name(), new_type, f.is_nullable()).with_metadata(f.metadata().clone())
+        })
+        .collect();
+    datafusion::arrow::datatypes::Schema::new_with_metadata(promoted, schema.metadata().clone())
+}
+
 
 /// Aggregate per-row-group parquet statistics into a file-level
 /// `ColumnStatistics`. Returns one entry per Arrow field in `schema`,
@@ -219,7 +257,13 @@ impl FastParquetTableProvider {
                 format!("FastParquetTableProvider: parquet open failed: {e}").into(),
             )
         })?;
-        let schema = builder.schema().clone();
+        // Hand the planner (and downstream operators) a schema that
+        // declares string/binary columns as their `*View` form so kernel
+        // selection matches DataFusion's default parquet path. This
+        // schema is also passed to parquet-rs at read time via
+        // `ArrowReaderOptions::with_schema`, which actually emits
+        // StringViewArray/BinaryViewArray.
+        let schema: SchemaRef = Arc::new(promote_to_view_types(builder.schema()));
         let meta = builder.metadata();
         let num_row_groups = meta.num_row_groups();
         // num_rows is a global property of the file; parquet metadata
@@ -329,6 +373,7 @@ impl TableProvider for FastParquetTableProvider {
         let exec = FastParquetExec::try_new(
             self.path.clone(),
             projected_schema,
+            self.schema.clone(),
             projected_indices,
             assignments,
             self.num_rows,
@@ -348,6 +393,12 @@ impl TableProvider for FastParquetTableProvider {
 pub struct FastParquetExec {
     path: String,
     schema: SchemaRef,
+    /// Full (unprojected) promoted Arrow schema for the parquet file.
+    /// Threaded into `ArrowReaderOptions::with_schema` so parquet-rs
+    /// emits `Utf8View`/`BinaryView` arrays per the provider's schema
+    /// hint. parquet-rs requires `with_schema` to cover every parquet
+    /// column, not just the projected ones, so we keep the full schema.
+    full_schema: SchemaRef,
     projection: Vec<usize>,
     /// For partition `i`, `assignments[i]` lists which parquet row
     /// groups it reads. Empty assignments produce empty streams.
@@ -359,12 +410,21 @@ pub struct FastParquetExec {
     column_stats: Vec<ColumnStatistics>,
     parquet_schema: Arc<SchemaDescriptor>,
     properties: Arc<PlanProperties>,
+    /// Per-partition decode metrics. Σ.E2 follow-up: shipped initially
+    /// with `metrics=[]` which made Q01 SF=10 undiagnosable in EXPLAIN
+    /// ANALYZE — we couldn't see whether the gap was in file open,
+    /// row-group decode, or batch hand-off. Surface matches DataFusion's
+    /// `DataSourceExec`: `output_rows`, `elapsed_compute`, `output_batches`,
+    /// `bytes_scanned`, `time_elapsed_opening`, `time_elapsed_processing`.
+    metrics: ExecutionPlanMetricsSet,
 }
 
 impl FastParquetExec {
+    #[allow(clippy::too_many_arguments)]
     pub fn try_new(
         path: String,
         schema: SchemaRef,
+        full_schema: SchemaRef,
         projection: Vec<usize>,
         assignments: Vec<Vec<usize>>,
         num_rows: usize,
@@ -381,13 +441,45 @@ impl FastParquetExec {
         Ok(Self {
             path,
             schema,
+            full_schema,
             projection,
             assignments,
             num_rows,
             column_stats,
             parquet_schema,
             properties,
+            metrics: ExecutionPlanMetricsSet::new(),
         })
+    }
+}
+
+/// Per-partition handles into the shared `ExecutionPlanMetricsSet`.
+/// Constructed once per `execute()` call and threaded into the
+/// blocking decode worker + the consumer-side stream.
+struct PartitionMetrics {
+    baseline: BaselineMetrics,
+    output_batches: Count,
+    bytes_scanned: Count,
+    time_opening: Time,
+    time_processing: Time,
+}
+
+impl PartitionMetrics {
+    fn new(metrics: &ExecutionPlanMetricsSet, partition: usize) -> Self {
+        Self {
+            baseline: BaselineMetrics::new(metrics, partition),
+            // Use typed builders where DataFusion provides them
+            // (`output_batches` is a reserved MetricValue variant —
+            // a plain `counter("output_batches", …)` panics at
+            // aggregation time with a type mismatch). The free-form
+            // `bytes_scanned` reuses the name DataSourceExec uses so
+            // EXPLAIN ANALYZE output reads consistently.
+            output_batches: MetricBuilder::new(metrics).output_batches(partition),
+            bytes_scanned: MetricBuilder::new(metrics).counter("bytes_scanned", partition),
+            time_opening: MetricBuilder::new(metrics).subset_time("time_elapsed_opening", partition),
+            time_processing: MetricBuilder::new(metrics)
+                .subset_time("time_elapsed_processing", partition),
+        }
     }
 }
 
@@ -440,15 +532,22 @@ impl ExecutionPlan for FastParquetExec {
                 self.assignments.len()
             ))
         })?;
+        let pm = PartitionMetrics::new(&self.metrics, partition);
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             self.schema.clone(),
             build_partition_stream(
                 self.path.clone(),
                 self.projection.clone(),
                 self.parquet_schema.clone(),
+                self.full_schema.clone(),
                 row_groups.clone(),
+                pm,
             ),
         )))
+    }
+
+    fn metrics(&self) -> Option<MetricsSet> {
+        Some(self.metrics.clone_inner())
     }
 
     fn partition_statistics(&self, partition: Option<usize>) -> DfResult<Statistics> {
@@ -495,7 +594,9 @@ fn build_partition_stream(
     path: String,
     projection: Vec<usize>,
     parquet_schema: Arc<SchemaDescriptor>,
+    full_schema: SchemaRef,
     row_groups: Vec<usize>,
+    pm: PartitionMetrics,
 ) -> impl futures_util::Stream<Item = DfResult<RecordBatch>> + Send + 'static {
     // Empty fast-path: don't spawn a worker just to do nothing.
     if row_groups.is_empty() {
@@ -508,11 +609,21 @@ fn build_partition_stream(
     // starving the consumer, small enough to bound peak memory.
     let (tx, rx) = tokio::sync::mpsc::channel::<DfResult<RecordBatch>>(8);
 
+    // The blocking decoder needs its own handles for the metrics it
+    // records (open/processing time, batch count, bytes). The consumer
+    // side keeps the rest (baseline elapsed_compute + output_rows).
+    let bytes_scanned = pm.bytes_scanned.clone();
+    let output_batches = pm.output_batches.clone();
+    let time_opening = pm.time_opening.clone();
+    let time_processing = pm.time_processing.clone();
+
     tokio::task::spawn_blocking(move || {
         let send_err = |tx: &tokio::sync::mpsc::Sender<DfResult<RecordBatch>>,
                         e: DataFusionError| {
             let _ = tx.blocking_send(Err(e));
         };
+
+        let open_timer = time_opening.timer();
 
         let file = match File::open(&path) {
             Ok(f) => f,
@@ -526,7 +637,13 @@ fn build_partition_stream(
                 return;
             }
         };
-        let builder = match ParquetRecordBatchReaderBuilder::try_new(file) {
+        // `with_schema` lets parquet-rs honour our Utf8View/BinaryView
+        // promotion: at column-decode time it sees the hint and routes
+        // the column through the view-emitting array reader (see
+        // parquet-58.1.0 src/arrow/array_reader/byte_view_array.rs).
+        // The hint covers the full file schema, not just the projection.
+        let options = ArrowReaderOptions::new().with_schema(full_schema);
+        let builder = match ParquetRecordBatchReaderBuilder::try_new_with_options(file, options) {
             Ok(b) => b,
             Err(e) => {
                 send_err(
@@ -539,7 +656,7 @@ fn build_partition_stream(
             }
         };
         let mask = ProjectionMask::leaves(&parquet_schema, projection.iter().copied());
-        let reader = match builder
+        let mut reader = match builder
             .with_projection(mask)
             .with_row_groups(row_groups)
             .with_batch_size(DEFAULT_BATCH_SIZE)
@@ -556,13 +673,24 @@ fn build_partition_stream(
                 return;
             }
         };
+        // Stop counting "opening" time once we have a live reader; the
+        // remaining time inside the loop is decode work.
+        drop(open_timer);
 
-        for batch in reader {
-            let item = batch.map_err(|e| {
+        loop {
+            let timer = time_processing.timer();
+            let next = reader.next();
+            drop(timer);
+            let Some(batch_res) = next else { break };
+            let item = batch_res.map_err(|e| {
                 DataFusionError::External(
                     format!("FastParquetExec: batch decode failed: {e}").into(),
                 )
             });
+            if let Ok(ref b) = item {
+                output_batches.add(1);
+                bytes_scanned.add(b.get_array_memory_size());
+            }
             // blocking_send returns Err only when the receiver dropped —
             // the consumer doesn't want more data, so stop decoding.
             if tx.blocking_send(item).is_err() {
@@ -572,8 +700,17 @@ fn build_partition_stream(
     });
 
     // Adapt `Receiver` to `Stream` without pulling in `tokio-stream`.
-    futures_util::stream::unfold(rx, |mut rx| async move {
-        rx.recv().await.map(|item| (item, rx))
+    // Wrap the recv so each poll's wall-clock counts toward
+    // `elapsed_compute` and per-batch rows are reported via baseline.
+    let baseline = pm.baseline;
+    futures_util::stream::unfold((rx, baseline), |(mut rx, baseline)| async move {
+        let timer = baseline.elapsed_compute().timer();
+        let item = rx.recv().await;
+        drop(timer);
+        if let Some(Ok(ref batch)) = item {
+            baseline.record_output(batch.num_rows());
+        }
+        item.map(|i| (i, (rx, baseline)))
     })
     .right_stream()
 }
@@ -803,6 +940,132 @@ mod tests {
             "first batch took {first_batch_time:?} but full scan {total_time:?} \
              (ratio={ratio:.3}) — partition stream is not yielding incrementally"
         );
+    }
+
+    /// Σ.E2 root-cause fix: `Utf8` columns on the wire should surface
+    /// as `Utf8View` (StringView), matching DataFusion's default
+    /// parquet reader. The diagnostic `fast_parquet_array_diff` example
+    /// showed Q01's 31% SF=10 regression was caused by string columns
+    /// going through legacy Utf8 kernels in downstream FilterExec and
+    /// AggregatePartial; DF emits StringView, so its kernels are
+    /// SIMD-optimised over the 16-byte inline view layout.
+    ///
+    /// The fix is to convert Utf8 → Utf8View in the schema we hand to
+    /// parquet-rs's `ArrowReaderOptions::with_schema`. Same for Binary
+    /// → BinaryView. For TPC-H lineitem this only affects
+    /// l_returnflag, l_linestatus, l_shipmode, l_shipinstruct,
+    /// l_comment, but those columns drive Q01's grouping cost.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn string_columns_decoded_as_utf8view() {
+        use datafusion::arrow::array::AsArray;
+        use datafusion::arrow::datatypes::DataType;
+        use datafusion::execution::TaskContext;
+        use datafusion::prelude::{SessionConfig, SessionContext};
+        use futures_util::StreamExt;
+
+        let Some(path) = lineitem_parquet() else {
+            eprintln!("TPC-H SF=1 data not generated; skipping test");
+            return;
+        };
+        let ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(1));
+        let state = ctx.state();
+        let prov = FastParquetTableProvider::try_new(path).unwrap();
+
+        // Schema-level: provider must advertise Utf8View for string cols
+        // so DataFusion's planner picks the SIMD-friendly kernel paths.
+        // lineitem field 8 = l_returnflag, field 9 = l_linestatus.
+        let schema = prov.schema();
+        for i in [8usize, 9] {
+            assert!(
+                matches!(schema.field(i).data_type(), DataType::Utf8View),
+                "field {i} ({:?}) should be Utf8View, got {:?}",
+                schema.field(i).name(),
+                schema.field(i).data_type()
+            );
+        }
+
+        // Runtime-level: actual decoded array must be StringViewArray.
+        let exec = prov.scan(&state, None, &[], None).await.unwrap();
+        let task_ctx = Arc::new(TaskContext::default());
+        let mut stream = exec.execute(0, task_ctx).unwrap();
+        let batch = stream
+            .next()
+            .await
+            .expect("at least one batch")
+            .expect("batch decodes ok");
+        let rf_arr = batch.column(8);
+        assert!(
+            rf_arr.as_string_view_opt().is_some(),
+            "l_returnflag must downcast to StringViewArray, got {:?}",
+            rf_arr.data_type()
+        );
+    }
+
+    /// Σ.E2 follow-up: `FastParquetExec` must expose decode metrics so
+    /// EXPLAIN ANALYZE can attribute time to the scan. Without these
+    /// (we shipped with `metrics=[]`), Q01 SF=10's 31% regression is
+    /// undiagnosable — we cannot see whether the gap is in parquet open,
+    /// row-group decode, or batch hand-off.
+    ///
+    /// Minimum required surface:
+    ///   - `elapsed_compute` (wall-clock time spent in poll_next)
+    ///   - `output_rows` and `output_batches`
+    ///   - `bytes_scanned` (sum of RecordBatch memory across all partitions)
+    ///   - `time_elapsed_opening` (file open + reader build)
+    ///   - `time_elapsed_processing` (cumulative time inside reader.next())
+    #[tokio::test(flavor = "multi_thread")]
+    async fn execution_plan_exposes_decode_metrics() {
+        use datafusion::execution::TaskContext;
+        use datafusion::prelude::{SessionConfig, SessionContext};
+        use futures_util::StreamExt;
+
+        let Some(path) = lineitem_parquet() else {
+            eprintln!("TPC-H SF=1 data not generated; skipping test");
+            return;
+        };
+        let ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(2));
+        let state = ctx.state();
+        let prov = FastParquetTableProvider::try_new(path).unwrap();
+        let exec = prov.scan(&state, None, &[], None).await.unwrap();
+        let n_partitions = exec.properties().partitioning.partition_count();
+
+        let task_ctx = Arc::new(TaskContext::default());
+        let mut total_rows = 0usize;
+        for p in 0..n_partitions {
+            let mut s = exec.execute(p, task_ctx.clone()).unwrap();
+            while let Some(b) = s.next().await {
+                let batch = b.expect("batch decodes ok");
+                total_rows += batch.num_rows();
+            }
+        }
+        assert_eq!(total_rows, 6_001_215, "all SF=1 lineitem rows scanned");
+
+        let metrics = exec
+            .metrics()
+            .expect("FastParquetExec should expose metrics() once instrumented");
+        let names: Vec<String> = metrics
+            .iter()
+            .map(|m| m.value().name().to_string())
+            .collect();
+
+        let elapsed = metrics
+            .elapsed_compute()
+            .expect("elapsed_compute aggregated across partitions");
+        assert!(elapsed > 0, "elapsed_compute should be > 0 after a scan");
+        let rows = metrics.output_rows().expect("output_rows populated");
+        assert_eq!(rows as usize, 6_001_215);
+
+        for required in [
+            "time_elapsed_opening",
+            "time_elapsed_processing",
+            "bytes_scanned",
+            "output_batches",
+        ] {
+            assert!(
+                names.iter().any(|n| n == required),
+                "FastParquetExec metrics missing `{required}`; have: {names:?}"
+            );
+        }
     }
 
     /// Q6 plan-level check. With `FastParquetTableProvider` the result
