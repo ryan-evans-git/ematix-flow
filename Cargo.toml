@@ -74,6 +74,19 @@ deltalake = { version = "0.32", default-features = false, features = ["rustls", 
 # arrow ABI. Adding as a direct dep so we can use SessionContext /
 # MemTable / DataFrame APIs from the transform layer.
 datafusion = { version = "53.1", default-features = false, features = ["parquet"] }
+# Σ.D3: cranelift JIT for the unified `FusedAggregateExec` fast path.
+# At plan time we emit machine code for the specific predicate +
+# aggregate shape; the resulting function runs the inner loop with
+# no per-clause dispatch — same performance as the hardcoded Σ.D1 /
+# Σ.D2 specialty operators, for arbitrary plan shapes. Pinned with
+# the same 0.107 series across both sub-crates to avoid duplicate
+# code-generation backends in the binary.
+cranelift = "0.107"
+cranelift-codegen = "0.107"
+cranelift-frontend = "0.107"
+cranelift-jit = "0.107"
+cranelift-module = "0.107"
+cranelift-native = "0.107"
 # Σ.B PR 2: distributed batch SQL execution. `datafusion-contrib`
 # library that adds peer-to-peer distributed execution via Arrow
 # Flight, with no separate scheduler/executor binaries — any ematix-
