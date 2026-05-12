@@ -17,6 +17,20 @@ pub mod duckdb_backend;
 // Q6 gap vs Polars (1.0 ms hand-written / 1.9 ms Polars / 5.96 ms
 // today's DataFusion). See `fused.rs` header and issue #44.
 pub mod fused;
+// Σ.D2: `FusedFilterMultiAggExec` — single-pass fused filter +
+// multi-aggregate + group-by physical operator. Day-1 prototype
+// (`examples/tpch_q1_tune.rs`) showed 3.08 ms on Q1 SF=1 / 14
+// threads vs DataFusion's 25.61 ms MemTable / 47.65 ms parquet
+// (15.5× faster) and Polars MemTable 35.2 ms (11.4× faster).
+// See `fused_multi_agg.rs` header and issue #45.
+pub mod fused_multi_agg;
+// Σ.D3: cranelift-JIT'd inner loop for the unified fused-aggregate
+// operator. See `fused_jit.rs` header and issue #45. Day-1 scaffold:
+// JIT'd Q6 predicate evaluator that hits the same kernel shape as
+// Σ.D1's hard-coded operator from a data-driven input. The full
+// generic IR emitter (any predicate AST, any agg spec, any group-by
+// shape) builds on this scaffold.
+pub mod fused_jit;
 pub mod hash;
 pub mod join;
 pub mod kafka_backend;

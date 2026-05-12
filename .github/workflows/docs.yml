@@ -18,15 +18,16 @@ permissions:
   pages: write
   id-token: write
 
-# Allow only one concurrent deployment, but don't cancel
-# in-progress deploys — they'd leave the site half-deployed.
-concurrency:
-  group: pages
-  cancel-in-progress: false
-
 jobs:
   build:
     runs-on: ubuntu-latest
+    # Per-ref concurrency: a new push to the same branch supersedes
+    # the previous build (saves CI), but PR builds and pushes on
+    # *different* refs run independently so sibling PRs don't cancel
+    # each other's required "build" check.
+    concurrency:
+      group: docs-build-${{ github.ref }}
+      cancel-in-progress: true
     steps:
       - uses: actions/checkout@v4
         with:
@@ -67,6 +68,11 @@ jobs:
     if: github.event_name != 'pull_request'
     needs: build
     runs-on: ubuntu-latest
+    # Pages allows only one concurrent deployment site-wide. Don't
+    # cancel in-progress deploys — they'd leave the site half-published.
+    concurrency:
+      group: pages
+      cancel-in-progress: false
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
