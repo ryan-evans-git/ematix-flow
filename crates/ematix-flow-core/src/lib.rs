@@ -12,6 +12,11 @@ pub mod delta_backend;
 // than SQL surfaces.
 pub mod dialect;
 pub mod duckdb_backend;
+// Σ.E2: row-group-parallel parquet TableProvider that bypasses
+// DataFusion's `ParquetExec → DataSourceExec → RepartitionExec` stack.
+// See `fast_parquet.rs` for the day-2/day-3 probe results that
+// motivated this.
+pub mod fast_parquet;
 // Σ.D1: `FusedFilterSumExec` physical operator for the simple
 // `Aggregate(SUM) over Filter(predicate)` plan shape — closes the
 // Q6 gap vs Polars (1.0 ms hand-written / 1.9 ms Polars / 5.96 ms
