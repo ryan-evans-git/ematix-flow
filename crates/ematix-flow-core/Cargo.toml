@@ -86,6 +86,13 @@ criterion = { workspace = true }
 # path. Pinned to the same major track as arrow-array so the ABI
 # matches.
 arrow-select = "58"
+# Used by the TPC-H bench examples as `#[global_allocator]`. macOS's
+# default malloc serializes on a global lock and was caught making
+# Q13 SF=10 catastrophic (5.95s) under the high-concurrency, large-
+# allocation pattern the v4-streaming change introduces; switching to
+# mimalloc here turns Q13 into a +33% win (152 ms vs DF default 226 ms).
+# Per-thread arenas + better fragmentation policy. Polars uses it too.
+mimalloc = { version = "0.1", default-features = false }
 # Σ.A1 PR 1: TPC-H generator + reference answers (used by the
 # `tpch_smoke` integration test and the `tpch_generate` example).
 # See workspace.dependencies for full rationale.
