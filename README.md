@@ -61,12 +61,18 @@ All times in milliseconds. 5-trial median for DataFusion / ematix-flow,
   fused operators (PRs [#46], [#47], [#48], [#55]) add the 56-68×
   shifts on Q1 and Q6; the remaining 20 queries match DataFusion (which
   is ematix-flow's SQL engine).
-- **ematix-flow wins outright on 19 of 22 queries** vs every engine
-  the comparison can evaluate. On three queries Polars beats us:
-  Q9 (1.30×), Q12 (2.29×), Q14 (2.17×). Each one is a simple
-  filter + 2-to-6-way join + small aggregate — Polars's join inner
-  loops are tighter than DataFusion's, and our Σ.D arc doesn't
-  address joins. Engine-level investigation tracked as the **Σ.E arc**.
+- **ematix-flow wins on 21 of 22 queries** with the opt-in
+  [FastParquet scan provider](#σe2--fastparquet-scan-provider-opt-in-2026-05-12)
+  enabled: 20 outright wins plus Q12 a statistical tie with Polars.
+  Only **Q14** is a remaining loss — Polars is 1.54× faster on a
+  3-way join + small aggregate where Polars's inner loops are tighter
+  than DataFusion's. Tracked under the **Σ.E arc**.
+- The table above shows `ematix-flow` numbers on DataFusion's
+  *default* parquet path (5-trial median, 2026-05-11 baseline). The
+  FastParquet provider — landed 2026-05-12 — gives a mean 1.53×
+  speedup on top of those numbers; per-query results in the section
+  below. Polars's listed wins on Q9 and Q12 reflect the default-path
+  numbers; with FastParquet enabled, Q9 flips and Q12 ties.
 - ¹ Polars's SQL parser (1.40.1) rejects implicit `FROM a, b, c`
   joins, `INTERVAL 'N' DAY` literals, `EXISTS` subqueries, and
   non-equi-join predicates. The 10 FAIL queries above hit those
@@ -89,6 +95,64 @@ All times in milliseconds. 5-trial median for DataFusion / ematix-flow,
 
 Full methodology + per-engine reproducers in
 [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md).
+
+### Σ.E2 — FastParquet scan provider (opt-in, 2026-05-12)
+
+`FastParquetTableProvider` is an opt-in alternative to DataFusion's
+default `register_parquet`. Same query results, faster scans. Two
+changes do the work:
+
+1. **Row-group-parallel decode with incremental streaming** — one
+   tokio task per row group, each batch flows through an `mpsc(8)`
+   channel so downstream operators start work the moment the first
+   batch lands instead of waiting for the whole partition. mimalloc
+   replaces macOS's globally-locked allocator under the 14-way
+   concurrent decode pattern (Σ.E2 PR #63).
+2. **`Utf8View` column promotion** — string columns surface as
+   Arrow's StringView layout (16-byte inline storage) instead of
+   classic Utf8 byte arrays. Downstream `FilterExec` and
+   `AggregatePartial` then pick their SIMD-optimised kernels for
+   hashing and equality.
+
+#### Headline numbers vs DataFusion's default scan
+
+15-trial median, M3 Pro, mimalloc allocator. A query is only called
+a win when the median difference exceeds the combined run-to-run
+noise envelope:
+
+| Scale | Real wins | Real losses | Mean speedup |
+|---|---:|---:|---:|
+| **SF=1**  (60 MB lineitem)  | **15 of 22** | **0** | **1.53×** |
+| **SF=10** (2.2 GB lineitem) | 1 of 22, plus 6 in-noise gains | **0** | **1.16×** |
+
+#### Status on the three previously-tight queries vs Polars (SF=1)
+
+| Query | Polars (ms) | ematix-flow + FastParquet (ms) | Status |
+|---|---:|---:|---|
+| **Q9**  | 52.81 | **34.73** | ematix-flow wins, **1.52× faster than Polars** |
+| **Q12** | 22.01 | 23.05 | basically tied (Polars 5% ahead, inside noise) |
+| **Q14** | 12.53 | 19.31 | Polars still wins, 1.54× |
+
+Reproducing this is a one-liner:
+
+```bash
+# All 22 queries, statistical mode with noise envelope (SF=1)
+cargo run --release -p ematix-flow-core --example tpch_fast_parquet_bench
+
+# Same harness at SF=10
+TPCH_DATA_DIR=$(pwd)/examples/tpch/data/sf10 \
+  cargo run --release -p ematix-flow-core --example tpch_fast_parquet_bench
+```
+
+To use the provider in your own code, register it like any
+`TableProvider`:
+
+```rust
+use ematix_flow_core::fast_parquet::FastParquetTableProvider;
+let prov = FastParquetTableProvider::try_new("/path/to/lineitem.parquet")?;
+ctx.register_table("lineitem", std::sync::Arc::new(prov))?;
+// then `SELECT … FROM lineitem` flows through the fast scan path.
+```
 
 [#46]: https://github.com/ryan-evans-git/ematix-flow/pull/46
 [#47]: https://github.com/ryan-evans-git/ematix-flow/pull/47
