@@ -20,13 +20,27 @@ parquet path wins via `DynamicFilter`:
 hook, so DataFusion's planner leaves all filters in a `FilterExec`
 parent and the scan reads every row group whole.
 
-## Strategy
+## Strategy (revised 2026-05-12)
 
-Implement `ExecutionPlan::gather_filters_for_pushdown` and
-`handle_child_pushdown_result` on `FastParquetExec`. Accept incoming
-`Arc<dyn PhysicalExpr>` filters (which may be `DynamicFilterPhysicalExpr`
-wrappers from a HashJoin build side). Translate them to parquet-rs
-`RowFilter` + use row-group statistics for cheap whole-group pruning.
+The original v3 strategy assumed filter pushdown was the missing
+lever for closing the SF=1 loss queries. Three filter-pushdown
+approaches were investigated:
+
+1. **v3.1** — Post-decode filter evaluation: regressed (FilterExec
+   is too well-tuned to compete with).
+2. **v3.2** — Decode-time pushdown via parquet `with_row_filter`:
+   regressed (TableProvider API bundles output and predicate
+   projections, triggering double-decode).
+3. **v3.3** — Row-group statistics pruning: correct, but inert on
+   TPC-H SF=1 data (DataFusion's own pruning also doesn't fire),
+   and the SF=10 audit that followed revealed the *real* bottleneck
+   is FastParquetExec's RG-count partitioning, not filter pushdown.
+
+**Revised strategy:** v3.3 ships as the substrate. **v4** —
+byte-range partitioning + pipelined streaming — is the next real
+perf investment. **v3.4** (dynamic filters) waits until v4 lands;
+layering it on the current partitioning compounds the SF=10
+regression rather than helps.
 
 Reference: [Dynamic Filters: Passing Information Between Operators](https://datafusion.apache.org/blog/2025/09/10/dynamic-filters)
 and `datafusion-physical-expr-53.1.0/src/expressions/dynamic_filters.rs`.
@@ -143,103 +157,145 @@ absorption wiring, `pushdown_filters` field, `extract_column_eq_literal`
 helper) for future use once the upstream gap is addressed. Re-ignore
 the plan-elimination test.
 
-### v3.3 — Row-group statistics pruning (now the next shippable PR)
+### v3.3 — Row-group statistics pruning (shipped on PR #62)
 
-**Now the leading v3 candidate** since it avoids both the v3.1 post-
-decode pipelining regression and the v3.2 predicate-column-overlap
-regression entirely. Pruning happens before any decode, so it's
-strictly additive to the existing scan path.
+**Status (2026-05-12): shipped on `feat/fast-parquet-row-group-pruning`
+as PR #62.** Correct, ship-ready, but **not the perf lever we hoped
+for** — the SF=10 audit that followed told a different story (see
+"SF=10 audit + v4 pivot" below).
 
-Scope:
-- For each row group, evaluate accepted filters against
-  `column_statistics[i].min_value/max_value` (already collected in
-  v2b).
-- If `min > literal` for `eq`, or `max < literal` for `gteq`, etc.,
-  remove that row group from the partition's assignment before the
-  scan starts.
-- Empty assignments produce empty streams (already supported).
-- Reduce partition count if all row groups in a partition prune.
+What landed:
+- Per-row-group, per-column `ColumnStatistics` collection at provider
+  open (`per_row_group_column_statistics`).
+- `supports_filters_pushdown` reports `Inexact` for `Column op Literal`
+  shapes so the planner passes filters to `scan()` *without* removing
+  the parent `FilterExec` (we never claim ownership — pruning is
+  advisory).
+- `column_op_literal_for_pruning` + `row_group_can_match` peel
+  supported shapes and consult per-RG min/max.
+- `scan()` filters the row-group assignment vector to surviving RGs.
 
-Failing tests:
-- `row_group_pruning_skips_disjoint_stats` — synthetic 6-row-group
-  parquet with `id` 0..1000, query `WHERE id > 5000` should scan
-  zero row groups.
-- `row_group_pruning_q12_pushes_to_parquet` — Q12's
-  `l_receiptdate >= '1994-01-01' AND l_receiptdate < '1995-01-01'`
-  should prune the lineitem row groups whose date ranges don't
-  overlap (the default parquet path's `row_groups_pruned_statistics`
-  metric shows this kind of pruning happening on Q12).
-- Bench-style guard: Q12 should improve from current -36% to within
-  -20%, with no other query worse than -5%.
+Tests:
+- `row_group_pruning_impossible_predicate_skips_all` — `l_orderkey >
+  999_999_999` against SF=1 lineitem prunes all 6 RGs (was 6 before
+  the implementation; now 0).
+- `row_group_pruning_inclusive_predicate_keeps_all` — full-range
+  predicate keeps all 6 RGs.
+- `row_group_pruning_correctness_when_all_pruned` — count returns 0,
+  no crash on empty assignments.
 
-Effort: ~1 week.
+Bench:
+- **SF=1**: 12w / 6l / 1.08× geomean — within run-to-run variance of
+  the v2b baseline (14w/3l/1.10× to 15w/4l/1.38× across runs of
+  identical code earlier today). Pruning didn't fire on the loss
+  queries (Q10/Q12/Q18) because SF=1 lineitem RGs each span the full
+  date and orderkey ranges. DataFusion's *own* parquet path shows the
+  same `row_groups_pruned_statistics=N total → N matched` non-pruning
+  on those queries in the v3.2 EXPLAIN data — even the default can't
+  prune by stats on this data layout.
+- **SF=10**: 12w / 7l / 1.03× geomean (vs 7w/11l/0.97× pure-v2b
+  baseline via `FASTPARQUET_DISABLE_V33=1` A/B). v3.3 mitigates SF=10
+  regressions partially but doesn't reverse them.
 
-### v3.4 — Dynamic filter integration (deferred until v3.3 ships)
+v3.3 still earns its place:
+- Strictly additive (no regression risk).
+- Correct where stats *can* prune (test-confirmed).
+- Substrate v3.4 would have built on — but v3.4 is now deferred (see
+  below).
 
-Same scope as before. Pre-requisite: v3.3 lands the row-group
-pruning path; dynamic filters update the pruning predicate as
-build-side rows arrive.
+### v3.4 — Dynamic filter integration
 
-### v3.5 — Bench + write-up + close
-
-Same scope as before.
-
-### v3.3 — Row-group statistics pruning
-
-Goal: skip whole row groups entirely when their column stats
-guarantee no rows match the filter.
-
-Scope:
-- For each row group, evaluate the filter against
-  `column_statistics[i].min_value/max_value` (already collected in
-  v2b).
-- If `min > literal` for `eq`, or `max < literal` for `gteq`, etc.,
-  skip the entire row group from the partition plan.
-- Page-index pruning is *not* in v3.3 — that's a parquet-2.4 feature
-  that needs additional row-group→page-index metadata. Maybe v3.6.
-
-Failing tests:
-- `row_group_pruning_skips_when_stats_disjoint` — synthetic 6-row-group
-  parquet with `id` 0..1000, query `WHERE id > 5000` should scan zero
-  row groups.
-
-Effort: ~1 week.
-
-### v3.4 — Dynamic filter subscription
-
-Goal: pick up build-side filter from a HashJoin probe scan. **This
-is the piece that actually closes Q10/Q12/Q18.**
-
-Scope:
-- Detect `DynamicFilterPhysicalExpr` in the incoming filter list
-  (via downcast or via the `snapshot_generation` API).
-- On every new row group scan, call `current()` to snapshot the latest
-  filter expression.
-- Optionally `subscribe()` to the `watch::Sender<FilterState>` so we
-  block briefly if the build side is still producing.
-
-Failing tests:
-- `q12_pushdown_closes_gap` — Q12 against FastParquet should be within
-  20% of default DataFusion (currently -36%; passes when ≥ -20%).
-- `q10_pushdown_closes_gap` — same shape for Q10.
-- `dynamic_filter_picks_up_build_side_update` — synthetic test with
-  a small build-side, large probe-side; assert probe scan reads
-  only the build-key range after the filter populates.
-
-Effort: ~1-2 weeks.
+**Status (2026-05-12): deferred until v4 lands.** Layering dynamic
+filters on top of the current FastParquetExec partitioning would
+compound the SF=10 regression captured below, not help — the
+Q10/Q12/Q18 gaps at SF=10 are dwarfed by the partitioning overhead.
+The v3.4 design is unchanged; the gate is "v4 architecture in place
+first."
 
 ### v3.5 — Bench + write-up + close
 
-Goal: re-run the 22-query suite, document, claim the geomean delta.
+Deferred. Will run once v3.4 (post-v4) lands and there's a real win
+to claim. The v3.3-only bench is recorded in PR #62 and the memory
+file; no headline-level update warranted.
+
+## SF=10 audit + v4 pivot
+
+After v3.3 landed at SF=1 with no perf delta, we re-benched at SF=10
+to test the substrate hypothesis (the row-group pruning should help
+at scale where the data layout is more selective). The SF=10 result
+told a different story:
+
+| | SF=10 v3.3 enabled | SF=10 pure v2b (FASTPARQUET_DISABLE_V33=1) |
+|---|---|---|
+| Geomean | 1.03× | 0.97× |
+| Q01 | -61% | -56% |
+| Q06 | -46% | -49% |
+| Q12 | -56% | -70% |
+| Q13 | **-512%** (1.87s) | **-14134%** (35.5s — 142× slower!) |
+| Q18 | -26% (5.8s) | +59% (10.3s) |
+
+v3.3 *mitigates* SF=10 regressions but doesn't cause them. The real
+issue is structural in FastParquetExec.
+
+### EXPLAIN ANALYZE on Q13 SF=10 — root cause
+
+Key metric: cumulative `RepartitionExec.fetch_time` on the orders
+scan + filter chain:
+
+- Default: **1.35s** (over a 14-byte-range scan of a 564 MB file)
+- FastParquet: **129s** (over 14 RG-based partitions of the same file)
+
+The default `ParquetExec` splits each parquet file into N byte-range
+partitions sized to balance work across cores. FastParquetExec splits
+by row-group count (`min(num_row_groups, target_partitions)`):
+
+- SF=1 lineitem: 6 RGs × ~12 MB. 14 partitions → uneven (8 empty),
+  but RGs are small. Works.
+- SF=10 orders: 15 RGs × ~38 MB. 14 partitions → 1 with 2 RGs, 13
+  with 1 RG. Larger RGs + 14 concurrent file seeks on the same 564
+  MB file create IO contention.
+- SF=10 lineitem: ~60 RGs × ~38 MB across 2.2 GB. Same pattern,
+  worse.
+
+Combined with our `spawn_blocking + Vec<RecordBatch>` pattern (which
+decodes all RG batches before yielding any), the partition does no
+useful work for the consumer until the entire row group is decoded.
+Default's reader yields batches as they decode.
+
+### v4 — byte-range partitioning + pipelined streaming
+
+**Now the next real perf investment.** Without this, scale-out
+claims for FastParquet are bounded by the current architecture.
 
 Scope:
-- `tpch_fast_parquet_bench` reruns; results into `docs/BENCHMARKS.md`
-  under a new "v3" section.
-- README update if v3 changes the headline number materially.
-- Memory file update closing this loss-list thread (or recording
-  what's left).
+- Rewrite FastParquetExec partitioning to split each parquet file
+  into N byte-range partitions (instead of RG-count partitions).
+  Parquet readers know how to handle a byte range that covers a
+  subset of row groups (`with_row_groups` filtered to those
+  intersecting the range).
+- Pipelined async streaming: yield each RecordBatch as it decodes,
+  not after the full RG. Drop the `spawn_blocking + Vec` shape.
+- Add metrics to FastParquetExec — today it emits `metrics=[]`,
+  which is why this audit had to infer scan cost from RepartitionExec.fetch_time
+  upstream.
 
-Effort: ~1 week.
+Failing tests:
+- `byte_range_partitioning_matches_target_partitions` — synthetic
+  parquet of N RGs, `target_partitions=K`; assert that
+  `FastParquetExec.assignments.len() == K` independent of N.
+- `pipelined_emission_yields_first_batch_before_rg_complete` —
+  observable via stream readiness; assert the first batch arrives
+  before all RG batches are decoded.
+- `q13_sf10_within_2x_of_default` — bench-style guard; Q13 at SF=10
+  must be within 2× of the default (currently 7× slower).
+
+Effort: 2–3 weeks (this is the real perf investment v3 was orbiting).
+
+### v3.4 picks back up after v4
+
+Once FastParquetExec scales correctly, v3.4 (dynamic filters from
+HashJoin build-side) can ride on the v3.3 row-group pruning machinery
+without the SF=10 architecture amplifying every regression.
 
 ## Out of scope for v3
 
