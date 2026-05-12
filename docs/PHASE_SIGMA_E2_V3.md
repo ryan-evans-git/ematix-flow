@@ -86,32 +86,103 @@ Tests:
 - `pushdown_plan_eliminates_filter_exec` — `#[ignore]`'d with a
   pointer back to this doc. Re-engages as v3.2's first failing test.
 
-### v3.2 — Real decode-time pushdown via parquet-rs `with_row_filter`
+### v3.2 — Decode-time pushdown via parquet-rs `with_row_filter` (attempted, blocked)
 
-**Now scoped as the first shippable v3 PR.** v3.1's lesson absorbed:
-this PR is what makes pushdown net-positive, by ensuring the filter
-runs at decode time (no materialized pruned rows) instead of after.
+**Status (2026-05-12): attempted, blocked at the TableProvider API layer.**
+
+Attempted v3.2 implementation: pre-compute `(parquet_leaf_idx, expr_rewritten_to_col0)`
+per accepted filter, wrap each in an `ArrowPredicate` calling the
+PhysicalExpr's own `evaluate`, hand them to
+`ParquetRecordBatchReaderBuilder::with_row_filter`. Wiring compiled
+cleanly, plan-shape test re-passed. Bench: **9w / 13l / 0.87× geomean.**
+
+Two queries blew up catastrophically:
+- Q06: 21ms → 251ms (12× slower).
+- Q20: 43ms → 595ms (14× slower).
+
+Root cause: per the parquet-rs docs,
+
+> Columns may be decoded multiple times if they appear in multiple
+> ProjectionMasks … if a predicate needs several columns of data to
+> evaluate but leaves 99% of the rows, it may be better to not filter
+> the data from parquet.
+
+On Q06, the predicate references `l_shipdate`, `l_discount`,
+`l_quantity` — all three are *also* in the output projection. So
+parquet-rs decodes them once per predicate (in sequence, refining the
+row selection), then decodes them again for the output, against
+millions of rows. The double-decode dominates.
+
+**The deeper architectural finding:** parquet-rs's `RowFilter` is
+designed for the case where predicate columns are *not* in the
+output projection (high-selectivity filter on a wide table where the
+output excludes the predicate columns). DataFusion's current
+`TableProvider::scan(projection: Option<&Vec<usize>>)` contract
+bundles "columns the output needs" and "columns referenced by
+pushed-down predicates" into a single projection vector — there is
+no way to mark a column as predicate-only.
+
+Without that distinction, **every** filter we accept has its
+predicate column in our output projection (otherwise the column
+wouldn't be in `scan()`'s projection in the first place). So every
+v3.2 acceptance triggers the double-decode regression.
+
+This isn't fixable inside `FastParquetExec`; it requires either:
+
+1. An upstream DataFusion change so `TableProvider::scan` can
+   distinguish output projection from predicate-only columns
+   (probably a new method or a richer scan request object). Significant
+   upstream contribution.
+2. A different optimization target that *doesn't* need the
+   predicate-only column concept — e.g. row-group statistics
+   pruning (v3.3), where we skip work *before* any decode and the
+   projection question never arises.
+
+Action: revert v3.2 implementation. Keep the scaffolding (filter
+absorption wiring, `pushdown_filters` field, `extract_column_eq_literal`
+helper) for future use once the upstream gap is addressed. Re-ignore
+the plan-elimination test.
+
+### v3.3 — Row-group statistics pruning (now the next shippable PR)
+
+**Now the leading v3 candidate** since it avoids both the v3.1 post-
+decode pipelining regression and the v3.2 predicate-column-overlap
+regression entirely. Pruning happens before any decode, so it's
+strictly additive to the existing scan path.
 
 Scope:
-- Re-engage `filter_is_supported` with the narrow `BinaryExpr(Column,
-  cmp, Literal)` shape from v3.1's experiment.
-- Translate accepted filters to parquet-rs `ArrowPredicate` via
-  `ArrowPredicateFn::new(projection_mask_for_predicate_cols, evaluator)`.
-- Pass via `ParquetRecordBatchReaderBuilder::with_row_filter`.
-- Handle the projection-vs-predicate-columns split: predicate may
-  reference a column not in the output projection (needs separate
-  projection mask + remapping the PhysicalExpr column indices).
-- Broaden translator to `and/or` combinations, `InListExpr`,
-  `BetweenExpr`. Decimal/Date literal coercion as needed for TPC-H.
+- For each row group, evaluate accepted filters against
+  `column_statistics[i].min_value/max_value` (already collected in
+  v2b).
+- If `min > literal` for `eq`, or `max < literal` for `gteq`, etc.,
+  remove that row group from the partition's assignment before the
+  scan starts.
+- Empty assignments produce empty streams (already supported).
+- Reduce partition count if all row groups in a partition prune.
 
-Failing tests (write first):
-- `pushdown_plan_eliminates_filter_exec` — un-ignore the v3.1 test.
-- Q12 static filter perf: bench-style test that asserts FastParquet
-  on Q12 is now within 20% of default DataFusion (currently -36%).
-- Q14 static filter correctness against default.
-- Q19 static filter (complex OR-of-ANDs) correctness.
+Failing tests:
+- `row_group_pruning_skips_disjoint_stats` — synthetic 6-row-group
+  parquet with `id` 0..1000, query `WHERE id > 5000` should scan
+  zero row groups.
+- `row_group_pruning_q12_pushes_to_parquet` — Q12's
+  `l_receiptdate >= '1994-01-01' AND l_receiptdate < '1995-01-01'`
+  should prune the lineitem row groups whose date ranges don't
+  overlap (the default parquet path's `row_groups_pruned_statistics`
+  metric shows this kind of pruning happening on Q12).
+- Bench-style guard: Q12 should improve from current -36% to within
+  -20%, with no other query worse than -5%.
 
-Effort: ~2 weeks (absorbing v3.1's scope).
+Effort: ~1 week.
+
+### v3.4 — Dynamic filter integration (deferred until v3.3 ships)
+
+Same scope as before. Pre-requisite: v3.3 lands the row-group
+pruning path; dynamic filters update the pruning predicate as
+build-side rows arrive.
+
+### v3.5 — Bench + write-up + close
+
+Same scope as before.
 
 ### v3.3 — Row-group statistics pruning
 
