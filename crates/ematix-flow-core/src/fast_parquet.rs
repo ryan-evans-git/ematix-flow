@@ -47,7 +47,7 @@ use datafusion::common::{
 };
 use datafusion::datasource::TableType;
 use datafusion::execution::TaskContext;
-use datafusion::logical_expr::Expr;
+use datafusion::logical_expr::{Expr, Operator};
 use datafusion::parquet::arrow::ProjectionMask;
 use datafusion::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use datafusion::parquet::schema::types::SchemaDescriptor;
@@ -77,6 +77,184 @@ const DEFAULT_BATCH_SIZE: usize = 65_536;
 ///   - `null_count`: sum across row groups (Exact iff every RG had Exact)
 ///   - `min_value`:  min across row groups
 ///   - `max_value`:  max across row groups
+/// Convert a parquet column-chunk `Statistics` (one row group) into
+/// `(min, max)` ScalarValues for the given Arrow type. Returns
+/// `(None, None)` for unsupported type pairings or when parquet's
+/// stats are absent.
+fn rg_min_max_for_arrow_type(
+    stats: &datafusion::parquet::file::statistics::Statistics,
+    arrow_ty: &datafusion::arrow::datatypes::DataType,
+) -> (Option<ScalarValue>, Option<ScalarValue>) {
+    use datafusion::arrow::datatypes::DataType;
+    use datafusion::parquet::file::statistics::Statistics as PqStats;
+    match (stats, arrow_ty) {
+        (PqStats::Int32(s), DataType::Int32) => match (s.min_opt(), s.max_opt()) {
+            (Some(&lo), Some(&hi)) => (
+                Some(ScalarValue::Int32(Some(lo))),
+                Some(ScalarValue::Int32(Some(hi))),
+            ),
+            _ => (None, None),
+        },
+        (PqStats::Int32(s), DataType::Date32) => match (s.min_opt(), s.max_opt()) {
+            (Some(&lo), Some(&hi)) => (
+                Some(ScalarValue::Date32(Some(lo))),
+                Some(ScalarValue::Date32(Some(hi))),
+            ),
+            _ => (None, None),
+        },
+        (PqStats::Int64(s), DataType::Int64) => match (s.min_opt(), s.max_opt()) {
+            (Some(&lo), Some(&hi)) => (
+                Some(ScalarValue::Int64(Some(lo))),
+                Some(ScalarValue::Int64(Some(hi))),
+            ),
+            _ => (None, None),
+        },
+        (PqStats::Float(s), DataType::Float32) => match (s.min_opt(), s.max_opt()) {
+            (Some(&lo), Some(&hi)) => (
+                Some(ScalarValue::Float32(Some(lo))),
+                Some(ScalarValue::Float32(Some(hi))),
+            ),
+            _ => (None, None),
+        },
+        (PqStats::Double(s), DataType::Float64) => match (s.min_opt(), s.max_opt()) {
+            (Some(&lo), Some(&hi)) => (
+                Some(ScalarValue::Float64(Some(lo))),
+                Some(ScalarValue::Float64(Some(hi))),
+            ),
+            _ => (None, None),
+        },
+        _ => (None, None),
+    }
+}
+
+/// Σ.E2 v3.3: peel one logical `Expr` down to `(column_index_in_schema,
+/// operator, literal)` if it matches `Column op Literal` or the
+/// commutated `Literal op Column` form (with the op flipped). Returns
+/// `None` for shapes we won't try to prune by — anything else, like
+/// `InList`, `Between`, or function calls.
+///
+/// This is the v3.3 acceptance vocabulary; v3.x can broaden it
+/// (Between, InList, AND-tree walking) without disturbing pruning
+/// semantics.
+fn column_op_literal_for_pruning(
+    expr: &Expr,
+    schema: &SchemaRef,
+) -> Option<(usize, Operator, ScalarValue)> {
+    let Expr::BinaryExpr(binary) = expr else {
+        return None;
+    };
+    let (col_name, op, lit) = match (&*binary.left, &*binary.right) {
+        (Expr::Column(c), Expr::Literal(v, _)) => (&c.name, binary.op, v.clone()),
+        (Expr::Literal(v, _), Expr::Column(c)) => {
+            let flipped = match binary.op {
+                Operator::Eq => Operator::Eq,
+                Operator::NotEq => Operator::NotEq,
+                Operator::Lt => Operator::Gt,
+                Operator::LtEq => Operator::GtEq,
+                Operator::Gt => Operator::Lt,
+                Operator::GtEq => Operator::LtEq,
+                _ => return None,
+            };
+            (&c.name, flipped, v.clone())
+        }
+        _ => return None,
+    };
+    if !matches!(
+        op,
+        Operator::Eq
+            | Operator::NotEq
+            | Operator::Lt
+            | Operator::LtEq
+            | Operator::Gt
+            | Operator::GtEq
+    ) {
+        return None;
+    }
+    let idx = schema.index_of(col_name).ok()?;
+    Some((idx, op, lit))
+}
+
+/// Σ.E2 v3.3: given a row group's per-column stats, decide whether
+/// the row group could possibly contain rows that satisfy `filter`.
+/// Returns `true` if it might (the safe answer when we can't tell);
+/// `false` only when the stats prove no row can match.
+fn row_group_can_match(
+    filter: &Expr,
+    schema: &SchemaRef,
+    rg_stats: &[ColumnStatistics],
+) -> bool {
+    let Some((col_idx, op, lit)) = column_op_literal_for_pruning(filter, schema) else {
+        return true; // unknown shape — don't prune
+    };
+    let stats = match rg_stats.get(col_idx) {
+        Some(s) => s,
+        None => return true,
+    };
+    let (Precision::Exact(min), Precision::Exact(max)) = (&stats.min_value, &stats.max_value)
+    else {
+        return true; // no usable bounds
+    };
+    // ScalarValue comparison is type-aware but only meaningful when the
+    // literal's variant matches the stats variant. For coerced/cast
+    // literals (e.g. Utf8 → Date32 in the parser), the variants would
+    // differ and we'd compare unequal ScalarValues — bail to "true" so
+    // we don't accidentally prune a row group that could in fact match.
+    if std::mem::discriminant(min) != std::mem::discriminant(&lit)
+        || std::mem::discriminant(max) != std::mem::discriminant(&lit)
+    {
+        return true;
+    }
+    match op {
+        Operator::Eq => min <= &lit && &lit <= max,
+        Operator::NotEq => !(min == max && min == &lit),
+        Operator::Lt => min < &lit,
+        Operator::LtEq => min <= &lit,
+        Operator::Gt => max > &lit,
+        Operator::GtEq => max >= &lit,
+        _ => true,
+    }
+}
+
+/// Σ.E2 v3.3: per-row-group, per-column statistics extracted from
+/// parquet metadata. Outer Vec is row-group index, inner Vec is
+/// Arrow field index. Cells with absent/unsupported stats use
+/// `ColumnStatistics::new_unknown()`. Used by `scan()` to prune
+/// row groups whose stats prove a filter can't match.
+fn per_row_group_column_statistics(
+    meta: &datafusion::parquet::file::metadata::ParquetMetaData,
+    arrow_schema: &datafusion::arrow::datatypes::Schema,
+) -> Vec<Vec<ColumnStatistics>> {
+    let num_fields = arrow_schema.fields().len();
+    let mut out = Vec::with_capacity(meta.num_row_groups());
+    for rg_idx in 0..meta.num_row_groups() {
+        let rg = meta.row_group(rg_idx);
+        let mut per_col = Vec::with_capacity(num_fields);
+        for (col_idx, field) in arrow_schema.fields().iter().enumerate() {
+            if col_idx >= rg.num_columns() {
+                per_col.push(ColumnStatistics::new_unknown());
+                continue;
+            }
+            let stats_opt = rg.column(col_idx).statistics();
+            let mut cs = ColumnStatistics::new_unknown();
+            if let Some(stats) = stats_opt {
+                if let Some(nc) = stats.null_count_opt() {
+                    cs.null_count = Precision::Exact(nc as usize);
+                }
+                let (min, max) = rg_min_max_for_arrow_type(stats, field.data_type());
+                if let Some(v) = min {
+                    cs.min_value = Precision::Exact(v);
+                }
+                if let Some(v) = max {
+                    cs.max_value = Precision::Exact(v);
+                }
+            }
+            per_col.push(cs);
+        }
+        out.push(per_col);
+    }
+    out
+}
+
 fn aggregate_column_statistics(
     meta: &datafusion::parquet::file::metadata::ParquetMetaData,
     arrow_schema: &datafusion::arrow::datatypes::Schema,
@@ -202,6 +380,10 @@ pub struct FastParquetTableProvider {
     /// parquet row-group stats at construction so we don't pay the
     /// metadata-read cost on every scan.
     column_stats: Arc<Vec<ColumnStatistics>>,
+    /// Σ.E2 v3.3: per-row-group, per-column stats. Outer index is
+    /// row-group, inner index is field. Used by `scan()` to prune
+    /// row groups whose stats prove a planner filter can't match.
+    row_group_stats: Arc<Vec<Vec<ColumnStatistics>>>,
 }
 
 impl FastParquetTableProvider {
@@ -228,6 +410,7 @@ impl FastParquetTableProvider {
         let num_rows = meta.file_metadata().num_rows().max(0) as usize;
         let parquet_schema: Arc<SchemaDescriptor> = builder.parquet_schema().clone().into();
         let column_stats = Arc::new(aggregate_column_statistics(meta, &schema));
+        let row_group_stats = Arc::new(per_row_group_column_statistics(meta, &schema));
         Ok(Self {
             path,
             schema,
@@ -235,6 +418,7 @@ impl FastParquetTableProvider {
             num_rows,
             parquet_schema,
             column_stats,
+            row_group_stats,
         })
     }
 
@@ -271,11 +455,33 @@ impl TableProvider for FastParquetTableProvider {
         TableType::Base
     }
 
+    /// Σ.E2 v3.3: report filters we can use for row-group pruning as
+    /// `Inexact`. That tells DataFusion to keep the parent `FilterExec`
+    /// (we don't actually apply the predicate to surviving rows — we
+    /// only skip row groups that can't possibly match) AND to pass us
+    /// the filter expressions in `scan()`.
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&Expr],
+    ) -> DfResult<Vec<datafusion::logical_expr::TableProviderFilterPushDown>> {
+        use datafusion::logical_expr::TableProviderFilterPushDown;
+        Ok(filters
+            .iter()
+            .map(|f| {
+                if column_op_literal_for_pruning(f, &self.schema).is_some() {
+                    TableProviderFilterPushDown::Inexact
+                } else {
+                    TableProviderFilterPushDown::Unsupported
+                }
+            })
+            .collect())
+    }
+
     async fn scan(
         &self,
         state: &dyn Session,
         projection: Option<&Vec<usize>>,
-        _filters: &[Expr],
+        filters: &[Expr],
         _limit: Option<usize>,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
         // Build the projected output schema. parquet-rs uses leaf-column
@@ -294,7 +500,23 @@ impl TableProvider for FastParquetTableProvider {
         let projected_schema: SchemaRef =
             Arc::new(datafusion::arrow::datatypes::Schema::new(projected_fields));
 
-        // Partition count = min(num_row_groups, target_partitions).
+        // Σ.E2 v3.3: row-group pruning. For each row group, check
+        // whether every filter has at least the possibility of
+        // matching given the column's min/max stats. If any filter
+        // proves disjoint, skip the row group entirely.
+        //
+        // FilterExec stays in the plan and applies the real predicate
+        // to surviving rows — we never claim a filter, only use it
+        // advisory-style to shrink work.
+        let surviving_row_groups: Vec<usize> = (0..self.num_row_groups)
+            .filter(|&rg| {
+                filters
+                    .iter()
+                    .all(|f| row_group_can_match(f, &self.schema, &self.row_group_stats[rg]))
+            })
+            .collect();
+
+        // Partition count = min(surviving_row_groups, target_partitions).
         //
         // Why not `target_partitions` directly: when a parquet file
         // has fewer row groups than CPUs (e.g. SF=1 lineitem has 6
@@ -311,16 +533,21 @@ impl TableProvider for FastParquetTableProvider {
         // DataFusion still adds a RoundRobinBatch above us. v3 work
         // can split row groups into byte ranges to remove that.
         let target_partitions = state.config().options().execution.target_partitions;
-        let num_partitions = self.num_row_groups.min(target_partitions).max(1);
+        let num_partitions = surviving_row_groups.len().min(target_partitions).max(1);
 
-        // partition i gets row groups {i, i+N, i+2N, …} ∩ [0, num_row_groups).
+        // partition i gets surviving row groups {i, i+N, i+2N, …}.
         let mut assignments: Vec<Vec<usize>> = vec![Vec::new(); num_partitions];
-        for rg in 0..self.num_row_groups {
-            assignments[rg % num_partitions].push(rg);
+        for (idx, rg) in surviving_row_groups.iter().enumerate() {
+            assignments[idx % num_partitions].push(*rg);
         }
 
-        // Project the column-statistics vector to match the projected
-        // schema. ColumnStatistics are positional in field order.
+        // Project the file-level column-statistics vector to match
+        // the projected schema. The exec uses these to advertise
+        // partition_statistics to the planner (e.g. for join build-
+        // side selection). When pruning happened, the file-level
+        // stats may overestimate vs the surviving row groups; that's
+        // acceptable for v3.3 — refining to match the surviving set
+        // is v3.x polish.
         let projected_col_stats: Vec<ColumnStatistics> = projected_indices
             .iter()
             .map(|&i| self.column_stats[i].clone())
@@ -388,6 +615,14 @@ impl FastParquetExec {
             parquet_schema,
             properties,
         })
+    }
+
+    /// Σ.E2 v3.3 observability: total parquet row groups assigned
+    /// across all partitions in this exec. Lets tests verify that
+    /// row-group pruning happened (count drops below the file's
+    /// total) without piping a new metric through `partition_statistics`.
+    pub fn total_assigned_row_groups(&self) -> usize {
+        self.assignments.iter().map(|a| a.len()).sum()
     }
 }
 
@@ -750,5 +985,107 @@ mod tests {
             rel_err < 1e-10,
             "Q6 revenue mismatch: ours={v}, ref={v_ref} (rel_err={rel_err:e})"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Σ.E2 v3.3: row-group statistics pruning.
+    //
+    // These tests fail until `scan()` consults per-row-group min/max
+    // stats against the planner's filters and removes row groups whose
+    // stats prove they cannot match. FilterExec stays (we never claim
+    // the filters); v3.3 only shrinks the work before it starts.
+    // -----------------------------------------------------------------
+
+    /// Walk a physical plan looking for the `FastParquetExec` node and
+    /// return its assigned row-group total. Returns `None` if no
+    /// `FastParquetExec` was found.
+    fn find_assigned_row_groups(plan: &Arc<dyn ExecutionPlan>) -> Option<usize> {
+        if let Some(exec) = plan.as_any().downcast_ref::<FastParquetExec>() {
+            return Some(exec.total_assigned_row_groups());
+        }
+        for child in plan.children() {
+            if let Some(n) = find_assigned_row_groups(child) {
+                return Some(n);
+            }
+        }
+        None
+    }
+
+    async fn plan_against_fast_parquet(sql: &str) -> Option<Arc<dyn ExecutionPlan>> {
+        use datafusion::prelude::SessionContext;
+        let path = lineitem_parquet()?;
+        let ctx = SessionContext::new();
+        let prov = FastParquetTableProvider::try_new(path).unwrap();
+        ctx.register_table("lineitem", Arc::new(prov)).unwrap();
+        let df = ctx.sql(sql).await.unwrap();
+        Some(df.create_physical_plan().await.unwrap())
+    }
+
+    /// v3.3: a filter that no row group can satisfy must remove every
+    /// row group from the scan. The SF=1 lineitem `l_orderkey` range
+    /// is 1..6_001_215; `> 999_999_999` is provably empty.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn row_group_pruning_impossible_predicate_skips_all() {
+        let Some(plan) = plan_against_fast_parquet(
+            "SELECT count(*) FROM lineitem WHERE l_orderkey > 999999999",
+        )
+        .await
+        else {
+            eprintln!("TPC-H SF=1 data not generated; skipping test");
+            return;
+        };
+        let rgs = find_assigned_row_groups(&plan).expect("FastParquetExec in plan");
+        assert_eq!(
+            rgs, 0,
+            "expected all 6 row groups pruned (impossible predicate); got {rgs}"
+        );
+    }
+
+    /// v3.3: a filter that every row group can satisfy must keep all
+    /// row groups (regression guard against over-eager pruning).
+    /// `l_orderkey BETWEEN 1 AND 6_001_215` covers the entire range.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn row_group_pruning_inclusive_predicate_keeps_all() {
+        let Some(plan) = plan_against_fast_parquet(
+            "SELECT count(*) FROM lineitem WHERE l_orderkey >= 1 AND l_orderkey <= 6001215",
+        )
+        .await
+        else {
+            eprintln!("TPC-H SF=1 data not generated; skipping test");
+            return;
+        };
+        let rgs = find_assigned_row_groups(&plan).expect("FastParquetExec in plan");
+        assert_eq!(
+            rgs, 6,
+            "expected all 6 row groups kept (predicate matches full range); got {rgs}"
+        );
+    }
+
+    /// v3.3: results must remain correct when pruning skips every RG
+    /// (no crash on empty assignments; count returns 0).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn row_group_pruning_correctness_when_all_pruned() {
+        let Some(path) = lineitem_parquet() else {
+            eprintln!("TPC-H SF=1 data not generated; skipping test");
+            return;
+        };
+        use datafusion::prelude::SessionContext;
+        let ctx = SessionContext::new();
+        let prov = FastParquetTableProvider::try_new(path).unwrap();
+        ctx.register_table("lineitem", Arc::new(prov)).unwrap();
+        let batches = ctx
+            .sql("SELECT count(*) FROM lineitem WHERE l_orderkey > 999999999")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let n = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::Int64Array>()
+            .unwrap()
+            .value(0);
+        assert_eq!(n, 0, "impossible predicate must return 0 rows");
     }
 }
