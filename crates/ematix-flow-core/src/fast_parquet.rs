@@ -751,4 +751,168 @@ mod tests {
             "Q6 revenue mismatch: ours={v}, ref={v_ref} (rel_err={rel_err:e})"
         );
     }
+
+    // -----------------------------------------------------------------
+    // Σ.E2 v3.1: static-predicate pushdown.
+    //
+    // These tests fail until `FastParquetExec` implements
+    // `gather_filters_for_pushdown` + `handle_child_pushdown_result`
+    // and applies received primitive `Column = Literal` filters via
+    // parquet-rs `with_row_filter`. They define what v3.1 must achieve.
+    // -----------------------------------------------------------------
+
+    /// v3.1: `WHERE l_shipmode = 'MAIL'` must produce the same row
+    /// count via FastParquet as via DataFusion's default provider.
+    /// This is the correctness regression guard — it must pass before
+    /// and after pushdown lands.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pushdown_count_correctness_string_eq() {
+        let Some(path) = lineitem_parquet() else {
+            eprintln!("TPC-H SF=1 data not generated; skipping test");
+            return;
+        };
+        use datafusion::prelude::SessionContext;
+        let sql = "SELECT count(*) FROM lineitem WHERE l_shipmode = 'MAIL'";
+
+        // Reference: default DataFusion parquet path.
+        let ctx_ref = SessionContext::new();
+        ctx_ref
+            .register_parquet("lineitem", &path, Default::default())
+            .await
+            .unwrap();
+        let r_ref = ctx_ref.sql(sql).await.unwrap().collect().await.unwrap();
+        let v_ref = r_ref[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::Int64Array>()
+            .unwrap()
+            .value(0);
+
+        // FastParquet provider.
+        let ctx = SessionContext::new();
+        let prov = FastParquetTableProvider::try_new(path).unwrap();
+        ctx.register_table("lineitem", Arc::new(prov)).unwrap();
+        let r = ctx.sql(sql).await.unwrap().collect().await.unwrap();
+        let v = r[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::Int64Array>()
+            .unwrap()
+            .value(0);
+
+        assert_eq!(
+            v, v_ref,
+            "l_shipmode=MAIL count mismatch: ours={v}, ref={v_ref}"
+        );
+    }
+
+    /// v3.1: `WHERE l_orderkey = 1` against FastParquet must return
+    /// the same rows as DataFusion's default provider (primitive Int64
+    /// equality is the simplest pushdown shape).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pushdown_count_correctness_int_eq() {
+        let Some(path) = lineitem_parquet() else {
+            eprintln!("TPC-H SF=1 data not generated; skipping test");
+            return;
+        };
+        use datafusion::prelude::SessionContext;
+        let sql = "SELECT count(*) FROM lineitem WHERE l_orderkey = 1";
+
+        let ctx_ref = SessionContext::new();
+        ctx_ref
+            .register_parquet("lineitem", &path, Default::default())
+            .await
+            .unwrap();
+        let v_ref = ctx_ref.sql(sql).await.unwrap().collect().await.unwrap()[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::Int64Array>()
+            .unwrap()
+            .value(0);
+
+        let ctx = SessionContext::new();
+        let prov = FastParquetTableProvider::try_new(path).unwrap();
+        ctx.register_table("lineitem", Arc::new(prov)).unwrap();
+        let v = ctx.sql(sql).await.unwrap().collect().await.unwrap()[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::Int64Array>()
+            .unwrap()
+            .value(0);
+
+        assert_eq!(
+            v, v_ref,
+            "l_orderkey=1 count mismatch: ours={v}, ref={v_ref}"
+        );
+    }
+
+    /// v3.1: the physical plan for a single-column-eq filter on
+    /// FastParquet must not have a `FilterExec` between the scan and
+    /// the consumer. If `FilterExec` survives, the planner thinks
+    /// FastParquet couldn't handle the filter — meaning pushdown
+    /// didn't happen. This is the plan-level pushdown signal.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pushdown_plan_eliminates_filter_exec() {
+        let Some(path) = lineitem_parquet() else {
+            eprintln!("TPC-H SF=1 data not generated; skipping test");
+            return;
+        };
+        use datafusion::physical_plan::displayable;
+        use datafusion::prelude::SessionContext;
+
+        let ctx = SessionContext::new();
+        let prov = FastParquetTableProvider::try_new(path).unwrap();
+        ctx.register_table("lineitem", Arc::new(prov)).unwrap();
+        let df = ctx
+            .sql("SELECT count(*) FROM lineitem WHERE l_orderkey = 1")
+            .await
+            .unwrap();
+        let plan = df.create_physical_plan().await.unwrap();
+        let rendered = format!("{}", displayable(plan.as_ref()).indent(true));
+        assert!(
+            !rendered.contains("FilterExec"),
+            "expected FastParquet to absorb the filter so no FilterExec \
+             remains in the plan; got:\n{rendered}"
+        );
+    }
+
+    /// v3.1: unsupported predicate shapes (e.g. `LIKE` patterns) must
+    /// still produce correct results — FastParquet should report them
+    /// as `Unsupported` so DataFusion keeps the `FilterExec`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pushdown_unsupported_falls_back_correctly() {
+        let Some(path) = lineitem_parquet() else {
+            eprintln!("TPC-H SF=1 data not generated; skipping test");
+            return;
+        };
+        use datafusion::prelude::SessionContext;
+        let sql = "SELECT count(*) FROM lineitem WHERE l_shipmode LIKE 'M%'";
+
+        let ctx_ref = SessionContext::new();
+        ctx_ref
+            .register_parquet("lineitem", &path, Default::default())
+            .await
+            .unwrap();
+        let v_ref = ctx_ref.sql(sql).await.unwrap().collect().await.unwrap()[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::Int64Array>()
+            .unwrap()
+            .value(0);
+
+        let ctx = SessionContext::new();
+        let prov = FastParquetTableProvider::try_new(path).unwrap();
+        ctx.register_table("lineitem", Arc::new(prov)).unwrap();
+        let v = ctx.sql(sql).await.unwrap().collect().await.unwrap()[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::Int64Array>()
+            .unwrap()
+            .value(0);
+
+        assert_eq!(
+            v, v_ref,
+            "LIKE 'M%' count must be correct even when pushdown declines"
+        );
+    }
 }
