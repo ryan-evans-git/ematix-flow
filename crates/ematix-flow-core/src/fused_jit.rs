@@ -318,6 +318,549 @@ impl Q6JitFn {
 unsafe impl Send for Q6JitFn {}
 unsafe impl Sync for Q6JitFn {}
 
+// ===========================================================================
+// Σ.D3 phase A: data-driven IR emitter (FusedFilterAggJit).
+// ===========================================================================
+//
+// `Q6JitFn` above is the day-1 scaffold — it bakes Q6's specific predicate
+// shape into hard-coded IR builder calls. Phase A factors out the spec from
+// the emitter: define a `FusedFilterAggSpec` data model (typed column slots,
+// AND-chain predicate, list of aggregates), and emit IR that walks the spec.
+// Q6's shape becomes one possible spec; the existing `try_build_q6_canonical`
+// reduces to "construct that spec, hand it to the generic builder."
+//
+// The generic builder is what Σ.D phase B/C/D extend with:
+//   * group-by (one accumulator block per group key)
+//   * StringView column types (prefix-check on 16-byte view layout)
+//   * direct-indexed probe bitmaps (Q14)
+//   * CASE-WHEN-guarded aggregates (Q14 PROMO%)
+//
+// For now we cover the subset needed to retrofit Σ.D1 (Q6 / FusedFilterSumExec):
+// Float64 / Date32 / Int32 / Int64 columns, AND-chain predicate, 1+ SUM
+// aggregates where each is either `SUM(col)` or `SUM(col_a * col_b)`.
+
+/// Cranelift-renderable column type. Picks the load width + cranelift IR
+/// type when the emitter reads `column[i]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColumnTy {
+    Float64,
+    Date32,
+    Int32,
+    Int64,
+}
+
+impl ColumnTy {
+    /// Byte width of one element in the column buffer.
+    fn elem_size(self) -> i64 {
+        match self {
+            ColumnTy::Float64 | ColumnTy::Int64 => 8,
+            ColumnTy::Date32 | ColumnTy::Int32 => 4,
+        }
+    }
+    /// Cranelift IR type for a loaded element. Currently used by the
+    /// Phase B/C extensions (StringView, group-by) being built on top
+    /// of this scaffold — kept here so the type-mapping lives next to
+    /// `elem_size` and stays in sync.
+    #[allow(dead_code)]
+    fn ir_ty(self) -> Type {
+        match self {
+            ColumnTy::Float64 => types::F64,
+            ColumnTy::Date32 | ColumnTy::Int32 => types::I32,
+            ColumnTy::Int64 => types::I64,
+        }
+    }
+}
+
+/// One clause of the AND-chain predicate. `column` indexes
+/// [`FusedFilterAggSpec::inputs`]. The op picks the comparison, and the
+/// immediate (whichever field matches the op's domain) becomes a baked-in
+/// constant in the IR.
+#[derive(Debug, Clone, Copy)]
+pub struct Clause {
+    pub column: usize,
+    pub op: ClauseOp,
+    pub imm_i32: i32,
+    pub imm_f64: f64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum ClauseOp {
+    /// Float64 column `>= imm_f64`.
+    F64Ge,
+    /// Float64 column `<= imm_f64`.
+    F64Le,
+    /// Float64 column `<  imm_f64`.
+    F64Lt,
+    /// Float64 column `>  imm_f64`.
+    F64Gt,
+    /// Int32 (or Date32 = Int32) column `>= imm_i32`.
+    I32Ge,
+    /// Int32 (or Date32) column `<  imm_i32`.
+    I32Lt,
+    /// Int32 (or Date32) column `<= imm_i32`.
+    I32Le,
+    /// Int32 (or Date32) column `>  imm_i32`.
+    I32Gt,
+}
+
+/// One aggregate expression evaluated for each matching row. The output
+/// is always f64 (DataFusion's SUM-of-numeric default). One `AggExpr`
+/// produces one entry in the JIT'd function's `outputs[]` array.
+#[derive(Debug, Clone, Copy)]
+pub enum AggExpr {
+    /// `SUM(col[i])` — column must be Float64.
+    SumColumn(usize),
+    /// `SUM(col[a] * col[b])` — both columns must be Float64. Q6's
+    /// `SUM(l_extendedprice * l_discount)` shape.
+    SumProductColumns(usize, usize),
+}
+
+/// Top-level spec. Owns the slots all three families (predicate, aggs,
+/// inputs) describe by index. Validated at JIT-build time.
+#[derive(Debug, Clone, Default)]
+pub struct FusedFilterAggSpec {
+    pub inputs: Vec<ColumnTy>,
+    pub predicate: Vec<Clause>,
+    pub aggregates: Vec<AggExpr>,
+}
+
+impl FusedFilterAggSpec {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    /// Q6 spec: shipdate ∈ [date_lo, date_hi), discount ∈ [disc_lo, disc_hi],
+    /// quantity < qty_hi; one aggregate, SUM(extprice * discount). Inputs
+    /// are ordered as in the hand-coded path: shipdate (0), discount (1),
+    /// quantity (2), extprice (3).
+    pub fn q6(date_lo: i32, date_hi: i32, disc_lo: f64, disc_hi: f64, qty_hi: f64) -> Self {
+        Self {
+            inputs: vec![
+                ColumnTy::Date32,
+                ColumnTy::Float64,
+                ColumnTy::Float64,
+                ColumnTy::Float64,
+            ],
+            predicate: vec![
+                Clause {
+                    column: 0,
+                    op: ClauseOp::I32Ge,
+                    imm_i32: date_lo,
+                    imm_f64: 0.0,
+                },
+                Clause {
+                    column: 0,
+                    op: ClauseOp::I32Lt,
+                    imm_i32: date_hi,
+                    imm_f64: 0.0,
+                },
+                Clause {
+                    column: 1,
+                    op: ClauseOp::F64Ge,
+                    imm_i32: 0,
+                    imm_f64: disc_lo,
+                },
+                Clause {
+                    column: 1,
+                    op: ClauseOp::F64Le,
+                    imm_i32: 0,
+                    imm_f64: disc_hi,
+                },
+                Clause {
+                    column: 2,
+                    op: ClauseOp::F64Lt,
+                    imm_i32: 0,
+                    imm_f64: qty_hi,
+                },
+            ],
+            aggregates: vec![AggExpr::SumProductColumns(3, 1)],
+        }
+    }
+}
+
+/// Generic JIT-built fused filter+aggregate function. Same lifetime/ABI
+/// shape as [`Q6JitFn`], but built from a [`FusedFilterAggSpec`].
+pub struct FusedFilterAggJit {
+    _module: JITModule,
+    func_ptr: *const u8,
+    n_inputs: usize,
+    n_outputs: usize,
+}
+
+/// Fixed-arity FFI for any spec. The IR loads each per-column pointer
+/// once at function entry from `inputs[k]`, then runs the loop. Outputs
+/// are read pre-seeded (so cross-shard merging can add into a global) and
+/// stored back at exit.
+pub type FusedFilterAggFn =
+    unsafe extern "C" fn(n: i64, inputs: *const *const u8, outputs: *mut f64);
+
+impl FusedFilterAggJit {
+    pub fn try_build(spec: &FusedFilterAggSpec) -> Result<Self, String> {
+        validate_spec(spec)?;
+        let n_inputs = spec.inputs.len();
+        let n_outputs = spec.aggregates.len();
+
+        // ----- 1. JIT module + ISA (identical to Q6JitFn) -----
+        let mut flag_builder = settings::builder();
+        flag_builder
+            .set("use_colocated_libcalls", "false")
+            .map_err(|e| format!("flag use_colocated_libcalls: {e}"))?;
+        flag_builder
+            .set("is_pic", "false")
+            .map_err(|e| format!("flag is_pic: {e}"))?;
+        flag_builder
+            .set("opt_level", "speed")
+            .map_err(|e| format!("flag opt_level: {e}"))?;
+        let flags = settings::Flags::new(flag_builder);
+        let isa_builder =
+            cranelift_native::builder().map_err(|e| format!("cranelift_native::builder: {e}"))?;
+        let isa = isa_builder
+            .finish(flags)
+            .map_err(|e| format!("isa.finish: {e}"))?;
+        let builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
+        let mut module = JITModule::new(builder);
+        let ptr_ty = module.target_config().pointer_type();
+
+        // ----- 2. Fixed-arity signature -----
+        let mut sig = Signature::new(CallConv::SystemV);
+        sig.params.push(AbiParam::new(types::I64)); // n
+        sig.params.push(AbiParam::new(ptr_ty)); // inputs: *const *const u8
+        sig.params.push(AbiParam::new(ptr_ty)); // outputs: *mut f64
+
+        let func_id = module
+            .declare_function("fused_filter_agg", Linkage::Local, &sig)
+            .map_err(|e| format!("declare_function: {e}"))?;
+
+        // ----- 3. Build the IR -----
+        let mut ctx = module.make_context();
+        ctx.func = Function::with_name_signature(UserFuncName::default(), sig.clone());
+        let mut fb_ctx = FunctionBuilderContext::new();
+        let mut builder = FunctionBuilder::new(&mut ctx.func, &mut fb_ctx);
+
+        let entry = builder.create_block();
+        let loop_header = builder.create_block();
+        let loop_body = builder.create_block();
+        let row_match = builder.create_block();
+        let row_skip = builder.create_block();
+        let loop_exit = builder.create_block();
+
+        builder.append_block_params_for_function_params(entry);
+
+        // loop_header carries: i (i64) + one f64 accumulator per aggregate.
+        builder.append_block_param(loop_header, types::I64);
+        for _ in 0..n_outputs {
+            builder.append_block_param(loop_header, types::F64);
+        }
+
+        builder.switch_to_block(entry);
+        builder.seal_block(entry);
+        let p_n = builder.block_params(entry)[0];
+        let p_inputs = builder.block_params(entry)[1];
+        let p_outputs = builder.block_params(entry)[2];
+
+        // Load each input column's base pointer once from inputs[k]. We
+        // store these in a Vec<Value> indexed by column-spec order — the
+        // hot loop references col_ptrs[clause.column] / [agg.column].
+        let ptr_size = i64::from(ptr_ty.bytes());
+        let mut col_ptrs: Vec<Value> = Vec::with_capacity(n_inputs);
+        for k in 0..n_inputs {
+            let off = builder.ins().iconst(types::I64, (k as i64) * ptr_size);
+            let slot = builder.ins().iadd(p_inputs, off);
+            let v = builder
+                .ins()
+                .load(ptr_ty, MemFlags::trusted(), slot, 0);
+            col_ptrs.push(v);
+        }
+
+        // Pre-seed accumulators from outputs[k] (caller may have set
+        // them to merge into a shared total across shards).
+        let f64_size = i64::from(types::F64.bytes());
+        let mut init_sums: Vec<Value> = Vec::with_capacity(n_outputs);
+        for k in 0..n_outputs {
+            let off = builder
+                .ins()
+                .iconst(types::I64, (k as i64) * f64_size);
+            let slot = builder.ins().iadd(p_outputs, off);
+            let v = builder.ins().load(types::F64, MemFlags::trusted(), slot, 0);
+            init_sums.push(v);
+        }
+
+        let zero_i = builder.ins().iconst(types::I64, 0);
+        let mut entry_args = Vec::with_capacity(1 + n_outputs);
+        entry_args.push(zero_i);
+        entry_args.extend(init_sums.iter().copied());
+        builder.ins().jump(loop_header, &entry_args);
+
+        // ----- Loop header: i < n ? body : exit -----
+        builder.switch_to_block(loop_header);
+        let i = builder.block_params(loop_header)[0];
+        // Snapshot the running-sum block-param IDs (avoid borrow conflicts
+        // with `builder.ins()` inside the loop body).
+        let header_sums: Vec<Value> =
+            (0..n_outputs).map(|k| builder.block_params(loop_header)[1 + k]).collect();
+        let cmp = builder.ins().icmp(IntCC::SignedLessThan, i, p_n);
+        builder.ins().brif(cmp, loop_body, &[], loop_exit, &[]);
+
+        // ----- Loop body: emit predicate eval, accumulate sums for match -----
+        builder.switch_to_block(loop_body);
+        builder.seal_block(loop_body);
+
+        // Evaluate each clause, AND them. Each clause loads its column
+        // at column[i], compares to the immediate, produces an i8 (0/1)
+        // mask.
+        let mut clause_masks: Vec<Value> = Vec::with_capacity(spec.predicate.len());
+        for clause in &spec.predicate {
+            let col_ty = spec.inputs[clause.column];
+            let mask =
+                emit_clause(&mut builder, col_ptrs[clause.column], col_ty, i, *clause);
+            clause_masks.push(mask);
+        }
+        // AND all masks. If the predicate is empty (rare — every row
+        // passes), we use a constant true.
+        let pass_all = if clause_masks.is_empty() {
+            builder.ins().iconst(types::I8, 1)
+        } else {
+            clause_masks
+                .into_iter()
+                .reduce(|a, b| builder.ins().band(a, b))
+                .unwrap()
+        };
+        builder.ins().brif(pass_all, row_match, &[], row_skip, &[]);
+
+        // ----- Match path: compute each AggExpr, add to its accumulator -----
+        builder.switch_to_block(row_match);
+        builder.seal_block(row_match);
+        let mut new_sums: Vec<Value> = Vec::with_capacity(n_outputs);
+        for (k, agg) in spec.aggregates.iter().enumerate() {
+            let term = emit_agg_term(&mut builder, &col_ptrs, &spec.inputs, i, *agg);
+            let new = builder.ins().fadd(header_sums[k], term);
+            new_sums.push(new);
+        }
+        let next_i = builder.ins().iadd_imm(i, 1);
+        let mut match_args = Vec::with_capacity(1 + n_outputs);
+        match_args.push(next_i);
+        match_args.extend(new_sums.iter().copied());
+        builder.ins().jump(loop_header, &match_args);
+
+        // ----- Skip path: pass sums through unchanged -----
+        builder.switch_to_block(row_skip);
+        builder.seal_block(row_skip);
+        let next_i_skip = builder.ins().iadd_imm(i, 1);
+        let mut skip_args = Vec::with_capacity(1 + n_outputs);
+        skip_args.push(next_i_skip);
+        skip_args.extend(header_sums.iter().copied());
+        builder.ins().jump(loop_header, &skip_args);
+
+        builder.seal_block(loop_header);
+
+        // ----- Exit: store each final sum back to outputs[k] -----
+        builder.switch_to_block(loop_exit);
+        builder.seal_block(loop_exit);
+        for k in 0..n_outputs {
+            let off = builder
+                .ins()
+                .iconst(types::I64, (k as i64) * f64_size);
+            let slot = builder.ins().iadd(p_outputs, off);
+            // Note: at loop_exit we read header_sums[k] (sealed values).
+            builder
+                .ins()
+                .store(MemFlags::trusted(), header_sums[k], slot, 0);
+        }
+        builder.ins().return_(&[]);
+        builder.finalize();
+
+        // ----- 4. Verify + define + finalize -----
+        verify_function(&ctx.func, module.isa())
+            .map_err(|e| format!("verify_function: {e}"))?;
+        module
+            .define_function(func_id, &mut ctx)
+            .map_err(|e| format!("define_function: {e}"))?;
+        module.clear_context(&mut ctx);
+        module
+            .finalize_definitions()
+            .map_err(|e| format!("finalize_definitions: {e}"))?;
+        let func_ptr = module.get_finalized_function(func_id);
+        Ok(Self {
+            _module: module,
+            func_ptr,
+            n_inputs,
+            n_outputs,
+        })
+    }
+
+    /// Number of input columns the JIT'd function expects in `inputs[]`.
+    pub fn n_inputs(&self) -> usize {
+        self.n_inputs
+    }
+    /// Number of aggregate outputs the JIT'd function writes to `outputs[]`.
+    pub fn n_outputs(&self) -> usize {
+        self.n_outputs
+    }
+
+    /// Run the JIT'd function. `inputs` must point to an array of
+    /// `self.n_inputs()` `*const u8` (each pointing at a column buffer
+    /// with at least `n` elements). `outputs` must point to a buffer of
+    /// `self.n_outputs()` f64 (caller initializes to 0 unless merging).
+    ///
+    /// # Safety
+    /// - `inputs[k]` must be non-null, properly aligned for the spec's
+    ///   `inputs[k]` element type, and have at least `n` elements.
+    /// - `outputs` must be non-null, properly aligned f64, and have at
+    ///   least `n_outputs()` elements.
+    pub unsafe fn run(&self, n: i64, inputs: *const *const u8, outputs: *mut f64) {
+        // SAFETY: caller upholds the contract documented above.
+        unsafe {
+            let func: FusedFilterAggFn = mem::transmute(self.func_ptr);
+            func(n, inputs, outputs);
+        }
+    }
+}
+
+// SAFETY: same reasoning as Q6JitFn — emitted code reads only from input
+// slices and writes to an out-buffer; no shared mutable state internally.
+unsafe impl Send for FusedFilterAggJit {}
+unsafe impl Sync for FusedFilterAggJit {}
+
+// Cranelift's `JITModule` doesn't implement `Debug`, so we provide a
+// minimal manual impl. This is needed because `FusedFilterSumExec`
+// derives `Debug` and now holds an `Option<Arc<FusedFilterAggJit>>`.
+impl std::fmt::Debug for FusedFilterAggJit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FusedFilterAggJit")
+            .field("n_inputs", &self.n_inputs)
+            .field("n_outputs", &self.n_outputs)
+            .field("func_ptr", &self.func_ptr)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Reject specs the emitter doesn't yet support, so the IR builder code
+/// can rely on validated invariants (e.g. AggExpr columns are Float64).
+fn validate_spec(spec: &FusedFilterAggSpec) -> Result<(), String> {
+    for (i, c) in spec.predicate.iter().enumerate() {
+        if c.column >= spec.inputs.len() {
+            return Err(format!(
+                "FusedFilterAggSpec: clause {i} references column {} but only {} inputs declared",
+                c.column,
+                spec.inputs.len()
+            ));
+        }
+        let ct = spec.inputs[c.column];
+        let ok = match c.op {
+            ClauseOp::F64Ge | ClauseOp::F64Le | ClauseOp::F64Lt | ClauseOp::F64Gt => {
+                ct == ColumnTy::Float64
+            }
+            ClauseOp::I32Ge | ClauseOp::I32Le | ClauseOp::I32Lt | ClauseOp::I32Gt => {
+                ct == ColumnTy::Date32 || ct == ColumnTy::Int32
+            }
+        };
+        if !ok {
+            return Err(format!(
+                "FusedFilterAggSpec: clause {i} op {:?} incompatible with column type {:?}",
+                c.op, ct
+            ));
+        }
+    }
+    for (i, a) in spec.aggregates.iter().enumerate() {
+        let cols: &[usize] = match a {
+            AggExpr::SumColumn(c) => std::slice::from_ref(c),
+            AggExpr::SumProductColumns(a, b) => {
+                if a == b {
+                    return Err(format!(
+                        "FusedFilterAggSpec: aggregate {i} multiplies a column by itself"
+                    ));
+                }
+                &[*a, *b][..]
+            }
+        };
+        for &c in cols {
+            if c >= spec.inputs.len() {
+                return Err(format!(
+                    "FusedFilterAggSpec: aggregate {i} references column {c} but only {} inputs",
+                    spec.inputs.len()
+                ));
+            }
+            if spec.inputs[c] != ColumnTy::Float64 {
+                return Err(format!(
+                    "FusedFilterAggSpec: aggregate {i} column {c} must be Float64, got {:?}",
+                    spec.inputs[c]
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Emit IR for `column[i] OP imm`, returning an i8 boolean mask.
+fn emit_clause(
+    builder: &mut FunctionBuilder,
+    col_base: Value,
+    col_ty: ColumnTy,
+    i: Value,
+    clause: Clause,
+) -> Value {
+    let elem_size = builder.ins().iconst(types::I64, col_ty.elem_size());
+    let off = builder.ins().imul(i, elem_size);
+    let slot = builder.ins().iadd(col_base, off);
+    match clause.op {
+        ClauseOp::F64Ge | ClauseOp::F64Le | ClauseOp::F64Lt | ClauseOp::F64Gt => {
+            let v = builder
+                .ins()
+                .load(types::F64, MemFlags::trusted(), slot, 0);
+            let imm = builder.ins().f64const(clause.imm_f64);
+            let cc = match clause.op {
+                ClauseOp::F64Ge => FloatCC::GreaterThanOrEqual,
+                ClauseOp::F64Le => FloatCC::LessThanOrEqual,
+                ClauseOp::F64Lt => FloatCC::LessThan,
+                ClauseOp::F64Gt => FloatCC::GreaterThan,
+                _ => unreachable!(),
+            };
+            builder.ins().fcmp(cc, v, imm)
+        }
+        ClauseOp::I32Ge | ClauseOp::I32Le | ClauseOp::I32Lt | ClauseOp::I32Gt => {
+            let v = builder
+                .ins()
+                .load(types::I32, MemFlags::trusted(), slot, 0);
+            let imm = builder
+                .ins()
+                .iconst(types::I32, i64::from(clause.imm_i32));
+            let cc = match clause.op {
+                ClauseOp::I32Ge => IntCC::SignedGreaterThanOrEqual,
+                ClauseOp::I32Le => IntCC::SignedLessThanOrEqual,
+                ClauseOp::I32Lt => IntCC::SignedLessThan,
+                ClauseOp::I32Gt => IntCC::SignedGreaterThan,
+                _ => unreachable!(),
+            };
+            builder.ins().icmp(cc, v, imm)
+        }
+    }
+}
+
+/// Emit IR for one `AggExpr` evaluated at row `i`, returning the f64
+/// contribution (already validated as a Float64 column or product).
+fn emit_agg_term(
+    builder: &mut FunctionBuilder,
+    col_ptrs: &[Value],
+    col_tys: &[ColumnTy],
+    i: Value,
+    agg: AggExpr,
+) -> Value {
+    let load_f64 = |b: &mut FunctionBuilder, col: usize| -> Value {
+        debug_assert_eq!(col_tys[col], ColumnTy::Float64);
+        let elem_size = b.ins().iconst(types::I64, 8);
+        let off = b.ins().imul(i, elem_size);
+        let slot = b.ins().iadd(col_ptrs[col], off);
+        b.ins().load(types::F64, MemFlags::trusted(), slot, 0)
+    };
+    match agg {
+        AggExpr::SumColumn(c) => load_f64(builder, c),
+        AggExpr::SumProductColumns(a, b_idx) => {
+            let av = load_f64(builder, a);
+            let bv = load_f64(builder, b_idx);
+            builder.ins().fmul(av, bv)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -411,5 +954,188 @@ mod tests {
             (running - 2.0).abs() < 1e-9,
             "expected 2.0 (only row 1 matched), got {running}",
         );
+    }
+
+    // ----- Phase A: spec-driven generic emitter -----
+    //
+    // These tests establish two invariants:
+    //   1. The generic emitter produces the same result as the Q6
+    //      hand-coded path for Q6's spec ("equivalence").
+    //   2. The emitter handles a second shape (single SumColumn aggregate,
+    //      no products) so we know the spec walk is data-driven and not
+    //      accidentally hard-coding Q6.
+
+    /// Helper: invoke the generic JIT on a Q6-shaped batch via the
+    /// fixed-arity `inputs/outputs` array form.
+    fn run_generic_q6(
+        jit: &FusedFilterAggJit,
+        shipdate: &[i32],
+        discount: &[f64],
+        quantity: &[f64],
+        extprice: &[f64],
+    ) -> f64 {
+        let inputs: [*const u8; 4] = [
+            shipdate.as_ptr().cast::<u8>(),
+            discount.as_ptr().cast::<u8>(),
+            quantity.as_ptr().cast::<u8>(),
+            extprice.as_ptr().cast::<u8>(),
+        ];
+        let mut outputs: [f64; 1] = [0.0];
+        // SAFETY: inputs all have length >= n; outputs has len >= 1; pointer
+        // alignment is upheld by the source slices' element type.
+        unsafe {
+            jit.run(
+                shipdate.len() as i64,
+                inputs.as_ptr(),
+                outputs.as_mut_ptr(),
+            );
+        }
+        outputs[0]
+    }
+
+    #[test]
+    fn generic_jit_q6_spec_matches_q6_jit_on_synthetic_batch() {
+        // Same 6-row batch as the hand-coded Q6 JIT test above; result
+        // must be byte-identical (single matching row contributes 6.0).
+        let shipdate: Vec<i32> = vec![8800, 8000, 9500, 8800, 8800, 8800];
+        let discount: Vec<f64> = vec![0.06, 0.06, 0.06, 0.04, 0.08, 0.06];
+        let quantity: Vec<f64> = vec![10.0, 10.0, 10.0, 10.0, 10.0, 24.0];
+        let extprice: Vec<f64> = vec![100.0, 100.0, 100.0, 100.0, 100.0, 100.0];
+
+        let spec = FusedFilterAggSpec::q6(8766, 9131, 0.05, 0.07, 24.0);
+        let jit = FusedFilterAggJit::try_build(&spec).expect("build generic JIT");
+        let got = run_generic_q6(&jit, &shipdate, &discount, &quantity, &extprice);
+        assert!(
+            (got - 6.0).abs() < 1e-9,
+            "generic JIT produced {got}, expected 6.0",
+        );
+    }
+
+    #[test]
+    fn generic_jit_q6_spec_matches_hand_coded_q6_jit_byte_identical() {
+        // Cross-check: same data through both JIT paths should produce
+        // bit-identical f64 sums (no FP-order surprises since the loop
+        // walks rows left-to-right in both).
+        let shipdate: Vec<i32> = vec![8800, 9000, 8700, 8900];
+        let discount: Vec<f64> = vec![0.06, 0.05, 0.07, 0.06];
+        let quantity: Vec<f64> = vec![10.0, 23.0, 10.0, 22.0];
+        let extprice: Vec<f64> = vec![100.0, 200.0, 300.0, 50.0];
+
+        // Hand-coded Q6 path.
+        let hand_jit = Q6JitFn::try_build_q6_canonical().unwrap();
+        let mut hand_sum: f64 = 0.0;
+        // SAFETY: all slices >= n, ptr aligned by source type.
+        unsafe {
+            hand_jit.run(
+                shipdate.len() as i64,
+                shipdate.as_ptr(),
+                discount.as_ptr(),
+                quantity.as_ptr(),
+                extprice.as_ptr(),
+                &mut hand_sum,
+            );
+        }
+        // Spec-driven path.
+        let spec = FusedFilterAggSpec::q6(8766, 9131, 0.05, 0.07, 24.0);
+        let generic = FusedFilterAggJit::try_build(&spec).unwrap();
+        let got = run_generic_q6(&generic, &shipdate, &discount, &quantity, &extprice);
+        assert_eq!(
+            hand_sum.to_bits(),
+            got.to_bits(),
+            "spec-driven Q6 JIT returned {got}, hand-coded returned {hand_sum} \
+             (must be bit-identical — same row order, same FP ops)",
+        );
+    }
+
+    /// SumColumn variant exercises the path the SumProductColumns case
+    /// doesn't: aggregate over a single column rather than a product.
+    #[test]
+    fn generic_jit_single_sum_column() {
+        // Spec: one Float64 input, no predicate clauses, SUM(col 0).
+        // Result should equal the unconditional sum of the data.
+        let spec = FusedFilterAggSpec {
+            inputs: vec![ColumnTy::Float64],
+            predicate: vec![],
+            aggregates: vec![AggExpr::SumColumn(0)],
+        };
+        let jit = FusedFilterAggJit::try_build(&spec).expect("build");
+        let data: Vec<f64> = vec![1.0, 2.0, 4.0, 8.0, 16.0];
+        let inputs: [*const u8; 1] = [data.as_ptr().cast::<u8>()];
+        let mut outputs: [f64; 1] = [0.0];
+        // SAFETY: data.len() == n, single Float64 input.
+        unsafe {
+            jit.run(data.len() as i64, inputs.as_ptr(), outputs.as_mut_ptr());
+        }
+        assert!(
+            (outputs[0] - 31.0).abs() < 1e-9,
+            "expected sum 31.0, got {}",
+            outputs[0],
+        );
+    }
+
+    /// Multiple-aggregate variant verifies the IR's per-aggregate
+    /// accumulator threading works for n_outputs > 1.
+    #[test]
+    fn generic_jit_two_aggregates_share_one_pass() {
+        // Spec: two inputs (Float64, Float64), no predicate.
+        // Agg 0: SUM(col 0). Agg 1: SUM(col 0 * col 1).
+        let spec = FusedFilterAggSpec {
+            inputs: vec![ColumnTy::Float64, ColumnTy::Float64],
+            predicate: vec![],
+            aggregates: vec![
+                AggExpr::SumColumn(0),
+                AggExpr::SumProductColumns(0, 1),
+            ],
+        };
+        let jit = FusedFilterAggJit::try_build(&spec).expect("build");
+        let a: Vec<f64> = vec![1.0, 2.0, 3.0];
+        let b: Vec<f64> = vec![10.0, 20.0, 30.0];
+        let inputs: [*const u8; 2] = [a.as_ptr().cast::<u8>(), b.as_ptr().cast::<u8>()];
+        let mut outputs: [f64; 2] = [0.0, 0.0];
+        // SAFETY: a.len()==b.len()==n, both Float64.
+        unsafe {
+            jit.run(a.len() as i64, inputs.as_ptr(), outputs.as_mut_ptr());
+        }
+        // SUM(a) = 6, SUM(a*b) = 10 + 40 + 90 = 140.
+        assert!((outputs[0] - 6.0).abs() < 1e-9, "got {}", outputs[0]);
+        assert!((outputs[1] - 140.0).abs() < 1e-9, "got {}", outputs[1]);
+    }
+
+    #[test]
+    fn generic_jit_rejects_clause_referencing_oob_column() {
+        let spec = FusedFilterAggSpec {
+            inputs: vec![ColumnTy::Float64],
+            predicate: vec![Clause {
+                column: 5, // oob — only 1 input
+                op: ClauseOp::F64Lt,
+                imm_i32: 0,
+                imm_f64: 0.0,
+            }],
+            aggregates: vec![AggExpr::SumColumn(0)],
+        };
+        // The Ok variant doesn't impl Debug, so we can't use unwrap_err().
+        match FusedFilterAggJit::try_build(&spec) {
+            Err(e) => assert!(e.contains("clause 0"), "got: {e}"),
+            Ok(_) => panic!("expected validation to reject oob column"),
+        }
+    }
+
+    #[test]
+    fn generic_jit_rejects_clause_type_mismatch() {
+        // I32Lt clause on a Float64 column — must reject.
+        let spec = FusedFilterAggSpec {
+            inputs: vec![ColumnTy::Float64],
+            predicate: vec![Clause {
+                column: 0,
+                op: ClauseOp::I32Lt,
+                imm_i32: 100,
+                imm_f64: 0.0,
+            }],
+            aggregates: vec![AggExpr::SumColumn(0)],
+        };
+        match FusedFilterAggJit::try_build(&spec) {
+            Err(e) => assert!(e.contains("incompatible"), "got: {e}"),
+            Ok(_) => panic!("expected validation to reject type mismatch"),
+        }
     }
 }
