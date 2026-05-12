@@ -509,7 +509,8 @@ fn build_partition_stream(
     let (tx, rx) = tokio::sync::mpsc::channel::<DfResult<RecordBatch>>(8);
 
     tokio::task::spawn_blocking(move || {
-        let send_err = |tx: &tokio::sync::mpsc::Sender<DfResult<RecordBatch>>, e: DataFusionError| {
+        let send_err = |tx: &tokio::sync::mpsc::Sender<DfResult<RecordBatch>>,
+                        e: DataFusionError| {
             let _ = tx.blocking_send(Err(e));
         };
 
@@ -753,10 +754,10 @@ mod tests {
     /// loose ratio (0.5) so the assertion is robust to host noise.
     #[tokio::test(flavor = "multi_thread")]
     async fn build_partition_stream_yields_batches_incrementally() {
-        use std::time::Instant;
-        use futures_util::StreamExt;
         use datafusion::execution::TaskContext;
         use datafusion::prelude::{SessionConfig, SessionContext};
+        use futures_util::StreamExt;
+        use std::time::Instant;
 
         let Some(path) = lineitem_parquet() else {
             eprintln!("TPC-H SF=1 data not generated; skipping test");
@@ -764,8 +765,7 @@ mod tests {
         };
         // target_partitions=1 forces all 6 RGs into one partition, so
         // a Vec-materializing impl waits for all of them before yielding.
-        let ctx =
-            SessionContext::new_with_config(SessionConfig::new().with_target_partitions(1));
+        let ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(1));
         let state = ctx.state();
         let prov = FastParquetTableProvider::try_new(path).unwrap();
         let exec = prov.scan(&state, None, &[], None).await.unwrap();

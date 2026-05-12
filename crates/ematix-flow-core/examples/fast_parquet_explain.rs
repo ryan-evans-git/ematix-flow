@@ -52,13 +52,7 @@ async fn print_explain(ctx: &SessionContext, label: &str, sql: &str) {
     // Warm-up: ensure timings reflect a hot run.
     let _ = ctx.sql(sql).await.unwrap().collect().await.unwrap();
     let plan_sql = format!("EXPLAIN ANALYZE {sql}");
-    let batches: Vec<RecordBatch> = ctx
-        .sql(&plan_sql)
-        .await
-        .unwrap()
-        .collect()
-        .await
-        .unwrap();
+    let batches: Vec<RecordBatch> = ctx.sql(&plan_sql).await.unwrap().collect().await.unwrap();
     println!("--- {label} ---");
     for batch in &batches {
         let plan_col = batch.column(1).as_string::<i32>();
@@ -91,10 +85,7 @@ async fn main() {
     };
     let data_dir = data_dir_buf.to_str().unwrap();
 
-    let args: Vec<u32> = env::args()
-        .skip(1)
-        .filter_map(|a| a.parse().ok())
-        .collect();
+    let args: Vec<u32> = env::args().skip(1).filter_map(|a| a.parse().ok()).collect();
     let queries: Vec<u32> = if args.is_empty() {
         DEFAULT_LOSSES.to_vec()
     } else {
