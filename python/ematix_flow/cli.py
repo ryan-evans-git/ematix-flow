@@ -216,11 +216,43 @@ def _cmd_run_due(args: argparse.Namespace) -> int:
 
 
 def _open_run_log_or_none(args: argparse.Namespace) -> "p.RunLog | None":
-    """Resolve the --run-log-path / --no-run-log args into a RunLog or None."""
+    """Resolve the --run-log-path / --no-run-log args into a RunLog or None.
+
+    Graceful degradation: if the resolved path can't be opened (read-only
+    filesystem, permission denied, missing parent dir we can't create, etc.)
+    we print a warning to stderr and return None, so the CLI continues to
+    fire pipelines but without persistence. The user's intent — "run my
+    schedule" — is still served; only the durable-history side-effect is
+    skipped. This matters for ephemeral environments (Lambda, read-only
+    container FSes, CI) where there may be no writable persistent location.
+    """
     if getattr(args, "no_run_log", False):
         return None
     path = getattr(args, "run_log_path", None) or _default_run_log_path()
-    return p.RunLog(path)
+    try:
+        return p.RunLog(path)
+    except (OSError, PermissionError) as e:
+        # OSError covers PermissionError, FileNotFoundError (unwritable
+        # parent), and most filesystem-level failures.
+        print(
+            f"warning: could not open run-log at {path!r}: {e}. "
+            f"Continuing without durable run history. "
+            f"Pass --no-run-log to silence, or --run-log-path PATH to "
+            f"point at a writable location.",
+            file=sys.stderr,
+        )
+        return None
+    except Exception as e:
+        # SQLite-level failures (locked DB, corrupted file) surface as
+        # sqlite3.OperationalError or sqlite3.DatabaseError — both
+        # subclasses of Exception but not OSError. Same treatment.
+        print(
+            f"warning: run-log backend at {path!r} failed to open: "
+            f"{type(e).__name__}: {e}. Continuing without durable run "
+            f"history.",
+            file=sys.stderr,
+        )
+        return None
 
 
 def _default_run_log_path() -> str:
