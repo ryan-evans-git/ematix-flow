@@ -91,12 +91,17 @@ pub struct FusedFilterMultiAggExec {
     predicate: Q1Predicate,
     schema: SchemaRef,
     properties: Arc<PlanProperties>,
+    /// Optional spec-driven Cranelift JIT (Σ.D3 phase B). When `Some`,
+    /// the execute() shard loop calls into the JIT'd Q1 function
+    /// instead of the hand-coded Rust path. Built once at construction.
+    jit: Option<Arc<crate::fused_jit::FusedFilterAggJit>>,
 }
 
 impl FusedFilterMultiAggExec {
     /// Build a Q1-shaped fused exec over `input`. Validates the child
     /// schema has the seven required columns by name with the expected
     /// types. Output schema is the canonical Q1 SELECT list (9 cols).
+    /// Uses the hand-coded Rust shard loop at execute time.
     pub fn try_new_q1(input: Arc<dyn ExecutionPlan>, predicate: Q1Predicate) -> DfResult<Self> {
         Self::validate_input_schema(&input.schema())?;
         let schema = Arc::new(Schema::new(vec![
@@ -123,7 +128,21 @@ impl FusedFilterMultiAggExec {
             predicate,
             schema,
             properties,
+            jit: None,
         })
+    }
+
+    /// Same shape as [`try_new_q1`] but routes the inner loop through
+    /// the Cranelift-JIT'd `FusedFilterAggJit`. Builds the JIT once
+    /// here (predicate cutoff baked into the IR as an immediate).
+    pub fn try_new_q1_jit(input: Arc<dyn ExecutionPlan>, predicate: Q1Predicate) -> DfResult<Self> {
+        let mut exec = Self::try_new_q1(input, predicate)?;
+        let spec = crate::fused_jit::FusedFilterAggSpec::q1(predicate.shipdate_cutoff);
+        let jit = crate::fused_jit::FusedFilterAggJit::try_build(&spec).map_err(|e| {
+            DataFusionError::Internal(format!("FusedFilterMultiAggExec: JIT build failed: {e}"))
+        })?;
+        exec.jit = Some(Arc::new(jit));
+        Ok(exec)
     }
 
     fn validate_input_schema(schema: &SchemaRef) -> DfResult<()> {
@@ -187,7 +206,12 @@ impl ExecutionPlan for FusedFilterMultiAggExec {
         let new_input = children.pop().ok_or_else(|| {
             DataFusionError::Internal("FusedFilterMultiAggExec requires exactly 1 child".into())
         })?;
-        Ok(Arc::new(Self::try_new_q1(new_input, self.predicate)?))
+        let next = if self.jit.is_some() {
+            Self::try_new_q1_jit(new_input, self.predicate)?
+        } else {
+            Self::try_new_q1(new_input, self.predicate)?
+        };
+        Ok(Arc::new(next))
     }
 
     fn execute(
@@ -203,6 +227,7 @@ impl ExecutionPlan for FusedFilterMultiAggExec {
         let input = self.input.clone();
         let predicate = self.predicate;
         let out_schema = self.schema.clone();
+        let jit = self.jit.clone();
 
         let in_schema = input.schema();
         let idx = ColumnIndices {
@@ -227,13 +252,15 @@ impl ExecutionPlan for FusedFilterMultiAggExec {
                 }
             }
 
-            // Run the fused loop on a blocking worker so the CPU-heavy
-            // pass doesn't hijack the tokio runtime.
+            // Dispatch hand-coded vs JIT'd at the parallel-driver level.
             let groups = tokio::task::spawn_blocking(move || {
                 let workers = std::thread::available_parallelism()
                     .map(|n| n.get())
                     .unwrap_or(8);
-                run_fused_q1_parallel(&batches, predicate, idx, workers)
+                match jit {
+                    None => run_fused_q1_parallel(&batches, predicate, idx, workers),
+                    Some(j) => run_fused_q1_parallel_jit(&batches, idx, workers, &j),
+                }
             })
             .await
             .map_err(|e| {
@@ -306,6 +333,132 @@ fn run_fused_q1_parallel(
         }
         merged
     })
+}
+
+/// JIT'd-shard variant of `run_fused_q1_parallel`. Same sharding
+/// strategy, but each shard's inner loop dispatches into the Cranelift-
+/// JIT'd `FusedFilterAggJit` (Q1 spec) instead of `run_fused_q1_shard`.
+/// Per-shard partial accumulators are read back as a `[Q1Aggs; 5]` so
+/// the merge + `q1_groups_to_record_batch` logic is shared with the
+/// hand-coded path.
+fn run_fused_q1_parallel_jit(
+    batches: &[RecordBatch],
+    idx: ColumnIndices,
+    workers: usize,
+    jit: &Arc<crate::fused_jit::FusedFilterAggJit>,
+) -> [Q1Aggs; 5] {
+    let n = batches.len();
+    let chunk = n.div_ceil(workers.max(1));
+    std::thread::scope(|s| {
+        let handles: Vec<_> = (0..workers)
+            .map(|w| {
+                let lo = (w * chunk).min(n);
+                let hi = ((w + 1) * chunk).min(n);
+                let slice = &batches[lo..hi];
+                let jit = jit.clone();
+                s.spawn(move || run_fused_q1_shard_jit(slice, idx, &jit))
+            })
+            .collect();
+        let mut merged = [Q1Aggs::default(); 5];
+        for h in handles {
+            let partial = h.join().unwrap();
+            for g in 0..merged.len() {
+                merged[g].merge(&partial[g]);
+            }
+        }
+        merged
+    })
+}
+
+/// JIT'd Q1 shard. The JIT's outputs[] layout is 30 f64 cells (5 groups
+/// × 6 aggs), row-major: `[g0_sum_qty, g0_sum_price, g0_sum_disc_price,
+/// g0_sum_charge, g0_sum_disc, g0_count, g1_sum_qty, ...]`. We keep one
+/// 30-cell scratch buffer across all batches in the shard so the JIT's
+/// pre-seed-from-outputs behaviour accumulates seamlessly batch-to-batch.
+fn run_fused_q1_shard_jit(
+    batches: &[RecordBatch],
+    idx: ColumnIndices,
+    jit: &crate::fused_jit::FusedFilterAggJit,
+) -> [Q1Aggs; 5] {
+    let mut cells: [f64; 30] = [0.0; 30];
+    for batch in batches {
+        let rflag = batch
+            .column(idx.rflag)
+            .as_any()
+            .downcast_ref::<StringViewArray>()
+            .expect("validated as Utf8View");
+        let lstatus = batch
+            .column(idx.lstatus)
+            .as_any()
+            .downcast_ref::<StringViewArray>()
+            .expect("validated as Utf8View");
+        let qty = batch
+            .column(idx.qty)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .expect("validated as Float64");
+        let price = batch
+            .column(idx.price)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .expect("validated as Float64");
+        let disc = batch
+            .column(idx.disc)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .expect("validated as Float64");
+        let tax = batch
+            .column(idx.tax)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .expect("validated as Float64");
+        let ship = batch
+            .column(idx.ship)
+            .as_any()
+            .downcast_ref::<Date32Array>()
+            .expect("validated as Date32");
+
+        // Column order must match `FusedFilterAggSpec::q1()`: returnflag,
+        // linestatus, quantity, extprice, discount, tax, shipdate. For
+        // Utf8View columns we pass the raw views buffer (16 bytes per row).
+        let inputs: [*const u8; 7] = [
+            rflag.views().as_ptr().cast::<u8>(),
+            lstatus.views().as_ptr().cast::<u8>(),
+            qty.values().as_ptr().cast::<u8>(),
+            price.values().as_ptr().cast::<u8>(),
+            disc.values().as_ptr().cast::<u8>(),
+            tax.values().as_ptr().cast::<u8>(),
+            ship.values().as_ptr().cast::<u8>(),
+        ];
+        // SAFETY: Arrow guarantees each slice has at least `batch.num_rows()`
+        // elements; views() is also `num_rows()` views long; cells holds
+        // exactly `jit.n_outputs() == 30` f64 cells.
+        debug_assert_eq!(jit.n_outputs(), 30);
+        unsafe {
+            jit.run(
+                batch.num_rows() as i64,
+                inputs.as_ptr(),
+                cells.as_mut_ptr(),
+            );
+        }
+    }
+    // Convert the 30 f64 cells back to [Q1Aggs; 5]. Group order in
+    // `cells[]` matches `FusedFilterAggSpec::q1()`'s known_keys: 0=(R,F),
+    // 1=(N,F), 2=(N,O), 3=(A,F), 4=catch-all. Same indexing as
+    // `q1_group_idx` so the merge stays consistent.
+    let mut groups = [Q1Aggs::default(); 5];
+    for g in 0..5 {
+        let base = g * 6;
+        groups[g].sum_qty = cells[base];
+        groups[g].sum_price = cells[base + 1];
+        groups[g].sum_disc_price = cells[base + 2];
+        groups[g].sum_charge = cells[base + 3];
+        groups[g].sum_disc = cells[base + 4];
+        // count is stored as f64 in the JIT path; round (it's an exact
+        // integer since each increment is 1.0).
+        groups[g].count = cells[base + 5] as u64;
+    }
+    groups
 }
 
 fn run_fused_q1_shard(batches: &[RecordBatch], p: Q1Predicate, idx: ColumnIndices) -> [Q1Aggs; 5] {
@@ -579,6 +732,75 @@ mod tests {
         assert_eq!(lstatus.value(3), "F");
         // The (R,F) input row had shipdate beyond cutoff — filtered out.
         assert_eq!(count.value(3), 0);
+    }
+
+    /// Σ.D3 phase B retrofit: JIT'd Q1 must produce the same 4-row
+    /// output batch as the hand-coded Q1 on the same input. Sum cells
+    /// must match bit-identically (same row order + same fadd order).
+    /// AVG cells are derived from the sums + count by the post-process
+    /// step in both paths, so equivalence carries to them too.
+    #[tokio::test]
+    async fn jit_q1_exec_matches_hand_coded_exec_bit_identical() {
+        let cutoff = 10471;
+        let predicate = Q1Predicate { shipdate_cutoff: cutoff };
+
+        let hand_input = input_plan_from_batch(make_test_batch(cutoff)).await;
+        let hand_exec = Arc::new(
+            FusedFilterMultiAggExec::try_new_q1(hand_input, predicate).unwrap(),
+        );
+
+        let jit_input = input_plan_from_batch(make_test_batch(cutoff)).await;
+        let jit_exec = Arc::new(
+            FusedFilterMultiAggExec::try_new_q1_jit(jit_input, predicate).unwrap(),
+        );
+
+        let session = SessionContext::new();
+        let mut hand_s = hand_exec.execute(0, session.task_ctx()).unwrap();
+        let hand_b = hand_s.try_next().await.unwrap().unwrap();
+        let mut jit_s = jit_exec.execute(0, session.task_ctx()).unwrap();
+        let jit_b = jit_s.try_next().await.unwrap().unwrap();
+
+        assert_eq!(hand_b.num_rows(), jit_b.num_rows());
+        assert_eq!(hand_b.num_columns(), jit_b.num_columns());
+
+        // Sum/avg columns are Float64 (cols 2..=8); count is Int64 (col 9).
+        for col in 2..=8 {
+            let h = hand_b
+                .column(col)
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .unwrap();
+            let j = jit_b
+                .column(col)
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .unwrap();
+            for row in 0..h.len() {
+                let hv = h.value(row);
+                let jv = j.value(row);
+                if hv.is_nan() && jv.is_nan() {
+                    continue;
+                }
+                assert_eq!(
+                    hv.to_bits(),
+                    jv.to_bits(),
+                    "Q1 col {col} row {row}: hand={hv}, jit={jv} (bits differ)"
+                );
+            }
+        }
+        let h_count = hand_b
+            .column(9)
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::Int64Array>()
+            .unwrap();
+        let j_count = jit_b
+            .column(9)
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::Int64Array>()
+            .unwrap();
+        for row in 0..h_count.len() {
+            assert_eq!(h_count.value(row), j_count.value(row), "count col row {row}");
+        }
     }
 
     async fn input_plan_with_schema(schema: SchemaRef) -> Arc<dyn ExecutionPlan> {
