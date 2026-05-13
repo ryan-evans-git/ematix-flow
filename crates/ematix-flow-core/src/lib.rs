@@ -43,6 +43,14 @@ pub mod fused_jit;
 // JOIN-bound). Substrate for the future cranelift-JIT-generalized
 // operator. See `fused_post_join.rs` header and issues #51, #52.
 pub mod fused_post_join;
+// Σ.D3 phase D: `PhysicalOptimizerRule` that auto-routes hand-coded
+// FusedFilterSumExec / FusedFilterMultiAggExec / FusedPostJoinExec(Q14)
+// instances to their Cranelift-JIT'd variants. Walks the physical plan
+// tree with `transform_up` and swaps each match in place. Full SQL-
+// pattern detection (extracting predicate constants from arbitrary
+// PhysicalExpr ASTs to inject a fused exec where none was constructed)
+// is documented as a follow-up in the module header.
+pub mod fused_jit_rule;
 pub mod hash;
 pub mod join;
 pub mod kafka_backend;

@@ -101,6 +101,17 @@ impl FusedPostJoinExec {
     /// for `FusedPostJoinSpec::Q14`; Q3/Q5 fall back to the hand-coded
     /// path. Returns an error for unsupported specs so the caller
     /// can't silently get the wrong execution mode.
+    /// Σ.D3 phase D introspection accessors.
+    pub fn spec(&self) -> FusedPostJoinSpec {
+        self.spec
+    }
+    pub fn has_jit(&self) -> bool {
+        self.jit.is_some()
+    }
+    pub fn input(&self) -> &Arc<dyn ExecutionPlan> {
+        &self.input
+    }
+
     pub fn try_new_jit(
         input: Arc<dyn ExecutionPlan>,
         spec: FusedPostJoinSpec,

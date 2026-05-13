@@ -145,6 +145,17 @@ impl FusedFilterMultiAggExec {
         Ok(exec)
     }
 
+    /// Σ.D3 phase D introspection accessors (see `fused.rs` docstrings).
+    pub fn predicate(&self) -> Q1Predicate {
+        self.predicate
+    }
+    pub fn has_jit(&self) -> bool {
+        self.jit.is_some()
+    }
+    pub fn input(&self) -> &Arc<dyn ExecutionPlan> {
+        &self.input
+    }
+
     fn validate_input_schema(schema: &SchemaRef) -> DfResult<()> {
         let required = [
             ("l_returnflag", DataType::Utf8View),

@@ -137,6 +137,21 @@ impl FusedFilterSumExec {
         Ok(exec)
     }
 
+    /// Σ.D3 phase D introspection accessor: the operator's predicate
+    /// shape. Used by the auto-routing optimizer rule to rebuild a JIT
+    /// variant from an existing hand-coded exec.
+    pub fn predicate(&self) -> Q6Predicate {
+        self.predicate
+    }
+    /// Whether this exec is already routed through the JIT path.
+    pub fn has_jit(&self) -> bool {
+        self.jit.is_some()
+    }
+    /// The child execution plan this operator pulls from.
+    pub fn input(&self) -> &Arc<dyn ExecutionPlan> {
+        &self.input
+    }
+
     fn validate_input_schema(schema: &SchemaRef) -> DfResult<()> {
         let required = [
             ("l_quantity", DataType::Float64),
