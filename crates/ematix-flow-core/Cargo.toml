@@ -167,3 +167,10 @@ path = "examples/tpch_q14_full_bench.rs"
 name = "parquet_rs_late_mat_q14"
 path = "examples/parquet_rs_late_mat_q14.rs"
 
+# Σ.D3 phase D (real): dump the DataFusion physical plan for Q6 to
+# learn the exact node shape the SQL-pattern auto-injection rule
+# needs to match.
+[[example]]
+name = "tpch_q6_plan_dump"
+path = "examples/tpch_q6_plan_dump.rs"
+

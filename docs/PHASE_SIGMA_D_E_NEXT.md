@@ -63,7 +63,45 @@ Q14. The next session's work to close it is added as increment 0
 below; the SQL-auto-injection plan from old increment 2 stays queued
 for the session after that.
 
-### 0. Parquet predicate pushdown in FastParquet (NEXT SESSION)
+### 0. Parquet predicate pushdown in FastParquet — DONE 2026-05-12
+
+**Update:** Row-group predicate pushdown landed (commit 2061db8).
+Infrastructure is correct: 6 unit tests pass, regression sweep across
+10 TPC-H queries at SF=1 shows 10 wins / 0 losses / mean 1.48×. **But
+it did not close the Q14 gap.** Diagnostic on the parquet file
+showed every row group of `lineitem` carries the same `l_shipdate`
+min/max = `[8036, 10561]` ≈ `[1992-01-02, 1998-12-01]` — the file is
+sort-ordered by `l_orderkey`, not `l_shipdate`, so the 30-day Q14
+window touches all 6 groups.
+
+To actually close the Q14 SF=1 gap vs Polars, the real lever is one
+of:
+
+* **Page-index pruning.** Parquet column-/offset-indexes give per-page
+  min/max (one page ≈ 1/100 of a row group). Polars almost certainly
+  uses this. Parquet-rs exposes `ParquetMetaData::column_index()` and
+  `offset_index()`; pruning at page granularity needs a different
+  reader path (`with_row_filter` over a synthetic page-filter, or
+  the lower-level `SerializedFileReader::get_row_group(rg).get_column_chunk(c)`
+  with manual page selection).
+* **Late materialization for high-selectivity predicates.** Only
+  decode `l_shipdate` first, build a row-mask, then decode the other
+  columns only for rows that pass. The day-3 `parquet_rs_late_mat.rs`
+  probe rejected `with_row_filter` for Q6 (21% slower at ~2% selectivity)
+  but Q14's shipdate filter has comparable selectivity — re-test with
+  a *cheap* predicate eval inside the filter callback (the day-3 test
+  used a heavier compound predicate).
+* **Re-sort the parquet file by shipdate** at generation time. Not a
+  code change in FastParquet itself; would prove the pushdown infra
+  works as designed. Worth doing as a control experiment but isn't
+  what users with arbitrary parquet files would get.
+
+Path forward: next session evaluates which of (a) page-index pruning
+or (b) `with_row_filter` for high-selectivity is the right Q14 lever.
+Either could close the 2.78 ms gap and unlock a clean "22 of 22 wins
+or ties" headline.
+
+### 0a. Original predicate-pushdown scope (kept for reference)
 
 **Why first:** Closes the remaining 2.78 ms Q14 SF=1 gap vs Polars.
 Same lever Polars uses; we already win on the post-decode CPU work.
