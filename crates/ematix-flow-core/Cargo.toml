@@ -239,3 +239,12 @@ path = "examples/tpch_q12_plan_dump.rs"
 name = "tpch_q12_inject_bench"
 path = "examples/tpch_q12_inject_bench.rs"
 
+# Σ.E2 follow-up: probe whether SF=1 lineitem.parquet has page-level
+# column/offset indexes, and if so what fraction of pages overlap
+# Q14's shipdate window. If overlap is small, page-index pruning is
+# the lever to close the Q14 gap to Polars (cheaper than forking
+# parquet-rs).
+[[example]]
+name = "parquet_page_index_probe"
+path = "examples/parquet_page_index_probe.rs"
+
