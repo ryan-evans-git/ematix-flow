@@ -93,6 +93,13 @@ arrow-select = "58"
 # mimalloc here turns Q13 into a +33% win (152 ms vs DF default 226 ms).
 # Per-thread arenas + better fragmentation policy. Polars uses it too.
 mimalloc = { version = "0.1", default-features = false }
+# ematix-parquet sibling repo — hand-rolled parquet decoder with
+# NEON-fused predicate kernels. Used by the `tpch_q14_ematix_lever`
+# example to measure full-Q14 wall-clock if the lineitem column-
+# decode portion uses our kernels end-to-end (no DataFusion).
+ematix-parquet-codec = { path = "../../../ematix-parquet/crates/ematix-parquet-codec" }
+ematix-parquet-format = { path = "../../../ematix-parquet/crates/ematix-parquet-format" }
+ematix-parquet-io = { path = "../../../ematix-parquet/crates/ematix-parquet-io" }
 # Σ.A1 PR 1: TPC-H generator + reference answers (used by the
 # `tpch_smoke` integration test and the `tpch_generate` example).
 # See workspace.dependencies for full rationale.
@@ -157,6 +164,16 @@ path = "examples/tpch_fused_jit_bench.rs"
 [[example]]
 name = "tpch_q14_full_bench"
 path = "examples/tpch_q14_full_bench.rs"
+
+# ematix-parquet ↔ ematix-flow integration POC. Runs Q14 entirely via
+# our sibling-repo kernels for lineitem column decode (Phase 5 fused-
+# NEON filter + Phase 6 bitmap-driven sparse gather) + parquet-rs for
+# the small part table. No DataFusion. Establishes the hard floor for
+# Q14 wall-clock with our kernels and tells us whether full integration
+# as a TableProvider is worth the engineering investment.
+[[example]]
+name = "tpch_q14_ematix_lever"
+path = "examples/tpch_q14_ematix_lever.rs"
 
 # Σ.E2 follow-up: probe parquet-rs `with_row_filter` against Q14's
 # single-Date32 predicate, deciding whether late materialization is

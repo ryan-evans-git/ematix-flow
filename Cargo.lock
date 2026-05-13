@@ -3642,6 +3642,9 @@ dependencies = [
  "deadpool-postgres",
  "deltalake",
  "duckdb",
+ "ematix-parquet-codec",
+ "ematix-parquet-format",
+ "ematix-parquet-io",
  "futures-util",
  "google-cloud-auth",
  "google-cloud-pubsub",
@@ -3713,6 +3716,26 @@ dependencies = [
  "pyo3",
  "serde_json",
  "tokio",
+]
+
+[[package]]
+name = "ematix-parquet-codec"
+version = "0.0.1"
+dependencies = [
+ "ematix-parquet-format",
+ "snap",
+ "zstd",
+]
+
+[[package]]
+name = "ematix-parquet-format"
+version = "0.0.1"
+
+[[package]]
+name = "ematix-parquet-io"
+version = "0.0.1"
+dependencies = [
+ "ematix-parquet-format",
 ]
 
 [[package]]
