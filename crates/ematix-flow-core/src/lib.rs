@@ -17,6 +17,10 @@ pub mod duckdb_backend;
 // See `fast_parquet.rs` for the day-2/day-3 probe results that
 // motivated this.
 pub mod fast_parquet;
+// Bridge from ematix-parquet kernel output (Vec<T>, Vec<u8> bitmap,
+// etc.) to Arrow arrays. Foundation for replacing parquet-rs under
+// FastParquetExec. See module docstring for the integration plan.
+pub mod ematix_parquet_bridge;
 // Σ.D1: `FusedFilterSumExec` physical operator for the simple
 // `Aggregate(SUM) over Filter(predicate)` plan shape — closes the
 // Q6 gap vs Polars (1.0 ms hand-written / 1.9 ms Polars / 5.96 ms

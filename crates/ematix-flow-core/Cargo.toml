@@ -34,6 +34,14 @@ rusqlite = { workspace = true }
 mysql_async = { workspace = true }
 object_store = { workspace = true }
 parquet = { workspace = true }
+# ematix-parquet sibling repo — hand-rolled parquet decoder with
+# NEON-fused predicate kernels. Wired into `ematix_parquet_bridge`
+# to produce Arrow arrays from column chunks without going through
+# parquet-rs's ParquetRecordBatchReader. Long-term: alternate backend
+# for FastParquetExec.
+ematix-parquet-codec = { path = "../../../ematix-parquet/crates/ematix-parquet-codec" }
+ematix-parquet-format = { path = "../../../ematix-parquet/crates/ematix-parquet-format" }
+ematix-parquet-io = { path = "../../../ematix-parquet/crates/ematix-parquet-io" }
 deltalake = { workspace = true }
 datafusion = { workspace = true }
 cranelift = { workspace = true }
@@ -93,13 +101,6 @@ arrow-select = "58"
 # mimalloc here turns Q13 into a +33% win (152 ms vs DF default 226 ms).
 # Per-thread arenas + better fragmentation policy. Polars uses it too.
 mimalloc = { version = "0.1", default-features = false }
-# ematix-parquet sibling repo — hand-rolled parquet decoder with
-# NEON-fused predicate kernels. Used by the `tpch_q14_ematix_lever`
-# example to measure full-Q14 wall-clock if the lineitem column-
-# decode portion uses our kernels end-to-end (no DataFusion).
-ematix-parquet-codec = { path = "../../../ematix-parquet/crates/ematix-parquet-codec" }
-ematix-parquet-format = { path = "../../../ematix-parquet/crates/ematix-parquet-format" }
-ematix-parquet-io = { path = "../../../ematix-parquet/crates/ematix-parquet-io" }
 # Σ.A1 PR 1: TPC-H generator + reference answers (used by the
 # `tpch_smoke` integration test and the `tpch_generate` example).
 # See workspace.dependencies for full rationale.
