@@ -176,6 +176,15 @@ path = "examples/tpch_q14_full_bench.rs"
 name = "tpch_q14_ematix_lever"
 path = "examples/tpch_q14_ematix_lever.rs"
 
+# Phase 3.5: Q14-shape SQL through 3 providers — register_parquet,
+# FastParquetTableProvider, EmatixFastParquetTableProvider with the
+# Phase 3 Date32 predicate pushdown. Measures wall-clock impact of
+# the pushdown chain (Phase 5 fused-NEON + Phase 6 sparse-gather)
+# end-to-end through DataFusion.
+[[example]]
+name = "tpch_q14_emat_provider_bench"
+path = "examples/tpch_q14_emat_provider_bench.rs"
+
 # Σ.E2 follow-up: probe parquet-rs `with_row_filter` against Q14's
 # single-Date32 predicate, deciding whether late materialization is
 # the right next lever for FastParquet (broad TPC-H impact). The
