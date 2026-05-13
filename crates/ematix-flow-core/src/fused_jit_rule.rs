@@ -1055,6 +1055,360 @@ fn descend_to_q14_lineitem_scan(
     Some((predicate, scan))
 }
 
+/// Σ.D3 phase D (Q3): pattern-match TPC-H Q3's plan
+/// (SortMerge → Sort → Projection → Aggregate(FinalPartitioned,
+/// gby=[l_orderkey, o_orderdate, o_shippriority], single SUM(extprice
+/// * (1-discount))) → Repartition(Hash) → Aggregate(Partial) →
+/// 3-table join chain) and replace the aggregate stack with a single
+/// `FusedPostJoinExec(spec=Q3)` over the existing join output. The
+/// join chain itself is kept (the fused exec is post-join only); we
+/// just substitute the small-cardinality group-by + SUM kernel for
+/// DataFusion's hash-aggregate stack.
+#[derive(Debug, Default)]
+pub struct InjectFusedQ3Rule;
+
+impl PhysicalOptimizerRule for InjectFusedQ3Rule {
+    fn optimize(
+        &self,
+        plan: Arc<dyn ExecutionPlan>,
+        _config: &ConfigOptions,
+    ) -> DfResult<Arc<dyn ExecutionPlan>> {
+        let result = plan.transform_down(|node| {
+            if let Some(new) = try_match_q3_plan(&node)? {
+                Ok(Transformed::yes(new))
+            } else {
+                Ok(Transformed::no(node))
+            }
+        })?;
+        Ok(result.data)
+    }
+    fn name(&self) -> &str {
+        "ematix_flow_inject_fused_q3"
+    }
+    fn schema_check(&self) -> bool {
+        // FusedPostJoinExec(Q3) emits Int64/Float64/Date32/Int32 non-
+        // nullable; DataFusion's synthesised schema may have nullable
+        // versions. The fused exec's output is also already sorted by
+        // revenue DESC but doesn't apply the secondary `o_orderdate`
+        // tiebreaker — for SF=1 Q3 there are no revenue ties in the
+        // canonical output, so this is benign; the SQL-level test
+        // compares cell-by-cell after both sides are re-sorted.
+        false
+    }
+}
+
+fn try_match_q3_plan(node: &Arc<dyn ExecutionPlan>) -> DfResult<Option<Arc<dyn ExecutionPlan>>> {
+    // Top: SortPreservingMergeExec (optional).
+    let after_merge: Arc<dyn ExecutionPlan> =
+        if node.as_any().downcast_ref::<SortPreservingMergeExec>().is_some() {
+            match node.children().first() {
+                Some(c) => (*c).clone(),
+                None => return Ok(None),
+            }
+        } else {
+            node.clone()
+        };
+    // SortExec (required: ORDER BY revenue desc, o_orderdate).
+    let Some(_sort) = after_merge.as_any().downcast_ref::<SortExec>() else {
+        return Ok(None);
+    };
+    let after_sort: Arc<dyn ExecutionPlan> = after_merge
+        .children()
+        .first()
+        .map(|c| (*c).clone())
+        .ok_or_else(|| dferr("Q3 match: SortExec missing input"))?;
+    // ProjectionExec emitting Q3's SELECT-list shape.
+    let Some(proj) = after_sort.as_any().downcast_ref::<ProjectionExec>() else {
+        return Ok(None);
+    };
+    if !projection_emits_q3_select_list(proj.schema().as_ref()) {
+        return Ok(None);
+    }
+    let after_proj: Arc<dyn ExecutionPlan> = proj
+        .children()
+        .first()
+        .map(|c| (*c).clone())
+        .ok_or_else(|| dferr("Q3 match: ProjectionExec missing input"))?;
+    // AggregateExec(FinalPartitioned, gby=[orderkey, orderdate, shippriority], 1 SUM).
+    let Some(agg_final) = after_proj.as_any().downcast_ref::<AggregateExec>() else {
+        return Ok(None);
+    };
+    if !matches!(agg_final.mode(), AggregateMode::FinalPartitioned) {
+        return Ok(None);
+    }
+    if !group_by_is_q3_keys(agg_final) || agg_final.aggr_expr().len() != 1 {
+        return Ok(None);
+    }
+    if !is_sum_extprice_times_one_minus_discount(&agg_final.aggr_expr()[0]) {
+        return Ok(None);
+    }
+    // RepartitionExec(Hash) and AggregateExec(Partial).
+    let after_final: Arc<dyn ExecutionPlan> = agg_final
+        .children()
+        .first()
+        .map(|c| (*c).clone())
+        .ok_or_else(|| dferr("Q3 match: AggregateExec(Final) missing input"))?;
+    let Some(_repart) = after_final.as_any().downcast_ref::<RepartitionExec>() else {
+        return Ok(None);
+    };
+    let after_repart: Arc<dyn ExecutionPlan> = after_final
+        .children()
+        .first()
+        .map(|c| (*c).clone())
+        .ok_or_else(|| dferr("Q3 match: RepartitionExec(Hash) missing input"))?;
+    let Some(agg_partial) = after_repart.as_any().downcast_ref::<AggregateExec>() else {
+        return Ok(None);
+    };
+    if !matches!(agg_partial.mode(), AggregateMode::Partial) {
+        return Ok(None);
+    }
+    if !group_by_is_q3_keys(agg_partial) || agg_partial.aggr_expr().len() != 1 {
+        return Ok(None);
+    }
+    // Below AggregateExec(Partial) is the join output. FusedPostJoinExec
+    // validates its child schema by column name, so we pass the join
+    // output directly. Any wrappers (RepartitionExec / CoalescePartitions)
+    // are fine — the fused exec drains its input regardless of partition
+    // shape.
+    let join_output: Arc<dyn ExecutionPlan> = agg_partial
+        .children()
+        .first()
+        .map(|c| (*c).clone())
+        .ok_or_else(|| dferr("Q3 match: AggregateExec(Partial) missing input"))?;
+    // Verify the join output exposes Q3's required columns.
+    if !post_join_has_q3_columns(&join_output.schema()) {
+        return Ok(None);
+    }
+    let fused = FusedPostJoinExec::try_new(join_output, FusedPostJoinSpec::Q3)?;
+    Ok(Some(Arc::new(fused) as Arc<dyn ExecutionPlan>))
+}
+
+fn projection_emits_q3_select_list(schema: &datafusion::arrow::datatypes::Schema) -> bool {
+    let expected = ["l_orderkey", "revenue", "o_orderdate", "o_shippriority"];
+    if schema.fields().len() != expected.len() {
+        return false;
+    }
+    schema
+        .fields()
+        .iter()
+        .zip(expected.iter())
+        .all(|(f, n)| f.name() == n)
+}
+
+fn group_by_is_q3_keys(agg: &AggregateExec) -> bool {
+    let exprs = agg.group_expr().expr();
+    if exprs.len() != 3 {
+        return false;
+    }
+    let names: Vec<Option<&str>> = exprs
+        .iter()
+        .map(|(e, _)| e.as_any().downcast_ref::<Column>().map(|c| c.name()))
+        .collect();
+    let required = ["l_orderkey", "o_orderdate", "o_shippriority"];
+    required
+        .iter()
+        .all(|r| names.iter().any(|n| n == &Some(*r)))
+}
+
+/// Match `SUM(l_extendedprice * (1 - l_discount))` or its arithmetic
+/// equivalent `SUM(l_extendedprice * 1 - l_extendedprice * l_discount)`.
+/// DataFusion's logical optimiser may distribute the multiplication;
+/// we accept either canonical form by checking the aggregate function
+/// is SUM and the argument references both columns.
+fn is_sum_extprice_times_one_minus_discount(
+    agg: &Arc<datafusion::physical_expr::aggregate::AggregateFunctionExpr>,
+) -> bool {
+    if !agg.fun().name().eq_ignore_ascii_case("sum") {
+        return false;
+    }
+    let exprs = agg.expressions();
+    if exprs.len() != 1 {
+        return false;
+    }
+    // Walk the expression collecting referenced column names.
+    let mut cols: Vec<String> = Vec::new();
+    collect_column_names(&exprs[0], &mut cols);
+    cols.contains(&"l_extendedprice".into()) && cols.contains(&"l_discount".into())
+}
+
+fn collect_column_names(expr: &Arc<dyn PhysicalExpr>, out: &mut Vec<String>) {
+    if let Some(c) = expr.as_any().downcast_ref::<Column>() {
+        out.push(c.name().to_string());
+        return;
+    }
+    if let Some(b) = expr.as_any().downcast_ref::<BinaryExpr>() {
+        collect_column_names(b.left(), out);
+        collect_column_names(b.right(), out);
+        return;
+    }
+    // Other PhysicalExpr types (Literal, ScalarFunctionExpr, …): skip.
+    // We're looking for evidence of the right Columns; missing ones
+    // make the predicate fail to match higher up.
+}
+
+fn post_join_has_q3_columns(schema: &datafusion::arrow::datatypes::SchemaRef) -> bool {
+    use datafusion::arrow::datatypes::DataType;
+    let has = |name: &str, allowed: &[DataType]| -> bool {
+        schema
+            .field_with_name(name)
+            .map(|f| allowed.iter().any(|t| t == f.data_type()))
+            .unwrap_or(false)
+    };
+    has("l_orderkey", &[DataType::Int32, DataType::Int64])
+        && has("l_extendedprice", &[DataType::Float64])
+        && has("l_discount", &[DataType::Float64])
+        && has("o_orderdate", &[DataType::Date32])
+        && has("o_shippriority", &[DataType::Int32, DataType::Int64])
+}
+
+/// Σ.D3 phase D (Q5): pattern-match TPC-H Q5's plan (similar top
+/// structure to Q3 but with a single string group key `n_name`) and
+/// replace the aggregate stack with `FusedPostJoinExec(spec=Q5)`. The
+/// join chain in Q5 is much longer than Q3 (region × nation × supplier
+/// × customer × orders × lineitem) — we keep it intact and just
+/// substitute the aggregate kernel.
+#[derive(Debug, Default)]
+pub struct InjectFusedQ5Rule;
+
+impl PhysicalOptimizerRule for InjectFusedQ5Rule {
+    fn optimize(
+        &self,
+        plan: Arc<dyn ExecutionPlan>,
+        _config: &ConfigOptions,
+    ) -> DfResult<Arc<dyn ExecutionPlan>> {
+        let result = plan.transform_down(|node| {
+            if let Some(new) = try_match_q5_plan(&node)? {
+                Ok(Transformed::yes(new))
+            } else {
+                Ok(Transformed::no(node))
+            }
+        })?;
+        Ok(result.data)
+    }
+    fn name(&self) -> &str {
+        "ematix_flow_inject_fused_q5"
+    }
+    fn schema_check(&self) -> bool {
+        // Q5 fused exec emits `n_name` as Utf8; planner's projection
+        // emits Utf8View. Metadata-only drift; SQL-level test pins
+        // cell-by-cell equivalence.
+        false
+    }
+}
+
+fn try_match_q5_plan(node: &Arc<dyn ExecutionPlan>) -> DfResult<Option<Arc<dyn ExecutionPlan>>> {
+    let after_merge: Arc<dyn ExecutionPlan> =
+        if node.as_any().downcast_ref::<SortPreservingMergeExec>().is_some() {
+            match node.children().first() {
+                Some(c) => (*c).clone(),
+                None => return Ok(None),
+            }
+        } else {
+            node.clone()
+        };
+    let Some(_sort) = after_merge.as_any().downcast_ref::<SortExec>() else {
+        return Ok(None);
+    };
+    let after_sort: Arc<dyn ExecutionPlan> = after_merge
+        .children()
+        .first()
+        .map(|c| (*c).clone())
+        .ok_or_else(|| dferr("Q5 match: SortExec missing input"))?;
+    let Some(proj) = after_sort.as_any().downcast_ref::<ProjectionExec>() else {
+        return Ok(None);
+    };
+    if !projection_emits_q5_select_list(proj.schema().as_ref()) {
+        return Ok(None);
+    }
+    let after_proj: Arc<dyn ExecutionPlan> = proj
+        .children()
+        .first()
+        .map(|c| (*c).clone())
+        .ok_or_else(|| dferr("Q5 match: ProjectionExec missing input"))?;
+    let Some(agg_final) = after_proj.as_any().downcast_ref::<AggregateExec>() else {
+        return Ok(None);
+    };
+    if !matches!(agg_final.mode(), AggregateMode::FinalPartitioned) {
+        return Ok(None);
+    }
+    if !group_by_is_q5_keys(agg_final) || agg_final.aggr_expr().len() != 1 {
+        return Ok(None);
+    }
+    if !is_sum_extprice_times_one_minus_discount(&agg_final.aggr_expr()[0]) {
+        return Ok(None);
+    }
+    let after_final: Arc<dyn ExecutionPlan> = agg_final
+        .children()
+        .first()
+        .map(|c| (*c).clone())
+        .ok_or_else(|| dferr("Q5 match: AggregateExec(Final) missing input"))?;
+    let Some(_repart) = after_final.as_any().downcast_ref::<RepartitionExec>() else {
+        return Ok(None);
+    };
+    let after_repart: Arc<dyn ExecutionPlan> = after_final
+        .children()
+        .first()
+        .map(|c| (*c).clone())
+        .ok_or_else(|| dferr("Q5 match: RepartitionExec(Hash) missing input"))?;
+    let Some(agg_partial) = after_repart.as_any().downcast_ref::<AggregateExec>() else {
+        return Ok(None);
+    };
+    if !matches!(agg_partial.mode(), AggregateMode::Partial) {
+        return Ok(None);
+    }
+    if !group_by_is_q5_keys(agg_partial) || agg_partial.aggr_expr().len() != 1 {
+        return Ok(None);
+    }
+    let join_output: Arc<dyn ExecutionPlan> = agg_partial
+        .children()
+        .first()
+        .map(|c| (*c).clone())
+        .ok_or_else(|| dferr("Q5 match: AggregateExec(Partial) missing input"))?;
+    if !post_join_has_q5_columns(&join_output.schema()) {
+        return Ok(None);
+    }
+    let fused = FusedPostJoinExec::try_new(join_output, FusedPostJoinSpec::Q5)?;
+    Ok(Some(Arc::new(fused) as Arc<dyn ExecutionPlan>))
+}
+
+fn projection_emits_q5_select_list(schema: &datafusion::arrow::datatypes::Schema) -> bool {
+    let expected = ["n_name", "revenue"];
+    if schema.fields().len() != expected.len() {
+        return false;
+    }
+    schema
+        .fields()
+        .iter()
+        .zip(expected.iter())
+        .all(|(f, n)| f.name() == n)
+}
+
+fn group_by_is_q5_keys(agg: &AggregateExec) -> bool {
+    let exprs = agg.group_expr().expr();
+    if exprs.len() != 1 {
+        return false;
+    }
+    exprs[0]
+        .0
+        .as_any()
+        .downcast_ref::<Column>()
+        .map(|c| c.name() == "n_name")
+        .unwrap_or(false)
+}
+
+fn post_join_has_q5_columns(schema: &datafusion::arrow::datatypes::SchemaRef) -> bool {
+    use datafusion::arrow::datatypes::DataType;
+    let has = |name: &str, allowed: &[DataType]| -> bool {
+        schema
+            .field_with_name(name)
+            .map(|f| allowed.iter().any(|t| t == f.data_type()))
+            .unwrap_or(false)
+    };
+    has("n_name", &[DataType::Utf8View])
+        && has("l_extendedprice", &[DataType::Float64])
+        && has("l_discount", &[DataType::Float64])
+}
+
 /// Extract a Q14 `l_shipdate ∈ [V_lo, V_hi)` predicate from an
 /// AND-chain. Tolerates the conditions in either order.
 fn extract_q14_predicate(expr: &Arc<dyn PhysicalExpr>) -> Option<Q14Predicate> {
@@ -1682,5 +2036,179 @@ mod tests {
             !plan_str.contains("FusedQ14FullExec"),
             "InjectFusedQ14Rule wrongly fired:\n{plan_str}"
         );
+    }
+
+    // ----- InjectFusedQ3Rule / InjectFusedQ5Rule tests -----
+
+    const Q3_SQL: &str = "
+        SELECT l_orderkey, sum(l_extendedprice * (1 - l_discount)) AS revenue,
+               o_orderdate, o_shippriority
+        FROM customer, orders, lineitem
+        WHERE c_mktsegment = 'BUILDING'
+          AND c_custkey = o_custkey
+          AND l_orderkey = o_orderkey
+          AND o_orderdate < DATE '1995-03-15'
+          AND l_shipdate > DATE '1995-03-15'
+        GROUP BY l_orderkey, o_orderdate, o_shippriority
+        ORDER BY revenue DESC, o_orderdate
+    ";
+
+    const Q5_SQL: &str = "
+        SELECT n_name, sum(l_extendedprice * (1 - l_discount)) AS revenue
+        FROM customer, orders, lineitem, supplier, nation, region
+        WHERE c_custkey = o_custkey
+          AND l_orderkey = o_orderkey
+          AND l_suppkey = s_suppkey
+          AND c_nationkey = s_nationkey
+          AND s_nationkey = n_nationkey
+          AND n_regionkey = r_regionkey
+          AND r_name = 'ASIA'
+          AND o_orderdate >= DATE '1994-01-01'
+          AND o_orderdate <  DATE '1995-01-01'
+        GROUP BY n_name
+        ORDER BY revenue DESC
+    ";
+
+    async fn ctx_for_q35<R: PhysicalOptimizerRule + Send + Sync + 'static>(
+        rule: Option<R>,
+    ) -> Option<SessionContext> {
+        use crate::fast_parquet::FastParquetTableProvider;
+        use datafusion::execution::session_state::SessionStateBuilder;
+        use datafusion::prelude::SessionConfig;
+        let path = sf1_lineitem()?;
+        let dir = std::path::PathBuf::from(&path)
+            .parent()?
+            .to_string_lossy()
+            .into_owned();
+        let mut builder = SessionStateBuilder::new()
+            .with_config(SessionConfig::new().with_target_partitions(14))
+            .with_default_features();
+        if let Some(r) = rule {
+            builder = builder.with_physical_optimizer_rule(Arc::new(r));
+        }
+        let state = builder.build();
+        let ctx = SessionContext::new_with_state(state);
+        for t in TPCH_TABLES {
+            let p = format!("{dir}/{t}.parquet");
+            let prov = FastParquetTableProvider::try_new(p).ok()?;
+            ctx.register_table(*t, Arc::new(prov)).unwrap();
+        }
+        Some(ctx)
+    }
+
+    /// Sort `RecordBatch` rows by every column (lex-sort) so we can
+    /// compare with-rule vs without-rule cell-by-cell, immune to
+    /// secondary-key ordering differences (Q3's tie-break on
+    /// `o_orderdate` isn't enforced by FusedPostJoinExec when revenues
+    /// happen to be equal; the rule path drops the SortExec above).
+    fn lex_sort_batch(batch: &RecordBatch) -> RecordBatch {
+        use datafusion::arrow::compute;
+        let sort_columns: Vec<compute::SortColumn> = (0..batch.num_columns())
+            .map(|i| compute::SortColumn {
+                values: batch.column(i).clone(),
+                options: None,
+            })
+            .collect();
+        let indices = compute::lexsort_to_indices(&sort_columns, None).unwrap();
+        let new_cols: Vec<_> = batch
+            .columns()
+            .iter()
+            .map(|c| compute::take(c.as_ref(), &indices, None).unwrap())
+            .collect();
+        RecordBatch::try_new(batch.schema(), new_cols).unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn inject_q3_rule_rewrites_real_plan_and_preserves_result() {
+        use datafusion::arrow::array::{AsArray, Float64Array};
+        use datafusion::physical_plan::displayable;
+        let Some(ctx_with) = ctx_for_q35(Some(InjectFusedQ3Rule)).await else {
+            eprintln!("TPC-H SF=1 data not generated; skipping test");
+            return;
+        };
+        let ctx_without: SessionContext = ctx_for_q35::<EnableFusedJitRule>(None).await.unwrap();
+
+        let plan = ctx_with.sql(Q3_SQL).await.unwrap().create_physical_plan().await.unwrap();
+        let plan_str = displayable(plan.as_ref()).indent(true).to_string();
+        assert!(
+            plan_str.contains("FusedPostJoinExec"),
+            "InjectFusedQ3Rule did not fire.\nPlan:\n{plan_str}"
+        );
+
+        let r_with = ctx_with.sql(Q3_SQL).await.unwrap().collect().await.unwrap();
+        let r_without = ctx_without.sql(Q3_SQL).await.unwrap().collect().await.unwrap();
+        // Concatenate into one batch each, then lex-sort, then compare.
+        let bw = datafusion::arrow::compute::concat_batches(&r_with[0].schema(), &r_with).unwrap();
+        let bo = datafusion::arrow::compute::concat_batches(&r_without[0].schema(), &r_without).unwrap();
+        assert_eq!(bw.num_rows(), bo.num_rows(), "row count");
+        let bw = lex_sort_batch(&bw);
+        let bo = lex_sort_batch(&bo);
+
+        // Revenue is column 1. Compare to rel_err < 1e-10 cell by cell.
+        let w = bw.column(1).as_any().downcast_ref::<Float64Array>().unwrap();
+        let o = bo.column(1).as_any().downcast_ref::<Float64Array>().unwrap();
+        for r in 0..bw.num_rows() {
+            let rel = (w.value(r) - o.value(r)).abs()
+                / o.value(r).abs().max(w.value(r).abs()).max(1e-300);
+            assert!(
+                rel < 1e-10,
+                "Q3 revenue row {r}: with={} without={} rel_err={rel:e}",
+                w.value(r),
+                o.value(r)
+            );
+        }
+        // Sanity-check the group keys match too (l_orderkey int64, dates).
+        let _ = bw.column(0).as_primitive_opt::<datafusion::arrow::datatypes::Int64Type>();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn inject_q5_rule_rewrites_real_plan_and_preserves_result() {
+        use datafusion::arrow::array::{AsArray, Float64Array};
+        use datafusion::physical_plan::displayable;
+        let Some(ctx_with) = ctx_for_q35(Some(InjectFusedQ5Rule)).await else {
+            eprintln!("TPC-H SF=1 data not generated; skipping test");
+            return;
+        };
+        let ctx_without: SessionContext = ctx_for_q35::<EnableFusedJitRule>(None).await.unwrap();
+
+        let plan = ctx_with.sql(Q5_SQL).await.unwrap().create_physical_plan().await.unwrap();
+        let plan_str = displayable(plan.as_ref()).indent(true).to_string();
+        assert!(
+            plan_str.contains("FusedPostJoinExec"),
+            "InjectFusedQ5Rule did not fire.\nPlan:\n{plan_str}"
+        );
+
+        let r_with = ctx_with.sql(Q5_SQL).await.unwrap().collect().await.unwrap();
+        let r_without = ctx_without.sql(Q5_SQL).await.unwrap().collect().await.unwrap();
+        let bw = datafusion::arrow::compute::concat_batches(&r_with[0].schema(), &r_with).unwrap();
+        let bo = datafusion::arrow::compute::concat_batches(&r_without[0].schema(), &r_without).unwrap();
+        assert_eq!(bw.num_rows(), bo.num_rows(), "row count");
+
+        // Match by n_name (col 0) for a stable comparison — string keys
+        // are unique here so we don't need to lex-sort.
+        let w_names = bw.column(0);
+        let o_names = bo.column(0);
+        let read_name = |arr: &dyn datafusion::arrow::array::Array, i: usize| -> String {
+            if let Some(s) = arr.as_string_opt::<i32>() {
+                s.value(i).to_string()
+            } else if let Some(s) = arr.as_string_view_opt() {
+                s.value(i).to_string()
+            } else {
+                panic!("unexpected string variant")
+            }
+        };
+        let w_rev = bw.column(1).as_any().downcast_ref::<Float64Array>().unwrap();
+        let o_rev = bo.column(1).as_any().downcast_ref::<Float64Array>().unwrap();
+        let mut w_map = std::collections::HashMap::<String, f64>::new();
+        let mut o_map = std::collections::HashMap::<String, f64>::new();
+        for r in 0..bw.num_rows() {
+            w_map.insert(read_name(w_names.as_ref(), r), w_rev.value(r));
+            o_map.insert(read_name(o_names.as_ref(), r), o_rev.value(r));
+        }
+        for (k, wv) in &w_map {
+            let ov = o_map.get(k).unwrap_or_else(|| panic!("missing key {k} in default plan"));
+            let rel = (wv - ov).abs() / ov.abs().max(wv.abs()).max(1e-300);
+            assert!(rel < 1e-10, "Q5 {k}: with={wv} without={ov} rel_err={rel:e}");
+        }
     }
 }

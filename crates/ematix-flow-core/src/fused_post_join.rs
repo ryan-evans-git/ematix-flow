@@ -265,30 +265,105 @@ impl ExecutionPlan for FusedPostJoinExec {
 
         let schema_for_batch = out_schema.clone();
         let fut = async move {
-            let mut batches: Vec<RecordBatch> = Vec::new();
-            for p in 0..input_partitions {
-                let mut s = input.execute(p, context.clone())?;
-                while let Some(b) = s.try_next().await? {
-                    batches.push(b);
+            // Σ.D3 phase D follow-up: per-partition streaming, no
+            // materialisation. One async task per input partition, each
+            // maintains its own per-spec accumulator (HashMap for
+            // Q3/Q5, [f64; 2] for Q14). When every stream ends, merge
+            // partitions' accumulators and emit the final batch.
+            //
+            // The earlier shape drained every partition into a
+            // Vec<RecordBatch> before computing, which serialised the
+            // upstream pipeline (FastParquet scan + join had to fully
+            // finish before any of our aggregate work started). The
+            // InjectFusedQ3/Q5Rule benchmarks landed at -61% / -103%
+            // pre-refactor because of exactly that drain-then-compute
+            // penalty.
+            match spec {
+                FusedPostJoinSpec::Q3 => {
+                    let mut handles = Vec::with_capacity(input_partitions);
+                    for p in 0..input_partitions {
+                        let mut s = input.execute(p, context.clone())?;
+                        handles.push(tokio::spawn(async move {
+                            let mut groups: std::collections::HashMap<(i64, i32, i32), f64> =
+                                std::collections::HashMap::with_capacity(4096);
+                            while let Some(batch) = s.try_next().await? {
+                                accumulate_q3_batch(&batch, &mut groups)?;
+                            }
+                            Ok::<_, DataFusionError>(groups)
+                        }));
+                    }
+                    let mut merged: std::collections::HashMap<(i64, i32, i32), f64> =
+                        std::collections::HashMap::with_capacity(4096);
+                    for h in handles {
+                        let partial = h.await.map_err(|e| {
+                            DataFusionError::Execution(format!(
+                                "FusedPostJoinExec(Q3): worker join failed: {e}"
+                            ))
+                        })??;
+                        for (k, v) in partial {
+                            *merged.entry(k).or_insert(0.0) += v;
+                        }
+                    }
+                    emit_q3(schema_for_batch, merged)
+                }
+                FusedPostJoinSpec::Q5 => {
+                    let mut handles = Vec::with_capacity(input_partitions);
+                    for p in 0..input_partitions {
+                        let mut s = input.execute(p, context.clone())?;
+                        handles.push(tokio::spawn(async move {
+                            let mut groups: std::collections::HashMap<String, f64> =
+                                std::collections::HashMap::with_capacity(64);
+                            while let Some(batch) = s.try_next().await? {
+                                accumulate_q5_batch(&batch, &mut groups)?;
+                            }
+                            Ok::<_, DataFusionError>(groups)
+                        }));
+                    }
+                    let mut merged: std::collections::HashMap<String, f64> =
+                        std::collections::HashMap::with_capacity(64);
+                    for h in handles {
+                        let partial = h.await.map_err(|e| {
+                            DataFusionError::Execution(format!(
+                                "FusedPostJoinExec(Q5): worker join failed: {e}"
+                            ))
+                        })??;
+                        for (k, v) in partial {
+                            *merged.entry(k).or_insert(0.0) += v;
+                        }
+                    }
+                    emit_q5(schema_for_batch, merged)
+                }
+                FusedPostJoinSpec::Q14 => {
+                    // Q14 path is the older post-join-only variant —
+                    // most user code now goes through FusedQ14FullExec
+                    // (which owns both scans and runs the bitmap probe
+                    // inline). We keep the materialise-then-compute
+                    // shape here for the JIT path's pre-seed-from-
+                    // outputs contract; the hand-coded path is small
+                    // enough that drain cost doesn't matter. If a
+                    // future user complains, mirror the Q3/Q5 streaming
+                    // shape above using a `[f64; 2]` accumulator.
+                    let mut batches: Vec<RecordBatch> = Vec::new();
+                    for p in 0..input_partitions {
+                        let mut s = input.execute(p, context.clone())?;
+                        while let Some(b) = s.try_next().await? {
+                            batches.push(b);
+                        }
+                    }
+                    tokio::task::spawn_blocking(move || -> DfResult<RecordBatch> {
+                        match jit {
+                            Some(j) => execute_q14_jit(&batches, schema_for_batch, &j),
+                            None => execute_q14(&batches, schema_for_batch),
+                        }
+                    })
+                    .await
+                    .map_err(|e| {
+                        DataFusionError::Execution(format!(
+                            "FusedPostJoinExec(Q14): blocking-task join failed: {e}"
+                        ))
+                    })?
                 }
             }
-            let batch = tokio::task::spawn_blocking(move || -> DfResult<RecordBatch> {
-                match (spec, jit) {
-                    (FusedPostJoinSpec::Q14, Some(j)) => {
-                        execute_q14_jit(&batches, schema_for_batch, &j)
-                    }
-                    (FusedPostJoinSpec::Q14, None) => execute_q14(&batches, schema_for_batch),
-                    (FusedPostJoinSpec::Q3, _) => execute_q3(&batches, schema_for_batch),
-                    (FusedPostJoinSpec::Q5, _) => execute_q5(&batches, schema_for_batch),
-                }
-            })
-            .await
-            .map_err(|e| {
-                DataFusionError::Execution(format!(
-                    "FusedPostJoinExec: blocking-task join failed: {e}"
-                ))
-            })??;
-            Ok::<RecordBatch, DataFusionError>(batch)
         };
 
         let s = stream::once(fut);
@@ -298,55 +373,63 @@ impl ExecutionPlan for FusedPostJoinExec {
 
 // ----- Q3: 3-col group, single SUM -----
 
-fn execute_q3(batches: &[RecordBatch], schema: SchemaRef) -> DfResult<RecordBatch> {
-    type Q3Key = (i64, i32, i32);
-    let mut groups: HashMap<Q3Key, f64> = HashMap::with_capacity(16_384);
-    for batch in batches {
-        let orderkey = batch
-            .column(batch.schema().index_of("l_orderkey")?)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .expect("l_orderkey Int64");
-        let price = batch
-            .column(batch.schema().index_of("l_extendedprice")?)
-            .as_any()
-            .downcast_ref::<Float64Array>()
-            .expect("l_extendedprice f64");
-        let disc = batch
-            .column(batch.schema().index_of("l_discount")?)
-            .as_any()
-            .downcast_ref::<Float64Array>()
-            .expect("l_discount f64");
-        let orderdate = batch
-            .column(batch.schema().index_of("o_orderdate")?)
-            .as_any()
-            .downcast_ref::<Date32Array>()
-            .expect("o_orderdate Date32");
-        let sp_col = batch.column(batch.schema().index_of("o_shippriority")?);
-        let sp_i64 = sp_col.as_any().downcast_ref::<Int64Array>();
-        let sp_i32 = sp_col.as_any().downcast_ref::<Int32Array>();
-        let ok_v = orderkey.values();
-        let price_v = price.values();
-        let disc_v = disc.values();
-        let od_v = orderdate.values();
-        let get_sp = |i: usize| -> i32 {
-            if let Some(a) = sp_i64 {
-                a.value(i) as i32
-            } else if let Some(a) = sp_i32 {
-                a.value(i)
-            } else {
-                panic!("o_shippriority neither Int32 nor Int64")
-            }
-        };
-        for i in 0..batch.num_rows() {
-            let key: Q3Key = (ok_v[i], od_v[i], get_sp(i));
-            let rev = price_v[i] * (1.0 - disc_v[i]);
-            *groups.entry(key).or_insert(0.0) += rev;
+/// Per-batch Q3 fold: add each row's contribution to `groups` keyed by
+/// `(l_orderkey, o_orderdate, o_shippriority)`. Streaming workers call
+/// this in a loop and pass `groups` through batch-to-batch.
+fn accumulate_q3_batch(
+    batch: &RecordBatch,
+    groups: &mut HashMap<(i64, i32, i32), f64>,
+) -> DfResult<()> {
+    let orderkey = batch
+        .column(batch.schema().index_of("l_orderkey")?)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("l_orderkey Int64");
+    let price = batch
+        .column(batch.schema().index_of("l_extendedprice")?)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .expect("l_extendedprice f64");
+    let disc = batch
+        .column(batch.schema().index_of("l_discount")?)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .expect("l_discount f64");
+    let orderdate = batch
+        .column(batch.schema().index_of("o_orderdate")?)
+        .as_any()
+        .downcast_ref::<Date32Array>()
+        .expect("o_orderdate Date32");
+    let sp_col = batch.column(batch.schema().index_of("o_shippriority")?);
+    let sp_i64 = sp_col.as_any().downcast_ref::<Int64Array>();
+    let sp_i32 = sp_col.as_any().downcast_ref::<Int32Array>();
+    let ok_v = orderkey.values();
+    let price_v = price.values();
+    let disc_v = disc.values();
+    let od_v = orderdate.values();
+    let get_sp = |i: usize| -> i32 {
+        if let Some(a) = sp_i64 {
+            a.value(i) as i32
+        } else if let Some(a) = sp_i32 {
+            a.value(i)
+        } else {
+            panic!("o_shippriority neither Int32 nor Int64")
         }
+    };
+    for i in 0..batch.num_rows() {
+        let key = (ok_v[i], od_v[i], get_sp(i));
+        let rev = price_v[i] * (1.0 - disc_v[i]);
+        *groups.entry(key).or_insert(0.0) += rev;
     }
-    let mut rows: Vec<(Q3Key, f64)> = groups.into_iter().collect();
-    rows.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+    Ok(())
+}
 
+fn emit_q3(
+    schema: SchemaRef,
+    groups: HashMap<(i64, i32, i32), f64>,
+) -> DfResult<RecordBatch> {
+    let mut rows: Vec<((i64, i32, i32), f64)> = groups.into_iter().collect();
+    rows.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
     let mut ok_b = Int64Builder::with_capacity(rows.len());
     let mut rev_b = Float64Builder::with_capacity(rows.len());
     let mut od_b = Date32Builder::with_capacity(rows.len());
@@ -368,39 +451,42 @@ fn execute_q3(batches: &[RecordBatch], schema: SchemaRef) -> DfResult<RecordBatc
 
 // ----- Q5: string group, single SUM -----
 
-fn execute_q5(batches: &[RecordBatch], schema: SchemaRef) -> DfResult<RecordBatch> {
-    let mut groups: HashMap<String, f64> = HashMap::with_capacity(64);
-    for batch in batches {
-        let nname = batch
-            .column(batch.schema().index_of("n_name")?)
-            .as_any()
-            .downcast_ref::<StringViewArray>()
-            .expect("n_name Utf8View");
-        let price = batch
-            .column(batch.schema().index_of("l_extendedprice")?)
-            .as_any()
-            .downcast_ref::<Float64Array>()
-            .expect("l_extendedprice f64");
-        let disc = batch
-            .column(batch.schema().index_of("l_discount")?)
-            .as_any()
-            .downcast_ref::<Float64Array>()
-            .expect("l_discount f64");
-        let price_v = price.values();
-        let disc_v = disc.values();
-        for i in 0..batch.num_rows() {
-            let n = nname.value(i);
-            let rev = price_v[i] * (1.0 - disc_v[i]);
-            if let Some(slot) = groups.get_mut(n) {
-                *slot += rev;
-            } else {
-                groups.insert(n.to_string(), rev);
-            }
+fn accumulate_q5_batch(
+    batch: &RecordBatch,
+    groups: &mut HashMap<String, f64>,
+) -> DfResult<()> {
+    let nname = batch
+        .column(batch.schema().index_of("n_name")?)
+        .as_any()
+        .downcast_ref::<StringViewArray>()
+        .expect("n_name Utf8View");
+    let price = batch
+        .column(batch.schema().index_of("l_extendedprice")?)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .expect("l_extendedprice f64");
+    let disc = batch
+        .column(batch.schema().index_of("l_discount")?)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .expect("l_discount f64");
+    let price_v = price.values();
+    let disc_v = disc.values();
+    for i in 0..batch.num_rows() {
+        let n = nname.value(i);
+        let rev = price_v[i] * (1.0 - disc_v[i]);
+        if let Some(slot) = groups.get_mut(n) {
+            *slot += rev;
+        } else {
+            groups.insert(n.to_string(), rev);
         }
     }
+    Ok(())
+}
+
+fn emit_q5(schema: SchemaRef, groups: HashMap<String, f64>) -> DfResult<RecordBatch> {
     let mut rows: Vec<(String, f64)> = groups.into_iter().collect();
     rows.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-
     let mut name_b = StringBuilder::with_capacity(rows.len(), rows.len() * 8);
     let mut rev_b = Float64Builder::with_capacity(rows.len());
     for (n, rev) in &rows {

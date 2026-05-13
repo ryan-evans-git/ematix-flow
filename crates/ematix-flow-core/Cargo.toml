@@ -215,3 +215,16 @@ path = "examples/tpch_q14_inject_bench.rs"
 name = "tpch_q14_inject_plan_dump"
 path = "examples/tpch_q14_inject_plan_dump.rs"
 
+# Σ.D3 phase D (Q3/Q5): dump canonical plan shapes for the
+# post-join-aggregate rules.
+[[example]]
+name = "tpch_q3q5_plan_dump"
+path = "examples/tpch_q3q5_plan_dump.rs"
+
+# Σ.D3 phase D (Q3/Q5): bench Q3 and Q5 with their auto-injection
+# rules registered. Both rules replace the post-join aggregate stack
+# with FusedPostJoinExec.
+[[example]]
+name = "tpch_q3q5_inject_bench"
+path = "examples/tpch_q3q5_inject_bench.rs"
+
