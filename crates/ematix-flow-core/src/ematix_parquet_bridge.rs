@@ -35,7 +35,10 @@ use arrow_array::{Float64Array, Int32Array, Int64Array};
 use datafusion::error::{DataFusionError, Result as DfResult};
 
 use ematix_parquet_codec::compression::{decompress_snappy_into, decompress_zstd_into};
-use ematix_parquet_codec::dict::decode_rle_dictionary_into;
+use ematix_parquet_codec::dict::{
+    decode_rle_dictionary_into, decode_rle_dictionary_predicate_bitmap_bw12,
+    gather_dict_at_bitmap_into,
+};
 use ematix_parquet_codec::plain::{decode_plain_f64, decode_plain_i32, decode_plain_i64};
 use ematix_parquet_format::types::{CompressionCodec, Encoding};
 use ematix_parquet_io::{PageWalker, ParquetFile};
@@ -195,6 +198,243 @@ fn decode_dict_chunk_generic<T: Copy>(
 #[inline]
 fn ext<S: Into<String>>(msg: S) -> DataFusionError {
     DataFusionError::External(format!("ematix_parquet_bridge: {}", msg.into()).into())
+}
+
+/// Phase 3: build a row bitmap for an INT32/Date32 column chunk by
+/// evaluating a closure-shaped predicate against the column's PLAIN-
+/// decoded dict. The dict_mask is 4096-padded so the NEON bw=12
+/// kernel can safely use bounds-free gathers (l_shipdate and
+/// similar TPC-H date columns all hit bw=12 in practice).
+///
+/// Returns the bitmap (1 bit per row, byte-stride) and the row count.
+/// `predicate(dict_value) -> bool` is evaluated once per dict entry —
+/// negligible cost (~2500 ops for shipdate-sized dicts) vs the
+/// per-row gain.
+///
+/// If any page in the chunk is bit_width != 12 OR not dict-encoded,
+/// the function returns `Err` so the caller can fall back to a
+/// dense decode + filter.
+pub fn filter_i32_column_to_bitmap(
+    path: &std::path::Path,
+    rg: usize,
+    col: usize,
+    predicate: impl Fn(i32) -> bool,
+) -> DfResult<(Vec<u8>, usize)> {
+    let file = ParquetFile::open(path)
+        .map_err(|e| ext(format!("ParquetFile::open: {e}")))?;
+    let md = file.metadata().map_err(|e| ext(format!("metadata: {e}")))?;
+    let cm = md.row_groups[rg].columns[col]
+        .meta_data
+        .as_ref()
+        .ok_or_else(|| ext("column missing meta_data"))?;
+    let total = cm.num_values as usize;
+    let codec = cm.codec;
+    let start = cm.dictionary_page_offset.unwrap_or(cm.data_page_offset) as u64;
+    let length = cm.total_compressed_size as u64;
+    let chunk = file
+        .read_range(start, length)
+        .map_err(|e| ext(format!("read_range: {e}")))?;
+
+    let mut walker = PageWalker::new(&chunk);
+    let mut scratch: Vec<u8> = Vec::with_capacity(128 * 1024);
+
+    // First page must be the dict (Phase 3 v1 requires dict-encoded).
+    let (first_hdr, first_body) = walker
+        .next_page()
+        .map_err(|e| ext(format!("next_page (dict): {e}")))?
+        .ok_or_else(|| ext("empty chunk"))?;
+    if first_hdr.dictionary_page_header.is_none() {
+        return Err(ext(
+            "filter_i32_column_to_bitmap requires dict-encoded chunk; \
+             use dense decode + scan for PLAIN-only columns",
+        ));
+    }
+    decompress_into(codec, first_body, &mut scratch)?;
+    let dict = decode_plain_i32(&scratch)
+        .map_err(|e| ext(format!("plain i32 dict: {e}")))?;
+    if dict.len() > 4096 {
+        return Err(ext(format!(
+            "dict size {} exceeds bw=12 cap (4096); column needs wider NEON kernel",
+            dict.len()
+        )));
+    }
+    let mut dict_mask = vec![0u8; 4096];
+    for (i, &v) in dict.iter().enumerate() {
+        if predicate(v) {
+            dict_mask[i] = 1;
+        }
+    }
+
+    // Walk data pages, emit bitmap. Phase 5 fused-NEON kernel handles
+    // bw=12 RLE_DICTIONARY pages; we error on anything else for now.
+    let mut bitmap: Vec<u8> = Vec::with_capacity(total.div_ceil(8));
+    let mut emitted: usize = 0;
+    while emitted < total {
+        let (hdr, body) = walker
+            .next_page()
+            .map_err(|e| ext(format!("next_page: {e}")))?
+            .ok_or_else(|| ext("chunk ended before num_values"))?;
+        let dph = hdr.data_page_header.as_ref().ok_or_else(|| {
+            ext("filter_i32: v2 data pages not yet supported in Phase 3")
+        })?;
+        let n = dph.num_values as usize;
+        decompress_into(codec, body, &mut scratch)?;
+        match dph.encoding {
+            Encoding::RleDictionary | Encoding::PlainDictionary => {
+                decode_rle_dictionary_predicate_bitmap_bw12(
+                    &scratch, n, &dict_mask, &mut bitmap,
+                )
+                .map_err(|e| ext(format!("phase5 bw12: {e}")))?;
+            }
+            other => {
+                return Err(ext(format!(
+                    "filter_i32: unexpected data page encoding {other:?} \
+                     (Phase 3 v1 dict-only)"
+                )));
+            }
+        }
+        emitted += n;
+    }
+    Ok((bitmap, total))
+}
+
+/// Phase 6 wrapper for a typed dict-encoded column: bitmap-driven
+/// sparse-gather of values at bitmap-true rows. Returns a Vec<T> of
+/// length `popcount(bitmap)`. Caller wraps in an Arrow array.
+fn gather_chunk_typed<T: Copy>(
+    path: &std::path::Path,
+    rg: usize,
+    col: usize,
+    bitmap: &[u8],
+    decode_dict_plain: impl Fn(&[u8]) -> DfResult<Vec<T>>,
+    decode_plain_page: impl Fn(&[u8]) -> DfResult<Vec<T>>,
+) -> DfResult<Vec<T>> {
+    let file = ParquetFile::open(path)
+        .map_err(|e| ext(format!("ParquetFile::open: {e}")))?;
+    let md = file.metadata().map_err(|e| ext(format!("metadata: {e}")))?;
+    let cm = md.row_groups[rg].columns[col]
+        .meta_data
+        .as_ref()
+        .ok_or_else(|| ext("column missing meta_data"))?;
+    let total = cm.num_values as usize;
+    let codec = cm.codec;
+    let start = cm.dictionary_page_offset.unwrap_or(cm.data_page_offset) as u64;
+    let length = cm.total_compressed_size as u64;
+    let chunk = file
+        .read_range(start, length)
+        .map_err(|e| ext(format!("read_range: {e}")))?;
+
+    let mut walker = PageWalker::new(&chunk);
+    let mut scratch: Vec<u8> = Vec::with_capacity(128 * 1024);
+
+    let (first_hdr, first_body) = walker
+        .next_page()
+        .map_err(|e| ext(format!("next_page (first): {e}")))?
+        .ok_or_else(|| ext("empty chunk"))?;
+    decompress_into(codec, first_body, &mut scratch)?;
+
+    let dict: Vec<T> = if first_hdr.dictionary_page_header.is_some() {
+        decode_dict_plain(&scratch)?
+    } else {
+        Vec::new()
+    };
+
+    let mut out: Vec<T> = Vec::with_capacity(bitmap.iter().map(|b| b.count_ones() as usize).sum());
+    let mut emitted: usize = 0;
+
+    // If first page was a data page, decode + sparse-emit inline.
+    if first_hdr.dictionary_page_header.is_none() {
+        let dph = first_hdr
+            .data_page_header
+            .as_ref()
+            .ok_or_else(|| ext("first page neither dict nor v1 data"))?;
+        let n = dph.num_values as usize;
+        if !matches!(dph.encoding, Encoding::Plain) {
+            return Err(ext(format!(
+                "non-dict first page must be PLAIN (got {:?})",
+                dph.encoding
+            )));
+        }
+        let vals = decode_plain_page(&scratch)?;
+        for (i, &v) in vals.iter().enumerate().take(n) {
+            if (bitmap[i / 8] >> (i % 8)) & 1 == 1 {
+                out.push(v);
+            }
+        }
+        emitted = n;
+    }
+
+    while emitted < total {
+        let (hdr, body) = walker
+            .next_page()
+            .map_err(|e| ext(format!("next_page: {e}")))?
+            .ok_or_else(|| ext("chunk ended before num_values"))?;
+        let dph = hdr
+            .data_page_header
+            .as_ref()
+            .ok_or_else(|| ext("v2 pages not yet supported in sparse gather"))?;
+        let n = dph.num_values as usize;
+        decompress_into(codec, body, &mut scratch)?;
+        match dph.encoding {
+            Encoding::RleDictionary | Encoding::PlainDictionary => {
+                gather_dict_at_bitmap_into(&scratch, n, bitmap, emitted, &dict, &mut out)
+                    .map_err(|e| ext(format!("gather_dict_at_bitmap: {e}")))?;
+            }
+            Encoding::Plain => {
+                let vals = decode_plain_page(&scratch)?;
+                for (i, &v) in vals.iter().enumerate().take(n) {
+                    let bp = emitted + i;
+                    if (bitmap[bp / 8] >> (bp % 8)) & 1 == 1 {
+                        out.push(v);
+                    }
+                }
+            }
+            other => {
+                return Err(ext(format!("unexpected encoding {other:?}")));
+            }
+        }
+        emitted += n;
+    }
+    Ok(out)
+}
+
+/// Phase 6 public wrappers (typed). Each one calls `gather_chunk_typed`
+/// with the appropriate decoders for its primitive type.
+pub fn sparse_gather_chunk_i32(
+    path: &std::path::Path,
+    rg: usize,
+    col: usize,
+    bitmap: &[u8],
+) -> DfResult<Vec<i32>> {
+    gather_chunk_typed::<i32>(
+        path, rg, col, bitmap,
+        |b| decode_plain_i32(b).map_err(|e| ext(format!("plain i32 dict: {e}"))),
+        |b| decode_plain_i32(b).map_err(|e| ext(format!("plain i32 page: {e}"))),
+    )
+}
+pub fn sparse_gather_chunk_i64(
+    path: &std::path::Path,
+    rg: usize,
+    col: usize,
+    bitmap: &[u8],
+) -> DfResult<Vec<i64>> {
+    gather_chunk_typed::<i64>(
+        path, rg, col, bitmap,
+        |b| decode_plain_i64(b).map_err(|e| ext(format!("plain i64 dict: {e}"))),
+        |b| decode_plain_i64(b).map_err(|e| ext(format!("plain i64 page: {e}"))),
+    )
+}
+pub fn sparse_gather_chunk_f64(
+    path: &std::path::Path,
+    rg: usize,
+    col: usize,
+    bitmap: &[u8],
+) -> DfResult<Vec<f64>> {
+    gather_chunk_typed::<f64>(
+        path, rg, col, bitmap,
+        |b| decode_plain_f64(b).map_err(|e| ext(format!("plain f64 dict: {e}"))),
+        |b| decode_plain_f64(b).map_err(|e| ext(format!("plain f64 page: {e}"))),
+    )
 }
 
 /// Codec-aware decompress helper. Dispatches on the column chunk's

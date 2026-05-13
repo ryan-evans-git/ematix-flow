@@ -229,17 +229,17 @@ fn aggregate_column_statistics(
 /// caller just doesn't push it down, and DataFusion's residual
 /// FilterExec runs as usual.
 #[derive(Debug, Clone)]
-struct RangePredicate {
-    column: String,
-    op: Operator,
-    literal: ScalarValue,
+pub struct RangePredicate {
+    pub column: String,
+    pub op: Operator,
+    pub literal: ScalarValue,
 }
 
 /// Walk a single filter `Expr` and return a `RangePredicate` if it
 /// matches `Column ⊕ Literal` with a supported comparison operator.
 /// Returns `None` for any other shape — that filter just isn't pushed
 /// down.
-fn extract_range_predicate(expr: &Expr) -> Option<RangePredicate> {
+pub fn extract_range_predicate(expr: &Expr) -> Option<RangePredicate> {
     let Expr::BinaryExpr(BinaryExpr { left, op, right }) = expr else {
         return None;
     };

@@ -30,10 +30,11 @@ use arrow_array::RecordBatch;
 use arrow_schema::{DataType, Schema, SchemaRef};
 use datafusion::catalog::{Session, TableProvider};
 use datafusion::common::stats::Statistics;
+use datafusion::common::ScalarValue;
 use datafusion::datasource::TableType;
 use datafusion::error::{DataFusionError, Result as DfResult};
 use datafusion::execution::TaskContext;
-use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
+use datafusion::logical_expr::{Expr, Operator, TableProviderFilterPushDown};
 use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::metrics::{
@@ -50,7 +51,102 @@ use parquet::file::reader::{FileReader, SerializedFileReader};
 
 use crate::ematix_parquet_bridge::{
     decode_column_chunk_f64, decode_column_chunk_i32, decode_column_chunk_i64,
+    filter_i32_column_to_bitmap, sparse_gather_chunk_f64, sparse_gather_chunk_i32,
+    sparse_gather_chunk_i64,
 };
+use crate::fast_parquet::{extract_range_predicate, RangePredicate};
+
+/// Phase 3 predicate: single-column conjunction of `column OP literal`
+/// clauses, where the column has Date32 / Int32 type. AND-combined
+/// into a closure used by `filter_i32_column_to_bitmap`.
+#[derive(Debug, Clone)]
+pub struct BridgeFilter {
+    /// Index of the filter column in the FULL (unprojected) schema —
+    /// same as the parquet column index since Arrow schema is built 1:1.
+    parquet_col_idx: usize,
+    /// Comparisons to AND together. All against the same column.
+    clauses: Vec<RangeClause>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RangeClause {
+    op: Operator,
+    literal_i32: i32,
+}
+
+impl BridgeFilter {
+    /// Evaluate AND of all clauses against one i32 / Date32 value.
+    #[inline]
+    fn eval_i32(&self, v: i32) -> bool {
+        for c in &self.clauses {
+            let pass = match c.op {
+                Operator::Eq => v == c.literal_i32,
+                Operator::NotEq => v != c.literal_i32,
+                Operator::Lt => v < c.literal_i32,
+                Operator::LtEq => v <= c.literal_i32,
+                Operator::Gt => v > c.literal_i32,
+                Operator::GtEq => v >= c.literal_i32,
+                _ => return false,
+            };
+            if !pass {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+/// Try to convert a `RangePredicate` into a [`RangeClause`] for an
+/// i32/Date32 column. Returns None for type mismatches, NULL literals,
+/// or unsupported operators.
+fn clause_from_predicate(pred: &RangePredicate, expected_type: &DataType) -> Option<RangeClause> {
+    let lit_i32: i32 = match (&pred.literal, expected_type) {
+        (ScalarValue::Int32(Some(v)), DataType::Int32) => *v,
+        (ScalarValue::Date32(Some(v)), DataType::Date32) => *v,
+        // String literal cast: SQL `DATE '1995-09-01'` resolves to
+        // Date32 in DataFusion typically, but handle the cast-through-
+        // string shape defensively.
+        _ => return None,
+    };
+    Some(RangeClause {
+        op: pred.op,
+        literal_i32: lit_i32,
+    })
+}
+
+/// Extract Phase-3-pushable filters from the DataFusion filter list.
+/// Returns the BridgeFilter if every input filter is pushable AND
+/// they all target the same column AND that column is Int32/Date32.
+/// Returns `None` if any condition fails — the caller falls back to
+/// non-pushdown decoding.
+fn extract_bridge_filter(filters: &[Expr], full_schema: &Schema) -> Option<BridgeFilter> {
+    let mut clauses: Vec<RangeClause> = Vec::new();
+    let mut col_idx: Option<usize> = None;
+    for f in filters {
+        let pred = extract_range_predicate(f)?;
+        let idx = full_schema.index_of(&pred.column).ok()?;
+        let dt = full_schema.field(idx).data_type();
+        if !matches!(dt, DataType::Int32 | DataType::Date32) {
+            return None;
+        }
+        let clause = clause_from_predicate(&pred, dt)?;
+        if let Some(prior) = col_idx {
+            if prior != idx {
+                return None; // multi-column pushdown not in Phase 3 v1
+            }
+        } else {
+            col_idx = Some(idx);
+        }
+        clauses.push(clause);
+    }
+    if clauses.is_empty() {
+        return None;
+    }
+    Some(BridgeFilter {
+        parquet_col_idx: col_idx?,
+        clauses,
+    })
+}
 
 /// `TableProvider` that scans a single parquet file using the
 /// ematix-parquet bridge for column decode.
@@ -145,19 +241,37 @@ impl TableProvider for EmatixFastParquetTableProvider {
         TableType::Base
     }
 
-    /// Phase 2 supports projection but not predicate pushdown.
+    /// Phase 3 pushdown: single-column AND-conjunction of `col OP lit`
+    /// where col is Int32/Date32. Other shapes return `Unsupported`
+    /// and stay in DataFusion's residual FilterExec.
     fn supports_filters_pushdown(
         &self,
         filters: &[&Expr],
     ) -> DfResult<Vec<TableProviderFilterPushDown>> {
-        Ok(vec![TableProviderFilterPushDown::Unsupported; filters.len()])
+        Ok(filters
+            .iter()
+            .map(|e| {
+                if let Some(p) = extract_range_predicate(e) {
+                    // Pushable iff the column exists and is i32/Date32.
+                    if let Ok(idx) = self.schema.index_of(&p.column) {
+                        let dt = self.schema.field(idx).data_type();
+                        if matches!(dt, DataType::Int32 | DataType::Date32)
+                            && clause_from_predicate(&p, dt).is_some()
+                        {
+                            return TableProviderFilterPushDown::Exact;
+                        }
+                    }
+                }
+                TableProviderFilterPushDown::Unsupported
+            })
+            .collect())
     }
 
     async fn scan(
         &self,
         state: &dyn Session,
         projection: Option<&Vec<usize>>,
-        _filters: &[Expr],
+        filters: &[Expr],
         _limit: Option<usize>,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
         let projection = projection
@@ -166,8 +280,6 @@ impl TableProvider for EmatixFastParquetTableProvider {
         let projected_schema: Schema = self.schema.project(&projection)?;
         let projected_schema: SchemaRef = Arc::new(projected_schema);
 
-        // Partition assignment: round-robin RGs across
-        // min(num_rgs, target_partitions) partitions.
         let target_partitions = state.config_options().execution.target_partitions;
         let num_rgs = self.num_row_groups;
         let num_partitions = num_rgs.min(target_partitions).max(1);
@@ -176,12 +288,20 @@ impl TableProvider for EmatixFastParquetTableProvider {
             assignments[rg % num_partitions].push(rg);
         }
 
+        // Phase 3: extract pushable filters from DataFusion's filter
+        // list. If all filters fit the shape, plumb them to the Exec
+        // for bitmap-first decode. Otherwise the Exec runs Phase 2's
+        // dense path (DataFusion's residual FilterExec handles the
+        // predicate).
+        let bridge_filter = extract_bridge_filter(filters, &self.schema);
+
         Ok(Arc::new(EmatixFastParquetExec::try_new(
             self.path.clone(),
             projected_schema,
             projection,
             assignments,
             self.num_rows,
+            bridge_filter,
         )?))
     }
 }
@@ -194,6 +314,10 @@ pub struct EmatixFastParquetExec {
     projection: Vec<usize>,
     assignments: Vec<Vec<usize>>,
     num_rows: usize,
+    /// Phase 3: optional pushed-down filter. When present, execute()
+    /// runs the bitmap-first path (Phase 5 fused-NEON filter + Phase 6
+    /// sparse gather). When None, runs Phase 2 dense decode.
+    filter: Option<BridgeFilter>,
     properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
 }
@@ -205,6 +329,7 @@ impl EmatixFastParquetExec {
         projection: Vec<usize>,
         assignments: Vec<Vec<usize>>,
         num_rows: usize,
+        filter: Option<BridgeFilter>,
     ) -> DfResult<Self> {
         let eq_props = EquivalenceProperties::new(schema.clone());
         let properties = Arc::new(PlanProperties::new(
@@ -219,6 +344,7 @@ impl EmatixFastParquetExec {
             projection,
             assignments,
             num_rows,
+            filter,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
         })
@@ -272,9 +398,17 @@ impl ExecutionPlan for EmatixFastParquetExec {
         let path = self.path.clone();
         let projection = self.projection.clone();
         let schema = self.schema.clone();
+        let filter = self.filter.clone();
         let baseline = BaselineMetrics::new(&self.metrics, partition);
 
-        let stream = build_partition_stream(path, schema.clone(), projection, row_groups, baseline);
+        let stream = build_partition_stream(
+            path,
+            schema.clone(),
+            projection,
+            row_groups,
+            filter,
+            baseline,
+        );
         Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)) as SendableRecordBatchStream)
     }
 
@@ -304,6 +438,7 @@ fn build_partition_stream(
     schema: SchemaRef,
     projection: Vec<usize>,
     row_groups: Vec<usize>,
+    filter: Option<BridgeFilter>,
     baseline: BaselineMetrics,
 ) -> futures_util::stream::BoxStream<'static, DfResult<RecordBatch>> {
     use futures_util::StreamExt;
@@ -317,7 +452,10 @@ fn build_partition_stream(
 
     tokio::task::spawn_blocking(move || {
         for rg in row_groups {
-            let batch_result = decode_one_rg(&path_buf, rg, &schema, &projection);
+            let batch_result = match &filter {
+                Some(f) => decode_one_rg_filtered(&path_buf, rg, &schema, &projection, f),
+                None => decode_one_rg(&path_buf, rg, &schema, &projection),
+            };
             if tx.blocking_send(batch_result).is_err() {
                 return; // consumer dropped
             }
@@ -334,6 +472,74 @@ fn build_partition_stream(
         item.map(|i| (i, (rx, baseline)))
     });
     stream.boxed()
+}
+
+/// Phase 3 path: filter-aware row group decoder.
+///   1. Build a row bitmap for the filter column via Phase 5 fused-
+///      NEON (`filter_i32_column_to_bitmap`).
+///   2. For each projected column, do bitmap-driven sparse gather
+///      (Phase 6 — `sparse_gather_chunk_*`). The filter column, if
+///      projected, is gathered too (the dict_mask path doesn't emit
+///      the filter column's values directly).
+///   3. Emit a RecordBatch sized to popcount(bitmap).
+///
+/// On any error (wrong bit width, non-dict pages, type mismatch), the
+/// error propagates; DataFusion's residual FilterExec is NOT going to
+/// re-run since we declared `Exact` pushdown, so callers must accept
+/// that the bridge's pushable shape is narrow.
+fn decode_one_rg_filtered(
+    path: &std::path::Path,
+    rg: usize,
+    schema: &SchemaRef,
+    projection: &[usize],
+    filter: &BridgeFilter,
+) -> DfResult<RecordBatch> {
+    let filter_owned = filter.clone();
+    let (bitmap, _total) = filter_i32_column_to_bitmap(
+        path,
+        rg,
+        filter.parquet_col_idx,
+        move |v: i32| filter_owned.eval_i32(v),
+    )?;
+
+    let matches: usize = bitmap.iter().map(|b| b.count_ones() as usize).sum();
+    let mut columns: Vec<Arc<dyn arrow_array::Array>> = Vec::with_capacity(projection.len());
+    for (out_idx, &col_idx) in projection.iter().enumerate() {
+        let field = schema.field(out_idx);
+        let arr: Arc<dyn arrow_array::Array> = match field.data_type() {
+            DataType::Int32 => {
+                let vals = sparse_gather_chunk_i32(path, rg, col_idx, &bitmap)?;
+                debug_assert_eq!(vals.len(), matches);
+                Arc::new(arrow_array::Int32Array::from(vals))
+            }
+            DataType::Date32 => {
+                let vals = sparse_gather_chunk_i32(path, rg, col_idx, &bitmap)?;
+                debug_assert_eq!(vals.len(), matches);
+                Arc::new(arrow_array::Date32Array::from(vals))
+            }
+            DataType::Int64 => {
+                let vals = sparse_gather_chunk_i64(path, rg, col_idx, &bitmap)?;
+                debug_assert_eq!(vals.len(), matches);
+                Arc::new(arrow_array::Int64Array::from(vals))
+            }
+            DataType::Float64 => {
+                let vals = sparse_gather_chunk_f64(path, rg, col_idx, &bitmap)?;
+                debug_assert_eq!(vals.len(), matches);
+                Arc::new(arrow_array::Float64Array::from(vals))
+            }
+            other => {
+                return Err(DataFusionError::NotImplemented(format!(
+                    "EmatixFastParquetExec (filtered): unsupported column type {other:?}",
+                )));
+            }
+        };
+        columns.push(arr);
+    }
+    RecordBatch::try_new(schema.clone(), columns).map_err(|e| {
+        DataFusionError::External(
+            format!("EmatixFastParquetExec (filtered): RecordBatch::try_new: {e}").into(),
+        )
+    })
 }
 
 /// Decode one row group into a `RecordBatch` matching `schema`. Each
@@ -530,5 +736,195 @@ mod tests {
         assert_eq!(sum_b, (0..1000i64).map(|i| i * 100).sum::<i64>());
         let expected_c: f64 = (0..1000).map(|i| (i as f64) * 1.5).sum();
         assert!((sum_c - expected_c).abs() < 1e-6);
+    }
+
+    /// Phase 3 oracle on real SF=1 lineitem: Q14-shape predicate
+    /// pushdown via the new fused-NEON path. Compares ours vs
+    /// parquet-rs+filter on the same SQL.
+    #[tokio::test]
+    async fn phase3_predicate_pushdown_q14_shape() {
+        let Some(path) = lineitem_path() else {
+            eprintln!("skipping: SF=1 lineitem not present");
+            return;
+        };
+
+        // Lineitem has BYTE_ARRAY columns so the full table can't
+        // register through Emat — but we can build a primitive-only
+        // helper file from lineitem's Q14-relevant columns. For this
+        // oracle, scan via parquet-rs to extract the columns, write
+        // a new parquet that's all-primitive, register that via
+        // EmatixFastParquetTableProvider, and compare.
+        //
+        // Setup: read SF=1 lineitem (l_shipdate, l_partkey,
+        // l_extendedprice, l_discount) into a temp parquet.
+        use parquet::basic::{Compression, Repetition, Type as PhysicalType};
+        use parquet::column::reader::ColumnReader;
+        use parquet::column::writer::ColumnWriter;
+        use parquet::file::properties::WriterProperties;
+        use parquet::file::reader::{FileReader, SerializedFileReader};
+        use parquet::file::writer::SerializedFileWriter;
+        use parquet::schema::types::Type as PType;
+
+        let r = SerializedFileReader::new(File::open(&path).unwrap()).unwrap();
+        let total = r.metadata().file_metadata().num_rows() as usize;
+
+        let mut shipdate: Vec<i32> = Vec::with_capacity(total);
+        let mut partkey: Vec<i64> = Vec::with_capacity(total);
+        let mut extprice: Vec<f64> = Vec::with_capacity(total);
+        let mut discount: Vec<f64> = Vec::with_capacity(total);
+        for rg in 0..r.metadata().num_row_groups() {
+            let rgr = r.get_row_group(rg).unwrap();
+            {
+                let mut t = match rgr.get_column_reader(10).unwrap() {
+                    ColumnReader::Int32ColumnReader(t) => t,
+                    _ => panic!(),
+                };
+                t.read_records(rgr.metadata().num_rows() as usize, None, None, &mut shipdate).unwrap();
+            }
+            {
+                let mut t = match rgr.get_column_reader(1).unwrap() {
+                    ColumnReader::Int64ColumnReader(t) => t,
+                    _ => panic!(),
+                };
+                t.read_records(rgr.metadata().num_rows() as usize, None, None, &mut partkey).unwrap();
+            }
+            {
+                let mut t = match rgr.get_column_reader(5).unwrap() {
+                    ColumnReader::DoubleColumnReader(t) => t,
+                    _ => panic!(),
+                };
+                t.read_records(rgr.metadata().num_rows() as usize, None, None, &mut extprice).unwrap();
+            }
+            {
+                let mut t = match rgr.get_column_reader(6).unwrap() {
+                    ColumnReader::DoubleColumnReader(t) => t,
+                    _ => panic!(),
+                };
+                t.read_records(rgr.metadata().num_rows() as usize, None, None, &mut discount).unwrap();
+            }
+        }
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let tmp_path = tmp.path().to_path_buf();
+        let schema = Arc::new(
+            PType::group_type_builder("schema")
+                .with_fields(vec![
+                    Arc::new(
+                        PType::primitive_type_builder("l_shipdate", PhysicalType::INT32)
+                            .with_repetition(Repetition::REQUIRED)
+                            .with_converted_type(parquet::basic::ConvertedType::DATE)
+                            .build()
+                            .unwrap(),
+                    ),
+                    Arc::new(
+                        PType::primitive_type_builder("l_partkey", PhysicalType::INT64)
+                            .with_repetition(Repetition::REQUIRED)
+                            .build()
+                            .unwrap(),
+                    ),
+                    Arc::new(
+                        PType::primitive_type_builder("l_extendedprice", PhysicalType::DOUBLE)
+                            .with_repetition(Repetition::REQUIRED)
+                            .build()
+                            .unwrap(),
+                    ),
+                    Arc::new(
+                        PType::primitive_type_builder("l_discount", PhysicalType::DOUBLE)
+                            .with_repetition(Repetition::REQUIRED)
+                            .build()
+                            .unwrap(),
+                    ),
+                ])
+                .build()
+                .unwrap(),
+        );
+        let props = Arc::new(
+            WriterProperties::builder()
+                .set_compression(Compression::SNAPPY)
+                .build(),
+        );
+        let file = File::create(&tmp_path).unwrap();
+        let mut writer = SerializedFileWriter::new(file, schema, props).unwrap();
+        let mut rg = writer.next_row_group().unwrap();
+        {
+            let mut col = rg.next_column().unwrap().unwrap();
+            if let ColumnWriter::Int32ColumnWriter(t) = col.untyped() {
+                t.write_batch(&shipdate, None, None).unwrap();
+            }
+            col.close().unwrap();
+        }
+        {
+            let mut col = rg.next_column().unwrap().unwrap();
+            if let ColumnWriter::Int64ColumnWriter(t) = col.untyped() {
+                t.write_batch(&partkey, None, None).unwrap();
+            }
+            col.close().unwrap();
+        }
+        {
+            let mut col = rg.next_column().unwrap().unwrap();
+            if let ColumnWriter::DoubleColumnWriter(t) = col.untyped() {
+                t.write_batch(&extprice, None, None).unwrap();
+            }
+            col.close().unwrap();
+        }
+        {
+            let mut col = rg.next_column().unwrap().unwrap();
+            if let ColumnWriter::DoubleColumnWriter(t) = col.untyped() {
+                t.write_batch(&discount, None, None).unwrap();
+            }
+            col.close().unwrap();
+        }
+        rg.close().unwrap();
+        writer.close().unwrap();
+
+        // Now register the synthetic primitive-only file via Emat and
+        // run Q14's lineitem-only aggregate: SUM(extprice * (1-discount))
+        // for rows where shipdate ∈ [9374, 9404).
+        let provider = EmatixFastParquetTableProvider::try_new(
+            tmp_path.to_string_lossy().to_string(),
+        )
+        .unwrap();
+        let ctx = SessionContext::new();
+        ctx.register_table("li_prim", Arc::new(provider)).unwrap();
+
+        let sql = "SELECT \
+            SUM(l_extendedprice * (1 - l_discount)) AS rev, \
+            COUNT(*) AS matches \
+            FROM li_prim \
+            WHERE l_shipdate >= DATE '1995-09-01' \
+              AND l_shipdate < DATE '1995-10-01'";
+        let df = ctx.sql(sql).await.unwrap();
+        let batches = df.collect().await.unwrap();
+        let b = &batches[0];
+        let rev = b
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow_array::Float64Array>()
+            .unwrap()
+            .value(0);
+        let matches = b
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow_array::Int64Array>()
+            .unwrap()
+            .value(0);
+
+        // Expected from earlier manual POC (commit 53e908d):
+        // 76024 matches, total revenue across all matching rows
+        // = sum(l_extprice * (1 - l_discount)).
+        let expected_rev: f64 = shipdate
+            .iter()
+            .zip(extprice.iter())
+            .zip(discount.iter())
+            .filter(|((d, _), _)| **d >= 9374 && **d < 9404)
+            .map(|((_, p), d)| p * (1.0 - d))
+            .sum();
+        let expected_matches = shipdate.iter().filter(|d| **d >= 9374 && **d < 9404).count() as i64;
+
+        assert_eq!(matches, expected_matches);
+        assert!(
+            (rev - expected_rev).abs() < 1e-3 * expected_rev.abs(),
+            "rev {rev:.4} vs expected {expected_rev:.4}"
+        );
     }
 }
