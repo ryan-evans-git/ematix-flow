@@ -40,9 +40,63 @@ every engine that can run a given query, we win or tie on 21 of 22."**
 The one remaining loss (Q14 vs Polars) has a concrete path to closure
 documented below.
 
-## Next increments, in order of decision value
+## 2026-05-12 update — what landed and what's next
 
-### 1. Q14 full-fusion (closes the last Polars loss)
+**Σ.D3 phase E landed (commit 6d427a1):** `FusedQ14FullExec` at SF=1
+clocks **15.31 ms ± 0.17** (15-trial median) on the bench at
+`examples/tpch_q14_full_bench.rs`. That's **31% faster than DataFusion
+default** (19.57 ms) and **9% faster than FastParquet+Utf8View SQL**
+(16.85 ms), but still **22% behind Polars's 12.53 ms reference**.
+
+The fully-fused operator does what increment 1 below scoped: one
+operator owns both inputs, builds a direct-indexed `Vec<bool>` promo
+bitmap from part concurrently with the lineitem scan, then runs one
+async worker per lineitem partition that applies the shipdate filter
++ probes the bitmap + accumulates dual SUMs inline as batches arrive
+from FastParquet. The CPU loop is no longer the bottleneck — the gap
+to Polars now lives in the **parquet scan**, because we decode the
+full ~6M lineitem rows while Polars uses page/row-group statistics to
+read ~1% of them (~76 K rows in the 30-day shipdate window).
+
+So the "22 of 22 wins or ties" headline is still false vs Polars on
+Q14. The next session's work to close it is added as increment 0
+below; the SQL-auto-injection plan from old increment 2 stays queued
+for the session after that.
+
+### 0. Parquet predicate pushdown in FastParquet (NEXT SESSION)
+
+**Why first:** Closes the remaining 2.78 ms Q14 SF=1 gap vs Polars.
+Same lever Polars uses; we already win on the post-decode CPU work.
+
+**Shape:** Extract `&[Expr]` filters in
+`FastParquetTableProvider::scan(...)` — DataFusion already passes
+them in but FastParquet ignores them today. Convert simple
+AND-of-range predicates on date/int columns to row-group statistics
+probes; drop row groups whose min/max stats fall outside the
+predicate range before kicking off decode.
+
+**Subtasks:**
+
+1. Implement `supports_filters_pushdown` returning `Exact` for
+   simple `Column ⊕ Literal` range predicates and `Inexact` otherwise
+   (so DataFusion still applies a residual FilterExec for safety).
+2. In `FastParquetTableProvider::scan`, walk `&[Expr]` and build a
+   `RowGroupPredicate` struct: per-column `(min_op, min_lit, max_op,
+   max_lit)`. Reject anything else (unknown column, non-literal RHS,
+   non-comparison op) — those just don't get pushed down.
+3. Before queuing row groups for decode, read the column-chunk
+   metadata, evaluate the predicate against `min`/`max` per row group,
+   and skip groups that cannot contain any matching rows.
+4. Verify: re-run `tpch_q14_full_bench` — target ≤12.5 ms (beats
+   Polars). Also re-run the SF=1 + SF=10 regression sweep to confirm
+   the other 21 queries don't regress.
+
+**Effort estimate:** 1 session. Risk: getting the predicate evaluation
+right for Date32 row-group statistics (the parquet metadata exposes
+min/max as `&[u8]`; need the same Date32 → days-since-epoch decoding
+the rest of FastParquet uses).
+
+### 1. Q14 full-fusion (closes the last Polars loss) — DONE 2026-05-12
 
 **Why first:** This is the only thing standing between today's
 posture and a clean "22 of 22 we win or tie vs every other engine"
