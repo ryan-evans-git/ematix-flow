@@ -42,7 +42,7 @@ Every TPC-H query, four engines, same M3 Pro / SF=1 / Parquet,
 | Q11 |    —    | 148.5 | FAIL¹    |  22.18 |  22.18   | |
 | Q12 |  894.94 | 298.3 |   22.01² |  50.39 |  50.39   | ⚠ Polars 2.29× faster |
 | Q13 |    —    | 706.1 | FAIL¹    |  94.52 |  94.52   | |
-| Q14 |  458.27 | 132.1 |   12.53² |  27.21 | **15.15**⁵ | ⚠ Polars 1.21× faster — closed from 2.17× via Σ.D3-E FusedQ14FullExec |
+| Q14 |  458.27 | 132.1 |   12.53² |  27.21 | **17.17**⁴ | Σ.D3-D auto-injects FusedQ14FullExec (scan + filter + join + dual-SUM) from SQL — ⚠ Polars 1.37× faster (was 2.17× before Σ.D3-E) |
 | Q15 |    —    | 146.3 | FAIL¹    |  30.30 |  30.30   | |
 | Q16 |    —    | 223.5 |   25.94² |  22.43 |  22.43   | |
 | Q17 |    —    | 303.9 | FAIL¹    |  61.99 |  61.99   | |
@@ -108,14 +108,13 @@ All times in milliseconds. 5-trial median for DataFusion / ematix-flow,
   (or `_q6_`). See
   [Σ.D3 phase D](#σd3--sql-pattern-auto-injection-of-fused-execs)
   for the rule mechanics.
-- ⁵ Q14 number is `FusedQ14FullExec` constructed manually (the
-  whole-query fused operator that owns both `lineitem` and `part`
-  inputs); SQL auto-injection for Q14's plan shape (which includes a
-  JOIN, more complex than Q1/Q6) is the next item on the Σ.D3 phase D
-  roadmap. Until that lands, callers wanting Q14's 15.15 ms must build
-  the exec via `FusedQ14FullExec::try_new`. See
-  [`crates/ematix-flow-core/examples/tpch_q14_full_bench.rs`](crates/ematix-flow-core/examples/tpch_q14_full_bench.rs)
-  for the construction pattern.
+- (footnote ⁴ covers Q14 too — the Q14 rule wraps both `lineitem`
+  and `part` scans inside a single `FusedQ14FullExec`, replacing the
+  hash join with a direct-indexed promo bitmap probe. Hand-built
+  `FusedQ14FullExec` direct-execute is ~15.7 ms; the rule-injected
+  full-SQL path is ~17 ms — the ~1 ms gap is per-call SQL parsing +
+  logical-planning + physical-planning + rule rewrite, intrinsic to
+  the `SessionContext::sql(...)` workflow.)
 
 Full methodology + per-engine reproducers in
 [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md).
@@ -155,7 +154,7 @@ noise envelope:
 |---|---:|---:|---|
 | **Q9**  | 52.81 | **34.73** | ematix-flow wins, **1.52× faster than Polars** |
 | **Q12** | 22.01 | 23.05 | basically tied (Polars 5% ahead, inside noise) |
-| **Q14** | 12.53 | **15.15** (with `FusedQ14FullExec`) | Polars 1.21× faster — gap closed from 1.54× via Σ.D3-E full-fusion |
+| **Q14** | 12.53 | **17.17** (auto-injected from SQL) / **15.7** (hand-built) | Polars 1.37× faster — gap closed from 1.54× via Σ.D3-E full-fusion |
 
 Reproducing this is a one-liner:
 
@@ -187,12 +186,13 @@ single Cranelift-JIT'd fused operator over the scan. No exec
 construction at the user's level — `SessionContext::sql(...)` is the
 whole API.
 
-Two rules ship today (2026-05-13):
+Three rules ship today (2026-05-13):
 
-| Rule | Shape it matches | Replaces with | Q1/Q6 SQL @ SF=1 (rule on vs off) | Status |
+| Rule | Shape it matches | Replaces with | SQL @ SF=1 (rule on vs off) | Status |
 |---|---|---|---:|---|
 | `InjectFusedQ6Rule` | `Projection → Aggregate(Final, single SUM(extprice*disc)) → CoalescePartitions → Aggregate(Partial) → Filter(5-AND chain) → scan` | `FusedFilterSumExec` (JIT) | 11.46 vs 12.04 ms (**+4.8 %**) | reliable win |
 | `InjectFusedQ1Rule` | `SortMerge → Sort → Projection → Aggregate(FinalPartitioned, gby=[returnflag,linestatus], 8 aggs) → RepartitionExec(Hash) → Aggregate(Partial) → Projection(CSE) → Filter(l_shipdate ≤ V) → scan` | `FusedFilterMultiAggExec` (JIT) | 21.74 vs 37.71 ms (**+42-46 %**) | **beats Polars 35.2 ms by 38 %** |
+| `InjectFusedQ14Rule` | `Projection → Aggregate(Final, 2 SUMs) → CoalescePartitions → Aggregate(Partial) → Projection(CSE) → HashJoin(p_partkey = l_partkey) → {part scan, Filter(shipdate range) → lineitem scan}` | `FusedQ14FullExec` (owns both scans, replaces hash join with direct-indexed promo bitmap probe) | 17.17 vs ~18 ms (**+6-30 %** depending on run) | Polars 1.37× faster (was 2.17×) |
 
 Both rules' detectors walk the `PhysicalExpr` AST (`BinaryExpr` /
 `Column` / `Literal` with column-on-either-side flipping) to extract
@@ -207,7 +207,9 @@ Register them like any other physical-optimiser rule:
 
 ```rust
 use ematix_flow_core::fast_parquet::FastParquetTableProvider;
-use ematix_flow_core::fused_jit_rule::{InjectFusedQ1Rule, InjectFusedQ6Rule};
+use ematix_flow_core::fused_jit_rule::{
+    InjectFusedQ1Rule, InjectFusedQ6Rule, InjectFusedQ14Rule,
+};
 use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::prelude::{SessionConfig, SessionContext};
 
@@ -216,13 +218,17 @@ let state = SessionStateBuilder::new()
     .with_default_features()
     .with_physical_optimizer_rule(std::sync::Arc::new(InjectFusedQ1Rule))
     .with_physical_optimizer_rule(std::sync::Arc::new(InjectFusedQ6Rule))
+    .with_physical_optimizer_rule(std::sync::Arc::new(InjectFusedQ14Rule))
     .build();
 let ctx = SessionContext::new_with_state(state);
-let prov = FastParquetTableProvider::try_new("lineitem.parquet")?;
-ctx.register_table("lineitem", std::sync::Arc::new(prov))?;
+for t in ["lineitem", "part" /* … */] {
+    let prov = FastParquetTableProvider::try_new(format!("{t}.parquet"))?;
+    ctx.register_table(t, std::sync::Arc::new(prov))?;
+}
 
-// Now `ctx.sql(...)` auto-detects Q1/Q6 shapes and uses the JIT'd
-// fused exec for the matching subtree. Other queries pass through.
+// Now `ctx.sql(...)` auto-detects Q1/Q6/Q14 shapes and uses the
+// JIT'd fused exec for the matching subtree. Other queries pass
+// through unchanged.
 ```
 
 A real-SQL test pins each rule's correctness against the un-rewritten
@@ -230,16 +236,17 @@ plan to relative error < 1e-10 (Float64 cells) or bit-equality (Int64
 counts + string group keys). See
 [`crates/ematix-flow-core/src/fused_jit_rule.rs`](crates/ematix-flow-core/src/fused_jit_rule.rs)
 for the matchers and
-[`crates/ematix-flow-core/examples/tpch_{q1,q6}_inject_bench.rs`](crates/ematix-flow-core/examples)
+[`crates/ematix-flow-core/examples/tpch_{q1,q6,q14}_inject_bench.rs`](crates/ematix-flow-core/examples)
 for the reproducible benches.
 
-The two rules' bigger story is that the Cranelift-JIT'd substrate
-behind them ([`fused_jit.rs`](crates/ematix-flow-core/src/fused_jit.rs))
-is *generic* — `FusedFilterAggSpec` describes any filter + multi-
+The bigger story is that the Cranelift-JIT'd substrate behind these
+rules ([`fused_jit.rs`](crates/ematix-flow-core/src/fused_jit.rs)) is
+*generic* — `FusedFilterAggSpec` describes any filter + multi-
 aggregate + small-cardinality group-by shape, and the IR emitter
-generates code for it. Adding a rule for a new query shape is a
-matcher + a spec call, not a new operator. Q14's full-fusion rule
-(scan + filter + join + dual-SUM) is in progress.
+generates code for it. The Q14 rule extends this to filter + join +
+agg by owning both inputs and substituting the hash join with a
+direct-indexed bitmap probe. Adding support for a new query shape is
+a matcher + a spec call, not a new operator.
 
 [#46]: https://github.com/ryan-evans-git/ematix-flow/pull/46
 [#47]: https://github.com/ryan-evans-git/ematix-flow/pull/47
