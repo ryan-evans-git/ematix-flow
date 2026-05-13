@@ -254,35 +254,71 @@ impl ExecutionPlan for FusedFilterMultiAggExec {
 
         let schema_for_batch = out_schema.clone();
         let fut = async move {
-            // Drain every input partition into a single in-memory vec.
-            let mut batches: Vec<RecordBatch> = Vec::new();
+            // Σ.D3 phase D follow-up (matches commit 700a53d on
+            // FusedFilterSumExec): stream-and-accumulate, no
+            // materialisation. One async task per input partition;
+            // each task pulls batches from its stream and runs the
+            // per-batch JIT (or hand-coded) kernel inline against a
+            // local 5-group accumulator. Reduce across partitions at
+            // end of stream.
+            //
+            // Previously this drained every partition into a
+            // `Vec<RecordBatch>` then ran a `thread::scope` parallel
+            // shard loop — which serialised the scan against the
+            // compute and made the SQL-pattern-injected version of
+            // this exec slower than DataFusion's default Filter+
+            // HashAggregate stack (the rationale for fusing in the
+            // first place). The InjectFusedQ6Rule benchmark on the
+            // sibling FusedFilterSumExec went from -7.3 % to +4.8 %
+            // when the same change landed there; this commit applies
+            // the same pattern here so InjectFusedQ1Rule (task #354)
+            // has a chance at a net win.
+            let mut handles = Vec::with_capacity(input_partitions);
             for p in 0..input_partitions {
                 let mut s = input.execute(p, context.clone())?;
-                while let Some(b) = s.try_next().await? {
-                    batches.push(b);
+                let predicate_p = predicate;
+                let idx_p = idx;
+                let jit_p = jit.clone();
+                handles.push(tokio::spawn(async move {
+                    let mut groups = [Q1Aggs::default(); 5];
+                    let mut cells: [f64; 30] = [0.0; 30];
+                    while let Some(batch) = s.try_next().await? {
+                        match &jit_p {
+                            Some(j) => process_q1_batch_jit(&batch, idx_p, j, &mut cells),
+                            None => process_q1_batch_hand(&batch, predicate_p, idx_p, &mut groups),
+                        }
+                    }
+                    // JIT writes into the 30-cell scratch buffer;
+                    // convert to [Q1Aggs; 5] for merging with the
+                    // hand-coded shape.
+                    if jit_p.is_some() {
+                        for g in 0..5 {
+                            let base = g * 6;
+                            groups[g].sum_qty = cells[base];
+                            groups[g].sum_price = cells[base + 1];
+                            groups[g].sum_disc_price = cells[base + 2];
+                            groups[g].sum_charge = cells[base + 3];
+                            groups[g].sum_disc = cells[base + 4];
+                            groups[g].count = cells[base + 5] as u64;
+                        }
+                    }
+                    Ok::<[Q1Aggs; 5], DataFusionError>(groups)
+                }));
+            }
+
+            let mut merged = [Q1Aggs::default(); 5];
+            for h in handles {
+                let partial = h.await.map_err(|e| {
+                    DataFusionError::Execution(format!(
+                        "FusedFilterMultiAggExec: worker join failed: {e}",
+                    ))
+                })??;
+                for g in 0..merged.len() {
+                    merged[g].merge(&partial[g]);
                 }
             }
 
-            // Dispatch hand-coded vs JIT'd at the parallel-driver level.
-            let groups = tokio::task::spawn_blocking(move || {
-                let workers = std::thread::available_parallelism()
-                    .map(|n| n.get())
-                    .unwrap_or(8);
-                match jit {
-                    None => run_fused_q1_parallel(&batches, predicate, idx, workers),
-                    Some(j) => run_fused_q1_parallel_jit(&batches, idx, workers, &j),
-                }
-            })
-            .await
-            .map_err(|e| {
-                DataFusionError::Execution(format!(
-                    "FusedFilterMultiAggExec: blocking-task join failed: {e}",
-                ))
-            })?;
-
-            // Materialize a 4-row output batch in TPC-H Q1's canonical
-            // sort order: (returnflag, linestatus) ascending.
-            let batch = q1_groups_to_record_batch(schema_for_batch, &groups)?;
+            let batch = q1_groups_to_record_batch(schema_for_batch, &merged)?;
             Ok::<RecordBatch, DataFusionError>(batch)
         };
 
@@ -316,232 +352,152 @@ fn q1_group_idx(rflag: u8, lstatus: u8) -> usize {
     }
 }
 
-/// Parallel fused loop. Mirrors the day-1 prototype in
-/// `examples/tpch_q1_tune.rs`.
-fn run_fused_q1_parallel(
-    batches: &[RecordBatch],
-    p: Q1Predicate,
-    idx: ColumnIndices,
-    workers: usize,
-) -> [Q1Aggs; 5] {
-    let n = batches.len();
-    let chunk = n.div_ceil(workers.max(1));
-    std::thread::scope(|s| {
-        let handles: Vec<_> = (0..workers)
-            .map(|w| {
-                let lo = (w * chunk).min(n);
-                let hi = ((w + 1) * chunk).min(n);
-                let slice = &batches[lo..hi];
-                s.spawn(move || run_fused_q1_shard(slice, p, idx))
-            })
-            .collect();
-        let mut merged = [Q1Aggs::default(); 5];
-        for h in handles {
-            let partial = h.join().unwrap();
-            for g in 0..merged.len() {
-                merged[g].merge(&partial[g]);
-            }
-        }
-        merged
-    })
-}
-
-/// JIT'd-shard variant of `run_fused_q1_parallel`. Same sharding
-/// strategy, but each shard's inner loop dispatches into the Cranelift-
-/// JIT'd `FusedFilterAggJit` (Q1 spec) instead of `run_fused_q1_shard`.
-/// Per-shard partial accumulators are read back as a `[Q1Aggs; 5]` so
-/// the merge + `q1_groups_to_record_batch` logic is shared with the
-/// hand-coded path.
-fn run_fused_q1_parallel_jit(
-    batches: &[RecordBatch],
-    idx: ColumnIndices,
-    workers: usize,
-    jit: &Arc<crate::fused_jit::FusedFilterAggJit>,
-) -> [Q1Aggs; 5] {
-    let n = batches.len();
-    let chunk = n.div_ceil(workers.max(1));
-    std::thread::scope(|s| {
-        let handles: Vec<_> = (0..workers)
-            .map(|w| {
-                let lo = (w * chunk).min(n);
-                let hi = ((w + 1) * chunk).min(n);
-                let slice = &batches[lo..hi];
-                let jit = jit.clone();
-                s.spawn(move || run_fused_q1_shard_jit(slice, idx, &jit))
-            })
-            .collect();
-        let mut merged = [Q1Aggs::default(); 5];
-        for h in handles {
-            let partial = h.join().unwrap();
-            for g in 0..merged.len() {
-                merged[g].merge(&partial[g]);
-            }
-        }
-        merged
-    })
-}
-
-/// JIT'd Q1 shard. The JIT's outputs[] layout is 30 f64 cells (5 groups
-/// × 6 aggs), row-major: `[g0_sum_qty, g0_sum_price, g0_sum_disc_price,
-/// g0_sum_charge, g0_sum_disc, g0_count, g1_sum_qty, ...]`. We keep one
-/// 30-cell scratch buffer across all batches in the shard so the JIT's
-/// pre-seed-from-outputs behaviour accumulates seamlessly batch-to-batch.
-fn run_fused_q1_shard_jit(
-    batches: &[RecordBatch],
+/// Per-batch fused filter + 5-group multi-aggregate update via the
+/// Cranelift-JIT'd kernel. `cells` is the running 30-cell accumulator
+/// (5 groups × 6 aggs, row-major). The JIT pre-seeds from `cells` at
+/// entry and stores back at exit, so calling this in a loop accumulates
+/// across batches.
+fn process_q1_batch_jit(
+    batch: &RecordBatch,
     idx: ColumnIndices,
     jit: &crate::fused_jit::FusedFilterAggJit,
-) -> [Q1Aggs; 5] {
-    let mut cells: [f64; 30] = [0.0; 30];
-    for batch in batches {
-        let rflag = batch
-            .column(idx.rflag)
-            .as_any()
-            .downcast_ref::<StringViewArray>()
-            .expect("validated as Utf8View");
-        let lstatus = batch
-            .column(idx.lstatus)
-            .as_any()
-            .downcast_ref::<StringViewArray>()
-            .expect("validated as Utf8View");
-        let qty = batch
-            .column(idx.qty)
-            .as_any()
-            .downcast_ref::<Float64Array>()
-            .expect("validated as Float64");
-        let price = batch
-            .column(idx.price)
-            .as_any()
-            .downcast_ref::<Float64Array>()
-            .expect("validated as Float64");
-        let disc = batch
-            .column(idx.disc)
-            .as_any()
-            .downcast_ref::<Float64Array>()
-            .expect("validated as Float64");
-        let tax = batch
-            .column(idx.tax)
-            .as_any()
-            .downcast_ref::<Float64Array>()
-            .expect("validated as Float64");
-        let ship = batch
-            .column(idx.ship)
-            .as_any()
-            .downcast_ref::<Date32Array>()
-            .expect("validated as Date32");
+    cells: &mut [f64; 30],
+) {
+    let rflag = batch
+        .column(idx.rflag)
+        .as_any()
+        .downcast_ref::<StringViewArray>()
+        .expect("validated as Utf8View");
+    let lstatus = batch
+        .column(idx.lstatus)
+        .as_any()
+        .downcast_ref::<StringViewArray>()
+        .expect("validated as Utf8View");
+    let qty = batch
+        .column(idx.qty)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .expect("validated as Float64");
+    let price = batch
+        .column(idx.price)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .expect("validated as Float64");
+    let disc = batch
+        .column(idx.disc)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .expect("validated as Float64");
+    let tax = batch
+        .column(idx.tax)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .expect("validated as Float64");
+    let ship = batch
+        .column(idx.ship)
+        .as_any()
+        .downcast_ref::<Date32Array>()
+        .expect("validated as Date32");
 
-        // Column order must match `FusedFilterAggSpec::q1()`: returnflag,
-        // linestatus, quantity, extprice, discount, tax, shipdate. For
-        // Utf8View columns we pass the raw views buffer (16 bytes per row).
-        let inputs: [*const u8; 7] = [
-            rflag.views().as_ptr().cast::<u8>(),
-            lstatus.views().as_ptr().cast::<u8>(),
-            qty.values().as_ptr().cast::<u8>(),
-            price.values().as_ptr().cast::<u8>(),
-            disc.values().as_ptr().cast::<u8>(),
-            tax.values().as_ptr().cast::<u8>(),
-            ship.values().as_ptr().cast::<u8>(),
-        ];
-        // SAFETY: Arrow guarantees each slice has at least `batch.num_rows()`
-        // elements; views() is also `num_rows()` views long; cells holds
-        // exactly `jit.n_outputs() == 30` f64 cells.
-        debug_assert_eq!(jit.n_outputs(), 30);
-        unsafe {
-            jit.run(
-                batch.num_rows() as i64,
-                inputs.as_ptr(),
-                cells.as_mut_ptr(),
-            );
-        }
+    // Column order must match `FusedFilterAggSpec::q1()`: returnflag,
+    // linestatus, quantity, extprice, discount, tax, shipdate. For
+    // Utf8View columns we pass the raw views buffer (16 bytes per row).
+    let inputs: [*const u8; 7] = [
+        rflag.views().as_ptr().cast::<u8>(),
+        lstatus.views().as_ptr().cast::<u8>(),
+        qty.values().as_ptr().cast::<u8>(),
+        price.values().as_ptr().cast::<u8>(),
+        disc.values().as_ptr().cast::<u8>(),
+        tax.values().as_ptr().cast::<u8>(),
+        ship.values().as_ptr().cast::<u8>(),
+    ];
+    debug_assert_eq!(jit.n_outputs(), 30);
+    // SAFETY: Arrow guarantees each slice has at least `batch.num_rows()`
+    // elements; views() is also `num_rows()` views long; cells holds
+    // exactly `jit.n_outputs() == 30` f64 cells.
+    unsafe {
+        jit.run(
+            batch.num_rows() as i64,
+            inputs.as_ptr(),
+            cells.as_mut_ptr(),
+        );
     }
-    // Convert the 30 f64 cells back to [Q1Aggs; 5]. Group order in
-    // `cells[]` matches `FusedFilterAggSpec::q1()`'s known_keys: 0=(R,F),
-    // 1=(N,F), 2=(N,O), 3=(A,F), 4=catch-all. Same indexing as
-    // `q1_group_idx` so the merge stays consistent.
-    let mut groups = [Q1Aggs::default(); 5];
-    for g in 0..5 {
-        let base = g * 6;
-        groups[g].sum_qty = cells[base];
-        groups[g].sum_price = cells[base + 1];
-        groups[g].sum_disc_price = cells[base + 2];
-        groups[g].sum_charge = cells[base + 3];
-        groups[g].sum_disc = cells[base + 4];
-        // count is stored as f64 in the JIT path; round (it's an exact
-        // integer since each increment is 1.0).
-        groups[g].count = cells[base + 5] as u64;
-    }
-    groups
 }
 
-fn run_fused_q1_shard(batches: &[RecordBatch], p: Q1Predicate, idx: ColumnIndices) -> [Q1Aggs; 5] {
-    let mut groups = [Q1Aggs::default(); 5];
-    for batch in batches {
-        let rflag = batch
-            .column(idx.rflag)
-            .as_any()
-            .downcast_ref::<StringViewArray>()
-            .expect("validated as Utf8View");
-        let lstatus = batch
-            .column(idx.lstatus)
-            .as_any()
-            .downcast_ref::<StringViewArray>()
-            .expect("validated as Utf8View");
-        let qty = batch
-            .column(idx.qty)
-            .as_any()
-            .downcast_ref::<Float64Array>()
-            .expect("validated as Float64");
-        let price = batch
-            .column(idx.price)
-            .as_any()
-            .downcast_ref::<Float64Array>()
-            .expect("validated as Float64");
-        let disc = batch
-            .column(idx.disc)
-            .as_any()
-            .downcast_ref::<Float64Array>()
-            .expect("validated as Float64");
-        let tax = batch
-            .column(idx.tax)
-            .as_any()
-            .downcast_ref::<Float64Array>()
-            .expect("validated as Float64");
-        let ship = batch
-            .column(idx.ship)
-            .as_any()
-            .downcast_ref::<Date32Array>()
-            .expect("validated as Date32");
-        let qty_v = qty.values();
-        let price_v = price.values();
-        let disc_v = disc.values();
-        let tax_v = tax.values();
-        let ship_v = ship.values();
-        for i in 0..batch.num_rows() {
-            if ship_v[i] > p.shipdate_cutoff {
-                continue;
-            }
-            let r = rflag.value(i).as_bytes()[0];
-            let l = lstatus.value(i).as_bytes()[0];
-            let g = q1_group_idx(r, l);
-
-            let q = qty_v[i];
-            let pr = price_v[i];
-            let d = disc_v[i];
-            let t = tax_v[i];
-
-            let omd = 1.0 - d;
-            let disc_price = pr * omd;
-            let charge = disc_price * (1.0 + t);
-
-            let a = &mut groups[g];
-            a.sum_qty += q;
-            a.sum_price += pr;
-            a.sum_disc_price += disc_price;
-            a.sum_charge += charge;
-            a.sum_disc += d;
-            a.count += 1;
+/// Per-batch fused filter + 5-group multi-aggregate update (hand-coded
+/// Rust). Same semantics as `process_q1_batch_jit` but accumulates
+/// directly into `[Q1Aggs; 5]`.
+fn process_q1_batch_hand(
+    batch: &RecordBatch,
+    p: Q1Predicate,
+    idx: ColumnIndices,
+    groups: &mut [Q1Aggs; 5],
+) {
+    let rflag = batch
+        .column(idx.rflag)
+        .as_any()
+        .downcast_ref::<StringViewArray>()
+        .expect("validated as Utf8View");
+    let lstatus = batch
+        .column(idx.lstatus)
+        .as_any()
+        .downcast_ref::<StringViewArray>()
+        .expect("validated as Utf8View");
+    let qty = batch
+        .column(idx.qty)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .expect("validated as Float64");
+    let price = batch
+        .column(idx.price)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .expect("validated as Float64");
+    let disc = batch
+        .column(idx.disc)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .expect("validated as Float64");
+    let tax = batch
+        .column(idx.tax)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .expect("validated as Float64");
+    let ship = batch
+        .column(idx.ship)
+        .as_any()
+        .downcast_ref::<Date32Array>()
+        .expect("validated as Date32");
+    let qty_v = qty.values();
+    let price_v = price.values();
+    let disc_v = disc.values();
+    let tax_v = tax.values();
+    let ship_v = ship.values();
+    for i in 0..batch.num_rows() {
+        if ship_v[i] > p.shipdate_cutoff {
+            continue;
         }
+        let r = rflag.value(i).as_bytes()[0];
+        let l = lstatus.value(i).as_bytes()[0];
+        let g = q1_group_idx(r, l);
+
+        let q = qty_v[i];
+        let pr = price_v[i];
+        let d = disc_v[i];
+        let t = tax_v[i];
+
+        let omd = 1.0 - d;
+        let disc_price = pr * omd;
+        let charge = disc_price * (1.0 + t);
+
+        let a = &mut groups[g];
+        a.sum_qty += q;
+        a.sum_price += pr;
+        a.sum_disc_price += disc_price;
+        a.sum_charge += charge;
+        a.sum_disc += d;
+        a.count += 1;
     }
-    groups
 }
 
 /// The four TPC-H Q1 groups in canonical `ORDER BY l_returnflag,

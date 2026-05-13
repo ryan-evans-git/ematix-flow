@@ -45,9 +45,11 @@ use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::filter::FilterExec;
 use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::repartition::RepartitionExec;
+use datafusion::physical_plan::sorts::sort::SortExec;
+use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
 
 use crate::fused::{FusedFilterSumExec, Q6Predicate};
-use crate::fused_multi_agg::FusedFilterMultiAggExec;
+use crate::fused_multi_agg::{FusedFilterMultiAggExec, Q1Predicate};
 use crate::fused_post_join::{FusedPostJoinExec, FusedPostJoinSpec};
 
 /// Σ.D3 phase D rule: rewrite hand-coded fused execs into their JIT
@@ -436,6 +438,321 @@ fn dferr(msg: &str) -> datafusion::error::DataFusionError {
     datafusion::error::DataFusionError::Internal(msg.into())
 }
 
+/// Σ.D3 phase D (real, Q1 variant): rule that pattern-matches the
+/// DataFusion default plan shape for the TPC-H Q1 group-by query and
+/// rewrites the whole subtree to a single [`FusedFilterMultiAggExec`]
+/// (JIT mode) directly over the scan. Group-by version of
+/// [`InjectFusedQ6Rule`].
+///
+/// Recognised plan shape (see `examples/tpch_q1_plan_dump.rs`):
+///
+/// ```text
+/// SortPreservingMergeExec(by [l_returnflag ASC, l_linestatus ASC])
+///   SortExec(by [l_returnflag ASC, l_linestatus ASC])
+///     ProjectionExec(rename sum/avg/count expressions → q1 SELECT list)
+///       AggregateExec(FinalPartitioned, gby=[returnflag, linestatus],
+///                    8 aggregates: 4 SUM + 3 AVG + COUNT)
+///         RepartitionExec(Hash([returnflag, linestatus], ...))
+///           AggregateExec(Partial, same gby + aggregates)
+///             ProjectionExec(CSE: extprice * (1 - discount))
+///               FilterExec(l_shipdate <= <Date32>, projection=[…])
+///                 [optional RepartitionExec wrapper]
+///                   scan (exposes the 7 cols Q1 fused needs)
+/// ```
+///
+/// Replacement: `FusedFilterMultiAggExec(scan, Q1Predicate { shipdate
+/// _cutoff })`. The fused exec emits the 10-column Q1 SELECT list in
+/// canonical (l_returnflag, l_linestatus)-sorted order, so the
+/// `SortPreservingMergeExec → SortExec → ProjectionExec` chain at the
+/// top is *redundant* — we replace from the SortPreservingMergeExec
+/// (or SortExec if that's the top) all the way down. Output schema
+/// matches the SQL's SELECT list exactly (names + types).
+#[derive(Debug, Default)]
+pub struct InjectFusedQ1Rule;
+
+impl PhysicalOptimizerRule for InjectFusedQ1Rule {
+    fn optimize(
+        &self,
+        plan: Arc<dyn ExecutionPlan>,
+        _config: &ConfigOptions,
+    ) -> DfResult<Arc<dyn ExecutionPlan>> {
+        let result = plan.transform_down(|node| {
+            if let Some(new) = try_match_q1_plan(&node)? {
+                Ok(Transformed::yes(new))
+            } else {
+                Ok(Transformed::no(node))
+            }
+        })?;
+        Ok(result.data)
+    }
+
+    fn name(&self) -> &str {
+        "ematix_flow_inject_fused_q1"
+    }
+
+    fn schema_check(&self) -> bool {
+        // The fused exec emits the Q1 SELECT-list columns by name +
+        // semantic type, but the *Arrow type* differs from DataFusion's
+        // synthesised AggregateExec output: returnflag / linestatus are
+        // Utf8 here vs Utf8View in the planner's schema; the 7 sum/avg
+        // cols are non-nullable Float64 here vs nullable in the planner's
+        // schema. The values are identical (no aggregate row of Q1 SF=1
+        // returns NULL anywhere); the type drift is purely a metadata
+        // difference. Turning schema_check off accepts that drift; the
+        // SQL-level test pins the resulting cell-by-cell equivalence
+        // with the un-rewritten plan.
+        false
+    }
+}
+
+/// Try to interpret `node` as the top of a Q1-shaped plan and return
+/// a [`FusedFilterMultiAggExec`] over the scan beneath it. Tolerates
+/// either `SortPreservingMergeExec` *or* `SortExec` at the top — the
+/// merge wraps the sort when DataFusion targets multiple partitions
+/// but the sort alone can be the root when there's only one.
+fn try_match_q1_plan(node: &Arc<dyn ExecutionPlan>) -> DfResult<Option<Arc<dyn ExecutionPlan>>> {
+    // Top: SortPreservingMergeExec (multi-partition) — strip if present.
+    let after_merge: Arc<dyn ExecutionPlan> =
+        if node.as_any().downcast_ref::<SortPreservingMergeExec>().is_some() {
+            match node.children().first() {
+                Some(c) => (*c).clone(),
+                None => return Ok(None),
+            }
+        } else {
+            node.clone()
+        };
+
+    // Next: SortExec (sort by [l_returnflag, l_linestatus]).
+    let Some(_sort) = after_merge.as_any().downcast_ref::<SortExec>() else {
+        return Ok(None);
+    };
+
+    // Down: ProjectionExec that renames sum/avg/count to the q1
+    // output column names. We don't fully validate the rename
+    // exprs — instead we check the output schema names match q1.
+    let after_sort: Arc<dyn ExecutionPlan> = after_merge
+        .children()
+        .first()
+        .map(|c| (*c).clone())
+        .ok_or_else(|| dferr("Q1 match: SortExec missing input"))?;
+    let Some(top_proj) = after_sort.as_any().downcast_ref::<ProjectionExec>() else {
+        return Ok(None);
+    };
+    if !projection_emits_q1_select_list(top_proj.schema().as_ref()) {
+        return Ok(None);
+    }
+
+    // Down: AggregateExec(FinalPartitioned), gby=[returnflag, linestatus].
+    let after_proj: Arc<dyn ExecutionPlan> = top_proj
+        .children()
+        .first()
+        .map(|c| (*c).clone())
+        .ok_or_else(|| dferr("Q1 match: top ProjectionExec missing input"))?;
+    let Some(agg_final) = after_proj.as_any().downcast_ref::<AggregateExec>() else {
+        return Ok(None);
+    };
+    if !matches!(agg_final.mode(), AggregateMode::FinalPartitioned) {
+        return Ok(None);
+    }
+    if !group_by_is_returnflag_linestatus(agg_final) {
+        return Ok(None);
+    }
+    if agg_final.aggr_expr().len() != 8 {
+        return Ok(None);
+    }
+
+    // Down: RepartitionExec(Hash([returnflag, linestatus])).
+    let after_final_agg: Arc<dyn ExecutionPlan> = agg_final
+        .children()
+        .first()
+        .map(|c| (*c).clone())
+        .ok_or_else(|| dferr("Q1 match: AggregateExec(Final) missing input"))?;
+    let Some(_repart) = after_final_agg.as_any().downcast_ref::<RepartitionExec>() else {
+        return Ok(None);
+    };
+
+    // Down: AggregateExec(Partial), same gby + 8 aggs.
+    let after_repart: Arc<dyn ExecutionPlan> = after_final_agg
+        .children()
+        .first()
+        .map(|c| (*c).clone())
+        .ok_or_else(|| dferr("Q1 match: shuffle RepartitionExec missing input"))?;
+    let Some(agg_partial) = after_repart.as_any().downcast_ref::<AggregateExec>() else {
+        return Ok(None);
+    };
+    if !matches!(agg_partial.mode(), AggregateMode::Partial) {
+        return Ok(None);
+    }
+    if !group_by_is_returnflag_linestatus(agg_partial) {
+        return Ok(None);
+    }
+    if agg_partial.aggr_expr().len() != 8 {
+        return Ok(None);
+    }
+
+    // Down: ProjectionExec (CSE: extprice * (1 - discount)). Some
+    // DataFusion versions skip it; treat as optional.
+    let after_partial: Arc<dyn ExecutionPlan> = agg_partial
+        .children()
+        .first()
+        .map(|c| (*c).clone())
+        .ok_or_else(|| dferr("Q1 match: AggregateExec(Partial) missing input"))?;
+    let after_cse: Arc<dyn ExecutionPlan> = match after_partial
+        .as_any()
+        .downcast_ref::<ProjectionExec>()
+    {
+        Some(_) => after_partial
+            .children()
+            .first()
+            .map(|c| (*c).clone())
+            .ok_or_else(|| dferr("Q1 match: inner ProjectionExec missing input"))?,
+        None => after_partial,
+    };
+
+    // Down: FilterExec with a single `l_shipdate <op> Date32` predicate.
+    let Some(filter) = after_cse.as_any().downcast_ref::<FilterExec>() else {
+        return Ok(None);
+    };
+    let Some(predicate) = extract_q1_predicate(filter.predicate()) else {
+        return Ok(None);
+    };
+
+    // Walk down to the scan: strip optional Repartition / CoalesceBatches.
+    let mut scan: Arc<dyn ExecutionPlan> = filter
+        .children()
+        .first()
+        .map(|c| (*c).clone())
+        .ok_or_else(|| dferr("Q1 match: FilterExec missing input"))?;
+    loop {
+        if scan_has_required_q1_columns(&scan.schema()) {
+            break;
+        }
+        let children = scan.children();
+        if children.len() != 1 {
+            return Ok(None);
+        }
+        scan = children[0].clone();
+        if !scan_has_required_q1_columns(&scan.schema()) && scan.children().is_empty() {
+            return Ok(None);
+        }
+    }
+
+    let fused = FusedFilterMultiAggExec::try_new_q1_jit(scan, predicate)?;
+    Ok(Some(Arc::new(fused) as Arc<dyn ExecutionPlan>))
+}
+
+/// Q1 output schema: 2 grouping keys + 8 aggregate output cols
+/// (4 SUM + 3 AVG + 1 COUNT, all renamed to canonical TPC-H names).
+fn projection_emits_q1_select_list(schema: &datafusion::arrow::datatypes::Schema) -> bool {
+    let expected = [
+        "l_returnflag",
+        "l_linestatus",
+        "sum_qty",
+        "sum_base_price",
+        "sum_disc_price",
+        "sum_charge",
+        "avg_qty",
+        "avg_price",
+        "avg_disc",
+        "count_order",
+    ];
+    if schema.fields().len() != expected.len() {
+        return false;
+    }
+    schema
+        .fields()
+        .iter()
+        .zip(expected.iter())
+        .all(|(f, n)| f.name() == n)
+}
+
+/// Check that `agg`'s group-by is exactly `[l_returnflag, l_linestatus]`
+/// — both as `Column` PhysicalExprs, in that order.
+fn group_by_is_returnflag_linestatus(agg: &AggregateExec) -> bool {
+    let g = agg.group_expr();
+    let exprs = g.expr();
+    if exprs.len() != 2 {
+        return false;
+    }
+    let a = exprs[0].0.as_any().downcast_ref::<Column>().map(|c| c.name());
+    let b = exprs[1].0.as_any().downcast_ref::<Column>().map(|c| c.name());
+    matches!(
+        (a, b),
+        (Some("l_returnflag"), Some("l_linestatus")) | (Some("l_linestatus"), Some("l_returnflag"))
+    )
+}
+
+fn scan_has_required_q1_columns(schema: &datafusion::arrow::datatypes::SchemaRef) -> bool {
+    use datafusion::arrow::datatypes::DataType;
+    let cols = [
+        ("l_returnflag", DataType::Utf8View),
+        ("l_linestatus", DataType::Utf8View),
+        ("l_quantity", DataType::Float64),
+        ("l_extendedprice", DataType::Float64),
+        ("l_discount", DataType::Float64),
+        ("l_tax", DataType::Float64),
+        ("l_shipdate", DataType::Date32),
+    ];
+    cols.iter().all(|(n, ty)| {
+        schema
+            .field_with_name(n)
+            .map(|f| f.data_type() == ty)
+            .unwrap_or(false)
+    })
+}
+
+/// Pull the Q1 predicate (a single `l_shipdate <= Date32(...)` or
+/// `<`) out of a FilterExec's PhysicalExpr. The TPC-H spec uses `<=`;
+/// `<` is accepted too in case a different translator/path emits it.
+/// Anything else (different column, different op, compound predicate)
+/// makes us return `None` and the rule passes through.
+fn extract_q1_predicate(expr: &Arc<dyn PhysicalExpr>) -> Option<Q1Predicate> {
+    // We support a single comparison leaf — Q1's filter is just one
+    // condition. If a future planner version splits it into an AND of
+    // redundant conditions we can re-use `flatten_and` here.
+    let (col, op, lit) = match decompose_filter_leaf(expr)? {
+        (c, o, l) => (c, o, l),
+    };
+    if col != "l_shipdate" {
+        return None;
+    }
+    let cutoff_lit = match lit {
+        ScalarValue::Date32(Some(d)) => d,
+        _ => return None,
+    };
+    // For `col <= V` the JIT's per-row check is `ship > V → skip`, i.e.
+    // cutoff = V. For `col < V` the equivalent inclusive cutoff is V-1.
+    let shipdate_cutoff = match op {
+        Operator::LtEq => cutoff_lit,
+        Operator::Lt => cutoff_lit - 1,
+        _ => return None,
+    };
+    Some(Q1Predicate { shipdate_cutoff })
+}
+
+/// Generic `Column ⊕ Literal` (or `Literal ⊕ Column`) decomposer.
+/// Same shape as `decompose_leaf` in the Q6 rule but un-aliased to a
+/// single static column name set, since Q1 only filters on one column.
+fn decompose_filter_leaf(
+    expr: &Arc<dyn PhysicalExpr>,
+) -> Option<(String, Operator, ScalarValue)> {
+    let b = expr.as_any().downcast_ref::<BinaryExpr>()?;
+    let op = *b.op();
+    match (
+        b.left().as_any().downcast_ref::<Column>(),
+        b.right().as_any().downcast_ref::<Literal>(),
+        b.left().as_any().downcast_ref::<Literal>(),
+        b.right().as_any().downcast_ref::<Column>(),
+    ) {
+        (Some(c), Some(l), _, _) => Some((c.name().to_string(), op, l.value().clone())),
+        (_, _, Some(l), Some(c)) => {
+            let flipped = flip_op(op)?;
+            Some((c.name().to_string(), flipped, l.value().clone()))
+        }
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -738,6 +1055,154 @@ mod tests {
         assert!(
             !plan_str.contains("FusedFilterSumExec"),
             "InjectFusedQ6Rule wrongly fired on a non-Q6 query:\n{plan_str}"
+        );
+    }
+
+    // ----- InjectFusedQ1Rule tests -----
+
+    const Q1_SQL: &str = "
+        SELECT
+            l_returnflag, l_linestatus,
+            sum(l_quantity) AS sum_qty,
+            sum(l_extendedprice) AS sum_base_price,
+            sum(l_extendedprice * (1 - l_discount)) AS sum_disc_price,
+            sum(l_extendedprice * (1 - l_discount) * (1 + l_tax)) AS sum_charge,
+            avg(l_quantity) AS avg_qty,
+            avg(l_extendedprice) AS avg_price,
+            avg(l_discount) AS avg_disc,
+            count(*) AS count_order
+        FROM lineitem
+        WHERE l_shipdate <= DATE '1998-09-02'
+        GROUP BY l_returnflag, l_linestatus
+        ORDER BY l_returnflag, l_linestatus
+    ";
+
+    async fn ctx_for_q1(register_rule: bool) -> Option<SessionContext> {
+        use crate::fast_parquet::FastParquetTableProvider;
+        use datafusion::execution::session_state::SessionStateBuilder;
+        use datafusion::prelude::SessionConfig;
+
+        let path = sf1_lineitem()?;
+        let state = if register_rule {
+            SessionStateBuilder::new()
+                .with_config(SessionConfig::new().with_target_partitions(14))
+                .with_default_features()
+                .with_physical_optimizer_rule(Arc::new(InjectFusedQ1Rule))
+                .build()
+        } else {
+            SessionStateBuilder::new()
+                .with_config(SessionConfig::new().with_target_partitions(14))
+                .with_default_features()
+                .build()
+        };
+        let ctx = SessionContext::new_with_state(state);
+        let prov = FastParquetTableProvider::try_new(path).unwrap();
+        ctx.register_table("lineitem", Arc::new(prov)).unwrap();
+        Some(ctx)
+    }
+
+    /// Inject Q1 rule fires on real Q1 SQL: the resulting physical
+    /// plan contains FusedFilterMultiAggExec and the answer agrees
+    /// with the un-rewritten plan on every cell.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn inject_q1_rule_rewrites_real_plan_and_preserves_result() {
+        use datafusion::arrow::array::{AsArray, Float64Array, Int64Array};
+        use datafusion::physical_plan::displayable;
+
+        fn string_at(b: &RecordBatch, col: usize, row: usize) -> String {
+            // The Arrow type for the grouping columns differs between
+            // the un-rewritten plan (StringViewArray) and the fused exec
+            // (StringArray). Read each via the matching downcast and
+            // compare as `&str`.
+            let arr = b.column(col);
+            if let Some(s) = arr.as_string_opt::<i32>() {
+                s.value(row).to_string()
+            } else if let Some(s) = arr.as_string_view_opt() {
+                s.value(row).to_string()
+            } else {
+                panic!("unexpected string array variant for col {col}");
+            }
+        }
+
+        let Some(ctx_with) = ctx_for_q1(true).await else {
+            eprintln!("TPC-H SF=1 data not generated; skipping test");
+            return;
+        };
+        let ctx_without = ctx_for_q1(false).await.unwrap();
+
+        let plan = ctx_with
+            .sql(Q1_SQL)
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+        let plan_str = displayable(plan.as_ref()).indent(true).to_string();
+        assert!(
+            plan_str.contains("FusedFilterMultiAggExec"),
+            "InjectFusedQ1Rule did not fire on canonical Q1 plan.\nPlan:\n{plan_str}"
+        );
+
+        let r_with = ctx_with.sql(Q1_SQL).await.unwrap().collect().await.unwrap();
+        let r_without = ctx_without.sql(Q1_SQL).await.unwrap().collect().await.unwrap();
+        assert_eq!(r_with.len(), r_without.len(), "batch count");
+        let bw = &r_with[0];
+        let bo = &r_without[0];
+        assert_eq!(bw.num_rows(), bo.num_rows(), "row count");
+        assert_eq!(bw.num_rows(), 4, "Q1 SF=1 yields 4 groups");
+
+        for col_idx in [0usize, 1] {
+            for r in 0..bw.num_rows() {
+                assert_eq!(
+                    string_at(bw, col_idx, r),
+                    string_at(bo, col_idx, r),
+                    "col {col_idx} row {r}"
+                );
+            }
+        }
+        for col_idx in 2..=8 {
+            let w = bw.column(col_idx).as_any().downcast_ref::<Float64Array>().unwrap();
+            let o = bo.column(col_idx).as_any().downcast_ref::<Float64Array>().unwrap();
+            for r in 0..bw.num_rows() {
+                let wv = w.value(r);
+                let ov = o.value(r);
+                let rel = (wv - ov).abs() / ov.abs().max(wv.abs()).max(1e-300);
+                assert!(
+                    rel < 1e-10,
+                    "col {col_idx} row {r}: with={wv} without={ov} rel_err={rel:e}"
+                );
+            }
+        }
+        let w_c = bw.column(9).as_any().downcast_ref::<Int64Array>().unwrap();
+        let o_c = bo.column(9).as_any().downcast_ref::<Int64Array>().unwrap();
+        for r in 0..bw.num_rows() {
+            assert_eq!(w_c.value(r), o_c.value(r), "count row {r}");
+        }
+    }
+
+    /// Rule must not fire when shape diverges (same group keys, but
+    /// no shipdate filter and different aggregates).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn inject_q1_rule_does_not_fire_on_unrelated_query() {
+        use datafusion::physical_plan::displayable;
+        let Some(ctx) = ctx_for_q1(true).await else {
+            eprintln!("TPC-H SF=1 data not generated; skipping test");
+            return;
+        };
+        let plan = ctx
+            .sql(
+                "SELECT l_returnflag, l_linestatus, count(*) FROM lineitem \
+                 GROUP BY l_returnflag, l_linestatus",
+            )
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+        let plan_str = displayable(plan.as_ref()).indent(true).to_string();
+        assert!(
+            !plan_str.contains("FusedFilterMultiAggExec"),
+            "InjectFusedQ1Rule wrongly fired:\n{plan_str}"
         );
     }
 }

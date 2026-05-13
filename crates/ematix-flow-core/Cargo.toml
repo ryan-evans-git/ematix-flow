@@ -181,3 +181,18 @@ path = "examples/tpch_q6_plan_dump.rs"
 name = "tpch_q6_inject_bench"
 path = "examples/tpch_q6_inject_bench.rs"
 
+# Σ.D3 phase D follow-up: dump the DataFusion physical plan for Q1
+# (group-by + 4 SUMs + 3 AVGs + COUNT) to learn the node tree the
+# InjectFusedQ1Rule pattern detector needs to match.
+[[example]]
+name = "tpch_q1_plan_dump"
+path = "examples/tpch_q1_plan_dump.rs"
+
+# Σ.D3 phase D (Q1 variant): bench Q1 with and without InjectFusedQ1Rule
+# registered. Group-by version of `tpch_q6_inject_bench` — Q1's
+# downstream HashAggregate stack is heavier so the fused replacement
+# has more headroom.
+[[example]]
+name = "tpch_q1_inject_bench"
+path = "examples/tpch_q1_inject_bench.rs"
+
