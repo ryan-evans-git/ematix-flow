@@ -354,6 +354,12 @@ fn build_promo_bitmap(part_batches: &[RecordBatch]) -> DfResult<Vec<bool>> {
     // StringView are always the first 4 string bytes (inline portion
     // or non-inline prefix); we don't need to handle the long-string
     // buffer here.
+    // Single-pass fused build: read each p_type once, check the
+    // 4-byte prefix inline, and update the partkey bitmap immediately.
+    // Saves: one Vec<bool> allocation per batch (~25 batches for part
+    // at SF=1) + one extra pass over the StringViewArray. Pattern
+    // ported from ematix-parquet Phase 5 (fuse passes, never
+    // materialize intermediate masks).
     let prefix = b"PROM";
     for batch in part_batches {
         let pk_col = batch.column(batch.schema().index_of("p_partkey")?);
@@ -363,16 +369,11 @@ fn build_promo_bitmap(part_batches: &[RecordBatch]) -> DfResult<Vec<bool>> {
             .downcast_ref::<StringViewArray>()
             .expect("p_type validated as Utf8View");
         let n = batch.num_rows();
-        let promo_mask: Vec<bool> = (0..n)
-            .map(|i| {
-                let s = pt.value(i).as_bytes();
-                s.len() >= 4 && &s[..4] == prefix
-            })
-            .collect();
         if let Some(a) = pk_col.as_any().downcast_ref::<Int32Array>() {
             let pks = a.values();
             for i in 0..n {
-                if promo_mask[i] {
+                let s = pt.value(i).as_bytes();
+                if s.len() >= 4 && &s[..4] == prefix {
                     bitmap[pks[i] as usize] = true;
                 }
             }
@@ -383,7 +384,8 @@ fn build_promo_bitmap(part_batches: &[RecordBatch]) -> DfResult<Vec<bool>> {
                 .expect("p_partkey already checked");
             let pks = a.values();
             for i in 0..n {
-                if promo_mask[i] {
+                let s = pt.value(i).as_bytes();
+                if s.len() >= 4 && &s[..4] == prefix {
                     bitmap[pks[i] as usize] = true;
                 }
             }
