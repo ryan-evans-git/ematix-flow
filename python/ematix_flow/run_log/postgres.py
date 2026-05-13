@@ -1,0 +1,121 @@
+"""PostgresRunLog — multi-host backend backed by PostgreSQL.
+
+Use this when more than one host runs `flow run-due` and they need to
+agree on the freshness gate and retry state. SQLite can't be safely
+shared across hosts; Postgres is the right tool.
+
+Schema mirrors SqliteRunLog's two tables. Conflict handling uses
+`INSERT ... ON CONFLICT (...) DO UPDATE` so the call sites stay the
+same as SQLite's REPLACE INTO.
+
+Optional dep: `psycopg` (psycopg 3, install via `pip install psycopg[binary]`).
+"""
+
+from __future__ import annotations
+
+from datetime import datetime
+
+from ._iso import iso_utc, parse_iso
+
+
+class PostgresRunLog:
+    """PostgreSQL-backed run history.
+
+    `dsn` is a libpq-style connection string ("postgresql://user@host/db",
+    "host=... dbname=...", or a service name). All four backends accept
+    a single string for the location; for Postgres that string is the DSN.
+
+    `schema` controls which Postgres schema the tables live in
+    (default "public"). Useful for keeping orchestrator state out of
+    your application data namespace.
+    """
+
+    _DDL = (
+        "CREATE TABLE IF NOT EXISTS {schema}.run_log ("
+        "  pipeline_name TEXT PRIMARY KEY,"
+        "  last_run_at   TEXT NOT NULL,"
+        "  success       BOOLEAN NOT NULL"
+        ");"
+        "CREATE TABLE IF NOT EXISTS {schema}.attempt_state ("
+        "  pipeline_name   TEXT PRIMARY KEY,"
+        "  attempt_count   INTEGER NOT NULL,"
+        "  last_attempt_at TEXT NOT NULL,"
+        "  gave_up         BOOLEAN NOT NULL"
+        ");"
+    )
+
+    def __init__(self, dsn: str, *, schema: str = "public"):
+        try:
+            import psycopg
+        except ImportError as e:
+            raise ImportError(
+                "PostgresRunLog requires psycopg. Install with "
+                "`pip install psycopg[binary]`."
+            ) from e
+
+        # autocommit=True keeps the semantics aligned with SQLite's
+        # isolation_level=None — each statement is its own transaction,
+        # mirroring the in-memory dict-assignment shape.
+        self._conn = psycopg.connect(dsn, autocommit=True)
+        self._schema = schema
+        with self._conn.cursor() as cur:
+            cur.execute(self._DDL.format(schema=schema))
+
+    def close(self) -> None:
+        self._conn.close()
+
+    def record_run(self, name: str, ts: datetime, success: bool) -> None:
+        with self._conn.cursor() as cur:
+            cur.execute(
+                f"INSERT INTO {self._schema}.run_log "
+                "(pipeline_name, last_run_at, success) VALUES (%s, %s, %s) "
+                "ON CONFLICT (pipeline_name) DO UPDATE SET "
+                "last_run_at = EXCLUDED.last_run_at, "
+                "success     = EXCLUDED.success",
+                (name, iso_utc(ts), success),
+            )
+
+    def record_attempt(self, name: str, state) -> None:
+        with self._conn.cursor() as cur:
+            cur.execute(
+                f"INSERT INTO {self._schema}.attempt_state "
+                "(pipeline_name, attempt_count, last_attempt_at, gave_up) "
+                "VALUES (%s, %s, %s, %s) "
+                "ON CONFLICT (pipeline_name) DO UPDATE SET "
+                "attempt_count   = EXCLUDED.attempt_count, "
+                "last_attempt_at = EXCLUDED.last_attempt_at, "
+                "gave_up         = EXCLUDED.gave_up",
+                (
+                    name,
+                    state.attempt_count,
+                    iso_utc(state.last_attempt_at),
+                    state.gave_up,
+                ),
+            )
+
+    def clear_attempt_state(self, name: str) -> None:
+        with self._conn.cursor() as cur:
+            cur.execute(
+                f"DELETE FROM {self._schema}.attempt_state WHERE pipeline_name = %s",
+                (name,),
+            )
+
+    def restore_into_process(self) -> None:
+        from ematix_flow import pipeline as _p
+
+        with self._conn.cursor() as cur:
+            cur.execute(
+                f"SELECT pipeline_name, last_run_at, success FROM {self._schema}.run_log"
+            )
+            for name, ts_s, ok in cur.fetchall():
+                _p._LAST_RUN[name] = (parse_iso(ts_s), bool(ok))
+            cur.execute(
+                f"SELECT pipeline_name, attempt_count, last_attempt_at, gave_up "
+                f"FROM {self._schema}.attempt_state"
+            )
+            for name, count, ts_s, gave_up in cur.fetchall():
+                _p._ATTEMPT_STATE[name] = _p.AttemptState(
+                    attempt_count=count,
+                    last_attempt_at=parse_iso(ts_s),
+                    gave_up=bool(gave_up),
+                )
