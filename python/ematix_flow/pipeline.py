@@ -495,6 +495,118 @@ def retry_policy_of(name: str) -> RetryPolicy:
     return _RETRY_POLICY.get(name, RetryPolicy())
 
 
+# Phase Ω.3 — operator-facing status view.
+#
+# `status_snapshot()` produces one dict per registered pipeline,
+# summarising the in-process state that Ω.1 and Ω.2 already maintain.
+# It does NOT touch durable run-history — that arrives with Ω.D1a's
+# RunLog. The renderer below turns the snapshot into a fixed-width
+# text table suitable for `flow status` CLI output.
+
+
+def status_snapshot() -> list[dict]:
+    """Return a list of per-pipeline state dicts. Stable order:
+    alphabetical by name. Each row has keys:
+
+      name          : str
+      schedule      : str | None
+      depends_on    : list[str]
+      last_run      : (datetime, bool) | None — None if never run
+      retry_policy  : dict mirroring RetryPolicy fields
+      attempt_state : dict | None, with keys
+                      attempt_count, last_attempt_at,
+                      next_eligible_at, gave_up
+                      (None when no retry cycle is in flight)
+    """
+    rows: list[dict] = []
+    for name in sorted(_REGISTRY):
+        sp = _REGISTRY[name]
+        policy = _RETRY_POLICY.get(name, RetryPolicy())
+        st = _ATTEMPT_STATE.get(name)
+        attempt_state: dict | None = None
+        if st is not None:
+            backoff_secs = _compute_backoff_secs(policy, st.attempt_count)
+            attempt_state = {
+                "attempt_count": st.attempt_count,
+                "last_attempt_at": st.last_attempt_at,
+                "next_eligible_at": st.last_attempt_at + timedelta(seconds=backoff_secs),
+                "gave_up": st.gave_up,
+            }
+        rows.append({
+            "name": name,
+            "schedule": sp.schedule,
+            "depends_on": list(_DEPENDS_ON.get(name, [])),
+            "last_run": _LAST_RUN.get(name),
+            "retry_policy": {
+                "max_attempts": policy.max_attempts,
+                "backoff": policy.backoff,
+                "base_secs": policy.base_secs,
+                "max_backoff_secs": policy.max_backoff_secs,
+            },
+            "attempt_state": attempt_state,
+        })
+    return rows
+
+
+def render_status_table(snapshot: list[dict]) -> str:
+    """Render a `status_snapshot()` result as a fixed-width text table.
+
+    The columns track what an operator wants to see at a glance:
+    name, schedule, last run + outcome, retry status. depends_on is
+    elided when empty to keep the row short.
+    """
+    if not snapshot:
+        return "no pipelines registered"
+
+    header = ("NAME", "SCHEDULE", "LAST RUN", "OUTCOME", "RETRY", "DEPENDS ON")
+    rows: list[tuple[str, ...]] = [header]
+    for r in snapshot:
+        last_run = r["last_run"]
+        if last_run is None:
+            last_run_s = "never"
+            outcome_s = "-"
+        else:
+            ts, ok = last_run
+            # Truncate to seconds; UTC iso with trailing Z is the most
+            # operator-friendly compact form.
+            last_run_s = ts.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+            outcome_s = "ok" if ok else "fail"
+        retry_s = _format_retry_cell(r["retry_policy"], r["attempt_state"])
+        deps_s = ",".join(r["depends_on"]) if r["depends_on"] else "-"
+        rows.append((
+            r["name"],
+            r["schedule"] or "-",
+            last_run_s,
+            outcome_s,
+            retry_s,
+            deps_s,
+        ))
+
+    widths = [max(len(row[i]) for row in rows) for i in range(len(header))]
+    lines = []
+    for i, row in enumerate(rows):
+        line = "  ".join(cell.ljust(widths[j]) for j, cell in enumerate(row))
+        lines.append(line)
+        if i == 0:
+            lines.append("  ".join("-" * w for w in widths))
+    return "\n".join(lines)
+
+
+def _format_retry_cell(policy: dict, state: dict | None) -> str:
+    """One short cell describing retry status for the table."""
+    max_attempts = policy.get("max_attempts", 1)
+    if state is None:
+        if max_attempts <= 1:
+            return "no retry"
+        return f"0/{max_attempts} ({policy['backoff']})"
+    attempt = state["attempt_count"]
+    if state["gave_up"]:
+        return f"{attempt}/{max_attempts} gave up"
+    next_at = state["next_eligible_at"]
+    next_at_s = next_at.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    return f"{attempt}/{max_attempts} next>{next_at_s}"
+
+
 @dataclass(frozen=True)
 class RegisteredTransform:
     """Phase 27b: a `@ematix.transform`-decorated standalone callable."""

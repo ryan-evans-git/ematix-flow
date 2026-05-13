@@ -212,6 +212,30 @@ def _upstream_ok(upstream: str, max_age_secs: int | None, now: datetime) -> bool
     return (now - ts).total_seconds() <= max_age_secs
 
 
+def _cmd_status(args: argparse.Namespace) -> int:
+    """Phase Ω.3: operator view of pipeline state.
+
+    Imports the user's module (which registers pipelines) and prints
+    the in-process state from `_LAST_RUN` + `_ATTEMPT_STATE`. With
+    `--format json`, dumps the snapshot directly; default is the
+    fixed-width text table from `render_status_table`.
+    """
+    _import_user_module(args.module)
+    snapshot = p.status_snapshot()
+    if args.format == "json":
+        def _ser(o: Any) -> Any:
+            import datetime as _dt
+            if isinstance(o, _dt.datetime):
+                return o.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+            if isinstance(o, tuple):
+                return list(o)
+            raise TypeError(f"unserialisable: {type(o).__name__}")
+        print(json.dumps(snapshot, default=_ser, indent=2))
+        return 0
+    print(p.render_status_table(snapshot))
+    return 0
+
+
 def _cmd_connections_list(args: argparse.Namespace) -> int:
     entries = config.list_connections()
     if not entries:
@@ -379,6 +403,14 @@ def main(argv: list[str] | None = None) -> int:
         "--format", choices=["text", "json"], default="text"
     )
     consume_list_p.set_defaults(func=_cmd_consume_list)
+
+    status_p = sub.add_parser(
+        "status",
+        help="operator view of pipeline state (last run, retry status, depends_on)",
+    )
+    status_p.add_argument("--module", required=True)
+    status_p.add_argument("--format", choices=["text", "json"], default="text")
+    status_p.set_defaults(func=_cmd_status)
 
     due_p = sub.add_parser(
         "run-due", help="run pipelines whose schedule fires in (now-interval, now]"
