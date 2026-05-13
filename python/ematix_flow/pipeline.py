@@ -497,118 +497,19 @@ def retry_policy_of(name: str) -> RetryPolicy:
 
 # Phase Ω.D1a — durable run-history.
 #
-# `RunLog` persists `_LAST_RUN` + `_ATTEMPT_STATE` to a local SQLite
-# file so a `flow run-due` cron tick can see what previous ticks did.
-# Single local file; multi-process write coordination is out of scope
-# (a hosted backend takes over for cross-host orchestrators).
+# The concrete RunLog backends live in `ematix_flow.run_log`. The
+# default is the local-file SqliteRunLog; alternates (in-memory,
+# Postgres, S3, Azure Blob, GCS) all satisfy the same Protocol and
+# are interchangeable in `run_due_with_dag(run_log=...)`.
+#
+# `pipeline.RunLog` is kept as a backwards-compat alias for the
+# SQLite backend — the original Ω.D1a name.
 
 
-class RunLog:
-    """SQLite-backed run history.
-
-    Two tables, one row per pipeline name each:
-      run_log         — last-run timestamp + success
-      attempt_state   — in-flight retry cycle (count, last-at, gave-up)
-
-    Records are upserted (REPLACE) so the DB always reflects the most
-    recent state, mirroring the in-memory dict semantics.
-    """
-
-    _SCHEMA = """
-        CREATE TABLE IF NOT EXISTS run_log (
-            pipeline_name TEXT PRIMARY KEY,
-            last_run_at   TEXT NOT NULL,
-            success       INTEGER NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS attempt_state (
-            pipeline_name   TEXT PRIMARY KEY,
-            attempt_count   INTEGER NOT NULL,
-            last_attempt_at TEXT NOT NULL,
-            gave_up         INTEGER NOT NULL
-        );
-    """
-
-    def __init__(self, path: str):
-        import os
-        import sqlite3
-
-        # Ensure parent dir exists so the default ~/.ematix-flow path
-        # works on first run.
-        parent = os.path.dirname(path)
-        if parent:
-            os.makedirs(parent, exist_ok=True)
-        self._path = path
-        self._conn = sqlite3.connect(path, isolation_level=None)
-        # WAL improves concurrent read tolerance without changing
-        # single-writer semantics. Cheap to enable per-connection.
-        self._conn.execute("PRAGMA journal_mode = WAL;")
-        self._conn.executescript(self._SCHEMA)
-
-    @property
-    def path(self) -> str:
-        return self._path
-
-    def close(self) -> None:
-        self._conn.close()
-
-    def record_run(self, name: str, ts: datetime, success: bool) -> None:
-        """Stamp the last-run row. Mirrors `_LAST_RUN[name] = (ts, success)`."""
-        self._conn.execute(
-            "REPLACE INTO run_log (pipeline_name, last_run_at, success) VALUES (?, ?, ?)",
-            (name, _iso_utc(ts), 1 if success else 0),
-        )
-
-    def record_attempt(self, name: str, state: "AttemptState") -> None:
-        """Stamp the attempt-state row. Call on every failure."""
-        self._conn.execute(
-            "REPLACE INTO attempt_state "
-            "(pipeline_name, attempt_count, last_attempt_at, gave_up) "
-            "VALUES (?, ?, ?, ?)",
-            (
-                name,
-                state.attempt_count,
-                _iso_utc(state.last_attempt_at),
-                1 if state.gave_up else 0,
-            ),
-        )
-
-    def clear_attempt_state(self, name: str) -> None:
-        """Drop the attempt-state row. Call on every success."""
-        self._conn.execute("DELETE FROM attempt_state WHERE pipeline_name = ?", (name,))
-
-    def restore_into_process(self) -> None:
-        """Populate `_LAST_RUN` and `_ATTEMPT_STATE` from disk. Call
-        this at process startup before any `run_due_with_dag` so the
-        freshness gate + retry backoff use durable history."""
-        cur = self._conn.execute(
-            "SELECT pipeline_name, last_run_at, success FROM run_log"
-        )
-        for name, ts_s, ok in cur.fetchall():
-            _LAST_RUN[name] = (_parse_iso(ts_s), bool(ok))
-        cur = self._conn.execute(
-            "SELECT pipeline_name, attempt_count, last_attempt_at, gave_up "
-            "FROM attempt_state"
-        )
-        for name, count, ts_s, gave_up in cur.fetchall():
-            _ATTEMPT_STATE[name] = AttemptState(
-                attempt_count=count,
-                last_attempt_at=_parse_iso(ts_s),
-                gave_up=bool(gave_up),
-            )
-
-
-def _iso_utc(ts: datetime) -> str:
-    """Format a UTC datetime as ISO8601 with a trailing Z."""
-    return ts.replace(microsecond=0).isoformat().replace("+00:00", "Z")
-
-
-def _parse_iso(s: str) -> datetime:
-    """Parse the ISO8601-with-Z form `_iso_utc` produces."""
-    from datetime import timezone
-
-    if s.endswith("Z"):
-        s = s[:-1] + "+00:00"
-    return datetime.fromisoformat(s).astimezone(timezone.utc)
+# Backwards-compat: the original Ω.D1a name lived here. New code
+# should prefer `from ematix_flow.run_log import SqliteRunLog`, but
+# the legacy spelling keeps working.
+from ematix_flow.run_log import SqliteRunLog as RunLog  # noqa: E402
 
 
 # Phase Ω.3 — operator-facing status view.
