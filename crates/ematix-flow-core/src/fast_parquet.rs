@@ -444,11 +444,23 @@ impl FastParquetTableProvider {
                 format!("FastParquetTableProvider: cannot open `{path}`: {e}").into(),
             )
         })?;
-        let builder = ParquetRecordBatchReaderBuilder::try_new(file).map_err(|e| {
-            DataFusionError::External(
-                format!("FastParquetTableProvider: parquet open failed: {e}").into(),
-            )
-        })?;
+        // Σ.E2 follow-up (R2): skip size + encoding stats at footer
+        // parse — we never read them. Column-stats (min/max/null_count)
+        // ARE kept because the row-group predicate-pushdown path uses
+        // them. Page indexes default to Skip already in parquet-rs
+        // 58.1.0; the corresponding `with_*_policy` calls are no-ops
+        // but stay for explicitness.
+        use datafusion::parquet::file::metadata::{PageIndexPolicy, ParquetStatisticsPolicy};
+        let footer_options = ArrowReaderOptions::new()
+            .with_page_index_policy(PageIndexPolicy::Skip)
+            .with_size_stats_policy(ParquetStatisticsPolicy::SkipAll)
+            .with_encoding_stats_policy(ParquetStatisticsPolicy::SkipAll);
+        let builder = ParquetRecordBatchReaderBuilder::try_new_with_options(file, footer_options)
+            .map_err(|e| {
+                DataFusionError::External(
+                    format!("FastParquetTableProvider: parquet open failed: {e}").into(),
+                )
+            })?;
         // Hand the planner (and downstream operators) a schema that
         // declares string/binary columns as their `*View` form so kernel
         // selection matches DataFusion's default parquet path. This
