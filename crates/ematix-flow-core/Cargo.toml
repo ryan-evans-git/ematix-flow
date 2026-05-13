@@ -158,3 +158,12 @@ path = "examples/tpch_fused_jit_bench.rs"
 name = "tpch_q14_full_bench"
 path = "examples/tpch_q14_full_bench.rs"
 
+# Σ.E2 follow-up: probe parquet-rs `with_row_filter` against Q14's
+# single-Date32 predicate, deciding whether late materialization is
+# the right next lever for FastParquet (broad TPC-H impact). The
+# day-3 probe rejected `with_row_filter` for Q6's compound predicate;
+# this one tests whether the cheaper Q14-shape predicate flips it.
+[[example]]
+name = "parquet_rs_late_mat_q14"
+path = "examples/parquet_rs_late_mat_q14.rs"
+
