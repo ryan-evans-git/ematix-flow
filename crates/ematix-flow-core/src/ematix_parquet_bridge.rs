@@ -31,7 +31,8 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use arrow_array::{Float64Array, Int32Array, Int64Array};
+use arrow_array::builder::ArrayBuilder;
+use arrow_array::{Float64Array, Int32Array, Int64Array, StringArray};
 use datafusion::error::{DataFusionError, Result as DfResult};
 
 use ematix_parquet_codec::compression::{decompress_snappy_into, decompress_zstd_into};
@@ -39,7 +40,9 @@ use ematix_parquet_codec::dict::{
     decode_rle_dictionary_into, decode_rle_dictionary_predicate_bitmap_bw12,
     gather_dict_at_bitmap_into,
 };
-use ematix_parquet_codec::plain::{decode_plain_f64, decode_plain_i32, decode_plain_i64};
+use ematix_parquet_codec::plain::{
+    decode_plain_byte_array, decode_plain_f64, decode_plain_i32, decode_plain_i64,
+};
 use ematix_parquet_format::types::{CompressionCodec, Encoding};
 use ematix_parquet_io::{PageWalker, ParquetFile};
 
@@ -100,6 +103,139 @@ pub fn decode_column_chunk_f64(
         },
     )?;
     Ok(Arc::new(Float64Array::from(buf)))
+}
+
+/// Decode a BYTE_ARRAY column chunk (Utf8 logical type) to a
+/// contiguous `StringArray`. Handles PLAIN and RLE_DICTIONARY data
+/// pages. Owned-byte output — copies dictionary entries into the
+/// values buffer for each row (no zero-copy yet; that'd need a
+/// custom Arrow buffer reuse).
+///
+/// REQUIRED columns only — no nulls. Phase 4 v1.
+pub fn decode_column_chunk_byte_array(
+    path: &Path,
+    rg: usize,
+    col: usize,
+) -> DfResult<Arc<StringArray>> {
+    let file = ParquetFile::open(path)
+        .map_err(|e| ext(format!("ParquetFile::open: {e}")))?;
+    let md = file
+        .metadata()
+        .map_err(|e| ext(format!("metadata: {e}")))?;
+    let cm = md.row_groups[rg].columns[col]
+        .meta_data
+        .as_ref()
+        .ok_or_else(|| ext("column missing meta_data"))?;
+    let total = cm.num_values as usize;
+    let codec = cm.codec;
+
+    let start = cm.dictionary_page_offset.unwrap_or(cm.data_page_offset) as u64;
+    let length = cm.total_compressed_size as u64;
+    let chunk = file
+        .read_range(start, length)
+        .map_err(|e| ext(format!("read_range: {e}")))?;
+
+    let mut walker = PageWalker::new(&chunk);
+    let mut scratch: Vec<u8> = Vec::with_capacity(128 * 1024);
+
+    // Use Arrow's StringBuilder which handles offsets + values
+    // buffers + UTF-8 validation. Pre-size by total values + a rough
+    // bytes estimate.
+    let mut builder = arrow_array::builder::StringBuilder::with_capacity(
+        total,
+        cm.total_uncompressed_size as usize,
+    );
+
+    // Peek first page: dict or directly a data page.
+    let (first_hdr, first_body) = walker
+        .next_page()
+        .map_err(|e| ext(format!("next_page (first): {e}")))?
+        .ok_or_else(|| ext("empty chunk"))?;
+    decompress_into(codec, first_body, &mut scratch)?;
+
+    // If first is a dict page, decode it to an owned Vec<Vec<u8>> so
+    // each lookup copies into `values`. Borrowed slices won't survive
+    // the scratch buffer reuse across pages.
+    let dict: Vec<Vec<u8>> = if first_hdr.dictionary_page_header.is_some() {
+        let borrowed = decode_plain_byte_array(&scratch)
+            .map_err(|e| ext(format!("plain byte_array dict: {e}")))?;
+        borrowed.iter().map(|s| s.to_vec()).collect()
+    } else {
+        let dph = first_hdr
+            .data_page_header
+            .as_ref()
+            .ok_or_else(|| ext("first page neither dict nor v1 data"))?;
+        let n = dph.num_values as usize;
+        match dph.encoding {
+            Encoding::Plain => {
+                let borrowed = decode_plain_byte_array(&scratch)
+                    .map_err(|e| ext(format!("plain byte_array: {e}")))?;
+                for s in borrowed.iter().take(n) {
+                    append_utf8(&mut builder, s)?;
+                }
+            }
+            other => {
+                return Err(ext(format!(
+                    "first page is data but encoding {other:?} for byte_array (need dict)"
+                )));
+            }
+        }
+        Vec::new()
+    };
+
+    while builder.len() < total {
+        let (hdr, body) = walker
+            .next_page()
+            .map_err(|e| ext(format!("next_page: {e}")))?
+            .ok_or_else(|| ext("chunk ended before num_values"))?;
+        let dph = hdr
+            .data_page_header
+            .as_ref()
+            .ok_or_else(|| ext("v2 byte_array pages not yet supported"))?;
+        let n = dph.num_values as usize;
+        decompress_into(codec, body, &mut scratch)?;
+        match dph.encoding {
+            Encoding::RleDictionary | Encoding::PlainDictionary => {
+                let idxs = ematix_parquet_codec::dict::decode_rle_dictionary_indices(&scratch, n)
+                    .map_err(|e| ext(format!("rle_dict_indices byte_array: {e}")))?;
+                for &i in &idxs {
+                    let s = dict
+                        .get(i as usize)
+                        .ok_or_else(|| ext(format!("dict idx {i} out of range {}", dict.len())))?;
+                    append_utf8(&mut builder, s)?;
+                }
+            }
+            Encoding::Plain => {
+                let borrowed = decode_plain_byte_array(&scratch)
+                    .map_err(|e| ext(format!("plain byte_array: {e}")))?;
+                for s in borrowed.iter().take(n) {
+                    append_utf8(&mut builder, s)?;
+                }
+            }
+            other => {
+                return Err(ext(format!(
+                    "unexpected byte_array data page encoding {other:?}"
+                )));
+            }
+        }
+    }
+
+    debug_assert_eq!(builder.len(), total);
+    Ok(Arc::new(builder.finish()))
+}
+
+#[inline]
+fn append_utf8(
+    builder: &mut arrow_array::builder::StringBuilder,
+    bytes: &[u8],
+) -> DfResult<()> {
+    // SAFETY check: parquet Utf8 logical type guarantees UTF-8 but
+    // we validate defensively. For dict-encoded columns this runs
+    // ~once per ~1000 rows (cached); for PLAIN pages it runs per row.
+    let s = std::str::from_utf8(bytes)
+        .map_err(|e| ext(format!("byte_array not UTF-8: {e}")))?;
+    builder.append_value(s);
+    Ok(())
 }
 
 /// Generic decoder for a dict-encoded REQUIRED column with a fixed-
@@ -468,6 +604,7 @@ mod tests {
     //! byte-for-byte identical to parquet-rs reading the same column.
 
     use super::*;
+    use arrow_array::Array;
     use std::fs::File;
     use std::path::PathBuf;
 
@@ -510,6 +647,19 @@ mod tests {
         let mut out: Vec<i64> = Vec::with_capacity(total);
         typed.read_records(total, None, None, &mut out).unwrap();
         out
+    }
+
+    fn pr_read_byte_array(path: &PathBuf, rg: usize, col: usize) -> Vec<Vec<u8>> {
+        let r = SerializedFileReader::new(File::open(path).unwrap()).unwrap();
+        let total = r.metadata().row_group(rg).column(col).num_values() as usize;
+        let rgr = r.get_row_group(rg).unwrap();
+        let mut typed = match rgr.get_column_reader(col).unwrap() {
+            ColumnReader::ByteArrayColumnReader(t) => t,
+            _ => panic!("not ByteArray"),
+        };
+        let mut out: Vec<parquet::data_type::ByteArray> = Vec::with_capacity(total);
+        typed.read_records(total, None, None, &mut out).unwrap();
+        out.into_iter().map(|b| b.data().to_vec()).collect()
     }
 
     fn pr_read_f64(path: &PathBuf, rg: usize, col: usize) -> Vec<f64> {
@@ -561,6 +711,46 @@ mod tests {
         let ours_vals: &[f64] = ours.values();
         // f64 must match exactly (PLAIN decode is bit-for-bit copy).
         assert_eq!(ours_vals, theirs.as_slice());
+    }
+
+    #[test]
+    fn returnflag_rg0_matches_parquet_rs() {
+        // l_returnflag (col 8) is a 1-character BYTE_ARRAY with 3
+        // distinct values ('R', 'A', 'N') — heavily dict-encoded.
+        // Validates the RLE_DICTIONARY byte_array path.
+        let Some(path) = lineitem_path() else {
+            return;
+        };
+        let ours = decode_column_chunk_byte_array(&path, 0, 8).unwrap();
+        let theirs = pr_read_byte_array(&path, 0, 8);
+        assert_eq!(ours.len(), theirs.len());
+        for i in 0..ours.len() {
+            assert_eq!(
+                ours.value(i).as_bytes(),
+                theirs[i].as_slice(),
+                "mismatch at row {i}"
+            );
+        }
+    }
+
+    #[test]
+    fn comment_rg0_matches_parquet_rs() {
+        // l_comment (col 15) is a longer, higher-cardinality
+        // BYTE_ARRAY. Exercises both dict pages and (likely) PLAIN-
+        // overflow pages depending on writer.
+        let Some(path) = lineitem_path() else {
+            return;
+        };
+        let ours = decode_column_chunk_byte_array(&path, 0, 15).unwrap();
+        let theirs = pr_read_byte_array(&path, 0, 15);
+        assert_eq!(ours.len(), theirs.len());
+        for i in 0..ours.len() {
+            assert_eq!(
+                ours.value(i).as_bytes(),
+                theirs[i].as_slice(),
+                "mismatch at row {i}"
+            );
+        }
     }
 
     #[test]

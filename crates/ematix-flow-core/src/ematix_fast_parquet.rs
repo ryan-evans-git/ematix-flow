@@ -26,7 +26,7 @@ use std::fs::File;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use arrow_array::RecordBatch;
+use arrow_array::{Array, RecordBatch};
 use arrow_schema::{DataType, Schema, SchemaRef};
 use datafusion::catalog::{Session, TableProvider};
 use datafusion::common::stats::Statistics;
@@ -50,9 +50,9 @@ use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
 use parquet::file::reader::{FileReader, SerializedFileReader};
 
 use crate::ematix_parquet_bridge::{
-    decode_column_chunk_f64, decode_column_chunk_i32, decode_column_chunk_i64,
-    filter_i32_column_to_bitmap, sparse_gather_chunk_f64, sparse_gather_chunk_i32,
-    sparse_gather_chunk_i64,
+    decode_column_chunk_byte_array, decode_column_chunk_f64, decode_column_chunk_i32,
+    decode_column_chunk_i64, filter_i32_column_to_bitmap, sparse_gather_chunk_f64,
+    sparse_gather_chunk_i32, sparse_gather_chunk_i64,
 };
 use crate::fast_parquet::{extract_range_predicate, RangePredicate};
 
@@ -182,14 +182,18 @@ impl EmatixFastParquetTableProvider {
         })?;
         let schema = meta.schema().clone();
 
-        // Validate: all columns must be primitive types the bridge
+        // Validate: every column must be one of the types the bridge
         // can decode. Anything else, defer to FastParquetTableProvider.
         for field in schema.fields() {
             match field.data_type() {
-                DataType::Int32 | DataType::Int64 | DataType::Float64 | DataType::Date32 => {}
+                DataType::Int32
+                | DataType::Int64
+                | DataType::Float64
+                | DataType::Date32
+                | DataType::Utf8 => {}
                 other => {
                     return Err(DataFusionError::NotImplemented(format!(
-                        "EmatixFastParquetTableProvider: column `{}` has type {other:?}; bridge supports Int32/Int64/Float64/Date32 only — use FastParquetTableProvider",
+                        "EmatixFastParquetTableProvider: column `{}` has type {other:?}; bridge supports Int32/Int64/Float64/Date32/Utf8 only — use FastParquetTableProvider",
                         field.name()
                     )));
                 }
@@ -527,6 +531,24 @@ fn decode_one_rg_filtered(
                 debug_assert_eq!(vals.len(), matches);
                 Arc::new(arrow_array::Float64Array::from(vals))
             }
+            DataType::Utf8 => {
+                // No sparse-gather kernel for Utf8 yet (Phase 4 v1).
+                // Fall back: dense decode, then walk the bitmap and
+                // append only matching rows to a StringBuilder. Costs
+                // O(num_values) instead of O(matches), but avoids
+                // pulling in `arrow_select` as a runtime dep.
+                let full = decode_column_chunk_byte_array(path, rg, col_idx)?;
+                let mut sb = arrow_array::builder::StringBuilder::with_capacity(
+                    matches,
+                    matches * 16, // rough average string size estimate
+                );
+                for i in 0..full.len() {
+                    if (bitmap[i / 8] >> (i % 8)) & 1 == 1 {
+                        sb.append_value(full.value(i));
+                    }
+                }
+                Arc::new(sb.finish())
+            }
             other => {
                 return Err(DataFusionError::NotImplemented(format!(
                     "EmatixFastParquetExec (filtered): unsupported column type {other:?}",
@@ -571,6 +593,9 @@ fn decode_one_rg(
             DataType::Float64 => {
                 decode_column_chunk_f64(path, rg, col_idx)? as Arc<dyn arrow_array::Array>
             }
+            DataType::Utf8 => {
+                decode_column_chunk_byte_array(path, rg, col_idx)? as Arc<dyn arrow_array::Array>
+            }
             other => {
                 return Err(DataFusionError::NotImplemented(format!(
                     "EmatixFastParquetExec: unsupported column type {other:?} for `{}`",
@@ -605,26 +630,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn count_rows_via_provider() {
+    async fn full_lineitem_count_via_provider() {
+        // Phase 4: lineitem registers cleanly via Emat now that
+        // BYTE_ARRAY/Utf8 is supported. Run SELECT COUNT(*) end to
+        // end through DataFusion and confirm the row count.
         let Some(path) = lineitem_path() else {
             eprintln!("skipping: SF=1 lineitem not present");
             return;
         };
-        // lineitem has BYTE_ARRAY columns (l_returnflag, l_linestatus,
-        // etc.) so the full table can't go through Emat alone yet.
-        // Probe with a single-column file? At minimum verify try_new
-        // rejects unsupported types cleanly.
-        let r = EmatixFastParquetTableProvider::try_new(path);
-        match r {
-            Ok(_) => panic!("expected lineitem to be rejected (BYTE_ARRAY cols)"),
-            Err(e) => {
-                let msg = e.to_string();
-                assert!(
-                    msg.contains("bridge supports") || msg.contains("BYTE_ARRAY") || msg.contains("Utf8"),
-                    "unexpected error: {msg}"
-                );
-            }
-        }
+        let prov = EmatixFastParquetTableProvider::try_new(path).unwrap();
+        let total = prov.num_rows();
+        let ctx = SessionContext::new();
+        ctx.register_table("lineitem", Arc::new(prov)).unwrap();
+        let df = ctx.sql("SELECT COUNT(*) FROM lineitem").await.unwrap();
+        let batches = df.collect().await.unwrap();
+        let count = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow_array::Int64Array>()
+            .unwrap()
+            .value(0);
+        assert_eq!(count as usize, total);
     }
 
     /// Build a small primitive-only parquet file in memory, register
