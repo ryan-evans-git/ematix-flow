@@ -149,3 +149,12 @@ path = "examples/fast_parquet_array_diff.rs"
 name = "tpch_fused_jit_bench"
 path = "examples/tpch_fused_jit_bench.rs"
 
+# Σ.D3 phase E: FusedQ14FullExec end-to-end SF=1 timing. Closes the
+# only outright Polars win in the README's main TPC-H table (Q14 =
+# 12.53 ms in Polars vs ~17 ms via FastParquet alone) by collapsing
+# scan + filter + join + dual-SUM-with-CASE-WHEN into one parallel
+# pass over a direct-indexed promo bitmap.
+[[example]]
+name = "tpch_q14_full_bench"
+path = "examples/tpch_q14_full_bench.rs"
+
