@@ -36,7 +36,7 @@ use std::fs::File;
 use std::path::PathBuf;
 use std::time::Instant;
 
-use ematix_parquet_codec::compression::decompress_snappy;
+use ematix_parquet_codec::compression::decompress_snappy_into;
 use ematix_parquet_codec::dict::{
     decode_rle_dictionary_predicate_bitmap_bw12, gather_dict_at_bitmap_into,
 };
@@ -108,16 +108,14 @@ fn build_part_lookup(path: &PathBuf) -> HashMap<i64, bool> {
     map
 }
 
-/// Decode the dict for `(rg, col)` as PLAIN i32, then build a
-/// 4096-padded `dict_mask` where mask[i] = 1 iff the predicate matches
-/// `dict[i]`. The mask is the input to Phase 5's NEON-fused kernel.
-fn build_shipdate_dict_mask(file: &ParquetFile, rg: usize) -> Vec<u8> {
+/// Decode the shipdate dict + build a 4096-padded predicate mask.
+fn build_shipdate_dict_mask(file: &ParquetFile, rg: usize, scratch: &mut Vec<u8>) -> Vec<u8> {
     let (chunk, _) = read_chunk(file, rg, 10);
     let mut walker = PageWalker::new(&chunk);
     let (hdr, body) = walker.next_page().unwrap().unwrap();
     assert!(hdr.dictionary_page_header.is_some(), "expected dict page");
-    let decompressed = decompress_snappy(body).unwrap();
-    let dict = decode_plain_i32(&decompressed).unwrap();
+    decompress_snappy_into(body, scratch).unwrap();
+    let dict = decode_plain_i32(scratch).unwrap();
     let mut m = vec![0u8; 4096];
     for (i, &v) in dict.iter().enumerate() {
         if v >= LO && v < HI {
@@ -127,10 +125,13 @@ fn build_shipdate_dict_mask(file: &ParquetFile, rg: usize) -> Vec<u8> {
     m
 }
 
-/// Phase 5 fused-NEON shipdate filter over one row group. Returns the
-/// packed row bitmap (1 bit per row, byte-stride). Skips the dict
-/// page (caller has already consumed it to build dict_mask).
-fn shipdate_bitmap_rg(file: &ParquetFile, rg: usize, dict_mask: &[u8]) -> (Vec<u8>, usize) {
+/// Phase 5 fused-NEON shipdate filter over one row group.
+fn shipdate_bitmap_rg(
+    file: &ParquetFile,
+    rg: usize,
+    dict_mask: &[u8],
+    scratch: &mut Vec<u8>,
+) -> (Vec<u8>, usize) {
     let (chunk, total) = read_chunk(file, rg, 10);
     let mut walker = PageWalker::new(&chunk);
     let _ = walker.next_page().unwrap().unwrap(); // skip dict page
@@ -141,9 +142,8 @@ fn shipdate_bitmap_rg(file: &ParquetFile, rg: usize, dict_mask: &[u8]) -> (Vec<u
         let (hdr, body) = walker.next_page().unwrap().unwrap();
         let dph = hdr.data_page_header.as_ref().unwrap();
         let n = dph.num_values as usize;
-        let decompressed = decompress_snappy(body).unwrap();
-        decode_rle_dictionary_predicate_bitmap_bw12(&decompressed, n, dict_mask, &mut bitmap)
-            .unwrap();
+        decompress_snappy_into(body, scratch).unwrap();
+        decode_rle_dictionary_predicate_bitmap_bw12(scratch, n, dict_mask, &mut bitmap).unwrap();
         emitted += n;
     }
     (bitmap, total)
@@ -160,34 +160,27 @@ fn sparse_gather_col<T: Copy>(
     col: usize,
     bitmap: &[u8],
     decode_dict: impl FnOnce(&[u8]) -> Vec<T>,
-    decode_plain: impl Fn(&[u8]) -> Vec<T>,
+    plain_value_size: usize,
+    plain_load_le: unsafe fn(*const u8) -> T,
+    scratch: &mut Vec<u8>,
     out: &mut Vec<T>,
 ) {
     let (chunk, total) = read_chunk(file, rg, col);
     let mut walker = PageWalker::new(&chunk);
 
-    // Peek first page: it's either a dictionary page (column has a
-    // dict) or directly a data page (no dict, all PLAIN). We can't
-    // know without looking.
+    // Peek first page: it's either a dictionary page or a data page.
     let (first_hdr, first_body) = walker.next_page().unwrap().unwrap();
-    let first_decompressed = decompress_snappy(first_body).unwrap();
+    decompress_snappy_into(first_body, scratch).unwrap();
 
     let dict: Vec<T> = if first_hdr.dictionary_page_header.is_some() {
-        decode_dict(&first_decompressed)
+        decode_dict(&scratch)
     } else {
-        // First page is a data page; handle it inline, then fall
-        // through to the loop for subsequent pages.
+        // First page is a data page; handle inline.
         let dph = first_hdr.data_page_header.as_ref().unwrap();
         let n = dph.num_values as usize;
         match dph.encoding {
             Encoding::Plain => {
-                let vals = decode_plain(&first_decompressed);
-                for (i, v) in vals.iter().enumerate().take(n) {
-                    let bp = i;
-                    if (bitmap[bp / 8] >> (bp % 8)) & 1 == 1 {
-                        out.push(*v);
-                    }
-                }
+                stream_plain_gather(&scratch, n, bitmap, 0, plain_value_size, plain_load_le, out);
             }
             other => panic!("first page non-dict and non-PLAIN: {other:?}"),
         }
@@ -204,23 +197,13 @@ fn sparse_gather_col<T: Copy>(
         let (hdr, body) = walker.next_page().unwrap().unwrap();
         let dph = hdr.data_page_header.as_ref().unwrap();
         let n = dph.num_values as usize;
-        let decompressed = decompress_snappy(body).unwrap();
+        decompress_snappy_into(body, scratch).unwrap();
         match dph.encoding {
             Encoding::RleDictionary | Encoding::PlainDictionary => {
-                gather_dict_at_bitmap_into(&decompressed, n, bitmap, emitted, &dict, out)
-                    .unwrap();
+                gather_dict_at_bitmap_into(&scratch, n, bitmap, emitted, &dict, out).unwrap();
             }
             Encoding::Plain => {
-                // Sparse iteration over PLAIN values. The dense decode
-                // happens once per page; we then filter by bitmap as
-                // we walk the page's value stream.
-                let vals = decode_plain(&decompressed);
-                for (i, v) in vals.iter().enumerate().take(n) {
-                    let bp = emitted + i;
-                    if (bitmap[bp / 8] >> (bp % 8)) & 1 == 1 {
-                        out.push(*v);
-                    }
-                }
+                stream_plain_gather(&scratch, n, bitmap, emitted, plain_value_size, plain_load_le, out);
             }
             other => panic!("unexpected encoding {other:?} col {col} rg {rg}"),
         }
@@ -228,55 +211,129 @@ fn sparse_gather_col<T: Copy>(
     }
 }
 
+/// Stream a PLAIN-encoded data page, emitting one value per bitmap-true
+/// row. Processes 8 rows at a time; if the mask byte is zero, skip 8
+/// values worth of bytes with no decode. At Q14 selectivity (~1.26%)
+/// ~99% of mask bytes are zero, so this collapses the per-page cost
+/// from ~20K loads + writes to ~250.
+///
+/// `plain_value_size` is the byte width of one value (8 for INT64 /
+/// DOUBLE, 4 for INT32 / FLOAT). `plain_load_le` reads one value at
+/// a `*const u8` (LE byte order on the host).
+#[inline]
+fn stream_plain_gather<T: Copy>(
+    decompressed: &[u8],
+    num_values: usize,
+    bitmap: &[u8],
+    bitmap_offset: usize,
+    plain_value_size: usize,
+    plain_load_le: unsafe fn(*const u8) -> T,
+    out: &mut Vec<T>,
+) {
+    let stride = plain_value_size;
+    debug_assert!(decompressed.len() >= num_values * stride);
+    let mut byte_off = 0usize;
+    let mut row = 0usize;
+    while row + 8 <= num_values {
+        debug_assert_eq!((bitmap_offset + row) % 8, 0);
+        let mb = bitmap[(bitmap_offset + row) / 8];
+        if mb != 0 {
+            for lane in 0..8 {
+                if (mb >> lane) & 1 == 1 {
+                    // SAFETY: byte_off + lane*stride + stride ≤ decompressed.len()
+                    // since num_values * stride ≤ decompressed.len() and
+                    // row + 8 ≤ num_values.
+                    let v = unsafe {
+                        plain_load_le(decompressed.as_ptr().add(byte_off + lane * stride))
+                    };
+                    out.push(v);
+                }
+            }
+        }
+        byte_off += 8 * stride;
+        row += 8;
+    }
+    // Tail (< 8 rows).
+    while row < num_values {
+        let bp = bitmap_offset + row;
+        if (bitmap[bp / 8] >> (bp % 8)) & 1 == 1 {
+            let v = unsafe { plain_load_le(decompressed.as_ptr().add(byte_off)) };
+            out.push(v);
+        }
+        byte_off += stride;
+        row += 1;
+    }
+}
+
+unsafe fn load_i64_le(p: *const u8) -> i64 {
+    let mut buf = [0u8; 8];
+    unsafe { std::ptr::copy_nonoverlapping(p, buf.as_mut_ptr(), 8) };
+    i64::from_le_bytes(buf)
+}
+unsafe fn load_f64_le(p: *const u8) -> f64 {
+    let mut buf = [0u8; 8];
+    unsafe { std::ptr::copy_nonoverlapping(p, buf.as_mut_ptr(), 8) };
+    f64::from_le_bytes(buf)
+}
+
 /// Process one row group end-to-end: filter shipdate, sparse-gather
 /// the three aggregate columns, accumulate Q14 partial sums.
-/// Returns (numerator, denominator) for this RG.
-fn process_rg(li_path: &PathBuf, rg: usize, part_lookup: &HashMap<i64, bool>) -> (f64, f64) {
+/// Returns (numerator, denominator, [opt] timing breakdown ns).
+fn process_rg(
+    li_path: &PathBuf,
+    rg: usize,
+    part_lookup: &HashMap<i64, bool>,
+    timing: Option<&std::sync::Mutex<Timing>>,
+) -> (f64, f64) {
+    let mut t = TimingLocal::default();
+    let t_open = Instant::now();
     let file = ParquetFile::open(li_path).unwrap();
-    let dict_mask = build_shipdate_dict_mask(&file, rg);
-    let (bitmap, _total) = shipdate_bitmap_rg(&file, rg, &dict_mask);
+    let mut scratch: Vec<u8> = Vec::with_capacity(128 * 1024);
+    t.open += t_open.elapsed().as_nanos() as u64;
+    let t_filt = Instant::now();
+    let dict_mask = build_shipdate_dict_mask(&file, rg, &mut scratch);
+    let (bitmap, _total) = shipdate_bitmap_rg(&file, rg, &dict_mask, &mut scratch);
+    t.shipdate_filter += t_filt.elapsed().as_nanos() as u64;
 
     let matches: usize = bitmap.iter().map(|b| b.count_ones() as usize).sum();
     if matches == 0 {
+        if let Some(m) = timing {
+            m.lock().unwrap().add(&t);
+        }
         return (0.0, 0.0);
     }
 
+    let t_pk = Instant::now();
     let mut keys: Vec<i64> = Vec::with_capacity(matches);
     sparse_gather_col::<i64>(
-        &file,
-        rg,
-        1,
-        &bitmap,
+        &file, rg, 1, &bitmap,
         |bytes| decode_plain_i64(bytes).unwrap(),
-        |bytes| decode_plain_i64(bytes).unwrap(),
-        &mut keys,
+        8, load_i64_le, &mut scratch, &mut keys,
     );
+    t.partkey_gather += t_pk.elapsed().as_nanos() as u64;
 
+    let t_ep = Instant::now();
     let mut prices: Vec<f64> = Vec::with_capacity(matches);
     sparse_gather_col::<f64>(
-        &file,
-        rg,
-        5,
-        &bitmap,
+        &file, rg, 5, &bitmap,
         |bytes| decode_plain_f64(bytes).unwrap(),
-        |bytes| decode_plain_f64(bytes).unwrap(),
-        &mut prices,
+        8, load_f64_le, &mut scratch, &mut prices,
     );
+    t.extprice_gather += t_ep.elapsed().as_nanos() as u64;
 
+    let t_dc = Instant::now();
     let mut discounts: Vec<f64> = Vec::with_capacity(matches);
     sparse_gather_col::<f64>(
-        &file,
-        rg,
-        6,
-        &bitmap,
+        &file, rg, 6, &bitmap,
         |bytes| decode_plain_f64(bytes).unwrap(),
-        |bytes| decode_plain_f64(bytes).unwrap(),
-        &mut discounts,
+        8, load_f64_le, &mut scratch, &mut discounts,
     );
+    t.discount_gather += t_dc.elapsed().as_nanos() as u64;
 
     debug_assert_eq!(keys.len(), prices.len());
     debug_assert_eq!(keys.len(), discounts.len());
 
+    let t_agg = Instant::now();
     let mut num: f64 = 0.0;
     let mut den: f64 = 0.0;
     for ((k, p), d) in keys.iter().zip(prices.iter()).zip(discounts.iter()) {
@@ -286,12 +343,57 @@ fn process_rg(li_path: &PathBuf, rg: usize, part_lookup: &HashMap<i64, bool>) ->
             num += revenue;
         }
     }
+    t.agg += t_agg.elapsed().as_nanos() as u64;
+
+    if let Some(m) = timing {
+        m.lock().unwrap().add(&t);
+    }
     (num, den)
+}
+
+#[derive(Default, Debug, Clone)]
+struct Timing {
+    open: u64,
+    shipdate_filter: u64,
+    partkey_gather: u64,
+    extprice_gather: u64,
+    discount_gather: u64,
+    agg: u64,
+}
+
+#[derive(Default)]
+struct TimingLocal {
+    open: u64,
+    shipdate_filter: u64,
+    partkey_gather: u64,
+    extprice_gather: u64,
+    discount_gather: u64,
+    agg: u64,
+}
+
+impl Timing {
+    fn add(&mut self, t: &TimingLocal) {
+        self.open += t.open;
+        self.shipdate_filter += t.shipdate_filter;
+        self.partkey_gather += t.partkey_gather;
+        self.extprice_gather += t.extprice_gather;
+        self.discount_gather += t.discount_gather;
+        self.agg += t.agg;
+    }
+    fn ms(&self) -> [f64; 6] {
+        let f = |n: u64| n as f64 / 1e6;
+        [f(self.open), f(self.shipdate_filter), f(self.partkey_gather),
+         f(self.extprice_gather), f(self.discount_gather), f(self.agg)]
+    }
 }
 
 /// Run Q14 end-to-end. Row groups process in parallel via
 /// `std::thread::scope`, mirroring DataFusion's RG-level partitioning.
-fn run_q14(li_path: &PathBuf, part_lookup: &HashMap<i64, bool>) -> f64 {
+fn run_q14(
+    li_path: &PathBuf,
+    part_lookup: &HashMap<i64, bool>,
+    timing: Option<&std::sync::Mutex<Timing>>,
+) -> f64 {
     let num_rgs = {
         let file = ParquetFile::open(li_path).unwrap();
         let md = file.metadata().unwrap();
@@ -303,7 +405,7 @@ fn run_q14(li_path: &PathBuf, part_lookup: &HashMap<i64, bool>) -> f64 {
     std::thread::scope(|s| {
         let mut handles = Vec::with_capacity(num_rgs);
         for rg in 0..num_rgs {
-            let h = s.spawn(move || process_rg(li_path, rg, part_lookup));
+            let h = s.spawn(move || process_rg(li_path, rg, part_lookup, timing));
             handles.push(h);
         }
         for h in handles {
@@ -341,11 +443,11 @@ fn main() {
 
     // Warmup.
     for _ in 0..WARMUPS {
-        let _ = run_q14(&li_path, &part_lookup);
+        let _ = run_q14(&li_path, &part_lookup, None);
     }
 
     // Correctness check (matches polars/datafusion ref).
-    let ratio = run_q14(&li_path, &part_lookup);
+    let ratio = run_q14(&li_path, &part_lookup, None);
     println!("  Q14 ratio: {:.6}% (DataFusion ref: 16.3808%)", ratio);
     assert!(
         (ratio - 16.3808).abs() < 0.01,
@@ -353,11 +455,27 @@ fn main() {
         ratio
     );
 
+    // Per-stage profile (single run with instrumentation).
+    let timing = std::sync::Mutex::new(Timing::default());
+    let _ = run_q14(&li_path, &part_lookup, Some(&timing));
+    let t = timing.into_inner().unwrap();
+    let m = t.ms();
+    println!("  Per-stage cumulative across 6 RGs (parallel wall-clock divides by ~6):");
+    println!("    open:            {:.2} ms", m[0]);
+    println!("    shipdate filter: {:.2} ms", m[1]);
+    println!("    partkey gather:  {:.2} ms", m[2]);
+    println!("    extprice gather: {:.2} ms", m[3]);
+    println!("    discount gather: {:.2} ms", m[4]);
+    println!("    aggregate loop:  {:.2} ms", m[5]);
+    let sum: f64 = m.iter().sum();
+    println!("    sum:             {:.2} ms", sum);
+    println!();
+
     // Timing.
     let mut times = Vec::with_capacity(ITERS);
     for _ in 0..ITERS {
         let t0 = Instant::now();
-        let _ = run_q14(&li_path, &part_lookup);
+        let _ = run_q14(&li_path, &part_lookup, None);
         times.push(t0.elapsed());
     }
     times.sort();
