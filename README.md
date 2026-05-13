@@ -186,12 +186,14 @@ single Cranelift-JIT'd fused operator over the scan. No exec
 construction at the user's level — `SessionContext::sql(...)` is the
 whole API.
 
-Three rules ship today (2026-05-13):
+Five rules ship today (2026-05-13):
 
 | Rule | Shape it matches | Replaces with | SQL @ SF=1 (rule on vs off) | Status |
 |---|---|---|---:|---|
 | `InjectFusedQ6Rule` | `Projection → Aggregate(Final, single SUM(extprice*disc)) → CoalescePartitions → Aggregate(Partial) → Filter(5-AND chain) → scan` | `FusedFilterSumExec` (JIT) | 11.46 vs 12.04 ms (**+4.8 %**) | reliable win |
 | `InjectFusedQ1Rule` | `SortMerge → Sort → Projection → Aggregate(FinalPartitioned, gby=[returnflag,linestatus], 8 aggs) → RepartitionExec(Hash) → Aggregate(Partial) → Projection(CSE) → Filter(l_shipdate ≤ V) → scan` | `FusedFilterMultiAggExec` (JIT) | 21.74 vs 37.71 ms (**+42-46 %**) | **beats Polars 35.2 ms by 38 %** |
+| `InjectFusedQ3Rule` | `SortMerge → Sort → Projection → Aggregate(FinalPartitioned, gby=[orderkey, orderdate, shippriority]) → … → Aggregate(Partial) → 3-table join` | `FusedPostJoinExec(spec=Q3)` (keeps join, replaces aggregate stack) | 19.08 vs 19.31 ms (**+1.2 %**) | already 2.3× faster than Polars |
+| `InjectFusedQ5Rule` | Same top shape as Q3 with gby=[n_name] over Q5's 6-table join chain | `FusedPostJoinExec(spec=Q5)` | 23.52 vs 23.91 ms (**+1.7 %**) | already 465× faster than Polars (Polars regresses on Q5) |
 | `InjectFusedQ14Rule` | `Projection → Aggregate(Final, 2 SUMs) → CoalescePartitions → Aggregate(Partial) → Projection(CSE) → HashJoin(p_partkey = l_partkey) → {part scan, Filter(shipdate range) → lineitem scan}` | `FusedQ14FullExec` (owns both scans, replaces hash join with direct-indexed promo bitmap probe) | 17.17 vs ~18 ms (**+6-30 %** depending on run) | Polars 1.37× faster (was 2.17×) |
 
 Both rules' detectors walk the `PhysicalExpr` AST (`BinaryExpr` /
@@ -208,7 +210,8 @@ Register them like any other physical-optimiser rule:
 ```rust
 use ematix_flow_core::fast_parquet::FastParquetTableProvider;
 use ematix_flow_core::fused_jit_rule::{
-    InjectFusedQ1Rule, InjectFusedQ6Rule, InjectFusedQ14Rule,
+    InjectFusedQ1Rule, InjectFusedQ3Rule, InjectFusedQ5Rule,
+    InjectFusedQ6Rule, InjectFusedQ14Rule,
 };
 use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::prelude::{SessionConfig, SessionContext};
@@ -217,6 +220,8 @@ let state = SessionStateBuilder::new()
     .with_config(SessionConfig::new().with_target_partitions(14))
     .with_default_features()
     .with_physical_optimizer_rule(std::sync::Arc::new(InjectFusedQ1Rule))
+    .with_physical_optimizer_rule(std::sync::Arc::new(InjectFusedQ3Rule))
+    .with_physical_optimizer_rule(std::sync::Arc::new(InjectFusedQ5Rule))
     .with_physical_optimizer_rule(std::sync::Arc::new(InjectFusedQ6Rule))
     .with_physical_optimizer_rule(std::sync::Arc::new(InjectFusedQ14Rule))
     .build();
@@ -226,9 +231,9 @@ for t in ["lineitem", "part" /* … */] {
     ctx.register_table(t, std::sync::Arc::new(prov))?;
 }
 
-// Now `ctx.sql(...)` auto-detects Q1/Q6/Q14 shapes and uses the
-// JIT'd fused exec for the matching subtree. Other queries pass
-// through unchanged.
+// Now `ctx.sql(...)` auto-detects Q1/Q3/Q5/Q6/Q14 shapes and uses
+// the corresponding fused exec for the matching subtree. Other
+// queries pass through unchanged.
 ```
 
 A real-SQL test pins each rule's correctness against the un-rewritten
