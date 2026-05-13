@@ -362,6 +362,24 @@ class ScheduledPipeline:
 
 _REGISTRY: dict[str, ScheduledPipeline] = {}
 
+# ---- Phase Ω.1 — pipeline DAG side-tables --------------------------
+#
+# Three small side-tables keep the DAG state out of `ScheduledPipeline`
+# (which stays frozen + serializable). They live alongside `_REGISTRY`
+# and are reset together. In-process only — durable run-history is
+# Phase Ω.D1a's job.
+#
+#   _DEPENDS_ON[pipeline_name]              = list of upstream names
+#   _UPSTREAM_FRESHNESS[pipeline_name]      = max age of upstream's
+#                                             last successful run in
+#                                             seconds, or None for ∞
+#   _LAST_RUN[pipeline_name]                = (timestamp, success)
+#                                             populated by
+#                                             `run_due_with_dag`
+_DEPENDS_ON: dict[str, list[str]] = {}
+_UPSTREAM_FRESHNESS: dict[str, int | None] = {}
+_LAST_RUN: dict[str, tuple[datetime, bool]] = {}
+
 
 @dataclass(frozen=True)
 class RegisteredTransform:
@@ -483,12 +501,27 @@ def _invoke_transform_callable(
 
 
 def register(
-    *, name: str, schedule: str | None
+    *,
+    name: str,
+    schedule: str | None,
+    depends_on: list[str] | None = None,
+    upstream_freshness_secs: int | None = None,
 ) -> Callable[[Callable[[], dict[str, Any]]], Callable[[], dict[str, Any]]]:
     """Decorator: register a callable as a scheduled pipeline.
 
     The function should perform a sync (or any work) and return a
     JSON-serializable dict describing what happened.
+
+    Phase Ω.1 keyword arguments:
+      depends_on: list of names of pipelines that must run successfully
+        before this one is eligible. Empty list / None = no upstreams.
+        Each name must already be registered. Self-loops and cycles are
+        rejected at registration time with a clear error pointing at
+        both endpoints.
+      upstream_freshness_secs: max age (seconds) of an upstream's last
+        successful run for this pipeline to count it as fresh. None
+        (the default) = ∞: any prior success counts. Used by
+        `run_due_with_dag` to gate downstream execution.
     """
 
     def decorator(
@@ -498,10 +531,203 @@ def register(
             raise ValueError(
                 f"a pipeline named {name!r} is already registered"
             )
+        upstreams = list(depends_on or [])
+        # Self-loop.
+        if name in upstreams:
+            raise ValueError(
+                f"pipeline {name!r} depends on itself; "
+                f"a self-cycle of length 1 is not allowed"
+            )
+        # All upstreams must already be registered.
+        for u in upstreams:
+            if u not in _REGISTRY:
+                raise ValueError(
+                    f"pipeline {name!r} declares depends_on={u!r} but "
+                    f"no pipeline named {u!r} has been registered yet — "
+                    f"order your decorators so upstreams register first"
+                )
+        # Cycle detection. With name->upstreams as a forward graph,
+        # check that none of `upstreams` (or anything they transitively
+        # depend on) is `name`. Returns the offending cycle path on hit.
+        cycle = _find_cycle_path(start=name, frontier=upstreams)
+        if cycle is not None:
+            raise ValueError(
+                f"pipeline {name!r} would create a dependency cycle: "
+                f"{' → '.join(cycle)} (rejected at registration time)"
+            )
         _REGISTRY[name] = ScheduledPipeline(name=name, schedule=schedule, fn=fn)
+        _DEPENDS_ON[name] = upstreams
+        if upstream_freshness_secs is not None:
+            _UPSTREAM_FRESHNESS[name] = upstream_freshness_secs
         return fn
 
     return decorator
+
+
+def _find_cycle_path(*, start: str, frontier: list[str]) -> list[str] | None:
+    """Returns a `start → ... → start` cycle path if one of `frontier`
+    can transitively reach `start`. Returns None if the graph is
+    acyclic when extended with edges `start → frontier`.
+    """
+    # DFS each frontier node; if any path reaches `start`, return the
+    # path including the original `start`.
+    for f in frontier:
+        path = _dfs_path(src=f, target=start)
+        if path is not None:
+            return [start, *path]
+    return None
+
+
+def _dfs_path(*, src: str, target: str) -> list[str] | None:
+    """DFS the _DEPENDS_ON forward graph from `src`; if any walk
+    reaches `target`, return the path. None if no path exists.
+    """
+    stack: list[tuple[str, list[str]]] = [(src, [src])]
+    seen: set[str] = set()
+    while stack:
+        node, path = stack.pop()
+        if node == target:
+            return path
+        if node in seen:
+            continue
+        seen.add(node)
+        for up in _DEPENDS_ON.get(node, []):
+            stack.append((up, [*path, up]))
+    return None
+
+
+def depends_on_of(name: str) -> list[str]:
+    """Return the upstream list for `name`. Empty list for pipelines
+    with no declared dependencies. KeyError for unknown names."""
+    if name not in _REGISTRY:
+        raise KeyError(name)
+    return list(_DEPENDS_ON.get(name, []))
+
+
+def upstream_freshness_secs_of(name: str) -> int | None:
+    """Return the `upstream_freshness_secs` for `name`, or None for ∞."""
+    if name not in _REGISTRY:
+        raise KeyError(name)
+    return _UPSTREAM_FRESHNESS.get(name)
+
+
+def order_for_run_due(names: list[str]) -> list[str]:
+    """Topo-sort the subset `names` so upstreams appear before
+    downstreams. Edges OUTSIDE the subset are ignored: e.g. if `b`
+    depends on `a` and only `b` is in `names`, the returned order is
+    `[b]` (caller's responsibility to handle the missing upstream
+    via the freshness gate in `run_due_with_dag`).
+
+    The input order is preserved among nodes with the same depth, so
+    callers get stable output.
+    """
+    name_set = set(names)
+    # Forward graph restricted to names; reverse edges = "downstreams
+    # of x within the subset".
+    in_degree: dict[str, int] = {n: 0 for n in names}
+    downstream: dict[str, list[str]] = {n: [] for n in names}
+    for n in names:
+        for u in _DEPENDS_ON.get(n, []):
+            if u in name_set:
+                in_degree[n] += 1
+                downstream[u].append(n)
+    # Kahn's algorithm — preserve original input order across ties.
+    queue: list[str] = [n for n in names if in_degree[n] == 0]
+    out: list[str] = []
+    while queue:
+        n = queue.pop(0)
+        out.append(n)
+        for d in downstream[n]:
+            in_degree[d] -= 1
+            if in_degree[d] == 0:
+                queue.append(d)
+    if len(out) != len(names):
+        # Should be impossible because cycles are rejected at
+        # registration, but defend anyway with a clear error.
+        leftover = [n for n in names if n not in out]
+        raise ValueError(
+            f"order_for_run_due: cycle detected involving {leftover} — "
+            f"this shouldn't happen given registration-time checks; "
+            f"please file a bug"
+        )
+    return out
+
+
+def _upstream_is_fresh(downstream_name: str, now: datetime) -> bool:
+    """For each declared upstream of `downstream_name`, check that
+    `_LAST_RUN[upstream]` exists, is a success, and was within the
+    declared freshness window. Returns True iff all upstreams pass.
+    """
+    upstreams = _DEPENDS_ON.get(downstream_name, [])
+    if not upstreams:
+        return True
+    max_age_secs = _UPSTREAM_FRESHNESS.get(downstream_name)  # None = ∞
+    for up in upstreams:
+        rec = _LAST_RUN.get(up)
+        if rec is None:
+            return False
+        ts, ok = rec
+        if not ok:
+            return False
+        if max_age_secs is not None:
+            age = (now - ts).total_seconds()
+            if age > max_age_secs:
+                return False
+    return True
+
+
+def run_due_with_dag(
+    due: list[str],
+    *,
+    now: datetime | None = None,
+) -> list[str]:
+    """Run the pipelines in `due`, honoring DAG order + freshness.
+
+    Steps:
+      1. Topo-sort `due` so any upstream-in-the-subset runs first.
+      2. For each pipeline in topo order:
+         - Skip if any declared upstream isn't fresh (per
+           `upstream_freshness_secs`).
+         - Otherwise invoke its registered callable.
+         - Record `_LAST_RUN[name] = (now, success_bool)`.
+
+    Returns the names that actually fired (skipped ones excluded).
+
+    This is the in-process gate. Cross-process freshness (upstream
+    ran successfully in an earlier `flow run-due` invocation) needs
+    Phase Ω.D1a's durable RunLog.
+    """
+    if now is None:
+        now = datetime.now(_tz_utc())
+    ordered = order_for_run_due(list(due))
+    fired: list[str] = []
+    for name in ordered:
+        if not _upstream_is_fresh(name, now):
+            continue
+        sp = _REGISTRY.get(name)
+        if sp is None:
+            raise KeyError(name)
+        success = False
+        try:
+            sp.fn()
+            success = True
+        except Exception:
+            # Record + re-raise? The roadmap says downstreams should
+            # SKIP on upstream failure, so swallow here to let the
+            # rest of the topo-order continue. Caller can inspect
+            # `_LAST_RUN` for failures.
+            success = False
+        _LAST_RUN[name] = (datetime.now(_tz_utc()), success)
+        if success:
+            fired.append(name)
+    return fired
+
+
+def _tz_utc():
+    """Return the UTC tzinfo without importing datetime.timezone at
+    the module top (kept lean for import-time)."""
+    from datetime import timezone
+    return timezone.utc
 
 
 def list_pipelines() -> list[ScheduledPipeline]:

@@ -146,23 +146,70 @@ def _cmd_run_due(args: argparse.Namespace) -> int:
     now = _parse_iso(args.now) if args.now else datetime.now(UTC)
     if now.tzinfo is None:
         now = now.replace(tzinfo=UTC)
+
+    # Phase Ω.1: topo-sort the due set so upstreams fire before
+    # downstreams, and skip downstreams whose upstream isn't fresh
+    # (failed, missing, or stale). The ordering is in-process only —
+    # cross-process upstream-success tracking is Phase Ω.D1a.
+    due: list[str] = [
+        sp.name for sp in p.list_pipelines()
+        if p.is_due(sp.schedule, now, args.interval)
+    ]
+    if not due:
+        print(json.dumps({"ran": [], "failed": [], "skipped": []}, default=str))
+        return 0
+    ordered = p.order_for_run_due(due)
+
     results: list[dict[str, Any]] = []
     failed: list[dict[str, str]] = []
-    for sp in p.list_pipelines():
-        if not p.is_due(sp.schedule, now, args.interval):
+    skipped: list[dict[str, str]] = []
+    for name in ordered:
+        if not p._upstream_is_fresh(name, now):
+            stale = [
+                u for u in p.depends_on_of(name)
+                if not _upstream_ok(u, p.upstream_freshness_secs_of(name), now)
+            ]
+            print(
+                f"skipping: {name} (upstream not fresh: {stale})",
+                file=sys.stderr,
+            )
+            skipped.append({"pipeline": name, "reason": "upstream_not_fresh",
+                            "stale_upstreams": ",".join(stale)})
             continue
+        sp = p._REGISTRY[name]
         print(f"firing: {sp.name}", file=sys.stderr)
+        success = False
         try:
             r = sp.fn()
+            success = True
         except Exception as e:
             print(f"failed: {sp.name}: {e}", file=sys.stderr)
             failed.append({"pipeline": sp.name, "error": str(e)})
+            p._LAST_RUN[name] = (datetime.now(UTC), False)
             continue
+        p._LAST_RUN[name] = (datetime.now(UTC), success)
         out = dict(r) if isinstance(r, dict) else {"result": r}
         out["_pipeline"] = sp.name
         results.append(out)
-    print(json.dumps({"ran": results, "failed": failed}, default=str))
+    print(json.dumps(
+        {"ran": results, "failed": failed, "skipped": skipped},
+        default=str,
+    ))
     return 1 if failed else 0
+
+
+def _upstream_ok(upstream: str, max_age_secs: int | None, now: datetime) -> bool:
+    """Mirror of `pipeline._upstream_is_fresh` for one upstream — used to
+    enumerate which specific upstream(s) are stale when logging skips."""
+    rec = p._LAST_RUN.get(upstream)
+    if rec is None:
+        return False
+    ts, ok = rec
+    if not ok:
+        return False
+    if max_age_secs is None:
+        return True
+    return (now - ts).total_seconds() <= max_age_secs
 
 
 def _cmd_connections_list(args: argparse.Namespace) -> int:
