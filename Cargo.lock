@@ -3721,7 +3721,7 @@ dependencies = [
 [[package]]
 name = "ematix-parquet-codec"
 version = "0.0.1"
-source = "git+https://github.com/ryan-evans-git/ematix-parquet.git?rev=f0969f8d16144b0b405d2b0c6650f44c853568e6#f0969f8d16144b0b405d2b0c6650f44c853568e6"
+source = "git+https://github.com/ryan-evans-git/ematix-parquet.git?rev=0f1d746#0f1d74668a7b97f5e3366dc1f30e056b81e341a9"
 dependencies = [
  "ematix-parquet-format",
  "snap",
@@ -3731,12 +3731,12 @@ dependencies = [
 [[package]]
 name = "ematix-parquet-format"
 version = "0.0.1"
-source = "git+https://github.com/ryan-evans-git/ematix-parquet.git?rev=f0969f8d16144b0b405d2b0c6650f44c853568e6#f0969f8d16144b0b405d2b0c6650f44c853568e6"
+source = "git+https://github.com/ryan-evans-git/ematix-parquet.git?rev=0f1d746#0f1d74668a7b97f5e3366dc1f30e056b81e341a9"
 
 [[package]]
 name = "ematix-parquet-io"
 version = "0.0.1"
-source = "git+https://github.com/ryan-evans-git/ematix-parquet.git?rev=f0969f8d16144b0b405d2b0c6650f44c853568e6#f0969f8d16144b0b405d2b0c6650f44c853568e6"
+source = "git+https://github.com/ryan-evans-git/ematix-parquet.git?rev=0f1d746#0f1d74668a7b97f5e3366dc1f30e056b81e341a9"
 dependencies = [
  "ematix-parquet-format",
 ]
