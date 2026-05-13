@@ -50,7 +50,7 @@ use datafusion::execution::TaskContext;
 use datafusion::logical_expr::{BinaryExpr, Expr, Operator, TableProviderFilterPushDown};
 use datafusion::parquet::arrow::ProjectionMask;
 use datafusion::parquet::arrow::arrow_reader::{
-    ArrowReaderOptions, ParquetRecordBatchReaderBuilder,
+    ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder,
 };
 use datafusion::parquet::schema::types::SchemaDescriptor;
 use datafusion::physical_expr::{EquivalenceProperties, Partitioning};
@@ -421,6 +421,13 @@ pub struct FastParquetTableProvider {
     /// DataFusion hands us, without re-opening the file. Sized in the
     /// low KB range for TPC-H SF=1/SF=10 files.
     metadata: Arc<datafusion::parquet::file::metadata::ParquetMetaData>,
+    /// Pre-built `ArrowReaderMetadata` (= cached parquet metadata +
+    /// Utf8View-promoted supplied schema). Threaded into every
+    /// `execute()` worker so they skip the parquet footer parse on
+    /// each invocation — without this, every partition × every query
+    /// re-opened the file and re-parsed the thrift footer. Each
+    /// `ArrowReaderMetadata` clone is one Arc bump.
+    arrow_metadata: Arc<ArrowReaderMetadata>,
     /// One entry per column in `schema` (field order). Populated from
     /// parquet row-group stats at construction so we don't pay the
     /// metadata-read cost on every scan.
@@ -458,6 +465,19 @@ impl FastParquetTableProvider {
         let parquet_schema: Arc<SchemaDescriptor> = builder.parquet_schema().clone().into();
         let column_stats = Arc::new(aggregate_column_statistics(meta, &schema));
         let metadata = builder.metadata().clone();
+        // Build the ArrowReaderMetadata once at construction time using
+        // the cached parquet metadata + the Utf8View-promoted schema
+        // hint. Workers clone this (one Arc bump) instead of paying the
+        // footer-parse cost on every execute() call.
+        let options = ArrowReaderOptions::new().with_schema(schema.clone());
+        let arrow_metadata = Arc::new(
+            ArrowReaderMetadata::try_new(metadata.clone(), options).map_err(|e| {
+                DataFusionError::External(
+                    format!("FastParquetTableProvider: building ArrowReaderMetadata: {e}")
+                        .into(),
+                )
+            })?,
+        );
         Ok(Self {
             path,
             schema,
@@ -465,6 +485,7 @@ impl FastParquetTableProvider {
             num_rows,
             parquet_schema,
             metadata,
+            arrow_metadata,
             column_stats,
         })
     }
@@ -619,6 +640,7 @@ impl TableProvider for FastParquetTableProvider {
             self.num_rows,
             projected_col_stats,
             self.parquet_schema.clone(),
+            self.arrow_metadata.clone(),
         )?;
         Ok(Arc::new(exec))
     }
@@ -634,10 +656,11 @@ pub struct FastParquetExec {
     path: String,
     schema: SchemaRef,
     /// Full (unprojected) promoted Arrow schema for the parquet file.
-    /// Threaded into `ArrowReaderOptions::with_schema` so parquet-rs
-    /// emits `Utf8View`/`BinaryView` arrays per the provider's schema
-    /// hint. parquet-rs requires `with_schema` to cover every parquet
-    /// column, not just the projected ones, so we keep the full schema.
+    /// Originally threaded into `ArrowReaderOptions::with_schema`; now
+    /// pre-baked into `arrow_metadata` once at provider construction
+    /// time, so we keep this only because `try_new` callers in tests
+    /// still pass it through (no runtime cost).
+    #[allow(dead_code)]
     full_schema: SchemaRef,
     projection: Vec<usize>,
     /// For partition `i`, `assignments[i]` lists which parquet row
@@ -649,6 +672,10 @@ pub struct FastParquetExec {
     /// Populated from parquet row-group statistics.
     column_stats: Vec<ColumnStatistics>,
     parquet_schema: Arc<SchemaDescriptor>,
+    /// Pre-built `ArrowReaderMetadata` from the provider — workers
+    /// clone this so they don't re-parse the parquet footer on each
+    /// `execute()` call.
+    arrow_metadata: Arc<ArrowReaderMetadata>,
     properties: Arc<PlanProperties>,
     /// Per-partition decode metrics. Σ.E2 follow-up: shipped initially
     /// with `metrics=[]` which made Q01 SF=10 undiagnosable in EXPLAIN
@@ -670,6 +697,7 @@ impl FastParquetExec {
         num_rows: usize,
         column_stats: Vec<ColumnStatistics>,
         parquet_schema: Arc<SchemaDescriptor>,
+        arrow_metadata: Arc<ArrowReaderMetadata>,
     ) -> DfResult<Self> {
         let eq_props = EquivalenceProperties::new(schema.clone());
         let properties = Arc::new(PlanProperties::new(
@@ -687,6 +715,7 @@ impl FastParquetExec {
             num_rows,
             column_stats,
             parquet_schema,
+            arrow_metadata,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
         })
@@ -779,7 +808,7 @@ impl ExecutionPlan for FastParquetExec {
                 self.path.clone(),
                 self.projection.clone(),
                 self.parquet_schema.clone(),
-                self.full_schema.clone(),
+                self.arrow_metadata.clone(),
                 row_groups.clone(),
                 pm,
             ),
@@ -834,7 +863,7 @@ fn build_partition_stream(
     path: String,
     projection: Vec<usize>,
     parquet_schema: Arc<SchemaDescriptor>,
-    full_schema: SchemaRef,
+    arrow_metadata: Arc<ArrowReaderMetadata>,
     row_groups: Vec<usize>,
     pm: PartitionMetrics,
 ) -> impl futures_util::Stream<Item = DfResult<RecordBatch>> + Send + 'static {
@@ -877,24 +906,16 @@ fn build_partition_stream(
                 return;
             }
         };
-        // `with_schema` lets parquet-rs honour our Utf8View/BinaryView
-        // promotion: at column-decode time it sees the hint and routes
-        // the column through the view-emitting array reader (see
-        // parquet-58.1.0 src/arrow/array_reader/byte_view_array.rs).
-        // The hint covers the full file schema, not just the projection.
-        let options = ArrowReaderOptions::new().with_schema(full_schema);
-        let builder = match ParquetRecordBatchReaderBuilder::try_new_with_options(file, options) {
-            Ok(b) => b,
-            Err(e) => {
-                send_err(
-                    &tx,
-                    DataFusionError::External(
-                        format!("FastParquetExec: builder failed: {e}").into(),
-                    ),
-                );
-                return;
-            }
-        };
+        // Reuse the provider's pre-built `ArrowReaderMetadata` —
+        // cached parquet metadata plus the Utf8View-promoted supplied
+        // schema. `new_with_metadata` skips the thrift footer parse
+        // that `try_new_with_options` does, which at SF=1 cost ~0.5-2
+        // ms per partition × per execute() call. The metadata is
+        // shared via Arc so each worker just clones a pointer.
+        let builder = ParquetRecordBatchReaderBuilder::new_with_metadata(
+            file,
+            (*arrow_metadata).clone(),
+        );
         let mask = ProjectionMask::leaves(&parquet_schema, projection.iter().copied());
         let mut reader = match builder
             .with_projection(mask)
