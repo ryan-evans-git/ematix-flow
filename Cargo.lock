@@ -3721,9 +3721,13 @@ dependencies = [
 [[package]]
 name = "ematix-parquet-codec"
 version = "0.0.1"
-source = "git+https://github.com/ryan-evans-git/ematix-parquet.git?rev=0f1d746#0f1d74668a7b97f5e3366dc1f30e056b81e341a9"
+source = "git+https://github.com/ryan-evans-git/ematix-parquet.git?rev=63b6954#63b6954aade8a73a6c850c85123868f2326e03f7"
 dependencies = [
+ "brotli",
  "ematix-parquet-format",
+ "ematix-parquet-io",
+ "flate2",
+ "lz4_flex 0.11.6",
  "snap",
  "zstd",
 ]
@@ -3731,12 +3735,12 @@ dependencies = [
 [[package]]
 name = "ematix-parquet-format"
 version = "0.0.1"
-source = "git+https://github.com/ryan-evans-git/ematix-parquet.git?rev=0f1d746#0f1d74668a7b97f5e3366dc1f30e056b81e341a9"
+source = "git+https://github.com/ryan-evans-git/ematix-parquet.git?rev=63b6954#63b6954aade8a73a6c850c85123868f2326e03f7"
 
 [[package]]
 name = "ematix-parquet-io"
 version = "0.0.1"
-source = "git+https://github.com/ryan-evans-git/ematix-parquet.git?rev=0f1d746#0f1d74668a7b97f5e3366dc1f30e056b81e341a9"
+source = "git+https://github.com/ryan-evans-git/ematix-parquet.git?rev=63b6954#63b6954aade8a73a6c850c85123868f2326e03f7"
 dependencies = [
  "ematix-parquet-format",
 ]
