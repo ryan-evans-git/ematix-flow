@@ -21,6 +21,11 @@ pub mod fast_parquet;
 // etc.) to Arrow arrays. Foundation for replacing parquet-rs under
 // FastParquetExec. See module docstring for the integration plan.
 pub mod ematix_parquet_bridge;
+// Phase 2 of the ematix-parquet integration — `TableProvider` +
+// `ExecutionPlan` that scan a parquet file via the bridge instead
+// of parquet-rs. Supports primitive columns only; non-primitive
+// callers continue using `FastParquetTableProvider`.
+pub mod ematix_fast_parquet;
 // Σ.D1: `FusedFilterSumExec` physical operator for the simple
 // `Aggregate(SUM) over Filter(predicate)` plan shape — closes the
 // Q6 gap vs Polars (1.0 ms hand-written / 1.9 ms Polars / 5.96 ms

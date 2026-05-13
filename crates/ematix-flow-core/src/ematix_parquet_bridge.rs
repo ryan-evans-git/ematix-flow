@@ -34,10 +34,10 @@ use std::sync::Arc;
 use arrow_array::{Float64Array, Int32Array, Int64Array};
 use datafusion::error::{DataFusionError, Result as DfResult};
 
-use ematix_parquet_codec::compression::decompress_snappy_into;
+use ematix_parquet_codec::compression::{decompress_snappy_into, decompress_zstd_into};
 use ematix_parquet_codec::dict::decode_rle_dictionary_into;
 use ematix_parquet_codec::plain::{decode_plain_f64, decode_plain_i32, decode_plain_i64};
-use ematix_parquet_format::types::Encoding;
+use ematix_parquet_format::types::{CompressionCodec, Encoding};
 use ematix_parquet_io::{PageWalker, ParquetFile};
 
 /// Decode an INT32 column chunk to a contiguous `Int32Array`.
@@ -119,6 +119,7 @@ fn decode_dict_chunk_generic<T: Copy>(
         .as_ref()
         .ok_or_else(|| ext("column missing meta_data"))?;
     let total = cm.num_values as usize;
+    let codec = cm.codec;
 
     let start = cm.dictionary_page_offset.unwrap_or(cm.data_page_offset) as u64;
     let length = cm.total_compressed_size as u64;
@@ -136,8 +137,7 @@ fn decode_dict_chunk_generic<T: Copy>(
         .next_page()
         .map_err(|e| ext(format!("next_page (first): {e}")))?
         .ok_or_else(|| ext("empty chunk"))?;
-    decompress_snappy_into(first_body, &mut scratch)
-        .map_err(|e| ext(format!("decompress (first): {e}")))?;
+    decompress_into(codec, first_body, &mut scratch)?;
 
     let dict: Vec<T> = if first_hdr.dictionary_page_header.is_some() {
         decode_plain(&scratch)?
@@ -173,8 +173,7 @@ fn decode_dict_chunk_generic<T: Copy>(
             .as_ref()
             .ok_or_else(|| ext("v2 pages not yet supported"))?;
         let n = dph.num_values as usize;
-        decompress_snappy_into(body, &mut scratch)
-            .map_err(|e| ext(format!("decompress: {e}")))?;
+        decompress_into(codec, body, &mut scratch)?;
         match dph.encoding {
             Encoding::RleDictionary | Encoding::PlainDictionary => {
                 decode_rle_dictionary_into(&scratch, &dict, n, &mut out)
@@ -196,6 +195,31 @@ fn decode_dict_chunk_generic<T: Copy>(
 #[inline]
 fn ext<S: Into<String>>(msg: S) -> DataFusionError {
     DataFusionError::External(format!("ematix_parquet_bridge: {}", msg.into()).into())
+}
+
+/// Codec-aware decompress helper. Dispatches on the column chunk's
+/// declared codec. UNCOMPRESSED pages just copy bytes into `out`.
+/// SNAPPY and ZSTD route to ematix-parquet's `_into` variants for
+/// buffer reuse across pages. Other codecs error.
+fn decompress_into(
+    codec: CompressionCodec,
+    body: &[u8],
+    out: &mut Vec<u8>,
+) -> DfResult<()> {
+    match codec {
+        CompressionCodec::Uncompressed => {
+            out.clear();
+            out.extend_from_slice(body);
+            Ok(())
+        }
+        CompressionCodec::Snappy => decompress_snappy_into(body, out)
+            .map_err(|e| ext(format!("snappy: {e}"))),
+        CompressionCodec::Zstd => decompress_zstd_into(body, out)
+            .map_err(|e| ext(format!("zstd: {e}"))),
+        other => Err(ext(format!(
+            "codec {other:?} not yet wired into bridge; use FastParquetTableProvider"
+        ))),
+    }
 }
 
 #[cfg(test)]
