@@ -25,25 +25,30 @@ import pytest
 from ematix_flow import pipeline as p
 
 
+_SIDE_TABLES = (
+    "_REGISTRY",
+    "_DEPENDS_ON",
+    "_UPSTREAM_FRESHNESS",
+    "_LAST_RUN",
+    # Ω.2 retry tables — must also clear so a prior test's failure
+    # doesn't leave `gave_up=True` state behind on a same-named pipeline.
+    "_RETRY_POLICY",
+    "_ATTEMPT_STATE",
+)
+
+
 @pytest.fixture(autouse=True)
 def _clean_registry():
     """Reset the process-global pipeline registry before each test."""
-    p._REGISTRY.clear()
-    # Reset Ω.1 DAG side-table too.
-    if hasattr(p, "_DEPENDS_ON"):
-        p._DEPENDS_ON.clear()
-    if hasattr(p, "_UPSTREAM_FRESHNESS"):
-        p._UPSTREAM_FRESHNESS.clear()
-    if hasattr(p, "_LAST_RUN"):
-        p._LAST_RUN.clear()
+    for tbl in _SIDE_TABLES:
+        d = getattr(p, tbl, None)
+        if d is not None:
+            d.clear()
     yield
-    p._REGISTRY.clear()
-    if hasattr(p, "_DEPENDS_ON"):
-        p._DEPENDS_ON.clear()
-    if hasattr(p, "_UPSTREAM_FRESHNESS"):
-        p._UPSTREAM_FRESHNESS.clear()
-    if hasattr(p, "_LAST_RUN"):
-        p._LAST_RUN.clear()
+    for tbl in _SIDE_TABLES:
+        d = getattr(p, tbl, None)
+        if d is not None:
+            d.clear()
 
 
 # ---- Registration --------------------------------------------------

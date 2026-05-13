@@ -381,6 +381,120 @@ _UPSTREAM_FRESHNESS: dict[str, int | None] = {}
 _LAST_RUN: dict[str, tuple[datetime, bool]] = {}
 
 
+# Phase Ω.2 — declarative retry policy + in-process attempt state.
+#
+#   _RETRY_POLICY[name]     = RetryPolicy describing the retry shape
+#   _ATTEMPT_STATE[name]    = AttemptState tracking the current retry
+#                             cycle. Cleared on a successful run.
+#
+# In-process scope only. Durable per-attempt history is Phase Ω.D1a.
+
+
+@dataclass(frozen=True)
+class RetryPolicy:
+    """Per-pipeline retry shape.
+
+    `max_attempts`: total invocations allowed, including the first.
+      1 means "no retries" (matches the default).
+    `backoff`: one of "fixed" | "linear" | "exponential".
+    `base_secs`: backoff window after the first failure. Linear and
+      exponential variants scale this.
+    `max_backoff_secs`: ceiling on the window for any single retry.
+      None disables the ceiling.
+    """
+
+    max_attempts: int = 1
+    backoff: str = "fixed"
+    base_secs: int = 0
+    max_backoff_secs: int | None = None
+
+
+@dataclass
+class AttemptState:
+    """In-process state of an in-flight retry cycle.
+
+    `attempt_count`: how many invocations have happened in this cycle,
+      including the original failed attempt.
+    `last_attempt_at`: timestamp of the most recent invocation.
+    `gave_up`: True once `attempt_count` has reached `max_attempts`
+      without success. A successful run clears the whole record.
+    """
+
+    attempt_count: int
+    last_attempt_at: datetime
+    gave_up: bool = False
+
+
+_RETRY_POLICY: dict[str, RetryPolicy] = {}
+_ATTEMPT_STATE: dict[str, AttemptState] = {}
+
+
+_VALID_BACKOFFS = {"fixed", "linear", "exponential"}
+
+
+def _build_retry_policy(name: str, raw: dict | None) -> RetryPolicy:
+    """Validate a retry= kwarg and produce a RetryPolicy. Raises
+    ValueError on shape problems so registration fails loud."""
+    if raw is None:
+        return RetryPolicy()
+    max_attempts = int(raw.get("max_attempts", 1))
+    if max_attempts < 1:
+        raise ValueError(
+            f"pipeline {name!r}: retry.max_attempts must be ≥ 1, got {max_attempts}"
+        )
+    backoff = str(raw.get("backoff", "fixed"))
+    if backoff not in _VALID_BACKOFFS:
+        raise ValueError(
+            f"pipeline {name!r}: retry.backoff must be one of "
+            f"{sorted(_VALID_BACKOFFS)}, got {backoff!r}"
+        )
+    base_secs = int(raw.get("base_secs", 0))
+    if base_secs < 0:
+        raise ValueError(
+            f"pipeline {name!r}: retry.base_secs must be ≥ 0, got {base_secs}"
+        )
+    max_backoff_secs = raw.get("max_backoff_secs")
+    if max_backoff_secs is not None:
+        max_backoff_secs = int(max_backoff_secs)
+        if max_backoff_secs < 0:
+            raise ValueError(
+                f"pipeline {name!r}: retry.max_backoff_secs must be ≥ 0 "
+                f"or omitted, got {max_backoff_secs}"
+            )
+    return RetryPolicy(
+        max_attempts=max_attempts,
+        backoff=backoff,
+        base_secs=base_secs,
+        max_backoff_secs=max_backoff_secs,
+    )
+
+
+def _compute_backoff_secs(policy: RetryPolicy, attempt_count: int) -> int:
+    """Backoff window after attempt `attempt_count`. attempt_count=1
+    means "after the first failure", so the window scales from there.
+    The ceiling, if set, caps every variant."""
+    base = policy.base_secs
+    if policy.backoff == "fixed":
+        secs = base
+    elif policy.backoff == "linear":
+        secs = base * attempt_count
+    elif policy.backoff == "exponential":
+        # attempt_count=1 → base; =2 → 2*base; =3 → 4*base; ...
+        secs = base * (2 ** (attempt_count - 1))
+    else:  # defensive — registration filtered this already
+        secs = base
+    if policy.max_backoff_secs is not None and secs > policy.max_backoff_secs:
+        secs = policy.max_backoff_secs
+    return secs
+
+
+def retry_policy_of(name: str) -> RetryPolicy:
+    """Return the RetryPolicy for `name`. KeyError for unknown names."""
+    if name not in _REGISTRY:
+        raise KeyError(name)
+    return _RETRY_POLICY.get(name, RetryPolicy())
+
+
 @dataclass(frozen=True)
 class RegisteredTransform:
     """Phase 27b: a `@ematix.transform`-decorated standalone callable."""
@@ -506,6 +620,7 @@ def register(
     schedule: str | None,
     depends_on: list[str] | None = None,
     upstream_freshness_secs: int | None = None,
+    retry: dict | None = None,
 ) -> Callable[[Callable[[], dict[str, Any]]], Callable[[], dict[str, Any]]]:
     """Decorator: register a callable as a scheduled pipeline.
 
@@ -555,10 +670,16 @@ def register(
                 f"pipeline {name!r} would create a dependency cycle: "
                 f"{' → '.join(cycle)} (rejected at registration time)"
             )
+        # Validate retry= up front so a malformed policy doesn't make
+        # it into the registry.
+        policy = _build_retry_policy(name, retry)
         _REGISTRY[name] = ScheduledPipeline(name=name, schedule=schedule, fn=fn)
         _DEPENDS_ON[name] = upstreams
         if upstream_freshness_secs is not None:
             _UPSTREAM_FRESHNESS[name] = upstream_freshness_secs
+        # Always populate so retry_policy_of returns the validated
+        # policy (the default RetryPolicy for unset cases).
+        _RETRY_POLICY[name] = policy
         return fn
 
     return decorator
@@ -704,6 +825,17 @@ def run_due_with_dag(
     for name in ordered:
         if not _upstream_is_fresh(name, now):
             continue
+        # Phase Ω.2: if a retry cycle is in flight, gate by the
+        # backoff window OR by gave_up=True (after max_attempts).
+        st = _ATTEMPT_STATE.get(name)
+        policy = _RETRY_POLICY.get(name, RetryPolicy())
+        if st is not None:
+            if st.gave_up:
+                continue
+            backoff_secs = _compute_backoff_secs(policy, st.attempt_count)
+            next_eligible = st.last_attempt_at + timedelta(seconds=backoff_secs)
+            if now < next_eligible:
+                continue
         sp = _REGISTRY.get(name)
         if sp is None:
             raise KeyError(name)
@@ -717,9 +849,21 @@ def run_due_with_dag(
             # rest of the topo-order continue. Caller can inspect
             # `_LAST_RUN` for failures.
             success = False
-        _LAST_RUN[name] = (datetime.now(_tz_utc()), success)
+        completed_at = datetime.now(_tz_utc())
+        _LAST_RUN[name] = (completed_at, success)
         if success:
             fired.append(name)
+            # Clear any in-flight retry cycle on success.
+            _ATTEMPT_STATE.pop(name, None)
+        else:
+            prev = _ATTEMPT_STATE.get(name)
+            attempt_count = (prev.attempt_count if prev else 0) + 1
+            gave_up = attempt_count >= policy.max_attempts
+            _ATTEMPT_STATE[name] = AttemptState(
+                attempt_count=attempt_count,
+                last_attempt_at=now,
+                gave_up=gave_up,
+            )
     return fired
 
 
