@@ -141,3 +141,11 @@ path = "examples/tpcds_dialect_audit.rs"
 name = "fast_parquet_array_diff"
 path = "examples/fast_parquet_array_diff.rs"
 
+# Σ.D3 phase A-D: hand-coded vs Cranelift-JIT'd inner loops for the
+# three fused-exec shapes (Q6, Q1, Q14 post-join). End-to-end timing
+# over real SF=1 parquet data, with bit-identical equivalence checks
+# between the two paths before timing.
+[[example]]
+name = "tpch_fused_jit_bench"
+path = "examples/tpch_fused_jit_bench.rs"
+
