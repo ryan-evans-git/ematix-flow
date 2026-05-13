@@ -31,12 +31,17 @@ class PostgresRunLog:
     """
 
     _DDL = (
-        "CREATE TABLE IF NOT EXISTS {schema}.run_log ("
+        # The schema is created first so a non-default schema name works
+        # without requiring the operator to pre-create it. The role used
+        # in `dsn` needs CREATE privilege on the database for this; if
+        # not, see `create_tables=False` below.
+        'CREATE SCHEMA IF NOT EXISTS "{schema}";'
+        'CREATE TABLE IF NOT EXISTS "{schema}".run_log ('
         "  pipeline_name TEXT PRIMARY KEY,"
         "  last_run_at   TEXT NOT NULL,"
         "  success       BOOLEAN NOT NULL"
         ");"
-        "CREATE TABLE IF NOT EXISTS {schema}.attempt_state ("
+        'CREATE TABLE IF NOT EXISTS "{schema}".attempt_state ('
         "  pipeline_name   TEXT PRIMARY KEY,"
         "  attempt_count   INTEGER NOT NULL,"
         "  last_attempt_at TEXT NOT NULL,"
@@ -44,7 +49,36 @@ class PostgresRunLog:
         ");"
     )
 
-    def __init__(self, dsn: str, *, schema: str = "public"):
+    def __init__(
+        self,
+        dsn: str,
+        *,
+        schema: str = "public",
+        create_tables: bool = True,
+    ):
+        """Connect to Postgres and (optionally) create the schema + tables.
+
+        Args:
+            dsn: libpq connection string (postgresql://user@host/db, etc.).
+            schema: namespace for the two orchestrator tables. Default
+                "public", which always exists. Custom schemas are
+                auto-created with `CREATE SCHEMA IF NOT EXISTS` — this
+                needs CREATE-on-database privilege.
+            create_tables: when True (default), the schema + two tables
+                are created on first connect via `IF NOT EXISTS` DDL.
+                Set to False if your role lacks DDL privilege; an
+                operator (DBA, migration script) must have already
+                created them with the matching layout.
+
+        Permission notes:
+          - To use `create_tables=True` with `schema="public"`:
+              GRANT USAGE, CREATE ON SCHEMA public TO <role>.
+          - To use a custom schema: that schema must either already
+            exist (with USAGE granted) OR the role must have CREATE
+            ON DATABASE.
+          - After first start, only INSERT/UPDATE/DELETE/SELECT on the
+            two tables are needed; the role can be downgraded.
+        """
         try:
             import psycopg
         except ImportError as e:
@@ -58,8 +92,9 @@ class PostgresRunLog:
         # mirroring the in-memory dict-assignment shape.
         self._conn = psycopg.connect(dsn, autocommit=True)
         self._schema = schema
-        with self._conn.cursor() as cur:
-            cur.execute(self._DDL.format(schema=schema))
+        if create_tables:
+            with self._conn.cursor() as cur:
+                cur.execute(self._DDL.format(schema=schema))
 
     def close(self) -> None:
         self._conn.close()
@@ -67,7 +102,7 @@ class PostgresRunLog:
     def record_run(self, name: str, ts: datetime, success: bool) -> None:
         with self._conn.cursor() as cur:
             cur.execute(
-                f"INSERT INTO {self._schema}.run_log "
+                f'INSERT INTO "{self._schema}".run_log '
                 "(pipeline_name, last_run_at, success) VALUES (%s, %s, %s) "
                 "ON CONFLICT (pipeline_name) DO UPDATE SET "
                 "last_run_at = EXCLUDED.last_run_at, "
@@ -78,7 +113,7 @@ class PostgresRunLog:
     def record_attempt(self, name: str, state) -> None:
         with self._conn.cursor() as cur:
             cur.execute(
-                f"INSERT INTO {self._schema}.attempt_state "
+                f'INSERT INTO "{self._schema}".attempt_state '
                 "(pipeline_name, attempt_count, last_attempt_at, gave_up) "
                 "VALUES (%s, %s, %s, %s) "
                 "ON CONFLICT (pipeline_name) DO UPDATE SET "
@@ -96,7 +131,7 @@ class PostgresRunLog:
     def clear_attempt_state(self, name: str) -> None:
         with self._conn.cursor() as cur:
             cur.execute(
-                f"DELETE FROM {self._schema}.attempt_state WHERE pipeline_name = %s",
+                f'DELETE FROM "{self._schema}".attempt_state WHERE pipeline_name = %s',
                 (name,),
             )
 
@@ -105,13 +140,13 @@ class PostgresRunLog:
 
         with self._conn.cursor() as cur:
             cur.execute(
-                f"SELECT pipeline_name, last_run_at, success FROM {self._schema}.run_log"
+                f'SELECT pipeline_name, last_run_at, success FROM "{self._schema}".run_log'
             )
             for name, ts_s, ok in cur.fetchall():
                 _p._LAST_RUN[name] = (parse_iso(ts_s), bool(ok))
             cur.execute(
-                f"SELECT pipeline_name, attempt_count, last_attempt_at, gave_up "
-                f"FROM {self._schema}.attempt_state"
+                f'SELECT pipeline_name, attempt_count, last_attempt_at, gave_up '
+                f'FROM "{self._schema}".attempt_state'
             )
             for name, count, ts_s, gave_up in cur.fetchall():
                 _p._ATTEMPT_STATE[name] = _p.AttemptState(
