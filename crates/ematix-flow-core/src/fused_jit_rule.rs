@@ -175,77 +175,39 @@ impl PhysicalOptimizerRule for InjectFusedQ6Rule {
 
 /// Try to interpret `node` as the top of a Q6-shaped plan and return
 /// a [`FusedFilterSumExec`] (JIT mode) over the scan beneath it.
-/// Returns `Ok(None)` if anything in the shape doesn't match — the
-/// node will be left unchanged by the caller.
+/// Migrated to the shared `match_aggregate_query_shape` walker.
 fn try_match_q6_plan(node: &Arc<dyn ExecutionPlan>) -> DfResult<Option<Arc<dyn ExecutionPlan>>> {
-    // Top: ProjectionExec with a single output column named "revenue".
-    // This catches the SQL `SUM(...) AS revenue` alias and avoids
-    // overlapping with non-Q6 plans that happen to share intermediate
-    // shape but produce different output names.
-    let Some(proj) = node.as_any().downcast_ref::<ProjectionExec>() else {
+    const CFG: AggregateShapeConfig = AggregateShapeConfig {
+        expect_top_sort: false,
+        expect_top_projection: true,
+        expect_final_mode: FinalAggMode::Final,
+        expect_group_by_count: 0,
+        expect_agg_count: 1,
+        expect_cse_projection: false,
+    };
+    let Some(shape) = match_aggregate_query_shape(node, &CFG)? else {
         return Ok(None);
     };
-    if proj.expr().len() != 1 || proj.schema().field(0).name() != "revenue" {
+    // Top ProjectionExec output: single column named "revenue".
+    let proj = shape.top_projection.as_ref().expect("config requires top projection");
+    if proj.schema().field(0).name() != "revenue" {
         return Ok(None);
     }
-
-    // Down: AggregateExec(Final), no group-by, single SUM agg.
-    let agg_final_child = proj.children().first().copied().cloned();
-    let Some(agg_final_child) = agg_final_child else {
-        return Ok(None);
-    };
-    let Some(agg_final) = agg_final_child.as_any().downcast_ref::<AggregateExec>() else {
-        return Ok(None);
-    };
-    if !matches!(agg_final.mode(), AggregateMode::Final) {
+    // Aggregate: SUM(extprice * discount).
+    if !is_sum_extprice_times_discount(&shape.final_agg.aggr_expr()[0]) {
         return Ok(None);
     }
-    if !agg_final.group_expr().is_empty() || agg_final.aggr_expr().len() != 1 {
+    if !is_sum_extprice_times_discount(&shape.partial_agg.aggr_expr()[0]) {
         return Ok(None);
     }
-    if !is_sum_extprice_times_discount(&agg_final.aggr_expr()[0]) {
-        return Ok(None);
-    }
-
-    // Down: CoalescePartitionsExec (optional wrapper around the partial agg).
-    let after_coalesce: Arc<dyn ExecutionPlan> = agg_final
-        .children()
-        .first()
-        .map(|c| (*c).clone())
-        .ok_or_else(|| dferr("Q6 match: AggregateExec missing input"))?;
-    let after_coalesce = strip_optional_coalesce(&after_coalesce);
-
-    // Down: AggregateExec(Partial), same shape as Final.
-    let Some(agg_partial) = after_coalesce.as_any().downcast_ref::<AggregateExec>() else {
-        return Ok(None);
-    };
-    if !matches!(agg_partial.mode(), AggregateMode::Partial) {
-        return Ok(None);
-    }
-    if !agg_partial.group_expr().is_empty() || agg_partial.aggr_expr().len() != 1 {
-        return Ok(None);
-    }
-    if !is_sum_extprice_times_discount(&agg_partial.aggr_expr()[0]) {
-        return Ok(None);
-    }
-
-    // Down: FilterExec with extractable Q6 predicate.
-    let after_filter: Arc<dyn ExecutionPlan> = agg_partial
-        .children()
-        .first()
-        .map(|c| (*c).clone())
-        .ok_or_else(|| dferr("Q6 match: AggregateExec(Partial) missing input"))?;
-    let Some(filter) = after_filter.as_any().downcast_ref::<FilterExec>() else {
+    // Body: FilterExec with extractable Q6 predicate, then scan with
+    // the 4 required columns.
+    let Some(filter) = shape.body.as_any().downcast_ref::<FilterExec>() else {
         return Ok(None);
     };
     let Some(predicate) = extract_q6_predicate(filter.predicate()) else {
         return Ok(None);
     };
-
-    // Strip wrappers between the filter and the scan: typically
-    // RepartitionExec, sometimes CoalesceBatchesExec. We keep walking
-    // until we hit a node whose schema has the four required columns
-    // — that's the scan (FastParquetExec, DataSourceExec, or MemTable).
     let mut scan: Arc<dyn ExecutionPlan> = filter
         .children()
         .first()
@@ -255,37 +217,17 @@ fn try_match_q6_plan(node: &Arc<dyn ExecutionPlan>) -> DfResult<Option<Arc<dyn E
         if scan_has_required_q6_columns(&scan.schema()) {
             break;
         }
-        // Try to descend through a single-child wrapper. If we can't,
-        // the plan doesn't fit the Q6 shape — bail out cleanly.
         let children = scan.children();
         if children.len() != 1 {
             return Ok(None);
         }
-        let next = children[0].clone();
-        // Repartition / CoalesceBatches / Projection — anything with
-        // one child and no semantic-altering effect for our purposes.
-        // We don't validate the wrapper type, just descend.
-        let _is_known_wrapper = scan.as_any().downcast_ref::<RepartitionExec>().is_some();
-        scan = next;
-        // Safety belt: don't recurse forever.
+        scan = children[0].clone();
         if !scan_has_required_q6_columns(&scan.schema()) && scan.children().is_empty() {
             return Ok(None);
         }
     }
-
-    // Validate via the constructor — schema check by name, JIT codegen
-    // confirms the predicate constants are well-formed.
     let fused = FusedFilterSumExec::try_new_q6_jit(scan, predicate)?;
     Ok(Some(Arc::new(fused) as Arc<dyn ExecutionPlan>))
-}
-
-fn strip_optional_coalesce(plan: &Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
-    if let Some(coal) = plan.as_any().downcast_ref::<CoalescePartitionsExec>() {
-        if let Some(child) = coal.children().first() {
-            return (*child).clone();
-        }
-    }
-    plan.clone()
 }
 
 fn scan_has_required_q6_columns(schema: &datafusion::arrow::datatypes::SchemaRef) -> bool {
@@ -440,6 +382,264 @@ fn dferr(msg: &str) -> datafusion::error::DataFusionError {
     datafusion::error::DataFusionError::Internal(msg.into())
 }
 
+// ===== Σ.D3 phase D follow-up (B): generalised plan-shape matcher =====
+//
+// The six per-query matchers (Q1/Q3/Q5/Q6/Q12/Q14) share most of their
+// walk skeleton: optional SortMerge → Sort → Projection at the top, an
+// AggregateExec(Final*) → optional CoalescePartitions/RepartitionExec
+// → AggregateExec(Partial) stack, then optional ProjectionExec(CSE)
+// and a tail that's either a FilterExec → scan (Q1/Q6) or a join
+// chain (Q3/Q5/Q12/Q14). Only the query-specific *validation* of each
+// step differs.
+//
+// `AggregateShapeConfig` declares the structural expectations a rule
+// has on the plan tree; `match_aggregate_query_shape` does the walk
+// and returns the matched nodes + the body (post-aggregate-stack
+// plan node) for the per-rule code to inspect.
+
+/// Position of the AggregateExec(Final*) bridge. Most queries with an
+/// ORDER BY use `FinalPartitioned` (and have a hash repartition
+/// between Partial and Final); queries without ORDER BY use `Final`
+/// (and have a `CoalescePartitionsExec` instead).
+#[derive(Debug, Clone, Copy)]
+pub enum FinalAggMode {
+    /// Plain `AggregateMode::Final`, expecting a `CoalescePartitionsExec`
+    /// between it and the AggregateExec(Partial).
+    Final,
+    /// `AggregateMode::FinalPartitioned`, expecting a
+    /// `RepartitionExec(Hash([...]))` between it and the
+    /// AggregateExec(Partial).
+    FinalPartitioned,
+}
+
+/// Declarative configuration for the structural plan walk shared by
+/// the InjectFused*Rule family. Per-rule code reads
+/// [`MatchedAggregateShape`] (the result of running this config) for
+/// the matched AggregateExec nodes + body, then does query-specific
+/// validation (predicate extraction, aggregate-name checks,
+/// replacement-exec construction).
+#[derive(Debug, Clone, Copy)]
+pub struct AggregateShapeConfig {
+    /// True if we should expect (and strip) a
+    /// `SortPreservingMergeExec → SortExec` pair at the top. Queries
+    /// with `ORDER BY` set this; otherwise false.
+    pub expect_top_sort: bool,
+    /// True if we should expect (and capture) a `ProjectionExec` above
+    /// the AggregateExec(Final*). The per-rule code can then check the
+    /// output column names.
+    pub expect_top_projection: bool,
+    /// Expected aggregate-final mode (drives whether we look for a
+    /// `CoalescePartitionsExec` or a `RepartitionExec(Hash)`).
+    pub expect_final_mode: FinalAggMode,
+    /// Expected number of group-by columns at both aggregate levels.
+    pub expect_group_by_count: usize,
+    /// Expected number of aggregate expressions at both aggregate
+    /// levels.
+    pub expect_agg_count: usize,
+    /// True if we should expect (and strip) a `ProjectionExec`
+    /// between AggregateExec(Partial) and the body. This is the CSE
+    /// projection DataFusion inserts when the aggregate argument
+    /// references a common sub-expression (e.g. `extprice * (1 -
+    /// discount)`).
+    pub expect_cse_projection: bool,
+}
+
+/// Result of running [`match_aggregate_query_shape`] on a plan tree.
+/// Per-rule code reads these and does query-specific validation.
+#[derive(Debug, Clone)]
+pub struct MatchedAggregateShape {
+    /// The top ProjectionExec (if `expect_top_projection`). Per-rule
+    /// code checks the output schema's column names.
+    pub top_projection: Option<Arc<ProjectionExec>>,
+    /// The AggregateExec(Final*). Per-rule code reads `group_expr()`
+    /// and `aggr_expr()` for query-specific validation.
+    pub final_agg: Arc<AggregateExec>,
+    /// The AggregateExec(Partial).
+    pub partial_agg: Arc<AggregateExec>,
+    /// The CSE ProjectionExec (if `expect_cse_projection`). Often
+    /// holds the `__common_expr_1 = extprice * (1 - discount)`
+    /// rewrite; per-rule code rarely needs to inspect it.
+    pub cse_projection: Option<Arc<ProjectionExec>>,
+    /// The plan node below the aggregate stack. For
+    /// FusedFilterSumExec / FusedFilterMultiAggExec-shaped rules
+    /// this is typically the `FilterExec`; for FusedPostJoinExec /
+    /// FusedQ14FullExec-shaped rules this is the join chain or
+    /// projection above it.
+    pub body: Arc<dyn ExecutionPlan>,
+}
+
+/// Walk `node` top-down and try to match the structural plan shape
+/// described by `cfg`. Returns `Ok(Some(MatchedAggregateShape))` on
+/// match, `Ok(None)` if any step diverges from `cfg`. Never errors
+/// except on internal-invariant violations (children missing).
+fn match_aggregate_query_shape(
+    node: &Arc<dyn ExecutionPlan>,
+    cfg: &AggregateShapeConfig,
+) -> DfResult<Option<MatchedAggregateShape>> {
+    // Top: optional SortPreservingMergeExec.
+    let after_merge: Arc<dyn ExecutionPlan> = if cfg.expect_top_sort
+        && node
+            .as_any()
+            .downcast_ref::<SortPreservingMergeExec>()
+            .is_some()
+    {
+        match node.children().first() {
+            Some(c) => (*c).clone(),
+            None => return Ok(None),
+        }
+    } else {
+        node.clone()
+    };
+
+    // SortExec (only when expect_top_sort).
+    let after_sort: Arc<dyn ExecutionPlan> = if cfg.expect_top_sort {
+        let Some(_) = after_merge.as_any().downcast_ref::<SortExec>() else {
+            return Ok(None);
+        };
+        after_merge
+            .children()
+            .first()
+            .map(|c| (*c).clone())
+            .ok_or_else(|| dferr("shape match: SortExec missing input"))?
+    } else {
+        after_merge
+    };
+
+    // Optional top ProjectionExec.
+    let (top_projection, after_top_proj): (Option<Arc<ProjectionExec>>, Arc<dyn ExecutionPlan>) =
+        if cfg.expect_top_projection {
+            let Some(proj) = after_sort.as_any().downcast_ref::<ProjectionExec>() else {
+                return Ok(None);
+            };
+            let next = after_sort
+                .children()
+                .first()
+                .map(|c| (*c).clone())
+                .ok_or_else(|| dferr("shape match: ProjectionExec missing input"))?;
+            // We need an owned Arc<ProjectionExec> for the result struct;
+            // `downcast_ref` only gives a borrow. Rebuild by cloning.
+            let owned: Arc<ProjectionExec> = Arc::new(
+                ProjectionExec::try_new(proj.expr().to_vec(), proj.children()[0].clone())?,
+            );
+            (Some(owned), next)
+        } else {
+            (None, after_sort)
+        };
+
+    // AggregateExec(Final*).
+    let Some(final_agg_ref) = after_top_proj.as_any().downcast_ref::<AggregateExec>() else {
+        return Ok(None);
+    };
+    let mode_ok = match cfg.expect_final_mode {
+        FinalAggMode::Final => matches!(final_agg_ref.mode(), AggregateMode::Final),
+        FinalAggMode::FinalPartitioned => {
+            matches!(final_agg_ref.mode(), AggregateMode::FinalPartitioned)
+        }
+    };
+    if !mode_ok {
+        return Ok(None);
+    }
+    if final_agg_ref.group_expr().expr().len() != cfg.expect_group_by_count
+        || final_agg_ref.aggr_expr().len() != cfg.expect_agg_count
+    {
+        return Ok(None);
+    }
+    let final_agg: Arc<AggregateExec> = Arc::new(final_agg_ref.clone());
+
+    // Bridge: CoalescePartitionsExec (Final) or RepartitionExec(Hash) (FinalPartitioned).
+    let after_final: Arc<dyn ExecutionPlan> = after_top_proj
+        .children()
+        .first()
+        .map(|c| (*c).clone())
+        .ok_or_else(|| dferr("shape match: AggregateExec(Final) missing input"))?;
+    let after_bridge: Arc<dyn ExecutionPlan> = match cfg.expect_final_mode {
+        FinalAggMode::Final => {
+            // CoalescePartitionsExec may or may not be present (it's
+            // skipped when the input is already single-partition);
+            // strip it if so.
+            if after_final
+                .as_any()
+                .downcast_ref::<CoalescePartitionsExec>()
+                .is_some()
+            {
+                after_final
+                    .children()
+                    .first()
+                    .map(|c| (*c).clone())
+                    .ok_or_else(|| dferr("shape match: CoalescePartitionsExec missing input"))?
+            } else {
+                after_final
+            }
+        }
+        FinalAggMode::FinalPartitioned => {
+            // Hash repartition is required for FinalPartitioned.
+            if after_final
+                .as_any()
+                .downcast_ref::<RepartitionExec>()
+                .is_none()
+            {
+                return Ok(None);
+            }
+            after_final
+                .children()
+                .first()
+                .map(|c| (*c).clone())
+                .ok_or_else(|| dferr("shape match: RepartitionExec(Hash) missing input"))?
+        }
+    };
+
+    // AggregateExec(Partial).
+    let Some(partial_agg_ref) = after_bridge.as_any().downcast_ref::<AggregateExec>() else {
+        return Ok(None);
+    };
+    if !matches!(partial_agg_ref.mode(), AggregateMode::Partial) {
+        return Ok(None);
+    }
+    if partial_agg_ref.group_expr().expr().len() != cfg.expect_group_by_count
+        || partial_agg_ref.aggr_expr().len() != cfg.expect_agg_count
+    {
+        return Ok(None);
+    }
+    let partial_agg: Arc<AggregateExec> = Arc::new(partial_agg_ref.clone());
+
+    // Optional CSE ProjectionExec.
+    let after_partial: Arc<dyn ExecutionPlan> = after_bridge
+        .children()
+        .first()
+        .map(|c| (*c).clone())
+        .ok_or_else(|| dferr("shape match: AggregateExec(Partial) missing input"))?;
+    let (cse_projection, body): (Option<Arc<ProjectionExec>>, Arc<dyn ExecutionPlan>) =
+        if cfg.expect_cse_projection {
+            // CSE projection is sometimes elided; treat as optional even
+            // when expected. Per-rule code can re-tighten if needed.
+            match after_partial.as_any().downcast_ref::<ProjectionExec>() {
+                Some(p) => {
+                    let owned: Arc<ProjectionExec> = Arc::new(ProjectionExec::try_new(
+                        p.expr().to_vec(),
+                        p.children()[0].clone(),
+                    )?);
+                    let next = after_partial
+                        .children()
+                        .first()
+                        .map(|c| (*c).clone())
+                        .ok_or_else(|| dferr("shape match: CSE ProjectionExec missing input"))?;
+                    (Some(owned), next)
+                }
+                None => (None, after_partial),
+            }
+        } else {
+            (None, after_partial)
+        };
+
+    Ok(Some(MatchedAggregateShape {
+        top_projection,
+        final_agg,
+        partial_agg,
+        cse_projection,
+        body,
+    }))
+}
+
 /// Σ.D3 phase D (real, Q1 variant): rule that pattern-matches the
 /// DataFusion default plan shape for the TPC-H Q1 group-by query and
 /// rewrites the whole subtree to a single [`FusedFilterMultiAggExec`]
@@ -513,113 +713,32 @@ impl PhysicalOptimizerRule for InjectFusedQ1Rule {
 /// merge wraps the sort when DataFusion targets multiple partitions
 /// but the sort alone can be the root when there's only one.
 fn try_match_q1_plan(node: &Arc<dyn ExecutionPlan>) -> DfResult<Option<Arc<dyn ExecutionPlan>>> {
-    // Top: SortPreservingMergeExec (multi-partition) — strip if present.
-    let after_merge: Arc<dyn ExecutionPlan> =
-        if node.as_any().downcast_ref::<SortPreservingMergeExec>().is_some() {
-            match node.children().first() {
-                Some(c) => (*c).clone(),
-                None => return Ok(None),
-            }
-        } else {
-            node.clone()
-        };
-
-    // Next: SortExec (sort by [l_returnflag, l_linestatus]).
-    let Some(_sort) = after_merge.as_any().downcast_ref::<SortExec>() else {
+    const CFG: AggregateShapeConfig = AggregateShapeConfig {
+        expect_top_sort: true,
+        expect_top_projection: true,
+        expect_final_mode: FinalAggMode::FinalPartitioned,
+        expect_group_by_count: 2,
+        expect_agg_count: 8,
+        expect_cse_projection: true,
+    };
+    let Some(shape) = match_aggregate_query_shape(node, &CFG)? else {
         return Ok(None);
     };
-
-    // Down: ProjectionExec that renames sum/avg/count to the q1
-    // output column names. We don't fully validate the rename
-    // exprs — instead we check the output schema names match q1.
-    let after_sort: Arc<dyn ExecutionPlan> = after_merge
-        .children()
-        .first()
-        .map(|c| (*c).clone())
-        .ok_or_else(|| dferr("Q1 match: SortExec missing input"))?;
-    let Some(top_proj) = after_sort.as_any().downcast_ref::<ProjectionExec>() else {
-        return Ok(None);
-    };
+    let top_proj = shape.top_projection.as_ref().expect("config requires top projection");
     if !projection_emits_q1_select_list(top_proj.schema().as_ref()) {
         return Ok(None);
     }
-
-    // Down: AggregateExec(FinalPartitioned), gby=[returnflag, linestatus].
-    let after_proj: Arc<dyn ExecutionPlan> = top_proj
-        .children()
-        .first()
-        .map(|c| (*c).clone())
-        .ok_or_else(|| dferr("Q1 match: top ProjectionExec missing input"))?;
-    let Some(agg_final) = after_proj.as_any().downcast_ref::<AggregateExec>() else {
-        return Ok(None);
-    };
-    if !matches!(agg_final.mode(), AggregateMode::FinalPartitioned) {
-        return Ok(None);
-    }
-    if !group_by_is_returnflag_linestatus(agg_final) {
-        return Ok(None);
-    }
-    if agg_final.aggr_expr().len() != 8 {
-        return Ok(None);
-    }
-
-    // Down: RepartitionExec(Hash([returnflag, linestatus])).
-    let after_final_agg: Arc<dyn ExecutionPlan> = agg_final
-        .children()
-        .first()
-        .map(|c| (*c).clone())
-        .ok_or_else(|| dferr("Q1 match: AggregateExec(Final) missing input"))?;
-    let Some(_repart) = after_final_agg.as_any().downcast_ref::<RepartitionExec>() else {
-        return Ok(None);
-    };
-
-    // Down: AggregateExec(Partial), same gby + 8 aggs.
-    let after_repart: Arc<dyn ExecutionPlan> = after_final_agg
-        .children()
-        .first()
-        .map(|c| (*c).clone())
-        .ok_or_else(|| dferr("Q1 match: shuffle RepartitionExec missing input"))?;
-    let Some(agg_partial) = after_repart.as_any().downcast_ref::<AggregateExec>() else {
-        return Ok(None);
-    };
-    if !matches!(agg_partial.mode(), AggregateMode::Partial) {
-        return Ok(None);
-    }
-    if !group_by_is_returnflag_linestatus(agg_partial) {
-        return Ok(None);
-    }
-    if agg_partial.aggr_expr().len() != 8 {
-        return Ok(None);
-    }
-
-    // Down: ProjectionExec (CSE: extprice * (1 - discount)). Some
-    // DataFusion versions skip it; treat as optional.
-    let after_partial: Arc<dyn ExecutionPlan> = agg_partial
-        .children()
-        .first()
-        .map(|c| (*c).clone())
-        .ok_or_else(|| dferr("Q1 match: AggregateExec(Partial) missing input"))?;
-    let after_cse: Arc<dyn ExecutionPlan> = match after_partial
-        .as_any()
-        .downcast_ref::<ProjectionExec>()
+    if !group_by_is_returnflag_linestatus(&shape.final_agg)
+        || !group_by_is_returnflag_linestatus(&shape.partial_agg)
     {
-        Some(_) => after_partial
-            .children()
-            .first()
-            .map(|c| (*c).clone())
-            .ok_or_else(|| dferr("Q1 match: inner ProjectionExec missing input"))?,
-        None => after_partial,
-    };
-
-    // Down: FilterExec with a single `l_shipdate <op> Date32` predicate.
-    let Some(filter) = after_cse.as_any().downcast_ref::<FilterExec>() else {
+        return Ok(None);
+    }
+    let Some(filter) = shape.body.as_any().downcast_ref::<FilterExec>() else {
         return Ok(None);
     };
     let Some(predicate) = extract_q1_predicate(filter.predicate()) else {
         return Ok(None);
     };
-
-    // Walk down to the scan: strip optional Repartition / CoalesceBatches.
     let mut scan: Arc<dyn ExecutionPlan> = filter
         .children()
         .first()
@@ -638,7 +757,6 @@ fn try_match_q1_plan(node: &Arc<dyn ExecutionPlan>) -> DfResult<Option<Arc<dyn E
             return Ok(None);
         }
     }
-
     let fused = FusedFilterMultiAggExec::try_new_q1_jit(scan, predicate)?;
     Ok(Some(Arc::new(fused) as Arc<dyn ExecutionPlan>))
 }
@@ -829,75 +947,27 @@ impl PhysicalOptimizerRule for InjectFusedQ14Rule {
 }
 
 fn try_match_q14_plan(node: &Arc<dyn ExecutionPlan>) -> DfResult<Option<Arc<dyn ExecutionPlan>>> {
-    // Top: ProjectionExec emitting a single column named "promo_revenue".
-    let Some(proj) = node.as_any().downcast_ref::<ProjectionExec>() else {
+    const CFG: AggregateShapeConfig = AggregateShapeConfig {
+        expect_top_sort: false,
+        expect_top_projection: true,
+        expect_final_mode: FinalAggMode::Final,
+        expect_group_by_count: 0,
+        expect_agg_count: 2,
+        expect_cse_projection: true,
+    };
+    let Some(shape) = match_aggregate_query_shape(node, &CFG)? else {
         return Ok(None);
     };
-    if proj.expr().len() != 1 || proj.schema().field(0).name() != "promo_revenue" {
+    let proj = shape.top_projection.as_ref().expect("config requires top projection");
+    if proj.schema().field(0).name() != "promo_revenue" {
         return Ok(None);
     }
-
-    // Down: AggregateExec(Final, no group-by, 2 SUMs).
-    let after_proj: Arc<dyn ExecutionPlan> = proj
-        .children()
-        .first()
-        .map(|c| (*c).clone())
-        .ok_or_else(|| dferr("Q14 match: top ProjectionExec missing input"))?;
-    let Some(agg_final) = after_proj.as_any().downcast_ref::<AggregateExec>() else {
-        return Ok(None);
-    };
-    if !matches!(agg_final.mode(), AggregateMode::Final) {
-        return Ok(None);
-    }
-    if !agg_final.group_expr().is_empty() || agg_final.aggr_expr().len() != 2 {
-        return Ok(None);
-    }
-    if !both_are_sum(agg_final.aggr_expr()) {
-        return Ok(None);
-    }
-
-    // Down: CoalescePartitionsExec (optional but expected for the
-    // Final → Partial bridge).
-    let after_final: Arc<dyn ExecutionPlan> = agg_final
-        .children()
-        .first()
-        .map(|c| (*c).clone())
-        .ok_or_else(|| dferr("Q14 match: AggregateExec(Final) missing input"))?;
-    let after_coalesce = strip_optional_coalesce(&after_final);
-
-    // Down: AggregateExec(Partial, no group-by, 2 SUMs).
-    let Some(agg_partial) = after_coalesce.as_any().downcast_ref::<AggregateExec>() else {
-        return Ok(None);
-    };
-    if !matches!(agg_partial.mode(), AggregateMode::Partial) {
-        return Ok(None);
-    }
-    if !agg_partial.group_expr().is_empty() || agg_partial.aggr_expr().len() != 2 {
-        return Ok(None);
-    }
-    if !both_are_sum(agg_partial.aggr_expr()) {
-        return Ok(None);
-    }
-
-    // Down: optional ProjectionExec (CSE for extprice * (1 - discount)).
-    let after_partial: Arc<dyn ExecutionPlan> = agg_partial
-        .children()
-        .first()
-        .map(|c| (*c).clone())
-        .ok_or_else(|| dferr("Q14 match: AggregateExec(Partial) missing input"))?;
-    let after_cse: Arc<dyn ExecutionPlan> = match after_partial
-        .as_any()
-        .downcast_ref::<ProjectionExec>()
+    if !both_are_sum(shape.final_agg.aggr_expr())
+        || !both_are_sum(shape.partial_agg.aggr_expr())
     {
-        Some(_) => after_partial
-            .children()
-            .first()
-            .map(|c| (*c).clone())
-            .ok_or_else(|| dferr("Q14 match: inner ProjectionExec missing input"))?,
-        None => after_partial,
-    };
-
-    // Down: HashJoinExec(Inner, on=[(part_key, lineitem_key)]).
+        return Ok(None);
+    }
+    let after_cse: Arc<dyn ExecutionPlan> = shape.body;
     let Some(join) = after_cse.as_any().downcast_ref::<HashJoinExec>() else {
         return Ok(None);
     };
@@ -1098,88 +1168,33 @@ impl PhysicalOptimizerRule for InjectFusedQ3Rule {
 }
 
 fn try_match_q3_plan(node: &Arc<dyn ExecutionPlan>) -> DfResult<Option<Arc<dyn ExecutionPlan>>> {
-    // Top: SortPreservingMergeExec (optional).
-    let after_merge: Arc<dyn ExecutionPlan> =
-        if node.as_any().downcast_ref::<SortPreservingMergeExec>().is_some() {
-            match node.children().first() {
-                Some(c) => (*c).clone(),
-                None => return Ok(None),
-            }
-        } else {
-            node.clone()
-        };
-    // SortExec (required: ORDER BY revenue desc, o_orderdate).
-    let Some(_sort) = after_merge.as_any().downcast_ref::<SortExec>() else {
+    const CFG: AggregateShapeConfig = AggregateShapeConfig {
+        expect_top_sort: true,
+        expect_top_projection: true,
+        expect_final_mode: FinalAggMode::FinalPartitioned,
+        expect_group_by_count: 3,
+        expect_agg_count: 1,
+        expect_cse_projection: false,
+    };
+    let Some(shape) = match_aggregate_query_shape(node, &CFG)? else {
         return Ok(None);
     };
-    let after_sort: Arc<dyn ExecutionPlan> = after_merge
-        .children()
-        .first()
-        .map(|c| (*c).clone())
-        .ok_or_else(|| dferr("Q3 match: SortExec missing input"))?;
-    // ProjectionExec emitting Q3's SELECT-list shape.
-    let Some(proj) = after_sort.as_any().downcast_ref::<ProjectionExec>() else {
-        return Ok(None);
-    };
+    let proj = shape.top_projection.as_ref().expect("config requires top projection");
     if !projection_emits_q3_select_list(proj.schema().as_ref()) {
         return Ok(None);
     }
-    let after_proj: Arc<dyn ExecutionPlan> = proj
-        .children()
-        .first()
-        .map(|c| (*c).clone())
-        .ok_or_else(|| dferr("Q3 match: ProjectionExec missing input"))?;
-    // AggregateExec(FinalPartitioned, gby=[orderkey, orderdate, shippriority], 1 SUM).
-    let Some(agg_final) = after_proj.as_any().downcast_ref::<AggregateExec>() else {
-        return Ok(None);
-    };
-    if !matches!(agg_final.mode(), AggregateMode::FinalPartitioned) {
+    if !group_by_is_q3_keys(&shape.final_agg)
+        || !group_by_is_q3_keys(&shape.partial_agg)
+    {
         return Ok(None);
     }
-    if !group_by_is_q3_keys(agg_final) || agg_final.aggr_expr().len() != 1 {
+    if !is_sum_extprice_times_one_minus_discount(&shape.final_agg.aggr_expr()[0]) {
         return Ok(None);
     }
-    if !is_sum_extprice_times_one_minus_discount(&agg_final.aggr_expr()[0]) {
+    if !post_join_has_q3_columns(&shape.body.schema()) {
         return Ok(None);
     }
-    // RepartitionExec(Hash) and AggregateExec(Partial).
-    let after_final: Arc<dyn ExecutionPlan> = agg_final
-        .children()
-        .first()
-        .map(|c| (*c).clone())
-        .ok_or_else(|| dferr("Q3 match: AggregateExec(Final) missing input"))?;
-    let Some(_repart) = after_final.as_any().downcast_ref::<RepartitionExec>() else {
-        return Ok(None);
-    };
-    let after_repart: Arc<dyn ExecutionPlan> = after_final
-        .children()
-        .first()
-        .map(|c| (*c).clone())
-        .ok_or_else(|| dferr("Q3 match: RepartitionExec(Hash) missing input"))?;
-    let Some(agg_partial) = after_repart.as_any().downcast_ref::<AggregateExec>() else {
-        return Ok(None);
-    };
-    if !matches!(agg_partial.mode(), AggregateMode::Partial) {
-        return Ok(None);
-    }
-    if !group_by_is_q3_keys(agg_partial) || agg_partial.aggr_expr().len() != 1 {
-        return Ok(None);
-    }
-    // Below AggregateExec(Partial) is the join output. FusedPostJoinExec
-    // validates its child schema by column name, so we pass the join
-    // output directly. Any wrappers (RepartitionExec / CoalescePartitions)
-    // are fine — the fused exec drains its input regardless of partition
-    // shape.
-    let join_output: Arc<dyn ExecutionPlan> = agg_partial
-        .children()
-        .first()
-        .map(|c| (*c).clone())
-        .ok_or_else(|| dferr("Q3 match: AggregateExec(Partial) missing input"))?;
-    // Verify the join output exposes Q3's required columns.
-    if !post_join_has_q3_columns(&join_output.schema()) {
-        return Ok(None);
-    }
-    let fused = FusedPostJoinExec::try_new(join_output, FusedPostJoinSpec::Q3)?;
+    let fused = FusedPostJoinExec::try_new(shape.body, FusedPostJoinSpec::Q3)?;
     Ok(Some(Arc::new(fused) as Arc<dyn ExecutionPlan>))
 }
 
@@ -1297,77 +1312,31 @@ impl PhysicalOptimizerRule for InjectFusedQ5Rule {
 }
 
 fn try_match_q5_plan(node: &Arc<dyn ExecutionPlan>) -> DfResult<Option<Arc<dyn ExecutionPlan>>> {
-    let after_merge: Arc<dyn ExecutionPlan> =
-        if node.as_any().downcast_ref::<SortPreservingMergeExec>().is_some() {
-            match node.children().first() {
-                Some(c) => (*c).clone(),
-                None => return Ok(None),
-            }
-        } else {
-            node.clone()
-        };
-    let Some(_sort) = after_merge.as_any().downcast_ref::<SortExec>() else {
+    const CFG: AggregateShapeConfig = AggregateShapeConfig {
+        expect_top_sort: true,
+        expect_top_projection: true,
+        expect_final_mode: FinalAggMode::FinalPartitioned,
+        expect_group_by_count: 1,
+        expect_agg_count: 1,
+        expect_cse_projection: false,
+    };
+    let Some(shape) = match_aggregate_query_shape(node, &CFG)? else {
         return Ok(None);
     };
-    let after_sort: Arc<dyn ExecutionPlan> = after_merge
-        .children()
-        .first()
-        .map(|c| (*c).clone())
-        .ok_or_else(|| dferr("Q5 match: SortExec missing input"))?;
-    let Some(proj) = after_sort.as_any().downcast_ref::<ProjectionExec>() else {
-        return Ok(None);
-    };
+    let proj = shape.top_projection.as_ref().expect("config requires top projection");
     if !projection_emits_q5_select_list(proj.schema().as_ref()) {
         return Ok(None);
     }
-    let after_proj: Arc<dyn ExecutionPlan> = proj
-        .children()
-        .first()
-        .map(|c| (*c).clone())
-        .ok_or_else(|| dferr("Q5 match: ProjectionExec missing input"))?;
-    let Some(agg_final) = after_proj.as_any().downcast_ref::<AggregateExec>() else {
-        return Ok(None);
-    };
-    if !matches!(agg_final.mode(), AggregateMode::FinalPartitioned) {
+    if !group_by_is_q5_keys(&shape.final_agg) || !group_by_is_q5_keys(&shape.partial_agg) {
         return Ok(None);
     }
-    if !group_by_is_q5_keys(agg_final) || agg_final.aggr_expr().len() != 1 {
+    if !is_sum_extprice_times_one_minus_discount(&shape.final_agg.aggr_expr()[0]) {
         return Ok(None);
     }
-    if !is_sum_extprice_times_one_minus_discount(&agg_final.aggr_expr()[0]) {
+    if !post_join_has_q5_columns(&shape.body.schema()) {
         return Ok(None);
     }
-    let after_final: Arc<dyn ExecutionPlan> = agg_final
-        .children()
-        .first()
-        .map(|c| (*c).clone())
-        .ok_or_else(|| dferr("Q5 match: AggregateExec(Final) missing input"))?;
-    let Some(_repart) = after_final.as_any().downcast_ref::<RepartitionExec>() else {
-        return Ok(None);
-    };
-    let after_repart: Arc<dyn ExecutionPlan> = after_final
-        .children()
-        .first()
-        .map(|c| (*c).clone())
-        .ok_or_else(|| dferr("Q5 match: RepartitionExec(Hash) missing input"))?;
-    let Some(agg_partial) = after_repart.as_any().downcast_ref::<AggregateExec>() else {
-        return Ok(None);
-    };
-    if !matches!(agg_partial.mode(), AggregateMode::Partial) {
-        return Ok(None);
-    }
-    if !group_by_is_q5_keys(agg_partial) || agg_partial.aggr_expr().len() != 1 {
-        return Ok(None);
-    }
-    let join_output: Arc<dyn ExecutionPlan> = agg_partial
-        .children()
-        .first()
-        .map(|c| (*c).clone())
-        .ok_or_else(|| dferr("Q5 match: AggregateExec(Partial) missing input"))?;
-    if !post_join_has_q5_columns(&join_output.schema()) {
-        return Ok(None);
-    }
-    let fused = FusedPostJoinExec::try_new(join_output, FusedPostJoinSpec::Q5)?;
+    let fused = FusedPostJoinExec::try_new(shape.body, FusedPostJoinSpec::Q5)?;
     Ok(Some(Arc::new(fused) as Arc<dyn ExecutionPlan>))
 }
 
@@ -1448,79 +1417,33 @@ impl PhysicalOptimizerRule for InjectFusedQ12Rule {
 }
 
 fn try_match_q12_plan(node: &Arc<dyn ExecutionPlan>) -> DfResult<Option<Arc<dyn ExecutionPlan>>> {
-    let after_merge: Arc<dyn ExecutionPlan> =
-        if node.as_any().downcast_ref::<SortPreservingMergeExec>().is_some() {
-            match node.children().first() {
-                Some(c) => (*c).clone(),
-                None => return Ok(None),
-            }
-        } else {
-            node.clone()
-        };
-    let Some(_sort) = after_merge.as_any().downcast_ref::<SortExec>() else {
+    const CFG: AggregateShapeConfig = AggregateShapeConfig {
+        expect_top_sort: true,
+        expect_top_projection: true,
+        expect_final_mode: FinalAggMode::FinalPartitioned,
+        expect_group_by_count: 1,
+        expect_agg_count: 2,
+        expect_cse_projection: false,
+    };
+    let Some(shape) = match_aggregate_query_shape(node, &CFG)? else {
         return Ok(None);
     };
-    let after_sort: Arc<dyn ExecutionPlan> = after_merge
-        .children()
-        .first()
-        .map(|c| (*c).clone())
-        .ok_or_else(|| dferr("Q12 match: SortExec missing input"))?;
-    let Some(proj) = after_sort.as_any().downcast_ref::<ProjectionExec>() else {
-        return Ok(None);
-    };
+    let proj = shape.top_projection.as_ref().expect("config requires top projection");
     if !projection_emits_q12_select_list(proj.schema().as_ref()) {
         return Ok(None);
     }
-    let after_proj: Arc<dyn ExecutionPlan> = proj
-        .children()
-        .first()
-        .map(|c| (*c).clone())
-        .ok_or_else(|| dferr("Q12 match: top ProjectionExec missing input"))?;
-    let Some(agg_final) = after_proj.as_any().downcast_ref::<AggregateExec>() else {
-        return Ok(None);
-    };
-    if !matches!(agg_final.mode(), AggregateMode::FinalPartitioned) {
+    if !group_by_is_l_shipmode(&shape.final_agg)
+        || !group_by_is_l_shipmode(&shape.partial_agg)
+    {
         return Ok(None);
     }
-    if !group_by_is_l_shipmode(agg_final) || agg_final.aggr_expr().len() != 2 {
+    if !both_are_sum(shape.final_agg.aggr_expr()) {
         return Ok(None);
     }
-    if !both_are_sum(agg_final.aggr_expr()) {
+    if !post_join_has_q12_columns(&shape.body.schema()) {
         return Ok(None);
     }
-    let after_final: Arc<dyn ExecutionPlan> = agg_final
-        .children()
-        .first()
-        .map(|c| (*c).clone())
-        .ok_or_else(|| dferr("Q12 match: AggregateExec(Final) missing input"))?;
-    let Some(_repart) = after_final.as_any().downcast_ref::<RepartitionExec>() else {
-        return Ok(None);
-    };
-    let after_repart: Arc<dyn ExecutionPlan> = after_final
-        .children()
-        .first()
-        .map(|c| (*c).clone())
-        .ok_or_else(|| dferr("Q12 match: RepartitionExec(Hash) missing input"))?;
-    let Some(agg_partial) = after_repart.as_any().downcast_ref::<AggregateExec>() else {
-        return Ok(None);
-    };
-    if !matches!(agg_partial.mode(), AggregateMode::Partial) {
-        return Ok(None);
-    }
-    if !group_by_is_l_shipmode(agg_partial) || agg_partial.aggr_expr().len() != 2 {
-        return Ok(None);
-    }
-    let join_output: Arc<dyn ExecutionPlan> = agg_partial
-        .children()
-        .first()
-        .map(|c| (*c).clone())
-        .ok_or_else(|| dferr("Q12 match: AggregateExec(Partial) missing input"))?;
-    // The fused exec's schema check requires (l_shipmode, o_orderpriority)
-    // — DataFusion's plan includes both in the post-join projection.
-    if !post_join_has_q12_columns(&join_output.schema()) {
-        return Ok(None);
-    }
-    let fused = FusedPostJoinExec::try_new(join_output, FusedPostJoinSpec::Q12)?;
+    let fused = FusedPostJoinExec::try_new(shape.body, FusedPostJoinSpec::Q12)?;
     Ok(Some(Arc::new(fused) as Arc<dyn ExecutionPlan>))
 }
 
