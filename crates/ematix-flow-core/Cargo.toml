@@ -228,3 +228,14 @@ path = "examples/tpch_q3q5_plan_dump.rs"
 name = "tpch_q3q5_inject_bench"
 path = "examples/tpch_q3q5_inject_bench.rs"
 
+# Σ.D3 phase D (Q12): dump canonical Q12 plan shape (join + complex
+# filter + 2-group hash agg with CASE-WHEN over o_orderpriority).
+[[example]]
+name = "tpch_q12_plan_dump"
+path = "examples/tpch_q12_plan_dump.rs"
+
+# Σ.D3 phase D (Q12): bench Q12 with and without InjectFusedQ12Rule.
+[[example]]
+name = "tpch_q12_inject_bench"
+path = "examples/tpch_q12_inject_bench.rs"
+

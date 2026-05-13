@@ -1409,6 +1409,158 @@ fn post_join_has_q5_columns(schema: &datafusion::arrow::datatypes::SchemaRef) ->
         && has("l_discount", &[DataType::Float64])
 }
 
+/// Σ.D3 phase D (Q12): pattern-match TPC-H Q12's plan
+/// (SortMerge → Sort → Projection → Aggregate(FinalPartitioned,
+/// gby=[l_shipmode], 2 SUM(CASE-WHEN ...) aggregates) → Repartition(Hash)
+/// → Aggregate(Partial) → Projection → HashJoin(lineitem ⋈ orders) →
+/// {Filter(shipmode IN, dates) → lineitem, orders}) and replace the
+/// aggregate stack with `FusedPostJoinExec(spec=Q12)` over the join
+/// output. The join chain itself is preserved; the fused exec just
+/// substitutes the hash-aggregate stack with a hard-coded 2-bucket
+/// (MAIL/SHIP) counter that does 1-byte-prefix checks on
+/// `o_orderpriority`.
+#[derive(Debug, Default)]
+pub struct InjectFusedQ12Rule;
+
+impl PhysicalOptimizerRule for InjectFusedQ12Rule {
+    fn optimize(
+        &self,
+        plan: Arc<dyn ExecutionPlan>,
+        _config: &ConfigOptions,
+    ) -> DfResult<Arc<dyn ExecutionPlan>> {
+        let result = plan.transform_down(|node| {
+            if let Some(new) = try_match_q12_plan(&node)? {
+                Ok(Transformed::yes(new))
+            } else {
+                Ok(Transformed::no(node))
+            }
+        })?;
+        Ok(result.data)
+    }
+    fn name(&self) -> &str {
+        "ematix_flow_inject_fused_q12"
+    }
+    fn schema_check(&self) -> bool {
+        // Fused exec emits Utf8 / Int64; planner emits Utf8View / Int64
+        // (nullable). Metadata-only drift; SQL test pins cell-by-cell.
+        false
+    }
+}
+
+fn try_match_q12_plan(node: &Arc<dyn ExecutionPlan>) -> DfResult<Option<Arc<dyn ExecutionPlan>>> {
+    let after_merge: Arc<dyn ExecutionPlan> =
+        if node.as_any().downcast_ref::<SortPreservingMergeExec>().is_some() {
+            match node.children().first() {
+                Some(c) => (*c).clone(),
+                None => return Ok(None),
+            }
+        } else {
+            node.clone()
+        };
+    let Some(_sort) = after_merge.as_any().downcast_ref::<SortExec>() else {
+        return Ok(None);
+    };
+    let after_sort: Arc<dyn ExecutionPlan> = after_merge
+        .children()
+        .first()
+        .map(|c| (*c).clone())
+        .ok_or_else(|| dferr("Q12 match: SortExec missing input"))?;
+    let Some(proj) = after_sort.as_any().downcast_ref::<ProjectionExec>() else {
+        return Ok(None);
+    };
+    if !projection_emits_q12_select_list(proj.schema().as_ref()) {
+        return Ok(None);
+    }
+    let after_proj: Arc<dyn ExecutionPlan> = proj
+        .children()
+        .first()
+        .map(|c| (*c).clone())
+        .ok_or_else(|| dferr("Q12 match: top ProjectionExec missing input"))?;
+    let Some(agg_final) = after_proj.as_any().downcast_ref::<AggregateExec>() else {
+        return Ok(None);
+    };
+    if !matches!(agg_final.mode(), AggregateMode::FinalPartitioned) {
+        return Ok(None);
+    }
+    if !group_by_is_l_shipmode(agg_final) || agg_final.aggr_expr().len() != 2 {
+        return Ok(None);
+    }
+    if !both_are_sum(agg_final.aggr_expr()) {
+        return Ok(None);
+    }
+    let after_final: Arc<dyn ExecutionPlan> = agg_final
+        .children()
+        .first()
+        .map(|c| (*c).clone())
+        .ok_or_else(|| dferr("Q12 match: AggregateExec(Final) missing input"))?;
+    let Some(_repart) = after_final.as_any().downcast_ref::<RepartitionExec>() else {
+        return Ok(None);
+    };
+    let after_repart: Arc<dyn ExecutionPlan> = after_final
+        .children()
+        .first()
+        .map(|c| (*c).clone())
+        .ok_or_else(|| dferr("Q12 match: RepartitionExec(Hash) missing input"))?;
+    let Some(agg_partial) = after_repart.as_any().downcast_ref::<AggregateExec>() else {
+        return Ok(None);
+    };
+    if !matches!(agg_partial.mode(), AggregateMode::Partial) {
+        return Ok(None);
+    }
+    if !group_by_is_l_shipmode(agg_partial) || agg_partial.aggr_expr().len() != 2 {
+        return Ok(None);
+    }
+    let join_output: Arc<dyn ExecutionPlan> = agg_partial
+        .children()
+        .first()
+        .map(|c| (*c).clone())
+        .ok_or_else(|| dferr("Q12 match: AggregateExec(Partial) missing input"))?;
+    // The fused exec's schema check requires (l_shipmode, o_orderpriority)
+    // — DataFusion's plan includes both in the post-join projection.
+    if !post_join_has_q12_columns(&join_output.schema()) {
+        return Ok(None);
+    }
+    let fused = FusedPostJoinExec::try_new(join_output, FusedPostJoinSpec::Q12)?;
+    Ok(Some(Arc::new(fused) as Arc<dyn ExecutionPlan>))
+}
+
+fn projection_emits_q12_select_list(schema: &datafusion::arrow::datatypes::Schema) -> bool {
+    let expected = ["l_shipmode", "high_line_count", "low_line_count"];
+    if schema.fields().len() != expected.len() {
+        return false;
+    }
+    schema
+        .fields()
+        .iter()
+        .zip(expected.iter())
+        .all(|(f, n)| f.name() == n)
+}
+
+fn group_by_is_l_shipmode(agg: &AggregateExec) -> bool {
+    let exprs = agg.group_expr().expr();
+    if exprs.len() != 1 {
+        return false;
+    }
+    exprs[0]
+        .0
+        .as_any()
+        .downcast_ref::<Column>()
+        .map(|c| c.name() == "l_shipmode")
+        .unwrap_or(false)
+}
+
+fn post_join_has_q12_columns(schema: &datafusion::arrow::datatypes::SchemaRef) -> bool {
+    use datafusion::arrow::datatypes::DataType;
+    schema
+        .field_with_name("l_shipmode")
+        .map(|f| f.data_type() == &DataType::Utf8View)
+        .unwrap_or(false)
+        && schema
+            .field_with_name("o_orderpriority")
+            .map(|f| f.data_type() == &DataType::Utf8View)
+            .unwrap_or(false)
+}
+
 /// Extract a Q14 `l_shipdate ∈ [V_lo, V_hi)` predicate from an
 /// AND-chain. Tolerates the conditions in either order.
 fn extract_q14_predicate(expr: &Arc<dyn PhysicalExpr>) -> Option<Q14Predicate> {
@@ -2159,6 +2311,97 @@ mod tests {
         }
         // Sanity-check the group keys match too (l_orderkey int64, dates).
         let _ = bw.column(0).as_primitive_opt::<datafusion::arrow::datatypes::Int64Type>();
+    }
+
+    // ----- InjectFusedQ12Rule tests -----
+
+    const Q12_SQL: &str = "
+        SELECT l_shipmode,
+            sum(case when o_orderpriority = '1-URGENT' OR o_orderpriority = '2-HIGH'
+                     then 1 else 0 end) AS high_line_count,
+            sum(case when o_orderpriority <> '1-URGENT' AND o_orderpriority <> '2-HIGH'
+                     then 1 else 0 end) AS low_line_count
+        FROM orders, lineitem
+        WHERE o_orderkey = l_orderkey
+          AND l_shipmode IN ('MAIL', 'SHIP')
+          AND l_commitdate < l_receiptdate
+          AND l_shipdate < l_commitdate
+          AND l_receiptdate >= DATE '1994-01-01'
+          AND l_receiptdate <  DATE '1995-01-01'
+        GROUP BY l_shipmode
+        ORDER BY l_shipmode
+    ";
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn inject_q12_rule_rewrites_real_plan_and_preserves_result() {
+        use datafusion::arrow::array::{AsArray, Int64Array};
+        use datafusion::physical_plan::displayable;
+        let Some(ctx_with) = ctx_for_q35(Some(InjectFusedQ12Rule)).await else {
+            eprintln!("TPC-H SF=1 data not generated; skipping test");
+            return;
+        };
+        let ctx_without: SessionContext = ctx_for_q35::<EnableFusedJitRule>(None).await.unwrap();
+
+        let plan = ctx_with.sql(Q12_SQL).await.unwrap().create_physical_plan().await.unwrap();
+        let plan_str = displayable(plan.as_ref()).indent(true).to_string();
+        assert!(
+            plan_str.contains("FusedPostJoinExec"),
+            "InjectFusedQ12Rule did not fire.\nPlan:\n{plan_str}"
+        );
+
+        let r_with = ctx_with.sql(Q12_SQL).await.unwrap().collect().await.unwrap();
+        let r_without = ctx_without.sql(Q12_SQL).await.unwrap().collect().await.unwrap();
+        let bw = datafusion::arrow::compute::concat_batches(&r_with[0].schema(), &r_with).unwrap();
+        let bo = datafusion::arrow::compute::concat_batches(&r_without[0].schema(), &r_without).unwrap();
+        assert_eq!(bw.num_rows(), bo.num_rows(), "row count");
+        assert_eq!(bw.num_rows(), 2, "Q12 SF=1 yields 2 groups (MAIL/SHIP)");
+
+        // String key comparison handles Utf8 vs Utf8View.
+        let read_name = |arr: &dyn datafusion::arrow::array::Array, i: usize| -> String {
+            if let Some(s) = arr.as_string_opt::<i32>() {
+                s.value(i).to_string()
+            } else if let Some(s) = arr.as_string_view_opt() {
+                s.value(i).to_string()
+            } else {
+                panic!("unexpected string variant")
+            }
+        };
+        for r in 0..bw.num_rows() {
+            assert_eq!(
+                read_name(bw.column(0).as_ref(), r),
+                read_name(bo.column(0).as_ref(), r),
+                "shipmode row {r}"
+            );
+            let w_high = bw.column(1).as_any().downcast_ref::<Int64Array>().unwrap().value(r);
+            let o_high = bo.column(1).as_any().downcast_ref::<Int64Array>().unwrap().value(r);
+            assert_eq!(w_high, o_high, "high_line_count row {r}");
+            let w_low = bw.column(2).as_any().downcast_ref::<Int64Array>().unwrap().value(r);
+            let o_low = bo.column(2).as_any().downcast_ref::<Int64Array>().unwrap().value(r);
+            assert_eq!(w_low, o_low, "low_line_count row {r}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn inject_q12_rule_does_not_fire_on_unrelated_query() {
+        use datafusion::physical_plan::displayable;
+        let Some(ctx) = ctx_for_q35(Some(InjectFusedQ12Rule)).await else {
+            eprintln!("TPC-H SF=1 data not generated; skipping test");
+            return;
+        };
+        // Group key matches Q12's `l_shipmode` but only COUNT(*) — not the
+        // 2-SUM-with-CASE-WHEN shape Q12 is.
+        let plan = ctx
+            .sql("SELECT l_shipmode, count(*) FROM lineitem GROUP BY l_shipmode")
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+        let plan_str = displayable(plan.as_ref()).indent(true).to_string();
+        assert!(
+            !plan_str.contains("FusedPostJoinExec"),
+            "InjectFusedQ12Rule wrongly fired:\n{plan_str}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

@@ -61,6 +61,12 @@ pub enum FusedPostJoinSpec {
     /// l_discount: Float64)`. No group-by, dual SUM (one CASE-WHEN guarded).
     /// Output: 1-col single-row batch with the `promo_revenue` ratio.
     Q14,
+    /// TPC-H Q12 shape: child is `(l_shipmode: Utf8View, o_orderpriority:
+    /// Utf8View)`. Small-cardinality group-by (2 values: MAIL/SHIP) +
+    /// two CASE-WHEN-counted aggregates over o_orderpriority. Output:
+    /// 3-col 2-row batch (l_shipmode, high_line_count, low_line_count)
+    /// sorted by l_shipmode.
+    Q12,
 }
 
 #[derive(Debug)]
@@ -153,6 +159,11 @@ fn output_schema(spec: FusedPostJoinSpec) -> SchemaRef {
             DataType::Float64,
             false,
         )])),
+        FusedPostJoinSpec::Q12 => Arc::new(Schema::new(vec![
+            Field::new("l_shipmode", DataType::Utf8, false),
+            Field::new("high_line_count", DataType::Int64, false),
+            Field::new("low_line_count", DataType::Int64, false),
+        ])),
     }
 }
 
@@ -174,6 +185,10 @@ fn validate_input_schema(schema: &SchemaRef, spec: FusedPostJoinSpec) -> DfResul
             ("p_type", DataType::Utf8View),
             ("l_extendedprice", DataType::Float64),
             ("l_discount", DataType::Float64),
+        ],
+        FusedPostJoinSpec::Q12 => &[
+            ("l_shipmode", DataType::Utf8View),
+            ("o_orderpriority", DataType::Utf8View),
         ],
     };
     for (name, expected) in required {
@@ -333,6 +348,36 @@ impl ExecutionPlan for FusedPostJoinExec {
                     }
                     emit_q5(schema_for_batch, merged)
                 }
+                FusedPostJoinSpec::Q12 => {
+                    let mut handles = Vec::with_capacity(input_partitions);
+                    for p in 0..input_partitions {
+                        let mut s = input.execute(p, context.clone())?;
+                        handles.push(tokio::spawn(async move {
+                            // Q12 buckets: 0 = MAIL, 1 = SHIP, 2 = catch-all
+                            // (should always stay empty per the SQL filter
+                            // `l_shipmode IN ('MAIL','SHIP')`, but kept so
+                            // adversarial data doesn't panic).
+                            let mut bins: [Q12Bin; 3] = [Q12Bin::default(); 3];
+                            while let Some(batch) = s.try_next().await? {
+                                accumulate_q12_batch(&batch, &mut bins)?;
+                            }
+                            Ok::<_, DataFusionError>(bins)
+                        }));
+                    }
+                    let mut merged: [Q12Bin; 3] = [Q12Bin::default(); 3];
+                    for h in handles {
+                        let partial = h.await.map_err(|e| {
+                            DataFusionError::Execution(format!(
+                                "FusedPostJoinExec(Q12): worker join failed: {e}"
+                            ))
+                        })??;
+                        for (m, p) in merged.iter_mut().zip(partial.iter()) {
+                            m.high += p.high;
+                            m.low += p.low;
+                        }
+                    }
+                    emit_q12(schema_for_batch, merged)
+                }
                 FusedPostJoinSpec::Q14 => {
                     // Q14 path is the older post-join-only variant —
                     // most user code now goes through FusedQ14FullExec
@@ -482,6 +527,74 @@ fn accumulate_q5_batch(
         }
     }
     Ok(())
+}
+
+/// Per-bucket running counts for Q12. `high` and `low` are
+/// independent because each row contributes 1 to exactly one (the
+/// CASE-WHENs are complementary on the priority enum) — but we keep
+/// both fields rather than computing one from the other to stay
+/// branchless inside `accumulate_q12_batch`.
+#[derive(Default, Clone, Copy)]
+struct Q12Bin {
+    high: i64,
+    low: i64,
+}
+
+/// Per-batch Q12 fold over `(l_shipmode, o_orderpriority)` columns.
+/// MAIL goes to bin 0, SHIP to bin 1, anything else to bin 2 (which
+/// is dropped from the output). High-priority orders (1-URGENT or
+/// 2-HIGH) increment `high`; everything else increments `low`. The
+/// CASE-WHEN guards reduce to a 1-byte prefix check on the priority
+/// string since TPC-H's `o_orderpriority` always starts with one of
+/// `1`, `2`, `3`, `4`, `5` followed by `-<NAME>`.
+fn accumulate_q12_batch(batch: &RecordBatch, bins: &mut [Q12Bin; 3]) -> DfResult<()> {
+    let shipmode = batch
+        .column(batch.schema().index_of("l_shipmode")?)
+        .as_any()
+        .downcast_ref::<StringViewArray>()
+        .expect("l_shipmode Utf8View");
+    let priority = batch
+        .column(batch.schema().index_of("o_orderpriority")?)
+        .as_any()
+        .downcast_ref::<StringViewArray>()
+        .expect("o_orderpriority Utf8View");
+    for i in 0..batch.num_rows() {
+        let sm = shipmode.value(i).as_bytes();
+        let bin = match sm.first().copied() {
+            Some(b'M') => 0, // MAIL
+            Some(b'S') => 1, // SHIP
+            _ => 2,
+        };
+        let pr = priority.value(i).as_bytes();
+        // High priority iff first byte is '1' (URGENT) or '2' (HIGH).
+        let is_high = matches!(pr.first().copied(), Some(b'1') | Some(b'2'));
+        if is_high {
+            bins[bin].high += 1;
+        } else {
+            bins[bin].low += 1;
+        }
+    }
+    Ok(())
+}
+
+fn emit_q12(schema: SchemaRef, bins: [Q12Bin; 3]) -> DfResult<RecordBatch> {
+    // Output the two real buckets in alphabetical order (MAIL < SHIP),
+    // dropping the catch-all bin.
+    let mut name_b = StringBuilder::with_capacity(2, 16);
+    let mut high_b = Int64Builder::with_capacity(2);
+    let mut low_b = Int64Builder::with_capacity(2);
+    name_b.append_value("MAIL");
+    high_b.append_value(bins[0].high);
+    low_b.append_value(bins[0].low);
+    name_b.append_value("SHIP");
+    high_b.append_value(bins[1].high);
+    low_b.append_value(bins[1].low);
+    let cols: Vec<ArrayRef> = vec![
+        Arc::new(name_b.finish()),
+        Arc::new(high_b.finish()),
+        Arc::new(low_b.finish()),
+    ];
+    Ok(RecordBatch::try_new(schema, cols)?)
 }
 
 fn emit_q5(schema: SchemaRef, groups: HashMap<String, f64>) -> DfResult<RecordBatch> {
