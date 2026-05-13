@@ -25,6 +25,7 @@ use datafusion::arrow::array::{Float64Array, RecordBatch};
 use datafusion::catalog::TableProvider;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::{SessionConfig, SessionContext};
+use ematix_flow_core::ematix_fast_parquet::EmatixFastParquetTableProvider;
 use ematix_flow_core::fast_parquet::FastParquetTableProvider;
 use ematix_flow_core::fused_q14_full::{FusedQ14FullExec, Q14Predicate};
 use futures_util::stream::TryStreamExt;
@@ -83,6 +84,23 @@ async fn make_fast_ctx(parquet_dir: &str) -> SessionContext {
     for table in TPCH_TABLES {
         let path = format!("{parquet_dir}/{table}.parquet");
         let prov = FastParquetTableProvider::try_new(path).unwrap();
+        ctx.register_table(*table, Arc::new(prov)).unwrap();
+    }
+    ctx
+}
+
+/// Phase 4: register every TPC-H table via the new
+/// `EmatixFastParquetTableProvider`. Now possible because Phase 4 added
+/// BYTE_ARRAY / Utf8 support to the bridge. Q14 only touches lineitem +
+/// part; the other 6 tables go through Emat too just so the registration
+/// path itself is exercised on real shapes (no Decimal in TPC-H so all
+/// columns are primitive or Utf8). Phase 3 predicate pushdown on
+/// l_shipdate kicks in automatically inside the scan.
+async fn make_emat_ctx(parquet_dir: &str) -> SessionContext {
+    let ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(14));
+    for table in TPCH_TABLES {
+        let path = format!("{parquet_dir}/{table}.parquet");
+        let prov = EmatixFastParquetTableProvider::try_new(path).unwrap();
         ctx.register_table(*table, Arc::new(prov)).unwrap();
     }
     ctx
@@ -254,6 +272,11 @@ async fn main() {
     // 2: FastParquet + Utf8View, same SQL.
     let ctx_fast = make_fast_ctx(&dir).await;
     let _ = bench_sql("FastParquet + Utf8View (same SQL)", &ctx_fast).await;
+
+    // 2b: EmatixFastParquetTableProvider (Phases 1-4). All TPC-H tables
+    // register via Emat; Phase 3 pushdown auto-applies to l_shipdate.
+    let ctx_emat = make_emat_ctx(&dir).await;
+    let _ = bench_sql("EmatixFastParquetProvider (Phases 1-4)", &ctx_emat).await;
 
     // 3: full-fusion path.
     let exec = build_full_fusion_exec(&dir).await;
