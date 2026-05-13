@@ -69,6 +69,11 @@ pub struct FusedPostJoinExec {
     spec: FusedPostJoinSpec,
     schema: SchemaRef,
     properties: Arc<PlanProperties>,
+    /// Optional spec-driven Cranelift JIT (Σ.D3 phase C). Currently only
+    /// the Q14 variant supports the JIT path — Q3 and Q5 need hash-
+    /// group-by-in-IR (deferred to a future phase) because their group
+    /// cardinality is unknown at plan-time.
+    jit: Option<Arc<crate::fused_jit::FusedFilterAggJit>>,
 }
 
 impl FusedPostJoinExec {
@@ -87,7 +92,36 @@ impl FusedPostJoinExec {
             spec,
             schema,
             properties,
+            jit: None,
         })
+    }
+
+    /// Same shape as [`try_new`] but routes the inner loop through the
+    /// Cranelift-JIT'd `FusedFilterAggJit`. Currently only supported
+    /// for `FusedPostJoinSpec::Q14`; Q3/Q5 fall back to the hand-coded
+    /// path. Returns an error for unsupported specs so the caller
+    /// can't silently get the wrong execution mode.
+    pub fn try_new_jit(
+        input: Arc<dyn ExecutionPlan>,
+        spec: FusedPostJoinSpec,
+    ) -> DfResult<Self> {
+        match spec {
+            FusedPostJoinSpec::Q14 => {
+                let mut exec = Self::try_new(input, spec)?;
+                let s = crate::fused_jit::FusedFilterAggSpec::q14_post_join();
+                let jit = crate::fused_jit::FusedFilterAggJit::try_build(&s).map_err(|e| {
+                    DataFusionError::Internal(format!(
+                        "FusedPostJoinExec: Q14 JIT build failed: {e}"
+                    ))
+                })?;
+                exec.jit = Some(Arc::new(jit));
+                Ok(exec)
+            }
+            other => Err(DataFusionError::Plan(format!(
+                "FusedPostJoinExec::try_new_jit: spec {other:?} not yet JIT-supported \
+                 (Q3/Q5 require hash-group-by-in-IR; deferred to a future Σ.D3 phase)"
+            ))),
+        }
     }
 }
 
@@ -194,7 +228,12 @@ impl ExecutionPlan for FusedPostJoinExec {
         let new_input = children.pop().ok_or_else(|| {
             DataFusionError::Internal("FusedPostJoinExec requires exactly 1 child".into())
         })?;
-        Ok(Arc::new(Self::try_new(new_input, self.spec)?))
+        let next = if self.jit.is_some() {
+            Self::try_new_jit(new_input, self.spec)?
+        } else {
+            Self::try_new(new_input, self.spec)?
+        };
+        Ok(Arc::new(next))
     }
 
     fn execute(
@@ -210,6 +249,7 @@ impl ExecutionPlan for FusedPostJoinExec {
         let input = self.input.clone();
         let spec = self.spec;
         let out_schema = self.schema.clone();
+        let jit = self.jit.clone();
         let input_partitions = input.properties().partitioning.partition_count();
 
         let schema_for_batch = out_schema.clone();
@@ -222,10 +262,13 @@ impl ExecutionPlan for FusedPostJoinExec {
                 }
             }
             let batch = tokio::task::spawn_blocking(move || -> DfResult<RecordBatch> {
-                match spec {
-                    FusedPostJoinSpec::Q3 => execute_q3(&batches, schema_for_batch),
-                    FusedPostJoinSpec::Q5 => execute_q5(&batches, schema_for_batch),
-                    FusedPostJoinSpec::Q14 => execute_q14(&batches, schema_for_batch),
+                match (spec, jit) {
+                    (FusedPostJoinSpec::Q14, Some(j)) => {
+                        execute_q14_jit(&batches, schema_for_batch, &j)
+                    }
+                    (FusedPostJoinSpec::Q14, None) => execute_q14(&batches, schema_for_batch),
+                    (FusedPostJoinSpec::Q3, _) => execute_q3(&batches, schema_for_batch),
+                    (FusedPostJoinSpec::Q5, _) => execute_q5(&batches, schema_for_batch),
                 }
             })
             .await
@@ -355,6 +398,66 @@ fn execute_q5(batches: &[RecordBatch], schema: SchemaRef) -> DfResult<RecordBatc
     }
     let cols: Vec<ArrayRef> = vec![Arc::new(name_b.finish()), Arc::new(rev_b.finish())];
     Ok(RecordBatch::try_new(schema, cols)?)
+}
+
+// ----- Q14 JIT path -----
+//
+// Same kernel surface as `execute_q14` but the inner CASE-WHEN +
+// dual-SUM loop is the Cranelift-JIT'd `FusedFilterAggJit` built from
+// `FusedFilterAggSpec::q14_post_join()`. The JIT's outputs[0] is the
+// PROMO-guarded sum, outputs[1] is the unguarded sum; the ratio
+// `100 * promo / total` is computed here on the host (the JIT only
+// does the per-row accumulation, not the final division).
+
+fn execute_q14_jit(
+    batches: &[RecordBatch],
+    schema: SchemaRef,
+    jit: &crate::fused_jit::FusedFilterAggJit,
+) -> DfResult<RecordBatch> {
+    let mut cells: [f64; 2] = [0.0, 0.0];
+    for batch in batches {
+        let ptype = batch
+            .column(batch.schema().index_of("p_type")?)
+            .as_any()
+            .downcast_ref::<StringViewArray>()
+            .expect("p_type validated as Utf8View");
+        let price = batch
+            .column(batch.schema().index_of("l_extendedprice")?)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .expect("l_extendedprice Float64");
+        let disc = batch
+            .column(batch.schema().index_of("l_discount")?)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .expect("l_discount Float64");
+        let inputs: [*const u8; 3] = [
+            ptype.views().as_ptr().cast::<u8>(),
+            price.values().as_ptr().cast::<u8>(),
+            disc.values().as_ptr().cast::<u8>(),
+        ];
+        // SAFETY: Arrow guarantees views/values length >= num_rows; cells
+        // has exactly `jit.n_outputs() == 2` elements.
+        debug_assert_eq!(jit.n_outputs(), 2);
+        unsafe {
+            jit.run(
+                batch.num_rows() as i64,
+                inputs.as_ptr(),
+                cells.as_mut_ptr(),
+            );
+        }
+    }
+    let promo = cells[0];
+    let total = cells[1];
+    let ratio = if total > 0.0 {
+        100.0 * promo / total
+    } else {
+        f64::NAN
+    };
+    let mut b = Float64Builder::with_capacity(1);
+    b.append_value(ratio);
+    let col: ArrayRef = Arc::new(b.finish());
+    Ok(RecordBatch::try_new(schema, vec![col])?)
 }
 
 // ----- Q14: dual SUM, one CASE-WHEN guard -----
@@ -535,6 +638,67 @@ mod tests {
             .unwrap()
             .value(0);
         assert!((ratio - 40.0).abs() < 1e-9, "expected 40.0%, got {ratio}",);
+    }
+
+    /// Σ.D3 phase C retrofit: Q14 JIT'd path must return the same
+    /// promo_revenue ratio as the hand-coded Q14 path on the same input.
+    /// The intermediate (promo, total) cells are bit-identical between
+    /// hand-coded and JIT'd because both walk rows in the same order
+    /// with the same fadd sequence; the final ratio is computed by the
+    /// host (same `100*p/t` formula on both sides).
+    #[tokio::test]
+    async fn q14_jit_matches_hand_coded_bit_identical() {
+        let hand_input = input_plan_from_batch(make_q14_batch()).await;
+        let hand_exec = Arc::new(
+            FusedPostJoinExec::try_new(hand_input, FusedPostJoinSpec::Q14).unwrap(),
+        );
+        let jit_input = input_plan_from_batch(make_q14_batch()).await;
+        let jit_exec = Arc::new(
+            FusedPostJoinExec::try_new_jit(jit_input, FusedPostJoinSpec::Q14).unwrap(),
+        );
+        let session = SessionContext::new();
+
+        let mut hand_s = hand_exec.execute(0, session.task_ctx()).unwrap();
+        let hand_out = hand_s.try_next().await.unwrap().unwrap();
+        let mut jit_s = jit_exec.execute(0, session.task_ctx()).unwrap();
+        let jit_out = jit_s.try_next().await.unwrap().unwrap();
+
+        let h = hand_out
+            .column(0)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap()
+            .value(0);
+        let j = jit_out
+            .column(0)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap()
+            .value(0);
+        assert_eq!(
+            h.to_bits(),
+            j.to_bits(),
+            "Q14 ratio: hand={h}, jit={j} (must be bit-identical)"
+        );
+    }
+
+    /// try_new_jit should reject Q3 and Q5 explicitly (they need hash-
+    /// group-by-in-IR, which isn't yet supported). The caller gets a
+    /// clear error rather than silently falling through to the hand-
+    /// coded path.
+    #[tokio::test]
+    async fn try_new_jit_rejects_q3_and_q5() {
+        // Reuse Q3's input schema for the Q3 check — we just need a
+        // syntactically-valid input.
+        let q3_input = input_plan_from_batch(make_q3_batch()).await;
+        let err =
+            FusedPostJoinExec::try_new_jit(q3_input, FusedPostJoinSpec::Q3).unwrap_err();
+        assert!(format!("{err}").contains("Q3"), "got: {err}");
+
+        let q5_input = input_plan_from_batch(make_q5_batch()).await;
+        let err =
+            FusedPostJoinExec::try_new_jit(q5_input, FusedPostJoinSpec::Q5).unwrap_err();
+        assert!(format!("{err}").contains("Q5"), "got: {err}");
     }
 
     fn make_q5_batch() -> RecordBatch {

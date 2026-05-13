@@ -422,7 +422,7 @@ pub enum ClauseOp {
 /// stored as f64 and the host casts back to integer at emit time).
 /// One `AggExpr` produces one entry in the JIT'd function's `outputs[]`
 /// array per group (or one total for no-group specs).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub enum AggExpr {
     /// `SUM(col[i])` — column must be Float64.
     SumColumn(usize),
@@ -439,6 +439,28 @@ pub enum AggExpr {
     /// the host downcasts to i64 at emit time when it needs integer
     /// `count_order` output.
     CountStar,
+    /// `SUM(CASE WHEN guard_col STARTS WITH prefix THEN val_col * (1 - disc_col) ELSE 0)`.
+    /// Q14's `SUM(CASE WHEN p_type LIKE 'PROMO%' THEN price * (1 - disc) ELSE 0)`.
+    ///
+    /// `guard_col` must be Utf8View; `val_col`/`disc_col` must be Float64.
+    /// `prefix` must be **≤ 4 bytes**: Arrow's StringView guarantees the
+    /// first 4 bytes of every string live at view-offset +4 (either as
+    /// part of the inline data for ≤12-byte strings, or as the inline
+    /// "prefix" portion of the non-inline layout for longer strings).
+    /// Bytes 5+ of long strings live in an external buffer that the IR
+    /// can't reach without a host callback. For longer prefix checks
+    /// the caller must reduce to a 4-byte unique identifier (TPC-H Q14
+    /// can use `"PROM"` since no other `p_type` value starts with PROM).
+    ///
+    /// The IR emits one byte-load per prefix byte, ANDs the equality
+    /// checks, and uses `select(match, term, 0.0)` so the loop stays
+    /// branchless on the hot path.
+    SumProductOneMinusGuardedByPrefix {
+        guard_col: usize,
+        val_col: usize,
+        disc_col: usize,
+        prefix: Vec<u8>,
+    },
 }
 
 /// Optional small-cardinality group-by. When present, `outputs[]` holds
@@ -577,6 +599,39 @@ impl FusedFilterAggSpec {
                     vec![b'A', b'F'], // 3
                 ],
             }),
+        }
+    }
+
+    /// Q14 post-join spec: matches the `FusedPostJoinExec::Q14` shape.
+    /// Inputs are the join output projected to `(p_type, l_extendedprice,
+    /// l_discount)`. No predicate (the filter happened before the join
+    /// in DataFusion's plan). Two aggregates: the PROMO-guarded SUM and
+    /// the unguarded SUM. Output is two f64 cells `[promo, total]`;
+    /// the host computes `100 * promo / total` at emit time.
+    pub fn q14_post_join() -> Self {
+        Self {
+            inputs: vec![
+                ColumnTy::Utf8View, // 0 p_type
+                ColumnTy::Float64,  // 1 l_extendedprice
+                ColumnTy::Float64,  // 2 l_discount
+            ],
+            predicate: vec![],
+            aggregates: vec![
+                AggExpr::SumProductOneMinusGuardedByPrefix {
+                    guard_col: 0,
+                    val_col: 1,
+                    disc_col: 2,
+                    // Q14's spec test is `p_type LIKE 'PROMO%'`. TPC-H
+                    // restricts p_type to a fixed enum where no other
+                    // value starts with "PROM", so the 4-byte prefix
+                    // "PROM" identifies "PROMO..." uniquely. See the
+                    // `SumProductOneMinusGuardedByPrefix` docs for why
+                    // the JIT is restricted to a 4-byte prefix.
+                    prefix: b"PROM".to_vec(),
+                },
+                AggExpr::SumProductOneMinus(1, 2),
+            ],
+            group: None,
         }
     }
 }
@@ -860,7 +915,7 @@ fn emit_match_path_ungrouped(
     builder.switch_to_block(match_block);
     builder.seal_block(match_block);
     for (k, agg) in aggregates.iter().enumerate() {
-        let term = emit_agg_term(builder, col_ptrs, col_tys, i, *agg);
+        let term = emit_agg_term(builder, col_ptrs, col_tys, i, agg);
         let cur = builder.ins().stack_load(types::F64, acc_slots[k], 0);
         let new = builder.ins().fadd(cur, term);
         builder.ins().stack_store(new, acc_slots[k], 0);
@@ -906,7 +961,7 @@ fn emit_match_path_grouped(
 
     let agg_terms: Vec<Value> = aggregates
         .iter()
-        .map(|a| emit_agg_term(builder, col_ptrs, col_tys, i, *a))
+        .map(|a| emit_agg_term(builder, col_ptrs, col_tys, i, a))
         .collect();
     let key_bytes: Vec<Value> = group
         .key_columns
@@ -1033,21 +1088,46 @@ fn validate_spec(spec: &FusedFilterAggSpec) -> Result<(), String> {
         }
     }
     for (i, a) in spec.aggregates.iter().enumerate() {
-        let cols: Vec<usize> = match a {
-            AggExpr::SumColumn(c) => vec![*c],
+        // Validate Float64 columns by collecting them per-variant.
+        // Some variants also have a Utf8View guard column with its own
+        // type/length constraints; we handle those separately below.
+        let (f64_cols, guard_constraint): (Vec<usize>, Option<(usize, usize)>) = match a {
+            AggExpr::SumColumn(c) => (vec![*c], None),
             AggExpr::SumProductColumns(a, b) => {
                 if a == b {
                     return Err(format!(
                         "FusedFilterAggSpec: aggregate {i} multiplies a column by itself"
                     ));
                 }
-                vec![*a, *b]
+                (vec![*a, *b], None)
             }
-            AggExpr::SumProductOneMinus(a, b) => vec![*a, *b],
-            AggExpr::SumProductTwoOneMinusOnePlus(a, b, c) => vec![*a, *b, *c],
-            AggExpr::CountStar => vec![],
+            AggExpr::SumProductOneMinus(a, b) => (vec![*a, *b], None),
+            AggExpr::SumProductTwoOneMinusOnePlus(a, b, c) => (vec![*a, *b, *c], None),
+            AggExpr::CountStar => (vec![], None),
+            AggExpr::SumProductOneMinusGuardedByPrefix {
+                guard_col,
+                val_col,
+                disc_col,
+                prefix,
+            } => {
+                if prefix.is_empty() {
+                    return Err(format!(
+                        "FusedFilterAggSpec: aggregate {i} has empty guard prefix"
+                    ));
+                }
+                if prefix.len() > 4 {
+                    return Err(format!(
+                        "FusedFilterAggSpec: aggregate {i} guard prefix has {} bytes; the JIT \
+                         can only access the first 4 bytes of a Utf8View element reliably \
+                         (bytes 5+ of long strings live in an external buffer). Reduce the \
+                         prefix to ≤4 bytes that uniquely identify the match.",
+                        prefix.len()
+                    ));
+                }
+                (vec![*val_col, *disc_col], Some((*guard_col, prefix.len())))
+            }
         };
-        for c in cols {
+        for c in f64_cols {
             if c >= spec.inputs.len() {
                 return Err(format!(
                     "FusedFilterAggSpec: aggregate {i} references column {c} but only {} inputs",
@@ -1058,6 +1138,20 @@ fn validate_spec(spec: &FusedFilterAggSpec) -> Result<(), String> {
                 return Err(format!(
                     "FusedFilterAggSpec: aggregate {i} column {c} must be Float64, got {:?}",
                     spec.inputs[c]
+                ));
+            }
+        }
+        if let Some((gc, _)) = guard_constraint {
+            if gc >= spec.inputs.len() {
+                return Err(format!(
+                    "FusedFilterAggSpec: aggregate {i} guard column {gc} out of range ({} inputs)",
+                    spec.inputs.len()
+                ));
+            }
+            if spec.inputs[gc] != ColumnTy::Utf8View {
+                return Err(format!(
+                    "FusedFilterAggSpec: aggregate {i} guard column {gc} must be Utf8View, got {:?}",
+                    spec.inputs[gc]
                 ));
             }
         }
@@ -1150,7 +1244,7 @@ fn emit_agg_term(
     col_ptrs: &[Value],
     col_tys: &[ColumnTy],
     i: Value,
-    agg: AggExpr,
+    agg: &AggExpr,
 ) -> Value {
     let load_f64 = |b: &mut FunctionBuilder, col: usize| -> Value {
         debug_assert_eq!(col_tys[col], ColumnTy::Float64);
@@ -1160,25 +1254,25 @@ fn emit_agg_term(
         b.ins().load(types::F64, MemFlags::trusted(), slot, 0)
     };
     match agg {
-        AggExpr::SumColumn(c) => load_f64(builder, c),
+        AggExpr::SumColumn(c) => load_f64(builder, *c),
         AggExpr::SumProductColumns(a, b_idx) => {
-            let av = load_f64(builder, a);
-            let bv = load_f64(builder, b_idx);
+            let av = load_f64(builder, *a);
+            let bv = load_f64(builder, *b_idx);
             builder.ins().fmul(av, bv)
         }
         AggExpr::SumProductOneMinus(a, b_idx) => {
             // term = col[a] * (1 - col[b])
-            let av = load_f64(builder, a);
-            let bv = load_f64(builder, b_idx);
+            let av = load_f64(builder, *a);
+            let bv = load_f64(builder, *b_idx);
             let one = builder.ins().f64const(1.0);
             let om = builder.ins().fsub(one, bv);
             builder.ins().fmul(av, om)
         }
         AggExpr::SumProductTwoOneMinusOnePlus(a, b_idx, c_idx) => {
             // term = col[a] * (1 - col[b]) * (1 + col[c])
-            let av = load_f64(builder, a);
-            let bv = load_f64(builder, b_idx);
-            let cv = load_f64(builder, c_idx);
+            let av = load_f64(builder, *a);
+            let bv = load_f64(builder, *b_idx);
+            let cv = load_f64(builder, *c_idx);
             let one_b = builder.ins().f64const(1.0);
             let one_c = builder.ins().f64const(1.0);
             let om = builder.ins().fsub(one_b, bv);
@@ -1187,7 +1281,65 @@ fn emit_agg_term(
             builder.ins().fmul(av_om, op)
         }
         AggExpr::CountStar => builder.ins().f64const(1.0),
+        AggExpr::SumProductOneMinusGuardedByPrefix {
+            guard_col,
+            val_col,
+            disc_col,
+            prefix,
+        } => {
+            // Compute the unguarded term first.
+            let av = load_f64(builder, *val_col);
+            let bv = load_f64(builder, *disc_col);
+            let one = builder.ins().f64const(1.0);
+            let om = builder.ins().fsub(one, bv);
+            let term = builder.ins().fmul(av, om);
+            // Prefix match on the Utf8View's inline bytes (offset +4).
+            let prefix_match = emit_utf8view_prefix_match(
+                builder,
+                col_ptrs[*guard_col],
+                i,
+                prefix,
+            );
+            // Branchless: pick `term` if prefix matched, else 0.0.
+            let zero = builder.ins().f64const(0.0);
+            builder.ins().select(prefix_match, term, zero)
+        }
     }
+}
+
+/// Emit IR for "first `prefix.len()` bytes of the Utf8View at row `i`
+/// equal `prefix`". Returns an i8 boolean mask. Each prefix byte is a
+/// separate u8 load + i32 compare; we AND them. Restricted to ≤4
+/// bytes because the StringView non-inline layout only puts the first
+/// 4 string bytes at view offset +4; bytes 5+ for long strings live in
+/// an external buffer the IR can't reach without a host callback.
+fn emit_utf8view_prefix_match(
+    builder: &mut FunctionBuilder,
+    col_base: Value,
+    i: Value,
+    prefix: &[u8],
+) -> Value {
+    debug_assert!(!prefix.is_empty(), "validated > 0 above");
+    debug_assert!(prefix.len() <= 4, "validated ≤4 bytes above");
+    // view_ptr = col_base + 16 * i
+    let view_size = builder.ins().iconst(types::I64, 16);
+    let row_off = builder.ins().imul(i, view_size);
+    let view_ptr = builder.ins().iadd(col_base, row_off);
+    let mut acc: Option<Value> = None;
+    for (j, &b) in prefix.iter().enumerate() {
+        // Byte j of the inline data is at view + 4 + j.
+        let load = builder
+            .ins()
+            .load(types::I8, MemFlags::trusted(), view_ptr, 4 + j as i32);
+        let loaded = builder.ins().uextend(types::I32, load);
+        let imm = builder.ins().iconst(types::I32, b as i64);
+        let eq = builder.ins().icmp(IntCC::Equal, loaded, imm);
+        acc = Some(match acc {
+            None => eq,
+            Some(prev) => builder.ins().band(prev, eq),
+        });
+    }
+    acc.unwrap()
 }
 
 #[cfg(test)]
@@ -1531,6 +1683,63 @@ mod tests {
         // Catch-all (group 4) must also be zero — no rows had unknown keys.
         let catch = &outputs[4 * 6..4 * 6 + 6];
         assert!(catch.iter().all(|v| *v == 0.0), "catch-all: {catch:?}");
+    }
+
+    /// Phase C exercise: Q14 post-join spec (CASE-WHEN guard, dual SUM,
+    /// no group-by) computes promo+total cells that match hand math.
+    ///
+    /// Synthetic batch (the spec uses a 4-byte `"PROM"` prefix — see
+    /// `q14_post_join` docs for why):
+    ///   row 0: p_type="PROMO BRUSH",      price=100, disc=0.10 → guarded=90,  unguarded=90
+    ///   row 1: p_type="PROMO POLIS",      price=50,  disc=0.00 → guarded=50,  unguarded=50
+    ///   row 2: p_type="ECONOMY ANO",      price=200, disc=0.20 → guarded=0,   unguarded=160
+    ///   row 3: p_type="STANDARD PO",      price=100, disc=0.50 → guarded=0,   unguarded=50
+    /// Expected: promo=140, total=350; ratio (host-computed) = 100*140/350 ≈ 40.0%
+    #[test]
+    fn generic_jit_q14_post_join_spec_matches_hand_math() {
+        fn view_of(s: &str) -> [u8; 16] {
+            let bytes = s.as_bytes();
+            let mut v = [0u8; 16];
+            // length stored as u32 LE in bytes 0..4
+            let n = bytes.len().min(12) as u32;
+            v[0..4].copy_from_slice(&n.to_le_bytes());
+            // inline data at bytes 4..(4+n)
+            v[4..4 + n as usize].copy_from_slice(&bytes[..n as usize]);
+            v
+        }
+        let ptype_views: Vec<[u8; 16]> = vec![
+            view_of("PROMO BRUSH"),    // 11 bytes — fits inline
+            view_of("PROMO POLIS"),    // also fits
+            view_of("ECONOMY ANO"),
+            view_of("STANDARD PO"),
+        ];
+        let price: Vec<f64> = vec![100.0, 50.0, 200.0, 100.0];
+        let disc: Vec<f64> = vec![0.10, 0.00, 0.20, 0.50];
+
+        let spec = FusedFilterAggSpec::q14_post_join();
+        let jit = FusedFilterAggJit::try_build(&spec).expect("build Q14 JIT");
+        let inputs: [*const u8; 3] = [
+            ptype_views.as_ptr().cast::<u8>(),
+            price.as_ptr().cast::<u8>(),
+            disc.as_ptr().cast::<u8>(),
+        ];
+        let mut outputs: [f64; 2] = [0.0, 0.0];
+        // SAFETY: ptype_views/price/disc each have n=4 elements; outputs
+        // has 2 cells matching jit.n_outputs().
+        assert_eq!(jit.n_outputs(), 2);
+        unsafe {
+            jit.run(
+                price.len() as i64,
+                inputs.as_ptr(),
+                outputs.as_mut_ptr(),
+            );
+        }
+        let promo = outputs[0];
+        let total = outputs[1];
+        assert!((promo - 140.0).abs() < 1e-6, "promo: {promo}");
+        assert!((total - 350.0).abs() < 1e-6, "total: {total}");
+        let ratio = 100.0 * promo / total;
+        assert!((ratio - 40.0).abs() < 1e-9, "ratio: {ratio}");
     }
 
     #[test]
