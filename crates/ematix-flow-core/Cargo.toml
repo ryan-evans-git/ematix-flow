@@ -196,3 +196,22 @@ path = "examples/tpch_q1_plan_dump.rs"
 name = "tpch_q1_inject_bench"
 path = "examples/tpch_q1_inject_bench.rs"
 
+# Σ.D3 phase D (Q14 variant): dump the canonical Q14 plan shape
+# (scan + filter + JOIN + dual-SUM-with-CASE-WHEN) so the future
+# InjectFusedQ14Rule detector can match it exactly.
+[[example]]
+name = "tpch_q14_plan_dump"
+path = "examples/tpch_q14_plan_dump.rs"
+
+# Σ.D3 phase D (Q14 variant): bench Q14 with and without
+# InjectFusedQ14Rule registered.
+[[example]]
+name = "tpch_q14_inject_bench"
+path = "examples/tpch_q14_inject_bench.rs"
+
+# Σ.D3 phase D (Q14 variant) diagnostic: dump the Q14 plan AFTER
+# InjectFusedQ14Rule runs.
+[[example]]
+name = "tpch_q14_inject_plan_dump"
+path = "examples/tpch_q14_inject_plan_dump.rs"
+
