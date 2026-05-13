@@ -147,10 +147,17 @@ def _cmd_run_due(args: argparse.Namespace) -> int:
     if now.tzinfo is None:
         now = now.replace(tzinfo=UTC)
 
+    # Phase Ω.D1a: open the run-log (default ~/.ematix-flow/run_log.db,
+    # opt-out via --no-run-log) and restore prior _LAST_RUN +
+    # _ATTEMPT_STATE so the upstream-freshness gate below can see what
+    # earlier cron ticks did.
+    run_log = _open_run_log_or_none(args)
+    if run_log is not None:
+        run_log.restore_into_process()
+
     # Phase Ω.1: topo-sort the due set so upstreams fire before
     # downstreams, and skip downstreams whose upstream isn't fresh
-    # (failed, missing, or stale). The ordering is in-process only —
-    # cross-process upstream-success tracking is Phase Ω.D1a.
+    # (failed, missing, or stale).
     due: list[str] = [
         sp.name for sp in p.list_pipelines()
         if p.is_due(sp.schedule, now, args.interval)
@@ -185,9 +192,19 @@ def _cmd_run_due(args: argparse.Namespace) -> int:
         except Exception as e:
             print(f"failed: {sp.name}: {e}", file=sys.stderr)
             failed.append({"pipeline": sp.name, "error": str(e)})
-            p._LAST_RUN[name] = (datetime.now(UTC), False)
+            completed_at = datetime.now(UTC)
+            p._LAST_RUN[name] = (completed_at, False)
+            if run_log is not None:
+                run_log.record_run(name, completed_at, False)
+            # NOTE: this CLI loop predates Ω.2 and doesn't yet honor
+            # the per-attempt retry backoff. `run_due_with_dag()` does;
+            # migrating this loop to use it is a follow-up so we keep
+            # back-compat on the `ran` JSON shape for now.
             continue
-        p._LAST_RUN[name] = (datetime.now(UTC), success)
+        completed_at = datetime.now(UTC)
+        p._LAST_RUN[name] = (completed_at, success)
+        if run_log is not None:
+            run_log.record_run(name, completed_at, success)
         out = dict(r) if isinstance(r, dict) else {"result": r}
         out["_pipeline"] = sp.name
         results.append(out)
@@ -196,6 +213,51 @@ def _cmd_run_due(args: argparse.Namespace) -> int:
         default=str,
     ))
     return 1 if failed else 0
+
+
+def _open_run_log_or_none(args: argparse.Namespace) -> "p.RunLog | None":
+    """Resolve the --run-log-path / --no-run-log args into a RunLog or None."""
+    if getattr(args, "no_run_log", False):
+        return None
+    path = getattr(args, "run_log_path", None) or _default_run_log_path()
+    return p.RunLog(path)
+
+
+def _default_run_log_path() -> str:
+    """`~/.ematix-flow/run_log.db` unless EMATIX_FLOW_RUN_LOG_PATH overrides."""
+    import os
+    env = os.environ.get("EMATIX_FLOW_RUN_LOG_PATH")
+    if env:
+        return env
+    return os.path.expanduser("~/.ematix-flow/run_log.db")
+
+
+def _add_run_log_args(parser: argparse.ArgumentParser) -> None:
+    """Shared --run-log-path / --no-run-log flags for run-due + status.
+
+    Persistence location resolution order:
+      1. `--run-log-path PATH` on the CLI (highest priority)
+      2. `EMATIX_FLOW_RUN_LOG_PATH` env var
+      3. Default: `~/.ematix-flow/run_log.db`
+
+    Any path the user can write to works — local disk, mounted volume,
+    NFS share, tmpfs. Parent directories are created on first use.
+    For ephemeral environments (CI, lambdas with read-only FS) pass
+    `--no-run-log` to skip persistence entirely.
+    """
+    parser.add_argument(
+        "--run-log-path",
+        default=None,
+        help="path to the durable run-history SQLite DB. Falls back to "
+        "$EMATIX_FLOW_RUN_LOG_PATH then ~/.ematix-flow/run_log.db. Parent "
+        "directories are created on first use.",
+    )
+    parser.add_argument(
+        "--no-run-log",
+        action="store_true",
+        help="don't persist run history. Useful for CI, ephemeral hosts, "
+        "or testing.",
+    )
 
 
 def _upstream_ok(upstream: str, max_age_secs: int | None, now: datetime) -> bool:
@@ -221,6 +283,11 @@ def _cmd_status(args: argparse.Namespace) -> int:
     fixed-width text table from `render_status_table`.
     """
     _import_user_module(args.module)
+    # Phase Ω.D1a: pull prior state off disk before snapshotting so
+    # the table reflects what last night's cron actually did.
+    run_log = _open_run_log_or_none(args)
+    if run_log is not None:
+        run_log.restore_into_process()
     snapshot = p.status_snapshot()
     if args.format == "json":
         def _ser(o: Any) -> Any:
@@ -410,6 +477,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     status_p.add_argument("--module", required=True)
     status_p.add_argument("--format", choices=["text", "json"], default="text")
+    _add_run_log_args(status_p)
     status_p.set_defaults(func=_cmd_status)
 
     due_p = sub.add_parser(
@@ -428,6 +496,7 @@ def main(argv: list[str] | None = None) -> int:
         help="window size in seconds (default 60); should match how often "
         "you invoke `flow run-due`",
     )
+    _add_run_log_args(due_p)
     due_p.set_defaults(func=_cmd_run_due)
 
     # `flow preview / dry-run` subcommands (Phase 25).
