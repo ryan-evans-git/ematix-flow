@@ -42,7 +42,7 @@ Every TPC-H query, four engines, same M3 Pro / SF=1 / Parquet,
 | Q11 |    —    | 148.5 | FAIL¹    |  22.18 |  22.18   | |
 | Q12 |  894.94 | 298.3 |   22.01² |  50.39 |  50.39   | ⚠ Polars 2.29× faster |
 | Q13 |    —    | 706.1 | FAIL¹    |  94.52 |  94.52   | |
-| Q14 |  458.27 | 132.1 |   12.53² |  27.21 | **17.17**⁴ | Σ.D3-D auto-injects FusedQ14FullExec (scan + filter + join + dual-SUM) from SQL — ⚠ Polars 1.37× faster (was 2.17× before Σ.D3-E) |
+| Q14 |  458.27 | 132.1 |   12.53² |  27.21 | **15.40**⁵ | EmatixFastParquetProvider (Phases 1-4) — standard SQL ties the bespoke FusedQ14FullExec; ⚠ Polars 1.23× faster |
 | Q15 |    —    | 146.3 | FAIL¹    |  30.30 |  30.30   | |
 | Q16 |    —    | 223.5 |   25.94² |  22.43 |  22.43   | |
 | Q17 |    —    | 303.9 | FAIL¹    |  61.99 |  61.99   | |
@@ -56,18 +56,18 @@ All times in milliseconds. 5-trial median for DataFusion / ematix-flow,
 3-trial median for everything else (PySpark 4.1.1 on JDK 23, Polars
 1.40.1, pandas 3.0.2).
 
-- **Geomean: ematix-flow is 8.02× faster than single-node PySpark**
-  across the 22-query suite — vs DataFusion-alone's 6.17×. The Σ.D-arc
-  fused operators (PRs [#46], [#47], [#48], [#55]) and the Σ.D3 phase D
-  auto-injection rules add the shifts on Q1 / Q6 / Q14; the remaining
-  19 queries match DataFusion (which is ematix-flow's SQL engine).
-- **ematix-flow wins on 21 of 22 queries** with the opt-in
-  [FastParquet scan provider](#σe2--fastparquet-scan-provider-opt-in-2026-05-12)
-  enabled: 20 outright wins plus Q12 a statistical tie with Polars.
-  Only **Q14** is a remaining loss — Polars is 1.21× faster (closed
-  from 2.17× via `FusedQ14FullExec`, but the gap that remains is in
-  parquet-rs's per-thread decode speed vs polars-parquet, not in any
-  operator we still own). Tracked under the **Σ.E arc**.
+- The Σ.D-arc fused operators (PRs [#46], [#47], [#48], [#55]) and
+  the Σ.D3 phase D auto-injection rules deliver the shifts on Q1 / Q6
+  / Q14 vs DataFusion's default plan; the remaining 19 queries match
+  DataFusion (which is ematix-flow's SQL engine).
+- **Q14 lands at 15.40 ms** via the new `EmatixFastParquetTableProvider`
+  (Σ.E3, Phases 1-4) — standard SQL through the generic provider now
+  ties the bespoke `FusedQ14FullExec` (15.03 ms) and is 19% faster
+  than DataFusion default. The remaining 2.9 ms gap to Polars (12.53)
+  is in DataFusion's join + aggregate machinery, not in the parquet
+  scan we own.
+- Only **Q14** is a remaining engine-vs-Polars loss (1.23× behind).
+  Tracked under the **Σ.E arc**.
 - The table above shows `ematix-flow` numbers on DataFusion's
   *default* parquet path (5-trial median, 2026-05-11 baseline) for
   every query except Q1, Q6, and Q14 — those three are real-SQL
@@ -111,10 +111,19 @@ All times in milliseconds. 5-trial median for DataFusion / ematix-flow,
 - (footnote ⁴ covers Q14 too — the Q14 rule wraps both `lineitem`
   and `part` scans inside a single `FusedQ14FullExec`, replacing the
   hash join with a direct-indexed promo bitmap probe. Hand-built
-  `FusedQ14FullExec` direct-execute is ~15.7 ms; the rule-injected
+  `FusedQ14FullExec` direct-execute is ~15.0 ms; the rule-injected
   full-SQL path is ~17 ms — the ~1 ms gap is per-call SQL parsing +
   logical-planning + physical-planning + rule rewrite, intrinsic to
   the `SessionContext::sql(...)` workflow.)
+- ⁵ Q14 at 15.40 ms uses the new `EmatixFastParquetTableProvider`
+  (Σ.E3, see below). Registering each TPC-H table via the provider
+  swaps the parquet scan for ematix-parquet kernels (NEON-fused
+  bitmap predicate pushdown for `l_shipdate`, bitmap-driven sparse
+  gather for the aggregate columns). Standard `SessionContext::sql`
+  with no per-query rule injection now ties the bespoke
+  `FusedQ14FullExec` (15.03 ms ± 0.58, 15-trial median, M3 Pro).
+  Reproduce with
+  `cargo run --release -p ematix-flow-core --example tpch_q14_full_bench`.
 
 Full methodology + per-engine reproducers in
 [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md).
@@ -154,7 +163,7 @@ noise envelope:
 |---|---:|---:|---|
 | **Q9**  | 52.81 | **34.73** | ematix-flow wins, **1.52× faster than Polars** |
 | **Q12** | 22.01 | 23.05 | basically tied (Polars 5% ahead, inside noise) |
-| **Q14** | 12.53 | **17.17** (auto-injected from SQL) / **15.7** (hand-built) | Polars 1.37× faster — gap closed from 1.54× via Σ.D3-E full-fusion |
+| **Q14** | 12.53 | **15.40** (Σ.E3 Emat provider, standard SQL) | Polars 1.23× faster — Emat provider now ties hand-built `FusedQ14FullExec` (15.03 ms) on standard SQL; gap from 2.17× → 1.23× |
 
 Reproducing this is a one-liner:
 
@@ -1392,13 +1401,13 @@ the [Install](#install) extras and the
 ## Performance and comparisons
 
 The headline 22-query four-engine table lives at the top of this
-README — see [Benchmarks](#benchmarks). ematix-flow is **8.02×
-faster than single-node PySpark across the suite (geomean)** and
-**wins outright on 19 of 22 queries** vs every engine the
-comparison can evaluate. On Q9 / Q12 / Q14, Polars beats us by
-1.3–2.3× — the gap is DataFusion's join cost, which our Σ.D
-aggregate-fusion arc doesn't address. Engine-level investigation
-tracked as the Σ.E arc.
+README — see [Benchmarks](#benchmarks). On the SF=1 suite at the
+default settings, ematix-flow finishes every query DataFusion can
+plan; the Σ.D fused-operator arc shifts Q1 / Q6 / Q14 to the front
+of the pack vs Polars. Q14 specifically — historically Polars's
+strongest TPC-H win against DataFusion — closes from 2.17× behind
+Polars to 1.23× via the Σ.E3 ematix-parquet provider integration.
+Engine-level investigation continues under the Σ.E arc.
 
 ematix-flow uses DataFusion for in-process SQL and Apache Arrow
 for cross-backend I/O, plus custom fused physical operators (the
@@ -1440,7 +1449,7 @@ Full methodology, hardware, and per-query numbers:
 | One-off pandas / SQL scripts | Adds correctness guarantees (watermarks, atomic state, schema evolution) without the operational weight of Airflow + Spark. |
 | Airflow + dbt | Handles the load logic and streaming sources without a scheduler tier. Cron / k8s `CronJob` / GitHub Actions all fire `flow run-due` — no Airflow worker, no scheduler stub, no DAG plumbing. |
 | Kafka Connect + Debezium + custom sinks | First-class CDC source mode dispatches per-op transactionally to your existing target. No separate connector tier to operate. |
-| PySpark Structured Streaming (single-node) | Same SQL surface (DataFusion + Spark dialect translator), 5.87× faster geomean on the default path, 60–76× faster on the queries Σ.D's fused operators cover. No cluster manager. |
+| PySpark Structured Streaming (single-node) | Same SQL surface (DataFusion + Spark dialect translator). No cluster manager, no JVM startup tax, no driver/executor split — for single-node workloads the operational weight gap is the bigger win than any one query's wall-clock. |
 | Polars `read_*` + custom load logic | Comparable per-query performance on shared workloads; **ematix-flow is faster (1.5–11.5× on tested shapes)** once Σ.D applies, plus the load tier on top — watermarks, atomic state, schema evolution, multi-target fan-out, CDC sources, streaming. |
 
 ---
