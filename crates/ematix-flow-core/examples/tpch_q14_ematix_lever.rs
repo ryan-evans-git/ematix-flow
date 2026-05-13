@@ -387,6 +387,74 @@ impl Timing {
     }
 }
 
+/// Standalone Snappy throughput probe. Pulls one representative
+/// l_extendedprice page from the file and times its decompression
+/// in a hot loop. Lets us project total Snappy share of Q14 time.
+fn probe_snappy_throughput(li_path: &PathBuf) {
+    let file = ParquetFile::open(li_path).unwrap();
+    let md = file.metadata().unwrap();
+    let cm = md.row_groups[0].columns[5].meta_data.as_ref().unwrap(); // l_extendedprice
+    let start = cm.dictionary_page_offset.unwrap_or(cm.data_page_offset) as u64;
+    let length = cm.total_compressed_size as u64;
+    let chunk = file.read_range(start, length).unwrap();
+    let mut walker = PageWalker::new(&chunk);
+
+    // Collect a few pages' compressed bytes.
+    let mut samples: Vec<Vec<u8>> = Vec::new();
+    let _ = walker.next_page().unwrap(); // dict
+    for _ in 0..10 {
+        if let Some((_hdr, body)) = walker.next_page().unwrap() {
+            samples.push(body.to_vec());
+        } else {
+            break;
+        }
+    }
+    let total_in: usize = samples.iter().map(|s| s.len()).sum();
+    let mut scratch: Vec<u8> = Vec::with_capacity(256 * 1024);
+
+    // Warmup.
+    for _ in 0..5 {
+        for s in &samples {
+            decompress_snappy_into(s, &mut scratch).unwrap();
+        }
+    }
+    let mut total_out: usize = 0;
+    for s in &samples {
+        decompress_snappy_into(s, &mut scratch).unwrap();
+        total_out += scratch.len();
+    }
+
+    let iters = 50;
+    let t0 = Instant::now();
+    for _ in 0..iters {
+        for s in &samples {
+            decompress_snappy_into(s, &mut scratch).unwrap();
+        }
+    }
+    let elapsed = t0.elapsed().as_secs_f64();
+    let bytes_in_total = total_in * iters;
+    let bytes_out_total = total_out * iters;
+    let gbps_in = bytes_in_total as f64 / elapsed / 1e9;
+    let gbps_out = bytes_out_total as f64 / elapsed / 1e9;
+    let ns_per_page = elapsed * 1e9 / (samples.len() * iters) as f64;
+    println!(
+        "  Snappy probe: {} pages × {} iters → {:.2} GB/s in, {:.2} GB/s out, {:.0} ns/page avg",
+        samples.len(),
+        iters,
+        gbps_in,
+        gbps_out,
+        ns_per_page
+    );
+    // Project total Snappy time for Q14: 6 RGs × 52 pages × 4 cols
+    // (shipdate + partkey + extprice + discount) ≈ 1248 pages.
+    let projected_total_ms = ns_per_page * 1248.0 / 1e6;
+    let projected_parallel_ms = projected_total_ms / 6.0;
+    println!(
+        "  Projected Q14 Snappy: {:.2} ms cumulative ({:.2} ms parallel wall on 6 cores)",
+        projected_total_ms, projected_parallel_ms
+    );
+}
+
 /// Run Q14 end-to-end. Row groups process in parallel via
 /// `std::thread::scope`, mirroring DataFusion's RG-level partitioning.
 fn run_q14(
@@ -454,6 +522,11 @@ fn main() {
         "Q14 ratio {} disagrees with reference",
         ratio
     );
+
+    // Snappy throughput probe (standalone — pulls real lineitem
+    // pages and times decompression alone).
+    probe_snappy_throughput(&li_path);
+    println!();
 
     // Per-stage profile (single run with instrumentation).
     let timing = std::sync::Mutex::new(Timing::default());
