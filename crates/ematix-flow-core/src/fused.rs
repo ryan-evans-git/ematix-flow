@@ -35,7 +35,7 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
 };
-use futures_util::stream::{self, TryStreamExt};
+use futures_util::stream::{self, StreamExt, TryStreamExt};
 
 /// Closed-range parameters for the canonical TPC-H Q6 predicate.
 ///
@@ -251,14 +251,21 @@ impl ExecutionPlan for FusedFilterSumExec {
 
         let schema_for_batch = schema.clone();
         let fut = async move {
-            // Drain every input partition.
-            let mut batches: Vec<RecordBatch> = Vec::new();
-            for p in 0..input_partitions {
-                let mut s = input.execute(p, context.clone())?;
-                while let Some(b) = s.try_next().await? {
-                    batches.push(b);
-                }
-            }
+            // Drain every input partition *concurrently*. Earlier the
+            // loop ran `execute(0); drain; execute(1); drain; …`, which
+            // serialized FastParquetExec's row-group-parallel readers
+            // and made the SQL-pattern-injected version of this exec
+            // 10 %+ *slower* than DataFusion's default Filter+Aggregate
+            // stack (the original problem this exec was meant to fix).
+            // `flatten_unordered(None)` fans out all per-partition
+            // streams and collects batches as soon as they arrive.
+            let streams: Vec<_> = (0..input_partitions)
+                .map(|p| input.execute(p, context.clone()))
+                .collect::<DfResult<Vec<_>>>()?;
+            let batches: Vec<RecordBatch> = stream::iter(streams)
+                .flatten_unordered(None)
+                .try_collect()
+                .await?;
 
             // Run the fused loop on a blocking worker so we don't
             // hijack the tokio runtime for ~ms of pure CPU work. Dispatch

@@ -174,3 +174,10 @@ path = "examples/parquet_rs_late_mat_q14.rs"
 name = "tpch_q6_plan_dump"
 path = "examples/tpch_q6_plan_dump.rs"
 
+# Σ.D3 phase D (real): bench Q6 with and without InjectFusedQ6Rule
+# registered. Same SQL, only difference is whether the rule rewrites
+# the Filter+Aggregate stack into a single FusedFilterSumExec.
+[[example]]
+name = "tpch_q6_inject_bench"
+path = "examples/tpch_q6_inject_bench.rs"
+
