@@ -16,9 +16,10 @@ from __future__ import annotations
 from datetime import datetime
 
 from ._iso import iso_utc, parse_iso
+from ._no_lease import NoLeaseSQLBackend
 
 
-class PostgresRunLog:
+class PostgresRunLog(NoLeaseSQLBackend):
     """PostgreSQL-backed run history.
 
     `dsn` is a libpq-style connection string ("postgresql://user@host/db",

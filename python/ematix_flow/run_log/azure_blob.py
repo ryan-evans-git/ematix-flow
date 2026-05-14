@@ -18,9 +18,10 @@ import json
 from datetime import datetime
 
 from ._iso import iso_utc, parse_iso
+from ._no_lease import NoLeaseBlobBackend
 
 
-class AzureBlobRunLog:
+class AzureBlobRunLog(NoLeaseBlobBackend):
     """Azure Blob Storage backend.
 
     Args:

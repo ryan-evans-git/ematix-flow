@@ -24,9 +24,10 @@ import json
 from datetime import datetime
 
 from ._iso import iso_utc, parse_iso
+from ._no_lease import NoLeaseBlobBackend
 
 
-class S3RunLog:
+class S3RunLog(NoLeaseBlobBackend):
     """AWS S3 (and S3-compatible) backend.
 
     Args:
