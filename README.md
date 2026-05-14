@@ -1478,6 +1478,7 @@ flow connections set warehouse url=postgres://...
 flow list                # registered pipelines
 flow run <name>          # one-shot
 flow run-due             # cron-style fire of all due pipelines (DAG-aware)
+flow scheduler --executor <url>   # long-running daemon: claim pipelines, dispatch to workers
 flow status              # operator view: per-pipeline status / next-due / attempts
 flow preview <name>      # dry-run, no commit
 flow validate <name>     # EXPLAIN against the target
@@ -1489,6 +1490,14 @@ flow consume <toml>      # streaming daemon (TOML form)
 flow consume --module my_pipelines <name>   # typed-Python form
 flow consume-list --module my_pipelines     # registered streaming pipelines
 ```
+
+`flow run-due` is the cron-tick model (external scheduler fires the
+process each minute). `flow scheduler` is the central-daemon model:
+one long-running process holds a leader lease, walks the DAG every
+`--poll-interval` seconds, and hands eligible pipelines to an
+Executor (`subprocess://`, `k8s://<ns>?image=...`,
+`lambda://<fn>`). See [USER_GUIDE.md § Central scheduler](docs/USER_GUIDE.md#central-scheduler-flow-scheduler)
+and [DEPLOYMENT.md recipe 8](docs/DEPLOYMENT.md#recipe-8--central-scheduler-fan-out-to-workers).
 
 `--module` points at any importable Python module.
 
