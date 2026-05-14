@@ -575,11 +575,29 @@ mod tests {
     use parquet::file::reader::{FileReader, SerializedFileReader};
 
     fn lineitem_path() -> Option<PathBuf> {
-        let p = match std::env::var("TPCH_DATA_DIR") {
-            Ok(s) => PathBuf::from(s).join("lineitem.parquet"),
-            Err(_) => PathBuf::from("examples/tpch/data/sf1/lineitem.parquet"),
-        };
-        if p.exists() { Some(p) } else { None }
+        // 1. Developer override.
+        if let Ok(s) = std::env::var("TPCH_DATA_DIR") {
+            let p = PathBuf::from(s).join("lineitem.parquet");
+            if p.exists() {
+                return Some(p);
+            }
+        }
+        // 2. Workspace SF=1 dataset, resolved against CARGO_MANIFEST_DIR
+        //    so the path is CWD-independent.
+        let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        if let Some(real) = manifest.parent().and_then(|p| p.parent()).map(|p| {
+            p.join("examples/tpch/data/sf1/lineitem.parquet")
+        }) {
+            if real.exists() {
+                return Some(real);
+            }
+        }
+        // 3. Fallback to the synthetic mini-fixture so the parquet-rs
+        //    oracle tests (decode-equality between our column decoders
+        //    and parquet-rs's typed column readers) can run in CI.
+        let mini = PathBuf::from(crate::test_support::tpch_mini_dir())
+            .join("lineitem.parquet");
+        mini.exists().then_some(mini)
     }
 
     fn pr_read_i32(path: &PathBuf, rg: usize, col: usize) -> Vec<i32> {

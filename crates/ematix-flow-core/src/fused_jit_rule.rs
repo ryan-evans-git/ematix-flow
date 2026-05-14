@@ -1717,7 +1717,16 @@ mod tests {
             Some(p) if p.exists() => p,
             _ => {
                 let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-                manifest.parent()?.parent()?.join("examples/tpch/data/sf1")
+                let real = manifest.parent()?.parent()?.join("examples/tpch/data/sf1");
+                if real.exists() {
+                    real
+                } else {
+                    // Fallback: synthetic mini-fixture (see
+                    // `test_support`). Lets the SQL plan-rewrite tests
+                    // exercise FastParquet end-to-end in CI without
+                    // the real SF=1 dataset on disk.
+                    PathBuf::from(crate::test_support::tpch_mini_dir())
+                }
             }
         };
         let p = dir.join("lineitem.parquet");

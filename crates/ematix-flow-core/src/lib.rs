@@ -89,6 +89,14 @@ pub mod transform;
 pub mod types;
 pub mod windowed;
 
+// Test-only TPC-H mini-fixture generator. Builds a tiny synthetic
+// dataset in a process-scoped tempdir on first use so the existing
+// integration tests can run in CI without `examples/tpch/data/sf1`
+// populated. See `test_support.rs` for the resolution-order contract
+// and the SF=1 cardinality gate.
+#[cfg(test)]
+pub(crate) mod test_support;
+
 pub use backend::{Backend, BackendError, Dialect, ObjectFormat, PostgresBackend, StreamingKind};
 pub use delta_backend::DeltaBackend;
 pub use duckdb_backend::DuckDBBackend;

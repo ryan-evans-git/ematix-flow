@@ -989,15 +989,33 @@ mod tests {
     use std::path::PathBuf;
 
     /// Resolve the SF=1 data dir, walking up from CARGO_MANIFEST_DIR
-    /// (`crates/ematix-flow-core`) to the workspace root.
+    /// (`crates/ematix-flow-core`) to the workspace root. Falls back
+    /// to the synthetic mini-fixture under `test_support` when neither
+    /// the env var nor the workspace `examples/tpch/data/sf1` path
+    /// resolves — see `test_support` module docs for the schema and
+    /// the SF=1 cardinality gate.
     fn sf1_dir() -> Option<PathBuf> {
         if let Ok(env) = std::env::var("TPCH_DATA_DIR") {
             let p = PathBuf::from(env);
-            return p.exists().then_some(p);
+            if p.exists() {
+                return Some(p);
+            }
         }
         let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let p = manifest.parent()?.parent()?.join("examples/tpch/data/sf1");
-        p.exists().then_some(p)
+        if let Some(p) = manifest
+            .parent()
+            .and_then(|p| p.parent())
+            .map(|p| p.join("examples/tpch/data/sf1"))
+        {
+            if p.exists() {
+                return Some(p);
+            }
+        }
+        // Synthetic mini-fixture fallback. Tests that rely on real
+        // SF=1 cardinalities gate on `test_support::is_real_sf1()`
+        // separately so they keep skipping under this path.
+        let mini = PathBuf::from(crate::test_support::tpch_mini_dir());
+        mini.exists().then_some(mini)
     }
 
     fn lineitem_parquet() -> Option<String> {
@@ -1006,6 +1024,13 @@ mod tests {
 
     #[test]
     fn provider_caches_schema_and_row_group_count() {
+        // Hard-coded SF=1 cardinality (`6` row groups). Skip on the
+        // synthetic mini-fixture — schema/field-name checks still
+        // happen in `provider_caches_schema_on_mini` below.
+        if !crate::test_support::is_real_sf1() {
+            eprintln!("TPC-H SF=1 data not generated; skipping test");
+            return;
+        }
         let Some(path) = lineitem_parquet() else {
             eprintln!("TPC-H SF=1 data not generated; skipping test");
             return;
@@ -1020,8 +1045,32 @@ mod tests {
         );
     }
 
+    /// Mini-fixture variant of the above: validates schema shape
+    /// (16 lineitem cols, first col `l_orderkey`) without pinning
+    /// the row-group count to SF=1's 6.
+    #[test]
+    fn provider_caches_schema_on_mini() {
+        let Some(path) = lineitem_parquet() else {
+            eprintln!("lineitem fixture missing; skipping test");
+            return;
+        };
+        let prov = FastParquetTableProvider::try_new(path).expect("open");
+        assert_eq!(prov.schema().fields().len(), 16, "lineitem has 16 cols");
+        assert!(
+            prov.num_row_groups() >= 1,
+            "expected at least one row group"
+        );
+        assert_eq!(prov.schema().field(0).name(), "l_orderkey");
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn scan_partition_count_is_min_of_rgs_and_target() {
+        // Pins SF=1 cardinality (6,001,215 rows / 6 partitions). Skip
+        // on the mini fixture.
+        if !crate::test_support::is_real_sf1() {
+            eprintln!("TPC-H SF=1 data not generated; skipping test");
+            return;
+        }
         let Some(path) = lineitem_parquet() else {
             eprintln!("TPC-H SF=1 data not generated; skipping test");
             return;
@@ -1101,6 +1150,10 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn count_star_matches_row_total() {
+        if !crate::test_support::is_real_sf1() {
+            eprintln!("TPC-H SF=1 data not generated; skipping test");
+            return;
+        }
         let Some(path) = lineitem_parquet() else {
             eprintln!("TPC-H SF=1 data not generated; skipping test");
             return;
@@ -1117,6 +1170,29 @@ mod tests {
             .downcast_ref::<datafusion::arrow::array::Int64Array>()
             .unwrap();
         assert_eq!(arr.value(0), 6_001_215, "SF=1 lineitem row count");
+    }
+
+    /// Mini-fixture variant: `count(*)` matches the provider's
+    /// reported `num_rows()` whatever the underlying dataset size.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn count_star_matches_provider_num_rows() {
+        let Some(path) = lineitem_parquet() else {
+            eprintln!("lineitem fixture missing; skipping test");
+            return;
+        };
+        use datafusion::prelude::SessionContext;
+        let prov = FastParquetTableProvider::try_new(path).unwrap();
+        let total = prov.num_rows();
+        let ctx = SessionContext::new();
+        ctx.register_table("lineitem", Arc::new(prov)).unwrap();
+        let df = ctx.sql("SELECT count(*) AS c FROM lineitem").await.unwrap();
+        let batches = df.collect().await.unwrap();
+        let arr = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::Int64Array>()
+            .unwrap();
+        assert_eq!(arr.value(0) as usize, total);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1164,6 +1240,13 @@ mod tests {
         use futures_util::StreamExt;
         use std::time::Instant;
 
+        // Pins SF=1 (50..=200) batch count expectation. Skip on the
+        // mini fixture; the underlying streaming behaviour is also
+        // covered by other tests that don't pin a batch-count window.
+        if !crate::test_support::is_real_sf1() {
+            eprintln!("TPC-H SF=1 data not generated; skipping test");
+            return;
+        }
         let Some(path) = lineitem_parquet() else {
             eprintln!("TPC-H SF=1 data not generated; skipping test");
             return;
@@ -1287,6 +1370,13 @@ mod tests {
         use datafusion::prelude::{SessionConfig, SessionContext};
         use futures_util::StreamExt;
 
+        // Pins SF=1 row count (6,001,215). Skip on the mini fixture;
+        // metric-surface registration is independent of cardinality
+        // so the SF=1 path is the canonical place to assert it.
+        if !crate::test_support::is_real_sf1() {
+            eprintln!("TPC-H SF=1 data not generated; skipping test");
+            return;
+        }
         let Some(path) = lineitem_parquet() else {
             eprintln!("TPC-H SF=1 data not generated; skipping test");
             return;
@@ -1512,6 +1602,13 @@ mod tests {
     async fn row_group_pruning_drops_groups_outside_shipdate_window() {
         use datafusion::logical_expr::{col, lit};
         use datafusion::prelude::{SessionConfig, SessionContext};
+        // Pins SF=1 row-group count (6). The pruning correctness over
+        // the mini fixture is covered by
+        // `row_group_pruning_preserves_result_correctness`.
+        if !crate::test_support::is_real_sf1() {
+            eprintln!("TPC-H SF=1 data not generated; skipping test");
+            return;
+        }
         let Some(path) = lineitem_parquet() else {
             eprintln!("TPC-H SF=1 data not generated; skipping test");
             return;
