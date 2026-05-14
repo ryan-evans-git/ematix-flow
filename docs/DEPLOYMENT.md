@@ -303,6 +303,127 @@ of using the URL form.
 
 ---
 
+## Recipe 8 — central scheduler, fan-out to workers
+
+Recipes 1–7 all use the **cron-tick** model: an external scheduler
+wakes `flow run-due` once per interval, fires whatever's due, and
+exits. This recipe uses `flow scheduler` instead — one long-running
+controller process holds a leader lease, walks the DAG every
+`--poll-interval` seconds, and dispatches each eligible pipeline to a
+disposable worker via an `Executor`. The controller never runs
+pipeline code itself.
+
+When to pick this over recipes 1–7:
+
+- You want sub-minute reactions (cron's minimum is one minute).
+- You want each pipeline isolated in its own pod / container instead
+  of crammed into one cron host.
+- You want one observable controller process (alerts, metrics, logs
+  in one place) instead of N-per-tick cron processes.
+
+Run multiple scheduler replicas for HA. Leader election uses the same
+`RunLog.claim` machinery as pipelines — there's no extra table, no
+separate consensus service. At most one replica walks the DAG per
+tick; the others log "leader is X" and sleep.
+
+**Install** (`Dockerfile`)
+
+```dockerfile
+FROM python:3.12-slim
+RUN pip install --no-cache-dir \
+    "ematix-flow[runlog-postgres,metrics-prometheus,executor-k8s]"
+COPY my_app/ /app/my_app/
+WORKDIR /app
+```
+
+**Scheduler Deployment** (k8s controller)
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: flow-scheduler
+spec:
+  replicas: 2                          # for HA; leader lease serialises them
+  selector: { matchLabels: { app: flow-scheduler } }
+  template:
+    metadata: { labels: { app: flow-scheduler } }
+    spec:
+      serviceAccountName: flow-scheduler   # needs k8s Job create + delete
+      containers:
+        - name: scheduler
+          image: my-registry/flow:latest
+          args:
+            - "flow"
+            - "scheduler"
+            - "--module=my_app.pipelines"
+            - "--executor=k8s://flow?image=my-registry/flow:latest&service-account=flow-worker"
+            - "--poll-interval=10"
+            - "--lease-seconds=300"
+          env:
+            - name: EMATIX_FLOW_RUN_LOG_URL
+              valueFrom: { secretKeyRef: { name: flow-secrets, key: pg-url } }
+            - name: EMATIX_FLOW_ALERTERS
+              value: "slack://hooks.slack.com/services/X/Y/Z"
+            - name: EMATIX_FLOW_METRICS
+              value: "otlp://otel-collector.observability:4317"
+```
+
+**RBAC for the controller** (`flow-scheduler` SA needs to create
+`Job`s in its namespace):
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata: { name: flow-job-runner, namespace: flow }
+rules:
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["create", "get", "list", "watch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata: { name: flow-scheduler, namespace: flow }
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: flow-job-runner
+subjects:
+  - { kind: ServiceAccount, name: flow-scheduler, namespace: flow }
+```
+
+The worker `Job`s (created by the controller) run as
+`flow-worker`, which only needs network access to the RunLog —
+no k8s API perms.
+
+**Executor URL alternatives**
+
+| URL | Spawns | Use when |
+| --- | --- | --- |
+| `subprocess://` | local `flow run` subprocess | Single host, no orchestrator. |
+| `subprocess+python://` | `python -m ematix_flow.cli run` via `sys.executable` | Dev / CI; no wheel on `PATH`. |
+| `k8s://<ns>?image=<img>&service-account=<sa>` | `batch/v1 Job` per pipeline | Multi-tenant cluster; pipeline isolation. |
+| `lambda://<fn>?qualifier=<alias>` | Async `Invoke(InvocationType="Event")` | AWS-native dispatch; lease-expiry handles death since Lambda has no cancel. |
+
+**State survival**
+
+- Postgres (or any durable RunLog) is the only shared state. The
+  scheduler holds no in-memory queue.
+- Killing a scheduler pod is safe — the leader lease expires after
+  `--lease-seconds`, the surviving replica takes over on the next
+  tick. Any worker `Job` already in flight keeps running and writes
+  outcome back to the RunLog independently.
+- A worker that dies mid-pipeline stops heartbeating; the next
+  scheduler tick sees the expired lease and the row becomes
+  claimable again. No separate "release" step.
+
+**Migrating from `flow run-due`** — run both side-by-side against the
+same RunLog. The per-pipeline claim CAS guarantees no
+double-dispatch, so you can leave cron up while you trust the new
+daemon, then remove the cron entry once you're satisfied.
+
+---
+
 ## Observability cheat sheet
 
 ### Alerters

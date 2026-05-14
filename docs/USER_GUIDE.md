@@ -1639,6 +1639,86 @@ Full operator-deployment recipes (per environment, with example
 URLs and the right pyproject extras for each backend):
 [`docs/DEPLOYMENT.md`](DEPLOYMENT.md).
 
+### Central scheduler (`flow scheduler`)
+
+`flow run-due` is the **cron-tick** model: an external scheduler
+(cron, systemd timer, k8s CronJob) wakes the process once per
+interval, fires whatever is due, and exits. State survives between
+ticks via the RunLog.
+
+`flow scheduler` is the **central-daemon** model: one long-running
+process holds a leader lease, walks the DAG every
+`--poll-interval` seconds, and hands eligible pipelines off to an
+**Executor** that spawns the actual work somewhere else (a local
+subprocess, a k8s `Job`, or a Lambda invocation). The scheduler
+itself never runs your pipeline code — it just decides what should
+fire next.
+
+Pick the central daemon when you want:
+
+- **Fan-out to disposable workers** instead of cramming every
+  pipeline into one cron host. k8s `Job` or Lambda dispatch gives
+  each pipeline its own pod / container.
+- **Sub-minute reactions**, e.g. dispatch within seconds of an
+  upstream succeeding. The cron model wakes at minute boundaries;
+  `--poll-interval 5` reacts within 5 seconds.
+- **One controller process** that's easy to observe and roll —
+  alerts on dispatch failure, metrics from a single source.
+
+```sh
+flow scheduler \
+    --module my_app.pipelines \
+    --executor "k8s://flow?image=my-registry/flow:latest&service-account=flow" \
+    --run-log-url postgres://flow:pw@db/flow_history \
+    --alerter slack://hooks.slack.com/services/T/B/X \
+    --metrics prometheus://:9100 \
+    --poll-interval 10 \
+    --lease-seconds 300
+```
+
+**How leader election works.** Multiple scheduler replicas can run
+side-by-side for HA; on each tick they all try to `claim` a
+reserved `_scheduler_singleton` row in the RunLog. Whichever one
+wins the CAS is the leader for that tick; the others log "leader
+is X" and sleep. A scheduler that crashes mid-tick loses its lease
+after `--lease-seconds` (default 300), and the next tick a
+replica takes over. The per-pipeline claim also CAS-protected, so
+even a brief two-leader window during a network partition can't
+double-dispatch.
+
+**Executor URL schemes.**
+
+| URL | Spawns | Install extra |
+| --- | --- | --- |
+| `subprocess://` | A `flow run` worker on the same host. Needs `flow` on `PATH`. | (none) |
+| `subprocess+python://` | `python -m ematix_flow.cli run` via `sys.executable`. Best for tests and dev shells where the wheel isn't on `PATH`. | (none) |
+| `k8s://<namespace>?image=<image>&service-account=<sa>` | A `batch/v1 Job` per pipeline (`backoffLimit: 0`, `restartPolicy: Never`). Image must have your `--module` importable. | `executor-k8s` |
+| `lambda://<function-name>?qualifier=<alias>` | Async `Invoke(InvocationType="Event")`. The Lambda's handler invokes `flow run` against the shared RunLog. | `executor-lambda` |
+
+**What workers do.** Each dispatched worker:
+
+1. Imports `--module` (so `@register` fires).
+2. Heartbeats the lease every `lease_seconds // 3` while running.
+3. Runs the pipeline.
+4. Records outcome to the same RunLog URL the scheduler reads from.
+5. Releases the claim on exit.
+
+If a worker dies mid-run, the heartbeat stops; on the next
+scheduler tick the lease is observed as expired and the row
+becomes claimable again. There is no separate "release" step.
+
+**Migration from `flow run-due`.** The two models share the
+RunLog, the alerter URLs, the metrics URL, and the
+`@register(retry=...)` semantics — switching is a deployment
+change, not a code change. A typical migration:
+
+1. Keep your existing `flow run-due` cron running.
+2. Stand up `flow scheduler` against the **same** RunLog. The
+   leader lock means only one of (cron, scheduler) will actually
+   dispatch each minute — whichever wins the per-pipeline CAS
+   first. There's no double-fire.
+3. Once you trust the daemon, remove the cron entry.
+
 ### Prometheus metrics
 
 The CLI binary exposes `/metrics` on `--metrics-port`. Every
