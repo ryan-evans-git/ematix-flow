@@ -111,7 +111,11 @@ async fn main() {
     println!();
 
     let off = bench("FastParquet SQL (rule OFF)", &build_ctx(&dir, false).await).await;
-    let on = bench("FastParquet SQL (rule ON — InjectFusedQ12Rule)", &build_ctx(&dir, true).await).await;
+    let on = bench(
+        "FastParquet SQL (rule ON — InjectFusedQ12Rule)",
+        &build_ctx(&dir, true).await,
+    )
+    .await;
 
     let pct = 100.0 * (off - on) / off;
     println!();

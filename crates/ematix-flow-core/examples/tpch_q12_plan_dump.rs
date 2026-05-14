@@ -50,7 +50,13 @@ async fn main() {
         let prov = FastParquetTableProvider::try_new(p).unwrap();
         ctx.register_table(*t, Arc::new(prov)).unwrap();
     }
-    let plan = ctx.sql(&sql).await.unwrap().create_physical_plan().await.unwrap();
+    let plan = ctx
+        .sql(&sql)
+        .await
+        .unwrap()
+        .create_physical_plan()
+        .await
+        .unwrap();
     println!("--- Tree (names only) ---");
     print_tree(&plan, 0);
     println!();

@@ -829,8 +829,7 @@ impl FusedFilterAggJit {
         builder.finalize();
 
         // ----- 4. Verify + define + finalize -----
-        verify_function(&ctx.func, module.isa())
-            .map_err(|e| format!("verify_function: {e}"))?;
+        verify_function(&ctx.func, module.isa()).map_err(|e| format!("verify_function: {e}"))?;
         module
             .define_function(func_id, &mut ctx)
             .map_err(|e| format!("define_function: {e}"))?;
@@ -910,7 +909,9 @@ fn emit_match_path_ungrouped(
     row_skip: Block,
 ) {
     let match_block = builder.create_block();
-    builder.ins().brif(pass_all, match_block, &[], row_skip, &[]);
+    builder
+        .ins()
+        .brif(pass_all, match_block, &[], row_skip, &[]);
 
     builder.switch_to_block(match_block);
     builder.seal_block(match_block);
@@ -953,7 +954,9 @@ fn emit_match_path_grouped(
     let catchall_idx = n_known;
 
     let setup_block = builder.create_block();
-    builder.ins().brif(pass_all, setup_block, &[], row_skip, &[]);
+    builder
+        .ins()
+        .brif(pass_all, setup_block, &[], row_skip, &[]);
 
     // setup_block: compute terms + key bytes, then start the dispatch chain.
     builder.switch_to_block(setup_block);
@@ -993,9 +996,7 @@ fn emit_match_path_grouped(
             // the catch-all body.
             group_bodies[catchall_idx]
         };
-        builder
-            .ins()
-            .brif(mask, group_bodies[k], &[], next, &[]);
+        builder.ins().brif(mask, group_bodies[k], &[], next, &[]);
     }
     // If `n_known == 0` for some reason, every row goes to catchall
     // (the dispatch chain would be skipped). The setup_block in that
@@ -1022,11 +1023,7 @@ fn emit_match_path_grouped(
 /// Build an i8 mask that's true iff every `key_bytes[j] == known[j]`.
 /// Both sides are zero-extended to i32 for the comparison so the
 /// integer-compare instruction matches the byte values cleanly.
-fn build_key_match(
-    builder: &mut FunctionBuilder,
-    key_bytes: &[Value],
-    known: &[u8],
-) -> Value {
+fn build_key_match(builder: &mut FunctionBuilder, key_bytes: &[Value], known: &[u8]) -> Value {
     debug_assert_eq!(key_bytes.len(), known.len());
     let mut acc: Option<Value> = None;
     for (j, &b) in known.iter().enumerate() {
@@ -1205,9 +1202,7 @@ fn emit_clause(
     let slot = builder.ins().iadd(col_base, off);
     match clause.op {
         ClauseOp::F64Ge | ClauseOp::F64Le | ClauseOp::F64Lt | ClauseOp::F64Gt => {
-            let v = builder
-                .ins()
-                .load(types::F64, MemFlags::trusted(), slot, 0);
+            let v = builder.ins().load(types::F64, MemFlags::trusted(), slot, 0);
             let imm = builder.ins().f64const(clause.imm_f64);
             let cc = match clause.op {
                 ClauseOp::F64Ge => FloatCC::GreaterThanOrEqual,
@@ -1219,12 +1214,8 @@ fn emit_clause(
             builder.ins().fcmp(cc, v, imm)
         }
         ClauseOp::I32Ge | ClauseOp::I32Le | ClauseOp::I32Lt | ClauseOp::I32Gt => {
-            let v = builder
-                .ins()
-                .load(types::I32, MemFlags::trusted(), slot, 0);
-            let imm = builder
-                .ins()
-                .iconst(types::I32, i64::from(clause.imm_i32));
+            let v = builder.ins().load(types::I32, MemFlags::trusted(), slot, 0);
+            let imm = builder.ins().iconst(types::I32, i64::from(clause.imm_i32));
             let cc = match clause.op {
                 ClauseOp::I32Ge => IntCC::SignedGreaterThanOrEqual,
                 ClauseOp::I32Le => IntCC::SignedLessThanOrEqual,
@@ -1294,12 +1285,7 @@ fn emit_agg_term(
             let om = builder.ins().fsub(one, bv);
             let term = builder.ins().fmul(av, om);
             // Prefix match on the Utf8View's inline bytes (offset +4).
-            let prefix_match = emit_utf8view_prefix_match(
-                builder,
-                col_ptrs[*guard_col],
-                i,
-                prefix,
-            );
+            let prefix_match = emit_utf8view_prefix_match(builder, col_ptrs[*guard_col], i, prefix);
             // Branchless: pick `term` if prefix matched, else 0.0.
             let zero = builder.ins().f64const(0.0);
             builder.ins().select(prefix_match, term, zero)
@@ -1465,11 +1451,7 @@ mod tests {
         // SAFETY: inputs all have length >= n; outputs has len >= 1; pointer
         // alignment is upheld by the source slices' element type.
         unsafe {
-            jit.run(
-                shipdate.len() as i64,
-                inputs.as_ptr(),
-                outputs.as_mut_ptr(),
-            );
+            jit.run(shipdate.len() as i64, inputs.as_ptr(), outputs.as_mut_ptr());
         }
         outputs[0]
     }
@@ -1564,10 +1546,7 @@ mod tests {
         let spec = FusedFilterAggSpec {
             inputs: vec![ColumnTy::Float64, ColumnTy::Float64],
             predicate: vec![],
-            aggregates: vec![
-                AggExpr::SumColumn(0),
-                AggExpr::SumProductColumns(0, 1),
-            ],
+            aggregates: vec![AggExpr::SumColumn(0), AggExpr::SumProductColumns(0, 1)],
             group: None,
         };
         let jit = FusedFilterAggJit::try_build(&spec).expect("build");
@@ -1649,11 +1628,7 @@ mod tests {
         // holds exactly 30 f64 cells matching `jit.n_outputs()`.
         assert_eq!(jit.n_outputs(), 30);
         unsafe {
-            jit.run(
-                ship.len() as i64,
-                inputs.as_ptr(),
-                outputs.as_mut_ptr(),
-            );
+            jit.run(ship.len() as i64, inputs.as_ptr(), outputs.as_mut_ptr());
         }
 
         // (N,F) is group 1 in q1's known_keys order. n_aggs=6 cells per group.
@@ -1678,7 +1653,10 @@ mod tests {
         // (R,F) row was filtered out by the shipdate predicate, so its
         // group cells (group 0) must remain zero.
         let rf = &outputs[0 * 6..0 * 6 + 6];
-        assert!(rf.iter().all(|v| *v == 0.0), "(R,F) shouldn't accumulate: {rf:?}");
+        assert!(
+            rf.iter().all(|v| *v == 0.0),
+            "(R,F) shouldn't accumulate: {rf:?}"
+        );
 
         // Catch-all (group 4) must also be zero — no rows had unknown keys.
         let catch = &outputs[4 * 6..4 * 6 + 6];
@@ -1708,8 +1686,8 @@ mod tests {
             v
         }
         let ptype_views: Vec<[u8; 16]> = vec![
-            view_of("PROMO BRUSH"),    // 11 bytes — fits inline
-            view_of("PROMO POLIS"),    // also fits
+            view_of("PROMO BRUSH"), // 11 bytes — fits inline
+            view_of("PROMO POLIS"), // also fits
             view_of("ECONOMY ANO"),
             view_of("STANDARD PO"),
         ];
@@ -1728,11 +1706,7 @@ mod tests {
         // has 2 cells matching jit.n_outputs().
         assert_eq!(jit.n_outputs(), 2);
         unsafe {
-            jit.run(
-                price.len() as i64,
-                inputs.as_ptr(),
-                outputs.as_mut_ptr(),
-            );
+            jit.run(price.len() as i64, inputs.as_ptr(), outputs.as_mut_ptr());
         }
         let promo = outputs[0];
         let total = outputs[1];

@@ -32,9 +32,9 @@
 use std::sync::Arc;
 
 use datafusion::common::Result as DfResult;
+use datafusion::common::ScalarValue;
 use datafusion::common::config::ConfigOptions;
 use datafusion::common::tree_node::{Transformed, TreeNode};
-use datafusion::common::ScalarValue;
 use datafusion::logical_expr::Operator;
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_expr::expressions::{BinaryExpr, Column, Literal};
@@ -70,28 +70,22 @@ impl PhysicalOptimizerRule for EnableFusedJitRule {
             // FusedFilterSumExec (Σ.D1 / Q6 shape)
             if let Some(e) = node.as_any().downcast_ref::<FusedFilterSumExec>() {
                 if !e.has_jit() {
-                    let new = FusedFilterSumExec::try_new_q6_jit(
-                        e.input().clone(),
-                        e.predicate(),
-                    )?;
+                    let new = FusedFilterSumExec::try_new_q6_jit(e.input().clone(), e.predicate())?;
                     return Ok(Transformed::yes(Arc::new(new) as Arc<dyn ExecutionPlan>));
                 }
             }
             // FusedFilterMultiAggExec (Σ.D2 / Q1 shape)
             if let Some(e) = node.as_any().downcast_ref::<FusedFilterMultiAggExec>() {
                 if !e.has_jit() {
-                    let new = FusedFilterMultiAggExec::try_new_q1_jit(
-                        e.input().clone(),
-                        e.predicate(),
-                    )?;
+                    let new =
+                        FusedFilterMultiAggExec::try_new_q1_jit(e.input().clone(), e.predicate())?;
                     return Ok(Transformed::yes(Arc::new(new) as Arc<dyn ExecutionPlan>));
                 }
             }
             // FusedPostJoinExec — JIT only currently supports Q14.
             if let Some(e) = node.as_any().downcast_ref::<FusedPostJoinExec>() {
                 if !e.has_jit() && matches!(e.spec(), FusedPostJoinSpec::Q14) {
-                    let new =
-                        FusedPostJoinExec::try_new_jit(e.input().clone(), e.spec())?;
+                    let new = FusedPostJoinExec::try_new_jit(e.input().clone(), e.spec())?;
                     return Ok(Transformed::yes(Arc::new(new) as Arc<dyn ExecutionPlan>));
                 }
             }
@@ -189,7 +183,10 @@ fn try_match_q6_plan(node: &Arc<dyn ExecutionPlan>) -> DfResult<Option<Arc<dyn E
         return Ok(None);
     };
     // Top ProjectionExec output: single column named "revenue".
-    let proj = shape.top_projection.as_ref().expect("config requires top projection");
+    let proj = shape
+        .top_projection
+        .as_ref()
+        .expect("config requires top projection");
     if proj.schema().field(0).name() != "revenue" {
         return Ok(None);
     }
@@ -265,7 +262,11 @@ fn is_sum_extprice_times_discount(
         return false;
     }
     let lname = b.left().as_any().downcast_ref::<Column>().map(|c| c.name());
-    let rname = b.right().as_any().downcast_ref::<Column>().map(|c| c.name());
+    let rname = b
+        .right()
+        .as_any()
+        .downcast_ref::<Column>()
+        .map(|c| c.name());
     matches!(
         (lname, rname),
         (Some("l_extendedprice"), Some("l_discount"))
@@ -341,9 +342,7 @@ fn flatten_and<'a>(expr: &'a Arc<dyn PhysicalExpr>, out: &mut Vec<&'a Arc<dyn Ph
 /// Try to interpret `expr` as `Column ⊕ Literal` (or its mirror) and
 /// return the canonicalised `(column_name, op, literal)`. Returns
 /// `None` for any other shape.
-fn decompose_leaf(
-    expr: &Arc<dyn PhysicalExpr>,
-) -> Option<(&'static str, Operator, ScalarValue)> {
+fn decompose_leaf(expr: &Arc<dyn PhysicalExpr>) -> Option<(&'static str, Operator, ScalarValue)> {
     let b = expr.as_any().downcast_ref::<BinaryExpr>()?;
     let op = *b.op();
     let (col, lit, flipped) = match (
@@ -518,9 +517,10 @@ fn match_aggregate_query_shape(
                 .ok_or_else(|| dferr("shape match: ProjectionExec missing input"))?;
             // We need an owned Arc<ProjectionExec> for the result struct;
             // `downcast_ref` only gives a borrow. Rebuild by cloning.
-            let owned: Arc<ProjectionExec> = Arc::new(
-                ProjectionExec::try_new(proj.expr().to_vec(), proj.children()[0].clone())?,
-            );
+            let owned: Arc<ProjectionExec> = Arc::new(ProjectionExec::try_new(
+                proj.expr().to_vec(),
+                proj.children()[0].clone(),
+            )?);
             (Some(owned), next)
         } else {
             (None, after_sort)
@@ -724,7 +724,10 @@ fn try_match_q1_plan(node: &Arc<dyn ExecutionPlan>) -> DfResult<Option<Arc<dyn E
     let Some(shape) = match_aggregate_query_shape(node, &CFG)? else {
         return Ok(None);
     };
-    let top_proj = shape.top_projection.as_ref().expect("config requires top projection");
+    let top_proj = shape
+        .top_projection
+        .as_ref()
+        .expect("config requires top projection");
     if !projection_emits_q1_select_list(top_proj.schema().as_ref()) {
         return Ok(None);
     }
@@ -794,8 +797,16 @@ fn group_by_is_returnflag_linestatus(agg: &AggregateExec) -> bool {
     if exprs.len() != 2 {
         return false;
     }
-    let a = exprs[0].0.as_any().downcast_ref::<Column>().map(|c| c.name());
-    let b = exprs[1].0.as_any().downcast_ref::<Column>().map(|c| c.name());
+    let a = exprs[0]
+        .0
+        .as_any()
+        .downcast_ref::<Column>()
+        .map(|c| c.name());
+    let b = exprs[1]
+        .0
+        .as_any()
+        .downcast_ref::<Column>()
+        .map(|c| c.name());
     matches!(
         (a, b),
         (Some("l_returnflag"), Some("l_linestatus")) | (Some("l_linestatus"), Some("l_returnflag"))
@@ -853,9 +864,7 @@ fn extract_q1_predicate(expr: &Arc<dyn PhysicalExpr>) -> Option<Q1Predicate> {
 /// Generic `Column ⊕ Literal` (or `Literal ⊕ Column`) decomposer.
 /// Same shape as `decompose_leaf` in the Q6 rule but un-aliased to a
 /// single static column name set, since Q1 only filters on one column.
-fn decompose_filter_leaf(
-    expr: &Arc<dyn PhysicalExpr>,
-) -> Option<(String, Operator, ScalarValue)> {
+fn decompose_filter_leaf(expr: &Arc<dyn PhysicalExpr>) -> Option<(String, Operator, ScalarValue)> {
     let b = expr.as_any().downcast_ref::<BinaryExpr>()?;
     let op = *b.op();
     match (
@@ -958,13 +967,14 @@ fn try_match_q14_plan(node: &Arc<dyn ExecutionPlan>) -> DfResult<Option<Arc<dyn 
     let Some(shape) = match_aggregate_query_shape(node, &CFG)? else {
         return Ok(None);
     };
-    let proj = shape.top_projection.as_ref().expect("config requires top projection");
+    let proj = shape
+        .top_projection
+        .as_ref()
+        .expect("config requires top projection");
     if proj.schema().field(0).name() != "promo_revenue" {
         return Ok(None);
     }
-    if !both_are_sum(shape.final_agg.aggr_expr())
-        || !both_are_sum(shape.partial_agg.aggr_expr())
-    {
+    if !both_are_sum(shape.final_agg.aggr_expr()) || !both_are_sum(shape.partial_agg.aggr_expr()) {
         return Ok(None);
     }
     let after_cse: Arc<dyn ExecutionPlan> = shape.body;
@@ -986,14 +996,13 @@ fn try_match_q14_plan(node: &Arc<dyn ExecutionPlan>) -> DfResult<Option<Arc<dyn 
     // which is `lineitem` (has l_partkey + l_extendedprice + …). The
     // planner consistently puts `part` on the build side here but we
     // detect by schema rather than hard-coding position.
-    let (part_scan, lineitem_branch) =
-        if descend_finds_part_columns(&build_side) {
-            (build_side, probe_side)
-        } else if descend_finds_part_columns(&probe_side) {
-            (probe_side, build_side)
-        } else {
-            return Ok(None);
-        };
+    let (part_scan, lineitem_branch) = if descend_finds_part_columns(&build_side) {
+        (build_side, probe_side)
+    } else if descend_finds_part_columns(&probe_side) {
+        (probe_side, build_side)
+    } else {
+        return Ok(None);
+    };
 
     // Resolve the part scan (strip RepartitionExec wrappers).
     let part_scan = match descend_to_scan_with(&part_scan, scan_has_part_columns) {
@@ -1004,19 +1013,16 @@ fn try_match_q14_plan(node: &Arc<dyn ExecutionPlan>) -> DfResult<Option<Arc<dyn 
     // Resolve the lineitem branch: walk down to a FilterExec, extract
     // the Q14Predicate, then walk *past* the FilterExec to the bare
     // scan (FusedQ14FullExec re-applies the predicate internally).
-    let (predicate, lineitem_scan) =
-        match descend_to_q14_lineitem_scan(&lineitem_branch) {
-            Some((p, s)) => (p, s),
-            None => return Ok(None),
-        };
+    let (predicate, lineitem_scan) = match descend_to_q14_lineitem_scan(&lineitem_branch) {
+        Some((p, s)) => (p, s),
+        None => return Ok(None),
+    };
 
     let fused = FusedQ14FullExec::try_new(lineitem_scan, part_scan, predicate)?;
     Ok(Some(Arc::new(fused) as Arc<dyn ExecutionPlan>))
 }
 
-fn both_are_sum(
-    aggs: &[Arc<datafusion::physical_expr::aggregate::AggregateFunctionExpr>],
-) -> bool {
+fn both_are_sum(aggs: &[Arc<datafusion::physical_expr::aggregate::AggregateFunctionExpr>]) -> bool {
     aggs.iter()
         .all(|a| a.fun().name().eq_ignore_ascii_case("sum"))
 }
@@ -1179,13 +1185,14 @@ fn try_match_q3_plan(node: &Arc<dyn ExecutionPlan>) -> DfResult<Option<Arc<dyn E
     let Some(shape) = match_aggregate_query_shape(node, &CFG)? else {
         return Ok(None);
     };
-    let proj = shape.top_projection.as_ref().expect("config requires top projection");
+    let proj = shape
+        .top_projection
+        .as_ref()
+        .expect("config requires top projection");
     if !projection_emits_q3_select_list(proj.schema().as_ref()) {
         return Ok(None);
     }
-    if !group_by_is_q3_keys(&shape.final_agg)
-        || !group_by_is_q3_keys(&shape.partial_agg)
-    {
+    if !group_by_is_q3_keys(&shape.final_agg) || !group_by_is_q3_keys(&shape.partial_agg) {
         return Ok(None);
     }
     if !is_sum_extprice_times_one_minus_discount(&shape.final_agg.aggr_expr()[0]) {
@@ -1323,7 +1330,10 @@ fn try_match_q5_plan(node: &Arc<dyn ExecutionPlan>) -> DfResult<Option<Arc<dyn E
     let Some(shape) = match_aggregate_query_shape(node, &CFG)? else {
         return Ok(None);
     };
-    let proj = shape.top_projection.as_ref().expect("config requires top projection");
+    let proj = shape
+        .top_projection
+        .as_ref()
+        .expect("config requires top projection");
     if !projection_emits_q5_select_list(proj.schema().as_ref()) {
         return Ok(None);
     }
@@ -1428,13 +1438,14 @@ fn try_match_q12_plan(node: &Arc<dyn ExecutionPlan>) -> DfResult<Option<Arc<dyn 
     let Some(shape) = match_aggregate_query_shape(node, &CFG)? else {
         return Ok(None);
     };
-    let proj = shape.top_projection.as_ref().expect("config requires top projection");
+    let proj = shape
+        .top_projection
+        .as_ref()
+        .expect("config requires top projection");
     if !projection_emits_q12_select_list(proj.schema().as_ref()) {
         return Ok(None);
     }
-    if !group_by_is_l_shipmode(&shape.final_agg)
-        || !group_by_is_l_shipmode(&shape.partial_agg)
-    {
+    if !group_by_is_l_shipmode(&shape.final_agg) || !group_by_is_l_shipmode(&shape.partial_agg) {
         return Ok(None);
     }
     if !both_are_sum(shape.final_agg.aggr_expr()) {
@@ -1600,9 +1611,8 @@ mod tests {
     #[tokio::test]
     async fn rule_enables_jit_on_hand_coded_q6_exec() {
         let input = input_plan_for_q6().await;
-        let hand = Arc::new(
-            FusedFilterSumExec::try_new_q6(input, q6_predicate_canonical()).unwrap(),
-        );
+        let hand =
+            Arc::new(FusedFilterSumExec::try_new_q6(input, q6_predicate_canonical()).unwrap());
         assert!(!hand.has_jit(), "starting state: hand-coded");
 
         let rule = EnableFusedJitRule;
@@ -1620,9 +1630,8 @@ mod tests {
     #[tokio::test]
     async fn rule_is_idempotent() {
         let input = input_plan_for_q6().await;
-        let already_jit = Arc::new(
-            FusedFilterSumExec::try_new_q6_jit(input, q6_predicate_canonical()).unwrap(),
-        );
+        let already_jit =
+            Arc::new(FusedFilterSumExec::try_new_q6_jit(input, q6_predicate_canonical()).unwrap());
         let rule = EnableFusedJitRule;
         let cfg = ConfigOptions::new();
         let optimized = rule.optimize(already_jit, &cfg).unwrap();
@@ -1641,14 +1650,12 @@ mod tests {
         use datafusion::arrow::array::Float64Array;
 
         let hand_input = input_plan_for_q6().await;
-        let hand_exec: Arc<dyn ExecutionPlan> = Arc::new(
-            FusedFilterSumExec::try_new_q6(hand_input, q6_predicate_canonical()).unwrap(),
-        );
+        let hand_exec: Arc<dyn ExecutionPlan> =
+            Arc::new(FusedFilterSumExec::try_new_q6(hand_input, q6_predicate_canonical()).unwrap());
 
         let rule_input = input_plan_for_q6().await;
-        let pre_rule: Arc<dyn ExecutionPlan> = Arc::new(
-            FusedFilterSumExec::try_new_q6(rule_input, q6_predicate_canonical()).unwrap(),
-        );
+        let pre_rule: Arc<dyn ExecutionPlan> =
+            Arc::new(FusedFilterSumExec::try_new_q6(rule_input, q6_predicate_canonical()).unwrap());
         let cfg = ConfigOptions::new();
         let rewritten = EnableFusedJitRule.optimize(pre_rule, &cfg).unwrap();
 
@@ -1714,10 +1721,7 @@ mod tests {
             Some(p) if p.exists() => p,
             _ => {
                 let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-                manifest
-                    .parent()?
-                    .parent()?
-                    .join("examples/tpch/data/sf1")
+                manifest.parent()?.parent()?.join("examples/tpch/data/sf1")
             }
         };
         let p = dir.join("lineitem.parquet");
@@ -1925,7 +1929,13 @@ mod tests {
         );
 
         let r_with = ctx_with.sql(Q1_SQL).await.unwrap().collect().await.unwrap();
-        let r_without = ctx_without.sql(Q1_SQL).await.unwrap().collect().await.unwrap();
+        let r_without = ctx_without
+            .sql(Q1_SQL)
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
         assert_eq!(r_with.len(), r_without.len(), "batch count");
         let bw = &r_with[0];
         let bo = &r_without[0];
@@ -1942,8 +1952,16 @@ mod tests {
             }
         }
         for col_idx in 2..=8 {
-            let w = bw.column(col_idx).as_any().downcast_ref::<Float64Array>().unwrap();
-            let o = bo.column(col_idx).as_any().downcast_ref::<Float64Array>().unwrap();
+            let w = bw
+                .column(col_idx)
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .unwrap();
+            let o = bo
+                .column(col_idx)
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .unwrap();
             for r in 0..bw.num_rows() {
                 let wv = w.value(r);
                 let ov = o.value(r);
@@ -2065,8 +2083,20 @@ mod tests {
             "InjectFusedQ14Rule did not fire on canonical Q14 plan.\nPlan:\n{plan_str}"
         );
 
-        let r_with = ctx_with.sql(Q14_SQL).await.unwrap().collect().await.unwrap();
-        let r_without = ctx_without.sql(Q14_SQL).await.unwrap().collect().await.unwrap();
+        let r_with = ctx_with
+            .sql(Q14_SQL)
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let r_without = ctx_without
+            .sql(Q14_SQL)
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
         let v_with = r_with[0]
             .column(0)
             .as_any()
@@ -2203,7 +2233,13 @@ mod tests {
         };
         let ctx_without: SessionContext = ctx_for_q35::<EnableFusedJitRule>(None).await.unwrap();
 
-        let plan = ctx_with.sql(Q3_SQL).await.unwrap().create_physical_plan().await.unwrap();
+        let plan = ctx_with
+            .sql(Q3_SQL)
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
         let plan_str = displayable(plan.as_ref()).indent(true).to_string();
         assert!(
             plan_str.contains("FusedPostJoinExec"),
@@ -2211,17 +2247,32 @@ mod tests {
         );
 
         let r_with = ctx_with.sql(Q3_SQL).await.unwrap().collect().await.unwrap();
-        let r_without = ctx_without.sql(Q3_SQL).await.unwrap().collect().await.unwrap();
+        let r_without = ctx_without
+            .sql(Q3_SQL)
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
         // Concatenate into one batch each, then lex-sort, then compare.
         let bw = datafusion::arrow::compute::concat_batches(&r_with[0].schema(), &r_with).unwrap();
-        let bo = datafusion::arrow::compute::concat_batches(&r_without[0].schema(), &r_without).unwrap();
+        let bo =
+            datafusion::arrow::compute::concat_batches(&r_without[0].schema(), &r_without).unwrap();
         assert_eq!(bw.num_rows(), bo.num_rows(), "row count");
         let bw = lex_sort_batch(&bw);
         let bo = lex_sort_batch(&bo);
 
         // Revenue is column 1. Compare to rel_err < 1e-10 cell by cell.
-        let w = bw.column(1).as_any().downcast_ref::<Float64Array>().unwrap();
-        let o = bo.column(1).as_any().downcast_ref::<Float64Array>().unwrap();
+        let w = bw
+            .column(1)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        let o = bo
+            .column(1)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
         for r in 0..bw.num_rows() {
             let rel = (w.value(r) - o.value(r)).abs()
                 / o.value(r).abs().max(w.value(r).abs()).max(1e-300);
@@ -2233,7 +2284,9 @@ mod tests {
             );
         }
         // Sanity-check the group keys match too (l_orderkey int64, dates).
-        let _ = bw.column(0).as_primitive_opt::<datafusion::arrow::datatypes::Int64Type>();
+        let _ = bw
+            .column(0)
+            .as_primitive_opt::<datafusion::arrow::datatypes::Int64Type>();
     }
 
     // ----- InjectFusedQ12Rule tests -----
@@ -2265,17 +2318,36 @@ mod tests {
         };
         let ctx_without: SessionContext = ctx_for_q35::<EnableFusedJitRule>(None).await.unwrap();
 
-        let plan = ctx_with.sql(Q12_SQL).await.unwrap().create_physical_plan().await.unwrap();
+        let plan = ctx_with
+            .sql(Q12_SQL)
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
         let plan_str = displayable(plan.as_ref()).indent(true).to_string();
         assert!(
             plan_str.contains("FusedPostJoinExec"),
             "InjectFusedQ12Rule did not fire.\nPlan:\n{plan_str}"
         );
 
-        let r_with = ctx_with.sql(Q12_SQL).await.unwrap().collect().await.unwrap();
-        let r_without = ctx_without.sql(Q12_SQL).await.unwrap().collect().await.unwrap();
+        let r_with = ctx_with
+            .sql(Q12_SQL)
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let r_without = ctx_without
+            .sql(Q12_SQL)
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
         let bw = datafusion::arrow::compute::concat_batches(&r_with[0].schema(), &r_with).unwrap();
-        let bo = datafusion::arrow::compute::concat_batches(&r_without[0].schema(), &r_without).unwrap();
+        let bo =
+            datafusion::arrow::compute::concat_batches(&r_without[0].schema(), &r_without).unwrap();
         assert_eq!(bw.num_rows(), bo.num_rows(), "row count");
         assert_eq!(bw.num_rows(), 2, "Q12 SF=1 yields 2 groups (MAIL/SHIP)");
 
@@ -2295,11 +2367,31 @@ mod tests {
                 read_name(bo.column(0).as_ref(), r),
                 "shipmode row {r}"
             );
-            let w_high = bw.column(1).as_any().downcast_ref::<Int64Array>().unwrap().value(r);
-            let o_high = bo.column(1).as_any().downcast_ref::<Int64Array>().unwrap().value(r);
+            let w_high = bw
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(r);
+            let o_high = bo
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(r);
             assert_eq!(w_high, o_high, "high_line_count row {r}");
-            let w_low = bw.column(2).as_any().downcast_ref::<Int64Array>().unwrap().value(r);
-            let o_low = bo.column(2).as_any().downcast_ref::<Int64Array>().unwrap().value(r);
+            let w_low = bw
+                .column(2)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(r);
+            let o_low = bo
+                .column(2)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(r);
             assert_eq!(w_low, o_low, "low_line_count row {r}");
         }
     }
@@ -2337,7 +2429,13 @@ mod tests {
         };
         let ctx_without: SessionContext = ctx_for_q35::<EnableFusedJitRule>(None).await.unwrap();
 
-        let plan = ctx_with.sql(Q5_SQL).await.unwrap().create_physical_plan().await.unwrap();
+        let plan = ctx_with
+            .sql(Q5_SQL)
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
         let plan_str = displayable(plan.as_ref()).indent(true).to_string();
         assert!(
             plan_str.contains("FusedPostJoinExec"),
@@ -2345,9 +2443,16 @@ mod tests {
         );
 
         let r_with = ctx_with.sql(Q5_SQL).await.unwrap().collect().await.unwrap();
-        let r_without = ctx_without.sql(Q5_SQL).await.unwrap().collect().await.unwrap();
+        let r_without = ctx_without
+            .sql(Q5_SQL)
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
         let bw = datafusion::arrow::compute::concat_batches(&r_with[0].schema(), &r_with).unwrap();
-        let bo = datafusion::arrow::compute::concat_batches(&r_without[0].schema(), &r_without).unwrap();
+        let bo =
+            datafusion::arrow::compute::concat_batches(&r_without[0].schema(), &r_without).unwrap();
         assert_eq!(bw.num_rows(), bo.num_rows(), "row count");
 
         // Match by n_name (col 0) for a stable comparison — string keys
@@ -2363,8 +2468,16 @@ mod tests {
                 panic!("unexpected string variant")
             }
         };
-        let w_rev = bw.column(1).as_any().downcast_ref::<Float64Array>().unwrap();
-        let o_rev = bo.column(1).as_any().downcast_ref::<Float64Array>().unwrap();
+        let w_rev = bw
+            .column(1)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        let o_rev = bo
+            .column(1)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
         let mut w_map = std::collections::HashMap::<String, f64>::new();
         let mut o_map = std::collections::HashMap::<String, f64>::new();
         for r in 0..bw.num_rows() {
@@ -2372,9 +2485,14 @@ mod tests {
             o_map.insert(read_name(o_names.as_ref(), r), o_rev.value(r));
         }
         for (k, wv) in &w_map {
-            let ov = o_map.get(k).unwrap_or_else(|| panic!("missing key {k} in default plan"));
+            let ov = o_map
+                .get(k)
+                .unwrap_or_else(|| panic!("missing key {k} in default plan"));
             let rel = (wv - ov).abs() / ov.abs().max(wv.abs()).max(1e-300);
-            assert!(rel < 1e-10, "Q5 {k}: with={wv} without={ov} rel_err={rel:e}");
+            assert!(
+                rel < 1e-10,
+                "Q5 {k}: with={wv} without={ov} rel_err={rel:e}"
+            );
         }
     }
 }

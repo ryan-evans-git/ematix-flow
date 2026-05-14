@@ -136,10 +136,7 @@ impl ObjectStoreBackend {
     /// Π.4a: override read-time options (CSV delimiter / quote / escape /
     /// header / null regex / comment / JSON inference window). Defaults
     /// reproduce historical Arrow defaults.
-    pub fn with_read_options(
-        mut self,
-        options: crate::backend::ObjectReadOptions,
-    ) -> Self {
+    pub fn with_read_options(mut self, options: crate::backend::ObjectReadOptions) -> Self {
         self.read_options = options;
         self
     }
@@ -419,8 +416,7 @@ async fn decode_csv_file(
 
     // Typed ReaderBuilder. Same option set, threaded a second time
     // because Format and ReaderBuilder are independent objects.
-    let mut builder = arrow_csv::ReaderBuilder::new(Arc::new(schema))
-        .with_header(has_header);
+    let mut builder = arrow_csv::ReaderBuilder::new(Arc::new(schema)).with_header(has_header);
     if let Some(d) = opts.delimiter {
         builder = builder.with_delimiter(d);
     }
@@ -540,9 +536,8 @@ async fn decode_jsonl_file(
         .map_err(|e| BackendError::Connection(format!("get bytes: {e}")))?;
     let mut cursor = std::io::Cursor::new(bytes.as_ref());
     let infer_max = opts.schema_infer_max_records.unwrap_or(1024);
-    let (schema, _records_inferred) =
-        infer_json_schema_from_seekable(&mut cursor, Some(infer_max))
-            .map_err(|e| BackendError::Query(format!("json infer: {e}")))?;
+    let (schema, _records_inferred) = infer_json_schema_from_seekable(&mut cursor, Some(infer_max))
+        .map_err(|e| BackendError::Query(format!("json infer: {e}")))?;
     let mut builder = ReaderBuilder::new(Arc::new(schema));
     if let Some(bs) = opts.batch_size {
         builder = builder.with_batch_size(bs);
@@ -787,9 +782,7 @@ async fn streaming_read_after(
         let file_batches = match format {
             ObjectFormat::Parquet => decode_parquet_file(store, &meta).await?,
             ObjectFormat::Csv => decode_csv_file(store, &meta, &read_options.csv).await?,
-            ObjectFormat::JsonLines => {
-                decode_jsonl_file(store, &meta, &read_options.json).await?
-            }
+            ObjectFormat::JsonLines => decode_jsonl_file(store, &meta, &read_options.json).await?,
             ObjectFormat::Orc => decode_orc_file(store, &meta).await?,
         };
         batches.extend(file_batches);
@@ -921,15 +914,14 @@ impl Backend for ObjectStoreBackend {
             .lock()
             .map_err(|e| BackendError::Other(format!("objectstore seek lock: {e}")))?
             .clone();
-        let (batches, new_last) =
-            streaming_read_after(
-                &self.store,
-                self.format,
-                &prefix,
-                after_key.as_deref(),
-                &self.read_options,
-            )
-            .await?;
+        let (batches, new_last) = streaming_read_after(
+            &self.store,
+            self.format,
+            &prefix,
+            after_key.as_deref(),
+            &self.read_options,
+        )
+        .await?;
         if let Some(key) = new_last {
             *self
                 .last_seen_object_key

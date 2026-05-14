@@ -21,7 +21,9 @@
 use std::fs::File;
 use std::path::PathBuf;
 
-use datafusion::parquet::arrow::arrow_reader::{ArrowReaderOptions, ParquetRecordBatchReaderBuilder};
+use datafusion::parquet::arrow::arrow_reader::{
+    ArrowReaderOptions, ParquetRecordBatchReaderBuilder,
+};
 use datafusion::parquet::file::metadata::PageIndexPolicy;
 
 fn data_path() -> String {
@@ -46,8 +48,7 @@ const HI: i32 = 9404;
 fn main() {
     let path = data_path();
     let file = File::open(&path).unwrap();
-    let opts = ArrowReaderOptions::new()
-        .with_page_index_policy(PageIndexPolicy::Optional);
+    let opts = ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Optional);
     let builder = ParquetRecordBatchReaderBuilder::try_new_with_options(file, opts).unwrap();
     let meta = builder.metadata();
     let parquet_schema = builder.parquet_schema();
@@ -163,9 +164,7 @@ fn main() {
     }
     println!();
     println!("==> Summary");
-    println!(
-        "  Total pages:     {total_pages}  ({total_rows} rows)"
-    );
+    println!("  Total pages:     {total_pages}  ({total_rows} rows)");
     println!(
         "  Overlap pages:   {overlap_pages} ({:.1}% of pages, {overlap_rows} rows = {:.2}% of total)",
         100.0 * overlap_pages as f64 / total_pages.max(1) as f64,
@@ -181,16 +180,12 @@ fn main() {
         println!(
             "    Combined with sparse-decode for the other 3 cols (partkey/extprice/discount),"
         );
-        println!(
-            "    this is the lever to close the gap to Polars."
-        );
+        println!("    this is the lever to close the gap to Polars.");
     } else {
         println!(
             "  ✗ Pages overlap the Q14 window too broadly ({:.0}% of rows still need decode);",
             100.0 * row_select
         );
-        println!(
-            "    page-index pruning won't help here. The gap to Polars must live elsewhere."
-        );
+        println!("    page-index pruning won't help here. The gap to Polars must live elsewhere.");
     }
 }

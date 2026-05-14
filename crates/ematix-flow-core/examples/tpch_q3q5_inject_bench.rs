@@ -161,7 +161,12 @@ async fn main() {
     let ctx_q3_on = build_ctx_q3(&dir, true).await;
     println!("Q3:");
     let off3 = bench("FastParquet SQL (rule OFF)", &ctx_q3_off, Q3_SQL).await;
-    let on3 = bench("FastParquet SQL (rule ON — InjectFusedQ3Rule)", &ctx_q3_on, Q3_SQL).await;
+    let on3 = bench(
+        "FastParquet SQL (rule ON — InjectFusedQ3Rule)",
+        &ctx_q3_on,
+        Q3_SQL,
+    )
+    .await;
     println!();
     report("Q3", off3, on3);
     println!();
@@ -170,7 +175,12 @@ async fn main() {
     let ctx_q5_on = build_ctx_q5(&dir, true).await;
     println!("Q5:");
     let off5 = bench("FastParquet SQL (rule OFF)", &ctx_q5_off, Q5_SQL).await;
-    let on5 = bench("FastParquet SQL (rule ON — InjectFusedQ5Rule)", &ctx_q5_on, Q5_SQL).await;
+    let on5 = bench(
+        "FastParquet SQL (rule ON — InjectFusedQ5Rule)",
+        &ctx_q5_on,
+        Q5_SQL,
+    )
+    .await;
     println!();
     report("Q5", off5, on5);
     println!();

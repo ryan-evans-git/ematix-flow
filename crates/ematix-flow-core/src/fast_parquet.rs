@@ -99,7 +99,6 @@ fn promote_to_view_types(
     datafusion::arrow::datatypes::Schema::new_with_metadata(promoted, schema.metadata().clone())
 }
 
-
 /// Aggregate per-row-group parquet statistics into a file-level
 /// `ColumnStatistics`. Returns one entry per Arrow field in `schema`,
 /// in field order.
@@ -303,9 +302,7 @@ fn predicate_excludes_row_group(
     // Bail if the literal's type doesn't match the column's type — we
     // can't compare scalars across types without coercion, and getting
     // coercion wrong here would silently drop rows.
-    if min.data_type() != pred.literal.data_type()
-        || max.data_type() != pred.literal.data_type()
-    {
+    if min.data_type() != pred.literal.data_type() || max.data_type() != pred.literal.data_type() {
         return false;
     }
     let lit = &pred.literal;
@@ -457,10 +454,10 @@ impl FastParquetTableProvider {
             .with_encoding_stats_policy(ParquetStatisticsPolicy::SkipAll);
         let builder = ParquetRecordBatchReaderBuilder::try_new_with_options(file, footer_options)
             .map_err(|e| {
-                DataFusionError::External(
-                    format!("FastParquetTableProvider: parquet open failed: {e}").into(),
-                )
-            })?;
+            DataFusionError::External(
+                format!("FastParquetTableProvider: parquet open failed: {e}").into(),
+            )
+        })?;
         // Hand the planner (and downstream operators) a schema that
         // declares string/binary columns as their `*View` form so kernel
         // selection matches DataFusion's default parquet path. This
@@ -485,8 +482,7 @@ impl FastParquetTableProvider {
         let arrow_metadata = Arc::new(
             ArrowReaderMetadata::try_new(metadata.clone(), options).map_err(|e| {
                 DataFusionError::External(
-                    format!("FastParquetTableProvider: building ArrowReaderMetadata: {e}")
-                        .into(),
+                    format!("FastParquetTableProvider: building ArrowReaderMetadata: {e}").into(),
                 )
             })?,
         );
@@ -757,7 +753,8 @@ impl PartitionMetrics {
             // EXPLAIN ANALYZE output reads consistently.
             output_batches: MetricBuilder::new(metrics).output_batches(partition),
             bytes_scanned: MetricBuilder::new(metrics).counter("bytes_scanned", partition),
-            time_opening: MetricBuilder::new(metrics).subset_time("time_elapsed_opening", partition),
+            time_opening: MetricBuilder::new(metrics)
+                .subset_time("time_elapsed_opening", partition),
             time_processing: MetricBuilder::new(metrics)
                 .subset_time("time_elapsed_processing", partition),
         }
@@ -924,10 +921,8 @@ fn build_partition_stream(
         // that `try_new_with_options` does, which at SF=1 cost ~0.5-2
         // ms per partition × per execute() call. The metadata is
         // shared via Arc so each worker just clones a pointer.
-        let builder = ParquetRecordBatchReaderBuilder::new_with_metadata(
-            file,
-            (*arrow_metadata).clone(),
-        );
+        let builder =
+            ParquetRecordBatchReaderBuilder::new_with_metadata(file, (*arrow_metadata).clone());
         let mask = ProjectionMask::leaves(&parquet_schema, projection.iter().copied());
         let mut reader = match builder
             .with_projection(mask)
@@ -1410,17 +1405,37 @@ mod tests {
         let min = ScalarValue::Int32(Some(10));
         let max = ScalarValue::Int32(Some(100));
         // col = 50: RG min=10, max=100 contains 50 → keep
-        assert!(!predicate_excludes_row_group(&mk(Operator::Eq), Some(&min), Some(&max)));
+        assert!(!predicate_excludes_row_group(
+            &mk(Operator::Eq),
+            Some(&min),
+            Some(&max)
+        ));
         // col = 50: RG min=60, max=80 doesn't contain 50 → prune
         let min2 = ScalarValue::Int32(Some(60));
         let max2 = ScalarValue::Int32(Some(80));
-        assert!(predicate_excludes_row_group(&mk(Operator::Eq), Some(&min2), Some(&max2)));
+        assert!(predicate_excludes_row_group(
+            &mk(Operator::Eq),
+            Some(&min2),
+            Some(&max2)
+        ));
         // col < 50: RG min=10 < 50 → keep (some rows below 50)
-        assert!(!predicate_excludes_row_group(&mk(Operator::Lt), Some(&min), Some(&max)));
+        assert!(!predicate_excludes_row_group(
+            &mk(Operator::Lt),
+            Some(&min),
+            Some(&max)
+        ));
         // col < 50: RG min=60 >= 50 → prune (no row below 50)
-        assert!(predicate_excludes_row_group(&mk(Operator::Lt), Some(&min2), Some(&max2)));
+        assert!(predicate_excludes_row_group(
+            &mk(Operator::Lt),
+            Some(&min2),
+            Some(&max2)
+        ));
         // col >= 50: RG max=100 >= 50 → keep
-        assert!(!predicate_excludes_row_group(&mk(Operator::GtEq), Some(&min), Some(&max)));
+        assert!(!predicate_excludes_row_group(
+            &mk(Operator::GtEq),
+            Some(&min),
+            Some(&max)
+        ));
         // col >= 50: RG max=40 < 50 → prune
         let max3 = ScalarValue::Int32(Some(40));
         assert!(predicate_excludes_row_group(
@@ -1508,7 +1523,10 @@ mod tests {
 
         // No filter: all 6 RGs survive.
         let exec_none = prov.scan(&state, None, &[], None).await.unwrap();
-        let fp_none = exec_none.as_any().downcast_ref::<FastParquetExec>().unwrap();
+        let fp_none = exec_none
+            .as_any()
+            .downcast_ref::<FastParquetExec>()
+            .unwrap();
         let total_none: usize = fp_none.assignments.iter().map(|a| a.len()).sum();
         assert_eq!(total_none, 6);
 
@@ -1518,7 +1536,10 @@ mod tests {
             col("l_shipdate").lt(lit(ScalarValue::Date32(Some(9404)))),
         ];
         let exec_pruned = prov.scan(&state, None, &filters, None).await.unwrap();
-        let fp_pruned = exec_pruned.as_any().downcast_ref::<FastParquetExec>().unwrap();
+        let fp_pruned = exec_pruned
+            .as_any()
+            .downcast_ref::<FastParquetExec>()
+            .unwrap();
         let total_pruned: usize = fp_pruned.assignments.iter().map(|a| a.len()).sum();
 
         // Diagnostic: print per-RG shipdate min/max so we know whether
@@ -1565,13 +1586,7 @@ mod tests {
         let ctx = SessionContext::new();
         let prov = FastParquetTableProvider::try_new(path).unwrap();
         ctx.register_table("lineitem", Arc::new(prov)).unwrap();
-        let v = ctx
-            .sql(sql)
-            .await
-            .unwrap()
-            .collect()
-            .await
-            .unwrap()[0]
+        let v = ctx.sql(sql).await.unwrap().collect().await.unwrap()[0]
             .column(0)
             .as_any()
             .downcast_ref::<datafusion::arrow::array::Float64Array>()
@@ -1588,13 +1603,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let v_ref = ref_ctx
-            .sql(sql)
-            .await
-            .unwrap()
-            .collect()
-            .await
-            .unwrap()[0]
+        let v_ref = ref_ctx.sql(sql).await.unwrap().collect().await.unwrap()[0]
             .column(0)
             .as_any()
             .downcast_ref::<datafusion::arrow::array::Float64Array>()

@@ -29,17 +29,15 @@ use std::sync::Arc;
 use arrow_array::{Array, RecordBatch};
 use arrow_schema::{DataType, Schema, SchemaRef};
 use datafusion::catalog::{Session, TableProvider};
-use datafusion::common::stats::Statistics;
 use datafusion::common::ScalarValue;
+use datafusion::common::stats::Statistics;
 use datafusion::datasource::TableType;
 use datafusion::error::{DataFusionError, Result as DfResult};
 use datafusion::execution::TaskContext;
 use datafusion::logical_expr::{Expr, Operator, TableProviderFilterPushDown};
 use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
-use datafusion::physical_plan::metrics::{
-    BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet,
-};
+use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
@@ -54,7 +52,7 @@ use crate::ematix_parquet_bridge::{
     decode_column_chunk_i64, filter_i32_column_to_bitmap, sparse_gather_chunk_f64,
     sparse_gather_chunk_i32, sparse_gather_chunk_i64,
 };
-use crate::fast_parquet::{extract_range_predicate, RangePredicate};
+use crate::fast_parquet::{RangePredicate, extract_range_predicate};
 
 /// Phase 3 predicate: single-column conjunction of `column OP literal`
 /// clauses, where the column has Date32 / Int32 type. AND-combined
@@ -394,11 +392,7 @@ impl ExecutionPlan for EmatixFastParquetExec {
         partition: usize,
         _context: Arc<TaskContext>,
     ) -> DfResult<SendableRecordBatchStream> {
-        let row_groups = self
-            .assignments
-            .get(partition)
-            .cloned()
-            .unwrap_or_default();
+        let row_groups = self.assignments.get(partition).cloned().unwrap_or_default();
         let path = self.path.clone();
         let projection = self.projection.clone();
         let schema = self.schema.clone();
@@ -499,12 +493,10 @@ fn decode_one_rg_filtered(
     filter: &BridgeFilter,
 ) -> DfResult<RecordBatch> {
     let filter_owned = filter.clone();
-    let (bitmap, _total) = filter_i32_column_to_bitmap(
-        path,
-        rg,
-        filter.parquet_col_idx,
-        move |v: i32| filter_owned.eval_i32(v),
-    )?;
+    let (bitmap, _total) =
+        filter_i32_column_to_bitmap(path, rg, filter.parquet_col_idx, move |v: i32| {
+            filter_owned.eval_i32(v)
+        })?;
 
     let matches: usize = bitmap.iter().map(|b| b.count_ones() as usize).sum();
     let mut columns: Vec<Arc<dyn arrow_array::Array>> = Vec::with_capacity(projection.len());
@@ -658,11 +650,11 @@ mod tests {
     /// confirm row count.
     #[tokio::test]
     async fn end_to_end_simple_count() {
+        use parquet::basic::{Compression, Repetition, Type as PhysicalType};
+        use parquet::column::writer::ColumnWriter;
         use parquet::file::properties::WriterProperties;
         use parquet::file::writer::SerializedFileWriter;
         use parquet::schema::types::Type as PType;
-        use parquet::basic::{Compression, Repetition, Type as PhysicalType};
-        use parquet::column::writer::ColumnWriter;
 
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let path = tmp.path().to_path_buf();
@@ -729,7 +721,10 @@ mod tests {
             EmatixFastParquetTableProvider::try_new(path.to_string_lossy().to_string()).unwrap();
         let ctx = SessionContext::new();
         ctx.register_table("t", Arc::new(provider)).unwrap();
-        let df = ctx.sql("SELECT COUNT(*), SUM(a), SUM(b), SUM(c) FROM t").await.unwrap();
+        let df = ctx
+            .sql("SELECT COUNT(*), SUM(a), SUM(b), SUM(c) FROM t")
+            .await
+            .unwrap();
         let batches = df.collect().await.unwrap();
         assert_eq!(batches.len(), 1);
         let b0 = &batches[0];
@@ -805,28 +800,47 @@ mod tests {
                     ColumnReader::Int32ColumnReader(t) => t,
                     _ => panic!(),
                 };
-                t.read_records(rgr.metadata().num_rows() as usize, None, None, &mut shipdate).unwrap();
+                t.read_records(
+                    rgr.metadata().num_rows() as usize,
+                    None,
+                    None,
+                    &mut shipdate,
+                )
+                .unwrap();
             }
             {
                 let mut t = match rgr.get_column_reader(1).unwrap() {
                     ColumnReader::Int64ColumnReader(t) => t,
                     _ => panic!(),
                 };
-                t.read_records(rgr.metadata().num_rows() as usize, None, None, &mut partkey).unwrap();
+                t.read_records(rgr.metadata().num_rows() as usize, None, None, &mut partkey)
+                    .unwrap();
             }
             {
                 let mut t = match rgr.get_column_reader(5).unwrap() {
                     ColumnReader::DoubleColumnReader(t) => t,
                     _ => panic!(),
                 };
-                t.read_records(rgr.metadata().num_rows() as usize, None, None, &mut extprice).unwrap();
+                t.read_records(
+                    rgr.metadata().num_rows() as usize,
+                    None,
+                    None,
+                    &mut extprice,
+                )
+                .unwrap();
             }
             {
                 let mut t = match rgr.get_column_reader(6).unwrap() {
                     ColumnReader::DoubleColumnReader(t) => t,
                     _ => panic!(),
                 };
-                t.read_records(rgr.metadata().num_rows() as usize, None, None, &mut discount).unwrap();
+                t.read_records(
+                    rgr.metadata().num_rows() as usize,
+                    None,
+                    None,
+                    &mut discount,
+                )
+                .unwrap();
             }
         }
 
@@ -906,10 +920,9 @@ mod tests {
         // Now register the synthetic primitive-only file via Emat and
         // run Q14's lineitem-only aggregate: SUM(extprice * (1-discount))
         // for rows where shipdate ∈ [9374, 9404).
-        let provider = EmatixFastParquetTableProvider::try_new(
-            tmp_path.to_string_lossy().to_string(),
-        )
-        .unwrap();
+        let provider =
+            EmatixFastParquetTableProvider::try_new(tmp_path.to_string_lossy().to_string())
+                .unwrap();
         let ctx = SessionContext::new();
         ctx.register_table("li_prim", Arc::new(provider)).unwrap();
 
@@ -945,7 +958,10 @@ mod tests {
             .filter(|((d, _), _)| **d >= 9374 && **d < 9404)
             .map(|((_, p), d)| p * (1.0 - d))
             .sum();
-        let expected_matches = shipdate.iter().filter(|d| **d >= 9374 && **d < 9404).count() as i64;
+        let expected_matches = shipdate
+            .iter()
+            .filter(|d| **d >= 9374 && **d < 9404)
+            .count() as i64;
 
         assert_eq!(matches, expected_matches);
         assert!(

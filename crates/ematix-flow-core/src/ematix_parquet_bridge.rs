@@ -52,56 +52,26 @@ use ematix_parquet_io::{PageWalker, ParquetFile};
 /// dict (if present) is PLAIN-decoded once and reused across all
 /// data pages. Decompression buffer is reused across pages (no per-
 /// page allocation).
-pub fn decode_column_chunk_i32(
-    path: &Path,
-    rg: usize,
-    col: usize,
-) -> DfResult<Arc<Int32Array>> {
-    let buf = decode_dict_chunk_generic::<i32>(
-        path,
-        rg,
-        col,
-        |bytes| {
-            decode_plain_i32(bytes)
-                .map_err(|e| ext(format!("plain i32: {e}")))
-        },
-    )?;
+pub fn decode_column_chunk_i32(path: &Path, rg: usize, col: usize) -> DfResult<Arc<Int32Array>> {
+    let buf = decode_dict_chunk_generic::<i32>(path, rg, col, |bytes| {
+        decode_plain_i32(bytes).map_err(|e| ext(format!("plain i32: {e}")))
+    })?;
     Ok(Arc::new(Int32Array::from(buf)))
 }
 
 /// Decode an INT64 column chunk to a contiguous `Int64Array`.
-pub fn decode_column_chunk_i64(
-    path: &Path,
-    rg: usize,
-    col: usize,
-) -> DfResult<Arc<Int64Array>> {
-    let buf = decode_dict_chunk_generic::<i64>(
-        path,
-        rg,
-        col,
-        |bytes| {
-            decode_plain_i64(bytes)
-                .map_err(|e| ext(format!("plain i64: {e}")))
-        },
-    )?;
+pub fn decode_column_chunk_i64(path: &Path, rg: usize, col: usize) -> DfResult<Arc<Int64Array>> {
+    let buf = decode_dict_chunk_generic::<i64>(path, rg, col, |bytes| {
+        decode_plain_i64(bytes).map_err(|e| ext(format!("plain i64: {e}")))
+    })?;
     Ok(Arc::new(Int64Array::from(buf)))
 }
 
 /// Decode a DOUBLE column chunk to a contiguous `Float64Array`.
-pub fn decode_column_chunk_f64(
-    path: &Path,
-    rg: usize,
-    col: usize,
-) -> DfResult<Arc<Float64Array>> {
-    let buf = decode_dict_chunk_generic::<f64>(
-        path,
-        rg,
-        col,
-        |bytes| {
-            decode_plain_f64(bytes)
-                .map_err(|e| ext(format!("plain f64: {e}")))
-        },
-    )?;
+pub fn decode_column_chunk_f64(path: &Path, rg: usize, col: usize) -> DfResult<Arc<Float64Array>> {
+    let buf = decode_dict_chunk_generic::<f64>(path, rg, col, |bytes| {
+        decode_plain_f64(bytes).map_err(|e| ext(format!("plain f64: {e}")))
+    })?;
     Ok(Arc::new(Float64Array::from(buf)))
 }
 
@@ -117,11 +87,8 @@ pub fn decode_column_chunk_byte_array(
     rg: usize,
     col: usize,
 ) -> DfResult<Arc<StringArray>> {
-    let file = ParquetFile::open(path)
-        .map_err(|e| ext(format!("ParquetFile::open: {e}")))?;
-    let md = file
-        .metadata()
-        .map_err(|e| ext(format!("metadata: {e}")))?;
+    let file = ParquetFile::open(path).map_err(|e| ext(format!("ParquetFile::open: {e}")))?;
+    let md = file.metadata().map_err(|e| ext(format!("metadata: {e}")))?;
     let cm = md.row_groups[rg].columns[col]
         .meta_data
         .as_ref()
@@ -225,15 +192,11 @@ pub fn decode_column_chunk_byte_array(
 }
 
 #[inline]
-fn append_utf8(
-    builder: &mut arrow_array::builder::StringBuilder,
-    bytes: &[u8],
-) -> DfResult<()> {
+fn append_utf8(builder: &mut arrow_array::builder::StringBuilder, bytes: &[u8]) -> DfResult<()> {
     // SAFETY check: parquet Utf8 logical type guarantees UTF-8 but
     // we validate defensively. For dict-encoded columns this runs
     // ~once per ~1000 rows (cached); for PLAIN pages it runs per row.
-    let s = std::str::from_utf8(bytes)
-        .map_err(|e| ext(format!("byte_array not UTF-8: {e}")))?;
+    let s = std::str::from_utf8(bytes).map_err(|e| ext(format!("byte_array not UTF-8: {e}")))?;
     builder.append_value(s);
     Ok(())
 }
@@ -248,11 +211,8 @@ fn decode_dict_chunk_generic<T: Copy>(
     col: usize,
     decode_plain: impl Fn(&[u8]) -> DfResult<Vec<T>>,
 ) -> DfResult<Vec<T>> {
-    let file = ParquetFile::open(path)
-        .map_err(|e| ext(format!("ParquetFile::open: {e}")))?;
-    let md = file
-        .metadata()
-        .map_err(|e| ext(format!("metadata: {e}")))?;
+    let file = ParquetFile::open(path).map_err(|e| ext(format!("ParquetFile::open: {e}")))?;
+    let md = file.metadata().map_err(|e| ext(format!("metadata: {e}")))?;
     let cm = md.row_groups[rg].columns[col]
         .meta_data
         .as_ref()
@@ -356,8 +316,7 @@ pub fn filter_i32_column_to_bitmap(
     col: usize,
     predicate: impl Fn(i32) -> bool,
 ) -> DfResult<(Vec<u8>, usize)> {
-    let file = ParquetFile::open(path)
-        .map_err(|e| ext(format!("ParquetFile::open: {e}")))?;
+    let file = ParquetFile::open(path).map_err(|e| ext(format!("ParquetFile::open: {e}")))?;
     let md = file.metadata().map_err(|e| ext(format!("metadata: {e}")))?;
     let cm = md.row_groups[rg].columns[col]
         .meta_data
@@ -386,8 +345,7 @@ pub fn filter_i32_column_to_bitmap(
         ));
     }
     decompress_into(codec, first_body, &mut scratch)?;
-    let dict = decode_plain_i32(&scratch)
-        .map_err(|e| ext(format!("plain i32 dict: {e}")))?;
+    let dict = decode_plain_i32(&scratch).map_err(|e| ext(format!("plain i32 dict: {e}")))?;
     if dict.len() > 4096 {
         return Err(ext(format!(
             "dict size {} exceeds bw=12 cap (4096); column needs wider NEON kernel",
@@ -410,17 +368,16 @@ pub fn filter_i32_column_to_bitmap(
             .next_page()
             .map_err(|e| ext(format!("next_page: {e}")))?
             .ok_or_else(|| ext("chunk ended before num_values"))?;
-        let dph = hdr.data_page_header.as_ref().ok_or_else(|| {
-            ext("filter_i32: v2 data pages not yet supported in Phase 3")
-        })?;
+        let dph = hdr
+            .data_page_header
+            .as_ref()
+            .ok_or_else(|| ext("filter_i32: v2 data pages not yet supported in Phase 3"))?;
         let n = dph.num_values as usize;
         decompress_into(codec, body, &mut scratch)?;
         match dph.encoding {
             Encoding::RleDictionary | Encoding::PlainDictionary => {
-                decode_rle_dictionary_predicate_bitmap_bw12(
-                    &scratch, n, &dict_mask, &mut bitmap,
-                )
-                .map_err(|e| ext(format!("phase5 bw12: {e}")))?;
+                decode_rle_dictionary_predicate_bitmap_bw12(&scratch, n, &dict_mask, &mut bitmap)
+                    .map_err(|e| ext(format!("phase5 bw12: {e}")))?;
             }
             other => {
                 return Err(ext(format!(
@@ -445,8 +402,7 @@ fn gather_chunk_typed<T: Copy>(
     decode_dict_plain: impl Fn(&[u8]) -> DfResult<Vec<T>>,
     decode_plain_page: impl Fn(&[u8]) -> DfResult<Vec<T>>,
 ) -> DfResult<Vec<T>> {
-    let file = ParquetFile::open(path)
-        .map_err(|e| ext(format!("ParquetFile::open: {e}")))?;
+    let file = ParquetFile::open(path).map_err(|e| ext(format!("ParquetFile::open: {e}")))?;
     let md = file.metadata().map_err(|e| ext(format!("metadata: {e}")))?;
     let cm = md.row_groups[rg].columns[col]
         .meta_data
@@ -543,7 +499,10 @@ pub fn sparse_gather_chunk_i32(
     bitmap: &[u8],
 ) -> DfResult<Vec<i32>> {
     gather_chunk_typed::<i32>(
-        path, rg, col, bitmap,
+        path,
+        rg,
+        col,
+        bitmap,
         |b| decode_plain_i32(b).map_err(|e| ext(format!("plain i32 dict: {e}"))),
         |b| decode_plain_i32(b).map_err(|e| ext(format!("plain i32 page: {e}"))),
     )
@@ -555,7 +514,10 @@ pub fn sparse_gather_chunk_i64(
     bitmap: &[u8],
 ) -> DfResult<Vec<i64>> {
     gather_chunk_typed::<i64>(
-        path, rg, col, bitmap,
+        path,
+        rg,
+        col,
+        bitmap,
         |b| decode_plain_i64(b).map_err(|e| ext(format!("plain i64 dict: {e}"))),
         |b| decode_plain_i64(b).map_err(|e| ext(format!("plain i64 page: {e}"))),
     )
@@ -567,7 +529,10 @@ pub fn sparse_gather_chunk_f64(
     bitmap: &[u8],
 ) -> DfResult<Vec<f64>> {
     gather_chunk_typed::<f64>(
-        path, rg, col, bitmap,
+        path,
+        rg,
+        col,
+        bitmap,
         |b| decode_plain_f64(b).map_err(|e| ext(format!("plain f64 dict: {e}"))),
         |b| decode_plain_f64(b).map_err(|e| ext(format!("plain f64 page: {e}"))),
     )
@@ -577,21 +542,19 @@ pub fn sparse_gather_chunk_f64(
 /// declared codec. UNCOMPRESSED pages just copy bytes into `out`.
 /// SNAPPY and ZSTD route to ematix-parquet's `_into` variants for
 /// buffer reuse across pages. Other codecs error.
-fn decompress_into(
-    codec: CompressionCodec,
-    body: &[u8],
-    out: &mut Vec<u8>,
-) -> DfResult<()> {
+fn decompress_into(codec: CompressionCodec, body: &[u8], out: &mut Vec<u8>) -> DfResult<()> {
     match codec {
         CompressionCodec::Uncompressed => {
             out.clear();
             out.extend_from_slice(body);
             Ok(())
         }
-        CompressionCodec::Snappy => decompress_snappy_into(body, out)
-            .map_err(|e| ext(format!("snappy: {e}"))),
-        CompressionCodec::Zstd => decompress_zstd_into(body, out)
-            .map_err(|e| ext(format!("zstd: {e}"))),
+        CompressionCodec::Snappy => {
+            decompress_snappy_into(body, out).map_err(|e| ext(format!("snappy: {e}")))
+        }
+        CompressionCodec::Zstd => {
+            decompress_zstd_into(body, out).map_err(|e| ext(format!("zstd: {e}")))
+        }
         other => Err(ext(format!(
             "codec {other:?} not yet wired into bridge; use FastParquetTableProvider"
         ))),
@@ -616,11 +579,7 @@ mod tests {
             Ok(s) => PathBuf::from(s).join("lineitem.parquet"),
             Err(_) => PathBuf::from("examples/tpch/data/sf1/lineitem.parquet"),
         };
-        if p.exists() {
-            Some(p)
-        } else {
-            None
-        }
+        if p.exists() { Some(p) } else { None }
     }
 
     fn pr_read_i32(path: &PathBuf, rg: usize, col: usize) -> Vec<i32> {

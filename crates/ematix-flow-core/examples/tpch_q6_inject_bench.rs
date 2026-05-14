@@ -124,13 +124,9 @@ async fn main() {
     let pct = 100.0 * (off - on) / off;
     println!();
     if pct > 0.0 {
-        println!(
-            "  ✓ rule wins: {on:.2} ms vs {off:.2} ms ({pct:+.1}% faster)"
-        );
+        println!("  ✓ rule wins: {on:.2} ms vs {off:.2} ms ({pct:+.1}% faster)");
     } else {
-        println!(
-            "  ✗ rule loses or neutral: {on:.2} ms vs {off:.2} ms ({pct:+.1}%)"
-        );
+        println!("  ✗ rule loses or neutral: {on:.2} ms vs {off:.2} ms ({pct:+.1}%)");
     }
     println!();
     println!("  Reference:");

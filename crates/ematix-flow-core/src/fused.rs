@@ -118,10 +118,7 @@ impl FusedFilterSumExec {
     /// the Cranelift-JIT'd `FusedFilterAggJit`. The JIT is built here
     /// once (constant cost; bounds become baked-in IR constants) and
     /// reused across every shard call.
-    pub fn try_new_q6_jit(
-        input: Arc<dyn ExecutionPlan>,
-        predicate: Q6Predicate,
-    ) -> DfResult<Self> {
+    pub fn try_new_q6_jit(input: Arc<dyn ExecutionPlan>, predicate: Q6Predicate) -> DfResult<Self> {
         let mut exec = Self::try_new_q6(input, predicate)?;
         let spec = crate::fused_jit::FusedFilterAggSpec::q6(
             predicate.date_lo,
@@ -404,11 +401,7 @@ fn process_q6_batch_jit(
     // source slices' element type; `sum` has one element matching
     // the spec's single SUM aggregate.
     unsafe {
-        jit.run(
-            batch.num_rows() as i64,
-            inputs.as_ptr(),
-            sum.as_mut_ptr(),
-        );
+        jit.run(batch.num_rows() as i64, inputs.as_ptr(), sum.as_mut_ptr());
     }
     sum[0]
 }

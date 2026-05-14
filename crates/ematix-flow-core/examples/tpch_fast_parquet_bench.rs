@@ -164,10 +164,7 @@ async fn main() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(10);
     let queries: Vec<u32> = match std::env::var("TPCH_BENCH_QUERIES") {
-        Ok(s) => s
-            .split(',')
-            .filter_map(|t| t.trim().parse().ok())
-            .collect(),
+        Ok(s) => s.split(',').filter_map(|t| t.trim().parse().ok()).collect(),
         Err(_) => (1u32..=22).collect(),
     };
 

@@ -118,10 +118,7 @@ impl FusedPostJoinExec {
         &self.input
     }
 
-    pub fn try_new_jit(
-        input: Arc<dyn ExecutionPlan>,
-        spec: FusedPostJoinSpec,
-    ) -> DfResult<Self> {
+    pub fn try_new_jit(input: Arc<dyn ExecutionPlan>, spec: FusedPostJoinSpec) -> DfResult<Self> {
         match spec {
             FusedPostJoinSpec::Q14 => {
                 let mut exec = Self::try_new(input, spec)?;
@@ -469,10 +466,7 @@ fn accumulate_q3_batch(
     Ok(())
 }
 
-fn emit_q3(
-    schema: SchemaRef,
-    groups: HashMap<(i64, i32, i32), f64>,
-) -> DfResult<RecordBatch> {
+fn emit_q3(schema: SchemaRef, groups: HashMap<(i64, i32, i32), f64>) -> DfResult<RecordBatch> {
     let mut rows: Vec<((i64, i32, i32), f64)> = groups.into_iter().collect();
     rows.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
     let mut ok_b = Int64Builder::with_capacity(rows.len());
@@ -496,10 +490,7 @@ fn emit_q3(
 
 // ----- Q5: string group, single SUM -----
 
-fn accumulate_q5_batch(
-    batch: &RecordBatch,
-    groups: &mut HashMap<String, f64>,
-) -> DfResult<()> {
+fn accumulate_q5_batch(batch: &RecordBatch, groups: &mut HashMap<String, f64>) -> DfResult<()> {
     let nname = batch
         .column(batch.schema().index_of("n_name")?)
         .as_any()
@@ -650,11 +641,7 @@ fn execute_q14_jit(
         // has exactly `jit.n_outputs() == 2` elements.
         debug_assert_eq!(jit.n_outputs(), 2);
         unsafe {
-            jit.run(
-                batch.num_rows() as i64,
-                inputs.as_ptr(),
-                cells.as_mut_ptr(),
-            );
+            jit.run(batch.num_rows() as i64, inputs.as_ptr(), cells.as_mut_ptr());
         }
     }
     let promo = cells[0];
@@ -859,13 +846,11 @@ mod tests {
     #[tokio::test]
     async fn q14_jit_matches_hand_coded_bit_identical() {
         let hand_input = input_plan_from_batch(make_q14_batch()).await;
-        let hand_exec = Arc::new(
-            FusedPostJoinExec::try_new(hand_input, FusedPostJoinSpec::Q14).unwrap(),
-        );
+        let hand_exec =
+            Arc::new(FusedPostJoinExec::try_new(hand_input, FusedPostJoinSpec::Q14).unwrap());
         let jit_input = input_plan_from_batch(make_q14_batch()).await;
-        let jit_exec = Arc::new(
-            FusedPostJoinExec::try_new_jit(jit_input, FusedPostJoinSpec::Q14).unwrap(),
-        );
+        let jit_exec =
+            Arc::new(FusedPostJoinExec::try_new_jit(jit_input, FusedPostJoinSpec::Q14).unwrap());
         let session = SessionContext::new();
 
         let mut hand_s = hand_exec.execute(0, session.task_ctx()).unwrap();
@@ -901,13 +886,11 @@ mod tests {
         // Reuse Q3's input schema for the Q3 check — we just need a
         // syntactically-valid input.
         let q3_input = input_plan_from_batch(make_q3_batch()).await;
-        let err =
-            FusedPostJoinExec::try_new_jit(q3_input, FusedPostJoinSpec::Q3).unwrap_err();
+        let err = FusedPostJoinExec::try_new_jit(q3_input, FusedPostJoinSpec::Q3).unwrap_err();
         assert!(format!("{err}").contains("Q3"), "got: {err}");
 
         let q5_input = input_plan_from_batch(make_q5_batch()).await;
-        let err =
-            FusedPostJoinExec::try_new_jit(q5_input, FusedPostJoinSpec::Q5).unwrap_err();
+        let err = FusedPostJoinExec::try_new_jit(q5_input, FusedPostJoinSpec::Q5).unwrap_err();
         assert!(format!("{err}").contains("Q5"), "got: {err}");
     }
 

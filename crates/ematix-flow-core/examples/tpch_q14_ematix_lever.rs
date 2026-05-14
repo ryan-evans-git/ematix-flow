@@ -67,9 +67,7 @@ fn data_dir() -> PathBuf {
 fn read_chunk(file: &ParquetFile, rg: usize, col: usize) -> (Vec<u8>, usize) {
     let md = file.metadata().unwrap();
     let cm = md.row_groups[rg].columns[col].meta_data.as_ref().unwrap();
-    let start = cm
-        .dictionary_page_offset
-        .unwrap_or(cm.data_page_offset) as u64;
+    let start = cm.dictionary_page_offset.unwrap_or(cm.data_page_offset) as u64;
     let length = cm.total_compressed_size as u64;
     let bytes = file.read_range(start, length).unwrap();
     (bytes, cm.num_values as usize)
@@ -89,7 +87,9 @@ fn build_part_lookup(path: &PathBuf) -> HashMap<i64, bool> {
         ColumnReader::Int64ColumnReader(t) => t,
         _ => panic!(),
     };
-    k_reader.read_records(total, None, None, &mut p_keys).unwrap();
+    k_reader
+        .read_records(total, None, None, &mut p_keys)
+        .unwrap();
 
     // p_type is col 4 (BYTE_ARRAY).
     let mut p_types: Vec<ByteArray> = Vec::with_capacity(total);
@@ -97,7 +97,9 @@ fn build_part_lookup(path: &PathBuf) -> HashMap<i64, bool> {
         ColumnReader::ByteArrayColumnReader(t) => t,
         _ => panic!(),
     };
-    t_reader.read_records(total, None, None, &mut p_types).unwrap();
+    t_reader
+        .read_records(total, None, None, &mut p_types)
+        .unwrap();
 
     let mut map = HashMap::with_capacity(total);
     for (k, t) in p_keys.into_iter().zip(p_types.into_iter()) {
@@ -203,7 +205,15 @@ fn sparse_gather_col<T: Copy>(
                 gather_dict_at_bitmap_into(&scratch, n, bitmap, emitted, &dict, out).unwrap();
             }
             Encoding::Plain => {
-                stream_plain_gather(&scratch, n, bitmap, emitted, plain_value_size, plain_load_le, out);
+                stream_plain_gather(
+                    &scratch,
+                    n,
+                    bitmap,
+                    emitted,
+                    plain_value_size,
+                    plain_load_le,
+                    out,
+                );
             }
             other => panic!("unexpected encoding {other:?} col {col} rg {rg}"),
         }
@@ -306,27 +316,45 @@ fn process_rg(
     let t_pk = Instant::now();
     let mut keys: Vec<i64> = Vec::with_capacity(matches);
     sparse_gather_col::<i64>(
-        &file, rg, 1, &bitmap,
+        &file,
+        rg,
+        1,
+        &bitmap,
         |bytes| decode_plain_i64(bytes).unwrap(),
-        8, load_i64_le, &mut scratch, &mut keys,
+        8,
+        load_i64_le,
+        &mut scratch,
+        &mut keys,
     );
     t.partkey_gather += t_pk.elapsed().as_nanos() as u64;
 
     let t_ep = Instant::now();
     let mut prices: Vec<f64> = Vec::with_capacity(matches);
     sparse_gather_col::<f64>(
-        &file, rg, 5, &bitmap,
+        &file,
+        rg,
+        5,
+        &bitmap,
         |bytes| decode_plain_f64(bytes).unwrap(),
-        8, load_f64_le, &mut scratch, &mut prices,
+        8,
+        load_f64_le,
+        &mut scratch,
+        &mut prices,
     );
     t.extprice_gather += t_ep.elapsed().as_nanos() as u64;
 
     let t_dc = Instant::now();
     let mut discounts: Vec<f64> = Vec::with_capacity(matches);
     sparse_gather_col::<f64>(
-        &file, rg, 6, &bitmap,
+        &file,
+        rg,
+        6,
+        &bitmap,
         |bytes| decode_plain_f64(bytes).unwrap(),
-        8, load_f64_le, &mut scratch, &mut discounts,
+        8,
+        load_f64_le,
+        &mut scratch,
+        &mut discounts,
     );
     t.discount_gather += t_dc.elapsed().as_nanos() as u64;
 
@@ -382,8 +410,14 @@ impl Timing {
     }
     fn ms(&self) -> [f64; 6] {
         let f = |n: u64| n as f64 / 1e6;
-        [f(self.open), f(self.shipdate_filter), f(self.partkey_gather),
-         f(self.extprice_gather), f(self.discount_gather), f(self.agg)]
+        [
+            f(self.open),
+            f(self.shipdate_filter),
+            f(self.partkey_gather),
+            f(self.extprice_gather),
+            f(self.discount_gather),
+            f(self.agg),
+        ]
     }
 }
 
@@ -557,7 +591,10 @@ fn main() {
     let max = times[ITERS - 1].as_secs_f64() * 1000.0;
 
     println!();
-    println!("  ematix-parquet manual Q14:  median {:.2} ms  min {:.2} ms  max {:.2} ms", med, min, max);
+    println!(
+        "  ematix-parquet manual Q14:  median {:.2} ms  min {:.2} ms  max {:.2} ms",
+        med, min, max
+    );
     println!();
     println!("  Reference numbers (same SF=1 data):");
     println!("    DataFusion default:        19.35 ms");
@@ -567,6 +604,14 @@ fn main() {
     println!();
     let vs_polars = med / 12.53;
     let vs_fused = med / 15.06;
-    println!("  vs Polars:      {:.2}× ({})", vs_polars, if vs_polars < 1.0 { "faster" } else { "slower" });
-    println!("  vs FusedQ14:    {:.2}× ({})", vs_fused, if vs_fused < 1.0 { "faster" } else { "slower" });
+    println!(
+        "  vs Polars:      {:.2}× ({})",
+        vs_polars,
+        if vs_polars < 1.0 { "faster" } else { "slower" }
+    );
+    println!(
+        "  vs FusedQ14:    {:.2}× ({})",
+        vs_fused,
+        if vs_fused < 1.0 { "faster" } else { "slower" }
+    );
 }

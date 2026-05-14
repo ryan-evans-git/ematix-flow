@@ -141,8 +141,13 @@ async fn q14_post_join_input(ctx: &SessionContext) -> Arc<dyn ExecutionPlan> {
     ";
     let df = ctx.sql(sql).await.unwrap();
     let schema = Arc::new(df.schema().as_arrow().clone());
-    let batches: Vec<RecordBatch> =
-        df.execute_stream().await.unwrap().try_collect().await.unwrap();
+    let batches: Vec<RecordBatch> = df
+        .execute_stream()
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
     let mem = MemTable::try_new(schema, vec![batches]).unwrap();
     let local = SessionContext::new();
     local.register_table("joined", Arc::new(mem)).unwrap();
@@ -173,8 +178,18 @@ async fn bench_q6(ctx: &SessionContext) {
 
     let hand_out = run_to_first_batch(hand.clone()).await;
     let jit_out = run_to_first_batch(jitd.clone()).await;
-    let h = hand_out.column(0).as_any().downcast_ref::<Float64Array>().unwrap().value(0);
-    let j = jit_out.column(0).as_any().downcast_ref::<Float64Array>().unwrap().value(0);
+    let h = hand_out
+        .column(0)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap()
+        .value(0);
+    let j = jit_out
+        .column(0)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap()
+        .value(0);
     assert_close(h, j, "Q6 SF=1 revenue");
 
     let t_hand = time_exec(hand).await;
@@ -188,20 +203,29 @@ async fn bench_q6(ctx: &SessionContext) {
 // ----- Q1 -----
 
 async fn bench_q1(ctx: &SessionContext) {
-    let predicate = Q1Predicate { shipdate_cutoff: 10471 };
+    let predicate = Q1Predicate {
+        shipdate_cutoff: 10471,
+    };
     let hand_input = q1_input_plan(ctx).await;
     let jit_input = q1_input_plan(ctx).await;
     let hand = Arc::new(FusedFilterMultiAggExec::try_new_q1(hand_input, predicate).unwrap());
-    let jitd =
-        Arc::new(FusedFilterMultiAggExec::try_new_q1_jit(jit_input, predicate).unwrap());
+    let jitd = Arc::new(FusedFilterMultiAggExec::try_new_q1_jit(jit_input, predicate).unwrap());
 
     let hand_out = run_to_first_batch(hand.clone()).await;
     let jit_out = run_to_first_batch(jitd.clone()).await;
     // Compare every Float64 cell + the Int64 count column for bit-equality.
     assert_eq!(hand_out.num_rows(), jit_out.num_rows(), "row count");
     for col in 2..=8 {
-        let h = hand_out.column(col).as_any().downcast_ref::<Float64Array>().unwrap();
-        let j = jit_out.column(col).as_any().downcast_ref::<Float64Array>().unwrap();
+        let h = hand_out
+            .column(col)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        let j = jit_out
+            .column(col)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
         for row in 0..h.len() {
             let hv = h.value(row);
             let jv = j.value(row);
@@ -211,14 +235,30 @@ async fn bench_q1(ctx: &SessionContext) {
             assert_close(hv, jv, &format!("Q1 col {col} row {row}"));
         }
     }
-    let h_count = hand_out.column(9).as_any().downcast_ref::<Int64Array>().unwrap();
-    let j_count = jit_out.column(9).as_any().downcast_ref::<Int64Array>().unwrap();
+    let h_count = hand_out
+        .column(9)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let j_count = jit_out
+        .column(9)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
     for r in 0..h_count.len() {
         assert_eq!(h_count.value(r), j_count.value(r), "Q1 count row {r}");
     }
     // Spot-check group identity by reading the leading two String cols.
-    let rflag = hand_out.column(0).as_any().downcast_ref::<StringArray>().unwrap();
-    assert_eq!(rflag.value(0), "A", "Q1 group sort order should be (A,F)/(N,F)/(N,O)/(R,F)");
+    let rflag = hand_out
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(
+        rflag.value(0),
+        "A",
+        "Q1 group sort order should be (A,F)/(N,F)/(N,O)/(R,F)"
+    );
 
     let t_hand = time_exec(hand).await;
     let t_jit = time_exec(jitd).await;
@@ -233,15 +273,23 @@ async fn bench_q1(ctx: &SessionContext) {
 async fn bench_q14_post_join(ctx: &SessionContext) {
     let hand_input = q14_post_join_input(ctx).await;
     let jit_input = q14_post_join_input(ctx).await;
-    let hand =
-        Arc::new(FusedPostJoinExec::try_new(hand_input, FusedPostJoinSpec::Q14).unwrap());
-    let jitd =
-        Arc::new(FusedPostJoinExec::try_new_jit(jit_input, FusedPostJoinSpec::Q14).unwrap());
+    let hand = Arc::new(FusedPostJoinExec::try_new(hand_input, FusedPostJoinSpec::Q14).unwrap());
+    let jitd = Arc::new(FusedPostJoinExec::try_new_jit(jit_input, FusedPostJoinSpec::Q14).unwrap());
 
     let h_out = run_to_first_batch(hand.clone()).await;
     let j_out = run_to_first_batch(jitd.clone()).await;
-    let h = h_out.column(0).as_any().downcast_ref::<Float64Array>().unwrap().value(0);
-    let j = j_out.column(0).as_any().downcast_ref::<Float64Array>().unwrap().value(0);
+    let h = h_out
+        .column(0)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap()
+        .value(0);
+    let j = j_out
+        .column(0)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap()
+        .value(0);
     assert_close(h, j, "Q14 SF=1 promo_revenue ratio");
 
     let t_hand = time_exec(hand).await;

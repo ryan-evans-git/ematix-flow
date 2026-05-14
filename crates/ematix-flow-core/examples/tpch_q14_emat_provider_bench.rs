@@ -66,7 +66,10 @@ fn ensure_synthetic_file(real_path: &PathBuf) -> PathBuf {
     if cache.exists() {
         return cache;
     }
-    eprintln!("Building primitive-only synthetic file at {}", cache.display());
+    eprintln!(
+        "Building primitive-only synthetic file at {}",
+        cache.display()
+    );
 
     let r = SerializedFileReader::new(File::open(real_path).unwrap()).unwrap();
     let mut shipdate: Vec<i32> = Vec::new();
@@ -234,9 +237,13 @@ async fn main() {
         let p = p1.clone();
         Box::pin(async move {
             let ctx = SessionContext::new();
-            ctx.register_parquet("lineitem", p.to_string_lossy().to_string(), Default::default())
-                .await
-                .unwrap();
+            ctx.register_parquet(
+                "lineitem",
+                p.to_string_lossy().to_string(),
+                Default::default(),
+            )
+            .await
+            .unwrap();
             ctx
         })
     })

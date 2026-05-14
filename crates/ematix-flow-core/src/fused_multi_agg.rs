@@ -416,11 +416,7 @@ fn process_q1_batch_jit(
     // elements; views() is also `num_rows()` views long; cells holds
     // exactly `jit.n_outputs() == 30` f64 cells.
     unsafe {
-        jit.run(
-            batch.num_rows() as i64,
-            inputs.as_ptr(),
-            cells.as_mut_ptr(),
-        );
+        jit.run(batch.num_rows() as i64, inputs.as_ptr(), cells.as_mut_ptr());
     }
 }
 
@@ -709,17 +705,17 @@ mod tests {
     #[tokio::test]
     async fn jit_q1_exec_matches_hand_coded_exec_bit_identical() {
         let cutoff = 10471;
-        let predicate = Q1Predicate { shipdate_cutoff: cutoff };
+        let predicate = Q1Predicate {
+            shipdate_cutoff: cutoff,
+        };
 
         let hand_input = input_plan_from_batch(make_test_batch(cutoff)).await;
-        let hand_exec = Arc::new(
-            FusedFilterMultiAggExec::try_new_q1(hand_input, predicate).unwrap(),
-        );
+        let hand_exec =
+            Arc::new(FusedFilterMultiAggExec::try_new_q1(hand_input, predicate).unwrap());
 
         let jit_input = input_plan_from_batch(make_test_batch(cutoff)).await;
-        let jit_exec = Arc::new(
-            FusedFilterMultiAggExec::try_new_q1_jit(jit_input, predicate).unwrap(),
-        );
+        let jit_exec =
+            Arc::new(FusedFilterMultiAggExec::try_new_q1_jit(jit_input, predicate).unwrap());
 
         let session = SessionContext::new();
         let mut hand_s = hand_exec.execute(0, session.task_ctx()).unwrap();
@@ -766,7 +762,11 @@ mod tests {
             .downcast_ref::<datafusion::arrow::array::Int64Array>()
             .unwrap();
         for row in 0..h_count.len() {
-            assert_eq!(h_count.value(row), j_count.value(row), "count col row {row}");
+            assert_eq!(
+                h_count.value(row),
+                j_count.value(row),
+                "count col row {row}"
+            );
         }
     }
 

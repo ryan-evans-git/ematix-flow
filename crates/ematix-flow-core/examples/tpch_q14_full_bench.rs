@@ -155,21 +155,16 @@ async fn build_full_fusion_exec(parquet_dir: &str) -> Arc<dyn ExecutionPlan> {
     let li_path = format!("{parquet_dir}/lineitem.parquet");
     let li_prov = FastParquetTableProvider::try_new(li_path).unwrap();
     let li_full_schema = li_prov.schema();
-    let li_proj: Vec<usize> = [
-        "l_partkey",
-        "l_extendedprice",
-        "l_discount",
-        "l_shipdate",
-    ]
-    .iter()
-    .map(|n| {
-        li_full_schema
-            .fields()
-            .iter()
-            .position(|f| f.name() == *n)
-            .unwrap_or_else(|| panic!("lineitem missing {n}"))
-    })
-    .collect();
+    let li_proj: Vec<usize> = ["l_partkey", "l_extendedprice", "l_discount", "l_shipdate"]
+        .iter()
+        .map(|n| {
+            li_full_schema
+                .fields()
+                .iter()
+                .position(|f| f.name() == *n)
+                .unwrap_or_else(|| panic!("lineitem missing {n}"))
+        })
+        .collect();
     let li = li_prov
         .scan(&ctx.state(), Some(&li_proj), &[], None)
         .await
@@ -236,13 +231,7 @@ async fn bench_full_fusion(label: &str, exec: Arc<dyn ExecutionPlan>) -> (Stats,
 /// pin equivalence on the full-fusion result before reporting timings.
 async fn reference_ratio(parquet_dir: &str) -> f64 {
     let ctx = make_default_ctx(parquet_dir).await;
-    let batches: Vec<RecordBatch> = ctx
-        .sql(Q14_SQL)
-        .await
-        .unwrap()
-        .collect()
-        .await
-        .unwrap();
+    let batches: Vec<RecordBatch> = ctx.sql(Q14_SQL).await.unwrap().collect().await.unwrap();
     batches[0]
         .column(0)
         .as_any()
@@ -260,9 +249,7 @@ async fn main() {
     println!();
 
     let ref_ratio = reference_ratio(&dir).await;
-    println!(
-        "  Reference ratio (DataFusion default SQL):   {ref_ratio:.4}%"
-    );
+    println!("  Reference ratio (DataFusion default SQL):   {ref_ratio:.4}%");
     println!();
 
     // 1: DataFusion default SQL path (register_parquet).
@@ -280,8 +267,7 @@ async fn main() {
 
     // 3: full-fusion path.
     let exec = build_full_fusion_exec(&dir).await;
-    let (stats_full, full_ratio) =
-        bench_full_fusion("FusedQ14FullExec (full fusion)", exec).await;
+    let (stats_full, full_ratio) = bench_full_fusion("FusedQ14FullExec (full fusion)", exec).await;
 
     // Sanity: full-fusion ratio must agree with the reference to within
     // rel_err 1e-12 (a few ULPs from SIMD-vs-scalar reduction order).

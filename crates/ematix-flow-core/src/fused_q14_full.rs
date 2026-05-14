@@ -289,25 +289,19 @@ impl ExecutionPlan for FusedQ14FullExec {
 
             // Fan the cached/built bitmap out to the workers. With the
             // cache warm on subsequent calls this is effectively free.
-            let bitmap = build_handle
-                .await
-                .map_err(|e| {
-                    DataFusionError::Execution(format!(
-                        "FusedQ14FullExec: bitmap task join failed: {e}"
-                    ))
-                })??;
+            let bitmap = build_handle.await.map_err(|e| {
+                DataFusionError::Execution(format!(
+                    "FusedQ14FullExec: bitmap task join failed: {e}"
+                ))
+            })??;
             let _ = bm_tx.send(Some(bitmap));
 
             let mut promo = 0.0_f64;
             let mut total = 0.0_f64;
             for h in handles {
-                let (p, t) = h
-                    .await
-                    .map_err(|e| {
-                        DataFusionError::Execution(format!(
-                            "FusedQ14FullExec: worker join failed: {e}"
-                        ))
-                    })??;
+                let (p, t) = h.await.map_err(|e| {
+                    DataFusionError::Execution(format!("FusedQ14FullExec: worker join failed: {e}"))
+                })??;
                 promo += p;
                 total += t;
             }
@@ -550,8 +544,7 @@ mod tests {
             Field::new("p_partkey", DataType::Int32, false),
             Field::new("p_type", DataType::Utf8View, false),
         ]));
-        RecordBatch::try_new(schema, vec![Arc::new(pk.finish()), Arc::new(pt.finish())])
-            .unwrap()
+        RecordBatch::try_new(schema, vec![Arc::new(pk.finish()), Arc::new(pt.finish())]).unwrap()
     }
 
     #[tokio::test(flavor = "multi_thread")]
