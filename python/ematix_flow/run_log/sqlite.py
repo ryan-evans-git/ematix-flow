@@ -1,16 +1,24 @@
 """SqliteRunLog — the default, local-file backend.
 
-Uses stdlib `sqlite3`. Two tables, one row per pipeline name; records
-are upserted via REPLACE so the DB always reflects the most recent
-state. WAL mode improves concurrent-reader tolerance without changing
-single-writer semantics.
+Uses stdlib `sqlite3`. Three tables, one row per pipeline name;
+records are upserted via REPLACE so the DB always reflects the most
+recent state. WAL mode improves concurrent-reader tolerance without
+changing single-writer semantics.
+
+Ω.W.1: a `pipeline_claims` table holds the lease layer. SQLite is
+single-writer, so a `BEGIN IMMEDIATE` transaction around
+read-then-conditional-write is sufficient for safe CAS within one
+process. Distributed multi-process CAS lives on Postgres/MySQL
+(Ω.W.2).
 """
 
 from __future__ import annotations
 
-from datetime import datetime
+import uuid
+from datetime import UTC, datetime, timedelta
 
 from ._iso import iso_utc, parse_iso
+from .protocol import ClaimResult, ExpiredClaim
 
 
 class SqliteRunLog:
@@ -28,6 +36,13 @@ class SqliteRunLog:
             attempt_count   INTEGER NOT NULL,
             last_attempt_at TEXT NOT NULL,
             gave_up         INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS pipeline_claims (
+            pipeline_name TEXT PRIMARY KEY,
+            claim_token   TEXT NOT NULL,
+            worker_id     TEXT NOT NULL,
+            claimed_at    TEXT NOT NULL,
+            expires_at    TEXT NOT NULL
         );
     """
 
@@ -90,3 +105,59 @@ class SqliteRunLog:
                 last_attempt_at=parse_iso(ts_s),
                 gave_up=bool(gave_up),
             )
+
+    # ---- Ω.W.1: lease layer ---------------------------------------
+
+    def claim(self, pipeline: str, worker_id: str, lease_seconds: int) -> ClaimResult:
+        # Truncate to second precision so what we hand back in
+        # ClaimResult matches what comes back out of the next SELECT.
+        now = datetime.now(UTC).replace(microsecond=0)
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = self._conn.execute(
+                "SELECT worker_id, expires_at FROM pipeline_claims WHERE pipeline_name = ?",
+                (pipeline,),
+            ).fetchone()
+            if row is not None and parse_iso(row[1]) > now:
+                self._conn.execute("COMMIT")
+                return ClaimResult.busy(holder=row[0], expires_at=parse_iso(row[1]))
+            token = uuid.uuid4().hex
+            expires_at = now + timedelta(seconds=lease_seconds)
+            self._conn.execute(
+                "REPLACE INTO pipeline_claims "
+                "(pipeline_name, claim_token, worker_id, claimed_at, expires_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (pipeline, token, worker_id, iso_utc(now), iso_utc(expires_at)),
+            )
+            self._conn.execute("COMMIT")
+        except Exception:
+            self._conn.execute("ROLLBACK")
+            raise
+        return ClaimResult.acquired_by(
+            token=token, worker_id=worker_id, expires_at=expires_at
+        )
+
+    def heartbeat(self, claim_token: str, lease_seconds: int) -> None:
+        new_expires = datetime.now(UTC).replace(microsecond=0) + timedelta(
+            seconds=lease_seconds
+        )
+        self._conn.execute(
+            "UPDATE pipeline_claims SET expires_at = ? WHERE claim_token = ?",
+            (iso_utc(new_expires), claim_token),
+        )
+
+    def release(self, claim_token: str) -> None:
+        self._conn.execute(
+            "DELETE FROM pipeline_claims WHERE claim_token = ?", (claim_token,)
+        )
+
+    def sweep_expired_leases(self, now: datetime) -> list[ExpiredClaim]:
+        cur = self._conn.execute(
+            "SELECT pipeline_name, worker_id, expires_at "
+            "FROM pipeline_claims WHERE expires_at < ?",
+            (iso_utc(now),),
+        )
+        return [
+            ExpiredClaim(pipeline=name, worker_id=wid, expires_at=parse_iso(exp))
+            for name, wid, exp in cur.fetchall()
+        ]

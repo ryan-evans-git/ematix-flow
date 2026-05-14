@@ -19,9 +19,10 @@ from datetime import datetime
 from urllib.parse import urlparse
 
 from ._iso import iso_utc, parse_iso
+from ._no_lease import NoLeaseSQLBackend
 
 
-class MySQLRunLog:
+class MySQLRunLog(NoLeaseSQLBackend):
     """MySQL (and MariaDB) backend.
 
     Args:
