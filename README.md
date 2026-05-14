@@ -534,9 +534,34 @@ That's the full file. Run it:
 ```sh
 flow run --module my_pipelines ingest_events     # one-shot
 flow run-due --module my_pipelines               # cron-style
+flow status --module my_pipelines                # operator view
 flow preview --module my_pipelines ingest_events # what would it do?
 flow validate --module my_pipelines ingest_events # EXPLAIN against the DB
 ```
+
+#### Dependencies + retry
+
+Pipelines can declare upstream `depends_on` and a per-pipeline
+`retry` policy. `flow run-due` honors both: it topologically
+orders fires, skips downstream work when upstreams fail, and
+applies exponential backoff between attempts.
+
+```python
+@ematix.pipeline(
+    target=DailyRollups,
+    target_connection="warehouse",
+    schedule="0 2 * * *",
+    mode="merge",
+    depends_on=["ingest_events"],          # must succeed first today
+    retry={"max_attempts": 5, "backoff_seconds": 30, "backoff_factor": 2.0},
+)
+def daily_rollups(conn):
+    return "SELECT ... FROM analytics.events GROUP BY ..."
+```
+
+Cycles are detected at module load time. Attempt state survives
+process restarts when a durable [Run history](#run-history)
+backend is configured.
 
 ### Tables
 
@@ -797,9 +822,66 @@ another orchestrator.
 
 ### Run history
 
-Every run lands in `ematix_flow.run_history` with a `run_id`,
-status, row counts, error message (if any), and metrics JSON.
-Inspect via SQL or `flow runs list`.
+Every run lands in the configured RunLog with a `run_id`, status,
+row counts, attempt count, error message (if any), and metrics
+JSON. Inspect via SQL, the backend's tooling, or `flow runs list`.
+
+#### RunLog backends
+
+Choose a backend via URL — same form for the CLI flag, the
+`@ematix.connection` decorator, and `run_due_with_dag_detailed`.
+
+| Scheme | Backend | Notes |
+|---|---|---|
+| `sqlite://path/to/run_log.db` | SQLite (default) | Single-process; zero config. |
+| `memory://` | In-memory | Tests only; lost on exit. |
+| `postgres://user:pw@host/db` | Postgres | Multi-host; auto-creates `ematix_flow` schema unless `create_tables=false`. |
+| `mysql://user:pw@host/db` | MySQL | Same shape as Postgres. |
+| `duckdb://path/to/run_log.duckdb` | DuckDB | Single-file analytical store. |
+| `s3://bucket/prefix?region=...` | S3 (AWS) | JSONL append; good for serverless. |
+| `azureblob://account/container/prefix` | Azure Blob | Append-block log. |
+| `gcs://bucket/prefix` | GCS | JSONL append. |
+
+```sh
+flow run-due --module my_pipelines \
+    --run-log postgres://flow:pw@logdb/flow_history \
+    --alerter slack://hooks.slack.com/services/... \
+    --metrics prometheus://:9100
+```
+
+When the configured RunLog location is unwritable (lambda
+read-only FS, missing credentials), `flow` warns and continues —
+orchestration stays alive even with the durable-history layer
+down.
+
+#### Alerters
+
+`--alerter <url>` (repeatable) attaches one or more sinks for
+failure / recovery events.
+
+| Scheme | Effect |
+|---|---|
+| `stdout://` | Human-readable lines on stderr. |
+| `slack://hooks.slack.com/services/...` | Posts to a Slack incoming webhook. |
+
+Buggy alerters are fault-isolated: any exception is logged and
+swallowed, never crashes the orchestrator.
+
+#### Metrics sinks
+
+`--metrics <url>` exports per-pipeline run counts, durations, and
+current attempt state.
+
+| Scheme | Effect |
+|---|---|
+| `null://` | Drop everything (default). |
+| `stdout://` | Pretty-print on flush. |
+| `memory://` | In-process counters; readable from Python. |
+| `prometheus://:9100` | `/metrics` endpoint on the given port. |
+| `otlp://collector:4318` | OTel HTTP exporter. |
+
+Full operator-deployment recipes (per environment, with example
+URLs and the right pyproject extras): [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md).
 
 ---
 
@@ -1281,6 +1363,25 @@ run_streaming_pipeline(
 )
 ```
 
+### Object-store file formats
+
+Object-store backends support `parquet`, `csv`, `json_lines`, and
+`orc`. The format is set on the connection and steers both the
+reader (schema inference + decode) and the writer (per-format
+encoder).
+
+```python
+from ematix_flow.connections import format_from_path
+
+format_from_path("s3://bucket/year=2026/events.csv.gz")  # → "csv"
+format_from_path("logs.ndjson")                          # → "json_lines"
+format_from_path("data.parquet")                         # → "parquet"
+```
+
+Recognized extensions cover `.parquet` / `.pq`, `.csv` / `.tsv`,
+`.json` / `.jsonl` / `.ndjson`, and `.orc`; the matcher strips
+`.gz` / `.bz2` / `.zst` / `.lz4` / `.snappy` first.
+
 ### Object-store write options
 
 ```python
@@ -1293,13 +1394,45 @@ Target(
 Target(
     connection=lake,
     prefix="events/csv",
-    csv_delimiter=";",
+    csv_delimiter=";",                # single ASCII char
     csv_header=False,
+    csv_quote="'",                    # Π.4e — defaults to `"`
+    csv_escape="\\",                  # defaults to doubled-quote
+    csv_null_value="\\N",             # how null cells render on write
+)
+```
+
+### Object-store read options
+
+CSV decode and JSON-lines decode honor a matching set of
+options. Schema inference and the row decoder both see the same
+settings, so a file written with one dialect can be read back with
+the same one.
+
+```python
+Target(
+    connection=lake,
+    prefix="events/csv",
+    csv_read_options={
+        "has_header": True,
+        "delimiter": ",",
+        "quote": '"',
+        "escape": "\\",
+        "comment": "#",
+        "null_regex": r"^(NA|NULL|\\N)$",  # in addition to empty string
+        "truncated_rows_ok": False,
+        "schema_infer_max_records": 4096,
+    },
+    json_read_options={
+        "schema_infer_max_records": 4096,
+        "batch_size": 8192,
+    },
 )
 ```
 
 The typed-Python boundary catches mis-shaped combos (e.g. setting
-`parquet_compression` on a CSV target) before TOML round-trip.
+`parquet_compression` on a CSV target, or `csv_read_options` on a
+Parquet target) before TOML round-trip.
 
 ### State store
 
@@ -1344,10 +1477,11 @@ flow connections set warehouse url=postgres://...
 ```
 flow list                # registered pipelines
 flow run <name>          # one-shot
-flow run-due             # cron-style fire of all due pipelines
+flow run-due             # cron-style fire of all due pipelines (DAG-aware)
+flow status              # operator view: per-pipeline status / next-due / attempts
 flow preview <name>      # dry-run, no commit
 flow validate <name>     # EXPLAIN against the target
-flow runs list           # recent runs from ematix_flow.run_history
+flow runs list           # recent runs from the configured RunLog
 flow connections list / check / set
 flow transform list / run
 
@@ -1356,9 +1490,19 @@ flow consume --module my_pipelines <name>   # typed-Python form
 flow consume-list --module my_pipelines     # registered streaming pipelines
 ```
 
-`--module` points at any importable Python module. `--metrics-port`
-exposes Prometheus metrics. `--restart-on-error --max-backoff-ms`
-enables the supervised-restart loop.
+`--module` points at any importable Python module.
+
+Observability flags (work on `run-due`, `status`, `runs list`):
+
+```
+--run-log <url>     # any RunLog scheme (sqlite/postgres/mysql/duckdb/s3/azureblob/gcs/memory)
+--alerter <url>    # repeatable; stdout:// or slack://...
+--metrics  <url>   # null:// / stdout:// / memory:// / prometheus://:port / otlp://endpoint
+```
+
+Streaming-daemon flags: `--metrics-port` exposes Prometheus metrics;
+`--restart-on-error --max-backoff-ms` enables the supervised-restart
+loop.
 
 ---
 
@@ -1468,7 +1612,7 @@ extensions, open design questions).
 - 124 Rust CLI unit tests + 27 backend-config scaffold round-trip
   tests across all 10 backends + distributed + TLS config
 - ~80 Rust testcontainers integration tests (Docker-gated)
-- 376 default Python tests + ~196 testcontainers-gated Python tests
+- 622 default Python tests + ~196 testcontainers-gated Python tests
 - 22-query TPC-H audit: **22/22 PASS** at SF=1
 - 103-query TPC-DS Spark-dialect audit: **103/103 PASS** plan-time
 
@@ -1488,6 +1632,7 @@ RustSec; ruff + bandit + pip-audit green on the Python side.
 - **[`docs/PHASE_DELTA_CDC_PLAN.md`](docs/PHASE_DELTA_CDC_PLAN.md)** — CDC source mode
 
 → **Full step-by-step walkthrough:** [`docs/USER_GUIDE.md`](docs/USER_GUIDE.md).
+→ **Operator deployment recipes:** [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md).
 → **Runnable examples:** [`examples/`](examples/) (one per strategy + streaming + windowed + session + join + CDC).
 → **Cutting a release:** [`docs/RELEASE.md`](docs/RELEASE.md).
 
