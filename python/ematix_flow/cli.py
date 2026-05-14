@@ -91,13 +91,50 @@ def _cmd_transform_run(args: argparse.Namespace) -> int:
 def _cmd_run(args: argparse.Namespace) -> int:
     print_banner()
     _import_user_module(args.module)
+
+    # Ω.W.3: worker-side claim semantics. When the scheduler spawns
+    # us via SubprocessExecutor, --claim-token is set and we need to
+    # heartbeat the lease while the pipeline runs, then release on
+    # exit so the next scheduler tick can re-fire if the schedule
+    # comes due again.
+    claim_token = getattr(args, "claim_token", None)
+    run_log = _open_run_log_or_none(args) if claim_token else None
+    heartbeat = None
+    if claim_token and run_log is not None:
+        from ematix_flow.executors.heartbeat import HeartbeatThread
+
+        heartbeat = HeartbeatThread(
+            run_log,
+            claim_token,
+            lease_seconds=int(args.lease_seconds),
+            interval_seconds=int(args.heartbeat_interval),
+        )
+        heartbeat.start()
+
     try:
-        result = p.run_pipeline(args.name)
-    except KeyError:
-        print(f"error: no pipeline named {args.name!r}", file=sys.stderr)
-        return 2
-    print(json.dumps(result, default=str))
-    return 0
+        try:
+            result = p.run_pipeline(args.name)
+        except KeyError:
+            print(f"error: no pipeline named {args.name!r}", file=sys.stderr)
+            return 2
+        print(json.dumps(result, default=str))
+        return 0
+    finally:
+        if heartbeat is not None:
+            heartbeat.stop()
+        if claim_token and run_log is not None:
+            try:
+                run_log.release(claim_token)
+            except Exception as e:
+                # Releasing is best-effort — the lease expires
+                # naturally and the scheduler reclaims.
+                print(
+                    f"warning: failed to release claim {claim_token}: "
+                    f"{type(e).__name__}: {e}",
+                    file=sys.stderr,
+                )
+        if run_log is not None:
+            run_log.close()
 
 
 def _cmd_consume(args: argparse.Namespace) -> int:
@@ -576,6 +613,34 @@ def main(argv: list[str] | None = None) -> int:
     run_p = sub.add_parser("run", help="run a pipeline by name")
     run_p.add_argument("--module", required=True)
     run_p.add_argument("name", help="pipeline name (matches @register(name=...))")
+    # Ω.W.3 worker-side flags. None of these are required when
+    # invoked by a human — they're populated by the scheduler's
+    # Executor when it dispatches a per-fire worker.
+    run_p.add_argument(
+        "--claim-token",
+        default=None,
+        help="RunLog claim token issued by the scheduler. When set, "
+        "the worker heartbeats the lease for the duration of the run "
+        "and releases the claim on exit.",
+    )
+    run_p.add_argument(
+        "--lease-seconds",
+        type=int,
+        default=300,
+        help="Lease duration the scheduler granted (default 300). "
+        "The worker's heartbeat keeps it pushed out by this many "
+        "seconds each interval.",
+    )
+    run_p.add_argument(
+        "--heartbeat-interval",
+        type=int,
+        default=100,
+        help="Seconds between heartbeat calls (default 100). Should "
+        "be a fraction of --lease-seconds so the scheduler sees two "
+        "missed windows before declaring the worker dead.",
+    )
+    _add_run_log_args(run_p)
+    _add_observability_args(run_p)
     run_p.set_defaults(func=_cmd_run)
 
     # Π.3: streaming-pipeline subcommands. `consume` runs a single
