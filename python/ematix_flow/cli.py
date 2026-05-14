@@ -165,8 +165,20 @@ def _cmd_run_due(args: argparse.Namespace) -> int:
 
     # Phase Ω.D2: use the unified `run_due_with_dag_detailed` so
     # retry backoff + gave-up gating actually fire from the CLI.
-    # Pre-Ω.D2 this loop had its own bespoke logic that bypassed Ω.2.
-    result = p.run_due_with_dag_detailed(due, now=now, run_log=run_log)
+    # Ω.D4: attach alerters + metrics sink resolved from --alerter
+    # and --metrics URLs.
+    alerters = _open_alerters(args)
+    metrics_sink = _open_metrics(args)
+    try:
+        result = p.run_due_with_dag_detailed(
+            due, now=now, run_log=run_log,
+            alerters=alerters, metrics=metrics_sink,
+        )
+    finally:
+        try:
+            metrics_sink.close()
+        except Exception:
+            pass
 
     # Log per-pipeline progress to stderr for tail-the-log operators;
     # the structured JSON on stdout is what scripts parse.
@@ -268,6 +280,86 @@ def _default_run_log_path() -> str:
     if env:
         return env
     return os.path.expanduser("~/.ematix-flow/run_log.db")
+
+
+def _open_alerters(args: argparse.Namespace) -> list:
+    """Resolve --alerter / $EMATIX_FLOW_ALERTERS into a list of Alerter
+    instances. Flags win over env; comma-separated URLs allowed in env.
+    A bad URL prints a warning to stderr and is skipped — the rest of
+    the list still loads. Default: empty list."""
+    import os
+    from ematix_flow.alerters import from_url as alerter_from_url
+
+    flag_list = getattr(args, "alerter", None)
+    if flag_list:
+        urls = list(flag_list)
+    else:
+        env = os.environ.get("EMATIX_FLOW_ALERTERS", "")
+        urls = [u.strip() for u in env.split(",") if u.strip()]
+
+    out = []
+    for url in urls:
+        try:
+            out.append(alerter_from_url(url))
+        except Exception as e:
+            print(
+                f"warning: skipping alerter {url!r}: "
+                f"{type(e).__name__}: {e}",
+                file=sys.stderr,
+            )
+    return out
+
+
+def _open_metrics(args: argparse.Namespace):
+    """Resolve --metrics / $EMATIX_FLOW_METRICS into a MetricsSink.
+    Flag wins over env; default is NullSink. A bad URL warns and
+    falls back to NullSink."""
+    import os
+    from ematix_flow.metrics import NullSink, from_url as metrics_from_url
+
+    url = getattr(args, "metrics", None) or os.environ.get("EMATIX_FLOW_METRICS")
+    if not url:
+        return NullSink()
+    try:
+        return metrics_from_url(url)
+    except Exception as e:
+        print(
+            f"warning: metrics URL {url!r} failed to construct: "
+            f"{type(e).__name__}: {e}. Falling back to NullSink "
+            f"(metrics will not be recorded).",
+            file=sys.stderr,
+        )
+        return NullSink()
+
+
+def _add_observability_args(parser: argparse.ArgumentParser) -> None:
+    """Shared --alerter (repeatable) and --metrics flags for run-due.
+
+    Alerter URL schemes: stdout://, slack://hooks.slack.com/...,
+    https://hooks.slack.com/... (passthrough).
+
+    Metrics URL schemes: null://, stdout://, memory://,
+    prometheus://[:port], otlp://endpoint, otlp+grpc://endpoint,
+    otlp+http://endpoint.
+
+    Default footprint is zero — no alerters, NullSink for metrics —
+    so observability is fully opt-in.
+    """
+    parser.add_argument(
+        "--alerter",
+        action="append",
+        default=None,
+        help="alerter URL; repeatable. Examples: stdout://, "
+        "slack://hooks.slack.com/services/X/Y/Z. Falls back to "
+        "$EMATIX_FLOW_ALERTERS (comma-separated list).",
+    )
+    parser.add_argument(
+        "--metrics",
+        default=None,
+        help="metrics sink URL. Examples: prometheus://:9090, "
+        "otlp://collector:4317, stdout://. Falls back to "
+        "$EMATIX_FLOW_METRICS. Default: no metrics.",
+    )
 
 
 def _add_run_log_args(parser: argparse.ArgumentParser) -> None:
@@ -544,6 +636,7 @@ def main(argv: list[str] | None = None) -> int:
         "you invoke `flow run-due`",
     )
     _add_run_log_args(due_p)
+    _add_observability_args(due_p)
     due_p.set_defaults(func=_cmd_run_due)
 
     # `flow preview / dry-run` subcommands (Phase 25).
