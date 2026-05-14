@@ -1717,7 +1717,16 @@ mod tests {
             Some(p) if p.exists() => p,
             _ => {
                 let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-                manifest.parent()?.parent()?.join("examples/tpch/data/sf1")
+                let real = manifest.parent()?.parent()?.join("examples/tpch/data/sf1");
+                if real.exists() {
+                    real
+                } else {
+                    // Fallback: synthetic mini-fixture (see
+                    // `test_support`). Lets the SQL plan-rewrite tests
+                    // exercise FastParquet end-to-end in CI without
+                    // the real SF=1 dataset on disk.
+                    PathBuf::from(crate::test_support::tpch_mini_dir())
+                }
             }
         };
         let p = dir.join("lineitem.parquet");
@@ -2490,5 +2499,282 @@ mod tests {
                 "Q5 {k}: with={wv} without={ov} rel_err={rel:e}"
             );
         }
+    }
+
+    // ----- Predicate-extraction unit tests -----
+    //
+    // The inject-rule tests above gate on SF=1 TPC-H data and therefore
+    // skip in CI without the dataset. The predicate-decomposer functions
+    // (`flip_op`, `decompose_leaf`, `decompose_filter_leaf`,
+    // `extract_q6_predicate`, `extract_q1_predicate`,
+    // `extract_q14_predicate`) are pure, no-fixture functions — these
+    // tests exercise their happy paths and the "return None" rejection
+    // branches that real-data tests never hit.
+
+    fn col(name: &str) -> Arc<dyn PhysicalExpr> {
+        Arc::new(Column::new(name, 0))
+    }
+
+    fn lit_date(d: i32) -> Arc<dyn PhysicalExpr> {
+        Arc::new(Literal::new(ScalarValue::Date32(Some(d))))
+    }
+
+    fn lit_f64(f: f64) -> Arc<dyn PhysicalExpr> {
+        Arc::new(Literal::new(ScalarValue::Float64(Some(f))))
+    }
+
+    fn lit_null_date() -> Arc<dyn PhysicalExpr> {
+        Arc::new(Literal::new(ScalarValue::Date32(None)))
+    }
+
+    fn bin(
+        l: Arc<dyn PhysicalExpr>,
+        op: Operator,
+        r: Arc<dyn PhysicalExpr>,
+    ) -> Arc<dyn PhysicalExpr> {
+        Arc::new(BinaryExpr::new(l, op, r))
+    }
+
+    #[test]
+    fn flip_op_covers_all_comparison_variants() {
+        assert_eq!(flip_op(Operator::Lt), Some(Operator::Gt));
+        assert_eq!(flip_op(Operator::LtEq), Some(Operator::GtEq));
+        assert_eq!(flip_op(Operator::Gt), Some(Operator::Lt));
+        assert_eq!(flip_op(Operator::GtEq), Some(Operator::LtEq));
+        assert_eq!(flip_op(Operator::Eq), Some(Operator::Eq));
+        assert_eq!(flip_op(Operator::NotEq), Some(Operator::NotEq));
+        assert_eq!(flip_op(Operator::Plus), None);
+        assert_eq!(flip_op(Operator::And), None);
+    }
+
+    #[test]
+    fn flatten_and_descends_through_nested_ands() {
+        // (a < 1) AND ((b < 2) AND (c < 3)) → three leaves.
+        let leaf_a = bin(col("a"), Operator::Lt, lit_f64(1.0));
+        let leaf_b = bin(col("b"), Operator::Lt, lit_f64(2.0));
+        let leaf_c = bin(col("c"), Operator::Lt, lit_f64(3.0));
+        let rhs = bin(leaf_b.clone(), Operator::And, leaf_c.clone());
+        let root = bin(leaf_a.clone(), Operator::And, rhs);
+        let mut out: Vec<&Arc<dyn PhysicalExpr>> = Vec::new();
+        flatten_and(&root, &mut out);
+        assert_eq!(out.len(), 3);
+    }
+
+    #[test]
+    fn flatten_and_treats_non_and_as_leaf() {
+        // A bare comparison is one leaf — no descent into the binary.
+        let expr = bin(col("a"), Operator::Lt, lit_f64(1.0));
+        let mut out: Vec<&Arc<dyn PhysicalExpr>> = Vec::new();
+        flatten_and(&expr, &mut out);
+        assert_eq!(out.len(), 1);
+    }
+
+    #[test]
+    fn decompose_leaf_handles_mirrored_literal_on_left() {
+        // `5 < l_quantity` should canonicalise to `(l_quantity, Gt, 5)`.
+        let mirrored = bin(lit_f64(5.0), Operator::Lt, col("l_quantity"));
+        let (name, op, lit) = decompose_leaf(&mirrored).unwrap();
+        assert_eq!(name, "l_quantity");
+        assert_eq!(op, Operator::Gt);
+        assert!(matches!(lit, ScalarValue::Float64(Some(v)) if v == 5.0));
+    }
+
+    #[test]
+    fn decompose_leaf_rejects_unknown_column() {
+        // Q6 only recognises l_shipdate / l_discount / l_quantity.
+        let expr = bin(col("l_orderkey"), Operator::Lt, lit_f64(1.0));
+        assert!(decompose_leaf(&expr).is_none());
+    }
+
+    #[test]
+    fn decompose_leaf_rejects_non_binary_expr() {
+        // A bare column isn't a BinaryExpr — None.
+        let bare = col("l_shipdate");
+        assert!(decompose_leaf(&bare).is_none());
+    }
+
+    #[test]
+    fn decompose_leaf_rejects_column_op_column() {
+        // No literal present on either side — None.
+        let two_cols = bin(col("l_shipdate"), Operator::Lt, col("l_quantity"));
+        assert!(decompose_leaf(&two_cols).is_none());
+    }
+
+    #[test]
+    fn extract_q6_predicate_happy_path() {
+        // Full canonical Q6 predicate ANDed together.
+        let p = bin(
+            bin(
+                bin(
+                    bin(
+                        bin(col("l_shipdate"), Operator::GtEq, lit_date(8766)),
+                        Operator::And,
+                        bin(col("l_shipdate"), Operator::Lt, lit_date(9131)),
+                    ),
+                    Operator::And,
+                    bin(col("l_discount"), Operator::GtEq, lit_f64(0.05)),
+                ),
+                Operator::And,
+                bin(col("l_discount"), Operator::LtEq, lit_f64(0.07)),
+            ),
+            Operator::And,
+            bin(col("l_quantity"), Operator::Lt, lit_f64(24.0)),
+        );
+        let pred = extract_q6_predicate(&p).unwrap();
+        assert_eq!(pred.date_lo, 8766);
+        assert_eq!(pred.date_hi, 9131);
+        assert!((pred.disc_lo - 0.05).abs() < 1e-12);
+        assert!((pred.disc_hi - 0.07).abs() < 1e-12);
+        assert!((pred.qty_hi - 24.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn extract_q6_predicate_rejects_wrong_literal_type_for_shipdate() {
+        // shipdate must be Date32; Float64 literal is rejected.
+        let bad = bin(col("l_shipdate"), Operator::GtEq, lit_f64(0.0));
+        assert!(extract_q6_predicate(&bad).is_none());
+    }
+
+    #[test]
+    fn extract_q6_predicate_rejects_unexpected_operator() {
+        // Q6 doesn't recognise (l_shipdate Eq date) — only GtEq/Lt.
+        let bad = bin(col("l_shipdate"), Operator::Eq, lit_date(8766));
+        assert!(extract_q6_predicate(&bad).is_none());
+    }
+
+    #[test]
+    fn extract_q6_predicate_rejects_missing_bounds() {
+        // Only one of the five required bounds → None (the `?` chain
+        // on the final Some(Q6Predicate{...}) sees the unwrap fail).
+        let only_date_lo = bin(col("l_shipdate"), Operator::GtEq, lit_date(8766));
+        assert!(extract_q6_predicate(&only_date_lo).is_none());
+    }
+
+    #[test]
+    fn extract_q1_predicate_lt_off_by_one_correction() {
+        // For `l_shipdate < V` the cutoff is V-1 (inclusive Lt).
+        let expr = bin(col("l_shipdate"), Operator::Lt, lit_date(10000));
+        let pred = extract_q1_predicate(&expr).unwrap();
+        assert_eq!(pred.shipdate_cutoff, 9999);
+    }
+
+    #[test]
+    fn extract_q1_predicate_lt_eq_uses_literal_directly() {
+        // For `l_shipdate <= V` the cutoff is V itself.
+        let expr = bin(col("l_shipdate"), Operator::LtEq, lit_date(10000));
+        let pred = extract_q1_predicate(&expr).unwrap();
+        assert_eq!(pred.shipdate_cutoff, 10000);
+    }
+
+    #[test]
+    fn extract_q1_predicate_rejects_wrong_column() {
+        let expr = bin(col("l_orderkey"), Operator::LtEq, lit_date(10000));
+        assert!(extract_q1_predicate(&expr).is_none());
+    }
+
+    #[test]
+    fn extract_q1_predicate_rejects_unsupported_operator() {
+        // Q1's filter is one-sided; GtEq is not the canonical shape.
+        let expr = bin(col("l_shipdate"), Operator::GtEq, lit_date(10000));
+        assert!(extract_q1_predicate(&expr).is_none());
+    }
+
+    #[test]
+    fn extract_q1_predicate_rejects_null_literal() {
+        let expr = bin(col("l_shipdate"), Operator::LtEq, lit_null_date());
+        assert!(extract_q1_predicate(&expr).is_none());
+    }
+
+    #[test]
+    fn extract_q14_predicate_gt_off_by_one_correction() {
+        // For `l_shipdate > V` the inclusive lo is V+1.
+        let p = bin(
+            bin(col("l_shipdate"), Operator::Gt, lit_date(9999)),
+            Operator::And,
+            bin(col("l_shipdate"), Operator::Lt, lit_date(10100)),
+        );
+        let pred = extract_q14_predicate(&p).unwrap();
+        assert_eq!(pred.shipdate_lo, 10000);
+        assert_eq!(pred.shipdate_hi, 10100);
+    }
+
+    #[test]
+    fn extract_q14_predicate_lt_eq_off_by_one_correction() {
+        // For `l_shipdate <= V` the exclusive hi is V+1.
+        let p = bin(
+            bin(col("l_shipdate"), Operator::GtEq, lit_date(9999)),
+            Operator::And,
+            bin(col("l_shipdate"), Operator::LtEq, lit_date(10099)),
+        );
+        let pred = extract_q14_predicate(&p).unwrap();
+        assert_eq!(pred.shipdate_lo, 9999);
+        assert_eq!(pred.shipdate_hi, 10100);
+    }
+
+    #[test]
+    fn extract_q14_predicate_rejects_double_lo() {
+        // Two GtEq leaves on the same column — Q14 expects exactly one
+        // lo bound; the second triggers `if lo.is_some()` → None.
+        let p = bin(
+            bin(col("l_shipdate"), Operator::GtEq, lit_date(9999)),
+            Operator::And,
+            bin(col("l_shipdate"), Operator::GtEq, lit_date(10000)),
+        );
+        assert!(extract_q14_predicate(&p).is_none());
+    }
+
+    #[test]
+    fn extract_q14_predicate_rejects_double_hi() {
+        // Two Lt leaves — second triggers `if hi.is_some()` → None.
+        let p = bin(
+            bin(col("l_shipdate"), Operator::Lt, lit_date(10100)),
+            Operator::And,
+            bin(col("l_shipdate"), Operator::Lt, lit_date(10200)),
+        );
+        assert!(extract_q14_predicate(&p).is_none());
+    }
+
+    #[test]
+    fn extract_q14_predicate_rejects_unsupported_operator() {
+        let bad = bin(col("l_shipdate"), Operator::Eq, lit_date(10000));
+        assert!(extract_q14_predicate(&bad).is_none());
+    }
+
+    #[test]
+    fn extract_q14_predicate_rejects_wrong_column() {
+        let bad = bin(col("l_orderkey"), Operator::GtEq, lit_date(10000));
+        assert!(extract_q14_predicate(&bad).is_none());
+    }
+
+    #[test]
+    fn decompose_filter_leaf_preserves_column_op_literal_order() {
+        let expr = bin(col("l_shipdate"), Operator::LtEq, lit_date(10000));
+        let (name, op, lit) = decompose_filter_leaf(&expr).unwrap();
+        assert_eq!(name, "l_shipdate");
+        assert_eq!(op, Operator::LtEq);
+        assert!(matches!(lit, ScalarValue::Date32(Some(d)) if d == 10000));
+    }
+
+    #[test]
+    fn decompose_filter_leaf_flips_mirrored_literal_op_column() {
+        // `10000 >= l_shipdate` flips to `(l_shipdate, LtEq, 10000)`.
+        let mirrored = bin(lit_date(10000), Operator::GtEq, col("l_shipdate"));
+        let (name, op, _) = decompose_filter_leaf(&mirrored).unwrap();
+        assert_eq!(name, "l_shipdate");
+        assert_eq!(op, Operator::LtEq);
+    }
+
+    #[test]
+    fn decompose_filter_leaf_rejects_non_flippable_mirrored_operator() {
+        // `10 + l_shipdate` — Plus has no flip, so None.
+        let bad = bin(lit_f64(10.0), Operator::Plus, col("l_shipdate"));
+        assert!(decompose_filter_leaf(&bad).is_none());
+    }
+
+    #[test]
+    fn dferr_produces_internal_variant() {
+        // Tiny smoke test on the rule's error helper.
+        let e = dferr("boom");
+        assert!(format!("{e:?}").contains("boom"));
     }
 }
