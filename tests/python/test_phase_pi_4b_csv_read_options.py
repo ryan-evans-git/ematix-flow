@@ -10,14 +10,12 @@ from __future__ import annotations
 
 import pytest
 
-from ematix_flow.connections import ObjectStoreLocalConnection
 from ematix_flow.streaming import (
     Target,
     _csv_read_options_lines,
     _json_read_options_lines,
     _object_store_format_lines,
 )
-
 
 # ---- _csv_read_options_lines ----------------------------------------
 

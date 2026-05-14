@@ -21,9 +21,7 @@ from __future__ import annotations
 import datetime as _dt
 import io
 import json
-import os
-import urllib.parse
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 
@@ -33,9 +31,10 @@ from ematix_flow.alerters import (
     AlertEvent,
     SlackAlerter,
     StdoutAlerter,
+)
+from ematix_flow.alerters import (
     from_url as alerter_from_url,
 )
-
 
 _SIDE_TABLES = (
     "_REGISTRY", "_DEPENDS_ON", "_UPSTREAM_FRESHNESS",
@@ -79,7 +78,7 @@ def test_alert_event_has_expected_fields():
         attempt_count=1,
         max_attempts=3,
         gave_up=False,
-        timestamp=_dt.datetime(2026, 5, 13, 12, 0, 0, tzinfo=_dt.timezone.utc),
+        timestamp=_dt.datetime(2026, 5, 13, 12, 0, 0, tzinfo=_dt.UTC),
     )
     assert ev.kind == "failed"
     assert ev.pipeline == "alpha"
@@ -99,7 +98,7 @@ def test_stdout_alerter_writes_failed_event():
         attempt_count=1,
         max_attempts=3,
         gave_up=False,
-        timestamp=_dt.datetime.now(_dt.timezone.utc),
+        timestamp=_dt.datetime.now(_dt.UTC),
     ))
     text = out.getvalue()
     assert "alpha" in text
@@ -118,7 +117,7 @@ def test_stdout_alerter_marks_gave_up():
         attempt_count=3,
         max_attempts=3,
         gave_up=True,
-        timestamp=_dt.datetime.now(_dt.timezone.utc),
+        timestamp=_dt.datetime.now(_dt.UTC),
     ))
     text = out.getvalue()
     assert "dies" in text
@@ -141,7 +140,7 @@ def test_slack_alerter_posts_to_webhook():
             attempt_count=1,
             max_attempts=3,
             gave_up=False,
-            timestamp=_dt.datetime.now(_dt.timezone.utc),
+            timestamp=_dt.datetime.now(_dt.UTC),
         ))
         assert mock_urlopen.called
         req = mock_urlopen.call_args[0][0]
@@ -164,7 +163,7 @@ def test_slack_alerter_includes_attempt_info_in_message():
             attempt_count=3,
             max_attempts=3,
             gave_up=True,
-            timestamp=_dt.datetime.now(_dt.timezone.utc),
+            timestamp=_dt.datetime.now(_dt.UTC),
         ))
         body = json.loads(mock_urlopen.call_args[0][0].data.decode("utf-8"))
         assert "3/3" in body["text"] or "3 / 3" in body["text"]
@@ -180,7 +179,7 @@ def test_slack_alerter_swallows_network_errors():
         alerter.notify(AlertEvent(
             kind="failed", pipeline="alpha", error_message="boom",
             error_type="RuntimeError", attempt_count=1, max_attempts=3,
-            gave_up=False, timestamp=_dt.datetime.now(_dt.timezone.utc),
+            gave_up=False, timestamp=_dt.datetime.now(_dt.UTC),
         ))
 
 
@@ -262,7 +261,7 @@ def test_run_due_fires_recovered_event():
         def notify(self, ev):
             events.append(ev)
 
-    t = _dt.datetime(2026, 5, 13, 12, 0, 0, tzinfo=_dt.timezone.utc)
+    t = _dt.datetime(2026, 5, 13, 12, 0, 0, tzinfo=_dt.UTC)
     for i in range(3):
         p.run_due_with_dag_detailed(
             ["flaky"], now=t + _dt.timedelta(seconds=i),

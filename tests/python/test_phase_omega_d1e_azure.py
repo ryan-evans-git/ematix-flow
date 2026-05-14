@@ -13,12 +13,11 @@ bypasses the SDK entirely.
 from __future__ import annotations
 
 import datetime as _dt
-from typing import Iterator
+from collections.abc import Iterator
 
 import pytest
 
 from ematix_flow import pipeline as p
-
 
 _SIDE_TABLES = (
     "_REGISTRY",
@@ -79,7 +78,7 @@ class _BlobClient:
             # Mimic the SDK's exception name so AzureBlobRunLog's
             # swallow-by-name path is exercised.
             err = type("ResourceNotFoundError", (Exception,), {})(str(e))
-            raise err
+            raise err from e
 
 
 class _ContainerClient:
@@ -122,7 +121,7 @@ def test_round_trip(mock_container):
     log = AzureBlobRunLog(
         container="ignored", prefix="flow/", container_client=mock_container
     )
-    ts = _dt.datetime(2026, 5, 13, 12, 0, 0, tzinfo=_dt.timezone.utc)
+    ts = _dt.datetime(2026, 5, 13, 12, 0, 0, tzinfo=_dt.UTC)
     log.record_run("alpha", ts, success=True)
     log.record_attempt(
         "flaky",
@@ -144,7 +143,7 @@ def test_clear_attempt_idempotent(mock_container):
     log = AzureBlobRunLog(container="ignored", container_client=mock_container)
     log.clear_attempt_state("nonexistent")  # must not raise
 
-    ts = _dt.datetime(2026, 5, 13, 12, 0, 0, tzinfo=_dt.timezone.utc)
+    ts = _dt.datetime(2026, 5, 13, 12, 0, 0, tzinfo=_dt.UTC)
     log.record_attempt("flaky", p.AttemptState(1, ts, False))
     log.clear_attempt_state("flaky")
     p._ATTEMPT_STATE.clear()
@@ -164,7 +163,7 @@ def test_run_due_writes_through(mock_container):
         raise RuntimeError("boom")
 
     log = AzureBlobRunLog(container="ignored", container_client=mock_container)
-    t = _dt.datetime(2026, 5, 13, 12, 0, 0, tzinfo=_dt.timezone.utc)
+    t = _dt.datetime(2026, 5, 13, 12, 0, 0, tzinfo=_dt.UTC)
     p.run_due_with_dag(["fail"], now=t, run_log=log)
 
     p._LAST_RUN.clear()

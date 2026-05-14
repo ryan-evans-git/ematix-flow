@@ -19,7 +19,6 @@ import pytest
 
 from ematix_flow import pipeline as p
 
-
 PG_DSN = os.environ.get("EMATIX_FLOW_TEST_PG_DSN")
 PSYCOPG_AVAILABLE = False
 try:
@@ -64,13 +63,11 @@ def pg_schema():
     name = "flowtest_" + uuid.uuid4().hex[:12]
     import psycopg
 
-    with psycopg.connect(PG_DSN, autocommit=True) as conn:
-        with conn.cursor() as cur:
-            cur.execute(f'CREATE SCHEMA "{name}"')
+    with psycopg.connect(PG_DSN, autocommit=True) as conn, conn.cursor() as cur:
+        cur.execute(f'CREATE SCHEMA "{name}"')
     yield name
-    with psycopg.connect(PG_DSN, autocommit=True) as conn:
-        with conn.cursor() as cur:
-            cur.execute(f'DROP SCHEMA "{name}" CASCADE')
+    with psycopg.connect(PG_DSN, autocommit=True) as conn, conn.cursor() as cur:
+        cur.execute(f'DROP SCHEMA "{name}" CASCADE')
 
 
 def test_protocol_check(pg_schema):
@@ -88,7 +85,7 @@ def test_round_trip(pg_schema):
 
     log = PostgresRunLog(PG_DSN, schema=pg_schema)
     try:
-        ts = _dt.datetime(2026, 5, 13, 12, 0, 0, tzinfo=_dt.timezone.utc)
+        ts = _dt.datetime(2026, 5, 13, 12, 0, 0, tzinfo=_dt.UTC)
         log.record_run("alpha", ts, success=True)
         log.record_attempt(
             "flaky",
@@ -111,7 +108,7 @@ def test_clear_attempt(pg_schema):
 
     log = PostgresRunLog(PG_DSN, schema=pg_schema)
     try:
-        ts = _dt.datetime(2026, 5, 13, 12, 0, 0, tzinfo=_dt.timezone.utc)
+        ts = _dt.datetime(2026, 5, 13, 12, 0, 0, tzinfo=_dt.UTC)
         log.record_attempt("flaky", p.AttemptState(1, ts, False))
         log.clear_attempt_state("flaky")
 
@@ -135,7 +132,7 @@ def test_run_due_writes_through(pg_schema):
 
     log = PostgresRunLog(PG_DSN, schema=pg_schema)
     try:
-        t = _dt.datetime(2026, 5, 13, 12, 0, 0, tzinfo=_dt.timezone.utc)
+        t = _dt.datetime(2026, 5, 13, 12, 0, 0, tzinfo=_dt.UTC)
         p.run_due_with_dag(["fail"], now=t, run_log=log)
 
         p._LAST_RUN.clear()

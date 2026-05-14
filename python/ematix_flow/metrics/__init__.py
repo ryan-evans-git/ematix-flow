@@ -117,7 +117,7 @@ class InMemorySink:
 # ---- URL factory --------------------------------------------------------
 
 
-def from_url(url: str) -> "MetricsSink":
+def from_url(url: str) -> MetricsSink:
     """Pick the right metrics sink for a URL. See module docstring."""
     from urllib.parse import urlparse
 
@@ -142,9 +142,8 @@ def from_url(url: str) -> "MetricsSink":
 
     if scheme in ("otlp", "otlp+grpc", "otlp+http"):
         from .otel import OtelSink
-        endpoint = url if scheme.startswith("otlp+") else url
         # Strip our custom prefix, hand the SDK what it expects.
-        endpoint = endpoint.replace("otlp+grpc://", "").replace(
+        endpoint = url.replace("otlp+grpc://", "").replace(
             "otlp+http://", ""
         ).replace("otlp://", "")
         return OtelSink(endpoint=endpoint)
@@ -156,12 +155,12 @@ def from_url(url: str) -> "MetricsSink":
 
 
 __all__ = [
+    "InMemorySink",
     "MetricsSink",
     "NullSink",
-    "StdoutSink",
-    "InMemorySink",
-    "PrometheusSink",
     "OtelSink",
+    "PrometheusSink",
+    "StdoutSink",
     "from_url",
 ]
 

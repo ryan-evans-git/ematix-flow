@@ -13,7 +13,6 @@ import pytest
 
 from ematix_flow.streaming import Target, _object_store_format_lines
 
-
 # ---- _object_store_format_lines: emission --------------------------
 
 

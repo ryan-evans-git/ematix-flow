@@ -9,12 +9,11 @@ installed because the constructor accepts a pre-built bucket_client.
 from __future__ import annotations
 
 import datetime as _dt
-from typing import Iterator
+from collections.abc import Iterator
 
 import pytest
 
 from ematix_flow import pipeline as p
-
 
 _SIDE_TABLES = (
     "_REGISTRY",
@@ -59,7 +58,7 @@ class _Blob:
             del self._store[self.name]
         except KeyError as e:
             err = type("NotFound", (Exception,), {})(str(e))
-            raise err
+            raise err from e
 
 
 class _Bucket:
@@ -93,7 +92,7 @@ def test_round_trip(mock_bucket):
     from ematix_flow.run_log import GcsRunLog
 
     log = GcsRunLog(bucket="ignored", prefix="flow/", bucket_client=mock_bucket)
-    ts = _dt.datetime(2026, 5, 13, 12, 0, 0, tzinfo=_dt.timezone.utc)
+    ts = _dt.datetime(2026, 5, 13, 12, 0, 0, tzinfo=_dt.UTC)
     log.record_run("alpha", ts, success=True)
     log.record_attempt(
         "flaky",
@@ -115,7 +114,7 @@ def test_clear_attempt_idempotent(mock_bucket):
     log = GcsRunLog(bucket="ignored", bucket_client=mock_bucket)
     log.clear_attempt_state("nonexistent")  # no error
 
-    ts = _dt.datetime(2026, 5, 13, 12, 0, 0, tzinfo=_dt.timezone.utc)
+    ts = _dt.datetime(2026, 5, 13, 12, 0, 0, tzinfo=_dt.UTC)
     log.record_attempt("flaky", p.AttemptState(1, ts, False))
     log.clear_attempt_state("flaky")
     p._ATTEMPT_STATE.clear()
@@ -135,7 +134,7 @@ def test_run_due_writes_through(mock_bucket):
         raise RuntimeError("boom")
 
     log = GcsRunLog(bucket="ignored", bucket_client=mock_bucket)
-    t = _dt.datetime(2026, 5, 13, 12, 0, 0, tzinfo=_dt.timezone.utc)
+    t = _dt.datetime(2026, 5, 13, 12, 0, 0, tzinfo=_dt.UTC)
     p.run_due_with_dag(["fail"], now=t, run_log=log)
 
     p._LAST_RUN.clear()
@@ -155,7 +154,7 @@ def test_prefix_isolation(mock_bucket):
     prod = GcsRunLog(bucket="ignored", prefix="prod/", bucket_client=mock_bucket)
     stg = GcsRunLog(bucket="ignored", prefix="staging/", bucket_client=mock_bucket)
 
-    ts = _dt.datetime(2026, 5, 13, 12, 0, 0, tzinfo=_dt.timezone.utc)
+    ts = _dt.datetime(2026, 5, 13, 12, 0, 0, tzinfo=_dt.UTC)
     prod.record_run("alpha", ts, success=True)
     stg.record_run("alpha", ts, success=False)
 

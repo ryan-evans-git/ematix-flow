@@ -20,10 +20,10 @@ Scope (in-process only — durable run-history is Ω.D1a):
 from __future__ import annotations
 
 import datetime as _dt
+
 import pytest
 
 from ematix_flow import pipeline as p
-
 
 _SIDE_TABLES = (
     "_REGISTRY",
@@ -103,7 +103,7 @@ def test_snapshot_records_last_run_after_invocation():
     def _ok():
         return {}
 
-    now = _dt.datetime(2026, 5, 13, 12, 0, 0, tzinfo=_dt.timezone.utc)
+    now = _dt.datetime(2026, 5, 13, 12, 0, 0, tzinfo=_dt.UTC)
     p.run_due_with_dag(["ok"], now=now)
     [row] = p.status_snapshot()
     assert row["last_run"] is not None
@@ -121,7 +121,7 @@ def test_snapshot_surfaces_in_flight_retry_cycle():
     def _flaky():
         raise RuntimeError("boom")
 
-    t = _dt.datetime(2026, 5, 13, 12, 0, 0, tzinfo=_dt.timezone.utc)
+    t = _dt.datetime(2026, 5, 13, 12, 0, 0, tzinfo=_dt.UTC)
     p.run_due_with_dag(["flaky"], now=t)
 
     [row] = p.status_snapshot()

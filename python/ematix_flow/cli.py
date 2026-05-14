@@ -215,7 +215,7 @@ def _cmd_run_due(args: argparse.Namespace) -> int:
     return 1 if failed_out else 0
 
 
-def _open_run_log_or_none(args: argparse.Namespace) -> "p.RunLog | None":
+def _open_run_log_or_none(args: argparse.Namespace) -> p.RunLog | None:
     """Resolve --run-log-url / --run-log-path / --no-run-log to a RunLog or None.
 
     Resolution order (highest priority first):
@@ -233,6 +233,7 @@ def _open_run_log_or_none(args: argparse.Namespace) -> "p.RunLog | None":
     my schedule") is still served.
     """
     import os
+
     from ematix_flow.run_log import from_url
 
     if getattr(args, "no_run_log", False):
@@ -288,6 +289,7 @@ def _open_alerters(args: argparse.Namespace) -> list:
     A bad URL prints a warning to stderr and is skipped — the rest of
     the list still loads. Default: empty list."""
     import os
+
     from ematix_flow.alerters import from_url as alerter_from_url
 
     flag_list = getattr(args, "alerter", None)
@@ -315,7 +317,9 @@ def _open_metrics(args: argparse.Namespace):
     Flag wins over env; default is NullSink. A bad URL warns and
     falls back to NullSink."""
     import os
-    from ematix_flow.metrics import NullSink, from_url as metrics_from_url
+
+    from ematix_flow.metrics import NullSink
+    from ematix_flow.metrics import from_url as metrics_from_url
 
     url = getattr(args, "metrics", None) or os.environ.get("EMATIX_FLOW_METRICS")
     if not url:

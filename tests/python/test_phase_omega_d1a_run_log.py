@@ -23,10 +23,10 @@ Tests cover:
 from __future__ import annotations
 
 import datetime as _dt
+
 import pytest
 
 from ematix_flow import pipeline as p
-
 
 _SIDE_TABLES = (
     "_REGISTRY",
@@ -68,7 +68,7 @@ def test_empty_db_restores_empty_state(db_path):
 
 def test_record_run_then_restore_repopulates_last_run(db_path):
     log = p.RunLog(db_path)
-    ts = _dt.datetime(2026, 5, 13, 12, 0, 0, tzinfo=_dt.timezone.utc)
+    ts = _dt.datetime(2026, 5, 13, 12, 0, 0, tzinfo=_dt.UTC)
     log.record_run("alpha", ts, success=True)
     # Clear in-memory state, then restore from disk.
     p._LAST_RUN.clear()
@@ -81,7 +81,7 @@ def test_record_run_then_restore_repopulates_last_run(db_path):
 
 def test_failed_run_is_recorded(db_path):
     log = p.RunLog(db_path)
-    ts = _dt.datetime(2026, 5, 13, 12, 0, 0, tzinfo=_dt.timezone.utc)
+    ts = _dt.datetime(2026, 5, 13, 12, 0, 0, tzinfo=_dt.UTC)
     log.record_run("alpha", ts, success=False)
     p._LAST_RUN.clear()
     p.RunLog(db_path).restore_into_process()
@@ -91,7 +91,7 @@ def test_failed_run_is_recorded(db_path):
 
 def test_record_run_overwrites_prior(db_path):
     log = p.RunLog(db_path)
-    t1 = _dt.datetime(2026, 5, 13, 12, 0, 0, tzinfo=_dt.timezone.utc)
+    t1 = _dt.datetime(2026, 5, 13, 12, 0, 0, tzinfo=_dt.UTC)
     t2 = t1 + _dt.timedelta(hours=1)
     log.record_run("alpha", t1, success=False)
     log.record_run("alpha", t2, success=True)
@@ -107,7 +107,7 @@ def test_record_run_overwrites_prior(db_path):
 
 def test_attempt_state_round_trip(db_path):
     log = p.RunLog(db_path)
-    last_at = _dt.datetime(2026, 5, 13, 12, 0, 0, tzinfo=_dt.timezone.utc)
+    last_at = _dt.datetime(2026, 5, 13, 12, 0, 0, tzinfo=_dt.UTC)
     state = p.AttemptState(attempt_count=2, last_attempt_at=last_at, gave_up=False)
     log.record_attempt("flaky", state)
     p._ATTEMPT_STATE.clear()
@@ -120,7 +120,7 @@ def test_attempt_state_round_trip(db_path):
 
 def test_gave_up_flag_persists(db_path):
     log = p.RunLog(db_path)
-    last_at = _dt.datetime(2026, 5, 13, 12, 0, 0, tzinfo=_dt.timezone.utc)
+    last_at = _dt.datetime(2026, 5, 13, 12, 0, 0, tzinfo=_dt.UTC)
     state = p.AttemptState(attempt_count=3, last_attempt_at=last_at, gave_up=True)
     log.record_attempt("dies", state)
     p._ATTEMPT_STATE.clear()
@@ -130,7 +130,7 @@ def test_gave_up_flag_persists(db_path):
 
 def test_clear_attempt_state(db_path):
     log = p.RunLog(db_path)
-    last_at = _dt.datetime(2026, 5, 13, 12, 0, 0, tzinfo=_dt.timezone.utc)
+    last_at = _dt.datetime(2026, 5, 13, 12, 0, 0, tzinfo=_dt.UTC)
     log.record_attempt("flaky", p.AttemptState(1, last_at, False))
     log.clear_attempt_state("flaky")
     p._ATTEMPT_STATE.clear()
@@ -145,7 +145,7 @@ def test_two_processes_share_state_via_disk(db_path):
     """Simulates two `flow run-due` invocations: tick 1 records state,
     tick 2 opens a fresh RunLog and sees it."""
     tick1 = p.RunLog(db_path)
-    t1 = _dt.datetime(2026, 5, 13, 12, 0, 0, tzinfo=_dt.timezone.utc)
+    t1 = _dt.datetime(2026, 5, 13, 12, 0, 0, tzinfo=_dt.UTC)
     tick1.record_run("root", t1, success=True)
     tick1.record_attempt("flaky", p.AttemptState(1, t1, False))
 
@@ -168,7 +168,7 @@ def test_run_due_with_dag_writes_through_on_success(db_path):
         return {}
 
     log = p.RunLog(db_path)
-    t = _dt.datetime(2026, 5, 13, 12, 0, 0, tzinfo=_dt.timezone.utc)
+    t = _dt.datetime(2026, 5, 13, 12, 0, 0, tzinfo=_dt.UTC)
     p.run_due_with_dag(["ok"], now=t, run_log=log)
 
     # Wipe and restore; should still see the success.
@@ -187,7 +187,7 @@ def test_run_due_with_dag_writes_through_on_failure(db_path):
         raise RuntimeError("boom")
 
     log = p.RunLog(db_path)
-    t = _dt.datetime(2026, 5, 13, 12, 0, 0, tzinfo=_dt.timezone.utc)
+    t = _dt.datetime(2026, 5, 13, 12, 0, 0, tzinfo=_dt.UTC)
     p.run_due_with_dag(["fail"], now=t, run_log=log)
 
     p._LAST_RUN.clear()
@@ -236,7 +236,7 @@ def test_retry_backoff_survives_tick_restart(db_path):
         raise RuntimeError("boom")
 
     log = p.RunLog(db_path)
-    t1 = _dt.datetime(2026, 5, 13, 12, 0, 0, tzinfo=_dt.timezone.utc)
+    t1 = _dt.datetime(2026, 5, 13, 12, 0, 0, tzinfo=_dt.UTC)
     p.run_due_with_dag(["flaky"], now=t1, run_log=log)
     assert p._ATTEMPT_STATE["flaky"].attempt_count == 1
 

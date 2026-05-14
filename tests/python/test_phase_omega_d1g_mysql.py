@@ -19,7 +19,6 @@ import pytest
 
 from ematix_flow import pipeline as p
 
-
 MYSQL_URL = os.environ.get("EMATIX_FLOW_TEST_MYSQL_URL")
 PYMYSQL_AVAILABLE = False
 try:
@@ -64,14 +63,14 @@ def mysql_prefix():
     name = "flowtest_" + uuid.uuid4().hex[:12] + "_"
     yield name
     import pymysql
+
     from ematix_flow.run_log.mysql import _parse_mysql_url
 
     kwargs = _parse_mysql_url(MYSQL_URL)
     kwargs.setdefault("autocommit", True)
-    with pymysql.connect(**kwargs) as conn:
-        with conn.cursor() as cur:
-            cur.execute(f"DROP TABLE IF EXISTS `{name}run_log`")
-            cur.execute(f"DROP TABLE IF EXISTS `{name}attempt_state`")
+    with pymysql.connect(**kwargs) as conn, conn.cursor() as cur:
+        cur.execute(f"DROP TABLE IF EXISTS `{name}run_log`")
+        cur.execute(f"DROP TABLE IF EXISTS `{name}attempt_state`")
 
 
 @needs_mysql
@@ -91,7 +90,7 @@ def test_round_trip(mysql_prefix):
 
     log = MySQLRunLog(url=MYSQL_URL, table_prefix=mysql_prefix)
     try:
-        ts = _dt.datetime(2026, 5, 13, 12, 0, 0, tzinfo=_dt.timezone.utc)
+        ts = _dt.datetime(2026, 5, 13, 12, 0, 0, tzinfo=_dt.UTC)
         log.record_run("alpha", ts, success=True)
         log.record_attempt(
             "flaky",
@@ -114,7 +113,7 @@ def test_clear_attempt(mysql_prefix):
 
     log = MySQLRunLog(url=MYSQL_URL, table_prefix=mysql_prefix)
     try:
-        ts = _dt.datetime(2026, 5, 13, 12, 0, 0, tzinfo=_dt.timezone.utc)
+        ts = _dt.datetime(2026, 5, 13, 12, 0, 0, tzinfo=_dt.UTC)
         log.record_attempt("flaky", p.AttemptState(1, ts, False))
         log.clear_attempt_state("flaky")
 
@@ -139,7 +138,7 @@ def test_run_due_writes_through(mysql_prefix):
 
     log = MySQLRunLog(url=MYSQL_URL, table_prefix=mysql_prefix)
     try:
-        t = _dt.datetime(2026, 5, 13, 12, 0, 0, tzinfo=_dt.timezone.utc)
+        t = _dt.datetime(2026, 5, 13, 12, 0, 0, tzinfo=_dt.UTC)
         p.run_due_with_dag(["fail"], now=t, run_log=log)
 
         p._LAST_RUN.clear()

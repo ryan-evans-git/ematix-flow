@@ -7,10 +7,10 @@ Tests skip if `duckdb` isn't installed.
 from __future__ import annotations
 
 import datetime as _dt
+
 import pytest
 
 from ematix_flow import pipeline as p
-
 
 pytest.importorskip("duckdb")
 
@@ -59,7 +59,7 @@ def test_round_trip_file_backed(db_path):
     from ematix_flow.run_log import DuckDBRunLog
 
     log = DuckDBRunLog(db_path)
-    ts = _dt.datetime(2026, 5, 13, 12, 0, 0, tzinfo=_dt.timezone.utc)
+    ts = _dt.datetime(2026, 5, 13, 12, 0, 0, tzinfo=_dt.UTC)
     log.record_run("alpha", ts, success=True)
     log.record_attempt(
         "flaky",
@@ -87,7 +87,7 @@ def test_in_memory_round_trip():
 
     log = DuckDBRunLog(":memory:")
     try:
-        ts = _dt.datetime(2026, 5, 13, 12, 0, 0, tzinfo=_dt.timezone.utc)
+        ts = _dt.datetime(2026, 5, 13, 12, 0, 0, tzinfo=_dt.UTC)
         log.record_run("alpha", ts, success=True)
         log.restore_into_process()
         assert p._LAST_RUN["alpha"] == (ts, True)
@@ -100,7 +100,7 @@ def test_clear_attempt(db_path):
 
     log = DuckDBRunLog(db_path)
     try:
-        ts = _dt.datetime(2026, 5, 13, 12, 0, 0, tzinfo=_dt.timezone.utc)
+        ts = _dt.datetime(2026, 5, 13, 12, 0, 0, tzinfo=_dt.UTC)
         log.record_attempt("flaky", p.AttemptState(1, ts, False))
         log.clear_attempt_state("flaky")
         p._ATTEMPT_STATE.clear()
@@ -123,7 +123,7 @@ def test_run_due_writes_through(db_path):
 
     log = DuckDBRunLog(db_path)
     try:
-        t = _dt.datetime(2026, 5, 13, 12, 0, 0, tzinfo=_dt.timezone.utc)
+        t = _dt.datetime(2026, 5, 13, 12, 0, 0, tzinfo=_dt.UTC)
         p.run_due_with_dag(["fail"], now=t, run_log=log)
     finally:
         log.close()

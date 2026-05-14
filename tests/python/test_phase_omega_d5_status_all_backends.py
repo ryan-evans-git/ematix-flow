@@ -9,13 +9,12 @@ from __future__ import annotations
 
 import argparse
 import datetime as _dt
-import io
 import json
 
 import pytest
 
-from ematix_flow import cli, pipeline as p
-
+from ematix_flow import cli
+from ematix_flow import pipeline as p
 
 _SIDE_TABLES = (
     "_REGISTRY", "_DEPENDS_ON", "_UPSTREAM_FRESHNESS",
@@ -45,7 +44,7 @@ def test_status_reads_from_sqlite_run_log(tmp_path, monkeypatch, capsys):
 
     db_path = tmp_path / "state.db"
     log = SqliteRunLog(str(db_path))
-    ts = _dt.datetime(2026, 5, 13, 12, 0, 0, tzinfo=_dt.timezone.utc)
+    ts = _dt.datetime(2026, 5, 13, 12, 0, 0, tzinfo=_dt.UTC)
     log.record_run("alpha", ts, success=True)
     log.close()
 
@@ -78,7 +77,7 @@ def test_status_reads_from_duckdb_run_log(tmp_path, monkeypatch, capsys):
 
     db_path = tmp_path / "state.duckdb"
     log = DuckDBRunLog(str(db_path))
-    ts = _dt.datetime(2026, 5, 13, 12, 0, 0, tzinfo=_dt.timezone.utc)
+    ts = _dt.datetime(2026, 5, 13, 12, 0, 0, tzinfo=_dt.UTC)
     log.record_run("beta", ts, success=False)
     log.close()
 
@@ -131,7 +130,7 @@ def test_status_no_run_log_flag_shows_in_memory_only(monkeypatch, capsys):
 
     # Pretend a previous in-process run set state. Without restoring
     # from disk, this state is what status sees.
-    ts = _dt.datetime(2026, 5, 13, 12, 0, 0, tzinfo=_dt.timezone.utc)
+    ts = _dt.datetime(2026, 5, 13, 12, 0, 0, tzinfo=_dt.UTC)
     p._LAST_RUN["alpha"] = (ts, True)
 
     monkeypatch.setattr(cli, "_import_user_module", lambda _m: None)
@@ -155,7 +154,7 @@ def test_status_text_format_renders_table(tmp_path, monkeypatch, capsys):
 
     db_path = tmp_path / "state.db"
     log = SqliteRunLog(str(db_path))
-    ts = _dt.datetime(2026, 5, 13, 12, 0, 0, tzinfo=_dt.timezone.utc)
+    ts = _dt.datetime(2026, 5, 13, 12, 0, 0, tzinfo=_dt.UTC)
     log.record_run("gamma", ts, success=True)
     log.close()
 

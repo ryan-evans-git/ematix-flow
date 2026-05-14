@@ -21,14 +21,11 @@ silently invents an alerter or sink — observability is opt-in.
 from __future__ import annotations
 
 import argparse
-import io
-import json
-import os
 
 import pytest
 
-from ematix_flow import cli, pipeline as p
-
+from ematix_flow import cli
+from ematix_flow import pipeline as p
 
 _SIDE_TABLES = (
     "_REGISTRY", "_DEPENDS_ON", "_UPSTREAM_FRESHNESS",

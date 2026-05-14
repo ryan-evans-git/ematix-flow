@@ -21,6 +21,7 @@ In-process scope only. Durable per-attempt history is Ω.D1a.
 from __future__ import annotations
 
 import datetime as _dt
+
 import pytest
 
 from ematix_flow import pipeline as p
@@ -140,7 +141,7 @@ def test_failure_records_attempt_and_blocks_immediate_retry():
         calls.append("attempt")
         raise RuntimeError("boom")
 
-    t0 = _dt.datetime(2026, 5, 13, 12, 0, 0, tzinfo=_dt.timezone.utc)
+    t0 = _dt.datetime(2026, 5, 13, 12, 0, 0, tzinfo=_dt.UTC)
     p.run_due_with_dag(["fail"], now=t0)
     assert calls == ["attempt"]
     state = p._ATTEMPT_STATE["fail"]
@@ -165,7 +166,7 @@ def test_failure_retries_after_backoff_window():
         calls.append("attempt")
         raise RuntimeError("boom")
 
-    t0 = _dt.datetime(2026, 5, 13, 12, 0, 0, tzinfo=_dt.timezone.utc)
+    t0 = _dt.datetime(2026, 5, 13, 12, 0, 0, tzinfo=_dt.UTC)
     p.run_due_with_dag(["fail"], now=t0)
     # After 11s, the 10s fixed window has elapsed — re-run.
     p.run_due_with_dag(["fail"], now=t0 + _dt.timedelta(seconds=11))
@@ -188,7 +189,7 @@ def test_exponential_backoff_grows():
         calls.append("attempt")
         raise RuntimeError("boom")
 
-    t = _dt.datetime(2026, 5, 13, 12, 0, 0, tzinfo=_dt.timezone.utc)
+    t = _dt.datetime(2026, 5, 13, 12, 0, 0, tzinfo=_dt.UTC)
     # 1st attempt: fires at t.
     p.run_due_with_dag(["exp"], now=t)
     # After 0.5s: still inside the 1s window.
@@ -256,7 +257,7 @@ def test_giving_up_after_max_attempts():
         calls.append("attempt")
         raise RuntimeError("boom")
 
-    t = _dt.datetime(2026, 5, 13, 12, 0, 0, tzinfo=_dt.timezone.utc)
+    t = _dt.datetime(2026, 5, 13, 12, 0, 0, tzinfo=_dt.UTC)
     p.run_due_with_dag(["dies"], now=t)
     p.run_due_with_dag(["dies"], now=t + _dt.timedelta(seconds=2))
     assert calls == ["attempt", "attempt"]
@@ -282,7 +283,7 @@ def test_success_after_partial_failures_resets_state():
             raise RuntimeError("not yet")
         return {}
 
-    t = _dt.datetime(2026, 5, 13, 12, 0, 0, tzinfo=_dt.timezone.utc)
+    t = _dt.datetime(2026, 5, 13, 12, 0, 0, tzinfo=_dt.UTC)
     # Iterate only until the function succeeds. After that the
     # pipeline is back in the "no retry cycle in flight" state, so
     # additional run_due_with_dag calls would fire as regular scheduled

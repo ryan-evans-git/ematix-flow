@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 
 from ematix_flow import _core
@@ -511,7 +511,6 @@ def retry_policy_of(name: str) -> RetryPolicy:
 # the legacy spelling keeps working.
 from ematix_flow.run_log import SqliteRunLog as RunLog  # noqa: E402
 
-
 # Phase Ω.3 — operator-facing status view.
 #
 # `status_snapshot()` produces one dict per registered pipeline,
@@ -974,7 +973,7 @@ def run_due_with_dag_detailed(
     due: list[str],
     *,
     now: datetime | None = None,
-    run_log: "RunLog | None" = None,
+    run_log: RunLog | None = None,
     alerters: list | None = None,
     metrics=None,
 ) -> RunDueResult:
@@ -1028,12 +1027,17 @@ def run_due_with_dag_detailed(
             backoff_secs = _compute_backoff_secs(policy, st.attempt_count)
             next_eligible = st.last_attempt_at + timedelta(seconds=backoff_secs)
             if now < next_eligible:
+                eligible_iso = (
+                    next_eligible.replace(microsecond=0)
+                    .isoformat()
+                    .replace("+00:00", "Z")
+                )
                 skipped.append(SkippedEvent(
                     name=name,
                     reason=(
                         f"retry backoff (attempt {st.attempt_count}/"
                         f"{policy.max_attempts}; next eligible at "
-                        f"{next_eligible.replace(microsecond=0).isoformat().replace('+00:00', 'Z')})"
+                        f"{eligible_iso})"
                     ),
                 ))
                 _safe_metric(metrics, "inc_runs", name, "skipped")
@@ -1199,7 +1203,7 @@ def run_due_with_dag(
     due: list[str],
     *,
     now: datetime | None = None,
-    run_log: "RunLog | None" = None,
+    run_log: RunLog | None = None,
 ) -> list[str]:
     """Legacy entry point: run the pipelines in `due`, return the names
     that fired successfully. Built on `run_due_with_dag_detailed` —
@@ -1213,8 +1217,7 @@ def run_due_with_dag(
 def _tz_utc():
     """Return the UTC tzinfo without importing datetime.timezone at
     the module top (kept lean for import-time)."""
-    from datetime import timezone
-    return timezone.utc
+    return UTC
 
 
 def list_pipelines() -> list[ScheduledPipeline]:

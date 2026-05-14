@@ -13,11 +13,11 @@ survive process exit).
 from __future__ import annotations
 
 import datetime as _dt
+
 import pytest
 
 from ematix_flow import pipeline as p
 from ematix_flow.run_log import InMemoryRunLog, RunLog
-
 
 _SIDE_TABLES = (
     "_REGISTRY",
@@ -50,7 +50,7 @@ def test_in_memory_satisfies_runlog_protocol():
 
 def test_record_run_then_restore_repopulates_last_run():
     log = InMemoryRunLog()
-    ts = _dt.datetime(2026, 5, 13, 12, 0, 0, tzinfo=_dt.timezone.utc)
+    ts = _dt.datetime(2026, 5, 13, 12, 0, 0, tzinfo=_dt.UTC)
     log.record_run("alpha", ts, success=True)
     p._LAST_RUN.clear()
     log.restore_into_process()
@@ -61,7 +61,7 @@ def test_record_run_then_restore_repopulates_last_run():
 
 def test_attempt_state_round_trip():
     log = InMemoryRunLog()
-    last_at = _dt.datetime(2026, 5, 13, 12, 0, 0, tzinfo=_dt.timezone.utc)
+    last_at = _dt.datetime(2026, 5, 13, 12, 0, 0, tzinfo=_dt.UTC)
     state = p.AttemptState(attempt_count=2, last_attempt_at=last_at, gave_up=False)
     log.record_attempt("flaky", state)
     p._ATTEMPT_STATE.clear()
@@ -74,7 +74,7 @@ def test_attempt_state_round_trip():
 
 def test_clear_attempt_state():
     log = InMemoryRunLog()
-    last_at = _dt.datetime(2026, 5, 13, 12, 0, 0, tzinfo=_dt.timezone.utc)
+    last_at = _dt.datetime(2026, 5, 13, 12, 0, 0, tzinfo=_dt.UTC)
     log.record_attempt("flaky", p.AttemptState(1, last_at, False))
     log.clear_attempt_state("flaky")
     p._ATTEMPT_STATE.clear()
@@ -92,7 +92,7 @@ def test_run_due_with_dag_writes_through_to_in_memory_log():
         raise RuntimeError("boom")
 
     log = InMemoryRunLog()
-    t = _dt.datetime(2026, 5, 13, 12, 0, 0, tzinfo=_dt.timezone.utc)
+    t = _dt.datetime(2026, 5, 13, 12, 0, 0, tzinfo=_dt.UTC)
     p.run_due_with_dag(["fail"], now=t, run_log=log)
 
     p._LAST_RUN.clear()

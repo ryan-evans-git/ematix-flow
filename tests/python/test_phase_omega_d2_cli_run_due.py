@@ -15,13 +15,12 @@ from __future__ import annotations
 
 import argparse
 import datetime as _dt
-import io
 import json
 
 import pytest
 
-from ematix_flow import cli, pipeline as p
-
+from ematix_flow import cli
+from ematix_flow import pipeline as p
 
 _SIDE_TABLES = (
     "_REGISTRY",
@@ -97,7 +96,7 @@ def test_detailed_records_skip_reason_for_retry_backoff():
     def _flaky():
         raise RuntimeError("boom")
 
-    t0 = _dt.datetime(2026, 5, 13, 12, 0, 0, tzinfo=_dt.timezone.utc)
+    t0 = _dt.datetime(2026, 5, 13, 12, 0, 0, tzinfo=_dt.UTC)
     # First tick: fire + fail. attempt_count=1, window opens.
     p.run_due_with_dag_detailed(["flaky"], now=t0)
     # Second tick within the window: skipped, not refired.

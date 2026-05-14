@@ -7,6 +7,7 @@ credentials. Skipped if moto isn't installed.
 from __future__ import annotations
 
 import datetime as _dt
+
 import pytest
 
 from ematix_flow import pipeline as p
@@ -16,7 +17,6 @@ from ematix_flow import pipeline as p
 moto = pytest.importorskip("moto")
 boto3 = pytest.importorskip("boto3")
 from moto import mock_aws  # noqa: E402
-
 
 _SIDE_TABLES = (
     "_REGISTRY",
@@ -64,7 +64,7 @@ def test_round_trip(s3_bucket):
 
     bucket, client = s3_bucket
     log = S3RunLog(bucket, prefix="flow/", client=client)
-    ts = _dt.datetime(2026, 5, 13, 12, 0, 0, tzinfo=_dt.timezone.utc)
+    ts = _dt.datetime(2026, 5, 13, 12, 0, 0, tzinfo=_dt.UTC)
     log.record_run("alpha", ts, success=True)
     log.record_attempt(
         "flaky",
@@ -88,7 +88,7 @@ def test_clear_attempt_idempotent(s3_bucket):
     # clear_attempt_state on a non-existent key must not raise.
     log.clear_attempt_state("nonexistent")
 
-    ts = _dt.datetime(2026, 5, 13, 12, 0, 0, tzinfo=_dt.timezone.utc)
+    ts = _dt.datetime(2026, 5, 13, 12, 0, 0, tzinfo=_dt.UTC)
     log.record_attempt("flaky", p.AttemptState(1, ts, False))
     log.clear_attempt_state("flaky")
 
@@ -110,7 +110,7 @@ def test_run_due_writes_through(s3_bucket):
 
     bucket, client = s3_bucket
     log = S3RunLog(bucket, prefix="flow/", client=client)
-    t = _dt.datetime(2026, 5, 13, 12, 0, 0, tzinfo=_dt.timezone.utc)
+    t = _dt.datetime(2026, 5, 13, 12, 0, 0, tzinfo=_dt.UTC)
     p.run_due_with_dag(["fail"], now=t, run_log=log)
 
     p._LAST_RUN.clear()
@@ -130,7 +130,7 @@ def test_prefix_isolation(s3_bucket):
     prod = S3RunLog(bucket, prefix="prod/", client=client)
     stg = S3RunLog(bucket, prefix="staging/", client=client)
 
-    ts = _dt.datetime(2026, 5, 13, 12, 0, 0, tzinfo=_dt.timezone.utc)
+    ts = _dt.datetime(2026, 5, 13, 12, 0, 0, tzinfo=_dt.UTC)
     prod.record_run("alpha", ts, success=True)
     stg.record_run("alpha", ts, success=False)
 

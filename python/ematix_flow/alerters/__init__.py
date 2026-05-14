@@ -32,7 +32,6 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Protocol, runtime_checkable
 
-
 # ---- AlertEvent ---------------------------------------------------------
 
 
@@ -77,7 +76,7 @@ class Alerter(Protocol):
 # ---- URL factory --------------------------------------------------------
 
 
-def from_url(url: str) -> "Alerter":
+def from_url(url: str) -> Alerter:
     """Pick the right alerter for a URL. See module docstring for schemes."""
     from urllib.parse import urlparse
 
@@ -112,10 +111,10 @@ def from_url(url: str) -> "Alerter":
 
 
 __all__ = [
-    "Alerter",
     "AlertEvent",
-    "StdoutAlerter",
+    "Alerter",
     "SlackAlerter",
+    "StdoutAlerter",
     "from_url",
 ]
 

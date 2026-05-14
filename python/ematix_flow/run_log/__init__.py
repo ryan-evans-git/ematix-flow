@@ -23,10 +23,9 @@ import:
                                               # boto3 not installed
 """
 
+from .memory import InMemoryRunLog
 from .protocol import RunLog
 from .sqlite import SqliteRunLog
-from .memory import InMemoryRunLog
-
 
 # ---- URL-based backend factory ---------------------------------------------
 #
@@ -170,15 +169,13 @@ def __getattr__(name: str):
 
 
 __all__ = [
-    "RunLog",
-    "SqliteRunLog",
-    "InMemoryRunLog",
-    # Optional backends — lazily imported. Naming them here so static
-    # tools can discover the full surface.
-    "PostgresRunLog",
-    "MySQLRunLog",
-    "DuckDBRunLog",
-    "S3RunLog",
     "AzureBlobRunLog",
+    "DuckDBRunLog",
     "GcsRunLog",
+    "InMemoryRunLog",
+    "MySQLRunLog",
+    "PostgresRunLog",
+    "RunLog",
+    "S3RunLog",
+    "SqliteRunLog",
 ]

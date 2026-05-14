@@ -20,10 +20,10 @@ In-process scope only. Cross-process (durable) run-history is Ω.D1a.
 from __future__ import annotations
 
 import datetime as _dt
+
 import pytest
 
 from ematix_flow import pipeline as p
-
 
 _SIDE_TABLES = (
     "_REGISTRY",
@@ -270,7 +270,7 @@ def test_downstream_skipped_when_upstream_stale():
 
     # Set root's last-success to 10 seconds ago (stale).
     p._LAST_RUN["root"] = (
-        _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(seconds=10),
+        _dt.datetime.now(_dt.UTC) - _dt.timedelta(seconds=10),
         True,
     )
 

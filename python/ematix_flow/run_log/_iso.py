@@ -7,7 +7,7 @@ across SQLite, Postgres, and the three object stores.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 
 def iso_utc(ts: datetime) -> str:
@@ -21,4 +21,4 @@ def parse_iso(s: str) -> datetime:
     any other ISO-8601 string Python's `fromisoformat` understands."""
     if s.endswith("Z"):
         s = s[:-1] + "+00:00"
-    return datetime.fromisoformat(s).astimezone(timezone.utc)
+    return datetime.fromisoformat(s).astimezone(UTC)

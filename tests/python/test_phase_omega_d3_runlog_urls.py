@@ -23,7 +23,6 @@ import pytest
 
 from ematix_flow.run_log import _resolve_backend, from_url
 
-
 # ---- _resolve_backend dispatch ---------------------------------------
 
 

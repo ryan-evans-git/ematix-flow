@@ -17,6 +17,7 @@ Sinks satisfy a narrow Protocol — anything with the four methods
 from __future__ import annotations
 
 import datetime as _dt
+
 import pytest
 
 from ematix_flow import pipeline as p
@@ -25,9 +26,10 @@ from ematix_flow.metrics import (
     MetricsSink,
     NullSink,
     StdoutSink,
+)
+from ematix_flow.metrics import (
     from_url as metrics_from_url,
 )
-
 
 _SIDE_TABLES = (
     "_REGISTRY", "_DEPENDS_ON", "_UPSTREAM_FRESHNESS",
@@ -152,7 +154,7 @@ def test_run_due_updates_retry_attempt_gauge():
         raise RuntimeError("boom")
 
     sink = InMemorySink()
-    t = _dt.datetime(2026, 5, 13, 12, 0, 0, tzinfo=_dt.timezone.utc)
+    t = _dt.datetime(2026, 5, 13, 12, 0, 0, tzinfo=_dt.UTC)
     p.run_due_with_dag_detailed(["flaky"], now=t, metrics=sink)
     assert sink.attempts["flaky"] == 1
     p.run_due_with_dag_detailed(["flaky"], now=t + _dt.timedelta(seconds=1), metrics=sink)
@@ -174,7 +176,7 @@ def test_run_due_clears_attempt_gauge_on_recovery():
         return {}
 
     sink = InMemorySink()
-    t = _dt.datetime(2026, 5, 13, 12, 0, 0, tzinfo=_dt.timezone.utc)
+    t = _dt.datetime(2026, 5, 13, 12, 0, 0, tzinfo=_dt.UTC)
     p.run_due_with_dag_detailed(["flaky"], now=t, metrics=sink)
     assert sink.attempts["flaky"] == 1
     p.run_due_with_dag_detailed(["flaky"], now=t + _dt.timedelta(seconds=1), metrics=sink)
@@ -229,7 +231,7 @@ def test_prometheus_sink_optional():
     """If `prometheus_client` is installed, PrometheusSink works.
     If not, the import path should fail with a helpful message."""
     try:
-        import prometheus_client  # noqa: F401
+        import prometheus_client
     except ImportError:
         pytest.skip("prometheus_client not installed")
 

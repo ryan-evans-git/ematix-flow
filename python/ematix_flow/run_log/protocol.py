@@ -25,7 +25,7 @@ class RunLog(Protocol):
     def record_run(self, name: str, ts: datetime, success: bool) -> None:
         """Persist the last completed run's timestamp + outcome."""
 
-    def record_attempt(self, name: str, state: "AttemptState") -> None:
+    def record_attempt(self, name: str, state: AttemptState) -> None:
         """Persist the current retry cycle's attempt state."""
 
     def clear_attempt_state(self, name: str) -> None:
