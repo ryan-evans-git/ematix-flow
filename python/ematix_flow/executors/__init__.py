@@ -6,7 +6,7 @@ Executors translate "fire pipeline X" into a concrete spawn:
 
   - SubprocessExecutor      — local process; default for dev + tests.
   - KubernetesJobExecutor   — k8s `batch/v1.Job`; needs `executor-k8s` extra.
-  - LambdaExecutor          — AWS Lambda invoke; deferred (Ω.W.5).
+  - LambdaExecutor          — AWS Lambda async invoke; needs `executor-lambda` extra.
   - ECSRunTaskExecutor      — AWS ECS RunTask; deferred.
   - CloudRunJobExecutor     — GCP Cloud Run Job; deferred.
 
@@ -28,6 +28,10 @@ def __getattr__(name: str):
         from .kubernetes import KubernetesJobExecutor
 
         return KubernetesJobExecutor
+    if name == "LambdaExecutor":
+        from .lambda_ import LambdaExecutor
+
+        return LambdaExecutor
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
@@ -37,6 +41,7 @@ __all__ = [
     "DispatchSpec",
     "Executor",
     "KubernetesJobExecutor",
+    "LambdaExecutor",
     "SubprocessExecutor",
     "python_subprocess_executor",
 ]
