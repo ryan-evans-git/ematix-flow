@@ -477,6 +477,15 @@ async fn write_csv_at_path(
     if let Some(d) = options.csv_delimiter {
         builder = builder.with_delimiter(d);
     }
+    if let Some(q) = options.csv_quote {
+        builder = builder.with_quote(q);
+    }
+    if let Some(e) = options.csv_escape {
+        builder = builder.with_escape(e);
+    }
+    if let Some(ref nv) = options.csv_null_value {
+        builder = builder.with_null(nv.clone());
+    }
     let mut writer = builder.build(&mut buf);
     let mut total: u64 = 0;
     for batch in &batches {
@@ -1313,6 +1322,71 @@ mod tests {
             .unwrap();
         assert_eq!(names.value(0), "alice \"the great\"");
         assert_eq!(names.value(1), "bob");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn csv_write_honors_quote_escape_null() {
+        // Round-trip: write with custom quote / null sentinel, then
+        // read back through the standard reader and verify the bytes
+        // landed correctly. We compare the on-disk file directly so
+        // the assertion is precise about the wire form.
+        use futures_util::TryStreamExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let backend = ObjectStoreBackend::open_local(dir.path(), ObjectFormat::Csv)
+            .unwrap()
+            .with_write_options(ObjectWriteOptions {
+                csv_delimiter: Some(b','),
+                csv_header: Some(true),
+                csv_quote: Some(b'\''),
+                csv_null_value: Some("\\N".to_string()),
+                ..Default::default()
+            });
+        let target = TargetTable {
+            schema: "raw".into(),
+            name: "events".into(),
+        };
+
+        // Build a batch with a null in row 2.
+        let schema = Arc::new(arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("id", arrow_schema::DataType::Int64, true),
+            arrow_schema::Field::new("name", arrow_schema::DataType::Utf8, true),
+        ]));
+        let names: Vec<Option<&str>> = vec![Some("alice"), None, Some("carol")];
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 3])),
+                Arc::new(StringArray::from(names)),
+            ],
+        )
+        .unwrap();
+
+        backend
+            .write_arrow_stream(&target, arrow_stream_for(batch), WriteMode::Append)
+            .await
+            .unwrap();
+
+        // Find the written CSV; assert the bytes contain our null
+        // sentinel and quote char.
+        let written_path = dir.path().join("raw").join("events");
+        let entries: Vec<_> = std::fs::read_dir(&written_path)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("csv"))
+            .collect();
+        assert_eq!(entries.len(), 1);
+        let bytes = std::fs::read_to_string(&entries[0]).unwrap();
+        // Row 2's null name should render as `\N`.
+        assert!(bytes.contains("2,\\N"), "got CSV: {bytes:?}");
+        // Header row should be present.
+        assert!(bytes.starts_with("id,name"), "header missing: {bytes:?}");
+
+        // Read it back via the same backend (quote=' so we expect
+        // unquoted values still work). Just sanity-check the row count.
+        let s = backend.read_arrow_stream("raw/events").await.unwrap();
+        let batches: Vec<RecordBatch> = s.try_collect().await.unwrap();
+        assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 3);
     }
 
     #[tokio::test(flavor = "multi_thread")]

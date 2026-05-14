@@ -112,6 +112,15 @@ class Target:
     parquet_compression: str | None = None  # "uncompressed" | "snappy" | "gzip" | "zstd"
     csv_delimiter: str | None = None  # single-character string
     csv_header: bool | None = None
+    # Π.4e: write-side CSV parity with the read options. Apply when
+    # the object-store target is a CSV sink. Defaults reproduce
+    # arrow-csv's library defaults:
+    #   csv_quote      = '"'  (single ASCII char)
+    #   csv_escape     = doubled-quote (i.e. write "" inside quoted values)
+    #   csv_null_value = ""   (empty string)
+    csv_quote: str | None = None
+    csv_escape: str | None = None
+    csv_null_value: str | None = None
     # Π.4b: per-format READ options. Used when an object-store target
     # is on the source side of a pipeline (less common, but the same
     # backend supports both directions). Shape mirrors the Rust
@@ -1309,6 +1318,9 @@ def _emit_single_target_block(spec: Target) -> list[str]:
             parquet_compression=spec.parquet_compression,
             csv_delimiter=spec.csv_delimiter,
             csv_header=spec.csv_header,
+            csv_quote=spec.csv_quote,
+            csv_escape=spec.csv_escape,
+            csv_null_value=spec.csv_null_value,
             csv_read_options=spec.csv_read_options,
             json_read_options=spec.json_read_options,
         )
@@ -1342,6 +1354,9 @@ def _emit_targets_array_entry(spec: Target) -> list[str]:
             parquet_compression=spec.parquet_compression,
             csv_delimiter=spec.csv_delimiter,
             csv_header=spec.csv_header,
+            csv_quote=spec.csv_quote,
+            csv_escape=spec.csv_escape,
+            csv_null_value=spec.csv_null_value,
             csv_read_options=spec.csv_read_options,
             json_read_options=spec.json_read_options,
         )
@@ -1569,6 +1584,9 @@ def _target_fields(
     parquet_compression: str | None = None,
     csv_delimiter: str | None = None,
     csv_header: bool | None = None,
+    csv_quote: str | None = None,
+    csv_escape: str | None = None,
+    csv_null_value: str | None = None,
     csv_read_options: dict | None = None,
     json_read_options: dict | None = None,
 ) -> list[str]:
@@ -1685,6 +1703,9 @@ def _target_fields(
                 parquet_compression,
                 csv_delimiter,
                 csv_header,
+                csv_quote,
+                csv_escape,
+                csv_null_value,
                 csv_read_options,
                 json_read_options,
             )
@@ -1714,6 +1735,9 @@ def _target_fields(
                 parquet_compression,
                 csv_delimiter,
                 csv_header,
+                csv_quote,
+                csv_escape,
+                csv_null_value,
                 csv_read_options,
                 json_read_options,
             )
@@ -1727,6 +1751,9 @@ def _object_store_format_lines(
     parquet_compression: str | None,
     csv_delimiter: str | None,
     csv_header: bool | None,
+    csv_quote: str | None = None,
+    csv_escape: str | None = None,
+    csv_null_value: str | None = None,
     csv_read_options: dict | None = None,
     json_read_options: dict | None = None,
 ) -> list[str]:
@@ -1769,6 +1796,41 @@ def _object_store_format_lines(
                 f"format={format_kind!r}"
             )
         out.append(f"csv_header = {'true' if csv_header else 'false'}")
+    if csv_quote is not None:
+        if format_kind != "csv":
+            raise ValueError(
+                f"Target.csv_quote={csv_quote!r} only applies when "
+                f"format='csv'; got format={format_kind!r}"
+            )
+        if len(csv_quote) != 1 or ord(csv_quote) > 127:
+            raise ValueError(
+                f"Target.csv_quote must be a single ASCII character, "
+                f"got {csv_quote!r}"
+            )
+        out.append(f"csv_quote = {_q(csv_quote)}")
+    if csv_escape is not None:
+        if format_kind != "csv":
+            raise ValueError(
+                f"Target.csv_escape={csv_escape!r} only applies when "
+                f"format='csv'; got format={format_kind!r}"
+            )
+        if len(csv_escape) != 1 or ord(csv_escape) > 127:
+            raise ValueError(
+                f"Target.csv_escape must be a single ASCII character, "
+                f"got {csv_escape!r}"
+            )
+        out.append(f"csv_escape = {_q(csv_escape)}")
+    if csv_null_value is not None:
+        if format_kind != "csv":
+            raise ValueError(
+                f"Target.csv_null_value={csv_null_value!r} only applies when "
+                f"format='csv'; got format={format_kind!r}"
+            )
+        if not isinstance(csv_null_value, str):
+            raise ValueError(
+                f"Target.csv_null_value must be str, got {csv_null_value!r}"
+            )
+        out.append(f"csv_null_value = {_q(csv_null_value)}")
     if csv_read_options:
         if format_kind != "csv":
             raise ValueError(

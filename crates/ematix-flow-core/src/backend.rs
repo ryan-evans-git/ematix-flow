@@ -76,6 +76,13 @@ pub struct ObjectWriteOptions {
     /// Whether to write a header row in CSV output. `None` = true.
     /// Used only when the backend's format is `Csv`.
     pub csv_header: Option<bool>,
+    /// Π.4e: CSV quote character. `None` = `b'"'`.
+    pub csv_quote: Option<u8>,
+    /// Π.4e: CSV escape character. `None` = doubled-quote.
+    pub csv_escape: Option<u8>,
+    /// Π.4e: how to render null cells on the write side. `None` = empty
+    /// string (Arrow default).
+    pub csv_null_value: Option<String>,
 }
 
 /// Parquet compression codec. Subset of the parquet crate's
