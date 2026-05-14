@@ -975,6 +975,7 @@ def run_due_with_dag_detailed(
     *,
     now: datetime | None = None,
     run_log: "RunLog | None" = None,
+    alerters: list | None = None,
 ) -> RunDueResult:
     """Like `run_due_with_dag` but returns a structured `RunDueResult`
     with full per-pipeline outcome detail. The CLI uses this to build
@@ -1051,10 +1052,25 @@ def run_due_with_dag_detailed(
         if run_log is not None:
             run_log.record_run(name, completed_at, success)
         if success:
+            prev = _ATTEMPT_STATE.get(name)
             fired.append(FiredEvent(name=name, result=ret))
             _ATTEMPT_STATE.pop(name, None)
             if run_log is not None:
                 run_log.clear_attempt_state(name)
+            # Recovery event: if a retry cycle was in flight (prev had
+            # attempt_count >= 1) and now we succeeded, push a
+            # `recovered` event so alerters can close the loop.
+            if prev is not None and prev.attempt_count >= 1:
+                _fan_out_alert(
+                    alerters,
+                    AlertEvent_local(
+                        kind="recovered",
+                        pipeline=name,
+                        timestamp=completed_at,
+                        attempt_count=prev.attempt_count + 1,
+                        max_attempts=policy.max_attempts,
+                    ),
+                )
         else:
             prev = _ATTEMPT_STATE.get(name)
             attempt_count = (prev.attempt_count if prev else 0) + 1
@@ -1067,15 +1083,70 @@ def run_due_with_dag_detailed(
             _ATTEMPT_STATE[name] = new_state
             if run_log is not None:
                 run_log.record_attempt(name, new_state)
+            err_msg = str(err) if err else ""
+            err_type = type(err).__name__ if err else "Exception"
             failed.append(FailedEvent(
                 name=name,
-                error_message=str(err) if err else "",
-                error_type=type(err).__name__ if err else "Exception",
+                error_message=err_msg,
+                error_type=err_type,
                 attempt_count=attempt_count,
                 gave_up=gave_up,
             ))
+            # Always emit a `failed` event; emit an additional
+            # `gave_up` if this attempt exhausted max_attempts.
+            _fan_out_alert(
+                alerters,
+                AlertEvent_local(
+                    kind="failed",
+                    pipeline=name,
+                    timestamp=completed_at,
+                    error_message=err_msg,
+                    error_type=err_type,
+                    attempt_count=attempt_count,
+                    max_attempts=policy.max_attempts,
+                    gave_up=gave_up,
+                ),
+            )
+            if gave_up:
+                _fan_out_alert(
+                    alerters,
+                    AlertEvent_local(
+                        kind="gave_up",
+                        pipeline=name,
+                        timestamp=completed_at,
+                        error_message=err_msg,
+                        error_type=err_type,
+                        attempt_count=attempt_count,
+                        max_attempts=policy.max_attempts,
+                        gave_up=True,
+                    ),
+                )
 
     return RunDueResult(fired=fired, failed=failed, skipped=skipped)
+
+
+def _fan_out_alert(alerters, event) -> None:
+    """Notify each alerter, swallowing any exceptions so a buggy
+    alerter can't poison the orchestrator loop."""
+    if not alerters:
+        return
+    import sys
+    for a in alerters:
+        try:
+            a.notify(event)
+        except Exception as e:
+            print(
+                f"warning: alerter {type(a).__name__} raised on notify: "
+                f"{type(e).__name__}: {e}",
+                file=sys.stderr,
+            )
+
+
+def AlertEvent_local(**kwargs):
+    """Lazy import of AlertEvent to avoid loading alerters at
+    pipeline.py module-import time."""
+    from ematix_flow.alerters import AlertEvent
+    return AlertEvent(**kwargs)
 
 
 def _one_upstream_is_fresh(
