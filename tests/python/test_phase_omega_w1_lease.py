@@ -239,16 +239,3 @@ def test_blob_backend_claim_raises_not_implemented():
         stub.release("tok")
     with pytest.raises(NotImplementedError, match="external lock service"):
         stub.sweep_expired_leases(datetime.now(UTC))
-
-
-def test_sql_backend_claim_raises_pending_w2():
-    """Postgres / MySQL get real CAS in Ω.W.2; until then the lease
-    methods raise pointing at the in-flight phase."""
-    from ematix_flow.run_log._no_lease import NoLeaseSQLBackend
-
-    class StubSQL(NoLeaseSQLBackend, _BlobStub):
-        pass
-
-    stub = StubSQL()
-    with pytest.raises(NotImplementedError, match="W.2"):
-        stub.claim("p1", "worker-A", lease_seconds=300)

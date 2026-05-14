@@ -10,19 +10,28 @@ to a specific one), so this backend takes a `table_prefix` instead of
 a Postgres-style schema name. Pass `table_prefix="orchestrator_"` to
 isolate state from other tables when sharing a database.
 
+Ω.W.2: the lease layer uses `INSERT ... ON DUPLICATE KEY UPDATE`
+with per-column `IF()` guards on `expires_at <= VALUES(claimed_at)`,
+followed by a verifying SELECT. That avoids `SELECT FOR UPDATE`
+deadlocks under contention (gap locks were biting concurrent
+claimers on different pipelines even though their target rows were
+disjoint). Two round-trips per claim — fine for orchestrator cadence
+(one claim per pipeline-fire, on the order of seconds).
+
 Optional dep: `PyMySQL` (pure-Python; install via `pip install PyMySQL`).
 """
 
 from __future__ import annotations
 
-from datetime import datetime
+import uuid
+from datetime import UTC, datetime, timedelta
 from urllib.parse import urlparse
 
 from ._iso import iso_utc, parse_iso
-from ._no_lease import NoLeaseSQLBackend
+from .protocol import ClaimResult, ExpiredClaim
 
 
-class MySQLRunLog(NoLeaseSQLBackend):
+class MySQLRunLog:
     """MySQL (and MariaDB) backend.
 
     Args:
@@ -82,6 +91,7 @@ class MySQLRunLog(NoLeaseSQLBackend):
         self._prefix = table_prefix
         self._run_log_table = f"{table_prefix}run_log"
         self._attempt_table = f"{table_prefix}attempt_state"
+        self._claims_table = f"{table_prefix}pipeline_claims"
 
         if create_tables:
             with self._conn.cursor() as cur:
@@ -98,6 +108,15 @@ class MySQLRunLog(NoLeaseSQLBackend):
                     "  attempt_count   INT          NOT NULL,"
                     "  last_attempt_at VARCHAR(64)  NOT NULL,"
                     "  gave_up         TINYINT(1)   NOT NULL"
+                    ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
+                )
+                cur.execute(
+                    f"CREATE TABLE IF NOT EXISTS `{self._claims_table}` ("
+                    "  pipeline_name VARCHAR(255) NOT NULL PRIMARY KEY,"
+                    "  claim_token   VARCHAR(64)  NOT NULL,"
+                    "  worker_id     VARCHAR(255) NOT NULL,"
+                    "  claimed_at    VARCHAR(64)  NOT NULL,"
+                    "  expires_at    VARCHAR(64)  NOT NULL"
                     ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
                 )
 
@@ -164,6 +183,84 @@ class MySQLRunLog(NoLeaseSQLBackend):
                     last_attempt_at=parse_iso(ts_s),
                     gave_up=bool(gave_up),
                 )
+
+    # ---- Ω.W.2: lease layer (atomic ON DUPLICATE KEY) -------------
+
+    def claim(self, pipeline: str, worker_id: str, lease_seconds: int) -> ClaimResult:
+        # Truncate to second precision so the value we return in
+        # ClaimResult matches what comes back out of the next SELECT.
+        now = datetime.now(UTC).replace(microsecond=0)
+        token = uuid.uuid4().hex
+        expires_at = now + timedelta(seconds=lease_seconds)
+
+        # MySQL's `ON DUPLICATE KEY UPDATE` is atomic per row. Each
+        # column gets the proposed value only when the existing lease
+        # has expired (`expires_at <= VALUES(claimed_at)`), otherwise
+        # it stays as-is. After the upsert, a SELECT tells us whether
+        # our token won the race — no explicit transaction, no
+        # SELECT FOR UPDATE, no MySQL deadlocks under contention.
+        with self._conn.cursor() as cur:
+            # Shared `IF()` guard: only update each column when the
+            # existing lease has expired at or before our claim time.
+            guard = "expires_at <= VALUES(claimed_at)"
+            cur.execute(
+                f"INSERT INTO `{self._claims_table}` "
+                "(pipeline_name, claim_token, worker_id, claimed_at, expires_at) "
+                "VALUES (%s, %s, %s, %s, %s) "
+                "ON DUPLICATE KEY UPDATE "
+                f"  claim_token = IF({guard}, VALUES(claim_token), claim_token), "
+                f"  worker_id   = IF({guard}, VALUES(worker_id),   worker_id), "
+                f"  claimed_at  = IF({guard}, VALUES(claimed_at),  claimed_at), "
+                f"  expires_at  = IF({guard}, VALUES(expires_at),  expires_at)",
+                (
+                    pipeline,
+                    token,
+                    worker_id,
+                    iso_utc(now),
+                    iso_utc(expires_at),
+                ),
+            )
+            cur.execute(
+                f"SELECT claim_token, worker_id, expires_at FROM `{self._claims_table}` "
+                "WHERE pipeline_name = %s",
+                (pipeline,),
+            )
+            row = cur.fetchone()
+        if row is not None and row[0] == token:
+            return ClaimResult.acquired_by(
+                token=token, worker_id=worker_id, expires_at=expires_at
+            )
+        return ClaimResult.busy(holder=row[1], expires_at=parse_iso(row[2]))
+
+    def heartbeat(self, claim_token: str, lease_seconds: int) -> None:
+        new_expires = datetime.now(UTC).replace(microsecond=0) + timedelta(
+            seconds=lease_seconds
+        )
+        with self._conn.cursor() as cur:
+            cur.execute(
+                f"UPDATE `{self._claims_table}` "
+                "SET expires_at = %s WHERE claim_token = %s",
+                (iso_utc(new_expires), claim_token),
+            )
+
+    def release(self, claim_token: str) -> None:
+        with self._conn.cursor() as cur:
+            cur.execute(
+                f"DELETE FROM `{self._claims_table}` WHERE claim_token = %s",
+                (claim_token,),
+            )
+
+    def sweep_expired_leases(self, now: datetime) -> list[ExpiredClaim]:
+        with self._conn.cursor() as cur:
+            cur.execute(
+                f"SELECT pipeline_name, worker_id, expires_at "
+                f"FROM `{self._claims_table}` WHERE expires_at < %s",
+                (iso_utc(now),),
+            )
+            return [
+                ExpiredClaim(pipeline=name, worker_id=wid, expires_at=parse_iso(exp))
+                for name, wid, exp in cur.fetchall()
+            ]
 
 
 def _parse_mysql_url(url: str) -> dict:
