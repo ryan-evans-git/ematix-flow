@@ -23,6 +23,9 @@ uuid.workspace = true
 futures-util.workspace = true
 bytes.workspace = true
 async-trait = "0.1"
+# Π.4a: CsvReadOptions.null_regex compiles to a regex::Regex which
+# the arrow-csv reader's with_null_regex consumes.
+regex = "1"
 arrow-array = { workspace = true }
 arrow-schema = { workspace = true }
 arrow-csv = { workspace = true }

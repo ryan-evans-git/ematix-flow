@@ -3659,6 +3659,7 @@ dependencies = [
  "prometheus",
  "protofish",
  "rdkafka",
+ "regex",
  "reqwest 0.12.28",
  "rusqlite",
  "sasl2-sys",
