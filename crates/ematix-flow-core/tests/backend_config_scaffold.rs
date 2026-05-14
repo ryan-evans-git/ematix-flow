@@ -630,6 +630,7 @@ fn object_store_local_config_round_trips_with_format() {
             parquet_compression: Some(ParquetCompression::Snappy),
             ..Default::default()
         },
+        read_options: Default::default(),
     });
     let json = serde_json::to_string(&cfg).expect("serialize");
     let recovered: BackendConfig = serde_json::from_str(&json).expect("deserialize");
@@ -661,6 +662,7 @@ fn object_store_s3_config_round_trips() {
         },
         format: ObjectFormat::Csv,
         write_options: ObjectWriteOptions::default(),
+        read_options: Default::default(),
     });
     let json = serde_json::to_string(&cfg).expect("serialize");
     let recovered: BackendConfig = serde_json::from_str(&json).expect("deserialize");
@@ -683,6 +685,7 @@ async fn backend_from_config_constructs_local_object_store() {
         },
         format: ObjectFormat::Parquet,
         write_options: ObjectWriteOptions::default(),
+        read_options: Default::default(),
     });
     let backend = backend_from_config(cfg).await.expect("construct");
     backend.ping().await.expect("ping");

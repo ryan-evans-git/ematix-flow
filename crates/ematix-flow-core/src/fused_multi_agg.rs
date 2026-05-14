@@ -292,14 +292,14 @@ impl ExecutionPlan for FusedFilterMultiAggExec {
                     // convert to [Q1Aggs; 5] for merging with the
                     // hand-coded shape.
                     if jit_p.is_some() {
-                        for g in 0..5 {
+                        for (g, group) in groups.iter_mut().enumerate() {
                             let base = g * 6;
-                            groups[g].sum_qty = cells[base];
-                            groups[g].sum_price = cells[base + 1];
-                            groups[g].sum_disc_price = cells[base + 2];
-                            groups[g].sum_charge = cells[base + 3];
-                            groups[g].sum_disc = cells[base + 4];
-                            groups[g].count = cells[base + 5] as u64;
+                            group.sum_qty = cells[base];
+                            group.sum_price = cells[base + 1];
+                            group.sum_disc_price = cells[base + 2];
+                            group.sum_charge = cells[base + 3];
+                            group.sum_disc = cells[base + 4];
+                            group.count = cells[base + 5] as u64;
                         }
                     }
                     Ok::<[Q1Aggs; 5], DataFusionError>(groups)

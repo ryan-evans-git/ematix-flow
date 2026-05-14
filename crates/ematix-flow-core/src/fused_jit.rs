@@ -747,11 +747,11 @@ impl FusedFilterAggJit {
         // Pre-seed each accumulator slot from outputs[k] (caller may
         // have set them to merge into a shared total across shards).
         let f64_size = i64::from(types::F64.bytes());
-        for k in 0..n_outputs {
+        for (k, slot_handle) in acc_slots.iter().enumerate() {
             let off = builder.ins().iconst(types::I64, (k as i64) * f64_size);
             let slot = builder.ins().iadd(p_outputs, off);
             let v = builder.ins().load(types::F64, MemFlags::trusted(), slot, 0);
-            builder.ins().stack_store(v, acc_slots[k], 0);
+            builder.ins().stack_store(v, *slot_handle, 0);
         }
 
         let zero_i = builder.ins().iconst(types::I64, 0);
@@ -819,10 +819,10 @@ impl FusedFilterAggJit {
         // ----- Exit: store each accumulator slot back to outputs[k] -----
         builder.switch_to_block(loop_exit);
         builder.seal_block(loop_exit);
-        for k in 0..n_outputs {
+        for (k, slot_handle) in acc_slots.iter().enumerate() {
             let off = builder.ins().iconst(types::I64, (k as i64) * f64_size);
             let slot = builder.ins().iadd(p_outputs, off);
-            let v = builder.ins().stack_load(types::F64, acc_slots[k], 0);
+            let v = builder.ins().stack_load(types::F64, *slot_handle, 0);
             builder.ins().store(MemFlags::trusted(), v, slot, 0);
         }
         builder.ins().return_(&[]);
@@ -1632,7 +1632,7 @@ mod tests {
         }
 
         // (N,F) is group 1 in q1's known_keys order. n_aggs=6 cells per group.
-        let nf = &outputs[1 * 6..1 * 6 + 6];
+        let nf = &outputs[6..12];
         assert!((nf[0] - 30.0).abs() < 1e-9, "(N,F) sum_qty: {nf:?}");
         assert!((nf[1] - 300.0).abs() < 1e-9, "(N,F) sum_price: {nf:?}");
         let nf_disc_price = 300.0 * (1.0 - 0.05); // 285
@@ -1652,7 +1652,7 @@ mod tests {
 
         // (R,F) row was filtered out by the shipdate predicate, so its
         // group cells (group 0) must remain zero.
-        let rf = &outputs[0 * 6..0 * 6 + 6];
+        let rf = &outputs[0..6];
         assert!(
             rf.iter().all(|v| *v == 0.0),
             "(R,F) shouldn't accumulate: {rf:?}"

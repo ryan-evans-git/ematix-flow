@@ -12,6 +12,7 @@
 //!      DataFusion's default planner (the existing 17.7 ms result)
 //!   3. ematix-flow with `FusedQ14FullExec` over FastParquet inputs
 //!      — the new full-fusion path
+//!
 //! Target: row 3 ≤ 12.53 ms.
 //!
 //! Usage:

@@ -102,7 +102,7 @@ fn build_part_lookup(path: &PathBuf) -> HashMap<i64, bool> {
         .unwrap();
 
     let mut map = HashMap::with_capacity(total);
-    for (k, t) in p_keys.into_iter().zip(p_types.into_iter()) {
+    for (k, t) in p_keys.into_iter().zip(p_types) {
         let bytes = t.data();
         let is_promo = bytes.len() >= 5 && &bytes[..5] == b"PROMO";
         map.insert(k, is_promo);
@@ -120,7 +120,7 @@ fn build_shipdate_dict_mask(file: &ParquetFile, rg: usize, scratch: &mut Vec<u8>
     let dict = decode_plain_i32(scratch).unwrap();
     let mut m = vec![0u8; 4096];
     for (i, &v) in dict.iter().enumerate() {
-        if v >= LO && v < HI {
+        if (LO..HI).contains(&v) {
             m[i] = 1;
         }
     }
@@ -156,6 +156,7 @@ fn shipdate_bitmap_rg(
 /// and a PLAIN-fallback decoder for pages that aren't dict-encoded
 /// (writers fall back to PLAIN when a column's dict would exceed the
 /// page-size limit — happens for l_partkey at SF=1).
+#[allow(clippy::too_many_arguments)]
 fn sparse_gather_col<T: Copy>(
     file: &ParquetFile,
     rg: usize,
@@ -175,14 +176,14 @@ fn sparse_gather_col<T: Copy>(
     decompress_snappy_into(first_body, scratch).unwrap();
 
     let dict: Vec<T> = if first_hdr.dictionary_page_header.is_some() {
-        decode_dict(&scratch)
+        decode_dict(scratch)
     } else {
         // First page is a data page; handle inline.
         let dph = first_hdr.data_page_header.as_ref().unwrap();
         let n = dph.num_values as usize;
         match dph.encoding {
             Encoding::Plain => {
-                stream_plain_gather(&scratch, n, bitmap, 0, plain_value_size, plain_load_le, out);
+                stream_plain_gather(scratch, n, bitmap, 0, plain_value_size, plain_load_le, out);
             }
             other => panic!("first page non-dict and non-PLAIN: {other:?}"),
         }
@@ -202,11 +203,11 @@ fn sparse_gather_col<T: Copy>(
         decompress_snappy_into(body, scratch).unwrap();
         match dph.encoding {
             Encoding::RleDictionary | Encoding::PlainDictionary => {
-                gather_dict_at_bitmap_into(&scratch, n, bitmap, emitted, &dict, out).unwrap();
+                gather_dict_at_bitmap_into(scratch, n, bitmap, emitted, &dict, out).unwrap();
             }
             Encoding::Plain => {
                 stream_plain_gather(
-                    &scratch,
+                    scratch,
                     n,
                     bitmap,
                     emitted,

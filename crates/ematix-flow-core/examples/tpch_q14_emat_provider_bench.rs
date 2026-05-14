@@ -150,7 +150,7 @@ fn ensure_synthetic_file(real_path: &PathBuf) -> PathBuf {
     let mut writer = SerializedFileWriter::new(file, schema, props).unwrap();
     // Split into 6 row groups matching the real file's shape.
     let total = shipdate.len();
-    let rg_size = (total + 5) / 6;
+    let rg_size = total.div_ceil(6);
     for chunk in (0..total).step_by(rg_size) {
         let end = (chunk + rg_size).min(total);
         let mut rg = writer.next_row_group().unwrap();

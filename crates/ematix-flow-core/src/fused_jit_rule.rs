@@ -841,9 +841,7 @@ fn extract_q1_predicate(expr: &Arc<dyn PhysicalExpr>) -> Option<Q1Predicate> {
     // We support a single comparison leaf — Q1's filter is just one
     // condition. If a future planner version splits it into an AND of
     // redundant conditions we can re-use `flatten_and` here.
-    let (col, op, lit) = match decompose_filter_leaf(expr)? {
-        (c, o, l) => (c, o, l),
-    };
+    let (col, op, lit) = decompose_filter_leaf(expr)?;
     if col != "l_shipdate" {
         return None;
     }
@@ -1131,14 +1129,13 @@ fn descend_to_q14_lineitem_scan(
     Some((predicate, scan))
 }
 
-/// Σ.D3 phase D (Q3): pattern-match TPC-H Q3's plan
-/// (SortMerge → Sort → Projection → Aggregate(FinalPartitioned,
-/// gby=[l_orderkey, o_orderdate, o_shippriority], single SUM(extprice
-/// * (1-discount))) → Repartition(Hash) → Aggregate(Partial) →
-/// 3-table join chain) and replace the aggregate stack with a single
-/// `FusedPostJoinExec(spec=Q3)` over the existing join output. The
-/// join chain itself is kept (the fused exec is post-join only); we
-/// just substitute the small-cardinality group-by + SUM kernel for
+/// Σ.D3 phase D (Q3): pattern-match TPC-H Q3's plan — SortMerge over a
+/// 3-table join chain, with a `FinalPartitioned/Partial` hash-aggregate
+/// stack on top grouping by `(l_orderkey, o_orderdate, o_shippriority)`
+/// and a single `SUM(extprice * (1-discount))`. Replace the aggregate
+/// stack with `FusedPostJoinExec(spec=Q3)` over the existing join
+/// output; the join chain itself is kept (the fused exec is post-join
+/// only). We substitute the small-cardinality group-by + SUM kernel for
 /// DataFusion's hash-aggregate stack.
 #[derive(Debug, Default)]
 pub struct InjectFusedQ3Rule;
@@ -1261,7 +1258,6 @@ fn collect_column_names(expr: &Arc<dyn PhysicalExpr>, out: &mut Vec<String>) {
     if let Some(b) = expr.as_any().downcast_ref::<BinaryExpr>() {
         collect_column_names(b.left(), out);
         collect_column_names(b.right(), out);
-        return;
     }
     // Other PhysicalExpr types (Literal, ScalarFunctionExpr, …): skip.
     // We're looking for evidence of the right Columns; missing ones

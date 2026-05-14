@@ -1,8 +1,8 @@
 //! Σ.D3 phase D (Q14 variant): bench Q14 with and without
 //! `InjectFusedQ14Rule` registered.
 //!
-//! Q14 is the heaviest of the three auto-injection rules: scan + filter
-//! + 2-way hash join + dual-SUM-with-CASE-WHEN. Fused replacement
+//! Q14 is the heaviest of the three auto-injection rules: scan, filter,
+//! 2-way hash join, dual-SUM-with-CASE-WHEN. Fused replacement
 //! (`FusedQ14FullExec`) owns both inputs and substitutes the hash join
 //! with a direct-indexed promo bitmap probe.
 

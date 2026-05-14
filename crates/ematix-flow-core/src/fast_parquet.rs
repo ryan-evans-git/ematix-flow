@@ -1551,10 +1551,10 @@ mod tests {
         let ship_idx = prov.schema().index_of("l_shipdate").unwrap();
         eprintln!("lineitem.parquet shipdate per-RG min/max:");
         for rg in 0..meta.num_row_groups() {
-            if let Some(s) = meta.row_group(rg).column(ship_idx).statistics() {
-                if let datafusion::parquet::file::statistics::Statistics::Int32(s) = s {
-                    eprintln!("  RG{rg}: min={:?} max={:?}", s.min_opt(), s.max_opt());
-                }
+            if let Some(datafusion::parquet::file::statistics::Statistics::Int32(s)) =
+                meta.row_group(rg).column(ship_idx).statistics()
+            {
+                eprintln!("  RG{rg}: min={:?} max={:?}", s.min_opt(), s.max_opt());
             }
         }
 

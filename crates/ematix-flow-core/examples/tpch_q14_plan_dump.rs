@@ -2,8 +2,8 @@
 //! against the SF=1 parquet, so the InjectFusedQ14Rule pattern detector
 //! knows the exact node tree it needs to match.
 //!
-//! Q14 = scan(lineitem) + scan(part) + filter(shipdate range) + JOIN
-//! + dual-SUM with CASE WHEN p_type LIKE 'PROMO%'. The fused
+//! Q14 = scan(lineitem) + scan(part) + filter(shipdate range) + JOIN,
+//! plus dual-SUM with CASE WHEN p_type LIKE 'PROMO%'. The fused
 //! replacement (`FusedQ14FullExec`) owns BOTH scans and replaces the
 //! hash join with a direct-indexed promo bitmap probe.
 

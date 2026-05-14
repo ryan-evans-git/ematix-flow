@@ -683,10 +683,10 @@ mod tests {
         let ours = decode_column_chunk_byte_array(&path, 0, 8).unwrap();
         let theirs = pr_read_byte_array(&path, 0, 8);
         assert_eq!(ours.len(), theirs.len());
-        for i in 0..ours.len() {
+        for (i, t) in theirs.iter().enumerate() {
             assert_eq!(
                 ours.value(i).as_bytes(),
-                theirs[i].as_slice(),
+                t.as_slice(),
                 "mismatch at row {i}"
             );
         }
@@ -703,10 +703,10 @@ mod tests {
         let ours = decode_column_chunk_byte_array(&path, 0, 15).unwrap();
         let theirs = pr_read_byte_array(&path, 0, 15);
         assert_eq!(ours.len(), theirs.len());
-        for i in 0..ours.len() {
+        for (i, t) in theirs.iter().enumerate() {
             assert_eq!(
                 ours.value(i).as_bytes(),
-                theirs[i].as_slice(),
+                t.as_slice(),
                 "mismatch at row {i}"
             );
         }

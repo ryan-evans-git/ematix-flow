@@ -1273,7 +1273,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn csv_custom_null_regex_makes_empty_and_NA_null() {
+    async fn csv_custom_null_regex_makes_empty_and_na_null() {
         // arrow-csv's default already treats empty as null. We add
         // "NA" via null_regex and verify both pass through as nulls.
         let csv = "id,name\n1,alice\n2,NA\n3,\n";
