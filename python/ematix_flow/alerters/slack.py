@@ -18,6 +18,14 @@ from . import AlertEvent
 
 class SlackAlerter:
     def __init__(self, webhook_url: str, *, timeout: float = 5.0):
+        # Reject anything that isn't an HTTPS webhook — slack incoming
+        # webhooks are always https://hooks.slack.com/services/...,
+        # and refusing other schemes closes the bandit B310 hole
+        # (file:/// + custom schemes).
+        if not webhook_url.startswith("https://"):
+            raise ValueError(
+                f"SlackAlerter webhook_url must be https://, got {webhook_url!r}"
+            )
         self.webhook_url = webhook_url
         self._timeout = timeout
 
@@ -32,7 +40,9 @@ class SlackAlerter:
             headers={"Content-Type": "application/json"},
         )
         try:
-            with urllib.request.urlopen(req, timeout=self._timeout) as resp:
+            # webhook_url is validated https:// in __init__, so the
+            # scheme is locked down before we hand it to urlopen.
+            with urllib.request.urlopen(req, timeout=self._timeout) as resp:  # nosec B310
                 resp.read()  # drain
         except (urllib.error.URLError, ConnectionError, OSError) as e:
             # Don't crash the orchestrator on a Slack outage.
