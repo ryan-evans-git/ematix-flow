@@ -1654,6 +1654,10 @@ maturin develop --release
 target/release/flow --help
 
 # Run tests
+make test                                 # both fast suites (no Docker)
+make test-integration                     # Docker-gated; auto-cleans testcontainers after
+
+# Or run them directly:
 cargo test --workspace --lib              # default (no Docker)
 cargo test --workspace -- --ignored       # Docker integration tests
                                           # (Kafka, RabbitMQ, Pub/Sub
@@ -1664,7 +1668,14 @@ cargo test --workspace -- --ignored       # Docker integration tests
 pytest                                    # default Python suite
 pytest -m integration                     # full integration (Docker)
 pytest -m spark                           # opt-in Spark E2E
+
+# If a test run is SIGKILL'd or OOM'd before testcontainers' Drop
+# fires, leaked containers + volumes can accumulate. The Makefile
+# target prunes by label and won't touch unrelated containers:
+make clean-testcontainers
 ```
+
+See `make help` for the full target list (fmt / lint / security).
 
 ---
 
