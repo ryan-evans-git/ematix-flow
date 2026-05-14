@@ -10,6 +10,8 @@ Default (always available):
 
 Optional (import errors when their dep isn't installed):
   - PostgresRunLog   — needs `psycopg`
+  - MySQLRunLog      — needs `PyMySQL`
+  - DuckDBRunLog     — needs `duckdb`
   - S3RunLog         — needs `boto3`
   - AzureBlobRunLog  — needs `azure-storage-blob`
   - GcsRunLog        — needs `google-cloud-storage`
@@ -32,6 +34,12 @@ def __getattr__(name: str):
     if name == "PostgresRunLog":
         from .postgres import PostgresRunLog
         return PostgresRunLog
+    if name == "MySQLRunLog":
+        from .mysql import MySQLRunLog
+        return MySQLRunLog
+    if name == "DuckDBRunLog":
+        from .duckdb import DuckDBRunLog
+        return DuckDBRunLog
     if name == "S3RunLog":
         from .s3 import S3RunLog
         return S3RunLog
@@ -51,6 +59,8 @@ __all__ = [
     # Optional backends — lazily imported. Naming them here so static
     # tools can discover the full surface.
     "PostgresRunLog",
+    "MySQLRunLog",
+    "DuckDBRunLog",
     "S3RunLog",
     "AzureBlobRunLog",
     "GcsRunLog",
