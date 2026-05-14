@@ -286,7 +286,7 @@ fn write_part(dir: &std::path::Path) {
         };
         p_type.push(ptype);
         p_size.push(((i % 50) as i32) + 1);
-        p_container.push(format!("SM CASE"));
+        p_container.push("SM CASE".to_string());
         p_retailprice.push(900.0 + (i as f64) * 0.5);
         p_comment.push(format!("part comment {i}"));
     }
