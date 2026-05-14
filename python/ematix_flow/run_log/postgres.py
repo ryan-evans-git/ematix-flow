@@ -4,22 +4,28 @@ Use this when more than one host runs `flow run-due` and they need to
 agree on the freshness gate and retry state. SQLite can't be safely
 shared across hosts; Postgres is the right tool.
 
-Schema mirrors SqliteRunLog's two tables. Conflict handling uses
+Schema mirrors SqliteRunLog's tables. Conflict handling uses
 `INSERT ... ON CONFLICT (...) DO UPDATE` so the call sites stay the
 same as SQLite's REPLACE INTO.
+
+Ω.W.2: the lease layer uses a single `INSERT ... ON CONFLICT DO
+UPDATE ... WHERE ... RETURNING` round-trip — the WHERE-conditioned
+upsert is atomic; the RETURNING clause tells us in one trip whether
+our token won the race.
 
 Optional dep: `psycopg` (psycopg 3, install via `pip install psycopg[binary]`).
 """
 
 from __future__ import annotations
 
-from datetime import datetime
+import uuid
+from datetime import UTC, datetime, timedelta
 
 from ._iso import iso_utc, parse_iso
-from ._no_lease import NoLeaseSQLBackend
+from .protocol import ClaimResult, ExpiredClaim
 
 
-class PostgresRunLog(NoLeaseSQLBackend):
+class PostgresRunLog:
     """PostgreSQL-backed run history.
 
     `dsn` is a libpq-style connection string ("postgresql://user@host/db",
@@ -47,6 +53,13 @@ class PostgresRunLog(NoLeaseSQLBackend):
         "  attempt_count   INTEGER NOT NULL,"
         "  last_attempt_at TEXT NOT NULL,"
         "  gave_up         BOOLEAN NOT NULL"
+        ");"
+        'CREATE TABLE IF NOT EXISTS "{schema}".pipeline_claims ('
+        "  pipeline_name TEXT PRIMARY KEY,"
+        "  claim_token   TEXT NOT NULL,"
+        "  worker_id     TEXT NOT NULL,"
+        "  claimed_at    TEXT NOT NULL,"
+        "  expires_at    TEXT NOT NULL"
         ");"
     )
 
@@ -155,3 +168,83 @@ class PostgresRunLog(NoLeaseSQLBackend):
                     last_attempt_at=parse_iso(ts_s),
                     gave_up=bool(gave_up),
                 )
+
+    # ---- Ω.W.2: lease layer (real CAS) ----------------------------
+
+    def claim(self, pipeline: str, worker_id: str, lease_seconds: int) -> ClaimResult:
+        # Truncate to second precision so the value we return in
+        # ClaimResult matches what comes back out of the next SELECT.
+        now = datetime.now(UTC).replace(microsecond=0)
+        token = uuid.uuid4().hex
+        expires_at = now + timedelta(seconds=lease_seconds)
+
+        # Atomic conditional upsert in a single round-trip:
+        #   - INSERT if no row exists for pipeline → we win (RETURNING our row)
+        #   - ON CONFLICT WHERE expires_at < EXCLUDED.claimed_at: take over
+        #     the row only if the existing lease has expired → RETURNING
+        #     gives us OUR new row
+        #   - ON CONFLICT but WHERE is false (lease still valid): no
+        #     update happens → RETURNING is empty → we lost the race
+        with self._conn.cursor() as cur:
+            cur.execute(
+                f'INSERT INTO "{self._schema}".pipeline_claims '
+                "(pipeline_name, claim_token, worker_id, claimed_at, expires_at) "
+                "VALUES (%s, %s, %s, %s, %s) "
+                "ON CONFLICT (pipeline_name) DO UPDATE "
+                "  SET claim_token = EXCLUDED.claim_token, "
+                "      worker_id   = EXCLUDED.worker_id, "
+                "      claimed_at  = EXCLUDED.claimed_at, "
+                "      expires_at  = EXCLUDED.expires_at "
+                # `<=` so a lease that expires exactly at our claim
+                # time is considered expired and can be taken over.
+                # This matches the SQLite/InMemory `> now` "still valid"
+                # check used elsewhere in the backend set.
+                f'  WHERE "{self._schema}".pipeline_claims.expires_at <= EXCLUDED.claimed_at '
+                "RETURNING claim_token",
+                (pipeline, token, worker_id, iso_utc(now), iso_utc(expires_at)),
+            )
+            row = cur.fetchone()
+            if row is not None and row[0] == token:
+                return ClaimResult.acquired_by(
+                    token=token, worker_id=worker_id, expires_at=expires_at
+                )
+            # Lost the race — read the current holder for the busy result.
+            cur.execute(
+                f'SELECT worker_id, expires_at FROM "{self._schema}".pipeline_claims '
+                "WHERE pipeline_name = %s",
+                (pipeline,),
+            )
+            held = cur.fetchone()
+        return ClaimResult.busy(holder=held[0], expires_at=parse_iso(held[1]))
+
+    def heartbeat(self, claim_token: str, lease_seconds: int) -> None:
+        new_expires = datetime.now(UTC).replace(microsecond=0) + timedelta(
+            seconds=lease_seconds
+        )
+        with self._conn.cursor() as cur:
+            cur.execute(
+                f'UPDATE "{self._schema}".pipeline_claims '
+                "SET expires_at = %s WHERE claim_token = %s",
+                (iso_utc(new_expires), claim_token),
+            )
+
+    def release(self, claim_token: str) -> None:
+        with self._conn.cursor() as cur:
+            cur.execute(
+                f'DELETE FROM "{self._schema}".pipeline_claims '
+                "WHERE claim_token = %s",
+                (claim_token,),
+            )
+
+    def sweep_expired_leases(self, now: datetime) -> list[ExpiredClaim]:
+        with self._conn.cursor() as cur:
+            cur.execute(
+                f'SELECT pipeline_name, worker_id, expires_at '
+                f'FROM "{self._schema}".pipeline_claims '
+                "WHERE expires_at < %s",
+                (iso_utc(now),),
+            )
+            return [
+                ExpiredClaim(pipeline=name, worker_id=wid, expires_at=parse_iso(exp))
+                for name, wid, exp in cur.fetchall()
+            ]
