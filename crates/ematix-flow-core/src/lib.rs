@@ -17,6 +17,15 @@ pub mod duckdb_backend;
 // See `fast_parquet.rs` for the day-2/day-3 probe results that
 // motivated this.
 pub mod fast_parquet;
+// Bridge from ematix-parquet kernel output (Vec<T>, Vec<u8> bitmap,
+// etc.) to Arrow arrays. Foundation for replacing parquet-rs under
+// FastParquetExec. See module docstring for the integration plan.
+pub mod ematix_parquet_bridge;
+// Phase 2 of the ematix-parquet integration — `TableProvider` +
+// `ExecutionPlan` that scan a parquet file via the bridge instead
+// of parquet-rs. Supports primitive columns only; non-primitive
+// callers continue using `FastParquetTableProvider`.
+pub mod ematix_fast_parquet;
 // Σ.D1: `FusedFilterSumExec` physical operator for the simple
 // `Aggregate(SUM) over Filter(predicate)` plan shape — closes the
 // Q6 gap vs Polars (1.0 ms hand-written / 1.9 ms Polars / 5.96 ms
@@ -43,6 +52,22 @@ pub mod fused_jit;
 // JOIN-bound). Substrate for the future cranelift-JIT-generalized
 // operator. See `fused_post_join.rs` header and issues #51, #52.
 pub mod fused_post_join;
+// Σ.D3 phase E: fully-fused Q14 scan + filter + join + agg in one
+// operator. Owns both inputs (lineitem + part); part becomes a
+// direct-indexed promo bitmap; lineitem streams through parallel
+// shards filtering + probing + accumulating in one pass. Built to
+// beat Polars's 12.5 ms Q14 SF=1 number — the post-join-only fusion
+// in `fused_post_join.rs::Q14` only saved ~0.9 ms; the JOIN+scan
+// dominated. See module header for the algorithm.
+pub mod fused_q14_full;
+// Σ.D3 phase D: `PhysicalOptimizerRule` that auto-routes hand-coded
+// FusedFilterSumExec / FusedFilterMultiAggExec / FusedPostJoinExec(Q14)
+// instances to their Cranelift-JIT'd variants. Walks the physical plan
+// tree with `transform_up` and swaps each match in place. Full SQL-
+// pattern detection (extracting predicate constants from arbitrary
+// PhysicalExpr ASTs to inject a fused exec where none was constructed)
+// is documented as a follow-up in the module header.
+pub mod fused_jit_rule;
 pub mod hash;
 pub mod join;
 pub mod kafka_backend;

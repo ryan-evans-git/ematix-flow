@@ -3642,11 +3642,15 @@ dependencies = [
  "deadpool-postgres",
  "deltalake",
  "duckdb",
+ "ematix-parquet-codec",
+ "ematix-parquet-format",
+ "ematix-parquet-io",
  "futures-util",
  "google-cloud-auth",
  "google-cloud-pubsub",
  "hyperloglogplus",
  "lapin",
+ "mimalloc",
  "mysql_async",
  "object_store",
  "orc-rust",
@@ -3655,6 +3659,7 @@ dependencies = [
  "prometheus",
  "protofish",
  "rdkafka",
+ "regex",
  "reqwest 0.12.28",
  "rusqlite",
  "sasl2-sys",
@@ -3712,6 +3717,33 @@ dependencies = [
  "pyo3",
  "serde_json",
  "tokio",
+]
+
+[[package]]
+name = "ematix-parquet-codec"
+version = "0.0.1"
+source = "git+https://github.com/ryan-evans-git/ematix-parquet.git?rev=63b6954#63b6954aade8a73a6c850c85123868f2326e03f7"
+dependencies = [
+ "brotli",
+ "ematix-parquet-format",
+ "ematix-parquet-io",
+ "flate2",
+ "lz4_flex 0.11.6",
+ "snap",
+ "zstd",
+]
+
+[[package]]
+name = "ematix-parquet-format"
+version = "0.0.1"
+source = "git+https://github.com/ryan-evans-git/ematix-parquet.git?rev=63b6954#63b6954aade8a73a6c850c85123868f2326e03f7"
+
+[[package]]
+name = "ematix-parquet-io"
+version = "0.0.1"
+source = "git+https://github.com/ryan-evans-git/ematix-parquet.git?rev=63b6954#63b6954aade8a73a6c850c85123868f2326e03f7"
+dependencies = [
+ "ematix-parquet-format",
 ]
 
 [[package]]
@@ -5248,6 +5280,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
 
 [[package]]
+name = "libmimalloc-sys"
+version = "0.1.47"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2d1eacfa31c33ec25e873c136ba5669f00f9866d0688bea7be4d3f7e43067df6"
+dependencies = [
+ "cc",
+]
+
+[[package]]
 name = "libredox"
 version = "0.1.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5451,6 +5492,15 @@ name = "memchr"
 version = "2.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8ca58f447f06ed17d5fc4043ce1b10dd205e060fb3ce5b979b8ed8e59ff3f79"
+
+[[package]]
+name = "mimalloc"
+version = "0.1.50"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b3627c4272df786b9260cabaa46aec1d59c93ede723d4c3ef646c503816b0640"
+dependencies = [
+ "libmimalloc-sys",
+]
 
 [[package]]
 name = "mime"

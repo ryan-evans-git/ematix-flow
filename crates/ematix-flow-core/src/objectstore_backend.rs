@@ -68,9 +68,12 @@ pub struct ObjectStoreBackend {
     /// `connection_info`). Not used for routing.
     base_label: String,
     /// Π.1.4: per-format write-time options (Parquet compression,
-    /// CSV delimiter / header). Read paths don't consult this — the
-    /// underlying readers infer codec / delimiter from file metadata.
+    /// CSV delimiter / header).
     write_options: ObjectWriteOptions,
+    /// Π.4a: per-format read-time options. CSV gets the lion's share
+    /// (delimiter, quote, escape, header, null regex, comment, …);
+    /// JSON gets a small schema-inference window.
+    read_options: crate::backend::ObjectReadOptions,
     /// Σ.B PR 1: original location config, retained so
     /// [`Backend::config`] can reconstruct an identical backend on
     /// another node. Carries credentials in plaintext — same trust
@@ -106,6 +109,7 @@ impl ObjectStoreBackend {
             dsn: format!("file://{}", root.display()),
             base_label: root.display().to_string(),
             write_options: ObjectWriteOptions::default(),
+            read_options: crate::backend::ObjectReadOptions::default(),
             location: crate::backend::ObjectStoreLocation::Local {
                 root_dir: root.display().to_string(),
             },
@@ -127,6 +131,18 @@ impl ObjectStoreBackend {
     /// logging.
     pub fn write_options(&self) -> &ObjectWriteOptions {
         &self.write_options
+    }
+
+    /// Π.4a: override read-time options (CSV delimiter / quote / escape /
+    /// header / null regex / comment / JSON inference window). Defaults
+    /// reproduce historical Arrow defaults.
+    pub fn with_read_options(mut self, options: crate::backend::ObjectReadOptions) -> Self {
+        self.read_options = options;
+        self
+    }
+
+    pub fn read_options(&self) -> &crate::backend::ObjectReadOptions {
+        &self.read_options
     }
 
     /// Borrow the underlying object store. Used by tests and (later)
@@ -177,6 +193,7 @@ impl ObjectStoreBackend {
             dsn: format!("s3://{bucket}@{endpoint}"),
             base_label: format!("s3://{bucket}"),
             write_options: ObjectWriteOptions::default(),
+            read_options: crate::backend::ObjectReadOptions::default(),
             location: crate::backend::ObjectStoreLocation::S3 {
                 endpoint: endpoint.to_string(),
                 bucket: bucket.to_string(),
@@ -342,9 +359,15 @@ async fn write_parquet_at_path(
 /// columns surface as errors when the second file's batches arrive.
 /// Decode a single CSV object. Header row assumed; schema inferred
 /// from the first 1024 records (arrow-csv's default cap).
+/// Read a single CSV object. Applies the supplied [`CsvReadOptions`]
+/// to both the schema-inference Format and the typed ReaderBuilder so
+/// the two stages agree on every dialect quirk (header / delimiter /
+/// quote / escape / null sentinel / comment prefix). Unset fields
+/// keep arrow-csv's library defaults.
 async fn decode_csv_file(
     store: &Arc<dyn ObjectStore>,
     meta: &object_store::ObjectMeta,
+    opts: &crate::backend::CsvReadOptions,
 ) -> Result<Vec<RecordBatch>, BackendError> {
     use arrow_csv::reader::Format;
 
@@ -355,15 +378,70 @@ async fn decode_csv_file(
         .bytes()
         .await
         .map_err(|e| BackendError::Connection(format!("get bytes: {e}")))?;
-    // Two passes over the bytes: first to infer schema, second to
-    // build the typed reader. arrow-csv's Format consumes the
-    // reader, so we hand it a fresh Cursor each time.
-    let format = Format::default().with_header(true);
+
+    let has_header = opts.has_header.unwrap_or(true);
+    let infer_max = opts.schema_infer_max_records.unwrap_or(1024);
+
+    // Schema-inference Format. Apply every applicable option so the
+    // inferred schema reflects the real shape (e.g. a TSV file with
+    // delimiter=\t needs the inference pass to use \t too).
+    let mut format = Format::default().with_header(has_header);
+    if let Some(d) = opts.delimiter {
+        format = format.with_delimiter(d);
+    }
+    if let Some(q) = opts.quote {
+        format = format.with_quote(q);
+    }
+    if let Some(e) = opts.escape {
+        format = format.with_escape(e);
+    }
+    if let Some(t) = opts.terminator {
+        format = format.with_terminator(t);
+    }
+    if let Some(c) = opts.comment {
+        format = format.with_comment(c);
+    }
+    if let Some(ref pat) = opts.null_regex {
+        let re = regex::Regex::new(pat)
+            .map_err(|e| BackendError::Query(format!("csv null_regex {pat:?}: {e}")))?;
+        format = format.with_null_regex(re);
+    }
+    if let Some(allow) = opts.truncated_rows_ok {
+        format = format.with_truncated_rows(allow);
+    }
+
     let (schema, _records_inferred) = format
-        .infer_schema(std::io::Cursor::new(&bytes), Some(1024))
+        .infer_schema(std::io::Cursor::new(&bytes), Some(infer_max))
         .map_err(|e| BackendError::Query(format!("csv infer: {e}")))?;
-    let reader = arrow_csv::ReaderBuilder::new(Arc::new(schema))
-        .with_header(true)
+
+    // Typed ReaderBuilder. Same option set, threaded a second time
+    // because Format and ReaderBuilder are independent objects.
+    let mut builder = arrow_csv::ReaderBuilder::new(Arc::new(schema)).with_header(has_header);
+    if let Some(d) = opts.delimiter {
+        builder = builder.with_delimiter(d);
+    }
+    if let Some(q) = opts.quote {
+        builder = builder.with_quote(q);
+    }
+    if let Some(e) = opts.escape {
+        builder = builder.with_escape(e);
+    }
+    if let Some(t) = opts.terminator {
+        builder = builder.with_terminator(t);
+    }
+    if let Some(c) = opts.comment {
+        builder = builder.with_comment(c);
+    }
+    if let Some(ref pat) = opts.null_regex {
+        let re = regex::Regex::new(pat)
+            .map_err(|e| BackendError::Query(format!("csv null_regex {pat:?}: {e}")))?;
+        builder = builder.with_null_regex(re);
+    }
+    if let Some(allow) = opts.truncated_rows_ok {
+        builder = builder.with_truncated_rows(allow);
+    }
+
+    let reader = builder
         .build(std::io::Cursor::new(bytes))
         .map_err(|e| BackendError::Query(format!("csv reader build: {e}")))?;
     let mut batches: Vec<RecordBatch> = Vec::new();
@@ -394,6 +472,15 @@ async fn write_csv_at_path(
     let mut builder = arrow_csv::WriterBuilder::new().with_header(header);
     if let Some(d) = options.csv_delimiter {
         builder = builder.with_delimiter(d);
+    }
+    if let Some(q) = options.csv_quote {
+        builder = builder.with_quote(q);
+    }
+    if let Some(e) = options.csv_escape {
+        builder = builder.with_escape(e);
+    }
+    if let Some(ref nv) = options.csv_null_value {
+        builder = builder.with_null(nv.clone());
     }
     let mut writer = builder.build(&mut buf);
     let mut total: u64 = 0;
@@ -435,6 +522,7 @@ fn parquet_compression_to_codec(codec: ParquetCompression) -> parquet::basic::Co
 async fn decode_jsonl_file(
     store: &Arc<dyn ObjectStore>,
     meta: &object_store::ObjectMeta,
+    opts: &crate::backend::JsonReadOptions,
 ) -> Result<Vec<RecordBatch>, BackendError> {
     use arrow_json::ReaderBuilder;
     use arrow_json::reader::infer_json_schema_from_seekable;
@@ -447,9 +535,14 @@ async fn decode_jsonl_file(
         .await
         .map_err(|e| BackendError::Connection(format!("get bytes: {e}")))?;
     let mut cursor = std::io::Cursor::new(bytes.as_ref());
-    let (schema, _records_inferred) = infer_json_schema_from_seekable(&mut cursor, Some(1024))
+    let infer_max = opts.schema_infer_max_records.unwrap_or(1024);
+    let (schema, _records_inferred) = infer_json_schema_from_seekable(&mut cursor, Some(infer_max))
         .map_err(|e| BackendError::Query(format!("json infer: {e}")))?;
-    let reader = ReaderBuilder::new(Arc::new(schema))
+    let mut builder = ReaderBuilder::new(Arc::new(schema));
+    if let Some(bs) = opts.batch_size {
+        builder = builder.with_batch_size(bs);
+    }
+    let reader = builder
         .build(std::io::BufReader::new(cursor))
         .map_err(|e| BackendError::Query(format!("json reader: {e}")))?;
     let mut batches: Vec<RecordBatch> = Vec::new();
@@ -673,6 +766,7 @@ async fn streaming_read_after(
     format: ObjectFormat,
     prefix: &ObjectPath,
     after_key: Option<&str>,
+    read_options: &crate::backend::ObjectReadOptions,
 ) -> Result<(Vec<RecordBatch>, Option<String>), BackendError> {
     let extensions: &[&str] = match format {
         ObjectFormat::Parquet => &[".parquet"],
@@ -687,8 +781,8 @@ async fn streaming_read_after(
         let key = meta.location.as_ref().to_string();
         let file_batches = match format {
             ObjectFormat::Parquet => decode_parquet_file(store, &meta).await?,
-            ObjectFormat::Csv => decode_csv_file(store, &meta).await?,
-            ObjectFormat::JsonLines => decode_jsonl_file(store, &meta).await?,
+            ObjectFormat::Csv => decode_csv_file(store, &meta, &read_options.csv).await?,
+            ObjectFormat::JsonLines => decode_jsonl_file(store, &meta, &read_options.json).await?,
             ObjectFormat::Orc => decode_orc_file(store, &meta).await?,
         };
         batches.extend(file_batches);
@@ -772,6 +866,7 @@ impl Backend for ObjectStoreBackend {
             location: self.location.clone(),
             format: self.format,
             write_options: self.write_options.clone(),
+            read_options: self.read_options.clone(),
         })
     }
 
@@ -819,8 +914,14 @@ impl Backend for ObjectStoreBackend {
             .lock()
             .map_err(|e| BackendError::Other(format!("objectstore seek lock: {e}")))?
             .clone();
-        let (batches, new_last) =
-            streaming_read_after(&self.store, self.format, &prefix, after_key.as_deref()).await?;
+        let (batches, new_last) = streaming_read_after(
+            &self.store,
+            self.format,
+            &prefix,
+            after_key.as_deref(),
+            &self.read_options,
+        )
+        .await?;
         if let Some(key) = new_last {
             *self
                 .last_seen_object_key
@@ -1075,7 +1176,7 @@ impl Backend for ObjectStoreBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_array::{Int64Array, StringArray};
+    use arrow_array::{Array, Int64Array, StringArray};
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 
     fn small_batch() -> RecordBatch {
@@ -1097,6 +1198,204 @@ mod tests {
         Box::pin(futures_util::stream::once(async move {
             Ok::<_, BackendError>(batch)
         }))
+    }
+
+    // ---- Π.4a: CsvReadOptions ---------------------------------------
+
+    /// Helper: drop `contents` at `<root>/<schema>/<table>/<filename>`
+    /// in the local-fs object store; returns the open backend ready
+    /// to read from that prefix.
+    fn stage_local_text_file(
+        contents: &str,
+        filename: &str,
+        format: ObjectFormat,
+    ) -> (tempfile::TempDir, ObjectStoreBackend) {
+        let dir = tempfile::tempdir().unwrap();
+        let target_dir = dir.path().join("raw").join("events");
+        std::fs::create_dir_all(&target_dir).unwrap();
+        std::fs::write(target_dir.join(filename), contents).unwrap();
+        let backend = ObjectStoreBackend::open_local(dir.path(), format).unwrap();
+        (dir, backend)
+    }
+
+    async fn collect_rows(backend: &ObjectStoreBackend) -> Vec<RecordBatch> {
+        use futures_util::TryStreamExt;
+        let s = backend.read_arrow_stream("raw/events").await.unwrap();
+        s.try_collect().await.unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn csv_default_options_round_trip_with_header() {
+        let csv = "id,name\n1,alice\n2,bob\n";
+        let (_d, backend) = stage_local_text_file(csv, "a.csv", ObjectFormat::Csv);
+        let batches = collect_rows(&backend).await;
+        let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, 2);
+        assert_eq!(batches[0].schema().field(0).name(), "id");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn csv_tsv_with_tab_delimiter() {
+        let tsv = "id\tname\n1\talice\n2\tbob\n";
+        let (_d, backend) = stage_local_text_file(tsv, "a.csv", ObjectFormat::Csv);
+        let opts = crate::backend::ObjectReadOptions {
+            csv: crate::backend::CsvReadOptions {
+                delimiter: Some(b'\t'),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let backend = backend.with_read_options(opts);
+        let batches = collect_rows(&backend).await;
+        let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, 2);
+        assert_eq!(batches[0].schema().field(0).name(), "id");
+        assert_eq!(batches[0].schema().field(1).name(), "name");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn csv_semicolon_with_no_header() {
+        // The "European CSV" shape: ; delimiter, no header row.
+        let csv = "1;alice\n2;bob\n3;carol\n";
+        let (_d, backend) = stage_local_text_file(csv, "a.csv", ObjectFormat::Csv);
+        let opts = crate::backend::ObjectReadOptions {
+            csv: crate::backend::CsvReadOptions {
+                has_header: Some(false),
+                delimiter: Some(b';'),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let backend = backend.with_read_options(opts);
+        let batches = collect_rows(&backend).await;
+        let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, 3, "all three rows decoded (no header consumed)");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn csv_custom_null_regex_makes_empty_and_na_null() {
+        // arrow-csv's default already treats empty as null. We add
+        // "NA" via null_regex and verify both pass through as nulls.
+        let csv = "id,name\n1,alice\n2,NA\n3,\n";
+        let (_d, backend) = stage_local_text_file(csv, "a.csv", ObjectFormat::Csv);
+        let opts = crate::backend::ObjectReadOptions {
+            csv: crate::backend::CsvReadOptions {
+                null_regex: Some("^(NA|)$".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let backend = backend.with_read_options(opts);
+        let batches = collect_rows(&backend).await;
+        // Inspect the `name` column; rows 2 + 3 should be null.
+        let batch = &batches[0];
+        let names = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("name column is utf8");
+        assert!(names.is_valid(0));
+        assert!(names.is_null(1), "row 2 'NA' should decode as null");
+        assert!(names.is_null(2), "row 3 (empty) should decode as null");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn csv_quote_and_escape_inside_quoted_field() {
+        // The classic "quote inside a quoted string" case. Default
+        // arrow-csv escapes doubled-quotes; this verifies the reader
+        // surfaces the embedded `"` correctly.
+        let csv = "id,name\n1,\"alice \"\"the great\"\"\"\n2,bob\n";
+        let (_d, backend) = stage_local_text_file(csv, "a.csv", ObjectFormat::Csv);
+        let batches = collect_rows(&backend).await;
+        let names = batches[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(names.value(0), "alice \"the great\"");
+        assert_eq!(names.value(1), "bob");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn csv_write_honors_quote_escape_null() {
+        // Round-trip: write with custom quote / null sentinel, then
+        // read back through the standard reader and verify the bytes
+        // landed correctly. We compare the on-disk file directly so
+        // the assertion is precise about the wire form.
+        use futures_util::TryStreamExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let backend = ObjectStoreBackend::open_local(dir.path(), ObjectFormat::Csv)
+            .unwrap()
+            .with_write_options(ObjectWriteOptions {
+                csv_delimiter: Some(b','),
+                csv_header: Some(true),
+                csv_quote: Some(b'\''),
+                csv_null_value: Some("\\N".to_string()),
+                ..Default::default()
+            });
+        let target = TargetTable {
+            schema: "raw".into(),
+            name: "events".into(),
+        };
+
+        // Build a batch with a null in row 2.
+        let schema = Arc::new(arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("id", arrow_schema::DataType::Int64, true),
+            arrow_schema::Field::new("name", arrow_schema::DataType::Utf8, true),
+        ]));
+        let names: Vec<Option<&str>> = vec![Some("alice"), None, Some("carol")];
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 3])),
+                Arc::new(StringArray::from(names)),
+            ],
+        )
+        .unwrap();
+
+        backend
+            .write_arrow_stream(&target, arrow_stream_for(batch), WriteMode::Append)
+            .await
+            .unwrap();
+
+        // Find the written CSV; assert the bytes contain our null
+        // sentinel and quote char.
+        let written_path = dir.path().join("raw").join("events");
+        let entries: Vec<_> = std::fs::read_dir(&written_path)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("csv"))
+            .collect();
+        assert_eq!(entries.len(), 1);
+        let bytes = std::fs::read_to_string(&entries[0]).unwrap();
+        // Row 2's null name should render as `\N`.
+        assert!(bytes.contains("2,\\N"), "got CSV: {bytes:?}");
+        // Header row should be present.
+        assert!(bytes.starts_with("id,name"), "header missing: {bytes:?}");
+
+        // Read it back via the same backend (quote=' so we expect
+        // unquoted values still work). Just sanity-check the row count.
+        let s = backend.read_arrow_stream("raw/events").await.unwrap();
+        let batches: Vec<RecordBatch> = s.try_collect().await.unwrap();
+        assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 3);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn csv_comment_lines_skipped() {
+        let csv = "# header below\nid,name\n# this row is ignored\n1,alice\n2,bob\n";
+        let (_d, backend) = stage_local_text_file(csv, "a.csv", ObjectFormat::Csv);
+        let opts = crate::backend::ObjectReadOptions {
+            csv: crate::backend::CsvReadOptions {
+                comment: Some(b'#'),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let backend = backend.with_read_options(opts);
+        let batches = collect_rows(&backend).await;
+        let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, 2, "two data rows; comment lines filtered out");
     }
 
     /// P4 #28: streaming-source happy path. Successive

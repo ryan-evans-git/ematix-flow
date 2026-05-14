@@ -1131,6 +1131,14 @@ class _EmatixNamespace:
         transforms_post: list[Any] | None = None,
         continue_on_failure_post: bool = False,
         ttl: Any = None,
+        # Phase Ω.1 — DAG dependencies + freshness gating.
+        depends_on: list[str] | None = None,
+        upstream_freshness_secs: int | None = None,
+        # Phase Ω.2 — declarative retry policy. dict shape:
+        #   {"max_attempts": N, "backoff": "fixed"|"linear"|"exponential",
+        #    "base_secs": M, "max_backoff_secs": K}
+        # See pipeline.RetryPolicy for field semantics.
+        retry: dict | None = None,
     ):
         """Function decorator. Wraps `pipeline.sync` and registers via the
         Phase 12 scheduling registry.
@@ -1389,7 +1397,13 @@ class _EmatixNamespace:
             # Register with the Phase 12 scheduling registry.
             from ematix_flow import pipeline as _p
 
-            _p.register(name=name or fn.__name__, schedule=schedule)(wrapped)
+            _p.register(
+                name=name or fn.__name__,
+                schedule=schedule,
+                depends_on=depends_on,
+                upstream_freshness_secs=upstream_freshness_secs,
+                retry=retry,
+            )(wrapped)
 
             return wrapped
 

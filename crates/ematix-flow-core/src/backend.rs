@@ -76,6 +76,13 @@ pub struct ObjectWriteOptions {
     /// Whether to write a header row in CSV output. `None` = true.
     /// Used only when the backend's format is `Csv`.
     pub csv_header: Option<bool>,
+    /// Π.4e: CSV quote character. `None` = `b'"'`.
+    pub csv_quote: Option<u8>,
+    /// Π.4e: CSV escape character. `None` = doubled-quote.
+    pub csv_escape: Option<u8>,
+    /// Π.4e: how to render null cells on the write side. `None` = empty
+    /// string (Arrow default).
+    pub csv_null_value: Option<String>,
 }
 
 /// Parquet compression codec. Subset of the parquet crate's
@@ -96,6 +103,53 @@ pub enum ParquetCompression {
     /// Modern best-in-class. ZstdLevel(3) — the parquet crate's
     /// default level, balanced encode speed vs ratio.
     Zstd,
+}
+
+/// Π.4a: per-format read-time options for the object-store backend.
+/// Symmetric to [`ObjectWriteOptions`] but applied during decode:
+/// schema-inference Format + ReaderBuilder both see the same settings.
+/// Defaults reproduce the pre-Π.4a behaviour (CSV: header=true,
+/// comma delimiter, double-quote, doubled-quote escape).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct ObjectReadOptions {
+    pub csv: CsvReadOptions,
+    pub json: JsonReadOptions,
+}
+
+/// Settings for the CSV decoder. Each field is `Option<...>` so we
+/// can tell apart "user-set" from "use library default" — same shape
+/// as [`ObjectWriteOptions`]. `None` semantics:
+///   - `has_header`     -> true
+///   - `delimiter`      -> `b','`
+///   - `quote`          -> `b'"'`
+///   - `escape`         -> doubled-quote (`""` inside quoted fields)
+///   - `terminator`     -> auto (LF or CRLF)
+///   - `comment`        -> no comment prefix
+///   - `null_regex`     -> empty string only (default Arrow behaviour)
+///   - `truncated_rows_ok` -> false
+///   - `schema_infer_max_records` -> 1024
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct CsvReadOptions {
+    pub has_header: Option<bool>,
+    pub delimiter: Option<u8>,
+    pub quote: Option<u8>,
+    pub escape: Option<u8>,
+    pub terminator: Option<u8>,
+    pub comment: Option<u8>,
+    /// Regex describing null sentinels (in addition to the empty
+    /// string). Example: `"NA|NULL|\\\\N"` matches the three common
+    /// pandas / Postgres COPY representations.
+    pub null_regex: Option<String>,
+    pub truncated_rows_ok: Option<bool>,
+    pub schema_infer_max_records: Option<usize>,
+}
+
+/// Settings for the JSON-lines decoder. Arrow's JSON reader has fewer
+/// knobs than CSV; the main one is the schema-inference scan depth.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct JsonReadOptions {
+    pub schema_infer_max_records: Option<usize>,
+    pub batch_size: Option<usize>,
 }
 
 /// Streaming source/sink kind (Phase 36–37).
@@ -626,6 +680,10 @@ pub struct ObjectStoreConfig {
     /// uncompressed, CSV comma + header).
     #[serde(default)]
     pub write_options: ObjectWriteOptions,
+    /// Π.4a: per-format read options (CSV dialect, JSON inference).
+    /// Default = Arrow's library defaults.
+    #[serde(default)]
+    pub read_options: ObjectReadOptions,
 }
 
 /// Local-FS root vs. S3-compatible root for [`ObjectStoreConfig`].
@@ -986,7 +1044,8 @@ pub async fn backend_from_config(
                     c.format,
                 )?,
             }
-            .with_write_options(c.write_options);
+            .with_write_options(c.write_options)
+            .with_read_options(c.read_options);
             Ok(std::sync::Arc::new(backend))
         }
         BackendConfig::Delta(c) => {

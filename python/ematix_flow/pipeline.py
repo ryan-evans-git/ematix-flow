@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 
 from ematix_flow import _core
@@ -362,6 +362,266 @@ class ScheduledPipeline:
 
 _REGISTRY: dict[str, ScheduledPipeline] = {}
 
+# ---- Phase Ω.1 — pipeline DAG side-tables --------------------------
+#
+# Three small side-tables keep the DAG state out of `ScheduledPipeline`
+# (which stays frozen + serializable). They live alongside `_REGISTRY`
+# and are reset together. In-process only — durable run-history is
+# Phase Ω.D1a's job.
+#
+#   _DEPENDS_ON[pipeline_name]              = list of upstream names
+#   _UPSTREAM_FRESHNESS[pipeline_name]      = max age of upstream's
+#                                             last successful run in
+#                                             seconds, or None for ∞
+#   _LAST_RUN[pipeline_name]                = (timestamp, success)
+#                                             populated by
+#                                             `run_due_with_dag`
+_DEPENDS_ON: dict[str, list[str]] = {}
+_UPSTREAM_FRESHNESS: dict[str, int | None] = {}
+_LAST_RUN: dict[str, tuple[datetime, bool]] = {}
+
+
+# Phase Ω.2 — declarative retry policy + in-process attempt state.
+#
+#   _RETRY_POLICY[name]     = RetryPolicy describing the retry shape
+#   _ATTEMPT_STATE[name]    = AttemptState tracking the current retry
+#                             cycle. Cleared on a successful run.
+#
+# In-process scope only. Durable per-attempt history is Phase Ω.D1a.
+
+
+@dataclass(frozen=True)
+class RetryPolicy:
+    """Per-pipeline retry shape.
+
+    `max_attempts`: total invocations allowed, including the first.
+      1 means "no retries" (matches the default).
+    `backoff`: one of "fixed" | "linear" | "exponential".
+    `base_secs`: backoff window after the first failure. Linear and
+      exponential variants scale this.
+    `max_backoff_secs`: ceiling on the window for any single retry.
+      None disables the ceiling.
+    """
+
+    max_attempts: int = 1
+    backoff: str = "fixed"
+    base_secs: int = 0
+    max_backoff_secs: int | None = None
+
+
+@dataclass
+class AttemptState:
+    """In-process state of an in-flight retry cycle.
+
+    `attempt_count`: how many invocations have happened in this cycle,
+      including the original failed attempt.
+    `last_attempt_at`: timestamp of the most recent invocation.
+    `gave_up`: True once `attempt_count` has reached `max_attempts`
+      without success. A successful run clears the whole record.
+    """
+
+    attempt_count: int
+    last_attempt_at: datetime
+    gave_up: bool = False
+
+
+_RETRY_POLICY: dict[str, RetryPolicy] = {}
+_ATTEMPT_STATE: dict[str, AttemptState] = {}
+
+
+_VALID_BACKOFFS = {"fixed", "linear", "exponential"}
+
+
+def _build_retry_policy(name: str, raw: dict | None) -> RetryPolicy:
+    """Validate a retry= kwarg and produce a RetryPolicy. Raises
+    ValueError on shape problems so registration fails loud."""
+    if raw is None:
+        return RetryPolicy()
+    max_attempts = int(raw.get("max_attempts", 1))
+    if max_attempts < 1:
+        raise ValueError(
+            f"pipeline {name!r}: retry.max_attempts must be ≥ 1, got {max_attempts}"
+        )
+    backoff = str(raw.get("backoff", "fixed"))
+    if backoff not in _VALID_BACKOFFS:
+        raise ValueError(
+            f"pipeline {name!r}: retry.backoff must be one of "
+            f"{sorted(_VALID_BACKOFFS)}, got {backoff!r}"
+        )
+    base_secs = int(raw.get("base_secs", 0))
+    if base_secs < 0:
+        raise ValueError(
+            f"pipeline {name!r}: retry.base_secs must be ≥ 0, got {base_secs}"
+        )
+    max_backoff_secs = raw.get("max_backoff_secs")
+    if max_backoff_secs is not None:
+        max_backoff_secs = int(max_backoff_secs)
+        if max_backoff_secs < 0:
+            raise ValueError(
+                f"pipeline {name!r}: retry.max_backoff_secs must be ≥ 0 "
+                f"or omitted, got {max_backoff_secs}"
+            )
+    return RetryPolicy(
+        max_attempts=max_attempts,
+        backoff=backoff,
+        base_secs=base_secs,
+        max_backoff_secs=max_backoff_secs,
+    )
+
+
+def _compute_backoff_secs(policy: RetryPolicy, attempt_count: int) -> int:
+    """Backoff window after attempt `attempt_count`. attempt_count=1
+    means "after the first failure", so the window scales from there.
+    The ceiling, if set, caps every variant."""
+    base = policy.base_secs
+    if policy.backoff == "fixed":
+        secs = base
+    elif policy.backoff == "linear":
+        secs = base * attempt_count
+    elif policy.backoff == "exponential":
+        # attempt_count=1 → base; =2 → 2*base; =3 → 4*base; ...
+        secs = base * (2 ** (attempt_count - 1))
+    else:  # defensive — registration filtered this already
+        secs = base
+    if policy.max_backoff_secs is not None and secs > policy.max_backoff_secs:
+        secs = policy.max_backoff_secs
+    return secs
+
+
+def retry_policy_of(name: str) -> RetryPolicy:
+    """Return the RetryPolicy for `name`. KeyError for unknown names."""
+    if name not in _REGISTRY:
+        raise KeyError(name)
+    return _RETRY_POLICY.get(name, RetryPolicy())
+
+
+# Phase Ω.D1a — durable run-history.
+#
+# The concrete RunLog backends live in `ematix_flow.run_log`. The
+# default is the local-file SqliteRunLog; alternates (in-memory,
+# Postgres, S3, Azure Blob, GCS) all satisfy the same Protocol and
+# are interchangeable in `run_due_with_dag(run_log=...)`.
+#
+# `pipeline.RunLog` is kept as a backwards-compat alias for the
+# SQLite backend — the original Ω.D1a name.
+
+
+# Backwards-compat: the original Ω.D1a name lived here. New code
+# should prefer `from ematix_flow.run_log import SqliteRunLog`, but
+# the legacy spelling keeps working.
+from ematix_flow.run_log import SqliteRunLog as RunLog  # noqa: E402
+
+# Phase Ω.3 — operator-facing status view.
+#
+# `status_snapshot()` produces one dict per registered pipeline,
+# summarising the in-process state that Ω.1 and Ω.2 already maintain.
+# It does NOT touch durable run-history — that arrives with Ω.D1a's
+# RunLog. The renderer below turns the snapshot into a fixed-width
+# text table suitable for `flow status` CLI output.
+
+
+def status_snapshot() -> list[dict]:
+    """Return a list of per-pipeline state dicts. Stable order:
+    alphabetical by name. Each row has keys:
+
+      name          : str
+      schedule      : str | None
+      depends_on    : list[str]
+      last_run      : (datetime, bool) | None — None if never run
+      retry_policy  : dict mirroring RetryPolicy fields
+      attempt_state : dict | None, with keys
+                      attempt_count, last_attempt_at,
+                      next_eligible_at, gave_up
+                      (None when no retry cycle is in flight)
+    """
+    rows: list[dict] = []
+    for name in sorted(_REGISTRY):
+        sp = _REGISTRY[name]
+        policy = _RETRY_POLICY.get(name, RetryPolicy())
+        st = _ATTEMPT_STATE.get(name)
+        attempt_state: dict | None = None
+        if st is not None:
+            backoff_secs = _compute_backoff_secs(policy, st.attempt_count)
+            attempt_state = {
+                "attempt_count": st.attempt_count,
+                "last_attempt_at": st.last_attempt_at,
+                "next_eligible_at": st.last_attempt_at + timedelta(seconds=backoff_secs),
+                "gave_up": st.gave_up,
+            }
+        rows.append({
+            "name": name,
+            "schedule": sp.schedule,
+            "depends_on": list(_DEPENDS_ON.get(name, [])),
+            "last_run": _LAST_RUN.get(name),
+            "retry_policy": {
+                "max_attempts": policy.max_attempts,
+                "backoff": policy.backoff,
+                "base_secs": policy.base_secs,
+                "max_backoff_secs": policy.max_backoff_secs,
+            },
+            "attempt_state": attempt_state,
+        })
+    return rows
+
+
+def render_status_table(snapshot: list[dict]) -> str:
+    """Render a `status_snapshot()` result as a fixed-width text table.
+
+    The columns track what an operator wants to see at a glance:
+    name, schedule, last run + outcome, retry status. depends_on is
+    elided when empty to keep the row short.
+    """
+    if not snapshot:
+        return "no pipelines registered"
+
+    header = ("NAME", "SCHEDULE", "LAST RUN", "OUTCOME", "RETRY", "DEPENDS ON")
+    rows: list[tuple[str, ...]] = [header]
+    for r in snapshot:
+        last_run = r["last_run"]
+        if last_run is None:
+            last_run_s = "never"
+            outcome_s = "-"
+        else:
+            ts, ok = last_run
+            # Truncate to seconds; UTC iso with trailing Z is the most
+            # operator-friendly compact form.
+            last_run_s = ts.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+            outcome_s = "ok" if ok else "fail"
+        retry_s = _format_retry_cell(r["retry_policy"], r["attempt_state"])
+        deps_s = ",".join(r["depends_on"]) if r["depends_on"] else "-"
+        rows.append((
+            r["name"],
+            r["schedule"] or "-",
+            last_run_s,
+            outcome_s,
+            retry_s,
+            deps_s,
+        ))
+
+    widths = [max(len(row[i]) for row in rows) for i in range(len(header))]
+    lines = []
+    for i, row in enumerate(rows):
+        line = "  ".join(cell.ljust(widths[j]) for j, cell in enumerate(row))
+        lines.append(line)
+        if i == 0:
+            lines.append("  ".join("-" * w for w in widths))
+    return "\n".join(lines)
+
+
+def _format_retry_cell(policy: dict, state: dict | None) -> str:
+    """One short cell describing retry status for the table."""
+    max_attempts = policy.get("max_attempts", 1)
+    if state is None:
+        if max_attempts <= 1:
+            return "no retry"
+        return f"0/{max_attempts} ({policy['backoff']})"
+    attempt = state["attempt_count"]
+    if state["gave_up"]:
+        return f"{attempt}/{max_attempts} gave up"
+    next_at = state["next_eligible_at"]
+    next_at_s = next_at.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    return f"{attempt}/{max_attempts} next>{next_at_s}"
+
 
 @dataclass(frozen=True)
 class RegisteredTransform:
@@ -483,12 +743,28 @@ def _invoke_transform_callable(
 
 
 def register(
-    *, name: str, schedule: str | None
+    *,
+    name: str,
+    schedule: str | None,
+    depends_on: list[str] | None = None,
+    upstream_freshness_secs: int | None = None,
+    retry: dict | None = None,
 ) -> Callable[[Callable[[], dict[str, Any]]], Callable[[], dict[str, Any]]]:
     """Decorator: register a callable as a scheduled pipeline.
 
     The function should perform a sync (or any work) and return a
     JSON-serializable dict describing what happened.
+
+    Phase Ω.1 keyword arguments:
+      depends_on: list of names of pipelines that must run successfully
+        before this one is eligible. Empty list / None = no upstreams.
+        Each name must already be registered. Self-loops and cycles are
+        rejected at registration time with a clear error pointing at
+        both endpoints.
+      upstream_freshness_secs: max age (seconds) of an upstream's last
+        successful run for this pipeline to count it as fresh. None
+        (the default) = ∞: any prior success counts. Used by
+        `run_due_with_dag` to gate downstream execution.
     """
 
     def decorator(
@@ -498,10 +774,450 @@ def register(
             raise ValueError(
                 f"a pipeline named {name!r} is already registered"
             )
+        upstreams = list(depends_on or [])
+        # Self-loop.
+        if name in upstreams:
+            raise ValueError(
+                f"pipeline {name!r} depends on itself; "
+                f"a self-cycle of length 1 is not allowed"
+            )
+        # All upstreams must already be registered.
+        for u in upstreams:
+            if u not in _REGISTRY:
+                raise ValueError(
+                    f"pipeline {name!r} declares depends_on={u!r} but "
+                    f"no pipeline named {u!r} has been registered yet — "
+                    f"order your decorators so upstreams register first"
+                )
+        # Cycle detection. With name->upstreams as a forward graph,
+        # check that none of `upstreams` (or anything they transitively
+        # depend on) is `name`. Returns the offending cycle path on hit.
+        cycle = _find_cycle_path(start=name, frontier=upstreams)
+        if cycle is not None:
+            raise ValueError(
+                f"pipeline {name!r} would create a dependency cycle: "
+                f"{' → '.join(cycle)} (rejected at registration time)"
+            )
+        # Validate retry= up front so a malformed policy doesn't make
+        # it into the registry.
+        policy = _build_retry_policy(name, retry)
         _REGISTRY[name] = ScheduledPipeline(name=name, schedule=schedule, fn=fn)
+        _DEPENDS_ON[name] = upstreams
+        if upstream_freshness_secs is not None:
+            _UPSTREAM_FRESHNESS[name] = upstream_freshness_secs
+        # Always populate so retry_policy_of returns the validated
+        # policy (the default RetryPolicy for unset cases).
+        _RETRY_POLICY[name] = policy
         return fn
 
     return decorator
+
+
+def _find_cycle_path(*, start: str, frontier: list[str]) -> list[str] | None:
+    """Returns a `start → ... → start` cycle path if one of `frontier`
+    can transitively reach `start`. Returns None if the graph is
+    acyclic when extended with edges `start → frontier`.
+    """
+    # DFS each frontier node; if any path reaches `start`, return the
+    # path including the original `start`.
+    for f in frontier:
+        path = _dfs_path(src=f, target=start)
+        if path is not None:
+            return [start, *path]
+    return None
+
+
+def _dfs_path(*, src: str, target: str) -> list[str] | None:
+    """DFS the _DEPENDS_ON forward graph from `src`; if any walk
+    reaches `target`, return the path. None if no path exists.
+    """
+    stack: list[tuple[str, list[str]]] = [(src, [src])]
+    seen: set[str] = set()
+    while stack:
+        node, path = stack.pop()
+        if node == target:
+            return path
+        if node in seen:
+            continue
+        seen.add(node)
+        for up in _DEPENDS_ON.get(node, []):
+            stack.append((up, [*path, up]))
+    return None
+
+
+def depends_on_of(name: str) -> list[str]:
+    """Return the upstream list for `name`. Empty list for pipelines
+    with no declared dependencies. KeyError for unknown names."""
+    if name not in _REGISTRY:
+        raise KeyError(name)
+    return list(_DEPENDS_ON.get(name, []))
+
+
+def upstream_freshness_secs_of(name: str) -> int | None:
+    """Return the `upstream_freshness_secs` for `name`, or None for ∞."""
+    if name not in _REGISTRY:
+        raise KeyError(name)
+    return _UPSTREAM_FRESHNESS.get(name)
+
+
+def order_for_run_due(names: list[str]) -> list[str]:
+    """Topo-sort the subset `names` so upstreams appear before
+    downstreams. Edges OUTSIDE the subset are ignored: e.g. if `b`
+    depends on `a` and only `b` is in `names`, the returned order is
+    `[b]` (caller's responsibility to handle the missing upstream
+    via the freshness gate in `run_due_with_dag`).
+
+    The input order is preserved among nodes with the same depth, so
+    callers get stable output.
+    """
+    name_set = set(names)
+    # Forward graph restricted to names; reverse edges = "downstreams
+    # of x within the subset".
+    in_degree: dict[str, int] = {n: 0 for n in names}
+    downstream: dict[str, list[str]] = {n: [] for n in names}
+    for n in names:
+        for u in _DEPENDS_ON.get(n, []):
+            if u in name_set:
+                in_degree[n] += 1
+                downstream[u].append(n)
+    # Kahn's algorithm — preserve original input order across ties.
+    queue: list[str] = [n for n in names if in_degree[n] == 0]
+    out: list[str] = []
+    while queue:
+        n = queue.pop(0)
+        out.append(n)
+        for d in downstream[n]:
+            in_degree[d] -= 1
+            if in_degree[d] == 0:
+                queue.append(d)
+    if len(out) != len(names):
+        # Should be impossible because cycles are rejected at
+        # registration, but defend anyway with a clear error.
+        leftover = [n for n in names if n not in out]
+        raise ValueError(
+            f"order_for_run_due: cycle detected involving {leftover} — "
+            f"this shouldn't happen given registration-time checks; "
+            f"please file a bug"
+        )
+    return out
+
+
+def _upstream_is_fresh(downstream_name: str, now: datetime) -> bool:
+    """For each declared upstream of `downstream_name`, check that
+    `_LAST_RUN[upstream]` exists, is a success, and was within the
+    declared freshness window. Returns True iff all upstreams pass.
+    """
+    upstreams = _DEPENDS_ON.get(downstream_name, [])
+    if not upstreams:
+        return True
+    max_age_secs = _UPSTREAM_FRESHNESS.get(downstream_name)  # None = ∞
+    for up in upstreams:
+        rec = _LAST_RUN.get(up)
+        if rec is None:
+            return False
+        ts, ok = rec
+        if not ok:
+            return False
+        if max_age_secs is not None:
+            age = (now - ts).total_seconds()
+            if age > max_age_secs:
+                return False
+    return True
+
+
+# ---- Detailed run-due result types (Phase Ω.D2) ------------------------
+
+
+@dataclass(frozen=True)
+class FiredEvent:
+    """One pipeline that ran successfully in this invocation."""
+
+    name: str
+    result: Any  # whatever the callable returned (dict or otherwise)
+
+
+@dataclass(frozen=True)
+class FailedEvent:
+    """One pipeline that ran but raised."""
+
+    name: str
+    error_message: str
+    error_type: str  # e.g. "RuntimeError"
+    attempt_count: int  # which attempt this was (1 = first)
+    gave_up: bool      # True iff attempt_count == max_attempts
+
+
+@dataclass(frozen=True)
+class SkippedEvent:
+    """One pipeline that didn't run at all (upstream stale, retry
+    backoff, or gave-up)."""
+
+    name: str
+    reason: str  # human-readable; e.g. "retry backoff (next at ...)"
+
+
+@dataclass(frozen=True)
+class RunDueResult:
+    """Per-pipeline outcomes from one `run_due_with_dag` invocation.
+
+    Three disjoint lists. Order matches topo-sort order so an operator
+    reading the JSON can see the DAG progression.
+    """
+
+    fired: list[FiredEvent]
+    failed: list[FailedEvent]
+    skipped: list[SkippedEvent]
+
+
+def run_due_with_dag_detailed(
+    due: list[str],
+    *,
+    now: datetime | None = None,
+    run_log: RunLog | None = None,
+    alerters: list | None = None,
+    metrics=None,
+) -> RunDueResult:
+    """Like `run_due_with_dag` but returns a structured `RunDueResult`
+    with full per-pipeline outcome detail. The CLI uses this to build
+    its ran/failed/skipped JSON output.
+
+    Same semantics as `run_due_with_dag`:
+      1. Topo-sort `due` so upstreams-in-the-subset go first.
+      2. For each pipeline:
+         a. Skip if a declared upstream isn't fresh (Ω.1).
+         b. Skip if mid retry-backoff or gave-up (Ω.2).
+         c. Otherwise fire; record outcome to `_LAST_RUN` and (if
+            provided) the durable `run_log`.
+    """
+    if now is None:
+        now = datetime.now(_tz_utc())
+    ordered = order_for_run_due(list(due))
+
+    fired: list[FiredEvent] = []
+    failed: list[FailedEvent] = []
+    skipped: list[SkippedEvent] = []
+
+    for name in ordered:
+        if not _upstream_is_fresh(name, now):
+            stale = [
+                u for u in _DEPENDS_ON.get(name, [])
+                if not _one_upstream_is_fresh(u, _UPSTREAM_FRESHNESS.get(name), now)
+            ]
+            skipped.append(SkippedEvent(
+                name=name,
+                reason=f"upstream not fresh: {','.join(stale) or '(unknown)'}",
+            ))
+            _safe_metric(metrics, "inc_runs", name, "skipped")
+            continue
+
+        # Ω.2: retry-backoff gate.
+        st = _ATTEMPT_STATE.get(name)
+        policy = _RETRY_POLICY.get(name, RetryPolicy())
+        if st is not None:
+            if st.gave_up:
+                skipped.append(SkippedEvent(
+                    name=name,
+                    reason=(
+                        f"gave up after {st.attempt_count} retry attempts "
+                        f"(max_attempts={policy.max_attempts})"
+                    ),
+                ))
+                _safe_metric(metrics, "inc_runs", name, "skipped")
+                continue
+            backoff_secs = _compute_backoff_secs(policy, st.attempt_count)
+            next_eligible = st.last_attempt_at + timedelta(seconds=backoff_secs)
+            if now < next_eligible:
+                eligible_iso = (
+                    next_eligible.replace(microsecond=0)
+                    .isoformat()
+                    .replace("+00:00", "Z")
+                )
+                skipped.append(SkippedEvent(
+                    name=name,
+                    reason=(
+                        f"retry backoff (attempt {st.attempt_count}/"
+                        f"{policy.max_attempts}; next eligible at "
+                        f"{eligible_iso})"
+                    ),
+                ))
+                _safe_metric(metrics, "inc_runs", name, "skipped")
+                continue
+
+        sp = _REGISTRY.get(name)
+        if sp is None:
+            raise KeyError(name)
+        ret: Any = None
+        success = False
+        err: Exception | None = None
+        started_at = datetime.now(_tz_utc())
+        try:
+            ret = sp.fn()
+            success = True
+        except Exception as e:
+            err = e
+            success = False
+        completed_at = datetime.now(_tz_utc())
+        duration_secs = (completed_at - started_at).total_seconds()
+        _LAST_RUN[name] = (completed_at, success)
+        if run_log is not None:
+            run_log.record_run(name, completed_at, success)
+        _safe_metric(metrics, "observe_duration", name, duration_secs)
+        if success:
+            prev = _ATTEMPT_STATE.get(name)
+            fired.append(FiredEvent(name=name, result=ret))
+            _ATTEMPT_STATE.pop(name, None)
+            if run_log is not None:
+                run_log.clear_attempt_state(name)
+            _safe_metric(metrics, "inc_runs", name, "success")
+            # Recovery → attempt gauge resets to 0.
+            _safe_metric(metrics, "set_attempt", name, 0)
+            # Recovery event: if a retry cycle was in flight (prev had
+            # attempt_count >= 1) and now we succeeded, push a
+            # `recovered` event so alerters can close the loop.
+            if prev is not None and prev.attempt_count >= 1:
+                _fan_out_alert(
+                    alerters,
+                    AlertEvent_local(
+                        kind="recovered",
+                        pipeline=name,
+                        timestamp=completed_at,
+                        attempt_count=prev.attempt_count + 1,
+                        max_attempts=policy.max_attempts,
+                    ),
+                )
+        else:
+            prev = _ATTEMPT_STATE.get(name)
+            attempt_count = (prev.attempt_count if prev else 0) + 1
+            gave_up = attempt_count >= policy.max_attempts
+            new_state = AttemptState(
+                attempt_count=attempt_count,
+                last_attempt_at=now,
+                gave_up=gave_up,
+            )
+            _ATTEMPT_STATE[name] = new_state
+            if run_log is not None:
+                run_log.record_attempt(name, new_state)
+            _safe_metric(metrics, "inc_runs", name, "failure")
+            _safe_metric(metrics, "set_attempt", name, attempt_count)
+            err_msg = str(err) if err else ""
+            err_type = type(err).__name__ if err else "Exception"
+            failed.append(FailedEvent(
+                name=name,
+                error_message=err_msg,
+                error_type=err_type,
+                attempt_count=attempt_count,
+                gave_up=gave_up,
+            ))
+            # Always emit a `failed` event; emit an additional
+            # `gave_up` if this attempt exhausted max_attempts.
+            _fan_out_alert(
+                alerters,
+                AlertEvent_local(
+                    kind="failed",
+                    pipeline=name,
+                    timestamp=completed_at,
+                    error_message=err_msg,
+                    error_type=err_type,
+                    attempt_count=attempt_count,
+                    max_attempts=policy.max_attempts,
+                    gave_up=gave_up,
+                ),
+            )
+            if gave_up:
+                _fan_out_alert(
+                    alerters,
+                    AlertEvent_local(
+                        kind="gave_up",
+                        pipeline=name,
+                        timestamp=completed_at,
+                        error_message=err_msg,
+                        error_type=err_type,
+                        attempt_count=attempt_count,
+                        max_attempts=policy.max_attempts,
+                        gave_up=True,
+                    ),
+                )
+
+    return RunDueResult(fired=fired, failed=failed, skipped=skipped)
+
+
+def _safe_metric(sink, method: str, *args) -> None:
+    """Call `sink.<method>(*args)` swallowing any exception, so a
+    buggy metrics backend can't poison the orchestrator loop. No-op
+    when `sink` is None."""
+    if sink is None:
+        return
+    try:
+        getattr(sink, method)(*args)
+    except Exception as e:
+        import sys
+        print(
+            f"warning: metrics sink {type(sink).__name__}.{method} raised: "
+            f"{type(e).__name__}: {e}",
+            file=sys.stderr,
+        )
+
+
+def _fan_out_alert(alerters, event) -> None:
+    """Notify each alerter, swallowing any exceptions so a buggy
+    alerter can't poison the orchestrator loop."""
+    if not alerters:
+        return
+    import sys
+    for a in alerters:
+        try:
+            a.notify(event)
+        except Exception as e:
+            print(
+                f"warning: alerter {type(a).__name__} raised on notify: "
+                f"{type(e).__name__}: {e}",
+                file=sys.stderr,
+            )
+
+
+def AlertEvent_local(**kwargs):
+    """Lazy import of AlertEvent to avoid loading alerters at
+    pipeline.py module-import time."""
+    from ematix_flow.alerters import AlertEvent
+    return AlertEvent(**kwargs)
+
+
+def _one_upstream_is_fresh(
+    upstream: str, max_age_secs: int | None, now: datetime
+) -> bool:
+    """Per-upstream variant of `_upstream_is_fresh`. Surfacing this
+    so the CLI / detailed result can name exactly which upstreams
+    are stale."""
+    rec = _LAST_RUN.get(upstream)
+    if rec is None:
+        return False
+    ts, ok = rec
+    if not ok:
+        return False
+    if max_age_secs is None:
+        return True
+    return (now - ts).total_seconds() <= max_age_secs
+
+
+def run_due_with_dag(
+    due: list[str],
+    *,
+    now: datetime | None = None,
+    run_log: RunLog | None = None,
+) -> list[str]:
+    """Legacy entry point: run the pipelines in `due`, return the names
+    that fired successfully. Built on `run_due_with_dag_detailed` —
+    same semantics, narrower return type for back-compat with
+    callers from Ω.1/Ω.2/Ω.D1a tests.
+    """
+    result = run_due_with_dag_detailed(due, now=now, run_log=run_log)
+    return [e.name for e in result.fired]
+
+
+def _tz_utc():
+    """Return the UTC tzinfo without importing datetime.timezone at
+    the module top (kept lean for import-time)."""
+    return UTC
 
 
 def list_pipelines() -> list[ScheduledPipeline]:

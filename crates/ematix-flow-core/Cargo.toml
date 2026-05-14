@@ -23,6 +23,9 @@ uuid.workspace = true
 futures-util.workspace = true
 bytes.workspace = true
 async-trait = "0.1"
+# Π.4a: CsvReadOptions.null_regex compiles to a regex::Regex which
+# the arrow-csv reader's with_null_regex consumes.
+regex = "1"
 arrow-array = { workspace = true }
 arrow-schema = { workspace = true }
 arrow-csv = { workspace = true }
@@ -34,6 +37,14 @@ rusqlite = { workspace = true }
 mysql_async = { workspace = true }
 object_store = { workspace = true }
 parquet = { workspace = true }
+# ematix-parquet sibling repo — hand-rolled parquet decoder with
+# NEON-fused predicate kernels. Wired into `ematix_parquet_bridge`
+# to produce Arrow arrays from column chunks without going through
+# parquet-rs's ParquetRecordBatchReader. Long-term: alternate backend
+# for FastParquetExec.
+ematix-parquet-codec = { git = "https://github.com/ryan-evans-git/ematix-parquet.git", rev = "63b6954" }
+ematix-parquet-format = { git = "https://github.com/ryan-evans-git/ematix-parquet.git", rev = "63b6954" }
+ematix-parquet-io = { git = "https://github.com/ryan-evans-git/ematix-parquet.git", rev = "63b6954" }
 deltalake = { workspace = true }
 datafusion = { workspace = true }
 cranelift = { workspace = true }
@@ -86,6 +97,13 @@ criterion = { workspace = true }
 # path. Pinned to the same major track as arrow-array so the ABI
 # matches.
 arrow-select = "58"
+# Used by the TPC-H bench examples as `#[global_allocator]`. macOS's
+# default malloc serializes on a global lock and was caught making
+# Q13 SF=10 catastrophic (5.95s) under the high-concurrency, large-
+# allocation pattern the v4-streaming change introduces; switching to
+# mimalloc here turns Q13 into a +33% win (152 ms vs DF default 226 ms).
+# Per-thread arenas + better fragmentation policy. Polars uses it too.
+mimalloc = { version = "0.1", default-features = false }
 # Σ.A1 PR 1: TPC-H generator + reference answers (used by the
 # `tpch_smoke` integration test and the `tpch_generate` example).
 # See workspace.dependencies for full rationale.
@@ -125,4 +143,138 @@ path = "examples/tpch_q6_tune.rs"
 [[example]]
 name = "tpcds_dialect_audit"
 path = "examples/tpcds_dialect_audit.rs"
+
+# Σ.E2 diagnostic: compare the in-memory Arrow array layout of the
+# first batch from DataFusion's default parquet path vs the
+# `FastParquetTableProvider`. Used to test whether Q01's persistent
+# downstream slowdown comes from differing array encodings.
+[[example]]
+name = "fast_parquet_array_diff"
+path = "examples/fast_parquet_array_diff.rs"
+
+# Σ.D3 phase A-D: hand-coded vs Cranelift-JIT'd inner loops for the
+# three fused-exec shapes (Q6, Q1, Q14 post-join). End-to-end timing
+# over real SF=1 parquet data, with bit-identical equivalence checks
+# between the two paths before timing.
+[[example]]
+name = "tpch_fused_jit_bench"
+path = "examples/tpch_fused_jit_bench.rs"
+
+# Σ.D3 phase E: FusedQ14FullExec end-to-end SF=1 timing. Closes the
+# only outright Polars win in the README's main TPC-H table (Q14 =
+# 12.53 ms in Polars vs ~17 ms via FastParquet alone) by collapsing
+# scan + filter + join + dual-SUM-with-CASE-WHEN into one parallel
+# pass over a direct-indexed promo bitmap.
+[[example]]
+name = "tpch_q14_full_bench"
+path = "examples/tpch_q14_full_bench.rs"
+
+# ematix-parquet ↔ ematix-flow integration POC. Runs Q14 entirely via
+# our sibling-repo kernels for lineitem column decode (Phase 5 fused-
+# NEON filter + Phase 6 bitmap-driven sparse gather) + parquet-rs for
+# the small part table. No DataFusion. Establishes the hard floor for
+# Q14 wall-clock with our kernels and tells us whether full integration
+# as a TableProvider is worth the engineering investment.
+[[example]]
+name = "tpch_q14_ematix_lever"
+path = "examples/tpch_q14_ematix_lever.rs"
+
+# Phase 3.5: Q14-shape SQL through 3 providers — register_parquet,
+# FastParquetTableProvider, EmatixFastParquetTableProvider with the
+# Phase 3 Date32 predicate pushdown. Measures wall-clock impact of
+# the pushdown chain (Phase 5 fused-NEON + Phase 6 sparse-gather)
+# end-to-end through DataFusion.
+[[example]]
+name = "tpch_q14_emat_provider_bench"
+path = "examples/tpch_q14_emat_provider_bench.rs"
+
+# Σ.E2 follow-up: probe parquet-rs `with_row_filter` against Q14's
+# single-Date32 predicate, deciding whether late materialization is
+# the right next lever for FastParquet (broad TPC-H impact). The
+# day-3 probe rejected `with_row_filter` for Q6's compound predicate;
+# this one tests whether the cheaper Q14-shape predicate flips it.
+[[example]]
+name = "parquet_rs_late_mat_q14"
+path = "examples/parquet_rs_late_mat_q14.rs"
+
+# Σ.D3 phase D (real): dump the DataFusion physical plan for Q6 to
+# learn the exact node shape the SQL-pattern auto-injection rule
+# needs to match.
+[[example]]
+name = "tpch_q6_plan_dump"
+path = "examples/tpch_q6_plan_dump.rs"
+
+# Σ.D3 phase D (real): bench Q6 with and without InjectFusedQ6Rule
+# registered. Same SQL, only difference is whether the rule rewrites
+# the Filter+Aggregate stack into a single FusedFilterSumExec.
+[[example]]
+name = "tpch_q6_inject_bench"
+path = "examples/tpch_q6_inject_bench.rs"
+
+# Σ.D3 phase D follow-up: dump the DataFusion physical plan for Q1
+# (group-by + 4 SUMs + 3 AVGs + COUNT) to learn the node tree the
+# InjectFusedQ1Rule pattern detector needs to match.
+[[example]]
+name = "tpch_q1_plan_dump"
+path = "examples/tpch_q1_plan_dump.rs"
+
+# Σ.D3 phase D (Q1 variant): bench Q1 with and without InjectFusedQ1Rule
+# registered. Group-by version of `tpch_q6_inject_bench` — Q1's
+# downstream HashAggregate stack is heavier so the fused replacement
+# has more headroom.
+[[example]]
+name = "tpch_q1_inject_bench"
+path = "examples/tpch_q1_inject_bench.rs"
+
+# Σ.D3 phase D (Q14 variant): dump the canonical Q14 plan shape
+# (scan + filter + JOIN + dual-SUM-with-CASE-WHEN) so the future
+# InjectFusedQ14Rule detector can match it exactly.
+[[example]]
+name = "tpch_q14_plan_dump"
+path = "examples/tpch_q14_plan_dump.rs"
+
+# Σ.D3 phase D (Q14 variant): bench Q14 with and without
+# InjectFusedQ14Rule registered.
+[[example]]
+name = "tpch_q14_inject_bench"
+path = "examples/tpch_q14_inject_bench.rs"
+
+# Σ.D3 phase D (Q14 variant) diagnostic: dump the Q14 plan AFTER
+# InjectFusedQ14Rule runs.
+[[example]]
+name = "tpch_q14_inject_plan_dump"
+path = "examples/tpch_q14_inject_plan_dump.rs"
+
+# Σ.D3 phase D (Q3/Q5): dump canonical plan shapes for the
+# post-join-aggregate rules.
+[[example]]
+name = "tpch_q3q5_plan_dump"
+path = "examples/tpch_q3q5_plan_dump.rs"
+
+# Σ.D3 phase D (Q3/Q5): bench Q3 and Q5 with their auto-injection
+# rules registered. Both rules replace the post-join aggregate stack
+# with FusedPostJoinExec.
+[[example]]
+name = "tpch_q3q5_inject_bench"
+path = "examples/tpch_q3q5_inject_bench.rs"
+
+# Σ.D3 phase D (Q12): dump canonical Q12 plan shape (join + complex
+# filter + 2-group hash agg with CASE-WHEN over o_orderpriority).
+[[example]]
+name = "tpch_q12_plan_dump"
+path = "examples/tpch_q12_plan_dump.rs"
+
+# Σ.D3 phase D (Q12): bench Q12 with and without InjectFusedQ12Rule.
+[[example]]
+name = "tpch_q12_inject_bench"
+path = "examples/tpch_q12_inject_bench.rs"
+
+# Σ.E2 follow-up: probe whether SF=1 lineitem.parquet has page-level
+# column/offset indexes, and if so what fraction of pages overlap
+# Q14's shipdate window. If overlap is small, page-index pruning is
+# the lever to close the Q14 gap to Polars (cheaper than forking
+# parquet-rs).
+[[example]]
+name = "parquet_page_index_probe"
+path = "examples/parquet_page_index_probe.rs"
 

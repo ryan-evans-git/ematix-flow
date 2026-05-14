@@ -21,7 +21,7 @@ durable state recovery.
 3. [Surface 1: declarative Postgres](#surface-1-declarative-postgres-pipelines) — original v0.1.
 4. [Surface 2: streaming pipelines](#surface-2-streaming-pipelines) — Phases 30–38.
 5. [Surface 3: stream processing](#surface-3-stream-processing) — Phase 39 (transforms, windows, sessions, joins).
-6. [Operations](#operations) — metrics, restart, DLQ, schema evolution.
+6. [Operations](#operations) — RunLog backends, alerters, metrics sinks, restart, DLQ, schema evolution.
 7. [Troubleshooting](#troubleshooting).
 
 ---
@@ -181,9 +181,49 @@ Run it:
 ```sh
 flow run-due --module my_pipelines           # cron-style: fire schedules in last interval
 flow run     --module my_pipelines ingest_events  # one-shot
+flow status  --module my_pipelines           # per-pipeline status / next-due / attempts
 flow preview --module my_pipelines ingest_events  # what would it do?
 flow validate --module my_pipelines ingest_events # EXPLAIN against the DB
 ```
+
+### Dependencies + retry (Ω.1 / Ω.2)
+
+Pipelines can declare upstream dependencies and a per-pipeline
+retry policy. `flow run-due` is DAG-aware: it topologically orders
+fires, skips downstream pipelines when an upstream fails today,
+and applies exponential backoff between attempts.
+
+```python
+@ematix.pipeline(
+    target=Events,
+    schedule="*/5 * * * *",
+    mode="append",
+    retry={
+        "max_attempts": 5,
+        "backoff_seconds": 30,
+        "backoff_factor": 2.0,        # 30s, 60s, 120s, 240s, 480s
+    },
+)
+def ingest_events(conn):
+    return "SELECT event_id, name, received_at FROM raw.events"
+
+@ematix.pipeline(
+    target=DailyRollups,
+    schedule="0 2 * * *",
+    mode="merge",
+    depends_on=["ingest_events"],     # waits for today's success
+)
+def daily_rollups(conn):
+    return "SELECT date_trunc('day', received_at) AS d, COUNT(*) AS n " \
+           "FROM analytics.events GROUP BY 1"
+```
+
+Cycles are caught at module-load time (`CycleError` with the
+offending ring). When `daily_rollups` fires before
+`ingest_events` succeeds today, `run-due` skips it and records a
+skip event in the RunLog so `flow status` shows *waiting on
+upstream*. Attempt state survives process restarts when a durable
+[RunLog](#durable-run-history-runlog) is configured.
 
 ### SCD2 with event-time
 
@@ -483,9 +523,13 @@ write failure surfaces the first error; targets that already wrote
 keep their data (at-least-once across the fan-out — duplicates
 absorbed by idempotent targets).
 
-### Object-store target write options (Π.1.4)
+### Object-store target options (Π.1.4 + Π.4)
 
-Object-store targets accept per-format write options on `Target`:
+Object-store targets accept per-format write *and* read options on
+`Target`. Π.1.4 shipped Parquet compression + the basic CSV
+write knobs; Π.4 added the full CSV/JSON read surface and the
+remaining CSV write parity (`csv_quote`, `csv_escape`,
+`csv_null_value`).
 
 ```python
 from ematix_flow import (
@@ -509,12 +553,79 @@ run_streaming_pipeline(
 )
 ```
 
-CSV targets accept `csv_delimiter=";"` and `csv_header=False` (both
-default to comma + header on). The typed-Python boundary catches
-shape mismatches early — setting `parquet_compression` on a CSV
-target (or vice versa) raises immediately, before TOML round-trip.
+**CSV write options.** Defaults match Arrow: comma delimiter,
+header on, double-quote quoting, doubled-quote escape, empty-string
+null rendering.
 
-The TOML equivalent:
+```python
+Target(
+    connection=lake,
+    prefix="events/csv",
+    csv_delimiter=";",           # Π.1.4
+    csv_header=False,            # Π.1.4
+    csv_quote="'",               # Π.4e — single ASCII char
+    csv_escape="\\",             # Π.4e — single ASCII char
+    csv_null_value="\\N",        # Π.4e — how null cells render on write
+)
+```
+
+**CSV read options** apply to schema inference *and* the row
+decoder, so a file written with one dialect can be read back with
+the same one:
+
+```python
+Target(
+    connection=lake,
+    prefix="events/csv",
+    csv_read_options={
+        "has_header": True,
+        "delimiter": ",",        # single ASCII char
+        "quote": '"',
+        "escape": "\\",
+        "comment": "#",          # ignore lines starting with `#`
+        "null_regex": r"^(NA|NULL|\\N)$",
+        "truncated_rows_ok": False,
+        "schema_infer_max_records": 4096,
+    },
+)
+```
+
+**JSON / JSON-lines read options:**
+
+```python
+Target(
+    connection=lake,
+    prefix="events/json",
+    json_read_options={
+        "schema_infer_max_records": 4096,
+        "batch_size": 8192,
+    },
+)
+```
+
+The typed-Python boundary catches shape mismatches early — setting
+`parquet_compression` on a CSV target, or `csv_read_options` on a
+Parquet target, raises immediately before TOML round-trip.
+
+**Format auto-detection** for a file path or URL — useful when
+building a connection from data dropped into a watch directory:
+
+```python
+from ematix_flow.connections import format_from_path
+
+format_from_path("s3://bucket/year=2026/events.csv.gz")  # → "csv"
+format_from_path("logs.ndjson")                          # → "json_lines"
+format_from_path("data.parquet")                         # → "parquet"
+format_from_path("unknown.xml")                          # → None
+```
+
+Recognized: `.parquet` / `.pq`, `.csv` / `.tsv`, `.json` /
+`.jsonl` / `.ndjson`, `.orc`. The matcher strips `.gz` / `.bz2` /
+`.zst` / `.lz4` / `.snappy` first so a `.csv.gz` URL still
+classifies as CSV. URLs with query strings (`?download=true`) are
+not stripped — strip them before calling if you need that case.
+
+The TOML equivalent of the write block:
 
 ```toml
 [target]
@@ -523,11 +634,17 @@ path = "/data/lake"
 format = "parquet"
 prefix = "events/raw"
 parquet_compression = "zstd"
+
+[target.read_options.csv]
+has_header  = true
+delimiter   = 44                  # ord(',')
+null_regex  = "^(NA|NULL)$"
+schema_infer_max_records = 4096
 ```
 
 Parquet readers handle compression transparently from file metadata,
-so existing `read_arrow_stream` callers don't change. Compression
-applies to writes only.
+so existing `read_arrow_stream` callers don't change. CSV/JSON read
+options are honored by both schema inference and the row decoder.
 
 ---
 
@@ -1427,6 +1544,100 @@ catalogues every extension's design + effort estimate.
 ---
 
 ## Operations
+
+### Durable run history (RunLog)
+
+Every `flow run-due` invocation appends a record per pipeline
+firing — status, row counts, attempt count, error message, metrics
+JSON — to the configured RunLog. Pick the backend with the
+`--run-log <url>` flag (same URL form as `@ematix.connection`
+DSNs).
+
+| Scheme | Backend | Typical fit |
+|---|---|---|
+| `sqlite://path/to/run_log.db` | SQLite (default) | Single-process / single-host. |
+| `memory://` | In-memory | Tests; lost on exit. |
+| `postgres://user:pw@host/db` | Postgres | Multi-host cron fan-out. |
+| `mysql://user:pw@host/db` | MySQL | Same shape as Postgres. |
+| `duckdb://path/to/run_log.duckdb` | DuckDB | Local analytical inspection. |
+| `s3://bucket/prefix?region=...` | S3 (AWS) | Lambda / serverless. |
+| `azureblob://account/container/prefix` | Azure Blob | Azure Functions. |
+| `gcs://bucket/prefix` | GCS | Cloud Run / Functions. |
+
+```sh
+flow run-due --module my_pipelines \
+    --run-log postgres://flow:pw@logdb/flow_history
+```
+
+Postgres/MySQL backends auto-create the `ematix_flow` schema and
+the run-log tables on first use; pass `create_tables=false` in the
+URL query string to opt out (e.g. when DDL is managed by a
+migration tool). When the configured location is unwritable
+(read-only FS, missing credentials), `flow` warns and continues —
+orchestration stays alive even with the durable layer down.
+
+After-the-fact inspection:
+
+```sh
+flow runs list --run-log postgres://flow:pw@logdb/flow_history
+flow status   --run-log postgres://flow:pw@logdb/flow_history
+```
+
+`flow status` reads the RunLog plus the in-process registry and
+prints a per-pipeline table: last status, last error, attempt
+count, next-due, and waiting-on-upstream state from the DAG.
+
+The RunLog is also what makes the `retry` policy survive process
+restarts — attempt state is reloaded from the backend at startup,
+so a `max_attempts=5` policy doesn't reset just because the cron
+worker rolled.
+
+### Alerters
+
+`--alerter <url>` (repeatable) attaches one or more event sinks
+for pipeline failures and recoveries.
+
+| Scheme | Effect |
+|---|---|
+| `stdout://` | Pretty lines on stderr. |
+| `slack://hooks.slack.com/services/...` | POSTs to a Slack incoming webhook. |
+
+```sh
+flow run-due --module my_pipelines \
+    --run-log postgres://... \
+    --alerter slack://hooks.slack.com/services/T000/B000/XXXX \
+    --alerter stdout://
+```
+
+Buggy alerters are fault-isolated — any exception is logged and
+swallowed, never crashes the orchestrator. The recovery event
+("pipeline X succeeded after N failed attempts") fires only when
+the previous attempt-count was ≥ 1, so first-time successes don't
+spam your channel.
+
+### Metrics sinks
+
+`--metrics <url>` exports per-pipeline run counters, durations,
+and current attempt-state for declarative pipelines. This is
+separate from the streaming-daemon `--metrics-port` (which serves
+Prometheus for the long-running consumer).
+
+| Scheme | Effect |
+|---|---|
+| `null://` | Drop everything (default). |
+| `stdout://` | Pretty-print on flush. |
+| `memory://` | In-process counters; readable from Python tests. |
+| `prometheus://:9100` | `/metrics` endpoint on the given port. |
+| `otlp://collector:4318` | OTel HTTP exporter. |
+
+```sh
+flow run-due --module my_pipelines \
+    --metrics prometheus://:9100
+```
+
+Full operator-deployment recipes (per environment, with example
+URLs and the right pyproject extras for each backend):
+[`docs/DEPLOYMENT.md`](DEPLOYMENT.md).
 
 ### Prometheus metrics
 

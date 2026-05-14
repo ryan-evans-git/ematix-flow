@@ -73,12 +73,24 @@ pub struct FusedFilterSumExec {
     predicate: Q6Predicate,
     schema: SchemaRef,
     properties: Arc<PlanProperties>,
+    /// Optional spec-driven Cranelift JIT path. When `Some(jit)`, the
+    /// `execute()` shard loop calls into the JIT'd function instead of
+    /// the hand-coded Rust inner loop. Built once at construction —
+    /// JIT codegen takes ~1 ms which is amortised over every shard call
+    /// in every execute().
+    ///
+    /// Σ.D3 phase A retrofit: enables the same operator to run either
+    /// hand-coded (default) or JIT'd (via `try_new_q6_jit`). Equivalence
+    /// is unit-tested below; the JIT path's perf gets benchmarked
+    /// separately in `examples/tpch_q6_jit_bench.rs`.
+    jit: Option<Arc<crate::fused_jit::FusedFilterAggJit>>,
 }
 
 impl FusedFilterSumExec {
     /// Build a Q6-shaped fused exec over `input`. Validates that the child
     /// schema contains the four required columns by name with the expected
-    /// types. Output schema is one column, `revenue: Float64`.
+    /// types. Output schema is one column, `revenue: Float64`. Uses the
+    /// hand-coded Rust shard loop at execute time.
     pub fn try_new_q6(input: Arc<dyn ExecutionPlan>, predicate: Q6Predicate) -> DfResult<Self> {
         Self::validate_input_schema(&input.schema())?;
         let schema = Arc::new(Schema::new(vec![Field::new(
@@ -98,7 +110,43 @@ impl FusedFilterSumExec {
             predicate,
             schema,
             properties,
+            jit: None,
         })
+    }
+
+    /// Same shape as [`try_new_q6`] but routes the inner loop through
+    /// the Cranelift-JIT'd `FusedFilterAggJit`. The JIT is built here
+    /// once (constant cost; bounds become baked-in IR constants) and
+    /// reused across every shard call.
+    pub fn try_new_q6_jit(input: Arc<dyn ExecutionPlan>, predicate: Q6Predicate) -> DfResult<Self> {
+        let mut exec = Self::try_new_q6(input, predicate)?;
+        let spec = crate::fused_jit::FusedFilterAggSpec::q6(
+            predicate.date_lo,
+            predicate.date_hi,
+            predicate.disc_lo,
+            predicate.disc_hi,
+            predicate.qty_hi,
+        );
+        let jit = crate::fused_jit::FusedFilterAggJit::try_build(&spec).map_err(|e| {
+            DataFusionError::Internal(format!("FusedFilterSumExec: JIT build failed: {e}"))
+        })?;
+        exec.jit = Some(Arc::new(jit));
+        Ok(exec)
+    }
+
+    /// Σ.D3 phase D introspection accessor: the operator's predicate
+    /// shape. Used by the auto-routing optimizer rule to rebuild a JIT
+    /// variant from an existing hand-coded exec.
+    pub fn predicate(&self) -> Q6Predicate {
+        self.predicate
+    }
+    /// Whether this exec is already routed through the JIT path.
+    pub fn has_jit(&self) -> bool {
+        self.jit.is_some()
+    }
+    /// The child execution plan this operator pulls from.
+    pub fn input(&self) -> &Arc<dyn ExecutionPlan> {
+        &self.input
     }
 
     fn validate_input_schema(schema: &SchemaRef) -> DfResult<()> {
@@ -160,7 +208,13 @@ impl ExecutionPlan for FusedFilterSumExec {
         let new_input = children.pop().ok_or_else(|| {
             DataFusionError::Internal("FusedFilterSumExec requires exactly 1 child".into())
         })?;
-        Ok(Arc::new(Self::try_new_q6(new_input, self.predicate)?))
+        // Preserve the JIT path if the original exec had one.
+        let next = if self.jit.is_some() {
+            Self::try_new_q6_jit(new_input, self.predicate)?
+        } else {
+            Self::try_new_q6(new_input, self.predicate)?
+        };
+        Ok(Arc::new(next))
     }
 
     fn execute(
@@ -176,6 +230,7 @@ impl ExecutionPlan for FusedFilterSumExec {
         let input = self.input.clone();
         let predicate = self.predicate;
         let schema = self.schema.clone();
+        let jit = self.jit.clone();
 
         let in_schema = input.schema();
         let idx_qty = in_schema.index_of("l_quantity")?;
@@ -193,29 +248,58 @@ impl ExecutionPlan for FusedFilterSumExec {
 
         let schema_for_batch = schema.clone();
         let fut = async move {
-            // Drain every input partition.
-            let mut batches: Vec<RecordBatch> = Vec::new();
+            // Σ.D3 phase D follow-up: stream-and-accumulate, no
+            // materialisation. Spawn one async task per input
+            // partition; each task pulls batches from its stream and
+            // processes each batch in-place via the JIT (or hand-coded)
+            // per-batch kernel, carrying a running partial sum. When
+            // every partition's stream ends, reduce the partials and
+            // emit the single-row result.
+            //
+            // Previously this operator drained every partition into a
+            // `Vec<RecordBatch>` first, then ran a `std::thread::scope`
+            // parallel shard loop. That was good for the unit tests but
+            // bad as a real-SQL drop-in: at Q6's 1.27% selectivity
+            // DataFusion's default Filter+Aggregate pipeline streams
+            // batches as the scan emits them, while we waited for the
+            // entire scan to finish. The InjectFusedQ6Rule benchmark
+            // showed it 7% *slower* than the un-rewritten plan; this
+            // refactor closes that gap.
+            //
+            // Parallelism = input_partitions (one streaming worker each).
+            // At SF=1 lineitem that's 6 row-group readers running
+            // concurrently — the same shape FastParquetExec exposes
+            // for the default Filter+Aggregate pipeline. The fused
+            // exec's per-batch CPU cost is small (~50 μs/batch for Q6
+            // at 65 K rows; the JIT runs at SIMD-vectorised speeds);
+            // doing it inline on the runtime thread does not stall
+            // other tasks meaningfully.
+            let mut handles = Vec::with_capacity(input_partitions);
             for p in 0..input_partitions {
                 let mut s = input.execute(p, context.clone())?;
-                while let Some(b) = s.try_next().await? {
-                    batches.push(b);
-                }
+                let predicate_p = predicate;
+                let indices_p = indices;
+                let jit_p = jit.clone();
+                handles.push(tokio::spawn(async move {
+                    let mut partial: f64 = 0.0;
+                    while let Some(batch) = s.try_next().await? {
+                        partial += match &jit_p {
+                            Some(j) => process_q6_batch_jit(&batch, indices_p, j),
+                            None => process_q6_batch_hand(&batch, predicate_p, indices_p),
+                        };
+                    }
+                    Ok::<f64, DataFusionError>(partial)
+                }));
             }
-
-            // Run the fused loop on a blocking worker so we don't
-            // hijack the tokio runtime for ~ms of pure CPU work.
-            let result = tokio::task::spawn_blocking(move || {
-                let workers = std::thread::available_parallelism()
-                    .map(|n| n.get())
-                    .unwrap_or(8);
-                run_fused_parallel(&batches, workers, predicate, indices)
-            })
-            .await
-            .map_err(|e| {
-                DataFusionError::Execution(format!(
-                    "FusedFilterSumExec: blocking-task join failed: {e}"
-                ))
-            })?;
+            let mut result: f64 = 0.0;
+            for h in handles {
+                let partial = h.await.map_err(|e| {
+                    DataFusionError::Execution(format!(
+                        "FusedFilterSumExec: worker join failed: {e}"
+                    ))
+                })??;
+                result += partial;
+            }
 
             let revenue: ArrayRef = Arc::new(Float64Array::from(vec![result]));
             let batch = RecordBatch::try_new(schema_for_batch, vec![revenue])?;
@@ -235,68 +319,91 @@ struct ColumnIndices {
     ship: usize,
 }
 
-/// Parallel fused loop. Same algorithm as the spike's
-/// `tpch_q6_tune::run_fused_parallel`: shard the batches across
-/// `workers` `std::thread::scope` threads, run the inline-predicate
-/// f64-sum loop on each shard, sum the partials on the main thread.
-fn run_fused_parallel(
-    batches: &[RecordBatch],
-    workers: usize,
-    p: Q6Predicate,
-    idx: ColumnIndices,
-) -> f64 {
-    let n = batches.len();
-    let chunk = n.div_ceil(workers.max(1));
-    std::thread::scope(|s| {
-        let handles: Vec<_> = (0..workers)
-            .map(|w| {
-                let lo = (w * chunk).min(n);
-                let hi = ((w + 1) * chunk).min(n);
-                let slice = &batches[lo..hi];
-                s.spawn(move || run_fused_shard(slice, p, idx))
-            })
-            .collect();
-        handles.into_iter().map(|h| h.join().unwrap()).sum()
-    })
-}
-
-fn run_fused_shard(batches: &[RecordBatch], p: Q6Predicate, idx: ColumnIndices) -> f64 {
+/// Per-batch fused filter + sum (hand-coded Rust). LLVM auto-vectorises
+/// the inner loop; on real lineitem batches this matches the JIT path
+/// to within rel_err 1e-12.
+fn process_q6_batch_hand(batch: &RecordBatch, p: Q6Predicate, idx: ColumnIndices) -> f64 {
+    let qty = batch
+        .column(idx.qty)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .expect("validated as Float64");
+    let price = batch
+        .column(idx.price)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .expect("validated as Float64");
+    let disc = batch
+        .column(idx.disc)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .expect("validated as Float64");
+    let ship = batch
+        .column(idx.ship)
+        .as_any()
+        .downcast_ref::<Date32Array>()
+        .expect("validated as Date32");
+    let qty_v = qty.values();
+    let price_v = price.values();
+    let disc_v = disc.values();
+    let ship_v = ship.values();
     let mut sum: f64 = 0.0;
-    for batch in batches {
-        let qty = batch
-            .column(idx.qty)
-            .as_any()
-            .downcast_ref::<Float64Array>()
-            .expect("validated as Float64");
-        let price = batch
-            .column(idx.price)
-            .as_any()
-            .downcast_ref::<Float64Array>()
-            .expect("validated as Float64");
-        let disc = batch
-            .column(idx.disc)
-            .as_any()
-            .downcast_ref::<Float64Array>()
-            .expect("validated as Float64");
-        let ship = batch
-            .column(idx.ship)
-            .as_any()
-            .downcast_ref::<Date32Array>()
-            .expect("validated as Date32");
-        let qty_v = qty.values();
-        let price_v = price.values();
-        let disc_v = disc.values();
-        let ship_v = ship.values();
-        for i in 0..batch.num_rows() {
-            let s = ship_v[i];
-            let d = disc_v[i];
-            let q = qty_v[i];
-            if s >= p.date_lo && s < p.date_hi && d >= p.disc_lo && d <= p.disc_hi && q < p.qty_hi {
-                sum += price_v[i] * d;
-            }
+    for i in 0..batch.num_rows() {
+        let s = ship_v[i];
+        let d = disc_v[i];
+        let q = qty_v[i];
+        if s >= p.date_lo && s < p.date_hi && d >= p.disc_lo && d <= p.disc_hi && q < p.qty_hi {
+            sum += price_v[i] * d;
         }
     }
     sum
+}
+
+/// Per-batch fused filter + sum via the Cranelift-JIT'd kernel. The
+/// JIT runs the same predicate-and-multiply-and-add the hand-coded
+/// path does, with the constants baked in as immediates.
+fn process_q6_batch_jit(
+    batch: &RecordBatch,
+    idx: ColumnIndices,
+    jit: &crate::fused_jit::FusedFilterAggJit,
+) -> f64 {
+    let qty = batch
+        .column(idx.qty)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .expect("validated as Float64");
+    let price = batch
+        .column(idx.price)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .expect("validated as Float64");
+    let disc = batch
+        .column(idx.disc)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .expect("validated as Float64");
+    let ship = batch
+        .column(idx.ship)
+        .as_any()
+        .downcast_ref::<Date32Array>()
+        .expect("validated as Date32");
+    // Column order must match `FusedFilterAggSpec::q6()`: shipdate,
+    // discount, quantity, extprice.
+    let inputs: [*const u8; 4] = [
+        ship.values().as_ptr().cast::<u8>(),
+        disc.values().as_ptr().cast::<u8>(),
+        qty.values().as_ptr().cast::<u8>(),
+        price.values().as_ptr().cast::<u8>(),
+    ];
+    let mut sum: [f64; 1] = [0.0];
+    // SAFETY: each slice has at least `batch.num_rows()` elements
+    // (Arrow's array invariant); pointer alignment is upheld by the
+    // source slices' element type; `sum` has one element matching
+    // the spec's single SUM aggregate.
+    unsafe {
+        jit.run(batch.num_rows() as i64, inputs.as_ptr(), sum.as_mut_ptr());
+    }
+    sum[0]
 }
 
 #[cfg(test)]
@@ -462,6 +569,60 @@ mod tests {
         assert!(
             msg.contains("l_quantity") && msg.contains("Int64"),
             "error should mention column + actual type: {msg}",
+        );
+    }
+
+    /// Σ.D3 phase A retrofit: the JIT'd execute path must return the same
+    /// final f64 sum as the hand-coded execute path on the same input.
+    /// We run a single batch through both shapes and pin bit-equality on
+    /// the result — the two kernels walk rows in the same order with the
+    /// same FP ops, so no rounding-order surprises should appear.
+    #[tokio::test]
+    async fn jit_exec_matches_hand_coded_exec_bit_identical() {
+        let predicate = Q6Predicate {
+            date_lo: 8766,
+            date_hi: 9131,
+            disc_lo: 0.05,
+            disc_hi: 0.07,
+            qty_hi: 24.0,
+        };
+        let hand = {
+            let input = input_plan_from_batch(make_test_batch()).await;
+            FusedFilterSumExec::try_new_q6(input, predicate).unwrap()
+        };
+        let jitd = {
+            let input = input_plan_from_batch(make_test_batch()).await;
+            FusedFilterSumExec::try_new_q6_jit(input, predicate).unwrap()
+        };
+        let session = SessionContext::new();
+
+        let mut hand_s = Arc::new(hand).execute(0, session.task_ctx()).unwrap();
+        let hand_v = hand_s
+            .try_next()
+            .await
+            .unwrap()
+            .unwrap()
+            .column(0)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap()
+            .value(0);
+
+        let mut jit_s = Arc::new(jitd).execute(0, session.task_ctx()).unwrap();
+        let jit_v = jit_s
+            .try_next()
+            .await
+            .unwrap()
+            .unwrap()
+            .column(0)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap()
+            .value(0);
+        assert_eq!(
+            hand_v.to_bits(),
+            jit_v.to_bits(),
+            "hand={hand_v}, jit={jit_v} (must be bit-identical: same row order, same FP ops)"
         );
     }
 }

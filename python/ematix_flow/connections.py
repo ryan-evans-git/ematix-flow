@@ -495,6 +495,66 @@ _KIND_FACTORIES: dict[str, type] = {
 }
 
 
+# Π.4d: file-format auto-detection from path / URL extension.
+#
+# Maps to the same string values ObjectStoreLocalConnection.format and
+# ObjectStoreS3Connection.format accept. Use this when you have a path
+# that already names the format ("s3://bucket/data.csv") and don't want
+# to repeat yourself in the connection construction:
+#
+#     fmt = format_from_path("s3://bucket/raw/data.tsv.gz")
+#     # fmt == "csv"
+#     conn = ObjectStoreS3Connection(..., format=fmt)
+
+# Order matters for `.json` vs `.json_lines`: longer / more specific
+# suffixes are checked first so `.ndjson` doesn't get matched as `.json`
+# (it can't — different suffix — but kept here for clarity if more
+# variants are added).
+_FORMAT_EXTENSIONS = (
+    # (suffix, format)
+    (".parquet", "parquet"),
+    (".pq", "parquet"),
+    (".tsv", "csv"),
+    (".csv", "csv"),
+    (".ndjson", "json_lines"),
+    (".jsonl", "json_lines"),
+    (".json", "json_lines"),  # treat single-file JSON as JSONL for now
+    (".orc", "orc"),
+)
+
+# Compression suffixes we strip before format matching — `data.csv.gz`
+# and `data.csv.zst` are both still CSV, just compressed in transit.
+_COMPRESSION_STRIP_SUFFIXES = (".gz", ".bz2", ".zst", ".zstd", ".snappy", ".lz4")
+
+
+def format_from_path(path: str) -> str | None:
+    """Pick an ObjectStore format string from a filesystem path or URL.
+
+    Returns one of "parquet" | "csv" | "json_lines" | "orc", or None
+    when the extension isn't recognized. Compression suffixes
+    (.gz, .zst, .bz2, .lz4, .snappy) are stripped before matching so
+    e.g. ``"events.csv.gz"`` → ``"csv"``. Case-insensitive.
+
+    Examples::
+
+        format_from_path("s3://bucket/data.parquet")     == "parquet"
+        format_from_path("/tmp/events.csv.gz")           == "csv"
+        format_from_path("https://host/logs.ndjson")     == "json_lines"
+        format_from_path("/tmp/no-extension")            is None
+    """
+    s = path.lower()
+    # Strip a trailing compression suffix (only one — `csv.gz.gz`
+    # isn't a thing in practice).
+    for comp in _COMPRESSION_STRIP_SUFFIXES:
+        if s.endswith(comp):
+            s = s[: -len(comp)]
+            break
+    for ext, fmt in _FORMAT_EXTENSIONS:
+        if s.endswith(ext):
+            return fmt
+    return None
+
+
 def register_connection(conn: Connection) -> Connection:
     """Register a connection under its ``name``. Returns the connection.
 
