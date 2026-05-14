@@ -204,38 +204,56 @@ def _cmd_run_due(args: argparse.Namespace) -> int:
 
 
 def _open_run_log_or_none(args: argparse.Namespace) -> "p.RunLog | None":
-    """Resolve the --run-log-path / --no-run-log args into a RunLog or None.
+    """Resolve --run-log-url / --run-log-path / --no-run-log to a RunLog or None.
 
-    Graceful degradation: if the resolved path can't be opened (read-only
-    filesystem, permission denied, missing parent dir we can't create, etc.)
-    we print a warning to stderr and return None, so the CLI continues to
-    fire pipelines but without persistence. The user's intent — "run my
-    schedule" — is still served; only the durable-history side-effect is
-    skipped. This matters for ephemeral environments (Lambda, read-only
-    container FSes, CI) where there may be no writable persistent location.
+    Resolution order (highest priority first):
+      1. `--no-run-log` → None
+      2. `--run-log-url <url>` (any scheme; e.g. postgres://, s3://)
+      3. `--run-log-path <path>` (legacy; back-compat alias for sqlite:///)
+      4. `$EMATIX_FLOW_RUN_LOG_URL` env var
+      5. `$EMATIX_FLOW_RUN_LOG_PATH` env var (legacy)
+      6. Default: ~/.ematix-flow/run_log.db (SQLite)
+
+    Graceful degradation: if the resolved backend can't be opened
+    (read-only filesystem, network unreachable, bad credentials, etc.)
+    we print a warning to stderr and return None — the CLI continues
+    to fire pipelines but without persistence. Operator intent ("run
+    my schedule") is still served.
     """
+    import os
+    from ematix_flow.run_log import from_url
+
     if getattr(args, "no_run_log", False):
         return None
-    path = getattr(args, "run_log_path", None) or _default_run_log_path()
+
+    url = getattr(args, "run_log_url", None)
+    if url is None:
+        legacy_path = getattr(args, "run_log_path", None)
+        if legacy_path:
+            url = legacy_path  # bare path is a valid `from_url` argument
+        else:
+            url = os.environ.get("EMATIX_FLOW_RUN_LOG_URL")
+    if url is None:
+        env_path = os.environ.get("EMATIX_FLOW_RUN_LOG_PATH")
+        if env_path:
+            url = env_path
+    if url is None:
+        url = _default_run_log_path()
+
     try:
-        return p.RunLog(path)
+        return from_url(url)
     except (OSError, PermissionError) as e:
-        # OSError covers PermissionError, FileNotFoundError (unwritable
-        # parent), and most filesystem-level failures.
         print(
-            f"warning: could not open run-log at {path!r}: {e}. "
-            f"Continuing without durable run history. "
-            f"Pass --no-run-log to silence, or --run-log-path PATH to "
-            f"point at a writable location.",
+            f"warning: could not open run-log at {url!r}: {e}. "
+            f"Continuing without durable run history. Pass --no-run-log "
+            f"to silence, or --run-log-url <url> to point at a writable "
+            f"location.",
             file=sys.stderr,
         )
         return None
     except Exception as e:
-        # SQLite-level failures (locked DB, corrupted file) surface as
-        # sqlite3.OperationalError or sqlite3.DatabaseError — both
-        # subclasses of Exception but not OSError. Same treatment.
         print(
-            f"warning: run-log backend at {path!r} failed to open: "
+            f"warning: run-log backend {url!r} failed to open: "
             f"{type(e).__name__}: {e}. Continuing without durable run "
             f"history.",
             file=sys.stderr,
@@ -266,11 +284,20 @@ def _add_run_log_args(parser: argparse.ArgumentParser) -> None:
     `--no-run-log` to skip persistence entirely.
     """
     parser.add_argument(
+        "--run-log-url",
+        default=None,
+        help="URL identifying the run-history backend. Supported schemes: "
+        "sqlite:///path, memory://, postgres://..., postgresql://..., "
+        "mysql://..., mariadb://..., duckdb:///path, duckdb://:memory:, "
+        "s3://bucket/prefix, gs://bucket/prefix, "
+        "azure://account/container/prefix. A bare path is treated as SQLite.",
+    )
+    parser.add_argument(
         "--run-log-path",
         default=None,
-        help="path to the durable run-history SQLite DB. Falls back to "
-        "$EMATIX_FLOW_RUN_LOG_PATH then ~/.ematix-flow/run_log.db. Parent "
-        "directories are created on first use.",
+        help="(legacy) SQLite-only alias for --run-log-url; kept for back-compat. "
+        "Falls back to $EMATIX_FLOW_RUN_LOG_URL, then $EMATIX_FLOW_RUN_LOG_PATH, "
+        "then ~/.ematix-flow/run_log.db. Parent dirs are created on first use.",
     )
     parser.add_argument(
         "--no-run-log",
