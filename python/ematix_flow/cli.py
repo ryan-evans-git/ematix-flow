@@ -454,6 +454,112 @@ def _upstream_ok(upstream: str, max_age_secs: int | None, now: datetime) -> bool
     return (now - ts).total_seconds() <= max_age_secs
 
 
+def _cmd_scheduler(args: argparse.Namespace) -> int:
+    """Ω.W.6: run the long-running scheduler loop.
+
+    Imports the user's module, opens the configured RunLog, builds
+    the Executor from the URL, and hands off to
+    `ematix_flow.scheduler.run_scheduler`. Returns when the loop
+    exits (only on --max-iterations or SIGTERM).
+    """
+    from ematix_flow.scheduler import executor_from_url, run_scheduler
+
+    print_banner()
+    run_log = _open_run_log_or_none(args)
+    if run_log is None:
+        print(
+            "error: scheduler requires a durable RunLog. Pass "
+            "--run-log-url or remove --no-run-log.",
+            file=sys.stderr,
+        )
+        return 2
+
+    # Resolve the URL the scheduler hands to workers. The
+    # `_open_run_log_or_none` helper already resolved the URL it
+    # opened; surface it for workers. If the URL came from
+    # default-path resolution, reconstruct the sqlite:// form.
+    run_log_url = _resolved_run_log_url(args)
+
+    try:
+        executor = executor_from_url(args.executor)
+    except (ValueError, ImportError) as e:
+        print(f"error: --executor {args.executor!r}: {e}", file=sys.stderr)
+        return 2
+
+    alerters = _open_alerters(args)
+    metrics_sink = _open_metrics(args)
+    alerter_urls = _resolved_alerter_urls(args)
+    metrics_url = _resolved_metrics_url(args)
+
+    try:
+        run_scheduler(
+            module=args.module,
+            run_log=run_log,
+            run_log_url=run_log_url,
+            executor=executor,
+            alerter_urls=alerter_urls,
+            metrics_url=metrics_url,
+            alerters=alerters,
+            metrics=metrics_sink,
+            poll_interval_seconds=args.poll_interval,
+            lease_seconds=args.lease_seconds,
+            interval_seconds=args.interval,
+            worker_id=args.worker_id,
+            max_iterations=args.max_iterations,
+        )
+    finally:
+        try:
+            metrics_sink.close()
+        except Exception:
+            pass
+        try:
+            run_log.close()
+        except Exception:
+            pass
+    return 0
+
+
+def _resolved_run_log_url(args: argparse.Namespace) -> str:
+    """The URL workers should use to write their outcome back —
+    same resolution chain as `_open_run_log_or_none` but returning
+    the string form, not the opened instance."""
+    import os
+
+    url = getattr(args, "run_log_url", None)
+    if url:
+        return url
+    legacy = getattr(args, "run_log_path", None)
+    if legacy:
+        return legacy if "://" in legacy else f"sqlite://{legacy}"
+    env_url = os.environ.get("EMATIX_FLOW_RUN_LOG_URL")
+    if env_url:
+        return env_url
+    env_path = os.environ.get("EMATIX_FLOW_RUN_LOG_PATH")
+    if env_path:
+        return env_path if "://" in env_path else f"sqlite://{env_path}"
+    return f"sqlite://{_default_run_log_path()}"
+
+
+def _resolved_alerter_urls(args: argparse.Namespace) -> list[str]:
+    """Mirror `_open_alerters` resolution but return the URL strings
+    workers should use, not the live Alerter instances."""
+    import os
+
+    flag_list = getattr(args, "alerter", None)
+    if flag_list:
+        return list(flag_list)
+    env = os.environ.get("EMATIX_FLOW_ALERTERS", "")
+    return [u.strip() for u in env.split(",") if u.strip()]
+
+
+def _resolved_metrics_url(args: argparse.Namespace) -> str | None:
+    import os
+
+    return getattr(args, "metrics", None) or os.environ.get(
+        "EMATIX_FLOW_METRICS_URL"
+    )
+
+
 def _cmd_status(args: argparse.Namespace) -> int:
     """Phase Ω.3: operator view of pipeline state.
 
@@ -687,6 +793,58 @@ def main(argv: list[str] | None = None) -> int:
     status_p.add_argument("--format", choices=["text", "json"], default="text")
     _add_run_log_args(status_p)
     status_p.set_defaults(func=_cmd_status)
+
+    # Ω.W.6: long-running scheduler daemon. Claims pipelines through
+    # the RunLog lease layer + dispatches them via an Executor URL
+    # (subprocess / k8s / lambda).
+    sched_p = sub.add_parser(
+        "scheduler",
+        help="long-running scheduler: claims pipelines and dispatches "
+        "them to the configured Executor (Ω.W)",
+    )
+    sched_p.add_argument("--module", required=True)
+    sched_p.add_argument(
+        "--executor",
+        required=True,
+        help="Executor URL: subprocess://, subprocess+python://, "
+        "k8s://<namespace>?image=<image>[&service-account=<sa>], "
+        "lambda://<function-name>[?qualifier=<alias>]",
+    )
+    sched_p.add_argument(
+        "--poll-interval",
+        type=int,
+        default=10,
+        help="seconds between scheduler ticks (default 10)",
+    )
+    sched_p.add_argument(
+        "--lease-seconds",
+        type=int,
+        default=300,
+        help="per-pipeline claim lease (default 300). Worker "
+        "heartbeats keep it pushed out.",
+    )
+    sched_p.add_argument(
+        "--interval",
+        type=int,
+        default=60,
+        help="cron-match window in seconds (default 60). Mirrors the "
+        "flow run-due --interval semantics.",
+    )
+    sched_p.add_argument(
+        "--worker-id",
+        default=None,
+        help="identifier this scheduler reports. Default: "
+        "scheduler-<hostname>-<pid>",
+    )
+    sched_p.add_argument(
+        "--max-iterations",
+        type=int,
+        default=None,
+        help="(testing) stop after N loop ticks; default loops forever",
+    )
+    _add_run_log_args(sched_p)
+    _add_observability_args(sched_p)
+    sched_p.set_defaults(func=_cmd_scheduler)
 
     due_p = sub.add_parser(
         "run-due", help="run pipelines whose schedule fires in (now-interval, now]"
