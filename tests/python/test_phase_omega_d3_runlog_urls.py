@@ -90,6 +90,7 @@ def test_mariadb_scheme():
 
 
 def test_duckdb_scheme():
+    pytest.importorskip("duckdb", reason="DuckDBRunLog requires the duckdb extra")
     from ematix_flow.run_log import DuckDBRunLog
 
     cls, kwargs = _resolve_backend("duckdb:///tmp/run.duckdb")
@@ -98,6 +99,7 @@ def test_duckdb_scheme():
 
 
 def test_duckdb_memory():
+    pytest.importorskip("duckdb", reason="DuckDBRunLog requires the duckdb extra")
     from ematix_flow.run_log import DuckDBRunLog
 
     cls, kwargs = _resolve_backend("duckdb://:memory:")
@@ -174,6 +176,7 @@ def test_from_url_memory_round_trip():
 
 
 def test_from_url_duckdb_round_trip(tmp_path):
+    pytest.importorskip("duckdb", reason="DuckDBRunLog requires the duckdb extra")
     path = tmp_path / "run.duckdb"
     log = from_url(f"duckdb:///{path}")
     try:
