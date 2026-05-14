@@ -131,6 +131,12 @@ observability = [
     "opentelemetry-exporter-otlp>=1.20",
 ]
 
+# ---- Executor extras (Ω.W) -----------------------------------------
+# SubprocessExecutor is stdlib-only. K8sJobExecutor and LambdaExecutor
+# pull in their respective cloud SDKs as opt-in extras.
+executor-k8s = ["kubernetes>=29"]
+executor-lambda = ["boto3>=1.34"]
+
 # Convenience: everything ematix-flow can plug into. Heavy install
 # — use targeted extras above in production.
 all = [
@@ -146,6 +152,7 @@ all = [
     "prometheus_client>=0.19",
     "opentelemetry-sdk>=1.20",
     "opentelemetry-exporter-otlp>=1.20",
+    "kubernetes>=29",
 ]
 
 dev = [
