@@ -976,6 +976,7 @@ def run_due_with_dag_detailed(
     now: datetime | None = None,
     run_log: "RunLog | None" = None,
     alerters: list | None = None,
+    metrics=None,
 ) -> RunDueResult:
     """Like `run_due_with_dag` but returns a structured `RunDueResult`
     with full per-pipeline outcome detail. The CLI uses this to build
@@ -1007,6 +1008,7 @@ def run_due_with_dag_detailed(
                 name=name,
                 reason=f"upstream not fresh: {','.join(stale) or '(unknown)'}",
             ))
+            _safe_metric(metrics, "inc_runs", name, "skipped")
             continue
 
         # Ω.2: retry-backoff gate.
@@ -1021,6 +1023,7 @@ def run_due_with_dag_detailed(
                         f"(max_attempts={policy.max_attempts})"
                     ),
                 ))
+                _safe_metric(metrics, "inc_runs", name, "skipped")
                 continue
             backoff_secs = _compute_backoff_secs(policy, st.attempt_count)
             next_eligible = st.last_attempt_at + timedelta(seconds=backoff_secs)
@@ -1033,6 +1036,7 @@ def run_due_with_dag_detailed(
                         f"{next_eligible.replace(microsecond=0).isoformat().replace('+00:00', 'Z')})"
                     ),
                 ))
+                _safe_metric(metrics, "inc_runs", name, "skipped")
                 continue
 
         sp = _REGISTRY.get(name)
@@ -1041,6 +1045,7 @@ def run_due_with_dag_detailed(
         ret: Any = None
         success = False
         err: Exception | None = None
+        started_at = datetime.now(_tz_utc())
         try:
             ret = sp.fn()
             success = True
@@ -1048,15 +1053,20 @@ def run_due_with_dag_detailed(
             err = e
             success = False
         completed_at = datetime.now(_tz_utc())
+        duration_secs = (completed_at - started_at).total_seconds()
         _LAST_RUN[name] = (completed_at, success)
         if run_log is not None:
             run_log.record_run(name, completed_at, success)
+        _safe_metric(metrics, "observe_duration", name, duration_secs)
         if success:
             prev = _ATTEMPT_STATE.get(name)
             fired.append(FiredEvent(name=name, result=ret))
             _ATTEMPT_STATE.pop(name, None)
             if run_log is not None:
                 run_log.clear_attempt_state(name)
+            _safe_metric(metrics, "inc_runs", name, "success")
+            # Recovery → attempt gauge resets to 0.
+            _safe_metric(metrics, "set_attempt", name, 0)
             # Recovery event: if a retry cycle was in flight (prev had
             # attempt_count >= 1) and now we succeeded, push a
             # `recovered` event so alerters can close the loop.
@@ -1083,6 +1093,8 @@ def run_due_with_dag_detailed(
             _ATTEMPT_STATE[name] = new_state
             if run_log is not None:
                 run_log.record_attempt(name, new_state)
+            _safe_metric(metrics, "inc_runs", name, "failure")
+            _safe_metric(metrics, "set_attempt", name, attempt_count)
             err_msg = str(err) if err else ""
             err_type = type(err).__name__ if err else "Exception"
             failed.append(FailedEvent(
@@ -1123,6 +1135,23 @@ def run_due_with_dag_detailed(
                 )
 
     return RunDueResult(fired=fired, failed=failed, skipped=skipped)
+
+
+def _safe_metric(sink, method: str, *args) -> None:
+    """Call `sink.<method>(*args)` swallowing any exception, so a
+    buggy metrics backend can't poison the orchestrator loop. No-op
+    when `sink` is None."""
+    if sink is None:
+        return
+    try:
+        getattr(sink, method)(*args)
+    except Exception as e:
+        import sys
+        print(
+            f"warning: metrics sink {type(sink).__name__}.{method} raised: "
+            f"{type(e).__name__}: {e}",
+            file=sys.stderr,
+        )
 
 
 def _fan_out_alert(alerters, event) -> None:
