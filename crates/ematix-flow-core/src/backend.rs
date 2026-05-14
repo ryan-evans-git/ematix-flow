@@ -673,6 +673,10 @@ pub struct ObjectStoreConfig {
     /// uncompressed, CSV comma + header).
     #[serde(default)]
     pub write_options: ObjectWriteOptions,
+    /// Π.4a: per-format read options (CSV dialect, JSON inference).
+    /// Default = Arrow's library defaults.
+    #[serde(default)]
+    pub read_options: ObjectReadOptions,
 }
 
 /// Local-FS root vs. S3-compatible root for [`ObjectStoreConfig`].
@@ -1033,7 +1037,8 @@ pub async fn backend_from_config(
                     c.format,
                 )?,
             }
-            .with_write_options(c.write_options);
+            .with_write_options(c.write_options)
+            .with_read_options(c.read_options);
             Ok(std::sync::Arc::new(backend))
         }
         BackendConfig::Delta(c) => {

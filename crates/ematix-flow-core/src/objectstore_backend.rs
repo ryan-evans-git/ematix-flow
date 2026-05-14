@@ -864,6 +864,7 @@ impl Backend for ObjectStoreBackend {
             location: self.location.clone(),
             format: self.format,
             write_options: self.write_options.clone(),
+            read_options: self.read_options.clone(),
         })
     }
 

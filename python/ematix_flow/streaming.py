@@ -112,6 +112,28 @@ class Target:
     parquet_compression: str | None = None  # "uncompressed" | "snappy" | "gzip" | "zstd"
     csv_delimiter: str | None = None  # single-character string
     csv_header: bool | None = None
+    # Π.4b: per-format READ options. Used when an object-store target
+    # is on the source side of a pipeline (less common, but the same
+    # backend supports both directions). Shape mirrors the Rust
+    # `CsvReadOptions` / `JsonReadOptions`:
+    #
+    #   csv_read_options = {
+    #       "has_header":      bool,
+    #       "delimiter":       str,           # single ASCII char
+    #       "quote":           str,           # single ASCII char
+    #       "escape":          str,           # single ASCII char
+    #       "terminator":      str,           # single ASCII char
+    #       "comment":         str,           # single ASCII char
+    #       "null_regex":      str,
+    #       "truncated_rows_ok": bool,
+    #       "schema_infer_max_records": int,
+    #   }
+    #   json_read_options = {
+    #       "schema_infer_max_records": int,
+    #       "batch_size":      int,
+    #   }
+    csv_read_options: dict | None = None
+    json_read_options: dict | None = None
     # Δ.X1.2: optional user-declared primary-key column list,
     # emitted as ``[target.table].primary_key = [...]`` in the
     # generated TOML. Required for CDC pipelines whose target
@@ -1287,6 +1309,8 @@ def _emit_single_target_block(spec: Target) -> list[str]:
             parquet_compression=spec.parquet_compression,
             csv_delimiter=spec.csv_delimiter,
             csv_header=spec.csv_header,
+            csv_read_options=spec.csv_read_options,
+            json_read_options=spec.json_read_options,
         )
     )
     if spec.table is not None:
@@ -1318,6 +1342,8 @@ def _emit_targets_array_entry(spec: Target) -> list[str]:
             parquet_compression=spec.parquet_compression,
             csv_delimiter=spec.csv_delimiter,
             csv_header=spec.csv_header,
+            csv_read_options=spec.csv_read_options,
+            json_read_options=spec.json_read_options,
         )
     )
     if spec.table is not None:
@@ -1543,6 +1569,8 @@ def _target_fields(
     parquet_compression: str | None = None,
     csv_delimiter: str | None = None,
     csv_header: bool | None = None,
+    csv_read_options: dict | None = None,
+    json_read_options: dict | None = None,
 ) -> list[str]:
     """Emit the `kind = ...` line + per-kind fields for [target]."""
 
@@ -1657,6 +1685,8 @@ def _target_fields(
                 parquet_compression,
                 csv_delimiter,
                 csv_header,
+                csv_read_options,
+                json_read_options,
             )
         )
         return out
@@ -1684,6 +1714,8 @@ def _target_fields(
                 parquet_compression,
                 csv_delimiter,
                 csv_header,
+                csv_read_options,
+                json_read_options,
             )
         )
         return out
@@ -1695,10 +1727,16 @@ def _object_store_format_lines(
     parquet_compression: str | None,
     csv_delimiter: str | None,
     csv_header: bool | None,
+    csv_read_options: dict | None = None,
+    json_read_options: dict | None = None,
 ) -> list[str]:
     """Π.1.4: emit the per-format option lines for object-store
     targets, with shape-correctness checks at the typed-Python
-    boundary so users see the right error before TOML round-trip."""
+    boundary so users see the right error before TOML round-trip.
+
+    Π.4b: also emits the [target.read_options.csv] / [target.read_options.json]
+    nested tables when csv_read_options / json_read_options are set.
+    """
     out: list[str] = []
     if parquet_compression is not None:
         if format_kind != "parquet":
@@ -1731,6 +1769,117 @@ def _object_store_format_lines(
                 f"format={format_kind!r}"
             )
         out.append(f"csv_header = {'true' if csv_header else 'false'}")
+    if csv_read_options:
+        if format_kind != "csv":
+            raise ValueError(
+                f"Target.csv_read_options only applies when format='csv'; "
+                f"got format={format_kind!r}"
+            )
+        out.extend(_csv_read_options_lines(csv_read_options))
+    if json_read_options:
+        if format_kind not in ("json", "json_lines", "jsonl"):
+            raise ValueError(
+                f"Target.json_read_options only applies when format='json' "
+                f"or 'json_lines'; got format={format_kind!r}"
+            )
+        out.extend(_json_read_options_lines(json_read_options))
+    return out
+
+
+# ---- Π.4b: read-option emitters ------------------------------------
+
+_CSV_READ_OPTION_KEYS = (
+    "has_header",
+    "delimiter",
+    "quote",
+    "escape",
+    "terminator",
+    "comment",
+    "null_regex",
+    "truncated_rows_ok",
+    "schema_infer_max_records",
+)
+
+
+def _csv_read_options_lines(opts: dict) -> list[str]:
+    """Emit the `[target.read_options.csv]` block. Shape-checks each
+    field so a typo here errors at decorator-evaluation time, not
+    inside the Rust deserializer at runtime."""
+    unknown = set(opts) - set(_CSV_READ_OPTION_KEYS)
+    if unknown:
+        raise ValueError(
+            f"Target.csv_read_options has unknown keys {sorted(unknown)!r}; "
+            f"valid: {list(_CSV_READ_OPTION_KEYS)!r}"
+        )
+
+    def _char(field_name: str, v: str) -> int:
+        if not isinstance(v, str) or len(v) != 1 or ord(v) > 127:
+            raise ValueError(
+                f"Target.csv_read_options[{field_name!r}] must be a single "
+                f"ASCII character, got {v!r}"
+            )
+        return ord(v)
+
+    out: list[str] = ["", "[target.read_options.csv]"]
+    if "has_header" in opts:
+        v = opts["has_header"]
+        if not isinstance(v, bool):
+            raise ValueError(
+                f"Target.csv_read_options.has_header must be bool, got {v!r}"
+            )
+        out.append(f"has_header = {'true' if v else 'false'}")
+    # Rust side deserialises these as `u8`, so we emit the integer
+    # code point (e.g. b'\t' = 9) rather than the character itself.
+    for k in ("delimiter", "quote", "escape", "terminator", "comment"):
+        if k in opts:
+            out.append(f"{k} = {_char(k, opts[k])}")
+    if "null_regex" in opts:
+        v = opts["null_regex"]
+        if not isinstance(v, str):
+            raise ValueError(
+                f"Target.csv_read_options.null_regex must be str, got {v!r}"
+            )
+        out.append(f"null_regex = {_q(v)}")
+    if "truncated_rows_ok" in opts:
+        v = opts["truncated_rows_ok"]
+        if not isinstance(v, bool):
+            raise ValueError(
+                f"Target.csv_read_options.truncated_rows_ok must be bool, "
+                f"got {v!r}"
+            )
+        out.append(f"truncated_rows_ok = {'true' if v else 'false'}")
+    if "schema_infer_max_records" in opts:
+        v = opts["schema_infer_max_records"]
+        if not isinstance(v, int) or v < 1:
+            raise ValueError(
+                f"Target.csv_read_options.schema_infer_max_records must be "
+                f"a positive int, got {v!r}"
+            )
+        out.append(f"schema_infer_max_records = {v}")
+    return out
+
+
+_JSON_READ_OPTION_KEYS = ("schema_infer_max_records", "batch_size")
+
+
+def _json_read_options_lines(opts: dict) -> list[str]:
+    """Emit the `[target.read_options.json]` block."""
+    unknown = set(opts) - set(_JSON_READ_OPTION_KEYS)
+    if unknown:
+        raise ValueError(
+            f"Target.json_read_options has unknown keys {sorted(unknown)!r}; "
+            f"valid: {list(_JSON_READ_OPTION_KEYS)!r}"
+        )
+    out: list[str] = ["", "[target.read_options.json]"]
+    for k in _JSON_READ_OPTION_KEYS:
+        if k in opts:
+            v = opts[k]
+            if not isinstance(v, int) or v < 1:
+                raise ValueError(
+                    f"Target.json_read_options.{k} must be a positive int, "
+                    f"got {v!r}"
+                )
+            out.append(f"{k} = {v}")
     return out
 
 
