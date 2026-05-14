@@ -31,9 +31,7 @@
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
-use arrow_array::{
-    Date32Array, Float64Array, Int32Array, Int64Array, RecordBatch, StringArray,
-};
+use arrow_array::{Date32Array, Float64Array, Int32Array, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use parquet::arrow::ArrowWriter;
 use parquet::basic::Compression;
@@ -105,8 +103,7 @@ fn write_parquet_multi_rg(path: PathBuf, batch: RecordBatch, max_rg: usize) {
         .set_compression(Compression::SNAPPY)
         .set_max_row_group_row_count(Some(max_rg))
         .build();
-    let mut writer =
-        ArrowWriter::try_new(file, batch.schema(), Some(props)).expect("arrow writer");
+    let mut writer = ArrowWriter::try_new(file, batch.schema(), Some(props)).expect("arrow writer");
     writer.write(&batch).expect("write batch");
     writer.close().expect("close writer");
 }
@@ -138,7 +135,12 @@ fn write_lineitem(dir: &std::path::Path) {
     // receiptdate also falls in the predicate window — this cycle
     // guarantees both shipmodes co-occur with the in-window shipdates.
     let shipmodes = ["MAIL", "SHIP", "TRUCK", "AIR"];
-    let shipinstructs = ["DELIVER IN PERSON", "TAKE BACK RETURN", "NONE", "COLLECT COD"];
+    let shipinstructs = [
+        "DELIVER IN PERSON",
+        "TAKE BACK RETURN",
+        "NONE",
+        "COLLECT COD",
+    ];
 
     let mut l_orderkey = Vec::<i64>::with_capacity(n);
     let mut l_partkey = Vec::<i64>::with_capacity(n);
@@ -334,14 +336,12 @@ fn write_orders(dir: &std::path::Path) {
     // [1994,1995) so the 1994 dates seed that match too.
     let n: usize = 20;
     let orderdate_pool: [i32; 4] = [
-        8766,  // 1994-01-01 (Q5)
-        9000,  // 1994-08-23
-        9204,  // 1995-03-15 (Q3 cutoff; <= excluded by `<`, but Q5 lies before)
-        9404,  // 1995-10-01
+        8766, // 1994-01-01 (Q5)
+        9000, // 1994-08-23
+        9204, // 1995-03-15 (Q3 cutoff; <= excluded by `<`, but Q5 lies before)
+        9404, // 1995-10-01
     ];
-    let priorities = [
-        "1-URGENT", "2-HIGH", "3-MEDIUM", "4-NOT SPECIFIED", "5-LOW",
-    ];
+    let priorities = ["1-URGENT", "2-HIGH", "3-MEDIUM", "4-NOT SPECIFIED", "5-LOW"];
 
     let mut o_orderkey = Vec::<i64>::with_capacity(n);
     let mut o_custkey = Vec::<i64>::with_capacity(n);
@@ -407,7 +407,13 @@ fn write_customer(dir: &std::path::Path) {
     // 15 customers; mktsegment cycles through 5 TPC-H values including
     // BUILDING (every 5th customer) so Q3 finds matches.
     let n: usize = 15;
-    let segments = ["BUILDING", "AUTOMOBILE", "FURNITURE", "HOUSEHOLD", "MACHINERY"];
+    let segments = [
+        "BUILDING",
+        "AUTOMOBILE",
+        "FURNITURE",
+        "HOUSEHOLD",
+        "MACHINERY",
+    ];
 
     let mut c_custkey = Vec::<i64>::with_capacity(n);
     let mut c_name = Vec::<String>::with_capacity(n);
@@ -534,7 +540,10 @@ fn write_nation(dir: &std::path::Path) {
     let n_nationkey: Vec<i64> = nations.iter().map(|(k, _, _)| *k).collect();
     let n_name: Vec<&str> = nations.iter().map(|(_, n, _)| *n).collect();
     let n_regionkey: Vec<i64> = nations.iter().map(|(_, _, r)| *r).collect();
-    let n_comment: Vec<String> = nations.iter().map(|(_, n, _)| format!("nation {n}")).collect();
+    let n_comment: Vec<String> = nations
+        .iter()
+        .map(|(_, n, _)| format!("nation {n}"))
+        .collect();
 
     let schema = Arc::new(Schema::new(vec![
         Field::new("n_nationkey", DataType::Int64, false),

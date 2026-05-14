@@ -624,8 +624,8 @@ mod tests {
         if std::path::Path::new(&s).exists() {
             return Some(s);
         }
-        let mini = std::path::PathBuf::from(crate::test_support::tpch_mini_dir())
-            .join("lineitem.parquet");
+        let mini =
+            std::path::PathBuf::from(crate::test_support::tpch_mini_dir()).join("lineitem.parquet");
         mini.exists().then(|| mini.to_string_lossy().into_owned())
     }
 
