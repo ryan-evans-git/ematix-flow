@@ -926,66 +926,132 @@ def _upstream_is_fresh(downstream_name: str, now: datetime) -> bool:
     return True
 
 
-def run_due_with_dag(
+# ---- Detailed run-due result types (Phase Ω.D2) ------------------------
+
+
+@dataclass(frozen=True)
+class FiredEvent:
+    """One pipeline that ran successfully in this invocation."""
+
+    name: str
+    result: Any  # whatever the callable returned (dict or otherwise)
+
+
+@dataclass(frozen=True)
+class FailedEvent:
+    """One pipeline that ran but raised."""
+
+    name: str
+    error_message: str
+    error_type: str  # e.g. "RuntimeError"
+    attempt_count: int  # which attempt this was (1 = first)
+    gave_up: bool      # True iff attempt_count == max_attempts
+
+
+@dataclass(frozen=True)
+class SkippedEvent:
+    """One pipeline that didn't run at all (upstream stale, retry
+    backoff, or gave-up)."""
+
+    name: str
+    reason: str  # human-readable; e.g. "retry backoff (next at ...)"
+
+
+@dataclass(frozen=True)
+class RunDueResult:
+    """Per-pipeline outcomes from one `run_due_with_dag` invocation.
+
+    Three disjoint lists. Order matches topo-sort order so an operator
+    reading the JSON can see the DAG progression.
+    """
+
+    fired: list[FiredEvent]
+    failed: list[FailedEvent]
+    skipped: list[SkippedEvent]
+
+
+def run_due_with_dag_detailed(
     due: list[str],
     *,
     now: datetime | None = None,
     run_log: "RunLog | None" = None,
-) -> list[str]:
-    """Run the pipelines in `due`, honoring DAG order + freshness.
+) -> RunDueResult:
+    """Like `run_due_with_dag` but returns a structured `RunDueResult`
+    with full per-pipeline outcome detail. The CLI uses this to build
+    its ran/failed/skipped JSON output.
 
-    Steps:
-      1. Topo-sort `due` so any upstream-in-the-subset runs first.
-      2. For each pipeline in topo order:
-         - Skip if any declared upstream isn't fresh (per
-           `upstream_freshness_secs`).
-         - Otherwise invoke its registered callable.
-         - Record `_LAST_RUN[name] = (now, success_bool)`.
-
-    Returns the names that actually fired (skipped ones excluded).
-
-    This is the in-process gate. Cross-process freshness (upstream
-    ran successfully in an earlier `flow run-due` invocation) needs
-    Phase Ω.D1a's durable RunLog.
+    Same semantics as `run_due_with_dag`:
+      1. Topo-sort `due` so upstreams-in-the-subset go first.
+      2. For each pipeline:
+         a. Skip if a declared upstream isn't fresh (Ω.1).
+         b. Skip if mid retry-backoff or gave-up (Ω.2).
+         c. Otherwise fire; record outcome to `_LAST_RUN` and (if
+            provided) the durable `run_log`.
     """
     if now is None:
         now = datetime.now(_tz_utc())
     ordered = order_for_run_due(list(due))
-    fired: list[str] = []
+
+    fired: list[FiredEvent] = []
+    failed: list[FailedEvent] = []
+    skipped: list[SkippedEvent] = []
+
     for name in ordered:
         if not _upstream_is_fresh(name, now):
+            stale = [
+                u for u in _DEPENDS_ON.get(name, [])
+                if not _one_upstream_is_fresh(u, _UPSTREAM_FRESHNESS.get(name), now)
+            ]
+            skipped.append(SkippedEvent(
+                name=name,
+                reason=f"upstream not fresh: {','.join(stale) or '(unknown)'}",
+            ))
             continue
-        # Phase Ω.2: if a retry cycle is in flight, gate by the
-        # backoff window OR by gave_up=True (after max_attempts).
+
+        # Ω.2: retry-backoff gate.
         st = _ATTEMPT_STATE.get(name)
         policy = _RETRY_POLICY.get(name, RetryPolicy())
         if st is not None:
             if st.gave_up:
+                skipped.append(SkippedEvent(
+                    name=name,
+                    reason=(
+                        f"gave up after {st.attempt_count} retry attempts "
+                        f"(max_attempts={policy.max_attempts})"
+                    ),
+                ))
                 continue
             backoff_secs = _compute_backoff_secs(policy, st.attempt_count)
             next_eligible = st.last_attempt_at + timedelta(seconds=backoff_secs)
             if now < next_eligible:
+                skipped.append(SkippedEvent(
+                    name=name,
+                    reason=(
+                        f"retry backoff (attempt {st.attempt_count}/"
+                        f"{policy.max_attempts}; next eligible at "
+                        f"{next_eligible.replace(microsecond=0).isoformat().replace('+00:00', 'Z')})"
+                    ),
+                ))
                 continue
+
         sp = _REGISTRY.get(name)
         if sp is None:
             raise KeyError(name)
+        ret: Any = None
         success = False
+        err: Exception | None = None
         try:
-            sp.fn()
+            ret = sp.fn()
             success = True
-        except Exception:
-            # Record + re-raise? The roadmap says downstreams should
-            # SKIP on upstream failure, so swallow here to let the
-            # rest of the topo-order continue. Caller can inspect
-            # `_LAST_RUN` for failures.
+        except Exception as e:
+            err = e
             success = False
         completed_at = datetime.now(_tz_utc())
         _LAST_RUN[name] = (completed_at, success)
         if run_log is not None:
             run_log.record_run(name, completed_at, success)
         if success:
-            fired.append(name)
-            # Clear any in-flight retry cycle on success.
+            fired.append(FiredEvent(name=name, result=ret))
             _ATTEMPT_STATE.pop(name, None)
             if run_log is not None:
                 run_log.clear_attempt_state(name)
@@ -1001,7 +1067,47 @@ def run_due_with_dag(
             _ATTEMPT_STATE[name] = new_state
             if run_log is not None:
                 run_log.record_attempt(name, new_state)
-    return fired
+            failed.append(FailedEvent(
+                name=name,
+                error_message=str(err) if err else "",
+                error_type=type(err).__name__ if err else "Exception",
+                attempt_count=attempt_count,
+                gave_up=gave_up,
+            ))
+
+    return RunDueResult(fired=fired, failed=failed, skipped=skipped)
+
+
+def _one_upstream_is_fresh(
+    upstream: str, max_age_secs: int | None, now: datetime
+) -> bool:
+    """Per-upstream variant of `_upstream_is_fresh`. Surfacing this
+    so the CLI / detailed result can name exactly which upstreams
+    are stale."""
+    rec = _LAST_RUN.get(upstream)
+    if rec is None:
+        return False
+    ts, ok = rec
+    if not ok:
+        return False
+    if max_age_secs is None:
+        return True
+    return (now - ts).total_seconds() <= max_age_secs
+
+
+def run_due_with_dag(
+    due: list[str],
+    *,
+    now: datetime | None = None,
+    run_log: "RunLog | None" = None,
+) -> list[str]:
+    """Legacy entry point: run the pipelines in `due`, return the names
+    that fired successfully. Built on `run_due_with_dag_detailed` —
+    same semantics, narrower return type for back-compat with
+    callers from Ω.1/Ω.2/Ω.D1a tests.
+    """
+    result = run_due_with_dag_detailed(due, now=now, run_log=run_log)
+    return [e.name for e in result.fired]
 
 
 def _tz_utc():

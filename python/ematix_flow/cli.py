@@ -149,15 +149,12 @@ def _cmd_run_due(args: argparse.Namespace) -> int:
 
     # Phase Ω.D1a: open the run-log (default ~/.ematix-flow/run_log.db,
     # opt-out via --no-run-log) and restore prior _LAST_RUN +
-    # _ATTEMPT_STATE so the upstream-freshness gate below can see what
+    # _ATTEMPT_STATE so freshness + retry-backoff gates see what
     # earlier cron ticks did.
     run_log = _open_run_log_or_none(args)
     if run_log is not None:
         run_log.restore_into_process()
 
-    # Phase Ω.1: topo-sort the due set so upstreams fire before
-    # downstreams, and skip downstreams whose upstream isn't fresh
-    # (failed, missing, or stale).
     due: list[str] = [
         sp.name for sp in p.list_pipelines()
         if p.is_due(sp.schedule, now, args.interval)
@@ -165,54 +162,45 @@ def _cmd_run_due(args: argparse.Namespace) -> int:
     if not due:
         print(json.dumps({"ran": [], "failed": [], "skipped": []}, default=str))
         return 0
-    ordered = p.order_for_run_due(due)
 
-    results: list[dict[str, Any]] = []
-    failed: list[dict[str, str]] = []
-    skipped: list[dict[str, str]] = []
-    for name in ordered:
-        if not p._upstream_is_fresh(name, now):
-            stale = [
-                u for u in p.depends_on_of(name)
-                if not _upstream_ok(u, p.upstream_freshness_secs_of(name), now)
-            ]
-            print(
-                f"skipping: {name} (upstream not fresh: {stale})",
-                file=sys.stderr,
-            )
-            skipped.append({"pipeline": name, "reason": "upstream_not_fresh",
-                            "stale_upstreams": ",".join(stale)})
-            continue
-        sp = p._REGISTRY[name]
-        print(f"firing: {sp.name}", file=sys.stderr)
-        success = False
-        try:
-            r = sp.fn()
-            success = True
-        except Exception as e:
-            print(f"failed: {sp.name}: {e}", file=sys.stderr)
-            failed.append({"pipeline": sp.name, "error": str(e)})
-            completed_at = datetime.now(UTC)
-            p._LAST_RUN[name] = (completed_at, False)
-            if run_log is not None:
-                run_log.record_run(name, completed_at, False)
-            # NOTE: this CLI loop predates Ω.2 and doesn't yet honor
-            # the per-attempt retry backoff. `run_due_with_dag()` does;
-            # migrating this loop to use it is a follow-up so we keep
-            # back-compat on the `ran` JSON shape for now.
-            continue
-        completed_at = datetime.now(UTC)
-        p._LAST_RUN[name] = (completed_at, success)
-        if run_log is not None:
-            run_log.record_run(name, completed_at, success)
-        out = dict(r) if isinstance(r, dict) else {"result": r}
-        out["_pipeline"] = sp.name
-        results.append(out)
+    # Phase Ω.D2: use the unified `run_due_with_dag_detailed` so
+    # retry backoff + gave-up gating actually fire from the CLI.
+    # Pre-Ω.D2 this loop had its own bespoke logic that bypassed Ω.2.
+    result = p.run_due_with_dag_detailed(due, now=now, run_log=run_log)
+
+    # Log per-pipeline progress to stderr for tail-the-log operators;
+    # the structured JSON on stdout is what scripts parse.
+    for ev in result.fired:
+        print(f"firing: {ev.name}", file=sys.stderr)
+    for ev in result.failed:
+        print(f"failed: {ev.name}: {ev.error_message}", file=sys.stderr)
+    for ev in result.skipped:
+        print(f"skipping: {ev.name} ({ev.reason})", file=sys.stderr)
+
+    ran_out: list[dict[str, Any]] = []
+    for ev in result.fired:
+        out = dict(ev.result) if isinstance(ev.result, dict) else {"result": ev.result}
+        out["_pipeline"] = ev.name
+        ran_out.append(out)
+    failed_out = [
+        {
+            "pipeline": ev.name,
+            "error": ev.error_message,
+            "error_type": ev.error_type,
+            "attempt_count": ev.attempt_count,
+            "gave_up": ev.gave_up,
+        }
+        for ev in result.failed
+    ]
+    skipped_out = [
+        {"pipeline": ev.name, "reason": ev.reason}
+        for ev in result.skipped
+    ]
     print(json.dumps(
-        {"ran": results, "failed": failed, "skipped": skipped},
+        {"ran": ran_out, "failed": failed_out, "skipped": skipped_out},
         default=str,
     ))
-    return 1 if failed else 0
+    return 1 if failed_out else 0
 
 
 def _open_run_log_or_none(args: argparse.Namespace) -> "p.RunLog | None":
