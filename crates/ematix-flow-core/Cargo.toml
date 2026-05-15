@@ -37,14 +37,15 @@ rusqlite = { workspace = true }
 mysql_async = { workspace = true }
 object_store = { workspace = true }
 parquet = { workspace = true }
-# ematix-parquet sibling repo — hand-rolled parquet decoder with
-# NEON-fused predicate kernels. Wired into `ematix_parquet_bridge`
-# to produce Arrow arrays from column chunks without going through
-# parquet-rs's ParquetRecordBatchReader. Long-term: alternate backend
-# for FastParquetExec.
-ematix-parquet-codec = { git = "https://github.com/ryan-evans-git/ematix-parquet.git", rev = "63b6954" }
-ematix-parquet-format = { git = "https://github.com/ryan-evans-git/ematix-parquet.git", rev = "63b6954" }
-ematix-parquet-io = { git = "https://github.com/ryan-evans-git/ematix-parquet.git", rev = "63b6954" }
+# ematix-parquet — hand-rolled parquet decoder with NEON-fused
+# predicate kernels. Wired into `ematix_parquet_bridge` to produce
+# Arrow arrays from column chunks without going through parquet-rs's
+# ParquetRecordBatchReader. Long-term: alternate backend for
+# FastParquetExec. Published from the sibling repo
+# https://github.com/ryan-evans-git/ematix-parquet.
+ematix-parquet-codec = "0.1"
+ematix-parquet-format = "0.1"
+ematix-parquet-io = "0.1"
 deltalake = { workspace = true }
 datafusion = { workspace = true }
 cranelift = { workspace = true }
