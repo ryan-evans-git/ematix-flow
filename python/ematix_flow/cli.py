@@ -462,7 +462,19 @@ def _cmd_scheduler(args: argparse.Namespace) -> int:
     `ematix_flow.scheduler.run_scheduler`. Returns when the loop
     exits (only on --max-iterations or SIGTERM).
     """
+    import logging as _logging
+
     from ematix_flow.scheduler import executor_from_url, run_scheduler
+
+    # Surface scheduler INFO-level events to stderr so operators can
+    # watch sweep / leader-acquire / dispatch / release in real time.
+    # Idempotent — `basicConfig` is a no-op if a handler is already
+    # configured (e.g. by a host process embedding flow as a library).
+    _logging.basicConfig(
+        level=_logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        datefmt="%H:%M:%S",
+    )
 
     print_banner()
     run_log = _open_run_log_or_none(args)

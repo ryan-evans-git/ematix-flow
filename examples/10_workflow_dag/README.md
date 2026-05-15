@@ -26,6 +26,22 @@ dispatches whatever's due. The cron schedule on every pipeline is
 `* * * * *` (every minute) for demo speed; in production these
 would naturally space out.
 
+## What you'll see in the scheduler terminal
+
+The scheduler streams INFO-level events to stderr — sweep, leader
+acquire, dispatch, release. Worker subprocesses inherit the same
+terminal, so each worker's own logs (pipeline body output, errors,
+JSON return value from `flow run`) appear inline with the scheduler's:
+
+```
+21:14:33 INFO ematix_flow.scheduler.loop: scheduler started: ...
+21:14:33 INFO ematix_flow.scheduler.loop: scheduler: dispatched pipeline=raw_orders claim=8f3a1c0e
+{"inserted": 5, "at": "2026-05-15T21:14:34+00:00"}
+21:14:38 INFO ematix_flow.scheduler.loop: scheduler: dispatched pipeline=enriched_orders claim=2b7e9d4a
+{"enriched": 5}
+21:14:43 ERROR ematix_flow.scheduler.loop: ... daily_summary failed: synthetic flake
+```
+
 ## Watch it in action
 
 In a second terminal:
