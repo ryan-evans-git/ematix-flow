@@ -8322,6 +8322,7 @@ mod tests {
             sasl_scram_password: Some("secret2".into()),
             sasl_scram_mechanism: Some("sha-256".into()),
             msk_iam_region: Some("us-east-1".into()),
+            auto_offset_reset: Some("earliest".into()),
         };
         let s = format!("{kafka:?}");
         assert!(s.contains("Kafka"));
