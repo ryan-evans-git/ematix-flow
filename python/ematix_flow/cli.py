@@ -97,15 +97,20 @@ def _cmd_transform_run(args: argparse.Namespace) -> int:
 
 
 def _cmd_run(args: argparse.Namespace) -> int:
-    print_banner()
-    _import_user_module(args.module)
-
     # Ω.W.3: worker-side claim semantics. When the scheduler spawns
     # us via SubprocessExecutor, --claim-token is set and we need to
     # heartbeat the lease while the pipeline runs, then release on
     # exit so the next scheduler tick can re-fire if the schedule
     # comes due again.
     claim_token = getattr(args, "claim_token", None)
+    # Skip the banner when running as a scheduler-dispatched worker —
+    # the scheduler already prints its own startup line and the worker's
+    # banner repeats every tick across N pipelines, drowning out actual
+    # output. Bare `flow run` (one-shot, no claim token) still prints it.
+    if not claim_token:
+        print_banner()
+    _import_user_module(args.module)
+
     run_log = _open_run_log_or_none(args) if claim_token else None
     heartbeat = None
     if claim_token and run_log is not None:
@@ -119,15 +124,51 @@ def _cmd_run(args: argparse.Namespace) -> int:
         )
         heartbeat.start()
 
+    success = False
+    err: BaseException | None = None
     try:
         try:
             result = p.run_pipeline(args.name)
+            success = True
         except KeyError:
             print(f"error: no pipeline named {args.name!r}", file=sys.stderr)
             return 2
+        except BaseException as e:  # noqa: BLE001 — re-raised after recording
+            err = e
+            raise
         print(json.dumps(result, default=str))
         return 0
     finally:
+        # Ω.W.6 follow-up: worker must record its own outcome to the
+        # RunLog so the central scheduler's DAG-gating sees this run.
+        # Without this, `depends_on=[...]` downstream pipelines stay
+        # gated forever because `_LAST_RUN` is only ever populated in
+        # the scheduler when it `restore_into_process()`s from the
+        # RunLog — which only the worker can write.
+        if claim_token and run_log is not None:
+            try:
+                completed_at = datetime.now(UTC)
+                run_log.record_run(args.name, completed_at, success)
+                if success:
+                    run_log.clear_attempt_state(args.name)
+                else:
+                    # Record an attempt so retry-backoff fires next tick.
+                    prev = p._ATTEMPT_STATE.get(args.name)
+                    attempt_count = (prev.attempt_count if prev else 0) + 1
+                    policy = p._RETRY_POLICY.get(args.name, p.RetryPolicy())
+                    new_state = p.AttemptState(
+                        attempt_count=attempt_count,
+                        last_attempt_at=completed_at,
+                        gave_up=attempt_count >= policy.max_attempts,
+                    )
+                    run_log.record_attempt(args.name, new_state)
+            except Exception as e:  # noqa: BLE001 — best-effort
+                print(
+                    f"warning: failed to record run outcome for "
+                    f"{args.name!r}: {type(e).__name__}: {e}",
+                    file=sys.stderr,
+                )
+
         if heartbeat is not None:
             heartbeat.stop()
         if claim_token and run_log is not None:
@@ -143,6 +184,9 @@ def _cmd_run(args: argparse.Namespace) -> int:
                 )
         if run_log is not None:
             run_log.close()
+        # If the pipeline raised, surface it now (after RunLog writes).
+        if err is not None and not isinstance(err, SystemExit):
+            return 1
 
 
 def _cmd_consume(args: argparse.Namespace) -> int:

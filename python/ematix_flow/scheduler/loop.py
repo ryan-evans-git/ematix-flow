@@ -196,7 +196,7 @@ def _sweep_and_log(run_log: RunLog, now: datetime, metrics) -> None:
             "lease expired: pipeline=%s held_by=%s expires_at=%s",
             e.pipeline, e.worker_id, e.expires_at,
         )
-        _safe_metric(metrics, "inc", "scheduler_lease_expired_total")
+        _safe_metric(metrics, "inc_runs", e.pipeline, "lease_expired")
 
 
 def _walk_and_dispatch(
@@ -215,6 +215,19 @@ def _walk_and_dispatch(
     now: datetime,
 ) -> None:
     """One scheduling tick: find due pipelines, gate, claim, dispatch."""
+    # Refresh _LAST_RUN + _ATTEMPT_STATE from the RunLog every tick so
+    # workers' outcome writes (`run_log.record_run` in `flow run`) are
+    # visible to the upstream-freshness + retry-backoff gates. Without
+    # this, `depends_on=[...]` downstream pipelines stay gated forever
+    # because the scheduler never sees the worker's success.
+    try:
+        run_log.restore_into_process()
+    except Exception as e:  # noqa: BLE001
+        log.warning(
+            "scheduler: restore_into_process failed: %s: %s",
+            type(e).__name__, e,
+        )
+
     due = [
         sp.name for sp in pipeline.list_pipelines()
         if pipeline.is_due(sp.schedule, now, interval_seconds)
@@ -298,7 +311,7 @@ def _dispatch_one(
             "scheduler: dispatched pipeline=%s claim=%s",
             spec.pipeline_name, claim_token[:8],
         )
-        _safe_metric(metrics, "inc", "scheduler_dispatched_total")
+        _safe_metric(metrics, "inc_runs", spec.pipeline_name, "dispatched")
     except DispatchError as e:
         # Spawn failed — release the claim so the next tick can retry.
         run_log.release(claim_token)
@@ -319,7 +332,7 @@ def _dispatch_one(
                     "scheduler: alerter %s failed: %s",
                     type(a).__name__, exc,
                 )
-        _safe_metric(metrics, "inc", "scheduler_dispatch_failed_total")
+        _safe_metric(metrics, "inc_runs", spec.pipeline_name, "dispatch_failed")
 
 
 def _safe_metric(metrics, method: str, *args, **kwargs) -> None:
