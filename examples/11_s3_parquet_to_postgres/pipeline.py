@@ -20,6 +20,7 @@ from ematix_flow import (
     register_connection,
     run_streaming_pipeline,
 )
+from ematix_flow.streaming import StateStore
 
 
 def main() -> None:
@@ -44,12 +45,22 @@ def main() -> None:
     # the last high-water mark on each tick, decodes each parquet
     # file's row groups, and ships the resulting Arrow batches to
     # the target's INSERT path.
+    #
+    # The StateStore persists the high-water mark (last-seen object
+    # key) so a restart resumes from where it left off — no
+    # re-processing of already-drained files. We use the same
+    # Postgres instance as the target; in production this would
+    # typically be a separate operational DB.
     run_streaming_pipeline(
         name="s3-events-to-pg",
         source=src,
         source_query="events/",
         target=tgt,
         target_table=("analytics", "events"),
+        state_store=StateStore(
+            kind="postgres",
+            url="postgres://postgres:postgres@localhost:5434/postgres",
+        ),
     )
 
 

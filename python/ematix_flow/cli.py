@@ -112,6 +112,20 @@ def _cmd_run(args: argparse.Namespace) -> int:
     _import_user_module(args.module)
 
     run_log = _open_run_log_or_none(args) if claim_token else None
+    if claim_token and run_log is not None:
+        # Restore _LAST_RUN + _ATTEMPT_STATE from the RunLog BEFORE the
+        # pipeline runs so the worker can compute the correct
+        # attempt_count on failure (prev.attempt_count + 1 instead of
+        # always 1). Without this, a flaky pipeline never advances past
+        # attempt_count=1 and gave_up never fires.
+        try:
+            run_log.restore_into_process()
+        except Exception as e:  # noqa: BLE001
+            print(
+                f"warning: restore_into_process failed in worker: "
+                f"{type(e).__name__}: {e}",
+                file=sys.stderr,
+            )
     heartbeat = None
     if claim_token and run_log is not None:
         from ematix_flow.executors.heartbeat import HeartbeatThread
