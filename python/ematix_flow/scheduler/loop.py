@@ -161,7 +161,21 @@ def run_scheduler(
 
 def _import_user_module(module: str) -> None:
     """Import the user's pipelines module so the @register decorators
-    fire and populate the in-process registry."""
+    fire and populate the in-process registry.
+
+    Adds the current working directory to `sys.path` before importing
+    so users can `flow scheduler --module pipelines` from the dir
+    containing `pipelines.py` without manually exporting `PYTHONPATH`.
+    Setuptools entry-point scripts (like the installed `flow` bin)
+    don't get cwd on sys.path automatically; this restores the
+    `python script.py` behavior most users expect.
+    """
+    import os
+    import sys
+
+    cwd = os.getcwd()
+    if cwd not in sys.path:
+        sys.path.insert(0, cwd)
     __import__(module)
 
 

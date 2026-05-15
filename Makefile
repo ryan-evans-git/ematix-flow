@@ -104,7 +104,7 @@ DEMO10_MOD := examples.10_workflow_dag.pipelines
 DEMO10_RUNS := sqlite:///tmp/ematix-demo-10-runs.db
 
 demo-workflow-scheduler:  ## Demo 10: run flow scheduler against the DAG (Ctrl+C to stop).
-	cd examples/10_workflow_dag && $(abspath $(FLOW)) scheduler \
+	cd examples/10_workflow_dag && PYTHONPATH=. $(abspath $(FLOW)) scheduler \
 		--module pipelines \
 		--executor "subprocess+python://" \
 		--run-log-url "$(DEMO10_RUNS)" \
@@ -112,7 +112,7 @@ demo-workflow-scheduler:  ## Demo 10: run flow scheduler against the DAG (Ctrl+C
 		--interval 60
 
 demo-workflow-status:  ## Demo 10: per-pipeline status snapshot.
-	cd examples/10_workflow_dag && $(abspath $(FLOW)) status \
+	cd examples/10_workflow_dag && PYTHONPATH=. $(abspath $(FLOW)) status \
 		--module pipelines \
 		--run-log-url "$(DEMO10_RUNS)"
 

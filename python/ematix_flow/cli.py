@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import importlib
 import json
+import os
 import sys
 from datetime import UTC, datetime
 from typing import Any
@@ -31,6 +32,13 @@ def _parse_iso(s: str) -> datetime:
 
 
 def _import_user_module(name: str) -> None:
+    # Setuptools entry-point scripts don't get cwd on sys.path the way
+    # `python script.py` does. Prepend it so users can `flow ... --module
+    # pipelines` from the dir containing `pipelines.py` without manually
+    # exporting PYTHONPATH.
+    cwd = os.getcwd()
+    if cwd not in sys.path:
+        sys.path.insert(0, cwd)
     importlib.import_module(name)
 
 
