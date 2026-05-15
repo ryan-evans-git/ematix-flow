@@ -7,6 +7,7 @@
 CREATE SCHEMA IF NOT EXISTS analytics;
 
 CREATE TABLE IF NOT EXISTS analytics.clicks (
+    seq_id      BIGINT       NOT NULL,
     user_id     BIGINT       NOT NULL,
     url         TEXT         NOT NULL,
     event_ts    TIMESTAMP    NOT NULL,

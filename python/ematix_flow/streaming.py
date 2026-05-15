@@ -1403,15 +1403,22 @@ def _resolve_kafka_schema_registry(
     )
 
 
-def _kafka_payload_and_sr_lines(conn: KafkaConnection) -> list[str]:
+def _kafka_payload_and_sr_lines(
+    conn: KafkaConnection, *, as_source: bool = False
+) -> list[str]:
     """Emit `payload_format = ...` + `schema_registry_url = ...` (and
     SR basic-auth, if configured) for a Kafka source or target.
     Shared between ``_source_fields`` and ``_target_fields`` so SR
     plumbing stays in one place.
+
+    `auto_offset_reset` is consumer-only; only emitted when
+    ``as_source=True``.
     """
     out: list[str] = []
     if conn.payload_format is not None:
         out.append(f"payload_format = {_q(conn.payload_format)}")
+    if as_source and conn.auto_offset_reset is not None:
+        out.append(f"auto_offset_reset = {_q(conn.auto_offset_reset)}")
     sr = _resolve_kafka_schema_registry(conn)
     if sr is None:
         return out
@@ -1506,7 +1513,7 @@ def _source_fields(conn: Connection) -> list[str]:
         out = ['kind = "kafka"', f"bootstrap_servers = {_q(bootstrap)}"]
         if conn.group_id is not None:
             out.append(f"group_id = {_q(resolve(conn.group_id))}")
-        out.extend(_kafka_payload_and_sr_lines(conn))
+        out.extend(_kafka_payload_and_sr_lines(conn, as_source=True))
         out.extend(_kafka_auth_lines(conn))
         return out
     if isinstance(conn, RabbitMQConnection):

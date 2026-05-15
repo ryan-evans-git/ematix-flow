@@ -277,6 +277,12 @@ class KafkaConnection(Connection):
     bootstrap_servers: str = ""
     group_id: str | None = None
     payload_format: str | None = None  # "json" | "raw_bytes" | "avro" | "protobuf"
+    # Consumer-side `auto.offset.reset` — where a fresh consumer
+    # group with no committed offsets starts reading.
+    #   "earliest" (default): from the start of the topic
+    #   "latest": only events produced AFTER the consumer subscribes
+    # Maps directly to rdkafka's `auto.offset.reset`.
+    auto_offset_reset: str | None = None
     schema_registry_url: str | None = None
     # Π.1: typed Schema Registry reference. Accepts a
     # `SchemaRegistryConnection` instance or a registered SR name

@@ -20,6 +20,11 @@ KAFKA = KafkaConnection(
     bootstrap_servers="localhost:9092",
     group_id="ematix-demo-09",
     payload_format="json",
+    # Fresh consumer group with no committed offsets reads from the
+    # start of the topic — picks up any events the producer emitted
+    # before the consumer subscribed. After the first commit, this is
+    # ignored and we resume from the committed position.
+    auto_offset_reset="earliest",
 )
 
 WAREHOUSE = PostgresConnection(
@@ -39,7 +44,7 @@ WAREHOUSE = PostgresConnection(
     # writes it as a real TIMESTAMP column (instead of choking on
     # "error serializing parameter 0").
     transform_sql=(
-        "SELECT user_id, url, "
+        "SELECT seq_id, user_id, url, "
         "arrow_cast(event_ts, 'Timestamp(Microsecond, None)') AS event_ts, "
         "referrer "
         "FROM source"

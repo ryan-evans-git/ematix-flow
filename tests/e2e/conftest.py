@@ -129,3 +129,50 @@ def wait_for_rows(table: str, target: int, timeout: float = 20.0) -> int:
 
 def truncate(table: str) -> None:
     psql(f"TRUNCATE {table}")
+
+
+def reset_kafka_topic(topic: str, *, partitions: int = 1) -> None:
+    """Delete + recreate a Kafka topic so the next consumer starts
+    from offset 0. Also implicitly clears any consumer-group state
+    bound to that topic since group offsets reference (topic,
+    partition, offset) tuples that no longer exist.
+
+    Useful for restart-resume tests where the test must control the
+    initial offset state independently of prior test runs.
+    """
+    # Best-effort delete (may not exist on first run).
+    subprocess.run(
+        ["docker", "exec", "ematix-flow-kafka",
+         "/opt/kafka/bin/kafka-topics.sh",
+         "--bootstrap-server", "localhost:9092",
+         "--delete", "--topic", topic],
+        capture_output=True, timeout=15,
+    )
+    # Recreate. `--if-not-exists` so a race doesn't fail us.
+    subprocess.run(
+        ["docker", "exec", "ematix-flow-kafka",
+         "/opt/kafka/bin/kafka-topics.sh",
+         "--bootstrap-server", "localhost:9092",
+         "--create", "--if-not-exists",
+         "--topic", topic,
+         "--partitions", str(partitions),
+         "--replication-factor", "1"],
+        capture_output=True, check=True, timeout=15,
+    )
+
+
+def reset_consumer_group(group_id: str) -> None:
+    """Delete a Kafka consumer group's committed offsets. Equivalent
+    to a brand-new group_id on next subscribe — `auto_offset_reset`
+    behavior kicks in.
+
+    Silent no-op if the group doesn't exist. Fails loudly if the
+    group has active members (caller must stop consumers first).
+    """
+    subprocess.run(
+        ["docker", "exec", "ematix-flow-kafka",
+         "/opt/kafka/bin/kafka-consumer-groups.sh",
+         "--bootstrap-server", "localhost:9092",
+         "--delete", "--group", group_id],
+        capture_output=True, timeout=15,
+    )
