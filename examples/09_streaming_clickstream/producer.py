@@ -38,7 +38,9 @@ def main() -> None:
             event = {
                 "user_id": random.randint(1, 100),
                 "url": random.choice(URLS),
-                "event_ts": datetime.now(UTC).isoformat(),
+                # ISO-8601 without timezone offset — keeps the
+                # Arrow → Postgres TIMESTAMP cast in pipeline.py simple.
+                "event_ts": datetime.now(UTC).replace(tzinfo=None).isoformat(timespec="microseconds"),
                 "referrer": random.choice(REFERRERS),
             }
             p.produce("clicks", json.dumps(event).encode("utf-8"))

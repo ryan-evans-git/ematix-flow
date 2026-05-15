@@ -8,7 +8,7 @@
 # idempotent and the Docker prune is targeted by label so it can't
 # touch unrelated containers on your machine.
 
-.PHONY: help test test-python test-rust test-integration \
+.PHONY: help test test-python test-rust test-integration test-e2e \
         clean-testcontainers fmt lint security \
         up down logs demo-deps \
         demo-streaming-init demo-streaming-producer demo-streaming-pipeline \
@@ -35,6 +35,9 @@ test-rust:  ## Rust workspace lib tests (no testcontainers).
 	cargo test --workspace --lib
 
 # ---- integration lane (Docker-gated, auto-cleanup) --------------
+
+test-e2e: ## E2E demo suite (needs `make up` for postgres+kafka+minio).
+	$(PYTHON) -m pytest tests/e2e/ --e2e -v
 
 test-integration: ## Full integration suite incl. testcontainers; always cleans up after.
 	@echo "==> Running integration tests (testcontainers will spin up postgres/redis/minio/kafka/etc)"
@@ -95,8 +98,8 @@ demo-streaming-producer:  ## Demo 09: run the synthetic producer (Ctrl+C to stop
 	$(PYTHON) examples/09_streaming_clickstream/producer.py
 
 demo-streaming-pipeline:  ## Demo 09: run the streaming pipeline (Ctrl+C to stop).
-	$(FLOW) consume examples/09_streaming_clickstream/pipeline.toml \
-		--restart-on-error --max-restarts 10
+	cd examples/09_streaming_clickstream && PYTHONPATH=. \
+		$(abspath $(FLOW)) consume --module pipeline clicks-to-pg
 
 # ---- demo 10: workflow DAG + central scheduler ------------------
 

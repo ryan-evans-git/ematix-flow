@@ -9,7 +9,7 @@ CREATE SCHEMA IF NOT EXISTS analytics;
 CREATE TABLE IF NOT EXISTS analytics.clicks (
     user_id     BIGINT       NOT NULL,
     url         TEXT         NOT NULL,
-    event_ts    TIMESTAMPTZ  NOT NULL,
+    event_ts    TIMESTAMP    NOT NULL,
     referrer    TEXT
 );
 

@@ -34,7 +34,7 @@ def main() -> None:
     )
     tgt = PostgresConnection(
         name="warehouse",
-        url="postgres://postgres:postgres@localhost:5432/postgres",
+        url="postgres://postgres:postgres@localhost:5434/postgres",
     )
     register_connection(src)
     register_connection(tgt)

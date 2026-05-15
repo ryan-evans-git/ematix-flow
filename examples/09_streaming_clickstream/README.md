@@ -6,6 +6,11 @@ table in real time.
 **Shape:** Python producer → Kafka topic `clicks` → `flow consume`
 streaming daemon → `analytics.clicks` in Postgres.
 
+The pipeline itself is declared in `pipeline.py` via the typed-Python
+`@ematix.streaming_pipeline(...)` decorator; `flow consume --module
+pipeline clicks-to-pg` imports the module and runs the registered
+pipeline.
+
 ## Run
 
 From the repo root, with `make up` already done (`docker compose up
