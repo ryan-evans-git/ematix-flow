@@ -9,11 +9,15 @@
 # touch unrelated containers on your machine.
 
 .PHONY: help test test-python test-rust test-integration \
-        clean-testcontainers fmt lint security
+        clean-testcontainers fmt lint security \
+        up down logs demo-deps \
+        demo-streaming-init demo-streaming-producer demo-streaming-pipeline \
+        demo-workflow-scheduler demo-workflow-status \
+        demo-s3-init demo-s3-seed demo-s3-pipeline
 
 help:  ## Show this help.
 	@awk 'BEGIN {FS=":.*##"; printf "Targets:\n"} \
-	     /^[a-zA-Z_-]+:.*##/ {printf "  %-22s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
+	     /^[a-zA-Z0-9_-]+:.*##/ {printf "  %-25s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
 
 # ---- fast test lanes (no Docker) ---------------------------------
 
@@ -58,3 +62,62 @@ lint:  ## ruff (Python) + clippy (Rust, the strict CI gate).
 security:  ## bandit (Python) + cargo-audit (Rust).
 	bandit -r python -ll -c pyproject.toml
 	cargo audit
+
+# ---- demo-stack lifecycle ----------------------------------------
+
+demo-deps:  ## Install Python deps the demos need (confluent-kafka, boto3, pyarrow).
+	pip install 'confluent-kafka>=2.0' 'boto3>=1.30' 'pyarrow>=14'
+
+up:  ## Bring up the demo docker stack (postgres + kafka + minio).
+	docker compose -f examples/docker-compose.yml up -d
+	@echo "==> waiting for services to be healthy"
+	@docker compose -f examples/docker-compose.yml ps
+
+down:  ## Tear down the demo docker stack (preserves volumes).
+	docker compose -f examples/docker-compose.yml down
+
+logs:  ## Tail logs from the demo docker stack.
+	docker compose -f examples/docker-compose.yml logs -f
+
+# ---- demo 09: streaming clickstream (Kafka → Postgres) ----------
+
+PG_EXEC = docker exec -i ematix-flow-pg psql -U postgres
+
+demo-streaming-init:  ## Demo 09: create analytics.clicks table.
+	$(PG_EXEC) -f - < examples/09_streaming_clickstream/init.sql
+
+demo-streaming-producer:  ## Demo 09: run the synthetic producer (Ctrl+C to stop).
+	python examples/09_streaming_clickstream/producer.py
+
+demo-streaming-pipeline:  ## Demo 09: run the streaming pipeline (Ctrl+C to stop).
+	flow consume examples/09_streaming_clickstream/pipeline.toml \
+		--restart-on-error --max-restarts 10
+
+# ---- demo 10: workflow DAG + central scheduler ------------------
+
+DEMO10_MOD := examples.10_workflow_dag.pipelines
+DEMO10_RUNS := sqlite:///tmp/ematix-demo-10-runs.db
+
+demo-workflow-scheduler:  ## Demo 10: run flow scheduler against the DAG (Ctrl+C to stop).
+	cd examples/10_workflow_dag && flow scheduler \
+		--module pipelines \
+		--executor "subprocess+python://" \
+		--run-log-url "$(DEMO10_RUNS)" \
+		--poll-interval 5 \
+		--interval 60
+
+demo-workflow-status:  ## Demo 10: per-pipeline status snapshot.
+	cd examples/10_workflow_dag && flow status \
+		--module pipelines \
+		--run-log-url "$(DEMO10_RUNS)"
+
+# ---- demo 11: S3 (MinIO) parquet → Postgres ---------------------
+
+demo-s3-init:  ## Demo 11: create analytics.events table.
+	$(PG_EXEC) -f - < examples/11_s3_parquet_to_postgres/init.sql
+
+demo-s3-seed:  ## Demo 11: upload 3 parquet files to MinIO bucket.
+	python examples/11_s3_parquet_to_postgres/seed.py
+
+demo-s3-pipeline:  ## Demo 11: run the S3 → Postgres pipeline (Ctrl+C to stop).
+	python examples/11_s3_parquet_to_postgres/pipeline.py

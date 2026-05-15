@@ -1,0 +1,32 @@
+# Streaming pipeline for demo 09: Kafka clicks topic -> Postgres
+# analytics.clicks table.
+#
+# The source emits JSON events with shape:
+#   {"user_id": int, "url": str, "event_ts": str (ISO-8601), "referrer": str|null}
+#
+# The pipeline does NO transformation — it lands every event row as-is.
+# Run with:
+#   flow consume examples/09_streaming_clickstream/pipeline.toml \
+#       --restart-on-error
+
+pipeline_name = "clicks-to-pg"
+source_query  = "clicks"
+idle_pause_ms = 200
+
+[source]
+kind              = "kafka"
+bootstrap_servers = "localhost:9092"
+group_id          = "ematix-demo-09"
+payload_format    = "json"
+# Start from the earliest message on first run so the demo shows
+# pre-existing producer output. After the consumer group commits
+# offsets, this auto-resumes from the last committed position.
+auto_offset_reset = "earliest"
+
+[target]
+kind = "postgres"
+url  = "postgres://postgres:postgres@localhost:5432/postgres"
+
+[target.table]
+schema = "analytics"
+name   = "clicks"

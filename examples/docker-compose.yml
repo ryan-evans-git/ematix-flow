@@ -1,8 +1,11 @@
-# Local dev stack for the streaming examples (05–08).
+# Local dev stack for the streaming + S3 + scheduler examples.
 #
 # Brings up:
 #   - postgres:16-alpine on :5432, db=postgres / user=postgres / pw=postgres
 #   - kafka (KRaft mode, no Zookeeper) on :9092
+#   - minio on :9000 (S3 API) + :9001 (web console)
+#     creds: minioadmin / minioadmin (set via env below)
+#   - minio-init: one-shot, creates the `ematix-demo` bucket and exits
 #
 # `docker compose up -d` to start. `docker compose down -v` to wipe.
 #
@@ -47,3 +50,38 @@ services:
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
       KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
       CLUSTER_ID: ematix-flow-cluster-id
+
+  # S3-API-compatible object store. Demo 11 uses this as the "S3
+  # without AWS" source. Web console at http://localhost:9001 (same
+  # creds) shows buckets + uploaded files visually.
+  minio:
+    image: minio/minio:latest
+    container_name: ematix-flow-minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # One-shot: create the `ematix-demo` bucket after MinIO is healthy,
+  # then exit. The `mc` CLI ships in the minio/mc image. Idempotent
+  # — re-running this is a no-op on an existing bucket.
+  minio-init:
+    image: minio/mc:latest
+    container_name: ematix-flow-minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      sh -c "
+      mc alias set local http://minio:9000 minioadmin minioadmin &&
+      mc mb --ignore-existing local/ematix-demo &&
+      echo 'bucket ematix-demo ready'
+      "
