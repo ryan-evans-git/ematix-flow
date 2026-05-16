@@ -115,6 +115,7 @@ Goal: stand alongside PySpark on batch SQL throughput at <20% of PySpark's image
 | Σ.B | 1 dev | 3–6 wk | Distributed batch SQL works at <150 MB image |
 | Σ.C | 1 dev | 1–2 wk | Public-facing benchmark vs PySpark |
 | Σ.D | 1 dev | 12–20 wk | Distributed streaming SQL (gated on spike) |
+| Σ.E3 | 1 dev | ~5 wk | Dict-aware execution end-to-end (see `docs/PHASE_SIGMA_E3_DICT_AWARE.md`) — Photon's #1 string-workload lever, scoped 2026-05-15 |
 | **A1–C only** | | **~7–13 wk** | Production-ready vs Spark batch |
 | **A1–D** | | **~19–33 wk** | Production-ready vs Spark batch + streaming |
 
