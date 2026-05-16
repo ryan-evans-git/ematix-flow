@@ -28,6 +28,9 @@ all-features = true
 #     license used by the `webpki-roots*` crates that ship the
 #     Mozilla CA bundle.
 #   - MPL-2.0 — file-level copyleft, OK for our usage.
+#   - BSL-1.0 — Boost Software License, OSI-approved + FSF-Free
+#     permissive, pulled in by `xxhash-rust` (transitive via
+#     polars-core in the triangulation bench feature).
 #
 # DO NOT add GPL-2.0/GPL-3.0/AGPL/SSPL/BUSL/Elastic-License/
 # Commons-Clause here. The whole point of this gate is to keep
@@ -45,6 +48,7 @@ allow = [
     "MPL-2.0",
     "bzip2-1.0.6",
     "CDLA-Permissive-2.0",
+    "BSL-1.0",
 ]
 
 # Confidence floor for license-text matching. cargo-deny computes a
