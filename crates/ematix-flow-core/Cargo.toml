@@ -254,3 +254,18 @@ name = "tpch_triangulation_bench"
 path = "examples/tpch_triangulation_bench.rs"
 required-features = ["triangulation"]
 
+# Σ.E3b.1 bench: `COUNT(*) GROUP BY dict_col` —
+# `DictGroupCountExec` vs DataFusion's default `AggregateExec` on a
+# synthetic dict-encoded fixture sized to amplify the per-row hot
+# loop (no I/O, no parquet decode — measures the agg kernel only).
+[[example]]
+name = "dict_group_count_bench"
+path = "examples/dict_group_count_bench.rs"
+
+
+# Σ.E3b diagnostic: do TPC-H string columns arrive at the Arrow
+# surface as Dictionary(UInt32, Utf8)? Gates whether
+# `EnableDictGroupCountRule` can ever fire on real parquet data.
+[[example]]
+name = "probe_dict_arrival"
+path = "examples/probe_dict_arrival.rs"

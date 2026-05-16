@@ -10,40 +10,40 @@ Each cell is **median ms ± σ** across 5 trials. "—" means the engine couldn'
 
 | Query | ematix-flow | DuckDB | Polars | Best |
 |------:|------------:|-------:|-------:|:-----|
-| Q01  | 80.86 ± 0.68 | 54.63 ± 4.95 | 48.60 ± 1.41 | Polars |
-| Q02  | 10.83 ± 0.25 | 19.80 ± 2.26 | 62.69 ± 24.10 | ematix-flow |
-| Q03  | 27.22 ± 1.72 | 43.66 ± 4.44 | 85.35 ± 9.20 | ematix-flow |
-| Q04  | 20.36 ± 2.44 | 32.33 ± 1.59 | 40.73 ± 5.79 | ematix-flow |
-| Q05  | 42.07 ± 2.97 | 51.25 ± 6.58 | 14083.27 ± 324.62 | ematix-flow |
-| Q06  | 17.57 ± 3.51 | 15.72 ± 2.80 | 12.04 ± 89.60 | Polars |
-| Q07  | 73.59 ± 4.36 | 38.06 ± 3.41 | 205.06 ± 14.75 | DuckDB |
-| Q08  | 43.65 ± 2.58 | 56.25 ± 4.20 | 153.63 ± 19.76 | ematix-flow |
-| Q09  | 54.25 ± 2.79 | 72.86 ± 6.23 | 72.05 ± 2.06 | ematix-flow |
-| Q10  | 44.66 ± 0.97 | 85.32 ± 3.61 | 174.49 ± 35.55 | ematix-flow |
-| Q11  | 11.68 ± 1.19 | 15.93 ± 1.84 | 11.72 ± 0.27 | ematix-flow |
-| Q12  | 27.61 ± 0.90 | 38.29 ± 2.65 | 26.07 ± 0.90 | Polars |
-| Q13  | 49.54 ± 2.70 | 164.26 ± 6.33 | 122.99 ± 2.18 | ematix-flow |
-| Q14  | 15.14 ± 0.84 | 31.49 ± 3.39 | 18.62 ± 0.73 | ematix-flow |
-| Q15  | 18.73 ± 0.74 | 21.21 ± 1.51 | 13.15 ± 0.62 | Polars |
-| Q16  | 13.75 ± 2.71 | 34.20 ± 1.98 | 41.89 ± 4.24 | ematix-flow |
-| Q17  | 51.77 ± 1.32 | 34.55 ± 3.51 | 60.13 ± 3.58 | DuckDB |
-| Q18  | 85.13 ± 8.39 | 73.86 ± 7.27 | 74.39 ± 10.47 | DuckDB |
-| Q19  | 73.55 ± 6.27 | 47.54 ± 1.01 | 182.20 ± 12.33 | DuckDB |
-| Q20  | 26.12 ± 1.97 | 45.00 ± 1.28 | 31.35 ± 1.01 | ematix-flow |
-| Q21  | 78.92 ± 8.78 | 101.83 ± 2.13 | 1112.38 ± 44.63 | ematix-flow |
-| Q22  | 12.87 ± 0.64 | 32.10 ± 0.38 | 16.68 ± 0.71 | ematix-flow |
+| Q01  | 78.19 ± 2.85 | 46.55 ± 1.20 | 45.95 ± 3.15 | Polars |
+| Q02  | 10.32 ± 0.27 | 20.38 ± 3.28 | 56.43 ± 1.57 | ematix-flow |
+| Q03  | 20.38 ± 1.22 | 33.85 ± 2.13 | 56.12 ± 3.27 | ematix-flow |
+| Q04  | 15.78 ± 0.55 | 23.84 ± 2.74 | 27.57 ± 0.57 | ematix-flow |
+| Q05  | 34.09 ± 0.57 | 34.29 ± 4.33 | 13959.84 ± 1638.74 | ematix-flow |
+| Q06  | 11.67 ± 0.55 | 15.35 ± 2.06 | 13.95 ± 663.47 | ematix-flow |
+| Q07  | 75.56 ± 15.62 | 38.19 ± 3.22 | 178.72 ± 21.10 | DuckDB |
+| Q08  | 35.66 ± 0.89 | 47.58 ± 3.12 | 136.28 ± 11.88 | ematix-flow |
+| Q09  | 50.16 ± 13.81 | 71.09 ± 4.96 | 71.85 ± 10.20 | ematix-flow |
+| Q10  | 39.73 ± 1.07 | 77.23 ± 3.29 | 145.32 ± 9.26 | ematix-flow |
+| Q11  | 9.37 ± 1.98 | 11.64 ± 0.63 | 11.00 ± 1.42 | ematix-flow |
+| Q12  | 23.34 ± 1.00 | 29.06 ± 2.33 | 21.91 ± 1.40 | Polars |
+| Q13  | 44.73 ± 1.07 | 165.46 ± 55.39 | 210.17 ± 31.58 | ematix-flow |
+| Q14  | 19.45 ± 2.62 | 31.20 ± 10.59 | 23.71 ± 1.01 | ematix-flow |
+| Q15  | 27.70 ± 2.14 | 28.40 ± 4.94 | 20.95 ± 0.93 | Polars |
+| Q16  | 18.29 ± 1.34 | 52.82 ± 5.40 | 38.14 ± 1.58 | ematix-flow |
+| Q17  | 80.96 ± 34.35 | 59.92 ± 2.02 | 110.50 ± 42.51 | DuckDB |
+| Q18  | 157.55 ± 45.84 | 59.51 ± 18.11 | 67.81 ± 1.75 | DuckDB |
+| Q19  | 99.76 ± 27.36 | 85.65 ± 3.59 | 341.46 ± 81.09 | DuckDB |
+| Q20  | 44.22 ± 5.99 | 77.82 ± 4.43 | 70.68 ± 23.44 | ematix-flow |
+| Q21  | 75.48 ± 2.08 | 98.97 ± 16.94 | 829.37 ± 23.82 | ematix-flow |
+| Q22  | 8.90 ± 0.46 | 25.38 ± 5.38 | 14.82 ± 0.66 | ematix-flow |
 
 ## Wins
 
-- **ematix-flow**: 14
+- **ematix-flow**: 15
 - **DuckDB**: 4
-- **Polars**: 4
+- **Polars**: 3
 
 ## Caveats
 
 - ematix-flow's late-materialization path (Π.10 `read_column_*_masked_into`) is enabled for `lineitem`. Late-mat helps queries with a selective filter on a dict/PLAIN-decodable scalar column (notably Q14); on aggregate-heavy queries with low filter selectivity (Q1) it's effectively a no-op.
 - Polars's SQL frontend rejects several TPC-H canonical shapes: implicit cross-join in FROM, bare-column equi-joins, EXISTS subqueries, scalar-subquery comparisons, `SUBSTRING ... FROM ... FOR`, HAVING against unprojected columns. We ship hand-translated `q??.polars.sql` variants alongside the canonical `q??.sql` files (under `examples/tpch/queries/`); the bench feeds Polars the polars variant when present. Translations are semantically equivalent: explicit JOIN ON with qualified columns; scalar subqueries materialized as CTE + CROSS JOIN; EXISTS rewritten as semi-join via DISTINCT + INNER JOIN; SUBSTRING rewritten as SUBSTR(x, start, len).
-- DuckDB runs at default settings (in-memory `read_parquet` views). ematix-flow runs with `target_partitions=14` and the InjectFusedQ1/Q3/Q5/Q6/Q12 physical-optimizer rules registered.
+- DuckDB runs at default settings (in-memory `read_parquet` views). ematix-flow runs with `target_partitions=14` and the InjectFusedQ1/Q3/Q5/Q6/Q12 + EnableDictGroupCount physical-optimizer rules registered.
 
 ## Failures and dialect gaps
 
