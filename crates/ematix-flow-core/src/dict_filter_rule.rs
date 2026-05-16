@@ -16,11 +16,11 @@
 //! planner emits when it casts a string literal to match the dict
 //! column's type during predicate unification.
 //!
+//! Projecting `FilterExec` nodes (`FilterExec { projection: Some }`)
+//! are handled by wrapping the `DictFilterExec` in a `ProjectionExec`
+//! with the same column-index selection.
+//!
 //! Out of scope for Σ.E3a (deferred):
-//! * Projecting FilterExec nodes (`FilterExec { projection: Some }`).
-//!   Rewriting those without preserving the projection produces
-//!   wrong-schema output downstream; a future commit wraps the
-//!   rewrite in a ProjectionExec.
 //! * `NOT IN`, mixed-type lists, NULL literals.
 //!
 //! The rule is **strictly speculative**: any departure from the
@@ -40,6 +40,7 @@ use datafusion::physical_expr::expressions::{BinaryExpr, Column, InListExpr, Lit
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::filter::FilterExec;
+use datafusion::physical_plan::projection::ProjectionExec;
 
 use crate::dict_filter::{DictFilterExec, DictInListPredicate};
 
@@ -65,8 +66,28 @@ impl PhysicalOptimizerRule for EnableDictFilterRule {
             let Some(predicate) = match_in_list_on_dict_column(filter) else {
                 return Ok(Transformed::no(node));
             };
-            let new = DictFilterExec::try_new(filter.input().clone(), predicate)?;
-            Ok(Transformed::yes(Arc::new(new) as Arc<dyn ExecutionPlan>))
+            let dict_exec = Arc::new(DictFilterExec::try_new(filter.input().clone(), predicate)?)
+                as Arc<dyn ExecutionPlan>;
+            // Preserve the FilterExec's inline projection (if any) by
+            // wrapping the DictFilterExec in a ProjectionExec with the
+            // same column-index selection.
+            let new: Arc<dyn ExecutionPlan> = match filter.projection() {
+                Some(indices) => {
+                    let child_schema = dict_exec.schema();
+                    let mut exprs: Vec<(Arc<dyn PhysicalExpr>, String)> =
+                        Vec::with_capacity(indices.len());
+                    for &i in indices.iter() {
+                        let field = child_schema.field(i);
+                        exprs.push((
+                            Arc::new(Column::new(field.name(), i)) as Arc<dyn PhysicalExpr>,
+                            field.name().clone(),
+                        ));
+                    }
+                    Arc::new(ProjectionExec::try_new(exprs, dict_exec)?)
+                }
+                None => dict_exec,
+            };
+            Ok(Transformed::yes(new))
         })?;
         Ok(result.data)
     }
@@ -95,14 +116,6 @@ impl PhysicalOptimizerRule for EnableDictFilterRule {
 /// non-Utf8 literals, comparisons on non-dict columns — return
 /// `None`, leaving the rule a no-op.
 fn match_in_list_on_dict_column(filter: &FilterExec) -> Option<DictInListPredicate> {
-    // Σ.E3a scope: defer handling FilterExecs with inline projection
-    // (e.g. `SELECT col FROM t WHERE ...` collapses filter+project
-    // into one node). Rewriting those without preserving the projection
-    // produces wrong-schema output downstream. Follow-up will wrap
-    // the rewrite in a ProjectionExec.
-    if filter.projection().is_some() {
-        return None;
-    }
     let child_schema = filter.input().schema();
 
     // Collect (col_idx, allowed_values) from whichever predicate shape
@@ -123,7 +136,8 @@ fn match_in_list_on_dict_column(filter: &FilterExec) -> Option<DictInListPredica
     }
     match child_schema.field(col_idx).data_type() {
         DataType::Dictionary(key, value)
-            if **key == DataType::UInt32 && **value == DataType::Utf8 => {}
+            if **key == DataType::UInt32
+                && (**value == DataType::Utf8 || **value == DataType::Utf8View) => {}
         _ => return None,
     }
 
@@ -382,6 +396,74 @@ mod tests {
             !has_dict_filter(&rewritten),
             "NOT IN must not be rewritten to DictFilterExec",
         );
+    }
+
+    /// Projection-preserving rewrite: `SELECT payload FROM t WHERE
+    /// l_shipmode IN ('MAIL', 'SHIP')` produces a FilterExec with
+    /// `projection=[payload@1]`. After rewrite, the output schema
+    /// must still be `[payload]` and the row-set must match.
+    #[tokio::test]
+    async fn rule_preserves_inline_projection() {
+        let ctx = ctx_with_shipmode_fixture().await;
+        let default_payloads: Vec<i64> = ctx
+            .sql("SELECT payload FROM t WHERE l_shipmode IN ('MAIL', 'SHIP') ORDER BY payload")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap()
+            .iter()
+            .flat_map(|b| {
+                let a = b
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .clone();
+                (0..a.len()).map(move |i| a.value(i)).collect::<Vec<_>>()
+            })
+            .collect();
+
+        // Rewrite + run.
+        let ctx2 = ctx_with_shipmode_fixture().await;
+        let df = ctx2
+            .sql("SELECT payload FROM t WHERE l_shipmode IN ('MAIL', 'SHIP')")
+            .await
+            .unwrap();
+        let physical = df.create_physical_plan().await.unwrap();
+        let rewritten = EnableDictFilterRule
+            .optimize(physical, &ConfigOptions::default())
+            .unwrap();
+
+        // Output schema must be just [payload].
+        assert_eq!(rewritten.schema().fields().len(), 1, "single output column");
+        assert_eq!(rewritten.schema().field(0).name(), "payload");
+
+        // Plan must now contain a DictFilterExec.
+        fn has_dict_filter(node: &Arc<dyn ExecutionPlan>) -> bool {
+            if node.as_any().is::<DictFilterExec>() {
+                return true;
+            }
+            node.children().iter().any(|c| has_dict_filter(c))
+        }
+        assert!(has_dict_filter(&rewritten), "rule should have rewritten");
+
+        // Row-set equivalence.
+        let mut rule_payloads: Vec<i64> = Vec::new();
+        let parts = rewritten.properties().partitioning.partition_count();
+        for p in 0..parts {
+            let mut s = rewritten.execute(p, ctx2.task_ctx()).unwrap();
+            while let Some(b) = s.try_next().await.unwrap() {
+                let a = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+                for i in 0..a.len() {
+                    rule_payloads.push(a.value(i));
+                }
+            }
+        }
+        rule_payloads.sort();
+        let mut def = default_payloads.clone();
+        def.sort();
+        assert_eq!(rule_payloads, def);
     }
 
     /// A FilterExec over a column whose type is NOT dict-encoded

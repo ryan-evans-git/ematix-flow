@@ -18,13 +18,13 @@
 //!
 //! In:
 //! * Single-column predicate: `dict_col IN (s1, s2, ..., sk)`.
-//! * Dict value type: `Utf8` (extension to `Utf8View` deferred).
-//! * Dict code type: `UInt32` (the FastParquet default).
+//! * Dict value type: `Utf8` and `Utf8View` (the latter is FastParquet's
+//!   default — see Σ.E2).
+//! * Dict code type: `UInt32`.
 //!
 //! Out (Σ.E3a+):
-//! * `LIKE 'prefix%'` and `=` literal — both reduce to a code set, so
-//!   the implementation is the same once the optimizer rule extracts
-//!   them; deferred for review-cost reasons in the first landing.
+//! * `LIKE 'prefix%'` — the same code-set machinery; just a different
+//!   scan-the-dict predicate. Easy follow-up.
 //! * Multi-column predicates / AND chains across different dict cols.
 //! * Non-dict fallback. The operator errors loudly if the column
 //!   isn't dict-encoded on entry; the optimizer rule guarantees we
@@ -40,7 +40,7 @@ use std::any::Any;
 use std::sync::Arc;
 
 use datafusion::arrow::array::{
-    Array, BooleanArray, DictionaryArray, RecordBatch, StringArray, UInt32Array,
+    Array, BooleanArray, DictionaryArray, RecordBatch, StringArray, StringViewArray, UInt32Array,
 };
 use datafusion::arrow::compute::filter_record_batch;
 use datafusion::arrow::datatypes::{DataType, SchemaRef, UInt32Type};
@@ -97,10 +97,11 @@ impl DictFilterExec {
         let field = schema.field(predicate.col_idx);
         match field.data_type() {
             DataType::Dictionary(key, value)
-                if **key == DataType::UInt32 && **value == DataType::Utf8 => {}
+                if **key == DataType::UInt32
+                    && (**value == DataType::Utf8 || **value == DataType::Utf8View) => {}
             other => {
                 return Err(DataFusionError::Plan(format!(
-                    "DictFilterExec: column `{}` has type {other:?}, expected Dictionary(UInt32, Utf8)",
+                    "DictFilterExec: column `{}` has type {other:?}, expected Dictionary(UInt32, Utf8|Utf8View)",
                     field.name(),
                 )));
             }
@@ -211,27 +212,27 @@ fn filter_batch_by_dict_code(
         })?;
 
     // Resolve string literals to dict codes once per batch. The dict
-    // values array is `Utf8` per the construction-time check.
-    let values = dict
-        .values()
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .ok_or_else(|| {
-            DataFusionError::Internal(
-                "DictFilterExec: dict values not StringArray at runtime".into(),
-            )
-        })?;
+    // values array is Utf8 OR Utf8View per the construction-time check.
+    let values = dict.values();
+    let (dict_len, value_at) = if let Some(arr) = values.as_any().downcast_ref::<StringArray>() {
+        (arr.len(), make_value_at_utf8(arr))
+    } else if let Some(arr) = values.as_any().downcast_ref::<StringViewArray>() {
+        (arr.len(), make_value_at_utf8_view(arr))
+    } else {
+        return Err(DataFusionError::Internal(
+            "DictFilterExec: dict values neither StringArray nor StringViewArray at runtime".into(),
+        ));
+    };
 
     // Code set: a Vec<bool> indexed by dict code. Codes are dense
-    // small ints by construction (< 2^32 in theory, but for the
-    // low-cardinality columns this operator targets the dict is
-    // typically ≤ thousands of entries).
-    let dict_len = values.len();
+    // small ints by construction.
     let mut code_set = vec![false; dict_len];
     for lit in &predicate.allowed_values {
         for (code, slot) in code_set.iter_mut().enumerate() {
-            if !values.is_null(code) && values.value(code) == lit.as_str() {
-                *slot = true;
+            if let Some(v) = value_at(code) {
+                if v == lit.as_str() {
+                    *slot = true;
+                }
             }
         }
     }
@@ -256,6 +257,31 @@ fn filter_batch_by_dict_code(
     let mask = BooleanArray::from(mask_buf);
 
     filter_record_batch(batch, &mask).map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
+}
+
+/// Build a `(code) -> Option<&str>` lookup for a `StringArray` dict.
+/// Returns `None` for null slots so the caller can skip-on-null.
+fn make_value_at_utf8<'a>(arr: &'a StringArray) -> Box<dyn Fn(usize) -> Option<&'a str> + 'a> {
+    Box::new(move |code| {
+        if arr.is_null(code) {
+            None
+        } else {
+            Some(arr.value(code))
+        }
+    })
+}
+
+/// Same for `StringViewArray` (Utf8View — FastParquet's dict path).
+fn make_value_at_utf8_view<'a>(
+    arr: &'a StringViewArray,
+) -> Box<dyn Fn(usize) -> Option<&'a str> + 'a> {
+    Box::new(move |code| {
+        if arr.is_null(code) {
+            None
+        } else {
+            Some(arr.value(code))
+        }
+    })
 }
 
 #[cfg(test)]
@@ -489,5 +515,56 @@ mod tests {
             default_payloads, dict_payloads,
             "payloads differ: default={default_payloads:?}, dict={dict_payloads:?}"
         );
+    }
+
+    /// FastParquet emits `DictionaryArray<UInt32, Utf8View>` (not
+    /// `Utf8`). The operator must accept both: pin via a hand-built
+    /// Utf8View dict.
+    #[tokio::test]
+    async fn dict_filter_works_on_utf8view_dict_values() {
+        use datafusion::arrow::array::{StringViewArray, UInt32Array};
+
+        // Hand-build a `DictionaryArray<UInt32Type>` whose values
+        // array is `StringViewArray`.
+        let values = StringViewArray::from(vec!["MAIL", "AIR", "SHIP"]);
+        let keys = UInt32Array::from(vec![0u32, 1, 0, 2, 1]); // MAIL, AIR, MAIL, SHIP, AIR
+        let dict_arr = DictionaryArray::<UInt32Type>::try_new(keys, Arc::new(values)).unwrap();
+        let payload = Int64Array::from(vec![10i64, 20, 30, 40, 50]);
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "l_shipmode",
+                DataType::Dictionary(Box::new(DataType::UInt32), Box::new(DataType::Utf8View)),
+                false,
+            ),
+            Field::new("payload", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(dict_arr) as ArrayRef, Arc::new(payload)],
+        )
+        .unwrap();
+        let input = input_plan_from_batch(batch).await;
+        let exec = Arc::new(
+            DictFilterExec::try_new(
+                input,
+                DictInListPredicate {
+                    col_idx: 0,
+                    allowed_values: vec!["MAIL".into(), "SHIP".into()],
+                },
+            )
+            .unwrap(),
+        );
+        let mut s = exec.execute(0, SessionContext::new().task_ctx()).unwrap();
+        let batch = s.try_next().await.unwrap().unwrap();
+        assert_eq!(batch.num_rows(), 3, "MAIL,MAIL,SHIP survive");
+        let payloads = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(payloads.value(0), 10);
+        assert_eq!(payloads.value(1), 30);
+        assert_eq!(payloads.value(2), 40);
     }
 }
