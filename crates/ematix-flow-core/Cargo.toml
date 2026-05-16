@@ -82,6 +82,20 @@ tracing = { workspace = true }
 # rationale.
 sqlparser = { workspace = true }
 
+# Triangulation bench: `polars` is heavy to compile so we gate it
+# behind the `triangulation` feature. `duckdb` is already a required
+# workspace dep (used by `DuckDBBackend`), so no gating needed there.
+# Cargo requires optional deps live in `[dependencies]` rather than
+# `[dev-dependencies]`; the example `tpch_triangulation_bench` opts
+# in via `required-features`.
+polars = { version = "0.52", optional = true, default-features = false, features = ["sql", "lazy", "parquet", "dtype-date", "dtype-datetime", "dtype-decimal", "strings", "temporal"] }
+
+[features]
+# Run:
+#   cargo run --release -p ematix-flow-core \
+#     --example tpch_triangulation_bench --features triangulation
+triangulation = ["dep:polars"]
+
 [dev-dependencies]
 arrow-array.workspace = true
 testcontainers.workspace = true
@@ -230,4 +244,13 @@ path = "examples/tpch_q12_inject_bench.rs"
 [[example]]
 name = "parquet_page_index_probe"
 path = "examples/parquet_page_index_probe.rs"
+
+# Triangulation bench: run all 22 TPC-H queries through ematix-flow,
+# DuckDB, and Polars in the same process on the same SF=1 parquet
+# data; produce BENCHMARKS.md. Heavy deps (polars, duckdb) gated
+# behind the `triangulation` feature.
+[[example]]
+name = "tpch_triangulation_bench"
+path = "examples/tpch_triangulation_bench.rs"
+required-features = ["triangulation"]
 
