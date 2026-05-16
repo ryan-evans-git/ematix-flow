@@ -493,9 +493,7 @@ fn build_partition_stream(
                 (Some(f), true) => {
                     decode_one_rg_filtered_late_mat(&path_buf, rg, &schema, &projection, f)
                 }
-                (Some(f), false) => {
-                    decode_one_rg_filtered(&path_buf, rg, &schema, &projection, f)
-                }
+                (Some(f), false) => decode_one_rg_filtered(&path_buf, rg, &schema, &projection, f),
                 (None, _) => decode_one_rg(&path_buf, rg, &schema, &projection),
             };
             if tx.blocking_send(batch_result).is_err() {
@@ -622,12 +620,9 @@ fn decode_one_rg_filtered_late_mat(
     // (Σ.E2 + bump-to-v0.2/0.3).
     let filter_owned = filter.clone();
     let (bitmap, _total) =
-        filter_i32_column_to_bitmap(
-            path,
-            rg,
-            filter.parquet_col_idx,
-            move |v: i32| filter_owned.eval_i32(v),
-        )?;
+        filter_i32_column_to_bitmap(path, rg, filter.parquet_col_idx, move |v: i32| {
+            filter_owned.eval_i32(v)
+        })?;
 
     // Open the parquet file once for this row group. The masked_into
     // façade caches column-chunk bytes internally; opening the
@@ -664,8 +659,7 @@ fn decode_one_rg_filtered_late_mat(
                 Arc::new(arrow_array::Float64Array::from(vals))
             }
             DataType::Utf8 => {
-                let vals =
-                    masked_decode_byte_array(&file, rg, col_idx, &bitmap)?;
+                let vals = masked_decode_byte_array(&file, rg, col_idx, &bitmap)?;
                 debug_assert_eq!(vals.len(), matches);
                 let mut sb = arrow_array::builder::StringBuilder::with_capacity(
                     vals.len(),
