@@ -68,6 +68,11 @@ pub mod fused_q14_full;
 // PhysicalExpr ASTs to inject a fused exec where none was constructed)
 // is documented as a follow-up in the module header.
 pub mod fused_jit_rule;
+// Σ.E3b.1: `DictGroupCountExec` — `COUNT(*) GROUP BY dict_col` with
+// per-batch code→slot translation so the per-row hot loop is a slot
+// lookup, no string hash. Minimum viable Σ.E3b landing (single key,
+// COUNT only). Multi-key + SUM/MIN/MAX deferred to Σ.E3b.2+.
+pub mod dict_aggregate;
 pub mod hash;
 pub mod join;
 pub mod kafka_backend;
