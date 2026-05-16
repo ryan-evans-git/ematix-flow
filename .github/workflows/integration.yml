@@ -122,30 +122,36 @@ jobs:
         # sanity check so a missing daemon fails the job up front
         # rather than every per-test container start.
         run: docker info >/dev/null
-      - name: Run tests with coverage (unit + ignored integration)
-        # `--workspace --tests` runs every test target across
-        # every crate but skips benches (criterion's CLI rejects
-        # libtest's `--include-ignored`). `--include-ignored`
-        # (after `--`) runs both ignored and non-ignored tests in
-        # the same binary invocation, producing one combined
-        # coverage profile. `--no-report` defers report generation
-        # so the same profdata feeds both the gate-check and the
-        # lcov artifact below.
-        #
-        # `--ignore-run-fail` (cargo-llvm-cov flag) instead of
-        # `--no-fail-fast` (cargo flag): we want a flaky
-        # testcontainer test (e.g. minio_orc_round_trip's
-        # occasional MinIO startup race) to NOT abort the
-        # downstream report-generation steps. The two flags are
-        # mutually exclusive — `--ignore-run-fail` wins because
-        # it covers both "keep going on individual test
-        # failures" and "still emit the coverage report when
-        # any test panicked," which is what we actually need
-        # for measurement-only mode. Real test failures still
-        # surface in the build log.
+      - name: Run unit tests with coverage (parallel)
+        # First pass: run every non-`#[ignore]`'d test under
+        # default parallelism. These don't touch testcontainers
+        # so they're safe to interleave.
         run: |
-          cargo llvm-cov --no-report --workspace --tests --ignore-run-fail \
-              -- --include-ignored
+          cargo llvm-cov --no-report --workspace --tests --ignore-run-fail
+      - name: Run ignored integration tests with coverage (serial)
+        # Second pass: run only `#[ignore]`'d tests, serialised
+        # (`--test-threads=1`). These each spin up Postgres /
+        # Kafka / Kinesis / MinIO testcontainers and were
+        # historically flaky under default parallelism — too many
+        # concurrent Docker container starts on a single CI
+        # runner caused port races, container-startup OOMs, and
+        # consumer-group commit losses. The visible symptom was a
+        # synchronised burst of state-recovery panics in
+        # `integration_pg.rs` (e.g. `pipeline_load_state_resumes`,
+        # `session_pipeline_crash_recovers_committed_state`, etc.)
+        # failing together across unrelated subsystems on the same
+        # run.
+        #
+        # `--no-clean` preserves the coverage profdata from the
+        # parallel run above so the final report is the union.
+        # `--ignored` (vs `--include-ignored`) runs ONLY the
+        # ignored set this round — keeps the parallel pass'
+        # results without re-running them.
+        # `--ignore-run-fail` stays so genuine new flake doesn't
+        # abort the rest of the workflow.
+        run: |
+          cargo llvm-cov --no-clean --no-report --workspace --tests --ignore-run-fail \
+              -- --ignored --test-threads=1
       - name: Coverage summary + 86% region floor
         # `--fail-under-regions=86` enforces the floor identified
         # at the top-of-file. Picked one pp below the actual
