@@ -238,17 +238,3 @@ sqlparser = { version = "0.61", features = ["visitor"] }
 [profile.release]
 lto = "thin"
 codegen-units = 1
-
-# Temporary: pin ematix-parquet to a post-0.4.0 git revision that
-# carries the `gather_dict_at_bitmap_into` misaligned-bitmap-offset
-# fix. The 0.4.0 bit-packed branch silently read the wrong bitmap
-# byte when `bitmap_offset` was not 8-aligned (the only guard was a
-# `debug_assert_eq!` that's dropped in release). This affected any
-# Utf8 dict-encoded column in a late-mat decode whose preceding pages
-# didn't sum to a multiple of 8 rows — surfaced by
-# `tpch_triangulation_bench` on Q1 l_returnflag. Drop this override
-# once the fix ships on crates.io as 0.4.1.
-[patch.crates-io]
-ematix-parquet-codec = { git = "https://github.com/ryan-evans-git/ematix-parquet", rev = "d71ae15" }
-ematix-parquet-format = { git = "https://github.com/ryan-evans-git/ematix-parquet", rev = "d71ae15" }
-ematix-parquet-io = { git = "https://github.com/ryan-evans-git/ematix-parquet", rev = "d71ae15" }
