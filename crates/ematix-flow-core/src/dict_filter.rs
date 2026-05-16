@@ -54,20 +54,42 @@ use datafusion::physical_plan::{
 };
 use futures_util::stream::StreamExt;
 
-/// IN-list predicate on a single dictionary-encoded string column.
-///
-/// Equivalent to `column[col_idx] IN (allowed_values...)`. The
-/// implementation resolves `allowed_values` to a sparse code set
-/// against each batch's dictionary, then filters by comparing the
-/// indices array against that set (no string compare in the hot loop).
+/// Dict-aware predicate on a single column. Each literal contributes
+/// to a code-set that the batch's dictionary is scanned against once;
+/// the per-row hot loop is a bitmap lookup indexed by the indices
+/// array, no string compare anywhere.
 #[derive(Debug, Clone)]
 pub struct DictInListPredicate {
     /// Column index in the *input* schema (the child plan's output).
     pub col_idx: usize,
-    /// Allowed string values. Membership test is `Vec::contains` over
-    /// the resolved dict codes — fine for the low-cardinality lists
-    /// this operator targets (≤ ~8 literals in practice).
-    pub allowed_values: Vec<String>,
+    /// Predicate literals. Each contributes additional dict codes to
+    /// the per-batch code-set. Empty list ⇒ no rows pass.
+    pub literals: Vec<DictLiteral>,
+}
+
+impl DictInListPredicate {
+    /// Convenience: equivalent to `col IN (s1, ..., sk)`.
+    pub fn in_list<S: Into<String>>(col_idx: usize, values: impl IntoIterator<Item = S>) -> Self {
+        Self {
+            col_idx,
+            literals: values
+                .into_iter()
+                .map(|s| DictLiteral::Equals(s.into()))
+                .collect(),
+        }
+    }
+}
+
+/// One literal contributing to a dict code-set.
+#[derive(Debug, Clone)]
+pub enum DictLiteral {
+    /// `col = s` — match the one dict code whose value equals `s`.
+    Equals(String),
+    /// `col LIKE 'prefix%'` — match every dict code whose value starts
+    /// with `prefix`. The prefix is matched verbatim; LIKE patterns
+    /// containing `%` other than the final character, `_`, or escape
+    /// characters are not eligible (the rule rejects them).
+    LikePrefix(String),
 }
 
 /// Σ.E3a operator: filter on `DictionaryArray<UInt32, Utf8>` by code
@@ -137,8 +159,8 @@ impl DisplayAs for DictFilterExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(
             f,
-            "DictFilterExec(col_idx={}, allowed={:?})",
-            self.predicate.col_idx, self.predicate.allowed_values
+            "DictFilterExec(col_idx={}, literals={:?})",
+            self.predicate.col_idx, self.predicate.literals
         )
     }
 }
@@ -227,11 +249,24 @@ fn filter_batch_by_dict_code(
     // Code set: a Vec<bool> indexed by dict code. Codes are dense
     // small ints by construction.
     let mut code_set = vec![false; dict_len];
-    for lit in &predicate.allowed_values {
-        for (code, slot) in code_set.iter_mut().enumerate() {
-            if let Some(v) = value_at(code) {
-                if v == lit.as_str() {
-                    *slot = true;
+    for lit in &predicate.literals {
+        match lit {
+            DictLiteral::Equals(s) => {
+                for (code, slot) in code_set.iter_mut().enumerate() {
+                    if let Some(v) = value_at(code) {
+                        if v == s.as_str() {
+                            *slot = true;
+                        }
+                    }
+                }
+            }
+            DictLiteral::LikePrefix(prefix) => {
+                for (code, slot) in code_set.iter_mut().enumerate() {
+                    if let Some(v) = value_at(code) {
+                        if v.starts_with(prefix.as_str()) {
+                            *slot = true;
+                        }
+                    }
                 }
             }
         }
@@ -339,7 +374,10 @@ mod tests {
                 input,
                 DictInListPredicate {
                     col_idx: 0,
-                    allowed_values: vec!["MAIL".into(), "SHIP".into()],
+                    literals: vec![
+                        DictLiteral::Equals("MAIL".into()),
+                        DictLiteral::Equals("SHIP".into()),
+                    ],
                 },
             )
             .unwrap(),
@@ -392,7 +430,7 @@ mod tests {
                 input,
                 DictInListPredicate {
                     col_idx: 0,
-                    allowed_values: vec!["FERRY".into()], // not in the dict
+                    literals: vec![DictLiteral::Equals("FERRY".into())], // not in the dict
                 },
             )
             .unwrap(),
@@ -414,7 +452,7 @@ mod tests {
                 input,
                 DictInListPredicate {
                     col_idx: 0,
-                    allowed_values: vec![],
+                    literals: vec![],
                 },
             )
             .unwrap(),
@@ -440,7 +478,7 @@ mod tests {
             input,
             DictInListPredicate {
                 col_idx: 0,
-                allowed_values: vec!["x".into()],
+                literals: vec![DictLiteral::Equals("x".into())],
             },
         );
         let err = res.expect_err("non-dict column should fail validation");
@@ -478,7 +516,10 @@ mod tests {
                 input,
                 DictInListPredicate {
                     col_idx: 0,
-                    allowed_values: vec!["MAIL".into(), "SHIP".into()],
+                    literals: vec![
+                        DictLiteral::Equals("MAIL".into()),
+                        DictLiteral::Equals("SHIP".into()),
+                    ],
                 },
             )
             .unwrap(),
@@ -550,7 +591,10 @@ mod tests {
                 input,
                 DictInListPredicate {
                     col_idx: 0,
-                    allowed_values: vec!["MAIL".into(), "SHIP".into()],
+                    literals: vec![
+                        DictLiteral::Equals("MAIL".into()),
+                        DictLiteral::Equals("SHIP".into()),
+                    ],
                 },
             )
             .unwrap(),

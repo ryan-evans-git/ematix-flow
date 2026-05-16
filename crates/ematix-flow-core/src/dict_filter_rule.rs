@@ -2,7 +2,8 @@
 //! nodes to [`crate::dict_filter::DictFilterExec`].
 //!
 //! Patterns detected (any one of, all referencing the same column,
-//! which must have `Dictionary(UInt32, Utf8)` in the child schema):
+//! which must have `Dictionary(UInt32, Utf8|Utf8View)` in the child
+//! schema):
 //!
 //! 1. `column[i] IN (utf8_lit, ...)` — `InListExpr(negated=false)`
 //!    (large IN-lists stay as InListExpr).
@@ -10,6 +11,9 @@
 //!    planner unfolds short IN-lists (typically ≤ 3 elements) into
 //!    an OR-tree of Eq nodes.
 //! 3. `column[i] = lit` — single equality.
+//! 4. `column[i] LIKE 'prefix%'` — `LikeExpr(negated=false,
+//!    case_insensitive=false)` with a constant prefix pattern.
+//!    Mid-pattern `%`, `_`, and escape characters disqualify.
 //!
 //! Each literal must be `Utf8(Some)`, `LargeUtf8(Some)`, or
 //! `Dictionary(_, Utf8(Some))` — the last form is what DataFusion's
@@ -42,7 +46,8 @@ use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::filter::FilterExec;
 use datafusion::physical_plan::projection::ProjectionExec;
 
-use crate::dict_filter::{DictFilterExec, DictInListPredicate};
+use crate::dict_filter::{DictFilterExec, DictInListPredicate, DictLiteral};
+use datafusion::physical_expr::expressions::LikeExpr;
 
 /// Walks the physical plan and rewrites every `FilterExec(InList on
 /// Dictionary(UInt32, Utf8) column)` to a [`DictFilterExec`].
@@ -118,15 +123,15 @@ impl PhysicalOptimizerRule for EnableDictFilterRule {
 fn match_in_list_on_dict_column(filter: &FilterExec) -> Option<DictInListPredicate> {
     let child_schema = filter.input().schema();
 
-    // Collect (col_idx, allowed_values) from whichever predicate shape
-    // we can recognise. Bail to None on ambiguity (different columns
+    // Collect (col_idx, literals) from whichever predicate shape
+    // we recognise. Bail to None on ambiguity (different columns
     // appearing in different OR branches).
     let mut col_idx: Option<usize> = None;
-    let mut allowed: Vec<String> = Vec::new();
-    extract_dict_or_chain(filter.predicate(), &mut col_idx, &mut allowed).ok()?;
+    let mut literals: Vec<DictLiteral> = Vec::new();
+    extract_dict_or_chain(filter.predicate(), &mut col_idx, &mut literals).ok()?;
 
     let col_idx = col_idx?;
-    if allowed.is_empty() {
+    if literals.is_empty() {
         return None;
     }
 
@@ -141,10 +146,7 @@ fn match_in_list_on_dict_column(filter: &FilterExec) -> Option<DictInListPredica
         _ => return None,
     }
 
-    Some(DictInListPredicate {
-        col_idx,
-        allowed_values: allowed,
-    })
+    Some(DictInListPredicate { col_idx, literals })
 }
 
 /// Walk a predicate expression, appending `(col_idx, literal)` pairs
@@ -158,7 +160,7 @@ fn match_in_list_on_dict_column(filter: &FilterExec) -> Option<DictInListPredica
 fn extract_dict_or_chain(
     expr: &Arc<dyn PhysicalExpr>,
     col_idx_out: &mut Option<usize>,
-    allowed: &mut Vec<String>,
+    literals: &mut Vec<DictLiteral>,
 ) -> Result<(), ()> {
     // Case A: InListExpr (large IN-lists stay as InListExpr).
     if let Some(in_list) = expr.as_any().downcast_ref::<InListExpr>() {
@@ -169,18 +171,39 @@ fn extract_dict_or_chain(
         set_or_check_col_idx(col_idx_out, column.index())?;
         for item in in_list.list() {
             let lit = item.as_any().downcast_ref::<Literal>().ok_or(())?;
-            allowed.push(extract_utf8_literal(lit.value()).ok_or(())?);
+            literals.push(DictLiteral::Equals(
+                extract_utf8_literal(lit.value()).ok_or(())?,
+            ));
         }
         return Ok(());
     }
 
-    // Case B/C: BinaryExpr — either OR-chain or single Eq.
+    // Case B: LikeExpr — `col LIKE 'prefix%'`.
+    if let Some(like) = expr.as_any().downcast_ref::<LikeExpr>() {
+        // Only support positive, case-sensitive LIKE.
+        if like.negated() || like.case_insensitive() {
+            return Err(());
+        }
+        let column = like.expr().as_any().downcast_ref::<Column>().ok_or(())?;
+        let lit = like
+            .pattern()
+            .as_any()
+            .downcast_ref::<Literal>()
+            .ok_or(())?;
+        let pattern = extract_utf8_literal(lit.value()).ok_or(())?;
+        let prefix = parse_like_prefix_pattern(&pattern).ok_or(())?;
+        set_or_check_col_idx(col_idx_out, column.index())?;
+        literals.push(DictLiteral::LikePrefix(prefix));
+        return Ok(());
+    }
+
+    // Case C/D: BinaryExpr — either OR-chain or single Eq.
     if let Some(bin) = expr.as_any().downcast_ref::<BinaryExpr>() {
         match bin.op() {
             Operator::Or => {
                 // Recurse into both sides; both must match shape.
-                extract_dict_or_chain(bin.left(), col_idx_out, allowed)?;
-                extract_dict_or_chain(bin.right(), col_idx_out, allowed)?;
+                extract_dict_or_chain(bin.left(), col_idx_out, literals)?;
+                extract_dict_or_chain(bin.right(), col_idx_out, literals)?;
                 return Ok(());
             }
             Operator::Eq => {
@@ -199,7 +222,9 @@ fn extract_dict_or_chain(
                     },
                 };
                 set_or_check_col_idx(col_idx_out, column.index())?;
-                allowed.push(extract_utf8_literal(lit.value()).ok_or(())?);
+                literals.push(DictLiteral::Equals(
+                    extract_utf8_literal(lit.value()).ok_or(())?,
+                ));
                 return Ok(());
             }
             _ => return Err(()),
@@ -207,6 +232,22 @@ fn extract_dict_or_chain(
     }
 
     Err(())
+}
+
+/// Recognise a LIKE pattern of the form `<prefix>%` with no embedded
+/// wildcards, underscores, or escape characters. Returns the prefix.
+///
+/// Examples:
+/// * `"PROMO%"` → `Some("PROMO")`
+/// * `"FOO%BAR%"` → `None` (mid-pattern `%`)
+/// * `"a_b%"` → `None` (single-char wildcard `_`)
+/// * `"foo"` → `None` (no trailing `%`)
+fn parse_like_prefix_pattern(pat: &str) -> Option<String> {
+    let stripped = pat.strip_suffix('%')?;
+    if stripped.contains('%') || stripped.contains('_') || stripped.contains('\\') {
+        return None;
+    }
+    Some(stripped.to_string())
 }
 
 /// Extract a Utf8 string from a literal `ScalarValue`. Handles bare
@@ -496,6 +537,101 @@ mod tests {
         assert!(
             !has_dict_filter(&rewritten),
             "Utf8 (non-dict) column must not be rewritten",
+        );
+    }
+
+    /// `LIKE 'PROMO%'` on a dict column — eligible prefix pattern.
+    /// The rule rewrites + the rewritten plan returns the right rows.
+    #[tokio::test]
+    async fn rule_rewrites_like_prefix() {
+        // Fixture: 5 rows with types like TPC-H p_type.
+        let mut keys: StringDictionaryBuilder<UInt32Type> = StringDictionaryBuilder::new();
+        for v in [
+            "PROMO BURNISHED",
+            "STANDARD POLISHED",
+            "PROMO PLATED",
+            "ECONOMY ANODIZED",
+            "PROMO BRUSHED",
+        ] {
+            keys.append(v).unwrap();
+        }
+        let dict = keys.finish();
+        let payload = Int64Array::from(vec![1i64, 2, 3, 4, 5]);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "p_type",
+                DataType::Dictionary(Box::new(DataType::UInt32), Box::new(DataType::Utf8)),
+                false,
+            ),
+            Field::new("payload", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(dict) as ArrayRef, Arc::new(payload)],
+        )
+        .unwrap();
+        let mem = MemTable::try_new(schema, vec![vec![batch]]).unwrap();
+        let ctx = SessionContext::new();
+        ctx.register_table("t", Arc::new(mem)).unwrap();
+
+        let df = ctx
+            .sql("SELECT * FROM t WHERE p_type LIKE 'PROMO%'")
+            .await
+            .unwrap();
+        let physical = df.create_physical_plan().await.unwrap();
+        let rewritten = EnableDictFilterRule
+            .optimize(physical, &ConfigOptions::default())
+            .unwrap();
+
+        // Rewrite happened.
+        fn has_dict_filter(node: &Arc<dyn ExecutionPlan>) -> bool {
+            if node.as_any().is::<DictFilterExec>() {
+                return true;
+            }
+            node.children().iter().any(|c| has_dict_filter(c))
+        }
+        assert!(
+            has_dict_filter(&rewritten),
+            "rule should rewrite LIKE 'PROMO%'"
+        );
+
+        // 3 PROMO rows survive (payloads 1, 3, 5).
+        let parts = rewritten.properties().partitioning.partition_count();
+        let mut payloads: Vec<i64> = Vec::new();
+        for p in 0..parts {
+            let mut s = rewritten.execute(p, ctx.task_ctx()).unwrap();
+            while let Some(b) = s.try_next().await.unwrap() {
+                let a = b.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+                for i in 0..a.len() {
+                    payloads.push(a.value(i));
+                }
+            }
+        }
+        payloads.sort();
+        assert_eq!(payloads, vec![1, 3, 5]);
+    }
+
+    /// Mid-pattern `%` is NOT a prefix pattern; rule must skip.
+    #[tokio::test]
+    async fn rule_skips_mid_pattern_like() {
+        let ctx = ctx_with_shipmode_fixture().await;
+        let df = ctx
+            .sql("SELECT * FROM t WHERE l_shipmode LIKE '%A%'")
+            .await
+            .unwrap();
+        let physical = df.create_physical_plan().await.unwrap();
+        let rewritten = EnableDictFilterRule
+            .optimize(physical, &ConfigOptions::default())
+            .unwrap();
+        fn has_dict_filter(node: &Arc<dyn ExecutionPlan>) -> bool {
+            if node.as_any().is::<DictFilterExec>() {
+                return true;
+            }
+            node.children().iter().any(|c| has_dict_filter(c))
+        }
+        assert!(
+            !has_dict_filter(&rewritten),
+            "mid-pattern LIKE must not be rewritten",
         );
     }
 }
