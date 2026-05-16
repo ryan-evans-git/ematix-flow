@@ -262,3 +262,10 @@ required-features = ["triangulation"]
 name = "dict_group_count_bench"
 path = "examples/dict_group_count_bench.rs"
 
+
+# Σ.E3b diagnostic: do TPC-H string columns arrive at the Arrow
+# surface as Dictionary(UInt32, Utf8)? Gates whether
+# `EnableDictGroupCountRule` can ever fire on real parquet data.
+[[example]]
+name = "probe_dict_arrival"
+path = "examples/probe_dict_arrival.rs"
