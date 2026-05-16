@@ -14,10 +14,10 @@ async fn main() {
     let candidates: &[(&str, &str, &str)] = &[
         ("lineitem", "l_returnflag", "Emat+FastParquet"),
         ("lineitem", "l_linestatus", "Emat+FastParquet"),
-        ("lineitem", "l_shipmode",   "Emat+FastParquet"),
-        ("orders",   "o_orderpriority", "FastParquet"),
-        ("part",     "p_brand", "FastParquet"),
-        ("part",     "p_type",  "FastParquet"),
+        ("lineitem", "l_shipmode", "Emat+FastParquet"),
+        ("orders", "o_orderpriority", "FastParquet"),
+        ("part", "p_brand", "FastParquet"),
+        ("part", "p_type", "FastParquet"),
     ];
     println!("=== probe: dict-arrival shape on TPC-H SF=1 columns ===\n");
     for (table, col, providers) in candidates {
@@ -28,22 +28,34 @@ async fn main() {
             let path = format!("{dir}/{table}.parquet");
             let prov = EmatixFastParquetTableProvider::try_new(&path).unwrap();
             ctx.register_table(*table, Arc::new(prov)).unwrap();
-            let df = ctx.sql(&format!("SELECT {col} FROM {table} LIMIT 1")).await.unwrap();
+            let df = ctx
+                .sql(&format!("SELECT {col} FROM {table} LIMIT 1"))
+                .await
+                .unwrap();
             let plan = df.create_physical_plan().await.unwrap();
             let mut s = plan.execute(0, ctx.task_ctx()).unwrap();
             let batch = s.try_next().await.unwrap().unwrap();
-            println!("  Emat:               {:?}", batch.schema().field(0).data_type());
+            println!(
+                "  Emat:               {:?}",
+                batch.schema().field(0).data_type()
+            );
         }
         // FastParquet path
         let ctx = SessionContext::new();
         let path = format!("{dir}/{table}.parquet");
         let prov = FastParquetTableProvider::try_new(&path).unwrap();
         ctx.register_table(*table, Arc::new(prov)).unwrap();
-        let df = ctx.sql(&format!("SELECT {col} FROM {table} LIMIT 1")).await.unwrap();
+        let df = ctx
+            .sql(&format!("SELECT {col} FROM {table} LIMIT 1"))
+            .await
+            .unwrap();
         let plan = df.create_physical_plan().await.unwrap();
         let mut s = plan.execute(0, ctx.task_ctx()).unwrap();
         let batch = s.try_next().await.unwrap().unwrap();
-        println!("  FastParquet:        {:?}", batch.schema().field(0).data_type());
+        println!(
+            "  FastParquet:        {:?}",
+            batch.schema().field(0).data_type()
+        );
         // FastParquet + dict preservation (Σ.E3b substrate, this commit)
         let ctx = SessionContext::new();
         let prov = FastParquetTableProvider::try_new(&path)
@@ -51,19 +63,33 @@ async fn main() {
             .with_dict_preservation(true)
             .unwrap();
         ctx.register_table(*table, Arc::new(prov)).unwrap();
-        let df = ctx.sql(&format!("SELECT {col} FROM {table} LIMIT 1")).await.unwrap();
+        let df = ctx
+            .sql(&format!("SELECT {col} FROM {table} LIMIT 1"))
+            .await
+            .unwrap();
         let plan = df.create_physical_plan().await.unwrap();
         let mut s = plan.execute(0, ctx.task_ctx()).unwrap();
         let batch = s.try_next().await.unwrap().unwrap();
-        println!("  FastParquet+dict:   {:?}", batch.schema().field(0).data_type());
+        println!(
+            "  FastParquet+dict:   {:?}",
+            batch.schema().field(0).data_type()
+        );
         // DataFusion's default parquet reader
         let ctx = SessionContext::new();
-        ctx.register_parquet(*table, &path, Default::default()).await.unwrap();
-        let df = ctx.sql(&format!("SELECT {col} FROM {table} LIMIT 1")).await.unwrap();
+        ctx.register_parquet(*table, &path, Default::default())
+            .await
+            .unwrap();
+        let df = ctx
+            .sql(&format!("SELECT {col} FROM {table} LIMIT 1"))
+            .await
+            .unwrap();
         let plan = df.create_physical_plan().await.unwrap();
         let mut s = plan.execute(0, ctx.task_ctx()).unwrap();
         let batch = s.try_next().await.unwrap().unwrap();
-        println!("  default:            {:?}", batch.schema().field(0).data_type());
+        println!(
+            "  default:            {:?}",
+            batch.schema().field(0).data_type()
+        );
         println!();
     }
 }

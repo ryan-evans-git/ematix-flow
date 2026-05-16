@@ -27,9 +27,9 @@ use std::time::Instant;
 
 use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::prelude::{SessionConfig, SessionContext};
+use ematix_flow_core::dict_aggregate_rule::EnableDictGroupCountRule;
 use ematix_flow_core::ematix_fast_parquet::EmatixFastParquetTableProvider;
 use ematix_flow_core::fast_parquet::FastParquetTableProvider;
-use ematix_flow_core::dict_aggregate_rule::EnableDictGroupCountRule;
 use ematix_flow_core::fused_jit_rule::{
     InjectFusedQ1Rule, InjectFusedQ3Rule, InjectFusedQ5Rule, InjectFusedQ6Rule, InjectFusedQ12Rule,
 };
