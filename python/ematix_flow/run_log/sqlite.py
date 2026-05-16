@@ -21,6 +21,36 @@ from ._iso import iso_utc, parse_iso
 from .protocol import ClaimResult, ExpiredClaim
 
 
+class _LockingConn:
+    """Thin proxy over sqlite3.Connection that holds an RLock for the
+    duration of each call. Used by `SqliteRunLog` so the
+    `HeartbeatThread` (a non-main thread) can `execute()` against the
+    same connection the scheduler / worker main thread uses, without
+    Python's `sqlite3` rejecting it for cross-thread access."""
+
+    __slots__ = ("_lock", "_raw")
+
+    def __init__(self, raw, lock):
+        self._raw = raw
+        self._lock = lock
+
+    def execute(self, *a, **kw):
+        with self._lock:
+            return self._raw.execute(*a, **kw)
+
+    def executescript(self, *a, **kw):
+        with self._lock:
+            return self._raw.executescript(*a, **kw)
+
+    def commit(self):
+        with self._lock:
+            return self._raw.commit()
+
+    def close(self):
+        with self._lock:
+            return self._raw.close()
+
+
 class SqliteRunLog:
     """Local SQLite file. The reference implementation other backends
     are measured against (it's what the Ω.D1a oracle tests pin)."""
@@ -49,12 +79,22 @@ class SqliteRunLog:
     def __init__(self, path: str):
         import os
         import sqlite3
+        import threading
 
         parent = os.path.dirname(path)
         if parent:
             os.makedirs(parent, exist_ok=True)
         self._path = path
-        self._conn = sqlite3.connect(path, isolation_level=None)
+        # Cross-thread access (Ω.W.3 HeartbeatThread calls in from a
+        # non-main thread). `check_same_thread=False` defuses SQLite's
+        # built-in rejection; `_LockingConn` then serialises every
+        # `.execute()` / `.executescript()` / `.close()` call via an
+        # `RLock`. SQLite is single-writer anyway — this just makes
+        # the serialisation explicit + visible to callers.
+        raw = sqlite3.connect(
+            path, isolation_level=None, check_same_thread=False
+        )
+        self._conn = _LockingConn(raw, threading.RLock())
         self._conn.execute("PRAGMA journal_mode = WAL;")
         self._conn.executescript(self._SCHEMA)
 

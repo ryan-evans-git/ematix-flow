@@ -51,6 +51,11 @@ class SubprocessExecutor:
         python: path to the Python interpreter, when invoking
             `python -m ematix_flow.cli` directly instead of `flow`.
             Defaults to None (use the `flow` binary).
+        inherit_stdio: if True (default), worker stdout/stderr stream
+            directly to the parent's terminal — useful for `flow
+            scheduler` operators watching pipelines in real time. Set
+            False to silence workers (tests, daemonised deployments
+            where stdout is captured by the supervisor).
     """
 
     backend_name = "subprocess"
@@ -60,6 +65,7 @@ class SubprocessExecutor:
         *,
         flow_binary: str | None = None,
         python: str | None = None,
+        inherit_stdio: bool = True,
     ):
         if python is not None:
             # Invoke the CLI through the given interpreter — useful
@@ -76,17 +82,22 @@ class SubprocessExecutor:
                     "in-process testing."
                 )
             self._argv0 = [resolved]
+        self._inherit_stdio = inherit_stdio
 
     def dispatch(self, spec: DispatchSpec) -> DispatchHandle:
         argv = list(self._argv0) + self._build_run_argv(spec)
         env = os.environ.copy()
         env.update(spec.env)
+        # Inherit parent stdio so worker logs appear inline with the
+        # scheduler's. Falls back to PIPE for tests / silent-worker
+        # callers that explicitly opted out.
+        stdio = None if self._inherit_stdio else subprocess.PIPE
         try:
             popen = subprocess.Popen(
                 argv,
                 env=env,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+                stdout=stdio,
+                stderr=stdio,
             )
         except OSError as e:
             raise DispatchError(

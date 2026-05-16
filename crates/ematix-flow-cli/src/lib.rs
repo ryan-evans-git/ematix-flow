@@ -1409,6 +1409,13 @@ pub enum SourceConfig {
         /// against MSK with sigv4 signing.
         #[serde(default)]
         msk_iam_region: Option<String>,
+        /// Where to start when a consumer group has no committed
+        /// offsets yet. `"earliest"` (default) reads from the start
+        /// of the topic; `"latest"` only sees events produced after
+        /// the consumer subscribes. Maps directly to rdkafka's
+        /// `auto.offset.reset` knob.
+        #[serde(default)]
+        auto_offset_reset: Option<String>,
     },
     Rabbitmq {
         amqp_url: String,
@@ -1641,6 +1648,7 @@ impl std::fmt::Debug for SourceConfig {
                 sasl_scram_password,
                 sasl_scram_mechanism,
                 msk_iam_region,
+                auto_offset_reset,
             } => f
                 .debug_struct("Kafka")
                 .field("bootstrap_servers", bootstrap_servers)
@@ -1669,6 +1677,7 @@ impl std::fmt::Debug for SourceConfig {
                 )
                 .field("sasl_scram_mechanism", sasl_scram_mechanism)
                 .field("msk_iam_region", msk_iam_region)
+                .field("auto_offset_reset", auto_offset_reset)
                 .finish(),
             SourceConfig::Rabbitmq { amqp_url } => f
                 .debug_struct("Rabbitmq")
@@ -2497,6 +2506,7 @@ impl PipelineCliConfig {
                 sasl_scram_password,
                 sasl_scram_mechanism,
                 msk_iam_region,
+                auto_offset_reset,
             } => {
                 let mut b = KafkaBackend::open(bootstrap_servers, group_id.as_deref())?;
                 if let Some(fmt) = payload_format {
@@ -2504,6 +2514,9 @@ impl PipelineCliConfig {
                 }
                 if let Some(url) = schema_registry_url {
                     b = b.with_schema_registry_url(url);
+                }
+                if let Some(reset) = auto_offset_reset {
+                    b = b.with_auto_offset_reset(reset.clone());
                 }
                 b = apply_sr_basic_auth(
                     b,
@@ -8309,6 +8322,7 @@ mod tests {
             sasl_scram_password: Some("secret2".into()),
             sasl_scram_mechanism: Some("sha-256".into()),
             msk_iam_region: Some("us-east-1".into()),
+            auto_offset_reset: Some("earliest".into()),
         };
         let s = format!("{kafka:?}");
         assert!(s.contains("Kafka"));

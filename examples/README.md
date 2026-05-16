@@ -13,6 +13,23 @@ covers one shape.
 | `06_windowed_tumbling.py` | Tumbling window aggregation | local Kafka + SQLite |
 | `07_session_window.toml` | Per-user session windows + StateStore | local Kafka + Postgres |
 | `08_stream_join.toml` | Keyed time-windowed stream-stream join | local Kafka + Postgres |
+| **`09_streaming_clickstream/`** | **End-to-end Kafka → Postgres with bundled producer** — `make demo-streaming-*` | local Kafka + Postgres |
+| **`10_workflow_dag/`** | **Workflow DAG + `flow scheduler` daemon + retries** — `make demo-workflow-*` | local SQLite only |
+| **`11_s3_parquet_to_postgres/`** | **MinIO (S3 API, no AWS) parquet → Postgres** — `make demo-s3-*` | local MinIO + Postgres |
+
+**Demos 09–11** are higher-touch — they include `make` targets for
+one-command setup, bundled synthetic producers, and inline READMEs
+that walk you through "see it in action" steps (live row counts,
+status tables, MinIO web console). Quick start:
+
+```sh
+make demo-deps   # installs confluent-kafka, boto3, pyarrow
+make up          # brings up postgres + kafka + minio
+make help        # lists every demo-* target
+```
+
+Each demo has its own README under `examples/0X_*/` with full
+walkthrough.
 
 All examples need at minimum a local Postgres — the v0.1 declarative
 `@ematix.pipeline` decorator is Postgres-specific (multi-backend

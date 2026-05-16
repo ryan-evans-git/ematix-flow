@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import importlib
 import json
+import os
 import sys
 from datetime import UTC, datetime
 from typing import Any
@@ -31,6 +32,13 @@ def _parse_iso(s: str) -> datetime:
 
 
 def _import_user_module(name: str) -> None:
+    # Setuptools entry-point scripts don't get cwd on sys.path the way
+    # `python script.py` does. Prepend it so users can `flow ... --module
+    # pipelines` from the dir containing `pipelines.py` without manually
+    # exporting PYTHONPATH.
+    cwd = os.getcwd()
+    if cwd not in sys.path:
+        sys.path.insert(0, cwd)
     importlib.import_module(name)
 
 
@@ -89,16 +97,35 @@ def _cmd_transform_run(args: argparse.Namespace) -> int:
 
 
 def _cmd_run(args: argparse.Namespace) -> int:
-    print_banner()
-    _import_user_module(args.module)
-
     # Ω.W.3: worker-side claim semantics. When the scheduler spawns
     # us via SubprocessExecutor, --claim-token is set and we need to
     # heartbeat the lease while the pipeline runs, then release on
     # exit so the next scheduler tick can re-fire if the schedule
     # comes due again.
     claim_token = getattr(args, "claim_token", None)
+    # Skip the banner when running as a scheduler-dispatched worker —
+    # the scheduler already prints its own startup line and the worker's
+    # banner repeats every tick across N pipelines, drowning out actual
+    # output. Bare `flow run` (one-shot, no claim token) still prints it.
+    if not claim_token:
+        print_banner()
+    _import_user_module(args.module)
+
     run_log = _open_run_log_or_none(args) if claim_token else None
+    if claim_token and run_log is not None:
+        # Restore _LAST_RUN + _ATTEMPT_STATE from the RunLog BEFORE the
+        # pipeline runs so the worker can compute the correct
+        # attempt_count on failure (prev.attempt_count + 1 instead of
+        # always 1). Without this, a flaky pipeline never advances past
+        # attempt_count=1 and gave_up never fires.
+        try:
+            run_log.restore_into_process()
+        except Exception as e:
+            print(
+                f"warning: restore_into_process failed in worker: "
+                f"{type(e).__name__}: {e}",
+                file=sys.stderr,
+            )
     heartbeat = None
     if claim_token and run_log is not None:
         from ematix_flow.executors.heartbeat import HeartbeatThread
@@ -111,15 +138,51 @@ def _cmd_run(args: argparse.Namespace) -> int:
         )
         heartbeat.start()
 
+    success = False
+    err: BaseException | None = None
     try:
         try:
             result = p.run_pipeline(args.name)
+            success = True
         except KeyError:
             print(f"error: no pipeline named {args.name!r}", file=sys.stderr)
             return 2
+        except BaseException as e:
+            err = e
+            raise
         print(json.dumps(result, default=str))
         return 0
     finally:
+        # Ω.W.6 follow-up: worker must record its own outcome to the
+        # RunLog so the central scheduler's DAG-gating sees this run.
+        # Without this, `depends_on=[...]` downstream pipelines stay
+        # gated forever because `_LAST_RUN` is only ever populated in
+        # the scheduler when it `restore_into_process()`s from the
+        # RunLog — which only the worker can write.
+        if claim_token and run_log is not None:
+            try:
+                completed_at = datetime.now(UTC)
+                run_log.record_run(args.name, completed_at, success)
+                if success:
+                    run_log.clear_attempt_state(args.name)
+                else:
+                    # Record an attempt so retry-backoff fires next tick.
+                    prev = p._ATTEMPT_STATE.get(args.name)
+                    attempt_count = (prev.attempt_count if prev else 0) + 1
+                    policy = p._RETRY_POLICY.get(args.name, p.RetryPolicy())
+                    new_state = p.AttemptState(
+                        attempt_count=attempt_count,
+                        last_attempt_at=completed_at,
+                        gave_up=attempt_count >= policy.max_attempts,
+                    )
+                    run_log.record_attempt(args.name, new_state)
+            except Exception as e:
+                print(
+                    f"warning: failed to record run outcome for "
+                    f"{args.name!r}: {type(e).__name__}: {e}",
+                    file=sys.stderr,
+                )
+
         if heartbeat is not None:
             heartbeat.stop()
         if claim_token and run_log is not None:
@@ -135,6 +198,9 @@ def _cmd_run(args: argparse.Namespace) -> int:
                 )
         if run_log is not None:
             run_log.close()
+        # If the pipeline raised, surface it now (after RunLog writes).
+        if err is not None and not isinstance(err, SystemExit):
+            return 1  # noqa: B012 — intentional: convert raise to exit code 1 after cleanup
 
 
 def _cmd_consume(args: argparse.Namespace) -> int:
@@ -462,7 +528,19 @@ def _cmd_scheduler(args: argparse.Namespace) -> int:
     `ematix_flow.scheduler.run_scheduler`. Returns when the loop
     exits (only on --max-iterations or SIGTERM).
     """
+    import logging as _logging
+
     from ematix_flow.scheduler import executor_from_url, run_scheduler
+
+    # Surface scheduler INFO-level events to stderr so operators can
+    # watch sweep / leader-acquire / dispatch / release in real time.
+    # Idempotent — `basicConfig` is a no-op if a handler is already
+    # configured (e.g. by a host process embedding flow as a library).
+    _logging.basicConfig(
+        level=_logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        datefmt="%H:%M:%S",
+    )
 
     print_banner()
     run_log = _open_run_log_or_none(args)

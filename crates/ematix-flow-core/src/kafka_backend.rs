@@ -556,6 +556,12 @@ pub struct KafkaBackend {
     /// `write_arrow_stream`. Builder-set via `with_payload_format`;
     /// defaults to JSON.
     payload_format: KafkaPayloadFormat,
+    /// Consumer-side `auto.offset.reset` override. `Some("earliest")`
+    /// (default behavior) reads from the start of the topic when
+    /// there's no committed offset; `Some("latest")` only sees events
+    /// produced AFTER the consumer subscribes. None ⇒ rdkafka library
+    /// default (`latest`). Builder-set via `with_auto_offset_reset`.
+    auto_offset_reset: Option<String>,
     /// Producer-side delivery semantics. Builder-set via
     /// `with_delivery_semantics`; defaults to `AtLeastOnce`.
     delivery_semantics: KafkaDeliverySemantics,
@@ -618,6 +624,10 @@ impl KafkaBackend {
             seek_map: Arc::new(std::sync::Mutex::new(HashMap::new())),
             auth: AuthMode::None,
             payload_format: KafkaPayloadFormat::default(),
+            // Default "earliest" preserves the prior hard-coded
+            // behavior — a fresh consumer with no committed offsets
+            // sees pre-existing topic content.
+            auto_offset_reset: Some("earliest".to_string()),
             delivery_semantics: KafkaDeliverySemantics::default(),
             producer_session: Arc::new(Mutex::new(ProducerSession::default())),
             schema_registry_url: None,
@@ -734,6 +744,13 @@ impl KafkaBackend {
     /// Borrow the active payload format (tests + introspection).
     pub fn payload_format(&self) -> KafkaPayloadFormat {
         self.payload_format
+    }
+
+    /// Override the consumer-side `auto.offset.reset` knob.
+    /// Accepts `"earliest"` / `"latest"` per rdkafka semantics.
+    pub fn with_auto_offset_reset(mut self, reset: impl Into<String>) -> Self {
+        self.auto_offset_reset = Some(reset.into());
+        self
     }
 
     /// SASL/PLAIN over TLS — Confluent Cloud's primary auth mode and
@@ -1194,12 +1211,15 @@ impl KafkaBackend {
             (Some(_), Some(t)) if t == topic
         );
         if need_new {
-            // Default to `earliest` so a fresh consumer with no
-            // committed offsets starts from the beginning. Long-
-            // running consumers (36g) may want `latest`; they can
-            // override at the ClientConfig layer in 36f+.
+            // `auto.offset.reset` honors the builder override (Π.W
+            // demo-09 ergonomics); defaults to `"earliest"` so a
+            // fresh consumer with no committed offsets starts from
+            // the beginning. Producers that need post-subscribe-only
+            // semantics set `"latest"` via `with_auto_offset_reset`.
             let mut config = self.client_config();
-            config.set("auto.offset.reset", "earliest");
+            if let Some(ref reset) = self.auto_offset_reset {
+                config.set("auto.offset.reset", reset.as_str());
+            }
             let context = self.build_context();
             let consumer: StreamConsumer<EmatixKafkaContext> = config
                 .create_with_context(context)
