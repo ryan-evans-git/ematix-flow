@@ -33,7 +33,10 @@ use std::path::Path;
 use std::sync::Arc;
 
 use arrow_array::builder::ArrayBuilder;
-use arrow_array::{Float64Array, Int32Array, Int64Array, StringArray};
+use arrow_array::types::UInt32Type;
+use arrow_array::{
+    Array, DictionaryArray, Float64Array, Int32Array, Int64Array, StringArray, UInt32Array,
+};
 use datafusion::error::{DataFusionError, Result as DfResult};
 
 use ematix_parquet_codec::compression::{decompress_snappy_into, decompress_zstd_into};
@@ -45,8 +48,8 @@ use ematix_parquet_codec::plain::{
     decode_plain_byte_array, decode_plain_f64, decode_plain_i32, decode_plain_i64,
 };
 use ematix_parquet_codec::read::{
-    read_column_byte_array_masked_into, read_column_f64_masked_into, read_column_i32_masked_into,
-    read_column_i64_masked_into,
+    read_column_byte_array_dict_preserved, read_column_byte_array_masked_into,
+    read_column_f64_masked_into, read_column_i32_masked_into, read_column_i64_masked_into,
 };
 use ematix_parquet_format::types::{CompressionCodec, Encoding};
 use ematix_parquet_io::{PageWalker, ParquetFile};
@@ -194,6 +197,57 @@ pub fn decode_column_chunk_byte_array(
 
     debug_assert_eq!(builder.len(), total);
     Ok(Arc::new(builder.finish()))
+}
+
+/// Decode a BYTE_ARRAY column chunk (Utf8 logical type) to a
+/// `DictionaryArray<UInt32, Utf8>` — preserving the parquet
+/// dictionary structure end-to-end instead of materialising every
+/// row's value into a contiguous `StringArray`.
+///
+/// Σ.E3b substrate: lets downstream dict-aware operators
+/// (`DictGroupCountExec`, `DictFilterExec`) stay on dict codes
+/// rather than paying per-batch gather + hash. The values dict is
+/// passed through as-is; the indices become Arrow keys of type
+/// `UInt32`.
+///
+/// Errors if the chunk has no dictionary page or if any data page
+/// fell back to PLAIN — same surface as the underlying
+/// `read_column_byte_array_dict_preserved` API. Callers should
+/// fall back to `decode_column_chunk_byte_array` in that case.
+pub fn decode_column_chunk_byte_array_dict_preserved(
+    path: &Path,
+    rg: usize,
+    col: usize,
+) -> DfResult<Arc<DictionaryArray<UInt32Type>>> {
+    let file = ParquetFile::open(path).map_err(|e| ext(format!("ParquetFile::open: {e}")))?;
+    let raw = read_column_byte_array_dict_preserved(&file, rg, col).map_err(|e| {
+        ext(format!(
+            "read_column_byte_array_dict_preserved (rg={rg}, col={col}): {e}"
+        ))
+    })?;
+
+    // Materialise dict entries as &str. The dict is small (lineitem
+    // shipdate has ~2.5k distinct values; returnflag has 3) so the
+    // per-entry slice + UTF-8 validate cost is negligible relative
+    // to the savings of not gathering every row.
+    let dict_len = raw.dict_offsets.len() - 1;
+    let mut dict_strings: Vec<&str> = Vec::with_capacity(dict_len);
+    for i in 0..dict_len {
+        let s = raw.dict_offsets[i] as usize;
+        let e = raw.dict_offsets[i + 1] as usize;
+        let bytes = &raw.dict_bytes[s..e];
+        let txt = std::str::from_utf8(bytes).map_err(|err| {
+            ext(format!(
+                "dict-preserved decode: dict entry {i} not valid UTF-8: {err}"
+            ))
+        })?;
+        dict_strings.push(txt);
+    }
+    let values: Arc<dyn Array> = Arc::new(StringArray::from(dict_strings));
+    let keys = UInt32Array::from(raw.indices);
+    let dict_arr = DictionaryArray::<UInt32Type>::try_new(keys, values)
+        .map_err(|e| ext(format!("DictionaryArray::try_new: {e}")))?;
+    Ok(Arc::new(dict_arr))
 }
 
 #[inline]
@@ -799,6 +853,85 @@ mod tests {
                 t.as_slice(),
                 "mismatch at row {i}"
             );
+        }
+    }
+
+    #[test]
+    fn returnflag_dict_preserved_matches_materialised() {
+        // Σ.E3b substrate: dict-preserved decode must produce a
+        // DictionaryArray whose materialised row stream is byte-
+        // identical to the StringArray returned by the eager path.
+        let Some(path) = lineitem_path() else {
+            return;
+        };
+        let materialised = decode_column_chunk_byte_array(&path, 0, 8).unwrap();
+        let dict_arr = decode_column_chunk_byte_array_dict_preserved(&path, 0, 8).unwrap();
+        assert_eq!(dict_arr.len(), materialised.len());
+
+        // The values dictionary should be small (l_returnflag has
+        // 3 distinct values) — the whole point of preserving it.
+        let values = dict_arr
+            .values()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("dict values must be StringArray");
+        assert!(
+            values.len() <= 8,
+            "dict too large for l_returnflag: {}",
+            values.len()
+        );
+
+        // Walk every row and confirm the indexed value matches the
+        // materialised value.
+        let keys = dict_arr.keys();
+        for i in 0..materialised.len() {
+            let k = keys.value(i) as usize;
+            assert_eq!(
+                values.value(k),
+                materialised.value(i),
+                "mismatch at row {i}"
+            );
+        }
+    }
+
+    #[test]
+    fn comment_dict_preserved_or_errors() {
+        // l_comment may have multiple data pages and may include
+        // PLAIN-encoded fallback pages depending on the writer.
+        // If it does, the dict-preserved path must error so the
+        // caller knows to fall back; if it doesn't, the dict must
+        // round-trip.
+        let Some(path) = lineitem_path() else {
+            return;
+        };
+        let materialised = decode_column_chunk_byte_array(&path, 0, 15).unwrap();
+        match decode_column_chunk_byte_array_dict_preserved(&path, 0, 15) {
+            Ok(dict_arr) => {
+                assert_eq!(dict_arr.len(), materialised.len());
+                let values = dict_arr
+                    .values()
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("dict values must be StringArray");
+                let keys = dict_arr.keys();
+                for i in 0..materialised.len() {
+                    let k = keys.value(i) as usize;
+                    assert_eq!(
+                        values.value(k),
+                        materialised.value(i),
+                        "mismatch at row {i}"
+                    );
+                }
+            }
+            Err(e) => {
+                // Acceptable: PLAIN fallback page in chunk — caller
+                // would fall back to the eager path.
+                let msg = format!("{e}");
+                assert!(
+                    msg.contains("PLAIN") || msg.contains("dictionary"),
+                    "unexpected error: {msg}"
+                );
+            }
         }
     }
 
