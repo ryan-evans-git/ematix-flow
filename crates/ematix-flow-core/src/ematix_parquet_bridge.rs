@@ -37,8 +37,8 @@ use datafusion::error::{DataFusionError, Result as DfResult};
 
 use ematix_parquet_codec::compression::{decompress_snappy_into, decompress_zstd_into};
 use ematix_parquet_codec::dict::{
-    decode_rle_dictionary_into, decode_rle_dictionary_predicate_bitmap_bw12,
-    gather_dict_at_bitmap_into,
+    build_dict_predicate_mask, decode_rle_dictionary_into,
+    decode_rle_dictionary_predicate_bitmap, gather_dict_at_bitmap_into,
 };
 use ematix_parquet_codec::plain::{
     decode_plain_byte_array, decode_plain_f64, decode_plain_i32, decode_plain_i64,
@@ -298,18 +298,19 @@ fn ext<S: Into<String>>(msg: S) -> DataFusionError {
 
 /// Phase 3: build a row bitmap for an INT32/Date32 column chunk by
 /// evaluating a closure-shaped predicate against the column's PLAIN-
-/// decoded dict. The dict_mask is 4096-padded so the NEON bw=12
-/// kernel can safely use bounds-free gathers (l_shipdate and
-/// similar TPC-H date columns all hit bw=12 in practice).
+/// decoded dict. The dict_mask is sized `1 << bit_width` so the NEON
+/// kernel can safely use bounds-free gathers; v0.2.0's width-generic
+/// `decode_rle_dictionary_predicate_bitmap` covers bw ∈ {12, 14, 15,
+/// 16, 17, 18} on NEON and scalar fallback for other widths.
 ///
 /// Returns the bitmap (1 bit per row, byte-stride) and the row count.
 /// `predicate(dict_value) -> bool` is evaluated once per dict entry —
-/// negligible cost (~2500 ops for shipdate-sized dicts) vs the
-/// per-row gain.
+/// negligible cost (~thousands of ops for shipdate-sized dicts) vs
+/// the per-row gain.
 ///
-/// If any page in the chunk is bit_width != 12 OR not dict-encoded,
-/// the function returns `Err` so the caller can fall back to a
-/// dense decode + filter.
+/// If the first data page is not dict-encoded (RLE_DICTIONARY /
+/// PLAIN_DICTIONARY), the function returns `Err` so the caller can
+/// fall back to a dense decode + filter.
 pub fn filter_i32_column_to_bitmap(
     path: &std::path::Path,
     rg: usize,
@@ -346,22 +347,14 @@ pub fn filter_i32_column_to_bitmap(
     }
     decompress_into(codec, first_body, &mut scratch)?;
     let dict = decode_plain_i32(&scratch).map_err(|e| ext(format!("plain i32 dict: {e}")))?;
-    if dict.len() > 4096 {
-        return Err(ext(format!(
-            "dict size {} exceeds bw=12 cap (4096); column needs wider NEON kernel",
-            dict.len()
-        )));
-    }
-    let mut dict_mask = vec![0u8; 4096];
-    for (i, &v) in dict.iter().enumerate() {
-        if predicate(v) {
-            dict_mask[i] = 1;
-        }
-    }
 
-    // Walk data pages, emit bitmap. Phase 5 fused-NEON kernel handles
-    // bw=12 RLE_DICTIONARY pages; we error on anything else for now.
+    // Walk data pages. Sniff bit_width from the first data page's
+    // body[0] so we can size the dict_mask correctly for v0.2.0's
+    // width-generic fused-predicate kernel. The bit_width is stable
+    // across pages within a chunk by construction (chosen at write
+    // time from the dict size).
     let mut bitmap: Vec<u8> = Vec::with_capacity(total.div_ceil(8));
+    let mut dict_mask: Vec<u8> = Vec::new();
     let mut emitted: usize = 0;
     while emitted < total {
         let (hdr, body) = walker
@@ -376,8 +369,16 @@ pub fn filter_i32_column_to_bitmap(
         decompress_into(codec, body, &mut scratch)?;
         match dph.encoding {
             Encoding::RleDictionary | Encoding::PlainDictionary => {
-                decode_rle_dictionary_predicate_bitmap_bw12(&scratch, n, &dict_mask, &mut bitmap)
-                    .map_err(|e| ext(format!("phase5 bw12: {e}")))?;
+                if dict_mask.is_empty() {
+                    if scratch.is_empty() {
+                        return Err(ext("filter_i32: empty data page body"));
+                    }
+                    let bit_width = scratch[0];
+                    dict_mask = build_dict_predicate_mask(&dict, bit_width, |&v| predicate(v))
+                        .map_err(|e| ext(format!("build_dict_predicate_mask: {e}")))?;
+                }
+                decode_rle_dictionary_predicate_bitmap(&scratch, n, &dict_mask, &mut bitmap)
+                    .map_err(|e| ext(format!("rle_dict_predicate_bitmap: {e}")))?;
             }
             other => {
                 return Err(ext(format!(
