@@ -11,7 +11,6 @@ records or evidence of a re-dispatch.
 from __future__ import annotations
 
 import os
-import sqlite3
 import subprocess
 import time
 from pathlib import Path

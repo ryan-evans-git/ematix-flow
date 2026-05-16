@@ -12,7 +12,12 @@ import subprocess
 import time
 
 from .conftest import (
-    EXAMPLES, FLOW, PYTHON, psql, psql_count, truncate, wait_for_rows,
+    EXAMPLES,
+    FLOW,
+    PYTHON,
+    psql,
+    truncate,
+    wait_for_rows,
 )
 
 DEMO = EXAMPLES / "09_streaming_clickstream"

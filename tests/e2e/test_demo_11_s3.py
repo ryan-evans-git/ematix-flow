@@ -6,13 +6,15 @@ for ~15 seconds, asserts 600 rows landed in `analytics.events`.
 
 from __future__ import annotations
 
-import os
 import signal
 import subprocess
-import time
 
 from .conftest import (
-    EXAMPLES, PYTHON, psql, psql_count, truncate, wait_for_rows,
+    EXAMPLES,
+    PYTHON,
+    psql,
+    truncate,
+    wait_for_rows,
 )
 
 DEMO = EXAMPLES / "11_s3_parquet_to_postgres"

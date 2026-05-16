@@ -11,7 +11,6 @@ document the gap).
 
 from __future__ import annotations
 
-import os
 import signal
 import subprocess
 import time
@@ -19,7 +18,11 @@ import time
 import pytest
 
 from ..conftest import (
-    EXAMPLES, PYTHON, psql_count, truncate, wait_for_rows,
+    EXAMPLES,
+    PYTHON,
+    psql_count,
+    truncate,
+    wait_for_rows,
 )
 
 DEMO = EXAMPLES / "11_s3_parquet_to_postgres"

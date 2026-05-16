@@ -13,10 +13,8 @@ their heartbeat stops and the row's `expires_at` rolls into the past.
 from __future__ import annotations
 
 import os
-import signal
 import sqlite3
 import subprocess
-import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 

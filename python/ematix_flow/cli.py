@@ -120,7 +120,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
         # attempt_count=1 and gave_up never fires.
         try:
             run_log.restore_into_process()
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             print(
                 f"warning: restore_into_process failed in worker: "
                 f"{type(e).__name__}: {e}",
@@ -147,7 +147,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
         except KeyError:
             print(f"error: no pipeline named {args.name!r}", file=sys.stderr)
             return 2
-        except BaseException as e:  # noqa: BLE001 — re-raised after recording
+        except BaseException as e:
             err = e
             raise
         print(json.dumps(result, default=str))
@@ -176,7 +176,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
                         gave_up=attempt_count >= policy.max_attempts,
                     )
                     run_log.record_attempt(args.name, new_state)
-            except Exception as e:  # noqa: BLE001 — best-effort
+            except Exception as e:
                 print(
                     f"warning: failed to record run outcome for "
                     f"{args.name!r}: {type(e).__name__}: {e}",
@@ -200,7 +200,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
             run_log.close()
         # If the pipeline raised, surface it now (after RunLog writes).
         if err is not None and not isinstance(err, SystemExit):
-            return 1
+            return 1  # noqa: B012 — intentional: convert raise to exit code 1 after cleanup
 
 
 def _cmd_consume(args: argparse.Namespace) -> int:

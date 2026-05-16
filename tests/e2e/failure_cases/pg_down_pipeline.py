@@ -16,7 +16,6 @@ import psycopg2
 
 from ematix_flow.pipeline import register
 
-
 # Deliberately unreachable: no service binds 5499 in docker-compose.yml.
 DEAD_PG_URL = "postgres://postgres:postgres@127.0.0.1:5499/postgres"
 

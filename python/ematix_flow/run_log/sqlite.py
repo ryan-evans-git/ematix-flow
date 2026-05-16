@@ -28,7 +28,7 @@ class _LockingConn:
     same connection the scheduler / worker main thread uses, without
     Python's `sqlite3` rejecting it for cross-thread access."""
 
-    __slots__ = ("_raw", "_lock")
+    __slots__ = ("_lock", "_raw")
 
     def __init__(self, raw, lock):
         self._raw = raw

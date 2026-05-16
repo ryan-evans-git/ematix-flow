@@ -222,7 +222,7 @@ def _walk_and_dispatch(
     # because the scheduler never sees the worker's success.
     try:
         run_log.restore_into_process()
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         log.warning(
             "scheduler: restore_into_process failed: %s: %s",
             type(e).__name__, e,
