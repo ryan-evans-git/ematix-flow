@@ -52,14 +52,6 @@ pub mod fused_jit;
 // JOIN-bound). Substrate for the future cranelift-JIT-generalized
 // operator. See `fused_post_join.rs` header and issues #51, #52.
 pub mod fused_post_join;
-// Σ.D3 phase E: fully-fused Q14 scan + filter + join + agg in one
-// operator. Owns both inputs (lineitem + part); part becomes a
-// direct-indexed promo bitmap; lineitem streams through parallel
-// shards filtering + probing + accumulating in one pass. Built to
-// beat Polars's 12.5 ms Q14 SF=1 number — the post-join-only fusion
-// in `fused_post_join.rs::Q14` only saved ~0.9 ms; the JOIN+scan
-// dominated. See module header for the algorithm.
-pub mod fused_q14_full;
 // Σ.D3 phase D: `PhysicalOptimizerRule` that auto-routes hand-coded
 // FusedFilterSumExec / FusedFilterMultiAggExec / FusedPostJoinExec(Q14)
 // instances to their Cranelift-JIT'd variants. Walks the physical plan

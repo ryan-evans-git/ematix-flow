@@ -43,7 +43,6 @@ use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode};
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::filter::FilterExec;
-use datafusion::physical_plan::joins::HashJoinExec;
 use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::physical_plan::sorts::sort::SortExec;
@@ -52,7 +51,6 @@ use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMerge
 use crate::fused::{FusedFilterSumExec, Q6Predicate};
 use crate::fused_multi_agg::{FusedFilterMultiAggExec, Q1Predicate};
 use crate::fused_post_join::{FusedPostJoinExec, FusedPostJoinSpec};
-use crate::fused_q14_full::{FusedQ14FullExec, Q14Predicate};
 
 /// Σ.D3 phase D rule: rewrite hand-coded fused execs into their JIT
 /// variants in-place. Idempotent — execs already in JIT mode pass
@@ -461,9 +459,8 @@ pub struct MatchedAggregateShape {
     pub cse_projection: Option<Arc<ProjectionExec>>,
     /// The plan node below the aggregate stack. For
     /// FusedFilterSumExec / FusedFilterMultiAggExec-shaped rules
-    /// this is typically the `FilterExec`; for FusedPostJoinExec /
-    /// FusedQ14FullExec-shaped rules this is the join chain or
-    /// projection above it.
+    /// this is typically the `FilterExec`; for FusedPostJoinExec-
+    /// shaped rules this is the join chain or projection above it.
     pub body: Arc<dyn ExecutionPlan>,
 }
 
@@ -880,253 +877,9 @@ fn decompose_filter_leaf(expr: &Arc<dyn PhysicalExpr>) -> Option<(String, Operat
     }
 }
 
-/// Σ.D3 phase D (Q14): rule that pattern-matches the DataFusion default
-/// plan for TPC-H Q14 (scan + filter + 2-way hash join + dual-SUM-
-/// with-CASE-WHEN) and rewrites the whole subtree to a single
-/// [`FusedQ14FullExec`] over the two FastParquet scans. More invasive
-/// than Q1/Q6 because the fused operator owns *both* inputs and
-/// replaces the hash join with a direct-indexed promo bitmap probe.
-///
-/// Recognised plan shape (see `examples/tpch_q14_plan_dump.rs`):
-///
-/// ```text
-/// ProjectionExec(rename `100 * sum(...) / sum(...)` → "promo_revenue")
-///   AggregateExec(Final, no group-by, 2 SUM aggregates)
-///     CoalescePartitionsExec
-///       AggregateExec(Partial, no group-by, 2 SUM aggregates)
-///         ProjectionExec(CSE: extprice * (1 - discount); p_type passthrough)
-///           HashJoinExec(Inner, on=[(p_partkey, l_partkey)],
-///                        projection=[p_type, extprice, discount])
-///             RepartitionExec(Hash([p_partkey]))
-///               scan(part, exposes p_partkey + p_type)
-///             RepartitionExec(Hash([l_partkey]))
-///               FilterExec(l_shipdate ∈ [V_lo, V_hi),
-///                          projection=[l_partkey, extprice, discount])
-///                 [optional RepartitionExec(RoundRobinBatch) wrapper]
-///                   scan(lineitem, exposes the 4 cols Q14 fused needs)
-/// ```
-///
-/// Replacement: `FusedQ14FullExec::try_new(lineitem_scan, part_scan,
-/// Q14Predicate { shipdate_lo, shipdate_hi })`. The fused operator
-/// re-applies the shipdate filter internally (no FilterExec needed
-/// above the lineitem scan) and replaces the hash join with a direct-
-/// indexed `Vec<bool>` promo bitmap probe built from `part`. Output
-/// is one Float64 column named "promo_revenue" — matches the SQL
-/// alias, so the top ProjectionExec is dropped.
-///
-/// Notes on lineitem-side descent: we extract the predicate from the
-/// FilterExec but then walk *past* it to find the bare scan, because
-/// FusedQ14FullExec requires the lineitem schema to still include
-/// l_shipdate (which FilterExec.projection drops). The internal
-/// RepartitionExec(RoundRobinBatch) wrapper between FilterExec and the
-/// scan is stripped automatically by the "descend through single-child
-/// wrappers" loop.
-#[derive(Debug, Default)]
-pub struct InjectFusedQ14Rule;
-
-impl PhysicalOptimizerRule for InjectFusedQ14Rule {
-    fn optimize(
-        &self,
-        plan: Arc<dyn ExecutionPlan>,
-        _config: &ConfigOptions,
-    ) -> DfResult<Arc<dyn ExecutionPlan>> {
-        let result = plan.transform_down(|node| {
-            if let Some(new) = try_match_q14_plan(&node)? {
-                Ok(Transformed::yes(new))
-            } else {
-                Ok(Transformed::no(node))
-            }
-        })?;
-        Ok(result.data)
-    }
-
-    fn name(&self) -> &str {
-        "ematix_flow_inject_fused_q14"
-    }
-
-    fn schema_check(&self) -> bool {
-        // Output is `promo_revenue: Float64` (non-nullable in the fused
-        // exec; DataFusion's synthesised division result is nullable).
-        // Same metadata-only drift as InjectFusedQ1Rule — accept it and
-        // pin cell-by-cell equivalence at the SQL test level.
-        false
-    }
-}
-
-fn try_match_q14_plan(node: &Arc<dyn ExecutionPlan>) -> DfResult<Option<Arc<dyn ExecutionPlan>>> {
-    const CFG: AggregateShapeConfig = AggregateShapeConfig {
-        expect_top_sort: false,
-        expect_top_projection: true,
-        expect_final_mode: FinalAggMode::Final,
-        expect_group_by_count: 0,
-        expect_agg_count: 2,
-        expect_cse_projection: true,
-    };
-    let Some(shape) = match_aggregate_query_shape(node, &CFG)? else {
-        return Ok(None);
-    };
-    let proj = shape
-        .top_projection
-        .as_ref()
-        .expect("config requires top projection");
-    if proj.schema().field(0).name() != "promo_revenue" {
-        return Ok(None);
-    }
-    if !both_are_sum(shape.final_agg.aggr_expr()) || !both_are_sum(shape.partial_agg.aggr_expr()) {
-        return Ok(None);
-    }
-    let after_cse: Arc<dyn ExecutionPlan> = shape.body;
-    let Some(join) = after_cse.as_any().downcast_ref::<HashJoinExec>() else {
-        return Ok(None);
-    };
-    // The two FastParquet scans are wrapped in RepartitionExec(Hash);
-    // descend through any wrappers (Repartition, CoalesceBatches) until
-    // we reach a node whose schema exposes the columns each side needs.
-    let (build_side, probe_side): (Arc<dyn ExecutionPlan>, Arc<dyn ExecutionPlan>) = {
-        let children = join.children();
-        if children.len() != 2 {
-            return Ok(None);
-        }
-        ((*children[0]).clone(), (*children[1]).clone())
-    };
-
-    // Figure out which side is `part` (has p_partkey + p_type) and
-    // which is `lineitem` (has l_partkey + l_extendedprice + …). The
-    // planner consistently puts `part` on the build side here but we
-    // detect by schema rather than hard-coding position.
-    let (part_scan, lineitem_branch) = if descend_finds_part_columns(&build_side) {
-        (build_side, probe_side)
-    } else if descend_finds_part_columns(&probe_side) {
-        (probe_side, build_side)
-    } else {
-        return Ok(None);
-    };
-
-    // Resolve the part scan (strip RepartitionExec wrappers).
-    let part_scan = match descend_to_scan_with(&part_scan, scan_has_part_columns) {
-        Some(s) => s,
-        None => return Ok(None),
-    };
-
-    // Resolve the lineitem branch: walk down to a FilterExec, extract
-    // the Q14Predicate, then walk *past* the FilterExec to the bare
-    // scan (FusedQ14FullExec re-applies the predicate internally).
-    let (predicate, lineitem_scan) = match descend_to_q14_lineitem_scan(&lineitem_branch) {
-        Some((p, s)) => (p, s),
-        None => return Ok(None),
-    };
-
-    let fused = FusedQ14FullExec::try_new(lineitem_scan, part_scan, predicate)?;
-    Ok(Some(Arc::new(fused) as Arc<dyn ExecutionPlan>))
-}
-
 fn both_are_sum(aggs: &[Arc<datafusion::physical_expr::aggregate::AggregateFunctionExpr>]) -> bool {
     aggs.iter()
         .all(|a| a.fun().name().eq_ignore_ascii_case("sum"))
-}
-
-fn scan_has_part_columns(schema: &datafusion::arrow::datatypes::SchemaRef) -> bool {
-    use datafusion::arrow::datatypes::DataType;
-    let has = |name: &str, allowed: &[DataType]| -> bool {
-        schema
-            .field_with_name(name)
-            .map(|f| allowed.iter().any(|t| t == f.data_type()))
-            .unwrap_or(false)
-    };
-    has("p_partkey", &[DataType::Int32, DataType::Int64]) && has("p_type", &[DataType::Utf8View])
-}
-
-fn scan_has_lineitem_q14_columns(schema: &datafusion::arrow::datatypes::SchemaRef) -> bool {
-    use datafusion::arrow::datatypes::DataType;
-    let has = |name: &str, allowed: &[DataType]| -> bool {
-        schema
-            .field_with_name(name)
-            .map(|f| allowed.iter().any(|t| t == f.data_type()))
-            .unwrap_or(false)
-    };
-    has("l_partkey", &[DataType::Int32, DataType::Int64])
-        && has("l_extendedprice", &[DataType::Float64])
-        && has("l_discount", &[DataType::Float64])
-        && has("l_shipdate", &[DataType::Date32])
-}
-
-/// Quick check: does `plan` (after descending through single-child
-/// wrappers) eventually expose the part-scan columns? Used to pick
-/// which branch of the HashJoin is the part side.
-fn descend_finds_part_columns(plan: &Arc<dyn ExecutionPlan>) -> bool {
-    let mut cur = plan.clone();
-    loop {
-        if scan_has_part_columns(&cur.schema()) {
-            return true;
-        }
-        let children = cur.children();
-        if children.len() != 1 {
-            return false;
-        }
-        cur = (*children[0]).clone();
-    }
-}
-
-/// Descend through single-child wrappers (Repartition, CoalesceBatches,
-/// etc.) and return the *deepest* node whose schema satisfies
-/// `predicate`. Earlier this returned the *first* match, which stopped
-/// at RepartitionExec wrappers (their schemas are identical to their
-/// scan children's) and made the rule wrap the fused exec around an
-/// unnecessary reshuffle layer — at SF=1 Q14 the rule won only +3%
-/// despite the fused inner loop being available, because the
-/// RoundRobinBatch + Hash repartition steps still ran above us.
-/// Walking all the way to the leaf strips them.
-fn descend_to_scan_with(
-    plan: &Arc<dyn ExecutionPlan>,
-    predicate: fn(&datafusion::arrow::datatypes::SchemaRef) -> bool,
-) -> Option<Arc<dyn ExecutionPlan>> {
-    let mut best: Option<Arc<dyn ExecutionPlan>> = None;
-    let mut cur = plan.clone();
-    loop {
-        if predicate(&cur.schema()) {
-            best = Some(cur.clone());
-        }
-        let children = cur.children();
-        if children.len() != 1 {
-            break;
-        }
-        cur = (*children[0]).clone();
-    }
-    best
-}
-
-/// Descend the lineitem branch of the join. Expects a FilterExec at
-/// some level along the way (its predicate becomes the Q14Predicate)
-/// and a scan beneath it that still has l_shipdate. Returns
-/// `(Q14Predicate, lineitem_scan)`.
-fn descend_to_q14_lineitem_scan(
-    plan: &Arc<dyn ExecutionPlan>,
-) -> Option<(Q14Predicate, Arc<dyn ExecutionPlan>)> {
-    // Walk top-down looking for a FilterExec.
-    let mut cur = plan.clone();
-    let predicate: Q14Predicate = loop {
-        if let Some(filter) = cur.as_any().downcast_ref::<FilterExec>() {
-            break extract_q14_predicate(filter.predicate())?;
-        }
-        let children = cur.children();
-        if children.len() != 1 {
-            return None;
-        }
-        cur = (*children[0]).clone();
-    };
-
-    // From the FilterExec, walk past it and any further wrappers to
-    // the scan whose schema still has l_shipdate.
-    let after_filter: Arc<dyn ExecutionPlan> = match cur.as_any().downcast_ref::<FilterExec>() {
-        Some(f) => f
-            .children()
-            .first()
-            .map(|c| (*c).clone())
-            .or_else(|| None)?,
-        None => return None,
-    };
-    let scan = descend_to_scan_with(&after_filter, scan_has_lineitem_q14_columns)?;
-    Some((predicate, scan))
 }
 
 /// Σ.D3 phase D (Q3): pattern-match TPC-H Q3's plan — SortMerge over a
@@ -1489,56 +1242,6 @@ fn post_join_has_q12_columns(schema: &datafusion::arrow::datatypes::SchemaRef) -
             .field_with_name("o_orderpriority")
             .map(|f| f.data_type() == &DataType::Utf8View)
             .unwrap_or(false)
-}
-
-/// Extract a Q14 `l_shipdate ∈ [V_lo, V_hi)` predicate from an
-/// AND-chain. Tolerates the conditions in either order.
-fn extract_q14_predicate(expr: &Arc<dyn PhysicalExpr>) -> Option<Q14Predicate> {
-    let mut leaves: Vec<&Arc<dyn PhysicalExpr>> = Vec::new();
-    flatten_and(expr, &mut leaves);
-    let mut lo: Option<i32> = None;
-    let mut hi: Option<i32> = None;
-    for leaf in leaves {
-        let (col, op, lit) = decompose_filter_leaf(leaf)?;
-        if col != "l_shipdate" {
-            return None;
-        }
-        let v = match lit {
-            ScalarValue::Date32(Some(d)) => d,
-            _ => return None,
-        };
-        match op {
-            Operator::GtEq => {
-                if lo.is_some() {
-                    return None;
-                }
-                lo = Some(v);
-            }
-            Operator::Gt => {
-                if lo.is_some() {
-                    return None;
-                }
-                lo = Some(v + 1);
-            }
-            Operator::Lt => {
-                if hi.is_some() {
-                    return None;
-                }
-                hi = Some(v);
-            }
-            Operator::LtEq => {
-                if hi.is_some() {
-                    return None;
-                }
-                hi = Some(v + 1);
-            }
-            _ => return None,
-        }
-    }
-    Some(Q14Predicate {
-        shipdate_lo: lo?,
-        shipdate_hi: hi?,
-    })
 }
 
 #[cfg(test)]
@@ -2010,143 +1713,9 @@ mod tests {
         );
     }
 
-    // ----- InjectFusedQ14Rule tests -----
-
-    const Q14_SQL: &str = "
-        SELECT
-            100.00 * sum(case when p_type like 'PROMO%'
-                              then l_extendedprice * (1 - l_discount)
-                              else 0 end)
-            / sum(l_extendedprice * (1 - l_discount)) AS promo_revenue
-        FROM lineitem, part
-        WHERE l_partkey = p_partkey
-          AND l_shipdate >= DATE '1995-09-01'
-          AND l_shipdate <  DATE '1995-10-01'
-    ";
-
     const TPCH_TABLES: &[&str] = &[
         "region", "nation", "supplier", "customer", "part", "partsupp", "orders", "lineitem",
     ];
-
-    async fn ctx_for_q14(register_rule: bool) -> Option<SessionContext> {
-        use crate::fast_parquet::FastParquetTableProvider;
-        use datafusion::execution::session_state::SessionStateBuilder;
-        use datafusion::prelude::SessionConfig;
-
-        let path = sf1_lineitem()?;
-        // Resolve the directory from the lineitem path to register
-        // every TPC-H table the planner might pull in.
-        let dir = std::path::PathBuf::from(&path)
-            .parent()?
-            .to_string_lossy()
-            .into_owned();
-        let state = if register_rule {
-            SessionStateBuilder::new()
-                .with_config(SessionConfig::new().with_target_partitions(14))
-                .with_default_features()
-                .with_physical_optimizer_rule(Arc::new(InjectFusedQ14Rule))
-                .build()
-        } else {
-            SessionStateBuilder::new()
-                .with_config(SessionConfig::new().with_target_partitions(14))
-                .with_default_features()
-                .build()
-        };
-        let ctx = SessionContext::new_with_state(state);
-        for t in TPCH_TABLES {
-            let p = format!("{dir}/{t}.parquet");
-            let prov = FastParquetTableProvider::try_new(p).ok()?;
-            ctx.register_table(*t, Arc::new(prov)).unwrap();
-        }
-        Some(ctx)
-    }
-
-    /// Inject Q14 rule fires on real Q14 SQL, plan contains
-    /// FusedQ14FullExec, and the ratio matches the un-rewritten plan
-    /// to rel_err < 1e-9.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn inject_q14_rule_rewrites_real_plan_and_preserves_result() {
-        use datafusion::arrow::array::Float64Array;
-        use datafusion::physical_plan::displayable;
-
-        let Some(ctx_with) = ctx_for_q14(true).await else {
-            eprintln!("TPC-H SF=1 data not generated; skipping test");
-            return;
-        };
-        let ctx_without = ctx_for_q14(false).await.unwrap();
-
-        let plan = ctx_with
-            .sql(Q14_SQL)
-            .await
-            .unwrap()
-            .create_physical_plan()
-            .await
-            .unwrap();
-        let plan_str = displayable(plan.as_ref()).indent(true).to_string();
-        assert!(
-            plan_str.contains("FusedQ14FullExec"),
-            "InjectFusedQ14Rule did not fire on canonical Q14 plan.\nPlan:\n{plan_str}"
-        );
-
-        let r_with = ctx_with
-            .sql(Q14_SQL)
-            .await
-            .unwrap()
-            .collect()
-            .await
-            .unwrap();
-        let r_without = ctx_without
-            .sql(Q14_SQL)
-            .await
-            .unwrap()
-            .collect()
-            .await
-            .unwrap();
-        let v_with = r_with[0]
-            .column(0)
-            .as_any()
-            .downcast_ref::<Float64Array>()
-            .unwrap()
-            .value(0);
-        let v_without = r_without[0]
-            .column(0)
-            .as_any()
-            .downcast_ref::<Float64Array>()
-            .unwrap()
-            .value(0);
-        let rel = (v_with - v_without).abs() / v_without.abs().max(v_with.abs());
-        assert!(
-            rel < 1e-9,
-            "rule-rewritten Q14 result diverges: with={v_with}, without={v_without}, rel_err={rel:e}"
-        );
-    }
-
-    /// Rule must not fire on a structurally-similar query that isn't
-    /// Q14 (here: same dual-table join but no PROMO CASE-WHEN).
-    #[tokio::test(flavor = "multi_thread")]
-    async fn inject_q14_rule_does_not_fire_on_unrelated_query() {
-        use datafusion::physical_plan::displayable;
-        let Some(ctx) = ctx_for_q14(true).await else {
-            eprintln!("TPC-H SF=1 data not generated; skipping test");
-            return;
-        };
-        // Single SUM, no CASE WHEN — alias also differs from "promo_revenue".
-        let plan = ctx
-            .sql(
-                "SELECT sum(l_extendedprice * (1 - l_discount)) AS total \
-                 FROM lineitem, part WHERE l_partkey = p_partkey",
-            )
-            .await
-            .unwrap()
-            .create_physical_plan()
-            .await
-            .unwrap();
-        let plan_str = displayable(plan.as_ref()).indent(true).to_string();
-        assert!(
-            !plan_str.contains("FusedQ14FullExec"),
-            "InjectFusedQ14Rule wrongly fired:\n{plan_str}"
-        );
-    }
 
     // ----- InjectFusedQ3Rule / InjectFusedQ5Rule tests -----
 
@@ -2506,10 +2075,10 @@ mod tests {
     // The inject-rule tests above gate on SF=1 TPC-H data and therefore
     // skip in CI without the dataset. The predicate-decomposer functions
     // (`flip_op`, `decompose_leaf`, `decompose_filter_leaf`,
-    // `extract_q6_predicate`, `extract_q1_predicate`,
-    // `extract_q14_predicate`) are pure, no-fixture functions — these
-    // tests exercise their happy paths and the "return None" rejection
-    // branches that real-data tests never hit.
+    // `extract_q6_predicate`, `extract_q1_predicate`) are pure, no-
+    // fixture functions — these tests exercise their happy paths and
+    // the "return None" rejection branches that real-data tests never
+    // hit.
 
     fn col(name: &str) -> Arc<dyn PhysicalExpr> {
         Arc::new(Column::new(name, 0))
@@ -2683,67 +2252,6 @@ mod tests {
     fn extract_q1_predicate_rejects_null_literal() {
         let expr = bin(col("l_shipdate"), Operator::LtEq, lit_null_date());
         assert!(extract_q1_predicate(&expr).is_none());
-    }
-
-    #[test]
-    fn extract_q14_predicate_gt_off_by_one_correction() {
-        // For `l_shipdate > V` the inclusive lo is V+1.
-        let p = bin(
-            bin(col("l_shipdate"), Operator::Gt, lit_date(9999)),
-            Operator::And,
-            bin(col("l_shipdate"), Operator::Lt, lit_date(10100)),
-        );
-        let pred = extract_q14_predicate(&p).unwrap();
-        assert_eq!(pred.shipdate_lo, 10000);
-        assert_eq!(pred.shipdate_hi, 10100);
-    }
-
-    #[test]
-    fn extract_q14_predicate_lt_eq_off_by_one_correction() {
-        // For `l_shipdate <= V` the exclusive hi is V+1.
-        let p = bin(
-            bin(col("l_shipdate"), Operator::GtEq, lit_date(9999)),
-            Operator::And,
-            bin(col("l_shipdate"), Operator::LtEq, lit_date(10099)),
-        );
-        let pred = extract_q14_predicate(&p).unwrap();
-        assert_eq!(pred.shipdate_lo, 9999);
-        assert_eq!(pred.shipdate_hi, 10100);
-    }
-
-    #[test]
-    fn extract_q14_predicate_rejects_double_lo() {
-        // Two GtEq leaves on the same column — Q14 expects exactly one
-        // lo bound; the second triggers `if lo.is_some()` → None.
-        let p = bin(
-            bin(col("l_shipdate"), Operator::GtEq, lit_date(9999)),
-            Operator::And,
-            bin(col("l_shipdate"), Operator::GtEq, lit_date(10000)),
-        );
-        assert!(extract_q14_predicate(&p).is_none());
-    }
-
-    #[test]
-    fn extract_q14_predicate_rejects_double_hi() {
-        // Two Lt leaves — second triggers `if hi.is_some()` → None.
-        let p = bin(
-            bin(col("l_shipdate"), Operator::Lt, lit_date(10100)),
-            Operator::And,
-            bin(col("l_shipdate"), Operator::Lt, lit_date(10200)),
-        );
-        assert!(extract_q14_predicate(&p).is_none());
-    }
-
-    #[test]
-    fn extract_q14_predicate_rejects_unsupported_operator() {
-        let bad = bin(col("l_shipdate"), Operator::Eq, lit_date(10000));
-        assert!(extract_q14_predicate(&bad).is_none());
-    }
-
-    #[test]
-    fn extract_q14_predicate_rejects_wrong_column() {
-        let bad = bin(col("l_orderkey"), Operator::GtEq, lit_date(10000));
-        assert!(extract_q14_predicate(&bad).is_none());
     }
 
     #[test]

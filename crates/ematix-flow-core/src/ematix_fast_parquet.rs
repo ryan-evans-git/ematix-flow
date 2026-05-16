@@ -49,7 +49,8 @@ use parquet::file::reader::{FileReader, SerializedFileReader};
 
 use crate::ematix_parquet_bridge::{
     decode_column_chunk_byte_array, decode_column_chunk_f64, decode_column_chunk_i32,
-    decode_column_chunk_i64, filter_i32_column_to_bitmap, sparse_gather_chunk_f64,
+    decode_column_chunk_i64, filter_i32_column_to_bitmap, masked_decode_byte_array,
+    masked_decode_f64, masked_decode_i32, masked_decode_i64, sparse_gather_chunk_f64,
     sparse_gather_chunk_i32, sparse_gather_chunk_i64,
 };
 use crate::fast_parquet::{RangePredicate, extract_range_predicate};
@@ -154,6 +155,20 @@ pub struct EmatixFastParquetTableProvider {
     schema: SchemaRef,
     num_row_groups: usize,
     num_rows: usize,
+    /// Σ.E5a (Π.10 integration): when true, the filtered-decode path
+    /// uses ematix-parquet v0.3.0's `read_column_*_masked_into` façade
+    /// (Π.10 late-materialisation) instead of the pre-Π.10 in-flow
+    /// `sparse_gather_chunk_*` path. The two are semantically
+    /// equivalent — same bitmap source, same projected output — but
+    /// the masked_into façade has per-page popcount skip + sparse
+    /// PLAIN decode that the old path lacks.
+    ///
+    /// **Default `true` since 2026-05-16:** the Q14 bench (`examples/
+    /// tpch_q14_late_mat_bench.rs`) validated the late-mat path
+    /// strictly faster than sparse_gather at SF=1 (+8.2%, σ down 3.4×)
+    /// and SF=10 (+5.9%, σ down 2.2×), with bit-identical answers.
+    /// `with_late_mat(false)` is retained for benchmark comparisons.
+    late_mat: bool,
 }
 
 impl EmatixFastParquetTableProvider {
@@ -217,7 +232,22 @@ impl EmatixFastParquetTableProvider {
             schema,
             num_row_groups,
             num_rows,
+            late_mat: true,
         })
+    }
+
+    /// Σ.E5a: opt into / out of the Π.10 late-materialisation path.
+    /// When set, the filtered-decode path uses ematix-parquet's
+    /// `read_column_*_masked_into` instead of the pre-Π.10
+    /// `sparse_gather_chunk_*` route in this crate's bridge.
+    pub fn with_late_mat(mut self, on: bool) -> Self {
+        self.late_mat = on;
+        self
+    }
+
+    /// Whether the late-mat path is enabled (Σ.E5a).
+    pub fn late_mat(&self) -> bool {
+        self.late_mat
     }
 
     pub fn path(&self) -> &str {
@@ -304,6 +334,7 @@ impl TableProvider for EmatixFastParquetTableProvider {
             assignments,
             self.num_rows,
             bridge_filter,
+            self.late_mat,
         )?))
     }
 }
@@ -320,6 +351,9 @@ pub struct EmatixFastParquetExec {
     /// runs the bitmap-first path (Phase 5 fused-NEON filter + Phase 6
     /// sparse gather). When None, runs Phase 2 dense decode.
     filter: Option<BridgeFilter>,
+    /// Σ.E5a (Π.10): when true AND `filter.is_some()`, decode goes
+    /// through `read_column_*_masked_into`. Else: sparse_gather path.
+    late_mat: bool,
     properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
 }
@@ -332,6 +366,7 @@ impl EmatixFastParquetExec {
         assignments: Vec<Vec<usize>>,
         num_rows: usize,
         filter: Option<BridgeFilter>,
+        late_mat: bool,
     ) -> DfResult<Self> {
         let eq_props = EquivalenceProperties::new(schema.clone());
         let properties = Arc::new(PlanProperties::new(
@@ -347,6 +382,7 @@ impl EmatixFastParquetExec {
             assignments,
             num_rows,
             filter,
+            late_mat,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
         })
@@ -397,6 +433,7 @@ impl ExecutionPlan for EmatixFastParquetExec {
         let projection = self.projection.clone();
         let schema = self.schema.clone();
         let filter = self.filter.clone();
+        let late_mat = self.late_mat;
         let baseline = BaselineMetrics::new(&self.metrics, partition);
 
         let stream = build_partition_stream(
@@ -405,6 +442,7 @@ impl ExecutionPlan for EmatixFastParquetExec {
             projection,
             row_groups,
             filter,
+            late_mat,
             baseline,
         );
         Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)) as SendableRecordBatchStream)
@@ -437,6 +475,7 @@ fn build_partition_stream(
     projection: Vec<usize>,
     row_groups: Vec<usize>,
     filter: Option<BridgeFilter>,
+    late_mat: bool,
     baseline: BaselineMetrics,
 ) -> futures_util::stream::BoxStream<'static, DfResult<RecordBatch>> {
     use futures_util::StreamExt;
@@ -450,9 +489,12 @@ fn build_partition_stream(
 
     tokio::task::spawn_blocking(move || {
         for rg in row_groups {
-            let batch_result = match &filter {
-                Some(f) => decode_one_rg_filtered(&path_buf, rg, &schema, &projection, f),
-                None => decode_one_rg(&path_buf, rg, &schema, &projection),
+            let batch_result = match (&filter, late_mat) {
+                (Some(f), true) => {
+                    decode_one_rg_filtered_late_mat(&path_buf, rg, &schema, &projection, f)
+                }
+                (Some(f), false) => decode_one_rg_filtered(&path_buf, rg, &schema, &projection, f),
+                (None, _) => decode_one_rg(&path_buf, rg, &schema, &projection),
             };
             if tx.blocking_send(batch_result).is_err() {
                 return; // consumer dropped
@@ -552,6 +594,104 @@ fn decode_one_rg_filtered(
     RecordBatch::try_new(schema.clone(), columns).map_err(|e| {
         DataFusionError::External(
             format!("EmatixFastParquetExec (filtered): RecordBatch::try_new: {e}").into(),
+        )
+    })
+}
+
+/// Σ.E5a (Π.10): late-materialisation variant of the filtered decode
+/// path. Same contract as [`decode_one_rg_filtered`] — same bitmap
+/// source, same projected output — but column decode runs through
+/// ematix-parquet v0.3.0's `read_column_*_masked_into` façade.
+///
+/// The masked_into façade pulls the column-chunk bytes once, then
+/// decodes only at rows where the bitmap is set. Pages whose bitmap-
+/// popcount is zero are skipped entirely (no decompression, no
+/// unpack); for high-selectivity filters this skips ~99% of the
+/// decode work the dense-then-gather path was doing.
+fn decode_one_rg_filtered_late_mat(
+    path: &std::path::Path,
+    rg: usize,
+    schema: &SchemaRef,
+    projection: &[usize],
+    filter: &BridgeFilter,
+) -> DfResult<RecordBatch> {
+    // Build the row-bitmap from the filter column. Same kernel the
+    // pre-Π.10 path uses — width-generic NEON-fused predicate
+    // (Σ.E2 + bump-to-v0.2/0.3).
+    let filter_owned = filter.clone();
+    let (bitmap, _total) =
+        filter_i32_column_to_bitmap(path, rg, filter.parquet_col_idx, move |v: i32| {
+            filter_owned.eval_i32(v)
+        })?;
+
+    // Open the parquet file once for this row group. The masked_into
+    // façade caches column-chunk bytes internally; opening the
+    // ParquetFile is the only IO setup we need.
+    let file = ematix_parquet_io::ParquetFile::open(path).map_err(|e| {
+        DataFusionError::External(
+            format!("EmatixFastParquetExec (late_mat): ParquetFile::open: {e}").into(),
+        )
+    })?;
+
+    let matches: usize = bitmap.iter().map(|b| b.count_ones() as usize).sum();
+    let mut columns: Vec<Arc<dyn arrow_array::Array>> = Vec::with_capacity(projection.len());
+    for (out_idx, &col_idx) in projection.iter().enumerate() {
+        let field = schema.field(out_idx);
+        let arr: Arc<dyn arrow_array::Array> = match field.data_type() {
+            DataType::Int32 => {
+                let vals = masked_decode_i32(&file, rg, col_idx, &bitmap)?;
+                debug_assert_eq!(vals.len(), matches);
+                Arc::new(arrow_array::Int32Array::from(vals))
+            }
+            DataType::Date32 => {
+                let vals = masked_decode_i32(&file, rg, col_idx, &bitmap)?;
+                debug_assert_eq!(vals.len(), matches);
+                Arc::new(arrow_array::Date32Array::from(vals))
+            }
+            DataType::Int64 => {
+                let vals = masked_decode_i64(&file, rg, col_idx, &bitmap)?;
+                debug_assert_eq!(vals.len(), matches);
+                Arc::new(arrow_array::Int64Array::from(vals))
+            }
+            DataType::Float64 => {
+                let vals = masked_decode_f64(&file, rg, col_idx, &bitmap)?;
+                debug_assert_eq!(vals.len(), matches);
+                Arc::new(arrow_array::Float64Array::from(vals))
+            }
+            DataType::Utf8 => {
+                let vals = masked_decode_byte_array(&file, rg, col_idx, &bitmap)?;
+                debug_assert_eq!(vals.len(), matches);
+                let mut sb = arrow_array::builder::StringBuilder::with_capacity(
+                    vals.len(),
+                    vals.iter().map(|v| v.len()).sum(),
+                );
+                for v in &vals {
+                    // The masked decoder returns UTF-8 bytes for Utf8
+                    // columns; treat invalid UTF-8 as a hard error
+                    // (parquet writers shouldn't produce it for Utf8).
+                    let s = std::str::from_utf8(v).map_err(|e| {
+                        DataFusionError::External(
+                            format!(
+                                "EmatixFastParquetExec (late_mat): Utf8 column has invalid UTF-8: {e}"
+                            )
+                            .into(),
+                        )
+                    })?;
+                    sb.append_value(s);
+                }
+                Arc::new(sb.finish())
+            }
+            other => {
+                return Err(DataFusionError::NotImplemented(format!(
+                    "EmatixFastParquetExec (late_mat): unsupported column type {other:?}",
+                )));
+            }
+        };
+        columns.push(arr);
+    }
+    RecordBatch::try_new(schema.clone(), columns).map_err(|e| {
+        DataFusionError::External(
+            format!("EmatixFastParquetExec (late_mat): RecordBatch::try_new: {e}").into(),
         )
     })
 }

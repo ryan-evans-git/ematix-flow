@@ -25,8 +25,9 @@
 //!   - Phase 3: predicate pushdown via Phase 5's fused bitmap
 //!     pattern at the exec layer (the biggest projected gain).
 //!
-//! Q14 lever already shown (`tpch_q14_ematix_lever` example):
-//!   14.60 ms manual end-to-end vs FusedQ14FullExec 15.06 ms.
+//! Q14 lever: the late-mat path on `EmatixFastParquetTableProvider`
+//! (Π.10 `read_column_*_masked_into`) is the canonical Q14
+//! implementation and replaced the older bespoke fused exec.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -42,6 +43,10 @@ use ematix_parquet_codec::dict::{
 };
 use ematix_parquet_codec::plain::{
     decode_plain_byte_array, decode_plain_f64, decode_plain_i32, decode_plain_i64,
+};
+use ematix_parquet_codec::read::{
+    read_column_byte_array_masked_into, read_column_f64_masked_into, read_column_i32_masked_into,
+    read_column_i64_masked_into,
 };
 use ematix_parquet_format::types::{CompressionCodec, Encoding};
 use ematix_parquet_io::{PageWalker, ParquetFile};
@@ -537,6 +542,71 @@ pub fn sparse_gather_chunk_f64(
         |b| decode_plain_f64(b).map_err(|e| ext(format!("plain f64 dict: {e}"))),
         |b| decode_plain_f64(b).map_err(|e| ext(format!("plain f64 page: {e}"))),
     )
+}
+
+// Σ.E5a (Π.10 integration): late-materialisation entry points that
+// defer the actual decode to ematix-parquet's `read_column_*_masked_into`
+// public façade. The kernel decodes only at rows where `mask`'s bit is
+// set; for high-selectivity filters (Q14's 30-day shipdate window ≈
+// 1.4% of lineitem) this skips 99% of the per-row decode work that
+// the sparse_gather path still incurs end-to-end.
+//
+// The new APIs take a `ParquetFile` (ematix-parquet-io's high-level
+// handle); callers open it once per row-group and pass it down to
+// each column read.
+
+/// Façade-level masked-decode for INT32 / Date32 columns.
+pub fn masked_decode_i32(
+    file: &ParquetFile,
+    rg: usize,
+    col: usize,
+    mask: &[u8],
+) -> DfResult<Vec<i32>> {
+    let mut out: Vec<i32> = Vec::new();
+    read_column_i32_masked_into(file, rg, col, mask, &mut out)
+        .map_err(|e| ext(format!("masked_decode_i32: {e}")))?;
+    Ok(out)
+}
+
+/// Façade-level masked-decode for INT64 columns.
+pub fn masked_decode_i64(
+    file: &ParquetFile,
+    rg: usize,
+    col: usize,
+    mask: &[u8],
+) -> DfResult<Vec<i64>> {
+    let mut out: Vec<i64> = Vec::new();
+    read_column_i64_masked_into(file, rg, col, mask, &mut out)
+        .map_err(|e| ext(format!("masked_decode_i64: {e}")))?;
+    Ok(out)
+}
+
+/// Façade-level masked-decode for DOUBLE columns.
+pub fn masked_decode_f64(
+    file: &ParquetFile,
+    rg: usize,
+    col: usize,
+    mask: &[u8],
+) -> DfResult<Vec<f64>> {
+    let mut out: Vec<f64> = Vec::new();
+    read_column_f64_masked_into(file, rg, col, mask, &mut out)
+        .map_err(|e| ext(format!("masked_decode_f64: {e}")))?;
+    Ok(out)
+}
+
+/// Façade-level masked-decode for BYTE_ARRAY (Utf8 / Binary) columns.
+/// Returns owned `Vec<u8>` per matched value; the caller materialises
+/// these into a `StringArray` / `BinaryArray`.
+pub fn masked_decode_byte_array(
+    file: &ParquetFile,
+    rg: usize,
+    col: usize,
+    mask: &[u8],
+) -> DfResult<Vec<Vec<u8>>> {
+    let mut out: Vec<Vec<u8>> = Vec::new();
+    read_column_byte_array_masked_into(file, rg, col, mask, &mut out)
+        .map_err(|e| ext(format!("masked_decode_byte_array: {e}")))?;
+    Ok(out)
 }
 
 /// Codec-aware decompress helper. Dispatches on the column chunk's
