@@ -29,6 +29,7 @@ use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::prelude::{SessionConfig, SessionContext};
 use ematix_flow_core::ematix_fast_parquet::EmatixFastParquetTableProvider;
 use ematix_flow_core::fast_parquet::FastParquetTableProvider;
+use ematix_flow_core::dict_aggregate_rule::EnableDictGroupCountRule;
 use ematix_flow_core::fused_jit_rule::{
     InjectFusedQ12Rule, InjectFusedQ1Rule, InjectFusedQ3Rule, InjectFusedQ5Rule, InjectFusedQ6Rule,
 };
@@ -272,6 +273,7 @@ async fn build_ematix_ctx(data_dir: &Path) -> Result<SessionContext, Box<dyn std
         .with_physical_optimizer_rule(Arc::new(InjectFusedQ5Rule))
         .with_physical_optimizer_rule(Arc::new(InjectFusedQ6Rule))
         .with_physical_optimizer_rule(Arc::new(InjectFusedQ12Rule))
+        .with_physical_optimizer_rule(Arc::new(EnableDictGroupCountRule))
         .build();
     let ctx = SessionContext::new_with_state(state);
     for t in TPCH_TABLES {
@@ -486,7 +488,7 @@ fn write_benchmarks_md(
         s,
         "- DuckDB runs at default settings (in-memory `read_parquet` views). \
          ematix-flow runs with `target_partitions=14` and the InjectFusedQ1/Q3/Q5/Q6/Q12 \
-         physical-optimizer rules registered."
+         + EnableDictGroupCount physical-optimizer rules registered."
     )
     .unwrap();
 

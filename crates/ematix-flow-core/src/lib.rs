@@ -60,6 +60,16 @@ pub mod fused_post_join;
 // PhysicalExpr ASTs to inject a fused exec where none was constructed)
 // is documented as a follow-up in the module header.
 pub mod fused_jit_rule;
+// Σ.E3b.1: `DictGroupCountExec` — single-pass COUNT(*) GROUP BY over
+// a Dictionary(UInt32, Utf8|Utf8View) column. Maintains a per-batch
+// dict-code → slot lookup so the hot row loop is one array index, one
+// counter bump — no hash, no string compare.
+pub mod dict_aggregate;
+// Σ.E3b.2: `EnableDictGroupCountRule` — PhysicalOptimizerRule that
+// rewrites `AggregateExec(FinalPartitioned) → RepartitionExec →
+// AggregateExec(Partial)` on a dict group column + COUNT(*) into a
+// DictGroupCountExec. Speculative; non-matching plans pass through.
+pub mod dict_aggregate_rule;
 pub mod hash;
 pub mod join;
 pub mod kafka_backend;
