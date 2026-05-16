@@ -285,6 +285,14 @@ async fn build_ematix_ctx(data_dir: &Path) -> Result<SessionContext, Box<dyn std
             let prov = EmatixFastParquetTableProvider::try_new(path)?;
             ctx.register_table(*t, Arc::new(prov))?;
         } else {
+            // FastParquet without dict preservation by default. Probe
+            // (`probe_dict_arrival`) confirms `with_dict_preservation(
+            // true)` does surface Dictionary(UInt32, Utf8) at the
+            // Arrow boundary — but enabling it globally regresses Q10
+            // (38→77ms) and Q13 (43→109ms) because downstream operators
+            // (filter on Utf8, multi-col GROUP BY mixing dict + plain
+            // strings) without dict-fast-paths materialize per batch.
+            // Future work: per-column or rule-driven opt-in.
             let prov = FastParquetTableProvider::try_new(path)?;
             ctx.register_table(*t, Arc::new(prov))?;
         }
