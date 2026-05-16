@@ -163,8 +163,11 @@ pub struct EmatixFastParquetTableProvider {
     /// the masked_into façade has per-page popcount skip + sparse
     /// PLAIN decode that the old path lacks.
     ///
-    /// Default `false` so the existing path stays the default until
-    /// the late-mat bench validates the win.
+    /// **Default `true` since 2026-05-16:** the Q14 bench (`examples/
+    /// tpch_q14_late_mat_bench.rs`) validated the late-mat path
+    /// strictly faster than sparse_gather at SF=1 (+8.2%, σ down 3.4×)
+    /// and SF=10 (+5.9%, σ down 2.2×), with bit-identical answers.
+    /// `with_late_mat(false)` is retained for benchmark comparisons.
     late_mat: bool,
 }
 
@@ -229,11 +232,11 @@ impl EmatixFastParquetTableProvider {
             schema,
             num_row_groups,
             num_rows,
-            late_mat: false,
+            late_mat: true,
         })
     }
 
-    /// Σ.E5a: opt into the Π.10 late-materialisation path.
+    /// Σ.E5a: opt into / out of the Π.10 late-materialisation path.
     /// When set, the filtered-decode path uses ematix-parquet's
     /// `read_column_*_masked_into` instead of the pre-Π.10
     /// `sparse_gather_chunk_*` route in this crate's bridge.
