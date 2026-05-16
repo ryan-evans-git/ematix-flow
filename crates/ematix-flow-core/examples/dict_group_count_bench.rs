@@ -71,7 +71,10 @@ async fn main() {
     let mem = Arc::new(mem);
 
     println!("=== dict_group_count_bench ===");
-    println!("rows={ROWS}, distinct_groups={}, trials={TRIALS}", SHIPMODES.len());
+    println!(
+        "rows={ROWS}, distinct_groups={}, trials={TRIALS}",
+        SHIPMODES.len()
+    );
 
     // --- Default DataFusion path ---
     let mut default_samples: Vec<f64> = Vec::with_capacity(TRIALS);

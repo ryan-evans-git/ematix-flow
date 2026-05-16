@@ -132,18 +132,20 @@ fn promote_dict_encoded_to_dictionary(
         .map(|(col_idx, f)| {
             let is_str_or_bin = matches!(
                 f.data_type(),
-                DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
-                    | DataType::Binary | DataType::LargeBinary | DataType::BinaryView
+                DataType::Utf8
+                    | DataType::LargeUtf8
+                    | DataType::Utf8View
+                    | DataType::Binary
+                    | DataType::LargeBinary
+                    | DataType::BinaryView
             );
             if !is_str_or_bin {
                 return f.as_ref().clone();
             }
             let all_dict = (0..num_rgs).all(|rg_idx| {
                 let cc = metadata.row_group(rg_idx).column(col_idx);
-                cc.encodings().any(|e| matches!(
-                    e,
-                    Encoding::RLE_DICTIONARY | Encoding::PLAIN_DICTIONARY
-                ))
+                cc.encodings()
+                    .any(|e| matches!(e, Encoding::RLE_DICTIONARY | Encoding::PLAIN_DICTIONARY))
             });
             if !all_dict {
                 return f.as_ref().clone();
@@ -157,12 +159,8 @@ fn promote_dict_encoded_to_dictionary(
                 DataType::BinaryView => DataType::Binary,
                 other => other.clone(),
             };
-            let dict_type = DataType::Dictionary(
-                Box::new(DataType::UInt32),
-                Box::new(value_type),
-            );
-            Field::new(f.name(), dict_type, f.is_nullable())
-                .with_metadata(f.metadata().clone())
+            let dict_type = DataType::Dictionary(Box::new(DataType::UInt32), Box::new(value_type));
+            Field::new(f.name(), dict_type, f.is_nullable()).with_metadata(f.metadata().clone())
         })
         .collect();
     datafusion::arrow::datatypes::Schema::new_with_metadata(promoted, schema.metadata().clone())
