@@ -37,8 +37,8 @@ use datafusion::error::{DataFusionError, Result as DfResult};
 
 use ematix_parquet_codec::compression::{decompress_snappy_into, decompress_zstd_into};
 use ematix_parquet_codec::dict::{
-    build_dict_predicate_mask, decode_rle_dictionary_into,
-    decode_rle_dictionary_predicate_bitmap, gather_dict_at_bitmap_into,
+    build_dict_predicate_mask, decode_rle_dictionary_into, decode_rle_dictionary_predicate_bitmap,
+    gather_dict_at_bitmap_into,
 };
 use ematix_parquet_codec::plain::{
     decode_plain_byte_array, decode_plain_f64, decode_plain_i32, decode_plain_i64,
