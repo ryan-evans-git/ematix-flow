@@ -25,8 +25,9 @@
 //!   - Phase 3: predicate pushdown via Phase 5's fused bitmap
 //!     pattern at the exec layer (the biggest projected gain).
 //!
-//! Q14 lever already shown (`tpch_q14_ematix_lever` example):
-//!   14.60 ms manual end-to-end vs FusedQ14FullExec 15.06 ms.
+//! Q14 lever: the late-mat path on `EmatixFastParquetTableProvider`
+//! (Π.10 `read_column_*_masked_into`) is the canonical Q14
+//! implementation and replaced the older bespoke fused exec.
 
 use std::path::Path;
 use std::sync::Arc;

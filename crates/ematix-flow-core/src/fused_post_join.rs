@@ -376,12 +376,10 @@ impl ExecutionPlan for FusedPostJoinExec {
                     emit_q12(schema_for_batch, merged)
                 }
                 FusedPostJoinSpec::Q14 => {
-                    // Q14 path is the older post-join-only variant —
-                    // most user code now goes through FusedQ14FullExec
-                    // (which owns both scans and runs the bitmap probe
-                    // inline). We keep the materialise-then-compute
-                    // shape here for the JIT path's pre-seed-from-
-                    // outputs contract; the hand-coded path is small
+                    // Q14 post-join-only variant. We keep the
+                    // materialise-then-compute shape here for the
+                    // JIT path's pre-seed-from-outputs contract; the
+                    // hand-coded path is small
                     // enough that drain cost doesn't matter. If a
                     // future user complains, mirror the Q3/Q5 streaming
                     // shape above using a `[f64; 2]` accumulator.

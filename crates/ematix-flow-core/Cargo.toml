@@ -160,25 +160,6 @@ path = "examples/fast_parquet_array_diff.rs"
 name = "tpch_fused_jit_bench"
 path = "examples/tpch_fused_jit_bench.rs"
 
-# Σ.D3 phase E: FusedQ14FullExec end-to-end SF=1 timing. Closes the
-# only outright Polars win in the README's main TPC-H table (Q14 =
-# 12.53 ms in Polars vs ~17 ms via FastParquet alone) by collapsing
-# scan + filter + join + dual-SUM-with-CASE-WHEN into one parallel
-# pass over a direct-indexed promo bitmap.
-[[example]]
-name = "tpch_q14_full_bench"
-path = "examples/tpch_q14_full_bench.rs"
-
-# ematix-parquet ↔ ematix-flow integration POC. Runs Q14 entirely via
-# our sibling-repo kernels for lineitem column decode (Phase 5 fused-
-# NEON filter + Phase 6 bitmap-driven sparse gather) + parquet-rs for
-# the small part table. No DataFusion. Establishes the hard floor for
-# Q14 wall-clock with our kernels and tells us whether full integration
-# as a TableProvider is worth the engineering investment.
-[[example]]
-name = "tpch_q14_ematix_lever"
-path = "examples/tpch_q14_ematix_lever.rs"
-
 # Phase 3.5: Q14-shape SQL through 3 providers — register_parquet,
 # FastParquetTableProvider, EmatixFastParquetTableProvider with the
 # Phase 3 Date32 predicate pushdown. Measures wall-clock impact of
@@ -187,15 +168,6 @@ path = "examples/tpch_q14_ematix_lever.rs"
 [[example]]
 name = "tpch_q14_emat_provider_bench"
 path = "examples/tpch_q14_emat_provider_bench.rs"
-
-# Σ.E2 follow-up: probe parquet-rs `with_row_filter` against Q14's
-# single-Date32 predicate, deciding whether late materialization is
-# the right next lever for FastParquet (broad TPC-H impact). The
-# day-3 probe rejected `with_row_filter` for Q6's compound predicate;
-# this one tests whether the cheaper Q14-shape predicate flips it.
-[[example]]
-name = "parquet_rs_late_mat_q14"
-path = "examples/parquet_rs_late_mat_q14.rs"
 
 # Σ.D3 phase D (real): dump the DataFusion physical plan for Q6 to
 # learn the exact node shape the SQL-pattern auto-injection rule
@@ -225,25 +197,6 @@ path = "examples/tpch_q1_plan_dump.rs"
 [[example]]
 name = "tpch_q1_inject_bench"
 path = "examples/tpch_q1_inject_bench.rs"
-
-# Σ.D3 phase D (Q14 variant): dump the canonical Q14 plan shape
-# (scan + filter + JOIN + dual-SUM-with-CASE-WHEN) so the future
-# InjectFusedQ14Rule detector can match it exactly.
-[[example]]
-name = "tpch_q14_plan_dump"
-path = "examples/tpch_q14_plan_dump.rs"
-
-# Σ.D3 phase D (Q14 variant): bench Q14 with and without
-# InjectFusedQ14Rule registered.
-[[example]]
-name = "tpch_q14_inject_bench"
-path = "examples/tpch_q14_inject_bench.rs"
-
-# Σ.D3 phase D (Q14 variant) diagnostic: dump the Q14 plan AFTER
-# InjectFusedQ14Rule runs.
-[[example]]
-name = "tpch_q14_inject_plan_dump"
-path = "examples/tpch_q14_inject_plan_dump.rs"
 
 # Σ.D3 phase D (Q3/Q5): dump canonical plan shapes for the
 # post-join-aggregate rules.
