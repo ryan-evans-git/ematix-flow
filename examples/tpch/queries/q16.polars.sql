@@ -10,7 +10,7 @@ select
 	count(distinct ps_suppkey) as supplier_cnt
 from
 	partsupp
-	join part on p_partkey = ps_partkey
+	join part on part.p_partkey = partsupp.ps_partkey
 where
 	p_brand <> 'Brand#45'
 	and p_type not like 'MEDIUM POLISHED %'

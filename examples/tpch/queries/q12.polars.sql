@@ -17,7 +17,7 @@ select
 	end) as low_line_count
 from
 	orders
-	join lineitem on o_orderkey = l_orderkey
+	join lineitem on lineitem.l_orderkey = orders.o_orderkey
 where
 	l_shipmode in ('MAIL', 'SHIP')
 	and l_commitdate < l_receiptdate
