@@ -42,9 +42,9 @@ parquet = { workspace = true }
 # to produce Arrow arrays from column chunks without going through
 # parquet-rs's ParquetRecordBatchReader. Long-term: alternate backend
 # for FastParquetExec.
-ematix-parquet-codec = { git = "https://github.com/ryan-evans-git/ematix-parquet.git", tag = "v0.2.0" }
-ematix-parquet-format = { git = "https://github.com/ryan-evans-git/ematix-parquet.git", tag = "v0.2.0" }
-ematix-parquet-io = { git = "https://github.com/ryan-evans-git/ematix-parquet.git", tag = "v0.2.0" }
+ematix-parquet-codec = { version = "0.3" }
+ematix-parquet-format = { version = "0.3" }
+ematix-parquet-io = { version = "0.3" }
 deltalake = { workspace = true }
 datafusion = { workspace = true }
 cranelift = { workspace = true }
