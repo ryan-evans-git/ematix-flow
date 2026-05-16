@@ -1,17 +1,17 @@
--- TPC-H Q5, Polars-parser-compatible variant. Semantically identical
--- to q05.sql; only difference is the implicit `FROM a, b, c, d, e, f`
--- cross-product is rewritten as explicit `JOIN ... ON ...` clauses.
--- Polars's SQL parser (1.40.x) rejects implicit-join FROM lists.
+-- TPC-H Q5, Polars-parser-compatible variant. JOIN ON predicates use
+-- qualified column refs because polars-sql requires both sides be
+-- `CompoundIdentifier`.
 select
 	n_name,
 	sum(l_extendedprice * (1 - l_discount)) as revenue
 from
 	region
-	join nation on n_regionkey = r_regionkey
-	join supplier on s_nationkey = n_nationkey
-	join customer on c_nationkey = s_nationkey
-	join orders on c_custkey = o_custkey
-	join lineitem on l_orderkey = o_orderkey and l_suppkey = s_suppkey
+	join nation on nation.n_regionkey = region.r_regionkey
+	join supplier on supplier.s_nationkey = nation.n_nationkey
+	join customer on customer.c_nationkey = supplier.s_nationkey
+	join orders on orders.o_custkey = customer.c_custkey
+	join lineitem on lineitem.l_orderkey = orders.o_orderkey
+		and lineitem.l_suppkey = supplier.s_suppkey
 where
 	r_name = 'ASIA'
 	and o_orderdate >= date '1994-01-01'

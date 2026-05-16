@@ -635,32 +635,46 @@ fn decode_one_rg_filtered_late_mat(
 
     let matches: usize = bitmap.iter().map(|b| b.count_ones() as usize).sum();
     let mut columns: Vec<Arc<dyn arrow_array::Array>> = Vec::with_capacity(projection.len());
+    let check_len = |got: usize, want: usize, name: &str, kind: &str| -> DfResult<()> {
+        if got != want {
+            Err(DataFusionError::External(
+                format!(
+                    "EmatixFastParquetExec (late_mat): column `{name}` ({kind}) decoded \
+                     {got} values, expected {want} (bitmap popcount). Likely a masked-decode \
+                     bug in ematix-parquet for this column type."
+                )
+                .into(),
+            ))
+        } else {
+            Ok(())
+        }
+    };
     for (out_idx, &col_idx) in projection.iter().enumerate() {
         let field = schema.field(out_idx);
         let arr: Arc<dyn arrow_array::Array> = match field.data_type() {
             DataType::Int32 => {
                 let vals = masked_decode_i32(&file, rg, col_idx, &bitmap)?;
-                debug_assert_eq!(vals.len(), matches);
+                check_len(vals.len(), matches, field.name(), "Int32")?;
                 Arc::new(arrow_array::Int32Array::from(vals))
             }
             DataType::Date32 => {
                 let vals = masked_decode_i32(&file, rg, col_idx, &bitmap)?;
-                debug_assert_eq!(vals.len(), matches);
+                check_len(vals.len(), matches, field.name(), "Date32")?;
                 Arc::new(arrow_array::Date32Array::from(vals))
             }
             DataType::Int64 => {
                 let vals = masked_decode_i64(&file, rg, col_idx, &bitmap)?;
-                debug_assert_eq!(vals.len(), matches);
+                check_len(vals.len(), matches, field.name(), "Int64")?;
                 Arc::new(arrow_array::Int64Array::from(vals))
             }
             DataType::Float64 => {
                 let vals = masked_decode_f64(&file, rg, col_idx, &bitmap)?;
-                debug_assert_eq!(vals.len(), matches);
+                check_len(vals.len(), matches, field.name(), "Float64")?;
                 Arc::new(arrow_array::Float64Array::from(vals))
             }
             DataType::Utf8 => {
                 let vals = masked_decode_byte_array(&file, rg, col_idx, &bitmap)?;
-                debug_assert_eq!(vals.len(), matches);
+                check_len(vals.len(), matches, field.name(), "Utf8")?;
                 let mut sb = arrow_array::builder::StringBuilder::with_capacity(
                     vals.len(),
                     vals.iter().map(|v| v.len()).sum(),
