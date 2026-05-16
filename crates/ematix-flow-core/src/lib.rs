@@ -73,6 +73,11 @@ pub mod fused_jit_rule;
 // lookup, no string hash. Minimum viable Σ.E3b landing (single key,
 // COUNT only). Multi-key + SUM/MIN/MAX deferred to Σ.E3b.2+.
 pub mod dict_aggregate;
+// Σ.E3b.2: `EnableDictGroupCountRule` — PhysicalOptimizerRule that
+// rewrites `AggregateExec(FinalPartitioned) → RepartitionExec →
+// AggregateExec(Partial)` on a dict group column + COUNT(*) into a
+// DictGroupCountExec. Speculative; non-matching plans pass through.
+pub mod dict_aggregate_rule;
 pub mod hash;
 pub mod join;
 pub mod kafka_backend;

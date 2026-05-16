@@ -76,29 +76,87 @@ pub struct DictGroupCountExec {
     input: Arc<dyn ExecutionPlan>,
     /// Column index in the *input* schema.
     group_col_idx: usize,
+    /// How to materialise the group column in output: bare Utf8 or
+    /// re-wrapped as Dictionary(UInt32, Utf8).
+    group_out_type: GroupOutputType,
     /// Pre-built output schema (`[group_value, count]`).
     schema: SchemaRef,
     properties: Arc<PlanProperties>,
 }
 
+/// Output materialisation for the group column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GroupOutputType {
+    /// Plain `Utf8` — simplest, the default for hand-construction.
+    Utf8,
+    /// `Dictionary(UInt32, Utf8)` — the form DataFusion's default
+    /// `AggregateExec` produces when the input is dict-encoded. The
+    /// optimizer rule uses this so the rewritten plan matches the
+    /// upstream operator's cached schema.
+    Dictionary,
+}
+
 impl DictGroupCountExec {
+    /// Construct with default output column names: `[<input-col-name>,
+    /// "count"]`.
     pub fn try_new(input: Arc<dyn ExecutionPlan>, group_col_idx: usize) -> DfResult<Self> {
+        let group_name = input.schema().field(group_col_idx).name().clone();
+        Self::try_new_with_names(input, group_col_idx, group_name, "count".into())
+    }
+
+    /// Construct with caller-chosen output column names. Used by the
+    /// optimizer rule so the rewritten plan emits the same column
+    /// names the original `AggregateExec` would have, keeping
+    /// downstream operators / projections happy.
+    pub fn try_new_with_names(
+        input: Arc<dyn ExecutionPlan>,
+        group_col_idx: usize,
+        group_out_name: String,
+        count_out_name: String,
+    ) -> DfResult<Self> {
+        Self::try_new_with_names_and_type(
+            input,
+            group_col_idx,
+            group_out_name,
+            count_out_name,
+            GroupOutputType::Utf8,
+        )
+    }
+
+    /// Most flexible constructor. The optimizer rule calls this with
+    /// `GroupOutputType::Dictionary` so the rewritten plan matches
+    /// DataFusion's default-aggregate output schema (which preserves
+    /// the input dict's encoding) — keeping downstream operators'
+    /// cached schemas valid.
+    pub fn try_new_with_names_and_type(
+        input: Arc<dyn ExecutionPlan>,
+        group_col_idx: usize,
+        group_out_name: String,
+        count_out_name: String,
+        group_out_type: GroupOutputType,
+    ) -> DfResult<Self> {
         let in_schema = input.schema();
         let field = in_schema.field(group_col_idx);
-        let group_name = field.name().clone();
+        let field_name = field.name().clone();
         match field.data_type() {
             DataType::Dictionary(key, value)
                 if **key == DataType::UInt32
                     && (**value == DataType::Utf8 || **value == DataType::Utf8View) => {}
             other => {
                 return Err(DataFusionError::Plan(format!(
-                    "DictGroupCountExec: column `{group_name}` has type {other:?}, expected Dictionary(UInt32, Utf8|Utf8View)",
+                    "DictGroupCountExec: column `{field_name}` has type {other:?}, expected Dictionary(UInt32, Utf8|Utf8View)",
                 )));
             }
         }
+        let out_dtype = match group_out_type {
+            GroupOutputType::Utf8 => DataType::Utf8,
+            GroupOutputType::Dictionary => {
+                DataType::Dictionary(Box::new(DataType::UInt32), Box::new(DataType::Utf8))
+            }
+        };
         let schema = Arc::new(Schema::new(vec![
-            Field::new(group_name, DataType::Utf8, false),
-            Field::new("count", DataType::Int64, false),
+            Field::new(group_out_name, out_dtype, false),
+            Field::new(count_out_name, DataType::Int64, false),
         ]));
         let eq_props = EquivalenceProperties::new(schema.clone());
         let properties = Arc::new(PlanProperties::new(
@@ -110,6 +168,7 @@ impl DictGroupCountExec {
         Ok(Self {
             input,
             group_col_idx,
+            group_out_type,
             schema,
             properties,
         })
@@ -158,7 +217,16 @@ impl ExecutionPlan for DictGroupCountExec {
         let new_input = children.pop().ok_or_else(|| {
             DataFusionError::Internal("DictGroupCountExec requires exactly 1 child".into())
         })?;
-        Ok(Arc::new(Self::try_new(new_input, self.group_col_idx)?))
+        // Preserve the existing output column names + materialisation.
+        let group_out_name = self.schema.field(0).name().clone();
+        let count_out_name = self.schema.field(1).name().clone();
+        Ok(Arc::new(Self::try_new_with_names_and_type(
+            new_input,
+            self.group_col_idx,
+            group_out_name,
+            count_out_name,
+            self.group_out_type,
+        )?))
     }
 
     fn execute(
@@ -173,6 +241,7 @@ impl ExecutionPlan for DictGroupCountExec {
         }
         let input = self.input.clone();
         let group_col_idx = self.group_col_idx;
+        let group_out_type = self.group_out_type;
         let schema = self.schema.clone();
         let schema_for_stream = schema.clone();
 
@@ -188,7 +257,7 @@ impl ExecutionPlan for DictGroupCountExec {
                     accum.consume_batch(&batch, group_col_idx)?;
                 }
             }
-            accum.finish(schema_for_stream)
+            accum.finish(schema_for_stream, group_out_type)
         };
 
         let s = stream::once(fut);
@@ -278,9 +347,22 @@ impl GroupCountAccumulator {
         s
     }
 
-    fn finish(self, schema: SchemaRef) -> DfResult<RecordBatch> {
-        let group_arr: ArrayRef = Arc::new(StringArray::from(self.groups));
+    fn finish(self, schema: SchemaRef, group_out_type: GroupOutputType) -> DfResult<RecordBatch> {
+        let n = self.groups.len();
         let count_arr: ArrayRef = Arc::new(Int64Array::from(self.counts));
+        let group_arr: ArrayRef = match group_out_type {
+            GroupOutputType::Utf8 => Arc::new(StringArray::from(self.groups)),
+            GroupOutputType::Dictionary => {
+                // Each surviving group gets its own dict-code:
+                //   keys = [0, 1, 2, ..., n-1]
+                //   values = groups (one entry per group).
+                let keys = UInt32Array::from((0u32..n as u32).collect::<Vec<_>>());
+                let values: ArrayRef = Arc::new(StringArray::from(self.groups));
+                let dict = DictionaryArray::<UInt32Type>::try_new(keys, values)
+                    .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+                Arc::new(dict)
+            }
+        };
         RecordBatch::try_new(schema, vec![group_arr, count_arr])
             .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
     }
