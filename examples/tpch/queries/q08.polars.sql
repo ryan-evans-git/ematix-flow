@@ -1,7 +1,6 @@
--- TPC-H Q8, Polars-parser-compatible variant. Semantically identical
--- to q08.sql; implicit `FROM` 8-table cross-product rewritten as
--- explicit JOIN chain. Nation self-joined for the supplier-nation
--- (n2) and customer-nation (n1) sides.
+-- TPC-H Q8, Polars-parser-compatible variant. JOIN ON predicates use
+-- qualified column refs. Nation is self-joined as n1 (customer side)
+-- and n2 (supplier side).
 select
 	o_year,
 	sum(case
@@ -16,13 +15,13 @@ from
 			n2.n_name as nation
 		from
 			region
-			join nation n1 on n1.n_regionkey = r_regionkey
-			join customer on c_nationkey = n1.n_nationkey
-			join orders on o_custkey = c_custkey
-			join lineitem on l_orderkey = o_orderkey
-			join part on p_partkey = l_partkey
-			join supplier on s_suppkey = l_suppkey
-			join nation n2 on s_nationkey = n2.n_nationkey
+			join nation n1 on n1.n_regionkey = region.r_regionkey
+			join customer on customer.c_nationkey = n1.n_nationkey
+			join orders on orders.o_custkey = customer.c_custkey
+			join lineitem on lineitem.l_orderkey = orders.o_orderkey
+			join part on part.p_partkey = lineitem.l_partkey
+			join supplier on supplier.s_suppkey = lineitem.l_suppkey
+			join nation n2 on n2.n_nationkey = supplier.s_nationkey
 		where
 			r_name = 'AMERICA'
 			and o_orderdate between date '1995-01-01' and date '1996-12-31'

@@ -1,6 +1,5 @@
--- TPC-H Q10, Polars-parser-compatible variant. Semantically identical
--- to q10.sql; implicit `FROM customer, orders, lineitem, nation`
--- rewritten as explicit JOIN chain.
+-- TPC-H Q10, Polars-parser-compatible variant. JOIN ON predicates use
+-- qualified column refs.
 select
 	c_custkey,
 	c_name,
@@ -12,9 +11,9 @@ select
 	c_comment
 from
 	customer
-	join nation on c_nationkey = n_nationkey
-	join orders on c_custkey = o_custkey
-	join lineitem on l_orderkey = o_orderkey
+	join nation on nation.n_nationkey = customer.c_nationkey
+	join orders on orders.o_custkey = customer.c_custkey
+	join lineitem on lineitem.l_orderkey = orders.o_orderkey
 where
 	o_orderdate >= date '1993-10-01'
 	and o_orderdate < date '1994-01-01'

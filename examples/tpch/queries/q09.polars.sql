@@ -1,8 +1,5 @@
--- TPC-H Q9, Polars-parser-compatible variant. Semantically identical
--- to q09.sql; implicit `FROM` 6-table cross-product rewritten as
--- explicit JOIN chain. The 3-way relationship between part / supplier
--- / partsupp is preserved via the (ps_suppkey, ps_partkey) composite
--- join keys.
+-- TPC-H Q9, Polars-parser-compatible variant. JOIN ON predicates use
+-- qualified column refs.
 select
 	nation,
 	o_year,
@@ -15,11 +12,12 @@ from
 			l_extendedprice * (1 - l_discount) - ps_supplycost * l_quantity as amount
 		from
 			part
-			join lineitem on p_partkey = l_partkey
-			join supplier on s_suppkey = l_suppkey
-			join partsupp on ps_suppkey = l_suppkey and ps_partkey = l_partkey
-			join orders on o_orderkey = l_orderkey
-			join nation on s_nationkey = n_nationkey
+			join lineitem on lineitem.l_partkey = part.p_partkey
+			join supplier on supplier.s_suppkey = lineitem.l_suppkey
+			join partsupp on partsupp.ps_suppkey = lineitem.l_suppkey
+				and partsupp.ps_partkey = lineitem.l_partkey
+			join orders on orders.o_orderkey = lineitem.l_orderkey
+			join nation on nation.n_nationkey = supplier.s_nationkey
 		where
 			p_name like '%green%'
 	) as profit
