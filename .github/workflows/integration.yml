@@ -142,15 +142,19 @@ jobs:
         # failing together across unrelated subsystems on the same
         # run.
         #
-        # `--no-clean` preserves the coverage profdata from the
-        # parallel run above so the final report is the union.
+        # Two `--no-report` invocations naturally accumulate
+        # profdata under cargo-llvm-cov (per its README's multi-
+        # pass pattern); the final `report` step downstream
+        # reads the union. `--no-clean` is intentionally NOT
+        # passed — cargo-llvm-cov rejects `--no-report
+        # --no-clean` as a mutex pair.
         # `--ignored` (vs `--include-ignored`) runs ONLY the
-        # ignored set this round — keeps the parallel pass'
-        # results without re-running them.
+        # ignored set this round, skipping the unit tests we
+        # already covered in the parallel pass.
         # `--ignore-run-fail` stays so genuine new flake doesn't
         # abort the rest of the workflow.
         run: |
-          cargo llvm-cov --no-clean --no-report --workspace --tests --ignore-run-fail \
+          cargo llvm-cov --no-report --workspace --tests --ignore-run-fail \
               -- --ignored --test-threads=1
       - name: Coverage summary + 86% region floor
         # `--fail-under-regions=86` enforces the floor identified
