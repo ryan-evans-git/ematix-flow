@@ -65,6 +65,11 @@ pub mod fused_post_join;
 // PhysicalExpr ASTs to inject a fused exec where none was constructed)
 // is documented as a follow-up in the module header.
 pub mod fused_jit_rule;
+// Σ.E3a: `DictFilterExec` — IN-list filter on Dictionary(UInt32, Utf8)
+// columns by code membership (no string compare in the hot loop).
+// Photon's #1 string-workload pattern; landing the operator standalone
+// here, with the matching `PhysicalOptimizerRule` to follow.
+pub mod dict_filter;
 // Σ.E3b.1: `DictGroupCountExec` — single-pass COUNT(*) GROUP BY over
 // a Dictionary(UInt32, Utf8|Utf8View) column. Maintains a per-batch
 // dict-code → slot lookup so the hot row loop is one array index, one
