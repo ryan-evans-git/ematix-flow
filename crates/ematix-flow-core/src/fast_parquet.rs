@@ -99,6 +99,75 @@ fn promote_to_view_types(
     datafusion::arrow::datatypes::Schema::new_with_metadata(promoted, schema.metadata().clone())
 }
 
+/// Σ.E3b substrate: rewrite each Utf8/Utf8View/Binary/BinaryView field
+/// in `schema` to `Dictionary(UInt32, <inner>)` when *every* row group's
+/// column chunk for that field declares PLAIN_DICTIONARY or
+/// RLE_DICTIONARY in its encodings list. parquet-rs's reader, given
+/// this target schema via `ArrowReaderOptions::with_schema`, will
+/// produce `DictionaryArray<UInt32Type>` instead of `StringViewArray`/
+/// `BinaryViewArray` — which is what the dict-aware downstream
+/// operators (e.g. `DictGroupCountExec`) need.
+///
+/// Conservative criterion: dict encoding present in *every* row group
+/// for that column. parquet-rs will tolerate occasional non-dict pages
+/// (it materialises them and rebuilds the dict at the page boundary),
+/// but advertising a dict schema for a column that's PLAIN throughout
+/// is wasteful — the on-the-fly dict construction adds work without
+/// downstream benefit. The all-RGs criterion picks low-cardinality
+/// columns naturally.
+fn promote_dict_encoded_to_dictionary(
+    schema: &datafusion::arrow::datatypes::Schema,
+    metadata: &datafusion::parquet::file::metadata::ParquetMetaData,
+) -> datafusion::arrow::datatypes::Schema {
+    use datafusion::arrow::datatypes::{DataType, Field};
+    use datafusion::parquet::basic::Encoding;
+    let num_rgs = metadata.num_row_groups();
+    if num_rgs == 0 {
+        return schema.clone();
+    }
+    let promoted: Vec<Field> = schema
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(col_idx, f)| {
+            let is_str_or_bin = matches!(
+                f.data_type(),
+                DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+                    | DataType::Binary | DataType::LargeBinary | DataType::BinaryView
+            );
+            if !is_str_or_bin {
+                return f.as_ref().clone();
+            }
+            let all_dict = (0..num_rgs).all(|rg_idx| {
+                let cc = metadata.row_group(rg_idx).column(col_idx);
+                cc.encodings().any(|e| matches!(
+                    e,
+                    Encoding::RLE_DICTIONARY | Encoding::PLAIN_DICTIONARY
+                ))
+            });
+            if !all_dict {
+                return f.as_ref().clone();
+            }
+            // Dictionary keys: UInt32 (matches what DictGroupCountExec
+            // expects and what the downstream rule recognises). Values:
+            // keep the source's string/binary type, but lower View
+            // variants back to plain since dict values aren't viewed.
+            let value_type = match f.data_type() {
+                DataType::Utf8View => DataType::Utf8,
+                DataType::BinaryView => DataType::Binary,
+                other => other.clone(),
+            };
+            let dict_type = DataType::Dictionary(
+                Box::new(DataType::UInt32),
+                Box::new(value_type),
+            );
+            Field::new(f.name(), dict_type, f.is_nullable())
+                .with_metadata(f.metadata().clone())
+        })
+        .collect();
+    datafusion::arrow::datatypes::Schema::new_with_metadata(promoted, schema.metadata().clone())
+}
+
 /// Aggregate per-row-group parquet statistics into a file-level
 /// `ColumnStatistics`. Returns one entry per Arrow field in `schema`,
 /// in field order.
@@ -429,6 +498,13 @@ pub struct FastParquetTableProvider {
     /// parquet row-group stats at construction so we don't pay the
     /// metadata-read cost on every scan.
     column_stats: Arc<Vec<ColumnStatistics>>,
+    /// Σ.E3b substrate: when true, Utf8/Binary columns that are
+    /// dict-encoded in every row group are advertised (and decoded) as
+    /// `Dictionary(UInt32, Utf8|Binary)`. Unblocks `EnableDictGroupCount
+    /// Rule` and any future dict-aware operator. Default: false (today
+    /// the default operator set isn't dict-aware enough for it to be a
+    /// universal win; flip per-call when the planner benefits).
+    dict_preservation: bool,
 }
 
 impl FastParquetTableProvider {
@@ -465,6 +541,10 @@ impl FastParquetTableProvider {
         // `ArrowReaderOptions::with_schema`, which actually emits
         // StringViewArray/BinaryViewArray.
         let schema: SchemaRef = Arc::new(promote_to_view_types(builder.schema()));
+        // Dict preservation defaults off; the builder method
+        // `with_dict_preservation(true)` constructs a separate provider.
+        // We keep `try_new` lean (no schema-rewrite cost when callers
+        // don't want it).
         let meta = builder.metadata();
         let num_row_groups = meta.num_row_groups();
         // num_rows is a global property of the file; parquet metadata
@@ -495,7 +575,75 @@ impl FastParquetTableProvider {
             metadata,
             arrow_metadata,
             column_stats,
+            dict_preservation: false,
         })
+    }
+
+    /// Σ.E3b substrate: opt into dict-encoded → `DictionaryArray`
+    /// passthrough at the Arrow boundary. Each Utf8/Binary column that
+    /// is RLE_DICTIONARY-encoded in every row group is rewritten to
+    /// `Dictionary(UInt32, Utf8|Binary)` in the advertised schema, and
+    /// parquet-rs's `byte_array_dictionary` reader (activated via
+    /// `ArrowReaderOptions::with_schema`) produces a `DictionaryArray`
+    /// at decode time instead of materialising the strings.
+    ///
+    /// Default off. Flip on per-provider — typically for tables whose
+    /// downstream queries do dict-aware GROUP BY (Q4-style), or where
+    /// you've validated downstream operators handle DictionaryArray
+    /// without falling back to materialise-then-compute.
+    ///
+    /// Rebuilds the `ArrowReaderMetadata` so workers pick up the new
+    /// supplied schema without per-execute footer reparse.
+    pub fn with_dict_preservation(mut self, on: bool) -> DfResult<Self> {
+        if self.dict_preservation == on {
+            return Ok(self);
+        }
+        let base_schema = promote_to_view_types(
+            // Re-derive from parquet-rs schema rather than mutate
+            // `self.schema` directly — the rewrite is idempotent only
+            // when applied to the View-promoted base.
+            &self.arrow_metadata.schema().as_ref().clone(),
+        );
+        let new_schema = if on {
+            promote_dict_encoded_to_dictionary(&base_schema, &self.metadata)
+        } else {
+            base_schema
+        };
+        let schema: SchemaRef = Arc::new(new_schema);
+        let column_stats = Arc::new(aggregate_column_statistics(&self.metadata, &schema));
+        let options = ArrowReaderOptions::new().with_schema(schema.clone());
+        let arrow_metadata = Arc::new(
+            ArrowReaderMetadata::try_new(self.metadata.clone(), options).map_err(|e| {
+                DataFusionError::External(
+                    format!(
+                        "FastParquetTableProvider: rebuilding ArrowReaderMetadata for \
+                         dict-preservation: {e}"
+                    )
+                    .into(),
+                )
+            })?,
+        );
+        self.schema = schema;
+        self.arrow_metadata = arrow_metadata;
+        self.column_stats = column_stats;
+        self.dict_preservation = on;
+        Ok(self)
+    }
+
+    /// Test/introspection: which fields were rewritten to Dictionary by
+    /// the most recent `with_dict_preservation(true)` call. Empty when
+    /// dict preservation is off or no columns met the all-RGs criterion.
+    pub fn dict_preserved_fields(&self) -> Vec<&str> {
+        use datafusion::arrow::datatypes::DataType;
+        if !self.dict_preservation {
+            return Vec::new();
+        }
+        self.schema
+            .fields()
+            .iter()
+            .filter(|f| matches!(f.data_type(), DataType::Dictionary(_, _)))
+            .map(|f| f.name().as_str())
+            .collect()
     }
 
     /// File path this provider scans.
