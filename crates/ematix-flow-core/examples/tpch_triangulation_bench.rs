@@ -471,10 +471,15 @@ fn write_benchmarks_md(
     .unwrap();
     writeln!(
         s,
-        "- Polars's SQL frontend has structural gaps on the TPC-H reference shapes \
-         (implicit cross-join in FROM, non-equi join predicates, EXISTS subqueries, \
-         SUBSTRING). To get Polars numbers across the full 22 you must translate to \
-         the LazyFrame DSL; we have not done that here."
+        "- Polars's SQL frontend rejects several TPC-H canonical shapes: implicit \
+         cross-join in FROM, bare-column equi-joins, EXISTS subqueries, scalar-subquery \
+         comparisons, `SUBSTRING ... FROM ... FOR`, HAVING against unprojected columns. \
+         We ship hand-translated `q??.polars.sql` variants alongside the canonical \
+         `q??.sql` files (under `examples/tpch/queries/`); the bench feeds Polars the \
+         polars variant when present. Translations are semantically equivalent: \
+         explicit JOIN ON with qualified columns; scalar subqueries materialized as \
+         CTE + CROSS JOIN; EXISTS rewritten as semi-join via DISTINCT + INNER JOIN; \
+         SUBSTRING rewritten as SUBSTR(x, start, len)."
     )
     .unwrap();
     writeln!(

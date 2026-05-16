@@ -9,7 +9,7 @@ select
 	end) / sum(l_extendedprice * (1 - l_discount)) as promo_revenue
 from
 	lineitem
-	join part on l_partkey = p_partkey
+	join part on part.p_partkey = lineitem.l_partkey
 where
 	l_shipdate >= date '1995-09-01'
 	and l_shipdate < date '1995-10-01';

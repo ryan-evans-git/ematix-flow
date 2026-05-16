@@ -1,8 +1,5 @@
--- TPC-H Q7, Polars-parser-compatible variant. Semantically identical
--- to q07.sql; implicit `FROM` cross-product rewritten as explicit JOIN.
--- Nation is self-joined twice (n1, n2) for the supplier and customer
--- sides — Polars handles aliased joins fine once the FROM clause is
--- explicit.
+-- TPC-H Q7, Polars-parser-compatible variant. JOIN ON predicates use
+-- qualified column refs. Nation is self-joined as n1/n2.
 select
 	supp_nation,
 	cust_nation,
@@ -17,11 +14,11 @@ from
 			l_extendedprice * (1 - l_discount) as volume
 		from
 			supplier
-			join lineitem on s_suppkey = l_suppkey
-			join orders on o_orderkey = l_orderkey
-			join customer on c_custkey = o_custkey
-			join nation n1 on s_nationkey = n1.n_nationkey
-			join nation n2 on c_nationkey = n2.n_nationkey
+			join lineitem on lineitem.l_suppkey = supplier.s_suppkey
+			join orders on orders.o_orderkey = lineitem.l_orderkey
+			join customer on customer.c_custkey = orders.o_custkey
+			join nation n1 on n1.n_nationkey = supplier.s_nationkey
+			join nation n2 on n2.n_nationkey = customer.c_nationkey
 		where
 			(
 				(n1.n_name = 'FRANCE' and n2.n_name = 'GERMANY')
