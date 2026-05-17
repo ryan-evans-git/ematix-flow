@@ -31,11 +31,21 @@ pub mod ematix_fast_parquet;
 // Q6 gap vs Polars (1.0 ms hand-written / 1.9 ms Polars / 5.96 ms
 // today's DataFusion). See `fused.rs` header and issue #44.
 pub mod fused;
-// Σ.G.2 first slice: `AggregateSpec` trait + `Q6Spec` concrete impl.
-// Foundation for the future unified `FusedAggregateExec<S>` operator
-// that's planned to absorb Q1 / Q6 / Q12 once the perf-equivalence
-// bench gate passes (see `examples/sigma_g2_q6_unified_vs_hand.rs`).
+// Σ.G.2 first slice: `AggregateSpec` trait + `Q6Spec` + `Q1Spec`.
+// Both per-shape gates pass (#92, #93) — the trait dispatch matches
+// hand-written perf within 1 % on synthetic batches.
 pub mod fused_aggregate;
+// Σ.G.2 third slice: the generic operator that the trait was built
+// to enable. Wraps any `AggregateSpec` impl as a DataFusion
+// `ExecutionPlan`. Reachable by direct construction (tests / bench)
+// or via `EnableFusedAggregateExecRule` (Σ.G.2d, `fused_aggregate_rule`).
+pub mod fused_aggregate_exec;
+// Σ.G.2d: `EnableFusedAggregateExecRule` — `PhysicalOptimizerRule`
+// that swaps hand-coded `FusedFilterSumExec` / `FusedFilterMultiAggExec`
+// instances for the generic `FusedAggregateExec<S>` parameterised by
+// `Q6Spec` / `Q1Spec`. Bench-gated by sigma_g2c_operator_vs_hand at
+// 41 trials × 3 rounds MIN-of-K, within 3 % of the hand operator.
+pub mod fused_aggregate_rule;
 // Σ.D2: `FusedFilterMultiAggExec` — single-pass fused filter +
 // multi-aggregate + group-by physical operator. Day-1 prototype
 // (`examples/tpch_q1_tune.rs`) showed 3.08 ms on Q1 SF=1 / 14

@@ -29,11 +29,14 @@
 //! the trait is the dispatch surface, the hot loops stay in free
 //! functions, and each `impl AggregateSpec` just forwards.
 
+use std::sync::Arc;
+
 use arrow_array::{Float64Array, RecordBatch};
 use arrow_schema::SchemaRef;
 use datafusion::common::Result as DfResult;
 
 use crate::fused::Q6Predicate;
+use crate::fused_multi_agg::{Q1Aggs, Q1ColumnIndices, Q1Predicate};
 
 /// Per-shape descriptor for the unified fused aggregate path.
 ///
@@ -66,9 +69,14 @@ pub trait AggregateSpec: Send + Sync + std::fmt::Debug + 'static {
     fn process_batch(&self, batch: &RecordBatch, acc: &mut Self::Accumulator) -> DfResult<()>;
 
     /// Convert the merged accumulator state to the operator's
-    /// output Arrow array. Called once per execute() at end-of-
+    /// output `RecordBatch`. Called once per execute() at end-of-
     /// input after merging per-shard accumulators.
-    fn finalize(&self, acc: Self::Accumulator) -> arrow_array::ArrayRef;
+    ///
+    /// Returns a full `RecordBatch` (not a single `ArrayRef`) so
+    /// multi-column shapes like Q1 (10 output columns) can be
+    /// expressed cleanly; single-column shapes like Q6 just wrap
+    /// their one array into a one-column batch.
+    fn finalize(&self, acc: Self::Accumulator) -> DfResult<RecordBatch>;
 
     /// Merge two per-shard accumulators. Called when the operator
     /// shards batches across rayon workers; each shard produces an
@@ -91,15 +99,16 @@ pub trait AggregateSpec: Send + Sync + std::fmt::Debug + 'static {
 // `FusedFilterSumExec` / `process_q6_batch_hand`.
 // ---------------------------------------------------------------
 
-/// Q6 column indices, cached at construction time so the per-batch
-/// loop doesn't pay for a name-to-index lookup on every batch.
-#[derive(Debug, Clone, Copy)]
-pub struct Q6ColumnIndices {
-    pub qty: usize,
-    pub price: usize,
-    pub disc: usize,
-    pub ship: usize,
-}
+/// Q6 column indices.
+///
+/// Σ.G.2c finding: aliased to `crate::fused::ColumnIndices` so the
+/// trait-method body can pass them straight to `process_q6_batch_hand`
+/// with no per-batch struct conversion. The two were field-identical
+/// before the alias; defining `Q6ColumnIndices` as a distinct
+/// nominal type was costing ~5 % at the operator level even though
+/// LLVM saw equivalent fields, because the conversion-emitting code
+/// was inside the per-batch trait method.
+pub type Q6ColumnIndices = crate::fused::ColumnIndices;
 
 /// Single-table SUM with a 5-bound range filter — the TPC-H Q6
 /// shape. Wraps the existing [`Q6Predicate`] plus the column
@@ -136,7 +145,7 @@ impl Q6Spec {
                 )));
             }
         }
-        let indices = Q6ColumnIndices {
+        let indices = crate::fused::ColumnIndices {
             qty: child_schema.index_of("l_quantity").unwrap(),
             price: child_schema.index_of("l_extendedprice").unwrap(),
             disc: child_schema.index_of("l_discount").unwrap(),
@@ -167,18 +176,18 @@ impl AggregateSpec for Q6Spec {
         // identical source (Σ.G.2 perf gate, 2026-05-17). LLVM keys
         // its per-shape codegen off the free function — keep it
         // there, forward from the impl.
-        let idx = crate::fused::ColumnIndices {
-            qty: self.indices.qty,
-            price: self.indices.price,
-            disc: self.indices.disc,
-            ship: self.indices.ship,
-        };
-        *acc += crate::fused::process_q6_batch_hand(batch, self.predicate, idx);
+        //
+        // Σ.G.2c follow-up: `Q6ColumnIndices = fused::ColumnIndices`
+        // is a type alias, so passing `self.indices` directly avoids
+        // a per-batch struct-conversion that was costing ~5 % at the
+        // operator level.
+        *acc += crate::fused::process_q6_batch_hand(batch, self.predicate, self.indices);
         Ok(())
     }
 
-    fn finalize(&self, acc: Self::Accumulator) -> arrow_array::ArrayRef {
-        std::sync::Arc::new(Float64Array::from(vec![acc]))
+    fn finalize(&self, acc: Self::Accumulator) -> DfResult<RecordBatch> {
+        let arr: arrow_array::ArrayRef = Arc::new(Float64Array::from(vec![acc]));
+        Ok(RecordBatch::try_new(self.output_schema.clone(), vec![arr])?)
     }
 
     fn merge(&self, left: Self::Accumulator, right: Self::Accumulator) -> Self::Accumulator {
@@ -195,6 +204,114 @@ impl AggregateSpec for Q6Spec {
         // `try_new` and the first `process_batch`. Cheap (4 column
         // lookups) so paying it again is fine.
         Q6Spec::try_new(self.predicate, schema).map(|_| ())
+    }
+}
+
+// ---------------------------------------------------------------
+// Q1Spec — second concrete impl. Equivalent to the hand path in
+// `FusedFilterMultiAggExec` / `process_q1_batch_hand`. Demonstrates
+// the multi-aggregate + fixed-cardinality GROUP BY shape on top of
+// the same `AggregateSpec` trait that Q6 used.
+// ---------------------------------------------------------------
+
+/// Single-table multi-aggregate with a 4-arm fixed group-by — the
+/// TPC-H Q1 shape. Accumulator is `[Q1Aggs; 5]`: four real groups
+/// plus an out-of-band catch-all bucket so the inner loop indexing
+/// stays branchless. The catch-all is dropped at finalize time.
+#[derive(Debug, Clone)]
+pub struct Q1Spec {
+    pub predicate: Q1Predicate,
+    pub indices: Q1ColumnIndices,
+    pub output_schema: SchemaRef,
+}
+
+impl Q1Spec {
+    /// Construct a Q1Spec from the predicate, resolving column
+    /// indices against the child schema. Returns a Plan error if
+    /// any of the seven required columns is missing or has the
+    /// wrong type. Mirrors `FusedFilterMultiAggExec::validate_input_schema`.
+    pub fn try_new(predicate: Q1Predicate, child_schema: &SchemaRef) -> DfResult<Self> {
+        let required: [(&str, arrow_schema::DataType); 7] = [
+            ("l_returnflag", arrow_schema::DataType::Utf8View),
+            ("l_linestatus", arrow_schema::DataType::Utf8View),
+            ("l_quantity", arrow_schema::DataType::Float64),
+            ("l_extendedprice", arrow_schema::DataType::Float64),
+            ("l_discount", arrow_schema::DataType::Float64),
+            ("l_tax", arrow_schema::DataType::Float64),
+            ("l_shipdate", arrow_schema::DataType::Date32),
+        ];
+        for (name, expected) in &required {
+            let field = child_schema.field_with_name(name).map_err(|_| {
+                datafusion::common::DataFusionError::Plan(format!(
+                    "Q1Spec: child schema missing column `{name}`"
+                ))
+            })?;
+            if field.data_type() != expected {
+                return Err(datafusion::common::DataFusionError::Plan(format!(
+                    "Q1Spec: column `{name}` has type {:?}, expected {expected:?}",
+                    field.data_type()
+                )));
+            }
+        }
+        let indices = Q1ColumnIndices {
+            rflag: child_schema.index_of("l_returnflag").unwrap(),
+            lstatus: child_schema.index_of("l_linestatus").unwrap(),
+            qty: child_schema.index_of("l_quantity").unwrap(),
+            price: child_schema.index_of("l_extendedprice").unwrap(),
+            disc: child_schema.index_of("l_discount").unwrap(),
+            tax: child_schema.index_of("l_tax").unwrap(),
+            ship: child_schema.index_of("l_shipdate").unwrap(),
+        };
+        // Canonical Q1 SELECT list — must match `FusedFilterMultiAggExec`.
+        let output_schema = Arc::new(arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("l_returnflag", arrow_schema::DataType::Utf8, false),
+            arrow_schema::Field::new("l_linestatus", arrow_schema::DataType::Utf8, false),
+            arrow_schema::Field::new("sum_qty", arrow_schema::DataType::Float64, false),
+            arrow_schema::Field::new("sum_base_price", arrow_schema::DataType::Float64, false),
+            arrow_schema::Field::new("sum_disc_price", arrow_schema::DataType::Float64, false),
+            arrow_schema::Field::new("sum_charge", arrow_schema::DataType::Float64, false),
+            arrow_schema::Field::new("avg_qty", arrow_schema::DataType::Float64, false),
+            arrow_schema::Field::new("avg_price", arrow_schema::DataType::Float64, false),
+            arrow_schema::Field::new("avg_disc", arrow_schema::DataType::Float64, false),
+            arrow_schema::Field::new("count_order", arrow_schema::DataType::Int64, false),
+        ]));
+        Ok(Self {
+            predicate,
+            indices,
+            output_schema,
+        })
+    }
+}
+
+impl AggregateSpec for Q1Spec {
+    type Accumulator = [Q1Aggs; 5];
+
+    #[inline(always)]
+    fn process_batch(&self, batch: &RecordBatch, acc: &mut Self::Accumulator) -> DfResult<()> {
+        // Same pattern as Q6Spec: the trait is the dispatch surface,
+        // the hot loop lives in `fused_multi_agg::process_q1_batch_hand`.
+        // See the Q6 bench finding in the module docstring for why.
+        crate::fused_multi_agg::process_q1_batch_hand(batch, self.predicate, self.indices, acc);
+        Ok(())
+    }
+
+    fn finalize(&self, acc: Self::Accumulator) -> DfResult<RecordBatch> {
+        crate::fused_multi_agg::q1_groups_to_record_batch(self.output_schema.clone(), &acc)
+    }
+
+    fn merge(&self, mut left: Self::Accumulator, right: Self::Accumulator) -> Self::Accumulator {
+        for i in 0..5 {
+            left[i].merge(&right[i]);
+        }
+        left
+    }
+
+    fn output_schema(&self) -> SchemaRef {
+        self.output_schema.clone()
+    }
+
+    fn validate_input_schema(&self, schema: &SchemaRef) -> DfResult<()> {
+        Q1Spec::try_new(self.predicate, schema).map(|_| ())
     }
 }
 
@@ -313,9 +430,14 @@ mod tests {
             qty_hi: 24.0,
         };
         let spec = Q6Spec::try_new(pred, &schema).unwrap();
-        let arr = spec.finalize(42.5);
-        let f = arr.as_any().downcast_ref::<Float64Array>().unwrap();
-        assert_eq!(f.len(), 1);
+        let batch = spec.finalize(42.5).unwrap();
+        assert_eq!(batch.num_rows(), 1);
+        assert_eq!(batch.num_columns(), 1);
+        let f = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
         assert!((f.value(0) - 42.5).abs() < 1e-9);
     }
 
@@ -332,5 +454,121 @@ mod tests {
         let spec = Q6Spec::try_new(pred, &schema).unwrap();
         assert_eq!(spec.merge(3.0, 4.0), 7.0);
         assert_eq!(spec.merge(0.0, 0.0), 0.0);
+    }
+
+    // ------------- Q1Spec tests -------------
+
+    fn small_q1_batch(cutoff: i32) -> (RecordBatch, SchemaRef) {
+        use arrow_array::{Date32Array, StringViewArray};
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("l_returnflag", DataType::Utf8View, false),
+            Field::new("l_linestatus", DataType::Utf8View, false),
+            Field::new("l_quantity", DataType::Float64, false),
+            Field::new("l_extendedprice", DataType::Float64, false),
+            Field::new("l_discount", DataType::Float64, false),
+            Field::new("l_tax", DataType::Float64, false),
+            Field::new("l_shipdate", DataType::Date32, false),
+        ]));
+        // 3 (N,F) rows + 1 (A,F) row in-window + 1 (R,F) row filtered out
+        let rflag = StringViewArray::from(vec!["N", "N", "N", "A", "R"]);
+        let lstatus = StringViewArray::from(vec!["F", "F", "F", "F", "F"]);
+        let qty = Float64Array::from(vec![10.0, 10.0, 10.0, 20.0, 5.0]);
+        let price = Float64Array::from(vec![100.0, 100.0, 100.0, 200.0, 50.0]);
+        let disc = Float64Array::from(vec![0.05, 0.05, 0.05, 0.10, 0.02]);
+        let tax = Float64Array::from(vec![0.10, 0.10, 0.10, 0.05, 0.05]);
+        let ship = Date32Array::from(vec![8800, 8800, 8800, 8800, cutoff + 1]);
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(rflag),
+                Arc::new(lstatus),
+                Arc::new(qty),
+                Arc::new(price),
+                Arc::new(disc),
+                Arc::new(tax),
+                Arc::new(ship),
+            ],
+        )
+        .unwrap();
+        (batch, schema)
+    }
+
+    #[test]
+    fn q1spec_validates_schema_correctly() {
+        let (_, schema) = small_q1_batch(10471);
+        let pred = Q1Predicate {
+            shipdate_cutoff: 10471,
+        };
+        let spec = Q1Spec::try_new(pred, &schema).unwrap();
+        assert_eq!(spec.indices.rflag, 0);
+        assert_eq!(spec.indices.ship, 6);
+
+        // Bad schema: missing column
+        let missing = Arc::new(Schema::new(vec![Field::new(
+            "l_returnflag",
+            DataType::Utf8View,
+            false,
+        )]));
+        assert!(Q1Spec::try_new(pred, &missing).is_err());
+    }
+
+    #[test]
+    fn q1spec_matches_hand_calculation() {
+        let (batch, schema) = small_q1_batch(10471);
+        let pred = Q1Predicate {
+            shipdate_cutoff: 10471,
+        };
+        let spec = Q1Spec::try_new(pred, &schema).unwrap();
+        let mut acc: [Q1Aggs; 5] = [Q1Aggs::default(); 5];
+        spec.process_batch(&batch, &mut acc).unwrap();
+        // (N,F) bin idx = 1: 3 rows × {qty=10, price=100, disc=0.05, tax=0.10}
+        //   sum_qty = 30; sum_price = 300; sum_disc_price = 3*100*0.95 = 285;
+        //   sum_charge = 3*95*1.10 = 313.5; sum_disc = 0.15; count = 3
+        assert_eq!(acc[1].count, 3);
+        assert!((acc[1].sum_qty - 30.0).abs() < 1e-9);
+        assert!((acc[1].sum_price - 300.0).abs() < 1e-9);
+        assert!((acc[1].sum_disc_price - 285.0).abs() < 1e-9);
+        // (A,F) bin idx = 3: 1 row × {qty=20, price=200, disc=0.10, tax=0.05}
+        assert_eq!(acc[3].count, 1);
+        assert!((acc[3].sum_qty - 20.0).abs() < 1e-9);
+        // Filtered-out row never lands anywhere
+        let total: u64 = acc.iter().map(|a| a.count).sum();
+        assert_eq!(total, 4);
+    }
+
+    #[test]
+    fn q1spec_finalize_emits_four_rows_ten_columns() {
+        let (batch, schema) = small_q1_batch(10471);
+        let pred = Q1Predicate {
+            shipdate_cutoff: 10471,
+        };
+        let spec = Q1Spec::try_new(pred, &schema).unwrap();
+        let mut acc: [Q1Aggs; 5] = [Q1Aggs::default(); 5];
+        spec.process_batch(&batch, &mut acc).unwrap();
+        let out = spec.finalize(acc).unwrap();
+        // Q1 output is always 4 rows (one per (rflag,lstatus) group),
+        // even for empty groups — matches DataFusion's convention.
+        assert_eq!(out.num_rows(), 4);
+        assert_eq!(out.num_columns(), 10);
+    }
+
+    #[test]
+    fn q1spec_merge_is_per_bin_addition() {
+        let (_, schema) = small_q1_batch(10471);
+        let pred = Q1Predicate {
+            shipdate_cutoff: 10471,
+        };
+        let spec = Q1Spec::try_new(pred, &schema).unwrap();
+        let mut a: [Q1Aggs; 5] = [Q1Aggs::default(); 5];
+        let mut b: [Q1Aggs; 5] = [Q1Aggs::default(); 5];
+        a[0].sum_qty = 10.0;
+        a[0].count = 1;
+        b[0].sum_qty = 5.0;
+        b[0].count = 2;
+        b[2].sum_qty = 7.0;
+        let merged = spec.merge(a, b);
+        assert_eq!(merged[0].sum_qty, 15.0);
+        assert_eq!(merged[0].count, 3);
+        assert_eq!(merged[2].sum_qty, 7.0);
     }
 }
