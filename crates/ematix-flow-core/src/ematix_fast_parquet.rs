@@ -48,10 +48,10 @@ use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
 use parquet::file::reader::{FileReader, SerializedFileReader};
 
 use crate::ematix_parquet_bridge::{
-    decode_column_chunk_byte_array, decode_column_chunk_f64, decode_column_chunk_i32,
-    decode_column_chunk_i64, filter_i32_column_to_bitmap, masked_decode_byte_array,
-    masked_decode_f64, masked_decode_i32, masked_decode_i64, sparse_gather_chunk_f64,
-    sparse_gather_chunk_i32, sparse_gather_chunk_i64,
+    decode_column_chunk_byte_array, decode_column_chunk_byte_array_dict_preserved,
+    decode_column_chunk_f64, decode_column_chunk_i32, decode_column_chunk_i64,
+    filter_i32_column_to_bitmap, masked_decode_byte_array, masked_decode_f64, masked_decode_i32,
+    masked_decode_i64, sparse_gather_chunk_f64, sparse_gather_chunk_i32, sparse_gather_chunk_i64,
 };
 use crate::fast_parquet::{RangePredicate, extract_range_predicate};
 
@@ -169,6 +169,25 @@ pub struct EmatixFastParquetTableProvider {
     /// and SF=10 (+5.9%, σ down 2.2×), with bit-identical answers.
     /// `with_late_mat(false)` is retained for benchmark comparisons.
     late_mat: bool,
+    /// Σ.E3b substrate: when true, Utf8 columns are decoded via the
+    /// ematix-parquet dict-preserved façade (v0.7.0+) and surface to
+    /// downstream operators as `Dictionary(UInt32, Utf8)` instead of
+    /// `Utf8`. Lets dict-aware operators (`DictGroupCountExec`,
+    /// `DictFilterExec`) stay on dict codes end-to-end.
+    ///
+    /// **Off by default.** Enabling globally regresses queries whose
+    /// downstream operators lack dict-fast-paths (they materialise per
+    /// batch). The mirror flag on `FastParquetTableProvider` exists
+    /// for the parquet-rs path; this is the Emat-side parity.
+    ///
+    /// When on, the table provider:
+    ///   - rewrites schema Utf8 → Dictionary(UInt32, Utf8) so the
+    ///     reported schema matches what `scan` produces;
+    ///   - disables pushdown of i32/Date32 range filters, because the
+    ///     filtered decode paths still materialise Utf8 columns as
+    ///     StringArray and that would mismatch the reported schema.
+    ///     DataFusion's residual FilterExec runs filters as usual.
+    dict_preservation: bool,
 }
 
 impl EmatixFastParquetTableProvider {
@@ -233,6 +252,7 @@ impl EmatixFastParquetTableProvider {
             num_row_groups,
             num_rows,
             late_mat: true,
+            dict_preservation: false,
         })
     }
 
@@ -248,6 +268,46 @@ impl EmatixFastParquetTableProvider {
     /// Whether the late-mat path is enabled (Σ.E5a).
     pub fn late_mat(&self) -> bool {
         self.late_mat
+    }
+
+    /// Σ.E3b: opt into reader-level dict preservation for Utf8
+    /// columns. When on, the schema's Utf8 fields are rewritten to
+    /// `Dictionary(UInt32, Utf8)` and decode uses the v0.7.0+
+    /// `read_column_byte_array_dict_preserved` façade. See
+    /// `dict_preservation` field docs for caveats.
+    pub fn with_dict_preservation(mut self, on: bool) -> Self {
+        self.dict_preservation = on;
+        if on {
+            // Rewrite Utf8 fields → Dictionary(UInt32, Utf8). Other
+            // types pass through. Field metadata + nullability
+            // preserved.
+            let fields = self
+                .schema
+                .fields()
+                .iter()
+                .map(|f| {
+                    if matches!(f.data_type(), DataType::Utf8) {
+                        Arc::new(arrow_schema::Field::new(
+                            f.name(),
+                            DataType::Dictionary(
+                                Box::new(DataType::UInt32),
+                                Box::new(DataType::Utf8),
+                            ),
+                            f.is_nullable(),
+                        ))
+                    } else {
+                        f.clone()
+                    }
+                })
+                .collect::<Vec<_>>();
+            self.schema = Arc::new(Schema::new(fields));
+        }
+        self
+    }
+
+    /// Whether dict-preservation is enabled (Σ.E3b).
+    pub fn dict_preservation(&self) -> bool {
+        self.dict_preservation
     }
 
     pub fn path(&self) -> &str {
@@ -276,10 +336,20 @@ impl TableProvider for EmatixFastParquetTableProvider {
     /// Phase 3 pushdown: single-column AND-conjunction of `col OP lit`
     /// where col is Int32/Date32. Other shapes return `Unsupported`
     /// and stay in DataFusion's residual FilterExec.
+    ///
+    /// Σ.E3b: when dict-preservation is enabled, no filter is pushed.
+    /// The filtered decode paths still materialise Utf8 → StringArray
+    /// which would mismatch the dict-rewritten schema.
     fn supports_filters_pushdown(
         &self,
         filters: &[&Expr],
     ) -> DfResult<Vec<TableProviderFilterPushDown>> {
+        if self.dict_preservation {
+            return Ok(filters
+                .iter()
+                .map(|_| TableProviderFilterPushDown::Unsupported)
+                .collect());
+        }
         Ok(filters
             .iter()
             .map(|e| {
@@ -742,6 +812,17 @@ fn decode_one_rg(
             DataType::Utf8 => {
                 decode_column_chunk_byte_array(path, rg, col_idx)? as Arc<dyn arrow_array::Array>
             }
+            DataType::Dictionary(k, v)
+                if matches!(k.as_ref(), DataType::UInt32)
+                    && matches!(v.as_ref(), DataType::Utf8) =>
+            {
+                // Σ.E3b: dict-preserved decode keeps the parquet dict
+                // structure intact across the Arrow boundary so
+                // downstream dict-aware operators (DictGroupCountExec,
+                // DictFilterExec) can stay on dict codes.
+                decode_column_chunk_byte_array_dict_preserved(path, rg, col_idx)?
+                    as Arc<dyn arrow_array::Array>
+            }
             other => {
                 return Err(DataFusionError::NotImplemented(format!(
                     "EmatixFastParquetExec: unsupported column type {other:?} for `{}`",
@@ -929,6 +1010,131 @@ mod tests {
         assert_eq!(sum_b, (0..1000i64).map(|i| i * 100).sum::<i64>());
         let expected_c: f64 = (0..1000).map(|i| (i as f64) * 1.5).sum();
         assert!((sum_c - expected_c).abs() < 1e-6);
+    }
+
+    /// Σ.E3b: with `with_dict_preservation(true)`, the provider must
+    /// (a) report Utf8 fields as `Dictionary(UInt32, Utf8)` on its
+    /// schema, (b) emit DictionaryArray-typed columns at scan time,
+    /// and (c) compose correctly with DataFusion's GROUP BY so the
+    /// pre-existing `EnableDictGroupCountRule` (Σ.E3b operator route)
+    /// has dict-encoded inputs to bind against.
+    #[tokio::test]
+    async fn dict_preservation_end_to_end() {
+        use parquet::basic::{Compression, Repetition, Type as PhysicalType};
+        use parquet::column::writer::ColumnWriter;
+        use parquet::data_type::ByteArray;
+        use parquet::file::properties::WriterProperties;
+        use parquet::file::writer::SerializedFileWriter;
+        use parquet::schema::types::Type as PType;
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+
+        // Schema: flag (Utf8) — 3 distinct values, heavy dict
+        // encoding. Single column keeps the schema rewrite assertion
+        // narrow.
+        let schema = Arc::new(
+            PType::group_type_builder("schema")
+                .with_fields(vec![Arc::new(
+                    PType::primitive_type_builder("flag", PhysicalType::BYTE_ARRAY)
+                        .with_repetition(Repetition::REQUIRED)
+                        .with_converted_type(parquet::basic::ConvertedType::UTF8)
+                        .build()
+                        .unwrap(),
+                )])
+                .build()
+                .unwrap(),
+        );
+        let props = Arc::new(
+            WriterProperties::builder()
+                .set_compression(Compression::SNAPPY)
+                // Force dict encoding — default already does this but
+                // make the test invariant explicit.
+                .set_dictionary_enabled(true)
+                .build(),
+        );
+        let file = File::create(&path).unwrap();
+        let mut writer = SerializedFileWriter::new(file, schema, props).unwrap();
+        let mut rg = writer.next_row_group().unwrap();
+        let palette: [&[u8]; 3] = [b"R", b"A", b"N"];
+        let values: Vec<ByteArray> = (0..1_500)
+            .map(|i| ByteArray::from(palette[i % 3].to_vec()))
+            .collect();
+        let mut col = rg.next_column().unwrap().unwrap();
+        if let ColumnWriter::ByteArrayColumnWriter(t) = col.untyped() {
+            t.write_batch(&values, None, None).unwrap();
+        }
+        col.close().unwrap();
+        rg.close().unwrap();
+        writer.close().unwrap();
+
+        // Off → schema is Utf8, batches are StringArray.
+        let prov_off =
+            EmatixFastParquetTableProvider::try_new(path.to_string_lossy().to_string()).unwrap();
+        assert!(matches!(
+            prov_off.schema().field(0).data_type(),
+            DataType::Utf8
+        ));
+
+        // On → schema is Dictionary(UInt32, Utf8), batches are
+        // DictionaryArray.
+        let prov_on = EmatixFastParquetTableProvider::try_new(path.to_string_lossy().to_string())
+            .unwrap()
+            .with_dict_preservation(true);
+        match prov_on.schema().field(0).data_type() {
+            DataType::Dictionary(k, v) => {
+                assert!(matches!(k.as_ref(), DataType::UInt32));
+                assert!(matches!(v.as_ref(), DataType::Utf8));
+            }
+            other => panic!("expected Dictionary(UInt32, Utf8), got {other:?}"),
+        }
+
+        let ctx = SessionContext::new();
+        ctx.register_table("t", Arc::new(prov_on)).unwrap();
+        let df = ctx.sql("SELECT flag FROM t LIMIT 5").await.unwrap();
+        let batches = df.collect().await.unwrap();
+        assert!(!batches.is_empty());
+        let col0 = batches[0].column(0);
+        assert!(matches!(
+            col0.data_type(),
+            DataType::Dictionary(k, v)
+                if matches!(k.as_ref(), DataType::UInt32)
+                    && matches!(v.as_ref(), DataType::Utf8)
+        ));
+        let dict_arr = col0
+            .as_any()
+            .downcast_ref::<arrow_array::DictionaryArray<arrow_array::types::UInt32Type>>()
+            .expect("expected DictionaryArray<UInt32Type>");
+        let values = dict_arr
+            .values()
+            .as_any()
+            .downcast_ref::<arrow_array::StringArray>()
+            .expect("dict values must be StringArray");
+        // Materialise first row and confirm it's one of the palette.
+        let k0 = dict_arr.keys().value(0) as usize;
+        let first = values.value(k0);
+        assert!(matches!(first, "R" | "A" | "N"), "unexpected: {first:?}");
+
+        // Also confirm GROUP BY composes through DataFusion (the rule
+        // matching machinery is unit-tested elsewhere; here we just
+        // verify the planner doesn't choke on the new column type).
+        let df2 = ctx
+            .sql("SELECT flag, COUNT(*) AS n FROM t GROUP BY flag ORDER BY flag")
+            .await
+            .unwrap();
+        let batches2 = df2.collect().await.unwrap();
+        let total: i64 = batches2
+            .iter()
+            .flat_map(|b| {
+                let c = b
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<arrow_array::Int64Array>()
+                    .unwrap();
+                (0..c.len()).map(move |i| c.value(i))
+            })
+            .sum();
+        assert_eq!(total, 1_500);
     }
 
     /// Phase 3 oracle on real SF=1 lineitem: Q14-shape predicate
