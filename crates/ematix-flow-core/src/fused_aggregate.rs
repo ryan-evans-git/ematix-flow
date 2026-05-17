@@ -99,15 +99,16 @@ pub trait AggregateSpec: Send + Sync + std::fmt::Debug + 'static {
 // `FusedFilterSumExec` / `process_q6_batch_hand`.
 // ---------------------------------------------------------------
 
-/// Q6 column indices, cached at construction time so the per-batch
-/// loop doesn't pay for a name-to-index lookup on every batch.
-#[derive(Debug, Clone, Copy)]
-pub struct Q6ColumnIndices {
-    pub qty: usize,
-    pub price: usize,
-    pub disc: usize,
-    pub ship: usize,
-}
+/// Q6 column indices.
+///
+/// Σ.G.2c finding: aliased to `crate::fused::ColumnIndices` so the
+/// trait-method body can pass them straight to `process_q6_batch_hand`
+/// with no per-batch struct conversion. The two were field-identical
+/// before the alias; defining `Q6ColumnIndices` as a distinct
+/// nominal type was costing ~5 % at the operator level even though
+/// LLVM saw equivalent fields, because the conversion-emitting code
+/// was inside the per-batch trait method.
+pub type Q6ColumnIndices = crate::fused::ColumnIndices;
 
 /// Single-table SUM with a 5-bound range filter — the TPC-H Q6
 /// shape. Wraps the existing [`Q6Predicate`] plus the column
@@ -144,7 +145,7 @@ impl Q6Spec {
                 )));
             }
         }
-        let indices = Q6ColumnIndices {
+        let indices = crate::fused::ColumnIndices {
             qty: child_schema.index_of("l_quantity").unwrap(),
             price: child_schema.index_of("l_extendedprice").unwrap(),
             disc: child_schema.index_of("l_discount").unwrap(),
@@ -175,13 +176,12 @@ impl AggregateSpec for Q6Spec {
         // identical source (Σ.G.2 perf gate, 2026-05-17). LLVM keys
         // its per-shape codegen off the free function — keep it
         // there, forward from the impl.
-        let idx = crate::fused::ColumnIndices {
-            qty: self.indices.qty,
-            price: self.indices.price,
-            disc: self.indices.disc,
-            ship: self.indices.ship,
-        };
-        *acc += crate::fused::process_q6_batch_hand(batch, self.predicate, idx);
+        //
+        // Σ.G.2c follow-up: `Q6ColumnIndices = fused::ColumnIndices`
+        // is a type alias, so passing `self.indices` directly avoids
+        // a per-batch struct-conversion that was costing ~5 % at the
+        // operator level.
+        *acc += crate::fused::process_q6_batch_hand(batch, self.predicate, self.indices);
         Ok(())
     }
 
