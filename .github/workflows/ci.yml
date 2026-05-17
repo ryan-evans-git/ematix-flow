@@ -46,11 +46,17 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Run unit + integration tests (nextest)
-        # `--all-targets` matches the previous `cargo test --all-targets`
-        # scope (lib + bins + integration + examples). nextest doesn't
-        # run doctests; if the project ever adds load-bearing doctests
-        # they'd need a separate `cargo test --doc` step here.
-        run: cargo nextest run --workspace --all-targets
+        # `--tests` (not `--all-targets`) intentionally: nextest enumerates
+        # each target via `--list`, and any bench whose module-init prints
+        # diagnostic lines (e.g. `examples/tpch/bench` printing data-dir
+        # info) breaks the "<name>: test" parse and fails the whole step.
+        # `--tests` filters to lib + integration test targets, matching
+        # integration.yml's working invocation. Compilation of benches /
+        # examples is still verified by the separate `cargo clippy
+        # --all-targets` step above. Doctests aren't run by nextest; if
+        # the project ever adds load-bearing doctests they'd need a
+        # separate `cargo test --doc` step here.
+        run: cargo nextest run --workspace --tests
 
   audit-rust:
     name: cargo audit (RustSec advisory DB)
