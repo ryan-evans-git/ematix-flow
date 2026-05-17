@@ -216,12 +216,13 @@ mod tests {
     #[tokio::test]
     async fn rule_lifts_q6_hand_to_generic_and_preserves_result() {
         let (scan, ctx) = q6_scan_plan().await;
-        let hand: Arc<dyn ExecutionPlan> = Arc::new(
-            FusedFilterSumExec::try_new_q6(scan.clone(), q6_predicate()).unwrap(),
-        );
+        let hand: Arc<dyn ExecutionPlan> =
+            Arc::new(FusedFilterSumExec::try_new_q6(scan.clone(), q6_predicate()).unwrap());
 
         let rule = EnableFusedAggregateExecRule;
-        let lifted = rule.optimize(hand.clone(), &ConfigOptions::default()).unwrap();
+        let lifted = rule
+            .optimize(hand.clone(), &ConfigOptions::default())
+            .unwrap();
 
         let is_generic = lifted
             .as_any()
@@ -250,18 +251,22 @@ mod tests {
     #[tokio::test]
     async fn rule_lifts_q1_hand_to_generic_and_preserves_row_count() {
         let (scan, ctx) = q1_scan_plan().await;
-        let hand: Arc<dyn ExecutionPlan> = Arc::new(
-            FusedFilterMultiAggExec::try_new_q1(scan.clone(), q1_predicate()).unwrap(),
-        );
+        let hand: Arc<dyn ExecutionPlan> =
+            Arc::new(FusedFilterMultiAggExec::try_new_q1(scan.clone(), q1_predicate()).unwrap());
 
         let rule = EnableFusedAggregateExecRule;
-        let lifted = rule.optimize(hand.clone(), &ConfigOptions::default()).unwrap();
+        let lifted = rule
+            .optimize(hand.clone(), &ConfigOptions::default())
+            .unwrap();
 
         let is_generic = lifted
             .as_any()
             .downcast_ref::<FusedAggregateExec<Q1Spec>>()
             .is_some();
-        assert!(is_generic, "rule should have lifted Q1 hand exec to generic");
+        assert!(
+            is_generic,
+            "rule should have lifted Q1 hand exec to generic"
+        );
 
         let hand_out = run_exec(hand, &ctx).await;
         let lift_out = run_exec(lifted, &ctx).await;
@@ -272,9 +277,8 @@ mod tests {
     #[tokio::test]
     async fn rule_leaves_jit_q6_alone() {
         let (scan, _ctx) = q6_scan_plan().await;
-        let jit: Arc<dyn ExecutionPlan> = Arc::new(
-            FusedFilterSumExec::try_new_q6_jit(scan, q6_predicate()).unwrap(),
-        );
+        let jit: Arc<dyn ExecutionPlan> =
+            Arc::new(FusedFilterSumExec::try_new_q6_jit(scan, q6_predicate()).unwrap());
 
         let rule = EnableFusedAggregateExecRule;
         let after = rule.optimize(jit, &ConfigOptions::default()).unwrap();
@@ -291,7 +295,9 @@ mod tests {
     async fn rule_passes_through_unrelated_plans() {
         let (scan, _ctx) = q6_scan_plan().await;
         let rule = EnableFusedAggregateExecRule;
-        let after = rule.optimize(scan.clone(), &ConfigOptions::default()).unwrap();
+        let after = rule
+            .optimize(scan.clone(), &ConfigOptions::default())
+            .unwrap();
         // Same Arc address — no rewrite happened.
         assert!(Arc::ptr_eq(&after, &scan));
     }

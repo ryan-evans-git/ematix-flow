@@ -303,7 +303,10 @@ async fn main() {
         "  trials:  {} interleaved × {} rounds/trial (after {} warmups)",
         TRIALS, ROUNDS_PER_TRIAL, WARMUPS
     );
-    println!("  gate:    unified.min ≤ hand.min × {:.2}", 1.0 + GATE_PCT / 100.0);
+    println!(
+        "  gate:    unified.min ≤ hand.min × {:.2}",
+        1.0 + GATE_PCT / 100.0
+    );
     println!();
 
     let q6 = bench_q6(&ctx).await;
@@ -314,7 +317,10 @@ async fn main() {
     println!();
 
     if ok6 && ok1 {
-        println!("  GATE PASS — operator-level Σ.G.2 within {:.0} % on both shapes (MIN-of-{}).", GATE_PCT, TRIALS);
+        println!(
+            "  GATE PASS — operator-level Σ.G.2 within {:.0} % on both shapes (MIN-of-{}).",
+            GATE_PCT, TRIALS
+        );
         println!("  Safe to write the planner rule that auto-routes existing Q6/Q1");
         println!("  plans through FusedAggregateExec<S>.");
     } else {
