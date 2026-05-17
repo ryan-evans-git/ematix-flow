@@ -69,6 +69,10 @@ use futures_util::TryStreamExt;
 use std::collections::BTreeMap;
 
 pub mod metrics_server;
+// Phase Z α: ephemeral one-shot worker — execute a single WorkUnit
+// shard against EmatixFastParquetTableProvider + write Arrow IPC.
+// Exposed for the `flow run-shard` CLI subcommand.
+pub mod run_shard;
 pub mod supervisor;
 use ematix_flow_core::kafka_backend::KafkaPayloadFormat;
 use ematix_flow_core::{
