@@ -48,8 +48,10 @@ use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
 
-use crate::fused::{FusedFilterSumExec, Q6Predicate};
-use crate::fused_multi_agg::{FusedFilterMultiAggExec, Q1Predicate};
+use crate::fused::Q6Predicate;
+use crate::fused_aggregate::{Q1Spec, Q6Spec};
+use crate::fused_aggregate_exec::FusedAggregateExec;
+use crate::fused_multi_agg::Q1Predicate;
 use crate::fused_post_join::{FusedPostJoinExec, FusedPostJoinSpec};
 
 /// Σ.D3 phase D rule: rewrite hand-coded fused execs into their JIT
@@ -65,18 +67,23 @@ impl PhysicalOptimizerRule for EnableFusedJitRule {
         _config: &ConfigOptions,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
         let result = plan.transform_up(|node| {
-            // FusedFilterSumExec (Σ.D1 / Q6 shape)
-            if let Some(e) = node.as_any().downcast_ref::<FusedFilterSumExec>() {
-                if !e.has_jit() {
-                    let new = FusedFilterSumExec::try_new_q6_jit(e.input().clone(), e.predicate())?;
+            // Σ.G.3d: FusedAggregateExec<Q6Spec> — the Q6 shape now lives
+            // here, not in the retired FusedFilterSumExec.
+            if let Some(e) = node.as_any().downcast_ref::<FusedAggregateExec<Q6Spec>>() {
+                if !e.spec().has_jit() {
+                    let input = e.input().clone();
+                    let new_spec = Q6Spec::try_new_jit(e.spec().predicate, &input.schema())?;
+                    let new = FusedAggregateExec::try_new(input, new_spec)?;
                     return Ok(Transformed::yes(Arc::new(new) as Arc<dyn ExecutionPlan>));
                 }
             }
-            // FusedFilterMultiAggExec (Σ.D2 / Q1 shape)
-            if let Some(e) = node.as_any().downcast_ref::<FusedFilterMultiAggExec>() {
-                if !e.has_jit() {
-                    let new =
-                        FusedFilterMultiAggExec::try_new_q1_jit(e.input().clone(), e.predicate())?;
+            // Σ.G.3d: FusedAggregateExec<Q1Spec> — same shape, now under
+            // the generic operator.
+            if let Some(e) = node.as_any().downcast_ref::<FusedAggregateExec<Q1Spec>>() {
+                if !e.spec().has_jit() {
+                    let input = e.input().clone();
+                    let new_spec = Q1Spec::try_new_jit(e.spec().predicate, &input.schema())?;
+                    let new = FusedAggregateExec::try_new(input, new_spec)?;
                     return Ok(Transformed::yes(Arc::new(new) as Arc<dyn ExecutionPlan>));
                 }
             }
@@ -221,7 +228,11 @@ fn try_match_q6_plan(node: &Arc<dyn ExecutionPlan>) -> DfResult<Option<Arc<dyn E
             return Ok(None);
         }
     }
-    let fused = FusedFilterSumExec::try_new_q6_jit(scan, predicate)?;
+    // Σ.G.3d: construct the generic `FusedAggregateExec<Q6Spec(JIT)>`
+    // directly instead of the now-retired `FusedFilterSumExec`. Matches
+    // the JIT-mode behaviour the old constructor implied.
+    let spec = Q6Spec::try_new_jit(predicate, &scan.schema())?;
+    let fused = FusedAggregateExec::try_new(scan, spec)?;
     Ok(Some(Arc::new(fused) as Arc<dyn ExecutionPlan>))
 }
 
@@ -757,7 +768,10 @@ fn try_match_q1_plan(node: &Arc<dyn ExecutionPlan>) -> DfResult<Option<Arc<dyn E
             return Ok(None);
         }
     }
-    let fused = FusedFilterMultiAggExec::try_new_q1_jit(scan, predicate)?;
+    // Σ.G.3d: same as InjectFusedQ6Rule above — construct the generic
+    // operator directly with the JIT-enabled spec.
+    let spec = Q1Spec::try_new_jit(predicate, &scan.schema())?;
+    let fused = FusedAggregateExec::try_new(scan, spec)?;
     Ok(Some(Arc::new(fused) as Arc<dyn ExecutionPlan>))
 }
 
@@ -1304,41 +1318,59 @@ mod tests {
         }
     }
 
-    /// Rule converts an existing hand-coded FusedFilterSumExec into
-    /// its JIT variant: same structural ExecutionPlan, but `has_jit()`
-    /// flips from false to true.
+    /// Build a non-JIT `FusedAggregateExec<Q6Spec>` directly — the Σ.G.3d
+    /// substrate the EnableFusedJitRule now lifts to JIT.
+    async fn fused_agg_q6_no_jit() -> Arc<dyn ExecutionPlan> {
+        let input = input_plan_for_q6().await;
+        let spec = Q6Spec::try_new(q6_predicate_canonical(), &input.schema()).unwrap();
+        Arc::new(FusedAggregateExec::try_new(input, spec).unwrap())
+    }
+
+    async fn fused_agg_q6_with_jit() -> Arc<dyn ExecutionPlan> {
+        let input = input_plan_for_q6().await;
+        let spec = Q6Spec::try_new_jit(q6_predicate_canonical(), &input.schema()).unwrap();
+        Arc::new(FusedAggregateExec::try_new(input, spec).unwrap())
+    }
+
+    /// Rule converts a non-JIT `FusedAggregateExec<Q6Spec>` into its
+    /// JIT variant: same structural ExecutionPlan, but the spec's
+    /// `has_jit()` flips from false to true.
     #[tokio::test]
     async fn rule_enables_jit_on_hand_coded_q6_exec() {
-        let input = input_plan_for_q6().await;
-        let hand =
-            Arc::new(FusedFilterSumExec::try_new_q6(input, q6_predicate_canonical()).unwrap());
-        assert!(!hand.has_jit(), "starting state: hand-coded");
+        let hand = fused_agg_q6_no_jit().await;
+        assert!(
+            !hand
+                .as_any()
+                .downcast_ref::<FusedAggregateExec<Q6Spec>>()
+                .unwrap()
+                .spec()
+                .has_jit(),
+            "starting state: hand-coded"
+        );
 
         let rule = EnableFusedJitRule;
         let cfg = ConfigOptions::new();
         let optimized = rule.optimize(hand.clone(), &cfg).unwrap();
         let downcast = optimized
             .as_any()
-            .downcast_ref::<FusedFilterSumExec>()
+            .downcast_ref::<FusedAggregateExec<Q6Spec>>()
             .expect("rule preserves the operator type");
-        assert!(downcast.has_jit(), "rule should enable JIT");
+        assert!(downcast.spec().has_jit(), "rule should enable JIT");
     }
 
     /// Rule is idempotent: a plan already in JIT mode passes through
     /// unchanged (no double-build, no panics).
     #[tokio::test]
     async fn rule_is_idempotent() {
-        let input = input_plan_for_q6().await;
-        let already_jit =
-            Arc::new(FusedFilterSumExec::try_new_q6_jit(input, q6_predicate_canonical()).unwrap());
+        let already_jit = fused_agg_q6_with_jit().await;
         let rule = EnableFusedJitRule;
         let cfg = ConfigOptions::new();
         let optimized = rule.optimize(already_jit, &cfg).unwrap();
         let downcast = optimized
             .as_any()
-            .downcast_ref::<FusedFilterSumExec>()
+            .downcast_ref::<FusedAggregateExec<Q6Spec>>()
             .unwrap();
-        assert!(downcast.has_jit());
+        assert!(downcast.spec().has_jit());
     }
 
     /// End-to-end: rule-rewritten plan produces the same final
@@ -1348,13 +1380,9 @@ mod tests {
     async fn rule_rewritten_plan_produces_same_result_as_hand_coded() {
         use datafusion::arrow::array::Float64Array;
 
-        let hand_input = input_plan_for_q6().await;
-        let hand_exec: Arc<dyn ExecutionPlan> =
-            Arc::new(FusedFilterSumExec::try_new_q6(hand_input, q6_predicate_canonical()).unwrap());
+        let hand_exec = fused_agg_q6_no_jit().await;
 
-        let rule_input = input_plan_for_q6().await;
-        let pre_rule: Arc<dyn ExecutionPlan> =
-            Arc::new(FusedFilterSumExec::try_new_q6(rule_input, q6_predicate_canonical()).unwrap());
+        let pre_rule = fused_agg_q6_no_jit().await;
         let cfg = ConfigOptions::new();
         let rewritten = EnableFusedJitRule.optimize(pre_rule, &cfg).unwrap();
 
@@ -1493,7 +1521,7 @@ mod tests {
         let plan = df.create_physical_plan().await.unwrap();
         let plan_str = displayable(plan.as_ref()).indent(true).to_string();
         assert!(
-            plan_str.contains("FusedFilterSumExec"),
+            plan_str.contains("FusedAggregateExec"),
             "InjectFusedQ6Rule did not fire on the canonical Q6 plan.\nPlan:\n{plan_str}"
         );
 
@@ -1546,7 +1574,7 @@ mod tests {
             .unwrap();
         let plan_str = displayable(plan.as_ref()).indent(true).to_string();
         assert!(
-            !plan_str.contains("FusedFilterSumExec"),
+            !plan_str.contains("FusedAggregateExec"),
             "InjectFusedQ6Rule wrongly fired on a non-Q6 query:\n{plan_str}"
         );
     }
@@ -1632,7 +1660,7 @@ mod tests {
             .unwrap();
         let plan_str = displayable(plan.as_ref()).indent(true).to_string();
         assert!(
-            plan_str.contains("FusedFilterMultiAggExec"),
+            plan_str.contains("FusedAggregateExec"),
             "InjectFusedQ1Rule did not fire on canonical Q1 plan.\nPlan:\n{plan_str}"
         );
 
@@ -1708,7 +1736,7 @@ mod tests {
             .unwrap();
         let plan_str = displayable(plan.as_ref()).indent(true).to_string();
         assert!(
-            !plan_str.contains("FusedFilterMultiAggExec"),
+            !plan_str.contains("FusedAggregateExec"),
             "InjectFusedQ1Rule wrongly fired:\n{plan_str}"
         );
     }
