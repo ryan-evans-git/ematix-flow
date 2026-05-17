@@ -32,8 +32,10 @@ use datafusion::datasource::MemTable;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::{SessionConfig, SessionContext};
 use ematix_flow_core::fast_parquet::FastParquetTableProvider;
-use ematix_flow_core::fused::{FusedFilterSumExec, Q6Predicate};
-use ematix_flow_core::fused_multi_agg::{FusedFilterMultiAggExec, Q1Predicate};
+use ematix_flow_core::fused::Q6Predicate;
+use ematix_flow_core::fused_aggregate::{Q1Spec, Q6Spec};
+use ematix_flow_core::fused_aggregate_exec::FusedAggregateExec;
+use ematix_flow_core::fused_multi_agg::Q1Predicate;
 use ematix_flow_core::fused_post_join::{FusedPostJoinExec, FusedPostJoinSpec};
 use futures_util::stream::TryStreamExt;
 
@@ -173,8 +175,12 @@ const Q6_PREDICATE: Q6Predicate = Q6Predicate {
 async fn bench_q6(ctx: &SessionContext) {
     let hand_input = q6_input_plan(ctx).await;
     let jit_input = q6_input_plan(ctx).await;
-    let hand = Arc::new(FusedFilterSumExec::try_new_q6(hand_input, Q6_PREDICATE).unwrap());
-    let jitd = Arc::new(FusedFilterSumExec::try_new_q6_jit(jit_input, Q6_PREDICATE).unwrap());
+    let hand_spec = Q6Spec::try_new(Q6_PREDICATE, &hand_input.schema()).unwrap();
+    let jit_spec = Q6Spec::try_new_jit(Q6_PREDICATE, &jit_input.schema()).unwrap();
+    let hand: Arc<dyn ExecutionPlan> =
+        Arc::new(FusedAggregateExec::try_new(hand_input, hand_spec).unwrap());
+    let jitd: Arc<dyn ExecutionPlan> =
+        Arc::new(FusedAggregateExec::try_new(jit_input, jit_spec).unwrap());
 
     let hand_out = run_to_first_batch(hand.clone()).await;
     let jit_out = run_to_first_batch(jitd.clone()).await;
@@ -208,8 +214,12 @@ async fn bench_q1(ctx: &SessionContext) {
     };
     let hand_input = q1_input_plan(ctx).await;
     let jit_input = q1_input_plan(ctx).await;
-    let hand = Arc::new(FusedFilterMultiAggExec::try_new_q1(hand_input, predicate).unwrap());
-    let jitd = Arc::new(FusedFilterMultiAggExec::try_new_q1_jit(jit_input, predicate).unwrap());
+    let hand_spec = Q1Spec::try_new(predicate, &hand_input.schema()).unwrap();
+    let jit_spec = Q1Spec::try_new_jit(predicate, &jit_input.schema()).unwrap();
+    let hand: Arc<dyn ExecutionPlan> =
+        Arc::new(FusedAggregateExec::try_new(hand_input, hand_spec).unwrap());
+    let jitd: Arc<dyn ExecutionPlan> =
+        Arc::new(FusedAggregateExec::try_new(jit_input, jit_spec).unwrap());
 
     let hand_out = run_to_first_batch(hand.clone()).await;
     let jit_out = run_to_first_batch(jitd.clone()).await;

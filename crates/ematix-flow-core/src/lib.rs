@@ -31,6 +31,16 @@ pub mod ematix_fast_parquet;
 // Q6 gap vs Polars (1.0 ms hand-written / 1.9 ms Polars / 5.96 ms
 // today's DataFusion). See `fused.rs` header and issue #44.
 pub mod fused;
+// Σ.G.2 first slice: `AggregateSpec` trait + `Q6Spec` + `Q1Spec`.
+// Both per-shape gates pass (#92, #93) — the trait dispatch matches
+// hand-written perf within 1 % on synthetic batches.
+pub mod fused_aggregate;
+// Σ.G.2 third slice: the generic operator that the trait was built
+// to enable. Wraps any `AggregateSpec` impl as a DataFusion
+// `ExecutionPlan`. Reachable via direct construction or via the
+// `InjectFusedQ{6,1}Rule` family which build it from raw SQL plans
+// (Σ.G.3d retired the intermediate FusedFilterSumExec lift).
+pub mod fused_aggregate_exec;
 // Σ.D2: `FusedFilterMultiAggExec` — single-pass fused filter +
 // multi-aggregate + group-by physical operator. Day-1 prototype
 // (`examples/tpch_q1_tune.rs`) showed 3.08 ms on Q1 SF=1 / 14
