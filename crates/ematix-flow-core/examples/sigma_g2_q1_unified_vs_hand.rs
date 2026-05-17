@@ -193,7 +193,7 @@ fn fmt_ns(ns: u128) -> String {
 /// uniform in [1, 50], extendedprice in [900, 105_000], discount in
 /// [0.0, 0.10], tax in [0.0, 0.08]. Seeded so re-runs are deterministic.
 fn synth_lineitem_batch() -> (RecordBatch, Arc<Schema>) {
-    let mut rng = Lcg::new(0xC0_FFEE_42_19);
+    let mut rng = Lcg::new(0x00C0_FFEE_4219);
 
     let flags = ["R", "N", "A"];
     let stati = ["O", "F"];
