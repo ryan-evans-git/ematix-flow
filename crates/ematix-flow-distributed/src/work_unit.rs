@@ -238,7 +238,9 @@ mod tests {
         assert_eq!(wu.execution.threads, None);
         // No row_group_range for an unsharded run
         match &wu.input {
-            Input::ParquetPartition { row_group_range, .. } => {
+            Input::ParquetPartition {
+                row_group_range, ..
+            } => {
                 assert!(row_group_range.is_empty());
             }
         }
