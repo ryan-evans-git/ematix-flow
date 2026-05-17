@@ -35,10 +35,20 @@ prometheus = { workspace = true }
 # Π.4b-3: lookup-load helper streams Arrow batches into MemTables.
 arrow-array = { workspace = true }
 arrow-schema = { workspace = true }
+# Phase Z α: `flow run-shard` writes its partial result as Arrow IPC
+# to the output URI; needs the FileWriter directly.
+arrow-ipc = "58"
 futures-util = { workspace = true }
 # Σ.B PR 2 commit 4: validating `[transform] peers = [...]` URL
 # well-formedness at config-load.
 url = { workspace = true }
+# Phase Z α: `flow run-shard` builds a DataFusion SessionContext to
+# execute the query against the EmatixFastParquetTableProvider.
+datafusion = { workspace = true }
+# Phase Z α: e2e smoke test against the in-tree SF=1 fixture (when
+# present) lives under `#[cfg(test)]` in run_shard.rs but the test
+# also uses `tempfile` to scope the output. Promote to a main dep
+# only the parts the production path needs; tempfile stays dev-only.
 
 [dev-dependencies]
 tempfile = "3"

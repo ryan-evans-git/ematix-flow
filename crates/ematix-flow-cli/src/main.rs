@@ -125,24 +125,18 @@ async fn main() -> ExitCode {
         Commands::RunShard {
             work_unit_file,
             work_unit_stdin,
-        } => run_shard_cmd(work_unit_file.as_deref(), work_unit_stdin),
+        } => run_shard_cmd(work_unit_file.as_deref(), work_unit_stdin).await,
     }
 }
 
 /// `flow run-shard` entry point. Phase Z ephemeral worker —
-/// parses + validates the WorkUnit, runs the query, writes the
-/// result, emits the metrics JSON on stdout.
-///
-/// Today: skeleton. Parses, validates, emits the metrics envelope
-/// with `wall_ms` populated; query execution to land in a follow-up.
-/// Exit code conventions are honored already so the coordinator
-/// path is testable end-to-end.
-fn run_shard_cmd(file: Option<&std::path::Path>, from_stdin: bool) -> ExitCode {
-    use ematix_flow_distributed::work_unit::{WorkUnit, WorkUnitMetrics};
+/// parses + validates the WorkUnit, executes the query against
+/// `EmatixFastParquetTableProvider`, writes Arrow IPC to the
+/// output URI, and emits the metrics JSON on stdout.
+async fn run_shard_cmd(file: Option<&std::path::Path>, from_stdin: bool) -> ExitCode {
+    use ematix_flow_cli::run_shard::execute_work_unit;
+    use ematix_flow_distributed::work_unit::WorkUnit;
     use std::io::Read;
-    use std::time::Instant;
-
-    let started = Instant::now();
 
     // ---- Read the WorkUnit JSON ----
     let raw = match (file, from_stdin) {
@@ -182,42 +176,20 @@ fn run_shard_cmd(file: Option<&std::path::Path>, from_stdin: bool) -> ExitCode {
     info!(
         work_unit_id = wu.id.as_str(),
         query = ?wu.query,
-        "work-unit parsed; execution path is not yet wired (Phase Z scaffold)"
+        "work-unit parsed; starting execution"
     );
 
-    // ---- Execute (SKELETON — to be wired in follow-up) ----
-    //
-    // The real path will:
-    //   1. Build an EmatixFastParquetTableProvider per input table,
-    //      applying with_dict_preservation / with_late_mat /
-    //      with_adaptive_predicate per execution config.
-    //   2. Run the SQL for `wu.query` against the SessionContext.
-    //   3. Stream the result through ArrowStreamWriter to the
-    //      output URI.
-    //
-    // For now, emit a "skeleton run" marker via the same stdout
-    // metrics envelope so coordinator harnesses can be developed
-    // against this binary.
-    let query_id = match &wu.query {
-        ematix_flow_distributed::work_unit::Query::Tpch { id } => id.clone(),
-    };
-    let output_uri = match &wu.output {
-        ematix_flow_distributed::work_unit::Output::ArrowIpc { uri } => uri.clone(),
+    // ---- Execute ----
+    let metrics = match execute_work_unit(&wu).await {
+        Ok(m) => m,
+        Err(e) => {
+            let code = e.exit_code();
+            error!(error = %e, exit_code = code, "execute_work_unit failed");
+            return ExitCode::from(code);
+        }
     };
 
-    let metrics = WorkUnitMetrics {
-        work_unit_id: wu.id.clone(),
-        query: query_id,
-        wall_ms: started.elapsed().as_millis() as u64,
-        decode_ms: None,
-        exec_ms: None,
-        output_write_ms: None,
-        rows_in: None,
-        rows_out: None,
-        output_uri,
-    };
-
-    // ---- Emit metrics JSON on stdout (one line, no trailing newline beyond println) ----
+    // ---- Emit metrics JSON on stdout (one line) ----
     match serde_json::to_string(&metrics) {
         Ok(line) => {
             println!("{}", line);
