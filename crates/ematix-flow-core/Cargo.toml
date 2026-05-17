@@ -197,6 +197,15 @@ path = "examples/sigma_g2_q1_unified_vs_hand.rs"
 name = "sigma_g2c_operator_vs_hand"
 path = "examples/sigma_g2c_operator_vs_hand.rs"
 
+# Σ.G.3a: operator-level perf gate for `FusedAggregateExec<Q6Spec(JIT)>`
+# vs `FusedFilterSumExec(JIT)`. Same methodology as the Σ.G.2c bench but
+# both sides JIT-build the same FusedFilterAggSpec::q6 — this isolates
+# the dispatch-on-`self.jit` overhead in `Q6Spec::process_batch` from
+# the JIT kernel itself.
+[[example]]
+name = "sigma_g3a_q6spec_jit_vs_hand_jit"
+path = "examples/sigma_g3a_q6spec_jit_vs_hand_jit.rs"
+
 # Phase 3.5: Q14-shape SQL through 3 providers — register_parquet,
 # FastParquetTableProvider, EmatixFastParquetTableProvider with the
 # Phase 3 Date32 predicate pushdown. Measures wall-clock impact of
