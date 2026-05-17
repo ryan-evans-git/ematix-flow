@@ -369,7 +369,11 @@ pub fn process_q6_batch_hand(batch: &RecordBatch, p: Q6Predicate, idx: ColumnInd
 /// Per-batch fused filter + sum via the Cranelift-JIT'd kernel. The
 /// JIT runs the same predicate-and-multiply-and-add the hand-coded
 /// path does, with the constants baked in as immediates.
-fn process_q6_batch_jit(
+///
+/// `pub` for Σ.G.3a so [`crate::fused_aggregate::Q6Spec`] can route
+/// its JIT path through the same kernel the hand operator uses.
+#[inline]
+pub fn process_q6_batch_jit(
     batch: &RecordBatch,
     idx: ColumnIndices,
     jit: &crate::fused_jit::FusedFilterAggJit,
