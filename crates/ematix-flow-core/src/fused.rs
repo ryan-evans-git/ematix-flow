@@ -312,17 +312,24 @@ impl ExecutionPlan for FusedFilterSumExec {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct ColumnIndices {
-    qty: usize,
-    price: usize,
-    disc: usize,
-    ship: usize,
+pub struct ColumnIndices {
+    pub qty: usize,
+    pub price: usize,
+    pub disc: usize,
+    pub ship: usize,
 }
 
 /// Per-batch fused filter + sum (hand-coded Rust). LLVM auto-vectorises
 /// the inner loop; on real lineitem batches this matches the JIT path
 /// to within rel_err 1e-12.
-fn process_q6_batch_hand(batch: &RecordBatch, p: Q6Predicate, idx: ColumnIndices) -> f64 {
+///
+/// Exposed `pub` so the Σ.G.2 perf-equivalence bench in
+/// `examples/sigma_g2_q6_unified_vs_hand.rs` can time it against
+/// the new generic `Q6Spec::process_batch` path. `#[inline]` matches
+/// the hint on the unified path so cross-crate inlining is fair on
+/// both sides (the bench is in `examples/` which is its own crate).
+#[inline]
+pub fn process_q6_batch_hand(batch: &RecordBatch, p: Q6Predicate, idx: ColumnIndices) -> f64 {
     let qty = batch
         .column(idx.qty)
         .as_any()
