@@ -206,6 +206,14 @@ path = "examples/sigma_g2c_operator_vs_hand.rs"
 name = "sigma_g3a_q6spec_jit_vs_hand_jit"
 path = "examples/sigma_g3a_q6spec_jit_vs_hand_jit.rs"
 
+# Σ.G.3b: mirror of Σ.G.3a but for the Q1 shape (5-group multi-aggregate).
+# Gates the per-batch scratch ↔ [Q1Aggs; 5] conversion in
+# process_q1_batch_jit_into_groups against the hand operator's worker
+# that keeps the cells buffer live for the whole stream.
+[[example]]
+name = "sigma_g3b_q1spec_jit_vs_hand_jit"
+path = "examples/sigma_g3b_q1spec_jit_vs_hand_jit.rs"
+
 # Phase 3.5: Q14-shape SQL through 3 providers — register_parquet,
 # FastParquetTableProvider, EmatixFastParquetTableProvider with the
 # Phase 3 Date32 predicate pushdown. Measures wall-clock impact of

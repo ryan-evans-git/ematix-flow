@@ -365,7 +365,15 @@ fn q1_group_idx(rflag: u8, lstatus: u8) -> usize {
 /// (5 groups × 6 aggs, row-major). The JIT pre-seeds from `cells` at
 /// entry and stores back at exit, so calling this in a loop accumulates
 /// across batches.
-fn process_q1_batch_jit(
+///
+/// `pub` for Σ.G.3b so [`crate::fused_aggregate::Q1Spec`] can drive its
+/// JIT path through the same kernel the hand operator uses. The hand
+/// path's worker manages the 30-cell buffer itself and converts to
+/// `[Q1Aggs; 5]` once at end-of-stream; the trait path keeps the
+/// canonical `[Q1Aggs; 5]` accumulator and uses [`process_q1_batch_jit_into_groups`]
+/// to handle the per-batch conversion.
+#[inline]
+pub fn process_q1_batch_jit(
     batch: &RecordBatch,
     idx: Q1ColumnIndices,
     jit: &crate::fused_jit::FusedFilterAggJit,
@@ -425,6 +433,51 @@ fn process_q1_batch_jit(
     // exactly `jit.n_outputs() == 30` f64 cells.
     unsafe {
         jit.run(batch.num_rows() as i64, inputs.as_ptr(), cells.as_mut_ptr());
+    }
+}
+
+/// Σ.G.3b adapter: run the Q1 JIT and add the result into a
+/// `[Q1Aggs; 5]` accumulator.
+///
+/// The JIT writes its 30-cell scratch in row-major (group, agg) order
+/// matching `FusedFilterAggSpec::q1()`:
+///   `(sum_qty, sum_price, sum_disc_price, sum_charge, sum_disc, count)`
+/// per group. We seed the scratch with the *current* accumulator
+/// values so the JIT's read-modify-store semantics keep accumulating
+/// across batches, then write the updated cells back to the typed
+/// `Q1Aggs` representation.
+///
+/// Cost: 30 f64 reads to seed + 30 f64 reads to write back, ~120 bytes
+/// of cache traffic per batch — negligible vs the JIT itself
+/// (validated by [`sigma_g3b_q1spec_jit_vs_hand_jit`]).
+#[inline]
+pub fn process_q1_batch_jit_into_groups(
+    batch: &RecordBatch,
+    idx: Q1ColumnIndices,
+    jit: &crate::fused_jit::FusedFilterAggJit,
+    groups: &mut [Q1Aggs; 5],
+) {
+    // Seed the 30-cell scratch from the current per-group running totals.
+    let mut cells: [f64; 30] = [0.0; 30];
+    for (g, group) in groups.iter().enumerate() {
+        let base = g * 6;
+        cells[base] = group.sum_qty;
+        cells[base + 1] = group.sum_price;
+        cells[base + 2] = group.sum_disc_price;
+        cells[base + 3] = group.sum_charge;
+        cells[base + 4] = group.sum_disc;
+        cells[base + 5] = group.count as f64;
+    }
+    process_q1_batch_jit(batch, idx, jit, &mut cells);
+    // Write the updated cells back to the typed groups.
+    for (g, group) in groups.iter_mut().enumerate() {
+        let base = g * 6;
+        group.sum_qty = cells[base];
+        group.sum_price = cells[base + 1];
+        group.sum_disc_price = cells[base + 2];
+        group.sum_charge = cells[base + 3];
+        group.sum_disc = cells[base + 4];
+        group.count = cells[base + 5] as u64;
     }
 }
 
