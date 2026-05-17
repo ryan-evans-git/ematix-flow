@@ -116,6 +116,13 @@ jobs:
     # Allow up to ~75 min: image pulls + sequential testcontainer
     # startup add up. The 2-hour default would mask a hung suite.
     timeout-minutes: 75
+    # Stacked-PR optimisation: skip this 75-min sweep on PRs that
+    # target a feature branch (i.e. the middle of a stack). Coverage
+    # still runs on the eventual PR-to-main and on every push to
+    # main, so a regression can't slip in — it just doesn't fire
+    # twice per stacked PR pair. Not gated for `push` or `schedule`
+    # events since those don't have a `base_ref`.
+    if: github.event_name != 'pull_request' || github.base_ref == 'main' || github.base_ref == 'master'
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

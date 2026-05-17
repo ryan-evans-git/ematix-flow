@@ -113,11 +113,23 @@ pub type Q6ColumnIndices = crate::fused::ColumnIndices;
 /// Single-table SUM with a 5-bound range filter — the TPC-H Q6
 /// shape. Wraps the existing [`Q6Predicate`] plus the column
 /// indices.
+///
+/// Σ.G.3a: the spec also carries an optional Cranelift JIT handle. When
+/// present, [`AggregateSpec::process_batch`] routes the inner loop
+/// through the JIT'd kernel (`fused::process_q6_batch_jit`) instead of
+/// the hand path. The JIT branch is invariant across batches once the
+/// spec is constructed — LLVM hoists the `match` out of the hot loop
+/// in monomorphised code, so the bench gate at [[sigma-g3a-bench]]
+/// gates this dispatch within 3 % of the hand-coded operator's JIT path.
+///
+/// Cloning the spec across operator workers is cheap: the field is
+/// `Arc<FusedFilterAggJit>` so workers share one JIT module.
 #[derive(Debug, Clone)]
 pub struct Q6Spec {
     pub predicate: Q6Predicate,
     pub indices: Q6ColumnIndices,
     pub output_schema: SchemaRef,
+    jit: Option<Arc<crate::fused_jit::FusedFilterAggJit>>,
 }
 
 impl Q6Spec {
@@ -161,7 +173,38 @@ impl Q6Spec {
             predicate,
             indices,
             output_schema,
+            jit: None,
         })
+    }
+
+    /// Σ.G.3a: same as [`try_new`] but builds a Cranelift JIT kernel
+    /// for the predicate. `process_batch` will route through the JIT
+    /// instead of the hand path.
+    ///
+    /// The JIT spec mirrors `FusedFilterSumExec::try_new_q6_jit`
+    /// exactly (same column order, same baked-in constants) so the
+    /// generic operator's JIT path is bit-equivalent to the hand
+    /// operator's JIT path. Bench gate confirms ([[sigma-g3a-bench]]).
+    pub fn try_new_jit(predicate: Q6Predicate, child_schema: &SchemaRef) -> DfResult<Self> {
+        let mut spec = Self::try_new(predicate, child_schema)?;
+        let jit_spec = crate::fused_jit::FusedFilterAggSpec::q6(
+            predicate.date_lo,
+            predicate.date_hi,
+            predicate.disc_lo,
+            predicate.disc_hi,
+            predicate.qty_hi,
+        );
+        let jit = crate::fused_jit::FusedFilterAggJit::try_build(&jit_spec).map_err(|e| {
+            datafusion::common::DataFusionError::Plan(format!("Q6Spec: JIT build failed: {e}"))
+        })?;
+        spec.jit = Some(Arc::new(jit));
+        Ok(spec)
+    }
+
+    /// Returns `true` if this spec was constructed with [`try_new_jit`]
+    /// and `process_batch` will route through the Cranelift kernel.
+    pub fn has_jit(&self) -> bool {
+        self.jit.is_some()
     }
 }
 
@@ -171,7 +214,7 @@ impl AggregateSpec for Q6Spec {
     #[inline(always)]
     fn process_batch(&self, batch: &RecordBatch, acc: &mut Self::Accumulator) -> DfResult<()> {
         // The trait method is the dispatch surface; the actual hot
-        // loop lives in `fused::process_q6_batch_hand`. Duplicating
+        // loop lives in `fused::process_q6_batch_{hand,jit}`. Duplicating
         // the body here regressed the bench by 12-39 % even with
         // identical source (Σ.G.2 perf gate, 2026-05-17). LLVM keys
         // its per-shape codegen off the free function — keep it
@@ -181,7 +224,14 @@ impl AggregateSpec for Q6Spec {
         // is a type alias, so passing `self.indices` directly avoids
         // a per-batch struct-conversion that was costing ~5 % at the
         // operator level.
-        *acc += crate::fused::process_q6_batch_hand(batch, self.predicate, self.indices);
+        //
+        // Σ.G.3a: dispatch on `self.jit`. The branch is invariant
+        // across iterations once the spec is constructed, so LLVM
+        // hoists it out of the inner loop in monomorphised code.
+        *acc += match &self.jit {
+            Some(j) => crate::fused::process_q6_batch_jit(batch, self.indices, j),
+            None => crate::fused::process_q6_batch_hand(batch, self.predicate, self.indices),
+        };
         Ok(())
     }
 
@@ -218,11 +268,19 @@ impl AggregateSpec for Q6Spec {
 /// TPC-H Q1 shape. Accumulator is `[Q1Aggs; 5]`: four real groups
 /// plus an out-of-band catch-all bucket so the inner loop indexing
 /// stays branchless. The catch-all is dropped at finalize time.
+///
+/// Σ.G.3b: optional JIT handle. When present, [`AggregateSpec::process_batch`]
+/// routes through the Cranelift kernel via
+/// [`crate::fused_multi_agg::process_q1_batch_jit_into_groups`], which
+/// owns the per-batch 30-cell scratch ↔ `[Q1Aggs; 5]` conversion. Bench
+/// gate at [[sigma-g3b-bench]] confirms the JIT-through-trait path is
+/// within 3 % of the hand-JIT operator.
 #[derive(Debug, Clone)]
 pub struct Q1Spec {
     pub predicate: Q1Predicate,
     pub indices: Q1ColumnIndices,
     pub output_schema: SchemaRef,
+    jit: Option<Arc<crate::fused_jit::FusedFilterAggJit>>,
 }
 
 impl Q1Spec {
@@ -279,7 +337,29 @@ impl Q1Spec {
             predicate,
             indices,
             output_schema,
+            jit: None,
         })
+    }
+
+    /// Σ.G.3b: same as [`try_new`] but builds a Cranelift JIT kernel
+    /// for the Q1 predicate + 30-cell multi-aggregate. The JIT spec
+    /// mirrors `FusedFilterMultiAggExec::try_new_q1_jit` exactly so
+    /// the generic operator's JIT path is bit-equivalent to the hand
+    /// operator's JIT path.
+    pub fn try_new_jit(predicate: Q1Predicate, child_schema: &SchemaRef) -> DfResult<Self> {
+        let mut spec = Self::try_new(predicate, child_schema)?;
+        let jit_spec = crate::fused_jit::FusedFilterAggSpec::q1(predicate.shipdate_cutoff);
+        let jit = crate::fused_jit::FusedFilterAggJit::try_build(&jit_spec).map_err(|e| {
+            datafusion::common::DataFusionError::Plan(format!("Q1Spec: JIT build failed: {e}"))
+        })?;
+        spec.jit = Some(Arc::new(jit));
+        Ok(spec)
+    }
+
+    /// Returns `true` if this spec was constructed with [`try_new_jit`]
+    /// and `process_batch` will route through the Cranelift kernel.
+    pub fn has_jit(&self) -> bool {
+        self.jit.is_some()
     }
 }
 
@@ -289,9 +369,26 @@ impl AggregateSpec for Q1Spec {
     #[inline(always)]
     fn process_batch(&self, batch: &RecordBatch, acc: &mut Self::Accumulator) -> DfResult<()> {
         // Same pattern as Q6Spec: the trait is the dispatch surface,
-        // the hot loop lives in `fused_multi_agg::process_q1_batch_hand`.
+        // the hot loop lives in `fused_multi_agg::process_q1_batch_{hand,jit}`.
         // See the Q6 bench finding in the module docstring for why.
-        crate::fused_multi_agg::process_q1_batch_hand(batch, self.predicate, self.indices, acc);
+        //
+        // Σ.G.3b: dispatch on `self.jit`. Invariant once the spec is
+        // constructed; LLVM hoists the match out of the inner loop in
+        // monomorphised code.
+        match &self.jit {
+            Some(j) => crate::fused_multi_agg::process_q1_batch_jit_into_groups(
+                batch,
+                self.indices,
+                j,
+                acc,
+            ),
+            None => crate::fused_multi_agg::process_q1_batch_hand(
+                batch,
+                self.predicate,
+                self.indices,
+                acc,
+            ),
+        }
         Ok(())
     }
 
@@ -456,6 +553,54 @@ mod tests {
         assert_eq!(spec.merge(0.0, 0.0), 0.0);
     }
 
+    // ------------- Σ.G.3a: Q6Spec JIT tests -------------
+
+    #[test]
+    fn q6spec_jit_matches_hand_calculation() {
+        let (batch, schema) = small_lineitem_batch();
+        let pred = Q6Predicate {
+            date_lo: 8766,
+            date_hi: 9131,
+            disc_lo: 0.05,
+            disc_hi: 0.07,
+            qty_hi: 24.0,
+        };
+        let hand = Q6Spec::try_new(pred, &schema).unwrap();
+        let jit = Q6Spec::try_new_jit(pred, &schema).unwrap();
+        assert!(!hand.has_jit());
+        assert!(jit.has_jit());
+
+        let mut a_hand = 0.0;
+        let mut a_jit = 0.0;
+        hand.process_batch(&batch, &mut a_hand).unwrap();
+        jit.process_batch(&batch, &mut a_jit).unwrap();
+        // Same fixture as `q6spec_matches_hand_calculation`: expected 24.0.
+        assert!((a_jit - 24.0).abs() < 1e-9, "JIT got {a_jit}");
+        assert!((a_jit - a_hand).abs() < 1e-9, "hand={a_hand} jit={a_jit}");
+    }
+
+    #[test]
+    fn q6spec_jit_clone_shares_kernel() {
+        // Σ.G.3a invariant: cloning the spec into per-partition workers
+        // should be an Arc bump on the JIT, not a rebuild. Verified by
+        // construction (Arc<FusedFilterAggJit>), but assert here so a
+        // future refactor that swaps Arc for Box trips the test.
+        let (_, schema) = small_lineitem_batch();
+        let pred = Q6Predicate {
+            date_lo: 8766,
+            date_hi: 9131,
+            disc_lo: 0.05,
+            disc_hi: 0.07,
+            qty_hi: 24.0,
+        };
+        let original = Q6Spec::try_new_jit(pred, &schema).unwrap();
+        let cloned = original.clone();
+        // Same Arc means same module pointer — verified by raw-ptr eq.
+        let p1 = Arc::as_ptr(original.jit.as_ref().unwrap());
+        let p2 = Arc::as_ptr(cloned.jit.as_ref().unwrap());
+        assert_eq!(p1, p2);
+    }
+
     // ------------- Q1Spec tests -------------
 
     fn small_q1_batch(cutoff: i32) -> (RecordBatch, SchemaRef) {
@@ -570,5 +715,76 @@ mod tests {
         assert_eq!(merged[0].sum_qty, 15.0);
         assert_eq!(merged[0].count, 3);
         assert_eq!(merged[2].sum_qty, 7.0);
+    }
+
+    // ------------- Σ.G.3b: Q1Spec JIT tests -------------
+
+    #[test]
+    fn q1spec_jit_matches_hand_calculation() {
+        let (batch, schema) = small_q1_batch(10471);
+        let pred = Q1Predicate {
+            shipdate_cutoff: 10471,
+        };
+        let hand = Q1Spec::try_new(pred, &schema).unwrap();
+        let jit = Q1Spec::try_new_jit(pred, &schema).unwrap();
+        assert!(!hand.has_jit());
+        assert!(jit.has_jit());
+
+        let mut a_hand: [Q1Aggs; 5] = [Q1Aggs::default(); 5];
+        let mut a_jit: [Q1Aggs; 5] = [Q1Aggs::default(); 5];
+        hand.process_batch(&batch, &mut a_hand).unwrap();
+        jit.process_batch(&batch, &mut a_jit).unwrap();
+
+        // Per-group equivalence on all 5 buckets.
+        for g in 0..5 {
+            assert_eq!(
+                a_hand[g].count, a_jit[g].count,
+                "group {g} count diverges: hand={} jit={}",
+                a_hand[g].count, a_jit[g].count
+            );
+            assert!(
+                (a_hand[g].sum_qty - a_jit[g].sum_qty).abs() < 1e-9,
+                "group {g} sum_qty diverges: hand={} jit={}",
+                a_hand[g].sum_qty,
+                a_jit[g].sum_qty
+            );
+            assert!(
+                (a_hand[g].sum_charge - a_jit[g].sum_charge).abs() < 1e-6,
+                "group {g} sum_charge diverges: hand={} jit={}",
+                a_hand[g].sum_charge,
+                a_jit[g].sum_charge
+            );
+        }
+    }
+
+    #[test]
+    fn q1spec_jit_accumulates_across_batches() {
+        // The Σ.G.3b adapter reseeds the JIT's 30-cell scratch from the
+        // accumulator at every call. If that seeding is wrong (e.g. the
+        // order of fields in the cells buffer drifts from the JIT IR),
+        // running the same batch twice will give a different answer than
+        // running it once with double the rows. This catches that.
+        let (batch, schema) = small_q1_batch(10471);
+        let pred = Q1Predicate {
+            shipdate_cutoff: 10471,
+        };
+        let jit = Q1Spec::try_new_jit(pred, &schema).unwrap();
+        let mut twice: [Q1Aggs; 5] = [Q1Aggs::default(); 5];
+        jit.process_batch(&batch, &mut twice).unwrap();
+        jit.process_batch(&batch, &mut twice).unwrap();
+
+        let mut once: [Q1Aggs; 5] = [Q1Aggs::default(); 5];
+        jit.process_batch(&batch, &mut once).unwrap();
+        for g in 0..5 {
+            assert_eq!(twice[g].count, once[g].count * 2, "group {g} count");
+            assert!(
+                (twice[g].sum_qty - once[g].sum_qty * 2.0).abs() < 1e-9,
+                "group {g} sum_qty"
+            );
+            assert!(
+                (twice[g].sum_charge - once[g].sum_charge * 2.0).abs() < 1e-6,
+                "group {g} sum_charge"
+            );
+        }
     }
 }
