@@ -41,6 +41,11 @@ pub mod fused_aggregate;
 // `InjectFusedQ{6,1}Rule` family which build it from raw SQL plans
 // (Σ.G.3d retired the intermediate FusedFilterSumExec lift).
 pub mod fused_aggregate_exec;
+// Σ.G.2e-1: `FilterSumSpec` — first runtime-configured `AggregateSpec`
+// impl. JIT-only single-bucket SUM over an AND-chain of (col ⊕ literal)
+// clauses. Substrate for `InjectFilterSumRule` (Σ.G.2e-2), which lifts
+// any SUM-over-Filter SQL into `FusedAggregateExec<FilterSumSpec>`.
+pub mod fused_aggregate_filter_sum;
 // Σ.D2: `FusedFilterMultiAggExec` — single-pass fused filter +
 // multi-aggregate + group-by physical operator. Day-1 prototype
 // (`examples/tpch_q1_tune.rs`) showed 3.08 ms on Q1 SF=1 / 14
