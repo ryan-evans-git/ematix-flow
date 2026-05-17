@@ -37,15 +37,10 @@ pub mod fused;
 pub mod fused_aggregate;
 // Σ.G.2 third slice: the generic operator that the trait was built
 // to enable. Wraps any `AggregateSpec` impl as a DataFusion
-// `ExecutionPlan`. Reachable by direct construction (tests / bench)
-// or via `EnableFusedAggregateExecRule` (Σ.G.2d, `fused_aggregate_rule`).
+// `ExecutionPlan`. Reachable via direct construction or via the
+// `InjectFusedQ{6,1}Rule` family which build it from raw SQL plans
+// (Σ.G.3d retired the intermediate FusedFilterSumExec lift).
 pub mod fused_aggregate_exec;
-// Σ.G.2d: `EnableFusedAggregateExecRule` — `PhysicalOptimizerRule`
-// that swaps hand-coded `FusedFilterSumExec` / `FusedFilterMultiAggExec`
-// instances for the generic `FusedAggregateExec<S>` parameterised by
-// `Q6Spec` / `Q1Spec`. Bench-gated by sigma_g2c_operator_vs_hand at
-// 41 trials × 3 rounds MIN-of-K, within 3 % of the hand operator.
-pub mod fused_aggregate_rule;
 // Σ.D2: `FusedFilterMultiAggExec` — single-pass fused filter +
 // multi-aggregate + group-by physical operator. Day-1 prototype
 // (`examples/tpch_q1_tune.rs`) showed 3.08 ms on Q1 SF=1 / 14
