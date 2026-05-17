@@ -35,10 +35,27 @@ jobs:
   audit-rust:
     name: cargo audit (RustSec advisory DB)
     runs-on: ubuntu-latest
+    # Required branch-protection check — must always run and produce
+    # a status. The actual audit (which installs cargo-audit and
+    # scans the lock file) is gated on whether Rust dep manifests
+    # actually changed in this PR; non-dep-touching PRs get a fast
+    # no-op so the required check stays green without burning ~2 min
+    # of `cargo install` + audit time.
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - name: Detect Cargo manifest changes
+        id: changes
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            deps:
+              - '**/Cargo.toml'
+              - 'Cargo.lock'
+              - '.cargo/audit.toml'
+      - if: steps.changes.outputs.deps == 'true'
+        uses: dtolnay/rust-toolchain@stable
+      - if: steps.changes.outputs.deps == 'true'
+        uses: Swatinem/rust-cache@v2
       # Shell-based cargo audit instead of the `rustsec/audit-check`
       # action — that one tries to post a GitHub Check Run, which
       # needs `checks: write` permission. Granting that to the whole
@@ -48,10 +65,15 @@ jobs:
       # non-zero on any non-ignored vulnerability. `.cargo/audit.toml`
       # lists ignored advisory IDs with rationale. Unmaintained
       # warnings don't fail CI — they're informational.
-      - name: Install cargo-audit
+      - if: steps.changes.outputs.deps == 'true'
+        name: Install cargo-audit
         run: cargo install --locked cargo-audit
-      - name: Run cargo audit
+      - if: steps.changes.outputs.deps == 'true'
+        name: Run cargo audit
         run: cargo audit
+      - if: steps.changes.outputs.deps != 'true'
+        name: Skip — no Cargo manifest changes
+        run: echo "No '**/Cargo.toml', 'Cargo.lock', or audit config changes — skipping audit."
 
   python:
     name: python (ubuntu-latest, py${{ matrix.python }})
@@ -62,7 +84,13 @@ jobs:
         # release.yml's build-linux/build-macos matrices). Keeping
         # ci + release in lockstep prevents accidentally publishing
         # a wheel for a Python the test suite has never run on.
-        python: ["3.11", "3.12", "3.13", "3.14"]
+        #
+        # PR-time matrix narrowed to the two required branch-protection
+        # versions (py3.11 + py3.12). Push to main expands to the full
+        # 3.11→3.14 sweep so a regression on 3.13 / 3.14 still trips
+        # before a release tag is cut. Saves ~50 % Python CI minutes
+        # per PR without weakening the release gate.
+        python: ${{ fromJSON(github.event_name == 'pull_request' && '["3.11","3.12"]' || '["3.11","3.12","3.13","3.14"]') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -130,16 +158,36 @@ jobs:
     # parses SPDX expressions correctly (handles `OR` / `AND` /
     # `WITH`) — a substring grep over `cargo-license` output would
     # mis-classify dual-licensed crates.
+    #
+    # Not a required branch-protection check, so the whole job is
+    # gated on Cargo manifest changes — PRs that don't touch deps
+    # don't run cargo-deny at all (saves ~1 min install + check).
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Install cargo-deny
+      - name: Detect Cargo manifest changes
+        id: changes
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            deps:
+              - '**/Cargo.toml'
+              - 'Cargo.lock'
+              - 'deny.toml'
+      - if: steps.changes.outputs.deps == 'true'
+        uses: dtolnay/rust-toolchain@stable
+      - if: steps.changes.outputs.deps == 'true'
+        uses: Swatinem/rust-cache@v2
+      - if: steps.changes.outputs.deps == 'true'
+        name: Install cargo-deny
         run: cargo install --locked cargo-deny
-      - name: Run cargo deny check licenses
+      - if: steps.changes.outputs.deps == 'true'
+        name: Run cargo deny check licenses
         # `deny.toml` at the repo root lists the forbidden SPDX IDs
         # (GPL/AGPL/SSPL/BUSL/Elastic/Commons-Clause) and the allowed
         # set. Only the `licenses` table is enforced here; the
         # advisories table is covered by the separate `audit-rust`
         # job, and `bans`/`sources` are left at defaults.
         run: cargo deny check licenses
+      - if: steps.changes.outputs.deps != 'true'
+        name: Skip — no Cargo manifest changes
+        run: echo "No '**/Cargo.toml', 'Cargo.lock', or 'deny.toml' changes — skipping license check."

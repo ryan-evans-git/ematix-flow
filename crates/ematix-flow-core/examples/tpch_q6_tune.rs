@@ -434,7 +434,9 @@ async fn main() {
     println!();
     println!("--- Section 5: FusedFilterSumExec (Σ.D1 wrapped operator) ---");
 
-    use ematix_flow_core::fused::{FusedFilterSumExec, Q6Predicate};
+    use ematix_flow_core::fused::Q6Predicate;
+    use ematix_flow_core::fused_aggregate::Q6Spec;
+    use ematix_flow_core::fused_aggregate_exec::FusedAggregateExec;
 
     let predicate = Q6Predicate {
         date_lo,
@@ -449,8 +451,12 @@ async fn main() {
         .await
         .unwrap();
     let child = logical.create_physical_plan().await.unwrap();
+    // Σ.G.3d: tune path now goes through the generic operator. Use
+    // the hand path (no JIT) here so the bench measures the unfused
+    // inner loop rather than Cranelift codegen.
+    let spec = Q6Spec::try_new(predicate, &child.schema()).unwrap();
     let fused: Arc<dyn datafusion::physical_plan::ExecutionPlan> =
-        Arc::new(FusedFilterSumExec::try_new_q6(child, predicate).unwrap());
+        Arc::new(FusedAggregateExec::try_new(child, spec).unwrap());
 
     // Warm-up.
     let task_ctx = ctx.task_ctx();

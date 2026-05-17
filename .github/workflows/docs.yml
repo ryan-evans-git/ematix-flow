@@ -28,6 +28,11 @@ jobs:
     concurrency:
       group: docs-build-${{ github.ref }}
       cancel-in-progress: true
+    # `build` is a required branch-protection check — the job must
+    # always run and produce a status. The actual mkdocs build is
+    # gated on whether docs / config / README files changed in this
+    # PR (per-step `if:` on `steps.changes.outputs.docs`). Push to
+    # main always builds because that path also feeds the deploy.
     steps:
       - uses: actions/checkout@v4
         with:
@@ -36,11 +41,41 @@ jobs:
           # Cheap on this repo's size.
           fetch-depth: 0
 
+      - name: Detect docs / config changes
+        id: changes
+        # On push events (e.g. main), `dorny/paths-filter` falls back
+        # to comparing against the previous commit. We want push-to-
+        # main to always build so it can deploy, so force `docs=true`
+        # for non-PR events.
+        if: github.event_name == 'pull_request'
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            docs:
+              - 'docs/**'
+              - 'mkdocs.yml'
+              - '**/*.md'
+              - '.github/workflows/docs.yml'
+
+      - name: Decide whether to build
+        id: gate
+        run: |
+          if [[ "${{ github.event_name }}" != "pull_request" ]]; then
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          elif [[ "${{ steps.changes.outputs.docs }}" == "true" ]]; then
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "build=false" >> "$GITHUB_OUTPUT"
+            echo "No docs/markdown/config changes — skipping mkdocs build."
+          fi
+
       - uses: actions/setup-python@v5
+        if: steps.gate.outputs.build == 'true'
         with:
           python-version: "3.12"
 
       - uses: astral-sh/setup-uv@v4
+        if: steps.gate.outputs.build == 'true'
         with:
           enable-cache: true
           # No uv.lock in this repo (we don't lock Python deps) —
@@ -49,6 +84,7 @@ jobs:
           cache-dependency-glob: ".github/workflows/docs.yml"
 
       - name: Install mkdocs
+        if: steps.gate.outputs.build == 'true'
         run: |
           uv venv .venv --python 3.12
           echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
@@ -56,10 +92,13 @@ jobs:
           uv pip install mkdocs-material 'mkdocs>=1.6'
 
       - name: Build site
+        if: steps.gate.outputs.build == 'true'
         run: mkdocs build --strict
 
       - name: Upload artifact
-        if: github.event_name != 'pull_request'
+        # Deploy step (in `deploy` job below) consumes this; only
+        # uploaded on push events when build actually ran.
+        if: github.event_name != 'pull_request' && steps.gate.outputs.build == 'true'
         uses: actions/upload-pages-artifact@v3
         with:
           path: site
