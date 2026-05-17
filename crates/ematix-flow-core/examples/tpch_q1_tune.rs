@@ -499,9 +499,11 @@ async fn main() {
     }
     println!();
 
-    println!("--- Section 7: FusedFilterMultiAggExec (Σ.D2 phase-2 wrapped operator) ---");
+    println!("--- Section 7: FusedAggregateExec<Q1Spec> (Σ.G.3 unified operator) ---");
     use datafusion::physical_plan::ExecutionPlan;
-    use ematix_flow_core::fused_multi_agg::{FusedFilterMultiAggExec, Q1Predicate};
+    use ematix_flow_core::fused_aggregate::Q1Spec;
+    use ematix_flow_core::fused_aggregate_exec::FusedAggregateExec;
+    use ematix_flow_core::fused_multi_agg::Q1Predicate;
 
     let logical = ctx_mem
         .sql(
@@ -512,15 +514,11 @@ async fn main() {
         .await
         .unwrap();
     let child = logical.create_physical_plan().await.unwrap();
-    let fused: Arc<dyn ExecutionPlan> = Arc::new(
-        FusedFilterMultiAggExec::try_new_q1(
-            child,
-            Q1Predicate {
-                shipdate_cutoff: cutoff,
-            },
-        )
-        .unwrap(),
-    );
+    let predicate = Q1Predicate {
+        shipdate_cutoff: cutoff,
+    };
+    let spec = Q1Spec::try_new(predicate, &child.schema()).unwrap();
+    let fused: Arc<dyn ExecutionPlan> = Arc::new(FusedAggregateExec::try_new(child, spec).unwrap());
     let task_ctx = ctx_mem.task_ctx();
     // Warm-up.
     let mut s = fused.execute(0, task_ctx.clone()).unwrap();

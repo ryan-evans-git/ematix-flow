@@ -174,6 +174,11 @@ path = "examples/fast_parquet_array_diff.rs"
 name = "tpch_fused_jit_bench"
 path = "examples/tpch_fused_jit_bench.rs"
 
+# Σ.G.2 / Σ.G.3 hand-vs-unified gate benches lived here until Σ.G.3d
+# retired the hand operators they compared against. Their gates passed
+# (4 consecutive runs within ±3 % on each shape); the work survives in
+# the commit history and on the Σ.G.* PR series.
+
 # Phase 3.5: Q14-shape SQL through 3 providers — register_parquet,
 # FastParquetTableProvider, EmatixFastParquetTableProvider with the
 # Phase 3 Date32 predicate pushdown. Measures wall-clock impact of
