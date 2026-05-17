@@ -182,6 +182,12 @@ path = "examples/tpch_fused_jit_bench.rs"
 name = "sigma_g2_q6_unified_vs_hand"
 path = "examples/sigma_g2_q6_unified_vs_hand.rs"
 
+# Σ.G.2 second slice: same perf gate, for the Q1 hot loop. Times
+# `fused_multi_agg::process_q1_batch_hand` against `Q1Spec`.
+[[example]]
+name = "sigma_g2_q1_unified_vs_hand"
+path = "examples/sigma_g2_q1_unified_vs_hand.rs"
+
 # Phase 3.5: Q14-shape SQL through 3 providers — register_parquet,
 # FastParquetTableProvider, EmatixFastParquetTableProvider with the
 # Phase 3 Date32 predicate pushdown. Measures wall-clock impact of
