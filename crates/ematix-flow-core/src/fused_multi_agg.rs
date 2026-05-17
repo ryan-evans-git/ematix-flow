@@ -61,18 +61,23 @@ pub struct Q1Predicate {
 /// Per-group running aggregates. Five SUMs + a row COUNT cover all eight
 /// Q1 output columns — AVG(qty), AVG(price), AVG(disc) are computed from
 /// the sums divided by `count` at finalize time.
+///
+/// `pub` so [`crate::fused_aggregate::Q1Spec`] can carry it as its
+/// `Accumulator` type. The fields stay public for the same reason —
+/// the Σ.G.2 unified path needs to read/write them directly without
+/// paying for accessor calls in the per-batch merge.
 #[derive(Default, Debug, Clone, Copy)]
-struct Q1Aggs {
-    sum_qty: f64,
-    sum_price: f64,
-    sum_disc_price: f64,
-    sum_charge: f64,
-    sum_disc: f64,
-    count: u64,
+pub struct Q1Aggs {
+    pub sum_qty: f64,
+    pub sum_price: f64,
+    pub sum_disc_price: f64,
+    pub sum_charge: f64,
+    pub sum_disc: f64,
+    pub count: u64,
 }
 
 impl Q1Aggs {
-    fn merge(&mut self, other: &Q1Aggs) {
+    pub fn merge(&mut self, other: &Q1Aggs) {
         self.sum_qty += other.sum_qty;
         self.sum_price += other.sum_price;
         self.sum_disc_price += other.sum_disc_price;
@@ -241,7 +246,7 @@ impl ExecutionPlan for FusedFilterMultiAggExec {
         let jit = self.jit.clone();
 
         let in_schema = input.schema();
-        let idx = ColumnIndices {
+        let idx = Q1ColumnIndices {
             rflag: in_schema.index_of("l_returnflag")?,
             lstatus: in_schema.index_of("l_linestatus")?,
             qty: in_schema.index_of("l_quantity")?,
@@ -327,15 +332,18 @@ impl ExecutionPlan for FusedFilterMultiAggExec {
     }
 }
 
+/// Renamed from `ColumnIndices` for Σ.G.2 to avoid name shadowing with
+/// `fused::ColumnIndices` once both are `pub`. Fields stay public so
+/// the bench / Q1Spec can construct one without a builder.
 #[derive(Debug, Clone, Copy)]
-struct ColumnIndices {
-    rflag: usize,
-    lstatus: usize,
-    qty: usize,
-    price: usize,
-    disc: usize,
-    tax: usize,
-    ship: usize,
+pub struct Q1ColumnIndices {
+    pub rflag: usize,
+    pub lstatus: usize,
+    pub qty: usize,
+    pub price: usize,
+    pub disc: usize,
+    pub tax: usize,
+    pub ship: usize,
 }
 
 /// Hardcoded TPC-H Q1 group routing. Index 4 is a junk catch-all so the
@@ -359,7 +367,7 @@ fn q1_group_idx(rflag: u8, lstatus: u8) -> usize {
 /// across batches.
 fn process_q1_batch_jit(
     batch: &RecordBatch,
-    idx: ColumnIndices,
+    idx: Q1ColumnIndices,
     jit: &crate::fused_jit::FusedFilterAggJit,
     cells: &mut [f64; 30],
 ) {
@@ -423,10 +431,15 @@ fn process_q1_batch_jit(
 /// Per-batch fused filter + 5-group multi-aggregate update (hand-coded
 /// Rust). Same semantics as `process_q1_batch_jit` but accumulates
 /// directly into `[Q1Aggs; 5]`.
-fn process_q1_batch_hand(
+/// Exposed `pub` for Σ.G.2 — `fused_aggregate::Q1Spec::process_batch`
+/// delegates here. `#[inline]` matches the hint on the Q1Spec wrapper
+/// so cross-crate inlining is fair on both sides (the perf-gate bench
+/// is in `examples/`, which is its own crate).
+#[inline]
+pub fn process_q1_batch_hand(
     batch: &RecordBatch,
     p: Q1Predicate,
-    idx: ColumnIndices,
+    idx: Q1ColumnIndices,
     groups: &mut [Q1Aggs; 5],
 ) {
     let rflag = batch
@@ -508,7 +521,10 @@ const Q1_OUTPUT_ORDER: [(usize, &str, &str); 4] = [
     (0, "R", "F"),
 ];
 
-fn q1_groups_to_record_batch(schema: SchemaRef, groups: &[Q1Aggs; 5]) -> DfResult<RecordBatch> {
+/// Exposed `pub` for Σ.G.2 — `fused_aggregate::Q1Spec::finalize`
+/// delegates here so the unified-vs-hand bench compares apples to
+/// apples for the build-output path too, not just the hot loop.
+pub fn q1_groups_to_record_batch(schema: SchemaRef, groups: &[Q1Aggs; 5]) -> DfResult<RecordBatch> {
     let mut rflag_b = StringBuilder::with_capacity(4, 4);
     let mut lstatus_b = StringBuilder::with_capacity(4, 4);
     let mut sum_qty_b = Float64Builder::with_capacity(4);
