@@ -39,6 +39,12 @@
 //! - ship `examples/distributed-cluster/` docker-compose with
 //!   N peer pods.
 
+// Phase Z WorkUnit — ephemeral one-shot worker spec (K8s Job, Lambda
+// invocation, or local `flow run-shard` for testing). Distinct from
+// the long-running `DistributedBackend` tonic-worker model below; see
+// docs/DISTRIBUTED_TPCH_BENCHMARK_PLAN.md.
+pub mod work_unit;
+
 use std::sync::Arc;
 
 use async_trait::async_trait;

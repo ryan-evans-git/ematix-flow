@@ -62,6 +62,34 @@ enum Commands {
         #[arg(long, value_name = "SECS", default_value_t = 60)]
         reset_backoff_after_secs: u64,
     },
+    /// Run a single distributed-query shard from a WorkUnit JSON
+    /// spec. Phase Z: one-shot ephemeral worker pattern. Reads the
+    /// spec from a file (`--work-unit-file`) or stdin
+    /// (`--work-unit-stdin`), executes the query against the
+    /// configured input, writes the partial result to the spec's
+    /// output URI, and exits.
+    ///
+    /// Exit codes:
+    ///   0 — success, result written to output URI
+    ///   2 — config error (bad spec, unreachable input)
+    ///   3 — execution error (query failed mid-run)
+    ///   4 — output error (write failed)
+    ///
+    /// Stdout: a single JSON line conforming to
+    /// `ematix_flow_distributed::work_unit::WorkUnitMetrics`.
+    /// Stderr: tracing logs. The coordinator parses stdout cleanly.
+    ///
+    /// Today this is a skeleton — parses + validates + emits the
+    /// metrics envelope but does NOT execute the query. Query
+    /// execution lands in a follow-up commit.
+    RunShard {
+        /// Path to the WorkUnit JSON spec.
+        #[arg(long, value_name = "PATH", conflicts_with = "work_unit_stdin")]
+        work_unit_file: Option<PathBuf>,
+        /// Read the WorkUnit JSON spec from stdin.
+        #[arg(long, conflicts_with = "work_unit_file")]
+        work_unit_stdin: bool,
+    },
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -93,6 +121,83 @@ async fn main() -> ExitCode {
                     ExitCode::from(1)
                 }
             }
+        }
+        Commands::RunShard {
+            work_unit_file,
+            work_unit_stdin,
+        } => run_shard_cmd(work_unit_file.as_deref(), work_unit_stdin).await,
+    }
+}
+
+/// `flow run-shard` entry point. Phase Z ephemeral worker —
+/// parses + validates the WorkUnit, executes the query against
+/// `EmatixFastParquetTableProvider`, writes Arrow IPC to the
+/// output URI, and emits the metrics JSON on stdout.
+async fn run_shard_cmd(file: Option<&std::path::Path>, from_stdin: bool) -> ExitCode {
+    use ematix_flow_cli::run_shard::execute_work_unit;
+    use ematix_flow_distributed::work_unit::WorkUnit;
+    use std::io::Read;
+
+    // ---- Read the WorkUnit JSON ----
+    let raw = match (file, from_stdin) {
+        (Some(p), false) => match std::fs::read_to_string(p) {
+            Ok(s) => s,
+            Err(e) => {
+                error!(error = %e, path = %p.display(), "cannot read work-unit file");
+                return ExitCode::from(2);
+            }
+        },
+        (None, true) => {
+            let mut s = String::new();
+            if let Err(e) = std::io::stdin().read_to_string(&mut s) {
+                error!(error = %e, "cannot read work-unit from stdin");
+                return ExitCode::from(2);
+            }
+            s
+        }
+        _ => {
+            error!("must pass exactly one of --work-unit-file or --work-unit-stdin");
+            return ExitCode::from(2);
+        }
+    };
+
+    // ---- Parse + validate ----
+    let wu: WorkUnit = match serde_json::from_str(&raw) {
+        Ok(wu) => wu,
+        Err(e) => {
+            error!(error = %e, "work-unit JSON parse failed");
+            return ExitCode::from(2);
+        }
+    };
+    if let Err(e) = wu.validate_schema() {
+        error!(reason = %e, "work-unit schema not supported");
+        return ExitCode::from(2);
+    }
+    info!(
+        work_unit_id = wu.id.as_str(),
+        query = ?wu.query,
+        "work-unit parsed; starting execution"
+    );
+
+    // ---- Execute ----
+    let metrics = match execute_work_unit(&wu).await {
+        Ok(m) => m,
+        Err(e) => {
+            let code = e.exit_code();
+            error!(error = %e, exit_code = code, "execute_work_unit failed");
+            return ExitCode::from(code);
+        }
+    };
+
+    // ---- Emit metrics JSON on stdout (one line) ----
+    match serde_json::to_string(&metrics) {
+        Ok(line) => {
+            println!("{}", line);
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            error!(error = %e, "failed to serialise WorkUnitMetrics");
+            ExitCode::from(4)
         }
     }
 }
