@@ -687,3 +687,56 @@ E5.4 once E5.1 closes. Realistic critical path is ~9 weeks.
 
 **Audit complete. Next:** review with user, slot E5.0 sign-off, schedule
 E5.1 + E5.2 in parallel as the first migration bites.
+
+---
+
+## STATUS UPDATE — 2026-05-18: paused
+
+**Current state:** E5.1, E5.1.b/.c/.d, E5.2, E5.3, E5.4.a have shipped. E5.1.e (flip
+streaming reader to default) was attempted in #115 and **reverted** in #117 after
+the 22-query SF=1 bench surfaced 9 regressions (geomean +6.4%). E5.4.b (default-flip)
+and E5.5 (remove parquet-rs from `ematix-flow-core` Cargo manifest) are blocked.
+
+**Why paused:** the 22-query bench is the gate for any default-flip, and the gap
+isn't a single root cause. Findings so far:
+
+1. **Σ.E5.2 diagnostic (PR #118):** codec parity holds (ematix-parquet 7.08 ms vs
+   parquet-rs 6.42 ms on Q1 lineitem decode). The Q1 regression is caused by
+   downstream `StringView` emission on dict-encoded columns, not codec time.
+2. **Σ.G.2f.4 (PR #119):** closes part of the Utf8View Q1 gap at the operator
+   layer (1.34× on the spec hot loop). Doesn't fix the reader's emission shape;
+   the dict-promotion work is the real fix.
+3. **Σ.E5.4.b dict auto-promotion (WIP on `feat/emat-dict-default`, stashed):**
+   promotion criterion needs to detect dict-fallback-prone columns
+   (`o_comment`, `l_comment`) via `encoding_stats()` to avoid the 6 errors
+   surfaced in the 22-query bench. Not finished.
+
+**Resumption gate (one criterion):** 22-query SF=1 bench geomean ≤ 1.02 on
+`EmatixFastParquet` vs `FastParquet`, with zero query errors. Until that holds,
+E5.4.b / E5.5 do not ship.
+
+**Resumption order (when the gate clears):**
+
+1. Finish auto-promotion fix on `feat/emat-dict-default` (task #497) — use
+   `encoding_stats()` per page to skip columns with PLAIN data pages (dict
+   fallback). Long-term: push the fix upstream into ematix-parquet so
+   `read_column_byte_array_dict_preserved` handles fallback transparently.
+2. Re-run the 22-query bench; require geomean ≤ 1.02 + zero errors.
+3. Σ.E5.4.b: flip default in `register_dict_aware_parquet`.
+4. Σ.E5.5: remove direct `parquet = { workspace = true }` from
+   `crates/ematix-flow-core/Cargo.toml`. (DataFusion's transitive dep stays.)
+
+**Out of scope while paused:** `objectstore_backend.rs` parquet-rs usage
+(async write side; capability gap upstream). Defer until ematix-parquet
+ships an async writer (Π.10+).
+
+**Closed PRs from this arc (don't revive):**
+- #110 Σ.E5.2 Q1 diagnostic — superseded by #118
+- #114 Σ.E5.3 metadata + fixtures — broken metadata migration; will re-do
+  from scratch if resumed
+- #115 Σ.E5.1.e default-flip — reverted by #117 (bench regressions)
+
+**Related memory notes:**
+- `project_sigma_e3_progress.md`
+- `project_dict_arrival_blocker.md`
+- `project_emat_dict_preserved_upstream.md`
