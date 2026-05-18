@@ -274,12 +274,19 @@ impl EmatixFastParquetTableProvider {
             num_rows,
             late_mat: true,
             dict_preservation: false,
-            // Σ.E5.1.e: default ON. The streaming reader meets the
-            // Σ.E5.2 ±5% gate on both Utf8View (+4.9%, #113) and
-            // Dictionary (−31.7% vs bridge, #112) paths; making it
-            // the default removes the opt-in step for users. Bridge
-            // still available via .with_streaming_arrow_reader(false).
-            streaming_arrow_reader: true,
+            // Reverted from the Σ.E5.1.e default-flip (#115). The
+            // 22-query parity bench (Σ.E5.4.a, #116) shipped after
+            // the flip and surfaced:
+            //   - 9 of 22 TPC-H queries regress > 5% on streaming
+            //     (worst Q01 +112%, Q12 +77%, Q19 +65%; geomean 1.064
+            //     vs the audit's target ≤ 1.02)
+            //   - Q15 returns wrong row count (0 vs 1) — correctness.
+            // The Σ.E5.1.e gate was Q1 SQL-only — too narrow. Default
+            // returns to the bridge path until the 22-query bench is
+            // green per docs/PHASE_SIGMA_E5_4_22_PARITY_FINDINGS.md.
+            // Streaming reader still available via
+            // .with_streaming_arrow_reader(true) for opt-in callers.
+            streaming_arrow_reader: false,
         })
     }
 
