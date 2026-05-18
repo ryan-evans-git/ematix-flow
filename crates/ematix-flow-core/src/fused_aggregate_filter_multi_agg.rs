@@ -327,6 +327,13 @@ impl AggregateSpec for FilterMultiAggSpec {
             }
             return self.process_batch_dict_single(batch, acc);
         }
+        // Σ.G.2f.4 — Q1 SQL shape (two Utf8View first-byte keys).
+        if self.group_keys.len() == 2
+            && matches!(self.group_keys[0].kind, GroupKeyKind::Utf8ViewFirstByte)
+            && matches!(self.group_keys[1].kind, GroupKeyKind::Utf8ViewFirstByte)
+        {
+            return self.process_batch_two_key_utf8view(batch, acc);
+        }
         self.process_batch_generic(batch, acc)
     }
 
@@ -572,6 +579,23 @@ impl<'a> GroupKeyAccessor<'a> {
                         )
                     })?;
                 Ok(GroupKeyAccessor::DictU32Utf8(dict, values))
+            }
+        }
+    }
+
+    /// First byte of this column at row `row`. Defined for
+    /// `Utf8ViewFirstByte`-shaped accessors (Utf8View / BinaryView)
+    /// only — callers that have a `DictU32Utf8` accessor must use
+    /// `append_key_bytes` instead. Panics on the dict variant in debug
+    /// builds; returns 0 in release builds for safety.
+    #[inline(always)]
+    fn first_byte_at(&self, row: usize) -> u8 {
+        match self {
+            GroupKeyAccessor::Utf8View(s) => s.value(row).as_bytes().first().copied().unwrap_or(0),
+            GroupKeyAccessor::BinaryView(b) => b.value(row).first().copied().unwrap_or(0),
+            GroupKeyAccessor::DictU32Utf8(_, _) => {
+                debug_assert!(false, "first_byte_at called on DictU32Utf8 accessor");
+                0
             }
         }
     }
@@ -985,6 +1009,88 @@ impl FilterMultiAggSpec {
             }
         }
 
+        Ok(())
+    }
+
+    /// Σ.G.2f.4 — specialized template for the two-Utf8View-first-byte
+    /// group-key shape (Q1 SQL when strings arrive as `Utf8View`).
+    /// Packs the two first bytes into a single `u16` and uses a per-
+    /// batch local index (`HashMap<u16, usize>`) to amortise the global
+    /// HashMap probe to one per distinct pair (≈ 4 for TPC-H Q1)
+    /// rather than per row. The fold writes the same 2-byte packed key
+    /// shape `append_key_bytes` would produce, so `finalize` is path-
+    /// independent.
+    pub(crate) fn process_batch_two_key_utf8view(
+        &self,
+        batch: &RecordBatch,
+        acc: &mut FilterMultiAggAccumulator,
+    ) -> DfResult<()> {
+        debug_assert_eq!(self.group_keys.len(), 2);
+        debug_assert!(matches!(
+            self.group_keys[0].kind,
+            GroupKeyKind::Utf8ViewFirstByte
+        ));
+        debug_assert!(matches!(
+            self.group_keys[1].kind,
+            GroupKeyKind::Utf8ViewFirstByte
+        ));
+
+        let n_rows = batch.num_rows();
+        if n_rows == 0 {
+            return Ok(());
+        }
+
+        let typed_cols = self.build_typed_cols(batch)?;
+
+        if acc.dict_values.len() < 2 {
+            acc.dict_values.resize(2, HashMap::new());
+        }
+
+        let col0 = batch.column(self.group_keys[0].col_idx);
+        let col1 = batch.column(self.group_keys[1].col_idx);
+        let acc0 = GroupKeyAccessor::new(GroupKeyKind::Utf8ViewFirstByte, col0.as_ref())?;
+        let acc1 = GroupKeyAccessor::new(GroupKeyKind::Utf8ViewFirstByte, col1.as_ref())?;
+
+        let mut packed_to_local: HashMap<u16, usize> = HashMap::new();
+        let mut local_cells: Vec<AggCells> = Vec::new();
+        let mut local_packed: Vec<u16> = Vec::new();
+
+        for row in 0..n_rows {
+            if !self.eval_predicate_typed(&typed_cols, row) {
+                continue;
+            }
+            let b0 = acc0.first_byte_at(row);
+            let b1 = acc1.first_byte_at(row);
+            let packed: u16 = ((b0 as u16) << 8) | (b1 as u16);
+            let local_idx = match packed_to_local.entry(packed) {
+                std::collections::hash_map::Entry::Occupied(e) => *e.get(),
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    let idx = local_cells.len();
+                    local_cells.push(fresh_cells(&self.aggregates));
+                    local_packed.push(packed);
+                    *e.insert(idx)
+                }
+            };
+            let cells = &mut local_cells[local_idx];
+            for (ai, agg) in self.aggregates.iter().enumerate() {
+                cells[ai] =
+                    self.combine_cell(agg, cells[ai], self.eval_agg_typed(agg, &typed_cols, row));
+            }
+        }
+
+        for (idx, packed) in local_packed.iter().enumerate() {
+            let b0 = (*packed >> 8) as u8;
+            let b1 = (*packed & 0xff) as u8;
+            let key_buf = vec![b0, b1];
+            let entry = acc
+                .groups
+                .entry(key_buf)
+                .or_insert_with(|| fresh_cells(&self.aggregates));
+            let local = std::mem::take(&mut local_cells[idx]);
+            for (i, v) in local.into_iter().enumerate() {
+                entry[i] = self.combine_cell(&self.aggregates[i], entry[i], v);
+            }
+        }
         Ok(())
     }
 
@@ -1696,6 +1802,176 @@ mod tests {
         for i in 0..counts_t.len() {
             assert_eq!(counts_t.value(i), counts_g.value(i));
         }
+    }
+
+    /// Σ.G.2f.4 — Utf8ViewTwoKeyU16 template equivalence with the
+    /// generic path on the Q1 shape (two Utf8View first-byte keys).
+    #[test]
+    fn two_key_utf8view_template_matches_generic() {
+        let spec = q1_spec();
+        // 8 rows covering 4 distinct (rflag, lstatus) pairs; one row
+        // filtered out by shipdate.
+        let batch = synthetic_batch(
+            &["A", "N", "N", "R", "A", "R", "N", "A"],
+            &["F", "F", "O", "F", "F", "F", "O", "F"],
+            &[10.0, 5.0, 7.0, 3.0, 2.0, 4.0, 8.0, 1.5],
+            &[100.0, 50.0, 70.0, 30.0, 20.0, 40.0, 80.0, 15.0],
+            &[0.1, 0.05, 0.0, 0.2, 0.1, 0.0, 0.05, 0.15],
+            &[0.05, 0.05, 0.0, 0.1, 0.05, 0.0, 0.0, 0.07],
+            &[9000, 9500, 8000, 9999, 9100, 8200, 8900, 99999],
+        );
+
+        let mut acc_template = FilterMultiAggAccumulator::default();
+        spec.process_batch_two_key_utf8view(&batch, &mut acc_template)
+            .unwrap();
+        let out_template = spec.finalize(acc_template).unwrap();
+
+        let mut acc_generic = FilterMultiAggAccumulator::default();
+        spec.process_batch_generic(&batch, &mut acc_generic)
+            .unwrap();
+        let out_generic = spec.finalize(acc_generic).unwrap();
+
+        assert_eq!(out_template.num_rows(), out_generic.num_rows());
+        assert_eq!(out_template.num_columns(), out_generic.num_columns());
+        let key0_t = out_template
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let key0_g = out_generic
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let key1_t = out_template
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let key1_g = out_generic
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        for i in 0..out_template.num_rows() {
+            assert_eq!(key0_t.value(i), key0_g.value(i), "key0 row {i}");
+            assert_eq!(key1_t.value(i), key1_g.value(i), "key1 row {i}");
+        }
+        for col_idx in 2..6 {
+            let l = out_template
+                .column(col_idx)
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .unwrap();
+            let r = out_generic
+                .column(col_idx)
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .unwrap();
+            for row in 0..l.len() {
+                assert!(
+                    (l.value(row) - r.value(row)).abs() < 1e-9,
+                    "col {col_idx} row {row}: template {} != generic {}",
+                    l.value(row),
+                    r.value(row)
+                );
+            }
+        }
+        let counts_t = out_template
+            .column(6)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let counts_g = out_generic
+            .column(6)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        for i in 0..counts_t.len() {
+            assert_eq!(counts_t.value(i), counts_g.value(i));
+        }
+    }
+
+    /// Σ.G.2f.4 — merge across batches still produces the same totals
+    /// when the per-batch path is the new template (exercises the
+    /// 2-byte packed-key fold into the global accumulator).
+    #[test]
+    fn two_key_utf8view_merge_matches_generic() {
+        let spec = q1_spec();
+        let b1 = synthetic_batch(
+            &["A", "N", "N", "R"],
+            &["F", "F", "O", "F"],
+            &[10.0, 5.0, 7.0, 3.0],
+            &[100.0, 50.0, 70.0, 30.0],
+            &[0.0, 0.0, 0.0, 0.0],
+            &[0.0, 0.0, 0.0, 0.0],
+            &[1, 1, 1, 1],
+        );
+        let b2 = synthetic_batch(
+            &["A", "N", "R", "N"],
+            &["F", "F", "F", "O"],
+            &[2.0, 6.0, 4.0, 9.0],
+            &[20.0, 60.0, 40.0, 90.0],
+            &[0.0, 0.0, 0.0, 0.0],
+            &[0.0, 0.0, 0.0, 0.0],
+            &[1, 1, 1, 1],
+        );
+
+        let mut acc_t1 = FilterMultiAggAccumulator::default();
+        let mut acc_t2 = FilterMultiAggAccumulator::default();
+        spec.process_batch_two_key_utf8view(&b1, &mut acc_t1)
+            .unwrap();
+        spec.process_batch_two_key_utf8view(&b2, &mut acc_t2)
+            .unwrap();
+        let merged_t = spec.merge(acc_t1, acc_t2);
+        let out_t = spec.finalize(merged_t).unwrap();
+
+        let mut acc_g1 = FilterMultiAggAccumulator::default();
+        let mut acc_g2 = FilterMultiAggAccumulator::default();
+        spec.process_batch_generic(&b1, &mut acc_g1).unwrap();
+        spec.process_batch_generic(&b2, &mut acc_g2).unwrap();
+        let merged_g = spec.merge(acc_g1, acc_g2);
+        let out_g = spec.finalize(merged_g).unwrap();
+
+        assert_eq!(out_t.num_rows(), out_g.num_rows());
+        let sum_t = out_t
+            .column(2)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        let sum_g = out_g
+            .column(2)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        for i in 0..sum_t.len() {
+            assert!((sum_t.value(i) - sum_g.value(i)).abs() < 1e-9);
+        }
+    }
+
+    /// Σ.G.2f.4 — confirms `process_batch` dispatches into the new
+    /// template when the spec has two Utf8ViewFirstByte keys (i.e.
+    /// the existing Q1 fixture).
+    #[test]
+    fn dispatch_routes_two_key_utf8view() {
+        let spec = q1_spec();
+        let batch = synthetic_batch(
+            &["A", "N", "R"],
+            &["F", "O", "F"],
+            &[1.0, 2.0, 3.0],
+            &[10.0, 20.0, 30.0],
+            &[0.0, 0.0, 0.0],
+            &[0.0, 0.0, 0.0],
+            &[1, 1, 1],
+        );
+        let mut acc = FilterMultiAggAccumulator::default();
+        spec.process_batch(&batch, &mut acc).unwrap();
+        let out = spec.finalize(acc).unwrap();
+        assert_eq!(out.num_rows(), 3);
+        let counts = out.column(6).as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(counts.value(0), 1);
+        assert_eq!(counts.value(1), 1);
+        assert_eq!(counts.value(2), 1);
     }
 
     /// Confirms `process_batch` actually dispatches into the dict-
