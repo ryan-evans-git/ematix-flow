@@ -46,6 +46,11 @@ pub mod fused_aggregate_exec;
 // clauses. Substrate for `InjectFilterSumRule` (Σ.G.2e-2), which lifts
 // any SUM-over-Filter SQL into `FusedAggregateExec<FilterSumSpec>`.
 pub mod fused_aggregate_filter_sum;
+// Σ.G.2e-2: `InjectFilterSumRule` — SQL-pattern matcher that
+// constructs `FusedAggregateExec<FilterSumSpec>` from a SUM-over-Filter
+// plan shape. First slice recognises the canonical Q6 shape; future
+// slices broaden the matcher to arbitrary column sets.
+pub mod fused_aggregate_filter_sum_rule;
 // Σ.D2: `FusedFilterMultiAggExec` — single-pass fused filter +
 // multi-aggregate + group-by physical operator. Day-1 prototype
 // (`examples/tpch_q1_tune.rs`) showed 3.08 ms on Q1 SF=1 / 14

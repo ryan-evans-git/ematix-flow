@@ -254,7 +254,7 @@ fn scan_has_required_q6_columns(schema: &datafusion::arrow::datatypes::SchemaRef
 
 /// Matches a `SUM(l_extendedprice * l_discount)` aggregate expression,
 /// regardless of the partial/final mode wrapping.
-fn is_sum_extprice_times_discount(
+pub(crate) fn is_sum_extprice_times_discount(
     agg: &Arc<datafusion::physical_expr::aggregate::AggregateFunctionExpr>,
 ) -> bool {
     if !agg.fun().name().eq_ignore_ascii_case("sum") {
@@ -291,7 +291,7 @@ fn is_sum_extprice_times_discount(
 ///
 /// Anything else makes us return `None` — the rule then leaves the
 /// plan unchanged, and DataFusion runs its normal Filter+Aggregate.
-fn extract_q6_predicate(expr: &Arc<dyn PhysicalExpr>) -> Option<Q6Predicate> {
+pub(crate) fn extract_q6_predicate(expr: &Arc<dyn PhysicalExpr>) -> Option<Q6Predicate> {
     let mut leaves: Vec<&Arc<dyn PhysicalExpr>> = Vec::new();
     flatten_and(expr, &mut leaves);
 
@@ -479,7 +479,7 @@ pub struct MatchedAggregateShape {
 /// described by `cfg`. Returns `Ok(Some(MatchedAggregateShape))` on
 /// match, `Ok(None)` if any step diverges from `cfg`. Never errors
 /// except on internal-invariant violations (children missing).
-fn match_aggregate_query_shape(
+pub(crate) fn match_aggregate_query_shape(
     node: &Arc<dyn ExecutionPlan>,
     cfg: &AggregateShapeConfig,
 ) -> DfResult<Option<MatchedAggregateShape>> {
