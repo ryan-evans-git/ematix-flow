@@ -241,20 +241,51 @@ impl EmatixFastParquetTableProvider {
                 format!("EmatixFastParquetTableProvider: load metadata: {e}").into(),
             )
         })?;
-        let schema = meta.schema().clone();
+        // Σ.E5 (2026-05-18): promote Utf8 → Utf8View at `try_new` time.
+        // The streaming reader path emits `StringViewArray`, and that's
+        // the default since Σ.E5.4.b. Previously this promotion only
+        // ran inside `with_streaming_arrow_reader(true)` (the builder),
+        // so default users got streaming=true with a Utf8 schema — the
+        // reader's dispatch fell to the StringArray branch and skipped
+        // the Σ.E5.1.d fast path entirely. That accounted for the Q1
+        // regression in the 22-query bench (which uses bare `try_new`
+        // — no builder calls). `with_streaming_arrow_reader(false)`
+        // reverts the promotion for the bridge path. Dict preservation
+        // composes via its own Utf8→Dictionary rewrite.
+        let raw_schema = meta.schema().clone();
+        let promoted_fields: Vec<Arc<arrow_schema::Field>> = raw_schema
+            .fields()
+            .iter()
+            .map(|f| {
+                if matches!(f.data_type(), DataType::Utf8) {
+                    Arc::new(
+                        arrow_schema::Field::new(f.name(), DataType::Utf8View, f.is_nullable())
+                            .with_metadata(f.metadata().clone()),
+                    )
+                } else {
+                    f.clone()
+                }
+            })
+            .collect();
+        let schema: SchemaRef =
+            Arc::new(Schema::new_with_metadata(promoted_fields, raw_schema.metadata().clone()));
 
         // Validate: every column must be one of the types the bridge
         // can decode. Anything else, defer to FastParquetTableProvider.
+        // `Utf8View` joins the list because of the Σ.E5 default
+        // schema promotion above; the streaming reader's dispatch
+        // routes it to `decode_byte_array_to_string_view`.
         for field in schema.fields() {
             match field.data_type() {
                 DataType::Int32
                 | DataType::Int64
                 | DataType::Float64
                 | DataType::Date32
-                | DataType::Utf8 => {}
+                | DataType::Utf8
+                | DataType::Utf8View => {}
                 other => {
                     return Err(DataFusionError::NotImplemented(format!(
-                        "EmatixFastParquetTableProvider: column `{}` has type {other:?}; bridge supports Int32/Int64/Float64/Date32/Utf8 only — use FastParquetTableProvider",
+                        "EmatixFastParquetTableProvider: column `{}` has type {other:?}; bridge supports Int32/Int64/Float64/Date32/Utf8/Utf8View only — use FastParquetTableProvider",
                         field.name()
                     )));
                 }
@@ -333,12 +364,15 @@ impl EmatixFastParquetTableProvider {
             // Rewrite Utf8 fields → Dictionary(UInt32, Utf8). Other
             // types pass through. Field metadata + nullability
             // preserved.
+            // Σ.E5 follow-up: `try_new` now auto-promotes Utf8 → Utf8View
+            // for the streaming reader default, so dict preservation has
+            // to recognise both shapes when rewriting to Dictionary.
             let fields = self
                 .schema
                 .fields()
                 .iter()
                 .map(|f| {
-                    if matches!(f.data_type(), DataType::Utf8) {
+                    if matches!(f.data_type(), DataType::Utf8 | DataType::Utf8View) {
                         Arc::new(arrow_schema::Field::new(
                             f.name(),
                             DataType::Dictionary(
@@ -1330,12 +1364,16 @@ mod tests {
         rg.close().unwrap();
         writer.close().unwrap();
 
-        // Off → schema is Utf8, batches are StringArray.
+        // Default (no with_dict_preservation): Σ.E5 auto-promotion now
+        // rewrites Utf8 → Utf8View at try_new for the streaming-reader
+        // default. With dict preservation off, the column reports
+        // Utf8View (was Utf8 before the Σ.E5 promotion fix); batches
+        // emit StringViewArray.
         let prov_off =
             EmatixFastParquetTableProvider::try_new(path.to_string_lossy().to_string()).unwrap();
         assert!(matches!(
             prov_off.schema().field(0).data_type(),
-            DataType::Utf8
+            DataType::Utf8View
         ));
 
         // On → schema is Dictionary(UInt32, Utf8), batches are
