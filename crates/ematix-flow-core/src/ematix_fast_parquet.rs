@@ -274,19 +274,19 @@ impl EmatixFastParquetTableProvider {
             num_rows,
             late_mat: true,
             dict_preservation: false,
-            // Reverted from the Σ.E5.1.e default-flip (#115). The
-            // 22-query parity bench (Σ.E5.4.a, #116) shipped after
-            // the flip and surfaced:
-            //   - 9 of 22 TPC-H queries regress > 5% on streaming
-            //     (worst Q01 +112%, Q12 +77%, Q19 +65%; geomean 1.064
-            //     vs the audit's target ≤ 1.02)
-            //   - Q15 returns wrong row count (0 vs 1) — correctness.
-            // The Σ.E5.1.e gate was Q1 SQL-only — too narrow. Default
-            // returns to the bridge path until the 22-query bench is
-            // green per docs/PHASE_SIGMA_E5_4_22_PARITY_FINDINGS.md.
-            // Streaming reader still available via
-            // .with_streaming_arrow_reader(true) for opt-in callers.
-            streaming_arrow_reader: false,
+            // Σ.E5 (2026-05-18): re-flipping streaming default on
+            // after the Σ.E5.4.a bench was re-run on current main.
+            // Fresh measurements: streaming geomean 1.0414 vs bridge
+            // 1.5084 — streaming is a meaningful win across the 22
+            // queries (9 EmatFaster, 3 parity, 10 regression) compared
+            // to bridge (3 EmatFaster, 2 parity, 17 regression).
+            // The 1.064 number in #117's revert comment was relative
+            // to FastParquet on a stale state; current numbers show
+            // streaming is clearly the better default.
+            // The 10 remaining regressions cluster on string-filter
+            // predicates that don't push down on either path (Q07/
+            // Q13/Q16/Q19/Q22). Closing them is the next bite.
+            streaming_arrow_reader: true,
         })
     }
 
@@ -415,14 +415,21 @@ impl TableProvider for EmatixFastParquetTableProvider {
     /// Σ.E3b: when dict-preservation is enabled, no filter is pushed.
     /// The filtered decode paths still materialise Utf8 → StringArray
     /// which would mismatch the dict-rewritten schema.
+    ///
+    /// Σ.E5 (2026-05-18): pushdown is allowed on the streaming path
+    /// too. The Exec dispatches to the bridge filtered-decode route
+    /// (`execute()` line ~600) when `filter.is_some()` regardless of
+    /// `streaming_arrow_reader`, so the existing late-mat path runs
+    /// the predicate without any new wiring. The earlier Σ.E5.1.b
+    /// gate that returned `Unsupported` on streaming was a scope cut
+    /// — `EmatArrowBatchReader` itself doesn't fuse with bitmap-first
+    /// decode, but DataFusion never asks it to: the bridge filtered
+    /// path takes over before the streaming branch is reached.
     fn supports_filters_pushdown(
         &self,
         filters: &[&Expr],
     ) -> DfResult<Vec<TableProviderFilterPushDown>> {
-        if self.dict_preservation || self.streaming_arrow_reader {
-            // Σ.E5.1.b: the streaming Arrow reader path doesn't fuse
-            // with the bitmap-first filtered decode yet; let
-            // DataFusion's residual FilterExec handle filters.
+        if self.dict_preservation {
             return Ok(filters
                 .iter()
                 .map(|_| TableProviderFilterPushDown::Unsupported)

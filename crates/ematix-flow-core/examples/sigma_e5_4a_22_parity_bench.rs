@@ -296,10 +296,9 @@ async fn build_ctx(
                 ctx.register_table(*t, Arc::new(prov))?;
             }
             Provider::EmatixFastParquet => {
-                // Default knobs — late-mat ON (per PR #115 the
-                // streaming reader is also the default). Mirror what
-                // a downstream user gets out of the box: no manual
-                // `with_dict_preservation` or other tweaks.
+                // Σ.E5 (2026-05-18): the streaming reader is the
+                // default again. Mirrors what a downstream user gets
+                // from `try_new` out of the box.
                 let prov = EmatixFastParquetTableProvider::try_new(path)?;
                 ctx.register_table(*t, Arc::new(prov))?;
             }
