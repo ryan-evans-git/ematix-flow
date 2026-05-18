@@ -12,11 +12,15 @@
 //!   hash-grouped fallback over the same input. Measures the cost of
 //!   "no data-specific baking" with `Utf8ViewFirstByte` group keys.
 //!
-//! * **FilterMultiAggSpec dict-single / Dictionary** — Σ.G.2f.2's
-//!   first template. Lineitem arrives via the preset
+//! * **FilterMultiAggSpec template dispatch / Dictionary** — Σ.G.2f.2's
+//!   per-batch template dispatch. Lineitem arrives via the preset
 //!   `register_dict_aware_parquet`, so the same string columns come
-//!   in as `Dictionary(UInt32, Utf8)`; the dict-vector inner loop
-//!   amortises HashMap probes per dict code rather than per row.
+//!   in as `Dictionary(UInt32, Utf8)`. For Q1's low-cardinality
+//!   returnflag dict (≤ `PERFECT_HASH_DICT_CARDINALITY_THRESHOLD`),
+//!   dispatch routes into `process_batch_perfect_hash_dict` — a flat
+//!   `Vec<f64>` indexed directly by dict code, no HashMap in the hot
+//!   loop. For larger dicts the per-batch slot-table `dict_single`
+//!   template handles it.
 //!
 //! The gate question: does the template path (row 3) reach the
 //! hand-baked baseline (row 1) within bench noise? If yes, the
@@ -298,10 +302,13 @@ async fn main() {
         &multi_utf8,
     );
 
-    // Path C: FilterMultiAggSpec dict-single on Dictionary.
+    // Path C: FilterMultiAggSpec template dispatch on Dictionary.
+    // For Q1's 3-distinct-returnflag dict this routes to the
+    // PerfectHashAggregate template (cardinality well under the
+    // threshold).
     let multi_dict = q1_filter_multi_spec(&dict_batches[0].schema(), GroupKeyKind::DictionaryU32);
     let multi_dict_ms = bench_spec(
-        "FilterMultiAggSpec dict-single / Dictionary",
+        "FilterMultiAggSpec template dispatch / Dictionary",
         &dict_batches,
         &multi_dict,
     );
@@ -309,14 +316,14 @@ async fn main() {
     let pct_dict = 100.0 * (multi_dict_ms - q1) / q1;
     let pct_gen = 100.0 * (multi_utf8_ms - q1) / q1;
     println!();
-    println!("  dict-single vs Q1Spec:  {multi_dict_ms:.2} ms vs {q1:.2} ms  ({pct_dict:+.1}%)");
-    println!("  generic     vs Q1Spec:  {multi_utf8_ms:.2} ms vs {q1:.2} ms  ({pct_gen:+.1}%)");
+    println!("  template (PH) vs Q1Spec:  {multi_dict_ms:.2} ms vs {q1:.2} ms  ({pct_dict:+.1}%)");
+    println!("  generic       vs Q1Spec:  {multi_utf8_ms:.2} ms vs {q1:.2} ms  ({pct_gen:+.1}%)");
     println!();
     if pct_dict.abs() < 5.0 {
-        println!("  ✓ dict-single ≈ Q1Spec (±5%) — gate PASSES; Σ.G.2f.3 deletion justified.");
+        println!("  ✓ template ≈ Q1Spec (±5%) — gate PASSES; Σ.G.2f.3 deletion justified.");
     } else if pct_dict < 0.0 {
-        println!("  ✓✓ dict-single beats Q1Spec — gate PASSES outright.");
+        println!("  ✓✓ template beats Q1Spec — gate PASSES outright.");
     } else {
-        println!("  ✗ dict-single regresses vs Q1Spec — investigate before .3 deletion.");
+        println!("  ✗ template regresses vs Q1Spec — investigate before .3 deletion.");
     }
 }

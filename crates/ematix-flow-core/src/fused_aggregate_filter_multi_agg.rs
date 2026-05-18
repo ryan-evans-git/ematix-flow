@@ -287,14 +287,29 @@ impl AggregateSpec for FilterMultiAggSpec {
         // Rust function monomorphised at compile time — Photon-style
         // template cookbook, no Cranelift, no runtime IR.
         //
-        // Current templates:
-        //   * dict-single: exactly one `DictionaryU32` group key. The
-        //     hot loop avoids the composite-key buffer + global
-        //     HashMap probe per row; DuckDB PR #15152 style.
+        // Current templates (in priority order):
+        //   * perfect-hash: one `DictionaryU32` group key with bounded
+        //     cardinality. Hot loop indexes a flat `Vec<f64>` directly
+        //     by dict code — no HashMap at all. DuckDB
+        //     `PerfectHashAggregate` style; matches Q1Spec's
+        //     branchless arm-match dispatch shape in pure Rust.
+        //   * dict-single: one `DictionaryU32` group key, any
+        //     cardinality. Per-batch slot table amortises the global
+        //     HashMap probe to one per unique code rather than per
+        //     row; DuckDB PR #15152 style.
         //   * generic: any shape.
         if self.group_keys.len() == 1
             && matches!(self.group_keys[0].kind, GroupKeyKind::DictionaryU32)
         {
+            if let Some(dict) = batch
+                .column(self.group_keys[0].col_idx)
+                .as_any()
+                .downcast_ref::<DictionaryArray<UInt32Type>>()
+            {
+                if dict.values().len() <= PERFECT_HASH_DICT_CARDINALITY_THRESHOLD {
+                    return self.process_batch_perfect_hash_dict(batch, acc);
+                }
+            }
             return self.process_batch_dict_single(batch, acc);
         }
         self.process_batch_generic(batch, acc)
@@ -635,10 +650,18 @@ impl<'a> TypedCol<'a> {
     }
 }
 
-// Per-batch templates. Σ.G.2f.2 lands the first two: a generic hash-
-// grouped fallback and a dict-single specialization. Future templates
-// (Utf8View first-byte 1-key, 2-key composites, PerfectHashAggregate
-// for bounded-cardinality dicts) plug in via the same dispatch site.
+/// Dict cardinality threshold for the PerfectHashAggregate template.
+/// Per-batch cell storage is `cardinality * n_aggs * 8 B`; at
+/// `n_aggs = 5` and `cardinality = 4096` this is 160 KB — fits in
+/// L2 on every realistic target. Beyond this the dispatch falls back
+/// to `dict_single`, which allocates a HashMap sized to actually
+/// observed codes rather than the full dict cardinality.
+pub(crate) const PERFECT_HASH_DICT_CARDINALITY_THRESHOLD: usize = 4096;
+
+// Per-batch templates. Σ.G.2f.2 lands three: a generic hash-grouped
+// fallback, a dict-single specialization, and a PerfectHashAggregate
+// for bounded-cardinality dicts. Future templates (Utf8View first-
+// byte 1-key, 2-key composites) plug in via the same dispatch site.
 
 impl FilterMultiAggSpec {
     /// Generic shape: any number of group keys, any kind, any aggs.
@@ -799,6 +822,116 @@ impl FilterMultiAggSpec {
             let local = std::mem::take(&mut local_cells[idx]);
             for (i, v) in local.into_iter().enumerate() {
                 entry[i] += v;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// PerfectHashAggregate template — fires for one `DictionaryU32`
+    /// group key with bounded cardinality (≤
+    /// [`PERFECT_HASH_DICT_CARDINALITY_THRESHOLD`]). The hot loop has
+    /// **no HashMap probe at all**: cell storage is a flat
+    /// `Vec<f64>` of length `cardinality * n_aggs`, indexed directly
+    /// by dict code. This matches Q1Spec's branchless 5-arm baked
+    /// match shape in pure Rust — DuckDB's `PerfectHashAggregate`
+    /// pattern.
+    ///
+    /// Cardinality threshold guards memory: TPC-H grouping columns
+    /// have 2–7 distinct values; the threshold accommodates 4096
+    /// codes (40-160 KB per batch at 5–20 aggs, fits in L1/L2). Above
+    /// the threshold the dispatch falls back to `dict_single`.
+    pub(crate) fn process_batch_perfect_hash_dict(
+        &self,
+        batch: &RecordBatch,
+        acc: &mut FilterMultiAggAccumulator,
+    ) -> DfResult<()> {
+        debug_assert_eq!(self.group_keys.len(), 1);
+        debug_assert!(matches!(
+            self.group_keys[0].kind,
+            GroupKeyKind::DictionaryU32
+        ));
+
+        let n_rows = batch.num_rows();
+        if n_rows == 0 {
+            return Ok(());
+        }
+
+        let n_aggs = self.aggregates.len();
+        let typed_cols = self.build_typed_cols(batch)?;
+
+        if acc.dict_values.is_empty() {
+            acc.dict_values.resize(1, HashMap::new());
+        }
+
+        let key_col = batch.column(self.group_keys[0].col_idx);
+        let dict = key_col
+            .as_any()
+            .downcast_ref::<DictionaryArray<UInt32Type>>()
+            .ok_or_else(|| {
+                DataFusionError::Internal(format!(
+                    "FilterMultiAggSpec perfect_hash: expected DictionaryArray<UInt32>, got {:?}",
+                    key_col.data_type()
+                ))
+            })?;
+        let dict_values = dict
+            .values()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| {
+                DataFusionError::Internal(
+                    "FilterMultiAggSpec perfect_hash: dict values must be Utf8 (StringArray)"
+                        .into(),
+                )
+            })?;
+        let dict_keys = dict.keys().values();
+        let cardinality = dict_values.len();
+
+        // Flat per-batch cell storage. `seen[code]` tracks which codes
+        // had any contribution this batch so the merge loop touches
+        // only those slots (not the full cardinality).
+        let mut cells: Vec<f64> = vec![0.0; cardinality * n_aggs];
+        let mut seen: Vec<bool> = vec![false; cardinality];
+        let mut seen_codes: Vec<u32> = Vec::new();
+
+        // Hot loop. The body is:
+        //   1. predicate eval on typed slices (no dyn dispatch)
+        //   2. flat array index by dict code (no HashMap)
+        //   3. per-agg accumulation
+        // LLVM autovectorises the inner agg loop in the common case
+        // where n_aggs is small and AggExpr arms collapse to FMA.
+        for row in 0..n_rows {
+            if !self.eval_predicate_typed(&typed_cols, row) {
+                continue;
+            }
+            let code = dict_keys[row];
+            let code_idx = code as usize;
+            if !seen[code_idx] {
+                seen[code_idx] = true;
+                seen_codes.push(code);
+            }
+            let base = code_idx * n_aggs;
+            for (ai, agg) in self.aggregates.iter().enumerate() {
+                cells[base + ai] += self.eval_agg_typed(agg, &typed_cols, row);
+            }
+        }
+
+        // Merge into global accumulator. One probe per code that
+        // actually had contributions in this batch.
+        for code in seen_codes {
+            let code_idx = code as usize;
+            acc.dict_values[0]
+                .entry(code)
+                .or_insert_with(|| dict_values.value(code_idx).to_string());
+            let mut key_buf = Vec::with_capacity(4);
+            key_buf.extend_from_slice(&code.to_le_bytes());
+            let entry = acc
+                .groups
+                .entry(key_buf)
+                .or_insert_with(|| vec![0.0; n_aggs]);
+            let base = code_idx * n_aggs;
+            for ai in 0..n_aggs {
+                entry[ai] += cells[base + ai];
             }
         }
 
@@ -1102,6 +1235,115 @@ mod tests {
         let n = out.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
         assert_eq!(sum.value(0), 27.0); // 5 + 10 + 12 (50 filtered)
         assert_eq!(n.value(0), 3);
+    }
+
+    /// Σ.G.2f.2 — verify the perfect-hash template path produces
+    /// bit-identical output to the generic path on the same input.
+    /// Uses a 4-distinct-value dict that's well below the cardinality
+    /// threshold so dispatch routes through `process_batch_perfect_hash_dict`.
+    #[test]
+    fn perfect_hash_template_matches_generic() {
+        use arrow_array::builder::StringDictionaryBuilder;
+        use arrow_array::types::UInt32Type;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "g",
+                DataType::Dictionary(Box::new(DataType::UInt32), Box::new(DataType::Utf8)),
+                false,
+            ),
+            Field::new("v", DataType::Float64, false),
+            Field::new("w", DataType::Float64, false),
+        ]));
+        // 40 rows across 4 dict values + a filter v < 50.
+        let groups: Vec<&str> = (0..40)
+            .map(|i| match i % 4 {
+                0 => "x",
+                1 => "y",
+                2 => "z",
+                _ => "q",
+            })
+            .collect();
+        let mut builder = StringDictionaryBuilder::<UInt32Type>::new();
+        for s in groups.iter() {
+            builder.append(*s).unwrap();
+        }
+        let dict = builder.finish();
+        let v: Vec<f64> = (0..40).map(|i| 1.0 + i as f64).collect();
+        let w: Vec<f64> = (0..40).map(|i| 200.0 - 2.0 * i as f64).collect();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(dict),
+                Arc::new(Float64Array::from(v)),
+                Arc::new(Float64Array::from(w)),
+            ],
+        )
+        .unwrap();
+
+        let spec = FilterMultiAggSpec::try_new(
+            vec![Clause {
+                column: 0,
+                op: ClauseOp::F64Lt,
+                imm_i32: 0,
+                imm_f64: 50.0,
+            }],
+            vec![ColumnTy::Float64, ColumnTy::Float64],
+            &["v", "w"],
+            vec![
+                AggExpr::SumColumn(0),
+                AggExpr::SumProductColumns(0, 1),
+                AggExpr::CountStar,
+            ],
+            vec!["sum_v".into(), "sum_vw".into(), "n".into()],
+            vec![("g".into(), GroupKeyKind::DictionaryU32)],
+            &schema,
+        )
+        .unwrap();
+
+        let mut acc_perfect = FilterMultiAggAccumulator::default();
+        spec.process_batch_perfect_hash_dict(&batch, &mut acc_perfect)
+            .unwrap();
+        let out_perfect = spec.finalize(acc_perfect).unwrap();
+
+        let mut acc_generic = FilterMultiAggAccumulator::default();
+        spec.process_batch_generic(&batch, &mut acc_generic)
+            .unwrap();
+        let out_generic = spec.finalize(acc_generic).unwrap();
+
+        assert_eq!(out_perfect.num_rows(), out_generic.num_rows());
+        for col_idx in 1..out_perfect.num_columns() - 1 {
+            let l = out_perfect
+                .column(col_idx)
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .unwrap();
+            let r = out_generic
+                .column(col_idx)
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .unwrap();
+            for row in 0..l.len() {
+                assert!(
+                    (l.value(row) - r.value(row)).abs() < 1e-9,
+                    "col {col_idx} row {row}: perfect {} != generic {}",
+                    l.value(row),
+                    r.value(row)
+                );
+            }
+        }
+        let counts_p = out_perfect
+            .column(3)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let counts_g = out_generic
+            .column(3)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        for i in 0..counts_p.len() {
+            assert_eq!(counts_p.value(i), counts_g.value(i));
+        }
     }
 
     /// Σ.G.2f.2 — verify the dict-single template path produces
