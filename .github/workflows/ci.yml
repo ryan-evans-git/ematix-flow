@@ -9,6 +9,14 @@ on:
   push:
     branches: [main, master]
   pull_request:
+  # `merge_group` fires on the synthetic `gh-readonly-queue/<base>/<sha>`
+  # refs the GitHub merge queue creates when a PR is added. Required so
+  # the queue's pre-merge CI run actually exercises the workflows;
+  # without this trigger the required-status-check set comes back empty
+  # and queued PRs sit forever. The PR-time `pull_request` trigger
+  # continues to gate the PR itself — `merge_group` is the *additional*
+  # post-queue gate.
+  merge_group:
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -17,6 +25,14 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # Use the `mold` linker for all Rust builds. mold is 5-10× faster than
+  # GNU ld on large binaries (this project's full dep graph includes
+  # DataFusion + Arrow + Cranelift + DeltaLake — ~30-60s of linking
+  # per build). Set globally on the workflow so every Rust step
+  # (clippy, test, maturin develop, audit installs) benefits without
+  # per-job opt-in. Installed via `rui314/setup-mold@v1` in each
+  # Rust-using job below.
+  RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
 
 jobs:
   rust:
@@ -24,13 +40,31 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: rui314/setup-mold@v1
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      # cargo-nextest runs tests in parallel with per-test process
+      # isolation and smarter scheduling. On this codebase's 700-test
+      # suite it cuts test-execution time ~30-50% vs `cargo test`'s
+      # serial-within-binary model. Installed precompiled via the
+      # taiki-e action (~3s vs ~2 min `cargo install`).
+      - uses: taiki-e/install-action@nextest
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --workspace --all-targets
+      - name: Run unit + integration tests (nextest)
+        # `--tests` (not `--all-targets`) intentionally: nextest enumerates
+        # each target via `--list`, and any bench whose module-init prints
+        # diagnostic lines (e.g. `examples/tpch/bench` printing data-dir
+        # info) breaks the "<name>: test" parse and fails the whole step.
+        # `--tests` filters to lib + integration test targets, matching
+        # integration.yml's working invocation. Compilation of benches /
+        # examples is still verified by the separate `cargo clippy
+        # --all-targets` step above. Doctests aren't run by nextest; if
+        # the project ever adds load-bearing doctests they'd need a
+        # separate `cargo test --doc` step here.
+        run: cargo nextest run --workspace --tests
 
   audit-rust:
     name: cargo audit (RustSec advisory DB)
@@ -52,6 +86,8 @@ jobs:
               - '**/Cargo.toml'
               - 'Cargo.lock'
               - '.cargo/audit.toml'
+      - if: steps.changes.outputs.deps == 'true'
+        uses: rui314/setup-mold@v1
       - if: steps.changes.outputs.deps == 'true'
         uses: dtolnay/rust-toolchain@stable
       - if: steps.changes.outputs.deps == 'true'
@@ -101,6 +137,7 @@ jobs:
         with:
           enable-cache: true
           cache-dependency-glob: "pyproject.toml"
+      - uses: rui314/setup-mold@v1
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       # `maturin develop` requires an active virtualenv (it refuses
@@ -125,7 +162,14 @@ jobs:
           uv pip install 'maturin>=1.7' pytest 'pytest-asyncio>=0.23' \
             ruff bandit pip-audit pip-licenses numpy 'pyarrow>=15'
       - name: Build extension
-        run: maturin develop --release
+        # CI builds the Python extension in debug (not release) mode.
+        # The release build was originally chosen for perf parity with
+        # shipping wheels, but CI tests only assert correctness — and
+        # release codegen on this dep graph (DataFusion + Arrow +
+        # Cranelift) takes ~5-8 min vs ~1-2 min in debug. The shipping
+        # wheels themselves are still built in release by release.yml's
+        # maturin invocation; this only affects CI smoke tests.
+        run: maturin develop
       - name: Lint
         run: ruff check python tests
       - name: Bandit (medium+ severity, no findings allowed)
@@ -173,6 +217,8 @@ jobs:
               - '**/Cargo.toml'
               - 'Cargo.lock'
               - 'deny.toml'
+      - if: steps.changes.outputs.deps == 'true'
+        uses: rui314/setup-mold@v1
       - if: steps.changes.outputs.deps == 'true'
         uses: dtolnay/rust-toolchain@stable
       - if: steps.changes.outputs.deps == 'true'

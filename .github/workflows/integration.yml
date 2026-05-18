@@ -94,6 +94,25 @@ on:
       - "examples/**/README*"
       - ".gitignore"
       - ".gitattributes"
+  # `merge_group` fires on the synthetic `gh-readonly-queue/<base>/<sha>`
+  # refs the GitHub merge queue creates when a PR is added. The
+  # integration suite is a required check, so the queue's pre-merge
+  # CI run needs this trigger — otherwise queued PRs never satisfy
+  # the required-status-check set. Same `paths-ignore` filter as
+  # `push` / `pull_request` so a docs-only queue entry doesn't spend
+  # 30 min on testcontainers.
+  merge_group:
+    paths-ignore:
+      - "**/*.md"
+      - "LICENSE*"
+      - "COPYING*"
+      - "NOTICE*"
+      - "AUTHORS*"
+      - "CONTRIBUTORS*"
+      - "docs/**"
+      - "examples/**/README*"
+      - ".gitignore"
+      - ".gitattributes"
   schedule:
     - cron: "0 6 * * *"
   workflow_dispatch:
@@ -108,6 +127,9 @@ env:
   # Bound testcontainers' container-startup retries — the default
   # surface produces noise when an image pull stalls.
   TESTCONTAINERS_RYUK_DISABLED: "true"
+  # Match ci.yml: use mold for all Rust builds. Saves ~30-60s of
+  # linking on this project's full dep graph each test pass.
+  RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
 
 jobs:
   integration-with-coverage:
@@ -125,6 +147,7 @@ jobs:
     if: github.event_name != 'pull_request' || github.base_ref == 'main' || github.base_ref == 'master'
     steps:
       - uses: actions/checkout@v4
+      - uses: rui314/setup-mold@v1
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: llvm-tools-preview
@@ -133,6 +156,10 @@ jobs:
       # so installation is a single download instead of a 2-min
       # `cargo install` build.
       - uses: taiki-e/install-action@cargo-llvm-cov
+      # cargo-nextest for the coverage runs (`cargo llvm-cov nextest`)
+      # — cuts test execution time 30-50% vs the standard `cargo test`
+      # runner. cargo-llvm-cov has first-class nextest support.
+      - uses: taiki-e/install-action@nextest
       - name: Verify Docker is available
         # The runner image preinstalls Docker; this is a fast
         # sanity check so a missing daemon fails the job up front
@@ -141,9 +168,11 @@ jobs:
       - name: Run unit tests with coverage (parallel)
         # First pass: run every non-`#[ignore]`'d test under
         # default parallelism. These don't touch testcontainers
-        # so they're safe to interleave.
+        # so they're safe to interleave. Uses `cargo llvm-cov nextest`
+        # for the 30-50% test-execution speedup over the standard
+        # cargo test runner.
         run: |
-          cargo llvm-cov --no-report --workspace --tests --ignore-run-fail
+          cargo llvm-cov --no-report --ignore-run-fail nextest --workspace --tests
       - name: Run ignored integration tests with coverage (serial)
         # Second pass: run only `#[ignore]`'d tests, serialised
         # (`--test-threads=1`). These each spin up Postgres /
@@ -164,14 +193,14 @@ jobs:
         # reads the union. `--no-clean` is intentionally NOT
         # passed — cargo-llvm-cov rejects `--no-report
         # --no-clean` as a mutex pair.
-        # `--ignored` (vs `--include-ignored`) runs ONLY the
-        # ignored set this round, skipping the unit tests we
-        # already covered in the parallel pass.
-        # `--ignore-run-fail` stays so genuine new flake doesn't
-        # abort the rest of the workflow.
+        # `--run-ignored only` runs ONLY the ignored set this round,
+        # skipping the unit tests we already covered in the parallel
+        # pass. `--ignore-run-fail` stays so genuine new flake doesn't
+        # abort the rest of the workflow. `--test-threads=1` keeps
+        # testcontainer suites from racing each other.
         run: |
-          cargo llvm-cov --no-report --workspace --tests --ignore-run-fail \
-              -- --ignored --test-threads=1
+          cargo llvm-cov --no-report --ignore-run-fail nextest --workspace --tests \
+              --run-ignored only -j 1
       - name: Coverage summary + 85% region floor
         # `--fail-under-regions=85` enforces the floor identified
         # at the top-of-file. Picked one pp below the current
