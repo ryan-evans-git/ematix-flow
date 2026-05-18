@@ -22,6 +22,7 @@ MAX_RUNTIME_HRS="${max_runtime_hrs}"
 LAMBDA_FUNCTION_NAME="${lambda_function_name}"
 EKS_CLUSTER_NAME="${eks_cluster_name}"
 ECR_REPO_URL="${ecr_repo_url}"
+PREBUILD_TARGET_BUCKET="${prebuild_target_bucket}"
 export LAMBDA_FUNCTION_NAME EKS_CLUSTER_NAME ECR_REPO_URL
 WORKDIR=/opt/ematix
 LOG=/var/log/ematix-bench.log
@@ -125,16 +126,85 @@ git clone --depth 1 https://github.com/ryan-evans-git/ematix-parquet.git
 git clone --depth 1 https://github.com/ryan-evans-git/ematix-flow.git
 REPOS
 
+# ---- Prebuilt target fast path ----
+#
+# When PREBUILD_TARGET_BUCKET is set (via the terraform var), try to
+# pull a cached `target/` tarball built on every push to main by the
+# `prebuild-target` GHA workflow. Saves ~10 min vs `cargo build`.
+#
+# The fast path is best-effort: any failure (network, missing key,
+# checksum mismatch, untar error) falls through to the cargo build
+# below. The bench harness never observes a difference either way —
+# both paths produce a populated target/release.
+#
+# `zstd` is needed for `tar --use-compress-program=zstd`. AL2023 base
+# images sometimes ship without it; install on demand. The dnf install
+# is idempotent + cheap (<1s when already present).
+PREBUILT_HIT=0
+if [[ -n "$PREBUILD_TARGET_BUCKET" ]]; then
+  echo "prebuilt target bucket: $PREBUILD_TARGET_BUCKET" | tee -a /var/log/ematix-build.log
+  dnf install -y zstd >/dev/null 2>&1 || true
+
+  sudo -u ec2-user bash <<PREBUILT
+set -uxo pipefail
+mkdir -p /opt/ematix/prebuilt
+cd /opt/ematix/prebuilt
+
+# Manifest first. If it's missing the bucket is fresh or the workflow
+# never ran — skip silently.
+if aws s3 cp "s3://$PREBUILD_TARGET_BUCKET/target/latest.manifest" \
+     ./manifest --region "$REGION" >/dev/null 2>&1; then
+  cat manifest
+  # The campaign builds against whatever main HEAD is at boot time;
+  # checking flow_sha against the actually-cloned commit lets us skip
+  # a stale tarball cleanly. \$ is escaped because templatefile() would
+  # otherwise consume the bare \$( ).
+  manifest_flow_sha=\$(grep '^flow_sha=' manifest | cut -d= -f2)
+  cloned_flow_sha=\$(git -C /opt/ematix/ematix-flow rev-parse --short=12 HEAD)
+  if [[ "\$manifest_flow_sha" != "\$cloned_flow_sha" ]]; then
+    echo "manifest flow_sha=\$manifest_flow_sha != cloned=\$cloned_flow_sha; skipping prebuilt fast path"
+    exit 1
+  fi
+
+  if aws s3 cp "s3://$PREBUILD_TARGET_BUCKET/target/latest.tar.zst" \
+       ./target.tar.zst --region "$REGION"; then
+    cd /opt/ematix
+    tar --use-compress-program='unzstd' -xf prebuilt/target.tar.zst
+    echo "prebuilt target unpacked"
+    exit 0
+  fi
+fi
+exit 1
+PREBUILT
+  if [[ $? -eq 0 ]]; then
+    PREBUILT_HIT=1
+    echo "prebuilt target fast path: HIT" | tee -a /var/log/ematix-build.log
+  else
+    echo "prebuilt target fast path: MISS (will cargo build)" | tee -a /var/log/ematix-build.log
+  fi
+fi
+
 # ---- Build ----
 #
 # RUSTFLAGS targets host-native — on c7i this picks up AVX-512F + BMI2
 # + the SHA-NI extensions. We rebuild in release mode; debug builds
 # are not representative.
+#
+# Even on a prebuilt HIT we still invoke `cargo build` — cargo sees a
+# populated target/, validates incrementally, and either no-ops (when
+# the source tree matches the tarball) or rebuilds just the dirty
+# crates (when something drifted). Net effect on a hit is ~30s of
+# cargo metadata scan vs the original ~10 min full build.
 sudo -u ec2-user bash <<'BUILD'
 set -euxo pipefail
 source $HOME/.cargo/env
 cd /opt/ematix/ematix-flow
-export RUSTFLAGS="-C target-cpu=native"
+# Match the GHA prebuild workflow's -C target-cpu so the cached
+# tarball's .rlib hashes line up with what cargo would produce here.
+# `x86-64-v4` covers Sapphire Rapids' AVX-512 baseline without pinning
+# to that exact micro-arch (lets us swap c7i → r7i / m7i without
+# rebuilding the cache from scratch).
+export RUSTFLAGS="-C target-cpu=x86-64-v4"
 # Force openssl-sys to use the system openssl-devel headers instead of
 # vendoring a fresh build. The vendored path requires perl-FindBin etc
 # (added to dnf above) and is slow even when it works. System openssl
