@@ -86,6 +86,15 @@ pub struct EmatArrowBatchReaderBuilder {
     projection: Option<Vec<usize>>,
     row_groups: Option<Vec<usize>>,
     batch_size: usize,
+    /// Σ.E5.1.c: per-RG column-decode parallelism budget. `None` means
+    /// "default to `available_parallelism()`" — the original behaviour.
+    /// `Some(n)` caps the per-RG scoped-thread count at `n` (still
+    /// further capped by `n_projected_columns`). Callers that know how
+    /// much outer parallelism is already in play (e.g. a per-partition
+    /// `ExecutionPlan`) pass `total_threads / outer_partitions` so the
+    /// total concurrent thread count tracks the core count instead of
+    /// the product.
+    parallelism_budget: Option<usize>,
 }
 
 impl EmatArrowBatchReaderBuilder {
@@ -96,6 +105,7 @@ impl EmatArrowBatchReaderBuilder {
             projection: None,
             row_groups: None,
             batch_size: DEFAULT_BATCH_SIZE,
+            parallelism_budget: None,
         }
     }
 
@@ -111,6 +121,24 @@ impl EmatArrowBatchReaderBuilder {
 
     pub fn with_batch_size(mut self, n: usize) -> Self {
         self.batch_size = n.max(1);
+        self
+    }
+
+    /// Σ.E5.1.c: cap the per-RG column-decode thread count at `n`.
+    ///
+    /// Default behaviour (no call / `None`) is "saturate
+    /// `available_parallelism()`" — every column gets a thread until
+    /// core count is hit. Callers that spawn N concurrent readers (one
+    /// per outer DataFusion partition) should pass `total_threads / N`
+    /// to keep the global thread count anchored to the core count
+    /// rather than the product, which oversubscribes the scheduler and
+    /// inflates wall-clock variance on the streaming path.
+    ///
+    /// Setting `n = 1` forces sequential per-RG column decode and is
+    /// the confirmation knob for "is per-column parallelism the
+    /// dominant cost when outer parallelism already saturates cores?".
+    pub fn with_parallelism_budget(mut self, n: usize) -> Self {
+        self.parallelism_budget = Some(n.max(1));
         self
     }
 
@@ -178,6 +206,7 @@ impl EmatArrowBatchReaderBuilder {
             projection,
             row_groups,
             batch_size: self.batch_size,
+            parallelism_budget: self.parallelism_budget,
             cur_rg_idx: 0,
             cur_rg_columns: None,
             cur_rg_row: 0,
@@ -234,20 +263,37 @@ fn validate_type_pair(name: &str, phys: ParquetType, target: &DataType) -> DfRes
 /// fully-materialised representation of the *entire* RG for that
 /// column; the reader slices these into `batch_size`-row windows
 /// without re-decoding.
+///
+/// Σ.E5.1.c: primitive variants hold `Buffer` instead of `Vec` so that
+/// per-batch slicing is zero-copy (`Buffer::slice_with_length` = Arc
+/// bump + offset/length change). Previously `Buffer::from_slice_ref`
+/// inside `slice_batch` did a fresh memcpy of every batch — for Q1
+/// (3 numeric cols × 65K rows × 8 bytes ≈ 1.5 MB per batch × ~20
+/// batches/partition × 6 partitions ≈ 200 MB of copying per query).
 enum DecodedColumn {
-    Int32(Vec<i32>),
-    Int64(Vec<i64>),
-    Float64(Vec<f64>),
-    /// (views as ScalarBuffer<u128>, backing data block)
+    /// 4-byte primitives (i32/Date32). `n_rows` is the logical row
+    /// count; `data.len() == n_rows * 4`.
+    Int32 { data: Buffer, n_rows: usize },
+    /// 8-byte primitives (i64). `data.len() == n_rows * 8`.
+    Int64 { data: Buffer, n_rows: usize },
+    /// 8-byte primitives (f64). `data.len() == n_rows * 8`.
+    Float64 { data: Buffer, n_rows: usize },
+    /// (views as `Buffer` of `u128`, backing data block). The views
+    /// buffer is sliced zero-copy per batch (Σ.E5.1.c); the backing
+    /// data buffer is shared across every batch in the RG via Arc.
     StringView {
-        views: Vec<u128>,
+        views: Buffer,
+        n_rows: usize,
         data: Buffer,
     },
     /// Dict-preserved BYTE_ARRAY → DictionaryArray<UInt32, Utf8>
     /// values + indices. Indices are RG-local — never spans RGs.
+    /// `indices` is a `Buffer` so per-batch key slicing is zero-copy
+    /// (Σ.E5.1.c).
     DictUtf8 {
         values: Arc<StringArray>,
-        indices: Vec<u32>,
+        indices: Buffer,
+        n_rows: usize,
     },
     /// Slow path: materialised UTF-8 (per-row copy).
     Utf8(Arc<StringArray>),
@@ -256,11 +302,11 @@ enum DecodedColumn {
 impl DecodedColumn {
     fn len(&self) -> usize {
         match self {
-            DecodedColumn::Int32(v) => v.len(),
-            DecodedColumn::Int64(v) => v.len(),
-            DecodedColumn::Float64(v) => v.len(),
-            DecodedColumn::StringView { views, .. } => views.len(),
-            DecodedColumn::DictUtf8 { indices, .. } => indices.len(),
+            DecodedColumn::Int32 { n_rows, .. } => *n_rows,
+            DecodedColumn::Int64 { n_rows, .. } => *n_rows,
+            DecodedColumn::Float64 { n_rows, .. } => *n_rows,
+            DecodedColumn::StringView { n_rows, .. } => *n_rows,
+            DecodedColumn::DictUtf8 { n_rows, .. } => *n_rows,
             DecodedColumn::Utf8(s) => s.len(),
         }
     }
@@ -275,6 +321,9 @@ pub struct EmatArrowBatchReader {
     /// Row groups to scan, in order.
     row_groups: Vec<usize>,
     batch_size: usize,
+    /// Σ.E5.1.c: caller-supplied cap on per-RG column-decode threads.
+    /// See [`EmatArrowBatchReaderBuilder::with_parallelism_budget`].
+    parallelism_budget: Option<usize>,
 
     // ---- iteration state ----
     /// Index into `row_groups`; `cur_rg_idx == row_groups.len()`
@@ -333,15 +382,19 @@ impl EmatArrowBatchReader {
         let file = &self.file;
         let n_cols = projection.len();
 
-        // Cap on spawned threads — never exceed available cores, even
-        // for wide projections. For Q1 (7 columns on a 14-core box)
-        // every column gets a thread; for a 200-column projection we
-        // batch onto the work queue.
-        let max_threads = std::thread::available_parallelism()
-            .map(|p| p.get())
-            .unwrap_or(1)
-            .max(1)
-            .min(n_cols.max(1));
+        // Cap on spawned threads. Default: never exceed available
+        // cores, even for wide projections (Q1 = 7 cols on a 14-core
+        // box → 7 threads). When the caller supplied a parallelism
+        // budget, honour it instead — this is how the
+        // `EmatixFastParquetExec` partition wrapper avoids
+        // oversubscribing the scheduler with `N_partitions × N_cols`
+        // scoped threads on top of its own outer parallelism.
+        let cap = self.parallelism_budget.unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|p| p.get())
+                .unwrap_or(1)
+        });
+        let max_threads = cap.max(1).min(n_cols.max(1));
 
         // Sequential fast path: skip scoped-thread overhead when
         // there's nothing to parallelise (single-column projection or
@@ -489,19 +542,31 @@ fn decode_one_column(
             let v = decode_dict_chunk_typed::<i32>(file, rg, leaf, |b| {
                 decode_plain_i32(b).map_err(|e| ext(format!("plain i32: {e}")))
             })?;
-            Ok(DecodedColumn::Int32(v))
+            let n_rows = v.len();
+            Ok(DecodedColumn::Int32 {
+                data: Buffer::from_vec(v),
+                n_rows,
+            })
         }
         DataType::Int64 => {
             let v = decode_dict_chunk_typed::<i64>(file, rg, leaf, |b| {
                 decode_plain_i64(b).map_err(|e| ext(format!("plain i64: {e}")))
             })?;
-            Ok(DecodedColumn::Int64(v))
+            let n_rows = v.len();
+            Ok(DecodedColumn::Int64 {
+                data: Buffer::from_vec(v),
+                n_rows,
+            })
         }
         DataType::Float64 => {
             let v = decode_dict_chunk_typed::<f64>(file, rg, leaf, |b| {
                 decode_plain_f64(b).map_err(|e| ext(format!("plain f64: {e}")))
             })?;
-            Ok(DecodedColumn::Float64(v))
+            let n_rows = v.len();
+            Ok(DecodedColumn::Float64 {
+                data: Buffer::from_vec(v),
+                n_rows,
+            })
         }
         DataType::Utf8View => decode_byte_array_to_string_view(file, rg, leaf),
         DataType::Dictionary(_, _) => decode_byte_array_dict_preserved(file, rg, leaf),
@@ -724,8 +789,11 @@ fn decode_byte_array_to_string_view(
     // view is fully inline and the data buffer entry is unused; this
     // is fine — the data block still exists.
     let data_buffer = Buffer::from_vec(data);
+    let n_rows = views.len();
+    let views_buffer = Buffer::from_vec(views);
     Ok(DecodedColumn::StringView {
-        views,
+        views: views_buffer,
+        n_rows,
         data: data_buffer,
     })
 }
@@ -766,9 +834,12 @@ fn decode_byte_array_dict_preserved(
         dict_strings.push(txt);
     }
     let values = Arc::new(StringArray::from(dict_strings));
+    let n_rows = raw.indices.len();
+    let indices_buf = Buffer::from_vec(raw.indices);
     Ok(DecodedColumn::DictUtf8 {
         values,
-        indices: raw.indices,
+        indices: indices_buf,
+        n_rows,
     })
 }
 
@@ -878,30 +949,36 @@ fn append_utf8(builder: &mut StringBuilder, bytes: &[u8]) -> DfResult<()> {
 /// For `DictUtf8` we share the `values` and slice the indices.
 fn slice_decoded(c: &DecodedColumn, start: usize, n: usize, target: &DataType) -> ArrayRef {
     match c {
-        DecodedColumn::Int32(v) => {
-            // Same underlying i32 buffer for both Int32 and Date32;
-            // pick the Arrow type by target.
-            let buf = Buffer::from_slice_ref(&v[start..start + n]);
-            let scalar = ScalarBuffer::<i32>::new(buf, 0, n);
+        DecodedColumn::Int32 { data, .. } => {
+            // Σ.E5.1.c: zero-copy slice via `Buffer::slice_with_length`
+            // — Arc bump + offset/length update, no memcpy. The
+            // previous `Buffer::from_slice_ref(&v[start..start+n])`
+            // copied every batch's worth of i32 (4 bytes × 65K rows ×
+            // many batches) for nothing.
+            let sliced = data.slice_with_length(start * 4, n * 4);
+            let scalar = ScalarBuffer::<i32>::new(sliced, 0, n);
             match target {
                 DataType::Date32 => Arc::new(Date32Array::new(scalar, None)),
                 _ => Arc::new(Int32Array::new(scalar, None)),
             }
         }
-        DecodedColumn::Int64(v) => {
-            let buf = Buffer::from_slice_ref(&v[start..start + n]);
-            let scalar = ScalarBuffer::<i64>::new(buf, 0, n);
+        DecodedColumn::Int64 { data, .. } => {
+            let sliced = data.slice_with_length(start * 8, n * 8);
+            let scalar = ScalarBuffer::<i64>::new(sliced, 0, n);
             Arc::new(Int64Array::new(scalar, None))
         }
-        DecodedColumn::Float64(v) => {
-            let buf = Buffer::from_slice_ref(&v[start..start + n]);
-            let scalar = ScalarBuffer::<f64>::new(buf, 0, n);
+        DecodedColumn::Float64 { data, .. } => {
+            let sliced = data.slice_with_length(start * 8, n * 8);
+            let scalar = ScalarBuffer::<f64>::new(sliced, 0, n);
             Arc::new(Float64Array::new(scalar, None))
         }
-        DecodedColumn::StringView { views, data } => {
-            // Build a sliced views buffer; data buffer is shared.
-            let view_slice: Vec<u128> = views[start..start + n].to_vec();
-            let views_buf = ScalarBuffer::<u128>::from(view_slice);
+        DecodedColumn::StringView { views, data, .. } => {
+            // Σ.E5.1.c: zero-copy slice for the views buffer too. Each
+            // view is 16 bytes — at 65K rows × ~20 batches × 2 string
+            // cols on Q1 that's ~40 MB of u128 copying eliminated.
+            // Backing data buffer is shared via Arc bump.
+            let sliced_views = views.slice_with_length(start * 16, n * 16);
+            let views_buf = ScalarBuffer::<u128>::new(sliced_views, 0, n);
             // SAFETY: we built every view ourselves with `make_view`
             // against `data` so the offsets are valid and the bytes
             // are valid UTF-8 (decode_plain_byte_array round-trips
@@ -914,9 +991,13 @@ fn slice_decoded(c: &DecodedColumn, start: usize, n: usize, target: &DataType) -
                 .expect("StringViewArray::try_new on internally-built views");
             Arc::new(arr)
         }
-        DecodedColumn::DictUtf8 { values, indices } => {
-            let key_slice = indices[start..start + n].to_vec();
-            let keys = UInt32Array::from(key_slice);
+        DecodedColumn::DictUtf8 {
+            values, indices, ..
+        } => {
+            // Σ.E5.1.c: zero-copy slice on dict keys.
+            let sliced = indices.slice_with_length(start * 4, n * 4);
+            let scalar = ScalarBuffer::<u32>::new(sliced, 0, n);
+            let keys = UInt32Array::new(scalar, None);
             let arr = DictionaryArray::<UInt32Type>::try_new(keys, values.clone() as ArrayRef)
                 .expect("DictionaryArray::try_new on internally-built dict");
             Arc::new(arr)
@@ -1498,5 +1579,88 @@ mod tests {
         assert_eq!(g.3[5].as_bytes(), s_pool[5 % s_pool.len()]);
         assert_eq!(g.4[0].as_bytes(), d_pool[0]);
         assert_eq!(g.4[8].as_bytes(), d_pool[8 % d_pool.len()]);
+    }
+
+    /// Σ.E5.1.c: with `parallelism_budget = 1` (sequential per-RG
+    /// column decode), every variant must produce byte-identical
+    /// output to the default `available_parallelism()`-saturating
+    /// path. Same fixture as `parallel_decode_equivalence`.
+    #[test]
+    fn parallelism_budget_one_matches_default() {
+        let path = tmp_parquet("budget_one_eq");
+        let n = 8_000usize;
+        let c_i32: Vec<i32> = (0..n as i32).collect();
+        let c_i64: Vec<i64> = (0..n as i64).map(|x| x * 13).collect();
+        let c_f64: Vec<f64> = (0..n).map(|x| x as f64 * 0.125).collect();
+        let s_pool = [
+            b"alpha_long_string".as_slice(),
+            b"beta_long_string".as_slice(),
+            b"gamma_long_string".as_slice(),
+        ];
+        let s_view: Vec<&[u8]> = (0..n).map(|i| s_pool[i % s_pool.len()]).collect();
+
+        write_table_with_dict_to_path(
+            &path,
+            &[
+                ("c_i32", ColumnData::I32(&c_i32)),
+                ("c_i64", ColumnData::I64(&c_i64)),
+                ("c_f64", ColumnData::F64(&c_f64)),
+                ("s_view", ColumnData::ByteArray(&s_view)),
+            ],
+            CompressionCodec::Uncompressed,
+            usize::MAX,
+            &[false, false, false, true],
+        )
+        .unwrap();
+
+        let schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("c_i32", DataType::Int32, false),
+            Field::new("c_i64", DataType::Int64, false),
+            Field::new("c_f64", DataType::Float64, false),
+            Field::new("s_view", DataType::Utf8View, false),
+        ]));
+
+        let read = |budget: Option<usize>| -> Vec<RecordBatch> {
+            let file = ParquetFile::open(&path).unwrap();
+            let mut b = EmatArrowBatchReaderBuilder::new(file, schema.clone());
+            if let Some(n) = budget {
+                b = b.with_parallelism_budget(n);
+            }
+            b.build().unwrap().map(|x| x.unwrap()).collect()
+        };
+
+        fn snap(batches: &[RecordBatch]) -> (Vec<i32>, Vec<i64>, Vec<f64>, Vec<String>) {
+            let mut a = Vec::new();
+            let mut b = Vec::new();
+            let mut c = Vec::new();
+            let mut d = Vec::new();
+            for rb in batches {
+                let i32_arr = rb.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+                let i64_arr = rb.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+                let f64_arr = rb
+                    .column(2)
+                    .as_any()
+                    .downcast_ref::<Float64Array>()
+                    .unwrap();
+                let sv = rb
+                    .column(3)
+                    .as_any()
+                    .downcast_ref::<StringViewArray>()
+                    .unwrap();
+                for i in 0..rb.num_rows() {
+                    a.push(i32_arr.value(i));
+                    b.push(i64_arr.value(i));
+                    c.push(f64_arr.value(i));
+                    d.push(sv.value(i).to_string());
+                }
+            }
+            (a, b, c, d)
+        }
+
+        let default = snap(&read(None));
+        let budget_1 = snap(&read(Some(1)));
+        let budget_2 = snap(&read(Some(2)));
+        assert_eq!(default, budget_1, "budget=1 must match default output");
+        assert_eq!(default, budget_2, "budget=2 must match default output");
     }
 }

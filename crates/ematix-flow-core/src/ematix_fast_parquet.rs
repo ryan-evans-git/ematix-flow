@@ -586,7 +586,36 @@ impl ExecutionPlan for EmatixFastParquetExec {
         // route through `EmatArrowBatchReader`. Otherwise fall back to
         // the whole-RG bridge path.
         let stream = if self.streaming_arrow_reader && filter.is_none() {
-            build_streaming_partition_stream(path, schema.clone(), projection, row_groups, baseline)
+            // Σ.E5.1.c: compute a per-partition column-decode thread
+            // budget so the total concurrent thread count tracks the
+            // core count rather than the product
+            // `N_outer_partitions × N_cols`. Q1 SF=1 on a 14-core box
+            // with 6 outer partitions → budget = 2 (per partition), so
+            // total ≈ 12 concurrent threads instead of 42 — kills the
+            // scheduler oversubscription that inflated streaming-mode
+            // variance (σ 5–7 ms vs bridge σ 2–3 ms) in #112's bench.
+            //
+            // Env override `EMAT_READER_PARALLELISM_BUDGET=N` forces
+            // the per-partition budget to N (used by the confirmation
+            // experiment; `N=1` = sequential per-RG column decode).
+            let outer_partitions = self.properties.partitioning.partition_count().max(1);
+            let total_threads = std::thread::available_parallelism()
+                .map(|p| p.get())
+                .unwrap_or(1);
+            let computed_budget = std::cmp::max(1, total_threads / outer_partitions);
+            let budget = std::env::var("EMAT_READER_PARALLELISM_BUDGET")
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .map(|n| n.max(1))
+                .unwrap_or(computed_budget);
+            build_streaming_partition_stream(
+                path,
+                schema.clone(),
+                projection,
+                row_groups,
+                budget,
+                baseline,
+            )
         } else {
             build_partition_stream(
                 path,
@@ -676,22 +705,20 @@ fn build_partition_stream(
 /// `Dictionary(UInt32, Utf8)` as appropriate), and stream each
 /// `batch_size`-row window over an mpsc channel.
 ///
-/// Threading note: the reader internally fan-outs per-column decode
-/// across `min(n_cols, available_parallelism())` scoped threads. With
-/// DataFusion's outer `target_partitions` repartition (one
-/// `spawn_blocking` worker per partition), peak concurrency is
-/// `num_partitions * n_cols_per_partition`. For Q1 SF=1 that's
-/// 6 partitions × 7 cols = 42 threads on a 14-core machine — the
-/// reader's internal cap of `available_parallelism()` keeps each
-/// partition's spawn count bounded. Pool oversubscription is mild and
-/// reflects the same shape the bridge path already exhibits with its
-/// per-RG decode (the bridge isn't column-parallel; the reader is, so
-/// the oversub is the *reader's* doing — measured below).
+/// Threading note (Σ.E5.1.c): the reader internally fan-outs per-column decode
+/// across `min(n_cols, parallelism_budget)` scoped threads. The
+/// `EmatixFastParquetExec` partition wrapper computes a per-partition
+/// budget = `max(1, available_parallelism() / n_outer_partitions)` so
+/// the global thread count tracks the core count rather than the
+/// product `N_partitions × N_cols`. For Q1 SF=1 (6 outer partitions on
+/// 14 cores) the budget is 2 — total ≈ 12 concurrent threads instead
+/// of the 42 the naive `available_parallelism()` cap produced.
 fn build_streaming_partition_stream(
     path: String,
     schema: SchemaRef,
     projection: Vec<usize>,
     row_groups: Vec<usize>,
+    parallelism_budget: usize,
     baseline: BaselineMetrics,
 ) -> futures_util::stream::BoxStream<'static, DfResult<RecordBatch>> {
     use futures_util::StreamExt;
@@ -721,6 +748,7 @@ fn build_streaming_partition_stream(
         let reader = match EmatArrowBatchReaderBuilder::new(file, schema)
             .with_projection(projection)
             .with_row_groups(row_groups)
+            .with_parallelism_budget(parallelism_budget)
             .build()
         {
             Ok(r) => r,
