@@ -27,16 +27,25 @@
 //! 1995-03-15), Q5 (ASIA region chain), Q6 (shipdate in 1994,
 //! discount 0.05-0.07, qty < 24), Q12 (MAIL/SHIP shipmode), Q14
 //! (PROMO p_type with shipdate in 1995-09).
+//!
+//! Σ.E5.3: parquet write path migrated from parquet-rs
+//! `ArrowWriter` + `WriterProperties` to ematix-parquet-codec's
+//! `write_table_to_path_with_row_group_size` — drops the last
+//! production-side parquet-rs use in this file. Snappy compression
+//! preserved. `RecordBatch` → `ColumnData<'_>` projection is done
+//! by `record_batch_to_column_data` below, which borrows from a
+//! caller-supplied `OwnedBatchBuffers` to keep byte-array columns'
+//! `&[u8]` slices alive for the duration of the write.
 
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
-use arrow_array::{Date32Array, Float64Array, Int32Array, Int64Array, RecordBatch, StringArray};
+use arrow_array::{
+    Array, Date32Array, Float64Array, Int32Array, Int64Array, RecordBatch, StringArray,
+};
 use arrow_schema::{DataType, Field, Schema};
-use parquet::arrow::ArrowWriter;
-use parquet::basic::Compression;
-use parquet::file::properties::WriterProperties;
-use std::fs::File;
+use ematix_parquet_codec::write::{ColumnData, write_table_to_path_with_row_group_size};
+use ematix_parquet_format::types::CompressionCodec;
 use std::sync::Arc;
 use tempfile::TempDir;
 
@@ -95,17 +104,115 @@ impl MiniFixture {
     }
 }
 
-/// Write a RecordBatch to parquet with multiple row groups by setting
-/// `max_row_group_size` smaller than the batch length.
+/// Σ.E5.3: write a RecordBatch through ematix-parquet-codec's
+/// multi-column writer with multiple row groups by setting
+/// `row_group_size` smaller than the batch length. Snappy-compressed
+/// to match the prior parquet-rs `ArrowWriter` shape.
+///
+/// The batch is projected into a `Vec<(&str, ColumnData<'_>)>` whose
+/// borrows pin against the batch's Arrow buffers + an external
+/// `OwnedBatchBuffers` that holds the `&[&[u8]]` indirection for
+/// byte_array columns. Both must outlive the call.
 fn write_parquet_multi_rg(path: PathBuf, batch: RecordBatch, max_rg: usize) {
-    let file = File::create(&path).unwrap_or_else(|e| panic!("create {path:?}: {e}"));
-    let props = WriterProperties::builder()
-        .set_compression(Compression::SNAPPY)
-        .set_max_row_group_row_count(Some(max_rg))
-        .build();
-    let mut writer = ArrowWriter::try_new(file, batch.schema(), Some(props)).expect("arrow writer");
-    writer.write(&batch).expect("write batch");
-    writer.close().expect("close writer");
+    let buffers = build_owned_buffers(&batch);
+    let columns = build_column_data(&batch, &buffers);
+    write_table_to_path_with_row_group_size(&path, &columns, CompressionCodec::Snappy, max_rg)
+        .unwrap_or_else(|e| panic!("write_table_to_path_with_row_group_size {path:?}: {e}"));
+}
+
+/// Owned per-column buffers needed to satisfy `ColumnData::ByteArray`'s
+/// `&[&[u8]]` shape. For each Utf8 column we cache a `Vec<&[u8]>` whose
+/// elements borrow directly from the underlying `StringArray`'s
+/// value-data buffer — no copy, just an extra level of slice
+/// indirection.
+struct OwnedBatchBuffers<'a> {
+    /// Per-column `Some(slices)` for `Utf8` columns; `None` otherwise.
+    /// Indexed by column position in the batch.
+    byte_array_slices: Vec<Option<Vec<&'a [u8]>>>,
+}
+
+fn build_owned_buffers(batch: &RecordBatch) -> OwnedBatchBuffers<'_> {
+    let mut byte_array_slices: Vec<Option<Vec<&[u8]>>> = Vec::with_capacity(batch.num_columns());
+    for col in batch.columns() {
+        if matches!(col.data_type(), DataType::Utf8) {
+            let arr = col
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("Utf8 column downcasts to StringArray");
+            let mut slices: Vec<&[u8]> = Vec::with_capacity(arr.len());
+            for i in 0..arr.len() {
+                // The mini fixture writes REQUIRED columns only — no
+                // nulls anywhere — so `value(i)` is safe for every row.
+                slices.push(arr.value(i).as_bytes());
+            }
+            byte_array_slices.push(Some(slices));
+        } else {
+            byte_array_slices.push(None);
+        }
+    }
+    OwnedBatchBuffers { byte_array_slices }
+}
+
+fn build_column_data<'a>(
+    batch: &'a RecordBatch,
+    buffers: &'a OwnedBatchBuffers<'a>,
+) -> Vec<(&'a str, ColumnData<'a>)> {
+    let schema = batch.schema_ref();
+    let mut out: Vec<(&str, ColumnData<'_>)> = Vec::with_capacity(batch.num_columns());
+    for (idx, col) in batch.columns().iter().enumerate() {
+        let name = schema.field(idx).name().as_str();
+        let cd = match col.data_type() {
+            DataType::Int32 => {
+                let arr = col
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .expect("Int32 column downcasts to Int32Array");
+                ColumnData::I32(arr.values())
+            }
+            DataType::Int64 => {
+                let arr = col
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("Int64 column downcasts to Int64Array");
+                ColumnData::I64(arr.values())
+            }
+            DataType::Float64 => {
+                let arr = col
+                    .as_any()
+                    .downcast_ref::<Float64Array>()
+                    .expect("Float64 column downcasts to Float64Array");
+                ColumnData::F64(arr.values())
+            }
+            DataType::Date32 => {
+                // Parquet's logical Date type is physical INT32. The
+                // mini fixture's pre-Σ.E5.3 code wrote Date32 columns
+                // as plain INT32 via `ArrowWriter` — which DOES emit
+                // the logical-Date annotation. Here we emit raw INT32
+                // (no annotation). Downstream readers in this repo
+                // ignore the annotation and key off the Arrow schema
+                // they construct against the file, so this is
+                // behaviour-preserving for the mini fixture's
+                // consumers (FastParquet, EmatixFastParquet, default
+                // DataFusion). See sub-bite 3 of the Σ.E5.3 report
+                // for the followup if a consumer ever annotation-
+                // probes.
+                let arr = col
+                    .as_any()
+                    .downcast_ref::<Date32Array>()
+                    .expect("Date32 column downcasts to Date32Array");
+                ColumnData::I32(arr.values())
+            }
+            DataType::Utf8 => {
+                let slices = buffers.byte_array_slices[idx]
+                    .as_deref()
+                    .expect("Utf8 column has pre-built &[&[u8]] buffer");
+                ColumnData::ByteArray(slices)
+            }
+            other => panic!("write_parquet_multi_rg: unsupported column type {other:?}"),
+        };
+        out.push((name, cd));
+    }
+    out
 }
 
 // ----- lineitem -------------------------------------------------------

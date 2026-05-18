@@ -22,12 +22,13 @@
 //! [`crate::fast_parquet::FastParquetTableProvider`].
 
 use std::any::Any;
+#[cfg(test)]
 use std::fs::File;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use arrow_array::{Array, RecordBatch};
-use arrow_schema::{DataType, Schema, SchemaRef};
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use datafusion::catalog::{Session, TableProvider};
 use datafusion::common::ScalarValue;
 use datafusion::common::stats::Statistics;
@@ -44,8 +45,8 @@ use datafusion::physical_plan::{
     SendableRecordBatchStream,
 };
 
-use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
-use parquet::file::reader::{FileReader, SerializedFileReader};
+use ematix_parquet_format::types::{ConvertedType, ParquetType};
+use ematix_parquet_io::ParquetFile;
 
 use crate::emat_arrow_reader::EmatArrowBatchReaderBuilder;
 use crate::ematix_parquet_bridge::{
@@ -211,6 +212,95 @@ pub struct EmatixFastParquetTableProvider {
     streaming_arrow_reader: bool,
 }
 
+/// Σ.E5.3: synthesise an Arrow [`Schema`] from an ematix-parquet
+/// [`SchemaElement`] tree, used by [`EmatixFastParquetTableProvider::try_new`]
+/// in place of parquet-rs's `ArrowReaderMetadata::load(...).schema()`.
+///
+/// Replicates the default Arrow type each parquet physical-type+annotation
+/// pair maps to under parquet-rs's defaults:
+///   - INT32                              → `Int32`
+///   - INT32 + ConvertedType::Date        → `Date32`
+///   - INT32 + LogicalType::Date          → `Date32`
+///   - INT64                              → `Int64`
+///   - DOUBLE                             → `Float64`
+///   - BYTE_ARRAY                         → `Utf8`
+///   - BYTE_ARRAY + ConvertedType::Utf8   → `Utf8`
+///   - BYTE_ARRAY + LogicalType::String   → `Utf8`
+///
+/// Any other physical type (BOOLEAN, FLOAT, INT96, FIXED_LEN_BYTE_ARRAY)
+/// is mapped to the closest plausible Arrow type and surfaces as
+/// `NotImplemented` in [`EmatixFastParquetTableProvider::try_new`]'s
+/// post-validate loop — keeps a clean error message for unsupported
+/// columns rather than failing deep in the schema walker.
+///
+/// Downstream callers (`with_dict_preservation`,
+/// `with_streaming_arrow_reader`) rewrite `Utf8` to
+/// `Dictionary(UInt32, Utf8)` / `Utf8View` after construction, so the
+/// initial schema must match what parquet-rs produced — that is, plain
+/// `Utf8` for byte_array columns, not `Utf8View`.
+///
+/// The first `SchemaElement` is the root group (`num_children > 0`,
+/// `column_type` is None); we skip it and emit one `Field` per
+/// subsequent leaf. Mini fixtures + TPC-H files in this repo are all
+/// flat schemas with no nested groups; nested support is not required
+/// for the Σ.E5.3 sites.
+fn arrow_schema_from_parquet_meta(
+    schema_elems: &[ematix_parquet_format::metadata::SchemaElement<'_>],
+) -> DfResult<Schema> {
+    use ematix_parquet_format::metadata::LogicalType;
+
+    // First element is the root group; subsequent elements are the
+    // leaves (the mini + TPC-H fixtures are flat). Reject any element
+    // with `num_children > 0` after the root — that's a nested group
+    // we don't handle.
+    let mut fields: Vec<Arc<Field>> = Vec::with_capacity(schema_elems.len().saturating_sub(1));
+    for (i, elem) in schema_elems.iter().enumerate() {
+        if i == 0 {
+            // Root group; skip.
+            continue;
+        }
+        if elem.num_children.unwrap_or(0) != 0 {
+            return Err(DataFusionError::NotImplemented(format!(
+                "EmatixFastParquetTableProvider: nested schema group `{}` not supported",
+                String::from_utf8_lossy(elem.name)
+            )));
+        }
+        let name = String::from_utf8_lossy(elem.name).into_owned();
+        let phys = elem.column_type.ok_or_else(|| {
+            DataFusionError::External(
+                format!("EmatixFastParquetTableProvider: leaf `{name}` missing physical type")
+                    .into(),
+            )
+        })?;
+        let dt = match (phys, elem.converted_type, elem.logical_type.as_ref()) {
+            (ParquetType::Int32, Some(ConvertedType::Date), _)
+            | (ParquetType::Int32, _, Some(LogicalType::Date)) => DataType::Date32,
+            (ParquetType::Int32, _, _) => DataType::Int32,
+            (ParquetType::Int64, _, _) => DataType::Int64,
+            (ParquetType::Double, _, _) => DataType::Float64,
+            (ParquetType::ByteArray, _, _) => DataType::Utf8,
+            // Surface other physical types as a stand-in DataType so the
+            // post-construction validate-loop produces a clean
+            // `NotImplemented` error instead of silently mismatching.
+            // Boolean maps to a not-supported placeholder.
+            (ParquetType::Float, _, _) => DataType::Float32,
+            (ParquetType::Boolean, _, _) => DataType::Boolean,
+            (ParquetType::Int96, _, _) => {
+                DataType::Timestamp(arrow_schema::TimeUnit::Nanosecond, None)
+            }
+            (ParquetType::FixedLenByteArray, _, _) => {
+                DataType::FixedSizeBinary(elem.type_length.unwrap_or(0))
+            }
+        };
+        let nullable = !matches!(
+            elem.repetition_type,
+            Some(ematix_parquet_format::types::FieldRepetitionType::Required)
+        );
+        fields.push(Arc::new(Field::new(name, dt, nullable)));
+    }
+    Ok(Schema::new(fields))
+}
+
 impl EmatixFastParquetTableProvider {
     /// Open the parquet file, validate that every column is one of the
     /// primitive types the bridge supports, and build the Arrow
@@ -218,22 +308,24 @@ impl EmatixFastParquetTableProvider {
     /// callers don't discover this mid-scan.
     pub fn try_new(path: impl Into<String>) -> DfResult<Self> {
         let path = path.into();
-        let file = File::open(&path).map_err(|e| {
+        // Σ.E5.3: open + parse footer via ematix-parquet-io. Replaces
+        // the parquet-rs `ArrowReaderMetadata::load` +
+        // `SerializedFileReader` pair. The Arrow schema is synthesised
+        // locally from the parquet `SchemaElement` leaves
+        // (see `arrow_schema_from_parquet_meta` below); downstream
+        // `with_dict_preservation` / `with_streaming_arrow_reader`
+        // rewriters operate on this schema unchanged.
+        let parquet_file = ParquetFile::open(&path).map_err(|e| {
             DataFusionError::External(
                 format!("EmatixFastParquetTableProvider: open `{path}`: {e}").into(),
             )
         })?;
-        // Use parquet-rs to extract the Arrow schema. The bridge
-        // operates on raw column chunks; we still need parquet-rs
-        // to translate parquet types into Arrow types for the
-        // RecordBatch schema we'll build.
-        let opts = ArrowReaderOptions::new();
-        let meta = ArrowReaderMetadata::load(&file, opts).map_err(|e| {
+        let fmd = parquet_file.metadata().map_err(|e| {
             DataFusionError::External(
-                format!("EmatixFastParquetTableProvider: load metadata: {e}").into(),
+                format!("EmatixFastParquetTableProvider: parse metadata: {e}").into(),
             )
         })?;
-        let schema = meta.schema().clone();
+        let schema: SchemaRef = Arc::new(arrow_schema_from_parquet_meta(&fmd.schema)?);
 
         // Validate: every column must be one of the types the bridge
         // can decode. Anything else, defer to FastParquetTableProvider.
@@ -253,19 +345,8 @@ impl EmatixFastParquetTableProvider {
             }
         }
 
-        let reader = SerializedFileReader::new(File::open(&path).map_err(|e| {
-            DataFusionError::External(
-                format!("EmatixFastParquetTableProvider: reopen `{path}`: {e}").into(),
-            )
-        })?)
-        .map_err(|e| {
-            DataFusionError::External(
-                format!("EmatixFastParquetTableProvider: SerializedFileReader: {e}").into(),
-            )
-        })?;
-        let fmd = reader.metadata().file_metadata();
-        let num_rows = fmd.num_rows() as usize;
-        let num_row_groups = reader.metadata().num_row_groups();
+        let num_rows = fmd.num_rows as usize;
+        let num_row_groups = fmd.row_groups.len();
 
         Ok(Self {
             path,
