@@ -1,0 +1,18 @@
+# Terraform state — NEVER commit. Contains resource IDs, secrets,
+# AWS account numbers. Use a remote backend (S3 + DynamoDB) for any
+# campaign that needs to be shared.
+*.tfstate
+*.tfstate.*
+*.tfstate.backup
+.terraform/
+.terraform.lock.hcl
+.terraform-build/
+
+# AWS credentials. The whole point of using a .env file for keys is
+# that they don't enter version control.
+.env
+.env.local
+.envrc
+
+# Bench artifacts
+results/

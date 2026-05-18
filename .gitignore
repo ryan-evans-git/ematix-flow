@@ -44,3 +44,20 @@ wheels/
 
 # Claude Code internal control files
 .claude/
+
+# Local environment files (AWS creds for paid campaigns, etc.)
+.env
+.env.local
+
+# Terraform state + provider binaries (per-machine, not version-controlled)
+*.tfstate
+*.tfstate.backup
+*.tfstate.*.backup
+.terraform/
+.terraform.lock.hcl
+.terraform-build/
+crash.log
+crash.*.log
+
+# AWS campaign artefacts (downloaded from S3 ad-hoc, never committed)
+/tmp/ematix-campaign-results/
