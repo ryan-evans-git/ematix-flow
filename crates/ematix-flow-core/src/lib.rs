@@ -26,6 +26,12 @@ pub mod ematix_parquet_bridge;
 // of parquet-rs. Supports primitive columns only; non-primitive
 // callers continue using `FastParquetTableProvider`.
 pub mod ematix_fast_parquet;
+// Σ.E5.1: streaming Arrow `RecordBatch` reader over ematix-parquet.
+// Emits 65 536-row batches sliced from a per-row-group dict-aware
+// decode. Replaces the whole-RG emission of `ematix_parquet_bridge`
+// for the Q1-shape workload. See
+// `docs/PHASE_SIGMA_E5_PARQUET_RS_ELIMINATION.md` §E5.1.
+pub mod emat_arrow_reader;
 // Σ.D1: `FusedFilterSumExec` physical operator for the simple
 // `Aggregate(SUM) over Filter(predicate)` plan shape — closes the
 // Q6 gap vs Polars (1.0 ms hand-written / 1.9 ms Polars / 5.96 ms
