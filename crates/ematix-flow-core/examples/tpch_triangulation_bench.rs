@@ -30,8 +30,9 @@ use datafusion::prelude::{SessionConfig, SessionContext};
 use ematix_flow_core::dict_aggregate_rule::EnableDictGroupCountRule;
 use ematix_flow_core::ematix_fast_parquet::EmatixFastParquetTableProvider;
 use ematix_flow_core::fast_parquet::FastParquetTableProvider;
+use ematix_flow_core::fused_aggregate_filter_sum_rule::InjectFilterSumRule;
 use ematix_flow_core::fused_jit_rule::{
-    InjectFusedQ1Rule, InjectFusedQ3Rule, InjectFusedQ5Rule, InjectFusedQ6Rule, InjectFusedQ12Rule,
+    InjectFusedQ1Rule, InjectFusedQ3Rule, InjectFusedQ5Rule, InjectFusedQ12Rule,
 };
 use futures_util::TryStreamExt;
 
@@ -268,7 +269,7 @@ async fn build_ematix_ctx(data_dir: &Path) -> Result<SessionContext, Box<dyn std
         .with_physical_optimizer_rule(Arc::new(InjectFusedQ1Rule))
         .with_physical_optimizer_rule(Arc::new(InjectFusedQ3Rule))
         .with_physical_optimizer_rule(Arc::new(InjectFusedQ5Rule))
-        .with_physical_optimizer_rule(Arc::new(InjectFusedQ6Rule))
+        .with_physical_optimizer_rule(Arc::new(InjectFilterSumRule))
         .with_physical_optimizer_rule(Arc::new(InjectFusedQ12Rule))
         .with_physical_optimizer_rule(Arc::new(EnableDictGroupCountRule))
         .build();
