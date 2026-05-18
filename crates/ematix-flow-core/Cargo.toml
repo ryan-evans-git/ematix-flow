@@ -285,3 +285,26 @@ path = "examples/probe_dict_arrival.rs"
 [[example]]
 name = "sigma_e5_4a_22_parity_bench"
 path = "examples/sigma_e5_4a_22_parity_bench.rs"
+
+# Σ.E5.2b dict-aware decode-gap diagnostics. Findings ship in
+# `docs/PHASE_SIGMA_E5_2B_DICT_DECODE_DIAGNOSTIC.md`. Three examples,
+# grouped by the `diag_dict_decode_` prefix:
+#   1. e2e:     end-to-end SQL wall-clock + EXPLAIN ANALYZE diff
+#                between FastParquet+dict and EmatixFastParquet+dict.
+#   2. codec:   pure decode of `l_returnflag` across all RGs — strips
+#                the provider, planner, and Arrow surface so the gap
+#                attribution lands on the codec layer.
+#   3. stages:  per-stage attribution inside ematix-parquet's
+#                dict-preserved decode (read_range / page_walk / snappy
+#                / dict_plain / rle_indices / assembly).
+[[example]]
+name = "diag_dict_decode_e2e"
+path = "examples/diag_dict_decode_e2e.rs"
+
+[[example]]
+name = "diag_dict_decode_codec"
+path = "examples/diag_dict_decode_codec.rs"
+
+[[example]]
+name = "diag_dict_decode_stages"
+path = "examples/diag_dict_decode_stages.rs"
