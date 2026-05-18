@@ -550,6 +550,91 @@ impl<'a> GroupKeyAccessor<'a> {
     }
 }
 
+/// Per-batch typed-slice cache for the predicate + agg input columns.
+///
+/// Built once per batch by downcasting each input ArrayRef into its
+/// concrete primitive slice. The hot row loop then indexes plain
+/// `&[f64]` / `&[i32]` rather than re-running `.as_any().downcast_ref()`
+/// per row. Σ.G.2f.2's bench gate showed this single change closes
+/// most of the ~4× gap vs Q1Spec's Cranelift-baked kernel — pure-Rust
+/// scalar code on typed slices vectorises through LLVM the same way
+/// the JIT does.
+enum TypedCol<'a> {
+    F64(&'a [f64]),
+    I32(&'a [i32]),
+    /// String / view columns that the predicate and aggregate eval
+    /// never touch (they reach the kernel only via `GroupKeyAccessor`).
+    /// Held here so the input-list slot index stays stable across the
+    /// spec — `TypedCol::f64_at` / `i32_at` won't be called on them.
+    Skip,
+}
+
+impl<'a> TypedCol<'a> {
+    fn build(col: &'a dyn Array, expected: ColumnTy) -> DfResult<Self> {
+        match expected {
+            ColumnTy::Float64 => Ok(TypedCol::F64(
+                col.as_any()
+                    .downcast_ref::<Float64Array>()
+                    .ok_or_else(|| {
+                        DataFusionError::Internal(format!(
+                            "FilterMultiAggSpec: expected Float64, got {:?}",
+                            col.data_type()
+                        ))
+                    })?
+                    .values(),
+            )),
+            ColumnTy::Date32 => Ok(TypedCol::I32(
+                col.as_any()
+                    .downcast_ref::<Date32Array>()
+                    .ok_or_else(|| {
+                        DataFusionError::Internal(format!(
+                            "FilterMultiAggSpec: expected Date32, got {:?}",
+                            col.data_type()
+                        ))
+                    })?
+                    .values(),
+            )),
+            ColumnTy::Int32 => Ok(TypedCol::I32(
+                col.as_any()
+                    .downcast_ref::<Int32Array>()
+                    .ok_or_else(|| {
+                        DataFusionError::Internal(format!(
+                            "FilterMultiAggSpec: expected Int32, got {:?}",
+                            col.data_type()
+                        ))
+                    })?
+                    .values(),
+            )),
+            // Int64 isn't reached by the hot loop in the shapes
+            // covered today; Utf8View slots are held but never
+            // read (group-key access goes through GroupKeyAccessor).
+            ColumnTy::Int64 => Err(DataFusionError::Internal(
+                "FilterMultiAggSpec: TypedCol cache doesn't yet support Int64".into(),
+            )),
+            ColumnTy::Utf8View => Ok(TypedCol::Skip),
+        }
+    }
+
+    #[inline(always)]
+    fn f64_at(&self, row: usize) -> f64 {
+        match self {
+            TypedCol::F64(v) => v[row],
+            // Reaching here means the spec referenced a non-Float64
+            // column from a predicate/agg slot; the validator should
+            // surface that at try_new time. 0.0 keeps the kernel safe.
+            TypedCol::I32(_) | TypedCol::Skip => 0.0,
+        }
+    }
+
+    #[inline(always)]
+    fn i32_at(&self, row: usize) -> i32 {
+        match self {
+            TypedCol::I32(v) => v[row],
+            TypedCol::F64(_) | TypedCol::Skip => i32::MIN,
+        }
+    }
+}
+
 // Per-batch templates. Σ.G.2f.2 lands the first two: a generic hash-
 // grouped fallback and a dict-single specialization. Future templates
 // (Utf8View first-byte 1-key, 2-key composites, PerfectHashAggregate
@@ -570,11 +655,7 @@ impl FilterMultiAggSpec {
             return Ok(());
         }
 
-        let input_cols: Vec<&dyn Array> = self
-            .input_col_indices
-            .iter()
-            .map(|&i| batch.column(i).as_ref())
-            .collect();
+        let typed_cols = self.build_typed_cols(batch)?;
 
         if acc.dict_values.len() < self.group_keys.len() {
             acc.dict_values
@@ -596,7 +677,7 @@ impl FilterMultiAggSpec {
 
         let mut key_buf: Vec<u8> = Vec::with_capacity(8 * self.group_keys.len());
         for row in 0..n_rows {
-            if !self.eval_predicate(&input_cols, row) {
+            if !self.eval_predicate_typed(&typed_cols, row) {
                 continue;
             }
             key_buf.clear();
@@ -609,7 +690,7 @@ impl FilterMultiAggSpec {
                 .entry(key_buf.clone())
                 .or_insert_with(|| vec![0.0; self.aggregates.len()]);
             for (ai, agg) in self.aggregates.iter().enumerate() {
-                cells[ai] += self.eval_agg(agg, &input_cols, row);
+                cells[ai] += self.eval_agg_typed(agg, &typed_cols, row);
             }
         }
         Ok(())
@@ -645,11 +726,7 @@ impl FilterMultiAggSpec {
         }
 
         let n_aggs = self.aggregates.len();
-        let input_cols: Vec<&dyn Array> = self
-            .input_col_indices
-            .iter()
-            .map(|&i| batch.column(i).as_ref())
-            .collect();
+        let typed_cols = self.build_typed_cols(batch)?;
 
         if acc.dict_values.is_empty() {
             acc.dict_values.resize(1, HashMap::new());
@@ -686,7 +763,7 @@ impl FilterMultiAggSpec {
         let mut local_codes: Vec<u32> = Vec::new();
 
         for row in 0..n_rows {
-            if !self.eval_predicate(&input_cols, row) {
+            if !self.eval_predicate_typed(&typed_cols, row) {
                 continue;
             }
             let code = dict_keys[row];
@@ -706,7 +783,7 @@ impl FilterMultiAggSpec {
             };
             let cells = &mut local_cells[local_idx];
             for (ai, agg) in self.aggregates.iter().enumerate() {
-                cells[ai] += self.eval_agg(agg, &input_cols, row);
+                cells[ai] += self.eval_agg_typed(agg, &typed_cols, row);
             }
         }
 
@@ -728,78 +805,56 @@ impl FilterMultiAggSpec {
         Ok(())
     }
 
-    fn eval_predicate(&self, cols: &[&dyn Array], row: usize) -> bool {
+    /// Build the per-batch typed-slice cache for all numeric input
+    /// columns. Returns an error if any input column's runtime type
+    /// disagrees with its declared `ColumnTy`.
+    fn build_typed_cols<'a>(&self, batch: &'a RecordBatch) -> DfResult<Vec<TypedCol<'a>>> {
+        self.input_col_indices
+            .iter()
+            .enumerate()
+            .map(|(slot, &col_idx)| {
+                TypedCol::build(batch.column(col_idx).as_ref(), self.input_tys[slot])
+            })
+            .collect()
+    }
+
+    /// Predicate eval using the per-batch typed-slice cache. No dyn
+    /// dispatch in the inner read — just an array index on a `&[f64]`
+    /// or `&[i32]`.
+    #[inline(always)]
+    fn eval_predicate_typed(&self, cols: &[TypedCol], row: usize) -> bool {
         for clause in &self.predicate {
-            if !self.eval_clause(clause, cols, row) {
+            let col = &cols[clause.column];
+            let ok = match clause.op {
+                ClauseOp::F64Ge => col.f64_at(row) >= clause.imm_f64,
+                ClauseOp::F64Le => col.f64_at(row) <= clause.imm_f64,
+                ClauseOp::F64Lt => col.f64_at(row) < clause.imm_f64,
+                ClauseOp::F64Gt => col.f64_at(row) > clause.imm_f64,
+                ClauseOp::I32Ge => col.i32_at(row) >= clause.imm_i32,
+                ClauseOp::I32Le => col.i32_at(row) <= clause.imm_i32,
+                ClauseOp::I32Lt => col.i32_at(row) < clause.imm_i32,
+                ClauseOp::I32Gt => col.i32_at(row) > clause.imm_i32,
+            };
+            if !ok {
                 return false;
             }
         }
         true
     }
 
-    fn eval_clause(&self, clause: &Clause, cols: &[&dyn Array], row: usize) -> bool {
-        let col = cols[clause.column];
-        match clause.op {
-            ClauseOp::F64Ge | ClauseOp::F64Le | ClauseOp::F64Lt | ClauseOp::F64Gt => {
-                let v = col
-                    .as_any()
-                    .downcast_ref::<Float64Array>()
-                    .map(|a| a.value(row))
-                    .unwrap_or(f64::NAN);
-                let lit = clause.imm_f64;
-                match clause.op {
-                    ClauseOp::F64Ge => v >= lit,
-                    ClauseOp::F64Le => v <= lit,
-                    ClauseOp::F64Lt => v < lit,
-                    ClauseOp::F64Gt => v > lit,
-                    _ => unreachable!(),
-                }
-            }
-            ClauseOp::I32Ge | ClauseOp::I32Le | ClauseOp::I32Lt | ClauseOp::I32Gt => {
-                let v = col
-                    .as_any()
-                    .downcast_ref::<Date32Array>()
-                    .map(|a| a.value(row))
-                    .or_else(|| {
-                        col.as_any()
-                            .downcast_ref::<Int32Array>()
-                            .map(|a| a.value(row))
-                    })
-                    .unwrap_or(i32::MIN);
-                let lit = clause.imm_i32;
-                match clause.op {
-                    ClauseOp::I32Ge => v >= lit,
-                    ClauseOp::I32Le => v <= lit,
-                    ClauseOp::I32Lt => v < lit,
-                    ClauseOp::I32Gt => v > lit,
-                    _ => unreachable!(),
-                }
-            }
-        }
-    }
-
-    fn eval_agg(&self, agg: &AggExpr, cols: &[&dyn Array], row: usize) -> f64 {
-        fn f64_col(cols: &[&dyn Array], idx: usize, row: usize) -> f64 {
-            cols[idx]
-                .as_any()
-                .downcast_ref::<Float64Array>()
-                .map(|a| a.value(row))
-                .unwrap_or(0.0)
-        }
+    /// Aggregate eval using the per-batch typed-slice cache.
+    #[inline(always)]
+    fn eval_agg_typed(&self, agg: &AggExpr, cols: &[TypedCol], row: usize) -> f64 {
         match agg {
-            AggExpr::SumColumn(i) => f64_col(cols, *i, row),
-            AggExpr::SumProductColumns(a, b) => f64_col(cols, *a, row) * f64_col(cols, *b, row),
+            AggExpr::SumColumn(i) => cols[*i].f64_at(row),
+            AggExpr::SumProductColumns(a, b) => cols[*a].f64_at(row) * cols[*b].f64_at(row),
             AggExpr::SumProductOneMinus(a, b) => {
-                f64_col(cols, *a, row) * (1.0 - f64_col(cols, *b, row))
+                cols[*a].f64_at(row) * (1.0 - cols[*b].f64_at(row))
             }
             AggExpr::SumProductTwoOneMinusOnePlus(a, b, c) => {
-                f64_col(cols, *a, row)
-                    * (1.0 - f64_col(cols, *b, row))
-                    * (1.0 + f64_col(cols, *c, row))
+                cols[*a].f64_at(row) * (1.0 - cols[*b].f64_at(row)) * (1.0 + cols[*c].f64_at(row))
             }
             AggExpr::CountStar => 1.0,
-            // Σ.G.2f.1 doesn't yet handle the LIKE-prefix CASE/SUM
-            // shape (Q14). Add when Q14 retires.
             AggExpr::SumProductOneMinusGuardedByPrefix { .. } => 0.0,
         }
     }
