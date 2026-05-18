@@ -36,7 +36,13 @@ duckdb = { workspace = true }
 rusqlite = { workspace = true }
 mysql_async = { workspace = true }
 object_store = { workspace = true }
-parquet = { workspace = true }
+# Σ.E5.5 (2026-05-18): removed `parquet = { workspace = true }`.
+# All in-crate `parquet::` references now go through DataFusion's
+# re-export (`datafusion::parquet::…`). Eliminates the direct
+# workspace edge to parquet-rs as a flow-side dep. The transitive
+# dep via DataFusion remains — DF's own Parquet integration still
+# uses parquet-rs internally, and the surface we hit (writer,
+# metadata, reader) is exactly what DF re-exports.
 # ematix-parquet sibling repo — hand-rolled parquet decoder with
 # NEON-fused predicate kernels. Wired into `ematix_parquet_bridge`
 # to produce Arrow arrays from column chunks without going through

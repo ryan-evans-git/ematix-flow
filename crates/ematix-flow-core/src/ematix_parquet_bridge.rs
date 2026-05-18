@@ -696,8 +696,8 @@ mod tests {
     use std::fs::File;
     use std::path::PathBuf;
 
-    use parquet::column::reader::ColumnReader;
-    use parquet::file::reader::{FileReader, SerializedFileReader};
+    use datafusion::parquet::column::reader::ColumnReader;
+    use datafusion::parquet::file::reader::{FileReader, SerializedFileReader};
 
     fn lineitem_path() -> Option<PathBuf> {
         // 1. Developer override.
@@ -760,7 +760,7 @@ mod tests {
             ColumnReader::ByteArrayColumnReader(t) => t,
             _ => panic!("not ByteArray"),
         };
-        let mut out: Vec<parquet::data_type::ByteArray> = Vec::with_capacity(total);
+        let mut out: Vec<datafusion::parquet::data_type::ByteArray> = Vec::with_capacity(total);
         typed.read_records(total, None, None, &mut out).unwrap();
         out.into_iter().map(|b| b.data().to_vec()).collect()
     }

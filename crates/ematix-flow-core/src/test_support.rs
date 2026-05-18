@@ -33,9 +33,9 @@ use std::sync::OnceLock;
 
 use arrow_array::{Date32Array, Float64Array, Int32Array, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
-use parquet::arrow::ArrowWriter;
-use parquet::basic::Compression;
-use parquet::file::properties::WriterProperties;
+use datafusion::parquet::arrow::ArrowWriter;
+use datafusion::parquet::basic::Compression;
+use datafusion::parquet::file::properties::WriterProperties;
 use std::fs::File;
 use std::sync::Arc;
 use tempfile::TempDir;

@@ -44,8 +44,8 @@ use datafusion::physical_plan::{
     SendableRecordBatchStream,
 };
 
-use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
-use parquet::file::reader::{FileReader, SerializedFileReader};
+use datafusion::parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
+use datafusion::parquet::file::reader::{FileReader, SerializedFileReader};
 
 use crate::emat_arrow_reader::EmatArrowBatchReaderBuilder;
 use crate::ematix_parquet_bridge::{
@@ -1165,11 +1165,11 @@ mod tests {
     /// confirm row count.
     #[tokio::test]
     async fn end_to_end_simple_count() {
-        use parquet::basic::{Compression, Repetition, Type as PhysicalType};
-        use parquet::column::writer::ColumnWriter;
-        use parquet::file::properties::WriterProperties;
-        use parquet::file::writer::SerializedFileWriter;
-        use parquet::schema::types::Type as PType;
+        use datafusion::parquet::basic::{Compression, Repetition, Type as PhysicalType};
+        use datafusion::parquet::column::writer::ColumnWriter;
+        use datafusion::parquet::file::properties::WriterProperties;
+        use datafusion::parquet::file::writer::SerializedFileWriter;
+        use datafusion::parquet::schema::types::Type as PType;
 
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let path = tmp.path().to_path_buf();
@@ -1282,12 +1282,12 @@ mod tests {
     /// has dict-encoded inputs to bind against.
     #[tokio::test]
     async fn dict_preservation_end_to_end() {
-        use parquet::basic::{Compression, Repetition, Type as PhysicalType};
-        use parquet::column::writer::ColumnWriter;
-        use parquet::data_type::ByteArray;
-        use parquet::file::properties::WriterProperties;
-        use parquet::file::writer::SerializedFileWriter;
-        use parquet::schema::types::Type as PType;
+        use datafusion::parquet::basic::{Compression, Repetition, Type as PhysicalType};
+        use datafusion::parquet::column::writer::ColumnWriter;
+        use datafusion::parquet::data_type::ByteArray;
+        use datafusion::parquet::file::properties::WriterProperties;
+        use datafusion::parquet::file::writer::SerializedFileWriter;
+        use datafusion::parquet::schema::types::Type as PType;
 
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let path = tmp.path().to_path_buf();
@@ -1300,7 +1300,7 @@ mod tests {
                 .with_fields(vec![Arc::new(
                     PType::primitive_type_builder("flag", PhysicalType::BYTE_ARRAY)
                         .with_repetition(Repetition::REQUIRED)
-                        .with_converted_type(parquet::basic::ConvertedType::UTF8)
+                        .with_converted_type(datafusion::parquet::basic::ConvertedType::UTF8)
                         .build()
                         .unwrap(),
                 )])
@@ -1427,13 +1427,13 @@ mod tests {
         //
         // Setup: read SF=1 lineitem (l_shipdate, l_partkey,
         // l_extendedprice, l_discount) into a temp parquet.
-        use parquet::basic::{Compression, Repetition, Type as PhysicalType};
-        use parquet::column::reader::ColumnReader;
-        use parquet::column::writer::ColumnWriter;
-        use parquet::file::properties::WriterProperties;
-        use parquet::file::reader::{FileReader, SerializedFileReader};
-        use parquet::file::writer::SerializedFileWriter;
-        use parquet::schema::types::Type as PType;
+        use datafusion::parquet::basic::{Compression, Repetition, Type as PhysicalType};
+        use datafusion::parquet::column::reader::ColumnReader;
+        use datafusion::parquet::column::writer::ColumnWriter;
+        use datafusion::parquet::file::properties::WriterProperties;
+        use datafusion::parquet::file::reader::{FileReader, SerializedFileReader};
+        use datafusion::parquet::file::writer::SerializedFileWriter;
+        use datafusion::parquet::schema::types::Type as PType;
 
         let r = SerializedFileReader::new(File::open(&path).unwrap()).unwrap();
         let total = r.metadata().file_metadata().num_rows() as usize;
@@ -1501,7 +1501,7 @@ mod tests {
                     Arc::new(
                         PType::primitive_type_builder("l_shipdate", PhysicalType::INT32)
                             .with_repetition(Repetition::REQUIRED)
-                            .with_converted_type(parquet::basic::ConvertedType::DATE)
+                            .with_converted_type(datafusion::parquet::basic::ConvertedType::DATE)
                             .build()
                             .unwrap(),
                     ),
@@ -1633,11 +1633,11 @@ mod tests {
     /// not vacuous.
     #[tokio::test]
     async fn streaming_reader_provider_q1_shape() {
-        use parquet::basic::{Compression, Repetition, Type as PhysicalType};
-        use parquet::column::writer::ColumnWriter;
-        use parquet::file::properties::WriterProperties;
-        use parquet::file::writer::SerializedFileWriter;
-        use parquet::schema::types::Type as PType;
+        use datafusion::parquet::basic::{Compression, Repetition, Type as PhysicalType};
+        use datafusion::parquet::column::writer::ColumnWriter;
+        use datafusion::parquet::file::properties::WriterProperties;
+        use datafusion::parquet::file::writer::SerializedFileWriter;
+        use datafusion::parquet::schema::types::Type as PType;
 
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let path = tmp.path().to_path_buf();
