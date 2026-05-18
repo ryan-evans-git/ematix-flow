@@ -111,6 +111,11 @@ pub mod state_size;
 pub mod state_store;
 pub mod strategy;
 pub mod streaming;
+// Σ.E4a: hardware topology discovery. Single source of truth for
+// NUMA node count / core count; consumed by Σ.E4b (NUMA-local alloc)
+// and Σ.E4c (node-partitioned hash execs). Today's implementation is
+// a single-node stub — hwloc2 backend lands in Σ.E4a.2.
+pub mod topology;
 pub mod transform;
 pub mod types;
 pub mod windowed;
