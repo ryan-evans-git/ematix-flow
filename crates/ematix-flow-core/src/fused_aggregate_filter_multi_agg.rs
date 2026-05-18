@@ -160,6 +160,21 @@ impl FilterMultiAggSpec {
                 agg_output_names.len()
             )));
         }
+        // AvgColumn divides at finalize by a CountStar cell. A spec
+        // with AvgColumn but no CountStar would have no count to
+        // divide by; reject up front so the planner falls through to
+        // DataFusion's default plan instead.
+        let has_avg = aggregates
+            .iter()
+            .any(|a| matches!(a, AggExpr::AvgColumn(_)));
+        let has_count = aggregates.iter().any(|a| matches!(a, AggExpr::CountStar));
+        if has_avg && !has_count {
+            return Err(DataFusionError::Plan(
+                "FilterMultiAggSpec: AvgColumn requires a CountStar aggregate \
+                 to divide by at finalize"
+                    .into(),
+            ));
+        }
 
         // Resolve predicate/agg input columns.
         let mut input_col_indices = Vec::with_capacity(input_column_names.len());
@@ -388,6 +403,14 @@ impl AggregateSpec for FilterMultiAggSpec {
             }
         }
 
+        // Cache the CountStar slot index (if any) so AvgColumn cells
+        // can divide by it during finalize. Validated at try_new:
+        // every spec with an AvgColumn has at least one CountStar.
+        let count_slot: Option<usize> = self
+            .aggregates
+            .iter()
+            .position(|a| matches!(a, AggExpr::CountStar));
+
         // Materialise aggregate output columns.
         let mut agg_columns: Vec<ArrayRef> = Vec::with_capacity(n_aggs);
         for (ai, agg) in self.aggregates.iter().enumerate() {
@@ -395,6 +418,19 @@ impl AggregateSpec for FilterMultiAggSpec {
                 AggExpr::CountStar => {
                     let vals: Vec<i64> = entries.iter().map(|(_, c)| c[ai] as i64).collect();
                     Arc::new(Int64Array::from(vals))
+                }
+                AggExpr::AvgColumn(_) => {
+                    // Divide the accumulated sum cell by the group's
+                    // count. count_slot is Some by try_new's validation.
+                    let cs = count_slot.expect("AvgColumn requires CountStar — validated");
+                    let vals: Vec<f64> = entries
+                        .iter()
+                        .map(|(_, c)| {
+                            let cnt = c[cs];
+                            if cnt == 0.0 { f64::NAN } else { c[ai] / cnt }
+                        })
+                        .collect();
+                    Arc::new(Float64Array::from(vals))
                 }
                 _ => {
                     let vals: Vec<f64> = entries.iter().map(|(_, c)| c[ai]).collect();
@@ -427,14 +463,15 @@ impl AggregateSpec for FilterMultiAggSpec {
                 }
             }
         }
-        // Merge group entries: sum cells.
+        // Merge group entries. Combine cells using each agg's
+        // semantics (+= for sum-like, min/max for the order variants).
         for (key, cells) in right.groups {
             let existing = left
                 .groups
                 .entry(key)
-                .or_insert_with(|| vec![0.0; self.aggregates.len()]);
+                .or_insert_with(|| fresh_cells(&self.aggregates));
             for (i, v) in cells.into_iter().enumerate() {
-                existing[i] += v;
+                existing[i] = self.combine_cell(&self.aggregates[i], existing[i], v);
             }
         }
         left
@@ -711,9 +748,10 @@ impl FilterMultiAggSpec {
             let cells = acc
                 .groups
                 .entry(key_buf.clone())
-                .or_insert_with(|| vec![0.0; self.aggregates.len()]);
+                .or_insert_with(|| fresh_cells(&self.aggregates));
             for (ai, agg) in self.aggregates.iter().enumerate() {
-                cells[ai] += self.eval_agg_typed(agg, &typed_cols, row);
+                cells[ai] =
+                    self.combine_cell(agg, cells[ai], self.eval_agg_typed(agg, &typed_cols, row));
             }
         }
         Ok(())
@@ -748,7 +786,6 @@ impl FilterMultiAggSpec {
             return Ok(());
         }
 
-        let n_aggs = self.aggregates.len();
         let typed_cols = self.build_typed_cols(batch)?;
 
         if acc.dict_values.is_empty() {
@@ -794,7 +831,7 @@ impl FilterMultiAggSpec {
                 std::collections::hash_map::Entry::Occupied(e) => *e.get(),
                 std::collections::hash_map::Entry::Vacant(e) => {
                     let idx = local_cells.len();
-                    local_cells.push(vec![0.0; n_aggs]);
+                    local_cells.push(fresh_cells(&self.aggregates));
                     local_codes.push(code);
                     // Capture the dict value mapping the first time
                     // this code is seen (used by `finalize`).
@@ -806,22 +843,24 @@ impl FilterMultiAggSpec {
             };
             let cells = &mut local_cells[local_idx];
             for (ai, agg) in self.aggregates.iter().enumerate() {
-                cells[ai] += self.eval_agg_typed(agg, &typed_cols, row);
+                cells[ai] =
+                    self.combine_cell(agg, cells[ai], self.eval_agg_typed(agg, &typed_cols, row));
             }
         }
 
         // Fold local cells into the global accumulator. One probe per
-        // unique code, not per row.
+        // unique code, not per row. Combine semantics matches the
+        // hot loop (sum-like / min / max) per agg.
         for (idx, code) in local_codes.iter().enumerate() {
             let mut key_buf = Vec::with_capacity(4);
             key_buf.extend_from_slice(&code.to_le_bytes());
             let entry = acc
                 .groups
                 .entry(key_buf)
-                .or_insert_with(|| vec![0.0; n_aggs]);
+                .or_insert_with(|| fresh_cells(&self.aggregates));
             let local = std::mem::take(&mut local_cells[idx]);
             for (i, v) in local.into_iter().enumerate() {
-                entry[i] += v;
+                entry[i] = self.combine_cell(&self.aggregates[i], entry[i], v);
             }
         }
 
@@ -887,10 +926,17 @@ impl FilterMultiAggSpec {
         let dict_keys = dict.keys().values();
         let cardinality = dict_values.len();
 
-        // Flat per-batch cell storage. `seen[code]` tracks which codes
-        // had any contribution this batch so the merge loop touches
-        // only those slots (not the full cardinality).
-        let mut cells: Vec<f64> = vec![0.0; cardinality * n_aggs];
+        // Flat per-batch cell storage. Each agg slot is initialised
+        // with its own seed value (`+inf` for MIN, `-inf` for MAX, 0
+        // for sum-like) so the per-row combine doesn't need a
+        // first-row special case. `seen[code]` tracks which codes had
+        // any contribution this batch so the merge loop touches only
+        // those slots (not the full cardinality).
+        let initials: Vec<f64> = self.aggregates.iter().map(initial_cell_value).collect();
+        let mut cells: Vec<f64> = Vec::with_capacity(cardinality * n_aggs);
+        for _ in 0..cardinality {
+            cells.extend_from_slice(&initials);
+        }
         let mut seen: Vec<bool> = vec![false; cardinality];
         let mut seen_codes: Vec<u32> = Vec::new();
 
@@ -912,7 +958,11 @@ impl FilterMultiAggSpec {
             }
             let base = code_idx * n_aggs;
             for (ai, agg) in self.aggregates.iter().enumerate() {
-                cells[base + ai] += self.eval_agg_typed(agg, &typed_cols, row);
+                cells[base + ai] = self.combine_cell(
+                    agg,
+                    cells[base + ai],
+                    self.eval_agg_typed(agg, &typed_cols, row),
+                );
             }
         }
 
@@ -928,10 +978,10 @@ impl FilterMultiAggSpec {
             let entry = acc
                 .groups
                 .entry(key_buf)
-                .or_insert_with(|| vec![0.0; n_aggs]);
+                .or_insert_with(|| fresh_cells(&self.aggregates));
             let base = code_idx * n_aggs;
             for ai in 0..n_aggs {
-                entry[ai] += cells[base + ai];
+                entry[ai] = self.combine_cell(&self.aggregates[ai], entry[ai], cells[base + ai]);
             }
         }
 
@@ -975,11 +1025,23 @@ impl FilterMultiAggSpec {
         true
     }
 
-    /// Aggregate eval using the per-batch typed-slice cache.
+    /// Per-row value an aggregate contributes. The hot loop combines
+    /// this with the existing cell via [`combine_cell`] — `+` for the
+    /// additive variants, `min` / `max` for the order variants.
     #[inline(always)]
     fn eval_agg_typed(&self, agg: &AggExpr, cols: &[TypedCol], row: usize) -> f64 {
         match agg {
-            AggExpr::SumColumn(i) => cols[*i].f64_at(row),
+            // Single-column reads: SumColumn accumulates the value,
+            // AvgColumn does the same (finalize divides by COUNT),
+            // MinColumn / MaxColumn track the same value pre-combine.
+            AggExpr::SumColumn(i)
+            | AggExpr::AvgColumn(i)
+            | AggExpr::MinColumn(i)
+            | AggExpr::MaxColumn(i) => cols[*i].f64_at(row),
+            AggExpr::SumSquaresColumn(i) => {
+                let v = cols[*i].f64_at(row);
+                v * v
+            }
             AggExpr::SumProductColumns(a, b) => cols[*a].f64_at(row) * cols[*b].f64_at(row),
             AggExpr::SumProductOneMinus(a, b) => {
                 cols[*a].f64_at(row) * (1.0 - cols[*b].f64_at(row))
@@ -991,6 +1053,36 @@ impl FilterMultiAggSpec {
             AggExpr::SumProductOneMinusGuardedByPrefix { .. } => 0.0,
         }
     }
+
+    /// Combine `current` cell value with the per-row contribution.
+    /// Additive for most variants; `min` / `max` for the order
+    /// variants. Kept tight and `#[inline(always)]` so the per-row
+    /// hot loop monomorphises cleanly.
+    #[inline(always)]
+    fn combine_cell(&self, agg: &AggExpr, current: f64, row_value: f64) -> f64 {
+        match agg {
+            AggExpr::MinColumn(_) => current.min(row_value),
+            AggExpr::MaxColumn(_) => current.max(row_value),
+            _ => current + row_value,
+        }
+    }
+}
+
+/// Initial cell value for an aggregate — `+inf` for MIN (any real
+/// value beats it), `-inf` for MAX, `0.0` for all additive variants.
+#[inline(always)]
+fn initial_cell_value(agg: &AggExpr) -> f64 {
+    match agg {
+        AggExpr::MinColumn(_) => f64::INFINITY,
+        AggExpr::MaxColumn(_) => f64::NEG_INFINITY,
+        _ => 0.0,
+    }
+}
+
+/// Allocate a fresh per-group cell vector with the correct initial
+/// values. Called at group-insertion time in every template path.
+fn fresh_cells(aggregates: &[AggExpr]) -> AggCells {
+    aggregates.iter().map(initial_cell_value).collect()
 }
 
 #[cfg(test)]
@@ -1235,6 +1327,154 @@ mod tests {
         let n = out.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
         assert_eq!(sum.value(0), 27.0); // 5 + 10 + 12 (50 filtered)
         assert_eq!(n.value(0), 3);
+    }
+
+    /// Σ.G.2f.3 — MIN/MAX/SumSquares per group, exercised through
+    /// the generic + perfect-hash + dict-single paths via dispatch.
+    #[test]
+    fn min_max_sumsquares_per_group() {
+        use arrow_array::builder::StringDictionaryBuilder;
+        use arrow_array::types::UInt32Type;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "g",
+                DataType::Dictionary(Box::new(DataType::UInt32), Box::new(DataType::Utf8)),
+                false,
+            ),
+            Field::new("v", DataType::Float64, false),
+        ]));
+        let groups = ["a", "a", "b", "b", "a"];
+        let v = vec![5.0, 1.0, 10.0, 3.0, 7.0];
+        let mut builder = StringDictionaryBuilder::<UInt32Type>::new();
+        for s in groups.iter() {
+            builder.append(*s).unwrap();
+        }
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(builder.finish()), Arc::new(Float64Array::from(v))],
+        )
+        .unwrap();
+
+        let spec = FilterMultiAggSpec::try_new(
+            vec![],
+            vec![ColumnTy::Float64],
+            &["v"],
+            vec![
+                AggExpr::MinColumn(0),
+                AggExpr::MaxColumn(0),
+                AggExpr::SumSquaresColumn(0),
+                AggExpr::CountStar,
+            ],
+            vec!["min_v".into(), "max_v".into(), "sum_v2".into(), "n".into()],
+            vec![("g".into(), GroupKeyKind::DictionaryU32)],
+            &schema,
+        )
+        .unwrap();
+        let mut acc = FilterMultiAggAccumulator::default();
+        spec.process_batch(&batch, &mut acc).unwrap();
+        let out = spec.finalize(acc).unwrap();
+        // Group order is by dict code; for groups inserted "a","b"
+        // the codes are 0, 1, so 'a' first.
+        let min = out
+            .column(1)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        let max = out
+            .column(2)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        let sq = out
+            .column(3)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        // group 'a' = [5, 1, 7]: min=1, max=7, sum²=25+1+49=75, n=3
+        // group 'b' = [10, 3]:   min=3, max=10, sum²=100+9=109, n=2
+        assert_eq!(min.value(0), 1.0);
+        assert_eq!(max.value(0), 7.0);
+        assert!((sq.value(0) - 75.0).abs() < 1e-9);
+        assert_eq!(min.value(1), 3.0);
+        assert_eq!(max.value(1), 10.0);
+        assert!((sq.value(1) - 109.0).abs() < 1e-9);
+    }
+
+    /// Σ.G.2f.3 — verify AvgColumn produces mean-of-column per group.
+    #[test]
+    fn avg_column_divides_by_countstar() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("g", DataType::Utf8View, false),
+            Field::new("v", DataType::Float64, false),
+        ]));
+        let groups = ["a", "a", "b", "b", "b"];
+        let vals = vec![10.0, 20.0, 1.0, 2.0, 3.0];
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringViewArray::from(groups.to_vec())),
+                Arc::new(Float64Array::from(vals)),
+            ],
+        )
+        .unwrap();
+
+        let spec = FilterMultiAggSpec::try_new(
+            vec![],
+            vec![ColumnTy::Float64],
+            &["v"],
+            vec![
+                AggExpr::SumColumn(0),
+                AggExpr::AvgColumn(0),
+                AggExpr::CountStar,
+            ],
+            vec!["sum_v".into(), "avg_v".into(), "n".into()],
+            vec![("g".into(), GroupKeyKind::Utf8ViewFirstByte)],
+            &schema,
+        )
+        .unwrap();
+
+        let mut acc = FilterMultiAggAccumulator::default();
+        spec.process_batch(&batch, &mut acc).unwrap();
+        let out = spec.finalize(acc).unwrap();
+        // Stable sort on packed key bytes → 'a' first, then 'b'.
+        let sum = out
+            .column(1)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        let avg = out
+            .column(2)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        let n = out.column(3).as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(sum.value(0), 30.0);
+        assert_eq!(sum.value(1), 6.0);
+        assert!((avg.value(0) - 15.0).abs() < 1e-9, "avg_a = 15");
+        assert!((avg.value(1) - 2.0).abs() < 1e-9, "avg_b = 2");
+        assert_eq!(n.value(0), 2);
+        assert_eq!(n.value(1), 3);
+    }
+
+    /// AvgColumn without a paired CountStar must error at try_new.
+    #[test]
+    fn avg_column_without_countstar_errors() {
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Float64, false)]));
+        let err = FilterMultiAggSpec::try_new(
+            vec![],
+            vec![ColumnTy::Float64],
+            &["v"],
+            vec![AggExpr::AvgColumn(0)],
+            vec!["avg_v".into()],
+            vec![],
+            &schema,
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("AvgColumn") && msg.contains("CountStar"),
+            "unexpected error: {msg}"
+        );
     }
 
     /// Σ.G.2f.2 — verify the perfect-hash template path produces
