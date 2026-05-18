@@ -26,9 +26,12 @@ use datafusion::arrow::array::{Date32Array, Float64Array, RecordBatch};
 /// l_quantity <  qty_hi                   — Float64
 /// ```
 ///
-/// Carried as plain values; the planner rule extracts these from a
-/// `PhysicalExpr` AST after pattern-matching on the predicate shape
-/// (see `crate::fused_jit_rule::extract_q6_predicate`).
+/// Carried as plain values. Σ.G.2e-4 retired the SQL-pattern matcher
+/// that built this from a `PhysicalExpr` AST (`InjectFusedQ6Rule`);
+/// the replacement `InjectFilterSumRule` produces a runtime-configured
+/// `FilterSumSpec` directly. `Q6Predicate` survives as a stable input
+/// to `Q6Spec::try_new_jit` for the direct-construction examples
+/// (`tpch_q6_jit_bench`, `tpch_q6_tune`).
 #[derive(Debug, Clone, Copy)]
 pub struct Q6Predicate {
     pub date_lo: i32,

@@ -1,66 +1,76 @@
-//! Σ.G.2e-2: `InjectFilterSumRule` — `PhysicalOptimizerRule` that
+//! Σ.G.2e-2/3: `InjectFilterSumRule` — `PhysicalOptimizerRule` that
 //! pattern-matches a SUM-over-Filter SQL plan shape, extracts the
-//! literals + clauses, and constructs a `FusedAggregateExec<FilterSumSpec>`
-//! over the scan beneath the FilterExec.
+//! literals + clauses + aggregate, and constructs a
+//! `FusedAggregateExec<FilterSumSpec>` over the scan beneath the
+//! FilterExec.
 //!
-//! ## Scope of this slice
+//! ## Supported shape (Σ.G.2e-3)
 //!
-//! Σ.G.2e-2 ships the rule that proves [`crate::fused_aggregate_filter_sum::FilterSumSpec`]
-//! works end-to-end on real SQL through DataFusion. To keep the SQL
-//! pattern matching from blowing up the diff, this first cut recognises
-//! exactly the canonical Q6 shape — same predicate columns + same
-//! aggregate as the existing `InjectFusedQ6Rule`, but routed through
-//! `FilterSumSpec` (built from a `FusedFilterAggSpec::q6(...)` IR
-//! description) instead of `Q6Spec`. The literal *values* are extracted
-//! from the AST exactly as in the Q6 rule — what changes is the
-//! resulting spec type, which is runtime-configured rather than
-//! Q6-hardcoded.
+//! ```sql
+//! SELECT sum(<numeric_expr>) AS <alias>
+//! FROM <scan>
+//! WHERE <and_chain_of_(col ⊕ literal)_clauses>
+//! ```
 //!
-//! ## Why ship this if it's "no more general than InjectFusedQ6Rule"
+//! Concretely:
 //!
-//! Two reasons:
+//! - **Aggregate**: `SUM(col)` (Float64 column) or `SUM(col_a * col_b)`
+//!   (both Float64 columns). The projection alias is arbitrary —
+//!   "revenue", "total", anything — propagated to the output schema
+//!   field name.
+//! - **Predicate**: any AND-chain of `Column ⊕ Literal` (or its
+//!   mirror) where:
+//!     - column type ∈ `{Float64, Date32, Int32}`
+//!     - operator ∈ `{<, <=, >, >=}` (Eq/NotEq are not supported
+//!       — the underlying JIT IR's `ClauseOp` lacks them).
+//! - **Plan shape**: Projection → AggregateExec(Final) → CoalescePartitions
+//!   → AggregateExec(Partial) → FilterExec → scan (the standard
+//!   DataFusion plan for the SQL above). The exec stack is matched via
+//!   the shared `match_aggregate_query_shape` walker.
 //!
-//! 1. **Bench gate.** The new `FilterSumSpec::process_batch` allocates
-//!    a `Vec<*const u8>` per batch (vs Q6Spec's statically-typed
-//!    fixed-size array). The Σ.G.2e bench (`sigma_g2e_filter_sum_vs_q6`)
-//!    measures whether that allocation is a real cost. If it stays
-//!    within 3 % of the Q6Spec path on TPC-H SF=1 Q6, the spec is
-//!    confirmed perf-equivalent and future slices can broaden the SQL
-//!    pattern coverage without re-running the same gate.
+//! Anything else (group-by, multi-aggregate, SUM-of-product-of-three,
+//! BoolExpr branches, sub-queries) makes the rule no-op so DataFusion's
+//! default plan runs unchanged.
 //!
-//! 2. **Substrate for generalisation.** Σ.G.2e-3 (next slice) extends
-//!    this rule's matcher to accept arbitrary column sets / arbitrary
-//!    clause counts on numeric columns. That follow-up changes only
-//!    the matcher; `FilterSumSpec` itself was already general at
-//!    Σ.G.2e-1 land time. Splitting it this way keeps each slice
-//!    individually bench-gated.
+//! ## Why this generalisation can't widen the JIT IR
 //!
-//! ## Composition with the existing Q6 rule
+//! `FusedFilterAggSpec`'s `ClauseOp` enum lists exactly the ops the
+//! Cranelift emitter knows how to render — adding Eq/NotEq would
+//! require extending the IR (small change, but a separate slice).
+//! Similarly, exotic aggregate shapes (`SUM(col * (1 - col))`,
+//! `SUM(CASE WHEN …)`, etc.) have dedicated `AggExpr` variants the
+//! generalised matcher could be taught later. The bench-gated parity
+//! confirmed by `sigma_g2e_filter_sum_vs_q6` covers the supported
+//! subset above; broader shapes need their own gates.
 //!
-//! Mutually exclusive with `InjectFusedQ6Rule`: only one of them
-//! should be registered on a SessionContext. The Q6 rule produces a
-//! `FusedAggregateExec<Q6Spec(JIT)>`; this rule produces a
-//! `FusedAggregateExec<FilterSumSpec>`. Both share the generic
-//! operator scaffold, both go through the same Cranelift kernel —
-//! they're alternate constructions of the same final exec node, and
-//! letting both fire would double-rewrite the plan.
+//! ## Composition with `InjectFusedQ6Rule`
 //!
-//! Once Σ.G.2e-3 broadens the matcher AND the bench gate confirms
-//! parity, the Q6 rule retires (Σ.G.2e-4).
+//! Σ.G.2e-3's generalised matcher subsumes `InjectFusedQ6Rule` —
+//! canonical Q6 SQL is a special case of the general shape above.
+//! Σ.G.2e-4 retires the Q6 rule. Until then they remain mutually
+//! exclusive (only one should be registered on a SessionContext) since
+//! both rewrite the same plan node to alternate constructions of
+//! `FusedAggregateExec<S>`.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
-use datafusion::common::Result as DfResult;
+use datafusion::arrow::datatypes::{DataType, SchemaRef};
+use datafusion::common::ScalarValue;
 use datafusion::common::config::ConfigOptions;
 use datafusion::common::tree_node::{Transformed, TreeNode};
+use datafusion::common::{DataFusionError, Result as DfResult};
+use datafusion::logical_expr::Operator;
+use datafusion::physical_expr::PhysicalExpr;
+use datafusion::physical_expr::aggregate::AggregateFunctionExpr;
+use datafusion::physical_expr::expressions::{BinaryExpr, Column, Literal};
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::filter::FilterExec;
 
-use crate::fused::Q6Predicate;
 use crate::fused_aggregate_exec::FusedAggregateExec;
 use crate::fused_aggregate_filter_sum::FilterSumSpec;
-use crate::fused_jit::FusedFilterAggSpec;
+use crate::fused_jit::{AggExpr, Clause, ClauseOp, ColumnTy, FusedFilterAggSpec};
 
 /// SQL-pattern injection rule for the generic FilterSum shape. See
 /// module-level docs.
@@ -92,15 +102,12 @@ impl PhysicalOptimizerRule for InjectFilterSumRule {
     }
 }
 
-/// Try to match the canonical Q6-shape SQL plan and return a
-/// `FusedAggregateExec<FilterSumSpec>` over the scan beneath. Returns
-/// `Ok(None)` for any non-matching plan — the rule falls through and
-/// DataFusion's default plan runs.
+// ===== matcher entry point =====
+
 fn try_match_filter_sum_plan(
     node: &Arc<dyn ExecutionPlan>,
 ) -> DfResult<Option<Arc<dyn ExecutionPlan>>> {
-    // Reuse the existing Q6 shape walker — same plan tree shape
-    // (Projection → Final agg → Coalesce → Partial agg → body).
+    // Plan-tree shape: Projection → Final agg → Coalesce → Partial agg → body.
     let cfg = crate::fused_jit_rule::AggregateShapeConfig {
         expect_top_sort: false,
         expect_top_projection: true,
@@ -113,46 +120,62 @@ fn try_match_filter_sum_plan(
         return Ok(None);
     };
 
-    // Output column name: `revenue` — canonical Q6 alias.
+    // Output column name = projection's first (only) field. Propagates
+    // the user's SQL alias to the FilterSumSpec output schema. Aggregate
+    // shapes that don't produce a single output field are excluded by
+    // the `expect_agg_count: 1` config above.
     let proj = shape
         .top_projection
         .as_ref()
         .expect("config requires top projection");
-    if proj.schema().field(0).name() != "revenue" {
+    let output_name = proj.schema().field(0).name().to_string();
+
+    // Aggregate: SUM(col) or SUM(col_a * col_b). Partial + final must
+    // describe the same shape (DataFusion's two-stage SUM splits keep
+    // the inner expression identical between modes, but a mismatch is
+    // either a planner bug or a non-SUM-shape we shouldn't touch).
+    let Some(agg) = extract_filter_sum_aggregate(&shape.final_agg.aggr_expr()[0]) else {
+        return Ok(None);
+    };
+    let Some(agg_partial) = extract_filter_sum_aggregate(&shape.partial_agg.aggr_expr()[0]) else {
+        return Ok(None);
+    };
+    if !agg_shapes_equal(&agg, &agg_partial) {
         return Ok(None);
     }
 
-    // Aggregate: SUM(extprice * discount).
-    if !crate::fused_jit_rule::is_sum_extprice_times_discount(&shape.final_agg.aggr_expr()[0]) {
-        return Ok(None);
-    }
-    if !crate::fused_jit_rule::is_sum_extprice_times_discount(&shape.partial_agg.aggr_expr()[0]) {
-        return Ok(None);
-    }
-
-    // Body: FilterExec with Q6-extractable predicate.
+    // Body: FilterExec with AND-chain of (col ⊕ literal) leaves.
     let Some(filter) = shape.body.as_any().downcast_ref::<FilterExec>() else {
         return Ok(None);
     };
-    let Some(predicate) = crate::fused_jit_rule::extract_q6_predicate(filter.predicate()) else {
+    let Some(clauses) = extract_filter_sum_clauses(filter.predicate()) else {
         return Ok(None);
     };
 
-    // Walk down to a scan that has the four required Q6 columns. The
-    // `extract_q6_predicate` extractor handles the literal values; we
-    // need the scan's schema for `FilterSumSpec::try_new` to resolve
-    // column indices.
+    // The required columns are everything referenced by predicate or
+    // aggregate. Walk past projections/repartitions inside the filter's
+    // input to find the scan whose schema contains all of them.
+    let referenced: Vec<String> = {
+        let mut s: Vec<String> = clauses.iter().map(|(n, _, _)| n.clone()).collect();
+        match &agg {
+            AggShape::SumColumn(n) => s.push(n.clone()),
+            AggShape::SumProductColumns(a, b) => {
+                s.push(a.clone());
+                s.push(b.clone());
+            }
+        }
+        s
+    };
+
     let mut scan: Arc<dyn ExecutionPlan> = filter
         .children()
         .first()
         .map(|c| (*c).clone())
         .ok_or_else(|| {
-            datafusion::common::DataFusionError::Internal(
-                "InjectFilterSumRule: FilterExec missing input".into(),
-            )
+            DataFusionError::Internal("InjectFilterSumRule: FilterExec missing input".into())
         })?;
     loop {
-        if scan_has_required_q6_columns(&scan.schema()) {
+        if scan_has_all_columns(&scan.schema(), &referenced) {
             break;
         }
         let children = scan.children();
@@ -160,68 +183,276 @@ fn try_match_filter_sum_plan(
             return Ok(None);
         }
         scan = children[0].clone();
-        if !scan_has_required_q6_columns(&scan.schema()) && scan.children().is_empty() {
+        if scan.children().is_empty() && !scan_has_all_columns(&scan.schema(), &referenced) {
             return Ok(None);
         }
     }
 
-    // Build the generic spec, route through FusedAggregateExec.
-    let fused = build_filter_sum_exec(scan, predicate)?;
-    Ok(Some(fused))
+    // Build the JIT spec + input-name list from the extracted predicate
+    // + aggregate. Returns None on any type / op the JIT IR can't lower.
+    let Some((jit_spec, input_names)) = build_jit_spec_and_inputs(clauses, agg, &scan.schema())
+    else {
+        return Ok(None);
+    };
+
+    let input_name_refs: Vec<&str> = input_names.iter().map(String::as_str).collect();
+    let spec = FilterSumSpec::try_new(jit_spec, &input_name_refs, &scan.schema(), &output_name)?;
+    let exec = FusedAggregateExec::try_new(scan, spec)?;
+    Ok(Some(Arc::new(exec) as Arc<dyn ExecutionPlan>))
 }
 
-/// Mirror of `crate::fused_jit_rule::scan_has_required_q6_columns`,
-/// duplicated here so the rule is self-contained without re-exporting
-/// a private item across modules.
-fn scan_has_required_q6_columns(schema: &datafusion::arrow::datatypes::SchemaRef) -> bool {
-    use datafusion::arrow::datatypes::DataType;
-    let cols = [
-        ("l_quantity", DataType::Float64),
-        ("l_extendedprice", DataType::Float64),
-        ("l_discount", DataType::Float64),
-        ("l_shipdate", DataType::Date32),
-    ];
-    cols.iter().all(|(n, ty)| {
-        schema
-            .field_with_name(n)
-            .map(|f| f.data_type() == ty)
-            .unwrap_or(false)
+// ===== aggregate extraction =====
+
+/// Recognised SUM aggregate shapes for FilterSumSpec.
+#[derive(Debug, Clone)]
+enum AggShape {
+    /// `SUM(col)` — `col` must be Float64.
+    SumColumn(String),
+    /// `SUM(col_a * col_b)` — both columns must be Float64.
+    SumProductColumns(String, String),
+}
+
+fn agg_shapes_equal(a: &AggShape, b: &AggShape) -> bool {
+    match (a, b) {
+        (AggShape::SumColumn(x), AggShape::SumColumn(y)) => x == y,
+        (AggShape::SumProductColumns(x1, x2), AggShape::SumProductColumns(y1, y2)) => {
+            // Multiply is commutative — accept either operand order.
+            (x1 == y1 && x2 == y2) || (x1 == y2 && x2 == y1)
+        }
+        _ => false,
+    }
+}
+
+/// Match a SUM aggregate over a single column or product of two columns.
+/// Returns None for any other shape (SUM(expr) with non-Column leaves,
+/// COUNT, AVG, multi-arg, etc.).
+fn extract_filter_sum_aggregate(agg: &Arc<AggregateFunctionExpr>) -> Option<AggShape> {
+    if !agg.fun().name().eq_ignore_ascii_case("sum") {
+        return None;
+    }
+    let exprs = agg.expressions();
+    if exprs.len() != 1 {
+        return None;
+    }
+    // SUM(col)
+    if let Some(c) = exprs[0].as_any().downcast_ref::<Column>() {
+        return Some(AggShape::SumColumn(c.name().to_string()));
+    }
+    // SUM(col_a * col_b)
+    if let Some(b) = exprs[0].as_any().downcast_ref::<BinaryExpr>() {
+        if matches!(b.op(), Operator::Multiply) {
+            let l = b.left().as_any().downcast_ref::<Column>()?;
+            let r = b.right().as_any().downcast_ref::<Column>()?;
+            return Some(AggShape::SumProductColumns(
+                l.name().to_string(),
+                r.name().to_string(),
+            ));
+        }
+    }
+    None
+}
+
+// ===== predicate extraction =====
+
+/// One leaf of the AND-chain after canonicalisation: column-on-the-left,
+/// op, literal-on-the-right.
+type ClauseLeaf = (String, Operator, ScalarValue);
+
+/// Walk an arbitrary AND-chain and decompose each leaf as
+/// `(column_name, op, literal)`. Returns None on any malformed leaf or
+/// unsupported operator.
+fn extract_filter_sum_clauses(expr: &Arc<dyn PhysicalExpr>) -> Option<Vec<ClauseLeaf>> {
+    let mut leaves: Vec<&Arc<dyn PhysicalExpr>> = Vec::new();
+    flatten_and(expr, &mut leaves);
+    if leaves.is_empty() {
+        return None;
+    }
+    let mut out = Vec::with_capacity(leaves.len());
+    for leaf in leaves {
+        let (col, op, lit) = decompose_leaf(leaf)?;
+        // The JIT IR's ClauseOp enum only has the four range operators —
+        // Eq/NotEq would need new IR variants (small change, separate slice).
+        if !matches!(
+            op,
+            Operator::Lt | Operator::LtEq | Operator::Gt | Operator::GtEq
+        ) {
+            return None;
+        }
+        out.push((col, op, lit));
+    }
+    Some(out)
+}
+
+fn flatten_and<'a>(expr: &'a Arc<dyn PhysicalExpr>, out: &mut Vec<&'a Arc<dyn PhysicalExpr>>) {
+    if let Some(b) = expr.as_any().downcast_ref::<BinaryExpr>() {
+        if matches!(b.op(), Operator::And) {
+            flatten_and(b.left(), out);
+            flatten_and(b.right(), out);
+            return;
+        }
+    }
+    out.push(expr);
+}
+
+/// Decompose `Column ⊕ Literal` (or its mirror `Literal ⊕ Column`) into
+/// `(column_name, op, literal)` with the column canonically on the left.
+fn decompose_leaf(expr: &Arc<dyn PhysicalExpr>) -> Option<ClauseLeaf> {
+    let b = expr.as_any().downcast_ref::<BinaryExpr>()?;
+    let op = *b.op();
+    let lcol = b.left().as_any().downcast_ref::<Column>();
+    let rlit = b.right().as_any().downcast_ref::<Literal>();
+    let llit = b.left().as_any().downcast_ref::<Literal>();
+    let rcol = b.right().as_any().downcast_ref::<Column>();
+    let (col_name, lit, flipped) = match (lcol, rlit, llit, rcol) {
+        (Some(c), Some(l), _, _) => (c.name().to_string(), l.value().clone(), false),
+        (_, _, Some(l), Some(c)) => (c.name().to_string(), l.value().clone(), true),
+        _ => return None,
+    };
+    let op = if flipped { flip_op(op)? } else { op };
+    Some((col_name, op, lit))
+}
+
+fn flip_op(op: Operator) -> Option<Operator> {
+    Some(match op {
+        Operator::Lt => Operator::Gt,
+        Operator::LtEq => Operator::GtEq,
+        Operator::Gt => Operator::Lt,
+        Operator::GtEq => Operator::LtEq,
+        Operator::Eq => Operator::Eq,
+        Operator::NotEq => Operator::NotEq,
+        _ => return None,
     })
 }
 
-/// Construct a `FusedAggregateExec<FilterSumSpec>` from a Q6 predicate +
-/// the resolved scan. Builds the JIT IR via `FusedFilterAggSpec::q6` so
-/// the kernel is bit-equivalent to `Q6Spec::try_new_jit`'s kernel; the
-/// only difference is the spec wrapper around it.
-fn build_filter_sum_exec(
-    scan: Arc<dyn ExecutionPlan>,
-    predicate: Q6Predicate,
-) -> DfResult<Arc<dyn ExecutionPlan>> {
-    let jit_spec = FusedFilterAggSpec::q6(
-        predicate.date_lo,
-        predicate.date_hi,
-        predicate.disc_lo,
-        predicate.disc_hi,
-        predicate.qty_hi,
-    );
-    let spec = FilterSumSpec::try_new(
-        jit_spec,
-        // Input order from `FusedFilterAggSpec::q6`: shipdate (0),
-        // discount (1), quantity (2), extprice (3). The rule resolves
-        // these by name in `FilterSumSpec::try_new`.
-        &["l_shipdate", "l_discount", "l_quantity", "l_extendedprice"],
-        &scan.schema(),
-        "revenue",
-    )?;
-    let exec = FusedAggregateExec::try_new(scan, spec)?;
-    Ok(Arc::new(exec) as Arc<dyn ExecutionPlan>)
+// ===== JIT spec construction =====
+
+/// Compose the extracted clauses + aggregate + scan schema into a fully
+/// validated `FusedFilterAggSpec` plus the ordered list of input column
+/// names. Returns None on any type / op the JIT IR can't lower.
+fn build_jit_spec_and_inputs(
+    clauses: Vec<ClauseLeaf>,
+    agg: AggShape,
+    scan_schema: &SchemaRef,
+) -> Option<(FusedFilterAggSpec, Vec<String>)> {
+    // Dedup + index columns referenced anywhere. Predicate columns
+    // come first in order of appearance, then aggregate columns not
+    // already present.
+    let mut input_names: Vec<String> = Vec::new();
+    let mut name_to_idx: HashMap<String, usize> = HashMap::new();
+    let mut register = |name: &str| {
+        if !name_to_idx.contains_key(name) {
+            name_to_idx.insert(name.to_string(), input_names.len());
+            input_names.push(name.to_string());
+        }
+    };
+    for (name, _, _) in &clauses {
+        register(name);
+    }
+    match &agg {
+        AggShape::SumColumn(name) => register(name),
+        AggShape::SumProductColumns(a, b) => {
+            register(a);
+            register(b);
+        }
+    }
+
+    // Resolve each input's ColumnTy from the scan schema. Reject up
+    // front on missing columns or unsupported types.
+    let mut input_tys: Vec<ColumnTy> = Vec::with_capacity(input_names.len());
+    for name in &input_names {
+        let field = scan_schema.field_with_name(name).ok()?;
+        let ty = map_arrow_to_column_ty(field.data_type())?;
+        input_tys.push(ty);
+    }
+
+    // Translate clauses to JIT IR.
+    let mut jit_clauses: Vec<Clause> = Vec::with_capacity(clauses.len());
+    for (name, op, lit) in clauses {
+        let col_idx = name_to_idx[&name];
+        let col_ty = input_tys[col_idx];
+        jit_clauses.push(build_clause(col_idx, col_ty, op, &lit)?);
+    }
+
+    // Translate aggregate to JIT IR. Both shapes require Float64 cols.
+    let jit_agg = match agg {
+        AggShape::SumColumn(name) => {
+            let idx = name_to_idx[&name];
+            if input_tys[idx] != ColumnTy::Float64 {
+                return None;
+            }
+            AggExpr::SumColumn(idx)
+        }
+        AggShape::SumProductColumns(a, b) => {
+            let a_idx = name_to_idx[&a];
+            let b_idx = name_to_idx[&b];
+            if input_tys[a_idx] != ColumnTy::Float64 || input_tys[b_idx] != ColumnTy::Float64 {
+                return None;
+            }
+            AggExpr::SumProductColumns(a_idx, b_idx)
+        }
+    };
+
+    let spec = FusedFilterAggSpec {
+        inputs: input_tys,
+        predicate: jit_clauses,
+        aggregates: vec![jit_agg],
+        group: None,
+    };
+    Some((spec, input_names))
+}
+
+fn map_arrow_to_column_ty(dt: &DataType) -> Option<ColumnTy> {
+    match dt {
+        DataType::Float64 => Some(ColumnTy::Float64),
+        DataType::Date32 => Some(ColumnTy::Date32),
+        DataType::Int32 => Some(ColumnTy::Int32),
+        // Int64 columns map to ColumnTy::Int64 in the IR, but the
+        // current ClauseOp variants are only Int32 immediates — we
+        // can't emit a clause against an Int64 column without an Int64
+        // immediate variant. Reject here; broaden when the IR adds them.
+        _ => None,
+    }
+}
+
+fn build_clause(
+    col_idx: usize,
+    col_ty: ColumnTy,
+    op: Operator,
+    lit: &ScalarValue,
+) -> Option<Clause> {
+    let (imm_i32, imm_f64) = match (col_ty, lit) {
+        (ColumnTy::Float64, ScalarValue::Float64(Some(f))) => (0, *f),
+        (ColumnTy::Date32, ScalarValue::Date32(Some(d))) => (*d, 0.0),
+        (ColumnTy::Int32, ScalarValue::Int32(Some(i))) => (*i, 0.0),
+        _ => return None,
+    };
+    let clause_op = match (col_ty, op) {
+        (ColumnTy::Float64, Operator::GtEq) => ClauseOp::F64Ge,
+        (ColumnTy::Float64, Operator::LtEq) => ClauseOp::F64Le,
+        (ColumnTy::Float64, Operator::Lt) => ClauseOp::F64Lt,
+        (ColumnTy::Float64, Operator::Gt) => ClauseOp::F64Gt,
+        (ColumnTy::Date32 | ColumnTy::Int32, Operator::GtEq) => ClauseOp::I32Ge,
+        (ColumnTy::Date32 | ColumnTy::Int32, Operator::LtEq) => ClauseOp::I32Le,
+        (ColumnTy::Date32 | ColumnTy::Int32, Operator::Lt) => ClauseOp::I32Lt,
+        (ColumnTy::Date32 | ColumnTy::Int32, Operator::Gt) => ClauseOp::I32Gt,
+        _ => return None,
+    };
+    Some(Clause {
+        column: col_idx,
+        op: clause_op,
+        imm_i32,
+        imm_f64,
+    })
+}
+
+fn scan_has_all_columns(schema: &SchemaRef, names: &[String]) -> bool {
+    names.iter().all(|n| schema.column_with_name(n).is_some())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::fast_parquet::FastParquetTableProvider;
-    use crate::fused_aggregate_filter_sum::FilterSumSpec;
     use datafusion::execution::session_state::SessionStateBuilder;
     use datafusion::physical_plan::displayable;
     use datafusion::prelude::{SessionConfig, SessionContext};
@@ -234,6 +465,15 @@ mod tests {
           AND l_shipdate <  DATE '1995-01-01'
           AND l_discount BETWEEN 0.05 AND 0.07
           AND l_quantity <  24
+    ";
+
+    /// Non-Q6 SQL that exercises the generalised matcher: arbitrary
+    /// alias, SUM(col) (not product), single-column predicate.
+    const SIMPLE_SUM_SQL: &str = "
+        SELECT sum(l_extendedprice) AS total
+        FROM lineitem
+        WHERE l_shipdate >= DATE '1994-01-01'
+          AND l_shipdate <  DATE '1995-01-01'
     ";
 
     /// Resolve the SF=1 lineitem.parquet path: env var TPCH_DATA_DIR
@@ -257,11 +497,6 @@ mod tests {
         p.exists().then(|| p.to_string_lossy().into_owned())
     }
 
-    /// Build a SessionContext over real SF=1 lineitem.parquet
-    /// (FastParquetTableProvider — same shape the InjectFusedQ6Rule
-    /// tests use) and optionally register the new rule. Returns None
-    /// if the data isn't on disk (CI without TPC-H + without the
-    /// mini-fixture should skip).
     async fn ctx_with_rule(register_rule: bool) -> Option<SessionContext> {
         let path = sf1_lineitem()?;
         let config = SessionConfig::new().with_target_partitions(14);
@@ -283,10 +518,10 @@ mod tests {
         Some(ctx)
     }
 
-    /// The rule fires on canonical Q6 SQL: the resulting physical plan
-    /// contains a `FusedAggregateExec` (specifically the FilterSumSpec
-    /// variant) and the answer matches the un-rewritten plan to within
-    /// floating-point tolerance.
+    /// Rule fires on canonical Q6 SQL (generalised matcher must subsume
+    /// the original Q6 shape). Plan contains a FusedAggregateExec
+    /// wrapping FilterSumSpec, and the answer matches the default plan
+    /// to floating-point relative tolerance.
     #[tokio::test(flavor = "multi_thread")]
     async fn inject_filter_sum_rule_rewrites_real_q6_plan_and_preserves_result() {
         use datafusion::arrow::array::Float64Array;
@@ -297,7 +532,6 @@ mod tests {
         };
         let ctx_without = ctx_with_rule(false).await.unwrap();
 
-        // 1. Verify the rule's effect on the physical plan.
         let df = ctx_with.sql(Q6_SQL).await.unwrap();
         let plan = df.create_physical_plan().await.unwrap();
         let plan_str = displayable(plan.as_ref()).indent(true).to_string();
@@ -305,16 +539,11 @@ mod tests {
             plan_str.contains("FusedAggregateExec"),
             "InjectFilterSumRule did not fire on the canonical Q6 plan.\nPlan:\n{plan_str}"
         );
-
-        // The FusedAggregateExec wraps FilterSumSpec (not Q6Spec) —
-        // type-name check via Debug since the operator's DisplayAs
-        // uses std::any::type_name::<S>().
         assert!(
             plan_str.contains("FilterSumSpec"),
             "FusedAggregateExec is not wrapping FilterSumSpec.\nPlan:\n{plan_str}"
         );
 
-        // 2. Verify the answer matches the un-rewritten plan.
         let r_with = ctx_with.sql(Q6_SQL).await.unwrap().collect().await.unwrap();
         let r_without = ctx_without
             .sql(Q6_SQL)
@@ -335,10 +564,6 @@ mod tests {
             .downcast_ref::<Float64Array>()
             .unwrap()
             .value(0);
-        // Relative-error tolerance matches the existing
-        // InjectFusedQ6Rule test — the JIT path sums in a different
-        // order than DataFusion's default plan, so absolute equality
-        // is too tight for SF=1 lineitem totals.
         let rel = ((v_with - v_without) / v_without).abs();
         assert!(
             rel < 1e-10,
@@ -346,14 +571,124 @@ mod tests {
         );
     }
 
-    /// Rule does NOT fire on an unrelated query.
+    /// Σ.G.2e-3 coverage: rule fires on a non-Q6 SUM-over-Filter shape
+    /// (arbitrary alias, single-column SUM, two-clause predicate).
+    /// Answer must match the default plan.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn inject_filter_sum_rule_fires_on_simple_sum_col() {
+        use datafusion::arrow::array::Float64Array;
+
+        let Some(ctx_with) = ctx_with_rule(true).await else {
+            eprintln!("TPC-H SF=1 data not generated; skipping test");
+            return;
+        };
+        let ctx_without = ctx_with_rule(false).await.unwrap();
+
+        let plan = ctx_with
+            .sql(SIMPLE_SUM_SQL)
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+        let plan_str = displayable(plan.as_ref()).indent(true).to_string();
+        assert!(
+            plan_str.contains("FusedAggregateExec"),
+            "Generalised matcher missed a SUM(col) shape.\nPlan:\n{plan_str}"
+        );
+        assert!(
+            plan_str.contains("FilterSumSpec"),
+            "FusedAggregateExec is not wrapping FilterSumSpec.\nPlan:\n{plan_str}"
+        );
+
+        let r_with = ctx_with
+            .sql(SIMPLE_SUM_SQL)
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let r_without = ctx_without
+            .sql(SIMPLE_SUM_SQL)
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let v_with = r_with[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap()
+            .value(0);
+        let v_without = r_without[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap()
+            .value(0);
+        let rel = ((v_with - v_without) / v_without).abs();
+        assert!(
+            rel < 1e-10,
+            "SUM(col) result diverges: with={v_with}, without={v_without}, rel_err={rel:e}"
+        );
+    }
+
+    /// Rule does not fire on an aggregate it can't lower (COUNT).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn inject_filter_sum_rule_skips_count_aggregate() {
+        let Some(ctx) = ctx_with_rule(true).await else {
+            eprintln!("TPC-H SF=1 data not generated; skipping test");
+            return;
+        };
+        let plan = ctx
+            .sql(
+                "SELECT count(*) AS n FROM lineitem
+                 WHERE l_shipdate >= DATE '1994-01-01'",
+            )
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+        let plan_str = displayable(plan.as_ref()).indent(true).to_string();
+        assert!(
+            !plan_str.contains("FusedAggregateExec"),
+            "InjectFilterSumRule wrongly fired on COUNT(*):\n{plan_str}"
+        );
+    }
+
+    /// Rule does not fire on equality predicates (JIT IR has no Eq).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn inject_filter_sum_rule_skips_equality_predicate() {
+        let Some(ctx) = ctx_with_rule(true).await else {
+            eprintln!("TPC-H SF=1 data not generated; skipping test");
+            return;
+        };
+        let plan = ctx
+            .sql(
+                "SELECT sum(l_extendedprice) AS total FROM lineitem
+                 WHERE l_quantity = 5",
+            )
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+        let plan_str = displayable(plan.as_ref()).indent(true).to_string();
+        assert!(
+            !plan_str.contains("FusedAggregateExec"),
+            "InjectFilterSumRule wrongly fired on equality predicate:\n{plan_str}"
+        );
+    }
+
+    /// Rule does not fire on a no-filter aggregate.
     #[tokio::test(flavor = "multi_thread")]
     async fn inject_filter_sum_rule_does_not_fire_on_unrelated_query() {
         let Some(ctx) = ctx_with_rule(true).await else {
             eprintln!("TPC-H SF=1 data not generated; skipping test");
             return;
         };
-        // No filter stack, different alias.
         let plan = ctx
             .sql("SELECT sum(l_extendedprice * l_discount) AS total FROM lineitem")
             .await
@@ -368,39 +703,136 @@ mod tests {
         );
     }
 
-    /// Substrate spot-check: build a scan via the SessionContext, then
-    /// call the rule's `build_filter_sum_exec` helper directly. This
-    /// verifies the constructed exec downcasts to the expected generic
-    /// FilterSumSpec parameterisation, independent of the SQL pattern
-    /// matcher.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn build_filter_sum_exec_constructs_expected_type() {
-        let Some(ctx) = ctx_with_rule(false).await else {
-            eprintln!("TPC-H SF=1 data not generated; skipping test");
-            return;
-        };
-        let scan = ctx
-            .sql("SELECT l_quantity, l_extendedprice, l_discount, l_shipdate FROM lineitem")
-            .await
-            .unwrap()
-            .create_physical_plan()
-            .await
-            .unwrap();
+    // ===== unit tests for the pure helpers =====
 
-        let pred = Q6Predicate {
-            date_lo: 8766,
-            date_hi: 9131,
-            disc_lo: 0.05,
-            disc_hi: 0.07,
-            qty_hi: 24.0,
-        };
-        let exec = build_filter_sum_exec(scan, pred).unwrap();
-        // Should be downcastable to FusedAggregateExec<FilterSumSpec>.
+    #[test]
+    fn flip_op_swaps_inequalities() {
+        assert_eq!(flip_op(Operator::Lt), Some(Operator::Gt));
+        assert_eq!(flip_op(Operator::LtEq), Some(Operator::GtEq));
+        assert_eq!(flip_op(Operator::Gt), Some(Operator::Lt));
+        assert_eq!(flip_op(Operator::GtEq), Some(Operator::LtEq));
+        assert_eq!(flip_op(Operator::Eq), Some(Operator::Eq));
+        assert_eq!(flip_op(Operator::Plus), None);
+    }
+
+    #[test]
+    fn agg_shapes_equal_handles_commutativity() {
+        let a = AggShape::SumProductColumns("x".into(), "y".into());
+        let b = AggShape::SumProductColumns("y".into(), "x".into());
+        let c = AggShape::SumProductColumns("x".into(), "z".into());
+        assert!(agg_shapes_equal(&a, &b));
+        assert!(!agg_shapes_equal(&a, &c));
+        assert!(!agg_shapes_equal(
+            &AggShape::SumColumn("x".into()),
+            &AggShape::SumProductColumns("x".into(), "x".into())
+        ));
+    }
+
+    #[test]
+    fn build_clause_rejects_eq_and_neq() {
         assert!(
-            exec.as_any()
-                .downcast_ref::<FusedAggregateExec<FilterSumSpec>>()
-                .is_some(),
-            "build_filter_sum_exec didn't produce FusedAggregateExec<FilterSumSpec>"
+            build_clause(
+                0,
+                ColumnTy::Float64,
+                Operator::Eq,
+                &ScalarValue::Float64(Some(1.0))
+            )
+            .is_none()
         );
+        assert!(
+            build_clause(
+                0,
+                ColumnTy::Float64,
+                Operator::NotEq,
+                &ScalarValue::Float64(Some(1.0))
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn build_clause_rejects_mismatched_literal_type() {
+        // Date32 column with a Float64 literal — not interpretable.
+        assert!(
+            build_clause(
+                0,
+                ColumnTy::Date32,
+                Operator::Lt,
+                &ScalarValue::Float64(Some(1.0))
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn build_clause_produces_canonical_ops() {
+        let c = build_clause(
+            2,
+            ColumnTy::Float64,
+            Operator::Lt,
+            &ScalarValue::Float64(Some(24.0)),
+        )
+        .unwrap();
+        assert_eq!(c.column, 2);
+        assert!(matches!(c.op, ClauseOp::F64Lt));
+        assert_eq!(c.imm_f64, 24.0);
+
+        let c = build_clause(
+            0,
+            ColumnTy::Date32,
+            Operator::GtEq,
+            &ScalarValue::Date32(Some(8766)),
+        )
+        .unwrap();
+        assert_eq!(c.column, 0);
+        assert!(matches!(c.op, ClauseOp::I32Ge));
+        assert_eq!(c.imm_i32, 8766);
+    }
+
+    #[test]
+    fn map_arrow_to_column_ty_supported_set() {
+        assert_eq!(
+            map_arrow_to_column_ty(&DataType::Float64),
+            Some(ColumnTy::Float64)
+        );
+        assert_eq!(
+            map_arrow_to_column_ty(&DataType::Date32),
+            Some(ColumnTy::Date32)
+        );
+        assert_eq!(
+            map_arrow_to_column_ty(&DataType::Int32),
+            Some(ColumnTy::Int32)
+        );
+        // Int64 not yet supported — no Int64 immediate variant in
+        // ClauseOp at this slice.
+        assert_eq!(map_arrow_to_column_ty(&DataType::Int64), None);
+        assert_eq!(map_arrow_to_column_ty(&DataType::Utf8View), None);
+        assert_eq!(map_arrow_to_column_ty(&DataType::Boolean), None);
+    }
+
+    #[test]
+    fn build_jit_spec_dedups_columns_referenced_twice() {
+        use datafusion::arrow::datatypes::{Field, Schema};
+        // `l_extendedprice` appears in both predicate and aggregate.
+        let clauses: Vec<ClauseLeaf> = vec![(
+            "l_extendedprice".into(),
+            Operator::Gt,
+            ScalarValue::Float64(Some(100.0)),
+        )];
+        let agg = AggShape::SumColumn("l_extendedprice".into());
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "l_extendedprice",
+            DataType::Float64,
+            true,
+        )]));
+        let (spec, names) = build_jit_spec_and_inputs(clauses, agg, &schema).unwrap();
+        assert_eq!(names, vec!["l_extendedprice"]);
+        assert_eq!(spec.inputs, vec![ColumnTy::Float64]);
+        assert_eq!(spec.predicate.len(), 1);
+        assert_eq!(spec.aggregates.len(), 1);
+        match &spec.aggregates[0] {
+            AggExpr::SumColumn(idx) => assert_eq!(*idx, 0),
+            _ => panic!("expected SumColumn"),
+        }
     }
 }

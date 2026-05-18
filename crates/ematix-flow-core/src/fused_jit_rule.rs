@@ -48,7 +48,6 @@ use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
 
-use crate::fused::Q6Predicate;
 use crate::fused_aggregate::{Q1Spec, Q6Spec};
 use crate::fused_aggregate_exec::FusedAggregateExec;
 use crate::fused_multi_agg::Q1Predicate;
@@ -111,268 +110,16 @@ impl PhysicalOptimizerRule for EnableFusedJitRule {
     }
 }
 
-/// Σ.D3 phase D (real): rule that pattern-matches the DataFusion
-/// default physical plan for the TPC-H Q6 shape and rewrites the
-/// subtree to a [`FusedFilterSumExec`] (JIT mode) directly over the
-/// underlying scan. This is what makes the fused-exec library
-/// user-visible — SQL users who go through `SessionContext::sql(...)`
-/// get the fused operator automatically, without hand-constructing it.
-///
-/// Recognised plan shape (see `examples/tpch_q6_plan_dump.rs`):
-///
-/// ```text
-/// ProjectionExec(rename sum() → "revenue")
-///   AggregateExec(Final, no group-by, single SUM)
-///     CoalescePartitionsExec
-///       AggregateExec(Partial, no group-by, single SUM)
-///         FilterExec(AND-chain on shipdate/discount/quantity)
-///           [optional RepartitionExec/CoalesceBatchesExec wrappers]
-///             scan (must expose l_quantity/l_extendedprice/l_discount/l_shipdate)
-/// ```
-///
-/// Replacement output: `FusedFilterSumExec(scan, Q6Predicate { ... })`.
-/// The fused exec validates the scan's schema by name (so the column
-/// order in the scan's projection doesn't matter) and re-applies the
-/// filter internally as part of its fused inner loop, so dropping the
-/// FilterExec/Aggregate stack is correctness-preserving.
-///
-/// When the shape doesn't match (different aggregate, missing
-/// columns, unsupported operator in the predicate, etc.) the rule
-/// passes the node through unchanged.
-#[derive(Debug, Default)]
-pub struct InjectFusedQ6Rule;
-
-impl PhysicalOptimizerRule for InjectFusedQ6Rule {
-    fn optimize(
-        &self,
-        plan: Arc<dyn ExecutionPlan>,
-        _config: &ConfigOptions,
-    ) -> DfResult<Arc<dyn ExecutionPlan>> {
-        let result = plan.transform_down(|node| {
-            if let Some(new) = try_match_q6_plan(&node)? {
-                Ok(Transformed::yes(new))
-            } else {
-                Ok(Transformed::no(node))
-            }
-        })?;
-        Ok(result.data)
-    }
-
-    fn name(&self) -> &str {
-        "ematix_flow_inject_fused_q6"
-    }
-
-    fn schema_check(&self) -> bool {
-        // FusedFilterSumExec emits a single Float64 column named
-        // "revenue", which matches the SQL's `AS revenue` alias on Q6.
-        // For other aliases the rule wouldn't fire (the outer projection
-        // wouldn't match the "revenue" column name guard), so DataFusion
-        // can keep schema-checking turned on.
-        true
-    }
-}
-
-/// Try to interpret `node` as the top of a Q6-shaped plan and return
-/// a [`FusedFilterSumExec`] (JIT mode) over the scan beneath it.
-/// Migrated to the shared `match_aggregate_query_shape` walker.
-fn try_match_q6_plan(node: &Arc<dyn ExecutionPlan>) -> DfResult<Option<Arc<dyn ExecutionPlan>>> {
-    const CFG: AggregateShapeConfig = AggregateShapeConfig {
-        expect_top_sort: false,
-        expect_top_projection: true,
-        expect_final_mode: FinalAggMode::Final,
-        expect_group_by_count: 0,
-        expect_agg_count: 1,
-        expect_cse_projection: false,
-    };
-    let Some(shape) = match_aggregate_query_shape(node, &CFG)? else {
-        return Ok(None);
-    };
-    // Top ProjectionExec output: single column named "revenue".
-    let proj = shape
-        .top_projection
-        .as_ref()
-        .expect("config requires top projection");
-    if proj.schema().field(0).name() != "revenue" {
-        return Ok(None);
-    }
-    // Aggregate: SUM(extprice * discount).
-    if !is_sum_extprice_times_discount(&shape.final_agg.aggr_expr()[0]) {
-        return Ok(None);
-    }
-    if !is_sum_extprice_times_discount(&shape.partial_agg.aggr_expr()[0]) {
-        return Ok(None);
-    }
-    // Body: FilterExec with extractable Q6 predicate, then scan with
-    // the 4 required columns.
-    let Some(filter) = shape.body.as_any().downcast_ref::<FilterExec>() else {
-        return Ok(None);
-    };
-    let Some(predicate) = extract_q6_predicate(filter.predicate()) else {
-        return Ok(None);
-    };
-    let mut scan: Arc<dyn ExecutionPlan> = filter
-        .children()
-        .first()
-        .map(|c| (*c).clone())
-        .ok_or_else(|| dferr("Q6 match: FilterExec missing input"))?;
-    loop {
-        if scan_has_required_q6_columns(&scan.schema()) {
-            break;
-        }
-        let children = scan.children();
-        if children.len() != 1 {
-            return Ok(None);
-        }
-        scan = children[0].clone();
-        if !scan_has_required_q6_columns(&scan.schema()) && scan.children().is_empty() {
-            return Ok(None);
-        }
-    }
-    // Σ.G.3d: construct the generic `FusedAggregateExec<Q6Spec(JIT)>`
-    // directly instead of the now-retired `FusedFilterSumExec`. Matches
-    // the JIT-mode behaviour the old constructor implied.
-    let spec = Q6Spec::try_new_jit(predicate, &scan.schema())?;
-    let fused = FusedAggregateExec::try_new(scan, spec)?;
-    Ok(Some(Arc::new(fused) as Arc<dyn ExecutionPlan>))
-}
-
-fn scan_has_required_q6_columns(schema: &datafusion::arrow::datatypes::SchemaRef) -> bool {
-    use datafusion::arrow::datatypes::DataType;
-    let cols = [
-        ("l_quantity", DataType::Float64),
-        ("l_extendedprice", DataType::Float64),
-        ("l_discount", DataType::Float64),
-        ("l_shipdate", DataType::Date32),
-    ];
-    cols.iter().all(|(n, ty)| {
-        schema
-            .field_with_name(n)
-            .map(|f| f.data_type() == ty)
-            .unwrap_or(false)
-    })
-}
-
-/// Matches a `SUM(l_extendedprice * l_discount)` aggregate expression,
-/// regardless of the partial/final mode wrapping.
-pub(crate) fn is_sum_extprice_times_discount(
-    agg: &Arc<datafusion::physical_expr::aggregate::AggregateFunctionExpr>,
-) -> bool {
-    if !agg.fun().name().eq_ignore_ascii_case("sum") {
-        return false;
-    }
-    let exprs = agg.expressions();
-    if exprs.len() != 1 {
-        return false;
-    }
-    let Some(b) = exprs[0].as_any().downcast_ref::<BinaryExpr>() else {
-        return false;
-    };
-    if !matches!(b.op(), Operator::Multiply) {
-        return false;
-    }
-    let lname = b.left().as_any().downcast_ref::<Column>().map(|c| c.name());
-    let rname = b
-        .right()
-        .as_any()
-        .downcast_ref::<Column>()
-        .map(|c| c.name());
-    matches!(
-        (lname, rname),
-        (Some("l_extendedprice"), Some("l_discount"))
-            | (Some("l_discount"), Some("l_extendedprice"))
-    )
-}
-
-/// Walk an AND-chain of comparisons and try to populate a `Q6Predicate`.
-/// Accepts the five canonical Q6 leaves in any order:
-/// * `l_shipdate >= <Date32>` and `l_shipdate < <Date32>`
-/// * `l_discount >= <Float64>` and `l_discount <= <Float64>`
-/// * `l_quantity <  <Float64>`
-///
-/// Anything else makes us return `None` — the rule then leaves the
-/// plan unchanged, and DataFusion runs its normal Filter+Aggregate.
-pub(crate) fn extract_q6_predicate(expr: &Arc<dyn PhysicalExpr>) -> Option<Q6Predicate> {
-    let mut leaves: Vec<&Arc<dyn PhysicalExpr>> = Vec::new();
-    flatten_and(expr, &mut leaves);
-
-    let mut date_lo: Option<i32> = None;
-    let mut date_hi: Option<i32> = None;
-    let mut disc_lo: Option<f64> = None;
-    let mut disc_hi: Option<f64> = None;
-    let mut qty_hi: Option<f64> = None;
-
-    for leaf in leaves {
-        let (col, op, lit) = decompose_leaf(leaf)?;
-        match (col, op) {
-            ("l_shipdate", Operator::GtEq) => match lit {
-                ScalarValue::Date32(Some(d)) => date_lo = Some(d),
-                _ => return None,
-            },
-            ("l_shipdate", Operator::Lt) => match lit {
-                ScalarValue::Date32(Some(d)) => date_hi = Some(d),
-                _ => return None,
-            },
-            ("l_discount", Operator::GtEq) => match lit {
-                ScalarValue::Float64(Some(f)) => disc_lo = Some(f),
-                _ => return None,
-            },
-            ("l_discount", Operator::LtEq) => match lit {
-                ScalarValue::Float64(Some(f)) => disc_hi = Some(f),
-                _ => return None,
-            },
-            ("l_quantity", Operator::Lt) => match lit {
-                ScalarValue::Float64(Some(f)) => qty_hi = Some(f),
-                _ => return None,
-            },
-            _ => return None,
-        }
-    }
-
-    Some(Q6Predicate {
-        date_lo: date_lo?,
-        date_hi: date_hi?,
-        disc_lo: disc_lo?,
-        disc_hi: disc_hi?,
-        qty_hi: qty_hi?,
-    })
-}
-
-fn flatten_and<'a>(expr: &'a Arc<dyn PhysicalExpr>, out: &mut Vec<&'a Arc<dyn PhysicalExpr>>) {
-    if let Some(b) = expr.as_any().downcast_ref::<BinaryExpr>() {
-        if matches!(b.op(), Operator::And) {
-            flatten_and(b.left(), out);
-            flatten_and(b.right(), out);
-            return;
-        }
-    }
-    out.push(expr);
-}
-
-/// Try to interpret `expr` as `Column ⊕ Literal` (or its mirror) and
-/// return the canonicalised `(column_name, op, literal)`. Returns
-/// `None` for any other shape.
-fn decompose_leaf(expr: &Arc<dyn PhysicalExpr>) -> Option<(&'static str, Operator, ScalarValue)> {
-    let b = expr.as_any().downcast_ref::<BinaryExpr>()?;
-    let op = *b.op();
-    let (col, lit, flipped) = match (
-        b.left().as_any().downcast_ref::<Column>(),
-        b.right().as_any().downcast_ref::<Literal>(),
-        b.left().as_any().downcast_ref::<Literal>(),
-        b.right().as_any().downcast_ref::<Column>(),
-    ) {
-        (Some(c), Some(l), _, _) => (c.name(), l.value().clone(), false),
-        (_, _, Some(l), Some(c)) => (c.name(), l.value().clone(), true),
-        _ => return None,
-    };
-    let op = if flipped { flip_op(op)? } else { op };
-    let canonical: &'static str = match col {
-        "l_shipdate" => "l_shipdate",
-        "l_discount" => "l_discount",
-        "l_quantity" => "l_quantity",
-        _ => return None,
-    };
-    Some((canonical, op, lit))
-}
+// Σ.G.2e-4: `InjectFusedQ6Rule` was retired in favour of
+// `InjectFilterSumRule` (`fused_aggregate_filter_sum_rule.rs`), whose
+// generalised matcher subsumes the Q6-shape SQL pattern and was
+// bench-gated at 1.50 % delta on TPC-H SF=1 Q6 (see
+// `examples/sigma_g2e_filter_sum_vs_q6.rs`). The substrate
+// `Q6Spec(JIT)` type is still exported from `fused_aggregate` so the
+// direct-construction examples (`tpch_q6_jit_bench`, `tpch_q6_tune`)
+// continue to work; only the SQL-pattern auto-injection rule + its
+// Q6-specific predicate/aggregate extractors are gone. The shared
+// `flip_op` helper survives because the Q1 path still uses it.
 
 fn flip_op(op: Operator) -> Option<Operator> {
     Some(match op {
@@ -1438,7 +1185,12 @@ mod tests {
         assert_eq!(batches[0].num_rows(), 1);
     }
 
-    // ----- InjectFusedQ6Rule tests -----
+    // Σ.G.2e-4: InjectFusedQ6Rule integration tests retired alongside
+    // the rule. End-to-end coverage of Q6-shape SQL (rule fires, answer
+    // matches default plan) now lives in
+    // `fused_aggregate_filter_sum_rule::tests::inject_filter_sum_rule_rewrites_real_q6_plan_and_preserves_result`
+    // — InjectFilterSumRule subsumes the Q6 rule and uses the same
+    // FastParquet provider + SF=1 dataset shape.
 
     use std::path::PathBuf;
 
@@ -1462,121 +1214,6 @@ mod tests {
         };
         let p = dir.join("lineitem.parquet");
         p.exists().then(|| p.to_string_lossy().into_owned())
-    }
-
-    const Q6_SQL: &str = "
-        SELECT sum(l_extendedprice * l_discount) AS revenue
-        FROM lineitem
-        WHERE l_shipdate >= DATE '1994-01-01'
-          AND l_shipdate <  DATE '1995-01-01'
-          AND l_discount BETWEEN 0.05 AND 0.07
-          AND l_quantity <  24
-    ";
-
-    /// Build a SessionContext over real SF=1 lineitem.parquet
-    /// (FastParquetTableProvider for parity with the bench harness) and
-    /// optionally register the InjectFusedQ6Rule.
-    async fn ctx_for_q6(register_rule: bool) -> Option<SessionContext> {
-        use crate::fast_parquet::FastParquetTableProvider;
-        use datafusion::execution::session_state::SessionStateBuilder;
-        use datafusion::prelude::SessionConfig;
-
-        let path = sf1_lineitem()?;
-        let state = if register_rule {
-            SessionStateBuilder::new()
-                .with_config(SessionConfig::new().with_target_partitions(14))
-                .with_default_features()
-                .with_physical_optimizer_rule(Arc::new(InjectFusedQ6Rule))
-                .build()
-        } else {
-            SessionStateBuilder::new()
-                .with_config(SessionConfig::new().with_target_partitions(14))
-                .with_default_features()
-                .build()
-        };
-        let ctx = SessionContext::new_with_state(state);
-        let prov = FastParquetTableProvider::try_new(path).unwrap();
-        ctx.register_table("lineitem", Arc::new(prov)).unwrap();
-        Some(ctx)
-    }
-
-    /// Inject rule fires on real Q6 SQL: the resulting physical plan
-    /// contains a `FusedFilterSumExec` (the Filter+Aggregate stack got
-    /// replaced) and the answer matches the unmodified plan to within
-    /// floating-point tolerance.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn inject_rule_rewrites_real_q6_plan_and_preserves_result() {
-        use datafusion::arrow::array::Float64Array;
-        use datafusion::physical_plan::displayable;
-
-        let Some(ctx_with) = ctx_for_q6(true).await else {
-            eprintln!("TPC-H SF=1 data not generated; skipping test");
-            return;
-        };
-        let ctx_without = ctx_for_q6(false).await.unwrap();
-
-        // 1. Verify the rule's effect on the physical plan: tree
-        //    should contain "FusedFilterSumExec" once.
-        let df = ctx_with.sql(Q6_SQL).await.unwrap();
-        let plan = df.create_physical_plan().await.unwrap();
-        let plan_str = displayable(plan.as_ref()).indent(true).to_string();
-        assert!(
-            plan_str.contains("FusedAggregateExec"),
-            "InjectFusedQ6Rule did not fire on the canonical Q6 plan.\nPlan:\n{plan_str}"
-        );
-
-        // 2. Verify the answer matches the un-rewritten plan.
-        let r_with = ctx_with.sql(Q6_SQL).await.unwrap().collect().await.unwrap();
-        let r_without = ctx_without
-            .sql(Q6_SQL)
-            .await
-            .unwrap()
-            .collect()
-            .await
-            .unwrap();
-        let v_with = r_with[0]
-            .column(0)
-            .as_any()
-            .downcast_ref::<Float64Array>()
-            .unwrap()
-            .value(0);
-        let v_without = r_without[0]
-            .column(0)
-            .as_any()
-            .downcast_ref::<Float64Array>()
-            .unwrap()
-            .value(0);
-        let rel = ((v_with - v_without) / v_without).abs();
-        assert!(
-            rel < 1e-10,
-            "rule-rewritten Q6 result diverges: with={v_with}, without={v_without}, rel_err={rel:e}"
-        );
-    }
-
-    /// Rule must NOT fire on a query that shares some structural
-    /// features but isn't Q6 (here: same SUM aggregate but no filter
-    /// stack and different alias). The plan should pass through
-    /// unchanged.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn inject_rule_does_not_fire_on_unrelated_query() {
-        use datafusion::physical_plan::displayable;
-        let Some(ctx) = ctx_for_q6(true).await else {
-            eprintln!("TPC-H SF=1 data not generated; skipping test");
-            return;
-        };
-        // No filter stack, different alias — shouldn't match Q6.
-        let plan = ctx
-            .sql("SELECT sum(l_extendedprice * l_discount) AS total FROM lineitem")
-            .await
-            .unwrap()
-            .create_physical_plan()
-            .await
-            .unwrap();
-        let plan_str = displayable(plan.as_ref()).indent(true).to_string();
-        assert!(
-            !plan_str.contains("FusedAggregateExec"),
-            "InjectFusedQ6Rule wrongly fired on a non-Q6 query:\n{plan_str}"
-        );
     }
 
     // ----- InjectFusedQ1Rule tests -----
@@ -2144,108 +1781,11 @@ mod tests {
         assert_eq!(flip_op(Operator::And), None);
     }
 
-    #[test]
-    fn flatten_and_descends_through_nested_ands() {
-        // (a < 1) AND ((b < 2) AND (c < 3)) → three leaves.
-        let leaf_a = bin(col("a"), Operator::Lt, lit_f64(1.0));
-        let leaf_b = bin(col("b"), Operator::Lt, lit_f64(2.0));
-        let leaf_c = bin(col("c"), Operator::Lt, lit_f64(3.0));
-        let rhs = bin(leaf_b.clone(), Operator::And, leaf_c.clone());
-        let root = bin(leaf_a.clone(), Operator::And, rhs);
-        let mut out: Vec<&Arc<dyn PhysicalExpr>> = Vec::new();
-        flatten_and(&root, &mut out);
-        assert_eq!(out.len(), 3);
-    }
-
-    #[test]
-    fn flatten_and_treats_non_and_as_leaf() {
-        // A bare comparison is one leaf — no descent into the binary.
-        let expr = bin(col("a"), Operator::Lt, lit_f64(1.0));
-        let mut out: Vec<&Arc<dyn PhysicalExpr>> = Vec::new();
-        flatten_and(&expr, &mut out);
-        assert_eq!(out.len(), 1);
-    }
-
-    #[test]
-    fn decompose_leaf_handles_mirrored_literal_on_left() {
-        // `5 < l_quantity` should canonicalise to `(l_quantity, Gt, 5)`.
-        let mirrored = bin(lit_f64(5.0), Operator::Lt, col("l_quantity"));
-        let (name, op, lit) = decompose_leaf(&mirrored).unwrap();
-        assert_eq!(name, "l_quantity");
-        assert_eq!(op, Operator::Gt);
-        assert!(matches!(lit, ScalarValue::Float64(Some(v)) if v == 5.0));
-    }
-
-    #[test]
-    fn decompose_leaf_rejects_unknown_column() {
-        // Q6 only recognises l_shipdate / l_discount / l_quantity.
-        let expr = bin(col("l_orderkey"), Operator::Lt, lit_f64(1.0));
-        assert!(decompose_leaf(&expr).is_none());
-    }
-
-    #[test]
-    fn decompose_leaf_rejects_non_binary_expr() {
-        // A bare column isn't a BinaryExpr — None.
-        let bare = col("l_shipdate");
-        assert!(decompose_leaf(&bare).is_none());
-    }
-
-    #[test]
-    fn decompose_leaf_rejects_column_op_column() {
-        // No literal present on either side — None.
-        let two_cols = bin(col("l_shipdate"), Operator::Lt, col("l_quantity"));
-        assert!(decompose_leaf(&two_cols).is_none());
-    }
-
-    #[test]
-    fn extract_q6_predicate_happy_path() {
-        // Full canonical Q6 predicate ANDed together.
-        let p = bin(
-            bin(
-                bin(
-                    bin(
-                        bin(col("l_shipdate"), Operator::GtEq, lit_date(8766)),
-                        Operator::And,
-                        bin(col("l_shipdate"), Operator::Lt, lit_date(9131)),
-                    ),
-                    Operator::And,
-                    bin(col("l_discount"), Operator::GtEq, lit_f64(0.05)),
-                ),
-                Operator::And,
-                bin(col("l_discount"), Operator::LtEq, lit_f64(0.07)),
-            ),
-            Operator::And,
-            bin(col("l_quantity"), Operator::Lt, lit_f64(24.0)),
-        );
-        let pred = extract_q6_predicate(&p).unwrap();
-        assert_eq!(pred.date_lo, 8766);
-        assert_eq!(pred.date_hi, 9131);
-        assert!((pred.disc_lo - 0.05).abs() < 1e-12);
-        assert!((pred.disc_hi - 0.07).abs() < 1e-12);
-        assert!((pred.qty_hi - 24.0).abs() < 1e-12);
-    }
-
-    #[test]
-    fn extract_q6_predicate_rejects_wrong_literal_type_for_shipdate() {
-        // shipdate must be Date32; Float64 literal is rejected.
-        let bad = bin(col("l_shipdate"), Operator::GtEq, lit_f64(0.0));
-        assert!(extract_q6_predicate(&bad).is_none());
-    }
-
-    #[test]
-    fn extract_q6_predicate_rejects_unexpected_operator() {
-        // Q6 doesn't recognise (l_shipdate Eq date) — only GtEq/Lt.
-        let bad = bin(col("l_shipdate"), Operator::Eq, lit_date(8766));
-        assert!(extract_q6_predicate(&bad).is_none());
-    }
-
-    #[test]
-    fn extract_q6_predicate_rejects_missing_bounds() {
-        // Only one of the five required bounds → None (the `?` chain
-        // on the final Some(Q6Predicate{...}) sees the unwrap fail).
-        let only_date_lo = bin(col("l_shipdate"), Operator::GtEq, lit_date(8766));
-        assert!(extract_q6_predicate(&only_date_lo).is_none());
-    }
+    // Σ.G.2e-4: tests for the Q6-only helpers (`flatten_and`,
+    // `decompose_leaf`, `extract_q6_predicate`) retired with the
+    // helpers themselves. The generalised equivalents in
+    // `fused_aggregate_filter_sum_rule` have their own unit + integration
+    // tests covering the same canonicalisation + rejection paths.
 
     #[test]
     fn extract_q1_predicate_lt_off_by_one_correction() {

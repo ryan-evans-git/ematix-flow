@@ -1,8 +1,8 @@
-//! Σ.D3 phase D (real): bench Q6 with and without `InjectFusedQ6Rule`
+//! Σ.D3 phase D (real): bench Q6 with and without `InjectFilterSumRule`
 //! to measure the gain from SQL-pattern auto-injection.
 //!
 //! Both paths run through `SessionContext::sql(Q6_SQL)`; the only
-//! difference is whether `InjectFusedQ6Rule` is registered as a
+//! difference is whether `InjectFilterSumRule` is registered as a
 //! physical-optimizer rule. With the rule, DataFusion's default
 //! Filter+Aggregate stack is rewritten to a single `FusedFilterSumExec`
 //! (JIT mode) over the FastParquet scan.
@@ -27,7 +27,7 @@ use std::time::Instant;
 use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::prelude::{SessionConfig, SessionContext};
 use ematix_flow_core::fast_parquet::FastParquetTableProvider;
-use ematix_flow_core::fused_jit_rule::InjectFusedQ6Rule;
+use ematix_flow_core::fused_aggregate_filter_sum_rule::InjectFilterSumRule;
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -76,7 +76,7 @@ async fn build_ctx(path: &str, with_rule: bool) -> SessionContext {
         SessionStateBuilder::new()
             .with_config(cfg)
             .with_default_features()
-            .with_physical_optimizer_rule(Arc::new(InjectFusedQ6Rule))
+            .with_physical_optimizer_rule(Arc::new(InjectFilterSumRule))
             .build()
     } else {
         SessionStateBuilder::new()
@@ -110,7 +110,7 @@ async fn bench(label: &str, ctx: &SessionContext) -> f64 {
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
     let path = data_path();
-    println!("==> Σ.D3 phase D (real): Q6 with InjectFusedQ6Rule");
+    println!("==> Σ.D3 phase D (real): Q6 with InjectFilterSumRule");
     println!("==> data: {path}");
     println!("==> {TRIALS}-trial median after {WARMUPS} warm-ups");
     println!();
@@ -119,7 +119,7 @@ async fn main() {
     let ctx_on = build_ctx(&path, true).await;
 
     let off = bench("FastParquet SQL (rule OFF)", &ctx_off).await;
-    let on = bench("FastParquet SQL (rule ON — InjectFusedQ6Rule)", &ctx_on).await;
+    let on = bench("FastParquet SQL (rule ON — InjectFilterSumRule)", &ctx_on).await;
 
     let pct = 100.0 * (off - on) / off;
     println!();
