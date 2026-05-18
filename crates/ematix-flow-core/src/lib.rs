@@ -51,6 +51,11 @@ pub mod fused_aggregate_filter_sum;
 // plan shape. First slice recognises the canonical Q6 shape; future
 // slices broaden the matcher to arbitrary column sets.
 pub mod fused_aggregate_filter_sum_rule;
+// Σ.G.2f.1 (task #480): `FilterMultiAggSpec` — runtime-configured
+// group-by + multi-aggregate spec with no data-specific JIT baking.
+// Substrate for the Photon-style template-specialization follow-up in
+// .2 that retires `InjectFusedQ1Rule` + `Q1Spec`.
+pub mod fused_aggregate_filter_multi_agg;
 // Σ.D2: `FusedFilterMultiAggExec` — single-pass fused filter +
 // multi-aggregate + group-by physical operator. Day-1 prototype
 // (`examples/tpch_q1_tune.rs`) showed 3.08 ms on Q1 SF=1 / 14
