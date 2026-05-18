@@ -56,6 +56,11 @@ pub mod fused_aggregate_filter_sum_rule;
 // Substrate for the Photon-style template-specialization follow-up in
 // .2 that retires `InjectFusedQ1Rule` + `Q1Spec`.
 pub mod fused_aggregate_filter_multi_agg;
+// Σ.G.2f.3 (task #481): `InjectFilterMultiAggRule` — SQL-pattern
+// physical optimizer rule that rewrites a multi-aggregate + group-by
+// plan shape into a single `FusedAggregateExec<FilterMultiAggSpec>`.
+// Group-by-aware counterpart to `InjectFilterSumRule`.
+pub mod fused_aggregate_filter_multi_agg_rule;
 // Σ.D2: `FusedFilterMultiAggExec` — single-pass fused filter +
 // multi-aggregate + group-by physical operator. Day-1 prototype
 // (`examples/tpch_q1_tune.rs`) showed 3.08 ms on Q1 SF=1 / 14
