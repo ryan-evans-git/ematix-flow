@@ -332,3 +332,49 @@ for feature.
 - **CDC / change-data-capture sources.** Out of scope. Use a Kafka
   Connect / Debezium-style upstream pipeline producing to Kafka, then
   consume with this framework.
+
+---
+
+## Post-2026-05-17 AWS campaign — next chapter
+
+The 2026-05-17 SF=1+SF=10 validation campaign produced concrete
+evidence (15/22 SF=1 wins vs DuckDB+Polars; Π.15 parallel scaling
+3.72× on x86 c7i; SF=10 regression vs DuckDB needs investigation) +
+exposed a set of harness bugs that lost the SF=10 BENCHMARKS.md.
+That run informs the next several phases.
+
+### Must-fix before the next campaign
+
+- [docs/CAMPAIGN_HARNESS_FIXES.md](CAMPAIGN_HARNESS_FIXES.md) — 15
+  concrete bugs/optimisations (stage ordering, BENCHMARKS-per-SF
+  upload, GHA prebuilt target, et al). One infra PR ≈ 1 wk.
+
+### New engine phases (drafted 2026-05-17, ready to prioritise)
+
+| Phase | Doc | Effort | Status | What it unlocks |
+|---|---|---|---|---|
+| **Σ.G** Generic fused aggregate | [PHASE_SIGMA_G_GENERIC_FUSED_AGGREGATE.md](PHASE_SIGMA_G_GENERIC_FUSED_AGGREGATE.md) | ~3 wk | Drafted | Retires per-query `InjectFusedQN` rules; "no longer per-query bandaid" |
+| **Φ** Vectorised aggregate kernels | [PHASE_PHI_VECTORISED_AGG_KERNELS.md](PHASE_PHI_VECTORISED_AGG_KERNELS.md) | ~9 wk | Drafted | Real wins on non-TPC-H aggregates; backs Σ.G.4 |
+| **Π** Aggregate (and join) spilling | [PHASE_PI_AGGREGATE_SPILLING.md](PHASE_PI_AGGREGATE_SPILLING.md) | ~9 wk | Stub | Production-readiness at SF=100+ |
+| **Ψ.1** Column stats + cardinality estimator | [PHASE_PSI_COLUMN_STATS_AND_CBO.md](PHASE_PSI_COLUMN_STATS_AND_CBO.md) | ~4 wk | Stub | Σ.G.4's cost-driven dispatch becomes useful |
+| **Ψ.2** Full CBO | (same doc) | ~3-6 mo | Stub (defer-decision) | Ship to users with arbitrary schemas |
+| **Z** Distributed TPC-H vs Spark | [DISTRIBUTED_TPCH_BENCHMARK_PLAN.md](DISTRIBUTED_TPCH_BENCHMARK_PLAN.md) | ~1 wk α+β impl, ~$2.50 to run | Drafted (incl. `flow worker` CLI spec) | TPC-H fan-out vs Spark/Trino/Daft on EKS |
+
+### Recommended order
+
+1. **Land PR #87** (Σ.E3b emat dict-preserved + parquet v0.9.2 bump) — open, awaiting CI.
+2. **Land CAMPAIGN_HARNESS_FIXES PR** — bundles the 15 fixes; trustworthy future campaign runs.
+3. **Σ.G** (3 wk) — hygiene + honest "no longer bandaid" claim.
+4. **Φ.1-Φ.3 + Π + Ψ.1 in parallel** (~12 wk, probably two engineers):
+   - Φ for non-TPC-H aggregate wins.
+   - Π for SF=100 production-readiness.
+   - Ψ.1 to feed Σ.G.4.
+5. **Decision point at T+15 wk:** commit to Ψ.2 (full CBO), or focus on Φ.4-5 (kernel breadth)?
+6. **Phase Z distributed** can run alongside any of #3-5 once the `flow worker` CLI subcommand ships.
+
+### Open prioritisation questions (for the post-campaign session)
+
+1. **Π vs Φ ordering** — Π unblocks SF=100 (real users). Φ unblocks non-TPC-H (better positioning). Which first?
+2. **Whether Ψ.2 ships at all** — if Σ.G.4 + Ψ.1 give "good enough" planning for target customers, Ψ.2's 3-6 months might be better spent on Φ.4+Φ.5.
+3. **Distributed campaign timing** — run α+β as soon as `flow worker` lands, or wait until Φ ships so we benchmark with the best kernels?
+4. **Generic vectorised kernels at the *parquet decode* layer too** — should ematix-parquet absorb Φ.5's codegen path, or keep decode + aggregate kernels separate?
