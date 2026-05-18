@@ -416,20 +416,22 @@ impl TableProvider for EmatixFastParquetTableProvider {
     /// The filtered decode paths still materialise Utf8 → StringArray
     /// which would mismatch the dict-rewritten schema.
     ///
-    /// Σ.E5 (2026-05-18): pushdown is allowed on the streaming path
-    /// too. The Exec dispatches to the bridge filtered-decode route
-    /// (`execute()` line ~600) when `filter.is_some()` regardless of
-    /// `streaming_arrow_reader`, so the existing late-mat path runs
-    /// the predicate without any new wiring. The earlier Σ.E5.1.b
-    /// gate that returned `Unsupported` on streaming was a scope cut
-    /// — `EmatArrowBatchReader` itself doesn't fuse with bitmap-first
-    /// decode, but DataFusion never asks it to: the bridge filtered
-    /// path takes over before the streaming branch is reached.
+    /// Σ.E5.1.b: when the streaming reader is on, pushdown is also
+    /// off. The Exec routes filter-bearing queries to the bridge
+    /// filtered-decode path (line ~600) — which emits Utf8 not
+    /// Utf8View. Bench measurement (2026-05-18) showed that route
+    /// is materially slower than streaming-with-residual-FilterExec
+    /// for Q01-shape queries: pushing the filter took Q01 from
+    /// 18.5 ms → 78.7 ms. Geomean across 22 queries: 1.0414 (no
+    /// pushdown) vs 1.1085 (with pushdown). Letting DataFusion's
+    /// residual FilterExec run the predicate on the Utf8View batches
+    /// is the right call until we have a Utf8View-aware filtered
+    /// decode path.
     fn supports_filters_pushdown(
         &self,
         filters: &[&Expr],
     ) -> DfResult<Vec<TableProviderFilterPushDown>> {
-        if self.dict_preservation {
+        if self.dict_preservation || self.streaming_arrow_reader {
             return Ok(filters
                 .iter()
                 .map(|_| TableProviderFilterPushDown::Unsupported)
