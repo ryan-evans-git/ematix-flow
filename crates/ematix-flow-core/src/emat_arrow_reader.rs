@@ -819,11 +819,10 @@ fn decode_byte_array_to_string_view_slow(
             )));
         }
         let n = dph.num_values as usize;
-        let slices =
-            decode_plain_byte_array(&scratch).map_err(|e| ext(format!("plain byte_array: {e}")))?;
-        for s in slices.iter().take(n) {
-            push_plain_view(&mut data, &mut views, s);
-        }
+        // Σ.E5 (2026-05-18): inline parse — skip the
+        // Vec<&[u8]> intermediate that `decode_plain_byte_array`
+        // would allocate. See `plain_byte_array_to_views`.
+        plain_byte_array_to_views(&scratch, &mut data, &mut views, n)?;
     }
 
     while views.len() < total {
@@ -854,11 +853,9 @@ fn decode_byte_array_to_string_view_slow(
                 }
             }
             Encoding::Plain => {
-                let slices = decode_plain_byte_array(&scratch)
-                    .map_err(|e| ext(format!("plain byte_array: {e}")))?;
-                for s in slices.iter().take(n) {
-                    push_plain_view(&mut data, &mut views, s);
-                }
+                // Σ.E5 (2026-05-18): inline parse to skip the
+                // Vec<&[u8]> intermediate.
+                plain_byte_array_to_views(&scratch, &mut data, &mut views, n)?;
             }
             other => {
                 return Err(ext(format!(
@@ -884,16 +881,57 @@ fn decode_byte_array_to_string_view_slow(
     })
 }
 
-/// Append `bytes` to `data` and push a view that points at the new
-/// offset. For ≤ 12-byte strings `make_view` returns a fully-inline
-/// view (the offset is ignored), so we still append (cheap memcpy)
-/// to keep the data block dense for downstream consumers that may
-/// scan it linearly.
+/// Σ.E5 (2026-05-18): PLAIN-encoded BYTE_ARRAY → views buffer in a
+/// single pass.
+///
+/// The old path called
+/// `ematix_parquet_codec::plain::decode_plain_byte_array(scratch)`
+/// which returns `Vec<&[u8]>`, then a `for s in slices.take(n)` loop
+/// that called the (now-removed) `push_plain_view` per row. On a
+/// 1.5M-row column like
+/// `o_comment` the intermediate Vec costs ~12 MB of allocation and a
+/// second pass over the data. Q13's scan time was 80 ms on Emat vs
+/// 50 ms on parquet-rs largely for this reason.
+///
+/// This inline parse walks `scratch` once: 4-byte LE length →
+/// extend data + push view. No intermediate Vec.
+///
+/// Format reference: parquet spec, BYTE_ARRAY PLAIN encoding is
+/// `[u32 len][bytes]` repeated `num_values` times.
 #[inline]
-fn push_plain_view(data: &mut Vec<u8>, views: &mut Vec<u128>, bytes: &[u8]) {
-    let off = data.len() as u32;
-    data.extend_from_slice(bytes);
-    views.push(make_view(bytes, 0, off));
+fn plain_byte_array_to_views(
+    scratch: &[u8],
+    data: &mut Vec<u8>,
+    views: &mut Vec<u128>,
+    n: usize,
+) -> DfResult<()> {
+    let mut off = 0usize;
+    let scratch_len = scratch.len();
+    for i in 0..n {
+        if off + 4 > scratch_len {
+            return Err(ext(format!(
+                "plain byte_array: truncated length prefix at value {i}/{n}, offset {off}/{scratch_len}"
+            )));
+        }
+        let len = u32::from_le_bytes([
+            scratch[off],
+            scratch[off + 1],
+            scratch[off + 2],
+            scratch[off + 3],
+        ]) as usize;
+        off += 4;
+        if off + len > scratch_len {
+            return Err(ext(format!(
+                "plain byte_array: value {i}/{n} length {len} overruns scratch at offset {off}"
+            )));
+        }
+        let bytes = &scratch[off..off + len];
+        let dst_off = data.len() as u32;
+        data.extend_from_slice(bytes);
+        views.push(make_view(bytes, 0, dst_off));
+        off += len;
+    }
+    Ok(())
 }
 
 /// BYTE_ARRAY → `DictionaryArray<UInt32, Utf8>` — same shape as
