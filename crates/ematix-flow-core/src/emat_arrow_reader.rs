@@ -663,12 +663,98 @@ fn decode_dict_chunk_typed<T: Copy>(
     Ok(out)
 }
 
-/// BYTE_ARRAY → `StringViewArray` with the parquet dictionary bytes
-/// pushed as one backing block. The per-row view (u128) points at an
-/// offset inside that block; no per-row UTF-8 validation, no
-/// `StringBuilder` round-trip. PLAIN-fallback pages append their
-/// bytes to the same block and emit views over the new offsets.
+/// BYTE_ARRAY → `StringViewArray`.
+///
+/// Σ.E5.1.d: the overwhelmingly common case is a dict-encoded chunk
+/// (parquet's default writer behaviour for low-cardinality byte
+/// arrays — `l_returnflag` / `l_linestatus` on TPC-H, every enum-ish
+/// column in practice). For that case we hand off to
+/// `decode_dict_byte_array_to_string_view` which:
+///   * decodes the dict + indices once via
+///     `read_column_byte_array_dict_preserved` (zero per-row UTF-8
+///     validation; reuses the codec's tuned dict-preservation path),
+///   * builds a `Vec<u128>` of *per-dict-entry* views — `make_view`
+///     (which is `#[inline(never)]` — a real call) runs `dict_len`
+///     times instead of `n_rows` times, and
+///   * fills the `n_rows` view buffer with a tight gather
+///     (`views[r] = dict_views[indices[r] as usize]`) — branch-free,
+///     no `extend_from_slice`, no per-row inline/buffer split.
+///
+/// We use `dict_bytes` straight from the dict-preserved column as the
+/// backing data block (no copy). For inline (≤12B) views the data
+/// block is unused but it's still attached for >12B-prefix arrays
+/// that might land here in future workloads.
+///
+/// For the rare PLAIN-only (no dict) case — extremely unusual in
+/// real parquet — we fall back to the previous row-by-row path so we
+/// still produce a correct result.
 fn decode_byte_array_to_string_view(
+    file: &ParquetFile,
+    rg: usize,
+    col: usize,
+) -> DfResult<DecodedColumn> {
+    // Fast path: try the dict-preserved reader first. It fails only
+    // when the column has no DictionaryPage or has a PLAIN-fallback
+    // data page (writer wrote some pages dict, some PLAIN).
+    match read_column_byte_array_dict_preserved(file, rg, col) {
+        Ok(raw) => Ok(build_string_view_from_dict_preserved(raw)),
+        Err(_) => decode_byte_array_to_string_view_slow(file, rg, col),
+    }
+}
+
+/// Σ.E5.1.d hot path — collapses to a tight gather:
+///   1. Build `dict_views: Vec<u128>` once (size = `dict_len`,
+///      typically 3–100 for low-card columns).
+///   2. For each `idx` in `indices`, `views.push(dict_views[idx])`.
+///      No `make_view` call; no inline-vs-buffered branch in the loop.
+///   3. Reuse `dict_bytes` as the backing block — zero copy.
+fn build_string_view_from_dict_preserved(
+    raw: ematix_parquet_codec::read::DictPreservedColumn,
+) -> DecodedColumn {
+    let dict_len = raw.dict_offsets.len() - 1;
+    let n_rows = raw.indices.len();
+
+    // (1) Build one view per dict entry. `make_view` is
+    // `#[inline(never)]` so we want this to run dict_len times, not
+    // n_rows times.
+    let mut dict_views: Vec<u128> = Vec::with_capacity(dict_len);
+    for i in 0..dict_len {
+        let start = raw.dict_offsets[i] as usize;
+        let end = raw.dict_offsets[i + 1] as usize;
+        let bytes = &raw.dict_bytes[start..end];
+        // block_id = 0 (we attach `dict_bytes` as buffer 0); offset
+        // = start (`make_view` ignores it for ≤12B inline strings,
+        // uses it for the long path). `make_view` already
+        // jump-tables by length to avoid `ptr::copy_nonoverlapping`
+        // for inline strings — see godbolt link in arrow-array.
+        dict_views.push(make_view(bytes, 0, raw.dict_offsets[i]));
+    }
+
+    // (2) Tight gather. Bounds were validated by the dict-preserved
+    // reader (it rejects any idx >= dict_len up front), so unchecked
+    // indexing is sound — but the bounds check usually elides under
+    // the optimiser here anyway. Keep it safe; the read is the cost.
+    let mut views: Vec<u128> = Vec::with_capacity(n_rows);
+    for &idx in &raw.indices {
+        // SAFETY (logical, not unsafe): the dict-preserved reader
+        // validates every idx < dict_len before returning.
+        views.push(dict_views[idx as usize]);
+    }
+    debug_assert_eq!(views.len(), n_rows);
+
+    // (3) `dict_bytes` is exactly the backing block our views point
+    // at (for >12B strings; ≤12B strings are inlined in the view).
+    DecodedColumn::StringView {
+        views: Buffer::from_vec(views),
+        n_rows,
+        data: Buffer::from_vec(raw.dict_bytes),
+    }
+}
+
+/// Slow path: PLAIN-only or mixed-encoding BYTE_ARRAY → StringView,
+/// row-by-row. Pre-Σ.E5.1.d behaviour; kept for correctness when the
+/// fast dict-preserved reader can't claim the chunk.
+fn decode_byte_array_to_string_view_slow(
     file: &ParquetFile,
     rg: usize,
     col: usize,
@@ -1198,6 +1284,82 @@ mod tests {
         for (i, g) in got.iter().enumerate() {
             assert_eq!(g.as_bytes(), raw[i % 3], "mismatch at row {i}");
         }
+    }
+
+    /// Σ.E5.1.d: dict-encoded BYTE_ARRAY → StringView must match an
+    /// independently-computed expected `StringViewArray` value-for-
+    /// value. Exercises the new gather-from-dict-views fast path
+    /// (Q1's `l_returnflag` / `l_linestatus` shape — short strings
+    /// inlined in the view).
+    #[test]
+    fn utf8view_dict_encoded_decode_matches_plain() {
+        let path = tmp_parquet("utf8view_dict");
+        // Mix of inline (≤12B) and long (>12B) entries to exercise
+        // both `make_view` branches inside the dict-views build loop.
+        // Q1's returnflag/linestatus are 1-byte; we add longer
+        // strings too so the data buffer path is also tested.
+        let raw: [&[u8]; 4] = [
+            b"R",
+            b"AB",
+            b"long_string_more_than_twelve_bytes_yo",
+            b"another_long_one",
+        ];
+        let n = 5_000usize;
+        let rows: Vec<&[u8]> = (0..n).map(|i| raw[i % raw.len()]).collect();
+        // Repeat values heavily → writer emits RLE_DICTIONARY data
+        // pages, exercising the fast path.
+        write_table_with_dict_to_path(
+            &path,
+            &[("s", ColumnData::ByteArray(&rows))],
+            CompressionCodec::Uncompressed,
+            usize::MAX,
+            &[true],
+        )
+        .unwrap();
+
+        let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new(
+            "s",
+            DataType::Utf8View,
+            false,
+        )]));
+        let file = ParquetFile::open(&path).unwrap();
+        let reader = EmatArrowBatchReaderBuilder::new(file, schema)
+            .build()
+            .unwrap();
+        let batches: Vec<RecordBatch> = reader.map(|b| b.unwrap()).collect();
+
+        // Expected StringViewArray from the row sequence the writer
+        // saw. Built via the standard arrow-array path so we know
+        // it's correct regardless of how we built ours.
+        let expected_strs: Vec<&str> = rows
+            .iter()
+            .map(|s| std::str::from_utf8(s).unwrap())
+            .collect();
+        let expected = StringViewArray::from(expected_strs);
+
+        // Concatenate every batch row-by-row and compare against
+        // `expected`. We can't use array-level equality because we
+        // emit one StringViewArray per batch (one per RG slice) and
+        // `expected` is one array — but the row sequence is locked.
+        let mut got_idx = 0usize;
+        for b in &batches {
+            let arr = b
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringViewArray>()
+                .unwrap();
+            for i in 0..arr.len() {
+                assert_eq!(
+                    arr.value(i),
+                    expected.value(got_idx),
+                    "row {got_idx}: got {:?}, expected {:?}",
+                    arr.value(i),
+                    expected.value(got_idx),
+                );
+                got_idx += 1;
+            }
+        }
+        assert_eq!(got_idx, n);
     }
 
     #[test]
