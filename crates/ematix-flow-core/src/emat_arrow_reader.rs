@@ -685,6 +685,25 @@ fn decode_dict_chunk_typed<T: Copy>(
 /// block is unused but it's still attached for >12B-prefix arrays
 /// that might land here in future workloads.
 ///
+/// Σ.E5 (2026-05-18) bench-only entry point. Exposes the per-RG
+/// StringView decode for direct micro-benchmarks against parquet-rs;
+/// returns just `(row_count, total_bytes_decoded)` so we don't have
+/// to widen `DecodedColumn`'s visibility.
+pub fn decode_byte_array_to_string_view_for_bench(
+    file: &ParquetFile,
+    rg: usize,
+    col: usize,
+) -> DfResult<(usize, usize)> {
+    let dc = decode_byte_array_to_string_view(file, rg, col)?;
+    let rows = dc.len();
+    // Total decoded byte size = views buffer (16 bytes/row) + data buffer.
+    let bytes = match &dc {
+        DecodedColumn::StringView { views, data, .. } => views.len() + data.len(),
+        _ => 0,
+    };
+    Ok((rows, bytes))
+}
+
 /// For the rare PLAIN-only (no dict) case — extremely unusual in
 /// real parquet — we fall back to the previous row-by-row path so we
 /// still produce a correct result.
