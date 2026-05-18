@@ -295,6 +295,28 @@ impl EmatArrowBatchReader {
     }
 
     /// Decode every projected column of `rg` into `cur_rg_columns`.
+    ///
+    /// Parallel-decode shape (Σ.E5.1 follow-up):
+    ///
+    /// Each projected column's decode is independent — distinct
+    /// `PageWalker` over a disjoint byte range from a shared
+    /// `ParquetFile` whose `read_range` is lock-free (`pread(2)` on
+    /// Unix, positional `ReadFile` on Windows). `ParquetFile` is `Sync`
+    /// — borrowing it across `std::thread::scope` works without
+    /// re-opening per thread. The `Arc<Schema>` is also `Sync` so each
+    /// thread can index its own `target` `DataType`.
+    ///
+    /// Threadpool sizing: we spawn `min(num_projected_columns,
+    /// available_parallelism())` threads. For the Q1 shape (7 columns
+    /// on a 14-core machine) every column gets its own thread; for a
+    /// 200-column wide table the spawn count is bounded by core count
+    /// and threads pull from a shared work queue.
+    ///
+    /// Memory note: doing N columns concurrently raises per-RG peak
+    /// memory by ~Nx vs the sequential path. At SF=1 a numeric RG
+    /// column is ~8 MB and 7 concurrent columns peak at ~50-100 MB —
+    /// well inside budget. At SF=10+ this is worth revisiting (chunked
+    /// or page-streaming decode is the next lever).
     fn load_row_group(&mut self, rg: usize) -> DfResult<()> {
         let md = self
             .file
@@ -302,13 +324,89 @@ impl EmatArrowBatchReader {
             .map_err(|e| ext(format!("metadata: {e}")))?;
         let row_group = &md.row_groups[rg];
         self.cur_rg_total = row_group.num_rows as usize;
+        // Drop `md` so `&self.file` is the only outstanding borrow
+        // before we hand it to scoped threads.
+        drop(md);
 
-        let mut cols: Vec<DecodedColumn> = Vec::with_capacity(self.projection.len());
-        for (proj_idx, &leaf) in self.projection.iter().enumerate() {
-            let target = self.arrow_schema.field(proj_idx).data_type();
-            let decoded = decode_one_column(&self.file, rg, leaf, target)?;
-            cols.push(decoded);
-        }
+        let projection = &self.projection;
+        let schema = &self.arrow_schema;
+        let file = &self.file;
+        let n_cols = projection.len();
+
+        // Cap on spawned threads — never exceed available cores, even
+        // for wide projections. For Q1 (7 columns on a 14-core box)
+        // every column gets a thread; for a 200-column projection we
+        // batch onto the work queue.
+        let max_threads = std::thread::available_parallelism()
+            .map(|p| p.get())
+            .unwrap_or(1)
+            .max(1)
+            .min(n_cols.max(1));
+
+        // Sequential fast path: skip scoped-thread overhead when
+        // there's nothing to parallelise (single-column projection or
+        // single-core machine).
+        let cols: Vec<DecodedColumn> = if max_threads <= 1 || n_cols <= 1 {
+            let mut out = Vec::with_capacity(n_cols);
+            for (proj_idx, &leaf) in projection.iter().enumerate() {
+                let target = schema.field(proj_idx).data_type();
+                out.push(decode_one_column(file, rg, leaf, target)?);
+            }
+            out
+        } else {
+            // Pre-allocate result slots so we can scatter into them
+            // by index without a final sort step.
+            let mut slots: Vec<Option<DfResult<DecodedColumn>>> =
+                (0..n_cols).map(|_| None).collect();
+
+            // Shared work queue — atomic counter handing out the next
+            // column index. Caps thread spawn count at `max_threads`
+            // while still letting each thread chew through multiple
+            // columns when n_cols > cores.
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            let next = AtomicUsize::new(0);
+
+            std::thread::scope(|s| {
+                // Each thread writes into a disjoint subset of `slots`
+                // (column index handed out by `next.fetch_add`), so we
+                // collect the per-thread results and merge them after
+                // join. No interior mutability across threads.
+                let mut handles = Vec::with_capacity(max_threads);
+                for _ in 0..max_threads {
+                    let next = &next;
+                    handles.push(s.spawn(move || -> Vec<(usize, DfResult<DecodedColumn>)> {
+                        let mut local: Vec<(usize, DfResult<DecodedColumn>)> = Vec::new();
+                        loop {
+                            let i = next.fetch_add(1, Ordering::Relaxed);
+                            if i >= n_cols {
+                                break;
+                            }
+                            let leaf = projection[i];
+                            let target = schema.field(i).data_type();
+                            local.push((i, decode_one_column(file, rg, leaf, target)));
+                        }
+                        local
+                    }));
+                }
+                for h in handles {
+                    // Propagate panics — a column-decode panic is a
+                    // bug, not a recoverable error.
+                    let partial = h.join().expect("emat_arrow_reader decode thread panicked");
+                    for (i, r) in partial {
+                        slots[i] = Some(r);
+                    }
+                }
+            });
+
+            // Fail-fast on the first column error (in projection order
+            // — gives deterministic error messages).
+            let mut out = Vec::with_capacity(n_cols);
+            for (i, slot) in slots.into_iter().enumerate() {
+                let r = slot.ok_or_else(|| ext(format!("column {i} decode slot never filled")))?;
+                out.push(r?);
+            }
+            out
+        };
 
         // Sanity: every column has the same length as the RG.
         for (i, c) in cols.iter().enumerate() {
@@ -1269,5 +1367,136 @@ mod tests {
             total_backing_bytes < n * avg_len,
             "backing bytes {total_backing_bytes} reached row-by-row materialisation bound"
         );
+    }
+
+    /// Σ.E5.1 follow-up: parallel per-column decode must produce
+    /// identical output to its own previous run (no race in the
+    /// scoped-thread implementation) and identical output across
+    /// batch-size variants.
+    ///
+    /// Fixture mixes every supported `DecodedColumn` variant —
+    /// Int32, Int64, Float64, Utf8View, Dictionary(UInt32, Utf8) —
+    /// so each decode path runs concurrently with the others.
+    #[test]
+    fn parallel_decode_equivalence() {
+        let path = tmp_parquet("parallel_eq");
+        let n = 12_000usize;
+        let c_i32: Vec<i32> = (0..n as i32).collect();
+        let c_i64: Vec<i64> = (0..n as i64).map(|x| x * 11).collect();
+        let c_f64: Vec<f64> = (0..n).map(|x| x as f64 * 0.25).collect();
+        let s_pool = [
+            b"alpha_long_string".as_slice(),
+            b"beta_long_string".as_slice(),
+            b"gamma_long_string".as_slice(),
+            b"delta_long_string".as_slice(),
+        ];
+        let s_view: Vec<&[u8]> = (0..n).map(|i| s_pool[i % s_pool.len()]).collect();
+        let d_pool = [b"R".as_slice(), b"A".as_slice(), b"N".as_slice()];
+        let s_dict: Vec<&[u8]> = (0..n).map(|i| d_pool[i % d_pool.len()]).collect();
+
+        write_table_with_dict_to_path(
+            &path,
+            &[
+                ("c_i32", ColumnData::I32(&c_i32)),
+                ("c_i64", ColumnData::I64(&c_i64)),
+                ("c_f64", ColumnData::F64(&c_f64)),
+                ("s_view", ColumnData::ByteArray(&s_view)),
+                ("s_dict", ColumnData::ByteArray(&s_dict)),
+            ],
+            CompressionCodec::Uncompressed,
+            usize::MAX,
+            // Force dict encoding on both byte_array columns so the
+            // DictUtf8 + StringView decode paths both run.
+            &[false, false, false, true, true],
+        )
+        .unwrap();
+
+        let dict_ty = DataType::Dictionary(Box::new(DataType::UInt32), Box::new(DataType::Utf8));
+        let schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("c_i32", DataType::Int32, false),
+            Field::new("c_i64", DataType::Int64, false),
+            Field::new("c_f64", DataType::Float64, false),
+            Field::new("s_view", DataType::Utf8View, false),
+            Field::new("s_dict", dict_ty, false),
+        ]));
+
+        // Snapshot the rows of every column into plain Vecs for a
+        // batch-size-independent equality check.
+        type Snapshot = (Vec<i32>, Vec<i64>, Vec<f64>, Vec<String>, Vec<String>);
+        fn collect_rows(batches: &[RecordBatch]) -> Snapshot {
+            let mut a = Vec::new();
+            let mut b = Vec::new();
+            let mut c = Vec::new();
+            let mut d = Vec::new();
+            let mut e = Vec::new();
+            for rb in batches {
+                let i32_arr = rb.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+                let i64_arr = rb.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+                let f64_arr = rb
+                    .column(2)
+                    .as_any()
+                    .downcast_ref::<Float64Array>()
+                    .unwrap();
+                let sv = rb
+                    .column(3)
+                    .as_any()
+                    .downcast_ref::<StringViewArray>()
+                    .unwrap();
+                let dict = rb
+                    .column(4)
+                    .as_any()
+                    .downcast_ref::<DictionaryArray<UInt32Type>>()
+                    .unwrap();
+                let dict_vals = dict.values().as_string::<i32>();
+                let keys = dict.keys();
+                for i in 0..rb.num_rows() {
+                    a.push(i32_arr.value(i));
+                    b.push(i64_arr.value(i));
+                    c.push(f64_arr.value(i));
+                    d.push(sv.value(i).to_string());
+                    e.push(dict_vals.value(keys.value(i) as usize).to_string());
+                }
+            }
+            (a, b, c, d, e)
+        }
+
+        fn read_with_batch_size(
+            path: &std::path::Path,
+            schema: SchemaRef,
+            batch_size: usize,
+        ) -> Vec<RecordBatch> {
+            let file = ParquetFile::open(path).unwrap();
+            let reader = EmatArrowBatchReaderBuilder::new(file, schema)
+                .with_batch_size(batch_size)
+                .build()
+                .unwrap();
+            reader.map(|b| b.unwrap()).collect()
+        }
+
+        // Read twice with the default 65_536 batch size to catch any
+        // race in the scoped-thread path.
+        let r1 = read_with_batch_size(&path, schema.clone(), DEFAULT_BATCH_SIZE);
+        let r2 = read_with_batch_size(&path, schema.clone(), DEFAULT_BATCH_SIZE);
+        assert_eq!(collect_rows(&r1), collect_rows(&r2));
+
+        // And cross-batch-size: the row sequence must be identical
+        // regardless of slicing.
+        let r_small = read_with_batch_size(&path, schema.clone(), 1024);
+        let r_large = read_with_batch_size(&path, schema.clone(), 65_536);
+        let g = collect_rows(&r1);
+        assert_eq!(g, collect_rows(&r_small));
+        assert_eq!(g, collect_rows(&r_large));
+
+        // Spot-check the actual values too — guards against a subtler
+        // bug where every read produces the same wrong answer.
+        assert_eq!(g.0.len(), n);
+        assert_eq!(g.0[0], 0);
+        assert_eq!(g.0[n - 1], (n - 1) as i32);
+        assert_eq!(g.1[7], 7 * 11);
+        assert_eq!(g.2[4], 1.0);
+        assert_eq!(g.3[0].as_bytes(), s_pool[0]);
+        assert_eq!(g.3[5].as_bytes(), s_pool[5 % s_pool.len()]);
+        assert_eq!(g.4[0].as_bytes(), d_pool[0]);
+        assert_eq!(g.4[8].as_bytes(), d_pool[8 % d_pool.len()]);
     }
 }
