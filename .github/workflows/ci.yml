@@ -9,6 +9,14 @@ on:
   push:
     branches: [main, master]
   pull_request:
+  # `merge_group` fires on the synthetic `gh-readonly-queue/<base>/<sha>`
+  # refs the GitHub merge queue creates when a PR is added. Required so
+  # the queue's pre-merge CI run actually exercises the workflows;
+  # without this trigger the required-status-check set comes back empty
+  # and queued PRs sit forever. The PR-time `pull_request` trigger
+  # continues to gate the PR itself — `merge_group` is the *additional*
+  # post-queue gate.
+  merge_group:
 
 concurrency:
   group: ci-${{ github.ref }}

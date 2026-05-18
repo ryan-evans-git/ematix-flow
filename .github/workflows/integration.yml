@@ -94,6 +94,25 @@ on:
       - "examples/**/README*"
       - ".gitignore"
       - ".gitattributes"
+  # `merge_group` fires on the synthetic `gh-readonly-queue/<base>/<sha>`
+  # refs the GitHub merge queue creates when a PR is added. The
+  # integration suite is a required check, so the queue's pre-merge
+  # CI run needs this trigger — otherwise queued PRs never satisfy
+  # the required-status-check set. Same `paths-ignore` filter as
+  # `push` / `pull_request` so a docs-only queue entry doesn't spend
+  # 30 min on testcontainers.
+  merge_group:
+    paths-ignore:
+      - "**/*.md"
+      - "LICENSE*"
+      - "COPYING*"
+      - "NOTICE*"
+      - "AUTHORS*"
+      - "CONTRIBUTORS*"
+      - "docs/**"
+      - "examples/**/README*"
+      - ".gitignore"
+      - ".gitattributes"
   schedule:
     - cron: "0 6 * * *"
   workflow_dispatch:
