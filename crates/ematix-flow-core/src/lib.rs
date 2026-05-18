@@ -107,6 +107,11 @@ pub mod meta;
 pub mod mysql_backend;
 pub mod objectstore_backend;
 pub mod pg;
+// Task #481: one-call setup helpers (`with_optimizer_rules` +
+// `register_dict_aware_parquet`) that activate the dict-aware fast
+// path without callers having to memorise the rule chain + the
+// `with_dict_preservation(true)` opt-in.
+pub mod preset;
 pub mod pubsub_backend;
 pub mod rabbitmq_backend;
 pub mod session_blob;
