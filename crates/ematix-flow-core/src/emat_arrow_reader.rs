@@ -278,13 +278,21 @@ enum DecodedColumn {
     Int64 { data: Buffer, n_rows: usize },
     /// 8-byte primitives (f64). `data.len() == n_rows * 8`.
     Float64 { data: Buffer, n_rows: usize },
-    /// (views as `Buffer` of `u128`, backing data block). The views
+    /// (views as `Buffer` of `u128`, backing data blocks). The views
     /// buffer is sliced zero-copy per batch (Σ.E5.1.c); the backing
-    /// data buffer is shared across every batch in the RG via Arc.
+    /// data buffers are shared across every batch in the RG via Arc.
+    ///
+    /// Σ.E5 (2026-05-18): widened from a single `data: Buffer` to
+    /// `data_buffers: Vec<Buffer>` — one buffer per decompressed
+    /// page, so we can take ownership of each page's decompressed
+    /// scratch directly instead of memcpy-per-row from scratch into
+    /// a single accumulator. Skips ~45 MB of memory traffic per RG
+    /// on the Q13-shape PLAIN byte_array decode. Views encode the
+    /// `block_id` (= index into `data_buffers`) of their source page.
     StringView {
         views: Buffer,
         n_rows: usize,
-        data: Buffer,
+        data_buffers: Vec<Buffer>,
     },
     /// Dict-preserved BYTE_ARRAY → DictionaryArray<UInt32, Utf8>
     /// values + indices. Indices are RG-local — never spans RGs.
@@ -696,10 +704,49 @@ pub fn decode_byte_array_to_string_view_for_bench(
 ) -> DfResult<(usize, usize)> {
     let dc = decode_byte_array_to_string_view(file, rg, col)?;
     let rows = dc.len();
-    // Total decoded byte size = views buffer (16 bytes/row) + data buffer.
+    // Total decoded byte size = views buffer (16 bytes/row) + sum of
+    // backing data buffers (one per page in the page-streaming layout).
     let bytes = match &dc {
-        DecodedColumn::StringView { views, data, .. } => views.len() + data.len(),
+        DecodedColumn::StringView {
+            views,
+            data_buffers,
+            ..
+        } => views.len() + data_buffers.iter().map(|b| b.len()).sum::<usize>(),
         _ => 0,
+    };
+    Ok((rows, bytes))
+}
+
+/// Σ.E5 (2026-05-18) bench-only entry point: decode an arbitrary
+/// column (numeric or string) for one RG, return `(rows, bytes)`. Used
+/// by `sigma_e5_column_decode_diff` to time decode by Arrow type
+/// without going through DataFusion / mpsc orchestration.
+///
+/// `target` must be one of the Arrow types `decode_one_column`
+/// recognises (Int32/Date32, Int64, Float64, Utf8View, Dictionary,
+/// Utf8). Bench callers pick the type by inspecting parquet-rs's
+/// promoted Arrow schema.
+pub fn decode_one_column_for_bench(
+    file: &ParquetFile,
+    rg: usize,
+    leaf: usize,
+    target: &DataType,
+) -> DfResult<(usize, usize)> {
+    let dc = decode_one_column(file, rg, leaf, target)?;
+    let rows = dc.len();
+    let bytes = match &dc {
+        DecodedColumn::Int32 { data, .. } => data.len(),
+        DecodedColumn::Int64 { data, .. } => data.len(),
+        DecodedColumn::Float64 { data, .. } => data.len(),
+        DecodedColumn::StringView {
+            views,
+            data_buffers,
+            ..
+        } => views.len() + data_buffers.iter().map(|b| b.len()).sum::<usize>(),
+        DecodedColumn::DictUtf8 {
+            values, indices, ..
+        } => indices.len() + values.get_array_memory_size(),
+        DecodedColumn::Utf8(a) => a.get_array_memory_size(),
     };
     Ok((rows, bytes))
 }
@@ -763,10 +810,12 @@ fn build_string_view_from_dict_preserved(
 
     // (3) `dict_bytes` is exactly the backing block our views point
     // at (for >12B strings; ≤12B strings are inlined in the view).
+    // Dict-preserved path: single backing buffer (block_id=0) since
+    // all values come from the one DictionaryPage.
     DecodedColumn::StringView {
         views: Buffer::from_vec(views),
         n_rows,
-        data: Buffer::from_vec(raw.dict_bytes),
+        data_buffers: vec![Buffer::from_vec(raw.dict_bytes)],
     }
 }
 
@@ -795,16 +844,21 @@ fn decode_byte_array_to_string_view_slow(
         .map_err(|e| ext(format!("read_range: {e}")))?;
 
     let mut walker = PageWalker::new(&chunk);
-    let mut scratch: Vec<u8> = Vec::with_capacity(128 * 1024);
-
-    // Backing data buffer. Pre-reserve to the chunk's uncompressed
-    // size (slight over-allocation for dict columns since the bytes
-    // are written once, indexed many times, but for PLAIN-only the
-    // estimate is right).
-    let mut data: Vec<u8> = Vec::with_capacity(cm.total_uncompressed_size as usize);
     let mut views: Vec<u128> = Vec::with_capacity(total);
 
-    // Dict offsets within `data` for the column's dictionary, if any.
+    // Σ.E5 (2026-05-18): page-streaming layout. Each data page's
+    // decompressed bytes become an owned `Vec<u8>` that we hand off
+    // as a distinct `Buffer` (`data_buffers[block_id]`). Views into
+    // that page use `block_id = data_buffers.len() - 1` so no per-row
+    // memcpy into a coalesced backing buffer is needed.
+    //
+    // The dictionary page (if any) is `data_buffers[0]`; dict-encoded
+    // data pages emit views referencing block 0. PLAIN data pages emit
+    // views referencing their own (newly-pushed) block.
+    let mut data_buffers: Vec<Buffer> = Vec::new();
+
+    // Dict offsets/lengths within `data_buffers[0]`, if a dict page is
+    // present.
     let mut dict_offsets: Vec<u32> = Vec::new();
     let mut dict_lengths: Vec<u32> = Vec::new();
 
@@ -812,19 +866,25 @@ fn decode_byte_array_to_string_view_slow(
         .next_page()
         .map_err(|e| ext(format!("next_page (first): {e}")))?
         .ok_or_else(|| ext("empty chunk"))?;
-    decompress_into(codec, first_body, &mut scratch)?;
 
     if first_hdr.dictionary_page_header.is_some() {
-        // Decode dict; append every entry to `data` and remember its
-        // (offset, length).
-        let entries = decode_plain_byte_array(&scratch)
+        // Decompress the dict page into a fresh owned buffer and
+        // record per-entry (offset, length) within it. The decoded
+        // bytes are *exactly* what we want as the backing block.
+        let mut dict_scratch: Vec<u8> = Vec::with_capacity(first_body.len() * 2);
+        decompress_into(codec, first_body, &mut dict_scratch)?;
+        let entries = decode_plain_byte_array(&dict_scratch)
             .map_err(|e| ext(format!("plain byte_array dict: {e}")))?;
+        // Compute offsets directly into `dict_scratch` by pointer math:
+        // every slice from `decode_plain_byte_array` is a view into
+        // `dict_scratch`, so its offset = ptr - dict_scratch.as_ptr().
+        let base = dict_scratch.as_ptr() as usize;
         for s in &entries {
-            let off = data.len() as u32;
-            data.extend_from_slice(s);
+            let off = (s.as_ptr() as usize - base) as u32;
             dict_offsets.push(off);
             dict_lengths.push(s.len() as u32);
         }
+        data_buffers.push(Buffer::from_vec(dict_scratch));
     } else {
         // First page IS a data page; handle it inline (PLAIN-only column).
         let dph = first_hdr
@@ -838,10 +898,11 @@ fn decode_byte_array_to_string_view_slow(
             )));
         }
         let n = dph.num_values as usize;
-        // Σ.E5 (2026-05-18): inline parse — skip the
-        // Vec<&[u8]> intermediate that `decode_plain_byte_array`
-        // would allocate. See `plain_byte_array_to_views`.
-        plain_byte_array_to_views(&scratch, &mut data, &mut views, n)?;
+        let mut page_buf: Vec<u8> = Vec::with_capacity(first_body.len() * 2);
+        decompress_into(codec, first_body, &mut page_buf)?;
+        let block_id = data_buffers.len() as u32;
+        plain_byte_array_to_views_in_place(&page_buf, &mut views, n, block_id)?;
+        data_buffers.push(Buffer::from_vec(page_buf));
     }
 
     while views.len() < total {
@@ -854,12 +915,22 @@ fn decode_byte_array_to_string_view_slow(
             .as_ref()
             .ok_or_else(|| ext("v2 pages not yet supported"))?;
         let n = dph.num_values as usize;
-        decompress_into(codec, body, &mut scratch)?;
         match dph.encoding {
             Encoding::RleDictionary | Encoding::PlainDictionary => {
-                let idxs = ematix_parquet_codec::dict::decode_rle_dictionary_indices(&scratch, n)
-                    .map_err(|e| ext(format!("rle_dict_indices byte_array: {e}")))?;
+                let mut idx_scratch: Vec<u8> = Vec::with_capacity(body.len() * 2);
+                decompress_into(codec, body, &mut idx_scratch)?;
+                let idxs = ematix_parquet_codec::dict::decode_rle_dictionary_indices(
+                    &idx_scratch,
+                    n,
+                )
+                .map_err(|e| ext(format!("rle_dict_indices byte_array: {e}")))?;
                 let dict_len = dict_offsets.len();
+                // Dict pages always reside in `data_buffers[0]`.
+                let dict_block = 0u32;
+                // SAFETY: data_buffers[0] is the dict page; established
+                // above. Slicing is sound since dict_offsets/lengths
+                // were computed against its full contents.
+                let dict_bytes: &[u8] = data_buffers[0].as_slice();
                 for &i in &idxs {
                     let i = i as usize;
                     if i >= dict_len {
@@ -867,14 +938,16 @@ fn decode_byte_array_to_string_view_slow(
                     }
                     let off = dict_offsets[i];
                     let len = dict_lengths[i];
-                    let bytes = &data[off as usize..(off + len) as usize];
-                    views.push(make_view(bytes, 0, off));
+                    let bytes = &dict_bytes[off as usize..(off + len) as usize];
+                    views.push(make_view(bytes, dict_block, off));
                 }
             }
             Encoding::Plain => {
-                // Σ.E5 (2026-05-18): inline parse to skip the
-                // Vec<&[u8]> intermediate.
-                plain_byte_array_to_views(&scratch, &mut data, &mut views, n)?;
+                let mut page_buf: Vec<u8> = Vec::with_capacity(body.len() * 2);
+                decompress_into(codec, body, &mut page_buf)?;
+                let block_id = data_buffers.len() as u32;
+                plain_byte_array_to_views_in_place(&page_buf, &mut views, n, block_id)?;
+                data_buffers.push(Buffer::from_vec(page_buf));
             }
             other => {
                 return Err(ext(format!(
@@ -886,68 +959,58 @@ fn decode_byte_array_to_string_view_slow(
 
     debug_assert_eq!(views.len(), total);
 
-    // For string > 12 bytes the view encodes `block_id = 0` (we push
-    // the whole data block as buffer 0). For string ≤ 12 bytes the
-    // view is fully inline and the data buffer entry is unused; this
-    // is fine — the data block still exists.
-    let data_buffer = Buffer::from_vec(data);
     let n_rows = views.len();
     let views_buffer = Buffer::from_vec(views);
     Ok(DecodedColumn::StringView {
         views: views_buffer,
         n_rows,
-        data: data_buffer,
+        data_buffers,
     })
 }
 
 /// Σ.E5 (2026-05-18): PLAIN-encoded BYTE_ARRAY → views buffer in a
-/// single pass.
+/// single pass, pointing views at the decompressed page bytes
+/// directly. No coalescing copy.
 ///
-/// The old path called
-/// `ematix_parquet_codec::plain::decode_plain_byte_array(scratch)`
-/// which returns `Vec<&[u8]>`, then a `for s in slices.take(n)` loop
-/// that called the (now-removed) `push_plain_view` per row. On a
-/// 1.5M-row column like
-/// `o_comment` the intermediate Vec costs ~12 MB of allocation and a
-/// second pass over the data. Q13's scan time was 80 ms on Emat vs
-/// 50 ms on parquet-rs largely for this reason.
+/// `page_buf` is the decompressed page (which the caller will hand
+/// off as `data_buffers[block_id]`). Each emitted view encodes
+/// `(block_id, offset_in_page)` — Arrow's StringViewArray dereferences
+/// it against `data_buffers[block_id]` at access time.
 ///
-/// This inline parse walks `scratch` once: 4-byte LE length →
-/// extend data + push view. No intermediate Vec.
+/// On Q13's `o_comment` (1.5M rows × ~30 B/value PLAIN) this
+/// eliminates ~45 MB of `extend_from_slice` memcpy that the old
+/// coalescing path did.
 ///
-/// Format reference: parquet spec, BYTE_ARRAY PLAIN encoding is
-/// `[u32 len][bytes]` repeated `num_values` times.
+/// Format: parquet BYTE_ARRAY PLAIN is `[u32 len][bytes]` repeated.
 #[inline]
-fn plain_byte_array_to_views(
-    scratch: &[u8],
-    data: &mut Vec<u8>,
+fn plain_byte_array_to_views_in_place(
+    page_buf: &[u8],
     views: &mut Vec<u128>,
     n: usize,
+    block_id: u32,
 ) -> DfResult<()> {
     let mut off = 0usize;
-    let scratch_len = scratch.len();
+    let page_len = page_buf.len();
     for i in 0..n {
-        if off + 4 > scratch_len {
+        if off + 4 > page_len {
             return Err(ext(format!(
-                "plain byte_array: truncated length prefix at value {i}/{n}, offset {off}/{scratch_len}"
+                "plain byte_array: truncated length prefix at value {i}/{n}, offset {off}/{page_len}"
             )));
         }
         let len = u32::from_le_bytes([
-            scratch[off],
-            scratch[off + 1],
-            scratch[off + 2],
-            scratch[off + 3],
+            page_buf[off],
+            page_buf[off + 1],
+            page_buf[off + 2],
+            page_buf[off + 3],
         ]) as usize;
         off += 4;
-        if off + len > scratch_len {
+        if off + len > page_len {
             return Err(ext(format!(
-                "plain byte_array: value {i}/{n} length {len} overruns scratch at offset {off}"
+                "plain byte_array: value {i}/{n} length {len} overruns page at offset {off}"
             )));
         }
-        let bytes = &scratch[off..off + len];
-        let dst_off = data.len() as u32;
-        data.extend_from_slice(bytes);
-        views.push(make_view(bytes, 0, dst_off));
+        let bytes = &page_buf[off..off + len];
+        views.push(make_view(bytes, block_id, off as u32));
         off += len;
     }
     Ok(())
@@ -1115,22 +1178,23 @@ fn slice_decoded(c: &DecodedColumn, start: usize, n: usize, target: &DataType) -
             let scalar = ScalarBuffer::<f64>::new(sliced, 0, n);
             Arc::new(Float64Array::new(scalar, None))
         }
-        DecodedColumn::StringView { views, data, .. } => {
+        DecodedColumn::StringView {
+            views,
+            data_buffers,
+            ..
+        } => {
             // Σ.E5.1.c: zero-copy slice for the views buffer too. Each
             // view is 16 bytes — at 65K rows × ~20 batches × 2 string
             // cols on Q1 that's ~40 MB of u128 copying eliminated.
-            // Backing data buffer is shared via Arc bump.
+            // Backing data buffers are shared via Arc bump (one clone
+            // per page; cheap — typically 1–6 pages per RG).
             let sliced_views = views.slice_with_length(start * 16, n * 16);
             let views_buf = ScalarBuffer::<u128>::new(sliced_views, 0, n);
             // SAFETY: we built every view ourselves with `make_view`
-            // against `data` so the offsets are valid and the bytes
-            // are valid UTF-8 (decode_plain_byte_array round-trips
-            // the parquet bytes which are UTF-8 by Utf8 logical type).
-            //
-            // We use the safe `try_new` since the upfront cost of
-            // validating views is negligible relative to decode time
-            // and gives us a defensive check.
-            let arr = StringViewArray::try_new(views_buf, vec![data.clone()], None::<NullBuffer>)
+            // against the corresponding `data_buffers[block_id]` so
+            // the (block_id, offset) coordinates are valid and the
+            // bytes are valid UTF-8 (parquet Utf8 logical type).
+            let arr = StringViewArray::try_new(views_buf, data_buffers.clone(), None::<NullBuffer>)
                 .expect("StringViewArray::try_new on internally-built views");
             Arc::new(arr)
         }

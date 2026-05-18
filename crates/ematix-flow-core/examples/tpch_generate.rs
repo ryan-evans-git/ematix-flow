@@ -29,9 +29,9 @@ use std::sync::Arc;
 use arrow_array::RecordBatch;
 use arrow_csv::ReaderBuilder;
 use arrow_schema::{DataType, Field, Schema};
-use parquet::arrow::ArrowWriter;
-use parquet::basic::Compression;
-use parquet::file::properties::WriterProperties;
+use datafusion::parquet::arrow::ArrowWriter;
+use datafusion::parquet::basic::Compression;
+use datafusion::parquet::file::properties::WriterProperties;
 use tpchgen::csv::{
     CustomerCsv, LineItemCsv, NationCsv, OrderCsv, PartCsv, PartSuppCsv, RegionCsv, SupplierCsv,
 };

@@ -33,13 +33,13 @@ use datafusion::prelude::{SessionConfig, SessionContext};
 use ematix_flow_core::ematix_fast_parquet::EmatixFastParquetTableProvider;
 use ematix_flow_core::fast_parquet::FastParquetTableProvider;
 
-use parquet::basic::{Compression, ConvertedType, Repetition, Type as PhysicalType};
-use parquet::column::reader::ColumnReader;
-use parquet::column::writer::ColumnWriter;
-use parquet::file::properties::WriterProperties;
-use parquet::file::reader::{FileReader, SerializedFileReader};
-use parquet::file::writer::SerializedFileWriter;
-use parquet::schema::types::Type as PType;
+use datafusion::parquet::basic::{Compression, ConvertedType, Repetition, Type as PhysicalType};
+use datafusion::parquet::column::reader::ColumnReader;
+use datafusion::parquet::column::writer::ColumnWriter;
+use datafusion::parquet::file::properties::WriterProperties;
+use datafusion::parquet::file::reader::{FileReader, SerializedFileReader};
+use datafusion::parquet::file::writer::SerializedFileWriter;
+use datafusion::parquet::schema::types::Type as PType;
 
 const WARMUPS: usize = 3;
 const ITERS: usize = 15;

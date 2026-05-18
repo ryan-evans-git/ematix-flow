@@ -683,6 +683,17 @@ impl ExecutionPlan for EmatixFastParquetExec {
             // scheduler oversubscription that inflated streaming-mode
             // variance (σ 5–7 ms vs bridge σ 2–3 ms) in #112's bench.
             //
+            // Σ.E5 (2026-05-18) diagnostic: tried `(2×cores) /
+            // outer_partitions` to help Q19 (6 RGs × 6 partitions on
+            // 14 cores, budget=2 leaves half the box idle). Q19 wall
+            // dropped from 30.6 → 28.0 ms in isolation, BUT the
+            // steady-state 22-query bench regressed geomean from
+            // 0.9306 → 0.9692 — Q01 went from -19% → +1.3%, several
+            // others regressed. The 1× divisor is the right floor for
+            // the dominant workload pattern; Q19's gap lives elsewhere
+            // (numeric decode or RG-load coordination, not thread
+            // count).
+            //
             // Env override `EMAT_READER_PARALLELISM_BUDGET=N` forces
             // the per-partition budget to N (used by the confirmation
             // experiment; `N=1` = sequential per-RG column decode).

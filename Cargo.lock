@@ -3762,7 +3762,6 @@ dependencies = [
  "mysql_async",
  "object_store 0.13.2",
  "orc-rust",
- "parquet",
  "polars",
  "postcard",
  "prometheus",

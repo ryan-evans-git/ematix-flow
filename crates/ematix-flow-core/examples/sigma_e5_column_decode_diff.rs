@@ -2,18 +2,19 @@
 //!
 //! Strips away DataFusion entirely. For a given parquet file +
 //! column, times:
-//!   1. Our flow-side `decode_byte_array_to_string_view` (which calls
-//!      into ematix-parquet under the hood)
-//!   2. parquet-rs's native byte_array → StringViewArray decode
+//!   1. Our flow-side `decode_one_column` (which calls into
+//!      ematix-parquet under the hood)
+//!   2. parquet-rs's native column decode via `ParquetRecordBatchReader`
 //!
-//! If timing 1 ≫ timing 2 on the same RG / column, the gap lives in
-//! the ematix-parquet stack (Snappy decompression, PageWalker, or
-//! the flow-side view construction). If timings are close, the gap
-//! in the 22-query bench is downstream of the scan.
+//! Dispatches by Arrow type — works for byte_array → StringView, plus
+//! Int32 / Int64 / Float64 / Decimal numerics. Use this to localise
+//! where a per-query gap lives (specific column? specific Arrow type?).
 //!
 //! Run:
 //!   COLUMN=o_comment FILE=orders.parquet \
 //!     cargo run --release -p ematix-flow-core --example sigma_e5_column_decode_diff
+//!
+//!   COLUMN=l_partkey FILE=lineitem.parquet ...
 //!
 //! Defaults to o_comment on orders.parquet (the Q13 hot column —
 //! 1.5M unique values, PLAIN-encoded, biggest known regression).
@@ -21,6 +22,7 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
+use datafusion::arrow::datatypes::DataType;
 use datafusion::parquet::arrow::ProjectionMask;
 use datafusion::parquet::arrow::arrow_reader::{
     ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder,
@@ -56,8 +58,23 @@ fn leaf_idx_by_name(file: &ParquetFile, name: &str) -> Option<usize> {
         .position(|f| f.name.as_ref() == name.as_bytes())
 }
 
-fn bench_emat(file_path: &PathBuf, col_idx: usize, trials: usize) -> (f64, usize) {
-    use ematix_flow_core::emat_arrow_reader::decode_byte_array_to_string_view_for_bench;
+/// Promote `Utf8` → `Utf8View` to match the EmatArrowBatchReader
+/// pipeline's behaviour (the provider always promotes byte_array
+/// outputs to view types — that's the Σ.E5.1.d hot path).
+fn promote_target(dt: &DataType) -> DataType {
+    match dt {
+        DataType::Utf8 | DataType::LargeUtf8 => DataType::Utf8View,
+        other => other.clone(),
+    }
+}
+
+fn bench_emat(
+    file_path: &PathBuf,
+    col_idx: usize,
+    target: &DataType,
+    trials: usize,
+) -> (f64, usize) {
+    use ematix_flow_core::emat_arrow_reader::decode_one_column_for_bench;
     let file = ParquetFile::open(file_path).expect("emat open");
     let md = file.metadata().expect("emat metadata");
     let num_rgs = md.row_groups.len();
@@ -67,8 +84,8 @@ fn bench_emat(file_path: &PathBuf, col_idx: usize, trials: usize) -> (f64, usize
         let t0 = Instant::now();
         let mut total_rows = 0usize;
         for rg in 0..num_rgs {
-            let (rows, _bytes) = decode_byte_array_to_string_view_for_bench(&file, rg, col_idx)
-                .expect("emat decode");
+            let (rows, _bytes) =
+                decode_one_column_for_bench(&file, rg, col_idx, target).expect("emat decode");
             total_rows += rows;
         }
         let ms = t0.elapsed().as_secs_f64() * 1000.0;
@@ -121,6 +138,22 @@ fn bench_parquet_rs(file_path: &PathBuf, col_name: &str, trials: usize) -> (f64,
     (best, rows_decoded)
 }
 
+/// Look up the column's Arrow data type via parquet-rs (single source
+/// of truth — what callers downstream would see).
+fn col_arrow_type(file_path: &PathBuf, col_name: &str) -> DataType {
+    use std::fs::File;
+    let file = File::open(file_path).unwrap();
+    let opts = ArrowReaderOptions::new();
+    let arrow_md = ArrowReaderMetadata::load(&file, opts).unwrap();
+    let schema = arrow_md.schema();
+    let field = schema
+        .fields()
+        .iter()
+        .find(|f| f.name() == col_name)
+        .unwrap_or_else(|| panic!("col {col_name} not in schema"));
+    field.data_type().clone()
+}
+
 fn main() {
     let dir = data_dir();
     let file_name = std::env::var("FILE").unwrap_or_else(|_| "orders.parquet".into());
@@ -132,9 +165,14 @@ fn main() {
 
     let file_path = PathBuf::from(format!("{dir}/{file_name}"));
 
+    let raw_type = col_arrow_type(&file_path, &col_name);
+    let target = promote_target(&raw_type);
+
     println!("--- column-decode micro-bench ---");
     println!("file: {}", file_path.display());
     println!("column: {col_name}");
+    println!("type (parquet-rs schema): {raw_type:?}");
+    println!("type (emat target):       {target:?}");
     println!("trials: {trials} (min)");
     println!();
 
@@ -144,12 +182,12 @@ fn main() {
         .expect("column not found in ematix-parquet schema leaves");
     drop(emat_file);
 
-    let (emat_ms, emat_rows) = bench_emat(&file_path, leaf_idx, trials);
+    let (emat_ms, emat_rows) = bench_emat(&file_path, leaf_idx, &target, trials);
     let (pq_ms, pq_rows) = bench_parquet_rs(&file_path, &col_name, trials);
 
-    println!("emat decode_byte_array_to_string_view:");
+    println!("emat decode_one_column ({target:?}):");
     println!("  min: {:>7.2} ms  ({rows} rows)", emat_ms, rows = emat_rows);
-    println!("parquet-rs ParquetRecordBatchReader (StringView output):");
+    println!("parquet-rs ParquetRecordBatchReader:");
     println!("  min: {:>7.2} ms  ({rows} rows)", pq_ms, rows = pq_rows);
     println!();
     let delta = (emat_ms - pq_ms) / pq_ms * 100.0;
@@ -159,8 +197,3 @@ fn main() {
         emat_ms / pq_ms
     );
 }
-
-// Wrapper required to expose decode_byte_array_to_string_view publicly
-// for this bench without permanently widening its visibility. Trick:
-// the function is `pub(crate)` plus a re-export under a `_for_bench`
-// alias in the public surface.
