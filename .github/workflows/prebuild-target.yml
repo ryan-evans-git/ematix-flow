@@ -1,0 +1,188 @@
+name: prebuild-target
+
+# Prebuilds the cargo `target/` directory for both ematix-flow and the
+# ematix-parquet sibling crate, then uploads a tarball to S3 so the
+# AWS test-validation campaign EC2 box can skip the ~10 min build step
+# at boot. See infra/prebuilt-target/README.md for the bootstrap setup.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      # Don't rebuild on doc-only pushes — the artifacts wouldn't
+      # change. Adding paths-ignore would be cleaner but `paths` is
+      # already used elsewhere in the workflow set so we stay consistent.
+      - 'crates/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain*'
+      - '.github/workflows/prebuild-target.yml'
+  # Manual fallback for when the auto-trigger missed something or the
+  # last upload bit-rotted (rare; mostly defensive).
+  workflow_dispatch:
+
+concurrency:
+  # Cancel in-flight builds when a newer commit lands. The cached
+  # tarball is keyed by SHA so only the most recent main commit's
+  # artifact actually matters.
+  group: prebuild-target-${{ github.ref }}
+  cancel-in-progress: true
+
+# Least-privilege GITHUB_TOKEN: only contents:read is needed for the
+# checkout actions. AWS auth uses long-lived access keys passed as
+# secrets, not the GITHUB_TOKEN — so no `id-token: write` here.
+# Adding this block also satisfies CodeQL's
+# `actions/missing-workflow-permissions` lint.
+permissions:
+  contents: read
+
+# Bucket name lives in a repo *variable* (vars.*), not a secret —
+# bucket names aren't credentials and surfacing the value in logs is
+# fine. The actual credentials (AWS keys) come from secrets.
+env:
+  BUCKET: ${{ vars.EMATIX_PREBUILD_BUCKET }}
+  AWS_REGION: us-east-2
+
+jobs:
+  prebuild:
+    name: build + upload target tarball
+    runs-on: ubuntu-latest
+
+    # If the repo hasn't been configured with the upload bucket yet
+    # the workflow no-ops cleanly instead of failing loudly on every
+    # push. See infra/prebuilt-target/README.md for setup.
+    if: ${{ vars.EMATIX_PREBUILD_BUCKET != '' }}
+
+    steps:
+      - name: Checkout ematix-flow
+        uses: actions/checkout@v4
+        with:
+          # Default checkout is a shallow clone of just this repo.
+          # Path keeps the directory structure matching what userdata.sh
+          # expects (/opt/ematix/ematix-flow) when later untarred.
+          path: ematix-flow
+
+      - name: Checkout ematix-parquet sibling
+        uses: actions/checkout@v4
+        with:
+          repository: ryan-evans-git/ematix-parquet
+          path: ematix-parquet
+
+      - name: Capture commit SHAs
+        id: shas
+        # Record both repos' HEAD shortnames into one tarball name so the
+        # campaign side can either ask for the exact pair it cloned or
+        # fall back to the `latest` pointer.
+        run: |
+          flow_sha=$(git -C ematix-flow rev-parse --short=12 HEAD)
+          parquet_sha=$(git -C ematix-parquet rev-parse --short=12 HEAD)
+          echo "flow_sha=$flow_sha" >> "$GITHUB_OUTPUT"
+          echo "parquet_sha=$parquet_sha" >> "$GITHUB_OUTPUT"
+          echo "tarball_key=target/flow-${flow_sha}-parquet-${parquet_sha}.tar.zst" >> "$GITHUB_OUTPUT"
+          echo "latest_key=target/latest.tar.zst" >> "$GITHUB_OUTPUT"
+          echo "manifest_key=target/latest.manifest" >> "$GITHUB_OUTPUT"
+
+      - uses: rui314/setup-mold@v1
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Two workspaces share dependency graphs (datafusion, arrow,
+          # tokio, …). Pin the cache key to *both* shas so we don't
+          # smear cache lines across unrelated commits.
+          shared-key: prebuild-${{ steps.shas.outputs.flow_sha }}-${{ steps.shas.outputs.parquet_sha }}
+          workspaces: |
+            ematix-flow
+            ematix-parquet
+
+      - name: Build ematix-parquet (release)
+        # The campaign benches both repos, so both target/ trees need
+        # to be cached. Build parquet first because flow depends on it
+        # via a path dependency; flow's build resolves the local sibling.
+        env:
+          # `target-cpu=x86-64-v4` is the closest portable spec to what
+          # the campaign EC2 (c7i = Sapphire Rapids) wants: AVX-512F +
+          # AVX-512BW/CD/DQ/VL + BMI2 + FMA. Using `sapphirerapids`
+          # would be tighter but pins us to that exact micro-arch — v4
+          # is the v3+AVX-512 baseline and matches every campaign box
+          # we'd reasonably launch (c7i, c7i.metal, m7i, r7i).
+          RUSTFLAGS: "-C target-cpu=x86-64-v4 -C link-arg=-fuse-ld=mold"
+          # Same as the campaign userdata — talk to the OS openssl
+          # instead of vendoring a fresh build.
+          OPENSSL_NO_VENDOR: '1'
+        working-directory: ematix-parquet
+        run: cargo build --release --workspace
+
+      - name: Build ematix-flow (release)
+        env:
+          RUSTFLAGS: "-C target-cpu=x86-64-v4 -C link-arg=-fuse-ld=mold"
+          OPENSSL_NO_VENDOR: '1'
+        working-directory: ematix-flow
+        run: cargo build --release --workspace
+
+      - name: Tar both target/ trees
+        # Both target/ dirs preserve their on-disk layout so the
+        # campaign can untar at /opt/ematix/ and have the structure
+        # the cargo invocations expect (relative to each repo root).
+        # zstd over gzip: ~3-4× faster compress, ~30% smaller, and
+        # the campaign side already has zstd available (used by
+        # cargo's own caching). Tarball is large (~3-5 GB
+        # uncompressed); zstd keeps the upload time bounded.
+        run: |
+          tar --use-compress-program='zstd -T0 -3' \
+            -cf target.tar.zst \
+            ematix-flow/target/release \
+            ematix-parquet/target/release
+          ls -lh target.tar.zst
+
+      - name: Write manifest
+        # Plain-text manifest that the campaign reads first to learn
+        # which SHA the cached tarball was built from. If the manifest
+        # SHA matches the SHA the campaign just cloned, the tarball is
+        # safe to use; otherwise fall back to cargo build.
+        run: |
+          cat <<EOF > target.manifest
+          flow_sha=${{ steps.shas.outputs.flow_sha }}
+          parquet_sha=${{ steps.shas.outputs.parquet_sha }}
+          built_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          rustc=$(rustc --version)
+          target_cpu=x86-64-v4
+          EOF
+          cat target.manifest
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Upload tarball + manifest
+        # Three keys uploaded:
+        #   1. SHA-stamped tarball (immutable, kept ~30 days by lifecycle)
+        #   2. latest.tar.zst (mutable, the campaign's default fetch)
+        #   3. latest.manifest (mutable, identifies what (1)/(2) is)
+        # The campaign reads the manifest *first* — if its parsed
+        # flow_sha matches what `git rev-parse HEAD` on the EC2 box
+        # returns, the tarball is the matching artifact for that exact
+        # checkout. If mismatched, fall back to cargo build.
+        run: |
+          aws s3 cp target.tar.zst \
+            "s3://$BUCKET/${{ steps.shas.outputs.tarball_key }}" \
+            --no-progress
+          aws s3 cp target.tar.zst \
+            "s3://$BUCKET/${{ steps.shas.outputs.latest_key }}" \
+            --no-progress
+          aws s3 cp target.manifest \
+            "s3://$BUCKET/${{ steps.shas.outputs.manifest_key }}" \
+            --no-progress
+
+      - name: Summary
+        run: |
+          {
+            echo "## Prebuilt target uploaded"
+            echo
+            echo "- Bucket: \`$BUCKET\`"
+            echo "- Flow SHA: \`${{ steps.shas.outputs.flow_sha }}\`"
+            echo "- Parquet SHA: \`${{ steps.shas.outputs.parquet_sha }}\`"
+            echo "- Tarball size: \`$(du -h target.tar.zst | cut -f1)\`"
+          } >> "$GITHUB_STEP_SUMMARY"

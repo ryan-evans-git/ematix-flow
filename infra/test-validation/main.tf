@@ -128,6 +128,30 @@ resource "aws_iam_role_policy" "phase_a_s3" {
   })
 }
 
+# Phase A → prebuilt-target bucket: read-only. The bucket itself is
+# provisioned out-of-band by `infra/prebuilt-target/`; we just attach
+# a read policy when the operator passed -var prebuild_target_bucket=
+# at apply time. No-op when the variable is empty.
+resource "aws_iam_role_policy" "phase_a_prebuild_read" {
+  count = var.phase_a_enabled && var.prebuild_target_bucket != "" ? 1 : 0
+  name  = "prebuild-target-read"
+  role  = aws_iam_role.phase_a[0].id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect = "Allow"
+      Action = [
+        "s3:GetObject",
+        "s3:ListBucket",
+      ]
+      Resource = [
+        "arn:${local.partition}:s3:::${var.prebuild_target_bucket}",
+        "arn:${local.partition}:s3:::${var.prebuild_target_bucket}/*",
+      ]
+    }]
+  })
+}
+
 # Phase A → Phase C: invoke + update the Lambda function.
 resource "aws_iam_role_policy" "phase_a_lambda" {
   count = var.phase_a_enabled && var.phase_c_enabled ? 1 : 0
@@ -255,13 +279,14 @@ resource "aws_security_group" "phase_a" {
 # the local `make aws-up-phase-a` target before launch) and runs it.
 locals {
   phase_a_userdata = var.phase_a_enabled ? templatefile("${path.module}/userdata.sh", {
-    region               = var.aws_region
-    results_bucket       = var.phase_b_enabled ? aws_s3_bucket.results[0].bucket : ""
-    project_tag          = var.project_tag
-    max_runtime_hrs      = var.phase_a_max_runtime_hours
-    lambda_function_name = var.phase_c_enabled ? aws_lambda_function.phase_c[0].function_name : ""
-    eks_cluster_name     = var.phase_d_enabled ? aws_eks_cluster.phase_d[0].name : ""
-    ecr_repo_url         = var.phase_d_enabled ? aws_ecr_repository.phase_d_worker[0].repository_url : ""
+    region                 = var.aws_region
+    results_bucket         = var.phase_b_enabled ? aws_s3_bucket.results[0].bucket : ""
+    project_tag            = var.project_tag
+    max_runtime_hrs        = var.phase_a_max_runtime_hours
+    lambda_function_name   = var.phase_c_enabled ? aws_lambda_function.phase_c[0].function_name : ""
+    eks_cluster_name       = var.phase_d_enabled ? aws_eks_cluster.phase_d[0].name : ""
+    ecr_repo_url           = var.phase_d_enabled ? aws_ecr_repository.phase_d_worker[0].repository_url : ""
+    prebuild_target_bucket = var.prebuild_target_bucket
   }) : ""
 }
 

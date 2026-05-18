@@ -37,12 +37,17 @@ Together: Q1 SQL runs the template route whether strings arrive as `Dictionary` 
 
 ## What's still open (umbrella #480)
 
-### 1. AWS pre-built target follow-up
+### 1. AWS pre-built target follow-up — ✓ landed via PR for `infra/aws-prebuilt-target`
 
-**Memory ref:** `project_aws_prebuilt_target_follow_up.md`
-**Scope:** GitHub Actions builds `target.tar.gz` for the campaign-runner image, pushes to S3 on each main push. Campaign runs `aws s3 cp` + `tar xf` instead of `cargo build` (~10 min saved per run).
-**Why deferred:** Independent of Σ.G.2f's correctness; just an ops-time lever. Lifted out of the arc once .4 shipped so #480 isn't blocked on a CI change.
-**Estimated effort:** 1–2 hours (one `.github/workflows/prebuild-target.yml`, one S3 bucket policy, one section in `bench.sh` to consume it).
+**Scope:** GitHub Actions builds a `target.tar.zst` (zstd over gzip — ~3-4× faster, ~30% smaller) on every push to main, uploads to a persistent S3 bucket. Phase A userdata.sh tries `aws s3 cp` + `tar xf` first, falls back to `cargo build` on miss / SHA mismatch.
+
+**Components shipped:**
+- `infra/prebuilt-target/` — separate persistent terraform module (one-time apply). Bucket auto-expires objects at 30 days.
+- `.github/workflows/prebuild-target.yml` — push-to-main trigger; builds both `ematix-flow` and `ematix-parquet` workspaces with `-C target-cpu=x86-64-v4` (Sapphire Rapids AVX-512 baseline without micro-arch pinning).
+- `infra/test-validation/main.tf` — new `prebuild_target_bucket` variable + conditional IAM read-policy attachment on Phase A's EC2 role.
+- `infra/test-validation/userdata.sh` — manifest-first SHA-validated fast path with graceful fallback to `cargo build`.
+
+**One-time operator setup:** `cd infra/prebuilt-target && terraform apply`, then set GH repo variable `EMATIX_PREBUILD_BUCKET` + secrets `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`, then pass `-var prebuild_target_bucket=<bucket>` to subsequent campaign `terraform apply`s.
 
 ### 2. Σ.G.2f closure sign-off
 

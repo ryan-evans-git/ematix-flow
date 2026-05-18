@@ -27,6 +27,12 @@ variable "max_lifetime_hours" {
   default     = 24
 }
 
+variable "prebuild_target_bucket" {
+  description = "Name of the persistent S3 bucket holding cached cargo target tarballs (created out-of-band via `infra/prebuilt-target/`). When set, the Phase A userdata pulls `target/latest.tar.zst` instead of running `cargo build` and falls through to a full build only on miss. Empty string disables the fast path and the cache-read IAM grant."
+  type        = string
+  default     = ""
+}
+
 # ============================================================
 # Phase A — EC2 bench / integration box
 # ============================================================
