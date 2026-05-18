@@ -274,3 +274,14 @@ path = "examples/dict_group_count_bench.rs"
 [[example]]
 name = "probe_dict_arrival"
 path = "examples/probe_dict_arrival.rs"
+
+# Σ.E5.4.a parity bench: 22-query TPC-H comparison of
+# `FastParquetTableProvider` (parquet-rs) vs
+# `EmatixFastParquetTableProvider` (ematix-parquet streaming reader,
+# default since PR #115). Measures the per-query delta + geomean
+# against E5.4's "within ±5% per-query, geomean ≤ 2% loss" acceptance
+# criterion. Findings ship in
+# `docs/PHASE_SIGMA_E5_4_22_PARITY_FINDINGS.md`.
+[[example]]
+name = "sigma_e5_4a_22_parity_bench"
+path = "examples/sigma_e5_4a_22_parity_bench.rs"
