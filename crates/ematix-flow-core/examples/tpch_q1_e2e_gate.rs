@@ -65,11 +65,23 @@ enum Mode {
     /// Routes through `process_batch_generic` (the generic Utf8View
     /// hash-grouped template) at the spec level.
     MultiAggRuleUtf8View,
-    /// Emat dict-aware parquet (Dictionary columns),
+    /// Emat (bridge path, Dictionary columns),
     /// InjectFilterMultiAggRule attached. Routes through the
     /// PerfectHashAggregate template because the 3-distinct
     /// returnflag dict is well under the cardinality threshold.
     MultiAggRuleDict,
+    /// Σ.E5.1.b: Emat (streaming Arrow reader, Utf8View columns),
+    /// InjectFilterMultiAggRule attached. Same spec template as the
+    /// FastParquet+MultiAggRule row, but the table provider streams
+    /// 65K-row Utf8View batches out of `EmatArrowBatchReader`
+    /// (per-column parallel decode) instead of the bridge's whole-RG
+    /// emission shape.
+    MultiAggRuleStreamingUtf8View,
+    /// Σ.E5.1.b: Emat (streaming Arrow reader, Dictionary columns),
+    /// InjectFilterMultiAggRule attached. Routes through the
+    /// PerfectHashAggregate template. Direct comparison with the
+    /// `MultiAggRuleDict` (bridge) row.
+    MultiAggRuleStreamingDict,
 }
 
 fn data_path() -> String {
@@ -108,7 +120,10 @@ async fn build_ctx(path: &str, mode: Mode) -> SessionContext {
         Mode::Q1Rule => builder
             .with_physical_optimizer_rule(Arc::new(InjectFusedQ1Rule))
             .build(),
-        Mode::MultiAggRuleUtf8View | Mode::MultiAggRuleDict => builder
+        Mode::MultiAggRuleUtf8View
+        | Mode::MultiAggRuleDict
+        | Mode::MultiAggRuleStreamingUtf8View
+        | Mode::MultiAggRuleStreamingDict => builder
             .with_physical_optimizer_rule(Arc::new(InjectFilterMultiAggRule))
             .build(),
     };
@@ -118,6 +133,24 @@ async fn build_ctx(path: &str, mode: Mode) -> SessionContext {
             let prov = EmatixFastParquetTableProvider::try_new(path)
                 .unwrap()
                 .with_dict_preservation(true);
+            ctx.register_table("lineitem", Arc::new(prov)).unwrap();
+        }
+        Mode::MultiAggRuleStreamingUtf8View => {
+            // Σ.E5.1.b: streaming Arrow reader, Utf8View columns (no
+            // dict preservation). Apples-to-apples with the FastParquet
+            // + MultiAggRule baseline at the schema level.
+            let prov = EmatixFastParquetTableProvider::try_new(path)
+                .unwrap()
+                .with_streaming_arrow_reader(true);
+            ctx.register_table("lineitem", Arc::new(prov)).unwrap();
+        }
+        Mode::MultiAggRuleStreamingDict => {
+            // Σ.E5.1.b: streaming Arrow reader, Dictionary columns.
+            // Direct comparison with the bridge MultiAggRuleDict row.
+            let prov = EmatixFastParquetTableProvider::try_new(path)
+                .unwrap()
+                .with_dict_preservation(true)
+                .with_streaming_arrow_reader(true);
             ctx.register_table("lineitem", Arc::new(prov)).unwrap();
         }
         _ => {
@@ -157,6 +190,8 @@ async fn main() {
     let ctx_q1 = build_ctx(&path, Mode::Q1Rule).await;
     let ctx_multi_utf8 = build_ctx(&path, Mode::MultiAggRuleUtf8View).await;
     let ctx_multi_dict = build_ctx(&path, Mode::MultiAggRuleDict).await;
+    let ctx_multi_stream_utf8 = build_ctx(&path, Mode::MultiAggRuleStreamingUtf8View).await;
+    let ctx_multi_stream_dict = build_ctx(&path, Mode::MultiAggRuleStreamingDict).await;
 
     let off = bench("FastParquet (rule OFF — DataFusion default)", &ctx_off).await;
     let q1 = bench("FastParquet + InjectFusedQ1Rule", &ctx_q1).await;
@@ -166,8 +201,18 @@ async fn main() {
     )
     .await;
     let multi_dict = bench(
-        "EmatDictAware + InjectFilterMultiAggRule (Dictionary)",
+        "EmatBridge + InjectFilterMultiAggRule (Dict)",
         &ctx_multi_dict,
+    )
+    .await;
+    let multi_stream_utf8 = bench(
+        "EmatStreaming + InjectFilterMultiAggRule (Utf8View)",
+        &ctx_multi_stream_utf8,
+    )
+    .await;
+    let multi_stream_dict = bench(
+        "EmatStreaming + InjectFilterMultiAggRule (Dict)",
+        &ctx_multi_stream_dict,
     )
     .await;
 
@@ -175,6 +220,12 @@ async fn main() {
     let pct_multi_utf8_vs_off = 100.0 * (off - multi_utf8) / off;
     let pct_multi_dict_vs_off = 100.0 * (off - multi_dict) / off;
     let pct_multi_dict_vs_q1 = 100.0 * (multi_dict - q1) / q1;
+    // Σ.E5.1.b paired deltas: streaming reader vs the corresponding
+    // bridge row (the apples-to-apples comparison the task asked for).
+    let pct_stream_utf8_vs_bridge_utf8 = 100.0 * (multi_stream_utf8 - multi_utf8) / multi_utf8;
+    let pct_stream_dict_vs_bridge_dict = 100.0 * (multi_stream_dict - multi_dict) / multi_dict;
+    let pct_stream_utf8_vs_off = 100.0 * (off - multi_stream_utf8) / off;
+    let pct_stream_dict_vs_off = 100.0 * (off - multi_stream_dict) / off;
     println!();
     println!(
         "  InjectFusedQ1Rule (Utf8View)       vs OFF:    {q1:>6.2} ms vs {off:>6.2} ms  ({pct_q1_vs_off:+.1}% faster)"
@@ -189,6 +240,22 @@ async fn main() {
         "  MultiAgg Dictionary vs Q1Rule:                {multi_dict:>6.2} ms vs {q1:>6.2} ms  ({pct_multi_dict_vs_q1:+.1}%)"
     );
     println!();
+    println!("  --- Σ.E5.1.b streaming reader (new path) ---");
+    println!("  EmatBridge    (Utf8View, FastParquet path):    {multi_utf8:>6.2} ms");
+    println!(
+        "  EmatStreaming (Utf8View, new reader):          {multi_stream_utf8:>6.2} ms     ({pct_stream_utf8_vs_bridge_utf8:+.1}% vs FastParquet bridge)"
+    );
+    println!("  EmatBridge    (Dict):                          {multi_dict:>6.2} ms");
+    println!(
+        "  EmatStreaming (Dict, new reader):              {multi_stream_dict:>6.2} ms     ({pct_stream_dict_vs_bridge_dict:+.1}% vs Emat bridge)"
+    );
+    println!(
+        "  EmatStreaming (Utf8View) vs OFF:               ({pct_stream_utf8_vs_off:+.1}% faster)"
+    );
+    println!(
+        "  EmatStreaming (Dict)     vs OFF:               ({pct_stream_dict_vs_off:+.1}% faster)"
+    );
+    println!();
     if pct_multi_dict_vs_q1.abs() <= 10.0 {
         println!("  ✓ MultiAgg (Dict) ≈ Q1Rule (within 10%) — Q1Spec deletion JUSTIFIED.");
     } else if pct_multi_dict_vs_q1 < 0.0 {
@@ -196,6 +263,25 @@ async fn main() {
     } else {
         println!(
             "  ✗ MultiAgg (Dict) {pct_multi_dict_vs_q1:+.1}% vs Q1Rule — investigate before deletion."
+        );
+    }
+    // Σ.E5.1.b ready-to-flip decision: streaming Utf8View should be
+    // within ±5% of the FastParquet+MultiAgg baseline to flip default.
+    println!();
+    if pct_stream_utf8_vs_bridge_utf8.abs() <= 5.0 {
+        println!(
+            "  ✓ EmatStreaming (Utf8View) within ±5% of FastParquet baseline — \
+             ready to flip default in follow-up."
+        );
+    } else if pct_stream_utf8_vs_bridge_utf8 < 0.0 {
+        println!(
+            "  ✓✓ EmatStreaming (Utf8View) BEATS FastParquet baseline — \
+             flip default in follow-up."
+        );
+    } else {
+        println!(
+            "  ✗ EmatStreaming (Utf8View) {pct_stream_utf8_vs_bridge_utf8:+.1}% vs \
+             FastParquet baseline — investigate before flipping default."
         );
     }
 }
