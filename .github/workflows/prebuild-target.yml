@@ -28,6 +28,14 @@ concurrency:
   group: prebuild-target-${{ github.ref }}
   cancel-in-progress: true
 
+# Least-privilege GITHUB_TOKEN: only contents:read is needed for the
+# checkout actions. AWS auth uses long-lived access keys passed as
+# secrets, not the GITHUB_TOKEN — so no `id-token: write` here.
+# Adding this block also satisfies CodeQL's
+# `actions/missing-workflow-permissions` lint.
+permissions:
+  contents: read
+
 # Bucket name lives in a repo *variable* (vars.*), not a secret —
 # bucket names aren't credentials and surfacing the value in logs is
 # fine. The actual credentials (AWS keys) come from secrets.
