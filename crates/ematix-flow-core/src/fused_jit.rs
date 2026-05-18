@@ -439,6 +439,31 @@ pub enum AggExpr {
     /// the host downcasts to i64 at emit time when it needs integer
     /// `count_order` output.
     CountStar,
+    /// `AVG(col[i])` — Float64 column. In the hot loop the cell
+    /// accumulates the running sum exactly like `SumColumn`; the
+    /// finalize step divides by the per-group COUNT(*) total to emit
+    /// the mean. A spec carrying `AvgColumn` must also carry at least
+    /// one `CountStar` aggregate — validated at `try_new` time —
+    /// because the division can't happen without a count cell.
+    ///
+    /// Σ.G.2f.3: introduced for full TPC-H Q1 coverage (`avg_qty`,
+    /// `avg_price`, `avg_disc`). Currently supported only by
+    /// [`crate::fused_aggregate_filter_multi_agg::FilterMultiAggSpec`]'s
+    /// pure-Rust kernels. The Cranelift JIT path doesn't lower this
+    /// variant yet; specs that need it must use the template-dispatch
+    /// path rather than `Q1Spec::try_new_jit`.
+    AvgColumn(usize),
+    /// `MIN(col[i])` — Float64 column. Hot loop tracks running min;
+    /// cell initialised to `+inf` so the first row's value always wins.
+    /// Only seen-during-batch groups appear in the output, so the
+    /// `+inf` sentinel never escapes to the user.
+    MinColumn(usize),
+    /// `MAX(col[i])` — Float64 column. Cell initialised to `-inf`.
+    MaxColumn(usize),
+    /// `SUM(col[i] * col[i])` — Float64 column. Building block for
+    /// variance/stddev derivations done at the rule projection level
+    /// (`var = (sum_sq - sum²/n) / (n-1)`). Cell init 0.0.
+    SumSquaresColumn(usize),
     /// `SUM(CASE WHEN guard_col STARTS WITH prefix THEN val_col * (1 - disc_col) ELSE 0)`.
     /// Q14's `SUM(CASE WHEN p_type LIKE 'PROMO%' THEN price * (1 - disc) ELSE 0)`.
     ///
@@ -1090,6 +1115,21 @@ fn validate_spec(spec: &FusedFilterAggSpec) -> Result<(), String> {
         // type/length constraints; we handle those separately below.
         let (f64_cols, guard_constraint): (Vec<usize>, Option<(usize, usize)>) = match a {
             AggExpr::SumColumn(c) => (vec![*c], None),
+            AggExpr::AvgColumn(_)
+            | AggExpr::MinColumn(_)
+            | AggExpr::MaxColumn(_)
+            | AggExpr::SumSquaresColumn(_) => {
+                // These variants are currently only lowered by the
+                // pure-Rust FilterMultiAggSpec template dispatch (each
+                // needs either a finalize-time derivation or a
+                // non-additive accumulator). Reject at JIT-spec
+                // validation rather than emit a kernel that ignores
+                // the variant.
+                return Err(format!(
+                    "FusedFilterAggSpec: aggregate {i} {a:?} not supported by JIT path; \
+                     use FilterMultiAggSpec template dispatch instead"
+                ));
+            }
             AggExpr::SumProductColumns(a, b) => {
                 if a == b {
                     return Err(format!(
@@ -1246,6 +1286,12 @@ fn emit_agg_term(
     };
     match agg {
         AggExpr::SumColumn(c) => load_f64(builder, *c),
+        AggExpr::AvgColumn(_)
+        | AggExpr::MinColumn(_)
+        | AggExpr::MaxColumn(_)
+        | AggExpr::SumSquaresColumn(_) => unreachable!(
+            "non-additive variants rejected at FusedFilterAggSpec::validate; JIT codegen should never see them"
+        ),
         AggExpr::SumProductColumns(a, b_idx) => {
             let av = load_f64(builder, *a);
             let bv = load_f64(builder, *b_idx);
