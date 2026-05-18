@@ -47,6 +47,7 @@ use datafusion::physical_plan::{
 use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
 use parquet::file::reader::{FileReader, SerializedFileReader};
 
+use crate::emat_arrow_reader::EmatArrowBatchReaderBuilder;
 use crate::ematix_parquet_bridge::{
     decode_column_chunk_byte_array, decode_column_chunk_byte_array_dict_preserved,
     decode_column_chunk_f64, decode_column_chunk_i32, decode_column_chunk_i64,
@@ -188,6 +189,26 @@ pub struct EmatixFastParquetTableProvider {
     ///     StringArray and that would mismatch the reported schema.
     ///     DataFusion's residual FilterExec runs filters as usual.
     dict_preservation: bool,
+    /// Σ.E5.1.b: when true, route batch emission through
+    /// [`crate::emat_arrow_reader::EmatArrowBatchReader`] instead of the
+    /// whole-row-group bridge path. The streaming reader decodes each
+    /// projected column once per RG (per-column parallel — distinct
+    /// `PageWalker` per thread) and slices the per-RG arrays into
+    /// `batch_size`-row windows, matching `FastParquetTableProvider`'s
+    /// batch shape.
+    ///
+    /// **Default off** until end-to-end parity is proven on the SF=1
+    /// Q1 SQL gate. With it on:
+    ///   - Utf8 fields in the bridge schema are promoted to `Utf8View`
+    ///     for `schema()` so the reader can emit `StringViewArray`
+    ///     directly (matching what FastParquet does end-to-end).
+    ///   - Filter pushdown is disabled — the streaming path's first
+    ///     iteration of this PR doesn't fuse with the bitmap-first
+    ///     filtered decode. DataFusion's residual FilterExec runs
+    ///     filters as usual. This is a deliberate Σ.E5.1.b scope cut;
+    ///     a follow-up can rejoin pushdown once the unfiltered path is
+    ///     verified.
+    streaming_arrow_reader: bool,
 }
 
 impl EmatixFastParquetTableProvider {
@@ -253,6 +274,7 @@ impl EmatixFastParquetTableProvider {
             num_rows,
             late_mat: true,
             dict_preservation: false,
+            streaming_arrow_reader: false,
         })
     }
 
@@ -310,6 +332,47 @@ impl EmatixFastParquetTableProvider {
         self.dict_preservation
     }
 
+    /// Σ.E5.1.b: route batch emission through `EmatArrowBatchReader`
+    /// instead of the whole-row-group bridge path. Default off until
+    /// e2e parity is proven; expected to flip default in a follow-up.
+    ///
+    /// When turned on without dict preservation, Utf8 columns in the
+    /// reported schema are promoted to `Utf8View` so the streaming
+    /// reader can emit `StringViewArray` directly. When combined with
+    /// `with_dict_preservation(true)`, schema rewriting to
+    /// `Dictionary(UInt32, Utf8)` already happened and is preserved.
+    pub fn with_streaming_arrow_reader(mut self, on: bool) -> Self {
+        self.streaming_arrow_reader = on;
+        if on && !self.dict_preservation {
+            // Promote Utf8 → Utf8View so the schema matches what the
+            // reader will emit (StringViewArray, not StringArray).
+            // Other types pass through, including Date32/Int32/etc.
+            let fields = self
+                .schema
+                .fields()
+                .iter()
+                .map(|f| {
+                    if matches!(f.data_type(), DataType::Utf8) {
+                        Arc::new(arrow_schema::Field::new(
+                            f.name(),
+                            DataType::Utf8View,
+                            f.is_nullable(),
+                        ))
+                    } else {
+                        f.clone()
+                    }
+                })
+                .collect::<Vec<_>>();
+            self.schema = Arc::new(Schema::new(fields));
+        }
+        self
+    }
+
+    /// Whether the Σ.E5.1.b streaming reader path is enabled.
+    pub fn streaming_arrow_reader(&self) -> bool {
+        self.streaming_arrow_reader
+    }
+
     pub fn path(&self) -> &str {
         &self.path
     }
@@ -344,7 +407,10 @@ impl TableProvider for EmatixFastParquetTableProvider {
         &self,
         filters: &[&Expr],
     ) -> DfResult<Vec<TableProviderFilterPushDown>> {
-        if self.dict_preservation {
+        if self.dict_preservation || self.streaming_arrow_reader {
+            // Σ.E5.1.b: the streaming Arrow reader path doesn't fuse
+            // with the bitmap-first filtered decode yet; let
+            // DataFusion's residual FilterExec handle filters.
             return Ok(filters
                 .iter()
                 .map(|_| TableProviderFilterPushDown::Unsupported)
@@ -405,6 +471,7 @@ impl TableProvider for EmatixFastParquetTableProvider {
             self.num_rows,
             bridge_filter,
             self.late_mat,
+            self.streaming_arrow_reader,
         )?))
     }
 }
@@ -424,11 +491,16 @@ pub struct EmatixFastParquetExec {
     /// Σ.E5a (Π.10): when true AND `filter.is_some()`, decode goes
     /// through `read_column_*_masked_into`. Else: sparse_gather path.
     late_mat: bool,
+    /// Σ.E5.1.b: when true AND `filter.is_none()`, batch emission
+    /// uses `EmatArrowBatchReader` (streaming, per-column-parallel,
+    /// `Utf8View`/`Dictionary`-aware) instead of the whole-RG bridge.
+    streaming_arrow_reader: bool,
     properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
 }
 
 impl EmatixFastParquetExec {
+    #[allow(clippy::too_many_arguments)]
     pub fn try_new(
         path: String,
         schema: SchemaRef,
@@ -437,6 +509,7 @@ impl EmatixFastParquetExec {
         num_rows: usize,
         filter: Option<BridgeFilter>,
         late_mat: bool,
+        streaming_arrow_reader: bool,
     ) -> DfResult<Self> {
         let eq_props = EquivalenceProperties::new(schema.clone());
         let properties = Arc::new(PlanProperties::new(
@@ -453,6 +526,7 @@ impl EmatixFastParquetExec {
             num_rows,
             filter,
             late_mat,
+            streaming_arrow_reader,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
         })
@@ -506,15 +580,24 @@ impl ExecutionPlan for EmatixFastParquetExec {
         let late_mat = self.late_mat;
         let baseline = BaselineMetrics::new(&self.metrics, partition);
 
-        let stream = build_partition_stream(
-            path,
-            schema.clone(),
-            projection,
-            row_groups,
-            filter,
-            late_mat,
-            baseline,
-        );
+        // Σ.E5.1.b: when the streaming reader is enabled AND no filter
+        // has been pushed down (the streaming path doesn't fuse with
+        // the bitmap-first filtered decode yet — Σ.E5.1.b scope cut),
+        // route through `EmatArrowBatchReader`. Otherwise fall back to
+        // the whole-RG bridge path.
+        let stream = if self.streaming_arrow_reader && filter.is_none() {
+            build_streaming_partition_stream(path, schema.clone(), projection, row_groups, baseline)
+        } else {
+            build_partition_stream(
+                path,
+                schema.clone(),
+                projection,
+                row_groups,
+                filter,
+                late_mat,
+                baseline,
+            )
+        };
         Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)) as SendableRecordBatchStream)
     }
 
@@ -567,6 +650,90 @@ fn build_partition_stream(
                 (None, _) => decode_one_rg(&path_buf, rg, &schema, &projection),
             };
             if tx.blocking_send(batch_result).is_err() {
+                return; // consumer dropped
+            }
+        }
+    });
+
+    let stream = futures_util::stream::unfold((rx, baseline), |(mut rx, baseline)| async move {
+        let timer = baseline.elapsed_compute().timer();
+        let item = rx.recv().await;
+        drop(timer);
+        if let Some(Ok(ref batch)) = item {
+            baseline.record_output(batch.num_rows());
+        }
+        item.map(|i| (i, (rx, baseline)))
+    });
+    stream.boxed()
+}
+
+/// Σ.E5.1.b: streaming partition stream built atop
+/// [`EmatArrowBatchReader`].
+///
+/// Per partition we open the parquet file once on a `spawn_blocking`
+/// worker, configure the reader against the projected schema (which
+/// the provider has already promoted to `Utf8View` or
+/// `Dictionary(UInt32, Utf8)` as appropriate), and stream each
+/// `batch_size`-row window over an mpsc channel.
+///
+/// Threading note: the reader internally fan-outs per-column decode
+/// across `min(n_cols, available_parallelism())` scoped threads. With
+/// DataFusion's outer `target_partitions` repartition (one
+/// `spawn_blocking` worker per partition), peak concurrency is
+/// `num_partitions * n_cols_per_partition`. For Q1 SF=1 that's
+/// 6 partitions × 7 cols = 42 threads on a 14-core machine — the
+/// reader's internal cap of `available_parallelism()` keeps each
+/// partition's spawn count bounded. Pool oversubscription is mild and
+/// reflects the same shape the bridge path already exhibits with its
+/// per-RG decode (the bridge isn't column-parallel; the reader is, so
+/// the oversub is the *reader's* doing — measured below).
+fn build_streaming_partition_stream(
+    path: String,
+    schema: SchemaRef,
+    projection: Vec<usize>,
+    row_groups: Vec<usize>,
+    baseline: BaselineMetrics,
+) -> futures_util::stream::BoxStream<'static, DfResult<RecordBatch>> {
+    use futures_util::StreamExt;
+
+    if row_groups.is_empty() {
+        return futures_util::stream::iter(Vec::<DfResult<RecordBatch>>::new()).boxed();
+    }
+
+    let (tx, rx) = tokio::sync::mpsc::channel::<DfResult<RecordBatch>>(8);
+    let path_buf = PathBuf::from(path);
+
+    tokio::task::spawn_blocking(move || {
+        let file = match ematix_parquet_io::ParquetFile::open(&path_buf) {
+            Ok(f) => f,
+            Err(e) => {
+                let _ = tx.blocking_send(Err(DataFusionError::External(
+                    format!(
+                        "EmatixFastParquetExec (streaming): ParquetFile::open `{}`: {e}",
+                        path_buf.display()
+                    )
+                    .into(),
+                )));
+                return;
+            }
+        };
+
+        let reader = match EmatArrowBatchReaderBuilder::new(file, schema)
+            .with_projection(projection)
+            .with_row_groups(row_groups)
+            .build()
+        {
+            Ok(r) => r,
+            Err(e) => {
+                let _ = tx.blocking_send(Err(DataFusionError::External(
+                    format!("EmatixFastParquetExec (streaming): build reader: {e}").into(),
+                )));
+                return;
+            }
+        };
+
+        for item in reader {
+            if tx.blocking_send(item).is_err() {
                 return; // consumer dropped
             }
         }
@@ -1355,5 +1522,162 @@ mod tests {
             (rev - expected_rev).abs() < 1e-3 * expected_rev.abs(),
             "rev {rev:.4} vs expected {expected_rev:.4}"
         );
+    }
+
+    /// Σ.E5.1.b end-to-end shape: the streaming reader path must
+    /// produce the same Q1-shaped (filter + GROUP BY + SUM + COUNT(*))
+    /// result as the legacy bridge path on a small synthetic
+    /// multi-row-group parquet.
+    ///
+    /// We write a 4-row-group file with a primitive grouping column
+    /// (Int32, three distinct values cycling) plus a Float64 value
+    /// column, then run the same SQL through:
+    ///   - bridge provider:  EmatixFastParquetTableProvider::try_new
+    ///   - streaming provider: same + .with_streaming_arrow_reader(true)
+    /// and confirm row-by-row equality. Filter is `v > 100.0` so it's
+    /// not vacuous.
+    #[tokio::test]
+    async fn streaming_reader_provider_q1_shape() {
+        use parquet::basic::{Compression, Repetition, Type as PhysicalType};
+        use parquet::column::writer::ColumnWriter;
+        use parquet::file::properties::WriterProperties;
+        use parquet::file::writer::SerializedFileWriter;
+        use parquet::schema::types::Type as PType;
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+
+        // 4 row groups × 200 rows each = 800 rows total. Grouping
+        // column cycles through 3 values; value column is i * 0.5 so
+        // some rows are > 100.0 and some aren't.
+        let n_per_rg = 200usize;
+        let n_rgs = 4usize;
+
+        let schema = Arc::new(
+            PType::group_type_builder("schema")
+                .with_fields(vec![
+                    Arc::new(
+                        PType::primitive_type_builder("g", PhysicalType::INT32)
+                            .with_repetition(Repetition::REQUIRED)
+                            .build()
+                            .unwrap(),
+                    ),
+                    Arc::new(
+                        PType::primitive_type_builder("v", PhysicalType::DOUBLE)
+                            .with_repetition(Repetition::REQUIRED)
+                            .build()
+                            .unwrap(),
+                    ),
+                ])
+                .build()
+                .unwrap(),
+        );
+        let props = Arc::new(
+            WriterProperties::builder()
+                .set_compression(Compression::SNAPPY)
+                .set_max_row_group_row_count(Some(n_per_rg))
+                .build(),
+        );
+        let file = File::create(&path).unwrap();
+        let mut writer = SerializedFileWriter::new(file, schema, props).unwrap();
+        for rg_idx in 0..n_rgs {
+            let mut rg = writer.next_row_group().unwrap();
+            let base = rg_idx * n_per_rg;
+            let g: Vec<i32> = (0..n_per_rg).map(|i| ((base + i) % 3) as i32).collect();
+            let v: Vec<f64> = (0..n_per_rg).map(|i| (base + i) as f64 * 0.5).collect();
+            let mut col = rg.next_column().unwrap().unwrap();
+            if let ColumnWriter::Int32ColumnWriter(t) = col.untyped() {
+                t.write_batch(&g, None, None).unwrap();
+            }
+            col.close().unwrap();
+            let mut col = rg.next_column().unwrap().unwrap();
+            if let ColumnWriter::DoubleColumnWriter(t) = col.untyped() {
+                t.write_batch(&v, None, None).unwrap();
+            }
+            col.close().unwrap();
+            rg.close().unwrap();
+        }
+        writer.close().unwrap();
+
+        let path_str = path.to_string_lossy().to_string();
+        let sql = "SELECT g, SUM(v) AS s, COUNT(*) AS n \
+                   FROM t \
+                   WHERE v > 100.0 \
+                   GROUP BY g \
+                   ORDER BY g";
+
+        async fn run_one(
+            provider: EmatixFastParquetTableProvider,
+            sql: &str,
+        ) -> Vec<(i32, f64, i64)> {
+            let ctx = SessionContext::new();
+            ctx.register_table("t", Arc::new(provider)).unwrap();
+            let df = ctx.sql(sql).await.unwrap();
+            let batches = df.collect().await.unwrap();
+            let mut out: Vec<(i32, f64, i64)> = Vec::new();
+            for b in &batches {
+                let g = b
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<arrow_array::Int32Array>()
+                    .unwrap();
+                let s = b
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<arrow_array::Float64Array>()
+                    .unwrap();
+                let n = b
+                    .column(2)
+                    .as_any()
+                    .downcast_ref::<arrow_array::Int64Array>()
+                    .unwrap();
+                for i in 0..b.num_rows() {
+                    out.push((g.value(i), s.value(i), n.value(i)));
+                }
+            }
+            out
+        }
+
+        let bridge_prov = EmatixFastParquetTableProvider::try_new(&path_str).unwrap();
+        let stream_prov = EmatixFastParquetTableProvider::try_new(&path_str)
+            .unwrap()
+            .with_streaming_arrow_reader(true);
+        assert!(stream_prov.streaming_arrow_reader());
+
+        let bridge_rows = run_one(bridge_prov, sql).await;
+        let stream_rows = run_one(stream_prov, sql).await;
+
+        // Same group set, same counts, same sums (within fp slack).
+        assert_eq!(bridge_rows.len(), stream_rows.len(), "row count mismatch");
+        assert!(!bridge_rows.is_empty(), "expected non-empty result");
+        for (i, (b, s)) in bridge_rows.iter().zip(stream_rows.iter()).enumerate() {
+            assert_eq!(b.0, s.0, "group key mismatch at row {i}");
+            assert_eq!(b.2, s.2, "count mismatch at row {i} (g={})", b.0);
+            assert!(
+                (b.1 - s.1).abs() < 1e-6 * b.1.abs().max(1.0),
+                "sum mismatch at row {i}: bridge {} vs stream {}",
+                b.1,
+                s.1
+            );
+        }
+
+        // Sanity: the manual oracle matches too.
+        let mut expected: std::collections::BTreeMap<i32, (f64, i64)> =
+            std::collections::BTreeMap::new();
+        let total = n_per_rg * n_rgs;
+        for i in 0..total {
+            let g = (i % 3) as i32;
+            let v = i as f64 * 0.5;
+            if v > 100.0 {
+                let e = expected.entry(g).or_insert((0.0, 0));
+                e.0 += v;
+                e.1 += 1;
+            }
+        }
+        for (i, (g, (s, n))) in expected.into_iter().enumerate() {
+            assert_eq!(bridge_rows[i].0, g);
+            assert!((bridge_rows[i].1 - s).abs() < 1e-6 * s.abs().max(1.0));
+            assert_eq!(bridge_rows[i].2, n);
+        }
     }
 }
