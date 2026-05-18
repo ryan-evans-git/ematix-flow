@@ -274,7 +274,12 @@ impl EmatixFastParquetTableProvider {
             num_rows,
             late_mat: true,
             dict_preservation: false,
-            streaming_arrow_reader: false,
+            // Σ.E5.1.e: default ON. The streaming reader meets the
+            // Σ.E5.2 ±5% gate on both Utf8View (+4.9%, #113) and
+            // Dictionary (−31.7% vs bridge, #112) paths; making it
+            // the default removes the opt-in step for users. Bridge
+            // still available via .with_streaming_arrow_reader(false).
+            streaming_arrow_reader: true,
         })
     }
 
