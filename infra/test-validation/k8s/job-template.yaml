@@ -1,0 +1,44 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: PLACEHOLDER_JOB_NAME
+  namespace: default
+  labels:
+    ematix-flow/pipeline: validation
+    ematix-flow/campaign: PLACEHOLDER_CAMPAIGN
+spec:
+  # The flow worker's Ω.2 retry layer owns retries (RunLog-based).
+  # `backoffLimit: 0` and `restartPolicy: Never` together guarantee
+  # at-most-once execution per Job — the exact contract
+  # K8sJobExecutor's documentation calls out.
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 600
+
+  template:
+    metadata:
+      labels:
+        ematix-flow/pipeline: validation
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: worker
+          image: PLACEHOLDER_IMAGE
+          imagePullPolicy: Always
+          # `--version` is the no-op smoke test. The validation
+          # campaign just proves the image runs in EKS; running a
+          # real pipeline would need additional setup (RunLog
+          # config, target tables, etc.) that's out of scope for
+          # the smoke.
+          args: ["--version"]
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "256Mi"
+            limits:
+              cpu: "500m"
+              memory: "1Gi"
+          env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: AWS_REGION
+              value: PLACEHOLDER_REGION
