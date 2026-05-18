@@ -446,9 +446,7 @@ fn build_clause(
 }
 
 fn scan_has_all_columns(schema: &SchemaRef, names: &[String]) -> bool {
-    names
-        .iter()
-        .all(|n| schema.column_with_name(n).is_some())
+    names.iter().all(|n| schema.column_with_name(n).is_some())
 }
 
 #[cfg(test)]
