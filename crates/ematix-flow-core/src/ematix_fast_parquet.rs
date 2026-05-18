@@ -156,6 +156,14 @@ pub struct EmatixFastParquetTableProvider {
     schema: SchemaRef,
     num_row_groups: usize,
     num_rows: usize,
+    /// Per-column typed min/max + null_count aggregated across row
+    /// groups at `try_new` time. Mirrors what `FastParquetTableProvider`
+    /// computes; the planner uses these for join-build-side selection
+    /// and selectivity estimates. Without them DataFusion sees
+    /// `Statistics::new_unknown` and picks suboptimal join orders
+    /// (e.g. Q21 — 4-way join of supplier/lineitem/orders/nation —
+    /// picked nation as build side without knowing it has only 25 rows).
+    column_stats: Arc<Vec<datafusion::common::stats::ColumnStatistics>>,
     /// Σ.E5a (Π.10 integration): when true, the filtered-decode path
     /// uses ematix-parquet v0.3.0's `read_column_*_masked_into` façade
     /// (Π.10 late-materialisation) instead of the pre-Π.10 in-flow
@@ -267,11 +275,21 @@ impl EmatixFastParquetTableProvider {
         let num_rows = fmd.num_rows() as usize;
         let num_row_groups = reader.metadata().num_row_groups();
 
+        // Σ.E5 (2026-05-18): aggregate typed per-column stats so
+        // `partition_statistics` returns real cardinality info to the
+        // planner. Reuses the helper in `fast_parquet.rs` — both
+        // providers read the same parquet-rs `ParquetMetaData`.
+        let column_stats = Arc::new(crate::fast_parquet::aggregate_column_statistics(
+            reader.metadata(),
+            schema.as_ref(),
+        ));
+
         Ok(Self {
             path,
             schema,
             num_row_groups,
             num_rows,
+            column_stats,
             late_mat: true,
             dict_preservation: false,
             // Σ.E5 (2026-05-18): re-flipping streaming default on
@@ -484,6 +502,13 @@ impl TableProvider for EmatixFastParquetTableProvider {
         // predicate).
         let bridge_filter = extract_bridge_filter(filters, &self.schema);
 
+        // Project the per-column stats so the Exec reports stats in
+        // projection order (matches the projected schema indices).
+        let projected_col_stats: Vec<datafusion::common::stats::ColumnStatistics> = projection
+            .iter()
+            .map(|&i| self.column_stats[i].clone())
+            .collect();
+
         Ok(Arc::new(EmatixFastParquetExec::try_new(
             self.path.clone(),
             projected_schema,
@@ -493,6 +518,7 @@ impl TableProvider for EmatixFastParquetTableProvider {
             bridge_filter,
             self.late_mat,
             self.streaming_arrow_reader,
+            projected_col_stats,
         )?))
     }
 }
@@ -516,6 +542,11 @@ pub struct EmatixFastParquetExec {
     /// uses `EmatArrowBatchReader` (streaming, per-column-parallel,
     /// `Utf8View`/`Dictionary`-aware) instead of the whole-RG bridge.
     streaming_arrow_reader: bool,
+    /// Σ.E5: projected per-column stats (min/max/null_count) so
+    /// `partition_statistics` returns real cardinality info instead
+    /// of `Statistics::new_unknown`. Same shape as
+    /// `FastParquetExec.column_stats`.
+    column_stats: Vec<datafusion::common::stats::ColumnStatistics>,
     properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
 }
@@ -531,6 +562,7 @@ impl EmatixFastParquetExec {
         filter: Option<BridgeFilter>,
         late_mat: bool,
         streaming_arrow_reader: bool,
+        column_stats: Vec<datafusion::common::stats::ColumnStatistics>,
     ) -> DfResult<Self> {
         let eq_props = EquivalenceProperties::new(schema.clone());
         let properties = Arc::new(PlanProperties::new(
@@ -548,6 +580,7 @@ impl EmatixFastParquetExec {
             filter,
             late_mat,
             streaming_arrow_reader,
+            column_stats,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
         })
@@ -656,16 +689,29 @@ impl ExecutionPlan for EmatixFastParquetExec {
     }
 
     fn partition_statistics(&self, partition: Option<usize>) -> DfResult<Statistics> {
+        // Σ.E5: report typed per-column min/max/null_count + num_rows.
+        // Mirrors `FastParquetExec::partition_statistics`. The planner
+        // uses these for join-build-side selection and selectivity
+        // estimates; without them every join build picks the "first"
+        // side, which is suboptimal for queries like Q21 where
+        // pre-filter cardinalities are wildly different across joined
+        // tables (e.g. nation = 25 rows vs lineitem = 6 M).
         let rows = match partition {
             Some(p) if p < self.assignments.len() => {
-                // Rough per-partition estimate: total / num_partitions.
                 self.num_rows / self.assignments.len().max(1)
             }
             None => self.num_rows,
             _ => 0,
         };
         let mut s = Statistics::new_unknown(&self.schema);
-        s.num_rows = datafusion::common::stats::Precision::Inexact(rows);
+        // Exact for whole-table; per-partition is an even split, so
+        // mark Inexact to signal the planner not to over-rely on it.
+        s.num_rows = if partition.is_none() {
+            datafusion::common::stats::Precision::Exact(rows)
+        } else {
+            datafusion::common::stats::Precision::Inexact(rows)
+        };
+        s.column_statistics = self.column_stats.clone();
         Ok(s)
     }
 }
