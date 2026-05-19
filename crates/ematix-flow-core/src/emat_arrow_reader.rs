@@ -323,6 +323,7 @@ impl EmatArrowBatchReaderBuilder {
             path: self.path,
             cur_rg_idx: 0,
             cur_rg_columns: None,
+            cur_rg_filter_bitmap: None,
             cur_rg_row: 0,
             cur_rg_total: 0,
         })
@@ -450,8 +451,117 @@ impl DecodedColumn {
 /// `LikeMatcher`, etc.) — that drops the FilterExec and unblocks the
 /// compact path as a real win.
 ///
-/// For `StringView`: views are filtered, `data_buffers` stays shared.
-/// For `DictUtf8`:   indices are filtered, dict values stay shared.
+/// Σ.E5 Phase 1.5 (2026-05-19): SIMD-accelerated compact via Arrow's
+/// `filter` kernel. Converts the DecodedColumn to an ArrayRef, runs
+/// `arrow_select::filter::filter` (which uses SIMD per-type kernels),
+/// and stores the result back. Same contract as
+/// `compact_decoded_column` but ~3-5× faster on wide projections.
+///
+/// `predicate` is a precompiled `FilterPredicate` so we don't rebuild
+/// the index list per column. Use `arrow_select::filter::FilterBuilder`
+/// to build one from a BooleanArray once per RG.
+fn compact_decoded_column_via_arrow(
+    col: &DecodedColumn,
+    predicate: &datafusion::arrow::compute::FilterPredicate,
+    target_type: &DataType,
+) -> DfResult<DecodedColumn> {
+    // Convert DecodedColumn -> ArrayRef via slice_decoded with full RG.
+    let n_rows = col.len();
+    let array_ref = slice_decoded(col, 0, n_rows, target_type);
+    let filtered = predicate
+        .filter(array_ref.as_ref())
+        .map_err(|e| ext(format!("arrow filter: {e}")))?;
+
+    // Convert ArrayRef -> DecodedColumn for downstream slice_batch.
+    let popcount = filtered.len();
+    match (col, filtered.data_type()) {
+        (DecodedColumn::Int32 { .. }, DataType::Int32 | DataType::Date32) => {
+            let arr = filtered.as_any();
+            let buf = if let Some(a) = arr.downcast_ref::<Int32Array>() {
+                a.values().inner().clone()
+            } else if let Some(a) = arr.downcast_ref::<Date32Array>() {
+                a.values().inner().clone()
+            } else {
+                return Err(ext("compact_via_arrow: i32 downcast failed"));
+            };
+            Ok(DecodedColumn::Int32 {
+                data: buf,
+                n_rows: popcount,
+            })
+        }
+        (DecodedColumn::Int64 { .. }, DataType::Int64) => {
+            let a = filtered
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| ext("compact_via_arrow: i64 downcast failed"))?;
+            Ok(DecodedColumn::Int64 {
+                data: a.values().inner().clone(),
+                n_rows: popcount,
+            })
+        }
+        (DecodedColumn::Float64 { .. }, DataType::Float64) => {
+            let a = filtered
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .ok_or_else(|| ext("compact_via_arrow: f64 downcast failed"))?;
+            Ok(DecodedColumn::Float64 {
+                data: a.values().inner().clone(),
+                n_rows: popcount,
+            })
+        }
+        (DecodedColumn::StringView { .. }, DataType::Utf8View) => {
+            let a = filtered
+                .as_any()
+                .downcast_ref::<StringViewArray>()
+                .ok_or_else(|| ext("compact_via_arrow: StringView downcast failed"))?;
+            Ok(DecodedColumn::StringView {
+                views: a.views().inner().clone(),
+                n_rows: popcount,
+                data_buffers: a.data_buffers().to_vec(),
+            })
+        }
+        (DecodedColumn::DictUtf8 { values, .. }, DataType::Dictionary(_, _)) => {
+            // Dict array's keys are filtered; values stay shared.
+            let a = filtered
+                .as_any()
+                .downcast_ref::<DictionaryArray<UInt32Type>>()
+                .ok_or_else(|| ext("compact_via_arrow: Dictionary<U32,Utf8> downcast failed"))?;
+            Ok(DecodedColumn::DictUtf8 {
+                values: values.clone(),
+                indices: a.keys().values().inner().clone(),
+                n_rows: popcount,
+            })
+        }
+        (DecodedColumn::Utf8(_), _) => {
+            // Slow path — keep as Utf8.
+            let a = filtered
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| ext("compact_via_arrow: Utf8 downcast failed"))?;
+            Ok(DecodedColumn::Utf8(Arc::new(a.clone())))
+        }
+        (other, dt) => Err(ext(format!(
+            "compact_via_arrow: type mismatch — DecodedColumn {:?} got Arrow {dt:?}",
+            std::mem::discriminant(other)
+        ))),
+    }
+}
+
+/// Σ.E5 (2026-05-19): compact a densely-decoded column down to only
+/// the rows where `bitmap` bit = 1. Output row count = `popcount`.
+///
+/// Intended for a future high-sel dense+bitmap-apply fallback path:
+/// when popcount is too high for masked decode to win, the reader
+/// would dense-decode and THEN compact via this helper. The first
+/// integration (calling this from the selectivity-gate fallback)
+/// regressed Q03 -36% → +21% and Q21 -10% → +30% because it ran
+/// alongside the FilterExec (Inexact pushdown), duplicating the
+/// per-row predicate work.
+///
+/// Kept as dead code so it's ready when we add per-filter Exact
+/// pushdown for predicate shapes we fully handle (string LIKE via
+/// `LikeMatcher`, etc.) — that drops the FilterExec and unblocks the
+/// compact path as a real win.
 #[allow(dead_code)]
 fn compact_decoded_column(
     col: &DecodedColumn,
@@ -592,6 +702,12 @@ pub struct EmatArrowBatchReader {
     /// Per-projected-column decoded buffers for the current RG, or
     /// `None` before the first batch / after the RG is exhausted.
     cur_rg_columns: Option<Vec<DecodedColumn>>,
+    /// Σ.E5 Phase 1.6: row bitmap from the late-mat selectivity gate
+    /// fallback. When present, `slice_batch` filters each emitted
+    /// batch via Arrow's SIMD `filter` kernel after the zero-copy
+    /// slice of `cur_rg_columns`. Cleared on RG boundary by
+    /// `load_row_group` / `load_row_group_dense`.
+    cur_rg_filter_bitmap: Option<Vec<u8>>,
     /// Next row index within the current RG.
     cur_rg_row: usize,
     /// Total rows in the current RG.
@@ -660,23 +776,17 @@ impl EmatArrowBatchReader {
         // between win and loss is narrow for mid-selectivity numeric
         // filters and 33% is a conservative cut.
         if total > 0 && popcount * 3 > total {
-            // Σ.E5 (2026-05-19, verified-NEG twice now): tried
-            // compacting dense-decoded cols via the bitmap here
-            // (`compact_decoded_column`).
+            // Σ.E5 (2026-05-19): high-selectivity fallback. Multiple
+            // verified-NEG attempts at applying the bitmap in-reader
+            // documented above. Until Phase 1.7 lands (parallel
+            // bitmap build to remove the serial tail), the safe
+            // behaviour is: drop the bitmap, dense decode, let the
+            // residual FilterExec re-filter (Inexact pushdown).
             //
-            // First attempt (ee67bde): Inexact pushdown → FilterExec
-            // still present → compact duplicates work → Q03 -36% →
-            // +21%, Q21 -10% → +30%.
-            //
-            // Second attempt (Phase 1, this file's Exact-pushdown
-            // landing): scalar compact loses to FilterExec's SIMD-
-            // accelerated Arrow `filter` kernel → Q01 -5% → +105%,
-            // Q03 -36% → +47%, Q05 +13%, Q08 +11%. Geomean
-            // 0.86 → 0.945.
-            //
-            // Path forward: re-implement compact via Arrow's filter
-            // kernel before re-enabling Exact pushdown. Keep the
-            // dead-code helper as the integration target.
+            // Phase 1.6 plumbing (per-batch filter via
+            // `cur_rg_filter_bitmap` + `slice_batch`) is kept in
+            // place but not activated — `cur_rg_filter_bitmap` stays
+            // `None` so slice_batch's filter branch is dead.
             self.cur_rg_total = self.cached_md.row_groups[rg].num_rows as usize;
             return self.load_row_group_dense(rg);
         }
@@ -771,6 +881,9 @@ impl EmatArrowBatchReader {
     fn load_row_group(&mut self, rg: usize) -> DfResult<()> {
         // Σ.E5.6: use the cached metadata snapshot — no thrift re-parse.
         self.cur_rg_total = self.cached_md.row_groups[rg].num_rows as usize;
+        // Σ.E5 Phase 1.6: clear any per-RG filter bitmap left from a
+        // previous RG's selectivity-gate fallback.
+        self.cur_rg_filter_bitmap = None;
 
         // Σ.E5 (#516): late-mat path — when a filter is set, decode the
         // filter column to a bitmap, then masked-decode each projected
@@ -916,8 +1029,32 @@ impl EmatArrowBatchReader {
             let target = self.arrow_schema.field(i).data_type();
             arrays.push(slice_decoded(c, start, n, target));
         }
-        RecordBatch::try_new(self.arrow_schema.clone(), arrays)
-            .map_err(|e| ext(format!("RecordBatch::try_new: {e}")))
+        let batch = RecordBatch::try_new(self.arrow_schema.clone(), arrays)
+            .map_err(|e| ext(format!("RecordBatch::try_new: {e}")))?;
+
+        // Σ.E5 Phase 1.6: if a per-RG filter bitmap is present (set by
+        // the selectivity-gate fallback in load_row_group_masked),
+        // build a BooleanArray over the batch's window of the bitmap
+        // and apply Arrow's SIMD filter to the batch. Matches the
+        // pipeline shape FilterExec would have provided if pushdown
+        // were Inexact; with Exact pushdown, this is the only filter
+        // step in the plan for the pushed predicate.
+        if let Some(bm) = self.cur_rg_filter_bitmap.as_ref() {
+            // Build a BooleanBuffer that points into the bitmap with
+            // the batch's row offset. BooleanBuffer takes a Buffer +
+            // start bit + length, so we can window the bitmap without
+            // copying.
+            let bool_buf = datafusion::arrow::buffer::BooleanBuffer::new(
+                Buffer::from_slice_ref(bm),
+                start,
+                n,
+            );
+            let predicate_arr = arrow_array::BooleanArray::new(bool_buf, None);
+            let filtered = datafusion::arrow::compute::filter_record_batch(&batch, &predicate_arr)
+                .map_err(|e| ext(format!("filter_record_batch: {e}")))?;
+            return Ok(filtered);
+        }
+        Ok(batch)
     }
 }
 

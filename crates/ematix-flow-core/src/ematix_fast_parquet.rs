@@ -1183,22 +1183,20 @@ impl TableProvider for EmatixFastParquetTableProvider {
         // dense fast path (dict_views: Vec<u128> cache + 16-byte
         // gather per row). Pushdown accepted for BridgeFilter-shaped
         // filters on all reader variants.
-        // Σ.E5 per-filter Exact pushdown — Phase 1 attempt 2026-05-19
-        // verified-NEG. Declaring Exact for I32Range/StringEq/etc. on
-        // null-free cols + replacing the gate's drop-bitmap with
-        // `compact_decoded_column` produced geomean 0.945 vs 0.86
-        // baseline. Q01 +105%, Q03 +47%, Q05 +13%, Q08 +11%.
+        // Σ.E5 Phase 1.6 (2026-05-19, verified-NEG): per-batch filter
+        // infrastructure landed in emat_arrow_reader.rs (`slice_batch`
+        // applies the bitmap via Arrow's SIMD filter when
+        // `cur_rg_filter_bitmap` is set). Bench gate failed: Q01 +77%
+        // because the BridgeFilter bitmap build runs SERIALLY while
+        // the no-pushdown path absorbs the filter col into the
+        // parallel projection decode. Geomean 0.86 → 0.88.
         //
-        // Root cause: the naive scalar compact loop runs ~3-5× slower
-        // than DataFusion's FilterExec which uses Arrow's SIMD-
-        // accelerated `filter` kernel. Trading FilterExec for the
-        // in-reader compact loses on wide projections (6 cols × 1M
-        // rows × 95% sel on Q01 → 30 ms of memcpy).
+        // Phase 1.7 (deferred): parallelize bitmap build alongside
+        // projection decode (spawn a thread for the filter col next
+        // to the projection cols), so Exact pushdown has no serial
+        // tail on high-sel filters.
         //
-        // Path forward: re-implement the compact via Arrow's filter
-        // kernel (or our own SIMD variant) before re-enabling Exact.
-        // See docs/PHASE_SIGMA_E5_PER_FILTER_EXACT.md §3 Phase 1
-        // bench-gate addendum.
+        // Pushdown stays Inexact for all shapes until Phase 1.7 lands.
         let _exact_unused = (&self.column_has_no_nulls, );
         Ok(filters
             .iter()
