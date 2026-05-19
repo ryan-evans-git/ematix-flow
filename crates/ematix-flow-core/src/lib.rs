@@ -32,6 +32,12 @@ pub mod ematix_fast_parquet;
 // for the Q1-shape workload. See
 // `docs/PHASE_SIGMA_E5_PARQUET_RS_ELIMINATION.md` §E5.1.
 pub mod emat_arrow_reader;
+// Σ.E5.6 scaffold: intra-RG page-streaming column decoders. The
+// trait + first concrete impl (Float64) — not yet wired into
+// EmatixFastParquetExec. Closes the architectural first-batch latency
+// gap diagnosed in Q19. See task #503 and
+// `project_q19_root_cause_orchestration.md`.
+pub mod emat_page_stream;
 // Σ.D1: `FusedFilterSumExec` physical operator for the simple
 // `Aggregate(SUM) over Filter(predicate)` plan shape — closes the
 // Q6 gap vs Polars (1.0 ms hand-written / 1.9 ms Polars / 5.96 ms
