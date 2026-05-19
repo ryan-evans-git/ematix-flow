@@ -842,6 +842,17 @@ fn build_streaming_partition_stream(
     let (tx, rx) = tokio::sync::mpsc::channel::<DfResult<RecordBatch>>(8);
     let path_buf = PathBuf::from(path);
 
+    // Σ.E5.6: opt-in dispatch to the page-streaming reader for A/B
+    // benching. EMAT_PAGE_STREAMING=1 swaps the burst-then-wait
+    // EmatArrowBatchReader for EmatPageStreamingReader (intra-RG
+    // page-streaming — first batch emerges after the slowest column's
+    // first page decodes, not after the full RG). Default = current
+    // behaviour; flipping the default depends on bench evidence.
+    let use_page_streaming = std::env::var("EMAT_PAGE_STREAMING")
+        .ok()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+
     tokio::task::spawn_blocking(move || {
         let file = match ematix_parquet_io::ParquetFile::open(&path_buf) {
             Ok(f) => f,
@@ -857,24 +868,40 @@ fn build_streaming_partition_stream(
             }
         };
 
-        let reader = match EmatArrowBatchReaderBuilder::new(file, schema)
-            .with_projection(projection)
-            .with_row_groups(row_groups)
-            .with_parallelism_budget(parallelism_budget)
-            .build()
-        {
-            Ok(r) => r,
-            Err(e) => {
-                let _ = tx.blocking_send(Err(DataFusionError::External(
-                    format!("EmatixFastParquetExec (streaming): build reader: {e}").into(),
-                )));
-                return;
+        if use_page_streaming {
+            use crate::emat_page_stream::EmatPageStreamingReader;
+            let reader = EmatPageStreamingReader::new(
+                file,
+                schema,
+                projection,
+                row_groups,
+                crate::emat_arrow_reader::DEFAULT_BATCH_SIZE,
+            );
+            for item in reader {
+                if tx.blocking_send(item).is_err() {
+                    return;
+                }
             }
-        };
-
-        for item in reader {
-            if tx.blocking_send(item).is_err() {
-                return; // consumer dropped
+        } else {
+            let reader = match EmatArrowBatchReaderBuilder::new(file, schema)
+                .with_projection(projection)
+                .with_row_groups(row_groups)
+                .with_parallelism_budget(parallelism_budget)
+                .build()
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = tx.blocking_send(Err(DataFusionError::External(
+                        format!("EmatixFastParquetExec (streaming): build reader: {e}")
+                            .into(),
+                    )));
+                    return;
+                }
+            };
+            for item in reader {
+                if tx.blocking_send(item).is_err() {
+                    return;
+                }
             }
         }
     });

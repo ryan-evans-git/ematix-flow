@@ -33,14 +33,19 @@
 
 use std::sync::Arc;
 
-use arrow_array::{ArrayRef, Float64Array};
+use arrow_array::builder::make_view;
+use arrow_array::{
+    ArrayRef, Date32Array, Float64Array, Int32Array, Int64Array, StringViewArray,
+};
 use arrow_schema::DataType;
-use datafusion::arrow::buffer::{Buffer, ScalarBuffer};
+use datafusion::arrow::buffer::{Buffer, NullBuffer, ScalarBuffer};
 use datafusion::error::{DataFusionError, Result as DfResult};
 
 use ematix_parquet_codec::compression::{decompress_snappy_into, decompress_zstd_into};
 use ematix_parquet_codec::dict::decode_rle_dictionary_into;
-use ematix_parquet_codec::plain::decode_plain_f64;
+use ematix_parquet_codec::plain::{
+    decode_plain_byte_array, decode_plain_f64, decode_plain_i32, decode_plain_i64,
+};
 use ematix_parquet_format::types::{CompressionCodec, Encoding};
 use ematix_parquet_io::{PageWalker, ParquetFile};
 
@@ -96,24 +101,81 @@ pub trait ColumnPageStream: Send {
     fn make_array(&self, start: usize, n: usize, target: &DataType) -> ArrayRef;
 }
 
-/// Page-streaming decoder for `Float64` (the simplest type to
-/// prototype against). Pattern mirrors the eager `decode_dict_chunk_typed`
-/// in `emat_arrow_reader` — same compression + dict + RLE flow, but
-/// the data-page loop is replaced with a single-step `decode_next_page`.
-pub struct Float64PageStream {
+/// Compact trait describing how a primitive type is PLAIN-decoded
+/// from parquet bytes and how a slice of decoded values is wrapped
+/// into an Arrow array.
+///
+/// One impl per supported primitive: `i32` (also covers `Date32`),
+/// `i64`, `f64`. The trait lets `PrimitivePageStream<T>` be one
+/// type-parametric struct instead of three near-identical copies.
+pub trait PrimitiveType: Copy + Send + 'static {
+    /// Identifier for error messages.
+    const NAME: &'static str;
+
+    /// PLAIN-decode a page's worth of bytes into a `Vec<Self>`.
+    fn decode_plain(bytes: &[u8]) -> DfResult<Vec<Self>>;
+
+    /// Build an Arrow array from a contiguous slice. `target`
+    /// distinguishes physically-identical types (e.g. `Int32` vs
+    /// `Date32`).
+    fn make_array(slice: &[Self], target: &DataType) -> ArrayRef;
+}
+
+impl PrimitiveType for i32 {
+    const NAME: &'static str = "i32";
+    fn decode_plain(bytes: &[u8]) -> DfResult<Vec<Self>> {
+        decode_plain_i32(bytes).map_err(|e| ext(format!("plain i32: {e}")))
+    }
+    fn make_array(slice: &[Self], target: &DataType) -> ArrayRef {
+        let buf = Buffer::from_slice_ref(slice);
+        let scalar = ScalarBuffer::<i32>::new(buf, 0, slice.len());
+        match target {
+            DataType::Date32 => Arc::new(Date32Array::new(scalar, None)),
+            _ => Arc::new(Int32Array::new(scalar, None)),
+        }
+    }
+}
+
+impl PrimitiveType for i64 {
+    const NAME: &'static str = "i64";
+    fn decode_plain(bytes: &[u8]) -> DfResult<Vec<Self>> {
+        decode_plain_i64(bytes).map_err(|e| ext(format!("plain i64: {e}")))
+    }
+    fn make_array(slice: &[Self], _target: &DataType) -> ArrayRef {
+        let buf = Buffer::from_slice_ref(slice);
+        let scalar = ScalarBuffer::<i64>::new(buf, 0, slice.len());
+        Arc::new(Int64Array::new(scalar, None))
+    }
+}
+
+impl PrimitiveType for f64 {
+    const NAME: &'static str = "f64";
+    fn decode_plain(bytes: &[u8]) -> DfResult<Vec<Self>> {
+        decode_plain_f64(bytes).map_err(|e| ext(format!("plain f64: {e}")))
+    }
+    fn make_array(slice: &[Self], _target: &DataType) -> ArrayRef {
+        let buf = Buffer::from_slice_ref(slice);
+        let scalar = ScalarBuffer::<f64>::new(buf, 0, slice.len());
+        Arc::new(Float64Array::new(scalar, None))
+    }
+}
+
+/// Page-streaming decoder for fixed-size primitives. Pattern mirrors
+/// the eager `decode_dict_chunk_typed` in `emat_arrow_reader` — same
+/// compression + dict + RLE flow, but the data-page loop is replaced
+/// with a single-step `decode_next_page`.
+pub struct PrimitivePageStream<T: PrimitiveType> {
     total: usize,
     codec: CompressionCodec,
     /// Owned page-chunk bytes. The walker borrows from this.
     chunk: Vec<u8>,
-    /// Walker position into `chunk`. Stored as a byte offset so we
-    /// can drop & recreate the walker — `PageWalker`'s lifetime is
-    /// tied to a `&[u8]` borrow.
+    /// Walker position into `chunk` as a byte offset (re-created each
+    /// call since `PageWalker`'s lifetime is tied to a `&[u8]` borrow).
     walker_pos: usize,
     /// Decoded dict (if the column has a dict page). Empty otherwise.
-    dict: Vec<f64>,
-    /// Decoded values so far. Grows by one page's worth per
-    /// `decode_next_page` call.
-    out: Vec<f64>,
+    dict: Vec<T>,
+    /// Decoded values so far. Grows by one page's worth per call.
+    out: Vec<T>,
     /// Reusable decompression buffer.
     scratch: Vec<u8>,
     /// True once the first page has been consumed (the first page is
@@ -122,7 +184,7 @@ pub struct Float64PageStream {
     first_page_consumed: bool,
 }
 
-impl Float64PageStream {
+impl<T: PrimitiveType> PrimitivePageStream<T> {
     pub fn new(file: &ParquetFile, rg: usize, col: usize) -> DfResult<Self> {
         let md = file.metadata().map_err(|e| ext(format!("metadata: {e}")))?;
         let cm = md.row_groups[rg].columns[col]
@@ -153,7 +215,7 @@ impl Float64PageStream {
     }
 }
 
-impl ColumnPageStream for Float64PageStream {
+impl<T: PrimitiveType> ColumnPageStream for PrimitivePageStream<T> {
     fn total_rows(&self) -> usize {
         self.total
     }
@@ -167,10 +229,6 @@ impl ColumnPageStream for Float64PageStream {
             return Ok(0);
         }
 
-        // Rebuild a walker that resumes at `walker_pos`. PageWalker
-        // borrows from `chunk` so it must be re-created each call;
-        // the chunk bytes are stable across calls so this is safe and
-        // amounts to a struct re-init.
         let mut walker = PageWalker::new(&self.chunk[self.walker_pos..]);
         let before = self.out.len();
 
@@ -179,9 +237,7 @@ impl ColumnPageStream for Float64PageStream {
             .map_err(|e| ext(format!("next_page: {e}")))?
             .ok_or_else(|| ext("chunk ended before num_values"))?;
 
-        // Capture the byte advance so we can resume from the next page
-        // on the subsequent call. PageWalker doesn't expose its position
-        // directly; we infer it from the body slice end relative to chunk.
+        // Capture byte advance so we can resume on the next call.
         let body_end = body.as_ptr() as usize - self.chunk.as_ptr() as usize + body.len();
         self.walker_pos = body_end;
 
@@ -190,12 +246,11 @@ impl ColumnPageStream for Float64PageStream {
         if !self.first_page_consumed {
             self.first_page_consumed = true;
             if hdr.dictionary_page_header.is_some() {
-                // Dict page: decode dict, return 0 rows (no row added yet).
-                self.dict = decode_plain_f64(&self.scratch)
-                    .map_err(|e| ext(format!("plain f64 dict: {e}")))?;
+                self.dict = T::decode_plain(&self.scratch)
+                    .map_err(|e| ext(format!("{} dict: {e}", T::NAME)))?;
                 return Ok(0);
             }
-            // First page is PLAIN data — fall through to data-page path.
+            // First page is PLAIN data — fall through.
         }
 
         let dph = hdr
@@ -206,31 +261,448 @@ impl ColumnPageStream for Float64PageStream {
         match dph.encoding {
             Encoding::RleDictionary | Encoding::PlainDictionary => {
                 decode_rle_dictionary_into(&self.scratch, &self.dict, n, &mut self.out)
-                    .map_err(|e| ext(format!("rle_dict f64: {e}")))?;
+                    .map_err(|e| ext(format!("rle_dict {}: {e}", T::NAME)))?;
             }
             Encoding::Plain => {
-                let mut vals = decode_plain_f64(&self.scratch)
-                    .map_err(|e| ext(format!("plain f64: {e}")))?;
+                let mut vals = T::decode_plain(&self.scratch)
+                    .map_err(|e| ext(format!("plain {}: {e}", T::NAME)))?;
                 vals.truncate(n);
                 self.out.extend(vals);
             }
             other => {
-                return Err(ext(format!("unexpected f64 data page encoding {other:?}")));
+                return Err(ext(format!(
+                    "unexpected {} data page encoding {other:?}",
+                    T::NAME
+                )));
             }
         }
 
         Ok(self.out.len() - before)
     }
 
-    fn make_array(&self, start: usize, n: usize, _target: &DataType) -> ArrayRef {
-        // Zero-copy slice of the decoded buffer. The Vec stays alive
-        // on the stream; we hand out an Arc-wrapped Float64Array
-        // backed by a Buffer slice of the existing storage.
+    fn make_array(&self, start: usize, n: usize, target: &DataType) -> ArrayRef {
         debug_assert!(start + n <= self.out.len());
-        let slice = &self.out[start..start + n];
-        let buf = Buffer::from_slice_ref(slice);
-        let scalar = ScalarBuffer::<f64>::new(buf, 0, n);
-        Arc::new(Float64Array::new(scalar, None))
+        T::make_array(&self.out[start..start + n], target)
+    }
+}
+
+/// Convenience aliases matching the existing `DecodedColumn` variants.
+pub type Int32PageStream = PrimitivePageStream<i32>;
+pub type Int64PageStream = PrimitivePageStream<i64>;
+pub type Float64PageStream = PrimitivePageStream<f64>;
+
+// ============================================================
+// StringView page stream
+// ============================================================
+
+/// Page-streaming decoder for `BYTE_ARRAY → StringViewArray`. Mirrors
+/// `decode_byte_array_to_string_view_slow` in `emat_arrow_reader` but
+/// yields page-by-page instead of decode-all-at-once.
+///
+/// Two encoding paths, both handled uniformly via `PageWalker`:
+///   * Dict-encoded chunks: first page is the DictionaryPage (decoded
+///     into `dict_offsets`/`dict_lengths` + stashed as
+///     `data_buffers[0]`); subsequent data pages emit views that
+///     reference `data_buffers[0]`.
+///   * PLAIN data pages: each page's decompressed bytes become an
+///     owned `Buffer` appended to `data_buffers`; views encode
+///     `(block_id = data_buffers.len() - 1, offset_in_page)`.
+///
+/// The multi-buffer layout (Σ.E5 multi-buffer commit 9cdf890) makes
+/// per-page zero-copy hand-off natural — no coalescing memcpy needed.
+pub struct StringViewPageStream {
+    total: usize,
+    codec: CompressionCodec,
+    chunk: Vec<u8>,
+    walker_pos: usize,
+    /// Per-dict-entry offsets/lengths into `data_buffers[0]` (only
+    /// populated when the column chunk has a DictionaryPage).
+    dict_offsets: Vec<u32>,
+    dict_lengths: Vec<u32>,
+    /// Per-page backing buffers (Σ.E5 multi-buffer layout).
+    data_buffers: Vec<Buffer>,
+    /// Views (16-byte each). Grown by one page's worth per call.
+    views: Vec<u128>,
+    first_page_consumed: bool,
+}
+
+impl StringViewPageStream {
+    pub fn new(file: &ParquetFile, rg: usize, col: usize) -> DfResult<Self> {
+        let md = file.metadata().map_err(|e| ext(format!("metadata: {e}")))?;
+        let cm = md.row_groups[rg].columns[col]
+            .meta_data
+            .as_ref()
+            .ok_or_else(|| ext("column missing meta_data"))?;
+        let total = cm.num_values as usize;
+        let codec = cm.codec;
+        let start = cm
+            .dictionary_page_offset
+            .filter(|&d| d < cm.data_page_offset)
+            .unwrap_or(cm.data_page_offset) as u64;
+        let length = cm.total_compressed_size as u64;
+        let chunk = file
+            .read_range(start, length)
+            .map_err(|e| ext(format!("read_range: {e}")))?;
+        Ok(Self {
+            total,
+            codec,
+            chunk,
+            walker_pos: 0,
+            dict_offsets: Vec::new(),
+            dict_lengths: Vec::new(),
+            data_buffers: Vec::new(),
+            views: Vec::with_capacity(total),
+            first_page_consumed: false,
+        })
+    }
+}
+
+impl ColumnPageStream for StringViewPageStream {
+    fn total_rows(&self) -> usize {
+        self.total
+    }
+
+    fn rows_decoded(&self) -> usize {
+        self.views.len()
+    }
+
+    fn decode_next_page(&mut self) -> DfResult<usize> {
+        if self.views.len() >= self.total {
+            return Ok(0);
+        }
+
+        let mut walker = PageWalker::new(&self.chunk[self.walker_pos..]);
+        let before = self.views.len();
+
+        let (hdr, body) = walker
+            .next_page()
+            .map_err(|e| ext(format!("next_page: {e}")))?
+            .ok_or_else(|| ext("chunk ended before num_values"))?;
+        let body_end = body.as_ptr() as usize - self.chunk.as_ptr() as usize + body.len();
+        self.walker_pos = body_end;
+
+        // Handle the first page (dict or PLAIN data) specially.
+        if !self.first_page_consumed {
+            self.first_page_consumed = true;
+            if hdr.dictionary_page_header.is_some() {
+                // Decompress into an owned buffer; record per-entry
+                // offsets/lengths; push the buffer as data_buffers[0].
+                let mut dict_scratch: Vec<u8> = Vec::with_capacity(body.len() * 2);
+                decompress_into(self.codec, body, &mut dict_scratch)?;
+                let entries = decode_plain_byte_array(&dict_scratch)
+                    .map_err(|e| ext(format!("plain byte_array dict: {e}")))?;
+                let base = dict_scratch.as_ptr() as usize;
+                for s in &entries {
+                    let off = (s.as_ptr() as usize - base) as u32;
+                    self.dict_offsets.push(off);
+                    self.dict_lengths.push(s.len() as u32);
+                }
+                self.data_buffers.push(Buffer::from_vec(dict_scratch));
+                return Ok(0);
+            }
+            // First page is PLAIN data: fall through to the PLAIN arm.
+        }
+
+        let dph = hdr
+            .data_page_header
+            .as_ref()
+            .ok_or_else(|| ext("expected v1 data page"))?;
+        let n = dph.num_values as usize;
+        match dph.encoding {
+            Encoding::RleDictionary | Encoding::PlainDictionary => {
+                let mut idx_scratch: Vec<u8> = Vec::with_capacity(body.len() * 2);
+                decompress_into(self.codec, body, &mut idx_scratch)?;
+                let idxs =
+                    ematix_parquet_codec::dict::decode_rle_dictionary_indices(&idx_scratch, n)
+                        .map_err(|e| ext(format!("rle_dict_indices: {e}")))?;
+                let dict_len = self.dict_offsets.len();
+                let dict_bytes: &[u8] = self.data_buffers[0].as_slice();
+                let dict_block = 0u32;
+                for &i in &idxs {
+                    let i = i as usize;
+                    if i >= dict_len {
+                        return Err(ext(format!("dict idx {i} out of range {dict_len}")));
+                    }
+                    let off = self.dict_offsets[i];
+                    let len = self.dict_lengths[i];
+                    let bytes = &dict_bytes[off as usize..(off + len) as usize];
+                    self.views.push(make_view(bytes, dict_block, off));
+                }
+            }
+            Encoding::Plain => {
+                let mut page_buf: Vec<u8> = Vec::with_capacity(body.len() * 2);
+                decompress_into(self.codec, body, &mut page_buf)?;
+                let block_id = self.data_buffers.len() as u32;
+                // Inline single-pass parse — same shape as
+                // `plain_byte_array_to_views_in_place` in
+                // `emat_arrow_reader`.
+                let mut off = 0usize;
+                let page_len = page_buf.len();
+                for i in 0..n {
+                    if off + 4 > page_len {
+                        return Err(ext(format!(
+                            "plain byte_array: truncated length prefix at {i}/{n}"
+                        )));
+                    }
+                    let len = u32::from_le_bytes([
+                        page_buf[off],
+                        page_buf[off + 1],
+                        page_buf[off + 2],
+                        page_buf[off + 3],
+                    ]) as usize;
+                    off += 4;
+                    if off + len > page_len {
+                        return Err(ext(format!(
+                            "plain byte_array: value {i}/{n} len {len} overruns page"
+                        )));
+                    }
+                    let bytes = &page_buf[off..off + len];
+                    self.views.push(make_view(bytes, block_id, off as u32));
+                    off += len;
+                }
+                self.data_buffers.push(Buffer::from_vec(page_buf));
+            }
+            other => {
+                return Err(ext(format!(
+                    "unexpected byte_array data page encoding {other:?}"
+                )));
+            }
+        }
+
+        Ok(self.views.len() - before)
+    }
+
+    fn make_array(&self, start: usize, n: usize, _target: &DataType) -> ArrayRef {
+        debug_assert!(start + n <= self.views.len());
+        let buf = Buffer::from_slice_ref(&self.views[start..start + n]);
+        let views_buf = ScalarBuffer::<u128>::new(buf, 0, n);
+        // Share all backing data buffers (Arc bump). Each page's
+        // buffer is referenced by potentially many slices; that's
+        // fine — StringViewArray supports it.
+        let arr = StringViewArray::try_new(views_buf, self.data_buffers.clone(), None::<NullBuffer>)
+            .expect("StringViewArray::try_new on internally-built views");
+        Arc::new(arr)
+    }
+}
+
+// ============================================================
+// Streaming reader (driver)
+// ============================================================
+
+use std::sync::mpsc;
+
+use arrow_array::RecordBatch;
+use arrow_schema::SchemaRef;
+
+/// Per-column decoder worker (parallel page-streaming).
+///
+/// Each worker owns one `ColumnPageStream` on a dedicated OS thread.
+/// Communication is request-reply: emit thread sends `(start, n)`;
+/// worker decodes pages until `rows_decoded >= start+n`, then replies
+/// with the sliced `ArrayRef`. Pre-decoding for the next batch
+/// happens while emit thread assembles the current batch — that's
+/// where the streaming win is.
+struct ColumnWorker {
+    request_tx: mpsc::Sender<(usize, usize)>,
+    reply_rx: mpsc::Receiver<DfResult<ArrayRef>>,
+    // JoinHandle dropped on Drop; worker exits when request_tx is
+    // dropped (recv returns Err).
+    _handle: std::thread::JoinHandle<()>,
+}
+
+impl ColumnWorker {
+    fn spawn(mut stream: Box<dyn ColumnPageStream>, target: DataType, col_label: String) -> Self {
+        let (req_tx, req_rx) = mpsc::channel::<(usize, usize)>();
+        let (rep_tx, rep_rx) = mpsc::channel::<DfResult<ArrayRef>>();
+        let handle = std::thread::Builder::new()
+            .name(format!("emat-page-stream-{col_label}"))
+            .spawn(move || {
+                while let Ok((start, n)) = req_rx.recv() {
+                    let result = (|| -> DfResult<ArrayRef> {
+                        let target_rows = start + n;
+                        while stream.rows_decoded() < target_rows
+                            && stream.rows_decoded() < stream.total_rows()
+                        {
+                            stream.decode_next_page()?;
+                        }
+                        if stream.rows_decoded() < target_rows {
+                            return Err(ext(format!(
+                                "column decoder ran out: need {target_rows}, have {}",
+                                stream.rows_decoded()
+                            )));
+                        }
+                        Ok(stream.make_array(start, n, &target))
+                    })();
+                    if rep_tx.send(result).is_err() {
+                        return;
+                    }
+                }
+            })
+            .expect("spawn column decoder thread");
+        Self {
+            request_tx: req_tx,
+            reply_rx: rep_rx,
+            _handle: handle,
+        }
+    }
+}
+
+/// Σ.E5.6 parallel page-streaming reader.
+///
+/// Each projected column runs on its own OS thread, decoding pages
+/// independently of the others. The emit thread sends a per-batch
+/// slice request `(start, n)` to every worker and awaits replies.
+/// Workers can pre-decode pages for the *next* batch while emit
+/// thread is busy assembling the current one — the streaming win.
+///
+/// First-batch latency: roughly `max(first_page_decode_time)` across
+/// columns (workers run in parallel), vs the eager
+/// `EmatArrowBatchReader` which pays `max(full_column_decode_time)`.
+/// For Q19 lineitem (6 cols, decode times 1-5 ms/RG each) this
+/// should drop first-batch latency by ~3-5×.
+///
+/// Concurrency model: one OS thread per column for the lifetime of
+/// the reader (spawn per RG; emit thread is the calling
+/// `spawn_blocking` worker). Total thread count for an N-partition
+/// query = N_outer + N_outer × N_cols. For Q1 SF=1 (6 partitions ×
+/// 7 cols on 14 cores) that's 48 threads — heavier than the eager
+/// path's 12-thread bound, but workers spend most of their time
+/// blocked on Snappy / mpsc::recv so the effective active count
+/// stays manageable. If this turns out to oversubscribe, the next
+/// step is to share a thread pool across partitions.
+pub struct EmatPageStreamingReader {
+    file: ParquetFile,
+    arrow_schema: SchemaRef,
+    projection: Vec<usize>,
+    row_groups: Vec<usize>,
+    batch_size: usize,
+
+    cur_rg_idx: usize,
+    cur_rg_workers: Option<Vec<ColumnWorker>>,
+    cur_rg_total: usize,
+    cur_rg_row: usize,
+}
+
+impl EmatPageStreamingReader {
+    pub fn new(
+        file: ParquetFile,
+        arrow_schema: SchemaRef,
+        projection: Vec<usize>,
+        row_groups: Vec<usize>,
+        batch_size: usize,
+    ) -> Self {
+        Self {
+            file,
+            arrow_schema,
+            projection,
+            row_groups,
+            batch_size,
+            cur_rg_idx: 0,
+            cur_rg_workers: None,
+            cur_rg_total: 0,
+            cur_rg_row: 0,
+        }
+    }
+
+    pub fn schema(&self) -> &SchemaRef {
+        &self.arrow_schema
+    }
+
+    fn open_row_group(&mut self, rg: usize) -> DfResult<()> {
+        let md = self
+            .file
+            .metadata()
+            .map_err(|e| ext(format!("metadata: {e}")))?;
+        let row_group = &md.row_groups[rg];
+        self.cur_rg_total = row_group.num_rows as usize;
+        drop(md);
+
+        // Drop previous workers (closes their request_tx → workers
+        // exit + threads join).
+        self.cur_rg_workers = None;
+
+        let mut workers: Vec<ColumnWorker> = Vec::with_capacity(self.projection.len());
+        for (i, &leaf) in self.projection.iter().enumerate() {
+            let target = self.arrow_schema.field(i).data_type().clone();
+            let stream: Box<dyn ColumnPageStream> = match &target {
+                DataType::Int32 | DataType::Date32 => {
+                    Box::new(Int32PageStream::new(&self.file, rg, leaf)?)
+                }
+                DataType::Int64 => Box::new(Int64PageStream::new(&self.file, rg, leaf)?),
+                DataType::Float64 => Box::new(Float64PageStream::new(&self.file, rg, leaf)?),
+                DataType::Utf8View => Box::new(StringViewPageStream::new(&self.file, rg, leaf)?),
+                other => {
+                    return Err(DataFusionError::NotImplemented(format!(
+                        "EmatPageStreamingReader: target type {other:?} not yet supported"
+                    )));
+                }
+            };
+            let label = format!("rg{rg}-col{i}");
+            workers.push(ColumnWorker::spawn(stream, target, label));
+        }
+        self.cur_rg_workers = Some(workers);
+        self.cur_rg_row = 0;
+        Ok(())
+    }
+
+    fn next_batch(&mut self) -> DfResult<Option<RecordBatch>> {
+        loop {
+            let need_new_rg =
+                self.cur_rg_workers.is_none() || self.cur_rg_row >= self.cur_rg_total;
+            if need_new_rg {
+                if self.cur_rg_idx >= self.row_groups.len() {
+                    self.cur_rg_workers = None;
+                    return Ok(None);
+                }
+                let rg = self.row_groups[self.cur_rg_idx];
+                self.cur_rg_idx += 1;
+                self.open_row_group(rg)?;
+                if self.cur_rg_total == 0 {
+                    continue;
+                }
+            }
+
+            let remaining = self.cur_rg_total - self.cur_rg_row;
+            let n = remaining.min(self.batch_size);
+            let start = self.cur_rg_row;
+
+            let workers = self
+                .cur_rg_workers
+                .as_ref()
+                .expect("cur_rg_workers set above");
+            // Fan out: send slice requests to every worker.
+            for w in workers.iter() {
+                w.request_tx
+                    .send((start, n))
+                    .map_err(|e| ext(format!("worker send: {e}")))?;
+            }
+            // Fan in: collect replies in column order.
+            let mut arrays: Vec<ArrayRef> = Vec::with_capacity(workers.len());
+            for w in workers.iter() {
+                let arr = w
+                    .reply_rx
+                    .recv()
+                    .map_err(|e| ext(format!("worker recv: {e}")))??;
+                arrays.push(arr);
+            }
+            self.cur_rg_row += n;
+            return Ok(Some(
+                RecordBatch::try_new(self.arrow_schema.clone(), arrays)
+                    .map_err(|e| ext(format!("RecordBatch::try_new: {e}")))?,
+            ));
+        }
+    }
+}
+
+impl Iterator for EmatPageStreamingReader {
+    type Item = DfResult<RecordBatch>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self.next_batch() {
+            Ok(Some(b)) => Some(Ok(b)),
+            Ok(None) => None,
+            Err(e) => Some(Err(e)),
+        }
     }
 }
 
@@ -242,7 +714,10 @@ impl ColumnPageStream for Float64PageStream {
 mod tests {
     use super::*;
     use arrow_array::Array;
-    use ematix_parquet_codec::write::{ColumnData, write_table_with_dict_to_path};
+    use arrow_schema::{Field, Schema};
+    use ematix_parquet_codec::write::{
+        ColumnData, write_table_to_path, write_table_with_dict_to_path,
+    };
     use ematix_parquet_format::types::CompressionCodec;
 
     fn tmp_parquet(name: &str) -> std::path::PathBuf {
@@ -337,5 +812,203 @@ mod tests {
         let mid = stream.make_array(5000, 100, &DataType::Float64);
         let mid_arr = mid.as_any().downcast_ref::<Float64Array>().unwrap();
         assert_eq!(mid_arr.value(0), (5000 % 50) as f64 * 0.5);
+    }
+
+    #[test]
+    fn int32_page_stream_yields_pages_then_terminates() {
+        let palette: Vec<i32> = (0..50).collect();
+        let n: usize = 10_000;
+        let i32s: Vec<i32> = (0..n).map(|i| palette[i % palette.len()]).collect();
+        let path = tmp_parquet("i32_page_stream");
+        write_table_with_dict_to_path(
+            &path,
+            &[("c_i32", ColumnData::I32(&i32s))],
+            CompressionCodec::Uncompressed,
+            usize::MAX,
+            &[true],
+        )
+        .unwrap();
+        let file = ParquetFile::open(&path).unwrap();
+        let mut stream = Int32PageStream::new(&file, 0, 0).unwrap();
+        let mut page_calls = 0;
+        while stream.rows_decoded() < n {
+            stream.decode_next_page().unwrap();
+            page_calls += 1;
+            assert!(page_calls <= 2048);
+        }
+        assert_eq!(stream.rows_decoded(), n);
+        assert!(page_calls >= 2);
+        let arr = stream.make_array(0, 100, &DataType::Int32);
+        let i32_arr = arr.as_any().downcast_ref::<Int32Array>().unwrap();
+        for i in 0..100 {
+            assert_eq!(i32_arr.value(i), (i % 50) as i32);
+        }
+        // Date32 dispatch.
+        let date_arr = stream.make_array(0, 10, &DataType::Date32);
+        assert_eq!(date_arr.data_type(), &DataType::Date32);
+    }
+
+    #[test]
+    fn string_view_page_stream_dict_encoded() {
+        // Dict-encoded byte_array column. Streams as: dict page →
+        // index pages, with views referencing data_buffers[0].
+        let palette: Vec<&[u8]> = vec![
+            b"apple", b"banana", b"cherry", b"date", b"elderberry",
+            b"fig", b"grape", b"honeydew",
+        ];
+        let n: usize = 10_000;
+        let rows: Vec<&[u8]> = (0..n).map(|i| palette[i % palette.len()]).collect();
+        let path = tmp_parquet("svps_dict");
+        write_table_with_dict_to_path(
+            &path,
+            &[("s", ColumnData::ByteArray(&rows))],
+            CompressionCodec::Uncompressed,
+            usize::MAX,
+            &[true],
+        )
+        .unwrap();
+        let file = ParquetFile::open(&path).unwrap();
+        let mut stream = StringViewPageStream::new(&file, 0, 0).unwrap();
+        let mut page_calls = 0;
+        while stream.rows_decoded() < n {
+            stream.decode_next_page().unwrap();
+            page_calls += 1;
+            assert!(page_calls <= 2048);
+        }
+        assert_eq!(stream.rows_decoded(), n);
+        assert!(page_calls >= 2, "got {page_calls} pages");
+        let arr = stream.make_array(0, 200, &DataType::Utf8View);
+        let sv = arr.as_any().downcast_ref::<StringViewArray>().unwrap();
+        for i in 0..200 {
+            let s = std::str::from_utf8(sv.value(i).as_bytes()).unwrap();
+            let expected = std::str::from_utf8(palette[i % palette.len()]).unwrap();
+            assert_eq!(s, expected, "row {i}");
+        }
+    }
+
+    #[test]
+    fn string_view_page_stream_plain_encoded() {
+        // PLAIN-encoded byte_array column (no dict). Each data page
+        // gets its own backing buffer; views encode the page block id.
+        // Force PLAIN by using high-entropy unique strings + dict
+        // opt-out.
+        let n: usize = 10_000;
+        let strings: Vec<String> = (0..n)
+            .map(|i| format!("unique_value_with_padding_for_size_{i:010}"))
+            .collect();
+        let rows: Vec<&[u8]> = strings.iter().map(|s| s.as_bytes()).collect();
+        let path = tmp_parquet("svps_plain");
+        write_table_with_dict_to_path(
+            &path,
+            &[("s", ColumnData::ByteArray(&rows))],
+            CompressionCodec::Uncompressed,
+            usize::MAX,
+            &[false], // dict OFF — force PLAIN
+        )
+        .unwrap();
+        let file = ParquetFile::open(&path).unwrap();
+        let mut stream = StringViewPageStream::new(&file, 0, 0).unwrap();
+        while stream.rows_decoded() < n {
+            stream.decode_next_page().unwrap();
+        }
+        assert_eq!(stream.rows_decoded(), n);
+        let arr = stream.make_array(0, 100, &DataType::Utf8View);
+        let sv = arr.as_any().downcast_ref::<StringViewArray>().unwrap();
+        for i in 0..100 {
+            let s = std::str::from_utf8(sv.value(i).as_bytes()).unwrap();
+            assert_eq!(s, strings[i], "row {i}");
+        }
+    }
+
+    /// End-to-end reader test: 3-column mixed-type RG decoded
+    /// through the streaming reader. Verifies that batches arrive
+    /// correctly, all 3 column types interleave, and the row counts
+    /// sum to the file total.
+    #[test]
+    fn streaming_reader_round_trips_mixed_types() {
+        let path = tmp_parquet("streaming_reader_mixed");
+        let n: usize = 50_000;
+        let i32s: Vec<i32> = (0..n as i32).collect();
+        let f64s: Vec<f64> = (0..n).map(|x| x as f64 * 0.5).collect();
+        let palette: Vec<&[u8]> = vec![b"red", b"green", b"blue", b"yellow"];
+        let strs: Vec<&[u8]> = (0..n).map(|i| palette[i % palette.len()]).collect();
+        write_table_to_path(
+            &path,
+            &[
+                ("c_i32", ColumnData::I32(&i32s)),
+                ("c_f64", ColumnData::F64(&f64s)),
+                ("c_str", ColumnData::ByteArray(&strs)),
+            ],
+            CompressionCodec::Uncompressed,
+        )
+        .unwrap();
+
+        let schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("c_i32", DataType::Int32, false),
+            Field::new("c_f64", DataType::Float64, false),
+            Field::new("c_str", DataType::Utf8View, false),
+        ]));
+
+        let file = ParquetFile::open(&path).unwrap();
+        let reader = EmatPageStreamingReader::new(file, schema, vec![0, 1, 2], vec![0], 8192);
+        let batches: Vec<RecordBatch> = reader.map(|b| b.unwrap()).collect();
+        let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, n);
+        // Multiple batches (batch_size=8192 vs 50K rows → ≥ 6 batches).
+        assert!(batches.len() >= 6, "got {} batches", batches.len());
+
+        // Spot-check the first batch.
+        let first = &batches[0];
+        assert_eq!(first.num_columns(), 3);
+        let i = first.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+        let f = first
+            .column(1)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        let s = first
+            .column(2)
+            .as_any()
+            .downcast_ref::<StringViewArray>()
+            .unwrap();
+        assert_eq!(i.value(0), 0);
+        assert_eq!(f.value(0), 0.0);
+        assert_eq!(s.value(0), "red");
+        assert_eq!(i.value(3), 3);
+        assert_eq!(
+            std::str::from_utf8(s.value(3).as_bytes()).unwrap(),
+            std::str::from_utf8(palette[3]).unwrap()
+        );
+    }
+
+    #[test]
+    fn int64_page_stream_yields_pages_then_terminates() {
+        let palette: Vec<i64> = (0..50).map(|x| x * 1_000_000_000_000i64).collect();
+        let n: usize = 10_000;
+        let i64s: Vec<i64> = (0..n).map(|i| palette[i % palette.len()]).collect();
+        let path = tmp_parquet("i64_page_stream");
+        write_table_with_dict_to_path(
+            &path,
+            &[("c_i64", ColumnData::I64(&i64s))],
+            CompressionCodec::Uncompressed,
+            usize::MAX,
+            &[true],
+        )
+        .unwrap();
+        let file = ParquetFile::open(&path).unwrap();
+        let mut stream = Int64PageStream::new(&file, 0, 0).unwrap();
+        let mut page_calls = 0;
+        while stream.rows_decoded() < n {
+            stream.decode_next_page().unwrap();
+            page_calls += 1;
+            assert!(page_calls <= 2048);
+        }
+        assert_eq!(stream.rows_decoded(), n);
+        assert!(page_calls >= 2);
+        let arr = stream.make_array(0, 100, &DataType::Int64);
+        let i64_arr = arr.as_any().downcast_ref::<Int64Array>().unwrap();
+        for i in 0..100 {
+            assert_eq!(i64_arr.value(i), (i % 50) as i64 * 1_000_000_000_000i64);
+        }
     }
 }
