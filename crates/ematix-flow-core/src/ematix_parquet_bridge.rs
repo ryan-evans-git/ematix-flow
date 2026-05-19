@@ -693,6 +693,34 @@ pub fn filter_byte_array_to_bitmap(
     Ok((bitmap, total))
 }
 
+/// Σ.E5 #518: build a row bitmap from a FLOAT64 column. Uses dense
+/// decode + per-row predicate eval. Cheap because the predicate is
+/// usually a small range (Q06 `l_quantity < 24`, Q19 `l_quantity
+/// BETWEEN 1 AND 30`) and the column is fixed-width 8-byte numeric.
+pub fn filter_f64_column_to_bitmap_dense(
+    path: &std::path::Path,
+    rg: usize,
+    col: usize,
+    predicate: impl Fn(f64) -> bool,
+) -> DfResult<(Vec<u8>, usize)> {
+    let file = ParquetFile::open(path).map_err(|e| ext(format!("ParquetFile::open: {e}")))?;
+    let md = file.metadata().map_err(|e| ext(format!("metadata: {e}")))?;
+    let cm = md.row_groups[rg].columns[col]
+        .meta_data
+        .as_ref()
+        .ok_or_else(|| ext("column missing meta_data"))?;
+    let total = cm.num_values as usize;
+    let all_ones = vec![0xFFu8; total.div_ceil(8)];
+    let values = masked_decode_f64(&file, rg, col, &all_ones)?;
+    let mut bitmap = vec![0u8; total.div_ceil(8)];
+    for (row, &v) in values.iter().enumerate() {
+        if predicate(v) {
+            bitmap[row >> 3] |= 1 << (row & 7);
+        }
+    }
+    Ok((bitmap, total))
+}
+
 /// Σ.E5: dense fallback for BYTE_ARRAY bitmap filter. Used when the
 /// chunk isn't dict-encoded (PLAIN-only) — `o_comment`-style
 /// high-cardinality columns. Decodes every row and applies the

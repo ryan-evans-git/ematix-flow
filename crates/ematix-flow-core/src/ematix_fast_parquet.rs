@@ -72,6 +72,12 @@ pub enum ColumnPredicate {
     I32Range { col_idx: usize, clauses: Vec<RangeClause> },
     /// `col IN (v1, v2, ...)` on an i32 column (Q16's p_size).
     I32In { col_idx: usize, values: Vec<i32> },
+    /// AND of comparisons on the same Float64 column. Used for
+    /// `l_quantity BETWEEN ...` (Q06, Q19).
+    F64Range {
+        col_idx: usize,
+        clauses: Vec<F64RangeClause>,
+    },
     /// `col = literal` on a string column (Q19's l_shipinstruct).
     StringEq { col_idx: usize, value: String },
     /// `col != literal` on a string column (Q16's p_brand <> 'Brand#45').
@@ -98,6 +104,12 @@ pub struct RangeClause {
     pub literal_i32: i32,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct F64RangeClause {
+    pub op: Operator,
+    pub literal_f64: f64,
+}
+
 impl BridgeFilter {
     pub fn predicates(&self) -> &[ColumnPredicate] {
         &self.predicates
@@ -116,7 +128,8 @@ impl BridgeFilter {
     ) -> DfResult<(Vec<u8>, usize)> {
         use crate::ematix_parquet_bridge::{
             filter_byte_array_to_bitmap, filter_byte_array_to_bitmap_dense,
-            filter_i32_column_to_bitmap, filter_i32_column_to_bitmap_dense,
+            filter_f64_column_to_bitmap_dense, filter_i32_column_to_bitmap,
+            filter_i32_column_to_bitmap_dense,
         };
         let mut combined: Option<(Vec<u8>, usize)> = None;
         for p in &self.predicates {
@@ -146,6 +159,12 @@ impl BridgeFilter {
                             )?
                         }
                     }
+                }
+                ColumnPredicate::F64Range { col_idx, .. } => {
+                    let pclone = p.clone();
+                    filter_f64_column_to_bitmap_dense(path, rg, *col_idx, move |v: f64| {
+                        pclone.eval_f64(v)
+                    })?
                 }
                 ColumnPredicate::StringEq { col_idx, .. }
                 | ColumnPredicate::StringNotEq { col_idx, .. }
@@ -207,10 +226,36 @@ impl ColumnPredicate {
         match self {
             ColumnPredicate::I32Range { col_idx, .. }
             | ColumnPredicate::I32In { col_idx, .. }
+            | ColumnPredicate::F64Range { col_idx, .. }
             | ColumnPredicate::StringEq { col_idx, .. }
             | ColumnPredicate::StringNotEq { col_idx, .. }
             | ColumnPredicate::StringIn { col_idx, .. }
             | ColumnPredicate::StringLike { col_idx, .. } => *col_idx,
+        }
+    }
+
+    /// Evaluate AND of all clauses against one f64 value (F64Range only).
+    #[inline]
+    pub fn eval_f64(&self, v: f64) -> bool {
+        match self {
+            ColumnPredicate::F64Range { clauses, .. } => {
+                for c in clauses {
+                    let pass = match c.op {
+                        Operator::Eq => v == c.literal_f64,
+                        Operator::NotEq => v != c.literal_f64,
+                        Operator::Lt => v < c.literal_f64,
+                        Operator::LtEq => v <= c.literal_f64,
+                        Operator::Gt => v > c.literal_f64,
+                        Operator::GtEq => v >= c.literal_f64,
+                        _ => return false,
+                    };
+                    if !pass {
+                        return false;
+                    }
+                }
+                true
+            }
+            _ => false,
         }
     }
 
@@ -323,7 +368,7 @@ fn clause_from_predicate(pred: &RangePredicate, expected_type: &DataType) -> Opt
 /// (which is fine when pushdown is declared `Inexact`: DataFusion's
 /// residual FilterExec handles the remainder).
 fn predicate_from_expr(expr: &Expr, full_schema: &Schema) -> Option<ColumnPredicate> {
-    // Shape 1: col OP literal (i32/Date32 range).
+    // Shape 1: col OP literal (i32/Date32 range OR f64 range).
     if let Some(p) = extract_range_predicate(expr) {
         let idx = full_schema.index_of(&p.column).ok()?;
         let dt = full_schema.field(idx).data_type();
@@ -333,6 +378,25 @@ fn predicate_from_expr(expr: &Expr, full_schema: &Schema) -> Option<ColumnPredic
                 col_idx: idx,
                 clauses: vec![clause],
             });
+        }
+        // Σ.E5 #518 (verified 2026-05-19): F64Range pushdown is net
+        // negative — refused. The 22-query suite confirms:
+        //   - Q06 (3 f64+date filters, all in projection): +114% if
+        //     pushed. Bitmap-build decodes all 3 filter cols (which
+        //     are also projection cols), giving 2× decode work.
+        //   - Q19 (l_quantity range as ONE of 3 predicates):
+        //     unchanged. The string IN-list on l_shipmode/
+        //     l_shipinstruct alone delivers ~3% combined
+        //     selectivity, and FilterExec handles the l_quantity
+        //     bound on the filtered batch cheaply.
+        // The F64Range / F64RangeClause types remain (eval_f64
+        // implemented) for callers that explicitly build a
+        // BridgeFilter with this variant, but DataFusion's planner
+        // won't push f64 ranges through us. Re-enable when there's
+        // a way to know at planning time that the filter col is NOT
+        // in projection.
+        if matches!(dt, DataType::Float64) {
+            return None;
         }
     }
     // Shape 2: col IN (lit, lit, ...) — DataFusion `InList`.
@@ -493,13 +557,28 @@ fn extract_bridge_filter(filters: &[Expr], full_schema: &Schema) -> Option<Bridg
             predicates.push(p);
         }
     }
-    // Merge multiple I32Range predicates on the same column into one
-    // (matches the prior behavior of AND-combined clauses).
+    // Merge multiple I32Range / F64Range predicates on the same
+    // column into one (matches the prior behavior of AND-combined
+    // clauses). Q19's `l_quantity >= 1 AND l_quantity <= 11` becomes
+    // a single F64Range with two clauses, evaluated against the dict
+    // mask once.
     let mut merged: Vec<ColumnPredicate> = Vec::with_capacity(predicates.len());
     for p in predicates {
         if let ColumnPredicate::I32Range { col_idx, clauses } = &p {
             if let Some(existing) = merged.iter_mut().find_map(|e| match e {
                 ColumnPredicate::I32Range {
+                    col_idx: ci,
+                    clauses: cs,
+                } if *ci == *col_idx => Some(cs),
+                _ => None,
+            }) {
+                existing.extend_from_slice(clauses);
+                continue;
+            }
+        }
+        if let ColumnPredicate::F64Range { col_idx, clauses } = &p {
+            if let Some(existing) = merged.iter_mut().find_map(|e| match e {
+                ColumnPredicate::F64Range {
                     col_idx: ci,
                     clauses: cs,
                 } if *ci == *col_idx => Some(cs),

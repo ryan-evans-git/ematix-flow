@@ -515,21 +515,24 @@ impl EmatArrowBatchReader {
         let (bitmap, total) = filter.build_bitmap(&path, rg)?;
         let popcount: usize = bitmap.iter().map(|b| b.count_ones() as usize).sum();
 
-        // Σ.E5 #517: selectivity gate. Masked decode is a win only
-        // when the filter is selective enough that the skipped
+        // Σ.E5 #517-518: selectivity gate. Masked decode is a win
+        // only when the filter is selective enough that the skipped
         // decode work outweighs the bitmap-construction + per-row
-        // gather overhead. Empirically (SF=1): Q14 at ~1% selective
-        // wins, Q01 at ~95% selective regresses 10× because the
-        // filter col is decoded twice (once for the bitmap, once
-        // through DataFusion's residual FilterExec — when we fall
-        // back) but the gather work doesn't save anything.
+        // gather overhead.
         //
-        // Threshold: if popcount / total > 0.5, the filter is
-        // non-selective enough that we're better off doing the dense
-        // parallel decode and letting DataFusion's FilterExec
-        // re-evaluate the predicate. We pay the bitmap construction
-        // as waste, but it's just one numeric column (~ms).
-        if total > 0 && popcount * 2 > total {
+        // Empirically (SF=1):
+        //   Q14   ~3% selective  → masked wins (-32%)
+        //   Q19   ~2% selective  → masked wins (-20%)
+        //   Q03   ~10% selective → masked wins (-21%)
+        //   Q06   ~46% selective → masked LOSES (+114%) because
+        //                          F64Range double-decodes l_quantity
+        //   Q01   ~95% selective → falls back (correct).
+        //
+        // Threshold at popcount * 3 > total (fall back at >33%
+        // selectivity). Lower than the prior 50% gate; the gap
+        // between win and loss is narrow for mid-selectivity numeric
+        // filters and 33% is a conservative cut.
+        if total > 0 && popcount * 3 > total {
             // Fall through to the dense path. Drop the bitmap, the
             // dense path will scan everything; DataFusion's residual
             // FilterExec (the predicate is Inexact when we set it,
