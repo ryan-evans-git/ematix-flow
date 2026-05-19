@@ -847,7 +847,11 @@ fn build_streaming_partition_stream(
     // EmatArrowBatchReader for EmatPageStreamingReader (intra-RG
     // page-streaming — first batch emerges after the slowest column's
     // first page decodes, not after the full RG). Default = current
-    // behaviour; flipping the default depends on bench evidence.
+    // behaviour (eager). The hybrid auto-pick experiment showed
+    // streaming helps only when its lower latency outpaces its sync
+    // overhead — at SF=1 the geomean balanced near eager, so no
+    // automatic flip yet; left as a knob until the streaming reader
+    // shaves more per-page sync cost.
     let use_page_streaming = std::env::var("EMAT_PAGE_STREAMING")
         .ok()
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))

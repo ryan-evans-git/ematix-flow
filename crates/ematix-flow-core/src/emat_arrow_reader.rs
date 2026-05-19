@@ -491,10 +491,13 @@ impl EmatArrowBatchReader {
         // there's nothing to parallelise (single-column projection or
         // single-core machine).
         let cols: Vec<DecodedColumn> = if max_threads <= 1 || n_cols <= 1 {
+            let mut chunk_buf: Vec<u8> = Vec::new();
             let mut out = Vec::with_capacity(n_cols);
             for (proj_idx, &leaf) in projection.iter().enumerate() {
                 let target = schema.field(proj_idx).data_type();
-                out.push(decode_one_column(file, cached_md, rg, leaf, target)?);
+                out.push(decode_one_column(
+                    file, cached_md, &mut chunk_buf, rg, leaf, target,
+                )?);
             }
             out
         } else {
@@ -515,11 +518,18 @@ impl EmatArrowBatchReader {
                 // (column index handed out by `next.fetch_add`), so we
                 // collect the per-thread results and merge them after
                 // join. No interior mutability across threads.
+                //
+                // Σ.E5.6: each thread also owns one `chunk_buf` —
+                // reused across every column it decodes. Eliminates
+                // ~half the per-call ~1 MB `vec![0u8; len]` +
+                // `madvise(MADV_DONTNEED)` churn the profiler flagged
+                // (1008 madvise samples / ~12% of decode CPU).
                 let mut handles = Vec::with_capacity(max_threads);
                 for _ in 0..max_threads {
                     let next = &next;
                     handles.push(s.spawn(move || -> Vec<(usize, DfResult<DecodedColumn>)> {
                         let mut local: Vec<(usize, DfResult<DecodedColumn>)> = Vec::new();
+                        let mut chunk_buf: Vec<u8> = Vec::new();
                         loop {
                             let i = next.fetch_add(1, Ordering::Relaxed);
                             if i >= n_cols {
@@ -527,7 +537,12 @@ impl EmatArrowBatchReader {
                             }
                             let leaf = projection[i];
                             let target = schema.field(i).data_type();
-                            local.push((i, decode_one_column(file, cached_md, rg, leaf, target)));
+                            local.push((
+                                i,
+                                decode_one_column(
+                                    file, cached_md, &mut chunk_buf, rg, leaf, target,
+                                ),
+                            ));
                         }
                         local
                     }));
@@ -625,6 +640,7 @@ impl Iterator for EmatArrowBatchReader {
 fn decode_one_column(
     file: &ParquetFile,
     cached_md: &CachedFileMetadata,
+    chunk_buf: &mut Vec<u8>,
     rg: usize,
     leaf: usize,
     target: &DataType,
@@ -632,7 +648,7 @@ fn decode_one_column(
     let cm = &cached_md.row_groups[rg].columns[leaf];
     match target {
         DataType::Int32 | DataType::Date32 => {
-            let v = decode_dict_chunk_typed::<i32>(file, cm, |b| {
+            let v = decode_dict_chunk_typed::<i32>(file, chunk_buf, cm, |b| {
                 decode_plain_i32(b).map_err(|e| ext(format!("plain i32: {e}")))
             })?;
             let n_rows = v.len();
@@ -642,7 +658,7 @@ fn decode_one_column(
             })
         }
         DataType::Int64 => {
-            let v = decode_dict_chunk_typed::<i64>(file, cm, |b| {
+            let v = decode_dict_chunk_typed::<i64>(file, chunk_buf, cm, |b| {
                 decode_plain_i64(b).map_err(|e| ext(format!("plain i64: {e}")))
             })?;
             let n_rows = v.len();
@@ -652,7 +668,7 @@ fn decode_one_column(
             })
         }
         DataType::Float64 => {
-            let v = decode_dict_chunk_typed::<f64>(file, cm, |b| {
+            let v = decode_dict_chunk_typed::<f64>(file, chunk_buf, cm, |b| {
                 decode_plain_f64(b).map_err(|e| ext(format!("plain f64: {e}")))
             })?;
             let n_rows = v.len();
@@ -661,9 +677,9 @@ fn decode_one_column(
                 n_rows,
             })
         }
-        DataType::Utf8View => decode_byte_array_to_string_view(file, cm, rg, leaf),
+        DataType::Utf8View => decode_byte_array_to_string_view(file, chunk_buf, cm, rg, leaf),
         DataType::Dictionary(_, _) => decode_byte_array_dict_preserved(file, rg, leaf),
-        DataType::Utf8 => decode_byte_array_to_utf8(file, cm),
+        DataType::Utf8 => decode_byte_array_to_utf8(file, chunk_buf, cm),
         other => Err(DataFusionError::NotImplemented(format!(
             "EmatArrowBatchReader: target Arrow type {other:?} not yet supported"
         ))),
@@ -674,9 +690,13 @@ fn decode_one_column(
 /// Mirrors `ematix_parquet_bridge::decode_dict_chunk_generic`.
 ///
 /// Σ.E5.6: takes the cached `CachedColumnChunk` directly instead of
-/// re-parsing the thrift footer per call.
+/// re-parsing the thrift footer per call, AND takes a reusable
+/// `chunk_buf` so consecutive column-chunk reads on the same thread
+/// share one allocation (eliminates per-call ~1 MB Vec alloc +
+/// `madvise(MADV_DONTNEED)` on drop).
 fn decode_dict_chunk_typed<T: Copy>(
     file: &ParquetFile,
+    chunk_buf: &mut Vec<u8>,
     cm: &CachedColumnChunk,
     decode_plain: impl Fn(&[u8]) -> DfResult<Vec<T>>,
 ) -> DfResult<Vec<T>> {
@@ -687,11 +707,11 @@ fn decode_dict_chunk_typed<T: Copy>(
         .filter(|&d| d < cm.data_page_offset)
         .unwrap_or(cm.data_page_offset) as u64;
     let length = cm.total_compressed_size as u64;
-    let chunk = file
-        .read_range(start, length)
-        .map_err(|e| ext(format!("read_range: {e}")))?;
+    file.read_range_into(chunk_buf, start, length)
+        .map_err(|e| ext(format!("read_range_into: {e}")))?;
+    let chunk = &chunk_buf[..];
 
-    let mut walker = PageWalker::new(&chunk);
+    let mut walker = PageWalker::new(chunk);
     let mut scratch: Vec<u8> = Vec::with_capacity(128 * 1024);
     let mut out: Vec<T> = Vec::with_capacity(total);
 
@@ -786,7 +806,8 @@ pub fn decode_byte_array_to_string_view_for_bench(
 ) -> DfResult<(usize, usize)> {
     let cached_md = CachedFileMetadata::from_file(file)?;
     let cm = &cached_md.row_groups[rg].columns[col];
-    let dc = decode_byte_array_to_string_view(file, cm, rg, col)?;
+    let mut chunk_buf: Vec<u8> = Vec::new();
+    let dc = decode_byte_array_to_string_view(file, &mut chunk_buf, cm, rg, col)?;
     let rows = dc.len();
     // Total decoded byte size = views buffer (16 bytes/row) + sum of
     // backing data buffers (one per page in the page-streaming layout).
@@ -817,7 +838,8 @@ pub fn decode_one_column_for_bench(
     target: &DataType,
 ) -> DfResult<(usize, usize)> {
     let cached_md = CachedFileMetadata::from_file(file)?;
-    let dc = decode_one_column(file, &cached_md, rg, leaf, target)?;
+    let mut chunk_buf: Vec<u8> = Vec::new();
+    let dc = decode_one_column(file, &cached_md, &mut chunk_buf, rg, leaf, target)?;
     let rows = dc.len();
     let bytes = match &dc {
         DecodedColumn::Int32 { data, .. } => data.len(),
@@ -841,6 +863,7 @@ pub fn decode_one_column_for_bench(
 /// still produce a correct result.
 fn decode_byte_array_to_string_view(
     file: &ParquetFile,
+    chunk_buf: &mut Vec<u8>,
     cm: &CachedColumnChunk,
     rg: usize,
     col: usize,
@@ -850,13 +873,14 @@ fn decode_byte_array_to_string_view(
     // data page (writer wrote some pages dict, some PLAIN).
     //
     // NOTE: `read_column_byte_array_dict_preserved` is from
-    // ematix-parquet-codec — it parses its own metadata. The
-    // CachedColumnChunk caching only applies to the slow path here.
-    // Upstream API change to take pre-cached metadata would close
-    // that remaining ~5% gap.
+    // ematix-parquet-codec — it parses its own metadata AND allocates
+    // its own chunk buffer. The CachedColumnChunk + chunk_buf reuse
+    // only benefit the slow path here. Upstream API changes to take
+    // pre-cached metadata + reusable scratch would close the
+    // remaining gap.
     match read_column_byte_array_dict_preserved(file, rg, col) {
         Ok(raw) => Ok(build_string_view_from_dict_preserved(raw)),
-        Err(_) => decode_byte_array_to_string_view_slow(file, cm),
+        Err(_) => decode_byte_array_to_string_view_slow(file, chunk_buf, cm),
     }
 }
 
@@ -916,6 +940,7 @@ fn build_string_view_from_dict_preserved(
 /// fast dict-preserved reader can't claim the chunk.
 fn decode_byte_array_to_string_view_slow(
     file: &ParquetFile,
+    chunk_buf: &mut Vec<u8>,
     cm: &CachedColumnChunk,
 ) -> DfResult<DecodedColumn> {
     let total = cm.num_values as usize;
@@ -925,9 +950,9 @@ fn decode_byte_array_to_string_view_slow(
         .filter(|&d| d < cm.data_page_offset)
         .unwrap_or(cm.data_page_offset) as u64;
     let length = cm.total_compressed_size as u64;
-    let chunk = file
-        .read_range(start, length)
-        .map_err(|e| ext(format!("read_range: {e}")))?;
+    file.read_range_into(chunk_buf, start, length)
+        .map_err(|e| ext(format!("read_range_into: {e}")))?;
+    let chunk = &chunk_buf[..];
 
     let mut walker = PageWalker::new(&chunk);
     let mut views: Vec<u128> = Vec::with_capacity(total);
@@ -991,6 +1016,12 @@ fn decode_byte_array_to_string_view_slow(
         data_buffers.push(Buffer::from_vec(page_buf));
     }
 
+    // Σ.E5 (2026-05-19): reusable per-RG scratch buffers — one Vec each
+    // grows to max-page size on the first page, then steady-state zero
+    // allocs. Replaces the per-page Vec churn that dominated allocator
+    // profile (1117 madvise samples in the prior Q19 profile).
+    let mut idx_scratch: Vec<u8> = Vec::new();
+    let mut idx_buf: Vec<u32> = Vec::new();
     while views.len() < total {
         let (hdr, body) = walker
             .next_page()
@@ -1003,11 +1034,12 @@ fn decode_byte_array_to_string_view_slow(
         let n = dph.num_values as usize;
         match dph.encoding {
             Encoding::RleDictionary | Encoding::PlainDictionary => {
-                let mut idx_scratch: Vec<u8> = Vec::with_capacity(body.len() * 2);
                 decompress_into(codec, body, &mut idx_scratch)?;
-                let idxs = ematix_parquet_codec::dict::decode_rle_dictionary_indices(
+                idx_buf.clear();
+                ematix_parquet_codec::dict::decode_rle_dictionary_indices_into(
                     &idx_scratch,
                     n,
+                    &mut idx_buf,
                 )
                 .map_err(|e| ext(format!("rle_dict_indices byte_array: {e}")))?;
                 let dict_len = dict_offsets.len();
@@ -1017,7 +1049,7 @@ fn decode_byte_array_to_string_view_slow(
                 // above. Slicing is sound since dict_offsets/lengths
                 // were computed against its full contents.
                 let dict_bytes: &[u8] = data_buffers[0].as_slice();
-                for &i in &idxs {
+                for &i in &idx_buf {
                     let i = i as usize;
                     if i >= dict_len {
                         return Err(ext(format!("dict idx {i} out of range {dict_len}")));
@@ -1138,7 +1170,11 @@ fn decode_byte_array_dict_preserved(
 /// Slow path: BYTE_ARRAY → `StringArray` row-by-row, using
 /// `StringBuilder`. Kept for completeness; callers should prefer
 /// `Utf8View` or `Dictionary(UInt32, Utf8)` on the hot path.
-fn decode_byte_array_to_utf8(file: &ParquetFile, cm: &CachedColumnChunk) -> DfResult<DecodedColumn> {
+fn decode_byte_array_to_utf8(
+    file: &ParquetFile,
+    chunk_buf: &mut Vec<u8>,
+    cm: &CachedColumnChunk,
+) -> DfResult<DecodedColumn> {
     let total = cm.num_values as usize;
     let codec = cm.codec;
     let start = cm
@@ -1146,11 +1182,11 @@ fn decode_byte_array_to_utf8(file: &ParquetFile, cm: &CachedColumnChunk) -> DfRe
         .filter(|&d| d < cm.data_page_offset)
         .unwrap_or(cm.data_page_offset) as u64;
     let length = cm.total_compressed_size as u64;
-    let chunk = file
-        .read_range(start, length)
-        .map_err(|e| ext(format!("read_range: {e}")))?;
+    file.read_range_into(chunk_buf, start, length)
+        .map_err(|e| ext(format!("read_range_into: {e}")))?;
+    let chunk = &chunk_buf[..];
 
-    let mut walker = PageWalker::new(&chunk);
+    let mut walker = PageWalker::new(chunk);
     let mut scratch: Vec<u8> = Vec::with_capacity(128 * 1024);
     let mut builder = StringBuilder::with_capacity(total, cm.total_uncompressed_size as usize);
 
@@ -1178,6 +1214,9 @@ fn decode_byte_array_to_utf8(file: &ParquetFile, cm: &CachedColumnChunk) -> DfRe
         Vec::new()
     };
 
+    // Σ.E5 (2026-05-19): reusable per-RG idx buffer eliminates the
+    // per-page `Vec<u32>` alloc churn.
+    let mut idx_buf: Vec<u32> = Vec::new();
     while builder.len() < total {
         let (hdr, body) = walker
             .next_page()
@@ -1191,9 +1230,14 @@ fn decode_byte_array_to_utf8(file: &ParquetFile, cm: &CachedColumnChunk) -> DfRe
         decompress_into(codec, body, &mut scratch)?;
         match dph.encoding {
             Encoding::RleDictionary | Encoding::PlainDictionary => {
-                let idxs = ematix_parquet_codec::dict::decode_rle_dictionary_indices(&scratch, n)
-                    .map_err(|e| ext(format!("rle_dict_indices: {e}")))?;
-                for &i in &idxs {
+                idx_buf.clear();
+                ematix_parquet_codec::dict::decode_rle_dictionary_indices_into(
+                    &scratch,
+                    n,
+                    &mut idx_buf,
+                )
+                .map_err(|e| ext(format!("rle_dict_indices: {e}")))?;
+                for &i in &idx_buf {
                     let s = dict
                         .get(i as usize)
                         .ok_or_else(|| ext(format!("dict idx {i} out of range {}", dict.len())))?;
