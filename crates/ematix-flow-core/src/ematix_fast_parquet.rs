@@ -156,6 +156,10 @@ pub struct EmatixFastParquetTableProvider {
     schema: SchemaRef,
     num_row_groups: usize,
     num_rows: usize,
+    /// Per-row-group row counts, cached at `try_new` time so the Exec
+    /// can size its partitions and pick the right reader variant
+    /// without re-decoding the thrift footer.
+    rg_num_rows: Arc<Vec<usize>>,
     /// Per-column typed min/max + null_count aggregated across row
     /// groups at `try_new` time. Mirrors what `FastParquetTableProvider`
     /// computes; the planner uses these for join-build-side selection
@@ -305,6 +309,14 @@ impl EmatixFastParquetTableProvider {
         let fmd = reader.metadata().file_metadata();
         let num_rows = fmd.num_rows() as usize;
         let num_row_groups = reader.metadata().num_row_groups();
+        let rg_num_rows: Arc<Vec<usize>> = Arc::new(
+            reader
+                .metadata()
+                .row_groups()
+                .iter()
+                .map(|rg| rg.num_rows() as usize)
+                .collect(),
+        );
 
         // Σ.E5 (2026-05-18): aggregate typed per-column stats so
         // `partition_statistics` returns real cardinality info to the
@@ -320,6 +332,7 @@ impl EmatixFastParquetTableProvider {
             schema,
             num_row_groups,
             num_rows,
+            rg_num_rows,
             column_stats,
             late_mat: true,
             dict_preservation: false,
@@ -549,6 +562,7 @@ impl TableProvider for EmatixFastParquetTableProvider {
             projection,
             assignments,
             self.num_rows,
+            Arc::clone(&self.rg_num_rows),
             bridge_filter,
             self.late_mat,
             self.streaming_arrow_reader,
@@ -565,6 +579,11 @@ pub struct EmatixFastParquetExec {
     projection: Vec<usize>,
     assignments: Vec<Vec<usize>>,
     num_rows: usize,
+    /// Cached per-RG row counts from the provider (decoded once when
+    /// the file was opened). Used by `execute()` to size the per-
+    /// partition row totals so it can pick the inline vs eager reader
+    /// without re-decoding the thrift footer per partition.
+    rg_num_rows: Arc<Vec<usize>>,
     /// Phase 3: optional pushed-down filter. When present, execute()
     /// runs the bitmap-first path (Phase 5 fused-NEON filter + Phase 6
     /// sparse gather). When None, runs Phase 2 dense decode.
@@ -593,6 +612,7 @@ impl EmatixFastParquetExec {
         projection: Vec<usize>,
         assignments: Vec<Vec<usize>>,
         num_rows: usize,
+        rg_num_rows: Arc<Vec<usize>>,
         filter: Option<BridgeFilter>,
         late_mat: bool,
         streaming_arrow_reader: bool,
@@ -611,6 +631,7 @@ impl EmatixFastParquetExec {
             projection,
             assignments,
             num_rows,
+            rg_num_rows,
             filter,
             late_mat,
             streaming_arrow_reader,
@@ -707,12 +728,22 @@ impl ExecutionPlan for EmatixFastParquetExec {
                 .and_then(|s| s.parse::<usize>().ok())
                 .map(|n| n.max(1))
                 .unwrap_or(computed_budget);
+            // Σ.E5: compute the partition's assigned row total from the
+            // provider's cached per-RG row counts. Threaded to
+            // `build_streaming_partition_stream` so it can pick the
+            // inline reader for single-RG small-row partitions without
+            // re-decoding the thrift footer.
+            let partition_rows: usize = row_groups
+                .iter()
+                .map(|&rg| self.rg_num_rows.get(rg).copied().unwrap_or(0))
+                .sum();
             build_streaming_partition_stream(
                 path,
                 schema.clone(),
                 projection,
                 row_groups,
                 budget,
+                partition_rows,
                 baseline,
             )
         } else {
@@ -831,6 +862,10 @@ fn build_streaming_partition_stream(
     projection: Vec<usize>,
     row_groups: Vec<usize>,
     parallelism_budget: usize,
+    // Total row count assigned to this partition, taken from the
+    // provider's cached per-RG counts. Drives the inline-vs-eager
+    // reader auto-pick without a per-partition footer re-decode.
+    partition_rows: usize,
     baseline: BaselineMetrics,
 ) -> futures_util::stream::BoxStream<'static, DfResult<RecordBatch>> {
     use futures_util::StreamExt;
@@ -866,10 +901,21 @@ fn build_streaming_partition_stream(
         .ok()
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
+    // Auto-pick threshold (0 = disabled). The cheap auto-pick is now
+    // wired (provider passes cached `rg_num_rows` → exec → here so no
+    // per-partition footer re-decode), but the inline reader's
+    // `StringViewPageStream` still uses the SLOW per-page byte-array
+    // path while the eager reader uses the fast dict-preserved
+    // gather. So engaging auto-pick today regresses string-heavy
+    // queries (Q19 +45% → +75% because part p_brand / p_type go
+    // through the slow path). Default off; opt-in for benching
+    // numeric-only files via `EMAT_INLINE_ROW_THRESHOLD=N`. Future
+    // work: port the dict-preserved fast path into
+    // `StringViewPageStream`, then flip the default to ~900_000.
     let inline_row_threshold: usize = std::env::var("EMAT_INLINE_ROW_THRESHOLD")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(900_000);
+        .unwrap_or(0);
 
     tokio::task::spawn_blocking(move || {
         let file = match ematix_parquet_io::ParquetFile::open(&path_buf) {
@@ -886,16 +932,29 @@ fn build_streaming_partition_stream(
             }
         };
 
-        // Reader choice: explicit env-var overrides only. The inline
-        // reader is OPT-IN via `EMAT_INLINE_STREAMING=1`; an earlier
-        // auto-pick (per-partition row-count threshold) added a thrift
-        // footer re-decode to every partition's spawn_blocking task
-        // which regressed the 22-query geomean by ~4 pp on noise-
-        // sensitive queries (Q01, Q19). Future work: lift the choice
-        // into the TableProvider where the metadata is already cached
-        // once.
-        let _ = inline_row_threshold; // kept as a knob for future use
-        let use_inline = force_inline.unwrap_or(false);
+        // Reader choice:
+        //   1. EMAT_INLINE_STREAMING=1/0 forces inline on/off.
+        //   2. EMAT_PAGE_STREAMING=1 forces the threaded page reader
+        //      (legacy A/B knob).
+        //   3. Otherwise auto-pick: inline for single-RG partitions
+        //      below `inline_row_threshold` rows (where eager full-RG
+        //      decode blocks downstream pipelining and streaming wins
+        //      first-batch latency); eager for everything else.
+        //
+        // The auto-pick uses the cheap `partition_rows` count threaded
+        // from the Exec — no per-partition footer decode (an earlier
+        // version that called `file.metadata()` here cost ~4 pp on
+        // the 22-query geomean).
+        let use_inline = match force_inline {
+            Some(forced) => forced,
+            None => {
+                if force_page {
+                    false
+                } else {
+                    row_groups.len() == 1 && partition_rows < inline_row_threshold
+                }
+            }
+        };
         let use_page_streaming = force_page && !use_inline;
 
         if use_inline {
