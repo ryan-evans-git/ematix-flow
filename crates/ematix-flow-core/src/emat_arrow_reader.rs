@@ -1706,6 +1706,15 @@ fn slice_decoded(c: &DecodedColumn, start: usize, n: usize, target: &DataType) -
             // cols on Q1 that's ~40 MB of u128 copying eliminated.
             // Backing data buffers are shared via Arc bump (one clone
             // per page; cheap — typically 1–6 pages per RG).
+            //
+            // Σ.E5 (2026-05-19, verified NEG): per-batch coalesce was
+            // tested as a fix for Q13's `output_bytes=2.1GB` accounting
+            // (vs fast's 152MB). Result: Q13 regressed +29% → +57%.
+            // The 14× buffer-size inflation is a reporting artifact
+            // (Arc<Buffer> ref-counts; operators don't iterate the
+            // backing bytes during repartition). The per-batch memcpy
+            // cost (~30MB for o_comment) far exceeds any downstream
+            // saving. Don't coalesce; share the page buffers.
             let sliced_views = views.slice_with_length(start * 16, n * 16);
             let views_buf = ScalarBuffer::<u128>::new(sliced_views, 0, n);
             // SAFETY: we built every view ourselves with `make_view`
