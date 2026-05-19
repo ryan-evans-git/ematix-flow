@@ -55,45 +55,24 @@ use crate::dict_aggregate_rule::EnableDictGroupCountRule;
 use crate::ematix_fast_parquet::EmatixFastParquetTableProvider;
 use crate::fused_aggregate_filter_multi_agg_rule::InjectFilterMultiAggRule;
 use crate::fused_aggregate_filter_sum_rule::InjectFilterSumRule;
-use crate::fused_jit_rule::EnableFusedJitRule;
 
 /// Attach ematix-flow's optimiser rule chain to a `SessionStateBuilder`.
 ///
-/// Idempotent in the sense that the chain is order-stable: re-applying
-/// it would just register the same rules twice (DataFusion runs each
-/// in turn but the second pass is a no-op since the first pass already
-/// transformed every match). Callers usually want one call per session.
+/// Rules installed (in registration order):
 ///
-/// Rules installed (in registration order, which is the order they run
-/// during physical optimisation):
-///
-/// 1. `InjectFilterMultiAggRule` — generic filter + group-by + multi-aggregate
-///    SQL pattern → `FusedAggregateExec<FilterMultiAggSpec>`. Replaces the
-///    retired `InjectFusedQ1Rule` (Σ.G.2f.3, task #486).
-/// 2. `InjectFilterSumRule` — generic SUM-over-Filter SQL (Σ.G.2e-3
-///    generalised matcher) → `FusedAggregateExec<FilterSumSpec>`.
-///    Subsumes the retired `InjectFusedQ6Rule`.
-/// 3. `EnableDictGroupCountRule` — `AggregateExec(Final+Partial)` on
+/// 1. `EnableDictGroupCountRule` — `AggregateExec(Final+Partial)` on
 ///    `Dictionary(UInt32, Utf8|Utf8View)` + `COUNT(*)` →
-///    `DictGroupCountExec`. Only fires when the upstream scan emits a
-///    `DictionaryArray`, which is why `register_dict_aware_parquet`
-///    uses `with_dict_preservation(true)`.
-/// 4. `EnableFusedJitRule` — promotes any hand-mode `FusedAggregateExec`
-///    in the plan tree to its JIT-mode variant.
-///    Idempotent; execs already in JIT mode pass through.
+///    `DictGroupCountExec`. Runs first because its shape is a strict
+///    subset of `InjectFilterMultiAggRule`'s matcher.
+/// 2. `InjectFilterMultiAggRule` — generic filter + group-by + multi-
+///    aggregate SQL pattern → `FusedAggregateExec<FilterMultiAggSpec>`.
+/// 3. `InjectFilterSumRule` — generic SUM-over-Filter SQL →
+///    `FusedAggregateExec<FilterSumSpec>`.
 pub fn with_optimizer_rules(builder: SessionStateBuilder) -> SessionStateBuilder {
-    // Σ.G.2f.3 cleanup (2026-05-19): EnableDictGroupCountRule runs
-    // FIRST because its shape (COUNT(*) GROUP BY single dict-encoded
-    // string col) is a strict subset of `InjectFilterMultiAggRule`'s
-    // matcher — the dict op is the more specialised path and must
-    // claim the plan before the generic filter+multi-agg rule absorbs
-    // it. Same ordering reason that the (now-retired) per-query rules
-    // used to run before the dict rule.
     builder
         .with_physical_optimizer_rule(Arc::new(EnableDictGroupCountRule))
         .with_physical_optimizer_rule(Arc::new(InjectFilterMultiAggRule))
         .with_physical_optimizer_rule(Arc::new(InjectFilterSumRule))
-        .with_physical_optimizer_rule(Arc::new(EnableFusedJitRule))
 }
 
 /// Register a parquet file as a table on `ctx` via

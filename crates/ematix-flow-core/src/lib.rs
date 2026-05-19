@@ -38,14 +38,10 @@ pub mod emat_arrow_reader;
 // gap diagnosed in Q19. See task #503 and
 // `project_q19_root_cause_orchestration.md`.
 pub mod emat_page_stream;
-// Σ.D1: `FusedFilterSumExec` physical operator for the simple
-// `Aggregate(SUM) over Filter(predicate)` plan shape — closes the
-// Q6 gap vs Polars (1.0 ms hand-written / 1.9 ms Polars / 5.96 ms
-// today's DataFusion). See `fused.rs` header and issue #44.
-pub mod fused;
-// Σ.G.2 first slice: `AggregateSpec` trait + `Q6Spec` + `Q1Spec`.
-// Both per-shape gates pass (#92, #93) — the trait dispatch matches
-// hand-written perf within 1 % on synthetic batches.
+// Σ.G.2 first slice: `AggregateSpec` trait. The Q1Spec/Q6Spec impls
+// that originally lived here were retired in Σ.G.2f.3 cleanup
+// (commit 476d65d). The trait survives as the abstraction shared by
+// `FilterSumSpec` and `FilterMultiAggSpec`.
 pub mod fused_aggregate;
 // Σ.G.2 third slice: the generic operator that the trait was built
 // to enable. Wraps any `AggregateSpec` impl as a DataFusion
@@ -73,34 +69,15 @@ pub mod fused_aggregate_filter_multi_agg;
 // plan shape into a single `FusedAggregateExec<FilterMultiAggSpec>`.
 // Group-by-aware counterpart to `InjectFilterSumRule`.
 pub mod fused_aggregate_filter_multi_agg_rule;
-// Σ.D2: `FusedFilterMultiAggExec` — single-pass fused filter +
-// multi-aggregate + group-by physical operator. Day-1 prototype
-// (`examples/tpch_q1_tune.rs`) showed 3.08 ms on Q1 SF=1 / 14
-// threads vs DataFusion's 25.61 ms MemTable / 47.65 ms parquet
-// (15.5× faster) and Polars MemTable 35.2 ms (11.4× faster).
-// See `fused_multi_agg.rs` header and issue #45.
-pub mod fused_multi_agg;
 // Σ.D3: cranelift-JIT'd inner loop for the unified fused-aggregate
-// operator. See `fused_jit.rs` header and issue #45. Day-1 scaffold:
-// JIT'd Q6 predicate evaluator that hits the same kernel shape as
-// Σ.D1's hard-coded operator from a data-driven input. The full
-// generic IR emitter (any predicate AST, any agg spec, any group-by
-// shape) builds on this scaffold.
+// operator. Hosts `FusedFilterAggSpec` IR + `FusedFilterAggJit`
+// runtime that `FilterSumSpec` and `FilterMultiAggSpec` build on.
 pub mod fused_jit;
-// Σ.D4 + Σ.D5: `FusedPostJoinExec` — single-pass fused aggregate
-// over the output of a join. Wraps the Q3/Q5/Q14 day-1 prototype
-// kernels (5-8× faster than DataFusion's per-aggregate dispatch on
-// the agg step; modest end-to-end shift because these queries are
-// JOIN-bound). Substrate for the future cranelift-JIT-generalized
-// operator. See `fused_post_join.rs` header and issues #51, #52.
-pub mod fused_post_join;
-// Σ.D3 phase D: `PhysicalOptimizerRule` that auto-routes hand-coded
-// FusedFilterSumExec / FusedFilterMultiAggExec / FusedPostJoinExec(Q14)
-// instances to their Cranelift-JIT'd variants. Walks the physical plan
-// tree with `transform_up` and swaps each match in place. Full SQL-
-// pattern detection (extracting predicate constants from arbitrary
-// PhysicalExpr ASTs to inject a fused exec where none was constructed)
-// is documented as a follow-up in the module header.
+// Σ.G.2f.3 cleanup: just the generalised aggregate plan-shape
+// matcher used by the two remaining injection rules. The four
+// per-query rules + EnableFusedJitRule that lived here were retired
+// in commit 476d65d (rules) and the substrate cleanup that landed
+// alongside it.
 pub mod fused_jit_rule;
 // Σ.E3a: `DictFilterExec` — IN-list filter on Dictionary(UInt32, Utf8)
 // columns by code membership (no string compare in the hot loop).
