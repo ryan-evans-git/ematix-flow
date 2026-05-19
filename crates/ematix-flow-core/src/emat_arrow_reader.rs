@@ -434,6 +434,133 @@ impl DecodedColumn {
     }
 }
 
+/// Σ.E5 (2026-05-19): compact a densely-decoded column down to only
+/// the rows where `bitmap` bit = 1. Output row count = `popcount`.
+///
+/// Intended for a future high-sel dense+bitmap-apply fallback path:
+/// when popcount is too high for masked decode to win, the reader
+/// would dense-decode and THEN compact via this helper. The first
+/// integration (calling this from the selectivity-gate fallback)
+/// regressed Q03 -36% → +21% and Q21 -10% → +30% because it ran
+/// alongside the FilterExec (Inexact pushdown), duplicating the
+/// per-row predicate work.
+///
+/// Kept as dead code so it's ready when we add per-filter Exact
+/// pushdown for predicate shapes we fully handle (string LIKE via
+/// `LikeMatcher`, etc.) — that drops the FilterExec and unblocks the
+/// compact path as a real win.
+///
+/// For `StringView`: views are filtered, `data_buffers` stays shared.
+/// For `DictUtf8`:   indices are filtered, dict values stay shared.
+#[allow(dead_code)]
+fn compact_decoded_column(
+    col: &DecodedColumn,
+    bitmap: &[u8],
+    popcount: usize,
+) -> DecodedColumn {
+    match col {
+        DecodedColumn::Int32 { data, n_rows } => {
+            let src = unsafe {
+                std::slice::from_raw_parts(data.as_ptr() as *const i32, *n_rows)
+            };
+            let mut out: Vec<i32> = Vec::with_capacity(popcount);
+            for row in 0..*n_rows {
+                if (bitmap[row >> 3] >> (row & 7)) & 1 == 1 {
+                    out.push(src[row]);
+                }
+            }
+            DecodedColumn::Int32 {
+                data: Buffer::from_vec(out),
+                n_rows: popcount,
+            }
+        }
+        DecodedColumn::Int64 { data, n_rows } => {
+            let src = unsafe {
+                std::slice::from_raw_parts(data.as_ptr() as *const i64, *n_rows)
+            };
+            let mut out: Vec<i64> = Vec::with_capacity(popcount);
+            for row in 0..*n_rows {
+                if (bitmap[row >> 3] >> (row & 7)) & 1 == 1 {
+                    out.push(src[row]);
+                }
+            }
+            DecodedColumn::Int64 {
+                data: Buffer::from_vec(out),
+                n_rows: popcount,
+            }
+        }
+        DecodedColumn::Float64 { data, n_rows } => {
+            let src = unsafe {
+                std::slice::from_raw_parts(data.as_ptr() as *const f64, *n_rows)
+            };
+            let mut out: Vec<f64> = Vec::with_capacity(popcount);
+            for row in 0..*n_rows {
+                if (bitmap[row >> 3] >> (row & 7)) & 1 == 1 {
+                    out.push(src[row]);
+                }
+            }
+            DecodedColumn::Float64 {
+                data: Buffer::from_vec(out),
+                n_rows: popcount,
+            }
+        }
+        DecodedColumn::StringView {
+            views,
+            n_rows,
+            data_buffers,
+        } => {
+            let src = unsafe {
+                std::slice::from_raw_parts(views.as_ptr() as *const u128, *n_rows)
+            };
+            let mut out: Vec<u128> = Vec::with_capacity(popcount);
+            for row in 0..*n_rows {
+                if (bitmap[row >> 3] >> (row & 7)) & 1 == 1 {
+                    out.push(src[row]);
+                }
+            }
+            DecodedColumn::StringView {
+                views: Buffer::from_vec(out),
+                n_rows: popcount,
+                data_buffers: data_buffers.clone(),
+            }
+        }
+        DecodedColumn::DictUtf8 {
+            values,
+            indices,
+            n_rows,
+        } => {
+            let src = unsafe {
+                std::slice::from_raw_parts(indices.as_ptr() as *const u32, *n_rows)
+            };
+            let mut out: Vec<u32> = Vec::with_capacity(popcount);
+            for row in 0..*n_rows {
+                if (bitmap[row >> 3] >> (row & 7)) & 1 == 1 {
+                    out.push(src[row]);
+                }
+            }
+            DecodedColumn::DictUtf8 {
+                values: values.clone(),
+                indices: Buffer::from_vec(out),
+                n_rows: popcount,
+            }
+        }
+        DecodedColumn::Utf8(s) => {
+            // Slow path — build a new StringArray with only matching
+            // rows. Rarely hit (Utf8 is the slow fallback).
+            let mut b = arrow_array::builder::StringBuilder::with_capacity(
+                popcount,
+                s.value_data().len(),
+            );
+            for row in 0..s.len() {
+                if (bitmap[row >> 3] >> (row & 7)) & 1 == 1 {
+                    b.append_value(s.value(row));
+                }
+            }
+            DecodedColumn::Utf8(Arc::new(b.finish()))
+        }
+    }
+}
+
 pub struct EmatArrowBatchReader {
     file: ParquetFile,
     arrow_schema: SchemaRef,
@@ -533,16 +660,19 @@ impl EmatArrowBatchReader {
         // between win and loss is narrow for mid-selectivity numeric
         // filters and 33% is a conservative cut.
         if total > 0 && popcount * 3 > total {
-            // Fall through to the dense path. Drop the bitmap, the
-            // dense path will scan everything; DataFusion's residual
-            // FilterExec (the predicate is Inexact when we set it,
-            // though we currently set Exact — see TODO below) will
-            // re-evaluate. NOTE: currently `supports_filters_pushdown`
-            // declares the BridgeFilter `Exact`, which means
-            // DataFusion REMOVES the FilterExec. If we fall back to
-            // dense here, the rows are not filtered. We must instead
-            // declare `Inexact` for pushed filters so DataFusion
-            // keeps the residual FilterExec as a safety net.
+            // Σ.E5 (2026-05-19, verified-NEG): tried compacting dense-
+            // decoded cols via the bitmap here (`compact_decoded_column`).
+            // Result: Q03 -36% → +21.5%, Q21 -10% → +30.1%. The compact
+            // duplicates work with DataFusion's FilterExec (which is
+            // still there because pushdown is Inexact), and the
+            // FilterExec re-runs the same predicate against the already-
+            // filtered rows. Would only be a net win if we ALSO declared
+            // Exact pushdown (to drop FilterExec) — but Exact has its
+            // own risks (safety-net loss on selectivity-fallback) we
+            // don't want to take on yet.
+            //
+            // Keeping the prior behaviour: drop the bitmap, let dense
+            // decode happen, rely on the residual FilterExec.
             self.cur_rg_total = self.cached_md.row_groups[rg].num_rows as usize;
             return self.load_row_group_dense(rg);
         }
