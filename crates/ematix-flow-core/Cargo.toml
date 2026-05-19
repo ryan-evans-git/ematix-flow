@@ -158,13 +158,6 @@ harness = false
 name = "tpch_generate"
 path = "examples/tpch_generate.rs"
 
-# Σ.A1 PR 4 follow-up: SessionConfig sweep for Q6, used to identify
-# which knobs close the Polars-vs-DataFusion 1.82× gap. The winning
-# config gets baked into `benches/tpch.rs`.
-[[example]]
-name = "tpch_q6_tune"
-path = "examples/tpch_q6_tune.rs"
-
 # Σ.A2 PR 4: TPC-DS dialect-translator audit. Plan-only check —
 # translates each of the 99 official Spark TPC-DS queries through
 # `dialect = "spark"`, hands the output to DataFusion's planner,
@@ -180,14 +173,6 @@ path = "examples/tpcds_dialect_audit.rs"
 [[example]]
 name = "fast_parquet_array_diff"
 path = "examples/fast_parquet_array_diff.rs"
-
-# Σ.D3 phase A-D: hand-coded vs Cranelift-JIT'd inner loops for the
-# three fused-exec shapes (Q6, Q1, Q14 post-join). End-to-end timing
-# over real SF=1 parquet data, with bit-identical equivalence checks
-# between the two paths before timing.
-[[example]]
-name = "tpch_fused_jit_bench"
-path = "examples/tpch_fused_jit_bench.rs"
 
 # Σ.G.2 / Σ.G.3 hand-vs-unified gate benches lived here until Σ.G.3d
 # retired the hand operators they compared against. Their gates passed
@@ -217,44 +202,17 @@ path = "examples/tpch_q6_plan_dump.rs"
 name = "tpch_q6_inject_bench"
 path = "examples/tpch_q6_inject_bench.rs"
 
-# Σ.D3 phase D follow-up: dump the DataFusion physical plan for Q1
-# (group-by + 4 SUMs + 3 AVGs + COUNT) to learn the node tree the
-# InjectFusedQ1Rule pattern detector needs to match.
-[[example]]
-name = "tpch_q1_plan_dump"
-path = "examples/tpch_q1_plan_dump.rs"
-
-# Σ.D3 phase D (Q1 variant): bench Q1 with and without InjectFusedQ1Rule
-# registered. Group-by version of `tpch_q6_inject_bench` — Q1's
-# downstream HashAggregate stack is heavier so the fused replacement
-# has more headroom.
-[[example]]
-name = "tpch_q1_inject_bench"
-path = "examples/tpch_q1_inject_bench.rs"
-
 # Σ.D3 phase D (Q3/Q5): dump canonical plan shapes for the
 # post-join-aggregate rules.
 [[example]]
 name = "tpch_q3q5_plan_dump"
 path = "examples/tpch_q3q5_plan_dump.rs"
 
-# Σ.D3 phase D (Q3/Q5): bench Q3 and Q5 with their auto-injection
-# rules registered. Both rules replace the post-join aggregate stack
-# with FusedPostJoinExec.
-[[example]]
-name = "tpch_q3q5_inject_bench"
-path = "examples/tpch_q3q5_inject_bench.rs"
-
 # Σ.D3 phase D (Q12): dump canonical Q12 plan shape (join + complex
 # filter + 2-group hash agg with CASE-WHEN over o_orderpriority).
 [[example]]
 name = "tpch_q12_plan_dump"
 path = "examples/tpch_q12_plan_dump.rs"
-
-# Σ.D3 phase D (Q12): bench Q12 with and without InjectFusedQ12Rule.
-[[example]]
-name = "tpch_q12_inject_bench"
-path = "examples/tpch_q12_inject_bench.rs"
 
 # Σ.E2 follow-up: probe whether SF=1 lineitem.parquet has page-level
 # column/offset indexes, and if so what fraction of pages overlap
