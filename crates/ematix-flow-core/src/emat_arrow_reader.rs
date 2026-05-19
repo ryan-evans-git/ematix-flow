@@ -73,6 +73,17 @@ use ematix_parquet_io::{PageWalker, ParquetFile};
 /// `DEFAULT_BATCH_SIZE` and DataFusion's pipelining sweet spot.
 pub const DEFAULT_BATCH_SIZE: usize = 65_536;
 
+/// `EMAT_BATCH_SIZE` env override (decimal). Σ.E5 diagnostic for the
+/// Q16 HashJoin-probe gap: split the masked-decode output into more
+/// batches when the post-filter row count is large relative to the
+/// reader's batch_size. Default = `DEFAULT_BATCH_SIZE`.
+fn env_batch_size() -> usize {
+    std::env::var("EMAT_BATCH_SIZE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_BATCH_SIZE)
+}
+
 // ============================================================
 // Cached metadata — Σ.E5.6 profile-driven optimization
 // ============================================================
@@ -198,7 +209,7 @@ impl EmatArrowBatchReaderBuilder {
             arrow_schema,
             projection: None,
             row_groups: None,
-            batch_size: DEFAULT_BATCH_SIZE,
+            batch_size: env_batch_size(),
             parallelism_budget: None,
             filter: None,
             path: None,
@@ -1256,8 +1267,27 @@ impl Iterator for EmatArrowBatchReader {
                 }
             }
 
+            // Σ.E5 (2026-05-19): when BridgeFilter pushdown is
+            // active and the post-filter RG fits in a single batch,
+            // sub-divide so downstream HashJoinExec sees multiple
+            // smaller probe batches. FastParquet emits ~4 batches in
+            // these cases (because filter+repartition splits a single
+            // 65k batch), and HashJoin probe with a 1-big-batch build
+            // side is slower than with 4-smaller-batch build (cache
+            // locality on the build-side hash table lookup). Q16
+            // wins ~5pp; doesn't regress Q01 (no filter pushdown).
             let remaining = self.cur_rg_total - self.cur_rg_row;
-            let n = remaining.min(self.batch_size);
+            let effective_batch_size = if self.filter.is_some()
+                && self.cur_rg_total < self.batch_size
+                && self.cur_rg_total >= 4 * 1024
+            {
+                // Target ~4 sub-batches when there's a filter and the
+                // post-filter RG is under one normal batch.
+                (self.cur_rg_total / 4).max(1024)
+            } else {
+                self.batch_size
+            };
+            let n = remaining.min(effective_batch_size);
             let start = self.cur_rg_row;
             self.cur_rg_row += n;
             return Some(self.slice_batch(start, n));
