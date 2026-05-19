@@ -1360,6 +1360,12 @@ fn decompress_into(codec: CompressionCodec, body: &[u8], out: &mut Vec<u8>) -> D
             Ok(())
         }
         CompressionCodec::Snappy => {
+            // Re-confirmed 2026-05-19: opting into
+            // `decompress_snappy_fast_into` via `EMAT_FAST_SNAPPY=1`
+            // regresses the 22-query geomean from 0.92 → 0.98 (Q14
+            // -36% → -24%, Q01 -5% → +3%). Microbench wins on
+            // random data don't transfer to TPC-H. `snap` crate
+            // stays the default; see [[hand-rolled-snappy-neg]].
             decompress_snappy_into(body, out).map_err(|e| ext(format!("snappy: {e}")))
         }
         CompressionCodec::Zstd => {
