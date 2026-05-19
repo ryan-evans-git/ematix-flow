@@ -1183,20 +1183,24 @@ impl TableProvider for EmatixFastParquetTableProvider {
         // dense fast path (dict_views: Vec<u128> cache + 16-byte
         // gather per row). Pushdown accepted for BridgeFilter-shaped
         // filters on all reader variants.
-        // Σ.E5 Phase 1.6 (2026-05-19, verified-NEG): per-batch filter
-        // infrastructure landed in emat_arrow_reader.rs (`slice_batch`
-        // applies the bitmap via Arrow's SIMD filter when
-        // `cur_rg_filter_bitmap` is set). Bench gate failed: Q01 +77%
-        // because the BridgeFilter bitmap build runs SERIALLY while
-        // the no-pushdown path absorbs the filter col into the
-        // parallel projection decode. Geomean 0.86 → 0.88.
+        // Σ.E5 Phase 1.7 (2026-05-19, verified-NEG): parallel
+        // bitmap+dense always-dense path (drop masked decode entirely)
+        // regressed Q01 +114%, Q02 +10%, Q04 +21%, Q08 +8%, Q16 +29%.
+        // Geomean 0.86 → 0.948.
         //
-        // Phase 1.7 (deferred): parallelize bitmap build alongside
-        // projection decode (spawn a thread for the filter col next
-        // to the projection cols), so Exact pushdown has no serial
-        // tail on high-sel filters.
+        // Two compounding losses:
+        //   1. Thread oversubscription — n_cols + 1 threads per
+        //      partition × N partitions on a 14-core box. Cap was
+        //      meant to avoid this.
+        //   2. Removing masked decode hurts low-sel queries that
+        //      benefit from per-page popcount skip.
         //
-        // Pushdown stays Inexact for all shapes until Phase 1.7 lands.
+        // Phase 1.8 (deferred): stats-based selectivity prediction.
+        // For each predicate, estimate pass rate from col min/max +
+        // literal. If predicted > 33%, take parallel bitmap+dense
+        // path. Else take serial-bitmap+masked path. Requires
+        // estimator implementation for I32Range / StringEq / StringIn
+        // / StringLike against `column_stats`.
         let _exact_unused = (&self.column_has_no_nulls, );
         Ok(filters
             .iter()

@@ -763,30 +763,16 @@ impl EmatArrowBatchReader {
         // decode work outweighs the bitmap-construction + per-row
         // gather overhead.
         //
-        // Empirically (SF=1):
-        //   Q14   ~3% selective  → masked wins (-32%)
-        //   Q19   ~2% selective  → masked wins (-20%)
-        //   Q03   ~10% selective → masked wins (-21%)
-        //   Q06   ~46% selective → masked LOSES (+114%) because
-        //                          F64Range double-decodes l_quantity
-        //   Q01   ~95% selective → falls back (correct).
-        //
         // Threshold at popcount * 3 > total (fall back at >33%
         // selectivity). Lower than the prior 50% gate; the gap
         // between win and loss is narrow for mid-selectivity numeric
         // filters and 33% is a conservative cut.
+        //
+        // Phase 1.6 plumbing (per-batch filter via
+        // `cur_rg_filter_bitmap` + `slice_batch`) is kept in place
+        // but not activated — `cur_rg_filter_bitmap` stays `None` so
+        // slice_batch's filter branch is dead.
         if total > 0 && popcount * 3 > total {
-            // Σ.E5 (2026-05-19): high-selectivity fallback. Multiple
-            // verified-NEG attempts at applying the bitmap in-reader
-            // documented above. Until Phase 1.7 lands (parallel
-            // bitmap build to remove the serial tail), the safe
-            // behaviour is: drop the bitmap, dense decode, let the
-            // residual FilterExec re-filter (Inexact pushdown).
-            //
-            // Phase 1.6 plumbing (per-batch filter via
-            // `cur_rg_filter_bitmap` + `slice_batch`) is kept in
-            // place but not activated — `cur_rg_filter_bitmap` stays
-            // `None` so slice_batch's filter branch is dead.
             self.cur_rg_total = self.cached_md.row_groups[rg].num_rows as usize;
             return self.load_row_group_dense(rg);
         }
