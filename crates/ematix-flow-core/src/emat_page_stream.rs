@@ -316,10 +316,21 @@ pub struct StringViewPageStream {
     /// populated when the column chunk has a DictionaryPage).
     dict_offsets: Vec<u32>,
     dict_lengths: Vec<u32>,
+    /// One u128 view per dict entry, built once on dict-page parse.
+    /// Empty for PLAIN-only chunks. Mirrors the dict-preserved fast
+    /// path in `build_string_view_from_dict_preserved` — per-row
+    /// emission becomes `views.push(dict_views[idx])` instead of a
+    /// per-row `make_view` call (which is `#[inline(never)]`).
+    dict_views: Vec<u128>,
     /// Per-page backing buffers (Σ.E5 multi-buffer layout).
     data_buffers: Vec<Buffer>,
     /// Views (16-byte each). Grown by one page's worth per call.
     views: Vec<u128>,
+    /// Reusable per-page scratch buffers — eliminates the per-page
+    /// `Vec` alloc churn (~50 page allocs per lineitem column chunk
+    /// dropped to 0 after the first call).
+    idx_scratch: Vec<u8>,
+    idx_buf: Vec<u32>,
     first_page_consumed: bool,
 }
 
@@ -342,8 +353,11 @@ impl StringViewPageStream {
             walker_pos: 0,
             dict_offsets: Vec::new(),
             dict_lengths: Vec::new(),
+            dict_views: Vec::new(),
             data_buffers: Vec::new(),
             views: Vec::with_capacity(total),
+            idx_scratch: Vec::new(),
+            idx_buf: Vec::new(),
             first_page_consumed: false,
         })
     }
@@ -378,16 +392,23 @@ impl ColumnPageStream for StringViewPageStream {
             self.first_page_consumed = true;
             if hdr.dictionary_page_header.is_some() {
                 // Decompress into an owned buffer; record per-entry
-                // offsets/lengths; push the buffer as data_buffers[0].
+                // offsets/lengths; pre-compute one u128 view per dict
+                // entry (so per-row emission is a tight `dict_views`
+                // gather instead of a per-row `make_view` call —
+                // mirrors `build_string_view_from_dict_preserved` in
+                // the eager reader).
                 let mut dict_scratch: Vec<u8> = Vec::with_capacity(body.len() * 2);
                 decompress_into(self.codec, body, &mut dict_scratch)?;
                 let entries = decode_plain_byte_array(&dict_scratch)
                     .map_err(|e| ext(format!("plain byte_array dict: {e}")))?;
                 let base = dict_scratch.as_ptr() as usize;
+                let dict_block = 0u32; // dict pages always land in data_buffers[0]
+                self.dict_views.reserve(entries.len());
                 for s in &entries {
                     let off = (s.as_ptr() as usize - base) as u32;
                     self.dict_offsets.push(off);
                     self.dict_lengths.push(s.len() as u32);
+                    self.dict_views.push(make_view(s, dict_block, off));
                 }
                 self.data_buffers.push(Buffer::from_vec(dict_scratch));
                 return Ok(0);
@@ -402,23 +423,26 @@ impl ColumnPageStream for StringViewPageStream {
         let n = dph.num_values as usize;
         match dph.encoding {
             Encoding::RleDictionary | Encoding::PlainDictionary => {
-                let mut idx_scratch: Vec<u8> = Vec::with_capacity(body.len() * 2);
-                decompress_into(self.codec, body, &mut idx_scratch)?;
-                let idxs =
-                    ematix_parquet_codec::dict::decode_rle_dictionary_indices(&idx_scratch, n)
-                        .map_err(|e| ext(format!("rle_dict_indices: {e}")))?;
-                let dict_len = self.dict_offsets.len();
-                let dict_bytes: &[u8] = self.data_buffers[0].as_slice();
-                let dict_block = 0u32;
-                for &i in &idxs {
-                    let i = i as usize;
-                    if i >= dict_len {
-                        return Err(ext(format!("dict idx {i} out of range {dict_len}")));
-                    }
-                    let off = self.dict_offsets[i];
-                    let len = self.dict_lengths[i];
-                    let bytes = &dict_bytes[off as usize..(off + len) as usize];
-                    self.views.push(make_view(bytes, dict_block, off));
+                decompress_into(self.codec, body, &mut self.idx_scratch)?;
+                self.idx_buf.clear();
+                ematix_parquet_codec::dict::decode_rle_dictionary_indices_into(
+                    &self.idx_scratch,
+                    n,
+                    &mut self.idx_buf,
+                )
+                .map_err(|e| ext(format!("rle_dict_indices: {e}")))?;
+                let dict_len = self.dict_views.len();
+                if let Some(bad) = self.idx_buf.iter().find(|&&i| (i as usize) >= dict_len) {
+                    return Err(ext(format!(
+                        "dict idx {bad} out of range {dict_len}"
+                    )));
+                }
+                self.views.reserve(self.idx_buf.len());
+                // Tight gather — same shape as the eager dict-
+                // preserved path's per-row hot loop.
+                for &i in &self.idx_buf {
+                    // SAFETY (logical): bounds validated above.
+                    self.views.push(self.dict_views[i as usize]);
                 }
             }
             Encoding::Plain => {
