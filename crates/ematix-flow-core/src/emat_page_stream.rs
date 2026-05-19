@@ -49,6 +49,8 @@ use ematix_parquet_codec::plain::{
 use ematix_parquet_format::types::{CompressionCodec, Encoding};
 use ematix_parquet_io::{PageWalker, ParquetFile};
 
+use crate::emat_arrow_reader::{CachedColumnChunk, CachedFileMetadata};
+
 #[inline]
 fn ext<S: Into<String>>(msg: S) -> DataFusionError {
     DataFusionError::External(msg.into().into())
@@ -185,12 +187,7 @@ pub struct PrimitivePageStream<T: PrimitiveType> {
 }
 
 impl<T: PrimitiveType> PrimitivePageStream<T> {
-    pub fn new(file: &ParquetFile, rg: usize, col: usize) -> DfResult<Self> {
-        let md = file.metadata().map_err(|e| ext(format!("metadata: {e}")))?;
-        let cm = md.row_groups[rg].columns[col]
-            .meta_data
-            .as_ref()
-            .ok_or_else(|| ext("column missing meta_data"))?;
+    pub fn new(file: &ParquetFile, cm: &CachedColumnChunk) -> DfResult<Self> {
         let total = cm.num_values as usize;
         let codec = cm.codec;
         let start = cm
@@ -327,12 +324,7 @@ pub struct StringViewPageStream {
 }
 
 impl StringViewPageStream {
-    pub fn new(file: &ParquetFile, rg: usize, col: usize) -> DfResult<Self> {
-        let md = file.metadata().map_err(|e| ext(format!("metadata: {e}")))?;
-        let cm = md.row_groups[rg].columns[col]
-            .meta_data
-            .as_ref()
-            .ok_or_else(|| ext("column missing meta_data"))?;
+    pub fn new(file: &ParquetFile, cm: &CachedColumnChunk) -> DfResult<Self> {
         let total = cm.num_values as usize;
         let codec = cm.codec;
         let start = cm
@@ -661,6 +653,10 @@ pub struct EmatPageStreamingReader {
     projection: Vec<usize>,
     row_groups: Vec<usize>,
     batch_size: usize,
+    /// Σ.E5.6: cached parquet metadata snapshot (decoded once at
+    /// construction, reused across RGs/columns). Same pattern as the
+    /// eager `EmatArrowBatchReader`.
+    cached_md: std::sync::Arc<CachedFileMetadata>,
 
     cur_rg_idx: usize,
     cur_rg_state: Option<std::sync::Arc<RgDecodeState>>,
@@ -675,18 +671,20 @@ impl EmatPageStreamingReader {
         projection: Vec<usize>,
         row_groups: Vec<usize>,
         batch_size: usize,
-    ) -> Self {
-        Self {
+    ) -> DfResult<Self> {
+        let cached_md = std::sync::Arc::new(CachedFileMetadata::from_file(&file)?);
+        Ok(Self {
             file,
             arrow_schema,
             projection,
             row_groups,
             batch_size,
+            cached_md,
             cur_rg_idx: 0,
             cur_rg_state: None,
             cur_rg_total: 0,
             cur_rg_row: 0,
-        }
+        })
     }
 
     pub fn schema(&self) -> &SchemaRef {
@@ -694,13 +692,8 @@ impl EmatPageStreamingReader {
     }
 
     fn open_row_group(&mut self, rg: usize) -> DfResult<()> {
-        let md = self
-            .file
-            .metadata()
-            .map_err(|e| ext(format!("metadata: {e}")))?;
-        let row_group = &md.row_groups[rg];
-        self.cur_rg_total = row_group.num_rows as usize;
-        drop(md);
+        // Σ.E5.6: use cached metadata snapshot — no thrift re-parse.
+        self.cur_rg_total = self.cached_md.row_groups[rg].num_rows as usize;
 
         let n_cols = self.projection.len();
         let mut streams: Vec<Mutex<Box<dyn ColumnPageStream>>> = Vec::with_capacity(n_cols);
@@ -708,13 +701,14 @@ impl EmatPageStreamingReader {
         let mut targets: Vec<DataType> = Vec::with_capacity(n_cols);
         for (i, &leaf) in self.projection.iter().enumerate() {
             let target = self.arrow_schema.field(i).data_type().clone();
+            let cm = &self.cached_md.row_groups[rg].columns[leaf];
             let stream: Box<dyn ColumnPageStream> = match &target {
                 DataType::Int32 | DataType::Date32 => {
-                    Box::new(Int32PageStream::new(&self.file, rg, leaf)?)
+                    Box::new(Int32PageStream::new(&self.file, cm)?)
                 }
-                DataType::Int64 => Box::new(Int64PageStream::new(&self.file, rg, leaf)?),
-                DataType::Float64 => Box::new(Float64PageStream::new(&self.file, rg, leaf)?),
-                DataType::Utf8View => Box::new(StringViewPageStream::new(&self.file, rg, leaf)?),
+                DataType::Int64 => Box::new(Int64PageStream::new(&self.file, cm)?),
+                DataType::Float64 => Box::new(Float64PageStream::new(&self.file, cm)?),
+                DataType::Utf8View => Box::new(StringViewPageStream::new(&self.file, cm)?),
                 other => {
                     return Err(DataFusionError::NotImplemented(format!(
                         "EmatPageStreamingReader: target type {other:?} not yet supported"
@@ -751,15 +745,29 @@ impl EmatPageStreamingReader {
     /// Wait until every column has either reached `target_rows` or
     /// exhausted its column total. Returns `Err` if any decoder
     /// surfaced an error.
+    ///
+    /// Lost-wakeup safety: the standard condvar pattern requires the
+    /// progress check + `wait` to happen WHILE holding the same mutex
+    /// the notifier acquires. Otherwise a decoder can `notify_one`
+    /// between the emit thread's atomic load and its `wait` call —
+    /// the signal is lost and emit hangs forever. We hold `notify`
+    /// for the entire loop body and only release it inside `wait`.
     fn wait_for_target(state: &RgDecodeState, target_rows: usize) -> DfResult<()> {
+        let mut guard = state
+            .notify
+            .lock()
+            .map_err(|e| ext(format!("notify lock poisoned: {e}")))?;
         loop {
-            // Check decoder errors first.
+            // Error check (under the notify lock — decoder takes the
+            // same lock before storing into `error`+notifying, so we
+            // observe a consistent view).
             if let Some(e) = state.error.lock().unwrap().take() {
                 return Err(e);
             }
 
             let mut all_at_target = true;
             for i in 0..state.rows_decoded.len() {
+                // Acquire-load pairs with the decoder's Release-store.
                 let r = state.rows_decoded[i].load(Ordering::Acquire);
                 if r < target_rows && r < state.total_rows[i] {
                     all_at_target = false;
@@ -770,15 +778,12 @@ impl EmatPageStreamingReader {
                 return Ok(());
             }
 
-            // Sleep until a decoder makes progress.
-            let guard = state
-                .notify
-                .lock()
-                .map_err(|e| ext(format!("notify lock poisoned: {e}")))?;
-            // `wait` releases the guard, sleeps, re-acquires on
-            // notify. The decoder always grabs `notify` before
-            // notify_one, so we don't miss wakeups.
-            let _g = state
+            // Release lock, sleep, re-acquire on notify. Any
+            // decoder's notify_one that happens between the load
+            // above and this wait still wakes us — because the
+            // decoder must acquire `notify` (which we still hold) to
+            // call notify_one.
+            guard = state
                 .cv
                 .wait(guard)
                 .map_err(|e| ext(format!("cv wait poisoned: {e}")))?;
@@ -902,7 +907,7 @@ mod tests {
         .unwrap();
 
         let file = ParquetFile::open(&path).unwrap();
-        let mut stream = Float64PageStream::new(&file, 0, 0).expect("open stream");
+        let mut stream = { let _md = CachedFileMetadata::from_file(&file).unwrap(); Float64PageStream::new(&file, &_md.row_groups[0].columns[0]) }.expect("open stream");
 
         let total = stream.total_rows();
         assert_eq!(total, n);
@@ -973,7 +978,7 @@ mod tests {
         )
         .unwrap();
         let file = ParquetFile::open(&path).unwrap();
-        let mut stream = Int32PageStream::new(&file, 0, 0).unwrap();
+        let mut stream = { let _md = CachedFileMetadata::from_file(&file).unwrap(); Int32PageStream::new(&file, &_md.row_groups[0].columns[0]) }.unwrap();
         let mut page_calls = 0;
         while stream.rows_decoded() < n {
             stream.decode_next_page().unwrap();
@@ -1012,7 +1017,7 @@ mod tests {
         )
         .unwrap();
         let file = ParquetFile::open(&path).unwrap();
-        let mut stream = StringViewPageStream::new(&file, 0, 0).unwrap();
+        let mut stream = { let _md = CachedFileMetadata::from_file(&file).unwrap(); StringViewPageStream::new(&file, &_md.row_groups[0].columns[0]) }.unwrap();
         let mut page_calls = 0;
         while stream.rows_decoded() < n {
             stream.decode_next_page().unwrap();
@@ -1051,7 +1056,7 @@ mod tests {
         )
         .unwrap();
         let file = ParquetFile::open(&path).unwrap();
-        let mut stream = StringViewPageStream::new(&file, 0, 0).unwrap();
+        let mut stream = { let _md = CachedFileMetadata::from_file(&file).unwrap(); StringViewPageStream::new(&file, &_md.row_groups[0].columns[0]) }.unwrap();
         while stream.rows_decoded() < n {
             stream.decode_next_page().unwrap();
         }
@@ -1094,7 +1099,7 @@ mod tests {
         ]));
 
         let file = ParquetFile::open(&path).unwrap();
-        let reader = EmatPageStreamingReader::new(file, schema, vec![0, 1, 2], vec![0], 8192);
+        let reader = EmatPageStreamingReader::new(file, schema, vec![0, 1, 2], vec![0], 8192).unwrap();
         let batches: Vec<RecordBatch> = reader.map(|b| b.unwrap()).collect();
         let total: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total, n);
@@ -1140,7 +1145,7 @@ mod tests {
         )
         .unwrap();
         let file = ParquetFile::open(&path).unwrap();
-        let mut stream = Int64PageStream::new(&file, 0, 0).unwrap();
+        let mut stream = { let _md = CachedFileMetadata::from_file(&file).unwrap(); Int64PageStream::new(&file, &_md.row_groups[0].columns[0]) }.unwrap();
         let mut page_calls = 0;
         while stream.rows_decoded() < n {
             stream.decode_next_page().unwrap();

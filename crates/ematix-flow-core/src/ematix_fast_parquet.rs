@@ -870,13 +870,21 @@ fn build_streaming_partition_stream(
 
         if use_page_streaming {
             use crate::emat_page_stream::EmatPageStreamingReader;
-            let reader = EmatPageStreamingReader::new(
+            let reader = match EmatPageStreamingReader::new(
                 file,
                 schema,
                 projection,
                 row_groups,
                 crate::emat_arrow_reader::DEFAULT_BATCH_SIZE,
-            );
+            ) {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = tx.blocking_send(Err(DataFusionError::External(
+                        format!("EmatPageStreamingReader::new: {e}").into(),
+                    )));
+                    return;
+                }
+            };
             for item in reader {
                 if tx.blocking_send(item).is_err() {
                     return;
