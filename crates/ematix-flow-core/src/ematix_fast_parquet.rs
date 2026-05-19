@@ -470,28 +470,54 @@ fn predicate_from_expr(expr: &Expr, full_schema: &Schema) -> Option<ColumnPredic
             }
         }
     }
-    // Shape 5: col [NOT] LIKE 'pattern' — NOT PUSHED.
-    //
-    // Σ.E5 (2026-05-19 verified): LIKE pushdown is net negative on
-    // the 22-query suite. Two failure modes:
-    //   1. Contains-pattern (`'%foo%bar%'`) — Q13's `o_comment NOT
-    //      LIKE '%special%requests%'`. Run on high-card non-dict
-    //      columns where the dense fallback double-decodes
-    //      (+407%).
-    //   2. Prefix-pattern (`'literal%'`) — Q20's `p_name LIKE
-    //      'forest%'`. p_name is unique-per-row, so PLAIN-encoded;
-    //      dense LIKE eval slower than DataFusion's vectorised
-    //      Utf8View LIKE (+55%).
-    //
-    // Even Q16's low-card prefix NOT LIKE on p_type didn't measurably
-    // win. DataFusion's residual FilterExec handles all LIKE shapes
-    // adequately on dict-preserved Utf8View batches.
-    //
-    // The infrastructure for ColumnPredicate::StringLike still exists
-    // (eval_str handles it); only the planner-side
-    // `predicate_from_expr` is gated. Re-enable per-column if we
-    // ever get reader-time stats indicating dict-encoding (`dict
-    // present` is a parquet metadata flag).
+    None
+}
+
+/// Like [`predicate_from_expr`] but with knowledge of per-column dict
+/// encoding. Enables LIKE pushdown for dict-encoded columns where the
+/// predicate evaluates O(|dict|) instead of O(rows). Non-dict cols
+/// still refuse LIKE (verified-neg on Q13/Q20).
+fn predicate_from_expr_with_dict(
+    expr: &Expr,
+    full_schema: &Schema,
+    column_is_dict_encoded: &[bool],
+) -> Option<ColumnPredicate> {
+    if let Some(p) = predicate_from_expr(expr, full_schema) {
+        return Some(p);
+    }
+    // LIKE — only if column is fully dict-encoded across all RGs.
+    if let Expr::Like(like) = expr {
+        if like.case_insensitive || like.escape_char.is_some() {
+            return None;
+        }
+        let col_name = match like.expr.as_ref() {
+            Expr::Column(c) => &c.name,
+            _ => return None,
+        };
+        let idx = full_schema.index_of(col_name).ok()?;
+        let dt = full_schema.field(idx).data_type();
+        if !matches!(dt, DataType::Utf8 | DataType::Utf8View) {
+            return None;
+        }
+        // Gate on the dict-encoded flag.
+        if !column_is_dict_encoded.get(idx).copied().unwrap_or(false) {
+            return None;
+        }
+        let pattern: String = match like.pattern.as_ref() {
+            Expr::Literal(ScalarValue::Utf8(Some(s)), _)
+            | Expr::Literal(ScalarValue::Utf8View(Some(s)), _)
+            | Expr::Literal(ScalarValue::LargeUtf8(Some(s)), _) => s.clone(),
+            _ => return None,
+        };
+        if pattern.contains('_') {
+            return None;
+        }
+        return Some(ColumnPredicate::StringLike {
+            col_idx: idx,
+            pattern,
+            negated: like.negated,
+        });
+    }
     None
 }
 
@@ -550,10 +576,14 @@ fn collect_string_eq_or_chain(
 /// Multiple predicates are AND-ed at evaluation time. Filters that
 /// don't fit a supported shape are dropped — pushdown is declared
 /// Inexact so DataFusion's residual FilterExec catches them.
-fn extract_bridge_filter(filters: &[Expr], full_schema: &Schema) -> Option<BridgeFilter> {
+fn extract_bridge_filter(
+    filters: &[Expr],
+    full_schema: &Schema,
+    column_is_dict_encoded: &[bool],
+) -> Option<BridgeFilter> {
     let mut predicates: Vec<ColumnPredicate> = Vec::new();
     for f in filters {
-        if let Some(p) = predicate_from_expr(f, full_schema) {
+        if let Some(p) = predicate_from_expr_with_dict(f, full_schema, column_is_dict_encoded) {
             predicates.push(p);
         }
     }
@@ -616,6 +646,12 @@ pub struct EmatixFastParquetTableProvider {
     /// (e.g. Q21 — 4-way join of supplier/lineitem/orders/nation —
     /// picked nation as build side without knowing it has only 25 rows).
     column_stats: Arc<Vec<datafusion::common::stats::ColumnStatistics>>,
+    /// Σ.E5: per-column flag — true iff every row group has a
+    /// dictionary page for this column. Used by
+    /// `supports_filters_pushdown` to gate LIKE-shape pushdowns to
+    /// dict-encoded columns only (PLAIN-encoded LIKE pushdown
+    /// verified-neg on Q13/Q20).
+    column_is_dict_encoded: Arc<Vec<bool>>,
     /// Σ.E5a (Π.10 integration): when true, the filtered-decode path
     /// uses ematix-parquet v0.3.0's `read_column_*_masked_into` façade
     /// (Π.10 late-materialisation) instead of the pre-Π.10 in-flow
@@ -775,6 +811,47 @@ impl EmatixFastParquetTableProvider {
             schema.as_ref(),
         ));
 
+        // Σ.E5: detect columns where EVERY row group has every data
+        // page dict-encoded (RleDictionary or PlainDictionary).
+        // Mere `dictionary_page_offset.is_some()` isn't sufficient —
+        // writers can include a dict page AND fall back to PLAIN for
+        // some data pages mid-chunk (Q13's o_comment, Q20's p_name).
+        // We check via `encoding_stats`: every data page must be
+        // dict-encoded. Used by supports_filters_pushdown to gate
+        // LIKE acceptance — dict-encoded columns let the per-entry
+        // predicate eval run O(|dict|).
+        use datafusion::parquet::basic::{Encoding as PqEnc, PageType as PqPageType};
+        let num_cols_in_schema = schema.fields().len();
+        let mut all_dict: Vec<bool> = vec![true; num_cols_in_schema];
+        for rg in reader.metadata().row_groups() {
+            for col_idx in 0..num_cols_in_schema.min(rg.columns().len()) {
+                if !all_dict[col_idx] {
+                    continue;
+                }
+                let col = rg.column(col_idx);
+                if col.dictionary_page_offset().is_none() {
+                    all_dict[col_idx] = false;
+                    continue;
+                }
+                // Must have encoding stats AND every data page must
+                // be dict-encoded.
+                let Some(stats) = col.page_encoding_stats() else {
+                    // Stats absent — conservatively mark non-dict to
+                    // avoid false-positive LIKE pushdowns.
+                    all_dict[col_idx] = false;
+                    continue;
+                };
+                let all_data_pages_dict = stats.iter().all(|s| {
+                    !matches!(s.page_type, PqPageType::DATA_PAGE | PqPageType::DATA_PAGE_V2)
+                        || matches!(s.encoding, PqEnc::RLE_DICTIONARY | PqEnc::PLAIN_DICTIONARY)
+                });
+                if !all_data_pages_dict {
+                    all_dict[col_idx] = false;
+                }
+            }
+        }
+        let column_is_dict_encoded: Arc<Vec<bool>> = Arc::new(all_dict);
+
         Ok(Self {
             path,
             schema,
@@ -782,6 +859,7 @@ impl EmatixFastParquetTableProvider {
             num_rows,
             rg_num_rows,
             column_stats,
+            column_is_dict_encoded,
             late_mat: true,
             dict_preservation: false,
             // Σ.E5 (2026-05-18): re-flipping streaming default on
@@ -959,13 +1037,14 @@ impl TableProvider for EmatixFastParquetTableProvider {
             .iter()
             .map(|e| {
                 // Σ.E5 #511-513: accept any filter shape recognised by
-                // `predicate_from_expr` (i32/Date32 range + i32 IN +
-                // string Eq + string IN). Always Inexact so DataFusion
-                // keeps the residual FilterExec — necessary for
-                // (a) selectivity-fallback safety in the streaming
-                // reader and (b) Q06-shape low-bandwidth bitmap
-                // overhead avoidance.
-                if predicate_from_expr(e, &self.schema).is_some() {
+                // `predicate_from_expr_with_dict` (i32/Date32 range +
+                // i32 IN + string Eq/NotEq/IN + LIKE on dict-encoded
+                // columns). Always Inexact so DataFusion keeps the
+                // residual FilterExec — necessary for selectivity-
+                // fallback safety in the streaming reader.
+                if predicate_from_expr_with_dict(e, &self.schema, &self.column_is_dict_encoded)
+                    .is_some()
+                {
                     TableProviderFilterPushDown::Inexact
                 } else {
                     TableProviderFilterPushDown::Unsupported
@@ -1000,7 +1079,8 @@ impl TableProvider for EmatixFastParquetTableProvider {
         // for bitmap-first decode. Otherwise the Exec runs Phase 2's
         // dense path (DataFusion's residual FilterExec handles the
         // predicate).
-        let bridge_filter = extract_bridge_filter(filters, &self.schema);
+        let bridge_filter =
+            extract_bridge_filter(filters, &self.schema, &self.column_is_dict_encoded);
 
         // Project the per-column stats so the Exec reports stats in
         // projection order (matches the projected schema indices).
