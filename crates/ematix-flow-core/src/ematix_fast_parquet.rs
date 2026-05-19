@@ -1238,6 +1238,15 @@ impl EmatixFastParquetTableProvider {
     pub fn with_dict_preservation(mut self, on: bool) -> Self {
         self.dict_preservation = on;
         if on {
+            // Σ.E5 follow-up: `try_new` defaults `streaming_arrow_reader`
+            // to true, and the streaming reader doesn't (yet) emit
+            // `DictionaryArray` outputs. Force it off when the caller
+            // asks for dict-preserved arrival so SELECT routes through
+            // the bridge path that actually produces Dict batches.
+            // Reapply via the explicit `with_streaming_arrow_reader(true)`
+            // setter if a future caller wires streaming + dict together.
+            self.streaming_arrow_reader = false;
+
             // Rewrite Utf8 fields → Dictionary(UInt32, Utf8). Other
             // types pass through. Field metadata + nullability
             // preserved.
