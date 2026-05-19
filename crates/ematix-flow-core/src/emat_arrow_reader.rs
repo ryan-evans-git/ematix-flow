@@ -888,18 +888,45 @@ fn masked_decode_one_column(
             // per surviving row emit dict_views[idx] (16-byte gather).
             // No per-row `make_view` call; matches the dense fast
             // path's emission cost.
+            //
+            // Σ.E5 (2026-05-19): falls back to PLAIN masked decode
+            // when the column is non-dict-encoded (Q20's p_name —
+            // writer fell back to PLAIN). The PLAIN path packs bytes
+            // and per-row make_view; slower but correct.
             let mut dict_bytes: Vec<u8> = Vec::new();
             let mut dict_offsets: Vec<u32> = Vec::new();
             let mut all_indices: Vec<u32> = Vec::new();
-            read_column_byte_array_dict_preserved_into(
+            if let Err(_e) = read_column_byte_array_dict_preserved_into(
                 file,
                 rg,
                 leaf,
                 &mut dict_bytes,
                 &mut dict_offsets,
                 &mut all_indices,
-            )
-            .map_err(|e| ext(format!("dict-preserved masked leaf {leaf}: {e}")))?;
+            ) {
+                let vals = masked_decode_byte_array(file, rg, leaf, bitmap)
+                    .map_err(|e| ext(format!("plain masked byte_array leaf {leaf}: {e}")))?;
+                if vals.len() != popcount {
+                    return Err(ext(format!(
+                        "plain masked byte_array leaf {leaf}: got {} rows, expected {popcount}",
+                        vals.len()
+                    )));
+                }
+                let total_bytes: usize = vals.iter().map(|v| v.len()).sum();
+                let mut packed: Vec<u8> = Vec::with_capacity(total_bytes);
+                let mut views: Vec<u128> = Vec::with_capacity(popcount);
+                let block_id: u32 = 0;
+                for v in &vals {
+                    let off = packed.len() as u32;
+                    packed.extend_from_slice(v);
+                    views.push(make_view(v, block_id, off));
+                }
+                return Ok(DecodedColumn::StringView {
+                    views: Buffer::from_vec(views),
+                    n_rows: popcount,
+                    data_buffers: vec![Buffer::from_vec(packed)],
+                });
+            }
 
             // Bytes land in a single buffer; block_id 0.
             let data_buffer = Buffer::from_vec(dict_bytes);

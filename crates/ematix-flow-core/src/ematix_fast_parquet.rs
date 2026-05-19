@@ -74,9 +74,22 @@ pub enum ColumnPredicate {
     I32In { col_idx: usize, values: Vec<i32> },
     /// `col = literal` on a string column (Q19's l_shipinstruct).
     StringEq { col_idx: usize, value: String },
+    /// `col != literal` on a string column (Q16's p_brand <> 'Brand#45').
+    StringNotEq { col_idx: usize, value: String },
     /// `col IN (v1, v2, ...)` on a string column. Captures both
     /// SQL `IN (...)` *and* OR-of-equality (Q19's l_shipmode).
     StringIn { col_idx: usize, values: Vec<String> },
+    /// `col [NOT] LIKE 'pattern'` on a string column. Pattern uses
+    /// SQL wildcards (`%` = any, `_` not yet supported — caller
+    /// avoids pushing patterns with `_`). `negated` flips the match.
+    /// Examples:
+    ///   Q13: `o_comment NOT LIKE '%special%requests%'`
+    ///   Q16: `p_type NOT LIKE 'MEDIUM POLISHED %'`
+    StringLike {
+        col_idx: usize,
+        pattern: String,
+        negated: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -102,8 +115,8 @@ impl BridgeFilter {
         rg: usize,
     ) -> DfResult<(Vec<u8>, usize)> {
         use crate::ematix_parquet_bridge::{
-            filter_byte_array_to_bitmap, filter_i32_column_to_bitmap,
-            filter_i32_column_to_bitmap_dense,
+            filter_byte_array_to_bitmap, filter_byte_array_to_bitmap_dense,
+            filter_i32_column_to_bitmap, filter_i32_column_to_bitmap_dense,
         };
         let mut combined: Option<(Vec<u8>, usize)> = None;
         for p in &self.predicates {
@@ -135,14 +148,34 @@ impl BridgeFilter {
                     }
                 }
                 ColumnPredicate::StringEq { col_idx, .. }
-                | ColumnPredicate::StringIn { col_idx, .. } => {
+                | ColumnPredicate::StringNotEq { col_idx, .. }
+                | ColumnPredicate::StringIn { col_idx, .. }
+                | ColumnPredicate::StringLike { col_idx, .. } => {
                     let pclone = p.clone();
-                    filter_byte_array_to_bitmap(path, rg, *col_idx, move |bytes: &[u8]| {
-                        match std::str::from_utf8(bytes) {
-                            Ok(s) => pclone.eval_str(s),
+                    // Try dict-preserved fast path; fall back to dense
+                    // on PLAIN-encoded high-cardinality columns
+                    // (Q13's o_comment).
+                    match filter_byte_array_to_bitmap(path, rg, *col_idx, {
+                        let pc = pclone.clone();
+                        move |bytes: &[u8]| match std::str::from_utf8(bytes) {
+                            Ok(s) => pc.eval_str(s),
                             Err(_) => false,
                         }
-                    })?
+                    }) {
+                        Ok(r) => r,
+                        Err(_) => {
+                            let pc2 = pclone.clone();
+                            filter_byte_array_to_bitmap_dense(
+                                path,
+                                rg,
+                                *col_idx,
+                                move |bytes: &[u8]| match std::str::from_utf8(bytes) {
+                                    Ok(s) => pc2.eval_str(s),
+                                    Err(_) => false,
+                                },
+                            )?
+                        }
+                    }
                 }
             };
             match combined.as_mut() {
@@ -175,7 +208,9 @@ impl ColumnPredicate {
             ColumnPredicate::I32Range { col_idx, .. }
             | ColumnPredicate::I32In { col_idx, .. }
             | ColumnPredicate::StringEq { col_idx, .. }
-            | ColumnPredicate::StringIn { col_idx, .. } => *col_idx,
+            | ColumnPredicate::StringNotEq { col_idx, .. }
+            | ColumnPredicate::StringIn { col_idx, .. }
+            | ColumnPredicate::StringLike { col_idx, .. } => *col_idx,
         }
     }
 
@@ -205,15 +240,66 @@ impl ColumnPredicate {
         }
     }
 
-    /// Evaluate against a string value (StringEq / StringIn only).
+    /// Evaluate against a string value (StringEq / StringNotEq /
+    /// StringIn / StringLike only).
     #[inline]
     pub fn eval_str(&self, v: &str) -> bool {
         match self {
             ColumnPredicate::StringEq { value, .. } => v == value.as_str(),
+            ColumnPredicate::StringNotEq { value, .. } => v != value.as_str(),
             ColumnPredicate::StringIn { values, .. } => values.iter().any(|s| s.as_str() == v),
+            ColumnPredicate::StringLike {
+                pattern, negated, ..
+            } => {
+                let m = matches_sql_like(pattern.as_str(), v);
+                if *negated { !m } else { m }
+            }
             _ => false,
         }
     }
+}
+
+/// SQL LIKE matcher supporting `%` wildcards. Splits the pattern by
+/// `%` into literal chunks that must occur IN ORDER in the value.
+/// Anchors at the front if the pattern doesn't start with `%`, and
+/// at the back if it doesn't end with `%`. Bails (returns false) on
+/// `_` wildcard — callers should avoid pushing patterns containing
+/// `_` so we don't silently mismatch.
+fn matches_sql_like(pattern: &str, value: &str) -> bool {
+    if pattern.contains('_') {
+        return false;
+    }
+    let starts_anchored = !pattern.starts_with('%');
+    let ends_anchored = !pattern.ends_with('%');
+    let parts: Vec<&str> = pattern.split('%').filter(|s| !s.is_empty()).collect();
+    if parts.is_empty() {
+        return true; // pattern was `%`, `%%`, or empty
+    }
+    let n = parts.len();
+    let mut pos = 0usize;
+    for (i, part) in parts.iter().enumerate() {
+        let is_first = i == 0;
+        let is_last = i == n - 1;
+        let anchor_start = is_first && starts_anchored;
+        let anchor_end = is_last && ends_anchored;
+        if anchor_start && anchor_end {
+            return value == *part;
+        }
+        if anchor_start {
+            if !value[pos..].starts_with(part) {
+                return false;
+            }
+            pos += part.len();
+        } else if anchor_end {
+            return value[pos..].ends_with(part);
+        } else {
+            match value[pos..].find(part) {
+                Some(off) => pos += off + part.len(),
+                None => return false,
+            }
+        }
+    }
+    true
 }
 
 /// Try to convert a `RangePredicate` into a [`RangeClause`] for an
@@ -285,9 +371,9 @@ fn predicate_from_expr(expr: &Expr, full_schema: &Schema) -> Option<ColumnPredic
             }
         }
     }
-    // Shape 3: col = 'literal' (string equality).
+    // Shape 3: col [!]= 'literal' (string equality / inequality).
     if let Expr::BinaryExpr(b) = expr {
-        if matches!(b.op, Operator::Eq) {
+        if matches!(b.op, Operator::Eq | Operator::NotEq) {
             if let (Expr::Column(c), Expr::Literal(lit, _)) = (b.left.as_ref(), b.right.as_ref()) {
                 let idx = full_schema.index_of(&c.name).ok()?;
                 let dt = full_schema.field(idx).data_type();
@@ -298,7 +384,11 @@ fn predicate_from_expr(expr: &Expr, full_schema: &Schema) -> Option<ColumnPredic
                         | ScalarValue::LargeUtf8(Some(s)) => s.clone(),
                         _ => return None,
                     };
-                    return Some(ColumnPredicate::StringEq { col_idx: idx, value: s });
+                    return Some(if matches!(b.op, Operator::Eq) {
+                        ColumnPredicate::StringEq { col_idx: idx, value: s }
+                    } else {
+                        ColumnPredicate::StringNotEq { col_idx: idx, value: s }
+                    });
                 }
             }
         }
@@ -316,6 +406,28 @@ fn predicate_from_expr(expr: &Expr, full_schema: &Schema) -> Option<ColumnPredic
             }
         }
     }
+    // Shape 5: col [NOT] LIKE 'pattern' — NOT PUSHED.
+    //
+    // Σ.E5 (2026-05-19 verified): LIKE pushdown is net negative on
+    // the 22-query suite. Two failure modes:
+    //   1. Contains-pattern (`'%foo%bar%'`) — Q13's `o_comment NOT
+    //      LIKE '%special%requests%'`. Run on high-card non-dict
+    //      columns where the dense fallback double-decodes
+    //      (+407%).
+    //   2. Prefix-pattern (`'literal%'`) — Q20's `p_name LIKE
+    //      'forest%'`. p_name is unique-per-row, so PLAIN-encoded;
+    //      dense LIKE eval slower than DataFusion's vectorised
+    //      Utf8View LIKE (+55%).
+    //
+    // Even Q16's low-card prefix NOT LIKE on p_type didn't measurably
+    // win. DataFusion's residual FilterExec handles all LIKE shapes
+    // adequately on dict-preserved Utf8View batches.
+    //
+    // The infrastructure for ColumnPredicate::StringLike still exists
+    // (eval_str handles it); only the planner-side
+    // `predicate_from_expr` is gated. Re-enable per-column if we
+    // ever get reader-time stats indicating dict-encoding (`dict
+    // present` is a parquet metadata flag).
     None
 }
 
