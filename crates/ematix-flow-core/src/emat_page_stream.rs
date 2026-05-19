@@ -489,7 +489,8 @@ impl ColumnPageStream for StringViewPageStream {
 // Streaming reader (driver)
 // ============================================================
 
-use std::sync::{Mutex, OnceLock, mpsc};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Condvar, Mutex, OnceLock, mpsc};
 
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
@@ -563,26 +564,97 @@ impl DecodePool {
     }
 }
 
-/// Σ.E5.6 page-streaming reader (shared-pool variant).
+/// Per-RG decode state, shared between the pool's column-decoder
+/// jobs and the emit thread.
 ///
-/// Per RG, each projected column gets one `ColumnPageStream` wrapped
-/// in a `Mutex<>`. Per batch, the emit thread submits one decode-and-
-/// slice job per column to the global `DecodePool`. Pool workers run
-/// the decode loop in parallel and reply via mpsc.
+/// One decoder job per column runs to completion; each job
+/// monotonically grows its `rows_decoded[i]` atomic after each page.
+/// The emit thread reads atomics + uses the condvar to sleep-wait
+/// for progress; it locks each stream only briefly (during slicing).
 ///
-/// Why the global pool: with per-RG `std::thread::spawn` (previous
-/// variant), Q19 sees 6 partitions × 6 cols = 36 concurrent decoder
-/// threads on a 14-core box. The 2.5× oversubscription regressed the
-/// 22-query geomean to 1.0017 (vs eager 0.9363). With the global
-/// pool, total active decoder threads = core count regardless of
-/// partition × col, so the streaming win can actually surface.
+/// This eliminates per-batch mpsc round-trips — for an RG with 16
+/// batches and 6 columns, the previous design did 192 channel ops
+/// (12 per batch). This design does 12 ops per RG (6 submits +
+/// 6 implicit "done" signals via the rows_decoded atomic reaching
+/// total).
+struct RgDecodeState {
+    streams: Vec<Mutex<Box<dyn ColumnPageStream>>>,
+    /// Per-column rows decoded so far. Monotonic. `Acquire`/`Release`
+    /// pair across decoder and emit thread.
+    rows_decoded: Vec<AtomicUsize>,
+    /// Per-column total row count (set at open time, immutable).
+    total_rows: Vec<usize>,
+    /// Per-column target Arrow type (for `make_array`).
+    targets: Vec<DataType>,
+    /// `(notify_mutex, cv)` — decoder threads `notify_one` after
+    /// each page decode; emit thread `wait`s when no column meets
+    /// the target.
+    notify: Mutex<()>,
+    cv: Condvar,
+    /// Latched decoder error (set on first failure; subsequent
+    /// decoders short-circuit; emit thread reports it).
+    error: Mutex<Option<DataFusionError>>,
+}
+
+impl RgDecodeState {
+    fn decoder_loop(self: std::sync::Arc<Self>, col_idx: usize) {
+        loop {
+            // Short-circuit if another column already failed.
+            if self.error.lock().unwrap().is_some() {
+                return;
+            }
+
+            let mut guard = match self.streams[col_idx].lock() {
+                Ok(g) => g,
+                Err(_) => return,
+            };
+            if guard.rows_decoded() >= guard.total_rows() {
+                return;
+            }
+            let r = match guard.decode_next_page() {
+                Ok(_) => guard.rows_decoded(),
+                Err(e) => {
+                    *self.error.lock().unwrap() = Some(e);
+                    drop(guard);
+                    // Final wake — emit thread polls error and surfaces it.
+                    let _g = self.notify.lock().unwrap();
+                    self.cv.notify_one();
+                    return;
+                }
+            };
+            drop(guard);
+            // Publish progress to emit thread.
+            self.rows_decoded[col_idx].store(r, Ordering::Release);
+            let _g = self.notify.lock().unwrap();
+            self.cv.notify_one();
+        }
+    }
+}
+
+/// Σ.E5.6 page-streaming reader (shared-pool + atomic-poll variant).
 ///
-/// First-batch latency: roughly `max(first_page_decode_time)` across
-/// columns (parallel via pool), vs the eager `EmatArrowBatchReader`
-/// which pays `max(full_column_decode_time)`. For Q19 lineitem
-/// (6 cols, decode times 1-5 ms/RG each) this should drop first-batch
-/// latency by ~3-5× — enough for downstream FilterExec/HashJoin to
-/// overlap.
+/// **Per-RG model:** when a new RG opens, one decode-to-completion
+/// job per column is submitted to the global `DecodePool`. Each
+/// decoder thread runs its `ColumnPageStream` page-by-page,
+/// publishing `rows_decoded` via an atomic after each page.
+///
+/// **Per-batch emit:** the emit thread polls the per-column atomic
+/// counters; when every column has `rows_decoded >= cursor +
+/// batch_size` (or is exhausted at its `total_rows`), it briefly
+/// locks each stream, calls `make_array(cursor, n, target)`, and
+/// emits the batch. Between polls it sleeps on the per-RG Condvar
+/// (woken by each decoder's `notify_one`).
+///
+/// **What's eliminated vs the per-batch variant:** the mpsc round-
+/// trip per (column × batch). For an RG with 16 batches × 6 cols
+/// that's 192 channel ops → 12 per RG. Decoders also run *ahead*
+/// of the emit thread, so their pages are pre-positioned by the
+/// time the next batch boundary arrives.
+///
+/// **Sync cost:** one atomic-store + one `notify_one` per page;
+/// emit thread does one atomic-load per column per poll iteration.
+/// Lock acquisitions only for the brief `make_array` window
+/// (typically <10µs).
 pub struct EmatPageStreamingReader {
     file: ParquetFile,
     arrow_schema: SchemaRef,
@@ -591,9 +663,7 @@ pub struct EmatPageStreamingReader {
     batch_size: usize,
 
     cur_rg_idx: usize,
-    // Arc wraps the Vec so we can hand clones to pool jobs without
-    // self-borrow issues.
-    cur_rg_streams: Option<std::sync::Arc<Vec<Mutex<Box<dyn ColumnPageStream>>>>>,
+    cur_rg_state: Option<std::sync::Arc<RgDecodeState>>,
     cur_rg_total: usize,
     cur_rg_row: usize,
 }
@@ -613,7 +683,7 @@ impl EmatPageStreamingReader {
             row_groups,
             batch_size,
             cur_rg_idx: 0,
-            cur_rg_streams: None,
+            cur_rg_state: None,
             cur_rg_total: 0,
             cur_rg_row: 0,
         }
@@ -632,8 +702,10 @@ impl EmatPageStreamingReader {
         self.cur_rg_total = row_group.num_rows as usize;
         drop(md);
 
-        let mut streams: Vec<Mutex<Box<dyn ColumnPageStream>>> =
-            Vec::with_capacity(self.projection.len());
+        let n_cols = self.projection.len();
+        let mut streams: Vec<Mutex<Box<dyn ColumnPageStream>>> = Vec::with_capacity(n_cols);
+        let mut total_rows: Vec<usize> = Vec::with_capacity(n_cols);
+        let mut targets: Vec<DataType> = Vec::with_capacity(n_cols);
         for (i, &leaf) in self.projection.iter().enumerate() {
             let target = self.arrow_schema.field(i).data_type().clone();
             let stream: Box<dyn ColumnPageStream> = match &target {
@@ -649,20 +721,82 @@ impl EmatPageStreamingReader {
                     )));
                 }
             };
+            total_rows.push(stream.total_rows());
+            targets.push(target);
             streams.push(Mutex::new(stream));
         }
-        self.cur_rg_streams = Some(std::sync::Arc::new(streams));
+
+        let state = std::sync::Arc::new(RgDecodeState {
+            streams,
+            rows_decoded: (0..n_cols).map(|_| AtomicUsize::new(0)).collect(),
+            total_rows,
+            targets,
+            notify: Mutex::new(()),
+            cv: Condvar::new(),
+            error: Mutex::new(None),
+        });
+
+        // Submit one decode-to-completion job per column.
+        let pool = DecodePool::global();
+        for col_idx in 0..n_cols {
+            let state = std::sync::Arc::clone(&state);
+            pool.submit(move || state.decoder_loop(col_idx));
+        }
+
+        self.cur_rg_state = Some(state);
         self.cur_rg_row = 0;
         Ok(())
+    }
+
+    /// Wait until every column has either reached `target_rows` or
+    /// exhausted its column total. Returns `Err` if any decoder
+    /// surfaced an error.
+    fn wait_for_target(state: &RgDecodeState, target_rows: usize) -> DfResult<()> {
+        loop {
+            // Check decoder errors first.
+            if let Some(e) = state.error.lock().unwrap().take() {
+                return Err(e);
+            }
+
+            let mut all_at_target = true;
+            for i in 0..state.rows_decoded.len() {
+                let r = state.rows_decoded[i].load(Ordering::Acquire);
+                if r < target_rows && r < state.total_rows[i] {
+                    all_at_target = false;
+                    break;
+                }
+            }
+            if all_at_target {
+                return Ok(());
+            }
+
+            // Sleep until a decoder makes progress.
+            let guard = state
+                .notify
+                .lock()
+                .map_err(|e| ext(format!("notify lock poisoned: {e}")))?;
+            // `wait` releases the guard, sleeps, re-acquires on
+            // notify. The decoder always grabs `notify` before
+            // notify_one, so we don't miss wakeups.
+            let _g = state
+                .cv
+                .wait(guard)
+                .map_err(|e| ext(format!("cv wait poisoned: {e}")))?;
+        }
     }
 
     fn next_batch(&mut self) -> DfResult<Option<RecordBatch>> {
         loop {
             let need_new_rg =
-                self.cur_rg_streams.is_none() || self.cur_rg_row >= self.cur_rg_total;
+                self.cur_rg_state.is_none() || self.cur_rg_row >= self.cur_rg_total;
             if need_new_rg {
+                // Drop previous state. Decoders may still be running
+                // briefly; the Arc keeps the state alive until they
+                // finish their current page, then they exit (their
+                // streams are at total_rows or they hit the error
+                // latch).
+                self.cur_rg_state = None;
                 if self.cur_rg_idx >= self.row_groups.len() {
-                    self.cur_rg_streams = None;
                     return Ok(None);
                 }
                 let rg = self.row_groups[self.cur_rg_idx];
@@ -676,53 +810,25 @@ impl EmatPageStreamingReader {
             let remaining = self.cur_rg_total - self.cur_rg_row;
             let n = remaining.min(self.batch_size);
             let start = self.cur_rg_row;
+            let target_rows = start + n;
 
-            let streams = std::sync::Arc::clone(
-                self.cur_rg_streams
-                    .as_ref()
-                    .expect("cur_rg_streams set above"),
-            );
-            let n_streams = streams.len();
-            let pool = DecodePool::global();
-            let (tx, rx) = mpsc::channel::<(usize, DfResult<ArrayRef>)>();
+            let state = self
+                .cur_rg_state
+                .as_ref()
+                .expect("cur_rg_state set above")
+                .clone();
 
-            for i in 0..n_streams {
-                let streams = std::sync::Arc::clone(&streams);
-                let tx = tx.clone();
-                let target = self.arrow_schema.field(i).data_type().clone();
-                pool.submit(move || {
-                    let result = (|| -> DfResult<ArrayRef> {
-                        let mut guard = streams[i]
-                            .lock()
-                            .map_err(|e| ext(format!("stream poisoned: {e}")))?;
-                        let target_rows = start + n;
-                        while guard.rows_decoded() < target_rows
-                            && guard.rows_decoded() < guard.total_rows()
-                        {
-                            guard.decode_next_page()?;
-                        }
-                        if guard.rows_decoded() < target_rows {
-                            return Err(ext(format!(
-                                "column {i} decoder ran out: need {target_rows}, have {}",
-                                guard.rows_decoded()
-                            )));
-                        }
-                        Ok(guard.make_array(start, n, &target))
-                    })();
-                    let _ = tx.send((i, result));
-                });
+            Self::wait_for_target(&state, target_rows)?;
+
+            // All columns at target. Briefly lock each to slice.
+            let n_cols = state.rows_decoded.len();
+            let mut arrays: Vec<ArrayRef> = Vec::with_capacity(n_cols);
+            for i in 0..n_cols {
+                let guard = state.streams[i]
+                    .lock()
+                    .map_err(|e| ext(format!("stream lock poisoned: {e}")))?;
+                arrays.push(guard.make_array(start, n, &state.targets[i]));
             }
-            drop(tx);
-
-            let mut arrays: Vec<Option<ArrayRef>> = (0..n_streams).map(|_| None).collect();
-            for _ in 0..n_streams {
-                let (i, r) = rx
-                    .recv()
-                    .map_err(|e| ext(format!("pool reply recv: {e}")))?;
-                arrays[i] = Some(r?);
-            }
-            let arrays: Vec<ArrayRef> =
-                arrays.into_iter().map(|a| a.expect("slot filled")).collect();
             self.cur_rg_row += n;
             return Ok(Some(
                 RecordBatch::try_new(self.arrow_schema.clone(), arrays)
