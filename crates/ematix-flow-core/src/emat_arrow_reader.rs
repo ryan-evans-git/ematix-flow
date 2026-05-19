@@ -1465,35 +1465,63 @@ fn decode_byte_array_to_string_view_slow(
 /// coalescing path did.
 ///
 /// Format: parquet BYTE_ARRAY PLAIN is `[u32 len][bytes]` repeated.
-#[inline]
+///
+/// Σ.E5 (2026-05-19): inlined the long-string (>12 B) view construction.
+/// Arrow's `make_view` is `#[inline(never)]` and dominates Q13 decode
+/// (~30 ns/row × 1.5 M = 45 ms). For values > 12 bytes the view is
+/// `[len:u32 | prefix:u32 | block_id:u32 | offset:u32]` little-endian,
+/// which we can splice directly into a `u128`. Short strings (≤ 12 B)
+/// fall back to `make_view` for the per-length inline specialization.
+#[inline(always)]
 fn plain_byte_array_to_views_in_place(
     page_buf: &[u8],
     views: &mut Vec<u128>,
     n: usize,
     block_id: u32,
 ) -> DfResult<()> {
-    let mut off = 0usize;
     let page_len = page_buf.len();
+    let bytes_ptr = page_buf.as_ptr();
+    let mut off = 0usize;
+    let block_hi = (block_id as u128) << 64;
+    views.reserve(n);
+
     for i in 0..n {
         if off + 4 > page_len {
             return Err(ext(format!(
                 "plain byte_array: truncated length prefix at value {i}/{n}, offset {off}/{page_len}"
             )));
         }
-        let len = u32::from_le_bytes([
-            page_buf[off],
-            page_buf[off + 1],
-            page_buf[off + 2],
-            page_buf[off + 3],
-        ]) as usize;
+        // Unaligned u32 read of the length prefix.
+        let len = unsafe {
+            std::ptr::read_unaligned(bytes_ptr.add(off) as *const u32)
+        } as usize;
         off += 4;
         if off + len > page_len {
             return Err(ext(format!(
                 "plain byte_array: value {i}/{n} length {len} overruns page at offset {off}"
             )));
         }
-        let bytes = &page_buf[off..off + len];
-        views.push(make_view(bytes, block_id, off as u32));
+
+        let view: u128 = if len > 12 {
+            // Inlined ByteView u128 layout (LE):
+            //   bytes 0..4  = length
+            //   bytes 4..8  = first-4-byte prefix
+            //   bytes 8..12 = buffer_index (= block_id)
+            //   bytes 12..16 = offset (= off as u32)
+            let prefix = unsafe {
+                std::ptr::read_unaligned(bytes_ptr.add(off) as *const u32)
+            };
+            (len as u128)
+                | ((prefix as u128) << 32)
+                | block_hi
+                | ((off as u128) << 96)
+        } else {
+            // Short strings need byte-by-byte inlining into the u128
+            // body — `make_view` jump-tables on length for this.
+            let bytes = &page_buf[off..off + len];
+            make_view(bytes, block_id, off as u32)
+        };
+        views.push(view);
         off += len;
     }
     Ok(())
