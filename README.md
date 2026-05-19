@@ -9,35 +9,58 @@
 
 # ematix-flow
 
-**A declarative Python framework for moving and transforming data
-between databases, files, and streaming sources. Rust + Apache
-Arrow under the hood.**
+**Declarative Python data pipelines. Rust + Apache Arrow under the hood.**
 
-> Status: **v0.3.0 on PyPI** as `ematix-flow`. All four
-> surfaces below — declarative pipelines, multi-backend, streaming,
-> stream processing — are shipped and stable. v0.3.0 ships the
-> ematix-parquet 0.12.0 backend (NEON + AVX2 small-bit-width SIMD,
-> parallel page decompression, buffer-reuse on the hot path) and
-> the generalised `InjectFilterMultiAggRule` / `InjectFilterSumRule`
-> physical-optimiser rules. Net effect on TPC-H SF=1:
-> **18/22 wins** vs DuckDB / Polars / PySpark, **12.9×** geomean
-> speedup over single-node PySpark.
+Move data between databases, files, and streams with one decorator. Cron
+schedules, DAG dependencies, watermarks, schema evolution, restart-safe state,
+and at-least-once delivery are all built in — no extra scheduler service to
+deploy.
 
-ematix-flow lets you declare a target table and a load strategy
-in Python; the framework handles schema evolution, watermarks,
-restart-safe state, at-least-once delivery, and change-data-
-capture. Pipelines carry their own `schedule="*/5 * * * *"` and
-fire from `flow run-due` (drop that into cron / a k8s `CronJob` /
-GitHub Actions and you have a working pipeline tier with no
-scheduler service to operate). Plug in Airflow / Dagster /
-Prefect if you'd rather, by calling each pipeline's `.sync()`
-directly. The same primitives power batch loads (Postgres,
-MySQL, SQLite, DuckDB), file targets (Parquet, CSV, JSON, ORC,
-Delta Lake — local or S3), and long-running streaming consumers
-(Kafka, RabbitMQ, GCP Pub/Sub, AWS Kinesis).
+```python
+from ematix_flow import ematix, Annotated, BigInt, Text, TimestampTZ, pk
 
-The rest of this README walks through how to use it, in the
-order you'd reach for each feature.
+class Events:
+    event_id: Annotated[BigInt, pk()]
+    name: Text | None
+    received_at: TimestampTZ
+
+@ematix.pipeline(
+    target=Events,
+    target_connection="warehouse",
+    schedule="*/5 * * * *",
+    mode="append",
+)
+def ingest_events(conn):
+    return "SELECT event_id, name, received_at FROM raw.events"
+```
+
+```sh
+pip install ematix-flow
+flow run-due --module my_pipelines    # cron-style; drop into systemd / cron / k8s CronJob
+```
+
+## Why ematix-flow
+
+- **Fast.** TPC-H SF=1, 22 queries, single Apple M3 Pro: **1.69× faster than
+  DuckDB**, **2.71× faster than Polars**, **12.9× faster than single-node
+  PySpark** (geomean). 18 / 22 wins outright. Full numbers and reproducer in
+  [Benchmarks](#benchmarks).
+- **Scheduling + DAG, no service to operate.** Pipelines carry their own
+  cron schedule and `depends_on=` edges (with cycle detection and exponential-
+  backoff retries). Run `flow run-due` from cron, systemd, a k8s `CronJob`,
+  GitHub Actions, or the bundled long-running scheduler — same code, same
+  topological order, same retry semantics. Already on Airflow / Dagster /
+  Prefect? Call `.sync()` directly.
+- **Batteries included.** Postgres, MySQL, SQLite, DuckDB, Kafka, RabbitMQ,
+  Kinesis, Pub/Sub, S3, Delta Lake. Schema Registry + Avro / Protobuf. CDC
+  source mode dispatches per-op transactionally to your existing target.
+- **Operationally honest.** Restart-safe state, watermarks, at-least-once
+  delivery, credential redaction, structured run history, Prometheus +
+  OpenTelemetry metrics, Slack alerts.
+
+> Status: **v0.3.0 on PyPI** as `ematix-flow`. All four surfaces — declarative
+> pipelines, multi-backend, streaming, stream processing — are shipped and
+> stable.
 
 ---
 
