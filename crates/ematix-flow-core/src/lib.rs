@@ -123,6 +123,10 @@ pub mod dict_aggregate;
 pub mod dict_aggregate_rule;
 pub mod hash;
 pub mod join;
+// Σ.E5 (2026-05-19): Photon-style vectorized LIKE pattern matcher
+// using memchr::memmem. Used by emat's BridgeFilter for byte_array
+// substring predicates (and available as a standalone utility).
+pub mod like_matcher;
 pub mod kafka_backend;
 pub mod kinesis_backend;
 pub mod meta;

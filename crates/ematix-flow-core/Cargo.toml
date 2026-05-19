@@ -26,6 +26,10 @@ async-trait = "0.1"
 # Π.4a: CsvReadOptions.null_regex compiles to a regex::Regex which
 # the arrow-csv reader's with_null_regex consumes.
 regex = "1"
+# Σ.E5 (2026-05-19): memchr::memmem provides SIMD-accelerated
+# substring search (two-way + AVX2/NEON). Used by the like_matcher
+# module to evaluate LIKE patterns Photon-style on raw byte slices.
+memchr = "2"
 arrow-array = { workspace = true }
 arrow-schema = { workspace = true }
 arrow-csv = { workspace = true }
@@ -48,9 +52,14 @@ object_store = { workspace = true }
 # to produce Arrow arrays from column chunks without going through
 # parquet-rs's ParquetRecordBatchReader. Long-term: alternate backend
 # for FastParquetExec.
-ematix-parquet-codec = { version = "0.10.0" }
-ematix-parquet-format = { version = "0.10.0" }
-ematix-parquet-io = { version = "0.10.0" }
+# TEMPORARY (Σ.E5.6 alloc-churn experiment, 2026-05-18): path overrides
+# to the sibling repo so we can test `ParquetFile::read_range_into`
+# (a buffer-reuse API being prototyped for v0.11.0). Revert these
+# back to version pins before merging — and bump to 0.11.0 once that
+# release ships the API.
+ematix-parquet-codec = { path = "../../../ematix-parquet/crates/ematix-parquet-codec" }
+ematix-parquet-format = { path = "../../../ematix-parquet/crates/ematix-parquet-format" }
+ematix-parquet-io = { path = "../../../ematix-parquet/crates/ematix-parquet-io" }
 deltalake = { workspace = true }
 datafusion = { workspace = true }
 cranelift = { workspace = true }

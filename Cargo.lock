@@ -3758,6 +3758,7 @@ dependencies = [
  "google-cloud-pubsub",
  "hyperloglogplus",
  "lapin",
+ "memchr",
  "mimalloc",
  "mysql_async",
  "object_store 0.13.2",
