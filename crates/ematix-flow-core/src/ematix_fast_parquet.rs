@@ -580,7 +580,17 @@ fn predicate_from_expr_with_dict(
         if !matches!(dt, DataType::Utf8 | DataType::Utf8View) {
             return None;
         }
-        // Gate on the dict-encoded flag.
+        // Gate on the dict-encoded flag. Σ.E5 (2026-05-19, smoke):
+        // tried lifting this gate + Exact pushdown so DataFusion
+        // would drop the filter col from projection. Confirmed
+        // projection IS dropped (`proj=Some([0,1])` excluding
+        // o_comment), but Q13 regressed +25% → +123% anyway —
+        // emat's masked-decode kernel for the projection cols is
+        // slower than the dense decode + FilterExec path. The LIKE
+        // eval is only ~38ms of the 50ms regression; the bitmap-
+        // build dense byte_array decode + masked i32/i64 decode of
+        // o_orderkey/o_custkey dominates. PLAIN LIKE pushdown stays
+        // off until the masked decode kernel matches dense throughput.
         if !column_is_dict_encoded.get(idx).copied().unwrap_or(false) {
             return None;
         }
