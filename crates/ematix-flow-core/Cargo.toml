@@ -15,6 +15,12 @@ name = "ematix_flow_core"
 # Σ.G.2f.3: MPMC channel for FusedAggregateExec's direct fan-out
 # (skips RepartitionExec's per-output-partition mpsc setup).
 async-channel = "2"
+# Σ.E5 (2026-05-19): rayon for intra-column-chunk parallel page
+# decompression in decode_byte_array_to_string_view_slow. Q13
+# profile shows Snappy decompress is 86% of column-decode time
+# (~42ms cumulative for o_comment); per-page parallelism collapses
+# the sequential tail.
+rayon = "1"
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

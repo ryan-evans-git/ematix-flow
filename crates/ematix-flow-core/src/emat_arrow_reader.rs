@@ -1755,6 +1755,18 @@ fn decode_byte_array_to_string_view_slow(
     chunk_buf: &mut Vec<u8>,
     cm: &CachedColumnChunk,
 ) -> DfResult<DecodedColumn> {
+    // Σ.E5 (2026-05-19): EMAT_DECODE_TIMING=1 dumps per-stage
+    // breakdown (read / decompress / view-build) for the slow path.
+    // Σ.E5 (2026-05-19): Q13 profile showed Snappy decompress is
+    // 86% of column-decode time (~42ms cumulative for o_comment
+    // across both RGs, sequential). Refactored to pre-walk pages,
+    // then rayon-parallelise the decompress+view-build of remaining
+    // data pages with pre-assigned block_ids. EMAT_DECODE_SERIAL=1
+    // forces back to the legacy sequential path for A/B testing.
+    let timing = std::env::var_os("EMAT_DECODE_TIMING").is_some();
+    let force_serial = std::env::var_os("EMAT_DECODE_SERIAL").is_some();
+    let t0 = std::time::Instant::now();
+
     let total = cm.num_values as usize;
     let codec = cm.codec;
     let start = cm
@@ -1765,6 +1777,12 @@ fn decode_byte_array_to_string_view_slow(
     file.read_range_into(chunk_buf, start, length)
         .map_err(|e| ext(format!("read_range_into: {e}")))?;
     let chunk = &chunk_buf[..];
+    let read_ns = t0.elapsed().as_nanos();
+    let mut decompress_ns: u128 = 0;
+    let mut viewbuild_ns: u128 = 0;
+    let mut n_pages_dict: usize = 0;
+    let mut n_pages_plain: usize = 0;
+    let mut n_pages_rle: usize = 0;
 
     let mut walker = PageWalker::new(&chunk);
     let mut views: Vec<u128> = Vec::with_capacity(total);
@@ -1795,7 +1813,10 @@ fn decode_byte_array_to_string_view_slow(
         // record per-entry (offset, length) within it. The decoded
         // bytes are *exactly* what we want as the backing block.
         let mut dict_scratch: Vec<u8> = Vec::with_capacity(first_body.len() * 2);
+        let td = std::time::Instant::now();
         decompress_into(codec, first_body, &mut dict_scratch)?;
+        decompress_ns += td.elapsed().as_nanos();
+        n_pages_dict += 1;
         let entries = decode_plain_byte_array(&dict_scratch)
             .map_err(|e| ext(format!("plain byte_array dict: {e}")))?;
         // Compute offsets directly into `dict_scratch` by pointer math:
@@ -1822,19 +1843,33 @@ fn decode_byte_array_to_string_view_slow(
         }
         let n = dph.num_values as usize;
         let mut page_buf: Vec<u8> = Vec::with_capacity(first_body.len() * 2);
+        let td = std::time::Instant::now();
         decompress_into(codec, first_body, &mut page_buf)?;
+        decompress_ns += td.elapsed().as_nanos();
         let block_id = data_buffers.len() as u32;
+        let tv = std::time::Instant::now();
         plain_byte_array_to_views_in_place(&page_buf, &mut views, n, block_id)?;
+        viewbuild_ns += tv.elapsed().as_nanos();
+        n_pages_plain += 1;
         data_buffers.push(Buffer::from_vec(page_buf));
     }
 
-    // Σ.E5 (2026-05-19): reusable per-RG scratch buffers — one Vec each
-    // grows to max-page size on the first page, then steady-state zero
-    // allocs. Replaces the per-page Vec churn that dominated allocator
-    // profile (1117 madvise samples in the prior Q19 profile).
-    let mut idx_scratch: Vec<u8> = Vec::new();
-    let mut idx_buf: Vec<u32> = Vec::new();
-    while views.len() < total {
+    // Σ.E5 (2026-05-19): pre-walk remaining data pages so we can
+    // either keep the serial inline loop OR fan-out via rayon. The
+    // walk itself is cheap (just thrift header reads + slice math)
+    // but the per-page decompress + view-build is the hot work.
+    struct PendingPage<'a> {
+        encoding: Encoding,
+        body: &'a [u8],
+        n_values: usize,
+        // Block_id of the data_buffers slot this page writes into
+        // (for PLAIN pages; RleDict pages reuse block 0 from dict).
+        block_id: u32,
+    }
+    let mut pending: Vec<PendingPage<'_>> = Vec::new();
+    let mut next_block_id = data_buffers.len() as u32;
+    let mut rows_seen = views.len();
+    while rows_seen < total {
         let (hdr, body) = walker
             .next_page()
             .map_err(|e| ext(format!("next_page: {e}")))?
@@ -1844,10 +1879,126 @@ fn decode_byte_array_to_string_view_slow(
             .as_ref()
             .ok_or_else(|| ext("v2 pages not yet supported"))?;
         let n = dph.num_values as usize;
-        match dph.encoding {
+        let block_id = if matches!(dph.encoding, Encoding::Plain) {
+            let bid = next_block_id;
+            next_block_id += 1;
+            bid
+        } else {
+            0
+        };
+        pending.push(PendingPage {
+            encoding: dph.encoding,
+            body,
+            n_values: n,
+            block_id,
+        });
+        rows_seen += n;
+    }
+
+    // Parallel branch: decompress + build views for each pending
+    // page in rayon. Each task returns (page_views, optional page_buf
+    // for PLAIN). Block IDs were pre-assigned above so each task's
+    // views reference the correct data_buffers slot once we
+    // sequentially append.
+    if !force_serial && pending.len() > 1 {
+        use rayon::prelude::*;
+        let dict_offsets_ref = &dict_offsets;
+        let dict_lengths_ref = &dict_lengths;
+        let dict_bytes_ref: &[u8] = if data_buffers.is_empty() {
+            &[]
+        } else {
+            data_buffers[0].as_slice()
+        };
+        let codec_copy = codec;
+
+        let td = std::time::Instant::now();
+        let results: Vec<DfResult<(Vec<u128>, Option<Vec<u8>>)>> = pending
+            .par_iter()
+            .map(|p| {
+                match p.encoding {
+                    Encoding::RleDictionary | Encoding::PlainDictionary => {
+                        let mut idx_scratch: Vec<u8> = Vec::new();
+                        decompress_into(codec_copy, p.body, &mut idx_scratch)?;
+                        let mut idx_buf: Vec<u32> = Vec::with_capacity(p.n_values);
+                        ematix_parquet_codec::dict::decode_rle_dictionary_indices_into(
+                            &idx_scratch,
+                            p.n_values,
+                            &mut idx_buf,
+                        )
+                        .map_err(|e| ext(format!("rle_dict_indices byte_array: {e}")))?;
+                        let dict_len = dict_offsets_ref.len();
+                        let mut page_views: Vec<u128> = Vec::with_capacity(p.n_values);
+                        for &i in &idx_buf {
+                            let i = i as usize;
+                            if i >= dict_len {
+                                return Err(ext(format!(
+                                    "dict idx {i} out of range {dict_len}"
+                                )));
+                            }
+                            let off = dict_offsets_ref[i];
+                            let len = dict_lengths_ref[i];
+                            let bytes =
+                                &dict_bytes_ref[off as usize..(off + len) as usize];
+                            page_views.push(make_view(bytes, 0u32, off));
+                        }
+                        Ok((page_views, None))
+                    }
+                    Encoding::Plain => {
+                        let mut page_buf: Vec<u8> = Vec::with_capacity(p.body.len() * 2);
+                        decompress_into(codec_copy, p.body, &mut page_buf)?;
+                        let mut page_views: Vec<u128> = Vec::with_capacity(p.n_values);
+                        plain_byte_array_to_views_in_place(
+                            &page_buf,
+                            &mut page_views,
+                            p.n_values,
+                            p.block_id,
+                        )?;
+                        Ok((page_views, Some(page_buf)))
+                    }
+                    other => Err(ext(format!(
+                        "unexpected byte_array data page encoding {other:?}"
+                    ))),
+                }
+            })
+            .collect();
+        let par_ns = td.elapsed().as_nanos();
+        // Account the parallel-section time under decompress (it's
+        // mostly Snappy) so timing breakdown stays comparable to the
+        // serial path.
+        decompress_ns += par_ns;
+
+        // Sequentially append in page order — preserves block_id
+        // contract (data_buffers[block_id] = this PLAIN page's bytes).
+        for (page, res) in pending.iter().zip(results.into_iter()) {
+            let (mut page_views, page_buf_opt) = res?;
+            views.append(&mut page_views);
+            match page.encoding {
+                Encoding::Plain => {
+                    debug_assert!(page_buf_opt.is_some());
+                    if let Some(buf) = page_buf_opt {
+                        data_buffers.push(Buffer::from_vec(buf));
+                    }
+                    n_pages_plain += 1;
+                }
+                _ => {
+                    n_pages_rle += 1;
+                }
+            }
+        }
+    } else {
+        // Serial fallback (EMAT_DECODE_SERIAL=1 or single-page chunks).
+        let mut idx_scratch: Vec<u8> = Vec::new();
+        let mut idx_buf: Vec<u32> = Vec::new();
+        for p in &pending {
+            let n = p.n_values;
+            let body = p.body;
+            match p.encoding {
             Encoding::RleDictionary | Encoding::PlainDictionary => {
+                let td = std::time::Instant::now();
                 decompress_into(codec, body, &mut idx_scratch)?;
+                decompress_ns += td.elapsed().as_nanos();
                 idx_buf.clear();
+                let tv = std::time::Instant::now();
                 ematix_parquet_codec::dict::decode_rle_dictionary_indices_into(
                     &idx_scratch,
                     n,
@@ -1871,12 +2022,19 @@ fn decode_byte_array_to_string_view_slow(
                     let bytes = &dict_bytes[off as usize..(off + len) as usize];
                     views.push(make_view(bytes, dict_block, off));
                 }
+                viewbuild_ns += tv.elapsed().as_nanos();
+                n_pages_rle += 1;
             }
             Encoding::Plain => {
                 let mut page_buf: Vec<u8> = Vec::with_capacity(body.len() * 2);
+                let td = std::time::Instant::now();
                 decompress_into(codec, body, &mut page_buf)?;
+                decompress_ns += td.elapsed().as_nanos();
                 let block_id = data_buffers.len() as u32;
+                let tv = std::time::Instant::now();
                 plain_byte_array_to_views_in_place(&page_buf, &mut views, n, block_id)?;
+                viewbuild_ns += tv.elapsed().as_nanos();
+                n_pages_plain += 1;
                 data_buffers.push(Buffer::from_vec(page_buf));
             }
             other => {
@@ -1884,10 +2042,24 @@ fn decode_byte_array_to_string_view_slow(
                     "unexpected byte_array data page encoding {other:?}"
                 )));
             }
+            }
         }
     }
 
     debug_assert_eq!(views.len(), total);
+
+    if timing {
+        let total_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        let read_ms = read_ns as f64 / 1_000_000.0;
+        let dec_ms = decompress_ns as f64 / 1_000_000.0;
+        let view_ms = viewbuild_ns as f64 / 1_000_000.0;
+        let other_ms = total_ms - read_ms - dec_ms - view_ms;
+        eprintln!(
+            "[emat.decode_byte_slow] total={total_ms:.2}ms read={read_ms:.2}ms \
+             decompress={dec_ms:.2}ms view-build={view_ms:.2}ms other={other_ms:.2}ms \
+             rows={total} pages_dict={n_pages_dict} pages_plain={n_pages_plain} pages_rle={n_pages_rle}"
+        );
+    }
 
     let n_rows = views.len();
     let views_buffer = Buffer::from_vec(views);
