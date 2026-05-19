@@ -69,6 +69,85 @@ use ematix_parquet_io::{PageWalker, ParquetFile};
 pub const DEFAULT_BATCH_SIZE: usize = 65_536;
 
 // ============================================================
+// Cached metadata — Σ.E5.6 profile-driven optimization
+// ============================================================
+//
+// Profiling Q19 (200-iteration loop, ~7s) showed ~10% of CPU spent
+// in `read_file_metadata` + `read_row_group` + `read_column_chunk`
+// + `read_column_metadata` (1014 samples across metadata-parsing
+// frames). Root cause: `ParquetFile::metadata()` re-decodes the
+// thrift footer on every call, and we call it once per
+// (decode_column × RG × partition) — for Q19 that's 6×6×6 = 216
+// calls per query × 200 queries = 43,200 parses.
+//
+// Fix: snapshot the metadata fields we actually use into an owned
+// struct (primitives only — no borrows from the footer bytes), cache
+// it on the reader, and share read-only across scoped threads.
+
+/// Per-column-chunk metadata we need for decode. Owned (primitives
+/// only) so it can live as long as the reader without lifetime gymnastics.
+#[derive(Debug, Clone)]
+pub(crate) struct CachedColumnChunk {
+    pub num_values: i64,
+    pub codec: CompressionCodec,
+    pub dictionary_page_offset: Option<i64>,
+    pub data_page_offset: i64,
+    pub total_compressed_size: i64,
+    pub total_uncompressed_size: i64,
+    pub column_type: ParquetType,
+}
+
+/// Per-row-group cached metadata.
+#[derive(Debug, Clone)]
+pub(crate) struct CachedRowGroup {
+    pub num_rows: i64,
+    pub columns: Vec<CachedColumnChunk>,
+}
+
+/// File-level cached metadata — built once at reader construction,
+/// shared (via Arc) across all scoped column-decode threads.
+#[derive(Debug, Clone)]
+pub(crate) struct CachedFileMetadata {
+    pub row_groups: Vec<CachedRowGroup>,
+}
+
+impl CachedFileMetadata {
+    pub fn from_file(file: &ParquetFile) -> DfResult<Self> {
+        let md = file.metadata().map_err(|e| ext(format!("metadata: {e}")))?;
+        let row_groups = md
+            .row_groups
+            .iter()
+            .map(|rg| {
+                let columns = rg
+                    .columns
+                    .iter()
+                    .map(|col| {
+                        let cm = col
+                            .meta_data
+                            .as_ref()
+                            .ok_or_else(|| ext("column missing meta_data"))?;
+                        Ok(CachedColumnChunk {
+                            num_values: cm.num_values,
+                            codec: cm.codec,
+                            dictionary_page_offset: cm.dictionary_page_offset,
+                            data_page_offset: cm.data_page_offset,
+                            total_compressed_size: cm.total_compressed_size,
+                            total_uncompressed_size: cm.total_uncompressed_size,
+                            column_type: cm.column_type,
+                        })
+                    })
+                    .collect::<DfResult<Vec<_>>>()?;
+                Ok(CachedRowGroup {
+                    num_rows: rg.num_rows,
+                    columns,
+                })
+            })
+            .collect::<DfResult<Vec<_>>>()?;
+        Ok(Self { row_groups })
+    }
+}
+
+// ============================================================
 // Builder
 // ============================================================
 
@@ -143,6 +222,10 @@ impl EmatArrowBatchReaderBuilder {
     }
 
     pub fn build(self) -> DfResult<EmatArrowBatchReader> {
+        // Σ.E5.6: decode and own the metadata snapshot once. Avoids
+        // re-parsing the thrift footer per column-decode call.
+        let cached_md = Arc::new(CachedFileMetadata::from_file(&self.file)?);
+
         let md = self
             .file
             .metadata()
@@ -207,6 +290,7 @@ impl EmatArrowBatchReaderBuilder {
             row_groups,
             batch_size: self.batch_size,
             parallelism_budget: self.parallelism_budget,
+            cached_md,
             cur_rg_idx: 0,
             cur_rg_columns: None,
             cur_rg_row: 0,
@@ -332,6 +416,11 @@ pub struct EmatArrowBatchReader {
     /// Σ.E5.1.c: caller-supplied cap on per-RG column-decode threads.
     /// See [`EmatArrowBatchReaderBuilder::with_parallelism_budget`].
     parallelism_budget: Option<usize>,
+    /// Σ.E5.6: cached parquet metadata. Decoded once at builder
+    /// time; shared (Arc) across all scoped column-decode threads.
+    /// Profile-driven: ~10% of Q19 CPU was re-parsing the thrift
+    /// footer on every `decode_one_column` call.
+    cached_md: Arc<CachedFileMetadata>,
 
     // ---- iteration state ----
     /// Index into `row_groups`; `cur_rg_idx == row_groups.len()`
@@ -375,19 +464,13 @@ impl EmatArrowBatchReader {
     /// well inside budget. At SF=10+ this is worth revisiting (chunked
     /// or page-streaming decode is the next lever).
     fn load_row_group(&mut self, rg: usize) -> DfResult<()> {
-        let md = self
-            .file
-            .metadata()
-            .map_err(|e| ext(format!("metadata: {e}")))?;
-        let row_group = &md.row_groups[rg];
-        self.cur_rg_total = row_group.num_rows as usize;
-        // Drop `md` so `&self.file` is the only outstanding borrow
-        // before we hand it to scoped threads.
-        drop(md);
+        // Σ.E5.6: use the cached metadata snapshot — no thrift re-parse.
+        self.cur_rg_total = self.cached_md.row_groups[rg].num_rows as usize;
 
         let projection = &self.projection;
         let schema = &self.arrow_schema;
         let file = &self.file;
+        let cached_md = &self.cached_md;
         let n_cols = projection.len();
 
         // Cap on spawned threads. Default: never exceed available
@@ -411,7 +494,7 @@ impl EmatArrowBatchReader {
             let mut out = Vec::with_capacity(n_cols);
             for (proj_idx, &leaf) in projection.iter().enumerate() {
                 let target = schema.field(proj_idx).data_type();
-                out.push(decode_one_column(file, rg, leaf, target)?);
+                out.push(decode_one_column(file, cached_md, rg, leaf, target)?);
             }
             out
         } else {
@@ -444,7 +527,7 @@ impl EmatArrowBatchReader {
                             }
                             let leaf = projection[i];
                             let target = schema.field(i).data_type();
-                            local.push((i, decode_one_column(file, rg, leaf, target)));
+                            local.push((i, decode_one_column(file, cached_md, rg, leaf, target)));
                         }
                         local
                     }));
@@ -541,13 +624,15 @@ impl Iterator for EmatArrowBatchReader {
 
 fn decode_one_column(
     file: &ParquetFile,
+    cached_md: &CachedFileMetadata,
     rg: usize,
     leaf: usize,
     target: &DataType,
 ) -> DfResult<DecodedColumn> {
+    let cm = &cached_md.row_groups[rg].columns[leaf];
     match target {
         DataType::Int32 | DataType::Date32 => {
-            let v = decode_dict_chunk_typed::<i32>(file, rg, leaf, |b| {
+            let v = decode_dict_chunk_typed::<i32>(file, cm, |b| {
                 decode_plain_i32(b).map_err(|e| ext(format!("plain i32: {e}")))
             })?;
             let n_rows = v.len();
@@ -557,7 +642,7 @@ fn decode_one_column(
             })
         }
         DataType::Int64 => {
-            let v = decode_dict_chunk_typed::<i64>(file, rg, leaf, |b| {
+            let v = decode_dict_chunk_typed::<i64>(file, cm, |b| {
                 decode_plain_i64(b).map_err(|e| ext(format!("plain i64: {e}")))
             })?;
             let n_rows = v.len();
@@ -567,7 +652,7 @@ fn decode_one_column(
             })
         }
         DataType::Float64 => {
-            let v = decode_dict_chunk_typed::<f64>(file, rg, leaf, |b| {
+            let v = decode_dict_chunk_typed::<f64>(file, cm, |b| {
                 decode_plain_f64(b).map_err(|e| ext(format!("plain f64: {e}")))
             })?;
             let n_rows = v.len();
@@ -576,9 +661,9 @@ fn decode_one_column(
                 n_rows,
             })
         }
-        DataType::Utf8View => decode_byte_array_to_string_view(file, rg, leaf),
+        DataType::Utf8View => decode_byte_array_to_string_view(file, cm, rg, leaf),
         DataType::Dictionary(_, _) => decode_byte_array_dict_preserved(file, rg, leaf),
-        DataType::Utf8 => decode_byte_array_to_utf8(file, rg, leaf),
+        DataType::Utf8 => decode_byte_array_to_utf8(file, cm),
         other => Err(DataFusionError::NotImplemented(format!(
             "EmatArrowBatchReader: target Arrow type {other:?} not yet supported"
         ))),
@@ -587,17 +672,14 @@ fn decode_one_column(
 
 /// PR-2-style generic dict-or-PLAIN decoder for fixed-size primitives.
 /// Mirrors `ematix_parquet_bridge::decode_dict_chunk_generic`.
+///
+/// Σ.E5.6: takes the cached `CachedColumnChunk` directly instead of
+/// re-parsing the thrift footer per call.
 fn decode_dict_chunk_typed<T: Copy>(
     file: &ParquetFile,
-    rg: usize,
-    col: usize,
+    cm: &CachedColumnChunk,
     decode_plain: impl Fn(&[u8]) -> DfResult<Vec<T>>,
 ) -> DfResult<Vec<T>> {
-    let md = file.metadata().map_err(|e| ext(format!("metadata: {e}")))?;
-    let cm = md.row_groups[rg].columns[col]
-        .meta_data
-        .as_ref()
-        .ok_or_else(|| ext("column missing meta_data"))?;
     let total = cm.num_values as usize;
     let codec = cm.codec;
     let start = cm
@@ -702,7 +784,9 @@ pub fn decode_byte_array_to_string_view_for_bench(
     rg: usize,
     col: usize,
 ) -> DfResult<(usize, usize)> {
-    let dc = decode_byte_array_to_string_view(file, rg, col)?;
+    let cached_md = CachedFileMetadata::from_file(file)?;
+    let cm = &cached_md.row_groups[rg].columns[col];
+    let dc = decode_byte_array_to_string_view(file, cm, rg, col)?;
     let rows = dc.len();
     // Total decoded byte size = views buffer (16 bytes/row) + sum of
     // backing data buffers (one per page in the page-streaming layout).
@@ -732,7 +816,8 @@ pub fn decode_one_column_for_bench(
     leaf: usize,
     target: &DataType,
 ) -> DfResult<(usize, usize)> {
-    let dc = decode_one_column(file, rg, leaf, target)?;
+    let cached_md = CachedFileMetadata::from_file(file)?;
+    let dc = decode_one_column(file, &cached_md, rg, leaf, target)?;
     let rows = dc.len();
     let bytes = match &dc {
         DecodedColumn::Int32 { data, .. } => data.len(),
@@ -756,15 +841,22 @@ pub fn decode_one_column_for_bench(
 /// still produce a correct result.
 fn decode_byte_array_to_string_view(
     file: &ParquetFile,
+    cm: &CachedColumnChunk,
     rg: usize,
     col: usize,
 ) -> DfResult<DecodedColumn> {
     // Fast path: try the dict-preserved reader first. It fails only
     // when the column has no DictionaryPage or has a PLAIN-fallback
     // data page (writer wrote some pages dict, some PLAIN).
+    //
+    // NOTE: `read_column_byte_array_dict_preserved` is from
+    // ematix-parquet-codec — it parses its own metadata. The
+    // CachedColumnChunk caching only applies to the slow path here.
+    // Upstream API change to take pre-cached metadata would close
+    // that remaining ~5% gap.
     match read_column_byte_array_dict_preserved(file, rg, col) {
         Ok(raw) => Ok(build_string_view_from_dict_preserved(raw)),
-        Err(_) => decode_byte_array_to_string_view_slow(file, rg, col),
+        Err(_) => decode_byte_array_to_string_view_slow(file, cm),
     }
 }
 
@@ -824,14 +916,8 @@ fn build_string_view_from_dict_preserved(
 /// fast dict-preserved reader can't claim the chunk.
 fn decode_byte_array_to_string_view_slow(
     file: &ParquetFile,
-    rg: usize,
-    col: usize,
+    cm: &CachedColumnChunk,
 ) -> DfResult<DecodedColumn> {
-    let md = file.metadata().map_err(|e| ext(format!("metadata: {e}")))?;
-    let cm = md.row_groups[rg].columns[col]
-        .meta_data
-        .as_ref()
-        .ok_or_else(|| ext("column missing meta_data"))?;
     let total = cm.num_values as usize;
     let codec = cm.codec;
     let start = cm
@@ -1052,12 +1138,7 @@ fn decode_byte_array_dict_preserved(
 /// Slow path: BYTE_ARRAY → `StringArray` row-by-row, using
 /// `StringBuilder`. Kept for completeness; callers should prefer
 /// `Utf8View` or `Dictionary(UInt32, Utf8)` on the hot path.
-fn decode_byte_array_to_utf8(file: &ParquetFile, rg: usize, col: usize) -> DfResult<DecodedColumn> {
-    let md = file.metadata().map_err(|e| ext(format!("metadata: {e}")))?;
-    let cm = md.row_groups[rg].columns[col]
-        .meta_data
-        .as_ref()
-        .ok_or_else(|| ext("column missing meta_data"))?;
+fn decode_byte_array_to_utf8(file: &ParquetFile, cm: &CachedColumnChunk) -> DfResult<DecodedColumn> {
     let total = cm.num_values as usize;
     let codec = cm.codec;
     let start = cm

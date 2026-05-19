@@ -12,36 +12,36 @@ Methodology: median ± σ across 21 timed trials after 3 warmups, single-machine
 
 | Query | FastParquet (ms) | EmatixFastParquet (ms) | Δ% (emat vs fast) | Verdict |
 |------:|-----------------:|-----------------------:|------------------:|:--------|
-| Q01  | 18.86 ± 2.86 | 21.03 ± 1.42 | +11.5 | Regression |
-| Q02  | 11.37 ± 4.57 | 13.52 ± 0.65 | +18.9 | Regression |
-| Q03  | 21.19 ± 1.38 | 15.22 ± 1.50 | -28.1 | EmatFaster |
-| Q04  | 15.91 ± 0.94 | 23.49 ± 1.28 | +47.6 | Regression |
-| Q05  | 25.30 ± 1.67 | 21.46 ± 1.11 | -15.2 | EmatFaster |
-| Q06  | 12.29 ± 1.32 | 9.99 ± 0.28 | -18.7 | EmatFaster |
-| Q07  | 30.68 ± 3.05 | 40.06 ± 9.26 | +30.6 | Regression |
-| Q08  | 24.45 ± 1.10 | 19.21 ± 1.03 | -21.4 | EmatFaster |
-| Q09  | 28.79 ± 1.56 | 27.80 ± 1.01 | -3.4 | within ±5% |
-| Q10  | 34.02 ± 1.19 | 30.02 ± 2.11 | -11.7 | EmatFaster |
-| Q11  | 7.21 ± 0.52 | 4.76 ± 0.21 | -33.9 | EmatFaster |
-| Q12  | 20.59 ± 1.20 | 28.21 ± 1.18 | +37.0 | Regression |
-| Q13  | 41.33 ± 0.99 | 51.65 ± 2.34 | +25.0 | Regression |
-| Q14  | 17.72 ± 1.93 | 13.03 ± 0.63 | -26.5 | EmatFaster |
-| Q15  | 23.42 ± 0.98 | 17.66 ± 1.16 | -24.6 | EmatFaster |
-| Q16  | 8.59 ± 0.88 | 11.71 ± 2.52 | +36.4 | Regression |
-| Q17  | 41.88 ± 4.94 | 48.13 ± 4.43 | +14.9 | Regression |
-| Q18  | 64.83 ± 9.07 | 63.36 ± 5.94 | -2.3 | within ±5% |
-| Q19  | 24.62 ± 2.79 | 48.77 ± 5.92 | +98.1 | Regression |
-| Q20  | 17.90 ± 1.05 | 16.48 ± 1.47 | -7.9 | EmatFaster |
-| Q21  | 45.22 ± 1.51 | 37.53 ± 2.46 | -17.0 | EmatFaster |
-| Q22  | 8.18 ± 0.13 | 7.93 ± 0.11 | -3.0 | within ±5% |
+| Q01  | 19.21 ± 2.53 | 18.24 ± 0.64 | -5.0 | EmatFaster |
+| Q02  | 10.06 ± 1.64 | 11.93 ± 0.61 | +18.7 | Regression |
+| Q03  | 19.21 ± 0.38 | 12.38 ± 1.82 | -35.6 | EmatFaster |
+| Q04  | 16.10 ± 0.87 | 19.18 ± 1.97 | +19.2 | Regression |
+| Q05  | 24.33 ± 0.87 | 20.78 ± 1.90 | -14.6 | EmatFaster |
+| Q06  | 11.63 ± 0.54 | 8.47 ± 0.36 | -27.2 | EmatFaster |
+| Q07  | 30.24 ± 0.80 | 26.54 ± 1.87 | -12.2 | EmatFaster |
+| Q08  | 23.85 ± 4.18 | 18.76 ± 1.47 | -21.4 | EmatFaster |
+| Q09  | 28.63 ± 1.24 | 26.69 ± 2.66 | -6.8 | EmatFaster |
+| Q10  | 33.98 ± 1.43 | 29.99 ± 2.94 | -11.7 | EmatFaster |
+| Q11  | 7.36 ± 0.82 | 4.60 ± 0.28 | -37.5 | EmatFaster |
+| Q12  | 19.84 ± 1.77 | 23.37 ± 1.83 | +17.8 | Regression |
+| Q13  | 42.13 ± 1.02 | 54.24 ± 1.46 | +28.7 | Regression |
+| Q14  | 16.68 ± 1.31 | 10.96 ± 0.80 | -34.3 | EmatFaster |
+| Q15  | 23.28 ± 1.89 | 15.67 ± 0.77 | -32.7 | EmatFaster |
+| Q16  | 8.51 ± 0.17 | 11.27 ± 0.15 | +32.3 | Regression |
+| Q17  | 36.82 ± 1.24 | 36.12 ± 2.34 | -1.9 | within ±5% |
+| Q18  | 51.03 ± 2.11 | 46.12 ± 2.82 | -9.6 | EmatFaster |
+| Q19  | 21.25 ± 0.37 | 32.60 ± 1.92 | +53.4 | Regression |
+| Q20  | 17.64 ± 0.49 | 19.46 ± 2.04 | +10.3 | Regression |
+| Q21  | 46.54 ± 4.80 | 39.24 ± 1.85 | -15.7 | EmatFaster |
+| Q22  | 8.75 ± 0.77 | 9.43 ± 0.13 | +7.8 | Regression |
 
-**Top-line:** 3 parity, 10 EmatFaster, 9 Regression (paired queries: 22). geomean(emat / fast) = **1.0082** (target ≤ 1.02 per E5.4 acceptance).
+**Top-line:** 1 parity, 13 EmatFaster, 8 Regression (paired queries: 22). geomean(emat / fast) = **0.9356** (target ≤ 1.02 per E5.4 acceptance).
 
 ## 2. Per-query analysis
 
 Regressions > 5%, ordered by magnitude. Threshold for EXPLAIN ANALYZE deep-dive is > 10%; queries between 5% and 10% are listed for completeness but not individually attributed unless they cluster on a shared root cause.
 
-### Q19 — +98.1% (24.62 → 48.77 ms)
+### Q19 — +53.4% (21.25 → 32.60 ms)
 
 _Deep-dive required (> 10% regression). Likely candidates, ranked by prior data from §3 capability gaps:_
 
@@ -54,7 +54,7 @@ _Confirm with `EXPLAIN ANALYZE`: count of rows emerging from the scan node shoul
 
 4. **Different operator selection by the planner** — if `partition_statistics` differences flip a join from hash to nested loop or vice versa, this is the symptom. EXPLAIN-diff the two plans.
 
-### Q04 — +47.6% (15.91 → 23.49 ms)
+### Q16 — +32.3% (8.51 → 11.27 ms)
 
 _Deep-dive required (> 10% regression). Likely candidates, ranked by prior data from §3 capability gaps:_
 
@@ -67,7 +67,7 @@ _Confirm with `EXPLAIN ANALYZE`: count of rows emerging from the scan node shoul
 
 4. **Different operator selection by the planner** — if `partition_statistics` differences flip a join from hash to nested loop or vice versa, this is the symptom. EXPLAIN-diff the two plans.
 
-### Q12 — +37.0% (20.59 → 28.21 ms)
+### Q13 — +28.7% (42.13 → 54.24 ms)
 
 _Deep-dive required (> 10% regression). Likely candidates, ranked by prior data from §3 capability gaps:_
 
@@ -80,7 +80,7 @@ _Confirm with `EXPLAIN ANALYZE`: count of rows emerging from the scan node shoul
 
 4. **Different operator selection by the planner** — if `partition_statistics` differences flip a join from hash to nested loop or vice versa, this is the symptom. EXPLAIN-diff the two plans.
 
-### Q16 — +36.4% (8.59 → 11.71 ms)
+### Q04 — +19.2% (16.10 → 19.18 ms)
 
 _Deep-dive required (> 10% regression). Likely candidates, ranked by prior data from §3 capability gaps:_
 
@@ -93,7 +93,7 @@ _Confirm with `EXPLAIN ANALYZE`: count of rows emerging from the scan node shoul
 
 4. **Different operator selection by the planner** — if `partition_statistics` differences flip a join from hash to nested loop or vice versa, this is the symptom. EXPLAIN-diff the two plans.
 
-### Q07 — +30.6% (30.68 → 40.06 ms)
+### Q02 — +18.7% (10.06 → 11.93 ms)
 
 _Deep-dive required (> 10% regression). Likely candidates, ranked by prior data from §3 capability gaps:_
 
@@ -106,7 +106,7 @@ _Confirm with `EXPLAIN ANALYZE`: count of rows emerging from the scan node shoul
 
 4. **Different operator selection by the planner** — if `partition_statistics` differences flip a join from hash to nested loop or vice versa, this is the symptom. EXPLAIN-diff the two plans.
 
-### Q13 — +25.0% (41.33 → 51.65 ms)
+### Q12 — +17.8% (19.84 → 23.37 ms)
 
 _Deep-dive required (> 10% regression). Likely candidates, ranked by prior data from §3 capability gaps:_
 
@@ -119,7 +119,7 @@ _Confirm with `EXPLAIN ANALYZE`: count of rows emerging from the scan node shoul
 
 4. **Different operator selection by the planner** — if `partition_statistics` differences flip a join from hash to nested loop or vice versa, this is the symptom. EXPLAIN-diff the two plans.
 
-### Q02 — +18.9% (11.37 → 13.52 ms)
+### Q20 — +10.3% (17.64 → 19.46 ms)
 
 _Deep-dive required (> 10% regression). Likely candidates, ranked by prior data from §3 capability gaps:_
 
@@ -132,31 +132,9 @@ _Confirm with `EXPLAIN ANALYZE`: count of rows emerging from the scan node shoul
 
 4. **Different operator selection by the planner** — if `partition_statistics` differences flip a join from hash to nested loop or vice versa, this is the symptom. EXPLAIN-diff the two plans.
 
-### Q17 — +14.9% (41.88 → 48.13 ms)
+### Q22 — +7.8% (8.75 → 9.43 ms)
 
-_Deep-dive required (> 10% regression). Likely candidates, ranked by prior data from §3 capability gaps:_
-
-1. **Filter pushdown disabled** when the streaming reader is on (see `EmatixFastParquetTableProvider::supports_filters_pushdown` — returns `Unsupported` for every filter while `streaming_arrow_reader` is true). DataFusion's residual `FilterExec` runs the predicates instead. On selective filters (Q06, Q14, Q19) this materially changes the rows-pushed-into-aggregate count.
-_Confirm with `EXPLAIN ANALYZE`: count of rows emerging from the scan node should be equal to the file's total rows on EmatixFastParquet and to the post-filter row count on FastParquet._
-
-2. **Row-group pruning by stats** — `EmatixFastParquetTableProvider::partition_statistics()` returns `Statistics::new_unknown` with only `num_rows` populated (`ematix_fast_parquet.rs:637`). FastParquet reports typed min/max from `ParquetMetaData::row_group().statistics()`, which feeds DataFusion's join-size + agg-cardinality estimates and drives row-group pruning. On stats-sensitive queries this changes the physical plan (smaller join build side, different operator ordering).
-
-3. **Per-column decode cost on specific column types** — primarily Decimal128 (none in TPC-H), Int96, FLBA, nested. TPC-H is all Int32/Int64/Float64/Date32/Utf8; if a regression shows here it's in the Utf8 → Utf8View streaming path (Σ.E5.1.d). Cross-check with the codec-layer `bench_decode` in ematix-parquet.
-
-4. **Different operator selection by the planner** — if `partition_statistics` differences flip a join from hash to nested loop or vice versa, this is the symptom. EXPLAIN-diff the two plans.
-
-### Q01 — +11.5% (18.86 → 21.03 ms)
-
-_Deep-dive required (> 10% regression). Likely candidates, ranked by prior data from §3 capability gaps:_
-
-1. **Filter pushdown disabled** when the streaming reader is on (see `EmatixFastParquetTableProvider::supports_filters_pushdown` — returns `Unsupported` for every filter while `streaming_arrow_reader` is true). DataFusion's residual `FilterExec` runs the predicates instead. On selective filters (Q06, Q14, Q19) this materially changes the rows-pushed-into-aggregate count.
-_Confirm with `EXPLAIN ANALYZE`: count of rows emerging from the scan node should be equal to the file's total rows on EmatixFastParquet and to the post-filter row count on FastParquet._
-
-2. **Row-group pruning by stats** — `EmatixFastParquetTableProvider::partition_statistics()` returns `Statistics::new_unknown` with only `num_rows` populated (`ematix_fast_parquet.rs:637`). FastParquet reports typed min/max from `ParquetMetaData::row_group().statistics()`, which feeds DataFusion's join-size + agg-cardinality estimates and drives row-group pruning. On stats-sensitive queries this changes the physical plan (smaller join build side, different operator ordering).
-
-3. **Per-column decode cost on specific column types** — primarily Decimal128 (none in TPC-H), Int96, FLBA, nested. TPC-H is all Int32/Int64/Float64/Date32/Utf8; if a regression shows here it's in the Utf8 → Utf8View streaming path (Σ.E5.1.d). Cross-check with the codec-layer `bench_decode` in ematix-parquet.
-
-4. **Different operator selection by the planner** — if `partition_statistics` differences flip a join from hash to nested loop or vice versa, this is the symptom. EXPLAIN-diff the two plans.
+Within the 5–10% band. Most likely cause: cumulative effect of filter-pushdown-disabled + unknown partition stats on a query whose hot path is dominated by aggregation, not scan. No deep-dive yet unless it clusters with a > 10% regression.
 
 ## 3. Capability gaps in EmatixFastParquet vs FastParquet
 
@@ -176,7 +154,7 @@ Gathered from a read of `src/ematix_fast_parquet.rs` and confirmed against the �
 
 ## 4. Migration sequencing recommendation
 
-**Close gaps first** — 9 query/queries regressed by more than 5% (geomean = 1.0082, target ≤ 1.02). Recommended ordered sub-phases:
+**Close gaps first** — 8 query/queries regressed by more than 5% (geomean = 0.9356, target ≤ 1.02). Recommended ordered sub-phases:
 
 1. **E5.4.b — restore filter pushdown on the streaming reader path** (highest impact). Re-enable `supports_filters_pushdown` for Int32/Date32 range predicates and fuse with the streaming bitmap-first decode. Expected to close Q06, Q14, Q19 and any other selective-filter query in the regression list.
 2. **E5.4.c — typed `partition_statistics`** (medium impact). Decode `ematix_parquet_format::Statistics` for the 5 physical types and report typed min/max + null_count from `EmatixFastParquetExec::partition_statistics`. Re-runs the planner's cardinality estimates on the EmatixFastParquet side; expected to close the join-heavy regressions (Q05, Q07, Q09, Q21).
