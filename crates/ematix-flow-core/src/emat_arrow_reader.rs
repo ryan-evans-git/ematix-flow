@@ -57,8 +57,7 @@ use datafusion::error::{DataFusionError, Result as DfResult};
 
 use crate::ematix_fast_parquet::BridgeFilter;
 use crate::ematix_parquet_bridge::{
-    filter_i32_column_to_bitmap, masked_decode_byte_array, masked_decode_f64, masked_decode_i32,
-    masked_decode_i64,
+    masked_decode_byte_array, masked_decode_f64, masked_decode_i32, masked_decode_i64,
 };
 use ematix_parquet_codec::read::read_column_byte_array_dict_preserved_into;
 use ematix_parquet_codec::compression::{decompress_snappy_into, decompress_zstd_into};
@@ -512,12 +511,8 @@ impl EmatArrowBatchReader {
         filter: BridgeFilter,
         path: std::path::PathBuf,
     ) -> DfResult<()> {
-        // 1. Build the row bitmap from the filter column.
-        let filter_eval = filter.clone();
-        let (bitmap, total) =
-            filter_i32_column_to_bitmap(&path, rg, filter.parquet_col_idx(), move |v: i32| {
-                filter_eval.eval_i32(v)
-            })?;
+        // 1. Build the combined multi-column AND bitmap.
+        let (bitmap, total) = filter.build_bitmap(&path, rg)?;
         let popcount: usize = bitmap.iter().map(|b| b.count_ones() as usize).sum();
 
         // Σ.E5 #517: selectivity gate. Masked decode is a win only

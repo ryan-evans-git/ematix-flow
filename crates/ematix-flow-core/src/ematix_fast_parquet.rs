@@ -57,47 +57,162 @@ use crate::ematix_parquet_bridge::{
 use crate::fast_parquet::{RangePredicate, extract_range_predicate};
 
 /// Phase 3 predicate: single-column conjunction of `column OP literal`
-/// clauses, where the column has Date32 / Int32 type. AND-combined
-/// into a closure used by `filter_i32_column_to_bitmap`.
+/// Multi-column predicate set, AND-combined. Each `ColumnPredicate`
+/// runs against ONE column; per-column bitmaps are built by the
+/// streaming reader's masked path and AND-ed together before
+/// projection columns are masked-decoded.
 #[derive(Debug, Clone)]
 pub struct BridgeFilter {
-    /// Index of the filter column in the FULL (unprojected) schema —
-    /// same as the parquet column index since Arrow schema is built 1:1.
-    parquet_col_idx: usize,
-    /// Comparisons to AND together. All against the same column.
-    clauses: Vec<RangeClause>,
+    predicates: Vec<ColumnPredicate>,
+}
+
+#[derive(Debug, Clone)]
+pub enum ColumnPredicate {
+    /// AND of comparisons on the same i32/Date32 column.
+    I32Range { col_idx: usize, clauses: Vec<RangeClause> },
+    /// `col IN (v1, v2, ...)` on an i32 column (Q16's p_size).
+    I32In { col_idx: usize, values: Vec<i32> },
+    /// `col = literal` on a string column (Q19's l_shipinstruct).
+    StringEq { col_idx: usize, value: String },
+    /// `col IN (v1, v2, ...)` on a string column. Captures both
+    /// SQL `IN (...)` *and* OR-of-equality (Q19's l_shipmode).
+    StringIn { col_idx: usize, values: Vec<String> },
 }
 
 #[derive(Debug, Clone, Copy)]
-struct RangeClause {
-    op: Operator,
-    literal_i32: i32,
+pub struct RangeClause {
+    pub op: Operator,
+    pub literal_i32: i32,
 }
 
 impl BridgeFilter {
-    /// Parquet column index this filter applies to.
-    pub fn parquet_col_idx(&self) -> usize {
-        self.parquet_col_idx
+    pub fn predicates(&self) -> &[ColumnPredicate] {
+        &self.predicates
     }
 
-    /// Evaluate AND of all clauses against one i32 / Date32 value.
-    #[inline]
-    pub fn eval_i32(&self, v: i32) -> bool {
-        for c in &self.clauses {
-            let pass = match c.op {
-                Operator::Eq => v == c.literal_i32,
-                Operator::NotEq => v != c.literal_i32,
-                Operator::Lt => v < c.literal_i32,
-                Operator::LtEq => v <= c.literal_i32,
-                Operator::Gt => v > c.literal_i32,
-                Operator::GtEq => v >= c.literal_i32,
-                _ => return false,
+    /// Σ.E5 #513: build a combined row bitmap by AND-combining one
+    /// per-predicate bitmap. Returns `(bitmap, total_rows)`. For i32
+    /// predicates uses the fast dict-mask + RLE-aware kernel; for
+    /// string predicates uses the dict-preserved per-entry mask.
+    /// Falls back to dense decode if the i32 column isn't
+    /// dict-encoded (e.g. PLAIN-only).
+    pub fn build_bitmap(
+        &self,
+        path: &std::path::Path,
+        rg: usize,
+    ) -> DfResult<(Vec<u8>, usize)> {
+        use crate::ematix_parquet_bridge::{
+            filter_byte_array_to_bitmap, filter_i32_column_to_bitmap,
+            filter_i32_column_to_bitmap_dense,
+        };
+        let mut combined: Option<(Vec<u8>, usize)> = None;
+        for p in &self.predicates {
+            let (b, total) = match p {
+                ColumnPredicate::I32Range { col_idx, .. }
+                | ColumnPredicate::I32In { col_idx, .. } => {
+                    let pclone = p.clone();
+                    // Try the fast dict-aware kernel first; fall back
+                    // to dense decode on PLAIN-only chunks.
+                    match filter_i32_column_to_bitmap(path, rg, *col_idx, {
+                        let pc = pclone.clone();
+                        move |v: i32| pc.eval_i32(v)
+                    }) {
+                        Ok(r) => r,
+                        Err(_) => {
+                            let pc2 = pclone.clone();
+                            let file = ematix_parquet_io::ParquetFile::open(path).map_err(|e| {
+                                DataFusionError::External(
+                                    format!("ParquetFile::open: {e}").into(),
+                                )
+                            })?;
+                            filter_i32_column_to_bitmap_dense(
+                                &file,
+                                rg,
+                                *col_idx,
+                                move |v: i32| pc2.eval_i32(v),
+                            )?
+                        }
+                    }
+                }
+                ColumnPredicate::StringEq { col_idx, .. }
+                | ColumnPredicate::StringIn { col_idx, .. } => {
+                    let pclone = p.clone();
+                    filter_byte_array_to_bitmap(path, rg, *col_idx, move |bytes: &[u8]| {
+                        match std::str::from_utf8(bytes) {
+                            Ok(s) => pclone.eval_str(s),
+                            Err(_) => false,
+                        }
+                    })?
+                }
             };
-            if !pass {
-                return false;
+            match combined.as_mut() {
+                None => combined = Some((b, total)),
+                Some((acc, prior_total)) => {
+                    if *prior_total != total {
+                        return Err(DataFusionError::External(
+                            format!(
+                                "BridgeFilter::build_bitmap: column row counts differ ({} vs {})",
+                                *prior_total, total
+                            )
+                            .into(),
+                        ));
+                    }
+                    for (a, b) in acc.iter_mut().zip(b.iter()) {
+                        *a &= b;
+                    }
+                }
             }
         }
-        true
+        combined.ok_or_else(|| {
+            DataFusionError::External("BridgeFilter::build_bitmap: no predicates".into())
+        })
+    }
+}
+
+impl ColumnPredicate {
+    pub fn col_idx(&self) -> usize {
+        match self {
+            ColumnPredicate::I32Range { col_idx, .. }
+            | ColumnPredicate::I32In { col_idx, .. }
+            | ColumnPredicate::StringEq { col_idx, .. }
+            | ColumnPredicate::StringIn { col_idx, .. } => *col_idx,
+        }
+    }
+
+    /// Evaluate AND of all clauses against one i32 value (I32Range / I32In only).
+    #[inline]
+    pub fn eval_i32(&self, v: i32) -> bool {
+        match self {
+            ColumnPredicate::I32Range { clauses, .. } => {
+                for c in clauses {
+                    let pass = match c.op {
+                        Operator::Eq => v == c.literal_i32,
+                        Operator::NotEq => v != c.literal_i32,
+                        Operator::Lt => v < c.literal_i32,
+                        Operator::LtEq => v <= c.literal_i32,
+                        Operator::Gt => v > c.literal_i32,
+                        Operator::GtEq => v >= c.literal_i32,
+                        _ => return false,
+                    };
+                    if !pass {
+                        return false;
+                    }
+                }
+                true
+            }
+            ColumnPredicate::I32In { values, .. } => values.iter().any(|&x| x == v),
+            _ => false,
+        }
+    }
+
+    /// Evaluate against a string value (StringEq / StringIn only).
+    #[inline]
+    pub fn eval_str(&self, v: &str) -> bool {
+        match self {
+            ColumnPredicate::StringEq { value, .. } => v == value.as_str(),
+            ColumnPredicate::StringIn { values, .. } => values.iter().any(|s| s.as_str() == v),
+            _ => false,
+        }
     }
 }
 
@@ -108,9 +223,6 @@ fn clause_from_predicate(pred: &RangePredicate, expected_type: &DataType) -> Opt
     let lit_i32: i32 = match (&pred.literal, expected_type) {
         (ScalarValue::Int32(Some(v)), DataType::Int32) => *v,
         (ScalarValue::Date32(Some(v)), DataType::Date32) => *v,
-        // String literal cast: SQL `DATE '1995-09-01'` resolves to
-        // Date32 in DataFusion typically, but handle the cast-through-
-        // string shape defensively.
         _ => return None,
     };
     Some(RangeClause {
@@ -119,38 +231,178 @@ fn clause_from_predicate(pred: &RangePredicate, expected_type: &DataType) -> Opt
     })
 }
 
-/// Extract Phase-3-pushable filters from the DataFusion filter list.
-/// Returns the BridgeFilter if every input filter is pushable AND
-/// they all target the same column AND that column is Int32/Date32.
-/// Returns `None` if any condition fails — the caller falls back to
-/// non-pushdown decoding.
-fn extract_bridge_filter(filters: &[Expr], full_schema: &Schema) -> Option<BridgeFilter> {
-    let mut clauses: Vec<RangeClause> = Vec::new();
-    let mut col_idx: Option<usize> = None;
-    for f in filters {
-        let pred = extract_range_predicate(f)?;
-        let idx = full_schema.index_of(&pred.column).ok()?;
+/// Recognise a single-filter `Expr` and turn it into a
+/// `ColumnPredicate` if its shape is supported. Returns None when the
+/// filter isn't one of the supported shapes — the caller skips it
+/// (which is fine when pushdown is declared `Inexact`: DataFusion's
+/// residual FilterExec handles the remainder).
+fn predicate_from_expr(expr: &Expr, full_schema: &Schema) -> Option<ColumnPredicate> {
+    // Shape 1: col OP literal (i32/Date32 range).
+    if let Some(p) = extract_range_predicate(expr) {
+        let idx = full_schema.index_of(&p.column).ok()?;
         let dt = full_schema.field(idx).data_type();
-        if !matches!(dt, DataType::Int32 | DataType::Date32) {
+        if matches!(dt, DataType::Int32 | DataType::Date32) {
+            let clause = clause_from_predicate(&p, dt)?;
+            return Some(ColumnPredicate::I32Range {
+                col_idx: idx,
+                clauses: vec![clause],
+            });
+        }
+    }
+    // Shape 2: col IN (lit, lit, ...) — DataFusion `InList`.
+    if let Expr::InList(in_list) = expr {
+        if in_list.negated {
             return None;
         }
-        let clause = clause_from_predicate(&pred, dt)?;
-        if let Some(prior) = col_idx {
-            if prior != idx {
-                return None; // multi-column pushdown not in Phase 3 v1
+        if let Expr::Column(c) = in_list.expr.as_ref() {
+            let idx = full_schema.index_of(&c.name).ok()?;
+            let dt = full_schema.field(idx).data_type();
+            // i32 IN-list
+            if matches!(dt, DataType::Int32) {
+                let mut values: Vec<i32> = Vec::with_capacity(in_list.list.len());
+                for v in &in_list.list {
+                    if let Expr::Literal(ScalarValue::Int32(Some(x)), _) = v {
+                        values.push(*x);
+                    } else {
+                        return None;
+                    }
+                }
+                return Some(ColumnPredicate::I32In { col_idx: idx, values });
             }
-        } else {
-            col_idx = Some(idx);
+            // string IN-list
+            if matches!(dt, DataType::Utf8 | DataType::Utf8View) {
+                let mut values: Vec<String> = Vec::with_capacity(in_list.list.len());
+                for v in &in_list.list {
+                    let s = match v {
+                        Expr::Literal(ScalarValue::Utf8(Some(s)), _)
+                        | Expr::Literal(ScalarValue::Utf8View(Some(s)), _)
+                        | Expr::Literal(ScalarValue::LargeUtf8(Some(s)), _) => s.clone(),
+                        _ => return None,
+                    };
+                    values.push(s);
+                }
+                return Some(ColumnPredicate::StringIn { col_idx: idx, values });
+            }
         }
-        clauses.push(clause);
     }
-    if clauses.is_empty() {
+    // Shape 3: col = 'literal' (string equality).
+    if let Expr::BinaryExpr(b) = expr {
+        if matches!(b.op, Operator::Eq) {
+            if let (Expr::Column(c), Expr::Literal(lit, _)) = (b.left.as_ref(), b.right.as_ref()) {
+                let idx = full_schema.index_of(&c.name).ok()?;
+                let dt = full_schema.field(idx).data_type();
+                if matches!(dt, DataType::Utf8 | DataType::Utf8View) {
+                    let s = match lit {
+                        ScalarValue::Utf8(Some(s))
+                        | ScalarValue::Utf8View(Some(s))
+                        | ScalarValue::LargeUtf8(Some(s)) => s.clone(),
+                        _ => return None,
+                    };
+                    return Some(ColumnPredicate::StringEq { col_idx: idx, value: s });
+                }
+            }
+        }
+        // Shape 4: (col = 'A') OR (col = 'B') OR ... → StringIn
+        if matches!(b.op, Operator::Or) {
+            let mut values: Vec<String> = Vec::new();
+            let mut col_idx: Option<usize> = None;
+            if collect_string_eq_or_chain(expr, full_schema, &mut col_idx, &mut values)
+                && !values.is_empty()
+            {
+                return Some(ColumnPredicate::StringIn {
+                    col_idx: col_idx.unwrap(),
+                    values,
+                });
+            }
+        }
+    }
+    None
+}
+
+/// Walk an OR-chain like `(col = 'A') OR (col = 'B') OR ...` and
+/// collect all literals. Returns true if every leaf matched the
+/// shape AND they target the same column.
+fn collect_string_eq_or_chain(
+    expr: &Expr,
+    schema: &Schema,
+    col_idx: &mut Option<usize>,
+    values: &mut Vec<String>,
+) -> bool {
+    if let Expr::BinaryExpr(b) = expr {
+        if matches!(b.op, Operator::Or) {
+            return collect_string_eq_or_chain(b.left.as_ref(), schema, col_idx, values)
+                && collect_string_eq_or_chain(b.right.as_ref(), schema, col_idx, values);
+        }
+        if matches!(b.op, Operator::Eq) {
+            if let (Expr::Column(c), Expr::Literal(lit, _)) = (b.left.as_ref(), b.right.as_ref()) {
+                let idx = match schema.index_of(&c.name) {
+                    Ok(i) => i,
+                    Err(_) => return false,
+                };
+                let dt = schema.field(idx).data_type();
+                if !matches!(dt, DataType::Utf8 | DataType::Utf8View) {
+                    return false;
+                }
+                let s = match lit {
+                    ScalarValue::Utf8(Some(s))
+                    | ScalarValue::Utf8View(Some(s))
+                    | ScalarValue::LargeUtf8(Some(s)) => s.clone(),
+                    _ => return false,
+                };
+                if let Some(prior) = *col_idx {
+                    if prior != idx {
+                        return false;
+                    }
+                } else {
+                    *col_idx = Some(idx);
+                }
+                values.push(s);
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Extract the BridgeFilter from DataFusion's filter list.
+/// Recognises:
+///   - i32/Date32 range comparisons (`<`, `<=`, etc.)
+///   - i32 IN-list
+///   - string equality
+///   - string IN-list (including OR-of-equality on the same column)
+///
+/// Multiple predicates are AND-ed at evaluation time. Filters that
+/// don't fit a supported shape are dropped — pushdown is declared
+/// Inexact so DataFusion's residual FilterExec catches them.
+fn extract_bridge_filter(filters: &[Expr], full_schema: &Schema) -> Option<BridgeFilter> {
+    let mut predicates: Vec<ColumnPredicate> = Vec::new();
+    for f in filters {
+        if let Some(p) = predicate_from_expr(f, full_schema) {
+            predicates.push(p);
+        }
+    }
+    // Merge multiple I32Range predicates on the same column into one
+    // (matches the prior behavior of AND-combined clauses).
+    let mut merged: Vec<ColumnPredicate> = Vec::with_capacity(predicates.len());
+    for p in predicates {
+        if let ColumnPredicate::I32Range { col_idx, clauses } = &p {
+            if let Some(existing) = merged.iter_mut().find_map(|e| match e {
+                ColumnPredicate::I32Range {
+                    col_idx: ci,
+                    clauses: cs,
+                } if *ci == *col_idx => Some(cs),
+                _ => None,
+            }) {
+                existing.extend_from_slice(clauses);
+                continue;
+            }
+        }
+        merged.push(p);
+    }
+    if merged.is_empty() {
         return None;
     }
-    Some(BridgeFilter {
-        parquet_col_idx: col_idx?,
-        clauses,
-    })
+    Some(BridgeFilter { predicates: merged })
 }
 
 /// `TableProvider` that scans a single parquet file using the
@@ -515,26 +767,18 @@ impl TableProvider for EmatixFastParquetTableProvider {
         Ok(filters
             .iter()
             .map(|e| {
-                if let Some(p) = extract_range_predicate(e) {
-                    // Pushable iff the column exists and is i32/Date32.
-                    if let Ok(idx) = self.schema.index_of(&p.column) {
-                        let dt = self.schema.field(idx).data_type();
-                        if matches!(dt, DataType::Int32 | DataType::Date32)
-                            && clause_from_predicate(&p, dt).is_some()
-                        {
-                            // Σ.E5 #517: declare Inexact so DataFusion
-                            // keeps the residual FilterExec. The
-                            // streaming reader's masked path bails to
-                            // dense decode when selectivity is high
-                            // (popcount/total > 0.5); FilterExec then
-                            // re-evaluates and produces the correct
-                            // result. Q14's tiny re-eval cost on the
-                            // filtered batches is negligible.
-                            return TableProviderFilterPushDown::Inexact;
-                        }
-                    }
+                // Σ.E5 #511-513: accept any filter shape recognised by
+                // `predicate_from_expr` (i32/Date32 range + i32 IN +
+                // string Eq + string IN). Always Inexact so DataFusion
+                // keeps the residual FilterExec — necessary for
+                // (a) selectivity-fallback safety in the streaming
+                // reader and (b) Q06-shape low-bandwidth bitmap
+                // overhead avoidance.
+                if predicate_from_expr(e, &self.schema).is_some() {
+                    TableProviderFilterPushDown::Inexact
+                } else {
+                    TableProviderFilterPushDown::Unsupported
                 }
-                TableProviderFilterPushDown::Unsupported
             })
             .collect())
     }
@@ -1108,11 +1352,7 @@ fn decode_one_rg_filtered(
     projection: &[usize],
     filter: &BridgeFilter,
 ) -> DfResult<RecordBatch> {
-    let filter_owned = filter.clone();
-    let (bitmap, _total) =
-        filter_i32_column_to_bitmap(path, rg, filter.parquet_col_idx, move |v: i32| {
-            filter_owned.eval_i32(v)
-        })?;
+    let (bitmap, _total) = filter.build_bitmap(path, rg)?;
 
     let matches: usize = bitmap.iter().map(|b| b.count_ones() as usize).sum();
     let mut columns: Vec<Arc<dyn arrow_array::Array>> = Vec::with_capacity(projection.len());
@@ -1189,15 +1429,6 @@ fn decode_one_rg_filtered_late_mat(
     projection: &[usize],
     filter: &BridgeFilter,
 ) -> DfResult<RecordBatch> {
-    // Build the row-bitmap from the filter column. Same kernel the
-    // pre-Π.10 path uses — width-generic NEON-fused predicate
-    // (Σ.E2 + bump-to-v0.2/0.3).
-    let filter_owned = filter.clone();
-    let (bitmap, _total) =
-        filter_i32_column_to_bitmap(path, rg, filter.parquet_col_idx, move |v: i32| {
-            filter_owned.eval_i32(v)
-        })?;
-
     // Open the parquet file once for this row group. The masked_into
     // façade caches column-chunk bytes internally; opening the
     // ParquetFile is the only IO setup we need.
@@ -1206,6 +1437,8 @@ fn decode_one_rg_filtered_late_mat(
             format!("EmatixFastParquetExec (late_mat): ParquetFile::open: {e}").into(),
         )
     })?;
+    // Σ.E5 #513: multi-column AND bitmap via BridgeFilter.
+    let (bitmap, _total) = filter.build_bitmap(path, rg)?;
 
     let matches: usize = bitmap.iter().map(|b| b.count_ones() as usize).sum();
     let mut columns: Vec<Arc<dyn arrow_array::Array>> = Vec::with_capacity(projection.len());
