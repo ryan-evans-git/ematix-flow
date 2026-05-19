@@ -48,6 +48,7 @@ use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
 
+use crate::ematix_fast_parquet::{BridgeFilter, ColumnPredicate, EmatixFastParquetExec};
 use crate::fused_aggregate::{Q1Spec, Q6Spec};
 use crate::fused_aggregate_exec::FusedAggregateExec;
 use crate::fused_multi_agg::Q1Predicate;
@@ -491,17 +492,39 @@ fn try_match_q1_plan(node: &Arc<dyn ExecutionPlan>) -> DfResult<Option<Arc<dyn E
     {
         return Ok(None);
     }
-    let Some(filter) = shape.body.as_any().downcast_ref::<FilterExec>() else {
-        return Ok(None);
-    };
-    let Some(predicate) = extract_q1_predicate(filter.predicate()) else {
-        return Ok(None);
-    };
-    let mut scan: Arc<dyn ExecutionPlan> = filter
-        .children()
-        .first()
-        .map(|c| (*c).clone())
-        .ok_or_else(|| dferr("Q1 match: FilterExec missing input"))?;
+    // Σ.E5 (2026-05-19): accept two body shapes —
+    //  - Inexact pushdown: `FilterExec(predicate)` sits directly under
+    //    the agg stack; pull the predicate from FilterExec's physical
+    //    expression (current path).
+    //  - Exact pushdown: DataFusion drops `FilterExec` entirely; the
+    //    predicate lives on `EmatixFastParquetExec`'s `BridgeFilter`.
+    //    Walk down `body` to find the emat scan and pull it from
+    //    there.
+    let (predicate, scan_root): (Q1Predicate, Arc<dyn ExecutionPlan>) =
+        if let Some(filter) = shape.body.as_any().downcast_ref::<FilterExec>() {
+            let Some(p) = extract_q1_predicate(filter.predicate()) else {
+                return Ok(None);
+            };
+            let child = filter
+                .children()
+                .first()
+                .map(|c| (*c).clone())
+                .ok_or_else(|| dferr("Q1 match: FilterExec missing input"))?;
+            (p, child)
+        } else {
+            // Walk to the EmatixFastParquetExec and read its
+            // BridgeFilter. If we don't find an emat scan, or the scan
+            // has no pushed filter matching Q1's shape, this isn't a
+            // Q1 plan and we pass.
+            let Some(scan) = find_emat_scan(&shape.body) else {
+                return Ok(None);
+            };
+            let Some(p) = extract_q1_predicate_from_scan(scan) else {
+                return Ok(None);
+            };
+            (p, shape.body.clone())
+        };
+    let mut scan: Arc<dyn ExecutionPlan> = scan_root;
     loop {
         if scan_has_required_q1_columns(&scan.schema()) {
             break;
@@ -612,6 +635,57 @@ fn extract_q1_predicate(expr: &Arc<dyn PhysicalExpr>) -> Option<Q1Predicate> {
     let shipdate_cutoff = match op {
         Operator::LtEq => cutoff_lit,
         Operator::Lt => cutoff_lit - 1,
+        _ => return None,
+    };
+    Some(Q1Predicate { shipdate_cutoff })
+}
+
+/// Σ.E5 (2026-05-19): walk down `node` looking for an
+/// `EmatixFastParquetExec`. Returns the first one found, descending
+/// through single-child wrappers (RepartitionExec, ProjectionExec,
+/// CoalesceBatchesExec, etc.). Returns `None` at branches or if no
+/// emat scan is found within 8 hops (TPC-H plans are shallow).
+fn find_emat_scan(node: &Arc<dyn ExecutionPlan>) -> Option<&EmatixFastParquetExec> {
+    if let Some(emat) = node.as_any().downcast_ref::<EmatixFastParquetExec>() {
+        return Some(emat);
+    }
+    let children = node.children();
+    if children.len() != 1 {
+        return None;
+    }
+    find_emat_scan(children[0])
+}
+
+/// Σ.E5 (2026-05-19): pull a Q1Predicate from an `EmatixFastParquetExec`'s
+/// pushed BridgeFilter. Returns `Some` only when the scan holds an
+/// `I32Range` predicate on `l_shipdate` (looked up via the file
+/// schema, so the col_idx is whatever the file happens to use). The
+/// range must be a single `<=` or `<` clause — Q1's filter is one
+/// inclusive upper bound.
+fn extract_q1_predicate_from_scan(scan: &EmatixFastParquetExec) -> Option<Q1Predicate> {
+    let bf: &BridgeFilter = scan.filter()?;
+    let file_schema = scan.file_schema();
+    // Q1's only pushable filter is `l_shipdate <= V`. Find the single
+    // I32Range predicate whose col_idx names `l_shipdate` in the file
+    // schema.
+    let preds = bf.predicates();
+    if preds.len() != 1 {
+        return None;
+    }
+    let ColumnPredicate::I32Range { col_idx, clauses } = &preds[0] else {
+        return None;
+    };
+    let col_name = file_schema.field(*col_idx).name().as_str();
+    if col_name != "l_shipdate" {
+        return None;
+    }
+    if clauses.len() != 1 {
+        return None;
+    }
+    let c = &clauses[0];
+    let shipdate_cutoff = match c.op {
+        Operator::LtEq => c.literal_i32,
+        Operator::Lt => c.literal_i32 - 1,
         _ => return None,
     };
     Some(Q1Predicate { shipdate_cutoff })

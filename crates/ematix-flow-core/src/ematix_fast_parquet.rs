@@ -1434,6 +1434,7 @@ impl TableProvider for EmatixFastParquetTableProvider {
         Ok(Arc::new(EmatixFastParquetExec::try_new(
             self.path.clone(),
             projected_schema,
+            Arc::clone(&self.schema),
             projection,
             assignments,
             self.num_rows,
@@ -1451,6 +1452,10 @@ impl TableProvider for EmatixFastParquetTableProvider {
 pub struct EmatixFastParquetExec {
     path: String,
     schema: SchemaRef,
+    /// Full (unprojected) file schema. Σ.E5 (2026-05-19): exposed so
+    /// `InjectFusedQ*Rule` can resolve `BridgeFilter` col_idx →
+    /// column name when matching the Exact-mode shape.
+    file_schema: SchemaRef,
     projection: Vec<usize>,
     assignments: Vec<Vec<usize>>,
     num_rows: usize,
@@ -1484,6 +1489,7 @@ impl EmatixFastParquetExec {
     pub fn try_new(
         path: String,
         schema: SchemaRef,
+        file_schema: SchemaRef,
         projection: Vec<usize>,
         assignments: Vec<Vec<usize>>,
         num_rows: usize,
@@ -1503,6 +1509,7 @@ impl EmatixFastParquetExec {
         Ok(Self {
             path,
             schema,
+            file_schema,
             projection,
             assignments,
             num_rows,
@@ -1514,6 +1521,30 @@ impl EmatixFastParquetExec {
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
         })
+    }
+
+    /// Full (unprojected) file schema. Σ.E5: needed by
+    /// `InjectFusedQ*Rule` to resolve a `BridgeFilter` predicate's
+    /// `col_idx` back to a column name when matching the Exact-mode
+    /// shape (no `FilterExec` in the plan).
+    pub fn file_schema(&self) -> &SchemaRef {
+        &self.file_schema
+    }
+
+    /// The pushed-down BridgeFilter, if any. Σ.E5 (2026-05-19):
+    /// `InjectFusedQ*Rule` reads this when matching the Exact-mode
+    /// shape (no `FilterExec` in the plan — the predicate lives on
+    /// the scan instead).
+    pub fn filter(&self) -> Option<&BridgeFilter> {
+        self.filter.as_ref()
+    }
+
+    /// Projected column indices into the file's logical schema.
+    /// Σ.E5: needed by `InjectFusedQ*Rule` Exact-shape match to map
+    /// from `BridgeFilter` `col_idx` (file-schema-indexed) back to a
+    /// column name via the scan's schema.
+    pub fn projection(&self) -> &[usize] {
+        &self.projection
     }
 }
 
