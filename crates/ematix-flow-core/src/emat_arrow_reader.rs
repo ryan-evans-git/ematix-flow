@@ -1900,7 +1900,17 @@ fn decode_byte_array_to_string_view_slow(
     // for PLAIN). Block IDs were pre-assigned above so each task's
     // views reference the correct data_buffers slot once we
     // sequentially append.
-    if !force_serial && pending.len() > 1 {
+    //
+    // Threshold: only parallelise when there are enough pages to
+    // amortise rayon dispatch (~50-100µs). On Q16 (supplier ~2 pages,
+    // ~10k rows) going parallel was adding ~300µs of overhead. On
+    // Q13 (o_comment 22-51 pages) parallel saves 15-25ms — clear
+    // win above ~4 pages.
+    let parallel_threshold = std::env::var("EMAT_DECODE_PARALLEL_THRESHOLD")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(4usize);
+    if !force_serial && pending.len() > parallel_threshold {
         use rayon::prelude::*;
         let dict_offsets_ref = &dict_offsets;
         let dict_lengths_ref = &dict_lengths;
