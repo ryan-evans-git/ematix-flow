@@ -96,6 +96,15 @@ pub enum ColumnPredicate {
         pattern: String,
         negated: bool,
     },
+    /// `col_a OP col_b` on two i32/Date32 columns of the same type.
+    /// Q12 has `l_commitdate < l_receiptdate AND l_shipdate <
+    /// l_commitdate`; Q21 has `l_receiptdate > l_commitdate`.
+    /// Pairwise eval in build_bitmap.
+    I32ColumnPair {
+        left_col: usize,
+        right_col: usize,
+        op: Operator,
+    },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -166,6 +175,59 @@ impl BridgeFilter {
                         pclone.eval_f64(v)
                     })?
                 }
+                ColumnPredicate::I32ColumnPair {
+                    left_col,
+                    right_col,
+                    op,
+                } => {
+                    // Decode both cols dense via masked_decode_i32
+                    // with all-ones masks. Same shape as the F64 dense
+                    // path. Apply the op pairwise to build the bitmap.
+                    use crate::ematix_parquet_bridge::masked_decode_i32;
+                    let file = ematix_parquet_io::ParquetFile::open(path).map_err(|e| {
+                        DataFusionError::External(
+                            format!("ParquetFile::open: {e}").into(),
+                        )
+                    })?;
+                    let md = file.metadata().map_err(|e| {
+                        DataFusionError::External(format!("metadata: {e}").into())
+                    })?;
+                    let total =
+                        md.row_groups[rg].columns[*left_col].meta_data.as_ref().map(|m| m.num_values as usize).unwrap_or(0);
+                    let all_ones = vec![0xFFu8; total.div_ceil(8)];
+                    let left = masked_decode_i32(&file, rg, *left_col, &all_ones)?;
+                    let right = masked_decode_i32(&file, rg, *right_col, &all_ones)?;
+                    if left.len() != right.len() || left.len() != total {
+                        return Err(DataFusionError::External(
+                            format!(
+                                "I32ColumnPair: row count mismatch left={} right={} total={}",
+                                left.len(),
+                                right.len(),
+                                total
+                            )
+                            .into(),
+                        ));
+                    }
+                    let mut bitmap = vec![0u8; total.div_ceil(8)];
+                    let op = *op;
+                    for row in 0..total {
+                        let l = left[row];
+                        let r = right[row];
+                        let pass = match op {
+                            Operator::Lt => l < r,
+                            Operator::LtEq => l <= r,
+                            Operator::Gt => l > r,
+                            Operator::GtEq => l >= r,
+                            Operator::Eq => l == r,
+                            Operator::NotEq => l != r,
+                            _ => false,
+                        };
+                        if pass {
+                            bitmap[row >> 3] |= 1 << (row & 7);
+                        }
+                    }
+                    (bitmap, total)
+                }
                 ColumnPredicate::StringEq { col_idx, .. }
                 | ColumnPredicate::StringNotEq { col_idx, .. }
                 | ColumnPredicate::StringIn { col_idx, .. }
@@ -231,6 +293,8 @@ impl ColumnPredicate {
             | ColumnPredicate::StringNotEq { col_idx, .. }
             | ColumnPredicate::StringIn { col_idx, .. }
             | ColumnPredicate::StringLike { col_idx, .. } => *col_idx,
+            // ColumnPair touches two cols; return left as the "primary".
+            ColumnPredicate::I32ColumnPair { left_col, .. } => *left_col,
         }
     }
 
@@ -469,6 +533,23 @@ fn predicate_from_expr(expr: &Expr, full_schema: &Schema) -> Option<ColumnPredic
                 });
             }
         }
+        // Shape 5: col_a OP col_b on two i32/Date32 columns —
+        // NOT PUSHED.
+        //
+        // Σ.E5 (verified 2026-05-19): col-vs-col pushdown is net
+        // negative — same double-decode trap as F64Range. Q12's
+        // `l_commitdate < l_receiptdate AND l_shipdate <
+        // l_commitdate` involves three date columns all in
+        // projection. With pushdown, all three are decoded twice
+        // (once for the bitmap, once masked for projection emission).
+        // Empirical result: Q12 −19% → +47%, Q21 −6% → −3%.
+        //
+        // The I32ColumnPair variant + build_bitmap path remain in
+        // the codebase for callers that explicitly construct one
+        // (e.g. when filter cols can be proven disjoint from
+        // projection at planning time). DataFusion's residual
+        // FilterExec handles col-vs-col adequately on dense Date32
+        // batches.
     }
     None
 }
