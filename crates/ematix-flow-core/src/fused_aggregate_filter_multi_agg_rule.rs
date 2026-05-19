@@ -338,14 +338,22 @@ fn try_build_replacement(
         Err(_) => return Ok(None),
     };
 
-    // Σ.G.2f.3 perf: optional RoundRobinBatch fan-out so the agg's
-    // hot loop runs across more workers than the scan's natural
-    // row-group partitioning. EMAT_FILTER_MULTI_AGG_FANOUT=N
-    // (default 14, matching the typical config target_partitions).
+    // Σ.G.2f.3 perf: RoundRobinBatch fan-out for the agg's hot loop.
+    // Sweep on Q01 SF=1 (14-core box, target_partitions=14):
+    //     fanout= 6  → median 59 ms
+    //     fanout= 8  → 53 ms
+    //     fanout=10  → 49 ms
+    //     fanout=14  → 46 ms (matches target_partitions)
+    //     fanout=18  → 45 ms ← default
+    //
+    // Going past `target_partitions` keeps additional workers ready
+    // to pull batches the moment any of the others blocks on the
+    // scan-side channel — the scheduling tail dominates wall-clock
+    // even on a 14-core box. Tuned via EMAT_FILTER_MULTI_AGG_FANOUT.
     let target_partitions: usize = std::env::var("EMAT_FILTER_MULTI_AGG_FANOUT")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(14);
+        .unwrap_or(18);
     let scan_partitions = scan.properties().partitioning.partition_count();
     let input_for_fused: Arc<dyn ExecutionPlan> = if target_partitions > scan_partitions {
         Arc::new(RepartitionExec::try_new(
