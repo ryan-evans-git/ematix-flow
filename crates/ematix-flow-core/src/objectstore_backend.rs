@@ -28,16 +28,16 @@ use std::sync::Arc;
 use arrow_array::RecordBatch;
 use async_trait::async_trait;
 use bytes::Bytes;
+use datafusion::parquet::arrow::AsyncArrowWriter;
+use datafusion::parquet::arrow::async_reader::ParquetObjectReader;
+use datafusion::parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder;
+use datafusion::parquet::file::properties::WriterProperties;
 use futures_util::StreamExt;
 use object_store::ObjectStore;
 use object_store::ObjectStoreExt;
 use object_store::aws::AmazonS3Builder;
 use object_store::local::LocalFileSystem;
 use object_store::path::Path as ObjectPath;
-use datafusion::parquet::arrow::AsyncArrowWriter;
-use datafusion::parquet::arrow::async_reader::ParquetObjectReader;
-use datafusion::parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder;
-use datafusion::parquet::file::properties::WriterProperties;
 use uuid::Uuid;
 
 use crate::backend::{
@@ -502,7 +502,9 @@ async fn write_csv_at_path(
 /// Π.1.4: map our narrow `ParquetCompression` enum to the parquet
 /// crate's wide `Compression`. ZSTD level defaults to 3 — the
 /// parquet crate's recommended default.
-fn parquet_compression_to_codec(codec: ParquetCompression) -> datafusion::parquet::basic::Compression {
+fn parquet_compression_to_codec(
+    codec: ParquetCompression,
+) -> datafusion::parquet::basic::Compression {
     use datafusion::parquet::basic::{Compression, GzipLevel, ZstdLevel};
     match codec {
         ParquetCompression::Uncompressed => Compression::UNCOMPRESSED,

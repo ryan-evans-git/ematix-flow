@@ -34,9 +34,7 @@
 use std::sync::Arc;
 
 use arrow_array::builder::make_view;
-use arrow_array::{
-    ArrayRef, Date32Array, Float64Array, Int32Array, Int64Array, StringViewArray,
-};
+use arrow_array::{ArrayRef, Date32Array, Float64Array, Int32Array, Int64Array, StringViewArray};
 use arrow_schema::DataType;
 use datafusion::arrow::buffer::{Buffer, NullBuffer, ScalarBuffer};
 use datafusion::error::{DataFusionError, Result as DfResult};
@@ -64,8 +62,9 @@ fn decompress_into(codec: CompressionCodec, body: &[u8], out: &mut Vec<u8>) -> D
             out.extend_from_slice(body);
             Ok(())
         }
-        CompressionCodec::Snappy => decompress_snappy_into(body, out)
-            .map_err(|e| ext(format!("snappy decompress: {e}"))),
+        CompressionCodec::Snappy => {
+            decompress_snappy_into(body, out).map_err(|e| ext(format!("snappy decompress: {e}")))
+        }
         CompressionCodec::Zstd => {
             decompress_zstd_into(body, out).map_err(|e| ext(format!("zstd decompress: {e}")))
         }
@@ -433,9 +432,7 @@ impl ColumnPageStream for StringViewPageStream {
                 .map_err(|e| ext(format!("rle_dict_indices: {e}")))?;
                 let dict_len = self.dict_views.len();
                 if let Some(bad) = self.idx_buf.iter().find(|&&i| (i as usize) >= dict_len) {
-                    return Err(ext(format!(
-                        "dict idx {bad} out of range {dict_len}"
-                    )));
+                    return Err(ext(format!("dict idx {bad} out of range {dict_len}")));
                 }
                 self.views.reserve(self.idx_buf.len());
                 // Tight gather — same shape as the eager dict-
@@ -495,8 +492,9 @@ impl ColumnPageStream for StringViewPageStream {
         // Share all backing data buffers (Arc bump). Each page's
         // buffer is referenced by potentially many slices; that's
         // fine — StringViewArray supports it.
-        let arr = StringViewArray::try_new(views_buf, self.data_buffers.clone(), None::<NullBuffer>)
-            .expect("StringViewArray::try_new on internally-built views");
+        let arr =
+            StringViewArray::try_new(views_buf, self.data_buffers.clone(), None::<NullBuffer>)
+                .expect("StringViewArray::try_new on internally-built views");
         Arc::new(arr)
     }
 }
@@ -545,18 +543,20 @@ impl DecodePool {
             let receiver = std::sync::Arc::clone(&receiver);
             std::thread::Builder::new()
                 .name(format!("emat-decode-pool-{i}"))
-                .spawn(move || loop {
-                    let job = {
-                        let guard = match receiver.lock() {
-                            Ok(g) => g,
-                            Err(_) => return, // poisoned — exit worker
+                .spawn(move || {
+                    loop {
+                        let job = {
+                            let guard = match receiver.lock() {
+                                Ok(g) => g,
+                                Err(_) => return, // poisoned — exit worker
+                            };
+                            match guard.recv() {
+                                Ok(j) => j,
+                                Err(_) => return, // sender dropped — exit
+                            }
                         };
-                        match guard.recv() {
-                            Ok(j) => j,
-                            Err(_) => return, // sender dropped — exit
-                        }
-                    };
-                    job();
+                        job();
+                    }
                 })
                 .expect("spawn emat decode pool worker");
         }
@@ -816,8 +816,7 @@ impl EmatPageStreamingReader {
 
     fn next_batch(&mut self) -> DfResult<Option<RecordBatch>> {
         loop {
-            let need_new_rg =
-                self.cur_rg_state.is_none() || self.cur_rg_row >= self.cur_rg_total;
+            let need_new_rg = self.cur_rg_state.is_none() || self.cur_rg_row >= self.cur_rg_total;
             if need_new_rg {
                 // Drop previous state. Decoders may still be running
                 // briefly; the Arc keeps the state alive until they
@@ -958,8 +957,7 @@ impl EmatInlineStreamingReader {
 
     fn open_row_group(&mut self, rg: usize) -> DfResult<()> {
         self.cur_rg_total = self.cached_md.row_groups[rg].num_rows as usize;
-        let mut streams: Vec<Box<dyn ColumnPageStream>> =
-            Vec::with_capacity(self.projection.len());
+        let mut streams: Vec<Box<dyn ColumnPageStream>> = Vec::with_capacity(self.projection.len());
         for (i, &leaf) in self.projection.iter().enumerate() {
             let target = self.arrow_schema.field(i).data_type();
             let cm = &self.cached_md.row_groups[rg].columns[leaf];
@@ -1130,7 +1128,11 @@ mod tests {
         .unwrap();
 
         let file = ParquetFile::open(&path).unwrap();
-        let mut stream = { let _md = CachedFileMetadata::from_file(&file).unwrap(); Float64PageStream::new(&file, &_md.row_groups[0].columns[0]) }.expect("open stream");
+        let mut stream = {
+            let _md = CachedFileMetadata::from_file(&file).unwrap();
+            Float64PageStream::new(&file, &_md.row_groups[0].columns[0])
+        }
+        .expect("open stream");
 
         let total = stream.total_rows();
         assert_eq!(total, n);
@@ -1150,7 +1152,10 @@ mod tests {
                 "rows_decoded ({now}) must not exceed total_rows ({total})",
             );
             last = now;
-            assert!(page_calls <= 2048, "too many pages — stream not terminating");
+            assert!(
+                page_calls <= 2048,
+                "too many pages — stream not terminating"
+            );
         }
         assert_eq!(stream.rows_decoded(), total);
         // 200K f64 = 1.6 MB. The codec writer cuts data pages well
@@ -1201,7 +1206,11 @@ mod tests {
         )
         .unwrap();
         let file = ParquetFile::open(&path).unwrap();
-        let mut stream = { let _md = CachedFileMetadata::from_file(&file).unwrap(); Int32PageStream::new(&file, &_md.row_groups[0].columns[0]) }.unwrap();
+        let mut stream = {
+            let _md = CachedFileMetadata::from_file(&file).unwrap();
+            Int32PageStream::new(&file, &_md.row_groups[0].columns[0])
+        }
+        .unwrap();
         let mut page_calls = 0;
         while stream.rows_decoded() < n {
             stream.decode_next_page().unwrap();
@@ -1225,8 +1234,14 @@ mod tests {
         // Dict-encoded byte_array column. Streams as: dict page →
         // index pages, with views referencing data_buffers[0].
         let palette: Vec<&[u8]> = vec![
-            b"apple", b"banana", b"cherry", b"date", b"elderberry",
-            b"fig", b"grape", b"honeydew",
+            b"apple",
+            b"banana",
+            b"cherry",
+            b"date",
+            b"elderberry",
+            b"fig",
+            b"grape",
+            b"honeydew",
         ];
         let n: usize = 10_000;
         let rows: Vec<&[u8]> = (0..n).map(|i| palette[i % palette.len()]).collect();
@@ -1240,7 +1255,11 @@ mod tests {
         )
         .unwrap();
         let file = ParquetFile::open(&path).unwrap();
-        let mut stream = { let _md = CachedFileMetadata::from_file(&file).unwrap(); StringViewPageStream::new(&file, &_md.row_groups[0].columns[0]) }.unwrap();
+        let mut stream = {
+            let _md = CachedFileMetadata::from_file(&file).unwrap();
+            StringViewPageStream::new(&file, &_md.row_groups[0].columns[0])
+        }
+        .unwrap();
         let mut page_calls = 0;
         while stream.rows_decoded() < n {
             stream.decode_next_page().unwrap();
@@ -1279,7 +1298,11 @@ mod tests {
         )
         .unwrap();
         let file = ParquetFile::open(&path).unwrap();
-        let mut stream = { let _md = CachedFileMetadata::from_file(&file).unwrap(); StringViewPageStream::new(&file, &_md.row_groups[0].columns[0]) }.unwrap();
+        let mut stream = {
+            let _md = CachedFileMetadata::from_file(&file).unwrap();
+            StringViewPageStream::new(&file, &_md.row_groups[0].columns[0])
+        }
+        .unwrap();
         while stream.rows_decoded() < n {
             stream.decode_next_page().unwrap();
         }
@@ -1322,7 +1345,8 @@ mod tests {
         ]));
 
         let file = ParquetFile::open(&path).unwrap();
-        let reader = EmatPageStreamingReader::new(file, schema, vec![0, 1, 2], vec![0], 8192).unwrap();
+        let reader =
+            EmatPageStreamingReader::new(file, schema, vec![0, 1, 2], vec![0], 8192).unwrap();
         let batches: Vec<RecordBatch> = reader.map(|b| b.unwrap()).collect();
         let total: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total, n);
@@ -1332,7 +1356,11 @@ mod tests {
         // Spot-check the first batch.
         let first = &batches[0];
         assert_eq!(first.num_columns(), 3);
-        let i = first.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+        let i = first
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
         let f = first
             .column(1)
             .as_any()
@@ -1368,7 +1396,11 @@ mod tests {
         )
         .unwrap();
         let file = ParquetFile::open(&path).unwrap();
-        let mut stream = { let _md = CachedFileMetadata::from_file(&file).unwrap(); Int64PageStream::new(&file, &_md.row_groups[0].columns[0]) }.unwrap();
+        let mut stream = {
+            let _md = CachedFileMetadata::from_file(&file).unwrap();
+            Int64PageStream::new(&file, &_md.row_groups[0].columns[0])
+        }
+        .unwrap();
         let mut page_calls = 0;
         while stream.rows_decoded() < n {
             stream.decode_next_page().unwrap();

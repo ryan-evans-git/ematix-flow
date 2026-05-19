@@ -172,7 +172,11 @@ impl<S: AggregateSpec + Clone> ExecutionPlan for FusedAggregateExec<S> {
         let schema_for_stream = output_schema.clone();
         let fut = async move {
             let timing = std::env::var_os("EMAT_AGG_TIMING").is_some();
-            let t_total = if timing { Some(std::time::Instant::now()) } else { None };
+            let t_total = if timing {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
 
             // Bounded MPMC channel. Capacity = n_workers * 2 keeps
             // workers fed (one in-flight + one queued each) without
@@ -187,14 +191,12 @@ impl<S: AggregateSpec + Clone> ExecutionPlan for FusedAggregateExec<S> {
                 let tx_p = tx.clone();
                 producers.push(tokio::spawn(async move {
                     let mut pull_ns: u128 = 0;
-                    while let Some(batch) =
-                        {
-                            let t = std::time::Instant::now();
-                            let n = s.try_next().await?;
-                            pull_ns += t.elapsed().as_nanos();
-                            n
-                        }
-                    {
+                    while let Some(batch) = {
+                        let t = std::time::Instant::now();
+                        let n = s.try_next().await?;
+                        pull_ns += t.elapsed().as_nanos();
+                        n
+                    } {
                         // If the send fails the consumer side closed
                         // (cancellation / error); stop producing.
                         if tx_p.send(batch).await.is_err() {
@@ -247,7 +249,11 @@ impl<S: AggregateSpec + Clone> ExecutionPlan for FusedAggregateExec<S> {
             }
 
             // Wait for workers and merge their accumulators.
-            let t_merge = if timing { Some(std::time::Instant::now()) } else { None };
+            let t_merge = if timing {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
             let mut merged = <S as AggregateSpec>::Accumulator::default();
             let mut sum_proc_ms = 0.0;
             let mut sum_rows = 0usize;
@@ -267,14 +273,21 @@ impl<S: AggregateSpec + Clone> ExecutionPlan for FusedAggregateExec<S> {
                 .map(|t| t.elapsed().as_secs_f64() * 1000.0)
                 .unwrap_or(0.0);
 
-            let t_fin = if timing { Some(std::time::Instant::now()) } else { None };
+            let t_fin = if timing {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
             let result = spec.finalize(merged);
             let fin_ms = t_fin
                 .map(|t| t.elapsed().as_secs_f64() * 1000.0)
                 .unwrap_or(0.0);
             if let Some(t) = t_total {
                 let total_ms = t.elapsed().as_secs_f64() * 1000.0;
-                let spec_name = std::any::type_name::<S>().rsplit("::").next().unwrap_or("?");
+                let spec_name = std::any::type_name::<S>()
+                    .rsplit("::")
+                    .next()
+                    .unwrap_or("?");
                 eprintln!(
                     "[emat.agg] spec={spec_name} producers={input_partitions} workers={n_workers} \
                      batches={sum_batches} rows={sum_rows} sum_pull={sum_pull_ms:.2}ms \
@@ -292,4 +305,3 @@ impl<S: AggregateSpec + Clone> ExecutionPlan for FusedAggregateExec<S> {
         )))
     }
 }
-

@@ -42,11 +42,7 @@ async fn probe(label: &str, ctx: &SessionContext) {
         .await
         .unwrap();
     let physical = df.create_physical_plan().await.unwrap();
-    let stream = datafusion::physical_plan::execute_stream(
-        physical,
-        ctx.task_ctx(),
-    )
-    .unwrap();
+    let stream = datafusion::physical_plan::execute_stream(physical, ctx.task_ctx()).unwrap();
     let batches = stream.try_collect::<Vec<_>>().await.unwrap();
     println!("=== {label} ===");
     if let Some(b) = batches.first() {

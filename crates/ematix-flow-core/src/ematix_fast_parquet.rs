@@ -110,7 +110,10 @@ impl BridgeFilter {
 #[derive(Debug, Clone)]
 pub enum ColumnPredicate {
     /// AND of comparisons on the same i32/Date32 column.
-    I32Range { col_idx: usize, clauses: Vec<RangeClause> },
+    I32Range {
+        col_idx: usize,
+        clauses: Vec<RangeClause>,
+    },
     /// `col IN (v1, v2, ...)` on an i32 column (Q16's p_size).
     I32In { col_idx: usize, values: Vec<i32> },
     /// AND of comparisons on the same Float64 column. Used for
@@ -171,11 +174,7 @@ impl BridgeFilter {
     /// string predicates uses the dict-preserved per-entry mask.
     /// Falls back to dense decode if the i32 column isn't
     /// dict-encoded (e.g. PLAIN-only).
-    pub fn build_bitmap(
-        &self,
-        path: &std::path::Path,
-        rg: usize,
-    ) -> DfResult<(Vec<u8>, usize)> {
+    pub fn build_bitmap(&self, path: &std::path::Path, rg: usize) -> DfResult<(Vec<u8>, usize)> {
         use crate::ematix_parquet_bridge::{
             filter_byte_array_to_bitmap, filter_byte_array_to_bitmap_dense,
             filter_f64_column_to_bitmap_dense, filter_i32_column_to_bitmap,
@@ -197,9 +196,7 @@ impl BridgeFilter {
                         Err(_) => {
                             let pc2 = pclone.clone();
                             let file = ematix_parquet_io::ParquetFile::open(path).map_err(|e| {
-                                DataFusionError::External(
-                                    format!("ParquetFile::open: {e}").into(),
-                                )
+                                DataFusionError::External(format!("ParquetFile::open: {e}").into())
                             })?;
                             filter_i32_column_to_bitmap_dense(
                                 &file,
@@ -226,15 +223,16 @@ impl BridgeFilter {
                     // path. Apply the op pairwise to build the bitmap.
                     use crate::ematix_parquet_bridge::masked_decode_i32;
                     let file = ematix_parquet_io::ParquetFile::open(path).map_err(|e| {
-                        DataFusionError::External(
-                            format!("ParquetFile::open: {e}").into(),
-                        )
+                        DataFusionError::External(format!("ParquetFile::open: {e}").into())
                     })?;
-                    let md = file.metadata().map_err(|e| {
-                        DataFusionError::External(format!("metadata: {e}").into())
-                    })?;
-                    let total =
-                        md.row_groups[rg].columns[*left_col].meta_data.as_ref().map(|m| m.num_values as usize).unwrap_or(0);
+                    let md = file
+                        .metadata()
+                        .map_err(|e| DataFusionError::External(format!("metadata: {e}").into()))?;
+                    let total = md.row_groups[rg].columns[*left_col]
+                        .meta_data
+                        .as_ref()
+                        .map(|m| m.num_values as usize)
+                        .unwrap_or(0);
                     let all_ones = vec![0xFFu8; total.div_ceil(8)];
                     let left = masked_decode_i32(&file, rg, *left_col, &all_ones)?;
                     let right = masked_decode_i32(&file, rg, *right_col, &all_ones)?;
@@ -347,10 +345,7 @@ impl ColumnPredicate {
     /// parallel-bitmap+dense (high-sel) and serial-bitmap+masked-
     /// decode (low-sel) paths. When stats are missing, returns a
     /// conservative 0.5 (treat as "may be high-sel").
-    pub fn estimate_pass_rate(
-        &self,
-        stats: &datafusion::common::stats::ColumnStatistics,
-    ) -> f64 {
+    pub fn estimate_pass_rate(&self, stats: &datafusion::common::stats::ColumnStatistics) -> f64 {
         use datafusion::common::stats::Precision;
 
         let extract_i32 = |p: &Precision<ScalarValue>| -> Option<i32> {
@@ -390,24 +385,40 @@ impl ColumnPredicate {
                         Operator::Eq => 1.0 / ((max - min) as f64).max(1.0),
                         Operator::NotEq => 1.0 - 1.0 / ((max - min) as f64).max(1.0),
                         Operator::Lt => {
-                            if lit <= min { 0.0 }
-                            else if lit > max { 1.0 }
-                            else { (lit - min) as f64 / range }
+                            if lit <= min {
+                                0.0
+                            } else if lit > max {
+                                1.0
+                            } else {
+                                (lit - min) as f64 / range
+                            }
                         }
                         Operator::LtEq => {
-                            if lit < min { 0.0 }
-                            else if lit >= max { 1.0 }
-                            else { ((lit - min + 1) as f64 / (range + 1.0)).min(1.0) }
+                            if lit < min {
+                                0.0
+                            } else if lit >= max {
+                                1.0
+                            } else {
+                                ((lit - min + 1) as f64 / (range + 1.0)).min(1.0)
+                            }
                         }
                         Operator::Gt => {
-                            if lit >= max { 0.0 }
-                            else if lit < min { 1.0 }
-                            else { (max - lit) as f64 / range }
+                            if lit >= max {
+                                0.0
+                            } else if lit < min {
+                                1.0
+                            } else {
+                                (max - lit) as f64 / range
+                            }
                         }
                         Operator::GtEq => {
-                            if lit > max { 0.0 }
-                            else if lit <= min { 1.0 }
-                            else { ((max - lit + 1) as f64 / (range + 1.0)).min(1.0) }
+                            if lit > max {
+                                0.0
+                            } else if lit <= min {
+                                1.0
+                            } else {
+                                ((max - lit + 1) as f64 / (range + 1.0)).min(1.0)
+                            }
                         }
                         _ => 1.0, // unknown op — conservative
                     };
@@ -419,11 +430,9 @@ impl ColumnPredicate {
                 let min = extract_i32(&stats.min_value);
                 let max = extract_i32(&stats.max_value);
                 let card = extract_usize(&stats.distinct_count);
-                let card = card.or_else(|| {
-                    match (min, max) {
-                        (Some(a), Some(b)) if b > a => Some((b - a + 1) as usize),
-                        _ => None,
-                    }
+                let card = card.or_else(|| match (min, max) {
+                    (Some(a), Some(b)) if b > a => Some((b - a + 1) as usize),
+                    _ => None,
                 });
                 match card {
                     Some(c) if c > 0 => (values.len() as f64 / c as f64).clamp(0.0, 1.0),
@@ -436,12 +445,10 @@ impl ColumnPredicate {
                     _ => 0.1, // conservative default
                 }
             }
-            ColumnPredicate::StringNotEq { .. } => {
-                match extract_usize(&stats.distinct_count) {
-                    Some(c) if c > 0 => 1.0 - 1.0 / c as f64,
-                    _ => 0.9,
-                }
-            }
+            ColumnPredicate::StringNotEq { .. } => match extract_usize(&stats.distinct_count) {
+                Some(c) if c > 0 => 1.0 - 1.0 / c as f64,
+                _ => 0.9,
+            },
             ColumnPredicate::StringIn { values, .. } => {
                 match extract_usize(&stats.distinct_count) {
                     Some(c) if c > 0 => (values.len() as f64 / c as f64).clamp(0.0, 1.0),
@@ -673,7 +680,10 @@ fn predicate_from_expr(expr: &Expr, full_schema: &Schema) -> Option<ColumnPredic
                         return None;
                     }
                 }
-                return Some(ColumnPredicate::I32In { col_idx: idx, values });
+                return Some(ColumnPredicate::I32In {
+                    col_idx: idx,
+                    values,
+                });
             }
             // string IN-list
             if matches!(dt, DataType::Utf8 | DataType::Utf8View) {
@@ -687,7 +697,10 @@ fn predicate_from_expr(expr: &Expr, full_schema: &Schema) -> Option<ColumnPredic
                     };
                     values.push(s);
                 }
-                return Some(ColumnPredicate::StringIn { col_idx: idx, values });
+                return Some(ColumnPredicate::StringIn {
+                    col_idx: idx,
+                    values,
+                });
             }
         }
     }
@@ -705,9 +718,15 @@ fn predicate_from_expr(expr: &Expr, full_schema: &Schema) -> Option<ColumnPredic
                         _ => return None,
                     };
                     return Some(if matches!(b.op, Operator::Eq) {
-                        ColumnPredicate::StringEq { col_idx: idx, value: s }
+                        ColumnPredicate::StringEq {
+                            col_idx: idx,
+                            value: s,
+                        }
                     } else {
-                        ColumnPredicate::StringNotEq { col_idx: idx, value: s }
+                        ColumnPredicate::StringNotEq {
+                            col_idx: idx,
+                            value: s,
+                        }
                     });
                 }
             }
@@ -1049,8 +1068,10 @@ impl EmatixFastParquetTableProvider {
                 }
             })
             .collect();
-        let schema: SchemaRef =
-            Arc::new(Schema::new_with_metadata(promoted_fields, raw_schema.metadata().clone()));
+        let schema: SchemaRef = Arc::new(Schema::new_with_metadata(
+            promoted_fields,
+            raw_schema.metadata().clone(),
+        ));
 
         // Validate: every column must be one of the types the bridge
         // can decode. Anything else, defer to FastParquetTableProvider.
@@ -1136,8 +1157,10 @@ impl EmatixFastParquetTableProvider {
                     continue;
                 };
                 let all_data_pages_dict = stats.iter().all(|s| {
-                    !matches!(s.page_type, PqPageType::DATA_PAGE | PqPageType::DATA_PAGE_V2)
-                        || matches!(s.encoding, PqEnc::RLE_DICTIONARY | PqEnc::PLAIN_DICTIONARY)
+                    !matches!(
+                        s.page_type,
+                        PqPageType::DATA_PAGE | PqPageType::DATA_PAGE_V2
+                    ) || matches!(s.encoding, PqEnc::RLE_DICTIONARY | PqEnc::PLAIN_DICTIONARY)
                 });
                 if !all_data_pages_dict {
                     all_dict[col_idx] = false;
@@ -1369,14 +1392,11 @@ impl TableProvider for EmatixFastParquetTableProvider {
         Ok(filters
             .iter()
             .map(|e| {
-                match predicate_from_expr_with_dict(
-                    e,
-                    &self.schema,
-                    &self.column_is_dict_encoded,
-                ) {
-                    Some(pred) if exact_opt_in
-                        && pred.is_exact_safe()
-                        && no_nulls.get(pred.col_idx()).copied().unwrap_or(false) =>
+                match predicate_from_expr_with_dict(e, &self.schema, &self.column_is_dict_encoded) {
+                    Some(pred)
+                        if exact_opt_in
+                            && pred.is_exact_safe()
+                            && no_nulls.get(pred.col_idx()).copied().unwrap_or(false) =>
                     {
                         TableProviderFilterPushDown::Exact
                     }
@@ -1414,15 +1434,14 @@ impl TableProvider for EmatixFastParquetTableProvider {
         // dense path (DataFusion's residual FilterExec handles the
         // predicate).
         let bridge_filter =
-            extract_bridge_filter(filters, &self.schema, &self.column_is_dict_encoded)
-                .map(|bf| {
-                    // Σ.E5 Phase 1.8: compute predicted pass rate from
-                    // stats. Used by the streaming reader to dispatch
-                    // parallel-bitmap+dense (high-sel) vs serial-
-                    // bitmap+masked (low-sel).
-                    let p = bf.estimate_pass_rate(&self.column_stats);
-                    bf.with_predicted_pass_rate(p)
-                });
+            extract_bridge_filter(filters, &self.schema, &self.column_is_dict_encoded).map(|bf| {
+                // Σ.E5 Phase 1.8: compute predicted pass rate from
+                // stats. Used by the streaming reader to dispatch
+                // parallel-bitmap+dense (high-sel) vs serial-
+                // bitmap+masked (low-sel).
+                let p = bf.estimate_pass_rate(&self.column_stats);
+                bf.with_predicted_pass_rate(p)
+            });
 
         // Project the per-column stats so the Exec reports stats in
         // projection order (matches the projected schema indices).
@@ -1681,9 +1700,7 @@ impl ExecutionPlan for EmatixFastParquetExec {
         // pre-filter cardinalities are wildly different across joined
         // tables (e.g. nation = 25 rows vs lineitem = 6 M).
         let rows = match partition {
-            Some(p) if p < self.assignments.len() => {
-                self.num_rows / self.assignments.len().max(1)
-            }
+            Some(p) if p < self.assignments.len() => self.num_rows / self.assignments.len().max(1),
             None => self.num_rows,
             _ => 0,
         };
@@ -1901,9 +1918,8 @@ fn build_streaming_partition_stream(
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(2_000_000);
-        let auto_inline = !has_filter
-            && row_groups.len() > 1
-            && partition_rows >= large_partition_threshold;
+        let auto_inline =
+            !has_filter && row_groups.len() > 1 && partition_rows >= large_partition_threshold;
         let use_inline = !has_filter && force_inline.unwrap_or(auto_inline);
         let use_page_streaming = if has_filter {
             false
@@ -1915,9 +1931,7 @@ fn build_streaming_partition_stream(
             // reader. The `file_total_rgs == 1` gate excludes
             // lineitem-style multi-RG files whose per-partition row
             // count (1M) looks small but loses to per-page sync.
-            row_groups.len() == 1
-                && file_total_rgs == 1
-                && partition_rows < inline_row_threshold
+            row_groups.len() == 1 && file_total_rgs == 1 && partition_rows < inline_row_threshold
         } else {
             false
         };
@@ -1978,8 +1992,7 @@ fn build_streaming_partition_stream(
                 Ok(r) => r,
                 Err(e) => {
                     let _ = tx.blocking_send(Err(DataFusionError::External(
-                        format!("EmatixFastParquetExec (streaming): build reader: {e}")
-                            .into(),
+                        format!("EmatixFastParquetExec (streaming): build reader: {e}").into(),
                     )));
                     return;
                 }

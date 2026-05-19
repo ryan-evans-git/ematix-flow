@@ -64,9 +64,7 @@ impl LikeMatcher {
         let anchor_start = !bytes.starts_with(b"%");
         let anchor_end = !bytes.ends_with(b"%");
 
-        let trimmed = bytes
-            .strip_prefix(b"%")
-            .unwrap_or(bytes);
+        let trimmed = bytes.strip_prefix(b"%").unwrap_or(bytes);
         let trimmed = trimmed.strip_suffix(b"%").unwrap_or(trimmed);
 
         let mut literals = Vec::new();
@@ -246,7 +244,11 @@ mod tests {
 
     #[test]
     fn multi_substring() {
-        check("%special%requests%", "needs special urgent requests now", true);
+        check(
+            "%special%requests%",
+            "needs special urgent requests now",
+            true,
+        );
         check("%special%requests%", "needs requests special now", false);
         check("%special%requests%", "no match here", false);
         check("%a%b%c%", "abc", true);

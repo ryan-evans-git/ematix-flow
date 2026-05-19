@@ -9,8 +9,8 @@
 //! Generates a 1.5M-row synthetic corpus of ~30-byte ASCII strings
 //! (orders.o_comment-shaped) and counts matches across the corpus.
 
-use std::time::Instant;
 use ematix_flow_core::like_matcher::LikeMatcher;
+use std::time::Instant;
 
 fn rng_string(seed: u64, idx: u64, target_len: usize) -> Vec<u8> {
     // xorshift-ish; ASCII printable only.
@@ -40,10 +40,7 @@ fn baseline_contains(haystack: &[u8], needles: &[&[u8]]) -> bool {
     // Multi-substring contains using std .windows().position().
     let mut cur = 0usize;
     for n in needles {
-        match haystack[cur..]
-            .windows(n.len())
-            .position(|w| w == *n)
-        {
+        match haystack[cur..].windows(n.len()).position(|w| w == *n) {
             Some(p) => cur += p + n.len(),
             None => return false,
         }
@@ -58,7 +55,10 @@ fn main() {
     let corpus: Vec<Vec<u8>> = (0..n_rows as u64)
         .map(|i| rng_string(42, i, avg_len))
         .collect();
-    println!("Total bytes: {}", corpus.iter().map(|v| v.len()).sum::<usize>());
+    println!(
+        "Total bytes: {}",
+        corpus.iter().map(|v| v.len()).sum::<usize>()
+    );
     println!();
 
     let trials = 5;

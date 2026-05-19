@@ -103,7 +103,8 @@ async fn measure(label: &str, ctx: SessionContext, sql: &str, trials: usize, war
     for _ in 0..trials {
         let df = ctx.sql(sql).await.unwrap();
         let plan = df.create_physical_plan().await.unwrap();
-        let stream = datafusion::physical_plan::execute_stream(plan.clone(), ctx.task_ctx()).unwrap();
+        let stream =
+            datafusion::physical_plan::execute_stream(plan.clone(), ctx.task_ctx()).unwrap();
         let t0 = Instant::now();
         let _ = stream.try_collect::<Vec<_>>().await.unwrap();
         let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;

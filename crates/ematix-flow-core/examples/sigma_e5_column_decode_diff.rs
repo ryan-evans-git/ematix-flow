@@ -186,7 +186,11 @@ fn main() {
     let (pq_ms, pq_rows) = bench_parquet_rs(&file_path, &col_name, trials);
 
     println!("emat decode_one_column ({target:?}):");
-    println!("  min: {:>7.2} ms  ({rows} rows)", emat_ms, rows = emat_rows);
+    println!(
+        "  min: {:>7.2} ms  ({rows} rows)",
+        emat_ms,
+        rows = emat_rows
+    );
     println!("parquet-rs ParquetRecordBatchReader:");
     println!("  min: {:>7.2} ms  ({rows} rows)", pq_ms, rows = pq_rows);
     println!();

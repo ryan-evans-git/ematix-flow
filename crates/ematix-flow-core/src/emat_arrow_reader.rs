@@ -59,13 +59,13 @@ use crate::ematix_fast_parquet::BridgeFilter;
 use crate::ematix_parquet_bridge::{
     masked_decode_byte_array, masked_decode_f64, masked_decode_i32, masked_decode_i64,
 };
-use ematix_parquet_codec::read::read_column_byte_array_dict_preserved_into;
 use ematix_parquet_codec::compression::{decompress_snappy_into, decompress_zstd_into};
 use ematix_parquet_codec::dict::decode_rle_dictionary_into;
 use ematix_parquet_codec::plain::{
     decode_plain_byte_array, decode_plain_f64, decode_plain_i32, decode_plain_i64,
 };
 use ematix_parquet_codec::read::read_column_byte_array_dict_preserved;
+use ematix_parquet_codec::read::read_column_byte_array_dict_preserved_into;
 use ematix_parquet_format::types::{CompressionCodec, Encoding, ParquetType};
 use ematix_parquet_io::{PageWalker, ParquetFile};
 
@@ -574,16 +574,10 @@ fn compact_decoded_column_via_arrow(
 /// `LikeMatcher`, etc.) — that drops the FilterExec and unblocks the
 /// compact path as a real win.
 #[allow(dead_code)]
-fn compact_decoded_column(
-    col: &DecodedColumn,
-    bitmap: &[u8],
-    popcount: usize,
-) -> DecodedColumn {
+fn compact_decoded_column(col: &DecodedColumn, bitmap: &[u8], popcount: usize) -> DecodedColumn {
     match col {
         DecodedColumn::Int32 { data, n_rows } => {
-            let src = unsafe {
-                std::slice::from_raw_parts(data.as_ptr() as *const i32, *n_rows)
-            };
+            let src = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const i32, *n_rows) };
             let mut out: Vec<i32> = Vec::with_capacity(popcount);
             for row in 0..*n_rows {
                 if (bitmap[row >> 3] >> (row & 7)) & 1 == 1 {
@@ -596,9 +590,7 @@ fn compact_decoded_column(
             }
         }
         DecodedColumn::Int64 { data, n_rows } => {
-            let src = unsafe {
-                std::slice::from_raw_parts(data.as_ptr() as *const i64, *n_rows)
-            };
+            let src = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const i64, *n_rows) };
             let mut out: Vec<i64> = Vec::with_capacity(popcount);
             for row in 0..*n_rows {
                 if (bitmap[row >> 3] >> (row & 7)) & 1 == 1 {
@@ -611,9 +603,7 @@ fn compact_decoded_column(
             }
         }
         DecodedColumn::Float64 { data, n_rows } => {
-            let src = unsafe {
-                std::slice::from_raw_parts(data.as_ptr() as *const f64, *n_rows)
-            };
+            let src = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const f64, *n_rows) };
             let mut out: Vec<f64> = Vec::with_capacity(popcount);
             for row in 0..*n_rows {
                 if (bitmap[row >> 3] >> (row & 7)) & 1 == 1 {
@@ -630,9 +620,7 @@ fn compact_decoded_column(
             n_rows,
             data_buffers,
         } => {
-            let src = unsafe {
-                std::slice::from_raw_parts(views.as_ptr() as *const u128, *n_rows)
-            };
+            let src = unsafe { std::slice::from_raw_parts(views.as_ptr() as *const u128, *n_rows) };
             let mut out: Vec<u128> = Vec::with_capacity(popcount);
             for row in 0..*n_rows {
                 if (bitmap[row >> 3] >> (row & 7)) & 1 == 1 {
@@ -650,9 +638,8 @@ fn compact_decoded_column(
             indices,
             n_rows,
         } => {
-            let src = unsafe {
-                std::slice::from_raw_parts(indices.as_ptr() as *const u32, *n_rows)
-            };
+            let src =
+                unsafe { std::slice::from_raw_parts(indices.as_ptr() as *const u32, *n_rows) };
             let mut out: Vec<u32> = Vec::with_capacity(popcount);
             for row in 0..*n_rows {
                 if (bitmap[row >> 3] >> (row & 7)) & 1 == 1 {
@@ -668,10 +655,8 @@ fn compact_decoded_column(
         DecodedColumn::Utf8(s) => {
             // Slow path — build a new StringArray with only matching
             // rows. Rarely hit (Utf8 is the slow fallback).
-            let mut b = arrow_array::builder::StringBuilder::with_capacity(
-                popcount,
-                s.value_data().len(),
-            );
+            let mut b =
+                arrow_array::builder::StringBuilder::with_capacity(popcount, s.value_data().len());
             for row in 0..s.len() {
                 if (bitmap[row >> 3] >> (row & 7)) & 1 == 1 {
                     b.append_value(s.value(row));
@@ -828,24 +813,22 @@ impl EmatArrowBatchReader {
                 let mut handles = Vec::with_capacity(max_threads);
                 for _ in 0..max_threads {
                     let next = &next;
-                    handles.push(s.spawn(
-                        move || -> Vec<(usize, DfResult<DecodedColumn>)> {
-                            let mut local: Vec<(usize, DfResult<DecodedColumn>)> = Vec::new();
-                            loop {
-                                let i = next.fetch_add(1, Ordering::Relaxed);
-                                if i >= n_cols {
-                                    break;
-                                }
-                                let leaf = projection[i];
-                                let target = schema.field(i).data_type();
-                                let r = masked_decode_one_column(
-                                    file, rg, leaf, bitmap_ref, popcount, target,
-                                );
-                                local.push((i, r));
+                    handles.push(s.spawn(move || -> Vec<(usize, DfResult<DecodedColumn>)> {
+                        let mut local: Vec<(usize, DfResult<DecodedColumn>)> = Vec::new();
+                        loop {
+                            let i = next.fetch_add(1, Ordering::Relaxed);
+                            if i >= n_cols {
+                                break;
                             }
-                            local
-                        },
-                    ));
+                            let leaf = projection[i];
+                            let target = schema.field(i).data_type();
+                            let r = masked_decode_one_column(
+                                file, rg, leaf, bitmap_ref, popcount, target,
+                            );
+                            local.push((i, r));
+                        }
+                        local
+                    }));
                 }
                 let mut all = Vec::with_capacity(n_cols);
                 for h in handles {
@@ -861,8 +844,8 @@ impl EmatArrowBatchReader {
             }
             let mut out = Vec::with_capacity(n_cols);
             for (i, slot) in slots.into_iter().enumerate() {
-                let r = slot
-                    .ok_or_else(|| ext(format!("column {i} masked-decode slot never filled")))?;
+                let r =
+                    slot.ok_or_else(|| ext(format!("column {i} masked-decode slot never filled")))?;
                 out.push(r?);
             }
             out
@@ -921,7 +904,11 @@ impl EmatArrowBatchReader {
         // diagnose why the parallel path doesn't beat no-pushdown on
         // Q01-shape queries.
         let timing = std::env::var_os("EMAT_TIMING").is_some();
-        let t_fn_start = if timing { Some(std::time::Instant::now()) } else { None };
+        let t_fn_start = if timing {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
 
         let total_rows = self.cached_md.row_groups[rg].num_rows as usize;
         let projection = &self.projection;
@@ -950,7 +937,11 @@ impl EmatArrowBatchReader {
         let filter_ref = &filter;
         let path_ref = &path;
 
-        let t_scope_start = if timing { Some(std::time::Instant::now()) } else { None };
+        let t_scope_start = if timing {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
         let mut bitmap_ms: f64 = 0.0;
         let mut proj_max_ms: f64 = 0.0;
         let bitmap_ms_ref = &mut bitmap_ms;
@@ -959,65 +950,67 @@ impl EmatArrowBatchReader {
             std::sync::Mutex::new(None);
         let bitmap_slot_ref = &bitmap_slot;
 
-        let projection_results: Vec<(usize, DfResult<DecodedColumn>)> =
-            std::thread::scope(|s| {
-                let mut handles = Vec::with_capacity(total_threads);
-                let n_tasks = n_cols + 1;
-                for _ in 0..total_threads {
-                    let next = &next;
-                    handles.push(s.spawn(
-                        move || -> (Vec<(usize, DfResult<DecodedColumn>)>, f64, f64) {
-                            let t_outer = std::time::Instant::now();
-                            let mut local: Vec<(usize, DfResult<DecodedColumn>)> = Vec::new();
-                            let mut chunk_buf: Vec<u8> = Vec::new();
-                            let mut bitmap_self_ms: f64 = 0.0;
-                            loop {
-                                let i = next.fetch_add(1, Ordering::Relaxed);
-                                if i >= n_tasks {
-                                    break;
-                                }
-                                if i == n_cols {
-                                    // Bitmap task — lives in the same
-                                    // pool. Whichever thread grabs it
-                                    // will then drop back to picking
-                                    // up projection cols.
-                                    let t_bm = std::time::Instant::now();
-                                    let r = filter_ref.build_bitmap(path_ref, rg);
-                                    bitmap_self_ms = t_bm.elapsed().as_secs_f64() * 1000.0;
-                                    *bitmap_slot_ref.lock().unwrap() = Some(r);
-                                } else {
-                                    let leaf = projection[i];
-                                    let target = schema.field(i).data_type();
-                                    local.push((
-                                        i,
-                                        decode_one_column(
-                                            file, cached_md, &mut chunk_buf, rg, leaf,
-                                            target,
-                                        ),
-                                    ));
-                                }
+        let projection_results: Vec<(usize, DfResult<DecodedColumn>)> = std::thread::scope(|s| {
+            let mut handles = Vec::with_capacity(total_threads);
+            let n_tasks = n_cols + 1;
+            for _ in 0..total_threads {
+                let next = &next;
+                handles.push(s.spawn(
+                    move || -> (Vec<(usize, DfResult<DecodedColumn>)>, f64, f64) {
+                        let t_outer = std::time::Instant::now();
+                        let mut local: Vec<(usize, DfResult<DecodedColumn>)> = Vec::new();
+                        let mut chunk_buf: Vec<u8> = Vec::new();
+                        let mut bitmap_self_ms: f64 = 0.0;
+                        loop {
+                            let i = next.fetch_add(1, Ordering::Relaxed);
+                            if i >= n_tasks {
+                                break;
                             }
-                            let outer_ms = t_outer.elapsed().as_secs_f64() * 1000.0;
-                            (local, outer_ms, bitmap_self_ms)
-                        },
-                    ));
-                }
-                let mut all = Vec::with_capacity(n_cols);
-                for h in handles {
-                    let (partial, outer_ms, bitmap_self_ms) =
-                        h.join().expect("decode thread panicked");
-                    if timing {
-                        if outer_ms > *proj_max_ms_ref {
-                            *proj_max_ms_ref = outer_ms;
+                            if i == n_cols {
+                                // Bitmap task — lives in the same
+                                // pool. Whichever thread grabs it
+                                // will then drop back to picking
+                                // up projection cols.
+                                let t_bm = std::time::Instant::now();
+                                let r = filter_ref.build_bitmap(path_ref, rg);
+                                bitmap_self_ms = t_bm.elapsed().as_secs_f64() * 1000.0;
+                                *bitmap_slot_ref.lock().unwrap() = Some(r);
+                            } else {
+                                let leaf = projection[i];
+                                let target = schema.field(i).data_type();
+                                local.push((
+                                    i,
+                                    decode_one_column(
+                                        file,
+                                        cached_md,
+                                        &mut chunk_buf,
+                                        rg,
+                                        leaf,
+                                        target,
+                                    ),
+                                ));
+                            }
                         }
-                        if bitmap_self_ms > 0.0 {
-                            *bitmap_ms_ref = bitmap_self_ms;
-                        }
+                        let outer_ms = t_outer.elapsed().as_secs_f64() * 1000.0;
+                        (local, outer_ms, bitmap_self_ms)
+                    },
+                ));
+            }
+            let mut all = Vec::with_capacity(n_cols);
+            for h in handles {
+                let (partial, outer_ms, bitmap_self_ms) = h.join().expect("decode thread panicked");
+                if timing {
+                    if outer_ms > *proj_max_ms_ref {
+                        *proj_max_ms_ref = outer_ms;
                     }
-                    all.extend(partial);
+                    if bitmap_self_ms > 0.0 {
+                        *bitmap_ms_ref = bitmap_self_ms;
+                    }
                 }
-                all
-            });
+                all.extend(partial);
+            }
+            all
+        });
 
         let bitmap_res = bitmap_slot
             .into_inner()
@@ -1034,8 +1027,7 @@ impl EmatArrowBatchReader {
                 "Phase 1.8: bitmap total {total} != RG rows {total_rows}"
             )));
         }
-        let mut slots: Vec<Option<DfResult<DecodedColumn>>> =
-            (0..n_cols).map(|_| None).collect();
+        let mut slots: Vec<Option<DfResult<DecodedColumn>>> = (0..n_cols).map(|_| None).collect();
         for (i, r) in projection_results {
             slots[i] = Some(r);
         }
@@ -1106,7 +1098,12 @@ impl EmatArrowBatchReader {
             for (proj_idx, &leaf) in projection.iter().enumerate() {
                 let target = schema.field(proj_idx).data_type();
                 out.push(decode_one_column(
-                    file, cached_md, &mut chunk_buf, rg, leaf, target,
+                    file,
+                    cached_md,
+                    &mut chunk_buf,
+                    rg,
+                    leaf,
+                    target,
                 )?);
             }
             out
@@ -1150,7 +1147,12 @@ impl EmatArrowBatchReader {
                             local.push((
                                 i,
                                 decode_one_column(
-                                    file, cached_md, &mut chunk_buf, rg, leaf, target,
+                                    file,
+                                    cached_md,
+                                    &mut chunk_buf,
+                                    rg,
+                                    leaf,
+                                    target,
                                 ),
                             ));
                         }
@@ -1219,16 +1221,17 @@ impl EmatArrowBatchReader {
         // step in the plan for the pushed predicate.
         if let Some(bm) = self.cur_rg_filter_bitmap.as_ref() {
             let timing = std::env::var_os("EMAT_TIMING").is_some();
-            let t_filter = if timing { Some(std::time::Instant::now()) } else { None };
+            let t_filter = if timing {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
             // Build a BooleanBuffer that points into the bitmap with
             // the batch's row offset. BooleanBuffer takes a Buffer +
             // start bit + length, so we can window the bitmap without
             // copying.
-            let bool_buf = datafusion::arrow::buffer::BooleanBuffer::new(
-                Buffer::from_slice_ref(bm),
-                start,
-                n,
-            );
+            let bool_buf =
+                datafusion::arrow::buffer::BooleanBuffer::new(Buffer::from_slice_ref(bm), start, n);
             let predicate_arr = arrow_array::BooleanArray::new(bool_buf, None);
             let filtered = datafusion::arrow::compute::filter_record_batch(&batch, &predicate_arr)
                 .map_err(|e| ext(format!("filter_record_batch: {e}")))?;
@@ -1954,51 +1957,46 @@ fn decode_byte_array_to_string_view_slow(
         let td = std::time::Instant::now();
         let results: Vec<DfResult<(Vec<u128>, Option<Vec<u8>>)>> = pending
             .par_iter()
-            .map(|p| {
-                match p.encoding {
-                    Encoding::RleDictionary | Encoding::PlainDictionary => {
-                        let mut idx_scratch: Vec<u8> = Vec::new();
-                        decompress_into(codec_copy, p.body, &mut idx_scratch)?;
-                        let mut idx_buf: Vec<u32> = Vec::with_capacity(p.n_values);
-                        ematix_parquet_codec::dict::decode_rle_dictionary_indices_into(
-                            &idx_scratch,
-                            p.n_values,
-                            &mut idx_buf,
-                        )
-                        .map_err(|e| ext(format!("rle_dict_indices byte_array: {e}")))?;
-                        let dict_len = dict_offsets_ref.len();
-                        let mut page_views: Vec<u128> = Vec::with_capacity(p.n_values);
-                        for &i in &idx_buf {
-                            let i = i as usize;
-                            if i >= dict_len {
-                                return Err(ext(format!(
-                                    "dict idx {i} out of range {dict_len}"
-                                )));
-                            }
-                            let off = dict_offsets_ref[i];
-                            let len = dict_lengths_ref[i];
-                            let bytes =
-                                &dict_bytes_ref[off as usize..(off + len) as usize];
-                            page_views.push(make_view(bytes, 0u32, off));
+            .map(|p| match p.encoding {
+                Encoding::RleDictionary | Encoding::PlainDictionary => {
+                    let mut idx_scratch: Vec<u8> = Vec::new();
+                    decompress_into(codec_copy, p.body, &mut idx_scratch)?;
+                    let mut idx_buf: Vec<u32> = Vec::with_capacity(p.n_values);
+                    ematix_parquet_codec::dict::decode_rle_dictionary_indices_into(
+                        &idx_scratch,
+                        p.n_values,
+                        &mut idx_buf,
+                    )
+                    .map_err(|e| ext(format!("rle_dict_indices byte_array: {e}")))?;
+                    let dict_len = dict_offsets_ref.len();
+                    let mut page_views: Vec<u128> = Vec::with_capacity(p.n_values);
+                    for &i in &idx_buf {
+                        let i = i as usize;
+                        if i >= dict_len {
+                            return Err(ext(format!("dict idx {i} out of range {dict_len}")));
                         }
-                        Ok((page_views, None))
+                        let off = dict_offsets_ref[i];
+                        let len = dict_lengths_ref[i];
+                        let bytes = &dict_bytes_ref[off as usize..(off + len) as usize];
+                        page_views.push(make_view(bytes, 0u32, off));
                     }
-                    Encoding::Plain => {
-                        let mut page_buf: Vec<u8> = Vec::with_capacity(p.body.len() * 2);
-                        decompress_into(codec_copy, p.body, &mut page_buf)?;
-                        let mut page_views: Vec<u128> = Vec::with_capacity(p.n_values);
-                        plain_byte_array_to_views_in_place(
-                            &page_buf,
-                            &mut page_views,
-                            p.n_values,
-                            p.block_id,
-                        )?;
-                        Ok((page_views, Some(page_buf)))
-                    }
-                    other => Err(ext(format!(
-                        "unexpected byte_array data page encoding {other:?}"
-                    ))),
+                    Ok((page_views, None))
                 }
+                Encoding::Plain => {
+                    let mut page_buf: Vec<u8> = Vec::with_capacity(p.body.len() * 2);
+                    decompress_into(codec_copy, p.body, &mut page_buf)?;
+                    let mut page_views: Vec<u128> = Vec::with_capacity(p.n_values);
+                    plain_byte_array_to_views_in_place(
+                        &page_buf,
+                        &mut page_views,
+                        p.n_values,
+                        p.block_id,
+                    )?;
+                    Ok((page_views, Some(page_buf)))
+                }
+                other => Err(ext(format!(
+                    "unexpected byte_array data page encoding {other:?}"
+                ))),
             })
             .collect();
         let par_ns = td.elapsed().as_nanos();
@@ -2033,55 +2031,55 @@ fn decode_byte_array_to_string_view_slow(
             let n = p.n_values;
             let body = p.body;
             match p.encoding {
-            Encoding::RleDictionary | Encoding::PlainDictionary => {
-                let td = std::time::Instant::now();
-                decompress_into(codec, body, &mut idx_scratch)?;
-                decompress_ns += td.elapsed().as_nanos();
-                idx_buf.clear();
-                let tv = std::time::Instant::now();
-                ematix_parquet_codec::dict::decode_rle_dictionary_indices_into(
-                    &idx_scratch,
-                    n,
-                    &mut idx_buf,
-                )
-                .map_err(|e| ext(format!("rle_dict_indices byte_array: {e}")))?;
-                let dict_len = dict_offsets.len();
-                // Dict pages always reside in `data_buffers[0]`.
-                let dict_block = 0u32;
-                // SAFETY: data_buffers[0] is the dict page; established
-                // above. Slicing is sound since dict_offsets/lengths
-                // were computed against its full contents.
-                let dict_bytes: &[u8] = data_buffers[0].as_slice();
-                for &i in &idx_buf {
-                    let i = i as usize;
-                    if i >= dict_len {
-                        return Err(ext(format!("dict idx {i} out of range {dict_len}")));
+                Encoding::RleDictionary | Encoding::PlainDictionary => {
+                    let td = std::time::Instant::now();
+                    decompress_into(codec, body, &mut idx_scratch)?;
+                    decompress_ns += td.elapsed().as_nanos();
+                    idx_buf.clear();
+                    let tv = std::time::Instant::now();
+                    ematix_parquet_codec::dict::decode_rle_dictionary_indices_into(
+                        &idx_scratch,
+                        n,
+                        &mut idx_buf,
+                    )
+                    .map_err(|e| ext(format!("rle_dict_indices byte_array: {e}")))?;
+                    let dict_len = dict_offsets.len();
+                    // Dict pages always reside in `data_buffers[0]`.
+                    let dict_block = 0u32;
+                    // SAFETY: data_buffers[0] is the dict page; established
+                    // above. Slicing is sound since dict_offsets/lengths
+                    // were computed against its full contents.
+                    let dict_bytes: &[u8] = data_buffers[0].as_slice();
+                    for &i in &idx_buf {
+                        let i = i as usize;
+                        if i >= dict_len {
+                            return Err(ext(format!("dict idx {i} out of range {dict_len}")));
+                        }
+                        let off = dict_offsets[i];
+                        let len = dict_lengths[i];
+                        let bytes = &dict_bytes[off as usize..(off + len) as usize];
+                        views.push(make_view(bytes, dict_block, off));
                     }
-                    let off = dict_offsets[i];
-                    let len = dict_lengths[i];
-                    let bytes = &dict_bytes[off as usize..(off + len) as usize];
-                    views.push(make_view(bytes, dict_block, off));
+                    viewbuild_ns += tv.elapsed().as_nanos();
+                    n_pages_rle += 1;
                 }
-                viewbuild_ns += tv.elapsed().as_nanos();
-                n_pages_rle += 1;
-            }
-            Encoding::Plain => {
-                let mut page_buf: Vec<u8> = Vec::with_capacity(body.len() * 2);
-                let td = std::time::Instant::now();
-                decompress_into(codec, body, &mut page_buf)?;
-                decompress_ns += td.elapsed().as_nanos();
-                let block_id = data_buffers.len() as u32;
-                let tv = std::time::Instant::now();
-                plain_byte_array_to_views_in_place(&page_buf, &mut views, n, block_id)?;
-                viewbuild_ns += tv.elapsed().as_nanos();
-                n_pages_plain += 1;
-                data_buffers.push(Buffer::from_vec(page_buf));
-            }
-            other => {
-                return Err(ext(format!(
-                    "unexpected byte_array data page encoding {other:?}"
-                )));
-            }
+                Encoding::Plain => {
+                    let mut page_buf: Vec<u8> = Vec::with_capacity(body.len() * 2);
+                    let td = std::time::Instant::now();
+                    decompress_into(codec, body, &mut page_buf)?;
+                    decompress_ns += td.elapsed().as_nanos();
+                    let block_id = data_buffers.len() as u32;
+                    let tv = std::time::Instant::now();
+                    plain_byte_array_to_views_in_place(&page_buf, &mut views, n, block_id)?;
+                    viewbuild_ns += tv.elapsed().as_nanos();
+                    n_pages_plain += 1;
+                    data_buffers.push(Buffer::from_vec(page_buf));
+                }
+                other => {
+                    return Err(ext(format!(
+                        "unexpected byte_array data page encoding {other:?}"
+                    )));
+                }
             }
         }
     }
@@ -2151,9 +2149,7 @@ fn plain_byte_array_to_views_in_place(
             )));
         }
         // Unaligned u32 read of the length prefix.
-        let len = unsafe {
-            std::ptr::read_unaligned(bytes_ptr.add(off) as *const u32)
-        } as usize;
+        let len = unsafe { std::ptr::read_unaligned(bytes_ptr.add(off) as *const u32) } as usize;
         off += 4;
         if off + len > page_len {
             return Err(ext(format!(
@@ -2167,13 +2163,8 @@ fn plain_byte_array_to_views_in_place(
             //   bytes 4..8  = first-4-byte prefix
             //   bytes 8..12 = buffer_index (= block_id)
             //   bytes 12..16 = offset (= off as u32)
-            let prefix = unsafe {
-                std::ptr::read_unaligned(bytes_ptr.add(off) as *const u32)
-            };
-            (len as u128)
-                | ((prefix as u128) << 32)
-                | block_hi
-                | ((off as u128) << 96)
+            let prefix = unsafe { std::ptr::read_unaligned(bytes_ptr.add(off) as *const u32) };
+            (len as u128) | ((prefix as u128) << 32) | block_hi | ((off as u128) << 96)
         } else {
             // Short strings need byte-by-byte inlining into the u128
             // body — `make_view` jump-tables on length for this.

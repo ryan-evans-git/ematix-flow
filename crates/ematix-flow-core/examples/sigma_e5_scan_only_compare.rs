@@ -46,18 +46,19 @@ const QUERY_SCANS: &[(&str, &[(&str, &[&str])])] = &[
     ),
     (
         "q19",
-        &[(
-            "lineitem",
-            &[
-                "l_partkey",
-                "l_quantity",
-                "l_extendedprice",
-                "l_discount",
-                "l_shipmode",
-                "l_shipinstruct",
-            ],
-        ),
-            ("part", &["p_partkey", "p_brand", "p_size", "p_container"])
+        &[
+            (
+                "lineitem",
+                &[
+                    "l_partkey",
+                    "l_quantity",
+                    "l_extendedprice",
+                    "l_discount",
+                    "l_shipmode",
+                    "l_shipinstruct",
+                ],
+            ),
+            ("part", &["p_partkey", "p_brand", "p_size", "p_container"]),
         ],
     ),
     (
@@ -77,10 +78,13 @@ const QUERY_SCANS: &[(&str, &[(&str, &[&str])])] = &[
     ),
     (
         "q14",
-        &[(
-            "lineitem",
-            &["l_partkey", "l_shipdate", "l_extendedprice", "l_discount"],
-        ), ("part", &["p_partkey", "p_type"])],
+        &[
+            (
+                "lineitem",
+                &["l_partkey", "l_shipdate", "l_extendedprice", "l_discount"],
+            ),
+            ("part", &["p_partkey", "p_type"]),
+        ],
     ),
 ];
 
@@ -150,7 +154,10 @@ async fn main() {
         .unwrap_or(40);
 
     println!("scan-only compare: dir={dir} iters={iters}");
-    println!("{:5}  {:10}  {:8}  {:8}  {:8}  {:>7}", "query", "table", "cols", "fast", "emat", "delta");
+    println!(
+        "{:5}  {:10}  {:8}  {:8}  {:8}  {:>7}",
+        "query", "table", "cols", "fast", "emat", "delta"
+    );
     println!("{}", "-".repeat(70));
 
     for (query, scans) in QUERY_SCANS {
