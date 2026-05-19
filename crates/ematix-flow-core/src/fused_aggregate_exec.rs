@@ -153,39 +153,73 @@ impl<S: AggregateSpec + Clone> ExecutionPlan for FusedAggregateExec<S> {
 
         let schema_for_stream = output_schema.clone();
         let fut = async move {
-            // One streaming worker per input partition. Each pulls
-            // batches from its stream and accumulates into a local
-            // `Accumulator`. Reducing happens after every worker has
-            // drained its stream.
-            //
-            // The spec is cloned by VALUE into each worker (not
-            // captured via Arc) — see the type-level doc on this
-            // operator for the bench finding that motivated this. The
-            // hand operators capture `Predicate` + `Indices` by Copy;
-            // we match that shape so LLVM sees the spec state as a
-            // local stack value in the inner loop.
+            let timing = std::env::var_os("EMAT_AGG_TIMING").is_some();
+            let t_total = if timing { Some(std::time::Instant::now()) } else { None };
+
             let mut handles = Vec::with_capacity(input_partitions);
             for p in 0..input_partitions {
                 let mut s = input.execute(p, context.clone())?;
                 let spec_p = spec.clone();
                 handles.push(tokio::spawn(async move {
                     let mut acc = <S as AggregateSpec>::Accumulator::default();
-                    while let Some(batch) = s.try_next().await? {
+                    let mut pull_ns: u128 = 0;
+                    let mut proc_ns: u128 = 0;
+                    let mut n_batches: usize = 0;
+                    let mut n_rows: usize = 0;
+                    loop {
+                        let t_pull = std::time::Instant::now();
+                        let next = s.try_next().await?;
+                        pull_ns += t_pull.elapsed().as_nanos();
+                        let Some(batch) = next else { break };
+                        n_batches += 1;
+                        n_rows += batch.num_rows();
+                        let t_proc = std::time::Instant::now();
                         spec_p.process_batch(&batch, &mut acc)?;
+                        proc_ns += t_proc.elapsed().as_nanos();
                     }
-                    Ok::<<S as AggregateSpec>::Accumulator, DataFusionError>(acc)
+                    Ok::<(<S as AggregateSpec>::Accumulator, u128, u128, usize, usize), DataFusionError>(
+                        (acc, pull_ns, proc_ns, n_batches, n_rows),
+                    )
                 }));
             }
+
             let mut merged = <S as AggregateSpec>::Accumulator::default();
+            let mut sum_pull_ms = 0.0;
+            let mut sum_proc_ms = 0.0;
+            let mut sum_rows = 0usize;
+            let mut sum_batches = 0usize;
+            let n_workers = handles.len();
+            let t_merge = if timing { Some(std::time::Instant::now()) } else { None };
             for h in handles {
-                let partial = h.await.map_err(|e| {
+                let (partial, pull_ns, proc_ns, n_batches, n_rows) = h.await.map_err(|e| {
                     DataFusionError::Execution(format!(
                         "FusedAggregateExec: worker join failed: {e}"
                     ))
                 })??;
+                sum_pull_ms += pull_ns as f64 / 1_000_000.0;
+                sum_proc_ms += proc_ns as f64 / 1_000_000.0;
+                sum_rows += n_rows;
+                sum_batches += n_batches;
                 merged = spec.merge(merged, partial);
             }
-            spec.finalize(merged)
+            let merge_ms = t_merge
+                .map(|t| t.elapsed().as_secs_f64() * 1000.0)
+                .unwrap_or(0.0);
+            let t_fin = if timing { Some(std::time::Instant::now()) } else { None };
+            let result = spec.finalize(merged);
+            let fin_ms = t_fin
+                .map(|t| t.elapsed().as_secs_f64() * 1000.0)
+                .unwrap_or(0.0);
+            if let Some(t) = t_total {
+                let total_ms = t.elapsed().as_secs_f64() * 1000.0;
+                let spec_name = std::any::type_name::<S>().rsplit("::").next().unwrap_or("?");
+                eprintln!(
+                    "[emat.agg] spec={spec_name} workers={n_workers} batches={sum_batches} \
+                     rows={sum_rows} sum_pull={sum_pull_ms:.2}ms sum_proc={sum_proc_ms:.2}ms \
+                     merge+join={merge_ms:.2}ms finalize={fin_ms:.3}ms total={total_ms:.2}ms"
+                );
+            }
+            result
         };
 
         let s = stream::once(fut);
