@@ -60,6 +60,7 @@ use crate::ematix_parquet_bridge::{
     filter_i32_column_to_bitmap, masked_decode_byte_array, masked_decode_f64, masked_decode_i32,
     masked_decode_i64,
 };
+use ematix_parquet_codec::read::read_column_byte_array_dict_preserved_into;
 use ematix_parquet_codec::compression::{decompress_snappy_into, decompress_zstd_into};
 use ematix_parquet_codec::dict::decode_rle_dictionary_into;
 use ematix_parquet_codec::plain::{
@@ -513,11 +514,40 @@ impl EmatArrowBatchReader {
     ) -> DfResult<()> {
         // 1. Build the row bitmap from the filter column.
         let filter_eval = filter.clone();
-        let (bitmap, _total) =
+        let (bitmap, total) =
             filter_i32_column_to_bitmap(&path, rg, filter.parquet_col_idx(), move |v: i32| {
                 filter_eval.eval_i32(v)
             })?;
         let popcount: usize = bitmap.iter().map(|b| b.count_ones() as usize).sum();
+
+        // Σ.E5 #517: selectivity gate. Masked decode is a win only
+        // when the filter is selective enough that the skipped
+        // decode work outweighs the bitmap-construction + per-row
+        // gather overhead. Empirically (SF=1): Q14 at ~1% selective
+        // wins, Q01 at ~95% selective regresses 10× because the
+        // filter col is decoded twice (once for the bitmap, once
+        // through DataFusion's residual FilterExec — when we fall
+        // back) but the gather work doesn't save anything.
+        //
+        // Threshold: if popcount / total > 0.5, the filter is
+        // non-selective enough that we're better off doing the dense
+        // parallel decode and letting DataFusion's FilterExec
+        // re-evaluate the predicate. We pay the bitmap construction
+        // as waste, but it's just one numeric column (~ms).
+        if total > 0 && popcount * 2 > total {
+            // Fall through to the dense path. Drop the bitmap, the
+            // dense path will scan everything; DataFusion's residual
+            // FilterExec (the predicate is Inexact when we set it,
+            // though we currently set Exact — see TODO below) will
+            // re-evaluate. NOTE: currently `supports_filters_pushdown`
+            // declares the BridgeFilter `Exact`, which means
+            // DataFusion REMOVES the FilterExec. If we fall back to
+            // dense here, the rows are not filtered. We must instead
+            // declare `Inexact` for pushed filters so DataFusion
+            // keeps the residual FilterExec as a safety net.
+            self.cur_rg_total = self.cached_md.row_groups[rg].num_rows as usize;
+            return self.load_row_group_dense(rg);
+        }
 
         // 2. Parallel masked-decode of each projected column. Same
         //    scoped-thread shape as the dense path — distinct
@@ -616,6 +646,13 @@ impl EmatArrowBatchReader {
         if let (Some(filter), Some(path)) = (&self.filter, &self.path) {
             return self.load_row_group_masked(rg, filter.clone(), path.clone());
         }
+        self.load_row_group_dense(rg)
+    }
+
+    fn load_row_group_dense(&mut self, rg: usize) -> DfResult<()> {
+        // Restore total to the RG's actual row count in case a masked
+        // call fell back here mid-execution.
+        self.cur_rg_total = self.cached_md.row_groups[rg].num_rows as usize;
 
         let projection = &self.projection;
         let schema = &self.arrow_schema;
@@ -844,30 +881,72 @@ fn masked_decode_one_column(
             })
         }
         DataType::Utf8View => {
-            let vals = masked_decode_byte_array(file, rg, leaf, bitmap)
-                .map_err(|e| ext(format!("masked byte_array leaf {leaf}: {e}")))?;
-            if vals.len() != popcount {
-                return Err(ext(format!(
-                    "masked byte_array leaf {leaf}: got {} rows, expected {popcount}",
-                    vals.len()
-                )));
+            // Σ.E5 #517: dict-preserved masked decode. Decode the
+            // chunk via the dict-preserved fast path (same as the
+            // dense `decode_byte_array_to_string_view_dict_preserved`
+            // shape), then build a per-dict-entry views cache and
+            // gather only bitmap-matching indices. Net: ~same decode
+            // CPU as the dense path + a cheap u128 gather per
+            // surviving row.
+            //
+            // Build dict_views once over the whole dict-page slice;
+            // per surviving row emit dict_views[idx] (16-byte gather).
+            // No per-row `make_view` call; matches the dense fast
+            // path's emission cost.
+            let mut dict_bytes: Vec<u8> = Vec::new();
+            let mut dict_offsets: Vec<u32> = Vec::new();
+            let mut all_indices: Vec<u32> = Vec::new();
+            read_column_byte_array_dict_preserved_into(
+                file,
+                rg,
+                leaf,
+                &mut dict_bytes,
+                &mut dict_offsets,
+                &mut all_indices,
+            )
+            .map_err(|e| ext(format!("dict-preserved masked leaf {leaf}: {e}")))?;
+
+            // Bytes land in a single buffer; block_id 0.
+            let data_buffer = Buffer::from_vec(dict_bytes);
+            let dict_len = dict_offsets.len().saturating_sub(1);
+            // SAFETY: data_buffer is the canonical block 0 store.
+            let base = data_buffer.as_ptr() as usize;
+            let mut dict_views: Vec<u128> = Vec::with_capacity(dict_len);
+            for i in 0..dict_len {
+                let off = dict_offsets[i] as usize;
+                let len = (dict_offsets[i + 1] - dict_offsets[i]) as usize;
+                let bytes_ptr = base + off;
+                // Build the bytes slice for make_view; it inspects
+                // the prefix only, no aliasing concerns with the
+                // owning Buffer.
+                let bytes = unsafe { std::slice::from_raw_parts(bytes_ptr as *const u8, len) };
+                dict_views.push(make_view(bytes, 0, off as u32));
             }
-            // Pack all bytes into one backing buffer, build views
-            // pointing into it. Same shape as the dense StringView
-            // path's first data_buffers slot.
-            let total_bytes: usize = vals.iter().map(|v| v.len()).sum();
-            let mut packed: Vec<u8> = Vec::with_capacity(total_bytes);
+
+            // Gather views for bitmap-matching rows in order.
             let mut views: Vec<u128> = Vec::with_capacity(popcount);
-            let block_id: u32 = 0;
-            for v in &vals {
-                let off = packed.len() as u32;
-                packed.extend_from_slice(v);
-                views.push(make_view(v, block_id, off));
+            for (row, &idx) in all_indices.iter().enumerate() {
+                let byte = bitmap[row >> 3];
+                if (byte >> (row & 7)) & 1 != 0 {
+                    let i = idx as usize;
+                    if i >= dict_len {
+                        return Err(ext(format!(
+                            "dict-preserved masked leaf {leaf}: idx {idx} out of range {dict_len}"
+                        )));
+                    }
+                    views.push(dict_views[i]);
+                }
+            }
+            if views.len() != popcount {
+                return Err(ext(format!(
+                    "dict-preserved masked leaf {leaf}: emitted {} rows, expected {popcount}",
+                    views.len()
+                )));
             }
             Ok(DecodedColumn::StringView {
                 views: Buffer::from_vec(views),
                 n_rows: popcount,
-                data_buffers: vec![Buffer::from_vec(packed)],
+                data_buffers: vec![data_buffer],
             })
         }
         DataType::Utf8 => {

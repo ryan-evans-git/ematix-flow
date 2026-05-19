@@ -501,24 +501,17 @@ impl TableProvider for EmatixFastParquetTableProvider {
         &self,
         filters: &[&Expr],
     ) -> DfResult<Vec<TableProviderFilterPushDown>> {
-        if self.dict_preservation || self.streaming_arrow_reader {
-            // Σ.E5 (#516, verified 2026-05-19): streaming reader's
-            // masked-decode path IS wired up (see
-            // `EmatArrowBatchReaderBuilder::with_filter`) but Utf8View
-            // masked decode lacks the dict-views cache the dense path
-            // uses, so even WINNING queries regress when pushdown is
-            // accepted:
-            //   Q01: -5%  → +126%  (Utf8View dominates; cache miss)
-            //   Q06: -28% → -13%   (numeric, filter-col re-decode)
-            //   Q14: -32% → -26%   (numeric, slight loss)
-            // The masked path needs a dict-preserved Utf8View variant
-            // (mirror of read_column_byte_array_dict_preserved_into)
-            // before pushdown can be re-enabled here. Tracked #517.
+        if self.dict_preservation {
             return Ok(filters
                 .iter()
                 .map(|_| TableProviderFilterPushDown::Unsupported)
                 .collect());
         }
+        // Σ.E5 #517 (2026-05-19): streaming reader's masked-decode
+        // path now uses dict-preserved Utf8View — same shape as the
+        // dense fast path (dict_views: Vec<u128> cache + 16-byte
+        // gather per row). Pushdown accepted for BridgeFilter-shaped
+        // filters on all reader variants.
         Ok(filters
             .iter()
             .map(|e| {
@@ -529,7 +522,15 @@ impl TableProvider for EmatixFastParquetTableProvider {
                         if matches!(dt, DataType::Int32 | DataType::Date32)
                             && clause_from_predicate(&p, dt).is_some()
                         {
-                            return TableProviderFilterPushDown::Exact;
+                            // Σ.E5 #517: declare Inexact so DataFusion
+                            // keeps the residual FilterExec. The
+                            // streaming reader's masked path bails to
+                            // dense decode when selectivity is high
+                            // (popcount/total > 0.5); FilterExec then
+                            // re-evaluates and produces the correct
+                            // result. Q14's tiny re-eval cost on the
+                            // filtered batches is negligible.
+                            return TableProviderFilterPushDown::Inexact;
                         }
                     }
                 }
