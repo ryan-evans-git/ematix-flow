@@ -842,20 +842,34 @@ fn build_streaming_partition_stream(
     let (tx, rx) = tokio::sync::mpsc::channel::<DfResult<RecordBatch>>(8);
     let path_buf = PathBuf::from(path);
 
-    // Σ.E5.6: opt-in dispatch to the page-streaming reader for A/B
-    // benching. EMAT_PAGE_STREAMING=1 swaps the burst-then-wait
-    // EmatArrowBatchReader for EmatPageStreamingReader (intra-RG
-    // page-streaming — first batch emerges after the slowest column's
-    // first page decodes, not after the full RG). Default = current
-    // behaviour (eager). The hybrid auto-pick experiment showed
-    // streaming helps only when its lower latency outpaces its sync
-    // overhead — at SF=1 the geomean balanced near eager, so no
-    // automatic flip yet; left as a knob until the streaming reader
-    // shaves more per-page sync cost.
-    let use_page_streaming = std::env::var("EMAT_PAGE_STREAMING")
+    // Σ.E5 reader dispatch — three modes:
+    //   EMAT_INLINE_STREAMING=1  → EmatInlineStreamingReader
+    //                              (single-threaded, no mutex; wins
+    //                              first-batch-latency for small-RG
+    //                              partitions like part / customer /
+    //                              supplier / partsupp).
+    //   EMAT_PAGE_STREAMING=1    → EmatPageStreamingReader
+    //                              (per-column thread pool, Condvar-
+    //                              gated; legacy A/B knob from Σ.E5.6).
+    //   default                  → EmatArrowBatchReader
+    //                              (eager full-RG decode, column-
+    //                              parallel — current SF=1 winner).
+    //
+    // Auto-pick (when no env var set): use the inline streamer if the
+    // partition holds a SINGLE small RG (< 1M rows). This targets the
+    // small-dim TPC-H regressions without affecting lineitem (1M-row
+    // RGs stay on eager).
+    let force_inline = std::env::var("EMAT_INLINE_STREAMING")
+        .ok()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+    let force_page = std::env::var("EMAT_PAGE_STREAMING")
         .ok()
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
+    let inline_row_threshold: usize = std::env::var("EMAT_INLINE_ROW_THRESHOLD")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(900_000);
 
     tokio::task::spawn_blocking(move || {
         let file = match ematix_parquet_io::ParquetFile::open(&path_buf) {
@@ -872,7 +886,41 @@ fn build_streaming_partition_stream(
             }
         };
 
-        if use_page_streaming {
+        // Reader choice: explicit env-var overrides only. The inline
+        // reader is OPT-IN via `EMAT_INLINE_STREAMING=1`; an earlier
+        // auto-pick (per-partition row-count threshold) added a thrift
+        // footer re-decode to every partition's spawn_blocking task
+        // which regressed the 22-query geomean by ~4 pp on noise-
+        // sensitive queries (Q01, Q19). Future work: lift the choice
+        // into the TableProvider where the metadata is already cached
+        // once.
+        let _ = inline_row_threshold; // kept as a knob for future use
+        let use_inline = force_inline.unwrap_or(false);
+        let use_page_streaming = force_page && !use_inline;
+
+        if use_inline {
+            use crate::emat_page_stream::EmatInlineStreamingReader;
+            let reader = match EmatInlineStreamingReader::new(
+                file,
+                schema,
+                projection,
+                row_groups,
+                crate::emat_arrow_reader::DEFAULT_BATCH_SIZE,
+            ) {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = tx.blocking_send(Err(DataFusionError::External(
+                        format!("EmatInlineStreamingReader::new: {e}").into(),
+                    )));
+                    return;
+                }
+            };
+            for item in reader {
+                if tx.blocking_send(item).is_err() {
+                    return;
+                }
+            }
+        } else if use_page_streaming {
             use crate::emat_page_stream::EmatPageStreamingReader;
             let reader = match EmatPageStreamingReader::new(
                 file,

@@ -856,6 +856,205 @@ impl Iterator for EmatPageStreamingReader {
 }
 
 // ============================================================
+// Inline streaming reader (single-threaded, parquet-rs shape)
+// ============================================================
+//
+// Σ.E5 (2026-05-19): a SIMPLER alternative to `EmatPageStreamingReader`
+// that does no per-column threading, no mutex/condvar, no decode pool.
+//
+// One next() call:
+//   1. Ensure the current RG has decode state (build column streams on
+//      first call / RG advance).
+//   2. Determine `target = min(cursor + batch_size, rg_total)`.
+//   3. For each column, call `decode_next_page` until rows_decoded >=
+//      target (or the column is exhausted at total_rows).
+//   4. Build a RecordBatch from `[cursor, target)`.
+//   5. Advance cursor.
+//
+// **Why single-threaded?** For the regression queries (single-RG files
+// like part / customer / supplier / partsupp), the partition has only
+// one RG and one decoder. There is no column-parallel work to lose —
+// the existing eager reader's scoped-thread fan-out already shrinks to
+// a single thread per partition (parallelism_budget = 1 when n_cols
+// dominates). The win is **first-batch latency**: parquet-rs ships the
+// first 65k rows after ~1-2ms; eager Emat blocks for ~5-6ms.
+//
+// **Why not for lineitem?** Lineitem RGs are 1M rows × 7 cols ×
+// ~1-2ms/page each. Doing it inline-sequential adds 7× single-threaded
+// page decoding per batch — measurably slower than the eager 2-way
+// scoped-thread fan-out. Caller picks based on per-RG row count.
+//
+// **Win path:** caller (EmatixFastParquetExec) auto-routes to this
+// reader when its assigned partition holds a single small RG.
+
+/// Σ.E5 inline streaming reader. Single-threaded; decodes pages
+/// inline within each `next()` call. Compatible with
+/// `EmatArrowBatchReader`'s output: 65k-row `RecordBatch`es matching
+/// the projected schema.
+pub struct EmatInlineStreamingReader {
+    file: ParquetFile,
+    arrow_schema: SchemaRef,
+    projection: Vec<usize>,
+    row_groups: Vec<usize>,
+    batch_size: usize,
+    cached_md: std::sync::Arc<CachedFileMetadata>,
+
+    /// Index into `row_groups` of the RG we're currently emitting from.
+    cur_rg_idx: usize,
+    /// Total rows in the current RG (zero until first RG opens).
+    cur_rg_total: usize,
+    /// One column-stream per projected column. `None` between RGs.
+    cur_rg_columns: Option<Vec<Box<dyn ColumnPageStream>>>,
+    /// Next row to emit within the current RG.
+    cursor: usize,
+}
+
+impl EmatInlineStreamingReader {
+    pub fn new(
+        file: ParquetFile,
+        arrow_schema: SchemaRef,
+        projection: Vec<usize>,
+        row_groups: Vec<usize>,
+        batch_size: usize,
+    ) -> DfResult<Self> {
+        let cached_md = std::sync::Arc::new(CachedFileMetadata::from_file(&file)?);
+        Ok(Self {
+            file,
+            arrow_schema,
+            projection,
+            row_groups,
+            batch_size: batch_size.max(1),
+            cached_md,
+            cur_rg_idx: 0,
+            cur_rg_total: 0,
+            cur_rg_columns: None,
+            cursor: 0,
+        })
+    }
+
+    fn open_row_group(&mut self, rg: usize) -> DfResult<()> {
+        self.cur_rg_total = self.cached_md.row_groups[rg].num_rows as usize;
+        let mut streams: Vec<Box<dyn ColumnPageStream>> =
+            Vec::with_capacity(self.projection.len());
+        for (i, &leaf) in self.projection.iter().enumerate() {
+            let target = self.arrow_schema.field(i).data_type();
+            let cm = &self.cached_md.row_groups[rg].columns[leaf];
+            let stream: Box<dyn ColumnPageStream> = match target {
+                DataType::Int32 | DataType::Date32 => {
+                    Box::new(Int32PageStream::new(&self.file, cm)?)
+                }
+                DataType::Int64 => Box::new(Int64PageStream::new(&self.file, cm)?),
+                DataType::Float64 => Box::new(Float64PageStream::new(&self.file, cm)?),
+                DataType::Utf8View => Box::new(StringViewPageStream::new(&self.file, cm)?),
+                other => {
+                    return Err(DataFusionError::NotImplemented(format!(
+                        "EmatInlineStreamingReader: target type {other:?} not yet supported"
+                    )));
+                }
+            };
+            streams.push(stream);
+        }
+        self.cur_rg_columns = Some(streams);
+        self.cursor = 0;
+        Ok(())
+    }
+
+    fn next_batch(&mut self) -> DfResult<Option<RecordBatch>> {
+        loop {
+            // Advance to the next RG when the current one is done /
+            // unset.
+            let need_new_rg = self.cur_rg_columns.is_none() || self.cursor >= self.cur_rg_total;
+            if need_new_rg {
+                if self.cur_rg_idx >= self.row_groups.len() {
+                    return Ok(None);
+                }
+                let rg = self.row_groups[self.cur_rg_idx];
+                self.cur_rg_idx += 1;
+                self.open_row_group(rg)?;
+                if self.cur_rg_total == 0 {
+                    // Empty RG — try next.
+                    self.cur_rg_columns = None;
+                    continue;
+                }
+            }
+
+            // Decode pages until every column has reached `target`
+            // rows (or its column total). Single-threaded: each column
+            // is exhausted in turn before moving to the next.
+            //
+            // `decode_next_page` may legitimately return Ok(0) for
+            // non-data pages (dict page on first call; IndexPage; etc.)
+            // — we re-poll. To avoid an infinite loop on a stuck
+            // stream we cap the consecutive zero-progress iterations.
+            let target = (self.cursor + self.batch_size).min(self.cur_rg_total);
+            let cols = self
+                .cur_rg_columns
+                .as_mut()
+                .expect("cur_rg_columns must be Some past the new-RG branch");
+            for col in cols.iter_mut() {
+                let mut zero_streak = 0usize;
+                while col.rows_decoded() < target && col.rows_decoded() < col.total_rows() {
+                    let before = col.rows_decoded();
+                    let added = col.decode_next_page()?;
+                    debug_assert!(col.rows_decoded() == before + added);
+                    if added == 0 {
+                        zero_streak += 1;
+                        if zero_streak > 4 {
+                            return Err(ext(format!(
+                                "inline reader: column stuck at {} / {} rows after {} consecutive zero-progress pages",
+                                col.rows_decoded(),
+                                col.total_rows(),
+                                zero_streak,
+                            )));
+                        }
+                    } else {
+                        zero_streak = 0;
+                    }
+                }
+            }
+
+            // Slice the batch. `n` is bounded by what's actually
+            // decoded (matches `target` when no column hit its end
+            // first; otherwise the minimum across columns).
+            let mut n = target - self.cursor;
+            for col in cols.iter() {
+                let avail = col.rows_decoded().saturating_sub(self.cursor);
+                if avail < n {
+                    n = avail;
+                }
+            }
+            if n == 0 {
+                // Shouldn't happen given the decode loop above — but
+                // guard so we don't emit an empty batch.
+                continue;
+            }
+
+            let mut arrays: Vec<ArrayRef> = Vec::with_capacity(cols.len());
+            for (i, col) in cols.iter().enumerate() {
+                let dt = self.arrow_schema.field(i).data_type();
+                arrays.push(col.make_array(self.cursor, n, dt));
+            }
+            let batch = RecordBatch::try_new(self.arrow_schema.clone(), arrays)
+                .map_err(|e| ext(format!("RecordBatch::try_new: {e}")))?;
+            self.cursor += n;
+            return Ok(Some(batch));
+        }
+    }
+}
+
+impl Iterator for EmatInlineStreamingReader {
+    type Item = DfResult<RecordBatch>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self.next_batch() {
+            Ok(Some(b)) => Some(Ok(b)),
+            Ok(None) => None,
+            Err(e) => Some(Err(e)),
+        }
+    }
+}
+
+// ============================================================
 // Tests
 // ============================================================
 
