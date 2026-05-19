@@ -23,125 +23,6 @@ Arrow under the hood.**
 > **18/22 wins** vs DuckDB / Polars / PySpark, **12.9×** geomean
 > speedup over single-node PySpark.
 
-<a id="benchmarks"></a>
-## Benchmarks — TPC-H SF=1, all 22 queries
-
-Every TPC-H query, four engines, same M3 Pro / SF=1 / Parquet,
-v0.3.0 baseline (2026-05-19):
-
-| Query | **ematix-flow** | DuckDB | Polars | PySpark | Best |
-|---|---:|---:|---:|---:|:---|
-| Q01 | **28.11** | 45.17 | 36.22 | 189.8 | ematix-flow |
-| Q02 | **10.51** | 18.84 | 45.85 | 215.6 | ematix-flow |
-| Q03 | **15.11** | 32.36 | 45.39 | 293.7 | ematix-flow |
-| Q04 | **12.55** | 22.04 | 23.30 | 218.8 | ematix-flow |
-| Q05 | **20.93** | 30.49 | 10754.97 | 366.2 | ematix-flow |
-| Q06 | 14.50 | 11.90 | **10.57** | 47.9 | Polars |
-| Q07 | **28.96** | 31.57 | 112.41 | 288.7 | ematix-flow |
-| Q08 | **20.76** | 37.35 | 93.29 | 215.2 | ematix-flow |
-| Q09 | **28.13** | 62.42 | 47.22 | 453.0 | ematix-flow |
-| Q10 | **28.16** | 64.14 | 109.27 | 416.9 | ematix-flow |
-| Q11 | **7.47** | 10.36 | 9.57 | 140.0 | ematix-flow |
-| Q12 | **14.72** | 23.49 | 19.33 | 310.5 | ematix-flow |
-| Q13 | **41.36** | 141.92 | 115.08 | 699.6 | ematix-flow |
-| Q14 | **11.28** | 23.00 | 12.38 | 117.1 | ematix-flow |
-| Q15 | 15.45 | 14.51 | **11.33** | 142.0 | Polars |
-| Q16 | **8.60** | 24.56 | 20.56 | 213.4 | ematix-flow |
-| Q17 | 35.71 | **28.77** | 40.28 | 272.4 | DuckDB |
-| Q18 | 52.02 | **50.70** | 56.38 | 587.1 | DuckDB |
-| Q19 | **18.81** | 34.15 | 100.06 | 103.2 | ematix-flow |
-| Q20 | **14.81** | 35.00 | 22.12 | 154.0 | ematix-flow |
-| Q21 | **38.08** | 82.49 | 679.78 | 598.8 | ematix-flow |
-| Q22 | **8.25** | 23.22 | 13.06 | 284.3 | ematix-flow |
-
-All times in milliseconds. 5-trial median for ematix-flow / DuckDB /
-Polars (same-process, `triangulation` feature); 3-trial median for
-PySpark 4.1.1 on JDK 23 (`local[*]`, `spark.sql.shuffle.partitions=8`,
-adaptive enabled).
-
-**Headline:** geomean **1.69× faster than DuckDB**, **2.71× faster
-than Polars**, **12.9× faster than single-node PySpark**.
-ematix-flow wins 18/22 queries outright; DuckDB takes Q17/Q18 by
-single-digit-ms margins; Polars takes Q06/Q15. Polars's Q05 outlier
-(10.7s) reflects a planner blowup on the canonical TPC-H Q05 shape —
-the canonical SQL is faster only on engines that can pick a better
-plan.
-
-- Polars's Q05 outlier (10.7s) is a planner blowup on the canonical
-  TPC-H Q05 shape — flagged but not a release blocker.
-- The four queries we don't win (Q06, Q15, Q17, Q18) are all
-  single-digit-ms gaps inside the run-to-run noise envelope.
-- Polars wins are measured from hand-translated `.polars.sql`
-  variants under `examples/tpch/queries/` — implicit `FROM a, b, c`
-  rewritten as explicit `JOIN ... ON`, INTERVAL literals
-  pre-resolved, semantically identical to the canonical TPC-H text.
-
-Full methodology + per-engine reproducers in
-[`BENCHMARKS.md`](BENCHMARKS.md).
-
-### How the speedups land
-
-Two layers do the work, both transparent at the SQL level:
-
-1. **`EmatixFastParquetTableProvider`** — the default parquet scan,
-   backed by [ematix-parquet 0.12.0](https://github.com/ryan-evans-git/ematix-parquet)
-   (a hand-rolled decoder we ship as a sibling crate). Adds row-group-parallel
-   decode, parallel per-page Snappy decompression, dict-preserved `Utf8View`,
-   buffer-reuse on the hot path, and small-bit-width NEON+AVX2 SIMD kernels
-   for RLE-dictionary indices. Replaces DataFusion's parquet-rs scan in-place
-   — `register_dict_aware_parquet(ctx, name, path)` is the whole API.
-2. **Physical-optimiser rules** — pattern-match canonical aggregate
-   shapes on the default plan tree and rewrite the matching subtree
-   to a specialised operator over the scan. No exec construction at
-   the user's level — `SessionContext::sql(...)` is the whole API.
-
-   | Rule | Shape it matches | Replaces with |
-   |---|---|---|
-   | `InjectFilterMultiAggRule` | `Aggregate(Final/Partial) → Projection(CSE) → Filter → scan` with a small-cardinality group-by | Template-specialised `FilterMultiAggSpec` (perfect-hash agg over typed-slice predicate eval) |
-   | `InjectFilterSumRule`     | `Aggregate(Final, sum/sum-product) → CoalescePartitions → Aggregate(Partial) → Filter(N-AND chain) → scan` | `FusedFilterSumExec` |
-   | `EnableDictGroupCountRule` | `count(*)` group-by on a dictionary-encoded string column | `DictGroupCountExec` (counts directly over dict keys) |
-
-   Each rule fires on shape — no query-specific gating. When anything
-   diverges (different aggregate, wrong column types, missing filter,
-   extra wrappers we don't recognise) the rule passes the node through
-   unchanged.
-
-Register them like any other physical-optimiser rule:
-
-```rust
-use ematix_flow_core::dict_aggregate_rule::EnableDictGroupCountRule;
-use ematix_flow_core::ematix_fast_parquet::EmatixFastParquetTableProvider;
-use ematix_flow_core::fused_aggregate_filter_multi_agg_rule::InjectFilterMultiAggRule;
-use ematix_flow_core::fused_aggregate_filter_sum_rule::InjectFilterSumRule;
-use datafusion::execution::session_state::SessionStateBuilder;
-use datafusion::prelude::{SessionConfig, SessionContext};
-use std::sync::Arc;
-
-let state = SessionStateBuilder::new()
-    .with_config(SessionConfig::new().with_target_partitions(14))
-    .with_default_features()
-    .with_physical_optimizer_rule(Arc::new(EnableDictGroupCountRule))
-    .with_physical_optimizer_rule(Arc::new(InjectFilterMultiAggRule))
-    .with_physical_optimizer_rule(Arc::new(InjectFilterSumRule))
-    .build();
-let ctx = SessionContext::new_with_state(state);
-for t in ["lineitem", "part" /* … */] {
-    let prov = EmatixFastParquetTableProvider::try_new(format!("{t}.parquet"))?;
-    ctx.register_table(t, Arc::new(prov))?;
-}
-// SQL goes through the fast scan and the matching rule fires
-// automatically. No per-query code.
-```
-
-Reproduce the bench with:
-
-```bash
-cargo run --release -p ematix-flow-core \
-    --example tpch_triangulation_bench --features triangulation
-```
-
----
-
 ematix-flow lets you declare a target table and a load strategy
 in Python; the framework handles schema evolution, watermarks,
 restart-safe state, at-least-once delivery, and change-data-
@@ -162,22 +43,21 @@ order you'd reach for each feature.
 
 ## Table of contents
 
-1. [Benchmarks](#benchmarks)
-2. [Install](#install)
-3. [Connections](#connections)
-4. [Backends](#backends)
-5. [Pipelines](#pipelines)
-6. [Modes](#modes)
-7. [Scheduling](#scheduling)
-8. [Streaming pipelines](#streaming-pipelines)
-9. [Stream processing](#stream-processing)
-10. [Configuration reference](#configuration-reference)
-11. [CLI](#cli)
-12. [Python API](#python-api)
-13. [Performance and comparisons](#performance-and-comparisons)
-14. [What's shipped](#whats-shipped)
-15. [Development](#development)
-16. [License](#license)
+1. [Install](#install)
+2. [Connections](#connections)
+3. [Backends](#backends)
+4. [Pipelines](#pipelines)
+5. [Modes](#modes)
+6. [Scheduling](#scheduling)
+7. [Streaming pipelines](#streaming-pipelines)
+8. [Stream processing](#stream-processing)
+9. [Configuration reference](#configuration-reference)
+10. [CLI](#cli)
+11. [Python API](#python-api)
+12. [Benchmarks and comparisons](#benchmarks)
+13. [What's shipped](#whats-shipped)
+14. [Development](#development)
+15. [License](#license)
 
 ---
 
@@ -1424,49 +1304,128 @@ the [Install](#install) extras and the
 ---
 
 <a id="performance-and-comparisons"></a>
-## Performance and comparisons
+<a id="benchmarks"></a>
+## Benchmarks and comparisons
 
-The headline 22-query four-engine table lives at the top of this
-README — see [Benchmarks](#benchmarks). On the SF=1 suite at the
-default settings, ematix-flow finishes every query DataFusion can
-plan; the Σ.D fused-operator arc shifts Q1 / Q6 / Q14 to the front
-of the pack vs Polars. Q14 specifically — historically Polars's
-strongest TPC-H win against DataFusion — closes from 2.17× behind
-Polars to 1.23× via the Σ.E3 ematix-parquet provider integration.
-Engine-level investigation continues under the Σ.E arc.
+### TPC-H SF=1, all 22 queries
 
-ematix-flow uses DataFusion for in-process SQL and Apache Arrow
-for cross-backend I/O, plus custom fused physical operators (the
-**Σ.D arc**) that close the gap on workload shapes where stock
-DataFusion materializes intermediate `BooleanArray` masks between
-filter and aggregate. The Σ.D operators (PRs [#46], [#47], [#48],
-[#55]) cover the `Aggregate over Filter over Scan` plan shape and
-deliver the 56-68× shifts on Q1 / Q6 in the headline table; the
-same architectural pattern extends to post-join aggregates and
-conditional `SUM(CASE WHEN ...)` shapes.
+Every TPC-H query, four engines, same M3 Pro / SF=1 / Parquet,
+v0.3.0 baseline (2026-05-19):
+
+| Query | **ematix-flow** | DuckDB | Polars | PySpark | Best |
+|---|---:|---:|---:|---:|:---|
+| Q01 | **28.11** | 45.17 | 36.22 | 189.8 | ematix-flow |
+| Q02 | **10.51** | 18.84 | 45.85 | 215.6 | ematix-flow |
+| Q03 | **15.11** | 32.36 | 45.39 | 293.7 | ematix-flow |
+| Q04 | **12.55** | 22.04 | 23.30 | 218.8 | ematix-flow |
+| Q05 | **20.93** | 30.49 | 10754.97 | 366.2 | ematix-flow |
+| Q06 | 14.50 | 11.90 | **10.57** | 47.9 | Polars |
+| Q07 | **28.96** | 31.57 | 112.41 | 288.7 | ematix-flow |
+| Q08 | **20.76** | 37.35 | 93.29 | 215.2 | ematix-flow |
+| Q09 | **28.13** | 62.42 | 47.22 | 453.0 | ematix-flow |
+| Q10 | **28.16** | 64.14 | 109.27 | 416.9 | ematix-flow |
+| Q11 | **7.47** | 10.36 | 9.57 | 140.0 | ematix-flow |
+| Q12 | **14.72** | 23.49 | 19.33 | 310.5 | ematix-flow |
+| Q13 | **41.36** | 141.92 | 115.08 | 699.6 | ematix-flow |
+| Q14 | **11.28** | 23.00 | 12.38 | 117.1 | ematix-flow |
+| Q15 | 15.45 | 14.51 | **11.33** | 142.0 | Polars |
+| Q16 | **8.60** | 24.56 | 20.56 | 213.4 | ematix-flow |
+| Q17 | 35.71 | **28.77** | 40.28 | 272.4 | DuckDB |
+| Q18 | 52.02 | **50.70** | 56.38 | 587.1 | DuckDB |
+| Q19 | **18.81** | 34.15 | 100.06 | 103.2 | ematix-flow |
+| Q20 | **14.81** | 35.00 | 22.12 | 154.0 | ematix-flow |
+| Q21 | **38.08** | 82.49 | 679.78 | 598.8 | ematix-flow |
+| Q22 | **8.25** | 23.22 | 13.06 | 284.3 | ematix-flow |
+
+All times in milliseconds. 5-trial median for ematix-flow / DuckDB /
+Polars (same-process, `triangulation` feature); 3-trial median for
+PySpark 4.1.1 on JDK 23 (`local[*]`, `spark.sql.shuffle.partitions=8`,
+adaptive enabled).
+
+**Headline:** geomean **1.69× faster than DuckDB**, **2.71× faster
+than Polars**, **12.9× faster than single-node PySpark**.
+ematix-flow wins 18/22 queries outright; the four it doesn't are all
+single-digit-ms gaps inside the run-to-run noise envelope. Polars's
+Q05 outlier (10.7s) is a planner blowup on the canonical TPC-H Q05
+shape — flagged but not a release blocker.
+
+Polars wins are measured from hand-translated `.polars.sql`
+variants under `examples/tpch/queries/` — implicit `FROM a, b, c`
+rewritten as explicit `JOIN ... ON`, INTERVAL literals pre-resolved,
+semantically identical to the canonical TPC-H text.
+
+Full methodology + per-engine reproducers in
+[`BENCHMARKS.md`](BENCHMARKS.md).
+
+### How the speedups land
+
+Two layers do the work, both transparent at the SQL level:
+
+1. **`EmatixFastParquetTableProvider`** — the default parquet scan,
+   backed by [ematix-parquet 0.12.0](https://github.com/ryan-evans-git/ematix-parquet)
+   (a hand-rolled decoder we ship as a sibling crate). Adds row-group-parallel
+   decode, parallel per-page Snappy decompression, dict-preserved `Utf8View`,
+   buffer-reuse on the hot path, and small-bit-width NEON+AVX2 SIMD kernels
+   for RLE-dictionary indices. Replaces DataFusion's parquet-rs scan in-place
+   — `register_dict_aware_parquet(ctx, name, path)` is the whole API.
+2. **Physical-optimiser rules** — pattern-match canonical aggregate
+   shapes on the default plan tree and rewrite the matching subtree
+   to a specialised operator over the scan. No exec construction at
+   the user's level — `SessionContext::sql(...)` is the whole API.
+
+   | Rule | Shape it matches | Replaces with |
+   |---|---|---|
+   | `InjectFilterMultiAggRule` | `Aggregate(Final/Partial) → Projection(CSE) → Filter → scan` with a small-cardinality group-by | Template-specialised `FilterMultiAggSpec` (perfect-hash agg over typed-slice predicate eval) |
+   | `InjectFilterSumRule`     | `Aggregate(Final, sum/sum-product) → CoalescePartitions → Aggregate(Partial) → Filter(N-AND chain) → scan` | `FusedFilterSumExec` |
+   | `EnableDictGroupCountRule` | `count(*)` group-by on a dictionary-encoded string column | `DictGroupCountExec` (counts directly over dict keys) |
+
+   Each rule fires on shape — no query-specific gating. When anything
+   diverges (different aggregate, wrong column types, missing filter,
+   extra wrappers we don't recognise) the rule passes the node through
+   unchanged.
+
+Register them like any other physical-optimiser rule:
+
+```rust
+use ematix_flow_core::dict_aggregate_rule::EnableDictGroupCountRule;
+use ematix_flow_core::ematix_fast_parquet::EmatixFastParquetTableProvider;
+use ematix_flow_core::fused_aggregate_filter_multi_agg_rule::InjectFilterMultiAggRule;
+use ematix_flow_core::fused_aggregate_filter_sum_rule::InjectFilterSumRule;
+use datafusion::execution::session_state::SessionStateBuilder;
+use datafusion::prelude::{SessionConfig, SessionContext};
+use std::sync::Arc;
+
+let state = SessionStateBuilder::new()
+    .with_config(SessionConfig::new().with_target_partitions(14))
+    .with_default_features()
+    .with_physical_optimizer_rule(Arc::new(EnableDictGroupCountRule))
+    .with_physical_optimizer_rule(Arc::new(InjectFilterMultiAggRule))
+    .with_physical_optimizer_rule(Arc::new(InjectFilterSumRule))
+    .build();
+let ctx = SessionContext::new_with_state(state);
+for t in ["lineitem", "part" /* … */] {
+    let prov = EmatixFastParquetTableProvider::try_new(format!("{t}.parquet"))?;
+    ctx.register_table(t, Arc::new(prov))?;
+}
+// SQL goes through the fast scan and the matching rule fires
+// automatically. No per-query code.
+```
+
+Reproduce the bench with:
+
+```bash
+cargo run --release -p ematix-flow-core \
+    --example tpch_triangulation_bench --features triangulation
+```
 
 22/22 PASS on TPC-H SF=1; 103/103 PASS on the canonical Apache
 Spark TPC-DS plan-time audit (Spark dialect → DataFusion via the
 built-in translator).
 
-The headline 22-query 5-engine table at the top of this README
-supersedes the earlier 4-query Polars head-to-head — see
-[Benchmarks](#benchmarks). The Σ.D arc covers Q1 / Q6 today;
-Q9 / Q12 / Q14 are the remaining gap (parquet decoder, tracked
-as Σ.E).
-
-[#46]: https://github.com/ryan-evans-git/ematix-flow/pull/46
-[#47]: https://github.com/ryan-evans-git/ematix-flow/pull/47
-[#48]: https://github.com/ryan-evans-git/ematix-flow/pull/48
-[#55]: https://github.com/ryan-evans-git/ematix-flow/pull/55
-
 Distributed batch SQL across multiple ematix-flow processes is
 available via the bundled `flow-worker` peer mesh. Cross-host
 scaling claims are honestly framed as deferred — there's no
 cluster hardware in this project's runway.
-
-Full methodology, hardware, and per-query numbers:
-[`docs/BENCHMARKS.md`](docs/BENCHMARKS.md).
 
 ### How it compares
 
@@ -1476,7 +1435,7 @@ Full methodology, hardware, and per-query numbers:
 | Airflow + dbt | Handles the load logic and streaming sources without a scheduler tier. Cron / k8s `CronJob` / GitHub Actions all fire `flow run-due` — no Airflow worker, no scheduler stub, no DAG plumbing. |
 | Kafka Connect + Debezium + custom sinks | First-class CDC source mode dispatches per-op transactionally to your existing target. No separate connector tier to operate. |
 | PySpark Structured Streaming (single-node) | Same SQL surface (DataFusion + Spark dialect translator). No cluster manager, no JVM startup tax, no driver/executor split — for single-node workloads the operational weight gap is the bigger win than any one query's wall-clock. |
-| Polars `read_*` + custom load logic | Comparable per-query performance on shared workloads; **ematix-flow is faster (1.5–11.5× on tested shapes)** once Σ.D applies, plus the load tier on top — watermarks, atomic state, schema evolution, multi-target fan-out, CDC sources, streaming. |
+| Polars `read_*` + custom load logic | Comparable per-query performance on shared workloads, plus the load tier on top — watermarks, atomic state, schema evolution, multi-target fan-out, CDC sources, streaming. |
 
 ---
 

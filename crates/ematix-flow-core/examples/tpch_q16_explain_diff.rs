@@ -3,7 +3,7 @@
 //! doesn't handle, so the rule doesn't fire; the regression is in the
 //! scan path.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -47,7 +47,7 @@ enum Provider {
     Emat,
 }
 
-async fn build_ctx(data_dir: &PathBuf, provider: Provider) -> SessionContext {
+async fn build_ctx(data_dir: &Path, provider: Provider) -> SessionContext {
     let state = SessionStateBuilder::new()
         .with_config(SessionConfig::new().with_target_partitions(14))
         .with_default_features()

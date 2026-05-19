@@ -121,7 +121,7 @@ async fn measure(label: &str, ctx: SessionContext, sql: &str, trials: usize, war
     println!("  total wall: {:.2} ms", best_ms);
     println!("  per-node elapsed_compute:");
     let mut entries: Vec<(String, u64)> = best_metrics.into_iter().collect();
-    entries.sort_by(|a, b| b.1.cmp(&a.1));
+    entries.sort_by_key(|e| std::cmp::Reverse(e.1));
     for (name, ns) in entries {
         println!("    {:<30} {:>10.2} ms", name, ns as f64 / 1e6);
     }

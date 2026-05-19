@@ -186,7 +186,7 @@ pub struct PrimitivePageStream<T: PrimitiveType> {
 }
 
 impl<T: PrimitiveType> PrimitivePageStream<T> {
-    pub fn new(file: &ParquetFile, cm: &CachedColumnChunk) -> DfResult<Self> {
+    pub(crate) fn new(file: &ParquetFile, cm: &CachedColumnChunk) -> DfResult<Self> {
         let total = cm.num_values as usize;
         let codec = cm.codec;
         let start = cm
@@ -334,7 +334,7 @@ pub struct StringViewPageStream {
 }
 
 impl StringViewPageStream {
-    pub fn new(file: &ParquetFile, cm: &CachedColumnChunk) -> DfResult<Self> {
+    pub(crate) fn new(file: &ParquetFile, cm: &CachedColumnChunk) -> DfResult<Self> {
         let total = cm.num_values as usize;
         let codec = cm.codec;
         let start = cm
@@ -1309,9 +1309,9 @@ mod tests {
         assert_eq!(stream.rows_decoded(), n);
         let arr = stream.make_array(0, 100, &DataType::Utf8View);
         let sv = arr.as_any().downcast_ref::<StringViewArray>().unwrap();
-        for i in 0..100 {
+        for (i, expected) in strings.iter().enumerate().take(100) {
             let s = std::str::from_utf8(sv.value(i).as_bytes()).unwrap();
-            assert_eq!(s, strings[i], "row {i}");
+            assert_eq!(s, expected, "row {i}");
         }
     }
 

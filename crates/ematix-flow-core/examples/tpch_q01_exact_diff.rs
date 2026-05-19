@@ -12,7 +12,7 @@
 //! join order changes, etc. Findings feed back into a "keep Exact's
 //! benefits without its regression" plan.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -45,7 +45,7 @@ const TABLES: &[&str] = &[
     "region", "nation", "supplier", "customer", "part", "partsupp", "orders", "lineitem",
 ];
 
-async fn build_ctx(data_dir: &PathBuf) -> SessionContext {
+async fn build_ctx(data_dir: &Path) -> SessionContext {
     let state = SessionStateBuilder::new()
         .with_config(SessionConfig::new().with_target_partitions(14))
         .with_default_features()

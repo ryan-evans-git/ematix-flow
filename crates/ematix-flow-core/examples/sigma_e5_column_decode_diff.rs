@@ -55,7 +55,7 @@ fn leaf_idx_by_name(file: &ParquetFile, name: &str) -> Option<usize> {
     md.schema
         .iter()
         .skip(1) // skip root group node
-        .position(|f| f.name.as_ref() == name.as_bytes())
+        .position(|f| f.name == name.as_bytes())
 }
 
 /// Promote `Utf8` → `Utf8View` to match the EmatArrowBatchReader

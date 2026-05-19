@@ -4,7 +4,7 @@
 //! Focused on finding where the 14× Utf8View buffer inflation actually
 //! costs CPU (vs being pure accounting overhead).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -49,7 +49,7 @@ enum Provider {
     Emat,
 }
 
-async fn build_ctx(data_dir: &PathBuf, provider: Provider) -> SessionContext {
+async fn build_ctx(data_dir: &Path, provider: Provider) -> SessionContext {
     let state = SessionStateBuilder::new()
         .with_config(SessionConfig::new().with_target_partitions(14))
         .with_default_features()

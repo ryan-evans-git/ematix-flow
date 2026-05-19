@@ -51,8 +51,8 @@ use crate::emat_arrow_reader::EmatArrowBatchReaderBuilder;
 use crate::ematix_parquet_bridge::{
     decode_column_chunk_byte_array, decode_column_chunk_byte_array_dict_preserved,
     decode_column_chunk_f64, decode_column_chunk_i32, decode_column_chunk_i64,
-    filter_i32_column_to_bitmap, masked_decode_byte_array, masked_decode_f64, masked_decode_i32,
-    masked_decode_i64, sparse_gather_chunk_f64, sparse_gather_chunk_i32, sparse_gather_chunk_i64,
+    masked_decode_byte_array, masked_decode_f64, masked_decode_i32, masked_decode_i64,
+    sparse_gather_chunk_f64, sparse_gather_chunk_i32, sparse_gather_chunk_i64,
 };
 use crate::fast_parquet::{RangePredicate, extract_range_predicate};
 
@@ -543,7 +543,7 @@ impl ColumnPredicate {
                 }
                 true
             }
-            ColumnPredicate::I32In { values, .. } => values.iter().any(|&x| x == v),
+            ColumnPredicate::I32In { values, .. } => values.contains(&v),
             _ => false,
         }
     }
@@ -1139,6 +1139,7 @@ impl EmatixFastParquetTableProvider {
         let num_cols_in_schema = schema.fields().len();
         let mut all_dict: Vec<bool> = vec![true; num_cols_in_schema];
         for rg in reader.metadata().row_groups() {
+            #[allow(clippy::needless_range_loop)]
             for col_idx in 0..num_cols_in_schema.min(rg.columns().len()) {
                 if !all_dict[col_idx] {
                     continue;
@@ -1174,6 +1175,7 @@ impl EmatixFastParquetTableProvider {
         // Stats missing → conservatively false (may have nulls).
         let mut no_nulls: Vec<bool> = vec![true; num_cols_in_schema];
         for rg in reader.metadata().row_groups() {
+            #[allow(clippy::needless_range_loop)]
             for col_idx in 0..num_cols_in_schema.min(rg.columns().len()) {
                 if !no_nulls[col_idx] {
                     continue;
@@ -1781,6 +1783,7 @@ fn build_partition_stream(
 /// product `N_partitions × N_cols`. For Q1 SF=1 (6 outer partitions on
 /// 14 cores) the budget is 2 — total ≈ 12 concurrent threads instead
 /// of the 42 the naive `available_parallelism()` cap produced.
+#[allow(clippy::too_many_arguments)]
 fn build_streaming_partition_stream(
     path: String,
     schema: SchemaRef,

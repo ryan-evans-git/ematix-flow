@@ -110,6 +110,7 @@ pub(crate) struct CachedColumnChunk {
     pub data_page_offset: i64,
     pub total_compressed_size: i64,
     pub total_uncompressed_size: i64,
+    #[allow(dead_code)]
     pub column_type: ParquetType,
 }
 
@@ -471,6 +472,7 @@ impl DecodedColumn {
 /// `predicate` is a precompiled `FilterPredicate` so we don't rebuild
 /// the index list per column. Use `arrow_select::filter::FilterBuilder`
 /// to build one from a BooleanArray once per RG.
+#[allow(dead_code)]
 fn compact_decoded_column_via_arrow(
     col: &DecodedColumn,
     predicate: &datafusion::arrow::compute::FilterPredicate,
@@ -946,6 +948,7 @@ impl EmatArrowBatchReader {
         let mut proj_max_ms: f64 = 0.0;
         let bitmap_ms_ref = &mut bitmap_ms;
         let proj_max_ms_ref = &mut proj_max_ms;
+        #[allow(clippy::type_complexity)]
         let bitmap_slot: std::sync::Mutex<Option<DfResult<(Vec<u8>, usize)>>> =
             std::sync::Mutex::new(None);
         let bitmap_slot_ref = &bitmap_slot;
@@ -1817,7 +1820,7 @@ fn decode_byte_array_to_string_view_slow(
     let mut n_pages_plain: usize = 0;
     let mut n_pages_rle: usize = 0;
 
-    let mut walker = PageWalker::new(&chunk);
+    let mut walker = PageWalker::new(chunk);
     let mut views: Vec<u128> = Vec::with_capacity(total);
 
     // Σ.E5 (2026-05-18): page-streaming layout. Each data page's
@@ -1955,6 +1958,7 @@ fn decode_byte_array_to_string_view_slow(
         let codec_copy = codec;
 
         let td = std::time::Instant::now();
+        #[allow(clippy::type_complexity)]
         let results: Vec<DfResult<(Vec<u128>, Option<Vec<u8>>)>> = pending
             .par_iter()
             .map(|p| match p.encoding {
@@ -2007,7 +2011,7 @@ fn decode_byte_array_to_string_view_slow(
 
         // Sequentially append in page order — preserves block_id
         // contract (data_buffers[block_id] = this PLAIN page's bytes).
-        for (page, res) in pending.iter().zip(results.into_iter()) {
+        for (page, res) in pending.iter().zip(results) {
             let (mut page_views, page_buf_opt) = res?;
             views.append(&mut page_views);
             match page.encoding {

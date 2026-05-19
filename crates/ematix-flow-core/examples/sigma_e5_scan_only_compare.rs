@@ -27,6 +27,7 @@ const TABLES: &[&str] = &[
 ];
 
 /// (query name, table → columns to scan).
+#[allow(clippy::type_complexity)]
 const QUERY_SCANS: &[(&str, &[(&str, &[&str])])] = &[
     // Regressions
     (
