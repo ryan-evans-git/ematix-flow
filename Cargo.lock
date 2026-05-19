@@ -3693,7 +3693,7 @@ checksum = "48c757948c5ede0e46177b7add2e67155f70e33c07fea8284df6576da70b3719"
 
 [[package]]
 name = "ematix-flow-cli"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "arrow-array",
  "arrow-ipc",
@@ -3723,7 +3723,7 @@ dependencies = [
 
 [[package]]
 name = "ematix-flow-core"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "apache-avro",
  "arrow-array",
@@ -3793,7 +3793,7 @@ dependencies = [
 
 [[package]]
 name = "ematix-flow-distributed"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -3816,7 +3816,7 @@ dependencies = [
 
 [[package]]
 name = "ematix-flow-py"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -3832,24 +3832,30 @@ dependencies = [
 
 [[package]]
 name = "ematix-parquet-codec"
-version = "0.11.0"
+version = "0.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "611b750e5a8be7c2e0d01b92b34ab0dfdbfb7d2fb01a8e3527ecbca049d688b7"
 dependencies = [
  "brotli",
  "ematix-parquet-format",
  "ematix-parquet-io",
  "flate2",
- "lz4_flex 0.11.6",
+ "lz4_flex 0.12.2",
  "snap",
  "zstd",
 ]
 
 [[package]]
 name = "ematix-parquet-format"
-version = "0.11.0"
+version = "0.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dc2096dd71d835ebf50184bb7273dd4b58136bbebed458cd3501b4c0b63966aa"
 
 [[package]]
 name = "ematix-parquet-io"
-version = "0.11.0"
+version = "0.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "978cdc661f7c49b3d32b325304a5e86e3ca8abb3e502ed421aded2225d87d69a"
 dependencies = [
  "ematix-parquet-format",
 ]
@@ -5596,6 +5602,12 @@ checksum = "373f5eceeeab7925e0c1098212f2fbc4d416adec9d35051a6ab251e824c1854a"
 dependencies = [
  "twox-hash",
 ]
+
+[[package]]
+name = "lz4_flex"
+version = "0.12.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "90071f8077f8e40adfc4b7fe9cd495ce316263f19e75c2211eeff3fdf475a3d9"
 
 [[package]]
 name = "lz4_flex"
