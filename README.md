@@ -19,11 +19,21 @@ deploy.
 ```python
 from ematix_flow import ematix, Annotated, BigInt, Text, TimestampTZ, pk
 
+# 1. Declare the connection. Credentials redacted in repr(); the
+#    framework looks this up by name from any pipeline.
+@ematix.connection
+class warehouse:
+    kind = "postgres"
+    url = "${WAREHOUSE_URL}"   # resolved from env at run time
+
+# 2. Declare the target table. Schema = annotated Python class —
+#    the framework migrates the table on first run.
 class Events:
     event_id: Annotated[BigInt, pk()]
     name: Text | None
     received_at: TimestampTZ
 
+# 3. Declare the pipeline: source SQL → target table.
 @ematix.pipeline(
     target=Events,
     target_connection="warehouse",
