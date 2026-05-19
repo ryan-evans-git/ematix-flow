@@ -497,6 +497,15 @@ impl TableProvider for EmatixFastParquetTableProvider {
         filters: &[&Expr],
     ) -> DfResult<Vec<TableProviderFilterPushDown>> {
         if self.dict_preservation || self.streaming_arrow_reader {
+            // Σ.E5 (verified 2026-05-19): routing pushed-down filters
+            // to the bridge late-mat path is a NET LOSS even with
+            // Utf8View added — the bridge path doesn't have the
+            // streaming reader's dict-views cache or page-overlap
+            // parallelism, so Q01 went -4 → +24 and Q06 went -26 →
+            // +9 in a smoke test. Late-mat needs to live INSIDE the
+            // streaming reader (`EmatArrowBatchReader` /
+            // `EmatPageStreamingReader`), not route around it. That's
+            // a much bigger refactor — tracked under task #516.
             return Ok(filters
                 .iter()
                 .map(|_| TableProviderFilterPushDown::Unsupported)
@@ -1230,6 +1239,29 @@ fn decode_one_rg_filtered_late_mat(
                         DataFusionError::External(
                             format!(
                                 "EmatixFastParquetExec (late_mat): Utf8 column has invalid UTF-8: {e}"
+                            )
+                            .into(),
+                        )
+                    })?;
+                    sb.append_value(s);
+                }
+                Arc::new(sb.finish())
+            }
+            DataType::Utf8View => {
+                // Σ.E5 (#515): late-mat path needs StringViewArray
+                // emission so it can be the integration target when
+                // pushdown is re-enabled on the streaming-default
+                // reader (which reports Utf8View in its schema).
+                let vals = masked_decode_byte_array(&file, rg, col_idx, &bitmap)?;
+                check_len(vals.len(), matches, field.name(), "Utf8View")?;
+                let total_bytes: usize = vals.iter().map(|v| v.len()).sum();
+                let mut sb = arrow_array::builder::StringViewBuilder::with_capacity(vals.len())
+                    .with_fixed_block_size(total_bytes.max(1) as u32);
+                for v in &vals {
+                    let s = std::str::from_utf8(v).map_err(|e| {
+                        DataFusionError::External(
+                            format!(
+                                "EmatixFastParquetExec (late_mat): Utf8View column has invalid UTF-8: {e}"
                             )
                             .into(),
                         )
