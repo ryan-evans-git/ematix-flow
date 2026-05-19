@@ -298,6 +298,38 @@ impl ColumnPredicate {
         }
     }
 
+    /// Σ.E5 per-filter Exact pushdown (2026-05-19): returns `true` if
+    /// emat's bitmap evaluation is provably equivalent to DataFusion's
+    /// predicate evaluation for this variant.
+    ///
+    /// Caller must ALSO check that the relevant column has no nulls
+    /// (emat's kernels don't handle def-levels). See
+    /// `EmatixFastParquetTableProvider::column_has_no_nulls`.
+    ///
+    /// See `docs/PHASE_SIGMA_E5_PER_FILTER_EXACT.md` §2 for the
+    /// per-shape safety audit.
+    pub fn is_exact_safe(&self) -> bool {
+        match self {
+            // Integer comparisons + discrete membership are byte-level
+            // unambiguous.
+            ColumnPredicate::I32Range { .. } | ColumnPredicate::I32In { .. } => true,
+            // Byte-equality matches Arrow's `eq_utf8`.
+            ColumnPredicate::StringEq { .. }
+            | ColumnPredicate::StringNotEq { .. }
+            | ColumnPredicate::StringIn { .. } => true,
+            // LIKE is Exact only when `LikeMatcher::compile` accepts
+            // the pattern (no `_`, no escape). Otherwise our matcher
+            // can't represent the pattern → Inexact.
+            ColumnPredicate::StringLike { pattern, .. } => {
+                crate::like_matcher::LikeMatcher::compile(pattern).is_some()
+            }
+            // Refused for pushdown elsewhere (NaN/Inf semantics, double-
+            // decode trap respectively). When/if re-enabled they'll
+            // need their own audit before claiming Exact.
+            ColumnPredicate::F64Range { .. } | ColumnPredicate::I32ColumnPair { .. } => false,
+        }
+    }
+
     /// Evaluate AND of all clauses against one f64 value (F64Range only).
     #[inline]
     pub fn eval_f64(&self, v: f64) -> bool {
@@ -743,6 +775,14 @@ pub struct EmatixFastParquetTableProvider {
     /// dict-encoded columns only (PLAIN-encoded LIKE pushdown
     /// verified-neg on Q13/Q20).
     column_is_dict_encoded: Arc<Vec<bool>>,
+    /// Σ.E5 (per-filter Exact pushdown, 2026-05-19): per-column flag
+    /// — true iff every row group reports `null_count == 0` AND has
+    /// non-null statistics for this column. Used by
+    /// `supports_filters_pushdown` to gate Exact pushdown: emat's
+    /// bitmap kernels don't handle null def-levels, so Exact is only
+    /// correct when there are no nulls to mis-interpret. Stats-missing
+    /// counts as "may have nulls" → conservative.
+    column_has_no_nulls: Arc<Vec<bool>>,
     /// Σ.E5a (Π.10 integration): when true, the filtered-decode path
     /// uses ematix-parquet v0.3.0's `read_column_*_masked_into` façade
     /// (Π.10 late-materialisation) instead of the pre-Π.10 in-flow
@@ -943,6 +983,24 @@ impl EmatixFastParquetTableProvider {
         }
         let column_is_dict_encoded: Arc<Vec<bool>> = Arc::new(all_dict);
 
+        // Σ.E5 per-filter Exact (2026-05-19): per-column no-nulls
+        // flag. `null_count_opt() == Some(0)` for every RG = safe.
+        // Stats missing → conservatively false (may have nulls).
+        let mut no_nulls: Vec<bool> = vec![true; num_cols_in_schema];
+        for rg in reader.metadata().row_groups() {
+            for col_idx in 0..num_cols_in_schema.min(rg.columns().len()) {
+                if !no_nulls[col_idx] {
+                    continue;
+                }
+                let col = rg.column(col_idx);
+                match col.statistics().and_then(|s| s.null_count_opt()) {
+                    Some(0) => {}
+                    _ => no_nulls[col_idx] = false,
+                }
+            }
+        }
+        let column_has_no_nulls: Arc<Vec<bool>> = Arc::new(no_nulls);
+
         Ok(Self {
             path,
             schema,
@@ -951,6 +1009,7 @@ impl EmatixFastParquetTableProvider {
             rg_num_rows,
             column_stats,
             column_is_dict_encoded,
+            column_has_no_nulls,
             late_mat: true,
             dict_preservation: false,
             // Σ.E5 (2026-05-18): re-flipping streaming default on
@@ -1124,15 +1183,26 @@ impl TableProvider for EmatixFastParquetTableProvider {
         // dense fast path (dict_views: Vec<u128> cache + 16-byte
         // gather per row). Pushdown accepted for BridgeFilter-shaped
         // filters on all reader variants.
+        // Σ.E5 per-filter Exact pushdown — Phase 1 attempt 2026-05-19
+        // verified-NEG. Declaring Exact for I32Range/StringEq/etc. on
+        // null-free cols + replacing the gate's drop-bitmap with
+        // `compact_decoded_column` produced geomean 0.945 vs 0.86
+        // baseline. Q01 +105%, Q03 +47%, Q05 +13%, Q08 +11%.
+        //
+        // Root cause: the naive scalar compact loop runs ~3-5× slower
+        // than DataFusion's FilterExec which uses Arrow's SIMD-
+        // accelerated `filter` kernel. Trading FilterExec for the
+        // in-reader compact loses on wide projections (6 cols × 1M
+        // rows × 95% sel on Q01 → 30 ms of memcpy).
+        //
+        // Path forward: re-implement the compact via Arrow's filter
+        // kernel (or our own SIMD variant) before re-enabling Exact.
+        // See docs/PHASE_SIGMA_E5_PER_FILTER_EXACT.md §3 Phase 1
+        // bench-gate addendum.
+        let _exact_unused = (&self.column_has_no_nulls, );
         Ok(filters
             .iter()
             .map(|e| {
-                // Σ.E5 #511-513: accept any filter shape recognised by
-                // `predicate_from_expr_with_dict` (i32/Date32 range +
-                // i32 IN + string Eq/NotEq/IN + LIKE on dict-encoded
-                // columns). Always Inexact so DataFusion keeps the
-                // residual FilterExec — necessary for selectivity-
-                // fallback safety in the streaming reader.
                 if predicate_from_expr_with_dict(e, &self.schema, &self.column_is_dict_encoded)
                     .is_some()
                 {

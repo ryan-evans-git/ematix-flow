@@ -660,19 +660,23 @@ impl EmatArrowBatchReader {
         // between win and loss is narrow for mid-selectivity numeric
         // filters and 33% is a conservative cut.
         if total > 0 && popcount * 3 > total {
-            // Σ.E5 (2026-05-19, verified-NEG): tried compacting dense-
-            // decoded cols via the bitmap here (`compact_decoded_column`).
-            // Result: Q03 -36% → +21.5%, Q21 -10% → +30.1%. The compact
-            // duplicates work with DataFusion's FilterExec (which is
-            // still there because pushdown is Inexact), and the
-            // FilterExec re-runs the same predicate against the already-
-            // filtered rows. Would only be a net win if we ALSO declared
-            // Exact pushdown (to drop FilterExec) — but Exact has its
-            // own risks (safety-net loss on selectivity-fallback) we
-            // don't want to take on yet.
+            // Σ.E5 (2026-05-19, verified-NEG twice now): tried
+            // compacting dense-decoded cols via the bitmap here
+            // (`compact_decoded_column`).
             //
-            // Keeping the prior behaviour: drop the bitmap, let dense
-            // decode happen, rely on the residual FilterExec.
+            // First attempt (ee67bde): Inexact pushdown → FilterExec
+            // still present → compact duplicates work → Q03 -36% →
+            // +21%, Q21 -10% → +30%.
+            //
+            // Second attempt (Phase 1, this file's Exact-pushdown
+            // landing): scalar compact loses to FilterExec's SIMD-
+            // accelerated Arrow `filter` kernel → Q01 -5% → +105%,
+            // Q03 -36% → +47%, Q05 +13%, Q08 +11%. Geomean
+            // 0.86 → 0.945.
+            //
+            // Path forward: re-implement compact via Arrow's filter
+            // kernel before re-enabling Exact pushdown. Keep the
+            // dead-code helper as the integration target.
             self.cur_rg_total = self.cached_md.row_groups[rg].num_rows as usize;
             return self.load_row_group_dense(rg);
         }
