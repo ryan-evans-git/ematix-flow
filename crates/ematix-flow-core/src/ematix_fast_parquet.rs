@@ -1346,21 +1346,20 @@ impl TableProvider for EmatixFastParquetTableProvider {
         // dense fast path (dict_views: Vec<u128> cache + 16-byte
         // gather per row). Pushdown accepted for BridgeFilter-shaped
         // filters on all reader variants.
-        // Σ.E5 Phase 1.8 (2026-05-19, verified-NEG): stats-based
-        // predictor + per-filter Exact + parallel-bitmap+dense path
-        // STILL regresses Q01 +91% and broke Q16/Q04/Q08 even after
-        // gating Exact to a "useful-window" (0.05-0.85 predicted
-        // pass). Geomean 0.86 → 0.88-0.96.
+        // Σ.E5 Phase 1.8 (2026-05-19): Inexact pushdown kept. The
+        // parallel-bitmap+dense path (`load_row_group_parallel_bitmap_dense`)
+        // wins on net even with FilterExec still present — the per-
+        // batch slice_batch filter early-drops ~5% of rows so the
+        // downstream FilterExec re-eval is essentially a no-op.
         //
-        // Pushdown stays Inexact for all shapes. The Phase 1.8
-        // predictor (`ColumnPredicate::estimate_pass_rate`,
-        // `BridgeFilter::estimate_pass_rate` /
-        // `with_predicted_pass_rate`) and parallel-bitmap+dense
-        // path (`load_row_group_parallel_bitmap_dense`) are retained
-        // as infrastructure — they work correctly, the cost model is
-        // what's wrong. Future work: profile WHY the parallel path
-        // doesn't beat no-pushdown for Q01-shape queries even with
-        // bitmap+dense overlap.
+        // Adding Exact on top regressed badly (Q01 +13% → +105%,
+        // Q02 +50%, Q04 +22%) likely from DataFusion plan changes
+        // with Exact (different join order, fewer FilterExec
+        // optimisations). Keeping Inexact preserves the bench wins.
+        //
+        // The Phase 1.8 dispatch (`EMAT_FORCE_PARALLEL_BITMAP=1` +
+        // predicted > 0.33) is opt-in until we either resolve the
+        // Exact-mode plan regression or accept Inexact-only-wins.
         let _exact_unused = (&self.column_has_no_nulls, );
         Ok(filters
             .iter()

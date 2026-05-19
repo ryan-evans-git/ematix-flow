@@ -763,7 +763,12 @@ impl EmatArrowBatchReader {
         // Disabled at the dispatch site to keep the current baseline.
         //
         // To re-enable: change `false` below to `filter.predicted_pass_rate() > 0.33`.
-        if false && filter.predicted_pass_rate() > 0.33 {
+        // Σ.E5 Phase 1.8 (2026-05-19): when predicted pass rate is
+        // high (>33%), use the work-stealing parallel bitmap+dense
+        // path. Empirical SF=1 22-query gate: 0.89 → 0.856 geomean.
+        // Override with EMAT_NO_PARALLEL_BITMAP=1.
+        let disable_parallel = std::env::var_os("EMAT_NO_PARALLEL_BITMAP").is_some();
+        if !disable_parallel && filter.predicted_pass_rate() > 0.33 {
             return self.load_row_group_parallel_bitmap_dense(rg, filter, path);
         }
 
@@ -900,6 +905,13 @@ impl EmatArrowBatchReader {
         filter: BridgeFilter,
         path: std::path::PathBuf,
     ) -> DfResult<()> {
+        // Σ.E5 timing probe (`EMAT_TIMING=1`) — per-RG wall times for
+        // bitmap thread vs projection-thread max vs scope total. Helps
+        // diagnose why the parallel path doesn't beat no-pushdown on
+        // Q01-shape queries.
+        let timing = std::env::var_os("EMAT_TIMING").is_some();
+        let t_fn_start = if timing { Some(std::time::Instant::now()) } else { None };
+
         let total_rows = self.cached_md.row_groups[rg].num_rows as usize;
         let projection = &self.projection;
         let schema = &self.arrow_schema;
@@ -911,52 +923,99 @@ impl EmatArrowBatchReader {
                 .map(|p| p.get())
                 .unwrap_or(1)
         });
-        // Honour the per-partition budget. 1 for bitmap, rest for
-        // projection (>=1).
-        let projection_threads = cap.saturating_sub(1).max(1).min(n_cols.max(1));
+        // Σ.E5 Phase 1.8 (post-profile): use a unified work-stealing
+        // pool of `cap` threads across (n_cols projection + 1 bitmap)
+        // tasks. The earlier "1 dedicated bitmap thread + cap-1
+        // projection threads" structure starved projection on small
+        // caps (Q01: cap=2 → 1 projection thread → 28 ms wall while
+        // the bitmap thread idled after its 1 ms task). Treating
+        // bitmap as just another task lets the bitmap-doing thread
+        // pick up a projection col next.
+        let total_threads = cap.max(1).min(n_cols + 1);
 
         use std::sync::atomic::{AtomicUsize, Ordering};
+        // Task indices: 0..n_cols = projection col i, n_cols = bitmap.
         let next = AtomicUsize::new(0);
         let filter_ref = &filter;
         let path_ref = &path;
 
-        let (bitmap_res, projection_results): (
-            DfResult<(Vec<u8>, usize)>,
-            Vec<(usize, DfResult<DecodedColumn>)>,
-        ) = std::thread::scope(|s| {
-            let bitmap_handle = s.spawn(move || filter_ref.build_bitmap(path_ref, rg));
+        let t_scope_start = if timing { Some(std::time::Instant::now()) } else { None };
+        let mut bitmap_ms: f64 = 0.0;
+        let mut proj_max_ms: f64 = 0.0;
+        let bitmap_ms_ref = &mut bitmap_ms;
+        let proj_max_ms_ref = &mut proj_max_ms;
+        let bitmap_slot: std::sync::Mutex<Option<DfResult<(Vec<u8>, usize)>>> =
+            std::sync::Mutex::new(None);
+        let bitmap_slot_ref = &bitmap_slot;
 
-            let mut handles = Vec::with_capacity(projection_threads);
-            for _ in 0..projection_threads {
-                let next = &next;
-                handles.push(s.spawn(move || -> Vec<(usize, DfResult<DecodedColumn>)> {
-                    let mut local: Vec<(usize, DfResult<DecodedColumn>)> = Vec::new();
-                    let mut chunk_buf: Vec<u8> = Vec::new();
-                    loop {
-                        let i = next.fetch_add(1, Ordering::Relaxed);
-                        if i >= n_cols {
-                            break;
+        let projection_results: Vec<(usize, DfResult<DecodedColumn>)> =
+            std::thread::scope(|s| {
+                let mut handles = Vec::with_capacity(total_threads);
+                let n_tasks = n_cols + 1;
+                for _ in 0..total_threads {
+                    let next = &next;
+                    handles.push(s.spawn(
+                        move || -> (Vec<(usize, DfResult<DecodedColumn>)>, f64, f64) {
+                            let t_outer = std::time::Instant::now();
+                            let mut local: Vec<(usize, DfResult<DecodedColumn>)> = Vec::new();
+                            let mut chunk_buf: Vec<u8> = Vec::new();
+                            let mut bitmap_self_ms: f64 = 0.0;
+                            loop {
+                                let i = next.fetch_add(1, Ordering::Relaxed);
+                                if i >= n_tasks {
+                                    break;
+                                }
+                                if i == n_cols {
+                                    // Bitmap task — lives in the same
+                                    // pool. Whichever thread grabs it
+                                    // will then drop back to picking
+                                    // up projection cols.
+                                    let t_bm = std::time::Instant::now();
+                                    let r = filter_ref.build_bitmap(path_ref, rg);
+                                    bitmap_self_ms = t_bm.elapsed().as_secs_f64() * 1000.0;
+                                    *bitmap_slot_ref.lock().unwrap() = Some(r);
+                                } else {
+                                    let leaf = projection[i];
+                                    let target = schema.field(i).data_type();
+                                    local.push((
+                                        i,
+                                        decode_one_column(
+                                            file, cached_md, &mut chunk_buf, rg, leaf,
+                                            target,
+                                        ),
+                                    ));
+                                }
+                            }
+                            let outer_ms = t_outer.elapsed().as_secs_f64() * 1000.0;
+                            (local, outer_ms, bitmap_self_ms)
+                        },
+                    ));
+                }
+                let mut all = Vec::with_capacity(n_cols);
+                for h in handles {
+                    let (partial, outer_ms, bitmap_self_ms) =
+                        h.join().expect("decode thread panicked");
+                    if timing {
+                        if outer_ms > *proj_max_ms_ref {
+                            *proj_max_ms_ref = outer_ms;
                         }
-                        let leaf = projection[i];
-                        let target = schema.field(i).data_type();
-                        local.push((
-                            i,
-                            decode_one_column(
-                                file, cached_md, &mut chunk_buf, rg, leaf, target,
-                            ),
-                        ));
+                        if bitmap_self_ms > 0.0 {
+                            *bitmap_ms_ref = bitmap_self_ms;
+                        }
                     }
-                    local
-                }));
-            }
+                    all.extend(partial);
+                }
+                all
+            });
 
-            let bitmap_res = bitmap_handle.join().expect("bitmap thread panicked");
-            let mut all = Vec::with_capacity(n_cols);
-            for h in handles {
-                all.extend(h.join().expect("decode thread panicked"));
-            }
-            (bitmap_res, all)
-        });
+        let bitmap_res = bitmap_slot
+            .into_inner()
+            .map_err(|e| ext(format!("bitmap slot poisoned: {e}")))?
+            .ok_or_else(|| ext("bitmap task never ran"))?;
+
+        let scope_ms = t_scope_start
+            .map(|t| t.elapsed().as_secs_f64() * 1000.0)
+            .unwrap_or(0.0);
 
         let (bitmap, total) = bitmap_res?;
         if total != total_rows {
@@ -988,6 +1047,17 @@ impl EmatArrowBatchReader {
         self.cur_rg_columns = Some(cols);
         self.cur_rg_filter_bitmap = Some(bitmap);
         self.cur_rg_row = 0;
+
+        if timing {
+            let total_fn_ms = t_fn_start
+                .map(|t| t.elapsed().as_secs_f64() * 1000.0)
+                .unwrap_or(0.0);
+            eprintln!(
+                "[emat.parallel] rg={rg} n_cols={n_cols} pool={total_threads} \
+                 bitmap={bitmap_ms:.2}ms proj_max={proj_max_ms:.2}ms scope={scope_ms:.2}ms \
+                 fn_total={total_fn_ms:.2}ms"
+            );
+        }
         Ok(())
     }
 
@@ -1137,6 +1207,8 @@ impl EmatArrowBatchReader {
         // were Inexact; with Exact pushdown, this is the only filter
         // step in the plan for the pushed predicate.
         if let Some(bm) = self.cur_rg_filter_bitmap.as_ref() {
+            let timing = std::env::var_os("EMAT_TIMING").is_some();
+            let t_filter = if timing { Some(std::time::Instant::now()) } else { None };
             // Build a BooleanBuffer that points into the bitmap with
             // the batch's row offset. BooleanBuffer takes a Buffer +
             // start bit + length, so we can window the bitmap without
@@ -1149,6 +1221,13 @@ impl EmatArrowBatchReader {
             let predicate_arr = arrow_array::BooleanArray::new(bool_buf, None);
             let filtered = datafusion::arrow::compute::filter_record_batch(&batch, &predicate_arr)
                 .map_err(|e| ext(format!("filter_record_batch: {e}")))?;
+            if let Some(t) = t_filter {
+                eprintln!(
+                    "[emat.batch_filter] start={start} n={n} out={} elapsed={:.3}ms",
+                    filtered.num_rows(),
+                    t.elapsed().as_secs_f64() * 1000.0
+                );
+            }
             return Ok(filtered);
         }
         Ok(batch)

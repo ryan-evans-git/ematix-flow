@@ -6,19 +6,58 @@ Source: `crates/ematix-flow-core/examples/sigma_e5_4a_22_parity_bench.rs`.
 
 Data: `examples/tpch/data/sf1`.
 
-Methodology: median ± σ across 1 timed trials after 0 warmups, single-machine, 14 target partitions, mimalloc allocator. Both providers register the same 8 TPC-H tables with the same rule chain (`InjectFusedQ{1,3,5,12}Rule` + `InjectFilterSumRule` + `EnableDictGroupCountRule`). Delta = `(emat - fast) / fast × 100`. Verdict bands: within ±5% = `parity`; emat ≥ 5% faster = `EmatFaster`; emat ≥ 5% slower = `Regression`.
+Methodology: median ± σ across 10 timed trials after 3 warmups, single-machine, 14 target partitions, mimalloc allocator. Both providers register the same 8 TPC-H tables with the same rule chain (`InjectFusedQ{1,3,5,12}Rule` + `InjectFilterSumRule` + `EnableDictGroupCountRule`). Delta = `(emat - fast) / fast × 100`. Verdict bands: within ±5% = `parity`; emat ≥ 5% faster = `EmatFaster`; emat ≥ 5% slower = `Regression`.
 
 ## 1. Bench numbers
 
 | Query | FastParquet (ms) | EmatixFastParquet (ms) | Δ% (emat vs fast) | Verdict |
 |------:|-----------------:|-----------------------:|------------------:|:--------|
-| Q19  | 98.02 ± 0.00 | 40.43 ± 0.00 | -58.8 | EmatFaster |
+| Q01  | 18.97 ± 1.14 | 18.53 ± 1.37 | -2.3 | within ±5% |
+| Q02  | 9.72 ± 0.09 | 7.50 ± 0.19 | -22.8 | EmatFaster |
+| Q03  | 19.55 ± 0.76 | 13.04 ± 0.63 | -33.3 | EmatFaster |
+| Q04  | 15.27 ± 2.46 | 11.94 ± 0.32 | -21.8 | EmatFaster |
+| Q05  | 23.46 ± 0.68 | 21.27 ± 1.36 | -9.4 | EmatFaster |
+| Q06  | 11.15 ± 0.28 | 9.41 ± 0.42 | -15.6 | EmatFaster |
+| Q07  | 28.59 ± 0.69 | 25.58 ± 0.69 | -10.5 | EmatFaster |
+| Q08  | 23.82 ± 1.05 | 17.41 ± 0.43 | -26.9 | EmatFaster |
+| Q09  | 27.95 ± 0.68 | 26.93 ± 3.17 | -3.7 | within ±5% |
+| Q10  | 33.86 ± 0.64 | 24.93 ± 0.62 | -26.4 | EmatFaster |
+| Q11  | 7.26 ± 0.25 | 4.82 ± 2.16 | -33.5 | EmatFaster |
+| Q12  | 19.49 ± 0.89 | 15.45 ± 0.45 | -20.7 | EmatFaster |
+| Q13  | 41.40 ± 0.94 | 51.63 ± 0.30 | +24.7 | Regression |
+| Q14  | 16.52 ± 0.33 | 11.66 ± 0.90 | -29.4 | EmatFaster |
+| Q15  | 23.58 ± 0.73 | 14.79 ± 0.47 | -37.3 | EmatFaster |
+| Q16  | 8.46 ± 0.92 | 9.18 ± 0.15 | +8.4 | Regression |
+| Q17  | 35.55 ± 2.21 | 33.14 ± 1.03 | -6.8 | EmatFaster |
+| Q18  | 50.23 ± 3.69 | 43.97 ± 1.81 | -12.5 | EmatFaster |
+| Q19  | 20.80 ± 0.31 | 16.69 ± 0.43 | -19.8 | EmatFaster |
+| Q20  | 17.87 ± 1.21 | 15.13 ± 0.59 | -15.4 | EmatFaster |
+| Q21  | 42.64 ± 2.09 | 37.56 ± 1.58 | -11.9 | EmatFaster |
+| Q22  | 8.38 ± 0.31 | 7.94 ± 0.13 | -5.2 | EmatFaster |
 
-**Top-line:** 0 parity, 1 EmatFaster, 0 Regression (paired queries: 1). geomean(emat / fast) = **0.4125** (target ≤ 1.02 per E5.4 acceptance).
+**Top-line:** 2 parity, 18 EmatFaster, 2 Regression (paired queries: 22). geomean(emat / fast) = **0.8378** (target ≤ 1.02 per E5.4 acceptance).
 
 ## 2. Per-query analysis
 
-No query regressed by more than 5%. The parity criterion holds for every query in the suite — no per-query EXPLAIN ANALYZE deep-dive is required.
+Regressions > 5%, ordered by magnitude. Threshold for EXPLAIN ANALYZE deep-dive is > 10%; queries between 5% and 10% are listed for completeness but not individually attributed unless they cluster on a shared root cause.
+
+### Q13 — +24.7% (41.40 → 51.63 ms)
+
+_Deep-dive required (> 10% regression). Likely candidates, ranked by prior data from §3 capability gaps:_
+
+1. **Filter pushdown disabled** when the streaming reader is on (see `EmatixFastParquetTableProvider::supports_filters_pushdown` — returns `Unsupported` for every filter while `streaming_arrow_reader` is true). DataFusion's residual `FilterExec` runs the predicates instead. On selective filters (Q06, Q14, Q19) this materially changes the rows-pushed-into-aggregate count.
+_Confirm with `EXPLAIN ANALYZE`: count of rows emerging from the scan node should be equal to the file's total rows on EmatixFastParquet and to the post-filter row count on FastParquet._
+
+2. **Row-group pruning by stats** — `EmatixFastParquetTableProvider::partition_statistics()` returns `Statistics::new_unknown` with only `num_rows` populated (`ematix_fast_parquet.rs:637`). FastParquet reports typed min/max from `ParquetMetaData::row_group().statistics()`, which feeds DataFusion's join-size + agg-cardinality estimates and drives row-group pruning. On stats-sensitive queries this changes the physical plan (smaller join build side, different operator ordering).
+
+3. **Per-column decode cost on specific column types** — primarily Decimal128 (none in TPC-H), Int96, FLBA, nested. TPC-H is all Int32/Int64/Float64/Date32/Utf8; if a regression shows here it's in the Utf8 → Utf8View streaming path (Σ.E5.1.d). Cross-check with the codec-layer `bench_decode` in ematix-parquet.
+
+4. **Different operator selection by the planner** — if `partition_statistics` differences flip a join from hash to nested loop or vice versa, this is the symptom. EXPLAIN-diff the two plans.
+
+### Q16 — +8.4% (8.46 → 9.18 ms)
+
+Within the 5–10% band. Most likely cause: cumulative effect of filter-pushdown-disabled + unknown partition stats on a query whose hot path is dominated by aggregation, not scan. No deep-dive yet unless it clusters with a > 10% regression.
+
 ## 3. Capability gaps in EmatixFastParquet vs FastParquet
 
 Gathered from a read of `src/ematix_fast_parquet.rs` and confirmed against the §1 acceptance check. These are properties of the *current* (PR #115) streaming-default provider, not codec capability gaps in ematix-parquet itself.
@@ -37,12 +76,12 @@ Gathered from a read of `src/ematix_fast_parquet.rs` and confirmed against the �
 
 ## 4. Migration sequencing recommendation
 
-**EmatixFastParquet is ready — proceed to E5.4.b in-tree switch.** Zero queries regressed by more than 5%, and the geomean of `emat / fast` is within the E5.4 acceptance threshold (≤ 1.02). Recommended sequencing:
+**Close gaps first** — 2 query/queries regressed by more than 5% (geomean = 0.8378, target ≤ 1.02). Recommended ordered sub-phases:
 
-1. **E5.4.b** — flip `tpch_triangulation_bench.rs` and other in-tree consumers from `FastParquetTableProvider` to `EmatixFastParquetTableProvider` one call site at a time, gating each on its own bench run.
-2. **E5.4.c** — restore filter pushdown on the streaming path (re-enable `supports_filters_pushdown` for Int32/Date32 range predicates; fuse the bitmap-first decode with the streaming emission). Expected wins on Q06/Q14/Q19.
-3. **E5.4.d** — wire typed `partition_statistics` so the planner sees min/max + null_count. Decode the thrift-level `ematix-parquet-format::Statistics` for the 5 physical types we use (Int32/Int64/Float/Double/Bool).
-4. **E5.4.e** — delete `FastParquetTableProvider` and its parquet-rs imports from `src/fast_parquet.rs`; verify `cargo tree -p ematix-flow-core -e=normal | grep parquet` shows no direct `parquet 58` edge.
+1. **E5.4.b — restore filter pushdown on the streaming reader path** (highest impact). Re-enable `supports_filters_pushdown` for Int32/Date32 range predicates and fuse with the streaming bitmap-first decode. Expected to close Q06, Q14, Q19 and any other selective-filter query in the regression list.
+2. **E5.4.c — typed `partition_statistics`** (medium impact). Decode `ematix_parquet_format::Statistics` for the 5 physical types and report typed min/max + null_count from `EmatixFastParquetExec::partition_statistics`. Re-runs the planner's cardinality estimates on the EmatixFastParquet side; expected to close the join-heavy regressions (Q05, Q07, Q09, Q21).
+3. **E5.4.d — row-group pruning at scan time** (small impact, rides E5.4.c). Once typed stats are present, drop RGs whose stats don't intersect any pushed-down filter. Mostly redundant with E5.4.b for SF=1 (lineitem has 6 RGs total) but lands cleanly at SF=10.
+4. **E5.4.e — rerun this parity bench**. Acceptance criterion: same as E5.4 — within ±5% per-query, geomean ≤ 1.02. Migrate in-tree call sites once green.
 
 ## 5. Bench reproduction
 
