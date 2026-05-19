@@ -1360,16 +1360,28 @@ impl TableProvider for EmatixFastParquetTableProvider {
         // The Phase 1.8 dispatch (`EMAT_FORCE_PARALLEL_BITMAP=1` +
         // predicted > 0.33) is opt-in until we either resolve the
         // Exact-mode plan regression or accept Inexact-only-wins.
-        let _exact_unused = (&self.column_has_no_nulls, );
+        // Σ.E5 Phase 1.8 investigation (2026-05-19): opt-in Exact via
+        // EMAT_EXACT_PUSHDOWN=1 for is_exact_safe() && column_has_no_nulls
+        // filters. Used by `tpch_q01_exact_diff` to A/B plan-diff. Stays
+        // off by default — Exact regresses on top of parallel path.
+        let exact_opt_in = std::env::var_os("EMAT_EXACT_PUSHDOWN").is_some();
+        let no_nulls = &self.column_has_no_nulls;
         Ok(filters
             .iter()
             .map(|e| {
-                if predicate_from_expr_with_dict(e, &self.schema, &self.column_is_dict_encoded)
-                    .is_some()
-                {
-                    TableProviderFilterPushDown::Inexact
-                } else {
-                    TableProviderFilterPushDown::Unsupported
+                match predicate_from_expr_with_dict(
+                    e,
+                    &self.schema,
+                    &self.column_is_dict_encoded,
+                ) {
+                    Some(pred) if exact_opt_in
+                        && pred.is_exact_safe()
+                        && no_nulls.get(pred.col_idx()).copied().unwrap_or(false) =>
+                    {
+                        TableProviderFilterPushDown::Exact
+                    }
+                    Some(_) => TableProviderFilterPushDown::Inexact,
+                    None => TableProviderFilterPushDown::Unsupported,
                 }
             })
             .collect())
