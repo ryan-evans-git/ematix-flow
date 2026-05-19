@@ -754,6 +754,19 @@ impl EmatArrowBatchReader {
         filter: BridgeFilter,
         path: std::path::PathBuf,
     ) -> DfResult<()> {
+        // Σ.E5 Phase 1.8 (2026-05-19, verified-NEG): stats-based
+        // dispatch infrastructure is in place
+        // (`load_row_group_parallel_bitmap_dense` available, predicted
+        // pass rate plumbed via BridgeFilter::with_predicted_pass_rate)
+        // but the parallel-bitmap+dense path didn't beat the no-
+        // pushdown baseline on Q01 even with the +1-within-budget fix.
+        // Disabled at the dispatch site to keep the current baseline.
+        //
+        // To re-enable: change `false` below to `filter.predicted_pass_rate() > 0.33`.
+        if false && filter.predicted_pass_rate() > 0.33 {
+            return self.load_row_group_parallel_bitmap_dense(rg, filter, path);
+        }
+
         // 1. Build the combined multi-column AND bitmap.
         let (bitmap, total) = filter.build_bitmap(&path, rg)?;
         let popcount: usize = bitmap.iter().map(|b| b.count_ones() as usize).sum();
@@ -761,17 +774,8 @@ impl EmatArrowBatchReader {
         // Σ.E5 #517-518: selectivity gate. Masked decode is a win
         // only when the filter is selective enough that the skipped
         // decode work outweighs the bitmap-construction + per-row
-        // gather overhead.
-        //
-        // Threshold at popcount * 3 > total (fall back at >33%
-        // selectivity). Lower than the prior 50% gate; the gap
-        // between win and loss is narrow for mid-selectivity numeric
-        // filters and 33% is a conservative cut.
-        //
-        // Phase 1.6 plumbing (per-batch filter via
-        // `cur_rg_filter_bitmap` + `slice_batch`) is kept in place
-        // but not activated — `cur_rg_filter_bitmap` stays `None` so
-        // slice_batch's filter branch is dead.
+        // gather overhead. Phase 1.8 may misfire (stats inaccurate)
+        // so keep the actual-popcount fallback as a safety net.
         if total > 0 && popcount * 3 > total {
             self.cur_rg_total = self.cached_md.row_groups[rg].num_rows as usize;
             return self.load_row_group_dense(rg);
@@ -878,6 +882,113 @@ impl EmatArrowBatchReader {
             return self.load_row_group_masked(rg, filter.clone(), path.clone());
         }
         self.load_row_group_dense(rg)
+    }
+
+    /// Σ.E5 Phase 1.8: parallel bitmap+dense path. Spawns one thread
+    /// for `filter.build_bitmap` alongside the existing parallel-
+    /// projection decode pool. Stores both `cur_rg_columns` and
+    /// `cur_rg_filter_bitmap` so `slice_batch` applies the bitmap
+    /// per-batch via Arrow's SIMD filter.
+    ///
+    /// Reused across-the-board thread budget: of `cap` threads
+    /// available, 1 goes to bitmap, `cap - 1` to projection cols
+    /// (with at least 1 minimum). Avoids the +1 oversubscription
+    /// that broke Phase 1.7.
+    fn load_row_group_parallel_bitmap_dense(
+        &mut self,
+        rg: usize,
+        filter: BridgeFilter,
+        path: std::path::PathBuf,
+    ) -> DfResult<()> {
+        let total_rows = self.cached_md.row_groups[rg].num_rows as usize;
+        let projection = &self.projection;
+        let schema = &self.arrow_schema;
+        let file = &self.file;
+        let cached_md = &self.cached_md;
+        let n_cols = projection.len();
+        let cap = self.parallelism_budget.unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|p| p.get())
+                .unwrap_or(1)
+        });
+        // Honour the per-partition budget. 1 for bitmap, rest for
+        // projection (>=1).
+        let projection_threads = cap.saturating_sub(1).max(1).min(n_cols.max(1));
+
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let next = AtomicUsize::new(0);
+        let filter_ref = &filter;
+        let path_ref = &path;
+
+        let (bitmap_res, projection_results): (
+            DfResult<(Vec<u8>, usize)>,
+            Vec<(usize, DfResult<DecodedColumn>)>,
+        ) = std::thread::scope(|s| {
+            let bitmap_handle = s.spawn(move || filter_ref.build_bitmap(path_ref, rg));
+
+            let mut handles = Vec::with_capacity(projection_threads);
+            for _ in 0..projection_threads {
+                let next = &next;
+                handles.push(s.spawn(move || -> Vec<(usize, DfResult<DecodedColumn>)> {
+                    let mut local: Vec<(usize, DfResult<DecodedColumn>)> = Vec::new();
+                    let mut chunk_buf: Vec<u8> = Vec::new();
+                    loop {
+                        let i = next.fetch_add(1, Ordering::Relaxed);
+                        if i >= n_cols {
+                            break;
+                        }
+                        let leaf = projection[i];
+                        let target = schema.field(i).data_type();
+                        local.push((
+                            i,
+                            decode_one_column(
+                                file, cached_md, &mut chunk_buf, rg, leaf, target,
+                            ),
+                        ));
+                    }
+                    local
+                }));
+            }
+
+            let bitmap_res = bitmap_handle.join().expect("bitmap thread panicked");
+            let mut all = Vec::with_capacity(n_cols);
+            for h in handles {
+                all.extend(h.join().expect("decode thread panicked"));
+            }
+            (bitmap_res, all)
+        });
+
+        let (bitmap, total) = bitmap_res?;
+        if total != total_rows {
+            return Err(ext(format!(
+                "Phase 1.8: bitmap total {total} != RG rows {total_rows}"
+            )));
+        }
+        let mut slots: Vec<Option<DfResult<DecodedColumn>>> =
+            (0..n_cols).map(|_| None).collect();
+        for (i, r) in projection_results {
+            slots[i] = Some(r);
+        }
+        let mut cols = Vec::with_capacity(n_cols);
+        for (i, slot) in slots.into_iter().enumerate() {
+            let r = slot.ok_or_else(|| ext(format!("column {i} decode slot never filled")))?;
+            cols.push(r?);
+        }
+        for (i, c) in cols.iter().enumerate() {
+            if c.len() != total {
+                return Err(ext(format!(
+                    "RG {rg}: column {i} (leaf {}) decoded {} rows but RG declares {total}",
+                    projection[i],
+                    c.len(),
+                )));
+            }
+        }
+
+        self.cur_rg_total = total;
+        self.cur_rg_columns = Some(cols);
+        self.cur_rg_filter_bitmap = Some(bitmap);
+        self.cur_rg_row = 0;
+        Ok(())
     }
 
     fn load_row_group_dense(&mut self, rg: usize) -> DfResult<()> {

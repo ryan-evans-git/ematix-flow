@@ -64,6 +64,47 @@ use crate::fast_parquet::{RangePredicate, extract_range_predicate};
 #[derive(Debug, Clone)]
 pub struct BridgeFilter {
     predicates: Vec<ColumnPredicate>,
+    /// Σ.E5 Phase 1.8: pre-computed pass-rate prediction. Set by the
+    /// provider's `scan()` from per-column stats; used by the
+    /// streaming reader to choose between parallel-bitmap+dense
+    /// (high-sel) and serial-bitmap+masked-decode (low-sel) paths.
+    /// 0.5 = unknown (no stats), conservative default.
+    predicted_pass_rate: f64,
+}
+
+impl BridgeFilter {
+    /// Σ.E5 Phase 1.8: combined pass-rate estimate across all
+    /// predicates (AND'd). `full_col_stats` is indexed by the
+    /// PROVIDER's full schema column index (the same index space
+    /// `ColumnPredicate::col_idx()` returns). Returns 0.5 if any
+    /// predicate's column lacks stats.
+    pub fn estimate_pass_rate(
+        &self,
+        full_col_stats: &[datafusion::common::stats::ColumnStatistics],
+    ) -> f64 {
+        let mut sel = 1.0_f64;
+        for p in &self.predicates {
+            let col = p.col_idx();
+            let Some(stats) = full_col_stats.get(col) else {
+                return 0.5;
+            };
+            sel *= p.estimate_pass_rate(stats);
+        }
+        sel.clamp(0.0, 1.0)
+    }
+
+    /// Σ.E5 Phase 1.8: store the predictor's verdict so the streaming
+    /// reader doesn't have to re-compute it per RG.
+    pub fn with_predicted_pass_rate(mut self, p: f64) -> Self {
+        self.predicted_pass_rate = p.clamp(0.0, 1.0);
+        self
+    }
+
+    /// Σ.E5 Phase 1.8: predicted pass rate (set via
+    /// `with_predicted_pass_rate`). 0.5 if not set (conservative).
+    pub fn predicted_pass_rate(&self) -> f64 {
+        self.predicted_pass_rate
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -295,6 +336,125 @@ impl ColumnPredicate {
             | ColumnPredicate::StringLike { col_idx, .. } => *col_idx,
             // ColumnPair touches two cols; return left as the "primary".
             ColumnPredicate::I32ColumnPair { left_col, .. } => *left_col,
+        }
+    }
+
+    /// Σ.E5 Phase 1.8 (2026-05-19): estimate the fraction of rows
+    /// that pass this predicate, given the column's min/max/distinct
+    /// stats from parquet metadata. Returns a value in [0.0, 1.0].
+    ///
+    /// Used by `load_row_group_masked` to dispatch between
+    /// parallel-bitmap+dense (high-sel) and serial-bitmap+masked-
+    /// decode (low-sel) paths. When stats are missing, returns a
+    /// conservative 0.5 (treat as "may be high-sel").
+    pub fn estimate_pass_rate(
+        &self,
+        stats: &datafusion::common::stats::ColumnStatistics,
+    ) -> f64 {
+        use datafusion::common::stats::Precision;
+
+        let extract_i32 = |p: &Precision<ScalarValue>| -> Option<i32> {
+            match p {
+                Precision::Exact(v) | Precision::Inexact(v) => match v {
+                    ScalarValue::Int32(Some(x)) => Some(*x),
+                    ScalarValue::Date32(Some(x)) => Some(*x),
+                    _ => None,
+                },
+                _ => None,
+            }
+        };
+        let extract_usize = |p: &Precision<usize>| -> Option<usize> {
+            match p {
+                Precision::Exact(v) | Precision::Inexact(v) => Some(*v),
+                _ => None,
+            }
+        };
+
+        match self {
+            ColumnPredicate::I32Range { clauses, .. } => {
+                let min = extract_i32(&stats.min_value);
+                let max = extract_i32(&stats.max_value);
+                let (Some(min), Some(max)) = (min, max) else {
+                    return 0.5;
+                };
+                if max <= min {
+                    return 0.5;
+                }
+                let range = (max - min) as f64;
+                // Combine clauses via AND — multiply selectivities
+                // (independence assumption — conservative).
+                let mut sel = 1.0_f64;
+                for c in clauses {
+                    let lit = c.literal_i32;
+                    let clause_sel = match c.op {
+                        Operator::Eq => 1.0 / ((max - min) as f64).max(1.0),
+                        Operator::NotEq => 1.0 - 1.0 / ((max - min) as f64).max(1.0),
+                        Operator::Lt => {
+                            if lit <= min { 0.0 }
+                            else if lit > max { 1.0 }
+                            else { (lit - min) as f64 / range }
+                        }
+                        Operator::LtEq => {
+                            if lit < min { 0.0 }
+                            else if lit >= max { 1.0 }
+                            else { ((lit - min + 1) as f64 / (range + 1.0)).min(1.0) }
+                        }
+                        Operator::Gt => {
+                            if lit >= max { 0.0 }
+                            else if lit < min { 1.0 }
+                            else { (max - lit) as f64 / range }
+                        }
+                        Operator::GtEq => {
+                            if lit > max { 0.0 }
+                            else if lit <= min { 1.0 }
+                            else { ((max - lit + 1) as f64 / (range + 1.0)).min(1.0) }
+                        }
+                        _ => 1.0, // unknown op — conservative
+                    };
+                    sel *= clause_sel;
+                }
+                sel.clamp(0.0, 1.0)
+            }
+            ColumnPredicate::I32In { values, .. } => {
+                let min = extract_i32(&stats.min_value);
+                let max = extract_i32(&stats.max_value);
+                let card = extract_usize(&stats.distinct_count);
+                let card = card.or_else(|| {
+                    match (min, max) {
+                        (Some(a), Some(b)) if b > a => Some((b - a + 1) as usize),
+                        _ => None,
+                    }
+                });
+                match card {
+                    Some(c) if c > 0 => (values.len() as f64 / c as f64).clamp(0.0, 1.0),
+                    _ => 0.5,
+                }
+            }
+            ColumnPredicate::StringEq { .. } => {
+                match extract_usize(&stats.distinct_count) {
+                    Some(c) if c > 0 => 1.0 / c as f64,
+                    _ => 0.1, // conservative default
+                }
+            }
+            ColumnPredicate::StringNotEq { .. } => {
+                match extract_usize(&stats.distinct_count) {
+                    Some(c) if c > 0 => 1.0 - 1.0 / c as f64,
+                    _ => 0.9,
+                }
+            }
+            ColumnPredicate::StringIn { values, .. } => {
+                match extract_usize(&stats.distinct_count) {
+                    Some(c) if c > 0 => (values.len() as f64 / c as f64).clamp(0.0, 1.0),
+                    _ => 0.2,
+                }
+            }
+            ColumnPredicate::StringLike { negated, .. } => {
+                // No cheap way to estimate LIKE; assume substring
+                // matches are uncommon. NOT LIKE inverts.
+                if *negated { 0.9 } else { 0.1 }
+            }
+            // Refused-for-pushdown shapes; never reach here in practice.
+            ColumnPredicate::F64Range { .. } | ColumnPredicate::I32ColumnPair { .. } => 0.5,
         }
     }
 
@@ -746,7 +906,10 @@ fn extract_bridge_filter(
     if merged.is_empty() {
         return None;
     }
-    Some(BridgeFilter { predicates: merged })
+    Some(BridgeFilter {
+        predicates: merged,
+        predicted_pass_rate: 0.5,
+    })
 }
 
 /// `TableProvider` that scans a single parquet file using the
@@ -1183,24 +1346,21 @@ impl TableProvider for EmatixFastParquetTableProvider {
         // dense fast path (dict_views: Vec<u128> cache + 16-byte
         // gather per row). Pushdown accepted for BridgeFilter-shaped
         // filters on all reader variants.
-        // Σ.E5 Phase 1.7 (2026-05-19, verified-NEG): parallel
-        // bitmap+dense always-dense path (drop masked decode entirely)
-        // regressed Q01 +114%, Q02 +10%, Q04 +21%, Q08 +8%, Q16 +29%.
-        // Geomean 0.86 → 0.948.
+        // Σ.E5 Phase 1.8 (2026-05-19, verified-NEG): stats-based
+        // predictor + per-filter Exact + parallel-bitmap+dense path
+        // STILL regresses Q01 +91% and broke Q16/Q04/Q08 even after
+        // gating Exact to a "useful-window" (0.05-0.85 predicted
+        // pass). Geomean 0.86 → 0.88-0.96.
         //
-        // Two compounding losses:
-        //   1. Thread oversubscription — n_cols + 1 threads per
-        //      partition × N partitions on a 14-core box. Cap was
-        //      meant to avoid this.
-        //   2. Removing masked decode hurts low-sel queries that
-        //      benefit from per-page popcount skip.
-        //
-        // Phase 1.8 (deferred): stats-based selectivity prediction.
-        // For each predicate, estimate pass rate from col min/max +
-        // literal. If predicted > 33%, take parallel bitmap+dense
-        // path. Else take serial-bitmap+masked path. Requires
-        // estimator implementation for I32Range / StringEq / StringIn
-        // / StringLike against `column_stats`.
+        // Pushdown stays Inexact for all shapes. The Phase 1.8
+        // predictor (`ColumnPredicate::estimate_pass_rate`,
+        // `BridgeFilter::estimate_pass_rate` /
+        // `with_predicted_pass_rate`) and parallel-bitmap+dense
+        // path (`load_row_group_parallel_bitmap_dense`) are retained
+        // as infrastructure — they work correctly, the cost model is
+        // what's wrong. Future work: profile WHY the parallel path
+        // doesn't beat no-pushdown for Q01-shape queries even with
+        // bitmap+dense overlap.
         let _exact_unused = (&self.column_has_no_nulls, );
         Ok(filters
             .iter()
@@ -1243,7 +1403,15 @@ impl TableProvider for EmatixFastParquetTableProvider {
         // dense path (DataFusion's residual FilterExec handles the
         // predicate).
         let bridge_filter =
-            extract_bridge_filter(filters, &self.schema, &self.column_is_dict_encoded);
+            extract_bridge_filter(filters, &self.schema, &self.column_is_dict_encoded)
+                .map(|bf| {
+                    // Σ.E5 Phase 1.8: compute predicted pass rate from
+                    // stats. Used by the streaming reader to dispatch
+                    // parallel-bitmap+dense (high-sel) vs serial-
+                    // bitmap+masked (low-sel).
+                    let p = bf.estimate_pass_rate(&self.column_stats);
+                    bf.with_predicted_pass_rate(p)
+                });
 
         // Project the per-column stats so the Exec reports stats in
         // projection order (matches the projected schema indices).
