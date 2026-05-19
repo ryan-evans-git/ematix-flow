@@ -744,6 +744,7 @@ impl ExecutionPlan for EmatixFastParquetExec {
                 row_groups,
                 budget,
                 partition_rows,
+                self.rg_num_rows.len(),
                 baseline,
             )
         } else {
@@ -866,6 +867,11 @@ fn build_streaming_partition_stream(
     // provider's cached per-RG counts. Drives the inline-vs-eager
     // reader auto-pick without a per-partition footer re-decode.
     partition_rows: usize,
+    // Total RG count of the file this partition reads from. Used to
+    // restrict page-streaming to single-RG files (dim tables) — multi-
+    // RG files like lineitem have 1M-row partitions that look small
+    // per-partition but lose to per-page sync cost when streamed.
+    file_total_rgs: usize,
     baseline: BaselineMetrics,
 ) -> futures_util::stream::BoxStream<'static, DfResult<RecordBatch>> {
     use futures_util::StreamExt;
@@ -901,21 +907,25 @@ fn build_streaming_partition_stream(
         .ok()
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
-    // Auto-pick threshold (0 = disabled). The cheap auto-pick is now
-    // wired (provider passes cached `rg_num_rows` → exec → here so no
-    // per-partition footer re-decode), but the inline reader's
-    // `StringViewPageStream` still uses the SLOW per-page byte-array
-    // path while the eager reader uses the fast dict-preserved
-    // gather. So engaging auto-pick today regresses string-heavy
-    // queries (Q19 +45% → +75% because part p_brand / p_type go
-    // through the slow path). Default off; opt-in for benching
-    // numeric-only files via `EMAT_INLINE_ROW_THRESHOLD=N`. Future
-    // work: port the dict-preserved fast path into
-    // `StringViewPageStream`, then flip the default to ~900_000.
+    // Auto-pick threshold: partitions of small single-RG *files*
+    // (dim tables) with < threshold rows route through the page-
+    // streaming reader. The dispatch (see below) also requires
+    // `file_total_rgs == 1`, which is defensive at 900k (lineitem
+    // RGs are 1M > 900k anyway) but blocks footguns if anyone raises
+    // the threshold above 1M.
+    //
+    // Threshold sweep at SF=1 (2026-05-19):
+    //   - 900k (default): geomean 0.9048 (current best)
+    //   - 1.8M + gate:   geomean 0.9151 — catches orders but Q04
+    //     regresses +29pp because Q04 needs full-table GROUP BY on
+    //     orderpriority. Orders is a coin-flip target (Q03 likes
+    //     page-streaming, Q04 hates it). Stay at 900k.
+    //
+    // Override via `EMAT_INLINE_ROW_THRESHOLD=N`; set to 0 to disable.
     let inline_row_threshold: usize = std::env::var("EMAT_INLINE_ROW_THRESHOLD")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
+        .unwrap_or(900_000);
 
     tokio::task::spawn_blocking(move || {
         let file = match ematix_parquet_io::ParquetFile::open(&path_buf) {
@@ -935,27 +945,37 @@ fn build_streaming_partition_stream(
         // Reader choice:
         //   1. EMAT_INLINE_STREAMING=1/0 forces inline on/off.
         //   2. EMAT_PAGE_STREAMING=1 forces the threaded page reader
-        //      (legacy A/B knob).
-        //   3. Otherwise auto-pick: inline for single-RG partitions
-        //      below `inline_row_threshold` rows (where eager full-RG
-        //      decode blocks downstream pipelining and streaming wins
-        //      first-batch latency); eager for everything else.
+        //      everywhere.
+        //   3. Otherwise auto-pick by per-query × per-mode bench
+        //      (2026-05-19 consolidation):
         //
-        // The auto-pick uses the cheap `partition_rows` count threaded
-        // from the Exec — no per-partition footer decode (an earlier
-        // version that called `file.metadata()` here cost ~4 pp on
-        // the 22-query geomean).
-        let use_inline = match force_inline {
-            Some(forced) => forced,
-            None => {
-                if force_page {
-                    false
-                } else {
-                    row_groups.len() == 1 && partition_rows < inline_row_threshold
-                }
-            }
+        //      * Small partitions (single RG, < threshold rows) →
+        //        PAGE-streaming. Q22 went +18.2% → +0.6% with this;
+        //        Q20 / Q17 / Q13 also flipped favourably. The
+        //        first-batch-latency win lets multi-table-join /
+        //        small-dim queries start downstream work earlier.
+        //      * Big partitions (lineitem, orders) → EAGER. Page-
+        //        streaming's per-page sync + shared decode-pool
+        //        contention regresses lineitem-heavy queries (Q19
+        //        +12.8pp, Q04 +10.3pp, Q06 +8.4pp, Q14 +7.2pp).
+        //
+        // Inline streaming is now opt-in only (`EMAT_INLINE_STREAMING=
+        // 1`); it lost on every query vs the page-streaming variant.
+        let use_inline = force_inline.unwrap_or(false);
+        let use_page_streaming = if force_page {
+            !use_inline
+        } else if !use_inline {
+            // Auto: route partitions of small *single-RG files* (dim
+            // tables: orders/part/partsupp/etc.) through the page
+            // reader. The `file_total_rgs == 1` gate excludes
+            // lineitem-style multi-RG files whose per-partition row
+            // count (1M) looks small but loses to per-page sync.
+            row_groups.len() == 1
+                && file_total_rgs == 1
+                && partition_rows < inline_row_threshold
+        } else {
+            false
         };
-        let use_page_streaming = force_page && !use_inline;
 
         if use_inline {
             use crate::emat_page_stream::EmatInlineStreamingReader;
