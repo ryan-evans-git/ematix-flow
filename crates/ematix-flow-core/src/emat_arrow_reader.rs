@@ -55,6 +55,11 @@ use arrow_schema::{DataType, SchemaRef};
 use datafusion::arrow::buffer::{Buffer, NullBuffer, ScalarBuffer};
 use datafusion::error::{DataFusionError, Result as DfResult};
 
+use crate::ematix_fast_parquet::BridgeFilter;
+use crate::ematix_parquet_bridge::{
+    filter_i32_column_to_bitmap, masked_decode_byte_array, masked_decode_f64, masked_decode_i32,
+    masked_decode_i64,
+};
 use ematix_parquet_codec::compression::{decompress_snappy_into, decompress_zstd_into};
 use ematix_parquet_codec::dict::decode_rle_dictionary_into;
 use ematix_parquet_codec::plain::{
@@ -174,6 +179,16 @@ pub struct EmatArrowBatchReaderBuilder {
     /// total concurrent thread count tracks the core count instead of
     /// the product.
     parallelism_budget: Option<usize>,
+    /// Σ.E5 (#516): when set, the reader runs in late-materialisation
+    /// mode — decode the filter column first, build a row bitmap, then
+    /// masked-decode each projected column. Lets the streaming reader
+    /// skip ~99% of decode work on selective queries (Q14, Q06) while
+    /// preserving the per-batch slicing shape.
+    filter: Option<BridgeFilter>,
+    /// File path. Needed for `filter_i32_column_to_bitmap` which opens
+    /// the file itself. Cached here at builder time to avoid threading
+    /// it through `load_row_group`.
+    path: Option<std::path::PathBuf>,
 }
 
 impl EmatArrowBatchReaderBuilder {
@@ -185,7 +200,20 @@ impl EmatArrowBatchReaderBuilder {
             row_groups: None,
             batch_size: DEFAULT_BATCH_SIZE,
             parallelism_budget: None,
+            filter: None,
+            path: None,
         }
+    }
+
+    /// Σ.E5 (#516): enable late-materialisation with the given filter.
+    /// The filter column is decoded first to build a row bitmap, then
+    /// projected columns are masked-decoded — pages with zero
+    /// bitmap-popcount are skipped entirely. Requires `with_path` so
+    /// the bitmap-build kernel can open the file.
+    pub fn with_filter(mut self, filter: BridgeFilter, path: std::path::PathBuf) -> Self {
+        self.filter = Some(filter);
+        self.path = Some(path);
+        self
     }
 
     pub fn with_projection(mut self, leaf_indices: Vec<usize>) -> Self {
@@ -291,6 +319,8 @@ impl EmatArrowBatchReaderBuilder {
             batch_size: self.batch_size,
             parallelism_budget: self.parallelism_budget,
             cached_md,
+            filter: self.filter,
+            path: self.path,
             cur_rg_idx: 0,
             cur_rg_columns: None,
             cur_rg_row: 0,
@@ -421,6 +451,12 @@ pub struct EmatArrowBatchReader {
     /// Profile-driven: ~10% of Q19 CPU was re-parsing the thrift
     /// footer on every `decode_one_column` call.
     cached_md: Arc<CachedFileMetadata>,
+    /// Σ.E5 (#516): late-mat filter. When set, `load_row_group`
+    /// branches into the masked-decode path.
+    filter: Option<BridgeFilter>,
+    /// File path. Set when `filter` is set — needed for the
+    /// path-based `filter_i32_column_to_bitmap` kernel.
+    path: Option<std::path::PathBuf>,
 
     // ---- iteration state ----
     /// Index into `row_groups`; `cur_rg_idx == row_groups.len()`
@@ -463,9 +499,123 @@ impl EmatArrowBatchReader {
     /// column is ~8 MB and 7 concurrent columns peak at ~50-100 MB —
     /// well inside budget. At SF=10+ this is worth revisiting (chunked
     /// or page-streaming decode is the next lever).
+    /// Σ.E5 (#516): late-mat variant of `load_row_group`. Decodes the
+    /// filter column first to build a row bitmap, then masked-decodes
+    /// each projected column in parallel. Sets `cur_rg_total` to the
+    /// bitmap popcount so the subsequent batch slicing emits only
+    /// surviving rows. Pages whose bitmap-popcount is zero are skipped
+    /// inside `masked_decode_*`.
+    fn load_row_group_masked(
+        &mut self,
+        rg: usize,
+        filter: BridgeFilter,
+        path: std::path::PathBuf,
+    ) -> DfResult<()> {
+        // 1. Build the row bitmap from the filter column.
+        let filter_eval = filter.clone();
+        let (bitmap, _total) =
+            filter_i32_column_to_bitmap(&path, rg, filter.parquet_col_idx(), move |v: i32| {
+                filter_eval.eval_i32(v)
+            })?;
+        let popcount: usize = bitmap.iter().map(|b| b.count_ones() as usize).sum();
+
+        // 2. Parallel masked-decode of each projected column. Same
+        //    scoped-thread shape as the dense path — distinct
+        //    PageWalker per thread over shared ParquetFile (Sync).
+        let projection = &self.projection;
+        let schema = &self.arrow_schema;
+        let file = &self.file;
+        let n_cols = projection.len();
+        let cap = self.parallelism_budget.unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|p| p.get())
+                .unwrap_or(1)
+        });
+        let max_threads = cap.max(1).min(n_cols.max(1));
+
+        let cols: Vec<DecodedColumn> = if max_threads <= 1 || n_cols <= 1 {
+            let mut out = Vec::with_capacity(n_cols);
+            for (proj_idx, &leaf) in projection.iter().enumerate() {
+                let target = schema.field(proj_idx).data_type();
+                out.push(masked_decode_one_column(
+                    file, rg, leaf, &bitmap, popcount, target,
+                )?);
+            }
+            out
+        } else {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            let next = AtomicUsize::new(0);
+            let bitmap_ref = &bitmap;
+            let merged: Vec<(usize, DfResult<DecodedColumn>)> = std::thread::scope(|s| {
+                let mut handles = Vec::with_capacity(max_threads);
+                for _ in 0..max_threads {
+                    let next = &next;
+                    handles.push(s.spawn(
+                        move || -> Vec<(usize, DfResult<DecodedColumn>)> {
+                            let mut local: Vec<(usize, DfResult<DecodedColumn>)> = Vec::new();
+                            loop {
+                                let i = next.fetch_add(1, Ordering::Relaxed);
+                                if i >= n_cols {
+                                    break;
+                                }
+                                let leaf = projection[i];
+                                let target = schema.field(i).data_type();
+                                let r = masked_decode_one_column(
+                                    file, rg, leaf, bitmap_ref, popcount, target,
+                                );
+                                local.push((i, r));
+                            }
+                            local
+                        },
+                    ));
+                }
+                let mut all = Vec::with_capacity(n_cols);
+                for h in handles {
+                    all.extend(h.join().expect("masked decode thread panic"));
+                }
+                all
+            });
+
+            let mut slots: Vec<Option<DfResult<DecodedColumn>>> =
+                (0..n_cols).map(|_| None).collect();
+            for (i, r) in merged {
+                slots[i] = Some(r);
+            }
+            let mut out = Vec::with_capacity(n_cols);
+            for (i, slot) in slots.into_iter().enumerate() {
+                let r = slot
+                    .ok_or_else(|| ext(format!("column {i} masked-decode slot never filled")))?;
+                out.push(r?);
+            }
+            out
+        };
+
+        for (i, c) in cols.iter().enumerate() {
+            if c.len() != popcount {
+                return Err(ext(format!(
+                    "RG {rg} masked: column {i} (leaf {}) decoded {} rows but bitmap popcount = {popcount}",
+                    self.projection[i],
+                    c.len(),
+                )));
+            }
+        }
+
+        self.cur_rg_total = popcount;
+        self.cur_rg_columns = Some(cols);
+        self.cur_rg_row = 0;
+        Ok(())
+    }
+
     fn load_row_group(&mut self, rg: usize) -> DfResult<()> {
         // Σ.E5.6: use the cached metadata snapshot — no thrift re-parse.
         self.cur_rg_total = self.cached_md.row_groups[rg].num_rows as usize;
+
+        // Σ.E5 (#516): late-mat path — when a filter is set, decode the
+        // filter column to a bitmap, then masked-decode each projected
+        // column. Pages with zero bitmap-popcount are skipped entirely.
+        if let (Some(filter), Some(path)) = (&self.filter, &self.path) {
+            return self.load_row_group_masked(rg, filter.clone(), path.clone());
+        }
 
         let projection = &self.projection;
         let schema = &self.arrow_schema;
@@ -630,6 +780,117 @@ impl Iterator for EmatArrowBatchReader {
             self.cur_rg_row += n;
             return Some(self.slice_batch(start, n));
         }
+    }
+}
+
+// ============================================================
+// Per-column masked decode (Σ.E5 #516 late-mat path)
+// ============================================================
+
+/// Decode one projected column applying the row bitmap. Pages whose
+/// bitmap-popcount is zero are skipped inside the underlying
+/// `masked_decode_*` helpers (Π.10). Returns a `DecodedColumn` with
+/// exactly `popcount` rows — same shape as the dense decode so the
+/// downstream `slice_batch` path works unchanged.
+fn masked_decode_one_column(
+    file: &ParquetFile,
+    rg: usize,
+    leaf: usize,
+    bitmap: &[u8],
+    popcount: usize,
+    target: &DataType,
+) -> DfResult<DecodedColumn> {
+    match target {
+        DataType::Int32 | DataType::Date32 => {
+            let v = masked_decode_i32(file, rg, leaf, bitmap)
+                .map_err(|e| ext(format!("masked i32 leaf {leaf}: {e}")))?;
+            if v.len() != popcount {
+                return Err(ext(format!(
+                    "masked i32 leaf {leaf}: got {} rows, expected {popcount}",
+                    v.len()
+                )));
+            }
+            Ok(DecodedColumn::Int32 {
+                data: Buffer::from_vec(v),
+                n_rows: popcount,
+            })
+        }
+        DataType::Int64 => {
+            let v = masked_decode_i64(file, rg, leaf, bitmap)
+                .map_err(|e| ext(format!("masked i64 leaf {leaf}: {e}")))?;
+            if v.len() != popcount {
+                return Err(ext(format!(
+                    "masked i64 leaf {leaf}: got {} rows, expected {popcount}",
+                    v.len()
+                )));
+            }
+            Ok(DecodedColumn::Int64 {
+                data: Buffer::from_vec(v),
+                n_rows: popcount,
+            })
+        }
+        DataType::Float64 => {
+            let v = masked_decode_f64(file, rg, leaf, bitmap)
+                .map_err(|e| ext(format!("masked f64 leaf {leaf}: {e}")))?;
+            if v.len() != popcount {
+                return Err(ext(format!(
+                    "masked f64 leaf {leaf}: got {} rows, expected {popcount}",
+                    v.len()
+                )));
+            }
+            Ok(DecodedColumn::Float64 {
+                data: Buffer::from_vec(v),
+                n_rows: popcount,
+            })
+        }
+        DataType::Utf8View => {
+            let vals = masked_decode_byte_array(file, rg, leaf, bitmap)
+                .map_err(|e| ext(format!("masked byte_array leaf {leaf}: {e}")))?;
+            if vals.len() != popcount {
+                return Err(ext(format!(
+                    "masked byte_array leaf {leaf}: got {} rows, expected {popcount}",
+                    vals.len()
+                )));
+            }
+            // Pack all bytes into one backing buffer, build views
+            // pointing into it. Same shape as the dense StringView
+            // path's first data_buffers slot.
+            let total_bytes: usize = vals.iter().map(|v| v.len()).sum();
+            let mut packed: Vec<u8> = Vec::with_capacity(total_bytes);
+            let mut views: Vec<u128> = Vec::with_capacity(popcount);
+            let block_id: u32 = 0;
+            for v in &vals {
+                let off = packed.len() as u32;
+                packed.extend_from_slice(v);
+                views.push(make_view(v, block_id, off));
+            }
+            Ok(DecodedColumn::StringView {
+                views: Buffer::from_vec(views),
+                n_rows: popcount,
+                data_buffers: vec![Buffer::from_vec(packed)],
+            })
+        }
+        DataType::Utf8 => {
+            let vals = masked_decode_byte_array(file, rg, leaf, bitmap)
+                .map_err(|e| ext(format!("masked byte_array leaf {leaf}: {e}")))?;
+            if vals.len() != popcount {
+                return Err(ext(format!(
+                    "masked byte_array leaf {leaf}: got {} rows, expected {popcount}",
+                    vals.len()
+                )));
+            }
+            let total_bytes: usize = vals.iter().map(|v| v.len()).sum();
+            let mut sb = StringBuilder::with_capacity(popcount, total_bytes);
+            for v in &vals {
+                let s = std::str::from_utf8(v)
+                    .map_err(|e| ext(format!("masked Utf8 leaf {leaf}: invalid UTF-8: {e}")))?;
+                sb.append_value(s);
+            }
+            Ok(DecodedColumn::Utf8(Arc::new(sb.finish())))
+        }
+        other => Err(ext(format!(
+            "masked decode: unsupported target type {other:?} for leaf {leaf}"
+        ))),
     }
 }
 

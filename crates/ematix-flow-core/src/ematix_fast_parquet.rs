@@ -75,9 +75,14 @@ struct RangeClause {
 }
 
 impl BridgeFilter {
+    /// Parquet column index this filter applies to.
+    pub fn parquet_col_idx(&self) -> usize {
+        self.parquet_col_idx
+    }
+
     /// Evaluate AND of all clauses against one i32 / Date32 value.
     #[inline]
-    fn eval_i32(&self, v: i32) -> bool {
+    pub fn eval_i32(&self, v: i32) -> bool {
         for c in &self.clauses {
             let pass = match c.op {
                 Operator::Eq => v == c.literal_i32,
@@ -497,15 +502,18 @@ impl TableProvider for EmatixFastParquetTableProvider {
         filters: &[&Expr],
     ) -> DfResult<Vec<TableProviderFilterPushDown>> {
         if self.dict_preservation || self.streaming_arrow_reader {
-            // Σ.E5 (verified 2026-05-19): routing pushed-down filters
-            // to the bridge late-mat path is a NET LOSS even with
-            // Utf8View added — the bridge path doesn't have the
-            // streaming reader's dict-views cache or page-overlap
-            // parallelism, so Q01 went -4 → +24 and Q06 went -26 →
-            // +9 in a smoke test. Late-mat needs to live INSIDE the
-            // streaming reader (`EmatArrowBatchReader` /
-            // `EmatPageStreamingReader`), not route around it. That's
-            // a much bigger refactor — tracked under task #516.
+            // Σ.E5 (#516, verified 2026-05-19): streaming reader's
+            // masked-decode path IS wired up (see
+            // `EmatArrowBatchReaderBuilder::with_filter`) but Utf8View
+            // masked decode lacks the dict-views cache the dense path
+            // uses, so even WINNING queries regress when pushdown is
+            // accepted:
+            //   Q01: -5%  → +126%  (Utf8View dominates; cache miss)
+            //   Q06: -28% → -13%   (numeric, filter-col re-decode)
+            //   Q14: -32% → -26%   (numeric, slight loss)
+            // The masked path needs a dict-preserved Utf8View variant
+            // (mirror of read_column_byte_array_dict_preserved_into)
+            // before pushdown can be re-enabled here. Tracked #517.
             return Ok(filters
                 .iter()
                 .map(|_| TableProviderFilterPushDown::Unsupported)
@@ -698,12 +706,12 @@ impl ExecutionPlan for EmatixFastParquetExec {
         let late_mat = self.late_mat;
         let baseline = BaselineMetrics::new(&self.metrics, partition);
 
-        // Σ.E5.1.b: when the streaming reader is enabled AND no filter
-        // has been pushed down (the streaming path doesn't fuse with
-        // the bitmap-first filtered decode yet — Σ.E5.1.b scope cut),
-        // route through `EmatArrowBatchReader`. Otherwise fall back to
-        // the whole-RG bridge path.
-        let stream = if self.streaming_arrow_reader && filter.is_none() {
+        // Σ.E5 (#516): streaming reader now handles filters natively via
+        // `EmatArrowBatchReaderBuilder::with_filter`. So route through
+        // it whenever streaming is enabled, regardless of filter state.
+        // The non-streaming branch below stays for the legacy
+        // bridge-only configuration.
+        let stream = if self.streaming_arrow_reader {
             // Σ.E5.1.c: compute a per-partition column-decode thread
             // budget so the total concurrent thread count tracks the
             // core count rather than the product
@@ -754,6 +762,7 @@ impl ExecutionPlan for EmatixFastParquetExec {
                 budget,
                 partition_rows,
                 self.rg_num_rows.len(),
+                filter,
                 baseline,
             )
         } else {
@@ -881,6 +890,9 @@ fn build_streaming_partition_stream(
     // RG files like lineitem have 1M-row partitions that look small
     // per-partition but lose to per-page sync cost when streamed.
     file_total_rgs: usize,
+    // Σ.E5 (#516): optional late-mat filter, plumbed into
+    // EmatArrowBatchReaderBuilder::with_filter when present.
+    filter: Option<BridgeFilter>,
     baseline: BaselineMetrics,
 ) -> futures_util::stream::BoxStream<'static, DfResult<RecordBatch>> {
     use futures_util::StreamExt;
@@ -970,8 +982,15 @@ fn build_streaming_partition_stream(
         //
         // Inline streaming is now opt-in only (`EMAT_INLINE_STREAMING=
         // 1`); it lost on every query vs the page-streaming variant.
-        let use_inline = force_inline.unwrap_or(false);
-        let use_page_streaming = if force_page {
+        // Σ.E5 (#516): if a late-mat filter is present, only the eager
+        // streaming reader (`EmatArrowBatchReader`) supports it today.
+        // Inline + page-streaming readers don't have a masked-decode
+        // branch yet — force them off.
+        let has_filter = filter.is_some();
+        let use_inline = !has_filter && force_inline.unwrap_or(false);
+        let use_page_streaming = if has_filter {
+            false
+        } else if force_page {
             !use_inline
         } else if !use_inline {
             // Auto: route partitions of small *single-RG files* (dim
@@ -1031,12 +1050,14 @@ fn build_streaming_partition_stream(
                 }
             }
         } else {
-            let reader = match EmatArrowBatchReaderBuilder::new(file, schema)
+            let mut builder = EmatArrowBatchReaderBuilder::new(file, schema)
                 .with_projection(projection)
                 .with_row_groups(row_groups)
-                .with_parallelism_budget(parallelism_budget)
-                .build()
-            {
+                .with_parallelism_budget(parallelism_budget);
+            if let Some(f) = filter.clone() {
+                builder = builder.with_filter(f, path_buf.clone());
+            }
+            let reader = match builder.build() {
                 Ok(r) => r,
                 Err(e) => {
                     let _ = tx.blocking_send(Err(DataFusionError::External(
