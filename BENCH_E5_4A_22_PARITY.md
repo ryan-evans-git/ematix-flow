@@ -12,36 +12,36 @@ Methodology: median ± σ across 10 timed trials after 3 warmups, single-machine
 
 | Query | FastParquet (ms) | EmatixFastParquet (ms) | Δ% (emat vs fast) | Verdict |
 |------:|-----------------:|-----------------------:|------------------:|:--------|
-| Q01  | 49.01 ± 8.72 | 52.90 ± 8.18 | +7.9 | Regression |
-| Q02  | 10.99 ± 0.65 | 9.10 ± 0.52 | -17.2 | EmatFaster |
-| Q03  | 22.85 ± 1.81 | 14.61 ± 1.13 | -36.1 | EmatFaster |
-| Q04  | 17.39 ± 1.65 | 14.03 ± 1.03 | -19.3 | EmatFaster |
-| Q05  | 27.67 ± 1.57 | 26.46 ± 4.11 | -4.4 | within ±5% |
-| Q06  | 14.41 ± 1.36 | 11.66 ± 1.07 | -19.1 | EmatFaster |
-| Q07  | 35.79 ± 2.07 | 35.00 ± 1.17 | -2.2 | within ±5% |
-| Q08  | 26.68 ± 1.03 | 20.56 ± 2.12 | -23.0 | EmatFaster |
-| Q09  | 34.88 ± 3.34 | 31.33 ± 2.91 | -10.2 | EmatFaster |
-| Q10  | 37.05 ± 1.10 | 29.83 ± 1.59 | -19.5 | EmatFaster |
-| Q11  | 7.48 ± 0.16 | 5.84 ± 0.23 | -21.9 | EmatFaster |
-| Q12  | 21.32 ± 1.26 | 18.03 ± 1.16 | -15.4 | EmatFaster |
-| Q13  | 41.98 ± 1.12 | 52.64 ± 0.71 | +25.4 | Regression |
-| Q14  | 16.80 ± 0.77 | 11.83 ± 1.74 | -29.6 | EmatFaster |
-| Q15  | 23.35 ± 0.73 | 15.84 ± 0.98 | -32.1 | EmatFaster |
-| Q16  | 8.37 ± 0.10 | 9.25 ± 0.11 | +10.5 | Regression |
-| Q17  | 39.50 ± 1.93 | 35.17 ± 0.69 | -11.0 | EmatFaster |
-| Q18  | 54.04 ± 3.06 | 51.41 ± 8.45 | -4.9 | within ±5% |
-| Q19  | 20.94 ± 0.50 | 17.98 ± 0.76 | -14.2 | EmatFaster |
-| Q20  | 17.66 ± 1.50 | 16.55 ± 0.96 | -6.3 | EmatFaster |
-| Q21  | 53.28 ± 6.66 | 39.90 ± 3.15 | -25.1 | EmatFaster |
-| Q22  | 8.18 ± 0.23 | 8.09 ± 0.16 | -1.1 | within ±5% |
+| Q01  | 31.22 ± 2.74 | 31.44 ± 1.03 | +0.7 | within ±5% |
+| Q02  | 9.93 ± 2.81 | 8.11 ± 3.27 | -18.3 | EmatFaster |
+| Q03  | 19.63 ± 0.43 | 13.19 ± 0.81 | -32.8 | EmatFaster |
+| Q04  | 15.85 ± 0.82 | 12.63 ± 1.00 | -20.3 | EmatFaster |
+| Q05  | 24.74 ± 1.00 | 21.79 ± 2.86 | -12.0 | EmatFaster |
+| Q06  | 11.47 ± 0.12 | 9.95 ± 0.75 | -13.3 | EmatFaster |
+| Q07  | 39.68 ± 8.88 | 35.66 ± 6.35 | -10.1 | EmatFaster |
+| Q08  | 24.88 ± 0.73 | 18.01 ± 0.48 | -27.6 | EmatFaster |
+| Q09  | 30.05 ± 0.77 | 29.18 ± 7.75 | -2.9 | within ±5% |
+| Q10  | 34.35 ± 7.56 | 28.49 ± 4.32 | -17.1 | EmatFaster |
+| Q11  | 7.50 ± 0.32 | 5.19 ± 0.27 | -30.8 | EmatFaster |
+| Q12  | 20.56 ± 0.88 | 15.77 ± 0.36 | -23.3 | EmatFaster |
+| Q13  | 41.38 ± 1.72 | 52.54 ± 1.02 | +27.0 | Regression |
+| Q14  | 16.93 ± 0.61 | 11.81 ± 0.59 | -30.3 | EmatFaster |
+| Q15  | 22.51 ± 0.95 | 15.93 ± 0.85 | -29.2 | EmatFaster |
+| Q16  | 8.84 ± 0.25 | 9.77 ± 0.57 | +10.6 | Regression |
+| Q17  | 37.89 ± 1.02 | 35.12 ± 2.06 | -7.3 | EmatFaster |
+| Q18  | 55.57 ± 3.40 | 47.45 ± 5.29 | -14.6 | EmatFaster |
+| Q19  | 21.41 ± 0.39 | 18.02 ± 0.98 | -15.8 | EmatFaster |
+| Q20  | 19.32 ± 1.79 | 16.44 ± 0.49 | -14.9 | EmatFaster |
+| Q21  | 50.75 ± 4.45 | 48.64 ± 6.91 | -4.2 | within ±5% |
+| Q22  | 8.23 ± 0.14 | 8.22 ± 1.01 | -0.1 | within ±5% |
 
-**Top-line:** 4 parity, 15 EmatFaster, 3 Regression (paired queries: 22). geomean(emat / fast) = **0.8666** (target ≤ 1.02 per E5.4 acceptance).
+**Top-line:** 4 parity, 16 EmatFaster, 2 Regression (paired queries: 22). geomean(emat / fast) = **0.8589** (target ≤ 1.02 per E5.4 acceptance).
 
 ## 2. Per-query analysis
 
 Regressions > 5%, ordered by magnitude. Threshold for EXPLAIN ANALYZE deep-dive is > 10%; queries between 5% and 10% are listed for completeness but not individually attributed unless they cluster on a shared root cause.
 
-### Q13 — +25.4% (41.98 → 52.64 ms)
+### Q13 — +27.0% (41.38 → 52.54 ms)
 
 _Deep-dive required (> 10% regression). Likely candidates, ranked by prior data from §3 capability gaps:_
 
@@ -54,7 +54,7 @@ _Confirm with `EXPLAIN ANALYZE`: count of rows emerging from the scan node shoul
 
 4. **Different operator selection by the planner** — if `partition_statistics` differences flip a join from hash to nested loop or vice versa, this is the symptom. EXPLAIN-diff the two plans.
 
-### Q16 — +10.5% (8.37 → 9.25 ms)
+### Q16 — +10.6% (8.84 → 9.77 ms)
 
 _Deep-dive required (> 10% regression). Likely candidates, ranked by prior data from §3 capability gaps:_
 
@@ -66,10 +66,6 @@ _Confirm with `EXPLAIN ANALYZE`: count of rows emerging from the scan node shoul
 3. **Per-column decode cost on specific column types** — primarily Decimal128 (none in TPC-H), Int96, FLBA, nested. TPC-H is all Int32/Int64/Float64/Date32/Utf8; if a regression shows here it's in the Utf8 → Utf8View streaming path (Σ.E5.1.d). Cross-check with the codec-layer `bench_decode` in ematix-parquet.
 
 4. **Different operator selection by the planner** — if `partition_statistics` differences flip a join from hash to nested loop or vice versa, this is the symptom. EXPLAIN-diff the two plans.
-
-### Q01 — +7.9% (49.01 → 52.90 ms)
-
-Within the 5–10% band. Most likely cause: cumulative effect of filter-pushdown-disabled + unknown partition stats on a query whose hot path is dominated by aggregation, not scan. No deep-dive yet unless it clusters with a > 10% regression.
 
 ## 3. Capability gaps in EmatixFastParquet vs FastParquet
 
@@ -89,7 +85,7 @@ Gathered from a read of `src/ematix_fast_parquet.rs` and confirmed against the �
 
 ## 4. Migration sequencing recommendation
 
-**Close gaps first** — 3 query/queries regressed by more than 5% (geomean = 0.8666, target ≤ 1.02). Recommended ordered sub-phases:
+**Close gaps first** — 2 query/queries regressed by more than 5% (geomean = 0.8589, target ≤ 1.02). Recommended ordered sub-phases:
 
 1. **E5.4.b — restore filter pushdown on the streaming reader path** (highest impact). Re-enable `supports_filters_pushdown` for Int32/Date32 range predicates and fuse with the streaming bitmap-first decode. Expected to close Q06, Q14, Q19 and any other selective-filter query in the regression list.
 2. **E5.4.c — typed `partition_statistics`** (medium impact). Decode `ematix_parquet_format::Statistics` for the 5 physical types and report typed min/max + null_count from `EmatixFastParquetExec::partition_statistics`. Re-runs the planner's cardinality estimates on the EmatixFastParquet side; expected to close the join-heavy regressions (Q05, Q07, Q09, Q21).

@@ -3732,6 +3732,7 @@ dependencies = [
  "arrow-json",
  "arrow-schema",
  "arrow-select",
+ "async-channel",
  "async-trait",
  "aws-config",
  "aws-credential-types",

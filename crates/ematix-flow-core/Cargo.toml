@@ -12,6 +12,9 @@ description = "Rust core for ematix-flow: declarative table management + load st
 name = "ematix_flow_core"
 
 [dependencies]
+# Σ.G.2f.3: MPMC channel for FusedAggregateExec's direct fan-out
+# (skips RepartitionExec's per-output-partition mpsc setup).
+async-channel = "2"
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
