@@ -1584,7 +1584,35 @@ fn build_streaming_partition_stream(
         // Inline + page-streaming readers don't have a masked-decode
         // branch yet — force them off.
         let has_filter = filter.is_some();
-        let use_inline = !has_filter && force_inline.unwrap_or(false);
+        // Σ.E5 (2026-05-19): auto-inline for large multi-RG partitions.
+        //
+        // The eager reader decodes a whole RG before emitting any batch.
+        // At SF=1 each RG decodes in ~5ms so the pipeline stall is
+        // small. At SF=10 each RG takes ~50ms and 4 RGs/partition,
+        // which stalls heavy downstream operators (Q18's nested hash
+        // agg over lineitem).
+        //
+        // Cut: partition_rows >= 2M AND row_groups.len() > 1
+        //   - SF=1 lineitem: 6 RGs / 6 partitions = 1 RG, 1M rows each
+        //     → NO trigger (preserves SF=1 baseline)
+        //   - SF=10 lineitem: 60 RGs / 14 partitions = 4 RGs, 4.3M each
+        //     → TRIGGERS (Q18: 1602ms → 1543ms; Q06/Q14/Q19 also win)
+        //
+        // Q18 is only partially closed (+52% → ~+49% with this rule;
+        // force-inline-everywhere went to +13.7%). The full close
+        // requires also routing SF=10 orders (~1M rows/partition, 1 RG
+        // each) through inline, which conflicts with SF=1's small dim
+        // tables. Filed for future investigation.
+        //
+        // Override with EMAT_LARGE_PARTITION_ROWS=N.
+        let large_partition_threshold: usize = std::env::var("EMAT_LARGE_PARTITION_ROWS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(2_000_000);
+        let auto_inline = !has_filter
+            && row_groups.len() > 1
+            && partition_rows >= large_partition_threshold;
+        let use_inline = !has_filter && force_inline.unwrap_or(auto_inline);
         let use_page_streaming = if has_filter {
             false
         } else if force_page {
