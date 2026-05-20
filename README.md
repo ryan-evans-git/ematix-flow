@@ -236,6 +236,11 @@ class kafka_avro:
     schema_registry = "sr_prod"      # name reference
 ```
 
+Today's `kind = "schema_registry"` covers Confluent-style wire format
+(Confluent SR, Apicurio Confluent-compat). **AWS Glue Schema Registry**
+is on the roadmap (different framing: `0x03` header byte + UUID +
+compression byte) and lands in a follow-on release.
+
 ---
 
 <a id="backends"></a>
@@ -284,7 +289,7 @@ take the `INSERT … SELECT` fast path automatically.
   `x-dead-letter-exchange`, Pub/Sub subscription
   `dead_letter_policy`).
 - **Schema Registry.** Avro and Protobuf decode/encode via
-  Confluent SR or Apicurio.
+  Confluent SR or Apicurio. AWS Glue Schema Registry on the roadmap.
 
 ### Cross-backend reads + writes
 
