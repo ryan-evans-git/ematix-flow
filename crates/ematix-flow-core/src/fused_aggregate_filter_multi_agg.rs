@@ -87,9 +87,23 @@ use crate::fused_jit::{AggExpr, Clause, ClauseOp, ColumnTy};
 #[derive(Debug, Clone, Copy)]
 pub enum GroupKeyKind {
     /// Read the first byte of the column's `StringViewArray` per row.
+    /// Lossy by design — only correct for single-character grouping
+    /// (TPC-H Q01's `l_returnflag`/`l_linestatus`). Multi-char string
+    /// columns must arrive as `Dictionary(UInt32)` via dict-preservation.
     Utf8ViewFirstByte,
     /// Read the u32 code from a `DictionaryArray<UInt32Type>` per row.
     DictionaryU32,
+    /// Σ.H.1b: 8-byte primitive group key for `Int64`.
+    Int64,
+    /// Σ.H.1b: 4-byte primitive group key for `Int32`.
+    Int32,
+    /// Σ.H.1b: 4-byte primitive group key for `Date32`
+    /// (days-since-epoch i32 value).
+    Date32,
+    /// Σ.H.1b: 8-byte primitive group key for `Float64`. Bit-cast to
+    /// `u64` for hash bytes — NaN/-0.0 collide as per their bit
+    /// pattern. Rare in OLAP; included for Q10's `c_acctbal`.
+    Float64,
 }
 
 /// Runtime-configured spec. Owned values; cloning is a refcount bump
@@ -211,6 +225,10 @@ impl FilterMultiAggSpec {
                 {
                     DataType::Dictionary(key_ty.clone(), val_ty.clone())
                 }
+                (GroupKeyKind::Int64, DataType::Int64) => DataType::Int64,
+                (GroupKeyKind::Int32, DataType::Int32) => DataType::Int32,
+                (GroupKeyKind::Date32, DataType::Date32) => DataType::Date32,
+                (GroupKeyKind::Float64, DataType::Float64) => DataType::Float64,
                 _ => {
                     return Err(DataFusionError::Plan(format!(
                         "FilterMultiAggSpec: group key `{name}` has type {actual:?}, \
@@ -367,6 +385,53 @@ impl AggregateSpec for FilterMultiAggSpec {
                         .collect();
                     key_columns.push(Arc::new(StringArray::from(strings)) as ArrayRef);
                 }
+                GroupKeyKind::Int64 => {
+                    let off = packed_key_offset(&self.group_keys, col_idx);
+                    let vals: Vec<i64> = entries
+                        .iter()
+                        .map(|(k, _)| {
+                            i64::from_le_bytes([
+                                k[off], k[off + 1], k[off + 2], k[off + 3],
+                                k[off + 4], k[off + 5], k[off + 6], k[off + 7],
+                            ])
+                        })
+                        .collect();
+                    key_columns.push(Arc::new(Int64Array::from(vals)) as ArrayRef);
+                }
+                GroupKeyKind::Int32 => {
+                    let off = packed_key_offset(&self.group_keys, col_idx);
+                    let vals: Vec<i32> = entries
+                        .iter()
+                        .map(|(k, _)| {
+                            i32::from_le_bytes([k[off], k[off + 1], k[off + 2], k[off + 3]])
+                        })
+                        .collect();
+                    key_columns.push(Arc::new(Int32Array::from(vals)) as ArrayRef);
+                }
+                GroupKeyKind::Date32 => {
+                    let off = packed_key_offset(&self.group_keys, col_idx);
+                    let vals: Vec<i32> = entries
+                        .iter()
+                        .map(|(k, _)| {
+                            i32::from_le_bytes([k[off], k[off + 1], k[off + 2], k[off + 3]])
+                        })
+                        .collect();
+                    key_columns.push(Arc::new(Date32Array::from(vals)) as ArrayRef);
+                }
+                GroupKeyKind::Float64 => {
+                    let off = packed_key_offset(&self.group_keys, col_idx);
+                    let vals: Vec<f64> = entries
+                        .iter()
+                        .map(|(k, _)| {
+                            let bits = u64::from_le_bytes([
+                                k[off], k[off + 1], k[off + 2], k[off + 3],
+                                k[off + 4], k[off + 5], k[off + 6], k[off + 7],
+                            ]);
+                            f64::from_bits(bits)
+                        })
+                        .collect();
+                    key_columns.push(Arc::new(Float64Array::from(vals)) as ArrayRef);
+                }
                 GroupKeyKind::DictionaryU32 => {
                     // Packed key carries the u32 code (4 bytes). Map
                     // back to string via the captured dict values.
@@ -511,6 +576,10 @@ impl AggregateSpec for FilterMultiAggSpec {
                 (GroupKeyKind::Utf8ViewFirstByte, DataType::Utf8View) => {}
                 (GroupKeyKind::DictionaryU32, DataType::Dictionary(kt, _))
                     if **kt == DataType::UInt32 => {}
+                (GroupKeyKind::Int64, DataType::Int64) => {}
+                (GroupKeyKind::Int32, DataType::Int32) => {}
+                (GroupKeyKind::Date32, DataType::Date32) => {}
+                (GroupKeyKind::Float64, DataType::Float64) => {}
                 _ => {
                     return Err(DataFusionError::Plan(format!(
                         "FilterMultiAggSpec: group key `{}` has type {:?}",
@@ -527,13 +596,22 @@ impl AggregateSpec for FilterMultiAggSpec {
 /// Compute the byte offset of group-key column `col_idx`'s packed
 /// representation in the composite key buffer.
 fn packed_key_offset(keys: &[GroupKeyColumn], col_idx: usize) -> usize {
-    keys[..col_idx]
-        .iter()
-        .map(|k| match k.kind {
-            GroupKeyKind::Utf8ViewFirstByte => 1,
-            GroupKeyKind::DictionaryU32 => 4,
-        })
-        .sum()
+    keys[..col_idx].iter().map(|k| key_byte_width(k.kind)).sum()
+}
+
+/// Byte width of one packed group-key cell in the composite key
+/// buffer. Σ.H.1b grew this from a hard-coded 1/4 table to a function
+/// so the new primitive kinds (Int32/Date32 = 4, Int64/Float64 = 8)
+/// extend cleanly.
+fn key_byte_width(kind: GroupKeyKind) -> usize {
+    match kind {
+        GroupKeyKind::Utf8ViewFirstByte => 1,
+        GroupKeyKind::DictionaryU32 => 4,
+        GroupKeyKind::Int32 => 4,
+        GroupKeyKind::Date32 => 4,
+        GroupKeyKind::Int64 => 8,
+        GroupKeyKind::Float64 => 8,
+    }
 }
 
 /// Typed accessor cached per batch so the hot loop avoids repeated
@@ -542,6 +620,10 @@ enum GroupKeyAccessor<'a> {
     Utf8View(&'a StringViewArray),
     BinaryView(&'a BinaryViewArray),
     DictU32Utf8(&'a DictionaryArray<UInt32Type>, &'a StringArray),
+    Int64(&'a Int64Array),
+    Int32(&'a Int32Array),
+    Date32(&'a Date32Array),
+    Float64(&'a Float64Array),
 }
 
 impl<'a> GroupKeyAccessor<'a> {
@@ -580,6 +662,46 @@ impl<'a> GroupKeyAccessor<'a> {
                     })?;
                 Ok(GroupKeyAccessor::DictU32Utf8(dict, values))
             }
+            GroupKeyKind::Int64 => col
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .map(GroupKeyAccessor::Int64)
+                .ok_or_else(|| {
+                    DataFusionError::Internal(format!(
+                        "FilterMultiAggSpec: Int64 key got non-Int64 array: {:?}",
+                        col.data_type()
+                    ))
+                }),
+            GroupKeyKind::Int32 => col
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .map(GroupKeyAccessor::Int32)
+                .ok_or_else(|| {
+                    DataFusionError::Internal(format!(
+                        "FilterMultiAggSpec: Int32 key got non-Int32 array: {:?}",
+                        col.data_type()
+                    ))
+                }),
+            GroupKeyKind::Date32 => col
+                .as_any()
+                .downcast_ref::<Date32Array>()
+                .map(GroupKeyAccessor::Date32)
+                .ok_or_else(|| {
+                    DataFusionError::Internal(format!(
+                        "FilterMultiAggSpec: Date32 key got non-Date32 array: {:?}",
+                        col.data_type()
+                    ))
+                }),
+            GroupKeyKind::Float64 => col
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .map(GroupKeyAccessor::Float64)
+                .ok_or_else(|| {
+                    DataFusionError::Internal(format!(
+                        "FilterMultiAggSpec: Float64 key got non-Float64 array: {:?}",
+                        col.data_type()
+                    ))
+                }),
         }
     }
 
@@ -593,8 +715,12 @@ impl<'a> GroupKeyAccessor<'a> {
         match self {
             GroupKeyAccessor::Utf8View(s) => s.value(row).as_bytes().first().copied().unwrap_or(0),
             GroupKeyAccessor::BinaryView(b) => b.value(row).first().copied().unwrap_or(0),
-            GroupKeyAccessor::DictU32Utf8(_, _) => {
-                debug_assert!(false, "first_byte_at called on DictU32Utf8 accessor");
+            GroupKeyAccessor::DictU32Utf8(_, _)
+            | GroupKeyAccessor::Int64(_)
+            | GroupKeyAccessor::Int32(_)
+            | GroupKeyAccessor::Date32(_)
+            | GroupKeyAccessor::Float64(_) => {
+                debug_assert!(false, "first_byte_at called on non-Utf8View accessor");
                 0
             }
         }
@@ -621,6 +747,22 @@ impl<'a> GroupKeyAccessor<'a> {
                     .entry(code)
                     .or_insert_with(|| values.value(code as usize).to_string());
                 buf.extend_from_slice(&code.to_le_bytes());
+            }
+            GroupKeyAccessor::Int64(a) => {
+                buf.extend_from_slice(&a.value(row).to_le_bytes());
+            }
+            GroupKeyAccessor::Int32(a) => {
+                buf.extend_from_slice(&a.value(row).to_le_bytes());
+            }
+            GroupKeyAccessor::Date32(a) => {
+                buf.extend_from_slice(&a.value(row).to_le_bytes());
+            }
+            GroupKeyAccessor::Float64(a) => {
+                // Bit-cast to u64 so NaN/-0.0 collide as per their
+                // exact bit pattern (consistent with DataFusion's
+                // default behavior, which also uses raw bits as the
+                // hash key).
+                buf.extend_from_slice(&a.value(row).to_bits().to_le_bytes());
             }
         }
     }
