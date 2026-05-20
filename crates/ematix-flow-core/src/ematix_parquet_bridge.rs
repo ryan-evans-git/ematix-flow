@@ -48,8 +48,9 @@ use ematix_parquet_codec::plain::{
     decode_plain_byte_array, decode_plain_f64, decode_plain_i32, decode_plain_i64,
 };
 use ematix_parquet_codec::read::{
-    read_column_byte_array_dict_preserved, read_column_byte_array_masked_into,
-    read_column_f64_masked_into, read_column_i32_masked_into, read_column_i64_masked_into,
+    read_column_byte_array_dict_preserved, read_column_byte_array_dict_preserved_into,
+    read_column_byte_array_masked_into, read_column_f64_masked_into, read_column_i32_masked_into,
+    read_column_i64_masked_into,
 };
 use ematix_parquet_format::types::{CompressionCodec, Encoding};
 use ematix_parquet_io::{PageWalker, ParquetFile};
@@ -648,6 +649,142 @@ pub fn masked_decode_f64(
     Ok(out)
 }
 
+/// Σ.E5 #512: build a row bitmap from a BYTE_ARRAY column. Uses the
+/// dict-preserved fast path: decode dict once, evaluate predicate
+/// per-dict-entry (O(|dict|)) into a dict_mask, then walk indices and
+/// scatter into the bitmap. Returns `Err` if the column isn't fully
+/// dict-encoded (PLAIN-only chunks fall back to dense-decode + filter
+/// at the caller).
+pub fn filter_byte_array_to_bitmap(
+    path: &std::path::Path,
+    rg: usize,
+    col: usize,
+    predicate: impl Fn(&[u8]) -> bool,
+) -> DfResult<(Vec<u8>, usize)> {
+    let file = ParquetFile::open(path).map_err(|e| ext(format!("ParquetFile::open: {e}")))?;
+    let mut dict_bytes: Vec<u8> = Vec::new();
+    let mut dict_offsets: Vec<u32> = Vec::new();
+    let mut indices: Vec<u32> = Vec::new();
+    read_column_byte_array_dict_preserved_into(
+        &file,
+        rg,
+        col,
+        &mut dict_bytes,
+        &mut dict_offsets,
+        &mut indices,
+    )
+    .map_err(|e| ext(format!("filter_byte_array dict-preserved: {e}")))?;
+
+    let dict_len = dict_offsets.len().saturating_sub(1);
+    let mut dict_mask: Vec<bool> = Vec::with_capacity(dict_len);
+    for i in 0..dict_len {
+        let off = dict_offsets[i] as usize;
+        let end = dict_offsets[i + 1] as usize;
+        dict_mask.push(predicate(&dict_bytes[off..end]));
+    }
+
+    let total = indices.len();
+    let mut bitmap = vec![0u8; total.div_ceil(8)];
+    for (row, &idx) in indices.iter().enumerate() {
+        if dict_mask[idx as usize] {
+            bitmap[row >> 3] |= 1 << (row & 7);
+        }
+    }
+    Ok((bitmap, total))
+}
+
+/// Σ.E5 #518: build a row bitmap from a FLOAT64 column. Uses dense
+/// decode + per-row predicate eval. Cheap because the predicate is
+/// usually a small range (Q06 `l_quantity < 24`, Q19 `l_quantity
+/// BETWEEN 1 AND 30`) and the column is fixed-width 8-byte numeric.
+pub fn filter_f64_column_to_bitmap_dense(
+    path: &std::path::Path,
+    rg: usize,
+    col: usize,
+    predicate: impl Fn(f64) -> bool,
+) -> DfResult<(Vec<u8>, usize)> {
+    let file = ParquetFile::open(path).map_err(|e| ext(format!("ParquetFile::open: {e}")))?;
+    let md = file.metadata().map_err(|e| ext(format!("metadata: {e}")))?;
+    let cm = md.row_groups[rg].columns[col]
+        .meta_data
+        .as_ref()
+        .ok_or_else(|| ext("column missing meta_data"))?;
+    let total = cm.num_values as usize;
+    let all_ones = vec![0xFFu8; total.div_ceil(8)];
+    let values = masked_decode_f64(&file, rg, col, &all_ones)?;
+    let mut bitmap = vec![0u8; total.div_ceil(8)];
+    for (row, &v) in values.iter().enumerate() {
+        if predicate(v) {
+            bitmap[row >> 3] |= 1 << (row & 7);
+        }
+    }
+    Ok((bitmap, total))
+}
+
+/// Σ.E5: dense fallback for BYTE_ARRAY bitmap filter. Used when the
+/// chunk isn't dict-encoded (PLAIN-only) — `o_comment`-style
+/// high-cardinality columns. Decodes every row and applies the
+/// predicate.
+pub fn filter_byte_array_to_bitmap_dense(
+    path: &std::path::Path,
+    rg: usize,
+    col: usize,
+    predicate: impl Fn(&[u8]) -> bool,
+) -> DfResult<(Vec<u8>, usize)> {
+    let file = ParquetFile::open(path).map_err(|e| ext(format!("ParquetFile::open: {e}")))?;
+    let md = file.metadata().map_err(|e| ext(format!("metadata: {e}")))?;
+    let cm = md.row_groups[rg].columns[col]
+        .meta_data
+        .as_ref()
+        .ok_or_else(|| ext("column missing meta_data"))?;
+    let total = cm.num_values as usize;
+    let all_ones = vec![0xFFu8; total.div_ceil(8)];
+    let values = masked_decode_byte_array(&file, rg, col, &all_ones)?;
+    if values.len() != total {
+        return Err(ext(format!(
+            "byte_array dense filter: decoded {} rows, expected {total}",
+            values.len()
+        )));
+    }
+    let mut bitmap = vec![0u8; total.div_ceil(8)];
+    for (row, v) in values.iter().enumerate() {
+        if predicate(v.as_slice()) {
+            bitmap[row >> 3] |= 1 << (row & 7);
+        }
+    }
+    Ok((bitmap, total))
+}
+
+/// Σ.E5 #512: build a row bitmap from an INT32 column via a simple
+/// dense-decode path. Used as a fallback when the chunk isn't
+/// dict-encoded (PLAIN-only). Mirrors `filter_i32_column_to_bitmap`
+/// but without the dict-mask optimisation. Path-based to match the
+/// existing public signature shape.
+pub fn filter_i32_column_to_bitmap_dense(
+    file: &ParquetFile,
+    rg: usize,
+    col: usize,
+    predicate: impl Fn(i32) -> bool,
+) -> DfResult<(Vec<u8>, usize)> {
+    // Decode the whole column via the existing masked-decode kernel
+    // with an all-ones mask. Then apply the predicate.
+    let md = file.metadata().map_err(|e| ext(format!("metadata: {e}")))?;
+    let cm = md.row_groups[rg].columns[col]
+        .meta_data
+        .as_ref()
+        .ok_or_else(|| ext("column missing meta_data"))?;
+    let total = cm.num_values as usize;
+    let all_ones = vec![0xFFu8; total.div_ceil(8)];
+    let values = masked_decode_i32(file, rg, col, &all_ones)?;
+    let mut bitmap = vec![0u8; total.div_ceil(8)];
+    for (row, &v) in values.iter().enumerate() {
+        if predicate(v) {
+            bitmap[row >> 3] |= 1 << (row & 7);
+        }
+    }
+    Ok((bitmap, total))
+}
+
 /// Façade-level masked-decode for BYTE_ARRAY (Utf8 / Binary) columns.
 /// Returns owned `Vec<u8>` per matched value; the caller materialises
 /// these into a `StringArray` / `BinaryArray`.
@@ -696,8 +833,8 @@ mod tests {
     use std::fs::File;
     use std::path::PathBuf;
 
-    use parquet::column::reader::ColumnReader;
-    use parquet::file::reader::{FileReader, SerializedFileReader};
+    use datafusion::parquet::column::reader::ColumnReader;
+    use datafusion::parquet::file::reader::{FileReader, SerializedFileReader};
 
     fn lineitem_path() -> Option<PathBuf> {
         // 1. Developer override.
@@ -760,7 +897,7 @@ mod tests {
             ColumnReader::ByteArrayColumnReader(t) => t,
             _ => panic!("not ByteArray"),
         };
-        let mut out: Vec<parquet::data_type::ByteArray> = Vec::with_capacity(total);
+        let mut out: Vec<datafusion::parquet::data_type::ByteArray> = Vec::with_capacity(total);
         typed.read_records(total, None, None, &mut out).unwrap();
         out.into_iter().map(|b| b.data().to_vec()).collect()
     }

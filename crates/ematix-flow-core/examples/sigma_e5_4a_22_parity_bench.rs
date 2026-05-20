@@ -18,7 +18,7 @@
 //!       * `Regression`  — Emat slower by > 5% — needs investigation.
 //!   - The same physical-optimizer rule chain that
 //!     `tpch_triangulation_bench.rs` uses is registered for both runs:
-//!     `InjectFusedQ{1,3,5,12}Rule`, `InjectFilterSumRule`,
+//!     `InjectFilterMultiAggRule`, `InjectFilterSumRule`,
 //!     `EnableDictGroupCountRule`. The goal is "what users get
 //!     end-to-end with each provider", including all the existing rule
 //!     rewrites.
@@ -48,10 +48,8 @@ use datafusion::prelude::{SessionConfig, SessionContext};
 use ematix_flow_core::dict_aggregate_rule::EnableDictGroupCountRule;
 use ematix_flow_core::ematix_fast_parquet::EmatixFastParquetTableProvider;
 use ematix_flow_core::fast_parquet::FastParquetTableProvider;
+use ematix_flow_core::fused_aggregate_filter_multi_agg_rule::InjectFilterMultiAggRule;
 use ematix_flow_core::fused_aggregate_filter_sum_rule::InjectFilterSumRule;
-use ematix_flow_core::fused_jit_rule::{
-    InjectFusedQ1Rule, InjectFusedQ3Rule, InjectFusedQ5Rule, InjectFusedQ12Rule,
-};
 use futures_util::TryStreamExt;
 
 #[global_allocator]
@@ -189,7 +187,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("    trials:  {trials} (after {warmups} warmups)");
     println!("    output:  {}", out_path.display());
     println!(
-        "    rules:   InjectFusedQ{{1,3,5,12}}Rule + InjectFilterSumRule + EnableDictGroupCountRule"
+        "    rules:   InjectFilterMultiAggRule + InjectFilterSumRule + EnableDictGroupCountRule"
     );
     println!();
 
@@ -277,12 +275,9 @@ async fn build_ctx(
     let state = SessionStateBuilder::new()
         .with_config(SessionConfig::new().with_target_partitions(14))
         .with_default_features()
-        .with_physical_optimizer_rule(Arc::new(InjectFusedQ1Rule))
-        .with_physical_optimizer_rule(Arc::new(InjectFusedQ3Rule))
-        .with_physical_optimizer_rule(Arc::new(InjectFusedQ5Rule))
-        .with_physical_optimizer_rule(Arc::new(InjectFilterSumRule))
-        .with_physical_optimizer_rule(Arc::new(InjectFusedQ12Rule))
         .with_physical_optimizer_rule(Arc::new(EnableDictGroupCountRule))
+        .with_physical_optimizer_rule(Arc::new(InjectFilterMultiAggRule))
+        .with_physical_optimizer_rule(Arc::new(InjectFilterSumRule))
         .build();
     let ctx = SessionContext::new_with_state(state);
     for t in TPCH_TABLES {
@@ -296,10 +291,9 @@ async fn build_ctx(
                 ctx.register_table(*t, Arc::new(prov))?;
             }
             Provider::EmatixFastParquet => {
-                // Default knobs — late-mat ON (per PR #115 the
-                // streaming reader is also the default). Mirror what
-                // a downstream user gets out of the box: no manual
-                // `with_dict_preservation` or other tweaks.
+                // Σ.E5 (2026-05-18): the streaming reader is the
+                // default again. Mirrors what a downstream user gets
+                // from `try_new` out of the box.
                 let prov = EmatixFastParquetTableProvider::try_new(path)?;
                 ctx.register_table(*t, Arc::new(prov))?;
             }
@@ -401,7 +395,7 @@ fn write_findings_md(
         "Methodology: median ± σ across {trials} timed trials after {warmups} warmups, \
          single-machine, 14 target partitions, mimalloc allocator. Both providers \
          register the same 8 TPC-H tables with the same rule chain \
-         (`InjectFusedQ{{1,3,5,12}}Rule` + `InjectFilterSumRule` + \
+         (`InjectFilterMultiAggRule` + `InjectFilterSumRule` + \
          `EnableDictGroupCountRule`). Delta = `(emat - fast) / fast × 100`. \
          Verdict bands: within ±5% = `parity`; emat ≥ 5% faster = `EmatFaster`; \
          emat ≥ 5% slower = `Regression`."

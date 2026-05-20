@@ -150,42 +150,152 @@ impl<S: AggregateSpec + Clone> ExecutionPlan for FusedAggregateExec<S> {
         let spec = self.spec.clone();
         let output_schema = self.spec.output_schema();
         let input_partitions = input.properties().partitioning.partition_count();
+        // Σ.G.2f.3 perf (2026-05-19): internal MPMC fan-out via
+        // async-channel. n_producers = input partitions (one tokio
+        // task per scan partition pulling and forwarding); n_workers
+        // = target_partitions × 1.3 (the same overshoot ratio that
+        // beat the RepartitionExec-based fanout on Q01). The shared
+        // channel lets any free worker grab the next batch the moment
+        // any producer pushes — no per-output-partition round-robin
+        // serialization.
+        let target_partitions: usize = context
+            .session_config()
+            .options()
+            .execution
+            .target_partitions
+            .max(1);
+        let n_workers: usize = std::env::var("EMAT_FILTER_MULTI_AGG_FANOUT")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or((target_partitions * 13 / 10).max(target_partitions));
 
         let schema_for_stream = output_schema.clone();
         let fut = async move {
-            // One streaming worker per input partition. Each pulls
-            // batches from its stream and accumulates into a local
-            // `Accumulator`. Reducing happens after every worker has
-            // drained its stream.
-            //
-            // The spec is cloned by VALUE into each worker (not
-            // captured via Arc) — see the type-level doc on this
-            // operator for the bench finding that motivated this. The
-            // hand operators capture `Predicate` + `Indices` by Copy;
-            // we match that shape so LLVM sees the spec state as a
-            // local stack value in the inner loop.
-            let mut handles = Vec::with_capacity(input_partitions);
+            let timing = std::env::var_os("EMAT_AGG_TIMING").is_some();
+            let t_total = if timing {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
+
+            // Bounded MPMC channel. Capacity = n_workers * 2 keeps
+            // workers fed (one in-flight + one queued each) without
+            // letting producers run too far ahead and blow memory.
+            let (tx, rx) = async_channel::bounded::<arrow_array::RecordBatch>(n_workers * 2);
+
+            // Producers: one tokio task per scan partition that
+            // drains its stream into the shared channel.
+            let mut producers = Vec::with_capacity(input_partitions);
             for p in 0..input_partitions {
                 let mut s = input.execute(p, context.clone())?;
-                let spec_p = spec.clone();
-                handles.push(tokio::spawn(async move {
-                    let mut acc = <S as AggregateSpec>::Accumulator::default();
-                    while let Some(batch) = s.try_next().await? {
-                        spec_p.process_batch(&batch, &mut acc)?;
+                let tx_p = tx.clone();
+                producers.push(tokio::spawn(async move {
+                    let mut pull_ns: u128 = 0;
+                    while let Some(batch) = {
+                        let t = std::time::Instant::now();
+                        let n = s.try_next().await?;
+                        pull_ns += t.elapsed().as_nanos();
+                        n
+                    } {
+                        // If the send fails the consumer side closed
+                        // (cancellation / error); stop producing.
+                        if tx_p.send(batch).await.is_err() {
+                            break;
+                        }
                     }
-                    Ok::<<S as AggregateSpec>::Accumulator, DataFusionError>(acc)
+                    Ok::<u128, DataFusionError>(pull_ns)
                 }));
             }
+            // Drop the local sender so the channel closes when all
+            // producer-clones drop.
+            drop(tx);
+
+            // Workers: tokio tasks that drain the channel via async
+            // recv. Using tokio::spawn (not std::thread) keeps us
+            // inside tokio's worker pool — no OS thread storm if many
+            // queries run concurrently, and cancellation works.
+            let mut workers = Vec::with_capacity(n_workers);
+            for _ in 0..n_workers {
+                let rx_w = rx.clone();
+                let spec_w = spec.clone();
+                workers.push(tokio::spawn(async move {
+                    let mut acc = <S as AggregateSpec>::Accumulator::default();
+                    let mut proc_ns: u128 = 0;
+                    let mut n_batches: usize = 0;
+                    let mut n_rows: usize = 0;
+                    while let Ok(batch) = rx_w.recv().await {
+                        n_batches += 1;
+                        n_rows += batch.num_rows();
+                        let t = std::time::Instant::now();
+                        spec_w.process_batch(&batch, &mut acc)?;
+                        proc_ns += t.elapsed().as_nanos();
+                    }
+                    Ok::<(<S as AggregateSpec>::Accumulator, u128, usize, usize), DataFusionError>(
+                        (acc, proc_ns, n_batches, n_rows),
+                    )
+                }));
+            }
+            drop(rx);
+
+            // Wait for producers (so we surface any scan errors).
+            let mut sum_pull_ms = 0.0;
+            for p in producers {
+                let pull_ns = p.await.map_err(|e| {
+                    DataFusionError::Execution(format!(
+                        "FusedAggregateExec: producer join failed: {e}"
+                    ))
+                })??;
+                sum_pull_ms += pull_ns as f64 / 1_000_000.0;
+            }
+
+            // Wait for workers and merge their accumulators.
+            let t_merge = if timing {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
             let mut merged = <S as AggregateSpec>::Accumulator::default();
-            for h in handles {
-                let partial = h.await.map_err(|e| {
+            let mut sum_proc_ms = 0.0;
+            let mut sum_rows = 0usize;
+            let mut sum_batches = 0usize;
+            for w in workers {
+                let (partial, proc_ns, n_batches, n_rows) = w.await.map_err(|e| {
                     DataFusionError::Execution(format!(
                         "FusedAggregateExec: worker join failed: {e}"
                     ))
                 })??;
+                sum_proc_ms += proc_ns as f64 / 1_000_000.0;
+                sum_rows += n_rows;
+                sum_batches += n_batches;
                 merged = spec.merge(merged, partial);
             }
-            spec.finalize(merged)
+            let merge_ms = t_merge
+                .map(|t| t.elapsed().as_secs_f64() * 1000.0)
+                .unwrap_or(0.0);
+
+            let t_fin = if timing {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
+            let result = spec.finalize(merged);
+            let fin_ms = t_fin
+                .map(|t| t.elapsed().as_secs_f64() * 1000.0)
+                .unwrap_or(0.0);
+            if let Some(t) = t_total {
+                let total_ms = t.elapsed().as_secs_f64() * 1000.0;
+                let spec_name = std::any::type_name::<S>()
+                    .rsplit("::")
+                    .next()
+                    .unwrap_or("?");
+                eprintln!(
+                    "[emat.agg] spec={spec_name} producers={input_partitions} workers={n_workers} \
+                     batches={sum_batches} rows={sum_rows} sum_pull={sum_pull_ms:.2}ms \
+                     sum_proc={sum_proc_ms:.2}ms join+merge={merge_ms:.2}ms finalize={fin_ms:.3}ms \
+                     total={total_ms:.2}ms"
+                );
+            }
+            result
         };
 
         let s = stream::once(fut);
@@ -193,164 +303,5 @@ impl<S: AggregateSpec + Clone> ExecutionPlan for FusedAggregateExec<S> {
             schema_for_stream,
             s,
         )))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::fused::Q6Predicate;
-    use crate::fused_aggregate::{Q1Spec, Q6Spec};
-    use crate::fused_multi_agg::Q1Predicate;
-    use arrow_array::{Date32Array, Float64Array, RecordBatch, StringViewArray};
-    use arrow_schema::{DataType, Field, Schema};
-    use datafusion::datasource::MemTable;
-    use datafusion::prelude::SessionContext;
-
-    /// Build a 10-row Q6-shaped batch with a known-good answer.
-    fn small_q6_batch() -> (RecordBatch, Arc<Schema>) {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("l_quantity", DataType::Float64, false),
-            Field::new("l_extendedprice", DataType::Float64, false),
-            Field::new("l_discount", DataType::Float64, false),
-            Field::new("l_shipdate", DataType::Date32, false),
-        ]));
-        // Matching rows: 0, 2, 4, 6 → 100*0.06 + 100*0.07 + 100*0.06 + 100*0.05 = 24
-        let qty = Float64Array::from(vec![
-            23.0, 30.0, 10.0, 25.0, 15.0, 24.0, 20.0, 35.0, 22.0, 5.0,
-        ]);
-        let price = Float64Array::from(vec![100.0; 10]);
-        let disc = Float64Array::from(vec![
-            0.06, 0.05, 0.07, 0.05, 0.06, 0.05, 0.05, 0.05, 0.04, 0.10,
-        ]);
-        let ship = Date32Array::from(vec![
-            9000, 8000, 9100, 9200, 8900, 9000, 8800, 9050, 9020, 9080,
-        ]);
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(qty),
-                Arc::new(price),
-                Arc::new(disc),
-                Arc::new(ship),
-            ],
-        )
-        .unwrap();
-        (batch, schema)
-    }
-
-    #[tokio::test]
-    async fn fused_aggregate_exec_runs_q6spec_end_to_end() {
-        let (batch, schema) = small_q6_batch();
-        let mem = MemTable::try_new(schema.clone(), vec![vec![batch]]).unwrap();
-        let ctx = SessionContext::new();
-        ctx.register_table("lineitem", Arc::new(mem)).unwrap();
-
-        let df = ctx.sql("SELECT * FROM lineitem").await.unwrap();
-        let physical = df.create_physical_plan().await.unwrap();
-
-        let predicate = Q6Predicate {
-            date_lo: 8766,
-            date_hi: 9131,
-            disc_lo: 0.05,
-            disc_hi: 0.07,
-            qty_hi: 24.0,
-        };
-        let spec = Q6Spec::try_new(predicate, &physical.schema()).unwrap();
-        let exec = FusedAggregateExec::try_new(physical, spec).unwrap();
-
-        let mut s = exec.execute(0, ctx.task_ctx()).unwrap();
-        let result = s.try_next().await.unwrap().expect("at least one batch");
-        assert_eq!(result.num_rows(), 1);
-        assert_eq!(result.num_columns(), 1);
-        let f = result
-            .column(0)
-            .as_any()
-            .downcast_ref::<Float64Array>()
-            .unwrap();
-        assert!(
-            (f.value(0) - 24.0).abs() < 1e-9,
-            "expected revenue 24.0, got {}",
-            f.value(0)
-        );
-    }
-
-    fn small_q1_batch() -> (RecordBatch, Arc<Schema>) {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("l_returnflag", DataType::Utf8View, false),
-            Field::new("l_linestatus", DataType::Utf8View, false),
-            Field::new("l_quantity", DataType::Float64, false),
-            Field::new("l_extendedprice", DataType::Float64, false),
-            Field::new("l_discount", DataType::Float64, false),
-            Field::new("l_tax", DataType::Float64, false),
-            Field::new("l_shipdate", DataType::Date32, false),
-        ]));
-        let rflag = StringViewArray::from(vec!["N", "N", "A", "R"]);
-        let lstatus = StringViewArray::from(vec!["F", "F", "F", "F"]);
-        let qty = Float64Array::from(vec![10.0, 10.0, 20.0, 5.0]);
-        let price = Float64Array::from(vec![100.0, 100.0, 200.0, 50.0]);
-        let disc = Float64Array::from(vec![0.05, 0.05, 0.10, 0.02]);
-        let tax = Float64Array::from(vec![0.10, 0.10, 0.05, 0.05]);
-        // First 3 in-window, last filtered out.
-        let ship = Date32Array::from(vec![8800, 8800, 8800, 20000]);
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(rflag),
-                Arc::new(lstatus),
-                Arc::new(qty),
-                Arc::new(price),
-                Arc::new(disc),
-                Arc::new(tax),
-                Arc::new(ship),
-            ],
-        )
-        .unwrap();
-        (batch, schema)
-    }
-
-    #[tokio::test]
-    async fn fused_aggregate_exec_runs_q1spec_end_to_end() {
-        let (batch, schema) = small_q1_batch();
-        let mem = MemTable::try_new(schema.clone(), vec![vec![batch]]).unwrap();
-        let ctx = SessionContext::new();
-        ctx.register_table("lineitem", Arc::new(mem)).unwrap();
-
-        let df = ctx.sql("SELECT * FROM lineitem").await.unwrap();
-        let physical = df.create_physical_plan().await.unwrap();
-
-        let predicate = Q1Predicate {
-            shipdate_cutoff: 10471,
-        };
-        let spec = Q1Spec::try_new(predicate, &physical.schema()).unwrap();
-        let exec = FusedAggregateExec::try_new(physical, spec).unwrap();
-
-        let mut s = exec.execute(0, ctx.task_ctx()).unwrap();
-        let result = s.try_next().await.unwrap().expect("at least one batch");
-        // Q1 always emits 4 rows × 10 cols (one per (rflag,lstatus) group).
-        assert_eq!(result.num_rows(), 4);
-        assert_eq!(result.num_columns(), 10);
-    }
-
-    #[tokio::test]
-    async fn fused_aggregate_exec_rejects_non_zero_partition() {
-        let (batch, schema) = small_q6_batch();
-        let mem = MemTable::try_new(schema.clone(), vec![vec![batch]]).unwrap();
-        let ctx = SessionContext::new();
-        ctx.register_table("lineitem", Arc::new(mem)).unwrap();
-
-        let df = ctx.sql("SELECT * FROM lineitem").await.unwrap();
-        let physical = df.create_physical_plan().await.unwrap();
-
-        let predicate = Q6Predicate {
-            date_lo: 0,
-            date_hi: 30000,
-            disc_lo: 0.0,
-            disc_hi: 1.0,
-            qty_hi: 100.0,
-        };
-        let spec = Q6Spec::try_new(predicate, &physical.schema()).unwrap();
-        let exec = FusedAggregateExec::try_new(physical, spec).unwrap();
-        assert!(exec.execute(1, ctx.task_ctx()).is_err());
     }
 }

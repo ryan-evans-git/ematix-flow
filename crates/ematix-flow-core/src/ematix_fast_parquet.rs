@@ -44,56 +44,570 @@ use datafusion::physical_plan::{
     SendableRecordBatchStream,
 };
 
-use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
-use parquet::file::reader::{FileReader, SerializedFileReader};
+use datafusion::parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
+use datafusion::parquet::file::reader::{FileReader, SerializedFileReader};
 
 use crate::emat_arrow_reader::EmatArrowBatchReaderBuilder;
 use crate::ematix_parquet_bridge::{
     decode_column_chunk_byte_array, decode_column_chunk_byte_array_dict_preserved,
     decode_column_chunk_f64, decode_column_chunk_i32, decode_column_chunk_i64,
-    filter_i32_column_to_bitmap, masked_decode_byte_array, masked_decode_f64, masked_decode_i32,
-    masked_decode_i64, sparse_gather_chunk_f64, sparse_gather_chunk_i32, sparse_gather_chunk_i64,
+    masked_decode_byte_array, masked_decode_f64, masked_decode_i32, masked_decode_i64,
+    sparse_gather_chunk_f64, sparse_gather_chunk_i32, sparse_gather_chunk_i64,
 };
 use crate::fast_parquet::{RangePredicate, extract_range_predicate};
 
 /// Phase 3 predicate: single-column conjunction of `column OP literal`
-/// clauses, where the column has Date32 / Int32 type. AND-combined
-/// into a closure used by `filter_i32_column_to_bitmap`.
+/// Multi-column predicate set, AND-combined. Each `ColumnPredicate`
+/// runs against ONE column; per-column bitmaps are built by the
+/// streaming reader's masked path and AND-ed together before
+/// projection columns are masked-decoded.
 #[derive(Debug, Clone)]
 pub struct BridgeFilter {
-    /// Index of the filter column in the FULL (unprojected) schema —
-    /// same as the parquet column index since Arrow schema is built 1:1.
-    parquet_col_idx: usize,
-    /// Comparisons to AND together. All against the same column.
-    clauses: Vec<RangeClause>,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct RangeClause {
-    op: Operator,
-    literal_i32: i32,
+    predicates: Vec<ColumnPredicate>,
+    /// Σ.E5 Phase 1.8: pre-computed pass-rate prediction. Set by the
+    /// provider's `scan()` from per-column stats; used by the
+    /// streaming reader to choose between parallel-bitmap+dense
+    /// (high-sel) and serial-bitmap+masked-decode (low-sel) paths.
+    /// 0.5 = unknown (no stats), conservative default.
+    predicted_pass_rate: f64,
 }
 
 impl BridgeFilter {
-    /// Evaluate AND of all clauses against one i32 / Date32 value.
-    #[inline]
-    fn eval_i32(&self, v: i32) -> bool {
-        for c in &self.clauses {
-            let pass = match c.op {
-                Operator::Eq => v == c.literal_i32,
-                Operator::NotEq => v != c.literal_i32,
-                Operator::Lt => v < c.literal_i32,
-                Operator::LtEq => v <= c.literal_i32,
-                Operator::Gt => v > c.literal_i32,
-                Operator::GtEq => v >= c.literal_i32,
-                _ => return false,
+    /// Σ.E5 Phase 1.8: combined pass-rate estimate across all
+    /// predicates (AND'd). `full_col_stats` is indexed by the
+    /// PROVIDER's full schema column index (the same index space
+    /// `ColumnPredicate::col_idx()` returns). Returns 0.5 if any
+    /// predicate's column lacks stats.
+    pub fn estimate_pass_rate(
+        &self,
+        full_col_stats: &[datafusion::common::stats::ColumnStatistics],
+    ) -> f64 {
+        let mut sel = 1.0_f64;
+        for p in &self.predicates {
+            let col = p.col_idx();
+            let Some(stats) = full_col_stats.get(col) else {
+                return 0.5;
             };
-            if !pass {
-                return false;
+            sel *= p.estimate_pass_rate(stats);
+        }
+        sel.clamp(0.0, 1.0)
+    }
+
+    /// Σ.E5 Phase 1.8: store the predictor's verdict so the streaming
+    /// reader doesn't have to re-compute it per RG.
+    pub fn with_predicted_pass_rate(mut self, p: f64) -> Self {
+        self.predicted_pass_rate = p.clamp(0.0, 1.0);
+        self
+    }
+
+    /// Σ.E5 Phase 1.8: predicted pass rate (set via
+    /// `with_predicted_pass_rate`). 0.5 if not set (conservative).
+    pub fn predicted_pass_rate(&self) -> f64 {
+        self.predicted_pass_rate
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum ColumnPredicate {
+    /// AND of comparisons on the same i32/Date32 column.
+    I32Range {
+        col_idx: usize,
+        clauses: Vec<RangeClause>,
+    },
+    /// `col IN (v1, v2, ...)` on an i32 column (Q16's p_size).
+    I32In { col_idx: usize, values: Vec<i32> },
+    /// AND of comparisons on the same Float64 column. Used for
+    /// `l_quantity BETWEEN ...` (Q06, Q19).
+    F64Range {
+        col_idx: usize,
+        clauses: Vec<F64RangeClause>,
+    },
+    /// `col = literal` on a string column (Q19's l_shipinstruct).
+    StringEq { col_idx: usize, value: String },
+    /// `col != literal` on a string column (Q16's p_brand <> 'Brand#45').
+    StringNotEq { col_idx: usize, value: String },
+    /// `col IN (v1, v2, ...)` on a string column. Captures both
+    /// SQL `IN (...)` *and* OR-of-equality (Q19's l_shipmode).
+    StringIn { col_idx: usize, values: Vec<String> },
+    /// `col [NOT] LIKE 'pattern'` on a string column. Pattern uses
+    /// SQL wildcards (`%` = any, `_` not yet supported — caller
+    /// avoids pushing patterns with `_`). `negated` flips the match.
+    /// Examples:
+    ///   Q13: `o_comment NOT LIKE '%special%requests%'`
+    ///   Q16: `p_type NOT LIKE 'MEDIUM POLISHED %'`
+    StringLike {
+        col_idx: usize,
+        pattern: String,
+        negated: bool,
+    },
+    /// `col_a OP col_b` on two i32/Date32 columns of the same type.
+    /// Q12 has `l_commitdate < l_receiptdate AND l_shipdate <
+    /// l_commitdate`; Q21 has `l_receiptdate > l_commitdate`.
+    /// Pairwise eval in build_bitmap.
+    I32ColumnPair {
+        left_col: usize,
+        right_col: usize,
+        op: Operator,
+    },
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct RangeClause {
+    pub op: Operator,
+    pub literal_i32: i32,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct F64RangeClause {
+    pub op: Operator,
+    pub literal_f64: f64,
+}
+
+impl BridgeFilter {
+    pub fn predicates(&self) -> &[ColumnPredicate] {
+        &self.predicates
+    }
+
+    /// Σ.E5 #513: build a combined row bitmap by AND-combining one
+    /// per-predicate bitmap. Returns `(bitmap, total_rows)`. For i32
+    /// predicates uses the fast dict-mask + RLE-aware kernel; for
+    /// string predicates uses the dict-preserved per-entry mask.
+    /// Falls back to dense decode if the i32 column isn't
+    /// dict-encoded (e.g. PLAIN-only).
+    pub fn build_bitmap(&self, path: &std::path::Path, rg: usize) -> DfResult<(Vec<u8>, usize)> {
+        use crate::ematix_parquet_bridge::{
+            filter_byte_array_to_bitmap, filter_byte_array_to_bitmap_dense,
+            filter_f64_column_to_bitmap_dense, filter_i32_column_to_bitmap,
+            filter_i32_column_to_bitmap_dense,
+        };
+        let mut combined: Option<(Vec<u8>, usize)> = None;
+        for p in &self.predicates {
+            let (b, total) = match p {
+                ColumnPredicate::I32Range { col_idx, .. }
+                | ColumnPredicate::I32In { col_idx, .. } => {
+                    let pclone = p.clone();
+                    // Try the fast dict-aware kernel first; fall back
+                    // to dense decode on PLAIN-only chunks.
+                    match filter_i32_column_to_bitmap(path, rg, *col_idx, {
+                        let pc = pclone.clone();
+                        move |v: i32| pc.eval_i32(v)
+                    }) {
+                        Ok(r) => r,
+                        Err(_) => {
+                            let pc2 = pclone.clone();
+                            let file = ematix_parquet_io::ParquetFile::open(path).map_err(|e| {
+                                DataFusionError::External(format!("ParquetFile::open: {e}").into())
+                            })?;
+                            filter_i32_column_to_bitmap_dense(
+                                &file,
+                                rg,
+                                *col_idx,
+                                move |v: i32| pc2.eval_i32(v),
+                            )?
+                        }
+                    }
+                }
+                ColumnPredicate::F64Range { col_idx, .. } => {
+                    let pclone = p.clone();
+                    filter_f64_column_to_bitmap_dense(path, rg, *col_idx, move |v: f64| {
+                        pclone.eval_f64(v)
+                    })?
+                }
+                ColumnPredicate::I32ColumnPair {
+                    left_col,
+                    right_col,
+                    op,
+                } => {
+                    // Decode both cols dense via masked_decode_i32
+                    // with all-ones masks. Same shape as the F64 dense
+                    // path. Apply the op pairwise to build the bitmap.
+                    use crate::ematix_parquet_bridge::masked_decode_i32;
+                    let file = ematix_parquet_io::ParquetFile::open(path).map_err(|e| {
+                        DataFusionError::External(format!("ParquetFile::open: {e}").into())
+                    })?;
+                    let md = file
+                        .metadata()
+                        .map_err(|e| DataFusionError::External(format!("metadata: {e}").into()))?;
+                    let total = md.row_groups[rg].columns[*left_col]
+                        .meta_data
+                        .as_ref()
+                        .map(|m| m.num_values as usize)
+                        .unwrap_or(0);
+                    let all_ones = vec![0xFFu8; total.div_ceil(8)];
+                    let left = masked_decode_i32(&file, rg, *left_col, &all_ones)?;
+                    let right = masked_decode_i32(&file, rg, *right_col, &all_ones)?;
+                    if left.len() != right.len() || left.len() != total {
+                        return Err(DataFusionError::External(
+                            format!(
+                                "I32ColumnPair: row count mismatch left={} right={} total={}",
+                                left.len(),
+                                right.len(),
+                                total
+                            )
+                            .into(),
+                        ));
+                    }
+                    let mut bitmap = vec![0u8; total.div_ceil(8)];
+                    let op = *op;
+                    for row in 0..total {
+                        let l = left[row];
+                        let r = right[row];
+                        let pass = match op {
+                            Operator::Lt => l < r,
+                            Operator::LtEq => l <= r,
+                            Operator::Gt => l > r,
+                            Operator::GtEq => l >= r,
+                            Operator::Eq => l == r,
+                            Operator::NotEq => l != r,
+                            _ => false,
+                        };
+                        if pass {
+                            bitmap[row >> 3] |= 1 << (row & 7);
+                        }
+                    }
+                    (bitmap, total)
+                }
+                ColumnPredicate::StringEq { col_idx, .. }
+                | ColumnPredicate::StringNotEq { col_idx, .. }
+                | ColumnPredicate::StringIn { col_idx, .. }
+                | ColumnPredicate::StringLike { col_idx, .. } => {
+                    let pclone = p.clone();
+                    // Try dict-preserved fast path; fall back to dense
+                    // on PLAIN-encoded high-cardinality columns
+                    // (Q13's o_comment).
+                    match filter_byte_array_to_bitmap(path, rg, *col_idx, {
+                        let pc = pclone.clone();
+                        move |bytes: &[u8]| match std::str::from_utf8(bytes) {
+                            Ok(s) => pc.eval_str(s),
+                            Err(_) => false,
+                        }
+                    }) {
+                        Ok(r) => r,
+                        Err(_) => {
+                            let pc2 = pclone.clone();
+                            filter_byte_array_to_bitmap_dense(
+                                path,
+                                rg,
+                                *col_idx,
+                                move |bytes: &[u8]| match std::str::from_utf8(bytes) {
+                                    Ok(s) => pc2.eval_str(s),
+                                    Err(_) => false,
+                                },
+                            )?
+                        }
+                    }
+                }
+            };
+            match combined.as_mut() {
+                None => combined = Some((b, total)),
+                Some((acc, prior_total)) => {
+                    if *prior_total != total {
+                        return Err(DataFusionError::External(
+                            format!(
+                                "BridgeFilter::build_bitmap: column row counts differ ({} vs {})",
+                                *prior_total, total
+                            )
+                            .into(),
+                        ));
+                    }
+                    for (a, b) in acc.iter_mut().zip(b.iter()) {
+                        *a &= b;
+                    }
+                }
             }
         }
-        true
+        combined.ok_or_else(|| {
+            DataFusionError::External("BridgeFilter::build_bitmap: no predicates".into())
+        })
     }
+}
+
+impl ColumnPredicate {
+    pub fn col_idx(&self) -> usize {
+        match self {
+            ColumnPredicate::I32Range { col_idx, .. }
+            | ColumnPredicate::I32In { col_idx, .. }
+            | ColumnPredicate::F64Range { col_idx, .. }
+            | ColumnPredicate::StringEq { col_idx, .. }
+            | ColumnPredicate::StringNotEq { col_idx, .. }
+            | ColumnPredicate::StringIn { col_idx, .. }
+            | ColumnPredicate::StringLike { col_idx, .. } => *col_idx,
+            // ColumnPair touches two cols; return left as the "primary".
+            ColumnPredicate::I32ColumnPair { left_col, .. } => *left_col,
+        }
+    }
+
+    /// Σ.E5 Phase 1.8 (2026-05-19): estimate the fraction of rows
+    /// that pass this predicate, given the column's min/max/distinct
+    /// stats from parquet metadata. Returns a value in [0.0, 1.0].
+    ///
+    /// Used by `load_row_group_masked` to dispatch between
+    /// parallel-bitmap+dense (high-sel) and serial-bitmap+masked-
+    /// decode (low-sel) paths. When stats are missing, returns a
+    /// conservative 0.5 (treat as "may be high-sel").
+    pub fn estimate_pass_rate(&self, stats: &datafusion::common::stats::ColumnStatistics) -> f64 {
+        use datafusion::common::stats::Precision;
+
+        let extract_i32 = |p: &Precision<ScalarValue>| -> Option<i32> {
+            match p {
+                Precision::Exact(v) | Precision::Inexact(v) => match v {
+                    ScalarValue::Int32(Some(x)) => Some(*x),
+                    ScalarValue::Date32(Some(x)) => Some(*x),
+                    _ => None,
+                },
+                _ => None,
+            }
+        };
+        let extract_usize = |p: &Precision<usize>| -> Option<usize> {
+            match p {
+                Precision::Exact(v) | Precision::Inexact(v) => Some(*v),
+                _ => None,
+            }
+        };
+
+        match self {
+            ColumnPredicate::I32Range { clauses, .. } => {
+                let min = extract_i32(&stats.min_value);
+                let max = extract_i32(&stats.max_value);
+                let (Some(min), Some(max)) = (min, max) else {
+                    return 0.5;
+                };
+                if max <= min {
+                    return 0.5;
+                }
+                let range = (max - min) as f64;
+                // Combine clauses via AND — multiply selectivities
+                // (independence assumption — conservative).
+                let mut sel = 1.0_f64;
+                for c in clauses {
+                    let lit = c.literal_i32;
+                    let clause_sel = match c.op {
+                        Operator::Eq => 1.0 / ((max - min) as f64).max(1.0),
+                        Operator::NotEq => 1.0 - 1.0 / ((max - min) as f64).max(1.0),
+                        Operator::Lt => {
+                            if lit <= min {
+                                0.0
+                            } else if lit > max {
+                                1.0
+                            } else {
+                                (lit - min) as f64 / range
+                            }
+                        }
+                        Operator::LtEq => {
+                            if lit < min {
+                                0.0
+                            } else if lit >= max {
+                                1.0
+                            } else {
+                                ((lit - min + 1) as f64 / (range + 1.0)).min(1.0)
+                            }
+                        }
+                        Operator::Gt => {
+                            if lit >= max {
+                                0.0
+                            } else if lit < min {
+                                1.0
+                            } else {
+                                (max - lit) as f64 / range
+                            }
+                        }
+                        Operator::GtEq => {
+                            if lit > max {
+                                0.0
+                            } else if lit <= min {
+                                1.0
+                            } else {
+                                ((max - lit + 1) as f64 / (range + 1.0)).min(1.0)
+                            }
+                        }
+                        _ => 1.0, // unknown op — conservative
+                    };
+                    sel *= clause_sel;
+                }
+                sel.clamp(0.0, 1.0)
+            }
+            ColumnPredicate::I32In { values, .. } => {
+                let min = extract_i32(&stats.min_value);
+                let max = extract_i32(&stats.max_value);
+                let card = extract_usize(&stats.distinct_count);
+                let card = card.or_else(|| match (min, max) {
+                    (Some(a), Some(b)) if b > a => Some((b - a + 1) as usize),
+                    _ => None,
+                });
+                match card {
+                    Some(c) if c > 0 => (values.len() as f64 / c as f64).clamp(0.0, 1.0),
+                    _ => 0.5,
+                }
+            }
+            ColumnPredicate::StringEq { .. } => {
+                match extract_usize(&stats.distinct_count) {
+                    Some(c) if c > 0 => 1.0 / c as f64,
+                    _ => 0.1, // conservative default
+                }
+            }
+            ColumnPredicate::StringNotEq { .. } => match extract_usize(&stats.distinct_count) {
+                Some(c) if c > 0 => 1.0 - 1.0 / c as f64,
+                _ => 0.9,
+            },
+            ColumnPredicate::StringIn { values, .. } => {
+                match extract_usize(&stats.distinct_count) {
+                    Some(c) if c > 0 => (values.len() as f64 / c as f64).clamp(0.0, 1.0),
+                    _ => 0.2,
+                }
+            }
+            ColumnPredicate::StringLike { negated, .. } => {
+                // No cheap way to estimate LIKE; assume substring
+                // matches are uncommon. NOT LIKE inverts.
+                if *negated { 0.9 } else { 0.1 }
+            }
+            // Refused-for-pushdown shapes; never reach here in practice.
+            ColumnPredicate::F64Range { .. } | ColumnPredicate::I32ColumnPair { .. } => 0.5,
+        }
+    }
+
+    /// Σ.E5 per-filter Exact pushdown (2026-05-19): returns `true` if
+    /// emat's bitmap evaluation is provably equivalent to DataFusion's
+    /// predicate evaluation for this variant.
+    ///
+    /// Caller must ALSO check that the relevant column has no nulls
+    /// (emat's kernels don't handle def-levels). See
+    /// `EmatixFastParquetTableProvider::column_has_no_nulls`.
+    ///
+    /// See `docs/PHASE_SIGMA_E5_PER_FILTER_EXACT.md` §2 for the
+    /// per-shape safety audit.
+    pub fn is_exact_safe(&self) -> bool {
+        match self {
+            // Integer comparisons + discrete membership are byte-level
+            // unambiguous.
+            ColumnPredicate::I32Range { .. } | ColumnPredicate::I32In { .. } => true,
+            // Byte-equality matches Arrow's `eq_utf8`.
+            ColumnPredicate::StringEq { .. }
+            | ColumnPredicate::StringNotEq { .. }
+            | ColumnPredicate::StringIn { .. } => true,
+            // LIKE is Exact only when `LikeMatcher::compile` accepts
+            // the pattern (no `_`, no escape). Otherwise our matcher
+            // can't represent the pattern → Inexact.
+            ColumnPredicate::StringLike { pattern, .. } => {
+                crate::like_matcher::LikeMatcher::compile(pattern).is_some()
+            }
+            // Refused for pushdown elsewhere (NaN/Inf semantics, double-
+            // decode trap respectively). When/if re-enabled they'll
+            // need their own audit before claiming Exact.
+            ColumnPredicate::F64Range { .. } | ColumnPredicate::I32ColumnPair { .. } => false,
+        }
+    }
+
+    /// Evaluate AND of all clauses against one f64 value (F64Range only).
+    #[inline]
+    pub fn eval_f64(&self, v: f64) -> bool {
+        match self {
+            ColumnPredicate::F64Range { clauses, .. } => {
+                for c in clauses {
+                    let pass = match c.op {
+                        Operator::Eq => v == c.literal_f64,
+                        Operator::NotEq => v != c.literal_f64,
+                        Operator::Lt => v < c.literal_f64,
+                        Operator::LtEq => v <= c.literal_f64,
+                        Operator::Gt => v > c.literal_f64,
+                        Operator::GtEq => v >= c.literal_f64,
+                        _ => return false,
+                    };
+                    if !pass {
+                        return false;
+                    }
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Evaluate AND of all clauses against one i32 value (I32Range / I32In only).
+    #[inline]
+    pub fn eval_i32(&self, v: i32) -> bool {
+        match self {
+            ColumnPredicate::I32Range { clauses, .. } => {
+                for c in clauses {
+                    let pass = match c.op {
+                        Operator::Eq => v == c.literal_i32,
+                        Operator::NotEq => v != c.literal_i32,
+                        Operator::Lt => v < c.literal_i32,
+                        Operator::LtEq => v <= c.literal_i32,
+                        Operator::Gt => v > c.literal_i32,
+                        Operator::GtEq => v >= c.literal_i32,
+                        _ => return false,
+                    };
+                    if !pass {
+                        return false;
+                    }
+                }
+                true
+            }
+            ColumnPredicate::I32In { values, .. } => values.contains(&v),
+            _ => false,
+        }
+    }
+
+    /// Evaluate against a string value (StringEq / StringNotEq /
+    /// StringIn / StringLike only).
+    #[inline]
+    pub fn eval_str(&self, v: &str) -> bool {
+        match self {
+            ColumnPredicate::StringEq { value, .. } => v == value.as_str(),
+            ColumnPredicate::StringNotEq { value, .. } => v != value.as_str(),
+            ColumnPredicate::StringIn { values, .. } => values.iter().any(|s| s.as_str() == v),
+            ColumnPredicate::StringLike {
+                pattern, negated, ..
+            } => {
+                let m = matches_sql_like(pattern.as_str(), v);
+                if *negated { !m } else { m }
+            }
+            _ => false,
+        }
+    }
+}
+
+/// SQL LIKE matcher supporting `%` wildcards. Splits the pattern by
+/// `%` into literal chunks that must occur IN ORDER in the value.
+/// Anchors at the front if the pattern doesn't start with `%`, and
+/// at the back if it doesn't end with `%`. Bails (returns false) on
+/// `_` wildcard — callers should avoid pushing patterns containing
+/// `_` so we don't silently mismatch.
+fn matches_sql_like(pattern: &str, value: &str) -> bool {
+    if pattern.contains('_') {
+        return false;
+    }
+    let starts_anchored = !pattern.starts_with('%');
+    let ends_anchored = !pattern.ends_with('%');
+    let parts: Vec<&str> = pattern.split('%').filter(|s| !s.is_empty()).collect();
+    if parts.is_empty() {
+        return true; // pattern was `%`, `%%`, or empty
+    }
+    let n = parts.len();
+    let mut pos = 0usize;
+    for (i, part) in parts.iter().enumerate() {
+        let is_first = i == 0;
+        let is_last = i == n - 1;
+        let anchor_start = is_first && starts_anchored;
+        let anchor_end = is_last && ends_anchored;
+        if anchor_start && anchor_end {
+            return value == *part;
+        }
+        if anchor_start {
+            if !value[pos..].starts_with(part) {
+                return false;
+            }
+            pos += part.len();
+        } else if anchor_end {
+            return value[pos..].ends_with(part);
+        } else {
+            match value[pos..].find(part) {
+                Some(off) => pos += off + part.len(),
+                None => return false,
+            }
+        }
+    }
+    true
 }
 
 /// Try to convert a `RangePredicate` into a [`RangeClause`] for an
@@ -103,9 +617,6 @@ fn clause_from_predicate(pred: &RangePredicate, expected_type: &DataType) -> Opt
     let lit_i32: i32 = match (&pred.literal, expected_type) {
         (ScalarValue::Int32(Some(v)), DataType::Int32) => *v,
         (ScalarValue::Date32(Some(v)), DataType::Date32) => *v,
-        // String literal cast: SQL `DATE '1995-09-01'` resolves to
-        // Date32 in DataFusion typically, but handle the cast-through-
-        // string shape defensively.
         _ => return None,
     };
     Some(RangeClause {
@@ -114,37 +625,309 @@ fn clause_from_predicate(pred: &RangePredicate, expected_type: &DataType) -> Opt
     })
 }
 
-/// Extract Phase-3-pushable filters from the DataFusion filter list.
-/// Returns the BridgeFilter if every input filter is pushable AND
-/// they all target the same column AND that column is Int32/Date32.
-/// Returns `None` if any condition fails — the caller falls back to
-/// non-pushdown decoding.
-fn extract_bridge_filter(filters: &[Expr], full_schema: &Schema) -> Option<BridgeFilter> {
-    let mut clauses: Vec<RangeClause> = Vec::new();
-    let mut col_idx: Option<usize> = None;
-    for f in filters {
-        let pred = extract_range_predicate(f)?;
-        let idx = full_schema.index_of(&pred.column).ok()?;
+/// Recognise a single-filter `Expr` and turn it into a
+/// `ColumnPredicate` if its shape is supported. Returns None when the
+/// filter isn't one of the supported shapes — the caller skips it
+/// (which is fine when pushdown is declared `Inexact`: DataFusion's
+/// residual FilterExec handles the remainder).
+fn predicate_from_expr(expr: &Expr, full_schema: &Schema) -> Option<ColumnPredicate> {
+    // Shape 1: col OP literal (i32/Date32 range OR f64 range).
+    if let Some(p) = extract_range_predicate(expr) {
+        let idx = full_schema.index_of(&p.column).ok()?;
         let dt = full_schema.field(idx).data_type();
-        if !matches!(dt, DataType::Int32 | DataType::Date32) {
+        if matches!(dt, DataType::Int32 | DataType::Date32) {
+            let clause = clause_from_predicate(&p, dt)?;
+            return Some(ColumnPredicate::I32Range {
+                col_idx: idx,
+                clauses: vec![clause],
+            });
+        }
+        // Σ.E5 #518 (verified 2026-05-19): F64Range pushdown is net
+        // negative — refused. The 22-query suite confirms:
+        //   - Q06 (3 f64+date filters, all in projection): +114% if
+        //     pushed. Bitmap-build decodes all 3 filter cols (which
+        //     are also projection cols), giving 2× decode work.
+        //   - Q19 (l_quantity range as ONE of 3 predicates):
+        //     unchanged. The string IN-list on l_shipmode/
+        //     l_shipinstruct alone delivers ~3% combined
+        //     selectivity, and FilterExec handles the l_quantity
+        //     bound on the filtered batch cheaply.
+        // The F64Range / F64RangeClause types remain (eval_f64
+        // implemented) for callers that explicitly build a
+        // BridgeFilter with this variant, but DataFusion's planner
+        // won't push f64 ranges through us. Re-enable when there's
+        // a way to know at planning time that the filter col is NOT
+        // in projection.
+        if matches!(dt, DataType::Float64) {
             return None;
         }
-        let clause = clause_from_predicate(&pred, dt)?;
-        if let Some(prior) = col_idx {
-            if prior != idx {
-                return None; // multi-column pushdown not in Phase 3 v1
-            }
-        } else {
-            col_idx = Some(idx);
-        }
-        clauses.push(clause);
     }
-    if clauses.is_empty() {
+    // Shape 2: col IN (lit, lit, ...) — DataFusion `InList`.
+    if let Expr::InList(in_list) = expr {
+        if in_list.negated {
+            return None;
+        }
+        if let Expr::Column(c) = in_list.expr.as_ref() {
+            let idx = full_schema.index_of(&c.name).ok()?;
+            let dt = full_schema.field(idx).data_type();
+            // i32 IN-list
+            if matches!(dt, DataType::Int32) {
+                let mut values: Vec<i32> = Vec::with_capacity(in_list.list.len());
+                for v in &in_list.list {
+                    if let Expr::Literal(ScalarValue::Int32(Some(x)), _) = v {
+                        values.push(*x);
+                    } else {
+                        return None;
+                    }
+                }
+                return Some(ColumnPredicate::I32In {
+                    col_idx: idx,
+                    values,
+                });
+            }
+            // string IN-list
+            if matches!(dt, DataType::Utf8 | DataType::Utf8View) {
+                let mut values: Vec<String> = Vec::with_capacity(in_list.list.len());
+                for v in &in_list.list {
+                    let s = match v {
+                        Expr::Literal(ScalarValue::Utf8(Some(s)), _)
+                        | Expr::Literal(ScalarValue::Utf8View(Some(s)), _)
+                        | Expr::Literal(ScalarValue::LargeUtf8(Some(s)), _) => s.clone(),
+                        _ => return None,
+                    };
+                    values.push(s);
+                }
+                return Some(ColumnPredicate::StringIn {
+                    col_idx: idx,
+                    values,
+                });
+            }
+        }
+    }
+    // Shape 3: col [!]= 'literal' (string equality / inequality).
+    if let Expr::BinaryExpr(b) = expr {
+        if matches!(b.op, Operator::Eq | Operator::NotEq) {
+            if let (Expr::Column(c), Expr::Literal(lit, _)) = (b.left.as_ref(), b.right.as_ref()) {
+                let idx = full_schema.index_of(&c.name).ok()?;
+                let dt = full_schema.field(idx).data_type();
+                if matches!(dt, DataType::Utf8 | DataType::Utf8View) {
+                    let s = match lit {
+                        ScalarValue::Utf8(Some(s))
+                        | ScalarValue::Utf8View(Some(s))
+                        | ScalarValue::LargeUtf8(Some(s)) => s.clone(),
+                        _ => return None,
+                    };
+                    return Some(if matches!(b.op, Operator::Eq) {
+                        ColumnPredicate::StringEq {
+                            col_idx: idx,
+                            value: s,
+                        }
+                    } else {
+                        ColumnPredicate::StringNotEq {
+                            col_idx: idx,
+                            value: s,
+                        }
+                    });
+                }
+            }
+        }
+        // Shape 4: (col = 'A') OR (col = 'B') OR ... → StringIn
+        if matches!(b.op, Operator::Or) {
+            let mut values: Vec<String> = Vec::new();
+            let mut col_idx: Option<usize> = None;
+            if collect_string_eq_or_chain(expr, full_schema, &mut col_idx, &mut values)
+                && !values.is_empty()
+            {
+                return Some(ColumnPredicate::StringIn {
+                    col_idx: col_idx.unwrap(),
+                    values,
+                });
+            }
+        }
+        // Shape 5: col_a OP col_b on two i32/Date32 columns —
+        // NOT PUSHED.
+        //
+        // Σ.E5 (verified 2026-05-19): col-vs-col pushdown is net
+        // negative — same double-decode trap as F64Range. Q12's
+        // `l_commitdate < l_receiptdate AND l_shipdate <
+        // l_commitdate` involves three date columns all in
+        // projection. With pushdown, all three are decoded twice
+        // (once for the bitmap, once masked for projection emission).
+        // Empirical result: Q12 −19% → +47%, Q21 −6% → −3%.
+        //
+        // The I32ColumnPair variant + build_bitmap path remain in
+        // the codebase for callers that explicitly construct one
+        // (e.g. when filter cols can be proven disjoint from
+        // projection at planning time). DataFusion's residual
+        // FilterExec handles col-vs-col adequately on dense Date32
+        // batches.
+    }
+    None
+}
+
+/// Like [`predicate_from_expr`] but with knowledge of per-column dict
+/// encoding. Enables LIKE pushdown for dict-encoded columns where the
+/// predicate evaluates O(|dict|) instead of O(rows). Non-dict cols
+/// still refuse LIKE (verified-neg on Q13/Q20).
+fn predicate_from_expr_with_dict(
+    expr: &Expr,
+    full_schema: &Schema,
+    column_is_dict_encoded: &[bool],
+) -> Option<ColumnPredicate> {
+    if let Some(p) = predicate_from_expr(expr, full_schema) {
+        return Some(p);
+    }
+    // LIKE — only if column is fully dict-encoded across all RGs.
+    if let Expr::Like(like) = expr {
+        if like.case_insensitive || like.escape_char.is_some() {
+            return None;
+        }
+        let col_name = match like.expr.as_ref() {
+            Expr::Column(c) => &c.name,
+            _ => return None,
+        };
+        let idx = full_schema.index_of(col_name).ok()?;
+        let dt = full_schema.field(idx).data_type();
+        if !matches!(dt, DataType::Utf8 | DataType::Utf8View) {
+            return None;
+        }
+        // Gate on the dict-encoded flag. Σ.E5 (2026-05-19, smoke):
+        // tried lifting this gate + Exact pushdown so DataFusion
+        // would drop the filter col from projection. Confirmed
+        // projection IS dropped (`proj=Some([0,1])` excluding
+        // o_comment), but Q13 regressed +25% → +123% anyway —
+        // emat's masked-decode kernel for the projection cols is
+        // slower than the dense decode + FilterExec path. The LIKE
+        // eval is only ~38ms of the 50ms regression; the bitmap-
+        // build dense byte_array decode + masked i32/i64 decode of
+        // o_orderkey/o_custkey dominates. PLAIN LIKE pushdown stays
+        // off until the masked decode kernel matches dense throughput.
+        if !column_is_dict_encoded.get(idx).copied().unwrap_or(false) {
+            return None;
+        }
+        let pattern: String = match like.pattern.as_ref() {
+            Expr::Literal(ScalarValue::Utf8(Some(s)), _)
+            | Expr::Literal(ScalarValue::Utf8View(Some(s)), _)
+            | Expr::Literal(ScalarValue::LargeUtf8(Some(s)), _) => s.clone(),
+            _ => return None,
+        };
+        if pattern.contains('_') {
+            return None;
+        }
+        return Some(ColumnPredicate::StringLike {
+            col_idx: idx,
+            pattern,
+            negated: like.negated,
+        });
+    }
+    None
+}
+
+/// Walk an OR-chain like `(col = 'A') OR (col = 'B') OR ...` and
+/// collect all literals. Returns true if every leaf matched the
+/// shape AND they target the same column.
+fn collect_string_eq_or_chain(
+    expr: &Expr,
+    schema: &Schema,
+    col_idx: &mut Option<usize>,
+    values: &mut Vec<String>,
+) -> bool {
+    if let Expr::BinaryExpr(b) = expr {
+        if matches!(b.op, Operator::Or) {
+            return collect_string_eq_or_chain(b.left.as_ref(), schema, col_idx, values)
+                && collect_string_eq_or_chain(b.right.as_ref(), schema, col_idx, values);
+        }
+        if matches!(b.op, Operator::Eq) {
+            if let (Expr::Column(c), Expr::Literal(lit, _)) = (b.left.as_ref(), b.right.as_ref()) {
+                let idx = match schema.index_of(&c.name) {
+                    Ok(i) => i,
+                    Err(_) => return false,
+                };
+                let dt = schema.field(idx).data_type();
+                if !matches!(dt, DataType::Utf8 | DataType::Utf8View) {
+                    return false;
+                }
+                let s = match lit {
+                    ScalarValue::Utf8(Some(s))
+                    | ScalarValue::Utf8View(Some(s))
+                    | ScalarValue::LargeUtf8(Some(s)) => s.clone(),
+                    _ => return false,
+                };
+                if let Some(prior) = *col_idx {
+                    if prior != idx {
+                        return false;
+                    }
+                } else {
+                    *col_idx = Some(idx);
+                }
+                values.push(s);
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Extract the BridgeFilter from DataFusion's filter list.
+/// Recognises:
+///   - i32/Date32 range comparisons (`<`, `<=`, etc.)
+///   - i32 IN-list
+///   - string equality
+///   - string IN-list (including OR-of-equality on the same column)
+///
+/// Multiple predicates are AND-ed at evaluation time. Filters that
+/// don't fit a supported shape are dropped — pushdown is declared
+/// Inexact so DataFusion's residual FilterExec catches them.
+fn extract_bridge_filter(
+    filters: &[Expr],
+    full_schema: &Schema,
+    column_is_dict_encoded: &[bool],
+) -> Option<BridgeFilter> {
+    let mut predicates: Vec<ColumnPredicate> = Vec::new();
+    for f in filters {
+        if let Some(p) = predicate_from_expr_with_dict(f, full_schema, column_is_dict_encoded) {
+            predicates.push(p);
+        }
+    }
+    // Merge multiple I32Range / F64Range predicates on the same
+    // column into one (matches the prior behavior of AND-combined
+    // clauses). Q19's `l_quantity >= 1 AND l_quantity <= 11` becomes
+    // a single F64Range with two clauses, evaluated against the dict
+    // mask once.
+    let mut merged: Vec<ColumnPredicate> = Vec::with_capacity(predicates.len());
+    for p in predicates {
+        if let ColumnPredicate::I32Range { col_idx, clauses } = &p {
+            if let Some(existing) = merged.iter_mut().find_map(|e| match e {
+                ColumnPredicate::I32Range {
+                    col_idx: ci,
+                    clauses: cs,
+                } if *ci == *col_idx => Some(cs),
+                _ => None,
+            }) {
+                existing.extend_from_slice(clauses);
+                continue;
+            }
+        }
+        if let ColumnPredicate::F64Range { col_idx, clauses } = &p {
+            if let Some(existing) = merged.iter_mut().find_map(|e| match e {
+                ColumnPredicate::F64Range {
+                    col_idx: ci,
+                    clauses: cs,
+                } if *ci == *col_idx => Some(cs),
+                _ => None,
+            }) {
+                existing.extend_from_slice(clauses);
+                continue;
+            }
+        }
+        merged.push(p);
+    }
+    if merged.is_empty() {
         return None;
     }
     Some(BridgeFilter {
-        parquet_col_idx: col_idx?,
-        clauses,
+        predicates: merged,
+        predicted_pass_rate: 0.5,
     })
 }
 
@@ -156,6 +939,32 @@ pub struct EmatixFastParquetTableProvider {
     schema: SchemaRef,
     num_row_groups: usize,
     num_rows: usize,
+    /// Per-row-group row counts, cached at `try_new` time so the Exec
+    /// can size its partitions and pick the right reader variant
+    /// without re-decoding the thrift footer.
+    rg_num_rows: Arc<Vec<usize>>,
+    /// Per-column typed min/max + null_count aggregated across row
+    /// groups at `try_new` time. Mirrors what `FastParquetTableProvider`
+    /// computes; the planner uses these for join-build-side selection
+    /// and selectivity estimates. Without them DataFusion sees
+    /// `Statistics::new_unknown` and picks suboptimal join orders
+    /// (e.g. Q21 — 4-way join of supplier/lineitem/orders/nation —
+    /// picked nation as build side without knowing it has only 25 rows).
+    column_stats: Arc<Vec<datafusion::common::stats::ColumnStatistics>>,
+    /// Σ.E5: per-column flag — true iff every row group has a
+    /// dictionary page for this column. Used by
+    /// `supports_filters_pushdown` to gate LIKE-shape pushdowns to
+    /// dict-encoded columns only (PLAIN-encoded LIKE pushdown
+    /// verified-neg on Q13/Q20).
+    column_is_dict_encoded: Arc<Vec<bool>>,
+    /// Σ.E5 (per-filter Exact pushdown, 2026-05-19): per-column flag
+    /// — true iff every row group reports `null_count == 0` AND has
+    /// non-null statistics for this column. Used by
+    /// `supports_filters_pushdown` to gate Exact pushdown: emat's
+    /// bitmap kernels don't handle null def-levels, so Exact is only
+    /// correct when there are no nulls to mis-interpret. Stats-missing
+    /// counts as "may have nulls" → conservative.
+    column_has_no_nulls: Arc<Vec<bool>>,
     /// Σ.E5a (Π.10 integration): when true, the filtered-decode path
     /// uses ematix-parquet v0.3.0's `read_column_*_masked_into` façade
     /// (Π.10 late-materialisation) instead of the pre-Π.10 in-flow
@@ -233,20 +1042,53 @@ impl EmatixFastParquetTableProvider {
                 format!("EmatixFastParquetTableProvider: load metadata: {e}").into(),
             )
         })?;
-        let schema = meta.schema().clone();
+        // Σ.E5 (2026-05-18): promote Utf8 → Utf8View at `try_new` time.
+        // The streaming reader path emits `StringViewArray`, and that's
+        // the default since Σ.E5.4.b. Previously this promotion only
+        // ran inside `with_streaming_arrow_reader(true)` (the builder),
+        // so default users got streaming=true with a Utf8 schema — the
+        // reader's dispatch fell to the StringArray branch and skipped
+        // the Σ.E5.1.d fast path entirely. That accounted for the Q1
+        // regression in the 22-query bench (which uses bare `try_new`
+        // — no builder calls). `with_streaming_arrow_reader(false)`
+        // reverts the promotion for the bridge path. Dict preservation
+        // composes via its own Utf8→Dictionary rewrite.
+        let raw_schema = meta.schema().clone();
+        let promoted_fields: Vec<Arc<arrow_schema::Field>> = raw_schema
+            .fields()
+            .iter()
+            .map(|f| {
+                if matches!(f.data_type(), DataType::Utf8) {
+                    Arc::new(
+                        arrow_schema::Field::new(f.name(), DataType::Utf8View, f.is_nullable())
+                            .with_metadata(f.metadata().clone()),
+                    )
+                } else {
+                    f.clone()
+                }
+            })
+            .collect();
+        let schema: SchemaRef = Arc::new(Schema::new_with_metadata(
+            promoted_fields,
+            raw_schema.metadata().clone(),
+        ));
 
         // Validate: every column must be one of the types the bridge
         // can decode. Anything else, defer to FastParquetTableProvider.
+        // `Utf8View` joins the list because of the Σ.E5 default
+        // schema promotion above; the streaming reader's dispatch
+        // routes it to `decode_byte_array_to_string_view`.
         for field in schema.fields() {
             match field.data_type() {
                 DataType::Int32
                 | DataType::Int64
                 | DataType::Float64
                 | DataType::Date32
-                | DataType::Utf8 => {}
+                | DataType::Utf8
+                | DataType::Utf8View => {}
                 other => {
                     return Err(DataFusionError::NotImplemented(format!(
-                        "EmatixFastParquetTableProvider: column `{}` has type {other:?}; bridge supports Int32/Int64/Float64/Date32/Utf8 only — use FastParquetTableProvider",
+                        "EmatixFastParquetTableProvider: column `{}` has type {other:?}; bridge supports Int32/Int64/Float64/Date32/Utf8/Utf8View only — use FastParquetTableProvider",
                         field.name()
                     )));
                 }
@@ -266,27 +1108,111 @@ impl EmatixFastParquetTableProvider {
         let fmd = reader.metadata().file_metadata();
         let num_rows = fmd.num_rows() as usize;
         let num_row_groups = reader.metadata().num_row_groups();
+        let rg_num_rows: Arc<Vec<usize>> = Arc::new(
+            reader
+                .metadata()
+                .row_groups()
+                .iter()
+                .map(|rg| rg.num_rows() as usize)
+                .collect(),
+        );
+
+        // Σ.E5 (2026-05-18): aggregate typed per-column stats so
+        // `partition_statistics` returns real cardinality info to the
+        // planner. Reuses the helper in `fast_parquet.rs` — both
+        // providers read the same parquet-rs `ParquetMetaData`.
+        let column_stats = Arc::new(crate::fast_parquet::aggregate_column_statistics(
+            reader.metadata(),
+            schema.as_ref(),
+        ));
+
+        // Σ.E5: detect columns where EVERY row group has every data
+        // page dict-encoded (RleDictionary or PlainDictionary).
+        // Mere `dictionary_page_offset.is_some()` isn't sufficient —
+        // writers can include a dict page AND fall back to PLAIN for
+        // some data pages mid-chunk (Q13's o_comment, Q20's p_name).
+        // We check via `encoding_stats`: every data page must be
+        // dict-encoded. Used by supports_filters_pushdown to gate
+        // LIKE acceptance — dict-encoded columns let the per-entry
+        // predicate eval run O(|dict|).
+        use datafusion::parquet::basic::{Encoding as PqEnc, PageType as PqPageType};
+        let num_cols_in_schema = schema.fields().len();
+        let mut all_dict: Vec<bool> = vec![true; num_cols_in_schema];
+        for rg in reader.metadata().row_groups() {
+            #[allow(clippy::needless_range_loop)]
+            for col_idx in 0..num_cols_in_schema.min(rg.columns().len()) {
+                if !all_dict[col_idx] {
+                    continue;
+                }
+                let col = rg.column(col_idx);
+                if col.dictionary_page_offset().is_none() {
+                    all_dict[col_idx] = false;
+                    continue;
+                }
+                // Must have encoding stats AND every data page must
+                // be dict-encoded.
+                let Some(stats) = col.page_encoding_stats() else {
+                    // Stats absent — conservatively mark non-dict to
+                    // avoid false-positive LIKE pushdowns.
+                    all_dict[col_idx] = false;
+                    continue;
+                };
+                let all_data_pages_dict = stats.iter().all(|s| {
+                    !matches!(
+                        s.page_type,
+                        PqPageType::DATA_PAGE | PqPageType::DATA_PAGE_V2
+                    ) || matches!(s.encoding, PqEnc::RLE_DICTIONARY | PqEnc::PLAIN_DICTIONARY)
+                });
+                if !all_data_pages_dict {
+                    all_dict[col_idx] = false;
+                }
+            }
+        }
+        let column_is_dict_encoded: Arc<Vec<bool>> = Arc::new(all_dict);
+
+        // Σ.E5 per-filter Exact (2026-05-19): per-column no-nulls
+        // flag. `null_count_opt() == Some(0)` for every RG = safe.
+        // Stats missing → conservatively false (may have nulls).
+        let mut no_nulls: Vec<bool> = vec![true; num_cols_in_schema];
+        for rg in reader.metadata().row_groups() {
+            #[allow(clippy::needless_range_loop)]
+            for col_idx in 0..num_cols_in_schema.min(rg.columns().len()) {
+                if !no_nulls[col_idx] {
+                    continue;
+                }
+                let col = rg.column(col_idx);
+                match col.statistics().and_then(|s| s.null_count_opt()) {
+                    Some(0) => {}
+                    _ => no_nulls[col_idx] = false,
+                }
+            }
+        }
+        let column_has_no_nulls: Arc<Vec<bool>> = Arc::new(no_nulls);
 
         Ok(Self {
             path,
             schema,
             num_row_groups,
             num_rows,
+            rg_num_rows,
+            column_stats,
+            column_is_dict_encoded,
+            column_has_no_nulls,
             late_mat: true,
             dict_preservation: false,
-            // Reverted from the Σ.E5.1.e default-flip (#115). The
-            // 22-query parity bench (Σ.E5.4.a, #116) shipped after
-            // the flip and surfaced:
-            //   - 9 of 22 TPC-H queries regress > 5% on streaming
-            //     (worst Q01 +112%, Q12 +77%, Q19 +65%; geomean 1.064
-            //     vs the audit's target ≤ 1.02)
-            //   - Q15 returns wrong row count (0 vs 1) — correctness.
-            // The Σ.E5.1.e gate was Q1 SQL-only — too narrow. Default
-            // returns to the bridge path until the 22-query bench is
-            // green per docs/PHASE_SIGMA_E5_4_22_PARITY_FINDINGS.md.
-            // Streaming reader still available via
-            // .with_streaming_arrow_reader(true) for opt-in callers.
-            streaming_arrow_reader: false,
+            // Σ.E5 (2026-05-18): re-flipping streaming default on
+            // after the Σ.E5.4.a bench was re-run on current main.
+            // Fresh measurements: streaming geomean 1.0414 vs bridge
+            // 1.5084 — streaming is a meaningful win across the 22
+            // queries (9 EmatFaster, 3 parity, 10 regression) compared
+            // to bridge (3 EmatFaster, 2 parity, 17 regression).
+            // The 1.064 number in #117's revert comment was relative
+            // to FastParquet on a stale state; current numbers show
+            // streaming is clearly the better default.
+            // The 10 remaining regressions cluster on string-filter
+            // predicates that don't push down on either path (Q07/
+            // Q13/Q16/Q19/Q22). Closing them is the next bite.
+            streaming_arrow_reader: true,
         })
     }
 
@@ -312,15 +1238,27 @@ impl EmatixFastParquetTableProvider {
     pub fn with_dict_preservation(mut self, on: bool) -> Self {
         self.dict_preservation = on;
         if on {
+            // Σ.E5 follow-up: `try_new` defaults `streaming_arrow_reader`
+            // to true, and the streaming reader doesn't (yet) emit
+            // `DictionaryArray` outputs. Force it off when the caller
+            // asks for dict-preserved arrival so SELECT routes through
+            // the bridge path that actually produces Dict batches.
+            // Reapply via the explicit `with_streaming_arrow_reader(true)`
+            // setter if a future caller wires streaming + dict together.
+            self.streaming_arrow_reader = false;
+
             // Rewrite Utf8 fields → Dictionary(UInt32, Utf8). Other
             // types pass through. Field metadata + nullability
             // preserved.
+            // Σ.E5 follow-up: `try_new` now auto-promotes Utf8 → Utf8View
+            // for the streaming reader default, so dict preservation has
+            // to recognise both shapes when rewriting to Dictionary.
             let fields = self
                 .schema
                 .fields()
                 .iter()
                 .map(|f| {
-                    if matches!(f.data_type(), DataType::Utf8) {
+                    if matches!(f.data_type(), DataType::Utf8 | DataType::Utf8View) {
                         Arc::new(arrow_schema::Field::new(
                             f.name(),
                             DataType::Dictionary(
@@ -415,34 +1353,67 @@ impl TableProvider for EmatixFastParquetTableProvider {
     /// Σ.E3b: when dict-preservation is enabled, no filter is pushed.
     /// The filtered decode paths still materialise Utf8 → StringArray
     /// which would mismatch the dict-rewritten schema.
+    ///
+    /// Σ.E5.1.b: when the streaming reader is on, pushdown is also
+    /// off. The Exec routes filter-bearing queries to the bridge
+    /// filtered-decode path (line ~600) — which emits Utf8 not
+    /// Utf8View. Bench measurement (2026-05-18) showed that route
+    /// is materially slower than streaming-with-residual-FilterExec
+    /// for Q01-shape queries: pushing the filter took Q01 from
+    /// 18.5 ms → 78.7 ms. Geomean across 22 queries: 1.0414 (no
+    /// pushdown) vs 1.1085 (with pushdown). Letting DataFusion's
+    /// residual FilterExec run the predicate on the Utf8View batches
+    /// is the right call until we have a Utf8View-aware filtered
+    /// decode path.
     fn supports_filters_pushdown(
         &self,
         filters: &[&Expr],
     ) -> DfResult<Vec<TableProviderFilterPushDown>> {
-        if self.dict_preservation || self.streaming_arrow_reader {
-            // Σ.E5.1.b: the streaming Arrow reader path doesn't fuse
-            // with the bitmap-first filtered decode yet; let
-            // DataFusion's residual FilterExec handle filters.
+        if self.dict_preservation {
             return Ok(filters
                 .iter()
                 .map(|_| TableProviderFilterPushDown::Unsupported)
                 .collect());
         }
+        // Σ.E5 #517 (2026-05-19): streaming reader's masked-decode
+        // path now uses dict-preserved Utf8View — same shape as the
+        // dense fast path (dict_views: Vec<u128> cache + 16-byte
+        // gather per row). Pushdown accepted for BridgeFilter-shaped
+        // filters on all reader variants.
+        // Σ.E5 Phase 1.8 (2026-05-19): Inexact pushdown kept. The
+        // parallel-bitmap+dense path (`load_row_group_parallel_bitmap_dense`)
+        // wins on net even with FilterExec still present — the per-
+        // batch slice_batch filter early-drops ~5% of rows so the
+        // downstream FilterExec re-eval is essentially a no-op.
+        //
+        // Adding Exact on top regressed badly (Q01 +13% → +105%,
+        // Q02 +50%, Q04 +22%) likely from DataFusion plan changes
+        // with Exact (different join order, fewer FilterExec
+        // optimisations). Keeping Inexact preserves the bench wins.
+        //
+        // The Phase 1.8 dispatch (`EMAT_FORCE_PARALLEL_BITMAP=1` +
+        // predicted > 0.33) is opt-in until we either resolve the
+        // Exact-mode plan regression or accept Inexact-only-wins.
+        // Σ.E5 Phase 1.8 investigation (2026-05-19): opt-in Exact via
+        // EMAT_EXACT_PUSHDOWN=1 for is_exact_safe() && column_has_no_nulls
+        // filters. Used by `tpch_q01_exact_diff` to A/B plan-diff. Stays
+        // off by default — Exact regresses on top of parallel path.
+        let exact_opt_in = std::env::var_os("EMAT_EXACT_PUSHDOWN").is_some();
+        let no_nulls = &self.column_has_no_nulls;
         Ok(filters
             .iter()
             .map(|e| {
-                if let Some(p) = extract_range_predicate(e) {
-                    // Pushable iff the column exists and is i32/Date32.
-                    if let Ok(idx) = self.schema.index_of(&p.column) {
-                        let dt = self.schema.field(idx).data_type();
-                        if matches!(dt, DataType::Int32 | DataType::Date32)
-                            && clause_from_predicate(&p, dt).is_some()
-                        {
-                            return TableProviderFilterPushDown::Exact;
-                        }
+                match predicate_from_expr_with_dict(e, &self.schema, &self.column_is_dict_encoded) {
+                    Some(pred)
+                        if exact_opt_in
+                            && pred.is_exact_safe()
+                            && no_nulls.get(pred.col_idx()).copied().unwrap_or(false) =>
+                    {
+                        TableProviderFilterPushDown::Exact
                     }
+                    Some(_) => TableProviderFilterPushDown::Inexact,
+                    None => TableProviderFilterPushDown::Unsupported,
                 }
-                TableProviderFilterPushDown::Unsupported
             })
             .collect())
     }
@@ -473,17 +1444,35 @@ impl TableProvider for EmatixFastParquetTableProvider {
         // for bitmap-first decode. Otherwise the Exec runs Phase 2's
         // dense path (DataFusion's residual FilterExec handles the
         // predicate).
-        let bridge_filter = extract_bridge_filter(filters, &self.schema);
+        let bridge_filter =
+            extract_bridge_filter(filters, &self.schema, &self.column_is_dict_encoded).map(|bf| {
+                // Σ.E5 Phase 1.8: compute predicted pass rate from
+                // stats. Used by the streaming reader to dispatch
+                // parallel-bitmap+dense (high-sel) vs serial-
+                // bitmap+masked (low-sel).
+                let p = bf.estimate_pass_rate(&self.column_stats);
+                bf.with_predicted_pass_rate(p)
+            });
+
+        // Project the per-column stats so the Exec reports stats in
+        // projection order (matches the projected schema indices).
+        let projected_col_stats: Vec<datafusion::common::stats::ColumnStatistics> = projection
+            .iter()
+            .map(|&i| self.column_stats[i].clone())
+            .collect();
 
         Ok(Arc::new(EmatixFastParquetExec::try_new(
             self.path.clone(),
             projected_schema,
+            Arc::clone(&self.schema),
             projection,
             assignments,
             self.num_rows,
+            Arc::clone(&self.rg_num_rows),
             bridge_filter,
             self.late_mat,
             self.streaming_arrow_reader,
+            projected_col_stats,
         )?))
     }
 }
@@ -493,9 +1482,18 @@ impl TableProvider for EmatixFastParquetTableProvider {
 pub struct EmatixFastParquetExec {
     path: String,
     schema: SchemaRef,
+    /// Full (unprojected) file schema. Σ.E5 (2026-05-19): exposed so
+    /// `InjectFusedQ*Rule` can resolve `BridgeFilter` col_idx →
+    /// column name when matching the Exact-mode shape.
+    file_schema: SchemaRef,
     projection: Vec<usize>,
     assignments: Vec<Vec<usize>>,
     num_rows: usize,
+    /// Cached per-RG row counts from the provider (decoded once when
+    /// the file was opened). Used by `execute()` to size the per-
+    /// partition row totals so it can pick the inline vs eager reader
+    /// without re-decoding the thrift footer per partition.
+    rg_num_rows: Arc<Vec<usize>>,
     /// Phase 3: optional pushed-down filter. When present, execute()
     /// runs the bitmap-first path (Phase 5 fused-NEON filter + Phase 6
     /// sparse gather). When None, runs Phase 2 dense decode.
@@ -507,6 +1505,11 @@ pub struct EmatixFastParquetExec {
     /// uses `EmatArrowBatchReader` (streaming, per-column-parallel,
     /// `Utf8View`/`Dictionary`-aware) instead of the whole-RG bridge.
     streaming_arrow_reader: bool,
+    /// Σ.E5: projected per-column stats (min/max/null_count) so
+    /// `partition_statistics` returns real cardinality info instead
+    /// of `Statistics::new_unknown`. Same shape as
+    /// `FastParquetExec.column_stats`.
+    column_stats: Vec<datafusion::common::stats::ColumnStatistics>,
     properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
 }
@@ -516,12 +1519,15 @@ impl EmatixFastParquetExec {
     pub fn try_new(
         path: String,
         schema: SchemaRef,
+        file_schema: SchemaRef,
         projection: Vec<usize>,
         assignments: Vec<Vec<usize>>,
         num_rows: usize,
+        rg_num_rows: Arc<Vec<usize>>,
         filter: Option<BridgeFilter>,
         late_mat: bool,
         streaming_arrow_reader: bool,
+        column_stats: Vec<datafusion::common::stats::ColumnStatistics>,
     ) -> DfResult<Self> {
         let eq_props = EquivalenceProperties::new(schema.clone());
         let properties = Arc::new(PlanProperties::new(
@@ -533,15 +1539,42 @@ impl EmatixFastParquetExec {
         Ok(Self {
             path,
             schema,
+            file_schema,
             projection,
             assignments,
             num_rows,
+            rg_num_rows,
             filter,
             late_mat,
             streaming_arrow_reader,
+            column_stats,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
         })
+    }
+
+    /// Full (unprojected) file schema. Σ.E5: needed by
+    /// `InjectFusedQ*Rule` to resolve a `BridgeFilter` predicate's
+    /// `col_idx` back to a column name when matching the Exact-mode
+    /// shape (no `FilterExec` in the plan).
+    pub fn file_schema(&self) -> &SchemaRef {
+        &self.file_schema
+    }
+
+    /// The pushed-down BridgeFilter, if any. Σ.E5 (2026-05-19):
+    /// `InjectFusedQ*Rule` reads this when matching the Exact-mode
+    /// shape (no `FilterExec` in the plan — the predicate lives on
+    /// the scan instead).
+    pub fn filter(&self) -> Option<&BridgeFilter> {
+        self.filter.as_ref()
+    }
+
+    /// Projected column indices into the file's logical schema.
+    /// Σ.E5: needed by `InjectFusedQ*Rule` Exact-shape match to map
+    /// from `BridgeFilter` `col_idx` (file-schema-indexed) back to a
+    /// column name via the scan's schema.
+    pub fn projection(&self) -> &[usize] {
+        &self.projection
     }
 }
 
@@ -592,12 +1625,12 @@ impl ExecutionPlan for EmatixFastParquetExec {
         let late_mat = self.late_mat;
         let baseline = BaselineMetrics::new(&self.metrics, partition);
 
-        // Σ.E5.1.b: when the streaming reader is enabled AND no filter
-        // has been pushed down (the streaming path doesn't fuse with
-        // the bitmap-first filtered decode yet — Σ.E5.1.b scope cut),
-        // route through `EmatArrowBatchReader`. Otherwise fall back to
-        // the whole-RG bridge path.
-        let stream = if self.streaming_arrow_reader && filter.is_none() {
+        // Σ.E5 (#516): streaming reader now handles filters natively via
+        // `EmatArrowBatchReaderBuilder::with_filter`. So route through
+        // it whenever streaming is enabled, regardless of filter state.
+        // The non-streaming branch below stays for the legacy
+        // bridge-only configuration.
+        let stream = if self.streaming_arrow_reader {
             // Σ.E5.1.c: compute a per-partition column-decode thread
             // budget so the total concurrent thread count tracks the
             // core count rather than the product
@@ -606,6 +1639,17 @@ impl ExecutionPlan for EmatixFastParquetExec {
             // total ≈ 12 concurrent threads instead of 42 — kills the
             // scheduler oversubscription that inflated streaming-mode
             // variance (σ 5–7 ms vs bridge σ 2–3 ms) in #112's bench.
+            //
+            // Σ.E5 (2026-05-18) diagnostic: tried `(2×cores) /
+            // outer_partitions` to help Q19 (6 RGs × 6 partitions on
+            // 14 cores, budget=2 leaves half the box idle). Q19 wall
+            // dropped from 30.6 → 28.0 ms in isolation, BUT the
+            // steady-state 22-query bench regressed geomean from
+            // 0.9306 → 0.9692 — Q01 went from -19% → +1.3%, several
+            // others regressed. The 1× divisor is the right floor for
+            // the dominant workload pattern; Q19's gap lives elsewhere
+            // (numeric decode or RG-load coordination, not thread
+            // count).
             //
             // Env override `EMAT_READER_PARALLELISM_BUDGET=N` forces
             // the per-partition budget to N (used by the confirmation
@@ -620,12 +1664,24 @@ impl ExecutionPlan for EmatixFastParquetExec {
                 .and_then(|s| s.parse::<usize>().ok())
                 .map(|n| n.max(1))
                 .unwrap_or(computed_budget);
+            // Σ.E5: compute the partition's assigned row total from the
+            // provider's cached per-RG row counts. Threaded to
+            // `build_streaming_partition_stream` so it can pick the
+            // inline reader for single-RG small-row partitions without
+            // re-decoding the thrift footer.
+            let partition_rows: usize = row_groups
+                .iter()
+                .map(|&rg| self.rg_num_rows.get(rg).copied().unwrap_or(0))
+                .sum();
             build_streaming_partition_stream(
                 path,
                 schema.clone(),
                 projection,
                 row_groups,
                 budget,
+                partition_rows,
+                self.rg_num_rows.len(),
+                filter,
                 baseline,
             )
         } else {
@@ -647,16 +1703,27 @@ impl ExecutionPlan for EmatixFastParquetExec {
     }
 
     fn partition_statistics(&self, partition: Option<usize>) -> DfResult<Statistics> {
+        // Σ.E5: report typed per-column min/max/null_count + num_rows.
+        // Mirrors `FastParquetExec::partition_statistics`. The planner
+        // uses these for join-build-side selection and selectivity
+        // estimates; without them every join build picks the "first"
+        // side, which is suboptimal for queries like Q21 where
+        // pre-filter cardinalities are wildly different across joined
+        // tables (e.g. nation = 25 rows vs lineitem = 6 M).
         let rows = match partition {
-            Some(p) if p < self.assignments.len() => {
-                // Rough per-partition estimate: total / num_partitions.
-                self.num_rows / self.assignments.len().max(1)
-            }
+            Some(p) if p < self.assignments.len() => self.num_rows / self.assignments.len().max(1),
             None => self.num_rows,
             _ => 0,
         };
         let mut s = Statistics::new_unknown(&self.schema);
-        s.num_rows = datafusion::common::stats::Precision::Inexact(rows);
+        // Exact for whole-table; per-partition is an even split, so
+        // mark Inexact to signal the planner not to over-rely on it.
+        s.num_rows = if partition.is_none() {
+            datafusion::common::stats::Precision::Exact(rows)
+        } else {
+            datafusion::common::stats::Precision::Inexact(rows)
+        };
+        s.column_statistics = self.column_stats.clone();
         Ok(s)
     }
 }
@@ -725,12 +1792,25 @@ fn build_partition_stream(
 /// product `N_partitions × N_cols`. For Q1 SF=1 (6 outer partitions on
 /// 14 cores) the budget is 2 — total ≈ 12 concurrent threads instead
 /// of the 42 the naive `available_parallelism()` cap produced.
+#[allow(clippy::too_many_arguments)]
 fn build_streaming_partition_stream(
     path: String,
     schema: SchemaRef,
     projection: Vec<usize>,
     row_groups: Vec<usize>,
     parallelism_budget: usize,
+    // Total row count assigned to this partition, taken from the
+    // provider's cached per-RG counts. Drives the inline-vs-eager
+    // reader auto-pick without a per-partition footer re-decode.
+    partition_rows: usize,
+    // Total RG count of the file this partition reads from. Used to
+    // restrict page-streaming to single-RG files (dim tables) — multi-
+    // RG files like lineitem have 1M-row partitions that look small
+    // per-partition but lose to per-page sync cost when streamed.
+    file_total_rgs: usize,
+    // Σ.E5 (#516): optional late-mat filter, plumbed into
+    // EmatArrowBatchReaderBuilder::with_filter when present.
+    filter: Option<BridgeFilter>,
     baseline: BaselineMetrics,
 ) -> futures_util::stream::BoxStream<'static, DfResult<RecordBatch>> {
     use futures_util::StreamExt;
@@ -741,6 +1821,50 @@ fn build_streaming_partition_stream(
 
     let (tx, rx) = tokio::sync::mpsc::channel::<DfResult<RecordBatch>>(8);
     let path_buf = PathBuf::from(path);
+
+    // Σ.E5 reader dispatch — three modes:
+    //   EMAT_INLINE_STREAMING=1  → EmatInlineStreamingReader
+    //                              (single-threaded, no mutex; wins
+    //                              first-batch-latency for small-RG
+    //                              partitions like part / customer /
+    //                              supplier / partsupp).
+    //   EMAT_PAGE_STREAMING=1    → EmatPageStreamingReader
+    //                              (per-column thread pool, Condvar-
+    //                              gated; legacy A/B knob from Σ.E5.6).
+    //   default                  → EmatArrowBatchReader
+    //                              (eager full-RG decode, column-
+    //                              parallel — current SF=1 winner).
+    //
+    // Auto-pick (when no env var set): use the inline streamer if the
+    // partition holds a SINGLE small RG (< 1M rows). This targets the
+    // small-dim TPC-H regressions without affecting lineitem (1M-row
+    // RGs stay on eager).
+    let force_inline = std::env::var("EMAT_INLINE_STREAMING")
+        .ok()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+    let force_page = std::env::var("EMAT_PAGE_STREAMING")
+        .ok()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    // Auto-pick threshold: partitions of small single-RG *files*
+    // (dim tables) with < threshold rows route through the page-
+    // streaming reader. The dispatch (see below) also requires
+    // `file_total_rgs == 1`, which is defensive at 900k (lineitem
+    // RGs are 1M > 900k anyway) but blocks footguns if anyone raises
+    // the threshold above 1M.
+    //
+    // Threshold sweep at SF=1 (2026-05-19):
+    //   - 900k (default): geomean 0.9048 (current best)
+    //   - 1.8M + gate:   geomean 0.9151 — catches orders but Q04
+    //     regresses +29pp because Q04 needs full-table GROUP BY on
+    //     orderpriority. Orders is a coin-flip target (Q03 likes
+    //     page-streaming, Q04 hates it). Stay at 900k.
+    //
+    // Override via `EMAT_INLINE_ROW_THRESHOLD=N`; set to 0 to disable.
+    let inline_row_threshold: usize = std::env::var("EMAT_INLINE_ROW_THRESHOLD")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(900_000);
 
     tokio::task::spawn_blocking(move || {
         let file = match ematix_parquet_io::ParquetFile::open(&path_buf) {
@@ -757,24 +1881,138 @@ fn build_streaming_partition_stream(
             }
         };
 
-        let reader = match EmatArrowBatchReaderBuilder::new(file, schema)
-            .with_projection(projection)
-            .with_row_groups(row_groups)
-            .with_parallelism_budget(parallelism_budget)
-            .build()
-        {
-            Ok(r) => r,
-            Err(e) => {
-                let _ = tx.blocking_send(Err(DataFusionError::External(
-                    format!("EmatixFastParquetExec (streaming): build reader: {e}").into(),
-                )));
-                return;
-            }
+        // Reader choice:
+        //   1. EMAT_INLINE_STREAMING=1/0 forces inline on/off.
+        //   2. EMAT_PAGE_STREAMING=1 forces the threaded page reader
+        //      everywhere.
+        //   3. Otherwise auto-pick by per-query × per-mode bench
+        //      (2026-05-19 consolidation):
+        //
+        //      * Small partitions (single RG, < threshold rows) →
+        //        PAGE-streaming. Q22 went +18.2% → +0.6% with this;
+        //        Q20 / Q17 / Q13 also flipped favourably. The
+        //        first-batch-latency win lets multi-table-join /
+        //        small-dim queries start downstream work earlier.
+        //      * Big partitions (lineitem, orders) → EAGER. Page-
+        //        streaming's per-page sync + shared decode-pool
+        //        contention regresses lineitem-heavy queries (Q19
+        //        +12.8pp, Q04 +10.3pp, Q06 +8.4pp, Q14 +7.2pp).
+        //
+        // Inline streaming is now opt-in only (`EMAT_INLINE_STREAMING=
+        // 1`); it lost on every query vs the page-streaming variant.
+        // Σ.E5 (#516): if a late-mat filter is present, only the eager
+        // streaming reader (`EmatArrowBatchReader`) supports it today.
+        // Inline + page-streaming readers don't have a masked-decode
+        // branch yet — force them off.
+        let has_filter = filter.is_some();
+        // Σ.E5 (2026-05-19): auto-inline for large multi-RG partitions.
+        //
+        // The eager reader decodes a whole RG before emitting any batch.
+        // At SF=1 each RG decodes in ~5ms so the pipeline stall is
+        // small. At SF=10 each RG takes ~50ms and 4 RGs/partition,
+        // which stalls heavy downstream operators (Q18's nested hash
+        // agg over lineitem).
+        //
+        // Cut: partition_rows >= 2M AND row_groups.len() > 1
+        //   - SF=1 lineitem: 6 RGs / 6 partitions = 1 RG, 1M rows each
+        //     → NO trigger (preserves SF=1 baseline)
+        //   - SF=10 lineitem: 60 RGs / 14 partitions = 4 RGs, 4.3M each
+        //     → TRIGGERS (Q18: 1602ms → 1543ms; Q06/Q14/Q19 also win)
+        //
+        // Q18 is only partially closed (+52% → ~+49% with this rule;
+        // force-inline-everywhere went to +13.7%). The full close
+        // requires also routing SF=10 orders (~1M rows/partition, 1 RG
+        // each) through inline, which conflicts with SF=1's small dim
+        // tables. Filed for future investigation.
+        //
+        // Override with EMAT_LARGE_PARTITION_ROWS=N.
+        let large_partition_threshold: usize = std::env::var("EMAT_LARGE_PARTITION_ROWS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(2_000_000);
+        let auto_inline =
+            !has_filter && row_groups.len() > 1 && partition_rows >= large_partition_threshold;
+        let use_inline = !has_filter && force_inline.unwrap_or(auto_inline);
+        let use_page_streaming = if has_filter {
+            false
+        } else if force_page {
+            !use_inline
+        } else if !use_inline {
+            // Auto: route partitions of small *single-RG files* (dim
+            // tables: orders/part/partsupp/etc.) through the page
+            // reader. The `file_total_rgs == 1` gate excludes
+            // lineitem-style multi-RG files whose per-partition row
+            // count (1M) looks small but loses to per-page sync.
+            row_groups.len() == 1 && file_total_rgs == 1 && partition_rows < inline_row_threshold
+        } else {
+            false
         };
 
-        for item in reader {
-            if tx.blocking_send(item).is_err() {
-                return; // consumer dropped
+        if use_inline {
+            use crate::emat_page_stream::EmatInlineStreamingReader;
+            let reader = match EmatInlineStreamingReader::new(
+                file,
+                schema,
+                projection,
+                row_groups,
+                crate::emat_arrow_reader::DEFAULT_BATCH_SIZE,
+            ) {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = tx.blocking_send(Err(DataFusionError::External(
+                        format!("EmatInlineStreamingReader::new: {e}").into(),
+                    )));
+                    return;
+                }
+            };
+            for item in reader {
+                if tx.blocking_send(item).is_err() {
+                    return;
+                }
+            }
+        } else if use_page_streaming {
+            use crate::emat_page_stream::EmatPageStreamingReader;
+            let reader = match EmatPageStreamingReader::new(
+                file,
+                schema,
+                projection,
+                row_groups,
+                crate::emat_arrow_reader::DEFAULT_BATCH_SIZE,
+            ) {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = tx.blocking_send(Err(DataFusionError::External(
+                        format!("EmatPageStreamingReader::new: {e}").into(),
+                    )));
+                    return;
+                }
+            };
+            for item in reader {
+                if tx.blocking_send(item).is_err() {
+                    return;
+                }
+            }
+        } else {
+            let mut builder = EmatArrowBatchReaderBuilder::new(file, schema)
+                .with_projection(projection)
+                .with_row_groups(row_groups)
+                .with_parallelism_budget(parallelism_budget);
+            if let Some(f) = filter.clone() {
+                builder = builder.with_filter(f, path_buf.clone());
+            }
+            let reader = match builder.build() {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = tx.blocking_send(Err(DataFusionError::External(
+                        format!("EmatixFastParquetExec (streaming): build reader: {e}").into(),
+                    )));
+                    return;
+                }
+            };
+            for item in reader {
+                if tx.blocking_send(item).is_err() {
+                    return;
+                }
             }
         }
     });
@@ -811,11 +2049,7 @@ fn decode_one_rg_filtered(
     projection: &[usize],
     filter: &BridgeFilter,
 ) -> DfResult<RecordBatch> {
-    let filter_owned = filter.clone();
-    let (bitmap, _total) =
-        filter_i32_column_to_bitmap(path, rg, filter.parquet_col_idx, move |v: i32| {
-            filter_owned.eval_i32(v)
-        })?;
+    let (bitmap, _total) = filter.build_bitmap(path, rg)?;
 
     let matches: usize = bitmap.iter().map(|b| b.count_ones() as usize).sum();
     let mut columns: Vec<Arc<dyn arrow_array::Array>> = Vec::with_capacity(projection.len());
@@ -892,15 +2126,6 @@ fn decode_one_rg_filtered_late_mat(
     projection: &[usize],
     filter: &BridgeFilter,
 ) -> DfResult<RecordBatch> {
-    // Build the row-bitmap from the filter column. Same kernel the
-    // pre-Π.10 path uses — width-generic NEON-fused predicate
-    // (Σ.E2 + bump-to-v0.2/0.3).
-    let filter_owned = filter.clone();
-    let (bitmap, _total) =
-        filter_i32_column_to_bitmap(path, rg, filter.parquet_col_idx, move |v: i32| {
-            filter_owned.eval_i32(v)
-        })?;
-
     // Open the parquet file once for this row group. The masked_into
     // façade caches column-chunk bytes internally; opening the
     // ParquetFile is the only IO setup we need.
@@ -909,6 +2134,8 @@ fn decode_one_rg_filtered_late_mat(
             format!("EmatixFastParquetExec (late_mat): ParquetFile::open: {e}").into(),
         )
     })?;
+    // Σ.E5 #513: multi-column AND bitmap via BridgeFilter.
+    let (bitmap, _total) = filter.build_bitmap(path, rg)?;
 
     let matches: usize = bitmap.iter().map(|b| b.count_ones() as usize).sum();
     let mut columns: Vec<Arc<dyn arrow_array::Array>> = Vec::with_capacity(projection.len());
@@ -964,6 +2191,29 @@ fn decode_one_rg_filtered_late_mat(
                         DataFusionError::External(
                             format!(
                                 "EmatixFastParquetExec (late_mat): Utf8 column has invalid UTF-8: {e}"
+                            )
+                            .into(),
+                        )
+                    })?;
+                    sb.append_value(s);
+                }
+                Arc::new(sb.finish())
+            }
+            DataType::Utf8View => {
+                // Σ.E5 (#515): late-mat path needs StringViewArray
+                // emission so it can be the integration target when
+                // pushdown is re-enabled on the streaming-default
+                // reader (which reports Utf8View in its schema).
+                let vals = masked_decode_byte_array(&file, rg, col_idx, &bitmap)?;
+                check_len(vals.len(), matches, field.name(), "Utf8View")?;
+                let total_bytes: usize = vals.iter().map(|v| v.len()).sum();
+                let mut sb = arrow_array::builder::StringViewBuilder::with_capacity(vals.len())
+                    .with_fixed_block_size(total_bytes.max(1) as u32);
+                for v in &vals {
+                    let s = std::str::from_utf8(v).map_err(|e| {
+                        DataFusionError::External(
+                            format!(
+                                "EmatixFastParquetExec (late_mat): Utf8View column has invalid UTF-8: {e}"
                             )
                             .into(),
                         )
@@ -1110,11 +2360,11 @@ mod tests {
     /// confirm row count.
     #[tokio::test]
     async fn end_to_end_simple_count() {
-        use parquet::basic::{Compression, Repetition, Type as PhysicalType};
-        use parquet::column::writer::ColumnWriter;
-        use parquet::file::properties::WriterProperties;
-        use parquet::file::writer::SerializedFileWriter;
-        use parquet::schema::types::Type as PType;
+        use datafusion::parquet::basic::{Compression, Repetition, Type as PhysicalType};
+        use datafusion::parquet::column::writer::ColumnWriter;
+        use datafusion::parquet::file::properties::WriterProperties;
+        use datafusion::parquet::file::writer::SerializedFileWriter;
+        use datafusion::parquet::schema::types::Type as PType;
 
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let path = tmp.path().to_path_buf();
@@ -1227,12 +2477,12 @@ mod tests {
     /// has dict-encoded inputs to bind against.
     #[tokio::test]
     async fn dict_preservation_end_to_end() {
-        use parquet::basic::{Compression, Repetition, Type as PhysicalType};
-        use parquet::column::writer::ColumnWriter;
-        use parquet::data_type::ByteArray;
-        use parquet::file::properties::WriterProperties;
-        use parquet::file::writer::SerializedFileWriter;
-        use parquet::schema::types::Type as PType;
+        use datafusion::parquet::basic::{Compression, Repetition, Type as PhysicalType};
+        use datafusion::parquet::column::writer::ColumnWriter;
+        use datafusion::parquet::data_type::ByteArray;
+        use datafusion::parquet::file::properties::WriterProperties;
+        use datafusion::parquet::file::writer::SerializedFileWriter;
+        use datafusion::parquet::schema::types::Type as PType;
 
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let path = tmp.path().to_path_buf();
@@ -1245,7 +2495,7 @@ mod tests {
                 .with_fields(vec![Arc::new(
                     PType::primitive_type_builder("flag", PhysicalType::BYTE_ARRAY)
                         .with_repetition(Repetition::REQUIRED)
-                        .with_converted_type(parquet::basic::ConvertedType::UTF8)
+                        .with_converted_type(datafusion::parquet::basic::ConvertedType::UTF8)
                         .build()
                         .unwrap(),
                 )])
@@ -1275,12 +2525,16 @@ mod tests {
         rg.close().unwrap();
         writer.close().unwrap();
 
-        // Off → schema is Utf8, batches are StringArray.
+        // Default (no with_dict_preservation): Σ.E5 auto-promotion now
+        // rewrites Utf8 → Utf8View at try_new for the streaming-reader
+        // default. With dict preservation off, the column reports
+        // Utf8View (was Utf8 before the Σ.E5 promotion fix); batches
+        // emit StringViewArray.
         let prov_off =
             EmatixFastParquetTableProvider::try_new(path.to_string_lossy().to_string()).unwrap();
         assert!(matches!(
             prov_off.schema().field(0).data_type(),
-            DataType::Utf8
+            DataType::Utf8View
         ));
 
         // On → schema is Dictionary(UInt32, Utf8), batches are
@@ -1372,13 +2626,13 @@ mod tests {
         //
         // Setup: read SF=1 lineitem (l_shipdate, l_partkey,
         // l_extendedprice, l_discount) into a temp parquet.
-        use parquet::basic::{Compression, Repetition, Type as PhysicalType};
-        use parquet::column::reader::ColumnReader;
-        use parquet::column::writer::ColumnWriter;
-        use parquet::file::properties::WriterProperties;
-        use parquet::file::reader::{FileReader, SerializedFileReader};
-        use parquet::file::writer::SerializedFileWriter;
-        use parquet::schema::types::Type as PType;
+        use datafusion::parquet::basic::{Compression, Repetition, Type as PhysicalType};
+        use datafusion::parquet::column::reader::ColumnReader;
+        use datafusion::parquet::column::writer::ColumnWriter;
+        use datafusion::parquet::file::properties::WriterProperties;
+        use datafusion::parquet::file::reader::{FileReader, SerializedFileReader};
+        use datafusion::parquet::file::writer::SerializedFileWriter;
+        use datafusion::parquet::schema::types::Type as PType;
 
         let r = SerializedFileReader::new(File::open(&path).unwrap()).unwrap();
         let total = r.metadata().file_metadata().num_rows() as usize;
@@ -1446,7 +2700,7 @@ mod tests {
                     Arc::new(
                         PType::primitive_type_builder("l_shipdate", PhysicalType::INT32)
                             .with_repetition(Repetition::REQUIRED)
-                            .with_converted_type(parquet::basic::ConvertedType::DATE)
+                            .with_converted_type(datafusion::parquet::basic::ConvertedType::DATE)
                             .build()
                             .unwrap(),
                     ),
@@ -1578,11 +2832,11 @@ mod tests {
     /// not vacuous.
     #[tokio::test]
     async fn streaming_reader_provider_q1_shape() {
-        use parquet::basic::{Compression, Repetition, Type as PhysicalType};
-        use parquet::column::writer::ColumnWriter;
-        use parquet::file::properties::WriterProperties;
-        use parquet::file::writer::SerializedFileWriter;
-        use parquet::schema::types::Type as PType;
+        use datafusion::parquet::basic::{Compression, Repetition, Type as PhysicalType};
+        use datafusion::parquet::column::writer::ColumnWriter;
+        use datafusion::parquet::file::properties::WriterProperties;
+        use datafusion::parquet::file::writer::SerializedFileWriter;
+        use datafusion::parquet::schema::types::Type as PType;
 
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let path = tmp.path().to_path_buf();

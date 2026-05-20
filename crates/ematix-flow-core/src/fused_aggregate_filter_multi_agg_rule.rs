@@ -67,8 +67,10 @@ use datafusion::physical_expr::aggregate::AggregateFunctionExpr;
 use datafusion::physical_expr::expressions::{BinaryExpr, Column, Literal};
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::ExecutionPlan;
+use datafusion::physical_plan::Partitioning;
 use datafusion::physical_plan::filter::FilterExec;
 use datafusion::physical_plan::projection::ProjectionExec;
+use datafusion::physical_plan::repartition::RepartitionExec;
 
 use crate::fused_aggregate_exec::FusedAggregateExec;
 use crate::fused_aggregate_filter_multi_agg::{FilterMultiAggSpec, GroupKeyKind};
@@ -124,6 +126,9 @@ impl PhysicalOptimizerRule for InjectFilterMultiAggRule {
 fn try_match_filter_multi_agg_plan(
     node: &Arc<dyn ExecutionPlan>,
 ) -> DfResult<Option<Arc<dyn ExecutionPlan>>> {
+    if std::env::var_os("EMAT_DISABLE_FILTER_MULTI_AGG").is_some() {
+        return Ok(None);
+    }
     // The expected_agg_count is read off the actual plan; we just need
     // the group-by count to commit to a CFG up-front. Try 1 then 2.
     // Similarly, we try both `expect_top_sort` settings (with `ORDER BY`
@@ -333,7 +338,34 @@ fn try_build_replacement(
         Err(_) => return Ok(None),
     };
 
-    let fused = Arc::new(FusedAggregateExec::try_new(scan, spec)?) as Arc<dyn ExecutionPlan>;
+    // Σ.G.2f.3 perf (2026-05-19): FusedAggregateExec now fans out
+    // *internally* via async-channel MPMC, so we don't need to wrap
+    // the scan in RepartitionExec(RoundRobinBatch) anymore. The agg
+    // pulls from the scan's natural partitions and dispatches
+    // batches to a worker pool sized by target_partitions.
+    //
+    // EMAT_FILTER_MULTI_AGG_USE_REPARTITION=1 re-enables the old
+    // RepartitionExec-based fanout for A/B testing.
+    let input_for_fused: Arc<dyn ExecutionPlan> =
+        if std::env::var_os("EMAT_FILTER_MULTI_AGG_USE_REPARTITION").is_some() {
+            let target_partitions: usize = std::env::var("EMAT_FILTER_MULTI_AGG_FANOUT")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(18);
+            let scan_partitions = scan.properties().partitioning.partition_count();
+            if target_partitions > scan_partitions {
+                Arc::new(RepartitionExec::try_new(
+                    scan,
+                    Partitioning::RoundRobinBatch(target_partitions),
+                )?)
+            } else {
+                scan
+            }
+        } else {
+            scan
+        };
+    let fused =
+        Arc::new(FusedAggregateExec::try_new(input_for_fused, spec)?) as Arc<dyn ExecutionPlan>;
 
     // Wrap the fused exec in a ProjectionExec that re-orders / re-aliases
     // its output columns to match the top ProjectionExec's schema. The
@@ -502,9 +534,10 @@ fn extract_one_agg(
     }
 }
 
-/// If `expr` is a `Column` whose name appears in the CSE projection's
-/// output, return a clone of the projection's input expression for that
-/// column. Otherwise return `expr` unchanged.
+/// Resolve `__common_expr_N` references in `expr` against the CSE
+/// projection. Walks recursively so a Column inside a nested
+/// BinaryExpr (e.g. Q01's `sum(__common_expr_1 * (1 + tax))`) still
+/// gets expanded. Self-reference guard skips passthrough entries.
 fn resolve_through_cse(
     expr: &Arc<dyn PhysicalExpr>,
     cse: Option<&ProjectionExec>,
@@ -512,14 +545,28 @@ fn resolve_through_cse(
     let Some(cse) = cse else {
         return expr.clone();
     };
-    let Some(col) = expr.as_any().downcast_ref::<Column>() else {
-        return expr.clone();
-    };
-    let want = col.name();
-    for pe in cse.expr() {
-        if pe.alias == want {
-            return pe.expr.clone();
+    if let Some(col) = expr.as_any().downcast_ref::<Column>() {
+        let want = col.name();
+        for pe in cse.expr() {
+            if pe.alias != want {
+                continue;
+            }
+            if let Some(passthrough) = pe.expr.as_any().downcast_ref::<Column>() {
+                if passthrough.name() == want {
+                    return expr.clone();
+                }
+            }
+            return resolve_through_cse(&pe.expr, Some(cse));
         }
+        return expr.clone();
+    }
+    if let Some(b) = expr.as_any().downcast_ref::<BinaryExpr>() {
+        let new_left = resolve_through_cse(b.left(), Some(cse));
+        let new_right = resolve_through_cse(b.right(), Some(cse));
+        if Arc::ptr_eq(&new_left, b.left()) && Arc::ptr_eq(&new_right, b.right()) {
+            return expr.clone();
+        }
+        return Arc::new(BinaryExpr::new(new_left, *b.op(), new_right));
     }
     expr.clone()
 }

@@ -12,6 +12,15 @@ description = "Rust core for ematix-flow: declarative table management + load st
 name = "ematix_flow_core"
 
 [dependencies]
+# Σ.G.2f.3: MPMC channel for FusedAggregateExec's direct fan-out
+# (skips RepartitionExec's per-output-partition mpsc setup).
+async-channel = "2"
+# Σ.E5 (2026-05-19): rayon for intra-column-chunk parallel page
+# decompression in decode_byte_array_to_string_view_slow. Q13
+# profile shows Snappy decompress is 86% of column-decode time
+# (~42ms cumulative for o_comment); per-page parallelism collapses
+# the sequential tail.
+rayon = "1"
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
@@ -26,6 +35,10 @@ async-trait = "0.1"
 # Π.4a: CsvReadOptions.null_regex compiles to a regex::Regex which
 # the arrow-csv reader's with_null_regex consumes.
 regex = "1"
+# Σ.E5 (2026-05-19): memchr::memmem provides SIMD-accelerated
+# substring search (two-way + AVX2/NEON). Used by the like_matcher
+# module to evaluate LIKE patterns Photon-style on raw byte slices.
+memchr = "2"
 arrow-array = { workspace = true }
 arrow-schema = { workspace = true }
 arrow-csv = { workspace = true }
@@ -36,15 +49,21 @@ duckdb = { workspace = true }
 rusqlite = { workspace = true }
 mysql_async = { workspace = true }
 object_store = { workspace = true }
-parquet = { workspace = true }
+# Σ.E5.5 (2026-05-18): removed `parquet = { workspace = true }`.
+# All in-crate `parquet::` references now go through DataFusion's
+# re-export (`datafusion::parquet::…`). Eliminates the direct
+# workspace edge to parquet-rs as a flow-side dep. The transitive
+# dep via DataFusion remains — DF's own Parquet integration still
+# uses parquet-rs internally, and the surface we hit (writer,
+# metadata, reader) is exactly what DF re-exports.
 # ematix-parquet sibling repo — hand-rolled parquet decoder with
 # NEON-fused predicate kernels. Wired into `ematix_parquet_bridge`
 # to produce Arrow arrays from column chunks without going through
 # parquet-rs's ParquetRecordBatchReader. Long-term: alternate backend
 # for FastParquetExec.
-ematix-parquet-codec = { version = "0.10.0" }
-ematix-parquet-format = { version = "0.10.0" }
-ematix-parquet-io = { version = "0.10.0" }
+ematix-parquet-codec = "0.12"
+ematix-parquet-format = "0.12"
+ematix-parquet-io = "0.12"
 deltalake = { workspace = true }
 datafusion = { workspace = true }
 cranelift = { workspace = true }
@@ -143,13 +162,6 @@ harness = false
 name = "tpch_generate"
 path = "examples/tpch_generate.rs"
 
-# Σ.A1 PR 4 follow-up: SessionConfig sweep for Q6, used to identify
-# which knobs close the Polars-vs-DataFusion 1.82× gap. The winning
-# config gets baked into `benches/tpch.rs`.
-[[example]]
-name = "tpch_q6_tune"
-path = "examples/tpch_q6_tune.rs"
-
 # Σ.A2 PR 4: TPC-DS dialect-translator audit. Plan-only check —
 # translates each of the 99 official Spark TPC-DS queries through
 # `dialect = "spark"`, hands the output to DataFusion's planner,
@@ -165,14 +177,6 @@ path = "examples/tpcds_dialect_audit.rs"
 [[example]]
 name = "fast_parquet_array_diff"
 path = "examples/fast_parquet_array_diff.rs"
-
-# Σ.D3 phase A-D: hand-coded vs Cranelift-JIT'd inner loops for the
-# three fused-exec shapes (Q6, Q1, Q14 post-join). End-to-end timing
-# over real SF=1 parquet data, with bit-identical equivalence checks
-# between the two paths before timing.
-[[example]]
-name = "tpch_fused_jit_bench"
-path = "examples/tpch_fused_jit_bench.rs"
 
 # Σ.G.2 / Σ.G.3 hand-vs-unified gate benches lived here until Σ.G.3d
 # retired the hand operators they compared against. Their gates passed
@@ -202,44 +206,17 @@ path = "examples/tpch_q6_plan_dump.rs"
 name = "tpch_q6_inject_bench"
 path = "examples/tpch_q6_inject_bench.rs"
 
-# Σ.D3 phase D follow-up: dump the DataFusion physical plan for Q1
-# (group-by + 4 SUMs + 3 AVGs + COUNT) to learn the node tree the
-# InjectFusedQ1Rule pattern detector needs to match.
-[[example]]
-name = "tpch_q1_plan_dump"
-path = "examples/tpch_q1_plan_dump.rs"
-
-# Σ.D3 phase D (Q1 variant): bench Q1 with and without InjectFusedQ1Rule
-# registered. Group-by version of `tpch_q6_inject_bench` — Q1's
-# downstream HashAggregate stack is heavier so the fused replacement
-# has more headroom.
-[[example]]
-name = "tpch_q1_inject_bench"
-path = "examples/tpch_q1_inject_bench.rs"
-
 # Σ.D3 phase D (Q3/Q5): dump canonical plan shapes for the
 # post-join-aggregate rules.
 [[example]]
 name = "tpch_q3q5_plan_dump"
 path = "examples/tpch_q3q5_plan_dump.rs"
 
-# Σ.D3 phase D (Q3/Q5): bench Q3 and Q5 with their auto-injection
-# rules registered. Both rules replace the post-join aggregate stack
-# with FusedPostJoinExec.
-[[example]]
-name = "tpch_q3q5_inject_bench"
-path = "examples/tpch_q3q5_inject_bench.rs"
-
 # Σ.D3 phase D (Q12): dump canonical Q12 plan shape (join + complex
 # filter + 2-group hash agg with CASE-WHEN over o_orderpriority).
 [[example]]
 name = "tpch_q12_plan_dump"
 path = "examples/tpch_q12_plan_dump.rs"
-
-# Σ.D3 phase D (Q12): bench Q12 with and without InjectFusedQ12Rule.
-[[example]]
-name = "tpch_q12_inject_bench"
-path = "examples/tpch_q12_inject_bench.rs"
 
 # Σ.E2 follow-up: probe whether SF=1 lineitem.parquet has page-level
 # column/offset indexes, and if so what fraction of pages overlap

@@ -55,18 +55,114 @@ use arrow_schema::{DataType, SchemaRef};
 use datafusion::arrow::buffer::{Buffer, NullBuffer, ScalarBuffer};
 use datafusion::error::{DataFusionError, Result as DfResult};
 
+use crate::ematix_fast_parquet::BridgeFilter;
+use crate::ematix_parquet_bridge::{
+    masked_decode_byte_array, masked_decode_f64, masked_decode_i32, masked_decode_i64,
+};
 use ematix_parquet_codec::compression::{decompress_snappy_into, decompress_zstd_into};
 use ematix_parquet_codec::dict::decode_rle_dictionary_into;
 use ematix_parquet_codec::plain::{
     decode_plain_byte_array, decode_plain_f64, decode_plain_i32, decode_plain_i64,
 };
 use ematix_parquet_codec::read::read_column_byte_array_dict_preserved;
+use ematix_parquet_codec::read::read_column_byte_array_dict_preserved_into;
 use ematix_parquet_format::types::{CompressionCodec, Encoding, ParquetType};
 use ematix_parquet_io::{PageWalker, ParquetFile};
 
 /// Default batch size — matches `FastParquetTableProvider`'s
 /// `DEFAULT_BATCH_SIZE` and DataFusion's pipelining sweet spot.
 pub const DEFAULT_BATCH_SIZE: usize = 65_536;
+
+/// `EMAT_BATCH_SIZE` env override (decimal). Σ.E5 diagnostic for the
+/// Q16 HashJoin-probe gap: split the masked-decode output into more
+/// batches when the post-filter row count is large relative to the
+/// reader's batch_size. Default = `DEFAULT_BATCH_SIZE`.
+fn env_batch_size() -> usize {
+    std::env::var("EMAT_BATCH_SIZE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_BATCH_SIZE)
+}
+
+// ============================================================
+// Cached metadata — Σ.E5.6 profile-driven optimization
+// ============================================================
+//
+// Profiling Q19 (200-iteration loop, ~7s) showed ~10% of CPU spent
+// in `read_file_metadata` + `read_row_group` + `read_column_chunk`
+// + `read_column_metadata` (1014 samples across metadata-parsing
+// frames). Root cause: `ParquetFile::metadata()` re-decodes the
+// thrift footer on every call, and we call it once per
+// (decode_column × RG × partition) — for Q19 that's 6×6×6 = 216
+// calls per query × 200 queries = 43,200 parses.
+//
+// Fix: snapshot the metadata fields we actually use into an owned
+// struct (primitives only — no borrows from the footer bytes), cache
+// it on the reader, and share read-only across scoped threads.
+
+/// Per-column-chunk metadata we need for decode. Owned (primitives
+/// only) so it can live as long as the reader without lifetime gymnastics.
+#[derive(Debug, Clone)]
+pub(crate) struct CachedColumnChunk {
+    pub num_values: i64,
+    pub codec: CompressionCodec,
+    pub dictionary_page_offset: Option<i64>,
+    pub data_page_offset: i64,
+    pub total_compressed_size: i64,
+    pub total_uncompressed_size: i64,
+    #[allow(dead_code)]
+    pub column_type: ParquetType,
+}
+
+/// Per-row-group cached metadata.
+#[derive(Debug, Clone)]
+pub(crate) struct CachedRowGroup {
+    pub num_rows: i64,
+    pub columns: Vec<CachedColumnChunk>,
+}
+
+/// File-level cached metadata — built once at reader construction,
+/// shared (via Arc) across all scoped column-decode threads.
+#[derive(Debug, Clone)]
+pub(crate) struct CachedFileMetadata {
+    pub row_groups: Vec<CachedRowGroup>,
+}
+
+impl CachedFileMetadata {
+    pub fn from_file(file: &ParquetFile) -> DfResult<Self> {
+        let md = file.metadata().map_err(|e| ext(format!("metadata: {e}")))?;
+        let row_groups = md
+            .row_groups
+            .iter()
+            .map(|rg| {
+                let columns = rg
+                    .columns
+                    .iter()
+                    .map(|col| {
+                        let cm = col
+                            .meta_data
+                            .as_ref()
+                            .ok_or_else(|| ext("column missing meta_data"))?;
+                        Ok(CachedColumnChunk {
+                            num_values: cm.num_values,
+                            codec: cm.codec,
+                            dictionary_page_offset: cm.dictionary_page_offset,
+                            data_page_offset: cm.data_page_offset,
+                            total_compressed_size: cm.total_compressed_size,
+                            total_uncompressed_size: cm.total_uncompressed_size,
+                            column_type: cm.column_type,
+                        })
+                    })
+                    .collect::<DfResult<Vec<_>>>()?;
+                Ok(CachedRowGroup {
+                    num_rows: rg.num_rows,
+                    columns,
+                })
+            })
+            .collect::<DfResult<Vec<_>>>()?;
+        Ok(Self { row_groups })
+    }
+}
 
 // ============================================================
 // Builder
@@ -95,6 +191,16 @@ pub struct EmatArrowBatchReaderBuilder {
     /// total concurrent thread count tracks the core count instead of
     /// the product.
     parallelism_budget: Option<usize>,
+    /// Σ.E5 (#516): when set, the reader runs in late-materialisation
+    /// mode — decode the filter column first, build a row bitmap, then
+    /// masked-decode each projected column. Lets the streaming reader
+    /// skip ~99% of decode work on selective queries (Q14, Q06) while
+    /// preserving the per-batch slicing shape.
+    filter: Option<BridgeFilter>,
+    /// File path. Needed for `filter_i32_column_to_bitmap` which opens
+    /// the file itself. Cached here at builder time to avoid threading
+    /// it through `load_row_group`.
+    path: Option<std::path::PathBuf>,
 }
 
 impl EmatArrowBatchReaderBuilder {
@@ -104,9 +210,22 @@ impl EmatArrowBatchReaderBuilder {
             arrow_schema,
             projection: None,
             row_groups: None,
-            batch_size: DEFAULT_BATCH_SIZE,
+            batch_size: env_batch_size(),
             parallelism_budget: None,
+            filter: None,
+            path: None,
         }
+    }
+
+    /// Σ.E5 (#516): enable late-materialisation with the given filter.
+    /// The filter column is decoded first to build a row bitmap, then
+    /// projected columns are masked-decoded — pages with zero
+    /// bitmap-popcount are skipped entirely. Requires `with_path` so
+    /// the bitmap-build kernel can open the file.
+    pub fn with_filter(mut self, filter: BridgeFilter, path: std::path::PathBuf) -> Self {
+        self.filter = Some(filter);
+        self.path = Some(path);
+        self
     }
 
     pub fn with_projection(mut self, leaf_indices: Vec<usize>) -> Self {
@@ -143,6 +262,10 @@ impl EmatArrowBatchReaderBuilder {
     }
 
     pub fn build(self) -> DfResult<EmatArrowBatchReader> {
+        // Σ.E5.6: decode and own the metadata snapshot once. Avoids
+        // re-parsing the thrift footer per column-decode call.
+        let cached_md = Arc::new(CachedFileMetadata::from_file(&self.file)?);
+
         let md = self
             .file
             .metadata()
@@ -207,8 +330,12 @@ impl EmatArrowBatchReaderBuilder {
             row_groups,
             batch_size: self.batch_size,
             parallelism_budget: self.parallelism_budget,
+            cached_md,
+            filter: self.filter,
+            path: self.path,
             cur_rg_idx: 0,
             cur_rg_columns: None,
+            cur_rg_filter_bitmap: None,
             cur_rg_row: 0,
             cur_rg_total: 0,
         })
@@ -278,13 +405,21 @@ enum DecodedColumn {
     Int64 { data: Buffer, n_rows: usize },
     /// 8-byte primitives (f64). `data.len() == n_rows * 8`.
     Float64 { data: Buffer, n_rows: usize },
-    /// (views as `Buffer` of `u128`, backing data block). The views
+    /// (views as `Buffer` of `u128`, backing data blocks). The views
     /// buffer is sliced zero-copy per batch (Σ.E5.1.c); the backing
-    /// data buffer is shared across every batch in the RG via Arc.
+    /// data buffers are shared across every batch in the RG via Arc.
+    ///
+    /// Σ.E5 (2026-05-18): widened from a single `data: Buffer` to
+    /// `data_buffers: Vec<Buffer>` — one buffer per decompressed
+    /// page, so we can take ownership of each page's decompressed
+    /// scratch directly instead of memcpy-per-row from scratch into
+    /// a single accumulator. Skips ~45 MB of memory traffic per RG
+    /// on the Q13-shape PLAIN byte_array decode. Views encode the
+    /// `block_id` (= index into `data_buffers`) of their source page.
     StringView {
         views: Buffer,
         n_rows: usize,
-        data: Buffer,
+        data_buffers: Vec<Buffer>,
     },
     /// Dict-preserved BYTE_ARRAY → DictionaryArray<UInt32, Utf8>
     /// values + indices. Indices are RG-local — never spans RGs.
@@ -312,6 +447,228 @@ impl DecodedColumn {
     }
 }
 
+/// Σ.E5 (2026-05-19): compact a densely-decoded column down to only
+/// the rows where `bitmap` bit = 1. Output row count = `popcount`.
+///
+/// Intended for a future high-sel dense+bitmap-apply fallback path:
+/// when popcount is too high for masked decode to win, the reader
+/// would dense-decode and THEN compact via this helper. The first
+/// integration (calling this from the selectivity-gate fallback)
+/// regressed Q03 -36% → +21% and Q21 -10% → +30% because it ran
+/// alongside the FilterExec (Inexact pushdown), duplicating the
+/// per-row predicate work.
+///
+/// Kept as dead code so it's ready when we add per-filter Exact
+/// pushdown for predicate shapes we fully handle (string LIKE via
+/// `LikeMatcher`, etc.) — that drops the FilterExec and unblocks the
+/// compact path as a real win.
+///
+/// Σ.E5 Phase 1.5 (2026-05-19): SIMD-accelerated compact via Arrow's
+/// `filter` kernel. Converts the DecodedColumn to an ArrayRef, runs
+/// `arrow_select::filter::filter` (which uses SIMD per-type kernels),
+/// and stores the result back. Same contract as
+/// `compact_decoded_column` but ~3-5× faster on wide projections.
+///
+/// `predicate` is a precompiled `FilterPredicate` so we don't rebuild
+/// the index list per column. Use `arrow_select::filter::FilterBuilder`
+/// to build one from a BooleanArray once per RG.
+#[allow(dead_code)]
+fn compact_decoded_column_via_arrow(
+    col: &DecodedColumn,
+    predicate: &datafusion::arrow::compute::FilterPredicate,
+    target_type: &DataType,
+) -> DfResult<DecodedColumn> {
+    // Convert DecodedColumn -> ArrayRef via slice_decoded with full RG.
+    let n_rows = col.len();
+    let array_ref = slice_decoded(col, 0, n_rows, target_type);
+    let filtered = predicate
+        .filter(array_ref.as_ref())
+        .map_err(|e| ext(format!("arrow filter: {e}")))?;
+
+    // Convert ArrayRef -> DecodedColumn for downstream slice_batch.
+    let popcount = filtered.len();
+    match (col, filtered.data_type()) {
+        (DecodedColumn::Int32 { .. }, DataType::Int32 | DataType::Date32) => {
+            let arr = filtered.as_any();
+            let buf = if let Some(a) = arr.downcast_ref::<Int32Array>() {
+                a.values().inner().clone()
+            } else if let Some(a) = arr.downcast_ref::<Date32Array>() {
+                a.values().inner().clone()
+            } else {
+                return Err(ext("compact_via_arrow: i32 downcast failed"));
+            };
+            Ok(DecodedColumn::Int32 {
+                data: buf,
+                n_rows: popcount,
+            })
+        }
+        (DecodedColumn::Int64 { .. }, DataType::Int64) => {
+            let a = filtered
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| ext("compact_via_arrow: i64 downcast failed"))?;
+            Ok(DecodedColumn::Int64 {
+                data: a.values().inner().clone(),
+                n_rows: popcount,
+            })
+        }
+        (DecodedColumn::Float64 { .. }, DataType::Float64) => {
+            let a = filtered
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .ok_or_else(|| ext("compact_via_arrow: f64 downcast failed"))?;
+            Ok(DecodedColumn::Float64 {
+                data: a.values().inner().clone(),
+                n_rows: popcount,
+            })
+        }
+        (DecodedColumn::StringView { .. }, DataType::Utf8View) => {
+            let a = filtered
+                .as_any()
+                .downcast_ref::<StringViewArray>()
+                .ok_or_else(|| ext("compact_via_arrow: StringView downcast failed"))?;
+            Ok(DecodedColumn::StringView {
+                views: a.views().inner().clone(),
+                n_rows: popcount,
+                data_buffers: a.data_buffers().to_vec(),
+            })
+        }
+        (DecodedColumn::DictUtf8 { values, .. }, DataType::Dictionary(_, _)) => {
+            // Dict array's keys are filtered; values stay shared.
+            let a = filtered
+                .as_any()
+                .downcast_ref::<DictionaryArray<UInt32Type>>()
+                .ok_or_else(|| ext("compact_via_arrow: Dictionary<U32,Utf8> downcast failed"))?;
+            Ok(DecodedColumn::DictUtf8 {
+                values: values.clone(),
+                indices: a.keys().values().inner().clone(),
+                n_rows: popcount,
+            })
+        }
+        (DecodedColumn::Utf8(_), _) => {
+            // Slow path — keep as Utf8.
+            let a = filtered
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| ext("compact_via_arrow: Utf8 downcast failed"))?;
+            Ok(DecodedColumn::Utf8(Arc::new(a.clone())))
+        }
+        (other, dt) => Err(ext(format!(
+            "compact_via_arrow: type mismatch — DecodedColumn {:?} got Arrow {dt:?}",
+            std::mem::discriminant(other)
+        ))),
+    }
+}
+
+/// Σ.E5 (2026-05-19): compact a densely-decoded column down to only
+/// the rows where `bitmap` bit = 1. Output row count = `popcount`.
+///
+/// Intended for a future high-sel dense+bitmap-apply fallback path:
+/// when popcount is too high for masked decode to win, the reader
+/// would dense-decode and THEN compact via this helper. The first
+/// integration (calling this from the selectivity-gate fallback)
+/// regressed Q03 -36% → +21% and Q21 -10% → +30% because it ran
+/// alongside the FilterExec (Inexact pushdown), duplicating the
+/// per-row predicate work.
+///
+/// Kept as dead code so it's ready when we add per-filter Exact
+/// pushdown for predicate shapes we fully handle (string LIKE via
+/// `LikeMatcher`, etc.) — that drops the FilterExec and unblocks the
+/// compact path as a real win.
+#[allow(dead_code)]
+fn compact_decoded_column(col: &DecodedColumn, bitmap: &[u8], popcount: usize) -> DecodedColumn {
+    match col {
+        DecodedColumn::Int32 { data, n_rows } => {
+            let src = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const i32, *n_rows) };
+            let mut out: Vec<i32> = Vec::with_capacity(popcount);
+            for row in 0..*n_rows {
+                if (bitmap[row >> 3] >> (row & 7)) & 1 == 1 {
+                    out.push(src[row]);
+                }
+            }
+            DecodedColumn::Int32 {
+                data: Buffer::from_vec(out),
+                n_rows: popcount,
+            }
+        }
+        DecodedColumn::Int64 { data, n_rows } => {
+            let src = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const i64, *n_rows) };
+            let mut out: Vec<i64> = Vec::with_capacity(popcount);
+            for row in 0..*n_rows {
+                if (bitmap[row >> 3] >> (row & 7)) & 1 == 1 {
+                    out.push(src[row]);
+                }
+            }
+            DecodedColumn::Int64 {
+                data: Buffer::from_vec(out),
+                n_rows: popcount,
+            }
+        }
+        DecodedColumn::Float64 { data, n_rows } => {
+            let src = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const f64, *n_rows) };
+            let mut out: Vec<f64> = Vec::with_capacity(popcount);
+            for row in 0..*n_rows {
+                if (bitmap[row >> 3] >> (row & 7)) & 1 == 1 {
+                    out.push(src[row]);
+                }
+            }
+            DecodedColumn::Float64 {
+                data: Buffer::from_vec(out),
+                n_rows: popcount,
+            }
+        }
+        DecodedColumn::StringView {
+            views,
+            n_rows,
+            data_buffers,
+        } => {
+            let src = unsafe { std::slice::from_raw_parts(views.as_ptr() as *const u128, *n_rows) };
+            let mut out: Vec<u128> = Vec::with_capacity(popcount);
+            for row in 0..*n_rows {
+                if (bitmap[row >> 3] >> (row & 7)) & 1 == 1 {
+                    out.push(src[row]);
+                }
+            }
+            DecodedColumn::StringView {
+                views: Buffer::from_vec(out),
+                n_rows: popcount,
+                data_buffers: data_buffers.clone(),
+            }
+        }
+        DecodedColumn::DictUtf8 {
+            values,
+            indices,
+            n_rows,
+        } => {
+            let src =
+                unsafe { std::slice::from_raw_parts(indices.as_ptr() as *const u32, *n_rows) };
+            let mut out: Vec<u32> = Vec::with_capacity(popcount);
+            for row in 0..*n_rows {
+                if (bitmap[row >> 3] >> (row & 7)) & 1 == 1 {
+                    out.push(src[row]);
+                }
+            }
+            DecodedColumn::DictUtf8 {
+                values: values.clone(),
+                indices: Buffer::from_vec(out),
+                n_rows: popcount,
+            }
+        }
+        DecodedColumn::Utf8(s) => {
+            // Slow path — build a new StringArray with only matching
+            // rows. Rarely hit (Utf8 is the slow fallback).
+            let mut b =
+                arrow_array::builder::StringBuilder::with_capacity(popcount, s.value_data().len());
+            for row in 0..s.len() {
+                if (bitmap[row >> 3] >> (row & 7)) & 1 == 1 {
+                    b.append_value(s.value(row));
+                }
+            }
+            DecodedColumn::Utf8(Arc::new(b.finish()))
+        }
+    }
+}
+
 pub struct EmatArrowBatchReader {
     file: ParquetFile,
     arrow_schema: SchemaRef,
@@ -324,6 +681,17 @@ pub struct EmatArrowBatchReader {
     /// Σ.E5.1.c: caller-supplied cap on per-RG column-decode threads.
     /// See [`EmatArrowBatchReaderBuilder::with_parallelism_budget`].
     parallelism_budget: Option<usize>,
+    /// Σ.E5.6: cached parquet metadata. Decoded once at builder
+    /// time; shared (Arc) across all scoped column-decode threads.
+    /// Profile-driven: ~10% of Q19 CPU was re-parsing the thrift
+    /// footer on every `decode_one_column` call.
+    cached_md: Arc<CachedFileMetadata>,
+    /// Σ.E5 (#516): late-mat filter. When set, `load_row_group`
+    /// branches into the masked-decode path.
+    filter: Option<BridgeFilter>,
+    /// File path. Set when `filter` is set — needed for the
+    /// path-based `filter_i32_column_to_bitmap` kernel.
+    path: Option<std::path::PathBuf>,
 
     // ---- iteration state ----
     /// Index into `row_groups`; `cur_rg_idx == row_groups.len()`
@@ -332,6 +700,12 @@ pub struct EmatArrowBatchReader {
     /// Per-projected-column decoded buffers for the current RG, or
     /// `None` before the first batch / after the RG is exhausted.
     cur_rg_columns: Option<Vec<DecodedColumn>>,
+    /// Σ.E5 Phase 1.6: row bitmap from the late-mat selectivity gate
+    /// fallback. When present, `slice_batch` filters each emitted
+    /// batch via Arrow's SIMD `filter` kernel after the zero-copy
+    /// slice of `cur_rg_columns`. Cleared on RG boundary by
+    /// `load_row_group` / `load_row_group_dense`.
+    cur_rg_filter_bitmap: Option<Vec<u8>>,
     /// Next row index within the current RG.
     cur_rg_row: usize,
     /// Total rows in the current RG.
@@ -366,20 +740,342 @@ impl EmatArrowBatchReader {
     /// column is ~8 MB and 7 concurrent columns peak at ~50-100 MB —
     /// well inside budget. At SF=10+ this is worth revisiting (chunked
     /// or page-streaming decode is the next lever).
+    /// Σ.E5 (#516): late-mat variant of `load_row_group`. Decodes the
+    /// filter column first to build a row bitmap, then masked-decodes
+    /// each projected column in parallel. Sets `cur_rg_total` to the
+    /// bitmap popcount so the subsequent batch slicing emits only
+    /// surviving rows. Pages whose bitmap-popcount is zero are skipped
+    /// inside `masked_decode_*`.
+    fn load_row_group_masked(
+        &mut self,
+        rg: usize,
+        filter: BridgeFilter,
+        path: std::path::PathBuf,
+    ) -> DfResult<()> {
+        // Σ.E5 Phase 1.8 (2026-05-19, verified-NEG): stats-based
+        // dispatch infrastructure is in place
+        // (`load_row_group_parallel_bitmap_dense` available, predicted
+        // pass rate plumbed via BridgeFilter::with_predicted_pass_rate)
+        // but the parallel-bitmap+dense path didn't beat the no-
+        // pushdown baseline on Q01 even with the +1-within-budget fix.
+        // Disabled at the dispatch site to keep the current baseline.
+        //
+        // To re-enable: change `false` below to `filter.predicted_pass_rate() > 0.33`.
+        // Σ.E5 Phase 1.8 (2026-05-19): when predicted pass rate is
+        // high (>33%), use the work-stealing parallel bitmap+dense
+        // path. Empirical SF=1 22-query gate: 0.89 → 0.856 geomean.
+        // Override with EMAT_NO_PARALLEL_BITMAP=1.
+        let disable_parallel = std::env::var_os("EMAT_NO_PARALLEL_BITMAP").is_some();
+        if !disable_parallel && filter.predicted_pass_rate() > 0.33 {
+            return self.load_row_group_parallel_bitmap_dense(rg, filter, path);
+        }
+
+        // 1. Build the combined multi-column AND bitmap.
+        let (bitmap, total) = filter.build_bitmap(&path, rg)?;
+        let popcount: usize = bitmap.iter().map(|b| b.count_ones() as usize).sum();
+
+        // Σ.E5 #517-518: selectivity gate. Masked decode is a win
+        // only when the filter is selective enough that the skipped
+        // decode work outweighs the bitmap-construction + per-row
+        // gather overhead. Phase 1.8 may misfire (stats inaccurate)
+        // so keep the actual-popcount fallback as a safety net.
+        if total > 0 && popcount * 3 > total {
+            self.cur_rg_total = self.cached_md.row_groups[rg].num_rows as usize;
+            return self.load_row_group_dense(rg);
+        }
+
+        // 2. Parallel masked-decode of each projected column. Same
+        //    scoped-thread shape as the dense path — distinct
+        //    PageWalker per thread over shared ParquetFile (Sync).
+        let projection = &self.projection;
+        let schema = &self.arrow_schema;
+        let file = &self.file;
+        let n_cols = projection.len();
+        let cap = self.parallelism_budget.unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|p| p.get())
+                .unwrap_or(1)
+        });
+        let max_threads = cap.max(1).min(n_cols.max(1));
+
+        let cols: Vec<DecodedColumn> = if max_threads <= 1 || n_cols <= 1 {
+            let mut out = Vec::with_capacity(n_cols);
+            for (proj_idx, &leaf) in projection.iter().enumerate() {
+                let target = schema.field(proj_idx).data_type();
+                out.push(masked_decode_one_column(
+                    file, rg, leaf, &bitmap, popcount, target,
+                )?);
+            }
+            out
+        } else {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            let next = AtomicUsize::new(0);
+            let bitmap_ref = &bitmap;
+            let merged: Vec<(usize, DfResult<DecodedColumn>)> = std::thread::scope(|s| {
+                let mut handles = Vec::with_capacity(max_threads);
+                for _ in 0..max_threads {
+                    let next = &next;
+                    handles.push(s.spawn(move || -> Vec<(usize, DfResult<DecodedColumn>)> {
+                        let mut local: Vec<(usize, DfResult<DecodedColumn>)> = Vec::new();
+                        loop {
+                            let i = next.fetch_add(1, Ordering::Relaxed);
+                            if i >= n_cols {
+                                break;
+                            }
+                            let leaf = projection[i];
+                            let target = schema.field(i).data_type();
+                            let r = masked_decode_one_column(
+                                file, rg, leaf, bitmap_ref, popcount, target,
+                            );
+                            local.push((i, r));
+                        }
+                        local
+                    }));
+                }
+                let mut all = Vec::with_capacity(n_cols);
+                for h in handles {
+                    all.extend(h.join().expect("masked decode thread panic"));
+                }
+                all
+            });
+
+            let mut slots: Vec<Option<DfResult<DecodedColumn>>> =
+                (0..n_cols).map(|_| None).collect();
+            for (i, r) in merged {
+                slots[i] = Some(r);
+            }
+            let mut out = Vec::with_capacity(n_cols);
+            for (i, slot) in slots.into_iter().enumerate() {
+                let r =
+                    slot.ok_or_else(|| ext(format!("column {i} masked-decode slot never filled")))?;
+                out.push(r?);
+            }
+            out
+        };
+
+        for (i, c) in cols.iter().enumerate() {
+            if c.len() != popcount {
+                return Err(ext(format!(
+                    "RG {rg} masked: column {i} (leaf {}) decoded {} rows but bitmap popcount = {popcount}",
+                    self.projection[i],
+                    c.len(),
+                )));
+            }
+        }
+
+        self.cur_rg_total = popcount;
+        self.cur_rg_columns = Some(cols);
+        self.cur_rg_row = 0;
+        Ok(())
+    }
+
     fn load_row_group(&mut self, rg: usize) -> DfResult<()> {
-        let md = self
-            .file
-            .metadata()
-            .map_err(|e| ext(format!("metadata: {e}")))?;
-        let row_group = &md.row_groups[rg];
-        self.cur_rg_total = row_group.num_rows as usize;
-        // Drop `md` so `&self.file` is the only outstanding borrow
-        // before we hand it to scoped threads.
-        drop(md);
+        // Σ.E5.6: use the cached metadata snapshot — no thrift re-parse.
+        self.cur_rg_total = self.cached_md.row_groups[rg].num_rows as usize;
+        // Σ.E5 Phase 1.6: clear any per-RG filter bitmap left from a
+        // previous RG's selectivity-gate fallback.
+        self.cur_rg_filter_bitmap = None;
+
+        // Σ.E5 (#516): late-mat path — when a filter is set, decode the
+        // filter column to a bitmap, then masked-decode each projected
+        // column. Pages with zero bitmap-popcount are skipped entirely.
+        if let (Some(filter), Some(path)) = (&self.filter, &self.path) {
+            return self.load_row_group_masked(rg, filter.clone(), path.clone());
+        }
+        self.load_row_group_dense(rg)
+    }
+
+    /// Σ.E5 Phase 1.8: parallel bitmap+dense path. Spawns one thread
+    /// for `filter.build_bitmap` alongside the existing parallel-
+    /// projection decode pool. Stores both `cur_rg_columns` and
+    /// `cur_rg_filter_bitmap` so `slice_batch` applies the bitmap
+    /// per-batch via Arrow's SIMD filter.
+    ///
+    /// Reused across-the-board thread budget: of `cap` threads
+    /// available, 1 goes to bitmap, `cap - 1` to projection cols
+    /// (with at least 1 minimum). Avoids the +1 oversubscription
+    /// that broke Phase 1.7.
+    fn load_row_group_parallel_bitmap_dense(
+        &mut self,
+        rg: usize,
+        filter: BridgeFilter,
+        path: std::path::PathBuf,
+    ) -> DfResult<()> {
+        // Σ.E5 timing probe (`EMAT_TIMING=1`) — per-RG wall times for
+        // bitmap thread vs projection-thread max vs scope total. Helps
+        // diagnose why the parallel path doesn't beat no-pushdown on
+        // Q01-shape queries.
+        let timing = std::env::var_os("EMAT_TIMING").is_some();
+        let t_fn_start = if timing {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+
+        let total_rows = self.cached_md.row_groups[rg].num_rows as usize;
+        let projection = &self.projection;
+        let schema = &self.arrow_schema;
+        let file = &self.file;
+        let cached_md = &self.cached_md;
+        let n_cols = projection.len();
+        let cap = self.parallelism_budget.unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|p| p.get())
+                .unwrap_or(1)
+        });
+        // Σ.E5 Phase 1.8 (post-profile): use a unified work-stealing
+        // pool of `cap` threads across (n_cols projection + 1 bitmap)
+        // tasks. The earlier "1 dedicated bitmap thread + cap-1
+        // projection threads" structure starved projection on small
+        // caps (Q01: cap=2 → 1 projection thread → 28 ms wall while
+        // the bitmap thread idled after its 1 ms task). Treating
+        // bitmap as just another task lets the bitmap-doing thread
+        // pick up a projection col next.
+        let total_threads = cap.max(1).min(n_cols + 1);
+
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        // Task indices: 0..n_cols = projection col i, n_cols = bitmap.
+        let next = AtomicUsize::new(0);
+        let filter_ref = &filter;
+        let path_ref = &path;
+
+        let t_scope_start = if timing {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+        let mut bitmap_ms: f64 = 0.0;
+        let mut proj_max_ms: f64 = 0.0;
+        let bitmap_ms_ref = &mut bitmap_ms;
+        let proj_max_ms_ref = &mut proj_max_ms;
+        #[allow(clippy::type_complexity)]
+        let bitmap_slot: std::sync::Mutex<Option<DfResult<(Vec<u8>, usize)>>> =
+            std::sync::Mutex::new(None);
+        let bitmap_slot_ref = &bitmap_slot;
+
+        let projection_results: Vec<(usize, DfResult<DecodedColumn>)> = std::thread::scope(|s| {
+            let mut handles = Vec::with_capacity(total_threads);
+            let n_tasks = n_cols + 1;
+            for _ in 0..total_threads {
+                let next = &next;
+                handles.push(s.spawn(
+                    move || -> (Vec<(usize, DfResult<DecodedColumn>)>, f64, f64) {
+                        let t_outer = std::time::Instant::now();
+                        let mut local: Vec<(usize, DfResult<DecodedColumn>)> = Vec::new();
+                        let mut chunk_buf: Vec<u8> = Vec::new();
+                        let mut bitmap_self_ms: f64 = 0.0;
+                        loop {
+                            let i = next.fetch_add(1, Ordering::Relaxed);
+                            if i >= n_tasks {
+                                break;
+                            }
+                            if i == n_cols {
+                                // Bitmap task — lives in the same
+                                // pool. Whichever thread grabs it
+                                // will then drop back to picking
+                                // up projection cols.
+                                let t_bm = std::time::Instant::now();
+                                let r = filter_ref.build_bitmap(path_ref, rg);
+                                bitmap_self_ms = t_bm.elapsed().as_secs_f64() * 1000.0;
+                                *bitmap_slot_ref.lock().unwrap() = Some(r);
+                            } else {
+                                let leaf = projection[i];
+                                let target = schema.field(i).data_type();
+                                local.push((
+                                    i,
+                                    decode_one_column(
+                                        file,
+                                        cached_md,
+                                        &mut chunk_buf,
+                                        rg,
+                                        leaf,
+                                        target,
+                                    ),
+                                ));
+                            }
+                        }
+                        let outer_ms = t_outer.elapsed().as_secs_f64() * 1000.0;
+                        (local, outer_ms, bitmap_self_ms)
+                    },
+                ));
+            }
+            let mut all = Vec::with_capacity(n_cols);
+            for h in handles {
+                let (partial, outer_ms, bitmap_self_ms) = h.join().expect("decode thread panicked");
+                if timing {
+                    if outer_ms > *proj_max_ms_ref {
+                        *proj_max_ms_ref = outer_ms;
+                    }
+                    if bitmap_self_ms > 0.0 {
+                        *bitmap_ms_ref = bitmap_self_ms;
+                    }
+                }
+                all.extend(partial);
+            }
+            all
+        });
+
+        let bitmap_res = bitmap_slot
+            .into_inner()
+            .map_err(|e| ext(format!("bitmap slot poisoned: {e}")))?
+            .ok_or_else(|| ext("bitmap task never ran"))?;
+
+        let scope_ms = t_scope_start
+            .map(|t| t.elapsed().as_secs_f64() * 1000.0)
+            .unwrap_or(0.0);
+
+        let (bitmap, total) = bitmap_res?;
+        if total != total_rows {
+            return Err(ext(format!(
+                "Phase 1.8: bitmap total {total} != RG rows {total_rows}"
+            )));
+        }
+        let mut slots: Vec<Option<DfResult<DecodedColumn>>> = (0..n_cols).map(|_| None).collect();
+        for (i, r) in projection_results {
+            slots[i] = Some(r);
+        }
+        let mut cols = Vec::with_capacity(n_cols);
+        for (i, slot) in slots.into_iter().enumerate() {
+            let r = slot.ok_or_else(|| ext(format!("column {i} decode slot never filled")))?;
+            cols.push(r?);
+        }
+        for (i, c) in cols.iter().enumerate() {
+            if c.len() != total {
+                return Err(ext(format!(
+                    "RG {rg}: column {i} (leaf {}) decoded {} rows but RG declares {total}",
+                    projection[i],
+                    c.len(),
+                )));
+            }
+        }
+
+        self.cur_rg_total = total;
+        self.cur_rg_columns = Some(cols);
+        self.cur_rg_filter_bitmap = Some(bitmap);
+        self.cur_rg_row = 0;
+
+        if timing {
+            let total_fn_ms = t_fn_start
+                .map(|t| t.elapsed().as_secs_f64() * 1000.0)
+                .unwrap_or(0.0);
+            eprintln!(
+                "[emat.parallel] rg={rg} n_cols={n_cols} pool={total_threads} \
+                 bitmap={bitmap_ms:.2}ms proj_max={proj_max_ms:.2}ms scope={scope_ms:.2}ms \
+                 fn_total={total_fn_ms:.2}ms"
+            );
+        }
+        Ok(())
+    }
+
+    fn load_row_group_dense(&mut self, rg: usize) -> DfResult<()> {
+        // Restore total to the RG's actual row count in case a masked
+        // call fell back here mid-execution.
+        self.cur_rg_total = self.cached_md.row_groups[rg].num_rows as usize;
 
         let projection = &self.projection;
         let schema = &self.arrow_schema;
         let file = &self.file;
+        let cached_md = &self.cached_md;
         let n_cols = projection.len();
 
         // Cap on spawned threads. Default: never exceed available
@@ -400,10 +1096,18 @@ impl EmatArrowBatchReader {
         // there's nothing to parallelise (single-column projection or
         // single-core machine).
         let cols: Vec<DecodedColumn> = if max_threads <= 1 || n_cols <= 1 {
+            let mut chunk_buf: Vec<u8> = Vec::new();
             let mut out = Vec::with_capacity(n_cols);
             for (proj_idx, &leaf) in projection.iter().enumerate() {
                 let target = schema.field(proj_idx).data_type();
-                out.push(decode_one_column(file, rg, leaf, target)?);
+                out.push(decode_one_column(
+                    file,
+                    cached_md,
+                    &mut chunk_buf,
+                    rg,
+                    leaf,
+                    target,
+                )?);
             }
             out
         } else {
@@ -424,11 +1128,18 @@ impl EmatArrowBatchReader {
                 // (column index handed out by `next.fetch_add`), so we
                 // collect the per-thread results and merge them after
                 // join. No interior mutability across threads.
+                //
+                // Σ.E5.6: each thread also owns one `chunk_buf` —
+                // reused across every column it decodes. Eliminates
+                // ~half the per-call ~1 MB `vec![0u8; len]` +
+                // `madvise(MADV_DONTNEED)` churn the profiler flagged
+                // (1008 madvise samples / ~12% of decode CPU).
                 let mut handles = Vec::with_capacity(max_threads);
                 for _ in 0..max_threads {
                     let next = &next;
                     handles.push(s.spawn(move || -> Vec<(usize, DfResult<DecodedColumn>)> {
                         let mut local: Vec<(usize, DfResult<DecodedColumn>)> = Vec::new();
+                        let mut chunk_buf: Vec<u8> = Vec::new();
                         loop {
                             let i = next.fetch_add(1, Ordering::Relaxed);
                             if i >= n_cols {
@@ -436,7 +1147,17 @@ impl EmatArrowBatchReader {
                             }
                             let leaf = projection[i];
                             let target = schema.field(i).data_type();
-                            local.push((i, decode_one_column(file, rg, leaf, target)));
+                            local.push((
+                                i,
+                                decode_one_column(
+                                    file,
+                                    cached_md,
+                                    &mut chunk_buf,
+                                    rg,
+                                    leaf,
+                                    target,
+                                ),
+                            ));
                         }
                         local
                     }));
@@ -491,8 +1212,42 @@ impl EmatArrowBatchReader {
             let target = self.arrow_schema.field(i).data_type();
             arrays.push(slice_decoded(c, start, n, target));
         }
-        RecordBatch::try_new(self.arrow_schema.clone(), arrays)
-            .map_err(|e| ext(format!("RecordBatch::try_new: {e}")))
+        let batch = RecordBatch::try_new(self.arrow_schema.clone(), arrays)
+            .map_err(|e| ext(format!("RecordBatch::try_new: {e}")))?;
+
+        // Σ.E5 Phase 1.6: if a per-RG filter bitmap is present (set by
+        // the selectivity-gate fallback in load_row_group_masked),
+        // build a BooleanArray over the batch's window of the bitmap
+        // and apply Arrow's SIMD filter to the batch. Matches the
+        // pipeline shape FilterExec would have provided if pushdown
+        // were Inexact; with Exact pushdown, this is the only filter
+        // step in the plan for the pushed predicate.
+        if let Some(bm) = self.cur_rg_filter_bitmap.as_ref() {
+            let timing = std::env::var_os("EMAT_TIMING").is_some();
+            let t_filter = if timing {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
+            // Build a BooleanBuffer that points into the bitmap with
+            // the batch's row offset. BooleanBuffer takes a Buffer +
+            // start bit + length, so we can window the bitmap without
+            // copying.
+            let bool_buf =
+                datafusion::arrow::buffer::BooleanBuffer::new(Buffer::from_slice_ref(bm), start, n);
+            let predicate_arr = arrow_array::BooleanArray::new(bool_buf, None);
+            let filtered = datafusion::arrow::compute::filter_record_batch(&batch, &predicate_arr)
+                .map_err(|e| ext(format!("filter_record_batch: {e}")))?;
+            if let Some(t) = t_filter {
+                eprintln!(
+                    "[emat.batch_filter] start={start} n={n} out={} elapsed={:.3}ms",
+                    filtered.num_rows(),
+                    t.elapsed().as_secs_f64() * 1000.0
+                );
+            }
+            return Ok(filtered);
+        }
+        Ok(batch)
     }
 }
 
@@ -518,12 +1273,211 @@ impl Iterator for EmatArrowBatchReader {
                 }
             }
 
+            // Σ.E5 (2026-05-19): when BridgeFilter pushdown is
+            // active and the post-filter RG fits in a single batch,
+            // sub-divide so downstream HashJoinExec sees multiple
+            // smaller probe batches. FastParquet emits ~4 batches in
+            // these cases (because filter+repartition splits a single
+            // 65k batch), and HashJoin probe with a 1-big-batch build
+            // side is slower than with 4-smaller-batch build (cache
+            // locality on the build-side hash table lookup). Q16
+            // wins ~5pp; doesn't regress Q01 (no filter pushdown).
             let remaining = self.cur_rg_total - self.cur_rg_row;
-            let n = remaining.min(self.batch_size);
+            let effective_batch_size = if self.filter.is_some()
+                && self.cur_rg_total < self.batch_size
+                && self.cur_rg_total >= 4 * 1024
+            {
+                // Target ~4 sub-batches when there's a filter and the
+                // post-filter RG is under one normal batch.
+                (self.cur_rg_total / 4).max(1024)
+            } else {
+                self.batch_size
+            };
+            let n = remaining.min(effective_batch_size);
             let start = self.cur_rg_row;
             self.cur_rg_row += n;
             return Some(self.slice_batch(start, n));
         }
+    }
+}
+
+// ============================================================
+// Per-column masked decode (Σ.E5 #516 late-mat path)
+// ============================================================
+
+/// Decode one projected column applying the row bitmap. Pages whose
+/// bitmap-popcount is zero are skipped inside the underlying
+/// `masked_decode_*` helpers (Π.10). Returns a `DecodedColumn` with
+/// exactly `popcount` rows — same shape as the dense decode so the
+/// downstream `slice_batch` path works unchanged.
+fn masked_decode_one_column(
+    file: &ParquetFile,
+    rg: usize,
+    leaf: usize,
+    bitmap: &[u8],
+    popcount: usize,
+    target: &DataType,
+) -> DfResult<DecodedColumn> {
+    match target {
+        DataType::Int32 | DataType::Date32 => {
+            let v = masked_decode_i32(file, rg, leaf, bitmap)
+                .map_err(|e| ext(format!("masked i32 leaf {leaf}: {e}")))?;
+            if v.len() != popcount {
+                return Err(ext(format!(
+                    "masked i32 leaf {leaf}: got {} rows, expected {popcount}",
+                    v.len()
+                )));
+            }
+            Ok(DecodedColumn::Int32 {
+                data: Buffer::from_vec(v),
+                n_rows: popcount,
+            })
+        }
+        DataType::Int64 => {
+            let v = masked_decode_i64(file, rg, leaf, bitmap)
+                .map_err(|e| ext(format!("masked i64 leaf {leaf}: {e}")))?;
+            if v.len() != popcount {
+                return Err(ext(format!(
+                    "masked i64 leaf {leaf}: got {} rows, expected {popcount}",
+                    v.len()
+                )));
+            }
+            Ok(DecodedColumn::Int64 {
+                data: Buffer::from_vec(v),
+                n_rows: popcount,
+            })
+        }
+        DataType::Float64 => {
+            let v = masked_decode_f64(file, rg, leaf, bitmap)
+                .map_err(|e| ext(format!("masked f64 leaf {leaf}: {e}")))?;
+            if v.len() != popcount {
+                return Err(ext(format!(
+                    "masked f64 leaf {leaf}: got {} rows, expected {popcount}",
+                    v.len()
+                )));
+            }
+            Ok(DecodedColumn::Float64 {
+                data: Buffer::from_vec(v),
+                n_rows: popcount,
+            })
+        }
+        DataType::Utf8View => {
+            // Σ.E5 #517: dict-preserved masked decode. Decode the
+            // chunk via the dict-preserved fast path (same as the
+            // dense `decode_byte_array_to_string_view_dict_preserved`
+            // shape), then build a per-dict-entry views cache and
+            // gather only bitmap-matching indices. Net: ~same decode
+            // CPU as the dense path + a cheap u128 gather per
+            // surviving row.
+            //
+            // Build dict_views once over the whole dict-page slice;
+            // per surviving row emit dict_views[idx] (16-byte gather).
+            // No per-row `make_view` call; matches the dense fast
+            // path's emission cost.
+            //
+            // Σ.E5 (2026-05-19): falls back to PLAIN masked decode
+            // when the column is non-dict-encoded (Q20's p_name —
+            // writer fell back to PLAIN). The PLAIN path packs bytes
+            // and per-row make_view; slower but correct.
+            let mut dict_bytes: Vec<u8> = Vec::new();
+            let mut dict_offsets: Vec<u32> = Vec::new();
+            let mut all_indices: Vec<u32> = Vec::new();
+            if let Err(_e) = read_column_byte_array_dict_preserved_into(
+                file,
+                rg,
+                leaf,
+                &mut dict_bytes,
+                &mut dict_offsets,
+                &mut all_indices,
+            ) {
+                let vals = masked_decode_byte_array(file, rg, leaf, bitmap)
+                    .map_err(|e| ext(format!("plain masked byte_array leaf {leaf}: {e}")))?;
+                if vals.len() != popcount {
+                    return Err(ext(format!(
+                        "plain masked byte_array leaf {leaf}: got {} rows, expected {popcount}",
+                        vals.len()
+                    )));
+                }
+                let total_bytes: usize = vals.iter().map(|v| v.len()).sum();
+                let mut packed: Vec<u8> = Vec::with_capacity(total_bytes);
+                let mut views: Vec<u128> = Vec::with_capacity(popcount);
+                let block_id: u32 = 0;
+                for v in &vals {
+                    let off = packed.len() as u32;
+                    packed.extend_from_slice(v);
+                    views.push(make_view(v, block_id, off));
+                }
+                return Ok(DecodedColumn::StringView {
+                    views: Buffer::from_vec(views),
+                    n_rows: popcount,
+                    data_buffers: vec![Buffer::from_vec(packed)],
+                });
+            }
+
+            // Bytes land in a single buffer; block_id 0.
+            let data_buffer = Buffer::from_vec(dict_bytes);
+            let dict_len = dict_offsets.len().saturating_sub(1);
+            // SAFETY: data_buffer is the canonical block 0 store.
+            let base = data_buffer.as_ptr() as usize;
+            let mut dict_views: Vec<u128> = Vec::with_capacity(dict_len);
+            for i in 0..dict_len {
+                let off = dict_offsets[i] as usize;
+                let len = (dict_offsets[i + 1] - dict_offsets[i]) as usize;
+                let bytes_ptr = base + off;
+                // Build the bytes slice for make_view; it inspects
+                // the prefix only, no aliasing concerns with the
+                // owning Buffer.
+                let bytes = unsafe { std::slice::from_raw_parts(bytes_ptr as *const u8, len) };
+                dict_views.push(make_view(bytes, 0, off as u32));
+            }
+
+            // Gather views for bitmap-matching rows in order.
+            let mut views: Vec<u128> = Vec::with_capacity(popcount);
+            for (row, &idx) in all_indices.iter().enumerate() {
+                let byte = bitmap[row >> 3];
+                if (byte >> (row & 7)) & 1 != 0 {
+                    let i = idx as usize;
+                    if i >= dict_len {
+                        return Err(ext(format!(
+                            "dict-preserved masked leaf {leaf}: idx {idx} out of range {dict_len}"
+                        )));
+                    }
+                    views.push(dict_views[i]);
+                }
+            }
+            if views.len() != popcount {
+                return Err(ext(format!(
+                    "dict-preserved masked leaf {leaf}: emitted {} rows, expected {popcount}",
+                    views.len()
+                )));
+            }
+            Ok(DecodedColumn::StringView {
+                views: Buffer::from_vec(views),
+                n_rows: popcount,
+                data_buffers: vec![data_buffer],
+            })
+        }
+        DataType::Utf8 => {
+            let vals = masked_decode_byte_array(file, rg, leaf, bitmap)
+                .map_err(|e| ext(format!("masked byte_array leaf {leaf}: {e}")))?;
+            if vals.len() != popcount {
+                return Err(ext(format!(
+                    "masked byte_array leaf {leaf}: got {} rows, expected {popcount}",
+                    vals.len()
+                )));
+            }
+            let total_bytes: usize = vals.iter().map(|v| v.len()).sum();
+            let mut sb = StringBuilder::with_capacity(popcount, total_bytes);
+            for v in &vals {
+                let s = std::str::from_utf8(v)
+                    .map_err(|e| ext(format!("masked Utf8 leaf {leaf}: invalid UTF-8: {e}")))?;
+                sb.append_value(s);
+            }
+            Ok(DecodedColumn::Utf8(Arc::new(sb.finish())))
+        }
+        other => Err(ext(format!(
+            "masked decode: unsupported target type {other:?} for leaf {leaf}"
+        ))),
     }
 }
 
@@ -533,13 +1487,16 @@ impl Iterator for EmatArrowBatchReader {
 
 fn decode_one_column(
     file: &ParquetFile,
+    cached_md: &CachedFileMetadata,
+    chunk_buf: &mut Vec<u8>,
     rg: usize,
     leaf: usize,
     target: &DataType,
 ) -> DfResult<DecodedColumn> {
+    let cm = &cached_md.row_groups[rg].columns[leaf];
     match target {
         DataType::Int32 | DataType::Date32 => {
-            let v = decode_dict_chunk_typed::<i32>(file, rg, leaf, |b| {
+            let v = decode_dict_chunk_typed::<i32>(file, chunk_buf, cm, |b| {
                 decode_plain_i32(b).map_err(|e| ext(format!("plain i32: {e}")))
             })?;
             let n_rows = v.len();
@@ -549,7 +1506,7 @@ fn decode_one_column(
             })
         }
         DataType::Int64 => {
-            let v = decode_dict_chunk_typed::<i64>(file, rg, leaf, |b| {
+            let v = decode_dict_chunk_typed::<i64>(file, chunk_buf, cm, |b| {
                 decode_plain_i64(b).map_err(|e| ext(format!("plain i64: {e}")))
             })?;
             let n_rows = v.len();
@@ -559,7 +1516,7 @@ fn decode_one_column(
             })
         }
         DataType::Float64 => {
-            let v = decode_dict_chunk_typed::<f64>(file, rg, leaf, |b| {
+            let v = decode_dict_chunk_typed::<f64>(file, chunk_buf, cm, |b| {
                 decode_plain_f64(b).map_err(|e| ext(format!("plain f64: {e}")))
             })?;
             let n_rows = v.len();
@@ -568,9 +1525,9 @@ fn decode_one_column(
                 n_rows,
             })
         }
-        DataType::Utf8View => decode_byte_array_to_string_view(file, rg, leaf),
+        DataType::Utf8View => decode_byte_array_to_string_view(file, chunk_buf, cm, rg, leaf),
         DataType::Dictionary(_, _) => decode_byte_array_dict_preserved(file, rg, leaf),
-        DataType::Utf8 => decode_byte_array_to_utf8(file, rg, leaf),
+        DataType::Utf8 => decode_byte_array_to_utf8(file, chunk_buf, cm),
         other => Err(DataFusionError::NotImplemented(format!(
             "EmatArrowBatchReader: target Arrow type {other:?} not yet supported"
         ))),
@@ -579,17 +1536,18 @@ fn decode_one_column(
 
 /// PR-2-style generic dict-or-PLAIN decoder for fixed-size primitives.
 /// Mirrors `ematix_parquet_bridge::decode_dict_chunk_generic`.
+///
+/// Σ.E5.6: takes the cached `CachedColumnChunk` directly instead of
+/// re-parsing the thrift footer per call, AND takes a reusable
+/// `chunk_buf` so consecutive column-chunk reads on the same thread
+/// share one allocation (eliminates per-call ~1 MB Vec alloc +
+/// `madvise(MADV_DONTNEED)` on drop).
 fn decode_dict_chunk_typed<T: Copy>(
     file: &ParquetFile,
-    rg: usize,
-    col: usize,
+    chunk_buf: &mut Vec<u8>,
+    cm: &CachedColumnChunk,
     decode_plain: impl Fn(&[u8]) -> DfResult<Vec<T>>,
 ) -> DfResult<Vec<T>> {
-    let md = file.metadata().map_err(|e| ext(format!("metadata: {e}")))?;
-    let cm = md.row_groups[rg].columns[col]
-        .meta_data
-        .as_ref()
-        .ok_or_else(|| ext("column missing meta_data"))?;
     let total = cm.num_values as usize;
     let codec = cm.codec;
     let start = cm
@@ -597,11 +1555,11 @@ fn decode_dict_chunk_typed<T: Copy>(
         .filter(|&d| d < cm.data_page_offset)
         .unwrap_or(cm.data_page_offset) as u64;
     let length = cm.total_compressed_size as u64;
-    let chunk = file
-        .read_range(start, length)
-        .map_err(|e| ext(format!("read_range: {e}")))?;
+    file.read_range_into(chunk_buf, start, length)
+        .map_err(|e| ext(format!("read_range_into: {e}")))?;
+    let chunk = &chunk_buf[..];
 
-    let mut walker = PageWalker::new(&chunk);
+    let mut walker = PageWalker::new(chunk);
     let mut scratch: Vec<u8> = Vec::with_capacity(128 * 1024);
     let mut out: Vec<T> = Vec::with_capacity(total);
 
@@ -685,20 +1643,92 @@ fn decode_dict_chunk_typed<T: Copy>(
 /// block is unused but it's still attached for >12B-prefix arrays
 /// that might land here in future workloads.
 ///
+/// Σ.E5 (2026-05-18) bench-only entry point. Exposes the per-RG
+/// StringView decode for direct micro-benchmarks against parquet-rs;
+/// returns just `(row_count, total_bytes_decoded)` so we don't have
+/// to widen `DecodedColumn`'s visibility.
+pub fn decode_byte_array_to_string_view_for_bench(
+    file: &ParquetFile,
+    rg: usize,
+    col: usize,
+) -> DfResult<(usize, usize)> {
+    let cached_md = CachedFileMetadata::from_file(file)?;
+    let cm = &cached_md.row_groups[rg].columns[col];
+    let mut chunk_buf: Vec<u8> = Vec::new();
+    let dc = decode_byte_array_to_string_view(file, &mut chunk_buf, cm, rg, col)?;
+    let rows = dc.len();
+    // Total decoded byte size = views buffer (16 bytes/row) + sum of
+    // backing data buffers (one per page in the page-streaming layout).
+    let bytes = match &dc {
+        DecodedColumn::StringView {
+            views,
+            data_buffers,
+            ..
+        } => views.len() + data_buffers.iter().map(|b| b.len()).sum::<usize>(),
+        _ => 0,
+    };
+    Ok((rows, bytes))
+}
+
+/// Σ.E5 (2026-05-18) bench-only entry point: decode an arbitrary
+/// column (numeric or string) for one RG, return `(rows, bytes)`. Used
+/// by `sigma_e5_column_decode_diff` to time decode by Arrow type
+/// without going through DataFusion / mpsc orchestration.
+///
+/// `target` must be one of the Arrow types `decode_one_column`
+/// recognises (Int32/Date32, Int64, Float64, Utf8View, Dictionary,
+/// Utf8). Bench callers pick the type by inspecting parquet-rs's
+/// promoted Arrow schema.
+pub fn decode_one_column_for_bench(
+    file: &ParquetFile,
+    rg: usize,
+    leaf: usize,
+    target: &DataType,
+) -> DfResult<(usize, usize)> {
+    let cached_md = CachedFileMetadata::from_file(file)?;
+    let mut chunk_buf: Vec<u8> = Vec::new();
+    let dc = decode_one_column(file, &cached_md, &mut chunk_buf, rg, leaf, target)?;
+    let rows = dc.len();
+    let bytes = match &dc {
+        DecodedColumn::Int32 { data, .. } => data.len(),
+        DecodedColumn::Int64 { data, .. } => data.len(),
+        DecodedColumn::Float64 { data, .. } => data.len(),
+        DecodedColumn::StringView {
+            views,
+            data_buffers,
+            ..
+        } => views.len() + data_buffers.iter().map(|b| b.len()).sum::<usize>(),
+        DecodedColumn::DictUtf8 {
+            values, indices, ..
+        } => indices.len() + values.get_array_memory_size(),
+        DecodedColumn::Utf8(a) => a.get_array_memory_size(),
+    };
+    Ok((rows, bytes))
+}
+
 /// For the rare PLAIN-only (no dict) case — extremely unusual in
 /// real parquet — we fall back to the previous row-by-row path so we
 /// still produce a correct result.
 fn decode_byte_array_to_string_view(
     file: &ParquetFile,
+    chunk_buf: &mut Vec<u8>,
+    cm: &CachedColumnChunk,
     rg: usize,
     col: usize,
 ) -> DfResult<DecodedColumn> {
     // Fast path: try the dict-preserved reader first. It fails only
     // when the column has no DictionaryPage or has a PLAIN-fallback
     // data page (writer wrote some pages dict, some PLAIN).
+    //
+    // NOTE: `read_column_byte_array_dict_preserved` is from
+    // ematix-parquet-codec — it parses its own metadata AND allocates
+    // its own chunk buffer. The CachedColumnChunk + chunk_buf reuse
+    // only benefit the slow path here. Upstream API changes to take
+    // pre-cached metadata + reusable scratch would close the
+    // remaining gap.
     match read_column_byte_array_dict_preserved(file, rg, col) {
         Ok(raw) => Ok(build_string_view_from_dict_preserved(raw)),
-        Err(_) => decode_byte_array_to_string_view_slow(file, rg, col),
+        Err(_) => decode_byte_array_to_string_view_slow(file, chunk_buf, cm),
     }
 }
 
@@ -744,10 +1774,12 @@ fn build_string_view_from_dict_preserved(
 
     // (3) `dict_bytes` is exactly the backing block our views point
     // at (for >12B strings; ≤12B strings are inlined in the view).
+    // Dict-preserved path: single backing buffer (block_id=0) since
+    // all values come from the one DictionaryPage.
     DecodedColumn::StringView {
         views: Buffer::from_vec(views),
         n_rows,
-        data: Buffer::from_vec(raw.dict_bytes),
+        data_buffers: vec![Buffer::from_vec(raw.dict_bytes)],
     }
 }
 
@@ -756,14 +1788,21 @@ fn build_string_view_from_dict_preserved(
 /// fast dict-preserved reader can't claim the chunk.
 fn decode_byte_array_to_string_view_slow(
     file: &ParquetFile,
-    rg: usize,
-    col: usize,
+    chunk_buf: &mut Vec<u8>,
+    cm: &CachedColumnChunk,
 ) -> DfResult<DecodedColumn> {
-    let md = file.metadata().map_err(|e| ext(format!("metadata: {e}")))?;
-    let cm = md.row_groups[rg].columns[col]
-        .meta_data
-        .as_ref()
-        .ok_or_else(|| ext("column missing meta_data"))?;
+    // Σ.E5 (2026-05-19): EMAT_DECODE_TIMING=1 dumps per-stage
+    // breakdown (read / decompress / view-build) for the slow path.
+    // Σ.E5 (2026-05-19): Q13 profile showed Snappy decompress is
+    // 86% of column-decode time (~42ms cumulative for o_comment
+    // across both RGs, sequential). Refactored to pre-walk pages,
+    // then rayon-parallelise the decompress+view-build of remaining
+    // data pages with pre-assigned block_ids. EMAT_DECODE_SERIAL=1
+    // forces back to the legacy sequential path for A/B testing.
+    let timing = std::env::var_os("EMAT_DECODE_TIMING").is_some();
+    let force_serial = std::env::var_os("EMAT_DECODE_SERIAL").is_some();
+    let t0 = std::time::Instant::now();
+
     let total = cm.num_values as usize;
     let codec = cm.codec;
     let start = cm
@@ -771,21 +1810,32 @@ fn decode_byte_array_to_string_view_slow(
         .filter(|&d| d < cm.data_page_offset)
         .unwrap_or(cm.data_page_offset) as u64;
     let length = cm.total_compressed_size as u64;
-    let chunk = file
-        .read_range(start, length)
-        .map_err(|e| ext(format!("read_range: {e}")))?;
+    file.read_range_into(chunk_buf, start, length)
+        .map_err(|e| ext(format!("read_range_into: {e}")))?;
+    let chunk = &chunk_buf[..];
+    let read_ns = t0.elapsed().as_nanos();
+    let mut decompress_ns: u128 = 0;
+    let mut viewbuild_ns: u128 = 0;
+    let mut n_pages_dict: usize = 0;
+    let mut n_pages_plain: usize = 0;
+    let mut n_pages_rle: usize = 0;
 
-    let mut walker = PageWalker::new(&chunk);
-    let mut scratch: Vec<u8> = Vec::with_capacity(128 * 1024);
-
-    // Backing data buffer. Pre-reserve to the chunk's uncompressed
-    // size (slight over-allocation for dict columns since the bytes
-    // are written once, indexed many times, but for PLAIN-only the
-    // estimate is right).
-    let mut data: Vec<u8> = Vec::with_capacity(cm.total_uncompressed_size as usize);
+    let mut walker = PageWalker::new(chunk);
     let mut views: Vec<u128> = Vec::with_capacity(total);
 
-    // Dict offsets within `data` for the column's dictionary, if any.
+    // Σ.E5 (2026-05-18): page-streaming layout. Each data page's
+    // decompressed bytes become an owned `Vec<u8>` that we hand off
+    // as a distinct `Buffer` (`data_buffers[block_id]`). Views into
+    // that page use `block_id = data_buffers.len() - 1` so no per-row
+    // memcpy into a coalesced backing buffer is needed.
+    //
+    // The dictionary page (if any) is `data_buffers[0]`; dict-encoded
+    // data pages emit views referencing block 0. PLAIN data pages emit
+    // views referencing their own (newly-pushed) block.
+    let mut data_buffers: Vec<Buffer> = Vec::new();
+
+    // Dict offsets/lengths within `data_buffers[0]`, if a dict page is
+    // present.
     let mut dict_offsets: Vec<u32> = Vec::new();
     let mut dict_lengths: Vec<u32> = Vec::new();
 
@@ -793,19 +1843,28 @@ fn decode_byte_array_to_string_view_slow(
         .next_page()
         .map_err(|e| ext(format!("next_page (first): {e}")))?
         .ok_or_else(|| ext("empty chunk"))?;
-    decompress_into(codec, first_body, &mut scratch)?;
 
     if first_hdr.dictionary_page_header.is_some() {
-        // Decode dict; append every entry to `data` and remember its
-        // (offset, length).
-        let entries = decode_plain_byte_array(&scratch)
+        // Decompress the dict page into a fresh owned buffer and
+        // record per-entry (offset, length) within it. The decoded
+        // bytes are *exactly* what we want as the backing block.
+        let mut dict_scratch: Vec<u8> = Vec::with_capacity(first_body.len() * 2);
+        let td = std::time::Instant::now();
+        decompress_into(codec, first_body, &mut dict_scratch)?;
+        decompress_ns += td.elapsed().as_nanos();
+        n_pages_dict += 1;
+        let entries = decode_plain_byte_array(&dict_scratch)
             .map_err(|e| ext(format!("plain byte_array dict: {e}")))?;
+        // Compute offsets directly into `dict_scratch` by pointer math:
+        // every slice from `decode_plain_byte_array` is a view into
+        // `dict_scratch`, so its offset = ptr - dict_scratch.as_ptr().
+        let base = dict_scratch.as_ptr() as usize;
         for s in &entries {
-            let off = data.len() as u32;
-            data.extend_from_slice(s);
+            let off = (s.as_ptr() as usize - base) as u32;
             dict_offsets.push(off);
             dict_lengths.push(s.len() as u32);
         }
+        data_buffers.push(Buffer::from_vec(dict_scratch));
     } else {
         // First page IS a data page; handle it inline (PLAIN-only column).
         let dph = first_hdr
@@ -819,14 +1878,34 @@ fn decode_byte_array_to_string_view_slow(
             )));
         }
         let n = dph.num_values as usize;
-        let slices =
-            decode_plain_byte_array(&scratch).map_err(|e| ext(format!("plain byte_array: {e}")))?;
-        for s in slices.iter().take(n) {
-            push_plain_view(&mut data, &mut views, s);
-        }
+        let mut page_buf: Vec<u8> = Vec::with_capacity(first_body.len() * 2);
+        let td = std::time::Instant::now();
+        decompress_into(codec, first_body, &mut page_buf)?;
+        decompress_ns += td.elapsed().as_nanos();
+        let block_id = data_buffers.len() as u32;
+        let tv = std::time::Instant::now();
+        plain_byte_array_to_views_in_place(&page_buf, &mut views, n, block_id)?;
+        viewbuild_ns += tv.elapsed().as_nanos();
+        n_pages_plain += 1;
+        data_buffers.push(Buffer::from_vec(page_buf));
     }
 
-    while views.len() < total {
+    // Σ.E5 (2026-05-19): pre-walk remaining data pages so we can
+    // either keep the serial inline loop OR fan-out via rayon. The
+    // walk itself is cheap (just thrift header reads + slice math)
+    // but the per-page decompress + view-build is the hot work.
+    struct PendingPage<'a> {
+        encoding: Encoding,
+        body: &'a [u8],
+        n_values: usize,
+        // Block_id of the data_buffers slot this page writes into
+        // (for PLAIN pages; RleDict pages reuse block 0 from dict).
+        block_id: u32,
+    }
+    let mut pending: Vec<PendingPage<'_>> = Vec::new();
+    let mut next_block_id = data_buffers.len() as u32;
+    let mut rows_seen = views.len();
+    while rows_seen < total {
         let (hdr, body) = walker
             .next_page()
             .map_err(|e| ext(format!("next_page: {e}")))?
@@ -836,64 +1915,270 @@ fn decode_byte_array_to_string_view_slow(
             .as_ref()
             .ok_or_else(|| ext("v2 pages not yet supported"))?;
         let n = dph.num_values as usize;
-        decompress_into(codec, body, &mut scratch)?;
-        match dph.encoding {
-            Encoding::RleDictionary | Encoding::PlainDictionary => {
-                let idxs = ematix_parquet_codec::dict::decode_rle_dictionary_indices(&scratch, n)
+        let block_id = if matches!(dph.encoding, Encoding::Plain) {
+            let bid = next_block_id;
+            next_block_id += 1;
+            bid
+        } else {
+            0
+        };
+        pending.push(PendingPage {
+            encoding: dph.encoding,
+            body,
+            n_values: n,
+            block_id,
+        });
+        rows_seen += n;
+    }
+
+    // Parallel branch: decompress + build views for each pending
+    // page in rayon. Each task returns (page_views, optional page_buf
+    // for PLAIN). Block IDs were pre-assigned above so each task's
+    // views reference the correct data_buffers slot once we
+    // sequentially append.
+    //
+    // Threshold: only parallelise when there are enough pages to
+    // amortise rayon dispatch (~50-100µs). On Q16 (supplier ~2 pages,
+    // ~10k rows) going parallel was adding ~300µs of overhead. On
+    // Q13 (o_comment 22-51 pages) parallel saves 15-25ms — clear
+    // win above ~4 pages.
+    let parallel_threshold = std::env::var("EMAT_DECODE_PARALLEL_THRESHOLD")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(4usize);
+    if !force_serial && pending.len() > parallel_threshold {
+        use rayon::prelude::*;
+        let dict_offsets_ref = &dict_offsets;
+        let dict_lengths_ref = &dict_lengths;
+        let dict_bytes_ref: &[u8] = if data_buffers.is_empty() {
+            &[]
+        } else {
+            data_buffers[0].as_slice()
+        };
+        let codec_copy = codec;
+
+        let td = std::time::Instant::now();
+        #[allow(clippy::type_complexity)]
+        let results: Vec<DfResult<(Vec<u128>, Option<Vec<u8>>)>> = pending
+            .par_iter()
+            .map(|p| match p.encoding {
+                Encoding::RleDictionary | Encoding::PlainDictionary => {
+                    let mut idx_scratch: Vec<u8> = Vec::new();
+                    decompress_into(codec_copy, p.body, &mut idx_scratch)?;
+                    let mut idx_buf: Vec<u32> = Vec::with_capacity(p.n_values);
+                    ematix_parquet_codec::dict::decode_rle_dictionary_indices_into(
+                        &idx_scratch,
+                        p.n_values,
+                        &mut idx_buf,
+                    )
                     .map_err(|e| ext(format!("rle_dict_indices byte_array: {e}")))?;
-                let dict_len = dict_offsets.len();
-                for &i in &idxs {
-                    let i = i as usize;
-                    if i >= dict_len {
-                        return Err(ext(format!("dict idx {i} out of range {dict_len}")));
+                    let dict_len = dict_offsets_ref.len();
+                    let mut page_views: Vec<u128> = Vec::with_capacity(p.n_values);
+                    for &i in &idx_buf {
+                        let i = i as usize;
+                        if i >= dict_len {
+                            return Err(ext(format!("dict idx {i} out of range {dict_len}")));
+                        }
+                        let off = dict_offsets_ref[i];
+                        let len = dict_lengths_ref[i];
+                        let bytes = &dict_bytes_ref[off as usize..(off + len) as usize];
+                        page_views.push(make_view(bytes, 0u32, off));
                     }
-                    let off = dict_offsets[i];
-                    let len = dict_lengths[i];
-                    let bytes = &data[off as usize..(off + len) as usize];
-                    views.push(make_view(bytes, 0, off));
+                    Ok((page_views, None))
                 }
-            }
-            Encoding::Plain => {
-                let slices = decode_plain_byte_array(&scratch)
-                    .map_err(|e| ext(format!("plain byte_array: {e}")))?;
-                for s in slices.iter().take(n) {
-                    push_plain_view(&mut data, &mut views, s);
+                Encoding::Plain => {
+                    let mut page_buf: Vec<u8> = Vec::with_capacity(p.body.len() * 2);
+                    decompress_into(codec_copy, p.body, &mut page_buf)?;
+                    let mut page_views: Vec<u128> = Vec::with_capacity(p.n_values);
+                    plain_byte_array_to_views_in_place(
+                        &page_buf,
+                        &mut page_views,
+                        p.n_values,
+                        p.block_id,
+                    )?;
+                    Ok((page_views, Some(page_buf)))
                 }
-            }
-            other => {
-                return Err(ext(format!(
+                other => Err(ext(format!(
                     "unexpected byte_array data page encoding {other:?}"
-                )));
+                ))),
+            })
+            .collect();
+        let par_ns = td.elapsed().as_nanos();
+        // Account the parallel-section time under decompress (it's
+        // mostly Snappy) so timing breakdown stays comparable to the
+        // serial path.
+        decompress_ns += par_ns;
+
+        // Sequentially append in page order — preserves block_id
+        // contract (data_buffers[block_id] = this PLAIN page's bytes).
+        for (page, res) in pending.iter().zip(results) {
+            let (mut page_views, page_buf_opt) = res?;
+            views.append(&mut page_views);
+            match page.encoding {
+                Encoding::Plain => {
+                    debug_assert!(page_buf_opt.is_some());
+                    if let Some(buf) = page_buf_opt {
+                        data_buffers.push(Buffer::from_vec(buf));
+                    }
+                    n_pages_plain += 1;
+                }
+                _ => {
+                    n_pages_rle += 1;
+                }
+            }
+        }
+    } else {
+        // Serial fallback (EMAT_DECODE_SERIAL=1 or single-page chunks).
+        let mut idx_scratch: Vec<u8> = Vec::new();
+        let mut idx_buf: Vec<u32> = Vec::new();
+        for p in &pending {
+            let n = p.n_values;
+            let body = p.body;
+            match p.encoding {
+                Encoding::RleDictionary | Encoding::PlainDictionary => {
+                    let td = std::time::Instant::now();
+                    decompress_into(codec, body, &mut idx_scratch)?;
+                    decompress_ns += td.elapsed().as_nanos();
+                    idx_buf.clear();
+                    let tv = std::time::Instant::now();
+                    ematix_parquet_codec::dict::decode_rle_dictionary_indices_into(
+                        &idx_scratch,
+                        n,
+                        &mut idx_buf,
+                    )
+                    .map_err(|e| ext(format!("rle_dict_indices byte_array: {e}")))?;
+                    let dict_len = dict_offsets.len();
+                    // Dict pages always reside in `data_buffers[0]`.
+                    let dict_block = 0u32;
+                    // SAFETY: data_buffers[0] is the dict page; established
+                    // above. Slicing is sound since dict_offsets/lengths
+                    // were computed against its full contents.
+                    let dict_bytes: &[u8] = data_buffers[0].as_slice();
+                    for &i in &idx_buf {
+                        let i = i as usize;
+                        if i >= dict_len {
+                            return Err(ext(format!("dict idx {i} out of range {dict_len}")));
+                        }
+                        let off = dict_offsets[i];
+                        let len = dict_lengths[i];
+                        let bytes = &dict_bytes[off as usize..(off + len) as usize];
+                        views.push(make_view(bytes, dict_block, off));
+                    }
+                    viewbuild_ns += tv.elapsed().as_nanos();
+                    n_pages_rle += 1;
+                }
+                Encoding::Plain => {
+                    let mut page_buf: Vec<u8> = Vec::with_capacity(body.len() * 2);
+                    let td = std::time::Instant::now();
+                    decompress_into(codec, body, &mut page_buf)?;
+                    decompress_ns += td.elapsed().as_nanos();
+                    let block_id = data_buffers.len() as u32;
+                    let tv = std::time::Instant::now();
+                    plain_byte_array_to_views_in_place(&page_buf, &mut views, n, block_id)?;
+                    viewbuild_ns += tv.elapsed().as_nanos();
+                    n_pages_plain += 1;
+                    data_buffers.push(Buffer::from_vec(page_buf));
+                }
+                other => {
+                    return Err(ext(format!(
+                        "unexpected byte_array data page encoding {other:?}"
+                    )));
+                }
             }
         }
     }
 
     debug_assert_eq!(views.len(), total);
 
-    // For string > 12 bytes the view encodes `block_id = 0` (we push
-    // the whole data block as buffer 0). For string ≤ 12 bytes the
-    // view is fully inline and the data buffer entry is unused; this
-    // is fine — the data block still exists.
-    let data_buffer = Buffer::from_vec(data);
+    if timing {
+        let total_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        let read_ms = read_ns as f64 / 1_000_000.0;
+        let dec_ms = decompress_ns as f64 / 1_000_000.0;
+        let view_ms = viewbuild_ns as f64 / 1_000_000.0;
+        let other_ms = total_ms - read_ms - dec_ms - view_ms;
+        eprintln!(
+            "[emat.decode_byte_slow] total={total_ms:.2}ms read={read_ms:.2}ms \
+             decompress={dec_ms:.2}ms view-build={view_ms:.2}ms other={other_ms:.2}ms \
+             rows={total} pages_dict={n_pages_dict} pages_plain={n_pages_plain} pages_rle={n_pages_rle}"
+        );
+    }
+
     let n_rows = views.len();
     let views_buffer = Buffer::from_vec(views);
     Ok(DecodedColumn::StringView {
         views: views_buffer,
         n_rows,
-        data: data_buffer,
+        data_buffers,
     })
 }
 
-/// Append `bytes` to `data` and push a view that points at the new
-/// offset. For ≤ 12-byte strings `make_view` returns a fully-inline
-/// view (the offset is ignored), so we still append (cheap memcpy)
-/// to keep the data block dense for downstream consumers that may
-/// scan it linearly.
-#[inline]
-fn push_plain_view(data: &mut Vec<u8>, views: &mut Vec<u128>, bytes: &[u8]) {
-    let off = data.len() as u32;
-    data.extend_from_slice(bytes);
-    views.push(make_view(bytes, 0, off));
+/// Σ.E5 (2026-05-18): PLAIN-encoded BYTE_ARRAY → views buffer in a
+/// single pass, pointing views at the decompressed page bytes
+/// directly. No coalescing copy.
+///
+/// `page_buf` is the decompressed page (which the caller will hand
+/// off as `data_buffers[block_id]`). Each emitted view encodes
+/// `(block_id, offset_in_page)` — Arrow's StringViewArray dereferences
+/// it against `data_buffers[block_id]` at access time.
+///
+/// On Q13's `o_comment` (1.5M rows × ~30 B/value PLAIN) this
+/// eliminates ~45 MB of `extend_from_slice` memcpy that the old
+/// coalescing path did.
+///
+/// Format: parquet BYTE_ARRAY PLAIN is `[u32 len][bytes]` repeated.
+///
+/// Σ.E5 (2026-05-19): inlined the long-string (>12 B) view construction.
+/// Arrow's `make_view` is `#[inline(never)]` and dominates Q13 decode
+/// (~30 ns/row × 1.5 M = 45 ms). For values > 12 bytes the view is
+/// `[len:u32 | prefix:u32 | block_id:u32 | offset:u32]` little-endian,
+/// which we can splice directly into a `u128`. Short strings (≤ 12 B)
+/// fall back to `make_view` for the per-length inline specialization.
+#[inline(always)]
+fn plain_byte_array_to_views_in_place(
+    page_buf: &[u8],
+    views: &mut Vec<u128>,
+    n: usize,
+    block_id: u32,
+) -> DfResult<()> {
+    let page_len = page_buf.len();
+    let bytes_ptr = page_buf.as_ptr();
+    let mut off = 0usize;
+    let block_hi = (block_id as u128) << 64;
+    views.reserve(n);
+
+    for i in 0..n {
+        if off + 4 > page_len {
+            return Err(ext(format!(
+                "plain byte_array: truncated length prefix at value {i}/{n}, offset {off}/{page_len}"
+            )));
+        }
+        // Unaligned u32 read of the length prefix.
+        let len = unsafe { std::ptr::read_unaligned(bytes_ptr.add(off) as *const u32) } as usize;
+        off += 4;
+        if off + len > page_len {
+            return Err(ext(format!(
+                "plain byte_array: value {i}/{n} length {len} overruns page at offset {off}"
+            )));
+        }
+
+        let view: u128 = if len > 12 {
+            // Inlined ByteView u128 layout (LE):
+            //   bytes 0..4  = length
+            //   bytes 4..8  = first-4-byte prefix
+            //   bytes 8..12 = buffer_index (= block_id)
+            //   bytes 12..16 = offset (= off as u32)
+            let prefix = unsafe { std::ptr::read_unaligned(bytes_ptr.add(off) as *const u32) };
+            (len as u128) | ((prefix as u128) << 32) | block_hi | ((off as u128) << 96)
+        } else {
+            // Short strings need byte-by-byte inlining into the u128
+            // body — `make_view` jump-tables on length for this.
+            let bytes = &page_buf[off..off + len];
+            make_view(bytes, block_id, off as u32)
+        };
+        views.push(view);
+        off += len;
+    }
+    Ok(())
 }
 
 /// BYTE_ARRAY → `DictionaryArray<UInt32, Utf8>` — same shape as
@@ -932,12 +2217,11 @@ fn decode_byte_array_dict_preserved(
 /// Slow path: BYTE_ARRAY → `StringArray` row-by-row, using
 /// `StringBuilder`. Kept for completeness; callers should prefer
 /// `Utf8View` or `Dictionary(UInt32, Utf8)` on the hot path.
-fn decode_byte_array_to_utf8(file: &ParquetFile, rg: usize, col: usize) -> DfResult<DecodedColumn> {
-    let md = file.metadata().map_err(|e| ext(format!("metadata: {e}")))?;
-    let cm = md.row_groups[rg].columns[col]
-        .meta_data
-        .as_ref()
-        .ok_or_else(|| ext("column missing meta_data"))?;
+fn decode_byte_array_to_utf8(
+    file: &ParquetFile,
+    chunk_buf: &mut Vec<u8>,
+    cm: &CachedColumnChunk,
+) -> DfResult<DecodedColumn> {
     let total = cm.num_values as usize;
     let codec = cm.codec;
     let start = cm
@@ -945,11 +2229,11 @@ fn decode_byte_array_to_utf8(file: &ParquetFile, rg: usize, col: usize) -> DfRes
         .filter(|&d| d < cm.data_page_offset)
         .unwrap_or(cm.data_page_offset) as u64;
     let length = cm.total_compressed_size as u64;
-    let chunk = file
-        .read_range(start, length)
-        .map_err(|e| ext(format!("read_range: {e}")))?;
+    file.read_range_into(chunk_buf, start, length)
+        .map_err(|e| ext(format!("read_range_into: {e}")))?;
+    let chunk = &chunk_buf[..];
 
-    let mut walker = PageWalker::new(&chunk);
+    let mut walker = PageWalker::new(chunk);
     let mut scratch: Vec<u8> = Vec::with_capacity(128 * 1024);
     let mut builder = StringBuilder::with_capacity(total, cm.total_uncompressed_size as usize);
 
@@ -977,6 +2261,9 @@ fn decode_byte_array_to_utf8(file: &ParquetFile, rg: usize, col: usize) -> DfRes
         Vec::new()
     };
 
+    // Σ.E5 (2026-05-19): reusable per-RG idx buffer eliminates the
+    // per-page `Vec<u32>` alloc churn.
+    let mut idx_buf: Vec<u32> = Vec::new();
     while builder.len() < total {
         let (hdr, body) = walker
             .next_page()
@@ -990,9 +2277,14 @@ fn decode_byte_array_to_utf8(file: &ParquetFile, rg: usize, col: usize) -> DfRes
         decompress_into(codec, body, &mut scratch)?;
         match dph.encoding {
             Encoding::RleDictionary | Encoding::PlainDictionary => {
-                let idxs = ematix_parquet_codec::dict::decode_rle_dictionary_indices(&scratch, n)
-                    .map_err(|e| ext(format!("rle_dict_indices: {e}")))?;
-                for &i in &idxs {
+                idx_buf.clear();
+                ematix_parquet_codec::dict::decode_rle_dictionary_indices_into(
+                    &scratch,
+                    n,
+                    &mut idx_buf,
+                )
+                .map_err(|e| ext(format!("rle_dict_indices: {e}")))?;
+                for &i in &idx_buf {
                     let s = dict
                         .get(i as usize)
                         .ok_or_else(|| ext(format!("dict idx {i} out of range {}", dict.len())))?;
@@ -1058,22 +2350,32 @@ fn slice_decoded(c: &DecodedColumn, start: usize, n: usize, target: &DataType) -
             let scalar = ScalarBuffer::<f64>::new(sliced, 0, n);
             Arc::new(Float64Array::new(scalar, None))
         }
-        DecodedColumn::StringView { views, data, .. } => {
+        DecodedColumn::StringView {
+            views,
+            data_buffers,
+            ..
+        } => {
             // Σ.E5.1.c: zero-copy slice for the views buffer too. Each
             // view is 16 bytes — at 65K rows × ~20 batches × 2 string
             // cols on Q1 that's ~40 MB of u128 copying eliminated.
-            // Backing data buffer is shared via Arc bump.
+            // Backing data buffers are shared via Arc bump (one clone
+            // per page; cheap — typically 1–6 pages per RG).
+            //
+            // Σ.E5 (2026-05-19, verified NEG): per-batch coalesce was
+            // tested as a fix for Q13's `output_bytes=2.1GB` accounting
+            // (vs fast's 152MB). Result: Q13 regressed +29% → +57%.
+            // The 14× buffer-size inflation is a reporting artifact
+            // (Arc<Buffer> ref-counts; operators don't iterate the
+            // backing bytes during repartition). The per-batch memcpy
+            // cost (~30MB for o_comment) far exceeds any downstream
+            // saving. Don't coalesce; share the page buffers.
             let sliced_views = views.slice_with_length(start * 16, n * 16);
             let views_buf = ScalarBuffer::<u128>::new(sliced_views, 0, n);
             // SAFETY: we built every view ourselves with `make_view`
-            // against `data` so the offsets are valid and the bytes
-            // are valid UTF-8 (decode_plain_byte_array round-trips
-            // the parquet bytes which are UTF-8 by Utf8 logical type).
-            //
-            // We use the safe `try_new` since the upfront cost of
-            // validating views is negligible relative to decode time
-            // and gives us a defensive check.
-            let arr = StringViewArray::try_new(views_buf, vec![data.clone()], None::<NullBuffer>)
+            // against the corresponding `data_buffers[block_id]` so
+            // the (block_id, offset) coordinates are valid and the
+            // bytes are valid UTF-8 (parquet Utf8 logical type).
+            let arr = StringViewArray::try_new(views_buf, data_buffers.clone(), None::<NullBuffer>)
                 .expect("StringViewArray::try_new on internally-built views");
             Arc::new(arr)
         }
@@ -1114,6 +2416,12 @@ fn decompress_into(codec: CompressionCodec, body: &[u8], out: &mut Vec<u8>) -> D
             Ok(())
         }
         CompressionCodec::Snappy => {
+            // Re-confirmed 2026-05-19: opting into
+            // `decompress_snappy_fast_into` via `EMAT_FAST_SNAPPY=1`
+            // regresses the 22-query geomean from 0.92 → 0.98 (Q14
+            // -36% → -24%, Q01 -5% → +3%). Microbench wins on
+            // random data don't transfer to TPC-H. `snap` crate
+            // stays the default; see [[hand-rolled-snappy-neg]].
             decompress_snappy_into(body, out).map_err(|e| ext(format!("snappy: {e}")))
         }
         CompressionCodec::Zstd => {

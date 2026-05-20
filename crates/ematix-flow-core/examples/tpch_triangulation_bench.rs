@@ -30,10 +30,8 @@ use datafusion::prelude::{SessionConfig, SessionContext};
 use ematix_flow_core::dict_aggregate_rule::EnableDictGroupCountRule;
 use ematix_flow_core::ematix_fast_parquet::EmatixFastParquetTableProvider;
 use ematix_flow_core::fast_parquet::FastParquetTableProvider;
+use ematix_flow_core::fused_aggregate_filter_multi_agg_rule::InjectFilterMultiAggRule;
 use ematix_flow_core::fused_aggregate_filter_sum_rule::InjectFilterSumRule;
-use ematix_flow_core::fused_jit_rule::{
-    InjectFusedQ1Rule, InjectFusedQ3Rule, InjectFusedQ5Rule, InjectFusedQ12Rule,
-};
 use futures_util::TryStreamExt;
 
 #[global_allocator]
@@ -266,12 +264,9 @@ async fn build_ematix_ctx(data_dir: &Path) -> Result<SessionContext, Box<dyn std
     let state = SessionStateBuilder::new()
         .with_config(SessionConfig::new().with_target_partitions(14))
         .with_default_features()
-        .with_physical_optimizer_rule(Arc::new(InjectFusedQ1Rule))
-        .with_physical_optimizer_rule(Arc::new(InjectFusedQ3Rule))
-        .with_physical_optimizer_rule(Arc::new(InjectFusedQ5Rule))
-        .with_physical_optimizer_rule(Arc::new(InjectFilterSumRule))
-        .with_physical_optimizer_rule(Arc::new(InjectFusedQ12Rule))
         .with_physical_optimizer_rule(Arc::new(EnableDictGroupCountRule))
+        .with_physical_optimizer_rule(Arc::new(InjectFilterMultiAggRule))
+        .with_physical_optimizer_rule(Arc::new(InjectFilterSumRule))
         .build();
     let ctx = SessionContext::new_with_state(state);
     for t in TPCH_TABLES {
