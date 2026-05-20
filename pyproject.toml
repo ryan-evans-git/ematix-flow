@@ -151,6 +151,15 @@ secrets = [
     "google-cloud-secret-manager>=2.16",
 ]
 
+# ---- Web UI extras (Phase 4 — flow web subcommand) -----------------
+# FastAPI + uvicorn server + embedded Vite/Svelte SPA bundle. The
+# Python wheel ships the pre-built SPA in `ematix_flow/web/ui_dist/`
+# at build time so `flow web` works out of the box.
+web = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.27",
+]
+
 # ---- Cloud warehouse extras (Phase 2 — Snowflake / BigQuery / Redshift)
 # Each warehouse's typed Connection + the matching `*_query_to_arrow`
 # adapter pulls the upstream Python SDK as an opt-in extra. The
