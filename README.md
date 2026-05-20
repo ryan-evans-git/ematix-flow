@@ -16,6 +16,8 @@ schedules, DAG dependencies, watermarks, schema evolution, restart-safe state,
 and at-least-once delivery are all built in — no extra scheduler service to
 deploy.
 
+Project site: **[ematix.dev](https://ematix.dev)**.
+
 ```python
 from ematix_flow import ematix, ManagedTable, Annotated, BigInt, Text, TimestampTZ, pk
 
