@@ -73,12 +73,12 @@ pub mod fused_aggregate_filter_multi_agg_rule;
 // operator. Hosts `FusedFilterAggSpec` IR + `FusedFilterAggJit`
 // runtime that `FilterSumSpec` and `FilterMultiAggSpec` build on.
 pub mod fused_jit;
-// Σ.G.2f.3 cleanup: just the generalised aggregate plan-shape
-// matcher used by the two remaining injection rules. The four
-// per-query rules + EnableFusedJitRule that lived here were retired
-// in commit 476d65d (rules) and the substrate cleanup that landed
-// alongside it.
-pub mod fused_jit_rule;
+// fused_jit_rule retired in Σ.F.2 (2026-05-20). The shared
+// `AggregateShapeConfig` walker it hosted is replaced by the
+// declarative shape catalog (`shape_catalog`); both fused-aggregate
+// injection rules now express their patterns as `Shape`s and call
+// `Shape::try_match` directly. The remaining JIT-emission substrate
+// stayed in `fused_jit.rs`.
 // Σ.E3a: `DictFilterExec` — IN-list filter on Dictionary(UInt32, Utf8)
 // columns by code membership (no string compare in the hot loop).
 // Photon's #1 string-workload pattern; landing the operator standalone

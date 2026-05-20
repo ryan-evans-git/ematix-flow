@@ -40,6 +40,8 @@ use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::filter::FilterExec;
 use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::repartition::RepartitionExec;
+use datafusion::physical_plan::sorts::sort::SortExec;
+use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
 use datafusion::physical_expr::Partitioning;
 
 /// Aggregate-mode filter used by [`Shape::Aggregate`].
@@ -98,6 +100,18 @@ pub enum Shape {
         capture: Option<&'static str>,
         children: Vec<Shape>,
     },
+    /// `SortExec` (any sort key).
+    Sort {
+        capture: Option<&'static str>,
+        children: Vec<Shape>,
+    },
+    /// `SortPreservingMergeExec` (any sort key). DataFusion emits the
+    /// SortPreservingMerge > Sort > ... wrapper pair when the SQL has
+    /// an `ORDER BY` clause downstream of a partitioned aggregate.
+    SortPreservingMerge {
+        capture: Option<&'static str>,
+        children: Vec<Shape>,
+    },
     /// Wrap an `inner` shape under an `optional` outer wrapper. Tries
     /// `wrapper(inner)` first; on miss, falls back to matching `inner`
     /// directly. The wrapper's capture (if any) is populated only when
@@ -148,6 +162,14 @@ pub fn coalesce_partitions(capture: Option<&'static str>, children: Vec<Shape>) 
 
 pub fn repartition_hash(capture: Option<&'static str>, children: Vec<Shape>) -> Shape {
     Shape::RepartitionHash { capture, children }
+}
+
+pub fn sort(capture: Option<&'static str>, children: Vec<Shape>) -> Shape {
+    Shape::Sort { capture, children }
+}
+
+pub fn sort_preserving_merge(capture: Option<&'static str>, children: Vec<Shape>) -> Shape {
+    Shape::SortPreservingMerge { capture, children }
 }
 
 pub fn optional(wrapper: Shape, inner: Shape) -> Shape {
@@ -267,6 +289,30 @@ impl Shape {
                     return false;
                 };
                 if !matches!(rep.partitioning(), Partitioning::Hash(_, _)) {
+                    return false;
+                }
+                if !match_children(children, plan, captures) {
+                    return false;
+                }
+                capture_if(captures, *capture, plan);
+                true
+            }
+            Shape::Sort { capture, children } => {
+                if plan.as_any().downcast_ref::<SortExec>().is_none() {
+                    return false;
+                }
+                if !match_children(children, plan, captures) {
+                    return false;
+                }
+                capture_if(captures, *capture, plan);
+                true
+            }
+            Shape::SortPreservingMerge { capture, children } => {
+                if plan
+                    .as_any()
+                    .downcast_ref::<SortPreservingMergeExec>()
+                    .is_none()
+                {
                     return false;
                 }
                 if !match_children(children, plan, captures) {
@@ -470,5 +516,43 @@ mod tests {
             let owned: Arc<dyn ExecutionPlan> = (*child).clone();
             walk(&owned, f);
         }
+    }
+
+    /// `ORDER BY a` triggers SortPreservingMerge > Sort > ... above the
+    /// aggregate stack. The Σ.F.2 fused-agg-rule patterns need both
+    /// shapes addressable by the matcher.
+    #[tokio::test]
+    async fn sort_and_sort_merge_match_order_by_plan() {
+        let ctx = simple_int_ctx().await;
+        let physical = ctx
+            .sql("SELECT a, SUM(b) FROM t GROUP BY a ORDER BY a")
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+
+        // Find a SortExec anywhere in the tree.
+        let any_sort_below = sort(Some("sort"), vec![any_capture("inner")]);
+        let mut found_sort = false;
+        walk(&physical, &mut |node| {
+            if any_sort_below.try_match(node).is_some() {
+                found_sort = true;
+            }
+        });
+        assert!(found_sort, "ORDER BY plan should contain a SortExec");
+
+        // Find a SortPreservingMergeExec anywhere in the tree.
+        let any_spm = sort_preserving_merge(Some("spm"), vec![any_capture("inner")]);
+        let mut found_spm = false;
+        walk(&physical, &mut |node| {
+            if any_spm.try_match(node).is_some() {
+                found_spm = true;
+            }
+        });
+        assert!(
+            found_spm,
+            "ORDER BY plan should contain a SortPreservingMergeExec"
+        );
     }
 }
