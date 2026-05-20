@@ -44,6 +44,11 @@
 // the long-running `DistributedBackend` tonic-worker model below; see
 // docs/DISTRIBUTED_TPCH_BENCHMARK_PLAN.md.
 pub mod work_unit;
+// Phase 3 of "What's not shipped": peer auto-discovery. Recognises
+// `dns://` and `k8s://` schemes inside the `peers` config and resolves
+// them to concrete A-record URLs at backend-open time. Plain `http(s)://`
+// URLs continue to work unchanged. See module docs.
+pub mod peer_discovery;
 
 use std::sync::Arc;
 
@@ -116,16 +121,21 @@ impl DistributedBackend {
     /// produces a single-worker degenerate cluster (handy for
     /// tests). Each peer URL is parsed eagerly so misconfiguration
     /// surfaces here, not on first execute.
+    ///
+    /// Peer entries may use any of the following schemes (mixed
+    /// freely in the same list):
+    ///
+    /// - `http://host:port` / `https://host:port` — static URL,
+    ///   passed through.
+    /// - `dns://host:port` — A-record lookup at open time, one URL
+    ///   per resolved address.
+    /// - `k8s://service.namespace:port` — sugar for
+    ///   `dns://service.namespace.svc.cluster.local:port`. Lets a
+    ///   single config line replace a whole pod-IP list.
+    ///
+    /// See [`crate::peer_discovery`] for the resolution contract.
     pub fn open(cfg: DistributedConfig) -> Result<Self, BackendError> {
-        let peers = cfg
-            .peers
-            .iter()
-            .enumerate()
-            .map(|(i, raw)| {
-                Url::parse(raw)
-                    .map_err(|e| BackendError::Connection(format!("peer #{i} ({raw:?}): {e}")))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        let peers = peer_discovery::expand_peer_entries(&cfg.peers)?;
         Ok(Self {
             peers,
             tls: cfg.tls,
