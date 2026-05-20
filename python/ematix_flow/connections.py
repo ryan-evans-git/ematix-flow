@@ -56,19 +56,35 @@ kafka_prod = KafkaConnection(
 # connections across pipelines.
 ```
 
-## ${VAR} env interpolation
+## ${...} interpolation — env + pluggable secret stores
 
-Any ``str`` field on a connection can contain ``${VAR}``
+Any ``str`` field on a connection can contain ``${...}``
 references. The interpolation happens **at backend-build time**
 (when the pipeline starts), not at connection-definition time —
-so changing an env var between definition and run picks up the
-new value, and undefined vars surface as a clear ``KeyError``.
+so changing the underlying secret between definition and run picks
+up the new value.
+
+Supported reference shapes:
+
+- ``${VAR}`` — bare env-var name. Resolves against ``os.environ``.
+  Existing v0.1+ syntax; unchanged.
+- ``${vault:path/to/secret#key}`` — HashiCorp Vault KV v2.
+- ``${aws:secret-name#field}`` — AWS Secrets Manager (JSON field
+  selector via ``#``).
+- ``${gcp:secret-name#version}`` — GCP Secret Manager (short form;
+  version defaults to ``latest``).
+
+For the non-env resolvers to work the caller must register them at
+app startup; see :mod:`ematix_flow.secrets`. Unresolvable references
+raise :class:`ematix_flow.secrets.MissingSecretError` (a ``KeyError``
+subclass, so legacy ``except KeyError`` handlers continue to work).
 
 ```python
 @ematix.connection
 class warehouse:
     kind = "postgres"
-    url = "postgres://app:${WAREHOUSE_PASSWORD}@${WAREHOUSE_HOST}/main"
+    # Mix and match — host from env, password from Vault.
+    url = "postgres://app:${vault:db/prod#password}@${WAREHOUSE_HOST}/main"
 ```
 
 ## Credential safety
@@ -142,24 +158,26 @@ _SECRET_FIELDS = frozenset(
 
 
 def resolve(value: str | None) -> str | None:
-    """Replace ``${VAR}`` references with ``os.environ[VAR]``.
+    """Replace ``${...}`` references with values from registered
+    secret resolvers.
 
-    Returns ``None`` unchanged. Raises ``KeyError`` (with a clear
-    pointer) if a referenced variable isn't set.
+    Bare ``${VAR}`` resolves against ``os.environ`` (backwards-compatible
+    with v0.1). Prefixed forms like ``${vault:path#key}``,
+    ``${aws:secret-name}``, ``${gcp:secret-name}`` dispatch to the
+    matching resolver registered via
+    :func:`ematix_flow.secrets.register_resolver`.
+
+    Returns ``None`` unchanged. Raises
+    :class:`ematix_flow.secrets.MissingSecretError` (a ``KeyError``
+    subclass, so existing ``except KeyError`` handlers still catch it)
+    if a referenced secret can't be resolved.
+
+    Delegates the actual interpolation to :func:`ematix_flow.secrets.expand`
+    so connection strings and DSN templates share one syntax.
     """
-    if value is None:
-        return None
+    from ematix_flow.secrets import expand
 
-    def sub(match: re.Match[str]) -> str:
-        var = match.group(1)
-        if var not in os.environ:
-            raise KeyError(
-                f"environment variable {var!r} is referenced by an ematix-flow "
-                "connection but is not set"
-            )
-        return os.environ[var]
-
-    return _INTERP.sub(sub, value)
+    return expand(value)
 
 
 def redact(field_name: str, value: Any) -> Any:

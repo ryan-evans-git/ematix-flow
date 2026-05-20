@@ -137,6 +137,20 @@ observability = [
 executor-k8s = ["kubernetes>=29"]
 executor-lambda = ["boto3>=1.34"]
 
+# ---- Secrets-resolver extras (Phase 1 — pluggable secrets) ---------
+# The EnvResolver is stdlib-only. The three external-store resolvers
+# pull their respective SDKs as opt-in extras. Users register the
+# matching resolver at app bootstrap; see
+# ``python/ematix_flow/secrets.py`` and docs/USER_GUIDE.md.
+secrets-vault       = ["hvac>=2.0"]
+secrets-aws         = ["boto3>=1.34"]
+secrets-gcp         = ["google-cloud-secret-manager>=2.16"]
+secrets = [
+    "hvac>=2.0",
+    "boto3>=1.34",
+    "google-cloud-secret-manager>=2.16",
+]
+
 # Convenience: everything ematix-flow can plug into. Heavy install
 # — use targeted extras above in production.
 all = [

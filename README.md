@@ -168,7 +168,12 @@ bootstrap_servers = "${KAFKA_BOOTSTRAP}"
 group_id = "ematix-flow"
 ```
 
-`${VAR}` interpolation lets secrets stay out of the file.
+`${VAR}` interpolation lets secrets stay out of the file. Bare
+`${VAR}` resolves against `os.environ`; prefixed forms route to
+pluggable resolvers — `${vault:secret/db#password}` (HashiCorp Vault),
+`${aws:prod/db#password}` (AWS Secrets Manager), `${gcp:db-password}`
+(GCP Secret Manager). Register additional resolvers via
+`ematix_flow.secrets.register_resolver`.
 
 #### `@ematix.connection` decorator
 
