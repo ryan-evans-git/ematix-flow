@@ -78,6 +78,7 @@ use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode};
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::filter::FilterExec;
+use datafusion::physical_plan::limit::GlobalLimitExec;
 use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::physical_plan::sorts::sort::SortExec;
@@ -152,6 +153,12 @@ pub enum Shape {
         capture: Option<&'static str>,
         children: Vec<Shape>,
     },
+    /// `GlobalLimitExec` (any skip / fetch). DataFusion emits this
+    /// for `LIMIT N` (and `LIMIT N OFFSET M`) at the top of the plan.
+    GlobalLimit {
+        capture: Option<&'static str>,
+        children: Vec<Shape>,
+    },
     /// Wrap an `inner` shape under an `optional` outer wrapper. Tries
     /// `wrapper(inner)` first; on miss, falls back to matching `inner`
     /// directly. The wrapper's capture (if any) is populated only when
@@ -212,11 +219,40 @@ pub fn sort_preserving_merge(capture: Option<&'static str>, children: Vec<Shape>
     Shape::SortPreservingMerge { capture, children }
 }
 
+pub fn global_limit(capture: Option<&'static str>, children: Vec<Shape>) -> Shape {
+    Shape::GlobalLimit { capture, children }
+}
+
 pub fn optional(wrapper: Shape, inner: Shape) -> Shape {
     Shape::Optional {
         wrapper: Box::new(wrapper),
         inner: Box::new(inner),
     }
+}
+
+/// Wrap `core` in the standard set of top-of-plan wrappers DataFusion
+/// emits for `ORDER BY` / `LIMIT` / `ORDER BY + LIMIT` over an
+/// aggregated query. The composition is:
+///
+/// ```text
+/// optional( GlobalLimit(sortish),  sortish )
+///   where sortish = optional(
+///     SortPreservingMerge( Sort( core ) ),
+///     optional( Sort( core ), core )
+///   )
+/// ```
+///
+/// The matcher tries the most-wrapped variant first and falls back
+/// layer by layer. Pass `core` as the un-wrapped pattern (e.g. a
+/// `projection(...)` over an `Aggregate(...)` stack). None of the
+/// wrappers capture by default — pre-wrap or post-process if a rule
+/// needs to read them.
+pub fn wrap_top_for_limit_and_sort(core: Shape) -> Shape {
+    let sortish = optional(
+        sort_preserving_merge(None, vec![sort(None, vec![core.clone()])]),
+        optional(sort(None, vec![core.clone()]), core.clone()),
+    );
+    optional(global_limit(None, vec![sortish.clone()]), sortish)
 }
 
 /// Result of a successful match. The rewriter reads
@@ -353,6 +389,16 @@ impl Shape {
                     .downcast_ref::<SortPreservingMergeExec>()
                     .is_none()
                 {
+                    return false;
+                }
+                if !match_children(children, plan, captures) {
+                    return false;
+                }
+                capture_if(captures, *capture, plan);
+                true
+            }
+            Shape::GlobalLimit { capture, children } => {
+                if plan.as_any().downcast_ref::<GlobalLimitExec>().is_none() {
                     return false;
                 }
                 if !match_children(children, plan, captures) {

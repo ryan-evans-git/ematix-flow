@@ -74,6 +74,7 @@ use crate::fused_aggregate_filter_sum::FilterSumSpec;
 use crate::fused_jit::{AggExpr, Clause, ClauseOp, ColumnTy, FusedFilterAggSpec};
 use crate::shape_catalog::{
     AggMode, Shape, aggregate, any_capture, coalesce_partitions, optional, projection,
+    wrap_top_for_limit_and_sort,
 };
 use datafusion::physical_plan::aggregates::AggregateExec;
 use datafusion::physical_plan::projection::ProjectionExec;
@@ -95,7 +96,7 @@ fn filter_sum_shape() -> Shape {
             vec![any_capture("body")],
         )
     };
-    projection(
+    let core = projection(
         Some("top_projection"),
         vec![aggregate(
             Some("final_agg"),
@@ -107,7 +108,12 @@ fn filter_sum_shape() -> Shape {
                 partial_then_body(),
             )],
         )],
-    )
+    );
+    // Σ.I.1: also accept the optional top-of-plan wrappers DataFusion
+    // emits for ORDER BY / LIMIT (covers ClickBench-shaped queries
+    // that wrap the FilterSum body in a SortExec(TopK) or
+    // GlobalLimitExec).
+    wrap_top_for_limit_and_sort(core)
 }
 
 /// SQL-pattern injection rule for the generic FilterSum shape. See

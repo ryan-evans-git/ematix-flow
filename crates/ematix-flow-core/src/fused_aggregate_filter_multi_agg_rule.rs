@@ -77,31 +77,32 @@ use crate::fused_aggregate_filter_multi_agg::{FilterMultiAggSpec, GroupKeyKind};
 use crate::fused_jit::{AggExpr, Clause, ClauseOp, ColumnTy};
 use crate::shape_catalog::{
     AggMode, MatchedSubtree, Shape, aggregate, any_capture, optional, projection, repartition_hash,
-    sort, sort_preserving_merge,
+    wrap_top_for_limit_and_sort,
 };
 use datafusion::physical_plan::aggregates::AggregateExec;
 
 /// Σ.F catalog entry for the FilterMultiAgg shape (TPC-H Q1 and kin):
 ///
 /// ```text
-/// [opt SortPreservingMerge > Sort]
-///   > Projection
-///     > Aggregate(FinalPartitioned)
-///       > RepartitionExec(Hash)
-///         > Aggregate(Partial)
-///           > [opt CSE Projection]
-///             > Any(body)
+/// [opt GlobalLimit]
+///   > [opt SortPreservingMerge > Sort  |  Sort  |  ø]
+///     > Projection
+///       > Aggregate(FinalPartitioned)
+///         > RepartitionExec(Hash)
+///           > Aggregate(Partial)
+///             > [opt CSE Projection]
+///               > Any(body)
 /// ```
 ///
-/// Replaces the 8-variant brute-force search of the previous matcher
-/// (2 × top-sort × 2 × CSE × 2 × group-by-count). Group-by arity +
-/// aggregate arity are intentionally `None` here — the per-rule
-/// validation in [`try_build_replacement`] reads them off the captured
-/// `AggregateExec` and rejects unsupported counts.
+/// Σ.I.1 (2026-05-20) widened the top-of-plan wrappers to also accept
+/// `SortExec(TopK)` (ORDER BY with LIMIT pushed into the sort) and
+/// `GlobalLimitExec` (LIMIT without ORDER BY) — covers ~30 additional
+/// ClickBench-shaped queries that previously fell through the matcher.
+///
+/// Group-by arity + aggregate arity are intentionally `None` here —
+/// the per-rule validation in [`try_build_replacement`] reads them off
+/// the captured `AggregateExec` and rejects unsupported counts.
 fn filter_multi_agg_shape() -> Shape {
-    // Build the core "Projection > FinalPartitioned > RepartitionHash >
-    // Partial > optional(CSE Projection) > Any(body)" once so the
-    // sort/no-sort variants reuse it.
     let core = projection(
         Some("top_projection"),
         vec![aggregate(
@@ -124,12 +125,7 @@ fn filter_multi_agg_shape() -> Shape {
             )],
         )],
     );
-    // ORDER BY emits `SortPreservingMerge > Sort > ...` above the
-    // top Projection. Try with-sort first, then bare core.
-    optional(
-        sort_preserving_merge(None, vec![sort(None, vec![core.clone()])]),
-        core,
-    )
+    wrap_top_for_limit_and_sort(core)
 }
 
 /// SQL-pattern injection rule for the generic multi-aggregate + group-by
