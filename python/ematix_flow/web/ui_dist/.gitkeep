@@ -1,0 +1,4 @@
+# Placeholder so `ematix_flow.web.ui_dist` is a discoverable
+# data dir. The actual SPA bundle is written here by the Vite
+# build (web-ui/vite.config.js → outDir). Git ignores everything
+# else in this directory (see python/ematix_flow/web/.gitignore).
