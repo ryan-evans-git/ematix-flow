@@ -99,6 +99,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let tpcds_results = audit_suite(&tpcds_ctx, tpcds_queries).await;
     sections.push(("TPC-DS (Spark dialect)".to_string(), tpcds_results));
 
+    // --- Suite 3: ClickBench (43 queries, single-table hits) -----
+    let cb_schema_path = repo_root.join("examples/clickbench/schema.sql");
+    let cb_queries_path = repo_root.join("examples/clickbench/queries.sql");
+    if cb_schema_path.is_file() && cb_queries_path.is_file() {
+        let cb_schema = fs::read_to_string(&cb_schema_path)?;
+        let cb_ctx = setup_ctx(&cb_schema).await?;
+        let cb_queries = read_queries_inline(&cb_queries_path)?;
+        let cb_results = audit_suite(&cb_ctx, cb_queries).await;
+        sections.push(("ClickBench (43 queries)".to_string(), cb_results));
+    } else {
+        eprintln!(
+            "ClickBench files not found at {} / {}; skipping suite",
+            cb_schema_path.display(),
+            cb_queries_path.display()
+        );
+    }
+
     // --- Report ---------------------------------------------
     emit_markdown(&sections);
     Ok(())
@@ -241,6 +258,25 @@ fn read_queries(
         na.cmp(&nb).then_with(|| sa.cmp(&sb))
     });
     Ok(entries)
+}
+
+/// Read queries from a single file with one statement per line (the
+/// ClickBench `queries.sql` format). Blank lines and lines starting
+/// with `--` are skipped. The query ID is the 1-based line number.
+fn read_queries_inline(path: &Path) -> Result<Vec<(String, String)>, Box<dyn std::error::Error>> {
+    let raw = fs::read_to_string(path)?;
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut idx = 0usize;
+    for line in raw.lines() {
+        let stripped = line.trim();
+        if stripped.is_empty() || stripped.starts_with("--") {
+            continue;
+        }
+        idx += 1;
+        let sql = stripped.trim_end_matches(';').to_string();
+        out.push((format!("{:02}", idx), sql));
+    }
+    Ok(out)
 }
 
 fn truncate(s: &str, n: usize) -> String {

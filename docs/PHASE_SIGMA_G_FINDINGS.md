@@ -8,35 +8,54 @@ examples/sigma_g_shape_inventory.rs`. Reproduce with `cargo run
 
 ## Headline
 
-**125 queries** audited (22 TPC-H + 103 TPC-DS Spark dialect).
+**168 queries** audited across three workloads:
 
-- **100% plan successfully** — DataFusion's SQL parser handles every
-  query in both suites, including all TPC-DS Spark dialect.
-- **12/125 (10%) hit at least one current catalog rule** — and all
-  12 are TPC-H. **Zero TPC-DS queries** hit any rule.
-- **121/125 (97%) of queries contain a `HashJoinExec`** somewhere in
-  the plan tree. We have zero catalog entries that handle joins.
+- **TPC-H 22** (real parquet via EmatixFastParquetTableProvider)
+- **TPC-DS 103** (Spark dialect, schema-only empty MemTable)
+- **ClickBench 43** (single-table OLAP, schema-only empty MemTable)
+
+All 168 plan successfully — DataFusion's SQL parser handles every
+query, including TPC-DS Spark dialect and ClickBench's
+ClickHouse-flavoured SQL. **16/168 (10%)** hit at least one current
+catalog rule (12 from TPC-H, 0 from TPC-DS, 4 from ClickBench).
+
+**The two big patterns** that emerge are *orthogonal* — different
+workload classes need different shapes:
+
+- **Multi-table OLAP (TPC-H / TPC-DS):** 121/125 queries contain a
+  `HashJoinExec`. The join is the gating shape — our aggregate
+  rules can't reach the scan through it.
+- **Single-table OLAP (ClickBench):** **0 queries have a join.**
+  Instead, 31/43 (72%) use `SortExec(TopK)` for ORDER BY + LIMIT.
+  The dominant pattern is `Filter → Aggregate → Sort → Limit`.
+
+So "any user's SQL" actually maps to two distinct executor gaps,
+not one. The right next-phase ordering reflects this.
 
 ## Operator-class footprint (queries that mention each)
 
-| Operator | TPC-H (22) | TPC-DS (103) | **Total / 125** |
-|---|---:|---:|---:|
-| `HashJoinExec` | 20 | 101 | **121 (97%)** |
-| `AggregateExec` | 22 | 102 | **124 (99%)** |
-| `FilterExec` | 22 | 103 | **125 (100%)** |
-| `RepartitionExec` | 22 | 103 | **125 (100%)** |
-| `ProjectionExec` | 21 | 97 | **118 (94%)** |
-| `SortPreservingMergeExec` | 18 | 84 | **102 (82%)** |
-| `SortExec(TopK)` | 0 | 75 | **75 (60%)** |
-| `SortExec` | 18 | 24 | **42 (34%)** |
-| `CoalescePartitionsExec` | 14 | 25 | **39 (31%)** |
-| `UnionExec` | 0 | 12 | **12 (10%)** |
-| `NestedLoopJoinExec` | 2 | 9 | **11 (9%)** |
-| `GlobalLimitExec` | 0 | 10 | **10 (8%)** |
-| `BoundedWindowAggExec` | 0 | 9 | **9 (7%)** |
-| `WindowAggExec` | 0 | 8 | **8 (6%)** |
-| `CrossJoinExec` | 0 | 5 | **5 (4%)** |
-| `InterleaveExec` | 0 | 5 | **5 (4%)** |
+| Operator | TPC-H (22) | TPC-DS (103) | ClickBench (43) | **Total / 168** |
+|---|---:|---:|---:|---:|
+| `AggregateExec` | 22 | 102 | 36 | **160 (95%)** |
+| `FilterExec` | 22 | 103 | 26 | **151 (90%)** |
+| `RepartitionExec` | 22 | 103 | 21 | **146 (87%)** |
+| `ProjectionExec` | 21 | 97 | 39 | **157 (93%)** |
+| `HashJoinExec` | 20 | 101 | **0** | **121 (72%)** |
+| `SortPreservingMergeExec` | 18 | 84 | 19 | **121 (72%)** |
+| `SortExec(TopK)` | 0 | 75 | 31 | **106 (63%)** |
+| `SortExec` | 18 | 24 | 1 | **43 (26%)** |
+| `CoalescePartitionsExec` | 14 | 25 | 2 | **41 (24%)** |
+| `GlobalLimitExec` | 0 | 10 | 6 | **16 (10%)** |
+| `UnionExec` | 0 | 12 | 0 | **12 (7%)** |
+| `NestedLoopJoinExec` | 2 | 9 | 0 | **11 (7%)** |
+| `BoundedWindowAggExec` | 0 | 9 | 0 | **9 (5%)** |
+| `WindowAggExec` | 0 | 8 | 0 | **8 (5%)** |
+| `CrossJoinExec` | 0 | 5 | 0 | **5 (3%)** |
+| `InterleaveExec` | 0 | 5 | 0 | **5 (3%)** |
+
+Read the table by *column* to see workload character:
+- TPC-H/TPC-DS: heavy join (97% of those 125 queries).
+- ClickBench: heavy TopN (72% — vs 0% join). Different world.
 
 ## What the data says clearly
 
@@ -58,20 +77,30 @@ predicate+aggregate pipeline beats it.
 either `BoundedWindowAggExec` or `WindowAggExec`. Zero TPC-H queries
 do, so our current bench harness can't measure window perf at all.
 
-**4. Aggregate + Filter shapes are already nearly-covered.** Where
-TPC-H rules fire: `dict_filter` (9), `dict_group_count` (2),
-`filter_sum` (1, Q06), `filter_multi_agg` (1, Q01). The
-multi-agg/filter-sum rules only fire on Q01 and Q06 because every
-*other* aggregate query has a JOIN between the aggregate and the
-scan, which the current shapes reject. **The join is again the
-gating shape.**
+**4. Aggregate + Filter shapes are already nearly-covered for
+single-table workloads.** Where TPC-H rules fire: `dict_filter` (9),
+`dict_group_count` (2), `filter_sum` (1, Q06), `filter_multi_agg`
+(1, Q01). The multi-agg/filter-sum rules only fire on Q01 and Q06
+because every *other* TPC-H aggregate query has a JOIN between the
+aggregate and the scan.
+
+**ClickBench fires `filter_multi_agg` on Q13/Q37/Q38/Q39 even with
+empty data**, because those queries have a `Filter > Aggregate >
+Scan` shape with no join. The rule already works; the queries it
+doesn't fire on (the other 39 ClickBench queries) mostly have a
+trailing `SortExec(TopK) > GlobalLimitExec` wrapper that the current
+shape doesn't accept. **Extending the existing aggregate rules to
+match the TopN-wrapped variant is much cheaper than the
+join-aware extension.**
 
 **5. DataFusion's parser handles real TPC-DS Spark queries.** This
 was the previous risk — Spark dialect specifics (LATERAL VIEW, etc.).
 None of the 103 queries failed to plan. So we don't need a dialect
 translator for the inventory itself, only for execution.
 
-## Catalog rule activation, per-query (TPC-H)
+## Catalog rule activation, per-query
+
+**TPC-H 22 (real parquet — accurate rule firing):**
 
 | Q | Rules fired |
 |---|---|
@@ -80,57 +109,85 @@ translator for the inventory itself, only for execution.
 | Q04 | `dict_group_count` |
 | Q06 | `filter_sum` |
 | Q21 | also `dict_group_count` |
-| Q09, Q12-Q19, Q22 | — (no rule fired) |
+| Q09, Q12-Q19, Q22 | — |
 
-Note that on real-parquet TPC-H, **10 queries fire `dict_filter`**
-(up from 0 with empty MemTables) — the dict-aware string filter is
-*broadly applicable* even with the existing narrow shape, because the
-predicate only needs to be on a dict column. This is the model the
-join shape should follow: narrow precise pattern, applies across
-many queries.
+**ClickBench 43 (empty MemTable — fires only when shape matches
+syntactically, without dict-decoded data):**
+
+| Q | Rules fired |
+|---|---|
+| Q13, Q37, Q38, Q39 | `filter_multi_agg` |
+| Q01-Q12, Q14-Q36, Q40-Q43 | — |
+
+**TPC-DS 103:** zero rules fire (mostly because every query has a
+join blocking the catalog's aggregate-side shapes).
+
+Note: on real-parquet TPC-H, **10 queries fire `dict_filter`** (up
+from 0 with empty MemTables) — the dict-aware string filter is
+*broadly applicable* even with its narrow shape, because the
+predicate only needs a dict column. **This is the model new shapes
+should follow:** narrow precise pattern, applies across many
+queries via the runtime data shape, not by widening the matcher.
 
 ## Recommended next phase ordering
 
-Read these as "the catalog gap + the executor it implies".
+Read these as "catalog gap + executor it implies". The first two
+phases below are *orthogonal* — they unlock different workload
+classes — so they can ship in parallel or in either order. The
+join phase has higher per-query leverage on the benches we already
+track; the TopN phase touches a workload class we currently can't
+optimise at all.
 
-### Σ.H — `Filter + HashJoin + Aggregate` shape (highest leverage)
+### Σ.H — `Filter + HashJoin + Aggregate` shape (multi-table OLAP)
 
-**Coverage:** ~80+ queries across both suites have this exact
-sub-pattern (filter on dim table → hash-join into fact → aggregate).
-TPC-H Q3 / Q5 / Q7 / Q8 / Q10 / Q11 / Q19 / Q21; TPC-DS dozens.
+**Coverage:** 121/125 TPC-H + TPC-DS queries have a HashJoinExec.
+Specifically the `filter on dim table → hash-join into fact →
+aggregate` pattern: TPC-H Q3 / Q5 / Q7 / Q8 / Q10 / Q11 / Q19 / Q21;
+dozens of TPC-DS queries. ClickBench: 0 (no joins).
 
 **Catalog entry:** new shape `Aggregate(Final*) > ... > HashJoinExec >
 Filter > Scan` (with the various wrappers we already handle on the
-agg side). ~50 LOC catalog code.
+agg side). ~50 LOC catalog code, leveraging the Σ.F substrate.
 
 **Executor work (the substance):** Σ.E6 Appendix B4 covers two
 subpaths:
 - *Cheap:* pre-filter the build side, then DataFusion's standard
-  HashJoinExec, then our existing FilterMultiAggSpec. Probably ~1 wk
-  including bench gate.
+  HashJoinExec, then our existing FilterMultiAggSpec. ~1 wk with
+  bench gate.
 - *Aggressive:* dict-aware probe-side join (compose with dict-arrival
   decode → dict-coded probe key → translate-once cache). 2-3 wk.
 
 Start with the cheap variant. Bench-gate. Decide on aggressive based
 on results.
 
-### Σ.I — `TopN` shape (broad, smaller per-query win)
+### Σ.I — `Filter + Aggregate + TopN` shape (single-table OLAP)
 
-**Coverage:** 75/103 TPC-DS queries use SortExec(TopK). Many real
-analytics ("show me top 10 by sales") use this pattern.
+**Coverage:** 106/168 total queries contain `SortExec(TopK)`. The
+specific high-leverage sub-pattern is `Aggregate > Sort(TopK) > ...`
+or `GlobalLimit > SortPreservingMerge > Aggregate > ...` — ClickBench
+has ~30 of these; TPC-DS another 75-ish.
 
-**Catalog entry:** `SortExec(fetch=Some(N)) > Aggregate > ...` or
-`GlobalLimitExec > SortPreservingMergeExec > ...`.
+**Two distinct sub-pieces:**
 
-**Executor work:** custom heap-based TopK that runs inside the
-aggregate (avoiding materialising the full sorted result). Hard to
-beat DataFusion's TopK by a big margin since theirs is decent;
-worth a 1-day spike to measure.
+1. **Widen the existing `filter_multi_agg` / `filter_sum` shapes**
+   to accept a trailing `SortExec(TopK)` or `GlobalLimitExec` above
+   the top Projection. The aggregate exec doesn't change — only the
+   catalog matcher does. ~30 LOC per shape variant. This alone
+   *probably* makes 20-30 ClickBench queries hit `filter_multi_agg`
+   that currently miss only because of the wrapper.
+2. **Custom heap-based TopK inside the aggregate.** DataFusion's
+   `SortExec(TopK)` materialises the full sorted prefix then takes
+   N; a TopK that maintains an N-element heap during aggregation
+   avoids the materialisation. ~1 wk; worth a 1-day spike first
+   to measure whether the win is meaningful vs DF's TopK.
 
-### Σ.J — `WindowAgg` shape
+Recommend doing (1) first — it's nearly free and validates that the
+trailing-wrapper extension is the actual blocker.
 
-**Coverage:** 17/103 TPC-DS queries. Common in real analytics (
-running totals, ranks, lag/lead).
+### Σ.J — `WindowAgg` shape (mid-priority)
+
+**Coverage:** 17/103 TPC-DS queries. Common in real analytics
+(running totals, ranks, lag/lead). Zero TPC-H, zero ClickBench.
 
 **Executor work:** specialized window kernels for the common cases
 (ROW_NUMBER, RANK, SUM OVER, LAG/LEAD with default offsets).
@@ -140,7 +197,7 @@ Per-shape templates, similar to FilterMultiAggSpec's family. 2-3 wk.
 
 UnionAll is mostly about avoiding the materialisation copy (small
 win). NestedLoopJoin / CrossJoin only show up on small inputs in
-both suites; if a query lands on these it's already small enough
+both TPC suites; if a query lands on these it's already small enough
 that perf doesn't matter much.
 
 ## Quality-of-life signal
