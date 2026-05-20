@@ -712,12 +712,6 @@ fn resolve_group_keys(
             DataType::Dictionary(key_ty, _) if **key_ty == DataType::UInt32 => {
                 GroupKeyKind::DictionaryU32
             }
-            // Σ.H.1b: numeric / date group keys go through the generic
-            // hash-grouped path (no specialised template).
-            DataType::Int64 => GroupKeyKind::Int64,
-            DataType::Int32 => GroupKeyKind::Int32,
-            DataType::Date32 => GroupKeyKind::Date32,
-            DataType::Float64 => GroupKeyKind::Float64,
             _ => return None,
         };
         out.push((n.clone(), kind));
