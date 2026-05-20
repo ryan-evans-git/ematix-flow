@@ -4832,8 +4832,7 @@ mod tests {
             sql = "SELECT * FROM source"
             peers = ["http://flow-01:50051"]
         "#;
-        let cfg = PipelineCliConfig::from_toml_str(toml)
-            .expect("absent engine = auto (Phase 3.5)");
+        let cfg = PipelineCliConfig::from_toml_str(toml).expect("absent engine = auto (Phase 3.5)");
         let t = cfg.transform.as_ref().unwrap();
         // Engine string is left absent in the config; auto is the
         // implicit default at validation + build time.
@@ -5145,10 +5144,7 @@ mod tests {
             msg.contains("transform.tls"),
             "name the bad block; got: {msg}"
         );
-        assert!(
-            msg.contains("datafusion"),
-            "name the engine; got: {msg}"
-        );
+        assert!(msg.contains("datafusion"), "name the engine; got: {msg}");
     }
 
     /// Phase 3.5: with engine absent (defaults to auto) a

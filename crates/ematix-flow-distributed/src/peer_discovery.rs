@@ -73,9 +73,8 @@ pub fn expand_peer_entries(entries: &[String]) -> Result<Vec<Url>, BackendError>
         if trimmed.is_empty() {
             continue;
         }
-        let expanded = expand_one(trimmed).map_err(|e| {
-            BackendError::Connection(format!("peer #{i} ({raw:?}): {e}"))
-        })?;
+        let expanded = expand_one(trimmed)
+            .map_err(|e| BackendError::Connection(format!("peer #{i} ({raw:?}): {e}")))?;
         out.extend(expanded);
     }
     Ok(out)
@@ -180,9 +179,10 @@ mod tests {
         assert!(out.iter().any(|u| u.as_str() == "http://10.0.0.5:50051/"));
         // The dns:// branch should have produced at least one
         // 127.0.0.1 / ::1 URL.
-        assert!(out
-            .iter()
-            .any(|u| u.host_str() == Some("127.0.0.1") || u.host_str() == Some("[::1]")));
+        assert!(
+            out.iter()
+                .any(|u| u.host_str() == Some("127.0.0.1") || u.host_str() == Some("[::1]"))
+        );
     }
 
     #[test]
@@ -222,10 +222,8 @@ mod tests {
     #[test]
     fn dns_nonexistent_host_errors() {
         // ".invalid" is RFC 6761 reserved for "definitely does not resolve."
-        let err = expand_peer_entries(&[
-            "dns://nonexistent-host.invalid:50051".into(),
-        ])
-        .unwrap_err();
+        let err =
+            expand_peer_entries(&["dns://nonexistent-host.invalid:50051".into()]).unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("DNS lookup"), "got: {msg}");
     }
@@ -236,10 +234,7 @@ mod tests {
         // outside a real K8s cluster, but the error message must
         // mention the expanded FQDN — that's how operators
         // diagnose misconfiguration.
-        let err = expand_peer_entries(&[
-            "k8s://flow-workers.flow:50051".into(),
-        ])
-        .unwrap_err();
+        let err = expand_peer_entries(&["k8s://flow-workers.flow:50051".into()]).unwrap_err();
         let msg = format!("{err}");
         // Either the lookup happened (we got "DNS lookup ... failed")
         // or the FQDN appears in the error.
@@ -260,8 +255,7 @@ mod tests {
     /// so operators can grep their config.
     #[test]
     fn error_quotes_the_bad_entry() {
-        let err =
-            expand_peer_entries(&["definitely-not-a-url".into()]).unwrap_err();
+        let err = expand_peer_entries(&["definitely-not-a-url".into()]).unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("definitely-not-a-url"), "got: {msg}");
     }

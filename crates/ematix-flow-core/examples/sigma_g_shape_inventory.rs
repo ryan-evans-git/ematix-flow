@@ -306,11 +306,18 @@ async fn audit_suite(ctx: &SessionContext, queries: Vec<(String, String)>) -> Ve
 
 async fn audit_query(ctx: &SessionContext, id: &str, sql: &str) -> QueryResult {
     let plan: Result<Arc<dyn ExecutionPlan>, String> = match ctx.sql(sql).await {
-        Ok(df) => df
-            .create_physical_plan()
-            .await
-            .map_err(|e| format!("{e}").lines().next().unwrap_or("plan error").to_string()),
-        Err(e) => Err(format!("{e}").lines().next().unwrap_or("parse error").to_string()),
+        Ok(df) => df.create_physical_plan().await.map_err(|e| {
+            format!("{e}")
+                .lines()
+                .next()
+                .unwrap_or("plan error")
+                .to_string()
+        }),
+        Err(e) => Err(format!("{e}")
+            .lines()
+            .next()
+            .unwrap_or("parse error")
+            .to_string()),
     };
 
     match plan {
@@ -472,7 +479,10 @@ fn emit_markdown(sections: &[(String, Vec<QueryResult>)]) {
 
     println!("## Combined headline\n");
     println!("- **{total}** queries across TPC-H + TPC-DS.");
-    println!("- **{planned}** plan successfully ({:.0}%).", 100.0 * planned as f64 / total as f64);
+    println!(
+        "- **{planned}** plan successfully ({:.0}%).",
+        100.0 * planned as f64 / total as f64
+    );
     println!(
         "- **{any_rule}** hit at least one current catalog rule \
          ({:.0}% of total, {:.0}% of planned).",

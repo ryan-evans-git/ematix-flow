@@ -74,6 +74,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use datafusion::physical_expr::Partitioning;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode};
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
@@ -83,7 +84,6 @@ use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
-use datafusion::physical_expr::Partitioning;
 
 /// Aggregate-mode filter used by [`Shape::Aggregate`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -176,7 +176,9 @@ pub fn any() -> Shape {
 }
 
 pub fn any_capture(name: &'static str) -> Shape {
-    Shape::Any { capture: Some(name) }
+    Shape::Any {
+        capture: Some(name),
+    }
 }
 
 pub fn filter(capture: Option<&'static str>, children: Vec<Shape>) -> Shape {
@@ -572,13 +574,7 @@ mod tests {
             None,
             vec![bridge.clone()],
         );
-        let final_plain = aggregate(
-            Some("final"),
-            AggMode::Final,
-            Some(1),
-            None,
-            vec![bridge],
-        );
+        let final_plain = aggregate(Some("final"), AggMode::Final, Some(1), None, vec![bridge]);
 
         // Either Final or FinalPartitioned at the top — try both.
         let mut got: Option<MatchedSubtree> = None;

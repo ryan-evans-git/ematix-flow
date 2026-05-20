@@ -470,32 +470,41 @@ impl AggregateSpec for FilterMultiAggSpecNumeric {
                 self.process_int64_keys(keys, &typed_cols, n_rows, acc);
             }
             NumericKeyKind::Int32 => {
-                let arr = key_col.as_any().downcast_ref::<Int32Array>().ok_or_else(|| {
-                    DataFusionError::Internal(format!(
-                        "FilterMultiAggSpecNumeric: expected Int32Array, got {:?}",
-                        key_col.data_type()
-                    ))
-                })?;
+                let arr = key_col
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .ok_or_else(|| {
+                        DataFusionError::Internal(format!(
+                            "FilterMultiAggSpecNumeric: expected Int32Array, got {:?}",
+                            key_col.data_type()
+                        ))
+                    })?;
                 let keys = arr.values();
                 self.process_int32_keys(keys, &typed_cols, n_rows, acc);
             }
             NumericKeyKind::Date32 => {
-                let arr = key_col.as_any().downcast_ref::<Date32Array>().ok_or_else(|| {
-                    DataFusionError::Internal(format!(
-                        "FilterMultiAggSpecNumeric: expected Date32Array, got {:?}",
-                        key_col.data_type()
-                    ))
-                })?;
+                let arr = key_col
+                    .as_any()
+                    .downcast_ref::<Date32Array>()
+                    .ok_or_else(|| {
+                        DataFusionError::Internal(format!(
+                            "FilterMultiAggSpecNumeric: expected Date32Array, got {:?}",
+                            key_col.data_type()
+                        ))
+                    })?;
                 let keys = arr.values();
                 self.process_int32_keys(keys, &typed_cols, n_rows, acc);
             }
             NumericKeyKind::Float64 => {
-                let arr = key_col.as_any().downcast_ref::<Float64Array>().ok_or_else(|| {
-                    DataFusionError::Internal(format!(
-                        "FilterMultiAggSpecNumeric: expected Float64Array, got {:?}",
-                        key_col.data_type()
-                    ))
-                })?;
+                let arr = key_col
+                    .as_any()
+                    .downcast_ref::<Float64Array>()
+                    .ok_or_else(|| {
+                        DataFusionError::Internal(format!(
+                            "FilterMultiAggSpecNumeric: expected Float64Array, got {:?}",
+                            key_col.data_type()
+                        ))
+                    })?;
                 let keys = arr.values();
                 self.process_f64_keys(keys, &typed_cols, n_rows, acc);
             }
@@ -646,8 +655,7 @@ impl FilterMultiAggSpecNumeric {
                 .entry(keys[row])
                 .or_insert_with(|| fresh_cells(&self.aggregates));
             for (ai, agg) in self.aggregates.iter().enumerate() {
-                cells[ai] =
-                    self.combine_cell(agg, cells[ai], self.eval_agg(agg, typed_cols, row));
+                cells[ai] = self.combine_cell(agg, cells[ai], self.eval_agg(agg, typed_cols, row));
             }
         }
     }
@@ -671,8 +679,7 @@ impl FilterMultiAggSpecNumeric {
                 .entry(key)
                 .or_insert_with(|| fresh_cells(&self.aggregates));
             for (ai, agg) in self.aggregates.iter().enumerate() {
-                cells[ai] =
-                    self.combine_cell(agg, cells[ai], self.eval_agg(agg, typed_cols, row));
+                cells[ai] = self.combine_cell(agg, cells[ai], self.eval_agg(agg, typed_cols, row));
             }
         }
     }
@@ -695,8 +702,7 @@ impl FilterMultiAggSpecNumeric {
                 .entry(key)
                 .or_insert_with(|| fresh_cells(&self.aggregates));
             for (ai, agg) in self.aggregates.iter().enumerate() {
-                cells[ai] =
-                    self.combine_cell(agg, cells[ai], self.eval_agg(agg, typed_cols, row));
+                cells[ai] = self.combine_cell(agg, cells[ai], self.eval_agg(agg, typed_cols, row));
             }
         }
     }
@@ -757,11 +763,7 @@ mod tests {
         // Finalize: sorted by key (1, 2).
         let out = spec.finalize(acc).unwrap();
         assert_eq!(out.num_rows(), 2);
-        let out_keys = out
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap();
+        let out_keys = out.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
         let out_sums = out
             .column(1)
             .as_any()
@@ -804,16 +806,8 @@ mod tests {
         assert_eq!(acc.groups.get(&30).unwrap()[0], 1.0);
 
         let out = spec.finalize(acc).unwrap();
-        let out_keys = out
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int32Array>()
-            .unwrap();
-        let out_cnt = out
-            .column(1)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap();
+        let out_keys = out.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+        let out_cnt = out.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
         assert_eq!(out_keys.values(), &[10, 20, 30]);
         assert_eq!(out_cnt.values(), &[2, 2, 1]);
     }

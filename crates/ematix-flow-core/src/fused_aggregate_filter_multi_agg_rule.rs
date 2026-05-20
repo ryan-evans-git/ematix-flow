@@ -188,9 +188,7 @@ fn try_match_filter_multi_agg_plan(
 /// projection. Returns `Ok(None)` if any per-rule validation fails
 /// (unsupported aggregate, group-key type, predicate operator, …) so
 /// the rule falls through and DataFusion's default plan runs.
-fn try_build_replacement(
-    matched: &MatchedSubtree,
-) -> DfResult<Option<Arc<dyn ExecutionPlan>>> {
+fn try_build_replacement(matched: &MatchedSubtree) -> DfResult<Option<Arc<dyn ExecutionPlan>>> {
     let top_proj = matched
         .get("top_projection")
         .and_then(|p| p.as_any().downcast_ref::<ProjectionExec>())

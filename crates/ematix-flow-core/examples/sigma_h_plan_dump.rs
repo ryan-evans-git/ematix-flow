@@ -37,10 +37,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ctx = SessionContext::new();
     for t in TPCH_TABLES {
         let path = data_dir.join(format!("{t}.parquet"));
-        let path_str = path
-            .to_str()
-            .ok_or("path not utf-8")?
-            .to_string();
+        let path_str = path.to_str().ok_or("path not utf-8")?.to_string();
         let prov = EmatixFastParquetTableProvider::try_new(path_str)?.with_dict_preservation(true);
         ctx.register_table(*t, Arc::new(prov))?;
     }
