@@ -571,3 +571,112 @@ class TestPostEndpoints:
         r = client.post("/api/runs/anything/restart", json={})
         assert r.status_code == 400
         assert "RunHistoryStore" in r.json()["detail"]
+
+
+class TestSchedulerIntegrationHooks:
+    """Phase 4b-2: pending_actions() + consume_requested_run().
+
+    Contract surface that the scheduler will call on each tick to
+    pick up enqueued restart / rerun requests and pause/resume
+    transitions. Worker-side pause checking (the part that actually
+    transitions a running pipeline to paused) lives in the worker
+    binary and is documented separately."""
+
+    def test_pending_actions_includes_requested_rows(self):
+        store, prior = TestStoreMutatingActions()._make_store_with_failed_batch()  # type: ignore[attr-defined]
+        store.enqueue_restart(prior.run_id, "merge_payments")
+        store.enqueue_rerun(prior.run_id)
+        pending = store.pending_actions()
+        # Two enqueued + the prior failed (not pending).
+        assert len(pending) == 2
+        assert all(r.status == "requested" for r in pending)
+
+    def test_pending_actions_includes_pause_requested_running_rows(self):
+        store = InMemoryRunHistory()
+        store.record_run_record(
+            RunRecord(
+                run_id="r1",
+                pipeline="p",
+                status="running",
+                started_at=_ts(),
+            )
+        )
+        # No pending action yet.
+        assert store.pending_actions() == []
+        store.set_pause("r1", True)
+        pending = store.pending_actions()
+        assert len(pending) == 1
+        assert pending[0].run_id == "r1"
+        assert pending[0].status == "running"  # not transitioned yet
+
+    def test_pending_actions_includes_resume_requested_paused_rows(self):
+        store = InMemoryRunHistory()
+        store.record_run_record(
+            RunRecord(
+                run_id="r1",
+                pipeline="p",
+                status="paused",
+                started_at=_ts(),
+                extras={"pause_requested": True},
+            )
+        )
+        # Currently paused + pause_requested=True → no transition needed.
+        assert store.pending_actions() == []
+        store.set_pause("r1", False)  # ask to resume
+        pending = store.pending_actions()
+        assert len(pending) == 1
+        assert pending[0].run_id == "r1"
+        assert pending[0].status == "paused"
+
+    def test_pending_actions_skips_already_aligned_pause_state(self):
+        # running + pause_requested=False → no transition, no pending.
+        # paused  + pause_requested=True  → no transition, no pending.
+        store = InMemoryRunHistory()
+        store.record_run_record(
+            RunRecord(
+                run_id="r1",
+                pipeline="p",
+                status="running",
+                started_at=_ts(),
+                extras={"pause_requested": False},
+            )
+        )
+        store.record_run_record(
+            RunRecord(
+                run_id="r2",
+                pipeline="p",
+                status="paused",
+                started_at=_ts(),
+                extras={"pause_requested": True},
+            )
+        )
+        assert store.pending_actions() == []
+
+    def test_consume_requested_run_transitions_to_running(self):
+        store, prior = TestStoreMutatingActions()._make_store_with_failed_batch()  # type: ignore[attr-defined]
+        new_id = store.enqueue_rerun(prior.run_id)
+        assert store.get_run(new_id).status == "requested"  # type: ignore[union-attr]
+        ok = store.consume_requested_run(new_id)
+        assert ok is True
+        assert store.get_run(new_id).status == "running"  # type: ignore[union-attr]
+
+    def test_consume_requested_run_is_idempotent(self):
+        store, prior = TestStoreMutatingActions()._make_store_with_failed_batch()  # type: ignore[attr-defined]
+        new_id = store.enqueue_rerun(prior.run_id)
+        assert store.consume_requested_run(new_id) is True
+        # Second call: already "running", no transition.
+        assert store.consume_requested_run(new_id) is False
+
+    def test_consume_requested_run_unknown_returns_false(self):
+        store = InMemoryRunHistory()
+        assert store.consume_requested_run("never-existed") is False
+
+    def test_pending_actions_after_consume_drops_the_row(self):
+        store, prior = TestStoreMutatingActions()._make_store_with_failed_batch()  # type: ignore[attr-defined]
+        new_id = store.enqueue_rerun(prior.run_id)
+        assert len(store.pending_actions()) == 1
+        store.consume_requested_run(new_id)
+        # Row is now "running" (not "requested" and not in a
+        # pause-mismatch state), so pending_actions no longer
+        # includes it.
+        assert store.pending_actions() == []

@@ -241,6 +241,35 @@ class RunHistoryStore(Protocol):
         already-paused run is a no-op.
         """
 
+    # ---- Scheduler-integration hooks (Phase 4b-2) -----------------
+
+    def pending_actions(self) -> list[RunRecord]:
+        """Return rows the scheduler should act on this tick.
+
+        Two row classes qualify:
+
+        1. ``status == "requested"`` — a restart or rerun enqueued
+           via :meth:`enqueue_restart` / :meth:`enqueue_rerun` that
+           the scheduler hasn't dispatched yet.
+        2. Rows with ``extras["pause_requested"]`` set whose status
+           doesn't yet match (running with pause_requested=True or
+           paused with pause_requested=False). These are
+           transitions the worker needs to apply at the next
+           boundary.
+
+        Implementations should be idempotent: returning the same
+        row twice across ticks is harmless because the consumer
+        (``consume_requested_run`` or the worker's transition
+        logic) is itself idempotent.
+        """
+
+    def consume_requested_run(self, run_id: str) -> bool:
+        """Atomically transition ``run_id`` from ``"requested"`` to
+        ``"running"``. Returns True if the transition fired, False
+        if the row wasn't in ``"requested"`` state (another worker
+        already claimed it, or the user cancelled). Idempotent.
+        """
+
 
 # ---- In-memory impl ------------------------------------------------
 
@@ -349,6 +378,30 @@ class InMemoryRunHistory:
         from dataclasses import replace as _replace
 
         self._by_id[run_id] = _replace(record, extras=new_extras)
+
+    # ---- Scheduler-integration hooks (Phase 4b-2) -----------------
+
+    def pending_actions(self) -> list[RunRecord]:
+        out: list[RunRecord] = []
+        for r in self._by_id.values():
+            if r.status == "requested":
+                out.append(r)
+                continue
+            pause_req = r.extras.get("pause_requested")
+            if pause_req is True and r.status == "running":
+                out.append(r)
+            elif pause_req is False and r.status == "paused":
+                out.append(r)
+        return out
+
+    def consume_requested_run(self, run_id: str) -> bool:
+        rec = self._by_id.get(run_id)
+        if rec is None or rec.status != "requested":
+            return False
+        from dataclasses import replace as _replace
+
+        self._by_id[run_id] = _replace(rec, status="running")
+        return True
 
     # Convenience helpers --------------------------------------------
 
