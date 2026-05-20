@@ -1,9 +1,9 @@
 //! Σ.F — declarative shape catalog for the physical-plan optimiser.
 //!
-//! v1 surface. The catalog itself (entries + dispatcher) lands in a
-//! follow-up bite; this module ships the substrate — the `Shape` AST,
-//! its named captures, and `Shape::try_match` against a DataFusion
-//! `ExecutionPlan` tree.
+//! The module ships the substrate — the `Shape` AST, its named
+//! captures, and `Shape::try_match` against a DataFusion
+//! `ExecutionPlan` tree. The per-rule entries that build catalog
+//! shapes live alongside their rules (see "Catalog inventory" below).
 //!
 //! Goal: replace the per-rule plan walkers (`dict_filter_rule`,
 //! `dict_aggregate_rule`, `fused_aggregate_filter_sum_rule`,
@@ -11,7 +11,37 @@
 //! catalog where each entry is a `Shape` + a rewriter fn. See
 //! `docs/PHASE_SIGMA_F_SHAPE_CATALOG.md`.
 //!
-//! Design points worth knowing:
+//! # Catalog inventory (Σ.F.2)
+//!
+//! | Rule (module) | Shape constructor | Pattern (top → bottom) |
+//! |---|---|---|
+//! | [`crate::dict_filter_rule`] | `dict_filter_shape` | `Filter > Any(body)` |
+//! | [`crate::dict_aggregate_rule`] | `dict_group_count_shapes` | `Aggregate(Final or FinalPartitioned) > Any(body)` (two-shape try-both) |
+//! | [`crate::fused_aggregate_filter_sum_rule`] | `filter_sum_shape` | `Projection > Aggregate(Final, gby=0, aggs=1) > optional(CoalescePartitions) > Aggregate(Partial, gby=0, aggs=1) > Any(body)` |
+//! | [`crate::fused_aggregate_filter_multi_agg_rule`] | `filter_multi_agg_shape` | `optional(SortPreservingMerge > Sort) > Projection > Aggregate(FinalPartitioned) > RepartitionHash > Aggregate(Partial) > optional(Projection) > Any(body)` |
+//!
+//! Each shape uses named captures (e.g. `"filter"`, `"final_agg"`,
+//! `"partial_agg"`, `"cse_projection"`, `"body"`) that the rule's
+//! `try_build_replacement` / `try_match_*_plan` reads via
+//! `MatchedSubtree::get`.
+//!
+//! # Adding a new shape
+//!
+//! 1. If the new shape needs an operator class not yet in the AST,
+//!    add a `Shape::X` variant + a `match_node` arm + a builder fn
+//!    (`fn x(...)`). Σ.F.2 added `Sort` and `SortPreservingMerge` for
+//!    the FilterMultiAgg ORDER BY prefix; each one was ~25 LOC
+//!    including the unit test.
+//! 2. Write the shape constructor (`fn my_rule_shape() -> Shape`)
+//!    alongside the rule that consumes it, not in this module —
+//!    keeps the catalog discoverable from each rule's source.
+//! 3. The rule body calls `my_rule_shape().try_match(node)`, pulls
+//!    out captured nodes by name, and does its domain-specific
+//!    validation (predicate shapes, aggregate kinds, scan column
+//!    types). The catalog matcher only checks operator class +
+//!    coarse arity attributes — predicate validation lives per-rule.
+//!
+//! # Design points worth knowing
 //!
 //! - **Named captures**. Each `Shape` variant carries an optional
 //!   `&'static str` capture name. A successful match populates a
@@ -19,17 +49,27 @@
 //!   rewriter reads to pull out the specific nodes it needs (e.g.
 //!   the `FilterExec`, the `AggregateExec(Final*)`, the `body`).
 //! - **No DSL macro yet**. The `shape!` macro from the plan doc is
-//!   sugar over these builder functions. The macro lands once the
-//!   AST is proven by migrating at least one real rule.
+//!   sugar over these builder functions. The macro will land once
+//!   the AST has stabilised — Σ.F.2's four rule migrations already
+//!   exercise the surface enough to find painful constructions.
 //! - **Optional wrappers**. DataFusion occasionally elides
 //!   `CoalescePartitionsExec` (when input is already single-partition)
-//!   and inserts `ProjectionExec` for CSE. The `optional(...)` shape
-//!   matches whether the wrapper is present or skipped.
+//!   and inserts `ProjectionExec` for CSE. The [`optional`] shape
+//!   matches whether the wrapper is present or skipped. Nested
+//!   `optional` handles top-of-plan ORDER BY (`SortPreservingMerge >
+//!   Sort > ...`).
 //! - **Structural match only**. The matcher checks operator class +
 //!   coarse attributes (`AggregateMode`, group-by arity, agg arity).
 //!   Predicate-shape inspection, scan-column type checking, and
-//!   ScalarValue extraction stay in the per-rule rewriter — they're
+//!   `ScalarValue` extraction stay in the per-rule rewriter — they're
 //!   too domain-specific to live in the matcher AST.
+//! - **Multiple modes via try-both**. The AST currently encodes one
+//!   `AggMode` per `Aggregate` shape. Rules that accept multiple
+//!   modes (e.g. `dict_aggregate_rule` accepts both `Final` and
+//!   `FinalPartitioned`) construct a small array of shapes and
+//!   `iter().find_map(|s| s.try_match(node))`. If this pattern grows
+//!   beyond two-three modes, fold it into a `modes: Vec<AggMode>`
+//!   field on the `Aggregate` variant.
 
 use std::collections::HashMap;
 use std::sync::Arc;
