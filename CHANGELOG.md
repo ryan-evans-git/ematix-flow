@@ -7,6 +7,64 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — closing "What's not shipped"
+
+- **Pluggable secret stores** (Phase 1). `${...}` interpolation
+  now supports provider prefixes: bare `${VAR}` (env, unchanged),
+  `${vault:path#key}` (Vault KV v2), `${aws:secret#field}` (AWS
+  Secrets Manager JSON), `${gcp:secret#version}` (GCP). Register
+  via `ematix_flow.secrets.register_resolver(prefix, resolver)`.
+  Extras: `[secrets-vault]` / `[secrets-aws]` / `[secrets-gcp]` /
+  `[secrets]`.
+- **Snowflake / BigQuery / Redshift connections** (Phase 2).
+  Typed connection dataclasses + `*_query_to_arrow` adapters
+  with `${...}` interpolation and repr redaction. Extras:
+  `[snowflake]` / `[bigquery]` / `[redshift]` / `[warehouses]`.
+- **Warehouse pipeline orchestrator** (Phase 2b).
+  `Source.snowflake_query` / `bigquery_query` / `redshift_query`
+  factories + `WarehouseTarget` classmethods + `run_warehouse_pipeline`
+  for end-to-end read → DuckDB SQL transform → bulk write.
+  `snowflake_write_arrow` (write_pandas), `bigquery_write_arrow`
+  (load_table_from_dataframe), `redshift_write_arrow` (S3-staged
+  COPY) ship under the same extras.
+- **Distributed peer auto-detection** (Phase 3). `peers = [...]`
+  accepts three schemes (mix freely): `http://host:port` (static,
+  unchanged), `dns://host:port` (A-record lookup),
+  `k8s://service.namespace:port` (sugar for
+  `*.svc.cluster.local`). Resolution at backend open via
+  stdlib `ToSocketAddrs`.
+- **`engine = "auto"` + default switch** (Phase 3.5). Picks
+  distributed when peers expand to ≥1 URL at startup, in-process
+  otherwise (with an `info!` log). Default when `engine` is
+  absent is now `"auto"` (was `"datafusion"`); identical behavior
+  for configs without `peers`.
+- **Web UI** (Phase 4). New `flow web` CLI subcommand serves a
+  FastAPI + Svelte SPA matching ematix.dev's Pip-Boy theme at
+  `http://127.0.0.1:8080/`. Read endpoints (`/api/runs`,
+  `/api/runs/:id`, `/api/pipelines`) + mutating endpoints
+  (`/restart`, `/rerun`, `/pause`, `/resume`). Localhost-only by
+  default; binding off-host logs a loud warning. Extras: `[web]`.
+  - New `RunHistoryStore` Protocol (separate from `RunLog`) with
+    `list_runs` / `get_run` / `record_run_record` / `enqueue_restart`
+    / `enqueue_rerun` / `set_pause` / `pending_actions` /
+    `consume_requested_run`.
+  - In-memory impl shipped; scheduler loop's `_pickup_pending_actions`
+    walks "requested" rows + dispatches via the existing executor,
+    carrying `EMATIX_FLOW_RESTART_FROM_STEP` /
+    `EMATIX_FLOW_RERUN_FULL` / `EMATIX_FLOW_PRIOR_RUN_ID` env vars.
+  - `PauseChecker` helper for worker-side pause/resume at step /
+    batch / watermark boundaries.
+- **Warehouse Rust-side type shape** (Phase 2c).
+  `Dialect::Snowflake` / `BigQuery` / `Redshift` + the matching
+  `*Config` structs. Full Rust dispatch (PyO3 bridge into the
+  Python adapters) is Phase 2d.
+
+### Changed
+
+- **Status: alpha** (was pre-alpha). PyPI classifier was already
+  "Development Status :: 3 - Alpha"; ematix.dev's status banner,
+  nav pill, and `01-advantages.mdx` updated to match.
+
 ### Added
 
 - **Startup banner** on long-running CLI commands. `flow run`,
