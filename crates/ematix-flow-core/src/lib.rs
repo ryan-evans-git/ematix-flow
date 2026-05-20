@@ -69,6 +69,14 @@ pub mod fused_aggregate_filter_multi_agg;
 // plan shape into a single `FusedAggregateExec<FilterMultiAggSpec>`.
 // Group-by-aware counterpart to `InjectFilterSumRule`.
 pub mod fused_aggregate_filter_multi_agg_rule;
+// Σ.H.1d.1 (task #552): scaffolding for the parallel numeric-keyed
+// `FilterMultiAggSpec`. Hosts `NumericKeyKind` and (future)
+// `FilterMultiAggSpecNumeric`. Kept disjoint from the existing
+// string-keyed `fused_aggregate_filter_multi_agg` so the Dict /
+// Utf8View hot-path codegen is unaffected. See
+// `docs/PHASE_SIGMA_H1D_DIAGNOSIS_AND_DESIGN.md` for the binary-cost
+// vs exec-cost decomposition that motivated this split.
+pub mod fused_aggregate_filter_multi_agg_numeric;
 // Σ.D3: cranelift-JIT'd inner loop for the unified fused-aggregate
 // operator. Hosts `FusedFilterAggSpec` IR + `FusedFilterAggJit`
 // runtime that `FilterSumSpec` and `FilterMultiAggSpec` build on.
