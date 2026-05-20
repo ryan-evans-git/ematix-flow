@@ -36,8 +36,8 @@
 <div class="app">
   <nav class="topbar">
     <span class="brand">▸ ematix-flow</span>
-    <a href="#/runs" class={navTarget("runs")}>Runs</a>
-    <a href="#/pipelines" class={navTarget("pipelines")}>Pipelines</a>
+    <a href="#/runs" class={navTarget("runs")}>Pipelines</a>
+    <a href="#/pipelines" class={navTarget("pipelines")}>Summary</a>
     <span style="flex: 1"></span>
     <a href="/api/docs" target="_blank" rel="noopener">API Docs ↗</a>
   </nav>

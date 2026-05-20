@@ -33,7 +33,7 @@
   }
 </script>
 
-<h1>Pipelines</h1>
+<h1>Pipeline summary</h1>
 
 {#if error}
   <div class="panel" style="border-color: var(--color-alarm); color: var(--color-alarm);">
