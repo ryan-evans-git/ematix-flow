@@ -172,6 +172,40 @@ Response:
 { "new_run_id": "01HQ...new..." }
 ```
 
+### `POST /api/runs/:id/pause`
+
+Request a graceful pause on a currently-running workflow. The
+worker checks for a `pause_requested` flag at the next step
+boundary (batch) or watermark boundary (streaming) and transitions
+its run row to `paused`. Idempotent — POSTing on an already-paused
+run is a no-op.
+
+```json
+{}
+```
+
+Response:
+
+```json
+{ "status": "paused" }
+```
+
+### `POST /api/runs/:id/resume`
+
+Resume a paused workflow from where it stopped. The worker clears
+the pause flag and continues from the held-at step / watermark.
+Idempotent.
+
+```json
+{}
+```
+
+Response:
+
+```json
+{ "status": "running" }
+```
+
 ### `GET /api/pipelines`
 
 ```json
@@ -203,14 +237,21 @@ Response:
 - Step timeline (left rail): one row per step, color-coded by
   status, click to anchor that step's logs
 - Attempts panel: collapsible per-attempt block with error stack
-- **Action buttons** (top-right, only when permitted):
-  - **Restart from failed step** — dropdown lists the failed
-    steps; click → confirm modal → POST /restart → toast +
-    redirect to the new run's /runs/:id
-  - **Rerun from beginning** — single button → confirm modal →
-    POST /rerun → toast + redirect
-  - Both disabled in anonymous mode with tooltip "set
-    EMATIX_FLOW_WEB_TOKEN to enable mutating actions"
+- **Action buttons** (top-right, gated by run status):
+  - **Pause** (visible only on `running` runs) — POST /pause →
+    toast "pause requested, will hold at next boundary"
+  - **Resume** (visible only on `paused` runs) — POST /resume →
+    toast "resuming" → status flips
+  - **Restart from failed step** (visible only on `failed` runs) —
+    dropdown lists the failed steps; click → confirm modal →
+    POST /restart → toast + redirect to the new run's /runs/:id
+  - **Rerun from beginning** (visible on `failed` / `succeeded` /
+    `cancelled` runs) — single button → confirm modal → POST
+    /rerun → toast + redirect
+  - For streaming runs, the restart-from-step button is replaced
+    with **Resume from watermark** (POST /restart with
+    `from_step: null` — scheduler interprets this as "reset to
+    last committed watermark").
 
 ### `/pipelines` — summary
 
@@ -220,16 +261,20 @@ Response:
 
 ## Auth
 
-- `--auth-token <T>` or `EMATIX_FLOW_WEB_TOKEN` env var enables
-  bearer-token auth. All endpoints require `Authorization: Bearer
-  <T>`; reject with 401 otherwise.
-- Without a token, the server starts in **anonymous mode**:
-  - GET endpoints serve.
-  - POST endpoints return 403 with a clear message ("server is
-    running without auth; mutating actions are disabled").
-  - Startup logs a warning.
-- HTTPS is operator's job (reverse proxy). Documented in
-  DEPLOYMENT.md Recipe 10.
+**Phase 4a chosen model**: localhost-only by default.
+
+- Server binds `127.0.0.1` unless `--bind <addr>` is passed. With
+  the default bind, only processes on the same host can reach the
+  UI. No auth tokens; the OS-level user boundary is the trust
+  boundary.
+- For remote access, operators either SSH-tunnel (e.g.
+  `ssh -L 8080:127.0.0.1:8080 host`) or run the server behind a
+  reverse proxy that adds OIDC / TLS / etc.
+- If the user passes `--bind 0.0.0.0` or any non-loopback address,
+  the startup logs a loud warning that the server is reachable
+  off-host without auth and any caller can issue restart / rerun
+  / pause actions.
+- OIDC / OAuth2 is a Phase 4c follow-up — not in this PR.
 
 ## Slice plan
 
