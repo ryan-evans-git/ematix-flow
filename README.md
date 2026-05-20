@@ -74,9 +74,10 @@ flow run-due --module my_pipelines    # cron-style; drop into systemd / cron / k
   delivery, credential redaction, structured run history, Prometheus +
   OpenTelemetry metrics, Slack alerts.
 
-> Status: **v0.3.0 on PyPI** as `ematix-flow`. All four surfaces — declarative
-> pipelines, multi-backend, streaming, stream processing — are shipped and
-> stable.
+> Status: **v0.4.0 on PyPI** as `ematix-flow` (alpha). All four surfaces —
+> declarative pipelines, multi-backend, streaming, stream processing — are
+> shipped end-to-end; a handful of surfaces (warehouse pipeline integration in
+> `@ematix.pipeline`, Web UI mutating endpoints) are still settling.
 
 ---
 

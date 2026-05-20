@@ -183,7 +183,7 @@ def create_app(
 
     app = FastAPI(
         title="ematix-flow Web UI",
-        version="0.3.0",
+        version="0.4.0",
         docs_url="/api/docs",
         redoc_url=None,
     )
