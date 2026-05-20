@@ -74,6 +74,9 @@ use datafusion::physical_plan::repartition::RepartitionExec;
 
 use crate::fused_aggregate_exec::FusedAggregateExec;
 use crate::fused_aggregate_filter_multi_agg::{FilterMultiAggSpec, GroupKeyKind};
+use crate::fused_aggregate_filter_multi_agg_numeric::{
+    FilterMultiAggSpecNumeric, NumericKeyKind,
+};
 use crate::fused_jit::{AggExpr, Clause, ClauseOp, ColumnTy};
 use crate::shape_catalog::{
     AggMode, MatchedSubtree, Shape, aggregate, any_capture, optional, projection, repartition_hash,
@@ -269,9 +272,18 @@ fn try_build_replacement(
         return Ok(None);
     };
 
-    // Resolve group-key kinds from the scan schema.
-    let Some(group_keys) = resolve_group_keys(&group_key_names, &scan.schema()) else {
+    // Σ.H.1d.4: classify group keys as all-string, all-numeric, or
+    // mixed/unsupported. String falls through to the existing
+    // FilterMultiAggSpec path; 1-key numeric routes to the new
+    // FilterMultiAggSpecNumeric. Multi-key numeric + mixed bail.
+    let Some(resolved_keys) = resolve_keys_unified(&group_key_names, &scan.schema()) else {
         return Ok(None);
+    };
+    // Local binding used by the existing string path below. The
+    // numeric path branches earlier and never reads this.
+    let group_keys: Vec<(String, GroupKeyKind)> = match &resolved_keys {
+        ResolvedKeys::String(keys) => keys.clone(),
+        ResolvedKeys::Numeric(_) => Vec::new(),
     };
 
     // Build the spec's input column list: predicate cols ∪ agg cols,
@@ -331,22 +343,7 @@ fn try_build_replacement(
         agg_output_names.push(format!("agg_{i}"));
     }
 
-    // Construct the FilterMultiAggSpec.
     let input_name_refs: Vec<&str> = input_names.iter().map(String::as_str).collect();
-    let group_key_args: Vec<(String, GroupKeyKind)> =
-        group_keys.iter().map(|(n, k)| (n.clone(), *k)).collect();
-    let spec = match FilterMultiAggSpec::try_new(
-        jit_clauses,
-        input_tys,
-        &input_name_refs,
-        agg_exprs,
-        agg_output_names,
-        group_key_args,
-        &scan.schema(),
-    ) {
-        Ok(s) => s,
-        Err(_) => return Ok(None),
-    };
 
     // Σ.G.2f.3 perf (2026-05-19): FusedAggregateExec now fans out
     // *internally* via async-channel MPMC, so we don't need to wrap
@@ -365,17 +362,60 @@ fn try_build_replacement(
             let scan_partitions = scan.properties().partitioning.partition_count();
             if target_partitions > scan_partitions {
                 Arc::new(RepartitionExec::try_new(
-                    scan,
+                    scan.clone(),
                     Partitioning::RoundRobinBatch(target_partitions),
                 )?)
             } else {
-                scan
+                scan.clone()
             }
         } else {
-            scan
+            scan.clone()
         };
-    let fused =
-        Arc::new(FusedAggregateExec::try_new(input_for_fused, spec)?) as Arc<dyn ExecutionPlan>;
+
+    // Σ.H.1d.4: branch on resolved-key class. String falls through to
+    // FilterMultiAggSpec (existing path); 1-key numeric goes to the
+    // new FilterMultiAggSpecNumeric. Multi-key numeric bails — Σ.H.1d.3
+    // future work.
+    let fused: Arc<dyn ExecutionPlan> = match resolved_keys {
+        ResolvedKeys::String(_) => {
+            let group_key_args: Vec<(String, GroupKeyKind)> =
+                group_keys.iter().map(|(n, k)| (n.clone(), *k)).collect();
+            let spec = match FilterMultiAggSpec::try_new(
+                jit_clauses,
+                input_tys,
+                &input_name_refs,
+                agg_exprs,
+                agg_output_names,
+                group_key_args,
+                &scan.schema(),
+            ) {
+                Ok(s) => s,
+                Err(_) => return Ok(None),
+            };
+            Arc::new(FusedAggregateExec::try_new(input_for_fused, spec)?)
+        }
+        ResolvedKeys::Numeric(numeric_keys) => {
+            if numeric_keys.len() != 1 {
+                // Σ.H.1d.4 ships only 1-key numeric. Multi-key
+                // numeric + the >2-key exec-cost gate land in
+                // Σ.H.1d.3 / Σ.H.1d.5.
+                return Ok(None);
+            }
+            let spec = match FilterMultiAggSpecNumeric::try_new(
+                jit_clauses,
+                input_tys,
+                &input_name_refs,
+                agg_exprs,
+                agg_output_names,
+                numeric_keys,
+                &scan.schema(),
+            ) {
+                Ok(s) => s,
+                Err(_) => return Ok(None),
+            };
+            Arc::new(FusedAggregateExec::try_new(input_for_fused, spec)?)
+        }
+    };
 
     // Wrap the fused exec in a ProjectionExec that re-orders / re-aliases
     // its output columns to match the top ProjectionExec's schema. The
@@ -717,6 +757,49 @@ fn resolve_group_keys(
         out.push((n.clone(), kind));
     }
     Some(out)
+}
+
+/// Σ.H.1d.4: try to resolve all group keys as numeric types
+/// (Int64 / Int32 / Date32 / Float64). Returns `None` if any key
+/// isn't a supported numeric type (caller then tries the string
+/// resolver, or bails for the mixed case).
+fn resolve_numeric_group_keys(
+    names: &[String],
+    scan_schema: &SchemaRef,
+) -> Option<Vec<(String, NumericKeyKind)>> {
+    let mut out = Vec::with_capacity(names.len());
+    for n in names {
+        let f = scan_schema.field_with_name(n).ok()?;
+        let kind = match f.data_type() {
+            DataType::Int64 => NumericKeyKind::Int64,
+            DataType::Int32 => NumericKeyKind::Int32,
+            DataType::Date32 => NumericKeyKind::Date32,
+            DataType::Float64 => NumericKeyKind::Float64,
+            _ => return None,
+        };
+        out.push((n.clone(), kind));
+    }
+    Some(out)
+}
+
+/// Σ.H.1d.4: classification of a query's group keys for dispatch.
+enum ResolvedKeys {
+    String(Vec<(String, GroupKeyKind)>),
+    Numeric(Vec<(String, NumericKeyKind)>),
+}
+
+fn resolve_keys_unified(names: &[String], scan_schema: &SchemaRef) -> Option<ResolvedKeys> {
+    // Try all-string first — preserves Σ.H.1's exact path for queries
+    // that previously fired (Q01, Q04, Q05, Q21).
+    if let Some(keys) = resolve_group_keys(names, scan_schema) {
+        return Some(ResolvedKeys::String(keys));
+    }
+    // Then try all-numeric (Σ.H.1d.4 — the new path).
+    if let Some(keys) = resolve_numeric_group_keys(names, scan_schema) {
+        return Some(ResolvedKeys::Numeric(keys));
+    }
+    // Mixed string + numeric, or unsupported types — bail.
+    None
 }
 
 // ===== predicate extraction (copied from InjectFilterSumRule) =====
