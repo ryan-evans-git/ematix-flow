@@ -143,7 +143,7 @@ _INTERP = re.compile(r"\$\{([A-Z_][A-Z0-9_]*)\}")
 # Field names whose values are credentials and must be redacted in
 # repr() output. Matched case-insensitively against the dataclass
 # field name.
-_SECRET_TOKENS = frozenset({"password", "secret", "token"})
+_SECRET_TOKENS = frozenset({"password", "secret", "token", "key"})
 _SECRET_FIELDS = frozenset(
     {
         "password",
@@ -151,6 +151,7 @@ _SECRET_FIELDS = frozenset(
         "secret_access_key",
         "access_key_id",
         "key_password",
+        "private_key",
         "token",
         "api_key",
     }

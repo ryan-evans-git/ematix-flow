@@ -151,6 +151,26 @@ secrets = [
     "google-cloud-secret-manager>=2.16",
 ]
 
+# ---- Cloud warehouse extras (Phase 2 — Snowflake / BigQuery / Redshift)
+# Each warehouse's typed Connection + the matching `*_query_to_arrow`
+# adapter pulls the upstream Python SDK as an opt-in extra. The
+# Connection dataclasses themselves are stdlib-only; install the
+# extra only when you actually need to talk to that warehouse.
+snowflake = ["snowflake-connector-python>=3.7"]
+bigquery  = [
+    "google-cloud-bigquery>=3.17",
+    "google-cloud-bigquery-storage>=2.24",
+    "pyarrow>=15",
+]
+redshift  = ["redshift-connector>=2.1"]
+warehouses = [
+    "snowflake-connector-python>=3.7",
+    "google-cloud-bigquery>=3.17",
+    "google-cloud-bigquery-storage>=2.24",
+    "redshift-connector>=2.1",
+    "pyarrow>=15",
+]
+
 # Convenience: everything ematix-flow can plug into. Heavy install
 # — use targeted extras above in production.
 all = [
