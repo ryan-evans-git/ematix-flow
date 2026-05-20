@@ -874,6 +874,88 @@ pub struct JoinConfigToml {
     pub right_column_prefix: String,
 }
 
+/// Phase 3.5: resolve the `[transform] engine` field to a binary
+/// distributed-yes-or-no decision at pipeline build time.
+///
+/// - `"datafusion"` → `false` (in-process).
+/// - `"distributed"` → `true` (peer-distributed). Validation already
+///   guaranteed peers are configured and window/join are absent.
+/// - `"auto"` (and the default-when-absent case) → `true` if
+///   `peers` expands to ≥1 URL via `peer_discovery::expand_peer_entries`
+///   AND no window/join is configured. Otherwise `false` with an
+///   `info!` log explaining the choice.
+///
+/// The expansion step runs DNS lookups for `dns://` / `k8s://`
+/// peer entries; for K8s headless services this is the moment that
+/// resolves "are there pods up?" into a concrete URL list. Plain
+/// `http://` entries pass through trivially.
+///
+/// Returning `true` here doesn't yet open a Flight handshake — the
+/// actual health check happens inside `DistributedSqlTransform::open`
+/// when DataFusion first executes a plan. For Phase 3.5 the auto
+/// criterion is "DNS resolves" rather than "Flight handshake succeeds";
+/// the harder live-health check is a Phase 3b follow-up.
+fn resolve_transform_engine(t: &TransformConfig) -> bool {
+    let engine = t.engine.as_deref().unwrap_or("auto");
+    match engine {
+        "distributed" => true,
+        "datafusion" => false,
+        "auto" => {
+            // Auto can't go distributed if the windowed / joined
+            // wrapper is set — those wrappers don't support the
+            // distributed transform yet (Σ.B follow-up).
+            if t.window.is_some() || t.join.is_some() {
+                tracing::info!(
+                    "[transform] engine = \"auto\" falling back to in-process \
+                     (window or join is configured; distributed transform \
+                     doesn't yet support those wrappers)"
+                );
+                return false;
+            }
+            if t.peers.is_empty() {
+                tracing::info!(
+                    "[transform] engine = \"auto\" resolved to in-process \
+                     (no peers configured)"
+                );
+                return false;
+            }
+            match ematix_flow_distributed::peer_discovery::expand_peer_entries(&t.peers) {
+                Ok(urls) if !urls.is_empty() => {
+                    tracing::info!(
+                        "[transform] engine = \"auto\" resolved to distributed \
+                         ({n} peer URLs after expansion)",
+                        n = urls.len()
+                    );
+                    true
+                }
+                Ok(_) => {
+                    tracing::info!(
+                        "[transform] engine = \"auto\" falling back to in-process \
+                         (peers were configured but expansion produced 0 URLs)"
+                    );
+                    false
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "[transform] engine = \"auto\" falling back to in-process \
+                         (peer discovery failed: {e})"
+                    );
+                    false
+                }
+            }
+        }
+        // validate_transform_engine has already rejected any other
+        // value; the unreachable here is just defensive.
+        other => {
+            tracing::warn!(
+                "[transform] engine = {other:?} not recognised at build time \
+                 (validation should have rejected this); falling back to in-process"
+            );
+            false
+        }
+    }
+}
+
 fn join_toml_to_core(t: &JoinConfigToml) -> Result<ematix_flow_core::join::JoinConfig, String> {
     use ematix_flow_core::join::{JoinConfig, JoinKind, JoinLateDataPolicy};
     let late_data = match t.late_data.as_str() {
@@ -2048,46 +2130,97 @@ impl PipelineCliConfig {
 
     /// Σ.B PR 2 commit 4: validate `[transform] engine` value and
     /// peer-URL well-formedness. Accepted values: `"datafusion"` |
-    /// `"distributed"`. Empty / absent = `"datafusion"`. Each entry
-    /// in `peers` must be a parseable `url::Url`.
+    /// `"distributed"` | `"auto"`. Empty / absent = `"auto"`.
+    ///
+    /// Per-engine semantics (build-time):
+    ///
+    /// - `"datafusion"` — always single-process. `peers` / `[tls]`
+    ///   under this engine are rejected (clear pointer to use
+    ///   `"auto"` or `"distributed"`).
+    /// - `"distributed"` — always peer-distributed. Window/join
+    ///   combinations are rejected (the wrappers hard-type against
+    ///   the in-process transform, see Σ.B follow-up). Peers may
+    ///   use any of the `http://` / `dns://` / `k8s://` schemes
+    ///   from Phase 3.
+    /// - `"auto"` (default) — if `peers` expands to ≥1 URL at
+    ///   startup AND no window/join is configured, go distributed;
+    ///   otherwise fall back to in-process. The fallback is logged
+    ///   so operators can tell which path was taken. `peers` /
+    ///   `[tls]` are accepted but optional.
+    ///
+    /// Phase 3.5 (2026-05-20) added `"auto"` + the default switch.
+    /// Before, absent engine defaulted to `"datafusion"`; existing
+    /// configs that had no `peers` block are unaffected by the new
+    /// default (auto with no peers behaves identically). Configs
+    /// that had `peers = [...]` always specified `engine = "distributed"`
+    /// because earlier validation rejected the alternative.
     fn validate_transform_engine(&self) -> Result<(), ConfigError> {
         let Some(t) = &self.transform else {
             return Ok(());
         };
         if let Some(engine) = t.engine.as_deref() {
             match engine {
-                "datafusion" | "distributed" => {}
+                "datafusion" | "distributed" | "auto" => {}
                 other => {
                     return Err(ConfigError::Parse(format!(
                         "[transform] engine = {other:?} not supported \
-                         (use \"datafusion\" or \"distributed\")"
+                         (use \"datafusion\", \"distributed\", or \"auto\")"
                     )));
                 }
             }
         }
-        // `peers` only meaningful when engine = "distributed"; cross-
-        // validate so a stray peers list under engine = "datafusion"
-        // doesn't silently get ignored.
-        let engine_is_distributed = t.engine.as_deref() == Some("distributed");
-        if !t.peers.is_empty() && !engine_is_distributed {
+        // `peers` / `[tls]` are accepted under "distributed" (today's
+        // behavior) and "auto" (where they make distributed mode
+        // eligible but not required). They are rejected under
+        // "datafusion" since that engine is explicitly single-
+        // process; a stray peers list there is almost always a
+        // copy-paste mistake.
+        let engine_str = t.engine.as_deref().unwrap_or("auto");
+        let engine_is_explicit_datafusion = engine_str == "datafusion";
+        let engine_is_distributed = engine_str == "distributed";
+        if !t.peers.is_empty() && engine_is_explicit_datafusion {
             return Err(ConfigError::Parse(
-                "[transform] peers = [...] is only meaningful when \
-                 engine = \"distributed\""
+                "[transform] peers = [...] is not allowed under \
+                 engine = \"datafusion\" (use engine = \"auto\" if you \
+                 want distributed-when-peers-are-up + in-process \
+                 fallback, or engine = \"distributed\" to require \
+                 distributed)"
                     .into(),
             ));
         }
-        // Σ.B follow-up: same shape for [transform.tls]. Without
-        // engine = "distributed" there's no coordinator → worker
-        // traffic to encrypt.
-        if t.tls.is_some() && !engine_is_distributed {
+        if t.tls.is_some() && engine_is_explicit_datafusion {
             return Err(ConfigError::Parse(
-                "[transform.tls] is only meaningful when \
-                 engine = \"distributed\""
+                "[transform.tls] is not allowed under \
+                 engine = \"datafusion\" (use \"auto\" or \
+                 \"distributed\")"
                     .into(),
             ));
         }
-        // URL well-formedness — fail fast at config-load.
+        // URL well-formedness — fail fast at config-load. The
+        // peer_discovery expander recognises http/https/dns/k8s
+        // schemes; reject anything else here with a clear pointer.
         for (i, raw) in t.peers.iter().enumerate() {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if trimmed.starts_with("dns://") || trimmed.starts_with("k8s://") {
+                // Pseudo-URL schemes — peer_discovery handles them.
+                // Validate the host:port suffix shape eagerly so
+                // operators get a clear error here, not at first
+                // backend open.
+                let suffix = trimmed
+                    .strip_prefix("dns://")
+                    .or_else(|| trimmed.strip_prefix("k8s://"))
+                    .expect("just checked the prefix");
+                if !suffix.contains(':') {
+                    return Err(ConfigError::Parse(format!(
+                        "[transform] peers[{i}] = {raw:?} is missing a port \
+                         (expected scheme://host:port)"
+                    )));
+                }
+                continue;
+            }
             url::Url::parse(raw).map_err(|e| {
                 ConfigError::Parse(format!(
                     "[transform] peers[{i}] = {raw:?} is not a valid URL: {e}"
@@ -2097,8 +2230,10 @@ impl PipelineCliConfig {
         // Σ.B PR 2 commit 5: distributed engine doesn't yet
         // wrap windowed / joined transforms (those wrappers are
         // hard-typed against `LazySqlTransform`). Reject the
-        // combination at config-load with a clear error pointing
-        // at the follow-up.
+        // combination at config-load for *explicit* distributed.
+        // For "auto", the build-time resolver silently picks
+        // datafusion when window/join is present — no need to
+        // reject here.
         if engine_is_distributed {
             if t.window.is_some() {
                 return Err(ConfigError::Parse(
@@ -2106,7 +2241,8 @@ impl PipelineCliConfig {
                      [transform.window]. The windowed-aggregator wrapper currently \
                      hard-types against the in-process LazySqlTransform; lifting \
                      that constraint is a Σ.B follow-up. Use engine = \"datafusion\" \
-                     for windowed transforms today."
+                     for windowed transforms today, or engine = \"auto\" if you \
+                     want distributed only on non-windowed pipelines."
                         .into(),
                 ));
             }
@@ -2114,7 +2250,8 @@ impl PipelineCliConfig {
                 return Err(ConfigError::Parse(
                     "[transform] engine = \"distributed\" is not yet supported with \
                      [transform.join]. Lift the constraint as a Σ.B follow-up. Use \
-                     engine = \"datafusion\" for joined transforms today."
+                     engine = \"datafusion\" for joined transforms today, or \
+                     engine = \"auto\" for distributed-on-non-joined fallback."
                         .into(),
                 ));
             }
@@ -2989,7 +3126,16 @@ impl PipelineCliConfig {
             // SQL pre-stage. Empty `sql` means "no pre-stage" — only
             // valid when a window block is configured (windowed
             // transform doesn't require a SQL inner).
-            let engine_is_distributed = t.engine.as_deref() == Some("distributed");
+            //
+            // Phase 3.5: engine resolution. `"datafusion"` and
+            // `"distributed"` are explicit. `"auto"` (and absent,
+            // which now defaults to auto) picks distributed when
+            // peers expand to ≥1 URL via the Phase 3 discovery
+            // resolver, and otherwise falls back to datafusion
+            // with an info-level log. Window/join configurations
+            // force auto → datafusion since the distributed
+            // wrappers don't support them yet.
+            let engine_is_distributed = resolve_transform_engine(t);
             // The translator runs regardless of engine — the SQL
             // dialect is upstream of where execution happens.
             let translated_sql: Option<String> = if t.sql.is_empty() {
@@ -4665,11 +4811,12 @@ mod tests {
         assert!(msg.contains("peers[0]"), "name the bad index; got: {msg}");
     }
 
-    /// Cross-validation: peers under engine = "datafusion" is a
-    /// silent-no-op trap. Reject at config-load so the user knows
-    /// they need to set engine = "distributed".
+    /// Phase 3.5: peers without an explicit engine now defaults to
+    /// `"auto"`, which accepts the peer list and decides between
+    /// distributed and in-process at backend-open time. Before 3.5
+    /// this combination was rejected.
     #[test]
-    fn transform_engine_rejects_peers_without_distributed_engine() {
+    fn transform_engine_defaults_to_auto_when_unspecified() {
         let toml = r#"
             pipeline_name = "p"
             source_query = "events"
@@ -4685,8 +4832,101 @@ mod tests {
             sql = "SELECT * FROM source"
             peers = ["http://flow-01:50051"]
         "#;
-        let err = PipelineCliConfig::from_toml_str(toml).expect_err("orphan peers");
-        assert!(format!("{err}").contains("engine"));
+        let cfg = PipelineCliConfig::from_toml_str(toml)
+            .expect("absent engine = auto (Phase 3.5)");
+        let t = cfg.transform.as_ref().unwrap();
+        // Engine string is left absent in the config; auto is the
+        // implicit default at validation + build time.
+        assert!(t.engine.is_none());
+        assert_eq!(t.peers.len(), 1);
+    }
+
+    /// Cross-validation: peers under explicit engine = "datafusion"
+    /// is still rejected (Phase 3.5 kept this guard — explicit
+    /// single-process + peers is contradictory). The error message
+    /// points the user at the right alternative.
+    #[test]
+    fn transform_engine_rejects_peers_under_explicit_datafusion() {
+        let toml = r#"
+            pipeline_name = "p"
+            source_query = "events"
+            [source]
+            kind = "kafka"
+            bootstrap_servers = "localhost:9092"
+            [target]
+            kind = "sqlite"
+            path = ":memory:"
+            [target.table]
+            name = "out"
+            [transform]
+            sql = "SELECT * FROM source"
+            engine = "datafusion"
+            peers = ["http://flow-01:50051"]
+        "#;
+        let err = PipelineCliConfig::from_toml_str(toml)
+            .expect_err("explicit datafusion + peers must be rejected");
+        let msg = format!("{err}");
+        assert!(msg.contains("datafusion"), "name the engine; got: {msg}");
+        assert!(
+            msg.contains("auto") || msg.contains("distributed"),
+            "name a workaround; got: {msg}"
+        );
+    }
+
+    /// Phase 3.5: explicit `engine = "auto"` accepts peers and tls
+    /// just like distributed does.
+    #[test]
+    fn transform_engine_auto_accepts_peers_and_tls() {
+        let toml = r#"
+            pipeline_name = "p"
+            source_query = "events"
+            [source]
+            kind = "kafka"
+            bootstrap_servers = "localhost:9092"
+            [target]
+            kind = "sqlite"
+            path = ":memory:"
+            [target.table]
+            name = "out"
+            [transform]
+            sql = "SELECT * FROM source"
+            engine = "auto"
+            peers = ["https://flow-01:50051", "k8s://flow-workers.flow:50051"]
+            [transform.tls]
+            ca_cert_pem_path = "/etc/ca.pem"
+        "#;
+        let cfg = PipelineCliConfig::from_toml_str(toml).expect("auto + peers + tls accepted");
+        let t = cfg.transform.as_ref().unwrap();
+        assert_eq!(t.engine.as_deref(), Some("auto"));
+        assert_eq!(t.peers.len(), 2);
+        assert!(t.tls.is_some());
+    }
+
+    /// Phase 3.5: explicit `engine = "auto"` validates the
+    /// host:port shape on dns:// / k8s:// peers (otherwise the
+    /// failure would only surface at backend-open, much later).
+    #[test]
+    fn transform_engine_auto_rejects_dns_peer_missing_port() {
+        let toml = r#"
+            pipeline_name = "p"
+            source_query = "events"
+            [source]
+            kind = "kafka"
+            bootstrap_servers = "localhost:9092"
+            [target]
+            kind = "sqlite"
+            path = ":memory:"
+            [target.table]
+            name = "out"
+            [transform]
+            sql = "SELECT * FROM source"
+            engine = "auto"
+            peers = ["dns://flow-workers"]
+        "#;
+        let err = PipelineCliConfig::from_toml_str(toml)
+            .expect_err("dns:// peer without port must be rejected");
+        let msg = format!("{err}");
+        assert!(msg.contains("port"), "name the missing field; got: {msg}");
     }
 
     /// Σ.B follow-up: the windowed-aggregator wrapper hard-types
@@ -4872,9 +5112,15 @@ mod tests {
 
     /// [transform.tls] under the in-process engine is a silent-no-op
     /// trap; reject at config-load so the user knows they need
-    /// engine = "distributed".
+    /// engine = "distributed" (or, post-Phase-3.5, "auto").
+    ///
+    /// `[transform.tls]` under explicit `engine = "datafusion"` is
+    /// still rejected (Phase 3.5 kept this guard). With the engine
+    /// absent (now defaults to auto) the tls block is accepted; the
+    /// runtime decides whether to actually use it based on whether
+    /// peers expand. Two assertions below cover both shapes.
     #[test]
-    fn transform_tls_rejected_without_distributed_engine() {
+    fn transform_tls_rejected_under_explicit_datafusion() {
         let toml = r#"
             pipeline_name = "p"
             source_query = "events"
@@ -4888,19 +5134,53 @@ mod tests {
             name = "out"
             [transform]
             sql = "SELECT * FROM source"
+            engine = "datafusion"
             [transform.tls]
             ca_cert_pem_path = "/etc/ematix-flow/tls/ca.pem"
         "#;
-        let err = PipelineCliConfig::from_toml_str(toml).expect_err("orphan tls block must fail");
+        let err = PipelineCliConfig::from_toml_str(toml)
+            .expect_err("explicit datafusion + tls block must fail");
         let msg = format!("{err}");
         assert!(
             msg.contains("transform.tls"),
             "name the bad block; got: {msg}"
         );
         assert!(
-            msg.contains("distributed"),
-            "point at the engine knob; got: {msg}"
+            msg.contains("datafusion"),
+            "name the engine; got: {msg}"
         );
+    }
+
+    /// Phase 3.5: with engine absent (defaults to auto) a
+    /// `[transform.tls]` block is accepted. The runtime decides at
+    /// backend-open whether to actually use it based on whether
+    /// peers expand. (Without peers, auto resolves to in-process
+    /// and the tls config sits idle.)
+    #[test]
+    fn transform_tls_accepted_under_auto_default() {
+        let toml = r#"
+            pipeline_name = "p"
+            source_query = "events"
+            [source]
+            kind = "kafka"
+            bootstrap_servers = "localhost:9092"
+            [target]
+            kind = "sqlite"
+            path = ":memory:"
+            [target.table]
+            name = "out"
+            [transform]
+            sql = "SELECT * FROM source"
+            peers = ["https://flow-01:50051"]
+            [transform.tls]
+            ca_cert_pem_path = "/etc/ematix-flow/tls/ca.pem"
+        "#;
+        let cfg = PipelineCliConfig::from_toml_str(toml)
+            .expect("absent engine + peers + tls = auto, accepted");
+        let t = cfg.transform.as_ref().unwrap();
+        assert!(t.engine.is_none());
+        assert!(t.tls.is_some());
+        assert_eq!(t.peers.len(), 1);
     }
 
     /// A missing `ca_cert_pem_path` is a hard parse failure (not a

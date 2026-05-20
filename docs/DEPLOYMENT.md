@@ -428,7 +428,21 @@ daemon, then remove the cron entry once you're satisfied.
 
 When the workload outgrows a single process, ematix-flow can fan
 queries out across a peer mesh of `flow-worker` processes via Apache
-Arrow Flight (set `engine = "distributed"` in the pipeline config).
+Arrow Flight.
+
+### Engine modes
+
+| `engine` | Behavior |
+|---|---|
+| `"single"` *(alias of `"datafusion"`)* | Always in-process. Specifying `peers` is rejected (clear pointer to use `"auto"` or `"distributed"`). |
+| `"distributed"` | Always peer-distributed. Requires `peers = [...]`. Window/join transforms are rejected — not yet supported. |
+| **`"auto"` *(default when `engine` is absent)*** | Try distributed if peers expand to ≥1 URL at startup AND no window/join is configured; otherwise fall back to in-process. The choice is logged at `info!` level so operators can verify which path was taken. |
+
+`engine = "auto"` is the default starting in Phase 3.5. Existing
+configs that didn't specify `engine` previously defaulted to
+`"datafusion"`; with the new default they behave **identically** as
+long as they had no `peers` block (which earlier validation rejected
+anyway, so this is a no-op for every shipped config).
 
 Each peer URL in the `peers` list can be one of three shapes — mix
 freely:
