@@ -218,6 +218,85 @@ table.runs tr:hover { background: rgba(51, 220, 204, 0.03); cursor: pointer; }
 .status--requested { color: var(--color-amber-glow); }
 .status--cancelled { color: var(--color-phosphor-700); }
 
+/* ----- DAG renderer ----- */
+.dag {
+  display: block;
+  color: var(--color-phosphor-500);
+  font-family: var(--font-mono);
+}
+.dag-edge {
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.5;
+  opacity: 0.75;
+}
+.dag-node rect {
+  stroke-width: 1.5;
+}
+.dag-node text {
+  fill: currentColor;
+  pointer-events: none;
+}
+.dag-name {
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+}
+.dag-status {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  opacity: 0.75;
+}
+.dag-node--succeeded {
+  color: var(--color-success);
+}
+.dag-node--succeeded rect {
+  fill: rgba(77, 229, 210, 0.12);
+  stroke: var(--color-success);
+}
+.dag-node--running {
+  color: var(--color-amber-glow);
+}
+.dag-node--running rect {
+  fill: rgba(255, 191, 64, 0.18);
+  stroke: var(--color-amber-glow);
+  animation: dag-pulse 1.6s ease-in-out infinite;
+}
+.dag-node--pending {
+  color: var(--color-phosphor-500);
+}
+.dag-node--pending rect {
+  fill: rgba(13, 106, 100, 0.18);
+  stroke: var(--color-phosphor-600);
+  stroke-dasharray: 4 4;
+}
+.dag-node--failed {
+  color: var(--color-alarm);
+}
+.dag-node--failed rect {
+  fill: rgba(255, 51, 68, 0.15);
+  stroke: var(--color-alarm);
+}
+@keyframes dag-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.55; }
+}
+.dag-legend {
+  display: flex;
+  gap: 1.25rem;
+  font-family: var(--font-mono);
+  font-size: 0.7rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  margin-top: 0.5rem;
+  color: var(--color-phosphor-500);
+}
+.dag-legend .legend--succeeded { color: var(--color-success); }
+.dag-legend .legend--running   { color: var(--color-amber-glow); }
+.dag-legend .legend--pending   { color: var(--color-phosphor-400); }
+.dag-legend .legend--failed    { color: var(--color-alarm); }
+
 /* ----- Buttons (action bar) ----- */
 .actions {
   display: flex;

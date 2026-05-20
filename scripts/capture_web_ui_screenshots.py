@@ -160,6 +160,58 @@ def _success_only_store() -> InMemoryRunHistory:
     return store
 
 
+def _workflow_dag_store() -> InMemoryRunHistory:
+    """In-flight workflow with a parallel branch — for the DAG shot.
+
+    Topology:
+
+        extract_orders ──┬─► transform_orders ─────────┐
+                         │                              ├─► merge_payments ─► load_warehouse
+                         └─► transform_payments ───────┘
+    """
+    store = InMemoryRunHistory()
+    ts = datetime(2026, 5, 20, 16, 15, 0, tzinfo=UTC)
+    steps = [
+        {
+            "name": "extract_orders",
+            "status": "succeeded",
+            "depends_on": [],
+            "duration_ms": 4_200,
+        },
+        {
+            "name": "transform_orders",
+            "status": "succeeded",
+            "depends_on": ["extract_orders"],
+            "duration_ms": 8_750,
+        },
+        {
+            "name": "transform_payments",
+            "status": "running",
+            "depends_on": ["extract_orders"],
+        },
+        {
+            "name": "merge_payments",
+            "status": "pending",
+            "depends_on": ["transform_orders", "transform_payments"],
+        },
+        {
+            "name": "load_warehouse",
+            "status": "pending",
+            "depends_on": ["merge_payments"],
+        },
+    ]
+    store.record_run_record(
+        RunRecord(
+            run_id="01HQ-orders-dag",
+            pipeline="orders_etl",
+            status="running",
+            started_at=ts,
+            extras={"steps": steps},
+        )
+    )
+    return store
+
+
 def _failed_detail_store() -> InMemoryRunHistory:
     """One failed warehouse_etl run for the detail-page shot."""
     store = InMemoryRunHistory()
@@ -216,25 +268,33 @@ def main() -> int:
     ).resolve()
     print(f"writing screenshots to {out_dir}")
 
-    print("[1/3] runs-list — mixed batch + streaming")
+    print("[1/4] runs-list — mixed batch + streaming")
     port = _free_port()
     _start_server(_runs_list_store(), port)
     _capture(f"http://127.0.0.1:{port}/#/runs", out_dir / "runs-list.png")
 
-    print("[2/3] runs-successful — orders_etl green track record")
+    print("[2/4] runs-successful — orders_etl green track record")
     port = _free_port()
     _start_server(_success_only_store(), port)
     _capture(
         f"http://127.0.0.1:{port}/#/runs", out_dir / "runs-successful.png"
     )
 
-    print("[3/3] run-failed-restart — detail with action button hovered")
+    print("[3/4] run-failed-restart — detail with action button hovered")
     port = _free_port()
     _start_server(_failed_detail_store(), port)
     _capture(
         f"http://127.0.0.1:{port}/#/runs/01HQ-warehouse-fail",
         out_dir / "run-failed-restart.png",
         focus_selector="button.action:has-text('Restart')",
+    )
+
+    print("[4/4] workflow-dag — running DAG with parallel branch")
+    port = _free_port()
+    _start_server(_workflow_dag_store(), port)
+    _capture(
+        f"http://127.0.0.1:{port}/#/runs/01HQ-orders-dag",
+        out_dir / "workflow-dag.png",
     )
 
     print(f"done — {out_dir}")

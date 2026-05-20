@@ -140,7 +140,10 @@ def _detail_payload_from_record(record: RunRecord) -> dict[str, Any]:
             "error_stack": None,  # not captured in RunRecord today
         }
     ]
-    detail["steps"] = []  # populated by backend impls that track per-step state
+    # Surface per-step DAG state if a backend (or demo data) stashed it
+    # in extras["steps"]. Shape: ``list[dict]`` with at least ``name`` +
+    # ``status``; optional ``depends_on: list[str]`` + ``duration_ms``.
+    detail["steps"] = list(record.extras.get("steps") or [])
     detail["actions"] = _action_buttons_for(detail)
     return detail
 
