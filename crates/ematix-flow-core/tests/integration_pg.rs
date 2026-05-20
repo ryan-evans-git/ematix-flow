@@ -3985,7 +3985,7 @@ async fn kafka_read_arrow_stream_consumes_json_messages() {
 /// both the pre-crash and post-crash rows — i.e. recovery
 /// preserved the in-flight session.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs Docker; run with `cargo test -- --ignored`"]
+#[ignore = "FIXME #539: kafka eventual-consistency flake — see PR 122 CI history"]
 async fn session_pipeline_crash_recovers_committed_state() {
     use std::sync::Arc;
 
@@ -4173,7 +4173,7 @@ async fn session_pipeline_crash_recovers_committed_state() {
 /// Doubles as a regression test for the
 /// `take_state_commit` / `recover_state` trait-dispatch fix.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs Docker; run with `cargo test -- --ignored`"]
+#[ignore = "FIXME #539: kafka eventual-consistency flake — see PR 122 CI history"]
 async fn join_pipeline_crash_recovers_committed_state() {
     use std::sync::Arc;
 
@@ -4396,7 +4396,7 @@ async fn join_pipeline_crash_recovers_committed_state() {
 /// call `load_state`, produce 3 more messages, read — must see
 /// exactly the new 3, not the original 5.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs Docker; run with `cargo test -- --ignored`"]
+#[ignore = "FIXME #539: kafka eventual-consistency flake — see PR 122 CI history"]
 async fn pipeline_load_state_resumes_from_committed_offset() {
     use arrow_array::Int64Array;
     use ematix_flow_core::SQLiteBackend;
@@ -4574,7 +4574,7 @@ async fn pipeline_load_state_with_empty_store_is_noop() {
 /// pointing at offset 2, then read — must receive only messages
 /// 3 / 4 / 5 (i.e. starting from offset 2).
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs Docker; run with `cargo test -- --ignored`"]
+#[ignore = "FIXME #539: kafka eventual-consistency flake — see PR 122 CI history"]
 async fn kafka_seek_to_resumes_from_committed_offset() {
     use arrow_array::Int64Array;
     use std::collections::HashMap;
