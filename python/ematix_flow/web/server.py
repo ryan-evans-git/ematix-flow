@@ -1,9 +1,13 @@
 """FastAPI app + uvicorn launcher.
 
-First slice (Phase 4a-1): server skeleton with stub data so the CLI
-subcommand and SPA plumbing can be tested in isolation. Real RunLog
-integration lands in the next slice once the RunLog Protocol gets
-its ``list_runs`` / ``get_run`` query extension.
+Phase 4a-1 (server skeleton + stub data).
+Phase 4a-2: ``create_app`` takes an optional :class:`RunHistoryStore`
+  (see :mod:`ematix_flow.run_log.history`); when provided, the GET
+  endpoints return real records instead of the stub list.
+
+When the user runs ``flow web`` without configuring a store, the
+server falls back to the stub data so the placeholder UI is still
+useful for trying out the surface.
 """
 from __future__ import annotations
 
@@ -12,6 +16,8 @@ import sys
 from importlib import resources
 from pathlib import Path
 from typing import Any
+
+from ematix_flow.run_log.history import RunHistoryStore, RunRecord
 
 logger = logging.getLogger(__name__)
 
@@ -77,9 +83,16 @@ def _action_buttons_for(run: dict[str, Any]) -> dict[str, Any]:
     Returns a dict describing the actions allowed on this run's
     current status. The SPA renders buttons based on this output —
     keeps the policy in one place.
+
+    Accepts a dict (stub fallback path) or, by callers, the output
+    of :func:`_detail_payload_from_record` which has the same
+    shape.
     """
     status = run["status"]
-    is_streaming = run["pipeline"] == "events_stream"  # stub
+    kind = run.get("kind") or (
+        "streaming" if run["pipeline"] == "events_stream" else "batch"
+    )
+    is_streaming = kind == "streaming"
     actions: dict[str, Any] = {
         "pause": False,
         "resume": False,
@@ -104,18 +117,56 @@ def _action_buttons_for(run: dict[str, Any]) -> dict[str, Any]:
     return actions
 
 
+def _detail_payload_from_record(record: RunRecord) -> dict[str, Any]:
+    """Convert a :class:`RunRecord` into the
+    ``GET /api/runs/:id`` JSON shape, including the synthetic
+    ``attempts`` and ``steps`` arrays the UI renders.
+
+    For Phase 4a-2 we synthesize a single-attempt history from the
+    record (real per-attempt history needs a separate
+    ``AttemptRecord`` model — Phase 4c follow-up). The ``steps``
+    array is empty for runs that don't carry per-step state; the UI
+    handles the empty case gracefully.
+    """
+    detail = record.to_detail_dict()
+    detail["attempts"] = [
+        {
+            "attempt": record.attempt,
+            "started_at": detail["started_at"],
+            "finished_at": detail["finished_at"],
+            "status": record.status,
+            "failed_step": record.failed_step,
+            "error_summary": record.error_summary,
+            "error_stack": None,  # not captured in RunRecord today
+        }
+    ]
+    detail["steps"] = []  # populated by backend impls that track per-step state
+    detail["actions"] = _action_buttons_for(detail)
+    return detail
+
+
 # ---- App factory ---------------------------------------------------
 
 
-def create_app(*, ui_dist_dir: Path | None = None):
+def create_app(
+    *,
+    history: RunHistoryStore | None = None,
+    ui_dist_dir: Path | None = None,
+):
     """Build the FastAPI app.
 
-    ``ui_dist_dir`` overrides where the SPA bundle is served from.
-    Default behavior is to load the bundle from the package's
-    ``ematix_flow.web.ui_dist`` data dir, which is populated by the
-    Vite build at wheel-build time. If the bundle is absent (e.g.
-    running from a source checkout without ``npm run build``), the
-    server still serves a friendly placeholder HTML page.
+    Parameters:
+
+    - ``history`` — optional :class:`RunHistoryStore` (Phase 4a-2).
+      When provided, ``/api/runs`` and ``/api/runs/:id`` return real
+      records via ``history.list_runs()`` / ``history.get_run()``.
+      When ``None``, the GET endpoints fall back to a stub list so
+      the server is still useful for trying out the API surface.
+    - ``ui_dist_dir`` overrides where the SPA bundle is served
+      from. Default behavior is to load from the package's
+      ``ematix_flow.web.ui_dist`` data dir, which is populated by
+      the Vite build at wheel-build time. If absent, the server
+      serves a friendly placeholder HTML page.
     """
     try:
         from fastapi import FastAPI, HTTPException
@@ -145,6 +196,16 @@ def create_app(*, ui_dist_dir: Path | None = None):
         limit: int = 50,
         offset: int = 0,
     ) -> dict[str, Any]:  # type: ignore[unused-function]
+        if history is not None:
+            records, total = history.list_runs(
+                pipeline=pipeline, status=status, limit=limit, offset=offset
+            )
+            return {
+                "runs": [r.to_summary_dict() for r in records],
+                "total": total,
+                "next_offset": offset + limit if offset + limit < total else None,
+            }
+        # Stub fallback (no history store configured).
         rows = _STUB_RUNS
         if pipeline:
             rows = [r for r in rows if r["pipeline"] == pipeline]
@@ -160,6 +221,14 @@ def create_app(*, ui_dist_dir: Path | None = None):
 
     @app.get("/api/runs/{run_id}")
     def get_run(run_id: str) -> dict[str, Any]:  # type: ignore[unused-function]
+        if history is not None:
+            record = history.get_run(run_id)
+            if record is None:
+                raise HTTPException(
+                    status_code=404, detail=f"run {run_id} not found"
+                )
+            return _detail_payload_from_record(record)
+        # Stub fallback.
         for r in _STUB_RUNS:
             if r["run_id"] == run_id:
                 return {
@@ -191,6 +260,33 @@ def create_app(*, ui_dist_dir: Path | None = None):
 
     @app.get("/api/pipelines")
     def list_pipelines() -> dict[str, Any]:  # type: ignore[unused-function]
+        if history is not None:
+            # Aggregate from the rich-history store. Pull a generous
+            # window (1000 most recent) and bucket by pipeline name.
+            records, _ = history.list_runs(limit=1000, offset=0)
+            by_pipeline: dict[str, list[RunRecord]] = {}
+            for r in records:
+                by_pipeline.setdefault(r.pipeline, []).append(r)
+            pipelines = []
+            for name, runs in by_pipeline.items():
+                runs.sort(key=lambda r: r.started_at, reverse=True)
+                latest = runs[0]
+                durations = [
+                    r.duration_ms for r in runs if r.duration_ms is not None
+                ]
+                failed = sum(1 for r in runs if r.status == "failed")
+                pipelines.append(
+                    {
+                        "name": name,
+                        "kind": latest.kind,
+                        "latest_run": latest.to_summary_dict(),
+                        "failure_rate_7d": (failed / len(runs)) if runs else 0.0,
+                        "median_duration_ms": (
+                            _median(durations) if durations else None
+                        ),
+                    }
+                )
+            return {"pipelines": pipelines}
         return {"pipelines": _STUB_PIPELINES}
 
     # ---- SPA bundle ------------------------------------------------
@@ -211,6 +307,15 @@ def create_app(*, ui_dist_dir: Path | None = None):
             return _PLACEHOLDER_HTML
 
     return app
+
+
+def _median(xs: list[int]) -> int:
+    """Integer median. ``xs`` must be non-empty; callers gate."""
+    s = sorted(xs)
+    mid = len(s) // 2
+    if len(s) % 2 == 0:
+        return (s[mid - 1] + s[mid]) // 2
+    return s[mid]
 
 
 def _resolve_ui_dir(override: Path | None) -> Path | None:
