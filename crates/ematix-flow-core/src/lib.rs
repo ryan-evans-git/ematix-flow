@@ -118,6 +118,11 @@ pub mod preset;
 pub mod pubsub_backend;
 pub mod rabbitmq_backend;
 pub mod session_blob;
+// Σ.F (task #543): declarative shape catalog substrate. The matcher
+// AST + named-capture try_match. Replaces the per-rule plan walkers
+// (dict_filter_rule / dict_aggregate_rule / the two
+// fused_aggregate_filter_*_rule) once the catalog dispatcher lands.
+pub mod shape_catalog;
 pub mod spec;
 pub mod sqlite_backend;
 pub mod state_size;

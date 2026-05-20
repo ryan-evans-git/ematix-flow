@@ -47,7 +47,15 @@ use datafusion::physical_plan::filter::FilterExec;
 use datafusion::physical_plan::projection::ProjectionExec;
 
 use crate::dict_filter::{DictFilterExec, DictInListPredicate, DictLiteral};
+use crate::shape_catalog::{Shape, any_capture, filter as filter_shape};
 use datafusion::physical_expr::expressions::LikeExpr;
+
+/// Σ.F catalog entry pattern: `FilterExec > Any`. The structural
+/// matcher only checks "is this a FilterExec"; the per-rule predicate
+/// validation (`match_in_list_on_dict_column`) still lives below.
+fn dict_filter_shape() -> Shape {
+    filter_shape(Some("filter"), vec![any_capture("body")])
+}
 
 /// Walks the physical plan and rewrites every `FilterExec(InList on
 /// Dictionary(UInt32, Utf8) column)` to a [`DictFilterExec`].
@@ -61,13 +69,23 @@ impl PhysicalOptimizerRule for EnableDictFilterRule {
         plan: Arc<dyn ExecutionPlan>,
         _config: &ConfigOptions,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
+        let shape = dict_filter_shape();
         let result = plan.transform_up(|node| {
-            let Some(filter) = node.as_any().downcast_ref::<FilterExec>() else {
+            let Some(matched) = shape.try_match(&node) else {
                 return Ok(Transformed::no(node));
             };
-            // Try to extract a (col_idx, allowed_values) pair from the
-            // FilterExec's predicate. Bail to "no rewrite" on any
-            // mismatch — never wrong-answer.
+            // The matcher guarantees `filter` is a FilterExec; the
+            // unwrap below cannot fail.
+            let filter_node = matched
+                .get("filter")
+                .expect("dict_filter_shape captures `filter`");
+            let filter = filter_node
+                .as_any()
+                .downcast_ref::<FilterExec>()
+                .expect("captured node must be FilterExec");
+            // Predicate-shape validation (dict column, allowed-literal
+            // kinds, OR/InList/Eq/LIKE) stays per-rule — it's too
+            // domain-specific to push into the catalog AST.
             let Some(predicate) = match_in_list_on_dict_column(filter) else {
                 return Ok(Transformed::no(node));
             };
