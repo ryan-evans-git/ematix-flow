@@ -63,9 +63,17 @@ __all__ = [
     "BigQueryConnection",
     "RedshiftConnection",
     "SnowflakeConnection",
+    "WarehouseRunResult",
+    "WarehouseSource",
+    "WarehouseSyncError",
+    "WarehouseTarget",
     "bigquery_query_to_arrow",
+    "bigquery_write_arrow",
     "redshift_query_to_arrow",
+    "redshift_write_arrow",
+    "run_warehouse_pipeline",
     "snowflake_query_to_arrow",
+    "snowflake_write_arrow",
 ]
 
 
@@ -350,3 +358,425 @@ def redshift_query_to_arrow(
         for name, value in zip(col_names, row, strict=False):
             columns[name].append(value)
     return pa.table(columns)
+
+
+# ============================================================
+# Write-side adapters
+# ============================================================
+
+
+def snowflake_write_arrow(
+    conn: SnowflakeConnection,
+    table: pa.Table,
+    *,
+    table_name: str,
+    create_if_not_exists: bool = True,
+    _client: Any | None = None,
+) -> int:
+    """Bulk-load ``table`` into Snowflake table ``table_name`` via
+    ``snowflake-connector-python``'s ``write_pandas``. Returns the
+    row count written.
+
+    Uses pandas-conversion under the hood (Snowflake's write_pandas
+    requires it). For multi-GB tables, prefer staging to S3 +
+    ``COPY INTO`` directly; this adapter is the convenient path for
+    small-to-medium tables.
+    """
+    if _client is None:
+        try:
+            import snowflake.connector  # type: ignore[import-not-found]
+        except ImportError as exc:
+            raise ImportError(
+                "snowflake-connector-python is required for "
+                "snowflake_write_arrow; install with "
+                "`pip install ematix-flow[snowflake]`"
+            ) from exc
+        connect_kwargs: dict[str, Any] = {
+            "account": conn.resolved_account(),
+            "user": conn.resolved_user(),
+        }
+        if conn.password:
+            connect_kwargs["password"] = conn.resolved_password()
+        if conn.private_key:
+            connect_kwargs["private_key"] = conn.resolved_private_key()
+        for fld in ("warehouse", "database", "schema", "role"):
+            v = expand(getattr(conn, fld))
+            if v:
+                connect_kwargs[fld] = v
+        _client = snowflake.connector.connect(**connect_kwargs)
+    try:
+        from snowflake.connector.pandas_tools import write_pandas  # type: ignore[import-not-found]
+    except ImportError as exc:
+        raise ImportError(
+            "snowflake-connector-python's pandas_tools is required; ensure "
+            "you have a recent connector + pandas installed"
+        ) from exc
+    df = table.to_pandas()
+    success, _, nrows, _ = write_pandas(
+        _client,
+        df,
+        table_name=table_name,
+        auto_create_table=create_if_not_exists,
+    )
+    if not success:
+        raise WarehouseSyncError(
+            f"snowflake_write_arrow: write_pandas reported failure for table "
+            f"{table_name!r}"
+        )
+    return nrows
+
+
+def bigquery_write_arrow(
+    conn: BigQueryConnection,
+    table: pa.Table,
+    *,
+    table_name: str,
+    create_if_not_exists: bool = True,
+    _client: Any | None = None,
+) -> int:
+    """Bulk-load ``table`` into BigQuery via
+    ``client.load_table_from_dataframe``. Returns the row count.
+
+    Uses pandas conversion since BigQuery's Python SDK takes
+    DataFrames; for very large tables, write to a staging GCS
+    location and ``LOAD DATA`` directly.
+    """
+    if _client is None:
+        try:
+            from google.cloud import bigquery  # type: ignore[import-not-found]
+        except ImportError as exc:
+            raise ImportError(
+                "google-cloud-bigquery is required for "
+                "bigquery_write_arrow; install with "
+                "`pip install ematix-flow[bigquery]`"
+            ) from exc
+        client_kwargs: dict[str, Any] = {"project": conn.resolved_project()}
+        if conn.location:
+            client_kwargs["location"] = expand(conn.location)
+        _client = bigquery.Client(**client_kwargs)
+    project = conn.resolved_project()
+    dataset = conn.resolved_dataset()
+    table_ref = f"{project}.{dataset}.{table_name}"
+    df = table.to_pandas()
+    # The job-config import is lazy so the mocked tests don't need
+    # the SDK installed.
+    try:
+        from google.cloud import bigquery as _bq  # type: ignore[import-not-found]
+
+        write_disposition = (
+            _bq.WriteDisposition.WRITE_APPEND
+            if not create_if_not_exists
+            else _bq.WriteDisposition.WRITE_TRUNCATE
+        )
+        job_config = _bq.LoadJobConfig(write_disposition=write_disposition)
+        job = _client.load_table_from_dataframe(df, table_ref, job_config=job_config)
+    except ImportError:
+        # Pure-mock path (test client has no bigquery import).
+        job = _client.load_table_from_dataframe(df, table_ref)
+    job.result()  # blocks until the load job completes
+    return len(df)
+
+
+def redshift_write_arrow(
+    conn: RedshiftConnection,
+    table: pa.Table,
+    *,
+    table_name: str,
+    create_if_not_exists: bool = True,
+    _client: Any | None = None,
+    _s3_client: Any | None = None,
+) -> int:
+    """Bulk-load ``table`` into Redshift via S3 + ``COPY``.
+
+    Requires ``s3_staging_dir`` + ``iam_role`` on the connection.
+    Writes the Arrow table as Parquet into the staging dir, then
+    runs ``COPY <table> FROM '<staging>' IAM_ROLE '<role>' FORMAT
+    PARQUET``. Returns the row count.
+
+    For small writes, callers can fall back to row-by-row INSERTs
+    via standard psycopg2 — but COPY is dramatically faster on
+    anything more than a few thousand rows.
+    """
+    if not conn.s3_staging_dir or not conn.iam_role:
+        raise WarehouseSyncError(
+            f"redshift_write_arrow: connection {conn.name!r} needs both "
+            "s3_staging_dir and iam_role to use bulk-COPY writes"
+        )
+    if _client is None:
+        try:
+            import redshift_connector  # type: ignore[import-not-found]
+        except ImportError as exc:
+            raise ImportError(
+                "redshift-connector is required for redshift_write_arrow; "
+                "install with `pip install ematix-flow[redshift]`"
+            ) from exc
+        _client = redshift_connector.connect(
+            host=expand(conn.host),
+            port=conn.port,
+            database=expand(conn.database),
+            user=expand(conn.user),
+            password=expand(conn.password),
+        )
+    if _s3_client is None:
+        try:
+            import boto3  # type: ignore[import-not-found]
+        except ImportError as exc:
+            raise ImportError(
+                "boto3 is required for redshift bulk writes (S3 staging); "
+                "install with `pip install ematix-flow[redshift]`"
+            ) from exc
+        _s3_client = boto3.client("s3")
+    # Stage the Arrow table to S3 as Parquet.
+    import io as _io
+    import re as _re
+    import uuid as _uuid
+
+    import pyarrow.parquet as pq  # type: ignore[import-not-found]
+
+    buf = _io.BytesIO()
+    pq.write_table(table, buf)
+    buf.seek(0)
+    m = _re.match(r"^s3://([^/]+)/(.*)$", expand(conn.s3_staging_dir) or "")
+    if not m:
+        raise WarehouseSyncError(
+            f"redshift_write_arrow: s3_staging_dir {conn.s3_staging_dir!r} "
+            "must look like s3://bucket/prefix/"
+        )
+    bucket = m.group(1)
+    prefix = m.group(2).rstrip("/")
+    key = f"{prefix}/{_uuid.uuid4().hex}.parquet"
+    _s3_client.put_object(Bucket=bucket, Key=key, Body=buf.getvalue())
+    staging_url = f"s3://{bucket}/{key}"
+    try:
+        with _client.cursor() as cur:
+            cur.execute(
+                f"COPY {table_name} FROM '{staging_url}' "
+                f"IAM_ROLE '{expand(conn.iam_role)}' FORMAT PARQUET"
+            )
+        _client.commit()
+    finally:
+        # Clean up the staging file even if COPY failed.
+        try:
+            _s3_client.delete_object(Bucket=bucket, Key=key)
+        except Exception:  # noqa: BLE001
+            pass  # best-effort cleanup
+    return table.num_rows
+
+
+# ============================================================
+# Pipeline integration — Source/Target factories + orchestrator
+# ============================================================
+
+
+class WarehouseSyncError(RuntimeError):
+    """Raised when a warehouse read / transform / write fails."""
+
+
+@dataclass(frozen=True)
+class WarehouseSource:
+    """A typed warehouse source spec: (connection, sql, kind).
+
+    Returned by ``Source.snowflake_query`` / ``bigquery_query`` /
+    ``redshift_query``; consumed by ``run_warehouse_pipeline``.
+    """
+
+    connection: Connection
+    sql: str
+    kind: str  # "snowflake" | "bigquery" | "redshift"
+
+
+@dataclass(frozen=True)
+class WarehouseTarget:
+    """A typed warehouse target spec: (connection, table_name, kind).
+
+    Returned by ``WarehouseTarget.snowflake_table`` /
+    ``bigquery_table`` / ``redshift_table``; consumed by
+    ``run_warehouse_pipeline``.
+
+    ``create_if_not_exists`` defers schema decisions to the
+    warehouse's auto-create when True; explicit ``CREATE TABLE``
+    DDL is operator-supplied when False.
+    """
+
+    connection: Connection
+    table_name: str
+    kind: str  # "snowflake" | "bigquery" | "redshift"
+    create_if_not_exists: bool = True
+
+    @classmethod
+    def snowflake_table(
+        cls,
+        connection: SnowflakeConnection,
+        table_name: str,
+        *,
+        create_if_not_exists: bool = True,
+    ) -> WarehouseTarget:
+        return cls(
+            connection=connection,
+            table_name=table_name,
+            kind="snowflake",
+            create_if_not_exists=create_if_not_exists,
+        )
+
+    @classmethod
+    def bigquery_table(
+        cls,
+        connection: BigQueryConnection,
+        table_name: str,
+        *,
+        create_if_not_exists: bool = True,
+    ) -> WarehouseTarget:
+        return cls(
+            connection=connection,
+            table_name=table_name,
+            kind="bigquery",
+            create_if_not_exists=create_if_not_exists,
+        )
+
+    @classmethod
+    def redshift_table(
+        cls,
+        connection: RedshiftConnection,
+        table_name: str,
+        *,
+        create_if_not_exists: bool = True,
+    ) -> WarehouseTarget:
+        return cls(
+            connection=connection,
+            table_name=table_name,
+            kind="redshift",
+            create_if_not_exists=create_if_not_exists,
+        )
+
+
+@dataclass(frozen=True)
+class WarehouseRunResult:
+    """Outcome of :func:`run_warehouse_pipeline`."""
+
+    rows_read: int
+    rows_written: int
+    duration_ms: int
+
+
+def run_warehouse_pipeline(
+    source: WarehouseSource,
+    target: WarehouseTarget,
+    *,
+    transform_sql: str | None = None,
+    _source_client: Any | None = None,
+    _target_client: Any | None = None,
+    _target_s3_client: Any | None = None,
+) -> WarehouseRunResult:
+    """Read → optional in-memory SQL transform → write.
+
+    Reads Arrow batches from ``source`` via the matching
+    ``*_query_to_arrow`` adapter, optionally runs ``transform_sql``
+    against the result via DuckDB's in-memory engine, then writes
+    to ``target`` via the matching ``*_write_arrow`` adapter.
+
+    Returns row counts + duration in milliseconds. Raises
+    :class:`WarehouseSyncError` on read / transform / write
+    failures with the underlying message preserved.
+
+    The ``_source_client`` / ``_target_client`` / ``_target_s3_client``
+    parameters are internal test hooks; production callers pass only
+    the source + target + transform_sql.
+    """
+    import time as _time
+
+    started = _time.monotonic()
+
+    # ---- Read ---------------------------------------------------
+    try:
+        if source.kind == "snowflake":
+            arrow_in = snowflake_query_to_arrow(
+                source.connection, source.sql, _client=_source_client
+            )
+        elif source.kind == "bigquery":
+            arrow_in = bigquery_query_to_arrow(
+                source.connection, source.sql, _client=_source_client
+            )
+        elif source.kind == "redshift":
+            arrow_in = redshift_query_to_arrow(
+                source.connection, source.sql, _client=_source_client
+            )
+        else:
+            raise WarehouseSyncError(
+                f"run_warehouse_pipeline: unknown source kind {source.kind!r}"
+            )
+    except Exception as exc:
+        if isinstance(exc, WarehouseSyncError):
+            raise
+        raise WarehouseSyncError(
+            f"read failed from {source.kind} source: {exc}"
+        ) from exc
+
+    rows_read = arrow_in.num_rows
+
+    # ---- Transform ----------------------------------------------
+    if transform_sql:
+        try:
+            import duckdb  # type: ignore[import-not-found]
+        except ImportError as exc:
+            raise ImportError(
+                "duckdb is required for transform_sql; install with "
+                "`pip install ematix-flow[runlog-duckdb]` or any extra "
+                "that includes duckdb"
+            ) from exc
+        con = duckdb.connect()
+        try:
+            con.register("source", arrow_in)
+            arrow_out = con.execute(transform_sql).arrow()
+        except Exception as exc:
+            raise WarehouseSyncError(
+                f"transform_sql failed: {exc}"
+            ) from exc
+        finally:
+            con.close()
+    else:
+        arrow_out = arrow_in
+
+    # ---- Write --------------------------------------------------
+    try:
+        if target.kind == "snowflake":
+            rows_written = snowflake_write_arrow(
+                target.connection,
+                arrow_out,
+                table_name=target.table_name,
+                create_if_not_exists=target.create_if_not_exists,
+                _client=_target_client,
+            )
+        elif target.kind == "bigquery":
+            rows_written = bigquery_write_arrow(
+                target.connection,
+                arrow_out,
+                table_name=target.table_name,
+                create_if_not_exists=target.create_if_not_exists,
+                _client=_target_client,
+            )
+        elif target.kind == "redshift":
+            rows_written = redshift_write_arrow(
+                target.connection,
+                arrow_out,
+                table_name=target.table_name,
+                create_if_not_exists=target.create_if_not_exists,
+                _client=_target_client,
+                _s3_client=_target_s3_client,
+            )
+        else:
+            raise WarehouseSyncError(
+                f"run_warehouse_pipeline: unknown target kind {target.kind!r}"
+            )
+    except Exception as exc:
+        if isinstance(exc, WarehouseSyncError):
+            raise
+        raise WarehouseSyncError(
+            f"write failed to {target.kind} target: {exc}"
+        ) from exc
+
+    elapsed_ms = int((_time.monotonic() - started) * 1000)
+    return WarehouseRunResult(
+        rows_read=rows_read,
+        rows_written=rows_written,
+        duration_ms=elapsed_ms,
+    )

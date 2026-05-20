@@ -274,3 +274,210 @@ class TestRedshiftQueryToArrow:
         assert result.column_names == ["id", "name"]
         assert result.num_rows == 2
         mock_cursor.execute.assert_called_once_with("SELECT id, name FROM t")
+
+
+# ----- Phase 2b: Source/Target factories + orchestrator -----------
+
+
+class TestSourceFactories:
+    """The `Source.snowflake_query` / `bigquery_query` /
+    `redshift_query` factories return a typed `WarehouseSource`."""
+
+    def test_source_snowflake_query_returns_warehouse_source(self):
+        from ematix_flow.source import Source
+        from ematix_flow.warehouses import WarehouseSource
+
+        conn = SnowflakeConnection(
+            name="snow", account="a", user="u", password="p", warehouse="W"
+        )
+        spec = Source.snowflake_query(conn, "SELECT 1")
+        assert isinstance(spec, WarehouseSource)
+        assert spec.kind == "snowflake"
+        assert spec.sql == "SELECT 1"
+        assert spec.connection is conn
+
+    def test_source_bigquery_query_returns_warehouse_source(self):
+        from ematix_flow.source import Source
+        from ematix_flow.warehouses import WarehouseSource
+
+        conn = BigQueryConnection(name="bq", project="p", dataset="d")
+        spec = Source.bigquery_query(conn, "SELECT 2")
+        assert isinstance(spec, WarehouseSource)
+        assert spec.kind == "bigquery"
+
+    def test_source_redshift_query_returns_warehouse_source(self):
+        from ematix_flow.source import Source
+        from ematix_flow.warehouses import WarehouseSource
+
+        conn = RedshiftConnection(
+            name="rs", host="h", database="d", user="u", password="p"
+        )
+        spec = Source.redshift_query(conn, "SELECT 3")
+        assert isinstance(spec, WarehouseSource)
+        assert spec.kind == "redshift"
+
+
+class TestTargetFactories:
+    """The `WarehouseTarget.{snowflake,bigquery,redshift}_table`
+    factories build typed target specs."""
+
+    def test_snowflake_table_factory(self):
+        from ematix_flow.warehouses import WarehouseTarget
+
+        conn = SnowflakeConnection(
+            name="snow", account="a", user="u", password="p", warehouse="W"
+        )
+        tgt = WarehouseTarget.snowflake_table(conn, "my_table")
+        assert tgt.kind == "snowflake"
+        assert tgt.table_name == "my_table"
+        assert tgt.create_if_not_exists is True
+
+    def test_bigquery_table_factory(self):
+        from ematix_flow.warehouses import WarehouseTarget
+
+        conn = BigQueryConnection(name="bq", project="p", dataset="d")
+        tgt = WarehouseTarget.bigquery_table(conn, "out", create_if_not_exists=False)
+        assert tgt.kind == "bigquery"
+        assert tgt.create_if_not_exists is False
+
+    def test_redshift_table_factory(self):
+        from ematix_flow.warehouses import WarehouseTarget
+
+        conn = RedshiftConnection(
+            name="rs",
+            host="h",
+            database="d",
+            user="u",
+            password="p",
+            s3_staging_dir="s3://b/p/",
+            iam_role="arn:aws:iam::1:role/r",
+        )
+        tgt = WarehouseTarget.redshift_table(conn, "rs_table")
+        assert tgt.kind == "redshift"
+
+
+class TestRunWarehousePipeline:
+    """End-to-end orchestrator with mocked SDK clients."""
+
+    def _src_client_returning(self, table: pa.Table):
+        """Return a mock client that satisfies the snowflake adapter:
+        connection.cursor().__enter__().fetch_arrow_all() → table."""
+        mock_cursor = MagicMock()
+        mock_cursor.fetch_arrow_all.return_value = table
+        mock_conn = MagicMock()
+        mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+        return mock_conn
+
+    def _tgt_client_capturing(self, captured: list[pa.Table]):
+        """Mock snowflake write_pandas — captures the written DF as
+        Arrow for assertion."""
+        mock_conn = MagicMock()
+        # The write_pandas function is imported inside
+        # snowflake_write_arrow; we monkeypatch via the module.
+        import ematix_flow.warehouses as wh
+
+        def _fake_write_pandas(client, df, table_name, auto_create_table):  # noqa: ANN001
+            captured.append(pa.Table.from_pandas(df))
+            return (True, 0, len(df), 0)
+
+        # Patch the import-time symbol path:
+        wh.snowflake_write_arrow.__globals__["__test_fake_write_pandas"] = (  # type: ignore[attr-defined]
+            _fake_write_pandas
+        )
+        return mock_conn
+
+    def test_run_pipeline_snowflake_to_snowflake_no_transform(self, monkeypatch):
+        from ematix_flow.warehouses import (
+            WarehouseSource,
+            WarehouseTarget,
+            run_warehouse_pipeline,
+            snowflake_write_arrow,
+        )
+
+        # Build a tiny "source" table.
+        src_table = pa.table({"id": [1, 2, 3], "v": [10, 20, 30]})
+
+        # Monkeypatch write_pandas at the import site to avoid
+        # needing the real snowflake SDK.
+        import ematix_flow.warehouses as wh
+
+        captured: list[pa.Table] = []
+
+        def _fake_write_pandas(client, df, table_name, auto_create_table):  # noqa: ANN001
+            captured.append(pa.Table.from_pandas(df))
+            return (True, 0, len(df), 0)
+
+        # snowflake_write_arrow imports `from snowflake.connector.pandas_tools
+        # import write_pandas` lazily inside the function; patch at the
+        # import-machinery level via sys.modules.
+        import sys
+        import types
+
+        fake_pandas_tools = types.ModuleType("snowflake.connector.pandas_tools")
+        fake_pandas_tools.write_pandas = _fake_write_pandas  # type: ignore[attr-defined]
+        fake_snowflake = types.ModuleType("snowflake")
+        fake_connector = types.ModuleType("snowflake.connector")
+        fake_connector.pandas_tools = fake_pandas_tools  # type: ignore[attr-defined]
+        fake_snowflake.connector = fake_connector  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, "snowflake", fake_snowflake)
+        monkeypatch.setitem(sys.modules, "snowflake.connector", fake_connector)
+        monkeypatch.setitem(
+            sys.modules, "snowflake.connector.pandas_tools", fake_pandas_tools
+        )
+
+        src_client = self._src_client_returning(src_table)
+        tgt_client = MagicMock()  # write_pandas is monkeypatched
+
+        src_conn = SnowflakeConnection(
+            name="src", account="a", user="u", password="p", warehouse="W"
+        )
+        tgt_conn = SnowflakeConnection(
+            name="tgt", account="a", user="u", password="p", warehouse="W"
+        )
+
+        result = run_warehouse_pipeline(
+            source=WarehouseSource(connection=src_conn, sql="SELECT * FROM t", kind="snowflake"),
+            target=WarehouseTarget.snowflake_table(tgt_conn, "out_table"),
+            _source_client=src_client,
+            _target_client=tgt_client,
+        )
+
+        assert result.rows_read == 3
+        assert result.rows_written == 3
+        assert result.duration_ms >= 0
+        assert len(captured) == 1
+        # Written table has the same shape as input (no transform).
+        assert captured[0].num_rows == 3
+
+    def test_run_pipeline_unknown_source_kind_raises(self):
+        from ematix_flow.warehouses import (
+            WarehouseSource,
+            WarehouseSyncError,
+            WarehouseTarget,
+            run_warehouse_pipeline,
+        )
+
+        src_conn = SnowflakeConnection(
+            name="s", account="a", user="u", password="p", warehouse="W"
+        )
+        bad_source = WarehouseSource(
+            connection=src_conn, sql="x", kind="oracle"  # not supported
+        )
+        with pytest.raises(WarehouseSyncError, match="unknown source kind"):
+            run_warehouse_pipeline(
+                source=bad_source,
+                target=WarehouseTarget.snowflake_table(src_conn, "out"),
+            )
+
+    def test_redshift_write_rejects_missing_s3_staging(self):
+        from ematix_flow.warehouses import (
+            WarehouseSyncError,
+            redshift_write_arrow,
+        )
+
+        conn = RedshiftConnection(
+            name="rs", host="h", database="d", user="u", password="p"
+        )  # no s3_staging_dir or iam_role
+        table = pa.table({"id": [1]})
+        with pytest.raises(WarehouseSyncError, match="s3_staging_dir"):
+            redshift_write_arrow(conn, table, table_name="t")
