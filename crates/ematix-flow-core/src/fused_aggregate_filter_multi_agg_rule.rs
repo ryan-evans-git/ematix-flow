@@ -239,9 +239,17 @@ fn try_build_replacement(
             (Vec::new(), body.clone())
         };
 
-    // Reject any plan with multi-child nodes between the (Filter/)body
-    // and the scan — those are joins or set-operators we don't handle.
-    if !is_passthrough_chain_to_leaf(&scan) {
+    // Σ.H.1 (2026-05-20): accept HashJoinExec as a stopping point in
+    // the body chain in addition to a single-child-chain-to-leaf.
+    // FilterMultiAggSpec consumes batches from whatever the body
+    // produces; the join's output schema provides every column the
+    // spec needs by name (resolution failures downgrade to a graceful
+    // Ok(None) and DataFusion's default plan runs).
+    //
+    // NestedLoopJoinExec / CrossJoinExec / UnionExec stay rejected —
+    // their semantics or perf shapes aren't what the spec was
+    // designed for.
+    if !is_supported_body(&scan) {
         return Ok(None);
     }
 
@@ -854,6 +862,11 @@ fn true_if_we_can_see_all_needed(_sch: &SchemaRef) -> bool {
 /// True if `node` and every descendant on the single-child walk down
 /// to a leaf has exactly one child (or is itself a leaf). False on the
 /// first multi-child node (HashJoinExec, NestedLoopJoinExec, …).
+///
+/// Retained for the FilterSum rule (which still requires the strict
+/// single-table form); `is_supported_body` is the loosened variant
+/// used by the multi-agg rule post-Σ.H.1.
+#[allow(dead_code)]
 fn is_passthrough_chain_to_leaf(node: &Arc<dyn ExecutionPlan>) -> bool {
     let mut cur = node.clone();
     loop {
@@ -866,6 +879,31 @@ fn is_passthrough_chain_to_leaf(node: &Arc<dyn ExecutionPlan>) -> bool {
         }
         cur = children[0].clone();
     }
+}
+
+/// Σ.H.1: True if `node` is a valid body for the FilterMultiAgg rule
+/// — either a single-child chain to a leaf, or a `HashJoinExec` whose
+/// both sides are themselves valid bodies (recursive). Rejects
+/// `NestedLoopJoinExec`, `CrossJoinExec`, `UnionExec`, and any other
+/// multi-child node that isn't a HashJoin.
+fn is_supported_body(node: &Arc<dyn ExecutionPlan>) -> bool {
+    use datafusion::physical_plan::joins::HashJoinExec;
+    let children = node.children();
+    if children.is_empty() {
+        return true;
+    }
+    if children.len() == 1 {
+        let owned: Arc<dyn ExecutionPlan> = (*children[0]).clone();
+        return is_supported_body(&owned);
+    }
+    // Multi-child: only HashJoinExec is accepted.
+    if node.as_any().downcast_ref::<HashJoinExec>().is_none() {
+        return false;
+    }
+    children.iter().all(|c| {
+        let owned: Arc<dyn ExecutionPlan> = (*c).clone();
+        is_supported_body(&owned)
+    })
 }
 
 // ===== output projection wrapper =====
@@ -1002,10 +1040,11 @@ mod tests {
         );
     }
 
-    /// Rule does not fire on a SQL with a JOIN — the body under the
-    /// aggregate stack isn't a FilterExec→scan, so the matcher rejects.
+    /// Σ.H.1 (2026-05-20): rule now fires on `Aggregate > ... >
+    /// HashJoinExec > ...` plans. `is_supported_body` accepts a
+    /// HashJoin as a valid stopping point. Test renamed + flipped.
     #[tokio::test(flavor = "multi_thread")]
-    async fn does_not_fire_on_join_shape() {
+    async fn fires_on_hash_join_shape_post_sigma_h_1() {
         let ctx = ctx_with_rule().await;
         // Register a second tiny table to join against.
         let schema = Arc::new(ArrowSchema::new(vec![
@@ -1030,9 +1069,17 @@ mod tests {
             .await
             .unwrap();
         let plan_str = displayable(plan.as_ref()).indent(true).to_string();
+        // We expect FilterMultiAggSpec to be wired in. The plan must
+        // also still contain the HashJoinExec — the rule routes the
+        // aggregate over the join's output, it doesn't replace the
+        // join itself.
         assert!(
-            !plan_str.contains("FilterMultiAggSpec"),
-            "InjectFilterMultiAggRule wrongly fired on a JOIN shape.\nPlan:\n{plan_str}"
+            plan_str.contains("FilterMultiAggSpec"),
+            "InjectFilterMultiAggRule should now fire over a join body.\nPlan:\n{plan_str}"
+        );
+        assert!(
+            plan_str.contains("HashJoinExec"),
+            "Σ.H.1 must not eliminate the HashJoin; the join still runs.\nPlan:\n{plan_str}"
         );
     }
 
