@@ -250,6 +250,9 @@ pipeline's target by changing one line.
 | MySQL | ✅ | — | ✅ | ✅ | ✅ (`ON DUPLICATE KEY`) | ✅ |
 | SQLite | ✅ | — | ✅ | ✅ | ✅ | ✅ |
 | DuckDB | ✅ | — | ✅ | ✅ | ✅ | ✅ |
+| Snowflake | ✅ | — | ✅ | n/a | append (`write_pandas`) + truncate + merge (staged `MERGE`) | — |
+| BigQuery | ✅ | — | ✅ | n/a | append (`load_table_from_dataframe`) + truncate + merge (`MERGE INTO` from staging) | — |
+| Redshift | ✅ | — | ✅ | n/a | append (S3 → `COPY`) + truncate + merge (`MERGE INTO` from staging) | — |
 | Delta Lake (local + S3) | ✅ | ✅ | ✅ | n/a | ✅ (DataFusion-backed `MERGE`) | ✅ |
 | Object stores (Parquet / CSV / ORC / JSONL, local + S3) | ✅ | ✅ | ✅ | n/a | append + truncate | — *(see Δ.X3)* |
 | Kafka | — | ✅ | ✅ | n/a | append (cross-backend) | source role only |
@@ -616,6 +619,45 @@ ingest.sync(keys=("event_id",))     # pipelines expose a `.sync()` method
 
 Useful for tests, notebooks, or wrapping a pipeline inside
 another orchestrator.
+
+### Web UI (`flow web`)
+
+For visual ops, `flow web` serves a local SPA over the same
+RunLog. Lists pipelines + run history, shows per-run task graphs,
+and exposes one-click **restart from failed step** / **resume from
+watermark** / **rerun from beginning** / **pause** / **resume** on
+in-flight runs.
+
+```sh
+pip install "ematix-flow[web]"
+flow web --port 8080
+# open http://127.0.0.1:8080/
+```
+
+Localhost-only by default (binding a non-loopback address logs a
+warning since the alpha ships without bearer-token auth — SSH
+tunnel or front with a reverse proxy for remote access).
+
+The run-detail page renders the task DAG live, color-coded by
+status — solid teal for **succeeded**, pulsing amber for **running**,
+dashed dim teal for **pending**, solid red for **failed**:
+
+![workflow DAG with parallel branch](docs/screenshots/workflow-dag.png)
+
+Reading left-to-right: `extract_orders` (done) fans out into two
+parallel branches — `transform_orders` (done) and `transform_payments`
+(running) — both feeding `merge_payments` and ultimately
+`load_warehouse`. Sibling steps at the same rank stack vertically
+so parallelism is visible at a glance.
+
+The action buttons map directly to scheduler-loop pickup: clicking
+**Restart from step "merge_payments"** writes a `requested` row to
+the RunLog with `extras["restart_from_step"]`; the next scheduler
+tick claims it and the worker honors `EMATIX_FLOW_RESTART_FROM_STEP`
+to resume the DAG from that node — upstream artifacts get reused
+rather than recomputed.
+
+More screenshots + walkthrough: [ematix.dev/specs/04-web-ui-screenshots](https://ematix.dev/specs/04-web-ui-screenshots).
 
 ### Run history
 
@@ -1126,6 +1168,23 @@ Apache Arrow Flight. mTLS for the mesh, cross-pod lookup
 broadcast, no separate cluster service. SQL dialect translator
 (Spark / DuckDB → DataFusion) makes existing queries portable
 without rewrites.
+
+**Peer auto-detection.** `peers = [...]` accepts three schemes:
+
+- `http://host:port` — static, unchanged.
+- `dns://host:port` — resolves the A-record at startup and
+  expands to every IP behind the name (good for headless services).
+- `k8s://service.namespace:port` — sugar for
+  `dns://service.namespace.svc.cluster.local:port`.
+
+Mix and match freely. Static peers added by the user are kept as-is;
+auto-detected peers are appended on top.
+
+**Engine default — `engine = "auto"`.** When unspecified (or set to
+`"auto"`), the runtime picks distributed if `peers` expands to ≥1 URL,
+otherwise falls back to in-process with an info log. Existing
+`engine = "single"` / `engine = "distributed"` selections are honored
+verbatim.
 
 ---
 
