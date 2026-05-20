@@ -41,6 +41,7 @@ __all__ = [
 
 _VALID_STATUS = frozenset(
     {
+        "requested",  # enqueued via Phase 4b restart/rerun, awaiting pickup
         "running",
         "paused",
         "succeeded",
@@ -103,7 +104,10 @@ class RunRecord:
             )
         if self.attempt < 1:
             raise ValueError(f"RunRecord.attempt must be >= 1, got {self.attempt}")
-        if self.status in {"running", "paused"} and self.finished_at is not None:
+        if (
+            self.status in {"requested", "running", "paused"}
+            and self.finished_at is not None
+        ):
             raise ValueError(
                 f"RunRecord with status {self.status!r} must have "
                 "finished_at=None (the run hasn't ended yet)"
@@ -160,11 +164,21 @@ def _iso(ts: datetime) -> str:
 
 @runtime_checkable
 class RunHistoryStore(Protocol):
-    """Query + write surface for the Web UI's run-history view.
+    """Query + write + mutating-action surface for the Web UI.
 
-    Implementations should be idempotent on ``record_run_record``
-    (re-recording the same run_id replaces the prior copy).
-    ``list_runs`` and ``get_run`` are query-only.
+    Methods split into three layers:
+
+    **Query**: ``list_runs``, ``get_run``.
+    **Write**: ``record_run_record`` (idempotent on ``run_id``).
+    **Actions** (Phase 4b): ``enqueue_restart``, ``enqueue_rerun``,
+    ``set_pause`` — implementations record the user's intent into
+    the store; the scheduler claim loop picks the new rows up on
+    its next tick and dispatches them.
+
+    Actions write **new rows** for restart / rerun (they're new
+    run families with status ``"requested"``) and mutate the
+    existing row's ``extras["pause_requested"]`` flag for pause /
+    resume (the same run, asked to stop or continue).
     """
 
     def record_run_record(self, record: RunRecord) -> None:
@@ -189,6 +203,43 @@ class RunHistoryStore(Protocol):
 
     def get_run(self, run_id: str) -> RunRecord | None:
         """Return the record for ``run_id`` or None if unknown."""
+
+    # ---- Mutating actions (Phase 4b) ------------------------------
+
+    def enqueue_restart(self, prior_run_id: str, from_step: str | None) -> str:
+        """Enqueue a restart of ``prior_run_id``.
+
+        Writes a new :class:`RunRecord` with status
+        ``"requested"`` and ``extras`` containing
+        ``{"restart_from_step": <step>, "prior_run_id": <id>}``.
+        The scheduler picks the new row up and resumes the
+        pipeline at ``from_step`` (batch) or from the prior
+        watermark (when ``from_step`` is None).
+
+        Returns the new run id.
+        """
+
+    def enqueue_rerun(self, prior_run_id: str) -> str:
+        """Enqueue a full re-run of ``prior_run_id``.
+
+        Writes a new :class:`RunRecord` with status
+        ``"requested"`` and ``extras`` containing
+        ``{"rerun_full": true, "prior_run_id": <id>}``. The
+        scheduler picks the new row up and runs the pipeline from
+        scratch.
+
+        Returns the new run id.
+        """
+
+    def set_pause(self, run_id: str, pause: bool) -> None:
+        """Request a pause (or resume) on a running/paused run.
+
+        Sets ``extras["pause_requested"] = pause`` on the existing
+        row. The worker checks this at the next step / watermark
+        boundary and transitions to ``"paused"`` (or back to
+        ``"running"``). Idempotent — setting pause=True on an
+        already-paused run is a no-op.
+        """
 
 
 # ---- In-memory impl ------------------------------------------------
@@ -233,6 +284,71 @@ class InMemoryRunHistory:
 
     def get_run(self, run_id: str) -> RunRecord | None:
         return self._by_id.get(run_id)
+
+    # ---- Mutating actions (Phase 4b) ------------------------------
+
+    def enqueue_restart(
+        self, prior_run_id: str, from_step: str | None
+    ) -> str:
+        prior = self._by_id.get(prior_run_id)
+        if prior is None:
+            raise KeyError(
+                f"enqueue_restart: prior run_id {prior_run_id!r} not found"
+            )
+        from datetime import datetime as _dt, timezone as _tz
+        import uuid as _uuid
+
+        new_id = f"req-{_uuid.uuid4().hex}"
+        new_record = RunRecord(
+            run_id=new_id,
+            pipeline=prior.pipeline,
+            status="requested",
+            started_at=_dt.now(_tz.utc),
+            kind=prior.kind,
+            extras={
+                "restart_from_step": from_step,
+                "prior_run_id": prior_run_id,
+            },
+        )
+        self._by_id[new_id] = new_record
+        return new_id
+
+    def enqueue_rerun(self, prior_run_id: str) -> str:
+        prior = self._by_id.get(prior_run_id)
+        if prior is None:
+            raise KeyError(
+                f"enqueue_rerun: prior run_id {prior_run_id!r} not found"
+            )
+        from datetime import datetime as _dt, timezone as _tz
+        import uuid as _uuid
+
+        new_id = f"req-{_uuid.uuid4().hex}"
+        new_record = RunRecord(
+            run_id=new_id,
+            pipeline=prior.pipeline,
+            status="requested",
+            started_at=_dt.now(_tz.utc),
+            kind=prior.kind,
+            extras={
+                "rerun_full": True,
+                "prior_run_id": prior_run_id,
+            },
+        )
+        self._by_id[new_id] = new_record
+        return new_id
+
+    def set_pause(self, run_id: str, pause: bool) -> None:
+        record = self._by_id.get(run_id)
+        if record is None:
+            raise KeyError(f"set_pause: run_id {run_id!r} not found")
+        # RunRecord is frozen; build a new one with updated extras.
+        new_extras = dict(record.extras)
+        new_extras["pause_requested"] = pause
+        # Use dataclasses.replace via __dataclass_fields__ — frozen
+        # but mutable through replace.
+        from dataclasses import replace as _replace
+
+        self._by_id[run_id] = _replace(record, extras=new_extras)
 
     # Convenience helpers --------------------------------------------
 

@@ -354,3 +354,220 @@ class TestWebServerWithHistory:
         etl = next(p for p in body["pipelines"] if p["name"] == "real_etl")
         assert etl["kind"] == "batch"
         assert etl["latest_run"]["run_id"] == "01HQ-real-batch"
+
+
+class TestStoreMutatingActions:
+    """Phase 4b-1: enqueue_restart / enqueue_rerun / set_pause."""
+
+    def _make_store_with_failed_batch(self) -> tuple[InMemoryRunHistory, RunRecord]:
+        store = InMemoryRunHistory()
+        rec = RunRecord(
+            run_id="prior-failed",
+            pipeline="warehouse_etl",
+            status="failed",
+            started_at=_ts(),
+            finished_at=_ts(hour=14, minute=1),
+            attempt=2,
+            failed_step="merge_payments",
+            error_summary="ValueError",
+            kind="batch",
+        )
+        store.record_run_record(rec)
+        return store, rec
+
+    def test_enqueue_restart_writes_new_row(self):
+        store, prior = self._make_store_with_failed_batch()
+        new_id = store.enqueue_restart(prior.run_id, "merge_payments")
+        assert new_id != prior.run_id
+        new = store.get_run(new_id)
+        assert new is not None
+        assert new.status == "requested"
+        assert new.pipeline == prior.pipeline
+        assert new.kind == prior.kind
+        assert new.extras["restart_from_step"] == "merge_payments"
+        assert new.extras["prior_run_id"] == prior.run_id
+
+    def test_enqueue_restart_with_no_step_carries_none(self):
+        # For streaming runs `from_step` is None — the worker
+        # interprets that as "resume from last watermark".
+        store, prior = self._make_store_with_failed_batch()
+        new_id = store.enqueue_restart(prior.run_id, None)
+        assert store.get_run(new_id).extras["restart_from_step"] is None  # type: ignore[union-attr]
+
+    def test_enqueue_restart_unknown_prior_raises(self):
+        store = InMemoryRunHistory()
+        with pytest.raises(KeyError, match="not found"):
+            store.enqueue_restart("never-existed", "x")
+
+    def test_enqueue_rerun_writes_new_row_with_rerun_flag(self):
+        store, prior = self._make_store_with_failed_batch()
+        new_id = store.enqueue_rerun(prior.run_id)
+        new = store.get_run(new_id)
+        assert new is not None
+        assert new.status == "requested"
+        assert new.pipeline == prior.pipeline
+        assert new.extras["rerun_full"] is True
+        assert new.extras["prior_run_id"] == prior.run_id
+
+    def test_enqueue_rerun_unknown_prior_raises(self):
+        store = InMemoryRunHistory()
+        with pytest.raises(KeyError, match="not found"):
+            store.enqueue_rerun("missing")
+
+    def test_set_pause_true_flips_extras(self):
+        store = InMemoryRunHistory()
+        rec = RunRecord(
+            run_id="running-1",
+            pipeline="p",
+            status="running",
+            started_at=_ts(),
+        )
+        store.record_run_record(rec)
+        store.set_pause("running-1", True)
+        assert store.get_run("running-1").extras["pause_requested"] is True  # type: ignore[union-attr]
+
+    def test_set_pause_false_flips_extras_back(self):
+        store = InMemoryRunHistory()
+        rec = RunRecord(
+            run_id="r1",
+            pipeline="p",
+            status="paused",
+            started_at=_ts(),
+            extras={"pause_requested": True},
+        )
+        store.record_run_record(rec)
+        store.set_pause("r1", False)
+        assert store.get_run("r1").extras["pause_requested"] is False  # type: ignore[union-attr]
+
+    def test_set_pause_unknown_raises(self):
+        store = InMemoryRunHistory()
+        with pytest.raises(KeyError, match="not found"):
+            store.set_pause("missing", True)
+
+    def test_set_pause_preserves_other_extras(self):
+        store = InMemoryRunHistory()
+        rec = RunRecord(
+            run_id="r1",
+            pipeline="p",
+            status="running",
+            started_at=_ts(),
+            extras={"k8s_job_id": "abc-123", "scheduler_tick": 42},
+        )
+        store.record_run_record(rec)
+        store.set_pause("r1", True)
+        new = store.get_run("r1")
+        assert new is not None
+        assert new.extras["k8s_job_id"] == "abc-123"
+        assert new.extras["scheduler_tick"] == 42
+        assert new.extras["pause_requested"] is True
+
+
+class TestPostEndpoints:
+    """Phase 4b-1 mutating endpoint surface. Each test runs against a
+    history-store-backed app so the enqueued effects can be verified
+    end-to-end."""
+
+    def _make(self):
+        pytest.importorskip("fastapi")
+        from fastapi.testclient import TestClient
+        from ematix_flow.web.server import create_app
+
+        store = InMemoryRunHistory()
+        store.record_run_record(
+            RunRecord(
+                run_id="prior-batch",
+                pipeline="warehouse_etl",
+                status="failed",
+                started_at=_ts(),
+                finished_at=_ts(hour=14, minute=2),
+                failed_step="merge_payments",
+                kind="batch",
+            )
+        )
+        store.record_run_record(
+            RunRecord(
+                run_id="prior-stream",
+                pipeline="events",
+                status="running",
+                started_at=_ts(),
+                kind="streaming",
+            )
+        )
+        client = TestClient(create_app(history=store))
+        return client, store
+
+    def test_restart_enqueues_new_run(self):
+        client, store = self._make()
+        r = client.post(
+            "/api/runs/prior-batch/restart",
+            json={"from_step": "merge_payments"},
+        )
+        assert r.status_code == 200
+        body = r.json()
+        assert "new_run_id" in body
+        new = store.get_run(body["new_run_id"])
+        assert new is not None
+        assert new.status == "requested"
+        assert new.extras["restart_from_step"] == "merge_payments"
+
+    def test_restart_unknown_prior_404s(self):
+        client, _ = self._make()
+        r = client.post(
+            "/api/runs/missing/restart",
+            json={"from_step": "x"},
+        )
+        assert r.status_code == 404
+
+    def test_restart_empty_body_passes_none_from_step(self):
+        client, store = self._make()
+        r = client.post("/api/runs/prior-batch/restart", json={})
+        assert r.status_code == 200
+        new = store.get_run(r.json()["new_run_id"])
+        assert new is not None
+        assert new.extras["restart_from_step"] is None
+
+    def test_rerun_enqueues_new_run(self):
+        client, store = self._make()
+        r = client.post("/api/runs/prior-batch/rerun")
+        assert r.status_code == 200
+        new = store.get_run(r.json()["new_run_id"])
+        assert new is not None
+        assert new.extras["rerun_full"] is True
+
+    def test_pause_sets_flag(self):
+        client, store = self._make()
+        r = client.post("/api/runs/prior-stream/pause")
+        assert r.status_code == 200
+        assert r.json()["status"] == "pause_requested"
+        assert (
+            store.get_run("prior-stream").extras["pause_requested"]  # type: ignore[union-attr]
+            is True
+        )
+
+    def test_resume_clears_flag(self):
+        client, store = self._make()
+        client.post("/api/runs/prior-stream/pause")  # set
+        r = client.post("/api/runs/prior-stream/resume")  # clear
+        assert r.status_code == 200
+        assert r.json()["status"] == "resume_requested"
+        assert (
+            store.get_run("prior-stream").extras["pause_requested"]  # type: ignore[union-attr]
+            is False
+        )
+
+    def test_pause_unknown_run_404s(self):
+        client, _ = self._make()
+        r = client.post("/api/runs/no-such-run/pause")
+        assert r.status_code == 404
+
+    def test_mutating_endpoint_without_history_400s(self):
+        # Stub server (no history store) should refuse mutating
+        # actions with a clear pointer.
+        pytest.importorskip("fastapi")
+        from fastapi.testclient import TestClient
+        from ematix_flow.web.server import create_app
+
+        client = TestClient(create_app())  # no history
+        r = client.post("/api/runs/anything/restart", json={})
+        assert r.status_code == 400
+        assert "RunHistoryStore" in r.json()["detail"]

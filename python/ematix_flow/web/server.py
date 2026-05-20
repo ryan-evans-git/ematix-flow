@@ -169,7 +169,7 @@ def create_app(
       serves a friendly placeholder HTML page.
     """
     try:
-        from fastapi import FastAPI, HTTPException
+        from fastapi import Body, FastAPI, HTTPException
         from fastapi.responses import HTMLResponse
         from fastapi.staticfiles import StaticFiles
     except ImportError as exc:
@@ -288,6 +288,70 @@ def create_app(
                 )
             return {"pipelines": pipelines}
         return {"pipelines": _STUB_PIPELINES}
+
+    # ---- Mutating actions (Phase 4b) -------------------------------
+    #
+    # All four endpoints require a configured history store; without
+    # one the server only has stub data and there's nothing real to
+    # mutate. Anonymous mode (the default Phase 4a auth choice) is
+    # *not* gated here — the server already binds 127.0.0.1 by
+    # default, so OS-level user boundary is the trust boundary.
+    # Operators who pass --bind <non-loopback> see the loud warning
+    # at startup.
+
+    def _require_history():
+        if history is None:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "mutating actions require a configured RunHistoryStore; "
+                    "this server was started without one (stub mode)"
+                ),
+            )
+
+    @app.post("/api/runs/{run_id}/restart")
+    def post_restart(
+        run_id: str,
+        body: dict[str, Any] = Body(default_factory=dict),
+    ) -> dict[str, Any]:  # type: ignore[unused-function]
+        _require_history()
+        assert history is not None  # narrowed by _require_history
+        from_step = body.get("from_step")
+        try:
+            new_id = history.enqueue_restart(run_id, from_step)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return {"new_run_id": new_id}
+
+    @app.post("/api/runs/{run_id}/rerun")
+    def post_rerun(run_id: str) -> dict[str, Any]:  # type: ignore[unused-function]
+        _require_history()
+        assert history is not None
+        try:
+            new_id = history.enqueue_rerun(run_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return {"new_run_id": new_id}
+
+    @app.post("/api/runs/{run_id}/pause")
+    def post_pause(run_id: str) -> dict[str, Any]:  # type: ignore[unused-function]
+        _require_history()
+        assert history is not None
+        try:
+            history.set_pause(run_id, True)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return {"status": "pause_requested"}
+
+    @app.post("/api/runs/{run_id}/resume")
+    def post_resume(run_id: str) -> dict[str, Any]:  # type: ignore[unused-function]
+        _require_history()
+        assert history is not None
+        try:
+            history.set_pause(run_id, False)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return {"status": "resume_requested"}
 
     # ---- SPA bundle ------------------------------------------------
 
