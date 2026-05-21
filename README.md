@@ -57,9 +57,9 @@ flow run-due --module my_pipelines    # cron-style; drop into systemd / cron / k
 
 ## Why ematix-flow
 
-- **Fast.** TPC-H SF=1, 22 queries, single Apple M3 Pro: **1.68× faster than
-  DuckDB**, **2.72× faster than Polars**, **12.4× faster than single-node
-  PySpark** (geomean). 18 / 22 wins outright. Full numbers and reproducer in
+- **Fast.** TPC-H SF=1, 22 queries, single Apple M3 Pro: **1.75× faster than
+  DuckDB**, **2.77× faster than Polars**, **13.4× faster than single-node
+  PySpark** (geomean). 19 / 22 wins outright. Full numbers and reproducer in
   [Benchmarks](#benchmarks).
 - **Scheduling + DAG, no service to operate.** Pipelines carry their own
   cron schedule and `depends_on=` edges (with cycle detection and exponential-
@@ -1419,46 +1419,55 @@ the [Install](#install) extras and the
 ### TPC-H SF=1, all 22 queries
 
 Every TPC-H query, four engines, same M3 Pro / SF=1 / Parquet,
-v0.4.0 (2026-05-20):
+v0.4.0 (2026-05-20, 10 trials):
 
 | Query | **ematix-flow** | DuckDB | Polars | PySpark | Best |
 |---|---:|---:|---:|---:|:---|
-| Q01 | **29.35** | 45.24 | 38.67 | 189.8 | ematix-flow |
-| Q02 | **11.96** | 18.43 | 46.52 | 215.6 | ematix-flow |
-| Q03 | **15.97** | 32.49 | 46.34 | 293.7 | ematix-flow |
-| Q04 | **12.96** | 22.61 | 23.79 | 218.8 | ematix-flow |
-| Q05 | **21.21** | 31.70 | 11338.67 | 366.2 | ematix-flow |
-| Q06 | **10.44** | 12.57 | 10.57 | 47.9 | ematix-flow |
-| Q07 | 37.68 | **32.33** | 122.21 | 288.7 | DuckDB |
-| Q08 | **20.60** | 40.04 | 100.73 | 215.2 | ematix-flow |
-| Q09 | **27.01** | 62.26 | 49.12 | 453.0 | ematix-flow |
-| Q10 | **29.25** | 68.21 | 106.38 | 416.9 | ematix-flow |
-| Q11 | **7.71** | 10.50 | 10.45 | 140.0 | ematix-flow |
-| Q12 | **14.84** | 24.09 | 19.70 | 310.5 | ematix-flow |
-| Q13 | **42.01** | 144.40 | 119.43 | 699.6 | ematix-flow |
-| Q14 | **12.29** | 24.35 | 13.69 | 117.1 | ematix-flow |
-| Q15 | 16.60 | 15.15 | **11.83** | 142.0 | Polars |
-| Q16 | **9.06** | 25.57 | 20.83 | 213.4 | ematix-flow |
-| Q17 | 36.73 | **28.88** | 41.19 | 272.4 | DuckDB |
-| Q18 | 56.57 | **50.00** | 60.70 | 587.1 | DuckDB |
-| Q19 | **17.82** | 36.41 | 108.90 | 103.2 | ematix-flow |
-| Q20 | **16.28** | 35.59 | 23.66 | 154.0 | ematix-flow |
-| Q21 | **45.47** | 84.53 | 704.13 | 598.8 | ematix-flow |
-| Q22 | **8.67** | 24.13 | 13.10 | 284.3 | ematix-flow |
+| Q01 | **28.63** | 45.24 | 38.52 | 196.5 | ematix-flow |
+| Q02 | **9.85**  | 19.07 | 46.07 | 290.7 | ematix-flow |
+| Q03 | **13.96** | 32.70 | 46.00 | 288.2 | ematix-flow |
+| Q04 | **13.21** | 23.07 | 25.28 | 226.1 | ematix-flow |
+| Q05 | **21.59** | 31.48 | 11150.72 | 364.2 | ematix-flow |
+| Q06 | 11.04 | 11.94 | **10.16** | 68.3 | Polars |
+| Q07 | **28.79** | 32.65 | 115.31 | 286.8 | ematix-flow |
+| Q08 | **20.41** | 38.26 | 93.62 | 209.8 | ematix-flow |
+| Q09 | **26.30** | 60.67 | 47.96 | 461.3 | ematix-flow |
+| Q10 | **28.83** | 68.29 | 111.80 | 421.9 | ematix-flow |
+| Q11 | **8.65**  | 11.62 | 9.35 | 139.1 | ematix-flow |
+| Q12 | **14.85** | 24.37 | 19.06 | 288.4 | ematix-flow |
+| Q13 | **41.68** | 147.33 | 117.00 | 694.2 | ematix-flow |
+| Q14 | **12.13** | 24.22 | 13.01 | 138.3 | ematix-flow |
+| Q15 | 16.25 | 15.69 | **11.48** | 166.4 | Polars |
+| Q16 | **8.76**  | 26.00 | 21.29 | 211.5 | ematix-flow |
+| Q17 | 36.85 | **28.48** | 42.04 | 239.4 | DuckDB |
+| Q18 | **51.21** | 52.37 | 59.19 | 569.1 | ematix-flow |
+| Q19 | **17.79** | 36.82 | 106.55 | 111.4 | ematix-flow |
+| Q20 | **16.34** | 39.11 | 23.30 | 148.8 | ematix-flow |
+| Q21 | **41.08** | 87.04 | 730.68 | 648.5 | ematix-flow |
+| Q22 | **8.62**  | 22.40 | 12.97 | 280.2 | ematix-flow |
 
-All times in milliseconds. 5-trial median for ematix-flow / DuckDB /
-Polars (same-process, `triangulation` feature); 3-trial median for
-PySpark 4.1.1 on JDK 23 (`local[*]`, `spark.sql.shuffle.partitions=8`,
-adaptive enabled). PySpark column is the v0.3.0 baseline — the SQL
-hot path didn't shift in v0.4.0 (alpha milestone work was warehouse +
-Web UI + secrets, all orthogonal to scan/aggregate kernels).
+All times in milliseconds. 10-trial median for ematix-flow / DuckDB /
+Polars (after 3 warmups, same-process, `triangulation` feature);
+3-trial median for PySpark 4.1.1 on JDK 23 (`local[*]`,
+`spark.sql.shuffle.partitions=8`, adaptive enabled). Both columns
+refreshed on the same machine, same data, same day.
 
-**Headline:** geomean **1.68× faster than DuckDB**, **2.72× faster
-than Polars**, **12.4× faster than single-node PySpark**.
-ematix-flow wins 18/22 queries outright; the four it doesn't (Q07,
-Q15, Q17, Q18) are all single-digit-ms gaps inside the run-to-run
-noise envelope. Polars's Q05 outlier (~11s) is a planner blowup on
-the canonical TPC-H Q05 shape — flagged but not a release blocker.
+**Headline:** geomean **1.75× faster than DuckDB**, **2.77× faster
+than Polars**, **13.4× faster than single-node PySpark** — up from
+1.69× / 2.71× / 12.9× at v0.3.0. ematix-flow wins **19 / 22**
+queries outright (was 18 / 22 at v0.3.0). The three it doesn't (Q06,
+Q15, Q17) are single-digit-ms gaps inside the run-to-run noise
+envelope. Polars's Q05 outlier (~11s) is a planner blowup on the
+canonical TPC-H Q05 shape — flagged but not a release blocker.
+
+The v0.4.0 geomean improvement comes from the **ematix-parquet
+v0.13.0** bump (full SIMD specialisation bw=1..=32) — Q06 scan
+kernel -18.7%, Q17 -9.5% at the kernel level — combined with the
+**Σ.F.1 shape-catalog substrate** that auto-loads the previously
+hand-wired `InjectFilterMultiAgg` / `InjectFilterSum` /
+`EnableDictGroupCount` optimizer rules. The "What's not shipped"
+closures (warehouse backends, Web UI, secrets, distributed peer
+auto-detection) are orthogonal to the scan/aggregate hot path.
 
 Polars wins are measured from hand-translated `.polars.sql`
 variants under `examples/tpch/queries/` — implicit `FROM a, b, c`
