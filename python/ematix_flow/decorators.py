@@ -1139,6 +1139,10 @@ class _EmatixNamespace:
         #    "base_secs": M, "max_backoff_secs": K}
         # See pipeline.RetryPolicy for field semantics.
         retry: dict | None = None,
+        # Task #558 — IANA tz the cron expression should be interpreted
+        # in (e.g. "America/New_York"). The Web UI also picks this up
+        # to localise the "Next run" rendering.
+        timezone: str | None = None,
     ):
         """Function decorator. Wraps `pipeline.sync` and registers via the
         Phase 12 scheduling registry.
@@ -1403,6 +1407,7 @@ class _EmatixNamespace:
                 depends_on=depends_on,
                 upstream_freshness_secs=upstream_freshness_secs,
                 retry=retry,
+                timezone=timezone,
             )(wrapped)
 
             return wrapped

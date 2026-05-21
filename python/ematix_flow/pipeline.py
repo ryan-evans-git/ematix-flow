@@ -353,11 +353,18 @@ class ScheduledPipeline:
     `schedule=None` (Phase 27c) keeps a pipeline registered without a cron
     — only fires when invoked by another pipeline's transforms_post via
     `transform_ref(...)` or directly via `flow run`.
+
+    ``timezone`` (task #558) — IANA tz name (e.g. ``"America/New_York"``)
+    in which the cron expression is interpreted. ``None`` keeps the
+    historical UTC interpretation. The same string is surfaced through
+    the Web UI so the "Next run" line renders in the pipeline's local
+    tz instead of UTC.
     """
 
     name: str
     schedule: str | None
     fn: Callable[[], dict[str, Any]]
+    timezone: str | None = None
 
 
 _REGISTRY: dict[str, ScheduledPipeline] = {}
@@ -749,6 +756,7 @@ def register(
     depends_on: list[str] | None = None,
     upstream_freshness_secs: int | None = None,
     retry: dict | None = None,
+    timezone: str | None = None,
 ) -> Callable[[Callable[[], dict[str, Any]]], Callable[[], dict[str, Any]]]:
     """Decorator: register a callable as a scheduled pipeline.
 
@@ -801,7 +809,18 @@ def register(
         # Validate retry= up front so a malformed policy doesn't make
         # it into the registry.
         policy = _build_retry_policy(name, retry)
-        _REGISTRY[name] = ScheduledPipeline(name=name, schedule=schedule, fn=fn)
+        # Validate timezone= up front — invalid names should fail at
+        # registration, not at the first scheduled tick.
+        if timezone is not None:
+            try:
+                _resolve_tz(timezone)
+            except Exception as e:
+                raise ValueError(
+                    f"pipeline {name!r}: invalid timezone {timezone!r}: {e}"
+                ) from e
+        _REGISTRY[name] = ScheduledPipeline(
+            name=name, schedule=schedule, fn=fn, timezone=timezone,
+        )
         _DEPENDS_ON[name] = upstreams
         if upstream_freshness_secs is not None:
             _UPSTREAM_FRESHNESS[name] = upstream_freshness_secs
@@ -1488,6 +1507,40 @@ def _resolve_tz(tz: Any) -> Any:
 
         return ZoneInfo(tz)
     return tz
+
+
+def forecast_next_run(
+    schedule: str | None,
+    *,
+    now: datetime | None = None,
+    timezone: str | None = None,
+) -> datetime | None:
+    """Return the next scheduled fire time as a UTC :class:`datetime`,
+    or ``None`` if ``schedule`` is unset.
+
+    ``timezone`` (IANA tz name) makes the cron expression interpret in
+    that tz — e.g. ``schedule="0 9 * * *", timezone="America/New_York"``
+    fires at 09:00 Eastern, automatically tracking DST. The returned
+    datetime is always normalised to UTC so callers serialising to ISO
+    8601 don't need to know what tz the user picked.
+    """
+    if schedule is None:
+        return None
+    from croniter import croniter
+
+    if now is None:
+        now = datetime.now(_tz_utc())
+    tz_resolved = _resolve_tz(timezone)
+    if tz_resolved is not None:
+        # Anchor croniter in the pipeline's local tz so daily / weekly
+        # cron lines map to the correct wall-clock moment.
+        local_now = now.astimezone(tz_resolved)
+        cron = croniter(schedule, local_now)
+        next_local = cron.get_next(datetime)
+        # Round-trip back to UTC for transport.
+        return next_local.astimezone(_tz_utc())
+    cron = croniter(schedule, now)
+    return cron.get_next(datetime)
 
 
 # --- Phase 25: preview / dry-run --------------------------------------------

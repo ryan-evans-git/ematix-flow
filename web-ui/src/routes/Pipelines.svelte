@@ -27,9 +27,24 @@
     return `${(ms / 1000).toFixed(2)}s`;
   }
 
-  function fmtNextRun(iso) {
+  function fmtNextRun(iso, tz) {
     if (!iso) return "—";
     try {
+      const d = new Date(iso);
+      if (tz) {
+        // Pipeline-local rendering via Intl. Format "YYYY-MM-DD HH:MM TZ"
+        // so the column stays aligned with the UTC fallback. Tag with the
+        // short zone name ("EDT" / "PST") so the user sees the offset.
+        const dt = new Intl.DateTimeFormat("en-CA", {
+          timeZone: tz,
+          year: "numeric", month: "2-digit", day: "2-digit",
+          hour: "2-digit", minute: "2-digit", hour12: false,
+        }).format(d).replace(",", "");
+        const zone = new Intl.DateTimeFormat("en-US", {
+          timeZone: tz, timeZoneName: "short",
+        }).formatToParts(d).find(p => p.type === "timeZoneName")?.value || tz;
+        return `${dt} ${zone}`;
+      }
       return new Date(iso).toISOString().replace("T", " ").slice(0, 16) + " UTC";
     } catch (_) {
       return iso;
@@ -70,7 +85,7 @@
           {#if p.kind === "streaming"}
             <span class="streaming-pill">▶ LIVE STREAMING</span>
           {:else if p.next_run_at}
-            <span class="next-run">Next: <span class="mono">{fmtNextRun(p.next_run_at)}</span></span>
+            <span class="next-run">Next: <span class="mono">{fmtNextRun(p.next_run_at, p.timezone)}</span></span>
           {:else}
             <span class="next-run next-run--muted">Next: —</span>
           {/if}
