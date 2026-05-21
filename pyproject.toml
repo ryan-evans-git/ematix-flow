@@ -172,6 +172,14 @@ web = [
     "uvicorn[standard]>=0.27",
 ]
 
+# ---- AWS Glue Schema Registry (task #556)
+# boto3 — Glue's GetSchemaVersion / RegisterSchemaVersion / CreateSchema
+# calls. Only the schema fetch+register lives in Python; the Kafka
+# wire-frame primitives are in the Rust crate.
+glue-schema-registry = [
+    "boto3>=1.34",
+]
+
 # ---- Cloud warehouse extras (Phase 2 — Snowflake / BigQuery / Redshift)
 # Each warehouse's typed Connection + the matching `*_query_to_arrow`
 # adapter pulls the upstream Python SDK as an opt-in extra. The
