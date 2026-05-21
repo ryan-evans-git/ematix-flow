@@ -185,12 +185,13 @@ snowflake = [
 bigquery  = [
     "google-cloud-bigquery>=3.17",
     "google-cloud-bigquery-storage>=2.24",
-    "pandas>=2.0",
+    # Arrow-native load_table_from_file(PARQUET) path — no pandas dep.
     "pyarrow>=15",
 ]
 redshift  = [
     "redshift-connector>=2.1",
-    "pandas>=2.0",
+    "boto3>=1.34",
+    # Arrow-native S3 + COPY FROM ... PARQUET path — no pandas dep.
     "pyarrow>=15",
 ]
 warehouses = [
@@ -198,7 +199,7 @@ warehouses = [
     "google-cloud-bigquery>=3.17",
     "google-cloud-bigquery-storage>=2.24",
     "redshift-connector>=2.1",
-    "pandas>=2.0",
+    "boto3>=1.34",
     "pyarrow>=15",
 ]
 

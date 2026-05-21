@@ -553,12 +553,19 @@ def bigquery_write_arrow(
     create_if_not_exists: bool = True,
     _client: Any | None = None,
 ) -> int:
-    """Bulk-load ``table`` into BigQuery via
-    ``client.load_table_from_dataframe``. Returns the row count.
+    """Bulk-load ``table`` into BigQuery via parquet
+    ``load_table_from_file``. Returns the row count.
 
-    Uses pandas conversion since BigQuery's Python SDK takes
-    DataFrames; for very large tables, write to a staging GCS
-    location and ``LOAD DATA`` directly.
+    **Arrow-native — no pandas dependency.** The Arrow table is
+    written to a local temp parquet file with ``pyarrow.parquet``,
+    then handed to the BigQuery client's ``load_table_from_file``
+    with ``source_format = PARQUET``. This replaces the earlier
+    ``load_table_from_dataframe`` path (which required pandas).
+
+    ``create_if_not_exists=True`` maps to ``WRITE_TRUNCATE`` (creates
+    or replaces); ``False`` maps to ``WRITE_APPEND`` (rejects if the
+    table is missing). For very large tables, prefer staging the
+    parquet to GCS and using ``LOAD DATA`` directly.
     """
     if _client is None:
         try:
@@ -573,27 +580,57 @@ def bigquery_write_arrow(
         if conn.location:
             client_kwargs["location"] = expand(conn.location)
         _client = bigquery.Client(**client_kwargs)
+
+    import os
+    import tempfile
+
+    import pyarrow.parquet as pq
+
     project = conn.resolved_project()
     dataset = conn.resolved_dataset()
     table_ref = f"{project}.{dataset}.{table_name}"
-    df = table.to_pandas()
-    # The job-config import is lazy so the mocked tests don't need
-    # the SDK installed.
-    try:
-        from google.cloud import bigquery as _bq  # type: ignore[import-not-found]
+    nrows = table.num_rows
 
-        write_disposition = (
-            _bq.WriteDisposition.WRITE_APPEND
-            if not create_if_not_exists
-            else _bq.WriteDisposition.WRITE_TRUNCATE
-        )
-        job_config = _bq.LoadJobConfig(write_disposition=write_disposition)
-        job = _client.load_table_from_dataframe(df, table_ref, job_config=job_config)
-    except ImportError:
-        # Pure-mock path (test client has no bigquery import).
-        job = _client.load_table_from_dataframe(df, table_ref)
-    job.result()  # blocks until the load job completes
-    return len(df)
+    with tempfile.NamedTemporaryFile(
+        suffix=".parquet", delete=False
+    ) as tmp:
+        parquet_path = tmp.name
+    try:
+        pq.write_table(table, parquet_path)
+        # The job-config import is lazy so mocked tests don't need
+        # the SDK installed.
+        try:
+            from google.cloud import bigquery as _bq  # type: ignore[import-not-found]
+
+            write_disposition = (
+                _bq.WriteDisposition.WRITE_APPEND
+                if not create_if_not_exists
+                else _bq.WriteDisposition.WRITE_TRUNCATE
+            )
+            job_config = _bq.LoadJobConfig(
+                source_format=_bq.SourceFormat.PARQUET,
+                write_disposition=write_disposition,
+            )
+            with open(parquet_path, "rb") as fh:
+                job = _client.load_table_from_file(
+                    fh, table_ref, job_config=job_config
+                )
+        except ImportError:
+            # Pure-mock path (test client has no bigquery import).
+            with open(parquet_path, "rb") as fh:
+                job = _client.load_table_from_file(fh, table_ref)
+        job.result()  # blocks until the load job completes
+    except Exception as exc:
+        raise WarehouseSyncError(
+            f"bigquery_write_arrow: write failed for table "
+            f"{table_name!r}: {exc}"
+        ) from exc
+    finally:
+        try:
+            os.unlink(parquet_path)
+        except OSError:
+            pass  # best-effort cleanup
+    return nrows
 
 
 def redshift_write_arrow(
