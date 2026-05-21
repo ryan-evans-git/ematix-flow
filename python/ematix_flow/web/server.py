@@ -155,6 +155,7 @@ def create_app(
     *,
     history: RunHistoryStore | None = None,
     ui_dist_dir: Path | None = None,
+    bearer_token: str | None = None,
 ):
     """Build the FastAPI app.
 
@@ -170,9 +171,14 @@ def create_app(
       ``ematix_flow.web.ui_dist`` data dir, which is populated by
       the Vite build at wheel-build time. If absent, the server
       serves a friendly placeholder HTML page.
+    - ``bearer_token`` — when set, ``/api/*`` routes require an
+      ``Authorization: Bearer <token>`` header that matches. Lets
+      operators bind the server to non-loopback addresses safely.
+      ``/api/health`` stays open so load-balancer / readiness probes
+      keep working.
     """
     try:
-        from fastapi import Body, FastAPI, HTTPException
+        from fastapi import Body, FastAPI, HTTPException, Request
         from fastapi.responses import HTMLResponse
         from fastapi.staticfiles import StaticFiles
     except ImportError as exc:
@@ -187,6 +193,38 @@ def create_app(
         docs_url="/api/docs",
         redoc_url=None,
     )
+
+    # Task #6: bearer-token middleware. Applied as an HTTP-level
+    # middleware (not a per-route Depends) so SPA static files +
+    # docs stay reachable without auth, while every /api/* route
+    # except /api/health is gated. Using constant-time compare so
+    # a timing attack can't fingerprint valid tokens.
+    if bearer_token is not None:
+        import hmac
+
+        @app.middleware("http")
+        async def _bearer_token_gate(request: Request, call_next):
+            path = request.url.path
+            # Static / SPA paths + /api/health are open; everything
+            # else under /api/ requires the bearer token.
+            if not path.startswith("/api/") or path == "/api/health":
+                return await call_next(request)
+            header = request.headers.get("authorization", "")
+            if not header.startswith("Bearer "):
+                from fastapi.responses import JSONResponse
+
+                return JSONResponse(
+                    {"detail": "missing Authorization: Bearer <token> header"},
+                    status_code=401,
+                )
+            presented = header[len("Bearer "):].strip()
+            if not hmac.compare_digest(presented, bearer_token):
+                from fastapi.responses import JSONResponse
+
+                return JSONResponse(
+                    {"detail": "invalid bearer token"}, status_code=401,
+                )
+            return await call_next(request)
 
     @app.get("/api/health")
     def health() -> dict[str, str]:  # type: ignore[unused-function]
@@ -505,14 +543,15 @@ def run_server(
     host: str = "127.0.0.1",
     port: int = 8080,
     log_level: str = "info",
+    bearer_token: str | None = None,
 ) -> None:
     """Launch the uvicorn server.
 
     Defaults to ``127.0.0.1`` so the UI is unreachable off-host
     without an explicit ``--bind <addr>`` opt-in. Binding to
-    ``0.0.0.0`` (or any non-loopback) prints a loud warning since
-    Phase 4a ships without bearer-token auth — anyone who can reach
-    the port can trigger restart / rerun / pause actions.
+    ``0.0.0.0`` (or any non-loopback) prints a loud warning **unless
+    bearer-token auth is configured** — once a token is set, mutating
+    actions require it and the non-loopback bind is safe.
     """
     try:
         import uvicorn  # type: ignore[import-not-found]
@@ -522,15 +561,16 @@ def run_server(
             "`pip install ematix-flow[web]`"
         ) from exc
 
-    if host not in {"127.0.0.1", "localhost", "::1"}:
+    is_loopback = host in {"127.0.0.1", "localhost", "::1"}
+    if not is_loopback and bearer_token is None:
         print(
-            f"WARNING: ematix-flow web is binding to {host!r}. This server "
-            "ships without auth in Phase 4a — anyone who can reach this "
-            "port can trigger restart / rerun / pause actions on your "
-            "pipelines. Use 127.0.0.1 + SSH tunneling, or put a reverse "
-            "proxy with auth in front, before exposing this off-host.",
+            f"WARNING: ematix-flow web is binding to {host!r} with no "
+            "bearer-token auth. Anyone who can reach this port can trigger "
+            "restart / rerun / pause actions on your pipelines. Pass "
+            "--token <secret> (or set EMATIX_FLOW_WEB_TOKEN env var) before "
+            "exposing this off-host.",
             file=sys.stderr,
         )
 
-    app = create_app()
+    app = create_app(bearer_token=bearer_token)
     uvicorn.run(app, host=host, port=port, log_level=log_level)

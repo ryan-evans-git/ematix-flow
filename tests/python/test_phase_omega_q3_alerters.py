@@ -320,6 +320,8 @@ def test_from_url_slack_keeps_full_https_url():
 
 
 def test_from_url_unknown_scheme():
+    # `pagerduty://` is supported as of v0.5.0; use a genuinely
+    # unknown scheme here.
     with pytest.raises(ValueError) as ei:
-        alerter_from_url("pagerduty://...")
-    assert "pagerduty" in str(ei.value).lower() or "unknown" in str(ei.value).lower()
+        alerter_from_url("teams://...")
+    assert "teams" in str(ei.value).lower() or "unknown" in str(ei.value).lower()

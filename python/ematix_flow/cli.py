@@ -704,6 +704,30 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
     return 1 if any(r.is_fail for r in reports) else 0
 
 
+def _cmd_init(args: argparse.Namespace) -> int:
+    """``flow init <path> [--force]`` — scaffold a new ematix-flow
+    project: pipelines.py + connections.toml + Dockerfile + flow.service
+    + .gitignore + README.md. Maven-archetype-style: enough to be
+    runnable immediately."""
+    from pathlib import Path
+
+    from ematix_flow.init_scaffold import scaffold_project
+
+    target = Path(args.path).resolve()
+    try:
+        written = scaffold_project(target, force=args.force)
+    except FileExistsError as exc:
+        print(f"flow init: {exc}", file=sys.stderr)
+        return 1
+    print(f"flow init: scaffolded {len(written)} files in {target}")
+    for path in written:
+        print(f"  + {path.relative_to(target)}")
+    print(
+        "\nNext: `cd " + str(target) + " && flow doctor --module pipelines`"
+    )
+    return 0
+
+
 def _cmd_secrets_test(args: argparse.Namespace) -> int:
     """``flow secrets test '${vault:foo#bar}'`` — resolve a single
     ``${...}`` reference via the registered resolver chain and print
@@ -1067,6 +1091,23 @@ def main(argv: list[str] | None = None) -> int:
     )
     conn_set.set_defaults(func=_cmd_connections_set)
 
+    # ``flow init <path>`` — scaffold a new project (Maven-archetype-style).
+    init_p = sub.add_parser(
+        "init",
+        help="scaffold a new ematix-flow project (pipelines.py + "
+        "connections.toml + Dockerfile + systemd unit)",
+    )
+    init_p.add_argument(
+        "path",
+        help="target directory for the new project (created if missing)",
+    )
+    init_p.add_argument(
+        "--force",
+        action="store_true",
+        help="overwrite existing files in the target directory",
+    )
+    init_p.set_defaults(func=_cmd_init)
+
     # ``flow doctor`` — health-check every registered typed connection.
     # Exit code is 1 if any probe failed; useful as a pre-deploy gate.
     doctor_p = sub.add_parser(
@@ -1129,6 +1170,13 @@ def main(argv: list[str] | None = None) -> int:
         choices=["debug", "info", "warning", "error"],
         help="uvicorn log level (default info)",
     )
+    web_p.add_argument(
+        "--token",
+        default=None,
+        help="bearer token required on every /api/* call (except /api/health). "
+        "Set this before binding to a non-loopback address. Falls back to "
+        "$EMATIX_FLOW_WEB_TOKEN if not passed on the CLI.",
+    )
     web_p.set_defaults(func=_cmd_web)
 
     args = parser.parse_args(argv)
@@ -1148,7 +1196,13 @@ def _cmd_web(args) -> int:
             file=sys.stderr,
         )
         return 1
-    run_server(host=args.bind, port=args.port, log_level=args.log_level)
+    # Bearer-token auth — set via --token, or fall back to the
+    # EMATIX_FLOW_WEB_TOKEN env var so secrets stay out of shell history.
+    token = args.token or os.environ.get("EMATIX_FLOW_WEB_TOKEN")
+    run_server(
+        host=args.bind, port=args.port, log_level=args.log_level,
+        bearer_token=token,
+    )
     return 0
 
 

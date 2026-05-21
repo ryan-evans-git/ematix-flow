@@ -1069,8 +1069,14 @@ def run_due_with_dag_detailed(
         success = False
         err: Exception | None = None
         started_at = datetime.now(_tz_utc())
+        # OTEL tracing: wrap each pipeline run in a `flow.pipeline.run`
+        # span. No-op when no tracer is configured.
+        from ematix_flow.tracing import pipeline_run_span
+
+        attempt_num = (st.attempt_count + 1) if st is not None else 1
         try:
-            ret = sp.fn()
+            with pipeline_run_span(name, attempt=attempt_num):
+                ret = sp.fn()
             success = True
         except Exception as e:
             err = e
