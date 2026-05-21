@@ -1436,6 +1436,7 @@ def _kafka_payload_and_sr_lines(
         # `schema_registry_url` for the Glue path (the URL is
         # implicit in the IAM-backed Glue API endpoint).
         from ematix_flow.glue_schema_registry import (
+            GLUE_SCHEMA_LOOKUP_BY_NAME_CALLBACK,
             GLUE_SCHEMA_LOOKUP_CALLBACK,
         )
         out.append(
@@ -1444,7 +1445,9 @@ def _kafka_payload_and_sr_lines(
             f"region = {_q(_resolve_required(sr.region, 'region'))}, "
             "registry_name = "
             f"{_q(_resolve_required(sr.registry_name, 'registry_name'))}, "
-            f"schema_lookup_callback = {_q(GLUE_SCHEMA_LOOKUP_CALLBACK)}"
+            f"schema_lookup_callback = {_q(GLUE_SCHEMA_LOOKUP_CALLBACK)}, "
+            "schema_lookup_by_name_callback = "
+            f"{_q(GLUE_SCHEMA_LOOKUP_BY_NAME_CALLBACK)}"
             " }"
         )
         return out

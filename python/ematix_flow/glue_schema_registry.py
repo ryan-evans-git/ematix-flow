@@ -34,8 +34,10 @@ from ematix_flow.connections import GlueSchemaRegistryConnection
 from ematix_flow.secrets import expand
 
 __all__ = [
+    "GLUE_SCHEMA_LOOKUP_BY_NAME_CALLBACK",
     "GLUE_SCHEMA_LOOKUP_CALLBACK",
     "GlueSchema",
+    "fetch_schema_by_name",
     "fetch_schema_by_uuid",
     "register_glue_schema_lookup_callback",
     "register_schema",
@@ -49,14 +51,20 @@ _VALID_DATA_FORMATS = frozenset({"AVRO", "PROTOBUF", "JSON"})
 
 
 # Name the Rust Kafka backend looks up when it needs to resolve a
-# Glue schema UUID. Treat as a stable identifier — must match the
-# value used in ``crates/ematix-flow-core/src/kafka_backend.rs`` when
-# constructing a ``SchemaRegistryKind::Glue { schema_lookup_callback,
-# .. }``. The default in the Python KafkaConnection plumbing wires
-# this constant up, so users registering a single Glue registry
-# never have to think about it.
+# Glue schema UUID (consumer path — the UUID arrives in the wire
+# frame). Treat as a stable identifier — must match the value used
+# in ``crates/ematix-flow-core/src/kafka_backend.rs``.
 GLUE_SCHEMA_LOOKUP_CALLBACK = (
     "ematix_flow.glue_schema_registry.fetch_schema_by_uuid"
+)
+
+
+# Name the Rust Kafka backend looks up when it needs to resolve a
+# Glue schema by its registered name (producer path — the producer
+# knows the schema name from config and needs the latest UUID +
+# definition to Avro-encode + Glue-frame each batch).
+GLUE_SCHEMA_LOOKUP_BY_NAME_CALLBACK = (
+    "ematix_flow.glue_schema_registry.fetch_schema_by_name"
 )
 
 
@@ -117,6 +125,53 @@ def _build_glue_client(
             aws_secret_access_key=expand(conn.aws_secret_access_key),
         )
     return boto3.client("glue", region_name=region)
+
+
+def fetch_schema_by_name(
+    conn: GlueSchemaRegistryConnection,
+    schema_name: str,
+    *,
+    version: int | str = "LATEST",
+    _client: Any | None = None,
+) -> GlueSchema:
+    """Resolve a Glue schema by registered name to its UUID + text.
+
+    Used by the Kafka *producer* path (task #556 producer slice): the
+    producer knows the schema name from config and needs the latest
+    UUID + definition text on the first send so it can Avro-encode +
+    Glue-frame each batch. Subsequent batches use the cached UUID.
+
+    ``version`` accepts an integer version number or the string
+    ``"LATEST"`` (the default). Glue's API uses
+    ``SchemaVersionNumber={"LatestVersion": True}`` for the latest
+    case; specific version numbers go through
+    ``SchemaVersionNumber={"VersionNumber": N}``.
+    """
+    client = _build_glue_client(conn, _client)
+    registry_name = expand(conn.registry_name)
+    schema_id = {"RegistryName": registry_name, "SchemaName": schema_name}
+    if version == "LATEST":
+        version_arg: dict[str, Any] = {"LatestVersion": True}
+    else:
+        version_arg = {"VersionNumber": int(version)}
+    response = client.get_schema_version(
+        SchemaId=schema_id,
+        SchemaVersionNumber=version_arg,
+    )
+    data_format = response.get("DataFormat")
+    if data_format not in _VALID_DATA_FORMATS:
+        raise ValueError(
+            f"Glue schema {schema_name!r} has unsupported DataFormat "
+            f"{data_format!r}; expected one of "
+            f"{sorted(_VALID_DATA_FORMATS)}"
+        )
+    return GlueSchema(
+        schema_uuid=response["SchemaVersionId"],
+        data_format=data_format,
+        schema_definition=response["SchemaDefinition"],
+        schema_arn=response["SchemaArn"],
+        version_number=int(response["VersionNumber"]),
+    )
 
 
 def fetch_schema_by_uuid(
@@ -221,6 +276,41 @@ def register_schema(
 # ---------------------------------------------------------------------------
 
 
+def _glue_lookup_by_name_dispatcher(req_bytes: bytes) -> bytes:
+    """Adapter invoked by the Rust Kafka *producer* when it needs to
+    resolve a schema by name to its UUID + text before encoding a
+    batch.
+
+    Request JSON shape:
+
+    .. code-block:: json
+
+        {"schema_name": "Order", "registry_name": "my-registry",
+         "region": "us-east-1"}
+
+    Response shape mirrors :func:`_glue_lookup_dispatcher` — the same
+    :class:`GlueSchemaResponse` structure on the Rust side
+    deserializes both producer and consumer responses.
+    """
+    req = json.loads(req_bytes.decode("utf-8"))
+    registry_name = req["registry_name"]
+    schema_name = req["schema_name"]
+    conn = _REGISTRY_CONNECTIONS.get(registry_name)
+    if conn is None:
+        raise KeyError(
+            f"no GlueSchemaRegistryConnection registered for "
+            f"registry_name={registry_name!r}; call "
+            f"register_glue_schema_lookup_callback(conn) at startup"
+        )
+    schema = fetch_schema_by_name(conn, schema_name)
+    resp = {
+        "schema_uuid": schema.schema_uuid,
+        "data_format": schema.data_format,
+        "schema_definition": schema.schema_definition,
+    }
+    return json.dumps(resp).encode("utf-8")
+
+
 def _glue_lookup_dispatcher(req_bytes: bytes) -> bytes:
     """Adapter invoked by the Rust Kafka backend when it sees a Glue-
     framed message and needs the schema text for the embedded UUID.
@@ -295,6 +385,13 @@ def register_glue_schema_lookup_callback(
         GLUE_SCHEMA_LOOKUP_CALLBACK,
         _glue_lookup_dispatcher,
     )
+    # Producer-side by-name lookup. Wired together with the consumer
+    # callback so a single ``register_glue_schema_lookup_callback``
+    # call covers both directions.
+    _registry_module.register_python_callback(
+        GLUE_SCHEMA_LOOKUP_BY_NAME_CALLBACK,
+        _glue_lookup_by_name_dispatcher,
+    )
 
 
 def unregister_glue_schema_lookup_callback(
@@ -313,5 +410,8 @@ def unregister_glue_schema_lookup_callback(
             except ImportError:
                 return  # nothing to unregister if the ext wasn't loaded
         _registry_module.unregister_python_callback(GLUE_SCHEMA_LOOKUP_CALLBACK)
+        _registry_module.unregister_python_callback(
+            GLUE_SCHEMA_LOOKUP_BY_NAME_CALLBACK,
+        )
     else:
         _REGISTRY_CONNECTIONS.pop(registry_name, None)

@@ -35,6 +35,10 @@ def _reset_dispatcher_state():
 
 class TestRegisterAndUnregister:
     def test_register_stores_connection_under_registry_name(self) -> None:
+        from ematix_flow.glue_schema_registry import (
+            GLUE_SCHEMA_LOOKUP_BY_NAME_CALLBACK,
+        )
+
         conn = GlueSchemaRegistryConnection(
             name="g", registry_name="orders-registry", region="us-east-1",
         )
@@ -43,10 +47,15 @@ class TestRegisterAndUnregister:
         fake = MagicMock()
         register_glue_schema_lookup_callback(conn, _registry_module=fake)
         assert _REGISTRY_CONNECTIONS["orders-registry"] is conn
-        fake.register_python_callback.assert_called_once()
-        args = fake.register_python_callback.call_args.args
-        assert args[0] == GLUE_SCHEMA_LOOKUP_CALLBACK
-        assert callable(args[1])
+        # Both callbacks register together — one for consumer (by UUID),
+        # one for producer (by name).
+        assert fake.register_python_callback.call_count == 2
+        callback_names = {
+            call.args[0]
+            for call in fake.register_python_callback.call_args_list
+        }
+        assert GLUE_SCHEMA_LOOKUP_CALLBACK in callback_names
+        assert GLUE_SCHEMA_LOOKUP_BY_NAME_CALLBACK in callback_names
 
     def test_register_is_idempotent(self) -> None:
         conn = GlueSchemaRegistryConnection(
@@ -73,6 +82,10 @@ class TestRegisterAndUnregister:
         assert _REGISTRY_CONNECTIONS["events"] is b
 
     def test_unregister_clears_everything_by_default(self) -> None:
+        from ematix_flow.glue_schema_registry import (
+            GLUE_SCHEMA_LOOKUP_BY_NAME_CALLBACK,
+        )
+
         conn = GlueSchemaRegistryConnection(
             name="g", registry_name="r", region="us-east-1",
         )
@@ -80,9 +93,13 @@ class TestRegisterAndUnregister:
         register_glue_schema_lookup_callback(conn, _registry_module=fake)
         unregister_glue_schema_lookup_callback(_registry_module=fake)
         assert _REGISTRY_CONNECTIONS == {}
-        fake.unregister_python_callback.assert_called_with(
-            GLUE_SCHEMA_LOOKUP_CALLBACK
-        )
+        # Both callbacks unregister together.
+        cleared = {
+            call.args[0]
+            for call in fake.unregister_python_callback.call_args_list
+        }
+        assert GLUE_SCHEMA_LOOKUP_CALLBACK in cleared
+        assert GLUE_SCHEMA_LOOKUP_BY_NAME_CALLBACK in cleared
 
     def test_unregister_by_name_only_removes_that_binding(self) -> None:
         a = GlueSchemaRegistryConnection(
@@ -171,6 +188,42 @@ class TestDispatcher:
         req_bytes = json.dumps({"schema_uuid": "u"}).encode("utf-8")
         with pytest.raises(KeyError):
             _glue_lookup_dispatcher(req_bytes)
+
+    def test_by_name_dispatcher_returns_schema_response_bytes(self) -> None:
+        # Producer-side: the Rust Kafka producer asks "what's the
+        # latest UUID + definition for this schema name?"
+        from unittest.mock import patch
+
+        from ematix_flow.glue_schema_registry import (
+            GlueSchema,
+            _glue_lookup_by_name_dispatcher,
+        )
+
+        self._register()
+        req_bytes = json.dumps({
+            "schema_name": "Order",
+            "region": "us-east-1",
+            "registry_name": "r",
+        }).encode("utf-8")
+        with patch(
+            "ematix_flow.glue_schema_registry.fetch_schema_by_name"
+        ) as mock_fetch:
+            mock_fetch.return_value = GlueSchema(
+                schema_uuid="aabbccdd-0000-1111-2222-3344556677ff",
+                data_format="AVRO",
+                schema_definition='{"type":"record","name":"Order","fields":[]}',
+                schema_arn="arn:aws:glue:us-east-1:123:schema/r/Order",
+                version_number=3,
+            )
+            resp_bytes = _glue_lookup_by_name_dispatcher(req_bytes)
+        mock_fetch.assert_called_once()
+        called_conn, called_name = mock_fetch.call_args.args
+        assert called_conn.registry_name == "r"
+        assert called_name == "Order"
+        resp = json.loads(resp_bytes.decode("utf-8"))
+        assert resp["schema_uuid"] == "aabbccdd-0000-1111-2222-3344556677ff"
+        assert resp["data_format"] == "AVRO"
+        assert "Order" in resp["schema_definition"]
 
     def test_dispatcher_routes_to_right_connection(self) -> None:
         # Two registries; the dispatcher must pick the one matching

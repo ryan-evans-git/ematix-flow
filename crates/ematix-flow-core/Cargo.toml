@@ -30,6 +30,7 @@ tokio-postgres.workspace = true
 deadpool-postgres.workspace = true
 uuid.workspace = true
 futures-util.workspace = true
+flate2.workspace = true
 bytes.workspace = true
 async-trait = "0.1"
 # Π.4a: CsvReadOptions.null_regex compiles to a regex::Regex which
