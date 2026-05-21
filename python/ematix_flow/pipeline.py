@@ -389,36 +389,204 @@ _UPSTREAM_FRESHNESS: dict[str, int | None] = {}
 _LAST_RUN: dict[str, tuple[datetime, bool]] = {}
 
 
-# ---- Workflows -----------------------------------------------------
+# ---- Workflow trigger expression tree (v0.7.0) -------------------
 #
-# A Workflow is a user-named grouping of jobs (decorated functions)
-# plus the depends_on edges between them. The Workflow is where the
-# DAG lives; per-job depends_on still works for back-compat but new
-# code should declare edges in the workflow.
+# `triggered_by=` accepts:
+#   - a single name string                    -> AllOf(<name>)
+#   - a list of names                         -> AllOf(<name>, <name>, ...)
+#   - a nested AllOf(...)/AnyOf(...) tree     -> kept as declared
 #
-#   _WORKFLOWS[name]            = Workflow(name, jobs, depends_on)
+# The canonical form is always a TriggerOp tree, never a flat list.
+# Leaves are str (upstream job or workflow names). Internal nodes are
+# AllOf (boolean AND) or AnyOf (boolean OR).
+
+
+@dataclass(frozen=True)
+class TriggerOp:
+    """Boolean combinator over upstream names.
+
+    ``kind`` is ``"all"`` (AND) or ``"any"`` (OR).
+    ``members`` is a tuple of strings (leaf names) or nested
+    :class:`TriggerOp` instances.
+
+    Build instances via :func:`AllOf` and :func:`AnyOf`; this dataclass
+    is exposed only so the registry / API layer can pattern-match on
+    ``.kind`` and walk ``.members``.
+    """
+
+    kind: str
+    members: tuple[Any, ...]
+
+    def leaves(self) -> tuple[str, ...]:
+        """Flat tuple of every upstream name appearing anywhere in
+        this expression (recursively). Order matches a depth-first
+        traversal of ``members``."""
+        out: list[str] = []
+        for m in self.members:
+            if isinstance(m, TriggerOp):
+                out.extend(m.leaves())
+            else:
+                out.append(m)
+        return tuple(out)
+
+
+def AllOf(*members: Any) -> TriggerOp:
+    """Boolean AND over upstream names / nested expressions.
+
+    Every member must be satisfied since this workflow last succeeded
+    for the AND to be ready. AND-of-zero (no members) is invalid;
+    AND-of-one is fine.
+    """
+    if not members:
+        raise ValueError("AllOf() requires at least one member")
+    return TriggerOp(kind="all", members=tuple(members))
+
+
+def AnyOf(*members: Any) -> TriggerOp:
+    """Boolean OR over upstream names / nested expressions.
+
+    The OR is ready as soon as any one member is ready. Useful for
+    ``A and (B or C)`` shaped trees:
+    ``AllOf("A", AnyOf("B", "C"))``.
+    """
+    if not members:
+        raise ValueError("AnyOf() requires at least one member")
+    return TriggerOp(kind="any", members=tuple(members))
+
+
+def _normalize_triggered_by(
+    value: Any,
+    *,
+    workflow_name: str,
+) -> TriggerOp | None:
+    """Coerce a ``triggered_by=`` input into a canonical ``TriggerOp``.
+
+    Accepts the legacy flat-list and bare-string shapes for
+    convenience; passes through a TriggerOp; raises ``ValueError`` on
+    anything else.
+    """
+    if value is None:
+        return None
+    if isinstance(value, TriggerOp):
+        _validate_trigger_op(value, workflow_name=workflow_name)
+        return value
+    if isinstance(value, str):
+        return TriggerOp(kind="all", members=(value,))
+    if isinstance(value, (list, tuple)):
+        if not value:
+            return None
+        # Wrap nested TriggerOps as members of an implicit AllOf.
+        for m in value:
+            if not isinstance(m, (str, TriggerOp)):
+                raise ValueError(
+                    f"workflow {workflow_name!r}: triggered_by= list members "
+                    "must be strings or AllOf/AnyOf expressions; got "
+                    f"{type(m).__name__}"
+                )
+        wrapped = TriggerOp(kind="all", members=tuple(value))
+        _validate_trigger_op(wrapped, workflow_name=workflow_name)
+        return wrapped
+    raise ValueError(
+        f"workflow {workflow_name!r}: triggered_by= must be a string, "
+        "list of strings, or AllOf/AnyOf expression; got "
+        f"{type(value).__name__}"
+    )
+
+
+def _validate_trigger_op(op: TriggerOp, *, workflow_name: str) -> None:
+    """Walk the expression tree to confirm every leaf is a string and
+    every internal node has the right shape. Raises ``ValueError`` on
+    structural problems."""
+    if op.kind not in ("all", "any"):
+        raise ValueError(
+            f"workflow {workflow_name!r}: TriggerOp.kind must be "
+            f"'all' or 'any', got {op.kind!r}"
+        )
+    if not op.members:
+        raise ValueError(
+            f"workflow {workflow_name!r}: TriggerOp.members cannot be empty"
+        )
+    seen_in_this_level: set[str] = set()
+    for m in op.members:
+        if isinstance(m, TriggerOp):
+            _validate_trigger_op(m, workflow_name=workflow_name)
+        elif isinstance(m, str):
+            if m in seen_in_this_level:
+                raise ValueError(
+                    f"workflow {workflow_name!r}: duplicate upstream "
+                    f"{m!r} in triggered_by tree at the same level"
+                )
+            seen_in_this_level.add(m)
+        else:
+            raise ValueError(
+                f"workflow {workflow_name!r}: triggered_by leaf must be "
+                f"a string, got {type(m).__name__}"
+            )
+
+
+# ---- Workflows (v0.7.0 trigger model) ----------------------------
+#
+# A Workflow is a user-named grouping of jobs. Its trigger is an
+# AND-conjunction of declared conditions:
+#
+#   triggered_by=[<job_or_workflow_name>, ...]   event prereqs
+#   schedule="cron"                              time prereq
+#   timezone="IANA"                              for the schedule
+#   on_message=<source>                          per-message firing
+#                                                (exclusive with the above)
+#
+# Implicit streaming: if any job in jobs= is a streaming pipeline, the
+# whole workflow is treated as streaming (no other trigger required or
+# allowed).
+#
+# Per-job DAG edges (``depends_on=[...]`` on @ematix.job) describe the
+# ordering of jobs WITHIN the workflow once it fires.
+#
+#   _WORKFLOWS[name]            = Workflow(...)
 #   _JOB_TO_WORKFLOW[job_name]  = workflow name (reverse lookup)
-#
-# Jobs without an explicit workflow assignment are exposed by the API
-# as workflow-of-one when listed.
 
 
 @dataclass(frozen=True)
 class Workflow:
-    """Named grouping of jobs + the DAG between them.
+    """Named grouping of jobs + trigger conditions.
 
-    ``jobs`` lists every member job by name (matching their @ematix.job
-    / @ematix.pipeline name= kwarg).
+    Trigger fields (AND-conjunction across the kwargs; ``triggered_by``
+    itself is a boolean expression tree of upstream names — see
+    :class:`TriggerOp`):
 
-    ``depends_on`` maps each downstream job to the list of upstreams it
-    waits on, all within this workflow. The same edges are mirrored into
-    the module-level ``_DEPENDS_ON`` table so the scheduler keeps working
-    unchanged.
+    - ``triggered_by`` — canonical expression tree over upstream names.
+      ``None`` means no event prereqs. Build with :func:`AllOf` and
+      :func:`AnyOf`; a flat list / single string passed to
+      ``register_workflow`` is auto-normalised to ``AllOf(...)``.
+    - ``schedule`` — cron expression whose next tick after the last
+      self-run must have reached.
+    - ``timezone`` — IANA tz for ``schedule`` interpretation.
+    - ``on_message`` — opaque message-source descriptor; per-message
+      firing. Exclusive with ``triggered_by`` / ``schedule``.
+
+    ``jobs`` lists every member job by name. The internal DAG between
+    jobs is declared by each member job's own ``depends_on=[...]``
+    kwarg and discovered at scheduler / UI time.
     """
 
     name: str
     jobs: tuple[str, ...]
-    depends_on: dict[str, tuple[str, ...]]
+    triggered_by: TriggerOp | None = None
+    schedule: str | None = None
+    timezone: str | None = None
+    on_message: Any = None
+
+    @property
+    def triggered_by_leaves(self) -> tuple[str, ...]:
+        """All upstream names in the trigger expression (flat).
+
+        Useful for cycle detection and registry-level lookups that
+        don't care about boolean structure. Returns ``()`` when no
+        ``triggered_by`` is set.
+        """
+        if self.triggered_by is None:
+            return ()
+        return self.triggered_by.leaves()
 
 
 _WORKFLOWS: dict[str, Workflow] = {}
@@ -429,14 +597,30 @@ def register_workflow(
     *,
     name: str,
     jobs: list[str],
-    depends_on: dict[str, list[str]] | None = None,
+    triggered_by: Any = None,
+    schedule: str | None = None,
+    timezone: str | None = None,
+    on_message: Any = None,
+    # v0.6.0 compat sentinel: raise a clear error if old callers still pass
+    # depends_on={...} (the v0.6.0 dict-keyed within-workflow DAG). The DAG
+    # now lives on each member job's ``depends_on=[...]``.
+    depends_on: Any = None,
 ) -> Workflow:
     """Register a workflow.
 
-    Jobs listed in ``jobs`` don't have to be registered yet — the
-    workflow stores names; resolution happens at scheduler / UI time.
-    But ``depends_on`` keys + values must all appear in ``jobs`` so
-    the graph stays self-contained.
+    ``triggered_by`` accepts a single name string, a list of names
+    (AND-conjoined), or an explicit :func:`AllOf` / :func:`AnyOf`
+    expression tree for composite shapes like ``A AND (B OR C)``.
+
+    Member-job ordering inside the workflow is declared on each job
+    (per-job ``depends_on=[...]`` kwarg). The workflow itself only
+    declares trigger conditions + the membership list.
+
+    Raises:
+        ValueError: name is empty, jobs is empty, duplicate jobs,
+            malformed trigger expression, conflicting triggers, no
+            triggers declared, or v0.6.0-shaped ``depends_on={...}``
+            is passed (the within-workflow DAG model changed in v0.7.0).
     """
     if not name:
         raise ValueError("workflow name must be non-empty")
@@ -445,24 +629,64 @@ def register_workflow(
     job_set = set(jobs)
     if len(job_set) != len(jobs):
         raise ValueError(f"workflow {name!r}: duplicate job names in jobs=")
-    deps_norm: dict[str, tuple[str, ...]] = {}
-    for downstream, upstreams in (depends_on or {}).items():
-        if downstream not in job_set:
-            raise ValueError(
-                f"workflow {name!r}: depends_on references {downstream!r} "
-                "which isn't listed in jobs="
-            )
-        ups_t: list[str] = []
-        for u in upstreams:
-            if u not in job_set:
-                raise ValueError(
-                    f"workflow {name!r}: depends_on[{downstream!r}] references "
-                    f"{u!r} which isn't listed in jobs="
-                )
-            ups_t.append(u)
-        deps_norm[downstream] = tuple(ups_t)
 
-    wf = Workflow(name=name, jobs=tuple(jobs), depends_on=deps_norm)
+    # Hard-break: v0.6.0 used a dict-keyed depends_on at the workflow level.
+    # In v0.7.0, the within-workflow DAG moves onto each member job
+    # (`@ematix.job(..., depends_on=[...])`). Surface a pointer instead of
+    # silently doing the wrong thing.
+    if depends_on is not None:
+        raise ValueError(
+            f"workflow {name!r}: depends_on= was removed in v0.7.0. The "
+            "within-workflow DAG is now declared on each job via "
+            "`@ematix.job(..., depends_on=[upstream_job, ...])`. The "
+            "workflow itself only declares triggers + the job list. See "
+            "docs/PHASE_SIGMA_W_TRIGGERS.md for the new model."
+        )
+
+    trigger_expr = _normalize_triggered_by(triggered_by, workflow_name=name)
+
+    # Mutual-exclusion checks.
+    has_message = on_message is not None
+    has_schedule_or_event = (trigger_expr is not None) or schedule is not None
+    if has_message and has_schedule_or_event:
+        raise ValueError(
+            f"workflow {name!r}: on_message= is exclusive with "
+            "triggered_by= and schedule= (per-message firing doesn't "
+            "compose with AND-conjunction trigger conditions)"
+        )
+    if timezone is not None and schedule is None:
+        raise ValueError(
+            f"workflow {name!r}: timezone= requires schedule= "
+            "(timezone only applies to a cron expression)"
+        )
+
+    # Implicit streaming detection requires looking up member jobs in
+    # the streaming registry. Import lazily to avoid a circular dep.
+    is_streaming = _workflow_is_streaming(jobs)
+    has_any_trigger = (
+        has_schedule_or_event or has_message or is_streaming
+    )
+    if not has_any_trigger:
+        raise ValueError(
+            f"workflow {name!r}: needs a trigger. Set at least one of "
+            "triggered_by=, schedule=, or on_message=, or include a "
+            "streaming pipeline in jobs= for implicit streaming."
+        )
+    if is_streaming and (has_schedule_or_event or has_message):
+        raise ValueError(
+            f"workflow {name!r}: streaming workflows (jobs include a "
+            "streaming pipeline) can't also declare triggered_by/"
+            "schedule/on_message — the streaming consumer drives execution."
+        )
+
+    wf = Workflow(
+        name=name,
+        jobs=tuple(jobs),
+        triggered_by=trigger_expr,
+        schedule=schedule,
+        timezone=timezone,
+        on_message=on_message,
+    )
     _WORKFLOWS[name] = wf
     for j in jobs:
         # Last writer wins if the same job is listed in two workflows.
@@ -477,12 +701,36 @@ def register_workflow(
                 stacklevel=2,
             )
         _JOB_TO_WORKFLOW[j] = name
-    # Mirror edges into the module-level depends-on table so the
-    # scheduler's freshness gating keeps working.
-    for downstream, upstreams in deps_norm.items():
-        if upstreams:
-            _DEPENDS_ON[downstream] = list(upstreams)
     return wf
+
+
+def _workflow_is_streaming(job_names: list[str]) -> bool:
+    """Return True if any member job is a streaming pipeline."""
+    try:
+        from ematix_flow.streaming import _STREAMING_PIPELINES
+    except Exception:
+        return False
+    return any(n in _STREAMING_PIPELINES for n in job_names)
+
+
+def workflow_dag_edges(workflow_name: str) -> list[tuple[str, str]]:
+    """Return the (upstream, downstream) edges INSIDE a workflow.
+
+    Edges are derived from each member job's own ``depends_on=[...]``
+    list, filtered to references that are also members of this workflow.
+    Cross-workflow ``depends_on`` references are skipped here — those
+    are workflow-level triggers, not internal DAG edges.
+    """
+    wf = _WORKFLOWS.get(workflow_name)
+    if wf is None:
+        return []
+    member_set = set(wf.jobs)
+    edges: list[tuple[str, str]] = []
+    for downstream in wf.jobs:
+        for upstream in _DEPENDS_ON.get(downstream, []) or []:
+            if upstream in member_set:
+                edges.append((upstream, downstream))
+    return edges
 
 
 # Phase Ω.2 — declarative retry policy + in-process attempt state.

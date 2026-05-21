@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import logging
 import sys
+from datetime import UTC
 from importlib import resources
 from pathlib import Path
 from typing import Any
@@ -478,17 +479,232 @@ def create_app(
         return {"nodes": nodes, "edges": edges}
 
     # ---- Workflows: named groupings of jobs ---------------------------
+    def _last_success_time(name: str):
+        """Most recent succeeded run start time for ``name``, or None."""
+        if history is None:
+            return None
+        try:
+            runs, _ = history.list_runs(pipeline=name, status="succeeded", limit=1)
+        except Exception:
+            return None
+        if not runs:
+            return None
+        # list_runs returns RunRecord with started_at as datetime or ISO str.
+        st = runs[0].started_at
+        if isinstance(st, str):
+            try:
+                from datetime import datetime as _dt
+                # Accept both Z-suffix and +00:00.
+                return _dt.fromisoformat(st.replace("Z", "+00:00"))
+            except Exception:
+                return None
+        return st
+
+    def _latest_terminal_run(name: str):
+        """Most recent terminal (succeeded/failed/cancelled) run for ``name``."""
+        if history is None:
+            return None
+        try:
+            runs, _ = history.list_runs(pipeline=name, limit=10)
+        except Exception:
+            return None
+        for r in runs:
+            if r.status in ("succeeded", "failed", "cancelled"):
+                return r
+        return None
+
+    def _eval_trigger_op(
+        op: Any,
+        *,
+        last_self_success,
+    ) -> dict[str, Any]:
+        """Recursively evaluate a TriggerOp expression tree against
+        the workflow's last successful run.
+
+        Returns a JSON-serialisable dict mirroring the tree structure
+        and carrying a ``state`` (ready/pending/failed) at every node.
+
+        Leaf state semantics:
+            - ready  : upstream has a successful run since last_self_success
+            - failed : upstream's most recent terminal run since
+                       last_self_success was a failure
+            - pending: otherwise (running, never run, etc.)
+
+        Internal-node state semantics:
+            - all : ready if every child ready; failed if any failed and
+                    none pending; otherwise pending
+            - any : ready if any child ready; failed if every child
+                    failed; otherwise pending
+        """
+        from ematix_flow.pipeline import TriggerOp
+
+        if isinstance(op, str):
+            # Leaf — compute event state.
+            last_up_success = _last_success_time(op)
+            latest = _latest_terminal_run(op)
+            state = "pending"
+            if last_up_success is not None and (
+                last_self_success is None or last_up_success > last_self_success
+            ):
+                state = "ready"
+            if (
+                state == "pending"
+                and latest is not None
+                and latest.status == "failed"
+                and (
+                    last_up_success is None
+                    or (
+                        last_self_success is not None
+                        and last_up_success <= last_self_success
+                    )
+                )
+            ):
+                state = "failed"
+            return {"kind": "leaf", "name": op, "state": state}
+
+        if isinstance(op, TriggerOp):
+            children = [
+                _eval_trigger_op(m, last_self_success=last_self_success)
+                for m in op.members
+            ]
+            child_states = [c["state"] for c in children]
+            if op.kind == "all":
+                if all(s == "ready" for s in child_states):
+                    state = "ready"
+                elif any(s == "failed" for s in child_states) and "pending" not in child_states:
+                    state = "failed"
+                else:
+                    state = "pending"
+            else:  # "any"
+                if any(s == "ready" for s in child_states):
+                    state = "ready"
+                elif all(s == "failed" for s in child_states):
+                    state = "failed"
+                else:
+                    state = "pending"
+            return {"kind": op.kind, "members": children, "state": state}
+
+        # Shouldn't happen if normalisation worked, but be defensive.
+        return {"kind": "leaf", "name": repr(op), "state": "pending"}
+
+    def _compute_triggers(
+        *,
+        triggered_by: Any,
+        schedule: str | None,
+        timezone_name: str | None,
+        on_message_repr: str | None,
+        last_self_success,
+    ) -> list[dict[str, Any]]:
+        """Return a per-condition list of trigger dicts with state +
+        display info. ``last_self_success`` is this workflow's own
+        most-recent successful run start time, or None if never run.
+
+        Each entry shape:
+          {
+            "kind": "schedule" | "after" | "on_message",
+            "label": "human-readable display",
+            "state": "ready" | "pending" | "failed",
+            ... kind-specific fields ...
+          }
+        """
+        out: list[dict[str, Any]] = []
+        from datetime import datetime as _dt
+
+        now = _dt.now(UTC)
+
+        # Schedule trigger
+        if schedule:
+            from ematix_flow.pipeline import forecast_next_run
+            anchor = last_self_success if last_self_success is not None else None
+            try:
+                next_tick = forecast_next_run(
+                    schedule,
+                    now=anchor or now,
+                    timezone=timezone_name,
+                )
+            except Exception:
+                next_tick = None
+            if next_tick is not None:
+                state = "ready" if now >= next_tick else "pending"
+                # Format the tick in the workflow's tz for the label.
+                label = _format_tick(next_tick, timezone_name, now)
+            else:
+                state = "pending"
+                label = schedule
+            out.append({
+                "kind": "schedule",
+                "cron": schedule,
+                "timezone": timezone_name,
+                "next_at": (next_tick.isoformat() if next_tick is not None else None),
+                "state": state,
+                "label": label,
+            })
+
+        # Upstream event triggers. ``triggered_by`` is now a TriggerOp
+        # expression tree (or None). We append a single "after_expr"
+        # entry whose nested ``expr`` field carries the boolean tree
+        # with per-node state; the UI renders the tree with AND/OR
+        # grouping and parentheses.
+        if triggered_by is not None:
+            expr_eval = _eval_trigger_op(
+                triggered_by, last_self_success=last_self_success
+            )
+            out.append({
+                "kind": "after_expr",
+                "state": expr_eval["state"],
+                "expr": expr_eval,
+            })
+
+        # on_message: pending (firing is per-message; no AND eval at tick time)
+        if on_message_repr:
+            out.append({
+                "kind": "on_message",
+                "source": on_message_repr,
+                "state": "pending",
+                "label": on_message_repr,
+            })
+
+        return out
+
+    def _format_tick(tick_utc, timezone_name: str | None, now_utc) -> str:
+        """Format a UTC datetime in the given IANA tz for display.
+
+        Returns just ``HH:MM TZ`` when the tick is today in that tz, or
+        ``YYYY-MM-DD HH:MM TZ`` otherwise.
+        """
+        try:
+            from zoneinfo import ZoneInfo
+        except ImportError:
+            ZoneInfo = None  # type: ignore[assignment]
+        if timezone_name and ZoneInfo is not None:
+            try:
+                tz = ZoneInfo(timezone_name)
+                local_tick = tick_utc.astimezone(tz)
+                local_now = now_utc.astimezone(tz)
+                short_tz = local_tick.strftime("%Z") or timezone_name
+                if local_tick.date() == local_now.date():
+                    return f"{local_tick.strftime('%H:%M')} {short_tz}"
+                return f"{local_tick.strftime('%Y-%m-%d %H:%M')} {short_tz}"
+            except Exception:
+                pass
+        # Fallback: UTC.
+        if tick_utc.date() == now_utc.date():
+            return f"{tick_utc.strftime('%H:%M')} UTC"
+        return f"{tick_utc.strftime('%Y-%m-%d %H:%M')} UTC"
+
     @app.get("/api/workflows")
     def list_workflows() -> dict[str, Any]:  # type: ignore[unused-function]
-        """Each workflow is a user-named group of jobs + the DAG between
-        them. Jobs without an explicit workflow show up as a synthetic
-        workflow-of-one keyed by their own name."""
+        """Each workflow is a user-named group of jobs + the trigger
+        conditions that fire it. Jobs without an explicit workflow show up
+        as a synthetic workflow-of-one keyed by their own name."""
         try:
             from ematix_flow.pipeline import (
                 _DEPENDS_ON,
                 _JOB_TO_WORKFLOW,
                 _REGISTRY,
                 _WORKFLOWS,
+                _workflow_is_streaming,
+                workflow_dag_edges,
             )
         except Exception:
             return {"workflows": []}
@@ -503,40 +719,87 @@ def create_app(
 
         all_jobs = sorted(_REGISTRY.keys())
         result: list[dict[str, Any]] = []
+
         # Declared workflows first.
         for wf_name, wf in sorted(_WORKFLOWS.items()):
-            edges = []
-            for downstream, upstreams in wf.depends_on.items():
-                for u in upstreams:
-                    edges.append({"from": u, "to": downstream})
+            # Edges come from each member job's own depends_on, filtered to
+            # references inside this workflow.
+            edges = [
+                {"from": u, "to": d}
+                for (u, d) in workflow_dag_edges(wf_name)
+            ]
+            # Streaming workflow if any member job is a streaming pipeline.
+            is_streaming = _workflow_is_streaming(list(wf.jobs))
+            kind = "streaming" if is_streaming else "declared"
+            on_msg_repr = (
+                repr(wf.on_message) if wf.on_message is not None else None
+            )
+            last_self = _last_success_time(wf_name)
+            triggers = (
+                []
+                if is_streaming
+                else _compute_triggers(
+                    triggered_by=wf.triggered_by,
+                    schedule=wf.schedule,
+                    timezone_name=wf.timezone,
+                    on_message_repr=on_msg_repr,
+                    last_self_success=last_self,
+                )
+            )
+            # Legacy flat list (leaf names) for any UI/consumer that
+            # doesn't yet understand the expression tree.
+            leaf_names = list(wf.triggered_by_leaves)
             result.append(
                 {
                     "name": wf_name,
-                    "kind": "declared",
+                    "kind": kind,
                     "jobs": list(wf.jobs),
                     "edges": edges,
+                    "triggered_by": leaf_names,
+                    "schedule": wf.schedule,
+                    "timezone": wf.timezone,
+                    "on_message": on_msg_repr,
+                    "triggers": triggers,
                 }
             )
-        # Synthetic workflow-of-one for every unassigned batch job.
+
+        # Synthetic workflow-of-one for every unassigned batch job. Carry
+        # the job's own per-job schedule/depends_on through as the
+        # standalone trigger. Wrap upstream-name list as an AllOf tree
+        # so the UI renders consistently.
+        from ematix_flow.pipeline import AllOf as _AllOf
         for job_name in all_jobs:
             if job_name in _JOB_TO_WORKFLOW:
                 continue
-            # Even unassigned jobs can have depends_on (legacy decorator
-            # kwarg). Surface those edges as an "ad-hoc" workflow-of-N.
             ups = _DEPENDS_ON.get(job_name) or []
             edges = [{"from": u, "to": job_name} for u in ups]
+            sp = _REGISTRY.get(job_name)
+            sched = getattr(sp, "schedule", None)
+            tz = getattr(sp, "timezone", None)
+            last_self = _last_success_time(job_name)
+            trigger_expr = _AllOf(*ups) if ups else None
+            triggers = _compute_triggers(
+                triggered_by=trigger_expr,
+                schedule=sched,
+                timezone_name=tz,
+                on_message_repr=None,
+                last_self_success=last_self,
+            )
             result.append(
                 {
                     "name": job_name,
                     "kind": "single",
                     "jobs": [job_name],
                     "edges": edges,
+                    "triggered_by": list(ups),
+                    "schedule": sched,
+                    "timezone": tz,
+                    "on_message": None,
+                    "triggers": triggers,
                 }
             )
-        # Streaming pipelines that aren't part of a declared workflow
-        # surface as single-kind workflow-of-one too. Marked as
-        # "streaming" so the UI can render the LIVE STREAMING pill in
-        # the card header instead of the next-run forecast.
+
+        # Streaming pipelines that aren't part of a declared workflow.
         for name in streaming_names:
             if name in _JOB_TO_WORKFLOW:
                 continue
@@ -546,6 +809,11 @@ def create_app(
                     "kind": "streaming",
                     "jobs": [name],
                     "edges": [],
+                    "triggered_by": [],
+                    "schedule": None,
+                    "timezone": None,
+                    "on_message": None,
+                    "triggers": [],
                 }
             )
         return {"workflows": result}
@@ -593,6 +861,139 @@ def create_app(
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         return {"new_run_id": new_id}
+
+    def _enqueue_run_now(
+        *,
+        pipeline_name: str,
+        kind: str = "batch",
+        extras: dict[str, Any] | None = None,
+    ) -> str:
+        """Write a fresh ``status="requested"`` record for ``pipeline_name``
+        that the scheduler / run-due path picks up on its next tick.
+
+        Used by the Workflows/Jobs tabs' "Run now" buttons. Returns the
+        new run_id.
+        """
+        import uuid
+        from datetime import datetime
+
+        from ematix_flow.run_log.history import RunRecord
+
+        new_id = f"run-now-{pipeline_name}-{uuid.uuid4().hex[:12]}"
+        base_extras: dict[str, Any] = {"source": "run_now"}
+        if extras:
+            base_extras.update(extras)
+        history.record_run_record(
+            RunRecord(
+                run_id=new_id,
+                pipeline=pipeline_name,
+                status="requested",
+                started_at=datetime.now(UTC),
+                finished_at=None,
+                attempt=1,
+                kind=kind,
+                extras=base_extras,
+            )
+        )
+        return new_id
+
+    @app.post("/api/workflows/{name}/run-now")
+    def post_workflow_run_now(  # type: ignore[unused-function]
+        name: str,
+        body: dict[str, Any] = Body(default_factory=dict),  # noqa: B008
+    ) -> dict[str, Any]:
+        """Enqueue an immediate run of the named workflow. Ignores
+        trigger gates (cron not yet reached, upstream events not
+        satisfied).
+
+        Optional body fields:
+
+        - ``jobs``: list of member job names to include in this run.
+          Defaults to all the workflow's member jobs. Selected names
+          must be a subset of the workflow's ``jobs=`` list.
+        """
+        _require_history()
+        assert history is not None
+        try:
+            from ematix_flow.pipeline import _REGISTRY, _WORKFLOWS
+        except Exception as e:
+            raise HTTPException(
+                status_code=500, detail="pipeline registry unavailable"
+            ) from e
+        wf = _WORKFLOWS.get(name)
+        if wf is None:
+            # Allow a workflow-of-one (standalone job/streaming) by name too,
+            # so the "Run now" button works uniformly on every card.
+            if name not in _REGISTRY:
+                try:
+                    from ematix_flow.streaming import _STREAMING_PIPELINES
+                    if name not in _STREAMING_PIPELINES:
+                        raise HTTPException(status_code=404, detail=f"unknown workflow {name!r}")
+                except ImportError as e:
+                    raise HTTPException(
+                        status_code=404, detail=f"unknown workflow {name!r}"
+                    ) from e
+            selected = [name]
+            all_jobs = (name,)
+        else:
+            all_jobs = wf.jobs
+            requested = body.get("jobs")
+            if requested is None:
+                selected = list(all_jobs)
+            else:
+                if not isinstance(requested, list) or not all(
+                    isinstance(j, str) for j in requested
+                ):
+                    raise HTTPException(
+                        status_code=400, detail="jobs= must be a list of strings"
+                    )
+                bad = [j for j in requested if j not in all_jobs]
+                if bad:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"jobs= contains names not in workflow {name!r}: {bad}",
+                    )
+                if not requested:
+                    raise HTTPException(status_code=400, detail="jobs= cannot be empty")
+                selected = requested
+        new_id = _enqueue_run_now(
+            pipeline_name=name,
+            kind="batch",
+            extras={"selected_jobs": list(selected)},
+        )
+        return {"new_run_id": new_id, "selected_jobs": list(selected)}
+
+    @app.post("/api/jobs/{name}/run-now")
+    def post_job_run_now(  # type: ignore[unused-function]
+        name: str,
+        body: dict[str, Any] = Body(default_factory=dict),  # noqa: B008
+    ) -> dict[str, Any]:
+        """Enqueue an immediate run of the named job.
+
+        Optional body fields:
+
+        - ``cascade_downstream``: when ``true``, after this job
+          succeeds, any job that depends on it (within the same
+          workflow, or via legacy per-job depends_on) is also
+          enqueued. Default ``false`` — runs just this job.
+        """
+        _require_history()
+        assert history is not None
+        try:
+            from ematix_flow.pipeline import _REGISTRY
+        except Exception as e:
+            raise HTTPException(
+                status_code=500, detail="pipeline registry unavailable"
+            ) from e
+        if name not in _REGISTRY:
+            raise HTTPException(status_code=404, detail=f"unknown job {name!r}")
+        cascade = bool(body.get("cascade_downstream", False))
+        new_id = _enqueue_run_now(
+            pipeline_name=name,
+            kind="batch",
+            extras={"cascade_downstream": cascade},
+        )
+        return {"new_run_id": new_id, "cascade_downstream": cascade}
 
     @app.post("/api/runs/{run_id}/pause")
     def post_pause(run_id: str) -> dict[str, Any]:  # type: ignore[unused-function]

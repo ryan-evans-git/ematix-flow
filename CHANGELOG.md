@@ -7,7 +7,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-(no entries yet — anything landing on `main` after v0.6.1 goes here)
+(no entries yet — anything landing on `main` after v0.7.0 goes here)
+
+## [0.7.0] — 2026-05-21
+
+Workflow trigger model. The previous v0.6.0 workflow shape — name + jobs
++ centralised `depends_on={dict}` — is replaced by a richer trigger
+surface on the workflow plus per-job depends_on for the within-workflow
+DAG. **Hard break, no backwards compat** (we're alpha; nothing shipped
+externally depends on the v0.6.0 shape).
+
+### Changed (breaking from v0.6.0)
+
+- **`ematix.workflow(...)`** now takes trigger kwargs instead of a
+  centralised DAG dict:
+  - `triggered_by=[<workflow_or_job_name>, ...]` — event prereqs that
+    must have succeeded since this workflow last succeeded.
+  - `schedule="cron"` — cron trigger; next tick must be reached.
+  - `timezone="IANA"` — cron interpretation timezone.
+  - `on_message=<source>` — per-message firing (mutually exclusive
+    with `triggered_by`/`schedule`).
+  - `jobs=[name, ...]` — member list (unchanged).
+  All declared trigger conditions are AND-conjoined. At least one
+  required unless the workflow contains a streaming pipeline (implicit
+  streaming).
+- The within-workflow DAG is now declared on each job via
+  `@ematix.job(..., depends_on=[upstream_job, ...])`. The workflow
+  itself no longer accepts a `depends_on=` dict — passing one raises
+  `ValueError` with a pointer to the new model. Existing per-job
+  `depends_on` from earlier versions keeps working unchanged.
+- Per-job `schedule` / `triggered_by` on jobs that are listed in a
+  workflow's `jobs=` are ignored (a `DeprecationWarning` is emitted at
+  registration time). The workflow trigger supersedes them.
+
+### Added
+
+- `workflow_dag_edges(name)` helper that returns the within-workflow
+  (upstream, downstream) edges by walking each member job's
+  `depends_on` and filtering to inside-the-workflow references.
+- `_workflow_is_streaming(jobs)` helper used by registration validation
+  and the API to detect implicit streaming workflows.
+- `/api/workflows` payload now carries `triggered_by`, `schedule`,
+  `timezone`, `on_message` per workflow, and the edges field is derived
+  from per-job `depends_on`.
+- Web UI Workflows card renders a trigger summary line ("After: a, b ·
+  Schedule: 0 21 * * * America/New_York") under the header.
+
+### Migration
+
+- Replace `ematix.workflow(name=..., jobs=[...], depends_on={d: [u]})`
+  with `ematix.workflow(name=..., jobs=[...], schedule=..., or triggered_by=...)`
+  and move the DAG edges onto each job's decorator:
+  `@ematix.job(name="d", depends_on=["u"], ...)`. The
+  `register_workflow` validator raises with a pointer at the new model
+  if it sees the old shape.
 
 ## [0.6.1] — 2026-05-21
 

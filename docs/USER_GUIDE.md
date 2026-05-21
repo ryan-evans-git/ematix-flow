@@ -153,74 +153,156 @@ selects which one.
 
 ---
 
-## Workflows + Jobs (v0.6.0)
+## Workflows + Jobs (v0.7.0)
 
 `ematix-flow` has two top-level concepts:
 
-- **Job** — one unit of work. Declared with `@ematix.job(...)` (or
-  the older name `@ematix.pipeline(...)` — both resolve to the same
-  decorator). One target, one schedule, one retry policy.
-- **Workflow** — a user-named group of jobs plus the DAG between
-  them. Declared with `ematix.workflow(name=..., jobs=[...],
-  depends_on={...})`. The DAG lives on the workflow, not on the
-  individual jobs.
+- **Job** — one unit of work. Declared with `@ematix.job(...)`
+  (`@ematix.pipeline` remains as an alias). One target, one mode,
+  one retry policy. Inside a workflow, a job's DAG position is
+  declared by its `depends_on=[upstream_job, ...]` kwarg.
+- **Workflow** — a named group of jobs plus the **trigger conditions**
+  that fire it. The DAG between jobs is read from each member job's
+  `depends_on=`. The workflow's own kwargs answer "what causes this
+  workflow to start running?"
+
+### Trigger surface
+
+All trigger kwargs on a workflow are AND-conjoined (every one set must
+be satisfied since the workflow last succeeded):
+
+- `triggered_by=<expression>` — event prereqs that must have
+  succeeded since this workflow last succeeded. Accepts:
+  - a single name string,
+  - a list of names (AND-conjoined),
+  - or an explicit boolean expression tree built with
+    `AllOf(...)` / `AnyOf(...)` for OR / nested composition.
+- `schedule="cron"` + optional `timezone="IANA"` — cron tick must reach.
+- `on_message=<KafkaConnection.topic("...")>` — per-message firing
+  (mutually exclusive with the above).
+
+At least one trigger is required, unless the workflow contains a
+streaming pipeline (it's then implicitly streaming and the consumer
+drives execution).
+
+#### Boolean composition (AllOf / AnyOf)
+
+For trees like *A AND (B OR C)*, import the combinators from the
+top-level package:
+
+```python
+from ematix_flow import ematix, AllOf, AnyOf
+
+ematix.workflow(
+    name="combined_report",
+    triggered_by=AllOf("workflow_A", AnyOf("workflow_B", "workflow_C")),
+    schedule="0 21 * * *",
+    timezone="America/New_York",
+    jobs=[...],
+)
+```
+
+Trees nest arbitrarily. `AllOf("A", AnyOf("B", AllOf("C", "D")))` is
+*A AND (B OR (C AND D))*. Per-node state semantics: a leaf is
+**ready** if its upstream has succeeded since this workflow's own last
+success, **failed** if the upstream's most recent terminal run since
+then was a failure, **pending** otherwise. An `AllOf` is ready iff
+every child is ready; an `AnyOf` is ready iff any child is ready.
 
 ```python
 from ematix_flow import ematix
 
-@ematix.job(name="extract_orders", target=OrdersExtracted, ...)
+@ematix.job(
+    name="extract_orders",
+    target=OrdersExtracted, target_connection="warehouse",
+    mode="merge", keys=("order_id",),
+)
 def extract_orders(conn): return "SELECT ..."
 
-@ematix.job(name="enrich_orders", target=OrdersEnriched, ...)
+@ematix.job(
+    name="enrich_orders",
+    target=OrdersEnriched, target_connection="warehouse",
+    mode="merge", keys=("order_id",),
+    depends_on=["extract_orders"],
+)
 def enrich_orders(conn): return "SELECT ..."
 
-@ematix.job(name="aggregate_orders", target=OrdersByCustomer, ...)
+@ematix.job(
+    name="aggregate_orders",
+    target=OrdersByCustomer, target_connection="warehouse",
+    mode="merge", keys=("customer_id",),
+    depends_on=["extract_orders"],
+)
 def aggregate_orders(conn): return "SELECT ..."
 
-@ematix.job(name="report_orders", target=OrdersReport, ...)
+@ematix.job(
+    name="report_orders",
+    target=OrdersReport, target_connection="warehouse",
+    mode="merge", keys=("customer_id",),
+    depends_on=["enrich_orders", "aggregate_orders"],
+)
 def report_orders(conn): return "SELECT ..."
 
 ematix.workflow(
-    name="orders_etl",
+    name="evening_combined_report",
+    triggered_by=["workflow_A", "workflow_B"],
+    schedule="0 21 * * *",
+    timezone="America/New_York",
     jobs=[
         "extract_orders",
         "enrich_orders",
         "aggregate_orders",
         "report_orders",
     ],
-    depends_on={
-        "enrich_orders":    ["extract_orders"],
-        "aggregate_orders": ["extract_orders"],
-        "report_orders":    ["enrich_orders", "aggregate_orders"],
-    },
 )
 ```
 
-Reading: `enrich_orders` waits on `extract_orders`; `aggregate_orders`
-also waits on `extract_orders` (so the two run in parallel after
-extract finishes); `report_orders` waits on **both** `enrich_orders`
-and `aggregate_orders`. The scheduler honors these edges via
-upstream-freshness gating per its existing semantics.
+The workflow above fires when all three are true since its last
+successful run: `workflow_A` succeeded, `workflow_B` succeeded, and
+21:00 America/New_York has been reached. If the workflows finish at
+22:30 (B was late), it fires at 22:30 — immediately, since all three
+conditions are now satisfied.
+
+### Firing semantics
+
+At each scheduler tick:
+
+1. Look up `last_successful_run` for this workflow.
+2. For each `triggered_by` upstream: has its last success time exceeded
+   `last_successful_run` of self?
+3. For `schedule`: has the next cron tick *after* `last_successful_run`
+   of self reached?
+4. If every declared condition is true → fire. On success, update
+   `last_successful_run`.
+
+### Job-level triggers (standalone jobs)
+
+Jobs that are not members of any workflow keep their own
+`schedule=` / `triggered_by=` / `on_message=` and act as workflow-of-one
+themselves on the UI. Inside a workflow, those per-job triggers are
+ignored (a warning is emitted at registration).
 
 ### In the Web UI
 
-- **Workflows tab** — one card per workflow with member jobs laid
-  out as an inline flowchart with arrows. `kind: "declared"` for
-  workflows you registered; `kind: "single"` for jobs that aren't
-  part of any workflow (each shown as a workflow-of-one).
-- **Jobs tab** — flat list of every individual job, with filters
-  and sort. Same last-10-execution strip and streaming-throughput
-  footer as before.
-- **Runs tab** — execution history; click a column header to sort.
-- **DAG tab** — full cross-workflow graph as an SVG flowchart.
-  `#/dag/<job-name>` focuses the subgraph on that job.
+- **Workflows tab** — one card per workflow with the trigger summary
+  ("After: a, b · Schedule: 0 21 * * * America/New_York") and the
+  member-job flowchart inline.
+- **Jobs tab** — flat list of every individual job, with filters and
+  sort.
+- **Runs tab** — execution history; sortable column headers.
+- **DAG tab** — full cross-workflow graph as an SVG flowchart;
+  `#/dag/<job-name>` focuses the subgraph on a single job.
 
-### Migration from per-job depends_on
+### Migration from v0.6.0
 
-`@ematix.pipeline(depends_on=[...])` from earlier versions still
-works — those jobs surface as single-kind workflows in the UI. To
-group them into a named workflow, drop the per-job `depends_on=` and
-add a single `ematix.workflow(...)` call.
+The v0.6.0 shape `ematix.workflow(name=..., jobs=..., depends_on={dict})`
+is removed. To migrate:
+
+1. Drop the workflow-level `depends_on=` dict.
+2. Add a workflow trigger (`schedule=`, `triggered_by=`, or
+   `on_message=`).
+3. Move each edge `{downstream: [upstream]}` onto the downstream
+   job's decorator as `depends_on=[upstream]`.
 
 ---
 

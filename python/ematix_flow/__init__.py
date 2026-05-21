@@ -26,6 +26,11 @@ from ematix_flow.connections import (
 )
 from ematix_flow.decorators import ematix
 from ematix_flow.markers import natural_key, nullable, pk
+from ematix_flow.pipeline import (
+    AllOf,
+    AnyOf,
+    TriggerOp,
+)
 from ematix_flow.streaming import (
     CDC,
     Aggregation,
@@ -71,6 +76,8 @@ except ImportError:
 __all__ = [
     "CDC",
     "Aggregation",
+    "AllOf",
+    "AnyOf",
     "Connection",
     "DeltaLocalConnection",
     "DeltaS3Connection",
@@ -92,6 +99,7 @@ __all__ = [
     "Source",
     "StateStore",
     "Target",
+    "TriggerOp",
     "Watermark",
     "Window",
     "__version__",
