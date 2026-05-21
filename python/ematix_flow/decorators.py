@@ -1173,7 +1173,10 @@ class _EmatixNamespace:
         *,
         target: type[ManagedTable] | None = None,
         targets: list[Target] | None = None,
-        schedule: str | None,
+        # v0.7.0: schedule is now optional on @ematix.job, since workflow
+        # members get their fire timing from the parent workflow. Standalone
+        # jobs (not in any workflow) still need it.
+        schedule: str | None = None,
         mode: str | None = None,
         name: str | None = None,
         source_connection: str | None = None,

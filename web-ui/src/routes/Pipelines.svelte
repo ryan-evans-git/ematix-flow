@@ -1,6 +1,39 @@
 <script>
   import { onMount } from "svelte";
-  import { listPipelines } from "../lib/api.js";
+  import { listPipelines, runJobNow } from "../lib/api.js";
+
+  // Run-now modal state — per-job Run now with optional cascade.
+  let runNowFor = null;
+  let runNowCascade = false;
+  let runNowBusy = false;
+  let runNowError = null;
+  let runNowOk = null;
+
+  function openRunNow(name) {
+    runNowFor = name;
+    runNowCascade = false;
+    runNowError = null;
+    runNowOk = null;
+  }
+  function closeRunNow() {
+    runNowFor = null;
+    runNowError = null;
+    runNowOk = null;
+  }
+  async function submitRunNow() {
+    if (!runNowFor) return;
+    runNowBusy = true;
+    runNowError = null;
+    try {
+      const r = await runJobNow(runNowFor, { cascadeDownstream: runNowCascade });
+      runNowOk = r.new_run_id || "queued";
+      setTimeout(closeRunNow, 1200);
+    } catch (e) {
+      runNowError = e.message;
+    } finally {
+      runNowBusy = false;
+    }
+  }
 
   let pipelines = [];
   let loading = true;
@@ -277,6 +310,12 @@
           <span><strong>Median duration:</strong> {fmtDuration(p.median_duration_ms)}</span>
         {/if}
         <span>
+          {#if p.kind !== "streaming"}
+            <button class="action" on:click|stopPropagation={() => openRunNow(p.name)} title="Run this job now">
+              ▶ Run now
+            </button>
+            &nbsp;
+          {/if}
           <a class="link" href={`#/dag/${encodeURIComponent(p.name)}`}>dag →</a>
           &nbsp;
           <a class="link" href="#/runs?pipeline={encodeURIComponent(p.name)}">all jobs →</a>
@@ -285,3 +324,57 @@
     </div>
   {/each}
 {/if}
+
+{#if runNowFor}
+  <div class="modal-bg" on:click={closeRunNow} role="presentation">
+    <div class="modal" on:click|stopPropagation role="dialog" aria-label="Run job now">
+      <h3 class="modal-title">Run <span class="mono">{runNowFor}</span> now</h3>
+      <p class="dim" style="font-size: 0.85em; margin-bottom: 0.6em;">
+        Fires the job once, ignoring any trigger gates.
+      </p>
+      <label style="display: flex; align-items: center; gap: 0.5em; padding: 0.5em 0;
+                    border-top: 1px dashed var(--color-border, #444);
+                    border-bottom: 1px dashed var(--color-border, #444);">
+        <input type="checkbox" bind:checked={runNowCascade} />
+        <span>
+          <strong>Trigger downstream dependents</strong>
+          <span class="dim" style="display: block; font-size: 0.78em;">
+            When this job succeeds, also enqueue every job that has this one
+            in its <code>depends_on</code>. Off by default — just this job.
+          </span>
+        </span>
+      </label>
+      <div style="display: flex; gap: 0.5em; align-items: center; margin-top: 0.7em;">
+        {#if runNowError}
+          <span style="color: var(--color-alarm, #b85040); font-size: 0.85em;">{runNowError}</span>
+        {/if}
+        {#if runNowOk}
+          <span style="color: var(--color-phosphor-300, #8fd28f); font-size: 0.85em;">queued: {runNowOk}</span>
+        {/if}
+        <span style="flex: 1;"></span>
+        <button class="action" on:click={closeRunNow} disabled={runNowBusy}>Cancel</button>
+        <button class="action" on:click={submitRunNow} disabled={runNowBusy}>
+          {runNowBusy ? "..." : (runNowCascade ? "Run + cascade" : "Run")}
+        </button>
+      </div>
+    </div>
+  </div>
+{/if}
+
+<style>
+  .modal-bg {
+    position: fixed; inset: 0;
+    background: rgba(0, 0, 0, 0.65);
+    z-index: 50;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .modal {
+    background: var(--color-vault-900, #0a1410);
+    border: 1px solid var(--color-phosphor-500, #4eb84e);
+    border-radius: 4px;
+    padding: 1.2em 1.4em;
+    min-width: 360px;
+    max-width: 520px;
+  }
+  .modal-title { margin: 0 0 0.4em 0; }
+</style>

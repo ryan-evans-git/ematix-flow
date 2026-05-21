@@ -1,12 +1,53 @@
 <script>
   import { onMount } from "svelte";
-  import { listWorkflows, listPipelines } from "../lib/api.js";
+  import { listWorkflows, listPipelines, runWorkflowNow } from "../lib/api.js";
   import DagFlowchart from "../lib/DagFlowchart.svelte";
 
   let workflows = [];
   let jobMap = {};
   let loading = true;
   let error = null;
+
+  // Run-now modal state
+  let runNowFor = null;           // workflow object currently being run, or null
+  let runNowSelected = new Set(); // selected job names
+  let runNowBusy = false;
+  let runNowError = null;
+  let runNowOk = null;
+
+  function openRunNow(w) {
+    runNowFor = w;
+    runNowSelected = new Set(w.jobs);  // default: all
+    runNowError = null;
+    runNowOk = null;
+  }
+  function closeRunNow() {
+    runNowFor = null;
+    runNowError = null;
+    runNowOk = null;
+  }
+  function toggleJob(j) {
+    if (runNowSelected.has(j)) runNowSelected.delete(j);
+    else runNowSelected.add(j);
+    runNowSelected = new Set(runNowSelected);  // trigger reactivity
+  }
+  async function submitRunNow() {
+    if (!runNowFor || runNowSelected.size === 0) return;
+    runNowBusy = true;
+    runNowError = null;
+    try {
+      const r = await runWorkflowNow(runNowFor.name, {
+        jobs: [...runNowSelected],
+      });
+      runNowOk = r.new_run_id || "queued";
+      // Auto-close after a moment.
+      setTimeout(closeRunNow, 1200);
+    } catch (e) {
+      runNowError = e.message;
+    } finally {
+      runNowBusy = false;
+    }
+  }
 
   let nameFilter = "";
   let kindFilter = "";
@@ -169,25 +210,39 @@
         </span>
       </div>
 
-      {#if w.kind !== "streaming"}
-        {#if (w.triggered_by && w.triggered_by.length > 0) || w.schedule || w.on_message}
-          <div class="wf-trigger">
-            <span class="dim">Trigger:</span>
-            {#if w.triggered_by && w.triggered_by.length > 0}
-              <strong>After:</strong>
-              <span class="mono">{w.triggered_by.join(", ")}</span>
-            {/if}
-            {#if w.schedule}
-              {#if w.triggered_by && w.triggered_by.length > 0}<span class="sep"> · </span>{/if}
-              <strong>Schedule:</strong>
-              <span class="mono">{w.schedule}{w.timezone ? ' ' + w.timezone : ''}</span>
-            {/if}
-            {#if w.on_message}
-              <strong>On message:</strong>
-              <span class="mono">{w.on_message}</span>
-            {/if}
-          </div>
-        {/if}
+      {#if w.kind !== "streaming" && w.triggers && w.triggers.length > 0}
+        <div class="wf-trigger">
+          <span class="wf-trigger-label">Trigger:</span>
+          {#each w.triggers as t}
+            <span class="wf-trig wf-trig--{t.state}" title={`${t.kind}: ${t.label}`}>
+              <span class="wf-trig-dot"></span>
+              {#if t.kind === "schedule"}
+                <strong>Schedule:</strong>
+                <span class="mono">{t.label}</span>
+              {:else if t.kind === "after"}
+                <strong>After:</strong>
+                <span class="mono">{t.label}</span>
+              {:else if t.kind === "on_message"}
+                <strong>On message:</strong>
+                <span class="mono">{t.label}</span>
+              {/if}
+            </span>
+          {/each}
+          <button class="action wf-run-now"
+                  on:click|stopPropagation={() => openRunNow(w)}
+                  disabled={w.jobs.length === 0}>
+            ▶ Run now
+          </button>
+        </div>
+      {:else if w.kind !== "streaming"}
+        <div class="wf-trigger wf-trigger--empty">
+          <span class="dim">No trigger declared</span>
+          <button class="action wf-run-now"
+                  on:click|stopPropagation={() => openRunNow(w)}
+                  disabled={w.jobs.length === 0}>
+            ▶ Run now
+          </button>
+        </div>
       {/if}
 
       <DagFlowchart
@@ -203,6 +258,42 @@
       </div>
     </div>
   {/each}
+{/if}
+
+{#if runNowFor}
+  <div class="modal-bg" on:click={closeRunNow} role="presentation">
+    <div class="modal" on:click|stopPropagation role="dialog" aria-label="Run workflow now">
+      <h3 class="modal-title">Run <span class="mono">{runNowFor.name}</span> now</h3>
+      <p class="dim" style="font-size: 0.85em;">
+        Pick the jobs to include. All trigger gates are bypassed.
+      </p>
+      <div class="modal-jobs">
+        {#each runNowFor.jobs as j}
+          <label class="modal-job">
+            <input type="checkbox"
+                   checked={runNowSelected.has(j)}
+                   on:change={() => toggleJob(j)} />
+            <span class="mono">{j}</span>
+          </label>
+        {/each}
+      </div>
+      <div class="modal-actions">
+        {#if runNowError}
+          <span style="color: var(--color-alarm, #b85040); font-size: 0.85em;">{runNowError}</span>
+        {/if}
+        {#if runNowOk}
+          <span style="color: var(--color-phosphor-300, #8fd28f); font-size: 0.85em;">queued: {runNowOk}</span>
+        {/if}
+        <span style="flex: 1;"></span>
+        <button class="action" on:click={closeRunNow} disabled={runNowBusy}>Cancel</button>
+        <button class="action"
+                on:click={submitRunNow}
+                disabled={runNowBusy || runNowSelected.size === 0}>
+          {runNowBusy ? "..." : `Run ${runNowSelected.size} job${runNowSelected.size === 1 ? "" : "s"}`}
+        </button>
+      </div>
+    </div>
+  </div>
 {/if}
 
 <style>
@@ -247,7 +338,64 @@
     background: rgba(0,0,0,0.2);
     border-left: 2px solid var(--color-phosphor-500, #4eb84e);
     border-radius: 2px;
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 0.6em;
   }
+  .wf-trigger-label {
+    color: var(--color-fg-muted, #888);
+    text-transform: uppercase;
+    font-size: 0.85em;
+    letter-spacing: 0.08em;
+  }
+  .wf-trig {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.35em;
+    padding: 0.15em 0.5em;
+    border-radius: 3px;
+    background: rgba(255,255,255,0.04);
+  }
+  .wf-trig-dot {
+    width: 0.7em;
+    height: 0.7em;
+    border-radius: 50%;
+    display: inline-block;
+    flex-shrink: 0;
+  }
+  .wf-trig--ready .wf-trig-dot   { background: #4eb84e; box-shadow: 0 0 4px rgba(78, 184, 78, 0.6); }
+  .wf-trig--pending .wf-trig-dot { background: var(--color-amber-glow, #ffb000); box-shadow: 0 0 4px rgba(255, 176, 0, 0.55); }
+  .wf-trig--failed .wf-trig-dot  { background: var(--color-alarm, #b85040); box-shadow: 0 0 4px rgba(184, 80, 64, 0.6); }
+  .wf-trigger--empty { border-left-color: var(--color-border, #444); }
+  .wf-run-now {
+    margin-left: auto;
+    font-size: 0.9em;
+  }
+  .modal-bg {
+    position: fixed; inset: 0;
+    background: rgba(0, 0, 0, 0.65);
+    z-index: 50;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .modal {
+    background: var(--color-vault-900, #0a1410);
+    border: 1px solid var(--color-phosphor-500, #4eb84e);
+    border-radius: 4px;
+    padding: 1.2em 1.4em;
+    min-width: 360px;
+    max-width: 520px;
+  }
+  .modal-title { margin: 0 0 0.4em 0; }
+  .modal-jobs {
+    display: flex; flex-direction: column; gap: 0.3em;
+    margin: 0.6em 0;
+    padding: 0.4em 0;
+    border-top: 1px dashed var(--color-border, #444);
+    border-bottom: 1px dashed var(--color-border, #444);
+  }
+  .modal-job { display: flex; align-items: center; gap: 0.5em; cursor: pointer; }
+  .modal-actions { display: flex; align-items: center; gap: 0.5em; margin-top: 0.7em; }
   .wf-footer {
     margin-top: 0.4rem;
     padding-top: 0.4rem;

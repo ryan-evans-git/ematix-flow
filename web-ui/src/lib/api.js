@@ -68,3 +68,21 @@ export async function health() {
 export async function pipelineDag() {
   return _request("/dag");
 }
+
+export async function runWorkflowNow(name, { jobs } = {}) {
+  const body = {};
+  if (Array.isArray(jobs)) body.jobs = jobs;
+  return _request(`/workflows/${encodeURIComponent(name)}/run-now`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+}
+
+export async function runJobNow(name, { cascadeDownstream = false } = {}) {
+  return _request(`/jobs/${encodeURIComponent(name)}/run-now`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ cascade_downstream: !!cascadeDownstream }),
+  });
+}

@@ -478,6 +478,162 @@ def create_app(
         return {"nodes": nodes, "edges": edges}
 
     # ---- Workflows: named groupings of jobs ---------------------------
+    def _last_success_time(name: str):
+        """Most recent succeeded run start time for ``name``, or None."""
+        if history is None:
+            return None
+        try:
+            runs, _ = history.list_runs(pipeline=name, status="succeeded", limit=1)
+        except Exception:
+            return None
+        if not runs:
+            return None
+        # list_runs returns RunRecord with started_at as datetime or ISO str.
+        st = runs[0].started_at
+        if isinstance(st, str):
+            try:
+                from datetime import datetime as _dt
+                # Accept both Z-suffix and +00:00.
+                return _dt.fromisoformat(st.replace("Z", "+00:00"))
+            except Exception:
+                return None
+        return st
+
+    def _latest_terminal_run(name: str):
+        """Most recent terminal (succeeded/failed/cancelled) run for ``name``."""
+        if history is None:
+            return None
+        try:
+            runs, _ = history.list_runs(pipeline=name, limit=10)
+        except Exception:
+            return None
+        for r in runs:
+            if r.status in ("succeeded", "failed", "cancelled"):
+                return r
+        return None
+
+    def _compute_triggers(
+        *,
+        triggered_by: list[str],
+        schedule: str | None,
+        timezone_name: str | None,
+        on_message_repr: str | None,
+        last_self_success,
+    ) -> list[dict[str, Any]]:
+        """Return a per-condition list of trigger dicts with state +
+        display info. ``last_self_success`` is this workflow's own
+        most-recent successful run start time, or None if never run.
+
+        Each entry shape:
+          {
+            "kind": "schedule" | "after" | "on_message",
+            "label": "human-readable display",
+            "state": "ready" | "pending" | "failed",
+            ... kind-specific fields ...
+          }
+        """
+        out: list[dict[str, Any]] = []
+        from datetime import datetime as _dt
+        from datetime import timezone as _utc_tz
+
+        now = _dt.now(_utc_tz.utc)
+
+        # Schedule trigger
+        if schedule:
+            from ematix_flow.pipeline import forecast_next_run
+            anchor = last_self_success if last_self_success is not None else None
+            try:
+                next_tick = forecast_next_run(
+                    schedule,
+                    now=anchor or now - _dt.now(_utc_tz.utc).utcoffset() if False else (anchor or now),
+                    timezone=timezone_name,
+                )
+            except Exception:
+                next_tick = None
+            if next_tick is not None:
+                # If we have no last self run, the "next tick after epoch" is
+                # essentially "the next future tick" — treat as pending.
+                state = "ready" if (anchor is not None and now >= next_tick) else (
+                    "ready" if (anchor is None and False) else "pending"
+                )
+                # If anchor is None (never ran), still mark as ready if the
+                # tick has passed (i.e., we should fire on first scheduler tick).
+                if anchor is None and now >= next_tick:
+                    state = "ready"
+                # Format the tick in the workflow's tz for the label.
+                label = _format_tick(next_tick, timezone_name, now)
+            else:
+                state = "pending"
+                label = schedule
+            out.append({
+                "kind": "schedule",
+                "cron": schedule,
+                "timezone": timezone_name,
+                "next_at": (next_tick.isoformat() if next_tick is not None else None),
+                "state": state,
+                "label": label,
+            })
+
+        # Upstream event triggers
+        for up_name in triggered_by:
+            last_up_success = _last_success_time(up_name)
+            latest = _latest_terminal_run(up_name)
+            state = "pending"
+            if last_up_success is not None:
+                if last_self_success is None or last_up_success > last_self_success:
+                    state = "ready"
+            # Failed only when the upstream's most recent terminal run *since*
+            # last self-success was a failure (no later success has overridden).
+            if state == "pending" and latest is not None and latest.status == "failed":
+                # if no success since last self-run, latest failure blocks us
+                if last_up_success is None or (
+                    last_self_success is not None and last_up_success <= last_self_success
+                ):
+                    state = "failed"
+            out.append({
+                "kind": "after",
+                "name": up_name,
+                "state": state,
+                "label": up_name,
+            })
+
+        # on_message: pending (firing is per-message; no AND eval at tick time)
+        if on_message_repr:
+            out.append({
+                "kind": "on_message",
+                "source": on_message_repr,
+                "state": "pending",
+                "label": on_message_repr,
+            })
+
+        return out
+
+    def _format_tick(tick_utc, timezone_name: str | None, now_utc) -> str:
+        """Format a UTC datetime in the given IANA tz for display.
+
+        Returns just ``HH:MM TZ`` when the tick is today in that tz, or
+        ``YYYY-MM-DD HH:MM TZ`` otherwise.
+        """
+        try:
+            from zoneinfo import ZoneInfo
+        except ImportError:
+            ZoneInfo = None  # type: ignore[assignment]
+        if timezone_name and ZoneInfo is not None:
+            try:
+                tz = ZoneInfo(timezone_name)
+                local_tick = tick_utc.astimezone(tz)
+                local_now = now_utc.astimezone(tz)
+                short_tz = local_tick.strftime("%Z") or timezone_name
+                if local_tick.date() == local_now.date():
+                    return f"{local_tick.strftime('%H:%M')} {short_tz}"
+                return f"{local_tick.strftime('%Y-%m-%d %H:%M')} {short_tz}"
+            except Exception:
+                pass
+        # Fallback: UTC.
+        if tick_utc.date() == now_utc.date():
+            return f"{tick_utc.strftime('%H:%M')} UTC"
+        return f"{tick_utc.strftime('%Y-%m-%d %H:%M')} UTC"
+
     @app.get("/api/workflows")
     def list_workflows() -> dict[str, Any]:  # type: ignore[unused-function]
         """Each workflow is a user-named group of jobs + the trigger
@@ -517,6 +673,21 @@ def create_app(
             # Streaming workflow if any member job is a streaming pipeline.
             is_streaming = _workflow_is_streaming(list(wf.jobs))
             kind = "streaming" if is_streaming else "declared"
+            on_msg_repr = (
+                repr(wf.on_message) if wf.on_message is not None else None
+            )
+            last_self = _last_success_time(wf_name)
+            triggers = (
+                []
+                if is_streaming
+                else _compute_triggers(
+                    triggered_by=list(wf.triggered_by),
+                    schedule=wf.schedule,
+                    timezone_name=wf.timezone,
+                    on_message_repr=on_msg_repr,
+                    last_self_success=last_self,
+                )
+            )
             result.append(
                 {
                     "name": wf_name,
@@ -526,11 +697,8 @@ def create_app(
                     "triggered_by": list(wf.triggered_by),
                     "schedule": wf.schedule,
                     "timezone": wf.timezone,
-                    "on_message": (
-                        repr(wf.on_message)
-                        if wf.on_message is not None
-                        else None
-                    ),
+                    "on_message": on_msg_repr,
+                    "triggers": triggers,
                 }
             )
 
@@ -543,6 +711,16 @@ def create_app(
             ups = _DEPENDS_ON.get(job_name) or []
             edges = [{"from": u, "to": job_name} for u in ups]
             sp = _REGISTRY.get(job_name)
+            sched = getattr(sp, "schedule", None)
+            tz = getattr(sp, "timezone", None)
+            last_self = _last_success_time(job_name)
+            triggers = _compute_triggers(
+                triggered_by=list(ups),
+                schedule=sched,
+                timezone_name=tz,
+                on_message_repr=None,
+                last_self_success=last_self,
+            )
             result.append(
                 {
                     "name": job_name,
@@ -550,9 +728,10 @@ def create_app(
                     "jobs": [job_name],
                     "edges": edges,
                     "triggered_by": list(ups),
-                    "schedule": getattr(sp, "schedule", None),
-                    "timezone": getattr(sp, "timezone", None),
+                    "schedule": sched,
+                    "timezone": tz,
                     "on_message": None,
+                    "triggers": triggers,
                 }
             )
 
@@ -570,6 +749,7 @@ def create_app(
                     "schedule": None,
                     "timezone": None,
                     "on_message": None,
+                    "triggers": [],
                 }
             )
         return {"workflows": result}
@@ -617,6 +797,133 @@ def create_app(
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         return {"new_run_id": new_id}
+
+    def _enqueue_run_now(
+        *,
+        pipeline_name: str,
+        kind: str = "batch",
+        extras: dict[str, Any] | None = None,
+    ) -> str:
+        """Write a fresh ``status="requested"`` record for ``pipeline_name``
+        that the scheduler / run-due path picks up on its next tick.
+
+        Used by the Workflows/Jobs tabs' "Run now" buttons. Returns the
+        new run_id.
+        """
+        import uuid
+        from datetime import datetime, timezone as _tz
+
+        from ematix_flow.run_log.history import RunRecord
+
+        new_id = f"run-now-{pipeline_name}-{uuid.uuid4().hex[:12]}"
+        base_extras: dict[str, Any] = {"source": "run_now"}
+        if extras:
+            base_extras.update(extras)
+        history.record_run_record(
+            RunRecord(
+                run_id=new_id,
+                pipeline=pipeline_name,
+                status="requested",
+                started_at=datetime.now(_tz.utc),
+                finished_at=None,
+                attempt=1,
+                kind=kind,
+                extras=base_extras,
+            )
+        )
+        return new_id
+
+    @app.post("/api/workflows/{name}/run-now")
+    def post_workflow_run_now(  # type: ignore[unused-function]
+        name: str,
+        body: dict[str, Any] = Body(default_factory=dict),  # noqa: B008
+    ) -> dict[str, Any]:
+        """Enqueue an immediate run of the named workflow. Ignores
+        trigger gates (cron not yet reached, upstream events not
+        satisfied).
+
+        Optional body fields:
+
+        - ``jobs``: list of member job names to include in this run.
+          Defaults to all the workflow's member jobs. Selected names
+          must be a subset of the workflow's ``jobs=`` list.
+        """
+        _require_history()
+        assert history is not None
+        try:
+            from ematix_flow.pipeline import _REGISTRY, _WORKFLOWS
+        except Exception:
+            raise HTTPException(status_code=500, detail="pipeline registry unavailable")
+        wf = _WORKFLOWS.get(name)
+        if wf is None:
+            # Allow a workflow-of-one (standalone job/streaming) by name too,
+            # so the "Run now" button works uniformly on every card.
+            if name not in _REGISTRY:
+                try:
+                    from ematix_flow.streaming import _STREAMING_PIPELINES
+                    if name not in _STREAMING_PIPELINES:
+                        raise HTTPException(status_code=404, detail=f"unknown workflow {name!r}")
+                except ImportError:
+                    raise HTTPException(status_code=404, detail=f"unknown workflow {name!r}")
+            selected = [name]
+            all_jobs = (name,)
+        else:
+            all_jobs = wf.jobs
+            requested = body.get("jobs")
+            if requested is None:
+                selected = list(all_jobs)
+            else:
+                if not isinstance(requested, list) or not all(
+                    isinstance(j, str) for j in requested
+                ):
+                    raise HTTPException(
+                        status_code=400, detail="jobs= must be a list of strings"
+                    )
+                bad = [j for j in requested if j not in all_jobs]
+                if bad:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"jobs= contains names not in workflow {name!r}: {bad}",
+                    )
+                if not requested:
+                    raise HTTPException(status_code=400, detail="jobs= cannot be empty")
+                selected = requested
+        new_id = _enqueue_run_now(
+            pipeline_name=name,
+            kind="batch",
+            extras={"selected_jobs": list(selected)},
+        )
+        return {"new_run_id": new_id, "selected_jobs": list(selected)}
+
+    @app.post("/api/jobs/{name}/run-now")
+    def post_job_run_now(  # type: ignore[unused-function]
+        name: str,
+        body: dict[str, Any] = Body(default_factory=dict),  # noqa: B008
+    ) -> dict[str, Any]:
+        """Enqueue an immediate run of the named job.
+
+        Optional body fields:
+
+        - ``cascade_downstream``: when ``true``, after this job
+          succeeds, any job that depends on it (within the same
+          workflow, or via legacy per-job depends_on) is also
+          enqueued. Default ``false`` — runs just this job.
+        """
+        _require_history()
+        assert history is not None
+        try:
+            from ematix_flow.pipeline import _REGISTRY
+        except Exception:
+            raise HTTPException(status_code=500, detail="pipeline registry unavailable")
+        if name not in _REGISTRY:
+            raise HTTPException(status_code=404, detail=f"unknown job {name!r}")
+        cascade = bool(body.get("cascade_downstream", False))
+        new_id = _enqueue_run_now(
+            pipeline_name=name,
+            kind="batch",
+            extras={"cascade_downstream": cascade},
+        )
+        return {"new_run_id": new_id, "cascade_downstream": cascade}
 
     @app.post("/api/runs/{run_id}/pause")
     def post_pause(run_id: str) -> dict[str, Any]:  # type: ignore[unused-function]
