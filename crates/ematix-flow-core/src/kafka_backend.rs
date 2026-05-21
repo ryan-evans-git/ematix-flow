@@ -592,7 +592,7 @@ pub struct KafkaBackend {
     /// mappings for the Glue *consumer* dispatch path. Populated
     /// lazily on first sight of each schema_uuid via a callback into
     /// Python's boto3 ``GetSchemaVersion`` call.
-    glue_schema_cache: Arc<RwLock<HashMap<uuid::Uuid, Arc<apache_avro::Schema>>>>,
+    glue_schema_cache: GlueConsumerSchemaCache,
     /// Task #556 producer slice: per-backend cache of
     /// schema-name→(UUID, parsed Avro schema) for the Glue producer
     /// path. Populated lazily on first send via a callback into
@@ -600,8 +600,7 @@ pub struct KafkaBackend {
     /// Separate from ``glue_schema_cache`` because the key shape and
     /// payload differ (producers also need the UUID to embed in the
     /// wire frame).
-    glue_producer_schema_cache:
-        Arc<RwLock<HashMap<String, Arc<(uuid::Uuid, apache_avro::Schema)>>>>,
+    glue_producer_schema_cache: GlueProducerSchemaCache,
     /// Phase 40.2: name of the Arrow column to use as the per-row
     /// Kafka message key. `None` means round-robin (default sticky
     /// partitioner) — matches pre-40.2 behavior. When set, the
@@ -626,11 +625,25 @@ pub struct KafkaBackend {
 /// the region and registry name so the callback has enough context
 /// to call `GetSchemaVersion`; the schema UUID comes from the wire
 /// frame on each message.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+/// Cache of (registry-UUID → parsed Avro schema) for the Glue
+/// *consumer* dispatch path. Read-heavy; populated lazily on first
+/// sight of each schema_uuid. Aliased so clippy's `type_complexity`
+/// lint doesn't fire at the struct field site.
+pub(crate) type GlueConsumerSchemaCache =
+    Arc<RwLock<HashMap<uuid::Uuid, Arc<apache_avro::Schema>>>>;
+
+/// Cache of (schema-name → (UUID, parsed Avro schema)) for the Glue
+/// *producer* dispatch path. Producers also need the UUID to embed
+/// in the wire frame, so we cache it alongside the schema.
+pub(crate) type GlueProducerSchemaCache =
+    Arc<RwLock<HashMap<String, Arc<(uuid::Uuid, apache_avro::Schema)>>>>;
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SchemaRegistryKind {
     /// Confluent / Apicurio wire format (0x00 + 4-byte BE schema id).
     /// The schema fetch is handled by `schema_registry_converter`.
+    #[default]
     Confluent,
     /// AWS Glue Schema Registry wire format (0x03 + 16-byte UUID +
     /// 1-byte codec). Schema fetch routes through named callbacks,
@@ -660,12 +673,6 @@ pub enum SchemaRegistryKind {
         #[serde(default)]
         schema_lookup_by_name_callback: String,
     },
-}
-
-impl Default for SchemaRegistryKind {
-    fn default() -> Self {
-        Self::Confluent
-    }
 }
 
 impl SchemaRegistryKind {
@@ -2441,7 +2448,7 @@ pub fn encode_batch_as_glue_avro(
     registry_name: &str,
     schema_name: &str,
     callback_name: &str,
-    cache: &Arc<RwLock<HashMap<String, Arc<(uuid::Uuid, apache_avro::Schema)>>>>,
+    cache: &GlueProducerSchemaCache,
 ) -> Result<Vec<Vec<u8>>, BackendError> {
     use crate::glue_schema_registry::{GlueCodec, build_glue_frame};
 
@@ -2771,7 +2778,7 @@ pub fn decode_payloads_as_glue_avro(
     region: &str,
     registry_name: &str,
     callback_name: &str,
-    cache: &Arc<RwLock<HashMap<uuid::Uuid, Arc<apache_avro::Schema>>>>,
+    cache: &GlueConsumerSchemaCache,
 ) -> Result<Vec<RecordBatch>, BackendError> {
     use crate::glue_schema_registry::{GlueCodec, parse_glue_frame};
 
@@ -4675,8 +4682,7 @@ mod tests {
         // name so this test doesn't collide with other tests.
         crate::py_callbacks::global().register("test::glue_lookup_caches", cb);
 
-        let cache: Arc<RwLock<HashMap<Uuid, Arc<apache_avro::Schema>>>> =
-            Arc::new(RwLock::new(HashMap::new()));
+        let cache: GlueConsumerSchemaCache = Arc::new(RwLock::new(HashMap::new()));
 
         // First call: cache miss → callback fires once.
         let batches = decode_payloads_as_glue_avro(
@@ -4725,8 +4731,7 @@ mod tests {
         });
         crate::py_callbacks::global().register("test::glue_lookup_protobuf", cb);
 
-        let cache: Arc<RwLock<HashMap<Uuid, Arc<apache_avro::Schema>>>> =
-            Arc::new(RwLock::new(HashMap::new()));
+        let cache: GlueConsumerSchemaCache = Arc::new(RwLock::new(HashMap::new()));
 
         let err = decode_payloads_as_glue_avro(
             vec![framed],
@@ -4752,8 +4757,7 @@ mod tests {
 
         let uuid = Uuid::new_v4();
         let framed = build_glue_frame(uuid, GlueCodec::None, b"x");
-        let cache: Arc<RwLock<HashMap<Uuid, Arc<apache_avro::Schema>>>> =
-            Arc::new(RwLock::new(HashMap::new()));
+        let cache: GlueConsumerSchemaCache = Arc::new(RwLock::new(HashMap::new()));
 
         let err = decode_payloads_as_glue_avro(
             vec![framed],
@@ -4804,8 +4808,7 @@ mod tests {
         });
         crate::py_callbacks::global().register("test::glue_zlib_roundtrip", cb);
 
-        let cache: Arc<RwLock<HashMap<Uuid, Arc<apache_avro::Schema>>>> =
-            Arc::new(RwLock::new(HashMap::new()));
+        let cache: GlueConsumerSchemaCache = Arc::new(RwLock::new(HashMap::new()));
         let batches = decode_payloads_as_glue_avro(
             vec![framed],
             "us-east-1",
@@ -4831,8 +4834,7 @@ mod tests {
         // root cause.
         let uuid = Uuid::new_v4();
         let framed = build_glue_frame(uuid, GlueCodec::Zlib, b"not-actually-zlib");
-        let cache: Arc<RwLock<HashMap<Uuid, Arc<apache_avro::Schema>>>> =
-            Arc::new(RwLock::new(HashMap::new()));
+        let cache: GlueConsumerSchemaCache = Arc::new(RwLock::new(HashMap::new()));
 
         let err = decode_payloads_as_glue_avro(vec![framed], "us-east-1", "r", "any-name", &cache)
             .unwrap_err();
@@ -4872,8 +4874,7 @@ mod tests {
         });
         crate::py_callbacks::global().register("test::glue_prod_by_name", cb);
 
-        let producer_cache: Arc<RwLock<HashMap<String, Arc<(Uuid, apache_avro::Schema)>>>> =
-            Arc::new(RwLock::new(HashMap::new()));
+        let producer_cache: GlueProducerSchemaCache = Arc::new(RwLock::new(HashMap::new()));
         let encoded = encode_batch_as_glue_avro(
             &batch,
             "us-east-1",
@@ -4923,7 +4924,6 @@ mod tests {
         use arrow_schema::{DataType, Field, Schema as ArrowSchema};
         use std::sync::Arc;
         use std::sync::atomic::{AtomicUsize, Ordering};
-        use uuid::Uuid;
 
         let arrow_schema = Arc::new(ArrowSchema::new(vec![Field::new(
             "i",
@@ -4947,8 +4947,7 @@ mod tests {
         });
         crate::py_callbacks::global().register("test::glue_prod_cache", cb);
 
-        let cache: Arc<RwLock<HashMap<String, Arc<(Uuid, apache_avro::Schema)>>>> =
-            Arc::new(RwLock::new(HashMap::new()));
+        let cache: GlueProducerSchemaCache = Arc::new(RwLock::new(HashMap::new()));
         for _ in 0..5 {
             let _ = encode_batch_as_glue_avro(
                 &batch,
