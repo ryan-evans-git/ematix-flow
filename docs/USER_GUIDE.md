@@ -171,8 +171,12 @@ selects which one.
 All trigger kwargs on a workflow are AND-conjoined (every one set must
 be satisfied since the workflow last succeeded):
 
-- `triggered_by=[<job_or_workflow_name>, ...]` — event prereqs that
-  must have succeeded since this workflow last succeeded.
+- `triggered_by=<expression>` — event prereqs that must have
+  succeeded since this workflow last succeeded. Accepts:
+  - a single name string,
+  - a list of names (AND-conjoined),
+  - or an explicit boolean expression tree built with
+    `AllOf(...)` / `AnyOf(...)` for OR / nested composition.
 - `schedule="cron"` + optional `timezone="IANA"` — cron tick must reach.
 - `on_message=<KafkaConnection.topic("...")>` — per-message firing
   (mutually exclusive with the above).
@@ -180,6 +184,30 @@ be satisfied since the workflow last succeeded):
 At least one trigger is required, unless the workflow contains a
 streaming pipeline (it's then implicitly streaming and the consumer
 drives execution).
+
+#### Boolean composition (AllOf / AnyOf)
+
+For trees like *A AND (B OR C)*, import the combinators from the
+top-level package:
+
+```python
+from ematix_flow import ematix, AllOf, AnyOf
+
+ematix.workflow(
+    name="combined_report",
+    triggered_by=AllOf("workflow_A", AnyOf("workflow_B", "workflow_C")),
+    schedule="0 21 * * *",
+    timezone="America/New_York",
+    jobs=[...],
+)
+```
+
+Trees nest arbitrarily. `AllOf("A", AnyOf("B", AllOf("C", "D")))` is
+*A AND (B OR (C AND D))*. Per-node state semantics: a leaf is
+**ready** if its upstream has succeeded since this workflow's own last
+success, **failed** if the upstream's most recent terminal run since
+then was a failure, **pending** otherwise. An `AllOf` is ready iff
+every child is ready; an `AnyOf` is ready iff any child is ready.
 
 ```python
 from ematix_flow import ematix
