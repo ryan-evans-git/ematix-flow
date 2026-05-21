@@ -687,6 +687,56 @@ def _cmd_connections_check(args: argparse.Namespace) -> int:
     return 2
 
 
+def _cmd_doctor(args: argparse.Namespace) -> int:
+    """``flow doctor [--module M]`` — probe every registered typed
+    connection and print a green/red liveness report.
+
+    Loads the user's pipeline module (if given) so connections
+    declared in it land in the registry before we probe.
+    """
+    from ematix_flow import doctor
+
+    if getattr(args, "module", None):
+        _import_user_module(args.module)
+    reports = doctor.run_doctor()
+    print(doctor.format_doctor_report(reports))
+    # Exit 1 if any probe failed — useful as a pre-deploy gate.
+    return 1 if any(r.is_fail for r in reports) else 0
+
+
+def _cmd_secrets_test(args: argparse.Namespace) -> int:
+    """``flow secrets test '${vault:foo#bar}'`` — resolve a single
+    ``${...}`` reference via the registered resolver chain and print
+    the result. Redacted by default (first/last 2 chars + length);
+    pass ``--show`` to print verbatim."""
+    from ematix_flow.secrets import MissingSecretError, expand
+
+    ref = args.reference
+    # Accept both `${vault:foo}` and bare `vault:foo` — wrap the
+    # bare form so ``expand`` sees a recognisable reference.
+    if not (ref.startswith("${") and ref.endswith("}")):
+        ref = "${" + ref + "}"
+    try:
+        resolved = expand(ref)
+    except MissingSecretError as exc:
+        print(f"{args.reference}: {exc}", file=sys.stderr)
+        return 1
+    if resolved is None or resolved == "":
+        print(f"{args.reference}: <empty>")
+        return 0
+    if args.show:
+        print(resolved)
+    else:
+        # Redact: first 2 + last 2 chars + length. Mirrors the way
+        # SSH / k8s show fingerprints without leaking the value.
+        if len(resolved) <= 4:
+            display = "*" * len(resolved)
+        else:
+            display = f"{resolved[:2]}...{resolved[-2:]}"
+        print(f"{display}  ({len(resolved)} chars; pass --show to reveal)")
+    return 0
+
+
 def _cmd_preview(args: argparse.Namespace) -> int:
     _import_user_module(args.module)
     try:
@@ -1016,6 +1066,44 @@ def main(argv: list[str] | None = None) -> int:
         help="e.g., warehouse=postgres://user:pass@host/db",
     )
     conn_set.set_defaults(func=_cmd_connections_set)
+
+    # ``flow doctor`` — health-check every registered typed connection.
+    # Exit code is 1 if any probe failed; useful as a pre-deploy gate.
+    doctor_p = sub.add_parser(
+        "doctor",
+        help="probe every registered connection and report green/red",
+    )
+    doctor_p.add_argument(
+        "--module",
+        help="user pipeline module to import first (so connections "
+        "declared in it land in the registry before probing)",
+    )
+    doctor_p.set_defaults(func=_cmd_doctor)
+
+    # ``flow secrets test`` — resolve a single ${...} reference.
+    secrets_p = sub.add_parser(
+        "secrets",
+        help="debug secret-resolver setup (e.g. Vault / AWS / GCP)",
+    )
+    secrets_sub = secrets_p.add_subparsers(dest="secrets_cmd", required=True)
+    secrets_test = secrets_sub.add_parser(
+        "test",
+        help="resolve a single ${vault:...} / ${aws:...} / ${gcp:...} "
+        "reference and print the result (redacted unless --show)",
+    )
+    secrets_test.add_argument(
+        "reference",
+        metavar="REF",
+        help="the reference, e.g. '${vault:secret/myapp#db_password}' "
+        "or bare 'vault:secret/myapp#db_password'",
+    )
+    secrets_test.add_argument(
+        "--show",
+        action="store_true",
+        help="print the resolved value verbatim (default: redacted "
+        "to first/last 2 chars + length)",
+    )
+    secrets_test.set_defaults(func=_cmd_secrets_test)
 
     # Phase 4 of "What's not shipped": web UI for run history +
     # restart / rerun / pause actions.
