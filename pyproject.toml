@@ -179,8 +179,7 @@ web = [
 # extra only when you actually need to talk to that warehouse.
 snowflake = [
     "snowflake-connector-python>=3.7",
-    # `to_pandas()` → write_pandas() bridge needs pandas at runtime.
-    "pandas>=2.0",
+    # Arrow-native PUT + COPY INTO path — no pandas dep.
     "pyarrow>=15",
 ]
 bigquery  = [

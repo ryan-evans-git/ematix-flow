@@ -364,6 +364,76 @@ def redshift_query_to_arrow(
 # ============================================================
 
 
+def _quote_snowflake_identifier(name: str) -> str:
+    """Double-quote a Snowflake identifier, escaping embedded quotes.
+
+    Snowflake folds unquoted identifiers to uppercase. Double-quoting
+    preserves the user's casing — what they declared in the Arrow
+    schema lands as that exact column name in the Snowflake table.
+    """
+    return '"' + name.replace('"', '""') + '"'
+
+
+def _arrow_type_to_snowflake(field: pa.Field) -> str:
+    """Map an Arrow type to a conservative Snowflake DDL type.
+
+    Snowflake's PARQUET file format performs type coercion on
+    ``COPY INTO``, so the target column types don't have to match the
+    parquet payload exactly. Defaults are conservative — wide enough
+    not to truncate, narrow enough not to mis-classify (e.g. ``int64``
+    → ``NUMBER(19)``, not ``VARIANT``).
+    """
+    t = field.type
+    if pa.types.is_int8(t) or pa.types.is_int16(t) or pa.types.is_int32(t):
+        return "NUMBER(10)"
+    if pa.types.is_int64(t):
+        return "NUMBER(19)"
+    if pa.types.is_uint8(t) or pa.types.is_uint16(t) or pa.types.is_uint32(t):
+        return "NUMBER(10)"
+    if pa.types.is_uint64(t):
+        return "NUMBER(20)"
+    if pa.types.is_float32(t):
+        return "FLOAT"
+    if pa.types.is_float64(t):
+        return "DOUBLE"
+    if pa.types.is_boolean(t):
+        return "BOOLEAN"
+    if pa.types.is_string(t) or pa.types.is_large_string(t):
+        return "VARCHAR(16777216)"
+    if pa.types.is_date32(t) or pa.types.is_date64(t):
+        return "DATE"
+    if pa.types.is_timestamp(t):
+        return "TIMESTAMP_NTZ" if t.tz is None else "TIMESTAMP_TZ"
+    if pa.types.is_binary(t) or pa.types.is_large_binary(t):
+        return "BINARY"
+    if pa.types.is_decimal(t):
+        return f"NUMBER({t.precision},{t.scale})"
+    if pa.types.is_list(t) or pa.types.is_large_list(t):
+        return "ARRAY"
+    if pa.types.is_struct(t) or pa.types.is_map(t):
+        return "OBJECT"
+    # Catch-all: Snowflake's JSON-shaped variant column.
+    return "VARIANT"
+
+
+def _arrow_schema_to_snowflake_ddl(table_name: str, schema: pa.Schema) -> str:
+    """Build ``CREATE TABLE IF NOT EXISTS`` from an Arrow schema.
+
+    Used when ``snowflake_write_arrow(create_if_not_exists=True)`` is
+    asked to land into a table that doesn't yet exist. Identifiers
+    are double-quoted so original casing is preserved.
+    """
+    cols = []
+    for field in schema:
+        sql_type = _arrow_type_to_snowflake(field)
+        nullable = "" if field.nullable else " NOT NULL"
+        cols.append(f"{_quote_snowflake_identifier(field.name)} {sql_type}{nullable}")
+    return (
+        f"CREATE TABLE IF NOT EXISTS {_quote_snowflake_identifier(table_name)} "
+        f"({', '.join(cols)})"
+    )
+
+
 def snowflake_write_arrow(
     conn: SnowflakeConnection,
     table: pa.Table,
@@ -372,14 +442,26 @@ def snowflake_write_arrow(
     create_if_not_exists: bool = True,
     _client: Any | None = None,
 ) -> int:
-    """Bulk-load ``table`` into Snowflake table ``table_name`` via
-    ``snowflake-connector-python``'s ``write_pandas``. Returns the
-    row count written.
+    """Bulk-load ``table`` into Snowflake table ``table_name`` via a
+    parquet-staged ``PUT`` + ``COPY INTO``. Returns the row count
+    written.
 
-    Uses pandas-conversion under the hood (Snowflake's write_pandas
-    requires it). For multi-GB tables, prefer staging to S3 +
-    ``COPY INTO`` directly; this adapter is the convenient path for
-    small-to-medium tables.
+    **Arrow-native — no pandas dependency.** The Arrow table is
+    written to a local temp parquet file with ``pyarrow.parquet``,
+    uploaded to Snowflake's table-scoped session stage with ``PUT``,
+    and loaded with ``COPY INTO ... FILE_FORMAT = (TYPE = PARQUET)
+    MATCH_BY_COLUMN_NAME = CASE_INSENSITIVE``. This replaces the
+    earlier ``write_pandas`` path (which required pandas as a
+    transitive runtime dep).
+
+    When ``create_if_not_exists=True`` and the target table doesn't
+    exist, a ``CREATE TABLE IF NOT EXISTS`` is issued first with a
+    schema derived from the Arrow schema; see
+    :func:`_arrow_type_to_snowflake` for the type mapping.
+
+    For multi-GB tables, prefer external-stage S3 + ``COPY INTO``
+    directly. This adapter uses the session stage (``@%<table>``)
+    which is convenient but uploads through the local connection.
     """
     if _client is None:
         try:
@@ -403,25 +485,63 @@ def snowflake_write_arrow(
             if v:
                 connect_kwargs[fld] = v
         _client = snowflake.connector.connect(**connect_kwargs)
+
+    # Stage the Arrow table as a local parquet file. ``delete=False``
+    # because Windows can't unlink an open file; we clean up
+    # explicitly in the finally.
+    import os
+    import tempfile
+
+    import pyarrow.parquet as pq
+
+    nrows = table.num_rows
+    with tempfile.NamedTemporaryFile(
+        suffix=".parquet", delete=False
+    ) as tmp:
+        parquet_path = tmp.name
     try:
-        from snowflake.connector.pandas_tools import write_pandas  # type: ignore[import-not-found]
-    except ImportError as exc:
-        raise ImportError(
-            "snowflake-connector-python's pandas_tools is required; ensure "
-            "you have a recent connector + pandas installed"
-        ) from exc
-    df = table.to_pandas()
-    success, _, nrows, _ = write_pandas(
-        _client,
-        df,
-        table_name=table_name,
-        auto_create_table=create_if_not_exists,
-    )
-    if not success:
+        pq.write_table(table, parquet_path)
+        cursor = _client.cursor()
+        try:
+            quoted_table = _quote_snowflake_identifier(table_name)
+            if create_if_not_exists:
+                cursor.execute(
+                    _arrow_schema_to_snowflake_ddl(table_name, table.schema)
+                )
+            # PUT to the table's session stage. ``OVERWRITE = TRUE``
+            # so repeated runs replace any leftover file from a prior
+            # failed COPY; ``AUTO_COMPRESS = FALSE`` because parquet
+            # is already columnar-compressed and the Snowflake-side
+            # gzip wrapper would just add CPU + bytes.
+            cursor.execute(
+                f"PUT file://{parquet_path} @%{quoted_table} "
+                "OVERWRITE = TRUE AUTO_COMPRESS = FALSE"
+            )
+            staged_basename = os.path.basename(parquet_path)
+            # COPY INTO. ``MATCH_BY_COLUMN_NAME = CASE_INSENSITIVE``
+            # handles column-order independence between the parquet
+            # and the target table. ``PURGE = TRUE`` deletes the
+            # staged file after a successful copy.
+            cursor.execute(
+                f"COPY INTO {quoted_table} "
+                f"FROM @%{quoted_table}/{staged_basename} "
+                "FILE_FORMAT = (TYPE = PARQUET) "
+                "MATCH_BY_COLUMN_NAME = CASE_INSENSITIVE "
+                "PURGE = TRUE"
+            )
+        finally:
+            cursor.close()
+    except Exception as exc:
         raise WarehouseSyncError(
-            f"snowflake_write_arrow: write_pandas reported failure for table "
-            f"{table_name!r}"
-        )
+            f"snowflake_write_arrow: write failed for table "
+            f"{table_name!r}: {exc}"
+        ) from exc
+    finally:
+        try:
+            os.unlink(parquet_path)
+        except OSError:
+            # Best-effort cleanup; temp dir GC will sweep eventually.
+            pass
     return nrows
 
 
