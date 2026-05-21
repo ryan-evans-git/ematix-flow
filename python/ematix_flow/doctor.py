@@ -196,7 +196,11 @@ def _probe_schema_registry(
             .encode()
         ).decode("ascii")
         req.add_header("Authorization", f"Basic {token}")
-    with urllib.request.urlopen(req, timeout=3.0) as resp:
+    # nosec B310: `target` is the user's own connection URL from their
+    # connections.toml — this is a health probe, not a server-side
+    # fetcher of user-supplied URLs. The scheme is validated at
+    # Connection construction time.
+    with urllib.request.urlopen(req, timeout=3.0) as resp:  # nosec B310
         status_code = resp.status
     return HealthReport(
         name=conn.name, kind=conn.kind,
