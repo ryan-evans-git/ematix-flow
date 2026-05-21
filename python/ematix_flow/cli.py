@@ -704,6 +704,32 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
     return 1 if any(r.is_fail for r in reports) else 0
 
 
+def _cmd_logs(args: argparse.Namespace) -> int:
+    """``flow logs <run_id>`` — print captured stdout/stderr for a
+    past run. Reads from ``$EMATIX_FLOW_LOGS_DIR`` (or
+    ``~/.ematix-flow/logs/``). Logs are only written when the
+    pipeline executed under ``EMATIX_FLOW_CAPTURE_LOGS=1`` — see
+    USER_GUIDE for the capture toggle."""
+    from ematix_flow.logs import logs_dir, read_run_logs
+
+    text = read_run_logs(args.run_id)
+    if text is None:
+        print(
+            f"flow logs: no log file for run_id={args.run_id!r} under "
+            f"{logs_dir()}. Logs are only captured when "
+            f"EMATIX_FLOW_CAPTURE_LOGS=1 was set during the run.",
+            file=sys.stderr,
+        )
+        return 1
+    if args.tail is not None:
+        lines = text.splitlines()
+        text = "\n".join(lines[-args.tail:])
+        if text and not text.endswith("\n"):
+            text += "\n"
+    print(text, end="")
+    return 0
+
+
 def _cmd_init(args: argparse.Namespace) -> int:
     """``flow init <path> [--force]`` — scaffold a new ematix-flow
     project: pipelines.py + connections.toml + Dockerfile + flow.service
@@ -1090,6 +1116,20 @@ def main(argv: list[str] | None = None) -> int:
         help="e.g., warehouse=postgres://user:pass@host/db",
     )
     conn_set.set_defaults(func=_cmd_connections_set)
+
+    # ``flow logs <run_id>`` — print captured stdout/stderr from a past run.
+    logs_p = sub.add_parser(
+        "logs",
+        help="print captured stdout/stderr from a past pipeline run",
+    )
+    logs_p.add_argument("run_id", help="run id (from the run-log API or scheduler)")
+    logs_p.add_argument(
+        "--tail",
+        type=int,
+        default=None,
+        help="show only the last N lines (default: full log)",
+    )
+    logs_p.set_defaults(func=_cmd_logs)
 
     # ``flow init <path>`` — scaffold a new project (Maven-archetype-style).
     init_p = sub.add_parser(

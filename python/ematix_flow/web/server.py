@@ -368,6 +368,34 @@ def create_app(
             return {"pipelines": pipelines}
         return {"pipelines": _STUB_PIPELINES}
 
+    # ---- Cross-pipeline DAG view (task #7) -------------------------
+    @app.get("/api/dag")
+    def pipeline_dag() -> dict[str, Any]:  # type: ignore[unused-function]
+        """Cross-pipeline DAG: nodes = registered pipelines, edges =
+        ``depends_on`` declarations. Renders in the SPA as a tree to
+        spot bottlenecks (deep chains, fan-out hot spots)."""
+        try:
+            from ematix_flow.pipeline import _DEPENDS_ON, _REGISTRY
+        except Exception:
+            return {"nodes": [], "edges": []}
+
+        nodes = []
+        for name, sp in sorted(_REGISTRY.items()):
+            nodes.append(
+                {
+                    "name": name,
+                    "schedule": sp.schedule,
+                    "timezone": getattr(sp, "timezone", None),
+                }
+            )
+        edges = []
+        for name, upstreams in _DEPENDS_ON.items():
+            for upstream in upstreams:
+                # Edge direction: upstream → downstream (upstream
+                # produces, downstream consumes).
+                edges.append({"from": upstream, "to": name})
+        return {"nodes": nodes, "edges": edges}
+
     # ---- Mutating actions (Phase 4b) -------------------------------
     #
     # All four endpoints require a configured history store; without
