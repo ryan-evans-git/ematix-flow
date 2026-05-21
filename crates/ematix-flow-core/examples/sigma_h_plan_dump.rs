@@ -12,7 +12,6 @@
 
 use std::env;
 use std::fs;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use datafusion::physical_plan::displayable;

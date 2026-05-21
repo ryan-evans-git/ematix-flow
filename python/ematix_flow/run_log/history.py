@@ -29,7 +29,7 @@ clear error pointing operators at a SQL backend.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any, Protocol, runtime_checkable
 
 __all__ = [
@@ -155,8 +155,8 @@ def _iso(ts: datetime) -> str:
     iso utility in `_iso.py` but kept inline so this module has
     zero internal cross-imports."""
     if ts.tzinfo is None:
-        ts = ts.replace(tzinfo=timezone.utc)
-    return ts.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+        ts = ts.replace(tzinfo=UTC)
+    return ts.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
 
 # ---- Protocol ------------------------------------------------------
@@ -324,15 +324,15 @@ class InMemoryRunHistory:
             raise KeyError(
                 f"enqueue_restart: prior run_id {prior_run_id!r} not found"
             )
-        from datetime import datetime as _dt, timezone as _tz
         import uuid as _uuid
+        from datetime import datetime as _dt
 
         new_id = f"req-{_uuid.uuid4().hex}"
         new_record = RunRecord(
             run_id=new_id,
             pipeline=prior.pipeline,
             status="requested",
-            started_at=_dt.now(_tz.utc),
+            started_at=_dt.now(UTC),
             kind=prior.kind,
             extras={
                 "restart_from_step": from_step,
@@ -348,15 +348,15 @@ class InMemoryRunHistory:
             raise KeyError(
                 f"enqueue_rerun: prior run_id {prior_run_id!r} not found"
             )
-        from datetime import datetime as _dt, timezone as _tz
         import uuid as _uuid
+        from datetime import datetime as _dt
 
         new_id = f"req-{_uuid.uuid4().hex}"
         new_record = RunRecord(
             run_id=new_id,
             pipeline=prior.pipeline,
             status="requested",
-            started_at=_dt.now(_tz.utc),
+            started_at=_dt.now(UTC),
             kind=prior.kind,
             extras={
                 "rerun_full": True,
@@ -388,9 +388,9 @@ class InMemoryRunHistory:
                 out.append(r)
                 continue
             pause_req = r.extras.get("pause_requested")
-            if pause_req is True and r.status == "running":
-                out.append(r)
-            elif pause_req is False and r.status == "paused":
+            wants_pause = pause_req is True and r.status == "running"
+            wants_resume = pause_req is False and r.status == "paused"
+            if wants_pause or wants_resume:
                 out.append(r)
         return out
 

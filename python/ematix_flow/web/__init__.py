@@ -26,7 +26,7 @@ from __future__ import annotations
 __all__ = ["create_app", "run_server"]
 
 
-def create_app(**kwargs):  # noqa: ANN003
+def create_app(**kwargs):
     """Lazy import wrapper around :func:`.server.create_app`.
 
     Keeps ``import ematix_flow.web`` cheap; FastAPI / starlette pull
@@ -37,7 +37,7 @@ def create_app(**kwargs):  # noqa: ANN003
     return _create(**kwargs)
 
 
-def run_server(**kwargs):  # noqa: ANN003
+def run_server(**kwargs):
     """Lazy import wrapper around :func:`.server.run_server`."""
     from ematix_flow.web.server import run_server as _run
 

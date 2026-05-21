@@ -169,7 +169,7 @@ pub enum Shape {
     },
 }
 
-/// Builder helpers — what the `shape!` macro will desugar to.
+// Builder helpers — what the `shape!` macro will desugar to.
 
 pub fn any() -> Shape {
     Shape::Any { capture: None }

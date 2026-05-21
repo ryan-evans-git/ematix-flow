@@ -83,13 +83,11 @@ pub fn expand_peer_entries(entries: &[String]) -> Result<Vec<Url>, BackendError>
 /// Resolve a single peer entry. Returns the expanded URL list (one
 /// element for plain URLs, N elements for DNS-resolved entries).
 fn expand_one(entry: &str) -> Result<Vec<Url>, String> {
-    if entry.starts_with("dns://") {
-        let host_port = &entry["dns://".len()..];
+    if let Some(host_port) = entry.strip_prefix("dns://") {
         return resolve_a_records(host_port);
     }
-    if entry.starts_with("k8s://") {
+    if let Some(host_port) = entry.strip_prefix("k8s://") {
         // k8s://service.namespace:port  →  dns://service.namespace.svc.cluster.local:port
-        let host_port = &entry["k8s://".len()..];
         let (host, port) = split_host_port(host_port)?;
         let fqdn = format!("{host}.svc.cluster.local");
         return resolve_a_records(&format!("{fqdn}:{port}"));

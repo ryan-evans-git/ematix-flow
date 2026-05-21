@@ -106,7 +106,6 @@ The Rust ``Debug`` impls for the same backends already redact (see
 
 from __future__ import annotations
 
-import os
 import re
 from dataclasses import dataclass, field, fields
 from typing import Any

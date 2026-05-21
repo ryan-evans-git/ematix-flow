@@ -1,5 +1,13 @@
 //! Σ.H.1d.1+2 — parallel numeric-keyed `FilterMultiAggSpec`.
 //!
+//! Module is REJECTED dead code (per docs/PHASE_SIGMA_H1D_BENCH_RESULT.md
+//! and the Σ.K.A bench-gate fail). Kept compiled to preserve the
+//! work for a possible revisit if/when codegen-sensitivity is
+//! addressed via PGO or a separate crate. Clippy lints are silenced
+//! at the module level because the file isn't on a code path anyone
+//! exercises today.
+#![allow(clippy::needless_range_loop, clippy::approx_constant)]
+//!
 //! ## Why this lives in a separate module
 //!
 //! Σ.H.1b tried to extend `FilterMultiAggSpec`'s existing

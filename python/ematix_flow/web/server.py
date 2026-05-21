@@ -315,7 +315,7 @@ def create_app(
     @app.post("/api/runs/{run_id}/restart")
     def post_restart(
         run_id: str,
-        body: dict[str, Any] = Body(default_factory=dict),
+        body: dict[str, Any] = Body(default_factory=dict),  # noqa: B008
     ) -> dict[str, Any]:  # type: ignore[unused-function]
         _require_history()
         assert history is not None  # narrowed by _require_history

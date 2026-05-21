@@ -80,9 +80,9 @@ use datafusion::physical_plan::aggregates::AggregateExec;
 use datafusion::physical_plan::projection::ProjectionExec;
 
 /// Σ.F catalog entry for the FilterSum shape:
-/// `Projection > Aggregate(Final, gby=0, aggs=1) > [opt CoalescePartitions]
-///   > Aggregate(Partial, gby=0, aggs=1) > Any(body)`. Captures the
-/// per-node references the rewriter needs by name.
+/// `Projection > Aggregate(Final, gby=0, aggs=1) >
+/// [opt CoalescePartitions] > Aggregate(Partial, gby=0, aggs=1) > Any(body)`.
+/// Captures the per-node references the rewriter needs by name.
 fn filter_sum_shape() -> Shape {
     // The Partial agg + body subtree appears twice (with and without
     // an intervening CoalescePartitions). DataFusion elides the

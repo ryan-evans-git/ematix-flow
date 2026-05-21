@@ -25,7 +25,6 @@ from ematix_flow.warehouses import (
     snowflake_query_to_arrow,
 )
 
-
 # ----- SnowflakeConnection ----------------------------------------
 
 
@@ -376,7 +375,7 @@ class TestRunWarehousePipeline:
         # snowflake_write_arrow; we monkeypatch via the module.
         import ematix_flow.warehouses as wh
 
-        def _fake_write_pandas(client, df, table_name, auto_create_table):  # noqa: ANN001
+        def _fake_write_pandas(client, df, table_name, auto_create_table):
             captured.append(pa.Table.from_pandas(df))
             return (True, 0, len(df), 0)
 
@@ -391,7 +390,6 @@ class TestRunWarehousePipeline:
             WarehouseSource,
             WarehouseTarget,
             run_warehouse_pipeline,
-            snowflake_write_arrow,
         )
 
         # Build a tiny "source" table.
@@ -399,11 +397,10 @@ class TestRunWarehousePipeline:
 
         # Monkeypatch write_pandas at the import site to avoid
         # needing the real snowflake SDK.
-        import ematix_flow.warehouses as wh
 
         captured: list[pa.Table] = []
 
-        def _fake_write_pandas(client, df, table_name, auto_create_table):  # noqa: ANN001
+        def _fake_write_pandas(client, df, table_name, auto_create_table):
             captured.append(pa.Table.from_pandas(df))
             return (True, 0, len(df), 0)
 

@@ -1,16 +1,13 @@
 """Tests for the worker-side PauseChecker (Phase 4b-4)."""
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from unittest.mock import MagicMock
-
-import pytest
 
 from ematix_flow.run_log.history import InMemoryRunHistory, RunRecord
 from ematix_flow.web.pause import PauseChecker
 
-
-UTC = timezone.utc
+UTC = UTC
 
 
 def _ts() -> datetime:

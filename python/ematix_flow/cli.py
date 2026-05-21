@@ -1047,7 +1047,7 @@ def main(argv: list[str] | None = None) -> int:
     return args.func(args)
 
 
-def _cmd_web(args) -> int:  # noqa: ANN001
+def _cmd_web(args) -> int:
     """Launch the FastAPI server. Lazy-imports the web module so users
     who never run the UI don't pay the fastapi / uvicorn import cost.
     """

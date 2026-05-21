@@ -6,17 +6,14 @@ with the right env vars carrying restart_from_step / rerun_full /
 prior_run_id."""
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from unittest.mock import MagicMock
-
-import pytest
 
 from ematix_flow.run_log.history import InMemoryRunHistory, RunRecord
 from ematix_flow.run_log.protocol import ClaimResult
 from ematix_flow.scheduler.loop import _pickup_pending_actions
 
-
-UTC = timezone.utc
+UTC = UTC
 
 
 def _ts(year=2026, month=5, day=20, hour=14) -> datetime:

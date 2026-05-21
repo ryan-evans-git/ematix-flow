@@ -50,14 +50,13 @@ clean place to land.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 import pyarrow as pa
 
 from ematix_flow.connections import Connection
 from ematix_flow.secrets import expand
-
 
 __all__ = [
     "BigQueryConnection",
@@ -558,7 +557,7 @@ def redshift_write_arrow(
         # Clean up the staging file even if COPY failed.
         try:
             _s3_client.delete_object(Bucket=bucket, Key=key)
-        except Exception:  # noqa: BLE001
+        except Exception:
             pass  # best-effort cleanup
     return table.num_rows
 

@@ -1,7 +1,7 @@
 """Tests for the RunHistoryStore protocol + InMemoryRunHistory impl."""
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -11,8 +11,7 @@ from ematix_flow.run_log.history import (
     RunRecord,
 )
 
-
-UTC = timezone.utc
+UTC = UTC
 
 
 def _ts(year=2026, month=5, day=20, hour=14, minute=0, second=0) -> datetime:
@@ -270,6 +269,7 @@ class TestWebServerWithHistory:
 
     def _make_client(self):
         from fastapi.testclient import TestClient
+
         from ematix_flow.web.server import create_app
 
         store = InMemoryRunHistory()
@@ -323,6 +323,7 @@ class TestWebServerWithHistory:
     def test_streaming_failed_run_offers_resume_from_watermark(self):
         pytest.importorskip("fastapi")
         from fastapi.testclient import TestClient
+
         from ematix_flow.web.server import create_app
 
         store = InMemoryRunHistory()
@@ -470,6 +471,7 @@ class TestPostEndpoints:
     def _make(self):
         pytest.importorskip("fastapi")
         from fastapi.testclient import TestClient
+
         from ematix_flow.web.server import create_app
 
         store = InMemoryRunHistory()
@@ -565,6 +567,7 @@ class TestPostEndpoints:
         # actions with a clear pointer.
         pytest.importorskip("fastapi")
         from fastapi.testclient import TestClient
+
         from ematix_flow.web.server import create_app
 
         client = TestClient(create_app())  # no history

@@ -41,10 +41,9 @@ boundary.
 from __future__ import annotations
 
 from dataclasses import replace as _replace
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from ematix_flow.run_log.history import RunHistoryStore
-
 
 __all__ = ["PauseChecker"]
 
@@ -108,7 +107,6 @@ class PauseChecker:
         # Use `record_run_record` (the idempotent write API) so
         # backends without dedicated "update status" methods still
         # work uniformly.
-        from dataclasses import replace as _replace
 
         new_extras = dict(rec.extras)
         new_extras["paused_at"] = _iso_now()
@@ -131,5 +129,5 @@ class PauseChecker:
 
 
 def _iso_now() -> str:
-    ts = datetime.now(timezone.utc)
+    ts = datetime.now(UTC)
     return ts.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
