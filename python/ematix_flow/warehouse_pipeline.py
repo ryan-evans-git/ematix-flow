@@ -61,9 +61,11 @@ from ematix_flow.warehouses import (
 )
 
 __all__ = [
+    "WAREHOUSE_PIPELINE_CALLBACK_PREFIX",
     "InMemoryWatermarkStore",
     "WatermarkStore",
     "warehouse_pipeline",
+    "warehouse_pipeline_callback_name",
 ]
 
 
@@ -367,6 +369,59 @@ def warehouse_pipeline(
             retry=retry,
         )(wrapped)
 
+        # Task #559: register the wrapped function as a Rust-callable
+        # callback under a deterministic name. This lets the Rust
+        # scheduler invoke warehouse pipelines without subprocess
+        # overhead — once the Rust executor uses the bridge, hot
+        # warehouse pipelines avoid per-tick Python startup cost.
+        # Silently skip if the compiled extension isn't available
+        # (development install via plain `pip install`); falls back
+        # to the existing in-process scheduler path.
+        _register_warehouse_pipeline_callback(pipeline_name, wrapped)
+
         return wrapped
 
     return decorate
+
+
+WAREHOUSE_PIPELINE_CALLBACK_PREFIX = "ematix_flow.warehouse_pipeline:"
+
+
+def _register_warehouse_pipeline_callback(
+    pipeline_name: str,
+    wrapped: Callable[[], dict[str, Any]],
+) -> None:
+    """Best-effort registration of ``wrapped`` as a Rust-side callback.
+
+    The callback adapter takes JSON ``{}`` (no args today — the
+    pipeline name comes from the callback name itself) and returns
+    the JSON-encoded run-result dict. Silently no-ops when the
+    compiled extension hasn't been built.
+    """
+    try:
+        from ematix_flow import _core  # type: ignore[attr-defined]
+    except ImportError:
+        return  # extension not built — scheduler keeps using in-process path
+
+    register = getattr(_core, "register_python_callback", None)
+    if register is None:
+        # Extension is loaded but built against an older version that
+        # doesn't expose the bridge. Silently no-op; the scheduler keeps
+        # using the in-process path.
+        return
+
+    import json
+
+    def _adapter(_req_bytes: bytes) -> bytes:
+        result = wrapped()
+        return json.dumps(result).encode("utf-8")
+
+    callback_name = WAREHOUSE_PIPELINE_CALLBACK_PREFIX + pipeline_name
+    register(callback_name, _adapter)
+
+
+def warehouse_pipeline_callback_name(pipeline_name: str) -> str:
+    """Return the Rust callback name for ``pipeline_name``. Pinned as
+    a helper so the Rust side never has to know the prefix scheme;
+    Python owns the naming convention."""
+    return WAREHOUSE_PIPELINE_CALLBACK_PREFIX + pipeline_name
