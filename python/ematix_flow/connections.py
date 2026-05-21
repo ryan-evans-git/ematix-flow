@@ -115,6 +115,7 @@ __all__ = [
     "DeltaLocalConnection",
     "DeltaS3Connection",
     "DuckDBConnection",
+    "GlueSchemaRegistryConnection",
     "KafkaConnection",
     "KinesisConnection",
     "MySQLConnection",
@@ -281,6 +282,66 @@ class SchemaRegistryConnection(Connection):
         if not self.url:
             raise ValueError(
                 f"SchemaRegistryConnection({self.name!r}): url is required"
+            )
+
+
+@dataclass(repr=False)
+class GlueSchemaRegistryConnection(Connection):
+    """AWS Glue Schema Registry handle.
+
+    Different wire format from Confluent SR (``0x03`` header byte +
+    16-byte schema UUID + 1-byte compression byte + payload, vs
+    Confluent's ``0x00`` + 4-byte BE schema id), and AWS IAM auth
+    instead of HTTP basic. The Rust runner picks the framing based on
+    the connection ``kind``.
+
+    Auth options, in priority order:
+
+    1. ``aws_profile=`` — read credentials from ``~/.aws/credentials``
+       under the named profile (best for dev).
+    2. ``aws_access_key_id=`` + ``aws_secret_access_key=`` — explicit
+       static creds (discouraged; prefer IAM role / SSO / env vars).
+       Both must be set together.
+    3. Implicit — boto3's default credential chain (env vars, EC2
+       instance metadata, EKS pod identity, etc.). This is the
+       recommended production path; leave the auth fields unset.
+    """
+
+    registry_name: str = ""
+    region: str = ""
+    aws_profile: str | None = None
+    aws_access_key_id: str | None = None
+    aws_secret_access_key: str | None = None
+
+    def __post_init__(self) -> None:
+        self.kind = "glue_schema_registry"
+        if not self.registry_name:
+            raise ValueError(
+                f"GlueSchemaRegistryConnection({self.name!r}): "
+                "registry_name is required"
+            )
+        if not self.region:
+            raise ValueError(
+                f"GlueSchemaRegistryConnection({self.name!r}): region is required"
+            )
+        # Both halves of static creds must be set together; partial is
+        # an obvious misuse — fail at construction, not on first call.
+        has_key = bool(self.aws_access_key_id)
+        has_secret = bool(self.aws_secret_access_key)
+        if has_key != has_secret:
+            raise ValueError(
+                f"GlueSchemaRegistryConnection({self.name!r}): "
+                "aws_access_key_id and aws_secret_access_key must be set "
+                "together (or both omitted to use boto3's default "
+                "credential chain)"
+            )
+        # Profile + explicit creds is ambiguous — the user picked two
+        # auth modes. Reject up front.
+        if self.aws_profile and (has_key or has_secret):
+            raise ValueError(
+                f"GlueSchemaRegistryConnection({self.name!r}): pass either "
+                "aws_profile= OR aws_access_key_id/aws_secret_access_key=, "
+                "not both"
             )
 
 
@@ -508,6 +569,7 @@ _KIND_FACTORIES: dict[str, type] = {
     "pubsub": PubSubConnection,
     "kinesis": KinesisConnection,
     "schema_registry": SchemaRegistryConnection,
+    "glue_schema_registry": GlueSchemaRegistryConnection,
     "postgres": PostgresConnection,
     "mysql": MySQLConnection,
     "sqlite": SQLiteConnection,
