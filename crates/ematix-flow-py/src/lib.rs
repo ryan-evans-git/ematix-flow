@@ -912,51 +912,49 @@ fn unwrap_udaf_handles(
 #[pyfunction]
 fn connect(py: Python<'_>, url: &str) -> PyResult<Connection> {
     let dsn = url.to_string();
-    let backend: Arc<dyn Backend> =
-        if url.starts_with("postgres://") || url.starts_with("postgresql://") {
-            let url_for_connect = dsn.clone();
-            let pool = py
-                .detach(|| rt().block_on(async move { PgPool::connect(&url_for_connect).await }))
-                .map_err(|e| PyValueError::new_err(e.to_string()))?;
-            Arc::new(PostgresBackend::new(Arc::new(pool), dsn.clone()))
-        } else if url.starts_with("mysql://") || url.starts_with("mysql+pymysql://") {
-            // mysql_async expects `mysql://` — strip the SQLAlchemy
-            // driver qualifier when present.
-            let stripped = url.replacen("mysql+pymysql://", "mysql://", 1);
-            let backend = MySQLBackend::open(stripped)
-                .map_err(|e| PyValueError::new_err(format!("mysql connect: {e}")))?;
-            Arc::new(backend)
-        } else if url == ":memory:"
-            || url.starts_with("sqlite://")
-            || url.starts_with("sqlite:///")
-        {
-            // sqlite://path or sqlite:///abs/path → strip the prefix
-            // before handing to rusqlite.
-            let location = url
-                .strip_prefix("sqlite:///")
-                .or_else(|| url.strip_prefix("sqlite://"))
-                .unwrap_or(url)
-                .to_string();
-            let backend = SQLiteBackend::open(location)
-                .map_err(|e| PyValueError::new_err(format!("sqlite open: {e}")))?;
-            Arc::new(backend)
-        } else if url.starts_with("duckdb://") || url.starts_with("duckdb:///") {
-            let location = url
-                .strip_prefix("duckdb:///")
-                .or_else(|| url.strip_prefix("duckdb://"))
-                .unwrap_or(url)
-                .to_string();
-            let backend = DuckDBBackend::open(location)
-                .map_err(|e| PyValueError::new_err(format!("duckdb open: {e}")))?;
-            Arc::new(backend)
-        } else {
-            return Err(PyValueError::new_err(format!(
-                "unsupported connection URL scheme in {url:?}. Supported: \
+    let backend: Arc<dyn Backend> = if url.starts_with("postgres://")
+        || url.starts_with("postgresql://")
+    {
+        let url_for_connect = dsn.clone();
+        let pool = py
+            .detach(|| rt().block_on(async move { PgPool::connect(&url_for_connect).await }))
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        Arc::new(PostgresBackend::new(Arc::new(pool), dsn.clone()))
+    } else if url.starts_with("mysql://") || url.starts_with("mysql+pymysql://") {
+        // mysql_async expects `mysql://` — strip the SQLAlchemy
+        // driver qualifier when present.
+        let stripped = url.replacen("mysql+pymysql://", "mysql://", 1);
+        let backend = MySQLBackend::open(stripped)
+            .map_err(|e| PyValueError::new_err(format!("mysql connect: {e}")))?;
+        Arc::new(backend)
+    } else if url == ":memory:" || url.starts_with("sqlite://") || url.starts_with("sqlite:///") {
+        // sqlite://path or sqlite:///abs/path → strip the prefix
+        // before handing to rusqlite.
+        let location = url
+            .strip_prefix("sqlite:///")
+            .or_else(|| url.strip_prefix("sqlite://"))
+            .unwrap_or(url)
+            .to_string();
+        let backend = SQLiteBackend::open(location)
+            .map_err(|e| PyValueError::new_err(format!("sqlite open: {e}")))?;
+        Arc::new(backend)
+    } else if url.starts_with("duckdb://") || url.starts_with("duckdb:///") {
+        let location = url
+            .strip_prefix("duckdb:///")
+            .or_else(|| url.strip_prefix("duckdb://"))
+            .unwrap_or(url)
+            .to_string();
+        let backend = DuckDBBackend::open(location)
+            .map_err(|e| PyValueError::new_err(format!("duckdb open: {e}")))?;
+        Arc::new(backend)
+    } else {
+        return Err(PyValueError::new_err(format!(
+            "unsupported connection URL scheme in {url:?}. Supported: \
                  postgres:// / postgresql:// , mysql:// / mysql+pymysql:// , \
                  sqlite:// / sqlite:///<path> / :memory: , \
                  duckdb:// / duckdb:///<path>"
-            )));
-        };
+        )));
+    };
     Ok(Connection { backend, dsn })
 }
 
