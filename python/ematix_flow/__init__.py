@@ -26,6 +26,11 @@ from ematix_flow.connections import (
 )
 from ematix_flow.decorators import ematix
 from ematix_flow.markers import natural_key, nullable, pk
+from ematix_flow.pipeline import (
+    AllOf,
+    AnyOf,
+    TriggerOp,
+)
 from ematix_flow.streaming import (
     CDC,
     Aggregation,
@@ -49,11 +54,6 @@ from ematix_flow.udf import (
     apply_udf_to_batch,
     udf,
 )
-from ematix_flow.pipeline import (
-    AllOf,
-    AnyOf,
-    TriggerOp,
-)
 
 # Read the installed-package version dynamically so a release bump
 # only needs to touch Cargo.toml + pyproject.toml — not this file.
@@ -74,10 +74,10 @@ except ImportError:
     __version__ = _core.core_version()
 
 __all__ = [
-    "AllOf",
-    "AnyOf",
     "CDC",
     "Aggregation",
+    "AllOf",
+    "AnyOf",
     "Connection",
     "DeltaLocalConnection",
     "DeltaS3Connection",

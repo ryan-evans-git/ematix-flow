@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import logging
 import sys
+from datetime import UTC
 from importlib import resources
 from pathlib import Path
 from typing import Any
@@ -546,12 +547,19 @@ def create_app(
                 last_self_success is None or last_up_success > last_self_success
             ):
                 state = "ready"
-            if state == "pending" and latest is not None and latest.status == "failed":
-                if last_up_success is None or (
-                    last_self_success is not None
-                    and last_up_success <= last_self_success
-                ):
-                    state = "failed"
+            if (
+                state == "pending"
+                and latest is not None
+                and latest.status == "failed"
+                and (
+                    last_up_success is None
+                    or (
+                        last_self_success is not None
+                        and last_up_success <= last_self_success
+                    )
+                )
+            ):
+                state = "failed"
             return {"kind": "leaf", "name": op, "state": state}
 
         if isinstance(op, TriggerOp):
@@ -601,9 +609,8 @@ def create_app(
         """
         out: list[dict[str, Any]] = []
         from datetime import datetime as _dt
-        from datetime import timezone as _utc_tz
 
-        now = _dt.now(_utc_tz.utc)
+        now = _dt.now(UTC)
 
         # Schedule trigger
         if schedule:
@@ -612,21 +619,13 @@ def create_app(
             try:
                 next_tick = forecast_next_run(
                     schedule,
-                    now=anchor or now - _dt.now(_utc_tz.utc).utcoffset() if False else (anchor or now),
+                    now=anchor or now,
                     timezone=timezone_name,
                 )
             except Exception:
                 next_tick = None
             if next_tick is not None:
-                # If we have no last self run, the "next tick after epoch" is
-                # essentially "the next future tick" — treat as pending.
-                state = "ready" if (anchor is not None and now >= next_tick) else (
-                    "ready" if (anchor is None and False) else "pending"
-                )
-                # If anchor is None (never ran), still mark as ready if the
-                # tick has passed (i.e., we should fire on first scheduler tick).
-                if anchor is None and now >= next_tick:
-                    state = "ready"
+                state = "ready" if now >= next_tick else "pending"
                 # Format the tick in the workflow's tz for the label.
                 label = _format_tick(next_tick, timezone_name, now)
             else:
@@ -876,7 +875,7 @@ def create_app(
         new run_id.
         """
         import uuid
-        from datetime import datetime, timezone as _tz
+        from datetime import datetime
 
         from ematix_flow.run_log.history import RunRecord
 
@@ -889,7 +888,7 @@ def create_app(
                 run_id=new_id,
                 pipeline=pipeline_name,
                 status="requested",
-                started_at=datetime.now(_tz.utc),
+                started_at=datetime.now(UTC),
                 finished_at=None,
                 attempt=1,
                 kind=kind,
@@ -917,8 +916,10 @@ def create_app(
         assert history is not None
         try:
             from ematix_flow.pipeline import _REGISTRY, _WORKFLOWS
-        except Exception:
-            raise HTTPException(status_code=500, detail="pipeline registry unavailable")
+        except Exception as e:
+            raise HTTPException(
+                status_code=500, detail="pipeline registry unavailable"
+            ) from e
         wf = _WORKFLOWS.get(name)
         if wf is None:
             # Allow a workflow-of-one (standalone job/streaming) by name too,
@@ -928,8 +929,10 @@ def create_app(
                     from ematix_flow.streaming import _STREAMING_PIPELINES
                     if name not in _STREAMING_PIPELINES:
                         raise HTTPException(status_code=404, detail=f"unknown workflow {name!r}")
-                except ImportError:
-                    raise HTTPException(status_code=404, detail=f"unknown workflow {name!r}")
+                except ImportError as e:
+                    raise HTTPException(
+                        status_code=404, detail=f"unknown workflow {name!r}"
+                    ) from e
             selected = [name]
             all_jobs = (name,)
         else:
@@ -978,8 +981,10 @@ def create_app(
         assert history is not None
         try:
             from ematix_flow.pipeline import _REGISTRY
-        except Exception:
-            raise HTTPException(status_code=500, detail="pipeline registry unavailable")
+        except Exception as e:
+            raise HTTPException(
+                status_code=500, detail="pipeline registry unavailable"
+            ) from e
         if name not in _REGISTRY:
             raise HTTPException(status_code=404, detail=f"unknown job {name!r}")
         cascade = bool(body.get("cascade_downstream", False))
