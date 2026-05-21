@@ -136,6 +136,10 @@ class TestGlueSchemaRegistryProbe:
         assert report.status in ("skip", "ok", "fail")
 
     def test_list_registries_success(self) -> None:
+        # `patch("boto3.client")` needs boto3 to be importable. In dev /
+        # local runs the package is present (via the `[schema-registry-
+        # glue]` extra); in barebones CI runners it isn't, so skip.
+        pytest.importorskip("boto3")
         with patch("boto3.client") as mock_boto:
             client = mock_boto.return_value
             client.list_registries.return_value = {
