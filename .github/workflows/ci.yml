@@ -160,7 +160,8 @@ jobs:
         # so cross-job reruns hit the warm cache.
         run: |
           uv pip install 'maturin>=1.7' pytest 'pytest-asyncio>=0.23' \
-            ruff bandit pip-audit pip-licenses numpy 'pyarrow>=15'
+            ruff bandit pip-audit pip-licenses numpy 'pyarrow>=15' \
+            'pandas>=2.0'
       - name: Build extension
         # CI builds the Python extension in debug (not release) mode.
         # The release build was originally chosen for perf parity with

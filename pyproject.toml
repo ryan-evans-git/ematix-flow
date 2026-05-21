@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "ematix-flow"
-version = "0.3.0"
+version = "0.4.0"
 description = "Move data between databases, files, and streams from Python. Rust + Apache Arrow under the hood."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -136,6 +136,60 @@ observability = [
 # pull in their respective cloud SDKs as opt-in extras.
 executor-k8s = ["kubernetes>=29"]
 executor-lambda = ["boto3>=1.34"]
+
+# ---- Secrets-resolver extras (Phase 1 — pluggable secrets) ---------
+# The EnvResolver is stdlib-only. The three external-store resolvers
+# pull their respective SDKs as opt-in extras. Users register the
+# matching resolver at app bootstrap; see
+# ``python/ematix_flow/secrets.py`` and docs/USER_GUIDE.md.
+secrets-vault       = ["hvac>=2.0"]
+secrets-aws         = ["boto3>=1.34"]
+secrets-gcp         = ["google-cloud-secret-manager>=2.16"]
+secrets = [
+    "hvac>=2.0",
+    "boto3>=1.34",
+    "google-cloud-secret-manager>=2.16",
+]
+
+# ---- Web UI extras (Phase 4 — flow web subcommand) -----------------
+# FastAPI + uvicorn server + embedded Vite/Svelte SPA bundle. The
+# Python wheel ships the pre-built SPA in `ematix_flow/web/ui_dist/`
+# at build time so `flow web` works out of the box.
+web = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.27",
+]
+
+# ---- Cloud warehouse extras (Phase 2 — Snowflake / BigQuery / Redshift)
+# Each warehouse's typed Connection + the matching `*_query_to_arrow`
+# adapter pulls the upstream Python SDK as an opt-in extra. The
+# Connection dataclasses themselves are stdlib-only; install the
+# extra only when you actually need to talk to that warehouse.
+snowflake = [
+    "snowflake-connector-python>=3.7",
+    # `to_pandas()` → write_pandas() bridge needs pandas at runtime.
+    "pandas>=2.0",
+    "pyarrow>=15",
+]
+bigquery  = [
+    "google-cloud-bigquery>=3.17",
+    "google-cloud-bigquery-storage>=2.24",
+    "pandas>=2.0",
+    "pyarrow>=15",
+]
+redshift  = [
+    "redshift-connector>=2.1",
+    "pandas>=2.0",
+    "pyarrow>=15",
+]
+warehouses = [
+    "snowflake-connector-python>=3.7",
+    "google-cloud-bigquery>=3.17",
+    "google-cloud-bigquery-storage>=2.24",
+    "redshift-connector>=2.1",
+    "pandas>=2.0",
+    "pyarrow>=15",
+]
 
 # Convenience: everything ematix-flow can plug into. Heavy install
 # — use targeted extras above in production.

@@ -1017,8 +1017,51 @@ def main(argv: list[str] | None = None) -> int:
     )
     conn_set.set_defaults(func=_cmd_connections_set)
 
+    # Phase 4 of "What's not shipped": web UI for run history +
+    # restart / rerun / pause actions.
+    web_p = sub.add_parser(
+        "web",
+        help="launch the ematix-flow web UI on http://127.0.0.1:8080 by default",
+    )
+    web_p.add_argument(
+        "--bind",
+        default="127.0.0.1",
+        help="address to bind (default 127.0.0.1; binding to a non-loopback "
+        "address logs a warning since Phase 4a ships without auth)",
+    )
+    web_p.add_argument(
+        "--port",
+        type=int,
+        default=8080,
+        help="port to listen on (default 8080)",
+    )
+    web_p.add_argument(
+        "--log-level",
+        default="info",
+        choices=["debug", "info", "warning", "error"],
+        help="uvicorn log level (default info)",
+    )
+    web_p.set_defaults(func=_cmd_web)
+
     args = parser.parse_args(argv)
     return args.func(args)
+
+
+def _cmd_web(args) -> int:
+    """Launch the FastAPI server. Lazy-imports the web module so users
+    who never run the UI don't pay the fastapi / uvicorn import cost.
+    """
+    try:
+        from ematix_flow.web import run_server
+    except ImportError as exc:
+        print(
+            f"error: {exc}\n"
+            "Install the web extra: pip install ematix-flow[web]",
+            file=sys.stderr,
+        )
+        return 1
+    run_server(host=args.bind, port=args.port, log_level=args.log_level)
+    return 0
 
 
 if __name__ == "__main__":  # pragma: no cover

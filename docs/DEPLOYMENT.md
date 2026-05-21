@@ -424,6 +424,108 @@ daemon, then remove the cron entry once you're satisfied.
 
 ---
 
+## Recipe 9 — Distributed mesh with peer auto-detection
+
+When the workload outgrows a single process, ematix-flow can fan
+queries out across a peer mesh of `flow-worker` processes via Apache
+Arrow Flight.
+
+### Engine modes
+
+| `engine` | Behavior |
+|---|---|
+| `"single"` *(alias of `"datafusion"`)* | Always in-process. Specifying `peers` is rejected (clear pointer to use `"auto"` or `"distributed"`). |
+| `"distributed"` | Always peer-distributed. Requires `peers = [...]`. Window/join transforms are rejected — not yet supported. |
+| **`"auto"` *(default when `engine` is absent)*** | Try distributed if peers expand to ≥1 URL at startup AND no window/join is configured; otherwise fall back to in-process. The choice is logged at `info!` level so operators can verify which path was taken. |
+
+`engine = "auto"` is the default starting in Phase 3.5. Existing
+configs that didn't specify `engine` previously defaulted to
+`"datafusion"`; with the new default they behave **identically** as
+long as they had no `peers` block (which earlier validation rejected
+anyway, so this is a no-op for every shipped config).
+
+Each peer URL in the `peers` list can be one of three shapes — mix
+freely:
+
+| Scheme | Example | When to use |
+| --- | --- | --- |
+| `http://host:port` | `http://flow-01.local:50051` | Fixed-membership clusters, dev meshes, anything where pod IPs are stable. |
+| `dns://host:port` | `dns://flow-workers.flow.svc.cluster.local:50051` | Any DNS-driven registry — K8s headless services, Consul DNS, AWS Cloud Map, on-prem DNS round-robin. Resolves the A records once at backend open. |
+| `k8s://service.namespace:port` | `k8s://flow-workers.flow:50051` | Sugar for the `dns://` form targeting `*.svc.cluster.local`. Lets one line replace a 50-pod list. |
+
+### K8s headless service example
+
+```yaml
+# Service: headless so each pod gets its own A record.
+apiVersion: v1
+kind: Service
+metadata:
+  name: flow-workers
+  namespace: flow
+spec:
+  clusterIP: None            # headless — exposes per-pod A records
+  selector: { app: flow-worker }
+  ports:
+    - name: grpc
+      port: 50051
+      targetPort: 50051
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata: { name: flow-worker, namespace: flow }
+spec:
+  serviceName: flow-workers
+  replicas: 5
+  selector: { matchLabels: { app: flow-worker } }
+  template:
+    metadata: { labels: { app: flow-worker } }
+    spec:
+      containers:
+        - name: flow-worker
+          image: my-registry/flow:latest
+          command: ["flow-worker"]
+          args:  ["--bind=0.0.0.0:50051"]
+          ports: [{ containerPort: 50051, name: grpc }]
+```
+
+Coordinator config (anywhere — same cluster, another K8s ns, or
+outside K8s entirely as long as the DNS resolves):
+
+```toml
+# pipeline.toml
+[engine]
+kind = "distributed"
+peers = ["k8s://flow-workers.flow:50051"]
+```
+
+`flow run pipeline.toml` resolves `flow-workers.flow.svc.cluster.local`
+at start-up, fans out across whatever pods are alive at that
+moment, and the Flight mesh balances work.
+
+### Refresh semantics
+
+DNS resolution happens **once** when the backend opens. If pods
+churn (scale event, rolling restart), the SessionContext won't
+re-resolve until the process restarts or rebuilds the backend.
+For batch-job-style usage (Kubernetes Jobs, cron, `flow scheduler`
+launches) this is fine — every invocation gets a fresh peer list.
+Long-lived coordinator processes that need to track autoscaling
+events should run on a restart-on-config-change loop today;
+periodic refresh is a Phase 3b follow-up.
+
+### Diagnostic
+
+Bad peer entries surface at `flow run` startup with a clear
+quoted-entry error:
+
+```
+$ flow run pipeline.toml
+Error: peer #1 ("k8s://flow-workers.flow"): missing port in
+"flow-workers.flow" (expected host:port)
+```
+
+---
+
 ## Observability cheat sheet
 
 ### Alerters

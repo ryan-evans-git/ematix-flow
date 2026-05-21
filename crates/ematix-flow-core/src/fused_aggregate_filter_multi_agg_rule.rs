@@ -75,9 +75,58 @@ use datafusion::physical_plan::repartition::RepartitionExec;
 use crate::fused_aggregate_exec::FusedAggregateExec;
 use crate::fused_aggregate_filter_multi_agg::{FilterMultiAggSpec, GroupKeyKind};
 use crate::fused_jit::{AggExpr, Clause, ClauseOp, ColumnTy};
-use crate::fused_jit_rule::{
-    AggregateShapeConfig, FinalAggMode, MatchedAggregateShape, match_aggregate_query_shape,
+use crate::shape_catalog::{
+    AggMode, MatchedSubtree, Shape, aggregate, any_capture, optional, projection, repartition_hash,
+    wrap_top_for_limit_and_sort,
 };
+use datafusion::physical_plan::aggregates::AggregateExec;
+
+/// Σ.F catalog entry for the FilterMultiAgg shape (TPC-H Q1 and kin):
+///
+/// ```text
+/// [opt GlobalLimit]
+///   > [opt SortPreservingMerge > Sort  |  Sort  |  ø]
+///     > Projection
+///       > Aggregate(FinalPartitioned)
+///         > RepartitionExec(Hash)
+///           > Aggregate(Partial)
+///             > [opt CSE Projection]
+///               > Any(body)
+/// ```
+///
+/// Σ.I.1 (2026-05-20) widened the top-of-plan wrappers to also accept
+/// `SortExec(TopK)` (ORDER BY with LIMIT pushed into the sort) and
+/// `GlobalLimitExec` (LIMIT without ORDER BY) — covers ~30 additional
+/// ClickBench-shaped queries that previously fell through the matcher.
+///
+/// Group-by arity + aggregate arity are intentionally `None` here —
+/// the per-rule validation in [`try_build_replacement`] reads them off
+/// the captured `AggregateExec` and rejects unsupported counts.
+fn filter_multi_agg_shape() -> Shape {
+    let core = projection(
+        Some("top_projection"),
+        vec![aggregate(
+            Some("final_agg"),
+            AggMode::FinalPartitioned,
+            None,
+            None,
+            vec![repartition_hash(
+                None,
+                vec![aggregate(
+                    Some("partial_agg"),
+                    AggMode::Partial,
+                    None,
+                    None,
+                    vec![optional(
+                        projection(Some("cse_projection"), vec![any_capture("body")]),
+                        any_capture("body"),
+                    )],
+                )],
+            )],
+        )],
+    );
+    wrap_top_for_limit_and_sort(core)
+}
 
 /// SQL-pattern injection rule for the generic multi-aggregate + group-by
 /// shape. See module-level docs.
@@ -118,98 +167,51 @@ impl PhysicalOptimizerRule for InjectFilterMultiAggRule {
 
 // ===== matcher entry point =====
 
-/// Try to match `node` against any of the supported plan-shape variants
-/// (with/without top SortPreservingMerge+Sort, with/without CSE
-/// projection, with/without FilterExec, 1 or 2 group-by columns, etc.)
-/// and emit the rewritten plan. Returns `Ok(None)` if no variant
-/// matches.
+/// Try to match `node` against the catalog shape for FilterMultiAgg
+/// and emit the rewritten plan. Returns `Ok(None)` if the shape misses
+/// or any per-rule validation rejects.
 fn try_match_filter_multi_agg_plan(
     node: &Arc<dyn ExecutionPlan>,
 ) -> DfResult<Option<Arc<dyn ExecutionPlan>>> {
     if std::env::var_os("EMAT_DISABLE_FILTER_MULTI_AGG").is_some() {
         return Ok(None);
     }
-    // The expected_agg_count is read off the actual plan; we just need
-    // the group-by count to commit to a CFG up-front. Try 1 then 2.
-    // Similarly, we try both `expect_top_sort` settings (with `ORDER BY`
-    // emits a SortPreservingMergeExec; without, the projection is at the
-    // top). And try `expect_cse_projection` both ways since CSE is
-    // optional even when SUM(a*(1-b))-style expressions exist (the
-    // planner may have inlined the expression).
-    for &expect_top_sort in &[true, false] {
-        for &gby in &[1usize, 2] {
-            for &expect_cse in &[true, false] {
-                // We don't know the aggregate count up front; peek the
-                // first AggregateExec(FinalPartitioned) under the
-                // optional sort/proj prefix and use its arity.
-                let Some(agg_count) = peek_final_agg_count(node, expect_top_sort) else {
-                    continue;
-                };
-                let cfg = AggregateShapeConfig {
-                    expect_top_sort,
-                    expect_top_projection: true,
-                    expect_final_mode: FinalAggMode::FinalPartitioned,
-                    expect_group_by_count: gby,
-                    expect_agg_count: agg_count,
-                    expect_cse_projection: expect_cse,
-                };
-                let Some(shape) = match_aggregate_query_shape(node, &cfg)? else {
-                    continue;
-                };
-                if let Some(rewritten) = try_build_replacement(&shape)? {
-                    return Ok(Some(rewritten));
-                }
-            }
-        }
-    }
-    Ok(None)
+    let Some(matched) = filter_multi_agg_shape().try_match(node) else {
+        return Ok(None);
+    };
+    try_build_replacement(&matched)
 }
 
-/// Peek into `node` to find the AggregateExec(FinalPartitioned) and
-/// return its `aggr_expr().len()`. Returns `None` if the prefix doesn't
-/// match the expected shape (we can short-circuit the CFG retry loop).
-fn peek_final_agg_count(node: &Arc<dyn ExecutionPlan>, expect_top_sort: bool) -> Option<usize> {
-    use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode};
-    use datafusion::physical_plan::sorts::sort::SortExec;
-    use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
-
-    let after_merge: Arc<dyn ExecutionPlan> = if expect_top_sort
-        && node
-            .as_any()
-            .downcast_ref::<SortPreservingMergeExec>()
-            .is_some()
-    {
-        node.children().first().map(|c| (*c).clone())?
-    } else {
-        node.clone()
-    };
-    let after_sort: Arc<dyn ExecutionPlan> = if expect_top_sort {
-        let _ = after_merge.as_any().downcast_ref::<SortExec>()?;
-        after_merge.children().first().map(|c| (*c).clone())?
-    } else {
-        after_merge
-    };
-    let proj = after_sort.as_any().downcast_ref::<ProjectionExec>()?;
-    let after_proj = proj.children().first().map(|c| (*c).clone())?;
-    let agg = after_proj.as_any().downcast_ref::<AggregateExec>()?;
-    if !matches!(agg.mode(), AggregateMode::FinalPartitioned) {
-        return None;
-    }
-    Some(agg.aggr_expr().len())
-}
-
-/// Given a matched plan shape, try to build the replacement
+/// Given a successfully matched plan shape (captures populated by
+/// [`filter_multi_agg_shape`]), try to build the replacement
 /// `FusedAggregateExec<FilterMultiAggSpec>` wrapped in a re-ordering
 /// projection. Returns `Ok(None)` if any per-rule validation fails
 /// (unsupported aggregate, group-key type, predicate operator, …) so
-/// the outer loop can move on to another CFG variant or fall through.
-fn try_build_replacement(
-    shape: &MatchedAggregateShape,
-) -> DfResult<Option<Arc<dyn ExecutionPlan>>> {
-    let top_proj = shape
-        .top_projection
-        .as_ref()
-        .expect("config requires top projection");
+/// the rule falls through and DataFusion's default plan runs.
+fn try_build_replacement(matched: &MatchedSubtree) -> DfResult<Option<Arc<dyn ExecutionPlan>>> {
+    let top_proj = matched
+        .get("top_projection")
+        .and_then(|p| p.as_any().downcast_ref::<ProjectionExec>())
+        .expect("filter_multi_agg_shape captures top_projection as ProjectionExec");
+    let final_agg = matched
+        .get("final_agg")
+        .and_then(|p| p.as_any().downcast_ref::<AggregateExec>())
+        .expect("filter_multi_agg_shape captures final_agg as AggregateExec");
+    // partial_agg is captured for parity with the old MatchedAggregateShape
+    // but the multi-agg rewriter does not consult it.
+    let _partial_agg = matched
+        .get("partial_agg")
+        .and_then(|p| p.as_any().downcast_ref::<AggregateExec>())
+        .expect("filter_multi_agg_shape captures partial_agg as AggregateExec");
+    // CSE projection is optional in the shape — present only when the
+    // SQL's aggregate args reference a shared sub-expression.
+    let cse_projection: Option<&ProjectionExec> = matched
+        .get("cse_projection")
+        .and_then(|p| p.as_any().downcast_ref::<ProjectionExec>());
+    let body: Arc<dyn ExecutionPlan> = matched
+        .get("body")
+        .expect("filter_multi_agg_shape captures body")
+        .clone();
 
     // Walk through the body to find the scan + optional FilterExec.
     // Body must be FilterExec→scan or a scan-with-passthrough-wrappers
@@ -217,7 +219,7 @@ fn try_build_replacement(
     // are the JOIN-on-top-of-aggregate shape handled by the
     // FusedPostJoinExec rules, not this rule.
     let (filter_clauses, scan): (Vec<ClauseLeaf>, Arc<dyn ExecutionPlan>) =
-        if let Some(filter) = shape.body.as_any().downcast_ref::<FilterExec>() {
+        if let Some(filter) = body.as_any().downcast_ref::<FilterExec>() {
             let Some(clauses) = extract_and_chain_clauses(filter.predicate()) else {
                 return Ok(None);
             };
@@ -232,12 +234,20 @@ fn try_build_replacement(
                 })?;
             (clauses, scan)
         } else {
-            (Vec::new(), shape.body.clone())
+            (Vec::new(), body.clone())
         };
 
-    // Reject any plan with multi-child nodes between the (Filter/)body
-    // and the scan — those are joins or set-operators we don't handle.
-    if !is_passthrough_chain_to_leaf(&scan) {
+    // Σ.H.1 (2026-05-20): accept HashJoinExec as a stopping point in
+    // the body chain in addition to a single-child-chain-to-leaf.
+    // FilterMultiAggSpec consumes batches from whatever the body
+    // produces; the join's output schema provides every column the
+    // spec needs by name (resolution failures downgrade to a graceful
+    // Ok(None) and DataFusion's default plan runs).
+    //
+    // NestedLoopJoinExec / CrossJoinExec / UnionExec stay rejected —
+    // their semantics or perf shapes aren't what the spec was
+    // designed for.
+    if !is_supported_body(&scan) {
         return Ok(None);
     }
 
@@ -248,14 +258,12 @@ fn try_build_replacement(
 
     // Extract aggregates by walking final-agg expressions. Resolve any
     // `__common_expr_N` references via the CSE projection.
-    let Some(agg_specs) =
-        extract_aggregates(shape.final_agg.aggr_expr(), shape.cse_projection.as_deref())
-    else {
+    let Some(agg_specs) = extract_aggregates(final_agg.aggr_expr(), cse_projection) else {
         return Ok(None);
     };
 
     // Extract group keys from the final aggregate's group_expr().
-    let Some(group_key_names) = extract_group_key_names(&shape.final_agg) else {
+    let Some(group_key_names) = extract_group_key_names(final_agg) else {
         return Ok(None);
     };
 
@@ -852,6 +860,11 @@ fn true_if_we_can_see_all_needed(_sch: &SchemaRef) -> bool {
 /// True if `node` and every descendant on the single-child walk down
 /// to a leaf has exactly one child (or is itself a leaf). False on the
 /// first multi-child node (HashJoinExec, NestedLoopJoinExec, …).
+///
+/// Retained for the FilterSum rule (which still requires the strict
+/// single-table form); `is_supported_body` is the loosened variant
+/// used by the multi-agg rule post-Σ.H.1.
+#[allow(dead_code)]
 fn is_passthrough_chain_to_leaf(node: &Arc<dyn ExecutionPlan>) -> bool {
     let mut cur = node.clone();
     loop {
@@ -864,6 +877,31 @@ fn is_passthrough_chain_to_leaf(node: &Arc<dyn ExecutionPlan>) -> bool {
         }
         cur = children[0].clone();
     }
+}
+
+/// Σ.H.1: True if `node` is a valid body for the FilterMultiAgg rule
+/// — either a single-child chain to a leaf, or a `HashJoinExec` whose
+/// both sides are themselves valid bodies (recursive). Rejects
+/// `NestedLoopJoinExec`, `CrossJoinExec`, `UnionExec`, and any other
+/// multi-child node that isn't a HashJoin.
+fn is_supported_body(node: &Arc<dyn ExecutionPlan>) -> bool {
+    use datafusion::physical_plan::joins::HashJoinExec;
+    let children = node.children();
+    if children.is_empty() {
+        return true;
+    }
+    if children.len() == 1 {
+        let owned: Arc<dyn ExecutionPlan> = (*children[0]).clone();
+        return is_supported_body(&owned);
+    }
+    // Multi-child: only HashJoinExec is accepted.
+    if node.as_any().downcast_ref::<HashJoinExec>().is_none() {
+        return false;
+    }
+    children.iter().all(|c| {
+        let owned: Arc<dyn ExecutionPlan> = (*c).clone();
+        is_supported_body(&owned)
+    })
 }
 
 // ===== output projection wrapper =====
@@ -1000,10 +1038,11 @@ mod tests {
         );
     }
 
-    /// Rule does not fire on a SQL with a JOIN — the body under the
-    /// aggregate stack isn't a FilterExec→scan, so the matcher rejects.
+    /// Σ.H.1 (2026-05-20): rule now fires on `Aggregate > ... >
+    /// HashJoinExec > ...` plans. `is_supported_body` accepts a
+    /// HashJoin as a valid stopping point. Test renamed + flipped.
     #[tokio::test(flavor = "multi_thread")]
-    async fn does_not_fire_on_join_shape() {
+    async fn fires_on_hash_join_shape_post_sigma_h_1() {
         let ctx = ctx_with_rule().await;
         // Register a second tiny table to join against.
         let schema = Arc::new(ArrowSchema::new(vec![
@@ -1028,9 +1067,17 @@ mod tests {
             .await
             .unwrap();
         let plan_str = displayable(plan.as_ref()).indent(true).to_string();
+        // We expect FilterMultiAggSpec to be wired in. The plan must
+        // also still contain the HashJoinExec — the rule routes the
+        // aggregate over the join's output, it doesn't replace the
+        // join itself.
         assert!(
-            !plan_str.contains("FilterMultiAggSpec"),
-            "InjectFilterMultiAggRule wrongly fired on a JOIN shape.\nPlan:\n{plan_str}"
+            plan_str.contains("FilterMultiAggSpec"),
+            "InjectFilterMultiAggRule should now fire over a join body.\nPlan:\n{plan_str}"
+        );
+        assert!(
+            plan_str.contains("HashJoinExec"),
+            "Σ.H.1 must not eliminate the HashJoin; the join still runs.\nPlan:\n{plan_str}"
         );
     }
 

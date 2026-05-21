@@ -12,6 +12,7 @@ from datetime import UTC, datetime, timedelta
 
 from ematix_flow import pipeline
 from ematix_flow.executors import DispatchError, DispatchSpec, Executor
+from ematix_flow.run_log.history import RunHistoryStore
 from ematix_flow.run_log.protocol import RunLog
 
 log = logging.getLogger(__name__)
@@ -55,6 +56,13 @@ def run_scheduler(
     leader_lease_seconds: int = 60,
     interval_seconds: int = 60,
     worker_id: str | None = None,
+    # Phase 4b-3: optional Web-UI run-history store. When provided
+    # (typically the same backend as `run_log`), each tick walks
+    # `history.pending_actions()` and dispatches any user-enqueued
+    # restart / rerun rows via the same executor as cron-fired
+    # pipelines. Without it the scheduler ignores Web-UI actions
+    # (legacy behavior).
+    history: RunHistoryStore | None = None,
     # Test-injection hooks. Production callers don't pass these.
     max_iterations: int | None = None,
     now_fn: Callable[[], datetime] | None = None,
@@ -136,6 +144,25 @@ def run_scheduler(
             continue
 
         try:
+            # Phase 4b-3: Web-UI-enqueued actions (restart / rerun)
+            # run before the cron-driven walk so user-initiated work
+            # gets first dibs on the executor on each tick. Pause /
+            # resume transitions are also surfaced here for telemetry,
+            # but the actual transition happens worker-side (4b-4).
+            if history is not None:
+                _pickup_pending_actions(
+                    history=history,
+                    module=module,
+                    run_log=run_log,
+                    run_log_url=run_log_url,
+                    executor=executor,
+                    alerter_urls=alerter_urls or [],
+                    metrics_url=metrics_url,
+                    alerters=alerters or [],
+                    metrics=metrics,
+                    worker_id=worker_id,
+                    lease_seconds=lease_seconds,
+                )
             _walk_and_dispatch(
                 module=module,
                 run_log=run_log,
@@ -333,6 +360,107 @@ def _dispatch_one(
                     type(a).__name__, exc,
                 )
         _safe_metric(metrics, "inc_runs", spec.pipeline_name, "dispatch_failed")
+
+
+def _pickup_pending_actions(
+    *,
+    history: RunHistoryStore,
+    module: str,
+    run_log: RunLog,
+    run_log_url: str,
+    executor: Executor,
+    alerter_urls: list[str],
+    metrics_url: str | None,
+    alerters: list,
+    metrics,
+    worker_id: str,
+    lease_seconds: int,
+) -> None:
+    """Phase 4b-3: dispatch Web-UI-enqueued restart / rerun requests.
+
+    Walks ``history.pending_actions()`` and, for each
+    ``status == "requested"`` row:
+
+    1. Transitions the row to ``"running"`` via
+       ``consume_requested_run`` (CAS-style atomic; returns False if
+       another worker already grabbed it on a concurrent tick).
+    2. Claims the underlying pipeline via the same RunLog claim
+       call cron-fired pipelines use, so a Web-UI-enqueued run
+       doesn't double-dispatch alongside a scheduled one.
+    3. Dispatches via the same Executor, carrying the row's
+       ``extras["restart_from_step"]`` or ``extras["rerun_full"]``
+       through the env so the worker can honor the action.
+
+    Pause / resume transitions are also surfaced in
+    ``pending_actions`` for symmetry, but the actual run-state
+    flip happens worker-side (Phase 4b-4 — the worker checks for
+    pause_requested at the next step / watermark boundary).
+    """
+    try:
+        pending = history.pending_actions()
+    except Exception as e:
+        log.warning(
+            "scheduler: history.pending_actions failed: %s: %s",
+            type(e).__name__, e,
+        )
+        return
+    for record in pending:
+        if record.status != "requested":
+            # Pause / resume row — handled by the worker.
+            continue
+        if not history.consume_requested_run(record.run_id):
+            # Another scheduler instance grabbed it first, or the
+            # row state changed since pending_actions() ran.
+            log.debug(
+                "scheduler: pending action %s no longer requested",
+                record.run_id,
+            )
+            continue
+        claim = run_log.claim(
+            record.pipeline, worker_id, lease_seconds=lease_seconds
+        )
+        if not claim.acquired:
+            log.info(
+                "scheduler: web-enqueued run %s for pipeline %s deferred "
+                "— pipeline is already claimed by %s",
+                record.run_id, record.pipeline, claim.holder,
+            )
+            continue
+        env: dict[str, str] = {}
+        from_step = record.extras.get("restart_from_step")
+        if from_step is not None:
+            env["EMATIX_FLOW_RESTART_FROM_STEP"] = str(from_step)
+        if record.extras.get("rerun_full"):
+            env["EMATIX_FLOW_RERUN_FULL"] = "1"
+        prior = record.extras.get("prior_run_id")
+        if prior:
+            env["EMATIX_FLOW_PRIOR_RUN_ID"] = str(prior)
+        spec = DispatchSpec(
+            pipeline_name=record.pipeline,
+            module=module,
+            claim_token=claim.token,
+            lease_seconds=lease_seconds,
+            run_log_url=run_log_url,
+            alerter_urls=list(alerter_urls),
+            metrics_url=metrics_url,
+            env=env,
+        )
+        log.info(
+            "scheduler: dispatching web-enqueued run %s (pipeline=%s, "
+            "restart_from_step=%s, rerun_full=%s)",
+            record.run_id,
+            record.pipeline,
+            from_step,
+            bool(record.extras.get("rerun_full")),
+        )
+        _dispatch_one(
+            executor=executor,
+            spec=spec,
+            run_log=run_log,
+            claim_token=claim.token,
+            alerters=alerters,
+            metrics=metrics,
+        )
 
 
 def _safe_metric(metrics, method: str, *args, **kwargs) -> None:
