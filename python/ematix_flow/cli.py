@@ -1270,6 +1270,15 @@ def main(argv: list[str] | None = None) -> int:
         "Falls back to $EMATIX_FLOW_RUN_LOG_URL. Without this flag, the UI "
         "still works but pipeline / job lists fall back to stub data.",
     )
+    web_p.add_argument(
+        "--module",
+        action="append",
+        default=None,
+        help="import a pipeline module (e.g. `--module pipelines`) so the UI "
+        "can render schedule, next_run_at, and the cross-pipeline DAG. "
+        "Repeatable. Without this flag the UI still works but next-run + DAG "
+        "fall back to history-only data.",
+    )
     web_p.set_defaults(func=_cmd_web)
 
     args = parser.parse_args(argv)
@@ -1289,6 +1298,20 @@ def _cmd_web(args) -> int:
             file=sys.stderr,
         )
         return 1
+    # Import pipeline modules so the in-process registry is populated;
+    # the /api/pipelines and /api/dag endpoints look up schedule +
+    # depends_on metadata via _registry_lookup, which is empty until
+    # the @ematix.pipeline / @ematix.streaming_pipeline decorators fire.
+    for mod_name in (getattr(args, "module", None) or []):
+        try:
+            importlib.import_module(mod_name)
+        except Exception as exc:
+            print(
+                f"warning: --module {mod_name!r} failed to import "
+                f"({exc!r}); UI schedule + DAG will be empty for its "
+                "pipelines",
+                file=sys.stderr,
+            )
     # Bearer-token auth — set via --token, or fall back to the
     # EMATIX_FLOW_WEB_TOKEN env var so secrets stay out of shell history.
     token = args.token or os.environ.get("EMATIX_FLOW_WEB_TOKEN")

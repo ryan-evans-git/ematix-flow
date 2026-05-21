@@ -7,7 +7,79 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-(no entries yet — anything landing on `main` after v0.5.0 goes here)
+(no entries yet — anything landing on `main` after v0.6.0 goes here)
+
+## [0.6.0] — 2026-05-21
+
+Workflow + Job model — the previous flat "Pipelines" page becomes
+**Workflows** (user-named groupings) on top of **Jobs** (individual
+tasks). The DAG between jobs lives on the workflow declaration, not
+on individual jobs. Existing `@ematix.pipeline` code keeps working as
+single-job workflows-of-one, so this is a non-breaking model upgrade.
+
+### Added
+
+- `@ematix.workflow(name=..., jobs=[...], depends_on={...})` — new
+  decorator-style call that registers a named group of jobs plus the
+  DAG edges between them. The depends_on dict reads as
+  `{downstream: [upstream, ...]}`. Edges are mirrored into the legacy
+  per-job depends-on table so the scheduler keeps gating downstream
+  jobs on upstream freshness without changes.
+- `@ematix.job(...)` — alias for `@ematix.pipeline(...)`. Both names
+  resolve to the same decorator; new code should prefer `.job` so the
+  Python surface matches the Workflow/Job terminology the UI uses.
+- `flow web --module <name>` (repeatable) — imports a pipelines
+  module into the web-server process so the UI can render schedules,
+  next-run times, and the DAG view without a separate scheduler tick
+  having to populate the rich-history first.
+- `/api/workflows` endpoint — returns declared workflows + their
+  member jobs and DAG edges. Jobs not assigned to any workflow are
+  surfaced as synthetic `kind: "single"` workflow-of-one entries so
+  the UI doesn't need a separate "orphan jobs" code path.
+- Pipelines API now surfaces `next_run_at` for batch jobs by
+  forecasting from the registered cron + timezone when no scheduler
+  tick has populated the rich-history yet. Streaming jobs continue
+  to render `LIVE STREAMING` instead.
+
+### Changed
+
+- **Web UI** is reorganised around the new model:
+  - **Workflows** tab (default) — one card per workflow with the
+    member jobs laid out as an inline flowchart. Click any node or
+    the workflow title to refocus the full DAG view on it.
+  - **Jobs** tab — flat list of individual jobs (this is the
+    previous "Pipelines" page; the cards, last-10-strip,
+    next-run-at, and streaming throughput footer are unchanged).
+    Adds filter inputs (name, kind, latest status) and sort
+    buttons (name / kind / status / next / duration).
+  - **Runs** tab — renamed from the previous "Jobs" tab; same run
+    history table. Column headers are now clickable to sort by
+    pipeline / status / started / duration / attempt.
+  - **DAG** tab — same data, rendered as an SVG flowchart with
+    cubic-Bézier arrows from each upstream to each downstream. The
+    rank-as-column layout is gone; topological order is now
+    expressed by arrow direction. `#/dag/<job>` focuses the
+    subgraph on a single job's ancestors + descendants.
+  - Loopback bind no longer requires a bearer token by default.
+    Set `--token <secret>` (or `EMATIX_FLOW_WEB_TOKEN`) explicitly
+    when binding to a non-loopback address.
+- The pipeline DAG sub-component is extracted to
+  `web-ui/src/lib/DagFlowchart.svelte` so the Workflows card
+  preview and the full DAG view share one renderer. SVG sizes to
+  natural node-grid dimensions and only scales down when the
+  container is narrower than the canvas — single-job cards no
+  longer fill the panel.
+
+### Migration notes
+
+- Existing `@ematix.pipeline(depends_on=[...])` declarations
+  continue to work. Their edges show up on the Workflows page as
+  `kind: "single"` cards that link to the focused DAG, exactly like
+  jobs without any declared workflow.
+- To group existing jobs into a named workflow: drop the per-job
+  `depends_on=` kwargs and add one `ematix.workflow(...)` call that
+  enumerates the member jobs + the DAG between them.
+- URL bookmarks for `#/pipelines` are auto-redirected to `#/jobs`.
 
 ## [0.5.0] — 2026-05-21
 

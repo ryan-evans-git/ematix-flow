@@ -389,6 +389,102 @@ _UPSTREAM_FRESHNESS: dict[str, int | None] = {}
 _LAST_RUN: dict[str, tuple[datetime, bool]] = {}
 
 
+# ---- Workflows -----------------------------------------------------
+#
+# A Workflow is a user-named grouping of jobs (decorated functions)
+# plus the depends_on edges between them. The Workflow is where the
+# DAG lives; per-job depends_on still works for back-compat but new
+# code should declare edges in the workflow.
+#
+#   _WORKFLOWS[name]            = Workflow(name, jobs, depends_on)
+#   _JOB_TO_WORKFLOW[job_name]  = workflow name (reverse lookup)
+#
+# Jobs without an explicit workflow assignment are exposed by the API
+# as workflow-of-one when listed.
+
+
+@dataclass(frozen=True)
+class Workflow:
+    """Named grouping of jobs + the DAG between them.
+
+    ``jobs`` lists every member job by name (matching their @ematix.job
+    / @ematix.pipeline name= kwarg).
+
+    ``depends_on`` maps each downstream job to the list of upstreams it
+    waits on, all within this workflow. The same edges are mirrored into
+    the module-level ``_DEPENDS_ON`` table so the scheduler keeps working
+    unchanged.
+    """
+
+    name: str
+    jobs: tuple[str, ...]
+    depends_on: dict[str, tuple[str, ...]]
+
+
+_WORKFLOWS: dict[str, Workflow] = {}
+_JOB_TO_WORKFLOW: dict[str, str] = {}
+
+
+def register_workflow(
+    *,
+    name: str,
+    jobs: list[str],
+    depends_on: dict[str, list[str]] | None = None,
+) -> Workflow:
+    """Register a workflow.
+
+    Jobs listed in ``jobs`` don't have to be registered yet — the
+    workflow stores names; resolution happens at scheduler / UI time.
+    But ``depends_on`` keys + values must all appear in ``jobs`` so
+    the graph stays self-contained.
+    """
+    if not name:
+        raise ValueError("workflow name must be non-empty")
+    if not jobs:
+        raise ValueError(f"workflow {name!r} must declare at least one job")
+    job_set = set(jobs)
+    if len(job_set) != len(jobs):
+        raise ValueError(f"workflow {name!r}: duplicate job names in jobs=")
+    deps_norm: dict[str, tuple[str, ...]] = {}
+    for downstream, upstreams in (depends_on or {}).items():
+        if downstream not in job_set:
+            raise ValueError(
+                f"workflow {name!r}: depends_on references {downstream!r} "
+                "which isn't listed in jobs="
+            )
+        ups_t: list[str] = []
+        for u in upstreams:
+            if u not in job_set:
+                raise ValueError(
+                    f"workflow {name!r}: depends_on[{downstream!r}] references "
+                    f"{u!r} which isn't listed in jobs="
+                )
+            ups_t.append(u)
+        deps_norm[downstream] = tuple(ups_t)
+
+    wf = Workflow(name=name, jobs=tuple(jobs), depends_on=deps_norm)
+    _WORKFLOWS[name] = wf
+    for j in jobs:
+        # Last writer wins if the same job is listed in two workflows.
+        # That's a config error; surface but don't crash so import order
+        # is forgiving.
+        prior = _JOB_TO_WORKFLOW.get(j)
+        if prior is not None and prior != name:
+            import warnings
+            warnings.warn(
+                f"job {j!r} is now in workflow {name!r} (was previously "
+                f"{prior!r}); workflow membership is unique",
+                stacklevel=2,
+            )
+        _JOB_TO_WORKFLOW[j] = name
+    # Mirror edges into the module-level depends-on table so the
+    # scheduler's freshness gating keeps working.
+    for downstream, upstreams in deps_norm.items():
+        if upstreams:
+            _DEPENDS_ON[downstream] = list(upstreams)
+    return wf
+
+
 # Phase Ω.2 — declarative retry policy + in-process attempt state.
 #
 #   _RETRY_POLICY[name]     = RetryPolicy describing the retry shape

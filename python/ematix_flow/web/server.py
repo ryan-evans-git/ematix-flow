@@ -477,6 +477,56 @@ def create_app(
                 edges.append({"from": upstream, "to": name})
         return {"nodes": nodes, "edges": edges}
 
+    # ---- Workflows: named groupings of jobs ---------------------------
+    @app.get("/api/workflows")
+    def list_workflows() -> dict[str, Any]:  # type: ignore[unused-function]
+        """Each workflow is a user-named group of jobs + the DAG between
+        them. Jobs without an explicit workflow show up as a synthetic
+        workflow-of-one keyed by their own name."""
+        try:
+            from ematix_flow.pipeline import (
+                _DEPENDS_ON,
+                _JOB_TO_WORKFLOW,
+                _REGISTRY,
+                _WORKFLOWS,
+            )
+        except Exception:
+            return {"workflows": []}
+
+        all_jobs = sorted(_REGISTRY.keys())
+        result: list[dict[str, Any]] = []
+        # Declared workflows first.
+        for wf_name, wf in sorted(_WORKFLOWS.items()):
+            edges = []
+            for downstream, upstreams in wf.depends_on.items():
+                for u in upstreams:
+                    edges.append({"from": u, "to": downstream})
+            result.append(
+                {
+                    "name": wf_name,
+                    "kind": "declared",
+                    "jobs": list(wf.jobs),
+                    "edges": edges,
+                }
+            )
+        # Synthetic workflow-of-one for every unassigned job.
+        for job_name in all_jobs:
+            if job_name in _JOB_TO_WORKFLOW:
+                continue
+            # Even unassigned jobs can have depends_on (legacy decorator
+            # kwarg). Surface those edges as an "ad-hoc" workflow-of-N.
+            ups = _DEPENDS_ON.get(job_name) or []
+            edges = [{"from": u, "to": job_name} for u in ups]
+            result.append(
+                {
+                    "name": job_name,
+                    "kind": "single",
+                    "jobs": [job_name],
+                    "edges": edges,
+                }
+            )
+        return {"workflows": result}
+
     # ---- Mutating actions (Phase 4b) -------------------------------
     #
     # All four endpoints require a configured history store; without
