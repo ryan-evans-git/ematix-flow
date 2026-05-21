@@ -131,12 +131,31 @@ class TestPipelines:
 class TestRootPlaceholder:
     """Without a built SPA, the root path serves a friendly HTML
     placeholder pointing operators at /api/docs and the build
-    command."""
+    command. With a built SPA (the wheel ships ui_dist/), the root
+    serves index.html instead."""
 
     def test_root_serves_html(self, client: TestClient):
+        # The default fixture wires `create_app()` which picks up the
+        # bundled ui_dist/ — so root serves the SPA shell HTML, not the
+        # placeholder. Either way, it must be HTML pointing at /api/docs
+        # or mounting the SPA at #app.
         r = client.get("/")
         assert r.status_code == 200
         assert "text/html" in r.headers["content-type"]
+        body = r.text
+        # Accept either the legacy placeholder text or the Vite-emitted
+        # SPA shell that mounts at <div id="app">.
+        assert ("ematix-flow Web UI" in body) or ('id="app"' in body)
+
+    def test_placeholder_when_ui_dist_missing(self, tmp_path):
+        """Explicit placeholder path — when ui_dist_dir points at a
+        non-existent directory, the server falls back to the friendly
+        placeholder that names /api/docs."""
+        missing = tmp_path / "no-such-dist"
+        app = create_app(ui_dist_dir=missing)
+        client = TestClient(app)
+        r = client.get("/")
+        assert r.status_code == 200
         body = r.text
         assert "ematix-flow Web UI" in body
         assert "/api/docs" in body
