@@ -493,6 +493,14 @@ def create_app(
         except Exception:
             return {"workflows": []}
 
+        # Streaming pipelines live in a separate registry — surface them
+        # alongside batch jobs so the Workflows page shows every kind.
+        try:
+            from ematix_flow.streaming import _STREAMING_PIPELINES
+            streaming_names = sorted(_STREAMING_PIPELINES.keys())
+        except Exception:
+            streaming_names = []
+
         all_jobs = sorted(_REGISTRY.keys())
         result: list[dict[str, Any]] = []
         # Declared workflows first.
@@ -509,7 +517,7 @@ def create_app(
                     "edges": edges,
                 }
             )
-        # Synthetic workflow-of-one for every unassigned job.
+        # Synthetic workflow-of-one for every unassigned batch job.
         for job_name in all_jobs:
             if job_name in _JOB_TO_WORKFLOW:
                 continue
@@ -523,6 +531,21 @@ def create_app(
                     "kind": "single",
                     "jobs": [job_name],
                     "edges": edges,
+                }
+            )
+        # Streaming pipelines that aren't part of a declared workflow
+        # surface as single-kind workflow-of-one too. Marked as
+        # "streaming" so the UI can render the LIVE STREAMING pill in
+        # the card header instead of the next-run forecast.
+        for name in streaming_names:
+            if name in _JOB_TO_WORKFLOW:
+                continue
+            result.append(
+                {
+                    "name": name,
+                    "kind": "streaming",
+                    "jobs": [name],
+                    "edges": [],
                 }
             )
         return {"workflows": result}

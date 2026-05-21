@@ -136,18 +136,36 @@
       <div class="wf-header">
         <h3 class="wf-name">
           <a class="link" href={`#/dag/${encodeURIComponent(w.jobs[0])}`}>{w.name}</a>
-          {#if w.kind === "single"}
+          {#if w.kind === "streaming"}
+            <span class="wf-pill wf-pill--streaming">▶ LIVE STREAMING</span>
+          {:else if w.kind === "single"}
             <span class="wf-pill wf-pill--single">single</span>
           {:else}
             <span class="wf-pill">declared</span>
           {/if}
         </h3>
         <span class="wf-meta mono">
-          {w.jobs.length} job{w.jobs.length === 1 ? "" : "s"}
-          · {w.edges.length} edge{w.edges.length === 1 ? "" : "s"}
-          {#if summary.running > 0}· <span class="status status--running">{summary.running} running</span>{/if}
-          {#if summary.failed > 0}· <span class="status status--failed">{summary.failed} failed</span>{/if}
-          {#if summary.succeeded > 0}· <span class="status status--succeeded">{summary.succeeded} ok</span>{/if}
+          {#if w.kind === "streaming"}
+            {@const sj = jobMap[w.jobs[0]]}
+            {@const s1 = sj?.streaming_stats?.stats_1m}
+            {#if s1?.rows_consumed_per_sec != null}
+              <strong>Throughput:</strong>
+              <span class="mono">{s1.rows_consumed_per_sec >= 10 ? s1.rows_consumed_per_sec.toFixed(0) : s1.rows_consumed_per_sec.toFixed(2)} rps</span>
+              <span class="dim">in (1m)</span>
+              <span class="sep">·</span>
+              <strong>Batch cycle:</strong>
+              <span class="mono">{s1.avg_batch_cycle_ms != null ? (s1.avg_batch_cycle_ms < 1000 ? s1.avg_batch_cycle_ms.toFixed(0) + ' ms' : (s1.avg_batch_cycle_ms / 1000).toFixed(2) + ' s') : '—'}</span>
+              <span class="dim">avg (1m)</span>
+            {:else}
+              {w.jobs.length} job{w.jobs.length === 1 ? "" : "s"} · streaming
+            {/if}
+          {:else}
+            {w.jobs.length} job{w.jobs.length === 1 ? "" : "s"}
+            · {w.edges.length} edge{w.edges.length === 1 ? "" : "s"}
+            {#if summary.running > 0}· <span class="status status--running">{summary.running} running</span>{/if}
+            {#if summary.failed > 0}· <span class="status status--failed">{summary.failed} failed</span>{/if}
+            {#if summary.succeeded > 0}· <span class="status status--succeeded">{summary.succeeded} ok</span>{/if}
+          {/if}
         </span>
       </div>
 
@@ -190,6 +208,15 @@
     vertical-align: middle;
   }
   .wf-pill--single { color: var(--color-fg-muted, #888); border-color: var(--color-border, #444); }
+  .wf-pill--streaming {
+    color: var(--color-amber-glow, #ffb000);
+    border-color: var(--color-amber-glow, #ffb000);
+    animation: wf-pulse 2s ease-in-out infinite;
+  }
+  @keyframes wf-pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.55; }
+  }
   .wf-meta { font-size: 0.78rem; color: var(--color-fg-muted, #888); }
   .wf-footer {
     margin-top: 0.4rem;
