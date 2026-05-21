@@ -363,10 +363,14 @@ class KafkaConnection(Connection):
     # Maps directly to rdkafka's `auto.offset.reset`.
     auto_offset_reset: str | None = None
     schema_registry_url: str | None = None
-    # Π.1: typed Schema Registry reference. Accepts a
-    # `SchemaRegistryConnection` instance or a registered SR name
-    # string. Mutually exclusive with `schema_registry_url=`.
-    schema_registry: str | SchemaRegistryConnection | None = None
+    # Π.1 / task #556: typed Schema Registry reference. Accepts a
+    # ``SchemaRegistryConnection`` (Confluent wire format), a
+    # ``GlueSchemaRegistryConnection`` (AWS Glue wire format), or a
+    # registered SR name string. Mutually exclusive with
+    # ``schema_registry_url=``. The Rust backend picks the framing
+    # (Confluent 0x00+4B-id vs Glue 0x03+16B-UUID+1B-codec) based on
+    # the connection's ``kind``.
+    schema_registry: str | SchemaRegistryConnection | GlueSchemaRegistryConnection | None = None
     sasl_plain_username: str | None = None
     sasl_plain_password: str | None = None
     sasl_scram_username: str | None = None
