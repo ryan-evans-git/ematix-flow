@@ -7,8 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-Targeting v0.5.0. Each entry is a first-cut "slice 1" — see the linked PR
-for the slice plan and what's deferred to follow-ups.
+(no entries yet — anything landing on `main` after v0.5.0 goes here)
+
+## [0.5.0] — 2026-05-21
+
+Operational milestone — adds the user-facing surface (CLIs, Web UI,
+alerters, observability) on top of v0.4.0's backend matrix. Same
+query-execution surface as v0.4.0; per-query TPC-H times unchanged.
+Highlights: four new CLI subcommands (`flow doctor` / `init` / `logs`
+/ `secrets test`), bearer-token Web UI auth + cross-pipeline DAG
+view, email + PagerDuty alerters, OTEL trace spans + a starter
+Grafana dashboard, AWS Glue Schema Registry end-to-end Kafka
+dispatch, Arrow-native warehouse adapters, streaming pipeline live
+throughput in the Web UI, and the Rust executor for
+`@ematix.warehouse_pipeline` via the new PyO3 callback bridge.
 
 ### Added
 
@@ -954,5 +966,7 @@ Highlights of what's NOT in v0.1.0:
 - Iceberg-style transactional updates against object stores (use
   Delta for that today).
 
-[Unreleased]: https://github.com/ryan-evans-git/ematix-flow/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/ryan-evans-git/ematix-flow/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/ryan-evans-git/ematix-flow/compare/v0.4.0...v0.5.0
+[0.4.0]: https://github.com/ryan-evans-git/ematix-flow/compare/v0.1.0...v0.4.0
 [0.1.0]: https://github.com/ryan-evans-git/ematix-flow/releases/tag/v0.1.0
