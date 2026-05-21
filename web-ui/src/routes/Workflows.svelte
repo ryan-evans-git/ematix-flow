@@ -2,6 +2,7 @@
   import { onMount } from "svelte";
   import { listWorkflows, listPipelines, runWorkflowNow } from "../lib/api.js";
   import DagFlowchart from "../lib/DagFlowchart.svelte";
+  import TriggerExpr from "../lib/TriggerExpr.svelte";
 
   let workflows = [];
   let jobMap = {};
@@ -213,20 +214,23 @@
       {#if w.kind !== "streaming" && w.triggers && w.triggers.length > 0}
         <div class="wf-trigger">
           <span class="wf-trigger-label">Trigger:</span>
-          {#each w.triggers as t}
-            <span class="wf-trig wf-trig--{t.state}" title={`${t.kind}: ${t.label}`}>
-              <span class="wf-trig-dot"></span>
-              {#if t.kind === "schedule"}
+          {#each w.triggers as t, ti}
+            {#if ti > 0}<span class="wf-and">·&nbsp;AND&nbsp;·</span>{/if}
+            {#if t.kind === "schedule"}
+              <span class="wf-trig wf-trig--{t.state}">
+                <span class="wf-trig-dot"></span>
                 <strong>Schedule:</strong>
                 <span class="mono">{t.label}</span>
-              {:else if t.kind === "after"}
-                <strong>After:</strong>
-                <span class="mono">{t.label}</span>
-              {:else if t.kind === "on_message"}
+              </span>
+            {:else if t.kind === "on_message"}
+              <span class="wf-trig wf-trig--{t.state}">
+                <span class="wf-trig-dot"></span>
                 <strong>On message:</strong>
                 <span class="mono">{t.label}</span>
-              {/if}
-            </span>
+              </span>
+            {:else if t.kind === "after_expr"}
+              <TriggerExpr node={t.expr} topLevel={true} />
+            {/if}
           {/each}
           <button class="action wf-run-now"
                   on:click|stopPropagation={() => openRunNow(w)}

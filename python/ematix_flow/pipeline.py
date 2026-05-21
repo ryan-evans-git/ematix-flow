@@ -389,6 +389,141 @@ _UPSTREAM_FRESHNESS: dict[str, int | None] = {}
 _LAST_RUN: dict[str, tuple[datetime, bool]] = {}
 
 
+# ---- Workflow trigger expression tree (v0.7.0) -------------------
+#
+# `triggered_by=` accepts:
+#   - a single name string                    -> AllOf(<name>)
+#   - a list of names                         -> AllOf(<name>, <name>, ...)
+#   - a nested AllOf(...)/AnyOf(...) tree     -> kept as declared
+#
+# The canonical form is always a TriggerOp tree, never a flat list.
+# Leaves are str (upstream job or workflow names). Internal nodes are
+# AllOf (boolean AND) or AnyOf (boolean OR).
+
+
+@dataclass(frozen=True)
+class TriggerOp:
+    """Boolean combinator over upstream names.
+
+    ``kind`` is ``"all"`` (AND) or ``"any"`` (OR).
+    ``members`` is a tuple of strings (leaf names) or nested
+    :class:`TriggerOp` instances.
+
+    Build instances via :func:`AllOf` and :func:`AnyOf`; this dataclass
+    is exposed only so the registry / API layer can pattern-match on
+    ``.kind`` and walk ``.members``.
+    """
+
+    kind: str
+    members: tuple[Any, ...]
+
+    def leaves(self) -> tuple[str, ...]:
+        """Flat tuple of every upstream name appearing anywhere in
+        this expression (recursively). Order matches a depth-first
+        traversal of ``members``."""
+        out: list[str] = []
+        for m in self.members:
+            if isinstance(m, TriggerOp):
+                out.extend(m.leaves())
+            else:
+                out.append(m)
+        return tuple(out)
+
+
+def AllOf(*members: Any) -> TriggerOp:
+    """Boolean AND over upstream names / nested expressions.
+
+    Every member must be satisfied since this workflow last succeeded
+    for the AND to be ready. AND-of-zero (no members) is invalid;
+    AND-of-one is fine.
+    """
+    if not members:
+        raise ValueError("AllOf() requires at least one member")
+    return TriggerOp(kind="all", members=tuple(members))
+
+
+def AnyOf(*members: Any) -> TriggerOp:
+    """Boolean OR over upstream names / nested expressions.
+
+    The OR is ready as soon as any one member is ready. Useful for
+    ``A and (B or C)`` shaped trees:
+    ``AllOf("A", AnyOf("B", "C"))``.
+    """
+    if not members:
+        raise ValueError("AnyOf() requires at least one member")
+    return TriggerOp(kind="any", members=tuple(members))
+
+
+def _normalize_triggered_by(
+    value: Any,
+    *,
+    workflow_name: str,
+) -> TriggerOp | None:
+    """Coerce a ``triggered_by=`` input into a canonical ``TriggerOp``.
+
+    Accepts the legacy flat-list and bare-string shapes for
+    convenience; passes through a TriggerOp; raises ``ValueError`` on
+    anything else.
+    """
+    if value is None:
+        return None
+    if isinstance(value, TriggerOp):
+        _validate_trigger_op(value, workflow_name=workflow_name)
+        return value
+    if isinstance(value, str):
+        return TriggerOp(kind="all", members=(value,))
+    if isinstance(value, (list, tuple)):
+        if not value:
+            return None
+        # Wrap nested TriggerOps as members of an implicit AllOf.
+        for m in value:
+            if not isinstance(m, (str, TriggerOp)):
+                raise ValueError(
+                    f"workflow {workflow_name!r}: triggered_by= list members "
+                    "must be strings or AllOf/AnyOf expressions; got "
+                    f"{type(m).__name__}"
+                )
+        wrapped = TriggerOp(kind="all", members=tuple(value))
+        _validate_trigger_op(wrapped, workflow_name=workflow_name)
+        return wrapped
+    raise ValueError(
+        f"workflow {workflow_name!r}: triggered_by= must be a string, "
+        "list of strings, or AllOf/AnyOf expression; got "
+        f"{type(value).__name__}"
+    )
+
+
+def _validate_trigger_op(op: TriggerOp, *, workflow_name: str) -> None:
+    """Walk the expression tree to confirm every leaf is a string and
+    every internal node has the right shape. Raises ``ValueError`` on
+    structural problems."""
+    if op.kind not in ("all", "any"):
+        raise ValueError(
+            f"workflow {workflow_name!r}: TriggerOp.kind must be "
+            f"'all' or 'any', got {op.kind!r}"
+        )
+    if not op.members:
+        raise ValueError(
+            f"workflow {workflow_name!r}: TriggerOp.members cannot be empty"
+        )
+    seen_in_this_level: set[str] = set()
+    for m in op.members:
+        if isinstance(m, TriggerOp):
+            _validate_trigger_op(m, workflow_name=workflow_name)
+        elif isinstance(m, str):
+            if m in seen_in_this_level:
+                raise ValueError(
+                    f"workflow {workflow_name!r}: duplicate upstream "
+                    f"{m!r} in triggered_by tree at the same level"
+                )
+            seen_in_this_level.add(m)
+        else:
+            raise ValueError(
+                f"workflow {workflow_name!r}: triggered_by leaf must be "
+                f"a string, got {type(m).__name__}"
+            )
+
+
 # ---- Workflows (v0.7.0 trigger model) ----------------------------
 #
 # A Workflow is a user-named grouping of jobs. Its trigger is an
@@ -415,11 +550,14 @@ _LAST_RUN: dict[str, tuple[datetime, bool]] = {}
 class Workflow:
     """Named grouping of jobs + trigger conditions.
 
-    Trigger fields (AND-conjunction; at least one must be set unless the
-    workflow is implicitly streaming):
+    Trigger fields (AND-conjunction across the kwargs; ``triggered_by``
+    itself is a boolean expression tree of upstream names — see
+    :class:`TriggerOp`):
 
-    - ``triggered_by`` — tuple of upstream job/workflow names that must
-      have succeeded since this workflow last succeeded.
+    - ``triggered_by`` — canonical expression tree over upstream names.
+      ``None`` means no event prereqs. Build with :func:`AllOf` and
+      :func:`AnyOf`; a flat list / single string passed to
+      ``register_workflow`` is auto-normalised to ``AllOf(...)``.
     - ``schedule`` — cron expression whose next tick after the last
       self-run must have reached.
     - ``timezone`` — IANA tz for ``schedule`` interpretation.
@@ -433,10 +571,22 @@ class Workflow:
 
     name: str
     jobs: tuple[str, ...]
-    triggered_by: tuple[str, ...] = ()
+    triggered_by: TriggerOp | None = None
     schedule: str | None = None
     timezone: str | None = None
     on_message: Any = None
+
+    @property
+    def triggered_by_leaves(self) -> tuple[str, ...]:
+        """All upstream names in the trigger expression (flat).
+
+        Useful for cycle detection and registry-level lookups that
+        don't care about boolean structure. Returns ``()`` when no
+        ``triggered_by`` is set.
+        """
+        if self.triggered_by is None:
+            return ()
+        return self.triggered_by.leaves()
 
 
 _WORKFLOWS: dict[str, Workflow] = {}
@@ -447,7 +597,7 @@ def register_workflow(
     *,
     name: str,
     jobs: list[str],
-    triggered_by: list[str] | None = None,
+    triggered_by: Any = None,
     schedule: str | None = None,
     timezone: str | None = None,
     on_message: Any = None,
@@ -458,13 +608,18 @@ def register_workflow(
 ) -> Workflow:
     """Register a workflow.
 
+    ``triggered_by`` accepts a single name string, a list of names
+    (AND-conjoined), or an explicit :func:`AllOf` / :func:`AnyOf`
+    expression tree for composite shapes like ``A AND (B OR C)``.
+
     Member-job ordering inside the workflow is declared on each job
     (per-job ``depends_on=[...]`` kwarg). The workflow itself only
     declares trigger conditions + the membership list.
 
     Raises:
-        ValueError: name is empty, jobs is empty, duplicate jobs, conflicting
-            triggers, no triggers declared, or v0.6.0-shaped ``depends_on={...}``
+        ValueError: name is empty, jobs is empty, duplicate jobs,
+            malformed trigger expression, conflicting triggers, no
+            triggers declared, or v0.6.0-shaped ``depends_on={...}``
             is passed (the within-workflow DAG model changed in v0.7.0).
     """
     if not name:
@@ -488,15 +643,11 @@ def register_workflow(
             "docs/PHASE_SIGMA_W_TRIGGERS.md for the new model."
         )
 
-    triggered_by_t: tuple[str, ...] = tuple(triggered_by or ())
-    if len(set(triggered_by_t)) != len(triggered_by_t):
-        raise ValueError(
-            f"workflow {name!r}: duplicate names in triggered_by="
-        )
+    trigger_expr = _normalize_triggered_by(triggered_by, workflow_name=name)
 
     # Mutual-exclusion checks.
     has_message = on_message is not None
-    has_schedule_or_event = bool(triggered_by_t) or schedule is not None
+    has_schedule_or_event = (trigger_expr is not None) or schedule is not None
     if has_message and has_schedule_or_event:
         raise ValueError(
             f"workflow {name!r}: on_message= is exclusive with "
@@ -531,7 +682,7 @@ def register_workflow(
     wf = Workflow(
         name=name,
         jobs=tuple(jobs),
-        triggered_by=triggered_by_t,
+        triggered_by=trigger_expr,
         schedule=schedule,
         timezone=timezone,
         on_message=on_message,

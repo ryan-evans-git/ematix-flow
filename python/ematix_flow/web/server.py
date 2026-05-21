@@ -512,9 +512,76 @@ def create_app(
                 return r
         return None
 
+    def _eval_trigger_op(
+        op: Any,
+        *,
+        last_self_success,
+    ) -> dict[str, Any]:
+        """Recursively evaluate a TriggerOp expression tree against
+        the workflow's last successful run.
+
+        Returns a JSON-serialisable dict mirroring the tree structure
+        and carrying a ``state`` (ready/pending/failed) at every node.
+
+        Leaf state semantics:
+            - ready  : upstream has a successful run since last_self_success
+            - failed : upstream's most recent terminal run since
+                       last_self_success was a failure
+            - pending: otherwise (running, never run, etc.)
+
+        Internal-node state semantics:
+            - all : ready if every child ready; failed if any failed and
+                    none pending; otherwise pending
+            - any : ready if any child ready; failed if every child
+                    failed; otherwise pending
+        """
+        from ematix_flow.pipeline import TriggerOp
+
+        if isinstance(op, str):
+            # Leaf — compute event state.
+            last_up_success = _last_success_time(op)
+            latest = _latest_terminal_run(op)
+            state = "pending"
+            if last_up_success is not None and (
+                last_self_success is None or last_up_success > last_self_success
+            ):
+                state = "ready"
+            if state == "pending" and latest is not None and latest.status == "failed":
+                if last_up_success is None or (
+                    last_self_success is not None
+                    and last_up_success <= last_self_success
+                ):
+                    state = "failed"
+            return {"kind": "leaf", "name": op, "state": state}
+
+        if isinstance(op, TriggerOp):
+            children = [
+                _eval_trigger_op(m, last_self_success=last_self_success)
+                for m in op.members
+            ]
+            child_states = [c["state"] for c in children]
+            if op.kind == "all":
+                if all(s == "ready" for s in child_states):
+                    state = "ready"
+                elif any(s == "failed" for s in child_states) and "pending" not in child_states:
+                    state = "failed"
+                else:
+                    state = "pending"
+            else:  # "any"
+                if any(s == "ready" for s in child_states):
+                    state = "ready"
+                elif all(s == "failed" for s in child_states):
+                    state = "failed"
+                else:
+                    state = "pending"
+            return {"kind": op.kind, "members": children, "state": state}
+
+        # Shouldn't happen if normalisation worked, but be defensive.
+        return {"kind": "leaf", "name": repr(op), "state": "pending"}
+
     def _compute_triggers(
         *,
-        triggered_by: list[str],
+        triggered_by: Any,
         schedule: str | None,
         timezone_name: str | None,
         on_message_repr: str | None,
@@ -574,27 +641,19 @@ def create_app(
                 "label": label,
             })
 
-        # Upstream event triggers
-        for up_name in triggered_by:
-            last_up_success = _last_success_time(up_name)
-            latest = _latest_terminal_run(up_name)
-            state = "pending"
-            if last_up_success is not None:
-                if last_self_success is None or last_up_success > last_self_success:
-                    state = "ready"
-            # Failed only when the upstream's most recent terminal run *since*
-            # last self-success was a failure (no later success has overridden).
-            if state == "pending" and latest is not None and latest.status == "failed":
-                # if no success since last self-run, latest failure blocks us
-                if last_up_success is None or (
-                    last_self_success is not None and last_up_success <= last_self_success
-                ):
-                    state = "failed"
+        # Upstream event triggers. ``triggered_by`` is now a TriggerOp
+        # expression tree (or None). We append a single "after_expr"
+        # entry whose nested ``expr`` field carries the boolean tree
+        # with per-node state; the UI renders the tree with AND/OR
+        # grouping and parentheses.
+        if triggered_by is not None:
+            expr_eval = _eval_trigger_op(
+                triggered_by, last_self_success=last_self_success
+            )
             out.append({
-                "kind": "after",
-                "name": up_name,
-                "state": state,
-                "label": up_name,
+                "kind": "after_expr",
+                "state": expr_eval["state"],
+                "expr": expr_eval,
             })
 
         # on_message: pending (firing is per-message; no AND eval at tick time)
@@ -681,20 +740,23 @@ def create_app(
                 []
                 if is_streaming
                 else _compute_triggers(
-                    triggered_by=list(wf.triggered_by),
+                    triggered_by=wf.triggered_by,
                     schedule=wf.schedule,
                     timezone_name=wf.timezone,
                     on_message_repr=on_msg_repr,
                     last_self_success=last_self,
                 )
             )
+            # Legacy flat list (leaf names) for any UI/consumer that
+            # doesn't yet understand the expression tree.
+            leaf_names = list(wf.triggered_by_leaves)
             result.append(
                 {
                     "name": wf_name,
                     "kind": kind,
                     "jobs": list(wf.jobs),
                     "edges": edges,
-                    "triggered_by": list(wf.triggered_by),
+                    "triggered_by": leaf_names,
                     "schedule": wf.schedule,
                     "timezone": wf.timezone,
                     "on_message": on_msg_repr,
@@ -704,7 +766,9 @@ def create_app(
 
         # Synthetic workflow-of-one for every unassigned batch job. Carry
         # the job's own per-job schedule/depends_on through as the
-        # standalone trigger.
+        # standalone trigger. Wrap upstream-name list as an AllOf tree
+        # so the UI renders consistently.
+        from ematix_flow.pipeline import AllOf as _AllOf
         for job_name in all_jobs:
             if job_name in _JOB_TO_WORKFLOW:
                 continue
@@ -714,8 +778,9 @@ def create_app(
             sched = getattr(sp, "schedule", None)
             tz = getattr(sp, "timezone", None)
             last_self = _last_success_time(job_name)
+            trigger_expr = _AllOf(*ups) if ups else None
             triggers = _compute_triggers(
-                triggered_by=list(ups),
+                triggered_by=trigger_expr,
                 schedule=sched,
                 timezone_name=tz,
                 on_message_repr=None,
