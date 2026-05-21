@@ -286,10 +286,28 @@ def create_app(
                 # `next_run_at` is the most-recent forecast the scheduler
                 # produced (set via record.extras["next_run_at"]). For
                 # streaming pipelines we omit it and let the UI render
-                # "LIVE STREAMING" instead.
+                # "LIVE STREAMING" instead. If no extra is present, ask
+                # the in-process registry to forecast from the cron +
+                # timezone — this keeps the panel useful even on the
+                # first boot before any scheduler tick has run.
                 next_run_at = None
+                pipeline_tz = None
                 if latest.kind != "streaming":
                     next_run_at = latest.extras.get("next_run_at")
+                    pipeline_tz = latest.extras.get("timezone")
+                    if next_run_at is None or pipeline_tz is None:
+                        sp = _registry_lookup(name)
+                        if sp is not None:
+                            if pipeline_tz is None:
+                                pipeline_tz = sp.timezone
+                            if next_run_at is None and sp.schedule is not None:
+                                from ematix_flow.pipeline import forecast_next_run
+
+                                forecast = forecast_next_run(
+                                    sp.schedule, timezone=sp.timezone,
+                                )
+                                if forecast is not None:
+                                    next_run_at = forecast.isoformat()
                 pipelines.append(
                     {
                         "name": name,
@@ -301,6 +319,7 @@ def create_app(
                         ),
                         "recent_runs": recent,
                         "next_run_at": next_run_at,
+                        "timezone": pipeline_tz,
                     }
                 )
             # Sort pipelines so the most recently active is on top.
@@ -402,6 +421,18 @@ def _median(xs: list[int]) -> int:
     if len(s) % 2 == 0:
         return (s[mid - 1] + s[mid]) // 2
     return s[mid]
+
+
+def _registry_lookup(name: str):
+    """Look up a registered ScheduledPipeline by name, returning ``None``
+    if the registry is empty in this process. The web server runs in a
+    process where the user's pipelines may or may not be imported; we
+    do not want a missing import to make the API panel blank."""
+    try:
+        from ematix_flow.pipeline import _REGISTRY  # type: ignore[attr-defined]
+    except Exception:
+        return None
+    return _REGISTRY.get(name)
 
 
 def _resolve_ui_dir(override: Path | None) -> Path | None:
