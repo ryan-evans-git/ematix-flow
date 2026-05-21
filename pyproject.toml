@@ -165,18 +165,29 @@ web = [
 # adapter pulls the upstream Python SDK as an opt-in extra. The
 # Connection dataclasses themselves are stdlib-only; install the
 # extra only when you actually need to talk to that warehouse.
-snowflake = ["snowflake-connector-python>=3.7"]
+snowflake = [
+    "snowflake-connector-python>=3.7",
+    # `to_pandas()` → write_pandas() bridge needs pandas at runtime.
+    "pandas>=2.0",
+    "pyarrow>=15",
+]
 bigquery  = [
     "google-cloud-bigquery>=3.17",
     "google-cloud-bigquery-storage>=2.24",
+    "pandas>=2.0",
     "pyarrow>=15",
 ]
-redshift  = ["redshift-connector>=2.1"]
+redshift  = [
+    "redshift-connector>=2.1",
+    "pandas>=2.0",
+    "pyarrow>=15",
+]
 warehouses = [
     "snowflake-connector-python>=3.7",
     "google-cloud-bigquery>=3.17",
     "google-cloud-bigquery-storage>=2.24",
     "redshift-connector>=2.1",
+    "pandas>=2.0",
     "pyarrow>=15",
 ]
 
