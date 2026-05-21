@@ -151,6 +151,18 @@ secrets = [
     "google-cloud-secret-manager>=2.16",
 ]
 
+# ---- AWS Glue Schema Registry extra -------------------------------
+# Confluent / Apicurio SRs ride the existing `kind = "schema_registry"`
+# surface. Glue uses a different wire format (0x03 header + UUID +
+# codec byte) and AWS IAM auth, so it ships as a separate connection
+# kind with its own opt-in SDK dependency. See
+# ``crates/ematix-flow-core/src/glue_schema_registry.rs`` for the
+# framing primitives.
+schema-registry-glue = [
+    "boto3>=1.34",
+    "aws-glue-schema-registry>=1.1; platform_python_implementation == 'CPython'",
+]
+
 # ---- Web UI extras (Phase 4 — flow web subcommand) -----------------
 # FastAPI + uvicorn server + embedded Vite/Svelte SPA bundle. The
 # Python wheel ships the pre-built SPA in `ematix_flow/web/ui_dist/`
