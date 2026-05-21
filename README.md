@@ -77,8 +77,10 @@ flow run-due --module my_pipelines    # cron-style; drop into systemd / cron / k
 
 > Status: **v0.4.0 on PyPI** as `ematix-flow` (alpha). All four surfaces —
 > declarative pipelines, multi-backend, streaming, stream processing — are
-> shipped end-to-end; a handful of surfaces (warehouse pipeline integration in
-> `@ematix.pipeline`, Web UI mutating endpoints) are still settling.
+> shipped end-to-end. The next release adds
+> `@ematix.warehouse_pipeline` (cron + retries + DAG for warehouse
+> sources/targets), AWS Glue Schema Registry, and timezone-aware cron
+> schedules; see CHANGELOG for the in-flight slice plan.
 
 ---
 
@@ -240,8 +242,10 @@ class kafka_avro:
 
 Today's `kind = "schema_registry"` covers Confluent-style wire format
 (Confluent SR, Apicurio Confluent-compat). **AWS Glue Schema Registry**
-is on the roadmap (different framing: `0x03` header byte + UUID +
-compression byte) and lands in a follow-on release.
+(separate framing: `0x03` header byte + UUID + compression byte) lands
+in the next release — the typed `GlueSchemaRegistryConnection` class
+and Rust-side framing primitives are on `main` after v0.4.0; Kafka
+backend dispatch + LocalStack integration test follow.
 
 ---
 
@@ -291,7 +295,8 @@ take the `INSERT … SELECT` fast path automatically.
   `x-dead-letter-exchange`, Pub/Sub subscription
   `dead_letter_policy`).
 - **Schema Registry.** Avro and Protobuf decode/encode via
-  Confluent SR or Apicurio. AWS Glue Schema Registry on the roadmap.
+  Confluent SR or Apicurio. AWS Glue Schema Registry support lands
+  in the next release.
 
 ### Cross-backend reads + writes
 

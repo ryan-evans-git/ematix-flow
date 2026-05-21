@@ -7,6 +7,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+Targeting v0.5.0. Each entry is a first-cut "slice 1" — see the linked PR
+for the slice plan and what's deferred to follow-ups.
+
+### Added
+
+- **`@ematix.warehouse_pipeline` decorator** (Phase 2d slice 1, #125).
+  Wires `WarehouseSource` / `WarehouseTarget` into the
+  scheduler-registered pipeline registry so warehouse-shaped pipelines
+  participate in cron scheduling, retries, `depends_on` DAG, and
+  `flow run-due` the same way DB-backed `@ematix.pipeline` pipelines
+  do. The wrapped function is zero-arg; returning a `str` forwards
+  it as `transform_sql=` to `run_warehouse_pipeline` (DuckDB transform
+  in-flight on the Arrow table). Slice 2 will add the Rust PyO3
+  callback bridge so the worker can drive warehouse pipelines from
+  the Rust runtime; slice 3 adds warehouse-side watermark cursors.
+- **AWS Glue Schema Registry** typed connection + Rust framing
+  primitives (#126). New `GlueSchemaRegistryConnection` (kind
+  `glue_schema_registry`) carries `registry_name`, `region`, and three
+  auth modes (`aws_profile=` / explicit static creds / boto3 default
+  chain). Rust-side `glue_schema_registry` module ships the Glue wire
+  format (`0x03` header + 16-byte UUID + 1-byte compression byte) as
+  `parse_glue_frame` / `build_glue_frame` / `GlueFrame` /
+  `GlueCodec`. Confluent path (`kind = "schema_registry"`) unchanged.
+  New `[schema-registry-glue]` extra pulls boto3 +
+  aws-glue-schema-registry. Kafka backend dispatch + LocalStack
+  integration test land in a follow-up.
+- **Cron schedule timezone support** (#127, task #558 slice 1).
+  `is_due()` now accepts a keyword-only `tz=` argument that, when
+  set, interprets the cron expression in that timezone instead of
+  whatever timezone `now` carries (effectively UTC for
+  `flow run-due` today). Accepts a `zoneinfo.ZoneInfo` instance or a
+  tz name string. DST transitions are honored via croniter's
+  zoneinfo-aware path. `tz=None` (the default) preserves today's
+  behavior bit-for-bit. Slice 2 wires `timezone=` into
+  `@ematix.pipeline` / `@ematix.warehouse_pipeline`; slice 3 surfaces
+  the configured tz in the Web UI's "Next: …" rendering.
+
+### Design
+
+- **Arrow-native warehouse adapters** (#128, task #557). Three-slice
+  plan to drop pandas from the Snowflake / BigQuery / Redshift
+  adapter paths. Slice 1 = Snowflake PUT + COPY INTO via parquet
+  staging; slice 2 = Redshift S3 + COPY (extend merge-mode path to
+  append); slice 3 = BigQuery GCS + `load_table_from_uri`. Open
+  questions on type fidelity, Storage Write API vs GCS staging, and
+  the backward-compat shim policy captured for review before slice 1
+  implementation lands. See
+  `docs/PHASE_557_ARROW_NATIVE_WAREHOUSES.md`.
+
 ## [0.4.0] — 2026-05-20
 
 Alpha milestone — closes the ematix.dev "What's not shipped" list.
