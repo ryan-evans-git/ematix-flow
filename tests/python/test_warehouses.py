@@ -11,6 +11,7 @@ Real-credential integration tests live under
 """
 from __future__ import annotations
 
+from typing import Any
 from unittest.mock import MagicMock
 
 import pyarrow as pa
@@ -367,25 +368,22 @@ class TestRunWarehousePipeline:
         mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
         return mock_conn
 
-    def _tgt_client_capturing(self, captured: list[pa.Table]):
-        """Mock snowflake write_pandas — captures the written DF as
-        Arrow for assertion."""
+    def _tgt_client_capturing(self, executed: list[str]):
+        """Mock snowflake target client. Captures every ``cursor.execute()``
+        invocation as a SQL string so the test can assert the
+        PUT + COPY INTO sequence the Arrow-native path emits."""
+        mock_cursor = MagicMock()
+
+        def _exec(sql: str, *_args, **_kwargs) -> Any:
+            executed.append(sql)
+            return mock_cursor
+
+        mock_cursor.execute.side_effect = _exec
         mock_conn = MagicMock()
-        # The write_pandas function is imported inside
-        # snowflake_write_arrow; we monkeypatch via the module.
-        import ematix_flow.warehouses as wh
-
-        def _fake_write_pandas(client, df, table_name, auto_create_table):
-            captured.append(pa.Table.from_pandas(df))
-            return (True, 0, len(df), 0)
-
-        # Patch the import-time symbol path:
-        wh.snowflake_write_arrow.__globals__["__test_fake_write_pandas"] = (  # type: ignore[attr-defined]
-            _fake_write_pandas
-        )
+        mock_conn.cursor.return_value = mock_cursor
         return mock_conn
 
-    def test_run_pipeline_snowflake_to_snowflake_no_transform(self, monkeypatch):
+    def test_run_pipeline_snowflake_to_snowflake_no_transform(self):
         from ematix_flow.warehouses import (
             WarehouseSource,
             WarehouseTarget,
@@ -395,35 +393,9 @@ class TestRunWarehousePipeline:
         # Build a tiny "source" table.
         src_table = pa.table({"id": [1, 2, 3], "v": [10, 20, 30]})
 
-        # Monkeypatch write_pandas at the import site to avoid
-        # needing the real snowflake SDK.
-
-        captured: list[pa.Table] = []
-
-        def _fake_write_pandas(client, df, table_name, auto_create_table):
-            captured.append(pa.Table.from_pandas(df))
-            return (True, 0, len(df), 0)
-
-        # snowflake_write_arrow imports `from snowflake.connector.pandas_tools
-        # import write_pandas` lazily inside the function; patch at the
-        # import-machinery level via sys.modules.
-        import sys
-        import types
-
-        fake_pandas_tools = types.ModuleType("snowflake.connector.pandas_tools")
-        fake_pandas_tools.write_pandas = _fake_write_pandas  # type: ignore[attr-defined]
-        fake_snowflake = types.ModuleType("snowflake")
-        fake_connector = types.ModuleType("snowflake.connector")
-        fake_connector.pandas_tools = fake_pandas_tools  # type: ignore[attr-defined]
-        fake_snowflake.connector = fake_connector  # type: ignore[attr-defined]
-        monkeypatch.setitem(sys.modules, "snowflake", fake_snowflake)
-        monkeypatch.setitem(sys.modules, "snowflake.connector", fake_connector)
-        monkeypatch.setitem(
-            sys.modules, "snowflake.connector.pandas_tools", fake_pandas_tools
-        )
-
         src_client = self._src_client_returning(src_table)
-        tgt_client = MagicMock()  # write_pandas is monkeypatched
+        executed: list[str] = []
+        tgt_client = self._tgt_client_capturing(executed)
 
         src_conn = SnowflakeConnection(
             name="src", account="a", user="u", password="p", warehouse="W"
@@ -442,9 +414,12 @@ class TestRunWarehousePipeline:
         assert result.rows_read == 3
         assert result.rows_written == 3
         assert result.duration_ms >= 0
-        assert len(captured) == 1
-        # Written table has the same shape as input (no transform).
-        assert captured[0].num_rows == 3
+        # Arrow-native write path emits CREATE + PUT + COPY INTO.
+        joined = " ".join(executed)
+        assert "CREATE TABLE IF NOT EXISTS" in joined
+        assert "PUT file://" in joined
+        assert "COPY INTO" in joined
+        assert "FILE_FORMAT = (TYPE = PARQUET)" in joined
 
     def test_run_pipeline_unknown_source_kind_raises(self):
         from ematix_flow.warehouses import (
