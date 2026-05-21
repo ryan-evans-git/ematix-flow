@@ -7,7 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-(no entries yet — anything landing on `main` after v0.6.0 goes here)
+(no entries yet — anything landing on `main` after v0.6.1 goes here)
+
+## [0.6.1] — 2026-05-21
+
+### Fixed
+
+- **`/api/workflows`** now includes streaming pipelines as
+  `kind: "streaming"` workflow-of-one cards. Previously the endpoint
+  only iterated the batch pipeline registry, so `@ematix.streaming_pipeline`
+  consumers were invisible on the Workflows tab even though they were
+  fully registered. They still appeared on the Jobs and Runs tabs.
+- **Web UI Workflows page** renders streaming workflows with the same
+  pulsing amber `▶ LIVE STREAMING` pill used elsewhere in the SPA,
+  plus a live throughput / batch-cycle footer (driven by the same
+  `streaming_stats` snapshot the Jobs page uses).
 
 ## [0.6.0] — 2026-05-21
 
