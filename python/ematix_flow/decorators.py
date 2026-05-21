@@ -1111,30 +1111,62 @@ class _EmatixNamespace:
         *,
         name: str,
         jobs: list[str],
-        depends_on: dict[str, list[str]] | None = None,
+        triggered_by: list[str] | None = None,
+        schedule: str | None = None,
+        timezone: str | None = None,
+        on_message: Any = None,
+        # v0.7.0 hard-break sentinel — old callers passing the v0.6.0
+        # dict-keyed depends_on get a clear error from register_workflow.
+        depends_on: Any = None,
     ):
-        """Declare a named workflow grouping its member jobs.
+        """Declare a named workflow grouping its member jobs + the trigger
+        conditions that fire it (v0.7.0 model).
 
-        ``jobs`` is the list of job names that belong to this workflow.
-        ``depends_on`` is a dict of ``{downstream: [upstream, ...]}`` —
-        the DAG lives here, in the workflow, not on individual jobs.
+        ``jobs=`` is the list of member job names. The internal DAG between
+        jobs is declared on each job
+        (``@ematix.job(..., depends_on=[upstream_job, ...])``); the workflow
+        itself only declares WHEN to fire.
+
+        Trigger kwargs — AND-conjunction. At least one required unless the
+        workflow includes a streaming pipeline (in which case it's implicitly
+        streaming and these are not allowed):
+
+        - ``triggered_by=[name, ...]`` — workflow or job names that must
+          have succeeded since this workflow last succeeded.
+        - ``schedule="cron"`` — next cron tick after last self-run must reach.
+        - ``timezone="IANA"`` — cron interpretation tz.
+        - ``on_message=<source>`` — per-message firing; exclusive with the
+          above.
 
         Example::
 
-            @ematix.job(target=OrdersTable, schedule="*/5 * * * *", mode="merge", keys=("id",))
+            @ematix.job(name="extract_orders", target=OrdersTable,
+                        mode="merge", keys=("order_id",))
             def extract_orders(conn): return "SELECT ..."
 
-            @ematix.job(target=OrdersEnriched, schedule="*/5 * * * *", mode="merge", keys=("id",))
+            @ematix.job(name="enrich_orders", target=OrdersEnriched,
+                        mode="merge", keys=("order_id",),
+                        depends_on=["extract_orders"])
             def enrich_orders(conn): return "SELECT ..."
 
             ematix.workflow(
                 name="orders_etl",
+                triggered_by=["upstream_workflow"],
+                schedule="0 21 * * *",
+                timezone="America/New_York",
                 jobs=["extract_orders", "enrich_orders"],
-                depends_on={"enrich_orders": ["extract_orders"]},
             )
         """
         from ematix_flow.pipeline import register_workflow
-        return register_workflow(name=name, jobs=jobs, depends_on=depends_on)
+        return register_workflow(
+            name=name,
+            jobs=jobs,
+            triggered_by=triggered_by,
+            schedule=schedule,
+            timezone=timezone,
+            on_message=on_message,
+            depends_on=depends_on,
+        )
 
     def pipeline(
         self,

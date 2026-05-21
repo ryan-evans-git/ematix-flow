@@ -169,6 +169,27 @@
         </span>
       </div>
 
+      {#if w.kind !== "streaming"}
+        {#if (w.triggered_by && w.triggered_by.length > 0) || w.schedule || w.on_message}
+          <div class="wf-trigger">
+            <span class="dim">Trigger:</span>
+            {#if w.triggered_by && w.triggered_by.length > 0}
+              <strong>After:</strong>
+              <span class="mono">{w.triggered_by.join(", ")}</span>
+            {/if}
+            {#if w.schedule}
+              {#if w.triggered_by && w.triggered_by.length > 0}<span class="sep"> · </span>{/if}
+              <strong>Schedule:</strong>
+              <span class="mono">{w.schedule}{w.timezone ? ' ' + w.timezone : ''}</span>
+            {/if}
+            {#if w.on_message}
+              <strong>On message:</strong>
+              <span class="mono">{w.on_message}</span>
+            {/if}
+          </div>
+        {/if}
+      {/if}
+
       <DagFlowchart
         nodes={nodesForWorkflow(w)}
         edges={w.edges}
@@ -218,6 +239,15 @@
     50% { opacity: 0.55; }
   }
   .wf-meta { font-size: 0.78rem; color: var(--color-fg-muted, #888); }
+  .wf-trigger {
+    font-size: 0.78rem;
+    color: var(--color-phosphor-300, #8fd28f);
+    margin: 0.3em 0 0.5em 0;
+    padding: 0.4em 0.6em;
+    background: rgba(0,0,0,0.2);
+    border-left: 2px solid var(--color-phosphor-500, #4eb84e);
+    border-radius: 2px;
+  }
   .wf-footer {
     margin-top: 0.4rem;
     padding-top: 0.4rem;

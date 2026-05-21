@@ -389,36 +389,54 @@ _UPSTREAM_FRESHNESS: dict[str, int | None] = {}
 _LAST_RUN: dict[str, tuple[datetime, bool]] = {}
 
 
-# ---- Workflows -----------------------------------------------------
+# ---- Workflows (v0.7.0 trigger model) ----------------------------
 #
-# A Workflow is a user-named grouping of jobs (decorated functions)
-# plus the depends_on edges between them. The Workflow is where the
-# DAG lives; per-job depends_on still works for back-compat but new
-# code should declare edges in the workflow.
+# A Workflow is a user-named grouping of jobs. Its trigger is an
+# AND-conjunction of declared conditions:
 #
-#   _WORKFLOWS[name]            = Workflow(name, jobs, depends_on)
+#   triggered_by=[<job_or_workflow_name>, ...]   event prereqs
+#   schedule="cron"                              time prereq
+#   timezone="IANA"                              for the schedule
+#   on_message=<source>                          per-message firing
+#                                                (exclusive with the above)
+#
+# Implicit streaming: if any job in jobs= is a streaming pipeline, the
+# whole workflow is treated as streaming (no other trigger required or
+# allowed).
+#
+# Per-job DAG edges (``depends_on=[...]`` on @ematix.job) describe the
+# ordering of jobs WITHIN the workflow once it fires.
+#
+#   _WORKFLOWS[name]            = Workflow(...)
 #   _JOB_TO_WORKFLOW[job_name]  = workflow name (reverse lookup)
-#
-# Jobs without an explicit workflow assignment are exposed by the API
-# as workflow-of-one when listed.
 
 
 @dataclass(frozen=True)
 class Workflow:
-    """Named grouping of jobs + the DAG between them.
+    """Named grouping of jobs + trigger conditions.
 
-    ``jobs`` lists every member job by name (matching their @ematix.job
-    / @ematix.pipeline name= kwarg).
+    Trigger fields (AND-conjunction; at least one must be set unless the
+    workflow is implicitly streaming):
 
-    ``depends_on`` maps each downstream job to the list of upstreams it
-    waits on, all within this workflow. The same edges are mirrored into
-    the module-level ``_DEPENDS_ON`` table so the scheduler keeps working
-    unchanged.
+    - ``triggered_by`` — tuple of upstream job/workflow names that must
+      have succeeded since this workflow last succeeded.
+    - ``schedule`` — cron expression whose next tick after the last
+      self-run must have reached.
+    - ``timezone`` — IANA tz for ``schedule`` interpretation.
+    - ``on_message`` — opaque message-source descriptor; per-message
+      firing. Exclusive with ``triggered_by`` / ``schedule``.
+
+    ``jobs`` lists every member job by name. The internal DAG between
+    jobs is declared by each member job's own ``depends_on=[...]``
+    kwarg and discovered at scheduler / UI time.
     """
 
     name: str
     jobs: tuple[str, ...]
-    depends_on: dict[str, tuple[str, ...]]
+    triggered_by: tuple[str, ...] = ()
+    schedule: str | None = None
+    timezone: str | None = None
+    on_message: Any = None
 
 
 _WORKFLOWS: dict[str, Workflow] = {}
@@ -429,14 +447,25 @@ def register_workflow(
     *,
     name: str,
     jobs: list[str],
-    depends_on: dict[str, list[str]] | None = None,
+    triggered_by: list[str] | None = None,
+    schedule: str | None = None,
+    timezone: str | None = None,
+    on_message: Any = None,
+    # v0.6.0 compat sentinel: raise a clear error if old callers still pass
+    # depends_on={...} (the v0.6.0 dict-keyed within-workflow DAG). The DAG
+    # now lives on each member job's ``depends_on=[...]``.
+    depends_on: Any = None,
 ) -> Workflow:
     """Register a workflow.
 
-    Jobs listed in ``jobs`` don't have to be registered yet — the
-    workflow stores names; resolution happens at scheduler / UI time.
-    But ``depends_on`` keys + values must all appear in ``jobs`` so
-    the graph stays self-contained.
+    Member-job ordering inside the workflow is declared on each job
+    (per-job ``depends_on=[...]`` kwarg). The workflow itself only
+    declares trigger conditions + the membership list.
+
+    Raises:
+        ValueError: name is empty, jobs is empty, duplicate jobs, conflicting
+            triggers, no triggers declared, or v0.6.0-shaped ``depends_on={...}``
+            is passed (the within-workflow DAG model changed in v0.7.0).
     """
     if not name:
         raise ValueError("workflow name must be non-empty")
@@ -445,24 +474,68 @@ def register_workflow(
     job_set = set(jobs)
     if len(job_set) != len(jobs):
         raise ValueError(f"workflow {name!r}: duplicate job names in jobs=")
-    deps_norm: dict[str, tuple[str, ...]] = {}
-    for downstream, upstreams in (depends_on or {}).items():
-        if downstream not in job_set:
-            raise ValueError(
-                f"workflow {name!r}: depends_on references {downstream!r} "
-                "which isn't listed in jobs="
-            )
-        ups_t: list[str] = []
-        for u in upstreams:
-            if u not in job_set:
-                raise ValueError(
-                    f"workflow {name!r}: depends_on[{downstream!r}] references "
-                    f"{u!r} which isn't listed in jobs="
-                )
-            ups_t.append(u)
-        deps_norm[downstream] = tuple(ups_t)
 
-    wf = Workflow(name=name, jobs=tuple(jobs), depends_on=deps_norm)
+    # Hard-break: v0.6.0 used a dict-keyed depends_on at the workflow level.
+    # In v0.7.0, the within-workflow DAG moves onto each member job
+    # (`@ematix.job(..., depends_on=[...])`). Surface a pointer instead of
+    # silently doing the wrong thing.
+    if depends_on is not None:
+        raise ValueError(
+            f"workflow {name!r}: depends_on= was removed in v0.7.0. The "
+            "within-workflow DAG is now declared on each job via "
+            "`@ematix.job(..., depends_on=[upstream_job, ...])`. The "
+            "workflow itself only declares triggers + the job list. See "
+            "docs/PHASE_SIGMA_W_TRIGGERS.md for the new model."
+        )
+
+    triggered_by_t: tuple[str, ...] = tuple(triggered_by or ())
+    if len(set(triggered_by_t)) != len(triggered_by_t):
+        raise ValueError(
+            f"workflow {name!r}: duplicate names in triggered_by="
+        )
+
+    # Mutual-exclusion checks.
+    has_message = on_message is not None
+    has_schedule_or_event = bool(triggered_by_t) or schedule is not None
+    if has_message and has_schedule_or_event:
+        raise ValueError(
+            f"workflow {name!r}: on_message= is exclusive with "
+            "triggered_by= and schedule= (per-message firing doesn't "
+            "compose with AND-conjunction trigger conditions)"
+        )
+    if timezone is not None and schedule is None:
+        raise ValueError(
+            f"workflow {name!r}: timezone= requires schedule= "
+            "(timezone only applies to a cron expression)"
+        )
+
+    # Implicit streaming detection requires looking up member jobs in
+    # the streaming registry. Import lazily to avoid a circular dep.
+    is_streaming = _workflow_is_streaming(jobs)
+    has_any_trigger = (
+        has_schedule_or_event or has_message or is_streaming
+    )
+    if not has_any_trigger:
+        raise ValueError(
+            f"workflow {name!r}: needs a trigger. Set at least one of "
+            "triggered_by=, schedule=, or on_message=, or include a "
+            "streaming pipeline in jobs= for implicit streaming."
+        )
+    if is_streaming and (has_schedule_or_event or has_message):
+        raise ValueError(
+            f"workflow {name!r}: streaming workflows (jobs include a "
+            "streaming pipeline) can't also declare triggered_by/"
+            "schedule/on_message — the streaming consumer drives execution."
+        )
+
+    wf = Workflow(
+        name=name,
+        jobs=tuple(jobs),
+        triggered_by=triggered_by_t,
+        schedule=schedule,
+        timezone=timezone,
+        on_message=on_message,
+    )
     _WORKFLOWS[name] = wf
     for j in jobs:
         # Last writer wins if the same job is listed in two workflows.
@@ -477,12 +550,36 @@ def register_workflow(
                 stacklevel=2,
             )
         _JOB_TO_WORKFLOW[j] = name
-    # Mirror edges into the module-level depends-on table so the
-    # scheduler's freshness gating keeps working.
-    for downstream, upstreams in deps_norm.items():
-        if upstreams:
-            _DEPENDS_ON[downstream] = list(upstreams)
     return wf
+
+
+def _workflow_is_streaming(job_names: list[str]) -> bool:
+    """Return True if any member job is a streaming pipeline."""
+    try:
+        from ematix_flow.streaming import _STREAMING_PIPELINES
+    except Exception:
+        return False
+    return any(n in _STREAMING_PIPELINES for n in job_names)
+
+
+def workflow_dag_edges(workflow_name: str) -> list[tuple[str, str]]:
+    """Return the (upstream, downstream) edges INSIDE a workflow.
+
+    Edges are derived from each member job's own ``depends_on=[...]``
+    list, filtered to references that are also members of this workflow.
+    Cross-workflow ``depends_on`` references are skipped here — those
+    are workflow-level triggers, not internal DAG edges.
+    """
+    wf = _WORKFLOWS.get(workflow_name)
+    if wf is None:
+        return []
+    member_set = set(wf.jobs)
+    edges: list[tuple[str, str]] = []
+    for downstream in wf.jobs:
+        for upstream in _DEPENDS_ON.get(downstream, []) or []:
+            if upstream in member_set:
+                edges.append((upstream, downstream))
+    return edges
 
 
 # Phase Ω.2 — declarative retry policy + in-process attempt state.

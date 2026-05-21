@@ -480,15 +480,17 @@ def create_app(
     # ---- Workflows: named groupings of jobs ---------------------------
     @app.get("/api/workflows")
     def list_workflows() -> dict[str, Any]:  # type: ignore[unused-function]
-        """Each workflow is a user-named group of jobs + the DAG between
-        them. Jobs without an explicit workflow show up as a synthetic
-        workflow-of-one keyed by their own name."""
+        """Each workflow is a user-named group of jobs + the trigger
+        conditions that fire it. Jobs without an explicit workflow show up
+        as a synthetic workflow-of-one keyed by their own name."""
         try:
             from ematix_flow.pipeline import (
                 _DEPENDS_ON,
                 _JOB_TO_WORKFLOW,
                 _REGISTRY,
                 _WORKFLOWS,
+                _workflow_is_streaming,
+                workflow_dag_edges,
             )
         except Exception:
             return {"workflows": []}
@@ -503,40 +505,58 @@ def create_app(
 
         all_jobs = sorted(_REGISTRY.keys())
         result: list[dict[str, Any]] = []
+
         # Declared workflows first.
         for wf_name, wf in sorted(_WORKFLOWS.items()):
-            edges = []
-            for downstream, upstreams in wf.depends_on.items():
-                for u in upstreams:
-                    edges.append({"from": u, "to": downstream})
+            # Edges come from each member job's own depends_on, filtered to
+            # references inside this workflow.
+            edges = [
+                {"from": u, "to": d}
+                for (u, d) in workflow_dag_edges(wf_name)
+            ]
+            # Streaming workflow if any member job is a streaming pipeline.
+            is_streaming = _workflow_is_streaming(list(wf.jobs))
+            kind = "streaming" if is_streaming else "declared"
             result.append(
                 {
                     "name": wf_name,
-                    "kind": "declared",
+                    "kind": kind,
                     "jobs": list(wf.jobs),
                     "edges": edges,
+                    "triggered_by": list(wf.triggered_by),
+                    "schedule": wf.schedule,
+                    "timezone": wf.timezone,
+                    "on_message": (
+                        repr(wf.on_message)
+                        if wf.on_message is not None
+                        else None
+                    ),
                 }
             )
-        # Synthetic workflow-of-one for every unassigned batch job.
+
+        # Synthetic workflow-of-one for every unassigned batch job. Carry
+        # the job's own per-job schedule/depends_on through as the
+        # standalone trigger.
         for job_name in all_jobs:
             if job_name in _JOB_TO_WORKFLOW:
                 continue
-            # Even unassigned jobs can have depends_on (legacy decorator
-            # kwarg). Surface those edges as an "ad-hoc" workflow-of-N.
             ups = _DEPENDS_ON.get(job_name) or []
             edges = [{"from": u, "to": job_name} for u in ups]
+            sp = _REGISTRY.get(job_name)
             result.append(
                 {
                     "name": job_name,
                     "kind": "single",
                     "jobs": [job_name],
                     "edges": edges,
+                    "triggered_by": list(ups),
+                    "schedule": getattr(sp, "schedule", None),
+                    "timezone": getattr(sp, "timezone", None),
+                    "on_message": None,
                 }
             )
-        # Streaming pipelines that aren't part of a declared workflow
-        # surface as single-kind workflow-of-one too. Marked as
-        # "streaming" so the UI can render the LIVE STREAMING pill in
-        # the card header instead of the next-run forecast.
+
+        # Streaming pipelines that aren't part of a declared workflow.
         for name in streaming_names:
             if name in _JOB_TO_WORKFLOW:
                 continue
@@ -546,6 +566,10 @@ def create_app(
                     "kind": "streaming",
                     "jobs": [name],
                     "edges": [],
+                    "triggered_by": [],
+                    "schedule": None,
+                    "timezone": None,
+                    "on_message": None,
                 }
             )
         return {"workflows": result}
