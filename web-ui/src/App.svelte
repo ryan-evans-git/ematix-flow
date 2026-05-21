@@ -3,12 +3,14 @@
   import Runs from "./routes/Runs.svelte";
   import RunDetail from "./routes/RunDetail.svelte";
   import Pipelines from "./routes/Pipelines.svelte";
+  import Dag from "./routes/Dag.svelte";
 
   // Hash-based router: avoids needing SPA-fallback config on the
   // server. Routes:
   //   #/pipelines      → per-pipeline cards with last-10 strip (default)
   //   #/runs           → jobs table (all run records)
   //   #/runs/<id>      → run detail with task DAG
+  //   #/dag            → cross-pipeline depends_on DAG (v0.5.0)
   let route = parseHash(window.location.hash);
 
   function parseHash(h) {
@@ -17,6 +19,7 @@
       return { name: "run_detail", runId: decodeURIComponent(m.slice("/runs/".length)) };
     }
     if (m === "/runs" || m.startsWith("/runs?")) return { name: "runs" };
+    if (m === "/dag") return { name: "dag" };
     return { name: "pipelines" };
   }
 
@@ -38,6 +41,7 @@
     <span class="brand">▸ ematix-flow</span>
     <a href="#/pipelines" class={navTarget("pipelines")}>Pipelines</a>
     <a href="#/runs" class={navTarget("runs")}>Jobs</a>
+    <a href="#/dag" class={navTarget("dag")}>DAG</a>
     <span style="flex: 1"></span>
     <a href="/api/docs" target="_blank" rel="noopener">API Docs ↗</a>
   </nav>
@@ -48,5 +52,7 @@
     <RunDetail runId={route.runId} />
   {:else if route.name === "runs"}
     <Runs />
+  {:else if route.name === "dag"}
+    <Dag />
   {/if}
 </div>

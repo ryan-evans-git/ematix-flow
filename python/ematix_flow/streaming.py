@@ -573,6 +573,8 @@ def run_pipeline(
     config: str | os.PathLike[str] | None = None,
     config_str: str | None = None,
     metrics_port: int | None = None,
+    pipeline_name: str | None = None,
+    run_log_url: str | None = None,
 ) -> PipelineMetrics:
     """Run a streaming pipeline from a TOML config (string or path).
 
@@ -580,6 +582,17 @@ def run_pipeline(
     contents) must be provided. Returns a dict with
     ``total_rows``, ``iterations``, and ``shutdown_triggered``.
     Blocks until SIGTERM / SIGINT or clean exit.
+
+    Opt-in observability (v0.5.0): when ``run_log_url`` is set (or
+    the ``EMATIX_FLOW_RUN_LOG_URL`` env var is set), a streaming
+    RunRecord is created and a background thread snapshots the
+    daemon's Prometheus ``/metrics`` endpoint into the record's
+    ``extras`` every ~30s. The Web UI's Pipelines view surfaces
+    these as live throughput + batch-cycle figures.
+    ``pipeline_name`` is required for stats recording but the
+    pipeline still runs without it (snapshotter just won't open).
+    ``metrics_port`` must also be set — without an endpoint to
+    scrape, there's nothing to record.
 
     For new code, prefer :func:`run_streaming_pipeline` with typed
     :class:`Connection` objects — this form stays for back-compat
@@ -589,10 +602,66 @@ def run_pipeline(
         raise ValueError("run_pipeline: either `config` (path) or `config_str` is required")
     if config is not None and config_str is not None:
         raise ValueError("run_pipeline: pass `config` OR `config_str`, not both")
-    if config_str is not None:
-        return run_pipeline_from_toml_str(config_str, metrics_port)
-    assert config is not None
-    return run_pipeline_from_path(os.fspath(config), metrics_port)
+
+    def _run() -> PipelineMetrics:
+        if config_str is not None:
+            return run_pipeline_from_toml_str(config_str, metrics_port)
+        assert config is not None
+        return run_pipeline_from_path(os.fspath(config), metrics_port)
+
+    recorder = _maybe_open_stats_recorder(
+        pipeline_name=pipeline_name,
+        metrics_port=metrics_port,
+        run_log_url=run_log_url,
+    )
+    if recorder is None:
+        return _run()
+
+    with recorder:
+        return _run()
+
+
+def _maybe_open_stats_recorder(
+    *,
+    pipeline_name: str | None,
+    metrics_port: int | None,
+    run_log_url: str | None,
+):
+    """Open a :class:`StreamingStatsRecorder` if every prerequisite is met.
+
+    Returns the un-started recorder (the caller uses it as a CM), or
+    None when stats recording is disabled. Disabled is the default —
+    streaming pipelines without a configured RunLog stay invisible to
+    the Web UI exactly as before.
+
+    Best-effort: import or RunLog-open failures fall through to None
+    with a stderr warning rather than aborting the run.
+    """
+    import os
+    import sys
+
+    url = run_log_url or os.environ.get("EMATIX_FLOW_RUN_LOG_URL")
+    if not url or not pipeline_name or not metrics_port:
+        return None
+    try:
+        from ematix_flow.run_log import from_url
+        from ematix_flow.streaming_stats import StreamingStatsRecorder
+
+        rl = from_url(url)
+    except Exception as exc:
+        print(
+            f"streaming-stats: RunLog open failed ({exc!r}); "
+            "stats recording disabled, pipeline continues",
+            file=sys.stderr,
+        )
+        return None
+    if not hasattr(rl, "record_run_record"):
+        # The configured backend predates the rich-history protocol
+        # (e.g. an old in-memory shim). Skip silently.
+        return None
+    return StreamingStatsRecorder(
+        run_log=rl, pipeline_name=pipeline_name, metrics_port=metrics_port,
+    )
 
 
 # ---------- Π.1: typed-connection-based runner --------------------

@@ -9,6 +9,7 @@ Phase 12 adds `@register(name=..., schedule=...)` and helpers used by the
 from __future__ import annotations
 
 import json
+import os
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -1069,8 +1070,27 @@ def run_due_with_dag_detailed(
         success = False
         err: Exception | None = None
         started_at = datetime.now(_tz_utc())
+        # OTEL tracing: wrap each pipeline run in a `flow.pipeline.run`
+        # span. No-op when no tracer is configured.
+        from ematix_flow.tracing import pipeline_run_span
+
+        attempt_num = (st.attempt_count + 1) if st is not None else 1
+        # Optional stdout/stderr capture for `flow logs <run_id>` —
+        # opt-in via env var to keep the historical no-capture path
+        # the default (avoids surprising tail latency / disk usage).
+        capture_enabled = os.environ.get("EMATIX_FLOW_CAPTURE_LOGS") == "1"
+        run_id = f"{name}-{started_at.strftime('%Y%m%dT%H%M%S')}-{attempt_num}"
+        log_ctx = None
+        if capture_enabled:
+            from ematix_flow.logs import capture_pipeline_logs
+            log_ctx = capture_pipeline_logs(run_id)
         try:
-            ret = sp.fn()
+            if log_ctx is not None:
+                with log_ctx, pipeline_run_span(name, attempt=attempt_num):
+                    ret = sp.fn()
+            else:
+                with pipeline_run_span(name, attempt=attempt_num):
+                    ret = sp.fn()
             success = True
         except Exception as e:
             err = e

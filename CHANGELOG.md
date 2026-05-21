@@ -7,8 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-Targeting v0.5.0. Each entry is a first-cut "slice 1" — see the linked PR
-for the slice plan and what's deferred to follow-ups.
+(no entries yet — anything landing on `main` after v0.5.0 goes here)
+
+## [0.5.0] — 2026-05-21
+
+Operational milestone — adds the user-facing surface (CLIs, Web UI,
+alerters, observability) on top of v0.4.0's backend matrix. Same
+query-execution surface as v0.4.0; per-query TPC-H times unchanged.
+Highlights: four new CLI subcommands (`flow doctor` / `init` / `logs`
+/ `secrets test`), bearer-token Web UI auth + cross-pipeline DAG
+view, email + PagerDuty alerters, OTEL trace spans + a starter
+Grafana dashboard, AWS Glue Schema Registry end-to-end Kafka
+dispatch, Arrow-native warehouse adapters, streaming pipeline live
+throughput in the Web UI, and the Rust executor for
+`@ematix.warehouse_pipeline` via the new PyO3 callback bridge.
 
 ### Added
 
@@ -19,20 +31,137 @@ for the slice plan and what's deferred to follow-ups.
   `flow run-due` the same way DB-backed `@ematix.pipeline` pipelines
   do. The wrapped function is zero-arg; returning a `str` forwards
   it as `transform_sql=` to `run_warehouse_pipeline` (DuckDB transform
-  in-flight on the Arrow table). Slice 2 will add the Rust PyO3
-  callback bridge so the worker can drive warehouse pipelines from
-  the Rust runtime; slice 3 adds warehouse-side watermark cursors.
-- **AWS Glue Schema Registry** typed connection + Rust framing
-  primitives (#126). New `GlueSchemaRegistryConnection` (kind
-  `glue_schema_registry`) carries `registry_name`, `region`, and three
-  auth modes (`aws_profile=` / explicit static creds / boto3 default
-  chain). Rust-side `glue_schema_registry` module ships the Glue wire
-  format (`0x03` header + 16-byte UUID + 1-byte compression byte) as
-  `parse_glue_frame` / `build_glue_frame` / `GlueFrame` /
-  `GlueCodec`. Confluent path (`kind = "schema_registry"`) unchanged.
-  New `[schema-registry-glue]` extra pulls boto3 +
-  aws-glue-schema-registry. Kafka backend dispatch + LocalStack
-  integration test land in a follow-up.
+  in-flight on the Arrow table). Slice 2 ships in v0.5.0 across
+  #135 (PyO3 callback bridge) + #136 (Rust `invoke_warehouse_pipeline`
+  executor); slice 3 adds warehouse-side watermark cursors.
+- **AWS Glue Schema Registry — end-to-end** (#126 + #135). Slice 1
+  (#126) shipped the typed `GlueSchemaRegistryConnection` (kind
+  `glue_schema_registry`, fields `registry_name` / `region` / auth
+  via `aws_profile=` / explicit static creds / boto3 default chain),
+  the Rust `glue_schema_registry` module with the Glue wire format
+  (`0x03` header + 16-byte UUID + 1-byte compression byte) exposed as
+  `parse_glue_frame` / `build_glue_frame` / `GlueFrame` / `GlueCodec`,
+  and the `[schema-registry-glue]` extra (boto3 +
+  aws-glue-schema-registry). Slice 2 (#135) wired the Rust Kafka
+  backend to dispatch on registry kind for both consumer and
+  producer paths via a `SchemaRegistryKind::{Confluent, Glue {…}}`
+  enum, added per-backend schema caches (one boto3 round-trip per
+  UUID / per schema name), zlib codec (`GlueCodec::Zlib`,
+  byte 0x05) using flate2, producer-side encode
+  (`encode_batch_as_glue_avro`) via Arrow → JSONL → Avro, kafka
+  connection-time validation (Glue + non-Avro fails at construction),
+  and a LocalStack integration suite at
+  `tests/python/integration/test_glue_localstack.py` (gated on
+  `EMATIX_FLOW_LOCALSTACK_ENDPOINT`). Confluent path
+  (`kind = "schema_registry"`) unchanged.
+- **PyO3 callback bridge** (#135, task #559 slice 2). Process-global
+  registry of named Rust callbacks at
+  `ematix_flow_core::py_callbacks` (`register` / `unregister` /
+  `is_registered` / `invoke`, JSON-in / JSON-out adapter). Concrete
+  Python wiring in `ematix-flow-py::py_callbacks` exposes
+  `register_python_callback` / `unregister_python_callback` /
+  `is_python_callback_registered` / `invoke_python_callback`. The
+  Glue Kafka backend routes schema lookups (by-UUID for consumers,
+  by-name for producers) through this primitive; same primitive
+  carries the warehouse-pipeline executor in #136.
+- **Rust executor for `@ematix.warehouse_pipeline`** (#136,
+  task #559 slice 2 final piece). New
+  `ematix_flow_core::warehouse_executor::invoke_warehouse_pipeline(name)`
+  dispatches a registered warehouse pipeline by name through
+  `py_callbacks`, no subprocess. Python side: the
+  `@ematix.warehouse_pipeline` decorator now registers every wrapped
+  function as a callback at
+  `ematix_flow.warehouse_pipeline:<pipeline_name>` so the Rust
+  scheduler / worker can drive it directly. Three error variants
+  surface common failure modes (`NotRegistered` /
+  `CallbackFailed` / `BadResponseShape`); response shape is the
+  same dict the in-process scheduler builds (`status` / `pipeline` /
+  `rows_read` / `rows_written` / `duration_ms` / `watermark`).
+- **`flow init` project scaffold** (#136). `flow init <dir>` writes
+  a runnable starter project: `pipelines.py`, `connections.toml`,
+  `Dockerfile`, `flow.service` (systemd unit), `.gitignore`,
+  `README.md`. Refuses to overwrite without `--force`. Maven-archetype
+  shape — one command to a working `flow run-due` loop.
+- **`flow logs <run_id>`** (#136). Tails the captured stdout / stderr
+  for a given run. Capture is opt-in via the
+  `EMATIX_FLOW_CAPTURE_LOGS=1` env var (so existing deployments see
+  no disk / latency change). Logs land at
+  `$EMATIX_FLOW_LOGS_DIR/<run_id>.log`
+  (default `~/.ematix-flow/logs/`); `run_id` is pinned to
+  `<pipeline>-<UTC ts>-<attempt>` so the same record matches the
+  RunLog. Tee-based capture (original stream still gets the bytes);
+  atomic write (tmp + rename) + 30-day prune helper.
+- **`flow doctor`** (#136). Connection health probes by kind:
+  postgres (`SELECT 1`), kafka (TCP bootstrap probe), glue
+  (`list_registries`), pubsub (`get_topic`), rabbitmq (AMQP
+  handshake), s3 (`head_bucket`), snowflake / bigquery (`SELECT 1`).
+  Renders a one-pass status table; non-zero exit on any failure so it
+  fits CI / pre-deploy checks.
+- **`flow secrets test`** (#136). Resolves every `${…}` placeholder
+  in `connections.toml` (or whichever path is passed) and reports
+  per-secret outcome (provider, key, OK / missing / error) without
+  printing the resolved value. Useful for validating Vault / AWS /
+  GCP secret-store wiring before a deploy.
+- **Web UI bearer-token auth** (#136). New `--token <value>` flag on
+  `flow web` (and `bearer_token=` kwarg on `create_app` /
+  `run_server`) gates every `/api/*` route except `/api/health`
+  behind `Authorization: Bearer <token>`, compared with
+  `hmac.compare_digest`. `/api/health` stays open for load-balancer
+  probes. When a token is set, the "non-loopback bind without auth"
+  warning at startup is suppressed.
+- **Cross-pipeline DAG view in the Web UI** (#136). New `/api/dag`
+  endpoint returns `{nodes, edges}` from the `depends_on` registry
+  (each node carries `name` / `schedule` / `timezone`); new Svelte
+  route `#/dag` lays nodes out in topological-rank columns
+  (upstreams always left-of downstreams) with fan-out counts.
+- **Email + PagerDuty alerters** (#136). Two new alerter URL
+  schemes register through the same `--alerter <url>` flag the
+  Slack / webhook / stdout alerters use:
+  - `email://user:pass@host:port?from=...&to=...&starttls=1` — stdlib
+    `smtplib`; default port 587 (STARTTLS) / 465 (implicit SSL).
+    Errors are caught + logged (an alerter outage never breaks the
+    pipeline run).
+  - `pagerduty://<routing_key>?service=...&severity=...` — Events
+    API v2 trigger / resolve, with `dedup_key = "<service>:<pipeline>"`
+    so a recovered pipeline auto-resolves its open incident. Maps
+    `failed → trigger(error)`, `gave_up → trigger(critical)`,
+    `recovered → resolve`.
+- **OpenTelemetry trace spans for pipeline runs** (#136). New
+  `ematix_flow.tracing` module: `pipeline_run_span(name, attempt)`
+  context manager wraps every `@ematix.pipeline` /
+  `@ematix.warehouse_pipeline` execution; configure once via
+  `configure_tracer_from_url(...)` with `otel://stdout`,
+  `otel+otlp+grpc://collector:4317`, or
+  `otel+otlp+http://collector:4318`. Span attributes include
+  pipeline name, attempt number, run_id, status, and exception
+  on failure. Sits alongside the existing OTel-metrics export — same
+  collector can receive both.
+- **Streaming-pipeline live stats in the Web UI** (#136). Streaming
+  pipelines used to show a useless "Median duration: —" on the
+  Pipelines view (one open-ended record, no duration). The
+  ``flow consume`` daemon now opens an optional RunLog
+  (``--run-log-url`` / ``$EMATIX_FLOW_RUN_LOG_URL``) and spawns a
+  background thread that scrapes its own ``/metrics`` endpoint every
+  ~30s, computing rolling 1m + 5m windows from
+  ``ematix_streaming_rows_consumed_total`` /
+  ``ematix_streaming_rows_written_total`` /
+  ``ematix_streaming_batches_total`` /
+  ``ematix_streaming_errors_total`` and writing the result into the
+  running record's ``extras``. ``/api/pipelines`` surfaces these
+  fields; ``Pipelines.svelte`` renders "Throughput: X rps in (1m) /
+  Y rps in (5m) · Batch cycle: A ms avg (1m)" in place of the median
+  footer when ``kind == "streaming"``. SqliteRunLog now also
+  implements the rich-history protocol
+  (``record_run_record`` / ``list_runs`` / ``get_run`` against a
+  new ``run_records`` table), so the same SQLite file backs both the
+  ``flow consume`` daemon and ``flow web``.
+- **Grafana dashboard JSON** (#136). New
+  `examples/grafana/ematix-flow-dashboard.json` — 6-panel starter
+  board driven by the Prometheus metrics ematix-flow already
+  exports: runs/min by outcome, success-rate stat, in-flight retries,
+  p50 / p95 / p99 duration, per-pipeline run rate, top-20 failure
+  counts. `$pipeline` templated variable. Import in Grafana via the
+  JSON Model field.
 - **Cron schedule timezone support** (#127, task #558 slice 1).
   `is_due()` now accepts a keyword-only `tz=` argument that, when
   set, interprets the cron expression in that timezone instead of
@@ -837,5 +966,7 @@ Highlights of what's NOT in v0.1.0:
 - Iceberg-style transactional updates against object stores (use
   Delta for that today).
 
-[Unreleased]: https://github.com/ryan-evans-git/ematix-flow/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/ryan-evans-git/ematix-flow/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/ryan-evans-git/ematix-flow/compare/v0.4.0...v0.5.0
+[0.4.0]: https://github.com/ryan-evans-git/ematix-flow/compare/v0.1.0...v0.4.0
 [0.1.0]: https://github.com/ryan-evans-git/ematix-flow/releases/tag/v0.1.0

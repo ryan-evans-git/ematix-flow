@@ -27,6 +27,29 @@
     return `${(ms / 1000).toFixed(2)}s`;
   }
 
+  // v0.5.0: streaming pipelines surface throughput + batch cycle
+  // instead of a meaningless median over the single "still running"
+  // record. Snapshots come from the daemon every ~30s via the
+  // streaming-stats recorder.
+  function fmtRate(rps) {
+    if (rps == null) return "—";
+    if (rps >= 1000) return `${(rps / 1000).toFixed(1)}k rps`;
+    if (rps >= 10) return `${rps.toFixed(0)} rps`;
+    return `${rps.toFixed(2)} rps`;
+  }
+  function fmtCycle(ms) {
+    if (ms == null) return "—";
+    if (ms < 1000) return `${ms.toFixed(0)} ms`;
+    return `${(ms / 1000).toFixed(2)} s`;
+  }
+  function fmtSnapshotAge(iso) {
+    if (!iso) return "no snapshot yet";
+    const age = (Date.now() - new Date(iso).getTime()) / 1000;
+    if (age < 0) return "just now";
+    if (age < 90) return `${Math.round(age)}s ago`;
+    return `${Math.round(age / 60)}m ago`;
+  }
+
   function fmtNextRun(iso, tz) {
     if (!iso) return "—";
     try {
@@ -64,6 +87,37 @@
     }
     return out;
   }
+
+  // Per-cell height — relative to the longest run in this pipeline's
+  // last-10 strip so duration variance is visible at a glance. Bars are
+  // bottom-aligned (see .last-10-strip { align-items: flex-end }) so
+  // taller bars grow upward.
+  //
+  // Ramp: 8px (baseline / no duration) → 28px (max duration in strip).
+  // Sqrt scaling so a single 10× outlier doesn't crush everything else
+  // to a one-pixel sliver — a 60s run still looks meaningfully different
+  // from a 1s run when the strip also contains a 600s run.
+  //
+  // Running/pending cells with no duration_ms render at baseline so the
+  // strip stays readable.
+  const _MIN_H = 8;
+  const _MAX_H = 28;
+  function cellHeight(durationMs, maxDurationMs) {
+    if (durationMs == null || maxDurationMs == null || maxDurationMs <= 0) {
+      return _MIN_H;
+    }
+    const r = Math.sqrt(Math.max(durationMs, 0) / maxDurationMs);
+    return Math.round(_MIN_H + (_MAX_H - _MIN_H) * Math.min(r, 1));
+  }
+  function stripMaxDuration(recent) {
+    let m = 0;
+    for (const r of recent || []) {
+      if (typeof r.duration_ms === "number" && r.duration_ms > m) {
+        m = r.duration_ms;
+      }
+    }
+    return m > 0 ? m : null;
+  }
 </script>
 
 <h1>Pipelines</h1>
@@ -78,6 +132,7 @@
   <div class="empty">no pipelines registered yet</div>
 {:else}
   {#each pipelines as p}
+    {@const _maxDur = stripMaxDuration(p.recent_runs)}
     <div class="panel pipeline-card">
       <div class="pipeline-header">
         <h3 class="pipeline-name">{p.name}</h3>
@@ -93,25 +148,51 @@
       </div>
 
       <div class="last-10">
-        <div class="last-10-label">Last 10 executions</div>
+        <div class="last-10-label">Last 10 executions <span class="dim">(bar height ∝ duration)</span></div>
         <div class="last-10-strip">
           {#each padRecent(p.recent_runs) as r}
             {#if r.run_id}
               <button
                 type="button"
                 class="exec-cell exec-cell--{r.status}"
+                style="height: {cellHeight(r.duration_ms, _maxDur)}px"
                 title={`${r.status} · ${r.started_at || ""} · ${fmtDuration(r.duration_ms)}`}
                 on:click={() => gotoRun(r.run_id)}
               ></button>
             {:else}
-              <span class="exec-cell exec-cell--empty" title="no run yet"></span>
+              <span
+                class="exec-cell exec-cell--empty"
+                style="height: {_MIN_H}px"
+                title="no run yet"
+              ></span>
             {/if}
           {/each}
         </div>
       </div>
 
       <div class="pipeline-footer">
-        <span><strong>Median duration:</strong> {fmtDuration(p.median_duration_ms)}</span>
+        {#if p.kind === "streaming"}
+          {@const s1 = p.streaming_stats?.stats_1m}
+          {@const s5 = p.streaming_stats?.stats_5m}
+          <span class="streaming-stats">
+            <strong>Throughput:</strong>
+            <span class="mono">{fmtRate(s1?.rows_consumed_per_sec)}</span>
+            <span class="dim">in (1m)</span>
+            <span class="sep">/</span>
+            <span class="mono">{fmtRate(s5?.rows_consumed_per_sec)}</span>
+            <span class="dim">in (5m)</span>
+            <span class="sep">·</span>
+            <strong>Batch cycle:</strong>
+            <span class="mono">{fmtCycle(s1?.avg_batch_cycle_ms)}</span>
+            <span class="dim">avg (1m)</span>
+            <span class="sep">·</span>
+            <span class="dim" title={p.streaming_stats?.snapshot_at || ""}>
+              {fmtSnapshotAge(p.streaming_stats?.snapshot_at)}
+            </span>
+          </span>
+        {:else}
+          <span><strong>Median duration:</strong> {fmtDuration(p.median_duration_ms)}</span>
+        {/if}
         <span><a class="link" href="#/runs?pipeline={encodeURIComponent(p.name)}">all jobs →</a></span>
       </div>
     </div>

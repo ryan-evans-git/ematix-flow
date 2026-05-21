@@ -66,6 +66,22 @@ _STUB_PIPELINES: list[dict[str, Any]] = [
         "latest_run": _STUB_RUNS[1],
         "failure_rate_7d": 0.13,
         "median_duration_ms": 47000,
+        # Last 10 oldest→newest (left-to-right). Mix of durations so
+        # the height-encoding reads as variance, plus the failed run.
+        "recent_runs": [
+            {"run_id": f"01HQSTUB-WH-{i:02d}", "status": "succeeded",
+             "started_at": "2026-05-19T00:00:00Z", "duration_ms": d}
+            for i, d in enumerate([
+                42_000, 45_000, 51_000, 47_000, 110_000,
+                46_000, 48_000, 89_000, 43_000,
+            ])
+        ] + [
+            {"run_id": _STUB_RUNS[1]["run_id"], "status": "failed",
+             "started_at": _STUB_RUNS[1]["started_at"],
+             "duration_ms": _STUB_RUNS[1]["duration_ms"]},
+        ],
+        "next_run_at": "2026-05-21T17:00:00Z",
+        "timezone": None,
     },
     {
         "name": "events_stream",
@@ -73,6 +89,47 @@ _STUB_PIPELINES: list[dict[str, Any]] = [
         "latest_run": _STUB_RUNS[2],
         "failure_rate_7d": 0.0,
         "median_duration_ms": None,
+        # Streaming: prior daemon sessions ran for varied durations
+        # (manual restarts, deployments, etc.); current session is open.
+        "recent_runs": [
+            {"run_id": f"01HQSTUB-EV-{i:02d}", "status": "succeeded",
+             "started_at": "2026-05-20T00:00:00Z", "duration_ms": d}
+            for i, d in enumerate([
+                7_200_000, 1_800_000, 3_600_000, 14_400_000, 600_000,
+                3_600_000, 2_400_000, 10_800_000, 5_400_000,
+            ])
+        ] + [
+            {"run_id": _STUB_RUNS[2]["run_id"], "status": "running",
+             "started_at": _STUB_RUNS[2]["started_at"], "duration_ms": None},
+        ],
+        "next_run_at": None,
+        "timezone": None,
+        # v0.5.0: streaming pipelines surface throughput + batch cycle
+        # (live snapshots from the daemon's metrics endpoint), shown in
+        # the UI footer in place of "Median duration".
+        "streaming_stats": {
+            "snapshot_at": "2026-05-21T16:00:30Z",
+            "rows_consumed_total": 124_500,
+            "rows_written_total": 124_500,
+            "batches_total": 415,
+            "errors_total": 0,
+            "stats_1m": {
+                "rows_consumed_per_sec": 412.0,
+                "rows_written_per_sec": 412.0,
+                "batches_per_sec": 1.4,
+                "errors_per_sec": 0.0,
+                "avg_batch_cycle_ms": 714.3,
+                "span_seconds": 60.0,
+            },
+            "stats_5m": {
+                "rows_consumed_per_sec": 398.5,
+                "rows_written_per_sec": 398.5,
+                "batches_per_sec": 1.35,
+                "errors_per_sec": 0.0,
+                "avg_batch_cycle_ms": 740.7,
+                "span_seconds": 300.0,
+            },
+        },
     },
 ]
 
@@ -155,6 +212,7 @@ def create_app(
     *,
     history: RunHistoryStore | None = None,
     ui_dist_dir: Path | None = None,
+    bearer_token: str | None = None,
 ):
     """Build the FastAPI app.
 
@@ -170,9 +228,14 @@ def create_app(
       ``ematix_flow.web.ui_dist`` data dir, which is populated by
       the Vite build at wheel-build time. If absent, the server
       serves a friendly placeholder HTML page.
+    - ``bearer_token`` — when set, ``/api/*`` routes require an
+      ``Authorization: Bearer <token>`` header that matches. Lets
+      operators bind the server to non-loopback addresses safely.
+      ``/api/health`` stays open so load-balancer / readiness probes
+      keep working.
     """
     try:
-        from fastapi import Body, FastAPI, HTTPException
+        from fastapi import Body, FastAPI, HTTPException, Request
         from fastapi.responses import HTMLResponse
         from fastapi.staticfiles import StaticFiles
     except ImportError as exc:
@@ -187,6 +250,38 @@ def create_app(
         docs_url="/api/docs",
         redoc_url=None,
     )
+
+    # Task #6: bearer-token middleware. Applied as an HTTP-level
+    # middleware (not a per-route Depends) so SPA static files +
+    # docs stay reachable without auth, while every /api/* route
+    # except /api/health is gated. Using constant-time compare so
+    # a timing attack can't fingerprint valid tokens.
+    if bearer_token is not None:
+        import hmac
+
+        @app.middleware("http")
+        async def _bearer_token_gate(request: Request, call_next):
+            path = request.url.path
+            # Static / SPA paths + /api/health are open; everything
+            # else under /api/ requires the bearer token.
+            if not path.startswith("/api/") or path == "/api/health":
+                return await call_next(request)
+            header = request.headers.get("authorization", "")
+            if not header.startswith("Bearer "):
+                from fastapi.responses import JSONResponse
+
+                return JSONResponse(
+                    {"detail": "missing Authorization: Bearer <token> header"},
+                    status_code=401,
+                )
+            presented = header[len("Bearer "):].strip()
+            if not hmac.compare_digest(presented, bearer_token):
+                from fastapi.responses import JSONResponse
+
+                return JSONResponse(
+                    {"detail": "invalid bearer token"}, status_code=401,
+                )
+            return await call_next(request)
 
     @app.get("/api/health")
     def health() -> dict[str, str]:  # type: ignore[unused-function]
@@ -308,6 +403,29 @@ def create_app(
                                 )
                                 if forecast is not None:
                                     next_run_at = forecast.isoformat()
+                # v0.5.0: surface streaming live-stats from extras. The
+                # daemon writes throughput / cycle-time into the running
+                # record's extras every ~30s; we just pass them through
+                # so the UI can render them in place of "Median duration".
+                streaming_stats: dict[str, Any] | None = None
+                if latest.kind == "streaming":
+                    e = latest.extras or {}
+                    if any(
+                        k in e
+                        for k in (
+                            "snapshot_at", "stats_1m", "stats_5m",
+                            "rows_consumed_total",
+                        )
+                    ):
+                        streaming_stats = {
+                            "snapshot_at": e.get("snapshot_at"),
+                            "rows_consumed_total": e.get("rows_consumed_total"),
+                            "rows_written_total": e.get("rows_written_total"),
+                            "batches_total": e.get("batches_total"),
+                            "errors_total": e.get("errors_total"),
+                            "stats_1m": e.get("stats_1m"),
+                            "stats_5m": e.get("stats_5m"),
+                        }
                 pipelines.append(
                     {
                         "name": name,
@@ -320,6 +438,7 @@ def create_app(
                         "recent_runs": recent,
                         "next_run_at": next_run_at,
                         "timezone": pipeline_tz,
+                        "streaming_stats": streaming_stats,
                     }
                 )
             # Sort pipelines so the most recently active is on top.
@@ -329,6 +448,34 @@ def create_app(
             )
             return {"pipelines": pipelines}
         return {"pipelines": _STUB_PIPELINES}
+
+    # ---- Cross-pipeline DAG view (task #7) -------------------------
+    @app.get("/api/dag")
+    def pipeline_dag() -> dict[str, Any]:  # type: ignore[unused-function]
+        """Cross-pipeline DAG: nodes = registered pipelines, edges =
+        ``depends_on`` declarations. Renders in the SPA as a tree to
+        spot bottlenecks (deep chains, fan-out hot spots)."""
+        try:
+            from ematix_flow.pipeline import _DEPENDS_ON, _REGISTRY
+        except Exception:
+            return {"nodes": [], "edges": []}
+
+        nodes = []
+        for name, sp in sorted(_REGISTRY.items()):
+            nodes.append(
+                {
+                    "name": name,
+                    "schedule": sp.schedule,
+                    "timezone": getattr(sp, "timezone", None),
+                }
+            )
+        edges = []
+        for name, upstreams in _DEPENDS_ON.items():
+            for upstream in upstreams:
+                # Edge direction: upstream → downstream (upstream
+                # produces, downstream consumes).
+                edges.append({"from": upstream, "to": name})
+        return {"nodes": nodes, "edges": edges}
 
     # ---- Mutating actions (Phase 4b) -------------------------------
     #
@@ -505,14 +652,16 @@ def run_server(
     host: str = "127.0.0.1",
     port: int = 8080,
     log_level: str = "info",
+    bearer_token: str | None = None,
+    history: RunHistoryStore | None = None,
 ) -> None:
     """Launch the uvicorn server.
 
     Defaults to ``127.0.0.1`` so the UI is unreachable off-host
     without an explicit ``--bind <addr>`` opt-in. Binding to
-    ``0.0.0.0`` (or any non-loopback) prints a loud warning since
-    Phase 4a ships without bearer-token auth — anyone who can reach
-    the port can trigger restart / rerun / pause actions.
+    ``0.0.0.0`` (or any non-loopback) prints a loud warning **unless
+    bearer-token auth is configured** — once a token is set, mutating
+    actions require it and the non-loopback bind is safe.
     """
     try:
         import uvicorn  # type: ignore[import-not-found]
@@ -522,15 +671,16 @@ def run_server(
             "`pip install ematix-flow[web]`"
         ) from exc
 
-    if host not in {"127.0.0.1", "localhost", "::1"}:
+    is_loopback = host in {"127.0.0.1", "localhost", "::1"}
+    if not is_loopback and bearer_token is None:
         print(
-            f"WARNING: ematix-flow web is binding to {host!r}. This server "
-            "ships without auth in Phase 4a — anyone who can reach this "
-            "port can trigger restart / rerun / pause actions on your "
-            "pipelines. Use 127.0.0.1 + SSH tunneling, or put a reverse "
-            "proxy with auth in front, before exposing this off-host.",
+            f"WARNING: ematix-flow web is binding to {host!r} with no "
+            "bearer-token auth. Anyone who can reach this port can trigger "
+            "restart / rerun / pause actions on your pipelines. Pass "
+            "--token <secret> (or set EMATIX_FLOW_WEB_TOKEN env var) before "
+            "exposing this off-host.",
             file=sys.stderr,
         )
 
-    app = create_app()
+    app = create_app(bearer_token=bearer_token, history=history)
     uvicorn.run(app, host=host, port=port, log_level=log_level)

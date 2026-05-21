@@ -124,6 +124,10 @@ pub mod mysql_backend;
 pub mod objectstore_backend;
 pub mod pg;
 pub mod py_callbacks;
+// Task #559 final slice: Rust-side invoker for warehouse-pipeline
+// callbacks. Uses py_callbacks to dispatch a @ematix.warehouse_pipeline
+// function by name without subprocess overhead.
+pub mod warehouse_executor;
 // Task #481: one-call setup helpers (`with_optimizer_rules` +
 // `register_dict_aware_parquet`) that activate the dict-aware fast
 // path without callers having to memorise the rule chain + the

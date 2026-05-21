@@ -60,3 +60,7 @@ export async function resumeRun(runId) {
 export async function health() {
   return _request("/health");
 }
+
+export async function pipelineDag() {
+  return _request("/dag");
+}
