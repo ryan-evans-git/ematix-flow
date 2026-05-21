@@ -1607,6 +1607,44 @@ class _EmatixNamespace:
 
         return decorate
 
+    def warehouse_pipeline(
+        self,
+        *,
+        source: Any,
+        target: Any,
+        schedule: str | None,
+        name: str | None = None,
+        depends_on: list[str] | None = None,
+        upstream_freshness_secs: int | None = None,
+        retry: dict | None = None,
+    ):
+        """Phase 2d slice 1: register a warehouse-to-warehouse pipeline
+        for scheduling.
+
+        ``source`` and ``target`` must be a
+        :class:`~ematix_flow.warehouses.WarehouseSource` /
+        :class:`~ematix_flow.warehouses.WarehouseTarget` respectively.
+        The wrapped function runs once per schedule tick, executes
+        :func:`~ematix_flow.warehouses.run_warehouse_pipeline`, and
+        records a JSON-serializable summary to the configured RunLog.
+
+        See :mod:`ematix_flow.warehouse_pipeline` for full surface
+        documentation.
+        """
+        # Lazy import so the warehouses + decorator module pair don't
+        # form an import-time cycle.
+        from ematix_flow.warehouse_pipeline import warehouse_pipeline as _wp
+
+        return _wp(
+            source=source,
+            target=target,
+            schedule=schedule,
+            name=name,
+            depends_on=depends_on,
+            upstream_freshness_secs=upstream_freshness_secs,
+            retry=retry,
+        )
+
     @staticmethod
     def connection(cls: type) -> Any:
         """Π.1: register a typed streaming connection from a declarative class.
