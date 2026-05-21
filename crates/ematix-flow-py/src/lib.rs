@@ -11,8 +11,11 @@ use std::sync::{Arc, OnceLock};
 
 use ematix_flow_core::backend::{Backend, Dialect, PostgresBackend, TargetTable, WriteMode};
 use ematix_flow_core::ddl::{self, DriftResult};
+use ematix_flow_core::duckdb_backend::DuckDBBackend;
 use ematix_flow_core::meta::{DeleteHandling, WatermarkConfig};
+use ematix_flow_core::mysql_backend::MySQLBackend;
 use ematix_flow_core::pg::{self, EnsureOutcome, MergeRunResult, PgPool, Scd2RunResult};
+use ematix_flow_core::sqlite_backend::SQLiteBackend;
 use ematix_flow_core::strategy::append::{augment_with_metadata, plan_same_db_append};
 use ematix_flow_core::strategy::merge::plan_merge_upsert;
 use ematix_flow_core::strategy::scd2::{augment_with_scd2, plan_scd2};
@@ -158,32 +161,79 @@ fn create_table_sql(spec_json: &str) -> PyResult<String> {
 
 #[pyclass]
 struct Connection {
-    pool: Arc<PgPool>,
+    /// Σ.M.1a (#TBD): every Python-facing Connection now holds an
+    /// `Arc<dyn Backend>` rather than a concrete `Arc<PgPool>`. The
+    /// existing pymethods are still PG-only — they call `pg_pool()` to
+    /// downcast — but `_core.connect(url)` now dispatches on URL scheme
+    /// so MySQL / SQLite / DuckDB backends construct correctly. The
+    /// non-PG paths raise a clear "method X not yet implemented for
+    /// dialect Y; lands in Σ.M.3" error from `pg_pool()`, vs the prior
+    /// "invalid connection URL" from deep in `PgPool::connect`.
+    ///
+    /// Σ.M.1b will migrate the methods that have a `Backend` trait
+    /// equivalent (`run_append`, `run_merge`, `run_scd2`, `run_truncate`,
+    /// `ping`, `execute`) to trait dispatch — making those four
+    /// methods work for any backend without further per-backend code.
+    /// The remaining PG-only methods (`ensure_table`, `read_watermark`,
+    /// `fetch_scalar_int`, `execute_in_transaction`,
+    /// `record_transform_history`) need equivalents added to the
+    /// non-PG backend impls before they can shed the `pg_pool()`
+    /// downcast — that's Σ.M.3+.
+    backend: Arc<dyn Backend>,
     dsn: String,
+}
+
+impl Connection {
+    /// Downcast the backend to a `PgPool` for the PG-only pymethods.
+    /// Returns a clear error message when the backend isn't Postgres,
+    /// pointing at the Σ.M slice that lands cross-backend support for
+    /// the affected operation.
+    fn pg_pool(&self) -> PyResult<Arc<PgPool>> {
+        // Σ.M follow-up: replace this downcast with proper trait
+        // dispatch on every method that has a `Backend` trait
+        // equivalent. The 5 PG-only methods (ensure_table,
+        // read_watermark, fetch_scalar_int, execute_in_transaction,
+        // record_transform_history) need new trait methods + per-
+        // backend impls before they can shed the downcast.
+        let pool = self.backend.as_postgres().ok_or_else(|| {
+            PyValueError::new_err(format!(
+                "this operation is only implemented for Postgres targets in \
+                 v0.5.x; got dialect={:?}. Cross-backend batch support lands \
+                 in v0.6.0 (Σ.M milestone — see \
+                 docs/PHASE_SIGMA_M_MULTI_BACKEND_BATCH.md). For MySQL / \
+                 SQLite / DuckDB targets today, use @ematix.streaming_pipeline.",
+                self.backend.dialect()
+            ))
+        })?;
+        // PgPool is owned inside PostgresBackend as an Arc; `as_postgres()`
+        // returns `&PgPool`, so we wrap a fresh Arc by cloning the inner
+        // pool reference. (PgPool::clone is a cheap Arc bump.)
+        Ok(Arc::new(pool.clone()))
+    }
 }
 
 #[pymethods]
 impl Connection {
     fn ping(&self, py: Python<'_>) -> PyResult<i32> {
-        let pool = self.pool.clone();
+        let pool = self.pg_pool()?;
         py.detach(|| rt().block_on(async move { pool.ping().await }))
             .map_err(|e| PyValueError::new_err(e.to_string()))
     }
 
     fn execute(&self, py: Python<'_>, sql: String) -> PyResult<u64> {
-        let pool = self.pool.clone();
+        let pool = self.pg_pool()?;
         py.detach(|| rt().block_on(async move { pool.execute(&sql).await }))
             .map_err(|e| PyValueError::new_err(e.to_string()))
     }
 
     fn fetch_scalar_int(&self, py: Python<'_>, sql: String) -> PyResult<i32> {
-        let pool = self.pool.clone();
+        let pool = self.pg_pool()?;
         py.detach(|| rt().block_on(async move { pool.fetch_scalar_int(&sql).await }))
             .map_err(|e| PyValueError::new_err(e.to_string()))
     }
 
     fn execute_in_transaction(&self, py: Python<'_>, sqls: Vec<String>) -> PyResult<()> {
-        let pool = self.pool.clone();
+        let pool = self.pg_pool()?;
         py.detach(|| rt().block_on(async move { pool.execute_in_transaction(&sqls).await }))
             .map_err(|e| PyValueError::new_err(e.to_string()))
     }
@@ -205,7 +255,7 @@ impl Connection {
         error_message: Option<String>,
         metrics_json: Option<String>,
     ) -> PyResult<()> {
-        let pool = self.pool.clone();
+        let pool = self.pg_pool()?;
         py.detach(|| {
             rt().block_on(async move {
                 pool.insert_transform_history(
@@ -246,7 +296,11 @@ impl Connection {
     /// (host, port, dbname, user) tuple. Used Python-side to detect the
     /// same-DB vs cross-DB code path before calling run_append.
     fn connection_info<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let info = self.pool.info();
+        // Σ.M.1a: use the Backend trait's `connection_info()` — every
+        // backend impl supplies the same `(host, port, dbname, user)`
+        // tuple shape, so this works for pg / mysql / sqlite / duckdb
+        // unchanged.
+        let info = self.backend.connection_info();
         let dict = PyDict::new(py);
         dict.set_item("host", &info.host)?;
         dict.set_item("port", info.port)?;
@@ -304,8 +358,8 @@ impl Connection {
             .map_err(|e| PyValueError::new_err(e.to_string()))?;
         let spec: TableSpec =
             serde_json::from_str(&normalized).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let target_pool = self.pool.clone();
-        let source_pool = source.map(|s| s.pool.clone());
+        let target_pool = self.pg_pool()?;
+        let source_pool = source.map(|s| s.pg_pool()).transpose()?;
 
         let outcome: Scd2RunResult = py
             .detach(|| {
@@ -399,8 +453,8 @@ impl Connection {
             .map_err(|e| PyValueError::new_err(e.to_string()))?;
         let spec: TableSpec =
             serde_json::from_str(&normalized).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let target_pool = self.pool.clone();
-        let source_pool = source.map(|s| s.pool.clone());
+        let target_pool = self.pg_pool()?;
+        let source_pool = source.map(|s| s.pg_pool()).transpose()?;
 
         let outcome: MergeRunResult = py
             .detach(|| {
@@ -472,8 +526,8 @@ impl Connection {
             .map_err(|e| PyValueError::new_err(e.to_string()))?;
         let spec: TableSpec =
             serde_json::from_str(&normalized).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let target_pool = self.pool.clone();
-        let source_pool = source.map(|s| s.pool.clone());
+        let target_pool = self.pg_pool()?;
+        let source_pool = source.map(|s| s.pg_pool()).transpose()?;
 
         let outcome = py
             .detach(|| {
@@ -510,7 +564,7 @@ impl Connection {
         py: Python<'py>,
         pipeline_name: String,
     ) -> PyResult<Option<Bound<'py, PyDict>>> {
-        let pool = self.pool.clone();
+        let pool = self.pg_pool()?;
         let row = py
             .detach(|| rt().block_on(async move { pool.read_watermark(&pipeline_name).await }))
             .map_err(|e| PyValueError::new_err(e.to_string()))?;
@@ -553,8 +607,8 @@ impl Connection {
             .map_err(|e| PyValueError::new_err(e.to_string()))?;
         let spec: TableSpec =
             serde_json::from_str(&normalized).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let target_pool = self.pool.clone();
-        let source_pool = source.map(|s| s.pool.clone());
+        let target_pool = self.pg_pool()?;
+        let source_pool = source.map(|s| s.pg_pool()).transpose()?;
         let watermark = incremental_column.map(|column| WatermarkConfig {
             column,
             last_value_literal,
@@ -618,7 +672,7 @@ impl Connection {
             .map_err(|e| PyValueError::new_err(e.to_string()))?;
         let spec: TableSpec =
             serde_json::from_str(&normalized).map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let pool = self.pool.clone();
+        let pool = self.pg_pool()?;
         let outcome = py
             .detach(|| rt().block_on(async move { pool.ensure_table(&spec).await }))
             .map_err(|e| PyValueError::new_err(e.to_string()))?;
@@ -689,14 +743,15 @@ fn cross_backend_arrow_sync(
             )));
         }
     };
-    let source_backend: Arc<dyn Backend> = Arc::new(PostgresBackend::new(
-        source.pool.clone(),
-        source.dsn.clone(),
-    ));
-    let target_backend: Arc<dyn Backend> = Arc::new(PostgresBackend::new(
-        target.pool.clone(),
-        target.dsn.clone(),
-    ));
+    // Σ.M.1a: cross-backend Arrow streaming was already trait-based
+    // internally — it just had to manually wrap `Arc<PgPool>` back into
+    // a `PostgresBackend` to satisfy the trait. Now that `Connection`
+    // holds `Arc<dyn Backend>` directly, we just clone the handles.
+    // This makes pg↔mysql, mysql↔duckdb, etc. work as soon as each
+    // backend impl's `read_arrow_stream` / `write_arrow_stream` is wired
+    // (all four DB backends already implement both).
+    let source_backend: Arc<dyn Backend> = source.backend.clone();
+    let target_backend: Arc<dyn Backend> = target.backend.clone();
     let target_ref = TargetTable {
         schema: target_schema,
         name: target_table,
@@ -831,17 +886,78 @@ fn unwrap_udaf_handles(
         .collect()
 }
 
+/// Σ.M.1a: dispatch on URL scheme to construct the appropriate
+/// `Backend` impl. Returns a `Connection { backend: Arc<dyn Backend> }`
+/// that pymethods consume.
+///
+/// Supported schemes:
+///   - `postgres://` / `postgresql://` → `PostgresBackend` (async connect)
+///   - `mysql://` / `mysql+pymysql://` → `MySQLBackend` (sync connect;
+///     `+pymysql` is the SQLAlchemy-style driver qualifier the Python
+///     ORM layer appends — strip it before handing to mysql_async)
+///   - `sqlite://` / `sqlite:///path` / `:memory:` → `SQLiteBackend`
+///   - `duckdb://` / `duckdb:///path` / bare `.duckdb` filename →
+///     `DuckDBBackend`
+///
+/// Anything else raises a clear PyValueError listing the supported
+/// schemes. The previous hard-coded-Postgres behavior surfaced a
+/// confusing "invalid connection string" deep in `tokio_postgres`.
+///
+/// Note (Σ.M.1a): non-PG backends construct successfully here, but the
+/// 5 PG-only pymethods (`ensure_table`, `read_watermark`,
+/// `fetch_scalar_int`, `execute_in_transaction`,
+/// `record_transform_history`) still raise from `pg_pool()` when
+/// called — they need trait-level equivalents added per backend.
+/// That's Σ.M.3+ work.
 #[pyfunction]
 fn connect(py: Python<'_>, url: &str) -> PyResult<Connection> {
-    let url_owned = url.to_string();
-    let url_for_connect = url_owned.clone();
-    let pool = py
-        .detach(|| rt().block_on(async move { PgPool::connect(&url_for_connect).await }))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-    Ok(Connection {
-        pool: Arc::new(pool),
-        dsn: url_owned,
-    })
+    let dsn = url.to_string();
+    let backend: Arc<dyn Backend> =
+        if url.starts_with("postgres://") || url.starts_with("postgresql://") {
+            let url_for_connect = dsn.clone();
+            let pool = py
+                .detach(|| rt().block_on(async move { PgPool::connect(&url_for_connect).await }))
+                .map_err(|e| PyValueError::new_err(e.to_string()))?;
+            Arc::new(PostgresBackend::new(Arc::new(pool), dsn.clone()))
+        } else if url.starts_with("mysql://") || url.starts_with("mysql+pymysql://") {
+            // mysql_async expects `mysql://` — strip the SQLAlchemy
+            // driver qualifier when present.
+            let stripped = url.replacen("mysql+pymysql://", "mysql://", 1);
+            let backend = MySQLBackend::open(stripped)
+                .map_err(|e| PyValueError::new_err(format!("mysql connect: {e}")))?;
+            Arc::new(backend)
+        } else if url == ":memory:"
+            || url.starts_with("sqlite://")
+            || url.starts_with("sqlite:///")
+        {
+            // sqlite://path or sqlite:///abs/path → strip the prefix
+            // before handing to rusqlite.
+            let location = url
+                .strip_prefix("sqlite:///")
+                .or_else(|| url.strip_prefix("sqlite://"))
+                .unwrap_or(url)
+                .to_string();
+            let backend = SQLiteBackend::open(location)
+                .map_err(|e| PyValueError::new_err(format!("sqlite open: {e}")))?;
+            Arc::new(backend)
+        } else if url.starts_with("duckdb://") || url.starts_with("duckdb:///") {
+            let location = url
+                .strip_prefix("duckdb:///")
+                .or_else(|| url.strip_prefix("duckdb://"))
+                .unwrap_or(url)
+                .to_string();
+            let backend = DuckDBBackend::open(location)
+                .map_err(|e| PyValueError::new_err(format!("duckdb open: {e}")))?;
+            Arc::new(backend)
+        } else {
+            return Err(PyValueError::new_err(format!(
+                "unsupported connection URL scheme in {url:?}. Supported: \
+                 postgres:// / postgresql:// , mysql:// / mysql+pymysql:// , \
+                 sqlite:// / sqlite:///<path> / :memory: , \
+                 duckdb:// / duckdb:///<path>"
+            )));
+        };
+    Ok(Connection { backend, dsn })
 }
 
 #[pymodule]
