@@ -87,6 +87,37 @@
     }
     return out;
   }
+
+  // Per-cell height — relative to the longest run in this pipeline's
+  // last-10 strip so duration variance is visible at a glance. Bars are
+  // bottom-aligned (see .last-10-strip { align-items: flex-end }) so
+  // taller bars grow upward.
+  //
+  // Ramp: 8px (baseline / no duration) → 28px (max duration in strip).
+  // Sqrt scaling so a single 10× outlier doesn't crush everything else
+  // to a one-pixel sliver — a 60s run still looks meaningfully different
+  // from a 1s run when the strip also contains a 600s run.
+  //
+  // Running/pending cells with no duration_ms render at baseline so the
+  // strip stays readable.
+  const _MIN_H = 8;
+  const _MAX_H = 28;
+  function cellHeight(durationMs, maxDurationMs) {
+    if (durationMs == null || maxDurationMs == null || maxDurationMs <= 0) {
+      return _MIN_H;
+    }
+    const r = Math.sqrt(Math.max(durationMs, 0) / maxDurationMs);
+    return Math.round(_MIN_H + (_MAX_H - _MIN_H) * Math.min(r, 1));
+  }
+  function stripMaxDuration(recent) {
+    let m = 0;
+    for (const r of recent || []) {
+      if (typeof r.duration_ms === "number" && r.duration_ms > m) {
+        m = r.duration_ms;
+      }
+    }
+    return m > 0 ? m : null;
+  }
 </script>
 
 <h1>Pipelines</h1>
@@ -101,6 +132,7 @@
   <div class="empty">no pipelines registered yet</div>
 {:else}
   {#each pipelines as p}
+    {@const _maxDur = stripMaxDuration(p.recent_runs)}
     <div class="panel pipeline-card">
       <div class="pipeline-header">
         <h3 class="pipeline-name">{p.name}</h3>
@@ -116,18 +148,23 @@
       </div>
 
       <div class="last-10">
-        <div class="last-10-label">Last 10 executions</div>
+        <div class="last-10-label">Last 10 executions <span class="dim">(bar height ∝ duration)</span></div>
         <div class="last-10-strip">
           {#each padRecent(p.recent_runs) as r}
             {#if r.run_id}
               <button
                 type="button"
                 class="exec-cell exec-cell--{r.status}"
+                style="height: {cellHeight(r.duration_ms, _maxDur)}px"
                 title={`${r.status} · ${r.started_at || ""} · ${fmtDuration(r.duration_ms)}`}
                 on:click={() => gotoRun(r.run_id)}
               ></button>
             {:else}
-              <span class="exec-cell exec-cell--empty" title="no run yet"></span>
+              <span
+                class="exec-cell exec-cell--empty"
+                style="height: {_MIN_H}px"
+                title="no run yet"
+              ></span>
             {/if}
           {/each}
         </div>

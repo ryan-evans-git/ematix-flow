@@ -662,11 +662,14 @@ flow web --port 8080 --bind 0.0.0.0 --token "$EMATIX_FLOW_WEB_TOKEN"
 
 The landing view is **Pipelines** — one card per pipeline with a
 last-10-execution strip (teal = succeeded, red = failed,
-amber-pulse = running; a retried-then-succeeded run counts as
-green) and a "Next: `<UTC>`" or "LIVE STREAMING" indicator. Batch
-pipelines show median duration; streaming pipelines show live
-throughput (1m / 5m rolling) + average batch cycle, snapshotted
-from the daemon's `/metrics` endpoint every ~30s:
+amber-pulse = running; a retried-then-succeeded run counts as green).
+Bar **height** is proportional to run duration, scaled per-pipeline
+so variance is visible at a glance — a tall bar means that run took
+unusually long. The right side shows "Next: `<UTC>`" for batch
+pipelines or "LIVE STREAMING" for streaming. Batch cards have a
+median-duration footer; streaming cards swap that for live throughput
+(1m / 5m rolling) + average batch cycle, snapshotted from the
+daemon's `/metrics` endpoint every ~30s:
 
 ![Pipelines view — batch median duration vs streaming live throughput](docs/screenshots/pipelines-view.png)
 

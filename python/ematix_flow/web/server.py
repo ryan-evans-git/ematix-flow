@@ -66,11 +66,15 @@ _STUB_PIPELINES: list[dict[str, Any]] = [
         "latest_run": _STUB_RUNS[1],
         "failure_rate_7d": 0.13,
         "median_duration_ms": 47000,
-        # Last 10 oldest→newest (left-to-right). One failed, rest green.
+        # Last 10 oldest→newest (left-to-right). Mix of durations so
+        # the height-encoding reads as variance, plus the failed run.
         "recent_runs": [
             {"run_id": f"01HQSTUB-WH-{i:02d}", "status": "succeeded",
-             "started_at": "2026-05-19T00:00:00Z", "duration_ms": 47000}
-            for i in range(9)
+             "started_at": "2026-05-19T00:00:00Z", "duration_ms": d}
+            for i, d in enumerate([
+                42_000, 45_000, 51_000, 47_000, 110_000,
+                46_000, 48_000, 89_000, 43_000,
+            ])
         ] + [
             {"run_id": _STUB_RUNS[1]["run_id"], "status": "failed",
              "started_at": _STUB_RUNS[1]["started_at"],
@@ -85,11 +89,15 @@ _STUB_PIPELINES: list[dict[str, Any]] = [
         "latest_run": _STUB_RUNS[2],
         "failure_rate_7d": 0.0,
         "median_duration_ms": None,
-        # Streaming: current open record + a few prior daemon sessions.
+        # Streaming: prior daemon sessions ran for varied durations
+        # (manual restarts, deployments, etc.); current session is open.
         "recent_runs": [
             {"run_id": f"01HQSTUB-EV-{i:02d}", "status": "succeeded",
-             "started_at": "2026-05-20T00:00:00Z", "duration_ms": 3_600_000}
-            for i in range(9)
+             "started_at": "2026-05-20T00:00:00Z", "duration_ms": d}
+            for i, d in enumerate([
+                7_200_000, 1_800_000, 3_600_000, 14_400_000, 600_000,
+                3_600_000, 2_400_000, 10_800_000, 5_400_000,
+            ])
         ] + [
             {"run_id": _STUB_RUNS[2]["run_id"], "status": "running",
              "started_at": _STUB_RUNS[2]["started_at"], "duration_ms": None},
