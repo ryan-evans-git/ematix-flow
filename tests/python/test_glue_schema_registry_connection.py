@@ -14,8 +14,8 @@ from __future__ import annotations
 import pytest
 
 from ematix_flow.connections import (
-    GlueSchemaRegistryConnection,
     _KIND_FACTORIES,
+    GlueSchemaRegistryConnection,
 )
 
 
