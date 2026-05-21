@@ -74,6 +74,28 @@ class SqliteRunLog:
             claimed_at    TEXT NOT NULL,
             expires_at    TEXT NOT NULL
         );
+        -- v0.5.0: rich-history rows for the Web UI. One row per
+        -- run_id; REPLACE on write so updates (e.g. streaming
+        -- stats snapshots) overwrite in place.
+        CREATE TABLE IF NOT EXISTS run_records (
+            run_id           TEXT PRIMARY KEY,
+            pipeline         TEXT NOT NULL,
+            status           TEXT NOT NULL,
+            started_at       TEXT NOT NULL,
+            finished_at      TEXT,
+            attempt          INTEGER NOT NULL,
+            failed_step      TEXT,
+            failed_watermark TEXT,
+            error_summary    TEXT,
+            kind             TEXT NOT NULL,
+            extras_json      TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_run_records_started_at
+            ON run_records(started_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_run_records_pipeline
+            ON run_records(pipeline, started_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_run_records_status
+            ON run_records(status, started_at DESC);
     """
 
     def __init__(self, path: str):
@@ -201,3 +223,115 @@ class SqliteRunLog:
             ExpiredClaim(pipeline=name, worker_id=wid, expires_at=parse_iso(exp))
             for name, wid, exp in cur.fetchall()
         ]
+
+    # ---- v0.5.0: rich-history (RunHistoryStore protocol) ----------
+    #
+    # The Web UI's :class:`RunHistoryStore` protocol layers on top of
+    # SqliteRunLog by adding a separate `run_records` table. Same
+    # backing file, same connection, same write-once-then-replace
+    # semantics — so `flow consume --run-log-url sqlite:///foo.db` and
+    # `flow web --run-log-url sqlite:///foo.db` both see the same
+    # records without any extra wiring.
+
+    def record_run_record(self, record) -> None:
+        """Persist a :class:`RunRecord`. Idempotent — REPLACE on run_id
+        so the streaming snapshotter can re-write the same row every
+        ~30s without producing duplicate history rows in the UI."""
+        import json
+
+        # Lazy import to keep the lightweight RunLog path free of
+        # the history module's load cost for users who never touch
+        # the rich-history surface.
+        from .history import RunRecord  # noqa: F401 — type check
+
+        self._conn.execute(
+            "REPLACE INTO run_records "
+            "(run_id, pipeline, status, started_at, finished_at, "
+            " attempt, failed_step, failed_watermark, error_summary, "
+            " kind, extras_json) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                record.run_id,
+                record.pipeline,
+                record.status,
+                iso_utc(record.started_at),
+                iso_utc(record.finished_at) if record.finished_at else None,
+                record.attempt,
+                record.failed_step,
+                record.failed_watermark,
+                record.error_summary,
+                record.kind,
+                json.dumps(record.extras, default=str),
+            ),
+        )
+
+    def list_runs(
+        self,
+        *,
+        pipeline: str | None = None,
+        status: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> tuple[list, int]:
+        """Return ``(records, total)`` — same shape as InMemoryRunHistory."""
+        clauses: list[str] = []
+        params: list = []
+        if pipeline is not None:
+            clauses.append("pipeline = ?")
+            params.append(pipeline)
+        if status is not None:
+            clauses.append("status = ?")
+            params.append(status)
+        where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+
+        total_row = self._conn.execute(
+            f"SELECT COUNT(*) FROM run_records {where}", params,
+        ).fetchone()
+        total = int(total_row[0]) if total_row else 0
+
+        cur = self._conn.execute(
+            f"SELECT run_id, pipeline, status, started_at, finished_at, "
+            f" attempt, failed_step, failed_watermark, error_summary, "
+            f" kind, extras_json "
+            f"FROM run_records {where} "
+            f"ORDER BY started_at DESC "
+            f"LIMIT ? OFFSET ?",
+            params + [limit, offset],
+        )
+        records = [self._row_to_record(row) for row in cur.fetchall()]
+        return records, total
+
+    def get_run(self, run_id: str):
+        cur = self._conn.execute(
+            "SELECT run_id, pipeline, status, started_at, finished_at, "
+            " attempt, failed_step, failed_watermark, error_summary, "
+            " kind, extras_json "
+            "FROM run_records WHERE run_id = ?",
+            (run_id,),
+        )
+        row = cur.fetchone()
+        return self._row_to_record(row) if row is not None else None
+
+    @staticmethod
+    def _row_to_record(row):
+        import json
+
+        from .history import RunRecord
+
+        (
+            run_id, pipeline, status, started_s, finished_s, attempt,
+            failed_step, failed_watermark, error_summary, kind, extras_s,
+        ) = row
+        return RunRecord(
+            run_id=run_id,
+            pipeline=pipeline,
+            status=status,
+            started_at=parse_iso(started_s),
+            finished_at=parse_iso(finished_s) if finished_s else None,
+            attempt=int(attempt),
+            failed_step=failed_step,
+            failed_watermark=failed_watermark,
+            error_summary=error_summary,
+            kind=kind,
+            extras=json.loads(extras_s) if extras_s else {},
+        )

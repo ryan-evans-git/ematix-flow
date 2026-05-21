@@ -242,10 +242,13 @@ class kafka_avro:
 
 Today's `kind = "schema_registry"` covers Confluent-style wire format
 (Confluent SR, Apicurio Confluent-compat). **AWS Glue Schema Registry**
-(separate framing: `0x03` header byte + UUID + compression byte) lands
-in the next release — the typed `GlueSchemaRegistryConnection` class
-and Rust-side framing primitives are on `main` after v0.4.0; Kafka
-backend dispatch + LocalStack integration test follow.
+(separate framing: `0x03` header byte + UUID + compression byte) is
+fully wired in v0.5.0 — use
+`GlueSchemaRegistryConnection(kind = "glue_schema_registry", …)`,
+and the Rust Kafka backend dispatches consumer + producer paths to
+Glue automatically. End-to-end recipe (LocalStack quickstart +
+production wiring + IAM template) at
+[`docs/DEPLOYMENT.md` Recipe 10](docs/DEPLOYMENT.md#recipe-10--kafka--aws-glue-schema-registry).
 
 ---
 
@@ -646,16 +649,26 @@ flow web --port 8080
 # open http://127.0.0.1:8080/
 ```
 
-Localhost-only by default (binding a non-loopback address logs a
-warning since the alpha ships without bearer-token auth — SSH
-tunnel or front with a reverse proxy for remote access).
+Localhost-only by default. For remote access, pass `--token <value>`
+to enable bearer-token auth on every `/api/*` route
+(`/api/health` stays open for load-balancer probes); without a token,
+binding a non-loopback address logs a warning — SSH tunnel or front
+with a reverse proxy.
+
+```sh
+flow web --port 8080 --bind 0.0.0.0 --token "$EMATIX_FLOW_WEB_TOKEN"
+# clients send: Authorization: Bearer $EMATIX_FLOW_WEB_TOKEN
+```
 
 The landing view is **Pipelines** — one card per pipeline with a
 last-10-execution strip (teal = succeeded, red = failed,
 amber-pulse = running; a retried-then-succeeded run counts as
-green) and a "Next: `<UTC>`" or "LIVE STREAMING" indicator:
+green) and a "Next: `<UTC>`" or "LIVE STREAMING" indicator. Batch
+pipelines show median duration; streaming pipelines show live
+throughput (1m / 5m rolling) + average batch cycle, snapshotted
+from the daemon's `/metrics` endpoint every ~30s:
 
-![Pipelines view — last-10 strip + next-run indicator per pipeline](docs/screenshots/pipelines-view.png)
+![Pipelines view — batch median duration vs streaming live throughput](docs/screenshots/pipelines-view.png)
 
 Clicking any square drills into the run-detail page, which renders
 the task DAG live — solid teal for **succeeded**, pulsing amber
@@ -676,6 +689,13 @@ the RunLog with `extras["restart_from_step"]`; the next scheduler
 tick claims it and the worker honors `EMATIX_FLOW_RESTART_FROM_STEP`
 to resume the DAG from that node — upstream artifacts get reused
 rather than recomputed.
+
+A third top-level view, **DAG**, renders the cross-pipeline
+`depends_on` graph: each node carries its schedule + timezone +
+fan-out count, and topological-rank columns guarantee upstreams sit
+left of their downstreams. Useful for spotting orphan pipelines,
+unintended cycles, or fan-out hotspots before they bite at scheduler
+tick time.
 
 More screenshots + walkthrough: [ematix.dev/specs/04-web-ui-screenshots](https://ematix.dev/specs/04-web-ui-screenshots).
 
@@ -722,6 +742,8 @@ failure / recovery events.
 |---|---|
 | `stdout://` | Human-readable lines on stderr. |
 | `slack://hooks.slack.com/services/...` | Posts to a Slack incoming webhook. |
+| `email://user:pass@host:port?from=…&to=…&starttls=1` | Sends email via stdlib `smtplib` (default port 587 STARTTLS / 465 implicit SSL). |
+| `pagerduty://<routing_key>?service=…&severity=…` | PagerDuty Events API v2 trigger/resolve; `dedup_key="<service>:<pipeline>"` auto-resolves on recovery. |
 
 Buggy alerters are fault-isolated: any exception is logged and
 swallowed, never crashes the orchestrator.
@@ -1359,8 +1381,13 @@ flow status              # operator view: per-pipeline status / next-due / attem
 flow preview <name>      # dry-run, no commit
 flow validate <name>     # EXPLAIN against the target
 flow runs list           # recent runs from the configured RunLog
+flow logs <run_id>       # tail captured stdout/stderr for a run (opt-in capture: EMATIX_FLOW_CAPTURE_LOGS=1)
 flow connections list / check / set
 flow transform list / run
+
+flow init <dir>          # scaffold a runnable starter project (pipelines.py + connections.toml + Dockerfile + flow.service)
+flow doctor              # connection-health probes per kind (pg / kafka / glue / s3 / snowflake / …); non-zero exit on any failure
+flow secrets test [path] # resolve every ${…} in connections.toml + report per-secret OK/missing/error (no values printed)
 
 flow consume <toml>      # streaming daemon (TOML form)
 flow consume --module my_pipelines <name>   # typed-Python form
@@ -1381,8 +1408,9 @@ Observability flags (work on `run-due`, `status`, `runs list`):
 
 ```
 --run-log <url>     # any RunLog scheme (sqlite/postgres/mysql/duckdb/s3/azureblob/gcs/memory)
---alerter <url>    # repeatable; stdout:// or slack://...
+--alerter <url>    # repeatable; stdout:// / slack://... / email://... / pagerduty://...
 --metrics  <url>   # null:// / stdout:// / memory:// / prometheus://:port / otlp://endpoint
+--traces   <url>   # OTEL spans for every pipeline run: otel://stdout / otel+otlp+grpc://… / otel+otlp+http://…
 ```
 
 Streaming-daemon flags: `--metrics-port` exposes Prometheus metrics;

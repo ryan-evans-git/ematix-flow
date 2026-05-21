@@ -222,8 +222,17 @@ def _cmd_consume(args: argparse.Namespace) -> int:
     except KeyError as e:
         print(f"error: {e}", file=sys.stderr)
         return 2
+    # v0.5.0: opt-in streaming-stats recording. When --run-log-url is
+    # set (or $EMATIX_FLOW_RUN_LOG_URL), streaming pipelines emit live
+    # throughput + batch-cycle snapshots that the Web UI surfaces.
+    run_log_url = getattr(args, "run_log_url", None) or os.environ.get(
+        "EMATIX_FLOW_RUN_LOG_URL"
+    )
     result = streaming.run_pipeline(
-        config_str=toml, metrics_port=args.metrics_port
+        config_str=toml,
+        metrics_port=args.metrics_port,
+        pipeline_name=args.name,
+        run_log_url=run_log_url,
     )
     print(json.dumps(result, default=str))
     return 0
@@ -269,9 +278,10 @@ def _cmd_run_due(args: argparse.Namespace) -> int:
     # Phase Ω.D2: use the unified `run_due_with_dag_detailed` so
     # retry backoff + gave-up gating actually fire from the CLI.
     # Ω.D4: attach alerters + metrics sink resolved from --alerter
-    # and --metrics URLs.
+    # and --metrics URLs. Slice 2d (#136): wire OTEL traces too.
     alerters = _open_alerters(args)
     metrics_sink = _open_metrics(args)
+    _configure_tracing_from_args(args)
     try:
         result = p.run_due_with_dag_detailed(
             due, now=now, run_log=run_log,
@@ -467,6 +477,14 @@ def _add_observability_args(parser: argparse.ArgumentParser) -> None:
         "otlp://collector:4317, stdout://. Falls back to "
         "$EMATIX_FLOW_METRICS. Default: no metrics.",
     )
+    parser.add_argument(
+        "--traces",
+        default=None,
+        help="OpenTelemetry traces URL — emits one span per "
+        "pipeline run. Examples: otel://stdout, "
+        "otel+otlp+grpc://collector:4317, otel+otlp+http://collector:4318. "
+        "Falls back to $EMATIX_FLOW_TRACES. Default: no traces.",
+    )
 
 
 def _add_run_log_args(parser: argparse.ArgumentParser) -> None:
@@ -568,6 +586,7 @@ def _cmd_scheduler(args: argparse.Namespace) -> int:
     metrics_sink = _open_metrics(args)
     alerter_urls = _resolved_alerter_urls(args)
     metrics_url = _resolved_metrics_url(args)
+    _configure_tracing_from_args(args)
 
     try:
         run_scheduler(
@@ -636,6 +655,24 @@ def _resolved_metrics_url(args: argparse.Namespace) -> str | None:
     return getattr(args, "metrics", None) or os.environ.get(
         "EMATIX_FLOW_METRICS_URL"
     )
+
+
+def _configure_tracing_from_args(args: argparse.Namespace) -> None:
+    """Resolve --traces (or $EMATIX_FLOW_TRACES) into a global OTEL tracer.
+
+    Best-effort: if the user supplied no URL, leave the tracer at its
+    default no-op state. If they did supply a URL but the OTel SDK
+    isn't installed, surface the actionable hint and exit non-zero so
+    the misconfiguration doesn't silently degrade to no traces.
+    """
+    import os
+
+    url = getattr(args, "traces", None) or os.environ.get("EMATIX_FLOW_TRACES")
+    if not url:
+        return
+    from ematix_flow.tracing import configure_tracer_from_url
+
+    configure_tracer_from_url(url)
 
 
 def _cmd_status(args: argparse.Namespace) -> int:
@@ -951,6 +988,14 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="if set, expose Prometheus metrics on 127.0.0.1:<PORT>/metrics",
     )
+    consume_p.add_argument(
+        "--run-log-url",
+        default=None,
+        help="if set (with --metrics-port), write a streaming RunRecord + "
+        "periodically (~30s) snapshot throughput/batch-cycle into its extras. "
+        "The Web UI surfaces these as live stats. Falls back to "
+        "$EMATIX_FLOW_RUN_LOG_URL. Supported schemes match `flow run-due`.",
+    )
     consume_p.set_defaults(func=_cmd_consume)
 
     consume_list_p = sub.add_parser(
@@ -1217,6 +1262,14 @@ def main(argv: list[str] | None = None) -> int:
         "Set this before binding to a non-loopback address. Falls back to "
         "$EMATIX_FLOW_WEB_TOKEN if not passed on the CLI.",
     )
+    web_p.add_argument(
+        "--run-log-url",
+        default=None,
+        help="if set, open this RunLog backend as the rich-history source so "
+        "the UI shows real run records (incl. live streaming throughput). "
+        "Falls back to $EMATIX_FLOW_RUN_LOG_URL. Without this flag, the UI "
+        "still works but pipeline / job lists fall back to stub data.",
+    )
     web_p.set_defaults(func=_cmd_web)
 
     args = parser.parse_args(argv)
@@ -1239,9 +1292,38 @@ def _cmd_web(args) -> int:
     # Bearer-token auth — set via --token, or fall back to the
     # EMATIX_FLOW_WEB_TOKEN env var so secrets stay out of shell history.
     token = args.token or os.environ.get("EMATIX_FLOW_WEB_TOKEN")
+    # v0.5.0: opt-in rich-history wiring. Same RunLog URL the streaming
+    # consumer + scheduler use; the SqliteRunLog now satisfies both
+    # protocols against the same backing file.
+    run_log_url = getattr(args, "run_log_url", None) or os.environ.get(
+        "EMATIX_FLOW_RUN_LOG_URL"
+    )
+    history = None
+    if run_log_url:
+        try:
+            from ematix_flow.run_log import from_url
+
+            store = from_url(run_log_url)
+        except Exception as exc:  # noqa: BLE001
+            print(
+                f"warning: --run-log-url {run_log_url!r} could not be opened "
+                f"({exc!r}); web UI will fall back to stub data",
+                file=sys.stderr,
+            )
+            store = None
+        if store is not None and hasattr(store, "record_run_record"):
+            history = store
+        elif store is not None:
+            print(
+                f"warning: RunLog backend {type(store).__name__} doesn't "
+                "implement the rich-history protocol; web UI will fall back "
+                "to stub data. SqliteRunLog has the in-tree implementation.",
+                file=sys.stderr,
+            )
     run_server(
         host=args.bind, port=args.port, log_level=args.log_level,
         bearer_token=token,
+        history=history,
     )
     return 0
 

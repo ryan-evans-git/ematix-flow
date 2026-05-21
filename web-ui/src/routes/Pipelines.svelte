@@ -27,6 +27,29 @@
     return `${(ms / 1000).toFixed(2)}s`;
   }
 
+  // v0.5.0: streaming pipelines surface throughput + batch cycle
+  // instead of a meaningless median over the single "still running"
+  // record. Snapshots come from the daemon every ~30s via the
+  // streaming-stats recorder.
+  function fmtRate(rps) {
+    if (rps == null) return "—";
+    if (rps >= 1000) return `${(rps / 1000).toFixed(1)}k rps`;
+    if (rps >= 10) return `${rps.toFixed(0)} rps`;
+    return `${rps.toFixed(2)} rps`;
+  }
+  function fmtCycle(ms) {
+    if (ms == null) return "—";
+    if (ms < 1000) return `${ms.toFixed(0)} ms`;
+    return `${(ms / 1000).toFixed(2)} s`;
+  }
+  function fmtSnapshotAge(iso) {
+    if (!iso) return "no snapshot yet";
+    const age = (Date.now() - new Date(iso).getTime()) / 1000;
+    if (age < 0) return "just now";
+    if (age < 90) return `${Math.round(age)}s ago`;
+    return `${Math.round(age / 60)}m ago`;
+  }
+
   function fmtNextRun(iso, tz) {
     if (!iso) return "—";
     try {
@@ -111,7 +134,28 @@
       </div>
 
       <div class="pipeline-footer">
-        <span><strong>Median duration:</strong> {fmtDuration(p.median_duration_ms)}</span>
+        {#if p.kind === "streaming"}
+          {@const s1 = p.streaming_stats?.stats_1m}
+          {@const s5 = p.streaming_stats?.stats_5m}
+          <span class="streaming-stats">
+            <strong>Throughput:</strong>
+            <span class="mono">{fmtRate(s1?.rows_consumed_per_sec)}</span>
+            <span class="dim">in (1m)</span>
+            <span class="sep">/</span>
+            <span class="mono">{fmtRate(s5?.rows_consumed_per_sec)}</span>
+            <span class="dim">in (5m)</span>
+            <span class="sep">·</span>
+            <strong>Batch cycle:</strong>
+            <span class="mono">{fmtCycle(s1?.avg_batch_cycle_ms)}</span>
+            <span class="dim">avg (1m)</span>
+            <span class="sep">·</span>
+            <span class="dim" title={p.streaming_stats?.snapshot_at || ""}>
+              {fmtSnapshotAge(p.streaming_stats?.snapshot_at)}
+            </span>
+          </span>
+        {:else}
+          <span><strong>Median duration:</strong> {fmtDuration(p.median_duration_ms)}</span>
+        {/if}
         <span><a class="link" href="#/runs?pipeline={encodeURIComponent(p.name)}">all jobs →</a></span>
       </div>
     </div>

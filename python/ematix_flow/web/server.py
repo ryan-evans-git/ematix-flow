@@ -66,6 +66,18 @@ _STUB_PIPELINES: list[dict[str, Any]] = [
         "latest_run": _STUB_RUNS[1],
         "failure_rate_7d": 0.13,
         "median_duration_ms": 47000,
+        # Last 10 oldest→newest (left-to-right). One failed, rest green.
+        "recent_runs": [
+            {"run_id": f"01HQSTUB-WH-{i:02d}", "status": "succeeded",
+             "started_at": "2026-05-19T00:00:00Z", "duration_ms": 47000}
+            for i in range(9)
+        ] + [
+            {"run_id": _STUB_RUNS[1]["run_id"], "status": "failed",
+             "started_at": _STUB_RUNS[1]["started_at"],
+             "duration_ms": _STUB_RUNS[1]["duration_ms"]},
+        ],
+        "next_run_at": "2026-05-21T17:00:00Z",
+        "timezone": None,
     },
     {
         "name": "events_stream",
@@ -73,6 +85,43 @@ _STUB_PIPELINES: list[dict[str, Any]] = [
         "latest_run": _STUB_RUNS[2],
         "failure_rate_7d": 0.0,
         "median_duration_ms": None,
+        # Streaming: current open record + a few prior daemon sessions.
+        "recent_runs": [
+            {"run_id": f"01HQSTUB-EV-{i:02d}", "status": "succeeded",
+             "started_at": "2026-05-20T00:00:00Z", "duration_ms": 3_600_000}
+            for i in range(9)
+        ] + [
+            {"run_id": _STUB_RUNS[2]["run_id"], "status": "running",
+             "started_at": _STUB_RUNS[2]["started_at"], "duration_ms": None},
+        ],
+        "next_run_at": None,
+        "timezone": None,
+        # v0.5.0: streaming pipelines surface throughput + batch cycle
+        # (live snapshots from the daemon's metrics endpoint), shown in
+        # the UI footer in place of "Median duration".
+        "streaming_stats": {
+            "snapshot_at": "2026-05-21T16:00:30Z",
+            "rows_consumed_total": 124_500,
+            "rows_written_total": 124_500,
+            "batches_total": 415,
+            "errors_total": 0,
+            "stats_1m": {
+                "rows_consumed_per_sec": 412.0,
+                "rows_written_per_sec": 412.0,
+                "batches_per_sec": 1.4,
+                "errors_per_sec": 0.0,
+                "avg_batch_cycle_ms": 714.3,
+                "span_seconds": 60.0,
+            },
+            "stats_5m": {
+                "rows_consumed_per_sec": 398.5,
+                "rows_written_per_sec": 398.5,
+                "batches_per_sec": 1.35,
+                "errors_per_sec": 0.0,
+                "avg_batch_cycle_ms": 740.7,
+                "span_seconds": 300.0,
+            },
+        },
     },
 ]
 
@@ -346,6 +395,29 @@ def create_app(
                                 )
                                 if forecast is not None:
                                     next_run_at = forecast.isoformat()
+                # v0.5.0: surface streaming live-stats from extras. The
+                # daemon writes throughput / cycle-time into the running
+                # record's extras every ~30s; we just pass them through
+                # so the UI can render them in place of "Median duration".
+                streaming_stats: dict[str, Any] | None = None
+                if latest.kind == "streaming":
+                    e = latest.extras or {}
+                    if any(
+                        k in e
+                        for k in (
+                            "snapshot_at", "stats_1m", "stats_5m",
+                            "rows_consumed_total",
+                        )
+                    ):
+                        streaming_stats = {
+                            "snapshot_at": e.get("snapshot_at"),
+                            "rows_consumed_total": e.get("rows_consumed_total"),
+                            "rows_written_total": e.get("rows_written_total"),
+                            "batches_total": e.get("batches_total"),
+                            "errors_total": e.get("errors_total"),
+                            "stats_1m": e.get("stats_1m"),
+                            "stats_5m": e.get("stats_5m"),
+                        }
                 pipelines.append(
                     {
                         "name": name,
@@ -358,6 +430,7 @@ def create_app(
                         "recent_runs": recent,
                         "next_run_at": next_run_at,
                         "timezone": pipeline_tz,
+                        "streaming_stats": streaming_stats,
                     }
                 )
             # Sort pipelines so the most recently active is on top.
@@ -572,6 +645,7 @@ def run_server(
     port: int = 8080,
     log_level: str = "info",
     bearer_token: str | None = None,
+    history: RunHistoryStore | None = None,
 ) -> None:
     """Launch the uvicorn server.
 
@@ -600,5 +674,5 @@ def run_server(
             file=sys.stderr,
         )
 
-    app = create_app(bearer_token=bearer_token)
+    app = create_app(bearer_token=bearer_token, history=history)
     uvicorn.run(app, host=host, port=port, log_level=log_level)

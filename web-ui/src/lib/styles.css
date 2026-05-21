@@ -325,6 +325,24 @@ table.runs tr:hover { background: rgba(51, 220, 204, 0.03); cursor: pointer; }
   font-size: 0.78rem;
   color: var(--color-phosphor-500);
 }
+/* v0.5.0: streaming-pipeline footer surface — throughput + cycle */
+.streaming-stats {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.35em;
+}
+.streaming-stats .dim {
+  color: var(--color-phosphor-700);
+  font-size: 0.72rem;
+}
+.streaming-stats .sep {
+  color: var(--color-phosphor-700);
+  padding: 0 0.15em;
+}
+.streaming-stats .mono {
+  color: var(--color-phosphor-200);
+}
 .link {
   color: var(--color-phosphor-300);
 }
