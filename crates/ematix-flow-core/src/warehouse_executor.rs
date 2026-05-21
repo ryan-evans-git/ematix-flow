@@ -20,8 +20,7 @@ use crate::py_callbacks::{CallbackError, global};
 /// The prefix the Python side uses for warehouse-pipeline callbacks.
 /// Pinned in both languages; changing one without the other will
 /// silently route to "callback not registered" errors.
-pub const WAREHOUSE_PIPELINE_CALLBACK_PREFIX: &str =
-    "ematix_flow.warehouse_pipeline:";
+pub const WAREHOUSE_PIPELINE_CALLBACK_PREFIX: &str = "ematix_flow.warehouse_pipeline:";
 
 /// The run result a `@ematix.warehouse_pipeline` body returns. Same
 /// shape as the dict the Python in-process scheduler builds; the
@@ -136,10 +135,8 @@ mod tests {
 
     #[test]
     fn invoke_returns_not_registered_when_missing() {
-        let err = invoke_warehouse_pipeline(
-            "definitely_not_registered_pipeline_12345",
-        )
-        .unwrap_err();
+        let err =
+            invoke_warehouse_pipeline("definitely_not_registered_pipeline_12345").unwrap_err();
         match err {
             WarehouseExecutorError::NotRegistered(name) => {
                 assert_eq!(name, "definitely_not_registered_pipeline_12345");
@@ -150,9 +147,7 @@ mod tests {
 
     #[test]
     fn invoke_propagates_callback_failure() {
-        register_test_callback("test_fail", |_req| {
-            Err("synthetic pipeline error".into())
-        });
+        register_test_callback("test_fail", |_req| Err("synthetic pipeline error".into()));
         let err = invoke_warehouse_pipeline("test_fail").unwrap_err();
         match err {
             WarehouseExecutorError::CallbackFailed { pipeline, message } => {
@@ -166,11 +161,12 @@ mod tests {
 
     #[test]
     fn invoke_surfaces_bad_response_shape() {
-        register_test_callback("test_bad_shape", |_req| {
-            Ok(b"not-valid-json".to_vec())
-        });
+        register_test_callback("test_bad_shape", |_req| Ok(b"not-valid-json".to_vec()));
         let err = invoke_warehouse_pipeline("test_bad_shape").unwrap_err();
-        assert!(matches!(err, WarehouseExecutorError::BadResponseShape { .. }));
+        assert!(matches!(
+            err,
+            WarehouseExecutorError::BadResponseShape { .. }
+        ));
         global().unregister(&format!(
             "{WAREHOUSE_PIPELINE_CALLBACK_PREFIX}test_bad_shape"
         ));
@@ -190,10 +186,7 @@ mod tests {
             Ok(json.as_bytes().to_vec())
         });
         let result = invoke_warehouse_pipeline("test_watermark").unwrap();
-        assert_eq!(
-            result.watermark.as_deref(),
-            Some("2026-05-21T12:00:00Z"),
-        );
+        assert_eq!(result.watermark.as_deref(), Some("2026-05-21T12:00:00Z"),);
         global().unregister(&format!(
             "{WAREHOUSE_PIPELINE_CALLBACK_PREFIX}test_watermark"
         ));

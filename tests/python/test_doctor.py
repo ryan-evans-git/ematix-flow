@@ -64,7 +64,11 @@ class TestKafkaProbe:
             instance.connect.return_value = None
             report = doctor.probe_connection(conn)
         assert report.is_ok
-        assert "b1.example.com:9092" in report.detail
+        # Probe formats the detail as "tcp-connect <host>:<port>" — pin
+        # the exact prefix so this stays a real assertion (the prior
+        # substring-in form tripped a CodeQL false-positive flagging it
+        # as URL-sanitization-style code).
+        assert report.detail == "tcp-connect b1.example.com:9092"
         instance.connect.assert_called_with(("b1.example.com", 9092))
 
     def test_tcp_connect_refused_surfaces_as_fail(self) -> None:
