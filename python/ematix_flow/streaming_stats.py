@@ -97,8 +97,12 @@ def scrape_counters(metrics_url: str, pipeline_name: str) -> _Sample | None:
     Rust daemon has bound its port). Robust to extra metrics + label
     sets — only the four counters we care about are read.
     """
+    # nosec B310: `metrics_url` is built locally from a host (default
+    # 127.0.0.1) + numeric port; never user-controlled. The scheme is
+    # always http://, and the only consumer is the localhost daemon's
+    # Prometheus endpoint we just spawned.
     try:
-        with urlopen(metrics_url, timeout=2.0) as resp:
+        with urlopen(metrics_url, timeout=2.0) as resp:  # nosec B310
             body = resp.read().decode("utf-8", errors="replace")
     except (URLError, OSError, TimeoutError):
         return None
