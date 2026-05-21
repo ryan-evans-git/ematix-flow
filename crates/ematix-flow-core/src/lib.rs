@@ -121,9 +121,9 @@ pub mod mysql_backend;
 // embedding-language code (Python via PyO3) without taking a hard
 // PyO3 dependency. Glue Schema Registry decode + future warehouse
 // pipeline execution both route through this.
-pub mod py_callbacks;
 pub mod objectstore_backend;
 pub mod pg;
+pub mod py_callbacks;
 // Task #481: one-call setup helpers (`with_optimizer_rules` +
 // `register_dict_aware_parquet`) that activate the dict-aware fast
 // path without callers having to memorise the rule chain + the

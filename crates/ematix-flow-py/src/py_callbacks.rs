@@ -48,7 +48,10 @@ pub fn register_python_callback(name: &str, callable: Py<PyAny>) -> PyResult<()>
             let bytes_obj = bound.cast::<PyBytes>().map_err(|_| {
                 format!(
                     "python callback must return bytes, got {}",
-                    bound.get_type().name().map(|s| s.to_string())
+                    bound
+                        .get_type()
+                        .name()
+                        .map(|s| s.to_string())
                         .unwrap_or_else(|_| "<unknown>".to_string()),
                 )
             })?;

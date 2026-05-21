@@ -1604,9 +1604,7 @@ impl Backend for KafkaBackend {
                 // Glue registry. The Glue variant carries its own
                 // dispatch state on `schema_registry_kind`; the URL
                 // is the Confluent prerequisite.
-                if !self.schema_registry_kind.is_glue()
-                    && self.schema_registry_url.is_none()
-                {
+                if !self.schema_registry_kind.is_glue() && self.schema_registry_url.is_none() {
                     return Err(BackendError::Other(
                         "Kafka read_arrow_stream Avro: schema_registry_url is \
                          required (call `with_schema_registry_url(...)` on the \
@@ -2455,57 +2453,50 @@ pub fn encode_batch_as_glue_avro(
         cache_r.get(schema_name).cloned()
     }
     .ok_or(())
-    .or_else(|_| -> Result<Arc<(uuid::Uuid, apache_avro::Schema)>, BackendError> {
-        #[derive(serde::Serialize)]
-        struct ByNameRequest<'a> {
-            schema_name: &'a str,
-            registry_name: &'a str,
-            region: &'a str,
-        }
-        let req = ByNameRequest {
-            schema_name,
-            registry_name,
-            region,
-        };
-        let req_bytes = serde_json::to_vec(&req).map_err(|e| {
-            BackendError::Other(format!("glue by-name request serialize: {e}"))
-        })?;
-        let resp_bytes = crate::py_callbacks::global()
-            .invoke(callback_name, &req_bytes)
-            .map_err(|e| {
-                BackendError::Query(format!("glue by-name schema lookup: {e}"))
-            })?;
-        let resp: GlueSchemaResponse =
-            serde_json::from_slice(&resp_bytes).map_err(|e| {
-                BackendError::Other(format!("glue by-name response parse: {e}"))
-            })?;
-        if resp.data_format != "AVRO" {
-            return Err(BackendError::Query(format!(
-                "glue schema {:?} has data_format={:?}; only AVRO is wired \
+    .or_else(
+        |_| -> Result<Arc<(uuid::Uuid, apache_avro::Schema)>, BackendError> {
+            #[derive(serde::Serialize)]
+            struct ByNameRequest<'a> {
+                schema_name: &'a str,
+                registry_name: &'a str,
+                region: &'a str,
+            }
+            let req = ByNameRequest {
+                schema_name,
+                registry_name,
+                region,
+            };
+            let req_bytes = serde_json::to_vec(&req)
+                .map_err(|e| BackendError::Other(format!("glue by-name request serialize: {e}")))?;
+            let resp_bytes = crate::py_callbacks::global()
+                .invoke(callback_name, &req_bytes)
+                .map_err(|e| BackendError::Query(format!("glue by-name schema lookup: {e}")))?;
+            let resp: GlueSchemaResponse = serde_json::from_slice(&resp_bytes)
+                .map_err(|e| BackendError::Other(format!("glue by-name response parse: {e}")))?;
+            if resp.data_format != "AVRO" {
+                return Err(BackendError::Query(format!(
+                    "glue schema {:?} has data_format={:?}; only AVRO is wired \
                  on the producer path today",
-                schema_name, resp.data_format,
-            )));
-        }
-        let uuid = uuid::Uuid::parse_str(&resp.schema_uuid).map_err(|e| {
-            BackendError::Other(format!(
-                "glue by-name response: invalid SchemaVersionId UUID {:?}: {e}",
-                resp.schema_uuid,
-            ))
-        })?;
-        let parsed = apache_avro::Schema::parse_str(&resp.schema_definition)
-            .map_err(|e| {
-                BackendError::Query(format!(
-                    "glue avro schema parse for {:?}: {e}",
-                    schema_name,
+                    schema_name, resp.data_format,
+                )));
+            }
+            let uuid = uuid::Uuid::parse_str(&resp.schema_uuid).map_err(|e| {
+                BackendError::Other(format!(
+                    "glue by-name response: invalid SchemaVersionId UUID {:?}: {e}",
+                    resp.schema_uuid,
                 ))
             })?;
-        let arc = Arc::new((uuid, parsed));
-        let mut cache_w = cache.write().map_err(|_| {
-            BackendError::Other("glue producer schema cache write lock poisoned".into())
-        })?;
-        cache_w.insert(schema_name.to_string(), arc.clone());
-        Ok(arc)
-    })?;
+            let parsed = apache_avro::Schema::parse_str(&resp.schema_definition).map_err(|e| {
+                BackendError::Query(format!("glue avro schema parse for {:?}: {e}", schema_name,))
+            })?;
+            let arc = Arc::new((uuid, parsed));
+            let mut cache_w = cache.write().map_err(|_| {
+                BackendError::Other("glue producer schema cache write lock poisoned".into())
+            })?;
+            cache_w.insert(schema_name.to_string(), arc.clone());
+            Ok(arc)
+        },
+    )?;
     let (schema_uuid, schema) = schema_arc.as_ref();
 
     // ---- Render batch as JSONL → serde_json::Value rows -------------
@@ -2533,13 +2524,10 @@ pub fn encode_batch_as_glue_avro(
         // more actionable than the downstream "Value does not match
         // schema" the datum encoder would produce.
         let avro_value = json_to_avro_value(&json, schema).map_err(|e| {
-            BackendError::Query(format!(
-                "kafka glue avro encode (json→avro value): {e}",
-            ))
+            BackendError::Query(format!("kafka glue avro encode (json→avro value): {e}",))
         })?;
-        let avro_bytes = apache_avro::to_avro_datum(schema, avro_value).map_err(|e| {
-            BackendError::Query(format!("kafka glue avro encode (datum): {e}"))
-        })?;
+        let avro_bytes = apache_avro::to_avro_datum(schema, avro_value)
+            .map_err(|e| BackendError::Query(format!("kafka glue avro encode (datum): {e}")))?;
         out.push(build_glue_frame(*schema_uuid, GlueCodec::None, &avro_bytes));
     }
     Ok(out)
@@ -2587,36 +2575,34 @@ fn json_to_avro_value(
                 }
             }
         }
-        return Err(format!(
-            "no matching union variant for value {json:?}",
-        ));
+        return Err(format!("no matching union variant for value {json:?}",));
     }
 
     match (schema, json) {
         (S::Null, J::Null) => Ok(V::Null),
         (S::Boolean, J::Bool(b)) => Ok(V::Boolean(*b)),
         (S::Int, J::Number(n)) => {
-            let i = n.as_i64().ok_or_else(|| {
-                format!("Avro Int field got non-integer JSON number: {n}")
-            })?;
+            let i = n
+                .as_i64()
+                .ok_or_else(|| format!("Avro Int field got non-integer JSON number: {n}"))?;
             Ok(V::Int(i as i32))
         }
         (S::Long, J::Number(n)) => {
-            let i = n.as_i64().ok_or_else(|| {
-                format!("Avro Long field got non-integer JSON number: {n}")
-            })?;
+            let i = n
+                .as_i64()
+                .ok_or_else(|| format!("Avro Long field got non-integer JSON number: {n}"))?;
             Ok(V::Long(i))
         }
         (S::Float, J::Number(n)) => {
-            let f = n.as_f64().ok_or_else(|| {
-                format!("Avro Float field got non-numeric JSON: {n}")
-            })?;
+            let f = n
+                .as_f64()
+                .ok_or_else(|| format!("Avro Float field got non-numeric JSON: {n}"))?;
             Ok(V::Float(f as f32))
         }
         (S::Double, J::Number(n)) => {
-            let f = n.as_f64().ok_or_else(|| {
-                format!("Avro Double field got non-numeric JSON: {n}")
-            })?;
+            let f = n
+                .as_f64()
+                .ok_or_else(|| format!("Avro Double field got non-numeric JSON: {n}"))?;
             Ok(V::Double(f))
         }
         (S::String, J::String(s)) => Ok(V::String(s.clone())),
@@ -2656,11 +2642,9 @@ fn decompress_glue_zlib(payload: &[u8]) -> Result<Vec<u8>, BackendError> {
     // zlib form; size the buffer accordingly to avoid a re-alloc
     // sweep on the hot path.
     let mut out = Vec::with_capacity(payload.len() * 3);
-    decoder.read_to_end(&mut out).map_err(|e| {
-        BackendError::Query(format!(
-            "kafka glue avro: zlib decode failed: {e}",
-        ))
-    })?;
+    decoder
+        .read_to_end(&mut out)
+        .map_err(|e| BackendError::Query(format!("kafka glue avro: zlib decode failed: {e}",)))?;
     Ok(out)
 }
 
@@ -2793,9 +2777,8 @@ pub fn decode_payloads_as_glue_avro(
 
     let mut json_payloads: Vec<Vec<u8>> = Vec::with_capacity(payloads.len());
     for payload in payloads {
-        let frame = parse_glue_frame(&payload).map_err(|e| {
-            BackendError::Query(format!("kafka glue frame parse: {e}"))
-        })?;
+        let frame = parse_glue_frame(&payload)
+            .map_err(|e| BackendError::Query(format!("kafka glue frame parse: {e}")))?;
 
         // Decompress the payload if the codec byte says so. The
         // None (0x00) case is what messages produced by the AWS SDK
@@ -2814,9 +2797,7 @@ pub fn decode_payloads_as_glue_avro(
         let schema_arc: Arc<apache_avro::Schema> = {
             let cache_r = cache
                 .read()
-                .map_err(|_| BackendError::Other(
-                    "glue schema cache read lock poisoned".into(),
-                ))?;
+                .map_err(|_| BackendError::Other("glue schema cache read lock poisoned".into()))?;
             cache_r.get(&frame.schema_uuid).cloned()
         }
         .ok_or(())
@@ -2827,16 +2808,13 @@ pub fn decode_payloads_as_glue_avro(
                 region: region.to_string(),
                 registry_name: registry_name.to_string(),
             };
-            let req_bytes = serde_json::to_vec(&req).map_err(|e| {
-                BackendError::Other(format!("glue lookup request serialize: {e}"))
-            })?;
+            let req_bytes = serde_json::to_vec(&req)
+                .map_err(|e| BackendError::Other(format!("glue lookup request serialize: {e}")))?;
             let resp_bytes = crate::py_callbacks::global()
                 .invoke(callback_name, &req_bytes)
                 .map_err(|e| BackendError::Query(format!("glue schema lookup: {e}")))?;
             let resp: GlueSchemaResponse = serde_json::from_slice(&resp_bytes)
-                .map_err(|e| BackendError::Other(format!(
-                    "glue lookup response parse: {e}"
-                )))?;
+                .map_err(|e| BackendError::Other(format!("glue lookup response parse: {e}")))?;
             if resp.data_format != "AVRO" {
                 return Err(BackendError::Query(format!(
                     "glue schema UUID {} has data_format={:?}; only AVRO is wired \
@@ -2844,16 +2822,16 @@ pub fn decode_payloads_as_glue_avro(
                     frame.schema_uuid, resp.data_format,
                 )));
             }
-            let parsed = apache_avro::Schema::parse_str(&resp.schema_definition)
-                .map_err(|e| BackendError::Query(format!(
-                    "glue avro schema parse for UUID {}: {e}", frame.schema_uuid,
-                )))?;
+            let parsed = apache_avro::Schema::parse_str(&resp.schema_definition).map_err(|e| {
+                BackendError::Query(format!(
+                    "glue avro schema parse for UUID {}: {e}",
+                    frame.schema_uuid,
+                ))
+            })?;
             let arc = Arc::new(parsed);
             let mut cache_w = cache
                 .write()
-                .map_err(|_| BackendError::Other(
-                    "glue schema cache write lock poisoned".into(),
-                ))?;
+                .map_err(|_| BackendError::Other("glue schema cache write lock poisoned".into()))?;
             cache_w.insert(frame.schema_uuid, arc.clone());
             Ok(arc)
         })?;
@@ -2866,9 +2844,8 @@ pub fn decode_payloads_as_glue_avro(
         let value = apache_avro::from_avro_datum(&schema_arc, &mut cursor, None)
             .map_err(|e| BackendError::Query(format!("kafka glue avro decode: {e}")))?;
         let json = avro_value_to_json(&value);
-        let json_bytes = serde_json::to_vec(&json).map_err(|e| {
-            BackendError::Other(format!("glue avro→json serialize: {e}"))
-        })?;
+        let json_bytes = serde_json::to_vec(&json)
+            .map_err(|e| BackendError::Other(format!("glue avro→json serialize: {e}")))?;
         json_payloads.push(json_bytes);
     }
     decode_payloads_as_jsonl(json_payloads)
@@ -4687,7 +4664,8 @@ mod tests {
             assert_eq!(req.registry_name, "my-registry");
             let resp = GlueSchemaResponse {
                 data_format: "AVRO".into(),
-                schema_definition: r#"{"type":"record","name":"X","fields":[{"name":"i","type":"int"}]}"#.into(),
+                schema_definition:
+                    r#"{"type":"record","name":"X","fields":[{"name":"i","type":"int"}]}"#.into(),
                 schema_uuid: req.schema_uuid,
             };
             Ok(serde_json::to_vec(&resp).unwrap())
@@ -4785,10 +4763,7 @@ mod tests {
             &cache,
         )
         .unwrap_err();
-        assert!(
-            err.to_string().contains("schema lookup"),
-            "got: {err}",
-        );
+        assert!(err.to_string().contains("schema lookup"), "got: {err}",);
     }
 
     #[test]
@@ -4808,10 +4783,8 @@ mod tests {
         record.put("i", 7i32);
         let avro_bytes = apache_avro::to_avro_datum(&parsed, record).unwrap();
 
-        let mut encoder = flate2::write::ZlibEncoder::new(
-            Vec::new(),
-            flate2::Compression::default(),
-        );
+        let mut encoder =
+            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
         encoder.write_all(&avro_bytes).unwrap();
         let zlib_payload = encoder.finish().unwrap();
         // Sanity: the compressed form is byte-different from raw.
@@ -4823,7 +4796,8 @@ mod tests {
         let cb: crate::py_callbacks::CallbackFn = Arc::new(move |_req| {
             let resp = GlueSchemaResponse {
                 data_format: "AVRO".into(),
-                schema_definition: r#"{"type":"record","name":"X","fields":[{"name":"i","type":"int"}]}"#.into(),
+                schema_definition:
+                    r#"{"type":"record","name":"X","fields":[{"name":"i","type":"int"}]}"#.into(),
                 schema_uuid: "aabbccdd-eeff-0011-2233-445566778899".into(),
             };
             Ok(serde_json::to_vec(&resp).unwrap())
@@ -4860,18 +4834,9 @@ mod tests {
         let cache: Arc<RwLock<HashMap<Uuid, Arc<apache_avro::Schema>>>> =
             Arc::new(RwLock::new(HashMap::new()));
 
-        let err = decode_payloads_as_glue_avro(
-            vec![framed],
-            "us-east-1",
-            "r",
-            "any-name",
-            &cache,
-        )
-        .unwrap_err();
-        assert!(
-            err.to_string().contains("zlib decode failed"),
-            "got: {err}",
-        );
+        let err = decode_payloads_as_glue_avro(vec![framed], "us-east-1", "r", "any-name", &cache)
+            .unwrap_err();
+        assert!(err.to_string().contains("zlib decode failed"), "got: {err}",);
     }
 
     #[test]
@@ -4891,10 +4856,8 @@ mod tests {
         ]));
         let ids = Int32Array::from(vec![1, 2, 3]);
         let names = StringArray::from(vec!["a", "b", "c"]);
-        let batch = RecordBatch::try_new(
-            arrow_schema,
-            vec![Arc::new(ids), Arc::new(names)],
-        ).unwrap();
+        let batch =
+            RecordBatch::try_new(arrow_schema, vec![Arc::new(ids), Arc::new(names)]).unwrap();
 
         let avro_text = r#"{"type":"record","name":"X","fields":[{"name":"id","type":"int"},{"name":"name","type":"string"}]}"#;
         let known_uuid = Uuid::parse_str("11223344-5566-7788-9900-aabbccddeeff").unwrap();
@@ -4909,9 +4872,8 @@ mod tests {
         });
         crate::py_callbacks::global().register("test::glue_prod_by_name", cb);
 
-        let producer_cache: Arc<
-            RwLock<HashMap<String, Arc<(Uuid, apache_avro::Schema)>>>,
-        > = Arc::new(RwLock::new(HashMap::new()));
+        let producer_cache: Arc<RwLock<HashMap<String, Arc<(Uuid, apache_avro::Schema)>>>> =
+            Arc::new(RwLock::new(HashMap::new()));
         let encoded = encode_batch_as_glue_avro(
             &batch,
             "us-east-1",
@@ -4919,7 +4881,8 @@ mod tests {
             "test-topic",
             "test::glue_prod_by_name",
             &producer_cache,
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(encoded.len(), 3);
         for framed in &encoded {
             assert_eq!(framed[0], GLUE_HEADER_BYTE);
@@ -4945,7 +4908,8 @@ mod tests {
             "test-registry",
             "test::glue_prod_by_uuid",
             &consumer_cache,
-        ).unwrap();
+        )
+        .unwrap();
         let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total_rows, 3);
 
@@ -4961,13 +4925,13 @@ mod tests {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use uuid::Uuid;
 
-        let arrow_schema = Arc::new(ArrowSchema::new(vec![
-            Field::new("i", DataType::Int32, false),
-        ]));
-        let batch = RecordBatch::try_new(
-            arrow_schema,
-            vec![Arc::new(Int32Array::from(vec![42]))],
-        ).unwrap();
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "i",
+            DataType::Int32,
+            false,
+        )]));
+        let batch =
+            RecordBatch::try_new(arrow_schema, vec![Arc::new(Int32Array::from(vec![42]))]).unwrap();
 
         let calls = Arc::new(AtomicUsize::new(0));
         let calls_inner = calls.clone();
@@ -4975,7 +4939,8 @@ mod tests {
             calls_inner.fetch_add(1, Ordering::SeqCst);
             let resp = GlueSchemaResponse {
                 data_format: "AVRO".into(),
-                schema_definition: r#"{"type":"record","name":"X","fields":[{"name":"i","type":"int"}]}"#.into(),
+                schema_definition:
+                    r#"{"type":"record","name":"X","fields":[{"name":"i","type":"int"}]}"#.into(),
                 schema_uuid: "deadbeef-0000-1111-2222-333344445555".into(),
             };
             Ok(serde_json::to_vec(&resp).unwrap())
@@ -4986,9 +4951,14 @@ mod tests {
             Arc::new(RwLock::new(HashMap::new()));
         for _ in 0..5 {
             let _ = encode_batch_as_glue_avro(
-                &batch, "us-east-1", "r", "topic-x",
-                "test::glue_prod_cache", &cache,
-            ).unwrap();
+                &batch,
+                "us-east-1",
+                "r",
+                "topic-x",
+                "test::glue_prod_cache",
+                &cache,
+            )
+            .unwrap();
         }
         // Callback fires exactly once across 5 batches.
         assert_eq!(calls.load(Ordering::SeqCst), 1);
@@ -5002,7 +4972,8 @@ mod tests {
         // GetSchemaVersion. We can't actually drain a broker here,
         // but the validation block fires before broker IO, so a
         // dispatch error means we made it past that gate.
-        let b = KafkaBackend::open("localhost:9092", Some("g")).unwrap()
+        let b = KafkaBackend::open("localhost:9092", Some("g"))
+            .unwrap()
             .with_payload_format(KafkaPayloadFormat::Avro)
             .with_schema_registry_kind(SchemaRegistryKind::Glue {
                 region: "us-east-1".into(),

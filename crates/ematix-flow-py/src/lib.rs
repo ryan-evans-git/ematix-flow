@@ -875,8 +875,14 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<udaf::PyUdafHandle>()?;
     // Task #556 / #559 — Rust → Python callback registry.
     m.add_function(wrap_pyfunction!(py_callbacks::register_python_callback, m)?)?;
-    m.add_function(wrap_pyfunction!(py_callbacks::unregister_python_callback, m)?)?;
-    m.add_function(wrap_pyfunction!(py_callbacks::is_python_callback_registered, m)?)?;
+    m.add_function(wrap_pyfunction!(
+        py_callbacks::unregister_python_callback,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        py_callbacks::is_python_callback_registered,
+        m
+    )?)?;
     m.add_function(wrap_pyfunction!(py_callbacks::invoke_python_callback, m)?)?;
     Ok(())
 }

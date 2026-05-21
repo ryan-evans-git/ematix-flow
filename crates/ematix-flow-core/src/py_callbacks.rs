@@ -192,10 +192,7 @@ mod tests {
     fn register_replaces_previous_binding() {
         let r = CallbackRegistry::new();
         r.register("echo", echo_cb());
-        r.register(
-            "echo",
-            Arc::new(|_| Ok(b"override".to_vec())),
-        );
+        r.register("echo", Arc::new(|_| Ok(b"override".to_vec())));
         let out = r.invoke("echo", b"hello").unwrap();
         assert_eq!(out, b"override");
     }
