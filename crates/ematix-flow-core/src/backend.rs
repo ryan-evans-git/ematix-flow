@@ -880,6 +880,15 @@ pub struct KafkaConfig {
     #[serde(default)]
     pub schema_registry_basic_auth: Option<crate::kafka_backend::SrBasicAuth>,
 
+    /// Task #556: schema-registry wire-format selector. ``None`` /
+    /// ``Confluent`` keep the existing 0x00+4-byte-BE-id framing.
+    /// ``Glue { region, registry_name, schema_lookup_callback }``
+    /// swaps in Glue's 0x03+16-byte-UUID+1-byte-codec framing; the
+    /// schema fetch routes through the named Python callback (see
+    /// :mod:`ematix_flow.glue_schema_registry`).
+    #[serde(default)]
+    pub schema_registry_kind: Option<crate::kafka_backend::SchemaRegistryKind>,
+
     /// Per-row Kafka message-key column. `None` = round-robin
     /// (default sticky partitioner).
     #[serde(default)]
@@ -1192,6 +1201,9 @@ pub async fn backend_from_config(
             if let Some(sr_auth) = c.schema_registry_basic_auth {
                 backend =
                     backend.with_schema_registry_basic_auth(sr_auth.username, sr_auth.password);
+            }
+            if let Some(kind) = c.schema_registry_kind {
+                backend = backend.with_schema_registry_kind(kind);
             }
             if let Some(col) = c.message_key_column {
                 backend = backend.with_message_key_column(col);

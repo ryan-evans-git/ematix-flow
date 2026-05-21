@@ -388,6 +388,26 @@ class KafkaConnection(Connection):
                 "`schema_registry=` (typed SR connection or name) OR the "
                 "legacy `schema_registry_url=` shorthand, not both"
             )
+        # Task #556: catch misconfigurations at construction time
+        # rather than deep in the Rust dispatch. A Glue SR only
+        # makes sense with Avro / Protobuf payloads — pairing it
+        # with JSON / RawBytes is almost certainly a copy-paste
+        # error.
+        if isinstance(self.schema_registry, GlueSchemaRegistryConnection):
+            if self.payload_format is None:
+                raise ValueError(
+                    f"KafkaConnection({self.name!r}): "
+                    "schema_registry=GlueSchemaRegistryConnection requires "
+                    "payload_format='avro' (or 'protobuf' once that path "
+                    "is wired); set payload_format= explicitly"
+                )
+            if self.payload_format not in ("avro", "protobuf"):
+                raise ValueError(
+                    f"KafkaConnection({self.name!r}): "
+                    f"payload_format={self.payload_format!r} does not "
+                    "use a schema-registry wire frame; remove "
+                    "schema_registry= or switch payload_format to 'avro'"
+                )
 
 
 @dataclass(repr=False)

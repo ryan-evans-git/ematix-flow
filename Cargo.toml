@@ -29,6 +29,11 @@ tokio-postgres = { version = "0.7", features = ["with-uuid-1", "with-serde_json-
 deadpool-postgres = "0.14"
 uuid = { version = "1", features = ["v4", "v7"] }
 futures-util = "0.3"
+# flate2 — zlib decompress for AWS Glue Schema Registry payloads
+# (compression_type=ZLIB). Already in the dep tree transitively via
+# parquet's codec support; declaring it here as a workspace dep so
+# ematix-flow-core can use it directly for Kafka Glue dispatch.
+flate2 = "1"
 bytes = "1"
 arrow-array = "58"
 arrow-schema = "58"

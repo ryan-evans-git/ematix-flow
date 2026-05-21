@@ -20,6 +20,7 @@ from ematix_flow.connections import (
 )
 from ematix_flow.glue_schema_registry import (
     GlueSchema,
+    fetch_schema_by_name,
     fetch_schema_by_uuid,
     register_schema,
 )
@@ -84,6 +85,62 @@ class TestKafkaConnectionAcceptsGlueRegistry:
                 schema_registry=glue,
                 schema_registry_url="https://sr:8081",
             )
+
+    def test_glue_registry_requires_payload_format_set(self) -> None:
+        # Pairing Glue SR with no payload_format is almost always a
+        # copy-paste error — fail at construction with a clear hint.
+        glue = GlueSchemaRegistryConnection(
+            name="g", registry_name="r", region="us-east-1",
+        )
+        with pytest.raises(ValueError, match="payload_format='avro'"):
+            KafkaConnection(
+                name="orders",
+                bootstrap_servers="b:9092",
+                schema_registry=glue,
+                # No payload_format
+            )
+
+    def test_glue_registry_rejects_json_payload(self) -> None:
+        # Glue SR doesn't make sense with JSON payloads (no schema
+        # wire frame). Catch the misconfig at construction.
+        glue = GlueSchemaRegistryConnection(
+            name="g", registry_name="r", region="us-east-1",
+        )
+        with pytest.raises(ValueError, match="does not use a schema-registry"):
+            KafkaConnection(
+                name="orders",
+                bootstrap_servers="b:9092",
+                payload_format="json",
+                schema_registry=glue,
+            )
+
+    def test_glue_registry_rejects_raw_bytes_payload(self) -> None:
+        glue = GlueSchemaRegistryConnection(
+            name="g", registry_name="r", region="us-east-1",
+        )
+        with pytest.raises(ValueError, match="does not use a schema-registry"):
+            KafkaConnection(
+                name="orders",
+                bootstrap_servers="b:9092",
+                payload_format="raw_bytes",
+                schema_registry=glue,
+            )
+
+    def test_glue_registry_protobuf_payload_accepted(self) -> None:
+        # Protobuf via Glue is on the future-work list — the
+        # validation accepts it so the connection is constructable;
+        # the Rust dispatch will surface a "not yet implemented" error
+        # at the first read, not at config time.
+        glue = GlueSchemaRegistryConnection(
+            name="g", registry_name="r", region="us-east-1",
+        )
+        k = KafkaConnection(
+            name="orders",
+            bootstrap_servers="b:9092",
+            payload_format="protobuf",
+            schema_registry=glue,
+        )
+        assert k.schema_registry is glue
 
 
 # ---------------------------------------------------------------------------
@@ -155,6 +212,56 @@ class TestFetchSchemaByUuid:
         }
         schema = fetch_schema_by_uuid(_glue_conn(), "u", _client=client)
         assert schema.data_format == "PROTOBUF"
+
+
+class TestFetchSchemaByName:
+    """Producer-side helper: resolve the latest version of a named
+    schema. Used by the Rust Kafka producer on first send to learn
+    which UUID to embed in each Glue frame."""
+
+    def test_returns_latest_version_by_default(self) -> None:
+        client = MagicMock()
+        client.get_schema_version.return_value = {
+            "SchemaVersionId": "aa-bb-cc",
+            "DataFormat": "AVRO",
+            "SchemaDefinition": '{"type":"record","name":"Order","fields":[]}',
+            "SchemaArn": "arn:aws:glue:us-east-1:123:schema/r/Order",
+            "VersionNumber": 5,
+        }
+        schema = fetch_schema_by_name(_glue_conn(), "Order", _client=client)
+        # Glue's LatestVersion flag is what we want by default.
+        client.get_schema_version.assert_called_once()
+        kwargs = client.get_schema_version.call_args.kwargs
+        assert kwargs["SchemaId"] == {
+            "RegistryName": "my-registry", "SchemaName": "Order",
+        }
+        assert kwargs["SchemaVersionNumber"] == {"LatestVersion": True}
+        assert schema.version_number == 5
+        assert schema.data_format == "AVRO"
+
+    def test_specific_version_number(self) -> None:
+        client = MagicMock()
+        client.get_schema_version.return_value = {
+            "SchemaVersionId": "x",
+            "DataFormat": "AVRO",
+            "SchemaDefinition": "{}",
+            "SchemaArn": "arn",
+            "VersionNumber": 3,
+        }
+        fetch_schema_by_name(_glue_conn(), "Order", version=3, _client=client)
+        kwargs = client.get_schema_version.call_args.kwargs
+        assert kwargs["SchemaVersionNumber"] == {"VersionNumber": 3}
+
+    def test_rejects_unknown_data_format(self) -> None:
+        client = MagicMock()
+        client.get_schema_version.return_value = {
+            "DataFormat": "CSV",
+            "SchemaDefinition": "",
+            "SchemaArn": "arn",
+            "VersionNumber": 1,
+        }
+        with pytest.raises(ValueError, match="unsupported DataFormat"):
+            fetch_schema_by_name(_glue_conn(), "Order", _client=client)
 
 
 # ---------------------------------------------------------------------------

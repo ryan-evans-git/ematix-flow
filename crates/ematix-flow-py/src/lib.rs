@@ -2,6 +2,7 @@ mod arrow_iter;
 mod kafka;
 mod kinesis;
 mod pubsub;
+mod py_callbacks;
 mod rabbitmq;
 mod udaf;
 mod udf;
@@ -872,5 +873,16 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<arrow_iter::PyArrowBatchIter>()?;
     m.add_class::<udf::PyUdfHandle>()?;
     m.add_class::<udaf::PyUdafHandle>()?;
+    // Task #556 / #559 — Rust → Python callback registry.
+    m.add_function(wrap_pyfunction!(py_callbacks::register_python_callback, m)?)?;
+    m.add_function(wrap_pyfunction!(
+        py_callbacks::unregister_python_callback,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        py_callbacks::is_python_callback_registered,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(py_callbacks::invoke_python_callback, m)?)?;
     Ok(())
 }

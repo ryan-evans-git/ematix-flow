@@ -1,0 +1,46 @@
+# Task #556 — LocalStack harness for AWS Glue Schema Registry tests.
+#
+# Brings up a single LocalStack container with the Glue service
+# enabled on port 4566. The integration tests in
+# tests/python/integration/test_glue_localstack.py target this
+# endpoint when EMATIX_FLOW_LOCALSTACK_ENDPOINT is set.
+#
+# Quick start:
+#
+#   docker compose -f examples/glue-localstack/docker-compose.yml up -d
+#   export EMATIX_FLOW_LOCALSTACK_ENDPOINT=http://localhost:4566
+#   export AWS_ACCESS_KEY_ID=test
+#   export AWS_SECRET_ACCESS_KEY=test
+#   export AWS_DEFAULT_REGION=us-east-1
+#   pytest tests/python/integration/test_glue_localstack.py -v
+#   docker compose -f examples/glue-localstack/docker-compose.yml down
+#
+# LocalStack's Glue Schema Registry support is in the community
+# image (>=3.0); no Pro license required for the GetSchemaVersion /
+# RegisterSchemaVersion / CreateSchema calls we exercise.
+
+services:
+  localstack:
+    image: localstack/localstack:3.8
+    container_name: ematix-flow-glue-localstack
+    ports:
+      - "4566:4566"
+    environment:
+      # Only spin up Glue — saves memory + boot time.
+      SERVICES: glue
+      DEFAULT_REGION: us-east-1
+      # LocalStack ignores credential values but boto3 still wants
+      # them set; the integration tests export the same.
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      # Persist nothing — every container restart is a clean slate.
+      # That keeps the integration tests hermetic.
+      PERSISTENCE: 0
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - "curl -fsS http://localhost:4566/_localstack/health | grep -q '\"glue\": \"available\"' || curl -fsS http://localhost:4566/_localstack/health | grep -q '\"glue\": \"running\"'"
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 30s

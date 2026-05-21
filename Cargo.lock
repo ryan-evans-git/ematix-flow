@@ -3754,6 +3754,7 @@ dependencies = [
  "ematix-parquet-codec",
  "ematix-parquet-format",
  "ematix-parquet-io",
+ "flate2",
  "futures-util",
  "google-cloud-auth",
  "google-cloud-pubsub",
