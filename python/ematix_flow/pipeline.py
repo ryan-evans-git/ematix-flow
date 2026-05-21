@@ -1429,7 +1429,13 @@ def run_pipeline(name: str) -> dict[str, Any]:
     return _REGISTRY[name].fn()
 
 
-def is_due(schedule: str | None, now: datetime, interval_seconds: int) -> bool:
+def is_due(
+    schedule: str | None,
+    now: datetime,
+    interval_seconds: int,
+    *,
+    tz: Any = None,
+) -> bool:
     """Return True if `schedule` would fire within the half-open window
     `(now - interval_seconds, now]`. The intended invocation pattern is
     an external cron / k8s CronJob calling `flow run-due` once per
@@ -1438,18 +1444,50 @@ def is_due(schedule: str | None, now: datetime, interval_seconds: int) -> bool:
     `schedule=None` always returns False — unscheduled pipelines/transforms
     are only invoked explicitly (`flow run`, `flow transform run`) or
     indirectly via `transforms_post=[transform_ref(...)]`.
+
+    ``tz=`` (task #558) — interpret the cron expression in the given
+    timezone instead of whatever timezone ``now`` carries (effectively
+    UTC for ``flow run-due``). Accepts a :class:`zoneinfo.ZoneInfo`
+    instance or a tz name string ("America/New_York"). When set,
+    ``now`` is converted to the target tz before croniter evaluates the
+    schedule, so ``0 9 * * *`` with ``tz="America/New_York"`` fires at
+    9 AM Eastern, automatically tracking DST boundaries.
     """
     if schedule is None:
         return False
     from croniter import croniter
 
+    # Resolve the tz argument once. None = leave `now` as-is (preserves
+    # the historical UTC-or-naive behaviour).
+    tz_resolved = _resolve_tz(tz)
+
     try:
         base = now - timedelta(seconds=interval_seconds)
+        if tz_resolved is not None:
+            base_local = base.astimezone(tz_resolved)
+            now_local = now.astimezone(tz_resolved)
+            cron = croniter(schedule, base_local)
+            next_fire = cron.get_next(datetime)
+            return base_local < next_fire <= now_local
         cron = croniter(schedule, base)
         next_fire = cron.get_next(datetime)
     except Exception as e:
         raise ValueError(f"invalid cron expression {schedule!r}: {e}") from e
     return base < next_fire <= now
+
+
+def _resolve_tz(tz: Any) -> Any:
+    """Accept a ZoneInfo instance, a tz name string, or None.
+
+    Returning None lets the caller skip the conversion entirely.
+    """
+    if tz is None:
+        return None
+    if isinstance(tz, str):
+        from zoneinfo import ZoneInfo
+
+        return ZoneInfo(tz)
+    return tz
 
 
 # --- Phase 25: preview / dry-run --------------------------------------------
