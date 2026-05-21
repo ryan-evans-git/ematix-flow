@@ -6,6 +6,13 @@
   let loading = true;
   let error = null;
 
+  // --- filter + sort state ---
+  let nameFilter = "";
+  let kindFilter = "";            // "" | "batch" | "streaming"
+  let statusFilter = "";          // "" | "running" | "succeeded" | "failed" | ...
+  let sortKey = "name";           // name | kind | status | next | median
+  let sortDir = "asc";            // asc | desc
+
   async function load() {
     loading = true;
     error = null;
@@ -21,16 +28,55 @@
 
   onMount(load);
 
+  // --- visible = filtered + sorted ---
+  $: visible = (() => {
+    const nf = nameFilter.trim().toLowerCase();
+    let out = pipelines.filter((p) => {
+      if (nf && !p.name.toLowerCase().includes(nf)) return false;
+      if (kindFilter && p.kind !== kindFilter) return false;
+      if (statusFilter) {
+        const s = p.latest_run?.status || "";
+        if (s !== statusFilter) return false;
+      }
+      return true;
+    });
+    const dir = sortDir === "asc" ? 1 : -1;
+    out = out.slice().sort((a, b) => {
+      let av, bv;
+      switch (sortKey) {
+        case "kind":   av = a.kind || ""; bv = b.kind || ""; break;
+        case "status": av = a.latest_run?.status || ""; bv = b.latest_run?.status || ""; break;
+        case "next":   av = a.next_run_at || ""; bv = b.next_run_at || ""; break;
+        case "median": av = a.median_duration_ms ?? -1; bv = b.median_duration_ms ?? -1; break;
+        case "name":
+        default:       av = a.name; bv = b.name;
+      }
+      if (av < bv) return -1 * dir;
+      if (av > bv) return  1 * dir;
+      return 0;
+    });
+    return out;
+  })();
+
+  function setSort(key) {
+    if (sortKey === key) {
+      sortDir = sortDir === "asc" ? "desc" : "asc";
+    } else {
+      sortKey = key;
+      sortDir = "asc";
+    }
+  }
+  function arrow(key) {
+    if (sortKey !== key) return " ";
+    return sortDir === "asc" ? "▲" : "▼";
+  }
+
   function fmtDuration(ms) {
     if (ms == null) return "—";
     if (ms < 1000) return `${ms}ms`;
     return `${(ms / 1000).toFixed(2)}s`;
   }
 
-  // v0.5.0: streaming pipelines surface throughput + batch cycle
-  // instead of a meaningless median over the single "still running"
-  // record. Snapshots come from the daemon every ~30s via the
-  // streaming-stats recorder.
   function fmtRate(rps) {
     if (rps == null) return "—";
     if (rps >= 1000) return `${(rps / 1000).toFixed(1)}k rps`;
@@ -55,9 +101,6 @@
     try {
       const d = new Date(iso);
       if (tz) {
-        // Pipeline-local rendering via Intl. Format "YYYY-MM-DD HH:MM TZ"
-        // so the column stays aligned with the UTC fallback. Tag with the
-        // short zone name ("EDT" / "PST") so the user sees the offset.
         const dt = new Intl.DateTimeFormat("en-CA", {
           timeZone: tz,
           year: "numeric", month: "2-digit", day: "2-digit",
@@ -77,9 +120,10 @@
   function gotoRun(runId) {
     window.location.hash = `#/runs/${encodeURIComponent(runId)}`;
   }
+  function gotoDag(name) {
+    window.location.hash = `#/dag/${encodeURIComponent(name)}`;
+  }
 
-  // Pad recent_runs with placeholder "pending" cells so every strip
-  // is exactly 10 squares wide — keeps the visual grid aligned.
   function padRecent(recent) {
     const out = [...(recent || [])];
     while (out.length < 10) {
@@ -88,18 +132,6 @@
     return out;
   }
 
-  // Per-cell height — relative to the longest run in this pipeline's
-  // last-10 strip so duration variance is visible at a glance. Bars are
-  // bottom-aligned (see .last-10-strip { align-items: flex-end }) so
-  // taller bars grow upward.
-  //
-  // Ramp: 8px (baseline / no duration) → 28px (max duration in strip).
-  // Sqrt scaling so a single 10× outlier doesn't crush everything else
-  // to a one-pixel sliver — a 60s run still looks meaningfully different
-  // from a 1s run when the strip also contains a 600s run.
-  //
-  // Running/pending cells with no duration_ms render at baseline so the
-  // strip stays readable.
   const _MIN_H = 8;
   const _MAX_H = 28;
   function cellHeight(durationMs, maxDurationMs) {
@@ -120,7 +152,56 @@
   }
 </script>
 
-<h1>Pipelines</h1>
+<h1>Jobs</h1>
+<p class="dim" style="margin-top: -0.5rem;">
+  Individual jobs across all workflows. For named workflow groupings,
+  see <a class="link" href="#/workflows">Workflows</a>.
+</p>
+
+<div class="panel">
+  <div style="display: flex; gap: 0.75rem; flex-wrap: wrap; align-items: center;">
+    <label>
+      Name:
+      <input
+        type="text"
+        bind:value={nameFilter}
+        placeholder="(any)"
+        style="background: rgba(8,16,12,0.7); border: 1px solid var(--color-phosphor-700); color: var(--color-phosphor-200); padding: 0.25rem 0.5rem; font-family: var(--font-mono); width: 14ch;"
+      />
+    </label>
+    <label>
+      Kind:
+      <select bind:value={kindFilter}
+        style="background: rgba(8,16,12,0.7); border: 1px solid var(--color-phosphor-700); color: var(--color-phosphor-200); padding: 0.25rem 0.5rem; font-family: var(--font-mono);">
+        <option value="">(any)</option>
+        <option value="batch">batch</option>
+        <option value="streaming">streaming</option>
+      </select>
+    </label>
+    <label>
+      Latest status:
+      <select bind:value={statusFilter}
+        style="background: rgba(8,16,12,0.7); border: 1px solid var(--color-phosphor-700); color: var(--color-phosphor-200); padding: 0.25rem 0.5rem; font-family: var(--font-mono);">
+        <option value="">(any)</option>
+        <option value="running">running</option>
+        <option value="succeeded">succeeded</option>
+        <option value="failed">failed</option>
+        <option value="paused">paused</option>
+        <option value="cancelled">cancelled</option>
+      </select>
+    </label>
+    <span style="margin-left: auto; display: flex; gap: 0.4rem; align-items: center;">
+      <span class="dim">sort:</span>
+      <button class="action" on:click={() => setSort("name")}>name {arrow("name")}</button>
+      <button class="action" on:click={() => setSort("kind")}>kind {arrow("kind")}</button>
+      <button class="action" on:click={() => setSort("status")}>status {arrow("status")}</button>
+      <button class="action" on:click={() => setSort("next")}>next {arrow("next")}</button>
+      <button class="action" on:click={() => setSort("median")}>duration {arrow("median")}</button>
+    </span>
+    <button class="action" on:click={load}>Refresh</button>
+    <span class="mono" style="margin-left: 0.5rem;">total: {visible.length}/{pipelines.length}</span>
+  </div>
+</div>
 
 {#if error}
   <div class="panel" style="border-color: var(--color-alarm); color: var(--color-alarm);">
@@ -128,14 +209,16 @@
   </div>
 {:else if loading}
   <div class="loading">▸ loading...</div>
-{:else if pipelines.length === 0}
-  <div class="empty">no pipelines registered yet</div>
+{:else if visible.length === 0}
+  <div class="empty">no pipelines match the current filter</div>
 {:else}
-  {#each pipelines as p}
+  {#each visible as p}
     {@const _maxDur = stripMaxDuration(p.recent_runs)}
     <div class="panel pipeline-card">
       <div class="pipeline-header">
-        <h3 class="pipeline-name">{p.name}</h3>
+        <h3 class="pipeline-name">
+          <a class="link" href={`#/dag/${encodeURIComponent(p.name)}`}>{p.name}</a>
+        </h3>
         <span class="pipeline-meta">
           {#if p.kind === "streaming"}
             <span class="streaming-pill">▶ LIVE STREAMING</span>
@@ -193,7 +276,11 @@
         {:else}
           <span><strong>Median duration:</strong> {fmtDuration(p.median_duration_ms)}</span>
         {/if}
-        <span><a class="link" href="#/runs?pipeline={encodeURIComponent(p.name)}">all jobs →</a></span>
+        <span>
+          <a class="link" href={`#/dag/${encodeURIComponent(p.name)}`}>dag →</a>
+          &nbsp;
+          <a class="link" href="#/runs?pipeline={encodeURIComponent(p.name)}">all jobs →</a>
+        </span>
       </div>
     </div>
   {/each}

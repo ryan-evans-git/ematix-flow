@@ -1106,6 +1106,36 @@ class _EmatixNamespace:
             column_map=column_map,
         )
 
+    def workflow(
+        self,
+        *,
+        name: str,
+        jobs: list[str],
+        depends_on: dict[str, list[str]] | None = None,
+    ):
+        """Declare a named workflow grouping its member jobs.
+
+        ``jobs`` is the list of job names that belong to this workflow.
+        ``depends_on`` is a dict of ``{downstream: [upstream, ...]}`` —
+        the DAG lives here, in the workflow, not on individual jobs.
+
+        Example::
+
+            @ematix.job(target=OrdersTable, schedule="*/5 * * * *", mode="merge", keys=("id",))
+            def extract_orders(conn): return "SELECT ..."
+
+            @ematix.job(target=OrdersEnriched, schedule="*/5 * * * *", mode="merge", keys=("id",))
+            def enrich_orders(conn): return "SELECT ..."
+
+            ematix.workflow(
+                name="orders_etl",
+                jobs=["extract_orders", "enrich_orders"],
+                depends_on={"enrich_orders": ["extract_orders"]},
+            )
+        """
+        from ematix_flow.pipeline import register_workflow
+        return register_workflow(name=name, jobs=jobs, depends_on=depends_on)
+
     def pipeline(
         self,
         *,
@@ -1413,6 +1443,11 @@ class _EmatixNamespace:
             return wrapped
 
         return decorate
+
+    # `@ematix.job` is the new primary name for what used to be
+    # `@ematix.pipeline`. Both work; new code should prefer `.job` to
+    # match the workflow/job terminology the UI uses.
+    job = pipeline
 
     def table(
         self,

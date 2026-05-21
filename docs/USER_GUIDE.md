@@ -153,6 +153,77 @@ selects which one.
 
 ---
 
+## Workflows + Jobs (v0.6.0)
+
+`ematix-flow` has two top-level concepts:
+
+- **Job** — one unit of work. Declared with `@ematix.job(...)` (or
+  the older name `@ematix.pipeline(...)` — both resolve to the same
+  decorator). One target, one schedule, one retry policy.
+- **Workflow** — a user-named group of jobs plus the DAG between
+  them. Declared with `ematix.workflow(name=..., jobs=[...],
+  depends_on={...})`. The DAG lives on the workflow, not on the
+  individual jobs.
+
+```python
+from ematix_flow import ematix
+
+@ematix.job(name="extract_orders", target=OrdersExtracted, ...)
+def extract_orders(conn): return "SELECT ..."
+
+@ematix.job(name="enrich_orders", target=OrdersEnriched, ...)
+def enrich_orders(conn): return "SELECT ..."
+
+@ematix.job(name="aggregate_orders", target=OrdersByCustomer, ...)
+def aggregate_orders(conn): return "SELECT ..."
+
+@ematix.job(name="report_orders", target=OrdersReport, ...)
+def report_orders(conn): return "SELECT ..."
+
+ematix.workflow(
+    name="orders_etl",
+    jobs=[
+        "extract_orders",
+        "enrich_orders",
+        "aggregate_orders",
+        "report_orders",
+    ],
+    depends_on={
+        "enrich_orders":    ["extract_orders"],
+        "aggregate_orders": ["extract_orders"],
+        "report_orders":    ["enrich_orders", "aggregate_orders"],
+    },
+)
+```
+
+Reading: `enrich_orders` waits on `extract_orders`; `aggregate_orders`
+also waits on `extract_orders` (so the two run in parallel after
+extract finishes); `report_orders` waits on **both** `enrich_orders`
+and `aggregate_orders`. The scheduler honors these edges via
+upstream-freshness gating per its existing semantics.
+
+### In the Web UI
+
+- **Workflows tab** — one card per workflow with member jobs laid
+  out as an inline flowchart with arrows. `kind: "declared"` for
+  workflows you registered; `kind: "single"` for jobs that aren't
+  part of any workflow (each shown as a workflow-of-one).
+- **Jobs tab** — flat list of every individual job, with filters
+  and sort. Same last-10-execution strip and streaming-throughput
+  footer as before.
+- **Runs tab** — execution history; click a column header to sort.
+- **DAG tab** — full cross-workflow graph as an SVG flowchart.
+  `#/dag/<job-name>` focuses the subgraph on that job.
+
+### Migration from per-job depends_on
+
+`@ematix.pipeline(depends_on=[...])` from earlier versions still
+works — those jobs surface as single-kind workflows in the UI. To
+group them into a named workflow, drop the per-job `depends_on=` and
+add a single `ematix.workflow(...)` call.
+
+---
+
 ## Surface 1: declarative Postgres pipelines
 
 The v0.1 API: declare a target table as a class, declare the load

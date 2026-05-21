@@ -37,6 +37,10 @@ export async function listPipelines() {
   return _request("/pipelines");
 }
 
+export async function listWorkflows() {
+  return _request("/workflows");
+}
+
 export async function restartRun(runId, fromStep) {
   return _request(`/runs/${encodeURIComponent(runId)}/restart`, {
     method: "POST",
