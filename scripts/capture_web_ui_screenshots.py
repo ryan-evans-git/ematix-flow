@@ -141,20 +141,102 @@ def _runs_list_store() -> InMemoryRunHistory:
     return store
 
 
-def _success_only_store() -> InMemoryRunHistory:
-    """orders_etl with six consecutive green runs (for the
-    "successful history" shot when filtered)."""
+def _pipelines_view_store() -> InMemoryRunHistory:
+    """Four pipelines with rich last-10 histories for the pipelines
+    overview screenshot.
+
+    Mix:
+    - ``events_stream``  — streaming, currently running (LIVE pill).
+    - ``orders_etl``     — clean 10/10 green.
+    - ``warehouse_etl``  — mostly green with one failure 4 runs back
+                            (retried-then-succeeded shows as success).
+    - ``customers_sync`` — recent green track + ``next_run_at``.
+    """
     store = InMemoryRunHistory()
-    base = datetime(2026, 5, 20, 15, 30, 0, tzinfo=UTC)
-    for i in range(6):
-        ts = base + timedelta(hours=-i)
+    base = datetime(2026, 5, 20, 16, 0, 0, tzinfo=UTC)
+
+    # events_stream: currently running (kind=streaming, no
+    # next_run_at — UI renders the LIVE STREAMING pill instead).
+    for i in range(9):
+        ts = base + timedelta(hours=-3 - i * 3)
         store.record_run_record(
             RunRecord(
-                run_id=f"01HQ-orders-success-{i}",
+                run_id=f"01HQ-stream-{i}",
+                pipeline="events_stream",
+                status="succeeded",
+                started_at=ts,
+                finished_at=ts + timedelta(hours=2, minutes=58),
+                kind="streaming",
+            )
+        )
+    store.record_run_record(
+        RunRecord(
+            run_id="01HQ-stream-current",
+            pipeline="events_stream",
+            status="running",
+            started_at=base,
+            kind="streaming",
+        )
+    )
+
+    # orders_etl: 10 consecutive succeeds, next run forecast.
+    next_orders = (base + timedelta(minutes=22)).isoformat()
+    for i in range(10):
+        ts = base + timedelta(minutes=-15 - i * 30)
+        store.record_run_record(
+            RunRecord(
+                run_id=f"01HQ-orders-{i}",
                 pipeline="orders_etl",
                 status="succeeded",
                 started_at=ts,
-                finished_at=ts + timedelta(seconds=44 + i % 3),
+                finished_at=ts + timedelta(seconds=44 + i % 4),
+                extras={"next_run_at": next_orders},
+            )
+        )
+
+    # warehouse_etl: mostly green, one failed 4 runs back. The
+    # subsequent run after the failure succeeded (retry honored).
+    next_wh = (base + timedelta(minutes=58)).isoformat()
+    for i in range(10):
+        if i == 4:
+            store.record_run_record(
+                RunRecord(
+                    run_id="01HQ-wh-fail",
+                    pipeline="warehouse_etl",
+                    status="failed",
+                    started_at=base + timedelta(minutes=-90 - i * 60),
+                    finished_at=base + timedelta(minutes=-89 - i * 60),
+                    attempt=2,
+                    failed_step="merge_payments",
+                    error_summary="ValueError: amount column missing in batch 47",
+                    extras={"next_run_at": next_wh},
+                )
+            )
+        else:
+            ts = base + timedelta(minutes=-30 - i * 60)
+            store.record_run_record(
+                RunRecord(
+                    run_id=f"01HQ-wh-{i}",
+                    pipeline="warehouse_etl",
+                    status="succeeded",
+                    started_at=ts,
+                    finished_at=ts + timedelta(seconds=52 + i % 3),
+                    extras={"next_run_at": next_wh},
+                )
+            )
+
+    # customers_sync: tidy green track, next run forecast.
+    next_cust = (base + timedelta(hours=5)).isoformat()
+    for i in range(7):
+        ts = base + timedelta(hours=-6 - i * 6)
+        store.record_run_record(
+            RunRecord(
+                run_id=f"01HQ-cust-{i}",
+                pipeline="customers_sync",
+                status="succeeded",
+                started_at=ts,
+                finished_at=ts + timedelta(seconds=18 + i % 4),
+                extras={"next_run_at": next_cust},
             )
         )
     return store
@@ -268,17 +350,18 @@ def main() -> int:
     ).resolve()
     print(f"writing screenshots to {out_dir}")
 
-    print("[1/4] runs-list — mixed batch + streaming")
+    print("[1/4] pipelines-view — per-pipeline last-10 strip + next-run / LIVE")
+    port = _free_port()
+    _start_server(_pipelines_view_store(), port)
+    _capture(
+        f"http://127.0.0.1:{port}/#/pipelines",
+        out_dir / "pipelines-view.png",
+    )
+
+    print("[2/4] jobs-list — flat table of run records")
     port = _free_port()
     _start_server(_runs_list_store(), port)
-    _capture(f"http://127.0.0.1:{port}/#/runs", out_dir / "runs-list.png")
-
-    print("[2/4] runs-successful — orders_etl green track record")
-    port = _free_port()
-    _start_server(_success_only_store(), port)
-    _capture(
-        f"http://127.0.0.1:{port}/#/runs", out_dir / "runs-successful.png"
-    )
+    _capture(f"http://127.0.0.1:{port}/#/runs", out_dir / "jobs-list.png")
 
     print("[3/4] run-failed-restart — detail with action button hovered")
     port = _free_port()

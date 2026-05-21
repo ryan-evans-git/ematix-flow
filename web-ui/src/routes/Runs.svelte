@@ -45,7 +45,7 @@
   }
 </script>
 
-<h1>Pipelines</h1>
+<h1>Jobs</h1>
 
 <div class="panel">
   <div style="display: flex; gap: 0.75rem; flex-wrap: wrap; align-items: center;">

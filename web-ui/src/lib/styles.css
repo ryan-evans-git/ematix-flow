@@ -218,6 +218,120 @@ table.runs tr:hover { background: rgba(51, 220, 204, 0.03); cursor: pointer; }
 .status--requested { color: var(--color-amber-glow); }
 .status--cancelled { color: var(--color-phosphor-700); }
 
+/* ----- Pipelines view: last-10 strip + headers ----- */
+.pipeline-card {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+  padding: 1rem 1.1rem;
+}
+.pipeline-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 1rem;
+  flex-wrap: wrap;
+}
+.pipeline-name {
+  margin: 0;
+  font-family: var(--font-mono);
+  color: var(--color-phosphor-200);
+}
+.pipeline-meta {
+  font-family: var(--font-mono);
+  font-size: 0.78rem;
+  letter-spacing: 0.04em;
+}
+.next-run {
+  color: var(--color-phosphor-400);
+}
+.next-run--muted {
+  color: var(--color-phosphor-700);
+}
+.streaming-pill {
+  color: var(--color-amber-glow);
+  border: 1px solid var(--color-amber-glow);
+  border-radius: 2px;
+  padding: 0.1rem 0.5rem;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  animation: dag-pulse 1.6s ease-in-out infinite;
+}
+.last-10 {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+}
+.last-10-label {
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--color-phosphor-500);
+}
+.last-10-strip {
+  display: flex;
+  gap: 4px;
+}
+.exec-cell {
+  display: inline-block;
+  width: 22px;
+  height: 22px;
+  border-radius: 2px;
+  border: 1px solid transparent;
+  padding: 0;
+  cursor: pointer;
+  transition: transform 0.08s;
+}
+.exec-cell:hover {
+  transform: translateY(-1px);
+}
+.exec-cell--succeeded {
+  background: var(--color-success);
+  border-color: var(--color-success);
+}
+.exec-cell--failed {
+  background: var(--color-alarm);
+  border-color: var(--color-alarm);
+}
+.exec-cell--running {
+  background: rgba(255, 191, 64, 0.45);
+  border-color: var(--color-amber-glow);
+  animation: dag-pulse 1.6s ease-in-out infinite;
+}
+.exec-cell--paused {
+  background: rgba(255, 176, 0, 0.35);
+  border-color: var(--color-amber-glow);
+}
+.exec-cell--cancelled {
+  background: var(--color-phosphor-800);
+  border-color: var(--color-phosphor-700);
+}
+.exec-cell--requested {
+  background: rgba(255, 176, 0, 0.2);
+  border-color: var(--color-amber-glow);
+  border-style: dashed;
+}
+.exec-cell--pending,
+.exec-cell--empty {
+  background: transparent;
+  border: 1px dashed var(--color-phosphor-700);
+  cursor: default;
+}
+.pipeline-footer {
+  display: flex;
+  justify-content: space-between;
+  font-family: var(--font-mono);
+  font-size: 0.78rem;
+  color: var(--color-phosphor-500);
+}
+.link {
+  color: var(--color-phosphor-300);
+}
+.link:hover {
+  color: var(--color-phosphor-100);
+}
+
 /* ----- DAG renderer ----- */
 .dag {
   display: block;

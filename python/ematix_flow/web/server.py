@@ -278,6 +278,18 @@ def create_app(
                     r.duration_ms for r in runs if r.duration_ms is not None
                 ]
                 failed = sum(1 for r in runs if r.status == "failed")
+                # Last 10 executions, oldest → newest for left-to-right
+                # rendering. A run that retried-then-succeeded has
+                # status="succeeded" already (the final attempt is
+                # what counts), so attempt-count isn't surfaced here.
+                recent = [r.to_summary_dict() for r in runs[:10]][::-1]
+                # `next_run_at` is the most-recent forecast the scheduler
+                # produced (set via record.extras["next_run_at"]). For
+                # streaming pipelines we omit it and let the UI render
+                # "LIVE STREAMING" instead.
+                next_run_at = None
+                if latest.kind != "streaming":
+                    next_run_at = latest.extras.get("next_run_at")
                 pipelines.append(
                     {
                         "name": name,
@@ -287,8 +299,15 @@ def create_app(
                         "median_duration_ms": (
                             _median(durations) if durations else None
                         ),
+                        "recent_runs": recent,
+                        "next_run_at": next_run_at,
                     }
                 )
+            # Sort pipelines so the most recently active is on top.
+            pipelines.sort(
+                key=lambda p: p["latest_run"]["started_at"] or "",
+                reverse=True,
+            )
             return {"pipelines": pipelines}
         return {"pipelines": _STUB_PIPELINES}
 

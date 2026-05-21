@@ -645,9 +645,17 @@ Localhost-only by default (binding a non-loopback address logs a
 warning since the alpha ships without bearer-token auth — SSH
 tunnel or front with a reverse proxy for remote access).
 
-The run-detail page renders the task DAG live, color-coded by
-status — solid teal for **succeeded**, pulsing amber for **running**,
-dashed dim teal for **pending**, solid red for **failed**:
+The landing view is **Pipelines** — one card per pipeline with a
+last-10-execution strip (teal = succeeded, red = failed,
+amber-pulse = running; a retried-then-succeeded run counts as
+green) and a "Next: `<UTC>`" or "LIVE STREAMING" indicator:
+
+![Pipelines view — last-10 strip + next-run indicator per pipeline](docs/screenshots/pipelines-view.png)
+
+Clicking any square drills into the run-detail page, which renders
+the task DAG live — solid teal for **succeeded**, pulsing amber
+for **running**, dashed dim teal for **pending**, solid red for
+**failed**:
 
 ![workflow DAG with parallel branch](docs/screenshots/workflow-dag.png)
 
