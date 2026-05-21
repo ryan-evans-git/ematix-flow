@@ -67,9 +67,10 @@ flow run-due --module my_pipelines    # cron-style; drop into systemd / cron / k
   GitHub Actions, or the bundled long-running scheduler — same code, same
   topological order, same retry semantics. Already on Airflow / Dagster /
   Prefect? Call `.sync()` directly.
-- **Batteries included.** Postgres, MySQL, SQLite, DuckDB, Kafka, RabbitMQ,
-  Kinesis, Pub/Sub, S3, Delta Lake. Schema Registry + Avro / Protobuf. CDC
-  source mode dispatches per-op transactionally to your existing target.
+- **Batteries included.** Postgres, MySQL, SQLite, DuckDB, Snowflake,
+  BigQuery, Redshift, Kafka, RabbitMQ, Kinesis, Pub/Sub, S3, Delta Lake.
+  Schema Registry + Avro / Protobuf. CDC source mode dispatches per-op
+  transactionally to your existing target.
 - **Operationally honest.** Restart-safe state, watermarks, at-least-once
   delivery, credential redaction, structured run history, Prometheus +
   OpenTelemetry metrics, Slack alerts.
