@@ -15,7 +15,7 @@ from __future__ import annotations
 import threading
 import time
 from collections import deque
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from unittest.mock import patch
 
 import pytest
@@ -28,7 +28,6 @@ from ematix_flow.streaming_stats import (
     scrape_counters,
     summarize_window,
 )
-
 
 # ---- scrape_counters ----------------------------------------------
 
@@ -136,7 +135,7 @@ def test_summarize_with_no_batches_yields_none_cycle() -> None:
 
 
 def test_run_id_is_stable_shape() -> None:
-    ts = datetime(2026, 5, 21, 14, 30, 0, tzinfo=timezone.utc)
+    ts = datetime(2026, 5, 21, 14, 30, 0, tzinfo=UTC)
     rid = make_streaming_run_id("orders", ts)
     assert rid.startswith("orders-stream-20260521T143000Z-")
     # 8 hex chars suffix
@@ -219,10 +218,8 @@ def test_failure_path_marks_record_failed_with_error() -> None:
     rec = StreamingStatsRecorder(
         run_log=rl, pipeline_name="orders", metrics_port=9100, interval_seconds=10.0,
     )
-    with _patch_scrape_returning([None]):
-        with pytest.raises(RuntimeError, match="injected"):
-            with rec:
-                raise RuntimeError("injected")
+    with _patch_scrape_returning([None]), pytest.raises(RuntimeError, match="injected"), rec:
+        raise RuntimeError("injected")
 
     terminal = rl.records[-1]
     assert terminal.status == "failed"

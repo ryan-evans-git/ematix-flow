@@ -30,7 +30,7 @@ import time
 import uuid
 from collections import deque
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 from urllib.error import URLError
 from urllib.request import urlopen
@@ -75,7 +75,7 @@ def make_streaming_run_id(pipeline_name: str, started_at: datetime) -> str:
     UUID disambiguates same-second restarts; the ``-stream-`` infix
     distinguishes streaming records from batch records at a glance.
     """
-    ts = started_at.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    ts = started_at.astimezone(UTC).strftime("%Y%m%dT%H%M%SZ")
     return f"{pipeline_name}-stream-{ts}-{uuid.uuid4().hex[:8]}"
 
 
@@ -267,7 +267,7 @@ class StreamingStatsRecorder:
         """
         if self._thread is not None:
             raise RuntimeError("StreamingStatsRecorder.start() called twice")
-        self._started_at = datetime.now(timezone.utc)
+        self._started_at = datetime.now(UTC)
         self._run_id = make_streaming_run_id(self._pipeline_name, self._started_at)
         self._write_record(status="running", extras=self._initial_extras())
         self._thread = threading.Thread(
@@ -287,7 +287,7 @@ class StreamingStatsRecorder:
         # One last scrape so the terminal record reflects what really
         # shipped — not the snapshot from 30s ago. Best-effort.
         self._maybe_scrape()
-        finished_at = datetime.now(timezone.utc)
+        finished_at = datetime.now(UTC)
         extras = self._build_extras(now=time.time())
         if error:
             extras["error"] = error
@@ -349,7 +349,7 @@ class StreamingStatsRecorder:
             else None
         )
         return {
-            "snapshot_at": datetime.now(timezone.utc).isoformat(),
+            "snapshot_at": datetime.now(UTC).isoformat(),
             "rows_consumed_total": latest.rows_consumed if latest else 0,
             "rows_written_total": latest.rows_written if latest else 0,
             "batches_total": latest.batches if latest else 0,

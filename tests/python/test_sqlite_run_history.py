@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import tempfile
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -37,7 +37,7 @@ def _rec(run_id: str, *, started: datetime, **overrides) -> RunRecord:
 
 
 def test_record_then_get_round_trip(store) -> None:
-    ts = datetime(2026, 5, 21, 12, 0, 0, tzinfo=timezone.utc)
+    ts = datetime(2026, 5, 21, 12, 0, 0, tzinfo=UTC)
     rec = _rec("r1", started=ts, extras={"snapshot_at": "x", "rows": 42})
     store.record_run_record(rec)
     got = store.get_run("r1")
@@ -49,7 +49,7 @@ def test_record_then_get_round_trip(store) -> None:
 
 
 def test_replace_on_same_run_id(store) -> None:
-    ts = datetime(2026, 5, 21, 12, 0, 0, tzinfo=timezone.utc)
+    ts = datetime(2026, 5, 21, 12, 0, 0, tzinfo=UTC)
     store.record_run_record(_rec("r1", started=ts, status="running",
                                   finished_at=None))
     store.record_run_record(_rec("r1", started=ts, status="succeeded"))
@@ -59,7 +59,7 @@ def test_replace_on_same_run_id(store) -> None:
 
 
 def test_list_runs_orders_started_at_desc(store) -> None:
-    base = datetime(2026, 5, 21, 12, 0, 0, tzinfo=timezone.utc)
+    base = datetime(2026, 5, 21, 12, 0, 0, tzinfo=UTC)
     for i, mins in enumerate([10, 0, 5]):
         store.record_run_record(_rec(f"r{i}", started=base + timedelta(minutes=mins)))
     records, total = store.list_runs()
@@ -69,7 +69,7 @@ def test_list_runs_orders_started_at_desc(store) -> None:
 
 
 def test_list_runs_filters_by_pipeline_and_status(store) -> None:
-    base = datetime(2026, 5, 21, 12, 0, 0, tzinfo=timezone.utc)
+    base = datetime(2026, 5, 21, 12, 0, 0, tzinfo=UTC)
     store.record_run_record(_rec("r1", started=base))
     store.record_run_record(
         _rec("r2", started=base, pipeline="payments", status="failed"),
@@ -81,7 +81,7 @@ def test_list_runs_filters_by_pipeline_and_status(store) -> None:
 
 
 def test_pagination(store) -> None:
-    base = datetime(2026, 5, 21, 12, 0, 0, tzinfo=timezone.utc)
+    base = datetime(2026, 5, 21, 12, 0, 0, tzinfo=UTC)
     for i in range(5):
         store.record_run_record(_rec(f"r{i}", started=base + timedelta(seconds=i)))
     page1, total = store.list_runs(limit=2, offset=0)
@@ -92,7 +92,7 @@ def test_pagination(store) -> None:
 
 
 def test_streaming_extras_round_trip(store) -> None:
-    ts = datetime(2026, 5, 21, 12, 0, 0, tzinfo=timezone.utc)
+    ts = datetime(2026, 5, 21, 12, 0, 0, tzinfo=UTC)
     extras = {
         "snapshot_at": "2026-05-21T12:00:30Z",
         "rows_consumed_total": 12345,
@@ -114,7 +114,7 @@ def test_get_run_returns_none_when_missing(store) -> None:
 
 
 def test_record_run_record_doesnt_break_lightweight_path(store) -> None:
-    ts = datetime(2026, 5, 21, 12, 0, 0, tzinfo=timezone.utc)
+    ts = datetime(2026, 5, 21, 12, 0, 0, tzinfo=UTC)
     # Use both protocols against the same store.
     store.record_run(name="orders", ts=ts, success=True)
     store.record_run_record(_rec("r1", started=ts))

@@ -4,10 +4,10 @@ from __future__ import annotations
 import pytest
 
 pytest.importorskip("fastapi")
-from fastapi.testclient import TestClient  # noqa: E402
+from fastapi.testclient import TestClient
 
-from ematix_flow import pipeline  # noqa: E402
-from ematix_flow.web.server import create_app  # noqa: E402
+from ematix_flow import pipeline
+from ematix_flow.web.server import create_app
 
 
 @pytest.fixture(autouse=True)

@@ -62,10 +62,9 @@ class TestCapturePipelineLogs:
         # land with whatever was captured before the exception (so
         # `flow logs` can show the partial output that led up to the
         # failure).
-        with pytest.raises(RuntimeError):
-            with capture_pipeline_logs("run-4"):
-                print("printed before raise")
-                raise RuntimeError("kapow")
+        with pytest.raises(RuntimeError), capture_pipeline_logs("run-4"):
+            print("printed before raise")
+            raise RuntimeError("kapow")
         text = read_run_logs("run-4")
         assert text is not None
         assert "printed before raise" in text

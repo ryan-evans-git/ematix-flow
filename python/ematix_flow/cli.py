@@ -1304,7 +1304,7 @@ def _cmd_web(args) -> int:
             from ematix_flow.run_log import from_url
 
             store = from_url(run_log_url)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             print(
                 f"warning: --run-log-url {run_log_url!r} could not be opened "
                 f"({exc!r}); web UI will fall back to stub data",

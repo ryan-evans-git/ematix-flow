@@ -648,7 +648,7 @@ def _maybe_open_stats_recorder(
         from ematix_flow.streaming_stats import StreamingStatsRecorder
 
         rl = from_url(url)
-    except Exception as exc:  # noqa: BLE001 — best-effort, never crash the daemon
+    except Exception as exc:
         print(
             f"streaming-stats: RunLog open failed ({exc!r}); "
             "stats recording disabled, pipeline continues",

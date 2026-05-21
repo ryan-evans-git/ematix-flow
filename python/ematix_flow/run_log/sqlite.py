@@ -296,7 +296,7 @@ class SqliteRunLog:
             f"FROM run_records {where} "
             f"ORDER BY started_at DESC "
             f"LIMIT ? OFFSET ?",
-            params + [limit, offset],
+            [*params, limit, offset],
         )
         records = [self._row_to_record(row) for row in cur.fetchall()]
         return records, total
