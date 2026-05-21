@@ -40,7 +40,7 @@
 //! `group_id` for offset tracking and rebalancing.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use arrow_array::RecordBatch;
@@ -581,6 +581,20 @@ pub struct KafkaBackend {
     /// pair here. Wrapper type carries a custom Debug impl so the
     /// password redacts when KafkaBackend is `{:?}`-printed.
     schema_registry_basic_auth: Option<SrBasicAuth>,
+    /// Task #556: schema-registry wire-format selector. `Confluent`
+    /// (default) uses the 0x00+4-byte-BE-id framing handled by the
+    /// existing `decode_payloads_as_avro` path. `Glue { ... }` swaps
+    /// in the AWS Glue framing (0x03+16-byte-UUID+1-byte-codec) and
+    /// resolves schemas via the named Python callback (typically
+    /// `ematix_flow.glue_schema_registry.fetch_schema_by_uuid`).
+    schema_registry_kind: SchemaRegistryKind,
+    /// Task #556: per-backend cache of UUID→parsed-Avro-schema
+    /// mappings for the Glue dispatch path. Populated lazily on first
+    /// sight of each schema_uuid via a callback into Python's boto3
+    /// `GetSchemaVersion` call. Shared across the backend's read
+    /// surface so a hot topic only pays the network round-trip once
+    /// per schema version (not per message).
+    glue_schema_cache: Arc<RwLock<HashMap<uuid::Uuid, Arc<apache_avro::Schema>>>>,
     /// Phase 40.2: name of the Arrow column to use as the per-row
     /// Kafka message key. `None` means round-robin (default sticky
     /// partitioner) — matches pre-40.2 behavior. When set, the
@@ -588,6 +602,62 @@ pub struct KafkaBackend {
     /// compatible type (`Utf8`, `LargeUtf8`, or `Binary`); other
     /// types raise a clear error at produce time.
     message_key_column: Option<String>,
+}
+
+/// Task #556: Kafka schema-registry wire-format selector.
+///
+/// `Confluent` (default) preserves the pre-existing behavior — the
+/// 0x00+4-byte-BE-id framing handled by the
+/// [`decode_payloads_as_avro`] path via the `schema_registry_converter`
+/// crate. `Glue` swaps in AWS Glue's 0x03+16-byte-UUID+1-byte-codec
+/// framing; schema definitions are resolved at decode time via the
+/// [`crate::py_callbacks`] registry, with the boto3-backed lookup
+/// living in Python (`ematix_flow.glue_schema_registry`).
+///
+/// IAM credential refresh is handled by boto3 inside the Python
+/// callback — the Rust side stays IAM-free. The Glue variant carries
+/// the region and registry name so the callback has enough context
+/// to call `GetSchemaVersion`; the schema UUID comes from the wire
+/// frame on each message.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SchemaRegistryKind {
+    /// Confluent / Apicurio wire format (0x00 + 4-byte BE schema id).
+    /// The schema fetch is handled by `schema_registry_converter`.
+    Confluent,
+    /// AWS Glue Schema Registry wire format (0x03 + 16-byte UUID +
+    /// 1-byte codec). Schema fetch routes through the named callback,
+    /// which is expected to call boto3's `GetSchemaVersion`.
+    Glue {
+        /// AWS region the registry lives in. Passed verbatim to the
+        /// lookup callback so it can target the right Glue endpoint.
+        region: String,
+        /// The Glue registry name. Doesn't influence the wire format
+        /// (the UUID is sufficient) but is supplied to the lookup
+        /// callback so audit / metrics paths can record it.
+        registry_name: String,
+        /// Name of the Python callback (registered via
+        /// [`crate::py_callbacks`]) that resolves a schema UUID to
+        /// its definition + format. Defaults to
+        /// `ematix_flow.glue_schema_registry.fetch_schema_by_uuid`
+        /// when callers don't override it.
+        schema_lookup_callback: String,
+    },
+}
+
+impl Default for SchemaRegistryKind {
+    fn default() -> Self {
+        Self::Confluent
+    }
+}
+
+impl SchemaRegistryKind {
+    /// True if this is the Glue variant. Used by hot-path dispatch to
+    /// skip a `match` step on the JSON / RawBytes producer/consumer
+    /// paths where the kind doesn't matter.
+    pub fn is_glue(&self) -> bool {
+        matches!(self, Self::Glue { .. })
+    }
 }
 
 impl std::fmt::Debug for ConsumerSession {
@@ -632,8 +702,29 @@ impl KafkaBackend {
             producer_session: Arc::new(Mutex::new(ProducerSession::default())),
             schema_registry_url: None,
             schema_registry_basic_auth: None,
+            schema_registry_kind: SchemaRegistryKind::Confluent,
+            glue_schema_cache: Arc::new(RwLock::new(HashMap::new())),
             message_key_column: None,
         })
+    }
+
+    /// Task #556: configure the Schema Registry wire-format
+    /// dispatch. Defaults to [`SchemaRegistryKind::Confluent`]; pass
+    /// [`SchemaRegistryKind::Glue`] when reading from a topic that
+    /// uses AWS Glue Schema Registry framing.
+    ///
+    /// Has no effect for `KafkaPayloadFormat::Json` /
+    /// `KafkaPayloadFormat::RawBytes` — those formats don't carry an
+    /// SR wire frame.
+    pub fn with_schema_registry_kind(mut self, kind: SchemaRegistryKind) -> Self {
+        self.schema_registry_kind = kind;
+        self
+    }
+
+    /// Borrow the active schema-registry kind. Returns
+    /// [`SchemaRegistryKind::Confluent`] when unset.
+    pub fn schema_registry_kind(&self) -> &SchemaRegistryKind {
+        &self.schema_registry_kind
     }
 
     /// Phase 40.2: configure a per-row message-key column. When
@@ -1406,6 +1497,10 @@ impl Backend for KafkaBackend {
             delivery_semantics: Some(self.delivery_semantics.clone()),
             schema_registry_url: self.schema_registry_url.clone(),
             schema_registry_basic_auth: self.schema_registry_basic_auth.clone(),
+            schema_registry_kind: match &self.schema_registry_kind {
+                SchemaRegistryKind::Confluent => None,
+                glue => Some(glue.clone()),
+            },
             message_key_column: self.message_key_column.clone(),
             batch_config: Some(self.batch_config),
         })
@@ -1487,11 +1582,18 @@ impl Backend for KafkaBackend {
         match self.payload_format {
             KafkaPayloadFormat::Json | KafkaPayloadFormat::RawBytes => {}
             KafkaPayloadFormat::Avro => {
-                if self.schema_registry_url.is_none() {
+                // Avro needs *some* SR — either a Confluent URL or a
+                // Glue registry. The Glue variant carries its own
+                // dispatch state on `schema_registry_kind`; the URL
+                // is the Confluent prerequisite.
+                if !self.schema_registry_kind.is_glue()
+                    && self.schema_registry_url.is_none()
+                {
                     return Err(BackendError::Other(
                         "Kafka read_arrow_stream Avro: schema_registry_url is \
                          required (call `with_schema_registry_url(...)` on the \
-                         backend before reading)"
+                         backend before reading, or pass \
+                         `with_schema_registry_kind(SchemaRegistryKind::Glue { .. })`)"
                             .into(),
                     ));
                 }
@@ -1542,10 +1644,29 @@ impl Backend for KafkaBackend {
         let batches = match self.payload_format {
             KafkaPayloadFormat::Json => decode_payloads_as_jsonl(payloads)?,
             KafkaPayloadFormat::RawBytes => decode_payloads_as_raw_bytes(payloads)?,
-            KafkaPayloadFormat::Avro => {
-                // schema_registry_url presence already validated above.
-                decode_payloads_as_avro(payloads, &self.sr_auth()?).await?
-            }
+            KafkaPayloadFormat::Avro => match &self.schema_registry_kind {
+                SchemaRegistryKind::Confluent => {
+                    // schema_registry_url presence already validated above.
+                    decode_payloads_as_avro(payloads, &self.sr_auth()?).await?
+                }
+                SchemaRegistryKind::Glue {
+                    region,
+                    registry_name,
+                    schema_lookup_callback,
+                } => {
+                    // Glue path: schema fetched via the named callback
+                    // (typically the Python boto3 wrapper). Cache
+                    // lives on the backend so a hot topic only pays
+                    // the network round-trip once per UUID.
+                    decode_payloads_as_glue_avro(
+                        payloads,
+                        region,
+                        registry_name,
+                        schema_lookup_callback,
+                        &self.glue_schema_cache,
+                    )?
+                }
+            },
             KafkaPayloadFormat::Protobuf => {
                 // schema_registry_url presence already validated above.
                 decode_payloads_as_protobuf(payloads, &self.sr_auth()?).await?
@@ -2304,6 +2425,162 @@ fn avro_value_to_json(value: &apache_avro::types::Value) -> serde_json::Value {
 /// converter caches per-id internally so a hot topic only pays the
 /// lookup once.
 ///
+/// Task #556: schema-fetch request payload sent from Rust to the
+/// Python callback that wraps boto3's `GetSchemaVersion`. JSON-
+/// encoded so it round-trips through the opaque `&[u8]` callback
+/// boundary in [`crate::py_callbacks`].
+///
+/// The response shape ([`GlueSchemaResponse`]) carries the schema
+/// text + data format the Python side returned.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct GlueSchemaRequest {
+    /// Schema-version UUID parsed from the Kafka message frame.
+    pub schema_uuid: String,
+    /// AWS region the Glue registry lives in. Mirrored from the
+    /// connection so the callback can target the right endpoint.
+    pub region: String,
+    /// Glue registry name. The lookup keys off `schema_uuid` but the
+    /// callback can record the registry name for audit / metrics.
+    pub registry_name: String,
+}
+
+/// Response shape from the Python Glue schema lookup. The Rust side
+/// converts `schema_definition` into a parsed
+/// [`apache_avro::Schema`] (for Avro payloads); future Protobuf
+/// support would similarly parse `schema_definition` as a `.proto`
+/// source via `protofish`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct GlueSchemaResponse {
+    /// "AVRO", "PROTOBUF", or "JSON". Mirrors the boto3
+    /// `DataFormat` field.
+    pub data_format: String,
+    /// The schema text — Avro JSON for AVRO, `.proto` source for
+    /// PROTOBUF, JSON Schema for JSON.
+    pub schema_definition: String,
+    /// Echoed back from the request so the cache key matches.
+    pub schema_uuid: String,
+}
+
+/// Decode a Vec of message payloads using AWS Glue Schema Registry
+/// framing.
+///
+/// Wire format: `0x03` + 16-byte UUID + 1-byte codec + payload.
+/// The schema corresponding to the UUID is fetched once per UUID
+/// via the [`crate::py_callbacks`] registry; subsequent messages
+/// using the same UUID are served out of `cache`.
+///
+/// The codec byte chooses how to decompress the payload before
+/// handing it to `apache_avro::from_avro_datum`:
+/// - [`GlueCodec::None`] — bytes are uncompressed Avro single-object.
+/// - [`GlueCodec::Zlib`] — Glue's optional `Z` (zlib) compression.
+///
+/// Returns the same Arrow shape as
+/// [`decode_payloads_as_avro`]: Avro values are converted to
+/// `serde_json::Value`, batched as JSONL, and run through the
+/// existing Arrow schema-inference path. Strict-typed Avro→Arrow
+/// builders are a future enhancement (matches the Confluent path's
+/// trade-off).
+pub fn decode_payloads_as_glue_avro(
+    payloads: Vec<Vec<u8>>,
+    region: &str,
+    registry_name: &str,
+    callback_name: &str,
+    cache: &Arc<RwLock<HashMap<uuid::Uuid, Arc<apache_avro::Schema>>>>,
+) -> Result<Vec<RecordBatch>, BackendError> {
+    use crate::glue_schema_registry::{GlueCodec, parse_glue_frame};
+
+    let mut json_payloads: Vec<Vec<u8>> = Vec::with_capacity(payloads.len());
+    for payload in payloads {
+        let frame = parse_glue_frame(&payload).map_err(|e| {
+            BackendError::Query(format!("kafka glue frame parse: {e}"))
+        })?;
+
+        // Decompress the payload if the codec byte says so. The
+        // None (0x00) case is what messages produced by the AWS SDK
+        // with default settings emit — and what LocalStack's Glue
+        // emulation produces too. The Zlib (0x05) path is rare in
+        // practice and intentionally deferred: it'd add a flate2
+        // dep just for compatibility with a niche producer setting.
+        // Surface a clear error so the user knows their producer
+        // needs ``compression_type=NONE`` for now.
+        let bytes: Vec<u8> = match frame.codec {
+            GlueCodec::None => frame.payload.to_vec(),
+            GlueCodec::Zlib => {
+                return Err(BackendError::Query(
+                    "kafka glue avro: zlib-compressed payload not yet supported \
+                     (set compression_type=NONE on the producer; zlib decode \
+                     is a follow-up)"
+                        .into(),
+                ));
+            }
+        };
+
+        // Cache lookup. The schema cache lives on the KafkaBackend
+        // so a hot topic only pays the boto3 round-trip once per
+        // schema version (not per message).
+        let schema_arc: Arc<apache_avro::Schema> = {
+            let cache_r = cache
+                .read()
+                .map_err(|_| BackendError::Other(
+                    "glue schema cache read lock poisoned".into(),
+                ))?;
+            cache_r.get(&frame.schema_uuid).cloned()
+        }
+        .ok_or(())
+        .or_else(|_| -> Result<Arc<apache_avro::Schema>, BackendError> {
+            // Cache miss — call into Python to resolve.
+            let req = GlueSchemaRequest {
+                schema_uuid: frame.schema_uuid.to_string(),
+                region: region.to_string(),
+                registry_name: registry_name.to_string(),
+            };
+            let req_bytes = serde_json::to_vec(&req).map_err(|e| {
+                BackendError::Other(format!("glue lookup request serialize: {e}"))
+            })?;
+            let resp_bytes = crate::py_callbacks::global()
+                .invoke(callback_name, &req_bytes)
+                .map_err(|e| BackendError::Query(format!("glue schema lookup: {e}")))?;
+            let resp: GlueSchemaResponse = serde_json::from_slice(&resp_bytes)
+                .map_err(|e| BackendError::Other(format!(
+                    "glue lookup response parse: {e}"
+                )))?;
+            if resp.data_format != "AVRO" {
+                return Err(BackendError::Query(format!(
+                    "glue schema UUID {} has data_format={:?}; only AVRO is wired \
+                     today (Protobuf / JSON Schema are future work)",
+                    frame.schema_uuid, resp.data_format,
+                )));
+            }
+            let parsed = apache_avro::Schema::parse_str(&resp.schema_definition)
+                .map_err(|e| BackendError::Query(format!(
+                    "glue avro schema parse for UUID {}: {e}", frame.schema_uuid,
+                )))?;
+            let arc = Arc::new(parsed);
+            let mut cache_w = cache
+                .write()
+                .map_err(|_| BackendError::Other(
+                    "glue schema cache write lock poisoned".into(),
+                ))?;
+            cache_w.insert(frame.schema_uuid, arc.clone());
+            Ok(arc)
+        })?;
+
+        // Decode the Avro single-object body against the resolved
+        // writer schema. We pass the writer schema as both writer and
+        // reader — schema-evolution-aware decoding is a future
+        // enhancement (would track per-consumer reader schemas).
+        let mut cursor = std::io::Cursor::new(&bytes);
+        let value = apache_avro::from_avro_datum(&schema_arc, &mut cursor, None)
+            .map_err(|e| BackendError::Query(format!("kafka glue avro decode: {e}")))?;
+        let json = avro_value_to_json(&value);
+        let json_bytes = serde_json::to_vec(&json).map_err(|e| {
+            BackendError::Other(format!("glue avro→json serialize: {e}"))
+        })?;
+        json_payloads.push(json_bytes);
+    }
+    decode_payloads_as_jsonl(json_payloads)
+}
+
 /// Decoded `protofish::decode::MessageValue`s are converted to
 /// `serde_json::Value`s using the schema-resolved field names, then
 /// concatenated as JSONL bytes; we then route through the existing
@@ -4061,5 +4338,216 @@ mod tests {
             .unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("admin tools"), "got: {msg}");
+    }
+
+    // -----------------------------------------------------------------
+    // Task #556 — Glue Schema Registry dispatch tests
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn schema_registry_kind_defaults_to_confluent() {
+        let b = KafkaBackend::open("localhost:9092", None).unwrap();
+        assert_eq!(b.schema_registry_kind(), &SchemaRegistryKind::Confluent);
+        assert!(!b.schema_registry_kind().is_glue());
+    }
+
+    #[test]
+    fn with_schema_registry_kind_sets_glue() {
+        let b = KafkaBackend::open("localhost:9092", None)
+            .unwrap()
+            .with_schema_registry_kind(SchemaRegistryKind::Glue {
+                region: "us-east-1".into(),
+                registry_name: "my-registry".into(),
+                schema_lookup_callback: "test_cb".into(),
+            });
+        assert!(b.schema_registry_kind().is_glue());
+    }
+
+    #[test]
+    fn glue_decode_calls_callback_and_caches_schema() {
+        use crate::glue_schema_registry::{GlueCodec, build_glue_frame};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use uuid::Uuid;
+
+        // Build a Glue-framed message with a known schema UUID +
+        // tiny Avro record (one int field, value=42).
+        let schema_text = r#"{"type":"record","name":"X","fields":[{"name":"i","type":"int"}]}"#;
+        let parsed = apache_avro::Schema::parse_str(schema_text).unwrap();
+        let mut record = apache_avro::types::Record::new(&parsed).unwrap();
+        record.put("i", 42i32);
+        let avro_bytes = apache_avro::to_avro_datum(&parsed, record).unwrap();
+
+        let uuid = Uuid::parse_str("12345678-1234-5678-1234-567812345678").unwrap();
+        let framed = build_glue_frame(uuid, GlueCodec::None, &avro_bytes);
+
+        // Register a callback that returns the schema text for that UUID.
+        // Count invocations so the cache assertion is meaningful.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_inner = calls.clone();
+        let cb: crate::py_callbacks::CallbackFn = Arc::new(move |req_bytes: &[u8]| {
+            calls_inner.fetch_add(1, Ordering::SeqCst);
+            let req: GlueSchemaRequest = serde_json::from_slice(req_bytes).unwrap();
+            assert_eq!(req.schema_uuid, "12345678-1234-5678-1234-567812345678");
+            assert_eq!(req.region, "us-east-1");
+            assert_eq!(req.registry_name, "my-registry");
+            let resp = GlueSchemaResponse {
+                data_format: "AVRO".into(),
+                schema_definition: r#"{"type":"record","name":"X","fields":[{"name":"i","type":"int"}]}"#.into(),
+                schema_uuid: req.schema_uuid,
+            };
+            Ok(serde_json::to_vec(&resp).unwrap())
+        });
+        // Register against the *global* registry — that's what
+        // decode_payloads_as_glue_avro reads. Use a unique callback
+        // name so this test doesn't collide with other tests.
+        crate::py_callbacks::global().register("test::glue_lookup_caches", cb);
+
+        let cache: Arc<RwLock<HashMap<Uuid, Arc<apache_avro::Schema>>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+
+        // First call: cache miss → callback fires once.
+        let batches = decode_payloads_as_glue_avro(
+            vec![framed.clone()],
+            "us-east-1",
+            "my-registry",
+            "test::glue_lookup_caches",
+            &cache,
+        )
+        .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].num_rows(), 1);
+
+        // Second call with the same UUID: cache hit → no extra callback.
+        let _ = decode_payloads_as_glue_avro(
+            vec![framed.clone()],
+            "us-east-1",
+            "my-registry",
+            "test::glue_lookup_caches",
+            &cache,
+        )
+        .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // Cleanup so the global registry doesn't leak to other tests.
+        crate::py_callbacks::global().unregister("test::glue_lookup_caches");
+    }
+
+    #[test]
+    fn glue_decode_rejects_non_avro_data_format() {
+        use crate::glue_schema_registry::{GlueCodec, build_glue_frame};
+        use std::sync::Arc;
+        use uuid::Uuid;
+
+        let uuid = Uuid::new_v4();
+        let framed = build_glue_frame(uuid, GlueCodec::None, b"ignored");
+        let cb: crate::py_callbacks::CallbackFn = Arc::new(|req_bytes: &[u8]| {
+            let req: GlueSchemaRequest = serde_json::from_slice(req_bytes).unwrap();
+            let resp = GlueSchemaResponse {
+                data_format: "PROTOBUF".into(),
+                schema_definition: "".into(),
+                schema_uuid: req.schema_uuid,
+            };
+            Ok(serde_json::to_vec(&resp).unwrap())
+        });
+        crate::py_callbacks::global().register("test::glue_lookup_protobuf", cb);
+
+        let cache: Arc<RwLock<HashMap<Uuid, Arc<apache_avro::Schema>>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+
+        let err = decode_payloads_as_glue_avro(
+            vec![framed],
+            "us-east-1",
+            "r",
+            "test::glue_lookup_protobuf",
+            &cache,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("PROTOBUF") || err.to_string().contains("AVRO"),
+            "got: {err}",
+        );
+
+        crate::py_callbacks::global().unregister("test::glue_lookup_protobuf");
+    }
+
+    #[test]
+    fn glue_decode_surfaces_missing_callback() {
+        use crate::glue_schema_registry::{GlueCodec, build_glue_frame};
+        use std::sync::Arc;
+        use uuid::Uuid;
+
+        let uuid = Uuid::new_v4();
+        let framed = build_glue_frame(uuid, GlueCodec::None, b"x");
+        let cache: Arc<RwLock<HashMap<Uuid, Arc<apache_avro::Schema>>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+
+        let err = decode_payloads_as_glue_avro(
+            vec![framed],
+            "us-east-1",
+            "r",
+            "test::nonexistent_callback_for_glue_decode",
+            &cache,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("schema lookup"),
+            "got: {err}",
+        );
+    }
+
+    #[test]
+    fn glue_decode_rejects_zlib_codec_with_clear_message() {
+        use crate::glue_schema_registry::{GlueCodec, build_glue_frame};
+        use std::sync::Arc;
+        use uuid::Uuid;
+
+        let uuid = Uuid::new_v4();
+        // Build a Zlib-framed message (codec byte = 0x05). Decompression
+        // is deferred to a follow-up; we just need a useful error.
+        let framed = build_glue_frame(uuid, GlueCodec::Zlib, b"compressed");
+        let cache: Arc<RwLock<HashMap<Uuid, Arc<apache_avro::Schema>>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+
+        let err = decode_payloads_as_glue_avro(
+            vec![framed],
+            "us-east-1",
+            "r",
+            "any-name",
+            &cache,
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("zlib"), "got: {msg}");
+        assert!(msg.contains("compression_type=NONE"), "got: {msg}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn avro_read_skips_sr_url_check_when_glue_kind_set() {
+        // Schema-registry-URL check must be bypassed for the Glue
+        // path — the URL is meaningless when using Glue's IAM-backed
+        // GetSchemaVersion. We can't actually drain a broker here,
+        // but the validation block fires before broker IO, so a
+        // dispatch error means we made it past that gate.
+        let b = KafkaBackend::open("localhost:9092", Some("g")).unwrap()
+            .with_payload_format(KafkaPayloadFormat::Avro)
+            .with_schema_registry_kind(SchemaRegistryKind::Glue {
+                region: "us-east-1".into(),
+                registry_name: "r".into(),
+                schema_lookup_callback: "cb".into(),
+            });
+        // No `with_schema_registry_url` — Confluent path would reject.
+        // We expect either a successful drain attempt (in which case
+        // the broker connection will fail with a different error) or
+        // no SR-URL gate complaint. The test just confirms the gate
+        // path didn't emit its specific error string.
+        let result = b.read_arrow_stream("test-topic").await;
+        if let Err(e) = result {
+            assert!(
+                !e.to_string().contains("schema_registry_url is"),
+                "Glue path should not require schema_registry_url; got: {e}",
+            );
+        }
     }
 }

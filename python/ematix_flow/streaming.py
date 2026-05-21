@@ -63,6 +63,7 @@ from ematix_flow.connections import (
     DeltaLocalConnection,
     DeltaS3Connection,
     DuckDBConnection,
+    GlueSchemaRegistryConnection,
     KafkaConnection,
     KinesisConnection,
     MySQLConnection,
@@ -1375,14 +1376,17 @@ def _emit_targets_array_entry(spec: Target) -> list[str]:
 
 def _resolve_kafka_schema_registry(
     conn: KafkaConnection,
-) -> SchemaRegistryConnection | None:
+) -> SchemaRegistryConnection | GlueSchemaRegistryConnection | None:
     """Π.1: collapse ``KafkaConnection.schema_registry`` (typed) and
     ``schema_registry_url`` (legacy inline) into a single resolved
-    ``SchemaRegistryConnection``, or ``None`` if SR isn't configured.
+    connection, or ``None`` if SR isn't configured.
 
     Mutual exclusion is checked at dataclass construction time. A
     string in ``schema_registry`` is treated as a registered SR
-    name; a missing registration raises ``KeyError``.
+    name; a missing registration raises ``KeyError``. The resolved
+    object may be either ``SchemaRegistryConnection`` (Confluent /
+    Apicurio wire format) or ``GlueSchemaRegistryConnection`` (AWS
+    Glue wire format); the caller dispatches on type.
     """
     if conn.schema_registry is None and conn.schema_registry_url is None:
         return None
@@ -1390,11 +1394,14 @@ def _resolve_kafka_schema_registry(
         sr = conn.schema_registry
         if isinstance(sr, str):
             resolved = get_connection(sr)
-            if not isinstance(resolved, SchemaRegistryConnection):
+            if not isinstance(
+                resolved,
+                (SchemaRegistryConnection, GlueSchemaRegistryConnection),
+            ):
                 raise TypeError(
                     f"KafkaConnection({conn.name!r}).schema_registry={sr!r} "
                     f"resolved to a {type(resolved).__name__}, not "
-                    "SchemaRegistryConnection"
+                    "SchemaRegistryConnection or GlueSchemaRegistryConnection"
                 )
             return resolved
         return sr
@@ -1421,6 +1428,25 @@ def _kafka_payload_and_sr_lines(
         out.append(f"auto_offset_reset = {_q(conn.auto_offset_reset)}")
     sr = _resolve_kafka_schema_registry(conn)
     if sr is None:
+        return out
+    if isinstance(sr, GlueSchemaRegistryConnection):
+        # Task #556: Glue dispatch — emit `schema_registry_kind` as a
+        # TOML inline table so the Rust side parses it into the
+        # `SchemaRegistryKind::Glue { .. }` variant. No
+        # `schema_registry_url` for the Glue path (the URL is
+        # implicit in the IAM-backed Glue API endpoint).
+        from ematix_flow.glue_schema_registry import (
+            GLUE_SCHEMA_LOOKUP_CALLBACK,
+        )
+        out.append(
+            "schema_registry_kind = "
+            "{ kind = \"glue\", "
+            f"region = {_q(_resolve_required(sr.region, 'region'))}, "
+            "registry_name = "
+            f"{_q(_resolve_required(sr.registry_name, 'registry_name'))}, "
+            f"schema_lookup_callback = {_q(GLUE_SCHEMA_LOOKUP_CALLBACK)}"
+            " }"
+        )
         return out
     out.append(
         f"schema_registry_url = {_q(_resolve_required(sr.url, 'url'))}"
