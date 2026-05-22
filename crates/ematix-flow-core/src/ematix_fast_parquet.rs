@@ -2158,6 +2158,17 @@ fn build_streaming_partition_stream(
                 .with_parallelism_budget(parallelism_budget);
             if let Some(f) = filter.clone() {
                 builder = builder.with_filter(f, path_buf.clone());
+            } else if let Some(cache) =
+                crate::emat_arrow_reader::process_rg_decode_cache()
+            {
+                // Σ.O.c.2 — wire process-wide RG decode cache (off by
+                // default; opt-in via `EMAT_RG_DECODE_CACHE=1`). Only
+                // attached when no filter is set; filter outputs are
+                // mask-specific and not safely shareable. `with_path`
+                // is required so the cache key is file-scoped.
+                builder = builder
+                    .with_path(path_buf.clone())
+                    .with_rg_decode_cache(cache);
             }
             let reader = match builder.build() {
                 Ok(r) => r,

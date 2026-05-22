@@ -199,6 +199,55 @@ impl Default for RowGroupDecodeCache {
     }
 }
 
+// Σ.O.c.2 — process-wide row-group decode cache slot. Settable at
+// runtime via `set_process_rg_decode_cache`. Default reads
+// `EMAT_RG_DECODE_CACHE=1` on first lookup (and `EMAT_RG_DECODE_CACHE_
+// BYTES=<n>` overrides the default 1 GiB cap).
+//
+// `RwLock` is used so the hot-path lookup (in provider wire-up) is
+// shared-read; only install/uninstall takes the write lock.
+static PROCESS_RG_DECODE_CACHE: std::sync::OnceLock<
+    std::sync::RwLock<Option<std::sync::Arc<RowGroupDecodeCache>>>,
+> = std::sync::OnceLock::new();
+
+fn process_rg_decode_cache_slot()
+-> &'static std::sync::RwLock<Option<std::sync::Arc<RowGroupDecodeCache>>> {
+    PROCESS_RG_DECODE_CACHE.get_or_init(|| {
+        let initial = {
+            let enabled = std::env::var("EMAT_RG_DECODE_CACHE")
+                .ok()
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+            if enabled {
+                let cap = std::env::var("EMAT_RG_DECODE_CACHE_BYTES")
+                    .ok()
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(1024 * 1024 * 1024);
+                Some(std::sync::Arc::new(
+                    RowGroupDecodeCache::with_capacity_bytes(cap),
+                ))
+            } else {
+                None
+            }
+        };
+        std::sync::RwLock::new(initial)
+    })
+}
+
+/// Σ.O.c.2 — read the current process-wide RG decode cache, if one is
+/// installed. Returned as `Option<Arc<...>>` so callers wire it into
+/// builders without branching on env each call.
+pub fn process_rg_decode_cache() -> Option<std::sync::Arc<RowGroupDecodeCache>> {
+    process_rg_decode_cache_slot().read().unwrap().clone()
+}
+
+/// Σ.O.c.2 — install (or uninstall, with `None`) the process-wide RG
+/// decode cache. Bench-friendly: lets a single process compare
+/// rep-progression with cache off vs on without re-execing.
+pub fn set_process_rg_decode_cache(cache: Option<std::sync::Arc<RowGroupDecodeCache>>) {
+    *process_rg_decode_cache_slot().write().unwrap() = cache;
+}
+
 fn estimate_columns_bytes(cols: &[DecodedColumn]) -> usize {
     cols.iter()
         .map(|c| match c {
@@ -402,6 +451,15 @@ impl EmatArrowBatchReaderBuilder {
         cache: std::sync::Arc<RowGroupDecodeCache>,
     ) -> Self {
         self.rg_decode_cache = Some(cache);
+        self
+    }
+
+    /// Σ.O.c.2 — set the source file path so the RG decode cache key
+    /// can include it. `with_filter` already sets this; callers using
+    /// only `with_rg_decode_cache` (no filter) need to set it
+    /// explicitly so cache hits are scoped to the right file.
+    pub fn with_path(mut self, path: std::path::PathBuf) -> Self {
+        self.path = Some(path);
         self
     }
 
