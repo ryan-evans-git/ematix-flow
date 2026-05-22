@@ -1757,6 +1757,13 @@ impl EmatixFastParquetExec {
     pub fn projection(&self) -> &[usize] {
         &self.projection
     }
+
+    /// Σ.J.2.b.vi — backing parquet file path. Used by the
+    /// `EnableContextBloomRule` to compute the `<table>.<col>` uuid
+    /// (where `<table>` is the file basename without extension).
+    pub fn path(&self) -> &str {
+        &self.path
+    }
 }
 
 impl DisplayAs for EmatixFastParquetExec {

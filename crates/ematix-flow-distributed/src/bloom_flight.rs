@@ -40,6 +40,7 @@
 //! vs `table_name-col` etc.) and surviving plan rewrites — separate
 //! design. This bite ships the transport so the rule has a target.
 
+pub use ematix_flow_core::bloom::ContextBlooms;
 use ematix_flow_core::bloom::{
     blooms_to_header_pairs, header_pairs_to_blooms, BloomFilter,
     FLIGHT_BLOOM_HEADER_PREFIX,
@@ -102,50 +103,18 @@ pub fn header_map_to_blooms(headers: &HeaderMap) -> Vec<(String, BloomFilter)> {
     header_pairs_to_blooms(pairs)
 }
 
-/// Σ.J.2.b.v — `SessionState` extension type. Probe-side workers
-/// populate this from inbound passthrough headers. The downstream
-/// optimizer rule looks up blooms by `column_uuid` keyed on whatever
-/// stable scheme the join planner uses on the build side.
-///
-/// Wrapped in an `Arc` because DataFusion's extension store
-/// requires `Send + Sync + 'static`.
-#[derive(Debug, Default, Clone)]
-pub struct ContextBlooms {
-    inner: Arc<HashMap<String, Arc<BloomFilter>>>,
-}
-
-impl ContextBlooms {
-    pub fn new(blooms: HashMap<String, Arc<BloomFilter>>) -> Self {
-        Self {
-            inner: Arc::new(blooms),
-        }
-    }
-
-    /// Build from inbound headers.
-    pub fn from_headers(headers: &HeaderMap) -> Self {
-        let decoded = header_map_to_blooms(headers);
-        let map: HashMap<String, Arc<BloomFilter>> = decoded
-            .into_iter()
-            .map(|(uuid, bloom)| (uuid, Arc::new(bloom)))
-            .collect();
-        Self::new(map)
-    }
-
-    pub fn get(&self, column_uuid: &str) -> Option<&Arc<BloomFilter>> {
-        self.inner.get(column_uuid)
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.inner.is_empty()
-    }
-
-    pub fn len(&self) -> usize {
-        self.inner.len()
-    }
-
-    pub fn keys(&self) -> impl Iterator<Item = &str> {
-        self.inner.keys().map(|s| s.as_str())
-    }
+/// Σ.J.2.b.v — build a [`ContextBlooms`] (defined in core) from
+/// inbound passthrough HTTP headers. Probe-side workers call this
+/// in their `WorkerQueryContext` `build_state` callback so the
+/// per-request SessionState carries the right blooms for
+/// [`ematix_flow_core::context_bloom_rule::EnableContextBloomRule`].
+pub fn context_blooms_from_headers(headers: &HeaderMap) -> ContextBlooms {
+    let decoded = header_map_to_blooms(headers);
+    let map: HashMap<String, Arc<BloomFilter>> = decoded
+        .into_iter()
+        .map(|(uuid, bloom)| (uuid, Arc::new(bloom)))
+        .collect();
+    ContextBlooms::new(map)
 }
 
 #[cfg(test)]
@@ -187,10 +156,10 @@ mod tests {
     }
 
     #[test]
-    fn context_blooms_from_headers() {
+    fn context_blooms_from_headers_fn() {
         let a = mk_bloom(&[42]);
         let map = blooms_to_header_map(&[("test_uuid".into(), &a)]);
-        let ctx_blooms = ContextBlooms::from_headers(&map);
+        let ctx_blooms = context_blooms_from_headers(&map);
         assert_eq!(ctx_blooms.len(), 1);
         let bloom = ctx_blooms.get("test_uuid").expect("uuid present");
         assert!(bloom.might_contain_i64(42));
@@ -220,7 +189,7 @@ mod tests {
         assert!(map.is_empty());
         let decoded = header_map_to_blooms(&map);
         assert!(decoded.is_empty());
-        let ctx = ContextBlooms::from_headers(&map);
+        let ctx = context_blooms_from_headers(&map);
         assert!(ctx.is_empty());
     }
 }

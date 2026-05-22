@@ -159,6 +159,12 @@ pub mod robin_hood_agg;
 // chain — opt-in only via install_robin_hood_rule(state_builder) to
 // avoid the codegen tax recorded in optimizer-codegen-sensitivity.
 pub mod robin_hood_agg_rule;
+// Σ.J.2.b.vi (2026-05-22): per-request PhysicalOptimizerRule that
+// walks the plan, finds EmatixFastParquetExec scans whose
+// `<table>.<col>` uuid matches a build-side bloom in ContextBlooms,
+// and wraps them in BloomFilterExec. Closes the probe-side half of
+// the distributed bloom flow; build-side emitter is Σ.J.2.b.vii.
+pub mod context_bloom_rule;
 // Σ.O (2026-05-21): in-memory LRU cache of decoded RecordBatch by
 // (file_path, row_group_idx, projection_hash). Avoids re-decoding
 // the same parquet column chunks across queries in the same session.

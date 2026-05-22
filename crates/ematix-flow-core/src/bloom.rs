@@ -215,6 +215,66 @@ impl BloomFilter {
 /// to pick up build-side blooms shipped by the coordinator.
 pub const FLIGHT_BLOOM_HEADER_PREFIX: &str = "x-ematix-bloom-";
 
+/// Σ.J.2.b.vi — per-request, probe-side bag of `(column_uuid →
+/// BloomFilter)`. Constructed once per inbound query, then handed to
+/// [`crate::context_bloom_rule::EnableContextBloomRule`] which wraps
+/// matching scans in [`BloomFilterExec`] before execution.
+///
+/// **The uuid scheme is `<table>.<column>` (both lowercase).** For
+/// path-based parquet scans, `table` is the file basename without
+/// extension (e.g. `lineitem.parquet` → `lineitem.l_orderkey`).
+/// Identical strings on build + probe side are how the two halves
+/// match up — both compute the uuid from the same scheme.
+///
+/// Storage-only; the http-bound `from_headers` constructor lives in
+/// `ematix-flow-distributed::bloom_flight` so this crate stays
+/// http-dep-free.
+#[derive(Debug, Default, Clone)]
+pub struct ContextBlooms {
+    inner: std::sync::Arc<std::collections::HashMap<String, std::sync::Arc<BloomFilter>>>,
+}
+
+impl ContextBlooms {
+    pub fn new(
+        blooms: std::collections::HashMap<String, std::sync::Arc<BloomFilter>>,
+    ) -> Self {
+        Self {
+            inner: std::sync::Arc::new(blooms),
+        }
+    }
+
+    pub fn get(&self, column_uuid: &str) -> Option<&std::sync::Arc<BloomFilter>> {
+        self.inner.get(column_uuid)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.inner.len()
+    }
+
+    pub fn keys(&self) -> impl Iterator<Item = &str> {
+        self.inner.keys().map(|s| s.as_str())
+    }
+}
+
+/// Σ.J.2.b.vi — canonical column-uuid for the bloom keying scheme.
+/// `table` is normalised to lowercase; same for `column`. This is the
+/// string both build and probe sides hash on.
+pub fn column_uuid(table: &str, column: &str) -> String {
+    let mut s = String::with_capacity(table.len() + 1 + column.len());
+    for c in table.chars() {
+        s.extend(c.to_lowercase());
+    }
+    s.push('.');
+    for c in column.chars() {
+        s.extend(c.to_lowercase());
+    }
+    s
+}
+
 /// Σ.J.2.b.v — gRPC max header value size. Standard tonic / nginx /
 /// envoy default is ~8 KiB per header value. To leave room for
 /// framing + chunking, we cap a single bloom header at 6 KiB hex
