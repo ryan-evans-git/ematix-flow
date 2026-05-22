@@ -120,12 +120,10 @@ pub mod dict_routing;
 // ~100 queries on a workload, decisions converge and the probe runs
 // at most once per new shape.
 pub mod workload_log;
-// Σ.L.3 (2026-05-21): adaptive predicate reordering across row groups.
-// Tracks observed pass-rate per filter predicate after each row group;
-// reorders the remaining filter chain by ascending selectivity (cheapest
-// + most selective first). Cheap runtime adaptation; no plan rule, no
-// persistence — pure per-query state.
-pub mod adaptive_filter;
+// Σ.L.3 retired (2026-05-22): adaptive predicate reordering experiment
+// rejected by triangulation bench. Kernel-bench 0.64× on isolated Q06
+// didn't translate to wall-time at SF=1 or SF=10. See
+// `project_sigma_l3c_deleted.md` for the full bench-driven rationale.
 // Σ.L.4 (2026-05-21): cross-query scan-cache framing. When two
 // concurrent queries scan the same (file, row_group, projection,
 // filter), they share a single decoded handle instead of decoding

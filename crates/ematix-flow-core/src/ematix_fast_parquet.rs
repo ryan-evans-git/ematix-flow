@@ -70,18 +70,6 @@ pub struct BridgeFilter {
     /// (high-sel) and serial-bitmap+masked-decode (low-sel) paths.
     /// 0.5 = unknown (no stats), conservative default.
     predicted_pass_rate: f64,
-    /// Σ.L.3.b: opt-in adaptive filter reordering. When set, the
-    /// streaming reader records (rows_in, rows_out) per predicate per
-    /// row group; after WARMUP_ROW_GROUPS the predicates' apply order
-    /// is sorted by ascending pass-rate (most-selective first).
-    ///
-    /// Today's `build_bitmap` builds all bitmaps in parallel and ANDs
-    /// them — reordering doesn't change the CPU work. The wire-in
-    /// here makes the data structure available for the follow-up
-    /// refactor that switches the hot path to sequential masked-decode
-    /// with the cheapest+most-selective predicate gating subsequent
-    /// columns' decode. See [[sigma-l-adaptive-runtime]].
-    adaptive: Option<std::sync::Arc<std::sync::Mutex<crate::adaptive_filter::AdaptiveFilterOrder>>>,
 }
 
 impl BridgeFilter {
@@ -92,7 +80,6 @@ impl BridgeFilter {
         Self {
             predicates,
             predicted_pass_rate: 0.5,
-            adaptive: None,
         }
     }
 
@@ -129,54 +116,6 @@ impl BridgeFilter {
         self.predicted_pass_rate
     }
 
-    /// Σ.L.3.b — opt into adaptive predicate reordering. Once
-    /// [`crate::adaptive_filter::WARMUP_ROW_GROUPS`] row groups have
-    /// been observed, [`Self::applied_order`] returns predicate
-    /// indices sorted by ascending observed pass-rate (most-selective
-    /// first). Callers thread the observed (rows_in, rows_out) back
-    /// via [`Self::observe_row_group`].
-    ///
-    /// Note: the current `build_bitmap` ANDs all per-predicate
-    /// bitmaps in parallel, so reorder is information-only until a
-    /// follow-up refactor adopts sequential masked-decode. The data
-    /// structure ships now so that refactor's wire-in is trivial.
-    pub fn with_adaptive_reordering(mut self) -> Self {
-        let order = crate::adaptive_filter::AdaptiveFilterOrder::new(self.predicates.len());
-        self.adaptive = Some(std::sync::Arc::new(std::sync::Mutex::new(order)));
-        self
-    }
-
-    /// Σ.L.3.b — record per-predicate (rows_in, rows_out) for one row
-    /// group. No-op when adaptive reordering wasn't enabled. Indices
-    /// in `samples` follow PLAN order (i.e., `self.predicates()`
-    /// order); the AdaptiveFilterOrder internally rebases.
-    pub fn observe_row_group(&self, samples_in_plan_order: &[(u64, u64)]) {
-        if let Some(adaptive) = &self.adaptive {
-            adaptive
-                .lock()
-                .unwrap()
-                .observe_row_group(samples_in_plan_order);
-        }
-    }
-
-    /// Σ.L.3.b — predicate indices in the order the caller should
-    /// apply them. Plan order if adaptive is off, else
-    /// selectivity-sorted post-warmup.
-    pub fn applied_order(&self) -> Vec<usize> {
-        if let Some(adaptive) = &self.adaptive {
-            adaptive.lock().unwrap().current_order().to_vec()
-        } else {
-            (0..self.predicates.len()).collect()
-        }
-    }
-
-    /// Σ.L.3.b — selectivity snapshot for telemetry / Σ.L.2 workload
-    /// log writes. `None` if adaptive is off.
-    pub fn observed_selectivities(&self) -> Option<Vec<(usize, f64)>> {
-        self.adaptive
-            .as_ref()
-            .map(|a| a.lock().unwrap().selectivities_in_current_order())
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -393,102 +332,6 @@ impl BridgeFilter {
         })
     }
 
-    /// Σ.L.3.c.3 — auto-pick: should we run the sequential-AND path
-    /// instead of the parallel-AND path? Engages only when adaptive
-    /// reordering is enabled AND the predicted cumulative pass-rate
-    /// is low (≤30%), where sequential's masked-decode win
-    /// outweighs the loss of inter-predicate parallelism.
-    pub fn should_use_sequential(&self) -> bool {
-        self.adaptive.is_some()
-            && self.predicates.len() >= 2
-            && self.predicted_pass_rate <= 0.30
-    }
-
-    /// Σ.L.3.c.2 — sequential masked-AND variant of build_bitmap.
-    /// Applies predicates in [`Self::applied_order`] order. The first
-    /// predicate decodes its column fully; each subsequent predicate
-    /// uses the accumulated bitmap as a decode mask, skipping rows
-    /// already eliminated.
-    ///
-    /// **Scope of tonight's landing:** the simple predicate types
-    /// (I32Range, I32In, F64Range, StringEq) take the masked path.
-    /// Unsupported types (LIKE, StringIn, StringNotEq,
-    /// I32ColumnPair) fall through to the existing parallel path
-    /// via a return of `None` — caller treats this as "use
-    /// build_bitmap" instead.
-    ///
-    /// Returns `Ok(Some(...))` if all predicates supported,
-    /// `Ok(None)` if any predicate isn't yet supported in sequential
-    /// mode (caller should fall back to [`Self::build_bitmap`]).
-    pub fn build_bitmap_sequential(
-        &self,
-        path: &std::path::Path,
-        rg: usize,
-    ) -> DfResult<Option<(Vec<u8>, usize)>> {
-        use crate::ematix_parquet_bridge::{
-            filter_byte_array_masked, filter_byte_array_to_bitmap_dense,
-            filter_f64_column_masked, filter_f64_column_to_bitmap_dense,
-            filter_i32_column_masked, filter_i32_column_to_bitmap_dense,
-        };
-        let order = self.applied_order();
-        let mut acc: Option<(Vec<u8>, usize)> = None;
-        for &idx in &order {
-            let p = &self.predicates[idx];
-            // Determine column index (needed for masked variant).
-            let col = p.col_idx();
-            let (bitmap, total) = match (p, &acc) {
-                // First predicate (no accumulated mask): full decode.
-                (ColumnPredicate::I32Range { .. } | ColumnPredicate::I32In { .. }, None) => {
-                    let pc = p.clone();
-                    let file = ematix_parquet_io::ParquetFile::open(path).map_err(|e| {
-                        DataFusionError::External(format!("ParquetFile::open: {e}").into())
-                    })?;
-                    filter_i32_column_to_bitmap_dense(&file, rg, col, move |v: i32| {
-                        pc.eval_i32(v)
-                    })?
-                }
-                (ColumnPredicate::F64Range { .. }, None) => {
-                    let pc = p.clone();
-                    filter_f64_column_to_bitmap_dense(path, rg, col, move |v: f64| pc.eval_f64(v))?
-                }
-                (ColumnPredicate::StringEq { value, .. }, None) => {
-                    let needle = value.clone();
-                    filter_byte_array_to_bitmap_dense(path, rg, col, move |v: &[u8]| {
-                        v == needle.as_bytes()
-                    })?
-                }
-                // Subsequent predicates: use mask.
-                (
-                    ColumnPredicate::I32Range { .. } | ColumnPredicate::I32In { .. },
-                    Some((mask, total)),
-                ) => {
-                    let pc = p.clone();
-                    let file = ematix_parquet_io::ParquetFile::open(path).map_err(|e| {
-                        DataFusionError::External(format!("ParquetFile::open: {e}").into())
-                    })?;
-                    filter_i32_column_masked(&file, rg, col, mask, *total, move |v: i32| {
-                        pc.eval_i32(v)
-                    })?
-                }
-                (ColumnPredicate::F64Range { .. }, Some((mask, total))) => {
-                    let pc = p.clone();
-                    filter_f64_column_masked(path, rg, col, mask, *total, move |v: f64| {
-                        pc.eval_f64(v)
-                    })?
-                }
-                (ColumnPredicate::StringEq { value, .. }, Some((mask, total))) => {
-                    let needle = value.clone();
-                    filter_byte_array_masked(path, rg, col, mask, *total, move |v: &[u8]| {
-                        v == needle.as_bytes()
-                    })?
-                }
-                // Unsupported predicate type — caller falls back.
-                _ => return Ok(None),
-            };
-            acc = Some((bitmap, total));
-        }
-        Ok(acc.map(|x| x))
-    }
 }
 
 impl ColumnPredicate {
@@ -1097,7 +940,6 @@ fn extract_bridge_filter(
     Some(BridgeFilter {
         predicates: merged,
         predicted_pass_rate: 0.5,
-        adaptive: None,
     })
 }
 
@@ -1621,54 +1463,7 @@ impl TableProvider for EmatixFastParquetTableProvider {
                 // parallel-bitmap+dense (high-sel) vs serial-
                 // bitmap+masked (low-sel).
                 let p = bf.estimate_pass_rate(&self.column_stats);
-                // Σ.L.3.c: enable adaptive reordering on multi-
-                // predicate filters. The reader observes per-RG
-                // pass-rates and reorders. `should_use_sequential()`
-                // then picks the Σ.L.3.c sequential masked-AND path
-                // when predicted_pass_rate ≤ 0.30. Bench-gate on Q06
-                // shape (3 preds, ~2% pass) showed 0.64× wall-time
-                // (35% win); see `adaptive_filter_q06_gate` example.
-                let mut bf = bf.with_predicted_pass_rate(p);
-                // Σ.L.3.c — adaptive reordering is opt-in via env after
-                // bench A/B (2026-05-22): default-on regressed geomean
-                // by 16.8% vs v0.4.0 baseline (Q22 +2.94×, Q06 +1.52×,
-                // Q07/Q10/Q17/Q18 +25-32%). Tight 5% gate recovered
-                // geomean but still regressed Q06 by 12%. The kernel
-                // bench (0.64× on isolated build_bitmap_sequential)
-                // didn't predict wall-time outcomes: at SF=1, sequential
-                // serial decode loses to parallel-AND because (a)
-                // single-threaded predicate eval starves downstream
-                // 14-partition Aggregate, (b) decode is microseconds
-                // per column already, (c) masked-decode per-row branch
-                // cost > saved row work above ~5% mask density.
-                //
-                // The lever stays in the codebase (kernel + dispatch
-                // wired) for workloads where it CAN win: SF=10+, wide
-                // tables, very-selective (<0.1%) filters, slow-decode
-                // codecs. Σ.L.3.d ("parallel masked-AND with short-
-                // circuit") is the proper fix that captures the benefit
-                // without serialising decode — deferred.
-                //
-                // Set `EMAT_ADAPTIVE_REORDER=1` to opt back in. Set
-                // `EMAT_ADAPTIVE_REORDER_TRACE=1` to log when installed.
-                let adaptive_enabled = std::env::var("EMAT_ADAPTIVE_REORDER")
-                    .ok()
-                    .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-                    .unwrap_or(false);
-                if adaptive_enabled
-                    && bf.predicates().len() >= 2
-                    && bf.predicted_pass_rate() <= 0.05
-                {
-                    if std::env::var("EMAT_ADAPTIVE_REORDER_TRACE").is_ok() {
-                        eprintln!(
-                            "[adaptive] install: preds={} pass_rate={:.4}",
-                            bf.predicates().len(),
-                            bf.predicted_pass_rate()
-                        );
-                    }
-                    bf = bf.with_adaptive_reordering();
-                }
-                bf
+                bf.with_predicted_pass_rate(p)
             });
 
         // Project the per-column stats so the Exec reports stats in
