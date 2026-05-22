@@ -73,6 +73,151 @@ use ematix_parquet_io::{PageWalker, ParquetFile};
 /// `DEFAULT_BATCH_SIZE` and DataFusion's pipelining sweet spot.
 pub const DEFAULT_BATCH_SIZE: usize = 65_536;
 
+// ---------------------------------------------------------------------
+// Σ.O.c.1 — Private row-group decode cache.
+//
+// Stores `Vec<DecodedColumn>` per (file_path, row_group_idx, projection)
+// so repeated scans across queries skip parquet decode work. Uses Arc-
+// shared Arrow Buffers internally — clone is O(projection_count)
+// pointer copies, not a data copy.
+//
+// Σ.O.c bench data (project-3 cols, fresh ctx per rep): first-rep 45ms
+// → rep 2-5 36ms (warm OS cache). With this cache: rep 2-5 → ≪1ms
+// (no decode at all).
+//
+// Filter mode (BridgeFilter set) BYPASSES the cache because the decode
+// output is row-mask-specific.
+// ---------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct RgCacheKey {
+    pub(crate) file_path: std::path::PathBuf,
+    pub(crate) row_group_idx: usize,
+    /// Sorted leaf indices into the parquet column order. Order-
+    /// independent equality.
+    pub(crate) projection: Vec<usize>,
+}
+
+/// Σ.O.c.1 — process-shared cache of decoded row-group columns.
+/// Thread-safe; share an `Arc<RowGroupDecodeCache>` across reader
+/// instances to amortise decode across queries.
+pub struct RowGroupDecodeCache {
+    inner: std::sync::Mutex<RgInner>,
+    capacity_bytes: usize,
+}
+
+struct RgInner {
+    entries: std::collections::HashMap<RgCacheKey, RgEntry>,
+    insertion_order: Vec<RgCacheKey>,
+    bytes_used: usize,
+    hits: u64,
+    misses: u64,
+}
+
+struct RgEntry {
+    columns: std::sync::Arc<Vec<DecodedColumn>>,
+    bytes: usize,
+}
+
+impl RowGroupDecodeCache {
+    /// Default cap 1 GiB.
+    pub fn new() -> Self {
+        Self::with_capacity_bytes(1024 * 1024 * 1024)
+    }
+
+    pub fn with_capacity_bytes(capacity_bytes: usize) -> Self {
+        Self {
+            inner: std::sync::Mutex::new(RgInner {
+                entries: std::collections::HashMap::new(),
+                insertion_order: Vec::new(),
+                bytes_used: 0,
+                hits: 0,
+                misses: 0,
+            }),
+            capacity_bytes,
+        }
+    }
+
+    pub(crate) fn get(&self, key: &RgCacheKey) -> Option<std::sync::Arc<Vec<DecodedColumn>>> {
+        let mut inner = self.inner.lock().unwrap();
+        let cloned = inner.entries.get(key).map(|e| e.columns.clone());
+        if cloned.is_some() {
+            inner.hits += 1;
+        } else {
+            inner.misses += 1;
+        }
+        cloned
+    }
+
+    pub(crate) fn insert(&self, key: RgCacheKey, columns: Vec<DecodedColumn>) {
+        let bytes = estimate_columns_bytes(&columns);
+        if bytes > self.capacity_bytes {
+            return; // entry alone exceeds cap; skip
+        }
+        let mut inner = self.inner.lock().unwrap();
+        while inner.bytes_used + bytes > self.capacity_bytes
+            && !inner.insertion_order.is_empty()
+        {
+            let oldest = inner.insertion_order.remove(0);
+            if let Some(e) = inner.entries.remove(&oldest) {
+                inner.bytes_used -= e.bytes;
+            }
+        }
+        let arc = std::sync::Arc::new(columns);
+        if let Some(old) = inner.entries.insert(
+            key.clone(),
+            RgEntry {
+                columns: arc,
+                bytes,
+            },
+        ) {
+            inner.bytes_used -= old.bytes;
+            // already in insertion_order, no need to re-add
+        } else {
+            inner.insertion_order.push(key);
+        }
+        inner.bytes_used += bytes;
+    }
+
+    pub fn stats(&self) -> (u64, u64, usize) {
+        let inner = self.inner.lock().unwrap();
+        (inner.hits, inner.misses, inner.bytes_used)
+    }
+
+    pub fn len(&self) -> usize {
+        self.inner.lock().unwrap().entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+impl Default for RowGroupDecodeCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn estimate_columns_bytes(cols: &[DecodedColumn]) -> usize {
+    cols.iter()
+        .map(|c| match c {
+            DecodedColumn::Int32 { data, .. } => data.len(),
+            DecodedColumn::Int64 { data, .. } => data.len(),
+            DecodedColumn::Float64 { data, .. } => data.len(),
+            DecodedColumn::StringView {
+                views,
+                data_buffers,
+                ..
+            } => views.len() + data_buffers.iter().map(|b| b.len()).sum::<usize>(),
+            DecodedColumn::DictUtf8 {
+                values, indices, ..
+            } => values.value_data().len() + indices.len(),
+            DecodedColumn::Utf8(s) => s.value_data().len(),
+        })
+        .sum()
+}
+
 /// `EMAT_BATCH_SIZE` env override (decimal). Σ.E5 diagnostic for the
 /// Q16 HashJoin-probe gap: split the masked-decode output into more
 /// batches when the post-filter row count is large relative to the
@@ -213,6 +358,9 @@ pub struct EmatArrowBatchReaderBuilder {
     /// bypass the cache (the masked output is row-mask-specific and
     /// not safely shareable across queries with different filters).
     decode_cache: Option<std::sync::Arc<crate::parquet_decode_cache::ParquetDecodeCache>>,
+    /// Σ.O.c.1 — private row-group decode cache (`Vec<DecodedColumn>`
+    /// keyed by file/rg/projection). Bypassed when `filter` is set.
+    rg_decode_cache: Option<std::sync::Arc<RowGroupDecodeCache>>,
 }
 
 impl EmatArrowBatchReaderBuilder {
@@ -227,6 +375,7 @@ impl EmatArrowBatchReaderBuilder {
             filter: None,
             path: None,
             decode_cache: None,
+            rg_decode_cache: None,
         }
     }
 
@@ -239,6 +388,20 @@ impl EmatArrowBatchReaderBuilder {
         cache: std::sync::Arc<crate::parquet_decode_cache::ParquetDecodeCache>,
     ) -> Self {
         self.decode_cache = Some(cache);
+        self
+    }
+
+    /// Σ.O.c.1 — install a private (per-process or per-context)
+    /// row-group decode cache. Stores `Vec<DecodedColumn>` per (file,
+    /// rg, projection) so repeated scans skip parquet decode entirely.
+    /// Wired into the dense (no-filter) `load_row_group_dense` path
+    /// only — filter paths produce row-mask-specific output and aren't
+    /// safely shareable.
+    pub fn with_rg_decode_cache(
+        mut self,
+        cache: std::sync::Arc<RowGroupDecodeCache>,
+    ) -> Self {
+        self.rg_decode_cache = Some(cache);
         self
     }
 
@@ -359,6 +522,7 @@ impl EmatArrowBatchReaderBuilder {
             filter: self.filter,
             path: self.path,
             decode_cache: self.decode_cache,
+            rg_decode_cache: self.rg_decode_cache,
             cur_rg_idx: 0,
             cur_rg_columns: None,
             cur_rg_filter_bitmap: None,
@@ -423,7 +587,8 @@ fn validate_type_pair(name: &str, phys: ParquetType, target: &DataType) -> DfRes
 /// inside `slice_batch` did a fresh memcpy of every batch — for Q1
 /// (3 numeric cols × 65K rows × 8 bytes ≈ 1.5 MB per batch × ~20
 /// batches/partition × 6 partitions ≈ 200 MB of copying per query).
-enum DecodedColumn {
+#[derive(Clone)]
+pub(crate) enum DecodedColumn {
     /// 4-byte primitives (i32/Date32). `n_rows` is the logical row
     /// count; `data.len() == n_rows * 4`.
     Int32 { data: Buffer, n_rows: usize },
@@ -725,6 +890,11 @@ pub struct EmatArrowBatchReader {
     /// with different masks). See `Σ.O.c` follow-up for the load_
     /// row_group integration.
     pub(crate) decode_cache: Option<std::sync::Arc<crate::parquet_decode_cache::ParquetDecodeCache>>,
+    /// Σ.O.c.1 — private decode-column cache. Lookup at the top of
+    /// `load_row_group_dense`; on hit, restores `cur_rg_columns` from
+    /// the shared Arc<Vec<DecodedColumn>> with no parquet I/O. On miss,
+    /// decodes as usual and inserts. Bypassed when `filter` is set.
+    pub(crate) rg_decode_cache: Option<std::sync::Arc<RowGroupDecodeCache>>,
 
     // ---- iteration state ----
     /// Index into `row_groups`; `cur_rg_idx == row_groups.len()`
@@ -1157,6 +1327,32 @@ impl EmatArrowBatchReader {
         // call fell back here mid-execution.
         self.cur_rg_total = self.cached_md.row_groups[rg].num_rows as usize;
 
+        // Σ.O.c.1 — private RG decode cache lookup. Hit: clone the
+        // Arc<Vec<DecodedColumn>>'s inner vec (each DecodedColumn holds
+        // Arc-shared Arrow Buffers; clone is O(n_cols) pointer copies,
+        // not a data copy). Miss: fall through and insert after decode.
+        let rg_cache_key = self.rg_decode_cache.as_ref().and_then(|_| {
+            self.path.as_ref().map(|p| RgCacheKey {
+                file_path: p.clone(),
+                row_group_idx: rg,
+                projection: {
+                    let mut v = self.projection.clone();
+                    v.sort_unstable();
+                    v
+                },
+            })
+        });
+        if let (Some(cache), Some(key)) =
+            (self.rg_decode_cache.as_ref(), rg_cache_key.as_ref())
+        {
+            if let Some(cached) = cache.get(key) {
+                let cols: Vec<DecodedColumn> = (*cached).clone();
+                self.cur_rg_columns = Some(cols);
+                self.cur_rg_row = 0;
+                return Ok(());
+            }
+        }
+
         let projection = &self.projection;
         let schema = &self.arrow_schema;
         let file = &self.file;
@@ -1277,6 +1473,14 @@ impl EmatArrowBatchReader {
                     self.cur_rg_total,
                 )));
             }
+        }
+
+        // Σ.O.c.1 — populate cache on miss. Clone is O(n_cols) Arc
+        // pointer copies; the underlying Arrow Buffers are Arc-shared.
+        if let (Some(cache), Some(key)) =
+            (self.rg_decode_cache.as_ref(), rg_cache_key.as_ref())
+        {
+            cache.insert(key.clone(), cols.clone());
         }
 
         self.cur_rg_columns = Some(cols);
@@ -3217,5 +3421,92 @@ mod tests {
         let budget_2 = snap(&read(Some(2)));
         assert_eq!(default, budget_1, "budget=1 must match default output");
         assert_eq!(default, budget_2, "budget=2 must match default output");
+    }
+
+    // ----- Σ.O.c.1 — RowGroupDecodeCache wire-in -----
+
+    fn read_all_with_rg_cache(
+        path: &std::path::Path,
+        schema: SchemaRef,
+        cache: std::sync::Arc<RowGroupDecodeCache>,
+    ) -> Vec<RecordBatch> {
+        let file = ParquetFile::open(path).unwrap();
+        let mut rdr = EmatArrowBatchReaderBuilder::new(file, schema)
+            .with_rg_decode_cache(cache)
+            .build()
+            .unwrap();
+        // Set path so `rg_cache_key` is populated (mirrors how the
+        // provider wires the reader). The reader uses `path` for the
+        // RG cache key.
+        rdr.path = Some(path.to_path_buf());
+        let mut out = Vec::new();
+        while let Some(b) = rdr.next().transpose().unwrap() {
+            out.push(b);
+        }
+        out
+    }
+
+    #[test]
+    fn rg_decode_cache_returns_identical_rows_on_hit() {
+        let path = tmp_parquet("rg_cache_identity");
+        let n = 4096;
+        write_three_primitives(&path, n);
+
+        let cache = std::sync::Arc::new(RowGroupDecodeCache::new());
+
+        // First read: cache miss → decode + insert.
+        let first = read_all_with_rg_cache(&path, schema_three_primitives(), cache.clone());
+        let (h1, m1, _) = cache.stats();
+
+        // Second read: should hit the cache for every RG.
+        let second = read_all_with_rg_cache(&path, schema_three_primitives(), cache.clone());
+        let (h2, m2, _) = cache.stats();
+
+        // Sanity: first run inserted at least one entry; second run hit.
+        assert!(m1 >= 1, "first read should miss + insert (misses={m1})");
+        assert!(h2 > h1, "second read should produce hits (h1={h1} h2={h2})");
+        // Misses shouldn't grow on the second read (same key set).
+        assert_eq!(m1, m2, "second read should produce no new misses");
+
+        // Output equivalence: collect (i32, i64, f64) tuples and compare.
+        fn collect(rbs: &[RecordBatch]) -> Vec<(i32, i64, f64)> {
+            let mut out = Vec::new();
+            for rb in rbs {
+                let a = rb.column(0).as_primitive::<arrow_array::types::Int32Type>();
+                let b = rb.column(1).as_primitive::<arrow_array::types::Int64Type>();
+                let c = rb.column(2).as_primitive::<arrow_array::types::Float64Type>();
+                for i in 0..rb.num_rows() {
+                    out.push((a.value(i), b.value(i), c.value(i)));
+                }
+            }
+            out
+        }
+        assert_eq!(collect(&first), collect(&second));
+    }
+
+    #[test]
+    fn rg_decode_cache_default_is_inactive() {
+        // No cache installed → reader behaves like before; this just
+        // confirms the new field is optional and doesn't perturb the
+        // dense-decode path.
+        let path = tmp_parquet("rg_cache_none");
+        write_three_primitives(&path, 256);
+        let file = ParquetFile::open(&path).unwrap();
+        let mut rdr = EmatArrowBatchReaderBuilder::new(file, schema_three_primitives())
+            .build()
+            .unwrap();
+        assert!(rdr.rg_decode_cache.is_none());
+        while rdr.next().transpose().unwrap().is_some() {}
+    }
+
+    #[test]
+    fn rg_decode_cache_evicts_when_capacity_exceeded() {
+        // Tiny cap → entry should be skipped or evicted.
+        let path = tmp_parquet("rg_cache_evict");
+        write_three_primitives(&path, 256);
+        let cache = std::sync::Arc::new(RowGroupDecodeCache::with_capacity_bytes(8));
+        let _ = read_all_with_rg_cache(&path, schema_three_primitives(), cache.clone());
+        // Entry is larger than cap → skipped, cache stays empty.
+        assert_eq!(cache.len(), 0);
     }
 }
