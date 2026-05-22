@@ -49,7 +49,7 @@ use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode};
 
-use crate::robin_hood_agg::RobinHoodAggregateExec;
+use crate::robin_hood_agg::{RobinHoodAggregateExec, RobinHoodMode};
 
 /// Σ.N.d — opt-in installer. Adds the rule to a SessionStateBuilder.
 /// Callers who don't invoke this never pay the codegen tax.
@@ -76,28 +76,67 @@ impl PhysicalOptimizerRule for EnableRobinHoodAggregateRule {
         plan: Arc<dyn ExecutionPlan>,
         _config: &ConfigOptions,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
+        // Σ.N.e — per-node rewrite. Walks bottom-up, so Partial
+        // matches FIRST and is replaced before Final sees its input.
+        // Final's matcher then verifies the input chain leads to a
+        // (now-rewritten) RobinHoodAggregateExec(Partial).
         let result = plan.transform_up(|node| {
-            let Some(final_agg) = node.as_any().downcast_ref::<AggregateExec>() else {
-                return Ok(Transformed::no(node));
-            };
-            if !matches!(
-                final_agg.mode(),
-                AggregateMode::Final | AggregateMode::FinalPartitioned
-            ) {
-                return Ok(Transformed::no(node));
+            // Partial → RobinHoodAggregateExec(Partial).
+            if let Some(partial) = node.as_any().downcast_ref::<AggregateExec>() {
+                if matches!(partial.mode(), AggregateMode::Partial) {
+                    if let Some((col_idx, group_out_name, count_out_name)) =
+                        match_partial_shape(partial)
+                    {
+                        let real = partial.input().clone();
+                        // Input column type guard.
+                        if real.schema().field(col_idx).data_type() == &DataType::Int64 {
+                            let new = RobinHoodAggregateExec::try_new_full(
+                                real,
+                                col_idx,
+                                None,
+                                RobinHoodMode::Partial,
+                                group_out_name,
+                                count_out_name,
+                            )?;
+                            return Ok(Transformed::yes(
+                                Arc::new(new) as Arc<dyn ExecutionPlan>
+                            ));
+                        }
+                    }
+                }
+                // Final / FinalPartitioned → RobinHoodAggregateExec(FinalPartitioned)
+                // ONLY if its sub-chain leads to a RobinHoodAggregateExec(Partial).
+                if matches!(
+                    partial.mode(),
+                    AggregateMode::Final | AggregateMode::FinalPartitioned
+                ) {
+                    if let Some((col_idx, group_out_name, count_out_name)) =
+                        match_final_shape(partial)
+                    {
+                        // Walk down through pass-through nodes to find
+                        // a RobinHoodAggregateExec(Partial). If found,
+                        // we know the Final's input was the chain
+                        // [RobinHood(Partial) → ?(RepartitionExec) → us].
+                        if find_robin_hood_partial(partial.input()).is_some() {
+                            // partial_count_col_idx = 1 (Partial emits
+                            // [group_key, partial_count]).
+                            // group_col_idx = 0 (same).
+                            let new = RobinHoodAggregateExec::try_new_full(
+                                partial.input().clone(),
+                                0,
+                                Some(1),
+                                RobinHoodMode::FinalPartitioned,
+                                group_out_name,
+                                count_out_name,
+                            )?;
+                            return Ok(Transformed::yes(
+                                Arc::new(new) as Arc<dyn ExecutionPlan>
+                            ));
+                        }
+                    }
+                }
             }
-            let Some((real_input, col_idx, group_out_name, count_out_name)) =
-                match_robin_hood_shape(final_agg)
-            else {
-                return Ok(Transformed::no(node));
-            };
-            let new = RobinHoodAggregateExec::try_new_with_names(
-                real_input,
-                col_idx,
-                group_out_name,
-                count_out_name,
-            )?;
-            Ok(Transformed::yes(Arc::new(new) as Arc<dyn ExecutionPlan>))
+            Ok(Transformed::no(node))
         })?;
         Ok(result.data)
     }
@@ -107,22 +146,41 @@ impl PhysicalOptimizerRule for EnableRobinHoodAggregateRule {
     }
 
     fn schema_check(&self) -> bool {
-        // The rewrite preserves output names; types are Int64 (group)
-        // + Int64 (count) on both sides if the original FinalAgg
-        // takes an Int64 input. The match guard checks the input
-        // type below.
+        // Both replacements preserve column names + Int64/Int64 types.
         true
     }
 }
 
-/// Σ.N.d shape matcher. Returns Some((real_input, col_idx,
-/// group_out_name, count_out_name)) if the sub-plan matches:
-/// `AggregateExec(Final*) → ... → AggregateExec(Partial) → real`
-/// with a single Int64 group + COUNT.
-fn match_robin_hood_shape(
+/// Σ.N.e — match the Partial agg shape: single Int64 GROUP BY +
+/// single COUNT. Returns (col_idx, group_out_name, count_out_name).
+fn match_partial_shape(
+    partial: &AggregateExec,
+) -> Option<(usize, String, String)> {
+    let groups = partial.group_expr().expr();
+    if groups.len() != 1 {
+        return None;
+    }
+    let (group_expr, group_out_name) = &groups[0];
+    let col = group_expr.as_any().downcast_ref::<Column>()?;
+    let col_idx = col.index();
+
+    let aggs = partial.aggr_expr();
+    if aggs.len() != 1 {
+        return None;
+    }
+    let agg = &aggs[0];
+    if !agg.fun().name().eq_ignore_ascii_case("count") {
+        return None;
+    }
+    let count_out_name = agg.name().to_string();
+    Some((col_idx, group_out_name.clone(), count_out_name))
+}
+
+/// Σ.N.e — match the Final agg shape: single GROUP BY + single COUNT.
+/// Returns (col_idx, group_out_name, count_out_name).
+fn match_final_shape(
     final_agg: &AggregateExec,
-) -> Option<(Arc<dyn ExecutionPlan>, usize, String, String)> {
-    // Single group column.
+) -> Option<(usize, String, String)> {
     let groups = final_agg.group_expr().expr();
     if groups.len() != 1 {
         return None;
@@ -131,7 +189,6 @@ fn match_robin_hood_shape(
     let col = group_expr.as_any().downcast_ref::<Column>()?;
     let col_idx = col.index();
 
-    // Single COUNT aggregate.
     let aggs = final_agg.aggr_expr();
     if aggs.len() != 1 {
         return None;
@@ -141,47 +198,23 @@ fn match_robin_hood_shape(
         return None;
     }
     let count_out_name = agg.name().to_string();
+    Some((col_idx, group_out_name.clone(), count_out_name))
+}
 
-    // Walk down: FinalAgg → ?(pass-through) → AggregateExec(Partial) → real.
-    let mut cur: Arc<dyn ExecutionPlan> = final_agg.input().clone();
+/// Σ.N.e — walk down through pass-through nodes to find a
+/// RobinHoodAggregateExec(Partial). Returns the matched node if
+/// found.
+fn find_robin_hood_partial(
+    plan: &Arc<dyn ExecutionPlan>,
+) -> Option<Arc<dyn ExecutionPlan>> {
+    let mut cur = plan.clone();
     loop {
-        if let Some(partial) = cur.as_any().downcast_ref::<AggregateExec>() {
-            if !matches!(partial.mode(), AggregateMode::Partial) {
-                return None;
+        if let Some(rh) = cur.as_any().downcast_ref::<RobinHoodAggregateExec>() {
+            if rh.mode() == RobinHoodMode::Partial {
+                return Some(cur);
             }
-            let pgroups = partial.group_expr().expr();
-            if pgroups.len() != 1 {
-                return None;
-            }
-            let (pgexp, _) = &pgroups[0];
-            let pcol = pgexp.as_any().downcast_ref::<Column>()?;
-            if pcol.index() != col_idx {
-                return None;
-            }
-            // The real input's group column must be Int64.
-            let real = partial.input().clone();
-            let real_schema = real.schema();
-            if pcol.index() >= real_schema.fields().len() {
-                return None;
-            }
-            if real_schema.field(pcol.index()).data_type() != &DataType::Int64 {
-                return None;
-            }
-            // Σ.N.d partition guard (post-bench fix): RobinHood-
-            // AggregateExec emits a single output partition and
-            // iterates input partitions serially on one thread. If
-            // the input has multiple partitions, the rewrite would
-            // serialise what was parallel — catastrophic regression.
-            // Σ.N.e will add per-partition Partial/Final modes; until
-            // then, only fire when the input is already single-
-            // partition. See [[sigma-nd-partition-blocker]].
-            use datafusion::physical_plan::ExecutionPlanProperties;
-            if real.output_partitioning().partition_count() > 1 {
-                return None;
-            }
-            return Some((real, col_idx, group_out_name.clone(), count_out_name));
+            return None;
         }
-        // Walk down through single-child pass-through nodes.
         let children = cur.children();
         if children.len() != 1 {
             return None;
@@ -189,6 +222,7 @@ fn match_robin_hood_shape(
         cur = children[0].clone();
     }
 }
+
 
 #[cfg(test)]
 mod tests {
@@ -328,23 +362,53 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rule_no_op_on_multi_partition_input() {
-        // Σ.N.d partition guard: when the scan emits multiple partitions
-        // (a multi-batch MemTable here, or multi-row-group parquet in
-        // production), the rewrite would serialise parallel scans onto
-        // one thread. Rule must refuse.
+    async fn rule_fires_on_multi_partition_with_parallel_modes() {
+        // Σ.N.e — with Partial+FinalPartitioned modes, the rule
+        // SHOULD fire on multi-partition input. Each input partition
+        // gets its own Partial; the FinalPartitioned merges via
+        // ingest_partial_counts. No serialisation regression.
         let ctx = make_ctx_with_rule();
         register_int64_t_multi_partition(&ctx);
         let df = ctx
-            .sql("SELECT k, COUNT(*) FROM t_mp GROUP BY k")
+            .sql("SELECT k, COUNT(*) FROM t_mp GROUP BY k ORDER BY k")
             .await
             .unwrap();
-        let plan = df.create_physical_plan().await.unwrap();
+        let plan = df.clone().create_physical_plan().await.unwrap();
         let s = format!("{plan:?}");
+        // Both modes must appear in the rewritten plan.
         assert!(
-            !s.contains("RobinHoodAggregateExec"),
-            "rule fired on multi-partition input — partition guard failed. Got:\n{s}"
+            s.contains("mode: Partial"),
+            "expected RobinHoodAggregateExec(mode=Partial) in plan. Got:\n{s}"
         );
+        assert!(
+            s.contains("mode: FinalPartitioned"),
+            "expected RobinHoodAggregateExec(mode=FinalPartitioned) in plan. Got:\n{s}"
+        );
+
+        // Correctness: same output as DataFusion stock agg.
+        let rh_pairs = collect_pairs(&df.collect().await.unwrap());
+
+        let stock_ctx = SessionContext::new();
+        register_int64_t_multi_partition(&stock_ctx);
+        let df2 = stock_ctx
+            .sql("SELECT k, COUNT(*) FROM t_mp GROUP BY k ORDER BY k")
+            .await
+            .unwrap();
+        let stock_pairs = collect_pairs(&df2.collect().await.unwrap());
+        assert_eq!(rh_pairs, stock_pairs);
+    }
+
+    fn collect_pairs(batches: &[RecordBatch]) -> Vec<(i64, i64)> {
+        let mut out = Vec::new();
+        for b in batches {
+            let ks = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+            let cs = b.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+            for i in 0..b.num_rows() {
+                out.push((ks.value(i), cs.value(i)));
+            }
+        }
+        out.sort();
+        out
     }
 
     #[tokio::test]

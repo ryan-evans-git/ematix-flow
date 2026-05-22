@@ -325,6 +325,39 @@ impl RobinHoodCountAgg {
         }
     }
 
+    /// Σ.N.e — ingest a (key, partial_count) pair stream. For each
+    /// row, sums `partial_count` into the running total for `key`.
+    /// Used by the FinalPartitioned mode to merge upstream Partial
+    /// outputs.
+    pub fn ingest_partial_counts(
+        &mut self,
+        keys: &arrow_array::Int64Array,
+        partial_counts: &arrow_array::Int64Array,
+    ) {
+        use arrow_array::Array;
+        assert_eq!(
+            keys.len(),
+            partial_counts.len(),
+            "ingest_partial_counts: key and count arrays must be same length"
+        );
+        let n = keys.len();
+        if keys.null_count() == 0 && partial_counts.null_count() == 0 {
+            for i in 0..n {
+                let k = keys.value(i);
+                let c = partial_counts.value(i) as u64;
+                self.table.insert_or_update(k, c, sum_accumulator);
+            }
+        } else {
+            for i in 0..n {
+                if !keys.is_null(i) && !partial_counts.is_null(i) {
+                    let k = keys.value(i);
+                    let c = partial_counts.value(i) as u64;
+                    self.table.insert_or_update(k, c, sum_accumulator);
+                }
+            }
+        }
+    }
+
     /// Σ.N.b — finalise into a `RecordBatch` matching the SQL output
     /// schema `(group_key i64, count u64)`. Sorted by group key for
     /// stable comparison against DataFusion output.
@@ -379,31 +412,87 @@ use datafusion::physical_plan::{
 };
 use futures_util::stream::{self, TryStreamExt};
 
-/// Σ.N.c — `SELECT col, COUNT(*) FROM child GROUP BY col` where `col`
-/// is `Int64`. Uses RobinHoodCountAgg internally — 1.16-1.54× faster
-/// than the stock hashbrown-based aggregate.
+/// Σ.N.e — execution mode mirroring DataFusion's `AggregateExec`.
+/// Lets RobinHoodAggregateExec slot into the two-stage agg pipeline
+/// (Partial → RepartitionExec → FinalPartitioned) so a multi-partition
+/// scan is aggregated in parallel instead of being serialised.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RobinHoodMode {
+    /// Per-input-partition COUNT(*) GROUP BY. Each output partition
+    /// emits one batch containing the partial counts for that
+    /// partition's rows. Output column 1 is `partial_count: Int64`.
+    Partial,
+    /// Consumes partial counts (from upstream `Partial` after a
+    /// `RepartitionExec(Hash)`) and sums them per group key. Output
+    /// column 1 is the final `count: Int64`.
+    FinalPartitioned,
+}
+
+impl RobinHoodMode {
+    fn count_col_name(self) -> &'static str {
+        match self {
+            RobinHoodMode::Partial => "partial_count",
+            RobinHoodMode::FinalPartitioned => "count",
+        }
+    }
+}
+
+/// Σ.N.c + Σ.N.e — `SELECT col, COUNT(*) FROM child GROUP BY col`
+/// operator. Two modes:
 ///
-/// Output schema: `(group_key: Int64, count: Int64)`. Single-partition
-/// output (Final emission).
+/// - **Partial**: input is the raw scan; output is per-partition
+///   partial counts. Used as the leaf-side of the two-stage agg.
+/// - **FinalPartitioned**: input is partial counts from a
+///   `RepartitionExec(Hash)`; output is per-partition final counts.
 ///
-/// Like [`crate::dict_aggregate::DictGroupCountExec`] but for i64
-/// keys instead of dict-encoded strings.
+/// Output partitioning matches input partitioning in both modes.
+/// EmissionType::Final since each call emits one batch.
+///
+/// Uses RobinHoodCountAgg internally — 1.16-1.54× faster than the
+/// stock hashbrown-based aggregate at higher cardinalities.
 #[derive(Debug)]
 pub struct RobinHoodAggregateExec {
     input: Arc<dyn ExecutionPlan>,
     group_col_idx: usize,
+    /// Σ.N.e — for `FinalPartitioned`, the column index of the
+    /// partial-count input. `None` for `Partial` (raw scan; count by
+    /// incrementing 1 per row).
+    partial_count_col_idx: Option<usize>,
+    mode: RobinHoodMode,
     schema: SchemaRef,
     properties: Arc<PlanProperties>,
 }
 
 impl RobinHoodAggregateExec {
+    /// Σ.N.c convenience — Partial mode with default field names.
     pub fn try_new(input: Arc<dyn ExecutionPlan>, group_col_idx: usize) -> DfResult<Self> {
         Self::try_new_with_names(input, group_col_idx, "group_key".to_string(), "count".to_string())
     }
 
+    /// Σ.N.c convenience — Partial mode with caller-supplied names.
     pub fn try_new_with_names(
         input: Arc<dyn ExecutionPlan>,
         group_col_idx: usize,
+        group_out_name: String,
+        count_out_name: String,
+    ) -> DfResult<Self> {
+        Self::try_new_full(
+            input,
+            group_col_idx,
+            None,
+            RobinHoodMode::Partial,
+            group_out_name,
+            count_out_name,
+        )
+    }
+
+    /// Σ.N.e — full constructor with mode + optional partial-count
+    /// column index (required for FinalPartitioned).
+    pub fn try_new_full(
+        input: Arc<dyn ExecutionPlan>,
+        group_col_idx: usize,
+        partial_count_col_idx: Option<usize>,
+        mode: RobinHoodMode,
         group_out_name: String,
         count_out_name: String,
     ) -> DfResult<Self> {
@@ -420,20 +509,44 @@ impl RobinHoodAggregateExec {
                 "RobinHoodAggregateExec: group column must be Int64, got {gb_type:?}"
             )));
         }
+        if mode == RobinHoodMode::FinalPartitioned {
+            let cci = partial_count_col_idx.ok_or_else(|| {
+                DataFusionError::Internal(
+                    "RobinHoodAggregateExec(FinalPartitioned) needs partial_count_col_idx".into(),
+                )
+            })?;
+            if cci >= input_schema.fields().len() {
+                return Err(DataFusionError::Internal(format!(
+                    "RobinHoodAggregateExec: partial_count_col_idx={cci} out of bounds"
+                )));
+            }
+            if input_schema.field(cci).data_type() != &DataType::Int64 {
+                return Err(DataFusionError::Internal(format!(
+                    "RobinHoodAggregateExec: partial_count column must be Int64, got {:?}",
+                    input_schema.field(cci).data_type()
+                )));
+            }
+        }
         let schema = Arc::new(Schema::new(vec![
             Field::new(&group_out_name, DataType::Int64, false),
             Field::new(&count_out_name, DataType::Int64, false),
         ]));
         let eq_props = EquivalenceProperties::new(schema.clone());
+        // Σ.N.e — output partitioning matches input. Critical for
+        // not serialising parallel scans onto one thread.
+        use datafusion::physical_plan::ExecutionPlanProperties;
+        let n_parts = input.output_partitioning().partition_count();
         let properties = Arc::new(PlanProperties::new(
             eq_props,
-            Partitioning::UnknownPartitioning(1),
+            Partitioning::UnknownPartitioning(n_parts),
             EmissionType::Final,
             Boundedness::Bounded,
         ));
         Ok(Self {
             input,
             group_col_idx,
+            partial_count_col_idx,
+            mode,
             schema,
             properties,
         })
@@ -442,13 +555,21 @@ impl RobinHoodAggregateExec {
     pub fn group_col_idx(&self) -> usize {
         self.group_col_idx
     }
+
+    pub fn mode(&self) -> RobinHoodMode {
+        self.mode
+    }
 }
 
 impl DisplayAs for RobinHoodAggregateExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        let mode_str = match self.mode {
+            RobinHoodMode::Partial => "Partial",
+            RobinHoodMode::FinalPartitioned => "FinalPartitioned",
+        };
         write!(
             f,
-            "RobinHoodAggregateExec(group_col_idx={})",
+            "RobinHoodAggregateExec(mode={mode_str}, group_col_idx={})",
             self.group_col_idx
         )
     }
@@ -480,9 +601,11 @@ impl ExecutionPlan for RobinHoodAggregateExec {
         })?;
         let group_out_name = self.schema.field(0).name().clone();
         let count_out_name = self.schema.field(1).name().clone();
-        Ok(Arc::new(Self::try_new_with_names(
+        Ok(Arc::new(Self::try_new_full(
             new_input,
             self.group_col_idx,
+            self.partial_count_col_idx,
+            self.mode,
             group_out_name,
             count_out_name,
         )?))
@@ -493,37 +616,45 @@ impl ExecutionPlan for RobinHoodAggregateExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> DfResult<SendableRecordBatchStream> {
-        if partition != 0 {
-            return Err(DataFusionError::Internal(format!(
-                "RobinHoodAggregateExec emits only partition 0, got {partition}"
-            )));
-        }
+        // Σ.N.e — output partitioning matches input. Each call to
+        // execute(p) reads ONLY input partition p, not all of them.
         let input = self.input.clone();
         let group_col_idx = self.group_col_idx;
+        let partial_count_col_idx = self.partial_count_col_idx;
+        let mode = self.mode;
         let schema = self.schema.clone();
         let schema_for_stream = schema.clone();
 
         let fut = async move {
             let mut agg = RobinHoodCountAgg::new();
-            let in_parts = input.properties().partitioning.partition_count();
-            for p in 0..in_parts {
-                let mut s = input.execute(p, context.clone())?;
-                while let Some(batch) = s.try_next().await? {
-                    let arr = batch.column(group_col_idx);
-                    let i64_arr = arr
-                        .as_any()
-                        .downcast_ref::<Int64Array>()
-                        .ok_or_else(|| {
-                            DataFusionError::Internal(format!(
-                                "RobinHoodAggregateExec: column {group_col_idx} not Int64Array"
-                            ))
-                        })?;
-                    agg.ingest_int64_array(i64_arr);
+            let mut s = input.execute(partition, context)?;
+            while let Some(batch) = s.try_next().await? {
+                let keys_arr = batch.column(group_col_idx);
+                let keys = keys_arr.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
+                    DataFusionError::Internal(format!(
+                        "RobinHoodAggregateExec: column {group_col_idx} not Int64Array"
+                    ))
+                })?;
+                match mode {
+                    RobinHoodMode::Partial => {
+                        agg.ingest_int64_array(keys);
+                    }
+                    RobinHoodMode::FinalPartitioned => {
+                        let cci = partial_count_col_idx.expect("validated in constructor");
+                        let counts_arr = batch.column(cci);
+                        let counts = counts_arr
+                            .as_any()
+                            .downcast_ref::<Int64Array>()
+                            .ok_or_else(|| {
+                                DataFusionError::Internal(format!(
+                                    "RobinHoodAggregateExec: column {cci} not Int64Array"
+                                ))
+                            })?;
+                        agg.ingest_partial_counts(keys, counts);
+                    }
                 }
             }
-            // Finalise. Inline rather than calling finalize_to_record_batch
-            // to control schema field names + use Int64 (signed) for count
-            // (matches DataFusion convention).
+            // Finalise — sort by key for stable output.
             let mut pairs: Vec<(i64, u64)> = agg.table().iter().collect();
             pairs.sort_by_key(|(k, _)| *k);
             let keys: Vec<i64> = pairs.iter().map(|(k, _)| *k).collect();
