@@ -153,6 +153,12 @@ pub mod bloom;
 // Tonight ships the data structure + tests; operator integration is a
 // follow-up bite to avoid the optimizer-codegen-sensitivity tax.
 pub mod robin_hood_agg;
+// Σ.N.d (2026-05-22): planner rule that auto-installs
+// RobinHoodAggregateExec on AggregateExec(Final/Partial) sub-plans
+// with a single Int64 GROUP BY + COUNT(*). NOT installed in default
+// chain — opt-in only via install_robin_hood_rule(state_builder) to
+// avoid the codegen tax recorded in optimizer-codegen-sensitivity.
+pub mod robin_hood_agg_rule;
 // Σ.O (2026-05-21): in-memory LRU cache of decoded RecordBatch by
 // (file_path, row_group_idx, projection_hash). Avoids re-decoding
 // the same parquet column chunks across queries in the same session.

@@ -835,7 +835,18 @@ impl EmatArrowBatchReader {
         }
 
         // 1. Build the combined multi-column AND bitmap.
-        let (bitmap, total) = filter.build_bitmap(&path, rg)?;
+        // Σ.L.3.c.3.b: try sequential masked-AND first when adaptive
+        // is enabled AND predicted_pass_rate is low. Falls back to
+        // parallel build_bitmap on Ok(None) (unsupported predicate
+        // type) or on adaptive being off.
+        let (bitmap, total) = if filter.should_use_sequential() {
+            match filter.build_bitmap_sequential(&path, rg)? {
+                Some(b) => b,
+                None => filter.build_bitmap(&path, rg)?,
+            }
+        } else {
+            filter.build_bitmap(&path, rg)?
+        };
         let popcount: usize = bitmap.iter().map(|b| b.count_ones() as usize).sum();
 
         // Σ.E5 #517-518: selectivity gate. Masked decode is a win
@@ -1039,7 +1050,17 @@ impl EmatArrowBatchReader {
                                 // will then drop back to picking
                                 // up projection cols.
                                 let t_bm = std::time::Instant::now();
-                                let r = filter_ref.build_bitmap(path_ref, rg);
+                                // Σ.L.3.c.3.b — try sequential masked-AND
+                                // when adaptive is on; fall back to parallel.
+                                let r = if filter_ref.should_use_sequential() {
+                                    match filter_ref.build_bitmap_sequential(path_ref, rg) {
+                                        Ok(Some(b)) => Ok(b),
+                                        Ok(None) => filter_ref.build_bitmap(path_ref, rg),
+                                        Err(e) => Err(e),
+                                    }
+                                } else {
+                                    filter_ref.build_bitmap(path_ref, rg)
+                                };
                                 bitmap_self_ms = t_bm.elapsed().as_secs_f64() * 1000.0;
                                 *bitmap_slot_ref.lock().unwrap() = Some(r);
                             } else {
