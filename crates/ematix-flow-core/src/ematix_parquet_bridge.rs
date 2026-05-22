@@ -693,6 +693,86 @@ pub fn filter_byte_array_to_bitmap(
     Ok((bitmap, total))
 }
 
+/// Σ.E6 — dict-fused FLOAT64 column → row bitmap, mirroring the
+/// i32 path. Decode dict ONCE, eval predicate against ~50 dict
+/// entries to build a `dict_mask`, then the width-generic NEON
+/// kernel walks the RLE indices and writes the bitmap directly —
+/// zero Vec<f64> materialization. Falls back to
+/// [`filter_f64_column_to_bitmap_dense`] for PLAIN-only chunks.
+pub fn filter_f64_column_to_bitmap(
+    path: &std::path::Path,
+    rg: usize,
+    col: usize,
+    predicate: impl Fn(f64) -> bool,
+) -> DfResult<(Vec<u8>, usize)> {
+    let file = ParquetFile::open(path).map_err(|e| ext(format!("ParquetFile::open: {e}")))?;
+    let md = file.metadata().map_err(|e| ext(format!("metadata: {e}")))?;
+    let cm = md.row_groups[rg].columns[col]
+        .meta_data
+        .as_ref()
+        .ok_or_else(|| ext("column missing meta_data"))?;
+    let total = cm.num_values as usize;
+    let codec = cm.codec;
+    let start = cm.dictionary_page_offset.unwrap_or(cm.data_page_offset) as u64;
+    let length = cm.total_compressed_size as u64;
+    let chunk = file
+        .read_range(start, length)
+        .map_err(|e| ext(format!("read_range: {e}")))?;
+
+    let mut walker = PageWalker::new(&chunk);
+    let mut scratch: Vec<u8> = Vec::with_capacity(128 * 1024);
+
+    let (first_hdr, first_body) = walker
+        .next_page()
+        .map_err(|e| ext(format!("next_page (dict): {e}")))?
+        .ok_or_else(|| ext("empty chunk"))?;
+    if first_hdr.dictionary_page_header.is_none() {
+        return Err(ext(
+            "filter_f64_column_to_bitmap requires dict-encoded chunk; \
+             use dense decode + scan for PLAIN-only columns",
+        ));
+    }
+    decompress_into(codec, first_body, &mut scratch)?;
+    let dict = decode_plain_f64(&scratch).map_err(|e| ext(format!("plain f64 dict: {e}")))?;
+
+    let mut bitmap: Vec<u8> = Vec::with_capacity(total.div_ceil(8));
+    let mut dict_mask: Vec<u8> = Vec::new();
+    let mut emitted: usize = 0;
+    while emitted < total {
+        let (hdr, body) = walker
+            .next_page()
+            .map_err(|e| ext(format!("next_page: {e}")))?
+            .ok_or_else(|| ext("chunk ended before num_values"))?;
+        let dph = hdr
+            .data_page_header
+            .as_ref()
+            .ok_or_else(|| ext("filter_f64: v2 data pages not yet supported"))?;
+        let n = dph.num_values as usize;
+        decompress_into(codec, body, &mut scratch)?;
+        match dph.encoding {
+            Encoding::RleDictionary | Encoding::PlainDictionary => {
+                if dict_mask.is_empty() {
+                    if scratch.is_empty() {
+                        return Err(ext("filter_f64: empty data page body"));
+                    }
+                    let bit_width = scratch[0];
+                    dict_mask = build_dict_predicate_mask(&dict, bit_width, |&v| predicate(v))
+                        .map_err(|e| ext(format!("build_dict_predicate_mask f64: {e}")))?;
+                }
+                decode_rle_dictionary_predicate_bitmap(&scratch, n, &dict_mask, &mut bitmap)
+                    .map_err(|e| ext(format!("rle_dict_predicate_bitmap f64: {e}")))?;
+            }
+            other => {
+                return Err(ext(format!(
+                    "filter_f64: unexpected data page encoding {other:?} (dict-only)"
+                )));
+            }
+        }
+        emitted += n;
+    }
+    Ok((bitmap, total))
+}
+
 /// Σ.E5 #518: build a row bitmap from a FLOAT64 column. Uses dense
 /// decode + per-row predicate eval. Cheap because the predicate is
 /// usually a small range (Q06 `l_quantity < 24`, Q19 `l_quantity
