@@ -146,8 +146,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Workspace root — find by walking up from this binary's runtime
     // location until we find Cargo.toml.workspace or examples/tpch/queries/q01.sql.
-    let workspace_root = find_workspace_root()
-        .unwrap_or_else(|| PathBuf::from("/opt/ematix/ematix-flow"));
+    let workspace_root =
+        find_workspace_root().unwrap_or_else(|| PathBuf::from("/opt/ematix/ematix-flow"));
 
     eprintln!("=== ematix-flow distributed campaign ===");
     eprintln!("  peers:        {} workers", peers.len());
