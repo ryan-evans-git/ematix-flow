@@ -879,13 +879,20 @@ fn is_passthrough_chain_to_leaf(node: &Arc<dyn ExecutionPlan>) -> bool {
     }
 }
 
-/// Σ.H.1: True if `node` is a valid body for the FilterMultiAgg rule
-/// — either a single-child chain to a leaf, or a `HashJoinExec` whose
-/// both sides are themselves valid bodies (recursive). Rejects
-/// `NestedLoopJoinExec`, `CrossJoinExec`, `UnionExec`, and any other
-/// multi-child node that isn't a HashJoin.
+/// True if `node` is a valid body for the FilterMultiAgg rule —
+/// a single-child chain to a leaf. Rejects ALL multi-child nodes
+/// (HashJoinExec, NestedLoopJoinExec, CrossJoinExec, UnionExec).
+///
+/// 2026-05-22 (task #610): Σ.H.1 originally extended this to accept
+/// HashJoinExec bodies (Inner only) for Q12-shape perf. That turned
+/// out to be incorrect — Q05 (5 → 4 rows, all-Inner joins) and Q21
+/// (411 → 1 rows, with LEFT SEMI/ANTI from correlated subqueries)
+/// both broke. The single-pass FilterMultiAggSpec can't correctly
+/// merge cross-partition aggregates produced by hash-partitioned
+/// join trees. Reverting to single-child-chain only is the
+/// correctness-first fix; Σ.H.1's Q12 perf gain returns when the
+/// spec gains true partition-aware Partial+Final modes.
 fn is_supported_body(node: &Arc<dyn ExecutionPlan>) -> bool {
-    use datafusion::physical_plan::joins::HashJoinExec;
     let children = node.children();
     if children.is_empty() {
         return true;
@@ -894,14 +901,8 @@ fn is_supported_body(node: &Arc<dyn ExecutionPlan>) -> bool {
         let owned: Arc<dyn ExecutionPlan> = (*children[0]).clone();
         return is_supported_body(&owned);
     }
-    // Multi-child: only HashJoinExec is accepted.
-    if node.as_any().downcast_ref::<HashJoinExec>().is_none() {
-        return false;
-    }
-    children.iter().all(|c| {
-        let owned: Arc<dyn ExecutionPlan> = (*c).clone();
-        is_supported_body(&owned)
-    })
+    // Multi-child bodies (joins, unions) all reject — see above.
+    false
 }
 
 // ===== output projection wrapper =====
@@ -1038,11 +1039,13 @@ mod tests {
         );
     }
 
-    /// Σ.H.1 (2026-05-20): rule now fires on `Aggregate > ... >
-    /// HashJoinExec > ...` plans. `is_supported_body` accepts a
-    /// HashJoin as a valid stopping point. Test renamed + flipped.
+    /// 2026-05-22 (task #610): Σ.H.1's HashJoinExec body acceptance
+    /// was reverted because it broke correctness on Q05 and Q21 (the
+    /// single-pass spec can't merge hash-partitioned join output).
+    /// The rule MUST NOT fire on Aggregate-over-Join shapes; the
+    /// default DataFusion two-stage agg with Repartition runs instead.
     #[tokio::test(flavor = "multi_thread")]
-    async fn fires_on_hash_join_shape_post_sigma_h_1() {
+    async fn does_not_fire_on_hash_join_body() {
         let ctx = ctx_with_rule().await;
         // Register a second tiny table to join against.
         let schema = Arc::new(ArrowSchema::new(vec![
@@ -1067,17 +1070,13 @@ mod tests {
             .await
             .unwrap();
         let plan_str = displayable(plan.as_ref()).indent(true).to_string();
-        // We expect FilterMultiAggSpec to be wired in. The plan must
-        // also still contain the HashJoinExec — the rule routes the
-        // aggregate over the join's output, it doesn't replace the
-        // join itself.
         assert!(
-            plan_str.contains("FilterMultiAggSpec"),
-            "InjectFilterMultiAggRule should now fire over a join body.\nPlan:\n{plan_str}"
+            !plan_str.contains("FilterMultiAggSpec"),
+            "InjectFilterMultiAggRule must NOT fire over a join body.\nPlan:\n{plan_str}"
         );
         assert!(
             plan_str.contains("HashJoinExec"),
-            "Σ.H.1 must not eliminate the HashJoin; the join still runs.\nPlan:\n{plan_str}"
+            "join must still be present in the default plan.\nPlan:\n{plan_str}"
         );
     }
 
