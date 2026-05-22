@@ -69,6 +69,17 @@ pub mod fused_aggregate_filter_multi_agg;
 // plan shape into a single `FusedAggregateExec<FilterMultiAggSpec>`.
 // Group-by-aware counterpart to `InjectFilterSumRule`.
 pub mod fused_aggregate_filter_multi_agg_rule;
+// Task #610 follow-up: `DedupeAggregateForFloatDeterminism` —
+// PhysicalOptimizerRule that detects structurally-identical
+// AggregateExec subtrees and forces both to mode=Single to eliminate
+// f64 SUM non-determinism (TPC-H Q15's CTE-duplicate shape). SCAFFOLD
+// ONLY — not yet wired into any SessionState. See module docs.
+pub mod dedupe_aggregate_rule;
+// Σ.P.1: session-scoped subquery CSE. SharedSubtreeExec wraps a
+// duplicated subtree; both consumers share an Arc<CachedBatches> so
+// the first execute() computes and the rest replay. Backing storage
+// for DedupeAggregateForFloatDeterminism's CSE rewrite path.
+pub mod shared_subtree_exec;
 // Σ.H.1d.1 (task #552): scaffolding for the parallel numeric-keyed
 // `FilterMultiAggSpec`. Hosts `NumericKeyKind` and (future)
 // `FilterMultiAggSpecNumeric`. Kept disjoint from the existing
@@ -106,8 +117,71 @@ pub mod dict_aggregate;
 // AggregateExec(Partial)` on a dict group column + COUNT(*) into a
 // DictGroupCountExec. Speculative; non-matching plans pass through.
 pub mod dict_aggregate_rule;
+// Σ.K.2 (2026-05-21): query-shape-aware dict-arrival routing. Pre-
+// planning helper that walks a LogicalPlan and decides per-table
+// whether `with_dict_preservation(true)` is a net win, based on the
+// query's downstream operators (GROUP BY shape vs LIKE / multi-agg).
+// Lives outside the physical optimiser to avoid the LLVM-codegen
+// perturbation cost recorded in optimizer-codegen-sensitivity.
+pub mod dict_routing;
+// Σ.L.2 (2026-05-21): adaptive runtime workload feedback. Persists
+// per-shape probe outcomes + per-query observability (selectivity,
+// hash collision rate) to a SQLite file (~/.ematix/workload.db by
+// default). The optimiser consults this before speculating; after
+// ~100 queries on a workload, decisions converge and the probe runs
+// at most once per new shape.
+pub mod workload_log;
+// Σ.L.3 retired (2026-05-22): adaptive predicate reordering experiment
+// rejected by triangulation bench. Kernel-bench 0.64× on isolated Q06
+// didn't translate to wall-time at SF=1 or SF=10. See
+// `project_sigma_l3c_deleted.md` for the full bench-driven rationale.
+// Σ.L.4 (2026-05-21): cross-query scan-cache framing. When two
+// concurrent queries scan the same (file, row_group, projection,
+// filter), they share a single decoded handle instead of decoding
+// twice. Scaffolding lands here; full scan-path integration is a
+// follow-up bite.
+pub mod scan_cache;
+// Σ.L.5 (2026-05-21): workload-aware parquet write tuning. Reads
+// Σ.L.2's workload.db, emits recommendations for row-group size,
+// sort keys, bloom columns, dict columns, and compression codec.
+// Scaffolding lands here; CLI + actual rewrite are follow-ups.
+pub mod write_tuner;
+// Σ.M (2026-05-21): SQL → PhysicalPlan cache. Keyed by canonicalised
+// SQL string + schema-version. Photon does this for prepared statements
+// only; we do it for ad-hoc SQL. Massive win on benchmark/dashboard
+// workloads where queries repeat.
+pub mod plan_cache;
+// Σ.J.2 (2026-05-21): cross-stage bloom filter for distributed joins.
+// Build-side worker computes a bloom over join keys; ships it via
+// Flight metadata to probe-side workers; probe-side skips rows before
+// shipping. Cuts cross-stage row volume by 10-100× on selective joins.
+pub mod bloom;
+// Σ.N (2026-05-21): Robin Hood vectorized hash table for aggregates.
+// Open-addressing with Robin Hood eviction (probe-distance equalisation).
+// Photon's signature operator; nobody ships this in OSS DataFusion.
+// Tonight ships the data structure + tests; operator integration is a
+// follow-up bite to avoid the optimizer-codegen-sensitivity tax.
+pub mod robin_hood_agg;
+// Σ.N.d (2026-05-22): planner rule that auto-installs
+// RobinHoodAggregateExec on AggregateExec(Final/Partial) sub-plans
+// with a single Int64 GROUP BY + COUNT(*). NOT installed in default
+// chain — opt-in only via install_robin_hood_rule(state_builder) to
+// avoid the codegen tax recorded in optimizer-codegen-sensitivity.
+pub mod robin_hood_agg_rule;
+// Σ.J.2.b.vi (2026-05-22): per-request PhysicalOptimizerRule that
+// walks the plan, finds EmatixFastParquetExec scans whose
+// `<table>.<col>` uuid matches a build-side bloom in ContextBlooms,
+// and wraps them in BloomFilterExec. Closes the probe-side half of
+// the distributed bloom flow; build-side emitter is Σ.J.2.b.vii.
+pub mod context_bloom_rule;
+// Σ.O (2026-05-21): in-memory LRU cache of decoded RecordBatch by
+// (file_path, row_group_idx, projection_hash). Avoids re-decoding
+// the same parquet column chunks across queries in the same session.
+// Multi-query workloads (dashboards, repeated benchmarks) reuse
+// decoded batches instead of re-decoding.
 pub mod hash;
 pub mod join;
+pub mod parquet_decode_cache;
 // Σ.E5 (2026-05-19): Photon-style vectorized LIKE pattern matcher
 // using memchr::memmem. Used by emat's BridgeFilter for byte_array
 // substring predicates (and available as a standalone utility).

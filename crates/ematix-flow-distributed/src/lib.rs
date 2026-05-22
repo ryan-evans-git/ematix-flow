@@ -50,13 +50,30 @@ pub mod work_unit;
 // URLs continue to work unchanged. See module docs.
 pub mod peer_discovery;
 
+// Σ.J.2.b.v — Flight passthrough for cross-stage bloom filters. Build-
+// side workers stuff BloomFilters into `x-ematix-bloom-*` HTTP headers
+// via `set_distributed_passthrough_headers`; probe-side workers extract
+// them from the inbound request headers and stash them in a SessionState
+// extension (`ContextBlooms`) where a downstream optimizer rule can
+// wrap matching scans in `BloomFilterExec`.
+pub mod bloom_flight;
+// Σ.J.2.b.vii — automatic build-side bloom emitter. Walks a
+// LogicalPlan looking for small-build-side Inner equijoins on Int64
+// columns; for each match, pre-executes the build sub-plan and
+// returns a `HashMap<column_uuid, BloomFilter>` ready to ship via
+// `blooms_to_header_map`. Closes the distributed-bloom perf loop
+// end-to-end.
+pub mod bloom_emitter;
+
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use datafusion::common::DataFusionError;
 use datafusion::execution::SessionStateBuilder;
 use datafusion::prelude::SessionContext;
-use datafusion_distributed::{DistributedExt, DistributedPhysicalOptimizerRule, WorkerResolver};
+use datafusion_distributed::{
+    CompressionType, DistributedExt, DistributedPhysicalOptimizerRule, WorkerResolver,
+};
 use ematix_flow_core::backend::{
     ArrowBatchStream, Backend, BackendConfig, BackendError, DeleteHandling, Dialect,
     DistributedConfig, DistributedTlsConfig, StrategyRunResult, TargetTable, WriteMode,
@@ -189,6 +206,14 @@ impl DistributedBackend {
             });
             builder = builder.with_distributed_channel_resolver(resolver);
         }
+        // Σ.J — pin Flight payload compression to LZ4_FRAME. This matches
+        // datafusion-distributed's current default but is set explicitly so a
+        // future dep upgrade can't quietly drop it. LZ4_FRAME ships TPC-H tuples
+        // ~3× smaller than uncompressed with sub-millisecond decode at SF=1,
+        // making it a clear win on any non-trivial peer-mesh shuffle.
+        builder = builder
+            .with_distributed_compression(Some(CompressionType::LZ4_FRAME))
+            .expect("LZ4_FRAME is a valid compression type");
         Arc::new(SessionContext::from(builder.build()))
     }
 }
