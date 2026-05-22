@@ -69,6 +69,12 @@ pub mod fused_aggregate_filter_multi_agg;
 // plan shape into a single `FusedAggregateExec<FilterMultiAggSpec>`.
 // Group-by-aware counterpart to `InjectFilterSumRule`.
 pub mod fused_aggregate_filter_multi_agg_rule;
+// Task #610 follow-up: `DedupeAggregateForFloatDeterminism` —
+// PhysicalOptimizerRule that detects structurally-identical
+// AggregateExec subtrees and forces both to mode=Single to eliminate
+// f64 SUM non-determinism (TPC-H Q15's CTE-duplicate shape). SCAFFOLD
+// ONLY — not yet wired into any SessionState. See module docs.
+pub mod dedupe_aggregate_rule;
 // Σ.H.1d.1 (task #552): scaffolding for the parallel numeric-keyed
 // `FilterMultiAggSpec`. Hosts `NumericKeyKind` and (future)
 // `FilterMultiAggSpecNumeric`. Kept disjoint from the existing
