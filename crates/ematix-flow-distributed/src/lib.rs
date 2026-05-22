@@ -57,6 +57,13 @@ pub mod peer_discovery;
 // extension (`ContextBlooms`) where a downstream optimizer rule can
 // wrap matching scans in `BloomFilterExec`.
 pub mod bloom_flight;
+// Σ.J.2.b.vii — automatic build-side bloom emitter. Walks a
+// LogicalPlan looking for small-build-side Inner equijoins on Int64
+// columns; for each match, pre-executes the build sub-plan and
+// returns a `HashMap<column_uuid, BloomFilter>` ready to ship via
+// `blooms_to_header_map`. Closes the distributed-bloom perf loop
+// end-to-end.
+pub mod bloom_emitter;
 
 use std::sync::Arc;
 
