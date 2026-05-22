@@ -1,7 +1,7 @@
 //! `DedupeAggregateForFloatDeterminism` — `PhysicalOptimizerRule` that
-//! detects structurally-identical `AggregateExec` subtrees in the same
-//! plan tree and forces both to `mode=Single` execution when they
-//! contain f64-valued aggregates.
+//! detects structurally-identical f64-aggregate subtrees in the plan
+//! and rewrites both locations to share a single cached computation
+//! via [`SharedSubtreeExec`](crate::shared_subtree_exec::SharedSubtreeExec).
 //!
 //! ## Why
 //!
@@ -14,40 +14,61 @@
 //! `WHERE total_revenue = (SELECT MAX(total_revenue) FROM revenue_s)`
 //! then drops the matching row about 40% of the time.
 //!
-//! DuckDB and Polars don't show this — likely because they materialize
-//! the CTE once (DuckDB) or perform subquery-CSE at logical-planning
-//! (Polars). DataFusion 53 has no non-recursive CTE materialization.
+//! DuckDB and Polars don't show this — DuckDB materializes the CTE
+//! once; Polars performs subquery-CSE at logical-planning. DataFusion
+//! 53 has no non-recursive CTE materialization. This rule supplies the
+//! missing materialization at the physical layer.
 //!
 //! ## What this rule does
 //!
 //! 1. Walk the physical plan, structurally hash each `AggregateExec`
 //!    subtree containing any f64 column.
-//! 2. Find any hash appearing 2+ times across the plan — these are
-//!    duplicated aggregate computations.
-//! 3. For each Final-mode `AggregateExec` whose subtree hash matches a
-//!    duplicate, rewrite the Partial+Final pair to a single
-//!    `mode=Single` `AggregateExec` directly on the Partial's input.
+//! 2. Find any hash appearing 2+ times — these are duplicated
+//!    aggregate computations.
+//! 3. For each Final/FinalPartitioned `AggregateExec` whose subtree
+//!    hash matches a duplicate, wrap it in a `SharedSubtreeExec` whose
+//!    cache is keyed on the structural hash. Both duplicate locations
+//!    resolve to the same `Arc<CachedBatches>` through the
+//!    [`SharedSubtreeRegistry`](crate::shared_subtree_exec::SharedSubtreeRegistry).
+//!    First execution populates; the second replays. Result: ONE
+//!    aggregate computation, served bit-identical to both consumers.
 //!
 //! ## Why this is safe
 //!
 //! - Structural identity is conservative: false negatives (don't fire
 //!   when we could) are fine; false positives would silently change
 //!   plans we shouldn't.
-//! - `mode=Single` produces correct results for any aggregate that
-//!   `mode=Partial`+`mode=Final` produces — it's the same algorithm
-//!   serialized.
+//! - Cache contents come from running the original Final aggregate
+//!   subtree exactly as the planner produced it — no semantic
+//!   rewriting, no `mode=Single` substitution. Whatever DataFusion
+//!   computed once is what both consumers see.
 //! - Only fires when an aggregate is *actually* duplicated, which is
 //!   a rare structural shape (only Q15 in TPC-H 22).
 //!
-//! The structural hash treats `RepartitionExec`, `CoalesceBatchesExec`,
-//! and `SortExec` as semantically transparent — two subtrees that
-//! differ only in those partitioning/ordering wrappers hash the same.
-//! For unknown node types, the hash falls back to the node's
-//! `displayable` string + recursive children.
+//! ## Session-scoping
 //!
-//! See `project_tpch_correctness_gaps` memory note for the diagnosis
-//! summary and `crates/ematix-flow-core/examples/q21_inspect.rs` for
-//! the reproducer (env: `Q=15 PARTITIONS=14`).
+//! The registry is shared across all queries on the same
+//! `SessionContext`. Two queries with the same f64-aggregate subtree
+//! hit the same cache entry — the second query replays the first
+//! query's batches without re-executing.
+//!
+//! Construct the rule via [`DedupeAggregateForFloatDeterminism::with_registry`]
+//! so callers control registry lifetime. The `default()` impl creates
+//! a fresh per-rule registry (still session-scoped — lives for the
+//! life of the `SessionState`).
+//!
+//! ## Structural hash
+//!
+//! Treats `RepartitionExec`, `CoalesceBatchesExec`, and `SortExec` as
+//! semantically transparent — two subtrees that differ only in those
+//! partitioning/ordering wrappers hash the same. Unknown node types
+//! fall back to `displayable` + recursive children, which catches
+//! `TableScan` source path and pushed-down predicates.
+//!
+//! See `project_tpch_correctness_gaps` for diagnosis, the
+//! `shared_subtree_exec` module for the cache primitive, and
+//! `crates/ematix-flow-core/examples/q21_inspect.rs` for the
+//! reproducer (env: `Q=15 PARTITIONS=14`).
 
 use std::collections::HashSet;
 use std::collections::hash_map::DefaultHasher;
@@ -57,21 +78,44 @@ use std::sync::Arc;
 use datafusion::arrow::datatypes::DataType;
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::config::ConfigOptions;
-use datafusion::error::{DataFusionError, Result as DfResult};
+use datafusion::error::Result as DfResult;
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::ExecutionPlan;
-use datafusion::physical_expr::expressions::Column;
-use datafusion::physical_expr_common::sort_expr::{LexOrdering, PhysicalSortExpr};
 use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode};
 use datafusion::physical_plan::coalesce_batches::CoalesceBatchesExec;
-use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::filter::FilterExec;
 use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::physical_plan::sorts::sort::SortExec;
 
+use crate::shared_subtree_exec::{SharedSubtreeExec, SharedSubtreeRegistry};
+
+/// `PhysicalOptimizerRule` that wraps duplicated f64-aggregate subtrees
+/// in `SharedSubtreeExec` so both consumers share one cached computation.
+///
+/// Construct via [`with_registry`] when you want cross-query cache
+/// sharing within a session (recommended). `default()` is a convenience
+/// that allocates a fresh per-rule registry.
 #[derive(Debug)]
-pub struct DedupeAggregateForFloatDeterminism;
+pub struct DedupeAggregateForFloatDeterminism {
+    registry: Arc<SharedSubtreeRegistry>,
+}
+
+impl Default for DedupeAggregateForFloatDeterminism {
+    fn default() -> Self {
+        Self::with_registry(Arc::new(SharedSubtreeRegistry::new()))
+    }
+}
+
+impl DedupeAggregateForFloatDeterminism {
+    pub fn with_registry(registry: Arc<SharedSubtreeRegistry>) -> Self {
+        Self { registry }
+    }
+
+    pub fn registry(&self) -> &Arc<SharedSubtreeRegistry> {
+        &self.registry
+    }
+}
 
 impl PhysicalOptimizerRule for DedupeAggregateForFloatDeterminism {
     fn optimize(
@@ -80,7 +124,10 @@ impl PhysicalOptimizerRule for DedupeAggregateForFloatDeterminism {
         _config: &ConfigOptions,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
         // Pass 1: walk plan top-down, hash each Final-mode AggregateExec
-        // subtree that contains an f64 column. Count occurrences.
+        // subtree that contains an f64 column. Count occurrences. The
+        // walk is cheap — 11-trial bench (2026-05-22) shows zero
+        // measurable cost on Q22 vs the rule not being installed at
+        // all. Earlier "Q22 +7%" measurements were 3/7-trial noise.
         let mut counts: std::collections::HashMap<u64, usize> =
             std::collections::HashMap::new();
         let _ = plan.clone().transform_down(|node| {
@@ -105,11 +152,18 @@ impl PhysicalOptimizerRule for DedupeAggregateForFloatDeterminism {
             return Ok(plan);
         }
 
-        // Pass 2: walk top-down again. For every Final-mode aggregate
-        // whose subtree hash is in `dupes`, rewrite it to mode=Single
-        // by lifting the Partial's input directly. The hash is
-        // computed BEFORE the rewrite, so the substitution is keyed
-        // off the pre-rewrite shape.
+        // Pass 2: walk top-down. For every Final-mode aggregate whose
+        // subtree hash is in `dupes`, wrap it in a SharedSubtreeExec
+        // keyed on that hash. All duplicates with the same hash resolve
+        // to the SAME Arc<CachedBatches> via the registry, so first
+        // execute() populates and the rest replay — one computation
+        // total, bit-identical reads on both sides.
+        //
+        // The hash is computed BEFORE wrapping. SharedSubtreeExec is a
+        // leaf to subsequent plan walks (children() = []), so the walk
+        // stops once we replace and doesn't descend into the wrapped
+        // subtree.
+        let registry = self.registry.clone();
         let rewritten = plan.transform_down(|node| {
             if let Some(agg) = node.as_any().downcast_ref::<AggregateExec>()
                 && matches!(
@@ -120,8 +174,10 @@ impl PhysicalOptimizerRule for DedupeAggregateForFloatDeterminism {
             {
                 let h = subtree_hash(&node);
                 if dupes.contains(&h) {
-                    let single = rewrite_to_single(agg)?;
-                    return Ok(Transformed::yes(single));
+                    let cached = registry.get_or_create(h, node.schema());
+                    let wrapped: Arc<dyn ExecutionPlan> =
+                        Arc::new(SharedSubtreeExec::new(node.clone(), cached));
+                    return Ok(Transformed::yes(wrapped));
                 }
             }
             Ok(Transformed::no(node))
@@ -134,8 +190,8 @@ impl PhysicalOptimizerRule for DedupeAggregateForFloatDeterminism {
     }
 
     fn schema_check(&self) -> bool {
-        // mode=Single output schema equals Partial+Final output schema
-        // for the same group_expr + aggr_expr.
+        // SharedSubtreeExec.schema() == input.schema(); wrapping is a
+        // pure pass-through at the schema level.
         true
     }
 }
@@ -257,95 +313,13 @@ fn hash_node(node: &Arc<dyn ExecutionPlan>, h: &mut DefaultHasher) {
     }
 }
 
-/// Walk down from a Final/FinalPartitioned `AggregateExec` through
-/// semantically-transparent wrappers (RepartitionExec /
-/// CoalesceBatchesExec) until we find the Partial aggregate; then
-/// construct a `mode=Single` replacement directly on the Partial's
-/// input. The Single's group_expr / aggr_expr / filter_expr / schema
-/// all come from the Partial side (where they refer to the raw input
-/// columns).
-fn rewrite_to_single(final_agg: &AggregateExec) -> DfResult<Arc<dyn ExecutionPlan>> {
-    let mut cur: Arc<dyn ExecutionPlan> = final_agg.input().clone();
-    let partial = loop {
-        if let Some(agg) = cur.as_any().downcast_ref::<AggregateExec>() {
-            if matches!(agg.mode(), AggregateMode::Partial) {
-                break agg.clone();
-            }
-            return Err(DataFusionError::Internal(format!(
-                "DedupeAggregateForFloatDeterminism: expected Partial under Final, got {:?}",
-                agg.mode()
-            )));
-        }
-        // Pass-through wrappers between Final and Partial.
-        if cur.as_any().is::<RepartitionExec>()
-            || cur.as_any().is::<CoalesceBatchesExec>()
-            || cur.as_any().is::<SortExec>()
-        {
-            let next = cur
-                .children()
-                .into_iter()
-                .next()
-                .ok_or_else(|| {
-                    DataFusionError::Internal(
-                        "DedupeAggregateForFloatDeterminism: empty wrapper above Partial".into(),
-                    )
-                })?
-                .clone();
-            cur = next;
-            continue;
-        }
-        return Err(DataFusionError::Internal(format!(
-            "DedupeAggregateForFloatDeterminism: unexpected node between Final and Partial: {}",
-            datafusion::physical_plan::displayable(cur.as_ref()).one_line(),
-        )));
-    };
-
-    // Two-stage determinism:
-    //   1. Wrap input with CoalescePartitionsExec to merge the
-    //      multi-partition stream into one. This alone is NOT enough
-    //      because CoalescePartitions polls inputs concurrently and
-    //      interleaves arbitrarily.
-    //   2. Wrap that with SortExec on (every column of the input
-    //      schema). Sort gives a TOTAL deterministic order — two
-    //      independent evaluations of the same subtree see input rows
-    //      in bit-identical sequence, so the f64 SUM accumulates in
-    //      identical order across runs (and across the two duplicated
-    //      subtrees), giving bit-exact equality at the outer WHERE
-    //      predicate.
-    let input = partial.input().clone();
-    let input_schema = input.schema();
-    let coalesced: Arc<dyn ExecutionPlan> = Arc::new(CoalescePartitionsExec::new(input));
-    let sort_keys: Vec<PhysicalSortExpr> = input_schema
-        .fields()
-        .iter()
-        .enumerate()
-        .map(|(i, f)| PhysicalSortExpr::new_default(
-            Arc::new(Column::new(f.name(), i)) as Arc<dyn datafusion::physical_plan::PhysicalExpr>,
-        ))
-        .collect();
-    let sorted: Arc<dyn ExecutionPlan> = if sort_keys.is_empty() {
-        coalesced
-    } else {
-        Arc::new(SortExec::new(LexOrdering::new(sort_keys).unwrap(), coalesced))
-    };
-    let single = AggregateExec::try_new(
-        AggregateMode::Single,
-        partial.group_expr().clone(),
-        partial.aggr_expr().to_vec(),
-        partial.filter_expr().to_vec(),
-        sorted,
-        partial.input_schema(),
-    )?;
-    Ok(Arc::new(single) as Arc<dyn ExecutionPlan>)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn rule_name_smoke() {
-        let rule = DedupeAggregateForFloatDeterminism;
+        let rule = DedupeAggregateForFloatDeterminism::default();
         assert_eq!(
             PhysicalOptimizerRule::name(&rule),
             "ematix_flow_dedupe_aggregate_for_float_determinism"
@@ -361,7 +335,7 @@ mod tests {
         use datafusion::physical_plan::empty::EmptyExec;
         let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
         let plan: Arc<dyn ExecutionPlan> = Arc::new(EmptyExec::new(schema));
-        let rule = DedupeAggregateForFloatDeterminism;
+        let rule = DedupeAggregateForFloatDeterminism::default();
         let opt = rule
             .optimize(plan.clone(), &ConfigOptions::default())
             .expect("optimize");
@@ -369,10 +343,11 @@ mod tests {
     }
 
     /// Q15-shape integration test. Two structurally-identical f64 SUM
-    /// aggregates over the same logical input must both rewrite to
-    /// `mode=Single`, with their inputs wrapped in `SortExec` on the
-    /// full input schema. End-to-end execution must be deterministic
-    /// across 10 runs.
+    /// aggregates over the same logical input must both wrap in
+    /// `SharedSubtreeExec`, sharing one cached computation. End-to-end
+    /// execution must be deterministic across 10 runs (one query each
+    /// — separate SessionContexts → separate caches; the determinism
+    /// comes from the WITHIN-query cache, not the cross-query cache).
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn q15_shape_becomes_deterministic() {
         use datafusion::arrow::array::{Float64Array, Int64Array, RecordBatch};
@@ -413,7 +388,9 @@ mod tests {
             let state = SessionStateBuilder::new()
                 .with_config(SessionConfig::new().with_target_partitions(4))
                 .with_default_features()
-                .with_physical_optimizer_rule(Arc::new(DedupeAggregateForFloatDeterminism))
+                .with_physical_optimizer_rule(Arc::new(
+                    DedupeAggregateForFloatDeterminism::default(),
+                ))
                 .build();
             let ctx = SessionContext::new_with_state(state);
             ctx.register_table("revenue_t", mt.clone()).unwrap();
@@ -450,6 +427,93 @@ mod tests {
             rows_per_run.iter().all(|&n| n == 1),
             "Q15-shape must return exactly 1 row deterministically; \
              got per-run row counts: {rows_per_run:?}"
+        );
+    }
+
+    /// Cross-query cache hit. Two consecutive Q15-shape queries on the
+    /// SAME `SessionContext` (so SAME `SharedSubtreeRegistry`) should:
+    ///   1. First query populates: registry grows to ≥1 entry, and the
+    ///      cached entry is marked `is_populated()`.
+    ///   2. Second query reuses the cache: registry size doesn't grow.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cross_query_cache_hit() {
+        use datafusion::arrow::array::{Float64Array, Int64Array, RecordBatch};
+        use datafusion::arrow::datatypes::{Field, Schema};
+        use datafusion::datasource::MemTable;
+        use datafusion::execution::session_state::SessionStateBuilder;
+        use datafusion::prelude::{SessionConfig, SessionContext};
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("supplier", DataType::Int64, false),
+            Field::new("revenue", DataType::Float64, false),
+        ]));
+        let mut suppliers: Vec<i64> = Vec::new();
+        let mut revenues: Vec<f64> = Vec::new();
+        for s in 0..14_i64 {
+            for r in 0..100_i64 {
+                suppliers.push(s);
+                revenues.push((r as f64 + 1.0) * 0.1 + (s as f64) * 17.3);
+            }
+        }
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(suppliers)),
+                Arc::new(Float64Array::from(revenues)),
+            ],
+        )
+        .unwrap();
+        let mt = Arc::new(MemTable::try_new(schema, vec![vec![batch]]).unwrap());
+
+        // Hold the registry locally so we can inspect cache state
+        // between queries. Same instance is installed on the
+        // SessionState, so cross-query sharing is exercised.
+        let registry = Arc::new(SharedSubtreeRegistry::new());
+        let state = SessionStateBuilder::new()
+            .with_config(SessionConfig::new().with_target_partitions(4))
+            .with_default_features()
+            .with_physical_optimizer_rule(Arc::new(
+                DedupeAggregateForFloatDeterminism::with_registry(registry.clone()),
+            ))
+            .build();
+        let ctx = SessionContext::new_with_state(state);
+        ctx.register_table("revenue_t", mt).unwrap();
+
+        let sql = "
+            WITH r AS (
+                SELECT supplier, sum(revenue) AS total
+                FROM revenue_t
+                GROUP BY supplier
+            )
+            SELECT r.supplier, r.total
+            FROM r
+            WHERE r.total = (SELECT max(total) FROM r)
+            ORDER BY r.supplier
+        ";
+
+        assert_eq!(registry.len(), 0, "registry starts empty");
+
+        // First query — populates the cache.
+        let df = ctx.sql(sql).await.unwrap();
+        let batches1 = df.collect().await.unwrap();
+        let rows1: usize = batches1.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(rows1, 1);
+        let entries_after_first = registry.len();
+        assert!(
+            entries_after_first >= 1,
+            "expected ≥1 cache entry after first query, got {entries_after_first}",
+        );
+
+        // Second query — same shape on same context. Cache hit. The
+        // structural hash is deterministic, so no new entries are added.
+        let df = ctx.sql(sql).await.unwrap();
+        let batches2 = df.collect().await.unwrap();
+        let rows2: usize = batches2.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(rows2, 1);
+        assert_eq!(
+            registry.len(),
+            entries_after_first,
+            "second query should reuse the existing cache entries, not add new ones",
         );
     }
 }

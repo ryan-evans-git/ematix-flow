@@ -51,28 +51,66 @@ use datafusion::common::Result as DfResult;
 use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::prelude::SessionContext;
 
+use crate::dedupe_aggregate_rule::DedupeAggregateForFloatDeterminism;
 use crate::dict_aggregate_rule::EnableDictGroupCountRule;
 use crate::ematix_fast_parquet::EmatixFastParquetTableProvider;
 use crate::fused_aggregate_filter_multi_agg_rule::InjectFilterMultiAggRule;
 use crate::fused_aggregate_filter_sum_rule::InjectFilterSumRule;
+use crate::shared_subtree_exec::SharedSubtreeRegistry;
 
 /// Attach ematix-flow's optimiser rule chain to a `SessionStateBuilder`.
 ///
 /// Rules installed (in registration order):
 ///
-/// 1. `EnableDictGroupCountRule` — `AggregateExec(Final+Partial)` on
+/// 1. `DedupeAggregateForFloatDeterminism` — detects f64-aggregate
+///    subtrees that appear twice in the same plan (TPC-H Q15's
+///    `revenue_s` CTE shape) and wraps both in `SharedSubtreeExec` so
+///    they share one cached computation. **Must register FIRST** —
+///    `InjectFilterMultiAggRule` / `InjectFilterSumRule` would
+///    otherwise consume one side of the duplicate pair (rewriting it
+///    to a fused operator with a different structural hash) and leave
+///    the other as the parallel-SUM source of non-determinism. The
+///    rule is a no-op on the 21/22 TPC-H queries without duplicate
+///    aggregates.
+/// 2. `EnableDictGroupCountRule` — `AggregateExec(Final+Partial)` on
 ///    `Dictionary(UInt32, Utf8|Utf8View)` + `COUNT(*)` →
-///    `DictGroupCountExec`. Runs first because its shape is a strict
-///    subset of `InjectFilterMultiAggRule`'s matcher.
-/// 2. `InjectFilterMultiAggRule` — generic filter + group-by + multi-
+///    `DictGroupCountExec`. Runs after dedupe because its shape is a
+///    strict subset of `InjectFilterMultiAggRule`'s matcher.
+/// 3. `InjectFilterMultiAggRule` — generic filter + group-by + multi-
 ///    aggregate SQL pattern → `FusedAggregateExec<FilterMultiAggSpec>`.
-/// 3. `InjectFilterSumRule` — generic SUM-over-Filter SQL →
+/// 4. `InjectFilterSumRule` — generic SUM-over-Filter SQL →
 ///    `FusedAggregateExec<FilterSumSpec>`.
+///
+/// The dedupe rule's `SharedSubtreeRegistry` is freshly allocated per
+/// call to `with_optimizer_rules` and lives for the resulting
+/// `SessionState`. Multiple queries on the same `SessionContext`
+/// reuse the same registry — so a repeat Q15 hits the cache populated
+/// by the first run.
+///
+/// If you need to inspect / clear the cache from outside (tests,
+/// admin tools), use [`with_optimizer_rules_and_registry`] instead
+/// and keep the returned `Arc<SharedSubtreeRegistry>` handle.
 pub fn with_optimizer_rules(builder: SessionStateBuilder) -> SessionStateBuilder {
-    builder
+    with_optimizer_rules_and_registry(builder).0
+}
+
+/// Same as [`with_optimizer_rules`], but also returns the
+/// `SharedSubtreeRegistry` so callers can probe cache state across
+/// queries. Useful for benches that want to verify cross-query hits,
+/// or for clearing the cache after a table is re-registered with
+/// different data.
+pub fn with_optimizer_rules_and_registry(
+    builder: SessionStateBuilder,
+) -> (SessionStateBuilder, Arc<SharedSubtreeRegistry>) {
+    let registry = Arc::new(SharedSubtreeRegistry::new());
+    let builder = builder
+        .with_physical_optimizer_rule(Arc::new(
+            DedupeAggregateForFloatDeterminism::with_registry(registry.clone()),
+        ))
         .with_physical_optimizer_rule(Arc::new(EnableDictGroupCountRule))
         .with_physical_optimizer_rule(Arc::new(InjectFilterMultiAggRule))
-        .with_physical_optimizer_rule(Arc::new(InjectFilterSumRule))
+        .with_physical_optimizer_rule(Arc::new(InjectFilterSumRule));
+    (builder, registry)
 }
 
 /// Register a parquet file as a table on `ctx` via
@@ -183,6 +221,91 @@ mod tests {
         assert!(
             plan_str.contains("DictGroupCountExec"),
             "preset didn't activate the dict-aware operator.\nPlan:\n{plan_str}"
+        );
+    }
+
+    /// `with_optimizer_rules_and_registry` exposes the registry so
+    /// callers can probe cross-query cache hits. Two Q15-shape queries
+    /// on the same SessionContext should produce 1 row each and the
+    /// registry should hold ≥1 entry after the first query (the
+    /// duplicated f64 aggregate), with no growth on the second.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn registry_handle_observes_cross_query_cache_hit() {
+        use datafusion::arrow::array::{Float64Array, Int64Array, RecordBatch};
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::datasource::MemTable;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("supplier", DataType::Int64, false),
+            Field::new("revenue", DataType::Float64, false),
+        ]));
+        let mut suppliers: Vec<i64> = Vec::new();
+        let mut revenues: Vec<f64> = Vec::new();
+        for s in 0..14_i64 {
+            for r in 0..100_i64 {
+                suppliers.push(s);
+                revenues.push((r as f64 + 1.0) * 0.1 + (s as f64) * 17.3);
+            }
+        }
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(suppliers)),
+                Arc::new(Float64Array::from(revenues)),
+            ],
+        )
+        .unwrap();
+        let mt = Arc::new(MemTable::try_new(schema, vec![vec![batch]]).unwrap());
+
+        let (builder, registry) = with_optimizer_rules_and_registry(
+            SessionStateBuilder::new()
+                .with_config(SessionConfig::new().with_target_partitions(4))
+                .with_default_features(),
+        );
+        let ctx = SessionContext::new_with_state(builder.build());
+        ctx.register_table("revenue_t", mt).unwrap();
+
+        let sql = "
+            WITH r AS (
+                SELECT supplier, sum(revenue) AS total
+                FROM revenue_t
+                GROUP BY supplier
+            )
+            SELECT r.supplier, r.total
+            FROM r
+            WHERE r.total = (SELECT max(total) FROM r)
+        ";
+
+        assert_eq!(registry.len(), 0);
+        let n1: usize = ctx
+            .sql(sql)
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap()
+            .iter()
+            .map(|b| b.num_rows())
+            .sum();
+        assert_eq!(n1, 1);
+        let after_first = registry.len();
+        assert!(after_first >= 1, "expected ≥1 cache entry, got {after_first}");
+
+        let n2: usize = ctx
+            .sql(sql)
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap()
+            .iter()
+            .map(|b| b.num_rows())
+            .sum();
+        assert_eq!(n2, 1);
+        assert_eq!(
+            registry.len(),
+            after_first,
+            "second query must reuse the cache, not allocate new entries",
         );
     }
 

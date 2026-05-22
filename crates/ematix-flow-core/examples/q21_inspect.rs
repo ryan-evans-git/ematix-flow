@@ -27,7 +27,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let mode = std::env::var("Q21_MODE").unwrap_or_else(|_| "all".to_string());
-    println!("Q21_MODE = {mode}  (none / dict / multi / sum / dedupe / all)");
+    println!("Q21_MODE = {mode}  (none / dict / multi / sum / dedupe / v040 / all)");
     let partitions: usize = std::env::var("PARTITIONS")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -42,15 +42,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // source of f64 non-determinism (Q15).
     if matches!(mode.as_str(), "dedupe" | "all") {
         builder =
-            builder.with_physical_optimizer_rule(Arc::new(DedupeAggregateForFloatDeterminism));
+            builder.with_physical_optimizer_rule(Arc::new(
+                DedupeAggregateForFloatDeterminism::default(),
+            ));
     }
-    if matches!(mode.as_str(), "dict" | "all") {
+    if matches!(mode.as_str(), "dict" | "all" | "v040") {
         builder = builder.with_physical_optimizer_rule(Arc::new(EnableDictGroupCountRule));
     }
-    if matches!(mode.as_str(), "multi" | "all") {
+    if matches!(mode.as_str(), "multi" | "all" | "v040") {
         builder = builder.with_physical_optimizer_rule(Arc::new(InjectFilterMultiAggRule));
     }
-    if matches!(mode.as_str(), "sum" | "all") {
+    if matches!(mode.as_str(), "sum" | "all" | "v040") {
         builder = builder.with_physical_optimizer_rule(Arc::new(InjectFilterSumRule));
     }
     let state = builder.build();

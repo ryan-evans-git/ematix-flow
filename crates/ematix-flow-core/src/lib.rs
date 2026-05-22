@@ -75,6 +75,11 @@ pub mod fused_aggregate_filter_multi_agg_rule;
 // f64 SUM non-determinism (TPC-H Q15's CTE-duplicate shape). SCAFFOLD
 // ONLY — not yet wired into any SessionState. See module docs.
 pub mod dedupe_aggregate_rule;
+// Σ.P.1: session-scoped subquery CSE. SharedSubtreeExec wraps a
+// duplicated subtree; both consumers share an Arc<CachedBatches> so
+// the first execute() computes and the rest replay. Backing storage
+// for DedupeAggregateForFloatDeterminism's CSE rewrite path.
+pub mod shared_subtree_exec;
 // Σ.H.1d.1 (task #552): scaffolding for the parallel numeric-keyed
 // `FilterMultiAggSpec`. Hosts `NumericKeyKind` and (future)
 // `FilterMultiAggSpecNumeric`. Kept disjoint from the existing
