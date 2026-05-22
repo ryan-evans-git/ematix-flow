@@ -167,6 +167,18 @@ fn match_robin_hood_shape(
             if real_schema.field(pcol.index()).data_type() != &DataType::Int64 {
                 return None;
             }
+            // Σ.N.d partition guard (post-bench fix): RobinHood-
+            // AggregateExec emits a single output partition and
+            // iterates input partitions serially on one thread. If
+            // the input has multiple partitions, the rewrite would
+            // serialise what was parallel — catastrophic regression.
+            // Σ.N.e will add per-partition Partial/Final modes; until
+            // then, only fire when the input is already single-
+            // partition. See [[sigma-nd-partition-blocker]].
+            use datafusion::physical_plan::ExecutionPlanProperties;
+            if real.output_partitioning().partition_count() > 1 {
+                return None;
+            }
             return Some((real, col_idx, group_out_name.clone(), count_out_name));
         }
         // Walk down through single-child pass-through nodes.
@@ -189,14 +201,23 @@ mod tests {
     use futures_util::TryStreamExt;
     use std::sync::Arc;
 
+    /// Build a ctx with target_partitions=4 so DataFusion splits the
+    /// plan into Partial+Final (mode=Single is used at
+    /// target_partitions=1, which doesn't match the rule's expected
+    /// FinalPartitioned→Partial shape).
     fn make_ctx_with_rule() -> SessionContext {
+        let cfg = datafusion::prelude::SessionConfig::new().with_target_partitions(4);
         let state = install_robin_hood_rule(
-            SessionStateBuilder::new().with_default_features(),
+            SessionStateBuilder::new().with_default_features().with_config(cfg),
         )
         .build();
         SessionContext::new_with_state(state)
     }
 
+    /// Single-batch MemTable → input is always 1-partition regardless
+    /// of `target_partitions`. The rule's partition guard checks the
+    /// raw input partition count, which for parquet scans equals
+    /// target_partitions but for MemTable equals batch count.
     fn register_int64_t(ctx: &SessionContext) {
         let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, false)]));
         let batch = RecordBatch::try_new(
@@ -208,6 +229,32 @@ mod tests {
         .unwrap();
         let mt = MemTable::try_new(schema, vec![vec![batch]]).unwrap();
         ctx.register_table("t", Arc::new(mt)).unwrap();
+    }
+
+    /// Multi-batch MemTable → multi-partition input. The partition
+    /// guard should refuse the rewrite here (would serialise parallel
+    /// scans onto one thread).
+    fn register_int64_t_multi_partition(ctx: &SessionContext) {
+        let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, false)]));
+        let schema_for_batches = schema.clone();
+        let make_batch = move |vals: Vec<i64>| {
+            RecordBatch::try_new(
+                schema_for_batches.clone(),
+                vec![Arc::new(Int64Array::from(vals))],
+            )
+            .unwrap()
+        };
+        let mt = MemTable::try_new(
+            schema,
+            vec![
+                vec![make_batch(vec![1, 2, 3, 1])],
+                vec![make_batch(vec![2, 1, 5, 5])],
+                vec![make_batch(vec![2, 3, 3, 3])],
+                vec![make_batch(vec![1, 1, 5, 5])],
+            ],
+        )
+        .unwrap();
+        ctx.register_table("t_mp", Arc::new(mt)).unwrap();
     }
 
     #[tokio::test]
@@ -277,6 +324,26 @@ mod tests {
         assert!(
             !s.contains("RobinHoodAggregateExec"),
             "rule fired on non-Int64 group — that's wrong. Got:\n{s}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rule_no_op_on_multi_partition_input() {
+        // Σ.N.d partition guard: when the scan emits multiple partitions
+        // (a multi-batch MemTable here, or multi-row-group parquet in
+        // production), the rewrite would serialise parallel scans onto
+        // one thread. Rule must refuse.
+        let ctx = make_ctx_with_rule();
+        register_int64_t_multi_partition(&ctx);
+        let df = ctx
+            .sql("SELECT k, COUNT(*) FROM t_mp GROUP BY k")
+            .await
+            .unwrap();
+        let plan = df.create_physical_plan().await.unwrap();
+        let s = format!("{plan:?}");
+        assert!(
+            !s.contains("RobinHoodAggregateExec"),
+            "rule fired on multi-partition input — partition guard failed. Got:\n{s}"
         );
     }
 
