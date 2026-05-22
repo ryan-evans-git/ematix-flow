@@ -626,15 +626,31 @@ impl ExecutionPlan for RobinHoodAggregateExec {
         let schema_for_stream = schema.clone();
 
         let fut = async move {
+            // Σ.N.f profiling — set EMAT_RH_TIMING=1 to dump per-stage
+            // wall times per partition. Helps identify whether the
+            // operator's 25× wall-time gap vs stock lives in ingest,
+            // finalize, or stream-yielding.
+            let timing = std::env::var("EMAT_RH_TIMING").is_ok();
+            let mut t_ingest_us: u128 = 0;
+            let mut t_input_wait_us: u128 = 0;
+            let mut n_rows: usize = 0;
+            let t_total = std::time::Instant::now();
+
             let mut agg = RobinHoodCountAgg::new();
             let mut s = input.execute(partition, context)?;
-            while let Some(batch) = s.try_next().await? {
+            loop {
+                let t_w = std::time::Instant::now();
+                let batch_opt = s.try_next().await?;
+                t_input_wait_us += t_w.elapsed().as_micros();
+                let Some(batch) = batch_opt else { break };
+                n_rows += batch.num_rows();
                 let keys_arr = batch.column(group_col_idx);
                 let keys = keys_arr.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
                     DataFusionError::Internal(format!(
                         "RobinHoodAggregateExec: column {group_col_idx} not Int64Array"
                     ))
                 })?;
+                let t_i = std::time::Instant::now();
                 match mode {
                     RobinHoodMode::Partial => {
                         agg.ingest_int64_array(keys);
@@ -653,8 +669,10 @@ impl ExecutionPlan for RobinHoodAggregateExec {
                         agg.ingest_partial_counts(keys, counts);
                     }
                 }
+                t_ingest_us += t_i.elapsed().as_micros();
             }
             // Finalise — sort by key for stable output.
+            let t_f = std::time::Instant::now();
             let mut pairs: Vec<(i64, u64)> = agg.table().iter().collect();
             pairs.sort_by_key(|(k, _)| *k);
             let keys: Vec<i64> = pairs.iter().map(|(k, _)| *k).collect();
@@ -667,6 +685,20 @@ impl ExecutionPlan for RobinHoodAggregateExec {
                 ],
             )
             .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+            let t_finalize_us = t_f.elapsed().as_micros();
+            if timing {
+                let mode_str = match mode {
+                    RobinHoodMode::Partial => "Partial",
+                    RobinHoodMode::FinalPartitioned => "Final",
+                };
+                let t_total_us = t_total.elapsed().as_micros();
+                let n_groups = agg.len();
+                eprintln!(
+                    "[RH-timing] {mode_str:<8} p={partition:<2} total={t_total_us}us \
+                     input_wait={t_input_wait_us}us ingest={t_ingest_us}us \
+                     finalize={t_finalize_us}us  rows={n_rows} groups={n_groups}"
+                );
+            }
             DfResult::Ok(out)
         };
 
