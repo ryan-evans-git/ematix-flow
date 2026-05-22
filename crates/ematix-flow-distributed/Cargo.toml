@@ -58,3 +58,7 @@ rcgen = "0.14"
 [[bench]]
 name = "tpch_distributed"
 harness = false
+
+[[bench]]
+name = "tpch_distributed_bloom"
+harness = false
