@@ -1,0 +1,30 @@
+#!/bin/bash
+# Trino engine bootstrap. Dispatches to
+# infra/distributed-peers/trino/install.sh in the cloned repo.
+#
+# Role: ${role}
+# Coordinator: ${coordinator_ip}
+# Bench bucket: ${bench_bucket}
+# Glue database: ${glue_database_name}
+
+set -uo pipefail
+exec > >(tee /var/log/trino-userdata.log) 2>&1
+
+echo "=== trino bootstrap: role=${role}: $(date -u +%FT%TZ) ==="
+
+INSTALL=/opt/ematix/ematix-flow/infra/distributed-peers/trino/install.sh
+if [ ! -x "$INSTALL" ]; then
+  echo "FATAL: $INSTALL missing — base userdata didn't clone the repo correctly"
+  exit 1
+fi
+
+# The install script handles role-specific config (coordinator
+# discovery, jvm sizing, glue catalog wire-up).
+export AWS_REGION=${aws_region}
+export BENCH_BUCKET=${bench_bucket}
+export GLUE_DATABASE=${glue_database_name}
+export TRINO_SCALE_FACTOR=${scale_factor}
+
+"$INSTALL" --role ${role} --coordinator-host ${coordinator_ip}
+
+echo "=== trino bootstrap: done ==="

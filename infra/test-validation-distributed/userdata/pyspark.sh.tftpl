@@ -1,0 +1,34 @@
+#!/bin/bash
+# PySpark engine bootstrap. Dispatches to
+# infra/distributed-peers/pyspark/install.sh in the cloned repo.
+#
+# Role: ${role}  (master | worker)
+# Master host: ${coordinator_ip}
+# Bench bucket: ${bench_bucket}
+
+set -uo pipefail
+exec > >(tee /var/log/pyspark-userdata.log) 2>&1
+
+echo "=== pyspark bootstrap: role=${role}: $(date -u +%FT%TZ) ==="
+
+INSTALL=/opt/ematix/ematix-flow/infra/distributed-peers/pyspark/install.sh
+if [ ! -x "$INSTALL" ]; then
+  echo "FATAL: $INSTALL missing — base userdata didn't clone the repo correctly"
+  exit 1
+fi
+
+export AWS_REGION=${aws_region}
+export BENCH_BUCKET=${bench_bucket}
+export SPARK_SCALE_FACTOR=${scale_factor}
+
+# Terraform calls the coordinator-side role "coordinator", but Spark's
+# vocabulary is "master". Translate at the boundary so install.sh can
+# stay engine-native.
+ROLE=${role}
+if [ "$ROLE" = "coordinator" ]; then
+  ROLE=master
+fi
+
+"$INSTALL" --role "$ROLE" --master-host ${coordinator_ip}
+
+echo "=== pyspark bootstrap: done ==="

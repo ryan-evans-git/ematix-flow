@@ -1,0 +1,71 @@
+#!/bin/bash
+# ematix-flow distributed engine bootstrap.
+#
+# Role: ${role}
+# Coordinator: ${coordinator_ip}
+# Scale: ${scale_factor}
+# Bench bucket: ${bench_bucket}
+#
+# Builds flow-worker from /opt/ematix/ematix-flow (cloned by base.sh)
+# and starts it as a systemd service. Coordinator runs the bench
+# orchestrator; workers expose Arrow Flight on port 50051.
+
+set -uo pipefail
+exec > >(tee /var/log/ematix-userdata.log) 2>&1
+
+echo "=== ematix bootstrap: role=${role}: $(date -u +%FT%TZ) ==="
+
+# Rust toolchain — install for ec2-user (not root) so cargo cache lives
+# under /home/ec2-user.
+sudo -u ec2-user bash <<'INSTALL_RUST'
+if ! command -v rustc >/dev/null 2>&1; then
+  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
+fi
+source $HOME/.cargo/env
+rustc --version
+INSTALL_RUST
+
+# Build flow-worker (only the binary we actually need). Reusing the
+# cached target dir if present.
+sudo -u ec2-user bash <<'BUILD'
+source $HOME/.cargo/env
+cd /opt/ematix/ematix-flow
+cargo build --release -p ematix-flow-distributed --bin flow-worker 2>&1 | tail -50
+BUILD
+
+# systemd unit. Coordinator vs worker share the same flow-worker
+# binary; the orchestrator just connects to the workers' Flight
+# endpoints by IP.
+cat > /etc/systemd/system/flow-worker.service <<EOF
+[Unit]
+Description=ematix-flow flow-worker (Arrow Flight peer)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ec2-user
+WorkingDirectory=/opt/ematix/ematix-flow
+Environment=AWS_REGION=${aws_region}
+Environment=BENCH_BUCKET=${bench_bucket}
+Environment=EMATIX_ROLE=${role}
+Environment=EMATIX_COORDINATOR_IP=${coordinator_ip}
+Environment=EMATIX_SCALE_FACTOR=${scale_factor}
+Environment=RUST_LOG=info
+ExecStart=/opt/ematix/ematix-flow/target/release/flow-worker --bind 0.0.0.0:50051
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable flow-worker.service
+systemctl start flow-worker.service
+
+# Quick health check
+sleep 10
+systemctl is-active flow-worker.service || journalctl -u flow-worker.service --no-pager | tail -50
+
+echo "=== ematix bootstrap: done ==="
