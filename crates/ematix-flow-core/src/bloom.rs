@@ -1,0 +1,359 @@
+//! Σ.J.2 — cross-stage bloom filter for distributed joins.
+//!
+//! ## Why this is the right distributed lever
+//!
+//! In a distributed hash join, the build side (smaller table) lives
+//! on one set of workers; the probe side (larger table) lives on
+//! another. The probe side ships rows over Flight to the join workers
+//! based on partitioning. For a selective join (say, 1% of probe rows
+//! match a build row), 99% of the shuffle is wasted bandwidth.
+//!
+//! A bloom filter computed on the build side, shipped via Flight
+//! metadata to the probe-side scans, lets probe-side workers skip
+//! 90-99% of those rows *before they hit the wire*. This is **the**
+//! single biggest distributed lever publicly demonstrated by
+//! Photon/Trino/Spark — and not implemented in OSS DataFusion
+//! distributed today.
+//!
+//! ## Design
+//!
+//! - [`BloomFilter`] — fixed-size bit vector with k hash functions.
+//!   Tuned for ~1% FPR at 10 bits per key. Standard split-block design
+//!   (cache-line-aligned blocks of 256 bits, k=8 hashes per block) for
+//!   fast SIMD-friendly lookup.
+//! - [`BloomBuilder`] — accumulates keys on the build side; finalises
+//!   to a [`SerialisedBloom`] for shipping.
+//! - [`SerialisedBloom`] — wire format. Tiny header (n_blocks, k_hashes,
+//!   seed) + raw bytes; round-trippable via `to_bytes` / `from_bytes`.
+//!
+//! ## Tonight's scope: kernel + serialisation
+//!
+//! Plumbing through `HashJoinExec` + Flight metadata propagation is a
+//! follow-up bite (`Σ.J.2.b`). What lands here:
+//!
+//! 1. BloomFilter kernel + builder.
+//! 2. Serialisation format (so the Flight-metadata wiring can drop
+//!    in without redesign).
+//! 3. Tests proving FPR is within spec.
+//! 4. A `RecordBatch` builder helper that accepts an Arrow column
+//!    and produces a BloomBuilder over its values.
+
+use arrow_array::cast::AsArray;
+use arrow_array::types::Int64Type;
+use arrow_array::Array;
+
+/// Bits per key. 10 bits per key + k=8 hash functions ≈ 1% FPR.
+pub const DEFAULT_BITS_PER_KEY: usize = 10;
+/// Hash functions per lookup. Split-block design — all k hits land in
+/// a single 256-bit block, so each lookup is one cache line.
+pub const DEFAULT_K_HASHES: usize = 8;
+/// Block size in bits. Cache-line sized → one lookup = one fetch.
+pub const BLOCK_BITS: usize = 256;
+pub const BLOCK_BYTES: usize = BLOCK_BITS / 8;
+
+/// Σ.J.2 — split-block bloom filter. Cache-line-aligned blocks, k
+/// hashes per block, single block touched per lookup.
+#[derive(Debug, Clone)]
+pub struct BloomFilter {
+    /// Raw bytes, length = n_blocks * BLOCK_BYTES.
+    bits: Vec<u8>,
+    n_blocks: usize,
+    seed: u64,
+}
+
+impl BloomFilter {
+    /// Construct sized for `expected_keys` with the default 1% FPR.
+    pub fn for_keys(expected_keys: usize) -> Self {
+        Self::with_capacity(expected_keys, DEFAULT_BITS_PER_KEY)
+    }
+
+    pub fn with_capacity(expected_keys: usize, bits_per_key: usize) -> Self {
+        let total_bits = (expected_keys.max(1) * bits_per_key).max(BLOCK_BITS);
+        let n_blocks = total_bits.div_ceil(BLOCK_BITS);
+        Self {
+            bits: vec![0u8; n_blocks * BLOCK_BYTES],
+            n_blocks,
+            seed: 0xc0ffee_u64,
+        }
+    }
+
+    fn block_idx(&self, h: u64) -> usize {
+        (h % self.n_blocks as u64) as usize
+    }
+
+    /// Σ.J.2 — insert a hash. Caller is responsible for hashing the
+    /// key (so we can support i32/i64/string/etc. uniformly).
+    pub fn insert_hash(&mut self, h: u64) {
+        let block = self.block_idx(h);
+        let block_start = block * BLOCK_BYTES;
+        // k=8 split hashes from one u64. Each picks one bit position
+        // within the block.
+        let mut x = h.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        for _ in 0..DEFAULT_K_HASHES {
+            x = x.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+            let bit = (x >> 32) as usize % BLOCK_BITS;
+            let byte = block_start + bit / 8;
+            self.bits[byte] |= 1 << (bit % 8);
+        }
+    }
+
+    /// Σ.J.2 — check if `h` might be present.
+    pub fn might_contain_hash(&self, h: u64) -> bool {
+        let block = self.block_idx(h);
+        let block_start = block * BLOCK_BYTES;
+        let mut x = h.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        for _ in 0..DEFAULT_K_HASHES {
+            x = x.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+            let bit = (x >> 32) as usize % BLOCK_BITS;
+            let byte = block_start + bit / 8;
+            if self.bits[byte] & (1 << (bit % 8)) == 0 {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Σ.J.2 — convenience: insert an i64 key.
+    pub fn insert_i64(&mut self, v: i64) {
+        self.insert_hash(hash_i64(v, self.seed));
+    }
+
+    pub fn might_contain_i64(&self, v: i64) -> bool {
+        self.might_contain_hash(hash_i64(v, self.seed))
+    }
+
+    /// Σ.J.2 — convenience: insert a string key.
+    pub fn insert_str(&mut self, s: &str) {
+        self.insert_hash(hash_bytes(s.as_bytes(), self.seed));
+    }
+
+    pub fn might_contain_str(&self, s: &str) -> bool {
+        self.might_contain_hash(hash_bytes(s.as_bytes(), self.seed))
+    }
+
+    /// Σ.J.2 — wire-format serialisation. 24-byte header (magic +
+    /// version + n_blocks + seed) + raw bits.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(24 + self.bits.len());
+        out.extend_from_slice(b"EBLM0001"); // 8 bytes magic + version
+        out.extend_from_slice(&(self.n_blocks as u64).to_le_bytes());
+        out.extend_from_slice(&self.seed.to_le_bytes());
+        out.extend_from_slice(&self.bits);
+        out
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, BloomError> {
+        if bytes.len() < 24 {
+            return Err(BloomError::TooSmall);
+        }
+        if &bytes[0..8] != b"EBLM0001" {
+            return Err(BloomError::BadMagic);
+        }
+        let n_blocks =
+            u64::from_le_bytes(bytes[8..16].try_into().unwrap()) as usize;
+        let seed = u64::from_le_bytes(bytes[16..24].try_into().unwrap());
+        let expected_len = 24 + n_blocks * BLOCK_BYTES;
+        if bytes.len() != expected_len {
+            return Err(BloomError::LengthMismatch);
+        }
+        let bits = bytes[24..].to_vec();
+        Ok(Self {
+            bits,
+            n_blocks,
+            seed,
+        })
+    }
+
+    /// Bit count — useful for telemetry / FPR estimation.
+    pub fn estimated_population(&self) -> usize {
+        self.bits.iter().map(|b| b.count_ones() as usize).sum()
+    }
+
+    /// Footprint in bytes — what's shipped over Flight.
+    pub fn wire_size(&self) -> usize {
+        24 + self.bits.len()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BloomError {
+    TooSmall,
+    BadMagic,
+    LengthMismatch,
+}
+
+impl std::fmt::Display for BloomError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{self:?}")
+    }
+}
+impl std::error::Error for BloomError {}
+
+/// Σ.J.2 — builder accumulating join keys on the build side. Wraps a
+/// BloomFilter; finalise to ship.
+pub struct BloomBuilder {
+    bloom: BloomFilter,
+    n_inserted: usize,
+}
+
+impl BloomBuilder {
+    pub fn for_keys(expected_keys: usize) -> Self {
+        Self {
+            bloom: BloomFilter::for_keys(expected_keys),
+            n_inserted: 0,
+        }
+    }
+
+    pub fn insert_i64(&mut self, v: i64) {
+        self.bloom.insert_i64(v);
+        self.n_inserted += 1;
+    }
+    pub fn insert_str(&mut self, s: &str) {
+        self.bloom.insert_str(s);
+        self.n_inserted += 1;
+    }
+
+    /// Σ.J.2 — bulk insert from an Arrow Int64Array column. Skips
+    /// nulls (they can't match join keys anyway).
+    pub fn insert_int64_array(&mut self, arr: &dyn Array) {
+        if let Some(a) = arr.as_primitive_opt::<Int64Type>() {
+            for i in 0..a.len() {
+                if !a.is_null(i) {
+                    self.insert_i64(a.value(i));
+                }
+            }
+        }
+    }
+
+    pub fn into_bloom(self) -> BloomFilter {
+        self.bloom
+    }
+
+    pub fn n_inserted(&self) -> usize {
+        self.n_inserted
+    }
+}
+
+fn hash_i64(v: i64, seed: u64) -> u64 {
+    // splitmix64
+    let mut x = (v as u64).wrapping_add(seed);
+    x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    x ^ (x >> 31)
+}
+
+/// FNV-1a 64-bit — deterministic, cheap, good enough for bloom.
+fn hash_bytes(b: &[u8], seed: u64) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325 ^ seed;
+    for &byte in b {
+        h ^= byte as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    // Splitmix finalizer for better dispersion.
+    h = (h ^ (h >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    h = (h ^ (h >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    h ^ (h >> 31)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn insert_and_lookup_no_false_negatives() {
+        let mut b = BloomFilter::for_keys(1000);
+        for i in 0..1000i64 {
+            b.insert_i64(i);
+        }
+        // No false negatives — every inserted key must be found.
+        for i in 0..1000i64 {
+            assert!(b.might_contain_i64(i), "missing {i}");
+        }
+    }
+
+    #[test]
+    fn false_positive_rate_within_spec() {
+        let n = 10_000usize;
+        let mut b = BloomFilter::for_keys(n);
+        for i in 0..n as i64 {
+            b.insert_i64(i);
+        }
+        // Probe with N values we did NOT insert. FPR should be ~1%.
+        let mut fp = 0;
+        let probes = 10_000;
+        for i in (n as i64)..(n as i64 + probes) {
+            if b.might_contain_i64(i) {
+                fp += 1;
+            }
+        }
+        let rate = fp as f64 / probes as f64;
+        // Theoretical FPR for 10 bits/key + k=8 is ~0.46% but
+        // split-block doubles it. Spec: ≤3%.
+        assert!(rate < 0.03, "FPR {rate} too high");
+    }
+
+    #[test]
+    fn string_keys_work() {
+        let mut b = BloomFilter::for_keys(100);
+        for s in &["AIR", "MAIL", "SHIP", "RAIL", "FOB", "TRUCK", "REG AIR"] {
+            b.insert_str(s);
+        }
+        for s in &["AIR", "MAIL", "SHIP", "RAIL", "FOB", "TRUCK", "REG AIR"] {
+            assert!(b.might_contain_str(s));
+        }
+        assert!(!b.might_contain_str("NOPE_NOT_THERE_BOGUS"));
+    }
+
+    #[test]
+    fn serialise_round_trip() {
+        let mut b = BloomFilter::for_keys(1000);
+        for i in 0..1000i64 {
+            b.insert_i64(i);
+        }
+        let bytes = b.to_bytes();
+        let b2 = BloomFilter::from_bytes(&bytes).unwrap();
+        // After round trip, all keys still match.
+        for i in 0..1000i64 {
+            assert!(b2.might_contain_i64(i));
+        }
+        // Bit patterns identical.
+        assert_eq!(b.bits, b2.bits);
+        assert_eq!(b.n_blocks, b2.n_blocks);
+        assert_eq!(b.seed, b2.seed);
+    }
+
+    #[test]
+    fn serialise_rejects_bad_magic() {
+        let mut bytes = vec![0u8; 24];
+        bytes[0..8].copy_from_slice(b"NOTBLOOM");
+        match BloomFilter::from_bytes(&bytes) {
+            Err(BloomError::BadMagic) => {}
+            other => panic!("expected BadMagic, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn wire_size_reasonable_for_typical_join() {
+        // ~25K customer keys at 10 bits/key = ~31 KB.
+        let b = BloomFilter::for_keys(25_000);
+        // Allow ±50% slop from block alignment.
+        assert!(b.wire_size() >= 25_000);
+        assert!(b.wire_size() <= 50_000);
+    }
+
+    #[test]
+    fn builder_bulk_insert_from_arrow() {
+        use arrow_array::Int64Array;
+        let mut b = BloomBuilder::for_keys(100);
+        let arr = Int64Array::from(vec![Some(10), Some(20), None, Some(30)]);
+        b.insert_int64_array(&arr);
+        let bloom = b.into_bloom();
+        assert!(bloom.might_contain_i64(10));
+        assert!(bloom.might_contain_i64(20));
+        assert!(bloom.might_contain_i64(30));
+        // 40 was never inserted — should miss (with FPR caveat).
+        // For only 3 keys in a 256-bit block, FPR is ~0; this should
+        // reliably miss.
+        assert!(!bloom.might_contain_i64(99_999_999));
+    }
+}

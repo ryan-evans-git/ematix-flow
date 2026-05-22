@@ -70,6 +70,18 @@ pub struct BridgeFilter {
     /// (high-sel) and serial-bitmap+masked-decode (low-sel) paths.
     /// 0.5 = unknown (no stats), conservative default.
     predicted_pass_rate: f64,
+    /// Σ.L.3.b: opt-in adaptive filter reordering. When set, the
+    /// streaming reader records (rows_in, rows_out) per predicate per
+    /// row group; after WARMUP_ROW_GROUPS the predicates' apply order
+    /// is sorted by ascending pass-rate (most-selective first).
+    ///
+    /// Today's `build_bitmap` builds all bitmaps in parallel and ANDs
+    /// them — reordering doesn't change the CPU work. The wire-in
+    /// here makes the data structure available for the follow-up
+    /// refactor that switches the hot path to sequential masked-decode
+    /// with the cheapest+most-selective predicate gating subsequent
+    /// columns' decode. See [[sigma-l-adaptive-runtime]].
+    adaptive: Option<std::sync::Arc<std::sync::Mutex<crate::adaptive_filter::AdaptiveFilterOrder>>>,
 }
 
 impl BridgeFilter {
@@ -104,6 +116,55 @@ impl BridgeFilter {
     /// `with_predicted_pass_rate`). 0.5 if not set (conservative).
     pub fn predicted_pass_rate(&self) -> f64 {
         self.predicted_pass_rate
+    }
+
+    /// Σ.L.3.b — opt into adaptive predicate reordering. Once
+    /// [`crate::adaptive_filter::WARMUP_ROW_GROUPS`] row groups have
+    /// been observed, [`Self::applied_order`] returns predicate
+    /// indices sorted by ascending observed pass-rate (most-selective
+    /// first). Callers thread the observed (rows_in, rows_out) back
+    /// via [`Self::observe_row_group`].
+    ///
+    /// Note: the current `build_bitmap` ANDs all per-predicate
+    /// bitmaps in parallel, so reorder is information-only until a
+    /// follow-up refactor adopts sequential masked-decode. The data
+    /// structure ships now so that refactor's wire-in is trivial.
+    pub fn with_adaptive_reordering(mut self) -> Self {
+        let order = crate::adaptive_filter::AdaptiveFilterOrder::new(self.predicates.len());
+        self.adaptive = Some(std::sync::Arc::new(std::sync::Mutex::new(order)));
+        self
+    }
+
+    /// Σ.L.3.b — record per-predicate (rows_in, rows_out) for one row
+    /// group. No-op when adaptive reordering wasn't enabled. Indices
+    /// in `samples` follow PLAN order (i.e., `self.predicates()`
+    /// order); the AdaptiveFilterOrder internally rebases.
+    pub fn observe_row_group(&self, samples_in_plan_order: &[(u64, u64)]) {
+        if let Some(adaptive) = &self.adaptive {
+            adaptive
+                .lock()
+                .unwrap()
+                .observe_row_group(samples_in_plan_order);
+        }
+    }
+
+    /// Σ.L.3.b — predicate indices in the order the caller should
+    /// apply them. Plan order if adaptive is off, else
+    /// selectivity-sorted post-warmup.
+    pub fn applied_order(&self) -> Vec<usize> {
+        if let Some(adaptive) = &self.adaptive {
+            adaptive.lock().unwrap().current_order().to_vec()
+        } else {
+            (0..self.predicates.len()).collect()
+        }
+    }
+
+    /// Σ.L.3.b — selectivity snapshot for telemetry / Σ.L.2 workload
+    /// log writes. `None` if adaptive is off.
+    pub fn observed_selectivities(&self) -> Option<Vec<(usize, f64)>> {
+        self.adaptive
+            .as_ref()
+            .map(|a| a.lock().unwrap().selectivities_in_current_order())
     }
 }
 
@@ -928,6 +989,7 @@ fn extract_bridge_filter(
     Some(BridgeFilter {
         predicates: merged,
         predicted_pass_rate: 0.5,
+        adaptive: None,
     })
 }
 

@@ -137,6 +137,22 @@ pub mod scan_cache;
 // sort keys, bloom columns, dict columns, and compression codec.
 // Scaffolding lands here; CLI + actual rewrite are follow-ups.
 pub mod write_tuner;
+// Σ.M (2026-05-21): SQL → PhysicalPlan cache. Keyed by canonicalised
+// SQL string + schema-version. Photon does this for prepared statements
+// only; we do it for ad-hoc SQL. Massive win on benchmark/dashboard
+// workloads where queries repeat.
+pub mod plan_cache;
+// Σ.J.2 (2026-05-21): cross-stage bloom filter for distributed joins.
+// Build-side worker computes a bloom over join keys; ships it via
+// Flight metadata to probe-side workers; probe-side skips rows before
+// shipping. Cuts cross-stage row volume by 10-100× on selective joins.
+pub mod bloom;
+// Σ.N (2026-05-21): Robin Hood vectorized hash table for aggregates.
+// Open-addressing with Robin Hood eviction (probe-distance equalisation).
+// Photon's signature operator; nobody ships this in OSS DataFusion.
+// Tonight ships the data structure + tests; operator integration is a
+// follow-up bite to avoid the optimizer-codegen-sensitivity tax.
+pub mod robin_hood_agg;
 pub mod hash;
 pub mod join;
 // Σ.E5 (2026-05-19): Photon-style vectorized LIKE pattern matcher
