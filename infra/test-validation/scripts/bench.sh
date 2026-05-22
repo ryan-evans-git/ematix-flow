@@ -171,10 +171,16 @@ stage "03b-emat-parallel-scaling-bench" '
 # tpch_triangulation_bench.rs); if unset, falls back to legacy
 # BENCHMARKS.md (kept for backward compat with local dev).
 
+# AWS campaign 2026-05: 20 trials × 5 warmups for publishable medians.
+# 5 trials × 2 warmups (the prior default) was too noisy on sub-15ms
+# queries — Q06/Q15/Q22 swung ±15% run-to-run, masking real wins. At
+# 20×5, sub-millisecond noise collapses. See
+# docs/AWS_CAMPAIGN_2026_05_PLAN.md for the methodology rationale.
 stage "06-tpch-triangulation-sf1" '
   cd /opt/ematix/ematix-flow
   TPCH_DATA_DIR=examples/tpch/data/sf1 \
     TPCH_OUT=/opt/ematix/ematix-flow/BENCHMARKS-SF1.md \
+    TPCH_TRIALS=20 TPCH_WARMUPS=5 \
     cargo run --release --features triangulation \
     -p ematix-flow-core --example tpch_triangulation_bench 2>&1 | tail -400
 ' || true
@@ -184,6 +190,7 @@ stage "07-tpch-triangulation-sf10" '
   cd /opt/ematix/ematix-flow
   TPCH_DATA_DIR=examples/tpch/data/sf10 \
     TPCH_OUT=/opt/ematix/ematix-flow/BENCHMARKS-SF10.md \
+    TPCH_TRIALS=20 TPCH_WARMUPS=5 \
     cargo run --release --features triangulation \
     -p ematix-flow-core --example tpch_triangulation_bench 2>&1 | tail -400
 ' || true
