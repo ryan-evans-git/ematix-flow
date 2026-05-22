@@ -50,6 +50,14 @@ pub mod work_unit;
 // URLs continue to work unchanged. See module docs.
 pub mod peer_discovery;
 
+// Σ.J.2.b.v — Flight passthrough for cross-stage bloom filters. Build-
+// side workers stuff BloomFilters into `x-ematix-bloom-*` HTTP headers
+// via `set_distributed_passthrough_headers`; probe-side workers extract
+// them from the inbound request headers and stash them in a SessionState
+// extension (`ContextBlooms`) where a downstream optimizer rule can
+// wrap matching scans in `BloomFilterExec`.
+pub mod bloom_flight;
+
 use std::sync::Arc;
 
 use async_trait::async_trait;

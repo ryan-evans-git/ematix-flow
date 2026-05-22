@@ -3804,6 +3804,7 @@ dependencies = [
  "datafusion-distributed",
  "ematix-flow-core",
  "futures-util",
+ "http 1.4.0",
  "rcgen",
  "serde",
  "serde_json",

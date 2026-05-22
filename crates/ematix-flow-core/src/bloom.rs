@@ -210,6 +210,89 @@ impl BloomFilter {
     }
 }
 
+/// Σ.J.2.b.v — header-name prefix used for the multi-bloom flight
+/// transport. Probe-side workers scan inbound headers for this prefix
+/// to pick up build-side blooms shipped by the coordinator.
+pub const FLIGHT_BLOOM_HEADER_PREFIX: &str = "x-ematix-bloom-";
+
+/// Σ.J.2.b.v — gRPC max header value size. Standard tonic / nginx /
+/// envoy default is ~8 KiB per header value. To leave room for
+/// framing + chunking, we cap a single bloom header at 6 KiB hex
+/// (= 3 KiB binary = ~2.4K keys @ 10 bits/key). Blooms bigger than
+/// this go through the upstream proto path (Σ.J.2.c, deferred).
+pub const FLIGHT_BLOOM_MAX_HEADER_HEX: usize = 6 * 1024;
+
+/// Σ.J.2.b.v — bound on the *combined* size of all bloom headers on
+/// one request. gRPC implementations limit total headers to ~16 KiB.
+/// Drop blooms past this in `blooms_to_header_pairs` so a single
+/// oversized payload doesn't block all blooms.
+pub const FLIGHT_BLOOM_MAX_TOTAL_HEX: usize = 12 * 1024;
+
+/// Σ.J.2.b.v — marshall a set of `(column_uuid, BloomFilter)` to
+/// `(header_name, header_value)` pairs ready for an `http::HeaderMap`.
+/// The distributed crate converts these to `HeaderMap` at the
+/// boundary; this fn stays http-dep-free so the core crate doesn't
+/// pull `http`.
+///
+/// Filtering rules:
+/// - blooms whose hex value would exceed [`FLIGHT_BLOOM_MAX_HEADER_HEX`]
+///   are dropped (caller should ship them via the proto path)
+/// - once cumulative hex bytes pass [`FLIGHT_BLOOM_MAX_TOTAL_HEX`],
+///   remaining blooms are dropped (best-effort partial set)
+///
+/// The returned vec preserves input order so callers can detect which
+/// inputs got dropped (output.len() < input.len()).
+pub fn blooms_to_header_pairs(blooms: &[(String, &BloomFilter)]) -> Vec<(String, String)> {
+    let mut out = Vec::with_capacity(blooms.len());
+    let mut total = 0usize;
+    for (uuid, bloom) in blooms {
+        let header = bloom.to_flight_header();
+        if header.len() > FLIGHT_BLOOM_MAX_HEADER_HEX {
+            continue; // too big for header transport
+        }
+        if total + header.len() > FLIGHT_BLOOM_MAX_TOTAL_HEX {
+            break; // remaining blooms would blow the request limit
+        }
+        let name = format!("{FLIGHT_BLOOM_HEADER_PREFIX}{uuid}");
+        total += header.len();
+        out.push((name, header));
+    }
+    out
+}
+
+/// Σ.J.2.b.v — server-side: extract blooms from inbound header pairs.
+/// Iterates any iterator of `(header_name, header_value)` so the
+/// distributed crate can pass `http::HeaderMap::iter()` (with values
+/// converted to `&str`) without depending on its concrete type here.
+///
+/// Returns one (column_uuid, BloomFilter) per parseable matching
+/// header. Headers without the `x-ematix-bloom-` prefix are skipped.
+/// Malformed bloom values are dropped (logged via tracing if the
+/// feature is enabled).
+pub fn header_pairs_to_blooms<'a, I>(headers: I) -> Vec<(String, BloomFilter)>
+where
+    I: IntoIterator<Item = (&'a str, &'a str)>,
+{
+    let mut out = Vec::new();
+    for (name, value) in headers {
+        // HTTP/2 lowercases header names; tonic's MetadataMap is
+        // case-insensitive on read. Lowercase the prefix check to be
+        // safe across both transports.
+        if name.len() < FLIGHT_BLOOM_HEADER_PREFIX.len() {
+            continue;
+        }
+        let (head, tail) = name.split_at(FLIGHT_BLOOM_HEADER_PREFIX.len());
+        if !head.eq_ignore_ascii_case(FLIGHT_BLOOM_HEADER_PREFIX) {
+            continue;
+        }
+        match BloomFilter::from_flight_header(value) {
+            Ok(bloom) => out.push((tail.to_string(), bloom)),
+            Err(_) => continue, // skip malformed; better than failing the query
+        }
+    }
+    out
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BloomError {
     TooSmall,
@@ -626,6 +709,90 @@ mod tests {
             dropped > 0,
             "BloomFilterExec didn't drop any non-bloom keys (kept all 4..=10)"
         );
+    }
+
+    // ---- Σ.J.2.b.v — HeaderMap marshalling ----
+
+    #[test]
+    fn header_pairs_roundtrip() {
+        let mut a = BloomFilter::for_keys(100);
+        a.insert_i64(1);
+        a.insert_i64(2);
+        let mut b = BloomFilter::for_keys(100);
+        b.insert_i64(100);
+
+        let inputs: Vec<(String, &BloomFilter)> =
+            vec![("join0_left".into(), &a), ("join1_left".into(), &b)];
+        let pairs = blooms_to_header_pairs(&inputs);
+        assert_eq!(pairs.len(), 2);
+        assert_eq!(pairs[0].0, "x-ematix-bloom-join0_left");
+        assert_eq!(pairs[1].0, "x-ematix-bloom-join1_left");
+
+        // Decode the pairs as a server would.
+        let decoded = header_pairs_to_blooms(
+            pairs.iter().map(|(n, v)| (n.as_str(), v.as_str())),
+        );
+        assert_eq!(decoded.len(), 2);
+        assert_eq!(decoded[0].0, "join0_left");
+        assert_eq!(decoded[1].0, "join1_left");
+        // Verify the BloomFilter content survived.
+        assert!(decoded[0].1.might_contain_i64(1));
+        assert!(decoded[0].1.might_contain_i64(2));
+        assert!(decoded[1].1.might_contain_i64(100));
+    }
+
+    #[test]
+    fn header_pairs_drop_oversized() {
+        // A 100K-key bloom is ~120 KB → ~240 KB hex, way over the
+        // 6 KiB per-header limit.
+        let big = BloomFilter::for_keys(100_000);
+        let small = BloomFilter::for_keys(50);
+        let inputs: Vec<(String, &BloomFilter)> = vec![
+            ("oversized".into(), &big),
+            ("ok".into(), &small),
+        ];
+        let pairs = blooms_to_header_pairs(&inputs);
+        // big is dropped; small survives.
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].0, "x-ematix-bloom-ok");
+    }
+
+    #[test]
+    fn header_pairs_caseinsensitive_prefix() {
+        let mut b = BloomFilter::for_keys(50);
+        b.insert_i64(42);
+        let pairs = blooms_to_header_pairs(&[("test".into(), &b)]);
+        // Server-side: simulate a case-mangled prefix (HTTP/2 should
+        // lowercase, but be defensive).
+        let mangled = format!("X-Ematix-Bloom-{}", "test");
+        let decoded =
+            header_pairs_to_blooms(vec![(mangled.as_str(), pairs[0].1.as_str())]);
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].0, "test");
+        assert!(decoded[0].1.might_contain_i64(42));
+    }
+
+    #[test]
+    fn header_pairs_skip_non_bloom_headers() {
+        let mut b = BloomFilter::for_keys(50);
+        b.insert_i64(7);
+        let bloom_hdr = b.to_flight_header();
+        let decoded = header_pairs_to_blooms(vec![
+            ("content-type", "application/grpc"),
+            ("x-ematix-bloom-join0", bloom_hdr.as_str()),
+            ("traceparent", "00-aaa-bbb-01"),
+        ]);
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].0, "join0");
+    }
+
+    #[test]
+    fn header_pairs_skip_malformed() {
+        let decoded = header_pairs_to_blooms(vec![
+            ("x-ematix-bloom-broken", "not-valid-hex-zz"),
+            ("x-ematix-bloom-short", "abcd"),
+        ]);
+        assert!(decoded.is_empty(), "malformed blooms should be dropped");
     }
 
     #[test]

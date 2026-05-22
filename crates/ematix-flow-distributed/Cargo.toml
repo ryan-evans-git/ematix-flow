@@ -33,6 +33,10 @@ futures-util = { workspace = true }
 # crypto provider over aws-lc for the lighter build and the
 # pure-Rust dep tree.
 tonic = { workspace = true, features = ["tls-ring"] }
+# Σ.J.2.b.v — bloom_flight uses `HeaderMap`. Already a transitive dep
+# via datafusion-distributed; declared here so the module compiles
+# without leaning on indirect re-exports.
+http = "1"
 
 [[bin]]
 name = "flow-worker"
