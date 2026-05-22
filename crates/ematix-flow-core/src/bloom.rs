@@ -142,6 +142,41 @@ impl BloomFilter {
         out
     }
 
+    /// Σ.J.2.b — encode for Flight HTTP header (tonic
+    /// `MetadataMap` value). Uses hex (lowercase) — slightly larger
+    /// than base64 (2x vs 1.33x) but zero deps and gRPC-header-safe
+    /// (no ascii-binary boundary issues). Acceptable since
+    /// Σ.J.2.b's header path is ≤5K-key blooms ≤6 KiB → ≤12 KiB hex.
+    /// Wait — gRPC headers cap at ~8 KiB. So practical threshold is
+    /// ≤3K-key blooms in hex. Larger blooms must use the proto path
+    /// (Σ.J.2.c, see docs/PHASE_SIGMA_J2B_FLIGHT_BLOOM.md).
+    pub fn to_flight_header(&self) -> String {
+        let bytes = self.to_bytes();
+        let mut out = String::with_capacity(bytes.len() * 2);
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        for b in bytes {
+            out.push(HEX[(b >> 4) as usize] as char);
+            out.push(HEX[(b & 0xf) as usize] as char);
+        }
+        out
+    }
+
+    /// Σ.J.2.b — decode from a Flight HTTP header value. Returns
+    /// `Err(BadMagic)` if the hex decodes to non-bloom bytes.
+    pub fn from_flight_header(header: &str) -> Result<Self, BloomError> {
+        if header.len() % 2 != 0 {
+            return Err(BloomError::BadMagic);
+        }
+        let mut bytes = Vec::with_capacity(header.len() / 2);
+        let b = header.as_bytes();
+        for i in (0..b.len()).step_by(2) {
+            let hi = hex_val(b[i])?;
+            let lo = hex_val(b[i + 1])?;
+            bytes.push((hi << 4) | lo);
+        }
+        Self::from_bytes(&bytes)
+    }
+
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, BloomError> {
         if bytes.len() < 24 {
             return Err(BloomError::TooSmall);
@@ -242,6 +277,15 @@ fn hash_i64(v: i64, seed: u64) -> u64 {
     x ^ (x >> 31)
 }
 
+fn hex_val(b: u8) -> Result<u8, BloomError> {
+    match b {
+        b'0'..=b'9' => Ok(b - b'0'),
+        b'a'..=b'f' => Ok(b - b'a' + 10),
+        b'A'..=b'F' => Ok(b - b'A' + 10),
+        _ => Err(BloomError::BadMagic),
+    }
+}
+
 /// FNV-1a 64-bit — deterministic, cheap, good enough for bloom.
 fn hash_bytes(b: &[u8], seed: u64) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325 ^ seed;
@@ -339,6 +383,33 @@ mod tests {
         // Allow ±50% slop from block alignment.
         assert!(b.wire_size() >= 25_000);
         assert!(b.wire_size() <= 50_000);
+    }
+
+    #[test]
+    fn flight_header_round_trip() {
+        let mut b = BloomFilter::for_keys(100);
+        for i in 0..100i64 {
+            b.insert_i64(i);
+        }
+        let header = b.to_flight_header();
+        // Hex-only, lowercase.
+        assert!(header.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f')));
+        let b2 = BloomFilter::from_flight_header(&header).unwrap();
+        for i in 0..100i64 {
+            assert!(b2.might_contain_i64(i));
+        }
+    }
+
+    #[test]
+    fn flight_header_rejects_bad_hex() {
+        let r = BloomFilter::from_flight_header("zzznotvalidhex");
+        assert!(matches!(r, Err(BloomError::BadMagic)));
+    }
+
+    #[test]
+    fn flight_header_rejects_odd_length() {
+        let r = BloomFilter::from_flight_header("abc");
+        assert!(matches!(r, Err(BloomError::BadMagic)));
     }
 
     #[test]

@@ -153,6 +153,12 @@ pub mod bloom;
 // Tonight ships the data structure + tests; operator integration is a
 // follow-up bite to avoid the optimizer-codegen-sensitivity tax.
 pub mod robin_hood_agg;
+// Σ.O (2026-05-21): in-memory LRU cache of decoded RecordBatch by
+// (file_path, row_group_idx, projection_hash). Avoids re-decoding
+// the same parquet column chunks across queries in the same session.
+// Multi-query workloads (dashboards, repeated benchmarks) reuse
+// decoded batches instead of re-decoding.
+pub mod parquet_decode_cache;
 pub mod hash;
 pub mod join;
 // Σ.E5 (2026-05-19): Photon-style vectorized LIKE pattern matcher

@@ -269,6 +269,98 @@ pub fn min_accumulator(existing: u64, delta: u64) -> u64 {
     existing.min(delta)
 }
 
+// ---------------------------------------------------------------------
+// Σ.N.b — streaming aggregator that ingests Arrow batches.
+// ---------------------------------------------------------------------
+
+/// Σ.N.b — streaming `COUNT(*) GROUP BY i64_col` over Arrow
+/// Int64Array inputs. Mirrors what a `RobinHoodAggregateExec` would
+/// do without going through DataFusion's ExecutionPlan trait — for
+/// microbenching the real-data win + as a reference impl for the
+/// follow-up Σ.N.c full operator integration.
+pub struct RobinHoodCountAgg {
+    table: RobinHoodI64U64,
+}
+
+impl Default for RobinHoodCountAgg {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RobinHoodCountAgg {
+    pub fn new() -> Self {
+        Self {
+            table: RobinHoodI64U64::new(),
+        }
+    }
+
+    pub fn with_capacity(cap: usize) -> Self {
+        Self {
+            table: RobinHoodI64U64::with_capacity(cap),
+        }
+    }
+
+    /// Σ.N.b — ingest one batch's GROUP BY column. Skips nulls (NULL
+    /// keys don't form their own group in SQL standard COUNT GROUP BY
+    /// semantics; they're filtered out by DataFusion's analyzer in
+    /// most cases). For full SQL conformance, the caller can pre-
+    /// process NULLs into a sentinel key (e.g. i64::MIN).
+    pub fn ingest_int64_array(&mut self, arr: &arrow_array::Int64Array) {
+        use arrow_array::Array;
+        // Two paths: no nulls → tight loop; with nulls → null-check.
+        if arr.null_count() == 0 {
+            for i in 0..arr.len() {
+                let k = arr.value(i);
+                self.table.insert_or_update(k, 1, count_accumulator);
+            }
+        } else {
+            for i in 0..arr.len() {
+                if !arr.is_null(i) {
+                    let k = arr.value(i);
+                    self.table.insert_or_update(k, 1, count_accumulator);
+                }
+            }
+        }
+    }
+
+    /// Σ.N.b — finalise into a `RecordBatch` matching the SQL output
+    /// schema `(group_key i64, count u64)`. Sorted by group key for
+    /// stable comparison against DataFusion output.
+    pub fn finalize_to_record_batch(self) -> arrow_array::RecordBatch {
+        use arrow_array::{Int64Array, UInt64Array};
+        use arrow_schema::{DataType, Field, Schema};
+        use std::sync::Arc;
+        let mut pairs: Vec<(i64, u64)> = self.table.iter().collect();
+        pairs.sort_by_key(|(k, _)| *k);
+        let keys: Vec<i64> = pairs.iter().map(|(k, _)| *k).collect();
+        let counts: Vec<u64> = pairs.iter().map(|(_, v)| *v).collect();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("group_key", DataType::Int64, false),
+            Field::new("count", DataType::UInt64, false),
+        ]));
+        arrow_array::RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int64Array::from(keys)), Arc::new(UInt64Array::from(counts))],
+        )
+        .unwrap()
+    }
+
+    pub fn len(&self) -> usize {
+        self.table.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.table.is_empty()
+    }
+
+    /// Read-only view of the inner table. Useful for callers that
+    /// want to spot-check a group's count without finalising.
+    pub fn table(&self) -> &RobinHoodI64U64 {
+        &self.table
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -396,5 +488,112 @@ mod tests {
         assert_eq!(v1, 5);
         let v2 = t.insert_or_update(1, 3, sum_accumulator);
         assert_eq!(v2, 8);
+    }
+
+    #[test]
+    fn streaming_agg_ingests_int64_array() {
+        use arrow_array::Int64Array;
+        let mut agg = RobinHoodCountAgg::new();
+        agg.ingest_int64_array(&Int64Array::from(vec![1, 2, 3, 1, 2, 1]));
+        let batch = agg.finalize_to_record_batch();
+        // 3 distinct keys, sorted ascending.
+        assert_eq!(batch.num_rows(), 3);
+        let keys = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let counts = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow_array::UInt64Array>()
+            .unwrap();
+        assert_eq!(
+            (0..3).map(|i| (keys.value(i), counts.value(i))).collect::<Vec<_>>(),
+            vec![(1, 3), (2, 2), (3, 1)]
+        );
+    }
+
+    #[test]
+    fn streaming_agg_skips_nulls() {
+        use arrow_array::Int64Array;
+        let mut agg = RobinHoodCountAgg::new();
+        agg.ingest_int64_array(&Int64Array::from(vec![
+            Some(1),
+            None,
+            Some(2),
+            None,
+            Some(1),
+        ]));
+        let batch = agg.finalize_to_record_batch();
+        // 2 distinct non-null keys.
+        assert_eq!(batch.num_rows(), 2);
+    }
+
+    #[tokio::test]
+    async fn streaming_agg_matches_datafusion_output() {
+        // End-to-end equivalence: same input, same output as
+        // DataFusion's stock GROUP BY + COUNT(*).
+        use arrow_array::{Int64Array, RecordBatch};
+        use arrow_schema::{DataType, Field, Schema};
+        use datafusion::datasource::MemTable;
+        use datafusion::prelude::SessionContext;
+        use futures_util::TryStreamExt;
+        use std::sync::Arc;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, false)]));
+        let data = vec![
+            Some(1i64),
+            Some(2),
+            Some(3),
+            Some(1),
+            Some(2),
+            Some(1),
+            Some(5),
+            Some(5),
+        ];
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(data.clone()))],
+        )
+        .unwrap();
+
+        // Robin Hood path.
+        let mut agg = RobinHoodCountAgg::new();
+        agg.ingest_int64_array(
+            batch.column(0).as_any().downcast_ref().unwrap(),
+        );
+        let mut rh_pairs: Vec<(i64, u64)> = agg.table().iter().collect();
+        rh_pairs.sort();
+
+        // DataFusion path.
+        let mt = MemTable::try_new(schema, vec![vec![batch]]).unwrap();
+        let ctx = SessionContext::new();
+        ctx.register_table("t", Arc::new(mt)).unwrap();
+        let df = ctx
+            .sql("SELECT k, COUNT(*) FROM t GROUP BY k ORDER BY k")
+            .await
+            .unwrap();
+        let plan = df.create_physical_plan().await.unwrap();
+        let mut s = plan.execute(0, ctx.task_ctx()).unwrap();
+        let mut df_pairs: Vec<(i64, u64)> = Vec::new();
+        while let Some(b) = s.try_next().await.unwrap() {
+            let ks = b
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            let cs = b
+                .column(1)
+                .as_any()
+                .downcast_ref::<arrow_array::Int64Array>()
+                .unwrap();
+            for i in 0..b.num_rows() {
+                df_pairs.push((ks.value(i), cs.value(i) as u64));
+            }
+        }
+        df_pairs.sort();
+
+        assert_eq!(rh_pairs, df_pairs, "robin hood output differs from datafusion");
     }
 }

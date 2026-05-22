@@ -760,6 +760,97 @@ pub fn filter_byte_array_to_bitmap_dense(
 /// dict-encoded (PLAIN-only). Mirrors `filter_i32_column_to_bitmap`
 /// but without the dict-mask optimisation. Path-based to match the
 /// existing public signature shape.
+/// Σ.L.3.c.1 — masked-input variant of [`filter_i32_column_to_bitmap_dense`].
+/// `input_mask` selects which rows to evaluate; the returned bitmap
+/// has bits set only at rows that were both in `input_mask` AND
+/// satisfied the predicate. Rows not in the input mask have their
+/// output bit cleared regardless.
+///
+/// Used by Σ.L.3.c.2's sequential masked-AND build_bitmap to skip
+/// re-decoding columns at rows already eliminated by an earlier
+/// (more selective) predicate.
+pub fn filter_i32_column_masked(
+    file: &ParquetFile,
+    rg: usize,
+    col: usize,
+    input_mask: &[u8],
+    total: usize,
+    predicate: impl Fn(i32) -> bool,
+) -> DfResult<(Vec<u8>, usize)> {
+    let values = masked_decode_i32(file, rg, col, input_mask)?;
+    let mut bitmap = vec![0u8; total.div_ceil(8)];
+    let mut val_iter = values.iter();
+    for row in 0..total {
+        let in_mask = input_mask[row >> 3] & (1 << (row & 7)) != 0;
+        if !in_mask {
+            continue;
+        }
+        let v = *val_iter.next().ok_or_else(|| {
+            ext("filter_i32_column_masked: input_mask popcount > decoded count")
+        })?;
+        if predicate(v) {
+            bitmap[row >> 3] |= 1 << (row & 7);
+        }
+    }
+    Ok((bitmap, total))
+}
+
+/// Σ.L.3.c.1 — masked-input variant of [`filter_f64_column_to_bitmap_dense`].
+pub fn filter_f64_column_masked(
+    path: &std::path::Path,
+    rg: usize,
+    col: usize,
+    input_mask: &[u8],
+    total: usize,
+    predicate: impl Fn(f64) -> bool,
+) -> DfResult<(Vec<u8>, usize)> {
+    let file = ParquetFile::open(path).map_err(|e| ext(format!("ParquetFile::open: {e}")))?;
+    let values = masked_decode_f64(&file, rg, col, input_mask)?;
+    let mut bitmap = vec![0u8; total.div_ceil(8)];
+    let mut val_iter = values.iter();
+    for row in 0..total {
+        let in_mask = input_mask[row >> 3] & (1 << (row & 7)) != 0;
+        if !in_mask {
+            continue;
+        }
+        let v = *val_iter.next().ok_or_else(|| {
+            ext("filter_f64_column_masked: input_mask popcount > decoded count")
+        })?;
+        if predicate(v) {
+            bitmap[row >> 3] |= 1 << (row & 7);
+        }
+    }
+    Ok((bitmap, total))
+}
+
+/// Σ.L.3.c.1 — masked-input variant of [`filter_byte_array_to_bitmap_dense`].
+pub fn filter_byte_array_masked(
+    path: &std::path::Path,
+    rg: usize,
+    col: usize,
+    input_mask: &[u8],
+    total: usize,
+    predicate: impl Fn(&[u8]) -> bool,
+) -> DfResult<(Vec<u8>, usize)> {
+    let file = ParquetFile::open(path).map_err(|e| ext(format!("ParquetFile::open: {e}")))?;
+    let values = masked_decode_byte_array(&file, rg, col, input_mask)?;
+    let mut bitmap = vec![0u8; total.div_ceil(8)];
+    let mut val_iter = values.iter();
+    for row in 0..total {
+        let in_mask = input_mask[row >> 3] & (1 << (row & 7)) != 0;
+        if !in_mask {
+            continue;
+        }
+        let v = val_iter.next().ok_or_else(|| {
+            ext("filter_byte_array_masked: input_mask popcount > decoded count")
+        })?;
+        if predicate(v.as_slice()) {
+            bitmap[row >> 3] |= 1 << (row & 7);
+        }
+    }
+    Ok((bitmap, total))
+}
+
 pub fn filter_i32_column_to_bitmap_dense(
     file: &ParquetFile,
     rg: usize,
