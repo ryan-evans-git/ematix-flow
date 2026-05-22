@@ -8,6 +8,8 @@
   let error = null;
   let pipelineFilter = "";
   let statusFilter = "";
+  let sortKey = "started";  // pipeline | status | started | duration | attempt
+  let sortDir = "desc";
 
   async function load() {
     loading = true;
@@ -26,7 +28,50 @@
     }
   }
 
-  onMount(load);
+  onMount(() => {
+    // Honor the `?pipeline=` query string when arriving via "all jobs →".
+    const hash = window.location.hash || "";
+    const q = hash.split("?")[1];
+    if (q) {
+      const params = new URLSearchParams(q);
+      const p = params.get("pipeline");
+      if (p) pipelineFilter = p;
+      const s = params.get("status");
+      if (s) statusFilter = s;
+    }
+    load();
+  });
+
+  $: sorted = (() => {
+    const dir = sortDir === "asc" ? 1 : -1;
+    return runs.slice().sort((a, b) => {
+      let av, bv;
+      switch (sortKey) {
+        case "pipeline": av = a.pipeline || ""; bv = b.pipeline || ""; break;
+        case "status":   av = a.status || "";   bv = b.status || "";   break;
+        case "duration": av = a.duration_ms ?? -1; bv = b.duration_ms ?? -1; break;
+        case "attempt":  av = a.attempt ?? 0;   bv = b.attempt ?? 0;   break;
+        case "started":
+        default:         av = a.started_at || ""; bv = b.started_at || "";
+      }
+      if (av < bv) return -1 * dir;
+      if (av > bv) return  1 * dir;
+      return 0;
+    });
+  })();
+
+  function setSort(key) {
+    if (sortKey === key) {
+      sortDir = sortDir === "asc" ? "desc" : "asc";
+    } else {
+      sortKey = key;
+      sortDir = key === "started" ? "desc" : "asc";
+    }
+  }
+  function arrow(key) {
+    if (sortKey !== key) return "";
+    return sortDir === "asc" ? " ▲" : " ▼";
+  }
 
   function fmtDuration(ms) {
     if (ms == null) return "—";
@@ -36,7 +81,6 @@
 
   function fmtTime(iso) {
     if (!iso) return "—";
-    // Render as local-time, brief.
     try {
       return new Date(iso).toISOString().replace("T", " ").slice(0, 19);
     } catch (_) {
@@ -45,7 +89,7 @@
   }
 </script>
 
-<h1>Jobs</h1>
+<h1>Runs</h1>
 
 <div class="panel">
   <div style="display: flex; gap: 0.75rem; flex-wrap: wrap; align-items: center;">
@@ -92,16 +136,16 @@
   <table class="runs">
     <thead>
       <tr>
-        <th>Pipeline</th>
-        <th>Status</th>
-        <th>Started</th>
-        <th>Duration</th>
-        <th>Attempt</th>
+        <th style="cursor: pointer" on:click={() => setSort("pipeline")}>Pipeline{arrow("pipeline")}</th>
+        <th style="cursor: pointer" on:click={() => setSort("status")}>Status{arrow("status")}</th>
+        <th style="cursor: pointer" on:click={() => setSort("started")}>Started{arrow("started")}</th>
+        <th style="cursor: pointer" on:click={() => setSort("duration")}>Duration{arrow("duration")}</th>
+        <th style="cursor: pointer" on:click={() => setSort("attempt")}>Attempt{arrow("attempt")}</th>
         <th>Run ID</th>
       </tr>
     </thead>
     <tbody>
-      {#each runs as r (r.run_id)}
+      {#each sorted as r (r.run_id)}
         <tr on:click={() => (window.location.hash = `#/runs/${encodeURIComponent(r.run_id)}`)}>
           <td>{r.pipeline}</td>
           <td><span class="status status--{r.status}">{r.status}</span></td>

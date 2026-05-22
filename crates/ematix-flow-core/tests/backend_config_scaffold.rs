@@ -77,6 +77,7 @@ fn kafka_config_minimal(bootstrap: &str, group_id: Option<&str>) -> KafkaConfig 
         delivery_semantics: None,
         schema_registry_url: None,
         schema_registry_basic_auth: None,
+        schema_registry_kind: None,
         message_key_column: None,
         batch_config: None,
     }
@@ -139,6 +140,7 @@ fn kafka_config_full_builder_state_round_trips_through_serde() {
             username: "sr-user".into(),
             password: "sr-pass".into(),
         }),
+        schema_registry_kind: None,
         message_key_column: Some("user_id".into()),
         batch_config: Some(KafkaBatchConfig {
             batch_size: 50_000,
@@ -211,6 +213,7 @@ async fn kafka_backend_from_config_applies_sasl_plain_auth() {
         delivery_semantics: None,
         schema_registry_url: Some("http://sr:8081".into()),
         schema_registry_basic_auth: None,
+        schema_registry_kind: None,
         message_key_column: Some("user_id".into()),
         batch_config: None,
     });

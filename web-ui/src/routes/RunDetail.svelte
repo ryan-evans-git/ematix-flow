@@ -183,6 +183,7 @@
     <span class="status status--{run.status}">{run.status}</span>
     &middot; <span class="mono">{run.run_id}</span>
     &middot; attempt {run.attempt}
+    &middot; <a class="link" href={`#/dag/${encodeURIComponent(run.pipeline)}`}>pipeline dag →</a>
   </p>
 
   <div class="actions">

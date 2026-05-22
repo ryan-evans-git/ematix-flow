@@ -526,6 +526,154 @@ Error: peer #1 ("k8s://flow-workers.flow"): missing port in
 
 ---
 
+## Recipe 10 — Kafka + AWS Glue Schema Registry
+
+Kafka topics carrying Avro payloads, with schemas stored in AWS Glue
+Schema Registry instead of Confluent. The Rust Kafka backend
+dispatches the wire framing (0x03 + 16-byte UUID + 1-byte codec
+prefix) based on a single Python config switch.
+
+**When to use:** you're on AWS and already use Glue for other
+purposes; you want IAM-based access control on schemas instead of
+running a separate Confluent SR cluster.
+
+### Quickstart with LocalStack (dev/test)
+
+```sh
+# 1. Start LocalStack with Glue enabled.
+docker compose -f examples/glue-localstack/docker-compose.yml up -d
+
+# 2. Tell the SDK where to point.
+export AWS_ENDPOINT_URL_GLUE=http://localhost:4566
+export AWS_ACCESS_KEY_ID=test
+export AWS_SECRET_ACCESS_KEY=test
+export AWS_DEFAULT_REGION=us-east-1
+
+# 3. Run the gated integration tests.
+export EMATIX_FLOW_LOCALSTACK_ENDPOINT=http://localhost:4566
+pytest tests/python/integration/test_glue_localstack.py -v
+```
+
+### Production wiring
+
+Two halves, both Python-side:
+
+**A. Declare the connection** (in your pipeline module):
+
+```python
+from ematix_flow.connections import (
+    GlueSchemaRegistryConnection, KafkaConnection,
+)
+
+glue = GlueSchemaRegistryConnection(
+    name="prod_glue",
+    registry_name="orders-events",        # Glue registry you've created
+    region="us-east-1",
+    # Auth options, in priority order:
+    # 1. aws_profile="prod-glue"          (dev / SSO)
+    # 2. aws_access_key_id + aws_secret_access_key   (CI; discouraged)
+    # 3. omit both — boto3 default chain (EC2 IMDS / EKS pod identity)
+)
+
+orders = KafkaConnection(
+    name="orders",
+    bootstrap_servers="${KAFKA_BOOTSTRAP}",
+    group_id="ematix-orders",
+    payload_format="avro",                # required for Glue
+    schema_registry=glue,                 # accepts Glue or Confluent
+)
+```
+
+**B. Register the lookup callback** at process startup (typically in
+your `flow run`-style entrypoint or pipeline module's top level):
+
+```python
+from ematix_flow.glue_schema_registry import (
+    register_glue_schema_lookup_callback,
+)
+
+register_glue_schema_lookup_callback(glue)
+```
+
+That single call wires *both* the consumer-side schema fetch (by
+UUID, called from the Rust Kafka backend on each Glue-framed message)
+and the producer-side schema lookup (by name, called on first send
+to learn the latest UUID to embed). The Rust side caches the result
+per-process — a hot topic only pays the boto3 round-trip once per
+schema version.
+
+### Pre-registering schemas (producer-only)
+
+If your pipeline *produces* into a Glue-framed topic, the schema must
+exist in Glue before the first send. Either register it manually via
+the AWS Console, or do it in pipeline init:
+
+```python
+from ematix_flow.glue_schema_registry import register_schema
+
+register_schema(
+    glue,
+    schema_name="Order",       # convention: same as topic name
+    data_format="AVRO",
+    schema_definition='''{
+        "type": "record",
+        "name": "Order",
+        "fields": [
+            {"name": "id", "type": "long"},
+            {"name": "amount", "type": "double"}
+        ]
+    }''',
+    compatibility="BACKWARD",
+)
+```
+
+Subsequent calls on schema evolution (add an optional field, etc.)
+land as new versions; the producer picks the latest automatically.
+
+### IAM policy (production)
+
+The IAM principal the worker runs as needs at minimum:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "glue:GetSchemaVersion",
+        "glue:RegisterSchemaVersion",
+        "glue:CreateSchema",
+        "glue:ListSchemaVersions"
+      ],
+      "Resource": [
+        "arn:aws:glue:us-east-1:*:registry/orders-events",
+        "arn:aws:glue:us-east-1:*:schema/orders-events/*"
+      ]
+    }
+  ]
+}
+```
+
+Consumers can drop `RegisterSchemaVersion` / `CreateSchema`;
+producers can drop `ListSchemaVersions` (used only by the
+default-version-by-name lookup).
+
+### Pitfalls
+
+- **`payload_format` must be `"avro"`.** The connection construction
+  rejects `json` or `raw_bytes` because Glue's wire frame would have
+  nowhere to live in those formats.
+- **First producer send pays a network round-trip** to Glue. If you
+  have a tight latency budget on cold-start, call `register_schema`
+  in init so the next `fetch_schema_by_name` is a no-op.
+- **Schema evolution is opt-in.** The producer caches the UUID it
+  resolved on first send for the process lifetime; if you publish a
+  new schema version while the worker is running, restart the worker
+  to pick it up.
+
+---
+
 ## Observability cheat sheet
 
 ### Alerters

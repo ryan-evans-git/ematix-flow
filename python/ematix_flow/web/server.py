@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import logging
 import sys
+from datetime import UTC
 from importlib import resources
 from pathlib import Path
 from typing import Any
@@ -66,6 +67,22 @@ _STUB_PIPELINES: list[dict[str, Any]] = [
         "latest_run": _STUB_RUNS[1],
         "failure_rate_7d": 0.13,
         "median_duration_ms": 47000,
+        # Last 10 oldest→newest (left-to-right). Mix of durations so
+        # the height-encoding reads as variance, plus the failed run.
+        "recent_runs": [
+            {"run_id": f"01HQSTUB-WH-{i:02d}", "status": "succeeded",
+             "started_at": "2026-05-19T00:00:00Z", "duration_ms": d}
+            for i, d in enumerate([
+                42_000, 45_000, 51_000, 47_000, 110_000,
+                46_000, 48_000, 89_000, 43_000,
+            ])
+        ] + [
+            {"run_id": _STUB_RUNS[1]["run_id"], "status": "failed",
+             "started_at": _STUB_RUNS[1]["started_at"],
+             "duration_ms": _STUB_RUNS[1]["duration_ms"]},
+        ],
+        "next_run_at": "2026-05-21T17:00:00Z",
+        "timezone": None,
     },
     {
         "name": "events_stream",
@@ -73,6 +90,47 @@ _STUB_PIPELINES: list[dict[str, Any]] = [
         "latest_run": _STUB_RUNS[2],
         "failure_rate_7d": 0.0,
         "median_duration_ms": None,
+        # Streaming: prior daemon sessions ran for varied durations
+        # (manual restarts, deployments, etc.); current session is open.
+        "recent_runs": [
+            {"run_id": f"01HQSTUB-EV-{i:02d}", "status": "succeeded",
+             "started_at": "2026-05-20T00:00:00Z", "duration_ms": d}
+            for i, d in enumerate([
+                7_200_000, 1_800_000, 3_600_000, 14_400_000, 600_000,
+                3_600_000, 2_400_000, 10_800_000, 5_400_000,
+            ])
+        ] + [
+            {"run_id": _STUB_RUNS[2]["run_id"], "status": "running",
+             "started_at": _STUB_RUNS[2]["started_at"], "duration_ms": None},
+        ],
+        "next_run_at": None,
+        "timezone": None,
+        # v0.5.0: streaming pipelines surface throughput + batch cycle
+        # (live snapshots from the daemon's metrics endpoint), shown in
+        # the UI footer in place of "Median duration".
+        "streaming_stats": {
+            "snapshot_at": "2026-05-21T16:00:30Z",
+            "rows_consumed_total": 124_500,
+            "rows_written_total": 124_500,
+            "batches_total": 415,
+            "errors_total": 0,
+            "stats_1m": {
+                "rows_consumed_per_sec": 412.0,
+                "rows_written_per_sec": 412.0,
+                "batches_per_sec": 1.4,
+                "errors_per_sec": 0.0,
+                "avg_batch_cycle_ms": 714.3,
+                "span_seconds": 60.0,
+            },
+            "stats_5m": {
+                "rows_consumed_per_sec": 398.5,
+                "rows_written_per_sec": 398.5,
+                "batches_per_sec": 1.35,
+                "errors_per_sec": 0.0,
+                "avg_batch_cycle_ms": 740.7,
+                "span_seconds": 300.0,
+            },
+        },
     },
 ]
 
@@ -155,6 +213,7 @@ def create_app(
     *,
     history: RunHistoryStore | None = None,
     ui_dist_dir: Path | None = None,
+    bearer_token: str | None = None,
 ):
     """Build the FastAPI app.
 
@@ -170,9 +229,14 @@ def create_app(
       ``ematix_flow.web.ui_dist`` data dir, which is populated by
       the Vite build at wheel-build time. If absent, the server
       serves a friendly placeholder HTML page.
+    - ``bearer_token`` — when set, ``/api/*`` routes require an
+      ``Authorization: Bearer <token>`` header that matches. Lets
+      operators bind the server to non-loopback addresses safely.
+      ``/api/health`` stays open so load-balancer / readiness probes
+      keep working.
     """
     try:
-        from fastapi import Body, FastAPI, HTTPException
+        from fastapi import Body, FastAPI, HTTPException, Request
         from fastapi.responses import HTMLResponse
         from fastapi.staticfiles import StaticFiles
     except ImportError as exc:
@@ -187,6 +251,38 @@ def create_app(
         docs_url="/api/docs",
         redoc_url=None,
     )
+
+    # Task #6: bearer-token middleware. Applied as an HTTP-level
+    # middleware (not a per-route Depends) so SPA static files +
+    # docs stay reachable without auth, while every /api/* route
+    # except /api/health is gated. Using constant-time compare so
+    # a timing attack can't fingerprint valid tokens.
+    if bearer_token is not None:
+        import hmac
+
+        @app.middleware("http")
+        async def _bearer_token_gate(request: Request, call_next):
+            path = request.url.path
+            # Static / SPA paths + /api/health are open; everything
+            # else under /api/ requires the bearer token.
+            if not path.startswith("/api/") or path == "/api/health":
+                return await call_next(request)
+            header = request.headers.get("authorization", "")
+            if not header.startswith("Bearer "):
+                from fastapi.responses import JSONResponse
+
+                return JSONResponse(
+                    {"detail": "missing Authorization: Bearer <token> header"},
+                    status_code=401,
+                )
+            presented = header[len("Bearer "):].strip()
+            if not hmac.compare_digest(presented, bearer_token):
+                from fastapi.responses import JSONResponse
+
+                return JSONResponse(
+                    {"detail": "invalid bearer token"}, status_code=401,
+                )
+            return await call_next(request)
 
     @app.get("/api/health")
     def health() -> dict[str, str]:  # type: ignore[unused-function]
@@ -286,10 +382,51 @@ def create_app(
                 # `next_run_at` is the most-recent forecast the scheduler
                 # produced (set via record.extras["next_run_at"]). For
                 # streaming pipelines we omit it and let the UI render
-                # "LIVE STREAMING" instead.
+                # "LIVE STREAMING" instead. If no extra is present, ask
+                # the in-process registry to forecast from the cron +
+                # timezone — this keeps the panel useful even on the
+                # first boot before any scheduler tick has run.
                 next_run_at = None
+                pipeline_tz = None
                 if latest.kind != "streaming":
                     next_run_at = latest.extras.get("next_run_at")
+                    pipeline_tz = latest.extras.get("timezone")
+                    if next_run_at is None or pipeline_tz is None:
+                        sp = _registry_lookup(name)
+                        if sp is not None:
+                            if pipeline_tz is None:
+                                pipeline_tz = sp.timezone
+                            if next_run_at is None and sp.schedule is not None:
+                                from ematix_flow.pipeline import forecast_next_run
+
+                                forecast = forecast_next_run(
+                                    sp.schedule, timezone=sp.timezone,
+                                )
+                                if forecast is not None:
+                                    next_run_at = forecast.isoformat()
+                # v0.5.0: surface streaming live-stats from extras. The
+                # daemon writes throughput / cycle-time into the running
+                # record's extras every ~30s; we just pass them through
+                # so the UI can render them in place of "Median duration".
+                streaming_stats: dict[str, Any] | None = None
+                if latest.kind == "streaming":
+                    e = latest.extras or {}
+                    if any(
+                        k in e
+                        for k in (
+                            "snapshot_at", "stats_1m", "stats_5m",
+                            "rows_consumed_total",
+                        )
+                    ):
+                        streaming_stats = {
+                            "snapshot_at": e.get("snapshot_at"),
+                            "rows_consumed_total": e.get("rows_consumed_total"),
+                            "rows_written_total": e.get("rows_written_total"),
+                            "batches_total": e.get("batches_total"),
+                            "errors_total": e.get("errors_total"),
+                            "stats_1m": e.get("stats_1m"),
+                            "stats_5m": e.get("stats_5m"),
+                        }
                 pipelines.append(
                     {
                         "name": name,
@@ -301,6 +438,8 @@ def create_app(
                         ),
                         "recent_runs": recent,
                         "next_run_at": next_run_at,
+                        "timezone": pipeline_tz,
+                        "streaming_stats": streaming_stats,
                     }
                 )
             # Sort pipelines so the most recently active is on top.
@@ -310,6 +449,374 @@ def create_app(
             )
             return {"pipelines": pipelines}
         return {"pipelines": _STUB_PIPELINES}
+
+    # ---- Cross-pipeline DAG view (task #7) -------------------------
+    @app.get("/api/dag")
+    def pipeline_dag() -> dict[str, Any]:  # type: ignore[unused-function]
+        """Cross-pipeline DAG: nodes = registered pipelines, edges =
+        ``depends_on`` declarations. Renders in the SPA as a tree to
+        spot bottlenecks (deep chains, fan-out hot spots)."""
+        try:
+            from ematix_flow.pipeline import _DEPENDS_ON, _REGISTRY
+        except Exception:
+            return {"nodes": [], "edges": []}
+
+        nodes = []
+        for name, sp in sorted(_REGISTRY.items()):
+            nodes.append(
+                {
+                    "name": name,
+                    "schedule": sp.schedule,
+                    "timezone": getattr(sp, "timezone", None),
+                }
+            )
+        edges = []
+        for name, upstreams in _DEPENDS_ON.items():
+            for upstream in upstreams:
+                # Edge direction: upstream → downstream (upstream
+                # produces, downstream consumes).
+                edges.append({"from": upstream, "to": name})
+        return {"nodes": nodes, "edges": edges}
+
+    # ---- Workflows: named groupings of jobs ---------------------------
+    def _last_success_time(name: str):
+        """Most recent succeeded run start time for ``name``, or None."""
+        if history is None:
+            return None
+        try:
+            runs, _ = history.list_runs(pipeline=name, status="succeeded", limit=1)
+        except Exception:
+            return None
+        if not runs:
+            return None
+        # list_runs returns RunRecord with started_at as datetime or ISO str.
+        st = runs[0].started_at
+        if isinstance(st, str):
+            try:
+                from datetime import datetime as _dt
+                # Accept both Z-suffix and +00:00.
+                return _dt.fromisoformat(st.replace("Z", "+00:00"))
+            except Exception:
+                return None
+        return st
+
+    def _latest_terminal_run(name: str):
+        """Most recent terminal (succeeded/failed/cancelled) run for ``name``."""
+        if history is None:
+            return None
+        try:
+            runs, _ = history.list_runs(pipeline=name, limit=10)
+        except Exception:
+            return None
+        for r in runs:
+            if r.status in ("succeeded", "failed", "cancelled"):
+                return r
+        return None
+
+    def _eval_trigger_op(
+        op: Any,
+        *,
+        last_self_success,
+    ) -> dict[str, Any]:
+        """Recursively evaluate a TriggerOp expression tree against
+        the workflow's last successful run.
+
+        Returns a JSON-serialisable dict mirroring the tree structure
+        and carrying a ``state`` (ready/pending/failed) at every node.
+
+        Leaf state semantics:
+            - ready  : upstream has a successful run since last_self_success
+            - failed : upstream's most recent terminal run since
+                       last_self_success was a failure
+            - pending: otherwise (running, never run, etc.)
+
+        Internal-node state semantics:
+            - all : ready if every child ready; failed if any failed and
+                    none pending; otherwise pending
+            - any : ready if any child ready; failed if every child
+                    failed; otherwise pending
+        """
+        from ematix_flow.pipeline import TriggerOp
+
+        if isinstance(op, str):
+            # Leaf — compute event state.
+            last_up_success = _last_success_time(op)
+            latest = _latest_terminal_run(op)
+            state = "pending"
+            if last_up_success is not None and (
+                last_self_success is None or last_up_success > last_self_success
+            ):
+                state = "ready"
+            if (
+                state == "pending"
+                and latest is not None
+                and latest.status == "failed"
+                and (
+                    last_up_success is None
+                    or (
+                        last_self_success is not None
+                        and last_up_success <= last_self_success
+                    )
+                )
+            ):
+                state = "failed"
+            return {"kind": "leaf", "name": op, "state": state}
+
+        if isinstance(op, TriggerOp):
+            children = [
+                _eval_trigger_op(m, last_self_success=last_self_success)
+                for m in op.members
+            ]
+            child_states = [c["state"] for c in children]
+            if op.kind == "all":
+                if all(s == "ready" for s in child_states):
+                    state = "ready"
+                elif any(s == "failed" for s in child_states) and "pending" not in child_states:
+                    state = "failed"
+                else:
+                    state = "pending"
+            else:  # "any"
+                if any(s == "ready" for s in child_states):
+                    state = "ready"
+                elif all(s == "failed" for s in child_states):
+                    state = "failed"
+                else:
+                    state = "pending"
+            return {"kind": op.kind, "members": children, "state": state}
+
+        # Shouldn't happen if normalisation worked, but be defensive.
+        return {"kind": "leaf", "name": repr(op), "state": "pending"}
+
+    def _compute_triggers(
+        *,
+        triggered_by: Any,
+        schedule: str | None,
+        timezone_name: str | None,
+        on_message_repr: str | None,
+        last_self_success,
+    ) -> list[dict[str, Any]]:
+        """Return a per-condition list of trigger dicts with state +
+        display info. ``last_self_success`` is this workflow's own
+        most-recent successful run start time, or None if never run.
+
+        Each entry shape:
+          {
+            "kind": "schedule" | "after" | "on_message",
+            "label": "human-readable display",
+            "state": "ready" | "pending" | "failed",
+            ... kind-specific fields ...
+          }
+        """
+        out: list[dict[str, Any]] = []
+        from datetime import datetime as _dt
+
+        now = _dt.now(UTC)
+
+        # Schedule trigger
+        if schedule:
+            from ematix_flow.pipeline import forecast_next_run
+            anchor = last_self_success if last_self_success is not None else None
+            try:
+                next_tick = forecast_next_run(
+                    schedule,
+                    now=anchor or now,
+                    timezone=timezone_name,
+                )
+            except Exception:
+                next_tick = None
+            if next_tick is not None:
+                state = "ready" if now >= next_tick else "pending"
+                # Format the tick in the workflow's tz for the label.
+                label = _format_tick(next_tick, timezone_name, now)
+            else:
+                state = "pending"
+                label = schedule
+            out.append({
+                "kind": "schedule",
+                "cron": schedule,
+                "timezone": timezone_name,
+                "next_at": (next_tick.isoformat() if next_tick is not None else None),
+                "state": state,
+                "label": label,
+            })
+
+        # Upstream event triggers. ``triggered_by`` is now a TriggerOp
+        # expression tree (or None). We append a single "after_expr"
+        # entry whose nested ``expr`` field carries the boolean tree
+        # with per-node state; the UI renders the tree with AND/OR
+        # grouping and parentheses.
+        if triggered_by is not None:
+            expr_eval = _eval_trigger_op(
+                triggered_by, last_self_success=last_self_success
+            )
+            out.append({
+                "kind": "after_expr",
+                "state": expr_eval["state"],
+                "expr": expr_eval,
+            })
+
+        # on_message: pending (firing is per-message; no AND eval at tick time)
+        if on_message_repr:
+            out.append({
+                "kind": "on_message",
+                "source": on_message_repr,
+                "state": "pending",
+                "label": on_message_repr,
+            })
+
+        return out
+
+    def _format_tick(tick_utc, timezone_name: str | None, now_utc) -> str:
+        """Format a UTC datetime in the given IANA tz for display.
+
+        Returns just ``HH:MM TZ`` when the tick is today in that tz, or
+        ``YYYY-MM-DD HH:MM TZ`` otherwise.
+        """
+        try:
+            from zoneinfo import ZoneInfo
+        except ImportError:
+            ZoneInfo = None  # type: ignore[assignment]
+        if timezone_name and ZoneInfo is not None:
+            try:
+                tz = ZoneInfo(timezone_name)
+                local_tick = tick_utc.astimezone(tz)
+                local_now = now_utc.astimezone(tz)
+                short_tz = local_tick.strftime("%Z") or timezone_name
+                if local_tick.date() == local_now.date():
+                    return f"{local_tick.strftime('%H:%M')} {short_tz}"
+                return f"{local_tick.strftime('%Y-%m-%d %H:%M')} {short_tz}"
+            except Exception:
+                pass
+        # Fallback: UTC.
+        if tick_utc.date() == now_utc.date():
+            return f"{tick_utc.strftime('%H:%M')} UTC"
+        return f"{tick_utc.strftime('%Y-%m-%d %H:%M')} UTC"
+
+    @app.get("/api/workflows")
+    def list_workflows() -> dict[str, Any]:  # type: ignore[unused-function]
+        """Each workflow is a user-named group of jobs + the trigger
+        conditions that fire it. Jobs without an explicit workflow show up
+        as a synthetic workflow-of-one keyed by their own name."""
+        try:
+            from ematix_flow.pipeline import (
+                _DEPENDS_ON,
+                _JOB_TO_WORKFLOW,
+                _REGISTRY,
+                _WORKFLOWS,
+                _workflow_is_streaming,
+                workflow_dag_edges,
+            )
+        except Exception:
+            return {"workflows": []}
+
+        # Streaming pipelines live in a separate registry — surface them
+        # alongside batch jobs so the Workflows page shows every kind.
+        try:
+            from ematix_flow.streaming import _STREAMING_PIPELINES
+            streaming_names = sorted(_STREAMING_PIPELINES.keys())
+        except Exception:
+            streaming_names = []
+
+        all_jobs = sorted(_REGISTRY.keys())
+        result: list[dict[str, Any]] = []
+
+        # Declared workflows first.
+        for wf_name, wf in sorted(_WORKFLOWS.items()):
+            # Edges come from each member job's own depends_on, filtered to
+            # references inside this workflow.
+            edges = [
+                {"from": u, "to": d}
+                for (u, d) in workflow_dag_edges(wf_name)
+            ]
+            # Streaming workflow if any member job is a streaming pipeline.
+            is_streaming = _workflow_is_streaming(list(wf.jobs))
+            kind = "streaming" if is_streaming else "declared"
+            on_msg_repr = (
+                repr(wf.on_message) if wf.on_message is not None else None
+            )
+            last_self = _last_success_time(wf_name)
+            triggers = (
+                []
+                if is_streaming
+                else _compute_triggers(
+                    triggered_by=wf.triggered_by,
+                    schedule=wf.schedule,
+                    timezone_name=wf.timezone,
+                    on_message_repr=on_msg_repr,
+                    last_self_success=last_self,
+                )
+            )
+            # Legacy flat list (leaf names) for any UI/consumer that
+            # doesn't yet understand the expression tree.
+            leaf_names = list(wf.triggered_by_leaves)
+            result.append(
+                {
+                    "name": wf_name,
+                    "kind": kind,
+                    "jobs": list(wf.jobs),
+                    "edges": edges,
+                    "triggered_by": leaf_names,
+                    "schedule": wf.schedule,
+                    "timezone": wf.timezone,
+                    "on_message": on_msg_repr,
+                    "triggers": triggers,
+                }
+            )
+
+        # Synthetic workflow-of-one for every unassigned batch job. Carry
+        # the job's own per-job schedule/depends_on through as the
+        # standalone trigger. Wrap upstream-name list as an AllOf tree
+        # so the UI renders consistently.
+        from ematix_flow.pipeline import AllOf as _AllOf
+        for job_name in all_jobs:
+            if job_name in _JOB_TO_WORKFLOW:
+                continue
+            ups = _DEPENDS_ON.get(job_name) or []
+            edges = [{"from": u, "to": job_name} for u in ups]
+            sp = _REGISTRY.get(job_name)
+            sched = getattr(sp, "schedule", None)
+            tz = getattr(sp, "timezone", None)
+            last_self = _last_success_time(job_name)
+            trigger_expr = _AllOf(*ups) if ups else None
+            triggers = _compute_triggers(
+                triggered_by=trigger_expr,
+                schedule=sched,
+                timezone_name=tz,
+                on_message_repr=None,
+                last_self_success=last_self,
+            )
+            result.append(
+                {
+                    "name": job_name,
+                    "kind": "single",
+                    "jobs": [job_name],
+                    "edges": edges,
+                    "triggered_by": list(ups),
+                    "schedule": sched,
+                    "timezone": tz,
+                    "on_message": None,
+                    "triggers": triggers,
+                }
+            )
+
+        # Streaming pipelines that aren't part of a declared workflow.
+        for name in streaming_names:
+            if name in _JOB_TO_WORKFLOW:
+                continue
+            result.append(
+                {
+                    "name": name,
+                    "kind": "streaming",
+                    "jobs": [name],
+                    "edges": [],
+                    "triggered_by": [],
+                    "schedule": None,
+                    "timezone": None,
+                    "on_message": None,
+                    "triggers": [],
+                }
+            )
+        return {"workflows": result}
 
     # ---- Mutating actions (Phase 4b) -------------------------------
     #
@@ -354,6 +861,139 @@ def create_app(
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         return {"new_run_id": new_id}
+
+    def _enqueue_run_now(
+        *,
+        pipeline_name: str,
+        kind: str = "batch",
+        extras: dict[str, Any] | None = None,
+    ) -> str:
+        """Write a fresh ``status="requested"`` record for ``pipeline_name``
+        that the scheduler / run-due path picks up on its next tick.
+
+        Used by the Workflows/Jobs tabs' "Run now" buttons. Returns the
+        new run_id.
+        """
+        import uuid
+        from datetime import datetime
+
+        from ematix_flow.run_log.history import RunRecord
+
+        new_id = f"run-now-{pipeline_name}-{uuid.uuid4().hex[:12]}"
+        base_extras: dict[str, Any] = {"source": "run_now"}
+        if extras:
+            base_extras.update(extras)
+        history.record_run_record(
+            RunRecord(
+                run_id=new_id,
+                pipeline=pipeline_name,
+                status="requested",
+                started_at=datetime.now(UTC),
+                finished_at=None,
+                attempt=1,
+                kind=kind,
+                extras=base_extras,
+            )
+        )
+        return new_id
+
+    @app.post("/api/workflows/{name}/run-now")
+    def post_workflow_run_now(  # type: ignore[unused-function]
+        name: str,
+        body: dict[str, Any] = Body(default_factory=dict),  # noqa: B008
+    ) -> dict[str, Any]:
+        """Enqueue an immediate run of the named workflow. Ignores
+        trigger gates (cron not yet reached, upstream events not
+        satisfied).
+
+        Optional body fields:
+
+        - ``jobs``: list of member job names to include in this run.
+          Defaults to all the workflow's member jobs. Selected names
+          must be a subset of the workflow's ``jobs=`` list.
+        """
+        _require_history()
+        assert history is not None
+        try:
+            from ematix_flow.pipeline import _REGISTRY, _WORKFLOWS
+        except Exception as e:
+            raise HTTPException(
+                status_code=500, detail="pipeline registry unavailable"
+            ) from e
+        wf = _WORKFLOWS.get(name)
+        if wf is None:
+            # Allow a workflow-of-one (standalone job/streaming) by name too,
+            # so the "Run now" button works uniformly on every card.
+            if name not in _REGISTRY:
+                try:
+                    from ematix_flow.streaming import _STREAMING_PIPELINES
+                    if name not in _STREAMING_PIPELINES:
+                        raise HTTPException(status_code=404, detail=f"unknown workflow {name!r}")
+                except ImportError as e:
+                    raise HTTPException(
+                        status_code=404, detail=f"unknown workflow {name!r}"
+                    ) from e
+            selected = [name]
+            all_jobs = (name,)
+        else:
+            all_jobs = wf.jobs
+            requested = body.get("jobs")
+            if requested is None:
+                selected = list(all_jobs)
+            else:
+                if not isinstance(requested, list) or not all(
+                    isinstance(j, str) for j in requested
+                ):
+                    raise HTTPException(
+                        status_code=400, detail="jobs= must be a list of strings"
+                    )
+                bad = [j for j in requested if j not in all_jobs]
+                if bad:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"jobs= contains names not in workflow {name!r}: {bad}",
+                    )
+                if not requested:
+                    raise HTTPException(status_code=400, detail="jobs= cannot be empty")
+                selected = requested
+        new_id = _enqueue_run_now(
+            pipeline_name=name,
+            kind="batch",
+            extras={"selected_jobs": list(selected)},
+        )
+        return {"new_run_id": new_id, "selected_jobs": list(selected)}
+
+    @app.post("/api/jobs/{name}/run-now")
+    def post_job_run_now(  # type: ignore[unused-function]
+        name: str,
+        body: dict[str, Any] = Body(default_factory=dict),  # noqa: B008
+    ) -> dict[str, Any]:
+        """Enqueue an immediate run of the named job.
+
+        Optional body fields:
+
+        - ``cascade_downstream``: when ``true``, after this job
+          succeeds, any job that depends on it (within the same
+          workflow, or via legacy per-job depends_on) is also
+          enqueued. Default ``false`` — runs just this job.
+        """
+        _require_history()
+        assert history is not None
+        try:
+            from ematix_flow.pipeline import _REGISTRY
+        except Exception as e:
+            raise HTTPException(
+                status_code=500, detail="pipeline registry unavailable"
+            ) from e
+        if name not in _REGISTRY:
+            raise HTTPException(status_code=404, detail=f"unknown job {name!r}")
+        cascade = bool(body.get("cascade_downstream", False))
+        new_id = _enqueue_run_now(
+            pipeline_name=name,
+            kind="batch",
+            extras={"cascade_downstream": cascade},
+        )
+        return {"new_run_id": new_id, "cascade_downstream": cascade}
 
     @app.post("/api/runs/{run_id}/pause")
     def post_pause(run_id: str) -> dict[str, Any]:  # type: ignore[unused-function]
@@ -402,6 +1042,18 @@ def _median(xs: list[int]) -> int:
     if len(s) % 2 == 0:
         return (s[mid - 1] + s[mid]) // 2
     return s[mid]
+
+
+def _registry_lookup(name: str):
+    """Look up a registered ScheduledPipeline by name, returning ``None``
+    if the registry is empty in this process. The web server runs in a
+    process where the user's pipelines may or may not be imported; we
+    do not want a missing import to make the API panel blank."""
+    try:
+        from ematix_flow.pipeline import _REGISTRY  # type: ignore[attr-defined]
+    except Exception:
+        return None
+    return _REGISTRY.get(name)
 
 
 def _resolve_ui_dir(override: Path | None) -> Path | None:
@@ -474,14 +1126,16 @@ def run_server(
     host: str = "127.0.0.1",
     port: int = 8080,
     log_level: str = "info",
+    bearer_token: str | None = None,
+    history: RunHistoryStore | None = None,
 ) -> None:
     """Launch the uvicorn server.
 
     Defaults to ``127.0.0.1`` so the UI is unreachable off-host
     without an explicit ``--bind <addr>`` opt-in. Binding to
-    ``0.0.0.0`` (or any non-loopback) prints a loud warning since
-    Phase 4a ships without bearer-token auth — anyone who can reach
-    the port can trigger restart / rerun / pause actions.
+    ``0.0.0.0`` (or any non-loopback) prints a loud warning **unless
+    bearer-token auth is configured** — once a token is set, mutating
+    actions require it and the non-loopback bind is safe.
     """
     try:
         import uvicorn  # type: ignore[import-not-found]
@@ -491,15 +1145,16 @@ def run_server(
             "`pip install ematix-flow[web]`"
         ) from exc
 
-    if host not in {"127.0.0.1", "localhost", "::1"}:
+    is_loopback = host in {"127.0.0.1", "localhost", "::1"}
+    if not is_loopback and bearer_token is None:
         print(
-            f"WARNING: ematix-flow web is binding to {host!r}. This server "
-            "ships without auth in Phase 4a — anyone who can reach this "
-            "port can trigger restart / rerun / pause actions on your "
-            "pipelines. Use 127.0.0.1 + SSH tunneling, or put a reverse "
-            "proxy with auth in front, before exposing this off-host.",
+            f"WARNING: ematix-flow web is binding to {host!r} with no "
+            "bearer-token auth. Anyone who can reach this port can trigger "
+            "restart / rerun / pause actions on your pipelines. Pass "
+            "--token <secret> (or set EMATIX_FLOW_WEB_TOKEN env var) before "
+            "exposing this off-host.",
             file=sys.stderr,
         )
 
-    app = create_app()
+    app = create_app(bearer_token=bearer_token, history=history)
     uvicorn.run(app, host=host, port=port, log_level=log_level)

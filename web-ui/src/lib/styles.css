@@ -271,17 +271,33 @@ table.runs tr:hover { background: rgba(51, 220, 204, 0.03); cursor: pointer; }
 }
 .last-10-strip {
   display: flex;
+  /* v0.5.0: bars grow upward (bottom-aligned) so the height-encodes-
+     duration story reads at a glance. */
+  align-items: flex-end;
   gap: 4px;
+  /* Reserve enough vertical room for the tallest cell (28px) plus a
+     little breathing space, so the strip's bounding box doesn't jitter
+     as durations change. */
+  min-height: 32px;
+}
+.last-10-label .dim {
+  color: var(--color-phosphor-700);
+  font-size: 0.7rem;
+  margin-left: 0.4em;
+  font-weight: normal;
 }
 .exec-cell {
   display: inline-block;
   width: 22px;
+  /* Height is set inline per cell — see cellHeight() in Pipelines.svelte.
+     Falls back to 22px (the prior fixed shape) if the inline style is
+     stripped, so a JS-disabled render still shows a sensible strip. */
   height: 22px;
   border-radius: 2px;
   border: 1px solid transparent;
   padding: 0;
   cursor: pointer;
-  transition: transform 0.08s;
+  transition: transform 0.08s, height 0.18s ease-out;
 }
 .exec-cell:hover {
   transform: translateY(-1px);
@@ -324,6 +340,24 @@ table.runs tr:hover { background: rgba(51, 220, 204, 0.03); cursor: pointer; }
   font-family: var(--font-mono);
   font-size: 0.78rem;
   color: var(--color-phosphor-500);
+}
+/* v0.5.0: streaming-pipeline footer surface — throughput + cycle */
+.streaming-stats {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.35em;
+}
+.streaming-stats .dim {
+  color: var(--color-phosphor-700);
+  font-size: 0.72rem;
+}
+.streaming-stats .sep {
+  color: var(--color-phosphor-700);
+  padding: 0 0.15em;
+}
+.streaming-stats .mono {
+  color: var(--color-phosphor-200);
 }
 .link {
   color: var(--color-phosphor-300);

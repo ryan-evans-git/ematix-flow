@@ -184,7 +184,19 @@ def test_dataclass_stacking_rejected() -> None:
 def test_pydantic_basemodel_stacking_rejected() -> None:
     pydantic = pytest.importorskip("pydantic")
 
-    with pytest.raises(TypeError, match="pydantic|BaseModel"):
+    # ematix.table rejects BaseModel subclasses with a TypeError. On
+    # newer pydantic (>=2.13) the BaseModel itself also rejects our
+    # ematix Type sentinels via PydanticSchemaGenerationError — either
+    # path counts as "rejected", which is all the contract requires.
+    try:
+        from pydantic import PydanticSchemaGenerationError  # type: ignore[attr-defined]
+        expected: tuple[type[BaseException], ...] = (
+            TypeError, PydanticSchemaGenerationError,
+        )
+    except ImportError:
+        expected = (TypeError,)
+
+    with pytest.raises(expected):
 
         @ematix.table(schema="s")
         class T(pydantic.BaseModel):

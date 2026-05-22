@@ -104,15 +104,25 @@ def from_url(url: str) -> Alerter:
         from .slack import SlackAlerter
         return SlackAlerter(url)
 
+    if scheme == "email":
+        from .email import from_url as _from_email_url
+        return _from_email_url(url)
+
+    if scheme == "pagerduty":
+        from .pagerduty import from_url as _from_pd_url
+        return _from_pd_url(url)
+
     raise ValueError(
         f"unknown alerter URL scheme {scheme!r} in {url!r}. "
-        f"Supported: stdout, slack, https, http."
+        f"Supported: stdout, slack, https, http, email, pagerduty."
     )
 
 
 __all__ = [
     "AlertEvent",
     "Alerter",
+    "EmailAlerter",
+    "PagerDutyAlerter",
     "SlackAlerter",
     "StdoutAlerter",
     "from_url",
@@ -129,4 +139,10 @@ def __getattr__(name: str):
     if name == "SlackAlerter":
         from .slack import SlackAlerter
         return SlackAlerter
+    if name == "EmailAlerter":
+        from .email import EmailAlerter
+        return EmailAlerter
+    if name == "PagerDutyAlerter":
+        from .pagerduty import PagerDutyAlerter
+        return PagerDutyAlerter
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

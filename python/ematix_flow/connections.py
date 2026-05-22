@@ -363,10 +363,14 @@ class KafkaConnection(Connection):
     # Maps directly to rdkafka's `auto.offset.reset`.
     auto_offset_reset: str | None = None
     schema_registry_url: str | None = None
-    # Π.1: typed Schema Registry reference. Accepts a
-    # `SchemaRegistryConnection` instance or a registered SR name
-    # string. Mutually exclusive with `schema_registry_url=`.
-    schema_registry: str | SchemaRegistryConnection | None = None
+    # Π.1 / task #556: typed Schema Registry reference. Accepts a
+    # ``SchemaRegistryConnection`` (Confluent wire format), a
+    # ``GlueSchemaRegistryConnection`` (AWS Glue wire format), or a
+    # registered SR name string. Mutually exclusive with
+    # ``schema_registry_url=``. The Rust backend picks the framing
+    # (Confluent 0x00+4B-id vs Glue 0x03+16B-UUID+1B-codec) based on
+    # the connection's ``kind``.
+    schema_registry: str | SchemaRegistryConnection | GlueSchemaRegistryConnection | None = None
     sasl_plain_username: str | None = None
     sasl_plain_password: str | None = None
     sasl_scram_username: str | None = None
@@ -384,6 +388,26 @@ class KafkaConnection(Connection):
                 "`schema_registry=` (typed SR connection or name) OR the "
                 "legacy `schema_registry_url=` shorthand, not both"
             )
+        # Task #556: catch misconfigurations at construction time
+        # rather than deep in the Rust dispatch. A Glue SR only
+        # makes sense with Avro / Protobuf payloads — pairing it
+        # with JSON / RawBytes is almost certainly a copy-paste
+        # error.
+        if isinstance(self.schema_registry, GlueSchemaRegistryConnection):
+            if self.payload_format is None:
+                raise ValueError(
+                    f"KafkaConnection({self.name!r}): "
+                    "schema_registry=GlueSchemaRegistryConnection requires "
+                    "payload_format='avro' (or 'protobuf' once that path "
+                    "is wired); set payload_format= explicitly"
+                )
+            if self.payload_format not in ("avro", "protobuf"):
+                raise ValueError(
+                    f"KafkaConnection({self.name!r}): "
+                    f"payload_format={self.payload_format!r} does not "
+                    "use a schema-registry wire frame; remove "
+                    "schema_registry= or switch payload_format to 'avro'"
+                )
 
 
 @dataclass(repr=False)
