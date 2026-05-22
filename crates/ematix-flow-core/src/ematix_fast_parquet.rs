@@ -85,6 +85,17 @@ pub struct BridgeFilter {
 }
 
 impl BridgeFilter {
+    /// Constructor for tests + benches. Production callers go through
+    /// the predicate-collection pipeline in `merge_predicates_*` (see
+    /// line ~1086) so they get TPC-H-specific predicate merging.
+    pub fn new(predicates: Vec<ColumnPredicate>) -> Self {
+        Self {
+            predicates,
+            predicted_pass_rate: 0.5,
+            adaptive: None,
+        }
+    }
+
     /// Σ.E5 Phase 1.8: combined pass-rate estimate across all
     /// predicates (AND'd). `full_col_stats` is indexed by the
     /// PROVIDER's full schema column index (the same index space
@@ -1610,7 +1621,18 @@ impl TableProvider for EmatixFastParquetTableProvider {
                 // parallel-bitmap+dense (high-sel) vs serial-
                 // bitmap+masked (low-sel).
                 let p = bf.estimate_pass_rate(&self.column_stats);
-                bf.with_predicted_pass_rate(p)
+                // Σ.L.3.c: enable adaptive reordering on multi-
+                // predicate filters. The reader observes per-RG
+                // pass-rates and reorders. `should_use_sequential()`
+                // then picks the Σ.L.3.c sequential masked-AND path
+                // when predicted_pass_rate ≤ 0.30. Bench-gate on Q06
+                // shape (3 preds, ~2% pass) showed 0.64× wall-time
+                // (35% win); see `adaptive_filter_q06_gate` example.
+                let mut bf = bf.with_predicted_pass_rate(p);
+                if bf.predicates().len() >= 2 {
+                    bf = bf.with_adaptive_reordering();
+                }
+                bf
             });
 
         // Project the per-column stats so the Exec reports stats in
