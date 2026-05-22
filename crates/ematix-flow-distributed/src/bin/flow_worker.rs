@@ -25,7 +25,8 @@ use std::env;
 use std::error::Error;
 use std::net::SocketAddr;
 
-use datafusion_distributed::{DefaultSessionBuilder, Worker};
+use datafusion_distributed::Worker;
+use ematix_flow_distributed::bloom_flight::default_bloom_session_builder;
 use ematix_flow_distributed::tls::load_server_tls_config;
 use tonic::transport::Server;
 
@@ -112,7 +113,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
     };
 
     let addr: SocketAddr = format!("{bind_addr}:{port}").parse()?;
-    let worker = Worker::from_session_builder(DefaultSessionBuilder);
+    // Σ.J.2.b.viii — wrap the default session builder so inbound
+    // `x-ematix-bloom-*` headers automatically install the
+    // EnableContextBloomRule on the per-request SessionState. No-op
+    // for queries without inbound blooms.
+    let worker = Worker::from_session_builder(default_bloom_session_builder());
     let scheme = if server_tls.is_some() {
         "https"
     } else {

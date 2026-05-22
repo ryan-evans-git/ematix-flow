@@ -63,6 +63,7 @@ use datafusion::common::Result as DfResult;
 use datafusion::common::{Column, DataFusionError};
 use datafusion::logical_expr::{Expr, JoinType, LogicalPlan, LogicalPlanBuilder};
 use datafusion::prelude::SessionContext;
+use datafusion_distributed::DistributedExt;
 use ematix_flow_core::bloom::{column_uuid, BloomFilter};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -135,6 +136,39 @@ pub async fn emit_build_side_blooms(
         }
     }
     Ok(out)
+}
+
+/// Σ.J.2.b.viii — one-call coordinator-side: emit blooms for `plan`,
+/// marshall to a `HeaderMap`, install via
+/// `set_distributed_passthrough_headers`. The passthrough mechanism
+/// flows the headers across every Flight stage; probe-side workers
+/// with the [`crate::bloom_flight::BloomSessionBuilder`] installed
+/// pick them up automatically.
+///
+/// Pass the *same* `SessionContext` you'll use for the actual query.
+/// The headers are set on its internal SessionState; subsequent
+/// `ctx.sql(...).collect()` calls propagate them across all Flight
+/// requests for this query.
+///
+/// Returns the number of blooms attached (0 if nothing was eligible
+/// or if every candidate's build side overshot the row cap).
+pub async fn attach_blooms_for_plan(
+    ctx: &mut SessionContext,
+    plan: &LogicalPlan,
+    opts: &BloomEmitterOptions,
+) -> DfResult<usize> {
+    let blooms = emit_build_side_blooms(ctx, plan, opts).await?;
+    if blooms.is_empty() {
+        return Ok(0);
+    }
+    let refs: Vec<(String, &BloomFilter)> = blooms
+        .iter()
+        .map(|(uuid, b)| (uuid.clone(), b.as_ref()))
+        .collect();
+    let map = crate::bloom_flight::blooms_to_header_map(&refs);
+    let attached = map.len();
+    ctx.set_distributed_passthrough_headers(map)?;
+    Ok(attached)
 }
 
 #[derive(Debug, Clone)]
@@ -526,6 +560,29 @@ mod tests {
         let blooms =
             emit_build_side_blooms(&ctx, &plan, &BloomEmitterOptions::default()).await?;
         assert!(blooms.is_empty(), "string-keyed join should not emit blooms");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn attach_blooms_for_plan_sets_headers() -> DfResult<()> {
+        // Σ.J.2.b.viii — confirm the one-call coordinator API mutates
+        // the SessionContext so subsequent ctx.sql(...) calls
+        // propagate the bloom headers.
+        let mut ctx = SessionContext::new();
+        // Register tables + create the plan ON THE SAME ctx so the
+        // emitter can execute the build side against them.
+        register_orders(&ctx, "orders")?;
+        register_customer(&ctx, "customer")?;
+        let df = ctx
+            .sql(
+                "SELECT o_orderkey FROM orders \
+                 INNER JOIN customer ON o_custkey = c_custkey \
+                 WHERE c_name = 'A'",
+            )
+            .await?;
+        let plan = df.into_optimized_plan()?;
+        let n = attach_blooms_for_plan(&mut ctx, &plan, &BloomEmitterOptions::default()).await?;
+        assert!(n >= 1, "expected at least one bloom attached, got {n}");
         Ok(())
     }
 

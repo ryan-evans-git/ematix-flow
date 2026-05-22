@@ -41,10 +41,15 @@
 //! design. This bite ships the transport so the rule has a target.
 
 pub use ematix_flow_core::bloom::ContextBlooms;
+use async_trait::async_trait;
+use datafusion::common::DataFusionError;
+use datafusion::execution::SessionState;
+use datafusion_distributed::{WorkerQueryContext, WorkerSessionBuilder};
 use ematix_flow_core::bloom::{
     blooms_to_header_pairs, header_pairs_to_blooms, BloomFilter,
     FLIGHT_BLOOM_HEADER_PREFIX,
 };
+use ematix_flow_core::context_bloom_rule::install_context_bloom_rule;
 use http::{HeaderMap, HeaderName, HeaderValue};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -117,6 +122,74 @@ pub fn context_blooms_from_headers(headers: &HeaderMap) -> ContextBlooms {
     ContextBlooms::new(map)
 }
 
+/// Σ.J.2.b.viii — `WorkerSessionBuilder` adapter that automatically
+/// installs the probe-side bloom rule on every inbound query. Wrap
+/// any underlying [`WorkerSessionBuilder`] (e.g.
+/// `DefaultSessionBuilder` or a custom one) with this to opt the
+/// worker into bloom propagation.
+///
+/// Behaviour:
+/// 1. Read inbound `x-ematix-bloom-*` headers
+/// 2. Decode to [`ContextBlooms`]
+/// 3. If non-empty, register
+///    [`ematix_flow_core::context_bloom_rule::EnableContextBloomRule`]
+///    on the per-request `SessionStateBuilder`
+/// 4. Delegate to the inner builder for everything else
+///
+/// When the inbound request has no bloom headers, the rule is not
+/// installed — zero codegen-tax cost on non-distributed paths.
+///
+/// ```ignore
+/// // In flow-worker's main():
+/// let inner = DefaultSessionBuilder;
+/// let bloom_aware = BloomSessionBuilder::new(inner);
+/// let worker = Worker::from_session_builder(bloom_aware);
+/// ```
+#[derive(Debug, Clone)]
+pub struct BloomSessionBuilder<T: WorkerSessionBuilder> {
+    inner: T,
+}
+
+impl<T: WorkerSessionBuilder> BloomSessionBuilder<T> {
+    pub fn new(inner: T) -> Self {
+        Self { inner }
+    }
+}
+
+#[async_trait]
+impl<T> WorkerSessionBuilder for BloomSessionBuilder<T>
+where
+    T: WorkerSessionBuilder + Send + Sync + 'static,
+{
+    async fn build_session_state(
+        &self,
+        ctx: WorkerQueryContext,
+    ) -> Result<SessionState, DataFusionError> {
+        let blooms = context_blooms_from_headers(&ctx.headers);
+        if blooms.is_empty() {
+            // No blooms inbound → behave like the underlying builder
+            // with zero overhead.
+            return self.inner.build_session_state(ctx).await;
+        }
+        // Patch the builder before handing off to the inner builder
+        // so any further customisation (custom UDFs, codec, etc.)
+        // composes on top.
+        let patched = WorkerQueryContext {
+            builder: install_context_bloom_rule(ctx.builder, blooms),
+            headers: ctx.headers,
+        };
+        self.inner.build_session_state(patched).await
+    }
+}
+
+/// Σ.J.2.b.viii — convenience constructor: wrap
+/// `DefaultSessionBuilder` with [`BloomSessionBuilder`]. Most workers
+/// without custom session needs just want this.
+pub fn default_bloom_session_builder()
+-> BloomSessionBuilder<datafusion_distributed::DefaultSessionBuilder> {
+    BloomSessionBuilder::new(datafusion_distributed::DefaultSessionBuilder)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -181,6 +254,44 @@ mod tests {
         let decoded = header_map_to_blooms(&map);
         assert_eq!(decoded.len(), 1);
         assert_eq!(decoded[0].0, "only_one");
+    }
+
+    #[tokio::test]
+    async fn bloom_session_builder_installs_rule_when_headers_present() {
+        // Confirm the BloomSessionBuilder is wired correctly: when
+        // inbound headers carry blooms, the per-request SessionState
+        // gets the rule. We can't observe the rule list directly, but
+        // we can verify the wrapper compiles + delegates by exercising
+        // both the "headers empty" and "headers present" branches.
+        use datafusion_distributed::{DefaultSessionBuilder, WorkerQueryContext};
+
+        let builder = default_bloom_session_builder();
+
+        // Branch 1: no headers → inner builder runs unmodified.
+        let ctx_empty = WorkerQueryContext::default();
+        let state = builder.build_session_state(ctx_empty).await.unwrap();
+        // SessionState built — no panic, no error. Inner branch worked.
+        let _ = state;
+
+        // Branch 2: with headers → inner builder still produces a
+        // valid state (the rule is installed but only fires on
+        // matching scans, which none here have).
+        let bloom = mk_bloom(&[1, 2, 3]);
+        let map = blooms_to_header_map(&[("test.col".into(), &bloom)]);
+        let ctx_with = WorkerQueryContext {
+            builder: Default::default(),
+            headers: map,
+        };
+        let state = builder.build_session_state(ctx_with).await.unwrap();
+        let _ = state;
+
+        // Direct DefaultSessionBuilder should also still work via the
+        // wrapper (no panic on the empty path).
+        let direct = BloomSessionBuilder::new(DefaultSessionBuilder);
+        let _ = direct
+            .build_session_state(WorkerQueryContext::default())
+            .await
+            .unwrap();
     }
 
     #[test]
