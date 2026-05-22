@@ -21,7 +21,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
-use datafusion::physical_plan::{displayable, ExecutionPlanProperties};
+use datafusion::physical_plan::{ExecutionPlanProperties, displayable};
 use datafusion::prelude::{SessionConfig, SessionContext};
 use ematix_flow_core::ematix_fast_parquet::EmatixFastParquetTableProvider;
 use futures_util::TryStreamExt;
@@ -118,8 +118,8 @@ async fn run_once(ctx: &SessionContext, sql: &str) -> usize {
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
-    let dir = std::env::var("TPCH_DATA_DIR")
-        .unwrap_or_else(|_| "examples/tpch/data/sf10".to_string());
+    let dir =
+        std::env::var("TPCH_DATA_DIR").unwrap_or_else(|_| "examples/tpch/data/sf10".to_string());
     let path = PathBuf::from(&dir).join("lineitem.parquet");
     if !path.exists() {
         eprintln!("missing {}", path.display());
@@ -139,7 +139,10 @@ async fn main() {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(5);
-    println!("=== Q06 SF=10 breakdown ({} reps each, fresh warmup) ===", reps);
+    println!(
+        "=== Q06 SF=10 breakdown ({} reps each, fresh warmup) ===",
+        reps
+    );
     println!("Data: {}\n", path.display());
 
     let explain = std::env::var("EMAT_EXPLAIN").is_ok();
@@ -156,10 +159,7 @@ async fn main() {
         if explain {
             let df = ctx.sql(sql).await.unwrap();
             let plan = df.create_physical_plan().await.unwrap();
-            println!(
-                "    plan:\n{}",
-                displayable(plan.as_ref()).indent(true)
-            );
+            println!("    plan:\n{}", displayable(plan.as_ref()).indent(true));
         }
         prev_ms = ms;
     }

@@ -40,14 +40,13 @@
 //! vs `table_name-col` etc.) and surviving plan rewrites — separate
 //! design. This bite ships the transport so the rule has a target.
 
-pub use ematix_flow_core::bloom::ContextBlooms;
 use async_trait::async_trait;
 use datafusion::common::DataFusionError;
 use datafusion::execution::SessionState;
 use datafusion_distributed::{WorkerQueryContext, WorkerSessionBuilder};
+pub use ematix_flow_core::bloom::ContextBlooms;
 use ematix_flow_core::bloom::{
-    blooms_to_header_pairs, header_pairs_to_blooms, BloomFilter,
-    FLIGHT_BLOOM_HEADER_PREFIX,
+    BloomFilter, FLIGHT_BLOOM_HEADER_PREFIX, blooms_to_header_pairs, header_pairs_to_blooms,
 };
 use ematix_flow_core::context_bloom_rule::install_context_bloom_rule;
 use http::{HeaderMap, HeaderName, HeaderValue};
@@ -207,8 +206,10 @@ mod tests {
         let a = mk_bloom(&[1, 2, 3]);
         let b = mk_bloom(&[100, 200]);
 
-        let inputs: Vec<(String, &BloomFilter)> =
-            vec![("orders_l_orderkey".into(), &a), ("part_l_partkey".into(), &b)];
+        let inputs: Vec<(String, &BloomFilter)> = vec![
+            ("orders_l_orderkey".into(), &a),
+            ("part_l_partkey".into(), &b),
+        ];
 
         let map = blooms_to_header_map(&inputs);
         assert_eq!(map.len(), 2);

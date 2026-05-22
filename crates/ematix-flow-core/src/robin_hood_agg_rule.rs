@@ -98,9 +98,7 @@ impl PhysicalOptimizerRule for EnableRobinHoodAggregateRule {
                                 group_out_name,
                                 count_out_name,
                             )?;
-                            return Ok(Transformed::yes(
-                                Arc::new(new) as Arc<dyn ExecutionPlan>
-                            ));
+                            return Ok(Transformed::yes(Arc::new(new) as Arc<dyn ExecutionPlan>));
                         }
                     }
                 }
@@ -129,9 +127,7 @@ impl PhysicalOptimizerRule for EnableRobinHoodAggregateRule {
                                 group_out_name,
                                 count_out_name,
                             )?;
-                            return Ok(Transformed::yes(
-                                Arc::new(new) as Arc<dyn ExecutionPlan>
-                            ));
+                            return Ok(Transformed::yes(Arc::new(new) as Arc<dyn ExecutionPlan>));
                         }
                     }
                 }
@@ -153,9 +149,7 @@ impl PhysicalOptimizerRule for EnableRobinHoodAggregateRule {
 
 /// Σ.N.e — match the Partial agg shape: single Int64 GROUP BY +
 /// single COUNT. Returns (col_idx, group_out_name, count_out_name).
-fn match_partial_shape(
-    partial: &AggregateExec,
-) -> Option<(usize, String, String)> {
+fn match_partial_shape(partial: &AggregateExec) -> Option<(usize, String, String)> {
     let groups = partial.group_expr().expr();
     if groups.len() != 1 {
         return None;
@@ -178,9 +172,7 @@ fn match_partial_shape(
 
 /// Σ.N.e — match the Final agg shape: single GROUP BY + single COUNT.
 /// Returns (col_idx, group_out_name, count_out_name).
-fn match_final_shape(
-    final_agg: &AggregateExec,
-) -> Option<(usize, String, String)> {
+fn match_final_shape(final_agg: &AggregateExec) -> Option<(usize, String, String)> {
     let groups = final_agg.group_expr().expr();
     if groups.len() != 1 {
         return None;
@@ -204,9 +196,7 @@ fn match_final_shape(
 /// Σ.N.e — walk down through pass-through nodes to find a
 /// RobinHoodAggregateExec(Partial). Returns the matched node if
 /// found.
-fn find_robin_hood_partial(
-    plan: &Arc<dyn ExecutionPlan>,
-) -> Option<Arc<dyn ExecutionPlan>> {
+fn find_robin_hood_partial(plan: &Arc<dyn ExecutionPlan>) -> Option<Arc<dyn ExecutionPlan>> {
     let mut cur = plan.clone();
     loop {
         if let Some(rh) = cur.as_any().downcast_ref::<RobinHoodAggregateExec>() {
@@ -222,7 +212,6 @@ fn find_robin_hood_partial(
         cur = children[0].clone();
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -242,7 +231,9 @@ mod tests {
     fn make_ctx_with_rule() -> SessionContext {
         let cfg = datafusion::prelude::SessionConfig::new().with_target_partitions(4);
         let state = install_robin_hood_rule(
-            SessionStateBuilder::new().with_default_features().with_config(cfg),
+            SessionStateBuilder::new()
+                .with_default_features()
+                .with_config(cfg),
         )
         .build();
         SessionContext::new_with_state(state)
@@ -302,16 +293,8 @@ mod tests {
         let batches = df.collect().await.unwrap();
         let mut pairs: Vec<(i64, i64)> = Vec::new();
         for b in &batches {
-            let ks = b
-                .column(0)
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .unwrap();
-            let cs = b
-                .column(1)
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .unwrap();
+            let ks = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+            let cs = b.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
             for i in 0..b.num_rows() {
                 pairs.push((ks.value(i), cs.value(i)));
             }
@@ -344,7 +327,9 @@ mod tests {
         let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Utf8, false)]));
         let batch = RecordBatch::try_new(
             schema.clone(),
-            vec![Arc::new(arrow_array::StringArray::from(vec!["a", "b", "a"]))],
+            vec![Arc::new(arrow_array::StringArray::from(vec![
+                "a", "b", "a",
+            ]))],
         )
         .unwrap();
         let mt = MemTable::try_new(schema, vec![vec![batch]]).unwrap();

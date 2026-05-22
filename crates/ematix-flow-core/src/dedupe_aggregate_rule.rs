@@ -128,8 +128,7 @@ impl PhysicalOptimizerRule for DedupeAggregateForFloatDeterminism {
         // walk is cheap — 11-trial bench (2026-05-22) shows zero
         // measurable cost on Q22 vs the rule not being installed at
         // all. Earlier "Q22 +7%" measurements were 3/7-trial noise.
-        let mut counts: std::collections::HashMap<u64, usize> =
-            std::collections::HashMap::new();
+        let mut counts: std::collections::HashMap<u64, usize> = std::collections::HashMap::new();
         let _ = plan.clone().transform_down(|node| {
             if let Some(agg) = node.as_any().downcast_ref::<AggregateExec>()
                 && matches!(
@@ -303,10 +302,9 @@ fn hash_node(node: &Arc<dyn ExecutionPlan>, h: &mut DefaultHasher) {
     // display string captures column projections, predicates pushed
     // into the scan, and the source path / table name.
     h.write_u8(255);
-    let disp =
-        datafusion::physical_plan::displayable(node.as_ref())
-            .one_line()
-            .to_string();
+    let disp = datafusion::physical_plan::displayable(node.as_ref())
+        .one_line()
+        .to_string();
     disp.hash(h);
     for child in node.children() {
         hash_node(child, h);

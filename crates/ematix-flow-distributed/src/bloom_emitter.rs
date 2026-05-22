@@ -58,13 +58,13 @@
 
 use datafusion::arrow::array::{Array, Int32Array, Int64Array};
 use datafusion::arrow::datatypes::DataType;
-use datafusion::common::tree_node::TreeNode;
 use datafusion::common::Result as DfResult;
+use datafusion::common::tree_node::TreeNode;
 use datafusion::common::{Column, DataFusionError};
 use datafusion::logical_expr::{Expr, JoinType, LogicalPlan, LogicalPlanBuilder};
 use datafusion::prelude::SessionContext;
 use datafusion_distributed::DistributedExt;
-use ematix_flow_core::bloom::{column_uuid, BloomFilter};
+use ematix_flow_core::bloom::{BloomFilter, column_uuid};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -237,10 +237,7 @@ fn build_candidate(
     let probe_field = probe_schema
         .field_with_unqualified_name(&probe_col_name)
         .ok()?;
-    if !matches!(
-        probe_field.data_type(),
-        DataType::Int64 | DataType::Int32
-    ) {
+    if !matches!(probe_field.data_type(), DataType::Int64 | DataType::Int32) {
         return None;
     }
     // And on the build side too — we need to produce i64 keys to
@@ -249,10 +246,7 @@ fn build_candidate(
     let build_field = build_schema
         .field_with_unqualified_name(&right_col.name)
         .ok()?;
-    if !matches!(
-        build_field.data_type(),
-        DataType::Int64 | DataType::Int32
-    ) {
+    if !matches!(build_field.data_type(), DataType::Int64 | DataType::Int32) {
         return None;
     }
 
@@ -273,10 +267,7 @@ fn build_candidate(
 /// `col_name` may differ from `target_col.name` if there's an alias
 /// rewrite — we follow the projection back to the underlying scan's
 /// field.
-fn find_probe_table_col(
-    plan: &LogicalPlan,
-    target_col: &Column,
-) -> Option<(String, String)> {
+fn find_probe_table_col(plan: &LogicalPlan, target_col: &Column) -> Option<(String, String)> {
     match plan {
         LogicalPlan::TableScan(scan) => {
             // The col we're after should exist on this scan's
@@ -422,7 +413,10 @@ mod tests {
         let ckeys: Vec<i64> = (0..1000).map(|i| i % 100).collect();
         let rb = RecordBatch::try_new(
             schema.clone(),
-            vec![Arc::new(Int64Array::from(okeys)), Arc::new(Int64Array::from(ckeys))],
+            vec![
+                Arc::new(Int64Array::from(okeys)),
+                Arc::new(Int64Array::from(ckeys)),
+            ],
         )?;
         let mt = MemTable::try_new(schema, vec![vec![rb]])?;
         ctx.register_table(name, Arc::new(mt))?;
@@ -442,7 +436,10 @@ mod tests {
             .collect();
         let rb = RecordBatch::try_new(
             schema.clone(),
-            vec![Arc::new(Int64Array::from(ckeys)), Arc::new(StringArray::from(names))],
+            vec![
+                Arc::new(Int64Array::from(ckeys)),
+                Arc::new(StringArray::from(names)),
+            ],
         )?;
         let mt = MemTable::try_new(schema, vec![vec![rb]])?;
         ctx.register_table(name, Arc::new(mt))?;
@@ -463,8 +460,7 @@ mod tests {
             .await?;
         let plan = df.into_optimized_plan()?;
 
-        let blooms =
-            emit_build_side_blooms(&ctx, &plan, &BloomEmitterOptions::default()).await?;
+        let blooms = emit_build_side_blooms(&ctx, &plan, &BloomEmitterOptions::default()).await?;
 
         // Customer is the build side (right), filtered to A → 50 rows.
         // Should bloom under `orders.o_custkey`.
@@ -482,8 +478,13 @@ mod tests {
         // For keys 50..100 (definitely not inserted), at least most
         // should miss. With ~50 inserts in a 100-key-sized bloom the
         // FPR is well below 50%.
-        let misses = (50..100i64).filter(|k| !bloom.might_contain_i64(*k)).count();
-        assert!(misses > 25, "expected most non-inserted keys to miss, got {misses}/50");
+        let misses = (50..100i64)
+            .filter(|k| !bloom.might_contain_i64(*k))
+            .count();
+        assert!(
+            misses > 25,
+            "expected most non-inserted keys to miss, got {misses}/50"
+        );
         Ok(())
     }
 
@@ -519,8 +520,7 @@ mod tests {
         register_orders(&ctx, "orders")?;
         let df = ctx.sql("SELECT o_orderkey FROM orders").await?;
         let plan = df.into_optimized_plan()?;
-        let blooms =
-            emit_build_side_blooms(&ctx, &plan, &BloomEmitterOptions::default()).await?;
+        let blooms = emit_build_side_blooms(&ctx, &plan, &BloomEmitterOptions::default()).await?;
         assert!(blooms.is_empty());
         Ok(())
     }
@@ -551,15 +551,23 @@ mod tests {
                 Arc::new(Int64Array::from(vec![10])),
             ],
         )?;
-        ctx.register_table("a", Arc::new(MemTable::try_new(schema_a, vec![vec![rb_a]])?))?;
-        ctx.register_table("b", Arc::new(MemTable::try_new(schema_b, vec![vec![rb_b]])?))?;
+        ctx.register_table(
+            "a",
+            Arc::new(MemTable::try_new(schema_a, vec![vec![rb_a]])?),
+        )?;
+        ctx.register_table(
+            "b",
+            Arc::new(MemTable::try_new(schema_b, vec![vec![rb_b]])?),
+        )?;
         let df = ctx
             .sql("SELECT a_v FROM a INNER JOIN b ON a_k = b_k")
             .await?;
         let plan = df.into_optimized_plan()?;
-        let blooms =
-            emit_build_side_blooms(&ctx, &plan, &BloomEmitterOptions::default()).await?;
-        assert!(blooms.is_empty(), "string-keyed join should not emit blooms");
+        let blooms = emit_build_side_blooms(&ctx, &plan, &BloomEmitterOptions::default()).await?;
+        assert!(
+            blooms.is_empty(),
+            "string-keyed join should not emit blooms"
+        );
         Ok(())
     }
 
@@ -606,8 +614,7 @@ mod tests {
         let plan = df.into_optimized_plan()?;
 
         // 1. Build side: emit blooms.
-        let blooms =
-            emit_build_side_blooms(&ctx, &plan, &BloomEmitterOptions::default()).await?;
+        let blooms = emit_build_side_blooms(&ctx, &plan, &BloomEmitterOptions::default()).await?;
         assert!(!blooms.is_empty(), "expected at least one bloom");
 
         // 2. Build side: marshall to HeaderMap.

@@ -67,7 +67,7 @@ use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::ExecutionPlan;
 
-use crate::bloom::{column_uuid, BloomFilterExec, ContextBlooms};
+use crate::bloom::{BloomFilterExec, ContextBlooms, column_uuid};
 use crate::ematix_fast_parquet::EmatixFastParquetExec;
 
 /// Σ.J.2.b.vi — per-request rule. Constructed with the
@@ -103,8 +103,7 @@ impl PhysicalOptimizerRule for EnableContextBloomRule {
             return Ok(plan); // hot-path fast-out for non-distributed queries
         }
         let result = plan.transform_up(|node| {
-            let Some(scan) = node.as_any().downcast_ref::<EmatixFastParquetExec>()
-            else {
+            let Some(scan) = node.as_any().downcast_ref::<EmatixFastParquetExec>() else {
                 return Ok(Transformed::no(node));
             };
             let Some(table_stem) = table_stem_for(scan.path()) else {
@@ -122,11 +121,7 @@ impl PhysicalOptimizerRule for EnableContextBloomRule {
                 }
                 let uuid = column_uuid(&table_stem, field.name());
                 if let Some(bloom) = self.blooms.get(&uuid) {
-                    let wrapped = BloomFilterExec::try_new(
-                        node.clone(),
-                        idx,
-                        bloom.clone(),
-                    )?;
+                    let wrapped = BloomFilterExec::try_new(node.clone(), idx, bloom.clone())?;
                     return Ok(Transformed::yes(Arc::new(wrapped) as _));
                 }
             }
@@ -162,9 +157,9 @@ mod tests {
     use crate::ematix_fast_parquet::EmatixFastParquetTableProvider;
     use arrow_schema::DataType;
     use datafusion::execution::context::SessionContext;
-    use datafusion::physical_plan::displayable;
     use datafusion::physical_plan::ExecutionPlanProperties;
-    use ematix_parquet_codec::write::{write_table_to_path, ColumnData};
+    use datafusion::physical_plan::displayable;
+    use ematix_parquet_codec::write::{ColumnData, write_table_to_path};
     use ematix_parquet_format::types::CompressionCodec;
     use std::collections::HashMap;
 

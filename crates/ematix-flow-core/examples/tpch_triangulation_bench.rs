@@ -274,9 +274,8 @@ async fn build_ematix_ctx(data_dir: &Path) -> Result<SessionContext, Box<dyn std
         .with_config(SessionConfig::new().with_target_partitions(14))
         .with_default_features();
     if matches!(rules.as_str(), "all" | "dedupe") {
-        builder = builder.with_physical_optimizer_rule(Arc::new(
-            DedupeAggregateForFloatDeterminism::default(),
-        ));
+        builder = builder
+            .with_physical_optimizer_rule(Arc::new(DedupeAggregateForFloatDeterminism::default()));
     }
     if matches!(rules.as_str(), "all" | "v040") {
         builder = builder

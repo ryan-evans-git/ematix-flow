@@ -70,7 +70,10 @@ fn target_partitions() -> usize {
         .unwrap_or(8)
 }
 
-fn build_ctx(dir: &str, dict_overrides: &std::collections::HashMap<String, bool>) -> SessionContext {
+fn build_ctx(
+    dir: &str,
+    dict_overrides: &std::collections::HashMap<String, bool>,
+) -> SessionContext {
     let cfg = SessionConfig::new().with_target_partitions(target_partitions());
     let ctx = SessionContext::new_with_config(cfg);
     for t in TABLES {
@@ -117,8 +120,8 @@ fn all_dict() -> std::collections::HashMap<String, bool> {
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
-    let dir = std::env::var("TPCH_DATA_DIR")
-        .unwrap_or_else(|_| "examples/tpch/data/sf1".to_string());
+    let dir =
+        std::env::var("TPCH_DATA_DIR").unwrap_or_else(|_| "examples/tpch/data/sf1".to_string());
     println!("=== Σ.K.2: OFF vs ON-everywhere vs ROUTED ({}) ===\n", dir);
     println!(
         "{:<6} {:>10} {:>10} {:>10} {:>10} {:>10} {:>22}",

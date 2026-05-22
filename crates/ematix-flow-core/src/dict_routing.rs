@@ -80,7 +80,9 @@ pub enum DictArrivalVerdict {
     /// from the LogicalPlan. Σ.L.1's probe resolves these to Yes/No
     /// at runtime; Σ.L.2 caches the resolutions persistently so the
     /// probe runs at most a few times per workload.
-    Speculate { reason: &'static str },
+    Speculate {
+        reason: &'static str,
+    },
 }
 
 impl DictArrivalVerdict {
@@ -187,10 +189,7 @@ pub fn analyse_plan_verdicts(
 /// Pure function variant — operates on a [`LogicalPlan`] directly. Useful
 /// for unit tests + callers that already have a plan in hand. `row_counts`
 /// is consulted for the size-pruning rule; pass `&HashMap::new()` to skip.
-pub fn analyse_plan(
-    plan: &LogicalPlan,
-    row_counts: &HashMap<String, u64>,
-) -> DictArrivalDecision {
+pub fn analyse_plan(plan: &LogicalPlan, row_counts: &HashMap<String, u64>) -> DictArrivalDecision {
     // Step 1: collect, per table, all column refs that touch it.
     //         Walk down the plan, tagging which columns each TableScan
     //         exposes, then check upstream uses.
@@ -206,16 +205,17 @@ pub fn analyse_plan(
                 .filter(|f| is_stringy(f.data_type()))
                 .map(|f| f.name().to_string())
                 .collect();
-            state.tables.entry(scan.table_name.to_string()).or_insert_with(|| {
-                TableInfo {
+            state
+                .tables
+                .entry(scan.table_name.to_string())
+                .or_insert_with(|| TableInfo {
                     string_cols,
                     in_groupby: false,
                     groupby_string_keys: 0,
                     in_like_or_substr: false,
                     in_or_of_string_eq: false,
                     in_filter_multi_agg: false,
-                }
-            });
+                });
         }
         Ok(TreeNodeRecursion::Continue)
     })
@@ -238,8 +238,7 @@ pub fn analyse_plan(
                             }
                         }
                     }
-                    info.groupby_string_keys =
-                        info.groupby_string_keys.max(keys_from_table);
+                    info.groupby_string_keys = info.groupby_string_keys.max(keys_from_table);
                 }
             }
             LogicalPlan::Filter(f) => {
@@ -469,7 +468,10 @@ pub async fn probe_dict_vs_default(
     // One more rep each, take the min — single probe rep is noisy.
     let default_ms = default_ms.min(time_query(default_ctx_factory, probe_sql).await?);
     let dict_ms = dict_ms.min(time_query(dict_ctx_factory, probe_sql).await?);
-    Ok(ProbeResult { dict_ms, default_ms })
+    Ok(ProbeResult {
+        dict_ms,
+        default_ms,
+    })
 }
 
 async fn time_query(
@@ -505,13 +507,7 @@ pub async fn resolve_via_log_or_probe<F>(
     mut make_probe_factories: F,
 ) -> Result<DictArrivalDecision, datafusion::error::DataFusionError>
 where
-    F: FnMut(
-        &str,
-    ) -> Option<(
-        Box<CtxFactory<'static>>,
-        Box<CtxFactory<'static>>,
-        String,
-    )>,
+    F: FnMut(&str) -> Option<(Box<CtxFactory<'static>>, Box<CtxFactory<'static>>, String)>,
 {
     let mut out: DictArrivalDecision = HashMap::new();
     for (table, verdict) in verdicts {
@@ -531,21 +527,14 @@ where
                     }
                 };
                 // Consult the log first.
-                if let Ok(Some(cached)) =
-                    workload.consult_probe(table, &gb, min_observations)
-                {
+                if let Ok(Some(cached)) = workload.consult_probe(table, &gb, min_observations) {
                     out.insert(table.clone(), cached);
                     continue;
                 }
                 // Probe + record.
                 if let Some((dict_f, default_f, probe_sql)) = make_probe_factories(table) {
                     let r = probe_dict_vs_default(&*dict_f, &*default_f, &probe_sql).await?;
-                    let _ = workload.record_probe_outcome(
-                        table,
-                        &gb,
-                        r.dict_ms,
-                        r.default_ms,
-                    );
+                    let _ = workload.record_probe_outcome(table, &gb, r.dict_ms, r.default_ms);
                     out.insert(table.clone(), r.dict_wins());
                 } else {
                     out.insert(table.clone(), false);
@@ -565,13 +554,7 @@ pub async fn resolve_via_probe<F>(
     mut make_probe_factories: F,
 ) -> Result<DictArrivalDecision, datafusion::error::DataFusionError>
 where
-    F: FnMut(
-        &str,
-    ) -> Option<(
-        Box<CtxFactory<'static>>,
-        Box<CtxFactory<'static>>,
-        String,
-    )>,
+    F: FnMut(&str) -> Option<(Box<CtxFactory<'static>>, Box<CtxFactory<'static>>, String)>,
 {
     let mut out: DictArrivalDecision = HashMap::new();
     for (table, verdict) in verdicts {
@@ -772,13 +755,9 @@ mod tests {
         // we just verify the probe's mechanics, not real dict perf.
         // (Real-data race lives in the integration bench.)
         let factory = || ctx_with_lineitem();
-        let r = probe_dict_vs_default(
-            &factory,
-            &factory,
-            "SELECT COUNT(*) FROM lineitem",
-        )
-        .await
-        .unwrap();
+        let r = probe_dict_vs_default(&factory, &factory, "SELECT COUNT(*) FROM lineitem")
+            .await
+            .unwrap();
         // Same code path → neither side should win by >5%. The
         // important property: probe returns a valid ProbeResult.
         assert!(r.dict_ms > 0.0);

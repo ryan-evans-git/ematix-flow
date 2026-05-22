@@ -20,14 +20,13 @@
 //!     cargo run --release -p ematix-flow-core --example q06_fused_proof
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::Instant;
 
 use ematix_flow_core::ematix_parquet_bridge::{
-    filter_f64_column_to_bitmap, filter_f64_column_to_bitmap_dense,
-    filter_i32_column_to_bitmap,
+    filter_f64_column_to_bitmap, filter_f64_column_to_bitmap_dense, filter_i32_column_to_bitmap,
 };
 use ematix_parquet_codec::read::{read_column_f64_masked_into, read_column_i32_masked_into};
 use ematix_parquet_io::ParquetFile;
@@ -106,15 +105,14 @@ fn process_rg(path: &std::path::Path, rg: usize) -> f64 {
 
     // 3. Quantity bitmap.
     let t = Instant::now();
-    let (qy_bitmap, _) = match filter_f64_column_to_bitmap(path, rg, COL_QUANTITY, |v: f64| {
-        v < QUANTITY_MAX
-    }) {
-        Ok(r) => r,
-        Err(_) => filter_f64_column_to_bitmap_dense(path, rg, COL_QUANTITY, |v: f64| {
-            v < QUANTITY_MAX
-        })
-        .expect("quantity filter"),
-    };
+    let (qy_bitmap, _) =
+        match filter_f64_column_to_bitmap(path, rg, COL_QUANTITY, |v: f64| v < QUANTITY_MAX) {
+            Ok(r) => r,
+            Err(_) => {
+                filter_f64_column_to_bitmap_dense(path, rg, COL_QUANTITY, |v: f64| v < QUANTITY_MAX)
+                    .expect("quantity filter")
+            }
+        };
     T_QUANTITY.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
 
     // AND step.
@@ -151,10 +149,10 @@ fn process_rg(path: &std::path::Path, rg: usize) -> f64 {
 }
 
 fn main() {
-    let dir = std::env::var("TPCH_DATA_DIR")
-        .unwrap_or_else(|_| "examples/tpch/data/sf10".to_string());
-    let file_name = std::env::var("LINEITEM_FILE")
-        .unwrap_or_else(|_| "lineitem.parquet".to_string());
+    let dir =
+        std::env::var("TPCH_DATA_DIR").unwrap_or_else(|_| "examples/tpch/data/sf10".to_string());
+    let file_name =
+        std::env::var("LINEITEM_FILE").unwrap_or_else(|_| "lineitem.parquet".to_string());
     let path = PathBuf::from(&dir).join(&file_name);
     if !path.exists() {
         eprintln!("missing {}", path.display());
@@ -167,7 +165,10 @@ fn main() {
         .map(|n| n.get())
         .unwrap_or(8);
 
-    println!("=== Σ.E7 Q06 fused-proof ({}, {n_rgs} RGs, {n_threads} threads) ===\n", path.display());
+    println!(
+        "=== Σ.E7 Q06 fused-proof ({}, {n_rgs} RGs, {n_threads} threads) ===\n",
+        path.display()
+    );
 
     // Run REPS, take median.
     let reps: usize = std::env::var("REPS")
@@ -193,13 +194,34 @@ fn main() {
 
     println!();
     println!("Per-phase totals (microseconds, summed across all RGs × all reps):");
-    println!("  shipdate filter (i32):  {:>10} us", T_SHIPDATE.load(Ordering::Relaxed));
-    println!("  discount filter (f64):  {:>10} us", T_DISCOUNT.load(Ordering::Relaxed));
-    println!("  quantity filter (f64):  {:>10} us", T_QUANTITY.load(Ordering::Relaxed));
-    println!("  AND + popcount:         {:>10} us", T_AND.load(Ordering::Relaxed));
-    println!("  extprice masked decode: {:>10} us", T_PROJ_PRICE.load(Ordering::Relaxed));
-    println!("  discount masked decode: {:>10} us", T_PROJ_DISC.load(Ordering::Relaxed));
-    println!("  multiply-sum:           {:>10} us", T_AGG.load(Ordering::Relaxed));
+    println!(
+        "  shipdate filter (i32):  {:>10} us",
+        T_SHIPDATE.load(Ordering::Relaxed)
+    );
+    println!(
+        "  discount filter (f64):  {:>10} us",
+        T_DISCOUNT.load(Ordering::Relaxed)
+    );
+    println!(
+        "  quantity filter (f64):  {:>10} us",
+        T_QUANTITY.load(Ordering::Relaxed)
+    );
+    println!(
+        "  AND + popcount:         {:>10} us",
+        T_AND.load(Ordering::Relaxed)
+    );
+    println!(
+        "  extprice masked decode: {:>10} us",
+        T_PROJ_PRICE.load(Ordering::Relaxed)
+    );
+    println!(
+        "  discount masked decode: {:>10} us",
+        T_PROJ_DISC.load(Ordering::Relaxed)
+    );
+    println!(
+        "  multiply-sum:           {:>10} us",
+        T_AGG.load(Ordering::Relaxed)
+    );
     println!();
     println!("Σ.E7 (Q06 fused, no DataFusion):  median = {median:.2} ms");
     println!("Triangulation reference baseline:");

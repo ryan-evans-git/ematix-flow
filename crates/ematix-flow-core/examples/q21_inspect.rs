@@ -8,10 +8,10 @@ use std::sync::Arc;
 use datafusion::arrow::util::pretty::pretty_format_batches;
 use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::prelude::{SessionConfig, SessionContext};
-use ematix_flow_core::ematix_fast_parquet::EmatixFastParquetTableProvider;
-use ematix_flow_core::fast_parquet::FastParquetTableProvider;
 use ematix_flow_core::dedupe_aggregate_rule::DedupeAggregateForFloatDeterminism;
 use ematix_flow_core::dict_aggregate_rule::EnableDictGroupCountRule;
+use ematix_flow_core::ematix_fast_parquet::EmatixFastParquetTableProvider;
+use ematix_flow_core::fast_parquet::FastParquetTableProvider;
 use ematix_flow_core::fused_aggregate_filter_multi_agg_rule::InjectFilterMultiAggRule;
 use ematix_flow_core::fused_aggregate_filter_sum_rule::InjectFilterSumRule;
 use futures_util::TryStreamExt;
@@ -41,10 +41,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // one side of the pair and leave the other as the parallel-SUM
     // source of f64 non-determinism (Q15).
     if matches!(mode.as_str(), "dedupe" | "all") {
-        builder =
-            builder.with_physical_optimizer_rule(Arc::new(
-                DedupeAggregateForFloatDeterminism::default(),
-            ));
+        builder = builder
+            .with_physical_optimizer_rule(Arc::new(DedupeAggregateForFloatDeterminism::default()));
     }
     if matches!(mode.as_str(), "dict" | "all" | "v040") {
         builder = builder.with_physical_optimizer_rule(Arc::new(EnableDictGroupCountRule));
@@ -58,7 +56,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let state = builder.build();
     let ctx = SessionContext::new_with_state(state);
     for t in TABLES {
-        let path = data_dir.join(format!("{t}.parquet")).to_string_lossy().into_owned();
+        let path = data_dir
+            .join(format!("{t}.parquet"))
+            .to_string_lossy()
+            .into_owned();
         if *t == "lineitem" {
             let prov = EmatixFastParquetTableProvider::try_new(path)?;
             ctx.register_table(*t, Arc::new(prov))?;
@@ -125,15 +126,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Sanity probes: count what ematix sees independently of the join shape.
     println!("\n=== Sanity probes ===");
     for (label, q) in [
-        ("SAUDI suppliers", "SELECT COUNT(*) FROM supplier s JOIN nation n ON s.s_nationkey = n.n_nationkey WHERE n.n_name = 'SAUDI ARABIA'"),
-        ("SAUDI suppliers with late F-status lineitems",
-         "SELECT COUNT(DISTINCT s.s_suppkey) FROM supplier s JOIN nation n ON s.s_nationkey = n.n_nationkey \
+        (
+            "SAUDI suppliers",
+            "SELECT COUNT(*) FROM supplier s JOIN nation n ON s.s_nationkey = n.n_nationkey WHERE n.n_name = 'SAUDI ARABIA'",
+        ),
+        (
+            "SAUDI suppliers with late F-status lineitems",
+            "SELECT COUNT(DISTINCT s.s_suppkey) FROM supplier s JOIN nation n ON s.s_nationkey = n.n_nationkey \
           JOIN lineitem l ON l.l_suppkey = s.s_suppkey \
           JOIN orders o ON o.o_orderkey = l.l_orderkey \
-          WHERE n.n_name = 'SAUDI ARABIA' AND o.o_orderstatus = 'F' AND l.l_receiptdate > l.l_commitdate"),
-        ("EXISTS subquery alone — orderkeys with ≥ 2 distinct suppliers",
-         "SELECT COUNT(DISTINCT l1.l_orderkey) FROM lineitem l1 \
-          WHERE EXISTS (SELECT 1 FROM lineitem l2 WHERE l2.l_orderkey = l1.l_orderkey AND l2.l_suppkey <> l1.l_suppkey)"),
+          WHERE n.n_name = 'SAUDI ARABIA' AND o.o_orderstatus = 'F' AND l.l_receiptdate > l.l_commitdate",
+        ),
+        (
+            "EXISTS subquery alone — orderkeys with ≥ 2 distinct suppliers",
+            "SELECT COUNT(DISTINCT l1.l_orderkey) FROM lineitem l1 \
+          WHERE EXISTS (SELECT 1 FROM lineitem l2 WHERE l2.l_orderkey = l1.l_orderkey AND l2.l_suppkey <> l1.l_suppkey)",
+        ),
     ] {
         match ctx.sql(q).await {
             Ok(df) => {

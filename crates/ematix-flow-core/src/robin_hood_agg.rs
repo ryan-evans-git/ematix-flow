@@ -223,8 +223,7 @@ impl RobinHoodI64U64 {
     /// heuristic after the first batch reveals high cardinality.
     /// Cheaper than 3-4 sequential grow() cycles.
     pub fn reserve_to_capacity_pow2_of(&mut self, target: usize) {
-        let target_capacity = ((target * MAX_LOAD_FACTOR_DENOMINATOR
-            + MAX_LOAD_FACTOR_NUMERATOR
+        let target_capacity = ((target * MAX_LOAD_FACTOR_DENOMINATOR + MAX_LOAD_FACTOR_NUMERATOR
             - 1)
             / MAX_LOAD_FACTOR_NUMERATOR)
             .next_power_of_two();
@@ -237,10 +236,9 @@ impl RobinHoodI64U64 {
     /// rehashing in the hot path. Worst case: every key is new and
     /// the table grows to maintain ≤70% load factor.
     fn reserve_for_n_more(&mut self, extra: usize) {
-        let target_min_capacity = ((self.len + extra) * MAX_LOAD_FACTOR_DENOMINATOR
-            + MAX_LOAD_FACTOR_NUMERATOR
-            - 1)
-            / MAX_LOAD_FACTOR_NUMERATOR;
+        let target_min_capacity =
+            ((self.len + extra) * MAX_LOAD_FACTOR_DENOMINATOR + MAX_LOAD_FACTOR_NUMERATOR - 1)
+                / MAX_LOAD_FACTOR_NUMERATOR;
         while self.buckets.len() < target_min_capacity {
             self.grow();
         }
@@ -287,8 +285,7 @@ impl RobinHoodI64U64 {
 
     fn needs_grow(&self) -> bool {
         // load >= 70%
-        self.len * MAX_LOAD_FACTOR_DENOMINATOR
-            >= self.buckets.len() * MAX_LOAD_FACTOR_NUMERATOR
+        self.len * MAX_LOAD_FACTOR_DENOMINATOR >= self.buckets.len() * MAX_LOAD_FACTOR_NUMERATOR
     }
 
     fn grow(&mut self) {
@@ -446,7 +443,10 @@ impl RobinHoodCountAgg {
         ]));
         arrow_array::RecordBatch::try_new(
             schema,
-            vec![Arc::new(Int64Array::from(keys)), Arc::new(UInt64Array::from(counts))],
+            vec![
+                Arc::new(Int64Array::from(keys)),
+                Arc::new(UInt64Array::from(counts)),
+            ],
         )
         .unwrap()
     }
@@ -476,7 +476,6 @@ impl RobinHoodCountAgg {
 // Σ.N.c — DataFusion ExecutionPlan wrapping RobinHoodCountAgg.
 // ---------------------------------------------------------------------
 
-use std::any::Any;
 use datafusion::arrow::array::{Int64Array, RecordBatch};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::common::{DataFusionError, Result as DfResult};
@@ -488,6 +487,7 @@ use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
 };
 use futures_util::stream::{self, TryStreamExt};
+use std::any::Any;
 
 /// Σ.N.e — execution mode mirroring DataFusion's `AggregateExec`.
 /// Lets RobinHoodAggregateExec slot into the two-stage agg pipeline
@@ -543,7 +543,12 @@ pub struct RobinHoodAggregateExec {
 impl RobinHoodAggregateExec {
     /// Σ.N.c convenience — Partial mode with default field names.
     pub fn try_new(input: Arc<dyn ExecutionPlan>, group_col_idx: usize) -> DfResult<Self> {
-        Self::try_new_with_names(input, group_col_idx, "group_key".to_string(), "count".to_string())
+        Self::try_new_with_names(
+            input,
+            group_col_idx,
+            "group_key".to_string(),
+            "count".to_string(),
+        )
     }
 
     /// Σ.N.c convenience — Partial mode with caller-supplied names.
@@ -749,11 +754,14 @@ impl ExecutionPlan for RobinHoodAggregateExec {
                 let Some(batch) = batch_opt else { break };
                 n_rows += batch.num_rows();
                 let keys_arr = batch.column(group_col_idx);
-                let keys = keys_arr.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
-                    DataFusionError::Internal(format!(
-                        "RobinHoodAggregateExec: column {group_col_idx} not Int64Array"
-                    ))
-                })?;
+                let keys = keys_arr
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .ok_or_else(|| {
+                        DataFusionError::Internal(format!(
+                            "RobinHoodAggregateExec: column {group_col_idx} not Int64Array"
+                        ))
+                    })?;
                 let t_i = std::time::Instant::now();
                 match mode {
                     RobinHoodMode::Partial => {
@@ -1036,7 +1044,9 @@ mod tests {
             .downcast_ref::<arrow_array::UInt64Array>()
             .unwrap();
         assert_eq!(
-            (0..3).map(|i| (keys.value(i), counts.value(i))).collect::<Vec<_>>(),
+            (0..3)
+                .map(|i| (keys.value(i), counts.value(i)))
+                .collect::<Vec<_>>(),
             vec![(1, 3), (2, 2), (3, 1)]
         );
     }
@@ -1064,8 +1074,8 @@ mod tests {
         use arrow_array::{Int64Array, RecordBatch};
         use arrow_schema::{DataType, Field, Schema};
         use datafusion::datasource::MemTable;
-        use datafusion::prelude::SessionContext;
         use datafusion::physical_plan::ExecutionPlanProperties;
+        use datafusion::prelude::SessionContext;
         use futures_util::TryStreamExt;
         use std::sync::Arc;
 
@@ -1154,9 +1164,7 @@ mod tests {
 
         // Robin Hood path.
         let mut agg = RobinHoodCountAgg::new();
-        agg.ingest_int64_array(
-            batch.column(0).as_any().downcast_ref().unwrap(),
-        );
+        agg.ingest_int64_array(batch.column(0).as_any().downcast_ref().unwrap());
         let mut rh_pairs: Vec<(i64, u64)> = agg.table().iter().collect();
         rh_pairs.sort();
 
@@ -1172,11 +1180,7 @@ mod tests {
         let mut s = plan.execute(0, ctx.task_ctx()).unwrap();
         let mut df_pairs: Vec<(i64, u64)> = Vec::new();
         while let Some(b) = s.try_next().await.unwrap() {
-            let ks = b
-                .column(0)
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .unwrap();
+            let ks = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
             let cs = b
                 .column(1)
                 .as_any()
@@ -1188,6 +1192,9 @@ mod tests {
         }
         df_pairs.sort();
 
-        assert_eq!(rh_pairs, df_pairs, "robin hood output differs from datafusion");
+        assert_eq!(
+            rh_pairs, df_pairs,
+            "robin hood output differs from datafusion"
+        );
     }
 }

@@ -38,9 +38,9 @@
 //! 4. A `RecordBatch` builder helper that accepts an Arrow column
 //!    and produces a BloomBuilder over its values.
 
+use arrow_array::Array;
 use arrow_array::cast::AsArray;
 use arrow_array::types::Int64Type;
-use arrow_array::Array;
 
 /// Bits per key. 10 bits per key + k=8 hash functions ≈ 1% FPR.
 pub const DEFAULT_BITS_PER_KEY: usize = 10;
@@ -184,8 +184,7 @@ impl BloomFilter {
         if &bytes[0..8] != b"EBLM0001" {
             return Err(BloomError::BadMagic);
         }
-        let n_blocks =
-            u64::from_le_bytes(bytes[8..16].try_into().unwrap()) as usize;
+        let n_blocks = u64::from_le_bytes(bytes[8..16].try_into().unwrap()) as usize;
         let seed = u64::from_le_bytes(bytes[16..24].try_into().unwrap());
         let expected_len = 24 + n_blocks * BLOCK_BYTES;
         if bytes.len() != expected_len {
@@ -235,9 +234,7 @@ pub struct ContextBlooms {
 }
 
 impl ContextBlooms {
-    pub fn new(
-        blooms: std::collections::HashMap<String, std::sync::Arc<BloomFilter>>,
-    ) -> Self {
+    pub fn new(blooms: std::collections::HashMap<String, std::sync::Arc<BloomFilter>>) -> Self {
         Self {
             inner: std::sync::Arc::new(blooms),
         }
@@ -416,19 +413,19 @@ impl BloomBuilder {
 // Σ.J.2.b.iv — BloomFilterExec wrapper.
 // ---------------------------------------------------------------------
 
-use std::any::Any;
-use std::sync::Arc;
 use datafusion::arrow::array::{BooleanArray, Int64Array, RecordBatch};
 use datafusion::arrow::compute::filter_record_batch;
 use datafusion::common::{DataFusionError, Result as DfResult};
 use datafusion::execution::TaskContext;
+use datafusion::physical_expr::{EquivalenceProperties, Partitioning};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
 };
-use datafusion::physical_expr::{EquivalenceProperties, Partitioning};
 use futures_util::StreamExt;
+use std::any::Any;
+use std::sync::Arc;
 
 /// Σ.J.2.b.iv — wraps a child ExecutionPlan; drops rows whose value
 /// in `key_col_idx` doesn't pass the bloom filter. Used on the
@@ -720,8 +717,8 @@ mod tests {
         use arrow_array::{Int64Array, RecordBatch};
         use arrow_schema::{DataType, Field, Schema};
         use datafusion::datasource::MemTable;
-        use datafusion::prelude::SessionContext;
         use datafusion::physical_plan::ExecutionPlanProperties;
+        use datafusion::prelude::SessionContext;
         use futures_util::TryStreamExt;
         use std::sync::Arc;
 
@@ -789,9 +786,7 @@ mod tests {
         assert_eq!(pairs[1].0, "x-ematix-bloom-join1_left");
 
         // Decode the pairs as a server would.
-        let decoded = header_pairs_to_blooms(
-            pairs.iter().map(|(n, v)| (n.as_str(), v.as_str())),
-        );
+        let decoded = header_pairs_to_blooms(pairs.iter().map(|(n, v)| (n.as_str(), v.as_str())));
         assert_eq!(decoded.len(), 2);
         assert_eq!(decoded[0].0, "join0_left");
         assert_eq!(decoded[1].0, "join1_left");
@@ -807,10 +802,8 @@ mod tests {
         // 6 KiB per-header limit.
         let big = BloomFilter::for_keys(100_000);
         let small = BloomFilter::for_keys(50);
-        let inputs: Vec<(String, &BloomFilter)> = vec![
-            ("oversized".into(), &big),
-            ("ok".into(), &small),
-        ];
+        let inputs: Vec<(String, &BloomFilter)> =
+            vec![("oversized".into(), &big), ("ok".into(), &small)];
         let pairs = blooms_to_header_pairs(&inputs);
         // big is dropped; small survives.
         assert_eq!(pairs.len(), 1);
@@ -825,8 +818,7 @@ mod tests {
         // Server-side: simulate a case-mangled prefix (HTTP/2 should
         // lowercase, but be defensive).
         let mangled = format!("X-Ematix-Bloom-{}", "test");
-        let decoded =
-            header_pairs_to_blooms(vec![(mangled.as_str(), pairs[0].1.as_str())]);
+        let decoded = header_pairs_to_blooms(vec![(mangled.as_str(), pairs[0].1.as_str())]);
         assert_eq!(decoded.len(), 1);
         assert_eq!(decoded[0].0, "test");
         assert!(decoded[0].1.might_contain_i64(42));

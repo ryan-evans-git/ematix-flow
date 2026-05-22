@@ -116,10 +116,13 @@ async fn build_ctx(dir: &str, dict_on: bool) -> SessionContext {
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
-    let dir = std::env::var("TPCH_DATA_DIR")
-        .unwrap_or_else(|_| "examples/tpch/data/sf1".to_string());
+    let dir =
+        std::env::var("TPCH_DATA_DIR").unwrap_or_else(|_| "examples/tpch/data/sf1".to_string());
     println!("=== Σ.K.1: dict-preservation OFF vs ON ({}) ===\n", dir);
-    println!("{:<6} {:>12} {:>12} {:>10}", "Query", "OFF (ms)", "ON (ms)", "Δ%");
+    println!(
+        "{:<6} {:>12} {:>12} {:>10}",
+        "Query", "OFF (ms)", "ON (ms)", "Δ%"
+    );
     println!("{}", "-".repeat(46));
 
     let mut wins = 0;
@@ -145,9 +148,7 @@ async fn main() {
         on_times.sort();
         let off_med = off_times[REPS / 2];
         let on_med = on_times[REPS / 2];
-        let delta = (on_med.as_secs_f64() - off_med.as_secs_f64())
-            / off_med.as_secs_f64()
-            * 100.0;
+        let delta = (on_med.as_secs_f64() - off_med.as_secs_f64()) / off_med.as_secs_f64() * 100.0;
         if delta < -1.0 {
             wins += 1;
         } else if delta > 1.0 {

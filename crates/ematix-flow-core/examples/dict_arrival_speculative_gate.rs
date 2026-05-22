@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 use datafusion::physical_plan::ExecutionPlanProperties;
 use datafusion::prelude::{SessionConfig, SessionContext};
 use ematix_flow_core::dict_routing::{
-    analyse_dict_arrival_verdicts, resolve_via_probe, DictArrivalVerdict,
+    DictArrivalVerdict, analyse_dict_arrival_verdicts, resolve_via_probe,
 };
 use ematix_flow_core::ematix_fast_parquet::EmatixFastParquetTableProvider;
 use futures_util::TryStreamExt;
@@ -89,7 +89,10 @@ async fn measure(ctx: &SessionContext, sql: &str) -> Option<Duration> {
 }
 
 async fn count_rows(ctx: &SessionContext, table: &str) -> Option<u64> {
-    let df = ctx.sql(&format!("SELECT COUNT(*) FROM {table}")).await.ok()?;
+    let df = ctx
+        .sql(&format!("SELECT COUNT(*) FROM {table}"))
+        .await
+        .ok()?;
     let batches = df.collect().await.ok()?;
     let batch = batches.first()?;
     let arr = batch
@@ -118,18 +121,15 @@ async fn probe_sql_for_table(ctx: &SessionContext, table: &str) -> Option<String
         })?
         .name()
         .clone();
-    Some(format!(
-        "SELECT {gb}, COUNT(*) FROM {table} GROUP BY {gb}"
-    ))
+    Some(format!("SELECT {gb}, COUNT(*) FROM {table} GROUP BY {gb}"))
 }
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
-    let dir = std::env::var("TPCH_DATA_DIR")
-        .unwrap_or_else(|_| "examples/tpch/data/sf1".to_string());
+    let dir =
+        std::env::var("TPCH_DATA_DIR").unwrap_or_else(|_| "examples/tpch/data/sf1".to_string());
     let queries_dir = PathBuf::from(
-        std::env::var("TPCH_QUERIES_DIR")
-            .unwrap_or_else(|_| "examples/tpch/queries".to_string()),
+        std::env::var("TPCH_QUERIES_DIR").unwrap_or_else(|_| "examples/tpch/queries".to_string()),
     );
     println!("=== Σ.L.1 speculative gate ({}) ===\n", dir);
 
@@ -175,9 +175,7 @@ async fn main() {
 
         // Static verdicts.
         let analysis_ctx = build_ctx(&dir, &HashMap::new());
-        let verdicts = match analyse_dict_arrival_verdicts(&analysis_ctx, &sql, &row_counts)
-            .await
-        {
+        let verdicts = match analyse_dict_arrival_verdicts(&analysis_ctx, &sql, &row_counts).await {
             Ok(v) => v,
             Err(_) => continue,
         };
@@ -237,10 +235,8 @@ async fn main() {
         {
             let mut c = probe_cache.lock().unwrap();
             for (k, v) in &decision {
-                let was_speculate = matches!(
-                    verdicts.get(k),
-                    Some(&DictArrivalVerdict::Speculate { .. })
-                );
+                let was_speculate =
+                    matches!(verdicts.get(k), Some(&DictArrivalVerdict::Speculate { .. }));
                 if was_speculate && !c.contains_key(k) {
                     c.insert(k.clone(), *v);
                     probes_run += 1;

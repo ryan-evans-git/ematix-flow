@@ -35,7 +35,10 @@ use futures_util::TryStreamExt;
 /// when the table is already registered with our parquet provider
 /// (provider reads the footer for stats).
 async fn count_rows(ctx: &SessionContext, table: &str) -> Option<u64> {
-    let df = ctx.sql(&format!("SELECT COUNT(*) FROM {table}")).await.ok()?;
+    let df = ctx
+        .sql(&format!("SELECT COUNT(*) FROM {table}"))
+        .await
+        .ok()?;
     let batches = df.collect().await.ok()?;
     let batch = batches.first()?;
     let arr = batch
@@ -108,11 +111,10 @@ async fn measure(ctx: &SessionContext, sql: &str) -> Option<Duration> {
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
-    let dir = std::env::var("TPCH_DATA_DIR")
-        .unwrap_or_else(|_| "examples/tpch/data/sf1".to_string());
+    let dir =
+        std::env::var("TPCH_DATA_DIR").unwrap_or_else(|_| "examples/tpch/data/sf1".to_string());
     let queries_dir = PathBuf::from(
-        std::env::var("TPCH_QUERIES_DIR")
-            .unwrap_or_else(|_| "examples/tpch/queries".to_string()),
+        std::env::var("TPCH_QUERIES_DIR").unwrap_or_else(|_| "examples/tpch/queries".to_string()),
     );
 
     println!("=== Σ.K.2 22-query gate: OFF vs ROUTED ({}) ===\n", dir);
@@ -151,10 +153,14 @@ async fn main() {
 
         // Decide routing for this query.
         let analysis_ctx = build_ctx(&dir, &HashMap::new());
-        let decision = match analyse_dict_arrival_with_sizes(&analysis_ctx, &sql, &row_counts).await {
+        let decision = match analyse_dict_arrival_with_sizes(&analysis_ctx, &sql, &row_counts).await
+        {
             Ok(d) => d,
             Err(_) => {
-                println!("{:<5}  (analysis failed — falling back to OFF)", format!("Q{q:02}"));
+                println!(
+                    "{:<5}  (analysis failed — falling back to OFF)",
+                    format!("Q{q:02}")
+                );
                 HashMap::new()
             }
         };

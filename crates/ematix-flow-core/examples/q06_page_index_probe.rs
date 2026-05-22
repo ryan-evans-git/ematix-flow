@@ -22,8 +22,8 @@ const DISCOUNT_LOW: f64 = 0.05;
 const DISCOUNT_HIGH: f64 = 0.07;
 
 fn main() {
-    let dir = std::env::var("TPCH_DATA_DIR")
-        .unwrap_or_else(|_| "examples/tpch/data/sf10".to_string());
+    let dir =
+        std::env::var("TPCH_DATA_DIR").unwrap_or_else(|_| "examples/tpch/data/sf10".to_string());
     let path = PathBuf::from(&dir).join("lineitem.parquet");
     if !path.exists() {
         eprintln!("missing {}", path.display());
@@ -43,9 +43,18 @@ fn main() {
         .iter()
         .map(|f| f.name().to_string())
         .collect();
-    let shipdate = cols.iter().position(|n| n == "l_shipdate").expect("l_shipdate");
-    let quantity = cols.iter().position(|n| n == "l_quantity").expect("l_quantity");
-    let discount = cols.iter().position(|n| n == "l_discount").expect("l_discount");
+    let shipdate = cols
+        .iter()
+        .position(|n| n == "l_shipdate")
+        .expect("l_shipdate");
+    let quantity = cols
+        .iter()
+        .position(|n| n == "l_quantity")
+        .expect("l_quantity");
+    let discount = cols
+        .iter()
+        .position(|n| n == "l_discount")
+        .expect("l_discount");
 
     let n_rgs = md.num_row_groups();
     let ci = md.column_index().expect("column_index loaded");
@@ -100,7 +109,11 @@ fn main() {
                 }
             }
         }
-        let pct = if total > 0 { skip as f64 / total as f64 * 100.0 } else { 0.0 };
+        let pct = if total > 0 {
+            skip as f64 / total as f64 * 100.0
+        } else {
+            0.0
+        };
         println!("  {label:<14} pages: {total:>6}  skip: {skip:>6}  ({pct:>5.1}% skippable)");
         (total, skip)
     };
@@ -133,14 +146,8 @@ fn main() {
             total += 1;
             let s_mn = s_idx.min_value(p).copied().unwrap_or(i32::MIN);
             let s_mx = s_idx.max_value(p).copied().unwrap_or(i32::MAX);
-            let q_mn = q_idx
-                .min_value(p)
-                .copied()
-                .unwrap_or(f64::NEG_INFINITY);
-            let d_mn = d_idx
-                .min_value(p)
-                .copied()
-                .unwrap_or(f64::NEG_INFINITY);
+            let q_mn = q_idx.min_value(p).copied().unwrap_or(f64::NEG_INFINITY);
+            let d_mn = d_idx.min_value(p).copied().unwrap_or(f64::NEG_INFINITY);
             let d_mx = d_idx.max_value(p).copied().unwrap_or(f64::INFINITY);
             let s_skip = s_mx < SHIPDATE_LOW || s_mn >= SHIPDATE_HIGH;
             let q_skip = q_mn >= QUANTITY_MAX;
@@ -150,12 +157,21 @@ fn main() {
             }
         }
     }
-    let pct = if total > 0 { skip as f64 / total as f64 * 100.0 } else { 0.0 };
+    let pct = if total > 0 {
+        skip as f64 / total as f64 * 100.0
+    } else {
+        0.0
+    };
     println!("Combined Q06 (AND of 3 predicate cols):");
-    println!("  pages: {total}  keep: {}  skip: {skip}  ({pct:.1}% skippable)", total - skip);
+    println!(
+        "  pages: {total}  keep: {}  skip: {skip}  ({pct:.1}% skippable)",
+        total - skip
+    );
     println!();
     if skip == 0 {
-        println!("Verdict: DEAD LEVER — data uniform within every page. Same as Σ.E5 SF=1 finding.");
+        println!(
+            "Verdict: DEAD LEVER — data uniform within every page. Same as Σ.E5 SF=1 finding."
+        );
     } else if pct < 5.0 {
         println!("Verdict: marginal ({pct:.1}%). Probably not worth the wire-up cost.");
     } else if pct < 30.0 {

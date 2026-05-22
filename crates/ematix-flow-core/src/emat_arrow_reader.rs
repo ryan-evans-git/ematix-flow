@@ -155,9 +155,7 @@ impl RowGroupDecodeCache {
             return; // entry alone exceeds cap; skip
         }
         let mut inner = self.inner.lock().unwrap();
-        while inner.bytes_used + bytes > self.capacity_bytes
-            && !inner.insertion_order.is_empty()
-        {
+        while inner.bytes_used + bytes > self.capacity_bytes && !inner.insertion_order.is_empty() {
             let oldest = inner.insertion_order.remove(0);
             if let Some(e) = inner.entries.remove(&oldest) {
                 inner.bytes_used -= e.bytes;
@@ -446,10 +444,7 @@ impl EmatArrowBatchReaderBuilder {
     /// Wired into the dense (no-filter) `load_row_group_dense` path
     /// only — filter paths produce row-mask-specific output and aren't
     /// safely shareable.
-    pub fn with_rg_decode_cache(
-        mut self,
-        cache: std::sync::Arc<RowGroupDecodeCache>,
-    ) -> Self {
+    pub fn with_rg_decode_cache(mut self, cache: std::sync::Arc<RowGroupDecodeCache>) -> Self {
         self.rg_decode_cache = Some(cache);
         self
     }
@@ -947,7 +942,8 @@ pub struct EmatArrowBatchReader {
     /// row-mask-specific and not safely shareable across queries
     /// with different masks). See `Σ.O.c` follow-up for the load_
     /// row_group integration.
-    pub(crate) decode_cache: Option<std::sync::Arc<crate::parquet_decode_cache::ParquetDecodeCache>>,
+    pub(crate) decode_cache:
+        Option<std::sync::Arc<crate::parquet_decode_cache::ParquetDecodeCache>>,
     /// Σ.O.c.1 — private decode-column cache. Lookup at the top of
     /// `load_row_group_dense`; on hit, restores `cur_rg_columns` from
     /// the shared Arc<Vec<DecodedColumn>> with no parquet I/O. On miss,
@@ -1005,7 +1001,9 @@ impl EmatArrowBatchReader {
             .collect();
         let proj_refs: Vec<&str> = proj_names.iter().map(|s| s.as_str()).collect();
         Some(crate::parquet_decode_cache::DecodeCacheKey::new(
-            path_str, rg_idx as u32, &proj_refs,
+            path_str,
+            rg_idx as u32,
+            &proj_refs,
         ))
     }
 
@@ -1379,9 +1377,7 @@ impl EmatArrowBatchReader {
                 },
             })
         });
-        if let (Some(cache), Some(key)) =
-            (self.rg_decode_cache.as_ref(), rg_cache_key.as_ref())
-        {
+        if let (Some(cache), Some(key)) = (self.rg_decode_cache.as_ref(), rg_cache_key.as_ref()) {
             if let Some(cached) = cache.get(key) {
                 let cols: Vec<DecodedColumn> = (*cached).clone();
                 self.cur_rg_columns = Some(cols);
@@ -1514,9 +1510,7 @@ impl EmatArrowBatchReader {
 
         // Σ.O.c.1 — populate cache on miss. Clone is O(n_cols) Arc
         // pointer copies; the underlying Arrow Buffers are Arc-shared.
-        if let (Some(cache), Some(key)) =
-            (self.rg_decode_cache.as_ref(), rg_cache_key.as_ref())
-        {
+        if let (Some(cache), Some(key)) = (self.rg_decode_cache.as_ref(), rg_cache_key.as_ref()) {
             cache.insert(key.clone(), cols.clone());
         }
 
@@ -3511,7 +3505,9 @@ mod tests {
             for rb in rbs {
                 let a = rb.column(0).as_primitive::<arrow_array::types::Int32Type>();
                 let b = rb.column(1).as_primitive::<arrow_array::types::Int64Type>();
-                let c = rb.column(2).as_primitive::<arrow_array::types::Float64Type>();
+                let c = rb
+                    .column(2)
+                    .as_primitive::<arrow_array::types::Float64Type>();
                 for i in 0..rb.num_rows() {
                     out.push((a.value(i), b.value(i), c.value(i)));
                 }

@@ -182,11 +182,8 @@ mod tests {
         // Initially nothing.
         assert!(h_sub.try_take().is_none());
         let batch = Arc::new(
-            RecordBatch::try_new(
-                schema(),
-                vec![Arc::new(Int64Array::from(vec![1, 2, 3]))],
-            )
-            .unwrap(),
+            RecordBatch::try_new(schema(), vec![Arc::new(Int64Array::from(vec![1, 2, 3]))])
+                .unwrap(),
         );
         h_prod.publish(vec![batch.clone()]);
         let pulled = h_sub.try_take().unwrap();

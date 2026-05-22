@@ -16,9 +16,7 @@ use std::time::Instant;
 
 use datafusion::physical_plan::ExecutionPlanProperties;
 use datafusion::prelude::{SessionConfig, SessionContext};
-use ematix_flow_core::emat_arrow_reader::{
-    set_process_rg_decode_cache, RowGroupDecodeCache,
-};
+use ematix_flow_core::emat_arrow_reader::{RowGroupDecodeCache, set_process_rg_decode_cache};
 use ematix_flow_core::ematix_fast_parquet::EmatixFastParquetTableProvider;
 use futures_util::TryStreamExt;
 
@@ -78,8 +76,8 @@ fn median(v: &[f64]) -> f64 {
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
-    let dir = std::env::var("TPCH_DATA_DIR")
-        .unwrap_or_else(|_| "examples/tpch/data/sf1".to_string());
+    let dir =
+        std::env::var("TPCH_DATA_DIR").unwrap_or_else(|_| "examples/tpch/data/sf1".to_string());
     println!("=== Σ.O.c.2 — RG decode cache wire-up bench ===");
     println!("REPS={REPS}, fresh ctx+provider per rep.\n");
 

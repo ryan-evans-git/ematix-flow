@@ -168,9 +168,7 @@ impl PlanCache {
         // memory frees immediately. Not strictly required for
         // correctness — stale entries would never hit — but tidy.
         let current_epoch = inner.schema_epoch;
-        inner
-            .entries
-            .retain(|k, _| k.schema_epoch == current_epoch);
+        inner.entries.retain(|k, _| k.schema_epoch == current_epoch);
         inner.order.retain(|k| k.schema_epoch == current_epoch);
     }
 
@@ -275,10 +273,7 @@ mod tests {
             .get_or_plan(&ctx, "  SELECT  *   FROM   t  ")
             .await
             .unwrap();
-        let _ = cache
-            .get_or_plan(&ctx, "SELECT * FROM t;")
-            .await
-            .unwrap();
+        let _ = cache.get_or_plan(&ctx, "SELECT * FROM t;").await.unwrap();
         let (h, m) = cache.stats();
         assert_eq!(h, 2);
         assert_eq!(m, 1);

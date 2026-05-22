@@ -166,8 +166,7 @@ mod tests {
         log.record_probe_outcome("lineitem", "l_returnflag", 24.0, 14.0)
             .unwrap();
 
-        let rec = recommend_for_table(&log, "lineitem", &["l_shipmode", "l_returnflag"])
-            .unwrap();
+        let rec = recommend_for_table(&log, "lineitem", &["l_shipmode", "l_returnflag"]).unwrap();
         assert_eq!(rec.dict_columns, vec!["l_shipmode"]);
         assert!(!rec.is_no_op());
         assert!(rec.confidence > 0.0);
@@ -183,10 +182,7 @@ mod tests {
 
         let rec = recommend_for_table(&log, "orders", &["o_orderkey", "o_status"]).unwrap();
         assert_eq!(rec.bloom_columns, vec!["o_orderkey"]);
-        assert!(!rec
-            .bloom_columns
-            .iter()
-            .any(|c| c == "o_status"));
+        assert!(!rec.bloom_columns.iter().any(|c| c == "o_status"));
     }
 
     #[test]
@@ -227,14 +223,16 @@ mod tests {
         // - confidence > 0 since we have observations
         assert!(rec.confidence > 0.0);
         // - rationale lines reference both rules
-        assert!(rec
-            .rationale
-            .iter()
-            .any(|l| l.contains("dict-encode `o_orderpriority`")));
-        assert!(rec
-            .rationale
-            .iter()
-            .any(|l| l.contains("bloom on `o_orderkey`")));
+        assert!(
+            rec.rationale
+                .iter()
+                .any(|l| l.contains("dict-encode `o_orderpriority`"))
+        );
+        assert!(
+            rec.rationale
+                .iter()
+                .any(|l| l.contains("bloom on `o_orderkey`"))
+        );
     }
 
     #[test]

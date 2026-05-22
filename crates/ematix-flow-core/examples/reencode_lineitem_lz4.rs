@@ -24,8 +24,8 @@ use datafusion::parquet::basic::Compression;
 use datafusion::parquet::file::properties::WriterProperties;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let dir = std::env::var("TPCH_DATA_DIR")
-        .unwrap_or_else(|_| "examples/tpch/data/sf10".to_string());
+    let dir =
+        std::env::var("TPCH_DATA_DIR").unwrap_or_else(|_| "examples/tpch/data/sf10".to_string());
     let src = PathBuf::from(&dir).join("lineitem.parquet");
     let dst = PathBuf::from(&dir).join("lineitem.lz4.parquet");
 

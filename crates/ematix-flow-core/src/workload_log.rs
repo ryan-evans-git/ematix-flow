@@ -30,7 +30,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::SystemTime;
 
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, params};
 
 /// Default path: `~/.ematix/workload.db`. Caller can override.
 pub fn default_workload_db_path() -> PathBuf {
@@ -171,7 +171,13 @@ impl WorkloadLog {
             )
             .optional()
             .map_err(WorkloadLogError::Db)?;
-        Ok(row.and_then(|(dw, n)| if n >= min_observations { Some(dw == 1) } else { None }))
+        Ok(row.and_then(|(dw, n)| {
+            if n >= min_observations {
+                Some(dw == 1)
+            } else {
+                None
+            }
+        }))
     }
 
     /// Record per-query observability — wall time + total rows
@@ -317,7 +323,8 @@ mod tests {
         log.record_selectivity("lineitem", "l_shipdate", "range", 0.12)
             .unwrap();
         assert_eq!(
-            log.get_selectivity("lineitem", "l_shipdate", "range").unwrap(),
+            log.get_selectivity("lineitem", "l_shipdate", "range")
+                .unwrap(),
             Some(0.12)
         );
         // EWMA smoothing

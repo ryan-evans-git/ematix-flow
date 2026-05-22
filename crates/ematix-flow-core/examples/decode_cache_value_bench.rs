@@ -27,8 +27,14 @@ const REPS: usize = 5;
 
 const QUERIES: &[(&str, &str)] = &[
     ("scan-only (COUNT)", "SELECT COUNT(*) FROM lineitem"),
-    ("project-3 cols",   "SELECT l_orderkey, l_partkey, l_suppkey FROM lineitem"),
-    ("project-all + agg", "SELECT l_returnflag, COUNT(*) FROM lineitem GROUP BY l_returnflag"),
+    (
+        "project-3 cols",
+        "SELECT l_orderkey, l_partkey, l_suppkey FROM lineitem",
+    ),
+    (
+        "project-all + agg",
+        "SELECT l_returnflag, COUNT(*) FROM lineitem GROUP BY l_returnflag",
+    ),
 ];
 
 async fn time_query(ctx: &SessionContext, sql: &str) -> f64 {
@@ -48,8 +54,8 @@ async fn time_query(ctx: &SessionContext, sql: &str) -> f64 {
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
-    let dir = std::env::var("TPCH_DATA_DIR")
-        .unwrap_or_else(|_| "examples/tpch/data/sf1".to_string());
+    let dir =
+        std::env::var("TPCH_DATA_DIR").unwrap_or_else(|_| "examples/tpch/data/sf1".to_string());
     println!("=== Σ.O.c measurement: does same-file second-decode get cheaper? ===");
     println!("Method: {REPS} reps in one process, FRESH ctx each rep.\n");
 
@@ -60,7 +66,9 @@ async fn main() {
             // Fresh ctx + provider every rep — simulates "different
             // query, same data" workload pattern.
             let cfg = SessionConfig::new().with_target_partitions(
-                std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8),
+                std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(8),
             );
             let ctx = SessionContext::new_with_config(cfg);
             let path = format!("{dir}/lineitem.parquet");

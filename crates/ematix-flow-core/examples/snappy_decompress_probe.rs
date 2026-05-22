@@ -41,9 +41,7 @@ fn probe(file: &ParquetFile, col_idx: usize, label: &str, reps: usize) {
                 .meta_data
                 .as_ref()
                 .expect("cm");
-            let start = cm
-                .dictionary_page_offset
-                .unwrap_or(cm.data_page_offset) as u64;
+            let start = cm.dictionary_page_offset.unwrap_or(cm.data_page_offset) as u64;
             let length = cm.total_compressed_size as u64;
             let chunk = file.read_range(start, length).expect("read_range");
             let mut walker = PageWalker::new(&chunk);
@@ -65,9 +63,7 @@ fn probe(file: &ParquetFile, col_idx: usize, label: &str, reps: usize) {
                 .meta_data
                 .as_ref()
                 .expect("cm");
-            let start = cm
-                .dictionary_page_offset
-                .unwrap_or(cm.data_page_offset) as u64;
+            let start = cm.dictionary_page_offset.unwrap_or(cm.data_page_offset) as u64;
             let length = cm.total_compressed_size as u64;
             let chunk = file.read_range(start, length).expect("read_range");
             let mut walker = PageWalker::new(&chunk);
@@ -88,7 +84,11 @@ fn probe(file: &ParquetFile, col_idx: usize, label: &str, reps: usize) {
     let snap_gbs = (decomp_per_rep as f64 / 1e9) / (snap_median / 1000.0);
     let memcpy_gbs = (decomp_per_rep as f64 / 1e9) / (memcpy_median / 1000.0);
     let overhead = snap_median - memcpy_median;
-    let codec = md.row_groups[0].columns[col_idx].meta_data.as_ref().unwrap().codec;
+    let codec = md.row_groups[0].columns[col_idx]
+        .meta_data
+        .as_ref()
+        .unwrap()
+        .codec;
 
     println!("--- {label} (col {col_idx}, codec {codec:?}) ---");
     println!(
@@ -96,19 +96,18 @@ fn probe(file: &ParquetFile, col_idx: usize, label: &str, reps: usize) {
         total_pages / reps,
         decomp_per_rep as f64 / 1e6
     );
+    println!("  Snappy decompress:  median {snap_median:>7.2} ms  ({snap_gbs:.2} GB/s)");
+    println!("  Raw memcpy (ref):   median {memcpy_median:>7.2} ms  ({memcpy_gbs:.2} GB/s)");
     println!(
-        "  Snappy decompress:  median {snap_median:>7.2} ms  ({snap_gbs:.2} GB/s)"
+        "  Snappy overhead:    {overhead:>7.2} ms  ({:.1}× memcpy)",
+        snap_median / memcpy_median
     );
-    println!(
-        "  Raw memcpy (ref):   median {memcpy_median:>7.2} ms  ({memcpy_gbs:.2} GB/s)"
-    );
-    println!("  Snappy overhead:    {overhead:>7.2} ms  ({:.1}× memcpy)", snap_median / memcpy_median);
     println!();
 }
 
 fn main() {
-    let dir = std::env::var("TPCH_DATA_DIR")
-        .unwrap_or_else(|_| "examples/tpch/data/sf10".to_string());
+    let dir =
+        std::env::var("TPCH_DATA_DIR").unwrap_or_else(|_| "examples/tpch/data/sf10".to_string());
     let path = PathBuf::from(&dir).join("lineitem.parquet");
     let file = ParquetFile::open(&path).expect("open");
 
@@ -116,7 +115,10 @@ fn main() {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(5);
-    println!("=== Snappy decompress probe ({}, {reps} reps) ===\n", path.display());
+    println!(
+        "=== Snappy decompress probe ({}, {reps} reps) ===\n",
+        path.display()
+    );
 
     probe(&file, COL_QUANTITY, "l_quantity (ratio ≈ 1.00)", reps);
     probe(&file, COL_EXTPRICE, "l_extendedprice (ratio ≈ 0.73)", reps);

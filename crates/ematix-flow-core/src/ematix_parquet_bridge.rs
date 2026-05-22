@@ -129,7 +129,12 @@ pub fn decode_column_chunk_byte_array(
         .next_page()
         .map_err(|e| ext(format!("next_page (first): {e}")))?
         .ok_or_else(|| ext("empty chunk"))?;
-    decompress_into(codec, first_body, page_uncompressed_size(&first_hdr)?, &mut scratch)?;
+    decompress_into(
+        codec,
+        first_body,
+        page_uncompressed_size(&first_hdr)?,
+        &mut scratch,
+    )?;
 
     // If first is a dict page, decode it to an owned Vec<Vec<u8>> so
     // each lookup copies into `values`. Borrowed slices won't survive
@@ -298,7 +303,12 @@ fn decode_dict_chunk_generic<T: Copy>(
         .next_page()
         .map_err(|e| ext(format!("next_page (first): {e}")))?
         .ok_or_else(|| ext("empty chunk"))?;
-    decompress_into(codec, first_body, page_uncompressed_size(&first_hdr)?, &mut scratch)?;
+    decompress_into(
+        codec,
+        first_body,
+        page_uncompressed_size(&first_hdr)?,
+        &mut scratch,
+    )?;
 
     let dict: Vec<T> = if first_hdr.dictionary_page_header.is_some() {
         decode_plain(&scratch)?
@@ -407,7 +417,12 @@ pub fn filter_i32_column_to_bitmap(
              use dense decode + scan for PLAIN-only columns",
         ));
     }
-    decompress_into(codec, first_body, page_uncompressed_size(&first_hdr)?, &mut scratch)?;
+    decompress_into(
+        codec,
+        first_body,
+        page_uncompressed_size(&first_hdr)?,
+        &mut scratch,
+    )?;
     let dict = decode_plain_i32(&scratch).map_err(|e| ext(format!("plain i32 dict: {e}")))?;
 
     // Workstream 2A: dict-popcount-zero early-skip. If no value in
@@ -502,7 +517,12 @@ fn gather_chunk_typed<T: Copy>(
         .next_page()
         .map_err(|e| ext(format!("next_page (first): {e}")))?
         .ok_or_else(|| ext("empty chunk"))?;
-    decompress_into(codec, first_body, page_uncompressed_size(&first_hdr)?, &mut scratch)?;
+    decompress_into(
+        codec,
+        first_body,
+        page_uncompressed_size(&first_hdr)?,
+        &mut scratch,
+    )?;
 
     let dict: Vec<T> = if first_hdr.dictionary_page_header.is_some() {
         decode_dict_plain(&scratch)?
@@ -762,7 +782,12 @@ pub fn filter_f64_column_to_bitmap(
              use dense decode + scan for PLAIN-only columns",
         ));
     }
-    decompress_into(codec, first_body, page_uncompressed_size(&first_hdr)?, &mut scratch)?;
+    decompress_into(
+        codec,
+        first_body,
+        page_uncompressed_size(&first_hdr)?,
+        &mut scratch,
+    )?;
     let dict = decode_plain_f64(&scratch).map_err(|e| ext(format!("plain f64 dict: {e}")))?;
 
     // Workstream 2A: dict-popcount-zero early-skip. See i32 sibling

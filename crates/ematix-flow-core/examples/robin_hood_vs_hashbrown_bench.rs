@@ -11,7 +11,7 @@
 use std::time::Instant;
 
 use datafusion::arrow::buffer::Buffer;
-use ematix_flow_core::robin_hood_agg::{count_accumulator, RobinHoodI64U64};
+use ematix_flow_core::robin_hood_agg::{RobinHoodI64U64, count_accumulator};
 
 const N_ROWS: usize = 6_000_000;
 const CARDINALITIES: &[i64] = &[7, 100, 10_000];
@@ -62,7 +62,10 @@ fn median(xs: &mut [f64]) -> f64 {
 fn main() {
     println!("=== Σ.N: RobinHoodI64U64 vs hashbrown (HashMap<i64, u64>) ===");
     println!("{N_ROWS} rows, COUNT(*) GROUP BY i64, {REPS}-rep median\n");
-    println!("{:<13} {:>12} {:>12} {:>12}", "Cardinality", "RobinHood", "hashbrown", "RH speedup");
+    println!(
+        "{:<13} {:>12} {:>12} {:>12}",
+        "Cardinality", "RobinHood", "hashbrown", "RH speedup"
+    );
     println!("{}", "-".repeat(54));
 
     for &card in CARDINALITIES {

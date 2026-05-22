@@ -104,9 +104,9 @@ pub fn with_optimizer_rules_and_registry(
 ) -> (SessionStateBuilder, Arc<SharedSubtreeRegistry>) {
     let registry = Arc::new(SharedSubtreeRegistry::new());
     let builder = builder
-        .with_physical_optimizer_rule(Arc::new(
-            DedupeAggregateForFloatDeterminism::with_registry(registry.clone()),
-        ))
+        .with_physical_optimizer_rule(Arc::new(DedupeAggregateForFloatDeterminism::with_registry(
+            registry.clone(),
+        )))
         .with_physical_optimizer_rule(Arc::new(EnableDictGroupCountRule))
         .with_physical_optimizer_rule(Arc::new(InjectFilterMultiAggRule))
         .with_physical_optimizer_rule(Arc::new(InjectFilterSumRule));
@@ -289,7 +289,10 @@ mod tests {
             .sum();
         assert_eq!(n1, 1);
         let after_first = registry.len();
-        assert!(after_first >= 1, "expected ≥1 cache entry, got {after_first}");
+        assert!(
+            after_first >= 1,
+            "expected ≥1 cache entry, got {after_first}"
+        );
 
         let n2: usize = ctx
             .sql(sql)

@@ -1,12 +1,12 @@
 //! Quick inspect: what compression codec + encoding does each lineitem
 //! column use? Helps decide if masked-decode is decompression-bound.
 
-use std::path::PathBuf;
 use ematix_parquet_io::ParquetFile;
+use std::path::PathBuf;
 
 fn main() {
-    let dir = std::env::var("TPCH_DATA_DIR")
-        .unwrap_or_else(|_| "examples/tpch/data/sf10".to_string());
+    let dir =
+        std::env::var("TPCH_DATA_DIR").unwrap_or_else(|_| "examples/tpch/data/sf10".to_string());
     let path = PathBuf::from(&dir).join("lineitem.parquet");
     let file = ParquetFile::open(&path).expect("open");
     let md = file.metadata().expect("md");

@@ -39,8 +39,8 @@ use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::common::{DataFusionError, Result as DfResult};
 use datafusion::execution::TaskContext;
 use datafusion::physical_expr::{EquivalenceProperties, Partitioning};
-use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::ExecutionPlanProperties;
+use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
@@ -104,7 +104,10 @@ impl SharedSubtreeRegistry {
     /// empty one with the given schema if absent. All callers with the
     /// same key receive a clone of the same `Arc`.
     pub fn get_or_create(&self, key: u64, schema: SchemaRef) -> Arc<CachedBatches> {
-        let mut g = self.by_key.lock().expect("SharedSubtreeRegistry mutex poisoned");
+        let mut g = self
+            .by_key
+            .lock()
+            .expect("SharedSubtreeRegistry mutex poisoned");
         g.entry(key)
             .or_insert_with(|| Arc::new(CachedBatches::new(schema)))
             .clone()
@@ -259,7 +262,10 @@ impl ExecutionPlan for SharedSubtreeExec {
         };
 
         let s = fut.try_flatten_stream();
-        Ok(Box::pin(RecordBatchStreamAdapter::new(schema_for_stream, s)))
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            schema_for_stream,
+            s,
+        )))
     }
 }
 

@@ -179,9 +179,9 @@ pub mod context_bloom_rule;
 // the same parquet column chunks across queries in the same session.
 // Multi-query workloads (dashboards, repeated benchmarks) reuse
 // decoded batches instead of re-decoding.
-pub mod parquet_decode_cache;
 pub mod hash;
 pub mod join;
+pub mod parquet_decode_cache;
 // Σ.E5 (2026-05-19): Photon-style vectorized LIKE pattern matcher
 // using memchr::memmem. Used by emat's BridgeFilter for byte_array
 // substring predicates (and available as a standalone utility).

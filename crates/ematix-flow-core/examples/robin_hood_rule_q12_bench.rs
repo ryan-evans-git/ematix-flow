@@ -53,8 +53,7 @@ fn build_ctx(dir: &str, with_rule: bool) -> SessionContext {
     let mut builder = SessionStateBuilder::new()
         .with_default_features()
         .with_config(
-            datafusion::prelude::SessionConfig::new()
-                .with_target_partitions(target_partitions()),
+            datafusion::prelude::SessionConfig::new().with_target_partitions(target_partitions()),
         );
     if with_rule {
         builder = install_robin_hood_rule(builder);
@@ -106,8 +105,8 @@ async fn rule_fires_in_plan(ctx: &SessionContext, sql: &str) -> bool {
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
-    let dir = std::env::var("TPCH_DATA_DIR")
-        .unwrap_or_else(|_| "examples/tpch/data/sf1".to_string());
+    let dir =
+        std::env::var("TPCH_DATA_DIR").unwrap_or_else(|_| "examples/tpch/data/sf1".to_string());
     println!("=== Σ.N.d wall-time bench (rule on vs off) — {dir} ===\n");
     println!(
         "{:<28} {:>10} {:>10} {:>10} {:>10}",

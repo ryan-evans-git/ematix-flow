@@ -62,9 +62,9 @@ use datafusion::arrow::array::RecordBatch;
 use datafusion::prelude::SessionContext;
 use datafusion_distributed::{DefaultSessionBuilder, Worker};
 use ematix_flow_core::backend::DistributedConfig;
-use ematix_flow_distributed::bloom_emitter::{attach_blooms_for_plan, BloomEmitterOptions};
-use ematix_flow_distributed::bloom_flight::default_bloom_session_builder;
 use ematix_flow_distributed::DistributedBackend;
+use ematix_flow_distributed::bloom_emitter::{BloomEmitterOptions, attach_blooms_for_plan};
+use ematix_flow_distributed::bloom_flight::default_bloom_session_builder;
 use futures_util::TryStreamExt;
 use tokio::net::TcpListener;
 use tokio::runtime::Runtime;
@@ -198,9 +198,7 @@ fn run_query_on(rt: &Runtime, backend: &DistributedBackend, sql: &str) -> Vec<Re
         // so left-over headers from a prior query don't leak in.
         let mut ctx: SessionContext = backend.session_context().await.as_ref().clone();
         let df = ctx.sql(sql).await.expect("plan");
-        let plan = df
-            .into_optimized_plan()
-            .expect("optimize");
+        let plan = df.into_optimized_plan().expect("optimize");
         let _attached = attach_blooms_for_plan(&mut ctx, &plan, &BloomEmitterOptions::default())
             .await
             .expect("attach_blooms");
@@ -229,7 +227,10 @@ fn bench_bloom(c: &mut Criterion) {
     let rt = Runtime::new().expect("runtime");
     let dir = data_dir();
     let sf = sf_tag(&dir);
-    println!("==> TPC-H distributed bloom bench data dir: {}", dir.display());
+    println!(
+        "==> TPC-H distributed bloom bench data dir: {}",
+        dir.display()
+    );
     println!("==> SF tag (group label): {sf}");
     println!("==> Both configs use 3 in-process workers (loopback)");
 

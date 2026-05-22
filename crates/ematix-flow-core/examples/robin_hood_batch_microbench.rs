@@ -21,7 +21,7 @@
 use std::collections::HashMap;
 use std::time::Instant;
 
-use ematix_flow_core::robin_hood_agg::{count_accumulator, RobinHoodI64U64};
+use ematix_flow_core::robin_hood_agg::{RobinHoodI64U64, count_accumulator};
 
 const N_ROWS: usize = 6_000_000;
 const CARDINALITIES: &[i64] = &[7, 100, 10_000];
@@ -112,10 +112,14 @@ fn main() {
         let _ = bench_hb_row(&keys);
 
         let mut rh_row: Vec<f64> = (0..REPS).map(|_| bench_rh_row(&keys)).collect();
-        let mut rh_pre: Vec<f64> = (0..REPS).map(|_| bench_rh_row_pregrown(&keys, cap)).collect();
+        let mut rh_pre: Vec<f64> = (0..REPS)
+            .map(|_| bench_rh_row_pregrown(&keys, cap))
+            .collect();
         let mut rh_bat: Vec<f64> = (0..REPS).map(|_| bench_rh_batch(&keys)).collect();
         let mut hb_row: Vec<f64> = (0..REPS).map(|_| bench_hb_row(&keys)).collect();
-        let mut hb_res: Vec<f64> = (0..REPS).map(|_| bench_hb_row_reserve(&keys, cap)).collect();
+        let mut hb_res: Vec<f64> = (0..REPS)
+            .map(|_| bench_hb_row_reserve(&keys, cap))
+            .collect();
 
         let rh_row_med = median(&mut rh_row);
         let rh_pre_med = median(&mut rh_pre);
