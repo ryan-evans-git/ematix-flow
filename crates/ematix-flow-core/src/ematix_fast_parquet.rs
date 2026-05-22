@@ -381,6 +381,103 @@ impl BridgeFilter {
             DataFusionError::External("BridgeFilter::build_bitmap: no predicates".into())
         })
     }
+
+    /// Σ.L.3.c.3 — auto-pick: should we run the sequential-AND path
+    /// instead of the parallel-AND path? Engages only when adaptive
+    /// reordering is enabled AND the predicted cumulative pass-rate
+    /// is low (≤30%), where sequential's masked-decode win
+    /// outweighs the loss of inter-predicate parallelism.
+    pub fn should_use_sequential(&self) -> bool {
+        self.adaptive.is_some()
+            && self.predicates.len() >= 2
+            && self.predicted_pass_rate <= 0.30
+    }
+
+    /// Σ.L.3.c.2 — sequential masked-AND variant of build_bitmap.
+    /// Applies predicates in [`Self::applied_order`] order. The first
+    /// predicate decodes its column fully; each subsequent predicate
+    /// uses the accumulated bitmap as a decode mask, skipping rows
+    /// already eliminated.
+    ///
+    /// **Scope of tonight's landing:** the simple predicate types
+    /// (I32Range, I32In, F64Range, StringEq) take the masked path.
+    /// Unsupported types (LIKE, StringIn, StringNotEq,
+    /// I32ColumnPair) fall through to the existing parallel path
+    /// via a return of `None` — caller treats this as "use
+    /// build_bitmap" instead.
+    ///
+    /// Returns `Ok(Some(...))` if all predicates supported,
+    /// `Ok(None)` if any predicate isn't yet supported in sequential
+    /// mode (caller should fall back to [`Self::build_bitmap`]).
+    pub fn build_bitmap_sequential(
+        &self,
+        path: &std::path::Path,
+        rg: usize,
+    ) -> DfResult<Option<(Vec<u8>, usize)>> {
+        use crate::ematix_parquet_bridge::{
+            filter_byte_array_masked, filter_byte_array_to_bitmap_dense,
+            filter_f64_column_masked, filter_f64_column_to_bitmap_dense,
+            filter_i32_column_masked, filter_i32_column_to_bitmap_dense,
+        };
+        let order = self.applied_order();
+        let mut acc: Option<(Vec<u8>, usize)> = None;
+        for &idx in &order {
+            let p = &self.predicates[idx];
+            // Determine column index (needed for masked variant).
+            let col = p.col_idx();
+            let (bitmap, total) = match (p, &acc) {
+                // First predicate (no accumulated mask): full decode.
+                (ColumnPredicate::I32Range { .. } | ColumnPredicate::I32In { .. }, None) => {
+                    let pc = p.clone();
+                    let file = ematix_parquet_io::ParquetFile::open(path).map_err(|e| {
+                        DataFusionError::External(format!("ParquetFile::open: {e}").into())
+                    })?;
+                    filter_i32_column_to_bitmap_dense(&file, rg, col, move |v: i32| {
+                        pc.eval_i32(v)
+                    })?
+                }
+                (ColumnPredicate::F64Range { .. }, None) => {
+                    let pc = p.clone();
+                    filter_f64_column_to_bitmap_dense(path, rg, col, move |v: f64| pc.eval_f64(v))?
+                }
+                (ColumnPredicate::StringEq { value, .. }, None) => {
+                    let needle = value.clone();
+                    filter_byte_array_to_bitmap_dense(path, rg, col, move |v: &[u8]| {
+                        v == needle.as_bytes()
+                    })?
+                }
+                // Subsequent predicates: use mask.
+                (
+                    ColumnPredicate::I32Range { .. } | ColumnPredicate::I32In { .. },
+                    Some((mask, total)),
+                ) => {
+                    let pc = p.clone();
+                    let file = ematix_parquet_io::ParquetFile::open(path).map_err(|e| {
+                        DataFusionError::External(format!("ParquetFile::open: {e}").into())
+                    })?;
+                    filter_i32_column_masked(&file, rg, col, mask, *total, move |v: i32| {
+                        pc.eval_i32(v)
+                    })?
+                }
+                (ColumnPredicate::F64Range { .. }, Some((mask, total))) => {
+                    let pc = p.clone();
+                    filter_f64_column_masked(path, rg, col, mask, *total, move |v: f64| {
+                        pc.eval_f64(v)
+                    })?
+                }
+                (ColumnPredicate::StringEq { value, .. }, Some((mask, total))) => {
+                    let needle = value.clone();
+                    filter_byte_array_masked(path, rg, col, mask, *total, move |v: &[u8]| {
+                        v == needle.as_bytes()
+                    })?
+                }
+                // Unsupported predicate type — caller falls back.
+                _ => return Ok(None),
+            };
+            acc = Some((bitmap, total));
+        }
+        Ok(acc.map(|x| x))
+    }
 }
 
 impl ColumnPredicate {

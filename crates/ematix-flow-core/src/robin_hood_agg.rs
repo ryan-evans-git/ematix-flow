@@ -45,6 +45,7 @@
 //! the optimizer rule stack.
 
 use std::iter::Iterator;
+use std::sync::Arc;
 
 const INITIAL_CAPACITY: usize = 64;
 const MAX_LOAD_FACTOR_NUMERATOR: usize = 7;
@@ -361,6 +362,188 @@ impl RobinHoodCountAgg {
     }
 }
 
+// ---------------------------------------------------------------------
+// Σ.N.c — DataFusion ExecutionPlan wrapping RobinHoodCountAgg.
+// ---------------------------------------------------------------------
+
+use std::any::Any;
+use datafusion::arrow::array::{Int64Array, RecordBatch};
+use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use datafusion::common::{DataFusionError, Result as DfResult};
+use datafusion::execution::TaskContext;
+use datafusion::physical_expr::{EquivalenceProperties, Partitioning};
+use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion::physical_plan::{
+    DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
+};
+use futures_util::stream::{self, TryStreamExt};
+
+/// Σ.N.c — `SELECT col, COUNT(*) FROM child GROUP BY col` where `col`
+/// is `Int64`. Uses RobinHoodCountAgg internally — 1.16-1.54× faster
+/// than the stock hashbrown-based aggregate.
+///
+/// Output schema: `(group_key: Int64, count: Int64)`. Single-partition
+/// output (Final emission).
+///
+/// Like [`crate::dict_aggregate::DictGroupCountExec`] but for i64
+/// keys instead of dict-encoded strings.
+#[derive(Debug)]
+pub struct RobinHoodAggregateExec {
+    input: Arc<dyn ExecutionPlan>,
+    group_col_idx: usize,
+    schema: SchemaRef,
+    properties: Arc<PlanProperties>,
+}
+
+impl RobinHoodAggregateExec {
+    pub fn try_new(input: Arc<dyn ExecutionPlan>, group_col_idx: usize) -> DfResult<Self> {
+        Self::try_new_with_names(input, group_col_idx, "group_key".to_string(), "count".to_string())
+    }
+
+    pub fn try_new_with_names(
+        input: Arc<dyn ExecutionPlan>,
+        group_col_idx: usize,
+        group_out_name: String,
+        count_out_name: String,
+    ) -> DfResult<Self> {
+        let input_schema = input.schema();
+        if group_col_idx >= input_schema.fields().len() {
+            return Err(DataFusionError::Internal(format!(
+                "RobinHoodAggregateExec: group_col_idx={group_col_idx} out of bounds (schema has {} cols)",
+                input_schema.fields().len()
+            )));
+        }
+        let gb_type = input_schema.field(group_col_idx).data_type();
+        if gb_type != &DataType::Int64 {
+            return Err(DataFusionError::Internal(format!(
+                "RobinHoodAggregateExec: group column must be Int64, got {gb_type:?}"
+            )));
+        }
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(&group_out_name, DataType::Int64, false),
+            Field::new(&count_out_name, DataType::Int64, false),
+        ]));
+        let eq_props = EquivalenceProperties::new(schema.clone());
+        let properties = Arc::new(PlanProperties::new(
+            eq_props,
+            Partitioning::UnknownPartitioning(1),
+            EmissionType::Final,
+            Boundedness::Bounded,
+        ));
+        Ok(Self {
+            input,
+            group_col_idx,
+            schema,
+            properties,
+        })
+    }
+
+    pub fn group_col_idx(&self) -> usize {
+        self.group_col_idx
+    }
+}
+
+impl DisplayAs for RobinHoodAggregateExec {
+    fn fmt_as(&self, _t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(
+            f,
+            "RobinHoodAggregateExec(group_col_idx={})",
+            self.group_col_idx
+        )
+    }
+}
+
+impl ExecutionPlan for RobinHoodAggregateExec {
+    fn name(&self) -> &str {
+        "RobinHoodAggregateExec"
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn properties(&self) -> &Arc<PlanProperties> {
+        &self.properties
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.input]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        mut children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> DfResult<Arc<dyn ExecutionPlan>> {
+        let new_input = children.pop().ok_or_else(|| {
+            DataFusionError::Internal("RobinHoodAggregateExec requires exactly 1 child".into())
+        })?;
+        let group_out_name = self.schema.field(0).name().clone();
+        let count_out_name = self.schema.field(1).name().clone();
+        Ok(Arc::new(Self::try_new_with_names(
+            new_input,
+            self.group_col_idx,
+            group_out_name,
+            count_out_name,
+        )?))
+    }
+
+    fn execute(
+        &self,
+        partition: usize,
+        context: Arc<TaskContext>,
+    ) -> DfResult<SendableRecordBatchStream> {
+        if partition != 0 {
+            return Err(DataFusionError::Internal(format!(
+                "RobinHoodAggregateExec emits only partition 0, got {partition}"
+            )));
+        }
+        let input = self.input.clone();
+        let group_col_idx = self.group_col_idx;
+        let schema = self.schema.clone();
+        let schema_for_stream = schema.clone();
+
+        let fut = async move {
+            let mut agg = RobinHoodCountAgg::new();
+            let in_parts = input.properties().partitioning.partition_count();
+            for p in 0..in_parts {
+                let mut s = input.execute(p, context.clone())?;
+                while let Some(batch) = s.try_next().await? {
+                    let arr = batch.column(group_col_idx);
+                    let i64_arr = arr
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .ok_or_else(|| {
+                            DataFusionError::Internal(format!(
+                                "RobinHoodAggregateExec: column {group_col_idx} not Int64Array"
+                            ))
+                        })?;
+                    agg.ingest_int64_array(i64_arr);
+                }
+            }
+            // Finalise. Inline rather than calling finalize_to_record_batch
+            // to control schema field names + use Int64 (signed) for count
+            // (matches DataFusion convention).
+            let mut pairs: Vec<(i64, u64)> = agg.table().iter().collect();
+            pairs.sort_by_key(|(k, _)| *k);
+            let keys: Vec<i64> = pairs.iter().map(|(k, _)| *k).collect();
+            let counts: Vec<i64> = pairs.iter().map(|(_, v)| *v as i64).collect();
+            let out = RecordBatch::try_new(
+                schema_for_stream.clone(),
+                vec![
+                    Arc::new(Int64Array::from(keys)),
+                    Arc::new(Int64Array::from(counts)),
+                ],
+            )
+            .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+            DfResult::Ok(out)
+        };
+
+        let s = stream::once(fut);
+        Ok(Box::pin(RecordBatchStreamAdapter::new(schema, s)))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -528,6 +711,73 @@ mod tests {
         let batch = agg.finalize_to_record_batch();
         // 2 distinct non-null keys.
         assert_eq!(batch.num_rows(), 2);
+    }
+
+    #[tokio::test]
+    async fn robin_hood_aggregate_exec_matches_datafusion() {
+        // Σ.N.c — install RobinHoodAggregateExec over a MemTable scan
+        // and verify its output matches DataFusion's stock agg.
+        use arrow_array::{Int64Array, RecordBatch};
+        use arrow_schema::{DataType, Field, Schema};
+        use datafusion::datasource::MemTable;
+        use datafusion::prelude::SessionContext;
+        use datafusion::physical_plan::ExecutionPlanProperties;
+        use futures_util::TryStreamExt;
+        use std::sync::Arc;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![
+                1i64, 2, 3, 1, 2, 1, 5, 5, 2, 3, 3, 3,
+            ]))],
+        )
+        .unwrap();
+
+        let mt = MemTable::try_new(schema, vec![vec![batch.clone()]]).unwrap();
+        let ctx = SessionContext::new();
+        ctx.register_table("t", Arc::new(mt)).unwrap();
+
+        // Get the input plan (just MemTable scan).
+        let df = ctx.sql("SELECT k FROM t").await.unwrap();
+        let scan_plan = df.create_physical_plan().await.unwrap();
+
+        // Wrap in RobinHoodAggregateExec.
+        let rh_exec = RobinHoodAggregateExec::try_new(scan_plan, 0).unwrap();
+
+        let task_ctx = ctx.task_ctx();
+        let mut s = rh_exec.execute(0, task_ctx.clone()).unwrap();
+        let mut rh_pairs: Vec<(i64, i64)> = Vec::new();
+        while let Some(b) = s.try_next().await.unwrap() {
+            let ks = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+            let cs = b.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+            for i in 0..b.num_rows() {
+                rh_pairs.push((ks.value(i), cs.value(i)));
+            }
+        }
+        rh_pairs.sort();
+
+        // DataFusion stock agg path.
+        let df2 = ctx
+            .sql("SELECT k, COUNT(*) FROM t GROUP BY k ORDER BY k")
+            .await
+            .unwrap();
+        let plan2 = df2.create_physical_plan().await.unwrap();
+        let mut s2 = plan2.execute(0, task_ctx).unwrap();
+        let mut df_pairs: Vec<(i64, i64)> = Vec::new();
+        while let Some(b) = s2.try_next().await.unwrap() {
+            let ks = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+            let cs = b.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+            for i in 0..b.num_rows() {
+                df_pairs.push((ks.value(i), cs.value(i)));
+            }
+        }
+        df_pairs.sort();
+
+        assert_eq!(
+            rh_pairs, df_pairs,
+            "RobinHoodAggregateExec output diverged from DataFusion stock"
+        );
     }
 
     #[tokio::test]

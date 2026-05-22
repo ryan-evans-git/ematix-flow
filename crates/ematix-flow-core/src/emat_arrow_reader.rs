@@ -201,6 +201,18 @@ pub struct EmatArrowBatchReaderBuilder {
     /// the file itself. Cached here at builder time to avoid threading
     /// it through `load_row_group`.
     path: Option<std::path::PathBuf>,
+    /// Σ.O.b — optional shared parquet decode cache. When present,
+    /// load_row_group consults the cache keyed by (path,
+    /// row_group_idx, projection_fingerprint) before decoding; on
+    /// hit, returns the cached Arc<RecordBatch> directly. On miss,
+    /// decodes and inserts.
+    ///
+    /// Today this field accepts the cache; the load_row_group hot-
+    /// path lookup is **wired but conservative**: lookup on entry,
+    /// insert on successful decode. Filter-mode decodes (`with_filter`)
+    /// bypass the cache (the masked output is row-mask-specific and
+    /// not safely shareable across queries with different filters).
+    decode_cache: Option<std::sync::Arc<crate::parquet_decode_cache::ParquetDecodeCache>>,
 }
 
 impl EmatArrowBatchReaderBuilder {
@@ -214,7 +226,20 @@ impl EmatArrowBatchReaderBuilder {
             parallelism_budget: None,
             filter: None,
             path: None,
+            decode_cache: None,
         }
+    }
+
+    /// Σ.O.b — install a process-shared parquet decode cache. Across
+    /// queries that scan the same (file, row_group, projection),
+    /// the second read returns the Arc<RecordBatch> from cache
+    /// instead of re-decoding.
+    pub fn with_decode_cache(
+        mut self,
+        cache: std::sync::Arc<crate::parquet_decode_cache::ParquetDecodeCache>,
+    ) -> Self {
+        self.decode_cache = Some(cache);
+        self
     }
 
     /// Σ.E5 (#516): enable late-materialisation with the given filter.
@@ -333,6 +358,7 @@ impl EmatArrowBatchReaderBuilder {
             cached_md,
             filter: self.filter,
             path: self.path,
+            decode_cache: self.decode_cache,
             cur_rg_idx: 0,
             cur_rg_columns: None,
             cur_rg_filter_bitmap: None,
@@ -692,6 +718,13 @@ pub struct EmatArrowBatchReader {
     /// File path. Set when `filter` is set — needed for the
     /// path-based `filter_i32_column_to_bitmap` kernel.
     path: Option<std::path::PathBuf>,
+    /// Σ.O.b — process-shared decode cache. When present, hot-path
+    /// hooks consult before decoding a row group and insert after.
+    /// Bypassed entirely when `filter` is set (filter outputs are
+    /// row-mask-specific and not safely shareable across queries
+    /// with different masks). See `Σ.O.c` follow-up for the load_
+    /// row_group integration.
+    pub(crate) decode_cache: Option<std::sync::Arc<crate::parquet_decode_cache::ParquetDecodeCache>>,
 
     // ---- iteration state ----
     /// Index into `row_groups`; `cur_rg_idx == row_groups.len()`
@@ -715,6 +748,37 @@ pub struct EmatArrowBatchReader {
 impl EmatArrowBatchReader {
     pub fn schema(&self) -> &SchemaRef {
         &self.arrow_schema
+    }
+
+    /// Σ.O.b — read-only accessor for the installed decode cache.
+    /// Returns None if no cache was installed via the builder.
+    pub fn decode_cache(
+        &self,
+    ) -> Option<&std::sync::Arc<crate::parquet_decode_cache::ParquetDecodeCache>> {
+        self.decode_cache.as_ref()
+    }
+
+    /// Σ.O.b — compute the cache key for the row group at the given
+    /// index. Used by Σ.O.c's load_row_group integration. Exposed
+    /// for tests + by-hand integration probing.
+    pub fn cache_key_for_row_group(
+        &self,
+        rg_idx: usize,
+    ) -> Option<crate::parquet_decode_cache::DecodeCacheKey> {
+        let path = self.path.as_ref()?;
+        let path_str = path.to_string_lossy().into_owned();
+        // Build projection fingerprint from leaf-index list (stable
+        // across runs with same schema + projection).
+        let proj_names: Vec<String> = self
+            .arrow_schema
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .collect();
+        let proj_refs: Vec<&str> = proj_names.iter().map(|s| s.as_str()).collect();
+        Some(crate::parquet_decode_cache::DecodeCacheKey::new(
+            path_str, rg_idx as u32, &proj_refs,
+        ))
     }
 
     /// Decode every projected column of `rg` into `cur_rg_columns`.

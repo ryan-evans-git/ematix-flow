@@ -269,6 +269,166 @@ impl BloomBuilder {
     }
 }
 
+// ---------------------------------------------------------------------
+// Σ.J.2.b.iv — BloomFilterExec wrapper.
+// ---------------------------------------------------------------------
+
+use std::any::Any;
+use std::sync::Arc;
+use datafusion::arrow::array::{BooleanArray, Int64Array, RecordBatch};
+use datafusion::arrow::compute::filter_record_batch;
+use datafusion::common::{DataFusionError, Result as DfResult};
+use datafusion::execution::TaskContext;
+use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion::physical_plan::{
+    DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
+};
+use datafusion::physical_expr::{EquivalenceProperties, Partitioning};
+use futures_util::StreamExt;
+
+/// Σ.J.2.b.iv — wraps a child ExecutionPlan; drops rows whose value
+/// in `key_col_idx` doesn't pass the bloom filter. Used on the
+/// probe side of a distributed join — the build-side bloom arrives
+/// via Flight metadata (Σ.J.2.b) and is installed around the probe
+/// scan.
+///
+/// Today supports Int64 join keys (covers most TPC-H join shapes:
+/// l_partkey, l_orderkey, c_custkey, etc.). String keys + bloom
+/// composition is a follow-up.
+#[derive(Debug)]
+pub struct BloomFilterExec {
+    input: Arc<dyn ExecutionPlan>,
+    key_col_idx: usize,
+    bloom: Arc<BloomFilter>,
+    properties: Arc<PlanProperties>,
+}
+
+impl BloomFilterExec {
+    pub fn try_new(
+        input: Arc<dyn ExecutionPlan>,
+        key_col_idx: usize,
+        bloom: Arc<BloomFilter>,
+    ) -> DfResult<Self> {
+        let schema = input.schema();
+        if key_col_idx >= schema.fields().len() {
+            return Err(DataFusionError::Internal(format!(
+                "BloomFilterExec: key_col_idx={key_col_idx} out of bounds"
+            )));
+        }
+        if schema.field(key_col_idx).data_type() != &arrow_schema::DataType::Int64 {
+            return Err(DataFusionError::Internal(format!(
+                "BloomFilterExec: key column must be Int64, got {:?}",
+                schema.field(key_col_idx).data_type()
+            )));
+        }
+        let eq_props = EquivalenceProperties::new(schema.clone());
+        let n_parts = input.properties().partitioning.partition_count();
+        let properties = Arc::new(PlanProperties::new(
+            eq_props,
+            Partitioning::UnknownPartitioning(n_parts),
+            EmissionType::Incremental,
+            Boundedness::Bounded,
+        ));
+        Ok(Self {
+            input,
+            key_col_idx,
+            bloom,
+            properties,
+        })
+    }
+
+    pub fn bloom(&self) -> &Arc<BloomFilter> {
+        &self.bloom
+    }
+}
+
+impl DisplayAs for BloomFilterExec {
+    fn fmt_as(&self, _t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(
+            f,
+            "BloomFilterExec(key_col_idx={}, bloom_blocks={})",
+            self.key_col_idx, self.bloom.n_blocks
+        )
+    }
+}
+
+impl ExecutionPlan for BloomFilterExec {
+    fn name(&self) -> &str {
+        "BloomFilterExec"
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn properties(&self) -> &Arc<PlanProperties> {
+        &self.properties
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.input]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        mut children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> DfResult<Arc<dyn ExecutionPlan>> {
+        let new_input = children.pop().ok_or_else(|| {
+            DataFusionError::Internal("BloomFilterExec requires exactly 1 child".into())
+        })?;
+        Ok(Arc::new(Self::try_new(
+            new_input,
+            self.key_col_idx,
+            self.bloom.clone(),
+        )?))
+    }
+
+    fn execute(
+        &self,
+        partition: usize,
+        context: Arc<TaskContext>,
+    ) -> DfResult<SendableRecordBatchStream> {
+        let input_stream = self.input.execute(partition, context)?;
+        let key_col_idx = self.key_col_idx;
+        let bloom = self.bloom.clone();
+        let schema = self.input.schema();
+        let schema_clone = schema.clone();
+
+        let filtered = input_stream.map(move |batch_result| {
+            let batch = batch_result?;
+            let key_arr = batch
+                .column(key_col_idx)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| {
+                    DataFusionError::Internal(format!(
+                        "BloomFilterExec: column {key_col_idx} not Int64Array"
+                    ))
+                })?;
+            // Build boolean mask: true if bloom might-contain the key.
+            let mut mask = Vec::with_capacity(batch.num_rows());
+            for i in 0..batch.num_rows() {
+                let pass = if key_arr.is_null(i) {
+                    false
+                } else {
+                    bloom.might_contain_i64(key_arr.value(i))
+                };
+                mask.push(pass);
+            }
+            let bool_arr = BooleanArray::from(mask);
+            let out = filter_record_batch(&batch, &bool_arr)
+                .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+            DfResult::Ok(out)
+        });
+
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            schema_clone,
+            filtered,
+        )))
+    }
+}
+
 fn hash_i64(v: i64, seed: u64) -> u64 {
     // splitmix64
     let mut x = (v as u64).wrapping_add(seed);
@@ -410,6 +570,62 @@ mod tests {
     fn flight_header_rejects_odd_length() {
         let r = BloomFilter::from_flight_header("abc");
         assert!(matches!(r, Err(BloomError::BadMagic)));
+    }
+
+    #[tokio::test]
+    async fn bloom_filter_exec_drops_rows_not_in_bloom() {
+        use arrow_array::{Int64Array, RecordBatch};
+        use arrow_schema::{DataType, Field, Schema};
+        use datafusion::datasource::MemTable;
+        use datafusion::prelude::SessionContext;
+        use datafusion::physical_plan::ExecutionPlanProperties;
+        use futures_util::TryStreamExt;
+        use std::sync::Arc;
+
+        // Build a bloom containing only keys {1, 2, 3}.
+        let mut bloom = BloomFilter::for_keys(10);
+        for k in [1i64, 2, 3] {
+            bloom.insert_i64(k);
+        }
+
+        // Input table has keys 1..=10. We expect output to retain
+        // {1, 2, 3} plus possibly some false positives — and definitely
+        // exclude many of 4..=10.
+        let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from((1..=10i64).collect::<Vec<_>>()))],
+        )
+        .unwrap();
+        let mt = MemTable::try_new(schema, vec![vec![batch]]).unwrap();
+        let ctx = SessionContext::new();
+        ctx.register_table("t", Arc::new(mt)).unwrap();
+
+        let df = ctx.sql("SELECT k FROM t").await.unwrap();
+        let scan = df.create_physical_plan().await.unwrap();
+        let bfe = BloomFilterExec::try_new(scan, 0, Arc::new(bloom)).unwrap();
+
+        let mut s = bfe.execute(0, ctx.task_ctx()).unwrap();
+        let mut kept: Vec<i64> = Vec::new();
+        while let Some(b) = s.try_next().await.unwrap() {
+            let arr = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+            for i in 0..b.num_rows() {
+                kept.push(arr.value(i));
+            }
+        }
+        // Must include all true positives.
+        for k in [1, 2, 3] {
+            assert!(kept.contains(&k), "missing inserted key {k}");
+        }
+        // Must drop some false negatives (rows not in bloom that
+        // bloom correctly identified as absent). At least one of
+        // 4..=10 should NOT be in `kept` — for a 10-key bloom with
+        // 3 inserts, expected FP rate is ≪ 1.
+        let dropped = (4..=10i64).filter(|k| !kept.contains(k)).count();
+        assert!(
+            dropped > 0,
+            "BloomFilterExec didn't drop any non-bloom keys (kept all 4..=10)"
+        );
     }
 
     #[test]
