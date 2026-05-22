@@ -34,10 +34,31 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
+use async_trait::async_trait;
 use datafusion::arrow::array::RecordBatch;
-use ematix_flow_core::backend::{Backend, DistributedConfig};
-use ematix_flow_distributed::DistributedBackend;
+use datafusion::common::DataFusionError;
+use datafusion::execution::session_state::SessionStateBuilder;
+use datafusion::prelude::SessionContext;
+use datafusion_distributed::{
+    CompressionType, DistributedExt, DistributedPhysicalOptimizerRule, WorkerResolver,
+};
+use ematix_flow_core::preset;
 use serde::Serialize;
+use url::Url;
+
+/// Inline `WorkerResolver` — mirrors `ematix_flow_distributed::StaticWorkerResolver`,
+/// which is private to that crate. Same shape, returns the fixed peer list.
+#[derive(Clone)]
+struct StaticPeers {
+    urls: Vec<Url>,
+}
+
+#[async_trait]
+impl WorkerResolver for StaticPeers {
+    fn get_urls(&self) -> Result<Vec<Url>, DataFusionError> {
+        Ok(self.urls.clone())
+    }
+}
 
 const TPCH_TABLES: &[&str] = &[
     "region", "nation", "supplier", "customer", "part", "partsupp", "orders", "lineitem",
@@ -170,13 +191,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Build the distributed backend. peers comes from the env; tls=None
-    // (intra-cluster traffic is on a self-referential SG inside one VPC AZ).
-    let backend = Arc::new(DistributedBackend::open(DistributedConfig {
-        peers,
-        tls: None,
-    })?);
-    let ctx = backend.session_context().await;
+    // Build the SessionState ourselves so we get BOTH the distributed
+    // planner AND our preset rules (dedupe-for-f64-determinism +
+    // multi-agg / sum / dict-group-count). Going through
+    // `DistributedBackend::open` would give us only the distributed
+    // planner; Q15 would non-deterministically return 0 rows because
+    // the dedupe rule wouldn't fire (caught in local smoke test
+    // 2026-05-22).
+    let urls: Vec<Url> = peers
+        .iter()
+        .map(|s| Url::parse(s).unwrap_or_else(|e| panic!("bad EMATIX_PEERS url '{s}': {e}")))
+        .collect();
+    let resolver = StaticPeers { urls };
+    let (builder, _registry) = preset::with_optimizer_rules_and_registry(
+        SessionStateBuilder::new()
+            .with_default_features()
+            .with_physical_optimizer_rule(Arc::new(DistributedPhysicalOptimizerRule))
+            .with_distributed_worker_resolver(resolver),
+    );
+    let state = builder
+        .with_distributed_compression(Some(CompressionType::LZ4_FRAME))
+        .expect("LZ4_FRAME is a valid compression type")
+        .build();
+    let ctx = Arc::new(SessionContext::from(state));
     for table in TPCH_TABLES {
         let p = data_dir.join(format!("{table}.parquet"));
         ctx.register_parquet(*table, p.to_str().unwrap(), Default::default())
@@ -191,7 +228,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // Warmups (untimed, but verify it runs cleanly).
         for w in 0..warmups {
-            match run_query(&backend, &sql).await {
+            match run_query(&ctx, &sql).await {
                 Ok(_) => {}
                 Err(e) => {
                     eprintln!("  warmup {w} FAILED: {e}");
@@ -205,7 +242,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut rows_returned: usize = 0;
         for _ in 0..trials {
             let t0 = Instant::now();
-            match run_query(&backend, &sql).await {
+            match run_query(&ctx, &sql).await {
                 Ok(batches) => {
                     let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
                     trials_ms.push(elapsed_ms);
@@ -239,7 +276,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    let cluster_size = backend.peers().len() + 1; // +1 for coordinator
+    let cluster_size = peers.len() + 1; // +1 for coordinator
     let out = CampaignOutput {
         engine: "ematix",
         version: env!("CARGO_PKG_VERSION"),
@@ -259,12 +296,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn run_query(
-    backend: &DistributedBackend,
+    ctx: &SessionContext,
     sql: &str,
 ) -> Result<Vec<RecordBatch>, Box<dyn std::error::Error>> {
-    use futures_util::TryStreamExt;
-    let stream = backend.read_arrow_stream(sql).await?;
-    let batches: Vec<RecordBatch> = stream.try_collect().await?;
+    let df = ctx.sql(sql).await?;
+    let batches = df.collect().await?;
     Ok(batches)
 }
 
