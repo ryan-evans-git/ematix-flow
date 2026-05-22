@@ -130,8 +130,8 @@ async fn main() {
     println!("Row counts: {:?}\n", row_counts);
 
     println!(
-        "{:<5} {:>10} {:>10} {:>10} {}",
-        "Q", "OFF (ms)", "ROUTED", "Δ%", "routing"
+        "{:<5} {:>10} {:>10} {:>10} routing",
+        "Q", "OFF (ms)", "ROUTED", "Δ%"
     );
     println!("{}", "-".repeat(72));
 

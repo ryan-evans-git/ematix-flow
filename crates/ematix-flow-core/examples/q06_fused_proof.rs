@@ -28,7 +28,7 @@ use std::time::Instant;
 use ematix_flow_core::ematix_parquet_bridge::{
     filter_f64_column_to_bitmap, filter_f64_column_to_bitmap_dense, filter_i32_column_to_bitmap,
 };
-use ematix_parquet_codec::read::{read_column_f64_masked_into, read_column_i32_masked_into};
+use ematix_parquet_codec::read::read_column_f64_masked_into;
 use ematix_parquet_io::ParquetFile;
 
 // TPC-H lineitem column indices (0-based, from the file schema):
@@ -85,7 +85,7 @@ fn process_rg(path: &std::path::Path, rg: usize) -> f64 {
     // 1. Build shipdate bitmap (i32 dict-fused, NEON kernel).
     let t = Instant::now();
     let (mut bitmap, _total) = filter_i32_column_to_bitmap(path, rg, COL_SHIPDATE, |v: i32| {
-        v >= SHIPDATE_LOW && v < SHIPDATE_HIGH
+        (SHIPDATE_LOW..SHIPDATE_HIGH).contains(&v)
     })
     .expect("shipdate filter");
     T_SHIPDATE.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
@@ -93,11 +93,11 @@ fn process_rg(path: &std::path::Path, rg: usize) -> f64 {
     // 2. Discount bitmap.
     let t = Instant::now();
     let (dc_bitmap, _) = match filter_f64_column_to_bitmap(path, rg, COL_DISCOUNT, |v: f64| {
-        v >= DISCOUNT_LOW && v <= DISCOUNT_HIGH
+        (DISCOUNT_LOW..=DISCOUNT_HIGH).contains(&v)
     }) {
         Ok(r) => r,
         Err(_) => filter_f64_column_to_bitmap_dense(path, rg, COL_DISCOUNT, |v: f64| {
-            v >= DISCOUNT_LOW && v <= DISCOUNT_HIGH
+            (DISCOUNT_LOW..=DISCOUNT_HIGH).contains(&v)
         })
         .expect("discount filter"),
     };

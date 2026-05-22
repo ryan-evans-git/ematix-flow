@@ -22,6 +22,7 @@ use ematix_parquet_io::{PageWalker, ParquetFile};
 const COL_QUANTITY: usize = 4; // l_quantity (F64, ratio ≈ 1.00)
 const COL_EXTPRICE: usize = 5; // l_extendedprice (F64, ratio ≈ 0.73)
 
+#[allow(unused_variables, unused_assignments)]
 fn probe(file: &ParquetFile, col_idx: usize, label: &str, reps: usize) {
     let md = file.metadata().expect("md");
     let n_rgs = md.row_groups.len();

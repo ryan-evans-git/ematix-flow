@@ -255,7 +255,7 @@ impl ExecutionPlan for SharedSubtreeExec {
                 .await?;
             // Replay: clone the Arc<RecordBatch> headers (Arrow data
             // buffers are themselves Arc-shared, so this is cheap).
-            let owned: Vec<RecordBatch> = batches.iter().cloned().collect();
+            let owned: Vec<RecordBatch> = batches.to_vec();
             Ok::<_, DataFusionError>(stream::iter(
                 owned.into_iter().map(Ok::<_, DataFusionError>),
             ))

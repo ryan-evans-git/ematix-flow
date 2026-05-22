@@ -156,8 +156,8 @@ async fn main() {
     }
 
     println!(
-        "{:<5} {:>10} {:>10} {:>10} {}",
-        "Q", "OFF (ms)", "ROUTED", "Δ%", "decision (after probe)"
+        "{:<5} {:>10} {:>10} {:>10} decision (after probe)",
+        "Q", "OFF (ms)", "ROUTED", "Δ%"
     );
     println!("{}", "-".repeat(72));
 
@@ -196,10 +196,11 @@ async fn main() {
                         build_ctx(&dir_inner, &m)
                     });
                 let dir_inner2 = dir2.clone();
-                let table_inner2 = table.to_string();
+                let _table_inner2 = table.to_string();
                 let factory_default: Box<ematix_flow_core::dict_routing::CtxFactory<'static>> =
                     Box::new(move || build_ctx(&dir_inner2, &HashMap::new()));
                 // Use a trivially-cheap probe so the cached result drives the decision.
+                #[allow(clippy::if_same_then_else)]
                 let probe = if chosen {
                     "SELECT 1".to_string()
                 } else {

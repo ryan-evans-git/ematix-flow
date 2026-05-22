@@ -82,6 +82,10 @@ use datafusion::error::Result as DfResult;
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode};
+// CoalesceBatchesExec is deprecated in favor of arrow-rs BatchCoalescer
+// but DataFusion's planner still emits it in plan trees. We treat it as
+// a transparent wrapper in our structural-hash walk.
+#[allow(deprecated)]
 use datafusion::physical_plan::coalesce_batches::CoalesceBatchesExec;
 use datafusion::physical_plan::filter::FilterExec;
 use datafusion::physical_plan::projection::ProjectionExec;
@@ -216,6 +220,7 @@ fn subtree_hash(node: &Arc<dyn ExecutionPlan>) -> u64 {
     h.finish()
 }
 
+#[allow(deprecated)] // CoalesceBatchesExec
 fn hash_node(node: &Arc<dyn ExecutionPlan>, h: &mut DefaultHasher) {
     // Pass-through wrappers: hash skips straight to the child.
     if node.as_any().is::<RepartitionExec>()

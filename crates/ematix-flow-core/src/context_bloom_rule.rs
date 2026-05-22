@@ -157,7 +157,6 @@ mod tests {
     use crate::ematix_fast_parquet::EmatixFastParquetTableProvider;
     use arrow_schema::DataType;
     use datafusion::execution::context::SessionContext;
-    use datafusion::physical_plan::ExecutionPlanProperties;
     use datafusion::physical_plan::displayable;
     use ematix_parquet_codec::write::{ColumnData, write_table_to_path};
     use ematix_parquet_format::types::CompressionCodec;
@@ -177,7 +176,7 @@ mod tests {
         // Two int64 columns + one int32 (which the rule must skip).
         let key: Vec<i64> = (0..1024).collect();
         let val: Vec<i64> = (0..1024).map(|x| x * 10).collect();
-        let other: Vec<i32> = (0..1024).map(|x| x as i32).collect();
+        let other: Vec<i32> = (0..1024).collect();
         write_table_to_path(
             path,
             &[

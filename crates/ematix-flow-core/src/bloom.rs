@@ -413,7 +413,7 @@ impl BloomBuilder {
 // Σ.J.2.b.iv — BloomFilterExec wrapper.
 // ---------------------------------------------------------------------
 
-use datafusion::arrow::array::{BooleanArray, Int64Array, RecordBatch};
+use datafusion::arrow::array::{BooleanArray, Int64Array};
 use datafusion::arrow::compute::filter_record_batch;
 use datafusion::common::{DataFusionError, Result as DfResult};
 use datafusion::execution::TaskContext;
@@ -717,7 +717,6 @@ mod tests {
         use arrow_array::{Int64Array, RecordBatch};
         use arrow_schema::{DataType, Field, Schema};
         use datafusion::datasource::MemTable;
-        use datafusion::physical_plan::ExecutionPlanProperties;
         use datafusion::prelude::SessionContext;
         use futures_util::TryStreamExt;
         use std::sync::Arc;

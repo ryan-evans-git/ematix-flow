@@ -80,6 +80,7 @@ pub struct BloomEmitterOptions {
     /// uuid. Called once per probe-side base table. Returning `None`
     /// uses the table's local DataFusion name unchanged. Default
     /// passes through.
+    #[allow(clippy::type_complexity)]
     pub table_uuid_for: Option<Arc<dyn Fn(&str) -> Option<String> + Send + Sync>>,
 }
 
@@ -508,7 +509,7 @@ mod tests {
         let blooms = emit_build_side_blooms(&ctx, &plan, &opts).await?;
         // Build side exceeds cap → no bloom emitted.
         assert!(
-            blooms.get("orders.o_custkey").is_none(),
+            !blooms.contains_key("orders.o_custkey"),
             "build side > cap should skip emission"
         );
         Ok(())

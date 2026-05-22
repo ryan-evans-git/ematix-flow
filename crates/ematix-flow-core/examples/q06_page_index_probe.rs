@@ -66,6 +66,7 @@ fn main() {
     let probe = |col_idx: usize, label: &str, kind: &str| -> (usize, usize) {
         let mut total = 0usize;
         let mut skip = 0usize;
+        #[allow(clippy::needless_range_loop)]
         for rg in 0..n_rgs {
             let meta = &ci[rg][col_idx];
             match (meta, kind) {
@@ -128,6 +129,7 @@ fn main() {
     // page-i across the 3 columns refers to the same rows.
     let mut total = 0usize;
     let mut skip = 0usize;
+    #[allow(clippy::needless_range_loop)]
     for rg in 0..n_rgs {
         let s_idx = match &ci[rg][shipdate] {
             ColumnIndexMetaData::INT32(i) => i,

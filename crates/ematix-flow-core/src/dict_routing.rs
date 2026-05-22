@@ -321,17 +321,13 @@ fn filter_uses_like_or_substr(pred: &Expr, cols: &[String]) -> bool {
     let mut hit = false;
     pred.apply(|e| {
         match e {
-            Expr::Like(like) => {
-                if expr_references_any(&like.expr, cols) {
-                    hit = true;
-                    return Ok(TreeNodeRecursion::Stop);
-                }
+            Expr::Like(like) if expr_references_any(&like.expr, cols) => {
+                hit = true;
+                return Ok(TreeNodeRecursion::Stop);
             }
-            Expr::SimilarTo(like) => {
-                if expr_references_any(&like.expr, cols) {
-                    hit = true;
-                    return Ok(TreeNodeRecursion::Stop);
-                }
+            Expr::SimilarTo(like) if expr_references_any(&like.expr, cols) => {
+                hit = true;
+                return Ok(TreeNodeRecursion::Stop);
             }
             Expr::ScalarFunction(sf) => {
                 let n = sf.name().to_ascii_lowercase();

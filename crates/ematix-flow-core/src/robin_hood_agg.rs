@@ -223,9 +223,8 @@ impl RobinHoodI64U64 {
     /// heuristic after the first batch reveals high cardinality.
     /// Cheaper than 3-4 sequential grow() cycles.
     pub fn reserve_to_capacity_pow2_of(&mut self, target: usize) {
-        let target_capacity = ((target * MAX_LOAD_FACTOR_DENOMINATOR + MAX_LOAD_FACTOR_NUMERATOR
-            - 1)
-            / MAX_LOAD_FACTOR_NUMERATOR)
+        let target_capacity = (target * MAX_LOAD_FACTOR_DENOMINATOR)
+            .div_ceil(MAX_LOAD_FACTOR_NUMERATOR)
             .next_power_of_two();
         while self.buckets.len() < target_capacity {
             self.grow();
@@ -235,10 +234,10 @@ impl RobinHoodI64U64 {
     /// Σ.N.f.1 — pre-grow to accommodate `extra` more inserts without
     /// rehashing in the hot path. Worst case: every key is new and
     /// the table grows to maintain ≤70% load factor.
+    #[allow(dead_code)]
     fn reserve_for_n_more(&mut self, extra: usize) {
         let target_min_capacity =
-            ((self.len + extra) * MAX_LOAD_FACTOR_DENOMINATOR + MAX_LOAD_FACTOR_NUMERATOR - 1)
-                / MAX_LOAD_FACTOR_NUMERATOR;
+            ((self.len + extra) * MAX_LOAD_FACTOR_DENOMINATOR).div_ceil(MAX_LOAD_FACTOR_NUMERATOR);
         while self.buckets.len() < target_min_capacity {
             self.grow();
         }
@@ -506,6 +505,7 @@ pub enum RobinHoodMode {
 }
 
 impl RobinHoodMode {
+    #[allow(dead_code)]
     fn count_col_name(self) -> &'static str {
         match self {
             RobinHoodMode::Partial => "partial_count",
@@ -1074,7 +1074,6 @@ mod tests {
         use arrow_array::{Int64Array, RecordBatch};
         use arrow_schema::{DataType, Field, Schema};
         use datafusion::datasource::MemTable;
-        use datafusion::physical_plan::ExecutionPlanProperties;
         use datafusion::prelude::SessionContext;
         use futures_util::TryStreamExt;
         use std::sync::Arc;

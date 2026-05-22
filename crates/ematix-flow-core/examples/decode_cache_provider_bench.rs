@@ -4,6 +4,7 @@
 //!   1. Run REPS reps of the query with cache OFF (baseline).
 //!   2. Install a process-wide RowGroupDecodeCache.
 //!   3. Run REPS reps with cache ON.
+//!
 //! Each rep uses a FRESH SessionContext + TableProvider — that's the
 //! workload pattern this cache is designed for (different queries,
 //! same data file).

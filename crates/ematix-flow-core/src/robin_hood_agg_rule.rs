@@ -108,7 +108,7 @@ impl PhysicalOptimizerRule for EnableRobinHoodAggregateRule {
                     partial.mode(),
                     AggregateMode::Final | AggregateMode::FinalPartitioned
                 ) {
-                    if let Some((col_idx, group_out_name, count_out_name)) =
+                    if let Some((_col_idx, group_out_name, count_out_name)) =
                         match_final_shape(partial)
                     {
                         // Walk down through pass-through nodes to find
@@ -221,7 +221,6 @@ mod tests {
     use datafusion::datasource::MemTable;
     use datafusion::execution::session_state::SessionStateBuilder;
     use datafusion::prelude::SessionContext;
-    use futures_util::TryStreamExt;
     use std::sync::Arc;
 
     /// Build a ctx with target_partitions=4 so DataFusion splits the

@@ -144,8 +144,9 @@ impl PlanCache {
 
     fn insert(&self, key: CacheKey, plan: Arc<dyn ExecutionPlan>) {
         let mut inner = self.inner.lock().unwrap();
-        if inner.entries.contains_key(&key) {
-            inner.entries.insert(key, plan);
+        if let std::collections::hash_map::Entry::Occupied(mut e) = inner.entries.entry(key.clone())
+        {
+            e.insert(plan);
             return;
         }
         if inner.entries.len() >= self.capacity {
