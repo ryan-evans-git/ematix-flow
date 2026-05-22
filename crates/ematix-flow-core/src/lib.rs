@@ -106,6 +106,37 @@ pub mod dict_aggregate;
 // AggregateExec(Partial)` on a dict group column + COUNT(*) into a
 // DictGroupCountExec. Speculative; non-matching plans pass through.
 pub mod dict_aggregate_rule;
+// Σ.K.2 (2026-05-21): query-shape-aware dict-arrival routing. Pre-
+// planning helper that walks a LogicalPlan and decides per-table
+// whether `with_dict_preservation(true)` is a net win, based on the
+// query's downstream operators (GROUP BY shape vs LIKE / multi-agg).
+// Lives outside the physical optimiser to avoid the LLVM-codegen
+// perturbation cost recorded in optimizer-codegen-sensitivity.
+pub mod dict_routing;
+// Σ.L.2 (2026-05-21): adaptive runtime workload feedback. Persists
+// per-shape probe outcomes + per-query observability (selectivity,
+// hash collision rate) to a SQLite file (~/.ematix/workload.db by
+// default). The optimiser consults this before speculating; after
+// ~100 queries on a workload, decisions converge and the probe runs
+// at most once per new shape.
+pub mod workload_log;
+// Σ.L.3 (2026-05-21): adaptive predicate reordering across row groups.
+// Tracks observed pass-rate per filter predicate after each row group;
+// reorders the remaining filter chain by ascending selectivity (cheapest
+// + most selective first). Cheap runtime adaptation; no plan rule, no
+// persistence — pure per-query state.
+pub mod adaptive_filter;
+// Σ.L.4 (2026-05-21): cross-query scan-cache framing. When two
+// concurrent queries scan the same (file, row_group, projection,
+// filter), they share a single decoded handle instead of decoding
+// twice. Scaffolding lands here; full scan-path integration is a
+// follow-up bite.
+pub mod scan_cache;
+// Σ.L.5 (2026-05-21): workload-aware parquet write tuning. Reads
+// Σ.L.2's workload.db, emits recommendations for row-group size,
+// sort keys, bloom columns, dict columns, and compression codec.
+// Scaffolding lands here; CLI + actual rewrite are follow-ups.
+pub mod write_tuner;
 pub mod hash;
 pub mod join;
 // Σ.E5 (2026-05-19): Photon-style vectorized LIKE pattern matcher
