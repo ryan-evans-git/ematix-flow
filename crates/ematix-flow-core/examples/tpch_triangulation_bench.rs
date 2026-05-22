@@ -27,6 +27,7 @@ use std::time::Instant;
 
 use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::prelude::{SessionConfig, SessionContext};
+use ematix_flow_core::dedupe_aggregate_rule::DedupeAggregateForFloatDeterminism;
 use ematix_flow_core::dict_aggregate_rule::EnableDictGroupCountRule;
 use ematix_flow_core::ematix_fast_parquet::EmatixFastParquetTableProvider;
 use ematix_flow_core::fast_parquet::FastParquetTableProvider;
@@ -261,13 +262,28 @@ async fn run_ematix_flow(data_dir: &Path, sql: &str) -> Trial {
 }
 
 async fn build_ematix_ctx(data_dir: &Path) -> Result<SessionContext, Box<dyn std::error::Error>> {
-    let state = SessionStateBuilder::new()
+    // EMAT_RULES env knob for A/B benching. Defaults to "all" (production
+    // configuration). Other values enable subsets for isolating which rule
+    // accounts for which slice of the geomean perf vs v0.4.0.
+    //   "all" / unset           — dedupe + dict + multi + sum
+    //   "none"                  — no flow rules, default DataFusion only
+    //   "v040"                  — dict + multi + sum (matches v0.4.0)
+    //   "dedupe"                — dedupe only
+    let rules = std::env::var("EMAT_RULES").unwrap_or_else(|_| "all".to_string());
+    let mut builder = SessionStateBuilder::new()
         .with_config(SessionConfig::new().with_target_partitions(14))
-        .with_default_features()
-        .with_physical_optimizer_rule(Arc::new(EnableDictGroupCountRule))
-        .with_physical_optimizer_rule(Arc::new(InjectFilterMultiAggRule))
-        .with_physical_optimizer_rule(Arc::new(InjectFilterSumRule))
-        .build();
+        .with_default_features();
+    if matches!(rules.as_str(), "all" | "dedupe") {
+        builder = builder
+            .with_physical_optimizer_rule(Arc::new(DedupeAggregateForFloatDeterminism::default()));
+    }
+    if matches!(rules.as_str(), "all" | "v040") {
+        builder = builder
+            .with_physical_optimizer_rule(Arc::new(EnableDictGroupCountRule))
+            .with_physical_optimizer_rule(Arc::new(InjectFilterMultiAggRule))
+            .with_physical_optimizer_rule(Arc::new(InjectFilterSumRule));
+    }
+    let state = builder.build();
     let ctx = SessionContext::new_with_state(state);
     for t in TPCH_TABLES {
         let path = data_dir

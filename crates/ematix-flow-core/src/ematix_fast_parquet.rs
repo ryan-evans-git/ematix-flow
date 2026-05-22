@@ -73,6 +73,16 @@ pub struct BridgeFilter {
 }
 
 impl BridgeFilter {
+    /// Constructor for tests + benches. Production callers go through
+    /// the predicate-collection pipeline in `merge_predicates_*` (see
+    /// line ~1086) so they get TPC-H-specific predicate merging.
+    pub fn new(predicates: Vec<ColumnPredicate>) -> Self {
+        Self {
+            predicates,
+            predicted_pass_rate: 0.5,
+        }
+    }
+
     /// Σ.E5 Phase 1.8: combined pass-rate estimate across all
     /// predicates (AND'd). `full_col_stats` is indexed by the
     /// PROVIDER's full schema column index (the same index space
@@ -177,8 +187,8 @@ impl BridgeFilter {
     pub fn build_bitmap(&self, path: &std::path::Path, rg: usize) -> DfResult<(Vec<u8>, usize)> {
         use crate::ematix_parquet_bridge::{
             filter_byte_array_to_bitmap, filter_byte_array_to_bitmap_dense,
-            filter_f64_column_to_bitmap_dense, filter_i32_column_to_bitmap,
-            filter_i32_column_to_bitmap_dense,
+            filter_f64_column_to_bitmap, filter_f64_column_to_bitmap_dense,
+            filter_i32_column_to_bitmap, filter_i32_column_to_bitmap_dense,
         };
         let mut combined: Option<(Vec<u8>, usize)> = None;
         for p in &self.predicates {
@@ -209,9 +219,28 @@ impl BridgeFilter {
                 }
                 ColumnPredicate::F64Range { col_idx, .. } => {
                     let pclone = p.clone();
-                    filter_f64_column_to_bitmap_dense(path, rg, *col_idx, move |v: f64| {
-                        pclone.eval_f64(v)
-                    })?
+                    // Σ.E6: try dict-fused first; fall back to dense
+                    // decode on PLAIN-only chunks (Err returned).
+                    match filter_f64_column_to_bitmap(path, rg, *col_idx, {
+                        let pc = pclone.clone();
+                        move |v: f64| pc.eval_f64(v)
+                    }) {
+                        Ok(r) => {
+                            if std::env::var("EMAT_F64_DICT_TRACE").is_ok() {
+                                eprintln!("[f64 dict-fused] col={col_idx} rg={rg} OK");
+                            }
+                            r
+                        }
+                        Err(e) => {
+                            if std::env::var("EMAT_F64_DICT_TRACE").is_ok() {
+                                eprintln!("[f64 dict-fused] col={col_idx} rg={rg} FALLBACK: {e}");
+                            }
+                            let pc2 = pclone.clone();
+                            filter_f64_column_to_bitmap_dense(path, rg, *col_idx, move |v: f64| {
+                                pc2.eval_f64(v)
+                            })?
+                        }
+                    }
                 }
                 ColumnPredicate::I32ColumnPair {
                     left_col,
@@ -625,6 +654,25 @@ fn clause_from_predicate(pred: &RangePredicate, expected_type: &DataType) -> Opt
     })
 }
 
+/// Σ.E6 — mirror of [`clause_from_predicate`] for F64 columns.
+/// Dormant: F64 pushdown is currently refused (see
+/// `predicate_from_expr` for the rationale). Kept available for the
+/// day we find a wins regime.
+#[allow(dead_code)]
+fn clause_from_predicate_f64(
+    pred: &RangePredicate,
+    expected_type: &DataType,
+) -> Option<F64RangeClause> {
+    let lit_f64: f64 = match (&pred.literal, expected_type) {
+        (ScalarValue::Float64(Some(v)), DataType::Float64) => *v,
+        _ => return None,
+    };
+    Some(F64RangeClause {
+        op: pred.op,
+        literal_f64: lit_f64,
+    })
+}
+
 /// Recognise a single-filter `Expr` and turn it into a
 /// `ColumnPredicate` if its shape is supported. Returns None when the
 /// filter isn't one of the supported shapes — the caller skips it
@@ -642,22 +690,17 @@ fn predicate_from_expr(expr: &Expr, full_schema: &Schema) -> Option<ColumnPredic
                 clauses: vec![clause],
             });
         }
-        // Σ.E5 #518 (verified 2026-05-19): F64Range pushdown is net
-        // negative — refused. The 22-query suite confirms:
-        //   - Q06 (3 f64+date filters, all in projection): +114% if
-        //     pushed. Bitmap-build decodes all 3 filter cols (which
-        //     are also projection cols), giving 2× decode work.
-        //   - Q19 (l_quantity range as ONE of 3 predicates):
-        //     unchanged. The string IN-list on l_shipmode/
-        //     l_shipinstruct alone delivers ~3% combined
-        //     selectivity, and FilterExec handles the l_quantity
-        //     bound on the filtered batch cheaply.
-        // The F64Range / F64RangeClause types remain (eval_f64
-        // implemented) for callers that explicitly build a
-        // BridgeFilter with this variant, but DataFusion's planner
-        // won't push f64 ranges through us. Re-enable when there's
-        // a way to know at planning time that the filter col is NOT
-        // in projection.
+        // F64Range pushdown stays refused. Σ.E6 (2026-05-22) re-
+        // tested with the dict-fused `filter_f64_column_to_bitmap`
+        // and confirmed the 2026-05-19 finding: TPC-H F64 filter
+        // columns (l_discount, l_quantity) are ALSO projection
+        // columns, so any pushdown forces a 2× decode that exceeds
+        // the saved FilterExec cost. Q06 SF=10 went 96 → 107 ms
+        // when pushdown was re-enabled, even with the dict-fused
+        // kernel. The dict-fused kernel + helper stay in place
+        // (`filter_f64_column_to_bitmap`) for callers that have
+        // already-decoded-columns scenarios. See
+        // `project_sigma_e6_rejected.md` for the rationale.
         if matches!(dt, DataType::Float64) {
             return None;
         }
@@ -1576,6 +1619,13 @@ impl EmatixFastParquetExec {
     pub fn projection(&self) -> &[usize] {
         &self.projection
     }
+
+    /// Σ.J.2.b.vi — backing parquet file path. Used by the
+    /// `EnableContextBloomRule` to compute the `<table>.<col>` uuid
+    /// (where `<table>` is the file basename without extension).
+    pub fn path(&self) -> &str {
+        &self.path
+    }
 }
 
 impl DisplayAs for EmatixFastParquetExec {
@@ -2106,6 +2156,15 @@ fn build_streaming_partition_stream(
                 .with_parallelism_budget(parallelism_budget);
             if let Some(f) = filter.clone() {
                 builder = builder.with_filter(f, path_buf.clone());
+            } else if let Some(cache) = crate::emat_arrow_reader::process_rg_decode_cache() {
+                // Σ.O.c.2 — wire process-wide RG decode cache (off by
+                // default; opt-in via `EMAT_RG_DECODE_CACHE=1`). Only
+                // attached when no filter is set; filter outputs are
+                // mask-specific and not safely shareable. `with_path`
+                // is required so the cache key is file-scoped.
+                builder = builder
+                    .with_path(path_buf.clone())
+                    .with_rg_decode_cache(cache);
             }
             let reader = match builder.build() {
                 Ok(r) => r,
