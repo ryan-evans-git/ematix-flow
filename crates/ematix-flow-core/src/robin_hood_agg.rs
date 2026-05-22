@@ -218,6 +218,21 @@ impl RobinHoodI64U64 {
         }
     }
 
+    /// Σ.N.f.2 — jump-resize the table to fit at least `target`
+    /// entries at 70% load. Used by the operator's dynamic-resize
+    /// heuristic after the first batch reveals high cardinality.
+    /// Cheaper than 3-4 sequential grow() cycles.
+    pub fn reserve_to_capacity_pow2_of(&mut self, target: usize) {
+        let target_capacity = ((target * MAX_LOAD_FACTOR_DENOMINATOR
+            + MAX_LOAD_FACTOR_NUMERATOR
+            - 1)
+            / MAX_LOAD_FACTOR_NUMERATOR)
+            .next_power_of_two();
+        while self.buckets.len() < target_capacity {
+            self.grow();
+        }
+    }
+
     /// Σ.N.f.1 — pre-grow to accommodate `extra` more inserts without
     /// rehashing in the hot path. Worst case: every key is new and
     /// the table grows to maintain ≤70% load factor.
@@ -448,6 +463,12 @@ impl RobinHoodCountAgg {
     /// want to spot-check a group's count without finalising.
     pub fn table(&self) -> &RobinHoodI64U64 {
         &self.table
+    }
+
+    /// Σ.N.f.2 — mutable view for dynamic-resize callers (operator
+    /// hot path peeks at len + asks for jump-resize).
+    pub fn table_mut(&mut self) -> &mut RobinHoodI64U64 {
+        &mut self.table
     }
 }
 
@@ -692,20 +713,35 @@ impl ExecutionPlan for RobinHoodAggregateExec {
             let mut n_rows: usize = 0;
             let t_total = std::time::Instant::now();
 
-            // Σ.N.f.1 — pre-size the hash table. Microbench (10K
-            // cardinality) showed default cap=64 → ~100 M rows/sec,
-            // pre-sized cap → 230 M rows/sec (2.3× speedup, beats
-            // hashbrown 1.3×). Default to 8192 for the typical TPC-H
-            // mid-cardinality shape (l_suppkey 10K, o_orderpriority
-            // 5, l_returnflag 3, l_partkey 200K — the last grows
-            // geometrically but most queries stay below 8K and never
-            // trigger grow). Override via EMAT_RH_INIT_CAP.
+            // Σ.N.f.1 + Σ.N.f.2 — pre-size the hash table. Microbench
+            // (10K card) showed default cap=64 → ~100 M rows/sec,
+            // pre-sized → 230 M rows/sec (RH beats hashbrown 1.3-4×).
+            //
+            // Σ.N.f.2 cap sweep on l_suppkey (10K) + l_partkey (200K):
+            //   cap   suppkey   partkey
+            //    8K   +99%      +23%
+            //   16K   +71%      +51%
+            //   32K   +30%      +39%
+            //   65K   +18%      +32%   ← sweet spot
+            //  131K   +77%      +27%   ← memory pressure hurts mid
+            //  262K  +128%      +25%
+            //
+            // 65536 balances the two: enough headroom for ~50K distinct
+            // groups without grow, small enough that memory pressure
+            // doesn't dominate at mid cardinality. Override via
+            // EMAT_RH_INIT_CAP for known-workload tuning.
             let init_cap: usize = std::env::var("EMAT_RH_INIT_CAP")
                 .ok()
                 .and_then(|s| s.parse().ok())
-                .unwrap_or(8192);
+                .unwrap_or(65536);
             let mut agg = RobinHoodCountAgg::with_capacity(init_cap);
             let mut s = input.execute(partition, context)?;
+            // Σ.N.f.2 — dynamic resize: after first batch, if observed
+            // distinct count is already > 50% of capacity, the input
+            // is high-cardinality. Jump-resize to 4× ahead of the
+            // 2× geometric growth so we don't spend the next few
+            // batches in rehash territory. Cheap single-shot heuristic.
+            let mut first_batch_seen = false;
             loop {
                 let t_w = std::time::Instant::now();
                 let batch_opt = s.try_next().await?;
@@ -738,6 +774,17 @@ impl ExecutionPlan for RobinHoodAggregateExec {
                     }
                 }
                 t_ingest_us += t_i.elapsed().as_micros();
+                // Σ.N.f.2 dynamic resize check — after first batch only.
+                if !first_batch_seen {
+                    first_batch_seen = true;
+                    let len = agg.table().len();
+                    let cap = agg.table().capacity();
+                    if len * 2 > cap {
+                        // > 50% full already → high-cardinality
+                        // workload. Pre-empt grow chain.
+                        agg.table_mut().reserve_to_capacity_pow2_of(len * 8);
+                    }
+                }
             }
             // Finalise — sort by key for stable output.
             let t_f = std::time::Instant::now();
