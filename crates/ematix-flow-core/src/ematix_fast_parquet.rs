@@ -1629,7 +1629,43 @@ impl TableProvider for EmatixFastParquetTableProvider {
                 // shape (3 preds, ~2% pass) showed 0.64× wall-time
                 // (35% win); see `adaptive_filter_q06_gate` example.
                 let mut bf = bf.with_predicted_pass_rate(p);
-                if bf.predicates().len() >= 2 {
+                // Σ.L.3.c — adaptive reordering is opt-in via env after
+                // bench A/B (2026-05-22): default-on regressed geomean
+                // by 16.8% vs v0.4.0 baseline (Q22 +2.94×, Q06 +1.52×,
+                // Q07/Q10/Q17/Q18 +25-32%). Tight 5% gate recovered
+                // geomean but still regressed Q06 by 12%. The kernel
+                // bench (0.64× on isolated build_bitmap_sequential)
+                // didn't predict wall-time outcomes: at SF=1, sequential
+                // serial decode loses to parallel-AND because (a)
+                // single-threaded predicate eval starves downstream
+                // 14-partition Aggregate, (b) decode is microseconds
+                // per column already, (c) masked-decode per-row branch
+                // cost > saved row work above ~5% mask density.
+                //
+                // The lever stays in the codebase (kernel + dispatch
+                // wired) for workloads where it CAN win: SF=10+, wide
+                // tables, very-selective (<0.1%) filters, slow-decode
+                // codecs. Σ.L.3.d ("parallel masked-AND with short-
+                // circuit") is the proper fix that captures the benefit
+                // without serialising decode — deferred.
+                //
+                // Set `EMAT_ADAPTIVE_REORDER=1` to opt back in. Set
+                // `EMAT_ADAPTIVE_REORDER_TRACE=1` to log when installed.
+                let adaptive_enabled = std::env::var("EMAT_ADAPTIVE_REORDER")
+                    .ok()
+                    .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                    .unwrap_or(false);
+                if adaptive_enabled
+                    && bf.predicates().len() >= 2
+                    && bf.predicted_pass_rate() <= 0.05
+                {
+                    if std::env::var("EMAT_ADAPTIVE_REORDER_TRACE").is_ok() {
+                        eprintln!(
+                            "[adaptive] install: preds={} pass_rate={:.4}",
+                            bf.predicates().len(),
+                            bf.predicted_pass_rate()
+                        );
+                    }
                     bf = bf.with_adaptive_reordering();
                 }
                 bf
