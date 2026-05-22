@@ -10,6 +10,7 @@ use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::prelude::{SessionConfig, SessionContext};
 use ematix_flow_core::ematix_fast_parquet::EmatixFastParquetTableProvider;
 use ematix_flow_core::fast_parquet::FastParquetTableProvider;
+use ematix_flow_core::dedupe_aggregate_rule::DedupeAggregateForFloatDeterminism;
 use ematix_flow_core::dict_aggregate_rule::EnableDictGroupCountRule;
 use ematix_flow_core::fused_aggregate_filter_multi_agg_rule::InjectFilterMultiAggRule;
 use ematix_flow_core::fused_aggregate_filter_sum_rule::InjectFilterSumRule;
@@ -26,7 +27,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let mode = std::env::var("Q21_MODE").unwrap_or_else(|_| "all".to_string());
-    println!("Q21_MODE = {mode}  (none / dict / multi / sum / all)");
+    println!("Q21_MODE = {mode}  (none / dict / multi / sum / dedupe / all)");
     let partitions: usize = std::env::var("PARTITIONS")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -35,6 +36,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut builder = SessionStateBuilder::new()
         .with_config(SessionConfig::new().with_target_partitions(partitions))
         .with_default_features();
+    // Dedupe FIRST — converts duplicated Final+Partial pairs to Single
+    // before InjectFilterMultiAggRule / InjectFilterSumRule can consume
+    // one side of the pair and leave the other as the parallel-SUM
+    // source of f64 non-determinism (Q15).
+    if matches!(mode.as_str(), "dedupe" | "all") {
+        builder =
+            builder.with_physical_optimizer_rule(Arc::new(DedupeAggregateForFloatDeterminism));
+    }
     if matches!(mode.as_str(), "dict" | "all") {
         builder = builder.with_physical_optimizer_rule(Arc::new(EnableDictGroupCountRule));
     }

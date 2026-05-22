@@ -27,6 +27,7 @@ use std::time::Instant;
 
 use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::prelude::{SessionConfig, SessionContext};
+use ematix_flow_core::dedupe_aggregate_rule::DedupeAggregateForFloatDeterminism;
 use ematix_flow_core::dict_aggregate_rule::EnableDictGroupCountRule;
 use ematix_flow_core::ematix_fast_parquet::EmatixFastParquetTableProvider;
 use ematix_flow_core::fast_parquet::FastParquetTableProvider;
@@ -264,6 +265,14 @@ async fn build_ematix_ctx(data_dir: &Path) -> Result<SessionContext, Box<dyn std
     let state = SessionStateBuilder::new()
         .with_config(SessionConfig::new().with_target_partitions(14))
         .with_default_features()
+        // Dedupe FIRST — converts duplicated Final+Partial pairs to
+        // Single + Sort+CoalescePartitions on the input, so the f64
+        // SUM accumulates in a deterministic order. Must run before
+        // InjectFilterMultiAggRule / InjectFilterSumRule, which would
+        // otherwise consume one side of the pair (FusedAggregateExec)
+        // and leave the other as a parallel-SUM source of ULP-level
+        // non-determinism. Fixes TPC-H Q15's 0/1-row flake.
+        .with_physical_optimizer_rule(Arc::new(DedupeAggregateForFloatDeterminism))
         .with_physical_optimizer_rule(Arc::new(EnableDictGroupCountRule))
         .with_physical_optimizer_rule(Arc::new(InjectFilterMultiAggRule))
         .with_physical_optimizer_rule(Arc::new(InjectFilterSumRule))
