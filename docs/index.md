@@ -1,18 +1,19 @@
 # ematix-flow
 
 **Move data between databases, files, and streams from Python.
-5.87× faster than PySpark. No JVM needed.**
+13.4× faster than PySpark. No JVM needed.**
 
 ematix-flow is a Python library for moving data between
-databases (Postgres, MySQL, SQLite, DuckDB), files (Parquet,
-CSV, JSON, ORC, Delta Lake — local disk or S3), and streaming
-sources (Kafka, Pub/Sub, Kinesis, RabbitMQ). Declare a target
+databases (Postgres, MySQL, SQLite, DuckDB), cloud warehouses
+(Snowflake, BigQuery, Redshift), files (Parquet, CSV, JSON, ORC,
+Delta Lake — local disk or S3), and streaming sources (Kafka,
+Pub/Sub, Kinesis, RabbitMQ). Declare a target
 table and a load strategy — append, merge, or slowly-changing
 dimension — and the Rust + Apache Arrow engine handles
 correctness: schema evolution, watermarks, at-least-once
 delivery, change-data-capture.
 
-The 5.87× headline is geomean across all 22 TPC-H queries at
+The 13.4× headline is geomean across all 22 TPC-H queries at
 SF=1 — no cluster, no scheduler, one `pip install`.
 
 ## Where to start

@@ -26,7 +26,8 @@
 //! - **Plan shape**: Projection → AggregateExec(Final) → CoalescePartitions
 //!   → AggregateExec(Partial) → FilterExec → scan (the standard
 //!   DataFusion plan for the SQL above). The exec stack is matched via
-//!   the shared `match_aggregate_query_shape` walker.
+//!   the Σ.F catalog shape `filter_sum_shape()` (Σ.F.2 retired the prior
+//!   bespoke walker).
 //!
 //! Anything else (group-by, multi-aggregate, SUM-of-product-of-three,
 //! BoolExpr branches, sub-queries) makes the rule no-op so DataFusion's
@@ -71,6 +72,49 @@ use datafusion::physical_plan::filter::FilterExec;
 use crate::fused_aggregate_exec::FusedAggregateExec;
 use crate::fused_aggregate_filter_sum::FilterSumSpec;
 use crate::fused_jit::{AggExpr, Clause, ClauseOp, ColumnTy, FusedFilterAggSpec};
+use crate::shape_catalog::{
+    AggMode, Shape, aggregate, any_capture, coalesce_partitions, optional, projection,
+    wrap_top_for_limit_and_sort,
+};
+use datafusion::physical_plan::aggregates::AggregateExec;
+use datafusion::physical_plan::projection::ProjectionExec;
+
+/// Σ.F catalog entry for the FilterSum shape:
+/// `Projection > Aggregate(Final, gby=0, aggs=1) >
+/// [opt CoalescePartitions] > Aggregate(Partial, gby=0, aggs=1) > Any(body)`.
+/// Captures the per-node references the rewriter needs by name.
+fn filter_sum_shape() -> Shape {
+    // The Partial agg + body subtree appears twice (with and without
+    // an intervening CoalescePartitions). DataFusion elides the
+    // CoalescePartitions when the input is already single-partition.
+    let partial_then_body = || {
+        aggregate(
+            Some("partial_agg"),
+            AggMode::Partial,
+            Some(0),
+            Some(1),
+            vec![any_capture("body")],
+        )
+    };
+    let core = projection(
+        Some("top_projection"),
+        vec![aggregate(
+            Some("final_agg"),
+            AggMode::Final,
+            Some(0),
+            Some(1),
+            vec![optional(
+                coalesce_partitions(None, vec![partial_then_body()]),
+                partial_then_body(),
+            )],
+        )],
+    );
+    // Σ.I.1: also accept the optional top-of-plan wrappers DataFusion
+    // emits for ORDER BY / LIMIT (covers ClickBench-shaped queries
+    // that wrap the FilterSum body in a SortExec(TopK) or
+    // GlobalLimitExec).
+    wrap_top_for_limit_and_sort(core)
+}
 
 /// SQL-pattern injection rule for the generic FilterSum shape. See
 /// module-level docs.
@@ -107,37 +151,42 @@ impl PhysicalOptimizerRule for InjectFilterSumRule {
 fn try_match_filter_sum_plan(
     node: &Arc<dyn ExecutionPlan>,
 ) -> DfResult<Option<Arc<dyn ExecutionPlan>>> {
-    // Plan-tree shape: Projection → Final agg → Coalesce → Partial agg → body.
-    let cfg = crate::fused_jit_rule::AggregateShapeConfig {
-        expect_top_sort: false,
-        expect_top_projection: true,
-        expect_final_mode: crate::fused_jit_rule::FinalAggMode::Final,
-        expect_group_by_count: 0,
-        expect_agg_count: 1,
-        expect_cse_projection: false,
-    };
-    let Some(shape) = crate::fused_jit_rule::match_aggregate_query_shape(node, &cfg)? else {
+    // Σ.F catalog match. Plan-tree shape:
+    //   Projection → Aggregate(Final, gby=0, aggs=1)
+    //     → [opt CoalescePartitions]
+    //       → Aggregate(Partial, gby=0, aggs=1) → body.
+    let Some(matched) = filter_sum_shape().try_match(node) else {
         return Ok(None);
     };
+    let top_proj = matched
+        .get("top_projection")
+        .and_then(|p| p.as_any().downcast_ref::<ProjectionExec>())
+        .expect("filter_sum_shape captures top_projection as ProjectionExec");
+    let final_agg = matched
+        .get("final_agg")
+        .and_then(|p| p.as_any().downcast_ref::<AggregateExec>())
+        .expect("filter_sum_shape captures final_agg as AggregateExec");
+    let partial_agg = matched
+        .get("partial_agg")
+        .and_then(|p| p.as_any().downcast_ref::<AggregateExec>())
+        .expect("filter_sum_shape captures partial_agg as AggregateExec");
+    let body = matched
+        .get("body")
+        .expect("filter_sum_shape captures body")
+        .clone();
 
     // Output column name = projection's first (only) field. Propagates
-    // the user's SQL alias to the FilterSumSpec output schema. Aggregate
-    // shapes that don't produce a single output field are excluded by
-    // the `expect_agg_count: 1` config above.
-    let proj = shape
-        .top_projection
-        .as_ref()
-        .expect("config requires top projection");
-    let output_name = proj.schema().field(0).name().to_string();
+    // the user's SQL alias to the FilterSumSpec output schema.
+    let output_name = top_proj.schema().field(0).name().to_string();
 
     // Aggregate: SUM(col) or SUM(col_a * col_b). Partial + final must
     // describe the same shape (DataFusion's two-stage SUM splits keep
     // the inner expression identical between modes, but a mismatch is
     // either a planner bug or a non-SUM-shape we shouldn't touch).
-    let Some(agg) = extract_filter_sum_aggregate(&shape.final_agg.aggr_expr()[0]) else {
+    let Some(agg) = extract_filter_sum_aggregate(&final_agg.aggr_expr()[0]) else {
         return Ok(None);
     };
-    let Some(agg_partial) = extract_filter_sum_aggregate(&shape.partial_agg.aggr_expr()[0]) else {
+    let Some(agg_partial) = extract_filter_sum_aggregate(&partial_agg.aggr_expr()[0]) else {
         return Ok(None);
     };
     if !agg_shapes_equal(&agg, &agg_partial) {
@@ -145,7 +194,7 @@ fn try_match_filter_sum_plan(
     }
 
     // Body: FilterExec with AND-chain of (col ⊕ literal) leaves.
-    let Some(filter) = shape.body.as_any().downcast_ref::<FilterExec>() else {
+    let Some(filter) = body.as_any().downcast_ref::<FilterExec>() else {
         return Ok(None);
     };
     let Some(clauses) = extract_filter_sum_clauses(filter.predicate()) else {

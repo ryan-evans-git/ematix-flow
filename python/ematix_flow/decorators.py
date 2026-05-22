@@ -1106,12 +1106,77 @@ class _EmatixNamespace:
             column_map=column_map,
         )
 
+    def workflow(
+        self,
+        *,
+        name: str,
+        jobs: list[str],
+        triggered_by: list[str] | None = None,
+        schedule: str | None = None,
+        timezone: str | None = None,
+        on_message: Any = None,
+        # v0.7.0 hard-break sentinel — old callers passing the v0.6.0
+        # dict-keyed depends_on get a clear error from register_workflow.
+        depends_on: Any = None,
+    ):
+        """Declare a named workflow grouping its member jobs + the trigger
+        conditions that fire it (v0.7.0 model).
+
+        ``jobs=`` is the list of member job names. The internal DAG between
+        jobs is declared on each job
+        (``@ematix.job(..., depends_on=[upstream_job, ...])``); the workflow
+        itself only declares WHEN to fire.
+
+        Trigger kwargs — AND-conjunction. At least one required unless the
+        workflow includes a streaming pipeline (in which case it's implicitly
+        streaming and these are not allowed):
+
+        - ``triggered_by=[name, ...]`` — workflow or job names that must
+          have succeeded since this workflow last succeeded.
+        - ``schedule="cron"`` — next cron tick after last self-run must reach.
+        - ``timezone="IANA"`` — cron interpretation tz.
+        - ``on_message=<source>`` — per-message firing; exclusive with the
+          above.
+
+        Example::
+
+            @ematix.job(name="extract_orders", target=OrdersTable,
+                        mode="merge", keys=("order_id",))
+            def extract_orders(conn): return "SELECT ..."
+
+            @ematix.job(name="enrich_orders", target=OrdersEnriched,
+                        mode="merge", keys=("order_id",),
+                        depends_on=["extract_orders"])
+            def enrich_orders(conn): return "SELECT ..."
+
+            ematix.workflow(
+                name="orders_etl",
+                triggered_by=["upstream_workflow"],
+                schedule="0 21 * * *",
+                timezone="America/New_York",
+                jobs=["extract_orders", "enrich_orders"],
+            )
+        """
+        from ematix_flow.pipeline import register_workflow
+        return register_workflow(
+            name=name,
+            jobs=jobs,
+            triggered_by=triggered_by,
+            schedule=schedule,
+            timezone=timezone,
+            on_message=on_message,
+            depends_on=depends_on,
+        )
+
     def pipeline(
         self,
         *,
         target: type[ManagedTable] | None = None,
         targets: list[Target] | None = None,
-        schedule: str | None,
+        # v0.7.0: schedule is now optional on @ematix.job, since workflow
+        # members get their fire timing from the parent workflow. Standalone
+        # jobs (not in any workflow) still need it.
+        schedule: str | None = None,
         mode: str | None = None,
         name: str | None = None,
         source_connection: str | None = None,
@@ -1139,6 +1204,10 @@ class _EmatixNamespace:
         #    "base_secs": M, "max_backoff_secs": K}
         # See pipeline.RetryPolicy for field semantics.
         retry: dict | None = None,
+        # Task #558 — IANA tz the cron expression should be interpreted
+        # in (e.g. "America/New_York"). The Web UI also picks this up
+        # to localise the "Next run" rendering.
+        timezone: str | None = None,
     ):
         """Function decorator. Wraps `pipeline.sync` and registers via the
         Phase 12 scheduling registry.
@@ -1403,11 +1472,17 @@ class _EmatixNamespace:
                 depends_on=depends_on,
                 upstream_freshness_secs=upstream_freshness_secs,
                 retry=retry,
+                timezone=timezone,
             )(wrapped)
 
             return wrapped
 
         return decorate
+
+    # `@ematix.job` is the new primary name for what used to be
+    # `@ematix.pipeline`. Both work; new code should prefer `.job` to
+    # match the workflow/job terminology the UI uses.
+    job = pipeline
 
     def table(
         self,
@@ -1606,6 +1681,44 @@ class _EmatixNamespace:
             return wrapped
 
         return decorate
+
+    def warehouse_pipeline(
+        self,
+        *,
+        source: Any,
+        target: Any,
+        schedule: str | None,
+        name: str | None = None,
+        depends_on: list[str] | None = None,
+        upstream_freshness_secs: int | None = None,
+        retry: dict | None = None,
+    ):
+        """Phase 2d slice 1: register a warehouse-to-warehouse pipeline
+        for scheduling.
+
+        ``source`` and ``target`` must be a
+        :class:`~ematix_flow.warehouses.WarehouseSource` /
+        :class:`~ematix_flow.warehouses.WarehouseTarget` respectively.
+        The wrapped function runs once per schedule tick, executes
+        :func:`~ematix_flow.warehouses.run_warehouse_pipeline`, and
+        records a JSON-serializable summary to the configured RunLog.
+
+        See :mod:`ematix_flow.warehouse_pipeline` for full surface
+        documentation.
+        """
+        # Lazy import so the warehouses + decorator module pair don't
+        # form an import-time cycle.
+        from ematix_flow.warehouse_pipeline import warehouse_pipeline as _wp
+
+        return _wp(
+            source=source,
+            target=target,
+            schedule=schedule,
+            name=name,
+            depends_on=depends_on,
+            upstream_freshness_secs=upstream_freshness_secs,
+            retry=retry,
+        )
 
     @staticmethod
     def connection(cls: type) -> Any:

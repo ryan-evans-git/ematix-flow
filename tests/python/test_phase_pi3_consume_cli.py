@@ -72,7 +72,7 @@ def test_consume_renders_toml_and_runs(monkeypatch, capsys) -> None:
 
     captured: dict[str, Any] = {}
 
-    def fake_run_pipeline(*, config_str: str, metrics_port: int | None = None):
+    def fake_run_pipeline(*, config_str: str, metrics_port: int | None = None, **_):
         captured["config_str"] = config_str
         captured["metrics_port"] = metrics_port
         return {"total_rows": 0, "iterations": 0, "shutdown_triggered": False}
@@ -100,7 +100,7 @@ def test_consume_passes_metrics_port(monkeypatch) -> None:
     _register_kafka_to_sqlite()
     captured: dict[str, Any] = {}
 
-    def fake_run_pipeline(*, config_str: str, metrics_port: int | None = None):
+    def fake_run_pipeline(*, config_str: str, metrics_port: int | None = None, **_):
         captured["metrics_port"] = metrics_port
         return {"total_rows": 0, "iterations": 0, "shutdown_triggered": False}
 

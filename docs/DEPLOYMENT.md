@@ -424,6 +424,256 @@ daemon, then remove the cron entry once you're satisfied.
 
 ---
 
+## Recipe 9 — Distributed mesh with peer auto-detection
+
+When the workload outgrows a single process, ematix-flow can fan
+queries out across a peer mesh of `flow-worker` processes via Apache
+Arrow Flight.
+
+### Engine modes
+
+| `engine` | Behavior |
+|---|---|
+| `"single"` *(alias of `"datafusion"`)* | Always in-process. Specifying `peers` is rejected (clear pointer to use `"auto"` or `"distributed"`). |
+| `"distributed"` | Always peer-distributed. Requires `peers = [...]`. Window/join transforms are rejected — not yet supported. |
+| **`"auto"` *(default when `engine` is absent)*** | Try distributed if peers expand to ≥1 URL at startup AND no window/join is configured; otherwise fall back to in-process. The choice is logged at `info!` level so operators can verify which path was taken. |
+
+`engine = "auto"` is the default starting in Phase 3.5. Existing
+configs that didn't specify `engine` previously defaulted to
+`"datafusion"`; with the new default they behave **identically** as
+long as they had no `peers` block (which earlier validation rejected
+anyway, so this is a no-op for every shipped config).
+
+Each peer URL in the `peers` list can be one of three shapes — mix
+freely:
+
+| Scheme | Example | When to use |
+| --- | --- | --- |
+| `http://host:port` | `http://flow-01.local:50051` | Fixed-membership clusters, dev meshes, anything where pod IPs are stable. |
+| `dns://host:port` | `dns://flow-workers.flow.svc.cluster.local:50051` | Any DNS-driven registry — K8s headless services, Consul DNS, AWS Cloud Map, on-prem DNS round-robin. Resolves the A records once at backend open. |
+| `k8s://service.namespace:port` | `k8s://flow-workers.flow:50051` | Sugar for the `dns://` form targeting `*.svc.cluster.local`. Lets one line replace a 50-pod list. |
+
+### K8s headless service example
+
+```yaml
+# Service: headless so each pod gets its own A record.
+apiVersion: v1
+kind: Service
+metadata:
+  name: flow-workers
+  namespace: flow
+spec:
+  clusterIP: None            # headless — exposes per-pod A records
+  selector: { app: flow-worker }
+  ports:
+    - name: grpc
+      port: 50051
+      targetPort: 50051
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata: { name: flow-worker, namespace: flow }
+spec:
+  serviceName: flow-workers
+  replicas: 5
+  selector: { matchLabels: { app: flow-worker } }
+  template:
+    metadata: { labels: { app: flow-worker } }
+    spec:
+      containers:
+        - name: flow-worker
+          image: my-registry/flow:latest
+          command: ["flow-worker"]
+          args:  ["--bind=0.0.0.0:50051"]
+          ports: [{ containerPort: 50051, name: grpc }]
+```
+
+Coordinator config (anywhere — same cluster, another K8s ns, or
+outside K8s entirely as long as the DNS resolves):
+
+```toml
+# pipeline.toml
+[engine]
+kind = "distributed"
+peers = ["k8s://flow-workers.flow:50051"]
+```
+
+`flow run pipeline.toml` resolves `flow-workers.flow.svc.cluster.local`
+at start-up, fans out across whatever pods are alive at that
+moment, and the Flight mesh balances work.
+
+### Refresh semantics
+
+DNS resolution happens **once** when the backend opens. If pods
+churn (scale event, rolling restart), the SessionContext won't
+re-resolve until the process restarts or rebuilds the backend.
+For batch-job-style usage (Kubernetes Jobs, cron, `flow scheduler`
+launches) this is fine — every invocation gets a fresh peer list.
+Long-lived coordinator processes that need to track autoscaling
+events should run on a restart-on-config-change loop today;
+periodic refresh is a Phase 3b follow-up.
+
+### Diagnostic
+
+Bad peer entries surface at `flow run` startup with a clear
+quoted-entry error:
+
+```
+$ flow run pipeline.toml
+Error: peer #1 ("k8s://flow-workers.flow"): missing port in
+"flow-workers.flow" (expected host:port)
+```
+
+---
+
+## Recipe 10 — Kafka + AWS Glue Schema Registry
+
+Kafka topics carrying Avro payloads, with schemas stored in AWS Glue
+Schema Registry instead of Confluent. The Rust Kafka backend
+dispatches the wire framing (0x03 + 16-byte UUID + 1-byte codec
+prefix) based on a single Python config switch.
+
+**When to use:** you're on AWS and already use Glue for other
+purposes; you want IAM-based access control on schemas instead of
+running a separate Confluent SR cluster.
+
+### Quickstart with LocalStack (dev/test)
+
+```sh
+# 1. Start LocalStack with Glue enabled.
+docker compose -f examples/glue-localstack/docker-compose.yml up -d
+
+# 2. Tell the SDK where to point.
+export AWS_ENDPOINT_URL_GLUE=http://localhost:4566
+export AWS_ACCESS_KEY_ID=test
+export AWS_SECRET_ACCESS_KEY=test
+export AWS_DEFAULT_REGION=us-east-1
+
+# 3. Run the gated integration tests.
+export EMATIX_FLOW_LOCALSTACK_ENDPOINT=http://localhost:4566
+pytest tests/python/integration/test_glue_localstack.py -v
+```
+
+### Production wiring
+
+Two halves, both Python-side:
+
+**A. Declare the connection** (in your pipeline module):
+
+```python
+from ematix_flow.connections import (
+    GlueSchemaRegistryConnection, KafkaConnection,
+)
+
+glue = GlueSchemaRegistryConnection(
+    name="prod_glue",
+    registry_name="orders-events",        # Glue registry you've created
+    region="us-east-1",
+    # Auth options, in priority order:
+    # 1. aws_profile="prod-glue"          (dev / SSO)
+    # 2. aws_access_key_id + aws_secret_access_key   (CI; discouraged)
+    # 3. omit both — boto3 default chain (EC2 IMDS / EKS pod identity)
+)
+
+orders = KafkaConnection(
+    name="orders",
+    bootstrap_servers="${KAFKA_BOOTSTRAP}",
+    group_id="ematix-orders",
+    payload_format="avro",                # required for Glue
+    schema_registry=glue,                 # accepts Glue or Confluent
+)
+```
+
+**B. Register the lookup callback** at process startup (typically in
+your `flow run`-style entrypoint or pipeline module's top level):
+
+```python
+from ematix_flow.glue_schema_registry import (
+    register_glue_schema_lookup_callback,
+)
+
+register_glue_schema_lookup_callback(glue)
+```
+
+That single call wires *both* the consumer-side schema fetch (by
+UUID, called from the Rust Kafka backend on each Glue-framed message)
+and the producer-side schema lookup (by name, called on first send
+to learn the latest UUID to embed). The Rust side caches the result
+per-process — a hot topic only pays the boto3 round-trip once per
+schema version.
+
+### Pre-registering schemas (producer-only)
+
+If your pipeline *produces* into a Glue-framed topic, the schema must
+exist in Glue before the first send. Either register it manually via
+the AWS Console, or do it in pipeline init:
+
+```python
+from ematix_flow.glue_schema_registry import register_schema
+
+register_schema(
+    glue,
+    schema_name="Order",       # convention: same as topic name
+    data_format="AVRO",
+    schema_definition='''{
+        "type": "record",
+        "name": "Order",
+        "fields": [
+            {"name": "id", "type": "long"},
+            {"name": "amount", "type": "double"}
+        ]
+    }''',
+    compatibility="BACKWARD",
+)
+```
+
+Subsequent calls on schema evolution (add an optional field, etc.)
+land as new versions; the producer picks the latest automatically.
+
+### IAM policy (production)
+
+The IAM principal the worker runs as needs at minimum:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "glue:GetSchemaVersion",
+        "glue:RegisterSchemaVersion",
+        "glue:CreateSchema",
+        "glue:ListSchemaVersions"
+      ],
+      "Resource": [
+        "arn:aws:glue:us-east-1:*:registry/orders-events",
+        "arn:aws:glue:us-east-1:*:schema/orders-events/*"
+      ]
+    }
+  ]
+}
+```
+
+Consumers can drop `RegisterSchemaVersion` / `CreateSchema`;
+producers can drop `ListSchemaVersions` (used only by the
+default-version-by-name lookup).
+
+### Pitfalls
+
+- **`payload_format` must be `"avro"`.** The connection construction
+  rejects `json` or `raw_bytes` because Glue's wire frame would have
+  nowhere to live in those formats.
+- **First producer send pays a network round-trip** to Glue. If you
+  have a tight latency budget on cold-start, call `register_schema`
+  in init so the next `fetch_schema_by_name` is a no-op.
+- **Schema evolution is opt-in.** The producer caches the UUID it
+  resolved on first send for the process lifetime; if you publish a
+  new schema version while the worker is running, restart the worker
+  to pick it up.
+
+---
+
 ## Observability cheat sheet
 
 ### Alerters

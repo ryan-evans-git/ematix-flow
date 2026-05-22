@@ -30,6 +30,7 @@ tokio-postgres.workspace = true
 deadpool-postgres.workspace = true
 uuid.workspace = true
 futures-util.workspace = true
+flate2.workspace = true
 bytes.workspace = true
 async-trait = "0.1"
 # Π.4a: CsvReadOptions.null_regex compiles to a regex::Regex which
@@ -61,9 +62,9 @@ object_store = { workspace = true }
 # to produce Arrow arrays from column chunks without going through
 # parquet-rs's ParquetRecordBatchReader. Long-term: alternate backend
 # for FastParquetExec.
-ematix-parquet-codec = "0.12"
-ematix-parquet-format = "0.12"
-ematix-parquet-io = "0.12"
+ematix-parquet-codec = "0.13"
+ematix-parquet-format = "0.13"
+ematix-parquet-io = "0.13"
 deltalake = { workspace = true }
 datafusion = { workspace = true }
 cranelift = { workspace = true }

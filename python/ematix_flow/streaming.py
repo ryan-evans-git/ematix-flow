@@ -63,6 +63,7 @@ from ematix_flow.connections import (
     DeltaLocalConnection,
     DeltaS3Connection,
     DuckDBConnection,
+    GlueSchemaRegistryConnection,
     KafkaConnection,
     KinesisConnection,
     MySQLConnection,
@@ -572,6 +573,8 @@ def run_pipeline(
     config: str | os.PathLike[str] | None = None,
     config_str: str | None = None,
     metrics_port: int | None = None,
+    pipeline_name: str | None = None,
+    run_log_url: str | None = None,
 ) -> PipelineMetrics:
     """Run a streaming pipeline from a TOML config (string or path).
 
@@ -579,6 +582,17 @@ def run_pipeline(
     contents) must be provided. Returns a dict with
     ``total_rows``, ``iterations``, and ``shutdown_triggered``.
     Blocks until SIGTERM / SIGINT or clean exit.
+
+    Opt-in observability (v0.5.0): when ``run_log_url`` is set (or
+    the ``EMATIX_FLOW_RUN_LOG_URL`` env var is set), a streaming
+    RunRecord is created and a background thread snapshots the
+    daemon's Prometheus ``/metrics`` endpoint into the record's
+    ``extras`` every ~30s. The Web UI's Pipelines view surfaces
+    these as live throughput + batch-cycle figures.
+    ``pipeline_name`` is required for stats recording but the
+    pipeline still runs without it (snapshotter just won't open).
+    ``metrics_port`` must also be set — without an endpoint to
+    scrape, there's nothing to record.
 
     For new code, prefer :func:`run_streaming_pipeline` with typed
     :class:`Connection` objects — this form stays for back-compat
@@ -588,10 +602,66 @@ def run_pipeline(
         raise ValueError("run_pipeline: either `config` (path) or `config_str` is required")
     if config is not None and config_str is not None:
         raise ValueError("run_pipeline: pass `config` OR `config_str`, not both")
-    if config_str is not None:
-        return run_pipeline_from_toml_str(config_str, metrics_port)
-    assert config is not None
-    return run_pipeline_from_path(os.fspath(config), metrics_port)
+
+    def _run() -> PipelineMetrics:
+        if config_str is not None:
+            return run_pipeline_from_toml_str(config_str, metrics_port)
+        assert config is not None
+        return run_pipeline_from_path(os.fspath(config), metrics_port)
+
+    recorder = _maybe_open_stats_recorder(
+        pipeline_name=pipeline_name,
+        metrics_port=metrics_port,
+        run_log_url=run_log_url,
+    )
+    if recorder is None:
+        return _run()
+
+    with recorder:
+        return _run()
+
+
+def _maybe_open_stats_recorder(
+    *,
+    pipeline_name: str | None,
+    metrics_port: int | None,
+    run_log_url: str | None,
+):
+    """Open a :class:`StreamingStatsRecorder` if every prerequisite is met.
+
+    Returns the un-started recorder (the caller uses it as a CM), or
+    None when stats recording is disabled. Disabled is the default —
+    streaming pipelines without a configured RunLog stay invisible to
+    the Web UI exactly as before.
+
+    Best-effort: import or RunLog-open failures fall through to None
+    with a stderr warning rather than aborting the run.
+    """
+    import os
+    import sys
+
+    url = run_log_url or os.environ.get("EMATIX_FLOW_RUN_LOG_URL")
+    if not url or not pipeline_name or not metrics_port:
+        return None
+    try:
+        from ematix_flow.run_log import from_url
+        from ematix_flow.streaming_stats import StreamingStatsRecorder
+
+        rl = from_url(url)
+    except Exception as exc:
+        print(
+            f"streaming-stats: RunLog open failed ({exc!r}); "
+            "stats recording disabled, pipeline continues",
+            file=sys.stderr,
+        )
+        return None
+    if not hasattr(rl, "record_run_record"):
+        # The configured backend predates the rich-history protocol
+        # (e.g. an old in-memory shim). Skip silently.
+        return None
+    return StreamingStatsRecorder(
+        run_log=rl, pipeline_name=pipeline_name, metrics_port=metrics_port,
+    )
 
 
 # ---------- Π.1: typed-connection-based runner --------------------
@@ -1375,14 +1445,17 @@ def _emit_targets_array_entry(spec: Target) -> list[str]:
 
 def _resolve_kafka_schema_registry(
     conn: KafkaConnection,
-) -> SchemaRegistryConnection | None:
+) -> SchemaRegistryConnection | GlueSchemaRegistryConnection | None:
     """Π.1: collapse ``KafkaConnection.schema_registry`` (typed) and
     ``schema_registry_url`` (legacy inline) into a single resolved
-    ``SchemaRegistryConnection``, or ``None`` if SR isn't configured.
+    connection, or ``None`` if SR isn't configured.
 
     Mutual exclusion is checked at dataclass construction time. A
     string in ``schema_registry`` is treated as a registered SR
-    name; a missing registration raises ``KeyError``.
+    name; a missing registration raises ``KeyError``. The resolved
+    object may be either ``SchemaRegistryConnection`` (Confluent /
+    Apicurio wire format) or ``GlueSchemaRegistryConnection`` (AWS
+    Glue wire format); the caller dispatches on type.
     """
     if conn.schema_registry is None and conn.schema_registry_url is None:
         return None
@@ -1390,11 +1463,14 @@ def _resolve_kafka_schema_registry(
         sr = conn.schema_registry
         if isinstance(sr, str):
             resolved = get_connection(sr)
-            if not isinstance(resolved, SchemaRegistryConnection):
+            if not isinstance(
+                resolved,
+                (SchemaRegistryConnection, GlueSchemaRegistryConnection),
+            ):
                 raise TypeError(
                     f"KafkaConnection({conn.name!r}).schema_registry={sr!r} "
                     f"resolved to a {type(resolved).__name__}, not "
-                    "SchemaRegistryConnection"
+                    "SchemaRegistryConnection or GlueSchemaRegistryConnection"
                 )
             return resolved
         return sr
@@ -1421,6 +1497,28 @@ def _kafka_payload_and_sr_lines(
         out.append(f"auto_offset_reset = {_q(conn.auto_offset_reset)}")
     sr = _resolve_kafka_schema_registry(conn)
     if sr is None:
+        return out
+    if isinstance(sr, GlueSchemaRegistryConnection):
+        # Task #556: Glue dispatch — emit `schema_registry_kind` as a
+        # TOML inline table so the Rust side parses it into the
+        # `SchemaRegistryKind::Glue { .. }` variant. No
+        # `schema_registry_url` for the Glue path (the URL is
+        # implicit in the IAM-backed Glue API endpoint).
+        from ematix_flow.glue_schema_registry import (
+            GLUE_SCHEMA_LOOKUP_BY_NAME_CALLBACK,
+            GLUE_SCHEMA_LOOKUP_CALLBACK,
+        )
+        out.append(
+            "schema_registry_kind = "
+            "{ kind = \"glue\", "
+            f"region = {_q(_resolve_required(sr.region, 'region'))}, "
+            "registry_name = "
+            f"{_q(_resolve_required(sr.registry_name, 'registry_name'))}, "
+            f"schema_lookup_callback = {_q(GLUE_SCHEMA_LOOKUP_CALLBACK)}, "
+            "schema_lookup_by_name_callback = "
+            f"{_q(GLUE_SCHEMA_LOOKUP_BY_NAME_CALLBACK)}"
+            " }"
+        )
         return out
     out.append(
         f"schema_registry_url = {_q(_resolve_required(sr.url, 'url'))}"

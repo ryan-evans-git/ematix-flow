@@ -46,6 +46,30 @@ use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode};
 
 use crate::dict_aggregate::{DictGroupCountExec, GroupOutputType};
+use crate::shape_catalog::{AggMode, Shape, aggregate, any_capture};
+
+/// Σ.F catalog entries: `AggregateExec(Final*)`. Both `Final` and
+/// `FinalPartitioned` modes match; the per-rule walker below peels
+/// pass-through nodes down to `AggregateExec(Partial)` (which can be
+/// reached through RepartitionExec, CoalesceBatchesExec, etc.).
+fn dict_group_count_shapes() -> [Shape; 2] {
+    [
+        aggregate(
+            Some("final"),
+            AggMode::FinalPartitioned,
+            None,
+            None,
+            vec![any_capture("body")],
+        ),
+        aggregate(
+            Some("final"),
+            AggMode::Final,
+            None,
+            None,
+            vec![any_capture("body")],
+        ),
+    ]
+}
 
 /// Σ.E3b.2 rule: rewrite the `AggregateExec(FinalPartitioned)` →
 /// (optional `RepartitionExec`) → `AggregateExec(Partial)` →
@@ -60,19 +84,22 @@ impl PhysicalOptimizerRule for EnableDictGroupCountRule {
         plan: Arc<dyn ExecutionPlan>,
         _config: &ConfigOptions,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
+        let shapes = dict_group_count_shapes();
         let result = plan.transform_up(|node| {
-            let Some(final_agg) = node.as_any().downcast_ref::<AggregateExec>() else {
+            // Catalog match: the node must be AggregateExec in Final
+            // or FinalPartitioned mode. Per-rule predicate validation
+            // (single COUNT, single dict group key, peel to Partial)
+            // stays below in `match_dict_count_shape`.
+            let Some(matched) = shapes.iter().find_map(|s| s.try_match(&node)) else {
                 return Ok(Transformed::no(node));
             };
-            // Only the FinalPartitioned mode — Single / Final / Partial
-            // alone don't match the two-stage-with-shuffle shape we
-            // recognise.
-            if !matches!(
-                final_agg.mode(),
-                AggregateMode::FinalPartitioned | AggregateMode::Final
-            ) {
-                return Ok(Transformed::no(node));
-            }
+            let final_agg_node = matched
+                .get("final")
+                .expect("dict_group_count_shapes captures `final`");
+            let final_agg = final_agg_node
+                .as_any()
+                .downcast_ref::<AggregateExec>()
+                .expect("captured node must be AggregateExec");
             let Some((real_input, col_idx, group_out_name, count_out_name)) =
                 match_dict_count_shape(final_agg)
             else {

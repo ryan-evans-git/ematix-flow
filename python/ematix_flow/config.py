@@ -41,15 +41,20 @@ def _project_config_path() -> Path:
 
 
 def _interpolate(value: str) -> str:
-    """Replace `${VAR}` with `os.environ[VAR]`. Raise `KeyError` if missing."""
+    """Replace ``${...}`` references via the secrets resolver registry.
 
-    def replace(match: re.Match[str]) -> str:
-        var = match.group(1)
-        if var not in os.environ:
-            raise KeyError(f"environment variable {var!r} referenced in config is not set")
-        return os.environ[var]
+    Bare ``${VAR}`` continues to resolve against ``os.environ``
+    (backwards-compatible). Prefixed forms like ``${vault:...}``,
+    ``${aws:...}`` dispatch to whichever resolver is registered via
+    :func:`ematix_flow.secrets.register_resolver`. Raises
+    :class:`ematix_flow.secrets.MissingSecretError` (a ``KeyError``
+    subclass) when a reference can't be resolved.
+    """
+    from ematix_flow.secrets import expand
 
-    return _INTERPOLATION.sub(replace, value)
+    out = expand(value)
+    assert out is not None  # narrow Optional for the str-only public API
+    return out
 
 
 def _read_toml(path: Path) -> dict[str, Any]:

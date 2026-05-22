@@ -222,8 +222,17 @@ def _cmd_consume(args: argparse.Namespace) -> int:
     except KeyError as e:
         print(f"error: {e}", file=sys.stderr)
         return 2
+    # v0.5.0: opt-in streaming-stats recording. When --run-log-url is
+    # set (or $EMATIX_FLOW_RUN_LOG_URL), streaming pipelines emit live
+    # throughput + batch-cycle snapshots that the Web UI surfaces.
+    run_log_url = getattr(args, "run_log_url", None) or os.environ.get(
+        "EMATIX_FLOW_RUN_LOG_URL"
+    )
     result = streaming.run_pipeline(
-        config_str=toml, metrics_port=args.metrics_port
+        config_str=toml,
+        metrics_port=args.metrics_port,
+        pipeline_name=args.name,
+        run_log_url=run_log_url,
     )
     print(json.dumps(result, default=str))
     return 0
@@ -269,9 +278,10 @@ def _cmd_run_due(args: argparse.Namespace) -> int:
     # Phase Ω.D2: use the unified `run_due_with_dag_detailed` so
     # retry backoff + gave-up gating actually fire from the CLI.
     # Ω.D4: attach alerters + metrics sink resolved from --alerter
-    # and --metrics URLs.
+    # and --metrics URLs. Slice 2d (#136): wire OTEL traces too.
     alerters = _open_alerters(args)
     metrics_sink = _open_metrics(args)
+    _configure_tracing_from_args(args)
     try:
         result = p.run_due_with_dag_detailed(
             due, now=now, run_log=run_log,
@@ -467,6 +477,14 @@ def _add_observability_args(parser: argparse.ArgumentParser) -> None:
         "otlp://collector:4317, stdout://. Falls back to "
         "$EMATIX_FLOW_METRICS. Default: no metrics.",
     )
+    parser.add_argument(
+        "--traces",
+        default=None,
+        help="OpenTelemetry traces URL — emits one span per "
+        "pipeline run. Examples: otel://stdout, "
+        "otel+otlp+grpc://collector:4317, otel+otlp+http://collector:4318. "
+        "Falls back to $EMATIX_FLOW_TRACES. Default: no traces.",
+    )
 
 
 def _add_run_log_args(parser: argparse.ArgumentParser) -> None:
@@ -568,6 +586,7 @@ def _cmd_scheduler(args: argparse.Namespace) -> int:
     metrics_sink = _open_metrics(args)
     alerter_urls = _resolved_alerter_urls(args)
     metrics_url = _resolved_metrics_url(args)
+    _configure_tracing_from_args(args)
 
     try:
         run_scheduler(
@@ -638,6 +657,24 @@ def _resolved_metrics_url(args: argparse.Namespace) -> str | None:
     )
 
 
+def _configure_tracing_from_args(args: argparse.Namespace) -> None:
+    """Resolve --traces (or $EMATIX_FLOW_TRACES) into a global OTEL tracer.
+
+    Best-effort: if the user supplied no URL, leave the tracer at its
+    default no-op state. If they did supply a URL but the OTel SDK
+    isn't installed, surface the actionable hint and exit non-zero so
+    the misconfiguration doesn't silently degrade to no traces.
+    """
+    import os
+
+    url = getattr(args, "traces", None) or os.environ.get("EMATIX_FLOW_TRACES")
+    if not url:
+        return
+    from ematix_flow.tracing import configure_tracer_from_url
+
+    configure_tracer_from_url(url)
+
+
 def _cmd_status(args: argparse.Namespace) -> int:
     """Phase Ω.3: operator view of pipeline state.
 
@@ -685,6 +722,106 @@ def _cmd_connections_check(args: argparse.Namespace) -> int:
         return 0
     print(f"{args.name}: unreachable — {message}", file=sys.stderr)
     return 2
+
+
+def _cmd_doctor(args: argparse.Namespace) -> int:
+    """``flow doctor [--module M]`` — probe every registered typed
+    connection and print a green/red liveness report.
+
+    Loads the user's pipeline module (if given) so connections
+    declared in it land in the registry before we probe.
+    """
+    from ematix_flow import doctor
+
+    if getattr(args, "module", None):
+        _import_user_module(args.module)
+    reports = doctor.run_doctor()
+    print(doctor.format_doctor_report(reports))
+    # Exit 1 if any probe failed — useful as a pre-deploy gate.
+    return 1 if any(r.is_fail for r in reports) else 0
+
+
+def _cmd_logs(args: argparse.Namespace) -> int:
+    """``flow logs <run_id>`` — print captured stdout/stderr for a
+    past run. Reads from ``$EMATIX_FLOW_LOGS_DIR`` (or
+    ``~/.ematix-flow/logs/``). Logs are only written when the
+    pipeline executed under ``EMATIX_FLOW_CAPTURE_LOGS=1`` — see
+    USER_GUIDE for the capture toggle."""
+    from ematix_flow.logs import logs_dir, read_run_logs
+
+    text = read_run_logs(args.run_id)
+    if text is None:
+        print(
+            f"flow logs: no log file for run_id={args.run_id!r} under "
+            f"{logs_dir()}. Logs are only captured when "
+            f"EMATIX_FLOW_CAPTURE_LOGS=1 was set during the run.",
+            file=sys.stderr,
+        )
+        return 1
+    if args.tail is not None:
+        lines = text.splitlines()
+        text = "\n".join(lines[-args.tail:])
+        if text and not text.endswith("\n"):
+            text += "\n"
+    print(text, end="")
+    return 0
+
+
+def _cmd_init(args: argparse.Namespace) -> int:
+    """``flow init <path> [--force]`` — scaffold a new ematix-flow
+    project: pipelines.py + connections.toml + Dockerfile + flow.service
+    + .gitignore + README.md. Maven-archetype-style: enough to be
+    runnable immediately."""
+    from pathlib import Path
+
+    from ematix_flow.init_scaffold import scaffold_project
+
+    target = Path(args.path).resolve()
+    try:
+        written = scaffold_project(target, force=args.force)
+    except FileExistsError as exc:
+        print(f"flow init: {exc}", file=sys.stderr)
+        return 1
+    print(f"flow init: scaffolded {len(written)} files in {target}")
+    for path in written:
+        print(f"  + {path.relative_to(target)}")
+    print(
+        "\nNext: `cd " + str(target) + " && flow doctor --module pipelines`"
+    )
+    return 0
+
+
+def _cmd_secrets_test(args: argparse.Namespace) -> int:
+    """``flow secrets test '${vault:foo#bar}'`` — resolve a single
+    ``${...}`` reference via the registered resolver chain and print
+    the result. Redacted by default (first/last 2 chars + length);
+    pass ``--show`` to print verbatim."""
+    from ematix_flow.secrets import MissingSecretError, expand
+
+    ref = args.reference
+    # Accept both `${vault:foo}` and bare `vault:foo` — wrap the
+    # bare form so ``expand`` sees a recognisable reference.
+    if not (ref.startswith("${") and ref.endswith("}")):
+        ref = "${" + ref + "}"
+    try:
+        resolved = expand(ref)
+    except MissingSecretError as exc:
+        print(f"{args.reference}: {exc}", file=sys.stderr)
+        return 1
+    if resolved is None or resolved == "":
+        print(f"{args.reference}: <empty>")
+        return 0
+    if args.show:
+        print(resolved)
+    else:
+        # Redact: first 2 + last 2 chars + length. Mirrors the way
+        # SSH / k8s show fingerprints without leaking the value.
+        if len(resolved) <= 4:
+            display = "*" * len(resolved)
+        else:
+            display = f"{resolved[:2]}...{resolved[-2:]}"
+        print(f"{display}  ({len(resolved)} chars; pass --show to reveal)")
+    return 0
 
 
 def _cmd_preview(args: argparse.Namespace) -> int:
@@ -850,6 +987,14 @@ def main(argv: list[str] | None = None) -> int:
         type=int,
         default=None,
         help="if set, expose Prometheus metrics on 127.0.0.1:<PORT>/metrics",
+    )
+    consume_p.add_argument(
+        "--run-log-url",
+        default=None,
+        help="if set (with --metrics-port), write a streaming RunRecord + "
+        "periodically (~30s) snapshot throughput/batch-cycle into its extras. "
+        "The Web UI surfaces these as live stats. Falls back to "
+        "$EMATIX_FLOW_RUN_LOG_URL. Supported schemes match `flow run-due`.",
     )
     consume_p.set_defaults(func=_cmd_consume)
 
@@ -1017,8 +1162,193 @@ def main(argv: list[str] | None = None) -> int:
     )
     conn_set.set_defaults(func=_cmd_connections_set)
 
+    # ``flow logs <run_id>`` — print captured stdout/stderr from a past run.
+    logs_p = sub.add_parser(
+        "logs",
+        help="print captured stdout/stderr from a past pipeline run",
+    )
+    logs_p.add_argument("run_id", help="run id (from the run-log API or scheduler)")
+    logs_p.add_argument(
+        "--tail",
+        type=int,
+        default=None,
+        help="show only the last N lines (default: full log)",
+    )
+    logs_p.set_defaults(func=_cmd_logs)
+
+    # ``flow init <path>`` — scaffold a new project (Maven-archetype-style).
+    init_p = sub.add_parser(
+        "init",
+        help="scaffold a new ematix-flow project (pipelines.py + "
+        "connections.toml + Dockerfile + systemd unit)",
+    )
+    init_p.add_argument(
+        "path",
+        help="target directory for the new project (created if missing)",
+    )
+    init_p.add_argument(
+        "--force",
+        action="store_true",
+        help="overwrite existing files in the target directory",
+    )
+    init_p.set_defaults(func=_cmd_init)
+
+    # ``flow doctor`` — health-check every registered typed connection.
+    # Exit code is 1 if any probe failed; useful as a pre-deploy gate.
+    doctor_p = sub.add_parser(
+        "doctor",
+        help="probe every registered connection and report green/red",
+    )
+    doctor_p.add_argument(
+        "--module",
+        help="user pipeline module to import first (so connections "
+        "declared in it land in the registry before probing)",
+    )
+    doctor_p.set_defaults(func=_cmd_doctor)
+
+    # ``flow secrets test`` — resolve a single ${...} reference.
+    secrets_p = sub.add_parser(
+        "secrets",
+        help="debug secret-resolver setup (e.g. Vault / AWS / GCP)",
+    )
+    secrets_sub = secrets_p.add_subparsers(dest="secrets_cmd", required=True)
+    secrets_test = secrets_sub.add_parser(
+        "test",
+        help="resolve a single ${vault:...} / ${aws:...} / ${gcp:...} "
+        "reference and print the result (redacted unless --show)",
+    )
+    secrets_test.add_argument(
+        "reference",
+        metavar="REF",
+        help="the reference, e.g. '${vault:secret/myapp#db_password}' "
+        "or bare 'vault:secret/myapp#db_password'",
+    )
+    secrets_test.add_argument(
+        "--show",
+        action="store_true",
+        help="print the resolved value verbatim (default: redacted "
+        "to first/last 2 chars + length)",
+    )
+    secrets_test.set_defaults(func=_cmd_secrets_test)
+
+    # Phase 4 of "What's not shipped": web UI for run history +
+    # restart / rerun / pause actions.
+    web_p = sub.add_parser(
+        "web",
+        help="launch the ematix-flow web UI on http://127.0.0.1:8080 by default",
+    )
+    web_p.add_argument(
+        "--bind",
+        default="127.0.0.1",
+        help="address to bind (default 127.0.0.1; binding to a non-loopback "
+        "address logs a warning since Phase 4a ships without auth)",
+    )
+    web_p.add_argument(
+        "--port",
+        type=int,
+        default=8080,
+        help="port to listen on (default 8080)",
+    )
+    web_p.add_argument(
+        "--log-level",
+        default="info",
+        choices=["debug", "info", "warning", "error"],
+        help="uvicorn log level (default info)",
+    )
+    web_p.add_argument(
+        "--token",
+        default=None,
+        help="bearer token required on every /api/* call (except /api/health). "
+        "Set this before binding to a non-loopback address. Falls back to "
+        "$EMATIX_FLOW_WEB_TOKEN if not passed on the CLI.",
+    )
+    web_p.add_argument(
+        "--run-log-url",
+        default=None,
+        help="if set, open this RunLog backend as the rich-history source so "
+        "the UI shows real run records (incl. live streaming throughput). "
+        "Falls back to $EMATIX_FLOW_RUN_LOG_URL. Without this flag, the UI "
+        "still works but pipeline / job lists fall back to stub data.",
+    )
+    web_p.add_argument(
+        "--module",
+        action="append",
+        default=None,
+        help="import a pipeline module (e.g. `--module pipelines`) so the UI "
+        "can render schedule, next_run_at, and the cross-pipeline DAG. "
+        "Repeatable. Without this flag the UI still works but next-run + DAG "
+        "fall back to history-only data.",
+    )
+    web_p.set_defaults(func=_cmd_web)
+
     args = parser.parse_args(argv)
     return args.func(args)
+
+
+def _cmd_web(args) -> int:
+    """Launch the FastAPI server. Lazy-imports the web module so users
+    who never run the UI don't pay the fastapi / uvicorn import cost.
+    """
+    try:
+        from ematix_flow.web import run_server
+    except ImportError as exc:
+        print(
+            f"error: {exc}\n"
+            "Install the web extra: pip install ematix-flow[web]",
+            file=sys.stderr,
+        )
+        return 1
+    # Import pipeline modules so the in-process registry is populated;
+    # the /api/pipelines and /api/dag endpoints look up schedule +
+    # depends_on metadata via _registry_lookup, which is empty until
+    # the @ematix.pipeline / @ematix.streaming_pipeline decorators fire.
+    for mod_name in (getattr(args, "module", None) or []):
+        try:
+            importlib.import_module(mod_name)
+        except Exception as exc:
+            print(
+                f"warning: --module {mod_name!r} failed to import "
+                f"({exc!r}); UI schedule + DAG will be empty for its "
+                "pipelines",
+                file=sys.stderr,
+            )
+    # Bearer-token auth — set via --token, or fall back to the
+    # EMATIX_FLOW_WEB_TOKEN env var so secrets stay out of shell history.
+    token = args.token or os.environ.get("EMATIX_FLOW_WEB_TOKEN")
+    # v0.5.0: opt-in rich-history wiring. Same RunLog URL the streaming
+    # consumer + scheduler use; the SqliteRunLog now satisfies both
+    # protocols against the same backing file.
+    run_log_url = getattr(args, "run_log_url", None) or os.environ.get(
+        "EMATIX_FLOW_RUN_LOG_URL"
+    )
+    history = None
+    if run_log_url:
+        try:
+            from ematix_flow.run_log import from_url
+
+            store = from_url(run_log_url)
+        except Exception as exc:
+            print(
+                f"warning: --run-log-url {run_log_url!r} could not be opened "
+                f"({exc!r}); web UI will fall back to stub data",
+                file=sys.stderr,
+            )
+            store = None
+        if store is not None and hasattr(store, "record_run_record"):
+            history = store
+        elif store is not None:
+            print(
+                f"warning: RunLog backend {type(store).__name__} doesn't "
+                "implement the rich-history protocol; web UI will fall back "
+                "to stub data. SqliteRunLog has the in-tree implementation.",
+                file=sys.stderr,
+            )
+    run_server(
+        host=args.bind, port=args.port, log_level=args.log_level,
+        bearer_token=token,
+        history=history,
+    )
+    return 0
 
 
 if __name__ == "__main__":  # pragma: no cover

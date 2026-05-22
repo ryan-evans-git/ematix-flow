@@ -56,19 +56,35 @@ kafka_prod = KafkaConnection(
 # connections across pipelines.
 ```
 
-## ${VAR} env interpolation
+## ${...} interpolation — env + pluggable secret stores
 
-Any ``str`` field on a connection can contain ``${VAR}``
+Any ``str`` field on a connection can contain ``${...}``
 references. The interpolation happens **at backend-build time**
 (when the pipeline starts), not at connection-definition time —
-so changing an env var between definition and run picks up the
-new value, and undefined vars surface as a clear ``KeyError``.
+so changing the underlying secret between definition and run picks
+up the new value.
+
+Supported reference shapes:
+
+- ``${VAR}`` — bare env-var name. Resolves against ``os.environ``.
+  Existing v0.1+ syntax; unchanged.
+- ``${vault:path/to/secret#key}`` — HashiCorp Vault KV v2.
+- ``${aws:secret-name#field}`` — AWS Secrets Manager (JSON field
+  selector via ``#``).
+- ``${gcp:secret-name#version}`` — GCP Secret Manager (short form;
+  version defaults to ``latest``).
+
+For the non-env resolvers to work the caller must register them at
+app startup; see :mod:`ematix_flow.secrets`. Unresolvable references
+raise :class:`ematix_flow.secrets.MissingSecretError` (a ``KeyError``
+subclass, so legacy ``except KeyError`` handlers continue to work).
 
 ```python
 @ematix.connection
 class warehouse:
     kind = "postgres"
-    url = "postgres://app:${WAREHOUSE_PASSWORD}@${WAREHOUSE_HOST}/main"
+    # Mix and match — host from env, password from Vault.
+    url = "postgres://app:${vault:db/prod#password}@${WAREHOUSE_HOST}/main"
 ```
 
 ## Credential safety
@@ -90,7 +106,6 @@ The Rust ``Debug`` impls for the same backends already redact (see
 
 from __future__ import annotations
 
-import os
 import re
 from dataclasses import dataclass, field, fields
 from typing import Any
@@ -100,6 +115,7 @@ __all__ = [
     "DeltaLocalConnection",
     "DeltaS3Connection",
     "DuckDBConnection",
+    "GlueSchemaRegistryConnection",
     "KafkaConnection",
     "KinesisConnection",
     "MySQLConnection",
@@ -127,7 +143,7 @@ _INTERP = re.compile(r"\$\{([A-Z_][A-Z0-9_]*)\}")
 # Field names whose values are credentials and must be redacted in
 # repr() output. Matched case-insensitively against the dataclass
 # field name.
-_SECRET_TOKENS = frozenset({"password", "secret", "token"})
+_SECRET_TOKENS = frozenset({"password", "secret", "token", "key"})
 _SECRET_FIELDS = frozenset(
     {
         "password",
@@ -135,6 +151,7 @@ _SECRET_FIELDS = frozenset(
         "secret_access_key",
         "access_key_id",
         "key_password",
+        "private_key",
         "token",
         "api_key",
     }
@@ -142,24 +159,26 @@ _SECRET_FIELDS = frozenset(
 
 
 def resolve(value: str | None) -> str | None:
-    """Replace ``${VAR}`` references with ``os.environ[VAR]``.
+    """Replace ``${...}`` references with values from registered
+    secret resolvers.
 
-    Returns ``None`` unchanged. Raises ``KeyError`` (with a clear
-    pointer) if a referenced variable isn't set.
+    Bare ``${VAR}`` resolves against ``os.environ`` (backwards-compatible
+    with v0.1). Prefixed forms like ``${vault:path#key}``,
+    ``${aws:secret-name}``, ``${gcp:secret-name}`` dispatch to the
+    matching resolver registered via
+    :func:`ematix_flow.secrets.register_resolver`.
+
+    Returns ``None`` unchanged. Raises
+    :class:`ematix_flow.secrets.MissingSecretError` (a ``KeyError``
+    subclass, so existing ``except KeyError`` handlers still catch it)
+    if a referenced secret can't be resolved.
+
+    Delegates the actual interpolation to :func:`ematix_flow.secrets.expand`
+    so connection strings and DSN templates share one syntax.
     """
-    if value is None:
-        return None
+    from ematix_flow.secrets import expand
 
-    def sub(match: re.Match[str]) -> str:
-        var = match.group(1)
-        if var not in os.environ:
-            raise KeyError(
-                f"environment variable {var!r} is referenced by an ematix-flow "
-                "connection but is not set"
-            )
-        return os.environ[var]
-
-    return _INTERP.sub(sub, value)
+    return expand(value)
 
 
 def redact(field_name: str, value: Any) -> Any:
@@ -267,6 +286,66 @@ class SchemaRegistryConnection(Connection):
 
 
 @dataclass(repr=False)
+class GlueSchemaRegistryConnection(Connection):
+    """AWS Glue Schema Registry handle.
+
+    Different wire format from Confluent SR (``0x03`` header byte +
+    16-byte schema UUID + 1-byte compression byte + payload, vs
+    Confluent's ``0x00`` + 4-byte BE schema id), and AWS IAM auth
+    instead of HTTP basic. The Rust runner picks the framing based on
+    the connection ``kind``.
+
+    Auth options, in priority order:
+
+    1. ``aws_profile=`` — read credentials from ``~/.aws/credentials``
+       under the named profile (best for dev).
+    2. ``aws_access_key_id=`` + ``aws_secret_access_key=`` — explicit
+       static creds (discouraged; prefer IAM role / SSO / env vars).
+       Both must be set together.
+    3. Implicit — boto3's default credential chain (env vars, EC2
+       instance metadata, EKS pod identity, etc.). This is the
+       recommended production path; leave the auth fields unset.
+    """
+
+    registry_name: str = ""
+    region: str = ""
+    aws_profile: str | None = None
+    aws_access_key_id: str | None = None
+    aws_secret_access_key: str | None = None
+
+    def __post_init__(self) -> None:
+        self.kind = "glue_schema_registry"
+        if not self.registry_name:
+            raise ValueError(
+                f"GlueSchemaRegistryConnection({self.name!r}): "
+                "registry_name is required"
+            )
+        if not self.region:
+            raise ValueError(
+                f"GlueSchemaRegistryConnection({self.name!r}): region is required"
+            )
+        # Both halves of static creds must be set together; partial is
+        # an obvious misuse — fail at construction, not on first call.
+        has_key = bool(self.aws_access_key_id)
+        has_secret = bool(self.aws_secret_access_key)
+        if has_key != has_secret:
+            raise ValueError(
+                f"GlueSchemaRegistryConnection({self.name!r}): "
+                "aws_access_key_id and aws_secret_access_key must be set "
+                "together (or both omitted to use boto3's default "
+                "credential chain)"
+            )
+        # Profile + explicit creds is ambiguous — the user picked two
+        # auth modes. Reject up front.
+        if self.aws_profile and (has_key or has_secret):
+            raise ValueError(
+                f"GlueSchemaRegistryConnection({self.name!r}): pass either "
+                "aws_profile= OR aws_access_key_id/aws_secret_access_key=, "
+                "not both"
+            )
+
+
+@dataclass(repr=False)
 class KafkaConnection(Connection):
     """Kafka cluster handle.
 
@@ -284,10 +363,14 @@ class KafkaConnection(Connection):
     # Maps directly to rdkafka's `auto.offset.reset`.
     auto_offset_reset: str | None = None
     schema_registry_url: str | None = None
-    # Π.1: typed Schema Registry reference. Accepts a
-    # `SchemaRegistryConnection` instance or a registered SR name
-    # string. Mutually exclusive with `schema_registry_url=`.
-    schema_registry: str | SchemaRegistryConnection | None = None
+    # Π.1 / task #556: typed Schema Registry reference. Accepts a
+    # ``SchemaRegistryConnection`` (Confluent wire format), a
+    # ``GlueSchemaRegistryConnection`` (AWS Glue wire format), or a
+    # registered SR name string. Mutually exclusive with
+    # ``schema_registry_url=``. The Rust backend picks the framing
+    # (Confluent 0x00+4B-id vs Glue 0x03+16B-UUID+1B-codec) based on
+    # the connection's ``kind``.
+    schema_registry: str | SchemaRegistryConnection | GlueSchemaRegistryConnection | None = None
     sasl_plain_username: str | None = None
     sasl_plain_password: str | None = None
     sasl_scram_username: str | None = None
@@ -305,6 +388,26 @@ class KafkaConnection(Connection):
                 "`schema_registry=` (typed SR connection or name) OR the "
                 "legacy `schema_registry_url=` shorthand, not both"
             )
+        # Task #556: catch misconfigurations at construction time
+        # rather than deep in the Rust dispatch. A Glue SR only
+        # makes sense with Avro / Protobuf payloads — pairing it
+        # with JSON / RawBytes is almost certainly a copy-paste
+        # error.
+        if isinstance(self.schema_registry, GlueSchemaRegistryConnection):
+            if self.payload_format is None:
+                raise ValueError(
+                    f"KafkaConnection({self.name!r}): "
+                    "schema_registry=GlueSchemaRegistryConnection requires "
+                    "payload_format='avro' (or 'protobuf' once that path "
+                    "is wired); set payload_format= explicitly"
+                )
+            if self.payload_format not in ("avro", "protobuf"):
+                raise ValueError(
+                    f"KafkaConnection({self.name!r}): "
+                    f"payload_format={self.payload_format!r} does not "
+                    "use a schema-registry wire frame; remove "
+                    "schema_registry= or switch payload_format to 'avro'"
+                )
 
 
 @dataclass(repr=False)
@@ -490,6 +593,7 @@ _KIND_FACTORIES: dict[str, type] = {
     "pubsub": PubSubConnection,
     "kinesis": KinesisConnection,
     "schema_registry": SchemaRegistryConnection,
+    "glue_schema_registry": GlueSchemaRegistryConnection,
     "postgres": PostgresConnection,
     "mysql": MySQLConnection,
     "sqlite": SQLiteConnection,

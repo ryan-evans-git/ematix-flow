@@ -49,6 +49,14 @@ pub enum Dialect {
     Delta,
     ObjectStore { format: ObjectFormat },
     Streaming { kind: StreamingKind },
+    // Phase 2c: cloud-warehouse backends. SQL surface is mostly
+    // Postgres-flavored (with vendor-specific extensions) but the
+    // dialect carries its own discriminant so the planner can pick
+    // vendor-specific fast paths (e.g. Snowflake's `COPY INTO`,
+    // BigQuery's `MERGE`, Redshift's `UNLOAD TO 's3://...'`).
+    Snowflake,
+    BigQuery,
+    Redshift,
 }
 
 /// File format for raw object-storage targets (Phase 34).
@@ -635,6 +643,17 @@ pub enum BackendConfig {
     /// circular dep), so this arm errors with a clear pointer at
     /// the right constructor.
     Distributed(DistributedConfig),
+    // Phase 2c: cloud-warehouse backends. Configs round-trip via
+    // serde so distributed configs can carry them. The backend
+    // construction path (`backend_from_config`) currently returns
+    // a clear "implementation lives in Python" pointer for these
+    // arms — the production read/write goes through
+    // `python/ematix_flow/warehouses.py`'s adapters via the
+    // existing PyO3 surface. Phase 2d (future) wires Rust-side
+    // PyO3 callbacks so these become true first-class backends.
+    Snowflake(SnowflakeConfig),
+    BigQuery(BigQueryConfig),
+    Redshift(RedshiftConfig),
 }
 
 /// Σ.B PR 1 commit b: serializable Postgres config. The DSN carries
@@ -645,6 +664,68 @@ pub enum BackendConfig {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PostgresConfig {
     pub dsn: String,
+}
+
+/// Phase 2c: Snowflake account config. Mirrors the fields of
+/// `python.ematix_flow.warehouses.SnowflakeConnection`. Either
+/// `password` or `private_key` (PEM) must be set; both empty is
+/// rejected at backend-construction time. `${...}` interpolation
+/// (Phase 1 secrets) is applied by the Python side before this
+/// struct is built.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SnowflakeConfig {
+    pub account: String,
+    pub user: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub password: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub private_key: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub warehouse: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub database: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub schema: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub role: String,
+}
+
+/// Phase 2c: BigQuery dataset config. Mirrors
+/// `python.ematix_flow.warehouses.BigQueryConnection`.
+/// `credentials_path` empty = Application Default Credentials
+/// (gcloud auth ADC + workload identity).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct BigQueryConfig {
+    pub project: String,
+    pub dataset: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub credentials_path: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub location: String,
+}
+
+/// Phase 2c: Redshift cluster config. Mirrors
+/// `python.ematix_flow.warehouses.RedshiftConnection`. Redshift
+/// speaks Postgres wire protocol; the Phase 2c bridge can route
+/// reads through the existing Postgres backend via
+/// `to_postgres_dsn` for now. `s3_staging_dir` + `iam_role` are
+/// only consulted by the write-side bulk-COPY path.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct RedshiftConfig {
+    pub host: String,
+    #[serde(default = "default_redshift_port")]
+    pub port: u16,
+    pub database: String,
+    pub user: String,
+    pub password: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub s3_staging_dir: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub iam_role: String,
+}
+
+fn default_redshift_port() -> u16 {
+    5439
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -798,6 +879,15 @@ pub struct KafkaConfig {
     /// (username) + API secret (password) pair here.
     #[serde(default)]
     pub schema_registry_basic_auth: Option<crate::kafka_backend::SrBasicAuth>,
+
+    /// Task #556: schema-registry wire-format selector. ``None`` /
+    /// ``Confluent`` keep the existing 0x00+4-byte-BE-id framing.
+    /// ``Glue { region, registry_name, schema_lookup_callback }``
+    /// swaps in Glue's 0x03+16-byte-UUID+1-byte-codec framing; the
+    /// schema fetch routes through the named Python callback (see
+    /// :mod:`ematix_flow.glue_schema_registry`).
+    #[serde(default)]
+    pub schema_registry_kind: Option<crate::kafka_backend::SchemaRegistryKind>,
 
     /// Per-row Kafka message-key column. `None` = round-robin
     /// (default sticky partitioner).
@@ -1112,6 +1202,9 @@ pub async fn backend_from_config(
                 backend =
                     backend.with_schema_registry_basic_auth(sr_auth.username, sr_auth.password);
             }
+            if let Some(kind) = c.schema_registry_kind {
+                backend = backend.with_schema_registry_kind(kind);
+            }
             if let Some(col) = c.message_key_column {
                 backend = backend.with_message_key_column(col);
             }
@@ -1169,6 +1262,37 @@ pub async fn backend_from_config(
              (would be a circular dep). Construct via \
              `ematix_flow_distributed::DistributedBackend::open(cfg)` directly. \
              See docs/PHASE_SIGMA_B_TRAIT_SPIKE.md."
+                .into(),
+        )),
+        // Phase 2c: cloud-warehouse backends. The Python adapters
+        // (`python/ematix_flow/warehouses.py`) ship the read +
+        // write paths today; the Rust core's `BackendConfig`
+        // variants exist for type-safe config round-trip (serde,
+        // distributed configs, planner-side dialect hints). The
+        // PyO3-callback bridge that lets Rust actually invoke
+        // those adapters is Phase 2d.
+        BackendConfig::Snowflake(_) => Err(BackendError::Other(
+            "backend_from_config(Snowflake) — Rust-side dispatch is Phase 2d. \
+             Use the Python adapter today: \
+             ematix_flow.warehouses.snowflake_query_to_arrow(...) for reads \
+             and snowflake_write_arrow(...) for writes, or invoke \
+             ematix_flow.warehouses.run_warehouse_pipeline(...) for full \
+             read-transform-write. See docs/PHASE_2B_WAREHOUSE_PIPELINES.md."
+                .into(),
+        )),
+        BackendConfig::BigQuery(_) => Err(BackendError::Other(
+            "backend_from_config(BigQuery) — Rust-side dispatch is Phase 2d. \
+             Use the Python adapter today: \
+             ematix_flow.warehouses.bigquery_query_to_arrow(...) for reads \
+             and bigquery_write_arrow(...) for writes."
+                .into(),
+        )),
+        BackendConfig::Redshift(_) => Err(BackendError::Other(
+            "backend_from_config(Redshift) — Rust-side dispatch is Phase 2d. \
+             Use the Python adapter today: \
+             ematix_flow.warehouses.redshift_query_to_arrow(...) for reads \
+             and redshift_write_arrow(...) for writes (bulk COPY via S3 \
+             staging — requires s3_staging_dir + iam_role on the connection)."
                 .into(),
         )),
     }
@@ -2164,6 +2288,110 @@ async fn insert_record_batch(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Phase 2c: BackendConfig serde round-trip for the three new
+    /// warehouse variants. Locks in the wire format so future
+    /// changes don't accidentally break distributed configs that
+    /// carry warehouse backends.
+    #[test]
+    fn snowflake_config_round_trips_through_serde() {
+        let cfg = BackendConfig::Snowflake(SnowflakeConfig {
+            account: "ab12345.us-east-1".into(),
+            user: "loader".into(),
+            password: "hunter2".into(),
+            private_key: String::new(),
+            warehouse: "LOAD_WH".into(),
+            database: "ANALYTICS".into(),
+            schema: "PUBLIC".into(),
+            role: String::new(),
+        });
+        let json = serde_json::to_string(&cfg).unwrap();
+        // The kind discriminator is rendered snake_case.
+        assert!(json.contains("\"kind\":\"snowflake\""), "json: {json}");
+        // Empty fields with skip_serializing_if are omitted.
+        assert!(!json.contains("\"private_key\""), "json: {json}");
+        assert!(!json.contains("\"role\""), "json: {json}");
+        let parsed: BackendConfig = serde_json::from_str(&json).unwrap();
+        match parsed {
+            BackendConfig::Snowflake(s) => {
+                assert_eq!(s.account, "ab12345.us-east-1");
+                assert_eq!(s.warehouse, "LOAD_WH");
+                assert_eq!(s.private_key, "");
+            }
+            _ => panic!("expected Snowflake variant"),
+        }
+    }
+
+    #[test]
+    fn bigquery_config_round_trips_through_serde() {
+        let cfg = BackendConfig::BigQuery(BigQueryConfig {
+            project: "my-proj".into(),
+            dataset: "analytics".into(),
+            credentials_path: String::new(),
+            location: "us-central1".into(),
+        });
+        let json = serde_json::to_string(&cfg).unwrap();
+        assert!(json.contains("\"kind\":\"big_query\""), "json: {json}");
+        let parsed: BackendConfig = serde_json::from_str(&json).unwrap();
+        match parsed {
+            BackendConfig::BigQuery(b) => {
+                assert_eq!(b.project, "my-proj");
+                assert_eq!(b.location, "us-central1");
+            }
+            _ => panic!("expected BigQuery variant"),
+        }
+    }
+
+    #[test]
+    fn redshift_config_round_trips_through_serde_with_default_port() {
+        // `port` defaults to 5439 when omitted on the wire.
+        let json = r#"{
+            "kind": "redshift",
+            "host": "cluster.region.redshift.amazonaws.com",
+            "database": "dev",
+            "user": "loader",
+            "password": "hunter2"
+        }"#;
+        let parsed: BackendConfig = serde_json::from_str(json).unwrap();
+        match parsed {
+            BackendConfig::Redshift(r) => {
+                assert_eq!(r.host, "cluster.region.redshift.amazonaws.com");
+                assert_eq!(r.port, 5439);
+                assert_eq!(r.s3_staging_dir, "");
+                assert_eq!(r.iam_role, "");
+            }
+            _ => panic!("expected Redshift variant"),
+        }
+    }
+
+    #[test]
+    fn backend_from_config_warehouse_arms_point_at_python_adapters() {
+        // Phase 2c arms are intentional stubs — the read/write path
+        // lives in Python. The Rust error must point operators at
+        // the right helper so they don't go searching the source.
+        // `Arc<dyn Backend>` doesn't implement Debug, so we match
+        // the Result rather than calling expect_err.
+        use tokio::runtime::Builder;
+        let rt = Builder::new_current_thread().enable_all().build().unwrap();
+        let snow = BackendConfig::Snowflake(SnowflakeConfig {
+            account: "a".into(),
+            user: "u".into(),
+            password: "p".into(),
+            private_key: String::new(),
+            warehouse: "W".into(),
+            database: String::new(),
+            schema: String::new(),
+            role: String::new(),
+        });
+        match rt.block_on(backend_from_config(snow)) {
+            Ok(_) => panic!("expected Phase 2c stub to bail"),
+            Err(e) => {
+                let msg = format!("{e}");
+                assert!(msg.contains("snowflake_query_to_arrow"), "got: {msg}");
+                assert!(msg.contains("Phase 2"), "got: {msg}");
+            }
+        }
+    }
 
     /// `arrow_to_json_value` collapses Arrow primitives into JSON
     /// primitives. Smoke-only — the recursive cases below depend on

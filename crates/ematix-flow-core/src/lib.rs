@@ -69,16 +69,24 @@ pub mod fused_aggregate_filter_multi_agg;
 // plan shape into a single `FusedAggregateExec<FilterMultiAggSpec>`.
 // Group-by-aware counterpart to `InjectFilterSumRule`.
 pub mod fused_aggregate_filter_multi_agg_rule;
+// Σ.H.1d.1 (task #552): scaffolding for the parallel numeric-keyed
+// `FilterMultiAggSpec`. Hosts `NumericKeyKind` and (future)
+// `FilterMultiAggSpecNumeric`. Kept disjoint from the existing
+// string-keyed `fused_aggregate_filter_multi_agg` so the Dict /
+// Utf8View hot-path codegen is unaffected. See
+// `docs/PHASE_SIGMA_H1D_DIAGNOSIS_AND_DESIGN.md` for the binary-cost
+// vs exec-cost decomposition that motivated this split.
+pub mod fused_aggregate_filter_multi_agg_numeric;
 // Σ.D3: cranelift-JIT'd inner loop for the unified fused-aggregate
 // operator. Hosts `FusedFilterAggSpec` IR + `FusedFilterAggJit`
 // runtime that `FilterSumSpec` and `FilterMultiAggSpec` build on.
 pub mod fused_jit;
-// Σ.G.2f.3 cleanup: just the generalised aggregate plan-shape
-// matcher used by the two remaining injection rules. The four
-// per-query rules + EnableFusedJitRule that lived here were retired
-// in commit 476d65d (rules) and the substrate cleanup that landed
-// alongside it.
-pub mod fused_jit_rule;
+// fused_jit_rule retired in Σ.F.2 (2026-05-20). The shared
+// `AggregateShapeConfig` walker it hosted is replaced by the
+// declarative shape catalog (`shape_catalog`); both fused-aggregate
+// injection rules now express their patterns as `Shape`s and call
+// `Shape::try_match` directly. The remaining JIT-emission substrate
+// stayed in `fused_jit.rs`.
 // Σ.E3a: `DictFilterExec` — IN-list filter on Dictionary(UInt32, Utf8)
 // columns by code membership (no string compare in the hot loop).
 // Photon's #1 string-workload pattern; landing the operator standalone
@@ -103,13 +111,23 @@ pub mod join;
 // Σ.E5 (2026-05-19): Photon-style vectorized LIKE pattern matcher
 // using memchr::memmem. Used by emat's BridgeFilter for byte_array
 // substring predicates (and available as a standalone utility).
+pub mod glue_schema_registry;
 pub mod kafka_backend;
 pub mod kinesis_backend;
 pub mod like_matcher;
 pub mod meta;
 pub mod mysql_backend;
+// Task #556 / #559: callback registry that lets Rust backends invoke
+// embedding-language code (Python via PyO3) without taking a hard
+// PyO3 dependency. Glue Schema Registry decode + future warehouse
+// pipeline execution both route through this.
 pub mod objectstore_backend;
 pub mod pg;
+pub mod py_callbacks;
+// Task #559 final slice: Rust-side invoker for warehouse-pipeline
+// callbacks. Uses py_callbacks to dispatch a @ematix.warehouse_pipeline
+// function by name without subprocess overhead.
+pub mod warehouse_executor;
 // Task #481: one-call setup helpers (`with_optimizer_rules` +
 // `register_dict_aware_parquet`) that activate the dict-aware fast
 // path without callers having to memorise the rule chain + the
@@ -118,6 +136,11 @@ pub mod preset;
 pub mod pubsub_backend;
 pub mod rabbitmq_backend;
 pub mod session_blob;
+// Σ.F (task #543): declarative shape catalog substrate. The matcher
+// AST + named-capture try_match. Replaces the per-rule plan walkers
+// (dict_filter_rule / dict_aggregate_rule / the two
+// fused_aggregate_filter_*_rule) once the catalog dispatcher lands.
+pub mod shape_catalog;
 pub mod spec;
 pub mod sqlite_backend;
 pub mod state_size;
