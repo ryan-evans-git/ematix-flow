@@ -1468,18 +1468,6 @@ impl TableProvider for EmatixFastParquetTableProvider {
         &self,
         filters: &[&Expr],
     ) -> DfResult<Vec<TableProviderFilterPushDown>> {
-        // Σ.Q.L13 diagnostic — escape hatch to disable all filter
-        // pushdown. Σ.Q.L13 spike showed pushdown path is ~13× slower
-        // than DataFusion's "scan all, post-filter" approach on T2
-        // (date BETWEEN + lineitem SF=10). Setting EMAT_DISABLE_PUSHDOWN=1
-        // forces FilterExec to do the work on already-decoded batches,
-        // matching FastParquet's behaviour.
-        if std::env::var_os("EMAT_DISABLE_PUSHDOWN").is_some() {
-            return Ok(filters
-                .iter()
-                .map(|_| TableProviderFilterPushDown::Unsupported)
-                .collect());
-        }
         if self.dict_preservation {
             return Ok(filters
                 .iter()

@@ -1055,21 +1055,20 @@ impl EmatArrowBatchReader {
         filter: BridgeFilter,
         path: std::path::PathBuf,
     ) -> DfResult<()> {
-        // Σ.E5 Phase 1.8 (2026-05-19, verified-NEG): stats-based
-        // dispatch infrastructure is in place
-        // (`load_row_group_parallel_bitmap_dense` available, predicted
-        // pass rate plumbed via BridgeFilter::with_predicted_pass_rate)
-        // but the parallel-bitmap+dense path didn't beat the no-
-        // pushdown baseline on Q01 even with the +1-within-budget fix.
-        // Disabled at the dispatch site to keep the current baseline.
-        //
-        // To re-enable: change `false` below to `filter.predicted_pass_rate() > 0.33`.
-        // Σ.E5 Phase 1.8 (2026-05-19): when predicted pass rate is
-        // high (>33%), use the work-stealing parallel bitmap+dense
-        // path. Empirical SF=1 22-query gate: 0.89 → 0.856 geomean.
-        // Override with EMAT_NO_PARALLEL_BITMAP=1.
-        let disable_parallel = std::env::var_os("EMAT_NO_PARALLEL_BITMAP").is_some();
-        if !disable_parallel && filter.predicted_pass_rate() > 0.33 {
+        // Σ.Q.L13 (2026-05-23): parallel-bitmap+dense path is opt-IN
+        // via `EMAT_FORCE_PARALLEL_BITMAP=1`. The path was previously
+        // default-ON when `predicted_pass_rate > 0.33`, citing an SF=1
+        // 22q geomean win (0.89 → 0.856), but the Σ.Q.L13 scan-only
+        // A/B at SF=10 showed catastrophic regression on date-filter
+        // workloads — T2 (lineitem + l_shipdate BETWEEN) ran at 7318ms
+        // vs 168ms with this path disabled (43× regression). The
+        // earlier SF=1 win likely fell inside [[optimizer-codegen-sensitivity]]
+        // noise. Default-off restores T2/T3 parity with DataFusion's
+        // native parquet reader (both ~1.45× DuckDB on scan-only).
+        // Opt-in via EMAT_FORCE_PARALLEL_BITMAP=1 for cases where the
+        // work-stealing parallel decode is empirically faster.
+        let force_parallel = std::env::var_os("EMAT_FORCE_PARALLEL_BITMAP").is_some();
+        if force_parallel && filter.predicted_pass_rate() > 0.33 {
             return self.load_row_group_parallel_bitmap_dense(rg, filter, path);
         }
 
