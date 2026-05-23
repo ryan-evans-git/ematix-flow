@@ -18,6 +18,9 @@ use ematix_flow_core::ematix_fast_parquet::EmatixFastParquetTableProvider;
 use ematix_flow_core::fast_parquet::FastParquetTableProvider;
 use ematix_flow_core::fused_aggregate_filter_multi_agg_rule::InjectFilterMultiAggRule;
 use ematix_flow_core::fused_aggregate_filter_sum_rule::InjectFilterSumRule;
+use ematix_flow_core::robin_hood_sum_f64_exec::EnableRobinHoodSumF64Rule;
+use ematix_flow_core::runtime_bloom_sideband_rule::EnableRuntimeBloomSidebandRule;
+use ematix_flow_core::swap_semi_join_build_rule::SwapSemiJoinBuildSideRule;
 
 const TPCH_TABLES: &[&str] = &[
     "region", "nation", "supplier", "customer", "part", "partsupp", "orders", "lineitem",
@@ -32,19 +35,49 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dir = std::env::var("TPCH_DATA_DIR")
         .unwrap_or_else(|_| "examples/tpch/data/sf10".to_string());
 
-    let state = SessionStateBuilder::new()
+    let env_on = |name: &str| {
+        std::env::var(name)
+            .ok()
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    };
+    let swap_semi = env_on("EMAT_SWAP_SEMI");
+    let rt_bloom = env_on("EMAT_RT_BLOOM_SIDEBAND");
+    let rh_sum_f64 = env_on("EMAT_RH_SUM_F64");
+
+    let mut builder = SessionStateBuilder::new()
         .with_config(SessionConfig::new().with_target_partitions(14))
         .with_default_features()
         .with_physical_optimizer_rule(Arc::new(DedupeAggregateForFloatDeterminism::default()))
         .with_physical_optimizer_rule(Arc::new(EnableDictGroupCountRule))
         .with_physical_optimizer_rule(Arc::new(InjectFilterMultiAggRule))
-        .with_physical_optimizer_rule(Arc::new(InjectFilterSumRule))
-        .build();
+        .with_physical_optimizer_rule(Arc::new(InjectFilterSumRule));
+    if swap_semi {
+        builder = builder.with_physical_optimizer_rule(Arc::new(SwapSemiJoinBuildSideRule));
+    }
+    if rh_sum_f64 {
+        builder = builder.with_physical_optimizer_rule(Arc::new(EnableRobinHoodSumF64Rule));
+    }
+    if rt_bloom {
+        builder = builder.with_physical_optimizer_rule(Arc::new(EnableRuntimeBloomSidebandRule));
+    }
+    let state = builder.build();
+
+    eprintln!(
+        "sigma_q_explain_analyze rules: swap_semi={swap_semi} rt_bloom={rt_bloom} \
+         rh_sum_f64={rh_sum_f64}"
+    );
     let ctx = SessionContext::new_with_state(state);
 
+    // Σ.Q.L9 only wraps EmatixFastParquetExec. If we want the
+    // RightSemi 624-key bloom to push into the orders scan as a
+    // filter, orders has to be registered as Emat too. Probe via
+    // EMAT_REGISTER_ORDERS_AS_EMAT=1.
+    let orders_as_emat = env_on("EMAT_REGISTER_ORDERS_AS_EMAT");
     for t in TPCH_TABLES {
         let path = PathBuf::from(&dir).join(format!("{t}.parquet"));
-        if *t == "lineitem" {
+        let use_emat = *t == "lineitem" || (orders_as_emat && *t == "orders");
+        if use_emat {
             let prov = EmatixFastParquetTableProvider::try_new(path.to_string_lossy())?;
             ctx.register_table(*t, Arc::new(prov))?;
         } else {
