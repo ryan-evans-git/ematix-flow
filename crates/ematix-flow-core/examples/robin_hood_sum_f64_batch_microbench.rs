@@ -22,7 +22,7 @@
 use std::collections::HashMap;
 use std::time::Instant;
 
-use ematix_flow_core::robin_hood_agg::RobinHoodI64F64;
+use ematix_flow_core::robin_hood_agg::{RobinHoodI64F64, RobinHoodSumF64RadixAgg};
 
 const N_ROWS: usize = 6_000_000;
 const CARDINALITIES: &[i64] = &[200_000, 2_000_000, 15_000_000];
@@ -72,6 +72,19 @@ fn bench_rh_vectorised_pregrown(keys: &[i64], vals: &[f64], cap: usize) -> Optio
     t_map.insert_or_sum_batch_vectorised(keys, vals);
     std::hint::black_box(&t_map);
     Some(t.elapsed().as_secs_f64() * 1000.0)
+}
+
+/// Σ.R.1 — radix-partitioned ingest. `per_table_cap` is sized so the
+/// total capacity across `2^radix_bits` tables matches the single-table
+/// `cap` (apples-to-apples memory footprint).
+fn bench_rh_radix(keys: &[i64], vals: &[f64], cap: usize, radix_bits: u8) -> f64 {
+    let n_tables = 1usize << radix_bits;
+    let per_table_cap = (cap / n_tables).max(64);
+    let t = Instant::now();
+    let mut t_map = RobinHoodSumF64RadixAgg::new(radix_bits, per_table_cap);
+    t_map.ingest_batch_radix(keys, vals);
+    std::hint::black_box(&t_map);
+    t.elapsed().as_secs_f64() * 1000.0
 }
 
 fn bench_hb_row(keys: &[i64], vals: &[f64]) -> f64 {
@@ -169,6 +182,17 @@ fn main() {
             }
         };
 
+        // Σ.R.1 — sweep radix_bits across the L1/L2-fitting range.
+        let radix_results: Vec<(u8, f64)> = [4u8, 5, 6, 7, 8]
+            .iter()
+            .map(|&rb| {
+                let mut xs: Vec<f64> = (0..REPS)
+                    .map(|_| bench_rh_radix(&keys, &vals, cap, rb))
+                    .collect();
+                (rb, median(&mut xs))
+            })
+            .collect();
+
         let card_label = if card >= 1_000_000 {
             format!("{}M", card / 1_000_000)
         } else if card >= 1_000 {
@@ -181,6 +205,9 @@ fn main() {
         print_row("", "RH scalar + pre-grow", Some(median(&mut rh_scalar_pre)));
         print_row("", "RH vectorised", rh_vec_med);
         print_row("", "RH vec + pre-grow", rh_vec_pre_med);
+        for (rb, ms) in &radix_results {
+            print_row("", &format!("RH radix rb={rb}"), Some(*ms));
+        }
         print_row("", "hashbrown row", Some(median(&mut hb_row)));
         print_row("", "hashbrown + reserve", Some(median(&mut hb_res)));
         println!();

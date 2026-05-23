@@ -469,21 +469,43 @@ impl RobinHoodI64F64 {
     /// stage 4. Net throughput target: ≥3× scalar `insert_or_sum_batch`
     /// when pre-sized for high-cardinality workloads.
     pub fn insert_or_sum_batch_vectorised(&mut self, keys: &[i64], values: &[f64]) {
+        // Convenience wrapper: allocate scratch once and dispatch to
+        // the scratch-passing variant. Hot callers (e.g. the radix
+        // aggregator) should hold their own scratch and call
+        // `insert_or_sum_batch_vectorised_with_scratch` directly to
+        // avoid the per-call 8 KB stack-init cost.
+        const VEC_CHUNK: usize = 1024;
+        let mut slots = [0usize; VEC_CHUNK];
+        let mut hit = [false; VEC_CHUNK];
+        self.insert_or_sum_batch_vectorised_with_scratch(keys, values, &mut slots, &mut hit);
+    }
+
+    /// Σ.R.1 — scratch-passing variant of `insert_or_sum_batch_vectorised`.
+    ///
+    /// Caller provides `slots` (slot-index buffer) and `hit` (boolean
+    /// hit-mask buffer); both must be ≥ 1024 elements. The radix
+    /// aggregator calls this hundreds of thousands of times per
+    /// partition; owning the scratch in the radix struct avoids the
+    /// ~1 µs / 8 KB stack-init cost per call that otherwise dominates
+    /// when per-bin sub-batches are small.
+    pub fn insert_or_sum_batch_vectorised_with_scratch(
+        &mut self,
+        keys: &[i64],
+        values: &[f64],
+        slots: &mut [usize],
+        hit: &mut [bool],
+    ) {
         assert_eq!(
             keys.len(),
             values.len(),
             "insert_or_sum_batch_vectorised: keys and values must be same length"
         );
         const VEC_CHUNK: usize = 1024;
+        assert!(slots.len() >= VEC_CHUNK && hit.len() >= VEC_CHUNK);
         let n_total = keys.len();
         if n_total == 0 {
             return;
         }
-        // Stack-allocated work arrays — VEC_CHUNK is small enough to
-        // not stress the stack but large enough to amortise the per-
-        // stage iteration cost.
-        let mut slots = [0usize; VEC_CHUNK];
-        let mut hit = [false; VEC_CHUNK];
 
         let mut off = 0;
         while off < n_total {
@@ -718,6 +740,205 @@ impl RobinHoodSumF64Agg {
 
     pub fn table_mut(&mut self) -> &mut RobinHoodI64F64 {
         &mut self.table
+    }
+}
+
+// ---------------------------------------------------------------------
+// Σ.R.1 — radix-partitioned `SUM(f64) GROUP BY i64` aggregator.
+//
+// Cache-conscious aggregation à la DuckDB MorselDrivenParallelism:
+// hash → top `radix_bits` select a per-radix micro-table; each
+// micro-table is sized to fit in L1/L2 even at multi-million
+// total cardinality. Within a chunk we bin rows by radix first,
+// then call the L1b vectorised pipeline per bin — that keeps each
+// micro-table cache-resident for the duration of its bin.
+//
+// Designed for the Partial-aggregation phase of high-cardinality
+// `SUM(Float64-col) GROUP BY Int64-col` aggregates. FinalPartitioned
+// stays on the single-table L1b path because its input is already
+// hash-partitioned by RepartitionExec and radixing again would
+// concentrate ~all rows in one bin.
+// ---------------------------------------------------------------------
+
+/// Σ.R.1 — radix-partitioned `SUM(f64) GROUP BY i64` aggregator.
+pub struct RobinHoodSumF64RadixAgg {
+    /// `1 << radix_bits` per-radix tables. Allocated lazily on first
+    /// ingest so a Partial-mode operator that sees an empty input
+    /// doesn't pay the alloc cost.
+    tables: Vec<RobinHoodI64F64>,
+    radix_bits: u8,
+    /// Per-table init_cap passed to `RobinHoodI64F64::with_capacity`.
+    /// Caller sizes this from the upstream cardinality estimate divided
+    /// by `1 << radix_bits` so each micro-table starts at the right
+    /// load factor without grow-chain cost.
+    per_table_cap: usize,
+    /// Σ.R.1 scratch — owned to amortise per-bin call cost. Without
+    /// this, the per-call 8 KB stack-init of `slots` + `hit` inside
+    /// `insert_or_sum_batch_vectorised` dominates: 256 bins × thousands
+    /// of chunks × ~1 µs / call = >1 s overhead at 6M rows.
+    scratch_slots: Vec<usize>,
+    scratch_hit: Vec<bool>,
+}
+
+impl RobinHoodSumF64RadixAgg {
+    /// Create a radix-partitioned aggregator with `2^radix_bits`
+    /// micro-tables, each sized to `per_table_cap` slots.
+    ///
+    /// Reasonable defaults for Q18-shape Partial aggregation:
+    /// - `radix_bits = 6` → 64 tables; sweet spot for 100K–10M
+    ///   per-partition cardinality on M3 Pro (each table fits L2).
+    /// - `per_table_cap = max(input_rows_est / 4 / (1 << radix_bits),
+    ///   65_536 / (1 << radix_bits))`.
+    pub fn new(radix_bits: u8, per_table_cap: usize) -> Self {
+        assert!(
+            radix_bits <= 12,
+            "radix_bits must be ≤ 12 (4096 tables max); got {radix_bits}"
+        );
+        let n_tables = 1usize << radix_bits;
+        let mut tables = Vec::with_capacity(n_tables);
+        for _ in 0..n_tables {
+            tables.push(RobinHoodI64F64::with_capacity(per_table_cap));
+        }
+        Self {
+            tables,
+            radix_bits,
+            per_table_cap,
+            scratch_slots: vec![0usize; 1024],
+            scratch_hit: vec![false; 1024],
+        }
+    }
+
+    pub fn radix_bits(&self) -> u8 {
+        self.radix_bits
+    }
+
+    pub fn n_tables(&self) -> usize {
+        self.tables.len()
+    }
+
+    pub fn per_table_cap(&self) -> usize {
+        self.per_table_cap
+    }
+
+    /// Total entries across all micro-tables. O(n_tables); cheap.
+    pub fn len(&self) -> usize {
+        self.tables.iter().map(|t| t.len()).sum()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.tables.iter().all(|t| t.is_empty())
+    }
+
+    /// Σ.R.1 — radix-binned ingest. Processes the input in fixed-size
+    /// chunks of [`Self::VEC_CHUNK`] rows:
+    ///
+    /// 1. Hash all keys in the chunk; derive radix tag from the top
+    ///    `radix_bits` bits of the hash.
+    /// 2. Tally per-radix counts; prefix-sum to produce bin offsets.
+    /// 3. Scatter row indices into a single sorted buffer (rows
+    ///    grouped by radix tag).
+    /// 4. Per radix bin: gather the bin's keys + values into scratch
+    ///    buffers, then dispatch to
+    ///    [`RobinHoodI64F64::insert_or_sum_batch_vectorised`] against
+    ///    that bin's micro-table. The bin's table stays cache-resident
+    ///    for the duration of the bin's processing.
+    pub fn ingest_batch_radix(&mut self, keys: &[i64], values: &[f64]) {
+        assert_eq!(
+            keys.len(),
+            values.len(),
+            "ingest_batch_radix: keys and values must be same length"
+        );
+        if keys.is_empty() {
+            return;
+        }
+        const VEC_CHUNK: usize = 1024;
+        const MAX_RADIX: usize = 4096;
+        debug_assert!(self.tables.len() <= MAX_RADIX);
+
+        // Scratch arrays, stack-allocated for the inner loop.
+        let mut counts = [0u32; MAX_RADIX];
+        let mut offsets = [0u32; MAX_RADIX + 1];
+        let mut next = [0u32; MAX_RADIX];
+        let mut radix_tag = [0u16; VEC_CHUNK];
+        let mut scratch_keys = [0i64; VEC_CHUNK];
+        let mut scratch_vals = [0f64; VEC_CHUNK];
+
+        let n_tables = self.tables.len();
+        let shift: u32 = if self.radix_bits == 0 {
+            0
+        } else {
+            (usize::BITS as u32) - self.radix_bits as u32
+        };
+
+        let mut off = 0;
+        while off < keys.len() {
+            let n = (keys.len() - off).min(VEC_CHUNK);
+
+            // Stage 1: hash → radix tag; tally per-radix counts.
+            for c in counts.iter_mut().take(n_tables) {
+                *c = 0;
+            }
+            if self.radix_bits == 0 {
+                // Degenerate case: one table, no binning needed.
+                self.tables[0]
+                    .insert_or_sum_batch_vectorised(&keys[off..off + n], &values[off..off + n]);
+                off += n;
+                continue;
+            }
+            for i in 0..n {
+                let r = (hash_i64(keys[off + i]) >> shift) as u16;
+                radix_tag[i] = r;
+                counts[r as usize] += 1;
+            }
+
+            // Stage 2: prefix-sum to bin offsets.
+            let mut acc = 0u32;
+            for r in 0..n_tables {
+                offsets[r] = acc;
+                acc += counts[r];
+            }
+            offsets[n_tables] = acc;
+
+            // Stage 3: scatter keys + values into bin-sorted scratch
+            // buffers. Single pass; writes are to predictable offsets.
+            for (i, slot) in next.iter_mut().take(n_tables).enumerate() {
+                *slot = offsets[i];
+            }
+            for i in 0..n {
+                let r = radix_tag[i] as usize;
+                let dst = next[r] as usize;
+                scratch_keys[dst] = keys[off + i];
+                scratch_vals[dst] = values[off + i];
+                next[r] += 1;
+            }
+
+            // Stage 4: per-bin vectorised ingest into its micro-table.
+            // Pass the radix agg's owned scratch (slots/hit) to avoid
+            // the per-call 8 KB stack-init cost that otherwise
+            // dominates when bins are small.
+            for r in 0..n_tables {
+                let start = offsets[r] as usize;
+                let end = offsets[r + 1] as usize;
+                if end == start {
+                    continue;
+                }
+                self.tables[r].insert_or_sum_batch_vectorised_with_scratch(
+                    &scratch_keys[start..end],
+                    &scratch_vals[start..end],
+                    &mut self.scratch_slots,
+                    &mut self.scratch_hit,
+                );
+            }
+
+            off += n;
+        }
+    }
+
+    /// Iterate (key, value) pairs across all micro-tables. Order is
+    /// (radix-bin, bucket) — neither stable across reps nor sorted by
+    /// key. Callers that care should sort downstream.
+    pub fn iter(&self) -> impl Iterator<Item = (i64, f64)> + '_ {
+        self.tables.iter().flat_map(|t| t.iter())
     }
 }
 
@@ -1832,6 +2053,159 @@ mod tests {
         assert_eq!(vectorised.len(), 2);
         assert_eq!(vectorised.table().get(1), Some(15.0));
         assert_eq!(vectorised.table().get(2), Some(7.0));
+    }
+
+    // ----- Σ.R.1: RobinHoodSumF64RadixAgg correctness -----
+    // Property: radix-binned aggregation produces the same group-sum
+    // mapping as the single-table vectorised path, for any radix_bits
+    // ∈ {0..=8} and any input shape.
+
+    fn radix_vs_single_state(
+        keys: &[i64],
+        vals: &[f64],
+        radix_bits: u8,
+        per_table_cap: usize,
+    ) -> (Vec<(i64, f64)>, Vec<(i64, f64)>) {
+        // Single-table baseline.
+        let total_cap = per_table_cap.saturating_mul(1usize << radix_bits);
+        let mut single = RobinHoodI64F64::with_capacity(total_cap.max(64));
+        single.insert_or_sum_batch_vectorised(keys, vals);
+        let mut s_pairs: Vec<(i64, f64)> = single.iter().collect();
+        s_pairs.sort_by_key(|(k, _)| *k);
+
+        // Radix aggregator.
+        let mut radix = RobinHoodSumF64RadixAgg::new(radix_bits, per_table_cap);
+        radix.ingest_batch_radix(keys, vals);
+        let mut r_pairs: Vec<(i64, f64)> = radix.iter().collect();
+        r_pairs.sort_by_key(|(k, _)| *k);
+
+        (s_pairs, r_pairs)
+    }
+
+    #[test]
+    fn radix_agg_empty_input() {
+        let mut a = RobinHoodSumF64RadixAgg::new(6, 64);
+        a.ingest_batch_radix(&[], &[]);
+        assert_eq!(a.len(), 0);
+        assert!(a.is_empty());
+    }
+
+    #[test]
+    fn radix_agg_single_row_lands_in_one_bin() {
+        let mut a = RobinHoodSumF64RadixAgg::new(6, 64);
+        a.ingest_batch_radix(&[42], &[3.14]);
+        assert_eq!(a.len(), 1);
+        let pairs: Vec<(i64, f64)> = a.iter().collect();
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].0, 42);
+        assert_eq!(pairs[0].1, 3.14);
+    }
+
+    #[test]
+    fn radix_agg_radix_bits_zero_degrades_to_single_table() {
+        // radix_bits=0 → one table. Should be identical to the
+        // single-table vectorised path.
+        let n = 5000;
+        let keys: Vec<i64> = (0..n as i64).map(|k| k % 200).collect();
+        let vals: Vec<f64> = (0..n).map(|i| (i as f64) * 0.5).collect();
+        let (s, r) = radix_vs_single_state(&keys, &vals, 0, 1024);
+        assert_eq!(s, r);
+    }
+
+    #[test]
+    fn radix_agg_matches_single_low_card() {
+        // 10K rows / 100 distinct keys, heavy duplication → many rows
+        // hit the same radix bin and accumulate against the same
+        // bucket. radix_bits=4 → 16 bins.
+        let n = 10_000;
+        let card = 100i64;
+        let keys: Vec<i64> = (0..n).map(|i| (i as i64) % card).collect();
+        let vals: Vec<f64> = (0..n).map(|i| (i as f64) * 0.25).collect();
+        let (s, r) = radix_vs_single_state(&keys, &vals, 4, 64);
+        assert_eq!(s.len(), r.len());
+        for (a, b) in s.iter().zip(r.iter()) {
+            assert_eq!(a.0, b.0);
+            assert!(
+                (a.1 - b.1).abs() < 1e-6,
+                "diverged at key {}: single={} radix={}",
+                a.0,
+                a.1,
+                b.1
+            );
+        }
+    }
+
+    #[test]
+    fn radix_agg_matches_single_high_card() {
+        // 10K rows / 10K distinct keys → keys evenly spread across all
+        // radix bins. Stresses scatter + per-bin dispatch.
+        let n = 10_000;
+        let keys: Vec<i64> = (0..n as i64).collect();
+        let vals: Vec<f64> = (0..n).map(|i| (i as f64) + 0.125).collect();
+        let (s, r) = radix_vs_single_state(&keys, &vals, 6, 32);
+        assert_eq!(s.len(), r.len());
+        for (a, b) in s.iter().zip(r.iter()) {
+            assert_eq!(a.0, b.0);
+            assert!((a.1 - b.1).abs() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn radix_agg_spans_multiple_chunks() {
+        // 5000 rows ≈ 4 VEC_CHUNK + remainder; per-chunk bin offsets
+        // must reset cleanly each chunk.
+        let n = 5_000;
+        let card = 1000i64;
+        let keys: Vec<i64> = (0..n).map(|i| (i as i64 * 31) % card).collect();
+        let vals: Vec<f64> = (0..n).map(|i| ((i * 7) % 1000) as f64 * 0.01).collect();
+        let (s, r) = radix_vs_single_state(&keys, &vals, 5, 64);
+        assert_eq!(s.len(), r.len());
+        for (a, b) in s.iter().zip(r.iter()) {
+            assert_eq!(a.0, b.0);
+            assert!(
+                (a.1 - b.1).abs() < 1e-6,
+                "diverged at key {}: single={} radix={}",
+                a.0,
+                a.1,
+                b.1
+            );
+        }
+    }
+
+    #[test]
+    fn radix_agg_max_radix_bits_8() {
+        // radix_bits=8 → 256 bins; ensures the per-bin counters
+        // (u32) array fits and offsets[] indexing is correct.
+        let n = 20_000;
+        let keys: Vec<i64> = (0..n as i64).map(|k| k % 1000).collect();
+        let vals: Vec<f64> = (0..n).map(|i| (i as f64) * 0.5).collect();
+        let (s, r) = radix_vs_single_state(&keys, &vals, 8, 16);
+        assert_eq!(s.len(), r.len());
+        for (a, b) in s.iter().zip(r.iter()) {
+            assert_eq!(a.0, b.0);
+            assert!((a.1 - b.1).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn radix_agg_triggers_per_bin_grow() {
+        // Start with tiny per_table_cap so several bins exceed their
+        // initial capacity and trigger grow() mid-ingest. Verify all
+        // keys survive at correct values.
+        let n = 2_000;
+        let keys: Vec<i64> = (0..n as i64).collect();
+        let vals: Vec<f64> = (0..n).map(|i| (i as f64) + 0.5).collect();
+        let mut radix = RobinHoodSumF64RadixAgg::new(4, 4); // 16 bins, cap=4
+        radix.ingest_batch_radix(&keys, &vals);
+        assert_eq!(radix.len(), n);
+        let mut pairs: Vec<(i64, f64)> = radix.iter().collect();
+        pairs.sort_by_key(|(k, _)| *k);
+        for k in 0..n as i64 {
+            assert!(
+                (pairs[k as usize].1 - (k as f64 + 0.5)).abs() < 1e-9,
+                "lost or wrong value for key {k} after per-bin grow"
+            );
+        }
     }
 
     #[test]
