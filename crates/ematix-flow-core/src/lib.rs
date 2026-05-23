@@ -204,6 +204,11 @@ pub mod bridge_filter_sideband;
 // union-merged at completion), and publishes an I64InBloom
 // ColumnPredicate to a BridgeFilterSideband shared with the probe scan.
 pub mod build_side_bloom_emitter_exec;
+// Σ.Q.L9 slice 3 (2026-05-23): planner rule that threads a runtime
+// sideband between HashJoinExec's build child (wrapped with
+// BuildSideBloomEmitterExec) and the probe-side EmatixFastParquetExec
+// (via with_runtime_sideband). Opt-in via install_runtime_bloom_sideband_rule.
+pub mod runtime_bloom_sideband_rule;
 // Σ.O (2026-05-21): in-memory LRU cache of decoded RecordBatch by
 // (file_path, row_group_idx, projection_hash). Avoids re-decoding
 // the same parquet column chunks across queries in the same session.
