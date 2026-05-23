@@ -124,6 +124,87 @@ impl PhysicalOptimizerRule for SwapSemiJoinBuildSideRule {
                 return Ok(Transformed::no(p));
             }
 
+            // Σ.Q.L2 (2026-05-23): partition-mode-aware gate.
+            //
+            // DataFusion's HashJoinExec asserts two invariants in
+            // execute():
+            //   * mode != CollectLeft   || left_partitions == 1
+            //   * mode != Partitioned   || left_partitions == right_partitions
+            //
+            // The original L2 rule passed `hj.partition_mode().clone()`
+            // unchanged to `swap_inputs`. That works for joins where
+            // both sides are already Partitioned (the Q18-shape this
+            // rule was designed for) but explodes on `CollectLeft`
+            // joins whose old RIGHT — the new LEFT after swap — has
+            // >1 partition (Q20 shape: the agg-bounded side is itself
+            // the output of a 14-partition Inner subquery).
+            //
+            // The non-trivial question is what to do in that case.
+            // Two options were considered:
+            //
+            //   (a) Upgrade mode to `Partitioned` and synthesize
+            //       `RepartitionExec(Hash([key], N))` wrappers on both
+            //       new children. This is "make the swap work
+            //       everywhere" but it duplicates JoinSelection's
+            //       partition-planning work, and crucially: if the
+            //       original `CollectLeft` was chosen because
+            //       JoinSelection had stats showing the original LEFT
+            //       was small, then forcing Partitioned mode after the
+            //       swap produces a strictly-worse plan (now both
+            //       sides pay hash-repartition cost, and the
+            //       agg-bounded subtree we swapped onto LEFT may not
+            //       actually be smaller than the original LEFT was).
+            //
+            //   (b) Refuse the swap when CollectLeft can't be
+            //       preserved. This honours JoinSelection's
+            //       partition-mode choice — JoinSelection knows which
+            //       side is bounded based on real plan stats; our
+            //       "agg means bounded" heuristic was only intended to
+            //       fill the gap when JoinSelection's stats were
+            //       absent (the case it picks `Auto` / arbitrary).
+            //       Keeping CollectLeft means the swap is plan-hygiene
+            //       only when JoinSelection already validated the left
+            //       side as small.
+            //
+            // We go with (b). The rule fires safely on Q18 (its
+            // designed target — Partitioned mode, swap preserves
+            // shape) and stays quiet on Q20 (CollectLeft chosen for a
+            // reason — original LEFT IS small after the nation filter;
+            // swapping would produce a regression even if it didn't
+            // crash). L2 has no recorded TPC-H wins yet (per Σ.Q.L2
+            // bench notes), so this conservative gate doesn't sacrifice
+            // any measured perf.
+            use datafusion::physical_plan::ExecutionPlanProperties;
+            use datafusion::physical_plan::joins::PartitionMode;
+            match hj.partition_mode() {
+                PartitionMode::CollectLeft => {
+                    // After swap, new LEFT = old RIGHT.
+                    let new_left_partitions =
+                        hj.right().output_partitioning().partition_count();
+                    if new_left_partitions != 1 {
+                        return Ok(Transformed::no(p));
+                    }
+                }
+                PartitionMode::Partitioned => {
+                    // For Partitioned joins, the assertion is
+                    // `left_partitions == right_partitions`. The swap
+                    // swaps inputs symmetrically, so if both children
+                    // already match (which any well-formed Partitioned
+                    // plan does), the swap preserves that property.
+                    let lp = hj.left().output_partitioning().partition_count();
+                    let rp = hj.right().output_partitioning().partition_count();
+                    if lp != rp {
+                        // Already-malformed plan — leave it alone.
+                        return Ok(Transformed::no(p));
+                    }
+                }
+                _ => {
+                    // PartitionMode::Auto and any future variants —
+                    // play it safe.
+                    return Ok(Transformed::no(p));
+                }
+            }
+
             let swapped = hj.swap_inputs(hj.partition_mode().clone())?;
             Ok(Transformed::yes(swapped))
         })
@@ -169,6 +250,7 @@ mod tests {
     use datafusion::common::NullEquality;
     use datafusion::datasource::memory::MemorySourceConfig;
     use datafusion::physical_expr::PhysicalExpr;
+    use datafusion::physical_plan::ExecutionPlanProperties;
     use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode, PhysicalGroupBy};
     use datafusion::physical_plan::expressions::Column;
     use datafusion::physical_plan::joins::PartitionMode;
@@ -302,5 +384,171 @@ mod tests {
         let out = rule.optimize(hj, &ConfigOptions::default()).unwrap();
         let out_hj = out.as_any().downcast_ref::<HashJoinExec>().unwrap();
         assert_eq!(*out_hj.join_type(), JoinType::Inner);
+    }
+
+    /// Σ.Q.L2 fix regression test (Q20 shape, 2026-05-23): a
+    /// `CollectLeft` `LeftSemi` join whose RIGHT side has >1
+    /// partition must NOT be swapped — the swap would put a
+    /// multi-partition subtree on the new LEFT and violate
+    /// HashJoinExec's `mode != CollectLeft || left_partitions == 1`
+    /// assertion.
+    #[test]
+    fn collect_left_with_multi_partition_right_does_not_swap() {
+        use datafusion::arrow::array::Int64Array;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
+        // Single-partition LEFT (typical CollectLeft shape).
+        let left: Arc<dyn ExecutionPlan> = MemorySourceConfig::try_new_exec(
+            &[vec![
+                RecordBatch::try_new(
+                    schema.clone(),
+                    vec![Arc::new(Int64Array::from(vec![1i64, 2, 3]))],
+                )
+                .unwrap(),
+            ]],
+            schema.clone(),
+            None,
+        )
+        .unwrap();
+        // Multi-partition RIGHT (Q20-shape: would become new LEFT
+        // post-swap and violate the CollectLeft invariant).
+        let right_scan: Arc<dyn ExecutionPlan> = MemorySourceConfig::try_new_exec(
+            &[
+                vec![RecordBatch::try_new(
+                    schema.clone(),
+                    vec![Arc::new(Int64Array::from(vec![1i64, 2]))],
+                )
+                .unwrap()],
+                vec![RecordBatch::try_new(
+                    schema.clone(),
+                    vec![Arc::new(Int64Array::from(vec![3i64, 4]))],
+                )
+                .unwrap()],
+            ],
+            schema.clone(),
+            None,
+        )
+        .unwrap();
+        assert!(right_scan.output_partitioning().partition_count() >= 2);
+
+        // Wrap RIGHT in an AggregateExec to trigger L2's "swap-if-
+        // agg-side" condition.
+        let gb = PhysicalGroupBy::new_single(vec![(
+            Arc::new(Column::new("a", 0)) as Arc<dyn PhysicalExpr>,
+            "a".to_string(),
+        )]);
+        let agg = Arc::new(
+            AggregateExec::try_new(
+                AggregateMode::FinalPartitioned,
+                gb,
+                vec![],
+                vec![],
+                right_scan.clone(),
+                right_scan.schema(),
+            )
+            .unwrap(),
+        );
+
+        let on = vec![(
+            Arc::new(Column::new("a", 0)) as Arc<dyn PhysicalExpr>,
+            Arc::new(Column::new("a", 0)) as Arc<dyn PhysicalExpr>,
+        )];
+        let hj = Arc::new(
+            HashJoinExec::try_new(
+                left,
+                agg,
+                on,
+                None,
+                &JoinType::LeftSemi,
+                None,
+                PartitionMode::CollectLeft,
+                NullEquality::NullEqualsNothing,
+                false,
+            )
+            .unwrap(),
+        );
+
+        let rule = SwapSemiJoinBuildSideRule;
+        let out = rule.optimize(hj, &ConfigOptions::default()).unwrap();
+        let out_hj = out.as_any().downcast_ref::<HashJoinExec>().unwrap();
+        // Original shape preserved — rule refused the unsafe swap.
+        assert_eq!(*out_hj.join_type(), JoinType::LeftSemi);
+        assert!(matches!(out_hj.partition_mode(), PartitionMode::CollectLeft));
+    }
+
+    /// Σ.Q.L2 fix regression test (Q18-shape stays winning,
+    /// 2026-05-23): a `Partitioned` `LeftSemi` join with matching
+    /// partition counts on both sides MUST still swap. The new gate
+    /// shouldn't block the L2 lever's designed target.
+    #[test]
+    fn partitioned_mode_with_matching_partition_counts_still_swaps() {
+        use datafusion::arrow::array::Int64Array;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
+        let two_part = || -> Arc<dyn ExecutionPlan> {
+            MemorySourceConfig::try_new_exec(
+                &[
+                    vec![RecordBatch::try_new(
+                        schema.clone(),
+                        vec![Arc::new(Int64Array::from(vec![1i64, 2]))],
+                    )
+                    .unwrap()],
+                    vec![RecordBatch::try_new(
+                        schema.clone(),
+                        vec![Arc::new(Int64Array::from(vec![3i64, 4]))],
+                    )
+                    .unwrap()],
+                ],
+                schema.clone(),
+                None,
+            )
+            .unwrap()
+        };
+        let left = two_part();
+        let right_scan = two_part();
+        assert_eq!(
+            left.output_partitioning().partition_count(),
+            right_scan.output_partitioning().partition_count()
+        );
+
+        let gb = PhysicalGroupBy::new_single(vec![(
+            Arc::new(Column::new("a", 0)) as Arc<dyn PhysicalExpr>,
+            "a".to_string(),
+        )]);
+        let agg = Arc::new(
+            AggregateExec::try_new(
+                AggregateMode::FinalPartitioned,
+                gb,
+                vec![],
+                vec![],
+                right_scan.clone(),
+                right_scan.schema(),
+            )
+            .unwrap(),
+        );
+        let on = vec![(
+            Arc::new(Column::new("a", 0)) as Arc<dyn PhysicalExpr>,
+            Arc::new(Column::new("a", 0)) as Arc<dyn PhysicalExpr>,
+        )];
+        let hj = Arc::new(
+            HashJoinExec::try_new(
+                left,
+                agg,
+                on,
+                None,
+                &JoinType::LeftSemi,
+                None,
+                PartitionMode::Partitioned,
+                NullEquality::NullEqualsNothing,
+                false,
+            )
+            .unwrap(),
+        );
+
+        let rule = SwapSemiJoinBuildSideRule;
+        let out = rule.optimize(hj, &ConfigOptions::default()).unwrap();
+        let out_hj = out.as_any().downcast_ref::<HashJoinExec>().unwrap();
+        // Swap fired — L2 still works on its designed target shape.
+        assert_eq!(*out_hj.join_type(), JoinType::RightSemi);
     }
 }
