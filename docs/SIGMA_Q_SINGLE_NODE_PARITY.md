@@ -116,7 +116,7 @@ Status legend:
 | L1 | ~~Global PARTITIONS=28 at SF=10~~ | 🔴 NEG | Q18 win (-15.6%) but Q06/Q07/Q08/Q09/Q10/Q16/Q21 all regress 5-10%. Geomean shifts +1.09% — WORSE. Per-query shape matters; flat partitions tuning is not the right lever. Q18-specific tuning (gating on cardinality estimate) may still be possible — see L1b. |
 | L1b | Per-query auto-partition tuned by aggregate cardinality | 🔵 PROPOSED | Q18 winning at 28+ partitions correlates with its 15M-group FinalPartitioned aggregate. Other queries with smaller aggregates (Q06/Q09/Q11 nations) lose from over-partitioning. Need a planner hook that examines AggregateExec group cardinality estimates and bumps partitions only for the relevant subtree. Bigger build — likely 200-500 LOC. |
 | L1b | Extend Σ.N.d rule to SUM-by-i64-key aggregate | 🔵 PROPOSED (deferred — requires RobinHoodI64F64 table) | RobinHood currently only has I64→u64 (for COUNT). For SUM(f64), need a new I64→f64 variant. Larger lever; defer until L1 lands and we see remaining Q18 gap. |
-| L2 | **LeftSemi join swap-build-side** | 🔵 PROPOSED (high priority) | Q18 LeftSemi appears inverted: builds hash on 60M rows, probes with 624. Should be reversed. Verify by reading HashJoinExec swap rules + force the swap. |
+| L2 | LeftSemi join swap-build-side | 🟡 RULE LANDED — NEUTRAL on TPC-H 22 | `SwapSemiJoinBuildSideRule` (crates/ematix-flow-core/src/swap_semi_join_build_rule.rs). Walks plan after JoinSelection, swaps semi/anti hash joins so the side with an `AggregateExec` becomes the BUILD. EXPLAIN confirms the swap fires on Q18 (LeftSemi → RightSemi, build now on 624-row agg subtree, probe on 60M). Q18 SF=10 wall-time: **708.18 ± 55 ms (OFF) vs 726.84 ± 64 ms (ON)** — within noise. Hypothesis: DataFusion's 14-way partitioned hash join already shards the 60M build (~4.3M rows / partition), so inversion cost is small relative to the FinalPartitioned aggregate hot path. SF=1 22-query A/B: every query within ±5% (noise). Decision: keep rule on as plan-hygiene; it correctly fills the gap left by `JoinSelection` when stats are absent. Not the Q18 silver bullet. |
 | L3 | Multi-column parallel decode (task #397) | ⚫ DEPRIORITIZED for Q18 | Q18 decode is 230ms / 700ms = 33% — not the dominant cost. Re-evaluate after L1/L2 land; might matter for Q01/Q03 (more scan-bound). |
 | L4 | Bloom-on-build for HashJoinExec | 🔵 PROPOSED | Σ.J.2 infra exists. Q07/Q21 might benefit. Less urgent than L1/L2 because Q18 isn't bloom-prunable (semi-join already does the work). |
 | L5 | Custom RobinHoodHashJoin | ⚫ DEPRIORITIZED | If L1 extension fixes Q18's aggregate, hash join itself is only 13s of 700ms = secondary. Defer. |
@@ -176,6 +176,63 @@ by reading HashJoinExec source for join-type-specific swap rules.
 lineitem decode is ~230ms out of 696ms total → caching saves ~115ms
 but the aggregate dominates. Confirmed: cache is wired correctly but
 Q18 isn't decode-bound.
+
+---
+
+### Σ.Q.L2 — SwapSemiJoinBuildSideRule
+
+**Status**: 🟡 RULE LANDED, NEUTRAL.
+
+**Hypothesis**: Q18 LeftSemi has BUILD on the 60M-row Inner-joined left
+and PROBE on the 624-row Filter/AggregateExec right; reversing should
+cut hash-table build cost and free the runtime for the downstream agg.
+
+**Implementation**: `crates/ematix-flow-core/src/swap_semi_join_build_rule.rs`.
+Post-pass PhysicalOptimizerRule. For `HashJoinExec` of join type
+`{LeftSemi, LeftAnti, RightSemi, RightAnti}` that supports swap and is
+not null-aware, if one side contains an `AggregateExec` and the other
+doesn't, call `hash_join.swap_inputs(partition_mode)` so the
+agg-bounded side becomes the build. Tree-walk stops at HashJoinExec
+boundaries so we only count aggregates that bound *this* join's input.
+
+3 unit tests pass (left-semi-with-right-agg swaps to right-semi;
+left-semi-without-right-agg unchanged; inner-join untouched).
+
+**Plan verification**: EXPLAIN on Q18 SF=10 before/after:
+
+- OFF: `HashJoinExec LeftSemi on=[(o_orderkey, l_orderkey)]` with
+  60M-row inner-join on left.
+- ON:  `HashJoinExec RightSemi on=[(l_orderkey, o_orderkey)]` with the
+  624-row Filter→Aggregate subtree on left (now the build).
+
+**Q18 SF=10 wall-time** (10 trials × 3 warmups):
+
+| Variant | ematix (ms) |
+|---|---|
+| swap OFF (EMAT_SWAP_SEMI=0) | 708.18 ± 55.19 |
+| swap ON  (EMAT_SWAP_SEMI=1) | 726.84 ± 64.38 |
+
+Difference is inside one stddev. **The semi-join inversion is not Q18's
+bottleneck** — DataFusion's partitioned hash join already parallelizes
+build/probe over 14 partitions, so a "wrong-side build" of 60M ≈ 4.3M
+rows / partition isn't catastrophic. The dominant cost remains the
+FinalPartitioned `sum(f64) GROUP BY l_orderkey` at 15M cardinality.
+
+**SF=1 22-query A/B**: every query within ±5% of OFF baseline. Q15
+returned 0 rows in both runs because EMAT_RULES=v040 omits the
+DedupeAggregateForFloatDeterminism rule (unrelated to L2).
+
+**Decision**: keep the rule installed by default in
+`preset::with_optimizer_rules`. It's plan-hygiene — filling the gap
+left by JoinSelection when stats are absent. Net cost is one walk +
+zero practical wins on TPC-H 22; will pay off on workloads with
+extreme size skew where the partition shard count can't amortise the
+inversion.
+
+**Next**: pivot to L4 (bloom-on-build for HashJoinExec) — Σ.J.2.b
+infrastructure exists for distributed (Flight headers + probe-side
+rule + build-side emitter), but the BloomFilter primitive should
+apply locally too. Q07/Q21 are the likely targets.
 
 ---
 

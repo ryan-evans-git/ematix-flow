@@ -75,6 +75,10 @@ pub mod fused_aggregate_filter_multi_agg_rule;
 // f64 SUM non-determinism (TPC-H Q15's CTE-duplicate shape). SCAFFOLD
 // ONLY — not yet wired into any SessionState. See module docs.
 pub mod dedupe_aggregate_rule;
+// Σ.Q L2: swap LeftSemi/LeftAnti join sides when the probe side has an
+// AggregateExec (i.e., is bounded-small) but the build side doesn't.
+// Fixes Q18 SF=10 build-on-60M-rows inversion. See module docs.
+pub mod swap_semi_join_build_rule;
 // Σ.P.1: session-scoped subquery CSE. SharedSubtreeExec wraps a
 // duplicated subtree; both consumers share an Arc<CachedBatches> so
 // the first execute() computes and the rest replay. Backing storage

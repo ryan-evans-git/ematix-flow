@@ -33,6 +33,7 @@ use ematix_flow_core::ematix_fast_parquet::EmatixFastParquetTableProvider;
 use ematix_flow_core::fast_parquet::FastParquetTableProvider;
 use ematix_flow_core::fused_aggregate_filter_multi_agg_rule::InjectFilterMultiAggRule;
 use ematix_flow_core::fused_aggregate_filter_sum_rule::InjectFilterSumRule;
+use ematix_flow_core::swap_semi_join_build_rule::SwapSemiJoinBuildSideRule;
 use futures_util::TryStreamExt;
 
 #[global_allocator]
@@ -287,6 +288,17 @@ async fn build_ematix_ctx(data_dir: &Path) -> Result<SessionContext, Box<dyn std
             .with_physical_optimizer_rule(Arc::new(EnableDictGroupCountRule))
             .with_physical_optimizer_rule(Arc::new(InjectFilterMultiAggRule))
             .with_physical_optimizer_rule(Arc::new(InjectFilterSumRule));
+    }
+    // Σ.Q L2: opt-in semi-join build-side swap. ON by default in "all"
+    // and "swap"; OFF for "v040" / "none" / "dedupe" so A/B benches can
+    // isolate its impact.
+    let swap_enabled = std::env::var("EMAT_SWAP_SEMI")
+        .ok()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or_else(|| matches!(rules.as_str(), "all" | "swap"));
+    if swap_enabled {
+        builder =
+            builder.with_physical_optimizer_rule(Arc::new(SwapSemiJoinBuildSideRule));
     }
     let state = builder.build();
     let ctx = SessionContext::new_with_state(state);
