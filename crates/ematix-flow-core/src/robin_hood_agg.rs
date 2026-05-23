@@ -320,6 +320,291 @@ pub fn count_accumulator(existing: u64, delta: u64) -> u64 {
     existing.saturating_add(delta)
 }
 
+// ---------------------------------------------------------------------
+// Σ.Q.L1b — Robin Hood table specialised for i64 keys + f64 values.
+// Mirror of RobinHoodI64U64 with `value: f64`. Targets the Q18 shape:
+// `SUM(l_quantity::Float64) GROUP BY l_orderkey::Int64` at 15M
+// cardinality. The U64 version is the COUNT/SUM(i64) workhorse; this
+// is the SUM(f64) sibling. Kept as a separate type (not a generic)
+// because the EMPTY sentinel + accumulator semantics differ enough
+// from u64 to make a flat copy clearer than a parameterised one.
+// ---------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy)]
+struct BucketF64 {
+    key: i64,
+    value: f64,
+    /// Probe distance from ideal slot. `EMPTY` = vacant.
+    psl: u32,
+}
+
+impl BucketF64 {
+    const fn empty() -> Self {
+        Self {
+            key: 0,
+            value: 0.0,
+            psl: EMPTY_PSL,
+        }
+    }
+    fn is_empty(&self) -> bool {
+        self.psl == EMPTY_PSL
+    }
+}
+
+/// Σ.Q.L1b — Robin Hood hash table specialised for i64 keys + f64
+/// values. Used by `RobinHoodSumF64Agg` for `SUM(f64) GROUP BY i64`.
+/// Same probe / load / grow strategy as `RobinHoodI64U64`.
+pub struct RobinHoodI64F64 {
+    buckets: Vec<BucketF64>,
+    mask: usize,
+    len: usize,
+}
+
+impl Default for RobinHoodI64F64 {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RobinHoodI64F64 {
+    pub fn new() -> Self {
+        Self::with_capacity(INITIAL_CAPACITY)
+    }
+
+    pub fn with_capacity(cap: usize) -> Self {
+        let cap = cap.max(INITIAL_CAPACITY).next_power_of_two();
+        Self {
+            buckets: vec![BucketF64::empty(); cap],
+            mask: cap - 1,
+            len: 0,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.buckets.len()
+    }
+
+    pub fn clear(&mut self) {
+        for b in &mut self.buckets {
+            *b = BucketF64::empty();
+        }
+        self.len = 0;
+    }
+
+    /// Σ.Q.L1b — SUM-style entry. If `key` is present, adds `delta` to
+    /// the existing value. Otherwise inserts (key, delta). Returns the
+    /// post-update value.
+    pub fn insert_or_sum(&mut self, key: i64, delta: f64) -> f64 {
+        if self.needs_grow() {
+            self.grow();
+        }
+        let h = hash_i64(key);
+        let mut slot = h & self.mask;
+        let mut psl: u32 = 0;
+        let mut incoming = BucketF64 {
+            key,
+            value: delta,
+            psl: 0,
+        };
+        loop {
+            let b = self.buckets[slot];
+            if b.is_empty() {
+                incoming.psl = psl;
+                self.buckets[slot] = incoming;
+                self.len += 1;
+                return incoming.value;
+            }
+            // Robin Hood invariant: at most one bucket per key.
+            if b.key == incoming.key && !b.is_empty() {
+                let new_val = b.value + incoming.value;
+                self.buckets[slot].value = new_val;
+                return new_val;
+            }
+            if incoming.psl > b.psl {
+                self.buckets[slot] = incoming;
+                incoming = b;
+            }
+            slot = (slot + 1) & self.mask;
+            psl = psl.saturating_add(1);
+            incoming.psl = incoming.psl.saturating_add(1);
+        }
+    }
+
+    /// Bulk `SUM(values) GROUP BY keys` ingestion. Caller should
+    /// pre-size via `with_capacity` for high-cardinality merges.
+    pub fn insert_or_sum_batch(&mut self, keys: &[i64], values: &[f64]) {
+        assert_eq!(
+            keys.len(),
+            values.len(),
+            "insert_or_sum_batch: keys and values must be same length"
+        );
+        for i in 0..keys.len() {
+            self.insert_or_sum(keys[i], values[i]);
+        }
+    }
+
+    /// Jump-resize to fit at least `target` entries at 70% load.
+    /// Mirrors `RobinHoodI64U64::reserve_to_capacity_pow2_of`.
+    pub fn reserve_to_capacity_pow2_of(&mut self, target: usize) {
+        let target_capacity = (target * MAX_LOAD_FACTOR_DENOMINATOR)
+            .div_ceil(MAX_LOAD_FACTOR_NUMERATOR)
+            .next_power_of_two();
+        while self.buckets.len() < target_capacity {
+            self.grow();
+        }
+    }
+
+    /// Iterate (key, value). Order is bucket order (not insertion).
+    pub fn iter(&self) -> impl Iterator<Item = (i64, f64)> + '_ {
+        self.buckets
+            .iter()
+            .filter(|b| !b.is_empty())
+            .map(|b| (b.key, b.value))
+    }
+
+    /// Read-only lookup. Returns Some(value) if key present.
+    pub fn get(&self, key: i64) -> Option<f64> {
+        if self.buckets.is_empty() {
+            return None;
+        }
+        let h = hash_i64(key);
+        let mut slot = h & self.mask;
+        let mut psl: u32 = 0;
+        loop {
+            let b = self.buckets[slot];
+            if b.is_empty() {
+                return None;
+            }
+            if b.key == key {
+                return Some(b.value);
+            }
+            if psl > b.psl {
+                return None;
+            }
+            slot = (slot + 1) & self.mask;
+            psl = psl.saturating_add(1);
+            if psl as usize >= self.buckets.len() {
+                return None;
+            }
+        }
+    }
+
+    fn needs_grow(&self) -> bool {
+        self.len * MAX_LOAD_FACTOR_DENOMINATOR >= self.buckets.len() * MAX_LOAD_FACTOR_NUMERATOR
+    }
+
+    fn grow(&mut self) {
+        let new_cap = self.buckets.len() * 2;
+        let old = std::mem::replace(&mut self.buckets, vec![BucketF64::empty(); new_cap]);
+        self.mask = new_cap - 1;
+        self.len = 0;
+        for b in old {
+            if !b.is_empty() {
+                // Re-insert. Since `insert_or_sum` adds on key-match,
+                // and the re-insertion key is fresh in the new buckets
+                // array, this acts as a plain insert.
+                self.insert_or_sum(b.key, b.value);
+            }
+        }
+    }
+}
+
+/// Σ.Q.L1b — streaming `SUM(f64) GROUP BY i64` aggregator. Sister to
+/// `RobinHoodCountAgg`. Mirrors the same shape so the operator wiring
+/// can dispatch on an `AggKind` enum.
+pub struct RobinHoodSumF64Agg {
+    table: RobinHoodI64F64,
+}
+
+impl Default for RobinHoodSumF64Agg {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RobinHoodSumF64Agg {
+    pub fn new() -> Self {
+        Self {
+            table: RobinHoodI64F64::new(),
+        }
+    }
+
+    pub fn with_capacity(cap: usize) -> Self {
+        Self {
+            table: RobinHoodI64F64::with_capacity(cap),
+        }
+    }
+
+    /// Ingest one batch's (group_key, sum_value) pair. Skips rows where
+    /// either column is null — DataFusion's analyzer drops NULL keys
+    /// in SQL standard `SUM GROUP BY` semantics, and NULL value rows
+    /// don't contribute to a sum.
+    pub fn ingest_batch(
+        &mut self,
+        keys: &arrow_array::Int64Array,
+        values: &arrow_array::Float64Array,
+    ) {
+        use arrow_array::Array;
+        assert_eq!(
+            keys.len(),
+            values.len(),
+            "ingest_batch: key and value arrays must be same length"
+        );
+        let n = keys.len();
+        if keys.null_count() == 0 && values.null_count() == 0 {
+            for i in 0..n {
+                let k = keys.value(i);
+                let v = values.value(i);
+                self.table.insert_or_sum(k, v);
+            }
+        } else {
+            for i in 0..n {
+                if !keys.is_null(i) && !values.is_null(i) {
+                    let k = keys.value(i);
+                    let v = values.value(i);
+                    self.table.insert_or_sum(k, v);
+                }
+            }
+        }
+    }
+
+    /// Σ.Q.L1b — merge Partial output of the form
+    /// `(group_key i64, partial_sum f64)` from upstream. Identical to
+    /// `ingest_batch` but named for symmetry with
+    /// `RobinHoodCountAgg::ingest_partial_counts`.
+    pub fn ingest_partial_sums(
+        &mut self,
+        keys: &arrow_array::Int64Array,
+        partial_sums: &arrow_array::Float64Array,
+    ) {
+        self.ingest_batch(keys, partial_sums);
+    }
+
+    pub fn len(&self) -> usize {
+        self.table.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.table.is_empty()
+    }
+
+    pub fn table(&self) -> &RobinHoodI64F64 {
+        &self.table
+    }
+
+    pub fn table_mut(&mut self) -> &mut RobinHoodI64F64 {
+        &mut self.table
+    }
+}
+
 /// `SUM(x)` — each insert adds the delta.
 pub fn sum_accumulator(existing: u64, delta: u64) -> u64 {
     existing.saturating_add(delta)
@@ -1195,5 +1480,95 @@ mod tests {
             rh_pairs, df_pairs,
             "robin hood output differs from datafusion"
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // Σ.Q.L1b — RobinHoodI64F64 + SumF64Agg tests.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn f64_insert_and_lookup() {
+        let mut t = RobinHoodI64F64::new();
+        t.insert_or_sum(42, 1.5);
+        t.insert_or_sum(7, 2.25);
+        t.insert_or_sum(42, 0.5);
+        assert_eq!(t.get(42), Some(2.0));
+        assert_eq!(t.get(7), Some(2.25));
+        assert_eq!(t.get(99), None);
+        assert_eq!(t.len(), 2);
+    }
+
+    #[test]
+    fn f64_sum_accumulates() {
+        let mut t = RobinHoodI64F64::new();
+        for (k, v) in [(1i64, 1.0), (2, 2.0), (1, 3.0), (3, 4.0), (2, 5.0)] {
+            t.insert_or_sum(k, v);
+        }
+        assert_eq!(t.get(1), Some(4.0));
+        assert_eq!(t.get(2), Some(7.0));
+        assert_eq!(t.get(3), Some(4.0));
+    }
+
+    #[test]
+    fn f64_grows_past_initial_capacity() {
+        let mut t = RobinHoodI64F64::with_capacity(64);
+        for k in 0..1000i64 {
+            t.insert_or_sum(k, k as f64 * 0.5);
+        }
+        assert_eq!(t.len(), 1000);
+        for k in 0..1000i64 {
+            assert_eq!(t.get(k), Some(k as f64 * 0.5), "missing key {k}");
+        }
+        assert!(t.capacity() >= 1000);
+    }
+
+    #[test]
+    fn f64_agg_ingest_batch() {
+        use arrow_array::{Float64Array, Int64Array};
+        let keys = Int64Array::from(vec![1i64, 2, 1, 3, 2, 1]);
+        let vals = Float64Array::from(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let mut agg = RobinHoodSumF64Agg::with_capacity(8);
+        agg.ingest_batch(&keys, &vals);
+        assert_eq!(agg.table().get(1), Some(10.0)); // 1+3+6
+        assert_eq!(agg.table().get(2), Some(7.0)); // 2+5
+        assert_eq!(agg.table().get(3), Some(4.0));
+    }
+
+    #[test]
+    fn f64_agg_skips_nulls() {
+        use arrow_array::{Float64Array, Int64Array};
+        let keys = Int64Array::from(vec![Some(1i64), None, Some(2), Some(1)]);
+        let vals = Float64Array::from(vec![Some(10.0), Some(20.0), None, Some(5.0)]);
+        let mut agg = RobinHoodSumF64Agg::new();
+        agg.ingest_batch(&keys, &vals);
+        // (None, 20.0) and (2, None) are both dropped; only (1, 10) +
+        // (1, 5) survive.
+        assert_eq!(agg.len(), 1);
+        assert_eq!(agg.table().get(1), Some(15.0));
+    }
+
+    /// Q18-shape sanity: 10K distinct i64 keys, two batches, verify
+    /// SUM is bit-exact for the synthetic data (no FP rounding because
+    /// values are integer-valued f64).
+    #[test]
+    fn f64_agg_q18_shape() {
+        use arrow_array::{Float64Array, Int64Array};
+        let n_groups = 10_000i64;
+        let rows_per_group = 5usize;
+        let mut keys: Vec<i64> = Vec::new();
+        let mut vals: Vec<f64> = Vec::new();
+        for k in 0..n_groups {
+            for r in 0..rows_per_group {
+                keys.push(k);
+                vals.push((r as f64 + 1.0) * 7.0);
+            }
+        }
+        let mut agg = RobinHoodSumF64Agg::with_capacity(n_groups as usize * 2);
+        agg.ingest_batch(&Int64Array::from(keys), &Float64Array::from(vals));
+        assert_eq!(agg.len(), n_groups as usize);
+        // Each group: (1+2+3+4+5)*7 = 105.
+        for k in 0..n_groups {
+            assert_eq!(agg.table().get(k), Some(105.0), "wrong sum for key {k}");
+        }
     }
 }
