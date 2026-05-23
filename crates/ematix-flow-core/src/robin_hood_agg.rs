@@ -1461,6 +1461,462 @@ impl ExecutionPlan for RobinHoodAggregateExec {
     }
 }
 
+// ---------------------------------------------------------------------
+// Σ.Q.L12 — SIMD-tagged hash table specialised for i64 keys + f64
+// values. SwissTable-style metadata-byte probing on 16-byte groups.
+// Targets the Q17 SF=10 shape: AVG(f64) GROUP BY i64 at 2M cardinality.
+//
+// Rationale: existing RobinHoodI64F64 already beats hashbrown by 1-5%,
+// but its probe touches the full 24-byte bucket (key + value + PSL)
+// for every probed slot. Tagged probing reads a 16-byte tag group once
+// (one cache-line load), compares all 16 tags in parallel via NEON,
+// and only touches keys/values on tag-match. Sized for the high-
+// cardinality SUM/AVG workload where stage-4 chained probes dominate
+// the existing PSL-only path.
+// ---------------------------------------------------------------------
+
+const TAG_EMPTY: u8 = 0xFF;
+const GROUP_SIZE: usize = 16;
+
+#[inline(always)]
+fn tag_from_hash(h: usize) -> u8 {
+    // Top 7 bits of hash. High bit always clear, so real tags never
+    // collide with TAG_EMPTY (0xFF, high bit set).
+    ((h >> 57) as u8) & 0x7F
+}
+
+/// Σ.Q.L12 — match a tag byte across a 16-byte group on aarch64+NEON.
+/// Returns a u16 bitmask: bit i set iff slot+i equals `byte`. NEON has
+/// no native movemask; we AND with a bit-pattern then horizontal-sum
+/// each half (the compare result is 0x00 or 0xFF per lane so bits don't
+/// overlap; ADD == OR).
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+#[inline]
+unsafe fn neon_match_byte_mask_at(tags: &[u8], slot: usize, byte: u8) -> u16 {
+    use std::arch::aarch64::{
+        vaddv_u8, vandq_u8, vceqq_u8, vdupq_n_u8, vget_high_u8, vget_low_u8, vld1q_u8,
+    };
+    let group = unsafe { vld1q_u8(tags.as_ptr().add(slot)) };
+    let cmp = vceqq_u8(group, vdupq_n_u8(byte));
+    let bit_mask = unsafe {
+        std::mem::transmute::<[u8; 16], std::arch::aarch64::uint8x16_t>([
+            0x01u8, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x01u8, 0x02, 0x04, 0x08, 0x10,
+            0x20, 0x40, 0x80,
+        ])
+    };
+    let masked = vandq_u8(cmp, bit_mask);
+    let lo = vaddv_u8(vget_low_u8(masked)) as u16;
+    let hi = vaddv_u8(vget_high_u8(masked)) as u16;
+    (hi << 8) | lo
+}
+
+/// Scalar fallback for non-aarch64 builds. Byte-by-byte tag compare.
+#[cfg(not(target_arch = "aarch64"))]
+#[inline]
+fn scalar_match_byte_mask(tags: &[u8], slot: usize, byte: u8) -> u16 {
+    let mut mask = 0u16;
+    for i in 0..GROUP_SIZE {
+        if tags[slot + i] == byte {
+            mask |= 1 << i;
+        }
+    }
+    mask
+}
+
+/// Σ.Q.L12 — match a tag byte across a 16-byte group. Returns a u16
+/// bitmask: bit i set iff slot+i equals `byte`.
+#[inline(always)]
+fn match_byte_mask(tags: &[u8], slot: usize, byte: u8) -> u16 {
+    #[cfg(target_arch = "aarch64")]
+    {
+        unsafe { neon_match_byte_mask_at(tags, slot, byte) }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        scalar_match_byte_mask(tags, slot, byte)
+    }
+}
+
+/// Σ.Q.L12 — SwissTable-style hash table for i64 keys + f64 values.
+/// Probes 16 slots per group via NEON tag compare. SoA layout:
+/// tags / keys / values in three parallel Vecs.
+///
+/// Tail-pad invariant: all three buffers are sized `capacity +
+/// GROUP_SIZE` so a SIMD load at the last real slot is safe. The
+/// extra GROUP_SIZE tail entries always mirror slots [0..GROUP_SIZE)
+/// so linear scan wraps cleanly without a branch.
+pub struct TaggedI64F64 {
+    tags: Vec<u8>,
+    keys: Vec<i64>,
+    values: Vec<f64>,
+    mask: usize,
+    len: usize,
+}
+
+impl Default for TaggedI64F64 {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TaggedI64F64 {
+    pub fn new() -> Self {
+        Self::with_capacity(INITIAL_CAPACITY)
+    }
+
+    pub fn with_capacity(cap: usize) -> Self {
+        let cap = cap.max(INITIAL_CAPACITY).next_power_of_two();
+        Self {
+            tags: vec![TAG_EMPTY; cap + GROUP_SIZE],
+            keys: vec![0i64; cap + GROUP_SIZE],
+            values: vec![0.0f64; cap + GROUP_SIZE],
+            mask: cap - 1,
+            len: 0,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+    pub fn capacity(&self) -> usize {
+        self.mask + 1
+    }
+
+    pub fn clear(&mut self) {
+        for t in &mut self.tags {
+            *t = TAG_EMPTY;
+        }
+        self.len = 0;
+    }
+
+    /// Tail-mirror invariant: when slot `< GROUP_SIZE` is written, the
+    /// mirror at `cap + slot` must match so wrap-around loads still see
+    /// the right tag.
+    #[inline(always)]
+    fn write_slot(&mut self, slot: usize, tag: u8, key: i64, value: f64) {
+        let cap = self.mask + 1;
+        self.tags[slot] = tag;
+        self.keys[slot] = key;
+        self.values[slot] = value;
+        if slot < GROUP_SIZE {
+            self.tags[cap + slot] = tag;
+            self.keys[cap + slot] = key;
+            self.values[cap + slot] = value;
+        }
+    }
+
+    #[inline(always)]
+    fn accumulate_slot(&mut self, slot: usize, delta: f64) -> f64 {
+        let cap = self.mask + 1;
+        self.values[slot] += delta;
+        let v = self.values[slot];
+        if slot < GROUP_SIZE {
+            self.values[cap + slot] = v;
+        }
+        v
+    }
+
+    /// Σ.Q.L12 — SUM-style entry. Returns post-update value.
+    pub fn insert_or_sum(&mut self, key: i64, delta: f64) -> f64 {
+        if self.needs_grow() {
+            self.grow();
+        }
+        let h = hash_i64(key);
+        let tag = tag_from_hash(h);
+        let mask = self.mask;
+        let cap = mask + 1;
+        let mut slot = h & mask;
+        // Group-aligned scan: walk in steps of GROUP_SIZE. The tail-
+        // mirror invariant guarantees a safe load at any `slot < cap`.
+        loop {
+            // Stage 1: scan group for tag match.
+            let mut mm = match_byte_mask(&self.tags, slot, tag);
+            while mm != 0 {
+                let idx = mm.trailing_zeros() as usize;
+                let cand = slot + idx;
+                // cand is in [slot, slot + GROUP_SIZE). If cand >= cap,
+                // it lies in the tail mirror; the canonical slot is
+                // (cand - cap). Both the tag and the key in the mirror
+                // copy mirror the canonical slot, so equality works.
+                let canonical = if cand >= cap { cand - cap } else { cand };
+                if self.keys[cand] == key {
+                    return self.accumulate_slot(canonical, delta);
+                }
+                mm &= mm - 1;
+            }
+            // Stage 2: no key match → check for empty slot to insert.
+            let em = match_byte_mask(&self.tags, slot, TAG_EMPTY);
+            if em != 0 {
+                let idx = em.trailing_zeros() as usize;
+                let cand = slot + idx;
+                let canonical = if cand >= cap { cand - cap } else { cand };
+                self.write_slot(canonical, tag, key, delta);
+                self.len += 1;
+                return delta;
+            }
+            slot = (slot + GROUP_SIZE) & mask;
+        }
+    }
+
+    pub fn insert_or_sum_batch(&mut self, keys: &[i64], values: &[f64]) {
+        assert_eq!(
+            keys.len(),
+            values.len(),
+            "insert_or_sum_batch: keys and values must be same length"
+        );
+        for i in 0..keys.len() {
+            self.insert_or_sum(keys[i], values[i]);
+        }
+    }
+
+    /// Σ.Q.L12 — vectorised batch ingest. 4-stage pipeline analogous to
+    /// `RobinHoodI64F64::insert_or_sum_batch_vectorised`, but stage 2
+    /// uses a SIMD-tag scan over the FIRST GROUP per key, so primary-
+    /// group hits avoid touching keys/values on tag-mismatch slots.
+    ///
+    /// 1. Hash all keys in chunk → slot[i] = h & mask, tag[i] = tag(h).
+    /// 2. For each row, scan the primary group's 16 tags. If a tag
+    ///    matches AND the key matches, record `match_slot[i]`.
+    /// 3. Fast-path accumulate for hits (predictable store).
+    /// 4. Scalar fallback for misses via `insert_or_sum`.
+    pub fn insert_or_sum_batch_vectorised(&mut self, keys: &[i64], values: &[f64]) {
+        const VEC_CHUNK: usize = 1024;
+        let mut slots = [0usize; VEC_CHUNK];
+        let mut tags = [0u8; VEC_CHUNK];
+        let mut match_slot = [u32::MAX; VEC_CHUNK]; // u32::MAX = miss
+        self.insert_or_sum_batch_vectorised_with_scratch(
+            keys,
+            values,
+            &mut slots,
+            &mut tags,
+            &mut match_slot,
+        );
+    }
+
+    /// Scratch-passing variant. Hot callers should own scratch.
+    pub fn insert_or_sum_batch_vectorised_with_scratch(
+        &mut self,
+        keys: &[i64],
+        values: &[f64],
+        slots: &mut [usize],
+        tags: &mut [u8],
+        match_slot: &mut [u32],
+    ) {
+        assert_eq!(keys.len(), values.len());
+        const VEC_CHUNK: usize = 1024;
+        assert!(slots.len() >= VEC_CHUNK);
+        assert!(tags.len() >= VEC_CHUNK);
+        assert!(match_slot.len() >= VEC_CHUNK);
+        let n_total = keys.len();
+        if n_total == 0 {
+            return;
+        }
+
+        let mut off = 0;
+        while off < n_total {
+            let n = (n_total - off).min(VEC_CHUNK);
+            let mask = self.mask;
+            let cap = mask + 1;
+
+            // Stage 1: hash + group-base + tag.
+            for i in 0..n {
+                let h = hash_i64(keys[off + i]);
+                slots[i] = h & mask;
+                tags[i] = tag_from_hash(h);
+            }
+
+            // Stage 2: primary-group SIMD tag scan + key check. Record
+            // the exact slot index on first key match; u32::MAX = miss.
+            for i in 0..n {
+                let slot = slots[i];
+                let tag = tags[i];
+                let key = keys[off + i];
+                let mut mm = match_byte_mask(&self.tags, slot, tag);
+                let mut found = u32::MAX;
+                while mm != 0 {
+                    let idx = mm.trailing_zeros() as usize;
+                    let cand = slot + idx;
+                    if self.keys[cand] == key {
+                        let canonical = if cand >= cap { cand - cap } else { cand };
+                        found = canonical as u32;
+                        break;
+                    }
+                    mm &= mm - 1;
+                }
+                match_slot[i] = found;
+            }
+
+            // Stage 3: fast-path accumulate for hits.
+            for i in 0..n {
+                let ms = match_slot[i];
+                if ms != u32::MAX {
+                    let s = ms as usize;
+                    self.values[s] += values[off + i];
+                    if s < GROUP_SIZE {
+                        self.values[cap + s] = self.values[s];
+                    }
+                }
+            }
+
+            // Stage 4: scalar fallback for misses. May grow the table.
+            for i in 0..n {
+                if match_slot[i] == u32::MAX {
+                    self.insert_or_sum(keys[off + i], values[off + i]);
+                }
+            }
+
+            off += n;
+        }
+    }
+
+    pub fn reserve_to_capacity_pow2_of(&mut self, target: usize) {
+        let target_capacity = (target * MAX_LOAD_FACTOR_DENOMINATOR)
+            .div_ceil(MAX_LOAD_FACTOR_NUMERATOR)
+            .next_power_of_two();
+        while self.mask + 1 < target_capacity {
+            self.grow();
+        }
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (i64, f64)> + '_ {
+        let cap = self.mask + 1;
+        // Skip tail-mirror entries [cap..cap+GROUP_SIZE).
+        self.tags[..cap]
+            .iter()
+            .enumerate()
+            .filter_map(move |(i, &t)| {
+                if t == TAG_EMPTY {
+                    None
+                } else {
+                    Some((self.keys[i], self.values[i]))
+                }
+            })
+    }
+
+    pub fn get(&self, key: i64) -> Option<f64> {
+        let h = hash_i64(key);
+        let tag = tag_from_hash(h);
+        let mask = self.mask;
+        let cap = mask + 1;
+        let mut slot = h & mask;
+        let mut probed = 0usize;
+        loop {
+            let mut mm = match_byte_mask(&self.tags, slot, tag);
+            while mm != 0 {
+                let idx = mm.trailing_zeros() as usize;
+                let cand = slot + idx;
+                if self.keys[cand] == key {
+                    return Some(self.values[cand]);
+                }
+                mm &= mm - 1;
+            }
+            let em = match_byte_mask(&self.tags, slot, TAG_EMPTY);
+            if em != 0 {
+                return None;
+            }
+            slot = (slot + GROUP_SIZE) & mask;
+            probed += GROUP_SIZE;
+            if probed >= cap {
+                return None;
+            }
+        }
+    }
+
+    fn needs_grow(&self) -> bool {
+        self.len * MAX_LOAD_FACTOR_DENOMINATOR >= (self.mask + 1) * MAX_LOAD_FACTOR_NUMERATOR
+    }
+
+    fn grow(&mut self) {
+        let new_cap = (self.mask + 1) * 2;
+        let old_cap = self.mask + 1;
+        let old_tags = std::mem::replace(&mut self.tags, vec![TAG_EMPTY; new_cap + GROUP_SIZE]);
+        let old_keys = std::mem::replace(&mut self.keys, vec![0i64; new_cap + GROUP_SIZE]);
+        let old_values = std::mem::replace(&mut self.values, vec![0.0f64; new_cap + GROUP_SIZE]);
+        self.mask = new_cap - 1;
+        self.len = 0;
+        for i in 0..old_cap {
+            if old_tags[i] != TAG_EMPTY {
+                self.insert_or_sum(old_keys[i], old_values[i]);
+            }
+        }
+    }
+}
+
+/// Σ.Q.L12 — streaming `SUM(f64) GROUP BY i64` aggregator backed by the
+/// tagged kernel. Drop-in shape match for `RobinHoodSumF64Agg` so the
+/// operator can dispatch on a runtime kind flag.
+pub struct TaggedSumF64Agg {
+    table: TaggedI64F64,
+}
+
+impl Default for TaggedSumF64Agg {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TaggedSumF64Agg {
+    pub fn new() -> Self {
+        Self {
+            table: TaggedI64F64::new(),
+        }
+    }
+
+    pub fn with_capacity(cap: usize) -> Self {
+        Self {
+            table: TaggedI64F64::with_capacity(cap),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.table.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.table.is_empty()
+    }
+
+    pub fn ingest_batch(&mut self, keys: &arrow_array::Int64Array, values: &arrow_array::Float64Array) {
+        use arrow_array::Array;
+        let n = keys.len();
+        assert_eq!(n, values.len());
+        for i in 0..n {
+            if keys.is_null(i) || values.is_null(i) {
+                continue;
+            }
+            self.table.insert_or_sum(keys.value(i), values.value(i));
+        }
+    }
+
+    pub fn ingest_batch_vectorised(
+        &mut self,
+        keys: &arrow_array::Int64Array,
+        values: &arrow_array::Float64Array,
+    ) {
+        use arrow_array::Array;
+        let n = keys.len();
+        assert_eq!(n, values.len());
+        if keys.null_count() == 0 && values.null_count() == 0 {
+            self.table
+                .insert_or_sum_batch_vectorised(keys.values(), values.values());
+            return;
+        }
+        for i in 0..n {
+            if keys.is_null(i) || values.is_null(i) {
+                continue;
+            }
+            self.table.insert_or_sum(keys.value(i), values.value(i));
+        }
+    }
+
+    pub fn table(&self) -> &TaggedI64F64 {
+        &self.table
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2225,5 +2681,144 @@ mod tests {
                 "lost or wrong value for key {k} after mid-stream grow"
             );
         }
+    }
+
+    // ---------------------------------------------------------------------
+    // Σ.Q.L12 — TaggedI64F64 (SwissTable-style SIMD-tagged hash) tests.
+    // Mirror coverage of RobinHoodI64F64: insert/lookup, accumulation,
+    // grow, batch equivalence vs scalar.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn tagged_insert_and_lookup() {
+        let mut t = TaggedI64F64::new();
+        t.insert_or_sum(42, 1.5);
+        t.insert_or_sum(7, 2.25);
+        t.insert_or_sum(42, 0.5);
+        assert_eq!(t.get(42), Some(2.0));
+        assert_eq!(t.get(7), Some(2.25));
+        assert_eq!(t.get(99), None);
+        assert_eq!(t.len(), 2);
+    }
+
+    #[test]
+    fn tagged_sum_accumulates() {
+        let mut t = TaggedI64F64::new();
+        for (k, v) in [(1i64, 1.0), (2, 2.0), (1, 3.0), (3, 4.0), (2, 5.0)] {
+            t.insert_or_sum(k, v);
+        }
+        assert_eq!(t.get(1), Some(4.0));
+        assert_eq!(t.get(2), Some(7.0));
+        assert_eq!(t.get(3), Some(4.0));
+    }
+
+    #[test]
+    fn tagged_grows_past_initial_capacity() {
+        let mut t = TaggedI64F64::with_capacity(64);
+        for k in 0..1000i64 {
+            t.insert_or_sum(k, k as f64 * 0.5);
+        }
+        assert_eq!(t.len(), 1000);
+        for k in 0..1000i64 {
+            assert_eq!(t.get(k), Some(k as f64 * 0.5), "missing key {k}");
+        }
+        assert!(t.capacity() >= 1000);
+    }
+
+    #[test]
+    fn tagged_iter_yields_only_real_entries() {
+        // Sanity: tail-mirror entries must not appear in iter().
+        let mut t = TaggedI64F64::with_capacity(64);
+        for k in 0..5i64 {
+            t.insert_or_sum(k, k as f64);
+        }
+        let pairs: Vec<(i64, f64)> = t.iter().collect();
+        assert_eq!(pairs.len(), 5);
+        let mut keys: Vec<i64> = pairs.iter().map(|(k, _)| *k).collect();
+        keys.sort();
+        assert_eq!(keys, vec![0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn tagged_vec_batch_matches_scalar() {
+        // Equivalence: vectorised path must produce identical state to
+        // the scalar `insert_or_sum_batch` for any input shape.
+        let n = 5000;
+        let card = 200i64;
+        let keys: Vec<i64> = (0..n).map(|i| (i as i64 * 31) % card).collect();
+        let vals: Vec<f64> = (0..n).map(|i| (i as f64) * 0.125).collect();
+
+        let cap = (card as usize * 2).max(64);
+        let mut scalar = TaggedI64F64::with_capacity(cap);
+        scalar.insert_or_sum_batch(&keys, &vals);
+        let mut vec_path = TaggedI64F64::with_capacity(cap);
+        vec_path.insert_or_sum_batch_vectorised(&keys, &vals);
+
+        let mut s_pairs: Vec<(i64, f64)> = scalar.iter().collect();
+        let mut v_pairs: Vec<(i64, f64)> = vec_path.iter().collect();
+        s_pairs.sort_by_key(|(k, _)| *k);
+        v_pairs.sort_by_key(|(k, _)| *k);
+        assert_eq!(s_pairs.len(), v_pairs.len());
+        for (a, b) in s_pairs.iter().zip(v_pairs.iter()) {
+            assert_eq!(a.0, b.0);
+            assert!((a.1 - b.1).abs() < 1e-9, "diverged at key {}", a.0);
+        }
+    }
+
+    #[test]
+    fn tagged_vec_batch_triggers_grow_mid_stream() {
+        // Force multiple grow()s inside stage 4.
+        let n = 1000usize;
+        let keys: Vec<i64> = (0..n as i64).collect();
+        let vals: Vec<f64> = (0..n).map(|i| (i as f64) + 0.125).collect();
+        let mut t = TaggedI64F64::with_capacity(64);
+        t.insert_or_sum_batch_vectorised(&keys, &vals);
+        assert_eq!(t.len(), n);
+        for k in 0..n as i64 {
+            assert_eq!(
+                t.get(k),
+                Some(k as f64 + 0.125),
+                "lost or wrong value for key {k} after mid-stream grow"
+            );
+        }
+    }
+
+    #[test]
+    fn tagged_vs_robin_hood_q18_shape() {
+        // Q18-shape sanity: 10K distinct keys, multiple ingests, must
+        // match the RobinHoodI64F64 result bit-exactly (synthetic data
+        // chosen for integer-valued f64 sums).
+        let n_groups = 10_000i64;
+        let rows_per_group = 5usize;
+        let mut keys: Vec<i64> = Vec::new();
+        let mut vals: Vec<f64> = Vec::new();
+        for k in 0..n_groups {
+            for r in 0..rows_per_group {
+                keys.push(k);
+                vals.push((r as f64 + 1.0) * 7.0);
+            }
+        }
+        let mut rh = RobinHoodI64F64::with_capacity(n_groups as usize * 2);
+        rh.insert_or_sum_batch_vectorised(&keys, &vals);
+        let mut tagged = TaggedI64F64::with_capacity(n_groups as usize * 2);
+        tagged.insert_or_sum_batch_vectorised(&keys, &vals);
+
+        assert_eq!(rh.len(), tagged.len());
+        for k in 0..n_groups {
+            assert_eq!(rh.get(k), tagged.get(k), "diverged at key {k}");
+            assert_eq!(tagged.get(k), Some(105.0));
+        }
+    }
+
+    #[test]
+    fn tagged_agg_wrapper_works() {
+        use arrow_array::{Float64Array, Int64Array};
+        let keys = Int64Array::from(vec![1i64, 2, 1, 3, 2, 1]);
+        let vals = Float64Array::from(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let mut agg = TaggedSumF64Agg::with_capacity(8);
+        agg.ingest_batch_vectorised(&keys, &vals);
+        assert_eq!(agg.table().get(1), Some(10.0));
+        assert_eq!(agg.table().get(2), Some(7.0));
+        assert_eq!(agg.table().get(3), Some(4.0));
     }
 }
