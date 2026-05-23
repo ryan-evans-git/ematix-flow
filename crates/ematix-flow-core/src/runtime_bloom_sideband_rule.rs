@@ -45,11 +45,35 @@ use crate::ematix_fast_parquet::EmatixFastParquetExec;
 pub fn install_runtime_bloom_sideband_rule(
     builder: SessionStateBuilder,
 ) -> SessionStateBuilder {
-    builder.with_physical_optimizer_rule(Arc::new(EnableRuntimeBloomSidebandRule))
+    builder.with_physical_optimizer_rule(Arc::new(EnableRuntimeBloomSidebandRule::default()))
 }
 
-#[derive(Debug, Default)]
-pub struct EnableRuntimeBloomSidebandRule;
+/// Σ.Q.L9 — selectivity gate config. Only fires the rule when the
+/// build-side row estimate × `min_probe_to_build_ratio` is less than
+/// the probe-side leaf scan's row count. Default ratio = 64 (probe
+/// must be at least 64× the build). Set ratio = 0 to disable the gate
+/// (always fire) — used by tests over miniature parquet files.
+#[derive(Debug, Clone, Copy)]
+pub struct EnableRuntimeBloomSidebandRule {
+    pub min_probe_to_build_ratio: usize,
+}
+
+impl Default for EnableRuntimeBloomSidebandRule {
+    fn default() -> Self {
+        // 64× is a permissive floor — accommodates semi-join shapes
+        // (build/probe ≈ 1/1000+) while gating out fact⋈fact joins
+        // (build/probe ≈ 1/4) where the bloom can't be selective.
+        // Honor `EMAT_RT_BLOOM_SELECTIVITY=N` override at construction
+        // for ad-hoc bench tuning.
+        let ratio = std::env::var("EMAT_RT_BLOOM_SELECTIVITY")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(64);
+        Self {
+            min_probe_to_build_ratio: ratio,
+        }
+    }
+}
 
 impl PhysicalOptimizerRule for EnableRuntimeBloomSidebandRule {
     fn optimize(
@@ -107,6 +131,49 @@ impl PhysicalOptimizerRule for EnableRuntimeBloomSidebandRule {
                 return Ok(Transformed::no(node));
             };
 
+            // Σ.Q.L9 selectivity gate (2026-05-23, late-evening
+            // investigation):
+            //
+            // When we made the deferred-peek fix to the consumer side
+            // (EmatixFastParquetExec::execute), suddenly blooms that
+            // had ALWAYS been published-but-invisible were now actually
+            // being applied at the scan. That exposed a latent problem:
+            // L9 was firing on EVERY HashJoinExec, regardless of
+            // whether the bloom could plausibly drop probe rows.
+            //
+            // For Q18 SF=10, two of the three L9 firings emit blooms
+            // with ~100% pass rate against the probe side:
+            //   * customer (1.5M) ⋈ orders (15M) on c_custkey/o_custkey
+            //     — orders.o_custkey ∈ customer.c_custkey by FK
+            //     constraint, so the bloom membership check pays full
+            //     cost and drops 0 rows.
+            //   * orders⋈customer (15M) ⋈ lineitem (60M) on o_orderkey/
+            //     l_orderkey — same: lineitem.l_orderkey ∈ orders.
+            //
+            // Net effect of those two firings: ~360s of CPU spent
+            // computing `bloom.might_contain_i64(v)` on lineitem rows
+            // that all pass anyway, regressing Q18 wall-time from 530ms
+            // → 606ms.
+            //
+            // The third firing — RightSemi(624 keys) ⋈ lineitem — is
+            // where the bloom genuinely helps (0.004% pass rate).
+            //
+            // Gate: skip the wrap unless the build is meaningfully
+            // smaller than the probe-side scan. Threshold 1/64 is
+            // permissive (allows blooms where the build is up to ~1.5%
+            // of the probe). For TPC-H this gates out the
+            // dimension⋈fact and fact⋈fact joins (build ≈ probe / 4)
+            // while keeping semi-join shapes (build ≈ probe / 1000+).
+            let build_rows = estimate_build_rows(build.as_ref());
+            let probe_rows = estimate_probe_scan_rows(&scan_arc);
+            if self.min_probe_to_build_ratio > 0 {
+                if let (Some(b), Some(p)) = (build_rows, probe_rows) {
+                    if b.saturating_mul(self.min_probe_to_build_ratio) >= p {
+                        return Ok(Transformed::no(node));
+                    }
+                }
+            }
+
             // Σ.Q.L9: allocate the sideband, wrap the build child,
             // rewrite the probe subtree to thread the sideband into
             // the matching EmatixFastParquetExec.
@@ -115,7 +182,7 @@ impl PhysicalOptimizerRule for EnableRuntimeBloomSidebandRule {
             // Estimate expected build-side keys from the build's
             // partition statistics. Falls back to a generous default
             // (50K) when stats are unavailable.
-            let expected_keys = estimate_build_rows(build.as_ref()).unwrap_or(50_000);
+            let expected_keys = build_rows.unwrap_or(50_000);
 
             let wrapped_build: Arc<dyn ExecutionPlan> = Arc::new(BuildSideBloomEmitterExec::try_new(
                 build,
@@ -224,6 +291,21 @@ fn rewrite_probe_subtree(
         .data()
 }
 
+/// Σ.Q.L9 selectivity gate — best-effort row-count estimate for the
+/// probe-side leaf scan. The scan exposes `num_rows` directly via its
+/// own field, so this is a cheap accessor. Returns the total row
+/// count across partitions.
+fn estimate_probe_scan_rows(scan: &EmatixFastParquetExec) -> Option<usize> {
+    // EmatixFastParquetExec doesn't expose num_rows publicly, but
+    // partition_statistics(None) returns total row count.
+    use datafusion::common::stats::Precision;
+    let stats = scan.partition_statistics(None).ok()?;
+    match stats.num_rows {
+        Precision::Exact(n) | Precision::Inexact(n) => Some(n.max(1)),
+        _ => None,
+    }
+}
+
 /// Best-effort row-count estimate for the build subtree. Uses
 /// `partition_statistics` when available, sums across partitions.
 fn estimate_build_rows(plan: &dyn ExecutionPlan) -> Option<usize> {
@@ -310,12 +392,16 @@ mod tests {
         write_supplier(&sp);
 
         let cfg = SessionConfig::new().with_target_partitions(4);
-        let state = install_runtime_bloom_sideband_rule(
-            SessionStateBuilder::new()
-                .with_default_features()
-                .with_config(cfg),
-        )
-        .build();
+        // Disable the selectivity gate (build × ratio < probe) so the
+        // rule fires on this miniature test data; default gate is
+        // intended for SF=10 TPC-H shapes.
+        let state = SessionStateBuilder::new()
+            .with_default_features()
+            .with_config(cfg)
+            .with_physical_optimizer_rule(Arc::new(EnableRuntimeBloomSidebandRule {
+                min_probe_to_build_ratio: 0,
+            }))
+            .build();
         let ctx = SessionContext::new_with_state(state);
         ctx.register_table(
             "lineitem",
@@ -368,12 +454,16 @@ mod tests {
         write_filter_keys(&fk);
 
         let cfg = SessionConfig::new().with_target_partitions(4);
-        let state = install_runtime_bloom_sideband_rule(
-            SessionStateBuilder::new()
-                .with_default_features()
-                .with_config(cfg),
-        )
-        .build();
+        // Disable the selectivity gate (build × ratio < probe) so the
+        // rule fires on this miniature test data; default gate is
+        // intended for SF=10 TPC-H shapes.
+        let state = SessionStateBuilder::new()
+            .with_default_features()
+            .with_config(cfg)
+            .with_physical_optimizer_rule(Arc::new(EnableRuntimeBloomSidebandRule {
+                min_probe_to_build_ratio: 0,
+            }))
+            .build();
         let ctx = SessionContext::new_with_state(state);
         // Register all three as Emat so L9 can attach a sideband to
         // any of them.

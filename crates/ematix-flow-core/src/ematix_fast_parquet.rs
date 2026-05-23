@@ -39,6 +39,7 @@ use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use futures_util::StreamExt;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
     SendableRecordBatchStream,
@@ -1821,90 +1822,150 @@ impl ExecutionPlan for EmatixFastParquetExec {
         // call needs the same published predicates. The sideband
         // outlives the query, but the predicates inside are fresh
         // per query.
-        let mut filter = self.filter.clone();
-        if let Some(sb) = &self.runtime_sideband {
-            if let Some(extras) = sb.peek() {
-                if !extras.is_empty() {
-                    let mut bf = filter.unwrap_or_else(|| BridgeFilter::new(Vec::new()));
-                    bf.extend(extras);
-                    let p = bf.estimate_pass_rate(&self.column_stats);
-                    filter = Some(bf.with_predicted_pass_rate(p));
-                }
-            }
-        }
+        // Σ.Q.L9 — runtime sideband consumption (timing-corrected).
+        //
+        // Earlier versions peeked the sideband HERE at execute() time
+        // and resolved the BridgeFilter eagerly. That had a bug: in
+        // DataFusion, `HashJoinExec::execute(partition)` calls
+        // execute() on BOTH children before its build_future drains.
+        // So our `execute()` ran BEFORE the upstream BuildSideBloom
+        // emitter ever published. peek() always returned None →
+        // filter stayed empty → bloom did no work. Trace probe
+        // (EMAT_L9_TRACE=1) on Q18 SF=10 confirmed: every orders
+        // partition logged `peek=None`.
+        //
+        // Fix: defer the peek into the stream's first poll, where
+        // we ARE guaranteed to be downstream of the build_future's
+        // completion (the probe stream awaits build_future on first
+        // poll; first poll on our scan only happens once the parent
+        // join is past its build phase).
+        //
+        // Mechanics: capture the sideband Arc + the base filter, then
+        // build the partition stream inside a `stream::once(async)`
+        // / `flatten` wrapper so all the work (including the peek and
+        // the EmatArrowBatchReaderBuilder construction) is deferred
+        // to first poll.
+        let base_filter = self.filter.clone();
+        let runtime_sideband = self.runtime_sideband.clone();
+        let column_stats = self.column_stats.clone();
+        let trace_l9 = std::env::var("EMAT_L9_TRACE").ok().as_deref() == Some("1");
         let late_mat = self.late_mat;
         let baseline = BaselineMetrics::new(&self.metrics, partition);
+        let streaming_arrow_reader = self.streaming_arrow_reader;
+        let outer_partitions = self.properties.partitioning.partition_count().max(1);
 
-        // Σ.E5 (#516): streaming reader now handles filters natively via
-        // `EmatArrowBatchReaderBuilder::with_filter`. So route through
-        // it whenever streaming is enabled, regardless of filter state.
-        // The non-streaming branch below stays for the legacy
-        // bridge-only configuration.
-        let stream = if self.streaming_arrow_reader {
-            // Σ.E5.1.c: compute a per-partition column-decode thread
-            // budget so the total concurrent thread count tracks the
-            // core count rather than the product
-            // `N_outer_partitions × N_cols`. Q1 SF=1 on a 14-core box
-            // with 6 outer partitions → budget = 2 (per partition), so
-            // total ≈ 12 concurrent threads instead of 42 — kills the
-            // scheduler oversubscription that inflated streaming-mode
-            // variance (σ 5–7 ms vs bridge σ 2–3 ms) in #112's bench.
-            //
-            // Σ.E5 (2026-05-18) diagnostic: tried `(2×cores) /
-            // outer_partitions` to help Q19 (6 RGs × 6 partitions on
-            // 14 cores, budget=2 leaves half the box idle). Q19 wall
-            // dropped from 30.6 → 28.0 ms in isolation, BUT the
-            // steady-state 22-query bench regressed geomean from
-            // 0.9306 → 0.9692 — Q01 went from -19% → +1.3%, several
-            // others regressed. The 1× divisor is the right floor for
-            // the dominant workload pattern; Q19's gap lives elsewhere
-            // (numeric decode or RG-load coordination, not thread
-            // count).
-            //
-            // Env override `EMAT_READER_PARALLELISM_BUDGET=N` forces
-            // the per-partition budget to N (used by the confirmation
-            // experiment; `N=1` = sequential per-RG column decode).
-            let outer_partitions = self.properties.partitioning.partition_count().max(1);
-            let total_threads = std::thread::available_parallelism()
-                .map(|p| p.get())
-                .unwrap_or(1);
-            let computed_budget = std::cmp::max(1, total_threads / outer_partitions);
-            let budget = std::env::var("EMAT_READER_PARALLELISM_BUDGET")
-                .ok()
-                .and_then(|s| s.parse::<usize>().ok())
-                .map(|n| n.max(1))
-                .unwrap_or(computed_budget);
-            // Σ.E5: compute the partition's assigned row total from the
-            // provider's cached per-RG row counts. Threaded to
-            // `build_streaming_partition_stream` so it can pick the
-            // inline reader for single-RG small-row partitions without
-            // re-decoding the thrift footer.
-            let partition_rows: usize = row_groups
-                .iter()
-                .map(|&rg| self.rg_num_rows.get(rg).copied().unwrap_or(0))
-                .sum();
-            build_streaming_partition_stream(
+        // Σ.Q.L9 — fast path when no runtime sideband is attached
+        // (the common case for queries without the L9 rule installed
+        // or for scans that aren't probe-side targets of any join).
+        // The deferred-peek wrapper measured ~15ms overhead on Q18
+        // SF=10 even when the sideband was None; that's pure waste
+        // for plans that can't benefit. So: if there's no sideband,
+        // skip the wrapper entirely and use the original eager path.
+        if runtime_sideband.is_none() {
+            let stream = build_partition_stream_dispatch(
                 path,
                 schema.clone(),
                 projection,
                 row_groups,
-                budget,
-                partition_rows,
-                self.rg_num_rows.len(),
-                filter,
+                base_filter,
+                late_mat,
                 baseline,
-            )
-        } else {
-            build_partition_stream(
-                path,
-                schema.clone(),
-                projection,
-                row_groups,
+                streaming_arrow_reader,
+                outer_partitions,
+                self.rg_num_rows.clone(),
+            );
+            return Ok(
+                Box::pin(RecordBatchStreamAdapter::new(schema, stream)) as SendableRecordBatchStream
+            );
+        }
+
+        // Σ.Q.L9 deferred peek (sideband-attached case).
+        //
+        // Earlier versions peeked the sideband at execute() time and
+        // resolved the BridgeFilter eagerly. That had a bug: in
+        // DataFusion, `HashJoinExec::execute(partition)` calls
+        // execute() on BOTH children before its build_future drains.
+        // So our execute() ran BEFORE the upstream BuildSideBloom
+        // emitter ever published. peek() returned None →
+        // filter stayed empty. Trace probe (EMAT_L9_TRACE=1) on
+        // Q18 SF=10 confirmed: every orders partition logged
+        // `peek=None`.
+        //
+        // Fix below: defer the peek into the stream's first poll,
+        // where we ARE guaranteed to be past at least our parent's
+        // build_future (the parent's probe stream awaits build_future
+        // on first poll; the first poll on our scan only happens once
+        // the parent join is past its build phase).
+        //
+        // Caveat: scans on the BUILD side of a HashJoinExec are
+        // polled eagerly (they ARE part of the build phase), so the
+        // deferred peek still doesn't help them. For Q18 that's the
+        // orders scan inside customer⋈orders.
+        let path_for_async = path.clone();
+        let schema_for_async = schema.clone();
+        let projection_for_async = projection.clone();
+        let row_groups_for_async = row_groups.clone();
+        let column_stats_for_async = column_stats.clone();
+        let rg_num_rows_for_async = self.rg_num_rows.clone();
+
+        let inner_stream_fut = async move {
+            // Resolve the actual filter NOW (first poll), with the
+            // sideband possibly populated by an upstream build phase
+            // that has since completed.
+            let mut filter = base_filter;
+            if let Some(sb) = &runtime_sideband {
+                let peeked = sb.peek();
+                if trace_l9 {
+                    let path_short = std::path::Path::new(&path_for_async)
+                        .file_name()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| path_for_async.clone());
+                    match &peeked {
+                        Some(preds) => {
+                            let summary: Vec<String> = preds
+                                .iter()
+                                .map(|p| match p {
+                                    ColumnPredicate::I64InBloom { col_idx, .. } => {
+                                        format!("I64InBloom(col={col_idx})")
+                                    }
+                                    _ => "other".to_string(),
+                                })
+                                .collect();
+                            eprintln!(
+                                "[L9-trace] {path_short} p={partition} peek=Some({summary:?})"
+                            );
+                        }
+                        None => eprintln!(
+                            "[L9-trace] {path_short} p={partition} peek=None (bloom not published)"
+                        ),
+                    }
+                }
+                if let Some(extras) = peeked {
+                    if !extras.is_empty() {
+                        let mut bf = filter.unwrap_or_else(|| BridgeFilter::new(Vec::new()));
+                        bf.extend(extras);
+                        let p = bf.estimate_pass_rate(&column_stats_for_async);
+                        filter = Some(bf.with_predicted_pass_rate(p));
+                    }
+                }
+            }
+            build_partition_stream_dispatch(
+                path_for_async,
+                schema_for_async,
+                projection_for_async,
+                row_groups_for_async,
                 filter,
                 late_mat,
                 baseline,
+                streaming_arrow_reader,
+                outer_partitions,
+                rg_num_rows_for_async,
             )
         };
+
+        let stream = futures_util::stream::once(inner_stream_fut)
+            .flatten()
+            .boxed();
         Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)) as SendableRecordBatchStream)
     }
 
@@ -1935,6 +1996,63 @@ impl ExecutionPlan for EmatixFastParquetExec {
         };
         s.column_statistics = self.column_stats.clone();
         Ok(s)
+    }
+}
+
+/// Σ.Q.L9 — choose between the streaming reader path and the
+/// legacy bridge-only path. Factored out so the EmatixFastParquetExec
+/// execute() body can call this from inside its lazy
+/// `stream::once(async)` wrapper, where we've already peeked the
+/// runtime sideband and resolved the final BridgeFilter.
+fn build_partition_stream_dispatch(
+    path: String,
+    schema: SchemaRef,
+    projection: Vec<usize>,
+    row_groups: Vec<usize>,
+    filter: Option<BridgeFilter>,
+    late_mat: bool,
+    baseline: BaselineMetrics,
+    streaming_arrow_reader: bool,
+    outer_partitions: usize,
+    rg_num_rows: Arc<Vec<usize>>,
+) -> futures_util::stream::BoxStream<'static, DfResult<RecordBatch>> {
+    if streaming_arrow_reader {
+        // Σ.E5.1.c — per-partition column-decode thread budget; keep
+        // total concurrent decode threads aligned to core count.
+        let total_threads = std::thread::available_parallelism()
+            .map(|p| p.get())
+            .unwrap_or(1);
+        let computed_budget = std::cmp::max(1, total_threads / outer_partitions);
+        let budget = std::env::var("EMAT_READER_PARALLELISM_BUDGET")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .map(|n| n.max(1))
+            .unwrap_or(computed_budget);
+        let partition_rows: usize = row_groups
+            .iter()
+            .map(|&rg| rg_num_rows.get(rg).copied().unwrap_or(0))
+            .sum();
+        build_streaming_partition_stream(
+            path,
+            schema,
+            projection,
+            row_groups,
+            budget,
+            partition_rows,
+            rg_num_rows.len(),
+            filter,
+            baseline,
+        )
+    } else {
+        build_partition_stream(
+            path,
+            schema,
+            projection,
+            row_groups,
+            filter,
+            late_mat,
+            baseline,
+        )
     }
 }
 

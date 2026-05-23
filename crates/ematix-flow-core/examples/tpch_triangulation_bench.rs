@@ -363,7 +363,7 @@ async fn build_ematix_ctx(
         .unwrap_or(false);
     if rt_bloom_enabled {
         builder =
-            builder.with_physical_optimizer_rule(Arc::new(EnableRuntimeBloomSidebandRule));
+            builder.with_physical_optimizer_rule(Arc::new(EnableRuntimeBloomSidebandRule::default()));
     }
     // Σ.Q.L4′: install the in-scan bloom pushdown rule with an empty
     // shared bloom slot. `run_ematix_flow` swaps the slot's contents

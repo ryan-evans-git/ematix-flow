@@ -59,7 +59,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         builder = builder.with_physical_optimizer_rule(Arc::new(EnableRobinHoodSumF64Rule));
     }
     if rt_bloom {
-        builder = builder.with_physical_optimizer_rule(Arc::new(EnableRuntimeBloomSidebandRule));
+        builder = builder.with_physical_optimizer_rule(Arc::new(EnableRuntimeBloomSidebandRule::default()));
     }
     let state = builder.build();
 
