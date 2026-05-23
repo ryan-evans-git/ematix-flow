@@ -198,6 +198,12 @@ pub mod local_bloom_emitter;
 // side-effect of HashJoinExec's build phase; consumer
 // (EmatixFastParquetExec on the probe side) reads at execute() time.
 pub mod bridge_filter_sideband;
+// Σ.Q.L9 slice 2 (2026-05-23): pass-through wrapper exec that observes
+// batches flowing from a HashJoinExec build side, accumulates the i64
+// join-key column into a BloomFilter (one local per partition,
+// union-merged at completion), and publishes an I64InBloom
+// ColumnPredicate to a BridgeFilterSideband shared with the probe scan.
+pub mod build_side_bloom_emitter_exec;
 // Σ.O (2026-05-21): in-memory LRU cache of decoded RecordBatch by
 // (file_path, row_group_idx, projection_hash). Avoids re-decoding
 // the same parquet column chunks across queries in the same session.

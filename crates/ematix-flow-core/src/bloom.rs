@@ -207,6 +207,25 @@ impl BloomFilter {
     pub fn wire_size(&self) -> usize {
         24 + self.bits.len()
     }
+
+    /// Σ.Q.L9 — union-merge another bloom into this one. Both must
+    /// have the same `n_blocks` and `seed` (constructed via the same
+    /// `for_keys` / `with_capacity` call shape) so the bit layout
+    /// matches. ORs the byte arrays.
+    ///
+    /// Used by the build-side emitter (Σ.Q.L9 slice 2) to combine
+    /// per-partition local blooms into a single union bloom before
+    /// publishing to the runtime sideband.
+    pub fn union_with(&mut self, other: &BloomFilter) -> Result<(), BloomError> {
+        if self.n_blocks != other.n_blocks || self.seed != other.seed {
+            return Err(BloomError::TooSmall); // shape mismatch — re-use existing variant
+        }
+        debug_assert_eq!(self.bits.len(), other.bits.len());
+        for (a, b) in self.bits.iter_mut().zip(other.bits.iter()) {
+            *a |= *b;
+        }
+        Ok(())
+    }
 }
 
 /// Σ.J.2.b.v — header-name prefix used for the multi-bloom flight
