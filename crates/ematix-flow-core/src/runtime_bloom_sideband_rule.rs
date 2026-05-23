@@ -56,14 +56,20 @@ pub fn install_runtime_bloom_sideband_rule(
 #[derive(Debug, Clone, Copy)]
 pub struct EnableRuntimeBloomSidebandRule {
     pub min_probe_to_build_ratio: usize,
-    /// Σ.Q.L9 (2026-05-23 Q21 fix): Inner-join bloom pushdown can
-    /// produce *incorrect* row counts when the same parquet path
-    /// appears multiple times in the plan (Q21's l1/l2/l3 references)
-    /// and the bloom is built from a source that's been implicitly
-    /// constrained via downstream filters. Inner-join firings are
-    /// default-off; LeftSemi/RightSemi continue to fire (where the
-    /// strong Q18/Q21-class wins live). Opt-in via
-    /// `EMAT_RT_BLOOM_INNER_JOIN=1` for benchmarking.
+    /// Σ.Q.L9 / L14 (2026-05-23): Inner-join bloom pushdown was
+    /// producing silently-wrong results because the col_idx threaded
+    /// from `find_probe_scan_for_column` was a projected-schema index,
+    /// but `filter_i64_column_to_bitmap_dense` interprets it as a
+    /// file-schema (leaf) index. Q21 row count was wrong (1798 vs
+    /// 4009); Q07 sums were 94% wrong (verified against DuckDB). The
+    /// col_idx bug is fixed, but Inner-join L9 remains default-off:
+    /// the L4'-style "bloom on FK is net-negative" pattern means that
+    /// for joins where the build is unfiltered (e.g. full supplier in
+    /// Q07's s_suppkey⋈l_suppkey), the bloom passes ~100% by FK
+    /// constraint and the membership-test cost exceeds zero savings
+    /// (Q07 281→379 ms, Q05 192→244 ms, Q08 197→269 ms). When the
+    /// build IS pre-filtered (e.g. post-nation supplier), Inner-L9
+    /// becomes a win — opt in via `EMAT_RT_BLOOM_INNER_JOIN=1`.
     pub allow_inner_join: bool,
 }
 
@@ -78,6 +84,11 @@ impl Default for EnableRuntimeBloomSidebandRule {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(64);
+        // Σ.Q.L14 (2026-05-23): default-OFF for Inner joins even with
+        // the col_idx bug fixed. The L4'-style "bloom-on-FK is
+        // net-negative" pattern holds whenever the join's build is
+        // unfiltered. Opt-in via `EMAT_RT_BLOOM_INNER_JOIN=1` when
+        // the build IS pre-filtered.
         let allow_inner_join = std::env::var_os("EMAT_RT_BLOOM_INNER_JOIN").is_some();
         Self {
             min_probe_to_build_ratio: ratio,
@@ -105,14 +116,11 @@ impl PhysicalOptimizerRule for EnableRuntimeBloomSidebandRule {
             ) {
                 return Ok(Transformed::no(node));
             }
-            // Σ.Q.L9 (2026-05-23 Q21 fix): default-skip Inner-join firings.
-            // Inner-join bloom pushdown produces wrong row counts on Q21
-            // (1798 vs 4009) — the bloom from the s_suppkey⋈l_suppkey
-            // join applies as if supplier had been pre-filtered to ~4K
-            // Saudi rows, even though the supplier scan is unfiltered
-            // (the Saudi predicate joins later via nation). Root cause
-            // not yet narrowed (bloom-build / bloom-apply / both); keep
-            // Inner support gated until that's fixed.
+            // Σ.Q.L9 / L14 (2026-05-23): Inner-join firings stay
+            // available behind `allow_inner_join`. The Σ.Q.L14 fix
+            // (file-schema vs projected-schema col_idx mismatch) closes
+            // the silent-wrong-sums bug that originally motivated the
+            // default-off. Tests opt in via `allow_inner_join: true`.
             if matches!(hj.join_type(), JoinType::Inner) && !self.allow_inner_join {
                 return Ok(Transformed::no(node));
             }
@@ -267,13 +275,30 @@ fn find_probe_scan_for_column(
     col_name: &str,
 ) -> Option<(Arc<dyn ExecutionPlan>, Arc<EmatixFastParquetExec>, usize)> {
     if let Some(scan) = plan.as_any().downcast_ref::<EmatixFastParquetExec>() {
-        let sch = scan.schema();
-        if let Some((idx, _)) = sch
+        // Σ.Q.L14 (2026-05-23 Q07 sum fix): look up the column name in
+        // the FILE schema and return the FILE-schema index, not the
+        // projected-schema index. `ColumnPredicate::I64InBloom`'s
+        // col_idx is consumed by `filter_i64_column_to_bitmap_dense`
+        // which reads `md.row_groups[rg].columns[col]` — that needs
+        // the leaf column position in the parquet file, not the
+        // position in the projection. The earlier projected-idx code
+        // caused the supplier→lineitem bloom on Q07 to apply against
+        // l_partkey (file col 1) instead of l_suppkey (file col 2)
+        // when the projection was [0,2,5,6,10] — Q07's sums were 94%
+        // wrong (verified against DuckDB) silently for months because
+        // the bench only checks row counts.
+        let file_sch = scan.file_schema();
+        if let Some((file_idx, _)) = file_sch
             .fields()
             .iter()
             .enumerate()
             .find(|(_, f)| f.name() == col_name)
         {
+            // The column must also be in the projection — otherwise
+            // the scan never decodes it and the bloom can't apply.
+            if !scan.projection().contains(&file_idx) {
+                return None;
+            }
             // Σ.Q.L9 (2026-05-23 Q21 fix): return the ORIGINAL Arc node
             // alongside a typed handle. Q21 references lineitem three
             // times (l1, l2, l3) — all the same parquet path. The
@@ -284,7 +309,7 @@ fn find_probe_scan_for_column(
             // Arc lets `rewrite_probe_subtree` use Arc::ptr_eq to
             // attach the sideband to ONLY this specific scan instance.
             let fresh = scan.with_added_predicates(Vec::new()).ok()?;
-            return Some((Arc::clone(plan), fresh, idx));
+            return Some((Arc::clone(plan), fresh, file_idx));
         }
         return None;
     }
