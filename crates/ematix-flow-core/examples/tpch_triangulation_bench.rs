@@ -386,7 +386,17 @@ async fn build_ematix_ctx(
             .join(format!("{t}.parquet"))
             .to_string_lossy()
             .into_owned();
-        if *t == "lineitem" {
+        // Σ.Q.L9 extension probe — register orders as Emat too so
+        // the descent into the inner HashJoinExec can reach an Emat
+        // scan carrying o_orderkey. Enabled via env for measurement;
+        // not default since Emat for orders hasn't been broadly
+        // benched on the full 22 queries.
+        let orders_as_emat = std::env::var("EMAT_REGISTER_ORDERS_AS_EMAT")
+            .ok()
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        let use_emat = *t == "lineitem" || (orders_as_emat && *t == "orders");
+        if use_emat {
             // Emat for lineitem with late-mat ON (default since
             // 2026-05-16 + the misaligned-bitmap-offset fix in
             // ematix-parquet 0.4.1).

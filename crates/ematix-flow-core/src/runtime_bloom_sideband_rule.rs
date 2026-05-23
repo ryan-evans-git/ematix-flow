@@ -151,9 +151,22 @@ impl PhysicalOptimizerRule for EnableRuntimeBloomSidebandRule {
 
 /// Descend `plan` looking for an `EmatixFastParquetExec` whose
 /// schema contains a column named `col_name`. Returns the exec +
-/// the column index in its schema. Only walks through row-preserving
-/// physical wrappers (FilterExec, ProjectionExec preserving names,
-/// CoalescePartitionsExec, CoalesceBatchesExec, RepartitionExec).
+/// the column index in its schema.
+///
+/// Walks through both single-child wrappers (FilterExec,
+/// ProjectionExec, CoalescePartitionsExec, CoalesceBatchesExec,
+/// RepartitionExec, BuildSideBloomEmitterExec, etc.) and
+/// multi-child plans (HashJoinExec, UnionExec). For multi-child
+/// nodes the descent tries each child and returns the first hit —
+/// "first child carrying this column wins."
+///
+/// **Assumption**: column names are unique across the underlying
+/// tables in the probe subtree. For TPC-H this is the case
+/// (`l_*`, `o_*`, `c_*`, `s_*`, `n_*`, `r_*`, `p_*`, `ps_*`
+/// prefixes ensure uniqueness). Workloads with duplicate column
+/// names across joined tables would need column-index threading
+/// through join projections — substantially more code; not done
+/// here.
 fn find_probe_scan_for_column(
     plan: &Arc<dyn ExecutionPlan>,
     col_name: &str,
@@ -166,42 +179,24 @@ fn find_probe_scan_for_column(
             .enumerate()
             .find(|(_, f)| f.name() == col_name)
         {
-            // Reconstruct an Arc<EmatixFastParquetExec> from the plan
-            // — we have a &EmatixFastParquetExec, need an
-            // Arc<EmatixFastParquetExec>. The Arc<dyn ExecutionPlan>
-            // can be downcast via Arc::downcast on the trait object,
-            // but it's nightly-only. Workaround: clone via the
-            // scan's clone_internals path (private). Simpler:
-            // use the scan's exposed APIs — we don't actually need
-            // the Arc back, we just need the scan's identity so
-            // rewrite_probe_subtree can compare-and-replace.
-            //
-            // Return Arc::new of a fresh clone via with_added_predicates
-            // (with empty preds it just clones internals). It's
-            // safe — we won't actually use this Arc in the rewritten
-            // plan; we use with_runtime_sideband on the original
-            // when we find it during rewrite.
-            //
-            // Below: we use a sentinel Arc only for type plumbing.
-            // rewrite_probe_subtree gets the &EmatixFastParquetExec
-            // via a downcast at rewrite time, so this Arc need not
-            // be the same one.
+            // Return an Arc<EmatixFastParquetExec> via the no-op
+            // `with_added_predicates` clone path. The Arc is used
+            // only as a type-plumbing handle — `rewrite_probe_subtree`
+            // locates the actual scan in the live plan by path() match
+            // and rewrites THAT instance, not this clone.
             let fresh = scan.with_added_predicates(Vec::new()).ok()?;
             return Some((fresh, idx));
         }
         return None;
     }
-    // Descend through transparent wrappers.
-    let children = plan.children();
-    // FilterExec / ProjectionExec / CoalescePartitionsExec /
-    // CoalesceBatchesExec / RepartitionExec are all 1-child and
-    // preserve column NAMES (FilterExec preserves the entire schema;
-    // ProjectionExec preserves names only when the projection is
-    // pass-through, but for TPC-H this is the common case;
-    // CoalescePartitions/Batches preserve schema; RepartitionExec
-    // preserves schema).
-    if children.len() == 1 {
-        return find_probe_scan_for_column(children[0], col_name);
+    // Descend into every child. For 1-child wrappers this is a
+    // straight chain; for multi-child plans (HashJoinExec, Union)
+    // we try each child in turn — first match wins (see assumption
+    // in the doc comment).
+    for child in plan.children() {
+        if let Some(found) = find_probe_scan_for_column(child, col_name) {
+            return Some(found);
+        }
     }
     None
 }
@@ -293,6 +288,20 @@ mod tests {
         .unwrap();
     }
 
+    /// Σ.Q.L9 extension — small filter set that joins onto lineitem
+    /// through `l_suppkey`. Mirrors Q18's "624-key filter set →
+    /// orders scan" shape at miniature scale.
+    fn write_filter_keys(path: &std::path::Path) {
+        // 3 rows; key_suppkey ∈ {0, 5, 10}.
+        let key_suppkey: Vec<i64> = vec![0, 5, 10];
+        write_table_to_path(
+            path,
+            &[("key_suppkey", ColumnData::I64(&key_suppkey))],
+            CompressionCodec::Uncompressed,
+        )
+        .unwrap();
+    }
+
     #[tokio::test]
     async fn rule_threads_sideband_through_hashjoin() {
         let li = tmp_parquet("lineitem");
@@ -341,5 +350,81 @@ mod tests {
         // mod 50 → 20 rows per l_suppkey value. Only s_suppkey in
         // [0,25) participate → 25 × 20 = 500.
         assert_eq!(row_count, 500);
+    }
+
+    /// Σ.Q.L9 extension — verify the rule fires on a join whose
+    /// probe side is itself a HashJoinExec. Mirrors Q18's RightSemi
+    /// shape where the outer join's bloom needs to descend through
+    /// an inner join to reach an Emat scan. Before the descent fix
+    /// `find_probe_scan_for_column` bailed at 2-child plans, so the
+    /// outer join contributed nothing.
+    #[tokio::test]
+    async fn rule_descends_through_inner_join_to_emat_scan() {
+        let li = tmp_parquet("lineitem_outer");
+        let sp = tmp_parquet("supplier_outer");
+        let fk = tmp_parquet("filter_keys");
+        write_lineitem(&li);
+        write_supplier(&sp);
+        write_filter_keys(&fk);
+
+        let cfg = SessionConfig::new().with_target_partitions(4);
+        let state = install_runtime_bloom_sideband_rule(
+            SessionStateBuilder::new()
+                .with_default_features()
+                .with_config(cfg),
+        )
+        .build();
+        let ctx = SessionContext::new_with_state(state);
+        // Register all three as Emat so L9 can attach a sideband to
+        // any of them.
+        ctx.register_table(
+            "lineitem",
+            Arc::new(EmatixFastParquetTableProvider::try_new(li.to_string_lossy()).unwrap()),
+        )
+        .unwrap();
+        ctx.register_table(
+            "supplier",
+            Arc::new(EmatixFastParquetTableProvider::try_new(sp.to_string_lossy()).unwrap()),
+        )
+        .unwrap();
+        ctx.register_table(
+            "filter_keys",
+            Arc::new(EmatixFastParquetTableProvider::try_new(fk.to_string_lossy()).unwrap()),
+        )
+        .unwrap();
+
+        // Subquery-forced shape: outer JOIN whose probe side is an
+        // inner (supplier ⋈ lineitem). Outer key references s_suppkey,
+        // which lives in the inner join's LEFT input (supplier).
+        let sql = "SELECT l_orderkey \
+                   FROM filter_keys \
+                   JOIN (SELECT s_suppkey, l_orderkey \
+                         FROM supplier JOIN lineitem ON s_suppkey = l_suppkey) sub \
+                   ON key_suppkey = sub.s_suppkey";
+        let df = ctx.sql(sql).await.unwrap();
+        let plan = df.clone().create_physical_plan().await.unwrap();
+        let plan_str = format!("{plan:?}");
+
+        // With the descent fix, L9 should fire on BOTH joins —
+        // once on the inner (supplier⋈lineitem) and once on the
+        // outer (filter_keys⋈sub) — so two BuildSideBloomEmitterExec
+        // wrappers should appear in the plan.
+        let n_emitters = plan_str.matches("BuildSideBloomEmitterExec").count();
+        assert!(
+            n_emitters >= 2,
+            "expected ≥2 BuildSideBloomEmitterExec wrappers (one per join) — \
+             only found {n_emitters}. The outer join's bloom didn't descend \
+             through the inner HashJoinExec to reach an Emat scan. Plan:\n{plan_str}"
+        );
+
+        // Output correctness — query must produce the same rows as
+        // without the rule. filter_keys ∈ {0,5,10}; for each k,
+        // lineitem rows where l_suppkey == k and the join supplier
+        // s_suppkey == k. l_suppkey mod 50; rows with l_suppkey == 0
+        // = 20 rows (i ∈ {0, 50, 100, ..., 950}), same for 5 and 10.
+        // 3 filter keys × 20 lineitem matches = 60.
+        let batches = df.collect().await.unwrap();
+        let row_count: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(row_count, 60, "wrong row count with L9 descent active");
     }
 }
