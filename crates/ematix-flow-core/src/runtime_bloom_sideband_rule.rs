@@ -56,6 +56,15 @@ pub fn install_runtime_bloom_sideband_rule(
 #[derive(Debug, Clone, Copy)]
 pub struct EnableRuntimeBloomSidebandRule {
     pub min_probe_to_build_ratio: usize,
+    /// Σ.Q.L9 (2026-05-23 Q21 fix): Inner-join bloom pushdown can
+    /// produce *incorrect* row counts when the same parquet path
+    /// appears multiple times in the plan (Q21's l1/l2/l3 references)
+    /// and the bloom is built from a source that's been implicitly
+    /// constrained via downstream filters. Inner-join firings are
+    /// default-off; LeftSemi/RightSemi continue to fire (where the
+    /// strong Q18/Q21-class wins live). Opt-in via
+    /// `EMAT_RT_BLOOM_INNER_JOIN=1` for benchmarking.
+    pub allow_inner_join: bool,
 }
 
 impl Default for EnableRuntimeBloomSidebandRule {
@@ -69,8 +78,10 @@ impl Default for EnableRuntimeBloomSidebandRule {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(64);
+        let allow_inner_join = std::env::var_os("EMAT_RT_BLOOM_INNER_JOIN").is_some();
         Self {
             min_probe_to_build_ratio: ratio,
+            allow_inner_join,
         }
     }
 }
@@ -94,6 +105,17 @@ impl PhysicalOptimizerRule for EnableRuntimeBloomSidebandRule {
             ) {
                 return Ok(Transformed::no(node));
             }
+            // Σ.Q.L9 (2026-05-23 Q21 fix): default-skip Inner-join firings.
+            // Inner-join bloom pushdown produces wrong row counts on Q21
+            // (1798 vs 4009) — the bloom from the s_suppkey⋈l_suppkey
+            // join applies as if supplier had been pre-filtered to ~4K
+            // Saudi rows, even though the supplier scan is unfiltered
+            // (the Saudi predicate joins later via nation). Root cause
+            // not yet narrowed (bloom-build / bloom-apply / both); keep
+            // Inner support gated until that's fixed.
+            if matches!(hj.join_type(), JoinType::Inner) && !self.allow_inner_join {
+                return Ok(Transformed::no(node));
+            }
 
             // Σ.Q.L9: build = LEFT, probe = RIGHT in DataFusion's
             // HashJoinExec (per the SwapSemiJoinBuildSideRule docs).
@@ -104,7 +126,12 @@ impl PhysicalOptimizerRule for EnableRuntimeBloomSidebandRule {
             // EmatixFastParquetExec carrying that column. If none
             // found, this join contributes no sideband — leave it
             // alone.
-            let mut matched: Option<(usize, usize, Arc<EmatixFastParquetExec>)> = None;
+            let mut matched: Option<(
+                usize,
+                usize,
+                Arc<dyn ExecutionPlan>,
+                Arc<EmatixFastParquetExec>,
+            )> = None;
             for (left_expr, right_expr) in hj.on().iter() {
                 let Some(lcol) = left_expr.as_any().downcast_ref::<Column>() else {
                     continue;
@@ -119,15 +146,16 @@ impl PhysicalOptimizerRule for EnableRuntimeBloomSidebandRule {
                     continue;
                 }
                 let col_name = rcol.name().to_string();
-                if let Some((scan, scan_col_idx)) =
+                if let Some((scan_node, scan_typed, scan_col_idx)) =
                     find_probe_scan_for_column(&probe, &col_name)
                 {
-                    matched = Some((lcol.index(), scan_col_idx, scan));
+                    matched = Some((lcol.index(), scan_col_idx, scan_node, scan_typed));
                     break;
                 }
             }
 
-            let Some((build_key_idx, probe_scan_col_idx, scan_arc)) = matched else {
+            let Some((build_key_idx, probe_scan_col_idx, scan_node, scan_arc)) = matched
+            else {
                 return Ok(Transformed::no(node));
             };
 
@@ -192,7 +220,7 @@ impl PhysicalOptimizerRule for EnableRuntimeBloomSidebandRule {
                 expected_keys,
             )?);
 
-            let new_probe = rewrite_probe_subtree(&probe, scan_arc.as_ref(), &sideband)?;
+            let new_probe = rewrite_probe_subtree(&probe, &scan_node, &sideband)?;
 
             // Build a new HashJoinExec with the two new children. The
             // node itself is an Arc<dyn ExecutionPlan> pointing at this
@@ -237,7 +265,7 @@ impl PhysicalOptimizerRule for EnableRuntimeBloomSidebandRule {
 fn find_probe_scan_for_column(
     plan: &Arc<dyn ExecutionPlan>,
     col_name: &str,
-) -> Option<(Arc<EmatixFastParquetExec>, usize)> {
+) -> Option<(Arc<dyn ExecutionPlan>, Arc<EmatixFastParquetExec>, usize)> {
     if let Some(scan) = plan.as_any().downcast_ref::<EmatixFastParquetExec>() {
         let sch = scan.schema();
         if let Some((idx, _)) = sch
@@ -246,13 +274,17 @@ fn find_probe_scan_for_column(
             .enumerate()
             .find(|(_, f)| f.name() == col_name)
         {
-            // Return an Arc<EmatixFastParquetExec> via the no-op
-            // `with_added_predicates` clone path. The Arc is used
-            // only as a type-plumbing handle — `rewrite_probe_subtree`
-            // locates the actual scan in the live plan by path() match
-            // and rewrites THAT instance, not this clone.
+            // Σ.Q.L9 (2026-05-23 Q21 fix): return the ORIGINAL Arc node
+            // alongside a typed handle. Q21 references lineitem three
+            // times (l1, l2, l3) — all the same parquet path. The
+            // earlier path-equality rewrite incorrectly attached the
+            // bloom sideband to all three, dropping non-Saudi suppliers
+            // from the EXISTS subquery (l2) whose semantics require
+            // `l2.l_suppkey <> l1.l_suppkey`. Returning the original
+            // Arc lets `rewrite_probe_subtree` use Arc::ptr_eq to
+            // attach the sideband to ONLY this specific scan instance.
             let fresh = scan.with_added_predicates(Vec::new()).ok()?;
-            return Some((fresh, idx));
+            return Some((Arc::clone(plan), fresh, idx));
         }
         return None;
     }
@@ -270,18 +302,19 @@ fn find_probe_scan_for_column(
 
 fn rewrite_probe_subtree(
     plan: &Arc<dyn ExecutionPlan>,
-    target_scan: &EmatixFastParquetExec,
+    target_scan_node: &Arc<dyn ExecutionPlan>,
     sideband: &BridgeFilterSideband,
 ) -> DfResult<Arc<dyn ExecutionPlan>> {
-    // Bottom-up rewrite: if we find an EmatixFastParquetExec whose
-    // path matches the target's, replace it with the sideband-
-    // attached version. Match by `path()` since multiple distinct
-    // EmatixFastParquetExec instances over the same parquet would
-    // be equally valid attachment points.
+    // Σ.Q.L9 (2026-05-23 Q21 fix): match by Arc identity, not by path.
+    // Multiple EmatixFastParquetExec instances over the same parquet
+    // are valid in the same plan (TPC-H Q21 has 3 lineitem scans for
+    // the l1 / l2 / l3 references) and the sideband must attach only
+    // to the specific scan that find_probe_scan_for_column identified
+    // as the probe side of THIS HashJoinExec.
     plan.clone()
         .transform_up(|node| {
-            if let Some(scan) = node.as_any().downcast_ref::<EmatixFastParquetExec>() {
-                if scan.path() == target_scan.path() {
+            if Arc::ptr_eq(&node, target_scan_node) {
+                if let Some(scan) = node.as_any().downcast_ref::<EmatixFastParquetExec>() {
                     let new = scan.with_runtime_sideband(sideband.clone());
                     return Ok(Transformed::yes(new as Arc<dyn ExecutionPlan>));
                 }
@@ -400,6 +433,7 @@ mod tests {
             .with_config(cfg)
             .with_physical_optimizer_rule(Arc::new(EnableRuntimeBloomSidebandRule {
                 min_probe_to_build_ratio: 0,
+                allow_inner_join: true,
             }))
             .build();
         let ctx = SessionContext::new_with_state(state);
@@ -462,6 +496,7 @@ mod tests {
             .with_config(cfg)
             .with_physical_optimizer_rule(Arc::new(EnableRuntimeBloomSidebandRule {
                 min_probe_to_build_ratio: 0,
+                allow_inner_join: true,
             }))
             .build();
         let ctx = SessionContext::new_with_state(state);
