@@ -193,6 +193,11 @@ pub mod inbloom_scan_pushdown_rule;
 // install via EnableInBloomScanPushdownRule. Local sibling of
 // ematix-flow-distributed::bloom_emitter::emit_build_side_blooms.
 pub mod local_bloom_emitter;
+// Σ.Q.L9 (2026-05-23): runtime sideband channel for mid-query plan
+// adaptation. Producer (BuildSideBloomEmitterExec) writes blooms as a
+// side-effect of HashJoinExec's build phase; consumer
+// (EmatixFastParquetExec on the probe side) reads at execute() time.
+pub mod bridge_filter_sideband;
 // Σ.O (2026-05-21): in-memory LRU cache of decoded RecordBatch by
 // (file_path, row_group_idx, projection_hash). Avoids re-decoding
 // the same parquet column chunks across queries in the same session.

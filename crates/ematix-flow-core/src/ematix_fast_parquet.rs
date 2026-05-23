@@ -1608,6 +1608,12 @@ pub struct EmatixFastParquetExec {
     /// of `Statistics::new_unknown`. Same shape as
     /// `FastParquetExec.column_stats`.
     column_stats: Vec<datafusion::common::stats::ColumnStatistics>,
+    /// Σ.Q.L9 — runtime sideband for mid-query predicate injection.
+    /// `None` = no sideband attached (normal case). When set, the
+    /// scan's `execute()` consults this AFTER the build phase of any
+    /// upstream HashJoin has had a chance to populate it; matching
+    /// predicates are merged into the BridgeFilter before decode.
+    runtime_sideband: Option<crate::bridge_filter_sideband::BridgeFilterSideband>,
     properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
 }
@@ -1646,9 +1652,31 @@ impl EmatixFastParquetExec {
             late_mat,
             streaming_arrow_reader,
             column_stats,
+            runtime_sideband: None,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
         })
+    }
+
+    /// Σ.Q.L9 — attach a runtime sideband. The scan will consult this
+    /// at `execute()` time and merge any published predicates into
+    /// the BridgeFilter before decode. Returns a fresh Arc<Self> so
+    /// the planner rule's TreeNode walk stays honest.
+    pub fn with_runtime_sideband(
+        &self,
+        sideband: crate::bridge_filter_sideband::BridgeFilterSideband,
+    ) -> Arc<Self> {
+        let mut next = self.clone_internals();
+        next.runtime_sideband = Some(sideband);
+        Arc::new(next)
+    }
+
+    /// Σ.Q.L9 — the attached runtime sideband, if any. Used by the
+    /// planner rule to verify it threaded the sideband correctly.
+    pub fn runtime_sideband(
+        &self,
+    ) -> Option<&crate::bridge_filter_sideband::BridgeFilterSideband> {
+        self.runtime_sideband.as_ref()
     }
 
     /// Full (unprojected) file schema. Σ.E5: needed by
@@ -1712,6 +1740,7 @@ impl EmatixFastParquetExec {
             late_mat: self.late_mat,
             streaming_arrow_reader: self.streaming_arrow_reader,
             column_stats: self.column_stats.clone(),
+            runtime_sideband: self.runtime_sideband.clone(),
             properties: self.properties.clone(),
             metrics: ExecutionPlanMetricsSet::new(),
         }))
@@ -1730,6 +1759,7 @@ impl EmatixFastParquetExec {
             late_mat: self.late_mat,
             streaming_arrow_reader: self.streaming_arrow_reader,
             column_stats: self.column_stats.clone(),
+            runtime_sideband: self.runtime_sideband.clone(),
             properties: self.properties.clone(),
             metrics: ExecutionPlanMetricsSet::new(),
         }
@@ -1779,7 +1809,29 @@ impl ExecutionPlan for EmatixFastParquetExec {
         let path = self.path.clone();
         let projection = self.projection.clone();
         let schema = self.schema.clone();
-        let filter = self.filter.clone();
+        // Σ.Q.L9 — runtime sideband consumption. At execute() time
+        // (which for the probe side of a HashJoinExec runs AFTER the
+        // build phase has fully drained — see the L9 module doc), peek
+        // at the sideband. If the build-side wrapper has published
+        // predicates, merge them into the BridgeFilter we'll hand to
+        // the reader. Empty / no-sideband = no-op.
+        //
+        // We `peek` (not `take`) because in a partitioned plan,
+        // execute() is called once per partition; each partition's
+        // call needs the same published predicates. The sideband
+        // outlives the query, but the predicates inside are fresh
+        // per query.
+        let mut filter = self.filter.clone();
+        if let Some(sb) = &self.runtime_sideband {
+            if let Some(extras) = sb.peek() {
+                if !extras.is_empty() {
+                    let mut bf = filter.unwrap_or_else(|| BridgeFilter::new(Vec::new()));
+                    bf.extend(extras);
+                    let p = bf.estimate_pass_rate(&self.column_stats);
+                    filter = Some(bf.with_predicted_pass_rate(p));
+                }
+            }
+        }
         let late_mat = self.late_mat;
         let baseline = BaselineMetrics::new(&self.metrics, partition);
 
