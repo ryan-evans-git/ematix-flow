@@ -119,6 +119,7 @@ Status legend:
 | L2 | LeftSemi join swap-build-side | 🟡 RULE LANDED — NEUTRAL on TPC-H 22 | `SwapSemiJoinBuildSideRule` (crates/ematix-flow-core/src/swap_semi_join_build_rule.rs). Walks plan after JoinSelection, swaps semi/anti hash joins so the side with an `AggregateExec` becomes the BUILD. EXPLAIN confirms the swap fires on Q18 (LeftSemi → RightSemi, build now on 624-row agg subtree, probe on 60M). Q18 SF=10 wall-time: **708.18 ± 55 ms (OFF) vs 726.84 ± 64 ms (ON)** — within noise. Hypothesis: DataFusion's 14-way partitioned hash join already shards the 60M build (~4.3M rows / partition), so inversion cost is small relative to the FinalPartitioned aggregate hot path. SF=1 22-query A/B: every query within ±5% (noise). Decision: keep rule on as plan-hygiene; it correctly fills the gap left by `JoinSelection` when stats are absent. Not the Q18 silver bullet. |
 | L3 | Multi-column parallel decode (task #397) | ⚫ DEPRIORITIZED for Q18 | Q18 decode is 230ms / 700ms = 33% — not the dominant cost. Re-evaluate after L1/L2 land; might matter for Q01/Q03 (more scan-bound). |
 | L4 | Bloom-on-build for HashJoinExec | 🔵 PROPOSED | Σ.J.2 infra exists. Q07/Q21 might benefit. Less urgent than L1/L2 because Q18 isn't bloom-prunable (semi-join already does the work). |
+| L4′ | InBloom ColumnPredicate in BridgeFilter (pushdown into scan, not post-scan) | 🔴 NEG on Q07/Q21 SF=10 — mechanism works, lever doesn't pay | Predicate variant + dense kernel + planner rule + local emitter all land (commits `e3c5e81`, `449fbd6`, slice 3 below). End-to-end on Q07/Q21 SF=10: Q07 +6.6% (269→287ms), Q21 +2.0% (485→495ms). **Root cause**: `find_probe_table_col` only descends row-preserving wrappers (Filter/Projection/Sort/Limit/Distinct), not Joins. In deep TPC-H join trees the bloom only pushes across the immediate join — never reaches the deep table (lineitem) where decode savings would matter. The mechanism is reusable for shapes where probe = direct TableScan (e.g., star-schema fact↔dim shapes), and for distributed where Σ.J.2.b.v already serialises blooms across stages. **Next step to make this pay on TPC-H**: extend the probe-walker to descend through Joins by tracking column provenance, so a bloom from the nation-filter can push all the way down to lineitem.l_suppkey. Estimated 1-2 day spike. |
 | L5 | Custom RobinHoodHashJoin | ⚫ DEPRIORITIZED | If L1 extension fixes Q18's aggregate, hash join itself is only 13s of 700ms = secondary. Defer. |
 | L6 | Q17 correlated subquery diagnosis | 🔵 PROPOSED | 1.88× loss. EXPLAIN ANALYZE Q17 next. |
 | L6′ | Per-column RG decode cache (Σ.O.c.2 lift) | 🟢 WIN — opt-in via `EMAT_RG_DECODE_CACHE=1` | Cache key lifted from `(file, rg, projection_set)` to `(file, rg, leaf_idx)` so partial-projection overlap reuses entries. Eviction switched to `VecDeque::pop_front()` for O(1) LRU. `auto_inline` disabled when cache is active so the parallel-inline path doesn't bypass the cache. SF=10 5q (Q08/Q09/Q17/Q18/Q21) wins: Q21 −14.4%, Q18 −10.9%, Q17 −6.5%, Q09 −5.1%, Q08 −1.5%. SF=1 7q (Q01/Q03/Q06/Q12/Q14/Q15/Q18): within ±10% noise band (Q14 +10%, Q06 +6%, Q18 −10%, Q15 −7%, Q12 −2%, Q01 −1%, Q03 ~0%). Default OFF preserves no-regression posture; ON the right call for SF=10+ multi-scan workloads. |
@@ -374,6 +375,70 @@ build, fresh process per env) shows the more modest numbers above.
 The shape of the win is consistent (Q21 > Q18 > Q17 > Q09 > Q08) so
 the mechanism is right; the magnitude is just lower than the heated-
 cache-comparing-to-cold-baseline number reported earlier.
+
+---
+
+### Σ.Q.L4′ — InBloom ColumnPredicate (BridgeFilter pushdown)
+
+**Status**: 🔴 NEG on Q07/Q21 SF=10. Mechanism shipped; lever fires but
+doesn't beat the emission cost on these shapes.
+
+**Hypothesis**: Pre-execute small Inner-equijoin build sides (nation,
+region, filtered supplier) → hash into BloomFilter → push as an
+`I64InBloom` BridgeFilter predicate on the probe scan. Masked-decode
+skips rows whose join key isn't in the bloom — saving decode work,
+not just downstream join-probe work.
+
+**Implementation** (3 commits on `perf/sigma-q-single-node-parity`):
+
+1. `e3c5e81` — `ColumnPredicate::I64InBloom` variant + dense bitmap
+   kernel `filter_i64_column_to_bitmap_dense` + unit test (0 false
+   negatives, ≤5% FPR on the 1000-row synthetic).
+2. `449fbd6` — `EnableInBloomScanPushdownRule` (consumes `ContextBlooms`,
+   walks plan, rebuilds `EmatixFastParquetExec` with the predicate
+   appended via `with_added_predicates`). Rule holds the
+   `ContextBlooms` in `Arc<RwLock<…>>` so callers can swap the bloom
+   map between queries without rebuilding SessionState. 2 unit tests
+   cover the no-op (empty blooms) and the e2e plan-rewrite case.
+3. Slice 3 (this commit) — local emitter (
+   `local_bloom_emitter::emit_build_side_blooms_local`) walks
+   LogicalPlan for Inner equijoins, pre-executes build sides up to
+   `max_build_rows=50_000`, builds blooms keyed by
+   `column_uuid(probe_table, probe_col)`. Wired into
+   `tpch_triangulation_bench` behind `EMAT_BLOOM_PUSHDOWN=1`. The
+   per-trial timed window includes bloom emission cost.
+
+**Bench results** (SF=10, Q07/Q21, 3 trials × 1 warmup):
+
+| Q   | OFF (ms) | ON (ms) | Δ%      |
+|-----|---------:|--------:|--------:|
+| Q07 | 269.46   | 287.31  | +6.6%   |
+| Q21 | 485.47   | 494.98  | +2.0%   |
+
+**Diagnosis**: `find_probe_table_col` (lifted from the distributed
+emitter) only descends through row-preserving wrappers. For deep
+join trees like Q07's `lineitem → orders → customer → nation`, the
+emitter only matches the outermost direct-TableScan probe — bloom
+from `nation.n_name = GERMANY/FRANCE` reaches the immediate Join's
+left but not the deep `lineitem.l_suppkey` scan where decode
+savings would matter. The blooms that DO get emitted are small
+(few keys → tight bloom) on tables that don't dominate the query
+cost.
+
+**Decision**: Keep the predicate plumbing + rule + emitter in tree
+behind the env-var gate. They're correct, tested, and unlock the
+shape for shapes where probe = direct TableScan (star-schema, dim
+joins) and for distributed shipping (Σ.J.2.b.v / vi already use the
+same `ContextBlooms` + `column_uuid` keying scheme). The next step
+to make this pay on TPC-H is a deeper probe-walker that descends
+through Joins by tracking column provenance — that's a 1-2 day
+spike, deferred.
+
+**Lessons for the cost-benefit table**: the doc's "Expected SF=10
+win 15-30% on Q07/Q21" was optimistic. Bloom pushdown into the
+deepest table requires column-provenance plumbing the slim emitter
+doesn't have. The accurate cost-benefit is "+1-2 day spike to make
+the lever fire on lineitem; possibly 10-20% gain when it does."
 
 ---
 

@@ -183,6 +183,12 @@ pub mod context_bloom_rule;
 // predicates instead of wrapping them in BloomFilterExec. Saves decode
 // work on probe-side rows whose join key isn't in the build set.
 pub mod inbloom_scan_pushdown_rule;
+// Σ.Q.L4′ slice 3 (2026-05-23): single-node bloom emitter. Walks a
+// LogicalPlan, pre-executes Inner-equijoin build sides, returns a
+// `column_uuid → BloomFilter` map ready to wrap in ContextBlooms +
+// install via EnableInBloomScanPushdownRule. Local sibling of
+// ematix-flow-distributed::bloom_emitter::emit_build_side_blooms.
+pub mod local_bloom_emitter;
 // Σ.O (2026-05-21): in-memory LRU cache of decoded RecordBatch by
 // (file_path, row_group_idx, projection_hash). Avoids re-decoding
 // the same parquet column chunks across queries in the same session.

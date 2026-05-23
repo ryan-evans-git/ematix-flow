@@ -48,14 +48,34 @@ use crate::ematix_fast_parquet::{ColumnPredicate, EmatixFastParquetExec};
 
 /// Σ.Q.L4′ — pushes context blooms into emat scans as I64InBloom
 /// BridgeFilter predicates.
-#[derive(Debug)]
+///
+/// Holds the [`ContextBlooms`] behind an `Arc<RwLock<_>>` so the
+/// bench/caller can mutate the bloom map between queries without
+/// rebuilding the SessionState. An empty ContextBlooms is a no-op.
+#[derive(Debug, Default)]
 pub struct EnableInBloomScanPushdownRule {
-    blooms: ContextBlooms,
+    blooms: Arc<std::sync::RwLock<ContextBlooms>>,
 }
 
 impl EnableInBloomScanPushdownRule {
     pub fn new(blooms: ContextBlooms) -> Self {
+        Self {
+            blooms: Arc::new(std::sync::RwLock::new(blooms)),
+        }
+    }
+
+    /// Σ.Q.L4′ — construct with a shared lock so the caller can swap
+    /// the bloom map in between queries. The same rule instance is
+    /// installed once on the SessionState; the lock is mutated from
+    /// outside.
+    pub fn with_shared(blooms: Arc<std::sync::RwLock<ContextBlooms>>) -> Self {
         Self { blooms }
+    }
+
+    /// Σ.Q.L4′ — replace the active ContextBlooms. Used by the bench
+    /// harness to update the bloom map before each query.
+    pub fn set(&self, blooms: ContextBlooms) {
+        *self.blooms.write().unwrap() = blooms;
     }
 }
 
@@ -65,7 +85,8 @@ impl PhysicalOptimizerRule for EnableInBloomScanPushdownRule {
         plan: Arc<dyn ExecutionPlan>,
         _config: &ConfigOptions,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
-        if self.blooms.is_empty() {
+        let blooms = self.blooms.read().unwrap().clone();
+        if blooms.is_empty() {
             return Ok(plan);
         }
         let result = plan.transform_up(|node| {
@@ -87,7 +108,7 @@ impl PhysicalOptimizerRule for EnableInBloomScanPushdownRule {
                     continue;
                 }
                 let uuid = column_uuid(&table_stem, field.name());
-                if let Some(bloom) = self.blooms.get(&uuid) {
+                if let Some(bloom) = blooms.get(&uuid) {
                     new_preds.push(ColumnPredicate::I64InBloom {
                         col_idx: idx,
                         bloom: bloom.clone(),
