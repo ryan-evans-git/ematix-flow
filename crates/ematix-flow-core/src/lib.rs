@@ -172,6 +172,10 @@ pub mod robin_hood_agg;
 // chain — opt-in only via install_robin_hood_rule(state_builder) to
 // avoid the codegen tax recorded in optimizer-codegen-sensitivity.
 pub mod robin_hood_agg_rule;
+// Σ.Q.L1b (2026-05-23): SUM(f64) GROUP BY i64 operator + planner rule.
+// Sibling to robin_hood_agg's COUNT(*) variant; targets Q18 SF=10's
+// FinalPartitioned sum(l_quantity) GROUP BY l_orderkey at 15M card.
+pub mod robin_hood_sum_f64_exec;
 // Σ.J.2.b.vi (2026-05-22): per-request PhysicalOptimizerRule that
 // walks the plan, finds EmatixFastParquetExec scans whose
 // `<table>.<col>` uuid matches a build-side bloom in ContextBlooms,
