@@ -18,6 +18,7 @@ use ematix_flow_core::ematix_fast_parquet::EmatixFastParquetTableProvider;
 use ematix_flow_core::fast_parquet::FastParquetTableProvider;
 use ematix_flow_core::fused_aggregate_filter_multi_agg_rule::InjectFilterMultiAggRule;
 use ematix_flow_core::fused_aggregate_filter_sum_rule::InjectFilterSumRule;
+use ematix_flow_core::robin_hood_sum_f64_exec::EnableRobinHoodSumF64Rule;
 use ematix_flow_core::swap_semi_join_build_rule::SwapSemiJoinBuildSideRule;
 
 const TPCH_TABLES: &[&str] = &[
@@ -41,6 +42,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_physical_optimizer_rule(Arc::new(InjectFilterMultiAggRule))
         .with_physical_optimizer_rule(Arc::new(InjectFilterSumRule))
         .with_physical_optimizer_rule(Arc::new(SwapSemiJoinBuildSideRule))
+        .with_physical_optimizer_rule(Arc::new(EnableRobinHoodSumF64Rule))
         .build();
     let ctx = SessionContext::new_with_state(state);
 

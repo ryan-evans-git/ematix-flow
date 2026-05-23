@@ -36,6 +36,7 @@ use ematix_flow_core::fused_aggregate_filter_sum_rule::InjectFilterSumRule;
 use ematix_flow_core::inbloom_scan_pushdown_rule::EnableInBloomScanPushdownRule;
 use ematix_flow_core::local_bloom_emitter::{LocalBloomOptions, emit_build_side_blooms_local};
 use ematix_flow_core::bloom::ContextBlooms;
+use ematix_flow_core::robin_hood_sum_f64_exec::EnableRobinHoodSumF64Rule;
 use ematix_flow_core::swap_semi_join_build_rule::SwapSemiJoinBuildSideRule;
 use futures_util::TryStreamExt;
 
@@ -337,6 +338,19 @@ async fn build_ematix_ctx(
     if swap_enabled {
         builder =
             builder.with_physical_optimizer_rule(Arc::new(SwapSemiJoinBuildSideRule));
+    }
+    // Σ.Q.L1b: opt-in via EMAT_RH_SUM_F64=1. Routes
+    // SUM(Float64) GROUP BY Int64 through RobinHoodSumF64Exec.
+    // Default OFF (per [[optimizer-codegen-sensitivity]] — adding a
+    // rule costs ~7% geomean before it does any work; needs Q18 win
+    // to amortise).
+    let rh_sum_f64_enabled = std::env::var("EMAT_RH_SUM_F64")
+        .ok()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if rh_sum_f64_enabled {
+        builder =
+            builder.with_physical_optimizer_rule(Arc::new(EnableRobinHoodSumF64Rule));
     }
     // Σ.Q.L4′: install the in-scan bloom pushdown rule with an empty
     // shared bloom slot. `run_ematix_flow` swaps the slot's contents
