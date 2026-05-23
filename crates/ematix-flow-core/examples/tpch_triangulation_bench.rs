@@ -38,6 +38,7 @@ use ematix_flow_core::local_bloom_emitter::{LocalBloomOptions, emit_build_side_b
 use ematix_flow_core::bloom::ContextBlooms;
 use ematix_flow_core::robin_hood_sum_f64_exec::EnableRobinHoodSumF64Rule;
 use ematix_flow_core::runtime_bloom_sideband_rule::EnableRuntimeBloomSidebandRule;
+use ematix_flow_core::push_down_left_semi_rule::PushDownLeftSemiRule;
 use ematix_flow_core::swap_semi_join_build_rule::SwapSemiJoinBuildSideRule;
 use futures_util::TryStreamExt;
 
@@ -339,6 +340,17 @@ async fn build_ematix_ctx(
     if swap_enabled {
         builder =
             builder.with_physical_optimizer_rule(Arc::new(SwapSemiJoinBuildSideRule));
+    }
+    // Σ.Q.L10: logical-plan rewrite — push LeftSemi past Inner joins
+    // down to its target table. Closes the Q18-shape structural gap
+    // to DuckDB (semi-filter pushed to wrap orders directly,
+    // eliminating the 60M-row intermediate). Opt-in via EMAT_PUSH_SEMI=1.
+    let push_semi_enabled = std::env::var("EMAT_PUSH_SEMI")
+        .ok()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if push_semi_enabled {
+        builder = builder.with_optimizer_rule(Arc::new(PushDownLeftSemiRule));
     }
     // Σ.Q.L1b: opt-in via EMAT_RH_SUM_F64=1. Routes
     // SUM(Float64) GROUP BY Int64 through RobinHoodSumF64Exec.

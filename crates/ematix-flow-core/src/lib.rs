@@ -79,6 +79,13 @@ pub mod dedupe_aggregate_rule;
 // AggregateExec (i.e., is bounded-small) but the build side doesn't.
 // Fixes Q18 SF=10 build-on-60M-rows inversion. See module docs.
 pub mod swap_semi_join_build_rule;
+// Σ.Q.L10: logical-plan rewrite — push a LeftSemi join down past
+// Inner joins so it filters its target table directly, eliminating
+// the giant intermediate that gets semi-filtered at the top of the
+// plan. Closes the structural gap to DuckDB on Q18-style queries
+// where an IN-subquery decorrelates into a LeftSemi placed above
+// every join.
+pub mod push_down_left_semi_rule;
 // Σ.P.1: session-scoped subquery CSE. SharedSubtreeExec wraps a
 // duplicated subtree; both consumers share an Arc<CachedBatches> so
 // the first execute() computes and the rest replay. Backing storage

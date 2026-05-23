@@ -18,6 +18,7 @@ use ematix_flow_core::ematix_fast_parquet::EmatixFastParquetTableProvider;
 use ematix_flow_core::fast_parquet::FastParquetTableProvider;
 use ematix_flow_core::fused_aggregate_filter_multi_agg_rule::InjectFilterMultiAggRule;
 use ematix_flow_core::fused_aggregate_filter_sum_rule::InjectFilterSumRule;
+use ematix_flow_core::push_down_left_semi_rule::PushDownLeftSemiRule;
 use ematix_flow_core::robin_hood_sum_f64_exec::EnableRobinHoodSumF64Rule;
 use ematix_flow_core::runtime_bloom_sideband_rule::EnableRuntimeBloomSidebandRule;
 use ematix_flow_core::swap_semi_join_build_rule::SwapSemiJoinBuildSideRule;
@@ -44,6 +45,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let swap_semi = env_on("EMAT_SWAP_SEMI");
     let rt_bloom = env_on("EMAT_RT_BLOOM_SIDEBAND");
     let rh_sum_f64 = env_on("EMAT_RH_SUM_F64");
+    let push_semi = env_on("EMAT_PUSH_SEMI");
 
     let mut builder = SessionStateBuilder::new()
         .with_config(SessionConfig::new().with_target_partitions(14))
@@ -52,6 +54,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_physical_optimizer_rule(Arc::new(EnableDictGroupCountRule))
         .with_physical_optimizer_rule(Arc::new(InjectFilterMultiAggRule))
         .with_physical_optimizer_rule(Arc::new(InjectFilterSumRule));
+    if push_semi {
+        // Σ.Q.L10 — logical rule, installed via with_optimizer_rule.
+        builder = builder.with_optimizer_rule(Arc::new(PushDownLeftSemiRule));
+    }
     if swap_semi {
         builder = builder.with_physical_optimizer_rule(Arc::new(SwapSemiJoinBuildSideRule));
     }
@@ -64,8 +70,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let state = builder.build();
 
     eprintln!(
-        "sigma_q_explain_analyze rules: swap_semi={swap_semi} rt_bloom={rt_bloom} \
-         rh_sum_f64={rh_sum_f64}"
+        "sigma_q_explain_analyze rules: push_semi={push_semi} swap_semi={swap_semi} \
+         rt_bloom={rt_bloom} rh_sum_f64={rh_sum_f64}"
     );
     let ctx = SessionContext::new_with_state(state);
 
@@ -91,6 +97,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Warmup (3 runs to stabilize)
     for _ in 0..3 {
         ctx.sql(&sql).await?.collect().await?;
+    }
+
+    // Σ.Q.L10 — also dump the logical plan (initial + optimized) so
+    // we can see where the IN-subquery's semi-filter ends up
+    // *before* physical planning. EXPLAIN (no ANALYZE) returns both.
+    if std::env::var("EMAT_EXPLAIN_LOGICAL").ok().as_deref() == Some("1") {
+        println!("==== EXPLAIN (logical) ====");
+        let logical_sql = format!("EXPLAIN {sql}");
+        let lp_df = ctx.sql(&logical_sql).await?;
+        let lp_batches = lp_df.collect().await?;
+        println!("{}", pretty_format_batches(&lp_batches)?);
+        println!();
     }
 
     // Now run with EXPLAIN ANALYZE
