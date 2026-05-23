@@ -236,6 +236,96 @@ apply locally too. Q07/Q21 are the likely targets.
 
 ---
 
+### Σ.Q.L4/L6/L7 — Q07/Q17 plan dumps + lever cost-benefit re-evaluation
+
+**Status**: 🟡 SCOPE-FORK. Documented; awaiting strategy decision before
+the next code change.
+
+**Q17 plan structure** (correlated subquery, 1.88× DuckDB loss = 144 ms gap):
+
+```
+ProjectionExec  / 7.0
+  AggregateExec Final  sum(l_extendedprice)
+    HashJoin Inner on=(p_partkey, l_partkey), filter=(l_quantity < 0.2 * avg)
+      HashJoin Inner on=(p_partkey, l_partkey)   ←  p_brand+p_container → ~150 parts
+        FilterExec p_brand=Brand#23 AND p_container='MED BOX'
+          FastParquetExec part
+        EmatixFastParquetExec lineitem (60M rows, 3 cols)         ← scan #1
+      ProjectionExec 0.2 * avg(l_quantity), l_partkey            ← sub-agg side
+        AggregateExec FinalPartitioned avg(l_quantity) gby l_partkey
+          AggregateExec Partial
+            EmatixFastParquetExec lineitem (60M rows, 2 cols)     ← scan #2
+```
+
+Both lineitem scans run in full. Σ.O.c.2 decode cache should be the
+natural lever — the two scans share columns 1,4 (l_partkey, l_quantity)
+and the second scan adds column 5 (l_extendedprice). But Σ.O.c proved
+ZERO effect on Q18 SF=10 because the cache is RG-and-projection-set
+keyed, not column-set keyed. **Action item: probe Σ.O.c.2 behavior
+under partial-projection overlap to confirm/refute.**
+
+**Q07 plan structure** (5-way join, 1.98× DuckDB loss = 136 ms gap):
+
+```
+SortExec sort by supp_nation, cust_nation, l_year
+  AggregateExec FinalPartitioned sum(volume) gby (supp_nation,cust_nation,l_year)
+    HashJoin Inner on=(n_nationkey, c_nationkey)  CollectLeft  ← n2 filter
+      FilterExec n_name = GERMANY OR n_name = FRANCE  →   nation
+      HashJoin Inner on=(n_nationkey, s_nationkey)  CollectLeft  ← n1 filter
+        FilterExec n_name = FRANCE OR n_name = GERMANY  →   nation
+        HashJoin Inner on=(c_custkey, o_custkey)  Partitioned
+          FastParquetExec customer (1.5M)
+          HashJoin Inner on=(l_orderkey, o_orderkey)  Partitioned
+            HashJoin Inner on=(s_suppkey, l_suppkey)  CollectLeft
+              FastParquetExec supplier (100K)
+              FilterExec l_shipdate >= 1995-01-01 AND <= 1996-12-31
+                EmatixFastParquetExec lineitem (60M → ~16M after date filter)
+            FastParquetExec orders (15M)
+```
+
+`l_shipdate` predicate is pushed to scan (good — late-mat fires).
+`n_name` predicate pushed to scan (good). Plan is structurally clean.
+The remaining gap is **per-row throughput on the multi-way join** —
+DuckDB's pipelined hash joins beat partitioned hash joins on 5-way
+shapes where intermediate cardinality compounds.
+
+### Lever cost-benefit (post-Q07/Q17 diagnostic)
+
+| Lever | Build cost | Expected SF=10 win | Risk |
+|---|---|---|---|
+| L1b RobinHoodI64F64 | 8-12 hours | 5-15% on Q18 (50-100ms / 472ms gap) | Modest; codegen-sensitivity tax ~7% [[optimizer-codegen-sensitivity]] |
+| L4 Bloom-on-build post-scan | 2-4 hours | <5% Q07/Q21 (decode still happens) | Low — Σ.J.2.b infra exists |
+| **L4' Bloom-as-scan-predicate** (push into BridgeFilter) | 6-10 hours | **15-30% on Q07/Q21** (decode skipped) | Higher — requires new ColumnPredicate variant |
+| L6 Q17 sub-agg fusion / overlap-projection cache | 4-8 hours | 10-30% on Q17 | Σ.O.c.2 already-built; partial-projection probe unblocks it |
+| L7 Custom Q07 multi-join rewriter | 8-16 hours | Unknown; specula-fix without DuckDB profiling | High — same TPC-H-specific hardcoding risk we want to avoid [[no-tpch-hardcoding]] |
+
+### Recommended sequencing (next session)
+
+1. **Σ.O.c.2 partial-projection probe (1-2 hours)** — verify whether
+   wider key (Cell = RG × file-path) vs narrower key (Cell = RG ×
+   path × projected_cols_set) actually unlocks Q17's two-scan
+   overlap. If yes, lift the cache key to include column-set, then
+   bench Q17. This is the highest-EV first step.
+2. **L4' Bloom-as-scan-predicate (6-10 hours)** — extend
+   `BridgeFilter::columns` to accept `ColumnPredicate::InBloom(i64,
+   Arc<BloomFilter>)`. Pre-execute build sides via the Σ.J.2.b.vii
+   `emit_build_side_blooms` adapted for local mode. Test on Q07 SF=10
+   first (largest expected win).
+3. **L1b RobinHoodI64F64 (only if 1+2 don't hit parity)** — full
+   operator extension for SUM(f64) GROUP BY i64. Build only after
+   exhausting cheaper wins because of codegen-sensitivity baggage.
+
+### What we'd need from operator input before continuing autonomously
+
+- **Acceptable codegen tax**: do we accept up to ~7% geomean drag from
+  adding new optimizer rules, or do we want to consolidate into the
+  shape catalog [[shape-catalog-autotune-direction]] first?
+- **Bloom-pushdown semantic model**: false-positive vs exact-membership
+  ColumnPredicate. False-positive is cheaper to add; exact requires
+  hashset materialization on the build side.
+
+---
+
 ## Methodology notes
 
 - **Bench tool**: `cargo run --release -p ematix-flow-core --features triangulation --example tpch_triangulation_bench`
