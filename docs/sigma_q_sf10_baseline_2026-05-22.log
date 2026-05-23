@@ -1,0 +1,112 @@
+=== TPC-H 22 triangulation bench ===
+    data:    examples/tpch/data/sf10
+    queries: 21 ([1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22])
+    trials:  20 (after 5 warmups)
+    output:  /Users/ryanevans/RustroverProjects/ematix-flow/BENCHMARKS-SF10-LOCAL.md
+
+--- Q01 ---
+  ematix-flow   274.07 ms ± 12.05  (4 rows)
+  DuckDB        232.23 ms ±  4.05  (4 rows)
+  Polars        342.33 ms ± 12.55  (4 rows)
+
+--- Q02 ---
+  ematix-flow    48.17 ms ±  8.39  (4667 rows)
+  DuckDB         43.53 ms ±  1.29  (4667 rows)
+  Polars        428.41 ms ± 29.85  (4667 rows)
+
+--- Q03 ---
+  ematix-flow   154.65 ms ±  5.43  (114003 rows)
+  DuckDB        143.37 ms ±  3.57  (114003 rows)
+  Polars        560.56 ms ± 28.96  (114003 rows)
+
+--- Q04 ---
+  ematix-flow    81.71 ms ± 15.98  (5 rows)
+  DuckDB         86.80 ms ± 17.56  (5 rows)
+  Polars        270.26 ms ± 11.64  (5 rows)
+
+--- Q06 ---
+  ematix-flow    78.73 ms ±  4.37  (1 rows)
+  DuckDB         72.67 ms ±  2.85  (1 rows)
+  Polars         60.51 ms ±  1.47  (1 rows)
+
+--- Q07 ---
+  ematix-flow   274.59 ms ± 12.81  (4 rows)
+  DuckDB        138.63 ms ±  5.30  (4 rows)
+  Polars       1294.52 ms ± 46.77  (4 rows)
+
+--- Q08 ---
+  ematix-flow   201.68 ms ± 17.02  (2 rows)
+  DuckDB        173.61 ms ±  4.53  (2 rows)
+  Polars       1154.14 ms ± 24.15  (2 rows)
+
+--- Q09 ---
+  ematix-flow   294.79 ms ± 11.97  (175 rows)
+  DuckDB        308.69 ms ± 39.77  (175 rows)
+  Polars        436.70 ms ± 21.14  (175 rows)
+
+--- Q10 ---
+  ematix-flow   243.35 ms ± 10.76  (381105 rows)
+  DuckDB        409.21 ms ± 21.44  (381105 rows)
+  Polars       5625.75 ms ± 248.53  (381105 rows)
+
+--- Q11 ---
+  ematix-flow    26.24 ms ± 36.65  (0 rows)
+  DuckDB         24.82 ms ±  3.88  (0 rows)
+  Polars         33.23 ms ±  1.69  (0 rows)
+
+--- Q12 ---
+  ematix-flow   100.33 ms ±  5.66  (2 rows)
+  DuckDB        105.94 ms ± 15.73  (2 rows)
+  Polars        110.50 ms ±  5.29  (2 rows)
+
+--- Q13 ---
+  ematix-flow   134.56 ms ±  5.85  (46 rows)
+  DuckDB        267.76 ms ± 12.50  (46 rows)
+  Polars        409.16 ms ± 15.38  (46 rows)
+
+--- Q14 ---
+  ematix-flow    88.38 ms ±  2.98  (1 rows)
+  DuckDB        138.74 ms ± 13.38  (1 rows)
+  Polars         93.21 ms ±  2.42  (1 rows)
+
+--- Q15 ---
+  ematix-flow    79.34 ms ±  4.63  (1 rows)
+  DuckDB         85.82 ms ±  5.88  (1 rows)
+  Polars         66.63 ms ±  4.72  (1 rows)
+
+--- Q16 ---
+  ematix-flow    43.14 ms ±  2.00  (27840 rows)
+  DuckDB         63.27 ms ±  1.38  (27840 rows)
+  Polars        171.47 ms ± 13.75  (27840 rows)
+
+--- Q17 ---
+  ematix-flow   307.54 ms ±  8.06  (1 rows)
+  DuckDB        163.40 ms ±  3.89  (1 rows)
+  Polars        450.17 ms ± 32.17  (1 rows)
+
+--- Q18 ---
+  ematix-flow   696.82 ms ± 45.28  (624 rows)
+  DuckDB        224.97 ms ±  5.28  (624 rows)
+  Polars        592.65 ms ± 21.69  (624 rows)
+
+--- Q19 ---
+  ematix-flow   136.02 ms ±  6.40  (1 rows)
+  DuckDB        189.06 ms ±  5.14  (1 rows)
+  Polars       1193.02 ms ± 28.83  (1 rows)
+
+--- Q20 ---
+  ematix-flow   139.30 ms ± 11.93  (1804 rows)
+  DuckDB        137.49 ms ±  4.37  (1804 rows)
+  Polars        267.19 ms ± 14.12  (1804 rows)
+
+--- Q21 ---
+  ematix-flow   447.36 ms ± 43.72  (4009 rows)
+  DuckDB        411.79 ms ± 37.57  (4009 rows)
+  Polars       41009.60 ms ± 5165.24  (4009 rows)
+
+--- Q22 ---
+  ematix-flow    62.59 ms ± 35.96  (7 rows)
+  DuckDB        129.87 ms ±  2.61  (7 rows)
+  Polars        111.91 ms ±  8.85  (7 rows)
+
+wrote /Users/ryanevans/RustroverProjects/ematix-flow/BENCHMARKS-SF10-LOCAL.md

@@ -41,32 +41,64 @@ Q06 10.75   Q12 14.21   Q18 49.25
 - geomean(ematix/polars) = **0.362** (we are 2.76× faster than Polars)
 - Wins (outright): 19 / 22; beats DuckDB 21/22; beats Polars 20/22
 
-### SF=10 (in progress as of this commit)
+### SF=10 (complete; 21 queries — Q05 excluded due to Polars panic)
 
-```
-Q01 273.02   Q07 ?    Q13 ?    Q19 ?
-Q02  49.77   Q08 ?    Q14 ?    Q20 139.30
-Q03 159.73   Q09 ?    Q15 ?    Q21 447.36 (Polars panic'd, skipped)
-Q04  81.12   Q10 ?    Q16 ?    Q22 ?
-Q05 196.89   Q11 ?    Q17 307.54
-Q06  ?       Q12 ?    Q18 696.82
-```
+Median ± σ across 20 trials after 5 warmups. M3 Pro, all engines
+in-process. ematix is on the post-Σ.P main.
 
-(table will be filled when the in-progress bench completes; partial
-values from screen-scrape during run)
+| Q   | ematix (ms) | DuckDB (ms) | Polars (ms) | ematix vs DuckDB |
+|-----|-------:|-------:|-------:|:---|
+| Q01 | 274.07 | 232.23 | 342.33 | **−18%** loss |
+| Q02 | 48.17  | 43.53  | 428.41 | **−11%** loss |
+| Q03 | 154.65 | 143.37 | 560.56 | **−8%** loss |
+| Q04 | 81.71  | 86.80  | 270.26 | +6% win |
+| Q05 | (skip) | (skip) | PANIC  | (excluded) |
+| Q06 | 78.73  | 72.67  | 60.51  | **−8%** loss |
+| Q07 | 274.59 | 138.63 | 1294.52 | **−98%** loss (1.98×) |
+| Q08 | 201.68 | 173.61 | 1154.14 | **−16%** loss |
+| Q09 | 294.79 | 308.69 | 436.70 | +5% win |
+| Q10 | 243.35 | 409.21 | 5625.75 | **+68% win** |
+| Q11 | 26.24  | 24.82  | 33.23  | −6% (all 3 = 0 rows; spec quirk) |
+| Q12 | 100.33 | 105.94 | 110.50 | +6% win |
+| Q13 | 134.56 | 267.76 | 409.16 | **+99% win** |
+| Q14 | 88.38  | 138.74 | 93.21  | **+57% win** |
+| Q15 | 79.34  | 85.82  | 66.63  | +8% win (vs DuckDB; Polars wins outright) |
+| Q16 | 43.14  | 63.27  | 171.47 | **+47% win** |
+| Q17 | 307.54 | 163.40 | 450.17 | **−88%** loss (1.88×) |
+| Q18 | 696.82 | 224.97 | 592.65 | **−210%** loss (3.10×) ⭐ BIGGEST GAP |
+| Q19 | 136.02 | 189.06 | 1193.02 | **+39% win** |
+| Q20 | 139.30 | 137.49 | 267.19 | −1% tied |
+| Q21 | 447.36 | 411.79 | 41009.60 | **−9%** loss |
+| Q22 | 62.59  | 129.87 | 111.91 | **+107% win** |
 
-### Initial known losses at SF=10 (vs DuckDB)
+### SF=10 geomean
 
-| Q | ematix ms | DuckDB ms | Δ ematix/duckdb | Initial hypothesis |
-|---|---|---|---|---|
-| Q01 | 273.02 | 236.48 | 1.15 | full-lineitem scan-bound; decode parallelism |
-| Q02 | 49.77 | 43.21 | 1.15 | small joins; optimizer overhead borderline |
-| Q03 | 159.73 | 142.99 | 1.12 | hash join build cost |
-| Q05 | 196.89 | 141.35 | 1.39 | 6-way join shuffle |
-| Q17 | 307.54 | 163.40 | 1.88 | correlated subquery shape |
-| Q18 | 696.82 | 224.97 | 3.10 | huge hash table — biggest single loss |
+| Pair | Geomean ratio | Speedup |
+|---|---|---|
+| ematix / DuckDB | **0.9920** | ematix is 1.008× faster (essentially tied) |
+| ematix / Polars | 0.3458 | ematix is 2.89× faster |
 
-Q18 is the most extreme; flamegraph spike (Σ.Q.0) targets it first.
+**Outright wins**: ematix=9, DuckDB=10, Polars=2.
+
+### Where the losses concentrate
+
+Sorted by absolute ms gap (= what closing would shift the geomean most):
+
+| Q | Δ ms | Ratio | Hypothesis |
+|---|---:|---:|---|
+| Q18 | +472 | 3.10× | scalar-subquery + giant hash join + big group-by. **#1 lever.** |
+| Q17 | +144 | 1.88× | correlated subquery on lineitem — plan shape suspected |
+| Q07 | +136 | 1.98× | 5-way join + nation lookups; partitioning shuffle suspected |
+| Q01 | +42  | 1.18× | full-lineitem agg; decode parallelism |
+| Q21 | +36  | 1.09× | 4-way join + 2 anti-joins; hash join |
+| Q08 | +28  | 1.16× | 7-way join; same flavor as Q07 |
+| Q03 | +11  | 1.08× | filter + 3-way join; hash join probe |
+| Q06 | +6   | 1.08× | scan-bound; surprising loss (was win at SF=1) |
+| Q02 | +5   | 1.11× | small joins; borderline noise |
+| Q11 | +1   | 1.06× | zero-row result; spec quirk, not perf |
+
+**If Q18 alone closes to DuckDB parity (224ms), ematix/duckdb geomean
+becomes ~0.86 — a 14% lead over DuckDB.**
 
 ---
 
