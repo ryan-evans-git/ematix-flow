@@ -115,6 +115,14 @@ impl BridgeFilter {
     pub fn predicted_pass_rate(&self) -> f64 {
         self.predicted_pass_rate
     }
+
+    /// Σ.Q.L4′ — append additional predicates (typically I64InBloom
+    /// from a planner rule that pre-built blooms off small HashJoin
+    /// build sides). Order is "existing first, new after" so the
+    /// dict-aware fast-path predicates run before the bloom probe.
+    pub fn extend(&mut self, more: Vec<ColumnPredicate>) {
+        self.predicates.extend(more);
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1672,6 +1680,59 @@ impl EmatixFastParquetExec {
     /// (where `<table>` is the file basename without extension).
     pub fn path(&self) -> &str {
         &self.path
+    }
+
+    /// Σ.Q.L4′ — append extra predicates (e.g. I64InBloom from a
+    /// build-side bloom emitter) onto this scan's BridgeFilter. If
+    /// no filter existed, creates one from the supplied predicates.
+    /// Returns a fresh `Arc<Self>` to keep the rule's TreeNode walk
+    /// honest (no in-place mutation of shared exec nodes).
+    pub fn with_added_predicates(&self, more: Vec<ColumnPredicate>) -> DfResult<Arc<Self>> {
+        if more.is_empty() {
+            return Ok(Arc::new(self.clone_internals()));
+        }
+        let mut filter = match &self.filter {
+            Some(f) => f.clone(),
+            None => BridgeFilter::new(Vec::new()),
+        };
+        filter.extend(more);
+        // Re-compute the predicted pass rate so the streaming reader
+        // picks the right serial-vs-parallel path.
+        let p = filter.estimate_pass_rate(&self.column_stats);
+        let filter = filter.with_predicted_pass_rate(p);
+        Ok(Arc::new(Self {
+            path: self.path.clone(),
+            schema: self.schema.clone(),
+            file_schema: self.file_schema.clone(),
+            projection: self.projection.clone(),
+            assignments: self.assignments.clone(),
+            num_rows: self.num_rows,
+            rg_num_rows: self.rg_num_rows.clone(),
+            filter: Some(filter),
+            late_mat: self.late_mat,
+            streaming_arrow_reader: self.streaming_arrow_reader,
+            column_stats: self.column_stats.clone(),
+            properties: self.properties.clone(),
+            metrics: ExecutionPlanMetricsSet::new(),
+        }))
+    }
+
+    fn clone_internals(&self) -> Self {
+        Self {
+            path: self.path.clone(),
+            schema: self.schema.clone(),
+            file_schema: self.file_schema.clone(),
+            projection: self.projection.clone(),
+            assignments: self.assignments.clone(),
+            num_rows: self.num_rows,
+            rg_num_rows: self.rg_num_rows.clone(),
+            filter: self.filter.clone(),
+            late_mat: self.late_mat,
+            streaming_arrow_reader: self.streaming_arrow_reader,
+            column_stats: self.column_stats.clone(),
+            properties: self.properties.clone(),
+            metrics: ExecutionPlanMetricsSet::new(),
+        }
     }
 }
 

@@ -178,6 +178,11 @@ pub mod robin_hood_agg_rule;
 // and wraps them in BloomFilterExec. Closes the probe-side half of
 // the distributed bloom flow; build-side emitter is Σ.J.2.b.vii.
 pub mod context_bloom_rule;
+// Σ.Q.L4′ (2026-05-23): per-request PhysicalOptimizerRule that pushes
+// blooms INTO EmatixFastParquetExec scans as I64InBloom BridgeFilter
+// predicates instead of wrapping them in BloomFilterExec. Saves decode
+// work on probe-side rows whose join key isn't in the build set.
+pub mod inbloom_scan_pushdown_rule;
 // Σ.O (2026-05-21): in-memory LRU cache of decoded RecordBatch by
 // (file_path, row_group_idx, projection_hash). Avoids re-decoding
 // the same parquet column chunks across queries in the same session.
