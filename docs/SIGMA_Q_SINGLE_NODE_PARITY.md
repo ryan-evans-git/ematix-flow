@@ -585,8 +585,23 @@ vectorised path is what flips L1b from NEG to WIN.
 (`EMAT_RH_SUM_F64=1`) per the codegen-tax pattern; the vectorised
 kernel itself is default-on within the operator (revert via
 `EMAT_RH_SUM_F64_VEC=0`) since it costs nothing when the rule
-doesn't fire. 22-query SF=10 geomean check deferred to the
-follow-up Σ.R.1 sweep.
+doesn't fire.
+
+**22-query SF=10 geomean (5×2 trials, post-commit `f865779`)**:
+
+  ON-vec / OFF = **1.0206** (+2.06% slower across all 22 queries).
+
+The codegen tax shows up clearly: Q06/Q07/Q08/Q09/Q10/Q13/Q19 all
+regress +5-13% even though the L1b rule never fires on those queries
+(none of them are single-`SUM(Float64-col) GROUP BY Int64-col`).
+Q18 itself in the 22q sequence runs +7.8% slower (566→610 ms) — the
+standalone Q18 -4.4% win doesn't survive session-state context
+(allocator/page-cache/codegen interaction with preceding queries).
+
+This sharpens the Σ.R sequencing: **do not add a new optimizer rule**.
+Σ.R.1 (radix) and any future variants must live inside the existing
+`RobinHoodSumF64Exec` operator, gated by the same `EMAT_RH_SUM_F64=1`
+flag. Adding a separate rule would compound the codegen tax.
 
 ---
 
