@@ -80,6 +80,28 @@ in-process. ematix is on the post-Σ.P main.
 
 **Outright wins**: ematix=9, DuckDB=10, Polars=2.
 
+### SF=10 geomean — combined L6′ + L9 (2026-05-23, 5 trials × 2 warmups, Q20 excluded due to pre-existing HashJoinExec assertion failure)
+
+| Run | ematix / ematix(OFF) | ematix / DuckDB | Note |
+|---|---|---|---|
+| Both OFF (baseline) | 1.000 | 1.043 | ematix 4.3% behind DuckDB |
+| **L6′ + L9 ON** (`EMAT_RG_DECODE_CACHE=1 EMAT_RT_BLOOM_SIDEBAND=1`) | **0.917** | **0.970** | ematix **3.1% AHEAD of DuckDB**, 8.3% faster than itself |
+
+Per-query Δ% (ON vs OFF), wins ≥3%:
+- Q04 −26.9%, Q08 −21.5%, Q21 −18.4%, Q18 −16.8%, Q13 −14.7%
+- Q09 −12.6%, Q17 −11.9%, Q12 −8.8%, Q22 −7.7%, Q07 −7.5%
+- Q11 −7.3%, Q01 −4.5%, Q03 −4.4%, Q10 −4.2%, Q15 −3.6%
+
+Mild regressions (all within or just past noise σ):
+- Q16 +7.0% (44.96→48.11 ms — L6′ cache-probe overhead at small queries)
+- Q06 +4.2%, Q14 +1.9%
+
+**The SF=10 22-query geomean flipped from behind DuckDB to ahead with
+just L6′ + L9 enabled.** Both are opt-in env vars; default behavior is
+unchanged. Q20 fails in both runs with `Invalid HashJoinExec, the
+output partitio[ning]` assertion error — pre-existing bug, not
+introduced by either lever; investigation deferred.
+
 ### Where the losses concentrate
 
 Sorted by absolute ms gap (= what closing would shift the geomean most):
