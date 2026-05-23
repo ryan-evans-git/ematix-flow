@@ -119,7 +119,7 @@ Status legend:
 | L2 | LeftSemi join swap-build-side | 🟡 RULE LANDED — NEUTRAL on TPC-H 22 | `SwapSemiJoinBuildSideRule` (crates/ematix-flow-core/src/swap_semi_join_build_rule.rs). Walks plan after JoinSelection, swaps semi/anti hash joins so the side with an `AggregateExec` becomes the BUILD. EXPLAIN confirms the swap fires on Q18 (LeftSemi → RightSemi, build now on 624-row agg subtree, probe on 60M). Q18 SF=10 wall-time: **708.18 ± 55 ms (OFF) vs 726.84 ± 64 ms (ON)** — within noise. Hypothesis: DataFusion's 14-way partitioned hash join already shards the 60M build (~4.3M rows / partition), so inversion cost is small relative to the FinalPartitioned aggregate hot path. SF=1 22-query A/B: every query within ±5% (noise). Decision: keep rule on as plan-hygiene; it correctly fills the gap left by `JoinSelection` when stats are absent. Not the Q18 silver bullet. |
 | L3 | Multi-column parallel decode (task #397) | ⚫ DEPRIORITIZED for Q18 | Q18 decode is 230ms / 700ms = 33% — not the dominant cost. Re-evaluate after L1/L2 land; might matter for Q01/Q03 (more scan-bound). |
 | L4 | Bloom-on-build for HashJoinExec | 🔵 PROPOSED | Σ.J.2 infra exists. Q07/Q21 might benefit. Less urgent than L1/L2 because Q18 isn't bloom-prunable (semi-join already does the work). |
-| L4′ | InBloom ColumnPredicate in BridgeFilter (pushdown into scan, not post-scan) | 🔴 NEG on Q07/Q21 SF=10 — mechanism works, lever doesn't pay | Predicate variant + dense kernel + planner rule + local emitter all land (commits `e3c5e81`, `449fbd6`, slice 3 below). End-to-end on Q07/Q21 SF=10: Q07 +6.6% (269→287ms), Q21 +2.0% (485→495ms). **Root cause**: `find_probe_table_col` only descends row-preserving wrappers (Filter/Projection/Sort/Limit/Distinct), not Joins. In deep TPC-H join trees the bloom only pushes across the immediate join — never reaches the deep table (lineitem) where decode savings would matter. The mechanism is reusable for shapes where probe = direct TableScan (e.g., star-schema fact↔dim shapes), and for distributed where Σ.J.2.b.v already serialises blooms across stages. **Next step to make this pay on TPC-H**: extend the probe-walker to descend through Joins by tracking column provenance, so a bloom from the nation-filter can push all the way down to lineitem.l_suppkey. Estimated 1-2 day spike. |
+| L4′ | InBloom ColumnPredicate in BridgeFilter (pushdown into scan, not post-scan) | 🔴 NEG on Q07/Q21 SF=10 — mechanism works through 4 slices; lever still doesn't pay on TPC-H single-node | Slice 1-3 (commits `e3c5e81`/`449fbd6`/`d11ccf4`): predicate variant + kernel + rule + local emitter — first Q07/Q21 result was +6.6% / +2.0% because the probe walker stopped at Joins, so no bloom reached lineitem. Slice 4 (commit `<this>`): deep probe-walker descends through Inner Joins by tracking which side's schema carries the target column; both-direction candidate emission gated by `is_shallow_build_subtree` (only TableScan ± row-preserving wrappers — Joins/Aggregates excluded). Result: Q07 +15.2% (269→310ms), Q21 −0.7% (485→482ms). The shallow-build gate is load-bearing: without it the both-directions × deep-descent combo pre-executed lineitem-bearing subtrees and Q07 regressed +136%. **Root cause of the residual NEG**: the genuinely high-value bloom for Q07 would be `supplier WHERE s_nationkey ∈ filtered_nation` (post-Join filter) — but that build subtree is itself a Join, excluded by the shallow gate. Without the gate, the emitter pre-executes Joins whose cost matches the original query. Single-node bloom pushdown can only win if the bloom is captured as a **side-effect** of the regular HashJoinExec build phase, not as a separate emit pass — adaptive query execution territory. Kept behind env var; reusable for star-schema shapes (direct fact↔dim joins) and for distributed where Σ.J.2.b.v already serialises blooms across stages. |
 | L5 | Custom RobinHoodHashJoin | ⚫ DEPRIORITIZED | If L1 extension fixes Q18's aggregate, hash join itself is only 13s of 700ms = secondary. Defer. |
 | L6 | Q17 correlated subquery diagnosis | 🔵 PROPOSED | 1.88× loss. EXPLAIN ANALYZE Q17 next. |
 | L6′ | Per-column RG decode cache (Σ.O.c.2 lift) | 🟢 WIN — opt-in via `EMAT_RG_DECODE_CACHE=1` | Cache key lifted from `(file, rg, projection_set)` to `(file, rg, leaf_idx)` so partial-projection overlap reuses entries. Eviction switched to `VecDeque::pop_front()` for O(1) LRU. `auto_inline` disabled when cache is active so the parallel-inline path doesn't bypass the cache. SF=10 5q (Q08/Q09/Q17/Q18/Q21) wins: Q21 −14.4%, Q18 −10.9%, Q17 −6.5%, Q09 −5.1%, Q08 −1.5%. SF=1 7q (Q01/Q03/Q06/Q12/Q14/Q15/Q18): within ±10% noise band (Q14 +10%, Q06 +6%, Q18 −10%, Q15 −7%, Q12 −2%, Q01 −1%, Q03 ~0%). Default OFF preserves no-regression posture; ON the right call for SF=10+ multi-scan workloads. |
@@ -425,20 +425,63 @@ savings would matter. The blooms that DO get emitted are small
 (few keys → tight bloom) on tables that don't dominate the query
 cost.
 
-**Decision**: Keep the predicate plumbing + rule + emitter in tree
-behind the env-var gate. They're correct, tested, and unlock the
-shape for shapes where probe = direct TableScan (star-schema, dim
-joins) and for distributed shipping (Σ.J.2.b.v / vi already use the
-same `ContextBlooms` + `column_uuid` keying scheme). The next step
-to make this pay on TPC-H is a deeper probe-walker that descends
-through Joins by tracking column provenance — that's a 1-2 day
-spike, deferred.
+### Slice 4 — Deep probe-walker + shallow-build gate
 
-**Lessons for the cost-benefit table**: the doc's "Expected SF=10
-win 15-30% on Q07/Q21" was optimistic. Bloom pushdown into the
-deepest table requires column-provenance plumbing the slim emitter
-doesn't have. The accurate cost-benefit is "+1-2 day spike to make
-the lever fire on lineitem; possibly 10-20% gain when it does."
+**Hypothesis**: extend `find_probe_table_col` to descend through
+Inner Joins (track which side's schema carries the target column),
+and emit candidates in BOTH directions per `join.on` tuple so the
+small-build side wins regardless of left/right placement in the
+LogicalPlan. Gate build-side execution on `is_shallow_build_subtree`
+(TableScan ± Filter / Projection / Limit / Sort / Distinct / Alias —
+no Joins or Aggregates) to keep emission cheap.
+
+**Implementation**:
+
+- `local_bloom_emitter.rs`:
+  - `collect_join_candidates` now emits two candidates per
+    `(left_expr, right_expr)` — one per direction. Each is gated by
+    `is_shallow_build_subtree(build_side)`.
+  - `find_probe_table_col` adds a `LogicalPlan::Join(Inner)` arm
+    that resolves which side carries `target_col` (checking both
+    schemas) and recurses into that side.
+  - `build_candidate` takes explicit `probe_plan` + `build_plan`
+    parameters so the caller can run it once per direction.
+- New unit test `descends_through_inner_join_to_deep_table` confirms
+  a 3-table chain (`lineitem ↔ supplier ↔ nation`) produces a
+  `lineitem.l_suppkey` bloom under the optimized plan.
+- Renamed the cap test to `skips_when_both_sides_exceed_cap` and
+  picked both-large data so the cap still verifies under
+  both-direction emission.
+
+**Sequence of bench results** on Q07/Q21 SF=10 (3 trials × 1 warmup,
+single-process A/B, baseline = bloom OFF):
+
+| Variant | Q07 (ms) | Q21 (ms) | Notes |
+|---|---:|---:|---|
+| Baseline (OFF) | 269.46 | 485.47 | reference |
+| Slice 3 (walker stops at Join) | 287.31 (+6.6%) | 494.98 (+2.0%) | bloom never reaches lineitem |
+| Slice 4 attempt A (deep walker, no shallow gate) | 677.76 (+136%) | 539.82 (+9%) | both-directions × deep-descent ⇒ pre-executing lineitem-bearing build subtrees |
+| Slice 4 attempt B (deep walker + shallow-build gate) | 310.34 (+15.2%) | 481.94 (−0.7%) | mechanism correct; lever still not a TPC-H net win |
+
+**Diagnosis of the residual Q07 NEG**: the genuinely high-value
+bloom is `supplier WHERE s_nationkey ∈ filtered_nation` — the
+post-join filtered supplier set, which has ~200 of 10K rows and
+would prune lineitem strongly. But that build subtree is itself
+a Join, excluded by `is_shallow_build_subtree`. Without the gate,
+the emitter pre-executes Joins whose cost is comparable to the
+original query (slice 4 attempt A). With the gate, only raw dim
+tables become candidates, and their bloom isn't selective enough
+to pay back the emission + bloom-probe-during-decode overhead.
+
+**Decision**: Keep the predicate plumbing + rule + emitter + deep
+walker + shallow gate behind the env-var. They're correct, unit-
+tested, and the lever pays where probe IS direct TableScan
+(star-schema fact↔dim shapes, distributed shipping via Σ.J.2.b.v).
+For TPC-H single-node, the lever can only become a net win once
+the build-side bloom is captured as a **side-effect of the
+HashJoinExec build phase** rather than a separate pre-execution
+pass — that's adaptive-query-execution work (Σ.L-class adaptive
+runtime). Deferred.
 
 ---
 

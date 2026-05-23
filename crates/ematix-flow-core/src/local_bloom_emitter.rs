@@ -83,7 +83,25 @@ fn collect_join_candidates(plan: &LogicalPlan, out: &mut Vec<JoinCandidate>) {
     if let LogicalPlan::Join(join) = plan {
         if matches!(join.join_type, JoinType::Inner) {
             for (left_expr, right_expr) in &join.on {
-                if let Some(cand) = build_candidate(join, left_expr, right_expr) {
+                // Σ.Q.L4′ slice 4: emit candidates in BOTH directions
+                // (we can't know at logical-plan time which side will
+                // be physical-build vs physical-probe) — BUT only
+                // when the candidate's BUILD side is a shallow leaf
+                // (TableScan ± Filter / Projection / Limit / Sort /
+                // Distinct). Without that gate, pre-executing build
+                // subtrees that contain Joins or Aggregates dominates
+                // query time (the cap mechanism only filters AFTER
+                // execution, by which point we've already paid).
+                if is_shallow_build_subtree(&join.right)
+                    && let Some(cand) =
+                        build_candidate(&join.left, &join.right, left_expr, right_expr)
+                {
+                    out.push(cand);
+                }
+                if is_shallow_build_subtree(&join.left)
+                    && let Some(cand) =
+                        build_candidate(&join.right, &join.left, right_expr, left_expr)
+                {
                     out.push(cand);
                 }
             }
@@ -94,38 +112,62 @@ fn collect_join_candidates(plan: &LogicalPlan, out: &mut Vec<JoinCandidate>) {
     }
 }
 
+/// Σ.Q.L4′ slice 4: a build-side subtree is "shallow" if its leaves
+/// are a single `TableScan`, wrapped only in row-preserving operators
+/// (`Filter`, `Projection`, `Limit`, `Sort`, `Distinct`,
+/// `SubqueryAlias`). Joins and Aggregates are excluded — pre-executing
+/// those defeats the lever's purpose because they're the cost we're
+/// trying to elide on the probe side.
+fn is_shallow_build_subtree(plan: &LogicalPlan) -> bool {
+    match plan {
+        LogicalPlan::TableScan(_) => true,
+        LogicalPlan::Filter(f) => is_shallow_build_subtree(&f.input),
+        LogicalPlan::Projection(p) => is_shallow_build_subtree(&p.input),
+        LogicalPlan::Limit(l) => is_shallow_build_subtree(&l.input),
+        LogicalPlan::Sort(s) => is_shallow_build_subtree(&s.input),
+        LogicalPlan::Distinct(d) => is_shallow_build_subtree(d.input()),
+        LogicalPlan::SubqueryAlias(a) => is_shallow_build_subtree(&a.input),
+        _ => false,
+    }
+}
+
+/// Σ.Q.L4′ slice 4: parameterised in probe/build so the caller can
+/// run it once per direction. `probe_plan` is the side we'll search
+/// for the deep TableScan; `build_plan` is the side we'll pre-execute
+/// to build the bloom.
 fn build_candidate(
-    join: &datafusion::logical_expr::Join,
-    left_expr: &Expr,
-    right_expr: &Expr,
+    probe_plan: &LogicalPlan,
+    build_plan: &LogicalPlan,
+    probe_expr: &Expr,
+    build_expr: &Expr,
 ) -> Option<JoinCandidate> {
-    let left_col = match left_expr {
+    let probe_col = match probe_expr {
         Expr::Column(c) => c.clone(),
         _ => return None,
     };
-    let right_col = match right_expr {
+    let build_col = match build_expr {
         Expr::Column(c) => c.clone(),
         _ => return None,
     };
-    let (probe_table, probe_col_name) = find_probe_table_col(&join.left, &left_col)?;
-    let probe_schema = join.left.schema();
+    let (probe_table, probe_col_name) = find_probe_table_col(probe_plan, &probe_col)?;
+    let probe_schema = probe_plan.schema();
     let probe_field = probe_schema
         .field_with_unqualified_name(&probe_col_name)
         .ok()?;
     if !matches!(probe_field.data_type(), DataType::Int64 | DataType::Int32) {
         return None;
     }
-    let build_schema = join.right.schema();
+    let build_schema = build_plan.schema();
     let build_field = build_schema
-        .field_with_unqualified_name(&right_col.name)
+        .field_with_unqualified_name(&build_col.name)
         .ok()?;
     if !matches!(build_field.data_type(), DataType::Int64 | DataType::Int32) {
         return None;
     }
     let probe_uuid_hint = format!("{probe_table}.{probe_col_name}");
     Some(JoinCandidate {
-        build_plan: (*join.right).clone(),
-        build_col: right_col,
+        build_plan: build_plan.clone(),
+        build_col,
         probe_table,
         probe_col: probe_col_name,
         probe_uuid_hint,
@@ -168,6 +210,36 @@ fn find_probe_table_col(plan: &LogicalPlan, target_col: &Column) -> Option<(Stri
                 }
             }
             None
+        }
+        // Σ.Q.L4′ slice 4: descend through Inner joins by tracking
+        // which side's schema carries `target_col`. Inner joins
+        // preserve column names, so the column must come from one
+        // side (or both, in which case either resolves to the same
+        // base table via column equivalence post-Inner). Try left
+        // first; fall back to right if left's subtree doesn't
+        // resolve to a TableScan.
+        //
+        // Limited to Inner joins because outer joins fabricate NULL
+        // rows on the preserving side that wouldn't appear in any
+        // bloom — pushing a bloom would change query semantics.
+        LogicalPlan::Join(join) if matches!(join.join_type, JoinType::Inner) => {
+            let left_has = join
+                .left
+                .schema()
+                .field_with_unqualified_name(&target_col.name)
+                .is_ok();
+            let right_has = join
+                .right
+                .schema()
+                .field_with_unqualified_name(&target_col.name)
+                .is_ok();
+            match (left_has, right_has) {
+                (true, false) => find_probe_table_col(&join.left, target_col),
+                (false, true) => find_probe_table_col(&join.right, target_col),
+                (true, true) => find_probe_table_col(&join.left, target_col)
+                    .or_else(|| find_probe_table_col(&join.right, target_col)),
+                (false, false) => None,
+            }
         }
         _ => None,
     }
@@ -280,20 +352,110 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn skips_large_build_side() {
+    async fn descends_through_inner_join_to_deep_table() {
+        // 3-table chain: lineitem (probe) ↔ supplier ↔ nation (small).
+        // Bloom from the nation→supplier subtree should resolve probe
+        // = lineitem via Join-descent.
         let ctx = SessionContext::new();
-        register(&ctx, "big", &(0..1_000i64).collect::<Vec<_>>()).unwrap();
-        register(&ctx, "huge", &(0..200_000i64).collect::<Vec<_>>()).unwrap();
+        // "lineitem"-shaped: 1000 rows, l_suppkey ∈ [0, 100).
+        let lk: Vec<i64> = (0..1_000).collect();
+        let lsk: Vec<i64> = (0..1_000).map(|i| i % 100).collect();
+        let lschema = Arc::new(Schema::new(vec![
+            Field::new("l_orderkey", DataType::Int64, false),
+            Field::new("l_suppkey", DataType::Int64, false),
+        ]));
+        let lrb = RecordBatch::try_new(
+            lschema.clone(),
+            vec![Arc::new(Int64Array::from(lk)), Arc::new(Int64Array::from(lsk))],
+        )
+        .unwrap();
+        ctx.register_table(
+            "lineitem",
+            Arc::new(MemTable::try_new(lschema, vec![vec![lrb]]).unwrap()),
+        )
+        .unwrap();
+        // supplier: 100 rows, s_nationkey ∈ [0, 25).
+        let sk: Vec<i64> = (0..100).collect();
+        let snk: Vec<i64> = (0..100).map(|i| i % 25).collect();
+        let sschema = Arc::new(Schema::new(vec![
+            Field::new("s_suppkey", DataType::Int64, false),
+            Field::new("s_nationkey", DataType::Int64, false),
+        ]));
+        let srb = RecordBatch::try_new(
+            sschema.clone(),
+            vec![Arc::new(Int64Array::from(sk)), Arc::new(Int64Array::from(snk))],
+        )
+        .unwrap();
+        ctx.register_table(
+            "supplier",
+            Arc::new(MemTable::try_new(sschema, vec![vec![srb]]).unwrap()),
+        )
+        .unwrap();
+        // nation: 5 rows.
+        let nk: Vec<i64> = (0..5).collect();
+        let nschema = Arc::new(Schema::new(vec![Field::new(
+            "n_nationkey",
+            DataType::Int64,
+            false,
+        )]));
+        let nrb = RecordBatch::try_new(
+            nschema.clone(),
+            vec![Arc::new(Int64Array::from(nk))],
+        )
+        .unwrap();
+        ctx.register_table(
+            "nation",
+            Arc::new(MemTable::try_new(nschema, vec![vec![nrb]]).unwrap()),
+        )
+        .unwrap();
+        // Chain: lineitem ↔ supplier ↔ nation.
         let plan = ctx
-            .sql("SELECT big.k FROM big JOIN huge ON big.k = huge.k")
+            .sql(
+                "SELECT l_orderkey FROM lineitem \
+                 JOIN supplier ON l_suppkey = s_suppkey \
+                 JOIN nation ON s_nationkey = n_nationkey",
+            )
             .await
             .unwrap()
             .into_optimized_plan()
             .unwrap();
-        let opts = LocalBloomOptions {
-            max_build_rows: 1_000,
-        };
+        let map = emit_build_side_blooms_local(&ctx, &plan, &LocalBloomOptions::default())
+            .await
+            .unwrap();
+        // The high-value bloom is on lineitem.l_suppkey (probe side
+        // is lineitem, reached through Join-descent + Filter).
+        let uuid = column_uuid("lineitem", "l_suppkey");
+        let bloom = map
+            .get(&uuid)
+            .expect("expected lineitem.l_suppkey bloom (deep probe-walker)");
+        // s_suppkey ∈ [0, 100) — every key 0..100 must hit.
+        for k in 0..100i64 {
+            assert!(bloom.might_contain_i64(k), "missing l_suppkey={k}");
+        }
+        // 999_999 was never in supplier — should miss (bloom is small,
+        // FPR is well below 100%).
+        assert!(!bloom.might_contain_i64(999_999));
+    }
+
+    #[tokio::test]
+    async fn skips_when_both_sides_exceed_cap() {
+        // Σ.Q.L4′ slice 4: the emitter now emits candidates in both
+        // directions, so the cap mechanism is only fully tested when
+        // BOTH sides overshoot. Pick a cap below both tables.
+        let ctx = SessionContext::new();
+        register(&ctx, "a", &(0..10_000i64).collect::<Vec<_>>()).unwrap();
+        register(&ctx, "b", &(0..200_000i64).collect::<Vec<_>>()).unwrap();
+        let plan = ctx
+            .sql("SELECT a.k FROM a JOIN b ON a.k = b.k")
+            .await
+            .unwrap()
+            .into_optimized_plan()
+            .unwrap();
+        let opts = LocalBloomOptions { max_build_rows: 100 };
         let map = emit_build_side_blooms_local(&ctx, &plan, &opts).await.unwrap();
-        assert!(map.is_empty(), "huge build side should have been skipped");
+        assert!(
+            map.is_empty(),
+            "both sides exceed cap → no bloom should emit"
+        );
     }
 }
