@@ -1,0 +1,112 @@
+=== TPC-H 22 triangulation bench ===
+    data:    examples/tpch/data/sf10
+    queries: 21 ([1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22])
+    trials:  20 (after 5 warmups)
+    output:  /tmp/bench_sf10_p28.md
+
+--- Q01 ---
+  ematix-flow   268.97 ms ±  9.21  (4 rows)
+  DuckDB        237.09 ms ±  5.46  (4 rows)
+  Polars        360.88 ms ± 37.01  (4 rows)
+
+--- Q02 ---
+  ematix-flow    49.59 ms ± 12.09  (4667 rows)
+  DuckDB         43.12 ms ±  1.79  (4667 rows)
+  Polars        437.10 ms ± 14.16  (4667 rows)
+
+--- Q03 ---
+  ematix-flow   162.26 ms ±  7.27  (114003 rows)
+  DuckDB        141.69 ms ±  4.49  (114003 rows)
+  Polars        573.44 ms ± 19.98  (114003 rows)
+
+--- Q04 ---
+  ematix-flow    80.41 ms ±  7.58  (5 rows)
+  DuckDB         83.94 ms ±  3.25  (5 rows)
+  Polars        268.84 ms ± 22.18  (5 rows)
+
+--- Q06 ---
+  ematix-flow    84.28 ms ± 11.40  (1 rows)
+  DuckDB         72.01 ms ±  1.41  (1 rows)
+  Polars         60.97 ms ±  1.73  (1 rows)
+
+--- Q07 ---
+  ematix-flow   298.95 ms ± 11.35  (4 rows)
+  DuckDB        136.78 ms ±  3.87  (4 rows)
+  Polars       1299.55 ms ± 40.41  (4 rows)
+
+--- Q08 ---
+  ematix-flow   214.41 ms ±  7.69  (2 rows)
+  DuckDB        168.81 ms ±  4.42  (2 rows)
+  Polars       1230.46 ms ± 35.70  (2 rows)
+
+--- Q09 ---
+  ematix-flow   320.11 ms ± 14.41  (175 rows)
+  DuckDB        313.78 ms ± 13.41  (175 rows)
+  Polars        438.49 ms ± 20.74  (175 rows)
+
+--- Q10 ---
+  ematix-flow   258.26 ms ± 11.99  (381105 rows)
+  DuckDB        400.60 ms ±  8.31  (381105 rows)
+  Polars       5720.36 ms ± 300.62  (381105 rows)
+
+--- Q11 ---
+  ematix-flow    26.50 ms ±  8.00  (0 rows)
+  DuckDB         25.15 ms ±  2.29  (0 rows)
+  Polars         33.13 ms ±  2.01  (0 rows)
+
+--- Q12 ---
+  ematix-flow   102.27 ms ±  6.04  (2 rows)
+  DuckDB        104.21 ms ±  3.67  (2 rows)
+  Polars        111.79 ms ±  4.00  (2 rows)
+
+--- Q13 ---
+  ematix-flow   125.21 ms ±  4.61  (46 rows)
+  DuckDB        264.64 ms ± 10.94  (46 rows)
+  Polars        404.00 ms ± 14.56  (46 rows)
+
+--- Q14 ---
+  ematix-flow    87.17 ms ±  3.72  (1 rows)
+  DuckDB        132.50 ms ±  4.49  (1 rows)
+  Polars         92.38 ms ±  2.33  (1 rows)
+
+--- Q15 ---
+  ematix-flow    83.10 ms ±  4.14  (1 rows)
+  DuckDB         85.51 ms ±  3.27  (1 rows)
+  Polars         67.25 ms ±  3.90  (1 rows)
+
+--- Q16 ---
+  ematix-flow    47.19 ms ±  3.85  (27840 rows)
+  DuckDB         63.15 ms ±  4.02  (27840 rows)
+  Polars        168.14 ms ± 10.59  (27840 rows)
+
+--- Q17 ---
+  ematix-flow   294.86 ms ± 11.10  (1 rows)
+  DuckDB        152.53 ms ±  4.79  (1 rows)
+  Polars        458.36 ms ± 19.37  (1 rows)
+
+--- Q18 ---
+  ematix-flow   588.34 ms ± 26.65  (624 rows)
+  DuckDB        222.88 ms ±  3.72  (624 rows)
+  Polars        588.35 ms ± 21.80  (624 rows)
+
+--- Q19 ---
+  ematix-flow   128.53 ms ±  4.17  (1 rows)
+  DuckDB        186.74 ms ±  3.61  (1 rows)
+  Polars       1199.27 ms ± 33.90  (1 rows)
+
+--- Q20 ---
+  ematix-flow   136.88 ms ±  4.42  (1804 rows)
+  DuckDB        137.16 ms ±  3.47  (1804 rows)
+  Polars        269.95 ms ±  9.41  (1804 rows)
+
+--- Q21 ---
+  ematix-flow   489.96 ms ± 12.18  (4009 rows)
+  DuckDB        396.12 ms ±  7.43  (4009 rows)
+  Polars       44712.07 ms ± 5461.82  (4009 rows)
+
+--- Q22 ---
+  ematix-flow    59.17 ms ± 49.42  (7 rows)
+  DuckDB        128.64 ms ±  4.97  (7 rows)
+  Polars        109.20 ms ± 11.85  (7 rows)
+
+wrote /tmp/bench_sf10_p28.md
