@@ -37,6 +37,7 @@ use ematix_flow_core::inbloom_scan_pushdown_rule::EnableInBloomScanPushdownRule;
 use ematix_flow_core::local_bloom_emitter::{LocalBloomOptions, emit_build_side_blooms_local};
 use ematix_flow_core::bloom::ContextBlooms;
 use ematix_flow_core::robin_hood_sum_f64_exec::EnableRobinHoodSumF64Rule;
+use ematix_flow_core::runtime_bloom_sideband_rule::EnableRuntimeBloomSidebandRule;
 use ematix_flow_core::swap_semi_join_build_rule::SwapSemiJoinBuildSideRule;
 use futures_util::TryStreamExt;
 
@@ -351,6 +352,18 @@ async fn build_ematix_ctx(
     if rh_sum_f64_enabled {
         builder =
             builder.with_physical_optimizer_rule(Arc::new(EnableRobinHoodSumF64Rule));
+    }
+    // Σ.Q.L9: opt-in via EMAT_RT_BLOOM_SIDEBAND=1. Threads a sideband
+    // between HashJoinExec build and probe-side EmatixFastParquetExec
+    // so the build-side bloom is captured as a side-effect of the
+    // regular HashJoin build phase.
+    let rt_bloom_enabled = std::env::var("EMAT_RT_BLOOM_SIDEBAND")
+        .ok()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if rt_bloom_enabled {
+        builder =
+            builder.with_physical_optimizer_rule(Arc::new(EnableRuntimeBloomSidebandRule));
     }
     // Σ.Q.L4′: install the in-scan bloom pushdown rule with an empty
     // shared bloom slot. `run_ematix_flow` swaps the slot's contents
