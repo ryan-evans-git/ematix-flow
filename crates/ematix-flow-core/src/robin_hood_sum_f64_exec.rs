@@ -33,6 +33,7 @@ use datafusion::arrow::array::{Float64Array, Int64Array, RecordBatch};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::common::Result as DfResult;
 use datafusion::common::config::ConfigOptions;
+use datafusion::common::stats::Precision;
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::common::{DataFusionError};
 use datafusion::execution::TaskContext;
@@ -76,6 +77,11 @@ pub struct RobinHoodSumF64Exec {
     mode: RobinHoodSumF64Mode,
     schema: SchemaRef,
     properties: Arc<PlanProperties>,
+    /// Σ.Q.L1b retry — pre-computed init_cap derived from the input's
+    /// `Statistics::num_rows`. Avoids the default-cap grow chain that
+    /// cost +15.9% on Q18 SF=10 in slice 3. Sized at planner time so
+    /// the hot path doesn't pay any stats-lookup cost.
+    init_cap: usize,
 }
 
 impl RobinHoodSumF64Exec {
@@ -122,6 +128,31 @@ impl RobinHoodSumF64Exec {
             EmissionType::Final,
             Boundedness::Bounded,
         ));
+        // Σ.Q.L1b retry — derive init_cap from upstream Statistics.
+        // For Partial we see raw input rows; the # of groups is bounded
+        // by the row count and typically smaller (4× ratio is a good
+        // heuristic for Q18-shape SUM aggs). For FinalPartitioned each
+        // input row already represents one group, so init_cap ≈
+        // row count. Distributed evenly across `n_parts`.
+        let row_est = match input.partition_statistics(None) {
+            Ok(stats) => match stats.num_rows {
+                Precision::Exact(n) | Precision::Inexact(n) => n,
+                _ => 0,
+            },
+            Err(_) => 0,
+        };
+        let n_parts_safe = n_parts.max(1);
+        let per_partition_rows = row_est / n_parts_safe;
+        let raw_cap = match mode {
+            RobinHoodSumF64Mode::Partial => per_partition_rows / 4,
+            RobinHoodSumF64Mode::FinalPartitioned => per_partition_rows,
+        };
+        // Bound below by the previous default and above by a cap that
+        // guards against bad stats blowing memory. 32M buckets × 24 B =
+        // ~768 MB per partition worst case.
+        const MIN_INIT_CAP: usize = 65_536;
+        const MAX_INIT_CAP: usize = 32 * 1024 * 1024;
+        let init_cap = raw_cap.max(MIN_INIT_CAP).min(MAX_INIT_CAP);
         Ok(Self {
             input,
             group_col_idx,
@@ -129,7 +160,16 @@ impl RobinHoodSumF64Exec {
             mode,
             schema,
             properties,
+            init_cap,
         })
+    }
+
+    /// Σ.Q.L1b retry — the auto-sized initial table capacity, derived
+    /// from the input's `Statistics::num_rows` at planning time. The
+    /// `EMAT_RH_SUM_F64_INIT_CAP` env var still overrides this at
+    /// `execute()` time for ad-hoc benchmarking.
+    pub fn init_cap(&self) -> usize {
+        self.init_cap
     }
 
     pub fn mode(&self) -> RobinHoodSumF64Mode {
@@ -199,15 +239,22 @@ impl ExecutionPlan for RobinHoodSumF64Exec {
         let value_col_idx = self.value_col_idx;
         let schema = self.schema.clone();
         let schema_for_stream = schema.clone();
+        // Σ.Q.L1b retry — planner-derived init_cap (no env lookup in
+        // the hot path). Env override kept for ad-hoc bench A/B.
+        let planner_cap = self.init_cap;
+        // Σ.Q.L1b retry — vectorised vs scalar A/B toggle. Default ON
+        // since the microbench shows +13% at 15M card pre-grown and
+        // +65% at default-cap; set `EMAT_RH_SUM_F64_VEC=0` to compare.
+        let use_vec = std::env::var("EMAT_RH_SUM_F64_VEC")
+            .ok()
+            .map(|s| s != "0")
+            .unwrap_or(true);
 
         let fut = async move {
-            // Mirror RobinHoodAggregateExec's pre-sizing heuristic. Q18
-            // has 15M groups so even 65k capacity is too small — the
-            // dynamic resize after the first batch handles that case.
             let init_cap: usize = std::env::var("EMAT_RH_SUM_F64_INIT_CAP")
                 .ok()
                 .and_then(|s| s.parse().ok())
-                .unwrap_or(65536);
+                .unwrap_or(planner_cap);
             let mut agg = RobinHoodSumF64Agg::with_capacity(init_cap);
             let mut s = input.execute(partition, context)?;
             let mut first_batch_seen = false;
@@ -233,7 +280,11 @@ impl ExecutionPlan for RobinHoodSumF64Exec {
                             "RobinHoodSumF64Exec: column {value_col_idx} not Float64Array"
                         ))
                     })?;
-                agg.ingest_batch(keys, vals);
+                if use_vec {
+                    agg.ingest_batch_vectorised(keys, vals);
+                } else {
+                    agg.ingest_batch(keys, vals);
+                }
                 if !first_batch_seen {
                     first_batch_seen = true;
                     let len = agg.table().len();

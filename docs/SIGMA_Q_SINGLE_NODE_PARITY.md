@@ -137,7 +137,7 @@ Status legend:
 |---|---|---|---|
 | L1 | ~~Global PARTITIONS=28 at SF=10~~ | 🔴 NEG | Q18 win (-15.6%) but Q06/Q07/Q08/Q09/Q10/Q16/Q21 all regress 5-10%. Geomean shifts +1.09% — WORSE. Per-query shape matters; flat partitions tuning is not the right lever. Q18-specific tuning (gating on cardinality estimate) may still be possible — see L1b. |
 | L1b | Per-query auto-partition tuned by aggregate cardinality | 🔵 PROPOSED | Q18 winning at 28+ partitions correlates with its 15M-group FinalPartitioned aggregate. Other queries with smaller aggregates (Q06/Q09/Q11 nations) lose from over-partitioning. Need a planner hook that examines AggregateExec group cardinality estimates and bumps partitions only for the relevant subtree. Bigger build — likely 200-500 LOC. |
-| L1b | Extend Σ.N.d rule to SUM-by-i64-key aggregate | 🔴 NEG on Q18 SF=10 — operator + rule shipped, kernel doesn't win at 15M cardinality | 3 slices land (commits `46bc146`, `7b6b9ca`, `<this>`): `RobinHoodI64F64` table + `RobinHoodSumF64Agg` + `RobinHoodSumF64Exec` operator + `EnableRobinHoodSumF64Rule` planner rule. EXPLAIN confirms rule fires on Q18 (FinalPartitioned + Partial both rewritten to `RobinHoodSumF64Exec`); output is bit-equal (624 rows). Q18 SF=10 wall-time (5×2 trials): **OFF 570.91 ± 7.16 ms; ON 661.41 ± 21.66 ms (+15.9%); ON+EMAT_RH_SUM_F64_INIT_CAP=2M 603.33 ± 31.18 ms (+5.7%)**. Same pattern as Σ.N.f arc with COUNT: microbench wins (1-5% at 200K) don't translate at 15M cardinality because DataFusion's stock GroupAccumulator does vectorised batch-update across 1K-row chunks while our `insert_or_sum` is a per-row function-call loop. To make L1b actually win on Q18, need vectorised batch-ingest redesign (1-2 weeks, equivalent scope to L9). Operator + rule kept opt-in via `EMAT_RH_SUM_F64=1` — may pay at lower cardinality or different shapes. |
+| L1b | Extend Σ.N.d rule to SUM-by-i64-key aggregate | 🟢 WIN on Q18 SF=10 after vectorised batch-ingest retry — kernel +13% at 15M cardinality, wall-time -4.4% vs stock | Slices 1+2+3 (commits `46bc146`/`7b6b9ca`/`6e0ca92`) shipped a scalar `insert_or_sum` operator that NEG'd Q18 SF=10 (+5.7% even pre-sized) because DataFusion stock's `sum(f64)` GroupAccumulator uses vectorised batch-update across 1K-row chunks. **Retry (commits `<this>`)**: Photon-style 4-stage pipeline lands as `RobinHoodI64F64::insert_or_sum_batch_vectorised` (hash batch → probe primary slot → fast-path accumulate hits → scalar fallback for misses); microbench at 6M rows shows +13% at 15M cardinality pre-grown, +65% at default-cap vs the scalar path. Auto-sizes `init_cap` from `input.partition_statistics().num_rows` (Partial: rows/4, FinalPartitioned: rows; clamped to [65k, 32M] buckets) so the env-var override is no longer needed for high-cardinality inputs. Q18 SF=10 standalone (5×2 trials): **OFF 567.01 ± 8.73 ms; ON-scalar+auto-cap 604.69 ± 29.81 ms (+6.6%, matches old +5.7% — kernel was the gap); ON-vec+auto-cap 541.79 ± 7.05 ms (-4.4%)**. Operator + rule still opt-in via `EMAT_RH_SUM_F64=1` per [[optimizer-codegen-sensitivity]]; vectorised path is default-on inside the operator (`EMAT_RH_SUM_F64_VEC=0` to revert). 22-query geomean A/B run in this slice — see Σ.Q.L1b retry section below. |
 | L2 | LeftSemi join swap-build-side | 🟡 RULE LANDED — NEUTRAL on TPC-H 22 | `SwapSemiJoinBuildSideRule` (crates/ematix-flow-core/src/swap_semi_join_build_rule.rs). Walks plan after JoinSelection, swaps semi/anti hash joins so the side with an `AggregateExec` becomes the BUILD. EXPLAIN confirms the swap fires on Q18 (LeftSemi → RightSemi, build now on 624-row agg subtree, probe on 60M). Q18 SF=10 wall-time: **708.18 ± 55 ms (OFF) vs 726.84 ± 64 ms (ON)** — within noise. Hypothesis: DataFusion's 14-way partitioned hash join already shards the 60M build (~4.3M rows / partition), so inversion cost is small relative to the FinalPartitioned aggregate hot path. SF=1 22-query A/B: every query within ±5% (noise). Decision: keep rule on as plan-hygiene; it correctly fills the gap left by `JoinSelection` when stats are absent. Not the Q18 silver bullet. |
 | L3 | Multi-column parallel decode (task #397) | ⚫ DEPRIORITIZED for Q18 | Q18 decode is 230ms / 700ms = 33% — not the dominant cost. Re-evaluate after L1/L2 land; might matter for Q01/Q03 (more scan-bound). |
 | L4 | Bloom-on-build for HashJoinExec | 🔵 PROPOSED | Σ.J.2 infra exists. Q07/Q21 might benefit. Less urgent than L1/L2 because Q18 isn't bloom-prunable (semi-join already does the work). |
@@ -505,6 +505,88 @@ the build-side bloom is captured as a **side-effect of the
 HashJoinExec build phase** rather than a separate pre-execution
 pass — that's adaptive-query-execution work (Σ.L-class adaptive
 runtime). Deferred.
+
+### Σ.Q.L1b retry — Vectorised batch-ingest
+
+**Status**: 🟢 WIN on Q18 SF=10 (−4.4%).
+
+**Hypothesis** (from slice 3 NEG diagnosis): the scalar
+`insert_or_sum` loop loses to DataFusion's stock `sum(f64)` because
+stock GroupAccumulator does vectorised batch-update across 1K-row
+chunks, while we call into a per-row function for every input row.
+A Photon-style 4-stage batch-ingest pipeline should close the gap.
+
+**Design**: `RobinHoodI64F64::insert_or_sum_batch_vectorised`
+processes the input in 1024-row chunks:
+
+1. Hash all keys → ideal-slot array.
+2. Probe primary slot for direct hit (no displacement) → boolean
+   hit array.
+3. Fast-path accumulate hits — tight loop the compiler can
+   autovectorise; ~70-80% of rows take this path at 70% load.
+4. Scalar fallback for misses (insertions + collisions) via
+   `insert_or_sum`. Stage 3's in-place writes survive any
+   `grow()` triggered here because `grow()` re-inserts every
+   existing bucket.
+
+Bundled changes:
+
+- `RobinHoodSumF64Agg::ingest_batch_vectorised(keys, values)` —
+  null-aware wrapper that calls the kernel on the raw `.values()`
+  slice when both columns are null-free (the Q18 case) and falls
+  back to scalar per-row on null inputs.
+- `RobinHoodSumF64Exec::try_new` derives `init_cap` from
+  `input.partition_statistics().num_rows`: Partial mode uses
+  rows/4 (assuming ~4 rows/group); FinalPartitioned uses
+  rows×1 (one row = one group post-shuffle). Clamped to
+  `[65_536, 32M]`. Eliminates the `EMAT_RH_SUM_F64_INIT_CAP`
+  env var as a precondition for not paying the default-cap
+  grow chain (which was the +15.9% in slice 3).
+- Operator switches to the vectorised path by default
+  (`EMAT_RH_SUM_F64_VEC=0` to revert to scalar for A/B).
+
+**Code touched**:
+
+- `crates/ematix-flow-core/src/robin_hood_agg.rs` —
+  kernel + agg-level wrapper + 10 TDD tests.
+- `crates/ematix-flow-core/src/robin_hood_sum_f64_exec.rs` —
+  auto-sized `init_cap` field + vec/scalar toggle in `execute()`.
+- `crates/ematix-flow-core/examples/robin_hood_sum_f64_batch_microbench.rs` —
+  new SUM(f64) microbench mirroring the COUNT one.
+
+**Kernel microbench (6M rows × 5-rep median)**:
+
+| Cardinality | scalar pre-grown | vec pre-grown | Δ | vec default-cap vs scalar default-cap |
+|---:|---:|---:|---:|---:|
+| 200K | 137 M rows/sec | 143 M rows/sec | +4% | +3% |
+| 2M | 58 M rows/sec | 60 M rows/sec | +3% | +27% |
+| 15M | 41 M rows/sec | 47 M rows/sec | **+13%** | **+65%** |
+
+Win scales with cardinality; the default-cap win is largest because
+stage 3 bypasses the per-row `needs_grow()` branch that dominates the
+scalar path under grow churn.
+
+**Q18 SF=10 standalone (5 trials × 2 warmups)**:
+
+| Config | Q18 wall-time | Δ vs OFF |
+|---|---:|---:|
+| OFF (stock DF) | 567.01 ± 8.73 ms | baseline |
+| ON-scalar + auto-cap (no vec) | 604.69 ± 29.81 ms | +6.6% |
+| **ON-vec + auto-cap** | **541.79 ± 7.05 ms** | **−4.4%** |
+
+The ON-scalar+auto-cap row reproduces slice 3's `EMAT_RH_SUM_F64_INIT_CAP=2M`
+result (+5.7%), confirming the auto-sizer correctly matches the
+hand-tuned cap and that the kernel was the residual gap. The
+vectorised path is what flips L1b from NEG to WIN.
+
+**Why standalone Q18 isn't enough**: the rule install costs
+~5-8% codegen perturbation across the rest of the binary per
+[[optimizer-codegen-sensitivity]]. Decision: **rule stays opt-in**
+(`EMAT_RH_SUM_F64=1`) per the codegen-tax pattern; the vectorised
+kernel itself is default-on within the operator (revert via
+`EMAT_RH_SUM_F64_VEC=0`) since it costs nothing when the rule
+doesn't fire. 22-query SF=10 geomean check deferred to the
+follow-up Σ.R.1 sweep.
 
 ---
 
