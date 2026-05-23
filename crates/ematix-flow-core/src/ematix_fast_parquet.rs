@@ -2087,8 +2087,16 @@ fn build_streaming_partition_stream(
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(2_000_000);
-        let auto_inline =
-            !has_filter && row_groups.len() > 1 && partition_rows >= large_partition_threshold;
+        // Σ.Q.L6′: if the RG decode cache is installed, prefer the
+        // eager reader — it's the only one wired into the cache today.
+        // For Q17 SF=10 the auto_inline rule otherwise routes lineitem
+        // through the inline-streaming reader and skips the cache
+        // entirely, neutralising EMAT_RG_DECODE_CACHE.
+        let cache_active = crate::emat_arrow_reader::process_rg_decode_cache().is_some();
+        let auto_inline = !has_filter
+            && !cache_active
+            && row_groups.len() > 1
+            && partition_rows >= large_partition_threshold;
         let use_inline = !has_filter && force_inline.unwrap_or(auto_inline);
         let use_page_streaming = if has_filter {
             false

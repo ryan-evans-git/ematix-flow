@@ -89,13 +89,20 @@ pub const DEFAULT_BATCH_SIZE: usize = 65_536;
 // output is row-mask-specific.
 // ---------------------------------------------------------------------
 
+/// Σ.Q.L6′ — per-column cache key. Two scans of the same parquet file
+/// that ask for overlapping column subsets (Q17: cols [1,4,5] then
+/// cols [1,4]) share the decoded columns 1 and 4. Earlier
+/// projection-bound key (`RgCacheKey { ..., projection: Vec<usize> }`)
+/// keyed on the *set* of projected columns, so different projections
+/// missed the cache entirely — bench-confirmed neutral on Q17 SF=10.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct RgCacheKey {
     pub(crate) file_path: std::path::PathBuf,
     pub(crate) row_group_idx: usize,
-    /// Sorted leaf indices into the parquet column order. Order-
-    /// independent equality.
-    pub(crate) projection: Vec<usize>,
+    /// Single parquet leaf-column index. Each row-group × column pair
+    /// gets its own cache entry so overlapping projections share
+    /// decoded columns.
+    pub(crate) leaf_idx: usize,
 }
 
 /// Σ.O.c.1 — process-shared cache of decoded row-group columns.
@@ -108,14 +115,19 @@ pub struct RowGroupDecodeCache {
 
 struct RgInner {
     entries: std::collections::HashMap<RgCacheKey, RgEntry>,
-    insertion_order: Vec<RgCacheKey>,
+    /// Σ.Q.L6′: `VecDeque` so eviction is O(1) (pop_front) instead of
+    /// O(n) (Vec::remove(0)). With per-column keys the entry count
+    /// grows 5-10× vs the old per-projection cache, so the linear-
+    /// scan eviction became visible on SF=1 single-scan queries
+    /// (Q06 +37%).
+    insertion_order: std::collections::VecDeque<RgCacheKey>,
     bytes_used: usize,
     hits: u64,
     misses: u64,
 }
 
 struct RgEntry {
-    columns: std::sync::Arc<Vec<DecodedColumn>>,
+    column: std::sync::Arc<DecodedColumn>,
     bytes: usize,
 }
 
@@ -129,7 +141,7 @@ impl RowGroupDecodeCache {
         Self {
             inner: std::sync::Mutex::new(RgInner {
                 entries: std::collections::HashMap::new(),
-                insertion_order: Vec::new(),
+                insertion_order: std::collections::VecDeque::new(),
                 bytes_used: 0,
                 hits: 0,
                 misses: 0,
@@ -138,9 +150,9 @@ impl RowGroupDecodeCache {
         }
     }
 
-    pub(crate) fn get(&self, key: &RgCacheKey) -> Option<std::sync::Arc<Vec<DecodedColumn>>> {
+    pub(crate) fn get(&self, key: &RgCacheKey) -> Option<std::sync::Arc<DecodedColumn>> {
         let mut inner = self.inner.lock().unwrap();
-        let cloned = inner.entries.get(key).map(|e| e.columns.clone());
+        let cloned = inner.entries.get(key).map(|e| e.column.clone());
         if cloned.is_some() {
             inner.hits += 1;
         } else {
@@ -149,30 +161,33 @@ impl RowGroupDecodeCache {
         cloned
     }
 
-    pub(crate) fn insert(&self, key: RgCacheKey, columns: Vec<DecodedColumn>) {
-        let bytes = estimate_columns_bytes(&columns);
+    pub(crate) fn insert(&self, key: RgCacheKey, column: DecodedColumn) {
+        let bytes = estimate_column_bytes(&column);
         if bytes > self.capacity_bytes {
             return; // entry alone exceeds cap; skip
         }
         let mut inner = self.inner.lock().unwrap();
         while inner.bytes_used + bytes > self.capacity_bytes && !inner.insertion_order.is_empty() {
-            let oldest = inner.insertion_order.remove(0);
+            // O(1) FIFO eviction — was O(n) when using Vec::remove(0)
+            // and the per-column cache has 5-10× more entries than
+            // the old per-projection one.
+            let oldest = inner.insertion_order.pop_front().unwrap();
             if let Some(e) = inner.entries.remove(&oldest) {
                 inner.bytes_used -= e.bytes;
             }
         }
-        let arc = std::sync::Arc::new(columns);
+        let arc = std::sync::Arc::new(column);
         if let Some(old) = inner.entries.insert(
             key.clone(),
             RgEntry {
-                columns: arc,
+                column: arc,
                 bytes,
             },
         ) {
             inner.bytes_used -= old.bytes;
             // already in insertion_order, no need to re-add
         } else {
-            inner.insertion_order.push(key);
+            inner.insertion_order.push_back(key);
         }
         inner.bytes_used += bytes;
     }
@@ -246,23 +261,21 @@ pub fn set_process_rg_decode_cache(cache: Option<std::sync::Arc<RowGroupDecodeCa
     *process_rg_decode_cache_slot().write().unwrap() = cache;
 }
 
-fn estimate_columns_bytes(cols: &[DecodedColumn]) -> usize {
-    cols.iter()
-        .map(|c| match c {
-            DecodedColumn::Int32 { data, .. } => data.len(),
-            DecodedColumn::Int64 { data, .. } => data.len(),
-            DecodedColumn::Float64 { data, .. } => data.len(),
-            DecodedColumn::StringView {
-                views,
-                data_buffers,
-                ..
-            } => views.len() + data_buffers.iter().map(|b| b.len()).sum::<usize>(),
-            DecodedColumn::DictUtf8 {
-                values, indices, ..
-            } => values.value_data().len() + indices.len(),
-            DecodedColumn::Utf8(s) => s.value_data().len(),
-        })
-        .sum()
+fn estimate_column_bytes(c: &DecodedColumn) -> usize {
+    match c {
+        DecodedColumn::Int32 { data, .. } => data.len(),
+        DecodedColumn::Int64 { data, .. } => data.len(),
+        DecodedColumn::Float64 { data, .. } => data.len(),
+        DecodedColumn::StringView {
+            views,
+            data_buffers,
+            ..
+        } => views.len() + data_buffers.iter().map(|b| b.len()).sum::<usize>(),
+        DecodedColumn::DictUtf8 {
+            values, indices, ..
+        } => values.value_data().len() + indices.len(),
+        DecodedColumn::Utf8(s) => s.value_data().len(),
+    }
 }
 
 /// `EMAT_BATCH_SIZE` env override (decimal). Σ.E5 diagnostic for the
@@ -1362,35 +1375,45 @@ impl EmatArrowBatchReader {
         // call fell back here mid-execution.
         self.cur_rg_total = self.cached_md.row_groups[rg].num_rows as usize;
 
-        // Σ.O.c.1 — private RG decode cache lookup. Hit: clone the
-        // Arc<Vec<DecodedColumn>>'s inner vec (each DecodedColumn holds
-        // Arc-shared Arrow Buffers; clone is O(n_cols) pointer copies,
-        // not a data copy). Miss: fall through and insert after decode.
-        let rg_cache_key = self.rg_decode_cache.as_ref().and_then(|_| {
-            self.path.as_ref().map(|p| RgCacheKey {
-                file_path: p.clone(),
-                row_group_idx: rg,
-                projection: {
-                    let mut v = self.projection.clone();
-                    v.sort_unstable();
-                    v
-                },
-            })
-        });
-        if let (Some(cache), Some(key)) = (self.rg_decode_cache.as_ref(), rg_cache_key.as_ref()) {
-            if let Some(cached) = cache.get(key) {
-                let cols: Vec<DecodedColumn> = (*cached).clone();
-                self.cur_rg_columns = Some(cols);
-                self.cur_rg_row = 0;
-                return Ok(());
-            }
-        }
-
+        // Σ.Q.L6′ — per-column cache. Each projected leaf has its own
+        // entry: two scans of the same RG with overlapping but not
+        // identical projections share decoded columns (Q17: scan A
+        // wants [1,4,5], scan B wants [1,4] → 1 and 4 reuse, only 5
+        // is decoded once).
+        //
+        // Stage 1: probe cache, fill `cached_cols[i]` for hits, push i
+        // onto `miss_indices` for misses.
         let projection = &self.projection;
         let schema = &self.arrow_schema;
         let file = &self.file;
         let cached_md = &self.cached_md;
         let n_cols = projection.len();
+        let mut cached_cols: Vec<Option<DecodedColumn>> = vec![None; n_cols];
+        let mut miss_indices: Vec<usize> = Vec::new();
+        if let (Some(cache), Some(path)) = (self.rg_decode_cache.as_ref(), self.path.as_ref()) {
+            for (i, &leaf) in projection.iter().enumerate() {
+                let key = RgCacheKey {
+                    file_path: path.clone(),
+                    row_group_idx: rg,
+                    leaf_idx: leaf,
+                };
+                if let Some(arc) = cache.get(&key) {
+                    cached_cols[i] = Some((*arc).clone());
+                } else {
+                    miss_indices.push(i);
+                }
+            }
+        } else {
+            miss_indices.extend(0..n_cols);
+        }
+
+        // Fast-path: full hit, no decode work.
+        if miss_indices.is_empty() {
+            let cols: Vec<DecodedColumn> = cached_cols.into_iter().map(Option::unwrap).collect();
+            self.cur_rg_columns = Some(cols);
+            self.cur_rg_row = 0;
+            return Ok(());
+        }
 
         // Cap on spawned threads. Default: never exceed available
         // cores, even for wide projections (Q1 = 7 cols on a 14-core
@@ -1404,15 +1427,19 @@ impl EmatArrowBatchReader {
                 .map(|p| p.get())
                 .unwrap_or(1)
         });
-        let max_threads = cap.max(1).min(n_cols.max(1));
+        // Σ.Q.L6′: decode only the cache-miss subset, then merge with
+        // cached hits at their original projection positions.
+        let n_miss = miss_indices.len();
+        let max_threads = cap.max(1).min(n_miss.max(1));
 
         // Sequential fast path: skip scoped-thread overhead when
-        // there's nothing to parallelise (single-column projection or
+        // there's nothing to parallelise (single-column miss or
         // single-core machine).
-        let cols: Vec<DecodedColumn> = if max_threads <= 1 || n_cols <= 1 {
+        let mut decoded_misses: Vec<DecodedColumn> = if max_threads <= 1 || n_miss <= 1 {
             let mut chunk_buf: Vec<u8> = Vec::new();
-            let mut out = Vec::with_capacity(n_cols);
-            for (proj_idx, &leaf) in projection.iter().enumerate() {
+            let mut out = Vec::with_capacity(n_miss);
+            for &proj_idx in &miss_indices {
+                let leaf = projection[proj_idx];
                 let target = schema.field(proj_idx).data_type();
                 out.push(decode_one_column(
                     file,
@@ -1426,28 +1453,16 @@ impl EmatArrowBatchReader {
             out
         } else {
             // Pre-allocate result slots so we can scatter into them
-            // by index without a final sort step.
+            // by miss-index position without a final sort step.
             let mut slots: Vec<Option<DfResult<DecodedColumn>>> =
-                (0..n_cols).map(|_| None).collect();
+                (0..n_miss).map(|_| None).collect();
 
-            // Shared work queue — atomic counter handing out the next
-            // column index. Caps thread spawn count at `max_threads`
-            // while still letting each thread chew through multiple
-            // columns when n_cols > cores.
+            // Shared work queue over the miss subset only.
             use std::sync::atomic::{AtomicUsize, Ordering};
             let next = AtomicUsize::new(0);
+            let miss_indices_ref = &miss_indices;
 
             std::thread::scope(|s| {
-                // Each thread writes into a disjoint subset of `slots`
-                // (column index handed out by `next.fetch_add`), so we
-                // collect the per-thread results and merge them after
-                // join. No interior mutability across threads.
-                //
-                // Σ.E5.6: each thread also owns one `chunk_buf` —
-                // reused across every column it decodes. Eliminates
-                // ~half the per-call ~1 MB `vec![0u8; len]` +
-                // `madvise(MADV_DONTNEED)` churn the profiler flagged
-                // (1008 madvise samples / ~12% of decode CPU).
                 let mut handles = Vec::with_capacity(max_threads);
                 for _ in 0..max_threads {
                     let next = &next;
@@ -1455,14 +1470,15 @@ impl EmatArrowBatchReader {
                         let mut local: Vec<(usize, DfResult<DecodedColumn>)> = Vec::new();
                         let mut chunk_buf: Vec<u8> = Vec::new();
                         loop {
-                            let i = next.fetch_add(1, Ordering::Relaxed);
-                            if i >= n_cols {
+                            let m = next.fetch_add(1, Ordering::Relaxed);
+                            if m >= n_miss {
                                 break;
                             }
-                            let leaf = projection[i];
-                            let target = schema.field(i).data_type();
+                            let proj_idx = miss_indices_ref[m];
+                            let leaf = projection[proj_idx];
+                            let target = schema.field(proj_idx).data_type();
                             local.push((
-                                i,
+                                m,
                                 decode_one_column(
                                     file,
                                     cached_md,
@@ -1477,24 +1493,50 @@ impl EmatArrowBatchReader {
                     }));
                 }
                 for h in handles {
-                    // Propagate panics — a column-decode panic is a
-                    // bug, not a recoverable error.
                     let partial = h.join().expect("emat_arrow_reader decode thread panicked");
-                    for (i, r) in partial {
-                        slots[i] = Some(r);
+                    for (m, r) in partial {
+                        slots[m] = Some(r);
                     }
                 }
             });
 
-            // Fail-fast on the first column error (in projection order
-            // — gives deterministic error messages).
-            let mut out = Vec::with_capacity(n_cols);
-            for (i, slot) in slots.into_iter().enumerate() {
-                let r = slot.ok_or_else(|| ext(format!("column {i} decode slot never filled")))?;
+            // Fail-fast on the first column error.
+            let mut out = Vec::with_capacity(n_miss);
+            for (m, slot) in slots.into_iter().enumerate() {
+                let r = slot.ok_or_else(|| {
+                    ext(format!("column miss-slot {m} never filled"))
+                })?;
                 out.push(r?);
             }
             out
         };
+
+        // Σ.Q.L6′: insert each newly-decoded column into the per-column
+        // cache, then merge into the projection-ordered cols vec.
+        if let (Some(cache), Some(path)) = (self.rg_decode_cache.as_ref(), self.path.as_ref()) {
+            for (m, &proj_idx) in miss_indices.iter().enumerate() {
+                let leaf = projection[proj_idx];
+                let key = RgCacheKey {
+                    file_path: path.clone(),
+                    row_group_idx: rg,
+                    leaf_idx: leaf,
+                };
+                cache.insert(key, decoded_misses[m].clone());
+            }
+        }
+
+        // Drain `decoded_misses` in order; for each projection slot,
+        // pull either the cached column (if any) or the next decoded
+        // miss. Misses appear in the same order as `miss_indices`.
+        let mut miss_iter = decoded_misses.drain(..);
+        let cols: Vec<DecodedColumn> = (0..n_cols)
+            .map(|i| match cached_cols[i].take() {
+                Some(c) => c,
+                None => miss_iter
+                    .next()
+                    .expect("missed column with no decode result"),
+            })
+            .collect();
 
         // Sanity: every column has the same length as the RG.
         for (i, c) in cols.iter().enumerate() {
@@ -1508,11 +1550,8 @@ impl EmatArrowBatchReader {
             }
         }
 
-        // Σ.O.c.1 — populate cache on miss. Clone is O(n_cols) Arc
-        // pointer copies; the underlying Arrow Buffers are Arc-shared.
-        if let (Some(cache), Some(key)) = (self.rg_decode_cache.as_ref(), rg_cache_key.as_ref()) {
-            cache.insert(key.clone(), cols.clone());
-        }
+        // Σ.Q.L6′: cache inserts happened above per-column on the
+        // miss path — nothing to do here.
 
         self.cur_rg_columns = Some(cols);
         self.cur_rg_row = 0;

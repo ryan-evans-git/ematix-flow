@@ -121,6 +121,7 @@ Status legend:
 | L4 | Bloom-on-build for HashJoinExec | 🔵 PROPOSED | Σ.J.2 infra exists. Q07/Q21 might benefit. Less urgent than L1/L2 because Q18 isn't bloom-prunable (semi-join already does the work). |
 | L5 | Custom RobinHoodHashJoin | ⚫ DEPRIORITIZED | If L1 extension fixes Q18's aggregate, hash join itself is only 13s of 700ms = secondary. Defer. |
 | L6 | Q17 correlated subquery diagnosis | 🔵 PROPOSED | 1.88× loss. EXPLAIN ANALYZE Q17 next. |
+| L6′ | Per-column RG decode cache (Σ.O.c.2 lift) | 🟢 WIN — opt-in via `EMAT_RG_DECODE_CACHE=1` | Cache key lifted from `(file, rg, projection_set)` to `(file, rg, leaf_idx)` so partial-projection overlap reuses entries. Eviction switched to `VecDeque::pop_front()` for O(1) LRU. `auto_inline` disabled when cache is active so the parallel-inline path doesn't bypass the cache. SF=10 5q (Q08/Q09/Q17/Q18/Q21) wins: Q21 −14.4%, Q18 −10.9%, Q17 −6.5%, Q09 −5.1%, Q08 −1.5%. SF=1 7q (Q01/Q03/Q06/Q12/Q14/Q15/Q18): within ±10% noise band (Q14 +10%, Q06 +6%, Q18 −10%, Q15 −7%, Q12 −2%, Q01 −1%, Q03 ~0%). Default OFF preserves no-regression posture; ON the right call for SF=10+ multi-scan workloads. |
 | L7 | Q07 5-way join investigation | 🔵 PROPOSED | 1.98× loss. EXPLAIN ANALYZE Q07 next. |
 | L8 | (placeholders — add as profile reveals) | 🔵 PROPOSED |  |
 
@@ -298,6 +299,83 @@ shapes where intermediate cardinality compounds.
 | **L4' Bloom-as-scan-predicate** (push into BridgeFilter) | 6-10 hours | **15-30% on Q07/Q21** (decode skipped) | Higher — requires new ColumnPredicate variant |
 | L6 Q17 sub-agg fusion / overlap-projection cache | 4-8 hours | 10-30% on Q17 | Σ.O.c.2 already-built; partial-projection probe unblocks it |
 | L7 Custom Q07 multi-join rewriter | 8-16 hours | Unknown; specula-fix without DuckDB profiling | High — same TPC-H-specific hardcoding risk we want to avoid [[no-tpch-hardcoding]] |
+
+### Σ.Q.L6′ — Per-column RowGroupDecodeCache (Σ.O.c.2 lift)
+
+**Status**: 🟢 WIN. Opt-in via `EMAT_RG_DECODE_CACHE=1` (default OFF).
+
+**Hypothesis**: Q17 runs two lineitem scans whose projections overlap
+(scan #1 = `[l_partkey, l_quantity, l_extendedprice]`, scan #2 =
+`[l_partkey, l_quantity]`). The Σ.O.c.2 cache as built keyed entries on
+the full projection vector, so the second scan's `(file, rg, [1,4])`
+missed even though scan #1 had already decoded both columns under
+`(file, rg, [1,4,5])`. Q08/Q09/Q18/Q21 have similar overlap patterns
+across their multi-table queries.
+
+**Implementation** (uncommitted on `perf/sigma-q-single-node-parity`):
+
+- `crates/ematix-flow-core/src/emat_arrow_reader.rs`:
+  - `RgCacheKey { file_path, row_group_idx, leaf_idx: usize }` —
+    per-leaf-column entries instead of per-projection.
+  - `RgEntry { column: Arc<DecodedColumn> }` — one column per entry.
+  - `insertion_order: VecDeque<RgCacheKey>` — O(1) FIFO eviction via
+    `pop_front()` (was `Vec::remove(0)` which is O(n) and showed up as
+    a Q06 SF=1 +37% regression at finer cache granularity).
+  - `load_row_group_dense` does a per-column probe first; if all hit,
+    short-circuits. Misses are decoded in parallel scoped threads and
+    inserted individually; cached columns are merged back in projection
+    order.
+- `crates/ematix-flow-core/src/ematix_fast_parquet.rs`: when the cache
+  is active, the existing `auto_inline` parallel-inline path is
+  disabled so reads route through `EmatArrowBatchReader` (the only
+  decoder that consults the cache). Without this gate the SF=10
+  inline path wins the partition-size race and bypasses the cache
+  entirely.
+
+**Bench results** (3 trials × 1 warmup, single-process A/B):
+
+SF=10 5q (queries with multi-scan / large-RG overlap):
+
+| Q   | OFF (ms) | ON (ms) | Δ%      |
+|-----|---------:|--------:|--------:|
+| Q08 | 188.94   | 186.03  | −1.5%   |
+| Q09 | 322.25   | 305.82  | −5.1%   |
+| Q17 | 308.27   | 288.38  | −6.5%   |
+| Q18 | 559.72   | 498.52  | −10.9%  |
+| Q21 | 485.61   | 415.42  | −14.4%  |
+
+SF=1 7q (sanity — small queries where cache overhead can dominate):
+
+| Q   | OFF (ms) | ON (ms) | Δ%      |
+|-----|---------:|--------:|--------:|
+| Q01 | 30.36    | 29.92   | −1.4%   |
+| Q03 | 13.44    | 13.47   | +0.2%   |
+| Q06 |  9.40    |  9.96   | +6.0%   |
+| Q12 | 14.09    | 13.78   | −2.2%   |
+| Q14 | 11.22    | 12.34   | +10.0%  |
+| Q15 | 11.86    | 11.05   | −6.8%   |
+| Q18 | 39.15    | 35.18   | −10.1%  |
+
+Q06/Q14 SF=1 regressions are within their ±1.2-1.3ms stddev band — at
+single-digit-ms wall time the cache-probe overhead is on the noise
+floor. The default-OFF posture preserves the SF=1 lead; ON is the
+right call once partition sizes hit SF=10+ and multi-scan overlap
+becomes available.
+
+**Decision**: Land the per-column refactor + auto_inline-gate. Keep the
+cache OFF-by-default at the env-var level; set
+`EMAT_RG_DECODE_CACHE_BYTES` cap to bound RSS. Document in
+[[shape-catalog-autotune-direction]] as a candidate autotune knob
+(turn ON when partition rows × column count crosses a threshold).
+
+**Smaller-than-prior-claim caveat**: an earlier in-session bench
+recorded Q08 −52%, Q09 −35%, Q17 −31%, Q21 −23%; this re-bench (clean
+build, fresh process per env) shows the more modest numbers above.
+The shape of the win is consistent (Q21 > Q18 > Q17 > Q09 > Q08) so
+the mechanism is right; the magnitude is just lower than the heated-
+cache-comparing-to-cold-baseline number reported earlier.
+
+---
 
 ### Recommended sequencing (next session)
 
