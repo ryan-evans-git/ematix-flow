@@ -159,6 +159,17 @@ pub enum ColumnPredicate {
         right_col: usize,
         op: Operator,
     },
+    /// Σ.Q.L4′ — Bloom-filter membership probe on an i64 column.
+    /// Pre-built by the planner from a HashJoin's build side (e.g.
+    /// the post-filter supplier/nation keys) and pushed into the
+    /// probe-side scan so lineitem rows whose join key isn't in the
+    /// bloom skip masked-decode entirely. Approximate by design —
+    /// false positives are allowed (the residual join still runs);
+    /// this is selectivity reduction, not correctness.
+    I64InBloom {
+        col_idx: usize,
+        bloom: Arc<crate::bloom::BloomFilter>,
+    },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -189,6 +200,7 @@ impl BridgeFilter {
             filter_byte_array_to_bitmap, filter_byte_array_to_bitmap_dense,
             filter_f64_column_to_bitmap, filter_f64_column_to_bitmap_dense,
             filter_i32_column_to_bitmap, filter_i32_column_to_bitmap_dense,
+            filter_i64_column_to_bitmap_dense,
         };
         let mut combined: Option<(Vec<u8>, usize)> = None;
         for p in &self.predicates {
@@ -296,6 +308,12 @@ impl BridgeFilter {
                     }
                     (bitmap, total)
                 }
+                ColumnPredicate::I64InBloom { col_idx, bloom } => {
+                    let bloom = bloom.clone();
+                    filter_i64_column_to_bitmap_dense(path, rg, *col_idx, move |v: i64| {
+                        bloom.might_contain_i64(v)
+                    })?
+                }
                 ColumnPredicate::StringEq { col_idx, .. }
                 | ColumnPredicate::StringNotEq { col_idx, .. }
                 | ColumnPredicate::StringIn { col_idx, .. }
@@ -363,6 +381,7 @@ impl ColumnPredicate {
             | ColumnPredicate::StringLike { col_idx, .. } => *col_idx,
             // ColumnPair touches two cols; return left as the "primary".
             ColumnPredicate::I32ColumnPair { left_col, .. } => *left_col,
+            ColumnPredicate::I64InBloom { col_idx, .. } => *col_idx,
         }
     }
 
@@ -491,6 +510,18 @@ impl ColumnPredicate {
             }
             // Refused-for-pushdown shapes; never reach here in practice.
             ColumnPredicate::F64Range { .. } | ColumnPredicate::I32ColumnPair { .. } => 0.5,
+            // Σ.Q.L4′ — bloom is selectivity-reducing. Caller supplies
+            // the build-side cardinality via expected_keys when
+            // constructing; we approximate pass rate as 1 - FPR ≈ 0.01
+            // for true negatives + (built_card / col_distinct) for true
+            // positives. Without stats we lean on the bloom's own
+            // n_blocks heuristic; a 1% FPR + small build vs large
+            // probe means the pass rate is roughly the build/probe
+            // cardinality ratio. We don't have that here, so return
+            // 0.2 as a conservative win-leaning estimate (lower than
+            // the StringIn default of 0.2 because we expect blooms
+            // only to be injected when the build is genuinely small).
+            ColumnPredicate::I64InBloom { .. } => 0.2,
         }
     }
 
@@ -523,6 +554,10 @@ impl ColumnPredicate {
             // decode trap respectively). When/if re-enabled they'll
             // need their own audit before claiming Exact.
             ColumnPredicate::F64Range { .. } | ColumnPredicate::I32ColumnPair { .. } => false,
+            // Σ.Q.L4′ — bloom is approximate by construction (FPR > 0).
+            // Provider must declare this Inexact so DataFusion keeps
+            // the residual HashJoin equality test.
+            ColumnPredicate::I64InBloom { .. } => false,
         }
     }
 
@@ -573,6 +608,18 @@ impl ColumnPredicate {
                 true
             }
             ColumnPredicate::I32In { values, .. } => values.contains(&v),
+            _ => false,
+        }
+    }
+
+    /// Σ.Q.L4′ — evaluate against an i64 value (I64InBloom only).
+    /// Returns true on a bloom HIT (key may be present in the build
+    /// side). False positives are part of the contract; the residual
+    /// equijoin still runs.
+    #[inline]
+    pub fn eval_i64(&self, v: i64) -> bool {
+        match self {
+            ColumnPredicate::I64InBloom { bloom, .. } => bloom.might_contain_i64(v),
             _ => false,
         }
     }
@@ -3147,5 +3194,91 @@ mod tests {
             assert!((bridge_rows[i].1 - s).abs() < 1e-6 * s.abs().max(1.0));
             assert_eq!(bridge_rows[i].2, n);
         }
+    }
+
+    /// Σ.Q.L4′ — I64InBloom pushdown: write a small i64 column, build
+    /// a bloom from a known subset of keys, run BridgeFilter::build_bitmap
+    /// and assert (a) every "in-the-build-set" row is set in the bitmap
+    /// (no false negatives) and (b) the bloom rejects most "not-in"
+    /// rows (false-positive rate within a sane bound).
+    #[test]
+    fn i64_in_bloom_bitmap_rejects_misses() {
+        use crate::bloom::BloomFilter;
+        use datafusion::parquet::basic::{Compression, Repetition, Type as PhysicalType};
+        use datafusion::parquet::column::writer::ColumnWriter;
+        use datafusion::parquet::file::properties::WriterProperties;
+        use datafusion::parquet::file::writer::SerializedFileWriter;
+        use datafusion::parquet::schema::types::Type as PType;
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+
+        let schema = Arc::new(
+            PType::group_type_builder("schema")
+                .with_fields(vec![Arc::new(
+                    PType::primitive_type_builder("k", PhysicalType::INT64)
+                        .with_repetition(Repetition::REQUIRED)
+                        .build()
+                        .unwrap(),
+                )])
+                .build()
+                .unwrap(),
+        );
+        let props = Arc::new(
+            WriterProperties::builder()
+                .set_compression(Compression::SNAPPY)
+                .build(),
+        );
+        let file = File::create(&path).unwrap();
+        let mut writer = SerializedFileWriter::new(file, schema, props).unwrap();
+        let mut rg = writer.next_row_group().unwrap();
+        // k = 0, 7, 14, ... 6993 (1000 distinct i64 values).
+        let keys: Vec<i64> = (0..1000i64).map(|i| i * 7).collect();
+        let mut col = rg.next_column().unwrap().unwrap();
+        if let ColumnWriter::Int64ColumnWriter(t) = col.untyped() {
+            t.write_batch(&keys, None, None).unwrap();
+        }
+        col.close().unwrap();
+        rg.close().unwrap();
+        writer.close().unwrap();
+
+        // Build a bloom from every 10th key: {0, 70, 140, ..., 6930}.
+        let build_keys: Vec<i64> = (0..100i64).map(|i| i * 70).collect();
+        let mut bloom = BloomFilter::for_keys(build_keys.len());
+        for k in &build_keys {
+            bloom.insert_i64(*k);
+        }
+        let bloom = Arc::new(bloom);
+
+        let filter = BridgeFilter::new(vec![ColumnPredicate::I64InBloom {
+            col_idx: 0,
+            bloom: bloom.clone(),
+        }]);
+        let (bitmap, total) = filter.build_bitmap(&path, 0).unwrap();
+        assert_eq!(total, keys.len());
+
+        // No false negatives: every row whose key is in build_keys must
+        // be set in the bitmap.
+        let build_set: std::collections::HashSet<i64> = build_keys.iter().copied().collect();
+        let mut true_positives = 0usize;
+        let mut false_positives = 0usize;
+        for (row, &k) in keys.iter().enumerate() {
+            let bit = (bitmap[row >> 3] >> (row & 7)) & 1 == 1;
+            if build_set.contains(&k) {
+                assert!(bit, "false negative at row {row} (key={k})");
+                true_positives += 1;
+            } else if bit {
+                false_positives += 1;
+            }
+        }
+        assert_eq!(true_positives, build_keys.len());
+        // 1% FPR target ⇒ on 900 non-build rows expect ≤90 FPs in the
+        // worst case, but with k=8 hashes the empirical rate is much
+        // lower. Allow 5% to keep the test stable.
+        let fp_rate = false_positives as f64 / (keys.len() - build_keys.len()) as f64;
+        assert!(
+            fp_rate < 0.05,
+            "bloom false-positive rate {fp_rate:.4} exceeds 5%"
+        );
     }
 }
