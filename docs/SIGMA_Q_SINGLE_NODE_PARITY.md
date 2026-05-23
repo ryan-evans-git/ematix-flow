@@ -113,12 +113,20 @@ Status legend:
 
 | ID | Lever | Status | Notes |
 |---|---|---|---|
-| L1 | Multi-column parallel decode (task #397) | 🔵 PROPOSED | Decode-bound queries (Q01/Q03/Q06/Q14) likely biggest beneficiary at SF=10. Known parquet-rs/ematix-parquet mutex bottleneck at ~1.8× scaling cap. |
-| L2 | Bloom-on-build for HashJoinExec (single-node) | 🔵 PROPOSED | Σ.J.2 already built the bloom infra for distributed. Wire it into single-node HashJoin too. Q18/Q21 should win 2-5×. |
-| L3 | Custom RobinHoodHashJoin | 🔵 PROPOSED | Biggest potential, biggest risk. Defer until profile justifies. |
-| L4 | Q17 correlated-subquery plan diagnosis | 🔵 PROPOSED | 1.88× loss; might be plan shape rather than execution. |
-| L5 | Q05 6-way join order | 🔵 PROPOSED | DataFusion's join reorderer might be picking sub-optimal order for 6-table at SF=10. |
-| L6 | (placeholders — add as profile reveals) | 🔵 PROPOSED |  |
+| L1 | **Extend Σ.N.d rule to SUM-by-i64-key aggregate** | 🟡 IN PROGRESS (highest priority) | Σ.Q.0 profile finds Q18 dominated by FinalPartitioned `sum(f64) gby i64` at 15M cardinality. Current Σ.N.d matcher only fires on `COUNT(*) gby i64` (Q12 shape). Extend matcher; bench Q18 + Q01/Q03 (similar shapes possible). |
+| L2 | **LeftSemi join swap-build-side** | 🔵 PROPOSED (high priority) | Q18 LeftSemi appears inverted: builds hash on 60M rows, probes with 624. Should be reversed. Verify by reading HashJoinExec swap rules + force the swap. |
+| L3 | Multi-column parallel decode (task #397) | ⚫ DEPRIORITIZED for Q18 | Q18 decode is 230ms / 700ms = 33% — not the dominant cost. Re-evaluate after L1/L2 land; might matter for Q01/Q03 (more scan-bound). |
+| L4 | Bloom-on-build for HashJoinExec | 🔵 PROPOSED | Σ.J.2 infra exists. Q07/Q21 might benefit. Less urgent than L1/L2 because Q18 isn't bloom-prunable (semi-join already does the work). |
+| L5 | Custom RobinHoodHashJoin | ⚫ DEPRIORITIZED | If L1 extension fixes Q18's aggregate, hash join itself is only 13s of 700ms = secondary. Defer. |
+| L6 | Q17 correlated subquery diagnosis | 🔵 PROPOSED | 1.88× loss. EXPLAIN ANALYZE Q17 next. |
+| L7 | Q07 5-way join investigation | 🔵 PROPOSED | 1.98× loss. EXPLAIN ANALYZE Q07 next. |
+| L8 | (placeholders — add as profile reveals) | 🔵 PROPOSED |  |
+
+**Working hypothesis**: L1 (RobinHood-for-SUM extension) is the single
+highest-impact lever. If Q18 FinalPartitioned aggregate drops from
+~363s elapsed_compute to ~70s (RobinHood beats hashbrown 1-5× at 200K
+cardinality per Σ.N.f.3 notes — at 15M it might be even better with
+correct sizing), the per-iteration wall could drop 200-400ms.
 
 ---
 
@@ -129,14 +137,43 @@ per-query bench numbers SF=1 + SF=10, decision (commit/revert/gate).
 
 ### Σ.Q.0 — Profile spike on Q18 SF=10
 
-**Status**: 🟡 IN PROGRESS — harness built, awaiting bench completion to run.
+**Status**: 🟢 COMPLETE.
 
-**Tool**: `samply record ./target/release/examples/sigma_q_profile_loop`
-with `Q=18`. New example at
-`crates/ematix-flow-core/examples/sigma_q_profile_loop.rs` mirrors the
-triangulation bench's session (preset rules + dict-aware Emat).
+**Tools**:
+- `crates/ematix-flow-core/examples/sigma_q_profile_loop.rs` (samply, hex-only frames, low value without symbols)
+- `crates/ematix-flow-core/examples/sigma_q_explain_analyze.rs` (DataFusion EXPLAIN ANALYZE — primary finding source)
 
-**Expected findings**: (to be filled)
+**Findings**:
+
+Q18 SF=10 elapsed_compute, top operators (3 warmups + 1 ANALYZE run):
+
+| Operator | elapsed_compute | output_rows | Notes |
+|---|---|---|---|
+| **AggregateExec FinalPartitioned** sum(l_qty) gby l_orderkey | **363.96 s** | 15 M | Dominant. `time_calculating_group_ids=182.86s + aggregation_time=181.10s` |
+| **HashJoinExec LeftSemi** (Inner-out × subq) | 13.46 s | 4.4 K | **build_input_rows=59.99M** — appears to build on LARGE side, probe small |
+| HashJoinExec Inner (orders × lineitem) | 4.88 s | 60 M | Build=15M smaller side (correct) |
+| AggregateExec Partial sum(l_qty) gby l_orderkey | 2.95 s | 15 M | Normal — 4× reduction |
+| EmatixFastParquetExec lineitem (×2 scans) | ~230 ms | 60 M ×2 | **decode is NOT the bottleneck** |
+| HashJoinExec Inner (customer × orders) | 435 ms | 15 M | Normal |
+| RepartitionExec ([l_orderkey], 14) (×2) | ~700 ms total | 15M+60M | Normal |
+| SortExec (final) | 18 µs | 624 | Trivial |
+
+**Interpretation**: Q18's SF=10 cost is concentrated in **the FinalPartitioned
+aggregate that materializes 15M unique l_orderkey + sum() pairs**, then
+joins back. This is exactly the shape Σ.N RobinHoodAggregateExec was
+built for (i64-keyed numeric aggregate, high cardinality), but the
+Σ.N.d planner rule that auto-installs RobinHoodAggregateExec only
+matches `COUNT(*) GROUP BY i64-col`, not `SUM(f64) GROUP BY i64-col`.
+
+**Secondary opportunity**: LeftSemi join build side may be inverted
+(building hash on 60M rows when 624-row side is available). Confirm
+by reading HashJoinExec source for join-type-specific swap rules.
+
+**Decode cache (Σ.O.c.2) had ZERO effect** when enabled via
+`EMAT_RG_DECODE_CACHE=1`. This is consistent with the metrics:
+lineitem decode is ~230ms out of 696ms total → caching saves ~115ms
+but the aggregate dominates. Confirmed: cache is wired correctly but
+Q18 isn't decode-bound.
 
 ---
 

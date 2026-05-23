@@ -35,6 +35,7 @@ use datafusion::prelude::{SessionConfig, SessionContext};
 use ematix_flow_core::dedupe_aggregate_rule::DedupeAggregateForFloatDeterminism;
 use ematix_flow_core::dict_aggregate_rule::EnableDictGroupCountRule;
 use ematix_flow_core::ematix_fast_parquet::EmatixFastParquetTableProvider;
+use ematix_flow_core::fast_parquet::FastParquetTableProvider;
 use ematix_flow_core::fused_aggregate_filter_multi_agg_rule::InjectFilterMultiAggRule;
 use ematix_flow_core::fused_aggregate_filter_sum_rule::InjectFilterSumRule;
 use futures_util::TryStreamExt;
@@ -82,12 +83,18 @@ fn make_ctx() -> SessionContext {
 }
 
 fn register_tables(ctx: &SessionContext, dir: &str) {
+    // Mirror tpch_triangulation_bench's build_ematix_ctx: Emat for
+    // lineitem (no dict preservation — fails on SF=10 lineitem chunks
+    // where the writer fell back from dict), FastParquet for the rest.
     for t in TPCH_TABLES {
         let path = format!("{dir}/{t}.parquet");
-        let prov = EmatixFastParquetTableProvider::try_new(path)
-            .unwrap()
-            .with_dict_preservation(true);
-        ctx.register_table(*t, Arc::new(prov)).unwrap();
+        if *t == "lineitem" {
+            let prov = EmatixFastParquetTableProvider::try_new(path).unwrap();
+            ctx.register_table(*t, Arc::new(prov)).unwrap();
+        } else {
+            let prov = FastParquetTableProvider::try_new(path).unwrap();
+            ctx.register_table(*t, Arc::new(prov)).unwrap();
+        }
     }
 }
 
