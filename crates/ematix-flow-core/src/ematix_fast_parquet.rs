@@ -1842,6 +1842,103 @@ fn build_partition_stream(
 /// product `N_partitions × N_cols`. For Q1 SF=1 (6 outer partitions on
 /// 14 cores) the budget is 2 — total ≈ 12 concurrent threads instead
 /// of the 42 the naive `available_parallelism()` cap produced.
+/// Shape-aware default for `inline_row_threshold`.
+///
+/// The original 900_000-row constant was hand-calibrated for the
+/// TPC-H working set, where every scan projects ≤10 columns. Wider
+/// scans (TPC-DS fact tables, real-world denormalized analytics
+/// tables) hit the per-page sync cost at a much smaller row count
+/// because the per-partition decode budget scales with rows × cols,
+/// not rows alone.
+///
+/// **Calibration:** 900_000 rows × 7 projected columns ≈ 6_300_000
+/// cell budget. SF=1 lineitem scans (Q01: 7 projected cols, Q06: 4,
+/// Q14: 5, ...) all land in the ≤10-col bucket, so the
+/// derived threshold equals the legacy constant by construction.
+/// Bench gate parity is structural, not empirical.
+///
+/// **What this changes:** scans with 11+ projected columns get a
+/// lower threshold (scales as 6_300_000 / col_count). For a 30-col
+/// wide-fact projection the threshold drops to ~210_000 rows, which
+/// is closer to the actual first-batch latency budget that drove the
+/// original tuning.
+///
+/// **Override path is unchanged:** `EMAT_INLINE_ROW_THRESHOLD=N` env
+/// still wins; this helper only feeds the default branch.
+fn derive_inline_row_threshold(projected_columns: usize) -> usize {
+    const TPCH_CALIBRATION_THRESHOLD: usize = 900_000;
+    const INLINE_CELL_BUDGET: usize = 6_300_000;
+    /// TPC-H's widest single scan in the bench gate is 8 cols. Anything
+    /// at or below this leaves the legacy threshold intact; above it,
+    /// shape-aware scaling kicks in. The cutoff is deliberately wider
+    /// than the bench's actual max so a future TPC-H query that
+    /// projects 9 or 10 cols doesn't accidentally trip the auto-scale.
+    const NARROW_PROJECTION_CUTOFF: usize = 10;
+
+    let cols = projected_columns.max(1);
+    if cols <= NARROW_PROJECTION_CUTOFF {
+        TPCH_CALIBRATION_THRESHOLD
+    } else {
+        // Strict ceiling: never raise above the calibration value.
+        // Q04's +29pp regression at the 1.8M threshold sweep (see the
+        // comment block at `inline_row_threshold` callsite) is the
+        // anchor — going up from 900k breaks Q04's full-table GROUP BY
+        // pattern. The min() preserves that invariant.
+        (INLINE_CELL_BUDGET / cols).min(TPCH_CALIBRATION_THRESHOLD)
+    }
+}
+
+#[cfg(test)]
+mod inline_row_threshold_tests {
+    use super::derive_inline_row_threshold;
+
+    /// Narrow projections (≤10 cols, which covers the entire TPC-H
+    /// bench gate) must match the legacy 900_000 constant exactly so
+    /// the bench gate is bit-identical by construction.
+    #[test]
+    fn tpch_calibration_preserved_for_narrow_projections() {
+        for cols in 1..=10 {
+            assert_eq!(
+                derive_inline_row_threshold(cols),
+                900_000,
+                "col_count={cols} must keep legacy threshold"
+            );
+        }
+    }
+
+    /// Wide projections scale down proportionally to the cell budget.
+    #[test]
+    fn wide_projections_scale_down() {
+        // 15 cols: 6_300_000 / 15 = 420_000
+        assert_eq!(derive_inline_row_threshold(15), 420_000);
+        // 30 cols: 6_300_000 / 30 = 210_000
+        assert_eq!(derive_inline_row_threshold(30), 210_000);
+        // 63 cols: 6_300_000 / 63 = 100_000
+        assert_eq!(derive_inline_row_threshold(63), 100_000);
+    }
+
+    /// Threshold is monotonically non-increasing in column count —
+    /// strictly impossible to flip a TPC-H query to a higher threshold
+    /// regardless of projection width.
+    #[test]
+    fn monotonic_non_increasing_in_cols() {
+        let mut prev = usize::MAX;
+        for cols in 1..=64 {
+            let t = derive_inline_row_threshold(cols);
+            assert!(t <= prev, "non-monotonic at col_count={cols}: {t} > {prev}");
+            prev = t;
+        }
+    }
+
+    /// Zero columns is a guard case (shouldn't happen in practice but
+    /// the function must not divide-by-zero).
+    #[test]
+    fn zero_cols_is_safe() {
+        // Treated as 1 col → legacy threshold path.
+        assert_eq!(derive_inline_row_threshold(0), 900_000);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_streaming_partition_stream(
     path: String,
@@ -1911,10 +2008,20 @@ fn build_streaming_partition_stream(
     //     page-streaming, Q04 hates it). Stay at 900k.
     //
     // Override via `EMAT_INLINE_ROW_THRESHOLD=N`; set to 0 to disable.
+    //
+    // Shape-catalog autotune (#557 follow-on): the 900k row default was
+    // hand-tuned for the TPC-H working set, where every scan is
+    // ≤10 projected columns. Wider scans (think TPC-DS fact tables,
+    // 20-50 projected columns) hit the per-page sync cost on a much
+    // smaller row count because the cell-decode budget is proportional
+    // to rows × cols, not rows alone. `derive_inline_row_threshold`
+    // scales the default DOWN for wide projections while leaving the
+    // TPC-H calibration bit-identical. See module docstring for
+    // calibration math.
     let inline_row_threshold: usize = std::env::var("EMAT_INLINE_ROW_THRESHOLD")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(900_000);
+        .unwrap_or_else(|| derive_inline_row_threshold(projection.len()));
 
     tokio::task::spawn_blocking(move || {
         let file = match ematix_parquet_io::ParquetFile::open(&path_buf) {
