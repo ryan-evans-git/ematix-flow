@@ -71,8 +71,9 @@ fn data_dir() -> String {
 
 fn make_ctx() -> SessionContext {
     // Mirror tpch_triangulation_bench's EMAT_RULES=all session.
+    let partitions: usize = env_or("PARTITIONS", 14);
     let state = SessionStateBuilder::new()
-        .with_config(SessionConfig::new().with_target_partitions(14))
+        .with_config(SessionConfig::new().with_target_partitions(partitions))
         .with_default_features()
         .with_physical_optimizer_rule(Arc::new(DedupeAggregateForFloatDeterminism::default()))
         .with_physical_optimizer_rule(Arc::new(EnableDictGroupCountRule))

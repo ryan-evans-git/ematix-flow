@@ -271,7 +271,12 @@ async fn build_ematix_ctx(data_dir: &Path) -> Result<SessionContext, Box<dyn std
     //   "dedupe"                — dedupe only
     let rules = std::env::var("EMAT_RULES").unwrap_or_else(|_| "all".to_string());
     let mut builder = SessionStateBuilder::new()
-        .with_config(SessionConfig::new().with_target_partitions(14))
+        .with_config(SessionConfig::new().with_target_partitions(
+            std::env::var("PARTITIONS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(14),
+        ))
         .with_default_features();
     if matches!(rules.as_str(), "all" | "dedupe") {
         builder = builder

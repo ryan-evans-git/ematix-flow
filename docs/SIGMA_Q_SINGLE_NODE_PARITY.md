@@ -113,7 +113,8 @@ Status legend:
 
 | ID | Lever | Status | Notes |
 |---|---|---|---|
-| L1 | **Extend Σ.N.d rule to SUM-by-i64-key aggregate** | 🟡 IN PROGRESS (highest priority) | Σ.Q.0 profile finds Q18 dominated by FinalPartitioned `sum(f64) gby i64` at 15M cardinality. Current Σ.N.d matcher only fires on `COUNT(*) gby i64` (Q12 shape). Extend matcher; bench Q18 + Q01/Q03 (similar shapes possible). |
+| L1 | **Auto-scale target_partitions by data size** | 🟡 IN PROGRESS (free lever) | Q18 SF=10 partition sweep: 14→719ms, 28→593ms (-19%), 56→580ms, 112→629ms, 224→774ms. SF=1 Q18: 14→49ms, 28→48ms (no regression). Cheapest possible lever — single config knob. Need: shape-autotune rule that scales partitions with total data size. |
+| L1b | Extend Σ.N.d rule to SUM-by-i64-key aggregate | 🔵 PROPOSED (deferred — requires RobinHoodI64F64 table) | RobinHood currently only has I64→u64 (for COUNT). For SUM(f64), need a new I64→f64 variant. Larger lever; defer until L1 lands and we see remaining Q18 gap. |
 | L2 | **LeftSemi join swap-build-side** | 🔵 PROPOSED (high priority) | Q18 LeftSemi appears inverted: builds hash on 60M rows, probes with 624. Should be reversed. Verify by reading HashJoinExec swap rules + force the swap. |
 | L3 | Multi-column parallel decode (task #397) | ⚫ DEPRIORITIZED for Q18 | Q18 decode is 230ms / 700ms = 33% — not the dominant cost. Re-evaluate after L1/L2 land; might matter for Q01/Q03 (more scan-bound). |
 | L4 | Bloom-on-build for HashJoinExec | 🔵 PROPOSED | Σ.J.2 infra exists. Q07/Q21 might benefit. Less urgent than L1/L2 because Q18 isn't bloom-prunable (semi-join already does the work). |
