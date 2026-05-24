@@ -188,6 +188,12 @@ pub mod robin_hood_agg_rule;
 // Sibling to robin_hood_agg's COUNT(*) variant; targets Q18 SF=10's
 // FinalPartitioned sum(l_quantity) GROUP BY l_orderkey at 15M card.
 pub mod robin_hood_sum_f64_exec;
+// Σ.R.2 (2026-05-24): AVG(f64) GROUP BY i64 operator + opt-in rule.
+// Sister to robin_hood_sum_f64_exec; targets Q17 SF=10's
+// FinalPartitioned avg(l_quantity) GROUP BY l_partkey at ~2M card
+// where the Σ.Q closeout profile pinned GroupValuesPrimitive::intern
+// at 21.6% self time.
+pub mod robin_hood_avg_f64_exec;
 // Σ.J.2.b.vi (2026-05-22): per-request PhysicalOptimizerRule that
 // walks the plan, finds EmatixFastParquetExec scans whose
 // `<table>.<col>` uuid matches a build-side bloom in ContextBlooms,

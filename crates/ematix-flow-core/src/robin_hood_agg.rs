@@ -744,6 +744,465 @@ impl RobinHoodSumF64Agg {
 }
 
 // ---------------------------------------------------------------------
+// Σ.R.2 — Robin Hood hash table specialised for i64 keys + (sum f64,
+// count u64) tuples. Targets the Q17 SF=10 hot kernel: AVG(f64) GROUP
+// BY i64 at ~2M cardinality, where the Σ.Q closeout profile pinned
+// DataFusion's `GroupValuesPrimitive::intern` at 21.6% self time.
+//
+// Sister to `RobinHoodI64F64`. Same probe / load / grow strategy; the
+// bucket simply carries an extra `count` so the Partial stage can
+// emit both pieces of AVG state and the FinalPartitioned stage can
+// merge two (sum, count) pairs without recomputing.
+// ---------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy)]
+struct BucketAvgF64 {
+    key: i64,
+    sum: f64,
+    count: u64,
+    /// Probe distance from ideal slot. `EMPTY_PSL` = vacant.
+    psl: u32,
+}
+
+impl BucketAvgF64 {
+    const fn empty() -> Self {
+        Self {
+            key: 0,
+            sum: 0.0,
+            count: 0,
+            psl: EMPTY_PSL,
+        }
+    }
+    fn is_empty(&self) -> bool {
+        self.psl == EMPTY_PSL
+    }
+}
+
+/// Σ.R.2 — Robin Hood hash table for AVG(f64) GROUP BY i64. Buckets
+/// store (sum, count); callers compute `sum/count` on the way out.
+pub struct RobinHoodI64AvgF64 {
+    buckets: Vec<BucketAvgF64>,
+    mask: usize,
+    len: usize,
+}
+
+impl Default for RobinHoodI64AvgF64 {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RobinHoodI64AvgF64 {
+    pub fn new() -> Self {
+        Self::with_capacity(INITIAL_CAPACITY)
+    }
+
+    pub fn with_capacity(cap: usize) -> Self {
+        let cap = cap.max(INITIAL_CAPACITY).next_power_of_two();
+        Self {
+            buckets: vec![BucketAvgF64::empty(); cap],
+            mask: cap - 1,
+            len: 0,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.buckets.len()
+    }
+
+    pub fn clear(&mut self) {
+        for b in &mut self.buckets {
+            *b = BucketAvgF64::empty();
+        }
+        self.len = 0;
+    }
+
+    /// Σ.R.2 — Partial-stage entry. If `key` is present, adds `value`
+    /// to the existing sum and increments count. Otherwise inserts
+    /// (key, sum=value, count=1).
+    pub fn insert_or_update(&mut self, key: i64, value: f64) {
+        if self.needs_grow() {
+            self.grow();
+        }
+        let h = hash_i64(key);
+        let mut slot = h & self.mask;
+        let mut incoming = BucketAvgF64 {
+            key,
+            sum: value,
+            count: 1,
+            psl: 0,
+        };
+        loop {
+            let b = self.buckets[slot];
+            if b.is_empty() {
+                self.buckets[slot] = incoming;
+                self.len += 1;
+                return;
+            }
+            if b.key == incoming.key {
+                // Same-key accumulate: merge incoming into existing,
+                // don't displace.
+                self.buckets[slot].sum = b.sum + incoming.sum;
+                self.buckets[slot].count = b.count + incoming.count;
+                return;
+            }
+            if incoming.psl > b.psl {
+                self.buckets[slot] = incoming;
+                incoming = b;
+            }
+            slot = (slot + 1) & self.mask;
+            incoming.psl = incoming.psl.saturating_add(1);
+        }
+    }
+
+    /// Σ.R.2 — FinalPartitioned-stage entry. Merges a (partial_sum,
+    /// partial_count) pair for `key`. If `key` is present, adds both
+    /// fields; otherwise inserts as-is.
+    pub fn insert_or_merge(&mut self, key: i64, partial_sum: f64, partial_count: u64) {
+        if self.needs_grow() {
+            self.grow();
+        }
+        let h = hash_i64(key);
+        let mut slot = h & self.mask;
+        let mut incoming = BucketAvgF64 {
+            key,
+            sum: partial_sum,
+            count: partial_count,
+            psl: 0,
+        };
+        loop {
+            let b = self.buckets[slot];
+            if b.is_empty() {
+                self.buckets[slot] = incoming;
+                self.len += 1;
+                return;
+            }
+            if b.key == incoming.key {
+                self.buckets[slot].sum = b.sum + incoming.sum;
+                self.buckets[slot].count = b.count + incoming.count;
+                return;
+            }
+            if incoming.psl > b.psl {
+                self.buckets[slot] = incoming;
+                incoming = b;
+            }
+            slot = (slot + 1) & self.mask;
+            incoming.psl = incoming.psl.saturating_add(1);
+        }
+    }
+
+    /// Bulk Partial-stage ingest. Caller should pre-size via
+    /// `with_capacity` for high-cardinality merges.
+    pub fn insert_or_update_batch(&mut self, keys: &[i64], values: &[f64]) {
+        assert_eq!(
+            keys.len(),
+            values.len(),
+            "insert_or_update_batch: keys and values must be same length"
+        );
+        for i in 0..keys.len() {
+            self.insert_or_update(keys[i], values[i]);
+        }
+    }
+
+    /// Σ.R.2 — vectorised batch ingest mirroring the Σ.Q.L1b retry
+    /// 4-stage Photon-style pipeline. Processes input in 1024-row
+    /// chunks: (1) hash all keys, (2) probe primary slot for direct
+    /// hit, (3) fast-path accumulate hits (predicated store, branch-
+    /// free body, autovectorisable), (4) scalar fallback for misses
+    /// via `insert_or_update`. At Robin Hood's 70% load factor the
+    /// expected hit rate on stage 2 is 70-80%.
+    pub fn insert_or_update_batch_vectorised(&mut self, keys: &[i64], values: &[f64]) {
+        assert_eq!(
+            keys.len(),
+            values.len(),
+            "insert_or_update_batch_vectorised: keys and values must be same length"
+        );
+        const VEC_CHUNK: usize = 1024;
+        let n_total = keys.len();
+        if n_total == 0 {
+            return;
+        }
+        let mut slots = [0usize; VEC_CHUNK];
+        let mut hit = [false; VEC_CHUNK];
+
+        let mut off = 0;
+        while off < n_total {
+            let n = (n_total - off).min(VEC_CHUNK);
+            let mask = self.mask;
+
+            // Stage 1: hash all keys.
+            for i in 0..n {
+                slots[i] = hash_i64(keys[off + i]) & mask;
+            }
+
+            // Stage 2: check primary slot for direct hit.
+            for i in 0..n {
+                let s = slots[i];
+                let b = self.buckets[s];
+                hit[i] = !b.is_empty() && b.key == keys[off + i];
+            }
+
+            // Stage 3: fast-path accumulate hits.
+            for i in 0..n {
+                if hit[i] {
+                    self.buckets[slots[i]].sum += values[off + i];
+                    self.buckets[slots[i]].count += 1;
+                }
+            }
+
+            // Stage 4: scalar fallback for misses (insertions +
+            // chained probes). `insert_or_update` may grow the table;
+            // stage 3's in-place writes survive grow() because every
+            // existing bucket is reinserted.
+            for i in 0..n {
+                if !hit[i] {
+                    self.insert_or_update(keys[off + i], values[off + i]);
+                }
+            }
+
+            off += n;
+        }
+    }
+
+    /// Jump-resize to fit at least `target` entries at 70% load.
+    pub fn reserve_to_capacity_pow2_of(&mut self, target: usize) {
+        let target_capacity = (target * MAX_LOAD_FACTOR_DENOMINATOR)
+            .div_ceil(MAX_LOAD_FACTOR_NUMERATOR)
+            .next_power_of_two();
+        while self.buckets.len() < target_capacity {
+            self.grow();
+        }
+    }
+
+    /// Iterate (key, sum, count) — for FinalPartitioned passthrough or
+    /// inspection.
+    pub fn iter_sum_count(&self) -> impl Iterator<Item = (i64, f64, u64)> + '_ {
+        self.buckets
+            .iter()
+            .filter(|b| !b.is_empty())
+            .map(|b| (b.key, b.sum, b.count))
+    }
+
+    /// Iterate (key, avg) — convenience for FinalPartitioned output.
+    /// Yields `sum / count` per bucket.
+    pub fn iter_avg(&self) -> impl Iterator<Item = (i64, f64)> + '_ {
+        self.buckets
+            .iter()
+            .filter(|b| !b.is_empty())
+            .map(|b| (b.key, b.sum / b.count as f64))
+    }
+
+    /// Read-only lookup. Returns Some((sum, count)) if key present.
+    pub fn get(&self, key: i64) -> Option<(f64, u64)> {
+        if self.buckets.is_empty() {
+            return None;
+        }
+        let h = hash_i64(key);
+        let mut slot = h & self.mask;
+        let mut psl: u32 = 0;
+        loop {
+            let b = self.buckets[slot];
+            if b.is_empty() {
+                return None;
+            }
+            if b.key == key {
+                return Some((b.sum, b.count));
+            }
+            if psl > b.psl {
+                return None;
+            }
+            slot = (slot + 1) & self.mask;
+            psl = psl.saturating_add(1);
+            if psl as usize >= self.buckets.len() {
+                return None;
+            }
+        }
+    }
+
+    /// Convenience: returns Some(sum/count) if key present.
+    pub fn average(&self, key: i64) -> Option<f64> {
+        self.get(key).map(|(s, c)| s / c as f64)
+    }
+
+    fn needs_grow(&self) -> bool {
+        self.len * MAX_LOAD_FACTOR_DENOMINATOR >= self.buckets.len() * MAX_LOAD_FACTOR_NUMERATOR
+    }
+
+    fn grow(&mut self) {
+        let new_cap = self.buckets.len() * 2;
+        let old = std::mem::replace(&mut self.buckets, vec![BucketAvgF64::empty(); new_cap]);
+        self.mask = new_cap - 1;
+        self.len = 0;
+        for b in old {
+            if !b.is_empty() {
+                // Re-insert preserving (sum, count) — go through
+                // `insert_or_merge` so the bucket lands at the right
+                // slot in the new table.
+                self.insert_or_merge(b.key, b.sum, b.count);
+            }
+        }
+    }
+}
+
+/// Σ.R.2 — streaming `AVG(f64) GROUP BY i64` aggregator. Sister to
+/// `RobinHoodSumF64Agg`. Partial-stage callers invoke `ingest_batch`
+/// (or `ingest_batch_vectorised`); FinalPartitioned callers invoke
+/// `ingest_partials` with two state columns (Float64 sums + UInt64
+/// counts).
+pub struct RobinHoodAvgF64Agg {
+    table: RobinHoodI64AvgF64,
+}
+
+impl Default for RobinHoodAvgF64Agg {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RobinHoodAvgF64Agg {
+    pub fn new() -> Self {
+        Self {
+            table: RobinHoodI64AvgF64::new(),
+        }
+    }
+
+    pub fn with_capacity(cap: usize) -> Self {
+        Self {
+            table: RobinHoodI64AvgF64::with_capacity(cap),
+        }
+    }
+
+    /// Partial-stage ingest. Skips rows where either column is null —
+    /// SQL `AVG GROUP BY` drops NULL keys and NULL value rows don't
+    /// contribute to the average.
+    pub fn ingest_batch(
+        &mut self,
+        keys: &arrow_array::Int64Array,
+        values: &arrow_array::Float64Array,
+    ) {
+        use arrow_array::Array;
+        assert_eq!(
+            keys.len(),
+            values.len(),
+            "ingest_batch: key and value arrays must be same length"
+        );
+        let n = keys.len();
+        if keys.null_count() == 0 && values.null_count() == 0 {
+            for i in 0..n {
+                self.table.insert_or_update(keys.value(i), values.value(i));
+            }
+        } else {
+            for i in 0..n {
+                if !keys.is_null(i) && !values.is_null(i) {
+                    self.table.insert_or_update(keys.value(i), values.value(i));
+                }
+            }
+        }
+    }
+
+    /// Vectorised Partial-stage ingest. Routes to
+    /// [`RobinHoodI64AvgF64::insert_or_update_batch_vectorised`] when
+    /// both columns are null-free; otherwise falls back to the per-row
+    /// null-aware scalar path.
+    pub fn ingest_batch_vectorised(
+        &mut self,
+        keys: &arrow_array::Int64Array,
+        values: &arrow_array::Float64Array,
+    ) {
+        use arrow_array::Array;
+        assert_eq!(
+            keys.len(),
+            values.len(),
+            "ingest_batch_vectorised: key and value arrays must be same length"
+        );
+        if keys.null_count() == 0 && values.null_count() == 0 {
+            self.table
+                .insert_or_update_batch_vectorised(keys.values(), values.values());
+        } else {
+            let n = keys.len();
+            for i in 0..n {
+                if !keys.is_null(i) && !values.is_null(i) {
+                    self.table.insert_or_update(keys.value(i), values.value(i));
+                }
+            }
+        }
+    }
+
+    /// FinalPartitioned-stage ingest. Consumes a batch of (group_key,
+    /// partial_sum, partial_count) and merges each row into the
+    /// table. Null keys are skipped; a null in either state column
+    /// while the other is present is treated as 0 (preserves the
+    /// other side's contribution) — matches DataFusion's
+    /// `AvgGroupsAccumulator::merge` semantics.
+    pub fn ingest_partials(
+        &mut self,
+        keys: &arrow_array::Int64Array,
+        partial_sums: &arrow_array::Float64Array,
+        partial_counts: &arrow_array::UInt64Array,
+    ) {
+        use arrow_array::Array;
+        assert_eq!(keys.len(), partial_sums.len());
+        assert_eq!(keys.len(), partial_counts.len());
+        let n = keys.len();
+        if keys.null_count() == 0
+            && partial_sums.null_count() == 0
+            && partial_counts.null_count() == 0
+        {
+            for i in 0..n {
+                self.table.insert_or_merge(
+                    keys.value(i),
+                    partial_sums.value(i),
+                    partial_counts.value(i),
+                );
+            }
+        } else {
+            for i in 0..n {
+                if keys.is_null(i) {
+                    continue;
+                }
+                let s = if partial_sums.is_null(i) {
+                    0.0
+                } else {
+                    partial_sums.value(i)
+                };
+                let c = if partial_counts.is_null(i) {
+                    0
+                } else {
+                    partial_counts.value(i)
+                };
+                if c > 0 {
+                    self.table.insert_or_merge(keys.value(i), s, c);
+                }
+            }
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.table.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.table.is_empty()
+    }
+
+    pub fn table(&self) -> &RobinHoodI64AvgF64 {
+        &self.table
+    }
+
+    pub fn table_mut(&mut self) -> &mut RobinHoodI64AvgF64 {
+        &mut self.table
+    }
+}
+
+// ---------------------------------------------------------------------
 // Σ.R.1 — radix-partitioned `SUM(f64) GROUP BY i64` aggregator.
 //
 // Cache-conscious aggregation à la DuckDB MorselDrivenParallelism:
@@ -2820,5 +3279,261 @@ mod tests {
         assert_eq!(agg.table().get(1), Some(10.0));
         assert_eq!(agg.table().get(2), Some(7.0));
         assert_eq!(agg.table().get(3), Some(4.0));
+    }
+
+    // ---- Σ.R.2.a — RobinHoodI64AvgF64 + RobinHoodAvgF64Agg tests ----
+    //
+    // Sister to the Σ.Q.L1b RobinHoodI64F64 / RobinHoodSumF64Agg tests.
+    // Targets the Q17 SF=10 hot kernel: AVG(f64) GROUP BY i64. The
+    // bucket now carries (sum: f64, count: u64) so the operator can
+    // emit Partial state directly, and the FinalPartitioned stage can
+    // merge two (sum, count) pairs without recomputing.
+
+    #[test]
+    fn avg_f64_insert_first_row_seeds_sum_and_count() {
+        let mut t = RobinHoodI64AvgF64::new();
+        t.insert_or_update(42, 1.5);
+        let (sum, count) = t.get(42).expect("present");
+        assert_eq!(sum, 1.5);
+        assert_eq!(count, 1);
+        assert_eq!(t.len(), 1);
+    }
+
+    #[test]
+    fn avg_f64_second_row_accumulates_sum_and_count() {
+        let mut t = RobinHoodI64AvgF64::new();
+        t.insert_or_update(7, 2.25);
+        t.insert_or_update(7, 0.75);
+        let (sum, count) = t.get(7).expect("present");
+        assert_eq!(sum, 3.0);
+        assert_eq!(count, 2);
+        assert_eq!(t.len(), 1, "same key must not create a second bucket");
+    }
+
+    #[test]
+    fn avg_f64_average_helper_is_sum_over_count() {
+        let mut t = RobinHoodI64AvgF64::new();
+        t.insert_or_update(1, 10.0);
+        t.insert_or_update(1, 20.0);
+        t.insert_or_update(1, 30.0);
+        // AVG(10, 20, 30) = 20.0
+        let avg = t.average(1).expect("present");
+        assert!((avg - 20.0).abs() < 1e-12, "got {avg}");
+    }
+
+    #[test]
+    fn avg_f64_get_missing_returns_none() {
+        let t = RobinHoodI64AvgF64::new();
+        assert!(t.get(99).is_none());
+        assert!(t.average(99).is_none());
+    }
+
+    #[test]
+    fn avg_f64_grows_past_initial_capacity() {
+        let mut t = RobinHoodI64AvgF64::with_capacity(64);
+        for k in 0..1024i64 {
+            t.insert_or_update(k, k as f64 * 0.5);
+        }
+        assert_eq!(t.len(), 1024);
+        // Spot-check a few keys survived the grow chain.
+        assert_eq!(t.get(0), Some((0.0, 1)));
+        assert_eq!(t.get(500), Some((250.0, 1)));
+        assert_eq!(t.get(1023), Some((511.5, 1)));
+    }
+
+    #[test]
+    fn avg_f64_merge_partial_seeds_then_accumulates() {
+        // FinalPartitioned-stage simulation: feed (sum, count) pairs and
+        // verify they merge correctly across batches.
+        let mut t = RobinHoodI64AvgF64::new();
+        t.insert_or_merge(10, 100.0, 4);
+        t.insert_or_merge(10, 50.0, 1);
+        t.insert_or_merge(11, 7.5, 3);
+        assert_eq!(t.get(10), Some((150.0, 5)));
+        assert_eq!(t.get(11), Some((7.5, 3)));
+        // average(10) = 150.0 / 5 = 30.0
+        assert!((t.average(10).unwrap() - 30.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn avg_f64_iter_yields_all_keys() {
+        let mut t = RobinHoodI64AvgF64::new();
+        t.insert_or_update(1, 1.0);
+        t.insert_or_update(2, 2.0);
+        t.insert_or_update(3, 3.0);
+        t.insert_or_update(2, 4.0);
+        let mut entries: Vec<(i64, f64, u64)> = t.iter_sum_count().collect();
+        entries.sort_by_key(|(k, _, _)| *k);
+        assert_eq!(entries, vec![(1, 1.0, 1), (2, 6.0, 2), (3, 3.0, 1)]);
+    }
+
+    #[test]
+    fn avg_f64_agg_ingest_batch_no_nulls() {
+        use arrow_array::{Float64Array, Int64Array};
+        let keys = Int64Array::from(vec![1i64, 2, 1, 3, 2, 1]);
+        let vals = Float64Array::from(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let mut agg = RobinHoodAvgF64Agg::with_capacity(8);
+        agg.ingest_batch(&keys, &vals);
+        assert_eq!(agg.table().get(1), Some((10.0, 3))); // 1+3+6
+        assert_eq!(agg.table().get(2), Some((7.0, 2))); // 2+5
+        assert_eq!(agg.table().get(3), Some((4.0, 1)));
+    }
+
+    #[test]
+    fn avg_f64_agg_skips_null_keys_and_values() {
+        use arrow_array::{Float64Array, Int64Array};
+        let keys = Int64Array::from(vec![Some(1i64), None, Some(1), Some(2)]);
+        let vals = Float64Array::from(vec![Some(1.0), Some(2.0), None, Some(4.0)]);
+        let mut agg = RobinHoodAvgF64Agg::new();
+        agg.ingest_batch(&keys, &vals);
+        // Row 0 (k=1, v=1.0) and row 3 (k=2, v=4.0) contribute; rows 1+2 skipped.
+        assert_eq!(agg.table().get(1), Some((1.0, 1)));
+        assert_eq!(agg.table().get(2), Some((4.0, 1)));
+        assert_eq!(agg.table().len(), 2);
+    }
+
+    #[test]
+    fn avg_f64_agg_merge_partials_no_nulls() {
+        use arrow_array::{Float64Array, Int64Array, UInt64Array};
+        // Simulate two upstream Partial outputs being merged at the Final.
+        let keys = Int64Array::from(vec![1i64, 2, 1, 3]);
+        let sums = Float64Array::from(vec![10.0, 20.0, 5.0, 7.0]);
+        let counts = UInt64Array::from(vec![4u64, 5, 1, 2]);
+        let mut agg = RobinHoodAvgF64Agg::new();
+        agg.ingest_partials(&keys, &sums, &counts);
+        assert_eq!(agg.table().get(1), Some((15.0, 5)));
+        assert_eq!(agg.table().get(2), Some((20.0, 5)));
+        assert_eq!(agg.table().get(3), Some((7.0, 2)));
+    }
+
+    #[test]
+    fn avg_f64_q17_shape_matches_scalar_sum_count() {
+        // Q17-like: 2K distinct keys × 30 rows/key = 60K rows.
+        let n_groups = 2_000i64;
+        let rows_per_group = 30usize;
+        let mut keys: Vec<i64> = Vec::new();
+        let mut vals: Vec<f64> = Vec::new();
+        for k in 0..n_groups {
+            for r in 0..rows_per_group {
+                keys.push(k);
+                vals.push((r as f64 + 1.0) * 7.0);
+            }
+        }
+        let key_arr = arrow_array::Int64Array::from(keys);
+        let val_arr = arrow_array::Float64Array::from(vals);
+        let mut agg = RobinHoodAvgF64Agg::with_capacity(n_groups as usize * 2);
+        agg.ingest_batch(&key_arr, &val_arr);
+        // Per-group sum = 7 * (1+2+...+30) = 7 * 465 = 3255; count = 30.
+        for k in 0..n_groups {
+            assert_eq!(agg.table().get(k), Some((3255.0, 30)));
+        }
+    }
+
+    // ----- Σ.R.2.a vectorised batch ingest -----
+
+    fn avg_scalar_then_vec_state(
+        keys: &[i64],
+        vals: &[f64],
+        cap: usize,
+    ) -> (Vec<(i64, f64, u64)>, Vec<(i64, f64, u64)>) {
+        let mut scalar = RobinHoodI64AvgF64::with_capacity(cap);
+        for i in 0..keys.len() {
+            scalar.insert_or_update(keys[i], vals[i]);
+        }
+        let mut scalar_state: Vec<(i64, f64, u64)> = scalar.iter_sum_count().collect();
+        scalar_state.sort_by_key(|(k, _, _)| *k);
+
+        let mut vec_path = RobinHoodI64AvgF64::with_capacity(cap);
+        vec_path.insert_or_update_batch_vectorised(keys, vals);
+        let mut vec_state: Vec<(i64, f64, u64)> = vec_path.iter_sum_count().collect();
+        vec_state.sort_by_key(|(k, _, _)| *k);
+
+        (scalar_state, vec_state)
+    }
+
+    #[test]
+    fn avg_vec_batch_empty_input_is_noop() {
+        let mut t = RobinHoodI64AvgF64::new();
+        t.insert_or_update_batch_vectorised(&[], &[]);
+        assert_eq!(t.len(), 0);
+    }
+
+    #[test]
+    fn avg_vec_batch_single_row_seeds() {
+        let mut t = RobinHoodI64AvgF64::new();
+        t.insert_or_update_batch_vectorised(&[42], &[3.14]);
+        assert_eq!(t.get(42), Some((3.14, 1)));
+    }
+
+    #[test]
+    fn avg_vec_batch_matches_scalar_low_cardinality() {
+        let keys = vec![1i64, 2, 1, 3, 2, 1, 5, 5];
+        let vals = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        let (scalar, vec_path) = avg_scalar_then_vec_state(&keys, &vals, 64);
+        assert_eq!(scalar, vec_path);
+    }
+
+    #[test]
+    fn avg_vec_batch_matches_scalar_high_cardinality() {
+        // 5K distinct keys, 4 rows each → 20K input rows.
+        let mut keys = Vec::new();
+        let mut vals = Vec::new();
+        for k in 0..5_000i64 {
+            for r in 0..4 {
+                keys.push(k);
+                vals.push(k as f64 + r as f64 * 0.25);
+            }
+        }
+        let (scalar, vec_path) = avg_scalar_then_vec_state(&keys, &vals, 8_192);
+        assert_eq!(scalar.len(), 5_000);
+        assert_eq!(scalar, vec_path);
+    }
+
+    #[test]
+    fn avg_vec_batch_spans_multiple_1024_chunks() {
+        // 3 full chunks + a partial. Forces the off-loop branch +
+        // ensures hits found in chunk N still accumulate when keys
+        // recur in chunk N+1.
+        let n = 1024 * 3 + 257;
+        let mut keys = Vec::with_capacity(n);
+        let mut vals = Vec::with_capacity(n);
+        for i in 0..n {
+            keys.push((i % 137) as i64);
+            vals.push(i as f64 * 0.5);
+        }
+        let (scalar, vec_path) = avg_scalar_then_vec_state(&keys, &vals, 256);
+        assert_eq!(scalar, vec_path);
+    }
+
+    #[test]
+    fn avg_agg_vec_ingest_no_nulls_matches_scalar() {
+        use arrow_array::{Float64Array, Int64Array};
+        let keys = Int64Array::from((0..2_000i64).chain(0..2_000i64).collect::<Vec<_>>());
+        let vals = Float64Array::from(
+            (0..2_000)
+                .map(|i| i as f64 * 0.5)
+                .chain((0..2_000).map(|i| i as f64 * 0.5 + 1.0))
+                .collect::<Vec<_>>(),
+        );
+        let mut scalar = RobinHoodAvgF64Agg::new();
+        scalar.ingest_batch(&keys, &vals);
+        let mut vectorised = RobinHoodAvgF64Agg::new();
+        vectorised.ingest_batch_vectorised(&keys, &vals);
+        for k in 0..2_000i64 {
+            assert_eq!(scalar.table().get(k), vectorised.table().get(k), "k={k}");
+        }
+    }
+
+    #[test]
+    fn avg_agg_vec_ingest_with_nulls_falls_back_to_scalar() {
+        use arrow_array::{Float64Array, Int64Array};
+        let keys = Int64Array::from(vec![Some(1i64), None, Some(1), Some(2)]);
+        let vals = Float64Array::from(vec![Some(1.0), Some(2.0), None, Some(4.0)]);
+        let mut vectorised = RobinHoodAvgF64Agg::new();
+        vectorised.ingest_batch_vectorised(&keys, &vals);
+        // Same expected state as the null-aware scalar path.
+        assert_eq!(vectorised.table().get(1), Some((1.0, 1)));
+        assert_eq!(vectorised.table().get(2), Some((4.0, 1)));
+        assert_eq!(vectorised.table().len(), 2);
     }
 }

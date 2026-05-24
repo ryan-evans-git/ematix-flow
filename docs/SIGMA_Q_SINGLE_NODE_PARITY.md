@@ -814,3 +814,117 @@ Sister repo (ematix-parquet, `feat/compression-hygiene`):
 ```
 bc8c4c3 perf: bench_varint regression guard + negative-result documentation
 ```
+
+---
+
+## 2026-05-24 session — Σ.R.2 RobinHoodAvgF64Exec REJECTED
+
+### Build
+
+TDD bundle landed across three slices in one session (4 hours, not 6-10
+as the closeout estimated — most of the savings came from copying the
+`RobinHoodSumF64Exec` pattern verbatim with bucket-shape changes):
+
+| Slice | Module | LOC | Tests |
+|-------|--------|-----|-------|
+| Σ.R.2.a kernel | [robin_hood_agg.rs](../crates/ematix-flow-core/src/robin_hood_agg.rs) (+715) | `RobinHoodI64AvgF64` (bucket = `(key i64, sum f64, count u64, psl u32)`) + `RobinHoodAvgF64Agg` streaming agg, vectorised + scalar paths | 18 unit |
+| Σ.R.2.b exec + Σ.R.2.c rule | [robin_hood_avg_f64_exec.rs](../crates/ematix-flow-core/src/robin_hood_avg_f64_exec.rs) (new, 624) | `RobinHoodAvgF64Exec(Partial → (k, sum, count); FinalPartitioned → (k, avg))` + `EnableRobinHoodAvgF64Rule` opt-in via `install_robin_hood_avg_f64_rule` | 5 integration |
+| Σ.R.2.d bench | [sigma_r2_q17_ab.rs](../crates/ematix-flow-core/examples/sigma_r2_q17_ab.rs) | Q17 SF=10 5×2 A/B harness with plan-check sanity, OFF #1 → ON → OFF #2 ordering to spot drift | n/a |
+
+All 952 crate-wide tests pass. Operator + rule are opt-in only (per
+[[optimizer-codegen-sensitivity]]); env toggles `EMAT_RH_AVG_F64_VEC`
+and `EMAT_RH_AVG_F64_INIT_CAP`.
+
+### Q17 SF=10 gate result — REJECTED
+
+5 trials × 2 warmup, M3 Pro, release+LTO. Plan check confirmed
+`RobinHoodAvgF64Exec` is present under ON, absent under OFF.
+
+| Config | OFF #1 (ms) | ON (ms) | OFF #2 (ms) | Δ vs OFF #1 |
+|---|---:|---:|---:|---:|
+| Default (vec=on, init_cap=auto) | 410.5 | 603.2 | 412.2 | **+46.9%** |
+| `EMAT_RH_AVG_F64_VEC=0` (scalar) | 422.0 | 638.9 | 411.8 | **+51.4%** |
+| `EMAT_RH_AVG_F64_INIT_CAP=4194304` (pre-sized for 2M groups) | 407.7 | 570.8 | 399.1 | **+40.0%** |
+
+Three independent dials confirm a +40-55% regression. The pre-sized
+table modestly lessens the gap (no grow chain), but the operator is
+still 163 ms slower than DataFusion's stock AVG kernel on Q17. Pre-gate
+threshold was ≥10% improvement; we are firmly on the wrong side. **22q
+SF=10 publishable run skipped.**
+
+### Why it fails — split-vs-fused pipeline shape
+
+The Σ.Q profile correctly identified `GroupValuesPrimitive::intern` at
+21.6% self time. The mistake was assuming the SUM-operator pattern
+("hash + probe + accumulate inside the bucket, one row at a time")
+would transfer at Q17's cardinality (~2M distinct `l_partkey`).
+
+DataFusion's stock AVG pipeline splits the work into two SIMD-amenable
+batch passes:
+
+1. `GroupValuesPrimitive::intern(keys)` — hash-and-lookup over the
+   whole batch, returns a `Vec<group_idx>`.
+2. `AvgGroupsAccumulator::update_batch(values, group_indices)` —
+   indexed scatter: `sums[g[i]] += values[i]; counts[g[i]] += 1`.
+
+Each pass is tight and L1-resident. The accumulator arrays live
+contiguously in DRAM; the group_idx pass touches them sequentially.
+
+Our pipeline fuses both inside `insert_or_update`:
+
+1. Hash key, probe primary slot, possibly chain.
+2. Accumulate into the matched bucket (sum += value, count += 1)
+   **in the same loop**.
+
+At 2M groups × 32 B/bucket = 64 MB the table blows L2 (24 MB on M3
+Pro), so every per-row probe pulls a cold cache line. The vectorised
+4-stage variant doesn't help because Stage 4 (chained probes for non-
+primary-slot keys) still pays the cold-cache cost row-by-row, and at a
+non-empty table the Stage 2 primary-hit rate is just the 70%-load
+bound — Stage 4 still fires for ~30% of rows.
+
+**Lesson**: 21.6% self time in `GroupValuesPrimitive` does NOT mean
+"replace it and reclaim 21.6%." Most of that share is the unavoidable
+hash-and-lookup that any replacement also pays. The remaining ~5% is
+accumulator merge work that's already SIMD-optimal in DataFusion. The
+profile pointed at a high-share kernel; it did not predict whether
+replacing it with the SUM pattern would win.
+
+This is the AVG-specific analogue of the Σ.Q.L11 / Σ.Q.L12 lesson —
+plan-marker / profile-driven hypotheses still need a cheap kernel-
+level A/B before committing to the operator build.
+
+### What stays
+
+The operator + rule + tests + bench are all kept, opt-in via
+`install_robin_hood_avg_f64_rule`. They are:
+
+- **Reusable infra** for a future SoA-layout redesign that splits the
+  hash table from the accumulator arrays (matches DataFusion's
+  pipeline shape, may win when the accumulator vectors are i64/u64
+  rather than f64). Worth retrying if the underlying GroupValuesPrim
+  changes shape upstream.
+- **Regression guard** — the 23 unit + integration tests verify the
+  kernel's correctness against DataFusion stock at multiple
+  cardinality / partition shapes, useful if anyone tries this lever
+  again.
+
+### Decision: where next
+
+| Option | Why considered | Why not now |
+|---|---|---|
+| Σ.R.2 fused operator | profile-identified | rejected this session, +40% Q17 |
+| Σ.R.2′ SoA-layout redesign (split intern from accumulate) | matches DF pipeline, may close the gap | ~3-5 more days of work for an uncertain 60ms win; not the next-best EV |
+| **Q06 SF=10 decoder lever** | scan-bound, 14ms gap, single-table | clearest, smallest-scope win; ematix-parquet sibling repo |
+| Σ.L adaptive-runtime (Q05) | structural | multi-week phase, deferred per closeout |
+
+Next-session pick: **Q06 SF=10 decoder lever** in the
+[[ematix-parquet-repo]] sibling. Smaller scope, clearer profile-to-fix
+mapping than another GroupValuesPrimitive attempt.
+
+### Commit chronology
+
+```
+(this session, pending) Σ.R.2.a kernel + Σ.R.2.b/c exec+rule + Σ.R.2.d bench
+                        — REJECTED Q17 SF=10 +40-55%; kept opt-in
+```
