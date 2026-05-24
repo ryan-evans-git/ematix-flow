@@ -53,11 +53,20 @@
 //!    this gates IN lineitem (60M), orders (15M); gates OUT supplier
 //!    (100K), customer (1.5M just barely), part (2M).
 //!
-//! Phase 1 scope additionally restricts the dim subtree to a shallow
-//! shape (`Filter → TableScan` or `Filter → Projection → TableScan`).
-//! Phase 2 lifts this to follow one level of Inner Join descent so
-//! `nation ⋈ region` shapes can serve as the dim. Phase 3 lifts the
-//! depth cap entirely.
+//! Phase 1 scope restricts the dim subtree to a shallow shape
+//! (`Filter → TableScan` or `Filter → Projection → TableScan`).
+//!
+//! ## Slice 2 (rejected 2026-05-23)
+//!
+//! Extending `dim_subtree_has_filter` to recurse through one level of
+//! Inner Join (to cover Q07's `nation_filtered ⋈ supplier` cascade)
+//! was attempted at SF=10. Result: 22q geomean degraded 0.80 → 1.02
+//! (catastrophic regression). Q07 went from 159 ms → 187 ms (target
+//! ≤145), Q08 from 202 ms → 272 ms (target ≤190). Root causes:
+//! double-evaluation of joined dim subtree (DataFusion's CSE doesn't
+//! share Join outputs), over-firing on shapes that don't benefit, and
+//! the codegen-sensitivity tax compounding on top. See `[[sigma-qm-slice2-rejected]]`
+//! in memory. Slice 1 (shallow Filter→Scan) stays as opt-in infra.
 //!
 //! ## Opt-in
 //!
@@ -73,7 +82,7 @@ use datafusion::common::stats::Precision;
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::logical_expr::expr::Expr;
-use datafusion::logical_expr::{Join, JoinType, LogicalPlan, TableScan};
+use datafusion::logical_expr::{Join, JoinType, LogicalPlan};
 use datafusion::optimizer::{OptimizerConfig, OptimizerRule};
 
 /// Σ.Q.M Phase 1: fact-class threshold. Tables smaller than this don't
@@ -273,20 +282,20 @@ fn base_table_rows(plan: &LogicalPlan) -> Option<usize> {
     max_rows
 }
 
-/// Phase 1 detection: walk `dim_subtree` looking for a `Filter` node.
-/// Restricted to shallow shapes — descends through Projection /
-/// SubqueryAlias / Filter / TableScan but NOT through Joins (a Join in
-/// the dim subtree means we're already in Phase 2 territory).
+/// Σ.Q.M Phase 1 detection: walk `dim_subtree` looking for a `Filter`
+/// node. Restricted to shallow shapes — descends through Projection /
+/// SubqueryAlias / Filter / TableScan but NOT through Joins.
+///
+/// (Slice 2 — recursing through one level of Inner Join — was tried
+/// and rejected, see module docstring. The match arm for Join stays
+/// `false` to preserve the validated Slice 1 behavior.)
 fn dim_subtree_has_filter(plan: &LogicalPlan) -> bool {
     match plan {
         LogicalPlan::Filter(_) => true,
         LogicalPlan::Projection(p) => dim_subtree_has_filter(p.input.as_ref()),
         LogicalPlan::SubqueryAlias(a) => dim_subtree_has_filter(a.input.as_ref()),
-        // TableScan with no preceding Filter — unfiltered dim.
         LogicalPlan::TableScan(_) => false,
-        // Joins: Phase 1 doesn't recurse. (Phase 2 would.)
         LogicalPlan::Join(_) => false,
-        // Anything else: don't descend.
         _ => false,
     }
 }
@@ -339,29 +348,9 @@ fn expr_signature(e: &Expr) -> String {
     }
 }
 
-/// Walk a plan tree looking for a TableScan. Helper for tests.
-#[cfg(test)]
-fn find_scan<'a>(plan: &'a LogicalPlan, table: &str) -> Option<&'a TableScan> {
-    use std::cell::RefCell;
-    let found: RefCell<Option<&TableScan>> = RefCell::new(None);
-    let _ = plan.apply(|node| {
-        if let LogicalPlan::TableScan(scan) = node {
-            if scan.table_name.table() == table {
-                // SAFETY: borrow lifetime extends through apply().
-                let s: &TableScan = unsafe { std::mem::transmute(scan) };
-                *found.borrow_mut() = Some(s);
-                return Ok(TreeNodeRecursion::Stop);
-            }
-        }
-        Ok(TreeNodeRecursion::Continue)
-    });
-    found.into_inner()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ematix_fast_parquet::EmatixFastParquetTableProvider;
     use crate::fast_parquet::FastParquetTableProvider;
     use datafusion::execution::session_state::SessionStateBuilder;
     use datafusion::prelude::{SessionConfig, SessionContext};
@@ -684,6 +673,7 @@ mod tests {
         );
         assert!(dim_subtree_has_filter(&filter_node));
     }
+
 
     #[test]
     fn expr_signature_column() {
