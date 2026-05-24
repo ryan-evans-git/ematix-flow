@@ -16,6 +16,10 @@
   //   #/dag, #/dag/<n> → cross-job DAG (focused or full)
   // Legacy "#/pipelines" still routes to Jobs for any saved links.
   let route = parseHash(window.location.hash);
+  // Theme state mirrors the data-theme attribute set inline in
+  // index.html (so we avoid a flash of unstyled content). Toggling
+  // here updates both the attribute and localStorage.
+  let theme = "dark";
 
   function parseHash(h) {
     const m = (h || "#/workflows").replace(/^#/, "");
@@ -33,28 +37,51 @@
     return { name: "workflows" };
   }
 
+  function toggleTheme() {
+    const next = theme === "dark" ? "light" : "dark";
+    theme = next;
+    if (next === "light") {
+      document.documentElement.setAttribute("data-theme", "light");
+    } else {
+      document.documentElement.removeAttribute("data-theme");
+    }
+    try { localStorage.setItem("ematix-theme", next); } catch (_) {}
+  }
+
   onMount(() => {
+    theme = document.documentElement.getAttribute("data-theme") === "light" ? "light" : "dark";
     window.addEventListener("hashchange", () => {
       route = parseHash(window.location.hash);
     });
   });
 
-  function navTarget(name) {
-    if (route.name === name) return "active";
-    if (name === "runs" && route.name === "run_detail") return "active";
-    return "";
-  }
+  // Reactive derived flags. Svelte's template can't track function
+  // calls (a navTarget(name) call doesn't re-evaluate on `route`
+  // change), so we materialise the active state into top-level
+  // reactive vars and use `class:active={...}` in the template.
+  $: workflowsActive = route.name === "workflows";
+  $: jobsActive = route.name === "jobs";
+  $: runsActive = route.name === "runs" || route.name === "run_detail";
+  $: dagActive = route.name === "dag";
 </script>
 
 <div class="app">
   <nav class="topbar">
-    <span class="brand">▸ ematix-flow</span>
-    <a href="#/workflows" class={navTarget("workflows")}>Workflows</a>
-    <a href="#/jobs" class={navTarget("jobs")}>Jobs</a>
-    <a href="#/runs" class={navTarget("runs")}>Runs</a>
-    <a href="#/dag" class={navTarget("dag")}>DAG</a>
+    <span class="brand">ematix-flow</span>
+    <a href="#/workflows" class:active={workflowsActive}>Workflows</a>
+    <a href="#/jobs" class:active={jobsActive}>Jobs</a>
+    <a href="#/runs" class:active={runsActive}>Runs</a>
+    <a href="#/dag" class:active={dagActive}>DAG</a>
     <span style="flex: 1"></span>
     <a href="/api/docs" target="_blank" rel="noopener">API Docs ↗</a>
+    <button
+      class="theme-toggle"
+      on:click={toggleTheme}
+      aria-label="Toggle color theme"
+      title={theme === "dark" ? "Switch to light theme" : "Switch to dark theme"}
+    >
+      {theme === "dark" ? "☾" : "☀"}
+    </button>
   </nav>
 
   {#if route.name === "workflows"}

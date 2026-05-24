@@ -3,16 +3,27 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <meta name="color-scheme" content="dark" />
+    <meta name="color-scheme" content="dark light" />
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link
-      href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=VT323&display=swap"
+      href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap"
       rel="stylesheet"
     />
+    <script>
+      // Set theme before first paint to avoid flash. Reads
+      // localStorage; falls back to prefers-color-scheme.
+      (function () {
+        try {
+          var stored = localStorage.getItem("ematix-theme");
+          var theme = stored || (window.matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark");
+          if (theme === "light") document.documentElement.setAttribute("data-theme", "light");
+        } catch (_) {}
+      })();
+    </script>
     <title>ematix-flow</title>
-    <script type="module" crossorigin src="/assets/index-CSRlbzyh.js"></script>
-    <link rel="stylesheet" crossorigin href="/assets/index-CoM1nE09.css">
+    <script type="module" crossorigin src="/assets/index-Bmiq9bjg.js"></script>
+    <link rel="stylesheet" crossorigin href="/assets/index-DMQMKCmv.css">
   </head>
   <body>
     <div id="app"></div>
