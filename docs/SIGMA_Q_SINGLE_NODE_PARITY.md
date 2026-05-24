@@ -661,3 +661,156 @@ flag. Adding a separate rule would compound the codegen tax.
 Records design choices the operator may want to revisit.
 
 (none yet)
+
+---
+
+## 2026-05-23/24 session — Σ.Q.M closeout + profile-guided pivot identified
+
+### Final 22q SF=10 state
+
+| Metric | Value | Source |
+|--------|-------|--------|
+| 22q ematix-flow/DuckDB geomean | **0.80** (ematix 20% faster than DuckDB) | post-L16 baseline |
+| ematix wins | **14/22** | Q04, Q10, Q12, Q13, Q14, Q15 (Polars), Q16, Q17 (no), Q19, Q20, Q22, etc. |
+| Correctness (`tpch_validate`) | **22/22** match DuckDB | cell-level, FP tol 1e-6 |
+| Q05 SF=10 | 188 ms (1.32× DuckDB) | remaining structural gap |
+| Q07 SF=10 | 159 ms (1.17× DuckDB) | acceptable |
+| Q08 SF=10 | 202 ms (1.13× DuckDB) | acceptable |
+| Q17 SF=10 | 215 ms (1.31× DuckDB) | hot kernel identified |
+| Q21 SF=10 | 524 ms (1.30× DuckDB) | similar to Q17 shape |
+
+### Σ.Q.M arc — three negative results
+
+Attempted static-rewrite "redundant LeftSemi injection" — a static
+analogue of DuckDB's dynamic-filter propagation. **All three slices
+proved unviable in DataFusion's plan model.**
+
+| Slice | Result | Commit | Why it failed |
+|-------|--------|--------|---------------|
+| Slice 1: shallow Filter→TableScan detection | Opt-in infra | [301e644](commit) | +3pp regression alone, no Q-level wins |
+| Slice 2: depth-1 Inner Join descent in dim walker | REJECTED | [5b6b4a0](commit) | 22q geomean 0.80 → 1.02 (-27pp); double-eval of joined dim subtree |
+| Slice 4 SPIKE: hardcoded orders→lineitem with minimal extracted dim | REJECTED | uncommitted | Q05 SF=10 188 → 218 ms (+16%); double hash-build (CSE doesn't share Join builds) |
+
+**Conclusion**: every variant of redundant-semi injection pays either
+double-evaluation of a joined dim subtree, double hash-build for the
+same equi-keys, or has to remove a join key (would change Inner
+semantics). DataFusion's `common_subexpression_elimination` does NOT
+share Join outputs or HashJoin build sides — so any "let me re-use
+this dim filter" rewrite ends up paying for the work twice.
+
+### Join-reorder investigation — DataFusion is already correct
+
+Hypothesis going in: Q05's 1.32× gap is because DataFusion picks the
+wrong build/probe sides for the critical `orders ⋈ lineitem` join.
+Mechanism: dump the physical plan with the new `EMAT_DUMP_PLAN=1`
+helper and inspect HashJoinExec mode/side choices.
+
+**Reality**: DataFusion already picks the correct order. The critical
+join is `HashJoinExec(mode=Partitioned, build=customer⋈orders_filtered
+[~2.3M rows], probe=lineitem [60M rows])`. Build is the small
+filtered side, probe is the big fact table. This is what DuckDB does.
+
+**So the gap is elsewhere**: lineitem decodes all 60M rows in the
+probe phase because there's no mechanism to push the build's row
+set into the parquet scan's page-skip. Closing this requires
+adaptive-query-execution: the HashJoinExec build phase must emit a
+bloom (as a side-effect, not a pre-execution pass) that the probe
+scan consumes for actual page-skip. **Σ.L-class work, deferred.**
+
+### Parquet decoder survey — already at LLVM cycle floor
+
+Surveyed `ematix-parquet/crates/ematix-parquet-codec/` for hot-path
+optimization opportunities that haven't been profiled at SF=10.
+Inspected: varint decode, RLE inner loop, BYTE_STREAM_SPLIT, dict
+gather, Snappy literal-run, page header parsing.
+
+Selected Opportunity 1 (varint prefetch). Built `bench_varint`
+microbench. Baseline: 0.70 ns/value for 1-byte (≈2.8 cycles on
+M-series). Attempted two alternative implementations:
+
+| Variant | 1byte ns | mixed ns | 10byte ns |
+|---------|---------:|---------:|----------:|
+| baseline (per-byte read_u8) | **0.70** | **0.75** | **2.25** |
+| fast path `for i in 0..10` + `get_unchecked` | 2.26 | 2.00 | 2.64 |
+| manual 10-step unroll (b0..b9 const shifts) | 2.36 | 1.98 | 2.37 |
+
+**Both regressed**. Reason: LLVM is already eliding the per-byte
+bounds check via inlining + CFG analysis. The baseline's tight
+5-instruction inner loop is at the cycle floor.
+
+**Conclusion**: code-inspection surveys can identify pattern
+candidates but cannot judge LLVM's current optimization state.
+Future opportunistic-wins searches in the decoder should be
+**profile-guided**, not inspection-guided. The bench stays as a
+regression guard.
+
+Sister-repo commits: `bc8c4c3` on `feat/compression-hygiene`
+(ematix-parquet) — bench infra + negative-result documentation.
+
+### Profile-guided pivot — Q17 SF=10 hot kernels
+
+Built `examples/profile_query.rs` (samply-compatible, full DWARF
+debuginfo via `CARGO_PROFILE_RELEASE_DEBUG=true`) at commit
+[35b433c](commit). 30-trial Q17 SF=10 profile, symbol resolution via
+samply's `--unstable-presymbolicate` sidecar.
+
+Top hot kernels by self time (excluding idle):
+
+| Function | Self % | Class | Actionable? |
+|----------|-------:|-------|-------------|
+| `__psynch_cvwait` | 31.8% | OS thread idle | No (pool overhead between trials) |
+| **`GroupValuesPrimitive::intern`** | **21.6%** | DF GROUP BY i64 hash | **YES — top lever** |
+| `snap::decompress::Decoder::decompress` | 9.8% | parquet Snappy | Rejected (hand-roll -12% on Q14) |
+| `AvgGroupsAccumulator::merge` | 5.0% | DF AVG kernel | Overlaps #2 |
+| `arrow_select::take::take_native` | 5.0% | Arrow take | Maybe |
+| `BatchPartitioner::partition_iter` | 2.0% | Hash repartition | Unclear |
+| `hash_single_array` | 1.8% | DF hash function | Unclear |
+| `ematix_parquet_codec::bitpack_neon::unpack_lookup_into_neon_bw6` | 1.5% | parquet bit-unpack | Already SIMD-optimal |
+
+ematix-parquet kernels collectively account for **~3% of self time**
+on Q17 — the decoder is doing its job. The remaining structural gap
+lives in DataFusion's GROUP BY i64 hashing.
+
+### Recommended next session: Σ.R.2 — RobinHoodAvgF64Exec
+
+Profile says the highest-EV remaining lever is replacing DataFusion's
+`GroupValuesPrimitive` (the i64 GROUP BY hash) with a Robin Hood
+variant that handles `AVG(f64) GROUP BY i64` — extending the existing
+[`RobinHoodSumF64Exec`](../crates/ematix-flow-core/src/robin_hood_sum_f64_exec.rs)
+pattern that already wins 1-5% on `SUM(f64)`.
+
+Estimate: ~1700 lines of TDD work across kernel + exec + rule + bench.
+6-10 hours of focused work. Multi-session project.
+
+### Q05 / Σ.L adaptive-runtime — deferred
+
+Q05's 1.32× gap is structurally bounded: closing it requires
+adaptive-query-execution where the HashJoinExec build phase emits a
+bloom (as a side-effect, not a pre-execution pass) that the probe
+scan consumes for page-skip. This is the path DuckDB and Photon take
+internally. Multi-week phase, deferred.
+
+### Infrastructure landed this session
+
+| Item | Location | Purpose |
+|------|----------|---------|
+| `EMAT_DUMP_PLAN=1` env switch | [tpch_validate.rs](../crates/ematix-flow-core/examples/tpch_validate.rs) | Optimized logical + physical plan dump |
+| `profile_query` example | [profile_query.rs](../crates/ematix-flow-core/examples/profile_query.rs) | Samply-compatible per-query profiling |
+| `synthetic_left_semi_rule` (Σ.Q.M Slice 1) | [synthetic_left_semi_rule.rs](../crates/ematix-flow-core/src/synthetic_left_semi_rule.rs) | Opt-in dim→fact LeftSemi producer (inert, kept as infra) |
+| `bench_varint` regression guard | ematix-parquet `feat/compression-hygiene` | Documents LLVM-elided bounds-check baseline (0.70 ns/1-byte) |
+
+### Commit chronology
+
+```
+35b433c profile_query: minimal binary for samply-based per-query profiling
+072b92d tpch_validate: extend EMAT_DUMP_PLAN to include physical plan
+0a4baee tpch_validate: EMAT_DUMP_PLAN env switch for plan-shape investigations
+5b6b4a0 Σ.Q.M Slice 2 REJECTED: depth-1 Inner Join descent regresses 22q SF=10
+301e644 Σ.Q.M Slice 1: SyntheticLeftSemiRule (opt-in) + TableProvider stats
+```
+
+Sister repo (ematix-parquet, `feat/compression-hygiene`):
+
+```
+bc8c4c3 perf: bench_varint regression guard + negative-result documentation
+```
