@@ -32,14 +32,24 @@
 //! "free" data falling out of it.
 
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 use crate::ematix_fast_parquet::ColumnPredicate;
 
 /// Σ.Q.L9 — shared per-query slot for runtime predicates. Cheap to
 /// clone (it's an Arc<RwLock<_>>). Default-empty.
+///
+/// Σ.Q.L16: holds a `tokio::sync::Notify` alongside the predicate slot
+/// so the probe-side scan can await publication with a short timeout.
+/// Pre-L16, the peek raced with publish on 12 of 14 lineitem
+/// partitions in Q17 (small `filtered_part`⋈lineitem build finishes
+/// in ~6 ms; probe partitions started before the bloom was published
+/// and read None). With the timed wait, the probe blocks briefly for
+/// the bloom in the hot, small-build cases.
 #[derive(Debug, Clone, Default)]
 pub struct BridgeFilterSideband {
     inner: Arc<RwLock<Option<Vec<ColumnPredicate>>>>,
+    notify: Arc<tokio::sync::Notify>,
 }
 
 impl BridgeFilterSideband {
@@ -52,6 +62,12 @@ impl BridgeFilterSideband {
     /// wrapper calls this once when its input stream is fully drained.
     pub fn publish(&self, preds: Vec<ColumnPredicate>) {
         *self.inner.write().unwrap() = Some(preds);
+        // Σ.Q.L16 — wake any probe-side scans that are blocked in
+        // `wait_for_publish`. `notify_waiters` is no-op when there
+        // are no waiters and only wakes the currently-parked ones,
+        // which is exactly the semantics we need (each probe waits
+        // at most once before its first poll).
+        self.notify.notify_waiters();
     }
 
     /// Consume the published predicates (if any), leaving the
@@ -71,6 +87,26 @@ impl BridgeFilterSideband {
     /// Has a producer published yet?
     pub fn is_ready(&self) -> bool {
         self.inner.read().unwrap().is_some()
+    }
+
+    /// Σ.Q.L16: await publication, or `timeout`, whichever comes first.
+    /// Returns true if a publish happened (already or during the wait),
+    /// false on timeout. Safe to call multiple times — it short-circuits
+    /// if already published.
+    pub async fn wait_for_publish(&self, timeout: Duration) -> bool {
+        if self.is_ready() {
+            return true;
+        }
+        // Register interest BEFORE re-checking is_ready, to avoid
+        // missing a publish that races between the check and the wait.
+        let notified = self.notify.notified();
+        if self.is_ready() {
+            return true;
+        }
+        tokio::select! {
+            _ = notified => self.is_ready(),
+            _ = tokio::time::sleep(timeout) => self.is_ready(),
+        }
     }
 }
 

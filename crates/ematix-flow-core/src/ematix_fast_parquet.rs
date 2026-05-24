@@ -1914,6 +1914,21 @@ impl ExecutionPlan for EmatixFastParquetExec {
             // that has since completed.
             let mut filter = base_filter;
             if let Some(sb) = &runtime_sideband {
+                // Σ.Q.L16: brief wait for the build-side bloom to be
+                // published. Without this, the probe partitions race
+                // past the build on small-build joins (Q17 SF=10 had
+                // filtered_part = 2K rows building in ~6 ms, but 12 of
+                // 14 lineitem partitions peeked None and ran full
+                // 60 M rows). Default timeout 200 ms — small enough
+                // that big-build joins time out cleanly and proceed
+                // un-bloomed, large enough to absorb fast builds.
+                let timeout_ms: u64 = std::env::var("EMAT_L9_PEEK_TIMEOUT_MS")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(200);
+                let _ = sb
+                    .wait_for_publish(std::time::Duration::from_millis(timeout_ms))
+                    .await;
                 let peeked = sb.peek();
                 if trace_l9 {
                     let path_short = std::path::Path::new(&path_for_async)
