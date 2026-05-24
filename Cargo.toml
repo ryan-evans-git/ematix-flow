@@ -244,11 +244,8 @@ sqlparser = { version = "0.61", features = ["visitor"] }
 lto = "thin"
 codegen-units = 1
 
-# 2026-05-24 — pin to the local ematix-parquet sibling repo (branch
-# `feat/compression-hygiene`, currently ahead of v0.14.0 by unmerged
-# fixes that haven't been cut as v0.15.0 yet). Revert by removing this
-# block when the next ematix-parquet release is on crates.io.
-[patch.crates-io]
-ematix-parquet-codec  = { path = "../ematix-parquet/crates/ematix-parquet-codec" }
-ematix-parquet-format = { path = "../ematix-parquet/crates/ematix-parquet-format" }
-ematix-parquet-io     = { path = "../ematix-parquet/crates/ematix-parquet-io" }
+# ematix-parquet v0.15.0 now on crates.io — patch removed
+# 2026-05-24. Includes the V1 data-page level-prefix fix (#75) and
+# bench_varint regression guard. The flow-core crate's
+# `ematix-parquet-* = "0.15"` pin resolves directly from the
+# registry, no override needed.

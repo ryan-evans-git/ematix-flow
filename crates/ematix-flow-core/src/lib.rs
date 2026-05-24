@@ -245,6 +245,13 @@ pub mod fk_chain;
 // the build-side bloom to each via a per-scan sideband (build runs
 // once; bloom Arc shared). Install via install_cascading_bloom_rule.
 pub mod runtime_bloom_cascading_rule;
+// Σ.U.A (2026-05-24): Apache-Impala-style lane-parallel filter-sum
+// kernel. Generalises the splash-bloom pattern (see `bloom.rs`) to
+// the "M predicate clauses + SUM-of-product" shape that covers Q06,
+// Q14, Q19, and future predicates of the same family. Branchless,
+// fixed-size lane arrays, LLVM auto-vectorises to NEON on aarch64
+// and SSE2/AVX2 on x86_64 — one source-of-truth, two architectures.
+pub mod lane_filter_sum_kernel;
 // Σ.O (2026-05-21): in-memory LRU cache of decoded RecordBatch by
 // (file_path, row_group_idx, projection_hash). Avoids re-decoding
 // the same parquet column chunks across queries in the same session.
