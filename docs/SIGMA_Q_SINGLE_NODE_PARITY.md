@@ -928,3 +928,205 @@ mapping than another GroupValuesPrimitive attempt.
 (this session, pending) Σ.R.2.a kernel + Σ.R.2.b/c exec+rule + Σ.R.2.d bench
                         — REJECTED Q17 SF=10 +40-55%; kept opt-in
 ```
+
+---
+
+## 2026-05-24 follow-on session — Q06 LZ4_RAW + L9 evolution
+
+### Q06 LZ4_RAW investigation
+
+Pursued [[q06-sf10-polars-gap-wall]] / [[ematix-parquet-lz4-decode-bug]]
+levers. Result: codec migration is net-positive for DuckDB but
+net-negative for ematix on the natural DuckDB-COPY output (Optional
+columns force a V1 level-skip path costing ~30 ms wall at SF=10).
+
+The investigation surfaced TWO latent bugs:
+
+| Side | Bug | Fix |
+|------|-----|-----|
+| ematix-flow | `emat_page_stream::decompress_into` missing LZ4_RAW arm — non-masked column reads cleanly rejected the codec | LZ4_RAW arm + `uncompressed_size` threaded through 4 call sites |
+| ematix-parquet (sibling) | V1 data pages of Optional columns wire `[rep_lev RLE][def_lev RLE][values]`; `data_page_view` passed the whole decompressed body as values | Added `compute_max_levels` + `skip_v1_level_prefixes` (no Vec<u16> materialisation); threaded `(max_rep, max_def)` through 15+ call sites |
+
+Sibling fix landed on `feat/compression-hygiene` as commit `16c912b`,
+shipped in v0.15.0 release commit `de9b073` + tag `v0.15.0` (local-
+only, awaiting push to trigger crates.io publish). Until then,
+ematix-flow uses a `[patch.crates-io]` block to point at the local
+clone.
+
+Net: NO production perf change. The fix unbreaks a class of valid
+parquet files (V1 + Optional + any codec, exposed via LZ4_RAW DuckDB
+COPY) that ematix-flow could previously corrupt silently.
+
+### Σ.Q.L9.HashSet — exact i64 set for small builds
+
+Q17 fresh profile (2026-05-24) showed `BloomFilter::might_contain_hash`
+at 13.4% self-time as the new top hot kernel (the closeout's #1,
+`GroupValuesPrimitive::intern`, dropped out of the top 30 — the
+L9/L10/L15/L16 stack eliminated most of its work).
+
+Microbench at Q17 shape (2K-key build, 1M probes, ~0.1% hit):
+
+| Path | ns/probe | FP rate |
+|---|---:|---:|
+| BloomFilter::might_contain_i64 (legacy) | 17.2 | 1.13% |
+| std HashSet (SipHash) | 5.1 | 0% |
+| Manual i64 open-addr table | **1.3** | **0%** |
+
+Built `crates/ematix-flow-core/src/i64_set.rs`: `I64Set` open-
+addressing exact-membership table, multiply-shift hash, 50% load
+cap, `i64::MIN` sentinel. 11 unit tests including a parity test vs
+`std::collections::HashSet`.
+
+Wired into `BuildSideBloomEmitterExec`: each partition maintains
+BOTH a bloom AND an `Option<I64Set>` — the set is dropped once it
+overflows `EMAT_L9_SET_THRESHOLD` (default 32K = 256 KB I64Set).
+At finalize, if every partition kept its set AND the union stays
+under threshold, publishes the new `ColumnPredicate::I64InSet`
+(exact membership, single hash + lookup); otherwise falls back to
+`ColumnPredicate::I64InBloom` (existing path).
+
+22q SF=10 result (5×2 trials):
+
+| Metric | Pre-HashSet | Post-HashSet | Δ |
+|---|---|---|---|
+| ematix-flow/DuckDB geomean | 0.77 | **0.75** | −2pp |
+| ematix wins | 16/22 | **17/22** | +1 (Q17 flipped) |
+| **Q17** | 211 ms (1.26× DuckDB) | **159 ms (0.98×)** | **flipped to ematix win, −25%** |
+
+### Lever 1 — `#[inline(always)]` on bloom hot path
+
+Added `#[inline(always)]` to `BloomFilter::might_contain_hash`,
+`might_contain_i64`, `block_idx`, and `hash_i64`. Microbench Q17-
+shape: 17.2 → 15.6 ns/probe (−9%). Helps Q07/Q08/Q21-shape builds
+(>32K keys → bloom path). Zero risk; ships default-on.
+
+### Lever 3 — `I64Range` predicate (INFRA-ONLY, default-off)
+
+Designed `ColumnPredicate::I64Range { col_idx, lo, hi }` to mirror
+DuckDB's dynamic range pushdown alongside the bloom (per the Q05
+DuckDB EXPLAIN ANALYZE showing `l_partkey IN BF AND l_partkey >= N
+AND l_partkey <= M`).
+
+Wired through:
+- `BuildSideBloomEmitterExec` accumulates per-partition `(min, max)`
+  in a tight pass alongside the existing bloom insert loop.
+- `BridgeFilter::build_bitmap` dispatch: reads `rg_i64_min_max`
+  from parquet column-chunk stats and short-circuits to all-zeros
+  bitmap (no decode) when the RG range doesn't overlap `[lo, hi]`.
+  Also handles "fully inside" (all-ones, skip per-row check) and
+  "partial overlap" (per-row check) cases.
+
+Bench result: NET-NEGATIVE at the always-on default. Q17 SF=10 went
+211 → 244 ms (+15%); Q05/Q07/Q08 also slower. Root cause: the extra
+predicate triggers an extra `ParquetFile::open` + metadata read per
+RG (~800 extra opens at 14 partitions × 58 RGs across the typical
+query), and on TPC-H the build's value range typically overlaps
+~100% of the column distribution (filtered_part keys span ~100% of
+l_partkey), so no RG can actually be skipped.
+
+Decision: kept the infra (predicate variant + RG-skip dispatch + RG-
+stats helpers + accumulator) gated behind `EMAT_L9_EMIT_RANGE=1`.
+Future fix: cache parquet metadata across `build_bitmap` calls so
+the extra predicate doesn't double-open the file. Until then, the
+emit path is a no-op default-off.
+
+### L9.SelectiveBuild — "fire only when build subtree has FilterExec"
+
+Q05 fresh profile + DuckDB plan diff: DuckDB closes Q05 via a
+**cascading dynamic-filter chain** (region → nation → customer →
+orders → lineitem), pushing both a bloom AND a min/max range down
+to every scan. ematix's L9 ratio gate at 1024 blocks the firings on
+the central c⋈o and o⋈l joins (build_rows × 1024 ≥ probe_rows).
+Lowering the ratio fires more joins but regresses Q05/Q08/Q17
+because firing on FK-shape joins (build unfiltered → bloom passes
+~100% by referential integrity) is pure overhead.
+
+Added `EnableRuntimeBloomSidebandRule.require_filtered_build` flag
++ `build_subtree_has_filter(plan)` walker. When set, Inner-join L9
+firings are gated on whether the build subtree contains at least
+one `FilterExec`. LeftSemi/RightSemi unaffected (intrinsically
+selective).
+
+Bench result at default ratio=1024: filter gate is largely inert
+(the ratio gate already does its job; small Q05/Q08 gains within
+noise). At lower ratios the gate alone doesn't fix the
+net-negative — see Σ.S design doc for the deeper analysis.
+
+Decision: shipped default-on (zero cost at default ratio; safety
+net for future ratio tuning). Disable via `EMAT_L9_REQUIRE_FILTERED_
+BUILD=0`. Also added `EMAT_L9_TRACE=1` diagnostic mode (one-line
+stderr per HashJoinExec visit explaining fire/skip).
+
+### Σ.S.A — Apache Impala "splash" bloom layout (LANDED)
+
+Bloom layout swap: sequential multiply-shift + early-out (legacy) →
+Apache Impala "splash" (256-bit block = 8 × u32 lanes; 8
+independent salted hashes per probe; no early-out, fully data-
+parallel).
+
+`SPLASH_SALT` constants per Daniel Lemire's "Cache-, Hash- and
+Space-Efficient Bloom Filters" (Daniel Lemire / Apache Impala).
+Each hash i maps deterministically to its OWN u32 lane via
+`(h32 * SALT[i]) >> 27` → 5-bit position in that lane. Probe:
+`(block AND mask) == mask` per lane → OR-reduce of mismatches.
+
+Microbench (M3 Pro, 2026-05-24):
+
+| Workload | Legacy | Splash | Speedup | FP Δ |
+|---|---:|---:|---:|---:|
+| Q17-shape (2K keys, 0.1% hit) | 15.66 ns | **1.54 ns** | 10.15× | 8.8× lower |
+| Q05-o⋈l-shape (2.3M keys, 15% hit) | 12.60 ns | **1.69 ns** | 7.45× | 4.3× lower |
+| FK-shape (1.5M keys, 100% hit) | 5.40 ns | **1.61 ns** | 3.36× | both 0 |
+| Q21-shape (500 keys, 0.05% hit) | 12.94 ns | **1.38 ns** | 9.36× | 11× lower |
+
+Wire format magic bumped `EBLM0001` → `EBLM0002`. Cross-stage
+distributed deployments must roll forward both sender and receiver
+together; a v0001 sender → v0002 receiver gets `BadMagic` and the
+receiver proceeds without that bloom (no wrong answers — selectivity
+just doesn't propagate that hop).
+
+22q SF=10 wall time: unchanged at **0.75 geomean**. The 3-10×
+microbench gain doesn't translate to wall time at the default
+ratio=1024 because only supplier-side firings happen there, and
+those were already a small fraction of total time. Splash is
+infrastructure for Σ.S.B + a future-proof layout match for what
+every modern engine uses (Impala, Photon, Velox).
+
+### Σ.S.B — Cascading L9 (PLANNED, NOT YET BUILT)
+
+See `docs/PHASE_SIGMA_S_PIPELINED_SCAN_FILTER_JOIN.md`.
+
+The real Q05 lever. Walks past the immediate probe scan to attach
+sidebands to **downstream** scans in the same FK chain, matching
+DuckDB's region → nation → customer → orders → lineitem cascade.
+Multi-week effort with careful tests for correctness (Σ.Q.L14
+col_idx bug is the canonical "silent correctness" trap).
+
+### Final 22q SF=10 state at session close
+
+| Metric | Value | Notes |
+|---|---|---|
+| 22q geomean (ematix/DuckDB) | **0.75** | 25% faster than DuckDB |
+| ematix wins | 17/22 | Q01/Q03/Q06/Q17 are noise-band races vs DuckDB |
+| Correctness | 22/22 cell-by-cell | tpch_validate with full env stack |
+| Test suite | 977 lib tests + 22 oracle | all green |
+| Remaining gap queries | Q05 1.27×, Q07 1.10×, Q08 1.09× | Σ.S.B is the lever for all three |
+
+### Commit chronology (this session, perf/sigma-q-single-node-parity)
+
+```
+0ae9b22  Σ.R.2 RobinHoodAvgF64Exec — REJECTED Q17 SF=10 +40-55%
+(pending) Q06 LZ4_RAW investigation — bridge LZ4 arm + V1+Optional fix
+(pending) Σ.Q.L9 evolution: splash bloom + HashSet + selective build + range infra
+```
+
+Sister repo (`ematix-parquet`, `feat/compression-hygiene`):
+
+```
+de9b073  release: v0.15.0 — V1 page-body level-prefix fix + varint regression guard
+16c912b  fix: strip rep+def level prefixes in V1 data pages
+bc8c4c3  perf: bench_varint regression guard + negative-result documentation
+```
+
+Tag `v0.15.0` exists locally, NOT pushed. Pushing it triggers the
+release workflow that auto-publishes 5 crates to crates.io.

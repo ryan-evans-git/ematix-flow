@@ -67,6 +67,31 @@ impl Engine {
     fn all() -> &'static [Engine] {
         &[Engine::EmatixFlow, Engine::DuckDb, Engine::Polars]
     }
+    /// Filter `all()` by env vars:
+    ///   TPCH_SKIP_POLARS=1   — drop Polars (Q21 SF=10 takes ~41s/trial,
+    ///                          Q05 SF=10 panics with bigidx).
+    ///   TPCH_SKIP_DUCKDB=1   — drop DuckDB.
+    ///   TPCH_SKIP_EMATIX=1   — drop ematix-flow.
+    /// At least one engine must remain; an empty set falls back to all().
+    fn selected() -> Vec<Engine> {
+        let skip_polars = std::env::var("TPCH_SKIP_POLARS").map(|v| v != "0").unwrap_or(false);
+        let skip_duckdb = std::env::var("TPCH_SKIP_DUCKDB").map(|v| v != "0").unwrap_or(false);
+        let skip_ematix = std::env::var("TPCH_SKIP_EMATIX").map(|v| v != "0").unwrap_or(false);
+        let kept: Vec<Engine> = Self::all()
+            .iter()
+            .copied()
+            .filter(|e| match e {
+                Engine::Polars => !skip_polars,
+                Engine::DuckDb => !skip_duckdb,
+                Engine::EmatixFlow => !skip_ematix,
+            })
+            .collect();
+        if kept.is_empty() {
+            Self::all().to_vec()
+        } else {
+            kept
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -187,7 +212,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let polars_sql = std::fs::read_to_string(&polars_sql_path).ok();
 
         let mut per_engine: BTreeMap<Engine, EngineResult> = BTreeMap::new();
-        for &engine in Engine::all() {
+        let selected = Engine::selected();
+        for &engine in &selected {
             let mut res = EngineResult::default();
             let engine_sql = match engine {
                 Engine::Polars => polars_sql.as_deref().unwrap_or(&sql),
@@ -394,9 +420,14 @@ async fn build_ematix_ctx(
             .and_then(|s| s.parse().ok())
             .unwrap_or(64);
         let allow_inner = std::env::var("EMAT_RT_BLOOM_INNER_JOIN").is_ok();
+        let require_filtered_build = std::env::var("EMAT_L9_REQUIRE_FILTERED_BUILD")
+            .ok()
+            .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+            .unwrap_or(true);
         builder = builder.with_physical_optimizer_rule(Arc::new(EnableRuntimeBloomSidebandRule {
             min_probe_to_build_ratio: ratio,
             allow_inner_join: allow_inner,
+            require_filtered_build,
         }));
     }
     // Σ.Q.L4′: install the in-scan bloom pushdown rule with an empty

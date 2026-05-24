@@ -364,6 +364,7 @@ async fn run_ematix(data_dir: &Path, sql: &str) -> Result<Vec<Vec<Cell>>, Box<dy
         EnableRuntimeBloomSidebandRule {
             min_probe_to_build_ratio: 1024,
             allow_inner_join: true,
+            require_filtered_build: true,
         }
     } else {
         EnableRuntimeBloomSidebandRule::default()

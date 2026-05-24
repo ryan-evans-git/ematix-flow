@@ -172,6 +172,11 @@ pub mod plan_cache;
 // Flight metadata to probe-side workers; probe-side skips rows before
 // shipping. Cuts cross-stage row volume by 10-100× on selective joins.
 pub mod bloom;
+// L9.HashSet (2026-05-24): exact i64 membership set for the L9 runtime
+// bloom sideband path. Used when the join build is small enough that
+// an exact open-addressing table outperforms the probabilistic bloom
+// (Q17 SF=10: 17.2 ns/probe bloom → 1.3 ns/probe i64_set; +0 FPs).
+pub mod i64_set;
 // Σ.N (2026-05-21): Robin Hood vectorized hash table for aggregates.
 // Open-addressing with Robin Hood eviction (probe-distance equalisation).
 // Photon's signature operator; nobody ships this in OSS DataFusion.

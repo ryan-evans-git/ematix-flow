@@ -1,21 +1,24 @@
 # TPC-H SF=1 triangulation
 
-Same-process bench: ematix-flow vs DuckDB vs Polars over all 22 TPC-H queries on SF=1 parquet data, 5 timed trials after 2 warmups, single-machine.
+Same-process bench: ematix-flow vs DuckDB vs Polars over all 22 TPC-H queries on SF=1 parquet data, 10 timed trials after 3 warmups, single-machine.
 
 Source: `crates/ematix-flow-core/examples/tpch_triangulation_bench.rs` — feature-gated behind `--features triangulation`.
 
 Data: `examples/tpch/data/sf10`.
 
-Each cell is **median ms ± σ** across 5 trials. "—" means the engine couldn't parse / execute the query (dialect gap).
+Each cell is **median ms ± σ** across 10 trials. "—" means the engine couldn't parse / execute the query (dialect gap).
 
 | Query | ematix-flow | DuckDB | Polars | Best |
 |------:|------------:|-------:|-------:|:-----|
-| Q18  | 698.96 ± 62.97 | 223.80 ± 23.28 | 600.99 ± 17.52 | DuckDB |
+| Q05  | 237.05 ± 6.35 | 152.23 ± 2.64 | — | DuckDB |
+| Q07  | 167.69 ± 11.34 | 152.86 ± 3.65 | — | DuckDB |
+| Q08  | 241.01 ± 13.14 | 193.80 ± 4.67 | — | DuckDB |
+| Q17  | 241.09 ± 10.55 | 172.61 ± 5.49 | — | DuckDB |
 
 ## Wins
 
 - **ematix-flow**: 0
-- **DuckDB**: 1
+- **DuckDB**: 4
 - **Polars**: 0
 
 ## Caveats

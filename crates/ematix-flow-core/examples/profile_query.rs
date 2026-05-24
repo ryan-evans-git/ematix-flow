@@ -75,10 +75,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_physical_optimizer_rule(Arc::new(InjectFilterSumRule));
     builder = builder.with_optimizer_rule(Arc::new(PushDownLeftSemiRule));
     builder = builder.with_physical_optimizer_rule(Arc::new(SwapSemiJoinBuildSideRule));
-    builder = builder.with_physical_optimizer_rule(Arc::new(EnableRobinHoodSumF64Rule));
-    builder = builder.with_physical_optimizer_rule(Arc::new(
-        EnableRuntimeBloomSidebandRule::default(),
-    ));
+    // Σ.Q.L1b: matches the triangulation bench's gating on
+    // EMAT_RH_SUM_F64=1. Default-off avoids the ~7% geomean codegen
+    // tax from [[optimizer-codegen-sensitivity]] when the operator
+    // doesn't fire.
+    if std::env::var("EMAT_RH_SUM_F64")
+        .ok()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+    {
+        builder = builder.with_physical_optimizer_rule(Arc::new(EnableRobinHoodSumF64Rule));
+    }
+    // Σ.Q.L15: ratio=1024 is the perf-validated setting from the
+    // triangulation bench. `Default::default()` uses ratio=64 which
+    // is the original L9 default but fires on net-negative shapes
+    // (s⋈l, etc.) per the L15 memory. allow_inner_join is read from
+    // EMAT_RT_BLOOM_INNER_JOIN at rule-construction time inside
+    // Default::default(); reading it here mirrors the bench wiring.
+    let bloom_ratio = std::env::var("EMAT_RT_BLOOM_RATIO")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1024);
+    let allow_inner = std::env::var("EMAT_RT_BLOOM_INNER_JOIN").is_ok();
+    builder = builder.with_physical_optimizer_rule(Arc::new(EnableRuntimeBloomSidebandRule {
+        min_probe_to_build_ratio: bloom_ratio,
+        allow_inner_join: allow_inner,
+    }));
     let state = builder.build();
     let ctx = SessionContext::new_with_state(state);
 
@@ -102,9 +124,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn register_tables(ctx: &SessionContext, data_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    // Σ.Q.L15: when EMAT_ALL_TABLES_EMAT=1, every TPC-H table goes
+    // through EmatixFastParquetTableProvider so the L9 runtime bloom
+    // sideband can target supplier/customer/part scans (without it
+    // those land on FastParquet and L9's find_probe_scan_for_column
+    // walks past them, causing Inner-L9 firings to wait on side-
+    // bands that never get consumed).
+    let all_emat = std::env::var("EMAT_ALL_TABLES_EMAT")
+        .ok()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
     for t in TPCH_TABLES {
         let path = data_dir.join(format!("{t}.parquet"));
-        let use_emat = *t == "lineitem" || *t == "orders";
+        let use_emat = all_emat || *t == "lineitem" || *t == "orders";
         if use_emat {
             let prov = EmatixFastParquetTableProvider::try_new(path.to_string_lossy())?;
             ctx.register_table(*t, Arc::new(prov))?;

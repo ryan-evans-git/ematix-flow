@@ -179,6 +179,37 @@ pub enum ColumnPredicate {
         col_idx: usize,
         bloom: Arc<crate::bloom::BloomFilter>,
     },
+    /// L9.HashSet (2026-05-24) — exact i64 membership probe. Used by
+    /// the L9 runtime sideband when the build side is small enough
+    /// that an exact `I64Set` outperforms the probabilistic bloom
+    /// (Q17 SF=10 profile: 1.3 ns/probe vs 17.2 ns/probe for bloom
+    /// at a 2K-key build, plus zero false positives).
+    /// Falls back to `I64InBloom` past `EMAT_L9_SET_THRESHOLD` keys.
+    I64InSet {
+        col_idx: usize,
+        set: Arc<crate::i64_set::I64Set>,
+    },
+    /// Lever 3 (2026-05-24) — closed-interval `lo ≤ v ≤ hi` predicate
+    /// on an i64 column. Emitted alongside `I64InBloom` / `I64InSet`
+    /// by `BuildSideBloomEmitterExec` (tracking the min/max of all
+    /// build keys per-partition then unioning at publish). The win
+    /// isn't the per-row check — that's just two comparisons, the
+    /// bloom/set is already a single hash + lookup. The win is the
+    /// **RG-level skip**: `BridgeFilter::build_bitmap` consults the
+    /// parquet column-chunk min/max statistics for the target RG
+    /// and short-circuits to an all-zero bitmap when stats don't
+    /// overlap `[lo, hi]`. For TPC-H queries with a narrow dim
+    /// filter (Q05's ASIA → ~20K customers in a contiguous key
+    /// range, Q07's nation-filtered supplier set, Q08's brand+nation
+    /// part-filter) this can skip whole row groups before any
+    /// l_partkey / l_suppkey decode happens. For Q17 the range
+    /// covers ~100% of l_partkey so no RG is skipped — the lever is
+    /// query-shape dependent.
+    I64Range {
+        col_idx: usize,
+        lo: i64,
+        hi: i64,
+    },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -323,6 +354,63 @@ impl BridgeFilter {
                         bloom.might_contain_i64(v)
                     })?
                 }
+                ColumnPredicate::I64InSet { col_idx, set } => {
+                    let set = set.clone();
+                    filter_i64_column_to_bitmap_dense(path, rg, *col_idx, move |v: i64| {
+                        set.contains(v)
+                    })?
+                }
+                ColumnPredicate::I64Range { col_idx, lo, hi } => {
+                    // Lever 3 — RG-level skip via parquet column-chunk
+                    // min/max statistics. If the RG's stats don't
+                    // overlap `[lo, hi]`, return an all-zero bitmap
+                    // immediately (no decode). When stats are missing
+                    // or overlapping, fall through to the per-row
+                    // range check (which is two i64 comparisons).
+                    let lo = *lo;
+                    let hi = *hi;
+                    let col_idx = *col_idx;
+                    if let Some((rg_min, rg_max)) =
+                        crate::ematix_parquet_bridge::rg_i64_min_max(path, rg, col_idx)?
+                    {
+                        // No overlap: short-circuit.
+                        if rg_max < lo || rg_min > hi {
+                            // We still need to know `total` (rows in RG).
+                            let total =
+                                crate::ematix_parquet_bridge::rg_num_values(path, rg, col_idx)?;
+                            (vec![0u8; total.div_ceil(8)], total)
+                        } else if rg_min >= lo && rg_max <= hi {
+                            // Fully inside: every row passes the range.
+                            // Skip the per-row check; return an all-
+                            // ones bitmap. (Costs one masked-decode for
+                            // the AND-combine downstream, but no
+                            // per-row predicate evaluation.)
+                            let total =
+                                crate::ematix_parquet_bridge::rg_num_values(path, rg, col_idx)?;
+                            let mut bitmap = vec![0xFFu8; total.div_ceil(8)];
+                            // Clear the unused tail bits in the final
+                            // byte (avoid spuriously matching ghost
+                            // rows past `total`).
+                            let tail_bits = total & 7;
+                            if tail_bits != 0 {
+                                if let Some(last) = bitmap.last_mut() {
+                                    *last &= (1u8 << tail_bits) - 1;
+                                }
+                            }
+                            (bitmap, total)
+                        } else {
+                            // Partial overlap: per-row check.
+                            filter_i64_column_to_bitmap_dense(path, rg, col_idx, move |v: i64| {
+                                v >= lo && v <= hi
+                            })?
+                        }
+                    } else {
+                        // Stats unavailable: per-row check.
+                        filter_i64_column_to_bitmap_dense(path, rg, col_idx, move |v: i64| {
+                            v >= lo && v <= hi
+                        })?
+                    }
+                }
                 ColumnPredicate::StringEq { col_idx, .. }
                 | ColumnPredicate::StringNotEq { col_idx, .. }
                 | ColumnPredicate::StringIn { col_idx, .. }
@@ -391,6 +479,8 @@ impl ColumnPredicate {
             // ColumnPair touches two cols; return left as the "primary".
             ColumnPredicate::I32ColumnPair { left_col, .. } => *left_col,
             ColumnPredicate::I64InBloom { col_idx, .. } => *col_idx,
+            ColumnPredicate::I64InSet { col_idx, .. } => *col_idx,
+            ColumnPredicate::I64Range { col_idx, .. } => *col_idx,
         }
     }
 
@@ -531,6 +621,17 @@ impl ColumnPredicate {
             // the StringIn default of 0.2 because we expect blooms
             // only to be injected when the build is genuinely small).
             ColumnPredicate::I64InBloom { .. } => 0.2,
+            // L9.HashSet — exact membership has no FP rate, so the
+            // estimate can be tighter than the bloom's 0.2. The build
+            // is small by definition (≤ EMAT_L9_SET_THRESHOLD), so we
+            // expect ≤ ~0.1 pass rate in the common L9 case.
+            ColumnPredicate::I64InSet { .. } => 0.1,
+            // Lever 3 — closed-interval range. Without column stats we
+            // can't bound it tightly; assume the L9 emitter only
+            // produces this for builds with a narrow value range
+            // (Q05/Q07/Q08 dim filters), so 0.3 is a conservative
+            // win-leaning estimate.
+            ColumnPredicate::I64Range { .. } => 0.3,
         }
     }
 
@@ -567,6 +668,23 @@ impl ColumnPredicate {
             // Provider must declare this Inexact so DataFusion keeps
             // the residual HashJoin equality test.
             ColumnPredicate::I64InBloom { .. } => false,
+            // L9.HashSet — exact membership IS byte-level equivalent
+            // to the residual equi-join test, BUT the runtime sideband
+            // path uses Inexact so the residual HashJoin still fires
+            // (the sideband prunes selectivity, doesn't replace the
+            // join). Mark Inexact to preserve correctness across all
+            // L9 call sites. A future logical-rule pushdown that
+            // proves the column has no nulls + the join is Inner could
+            // promote this to true.
+            ColumnPredicate::I64InSet { .. } => false,
+            // Lever 3 — the I64Range is derived from build-side
+            // min/max, which is necessary-but-not-sufficient for
+            // the equi-join (every match key falls in [lo, hi] but
+            // not every key in [lo, hi] is a match). The residual
+            // HashJoin must still run. Inexact for the same reason
+            // as the L9 bloom/set: selectivity reduction, not
+            // replacement.
+            ColumnPredicate::I64Range { .. } => false,
         }
     }
 
@@ -629,6 +747,8 @@ impl ColumnPredicate {
     pub fn eval_i64(&self, v: i64) -> bool {
         match self {
             ColumnPredicate::I64InBloom { bloom, .. } => bloom.might_contain_i64(v),
+            ColumnPredicate::I64InSet { set, .. } => set.contains(v),
+            ColumnPredicate::I64Range { lo, hi, .. } => v >= *lo && v <= *hi,
             _ => false,
         }
     }

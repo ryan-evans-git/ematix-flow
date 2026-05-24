@@ -71,6 +71,21 @@ pub struct EnableRuntimeBloomSidebandRule {
     /// build IS pre-filtered (e.g. post-nation supplier), Inner-L9
     /// becomes a win — opt in via `EMAT_RT_BLOOM_INNER_JOIN=1`.
     pub allow_inner_join: bool,
+    /// L9.SelectiveBuild (2026-05-24, Q05 investigation): when true,
+    /// gate Inner-join firings on whether the build subtree contains
+    /// a `FilterExec`. The bloom-on-FK net-negative pattern
+    /// (customer⋈orders, lineitem⋈order_self) only hurts because the
+    /// FK side is *unfiltered* — referential integrity guarantees
+    /// ~100% bloom pass rate, so the membership probe is pure
+    /// overhead. When the build IS filtered (Q17 filtered_part →
+    /// lineitem, Q05 orders-post-date-filter → lineitem) the bloom
+    /// genuinely drops probe rows. This flag flips the rule from
+    /// "always fire Inner joins with allow_inner_join" to "fire Inner
+    /// joins ONLY when the build subtree has at least one FilterExec
+    /// on the way down". LeftSemi/RightSemi shapes are unaffected —
+    /// they're intrinsically selective. Disable via
+    /// `EMAT_L9_REQUIRE_FILTERED_BUILD=0` for benchmarking.
+    pub require_filtered_build: bool,
 }
 
 impl Default for EnableRuntimeBloomSidebandRule {
@@ -90,9 +105,16 @@ impl Default for EnableRuntimeBloomSidebandRule {
         // unfiltered. Opt-in via `EMAT_RT_BLOOM_INNER_JOIN=1` when
         // the build IS pre-filtered.
         let allow_inner_join = std::env::var_os("EMAT_RT_BLOOM_INNER_JOIN").is_some();
+        // L9.SelectiveBuild defaults to true. Override via
+        // `EMAT_L9_REQUIRE_FILTERED_BUILD=0` for A/B benching.
+        let require_filtered_build = std::env::var("EMAT_L9_REQUIRE_FILTERED_BUILD")
+            .ok()
+            .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+            .unwrap_or(true);
         Self {
             min_probe_to_build_ratio: ratio,
             allow_inner_join,
+            require_filtered_build,
         }
     }
 }
@@ -103,6 +125,12 @@ impl PhysicalOptimizerRule for EnableRuntimeBloomSidebandRule {
         plan: Arc<dyn ExecutionPlan>,
         _config: &ConfigOptions,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
+        // Σ.Q.L9 trace (Q05 investigation, 2026-05-24): when
+        // EMAT_L9_TRACE=1 is set, every HashJoinExec visit logs a one-
+        // line reason for fire / skip. Helps explain missing wraps
+        // (column-type mismatch, no probe scan reachable, gate
+        // rejection). No-op when the env var is unset.
+        let trace = std::env::var_os("EMAT_L9_TRACE").is_some();
         plan.transform_up(|node| {
             let Some(hj) = node.as_any().downcast_ref::<HashJoinExec>() else {
                 return Ok(Transformed::no(node));
@@ -122,6 +150,28 @@ impl PhysicalOptimizerRule for EnableRuntimeBloomSidebandRule {
             // the silent-wrong-sums bug that originally motivated the
             // default-off. Tests opt in via `allow_inner_join: true`.
             if matches!(hj.join_type(), JoinType::Inner) && !self.allow_inner_join {
+                if trace {
+                    eprintln!("[L9.trace] skip Inner — allow_inner_join=false");
+                }
+                return Ok(Transformed::no(node));
+            }
+            // L9.SelectiveBuild (2026-05-24): for Inner joins, fire
+            // only if the build subtree contains a FilterExec. The
+            // bloom-on-FK net-negative pattern (Q05 c⋈o on unfiltered
+            // customer, Q07/Q18 unfiltered-supplier joins) is exactly
+            // the "no filter in build" shape — referential integrity
+            // makes the bloom pass-through ~100%. LeftSemi/RightSemi
+            // are intrinsically selective so the gate doesn't apply
+            // to them.
+            if matches!(hj.join_type(), JoinType::Inner)
+                && self.require_filtered_build
+                && !build_subtree_has_filter(hj.left())
+            {
+                if trace {
+                    eprintln!(
+                        "[L9.trace] skip Inner — build subtree has no FilterExec (require_filtered_build=true)"
+                    );
+                }
                 return Ok(Transformed::no(node));
             }
 
@@ -142,28 +192,64 @@ impl PhysicalOptimizerRule for EnableRuntimeBloomSidebandRule {
             )> = None;
             for (left_expr, right_expr) in hj.on().iter() {
                 let Some(lcol) = left_expr.as_any().downcast_ref::<Column>() else {
+                    if trace {
+                        eprintln!("[L9.trace] equi-key left not a Column expr");
+                    }
                     continue;
                 };
                 let Some(rcol) = right_expr.as_any().downcast_ref::<Column>() else {
+                    if trace {
+                        eprintln!("[L9.trace] equi-key right not a Column expr");
+                    }
                     continue;
                 };
-                if build.schema().field(lcol.index()).data_type() != &DataType::Int64 {
+                let l_dt = build.schema().field(lcol.index()).data_type().clone();
+                let r_dt = probe.schema().field(rcol.index()).data_type().clone();
+                if l_dt != DataType::Int64 {
+                    if trace {
+                        eprintln!(
+                            "[L9.trace] skip — build key {} not Int64 (is {l_dt:?})",
+                            lcol.name()
+                        );
+                    }
                     continue;
                 }
-                if probe.schema().field(rcol.index()).data_type() != &DataType::Int64 {
+                if r_dt != DataType::Int64 {
+                    if trace {
+                        eprintln!(
+                            "[L9.trace] skip — probe key {} not Int64 (is {r_dt:?})",
+                            rcol.name()
+                        );
+                    }
                     continue;
                 }
                 let col_name = rcol.name().to_string();
                 if let Some((scan_node, scan_typed, scan_col_idx)) =
                     find_probe_scan_for_column(&probe, &col_name)
                 {
+                    if trace {
+                        eprintln!(
+                            "[L9.trace] matched key {col_name} → probe scan @ col_idx={scan_col_idx}"
+                        );
+                    }
                     matched = Some((lcol.index(), scan_col_idx, scan_node, scan_typed));
                     break;
+                } else if trace {
+                    eprintln!(
+                        "[L9.trace] probe key {col_name} found no EmatixFastParquetExec on probe side"
+                    );
                 }
             }
 
             let Some((build_key_idx, probe_scan_col_idx, scan_node, scan_arc)) = matched
             else {
+                if trace {
+                    eprintln!(
+                        "[L9.trace] {:?} join @ on={:?} — NO MATCH (no Emat scan reachable on probe)",
+                        hj.join_type(),
+                        hj.on()
+                    );
+                }
                 return Ok(Transformed::no(node));
             };
 
@@ -202,12 +288,32 @@ impl PhysicalOptimizerRule for EnableRuntimeBloomSidebandRule {
             // while keeping semi-join shapes (build ≈ probe / 1000+).
             let build_rows = estimate_build_rows(build.as_ref());
             let probe_rows = estimate_probe_scan_rows(&scan_arc);
+            if trace {
+                eprintln!(
+                    "[L9.trace] {:?} join — build_rows={build_rows:?} probe_rows={probe_rows:?} ratio_gate={}",
+                    hj.join_type(),
+                    self.min_probe_to_build_ratio
+                );
+            }
             if self.min_probe_to_build_ratio > 0 {
                 if let (Some(b), Some(p)) = (build_rows, probe_rows) {
                     if b.saturating_mul(self.min_probe_to_build_ratio) >= p {
+                        if trace {
+                            eprintln!(
+                                "[L9.trace] skip — gate rejects: b({b}) × ratio({}) >= p({p})",
+                                self.min_probe_to_build_ratio
+                            );
+                        }
                         return Ok(Transformed::no(node));
                     }
                 }
+            }
+            if trace {
+                eprintln!(
+                    "[L9.trace] WRAP {:?} join — expected_keys={}",
+                    hj.join_type(),
+                    build_rows.unwrap_or(50_000)
+                );
             }
 
             // Σ.Q.L9: allocate the sideband, wrap the build child,
@@ -349,6 +455,32 @@ fn rewrite_probe_subtree(
         .data()
 }
 
+/// L9.SelectiveBuild (2026-05-24) — does the build subtree contain
+/// a `FilterExec`? Used as a heuristic for "the build side is
+/// selective", which is necessary for an L9 bloom to pay off on an
+/// Inner join.
+///
+/// Walks down 1-child wrappers (RepartitionExec, ProjectionExec,
+/// CoalesceBatchesExec, BuildSideBloomEmitterExec, etc.) and into
+/// every child of multi-child plans (HashJoinExec, UnionExec).
+/// Returns true on the first `FilterExec` encountered.
+///
+/// For TPC-H this correctly returns:
+/// - false for Q05's customer⋈orders join's build (customer is a
+///   raw TableScan), or Q07's supplier⋈lineitem with build=supplier
+///   alone
+/// - true for Q05's orders_filtered⋈lineitem build (the c⋈o
+///   intermediate contains the orders date FilterExec)
+/// - true for Q17's filtered_part⋈lineitem build (filtered_part has
+///   a FilterExec on p_brand + p_container)
+fn build_subtree_has_filter(plan: &Arc<dyn ExecutionPlan>) -> bool {
+    use datafusion::physical_plan::filter::FilterExec;
+    if plan.as_any().downcast_ref::<FilterExec>().is_some() {
+        return true;
+    }
+    plan.children().iter().any(|c| build_subtree_has_filter(*c))
+}
+
 /// Σ.Q.L9 selectivity gate — best-effort row-count estimate for the
 /// probe-side leaf scan. The scan exposes `num_rows` directly via its
 /// own field, so this is a cheap accessor. Returns the total row
@@ -459,6 +591,10 @@ mod tests {
             .with_physical_optimizer_rule(Arc::new(EnableRuntimeBloomSidebandRule {
                 min_probe_to_build_ratio: 0,
                 allow_inner_join: true,
+                // Tests use miniature in-memory parquet with no
+                // FilterExec in the build path — they're verifying
+                // the wrap mechanism, not the selectivity heuristic.
+                require_filtered_build: false,
             }))
             .build();
         let ctx = SessionContext::new_with_state(state);
@@ -522,6 +658,10 @@ mod tests {
             .with_physical_optimizer_rule(Arc::new(EnableRuntimeBloomSidebandRule {
                 min_probe_to_build_ratio: 0,
                 allow_inner_join: true,
+                // Tests use miniature in-memory parquet with no
+                // FilterExec in the build path — they're verifying
+                // the wrap mechanism, not the selectivity heuristic.
+                require_filtered_build: false,
             }))
             .build();
         let ctx = SessionContext::new_with_state(state);

@@ -57,6 +57,22 @@ use futures_util::stream::StreamExt;
 use crate::bloom::BloomFilter;
 use crate::bridge_filter_sideband::BridgeFilterSideband;
 use crate::ematix_fast_parquet::ColumnPredicate;
+use crate::i64_set::I64Set;
+
+/// L9.HashSet (2026-05-24) — publish an exact `I64Set` instead of a
+/// probabilistic `BloomFilter` when the total accumulated build size
+/// is at or below this many keys. Default = 32_768 (256 KB / set);
+/// override via `EMAT_L9_SET_THRESHOLD`. See [`i64_set`] module docs
+/// for why this is faster on small builds.
+const DEFAULT_L9_SET_THRESHOLD: usize = 32_768;
+
+#[inline]
+fn l9_set_threshold() -> usize {
+    std::env::var("EMAT_L9_SET_THRESHOLD")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_L9_SET_THRESHOLD)
+}
 
 /// Σ.Q.L9 — Wrapper exec that emits a build-side bloom to a sideband.
 #[derive(Debug)]
@@ -73,6 +89,20 @@ pub struct BuildSideBloomEmitterExec {
     /// partition. Drained + merged + published when `completed`
     /// reaches `n_partitions`.
     local_blooms: Arc<Mutex<Vec<BloomFilter>>>,
+    /// L9.HashSet — per-partition exact set, pushed in alongside the
+    /// bloom at finalize. An entry is `Some(set)` if the partition
+    /// stayed under [`l9_set_threshold`]; `None` if it overflowed.
+    /// At publish time, if every partition contributed `Some`, the
+    /// emitter publishes `I64InSet` (faster + zero FP). If any
+    /// partition's `Option` is `None`, we fall back to publishing
+    /// `I64InBloom` from the local_blooms.
+    local_sets: Arc<Mutex<Vec<Option<I64Set>>>>,
+    /// Lever 3 — per-partition (min, max) of build-side keys. An
+    /// entry is `None` when the partition saw zero keys. At publish
+    /// time the global (min, max) is the union of per-partition
+    /// (min, max) pairs, and is emitted as an `I64Range` predicate
+    /// alongside the bloom/set.
+    local_ranges: Arc<Mutex<Vec<Option<(i64, i64)>>>>,
     completed: Arc<AtomicUsize>,
     n_partitions: usize,
     /// Used to size each partition's local bloom.
@@ -126,6 +156,8 @@ impl BuildSideBloomEmitterExec {
             target_col_idx,
             sideband,
             local_blooms: Arc::new(Mutex::new(Vec::with_capacity(n_partitions))),
+            local_sets: Arc::new(Mutex::new(Vec::with_capacity(n_partitions))),
+            local_ranges: Arc::new(Mutex::new(Vec::with_capacity(n_partitions))),
             completed: Arc::new(AtomicUsize::new(0)),
             n_partitions,
             expected_keys_per_partition,
@@ -194,34 +226,92 @@ impl ExecutionPlan for BuildSideBloomEmitterExec {
         let target_col_idx = self.target_col_idx;
         let sideband = self.sideband.clone();
         let local_blooms = self.local_blooms.clone();
+        let local_sets = self.local_sets.clone();
+        let local_ranges = self.local_ranges.clone();
         let completed = self.completed.clone();
         let n_partitions = self.n_partitions;
         let expected_per_part = self.expected_keys_per_partition;
         let in_schema: SchemaRef = self.input.schema();
+        // L9.HashSet — abandon the small-set path on this partition
+        // once it exceeds the global threshold. The threshold is read
+        // once at execute() time so the map closure stays branch-free
+        // on env lookups.
+        let set_threshold = l9_set_threshold();
 
-        // Per-partition local bloom — wrapped in Arc<Mutex<…>> so the
-        // map closure (per-batch updates) and the stream-end finalize
-        // (transfer-into-shared) can both touch it.
+        // Per-partition local bloom + set. Both are wrapped in
+        // Arc<Mutex<…>> so the map closure (per-batch updates) and the
+        // stream-end finalize (transfer-into-shared) can both touch
+        // them. Mutex is uncontended in practice — one partition owns
+        // its locals.
         let local_inner = Arc::new(Mutex::new(BloomFilter::for_keys(expected_per_part)));
         let local_for_map = local_inner.clone();
+        // Set option: `Some(_)` while still under threshold; replaced
+        // with `None` (and dropped) once it overflows. Sized for the
+        // expected per-partition keys but bounded by the threshold so
+        // a wildly-undersized stats estimate can't blow allocation.
+        let initial_set_cap = expected_per_part.min(set_threshold);
+        let local_set_inner: Arc<Mutex<Option<I64Set>>> =
+            Arc::new(Mutex::new(Some(I64Set::with_keys(initial_set_cap))));
+        let local_set_for_map = local_set_inner.clone();
+        // Lever 3 — per-partition (min, max). `None` until the first
+        // non-null key arrives.
+        let local_range_inner: Arc<Mutex<Option<(i64, i64)>>> =
+            Arc::new(Mutex::new(None));
+        let local_range_for_map = local_range_inner.clone();
 
         let upstream = self.input.execute(partition, context)?;
-        // For each batch: insert keys into local bloom, forward
-        // unchanged. The bloom mutex is uncontended (one partition
-        // owns the local).
+        // For each batch: insert keys into local bloom + set (until
+        // overflow), forward unchanged. The mutex is uncontended (one
+        // partition owns the locals).
         let mapped = upstream.map(move |batch_res| match batch_res {
             Ok(batch) => {
                 let arr = batch.column(key_col_idx);
                 if let Some(i64s) = arr.as_any().downcast_ref::<Int64Array>() {
-                    let mut guard = local_for_map.lock().unwrap();
-                    if i64s.null_count() == 0 {
-                        for i in 0..i64s.len() {
-                            guard.insert_i64(i64s.value(i));
+                    let mut bloom_guard = local_for_map.lock().unwrap();
+                    let mut set_guard = local_set_for_map.lock().unwrap();
+                    let mut range_guard = local_range_for_map.lock().unwrap();
+                    let null_count = i64s.null_count();
+                    if null_count == 0 {
+                        let vals = i64s.values();
+                        // Lever 3 — fold batch min/max in a single
+                        // pass before per-row bloom/set work. For TPC-H
+                        // builds this is ~free vs the bloom inserts.
+                        if !vals.is_empty() {
+                            let mut mn = vals[0];
+                            let mut mx = vals[0];
+                            for &v in vals.iter() {
+                                if v < mn {
+                                    mn = v;
+                                }
+                                if v > mx {
+                                    mx = v;
+                                }
+                            }
+                            let (cur_mn, cur_mx) = range_guard.unwrap_or((mn, mx));
+                            *range_guard = Some((cur_mn.min(mn), cur_mx.max(mx)));
+                        }
+                        for &v in vals.iter() {
+                            bloom_guard.insert_i64(v);
+                            if let Some(s) = set_guard.as_mut() {
+                                s.insert(v);
+                                if s.len() > set_threshold {
+                                    *set_guard = None;
+                                }
+                            }
                         }
                     } else {
                         for i in 0..i64s.len() {
                             if !i64s.is_null(i) {
-                                guard.insert_i64(i64s.value(i));
+                                let v = i64s.value(i);
+                                bloom_guard.insert_i64(v);
+                                if let Some(s) = set_guard.as_mut() {
+                                    s.insert(v);
+                                    if s.len() > set_threshold {
+                                        *set_guard = None;
+                                    }
+                                }
+                                let (cur_mn, cur_mx) = range_guard.unwrap_or((v, v));
+                                *range_guard = Some((cur_mn.min(v), cur_mx.max(v)));
                             }
                         }
                     }
@@ -240,21 +330,31 @@ impl ExecutionPlan for BuildSideBloomEmitterExec {
                 Box::pin(mapped),
                 false,
                 local_inner,
+                local_set_inner,
+                local_range_inner,
                 local_blooms,
+                local_sets,
+                local_ranges,
                 completed,
                 sideband,
                 target_col_idx,
                 n_partitions,
+                set_threshold,
             ),
             move |(
                 mut inner,
                 mut finalized,
-                local,
-                shared,
+                local_bloom,
+                local_set,
+                local_range,
+                shared_blooms,
+                shared_sets,
+                shared_ranges,
                 completed,
                 sideband,
                 target_col_idx,
                 n_partitions,
+                set_threshold,
             )| async move {
                 match inner.next().await {
                     Some(item) => Some((
@@ -262,38 +362,154 @@ impl ExecutionPlan for BuildSideBloomEmitterExec {
                         (
                             inner,
                             finalized,
-                            local,
-                            shared,
+                            local_bloom,
+                            local_set,
+                            local_range,
+                            shared_blooms,
+                            shared_sets,
+                            shared_ranges,
                             completed,
                             sideband,
                             target_col_idx,
                             n_partitions,
+                            set_threshold,
                         ),
                     )),
                     None => {
                         if !finalized {
                             finalized = true;
-                            // Extract local bloom (replace with a
-                            // tiny placeholder so the Arc<Mutex> stays
-                            // valid for any stray clones).
+                            // Extract local bloom + set + range
+                            // (replace with tiny placeholders so the
+                            // Arc<Mutex> stays valid for any stray
+                            // clones).
                             let bloom = std::mem::replace(
-                                &mut *local.lock().unwrap(),
+                                &mut *local_bloom.lock().unwrap(),
                                 BloomFilter::for_keys(1),
                             );
-                            shared.lock().unwrap().push(bloom);
+                            let set_opt = local_set.lock().unwrap().take();
+                            let range_opt = local_range.lock().unwrap().take();
+                            shared_blooms.lock().unwrap().push(bloom);
+                            shared_sets.lock().unwrap().push(set_opt);
+                            shared_ranges.lock().unwrap().push(range_opt);
                             let prev = completed.fetch_add(1, Ordering::SeqCst);
                             if prev + 1 == n_partitions {
                                 // Last partition — drain + union-merge
                                 // + publish.
-                                let mut all = shared.lock().unwrap();
-                                if let Some(mut merged) = all.pop() {
-                                    while let Some(other) = all.pop() {
-                                        let _ = merged.union_with(&other);
+                                let mut all_sets = shared_sets.lock().unwrap();
+                                let sets: Vec<Option<I64Set>> = all_sets.drain(..).collect();
+                                drop(all_sets);
+                                let mut all_ranges = shared_ranges.lock().unwrap();
+                                let ranges: Vec<Option<(i64, i64)>> =
+                                    all_ranges.drain(..).collect();
+                                drop(all_ranges);
+
+                                // Lever 3 — global (min, max) is the
+                                // union across all partitions that saw
+                                // any keys.
+                                let mut global_range: Option<(i64, i64)> = None;
+                                for r in &ranges {
+                                    if let Some((mn, mx)) = r {
+                                        global_range = Some(match global_range {
+                                            None => (*mn, *mx),
+                                            Some((gmn, gmx)) => (gmn.min(*mn), gmx.max(*mx)),
+                                        });
                                     }
-                                    sideband.publish(vec![ColumnPredicate::I64InBloom {
+                                }
+                                let range_pred = global_range.map(|(lo, hi)| {
+                                    ColumnPredicate::I64Range {
                                         col_idx: target_col_idx,
-                                        bloom: Arc::new(merged),
-                                    }]);
+                                        lo,
+                                        hi,
+                                    }
+                                });
+
+                                // L9.HashSet — if every partition kept
+                                // its set (none overflowed) AND the
+                                // union stays under the threshold,
+                                // publish the exact set. Otherwise fall
+                                // back to the bloom path.
+                                let all_some = sets.iter().all(|s| s.is_some());
+                                let primary = if all_some {
+                                    let mut merged = I64Set::with_keys(set_threshold);
+                                    let mut overflow = false;
+                                    for s in &sets {
+                                        if let Some(s) = s {
+                                            merged.extend(s);
+                                            if merged.len() > set_threshold {
+                                                overflow = true;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    if overflow {
+                                        None
+                                    } else {
+                                        Some(ColumnPredicate::I64InSet {
+                                            col_idx: target_col_idx,
+                                            set: Arc::new(merged),
+                                        })
+                                    }
+                                } else {
+                                    None
+                                };
+
+                                let primary = match primary {
+                                    Some(p) => Some(p),
+                                    None => {
+                                        // Fall back to bloom path.
+                                        let mut all_blooms = shared_blooms.lock().unwrap();
+                                        if let Some(mut merged) = all_blooms.pop() {
+                                            while let Some(other) = all_blooms.pop() {
+                                                let _ = merged.union_with(&other);
+                                            }
+                                            Some(ColumnPredicate::I64InBloom {
+                                                col_idx: target_col_idx,
+                                                bloom: Arc::new(merged),
+                                            })
+                                        } else {
+                                            None
+                                        }
+                                    }
+                                };
+
+                                // Publish primary + (optionally) the
+                                // range predicate. The range pred IS
+                                // accumulated (~free) but emitting it
+                                // is gated behind EMAT_L9_EMIT_RANGE=1
+                                // because the always-on emit was net-
+                                // negative on TPC-H SF=10 (Q17 −53%,
+                                // Q05/Q07/Q08 also slower). Cause:
+                                // each predicate triggers an extra
+                                // ParquetFile::open + metadata read in
+                                // build_bitmap, and when the build's
+                                // range fully overlaps the column's
+                                // value distribution (the common case
+                                // in TPC-H — Q17's filtered-part keys
+                                // span ~100% of l_partkey) no RG can
+                                // be skipped, so the range's only
+                                // effect is doubling the per-RG
+                                // metadata cost.
+                                //
+                                // The infra (predicate variant + RG-
+                                // skip dispatch + accumulator) is kept
+                                // so a future bench-positive case (or
+                                // a build_bitmap refactor that caches
+                                // file metadata) can flip the default.
+                                let emit_range = std::env::var("EMAT_L9_EMIT_RANGE")
+                                    .ok()
+                                    .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                                    .unwrap_or(false);
+                                let mut preds: Vec<ColumnPredicate> = Vec::with_capacity(2);
+                                if let Some(p) = primary {
+                                    preds.push(p);
+                                }
+                                if emit_range {
+                                    if let Some(r) = range_pred {
+                                        preds.push(r);
+                                    }
+                                }
+                                if !preds.is_empty() {
+                                    sideband.publish(preds);
                                 }
                             }
                         }
@@ -321,7 +537,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn publishes_bloom_after_all_partitions_drain() {
+    async fn publishes_small_build_as_i64_in_set() {
+        // L9.HashSet (2026-05-24): the small-build path now publishes
+        // `I64InSet` (exact, 0 FP rate) instead of `I64InBloom`. The
+        // build here is 9 keys — well under the 32K threshold — so we
+        // expect the set path.
         let ctx = SessionContext::new();
         let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, false)]));
         let mt = MemTable::try_new(
@@ -354,19 +574,74 @@ mod tests {
             let mut s = wrapper.execute(p, Arc::new(TaskContext::default())).unwrap();
             while let Some(_batch) = s.try_next().await.unwrap() {}
         }
-        // Sideband should now have a published predicate.
         let preds = sideband.peek().expect("sideband was not published to");
-        assert_eq!(preds.len(), 1);
+        // Lever 3 is gated behind EMAT_L9_EMIT_RANGE=1; default-off
+        // means we get exactly the primary predicate here.
+        assert_eq!(preds.len(), 1, "expected I64InSet only, got {preds:?}");
+        match &preds[0] {
+            ColumnPredicate::I64InSet { col_idx, set } => {
+                assert_eq!(*col_idx, 42);
+                assert_eq!(set.len(), 9, "expected 9 distinct keys");
+                for k in 1i64..=9 {
+                    assert!(set.contains(k), "missing key {k}");
+                }
+                assert!(!set.contains(999_999));
+                assert!(!set.contains(0));
+            }
+            other => panic!("expected I64InSet, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn publishes_bloom_when_build_exceeds_set_threshold() {
+        // L9.HashSet — with a build that genuinely exceeds the 32K
+        // default threshold, every partition's set overflows and we
+        // fall back to the bloom path. We use 40_000 distinct keys
+        // (well past 32_768) to drive the overflow without mutating
+        // the global env var (which would race with other parallel
+        // tests in this crate).
+        let n_keys = 40_000i64;
+        let keys: Vec<i64> = (0..n_keys).collect();
+        let ctx = SessionContext::new();
+        let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, false)]));
+        let mt = MemTable::try_new(schema.clone(), vec![vec![make_batch(keys.clone())]])
+            .unwrap();
+        ctx.register_table("t", Arc::new(mt)).unwrap();
+        let plan = ctx
+            .sql("SELECT k FROM t")
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+
+        let sideband = BridgeFilterSideband::new();
+        let wrapper = BuildSideBloomEmitterExec::try_new(
+            plan.clone(),
+            0,
+            42,
+            sideband.clone(),
+            n_keys as usize,
+        )
+        .unwrap();
+        use datafusion::physical_plan::ExecutionPlanProperties;
+        let n = wrapper.properties().output_partitioning().partition_count();
+        for p in 0..n {
+            let mut s = wrapper.execute(p, Arc::new(TaskContext::default())).unwrap();
+            while let Some(_batch) = s.try_next().await.unwrap() {}
+        }
+        let preds = sideband.peek().expect("sideband was not published to");
+        // Lever 3 default-off; expect only the bloom predicate here.
+        assert_eq!(preds.len(), 1, "expected I64InBloom only, got {preds:?}");
         match &preds[0] {
             ColumnPredicate::I64InBloom { col_idx, bloom } => {
                 assert_eq!(*col_idx, 42);
-                for k in 1i64..=9 {
+                // Spot-check a few keys made it into the bloom.
+                for &k in &[0i64, 1, 1000, 39_999] {
                     assert!(bloom.might_contain_i64(k), "missing key {k}");
                 }
-                // Definite-miss key (unlikely false positive).
-                assert!(!bloom.might_contain_i64(999_999));
             }
-            other => panic!("expected I64InBloom, got {other:?}"),
+            other => panic!("expected I64InBloom after overflow, got {other:?}"),
         }
     }
 
