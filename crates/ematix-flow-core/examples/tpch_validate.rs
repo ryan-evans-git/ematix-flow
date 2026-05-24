@@ -398,6 +398,12 @@ async fn run_ematix(data_dir: &Path, sql: &str) -> Result<Vec<Vec<Cell>>, Box<dy
             Ok(TreeNodeRecursion::Continue)
         });
         eprintln!("LeftSemi/Anti node count in optimized plan: {semi_count}");
+
+        // Also dump the physical plan to inspect build/probe sides.
+        let phys = ctx.state().create_physical_plan(&plan).await?;
+        let formatted =
+            datafusion::physical_plan::displayable(phys.as_ref()).indent(true).to_string();
+        eprintln!("=== PHYSICAL PLAN ===\n{formatted}=====================");
     }
     let batches = ctx.sql(sql).await?.collect().await?;
     let mut out: Vec<Vec<Cell>> = Vec::new();
