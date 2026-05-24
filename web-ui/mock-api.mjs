@@ -176,6 +176,50 @@ const WORKFLOWS = [
       { kind: "schedule", state: "active", label: "*/15 * * * * (UTC)" },
     ],
   },
+  // Demonstrates the composite `after_expr` trigger shape: nested
+  // AllOf / AnyOf with leaf job dependencies. Each member carries
+  // its own state (`ready` / `pending` / `failed`) so the renderer
+  // shows the per-element status dot and aggregates them at each
+  // composite level. Two-level nesting:
+  //   AllOf(
+  //     ingest_orders [ready],
+  //     AnyOf(
+  //       feature_views_ready [ready],
+  //       backfill_complete   [pending]
+  //     )
+  //   )
+  // Read: "fire after ingest_orders has finished AND (feature views
+  // are ready OR backfill has completed)" — common shape for jobs
+  // that gate on a primary upstream plus a fallback signal.
+  {
+    name: "data_quality_gate",
+    kind: "declared",
+    jobs: ["validate_invariants", "publish_qa_report"],
+    edges: [
+      { from: "validate_invariants", to: "publish_qa_report" },
+    ],
+    triggers: [
+      {
+        kind: "after_expr",
+        state: "pending",
+        expr: {
+          kind: "all",
+          state: "pending",
+          members: [
+            { kind: "leaf", name: "ingest_orders", state: "ready" },
+            {
+              kind: "any",
+              state: "pending",
+              members: [
+                { kind: "leaf", name: "feature_views_ready", state: "ready" },
+                { kind: "leaf", name: "backfill_complete",   state: "pending" },
+              ],
+            },
+          ],
+        },
+      },
+    ],
+  },
 ];
 
 // ----- Fixture: runs -----
