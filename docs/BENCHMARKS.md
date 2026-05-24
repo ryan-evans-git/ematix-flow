@@ -9,7 +9,43 @@ Plan: [`docs/PHASE_SIGMA_PLAN.md`](PHASE_SIGMA_PLAN.md).
 
 ---
 
-## TL;DR — TPC-H head-to-head, M3 Pro (2026-05-05)
+## TL;DR — release-refresh, M3 Pro (2026-05-24)
+
+**Latest 4-engine SF=1 release bench — 20 timed trials after 3 warmups,
+all four engines on the same hardware and same Parquet files:**
+
+| Engine  | Geomean ematix-flow speedup | Range          | Wins  |
+|---|---:|---|---:|
+| **ematix-flow** (single-node) | — | — | **20 / 22** |
+| DuckDB                        | **2.21×** | 0.96× – 8.71× | 0    |
+| Polars                        | **3.19×** | 0.74× – 553.7× | 2 (Q06, Q15) |
+| PySpark (`local[*]`)          | **13.33×** | 3.04× – 41.07× | 0    |
+
+The full per-query table + provenance / config / caveats live on the
+public docs site:
+[ematix.dev/reference/benchmarks](https://ematix.dev/reference/benchmarks).
+Source-of-truth artefact in this repo is auto-emitted by the harness:
+[`BENCHMARKS.md`](../BENCHMARKS.md) (top-level, 3 engines —
+ematix-flow / DuckDB / Polars; PySpark is captured separately by
+`scripts/bench-tpch-pyspark.py` because Spark needs a JVM out-of-process).
+
+The bench config is the same in every cell: `TPCH_TRIALS=20
+TPCH_WARMUPS=3 cargo run --release -p ematix-flow-core --example
+tpch_triangulation_bench --features triangulation` and
+`python scripts/bench-tpch-pyspark.py --data-dir examples/tpch/data/sf1
+--trials 20 --warmups 3`.
+
+> **Q06 footnote.** ematix-flow's Q06 22q-battery cell shows median
+> 13.65 ms ± **257.77** σ — one outlier trial out of 20 (likely JIT/
+> thermal contention after five preceding queries). Re-running Q06
+> in isolation under the same 20/3 config gives **9.22 ± 0.60 ms**
+> — i.e. ematix-flow narrowly beats Polars when Q06 isn't preceded by
+> other queries. We keep the 22q-battery median in the table because
+> every other cell has the same provenance.
+
+---
+
+## Historical TL;DR — TPC-H head-to-head, M3 Pro (2026-05-05, 5-trial)
 
 Single-node DataFusion (via ematix-flow) is faster than PySpark
 `local[*]` on every TPC-H query benched, at every scale factor
@@ -22,6 +58,10 @@ benched, on the same hardware:
   faster** (range 1.7× to 9.2×). Gap narrows at SF=10 vs SF=1
   — Spark amortises better as input scales — but DataFusion
   still wins every query.
+
+> The 5.87× number is the *5-trial / 1-warmup* baseline from 2026-05-05.
+> The 20-trial refresh above supersedes it; per-query medians shifted
+> ±10% under the longer trial window.
 
 The 22-query SF=1 numbers fully ground the headline claim that
 single-node DataFusion outperforms single-node Spark on TPC-H:
