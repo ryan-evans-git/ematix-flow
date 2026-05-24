@@ -10870,3 +10870,15 @@ dependencies = [
  "cc",
  "pkg-config",
 ]
+
+[[patch.unused]]
+name = "ematix-parquet-codec"
+version = "0.15.0"
+
+[[patch.unused]]
+name = "ematix-parquet-format"
+version = "0.15.0"
+
+[[patch.unused]]
+name = "ematix-parquet-io"
+version = "0.15.0"

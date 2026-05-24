@@ -7,7 +7,11 @@ use std::path::PathBuf;
 fn main() {
     let dir =
         std::env::var("TPCH_DATA_DIR").unwrap_or_else(|_| "examples/tpch/data/sf10".to_string());
-    let path = PathBuf::from(&dir).join("lineitem.parquet");
+    // Q06.a (2026-05-24): optional filename override so the LZ4_RAW
+    // sibling can be inspected without renaming the canonical file.
+    let filename =
+        std::env::var("TPCH_LINEITEM_FILE").unwrap_or_else(|_| "lineitem.parquet".to_string());
+    let path = PathBuf::from(&dir).join(&filename);
     let file = ParquetFile::open(&path).expect("open");
     let md = file.metadata().expect("md");
     let n_rgs = md.row_groups.len();
