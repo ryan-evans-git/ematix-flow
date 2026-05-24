@@ -348,6 +348,13 @@ async fn run_ematix(data_dir: &Path, sql: &str) -> Result<Vec<Vec<Cell>>, Box<dy
         .with_physical_optimizer_rule(Arc::new(EnableDictGroupCountRule))
         .with_physical_optimizer_rule(Arc::new(InjectFilterMultiAggRule))
         .with_physical_optimizer_rule(Arc::new(InjectFilterSumRule));
+    // Σ.Q.M: synthetic LeftSemi producer. Must precede L10 in
+    // registration order.
+    if std::env::var_os("EMAT_SYNTHETIC_LEFT_SEMI").is_some() {
+        builder = builder.with_optimizer_rule(Arc::new(
+            ematix_flow_core::synthetic_left_semi_rule::SyntheticLeftSemiRule,
+        ));
+    }
     builder = builder.with_optimizer_rule(Arc::new(PushDownLeftSemiRule));
     builder = builder.with_physical_optimizer_rule(Arc::new(SwapSemiJoinBuildSideRule));
     builder = builder.with_physical_optimizer_rule(Arc::new(EnableRobinHoodSumF64Rule));

@@ -1445,6 +1445,21 @@ impl TableProvider for EmatixFastParquetTableProvider {
         TableType::Base
     }
 
+    /// Σ.Q.M (2026-05-23): expose the file-metadata-derived row count
+    /// so logical optimizer rules can distinguish dim vs fact tables.
+    /// `num_rows` is read from parquet `FileMetadata::num_rows` at
+    /// registration time, so it's exact for unfiltered scans.
+    fn statistics(&self) -> Option<datafusion::common::Statistics> {
+        Some(datafusion::common::Statistics {
+            num_rows: datafusion::common::stats::Precision::Exact(self.num_rows),
+            total_byte_size: datafusion::common::stats::Precision::Absent,
+            column_statistics: vec![
+                datafusion::common::ColumnStatistics::new_unknown();
+                self.schema.fields().len()
+            ],
+        })
+    }
+
     /// Phase 3 pushdown: single-column AND-conjunction of `col OP lit`
     /// where col is Int32/Date32. Other shapes return `Unsupported`
     /// and stay in DataFusion's residual FilterExec.

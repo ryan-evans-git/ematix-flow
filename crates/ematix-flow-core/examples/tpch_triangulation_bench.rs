@@ -350,6 +350,18 @@ async fn build_ematix_ctx(
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
     if push_semi_enabled {
+        // Σ.Q.M (synthetic LeftSemi producer) MUST run BEFORE Σ.Q.L10
+        // (semi pushdown consumer). DataFusion runs custom rules in
+        // registration order, so add M first.
+        let synth_semi_enabled = std::env::var("EMAT_SYNTHETIC_LEFT_SEMI")
+            .ok()
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        if synth_semi_enabled {
+            builder = builder.with_optimizer_rule(Arc::new(
+                ematix_flow_core::synthetic_left_semi_rule::SyntheticLeftSemiRule,
+            ));
+        }
         builder = builder.with_optimizer_rule(Arc::new(PushDownLeftSemiRule));
     }
     // Σ.Q.L1b: opt-in via EMAT_RH_SUM_F64=1. Routes

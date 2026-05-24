@@ -86,6 +86,11 @@ pub mod swap_semi_join_build_rule;
 // where an IN-subquery decorrelates into a LeftSemi placed above
 // every join.
 pub mod push_down_left_semi_rule;
+// Σ.Q.M: synthesise LeftSemi joins above Inner joins where one side is
+// a filtered dim and the other is a fact table — the static analogue
+// of DuckDB's dynamic-filter propagation. Composes with Σ.Q.L10 which
+// then pushes the synthesised LeftSemi down to wrap the fact scan.
+pub mod synthetic_left_semi_rule;
 // Σ.P.1: session-scoped subquery CSE. SharedSubtreeExec wraps a
 // duplicated subtree; both consumers share an Arc<CachedBatches> so
 // the first execute() computes and the rest replay. Backing storage
