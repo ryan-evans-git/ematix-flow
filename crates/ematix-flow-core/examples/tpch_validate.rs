@@ -382,6 +382,23 @@ async fn run_ematix(data_dir: &Path, sql: &str) -> Result<Vec<Vec<Cell>>, Box<dy
             ctx.register_table(*t, Arc::new(prov))?;
         }
     }
+    if std::env::var_os("EMAT_DUMP_PLAN").is_some() {
+        let df = ctx.sql(sql).await?;
+        let plan = df.clone().into_optimized_plan()?;
+        eprintln!("=== OPTIMIZED LOGICAL PLAN ===\n{plan}\n==============================");
+        let mut semi_count = 0usize;
+        use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+        use datafusion::logical_expr::{JoinType, LogicalPlan as LP};
+        let _ = plan.apply(|node| {
+            if let LP::Join(j) = node {
+                if matches!(j.join_type, JoinType::LeftSemi | JoinType::LeftAnti) {
+                    semi_count += 1;
+                }
+            }
+            Ok(TreeNodeRecursion::Continue)
+        });
+        eprintln!("LeftSemi/Anti node count in optimized plan: {semi_count}");
+    }
     let batches = ctx.sql(sql).await?.collect().await?;
     let mut out: Vec<Vec<Cell>> = Vec::new();
     for batch in &batches {
