@@ -374,8 +374,18 @@ async fn build_ematix_ctx(
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
     if rt_bloom_enabled {
-        builder =
-            builder.with_physical_optimizer_rule(Arc::new(EnableRuntimeBloomSidebandRule::default()));
+        // Σ.Q.L15: tighter selectivity ratio + Inner-join L9 ON via env.
+        // ratio=1024 gates out the L4'-style net-negative s⋈l firing
+        // while still firing on small-dim → fact pushdowns.
+        let ratio = std::env::var("EMAT_RT_BLOOM_RATIO")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(64);
+        let allow_inner = std::env::var("EMAT_RT_BLOOM_INNER_JOIN").is_ok();
+        builder = builder.with_physical_optimizer_rule(Arc::new(EnableRuntimeBloomSidebandRule {
+            min_probe_to_build_ratio: ratio,
+            allow_inner_join: allow_inner,
+        }));
     }
     // Σ.Q.L4′: install the in-scan bloom pushdown rule with an empty
     // shared bloom slot. `run_ematix_flow` swaps the slot's contents
@@ -407,7 +417,17 @@ async fn build_ematix_ctx(
             .ok()
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
-        let use_emat = *t == "lineitem" || (orders_as_emat && *t == "orders");
+        // Σ.Q.L15: when EMAT_ALL_TABLES_EMAT=1, register every TPC-H
+        // table via EmatixFastParquetTableProvider. Lets the L9 runtime
+        // bloom sideband target supplier/customer/etc. scans (otherwise
+        // those land on FastParquet and L9's find_probe_scan_for_column
+        // skips them).
+        let all_emat = std::env::var("EMAT_ALL_TABLES_EMAT")
+            .ok()
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        let use_emat =
+            all_emat || *t == "lineitem" || (orders_as_emat && *t == "orders");
         if use_emat {
             // Emat for lineitem with late-mat ON (default since
             // 2026-05-16 + the misaligned-bitmap-offset fix in

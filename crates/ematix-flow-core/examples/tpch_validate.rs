@@ -351,13 +351,22 @@ async fn run_ematix(data_dir: &Path, sql: &str) -> Result<Vec<Vec<Cell>>, Box<dy
     builder = builder.with_optimizer_rule(Arc::new(PushDownLeftSemiRule));
     builder = builder.with_physical_optimizer_rule(Arc::new(SwapSemiJoinBuildSideRule));
     builder = builder.with_physical_optimizer_rule(Arc::new(EnableRobinHoodSumF64Rule));
-    builder = builder
-        .with_physical_optimizer_rule(Arc::new(EnableRuntimeBloomSidebandRule::default()));
+    // Σ.Q.L15: Inner-L9 + tight ratio + all-Emat enabled by env.
+    let l15 = std::env::var_os("L15").is_some();
+    let l9_rule = if l15 {
+        EnableRuntimeBloomSidebandRule {
+            min_probe_to_build_ratio: 1024,
+            allow_inner_join: true,
+        }
+    } else {
+        EnableRuntimeBloomSidebandRule::default()
+    };
+    builder = builder.with_physical_optimizer_rule(Arc::new(l9_rule));
     let state = builder.build();
     let ctx = SessionContext::new_with_state(state);
     for t in TPCH_TABLES {
         let path = data_dir.join(format!("{t}.parquet"));
-        let use_emat = *t == "lineitem" || *t == "orders";
+        let use_emat = l15 || *t == "lineitem" || *t == "orders";
         if use_emat {
             let prov = EmatixFastParquetTableProvider::try_new(path.to_string_lossy())?;
             ctx.register_table(*t, Arc::new(prov))?;
