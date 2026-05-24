@@ -3834,9 +3834,7 @@ dependencies = [
 
 [[package]]
 name = "ematix-parquet-codec"
-version = "0.14.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1e2595ca5b1748ae44fe9bc8d4df77955d599d3bc7027571eeabeb59427b6a4a"
+version = "0.15.0"
 dependencies = [
  "brotli",
  "ematix-parquet-format",
@@ -3849,15 +3847,11 @@ dependencies = [
 
 [[package]]
 name = "ematix-parquet-format"
-version = "0.14.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5bfd4da06bddd1c48bacf3cff6565dc399160a818b03030d7a646bfc1d24419f"
+version = "0.15.0"
 
 [[package]]
 name = "ematix-parquet-io"
-version = "0.14.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "85efd9342cb2fdd49befe3e514e8278c5115d0c54269c7fa9399e3f4a5863b50"
+version = "0.15.0"
 dependencies = [
  "ematix-parquet-format",
 ]
@@ -10870,15 +10864,3 @@ dependencies = [
  "cc",
  "pkg-config",
 ]
-
-[[patch.unused]]
-name = "ematix-parquet-codec"
-version = "0.15.0"
-
-[[patch.unused]]
-name = "ematix-parquet-format"
-version = "0.15.0"
-
-[[patch.unused]]
-name = "ematix-parquet-io"
-version = "0.15.0"

@@ -37,6 +37,7 @@ use ematix_flow_core::inbloom_scan_pushdown_rule::EnableInBloomScanPushdownRule;
 use ematix_flow_core::local_bloom_emitter::{LocalBloomOptions, emit_build_side_blooms_local};
 use ematix_flow_core::bloom::ContextBlooms;
 use ematix_flow_core::robin_hood_sum_f64_exec::EnableRobinHoodSumF64Rule;
+use ematix_flow_core::runtime_bloom_cascading_rule::EnableCascadingBloomRule;
 use ematix_flow_core::runtime_bloom_sideband_rule::EnableRuntimeBloomSidebandRule;
 use ematix_flow_core::push_down_left_semi_rule::PushDownLeftSemiRule;
 use ematix_flow_core::swap_semi_join_build_rule::SwapSemiJoinBuildSideRule;
@@ -370,11 +371,13 @@ async fn build_ematix_ctx(
     // Σ.Q.L10: logical-plan rewrite — push LeftSemi past Inner joins
     // down to its target table. Closes the Q18-shape structural gap
     // to DuckDB (semi-filter pushed to wrap orders directly,
-    // eliminating the 60M-row intermediate). Opt-in via EMAT_PUSH_SEMI=1.
+    // eliminating the 60M-row intermediate). **Default ON at the
+    // milestone config (0.738 / 17 wins SF=10);** set
+    // `EMAT_PUSH_SEMI=0` to disable for A/B benching.
     let push_semi_enabled = std::env::var("EMAT_PUSH_SEMI")
         .ok()
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
+        .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+        .unwrap_or(true);
     if push_semi_enabled {
         // Σ.Q.M (synthetic LeftSemi producer) MUST run BEFORE Σ.Q.L10
         // (semi pushdown consumer). DataFusion runs custom rules in
@@ -390,45 +393,68 @@ async fn build_ematix_ctx(
         }
         builder = builder.with_optimizer_rule(Arc::new(PushDownLeftSemiRule));
     }
-    // Σ.Q.L1b: opt-in via EMAT_RH_SUM_F64=1. Routes
-    // SUM(Float64) GROUP BY Int64 through RobinHoodSumF64Exec.
-    // Default OFF (per [[optimizer-codegen-sensitivity]] — adding a
-    // rule costs ~7% geomean before it does any work; needs Q18 win
-    // to amortise).
+    // Σ.Q.L1b: routes SUM(Float64) GROUP BY Int64 through
+    // RobinHoodSumF64Exec ([[sigma-nf3-beats-stock]]). **Default ON
+    // at milestone config** (closes Q22 −18 ms, Q04 −26 ms); set
+    // `EMAT_RH_SUM_F64=0` to disable for A/B.
     let rh_sum_f64_enabled = std::env::var("EMAT_RH_SUM_F64")
         .ok()
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
+        .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+        .unwrap_or(true);
     if rh_sum_f64_enabled {
         builder =
             builder.with_physical_optimizer_rule(Arc::new(EnableRobinHoodSumF64Rule));
     }
-    // Σ.Q.L9: opt-in via EMAT_RT_BLOOM_SIDEBAND=1. Threads a sideband
-    // between HashJoinExec build and probe-side EmatixFastParquetExec
-    // so the build-side bloom is captured as a side-effect of the
-    // regular HashJoin build phase.
+    // Σ.Q.L9: threads a sideband between HashJoinExec build and
+    // probe-side EmatixFastParquetExec so the build-side bloom is
+    // captured as a side-effect of the regular HashJoin build phase.
+    // **Default ON at milestone config**; set `EMAT_RT_BLOOM_SIDEBAND=0`
+    // to disable for A/B.
     let rt_bloom_enabled = std::env::var("EMAT_RT_BLOOM_SIDEBAND")
         .ok()
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
+        .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+        .unwrap_or(true);
     if rt_bloom_enabled {
-        // Σ.Q.L15: tighter selectivity ratio + Inner-join L9 ON via env.
-        // ratio=1024 gates out the L4'-style net-negative s⋈l firing
-        // while still firing on small-dim → fact pushdowns.
+        // Σ.Q.L15: tighter selectivity ratio + Inner-join L9 default
+        // ON at milestone config. ratio=1024 gates out the L4'-style
+        // net-negative s⋈l firing while still firing on small-dim →
+        // fact pushdowns. Set `EMAT_RT_BLOOM_RATIO=64` and
+        // `EMAT_RT_BLOOM_INNER_JOIN=0` to revert to pre-L15.
         let ratio = std::env::var("EMAT_RT_BLOOM_RATIO")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(64);
-        let allow_inner = std::env::var("EMAT_RT_BLOOM_INNER_JOIN").is_ok();
+            .unwrap_or(1024);
+        let allow_inner = std::env::var("EMAT_RT_BLOOM_INNER_JOIN")
+            .ok()
+            .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+            .unwrap_or(true);
         let require_filtered_build = std::env::var("EMAT_L9_REQUIRE_FILTERED_BUILD")
             .ok()
             .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
             .unwrap_or(true);
-        builder = builder.with_physical_optimizer_rule(Arc::new(EnableRuntimeBloomSidebandRule {
-            min_probe_to_build_ratio: ratio,
-            allow_inner_join: allow_inner,
-            require_filtered_build,
-        }));
+        // Σ.S.B: install cascading variant when EMAT_L9_CASCADE=1.
+        // Strict superset — same gates plus FK-chain extras.
+        let cascade = std::env::var_os("EMAT_L9_CASCADE").is_some();
+        if cascade {
+            let max_extras = std::env::var("EMAT_L9_CASCADE_MAX")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(4);
+            builder = builder.with_physical_optimizer_rule(Arc::new(EnableCascadingBloomRule {
+                min_probe_to_build_ratio: ratio,
+                allow_inner_join: allow_inner,
+                require_filtered_build,
+                max_extras_per_emitter: max_extras,
+            }));
+        } else {
+            builder = builder.with_physical_optimizer_rule(Arc::new(
+                EnableRuntimeBloomSidebandRule {
+                    min_probe_to_build_ratio: ratio,
+                    allow_inner_join: allow_inner,
+                    require_filtered_build,
+                },
+            ));
+        }
     }
     // Σ.Q.L4′: install the in-scan bloom pushdown rule with an empty
     // shared bloom slot. `run_ematix_flow` swaps the slot's contents
@@ -460,15 +486,17 @@ async fn build_ematix_ctx(
             .ok()
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
-        // Σ.Q.L15: when EMAT_ALL_TABLES_EMAT=1, register every TPC-H
-        // table via EmatixFastParquetTableProvider. Lets the L9 runtime
-        // bloom sideband target supplier/customer/etc. scans (otherwise
-        // those land on FastParquet and L9's find_probe_scan_for_column
-        // skips them).
+        // Σ.Q.L15: register every TPC-H table via
+        // EmatixFastParquetTableProvider. Lets the L9 runtime bloom
+        // sideband target supplier/customer/etc. scans (otherwise
+        // those land on FastParquet and L9's
+        // find_probe_scan_for_column skips them). **Default ON at
+        // milestone config;** set `EMAT_ALL_TABLES_EMAT=0` to revert
+        // to lineitem-only Emat.
         let all_emat = std::env::var("EMAT_ALL_TABLES_EMAT")
             .ok()
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
+            .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+            .unwrap_or(true);
         let use_emat =
             all_emat || *t == "lineitem" || (orders_as_emat && *t == "orders");
         if use_emat {

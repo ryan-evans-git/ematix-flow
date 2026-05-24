@@ -232,6 +232,19 @@ pub mod build_side_bloom_emitter_exec;
 // BuildSideBloomEmitterExec) and the probe-side EmatixFastParquetExec
 // (via with_runtime_sideband). Opt-in via install_runtime_bloom_sideband_rule.
 pub mod runtime_bloom_sideband_rule;
+// Σ.S.B (2026-05-24): plan-time FK-chain detection helper shared by
+// the cascading-L9 prototype and the general rule. Pure-fn stem
+// extraction + plan walker that surfaces candidate EmatixFastParquetExec
+// scans by column-name stem. The cascading rule layers join-path
+// confirmation on top of this — the helper itself only proposes
+// candidates, the rule commits.
+pub mod fk_chain;
+// Σ.S.B (2026-05-24): cascading-L9 rule. Opt-in superset of the
+// non-cascading L9 base rule: per HashJoinExec, finds extra
+// FK-chained scans in the probe subtree via fk_chain, then publishes
+// the build-side bloom to each via a per-scan sideband (build runs
+// once; bloom Arc shared). Install via install_cascading_bloom_rule.
+pub mod runtime_bloom_cascading_rule;
 // Σ.O (2026-05-21): in-memory LRU cache of decoded RecordBatch by
 // (file_path, row_group_idx, projection_hash). Avoids re-decoding
 // the same parquet column chunks across queries in the same session.

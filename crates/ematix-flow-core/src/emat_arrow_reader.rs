@@ -213,9 +213,11 @@ impl Default for RowGroupDecodeCache {
 }
 
 // Σ.O.c.2 — process-wide row-group decode cache slot. Settable at
-// runtime via `set_process_rg_decode_cache`. Default reads
-// `EMAT_RG_DECODE_CACHE=1` on first lookup (and `EMAT_RG_DECODE_CACHE_
-// BYTES=<n>` overrides the default 1 GiB cap).
+// runtime via `set_process_rg_decode_cache`. **Default ON at the
+// 2026-05-24 milestone config** (closes Q13 −58 ms, Q21 −41 ms,
+// Q18 −35 ms on TPC-H SF=10). Override via `EMAT_RG_DECODE_CACHE=0`
+// to disable for A/B benching; `EMAT_RG_DECODE_CACHE_BYTES=<n>`
+// overrides the default 1 GiB cap.
 //
 // `RwLock` is used so the hot-path lookup (in provider wire-up) is
 // shared-read; only install/uninstall takes the write lock.
@@ -229,8 +231,8 @@ fn process_rg_decode_cache_slot()
         let initial = {
             let enabled = std::env::var("EMAT_RG_DECODE_CACHE")
                 .ok()
-                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-                .unwrap_or(false);
+                .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+                .unwrap_or(true);
             if enabled {
                 let cap = std::env::var("EMAT_RG_DECODE_CACHE_BYTES")
                     .ok()

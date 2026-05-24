@@ -85,6 +85,13 @@ pub struct BuildSideBloomEmitterExec {
     /// matches the HashJoin's other side to an EmatixFastParquetExec.
     target_col_idx: usize,
     sideband: BridgeFilterSideband,
+    /// Σ.S.B (2026-05-24) — cascading sidebands. The bloom is built
+    /// once on the build side; the publish step shares the bloom Arc
+    /// and emits one predicate per extra target into its own sideband.
+    /// Each `(col_idx, sideband)` corresponds to a *different* probe-
+    /// side scan reached by walking past the immediate probe via an
+    /// FK chain. Empty in the non-cascading L9 path (default).
+    extra_targets: Vec<(usize, BridgeFilterSideband)>,
     /// Per-partition local blooms, pushed in by each finished
     /// partition. Drained + merged + published when `completed`
     /// reaches `n_partitions`.
@@ -129,6 +136,34 @@ impl BuildSideBloomEmitterExec {
         sideband: BridgeFilterSideband,
         expected_total_keys: usize,
     ) -> DfResult<Self> {
+        Self::try_new_with_extras(
+            input,
+            key_col_idx,
+            target_col_idx,
+            sideband,
+            Vec::new(),
+            expected_total_keys,
+        )
+    }
+
+    /// Σ.S.B — construct an emitter with one primary target plus a
+    /// list of cascading extras. The bloom is built ONCE; the publish
+    /// step shares the bloom Arc across the primary and every extra,
+    /// emitting one predicate per sideband with that sideband's
+    /// target col_idx.
+    ///
+    /// `extras` is `Vec<(target_col_idx, sideband)>`; each entry must
+    /// reference a *distinct* probe-side scan than the primary and
+    /// than every other extra. The caller (cascading rule) is
+    /// responsible for that uniqueness check.
+    pub fn try_new_with_extras(
+        input: Arc<dyn ExecutionPlan>,
+        key_col_idx: usize,
+        target_col_idx: usize,
+        sideband: BridgeFilterSideband,
+        extra_targets: Vec<(usize, BridgeFilterSideband)>,
+        expected_total_keys: usize,
+    ) -> DfResult<Self> {
         let in_schema = input.schema();
         if key_col_idx >= in_schema.fields().len() {
             return Err(DataFusionError::Internal(format!(
@@ -155,6 +190,7 @@ impl BuildSideBloomEmitterExec {
             key_col_idx,
             target_col_idx,
             sideband,
+            extra_targets,
             local_blooms: Arc::new(Mutex::new(Vec::with_capacity(n_partitions))),
             local_sets: Arc::new(Mutex::new(Vec::with_capacity(n_partitions))),
             local_ranges: Arc::new(Mutex::new(Vec::with_capacity(n_partitions))),
@@ -173,6 +209,11 @@ impl BuildSideBloomEmitterExec {
     }
     pub fn sideband(&self) -> &BridgeFilterSideband {
         &self.sideband
+    }
+    /// Σ.S.B — the list of cascading extra `(col_idx, sideband)`
+    /// pairs. Empty in the non-cascading L9 path.
+    pub fn extra_targets(&self) -> &[(usize, BridgeFilterSideband)] {
+        &self.extra_targets
     }
 }
 
@@ -208,11 +249,12 @@ impl ExecutionPlan for BuildSideBloomEmitterExec {
                 "BuildSideBloomEmitterExec requires exactly 1 child".into(),
             )
         })?;
-        Ok(Arc::new(Self::try_new(
+        Ok(Arc::new(Self::try_new_with_extras(
             new_input,
             self.key_col_idx,
             self.target_col_idx,
             self.sideband.clone(),
+            self.extra_targets.clone(),
             self.expected_keys_per_partition * self.n_partitions,
         )?))
     }
@@ -225,6 +267,10 @@ impl ExecutionPlan for BuildSideBloomEmitterExec {
         let key_col_idx = self.key_col_idx;
         let target_col_idx = self.target_col_idx;
         let sideband = self.sideband.clone();
+        // Σ.S.B — clone the cascade extras so the publish closure can
+        // iterate them on the last-partition finalize. Each extra is
+        // `(col_idx, sideband)` for a downstream FK-chained scan.
+        let extra_targets = self.extra_targets.clone();
         let local_blooms = self.local_blooms.clone();
         let local_sets = self.local_sets.clone();
         let local_ranges = self.local_ranges.clone();
@@ -338,6 +384,7 @@ impl ExecutionPlan for BuildSideBloomEmitterExec {
                 completed,
                 sideband,
                 target_col_idx,
+                extra_targets,
                 n_partitions,
                 set_threshold,
             ),
@@ -353,6 +400,7 @@ impl ExecutionPlan for BuildSideBloomEmitterExec {
                 completed,
                 sideband,
                 target_col_idx,
+                extra_targets,
                 n_partitions,
                 set_threshold,
             )| async move {
@@ -371,6 +419,7 @@ impl ExecutionPlan for BuildSideBloomEmitterExec {
                             completed,
                             sideband,
                             target_col_idx,
+                            extra_targets,
                             n_partitions,
                             set_threshold,
                         ),
@@ -426,10 +475,19 @@ impl ExecutionPlan for BuildSideBloomEmitterExec {
                                 // L9.HashSet — if every partition kept
                                 // its set (none overflowed) AND the
                                 // union stays under the threshold,
-                                // publish the exact set. Otherwise fall
-                                // back to the bloom path.
+                                // build the shared exact-set payload.
+                                // Otherwise fall back to a shared bloom
+                                // payload merged from all partitions.
+                                //
+                                // Σ.S.B (2026-05-24): the payload is
+                                // built ONCE and shared across the
+                                // primary sideband and every extra
+                                // cascade target. The col_idx differs
+                                // per-target so we construct one
+                                // predicate per (col_idx, sideband)
+                                // pair below.
                                 let all_some = sets.iter().all(|s| s.is_some());
-                                let primary = if all_some {
+                                let shared_set: Option<Arc<I64Set>> = if all_some {
                                     let mut merged = I64Set::with_keys(set_threshold);
                                     let mut overflow = false;
                                     for s in &sets {
@@ -441,36 +499,27 @@ impl ExecutionPlan for BuildSideBloomEmitterExec {
                                             }
                                         }
                                     }
-                                    if overflow {
-                                        None
-                                    } else {
-                                        Some(ColumnPredicate::I64InSet {
-                                            col_idx: target_col_idx,
-                                            set: Arc::new(merged),
-                                        })
-                                    }
+                                    if overflow { None } else { Some(Arc::new(merged)) }
                                 } else {
                                     None
                                 };
 
-                                let primary = match primary {
-                                    Some(p) => Some(p),
-                                    None => {
-                                        // Fall back to bloom path.
-                                        let mut all_blooms = shared_blooms.lock().unwrap();
-                                        if let Some(mut merged) = all_blooms.pop() {
-                                            while let Some(other) = all_blooms.pop() {
-                                                let _ = merged.union_with(&other);
-                                            }
-                                            Some(ColumnPredicate::I64InBloom {
-                                                col_idx: target_col_idx,
-                                                bloom: Arc::new(merged),
-                                            })
-                                        } else {
-                                            None
+                                let shared_bloom: Option<Arc<BloomFilter>> = if shared_set.is_none()
+                                {
+                                    let mut all_blooms = shared_blooms.lock().unwrap();
+                                    if let Some(mut merged) = all_blooms.pop() {
+                                        while let Some(other) = all_blooms.pop() {
+                                            let _ = merged.union_with(&other);
                                         }
+                                        Some(Arc::new(merged))
+                                    } else {
+                                        None
                                     }
+                                } else {
+                                    None
                                 };
+                                let shared_range: Option<(i64, i64)> = global_range;
+                                let _ = range_pred; // legacy local; replaced by per-target construction below
 
                                 // Publish primary + (optionally) the
                                 // range predicate. The range pred IS
@@ -499,17 +548,42 @@ impl ExecutionPlan for BuildSideBloomEmitterExec {
                                     .ok()
                                     .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                                     .unwrap_or(false);
-                                let mut preds: Vec<ColumnPredicate> = Vec::with_capacity(2);
-                                if let Some(p) = primary {
-                                    preds.push(p);
+
+                                // Σ.S.B — emit to primary AND each
+                                // cascade extra. The bloom/set Arcs are
+                                // shared (cheap refcount clone); only
+                                // the col_idx changes per-sideband.
+                                let mut all_targets: Vec<(usize, &BridgeFilterSideband)> =
+                                    Vec::with_capacity(1 + extra_targets.len());
+                                all_targets.push((target_col_idx, &sideband));
+                                for (ci, sb) in extra_targets.iter() {
+                                    all_targets.push((*ci, sb));
                                 }
-                                if emit_range {
-                                    if let Some(r) = range_pred {
-                                        preds.push(r);
+                                for (col_idx, sb) in all_targets.into_iter() {
+                                    let mut preds: Vec<ColumnPredicate> = Vec::with_capacity(2);
+                                    if let Some(set_arc) = &shared_set {
+                                        preds.push(ColumnPredicate::I64InSet {
+                                            col_idx,
+                                            set: Arc::clone(set_arc),
+                                        });
+                                    } else if let Some(bloom_arc) = &shared_bloom {
+                                        preds.push(ColumnPredicate::I64InBloom {
+                                            col_idx,
+                                            bloom: Arc::clone(bloom_arc),
+                                        });
                                     }
-                                }
-                                if !preds.is_empty() {
-                                    sideband.publish(preds);
+                                    if emit_range {
+                                        if let Some((lo, hi)) = shared_range {
+                                            preds.push(ColumnPredicate::I64Range {
+                                                col_idx,
+                                                lo,
+                                                hi,
+                                            });
+                                        }
+                                    }
+                                    if !preds.is_empty() {
+                                        sb.publish(preds);
+                                    }
                                 }
                             }
                         }
@@ -688,5 +762,138 @@ mod tests {
         }
         all_keys.sort();
         assert_eq!(all_keys, vec![100, 200, 300]);
+    }
+
+    /// Σ.S.B — extras share the bloom/set Arc and receive a predicate
+    /// with their own col_idx. Build runs once; publish iterates each
+    /// `(col_idx, sideband)` pair.
+    #[tokio::test]
+    async fn publishes_to_extras_with_per_target_col_idx() {
+        let ctx = SessionContext::new();
+        let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, false)]));
+        let mt = MemTable::try_new(
+            schema.clone(),
+            vec![vec![make_batch(vec![10, 20, 30])]],
+        )
+        .unwrap();
+        ctx.register_table("t", Arc::new(mt)).unwrap();
+        let plan = ctx
+            .sql("SELECT k FROM t")
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+
+        let primary_sb = BridgeFilterSideband::new();
+        let extra1_sb = BridgeFilterSideband::new();
+        let extra2_sb = BridgeFilterSideband::new();
+        let wrapper = BuildSideBloomEmitterExec::try_new_with_extras(
+            plan,
+            0,                  // key_col_idx
+            7,                  // primary target_col_idx
+            primary_sb.clone(),
+            vec![(11, extra1_sb.clone()), (22, extra2_sb.clone())],
+            16,
+        )
+        .unwrap();
+
+        use datafusion::physical_plan::ExecutionPlanProperties;
+        let n = wrapper.properties().output_partitioning().partition_count();
+        for p in 0..n {
+            let mut s = wrapper.execute(p, Arc::new(TaskContext::default())).unwrap();
+            while let Some(_batch) = s.try_next().await.unwrap() {}
+        }
+
+        // Primary publishes with col_idx=7.
+        let primary = primary_sb
+            .peek()
+            .expect("primary sideband was not published to");
+        assert_eq!(primary.len(), 1);
+        match &primary[0] {
+            ColumnPredicate::I64InSet { col_idx, set } => {
+                assert_eq!(*col_idx, 7);
+                for k in [10, 20, 30] {
+                    assert!(set.contains(k));
+                }
+            }
+            other => panic!("expected I64InSet @ col_idx=7, got {other:?}"),
+        }
+
+        // Extras each get their own col_idx with the SAME underlying
+        // set values.
+        for (sb, expected_col_idx) in &[(&extra1_sb, 11usize), (&extra2_sb, 22usize)] {
+            let preds = sb.peek().expect("extra sideband was not published to");
+            assert_eq!(preds.len(), 1);
+            match &preds[0] {
+                ColumnPredicate::I64InSet { col_idx, set } => {
+                    assert_eq!(*col_idx, *expected_col_idx);
+                    for k in [10, 20, 30] {
+                        assert!(set.contains(k));
+                    }
+                }
+                other => panic!("expected I64InSet @ col_idx={expected_col_idx}, got {other:?}"),
+            }
+        }
+    }
+
+    /// Σ.S.B — when the build overflows the set threshold, both
+    /// primary and extras receive an I64InBloom predicate with the
+    /// SAME shared bloom Arc (verified via `Arc::ptr_eq`) but their
+    /// own col_idx.
+    #[tokio::test]
+    async fn extras_share_bloom_arc_when_overflowing() {
+        let n_keys = 40_000i64; // overflows default 32K threshold
+        let keys: Vec<i64> = (0..n_keys).collect();
+        let ctx = SessionContext::new();
+        let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, false)]));
+        let mt = MemTable::try_new(schema.clone(), vec![vec![make_batch(keys)]]).unwrap();
+        ctx.register_table("t", Arc::new(mt)).unwrap();
+        let plan = ctx
+            .sql("SELECT k FROM t")
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+
+        let primary_sb = BridgeFilterSideband::new();
+        let extra_sb = BridgeFilterSideband::new();
+        let wrapper = BuildSideBloomEmitterExec::try_new_with_extras(
+            plan,
+            0,
+            3,
+            primary_sb.clone(),
+            vec![(99, extra_sb.clone())],
+            n_keys as usize,
+        )
+        .unwrap();
+        use datafusion::physical_plan::ExecutionPlanProperties;
+        let n = wrapper.properties().output_partitioning().partition_count();
+        for p in 0..n {
+            let mut s = wrapper.execute(p, Arc::new(TaskContext::default())).unwrap();
+            while let Some(_batch) = s.try_next().await.unwrap() {}
+        }
+
+        let primary = primary_sb.peek().expect("primary not published to");
+        let extra = extra_sb.peek().expect("extra not published to");
+        let (primary_bloom_ptr, primary_col) = match &primary[0] {
+            ColumnPredicate::I64InBloom { col_idx, bloom } => {
+                (Arc::as_ptr(bloom), *col_idx)
+            }
+            other => panic!("expected I64InBloom on primary, got {other:?}"),
+        };
+        let (extra_bloom_ptr, extra_col) = match &extra[0] {
+            ColumnPredicate::I64InBloom { col_idx, bloom } => {
+                (Arc::as_ptr(bloom), *col_idx)
+            }
+            other => panic!("expected I64InBloom on extra, got {other:?}"),
+        };
+        assert_eq!(primary_col, 3);
+        assert_eq!(extra_col, 99);
+        assert_eq!(
+            primary_bloom_ptr, extra_bloom_ptr,
+            "primary + extra should share the SAME bloom Arc"
+        );
     }
 }

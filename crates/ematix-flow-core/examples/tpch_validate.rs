@@ -29,6 +29,7 @@ use ematix_flow_core::fused_aggregate_filter_multi_agg_rule::InjectFilterMultiAg
 use ematix_flow_core::fused_aggregate_filter_sum_rule::InjectFilterSumRule;
 use ematix_flow_core::push_down_left_semi_rule::PushDownLeftSemiRule;
 use ematix_flow_core::robin_hood_sum_f64_exec::EnableRobinHoodSumF64Rule;
+use ematix_flow_core::runtime_bloom_cascading_rule::EnableCascadingBloomRule;
 use ematix_flow_core::runtime_bloom_sideband_rule::EnableRuntimeBloomSidebandRule;
 use ematix_flow_core::swap_semi_join_build_rule::SwapSemiJoinBuildSideRule;
 
@@ -358,18 +359,43 @@ async fn run_ematix(data_dir: &Path, sql: &str) -> Result<Vec<Vec<Cell>>, Box<dy
     builder = builder.with_optimizer_rule(Arc::new(PushDownLeftSemiRule));
     builder = builder.with_physical_optimizer_rule(Arc::new(SwapSemiJoinBuildSideRule));
     builder = builder.with_physical_optimizer_rule(Arc::new(EnableRobinHoodSumF64Rule));
-    // Σ.Q.L15: Inner-L9 + tight ratio + all-Emat enabled by env.
-    let l15 = std::env::var_os("L15").is_some();
-    let l9_rule = if l15 {
-        EnableRuntimeBloomSidebandRule {
-            min_probe_to_build_ratio: 1024,
-            allow_inner_join: true,
-            require_filtered_build: true,
-        }
+    // Σ.Q.L15: Inner-L9 + tight ratio + all-Emat. **Default ON at
+    // milestone config**; set `L15=0` to revert to pre-L15.
+    let l15 = std::env::var("L15")
+        .ok()
+        .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+        .unwrap_or(true);
+    // Σ.S.B: opt into the cascading variant via EMAT_L9_CASCADE=1.
+    // Strict superset of L9 base — same gates, plus FK-chain extras.
+    let cascade = std::env::var_os("EMAT_L9_CASCADE").is_some();
+    if cascade {
+        let max_extras = std::env::var("EMAT_L9_CASCADE_MAX")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(4);
+        let rule = if l15 {
+            EnableCascadingBloomRule {
+                min_probe_to_build_ratio: 1024,
+                allow_inner_join: true,
+                require_filtered_build: true,
+                max_extras_per_emitter: max_extras,
+            }
+        } else {
+            EnableCascadingBloomRule::default()
+        };
+        builder = builder.with_physical_optimizer_rule(Arc::new(rule));
     } else {
-        EnableRuntimeBloomSidebandRule::default()
-    };
-    builder = builder.with_physical_optimizer_rule(Arc::new(l9_rule));
+        let l9_rule = if l15 {
+            EnableRuntimeBloomSidebandRule {
+                min_probe_to_build_ratio: 1024,
+                allow_inner_join: true,
+                require_filtered_build: true,
+            }
+        } else {
+            EnableRuntimeBloomSidebandRule::default()
+        };
+        builder = builder.with_physical_optimizer_rule(Arc::new(l9_rule));
+    }
     let state = builder.build();
     let ctx = SessionContext::new_with_state(state);
     for t in TPCH_TABLES {
