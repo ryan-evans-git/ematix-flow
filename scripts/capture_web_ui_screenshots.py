@@ -8,377 +8,154 @@ Usage:
 Default OUT_DIR is ``../ematix.dev/public/screenshots/`` relative to
 the repo root. The script:
 
-1. Builds three flavors of demo data into in-memory ``RunHistoryStore``
-   instances (one per screenshot scenario, kept separate so the views
-   are uncluttered).
-2. Launches the FastAPI app on a free port in a background thread for
-   each scenario.
-3. Drives a headless Chromium via Playwright to navigate + capture
-   PNGs at 1440×900.
+1. Starts ``npm run dev`` in ``web-ui/`` — the Vite dev server picks
+   up ``web-ui/mock-api.mjs`` as a middleware so /api/* returns
+   realistic fixture JSON without needing a Python backend.
+2. Waits for the dev server to be ready on http://127.0.0.1:5173.
+3. Drives a headless Chromium via Playwright at 1440×900 (retina)
+   in dark color scheme to capture five PNGs:
 
-PNGs land at:
+       workflows-view.png   — #/workflows page with sub-DAG flowcharts
+       jobs-view.png        — #/jobs page with per-job last-10 strips
+       runs-list.png        — #/runs flat run history table
+       dag-flowchart.png    — #/dag cross-job flowchart
+       run-failed-restart.png — failed run detail with Restart hovered
 
-    OUT_DIR/runs-list.png
-    OUT_DIR/runs-successful.png
-    OUT_DIR/run-failed-restart.png
+4. Stops the dev server.
 
-Requires: ``ematix-flow[web]`` (FastAPI + uvicorn) and Playwright with
-the chromium browser installed (``playwright install chromium``).
+The mock data is in ``web-ui/mock-api.mjs`` — extend / tweak the
+WORKFLOWS / PIPELINES / RUNS / DAG fixtures there to evolve what the
+screenshots show.
+
+Requires: ``npm`` (Vite dev server) and Playwright with the chromium
+browser installed (``playwright install chromium``).
 """
 from __future__ import annotations
 
 import socket
+import subprocess
 import sys
-import threading
 import time
-from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-import uvicorn
-
-from ematix_flow.run_log.history import InMemoryRunHistory, RunRecord
-from ematix_flow.web.server import create_app
-
-
-UTC = timezone.utc
+DEV_PORT = 5173
+DEV_URL = f"http://localhost:{DEV_PORT}"
+WEB_UI_DIR = Path(__file__).resolve().parent.parent / "web-ui"
 
 
-def _free_port() -> int:
-    """Pick an ephemeral port the OS hasn't assigned yet."""
-    s = socket.socket()
-    s.bind(("127.0.0.1", 0))
-    p = s.getsockname()[1]
-    s.close()
-    return p
+def _port_open(port: int) -> bool:
+    # Vite binds to `localhost` (IPv6 ::1 + IPv4 127.0.0.1 only when
+    # explicitly configured) — using "localhost" lets getaddrinfo pick
+    # the right family.
+    try:
+        with socket.create_connection(("localhost", port), timeout=0.2):
+            return True
+    except OSError:
+        return False
 
 
-def _start_server(store: InMemoryRunHistory, port: int) -> threading.Thread:
-    """Start uvicorn in a background thread bound to 127.0.0.1:port."""
-    app = create_app(history=store)
-    config = uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning")
-    server = uvicorn.Server(config)
-
-    def _run() -> None:
-        server.run()
-
-    t = threading.Thread(target=_run, daemon=True)
-    t.start()
-    # Poll until the port responds.
-    for _ in range(50):
-        try:
-            with socket.create_connection(("127.0.0.1", port), timeout=0.2):
-                return t
-        except OSError:
-            time.sleep(0.1)
-    raise RuntimeError(f"server failed to come up on 127.0.0.1:{port}")
-
-
-# ----- Demo data factories ------------------------------------------
-
-
-def _runs_list_store() -> InMemoryRunHistory:
-    """Mix of streaming + batch + a failure for the headline screenshot."""
-    store = InMemoryRunHistory()
-    base = datetime(2026, 5, 20, 16, 0, 0, tzinfo=UTC)
-    # Streaming run, currently running.
-    store.record_run_record(
-        RunRecord(
-            run_id="01HQ-stream-running",
-            pipeline="events_stream",
-            status="running",
-            started_at=base,
-            kind="streaming",
-        )
+def _start_dev_server() -> subprocess.Popen | None:
+    """Start `npm run dev` and wait for it to be ready. Returns the
+    Popen handle (so the caller can terminate it), or None if a dev
+    server is already running on port 5173 (re-use it)."""
+    if _port_open(DEV_PORT):
+        print(f"  (dev server already up on {DEV_PORT} — re-using)")
+        return None
+    print("  starting npm run dev …")
+    proc = subprocess.Popen(
+        ["npm", "run", "dev"],
+        cwd=str(WEB_UI_DIR),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
     )
-    # Three successful warehouse_etl runs (oldest first).
-    for i, mins in enumerate([-90, -150, -210]):
-        ts = base + timedelta(minutes=mins)
-        store.record_run_record(
-            RunRecord(
-                run_id=f"01HQ-wh-{i}",
-                pipeline="warehouse_etl",
-                status="succeeded",
-                started_at=ts,
-                finished_at=ts + timedelta(seconds=47),
-            )
-        )
-    # The failed warehouse_etl that lives between the green ones.
-    store.record_run_record(
-        RunRecord(
-            run_id="01HQ-warehouse-fail",
-            pipeline="warehouse_etl",
-            status="failed",
-            started_at=base + timedelta(minutes=-60),
-            finished_at=base + timedelta(minutes=-60, seconds=35),
-            attempt=2,
-            failed_step="merge_payments",
-            error_summary="ValueError: amount column missing in batch 47",
-        )
-    )
-    # A long-running streaming history (succeeded after 3 hours).
-    store.record_run_record(
-        RunRecord(
-            run_id="01HQ-stream-prior",
-            pipeline="events_stream",
-            status="succeeded",
-            started_at=base + timedelta(hours=-3),
-            finished_at=base + timedelta(minutes=-1),
-            kind="streaming",
-        )
-    )
-    # A few succeeded orders_etl runs.
-    for i in range(3):
-        ts = base + timedelta(hours=-1 - i)
-        store.record_run_record(
-            RunRecord(
-                run_id=f"01HQ-orders-{i}",
-                pipeline="orders_etl",
-                status="succeeded",
-                started_at=ts,
-                finished_at=ts + timedelta(seconds=45 + i),
-            )
-        )
-    return store
+    for _ in range(100):  # up to 20s
+        if _port_open(DEV_PORT):
+            time.sleep(0.4)  # extra moment for Vite to wire mock middleware
+            return proc
+        time.sleep(0.2)
+    proc.terminate()
+    raise RuntimeError("npm run dev failed to come up on 127.0.0.1:5173")
 
 
-def _pipelines_view_store() -> InMemoryRunHistory:
-    """Four pipelines with rich last-10 histories for the pipelines
-    overview screenshot.
-
-    Mix:
-    - ``events_stream``  — streaming, currently running (LIVE pill).
-    - ``orders_etl``     — clean 10/10 green.
-    - ``warehouse_etl``  — mostly green with one failure 4 runs back
-                            (retried-then-succeeded shows as success).
-    - ``customers_sync`` — recent green track + ``next_run_at``.
-    """
-    store = InMemoryRunHistory()
-    base = datetime(2026, 5, 20, 16, 0, 0, tzinfo=UTC)
-
-    # events_stream: currently running (kind=streaming, no
-    # next_run_at — UI renders the LIVE STREAMING pill instead).
-    for i in range(9):
-        ts = base + timedelta(hours=-3 - i * 3)
-        store.record_run_record(
-            RunRecord(
-                run_id=f"01HQ-stream-{i}",
-                pipeline="events_stream",
-                status="succeeded",
-                started_at=ts,
-                finished_at=ts + timedelta(hours=2, minutes=58),
-                kind="streaming",
-            )
-        )
-    store.record_run_record(
-        RunRecord(
-            run_id="01HQ-stream-current",
-            pipeline="events_stream",
-            status="running",
-            started_at=base,
-            kind="streaming",
-        )
-    )
-
-    # orders_etl: 10 consecutive succeeds, next run forecast.
-    next_orders = (base + timedelta(minutes=22)).isoformat()
-    for i in range(10):
-        ts = base + timedelta(minutes=-15 - i * 30)
-        store.record_run_record(
-            RunRecord(
-                run_id=f"01HQ-orders-{i}",
-                pipeline="orders_etl",
-                status="succeeded",
-                started_at=ts,
-                finished_at=ts + timedelta(seconds=44 + i % 4),
-                extras={"next_run_at": next_orders},
-            )
-        )
-
-    # warehouse_etl: mostly green, one failed 4 runs back. The
-    # subsequent run after the failure succeeded (retry honored).
-    next_wh = (base + timedelta(minutes=58)).isoformat()
-    for i in range(10):
-        if i == 4:
-            store.record_run_record(
-                RunRecord(
-                    run_id="01HQ-wh-fail",
-                    pipeline="warehouse_etl",
-                    status="failed",
-                    started_at=base + timedelta(minutes=-90 - i * 60),
-                    finished_at=base + timedelta(minutes=-89 - i * 60),
-                    attempt=2,
-                    failed_step="merge_payments",
-                    error_summary="ValueError: amount column missing in batch 47",
-                    extras={"next_run_at": next_wh},
-                )
-            )
-        else:
-            ts = base + timedelta(minutes=-30 - i * 60)
-            store.record_run_record(
-                RunRecord(
-                    run_id=f"01HQ-wh-{i}",
-                    pipeline="warehouse_etl",
-                    status="succeeded",
-                    started_at=ts,
-                    finished_at=ts + timedelta(seconds=52 + i % 3),
-                    extras={"next_run_at": next_wh},
-                )
-            )
-
-    # customers_sync: tidy green track, next run forecast.
-    next_cust = (base + timedelta(hours=5)).isoformat()
-    for i in range(7):
-        ts = base + timedelta(hours=-6 - i * 6)
-        store.record_run_record(
-            RunRecord(
-                run_id=f"01HQ-cust-{i}",
-                pipeline="customers_sync",
-                status="succeeded",
-                started_at=ts,
-                finished_at=ts + timedelta(seconds=18 + i % 4),
-                extras={"next_run_at": next_cust},
-            )
-        )
-    return store
-
-
-def _workflow_dag_store() -> InMemoryRunHistory:
-    """In-flight workflow with a parallel branch — for the DAG shot.
-
-    Topology:
-
-        extract_orders ──┬─► transform_orders ─────────┐
-                         │                              ├─► merge_payments ─► load_warehouse
-                         └─► transform_payments ───────┘
-    """
-    store = InMemoryRunHistory()
-    ts = datetime(2026, 5, 20, 16, 15, 0, tzinfo=UTC)
-    steps = [
-        {
-            "name": "extract_orders",
-            "status": "succeeded",
-            "depends_on": [],
-            "duration_ms": 4_200,
-        },
-        {
-            "name": "transform_orders",
-            "status": "succeeded",
-            "depends_on": ["extract_orders"],
-            "duration_ms": 8_750,
-        },
-        {
-            "name": "transform_payments",
-            "status": "running",
-            "depends_on": ["extract_orders"],
-        },
-        {
-            "name": "merge_payments",
-            "status": "pending",
-            "depends_on": ["transform_orders", "transform_payments"],
-        },
-        {
-            "name": "load_warehouse",
-            "status": "pending",
-            "depends_on": ["merge_payments"],
-        },
-    ]
-    store.record_run_record(
-        RunRecord(
-            run_id="01HQ-orders-dag",
-            pipeline="orders_etl",
-            status="running",
-            started_at=ts,
-            extras={"steps": steps},
-        )
-    )
-    return store
-
-
-def _failed_detail_store() -> InMemoryRunHistory:
-    """One failed warehouse_etl run for the detail-page shot."""
-    store = InMemoryRunHistory()
-    ts = datetime(2026, 5, 20, 14, 30, 0, tzinfo=UTC)
-    store.record_run_record(
-        RunRecord(
-            run_id="01HQ-warehouse-fail",
-            pipeline="warehouse_etl",
-            status="failed",
-            started_at=ts,
-            finished_at=ts + timedelta(seconds=35),
-            attempt=2,
-            failed_step="merge_payments",
-            error_summary="ValueError: amount column missing in batch 47",
-        )
-    )
-    return store
-
-
-# ----- Playwright capture -------------------------------------------
-
-
-def _capture(url: str, out_path: Path, *, focus_selector: str | None = None) -> None:
-    from playwright.sync_api import sync_playwright
-
+def _capture(page, hash_path: str, out_path: Path, *, hover: str | None = None,
+             scroll_to: int | None = None) -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    with sync_playwright() as p:
-        browser = p.chromium.launch()
-        ctx = browser.new_context(
-            viewport={"width": 1440, "height": 900},
-            color_scheme="dark",
-            device_scale_factor=2,  # retina for sharper PNGs
-        )
-        page = ctx.new_page()
-        page.goto(url, wait_until="networkidle")
-        # Give the SPA a beat to render after fetch completes.
-        page.wait_for_timeout(800)
-        if focus_selector:
-            try:
-                page.hover(focus_selector)
-                page.wait_for_timeout(200)
-            except Exception:  # noqa: BLE001
-                pass  # hover is best-effort
-        page.screenshot(path=str(out_path), full_page=False)
-        browser.close()
+    page.goto(f"{DEV_URL}/#{hash_path}", wait_until="networkidle")
+    # Force route re-evaluation if the hashchange listener was already
+    # bound (the page may have been at a different hash before).
+    page.evaluate("window.dispatchEvent(new HashChangeEvent('hashchange'))")
+    # Give the SPA + data fetch a beat to settle.
+    page.wait_for_timeout(900)
+    if scroll_to is not None:
+        page.evaluate(f"window.scrollTo(0, {scroll_to})")
+        page.wait_for_timeout(150)
+    if hover:
+        try:
+            page.hover(hover, timeout=2000)
+            page.wait_for_timeout(200)
+        except Exception:  # noqa: BLE001
+            pass  # hover is best-effort
+    page.screenshot(path=str(out_path), full_page=False)
     print(f"  → {out_path} ({out_path.stat().st_size:,} bytes)")
 
 
 def main() -> int:
-    out_dir = Path(
-        sys.argv[1]
+    # Default to the sibling ematix.dev checkout's screenshots dir,
+    # resolved relative to the script (not cwd), so it works no
+    # matter where the user invokes from.
+    default_out = (
+        Path(__file__).resolve().parent.parent.parent
+        / "ematix.dev" / "public" / "screenshots"
+    )
+    out_dir = (
+        Path(sys.argv[1]).resolve()
         if len(sys.argv) > 1
-        else "../ematix.dev/public/screenshots"
-    ).resolve()
+        else default_out
+    )
     print(f"writing screenshots to {out_dir}")
 
-    print("[1/4] pipelines-view — per-pipeline last-10 strip + next-run / LIVE")
-    port = _free_port()
-    _start_server(_pipelines_view_store(), port)
-    _capture(
-        f"http://127.0.0.1:{port}/#/pipelines",
-        out_dir / "pipelines-view.png",
-    )
+    dev_proc = _start_dev_server()
+    try:
+        from playwright.sync_api import sync_playwright
 
-    print("[2/4] jobs-list — flat table of run records")
-    port = _free_port()
-    _start_server(_runs_list_store(), port)
-    _capture(f"http://127.0.0.1:{port}/#/runs", out_dir / "jobs-list.png")
+        with sync_playwright() as p:
+            browser = p.chromium.launch()
+            ctx = browser.new_context(
+                viewport={"width": 1440, "height": 900},
+                color_scheme="dark",
+                device_scale_factor=2,  # retina
+            )
+            page = ctx.new_page()
 
-    print("[3/4] run-failed-restart — detail with action button hovered")
-    port = _free_port()
-    _start_server(_failed_detail_store(), port)
-    _capture(
-        f"http://127.0.0.1:{port}/#/runs/01HQ-warehouse-fail",
-        out_dir / "run-failed-restart.png",
-        focus_selector="button.action:has-text('Restart')",
-    )
+            print("[1/5] workflows-view — Workflows landing with inline sub-DAGs")
+            _capture(page, "/workflows", out_dir / "workflows-view.png")
 
-    print("[4/4] workflow-dag — running DAG with parallel branch")
-    port = _free_port()
-    _start_server(_workflow_dag_store(), port)
-    _capture(
-        f"http://127.0.0.1:{port}/#/runs/01HQ-orders-dag",
-        out_dir / "workflow-dag.png",
-    )
+            print("[2/5] jobs-view — Jobs with per-job last-10 duration strips")
+            _capture(page, "/jobs", out_dir / "jobs-view.png")
+
+            print("[3/5] runs-list — Runs table across all jobs")
+            _capture(page, "/runs", out_dir / "runs-list.png")
+
+            print("[4/5] dag-flowchart — cross-job DAG")
+            _capture(page, "/dag", out_dir / "dag-flowchart.png")
+
+            print("[5/5] run-failed-restart — failed run detail w/ Restart hovered")
+            _capture(
+                page,
+                "/runs/r-99fc",  # nightly_reporting.materialize_dashboards failed run from mock
+                out_dir / "run-failed-restart.png",
+                hover="button.action:has-text('Restart')",
+            )
+
+            browser.close()
+    finally:
+        if dev_proc is not None:
+            print("  stopping dev server …")
+            dev_proc.terminate()
+            try:
+                dev_proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                dev_proc.kill()
 
     print(f"done — {out_dir}")
     return 0
