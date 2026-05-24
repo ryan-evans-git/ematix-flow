@@ -65,9 +65,9 @@ const PIPELINES = [
     recent_runs: recentRuns(["succeeded","succeeded","succeeded","succeeded","succeeded","succeeded","succeeded","succeeded","succeeded","succeeded"]),
   },
   {
-    name: "realtime_orders.stream_orders_to_olap",
+    name: "live_orders.stream_orders_to_olap",
     kind: "streaming",
-    workflow: "realtime_orders",
+    workflow: "live_orders",
     schedule: null,
     timezone: "UTC",
     next_run_at: null,
@@ -148,7 +148,7 @@ const WORKFLOWS = [
     ],
   },
   {
-    name: "realtime_orders",
+    name: "live_orders",
     kind: "streaming",
     jobs: ["stream_orders_to_olap"],
     edges: [],
@@ -227,13 +227,13 @@ const WORKFLOWS = [
 const RUNS = [
   { run_id: "r-9af3", pipeline: "warehouse_etl.ingest_orders",                  status: "succeeded", started_at: ago(m(34)),   duration_ms: 12_410, attempt: 1, triggered_by: "schedule" },
   { run_id: "r-9ad9", pipeline: "warehouse_etl.build_sales_mart",               status: "succeeded", started_at: ago(m(48)),   duration_ms: 48_911, attempt: 1, triggered_by: "schedule" },
-  { run_id: "r-9ada", pipeline: "realtime_orders.stream_orders_to_olap",        status: "running",   started_at: ago(h(2)),    duration_ms: null,   attempt: 1, triggered_by: "manual" },
+  { run_id: "r-9ada", pipeline: "live_orders.stream_orders_to_olap",        status: "running",   started_at: ago(h(2)),    duration_ms: null,   attempt: 1, triggered_by: "manual" },
   { run_id: "r-9ac2", pipeline: "feature_store_sync.publish_to_redis",          status: "succeeded", started_at: ago(m(12)),   duration_ms: 2_098,  attempt: 1, triggered_by: "schedule" },
   { run_id: "r-9ab0", pipeline: "warehouse_etl.publish_metrics",                status: "succeeded", started_at: ago(m(34)),   duration_ms: 4_311,  attempt: 1, triggered_by: "schedule" },
   { run_id: "r-99fc", pipeline: "nightly_reporting.materialize_dashboards",     status: "failed",    started_at: ago(h(7)),    duration_ms: 96_701, attempt: 2, triggered_by: "schedule" },
   { run_id: "r-99f8", pipeline: "warehouse_etl.ingest_orders",                  status: "succeeded", started_at: ago(h(2) + m(34)), duration_ms: 11_988, attempt: 1, triggered_by: "schedule" },
   { run_id: "r-99e1", pipeline: "warehouse_etl.build_sales_mart",               status: "succeeded", started_at: ago(h(2) + m(48)), duration_ms: 49_200, attempt: 1, triggered_by: "schedule" },
-  { run_id: "r-99d7", pipeline: "realtime_orders.stream_orders_to_olap",        status: "paused",    started_at: ago(h(8)),    duration_ms: null,   attempt: 1, triggered_by: "manual" },
+  { run_id: "r-99d7", pipeline: "live_orders.stream_orders_to_olap",        status: "paused",    started_at: ago(h(8)),    duration_ms: null,   attempt: 1, triggered_by: "manual" },
   { run_id: "r-99c4", pipeline: "feature_store_sync.publish_to_redis",          status: "succeeded", started_at: ago(m(27)),   duration_ms: 2_120,  attempt: 1, triggered_by: "schedule" },
   { run_id: "r-99b2", pipeline: "warehouse_etl.publish_metrics",                status: "succeeded", started_at: ago(h(2) + m(34)), duration_ms: 4_298, attempt: 1, triggered_by: "schedule" },
   { run_id: "r-99a9", pipeline: "warehouse_etl.ingest_orders",                  status: "succeeded", started_at: ago(h(4) + m(34)), duration_ms: 12_511, attempt: 1, triggered_by: "schedule" },
@@ -310,7 +310,7 @@ const DAG = {
     { from: "warehouse_etl.build_sales_mart",             to: "nightly_reporting.materialize_dashboards" },
     { from: "nightly_reporting.materialize_dashboards",   to: "nightly_reporting.send_briefs" },
     { from: "feature_store_sync.pull_feature_views",      to: "feature_store_sync.publish_to_redis" },
-    { from: "warehouse_etl.ingest_orders",                to: "realtime_orders.stream_orders_to_olap" },
+    { from: "warehouse_etl.ingest_orders",                to: "live_orders.stream_orders_to_olap" },
   ],
 };
 
