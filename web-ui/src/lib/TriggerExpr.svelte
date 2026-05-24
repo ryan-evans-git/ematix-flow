@@ -57,21 +57,20 @@
     display: inline-block;
     flex-shrink: 0;
   }
-  .wf-trig--ready   { border-color: rgba(78, 184, 78, 0.55); }
-  .wf-trig--pending { border-color: rgba(255, 176, 0, 0.55); }
-  .wf-trig--failed  { border-color: rgba(184, 80, 64, 0.6); }
-  .wf-trig--ready   .wf-trig-dot { background: #4eb84e; box-shadow: 0 0 4px rgba(78, 184, 78, 0.6); }
-  .wf-trig--pending .wf-trig-dot { background: var(--color-amber-glow, #ffb000); box-shadow: 0 0 4px rgba(255, 176, 0, 0.55); }
-  .wf-trig--failed  .wf-trig-dot { background: var(--color-alarm, #b85040); box-shadow: 0 0 4px rgba(184, 80, 64, 0.6); }
+  .wf-trig--ready   { border-color: var(--border-strong, #2e2e38); }
+  .wf-trig--pending { border-color: var(--border-strong, #2e2e38); }
+  .wf-trig--failed  { border-color: var(--border-strong, #2e2e38); }
+  .wf-trig--ready   .wf-trig-dot { background: var(--success, #4ade80); }
+  .wf-trig--pending .wf-trig-dot { background: var(--warning, #facc15); }
+  .wf-trig--failed  .wf-trig-dot { background: var(--danger, #f87171); }
 
   .wf-trig--composite {
-    border-width: 2px;
+    border-width: 1px;
     padding: 0.2em 0.55em;
     gap: 0.35em;
   }
   .wf-trig-op {
     font-family: var(--font-mono, monospace);
-    letter-spacing: 0.05em;
     font-size: 0.85em;
     opacity: 0.85;
   }

@@ -212,13 +212,42 @@ function runDetail(id) {
     { name: "write_destination",      status: base.status === "failed" ? "pending" : (base.status === "running" ? "running" : "succeeded"), started_at: base.started_at, duration_ms: base.status === "succeeded" ? 1_290 : null },
     { name: "publish_metrics",        status: base.status === "succeeded" ? "succeeded" : "pending", started_at: base.started_at, duration_ms: base.status === "succeeded" ? 180 : null },
   ];
+  const failedStep = steps.find((s) => s.status === "failed")?.name || null;
   return {
     ...base,
+    attempt: 1,
+    finished_at: base.duration_ms != null && base.started_at
+      ? new Date(new Date(base.started_at).getTime() + base.duration_ms).toISOString()
+      : null,
+    failed_step: failedStep,
+    failed_watermark: null,
+    error_summary: base.status === "failed"
+      ? "transform_partition_1: ConnectionResetError during shuffle"
+      : null,
     steps,
-    can_restart: base.status === "failed",
-    can_pause: base.status === "running",
-    can_resume: base.status === "paused",
-    can_rerun: ["succeeded","failed","cancelled"].includes(base.status),
+    attempts: [
+      {
+        attempt: 1,
+        status: base.status,
+        started_at: base.started_at,
+        finished_at: base.duration_ms != null && base.started_at
+          ? new Date(new Date(base.started_at).getTime() + base.duration_ms).toISOString()
+          : null,
+      },
+    ],
+    // `actions` shape per RunDetail.svelte:
+    //   actions.pause                bool
+    //   actions.resume               bool
+    //   actions.restart_from_step    array of step names (truthy if non-empty)
+    //   actions.resume_from_watermark bool
+    //   actions.rerun_full           bool
+    actions: {
+      pause: base.status === "running",
+      resume: base.status === "paused",
+      restart_from_step: failedStep ? [failedStep] : [],
+      resume_from_watermark: base.status === "failed" && false, // streaming-only
+      rerun_full: ["succeeded","failed","cancelled"].includes(base.status),
+    },
   };
 }
 

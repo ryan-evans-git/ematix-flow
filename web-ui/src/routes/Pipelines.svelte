@@ -254,7 +254,7 @@
         </h3>
         <span class="pipeline-meta">
           {#if p.kind === "streaming"}
-            <span class="streaming-pill">▶ LIVE STREAMING</span>
+            <span class="streaming-pill">Streaming</span>
           {:else if p.next_run_at}
             <span class="next-run">Next: <span class="mono">{fmtNextRun(p.next_run_at, p.timezone)}</span></span>
           {:else}
@@ -312,7 +312,7 @@
         <span>
           {#if p.kind !== "streaming"}
             <button class="action" on:click|stopPropagation={() => openRunNow(p.name)} title="Run this job now">
-              ▶ Run now
+              Run now
             </button>
             &nbsp;
           {/if}

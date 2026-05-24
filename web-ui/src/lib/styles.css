@@ -326,14 +326,25 @@ table.runs td.mono, table.runs td .mono { font-family: var(--font-mono); }
 .next-run { color: var(--accent); }
 .next-run--muted { color: var(--fg-subtle); }
 .streaming-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4em;
   color: var(--info);
   border: 1px solid var(--info);
   background: var(--info-soft);
   border-radius: 999px;
-  padding: 0.0625rem 0.5rem;
+  padding: 0.0625rem 0.625rem;
   font-weight: 500;
   font-size: 0.6875rem;
   letter-spacing: 0;
+}
+.streaming-pill::before {
+  content: "";
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+  animation: pulse 1.8s ease-in-out infinite;
 }
 
 .last-10 {
