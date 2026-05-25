@@ -5,6 +5,7 @@ members = [
     "crates/ematix-flow-py",
     "crates/ematix-flow-cli",
     "crates/ematix-flow-distributed",
+    "crates/ematix-flow-hash-join",
 ]
 
 [workspace.package]

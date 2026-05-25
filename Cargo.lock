@@ -3816,6 +3816,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "ematix-flow-hash-join"
+version = "0.8.0"
+dependencies = [
+ "criterion",
+ "rand 0.9.4",
+]
+
+[[package]]
 name = "ematix-flow-py"
 version = "0.8.0"
 dependencies = [
