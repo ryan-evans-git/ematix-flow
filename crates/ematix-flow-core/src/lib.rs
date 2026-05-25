@@ -140,6 +140,13 @@ pub mod dict_aggregate_rule;
 // Lives outside the physical optimiser to avoid the LLVM-codegen
 // perturbation cost recorded in optimizer-codegen-sensitivity.
 pub mod dict_routing;
+// Σ.T (2026-05-25): selectivity-first inner-join reorder. Pre-plan
+// walker pattern (same precedent as dict_routing — explicit caller
+// invocation, no PhysicalOptimizerRule, no codegen tax). Targets
+// Q05 / Q08 SF=10 where DataFusion 53.1 has no cost-based join
+// reorder and falls back to FROM-clause order. See
+// `docs/PHASE_SIGMA_T_JOIN_REORDER.md`.
+pub mod join_reorder;
 // Σ.L.2 (2026-05-21): adaptive runtime workload feedback. Persists
 // per-shape probe outcomes + per-query observability (selectivity,
 // hash collision rate) to a SQLite file (~/.ematix/workload.db by

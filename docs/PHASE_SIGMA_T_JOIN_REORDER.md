@@ -159,12 +159,31 @@ Tests added (all pass):
 - Bloom-filter NDV metadata extraction (parquet `BLOOM_FILTER_NDV`)
 - Integer-range NDV estimation (`max - min + 1`)
 
-### Phase 2 — Cost model + DP enumeration (~1 week)
-- New crate module: `crates/ematix-flow-core/src/join_reorder.rs`
-- Public entry: `reorder_logical(plan: LogicalPlan, ctx: &SessionContext) -> LogicalPlan`
-- Selinger left-deep DP, FK-aware output-card estimator
-- Hook into pre-plan walker alongside dict_routing
-- Unit tests: 16+ covering enum bounds, predicate selectivity, FK shapes, Cartesian fallthrough
+### Phase 2 — Cost model + reorder rule ✓ MVP LANDED 2026-05-25
+
+New crate module [`crates/ematix-flow-core/src/join_reorder.rs`](../crates/ematix-flow-core/src/join_reorder.rs).
+
+Public entry: `pub fn reorder_inner_joins(plan: LogicalPlan) -> DfResult<LogicalPlan>`.
+
+What the MVP does:
+- `transform_down + TreeNodeRecursion::Jump` walks the LogicalPlan, processing each Inner Join chain atomically from its top (not bottom-up, which would lose the chain shape after partial rebuilds).
+- Flattener descends through Projection nodes (DataFusion's projection-pruning optimizer inserts them between joins) but stops at SubqueryAlias / Filter / TableScan as leaves.
+- Extracts equi predicates from both `Join::on` and `Join::filter` slots — DataFusion 53.1's SQL parser routes `ON col=col` conditions through either depending on shape.
+- **Connectivity-aware greedy ordering**: at each step pick the smallest unplaced leaf that has a predicate connecting to the current chain. Pure smallest-first fails on Q05 because `orders` (~112K post-filter) is smaller than `customer` but doesn't connect directly to `region+nation+supplier`.
+- Rebuilds left-deep using `LogicalPlanBuilder::join_on` (predicates land in `filter` slot — DataFusion's HashJoin still treats column-pair filters as equi-keys for HashJoinExec construction).
+- Bails (returns the original plan) if any leaf can't be connected (cross-product detected), if any equi predicate can't be re-attached, or if the chosen order matches the input order.
+
+5 tests pass:
+1. `no_op_on_single_table` — `SELECT COUNT(*) FROM lineitem` passes through unchanged
+2. `no_op_on_two_table_join` — 2-leaf chains are no-ops (MVP threshold ≥3)
+3. `reorders_three_table_chain_smallest_first` — `lineitem JOIN orders JOIN customer` rewrites to put `customer` (smallest) as leftmost
+4. `reorders_q05_shape_against_real_data` — Q05 SF=1 reorders to `region → nation → supplier → customer → orders → lineitem`, exactly matching DuckDB's plan
+5. `rewrite_preserves_query_result` — end-to-end correctness: original plan and rewritten plan produce the same result rows on a 3-table aliased GROUP BY
+
+**Phase 2 NOT yet covered (deferred to Phase 2.b or 3):**
+- Selinger DP enumeration. The greedy heuristic is order-graph-aware and gets Q05's optimal order, but for shapes with more than one cardinality-equivalent join graph (cycles, multi-way bushy plans) DP could outperform it. Defer until a benchmark shows a case where greedy loses.
+- FK-aware output cardinality. The cost model uses leaf-side estimated rows (table size × filter selectivity from min/max). Output cardinality after join (`|A|×|B|/NDV`) isn't modeled — for left-deep TPC-H chains this is fine because the join graph is a tree and NDV ≈ smaller table's row count.
+- Q07/Q08-shape OR predicate splitting (`n_name=FRANCE AND n_name=GERMANY OR ...`). Separate Phase.
 
 ### Phase 3 — Bench validation (~1 week)
 - Single-query A/B Q05/Q07/Q08/Q17/Q18 (15-trial, 3-warmup)
