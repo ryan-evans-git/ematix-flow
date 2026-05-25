@@ -7,7 +7,96 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-(no entries yet — anything landing on `main` after v0.7.0 goes here)
+(no entries yet — anything landing on `main` after v0.8.0 goes here)
+
+## [0.8.0] — 2026-05-25
+
+Perf release. No Python API changes; the surface from v0.7.0 (workflow
+trigger kwargs + per-job DAG) is unchanged. The headline lift is in
+the single-node execution engine and the Web UI redesign — operational
+behavior the same, query latency materially better.
+
+### Added
+
+- **SF=1 + SF=10 release benchmarks** at 20 trials × 3 warmups across
+  ematix-flow / DuckDB / Polars / PySpark on the same hardware + same
+  Parquet files. Reproducible from the same `tpch_triangulation_bench`
+  harness; raw logs under `bench-results/release-2026-05-24/`. Full
+  numbers + caveats published at
+  [ematix.dev/reference/benchmarks](https://ematix.dev/reference/benchmarks).
+  Headline: SF=1 20 / 22 ematix wins, SF=10 14 / 22 (11–14 noise band).
+- **Web UI Linear-style theme** — dark-first, single teal accent,
+  monospace numerics, theme toggle persists. Replaces the previous
+  Pip-Boy / CRT-phosphor theme. Composite trigger expressions (nested
+  `AllOf` / `AnyOf`) render as labelled state-pill trees inline in the
+  Workflows view. Dev-only Vite mock middleware so `npm run dev` in
+  `web-ui/` works without a Python backend.
+- **Σ.Q runtime bloom sideband** — distributed-friendly per-query
+  bloom filter transport (`BridgeFilterSideband` +
+  `BuildSideBloomEmitterExec` + `EnableRuntimeBloomSidebandRule`).
+  Default ON with `EMAT_RT_BLOOM_RATIO=1024` + Inner-join firings
+  selectivity-gated. Closes Q07 / Q17 / Q18 SF=10 wins.
+- **Σ.Q.L10 `PushDownLeftSemiRule`** — pushes LeftSemi joins toward
+  scan side. Opt-in (`EMAT_PUSH_SEMI=1`, default ON in milestone
+  config). Q18 SF=10 −54%.
+- **Σ.S.A splash-bloom layout** + **Σ.S.B cascading-L9 infra** —
+  Apache-Impala-style SIMD-friendly bloom probe; multi-level FK-chain
+  bloom propagation (cascade default OFF; ships as infra).
+- **Σ.U.A shape-specialised lane filter-sum kernel** — Q06-family
+  branchless row loop autovec'd by LLVM into NEON / SSE2 / AVX2.
+  Q06 SF=1 9.22 ± 0.60 ms (isolated). Module present; only matches
+  Q06's exact 5-predicate filter shape.
+- **Σ.O.c row-group decode cache** — process-wide Arc-shared, byte-
+  bounded LRU keyed by file + RG + column. Default ON. Q13 / Q21
+  SF=10 tail-rep speedups.
+- **Σ.L.1 adaptive runtime** — speculative-race + 3-state
+  `DictArrivalVerdict` + resolver. First piece of the "optimizer
+  that learns from every query" framing.
+- **Robin-Hood SUM(f64) operator** (opt-in) — `EMAT_RH_SUM_F64=1`.
+  Default ON in milestone config. Closes Q22 / Q04 SF=1.
+
+### Changed
+
+- **ematix-parquet pin 0.13 → 0.16.1** — pulls in V1 level-prefix
+  correctness fix, LZ4_RAW arm + V1+Optional bug fix, splash-shaped
+  scalar predicate-bitmap pack, full SIMD specialisation bw=1..=32,
+  and the new sidecar-index capability (sorted / Bloom / composite /
+  inverted text) plus `ematix-iceberg` crate. Sidecar consumption
+  not wired into flow yet — Phase 1 / Phase 2 plan at
+  `docs/plans/CURRENT.md`; `ematix-iceberg` intentionally not yet a
+  flow-side dep.
+- `docs/BENCHMARKS.md` TL;DR refreshed with the 4-engine SF=1 + SF=10
+  release tables; historical 5-trial numbers preserved below as
+  reference.
+
+### Fixed
+
+- **Web UI DagFlowchart text overflow** — long workflow-qualified job
+  names (`feature_store_sync.pull_feature_views`) now fit cleanly:
+  leaf name on the primary line, workflow prefix as a muted subtitle,
+  ellipsis safety net.
+- **Σ.Q.L13 dispatch regression** — parallel-bitmap dispatch was
+  default-on with a permissive gate; T2 (lineitem SF=10 + date filter)
+  regressed 43×. Flipped to opt-in via `EMAT_FORCE_PARALLEL_BITMAP=1`.
+- **Σ.Q.L9 Q21 correctness** — Inner-join bloom default OFF (was
+  net-negative AND broke Q21 row count); selectivity-gated re-enable
+  via the milestone defaults.
+
+### Internal / planning
+
+- 7-question phased plan for sidecar-index integration into
+  `EmatixFastParquetTableProvider` written by the planner agent;
+  see `docs/plans/CURRENT.md` (Phase 1 read-path, Phase 2 adaptive
+  auto-creation, Phase 3+ Iceberg + async object-store).
+
+### Bench provenance
+
+All numbers in this release were measured with `TPCH_TRIALS=20
+TPCH_WARMUPS=3` on Apple M3 Pro, JDK 23 for PySpark. SF=10 noise
+band characterised explicitly (two back-to-back runs of the same
+binary varied 11 ↔ 14 ematix wins, every per-query median moving
+5–29% in lockstep across both ematix-flow and DuckDB — Mac CPU
+frequency / thermal, not engine).
 
 ## [0.7.0] — 2026-05-21
 

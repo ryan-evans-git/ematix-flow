@@ -1,0 +1,521 @@
+WARNING: Using incubator modules: jdk.incubator.vector
+Using Spark's default log4j profile: org/apache/spark/log4j2-defaults.properties
+26/05/24 18:02:14 WARN Utils: Your hostname, Developer-Macbook.local, resolves to a loopback address: 127.0.0.1; using 192.168.1.209 instead (on interface en0)
+26/05/24 18:02:14 WARN Utils: Set SPARK_LOCAL_IP if you need to bind to another address
+Using Spark's default log4j profile: org/apache/spark/log4j2-defaults.properties
+Setting default log level to "WARN".
+To adjust logging level use sc.setLogLevel(newLevel). For SparkR, use setLogLevel(newLevel).
+26/05/24 18:02:15 WARN NativeCodeLoader: Unable to load native-hadoop library for your platform... using builtin-java classes where applicable
+==> data dir: /Users/ryanevans/RustroverProjects/ematix-flow/examples/tpch/data/sf1
+==> trials per query: 20 (after 3 warm-ups)
+
+==> Spark 4.1.1, JDK /opt/homebrew/opt/openjdk
+-- q01 --
+  q01 trial 1/20: 195.57 ms
+  q01 trial 2/20: 188.62 ms
+  q01 trial 3/20: 185.97 ms
+  q01 trial 4/20: 175.73 ms
+  q01 trial 5/20: 174.76 ms
+  q01 trial 6/20: 176.22 ms
+  q01 trial 7/20: 175.88 ms
+  q01 trial 8/20: 166.77 ms
+  q01 trial 9/20: 167.41 ms
+  q01 trial 10/20: 168.74 ms
+  q01 trial 11/20: 169.01 ms
+  q01 trial 12/20: 165.00 ms
+  q01 trial 13/20: 162.61 ms
+  q01 trial 14/20: 159.99 ms
+  q01 trial 15/20: 158.33 ms
+  q01 trial 16/20: 159.33 ms
+  q01 trial 17/20: 164.21 ms
+  q01 trial 18/20: 162.52 ms
+  q01 trial 19/20: 165.44 ms
+  q01 trial 20/20: 159.51 ms
+
+-- q02 --
+  q02 trial 1/20: 206.69 ms
+  q02 trial 2/20: 206.51 ms
+  q02 trial 3/20: 192.79 ms
+  q02 trial 4/20: 296.72 ms
+  q02 trial 5/20: 217.67 ms
+  q02 trial 6/20: 198.06 ms
+  q02 trial 7/20: 187.32 ms
+  q02 trial 8/20: 198.85 ms
+  q02 trial 9/20: 178.21 ms
+  q02 trial 10/20: 182.48 ms
+  q02 trial 11/20: 198.77 ms
+  q02 trial 12/20: 180.37 ms
+  q02 trial 13/20: 178.14 ms
+  q02 trial 14/20: 196.74 ms
+  q02 trial 15/20: 178.80 ms
+  q02 trial 16/20: 173.22 ms
+  q02 trial 17/20: 194.69 ms
+  q02 trial 18/20: 177.68 ms
+  q02 trial 19/20: 176.06 ms
+  q02 trial 20/20: 186.37 ms
+
+-- q03 --
+  q03 trial 1/20: 272.17 ms
+  q03 trial 2/20: 266.58 ms
+  q03 trial 3/20: 273.03 ms
+  q03 trial 4/20: 257.69 ms
+  q03 trial 5/20: 254.98 ms
+  q03 trial 6/20: 240.96 ms
+  q03 trial 7/20: 246.14 ms
+  q03 trial 8/20: 263.07 ms
+  q03 trial 9/20: 244.08 ms
+  q03 trial 10/20: 244.53 ms
+  q03 trial 11/20: 264.83 ms
+  q03 trial 12/20: 262.59 ms
+  q03 trial 13/20: 257.04 ms
+  q03 trial 14/20: 257.76 ms
+  q03 trial 15/20: 252.57 ms
+  q03 trial 16/20: 241.87 ms
+  q03 trial 17/20: 241.39 ms
+  q03 trial 18/20: 257.30 ms
+  q03 trial 19/20: 258.07 ms
+  q03 trial 20/20: 245.28 ms
+
+-- q04 --
+  q04 trial 1/20: 190.08 ms
+  q04 trial 2/20: 180.76 ms
+  q04 trial 3/20: 195.32 ms
+  q04 trial 4/20: 179.32 ms
+  q04 trial 5/20: 190.74 ms
+  q04 trial 6/20: 177.20 ms
+  q04 trial 7/20: 182.02 ms
+  q04 trial 8/20: 191.99 ms
+  q04 trial 9/20: 181.60 ms
+  q04 trial 10/20: 195.62 ms
+  q04 trial 11/20: 180.57 ms
+  q04 trial 12/20: 177.68 ms
+  q04 trial 13/20: 196.62 ms
+  q04 trial 14/20: 185.14 ms
+  q04 trial 15/20: 178.17 ms
+  q04 trial 16/20: 190.34 ms
+  q04 trial 17/20: 181.88 ms
+  q04 trial 18/20: 182.12 ms
+  q04 trial 19/20: 187.09 ms
+  q04 trial 20/20: 185.50 ms
+
+-- q05 --
+  q05 trial 1/20: 348.30 ms
+  q05 trial 2/20: 342.20 ms
+  q05 trial 3/20: 322.81 ms
+  q05 trial 4/20: 350.42 ms
+  q05 trial 5/20: 370.06 ms
+  q05 trial 6/20: 337.90 ms
+  q05 trial 7/20: 334.48 ms
+  q05 trial 8/20: 356.29 ms
+  q05 trial 9/20: 330.60 ms
+  q05 trial 10/20: 335.21 ms
+  q05 trial 11/20: 322.91 ms
+  q05 trial 12/20: 319.12 ms
+  q05 trial 13/20: 339.69 ms
+  q05 trial 14/20: 323.49 ms
+  q05 trial 15/20: 336.20 ms
+  q05 trial 16/20: 319.20 ms
+  q05 trial 17/20: 331.69 ms
+  q05 trial 18/20: 337.89 ms
+  q05 trial 19/20: 331.55 ms
+  q05 trial 20/20: 314.70 ms
+
+-- q06 --
+  q06 trial 1/20: 45.36 ms
+  q06 trial 2/20: 48.02 ms
+  q06 trial 3/20: 39.89 ms
+  q06 trial 4/20: 41.39 ms
+  q06 trial 5/20: 39.74 ms
+  q06 trial 6/20: 53.46 ms
+  q06 trial 7/20: 56.22 ms
+  q06 trial 8/20: 41.58 ms
+  q06 trial 9/20: 40.23 ms
+  q06 trial 10/20: 48.56 ms
+  q06 trial 11/20: 38.36 ms
+  q06 trial 12/20: 38.96 ms
+  q06 trial 13/20: 39.86 ms
+  q06 trial 14/20: 51.87 ms
+  q06 trial 15/20: 50.18 ms
+  q06 trial 16/20: 42.46 ms
+  q06 trial 17/20: 40.25 ms
+  q06 trial 18/20: 40.69 ms
+  q06 trial 19/20: 46.44 ms
+  q06 trial 20/20: 41.11 ms
+
+-- q07 --
+  q07 trial 1/20: 286.65 ms
+  q07 trial 2/20: 271.15 ms
+  q07 trial 3/20: 254.61 ms
+  q07 trial 4/20: 295.15 ms
+  q07 trial 5/20: 253.83 ms
+  q07 trial 6/20: 278.58 ms
+  q07 trial 7/20: 249.95 ms
+  q07 trial 8/20: 263.25 ms
+  q07 trial 9/20: 253.28 ms
+  q07 trial 10/20: 253.26 ms
+  q07 trial 11/20: 295.97 ms
+  q07 trial 12/20: 253.21 ms
+  q07 trial 13/20: 292.20 ms
+  q07 trial 14/20: 257.61 ms
+  q07 trial 15/20: 298.43 ms
+  q07 trial 16/20: 255.31 ms
+  q07 trial 17/20: 276.16 ms
+  q07 trial 18/20: 254.06 ms
+  q07 trial 19/20: 277.63 ms
+  q07 trial 20/20: 252.95 ms
+
+-- q08 --
+  q08 trial 1/20: 177.92 ms
+  q08 trial 2/20: 212.68 ms
+  q08 trial 3/20: 174.94 ms
+  q08 trial 4/20: 191.56 ms
+  q08 trial 5/20: 177.90 ms
+  q08 trial 6/20: 205.37 ms
+  q08 trial 7/20: 173.05 ms
+  q08 trial 8/20: 222.93 ms
+  q08 trial 9/20: 171.17 ms
+  q08 trial 10/20: 193.35 ms
+  q08 trial 11/20: 184.15 ms
+  q08 trial 12/20: 292.82 ms
+  q08 trial 13/20: 237.65 ms
+  q08 trial 14/20: 187.69 ms
+  q08 trial 15/20: 170.66 ms
+  q08 trial 16/20: 178.67 ms
+  q08 trial 17/20: 180.27 ms
+  q08 trial 18/20: 170.64 ms
+  q08 trial 19/20: 167.09 ms
+  q08 trial 20/20: 189.13 ms
+
+-- q09 --
+  q09 trial 1/20: 460.00 ms
+  q09 trial 2/20: 482.06 ms
+  q09 trial 3/20: 505.34 ms
+  q09 trial 4/20: 458.66 ms
+  q09 trial 5/20: 471.73 ms
+  q09 trial 6/20: 547.83 ms
+  q09 trial 7/20: 467.68 ms
+  q09 trial 8/20: 475.44 ms
+  q09 trial 9/20: 764.08 ms
+  q09 trial 10/20: 646.30 ms
+  q09 trial 11/20: 677.04 ms
+  q09 trial 12/20: 725.56 ms
+  q09 trial 13/20: 596.56 ms
+  q09 trial 14/20: 598.04 ms
+  q09 trial 15/20: 579.18 ms
+  q09 trial 16/20: 593.71 ms
+  q09 trial 17/20: 582.49 ms
+  q09 trial 18/20: 587.16 ms
+  q09 trial 19/20: 595.26 ms
+  q09 trial 20/20: 583.30 ms
+
+-- q10 --
+  q10 trial 1/20: 383.45 ms
+  q10 trial 2/20: 347.94 ms
+  q10 trial 3/20: 391.63 ms
+  q10 trial 4/20: 351.11 ms
+  q10 trial 5/20: 366.03 ms
+  q10 trial 6/20: 370.93 ms
+  q10 trial 7/20: 361.19 ms
+  q10 trial 8/20: 388.20 ms
+  q10 trial 9/20: 362.55 ms
+  q10 trial 10/20: 356.82 ms
+  q10 trial 11/20: 365.63 ms
+  q10 trial 12/20: 346.39 ms
+  q10 trial 13/20: 355.31 ms
+  q10 trial 14/20: 350.41 ms
+  q10 trial 15/20: 357.43 ms
+  q10 trial 16/20: 378.71 ms
+  q10 trial 17/20: 387.21 ms
+  q10 trial 18/20: 344.69 ms
+  q10 trial 19/20: 365.51 ms
+  q10 trial 20/20: 354.88 ms
+
+-- q11 --
+  q11 trial 1/20: 121.17 ms
+  q11 trial 2/20: 116.03 ms
+  q11 trial 3/20: 125.09 ms
+  q11 trial 4/20: 129.15 ms
+  q11 trial 5/20: 128.49 ms
+  q11 trial 6/20: 116.59 ms
+  q11 trial 7/20: 119.65 ms
+  q11 trial 8/20: 117.08 ms
+  q11 trial 9/20: 155.59 ms
+  q11 trial 10/20: 119.35 ms
+  q11 trial 11/20: 117.83 ms
+  q11 trial 12/20: 117.59 ms
+  q11 trial 13/20: 116.26 ms
+  q11 trial 14/20: 135.04 ms
+  q11 trial 15/20: 117.54 ms
+  q11 trial 16/20: 116.95 ms
+  q11 trial 17/20: 119.35 ms
+  q11 trial 18/20: 147.56 ms
+  q11 trial 19/20: 119.03 ms
+  q11 trial 20/20: 114.64 ms
+
+-- q12 --
+  q12 trial 1/20: 269.41 ms
+  q12 trial 2/20: 296.39 ms
+  q12 trial 3/20: 264.51 ms
+  q12 trial 4/20: 263.81 ms
+  q12 trial 5/20: 288.36 ms
+  q12 trial 6/20: 258.25 ms
+  q12 trial 7/20: 265.56 ms
+  q12 trial 8/20: 289.33 ms
+  q12 trial 9/20: 278.09 ms
+  q12 trial 10/20: 266.93 ms
+  q12 trial 11/20: 290.04 ms
+  q12 trial 12/20: 257.47 ms
+  q12 trial 13/20: 268.71 ms
+  q12 trial 14/20: 283.80 ms
+  q12 trial 15/20: 262.42 ms
+  q12 trial 16/20: 278.84 ms
+  q12 trial 17/20: 284.90 ms
+  q12 trial 18/20: 266.19 ms
+  q12 trial 19/20: 267.01 ms
+  q12 trial 20/20: 282.77 ms
+
+-- q13 --
+  q13 trial 1/20: 690.34 ms
+  q13 trial 2/20: 707.03 ms
+  q13 trial 3/20: 674.94 ms
+  q13 trial 4/20: 672.33 ms
+  q13 trial 5/20: 694.60 ms
+  q13 trial 6/20: 681.77 ms
+  q13 trial 7/20: 672.35 ms
+  q13 trial 8/20: 703.06 ms
+  q13 trial 9/20: 676.79 ms
+  q13 trial 10/20: 686.16 ms
+  q13 trial 11/20: 676.96 ms
+  q13 trial 12/20: 677.63 ms
+  q13 trial 13/20: 706.87 ms
+  q13 trial 14/20: 679.36 ms
+  q13 trial 15/20: 686.73 ms
+  q13 trial 16/20: 679.96 ms
+  q13 trial 17/20: 705.44 ms
+  q13 trial 18/20: 690.66 ms
+  q13 trial 19/20: 671.83 ms
+  q13 trial 20/20: 707.08 ms
+
+-- q14 --
+  q14 trial 1/20: 111.76 ms
+  q14 trial 2/20: 132.04 ms
+  q14 trial 3/20: 129.01 ms
+  q14 trial 4/20: 113.50 ms
+  q14 trial 5/20: 123.20 ms
+  q14 trial 6/20: 110.30 ms
+  q14 trial 7/20: 111.13 ms
+  q14 trial 8/20: 135.19 ms
+  q14 trial 9/20: 119.50 ms
+  q14 trial 10/20: 112.50 ms
+  q14 trial 11/20: 118.94 ms
+  q14 trial 12/20: 111.03 ms
+  q14 trial 13/20: 113.07 ms
+  q14 trial 14/20: 140.79 ms
+  q14 trial 15/20: 113.91 ms
+  q14 trial 16/20: 110.25 ms
+  q14 trial 17/20: 121.93 ms
+  q14 trial 18/20: 111.57 ms
+  q14 trial 19/20: 110.60 ms
+  q14 trial 20/20: 138.89 ms
+
+-- q15 --
+  q15 trial 1/20: 128.88 ms
+  q15 trial 2/20: 131.50 ms
+  q15 trial 3/20: 120.12 ms
+  q15 trial 4/20: 154.46 ms
+  q15 trial 5/20: 125.05 ms
+  q15 trial 6/20: 131.89 ms
+  q15 trial 7/20: 123.01 ms
+  q15 trial 8/20: 152.50 ms
+  q15 trial 9/20: 125.14 ms
+  q15 trial 10/20: 120.24 ms
+  q15 trial 11/20: 129.97 ms
+  q15 trial 12/20: 123.92 ms
+  q15 trial 13/20: 157.15 ms
+  q15 trial 14/20: 122.77 ms
+  q15 trial 15/20: 133.40 ms
+  q15 trial 16/20: 122.69 ms
+  q15 trial 17/20: 122.73 ms
+  q15 trial 18/20: 159.58 ms
+  q15 trial 19/20: 121.78 ms
+  q15 trial 20/20: 132.72 ms
+
+-- q16 --
+  q16 trial 1/20: 211.76 ms
+  q16 trial 2/20: 432.15 ms
+  q16 trial 3/20: 214.50 ms
+  q16 trial 4/20: 217.62 ms
+  q16 trial 5/20: 198.55 ms
+  q16 trial 6/20: 201.21 ms
+  q16 trial 7/20: 202.40 ms
+  q16 trial 8/20: 219.16 ms
+  q16 trial 9/20: 203.94 ms
+  q16 trial 10/20: 201.20 ms
+  q16 trial 11/20: 200.94 ms
+  q16 trial 12/20: 288.81 ms
+  q16 trial 13/20: 208.48 ms
+  q16 trial 14/20: 200.37 ms
+  q16 trial 15/20: 198.57 ms
+  q16 trial 16/20: 201.85 ms
+  q16 trial 17/20: 211.20 ms
+  q16 trial 18/20: 205.47 ms
+  q16 trial 19/20: 211.57 ms
+  q16 trial 20/20: 199.01 ms
+
+-- q17 --
+  q17 trial 1/20: 231.25 ms
+  q17 trial 2/20: 238.99 ms
+  q17 trial 3/20: 230.61 ms
+  q17 trial 4/20: 231.33 ms
+  q17 trial 5/20: 261.44 ms
+  q17 trial 6/20: 232.53 ms
+  q17 trial 7/20: 240.24 ms
+  q17 trial 8/20: 227.80 ms
+  q17 trial 9/20: 232.25 ms
+  q17 trial 10/20: 259.79 ms
+  q17 trial 11/20: 234.22 ms
+  q17 trial 12/20: 229.84 ms
+  q17 trial 13/20: 245.84 ms
+  q17 trial 14/20: 234.48 ms
+  q17 trial 15/20: 231.94 ms
+  q17 trial 16/20: 259.53 ms
+  q17 trial 17/20: 229.95 ms
+  q17 trial 18/20: 240.74 ms
+  q17 trial 19/20: 230.52 ms
+  q17 trial 20/20: 236.27 ms
+
+-- q18 --
+  q18 trial 1/20: 545.43 ms
+  q18 trial 2/20: 567.95 ms
+  q18 trial 3/20: 590.56 ms
+  q18 trial 4/20: 580.81 ms
+  q18 trial 5/20: 540.63 ms
+  q18 trial 6/20: 553.12 ms
+  q18 trial 7/20: 548.21 ms
+  q18 trial 8/20: 544.77 ms
+  q18 trial 9/20: 583.39 ms
+  q18 trial 10/20: 542.47 ms
+  q18 trial 11/20: 562.81 ms
+  q18 trial 12/20: 558.42 ms
+  q18 trial 13/20: 558.29 ms
+  q18 trial 14/20: 605.40 ms
+  q18 trial 15/20: 549.03 ms
+  q18 trial 16/20: 566.18 ms
+  q18 trial 17/20: 559.41 ms
+  q18 trial 18/20: 594.50 ms
+  q18 trial 19/20: 559.81 ms
+  q18 trial 20/20: 567.36 ms
+
+-- q19 --
+  q19 trial 1/20: 86.54 ms
+  q19 trial 2/20: 94.88 ms
+  q19 trial 3/20: 96.30 ms
+  q19 trial 4/20: 89.34 ms
+  q19 trial 5/20: 79.20 ms
+  q19 trial 6/20: 76.20 ms
+  q19 trial 7/20: 94.36 ms
+  q19 trial 8/20: 85.22 ms
+  q19 trial 9/20: 88.74 ms
+  q19 trial 10/20: 77.45 ms
+  q19 trial 11/20: 76.80 ms
+  q19 trial 12/20: 103.45 ms
+  q19 trial 13/20: 81.72 ms
+  q19 trial 14/20: 85.40 ms
+  q19 trial 15/20: 80.93 ms
+  q19 trial 16/20: 96.78 ms
+  q19 trial 17/20: 88.37 ms
+  q19 trial 18/20: 76.55 ms
+  q19 trial 19/20: 87.50 ms
+  q19 trial 20/20: 75.97 ms
+
+-- q20 --
+  q20 trial 1/20: 114.97 ms
+  q20 trial 2/20: 102.04 ms
+  q20 trial 3/20: 142.91 ms
+  q20 trial 4/20: 105.07 ms
+  q20 trial 5/20: 101.53 ms
+  q20 trial 6/20: 112.44 ms
+  q20 trial 7/20: 109.53 ms
+  q20 trial 8/20: 152.69 ms
+  q20 trial 9/20: 105.45 ms
+  q20 trial 10/20: 101.69 ms
+  q20 trial 11/20: 117.52 ms
+  q20 trial 12/20: 103.18 ms
+  q20 trial 13/20: 146.24 ms
+  q20 trial 14/20: 106.12 ms
+  q20 trial 15/20: 100.61 ms
+  q20 trial 16/20: 113.81 ms
+  q20 trial 17/20: 101.15 ms
+  q20 trial 18/20: 145.24 ms
+  q20 trial 19/20: 103.44 ms
+  q20 trial 20/20: 100.89 ms
+
+-- q21 --
+  q21 trial 1/20: 575.24 ms
+  q21 trial 2/20: 599.79 ms
+  q21 trial 3/20: 608.34 ms
+  q21 trial 4/20: 619.04 ms
+  q21 trial 5/20: 593.14 ms
+  q21 trial 6/20: 607.78 ms
+  q21 trial 7/20: 617.98 ms
+  q21 trial 8/20: 590.60 ms
+  q21 trial 9/20: 617.24 ms
+  q21 trial 10/20: 609.57 ms
+  q21 trial 11/20: 636.33 ms
+  q21 trial 12/20: 724.27 ms
+  q21 trial 13/20: 789.60 ms
+  q21 trial 14/20: 715.33 ms
+  q21 trial 15/20: 716.11 ms
+  q21 trial 16/20: 726.86 ms
+  q21 trial 17/20: 696.74 ms
+  q21 trial 18/20: 685.52 ms
+  q21 trial 19/20: 739.23 ms
+  q21 trial 20/20: 737.21 ms
+
+-- q22 --
+  q22 trial 1/20: 294.35 ms
+  q22 trial 2/20: 300.65 ms
+  q22 trial 3/20: 293.65 ms
+  q22 trial 4/20: 329.89 ms
+  q22 trial 5/20: 306.57 ms
+  q22 trial 6/20: 313.83 ms
+  q22 trial 7/20: 306.51 ms
+  q22 trial 8/20: 315.47 ms
+  q22 trial 9/20: 299.76 ms
+  q22 trial 10/20: 663.27 ms
+  q22 trial 11/20: 390.94 ms
+  q22 trial 12/20: 434.49 ms
+  q22 trial 13/20: 359.11 ms
+  q22 trial 14/20: 392.16 ms
+  q22 trial 15/20: 355.25 ms
+  q22 trial 16/20: 390.84 ms
+  q22 trial 17/20: 377.14 ms
+  q22 trial 18/20: 382.39 ms
+  q22 trial 19/20: 353.61 ms
+  q22 trial 20/20: 372.81 ms
+
+=== Results ===
+| Query | DataFusion (ms) | PySpark (ms) | DF/PySpark | PySpark trials min/max (ms) | rows |
+|---|---|---|---|---|---|
+| Q01 |  48.7 |   167.1 | 0.291 | 158.3 / 195.6 | 4 |
+| Q02 |   TBD |   190.1 | — | 173.2 / 296.7 | 460 |
+| Q03 |  34.6 |   257.2 | 0.135 | 241.0 / 273.0 | 11620 |
+| Q04 |   TBD |   183.6 | — | 177.2 / 196.6 | 5 |
+| Q05 |   TBD |   334.8 | — | 314.7 / 370.1 | 5 |
+| Q06 |  18.2 |    41.5 | 0.439 | 38.4 / 56.2 | 1 |
+| Q07 |   TBD |   260.4 | — | 250.0 / 298.4 | 4 |
+| Q08 |   TBD |   182.2 | — | 167.1 / 292.8 | 2 |
+| Q09 |   TBD |   582.9 | — | 458.7 / 764.1 | 175 |
+| Q10 |   TBD |   361.9 | — | 344.7 / 391.6 | 37967 |
+| Q11 |   TBD |   119.2 | — | 114.6 / 155.6 | 1048 |
+| Q12 |   TBD |   269.1 | — | 257.5 / 296.4 | 2 |
+| Q13 |   TBD |   684.0 | — | 671.8 / 707.1 | 42 |
+| Q14 |   TBD |   113.7 | — | 110.2 / 140.8 | 1 |
+| Q15 |   TBD |   127.0 | — | 120.1 / 159.6 | 1 |
+| Q16 |   TBD |   204.7 | — | 198.6 / 432.1 | 18314 |
+| Q17 |   TBD |   233.4 | — | 227.8 / 261.4 | 1 |
+| Q18 |   TBD |   559.6 | — | 540.6 / 605.4 | 57 |
+| Q19 |  38.0 |    86.0 | 0.442 | 76.0 / 103.4 | 1 |
+| Q20 |   TBD |   105.8 | — | 100.6 / 152.7 | 186 |
+| Q21 |   TBD |   627.7 | — | 575.2 / 789.6 | 411 |
+| Q22 |   TBD |   354.4 | — | 293.7 / 663.3 | 7 |

@@ -897,6 +897,80 @@ pub fn filter_byte_array_to_bitmap_dense(
     Ok((bitmap, total))
 }
 
+/// Lever 3 (2026-05-24) — return `(min, max)` for an i64 column-chunk
+/// from its parquet statistics, or `None` if stats are absent or the
+/// values aren't 8-byte little-endian i64 (parquet's INT64 stats are
+/// stored as 8 raw LE bytes per the spec).
+pub fn rg_i64_min_max(
+    path: &std::path::Path,
+    rg: usize,
+    col: usize,
+) -> DfResult<Option<(i64, i64)>> {
+    let file = ParquetFile::open(path).map_err(|e| ext(format!("ParquetFile::open: {e}")))?;
+    let md = file.metadata().map_err(|e| ext(format!("metadata: {e}")))?;
+    let cm = md.row_groups[rg].columns[col]
+        .meta_data
+        .as_ref()
+        .ok_or_else(|| ext("column missing meta_data"))?;
+    let Some(stats) = &cm.statistics else {
+        return Ok(None);
+    };
+    // Parquet 2.0+ writers prefer min_value / max_value; older writers
+    // wrote the deprecated `min` / `max`. Try the new fields first.
+    let min_bytes = stats.min_value.or(stats.min);
+    let max_bytes = stats.max_value.or(stats.max);
+    match (min_bytes, max_bytes) {
+        (Some(mn), Some(mx)) if mn.len() == 8 && mx.len() == 8 => {
+            let mn = i64::from_le_bytes(mn.try_into().unwrap());
+            let mx = i64::from_le_bytes(mx.try_into().unwrap());
+            Ok(Some((mn, mx)))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// Lever 3 — return the number of values in an i64 column-chunk
+/// without decoding it. Used as the bitmap size when an RG is
+/// short-circuited by an `I64Range` predicate.
+pub fn rg_num_values(path: &std::path::Path, rg: usize, col: usize) -> DfResult<usize> {
+    let file = ParquetFile::open(path).map_err(|e| ext(format!("ParquetFile::open: {e}")))?;
+    let md = file.metadata().map_err(|e| ext(format!("metadata: {e}")))?;
+    let cm = md.row_groups[rg].columns[col]
+        .meta_data
+        .as_ref()
+        .ok_or_else(|| ext("column missing meta_data"))?;
+    Ok(cm.num_values as usize)
+}
+
+/// Σ.Q.L4′: build a row bitmap from an INT64 column. Used for bloom-
+/// filter probe pushdown on i64 join keys (l_orderkey, l_partkey,
+/// l_suppkey, o_orderkey, ...). PLAIN dense decode for now — TPC-H
+/// i64 columns are bw≥20 so dict-encoding is rare; a dict-aware fast
+/// path can be added later if a workload demands it.
+pub fn filter_i64_column_to_bitmap_dense(
+    path: &std::path::Path,
+    rg: usize,
+    col: usize,
+    predicate: impl Fn(i64) -> bool,
+) -> DfResult<(Vec<u8>, usize)> {
+    let file = ParquetFile::open(path).map_err(|e| ext(format!("ParquetFile::open: {e}")))?;
+    let md = file.metadata().map_err(|e| ext(format!("metadata: {e}")))?;
+    let cm = md.row_groups[rg].columns[col]
+        .meta_data
+        .as_ref()
+        .ok_or_else(|| ext("column missing meta_data"))?;
+    let total = cm.num_values as usize;
+    let all_ones = vec![0xFFu8; total.div_ceil(8)];
+    let values = masked_decode_i64(&file, rg, col, &all_ones)?;
+    let mut bitmap = vec![0u8; total.div_ceil(8)];
+    for (row, &v) in values.iter().enumerate() {
+        if predicate(v) {
+            bitmap[row >> 3] |= 1 << (row & 7);
+        }
+    }
+    Ok((bitmap, total))
+}
+
 /// Σ.E5 #512: build a row bitmap from an INT32 column via a simple
 /// dense-decode path. Used as a fallback when the chunk isn't
 /// dict-encoded (PLAIN-only). Mirrors `filter_i32_column_to_bitmap`

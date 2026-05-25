@@ -121,11 +121,13 @@ def median_then_range(values: list[float]) -> tuple[float, float, float]:
     return statistics.median(values), min(values), max(values)
 
 
-def run(spark: SparkSession, name: str, trials: int) -> dict[str, float]:
+def run(spark: SparkSession, name: str, trials: int, warmups: int = 1) -> dict[str, float]:
     sql = load_query(name)
 
-    # Warm-up: 1 untimed run to let the JIT settle.
-    _, row_count = time_query(spark, sql)
+    # Warm-ups: N untimed runs to let the JIT + Catalyst codegen settle.
+    row_count = 0
+    for _ in range(max(1, warmups)):
+        _, row_count = time_query(spark, sql)
 
     timings: list[float] = []
     for trial in range(trials):
@@ -183,7 +185,13 @@ def parse_args() -> argparse.Namespace:
         "--trials",
         type=int,
         default=3,
-        help="timed trials per query after a discarded warm-up (default: 3)",
+        help="timed trials per query after warm-ups (default: 3)",
+    )
+    p.add_argument(
+        "--warmups",
+        type=int,
+        default=1,
+        help="untimed warm-up runs per query (default: 1)",
     )
     return p.parse_args()
 
@@ -206,7 +214,7 @@ def main() -> None:
     args = parse_args()
 
     print(f"==> data dir: {args.data_dir}")
-    print(f"==> trials per query: {args.trials} (after 1 warm-up)")
+    print(f"==> trials per query: {args.trials} (after {args.warmups} warm-up{'s' if args.warmups != 1 else ''})")
     print()
 
     spark = build_spark()
@@ -217,7 +225,7 @@ def main() -> None:
     for name in QUERY_NAMES:
         print(f"-- {name} --")
         try:
-            results[name] = run(spark, name, args.trials)
+            results[name] = run(spark, name, args.trials, args.warmups)
         except Exception as e:  # noqa: BLE001 — surface, don't kill the run
             print(f"  FAIL: {e}")
         print()

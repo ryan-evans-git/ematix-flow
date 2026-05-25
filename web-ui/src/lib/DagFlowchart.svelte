@@ -20,7 +20,7 @@
   export let compact = false;
   export let onNavigate = null;
 
-  $: NODE_W   = compact ? 160 : 200;
+  $: NODE_W   = compact ? 180 : 220;
   $: NODE_H   = compact ?  56 :  76;
   $: COL_GAP  = compact ?  60 :  80;
   $: ROW_GAP  = compact ?  16 :  24;
@@ -98,6 +98,35 @@
     const p = jobMap[name];
     return p?.latest_run?.duration_ms ?? p?.median_duration_ms ?? null;
   }
+
+  // Split a possibly-qualified job name "workflow.job" into prefix + leaf.
+  // Plain leaf names (compact inline DAGs) come back with prefix === "".
+  function splitName(n) {
+    if (n && typeof n.short_name === "string" && n.short_name) {
+      const prefix = n.name && n.name !== n.short_name && n.name.endsWith("." + n.short_name)
+        ? n.name.slice(0, -1 - n.short_name.length)
+        : "";
+      return { leaf: n.short_name, prefix };
+    }
+    const raw = n?.name || "";
+    const dot = raw.lastIndexOf(".");
+    return dot < 0
+      ? { leaf: raw, prefix: "" }
+      : { leaf: raw.slice(dot + 1), prefix: raw.slice(0, dot) };
+  }
+
+  // Truncate to ~`max` chars with an ellipsis. Box-width safety net.
+  function truncate(s, max) {
+    if (!s) return s;
+    return s.length <= max ? s : s.slice(0, Math.max(1, max - 1)) + "…";
+  }
+
+  // Char budget at the rendered font sizes for the current NODE_W.
+  // 12px mono ≈ 7.2 px/char, 10px ≈ 6 px/char, 9px ≈ 5.4 px/char.
+  // Subtract 18px of horizontal padding (10 left + 8 right).
+  $: nameCharBudget  = Math.max(8, Math.floor((NODE_W - 18) / 7.2));
+  $: metaCharBudget  = Math.max(8, Math.floor((NODE_W - 18) / 6.0));
+  $: smallCharBudget = Math.max(8, Math.floor((NODE_W - 18) / 5.4));
 
   $: maxDur = (() => {
     let m = 0;
@@ -179,6 +208,9 @@
     {#each nodes as n}
       {@const pos = positions.get(n.name) || { x: 0, y: 0 }}
       {@const st = nodeStatus(n.name)}
+      {@const parts = splitName(n)}
+      {@const metaLine = `${st} · ${fmtDuration(nodeDuration(n.name))}`}
+      {@const subLine = compact ? "" : (parts.prefix || n.schedule || "")}
       <g transform={`translate(${pos.x}, ${pos.y})`} class="dag-node" on:click={(ev) => navigate(n.name, ev)} on:keydown={(ev) => ev.key === 'Enter' && navigate(n.name, ev)} role="link" tabindex="0">
         <title>{`${n.name}\nschedule: ${n.schedule || '—'}\nstatus: ${st}\nduration: ${fmtDuration(nodeDuration(n.name))}`}</title>
         <rect
@@ -189,10 +221,10 @@
           stroke={strokeFor(n.name)}
           stroke-width={strokeWidthFor(n.name)}
         />
-        <text x="10" y="18" class="dag-name" font-family="var(--font-mono, monospace)" font-size="12" font-weight="600" fill="var(--color-phosphor-200, #c8e8c8)">{n.name}</text>
-        <text x="10" y={compact ? 32 : 36} class="dag-meta" font-family="var(--font-mono, monospace)" font-size="10" fill="var(--color-fg-muted, #888)">{st} · {fmtDuration(nodeDuration(n.name))}</text>
-        {#if !compact}
-          <text x="10" y="52" class="dag-meta" font-family="var(--font-mono, monospace)" font-size="9" fill="var(--color-fg-muted, #666)">{n.schedule || '(no schedule)'}</text>
+        <text x="10" y="18" class="dag-name" font-family="var(--font-mono, monospace)" font-size="12" font-weight="600" fill="var(--color-phosphor-200, #c8e8c8)">{truncate(parts.leaf, nameCharBudget)}</text>
+        <text x="10" y={compact ? 32 : 36} class="dag-meta" font-family="var(--font-mono, monospace)" font-size="10" fill="var(--color-fg-muted, #888)">{truncate(metaLine, metaCharBudget)}</text>
+        {#if !compact && subLine}
+          <text x="10" y="52" class="dag-meta" font-family="var(--font-mono, monospace)" font-size="9" fill="var(--color-fg-muted, #666)">{truncate(subLine, smallCharBudget)}</text>
         {/if}
         <!-- duration bar -->
         <rect x="8" y={NODE_H - 8} width={NODE_W - 16} height="3" rx="1.5" fill="rgba(255,255,255,0.05)" />

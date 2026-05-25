@@ -109,7 +109,10 @@ pub fn with_optimizer_rules_and_registry(
         )))
         .with_physical_optimizer_rule(Arc::new(EnableDictGroupCountRule))
         .with_physical_optimizer_rule(Arc::new(InjectFilterMultiAggRule))
-        .with_physical_optimizer_rule(Arc::new(InjectFilterSumRule));
+        .with_physical_optimizer_rule(Arc::new(InjectFilterSumRule))
+        .with_physical_optimizer_rule(Arc::new(
+            crate::swap_semi_join_build_rule::SwapSemiJoinBuildSideRule,
+        ));
     (builder, registry)
 }
 

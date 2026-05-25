@@ -43,6 +43,7 @@ use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
     SendableRecordBatchStream,
 };
+use futures_util::StreamExt;
 
 use datafusion::parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
 use datafusion::parquet::file::reader::{FileReader, SerializedFileReader};
@@ -115,6 +116,14 @@ impl BridgeFilter {
     pub fn predicted_pass_rate(&self) -> f64 {
         self.predicted_pass_rate
     }
+
+    /// Σ.Q.L4′ — append additional predicates (typically I64InBloom
+    /// from a planner rule that pre-built blooms off small HashJoin
+    /// build sides). Order is "existing first, new after" so the
+    /// dict-aware fast-path predicates run before the bloom probe.
+    pub fn extend(&mut self, more: Vec<ColumnPredicate>) {
+        self.predicates.extend(more);
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -159,6 +168,44 @@ pub enum ColumnPredicate {
         right_col: usize,
         op: Operator,
     },
+    /// Σ.Q.L4′ — Bloom-filter membership probe on an i64 column.
+    /// Pre-built by the planner from a HashJoin's build side (e.g.
+    /// the post-filter supplier/nation keys) and pushed into the
+    /// probe-side scan so lineitem rows whose join key isn't in the
+    /// bloom skip masked-decode entirely. Approximate by design —
+    /// false positives are allowed (the residual join still runs);
+    /// this is selectivity reduction, not correctness.
+    I64InBloom {
+        col_idx: usize,
+        bloom: Arc<crate::bloom::BloomFilter>,
+    },
+    /// L9.HashSet (2026-05-24) — exact i64 membership probe. Used by
+    /// the L9 runtime sideband when the build side is small enough
+    /// that an exact `I64Set` outperforms the probabilistic bloom
+    /// (Q17 SF=10 profile: 1.3 ns/probe vs 17.2 ns/probe for bloom
+    /// at a 2K-key build, plus zero false positives).
+    /// Falls back to `I64InBloom` past `EMAT_L9_SET_THRESHOLD` keys.
+    I64InSet {
+        col_idx: usize,
+        set: Arc<crate::i64_set::I64Set>,
+    },
+    /// Lever 3 (2026-05-24) — closed-interval `lo ≤ v ≤ hi` predicate
+    /// on an i64 column. Emitted alongside `I64InBloom` / `I64InSet`
+    /// by `BuildSideBloomEmitterExec` (tracking the min/max of all
+    /// build keys per-partition then unioning at publish). The win
+    /// isn't the per-row check — that's just two comparisons, the
+    /// bloom/set is already a single hash + lookup. The win is the
+    /// **RG-level skip**: `BridgeFilter::build_bitmap` consults the
+    /// parquet column-chunk min/max statistics for the target RG
+    /// and short-circuits to an all-zero bitmap when stats don't
+    /// overlap `[lo, hi]`. For TPC-H queries with a narrow dim
+    /// filter (Q05's ASIA → ~20K customers in a contiguous key
+    /// range, Q07's nation-filtered supplier set, Q08's brand+nation
+    /// part-filter) this can skip whole row groups before any
+    /// l_partkey / l_suppkey decode happens. For Q17 the range
+    /// covers ~100% of l_partkey so no RG is skipped — the lever is
+    /// query-shape dependent.
+    I64Range { col_idx: usize, lo: i64, hi: i64 },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -189,6 +236,7 @@ impl BridgeFilter {
             filter_byte_array_to_bitmap, filter_byte_array_to_bitmap_dense,
             filter_f64_column_to_bitmap, filter_f64_column_to_bitmap_dense,
             filter_i32_column_to_bitmap, filter_i32_column_to_bitmap_dense,
+            filter_i64_column_to_bitmap_dense,
         };
         let mut combined: Option<(Vec<u8>, usize)> = None;
         for p in &self.predicates {
@@ -296,6 +344,69 @@ impl BridgeFilter {
                     }
                     (bitmap, total)
                 }
+                ColumnPredicate::I64InBloom { col_idx, bloom } => {
+                    let bloom = bloom.clone();
+                    filter_i64_column_to_bitmap_dense(path, rg, *col_idx, move |v: i64| {
+                        bloom.might_contain_i64(v)
+                    })?
+                }
+                ColumnPredicate::I64InSet { col_idx, set } => {
+                    let set = set.clone();
+                    filter_i64_column_to_bitmap_dense(path, rg, *col_idx, move |v: i64| {
+                        set.contains(v)
+                    })?
+                }
+                ColumnPredicate::I64Range { col_idx, lo, hi } => {
+                    // Lever 3 — RG-level skip via parquet column-chunk
+                    // min/max statistics. If the RG's stats don't
+                    // overlap `[lo, hi]`, return an all-zero bitmap
+                    // immediately (no decode). When stats are missing
+                    // or overlapping, fall through to the per-row
+                    // range check (which is two i64 comparisons).
+                    let lo = *lo;
+                    let hi = *hi;
+                    let col_idx = *col_idx;
+                    if let Some((rg_min, rg_max)) =
+                        crate::ematix_parquet_bridge::rg_i64_min_max(path, rg, col_idx)?
+                    {
+                        // No overlap: short-circuit.
+                        if rg_max < lo || rg_min > hi {
+                            // We still need to know `total` (rows in RG).
+                            let total =
+                                crate::ematix_parquet_bridge::rg_num_values(path, rg, col_idx)?;
+                            (vec![0u8; total.div_ceil(8)], total)
+                        } else if rg_min >= lo && rg_max <= hi {
+                            // Fully inside: every row passes the range.
+                            // Skip the per-row check; return an all-
+                            // ones bitmap. (Costs one masked-decode for
+                            // the AND-combine downstream, but no
+                            // per-row predicate evaluation.)
+                            let total =
+                                crate::ematix_parquet_bridge::rg_num_values(path, rg, col_idx)?;
+                            let mut bitmap = vec![0xFFu8; total.div_ceil(8)];
+                            // Clear the unused tail bits in the final
+                            // byte (avoid spuriously matching ghost
+                            // rows past `total`).
+                            let tail_bits = total & 7;
+                            if tail_bits != 0 {
+                                if let Some(last) = bitmap.last_mut() {
+                                    *last &= (1u8 << tail_bits) - 1;
+                                }
+                            }
+                            (bitmap, total)
+                        } else {
+                            // Partial overlap: per-row check.
+                            filter_i64_column_to_bitmap_dense(path, rg, col_idx, move |v: i64| {
+                                v >= lo && v <= hi
+                            })?
+                        }
+                    } else {
+                        // Stats unavailable: per-row check.
+                        filter_i64_column_to_bitmap_dense(path, rg, col_idx, move |v: i64| {
+                            v >= lo && v <= hi
+                        })?
+                    }
+                }
                 ColumnPredicate::StringEq { col_idx, .. }
                 | ColumnPredicate::StringNotEq { col_idx, .. }
                 | ColumnPredicate::StringIn { col_idx, .. }
@@ -363,6 +474,9 @@ impl ColumnPredicate {
             | ColumnPredicate::StringLike { col_idx, .. } => *col_idx,
             // ColumnPair touches two cols; return left as the "primary".
             ColumnPredicate::I32ColumnPair { left_col, .. } => *left_col,
+            ColumnPredicate::I64InBloom { col_idx, .. } => *col_idx,
+            ColumnPredicate::I64InSet { col_idx, .. } => *col_idx,
+            ColumnPredicate::I64Range { col_idx, .. } => *col_idx,
         }
     }
 
@@ -491,6 +605,29 @@ impl ColumnPredicate {
             }
             // Refused-for-pushdown shapes; never reach here in practice.
             ColumnPredicate::F64Range { .. } | ColumnPredicate::I32ColumnPair { .. } => 0.5,
+            // Σ.Q.L4′ — bloom is selectivity-reducing. Caller supplies
+            // the build-side cardinality via expected_keys when
+            // constructing; we approximate pass rate as 1 - FPR ≈ 0.01
+            // for true negatives + (built_card / col_distinct) for true
+            // positives. Without stats we lean on the bloom's own
+            // n_blocks heuristic; a 1% FPR + small build vs large
+            // probe means the pass rate is roughly the build/probe
+            // cardinality ratio. We don't have that here, so return
+            // 0.2 as a conservative win-leaning estimate (lower than
+            // the StringIn default of 0.2 because we expect blooms
+            // only to be injected when the build is genuinely small).
+            ColumnPredicate::I64InBloom { .. } => 0.2,
+            // L9.HashSet — exact membership has no FP rate, so the
+            // estimate can be tighter than the bloom's 0.2. The build
+            // is small by definition (≤ EMAT_L9_SET_THRESHOLD), so we
+            // expect ≤ ~0.1 pass rate in the common L9 case.
+            ColumnPredicate::I64InSet { .. } => 0.1,
+            // Lever 3 — closed-interval range. Without column stats we
+            // can't bound it tightly; assume the L9 emitter only
+            // produces this for builds with a narrow value range
+            // (Q05/Q07/Q08 dim filters), so 0.3 is a conservative
+            // win-leaning estimate.
+            ColumnPredicate::I64Range { .. } => 0.3,
         }
     }
 
@@ -523,6 +660,27 @@ impl ColumnPredicate {
             // decode trap respectively). When/if re-enabled they'll
             // need their own audit before claiming Exact.
             ColumnPredicate::F64Range { .. } | ColumnPredicate::I32ColumnPair { .. } => false,
+            // Σ.Q.L4′ — bloom is approximate by construction (FPR > 0).
+            // Provider must declare this Inexact so DataFusion keeps
+            // the residual HashJoin equality test.
+            ColumnPredicate::I64InBloom { .. } => false,
+            // L9.HashSet — exact membership IS byte-level equivalent
+            // to the residual equi-join test, BUT the runtime sideband
+            // path uses Inexact so the residual HashJoin still fires
+            // (the sideband prunes selectivity, doesn't replace the
+            // join). Mark Inexact to preserve correctness across all
+            // L9 call sites. A future logical-rule pushdown that
+            // proves the column has no nulls + the join is Inner could
+            // promote this to true.
+            ColumnPredicate::I64InSet { .. } => false,
+            // Lever 3 — the I64Range is derived from build-side
+            // min/max, which is necessary-but-not-sufficient for
+            // the equi-join (every match key falls in [lo, hi] but
+            // not every key in [lo, hi] is a match). The residual
+            // HashJoin must still run. Inexact for the same reason
+            // as the L9 bloom/set: selectivity reduction, not
+            // replacement.
+            ColumnPredicate::I64Range { .. } => false,
         }
     }
 
@@ -573,6 +731,20 @@ impl ColumnPredicate {
                 true
             }
             ColumnPredicate::I32In { values, .. } => values.contains(&v),
+            _ => false,
+        }
+    }
+
+    /// Σ.Q.L4′ — evaluate against an i64 value (I64InBloom only).
+    /// Returns true on a bloom HIT (key may be present in the build
+    /// side). False positives are part of the contract; the residual
+    /// equijoin still runs.
+    #[inline]
+    pub fn eval_i64(&self, v: i64) -> bool {
+        match self {
+            ColumnPredicate::I64InBloom { bloom, .. } => bloom.might_contain_i64(v),
+            ColumnPredicate::I64InSet { set, .. } => set.contains(v),
+            ColumnPredicate::I64Range { lo, hi, .. } => v >= *lo && v <= *hi,
             _ => false,
         }
     }
@@ -1389,6 +1561,21 @@ impl TableProvider for EmatixFastParquetTableProvider {
         TableType::Base
     }
 
+    /// Σ.Q.M (2026-05-23): expose the file-metadata-derived row count
+    /// so logical optimizer rules can distinguish dim vs fact tables.
+    /// `num_rows` is read from parquet `FileMetadata::num_rows` at
+    /// registration time, so it's exact for unfiltered scans.
+    fn statistics(&self) -> Option<datafusion::common::Statistics> {
+        Some(datafusion::common::Statistics {
+            num_rows: datafusion::common::stats::Precision::Exact(self.num_rows),
+            total_byte_size: datafusion::common::stats::Precision::Absent,
+            column_statistics: vec![
+                datafusion::common::ColumnStatistics::new_unknown();
+                self.schema.fields().len()
+            ],
+        })
+    }
+
     /// Phase 3 pushdown: single-column AND-conjunction of `col OP lit`
     /// where col is Int32/Date32. Other shapes return `Unsupported`
     /// and stay in DataFusion's residual FilterExec.
@@ -1553,6 +1740,12 @@ pub struct EmatixFastParquetExec {
     /// of `Statistics::new_unknown`. Same shape as
     /// `FastParquetExec.column_stats`.
     column_stats: Vec<datafusion::common::stats::ColumnStatistics>,
+    /// Σ.Q.L9 — runtime sideband for mid-query predicate injection.
+    /// `None` = no sideband attached (normal case). When set, the
+    /// scan's `execute()` consults this AFTER the build phase of any
+    /// upstream HashJoin has had a chance to populate it; matching
+    /// predicates are merged into the BridgeFilter before decode.
+    runtime_sideband: Option<crate::bridge_filter_sideband::BridgeFilterSideband>,
     properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
 }
@@ -1591,9 +1784,29 @@ impl EmatixFastParquetExec {
             late_mat,
             streaming_arrow_reader,
             column_stats,
+            runtime_sideband: None,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
         })
+    }
+
+    /// Σ.Q.L9 — attach a runtime sideband. The scan will consult this
+    /// at `execute()` time and merge any published predicates into
+    /// the BridgeFilter before decode. Returns a fresh Arc<Self> so
+    /// the planner rule's TreeNode walk stays honest.
+    pub fn with_runtime_sideband(
+        &self,
+        sideband: crate::bridge_filter_sideband::BridgeFilterSideband,
+    ) -> Arc<Self> {
+        let mut next = self.clone_internals();
+        next.runtime_sideband = Some(sideband);
+        Arc::new(next)
+    }
+
+    /// Σ.Q.L9 — the attached runtime sideband, if any. Used by the
+    /// planner rule to verify it threaded the sideband correctly.
+    pub fn runtime_sideband(&self) -> Option<&crate::bridge_filter_sideband::BridgeFilterSideband> {
+        self.runtime_sideband.as_ref()
     }
 
     /// Full (unprojected) file schema. Σ.E5: needed by
@@ -1625,6 +1838,61 @@ impl EmatixFastParquetExec {
     /// (where `<table>` is the file basename without extension).
     pub fn path(&self) -> &str {
         &self.path
+    }
+
+    /// Σ.Q.L4′ — append extra predicates (e.g. I64InBloom from a
+    /// build-side bloom emitter) onto this scan's BridgeFilter. If
+    /// no filter existed, creates one from the supplied predicates.
+    /// Returns a fresh `Arc<Self>` to keep the rule's TreeNode walk
+    /// honest (no in-place mutation of shared exec nodes).
+    pub fn with_added_predicates(&self, more: Vec<ColumnPredicate>) -> DfResult<Arc<Self>> {
+        if more.is_empty() {
+            return Ok(Arc::new(self.clone_internals()));
+        }
+        let mut filter = match &self.filter {
+            Some(f) => f.clone(),
+            None => BridgeFilter::new(Vec::new()),
+        };
+        filter.extend(more);
+        // Re-compute the predicted pass rate so the streaming reader
+        // picks the right serial-vs-parallel path.
+        let p = filter.estimate_pass_rate(&self.column_stats);
+        let filter = filter.with_predicted_pass_rate(p);
+        Ok(Arc::new(Self {
+            path: self.path.clone(),
+            schema: self.schema.clone(),
+            file_schema: self.file_schema.clone(),
+            projection: self.projection.clone(),
+            assignments: self.assignments.clone(),
+            num_rows: self.num_rows,
+            rg_num_rows: self.rg_num_rows.clone(),
+            filter: Some(filter),
+            late_mat: self.late_mat,
+            streaming_arrow_reader: self.streaming_arrow_reader,
+            column_stats: self.column_stats.clone(),
+            runtime_sideband: self.runtime_sideband.clone(),
+            properties: self.properties.clone(),
+            metrics: ExecutionPlanMetricsSet::new(),
+        }))
+    }
+
+    fn clone_internals(&self) -> Self {
+        Self {
+            path: self.path.clone(),
+            schema: self.schema.clone(),
+            file_schema: self.file_schema.clone(),
+            projection: self.projection.clone(),
+            assignments: self.assignments.clone(),
+            num_rows: self.num_rows,
+            rg_num_rows: self.rg_num_rows.clone(),
+            filter: self.filter.clone(),
+            late_mat: self.late_mat,
+            streaming_arrow_reader: self.streaming_arrow_reader,
+            column_stats: self.column_stats.clone(),
+            runtime_sideband: self.runtime_sideband.clone(),
+            properties: self.properties.clone(),
+            metrics: ExecutionPlanMetricsSet::new(),
+        }
     }
 }
 
@@ -1671,80 +1939,176 @@ impl ExecutionPlan for EmatixFastParquetExec {
         let path = self.path.clone();
         let projection = self.projection.clone();
         let schema = self.schema.clone();
-        let filter = self.filter.clone();
+        // Σ.Q.L9 — runtime sideband consumption. At execute() time
+        // (which for the probe side of a HashJoinExec runs AFTER the
+        // build phase has fully drained — see the L9 module doc), peek
+        // at the sideband. If the build-side wrapper has published
+        // predicates, merge them into the BridgeFilter we'll hand to
+        // the reader. Empty / no-sideband = no-op.
+        //
+        // We `peek` (not `take`) because in a partitioned plan,
+        // execute() is called once per partition; each partition's
+        // call needs the same published predicates. The sideband
+        // outlives the query, but the predicates inside are fresh
+        // per query.
+        // Σ.Q.L9 — runtime sideband consumption (timing-corrected).
+        //
+        // Earlier versions peeked the sideband HERE at execute() time
+        // and resolved the BridgeFilter eagerly. That had a bug: in
+        // DataFusion, `HashJoinExec::execute(partition)` calls
+        // execute() on BOTH children before its build_future drains.
+        // So our `execute()` ran BEFORE the upstream BuildSideBloom
+        // emitter ever published. peek() always returned None →
+        // filter stayed empty → bloom did no work. Trace probe
+        // (EMAT_L9_TRACE=1) on Q18 SF=10 confirmed: every orders
+        // partition logged `peek=None`.
+        //
+        // Fix: defer the peek into the stream's first poll, where
+        // we ARE guaranteed to be downstream of the build_future's
+        // completion (the probe stream awaits build_future on first
+        // poll; first poll on our scan only happens once the parent
+        // join is past its build phase).
+        //
+        // Mechanics: capture the sideband Arc + the base filter, then
+        // build the partition stream inside a `stream::once(async)`
+        // / `flatten` wrapper so all the work (including the peek and
+        // the EmatArrowBatchReaderBuilder construction) is deferred
+        // to first poll.
+        let base_filter = self.filter.clone();
+        let runtime_sideband = self.runtime_sideband.clone();
+        let column_stats = self.column_stats.clone();
+        let trace_l9 = std::env::var("EMAT_L9_TRACE").ok().as_deref() == Some("1");
         let late_mat = self.late_mat;
         let baseline = BaselineMetrics::new(&self.metrics, partition);
+        let streaming_arrow_reader = self.streaming_arrow_reader;
+        let outer_partitions = self.properties.partitioning.partition_count().max(1);
 
-        // Σ.E5 (#516): streaming reader now handles filters natively via
-        // `EmatArrowBatchReaderBuilder::with_filter`. So route through
-        // it whenever streaming is enabled, regardless of filter state.
-        // The non-streaming branch below stays for the legacy
-        // bridge-only configuration.
-        let stream = if self.streaming_arrow_reader {
-            // Σ.E5.1.c: compute a per-partition column-decode thread
-            // budget so the total concurrent thread count tracks the
-            // core count rather than the product
-            // `N_outer_partitions × N_cols`. Q1 SF=1 on a 14-core box
-            // with 6 outer partitions → budget = 2 (per partition), so
-            // total ≈ 12 concurrent threads instead of 42 — kills the
-            // scheduler oversubscription that inflated streaming-mode
-            // variance (σ 5–7 ms vs bridge σ 2–3 ms) in #112's bench.
-            //
-            // Σ.E5 (2026-05-18) diagnostic: tried `(2×cores) /
-            // outer_partitions` to help Q19 (6 RGs × 6 partitions on
-            // 14 cores, budget=2 leaves half the box idle). Q19 wall
-            // dropped from 30.6 → 28.0 ms in isolation, BUT the
-            // steady-state 22-query bench regressed geomean from
-            // 0.9306 → 0.9692 — Q01 went from -19% → +1.3%, several
-            // others regressed. The 1× divisor is the right floor for
-            // the dominant workload pattern; Q19's gap lives elsewhere
-            // (numeric decode or RG-load coordination, not thread
-            // count).
-            //
-            // Env override `EMAT_READER_PARALLELISM_BUDGET=N` forces
-            // the per-partition budget to N (used by the confirmation
-            // experiment; `N=1` = sequential per-RG column decode).
-            let outer_partitions = self.properties.partitioning.partition_count().max(1);
-            let total_threads = std::thread::available_parallelism()
-                .map(|p| p.get())
-                .unwrap_or(1);
-            let computed_budget = std::cmp::max(1, total_threads / outer_partitions);
-            let budget = std::env::var("EMAT_READER_PARALLELISM_BUDGET")
-                .ok()
-                .and_then(|s| s.parse::<usize>().ok())
-                .map(|n| n.max(1))
-                .unwrap_or(computed_budget);
-            // Σ.E5: compute the partition's assigned row total from the
-            // provider's cached per-RG row counts. Threaded to
-            // `build_streaming_partition_stream` so it can pick the
-            // inline reader for single-RG small-row partitions without
-            // re-decoding the thrift footer.
-            let partition_rows: usize = row_groups
-                .iter()
-                .map(|&rg| self.rg_num_rows.get(rg).copied().unwrap_or(0))
-                .sum();
-            build_streaming_partition_stream(
+        // Σ.Q.L9 — fast path when no runtime sideband is attached
+        // (the common case for queries without the L9 rule installed
+        // or for scans that aren't probe-side targets of any join).
+        // The deferred-peek wrapper measured ~15ms overhead on Q18
+        // SF=10 even when the sideband was None; that's pure waste
+        // for plans that can't benefit. So: if there's no sideband,
+        // skip the wrapper entirely and use the original eager path.
+        if runtime_sideband.is_none() {
+            let stream = build_partition_stream_dispatch(
                 path,
                 schema.clone(),
                 projection,
                 row_groups,
-                budget,
-                partition_rows,
-                self.rg_num_rows.len(),
-                filter,
+                base_filter,
+                late_mat,
                 baseline,
-            )
-        } else {
-            build_partition_stream(
-                path,
-                schema.clone(),
-                projection,
-                row_groups,
+                streaming_arrow_reader,
+                outer_partitions,
+                self.rg_num_rows.clone(),
+            );
+            return Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream))
+                as SendableRecordBatchStream);
+        }
+
+        // Σ.Q.L9 deferred peek (sideband-attached case).
+        //
+        // Earlier versions peeked the sideband at execute() time and
+        // resolved the BridgeFilter eagerly. That had a bug: in
+        // DataFusion, `HashJoinExec::execute(partition)` calls
+        // execute() on BOTH children before its build_future drains.
+        // So our execute() ran BEFORE the upstream BuildSideBloom
+        // emitter ever published. peek() returned None →
+        // filter stayed empty. Trace probe (EMAT_L9_TRACE=1) on
+        // Q18 SF=10 confirmed: every orders partition logged
+        // `peek=None`.
+        //
+        // Fix below: defer the peek into the stream's first poll,
+        // where we ARE guaranteed to be past at least our parent's
+        // build_future (the parent's probe stream awaits build_future
+        // on first poll; the first poll on our scan only happens once
+        // the parent join is past its build phase).
+        //
+        // Caveat: scans on the BUILD side of a HashJoinExec are
+        // polled eagerly (they ARE part of the build phase), so the
+        // deferred peek still doesn't help them. For Q18 that's the
+        // orders scan inside customer⋈orders.
+        let path_for_async = path.clone();
+        let schema_for_async = schema.clone();
+        let projection_for_async = projection.clone();
+        let row_groups_for_async = row_groups.clone();
+        let column_stats_for_async = column_stats.clone();
+        let rg_num_rows_for_async = self.rg_num_rows.clone();
+
+        let inner_stream_fut = async move {
+            // Resolve the actual filter NOW (first poll), with the
+            // sideband possibly populated by an upstream build phase
+            // that has since completed.
+            let mut filter = base_filter;
+            if let Some(sb) = &runtime_sideband {
+                // Σ.Q.L16: brief wait for the build-side bloom to be
+                // published. Without this, the probe partitions race
+                // past the build on small-build joins (Q17 SF=10 had
+                // filtered_part = 2K rows building in ~6 ms, but 12 of
+                // 14 lineitem partitions peeked None and ran full
+                // 60 M rows). Default timeout 200 ms — small enough
+                // that big-build joins time out cleanly and proceed
+                // un-bloomed, large enough to absorb fast builds.
+                let timeout_ms: u64 = std::env::var("EMAT_L9_PEEK_TIMEOUT_MS")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(200);
+                let _ = sb
+                    .wait_for_publish(std::time::Duration::from_millis(timeout_ms))
+                    .await;
+                let peeked = sb.peek();
+                if trace_l9 {
+                    let path_short = std::path::Path::new(&path_for_async)
+                        .file_name()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| path_for_async.clone());
+                    match &peeked {
+                        Some(preds) => {
+                            let summary: Vec<String> = preds
+                                .iter()
+                                .map(|p| match p {
+                                    ColumnPredicate::I64InBloom { col_idx, .. } => {
+                                        format!("I64InBloom(col={col_idx})")
+                                    }
+                                    _ => "other".to_string(),
+                                })
+                                .collect();
+                            eprintln!(
+                                "[L9-trace] {path_short} p={partition} peek=Some({summary:?})"
+                            );
+                        }
+                        None => eprintln!(
+                            "[L9-trace] {path_short} p={partition} peek=None (bloom not published)"
+                        ),
+                    }
+                }
+                if let Some(extras) = peeked {
+                    if !extras.is_empty() {
+                        let mut bf = filter.unwrap_or_else(|| BridgeFilter::new(Vec::new()));
+                        bf.extend(extras);
+                        let p = bf.estimate_pass_rate(&column_stats_for_async);
+                        filter = Some(bf.with_predicted_pass_rate(p));
+                    }
+                }
+            }
+            build_partition_stream_dispatch(
+                path_for_async,
+                schema_for_async,
+                projection_for_async,
+                row_groups_for_async,
                 filter,
                 late_mat,
                 baseline,
+                streaming_arrow_reader,
+                outer_partitions,
+                rg_num_rows_for_async,
             )
         };
+
+        let stream = futures_util::stream::once(inner_stream_fut)
+            .flatten()
+            .boxed();
         Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)) as SendableRecordBatchStream)
     }
 
@@ -1775,6 +2139,58 @@ impl ExecutionPlan for EmatixFastParquetExec {
         };
         s.column_statistics = self.column_stats.clone();
         Ok(s)
+    }
+}
+
+/// Σ.Q.L9 — choose between the streaming reader path and the
+/// legacy bridge-only path. Factored out so the EmatixFastParquetExec
+/// execute() body can call this from inside its lazy
+/// `stream::once(async)` wrapper, where we've already peeked the
+/// runtime sideband and resolved the final BridgeFilter.
+#[allow(clippy::too_many_arguments)]
+fn build_partition_stream_dispatch(
+    path: String,
+    schema: SchemaRef,
+    projection: Vec<usize>,
+    row_groups: Vec<usize>,
+    filter: Option<BridgeFilter>,
+    late_mat: bool,
+    baseline: BaselineMetrics,
+    streaming_arrow_reader: bool,
+    outer_partitions: usize,
+    rg_num_rows: Arc<Vec<usize>>,
+) -> futures_util::stream::BoxStream<'static, DfResult<RecordBatch>> {
+    if streaming_arrow_reader {
+        // Σ.E5.1.c — per-partition column-decode thread budget; keep
+        // total concurrent decode threads aligned to core count.
+        let total_threads = std::thread::available_parallelism()
+            .map(|p| p.get())
+            .unwrap_or(1);
+        let computed_budget = std::cmp::max(1, total_threads / outer_partitions);
+        let budget = std::env::var("EMAT_READER_PARALLELISM_BUDGET")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .map(|n| n.max(1))
+            .unwrap_or(computed_budget);
+        let partition_rows: usize = row_groups
+            .iter()
+            .map(|&rg| rg_num_rows.get(rg).copied().unwrap_or(0))
+            .sum();
+        build_streaming_partition_stream(
+            path,
+            schema,
+            projection,
+            row_groups,
+            budget,
+            partition_rows,
+            rg_num_rows.len(),
+            filter,
+            baseline,
+        )
+    } else {
+        build_partition_stream(
+            path, schema, projection, row_groups, filter, late_mat, baseline,
+        )
     }
 }
 
@@ -2087,8 +2503,16 @@ fn build_streaming_partition_stream(
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(2_000_000);
-        let auto_inline =
-            !has_filter && row_groups.len() > 1 && partition_rows >= large_partition_threshold;
+        // Σ.Q.L6′: if the RG decode cache is installed, prefer the
+        // eager reader — it's the only one wired into the cache today.
+        // For Q17 SF=10 the auto_inline rule otherwise routes lineitem
+        // through the inline-streaming reader and skips the cache
+        // entirely, neutralising EMAT_RG_DECODE_CACHE.
+        let cache_active = crate::emat_arrow_reader::process_rg_decode_cache().is_some();
+        let auto_inline = !has_filter
+            && !cache_active
+            && row_groups.len() > 1
+            && partition_rows >= large_partition_threshold;
         let use_inline = !has_filter && force_inline.unwrap_or(auto_inline);
         let use_page_streaming = if has_filter {
             false
@@ -3139,5 +3563,91 @@ mod tests {
             assert!((bridge_rows[i].1 - s).abs() < 1e-6 * s.abs().max(1.0));
             assert_eq!(bridge_rows[i].2, n);
         }
+    }
+
+    /// Σ.Q.L4′ — I64InBloom pushdown: write a small i64 column, build
+    /// a bloom from a known subset of keys, run BridgeFilter::build_bitmap
+    /// and assert (a) every "in-the-build-set" row is set in the bitmap
+    /// (no false negatives) and (b) the bloom rejects most "not-in"
+    /// rows (false-positive rate within a sane bound).
+    #[test]
+    fn i64_in_bloom_bitmap_rejects_misses() {
+        use crate::bloom::BloomFilter;
+        use datafusion::parquet::basic::{Compression, Repetition, Type as PhysicalType};
+        use datafusion::parquet::column::writer::ColumnWriter;
+        use datafusion::parquet::file::properties::WriterProperties;
+        use datafusion::parquet::file::writer::SerializedFileWriter;
+        use datafusion::parquet::schema::types::Type as PType;
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+
+        let schema = Arc::new(
+            PType::group_type_builder("schema")
+                .with_fields(vec![Arc::new(
+                    PType::primitive_type_builder("k", PhysicalType::INT64)
+                        .with_repetition(Repetition::REQUIRED)
+                        .build()
+                        .unwrap(),
+                )])
+                .build()
+                .unwrap(),
+        );
+        let props = Arc::new(
+            WriterProperties::builder()
+                .set_compression(Compression::SNAPPY)
+                .build(),
+        );
+        let file = File::create(&path).unwrap();
+        let mut writer = SerializedFileWriter::new(file, schema, props).unwrap();
+        let mut rg = writer.next_row_group().unwrap();
+        // k = 0, 7, 14, ... 6993 (1000 distinct i64 values).
+        let keys: Vec<i64> = (0..1000i64).map(|i| i * 7).collect();
+        let mut col = rg.next_column().unwrap().unwrap();
+        if let ColumnWriter::Int64ColumnWriter(t) = col.untyped() {
+            t.write_batch(&keys, None, None).unwrap();
+        }
+        col.close().unwrap();
+        rg.close().unwrap();
+        writer.close().unwrap();
+
+        // Build a bloom from every 10th key: {0, 70, 140, ..., 6930}.
+        let build_keys: Vec<i64> = (0..100i64).map(|i| i * 70).collect();
+        let mut bloom = BloomFilter::for_keys(build_keys.len());
+        for k in &build_keys {
+            bloom.insert_i64(*k);
+        }
+        let bloom = Arc::new(bloom);
+
+        let filter = BridgeFilter::new(vec![ColumnPredicate::I64InBloom {
+            col_idx: 0,
+            bloom: bloom.clone(),
+        }]);
+        let (bitmap, total) = filter.build_bitmap(&path, 0).unwrap();
+        assert_eq!(total, keys.len());
+
+        // No false negatives: every row whose key is in build_keys must
+        // be set in the bitmap.
+        let build_set: std::collections::HashSet<i64> = build_keys.iter().copied().collect();
+        let mut true_positives = 0usize;
+        let mut false_positives = 0usize;
+        for (row, &k) in keys.iter().enumerate() {
+            let bit = (bitmap[row >> 3] >> (row & 7)) & 1 == 1;
+            if build_set.contains(&k) {
+                assert!(bit, "false negative at row {row} (key={k})");
+                true_positives += 1;
+            } else if bit {
+                false_positives += 1;
+            }
+        }
+        assert_eq!(true_positives, build_keys.len());
+        // 1% FPR target ⇒ on 900 non-build rows expect ≤90 FPs in the
+        // worst case, but with k=8 hashes the empirical rate is much
+        // lower. Allow 5% to keep the test stable.
+        let fp_rate = false_positives as f64 / (keys.len() - build_keys.len()) as f64;
+        assert!(
+            fp_rate < 0.05,
+            "bloom false-positive rate {fp_rate:.4} exceeds 5%"
+        );
     }
 }

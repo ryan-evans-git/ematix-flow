@@ -75,6 +75,22 @@ pub mod fused_aggregate_filter_multi_agg_rule;
 // f64 SUM non-determinism (TPC-H Q15's CTE-duplicate shape). SCAFFOLD
 // ONLY — not yet wired into any SessionState. See module docs.
 pub mod dedupe_aggregate_rule;
+// Σ.Q L2: swap LeftSemi/LeftAnti join sides when the probe side has an
+// AggregateExec (i.e., is bounded-small) but the build side doesn't.
+// Fixes Q18 SF=10 build-on-60M-rows inversion. See module docs.
+pub mod swap_semi_join_build_rule;
+// Σ.Q.L10: logical-plan rewrite — push a LeftSemi join down past
+// Inner joins so it filters its target table directly, eliminating
+// the giant intermediate that gets semi-filtered at the top of the
+// plan. Closes the structural gap to DuckDB on Q18-style queries
+// where an IN-subquery decorrelates into a LeftSemi placed above
+// every join.
+pub mod push_down_left_semi_rule;
+// Σ.Q.M: synthesise LeftSemi joins above Inner joins where one side is
+// a filtered dim and the other is a fact table — the static analogue
+// of DuckDB's dynamic-filter propagation. Composes with Σ.Q.L10 which
+// then pushes the synthesised LeftSemi down to wrap the fact scan.
+pub mod synthetic_left_semi_rule;
 // Σ.P.1: session-scoped subquery CSE. SharedSubtreeExec wraps a
 // duplicated subtree; both consumers share an Arc<CachedBatches> so
 // the first execute() computes and the rest replay. Backing storage
@@ -156,6 +172,11 @@ pub mod plan_cache;
 // Flight metadata to probe-side workers; probe-side skips rows before
 // shipping. Cuts cross-stage row volume by 10-100× on selective joins.
 pub mod bloom;
+// L9.HashSet (2026-05-24): exact i64 membership set for the L9 runtime
+// bloom sideband path. Used when the join build is small enough that
+// an exact open-addressing table outperforms the probabilistic bloom
+// (Q17 SF=10: 17.2 ns/probe bloom → 1.3 ns/probe i64_set; +0 FPs).
+pub mod i64_set;
 // Σ.N (2026-05-21): Robin Hood vectorized hash table for aggregates.
 // Open-addressing with Robin Hood eviction (probe-distance equalisation).
 // Photon's signature operator; nobody ships this in OSS DataFusion.
@@ -168,12 +189,69 @@ pub mod robin_hood_agg;
 // chain — opt-in only via install_robin_hood_rule(state_builder) to
 // avoid the codegen tax recorded in optimizer-codegen-sensitivity.
 pub mod robin_hood_agg_rule;
+// Σ.Q.L1b (2026-05-23): SUM(f64) GROUP BY i64 operator + planner rule.
+// Sibling to robin_hood_agg's COUNT(*) variant; targets Q18 SF=10's
+// FinalPartitioned sum(l_quantity) GROUP BY l_orderkey at 15M card.
+pub mod robin_hood_sum_f64_exec;
+// Σ.R.2 (2026-05-24): AVG(f64) GROUP BY i64 operator + opt-in rule.
+// Sister to robin_hood_sum_f64_exec; targets Q17 SF=10's
+// FinalPartitioned avg(l_quantity) GROUP BY l_partkey at ~2M card
+// where the Σ.Q closeout profile pinned GroupValuesPrimitive::intern
+// at 21.6% self time.
+pub mod robin_hood_avg_f64_exec;
 // Σ.J.2.b.vi (2026-05-22): per-request PhysicalOptimizerRule that
 // walks the plan, finds EmatixFastParquetExec scans whose
 // `<table>.<col>` uuid matches a build-side bloom in ContextBlooms,
 // and wraps them in BloomFilterExec. Closes the probe-side half of
 // the distributed bloom flow; build-side emitter is Σ.J.2.b.vii.
 pub mod context_bloom_rule;
+// Σ.Q.L4′ (2026-05-23): per-request PhysicalOptimizerRule that pushes
+// blooms INTO EmatixFastParquetExec scans as I64InBloom BridgeFilter
+// predicates instead of wrapping them in BloomFilterExec. Saves decode
+// work on probe-side rows whose join key isn't in the build set.
+pub mod inbloom_scan_pushdown_rule;
+// Σ.Q.L4′ slice 3 (2026-05-23): single-node bloom emitter. Walks a
+// LogicalPlan, pre-executes Inner-equijoin build sides, returns a
+// `column_uuid → BloomFilter` map ready to wrap in ContextBlooms +
+// install via EnableInBloomScanPushdownRule. Local sibling of
+// ematix-flow-distributed::bloom_emitter::emit_build_side_blooms.
+pub mod local_bloom_emitter;
+// Σ.Q.L9 (2026-05-23): runtime sideband channel for mid-query plan
+// adaptation. Producer (BuildSideBloomEmitterExec) writes blooms as a
+// side-effect of HashJoinExec's build phase; consumer
+// (EmatixFastParquetExec on the probe side) reads at execute() time.
+pub mod bridge_filter_sideband;
+// Σ.Q.L9 slice 2 (2026-05-23): pass-through wrapper exec that observes
+// batches flowing from a HashJoinExec build side, accumulates the i64
+// join-key column into a BloomFilter (one local per partition,
+// union-merged at completion), and publishes an I64InBloom
+// ColumnPredicate to a BridgeFilterSideband shared with the probe scan.
+pub mod build_side_bloom_emitter_exec;
+// Σ.Q.L9 slice 3 (2026-05-23): planner rule that threads a runtime
+// sideband between HashJoinExec's build child (wrapped with
+// BuildSideBloomEmitterExec) and the probe-side EmatixFastParquetExec
+// (via with_runtime_sideband). Opt-in via install_runtime_bloom_sideband_rule.
+pub mod runtime_bloom_sideband_rule;
+// Σ.S.B (2026-05-24): plan-time FK-chain detection helper shared by
+// the cascading-L9 prototype and the general rule. Pure-fn stem
+// extraction + plan walker that surfaces candidate EmatixFastParquetExec
+// scans by column-name stem. The cascading rule layers join-path
+// confirmation on top of this — the helper itself only proposes
+// candidates, the rule commits.
+pub mod fk_chain;
+// Σ.S.B (2026-05-24): cascading-L9 rule. Opt-in superset of the
+// non-cascading L9 base rule: per HashJoinExec, finds extra
+// FK-chained scans in the probe subtree via fk_chain, then publishes
+// the build-side bloom to each via a per-scan sideband (build runs
+// once; bloom Arc shared). Install via install_cascading_bloom_rule.
+pub mod runtime_bloom_cascading_rule;
+// Σ.U.A (2026-05-24): Apache-Impala-style lane-parallel filter-sum
+// kernel. Generalises the splash-bloom pattern (see `bloom.rs`) to
+// the "M predicate clauses + SUM-of-product" shape that covers Q06,
+// Q14, Q19, and future predicates of the same family. Branchless,
+// fixed-size lane arrays, LLVM auto-vectorises to NEON on aarch64
+// and SSE2/AVX2 on x86_64 — one source-of-truth, two architectures.
+pub mod lane_filter_sum_kernel;
 // Σ.O (2026-05-21): in-memory LRU cache of decoded RecordBatch by
 // (file_path, row_group_idx, projection_hash). Avoids re-decoding
 // the same parquet column chunks across queries in the same session.

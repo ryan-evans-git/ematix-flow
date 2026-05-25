@@ -39,7 +39,9 @@ use arrow_schema::DataType;
 use datafusion::arrow::buffer::{Buffer, NullBuffer, ScalarBuffer};
 use datafusion::error::{DataFusionError, Result as DfResult};
 
-use ematix_parquet_codec::compression::{decompress_snappy_into, decompress_zstd_into};
+use ematix_parquet_codec::compression::{
+    decompress_lz4_raw_into_sized, decompress_snappy_into, decompress_zstd_into,
+};
 use ematix_parquet_codec::dict::decode_rle_dictionary_into;
 use ematix_parquet_codec::plain::{
     decode_plain_byte_array, decode_plain_f64, decode_plain_i32, decode_plain_i64,
@@ -55,7 +57,12 @@ fn ext<S: Into<String>>(msg: S) -> DataFusionError {
 }
 
 #[inline]
-fn decompress_into(codec: CompressionCodec, body: &[u8], out: &mut Vec<u8>) -> DfResult<()> {
+fn decompress_into(
+    codec: CompressionCodec,
+    body: &[u8],
+    uncompressed_size: usize,
+    out: &mut Vec<u8>,
+) -> DfResult<()> {
     out.clear();
     match codec {
         CompressionCodec::Uncompressed => {
@@ -68,6 +75,10 @@ fn decompress_into(codec: CompressionCodec, body: &[u8], out: &mut Vec<u8>) -> D
         CompressionCodec::Zstd => {
             decompress_zstd_into(body, out).map_err(|e| ext(format!("zstd decompress: {e}")))
         }
+        // Q06.c1 (2026-05-24): LZ4_RAW needs the page header's
+        // uncompressed_page_size — the codec has no embedded length.
+        CompressionCodec::Lz4Raw => decompress_lz4_raw_into_sized(body, uncompressed_size, out)
+            .map_err(|e| ext(format!("lz4_raw decompress: {e}"))),
         other => Err(ext(format!("unsupported compression codec {other:?}"))),
     }
 }
@@ -237,7 +248,8 @@ impl<T: PrimitiveType> ColumnPageStream for PrimitivePageStream<T> {
         let body_end = body.as_ptr() as usize - self.chunk.as_ptr() as usize + body.len();
         self.walker_pos = body_end;
 
-        decompress_into(self.codec, body, &mut self.scratch)?;
+        let usize_hdr = hdr.uncompressed_page_size.max(0) as usize;
+        decompress_into(self.codec, body, usize_hdr, &mut self.scratch)?;
 
         if !self.first_page_consumed {
             self.first_page_consumed = true;
@@ -397,7 +409,8 @@ impl ColumnPageStream for StringViewPageStream {
                 // mirrors `build_string_view_from_dict_preserved` in
                 // the eager reader).
                 let mut dict_scratch: Vec<u8> = Vec::with_capacity(body.len() * 2);
-                decompress_into(self.codec, body, &mut dict_scratch)?;
+                let usize_hdr = hdr.uncompressed_page_size.max(0) as usize;
+                decompress_into(self.codec, body, usize_hdr, &mut dict_scratch)?;
                 let entries = decode_plain_byte_array(&dict_scratch)
                     .map_err(|e| ext(format!("plain byte_array dict: {e}")))?;
                 let base = dict_scratch.as_ptr() as usize;
@@ -420,9 +433,10 @@ impl ColumnPageStream for StringViewPageStream {
             .as_ref()
             .ok_or_else(|| ext("expected v1 data page"))?;
         let n = dph.num_values as usize;
+        let usize_hdr = hdr.uncompressed_page_size.max(0) as usize;
         match dph.encoding {
             Encoding::RleDictionary | Encoding::PlainDictionary => {
-                decompress_into(self.codec, body, &mut self.idx_scratch)?;
+                decompress_into(self.codec, body, usize_hdr, &mut self.idx_scratch)?;
                 self.idx_buf.clear();
                 ematix_parquet_codec::dict::decode_rle_dictionary_indices_into(
                     &self.idx_scratch,
@@ -444,7 +458,7 @@ impl ColumnPageStream for StringViewPageStream {
             }
             Encoding::Plain => {
                 let mut page_buf: Vec<u8> = Vec::with_capacity(body.len() * 2);
-                decompress_into(self.codec, body, &mut page_buf)?;
+                decompress_into(self.codec, body, usize_hdr, &mut page_buf)?;
                 let block_id = self.data_buffers.len() as u32;
                 // Inline single-pass parse — same shape as
                 // `plain_byte_array_to_views_in_place` in

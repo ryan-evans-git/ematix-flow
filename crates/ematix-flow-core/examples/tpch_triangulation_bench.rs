@@ -27,12 +27,20 @@ use std::time::Instant;
 
 use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::prelude::{SessionConfig, SessionContext};
+use ematix_flow_core::bloom::ContextBlooms;
 use ematix_flow_core::dedupe_aggregate_rule::DedupeAggregateForFloatDeterminism;
 use ematix_flow_core::dict_aggregate_rule::EnableDictGroupCountRule;
 use ematix_flow_core::ematix_fast_parquet::EmatixFastParquetTableProvider;
 use ematix_flow_core::fast_parquet::FastParquetTableProvider;
 use ematix_flow_core::fused_aggregate_filter_multi_agg_rule::InjectFilterMultiAggRule;
 use ematix_flow_core::fused_aggregate_filter_sum_rule::InjectFilterSumRule;
+use ematix_flow_core::inbloom_scan_pushdown_rule::EnableInBloomScanPushdownRule;
+use ematix_flow_core::local_bloom_emitter::{LocalBloomOptions, emit_build_side_blooms_local};
+use ematix_flow_core::push_down_left_semi_rule::PushDownLeftSemiRule;
+use ematix_flow_core::robin_hood_sum_f64_exec::EnableRobinHoodSumF64Rule;
+use ematix_flow_core::runtime_bloom_cascading_rule::EnableCascadingBloomRule;
+use ematix_flow_core::runtime_bloom_sideband_rule::EnableRuntimeBloomSidebandRule;
+use ematix_flow_core::swap_semi_join_build_rule::SwapSemiJoinBuildSideRule;
 use futures_util::TryStreamExt;
 
 #[global_allocator]
@@ -59,6 +67,37 @@ impl Engine {
     }
     fn all() -> &'static [Engine] {
         &[Engine::EmatixFlow, Engine::DuckDb, Engine::Polars]
+    }
+    /// Filter `all()` by env vars:
+    ///   TPCH_SKIP_POLARS=1   — drop Polars (Q21 SF=10 takes ~41s/trial,
+    ///                          Q05 SF=10 panics with bigidx).
+    ///   TPCH_SKIP_DUCKDB=1   — drop DuckDB.
+    ///   TPCH_SKIP_EMATIX=1   — drop ematix-flow.
+    /// At least one engine must remain; an empty set falls back to all().
+    fn selected() -> Vec<Engine> {
+        let skip_polars = std::env::var("TPCH_SKIP_POLARS")
+            .map(|v| v != "0")
+            .unwrap_or(false);
+        let skip_duckdb = std::env::var("TPCH_SKIP_DUCKDB")
+            .map(|v| v != "0")
+            .unwrap_or(false);
+        let skip_ematix = std::env::var("TPCH_SKIP_EMATIX")
+            .map(|v| v != "0")
+            .unwrap_or(false);
+        let kept: Vec<Engine> = Self::all()
+            .iter()
+            .copied()
+            .filter(|e| match e {
+                Engine::Polars => !skip_polars,
+                Engine::DuckDb => !skip_duckdb,
+                Engine::EmatixFlow => !skip_ematix,
+            })
+            .collect();
+        if kept.is_empty() {
+            Self::all().to_vec()
+        } else {
+            kept
+        }
     }
 }
 
@@ -180,7 +219,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let polars_sql = std::fs::read_to_string(&polars_sql_path).ok();
 
         let mut per_engine: BTreeMap<Engine, EngineResult> = BTreeMap::new();
-        for &engine in Engine::all() {
+        let selected = Engine::selected();
+        for &engine in &selected {
             let mut res = EngineResult::default();
             let engine_sql = match engine {
                 Engine::Polars => polars_sql.as_deref().unwrap_or(&sql),
@@ -237,11 +277,37 @@ async fn run_one(engine: Engine, data_dir: &Path, sql: &str) -> Trial {
 // ---------- ematix-flow ----------
 
 async fn run_ematix_flow(data_dir: &Path, sql: &str) -> Trial {
-    let ctx = match build_ematix_ctx(data_dir).await {
+    let (ctx, bloom_rule) = match build_ematix_ctx(data_dir).await {
         Ok(c) => c,
         Err(e) => return Trial::Fail(format!("ctx build: {e}")),
     };
+    // Σ.Q.L4′: when EMAT_BLOOM_PUSHDOWN=1, pre-execute small Inner-
+    // equijoin build sides via the local emitter and install the
+    // resulting ContextBlooms into the shared rule slot before timing
+    // begins. Emission cost IS counted in the timed window so the
+    // bench measures the lever's net effect.
+    let bloom_pushdown = std::env::var("EMAT_BLOOM_PUSHDOWN")
+        .ok()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
     let t0 = Instant::now();
+    if let (true, Some(rule)) = (bloom_pushdown, bloom_rule.as_ref()) {
+        match ctx.sql(sql).await {
+            Ok(df) => match df.into_optimized_plan() {
+                Ok(plan) => {
+                    let opts = LocalBloomOptions::default();
+                    match emit_build_side_blooms_local(&ctx, &plan, &opts).await {
+                        Ok(map) => rule.set(ContextBlooms::new(map)),
+                        Err(e) => {
+                            return Trial::Fail(format!("bloom emit: {}", short(&e.to_string())));
+                        }
+                    }
+                }
+                Err(e) => return Trial::Fail(format!("plan: {}", short(&e.to_string()))),
+            },
+            Err(e) => return Trial::Fail(format!("plan: {}", short(&e.to_string()))),
+        }
+    }
     let df = match ctx.sql(sql).await {
         Ok(d) => d,
         Err(e) => return Trial::Fail(format!("plan: {}", short(&e.to_string()))),
@@ -252,6 +318,12 @@ async fn run_ematix_flow(data_dir: &Path, sql: &str) -> Trial {
     };
     let batches: Result<Vec<_>, _> = stream.try_collect().await;
     let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    // Clear the bloom slot so the next trial starts cold (matters for
+    // the warmup vs timed-trial distinction; emit only inside timed
+    // windows above).
+    if let Some(rule) = bloom_rule.as_ref() {
+        rule.set(ContextBlooms::default());
+    }
     match batches {
         Ok(b) => Trial::Pass {
             elapsed_ms,
@@ -261,7 +333,10 @@ async fn run_ematix_flow(data_dir: &Path, sql: &str) -> Trial {
     }
 }
 
-async fn build_ematix_ctx(data_dir: &Path) -> Result<SessionContext, Box<dyn std::error::Error>> {
+async fn build_ematix_ctx(
+    data_dir: &Path,
+) -> Result<(SessionContext, Option<Arc<EnableInBloomScanPushdownRule>>), Box<dyn std::error::Error>>
+{
     // EMAT_RULES env knob for A/B benching. Defaults to "all" (production
     // configuration). Other values enable subsets for isolating which rule
     // accounts for which slice of the geomean perf vs v0.4.0.
@@ -271,7 +346,14 @@ async fn build_ematix_ctx(data_dir: &Path) -> Result<SessionContext, Box<dyn std
     //   "dedupe"                — dedupe only
     let rules = std::env::var("EMAT_RULES").unwrap_or_else(|_| "all".to_string());
     let mut builder = SessionStateBuilder::new()
-        .with_config(SessionConfig::new().with_target_partitions(14))
+        .with_config(
+            SessionConfig::new().with_target_partitions(
+                std::env::var("PARTITIONS")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(14),
+            ),
+        )
         .with_default_features();
     if matches!(rules.as_str(), "all" | "dedupe") {
         builder = builder
@@ -283,6 +365,116 @@ async fn build_ematix_ctx(data_dir: &Path) -> Result<SessionContext, Box<dyn std
             .with_physical_optimizer_rule(Arc::new(InjectFilterMultiAggRule))
             .with_physical_optimizer_rule(Arc::new(InjectFilterSumRule));
     }
+    // Σ.Q L2: opt-in semi-join build-side swap. ON by default in "all"
+    // and "swap"; OFF for "v040" / "none" / "dedupe" so A/B benches can
+    // isolate its impact.
+    let swap_enabled = std::env::var("EMAT_SWAP_SEMI")
+        .ok()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or_else(|| matches!(rules.as_str(), "all" | "swap"));
+    if swap_enabled {
+        builder = builder.with_physical_optimizer_rule(Arc::new(SwapSemiJoinBuildSideRule));
+    }
+    // Σ.Q.L10: logical-plan rewrite — push LeftSemi past Inner joins
+    // down to its target table. Closes the Q18-shape structural gap
+    // to DuckDB (semi-filter pushed to wrap orders directly,
+    // eliminating the 60M-row intermediate). **Default ON at the
+    // milestone config (0.738 / 17 wins SF=10);** set
+    // `EMAT_PUSH_SEMI=0` to disable for A/B benching.
+    let push_semi_enabled = std::env::var("EMAT_PUSH_SEMI")
+        .ok()
+        .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+        .unwrap_or(true);
+    if push_semi_enabled {
+        // Σ.Q.M (synthetic LeftSemi producer) MUST run BEFORE Σ.Q.L10
+        // (semi pushdown consumer). DataFusion runs custom rules in
+        // registration order, so add M first.
+        let synth_semi_enabled = std::env::var("EMAT_SYNTHETIC_LEFT_SEMI")
+            .ok()
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        if synth_semi_enabled {
+            builder = builder.with_optimizer_rule(Arc::new(
+                ematix_flow_core::synthetic_left_semi_rule::SyntheticLeftSemiRule,
+            ));
+        }
+        builder = builder.with_optimizer_rule(Arc::new(PushDownLeftSemiRule));
+    }
+    // Σ.Q.L1b: routes SUM(Float64) GROUP BY Int64 through
+    // RobinHoodSumF64Exec ([[sigma-nf3-beats-stock]]). **Default ON
+    // at milestone config** (closes Q22 −18 ms, Q04 −26 ms); set
+    // `EMAT_RH_SUM_F64=0` to disable for A/B.
+    let rh_sum_f64_enabled = std::env::var("EMAT_RH_SUM_F64")
+        .ok()
+        .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+        .unwrap_or(true);
+    if rh_sum_f64_enabled {
+        builder = builder.with_physical_optimizer_rule(Arc::new(EnableRobinHoodSumF64Rule));
+    }
+    // Σ.Q.L9: threads a sideband between HashJoinExec build and
+    // probe-side EmatixFastParquetExec so the build-side bloom is
+    // captured as a side-effect of the regular HashJoin build phase.
+    // **Default ON at milestone config**; set `EMAT_RT_BLOOM_SIDEBAND=0`
+    // to disable for A/B.
+    let rt_bloom_enabled = std::env::var("EMAT_RT_BLOOM_SIDEBAND")
+        .ok()
+        .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+        .unwrap_or(true);
+    if rt_bloom_enabled {
+        // Σ.Q.L15: tighter selectivity ratio + Inner-join L9 default
+        // ON at milestone config. ratio=1024 gates out the L4'-style
+        // net-negative s⋈l firing while still firing on small-dim →
+        // fact pushdowns. Set `EMAT_RT_BLOOM_RATIO=64` and
+        // `EMAT_RT_BLOOM_INNER_JOIN=0` to revert to pre-L15.
+        let ratio = std::env::var("EMAT_RT_BLOOM_RATIO")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1024);
+        let allow_inner = std::env::var("EMAT_RT_BLOOM_INNER_JOIN")
+            .ok()
+            .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+            .unwrap_or(true);
+        let require_filtered_build = std::env::var("EMAT_L9_REQUIRE_FILTERED_BUILD")
+            .ok()
+            .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+            .unwrap_or(true);
+        // Σ.S.B: install cascading variant when EMAT_L9_CASCADE=1.
+        // Strict superset — same gates plus FK-chain extras.
+        let cascade = std::env::var_os("EMAT_L9_CASCADE").is_some();
+        if cascade {
+            let max_extras = std::env::var("EMAT_L9_CASCADE_MAX")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(4);
+            builder = builder.with_physical_optimizer_rule(Arc::new(EnableCascadingBloomRule {
+                min_probe_to_build_ratio: ratio,
+                allow_inner_join: allow_inner,
+                require_filtered_build,
+                max_extras_per_emitter: max_extras,
+            }));
+        } else {
+            builder =
+                builder.with_physical_optimizer_rule(Arc::new(EnableRuntimeBloomSidebandRule {
+                    min_probe_to_build_ratio: ratio,
+                    allow_inner_join: allow_inner,
+                    require_filtered_build,
+                }));
+        }
+    }
+    // Σ.Q.L4′: install the in-scan bloom pushdown rule with an empty
+    // shared bloom slot. `run_ematix_flow` swaps the slot's contents
+    // before each timed query when EMAT_BLOOM_PUSHDOWN=1.
+    let bloom_pushdown = std::env::var("EMAT_BLOOM_PUSHDOWN")
+        .ok()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let bloom_rule: Option<Arc<EnableInBloomScanPushdownRule>> = if bloom_pushdown {
+        let rule = Arc::new(EnableInBloomScanPushdownRule::default());
+        builder = builder.with_physical_optimizer_rule(rule.clone());
+        Some(rule)
+    } else {
+        None
+    };
     let state = builder.build();
     let ctx = SessionContext::new_with_state(state);
     for t in TPCH_TABLES {
@@ -290,7 +482,28 @@ async fn build_ematix_ctx(data_dir: &Path) -> Result<SessionContext, Box<dyn std
             .join(format!("{t}.parquet"))
             .to_string_lossy()
             .into_owned();
-        if *t == "lineitem" {
+        // Σ.Q.L9 extension probe — register orders as Emat too so
+        // the descent into the inner HashJoinExec can reach an Emat
+        // scan carrying o_orderkey. Enabled via env for measurement;
+        // not default since Emat for orders hasn't been broadly
+        // benched on the full 22 queries.
+        let orders_as_emat = std::env::var("EMAT_REGISTER_ORDERS_AS_EMAT")
+            .ok()
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        // Σ.Q.L15: register every TPC-H table via
+        // EmatixFastParquetTableProvider. Lets the L9 runtime bloom
+        // sideband target supplier/customer/etc. scans (otherwise
+        // those land on FastParquet and L9's
+        // find_probe_scan_for_column skips them). **Default ON at
+        // milestone config;** set `EMAT_ALL_TABLES_EMAT=0` to revert
+        // to lineitem-only Emat.
+        let all_emat = std::env::var("EMAT_ALL_TABLES_EMAT")
+            .ok()
+            .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+            .unwrap_or(true);
+        let use_emat = all_emat || *t == "lineitem" || (orders_as_emat && *t == "orders");
+        if use_emat {
             // Emat for lineitem with late-mat ON (default since
             // 2026-05-16 + the misaligned-bitmap-offset fix in
             // ematix-parquet 0.4.1).
@@ -309,7 +522,7 @@ async fn build_ematix_ctx(data_dir: &Path) -> Result<SessionContext, Box<dyn std
             ctx.register_table(*t, Arc::new(prov))?;
         }
     }
-    Ok(ctx)
+    Ok((ctx, bloom_rule))
 }
 
 // ---------- DuckDB ----------

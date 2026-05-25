@@ -677,6 +677,21 @@ impl TableProvider for FastParquetTableProvider {
         TableType::Base
     }
 
+    /// Σ.Q.M (2026-05-23): expose the file-metadata-derived row count
+    /// so logical optimizer rules can distinguish dim vs fact tables.
+    /// `num_rows` is read from parquet `FileMetadata::num_rows` at
+    /// registration time, so it's exact for unfiltered scans.
+    fn statistics(&self) -> Option<datafusion::common::Statistics> {
+        Some(datafusion::common::Statistics {
+            num_rows: datafusion::common::stats::Precision::Exact(self.num_rows),
+            total_byte_size: datafusion::common::stats::Precision::Absent,
+            column_statistics: vec![
+                datafusion::common::ColumnStatistics::new_unknown();
+                self.schema.fields().len()
+            ],
+        })
+    }
+
     fn supports_filters_pushdown(
         &self,
         filters: &[&Expr],

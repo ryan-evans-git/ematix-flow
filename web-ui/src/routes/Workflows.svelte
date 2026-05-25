@@ -179,11 +179,11 @@
         <h3 class="wf-name">
           <a class="link" href={`#/dag/${encodeURIComponent(w.jobs[0])}`}>{w.name}</a>
           {#if w.kind === "streaming"}
-            <span class="wf-pill wf-pill--streaming">▶ LIVE STREAMING</span>
+            <span class="wf-pill wf-pill--streaming">Streaming</span>
           {:else if w.kind === "single"}
-            <span class="wf-pill wf-pill--single">single</span>
+            <span class="wf-pill wf-pill--single">Single</span>
           {:else}
-            <span class="wf-pill">declared</span>
+            <span class="wf-pill">Declared</span>
           {/if}
         </h3>
         <span class="wf-meta mono">
@@ -235,7 +235,7 @@
           <button class="action wf-run-now"
                   on:click|stopPropagation={() => openRunNow(w)}
                   disabled={w.jobs.length === 0}>
-            ▶ Run now
+            Run now
           </button>
         </div>
       {:else if w.kind !== "streaming"}
@@ -244,7 +244,7 @@
           <button class="action wf-run-now"
                   on:click|stopPropagation={() => openRunNow(w)}
                   disabled={w.jobs.length === 0}>
-            ▶ Run now
+            Run now
           </button>
         </div>
       {/if}
@@ -312,66 +312,81 @@
   }
   .wf-name { margin: 0; font-size: 1.05rem; }
   .wf-pill {
-    display: inline-block;
-    font-size: 0.65em;
-    padding: 0.1em 0.45em;
-    border: 1px solid var(--color-phosphor-700, #2e7d32);
-    border-radius: 3px;
-    color: var(--color-phosphor-300, #8fd28f);
-    letter-spacing: 0.1em;
-    text-transform: uppercase;
+    display: inline-flex;
+    align-items: center;
+    gap: 0.35em;
+    font-size: 0.72em;
+    font-weight: 500;
+    padding: 0.1em 0.55em;
+    border: 1px solid var(--border-strong, #2e2e38);
+    border-radius: 999px;
+    color: var(--fg-muted, #a1a1aa);
+    background: var(--surface-2, #16161a);
     margin-left: 0.5rem;
     vertical-align: middle;
   }
-  .wf-pill--single { color: var(--color-fg-muted, #888); border-color: var(--color-border, #444); }
+  .wf-pill--single {
+    color: var(--fg-muted, #a1a1aa);
+    border-color: var(--border-strong, #2e2e38);
+  }
+  /* Streaming = active / live data. Uses the global info palette to
+     read as "ongoing process" without the Pip-Boy amber pulse. */
   .wf-pill--streaming {
-    color: var(--color-amber-glow, #ffb000);
-    border-color: var(--color-amber-glow, #ffb000);
-    animation: wf-pulse 2s ease-in-out infinite;
+    color: var(--info, #60a5fa);
+    border-color: var(--info, #60a5fa);
+    background: var(--info-soft, rgba(96, 165, 250, 0.10));
+  }
+  .wf-pill--streaming::before {
+    content: "";
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: currentColor;
+    animation: wf-pulse 1.8s ease-in-out infinite;
   }
   @keyframes wf-pulse {
     0%, 100% { opacity: 1; }
-    50% { opacity: 0.55; }
+    50% { opacity: 0.45; }
   }
   .wf-meta { font-size: 0.78rem; color: var(--color-fg-muted, #888); }
   .wf-trigger {
     font-size: 0.78rem;
-    color: var(--color-phosphor-300, #8fd28f);
+    color: var(--fg-muted, #a1a1aa);
     margin: 0.3em 0 0.5em 0;
-    padding: 0.4em 0.6em;
-    background: rgba(0,0,0,0.2);
-    border-left: 2px solid var(--color-phosphor-500, #4eb84e);
-    border-radius: 2px;
+    padding: 0.5em 0.75em;
+    background: var(--surface-2, #16161a);
+    border-left: 2px solid var(--accent, #5eead4);
+    border-radius: var(--radius, 6px);
     display: flex;
     align-items: center;
     flex-wrap: wrap;
     gap: 0.6em;
   }
   .wf-trigger-label {
-    color: var(--color-fg-muted, #888);
-    text-transform: uppercase;
+    color: var(--fg-subtle, #71717a);
     font-size: 0.85em;
-    letter-spacing: 0.08em;
+    font-weight: 500;
   }
   .wf-trig {
     display: inline-flex;
     align-items: center;
-    gap: 0.35em;
+    gap: 0.4em;
     padding: 0.15em 0.5em;
-    border-radius: 3px;
-    background: rgba(255,255,255,0.04);
+    border-radius: var(--radius, 6px);
+    background: var(--surface-1, #111114);
+    color: var(--fg, #e4e4e7);
   }
   .wf-trig-dot {
-    width: 0.7em;
-    height: 0.7em;
+    width: 0.5em;
+    height: 0.5em;
     border-radius: 50%;
     display: inline-block;
     flex-shrink: 0;
   }
-  .wf-trig--ready .wf-trig-dot   { background: #4eb84e; box-shadow: 0 0 4px rgba(78, 184, 78, 0.6); }
-  .wf-trig--pending .wf-trig-dot { background: var(--color-amber-glow, #ffb000); box-shadow: 0 0 4px rgba(255, 176, 0, 0.55); }
-  .wf-trig--failed .wf-trig-dot  { background: var(--color-alarm, #b85040); box-shadow: 0 0 4px rgba(184, 80, 64, 0.6); }
-  .wf-trigger--empty { border-left-color: var(--color-border, #444); }
+  .wf-trig--ready .wf-trig-dot   { background: var(--success, #4ade80); }
+  .wf-trig--pending .wf-trig-dot { background: var(--warning, #facc15); }
+  .wf-trig--failed .wf-trig-dot  { background: var(--danger, #f87171); }
+  .wf-trigger--empty { border-left-color: var(--border-strong, #2e2e38); }
   .wf-run-now {
     margin-left: auto;
     font-size: 0.9em;
