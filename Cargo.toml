@@ -252,24 +252,3 @@ codegen-units = 1
 # ematix-iceberg is intentionally NOT yet a flow-side dep — Phase 3+
 # of docs/plans/CURRENT.md will wire it in when we surface Iceberg-
 # managed tables.
-
-# Git-URL overrides for the Π.13 Tier 2 x86 SIMD parity work.
-# Pulls the AVX2 fused decode_predicate_bitmap kernels from the
-# ematix-parquet `x86-simd-parity` branch (PR ryan-evans-git/
-# ematix-parquet#94).
-#
-# Remove this block once the matching ematix-parquet release
-# (≥ v0.17.0 with the AVX2 kernels) is published to crates.io and
-# the `ematix-parquet-* = "0.16"` pin in ematix-flow-core/Cargo.toml
-# is bumped to "0.17".  The expected sequence:
-#   1. ematix-parquet#94 merges to main → cut new tag → publish.
-#   2. Bump pin here → `cargo update -p ematix-parquet-codec`.
-#   3. Revert the commit that introduced this block.
-#
-# Why git-URL rather than path: CI runners only check out this repo,
-# not the sibling ematix-parquet workspace, so a path override can't
-# resolve in CI.  Git URLs work anywhere `cargo fetch` does.
-[patch.crates-io]
-ematix-parquet-codec = { git = "https://github.com/ryan-evans-git/ematix-parquet", branch = "x86-simd-parity" }
-ematix-parquet-format = { git = "https://github.com/ryan-evans-git/ematix-parquet", branch = "x86-simd-parity" }
-ematix-parquet-io = { git = "https://github.com/ryan-evans-git/ematix-parquet", branch = "x86-simd-parity" }
