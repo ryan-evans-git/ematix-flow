@@ -79,18 +79,31 @@ Several queries scan the same table 2-3 times with identical projection + filter
 
 `SharedSubtreeExec` ([[sigma-p-subquery-cse]]) exists for the Q15 correlated-subquery shape. Generalising to identical-subtree CSE would deduplicate these.
 
-## Ranked lever list (by impact × effort)
+## Ranked lever list (by impact × effort) — REVISED 2026-05-25 EOD
 
-| Rank | Lever | Affects | Estimated effort | Expected geomean win | Risk |
-|------:|:------|:--------|:----------------|---------------------:|:-----|
-| 1 | BridgeFilter: BETWEEN + 2-column compare | Q03, Q04, Q07, Q12, Q21 | 1-2 wk | -8 to -12% | Low — known pattern. |
-| 2 | SIMD LIKE wire-up | Q13, Q22, Q16 | ~1 wk | -3 to -5% | Low — kernel already exists. |
-| 3 | L9 propagation across subqueries | Q05, Q08, Q09, Q17, Q18 | 4-6 wk | -10 to -15% | Medium — past attempts ([[sigma-sb-cascade-neg]]) had neutral results; need rule-narrowed scope. |
-| 4 | Compound-key Robin Hood SUM/AVG (2× i64) | Q09, Q20 | 2-3 wk | -3 to -5% | Low — extends existing kernel. |
-| 5 | CSE for identical scan+filter subtrees | Q02, Q11, Q17, Q18, Q21 | 2-3 wk | -2 to -4% | Medium — careful plan-rewrite. |
-| 6 | Group-by functional-dependency simplifier | Q10 | 2-3 wk | -1 to -2% | Medium — needs FK/PK metadata path. |
-| 7 | Q05 join-reorder via CBO | Q05 | Multi-month | -5% Q05 specifically | High — multi-quarter effort. |
-| 8 | RG decode cache bytes default bump | Q12, Q08 (variance) | 1 day | -1 to -2% | Low — config-only. |
+The original lever ranking was too optimistic — it didn't audit prior attempts deeply enough. Re-ranking after attempting Lever #1 (rejected — see [[path-a-i32-column-pair-rejected]]) and discovering Lever #2 was already documented as failed in the codebase:
+
+| Rank | Lever | Status | Notes |
+|------:|:------|:-------|:------|
+| ~~1~~ | BridgeFilter BETWEEN + 2-col compare | **REJECTED (2026-05-25)** | Q04 +123%, Q12 +77%, Q21 correctness bug (0 rows). Σ.E5 finding stands. |
+| ~~2~~ | SIMD LIKE PLAIN wire-up | **REJECTED (Σ.E5)** | Comment at [ematix_fast_parquet.rs:1009](../crates/ematix-flow-core/src/ematix_fast_parquet.rs:1009): Q13 regressed +25% → +123% with the Exact-pushdown + lifted dict-gate combo. Root cause is the masked-decode kernel being slower than dense + FilterExec for the OTHER projection cols, not the LIKE eval. |
+| ~~3~~ | L9 propagation across subqueries | **Neutral when tried** | [[sigma-sb-cascade-neg]] — opt-in only. |
+| 4 | Compound-key Robin Hood SUM/AVG (2× i64) | **Untried** | Affects Q09/Q20. 2-3 wk. -3 to -5% geomean. Greenfield. |
+| 5 | CSE/SharedSubtreeExec generalisation | **Partially tried** | [[sigma-p-subquery-cse]] for Q15-shape; identical-scan-subtree generalisation untested (Q21 specifically). 2-3 wk. |
+| 6 | Group-by FD simplifier | **Untried** | Q10-specific. 2-3 wk. ~-1 to -2% geomean. |
+| 7 | Q05 join-reorder via CBO | **Untried (multi-quarter)** | Multi-month structural work. |
+| 8 | RG decode cache bytes default bump | **Untried** | Config-only; ~1 day. |
+
+## Honest current-state summary
+
+At 22q SF=10 geomean **0.74 ematix-flow / DuckDB** (post StringView fix), we are at the realistic ceiling for the existing architecture. Every "quick win" lever the original survey identified has been attempted and either rejected outright or has been opt-in-only for a reason.
+
+**Realistic remaining paths forward:**
+- **Architectural** (multi-month): join reordering, full Polars-parquet-style decoder rewrite, masked-decode kernel performance work
+- **Targeted kernel** (2-4 weeks each, ~3-5% geomean each, uncertain): compound-key Robin Hood (#4), CSE generalisation (#5)
+- **Marginal** (1 day): RG cache size bump (#8)
+
+The survey delivered its purpose — documenting where each query stands relative to its floor and which patterns have/haven't been investigated. The next milestone shouldn't be "next lever from the list"; it should be a strategic decision: ship at 0.74, or invest in one of the multi-month architectural items.
 
 ## What we landed today
 
