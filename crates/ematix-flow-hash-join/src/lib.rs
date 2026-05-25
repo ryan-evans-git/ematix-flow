@@ -51,10 +51,13 @@
 //! - Multi-column composite keys. The optimiser projects composite
 //!   keys to a single i64 hash before this crate sees them; that's
 //!   a Story 2.5 concern.
-//! - Bloom emission (Story 2.3), skew detection (Story 2.4),
-//!   build-side selection (Story 2.2) — each lives in its own
-//!   module of this crate when its story lands.
+//! - Bloom emission (Story 2.3), skew detection (Story 2.4) —
+//!   each lives in its own module of this crate when its story
+//!   lands. Build-side selection (Story 2.2) lives in
+//!   [`build_side`].
 
+pub mod build_side;
 pub mod table;
 
+pub use build_side::{BuildSide, BuildSideReason, SideStats, StatsSource, choose};
 pub use table::{ProbeMatch, RobinHoodHashJoinI64Table};
