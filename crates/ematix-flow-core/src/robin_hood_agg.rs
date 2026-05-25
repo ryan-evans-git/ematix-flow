@@ -1970,8 +1970,34 @@ unsafe fn neon_match_byte_mask_at(tags: &[u8], slot: usize, byte: u8) -> u16 {
     (hi << 8) | lo
 }
 
-/// Scalar fallback for non-aarch64 builds. Byte-by-byte tag compare.
-#[cfg(not(target_arch = "aarch64"))]
+/// Σ.Q.L12 — match a tag byte across a 16-byte group on x86_64+SSE2.
+/// Returns a u16 bitmask: bit i set iff slot+i equals `byte`.
+///
+/// PCMPEQB sets 0xFF in each matching byte lane and 0x00 otherwise.
+/// PMOVMSKB extracts the top bit of each of the 16 bytes into a 16-bit
+/// integer — exactly the bitmask shape we want.  Two instructions per
+/// probe, the canonical SwissTable / boost::flat_hash_map pattern.
+///
+/// SSE2 is mandatory on x86_64 (part of the base ISA since AMD64),
+/// so this path needs no runtime feature detection; the `cfg` gate
+/// alone is sufficient.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse2")]
+#[inline]
+unsafe fn sse2_match_byte_mask_at(tags: &[u8], slot: usize, byte: u8) -> u16 {
+    use std::arch::x86_64::{
+        __m128i, _mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8, _mm_set1_epi8,
+    };
+    // SAFETY: callers guarantee `slot + GROUP_SIZE <= tags.len()` via the
+    // tail-mirror invariant documented on `RobinHoodI64F64::tags`.
+    let group = unsafe { _mm_loadu_si128(tags.as_ptr().add(slot) as *const __m128i) };
+    let cmp = _mm_cmpeq_epi8(group, _mm_set1_epi8(byte as i8));
+    _mm_movemask_epi8(cmp) as u16
+}
+
+/// Scalar fallback for non-{aarch64, x86_64} builds (e.g. RISC-V,
+/// wasm32 without SIMD).  Byte-by-byte tag compare.
+#[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
 #[inline]
 fn scalar_match_byte_mask(tags: &[u8], slot: usize, byte: u8) -> u16 {
     let mut mask = 0u16;
@@ -1991,7 +2017,11 @@ fn match_byte_mask(tags: &[u8], slot: usize, byte: u8) -> u16 {
     {
         unsafe { neon_match_byte_mask_at(tags, slot, byte) }
     }
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(target_arch = "x86_64")]
+    {
+        unsafe { sse2_match_byte_mask_at(tags, slot, byte) }
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     {
         scalar_match_byte_mask(tags, slot, byte)
     }
@@ -2384,6 +2414,52 @@ impl TaggedSumF64Agg {
 #[allow(clippy::type_complexity, clippy::approx_constant)]
 mod tests {
     use super::*;
+
+    /// SIMD parity: confirm the per-arch `match_byte_mask` dispatch returns
+    /// the same u16 bitmask as a byte-by-byte reference implementation, for
+    /// every position-of-match in a 16-byte group plus a handful of
+    /// multi-hit / no-hit shapes.  Runs on every target; the active arch
+    /// path (NEON on aarch64, SSE2 on x86_64, scalar elsewhere) is the one
+    /// being validated against the inline reference loop.
+    #[test]
+    fn match_byte_mask_matches_scalar_reference() {
+        fn reference(tags: &[u8], slot: usize, byte: u8) -> u16 {
+            let mut m = 0u16;
+            for i in 0..GROUP_SIZE {
+                if tags[slot + i] == byte {
+                    m |= 1 << i;
+                }
+            }
+            m
+        }
+        // Pad with GROUP_SIZE extra bytes so the SIMD load at slot=0 is in bounds
+        // even though we only vary the first 16 lanes.
+        let mut tags = vec![0xFFu8; GROUP_SIZE * 2];
+        // Single-position hits at every lane.
+        for i in 0..GROUP_SIZE {
+            for t in tags.iter_mut().take(GROUP_SIZE) {
+                *t = 0xFF;
+            }
+            tags[i] = 0x42;
+            assert_eq!(
+                match_byte_mask(&tags, 0, 0x42),
+                reference(&tags, 0, 0x42),
+                "single-hit mismatch at lane {i}",
+            );
+        }
+        // All-match / no-match boundaries.
+        for t in tags.iter_mut().take(GROUP_SIZE) {
+            *t = 0x77;
+        }
+        assert_eq!(match_byte_mask(&tags, 0, 0x77), 0xFFFF);
+        assert_eq!(match_byte_mask(&tags, 0, 0x00), 0x0000);
+        // Alternating pattern (every other lane matches).
+        for (i, t) in tags.iter_mut().take(GROUP_SIZE).enumerate() {
+            *t = if i % 2 == 0 { 0xAA } else { 0xBB };
+        }
+        assert_eq!(match_byte_mask(&tags, 0, 0xAA), 0b0101_0101_0101_0101);
+        assert_eq!(match_byte_mask(&tags, 0, 0xBB), 0b1010_1010_1010_1010);
+    }
 
     #[test]
     fn insert_and_lookup() {
