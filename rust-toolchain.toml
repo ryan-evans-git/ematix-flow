@@ -1,0 +1,17 @@
+[toolchain]
+# Stable channel (no specific version pinned) so MSRV (1.85) remains
+# the floor. The actively-used toolchain in CI is whatever stable
+# ships at the time of the build.
+channel = "stable"
+
+# Components required for the PGO pipeline (scripts/pgo/).
+# `llvm-tools-preview` ships `llvm-profdata`, used by `cargo pgo
+# optimize` to merge .profraw → .profdata.
+#
+# `rustfmt` and `clippy` are listed here so a fresh checkout of the
+# repo has them by default — CI runs both as gates.
+components = ["llvm-tools-preview", "rustfmt", "clippy"]
+
+# Targets compiled in CI / by contributors on x86 (release builds,
+# minipc cross-validation per V5 §5.2 / docs/plans/CURRENT.md).
+targets = ["x86_64-unknown-linux-gnu"]

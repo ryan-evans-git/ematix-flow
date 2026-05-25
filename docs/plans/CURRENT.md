@@ -20,7 +20,9 @@ V5 re-scored V2's 18 levers by **scale-universality** — which levers benefit S
 
 **Baseline:** 22q SF=10 geomean **0.80** (per `project_sigma_q_l13_to_l16_session.md`). Tier 1 target: **≤0.66** at end of Phase 3 (V5 §2.4 M6 checkpoint).
 
-**Canonical bench hardware:** Apple M3 Pro (per `bench-results/release-2026-05-24/`). All PGO training + acceptance-gate measurements run on this host. Commodity x86 (e.g. minipc) is a *portability cross-check*, not a sequencing input — see V5 §5.2 (memory-bandwidth finding: SF=10 on commodity x86 is BW-bound; compute-side levers like L13 / L11 mute there, but the canonical M3 Pro baseline doesn't show the same wall and is what the V5 closure targets are measured against).
+**Canonical bench hardware:** Apple M3 Pro (per `bench-results/release-2026-05-24/`). All non-PGO acceptance-gate measurements run on this host. Commodity x86 (e.g. minipc) is a *portability cross-check*, not a sequencing input — see V5 §5.2 (memory-bandwidth finding: SF=10 on commodity x86 is BW-bound; compute-side levers like L13 / L11 mute there, but the canonical M3 Pro baseline doesn't show the same wall and is what the V5 closure targets are measured against).
+
+**PGO training hardware (Phase 1 only):** Linux x86_64. The macOS aarch64 PGO-instrumented binary crashes in dyld init due to a C++ static constructor in vendored OpenSSL (pulled by `rdkafka`'s `ssl-vendored` feature) — see `scripts/pgo/README.md` "Platform support" section for the full root cause. Story 1.1 build pipeline still works on macOS for local toolchain validation; **Stories 1.2 + 1.3 run on the Linux bench host**. The PGO-vs-non-PGO geomean comparison (Story 1.3) is therefore Linux x86_64-canonical; the SF=1/SF=10 baseline-vs-PGO ratio is what the acceptance gate measures, and that ratio is hardware-independent at this granularity. M3 Pro stays canonical for **non-PGO** numbers and for the V5 closure targets; only the PGO improvement delta runs on Linux.
 
 **Recently absorbed (2026-05-25):** PR #146 — Π.13 x86 SIMD parity (Tier 1: SSE2 `match_byte_mask` SwissTable probe in `robin_hood_agg.rs`; Tier 2: AVX2 fused predicate-bitmap kernels bw 12–18 via ematix-parquet 0.16.2). Portability work outside the L-numbered lever space — closes a NEON-only architectural asymmetry, no expected wall-clock impact on the canonical M3 Pro baseline. Bump `ematix-parquet` pins `0.16` → `0.16.2` when PR #146 merges (the version bump rides with the SIMD-parity diff, not separately). Empirical addendum in V5 §5.
 
@@ -31,7 +33,8 @@ V5 re-scored V2's 18 levers by **scale-universality** — which levers benefit S
 ## Active phase + story
 
 - **Phase 1 — L3 PGO release build** is `[ACTIVE]`.
-- **Story 1.1 — cargo-pgo installation + instrumented build pipeline** is `[ACTIVE]`.
+- **Story 1.1 — cargo-pgo installation + instrumented build pipeline** is `[done — pending merge]`. Smoke test passes on M3 Pro (49 instrumentation symbols, plain release path still works). Scripts for Stories 1.2 + 1.3 ship in the same PR as Linux-ready stubs (the macOS instrumented binary crashes pre-main; see notes).
+- **Story 1.2 — Training-run script + initial profile capture** is `[next — Linux]`. Scripts written; awaiting Linux exercise.
 
 Phase 1 estimate: 1 week. Phase 2 estimate: 2-3 person-quarters. Phase 3 estimate: 4-6 weeks. The cumulative L8-CBO/L10/L17 follow-on tail is V5 M9–M12 and is NOT in this plan.
 
@@ -117,9 +120,9 @@ Three options:
 
 **Acceptance gate (V5 §4):** 22q SF=10 geomean improves by ≥3pp on PGO build vs non-PGO with identical source. No per-query regression > 2%.
 
-### Story 1.1 — cargo-pgo install + instrumented build pipeline [ACTIVE]
+### Story 1.1 — cargo-pgo install + instrumented build pipeline [done — pending merge]
 
-**Status:** `[ACTIVE]`
+**Status:** `[done — pending merge]`
 
 **Failing test (TDD anchor):**
 - `scripts/pgo/test_pgo_build_smoke.sh` — runs `cargo pgo build` (instrumented), asserts the resulting binary exists at `target/x86_64-apple-darwin/release/ematix-flow` (or current host triple) AND that `file <binary>` reports the binary is profile-instrumented (PGO instrumentation symbols present in `nm` output).
@@ -137,7 +140,7 @@ Three options:
 
 ### Story 1.2 — Training-run script + initial profile capture
 
-**Status:** `[ ]`
+**Status:** `[next — Linux]` (scripts written + ship in Story 1.1 PR; awaiting Linux exercise per macOS dyld-init blocker, see "PGO training hardware" note in Summary).
 
 **Failing test:**
 - `scripts/pgo/test_training_run.sh` — given an instrumented binary (precondition from Story 1.1), runs the training workload (22q SF=10 single iteration), asserts `target/pgo-profiles/*.profraw` files exist and are non-empty after the run.

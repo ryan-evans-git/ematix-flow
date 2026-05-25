@@ -3,6 +3,14 @@
 **/*.rs.bk
 Cargo.lock.bak
 
+# PGO profile data (scripts/pgo/). Profile files are machine-specific
+# (host triple, hot-path topology) and ~10-100 MB per training run —
+# never commit. Default location is target/pgo-profiles/ which is
+# already covered by /target/ above; these patterns catch stray files
+# if someone runs `cargo pgo` outside the script.
+**/*.profraw
+**/*.profdata
+
 # Python
 __pycache__/
 *.py[cod]
