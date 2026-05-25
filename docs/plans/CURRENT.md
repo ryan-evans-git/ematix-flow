@@ -4,23 +4,25 @@
 **Created:** 2026-05-25
 **Branch policy:** one PR per story unless a sub-bite is gated on perf / data / external dependency, per `feedback_fewer_prs.md`.
 **Roadmap parent:** [`docs/PHASE_SIGMA_T_SF10_WEAKNESS_CLOSURE_V5.md`](../PHASE_SIGMA_T_SF10_WEAKNESS_CLOSURE_V5.md) — V5 §1 Tier 1 plus §2 sequencing rationale; lever descriptions in [`V2`](../PHASE_SIGMA_T_SF10_WEAKNESS_CLOSURE_V2.md) §2.2 L3, §2.3 L13, §2.3 L14.
-**Predecessor plan:** [`docs/plans/sidecar-deferred.md`](./sidecar-deferred.md) — L1/L15 sidecar work (V5 Tier 5, scale-specific) deferred. Resumes after this plan's Phase 1 completes, or earlier if a dedicated engineer picks it up in parallel.
+**Predecessor plan:** [`docs/plans/sidecar-deferred.md`](./sidecar-deferred.md) — L1/L15 sidecar work (V5 Tier 5, scale-specific) deferred. Resumes after this plan's Phase 2 completes (Phase 1 dropped 2026-05-25 — see `docs/PHASE_PGO_BASELINE.md`), or earlier if a dedicated engineer picks it up in parallel.
 
 ---
 
 ## Summary
 
-V5 re-scored V2's 18 levers by **scale-universality** — which levers benefit SF=1, SF=10, and SF=100 in proportion. Tier 1 levers amplify with scale (SF=100 gains > SF=10 gains > SF=1 gains, all positive). This plan ships V5 Tier 1 in three phases:
+V5 re-scored V2's 18 levers by **scale-universality** — which levers benefit SF=1, SF=10, and SF=100 in proportion. Tier 1 levers amplify with scale (SF=100 gains > SF=10 gains > SF=1 gains, all positive). This plan now ships V5 Tier 1 in two phases after the Phase 1 PGO empirical result fell below the acceptance bar (see `docs/PHASE_PGO_BASELINE.md`):
 
-1. **Phase 1 — L3 PGO release build** (1 week, blast radius 1). Calendar-first because every subsequent lever rides on the PGO baseline AND L3 absorbs the codegen tax per `project_optimizer_codegen_sensitivity.md`. Flat 3-5pp universal lift across SF=1/SF=10/SF=100.
-2. **Phase 2 — L13 custom hash join** (2-3 person-quarters, blast radius 3). Sibling-crate kernel + ExecutionPlan wrapper. Reuses Σ.N.f.3 RobinHood substrate. Amplifying-with-scale: 2-4pp at SF=1, 10-13pp at SF=10, 18-25pp at SF=100.
+1. ~~**Phase 1 — L3 PGO release build**~~ **[DROPPED 2026-05-25]** — Linux x86_64 measurement (minipc) showed only +1.44pp geomean improvement vs. the ≥3pp acceptance gate, with Q14 at +2.06% per-query regression (just over the ≤2% bar). Most of the workload (the multi-join queries Q03 / Q05 / Q07–Q09) is memory-bandwidth-bound on SF=10 per V5 §5.2 — codegen quality is not the bottleneck. PGO scripts and pipeline (`scripts/pgo/` on branch `feat/pgo-instrumented-build`) are unmerged but available if hardware mix changes warrant revisiting.
+2. **Phase 2 — L13 custom hash join** (2-3 person-quarters, blast radius 3). Sibling-crate kernel + ExecutionPlan wrapper. Reuses Σ.N.f.3 RobinHood substrate. Amplifying-with-scale: 2-4pp at SF=1, 10-13pp at SF=10, 18-25pp at SF=100. **Promoted to ACTIVE** after Phase 1's drop.
 3. **Phase 3 — L14 dict-preserved end-to-end** (4-6 weeks, blast radius 2). Σ.K.2 dict-routing extended to default-on for low-cardinality strings; per-shape persistence via Σ.L workload log; speculative-race probe avoids the `project_sigma_k_dict_arrival_ab.md` regression regime. 1-2pp at SF=1, 3-5pp at SF=10, 5-10pp at SF=100.
 
-**Why this sequence (V5 §3.7):** ship amplifying-with-scale first because (a) the largest expected closure is at the most-bench-relevant scale (SF=10 published, SF=100 strategic target), (b) downstream Tier 2 / Tier 3 levers compose on top of Tier 1's surface, and (c) L3 absorbs codegen tax that L13 would otherwise pay.
+**Why this sequence (V5 §3.7 revised):** ship amplifying-with-scale L13 first because the largest expected closure is at the most-bench-relevant scale (SF=10 published, SF=100 strategic target) and downstream Tier 2 / Tier 3 levers compose on top of Tier 1's surface. The original "L3 absorbs codegen tax that L13 would otherwise pay" rationale no longer applies; the Phase 2 codegen-tax risk is now mitigated by sibling-crate isolation alone (see Risks table).
 
 **Baseline:** 22q SF=10 geomean **0.80** (per `project_sigma_q_l13_to_l16_session.md`). Tier 1 target: **≤0.66** at end of Phase 3 (V5 §2.4 M6 checkpoint).
 
-**Canonical bench hardware:** Apple M3 Pro (per `bench-results/release-2026-05-24/`). All PGO training + acceptance-gate measurements run on this host. Commodity x86 (e.g. minipc) is a *portability cross-check*, not a sequencing input — see V5 §5.2 (memory-bandwidth finding: SF=10 on commodity x86 is BW-bound; compute-side levers like L13 / L11 mute there, but the canonical M3 Pro baseline doesn't show the same wall and is what the V5 closure targets are measured against).
+**Canonical bench hardware:** Apple M3 Pro (per `bench-results/release-2026-05-24/`). All acceptance-gate measurements run on this host. Commodity x86 (e.g. minipc) is a *portability cross-check*, not a sequencing input — see V5 §5.2 (memory-bandwidth finding: SF=10 on commodity x86 is BW-bound; compute-side levers like L13 / L11 mute there, but the canonical M3 Pro baseline doesn't show the same wall and is what the V5 closure targets are measured against).
+
+**PGO measurement archive (Phase 1, dropped 2026-05-25):** The 22q SF=10 PGO-vs-non-PGO comparison ran on Linux x86_64 (minipc) because the macOS aarch64 instrumented binary crashes in dyld init (vendored OpenSSL C++ static constructors via rdkafka's `ssl-vendored` feature). Result documented in `docs/PHASE_PGO_BASELINE.md`. The scripts (`scripts/pgo/build-instrumented.sh`, `train.sh`, `optimize.sh`) and `rust-toolchain.toml` PGO pin live on unmerged branch `feat/pgo-instrumented-build`; re-measurement is one-command if the workload shape or hardware mix changes.
 
 **Recently absorbed (2026-05-25):** PR #146 — Π.13 x86 SIMD parity (Tier 1: SSE2 `match_byte_mask` SwissTable probe in `robin_hood_agg.rs`; Tier 2: AVX2 fused predicate-bitmap kernels bw 12–18 via ematix-parquet 0.16.2). Portability work outside the L-numbered lever space — closes a NEON-only architectural asymmetry, no expected wall-clock impact on the canonical M3 Pro baseline. Bump `ematix-parquet` pins `0.16` → `0.16.2` when PR #146 merges (the version bump rides with the SIMD-parity diff, not separately). Empirical addendum in V5 §5.
 
@@ -30,10 +32,11 @@ V5 re-scored V2's 18 levers by **scale-universality** — which levers benefit S
 
 ## Active phase + story
 
-- **Phase 1 — L3 PGO release build** is `[ACTIVE]`.
-- **Story 1.1 — cargo-pgo installation + instrumented build pipeline** is `[ACTIVE]`.
+- **Phase 1 — L3 PGO release build** is `[DROPPED 2026-05-25]`. See `docs/PHASE_PGO_BASELINE.md` for the measurement that produced the drop decision.
+- **Phase 2 — L13 custom hash join** is `[ACTIVE]`.
+- **Story 2.1 — Kernel scaffold + Robin Hood i64-keyed table** is `[next]`.
 
-Phase 1 estimate: 1 week. Phase 2 estimate: 2-3 person-quarters. Phase 3 estimate: 4-6 weeks. The cumulative L8-CBO/L10/L17 follow-on tail is V5 M9–M12 and is NOT in this plan.
+Phase 2 estimate: 2-3 person-quarters. Phase 3 estimate: 4-6 weeks. The cumulative L8-CBO/L10/L17 follow-on tail is V5 M9–M12 and is NOT in this plan.
 
 ---
 
@@ -107,19 +110,20 @@ Three options:
 
 ---
 
-## Phase 1 — L3 PGO release build [ACTIVE]
+## Phase 1 — L3 PGO release build [DROPPED 2026-05-25]
 
-**Goal:** a profile-guided LLVM release build of `ematix-flow-core` (+ binaries) drops 22q SF=10 geomean by ≥3pp on top of the current 0.80 baseline. PGO build flow is repeatable (re-train when training data changes) and CI-integrated for the SF=10 release bench.
+**Drop summary:** PGO measurement on Linux x86_64 (minipc, 22q SF=10, 10 trials × 2 warmups, full bench env) produced a geomean ratio of 0.9856 — **+1.44pp improvement, vs. the ≥3pp acceptance gate**. Q14 also regressed +2.06% (per-query bar is ≤2%). Both gate criteria miss. The bulk of the SF=10 workload (multi-join Q03/Q05/Q07–Q09) is memory-bandwidth-bound on commodity x86 per V5 §5.2 — codegen quality is not the limiting factor on this hardware mix. Full numbers, environment, and recommendation in `docs/PHASE_PGO_BASELINE.md`.
 
-**Estimated effort:** 1 week.
+**Infrastructure parked, not landed:**
+- `scripts/pgo/build-instrumented.sh`, `train.sh`, `optimize.sh`, `clean.sh`, and three smoke-test scripts live on branch `feat/pgo-instrumented-build`.
+- `rust-toolchain.toml` `llvm-tools-preview` pin lives on the same branch.
+- Re-measurement is one-command if a hardware mix change or training-shape change warrants revisiting; the branch is also the basis for re-opening as a PR if Phase 1 is later resurrected.
 
-**Bundle:** Stories 1.1 + 1.2 ship in one PR (instrumented build + training script are dead weight without each other). Story 1.3 is the bench-gate PR — separate because it depends on operator-run SF=10 numbers. Story 1.4 is the CI hook — separate small PR after 1.3 lands.
+**Stories 1.1–1.4 below preserved for traceability; statuses updated to reflect the drop.**
 
-**Acceptance gate (V5 §4):** 22q SF=10 geomean improves by ≥3pp on PGO build vs non-PGO with identical source. No per-query regression > 2%.
+### Story 1.1 — cargo-pgo install + instrumented build pipeline [done — branch only]
 
-### Story 1.1 — cargo-pgo install + instrumented build pipeline [ACTIVE]
-
-**Status:** `[ACTIVE]`
+**Status:** `[done — branch `feat/pgo-instrumented-build`, not merged]`
 
 **Failing test (TDD anchor):**
 - `scripts/pgo/test_pgo_build_smoke.sh` — runs `cargo pgo build` (instrumented), asserts the resulting binary exists at `target/x86_64-apple-darwin/release/ematix-flow` (or current host triple) AND that `file <binary>` reports the binary is profile-instrumented (PGO instrumentation symbols present in `nm` output).
@@ -137,7 +141,7 @@ Three options:
 
 ### Story 1.2 — Training-run script + initial profile capture
 
-**Status:** `[ ]`
+**Status:** `[done — Linux minipc 2026-05-25]`. Scripts ran end-to-end on `feat/pgo-instrumented-build`; one non-empty `.profraw` captured; `cargo pgo optimize` merged the profile and rebuilt the bench binary (227 MB → 196 MB, -14%).
 
 **Failing test:**
 - `scripts/pgo/test_training_run.sh` — given an instrumented binary (precondition from Story 1.1), runs the training workload (22q SF=10 single iteration), asserts `target/pgo-profiles/*.profraw` files exist and are non-empty after the run.
@@ -155,7 +159,7 @@ Three options:
 
 ### Story 1.3 — Release-bench reproduction with PGO binary; commit baseline numbers
 
-**Status:** `[ ]`
+**Status:** `[done — gate not met, see docs/PHASE_PGO_BASELINE.md]`. Linux minipc, 22q SF=10, ematix-flow only, 10 trials × 2 warmups, full bench env. Geomean +1.44pp (gate ≥3pp); Q14 +2.06% (gate ≤2%). Q22 (-9.24%), Q12 (-8.01%), Q01 (-4.89%) were the headline wins; the multi-join queries (Q03/Q05/Q07–Q09) moved <1pp consistent with memory-bandwidth-bound behaviour on commodity x86 (V5 §5.2). M3 Pro re-measurement was not run — minipc-vs-M3 hardware gap is unlikely to swing the result past the 3pp bar (Phase 1 acceptance is hardware-independent at this granularity per V5 §3.7 baseline narrative).
 
 **Failing test:**
 - `crates/ematix-flow-core/examples/bench_22q_sf10_pgo_vs_nopgo.rs` — checked-in runnable example. Runs 22q SF=10 5× against both the PGO and non-PGO binaries (configured via env var pointing at each binary path), reports per-query and geomean ratios. **The script asserts PGO geomean is ≤ non-PGO geomean × 0.97** (≥3pp improvement, per the V5 acceptance gate).
@@ -173,7 +177,7 @@ Three options:
 
 ### Story 1.4 — CI hook + release-workflow integration
 
-**Status:** `[ ]`
+**Status:** `[N/A — Phase 1 dropped]`. No PGO baseline meeting the gate exists to wire into CI. If Phase 1 is revisited (e.g. re-measured on a different hardware mix that clears the bar), this story re-activates.
 
 **Failing test:**
 - `.github/workflows/bench-sf10.yml` (or wherever the SF=10 bench CI lives) runs the PGO build instead of the plain release build. Smoke-test: CI successfully produces a PGO binary and runs at least one query against it.
@@ -189,7 +193,7 @@ Three options:
 
 ---
 
-## Phase 2 — L13 custom hash join
+## Phase 2 — L13 custom hash join [ACTIVE]
 
 **Goal:** Q18 SF=10 build phase drops below 60 ms; a standalone i64→i64 hash-join microbench shows ≥1.3× over DataFusion's stock `HashJoinExec` at both 1M and 15M build cardinalities. Sibling-crate scoped per `project_ematix_parquet_v013_win.md` to avoid codegen tax. Reuses Σ.N.f.3 RobinHood substrate (`project_sigma_nf3_beats_stock.md`).
 
@@ -197,10 +201,10 @@ Three options:
 
 **Bundle:** Each story is one PR — they are independently testable, and bundling sequential operator-replacement work makes the diff unreviewable. Story 2.3 (bloom emitter) and Story 2.4 (skew detection) can ship in either order after 2.1 + 2.2 land.
 
-**Acceptance gate (V5 §4):**
+**Acceptance gate (V5 §4, revised after Phase 1 drop):**
 - L13 isolated bench vs stock `HashJoinExec`, i64→i64 @ 1M and 15M build cardinalities: ≥1.3×.
 - Q18 SF=10 build phase: ≤60 ms.
-- 22q SF=10 geomean improvement on top of Phase 1 PGO baseline: target ≥6pp at SF=10 (V5 projects 10-13pp; gate at 6pp to allow for integration friction).
+- 22q SF=10 geomean improvement on top of the **0.80 non-PGO baseline** (Phase 1 dropped): target ≥6pp at SF=10 (V5 projects 10-13pp; gate at 6pp to allow for integration friction).
 - No per-query regression > 2%.
 
 ### Story 2.1 — Kernel scaffold + Robin Hood i64-keyed table
@@ -330,7 +334,7 @@ Three options:
 **Bundle:** Stories 3.1 + 3.2 ship in one PR (Σ.K.2 routing extension + speculative probe wire-up are co-dependent; the routing alone is dead weight without the probe gate). Story 3.3 ships separately — the default-on flip is an independent operational decision requiring a soak interval. Story 3.4 is the bench-gate PR.
 
 **Acceptance gate (V5 §4):**
-- 22q SF=10 geomean improves by ≥3pp on top of Phase 1+2 cumulative baseline.
+- 22q SF=10 geomean improves by ≥3pp on top of the Phase 2 cumulative baseline (Phase 1 dropped — see `docs/PHASE_PGO_BASELINE.md`).
 - Q01 SF=10 does NOT regress (Σ.L.1 probe must catch the dict-off regime per `project_sigma_k_dict_arrival_ab.md`).
 - Q13 SF=10 does NOT regress > 2%.
 - Q19 SF=10 does NOT regress > 2%.
@@ -430,10 +434,9 @@ Three options:
 
 | Risk | Mitigation |
 |---|---|
-| **PGO training profile is stale.** Hot-path code changes between PGO build and production runs; the profile no longer matches reality, and per-loop sharpening becomes per-loop noise. | Story 1.4 CI hook re-trains on `Cargo.lock` change. Operator SOP: re-train on every major-release-candidate build. |
 | **L13 kernel wins microbench but loses end-to-end.** Pattern seen in `project_sigma_r2_rejected.md` (RobinHoodAvgF64Exec) and `project_sigma_qm_slice4_spike_rejected.md`. | Story 2.6 bench gate requires both microbench ≥1.3× AND end-to-end ≥6pp geomean. If only microbench passes, ship as opt-in and triage. |
 | **L13 build-side selector regresses left-side-default cases.** DataFusion's left-side default may already be right for cases our cardinality estimator gets wrong. | Story 2.2's fallback rule explicitly returns left-side when no stats; opt-out via env flag `EMAT_HASH_JOIN=0`. |
-| **L13 codegen tax despite sibling-crate isolation.** Hot-path inlining could still cross crate boundaries via `#[inline]` annotations. | Phase 1 PGO absorbs ~3-5pp of codegen sensitivity buffer ahead of Phase 2. If 22q geomean still regresses, the swap helper (Story 2.5) goes opt-in. |
+| **L13 codegen tax despite sibling-crate isolation.** Hot-path inlining could still cross crate boundaries via `#[inline]` annotations. With Phase 1 PGO dropped, this risk no longer has a buffer. | Sibling-crate isolation per Story 2.1 (codegen lives in `ematix-flow-hash-join`, not `ematix-flow-core`); `#[inline]` boundaries audited at Story 2.5 integration. If 22q geomean still regresses, the swap helper (Story 2.5) goes opt-in via `EMAT_HASH_JOIN`. |
 | **L14 probe cost exceeds budget on slow first queries.** A first-encounter probe that doubles a 100ms query's wall-time is a UX regression even if it's a one-time tax. | Story 3.2 probe-cost budget of ≤5% of first-query wall-time; on overrun, record `verdict='tied'` and proceed with the static threshold. |
 | **Σ.L workload log contention** under high concurrent query load with many distinct columns. | Existing `WorkloadLog` WAL + Mutex pattern; same as Σ.L.1/Σ.L.2/Σ.L.5 already handle. New table follows the same pattern. |
 | **The deferred sidecar plan loses urgency.** Tier 5 levers are scheduled to run as a parallel track in V5 §2; if no engineer picks them up, Tier 1's downstream Tier 5 dependencies (e.g. L8 CBO consuming sidecar stats) drift. | Cross-reference in this plan + in `sidecar-deferred.md` keeps the work visible. Re-decision at the end of Phase 3 on whether to resume sidecar work or proceed to L8 CBO. |
