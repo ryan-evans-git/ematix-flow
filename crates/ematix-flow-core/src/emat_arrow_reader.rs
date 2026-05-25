@@ -2730,8 +2730,13 @@ fn slice_decoded(c: &DecodedColumn, start: usize, n: usize, target: &DataType) -
             // against the corresponding `data_buffers[block_id]` so
             // the (block_id, offset) coordinates are valid and the
             // bytes are valid UTF-8 (parquet Utf8 logical type).
-            let arr = StringViewArray::try_new(views_buf, data_buffers.clone(), None::<NullBuffer>)
-                .expect("StringViewArray::try_new on internally-built views");
+            // `new_unchecked` saves ~9% of self-time on Q01 SF=10
+            // (`validate_string_view` + `core::str::from_utf8` in the
+            // 2026-05 stage profile); `force_validate` feature still
+            // enables validation in debug.
+            let arr = unsafe {
+                StringViewArray::new_unchecked(views_buf, data_buffers.clone(), None::<NullBuffer>)
+            };
             Arc::new(arr)
         }
         DecodedColumn::DictUtf8 {
