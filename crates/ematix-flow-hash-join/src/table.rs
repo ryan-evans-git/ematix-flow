@@ -285,6 +285,45 @@ impl RobinHoodHashJoinI64Table {
         }
     }
 
+    /// Iterate every `(key, count)` pair in the table. `count` is
+    /// the number of `(key, build_row_idx)` entries inserted for
+    /// that key (== chain length).
+    ///
+    /// Iteration order is bucket order, not insertion order.
+    /// O(n_buckets + n_rows) — walks every bucket and every chain
+    /// node. Cheap enough for end-of-build skew analysis; do not
+    /// call inside the probe hot loop.
+    pub fn iter_key_counts(&self) -> impl Iterator<Item = (i64, usize)> + '_ {
+        self.buckets.iter().filter(|b| !b.is_empty()).map(|b| {
+            let mut count: usize = 0;
+            let mut node_idx = b.head;
+            while node_idx != NULL_CHAIN {
+                count += 1;
+                node_idx = self.chain_nodes[node_idx as usize].next;
+            }
+            (b.key, count)
+        })
+    }
+
+    /// Returns every `build_row_idx` inserted for `key`, in
+    /// insertion-reverse order (front-prepended chain).
+    ///
+    /// Allocates a `Vec` — intended for one-off lookup
+    /// (skew-partition extraction, debugging), not the hot probe
+    /// path.
+    pub fn build_rows_for_key(&self, key: i64) -> Vec<u32> {
+        let mut out = Vec::new();
+        if let Some(head) = self.lookup_chain_head(key) {
+            let mut node_idx = head;
+            while node_idx != NULL_CHAIN {
+                let node = self.chain_nodes[node_idx as usize];
+                out.push(node.build_row_idx);
+                node_idx = node.next;
+            }
+        }
+        out
+    }
+
     /// Read-only lookup. Returns the head chain-node index for
     /// `key`, or `None` if not present.
     #[inline]

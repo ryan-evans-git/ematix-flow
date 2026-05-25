@@ -51,13 +51,15 @@
 //! - Multi-column composite keys. The optimiser projects composite
 //!   keys to a single i64 hash before this crate sees them; that's
 //!   a Story 2.5 concern.
-//! - Bloom emission (Story 2.3), skew detection (Story 2.4) —
-//!   each lives in its own module of this crate when its story
+//! - Bloom emission (Story 2.3) lives in its own module when 2.3
 //!   lands. Build-side selection (Story 2.2) lives in
-//!   [`build_side`].
+//!   [`build_side`]; skew detection + overflow partition (Story 2.4)
+//!   lives in [`skew`].
 
 pub mod build_side;
+pub mod skew;
 pub mod table;
 
 pub use build_side::{BuildSide, BuildSideReason, SideStats, StatsSource, choose};
+pub use skew::{OverflowTable, SkewAnalysis, observe as observe_skew};
 pub use table::{ProbeMatch, RobinHoodHashJoinI64Table};
