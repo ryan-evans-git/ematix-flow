@@ -1,0 +1,222 @@
+   Compiling ematix-flow-core v0.7.0 (/Users/ryanevans/RustroverProjects/ematix-flow/crates/ematix-flow-core)
+warning: unused import: `RecordBatch`
+  --> crates/ematix-flow-core/src/build_side_bloom_emitter_exec.rs:42:44
+   |
+42 | use datafusion::arrow::array::{Int64Array, RecordBatch};
+   |                                            ^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `Clause`
+  --> crates/ematix-flow-core/src/lane_filter_sum_kernel.rs:47:33
+   |
+47 | use crate::fused_jit::{AggExpr, Clause, ClauseOp, ColumnTy, FusedFilterAggSpec};
+   |                                 ^^^^^^
+
+warning: unused import: `futures_util::TryStreamExt`
+  --> crates/ematix-flow-core/src/build_side_bloom_emitter_exec.rs:54:5
+   |
+54 | use futures_util::TryStreamExt;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: value assigned to `finalized` is never read
+   --> crates/ematix-flow-core/src/build_side_bloom_emitter_exec.rs:429:29
+    |
+429 | ...                   finalized = true;
+    |                       ^^^^^^^^^^^^^^^^
+    |
+    = help: maybe it is overwritten before being read?
+    = note: `#[warn(unused_assignments)]` (part of `#[warn(unused)]`) on by default
+
+warning: `ematix-flow-core` (lib) generated 4 warnings (run `cargo fix --lib -p ematix-flow-core` to apply 2 suggestions)
+    Finished `release` profile [optimized] target(s) in 2m 57s
+warning: the following packages contain code that will be rejected by a future version of Rust: polars-sql v0.52.0
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running `target/release/examples/tpch_triangulation_bench`
+=== TPC-H 22 triangulation bench ===
+    data:    examples/tpch/data/sf10
+    queries: 22 ([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22])
+    trials:  20 (after 3 warmups)
+    output:  /Users/ryanevans/RustroverProjects/ematix-flow/BENCHMARKS.md
+
+--- Q01 ---
+  ematix-flow   266.30 ms ± 12.55  (4 rows)
+  DuckDB        248.57 ms ±  6.08  (4 rows)
+  Polars        374.84 ms ± 23.23  (4 rows)
+
+--- Q02 ---
+  ematix-flow    35.76 ms ±  7.41  (4667 rows)
+  DuckDB         49.37 ms ±  3.14  (4667 rows)
+  Polars        421.71 ms ± 33.71  (4667 rows)
+
+--- Q03 ---
+  ematix-flow   155.21 ms ± 10.90  (114003 rows)
+  DuckDB        154.37 ms ±  3.81  (114003 rows)
+  Polars        626.94 ms ± 31.36  (114003 rows)
+
+--- Q04 ---
+  ematix-flow    58.65 ms ±  7.48  (5 rows)
+  DuckDB         92.57 ms ±  4.00  (5 rows)
+  Polars        277.20 ms ± 18.21  (5 rows)
+
+--- Q05 ---
+  ematix-flow   203.46 ms ± 13.31  (5 rows)
+  DuckDB        146.40 ms ±  5.84  (5 rows)
+
+thread 'polars-0' (5525846) panicked at /Users/ryanevans/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/polars-core-0.52.0/src/chunked_array/ops/chunkops.rs:152:13:
+Polars' maximum length reached. Consider compiling with 'bigidx' feature.
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+thread 'polars-0' (5525846) panicked at /Users/ryanevans/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/polars-core-0.52.0/src/chunked_array/ops/chunkops.rs:152:13:
+Polars' maximum length reached. Consider compiling with 'bigidx' feature.
+
+thread 'polars-0' (5525846) panicked at /Users/ryanevans/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/polars-core-0.52.0/src/chunked_array/ops/chunkops.rs:152:13:
+Polars' maximum length reached. Consider compiling with 'bigidx' feature.
+
+thread 'polars-0' (5525846) panicked at /Users/ryanevans/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/polars-core-0.52.0/src/chunked_array/ops/chunkops.rs:152:13:
+Polars' maximum length reached. Consider compiling with 'bigidx' feature.
+
+thread 'polars-0' (5525846) panicked at /Users/ryanevans/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/polars-core-0.52.0/src/chunked_array/ops/chunkops.rs:152:13:
+Polars' maximum length reached. Consider compiling with 'bigidx' feature.
+
+thread 'polars-0' (5525846) panicked at /Users/ryanevans/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/polars-core-0.52.0/src/chunked_array/ops/chunkops.rs:152:13:
+Polars' maximum length reached. Consider compiling with 'bigidx' feature.
+
+thread 'polars-0' (5525846) panicked at /Users/ryanevans/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/polars-core-0.52.0/src/chunked_array/ops/chunkops.rs:152:13:
+Polars' maximum length reached. Consider compiling with 'bigidx' feature.
+
+thread 'polars-0' (5525846) panicked at /Users/ryanevans/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/polars-core-0.52.0/src/chunked_array/ops/chunkops.rs:152:13:
+Polars' maximum length reached. Consider compiling with 'bigidx' feature.
+
+thread 'polars-0' (5525846) panicked at /Users/ryanevans/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/polars-core-0.52.0/src/chunked_array/ops/chunkops.rs:152:13:
+Polars' maximum length reached. Consider compiling with 'bigidx' feature.
+
+thread 'polars-0' (5525846) panicked at /Users/ryanevans/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/polars-core-0.52.0/src/chunked_array/ops/chunkops.rs:152:13:
+Polars' maximum length reached. Consider compiling with 'bigidx' feature.
+
+thread 'polars-0' (5525846) panicked at /Users/ryanevans/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/polars-core-0.52.0/src/chunked_array/ops/chunkops.rs:152:13:
+Polars' maximum length reached. Consider compiling with 'bigidx' feature.
+
+thread 'polars-0' (5525846) panicked at /Users/ryanevans/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/polars-core-0.52.0/src/chunked_array/ops/chunkops.rs:152:13:
+Polars' maximum length reached. Consider compiling with 'bigidx' feature.
+
+thread 'polars-0' (5525846) panicked at /Users/ryanevans/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/polars-core-0.52.0/src/chunked_array/ops/chunkops.rs:152:13:
+Polars' maximum length reached. Consider compiling with 'bigidx' feature.
+
+thread 'polars-0' (5525846) panicked at /Users/ryanevans/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/polars-core-0.52.0/src/chunked_array/ops/chunkops.rs:152:13:
+Polars' maximum length reached. Consider compiling with 'bigidx' feature.
+
+thread 'polars-0' (5525846) panicked at /Users/ryanevans/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/polars-core-0.52.0/src/chunked_array/ops/chunkops.rs:152:13:
+Polars' maximum length reached. Consider compiling with 'bigidx' feature.
+
+thread 'polars-0' (5525846) panicked at /Users/ryanevans/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/polars-core-0.52.0/src/chunked_array/ops/chunkops.rs:152:13:
+Polars' maximum length reached. Consider compiling with 'bigidx' feature.
+
+thread 'polars-0' (5525846) panicked at /Users/ryanevans/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/polars-core-0.52.0/src/chunked_array/ops/chunkops.rs:152:13:
+Polars' maximum length reached. Consider compiling with 'bigidx' feature.
+
+thread 'polars-0' (5525846) panicked at /Users/ryanevans/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/polars-core-0.52.0/src/chunked_array/ops/chunkops.rs:152:13:
+Polars' maximum length reached. Consider compiling with 'bigidx' feature.
+
+thread 'polars-0' (5525846) panicked at /Users/ryanevans/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/polars-core-0.52.0/src/chunked_array/ops/chunkops.rs:152:13:
+Polars' maximum length reached. Consider compiling with 'bigidx' feature.
+
+thread 'polars-0' (5525846) panicked at /Users/ryanevans/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/polars-core-0.52.0/src/chunked_array/ops/chunkops.rs:152:13:
+Polars' maximum length reached. Consider compiling with 'bigidx' feature.
+
+thread 'polars-0' (5525846) panicked at /Users/ryanevans/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/polars-core-0.52.0/src/chunked_array/ops/chunkops.rs:152:13:
+Polars' maximum length reached. Consider compiling with 'bigidx' feature.
+
+thread 'polars-0' (5525846) panicked at /Users/ryanevans/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/polars-core-0.52.0/src/chunked_array/ops/chunkops.rs:152:13:
+Polars' maximum length reached. Consider compiling with 'bigidx' feature.
+
+thread 'polars-0' (5525846) panicked at /Users/ryanevans/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/polars-core-0.52.0/src/chunked_array/ops/chunkops.rs:152:13:
+Polars' maximum length reached. Consider compiling with 'bigidx' feature.
+  Polars       FAIL: polars join: task 23060 panicked with message "Polars' maximum length reached. Consider compiling with 'bigidx' feature."
+
+--- Q06 ---
+  ematix-flow    75.38 ms ±  3.58  (1 rows)
+  DuckDB         70.44 ms ±  1.36  (1 rows)
+  Polars         59.99 ms ±  4.89  (1 rows)
+
+--- Q07 ---
+  ematix-flow   159.04 ms ±  5.83  (4 rows)
+  DuckDB        144.06 ms ±  5.96  (4 rows)
+  Polars       1371.31 ms ± 53.88  (4 rows)
+
+--- Q08 ---
+  ematix-flow   201.08 ms ± 13.02  (2 rows)
+  DuckDB        181.79 ms ±  3.18  (2 rows)
+  Polars       1314.79 ms ± 37.53  (2 rows)
+
+--- Q09 ---
+  ematix-flow   353.78 ms ± 27.05  (175 rows)
+  DuckDB        368.02 ms ± 13.67  (175 rows)
+  Polars        491.43 ms ± 18.75  (175 rows)
+
+--- Q10 ---
+  ematix-flow   300.43 ms ±  8.98  (381105 rows)
+  DuckDB        451.05 ms ± 11.10  (381105 rows)
+  Polars       4627.00 ms ± 1454.30  (381105 rows)
+
+--- Q11 ---
+  ematix-flow    13.53 ms ±  9.52  (0 rows)
+  DuckDB         28.53 ms ±  1.96  (0 rows)
+  Polars         41.66 ms ± 10.13  (0 rows)
+
+--- Q12 ---
+  ematix-flow   127.32 ms ±  7.22  (2 rows)
+  DuckDB        129.72 ms ±  4.68  (2 rows)
+  Polars        143.16 ms ±  8.49  (2 rows)
+
+--- Q13 ---
+  ematix-flow   150.86 ms ± 10.93  (46 rows)
+  DuckDB        330.08 ms ± 12.20  (46 rows)
+  Polars        433.27 ms ± 17.92  (46 rows)
+
+--- Q14 ---
+  ematix-flow   107.74 ms ±  6.76  (1 rows)
+  DuckDB        165.27 ms ±  5.41  (1 rows)
+  Polars        106.92 ms ±  5.90  (1 rows)
+
+--- Q15 ---
+  ematix-flow   173.68 ms ± 58.27  (1 rows)
+  DuckDB        259.78 ms ± 46.27  (1 rows)
+  Polars        227.48 ms ± 97.25  (1 rows)
+
+--- Q16 ---
+  ematix-flow    75.84 ms ±  6.89  (27840 rows)
+  DuckDB         74.35 ms ±  4.79  (27840 rows)
+  Polars        190.91 ms ± 28.42  (27840 rows)
+
+--- Q17 ---
+  ematix-flow   243.73 ms ± 13.24  (1 rows)
+  DuckDB        210.39 ms ± 13.92  (1 rows)
+  Polars        582.62 ms ± 24.03  (1 rows)
+
+--- Q18 ---
+  ematix-flow   346.06 ms ± 14.49  (624 rows)
+  DuckDB        287.95 ms ±  9.69  (624 rows)
+  Polars        742.70 ms ± 150.83  (624 rows)
+
+--- Q19 ---
+  ematix-flow   179.51 ms ± 12.11  (1 rows)
+  DuckDB        222.91 ms ±  8.22  (1 rows)
+  Polars       1434.94 ms ± 42.47  (1 rows)
+
+--- Q20 ---
+  ematix-flow   165.87 ms ± 34.17  (1804 rows)
+  DuckDB        158.18 ms ±  5.04  (1804 rows)
+  Polars        283.30 ms ± 12.25  (1804 rows)
+
+--- Q21 ---
+  ematix-flow   389.47 ms ± 12.73  (4009 rows)
+  DuckDB        453.50 ms ± 14.39  (4009 rows)
+  Polars       35655.73 ms ± 3945.99  (4009 rows)
+
+--- Q22 ---
+  ematix-flow    31.25 ms ± 39.23  (7 rows)
+  DuckDB        129.05 ms ±  2.41  (7 rows)
+  Polars        106.89 ms ±  6.01  (7 rows)
+
+wrote /Users/ryanevans/RustroverProjects/ematix-flow/BENCHMARKS.md

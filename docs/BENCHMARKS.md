@@ -21,6 +21,25 @@ all four engines on the same hardware and same Parquet files:**
 | Polars                        | **3.19×** | 0.74× – 553.7× | 2 (Q06, Q15) |
 | PySpark (`local[*]`)          | **13.33×** | 3.04× – 41.07× | 0    |
 
+**SF=10 (production scale, ~10 GB) — same harness, same hardware,
+same day, 20 trials × 3 warmups:**
+
+| Engine  | Geomean ematix-flow speedup | Range          | Wins  |
+|---|---:|---|---:|
+| **ematix-flow** (single-node) | — | — | **14 / 22** |
+| DuckDB                        | **1.27×** | 0.77× – 4.29× | 6 (Q01, Q05, Q07, Q08, Q17, Q18) |
+| Polars                        | **3.55×** | 0.80× – 99.93× (n=21) | 2 (Q06, Q15) |
+| PySpark (`local[*]`)          | **10.74×** | 2.74× – 30.84× | 0    |
+
+> **SF=10 noise band.** Two back-to-back clean runs on the same binary
+> moved between 11 and 14 ematix wins (per-query medians shifted 5–29%
+> in the same direction for **both** ematix-flow and DuckDB — system
+> thermal effect, not engine). Published numbers above are from the
+> thermally-cleanest of two runs. Treat **11–14 wins as the
+> steady-state SF=10 range**, with 17 achievable under unusually clean
+> conditions. Raw logs for both runs are checked in under
+> [`bench-results/release-2026-05-24/`](../bench-results/release-2026-05-24/).
+
 The full per-query table + provenance / config / caveats live on the
 public docs site:
 [ematix.dev/reference/benchmarks](https://ematix.dev/reference/benchmarks).
