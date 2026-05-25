@@ -116,7 +116,7 @@ impl OptimizerRule for SyntheticLeftSemiRule {
         plan: LogicalPlan,
         _config: &dyn OptimizerConfig,
     ) -> DfResult<Transformed<LogicalPlan>> {
-        plan.transform_up(|node| try_emit_semi(node))
+        plan.transform_up(try_emit_semi)
     }
 }
 

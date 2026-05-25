@@ -2147,6 +2147,7 @@ impl ExecutionPlan for EmatixFastParquetExec {
 /// execute() body can call this from inside its lazy
 /// `stream::once(async)` wrapper, where we've already peeked the
 /// runtime sideband and resolved the final BridgeFilter.
+#[allow(clippy::too_many_arguments)]
 fn build_partition_stream_dispatch(
     path: String,
     schema: SchemaRef,

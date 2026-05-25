@@ -27,7 +27,7 @@
 //!   rejected (returns false) — TPC-H never uses that value.
 //! - Hash: splitmix-style multiply-shift (`v.wrapping_mul(0x9e37...)
 //!   >> 32`) — same hash family as the bloom, deterministic, no
-//!   external dep.
+//!   > > external dep.
 //! - Load factor cap: 50% (grow when `len * 2 >= cap`). Higher load
 //!   pushes probe lengths up; at small N (a few thousand entries
 //!   for the L9 use case) the cap headroom is cheap.

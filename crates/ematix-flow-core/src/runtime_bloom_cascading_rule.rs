@@ -135,6 +135,7 @@ impl PhysicalOptimizerRule for EnableCascadingBloomRule {
             let probe = hj.right().clone();
 
             // Find an i64 equi-key with a matching primary scan.
+            #[allow(clippy::type_complexity)]
             let mut primary: Option<(usize, usize, Arc<dyn ExecutionPlan>, Arc<EmatixFastParquetExec>, String)> = None;
             for (left_expr, right_expr) in hj.on().iter() {
                 let Some(lcol) = left_expr.as_any().downcast_ref::<Column>() else {
@@ -347,7 +348,7 @@ fn build_subtree_has_filter(plan: &Arc<dyn ExecutionPlan>) -> bool {
     if plan.as_any().downcast_ref::<FilterExec>().is_some() {
         return true;
     }
-    plan.children().iter().any(|c| build_subtree_has_filter(*c))
+    plan.children().iter().any(|c| build_subtree_has_filter(c))
 }
 
 fn estimate_build_rows(plan: &dyn ExecutionPlan) -> Option<usize> {
@@ -577,7 +578,7 @@ mod tests {
         let suppkeys: Vec<i64> = (0..50i64).collect();
         write_table_to_path(
             &fk,
-            &[("fk_suppkey", ColumnData::I64(&vec![0, 5]))],
+            &[("fk_suppkey", ColumnData::I64(&[0, 5]))],
             CompressionCodec::Uncompressed,
         )
         .unwrap();

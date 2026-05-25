@@ -60,6 +60,7 @@ async fn run_q07(
     builder = builder.with_physical_optimizer_rule(Arc::new(EnableRuntimeBloomSidebandRule {
         min_probe_to_build_ratio: ratio,
         allow_inner_join: allow_inner,
+        require_filtered_build: false,
     }));
     let state = builder.build();
     let ctx = SessionContext::new_with_state(state);

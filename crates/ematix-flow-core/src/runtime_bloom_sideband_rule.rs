@@ -182,6 +182,7 @@ impl PhysicalOptimizerRule for EnableRuntimeBloomSidebandRule {
             // EmatixFastParquetExec carrying that column. If none
             // found, this join contributes no sideband — leave it
             // alone.
+            #[allow(clippy::type_complexity)]
             let mut matched: Option<(
                 usize,
                 usize,
@@ -476,7 +477,7 @@ fn build_subtree_has_filter(plan: &Arc<dyn ExecutionPlan>) -> bool {
     if plan.as_any().downcast_ref::<FilterExec>().is_some() {
         return true;
     }
-    plan.children().iter().any(|c| build_subtree_has_filter(*c))
+    plan.children().iter().any(|c| build_subtree_has_filter(c))
 }
 
 /// Σ.Q.L9 selectivity gate — best-effort row-count estimate for the

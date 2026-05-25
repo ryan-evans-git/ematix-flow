@@ -106,7 +106,7 @@ impl OptimizerRule for PushDownLeftSemiRule {
         // Walk every node in the tree. transform_up handles recursion,
         // mutating bottom-up; each visit can return Transformed::yes to
         // replace the current node.
-        plan.transform_up(|node| try_push_down(node))
+        plan.transform_up(try_push_down)
     }
 }
 
@@ -239,6 +239,7 @@ enum PushResult {
 /// Walk `plan` looking for the `TableScan(target)` and replace it with
 /// `LeftSemi(TableScan(target), right, on)`. Recurses through joins
 /// and other 1-or-2-child plan nodes that preserve column identity.
+#[allow(clippy::too_many_arguments)]
 fn push_through_subtree(
     plan: LogicalPlan,
     target: &TableQualifier,

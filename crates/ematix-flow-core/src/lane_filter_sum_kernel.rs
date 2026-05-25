@@ -44,7 +44,7 @@
 //! variants (Q01/Q19 family). A `macro_rules!` DSL can reduce the
 //! per-shape boilerplate once 3+ kernels exist.
 
-use crate::fused_jit::{AggExpr, Clause, ClauseOp, ColumnTy, FusedFilterAggSpec};
+use crate::fused_jit::{AggExpr, ClauseOp, ColumnTy, FusedFilterAggSpec};
 
 /// A specialised kernel ready to run on Arrow batches. The
 /// `process` function pointer dispatches to the shape-specific

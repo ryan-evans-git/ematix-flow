@@ -36,6 +36,7 @@ fn make_q6_fixture() -> (Vec<i32>, Vec<f64>, Vec<f64>, Vec<f64>) {
     (sd, d, q, e)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn scalar_reference(
     sd: &[i32],
     d: &[f64],

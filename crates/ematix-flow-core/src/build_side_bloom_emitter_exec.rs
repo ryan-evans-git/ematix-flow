@@ -39,7 +39,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use arrow_array::Array;
-use datafusion::arrow::array::{Int64Array, RecordBatch};
+use datafusion::arrow::array::Int64Array;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::common::DataFusionError;
 use datafusion::common::Result as DfResult;
@@ -51,7 +51,6 @@ use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
     SendableRecordBatchStream,
 };
-use futures_util::TryStreamExt;
 use futures_util::stream::StreamExt;
 
 use crate::bloom::BloomFilter;
@@ -109,6 +108,7 @@ pub struct BuildSideBloomEmitterExec {
     /// time the global (min, max) is the union of per-partition
     /// (min, max) pairs, and is emitted as an `I64Range` predicate
     /// alongside the bloom/set.
+    #[allow(clippy::type_complexity)]
     local_ranges: Arc<Mutex<Vec<Option<(i64, i64)>>>>,
     completed: Arc<AtomicUsize>,
     n_partitions: usize,
@@ -388,7 +388,7 @@ impl ExecutionPlan for BuildSideBloomEmitterExec {
             ),
             move |(
                 mut inner,
-                mut finalized,
+                finalized,
                 local_bloom,
                 local_set,
                 local_range,
@@ -424,7 +424,6 @@ impl ExecutionPlan for BuildSideBloomEmitterExec {
                     )),
                     None => {
                         if !finalized {
-                            finalized = true;
                             // Extract local bloom + set + range
                             // (replace with tiny placeholders so the
                             // Arc<Mutex> stays valid for any stray
@@ -454,13 +453,11 @@ impl ExecutionPlan for BuildSideBloomEmitterExec {
                                 // union across all partitions that saw
                                 // any keys.
                                 let mut global_range: Option<(i64, i64)> = None;
-                                for r in &ranges {
-                                    if let Some((mn, mx)) = r {
-                                        global_range = Some(match global_range {
-                                            None => (*mn, *mx),
-                                            Some((gmn, gmx)) => (gmn.min(*mn), gmx.max(*mx)),
-                                        });
-                                    }
+                                for (mn, mx) in ranges.iter().flatten() {
+                                    global_range = Some(match global_range {
+                                        None => (*mn, *mx),
+                                        Some((gmn, gmx)) => (gmn.min(*mn), gmx.max(*mx)),
+                                    });
                                 }
                                 let range_pred =
                                     global_range.map(|(lo, hi)| ColumnPredicate::I64Range {
@@ -487,13 +484,11 @@ impl ExecutionPlan for BuildSideBloomEmitterExec {
                                 let shared_set: Option<Arc<I64Set>> = if all_some {
                                     let mut merged = I64Set::with_keys(set_threshold);
                                     let mut overflow = false;
-                                    for s in &sets {
-                                        if let Some(s) = s {
-                                            merged.extend(s);
-                                            if merged.len() > set_threshold {
-                                                overflow = true;
-                                                break;
-                                            }
+                                    for s in sets.iter().flatten() {
+                                        merged.extend(s);
+                                        if merged.len() > set_threshold {
+                                            overflow = true;
+                                            break;
                                         }
                                     }
                                     if overflow {
@@ -601,10 +596,11 @@ impl ExecutionPlan for BuildSideBloomEmitterExec {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_array::Int64Array;
+    use arrow_array::{Int64Array, RecordBatch};
     use arrow_schema::{DataType, Field, Schema};
     use datafusion::datasource::MemTable;
     use datafusion::prelude::SessionContext;
+    use futures_util::TryStreamExt;
 
     fn make_batch(keys: Vec<i64>) -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, false)]));
@@ -643,7 +639,6 @@ mod tests {
         .unwrap();
 
         // Execute every partition to drain.
-        use datafusion::physical_plan::ExecutionPlanProperties;
         let n = wrapper.properties().output_partitioning().partition_count();
         for p in 0..n {
             let mut s = wrapper
@@ -700,7 +695,6 @@ mod tests {
             n_keys as usize,
         )
         .unwrap();
-        use datafusion::physical_plan::ExecutionPlanProperties;
         let n = wrapper.properties().output_partitioning().partition_count();
         for p in 0..n {
             let mut s = wrapper
@@ -740,7 +734,6 @@ mod tests {
         let wrapper =
             BuildSideBloomEmitterExec::try_new(plan, 0, 0, BridgeFilterSideband::new(), 10)
                 .unwrap();
-        use datafusion::physical_plan::ExecutionPlanProperties;
         let n = wrapper.properties().output_partitioning().partition_count();
         let mut all_keys: Vec<i64> = Vec::new();
         for p in 0..n {
@@ -793,7 +786,6 @@ mod tests {
         )
         .unwrap();
 
-        use datafusion::physical_plan::ExecutionPlanProperties;
         let n = wrapper.properties().output_partitioning().partition_count();
         for p in 0..n {
             let mut s = wrapper
@@ -865,7 +857,6 @@ mod tests {
             n_keys as usize,
         )
         .unwrap();
-        use datafusion::physical_plan::ExecutionPlanProperties;
         let n = wrapper.properties().output_partitioning().partition_count();
         for p in 0..n {
             let mut s = wrapper

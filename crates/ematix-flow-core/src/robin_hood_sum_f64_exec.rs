@@ -152,7 +152,7 @@ impl RobinHoodSumF64Exec {
         // ~768 MB per partition worst case.
         const MIN_INIT_CAP: usize = 65_536;
         const MAX_INIT_CAP: usize = 32 * 1024 * 1024;
-        let init_cap = raw_cap.max(MIN_INIT_CAP).min(MAX_INIT_CAP);
+        let init_cap = raw_cap.clamp(MIN_INIT_CAP, MAX_INIT_CAP);
         Ok(Self {
             input,
             group_col_idx,

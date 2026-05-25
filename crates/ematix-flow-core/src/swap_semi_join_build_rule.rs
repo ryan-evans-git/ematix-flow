@@ -204,7 +204,7 @@ impl PhysicalOptimizerRule for SwapSemiJoinBuildSideRule {
                 }
             }
 
-            let swapped = hj.swap_inputs(hj.partition_mode().clone())?;
+            let swapped = hj.swap_inputs(*hj.partition_mode())?;
             Ok(Transformed::yes(swapped))
         })
         .data()

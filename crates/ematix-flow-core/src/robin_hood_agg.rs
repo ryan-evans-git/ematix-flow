@@ -1326,7 +1326,7 @@ impl RobinHoodSumF64RadixAgg {
         let shift: u32 = if self.radix_bits == 0 {
             0
         } else {
-            (usize::BITS as u32) - self.radix_bits as u32
+            usize::BITS - self.radix_bits as u32
         };
 
         let mut off = 0;
@@ -2381,6 +2381,7 @@ impl TaggedSumF64Agg {
 }
 
 #[cfg(test)]
+#[allow(clippy::type_complexity, clippy::approx_constant)]
 mod tests {
     use super::*;
 

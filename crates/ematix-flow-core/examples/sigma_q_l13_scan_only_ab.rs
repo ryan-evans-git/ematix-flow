@@ -96,6 +96,7 @@ fn median(xs: &mut [f64]) -> f64 {
     xs[xs.len() / 2]
 }
 
+#[allow(dead_code)]
 fn stddev(xs: &[f64], mean: f64) -> f64 {
     let var: f64 = xs.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / xs.len() as f64;
     var.sqrt()
