@@ -1565,14 +1565,21 @@ impl TableProvider for EmatixFastParquetTableProvider {
     /// so logical optimizer rules can distinguish dim vs fact tables.
     /// `num_rows` is read from parquet `FileMetadata::num_rows` at
     /// registration time, so it's exact for unfiltered scans.
+    ///
+    /// Σ.T Phase 1 (2026-05-25): also surface the typed per-column
+    /// min/max/null_count that `try_new` already cached on
+    /// `self.column_stats` (via `aggregate_column_statistics`). Without
+    /// this the logical join planner can only distinguish tables by
+    /// row count — predicate selectivity stays invisible, so
+    /// region/nation filters never propagate to "join smaller pool
+    /// first" decisions. The Exec's `partition_statistics` has
+    /// returned these all along; this just plumbs the same data to
+    /// the TableProvider surface used by logical planning.
     fn statistics(&self) -> Option<datafusion::common::Statistics> {
         Some(datafusion::common::Statistics {
             num_rows: datafusion::common::stats::Precision::Exact(self.num_rows),
             total_byte_size: datafusion::common::stats::Precision::Absent,
-            column_statistics: vec![
-                datafusion::common::ColumnStatistics::new_unknown();
-                self.schema.fields().len()
-            ],
+            column_statistics: (*self.column_stats).clone(),
         })
     }
 
@@ -3648,6 +3655,116 @@ mod tests {
         assert!(
             fp_rate < 0.05,
             "bloom false-positive rate {fp_rate:.4} exceeds 5%"
+        );
+    }
+
+    /// Σ.T Phase 1 (2026-05-25): `TableProvider::statistics()` must
+    /// surface per-column min/max/null_count derived from parquet
+    /// row-group metadata. Without this the logical planner has only
+    /// `num_rows` to work with, so it can't reorder joins by
+    /// predicate selectivity.
+    ///
+    /// The infra (`aggregate_column_statistics` + cached `column_stats`)
+    /// is already in place — used by `partition_statistics` on the
+    /// Exec — but the TableProvider's own `statistics()` impl ignored
+    /// it and returned `new_unknown` for every column. This test
+    /// guards the wire-up.
+    #[tokio::test]
+    async fn table_provider_statistics_exposes_typed_column_stats() {
+        use datafusion::common::stats::Precision;
+        use datafusion::common::ScalarValue;
+        use datafusion::parquet::basic::{Compression, Repetition, Type as PhysicalType};
+        use datafusion::parquet::column::writer::ColumnWriter;
+        use datafusion::parquet::file::properties::WriterProperties;
+        use datafusion::parquet::file::writer::SerializedFileWriter;
+        use datafusion::parquet::schema::types::Type as PType;
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+
+        let pschema = Arc::new(
+            PType::group_type_builder("schema")
+                .with_fields(vec![
+                    Arc::new(
+                        PType::primitive_type_builder("a", PhysicalType::INT32)
+                            .with_repetition(Repetition::REQUIRED)
+                            .build()
+                            .unwrap(),
+                    ),
+                    Arc::new(
+                        PType::primitive_type_builder("b", PhysicalType::INT64)
+                            .with_repetition(Repetition::REQUIRED)
+                            .build()
+                            .unwrap(),
+                    ),
+                ])
+                .build()
+                .unwrap(),
+        );
+        let props = Arc::new(
+            WriterProperties::builder()
+                .set_compression(Compression::SNAPPY)
+                .build(),
+        );
+        let file = File::create(&path).unwrap();
+        let mut writer = SerializedFileWriter::new(file, pschema, props).unwrap();
+        let mut rg = writer.next_row_group().unwrap();
+        let a: Vec<i32> = (10..1010).collect();
+        let mut col = rg.next_column().unwrap().unwrap();
+        if let ColumnWriter::Int32ColumnWriter(t) = col.untyped() {
+            t.write_batch(&a, None, None).unwrap();
+        }
+        col.close().unwrap();
+        let b: Vec<i64> = (0..1000i64).map(|i| i * 100).collect();
+        let mut col = rg.next_column().unwrap().unwrap();
+        if let ColumnWriter::Int64ColumnWriter(t) = col.untyped() {
+            t.write_batch(&b, None, None).unwrap();
+        }
+        col.close().unwrap();
+        rg.close().unwrap();
+        writer.close().unwrap();
+
+        let provider =
+            EmatixFastParquetTableProvider::try_new(path.to_string_lossy().to_string()).unwrap();
+        let stats = provider.statistics().expect("provider must publish stats");
+        assert_eq!(stats.num_rows, Precision::Exact(1000));
+        assert_eq!(
+            stats.column_statistics.len(),
+            2,
+            "one ColumnStatistics per schema field"
+        );
+
+        // Column `a` — i32 in [10, 1009], no nulls
+        let cs_a = &stats.column_statistics[0];
+        assert_eq!(
+            cs_a.null_count,
+            Precision::Exact(0),
+            "column a: null_count should be Exact(0), got {:?}",
+            cs_a.null_count
+        );
+        assert_eq!(
+            cs_a.min_value,
+            Precision::Exact(ScalarValue::Int32(Some(10))),
+            "column a: min_value should be Exact(10), got {:?}",
+            cs_a.min_value
+        );
+        assert_eq!(
+            cs_a.max_value,
+            Precision::Exact(ScalarValue::Int32(Some(1009))),
+            "column a: max_value should be Exact(1009), got {:?}",
+            cs_a.max_value
+        );
+
+        // Column `b` — i64 in [0, 99_900]
+        let cs_b = &stats.column_statistics[1];
+        assert_eq!(cs_b.null_count, Precision::Exact(0));
+        assert_eq!(
+            cs_b.min_value,
+            Precision::Exact(ScalarValue::Int64(Some(0)))
+        );
+        assert_eq!(
+            cs_b.max_value,
+            Precision::Exact(ScalarValue::Int64(Some(99_900)))
         );
     }
 }
