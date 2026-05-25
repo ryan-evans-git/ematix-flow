@@ -295,7 +295,11 @@ mod tests {
         }
         assert_eq!(s.len(), n);
         for i in 0..n as i64 {
-            assert!(s.contains(i * 37 + 1), "missing key after grow: {}", i * 37 + 1);
+            assert!(
+                s.contains(i * 37 + 1),
+                "missing key after grow: {}",
+                i * 37 + 1
+            );
         }
         assert!(!s.contains(0));
         assert!(!s.contains(2));

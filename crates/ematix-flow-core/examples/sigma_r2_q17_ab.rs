@@ -76,9 +76,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or(5);
     let q17 = std::fs::read_to_string("examples/tpch/queries/q17.sql")?;
 
-    println!(
-        "Σ.R.2.d gate — Q17 SF=10 A/B, {trials} trials × 2 warmup, data={dir}\n"
-    );
+    println!("Σ.R.2.d gate — Q17 SF=10 A/B, {trials} trials × 2 warmup, data={dir}\n");
 
     // OFF — stock DataFusion (no rule installed).
     let off_state = SessionStateBuilder::new()
@@ -121,13 +119,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (off_med, off_sd, off_samples) = time_query(&off_ctx, &q17, trials).await;
     println!(
         "Q17 OFF (stock):   {off_med:7.2} ms ± {off_sd:.2}   samples={:?}",
-        off_samples.iter().map(|x| format!("{x:.1}")).collect::<Vec<_>>()
+        off_samples
+            .iter()
+            .map(|x| format!("{x:.1}"))
+            .collect::<Vec<_>>()
     );
 
     let (on_med, on_sd, on_samples) = time_query(&on_ctx, &q17, trials).await;
     println!(
         "Q17 ON  (rh-avg):  {on_med:7.2} ms ± {on_sd:.2}   samples={:?}",
-        on_samples.iter().map(|x| format!("{x:.1}")).collect::<Vec<_>>()
+        on_samples
+            .iter()
+            .map(|x| format!("{x:.1}"))
+            .collect::<Vec<_>>()
     );
 
     let (off2_med, off2_sd, _) = time_query(&off_ctx, &q17, trials).await;

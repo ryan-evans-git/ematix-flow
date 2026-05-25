@@ -31,11 +31,11 @@ use std::sync::Arc;
 
 use datafusion::arrow::array::{Float64Array, Int64Array, RecordBatch};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use datafusion::common::DataFusionError;
 use datafusion::common::Result as DfResult;
 use datafusion::common::config::ConfigOptions;
 use datafusion::common::stats::Precision;
 use datafusion::common::tree_node::{Transformed, TreeNode};
-use datafusion::common::{DataFusionError};
 use datafusion::execution::TaskContext;
 use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::physical_expr::expressions::Column;
@@ -457,7 +457,9 @@ fn match_final(agg: &AggregateExec) -> Option<Matched> {
     })
 }
 
-fn find_robin_hood_sum_f64_partial(plan: &Arc<dyn ExecutionPlan>) -> Option<Arc<dyn ExecutionPlan>> {
+fn find_robin_hood_sum_f64_partial(
+    plan: &Arc<dyn ExecutionPlan>,
+) -> Option<Arc<dyn ExecutionPlan>> {
     let mut cur = plan.clone();
     loop {
         if let Some(rh) = cur.as_any().downcast_ref::<RobinHoodSumF64Exec>() {
@@ -503,7 +505,10 @@ mod tests {
         let make_batch = move |ks: Vec<i64>, vs: Vec<f64>| {
             RecordBatch::try_new(
                 schema_clone.clone(),
-                vec![Arc::new(Int64Array::from(ks)), Arc::new(Float64Array::from(vs))],
+                vec![
+                    Arc::new(Int64Array::from(ks)),
+                    Arc::new(Float64Array::from(vs)),
+                ],
             )
             .unwrap()
         };
@@ -579,7 +584,10 @@ mod tests {
     async fn rule_no_op_on_count_agg() {
         let ctx = make_ctx_with_rule();
         register_q18_shape_table(&ctx, "t");
-        let df = ctx.sql("SELECT k, COUNT(*) FROM t GROUP BY k").await.unwrap();
+        let df = ctx
+            .sql("SELECT k, COUNT(*) FROM t GROUP BY k")
+            .await
+            .unwrap();
         let plan = df.create_physical_plan().await.unwrap();
         let s = format!("{plan:?}");
         assert!(

@@ -34,8 +34,8 @@ const TRIALS: usize = 5;
 const WARMUPS: usize = 2;
 
 async fn run_q07(collect_stats: bool) -> Result<(f64, f64, f64), Box<dyn std::error::Error>> {
-    let dir = std::env::var("TPCH_DATA_DIR")
-        .unwrap_or_else(|_| "examples/tpch/data/sf10".to_string());
+    let dir =
+        std::env::var("TPCH_DATA_DIR").unwrap_or_else(|_| "examples/tpch/data/sf10".to_string());
     let sql = std::fs::read_to_string("examples/tpch/queries/q07.sql")?;
 
     let mut cfg = SessionConfig::new().with_target_partitions(14);
@@ -50,8 +50,8 @@ async fn run_q07(collect_stats: bool) -> Result<(f64, f64, f64), Box<dyn std::er
     builder = builder.with_optimizer_rule(Arc::new(PushDownLeftSemiRule));
     builder = builder.with_physical_optimizer_rule(Arc::new(SwapSemiJoinBuildSideRule));
     builder = builder.with_physical_optimizer_rule(Arc::new(EnableRobinHoodSumF64Rule));
-    builder = builder
-        .with_physical_optimizer_rule(Arc::new(EnableRuntimeBloomSidebandRule::default()));
+    builder =
+        builder.with_physical_optimizer_rule(Arc::new(EnableRuntimeBloomSidebandRule::default()));
     let state = builder.build();
     let ctx = SessionContext::new_with_state(state);
     for t in TPCH_TABLES {
@@ -88,9 +88,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("({TRIALS} trials × {WARMUPS} warmups)\n");
 
     let (med_off, min_off, max_off) = run_q07(false).await?;
-    println!("OFF (default): p50 = {:.2} ms (min {:.2}, max {:.2})", med_off, min_off, max_off);
+    println!(
+        "OFF (default): p50 = {:.2} ms (min {:.2}, max {:.2})",
+        med_off, min_off, max_off
+    );
     let (med_on, min_on, max_on) = run_q07(true).await?;
-    println!("ON:            p50 = {:.2} ms (min {:.2}, max {:.2})", med_on, min_on, max_on);
+    println!(
+        "ON:            p50 = {:.2} ms (min {:.2}, max {:.2})",
+        med_on, min_on, max_on
+    );
 
     let delta_pct = (med_off - med_on) / med_off * 100.0;
     println!(

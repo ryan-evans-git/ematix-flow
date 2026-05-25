@@ -20,8 +20,8 @@ const TPCH_TABLES: &[&str] = &[
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let dir = std::env::var("TPCH_DATA_DIR")
-        .unwrap_or_else(|_| "examples/tpch/data/sf10".to_string());
+    let dir =
+        std::env::var("TPCH_DATA_DIR").unwrap_or_else(|_| "examples/tpch/data/sf10".to_string());
     let sql = std::fs::read_to_string("examples/tpch/queries/q07.sql")?;
 
     println!("===== DuckDB Q07 SF=10 result =====");
@@ -59,9 +59,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut builder = SessionStateBuilder::new()
             .with_config(SessionConfig::new().with_target_partitions(14))
             .with_default_features()
-            .with_physical_optimizer_rule(Arc::new(
-                DedupeAggregateForFloatDeterminism::default(),
-            ));
+            .with_physical_optimizer_rule(Arc::new(DedupeAggregateForFloatDeterminism::default()));
         builder = builder.with_physical_optimizer_rule(Arc::new(EnableRuntimeBloomSidebandRule {
             min_probe_to_build_ratio: 64,
             allow_inner_join: allow_inner,

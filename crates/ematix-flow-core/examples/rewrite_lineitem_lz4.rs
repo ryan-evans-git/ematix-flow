@@ -16,8 +16,8 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let dir = std::env::var("TPCH_DATA_DIR")
-        .unwrap_or_else(|_| "examples/tpch/data/sf10".to_string());
+    let dir =
+        std::env::var("TPCH_DATA_DIR").unwrap_or_else(|_| "examples/tpch/data/sf10".to_string());
     let src = PathBuf::from(&dir).join("lineitem.parquet");
     let dst = PathBuf::from(&dir).join("lineitem_lz4.parquet");
 
@@ -63,11 +63,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let src_sz = std::fs::metadata(&src)?.len();
     let dst_sz = std::fs::metadata(&dst)?.len();
     println!();
-    println!(
-        "src size: {} MB  ({} bytes)",
-        src_sz / 1_048_576,
-        src_sz
-    );
+    println!("src size: {} MB  ({} bytes)", src_sz / 1_048_576, src_sz);
     println!(
         "dst size: {} MB  ({} bytes)  Δ = {:+.1}%",
         dst_sz / 1_048_576,

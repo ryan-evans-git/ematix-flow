@@ -29,7 +29,8 @@ const WARMUPS: usize = 3;
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let dir = std::env::var("TPCH_DATA_DIR").unwrap_or_else(|_| "examples/tpch/data/sf10".to_string());
+    let dir =
+        std::env::var("TPCH_DATA_DIR").unwrap_or_else(|_| "examples/tpch/data/sf10".to_string());
     let sql = std::fs::read_to_string("examples/tpch/queries/q07.sql")?;
 
     let mut builder = SessionStateBuilder::new()
@@ -42,8 +43,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     builder = builder.with_optimizer_rule(Arc::new(PushDownLeftSemiRule));
     builder = builder.with_physical_optimizer_rule(Arc::new(SwapSemiJoinBuildSideRule));
     builder = builder.with_physical_optimizer_rule(Arc::new(EnableRobinHoodSumF64Rule));
-    builder = builder
-        .with_physical_optimizer_rule(Arc::new(EnableRuntimeBloomSidebandRule::default()));
+    builder =
+        builder.with_physical_optimizer_rule(Arc::new(EnableRuntimeBloomSidebandRule::default()));
     let state = builder.build();
     let ctx = SessionContext::new_with_state(state);
 

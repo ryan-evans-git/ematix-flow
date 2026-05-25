@@ -48,7 +48,7 @@ use datafusion::physical_plan::joins::HashJoinExec;
 use crate::bridge_filter_sideband::BridgeFilterSideband;
 use crate::build_side_bloom_emitter_exec::BuildSideBloomEmitterExec;
 use crate::ematix_fast_parquet::EmatixFastParquetExec;
-use crate::fk_chain::{fk_chain_stem, find_scans_by_fk_chain};
+use crate::fk_chain::{find_scans_by_fk_chain, fk_chain_stem};
 
 /// Install the cascading L9 rule. Mutually exclusive with the
 /// non-cascading L9 base rule — install one or the other.
@@ -392,11 +392,8 @@ mod tests {
     use ematix_parquet_format::types::CompressionCodec;
 
     fn tmp_parquet(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "cascade_rule_test_{}_{}",
-            std::process::id(),
-            name
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("cascade_rule_test_{}_{}", std::process::id(), name));
         let _ = std::fs::create_dir_all(&dir);
         dir.join(format!("{name}.parquet"))
     }
@@ -455,9 +452,7 @@ mod tests {
         let ctx = SessionContext::new_with_state(state);
         ctx.register_table(
             "fk",
-            Arc::new(
-                EmatixFastParquetTableProvider::try_new(fk.to_string_lossy()).unwrap(),
-            ),
+            Arc::new(EmatixFastParquetTableProvider::try_new(fk.to_string_lossy()).unwrap()),
         )
         .unwrap();
         ctx.register_table(
@@ -493,10 +488,7 @@ mod tests {
         // 400 per shared key. So 3 × 400 = 1200 final rows.
         let batches = df.collect().await.unwrap();
         let row_count: usize = batches.iter().map(|b| b.num_rows()).sum();
-        assert_eq!(
-            row_count, 1200,
-            "cascade must not change query semantics"
-        );
+        assert_eq!(row_count, 1200, "cascade must not change query semantics");
     }
 
     /// Σ.S.B — when no extra scan shares the FK stem, the rule
@@ -544,21 +536,16 @@ mod tests {
         let ctx = SessionContext::new_with_state(state);
         ctx.register_table(
             "small",
-            Arc::new(
-                EmatixFastParquetTableProvider::try_new(sm.to_string_lossy()).unwrap(),
-            ),
+            Arc::new(EmatixFastParquetTableProvider::try_new(sm.to_string_lossy()).unwrap()),
         )
         .unwrap();
         ctx.register_table(
             "big",
-            Arc::new(
-                EmatixFastParquetTableProvider::try_new(bg.to_string_lossy()).unwrap(),
-            ),
+            Arc::new(EmatixFastParquetTableProvider::try_new(bg.to_string_lossy()).unwrap()),
         )
         .unwrap();
 
-        let sql =
-            "SELECT bg_orderkey FROM small JOIN big ON sm_custkey = bg_custkey";
+        let sql = "SELECT bg_orderkey FROM small JOIN big ON sm_custkey = bg_custkey";
         let df = ctx.sql(sql).await.unwrap();
         let plan = df.clone().create_physical_plan().await.unwrap();
         let plan_str = format!("{plan:?}");
@@ -620,9 +607,7 @@ mod tests {
         let ctx = SessionContext::new_with_state(state);
         ctx.register_table(
             "fk",
-            Arc::new(
-                EmatixFastParquetTableProvider::try_new(fk.to_string_lossy()).unwrap(),
-            ),
+            Arc::new(EmatixFastParquetTableProvider::try_new(fk.to_string_lossy()).unwrap()),
         )
         .unwrap();
         ctx.register_table(
@@ -672,8 +657,8 @@ mod tests {
     /// (a + b) and the cascade correctly attaches to both.
     #[tokio::test]
     async fn cascade_skips_self_join_siblings_same_parquet_path() {
-        use datafusion::common::tree_node::TreeNode;
         use crate::build_side_bloom_emitter_exec::BuildSideBloomEmitterExec;
+        use datafusion::common::tree_node::TreeNode;
 
         let fk = tmp_parquet("fk_selfsib");
         let li = tmp_parquet("li_selfsib");
@@ -710,16 +695,12 @@ mod tests {
         let ctx = SessionContext::new_with_state(state);
         ctx.register_table(
             "fk",
-            Arc::new(
-                EmatixFastParquetTableProvider::try_new(fk.to_string_lossy()).unwrap(),
-            ),
+            Arc::new(EmatixFastParquetTableProvider::try_new(fk.to_string_lossy()).unwrap()),
         )
         .unwrap();
         ctx.register_table(
             "lineitem",
-            Arc::new(
-                EmatixFastParquetTableProvider::try_new(li.to_string_lossy()).unwrap(),
-            ),
+            Arc::new(EmatixFastParquetTableProvider::try_new(li.to_string_lossy()).unwrap()),
         )
         .unwrap();
 
@@ -740,9 +721,7 @@ mod tests {
         let mut max_extras_seen = 0usize;
         plan.clone()
             .apply(|node| {
-                if let Some(emit) =
-                    node.as_any().downcast_ref::<BuildSideBloomEmitterExec>()
-                {
+                if let Some(emit) = node.as_any().downcast_ref::<BuildSideBloomEmitterExec>() {
                     if emit.extra_targets().len() > max_extras_seen {
                         max_extras_seen = emit.extra_targets().len();
                     }

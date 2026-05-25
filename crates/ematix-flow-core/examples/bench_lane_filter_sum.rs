@@ -49,8 +49,11 @@ fn scalar_reference(
 ) -> f64 {
     let mut acc = 0.0f64;
     for i in 0..N {
-        let pass =
-            (sd[i] >= date_lo) & (sd[i] < date_hi) & (d[i] >= disc_lo) & (d[i] <= disc_hi) & (q[i] < qty_hi);
+        let pass = (sd[i] >= date_lo)
+            & (sd[i] < date_hi)
+            & (d[i] >= disc_lo)
+            & (d[i] <= disc_hi)
+            & (q[i] < qty_hi);
         let mask = if pass { 1.0 } else { 0.0 };
         acc += e[i] * d[i] * mask;
     }
@@ -82,7 +85,10 @@ fn time_loop(label: &str, mut f: impl FnMut() -> f64) -> (f64, f64) {
 
 fn main() {
     println!("Σ.U.A — lane-parallel filter-sum kernel microbench");
-    println!("N = {N}, {TRIALS} trials, target arch = {}", std::env::consts::ARCH);
+    println!(
+        "N = {N}, {TRIALS} trials, target arch = {}",
+        std::env::consts::ARCH
+    );
     println!();
 
     let (sd, d, q, e) = make_q6_fixture();

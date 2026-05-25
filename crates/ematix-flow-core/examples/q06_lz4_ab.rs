@@ -118,9 +118,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (med_dd, sd_dd, rows_dd) = {
         let conn = duckdb::Connection::open_in_memory()?;
         conn.execute_batch("PRAGMA threads=14")?;
-        let view_sql = format!(
-            "CREATE VIEW lineitem AS SELECT * FROM read_parquet('{path_str}');"
-        );
+        let view_sql = format!("CREATE VIEW lineitem AS SELECT * FROM read_parquet('{path_str}');");
         conn.execute_batch(&view_sql)?;
         let mut samples = Vec::with_capacity(trials);
         let mut last_rows = 0usize;
@@ -159,8 +157,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             use polars::sql::SQLContext;
             let mut ctx = SQLContext::new();
             let pl_path = polars::prelude::PlPath::new(&path_pl);
-            let lf =
-                LazyFrame::scan_parquet(pl_path, ScanArgsParquet::default()).unwrap();
+            let lf = LazyFrame::scan_parquet(pl_path, ScanArgsParquet::default()).unwrap();
             ctx.register("lineitem", lf);
             let mut samples = Vec::with_capacity(trials);
             let mut last_rows = 0usize;
@@ -204,7 +201,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     } else {
         println!("ematix-flow failed — DuckDB vs Polars:");
-        println!("  DuckDB/Polars ratio: {:+.1}%", (med_dd - med_pl) / med_pl * 100.0);
+        println!(
+            "  DuckDB/Polars ratio: {:+.1}%",
+            (med_dd - med_pl) / med_pl * 100.0
+        );
     }
 
     Ok(())

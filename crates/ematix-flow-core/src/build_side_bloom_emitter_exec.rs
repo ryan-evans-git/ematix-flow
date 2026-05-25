@@ -35,14 +35,14 @@
 //! and the publish is complete. No reads-before-write races.
 
 use std::any::Any;
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use arrow_array::Array;
 use datafusion::arrow::array::{Int64Array, RecordBatch};
 use datafusion::arrow::datatypes::SchemaRef;
-use datafusion::common::Result as DfResult;
 use datafusion::common::DataFusionError;
+use datafusion::common::Result as DfResult;
 use datafusion::execution::TaskContext;
 use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
@@ -170,7 +170,8 @@ impl BuildSideBloomEmitterExec {
                 "BuildSideBloomEmitterExec: key_col_idx={key_col_idx} out of bounds"
             )));
         }
-        if in_schema.field(key_col_idx).data_type() != &datafusion::arrow::datatypes::DataType::Int64
+        if in_schema.field(key_col_idx).data_type()
+            != &datafusion::arrow::datatypes::DataType::Int64
         {
             return Err(DataFusionError::Internal(format!(
                 "BuildSideBloomEmitterExec: key column must be Int64, got {:?}",
@@ -245,9 +246,7 @@ impl ExecutionPlan for BuildSideBloomEmitterExec {
         mut children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
         let new_input = children.pop().ok_or_else(|| {
-            DataFusionError::Internal(
-                "BuildSideBloomEmitterExec requires exactly 1 child".into(),
-            )
+            DataFusionError::Internal("BuildSideBloomEmitterExec requires exactly 1 child".into())
         })?;
         Ok(Arc::new(Self::try_new_with_extras(
             new_input,
@@ -301,8 +300,7 @@ impl ExecutionPlan for BuildSideBloomEmitterExec {
         let local_set_for_map = local_set_inner.clone();
         // Lever 3 — per-partition (min, max). `None` until the first
         // non-null key arrives.
-        let local_range_inner: Arc<Mutex<Option<(i64, i64)>>> =
-            Arc::new(Mutex::new(None));
+        let local_range_inner: Arc<Mutex<Option<(i64, i64)>>> = Arc::new(Mutex::new(None));
         let local_range_for_map = local_range_inner.clone();
 
         let upstream = self.input.execute(partition, context)?;
@@ -464,13 +462,12 @@ impl ExecutionPlan for BuildSideBloomEmitterExec {
                                         });
                                     }
                                 }
-                                let range_pred = global_range.map(|(lo, hi)| {
-                                    ColumnPredicate::I64Range {
+                                let range_pred =
+                                    global_range.map(|(lo, hi)| ColumnPredicate::I64Range {
                                         col_idx: target_col_idx,
                                         lo,
                                         hi,
-                                    }
-                                });
+                                    });
 
                                 // L9.HashSet — if every partition kept
                                 // its set (none overflowed) AND the
@@ -499,7 +496,11 @@ impl ExecutionPlan for BuildSideBloomEmitterExec {
                                             }
                                         }
                                     }
-                                    if overflow { None } else { Some(Arc::new(merged)) }
+                                    if overflow {
+                                        None
+                                    } else {
+                                        Some(Arc::new(merged))
+                                    }
                                 } else {
                                     None
                                 };
@@ -645,7 +646,9 @@ mod tests {
         use datafusion::physical_plan::ExecutionPlanProperties;
         let n = wrapper.properties().output_partitioning().partition_count();
         for p in 0..n {
-            let mut s = wrapper.execute(p, Arc::new(TaskContext::default())).unwrap();
+            let mut s = wrapper
+                .execute(p, Arc::new(TaskContext::default()))
+                .unwrap();
             while let Some(_batch) = s.try_next().await.unwrap() {}
         }
         let preds = sideband.peek().expect("sideband was not published to");
@@ -678,8 +681,7 @@ mod tests {
         let keys: Vec<i64> = (0..n_keys).collect();
         let ctx = SessionContext::new();
         let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, false)]));
-        let mt = MemTable::try_new(schema.clone(), vec![vec![make_batch(keys.clone())]])
-            .unwrap();
+        let mt = MemTable::try_new(schema.clone(), vec![vec![make_batch(keys.clone())]]).unwrap();
         ctx.register_table("t", Arc::new(mt)).unwrap();
         let plan = ctx
             .sql("SELECT k FROM t")
@@ -701,7 +703,9 @@ mod tests {
         use datafusion::physical_plan::ExecutionPlanProperties;
         let n = wrapper.properties().output_partitioning().partition_count();
         for p in 0..n {
-            let mut s = wrapper.execute(p, Arc::new(TaskContext::default())).unwrap();
+            let mut s = wrapper
+                .execute(p, Arc::new(TaskContext::default()))
+                .unwrap();
             while let Some(_batch) = s.try_next().await.unwrap() {}
         }
         let preds = sideband.peek().expect("sideband was not published to");
@@ -723,11 +727,8 @@ mod tests {
     async fn forwards_batches_unchanged() {
         let ctx = SessionContext::new();
         let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, false)]));
-        let mt = MemTable::try_new(
-            schema.clone(),
-            vec![vec![make_batch(vec![100, 200, 300])]],
-        )
-        .unwrap();
+        let mt =
+            MemTable::try_new(schema.clone(), vec![vec![make_batch(vec![100, 200, 300])]]).unwrap();
         ctx.register_table("t", Arc::new(mt)).unwrap();
         let plan = ctx
             .sql("SELECT k FROM t")
@@ -736,19 +737,16 @@ mod tests {
             .create_physical_plan()
             .await
             .unwrap();
-        let wrapper = BuildSideBloomEmitterExec::try_new(
-            plan,
-            0,
-            0,
-            BridgeFilterSideband::new(),
-            10,
-        )
-        .unwrap();
+        let wrapper =
+            BuildSideBloomEmitterExec::try_new(plan, 0, 0, BridgeFilterSideband::new(), 10)
+                .unwrap();
         use datafusion::physical_plan::ExecutionPlanProperties;
         let n = wrapper.properties().output_partitioning().partition_count();
         let mut all_keys: Vec<i64> = Vec::new();
         for p in 0..n {
-            let mut s = wrapper.execute(p, Arc::new(TaskContext::default())).unwrap();
+            let mut s = wrapper
+                .execute(p, Arc::new(TaskContext::default()))
+                .unwrap();
             while let Some(batch) = s.try_next().await.unwrap() {
                 let arr = batch
                     .column(0)
@@ -771,11 +769,8 @@ mod tests {
     async fn publishes_to_extras_with_per_target_col_idx() {
         let ctx = SessionContext::new();
         let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, false)]));
-        let mt = MemTable::try_new(
-            schema.clone(),
-            vec![vec![make_batch(vec![10, 20, 30])]],
-        )
-        .unwrap();
+        let mt =
+            MemTable::try_new(schema.clone(), vec![vec![make_batch(vec![10, 20, 30])]]).unwrap();
         ctx.register_table("t", Arc::new(mt)).unwrap();
         let plan = ctx
             .sql("SELECT k FROM t")
@@ -790,8 +785,8 @@ mod tests {
         let extra2_sb = BridgeFilterSideband::new();
         let wrapper = BuildSideBloomEmitterExec::try_new_with_extras(
             plan,
-            0,                  // key_col_idx
-            7,                  // primary target_col_idx
+            0, // key_col_idx
+            7, // primary target_col_idx
             primary_sb.clone(),
             vec![(11, extra1_sb.clone()), (22, extra2_sb.clone())],
             16,
@@ -801,7 +796,9 @@ mod tests {
         use datafusion::physical_plan::ExecutionPlanProperties;
         let n = wrapper.properties().output_partitioning().partition_count();
         for p in 0..n {
-            let mut s = wrapper.execute(p, Arc::new(TaskContext::default())).unwrap();
+            let mut s = wrapper
+                .execute(p, Arc::new(TaskContext::default()))
+                .unwrap();
             while let Some(_batch) = s.try_next().await.unwrap() {}
         }
 
@@ -871,22 +868,20 @@ mod tests {
         use datafusion::physical_plan::ExecutionPlanProperties;
         let n = wrapper.properties().output_partitioning().partition_count();
         for p in 0..n {
-            let mut s = wrapper.execute(p, Arc::new(TaskContext::default())).unwrap();
+            let mut s = wrapper
+                .execute(p, Arc::new(TaskContext::default()))
+                .unwrap();
             while let Some(_batch) = s.try_next().await.unwrap() {}
         }
 
         let primary = primary_sb.peek().expect("primary not published to");
         let extra = extra_sb.peek().expect("extra not published to");
         let (primary_bloom_ptr, primary_col) = match &primary[0] {
-            ColumnPredicate::I64InBloom { col_idx, bloom } => {
-                (Arc::as_ptr(bloom), *col_idx)
-            }
+            ColumnPredicate::I64InBloom { col_idx, bloom } => (Arc::as_ptr(bloom), *col_idx),
             other => panic!("expected I64InBloom on primary, got {other:?}"),
         };
         let (extra_bloom_ptr, extra_col) = match &extra[0] {
-            ColumnPredicate::I64InBloom { col_idx, bloom } => {
-                (Arc::as_ptr(bloom), *col_idx)
-            }
+            ColumnPredicate::I64InBloom { col_idx, bloom } => (Arc::as_ptr(bloom), *col_idx),
             other => panic!("expected I64InBloom on extra, got {other:?}"),
         };
         assert_eq!(primary_col, 3);

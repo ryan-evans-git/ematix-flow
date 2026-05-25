@@ -39,11 +39,11 @@ use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use futures_util::StreamExt;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
     SendableRecordBatchStream,
 };
+use futures_util::StreamExt;
 
 use datafusion::parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
 use datafusion::parquet::file::reader::{FileReader, SerializedFileReader};
@@ -205,11 +205,7 @@ pub enum ColumnPredicate {
     /// l_partkey / l_suppkey decode happens. For Q17 the range
     /// covers ~100% of l_partkey so no RG is skipped — the lever is
     /// query-shape dependent.
-    I64Range {
-        col_idx: usize,
-        lo: i64,
-        hi: i64,
-    },
+    I64Range { col_idx: usize, lo: i64, hi: i64 },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1809,9 +1805,7 @@ impl EmatixFastParquetExec {
 
     /// Σ.Q.L9 — the attached runtime sideband, if any. Used by the
     /// planner rule to verify it threaded the sideband correctly.
-    pub fn runtime_sideband(
-        &self,
-    ) -> Option<&crate::bridge_filter_sideband::BridgeFilterSideband> {
+    pub fn runtime_sideband(&self) -> Option<&crate::bridge_filter_sideband::BridgeFilterSideband> {
         self.runtime_sideband.as_ref()
     }
 
@@ -2009,9 +2003,8 @@ impl ExecutionPlan for EmatixFastParquetExec {
                 outer_partitions,
                 self.rg_num_rows.clone(),
             );
-            return Ok(
-                Box::pin(RecordBatchStreamAdapter::new(schema, stream)) as SendableRecordBatchStream
-            );
+            return Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream))
+                as SendableRecordBatchStream);
         }
 
         // Σ.Q.L9 deferred peek (sideband-attached case).
@@ -2195,13 +2188,7 @@ fn build_partition_stream_dispatch(
         )
     } else {
         build_partition_stream(
-            path,
-            schema,
-            projection,
-            row_groups,
-            filter,
-            late_mat,
-            baseline,
+            path, schema, projection, row_groups, filter, late_mat, baseline,
         )
     }
 }

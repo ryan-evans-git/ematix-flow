@@ -20,8 +20,8 @@ const T2_SQL: &str = "SELECT \
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let dir = std::env::var("TPCH_DATA_DIR")
-        .unwrap_or_else(|_| "examples/tpch/data/sf10".to_string());
+    let dir =
+        std::env::var("TPCH_DATA_DIR").unwrap_or_else(|_| "examples/tpch/data/sf10".to_string());
     let lineitem_path = PathBuf::from(&dir).join("lineitem.parquet");
 
     // ----- Emat -----

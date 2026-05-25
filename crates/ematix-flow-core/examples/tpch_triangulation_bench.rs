@@ -27,6 +27,7 @@ use std::time::Instant;
 
 use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::prelude::{SessionConfig, SessionContext};
+use ematix_flow_core::bloom::ContextBlooms;
 use ematix_flow_core::dedupe_aggregate_rule::DedupeAggregateForFloatDeterminism;
 use ematix_flow_core::dict_aggregate_rule::EnableDictGroupCountRule;
 use ematix_flow_core::ematix_fast_parquet::EmatixFastParquetTableProvider;
@@ -35,11 +36,10 @@ use ematix_flow_core::fused_aggregate_filter_multi_agg_rule::InjectFilterMultiAg
 use ematix_flow_core::fused_aggregate_filter_sum_rule::InjectFilterSumRule;
 use ematix_flow_core::inbloom_scan_pushdown_rule::EnableInBloomScanPushdownRule;
 use ematix_flow_core::local_bloom_emitter::{LocalBloomOptions, emit_build_side_blooms_local};
-use ematix_flow_core::bloom::ContextBlooms;
+use ematix_flow_core::push_down_left_semi_rule::PushDownLeftSemiRule;
 use ematix_flow_core::robin_hood_sum_f64_exec::EnableRobinHoodSumF64Rule;
 use ematix_flow_core::runtime_bloom_cascading_rule::EnableCascadingBloomRule;
 use ematix_flow_core::runtime_bloom_sideband_rule::EnableRuntimeBloomSidebandRule;
-use ematix_flow_core::push_down_left_semi_rule::PushDownLeftSemiRule;
 use ematix_flow_core::swap_semi_join_build_rule::SwapSemiJoinBuildSideRule;
 use futures_util::TryStreamExt;
 
@@ -75,9 +75,15 @@ impl Engine {
     ///   TPCH_SKIP_EMATIX=1   — drop ematix-flow.
     /// At least one engine must remain; an empty set falls back to all().
     fn selected() -> Vec<Engine> {
-        let skip_polars = std::env::var("TPCH_SKIP_POLARS").map(|v| v != "0").unwrap_or(false);
-        let skip_duckdb = std::env::var("TPCH_SKIP_DUCKDB").map(|v| v != "0").unwrap_or(false);
-        let skip_ematix = std::env::var("TPCH_SKIP_EMATIX").map(|v| v != "0").unwrap_or(false);
+        let skip_polars = std::env::var("TPCH_SKIP_POLARS")
+            .map(|v| v != "0")
+            .unwrap_or(false);
+        let skip_duckdb = std::env::var("TPCH_SKIP_DUCKDB")
+            .map(|v| v != "0")
+            .unwrap_or(false);
+        let skip_ematix = std::env::var("TPCH_SKIP_EMATIX")
+            .map(|v| v != "0")
+            .unwrap_or(false);
         let kept: Vec<Engine> = Self::all()
             .iter()
             .copied()
@@ -340,12 +346,14 @@ async fn build_ematix_ctx(
     //   "dedupe"                — dedupe only
     let rules = std::env::var("EMAT_RULES").unwrap_or_else(|_| "all".to_string());
     let mut builder = SessionStateBuilder::new()
-        .with_config(SessionConfig::new().with_target_partitions(
-            std::env::var("PARTITIONS")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(14),
-        ))
+        .with_config(
+            SessionConfig::new().with_target_partitions(
+                std::env::var("PARTITIONS")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(14),
+            ),
+        )
         .with_default_features();
     if matches!(rules.as_str(), "all" | "dedupe") {
         builder = builder
@@ -365,8 +373,7 @@ async fn build_ematix_ctx(
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or_else(|| matches!(rules.as_str(), "all" | "swap"));
     if swap_enabled {
-        builder =
-            builder.with_physical_optimizer_rule(Arc::new(SwapSemiJoinBuildSideRule));
+        builder = builder.with_physical_optimizer_rule(Arc::new(SwapSemiJoinBuildSideRule));
     }
     // Σ.Q.L10: logical-plan rewrite — push LeftSemi past Inner joins
     // down to its target table. Closes the Q18-shape structural gap
@@ -402,8 +409,7 @@ async fn build_ematix_ctx(
         .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
         .unwrap_or(true);
     if rh_sum_f64_enabled {
-        builder =
-            builder.with_physical_optimizer_rule(Arc::new(EnableRobinHoodSumF64Rule));
+        builder = builder.with_physical_optimizer_rule(Arc::new(EnableRobinHoodSumF64Rule));
     }
     // Σ.Q.L9: threads a sideband between HashJoinExec build and
     // probe-side EmatixFastParquetExec so the build-side bloom is
@@ -447,13 +453,12 @@ async fn build_ematix_ctx(
                 max_extras_per_emitter: max_extras,
             }));
         } else {
-            builder = builder.with_physical_optimizer_rule(Arc::new(
-                EnableRuntimeBloomSidebandRule {
+            builder =
+                builder.with_physical_optimizer_rule(Arc::new(EnableRuntimeBloomSidebandRule {
                     min_probe_to_build_ratio: ratio,
                     allow_inner_join: allow_inner,
                     require_filtered_build,
-                },
-            ));
+                }));
         }
     }
     // Σ.Q.L4′: install the in-scan bloom pushdown rule with an empty
@@ -497,8 +502,7 @@ async fn build_ematix_ctx(
             .ok()
             .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
             .unwrap_or(true);
-        let use_emat =
-            all_emat || *t == "lineitem" || (orders_as_emat && *t == "orders");
+        let use_emat = all_emat || *t == "lineitem" || (orders_as_emat && *t == "orders");
         if use_emat {
             // Emat for lineitem with late-mat ON (default since
             // 2026-05-16 + the misaligned-bitmap-offset fix in

@@ -72,8 +72,8 @@
 
 use std::sync::Arc;
 
-use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode};
 use datafusion::common::JoinType;
+use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode};
 use datafusion::config::ConfigOptions;
 use datafusion::error::Result;
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
@@ -179,8 +179,7 @@ impl PhysicalOptimizerRule for SwapSemiJoinBuildSideRule {
             match hj.partition_mode() {
                 PartitionMode::CollectLeft => {
                     // After swap, new LEFT = old RIGHT.
-                    let new_left_partitions =
-                        hj.right().output_partitioning().partition_count();
+                    let new_left_partitions = hj.right().output_partitioning().partition_count();
                     if new_left_partitions != 1 {
                         return Ok(Transformed::no(p));
                     }
@@ -414,16 +413,20 @@ mod tests {
         // post-swap and violate the CollectLeft invariant).
         let right_scan: Arc<dyn ExecutionPlan> = MemorySourceConfig::try_new_exec(
             &[
-                vec![RecordBatch::try_new(
-                    schema.clone(),
-                    vec![Arc::new(Int64Array::from(vec![1i64, 2]))],
-                )
-                .unwrap()],
-                vec![RecordBatch::try_new(
-                    schema.clone(),
-                    vec![Arc::new(Int64Array::from(vec![3i64, 4]))],
-                )
-                .unwrap()],
+                vec![
+                    RecordBatch::try_new(
+                        schema.clone(),
+                        vec![Arc::new(Int64Array::from(vec![1i64, 2]))],
+                    )
+                    .unwrap(),
+                ],
+                vec![
+                    RecordBatch::try_new(
+                        schema.clone(),
+                        vec![Arc::new(Int64Array::from(vec![3i64, 4]))],
+                    )
+                    .unwrap(),
+                ],
             ],
             schema.clone(),
             None,
@@ -473,7 +476,10 @@ mod tests {
         let out_hj = out.as_any().downcast_ref::<HashJoinExec>().unwrap();
         // Original shape preserved — rule refused the unsafe swap.
         assert_eq!(*out_hj.join_type(), JoinType::LeftSemi);
-        assert!(matches!(out_hj.partition_mode(), PartitionMode::CollectLeft));
+        assert!(matches!(
+            out_hj.partition_mode(),
+            PartitionMode::CollectLeft
+        ));
     }
 
     /// Σ.Q.L2 fix regression test (Q18-shape stays winning,
@@ -488,16 +494,20 @@ mod tests {
         let two_part = || -> Arc<dyn ExecutionPlan> {
             MemorySourceConfig::try_new_exec(
                 &[
-                    vec![RecordBatch::try_new(
-                        schema.clone(),
-                        vec![Arc::new(Int64Array::from(vec![1i64, 2]))],
-                    )
-                    .unwrap()],
-                    vec![RecordBatch::try_new(
-                        schema.clone(),
-                        vec![Arc::new(Int64Array::from(vec![3i64, 4]))],
-                    )
-                    .unwrap()],
+                    vec![
+                        RecordBatch::try_new(
+                            schema.clone(),
+                            vec![Arc::new(Int64Array::from(vec![1i64, 2]))],
+                        )
+                        .unwrap(),
+                    ],
+                    vec![
+                        RecordBatch::try_new(
+                            schema.clone(),
+                            vec![Arc::new(Int64Array::from(vec![3i64, 4]))],
+                        )
+                        .unwrap(),
+                    ],
                 ],
                 schema.clone(),
                 None,

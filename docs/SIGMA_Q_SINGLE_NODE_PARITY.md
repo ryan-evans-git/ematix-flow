@@ -776,7 +776,7 @@ lives in DataFusion's GROUP BY i64 hashing.
 Profile says the highest-EV remaining lever is replacing DataFusion's
 `GroupValuesPrimitive` (the i64 GROUP BY hash) with a Robin Hood
 variant that handles `AVG(f64) GROUP BY i64` — extending the existing
-[`RobinHoodSumF64Exec`](../crates/ematix-flow-core/src/robin_hood_sum_f64_exec.rs)
+`crates/ematix-flow-core/src/robin_hood_sum_f64_exec.rs`
 pattern that already wins 1-5% on `SUM(f64)`.
 
 Estimate: ~1700 lines of TDD work across kernel + exec + rule + bench.
@@ -794,9 +794,9 @@ internally. Multi-week phase, deferred.
 
 | Item | Location | Purpose |
 |------|----------|---------|
-| `EMAT_DUMP_PLAN=1` env switch | [tpch_validate.rs](../crates/ematix-flow-core/examples/tpch_validate.rs) | Optimized logical + physical plan dump |
-| `profile_query` example | [profile_query.rs](../crates/ematix-flow-core/examples/profile_query.rs) | Samply-compatible per-query profiling |
-| `synthetic_left_semi_rule` (Σ.Q.M Slice 1) | [synthetic_left_semi_rule.rs](../crates/ematix-flow-core/src/synthetic_left_semi_rule.rs) | Opt-in dim→fact LeftSemi producer (inert, kept as infra) |
+| `EMAT_DUMP_PLAN=1` env switch | `crates/ematix-flow-core/examples/tpch_validate.rs` | Optimized logical + physical plan dump |
+| `profile_query` example | `crates/ematix-flow-core/examples/profile_query.rs` | Samply-compatible per-query profiling |
+| `synthetic_left_semi_rule` (Σ.Q.M Slice 1) | `crates/ematix-flow-core/src/synthetic_left_semi_rule.rs` | Opt-in dim→fact LeftSemi producer (inert, kept as infra) |
 | `bench_varint` regression guard | ematix-parquet `feat/compression-hygiene` | Documents LLVM-elided bounds-check baseline (0.70 ns/1-byte) |
 
 ### Commit chronology
@@ -827,9 +827,9 @@ as the closeout estimated — most of the savings came from copying the
 
 | Slice | Module | LOC | Tests |
 |-------|--------|-----|-------|
-| Σ.R.2.a kernel | [robin_hood_agg.rs](../crates/ematix-flow-core/src/robin_hood_agg.rs) (+715) | `RobinHoodI64AvgF64` (bucket = `(key i64, sum f64, count u64, psl u32)`) + `RobinHoodAvgF64Agg` streaming agg, vectorised + scalar paths | 18 unit |
-| Σ.R.2.b exec + Σ.R.2.c rule | [robin_hood_avg_f64_exec.rs](../crates/ematix-flow-core/src/robin_hood_avg_f64_exec.rs) (new, 624) | `RobinHoodAvgF64Exec(Partial → (k, sum, count); FinalPartitioned → (k, avg))` + `EnableRobinHoodAvgF64Rule` opt-in via `install_robin_hood_avg_f64_rule` | 5 integration |
-| Σ.R.2.d bench | [sigma_r2_q17_ab.rs](../crates/ematix-flow-core/examples/sigma_r2_q17_ab.rs) | Q17 SF=10 5×2 A/B harness with plan-check sanity, OFF #1 → ON → OFF #2 ordering to spot drift | n/a |
+| Σ.R.2.a kernel | `crates/ematix-flow-core/src/robin_hood_agg.rs` (+715) | `RobinHoodI64AvgF64` (bucket = `(key i64, sum f64, count u64, psl u32)`) + `RobinHoodAvgF64Agg` streaming agg, vectorised + scalar paths | 18 unit |
+| Σ.R.2.b exec + Σ.R.2.c rule | `crates/ematix-flow-core/src/robin_hood_avg_f64_exec.rs` (new, 624) | `RobinHoodAvgF64Exec(Partial → (k, sum, count); FinalPartitioned → (k, avg))` + `EnableRobinHoodAvgF64Rule` opt-in via `install_robin_hood_avg_f64_rule` | 5 integration |
+| Σ.R.2.d bench | `crates/ematix-flow-core/examples/sigma_r2_q17_ab.rs` | Q17 SF=10 5×2 A/B harness with plan-check sanity, OFF #1 → ON → OFF #2 ordering to spot drift | n/a |
 
 All 952 crate-wide tests pass. Operator + rule are opt-in only (per
 [[optimizer-codegen-sensitivity]]); env toggles `EMAT_RH_AVG_F64_VEC`

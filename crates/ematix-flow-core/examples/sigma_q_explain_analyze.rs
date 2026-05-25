@@ -33,8 +33,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(18);
-    let dir = std::env::var("TPCH_DATA_DIR")
-        .unwrap_or_else(|_| "examples/tpch/data/sf10".to_string());
+    let dir =
+        std::env::var("TPCH_DATA_DIR").unwrap_or_else(|_| "examples/tpch/data/sf10".to_string());
 
     let env_on = |name: &str| {
         std::env::var(name)
@@ -65,7 +65,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         builder = builder.with_physical_optimizer_rule(Arc::new(EnableRobinHoodSumF64Rule));
     }
     if rt_bloom {
-        builder = builder.with_physical_optimizer_rule(Arc::new(EnableRuntimeBloomSidebandRule::default()));
+        builder = builder
+            .with_physical_optimizer_rule(Arc::new(EnableRuntimeBloomSidebandRule::default()));
     }
     let state = builder.build();
 

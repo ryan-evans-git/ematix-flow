@@ -59,11 +59,7 @@ pub async fn emit_build_side_blooms_local(
             }
             Ok(None) => {}
             Err(e) => {
-                tracing::warn!(
-                    "Σ.Q.L4′: skipped bloom for {}: {}",
-                    cand.probe_uuid_hint,
-                    e
-                );
+                tracing::warn!("Σ.Q.L4′: skipped bloom for {}: {}", cand.probe_uuid_hint, e);
             }
         }
     }
@@ -333,10 +329,9 @@ mod tests {
             .unwrap()
             .into_optimized_plan()
             .unwrap();
-        let map =
-            emit_build_side_blooms_local(&ctx, &plan, &LocalBloomOptions::default())
-                .await
-                .unwrap();
+        let map = emit_build_side_blooms_local(&ctx, &plan, &LocalBloomOptions::default())
+            .await
+            .unwrap();
         // The probe side is "big" + col "k" → uuid("big", "k").
         let uuid = column_uuid("big", "k");
         let bloom = map.get(&uuid).expect("expected a bloom for big.k");
@@ -366,7 +361,10 @@ mod tests {
         ]));
         let lrb = RecordBatch::try_new(
             lschema.clone(),
-            vec![Arc::new(Int64Array::from(lk)), Arc::new(Int64Array::from(lsk))],
+            vec![
+                Arc::new(Int64Array::from(lk)),
+                Arc::new(Int64Array::from(lsk)),
+            ],
         )
         .unwrap();
         ctx.register_table(
@@ -383,7 +381,10 @@ mod tests {
         ]));
         let srb = RecordBatch::try_new(
             sschema.clone(),
-            vec![Arc::new(Int64Array::from(sk)), Arc::new(Int64Array::from(snk))],
+            vec![
+                Arc::new(Int64Array::from(sk)),
+                Arc::new(Int64Array::from(snk)),
+            ],
         )
         .unwrap();
         ctx.register_table(
@@ -398,11 +399,8 @@ mod tests {
             DataType::Int64,
             false,
         )]));
-        let nrb = RecordBatch::try_new(
-            nschema.clone(),
-            vec![Arc::new(Int64Array::from(nk))],
-        )
-        .unwrap();
+        let nrb =
+            RecordBatch::try_new(nschema.clone(), vec![Arc::new(Int64Array::from(nk))]).unwrap();
         ctx.register_table(
             "nation",
             Arc::new(MemTable::try_new(nschema, vec![vec![nrb]]).unwrap()),
@@ -451,8 +449,12 @@ mod tests {
             .unwrap()
             .into_optimized_plan()
             .unwrap();
-        let opts = LocalBloomOptions { max_build_rows: 100 };
-        let map = emit_build_side_blooms_local(&ctx, &plan, &opts).await.unwrap();
+        let opts = LocalBloomOptions {
+            max_build_rows: 100,
+        };
+        let map = emit_build_side_blooms_local(&ctx, &plan, &opts)
+            .await
+            .unwrap();
         assert!(
             map.is_empty(),
             "both sides exceed cap → no bloom should emit"

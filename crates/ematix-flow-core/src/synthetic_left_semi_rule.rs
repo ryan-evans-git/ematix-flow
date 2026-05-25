@@ -95,9 +95,7 @@ const FACT_ROW_THRESHOLD: usize = 5_000_000;
 
 /// Install the Σ.Q.M synthetic LeftSemi rule into a SessionStateBuilder.
 /// Mirrors `install_push_down_left_semi_rule`.
-pub fn install_synthetic_left_semi_rule(
-    builder: SessionStateBuilder,
-) -> SessionStateBuilder {
+pub fn install_synthetic_left_semi_rule(builder: SessionStateBuilder) -> SessionStateBuilder {
     builder.with_optimizer_rule(Arc::new(SyntheticLeftSemiRule))
 }
 
@@ -305,10 +303,7 @@ fn dim_subtree_has_filter(plan: &LogicalPlan) -> bool {
 /// where Σ.Q.M has emitted on a prior pass and L10 hasn't pushed yet
 /// (LeftSemi at fact_subtree's root) and the case where L10 has pushed
 /// (LeftSemi wrapping the fact TableScan deep inside).
-fn fact_subtree_has_matching_left_semi(
-    plan: &LogicalPlan,
-    target_on: &[(Expr, Expr)],
-) -> bool {
+fn fact_subtree_has_matching_left_semi(plan: &LogicalPlan, target_on: &[(Expr, Expr)]) -> bool {
     let target_set: HashSet<(String, String)> = target_on
         .iter()
         .map(|(l, r)| (expr_signature(l), expr_signature(r)))
@@ -317,11 +312,10 @@ fn fact_subtree_has_matching_left_semi(
     let _ = plan.apply(|node| {
         if let LogicalPlan::Join(j) = node {
             if matches!(j.join_type, JoinType::LeftSemi) {
-                let node_set: HashSet<(String, String)> = j
-                    .on
-                    .iter()
-                    .map(|(l, r)| (expr_signature(l), expr_signature(r)))
-                    .collect();
+                let node_set: HashSet<(String, String)> =
+                    j.on.iter()
+                        .map(|(l, r)| (expr_signature(l), expr_signature(r)))
+                        .collect();
                 if node_set == target_set {
                     found = true;
                     return Ok(TreeNodeRecursion::Stop);
@@ -668,12 +662,14 @@ mod tests {
         });
         assert!(!dim_subtree_has_filter(&scan_dummy));
         let filter_node = LogicalPlan::Filter(
-            Filter::try_new(Expr::Literal(ScalarValue::Boolean(Some(true)), None),
-                Arc::new(scan_dummy.clone())).unwrap(),
+            Filter::try_new(
+                Expr::Literal(ScalarValue::Boolean(Some(true)), None),
+                Arc::new(scan_dummy.clone()),
+            )
+            .unwrap(),
         );
         assert!(dim_subtree_has_filter(&filter_node));
     }
-
 
     #[test]
     fn expr_signature_column() {

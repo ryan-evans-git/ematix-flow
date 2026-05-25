@@ -39,8 +39,8 @@ async fn run_q07(
     ratio: usize,
     all_emat: bool,
 ) -> Result<(f64, f64, usize), Box<dyn std::error::Error>> {
-    let dir = std::env::var("TPCH_DATA_DIR")
-        .unwrap_or_else(|_| "examples/tpch/data/sf10".to_string());
+    let dir =
+        std::env::var("TPCH_DATA_DIR").unwrap_or_else(|_| "examples/tpch/data/sf10".to_string());
     let sql = std::fs::read_to_string("examples/tpch/queries/q07.sql")?;
 
     let mut builder = SessionStateBuilder::new()
@@ -100,16 +100,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("{}", "-".repeat(70));
 
     let (m, mn, r) = run_q07(false, 64, false).await?;
-    println!("{:<42} {:>9.2} {:>10.2} {:>6}", "A: L9 OFF, lineitem+orders Emat", m, mn, r);
+    println!(
+        "{:<42} {:>9.2} {:>10.2} {:>6}",
+        "A: L9 OFF, lineitem+orders Emat", m, mn, r
+    );
 
     let (m, mn, r) = run_q07(true, 64, false).await?;
-    println!("{:<42} {:>9.2} {:>10.2} {:>6}", "B: L9 ON ratio=64, lineitem+orders", m, mn, r);
+    println!(
+        "{:<42} {:>9.2} {:>10.2} {:>6}",
+        "B: L9 ON ratio=64, lineitem+orders", m, mn, r
+    );
 
     let (m, mn, r) = run_q07(true, 64, true).await?;
-    println!("{:<42} {:>9.2} {:>10.2} {:>6}", "C: L9 ON ratio=64, ALL Emat", m, mn, r);
+    println!(
+        "{:<42} {:>9.2} {:>10.2} {:>6}",
+        "C: L9 ON ratio=64, ALL Emat", m, mn, r
+    );
 
     let (m, mn, r) = run_q07(true, 1024, true).await?;
-    println!("{:<42} {:>9.2} {:>10.2} {:>6}", "D: L9 ON ratio=1024, ALL Emat", m, mn, r);
+    println!(
+        "{:<42} {:>9.2} {:>10.2} {:>6}",
+        "D: L9 ON ratio=1024, ALL Emat", m, mn, r
+    );
 
     Ok(())
 }

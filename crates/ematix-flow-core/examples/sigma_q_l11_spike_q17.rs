@@ -29,14 +29,14 @@ async fn time_query(ctx: &SessionContext, sql: &str, trials: usize) -> (f64, f64
     samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let median = samples[samples.len() / 2];
     let mean: f64 = samples.iter().sum::<f64>() / samples.len() as f64;
-    let var: f64 =
-        samples.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / samples.len() as f64;
+    let var: f64 = samples.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / samples.len() as f64;
     (median, var.sqrt())
 }
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let dir = std::env::var("TPCH_DATA_DIR").unwrap_or_else(|_| "examples/tpch/data/sf10".to_string());
+    let dir =
+        std::env::var("TPCH_DATA_DIR").unwrap_or_else(|_| "examples/tpch/data/sf10".to_string());
     let trials: usize = std::env::var("TPCH_TRIALS")
         .ok()
         .and_then(|s| s.parse().ok())

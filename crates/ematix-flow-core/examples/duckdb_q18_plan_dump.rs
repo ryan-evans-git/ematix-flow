@@ -16,10 +16,7 @@ const TPCH_TABLES: &[&str] = &[
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
-    let q: u8 = args
-        .get(1)
-        .map(|s| s.parse().unwrap_or(18))
-        .unwrap_or(18);
+    let q: u8 = args.get(1).map(|s| s.parse().unwrap_or(18)).unwrap_or(18);
 
     let data_dir = std::env::var("TPCH_DATA_DIR")
         .map(PathBuf::from)

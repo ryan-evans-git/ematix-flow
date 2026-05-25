@@ -204,7 +204,9 @@ mod tests {
             .unwrap();
 
         let rule = EnableInBloomScanPushdownRule::new(ContextBlooms::default());
-        let rewritten = rule.optimize(plan.clone(), &ConfigOptions::default()).unwrap();
+        let rewritten = rule
+            .optimize(plan.clone(), &ConfigOptions::default())
+            .unwrap();
         // Same plan tree, no rewrites — Arc identity preserved.
         assert!(Arc::ptr_eq(&plan, &rewritten));
     }
@@ -244,12 +246,15 @@ mod tests {
         let _ = rewritten.clone().transform_up(|node| {
             if let Some(scan) = node.as_any().downcast_ref::<EmatixFastParquetExec>() {
                 let bf = scan.filter().expect("scan should have BridgeFilter");
-                let has_inbloom = bf.predicates().iter().any(|p| matches!(
-                    p,
-                    ColumnPredicate::I64InBloom { col_idx: 0, .. }
-                ));
-                assert!(has_inbloom, "expected I64InBloom on col 0:\n{}",
-                    displayable(rewritten.as_ref()).indent(true));
+                let has_inbloom = bf
+                    .predicates()
+                    .iter()
+                    .any(|p| matches!(p, ColumnPredicate::I64InBloom { col_idx: 0, .. }));
+                assert!(
+                    has_inbloom,
+                    "expected I64InBloom on col 0:\n{}",
+                    displayable(rewritten.as_ref()).indent(true)
+                );
                 found = true;
             }
             Ok(Transformed::no(node))

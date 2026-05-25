@@ -932,11 +932,7 @@ pub fn rg_i64_min_max(
 /// Lever 3 — return the number of values in an i64 column-chunk
 /// without decoding it. Used as the bitmap size when an RG is
 /// short-circuited by an `I64Range` predicate.
-pub fn rg_num_values(
-    path: &std::path::Path,
-    rg: usize,
-    col: usize,
-) -> DfResult<usize> {
+pub fn rg_num_values(path: &std::path::Path, rg: usize, col: usize) -> DfResult<usize> {
     let file = ParquetFile::open(path).map_err(|e| ext(format!("ParquetFile::open: {e}")))?;
     let md = file.metadata().map_err(|e| ext(format!("metadata: {e}")))?;
     let cm = md.row_groups[rg].columns[col]

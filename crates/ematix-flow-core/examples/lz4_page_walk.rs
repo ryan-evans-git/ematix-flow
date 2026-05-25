@@ -2,8 +2,8 @@
 //! see if PageHeader parsing succeeds and which page version DuckDB
 //! wrote.
 
-use ematix_parquet_io::pages::PageWalker;
 use ematix_parquet_io::ParquetFile;
+use ematix_parquet_io::pages::PageWalker;
 use std::path::PathBuf;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -30,9 +30,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "\n=== {col_name}  RG0  codec={:?}  comp={}  uncomp={} ===",
             cm.codec, cm.total_compressed_size, cm.total_uncompressed_size
         );
-        let offset = cm
-            .dictionary_page_offset
-            .unwrap_or(cm.data_page_offset) as u64;
+        let offset = cm.dictionary_page_offset.unwrap_or(cm.data_page_offset) as u64;
         let length = cm.total_compressed_size as u64;
         let chunk = file.read_range(offset, length)?;
         let limit = length as usize;
@@ -52,7 +50,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     };
                     println!(
                         "  page #{page_idx}  type={:?} kind={kind}  csize={}  usize={}  body.len()={}",
-                        hdr.page_type, hdr.compressed_page_size, hdr.uncompressed_page_size, body.len()
+                        hdr.page_type,
+                        hdr.compressed_page_size,
+                        hdr.uncompressed_page_size,
+                        body.len()
                     );
                     if let Some(ref v2) = hdr.data_page_header_v2 {
                         println!(

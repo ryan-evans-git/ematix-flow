@@ -259,11 +259,8 @@ mod tests {
     use ematix_parquet_format::types::CompressionCodec;
 
     fn tmp_parquet(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "fk_chain_test_{}_{}",
-            std::process::id(),
-            name
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("fk_chain_test_{}_{}", std::process::id(), name));
         let _ = std::fs::create_dir_all(&dir);
         dir.join(format!("{name}.parquet"))
     }
@@ -309,16 +306,12 @@ mod tests {
         let ctx = SessionContext::new_with_state(state);
         ctx.register_table(
             "orders",
-            Arc::new(
-                EmatixFastParquetTableProvider::try_new(o.to_string_lossy()).unwrap(),
-            ),
+            Arc::new(EmatixFastParquetTableProvider::try_new(o.to_string_lossy()).unwrap()),
         )
         .unwrap();
         ctx.register_table(
             "lineitem",
-            Arc::new(
-                EmatixFastParquetTableProvider::try_new(li.to_string_lossy()).unwrap(),
-            ),
+            Arc::new(EmatixFastParquetTableProvider::try_new(li.to_string_lossy()).unwrap()),
         )
         .unwrap();
         let sql = "SELECT o_orderkey, l_orderkey, l_suppkey \
@@ -337,8 +330,7 @@ mod tests {
         let matches = find_scans_by_fk_chain(&plan, "orderkey");
         let names: Vec<_> = matches.iter().map(|m| m.col_name.clone()).collect();
         assert!(
-            names.iter().any(|n| n == "o_orderkey")
-                && names.iter().any(|n| n == "l_orderkey"),
+            names.iter().any(|n| n == "o_orderkey") && names.iter().any(|n| n == "l_orderkey"),
             "expected both orders.o_orderkey AND lineitem.l_orderkey to match \
              stem 'orderkey'; got {names:?}"
         );

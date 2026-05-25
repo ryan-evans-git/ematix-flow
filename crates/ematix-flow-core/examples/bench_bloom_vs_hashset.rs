@@ -33,15 +33,15 @@ fn main() {
     keys.sort_unstable();
 
     // Probe set: mostly miss, ~0.1% hit (matches Q17 selectivity).
-    let mut probes: Vec<i64> = (0..n_probes as i64).map(|i| (i * 31) % 2_000_000 + 1).collect();
+    let mut probes: Vec<i64> = (0..n_probes as i64)
+        .map(|i| (i * 31) % 2_000_000 + 1)
+        .collect();
     // Sprinkle in some real hits to keep the early-out path honest.
     for i in (0..n_probes).step_by(1000) {
         probes[i] = keys[i % n_keys];
     }
 
-    println!(
-        "Q17-shape A/B: build={n_keys} keys, probes={n_probes} rows, ~0.1% hit rate\n"
-    );
+    println!("Q17-shape A/B: build={n_keys} keys, probes={n_probes} rows, ~0.1% hit rate\n");
 
     // ---- BloomFilter (current L9 path) ----
     let mut bloom = BloomFilter::for_keys(n_keys);

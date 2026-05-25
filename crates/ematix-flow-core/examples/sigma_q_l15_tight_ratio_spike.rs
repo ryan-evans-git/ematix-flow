@@ -43,8 +43,8 @@ async fn run_q07(
     allow_inner: bool,
     ratio: usize,
 ) -> Result<(f64, f64, usize), Box<dyn std::error::Error>> {
-    let dir = std::env::var("TPCH_DATA_DIR")
-        .unwrap_or_else(|_| "examples/tpch/data/sf10".to_string());
+    let dir =
+        std::env::var("TPCH_DATA_DIR").unwrap_or_else(|_| "examples/tpch/data/sf10".to_string());
     let sql = std::fs::read_to_string("examples/tpch/queries/q07.sql")?;
 
     let mut builder = SessionStateBuilder::new()
@@ -104,11 +104,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("{}", "-".repeat(64));
 
     let (m, mn, r) = run_q07(false, 64).await?;
-    println!("{:<28} {:>10.2} {:>12.2} {:>8}", "Inner-L9 OFF (default)", m, mn, r);
+    println!(
+        "{:<28} {:>10.2} {:>12.2} {:>8}",
+        "Inner-L9 OFF (default)", m, mn, r
+    );
 
     for ratio in [64usize, 256, 1024, 4096] {
         let (m, mn, r) = run_q07(true, ratio).await?;
-        println!("{:<28} {:>10.2} {:>12.2} {:>8}", format!("Inner-L9 ON ratio={ratio}"), m, mn, r);
+        println!(
+            "{:<28} {:>10.2} {:>12.2} {:>8}",
+            format!("Inner-L9 ON ratio={ratio}"),
+            m,
+            mn,
+            r
+        );
     }
 
     Ok(())

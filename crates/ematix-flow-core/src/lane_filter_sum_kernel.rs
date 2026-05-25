@@ -244,7 +244,11 @@ mod tests {
 
     /// Reference scalar — independent code path from the specialised
     /// kernel so a bug in either won't hide.
-    fn scalar_reference(spec: &FusedFilterAggSpec, column_ptrs: &[*const u8], n_rows: usize) -> f64 {
+    fn scalar_reference(
+        spec: &FusedFilterAggSpec,
+        column_ptrs: &[*const u8],
+        n_rows: usize,
+    ) -> f64 {
         let mut acc = 0.0f64;
         for row in 0..n_rows {
             let mut pass = true;
@@ -276,9 +280,7 @@ mod tests {
             }
             if pass {
                 acc += match &spec.aggregates[0] {
-                    AggExpr::SumColumn(a) => unsafe {
-                        *(column_ptrs[*a] as *const f64).add(row)
-                    },
+                    AggExpr::SumColumn(a) => unsafe { *(column_ptrs[*a] as *const f64).add(row) },
                     AggExpr::SumProductColumns(a, b) => unsafe {
                         let va = *(column_ptrs[*a] as *const f64).add(row);
                         let vb = *(column_ptrs[*b] as *const f64).add(row);
@@ -314,7 +316,10 @@ mod tests {
     fn detects_q6_canonical_shape() {
         let spec = FusedFilterAggSpec::q6(8766, 9131, 0.05, 0.07, 24.0);
         let kernel = LaneFilterSumKernel::from_spec(&spec);
-        assert!(kernel.is_some(), "Q06 canonical spec should match Q06 family");
+        assert!(
+            kernel.is_some(),
+            "Q06 canonical spec should match Q06 family"
+        );
     }
 
     #[test]

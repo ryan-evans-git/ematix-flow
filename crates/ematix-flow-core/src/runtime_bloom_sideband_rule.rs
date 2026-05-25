@@ -27,9 +27,9 @@
 use std::sync::Arc;
 
 use datafusion::arrow::datatypes::DataType;
+use datafusion::common::Result as DfResult;
 use datafusion::common::config::ConfigOptions;
 use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode};
-use datafusion::common::Result as DfResult;
 use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::physical_expr::expressions::Column;
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
@@ -42,9 +42,7 @@ use crate::build_side_bloom_emitter_exec::BuildSideBloomEmitterExec;
 use crate::ematix_fast_parquet::EmatixFastParquetExec;
 
 /// Install the L9 runtime-sideband rule.
-pub fn install_runtime_bloom_sideband_rule(
-    builder: SessionStateBuilder,
-) -> SessionStateBuilder {
+pub fn install_runtime_bloom_sideband_rule(builder: SessionStateBuilder) -> SessionStateBuilder {
     builder.with_physical_optimizer_rule(Arc::new(EnableRuntimeBloomSidebandRule::default()))
 }
 
@@ -525,11 +523,8 @@ mod tests {
     use ematix_parquet_format::types::CompressionCodec;
 
     fn tmp_parquet(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "l9_rule_test_{}_{}",
-            std::process::id(),
-            name
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("l9_rule_test_{}_{}", std::process::id(), name));
         let _ = std::fs::create_dir_all(&dir);
         dir.join(format!("{name}.parquet"))
     }
@@ -600,8 +595,7 @@ mod tests {
         let ctx = SessionContext::new_with_state(state);
         ctx.register_table(
             "lineitem",
-            Arc::new(EmatixFastParquetTableProvider::try_new(li.to_string_lossy())
-                .unwrap()),
+            Arc::new(EmatixFastParquetTableProvider::try_new(li.to_string_lossy()).unwrap()),
         )
         .unwrap();
         ctx.register_table(

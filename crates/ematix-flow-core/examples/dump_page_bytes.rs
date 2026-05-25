@@ -3,12 +3,10 @@
 //! LZ4 file is using a length-prefix wire format that ematix-parquet's
 //! `gather_dict_at_bitmap_into` doesn't handle.
 
-use ematix_parquet_codec::compression::{
-    decompress_lz4_raw_into_sized, decompress_snappy_into,
-};
+use ematix_parquet_codec::compression::{decompress_lz4_raw_into_sized, decompress_snappy_into};
 use ematix_parquet_format::types::CompressionCodec;
-use ematix_parquet_io::pages::PageWalker;
 use ematix_parquet_io::ParquetFile;
+use ematix_parquet_io::pages::PageWalker;
 use std::path::PathBuf;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -56,17 +54,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         println!(
             "\n{} : codec={:?} usize={} decomp.len()={}",
-            filename, codec, usize_hdr, decomp.len()
+            filename,
+            codec,
+            usize_hdr,
+            decomp.len()
         );
-        println!("  encoding={:?}", hdr.data_page_header.as_ref().unwrap().encoding);
         println!(
-            "  first 16 bytes: {:02x?}",
-            &decomp[..16.min(decomp.len())]
+            "  encoding={:?}",
+            hdr.data_page_header.as_ref().unwrap().encoding
         );
+        println!("  first 16 bytes: {:02x?}", &decomp[..16.min(decomp.len())]);
         // Interpret first 4 bytes as LE u32 in case it's a length prefix:
         if decomp.len() >= 4 {
             let prefix = u32::from_le_bytes([decomp[0], decomp[1], decomp[2], decomp[3]]);
-            println!("  first 4 as LE u32: {prefix} (decomp.len() - 4 = {})", decomp.len() - 4);
+            println!(
+                "  first 4 as LE u32: {prefix} (decomp.len() - 4 = {})",
+                decomp.len() - 4
+            );
         }
     }
     Ok(())

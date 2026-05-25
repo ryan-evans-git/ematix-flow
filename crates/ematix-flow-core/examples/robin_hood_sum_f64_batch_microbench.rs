@@ -250,8 +250,16 @@ fn main() {
         print_row("", "RH vectorised", rh_vec_med);
         print_row("", "RH vec + pre-grow", rh_vec_pre_med);
         print_row("", "Tagged vec", Some(median(&mut tagged_vec)));
-        print_row("", "Tagged vec + pre-grow", Some(median(&mut tagged_vec_pre)));
-        print_row("", "Tagged scalar + pregrow", Some(median(&mut tagged_scalar_pre)));
+        print_row(
+            "",
+            "Tagged vec + pre-grow",
+            Some(median(&mut tagged_vec_pre)),
+        );
+        print_row(
+            "",
+            "Tagged scalar + pregrow",
+            Some(median(&mut tagged_scalar_pre)),
+        );
         for (rb, ms) in &radix_results {
             print_row("", &format!("RH radix rb={rb}"), Some(*ms));
         }
@@ -267,7 +275,9 @@ fn main() {
     // Σ.Q.L12 — Q17 SF=10 shape: 60M rows / 2M groups (30 rows/grp).
     // -------------------------------------------------------------
     println!();
-    println!("=== Σ.Q.L12 — Q17 SF=10 shape: {Q17_N_ROWS} rows / {Q17_CARD} groups, {Q17_REPS}-rep median ===\n");
+    println!(
+        "=== Σ.Q.L12 — Q17 SF=10 shape: {Q17_N_ROWS} rows / {Q17_CARD} groups, {Q17_REPS}-rep median ===\n"
+    );
     println!(
         "{:<10} {:<22} {:>10} {:>14}",
         "Card", "Variant", "ms", "M rows/sec"
@@ -296,8 +306,14 @@ fn main() {
     }
     let (r_ms, r_tput) = fmt(rh_med, Q17_N_ROWS);
     let (t_ms, t_tput) = fmt(tagged_med, Q17_N_ROWS);
-    println!("{:<10} {:<22} {:>10.2} {:>14.1}", "Q17/2M", "RH vec + pre-grow", r_ms, r_tput);
-    println!("{:<10} {:<22} {:>10.2} {:>14.1}", "", "Tagged vec + pre-grow", t_ms, t_tput);
+    println!(
+        "{:<10} {:<22} {:>10.2} {:>14.1}",
+        "Q17/2M", "RH vec + pre-grow", r_ms, r_tput
+    );
+    println!(
+        "{:<10} {:<22} {:>10.2} {:>14.1}",
+        "", "Tagged vec + pre-grow", t_ms, t_tput
+    );
     println!(
         "\nΔ (Tagged vs RH): {:+.1}% — {}",
         delta_pct,

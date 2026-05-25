@@ -86,7 +86,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "SELECT COUNT(*) FROM lineitem WHERE l_quantity < 24",
     )
     .await;
-    try_query(&ctx, "Q7  full Q06", &std::fs::read_to_string("examples/tpch/queries/q06.sql")?).await;
+    try_query(
+        &ctx,
+        "Q7  full Q06",
+        &std::fs::read_to_string("examples/tpch/queries/q06.sql")?,
+    )
+    .await;
 
     Ok(())
 }

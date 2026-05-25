@@ -215,11 +215,8 @@ impl AggregateSpec for FilterSumSpec {
             // `batch.num_rows()` elements (Arrow invariant); `out`
             // has one element matching the single-aggregate spec.
             unsafe {
-                self.jit.run(
-                    n_rows as i64,
-                    input_ptrs.as_ptr(),
-                    out.as_mut_ptr(),
-                );
+                self.jit
+                    .run(n_rows as i64, input_ptrs.as_ptr(), out.as_mut_ptr());
             }
             *acc = out[0];
         }

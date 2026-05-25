@@ -78,15 +78,11 @@ use datafusion::common::Result as DfResult;
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::logical_expr::expr::Expr;
-use datafusion::logical_expr::{
-    Join, JoinType, LogicalPlan, TableScan,
-};
+use datafusion::logical_expr::{Join, JoinType, LogicalPlan, TableScan};
 use datafusion::optimizer::{OptimizerConfig, OptimizerRule};
 
 /// Install the Σ.Q.L10 rule.
-pub fn install_push_down_left_semi_rule(
-    builder: SessionStateBuilder,
-) -> SessionStateBuilder {
+pub fn install_push_down_left_semi_rule(builder: SessionStateBuilder) -> SessionStateBuilder {
     builder.with_optimizer_rule(Arc::new(PushDownLeftSemiRule))
 }
 
@@ -733,13 +729,9 @@ mod tests {
         )
         .await
         .unwrap();
-        ctx.register_parquet(
-            "orders",
-            or.to_string_lossy().as_ref(),
-            Default::default(),
-        )
-        .await
-        .unwrap();
+        ctx.register_parquet("orders", or.to_string_lossy().as_ref(), Default::default())
+            .await
+            .unwrap();
         ctx.register_parquet(
             "filter_set",
             fs.to_string_lossy().as_ref(),

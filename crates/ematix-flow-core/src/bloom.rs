@@ -136,10 +136,7 @@ impl BloomFilter {
         // alloc is at least 1-byte-aligned; the splash probe is fine
         // with unaligned u32 reads on arm64 and x86_64.
         unsafe {
-            std::slice::from_raw_parts(
-                self.bits.as_ptr().add(start) as *const u32,
-                BLOCK_U32_LANES,
-            )
+            std::slice::from_raw_parts(self.bits.as_ptr().add(start) as *const u32, BLOCK_U32_LANES)
         }
     }
 
@@ -189,7 +186,6 @@ impl BloomFilter {
         }
         diff == 0
     }
-
 
     /// Σ.J.2 — convenience: insert an i64 key.
     pub fn insert_i64(&mut self, v: i64) {

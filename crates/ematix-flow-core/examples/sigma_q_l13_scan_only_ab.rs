@@ -36,16 +36,14 @@ const WARMUPS: usize = 3;
 /// 100 fake supplier keys distributed across the keyspace. Simulates a
 /// nation-filtered supplier list for Q07-shape bloom predicate cost.
 const SIM_BLOOM_KEYS: &[i64] = &[
-    33, 1001, 2017, 3041, 4079, 5101, 6113, 7129, 8147, 9173,
-    10193, 11213, 12239, 13259, 14281, 15307, 16333, 17359, 18389, 19421,
-    20443, 21467, 22501, 23533, 24571, 25601, 26633, 27659, 28687, 29717,
-    30743, 31769, 32801, 33829, 34861, 35893, 36919, 37951, 38981, 40009,
-    41039, 42061, 43093, 44119, 45151, 46181, 47207, 48239, 49267, 50291,
-    51319, 52343, 53371, 54401, 55429, 56459, 57487, 58513, 59539, 60571,
-    61601, 62629, 63659, 64687, 65713, 66743, 67771, 68803, 69829, 70859,
-    71887, 72917, 73943, 74971, 76001, 77027, 78053, 79081, 80111, 81139,
-    82171, 83197, 84229, 85253, 86281, 87311, 88339, 89369, 90397, 91423,
-    92453, 93481, 94511, 95537, 96569, 97597, 98621, 99649, 99990, 99000,
+    33, 1001, 2017, 3041, 4079, 5101, 6113, 7129, 8147, 9173, 10193, 11213, 12239, 13259, 14281,
+    15307, 16333, 17359, 18389, 19421, 20443, 21467, 22501, 23533, 24571, 25601, 26633, 27659,
+    28687, 29717, 30743, 31769, 32801, 33829, 34861, 35893, 36919, 37951, 38981, 40009, 41039,
+    42061, 43093, 44119, 45151, 46181, 47207, 48239, 49267, 50291, 51319, 52343, 53371, 54401,
+    55429, 56459, 57487, 58513, 59539, 60571, 61601, 62629, 63659, 64687, 65713, 66743, 67771,
+    68803, 69829, 70859, 71887, 72917, 73943, 74971, 76001, 77027, 78053, 79081, 80111, 81139,
+    82171, 83197, 84229, 85253, 86281, 87311, 88339, 89369, 90397, 91423, 92453, 93481, 94511,
+    95537, 96569, 97597, 98621, 99649, 99990, 99000,
 ];
 
 /// T1: decode-only. Sum of computed expressions touching all 5 cols.
@@ -56,7 +54,8 @@ fn t1_sql() -> String {
        sum(l_extendedprice * (1.0 - l_discount)), \
        sum(l_orderkey % 7) + sum(l_suppkey % 11), \
        sum(extract(year FROM l_shipdate)) \
-     FROM lineitem".to_string()
+     FROM lineitem"
+        .to_string()
 }
 
 /// T2: T1 + date-range filter. Adds column predicate evaluation. The
@@ -68,7 +67,8 @@ fn t2_sql() -> String {
        sum(l_extendedprice * (1.0 - l_discount)), \
        sum(l_orderkey % 7) + sum(l_suppkey % 11) \
      FROM lineitem \
-     WHERE l_shipdate BETWEEN DATE '1995-01-01' AND DATE '1996-12-31'".to_string()
+     WHERE l_shipdate BETWEEN DATE '1995-01-01' AND DATE '1996-12-31'"
+        .to_string()
 }
 
 /// T3: T2 + IN-list on l_suppkey. Simulates the cost of L9's runtime
@@ -119,8 +119,8 @@ fn time_duckdb_sql(conn: &duckdb::Connection, sql: &str) -> f64 {
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let dir = std::env::var("TPCH_DATA_DIR")
-        .unwrap_or_else(|_| "examples/tpch/data/sf10".to_string());
+    let dir =
+        std::env::var("TPCH_DATA_DIR").unwrap_or_else(|_| "examples/tpch/data/sf10".to_string());
     let lineitem_path = PathBuf::from(&dir).join("lineitem.parquet");
 
     // ----- ematix-flow + EmatixFastParquet (our full stack) -----
@@ -155,9 +155,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     ))?;
 
     let tests: &[(&str, String, &str)] = &[
-        ("T1 decode-only (5 cols)", t1_sql(), "All 5 Q07 cols, no filter"),
-        ("T2 decode+date filter",   t2_sql(), "4 cols + l_shipdate predicate"),
-        ("T3 decode+date+IN(100)",  t3_sql(), "3 cols + date + 100-key IN-list"),
+        (
+            "T1 decode-only (5 cols)",
+            t1_sql(),
+            "All 5 Q07 cols, no filter",
+        ),
+        (
+            "T2 decode+date filter",
+            t2_sql(),
+            "4 cols + l_shipdate predicate",
+        ),
+        (
+            "T3 decode+date+IN(100)",
+            t3_sql(),
+            "3 cols + date + 100-key IN-list",
+        ),
     ];
 
     println!(

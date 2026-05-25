@@ -31,16 +31,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .expect("l_shipdate col");
 
     for rg_idx in 0..3 {
-        let cm = md.row_groups[rg_idx].columns[col].meta_data.as_ref().unwrap();
+        let cm = md.row_groups[rg_idx].columns[col]
+            .meta_data
+            .as_ref()
+            .unwrap();
         let n_rows = cm.num_values as usize;
         // All-ones mask: every bit set, full row count.
         let mask = vec![0xFFu8; n_rows.div_ceil(8)];
-        println!("RG{rg_idx}: l_shipdate codec={:?}  num_rows={n_rows}", cm.codec);
+        println!(
+            "RG{rg_idx}: l_shipdate codec={:?}  num_rows={n_rows}",
+            cm.codec
+        );
         match masked_decode_i32(&file, rg_idx, col, &mask) {
-            Ok(v) => println!("  OK — decoded {} values  first={:?} last={:?}",
-                              v.len(),
-                              v.first(),
-                              v.last()),
+            Ok(v) => println!(
+                "  OK — decoded {} values  first={:?} last={:?}",
+                v.len(),
+                v.first(),
+                v.last()
+            ),
             Err(e) => {
                 println!("  FAIL — {e}");
                 // Bail after first failure so we don't spam.

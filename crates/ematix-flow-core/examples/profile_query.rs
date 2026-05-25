@@ -48,7 +48,9 @@ const TPCH_TABLES: &[&str] = &[
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let data_dir = std::env::var("TPCH_DATA_DIR")
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| std::path::PathBuf::from("crates/ematix-flow-core/examples/tpch/data/sf1"));
+        .unwrap_or_else(|_| {
+            std::path::PathBuf::from("crates/ematix-flow-core/examples/tpch/data/sf1")
+        });
     let q: u8 = std::env::var("TPCH_QUERY")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -123,7 +125,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn register_tables(ctx: &SessionContext, data_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
+fn register_tables(
+    ctx: &SessionContext,
+    data_dir: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
     // Σ.Q.L15: when EMAT_ALL_TABLES_EMAT=1, every TPC-H table goes
     // through EmatixFastParquetTableProvider so the L9 runtime bloom
     // sideband can target supplier/customer/part scans (without it

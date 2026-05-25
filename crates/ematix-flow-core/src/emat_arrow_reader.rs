@@ -177,13 +177,10 @@ impl RowGroupDecodeCache {
             }
         }
         let arc = std::sync::Arc::new(column);
-        if let Some(old) = inner.entries.insert(
-            key.clone(),
-            RgEntry {
-                column: arc,
-                bytes,
-            },
-        ) {
+        if let Some(old) = inner
+            .entries
+            .insert(key.clone(), RgEntry { column: arc, bytes })
+        {
             inner.bytes_used -= old.bytes;
             // already in insertion_order, no need to re-add
         } else {
@@ -1504,9 +1501,7 @@ impl EmatArrowBatchReader {
             // Fail-fast on the first column error.
             let mut out = Vec::with_capacity(n_miss);
             for (m, slot) in slots.into_iter().enumerate() {
-                let r = slot.ok_or_else(|| {
-                    ext(format!("column miss-slot {m} never filled"))
-                })?;
+                let r = slot.ok_or_else(|| ext(format!("column miss-slot {m} never filled")))?;
                 out.push(r?);
             }
             out

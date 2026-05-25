@@ -38,15 +38,15 @@ same day, 20 trials × 3 warmups:**
 > thermally-cleanest of two runs. Treat **11–14 wins as the
 > steady-state SF=10 range**, with 17 achievable under unusually clean
 > conditions. Raw logs for both runs are checked in under
-> [`bench-results/release-2026-05-24/`](../bench-results/release-2026-05-24/).
+> `bench-results/release-2026-05-24/` in the repo root.
 
 The full per-query table + provenance / config / caveats live on the
 public docs site:
 [ematix.dev/reference/benchmarks](https://ematix.dev/reference/benchmarks).
-Source-of-truth artefact in this repo is auto-emitted by the harness:
-[`BENCHMARKS.md`](../BENCHMARKS.md) (top-level, 3 engines —
-ematix-flow / DuckDB / Polars; PySpark is captured separately by
-`scripts/bench-tpch-pyspark.py` because Spark needs a JVM out-of-process).
+The harness-emitted top-level `BENCHMARKS.md` in the repo root holds the
+auto-generated 3-engine view (ematix-flow / DuckDB / Polars); PySpark
+is captured separately by `scripts/bench-tpch-pyspark.py` because
+Spark needs a JVM out-of-process.
 
 The bench config is the same in every cell: `TPCH_TRIALS=20
 TPCH_WARMUPS=3 cargo run --release -p ematix-flow-core --example

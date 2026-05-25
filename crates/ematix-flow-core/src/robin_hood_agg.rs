@@ -1960,8 +1960,8 @@ unsafe fn neon_match_byte_mask_at(tags: &[u8], slot: usize, byte: u8) -> u16 {
     let cmp = vceqq_u8(group, vdupq_n_u8(byte));
     let bit_mask = unsafe {
         std::mem::transmute::<[u8; 16], std::arch::aarch64::uint8x16_t>([
-            0x01u8, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x01u8, 0x02, 0x04, 0x08, 0x10,
-            0x20, 0x40, 0x80,
+            0x01u8, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x01u8, 0x02, 0x04, 0x08, 0x10, 0x20,
+            0x40, 0x80,
         ])
     };
     let masked = vandq_u8(cmp, bit_mask);
@@ -2338,7 +2338,11 @@ impl TaggedSumF64Agg {
         self.table.is_empty()
     }
 
-    pub fn ingest_batch(&mut self, keys: &arrow_array::Int64Array, values: &arrow_array::Float64Array) {
+    pub fn ingest_batch(
+        &mut self,
+        keys: &arrow_array::Int64Array,
+        values: &arrow_array::Float64Array,
+    ) {
         use arrow_array::Array;
         let n = keys.len();
         assert_eq!(n, values.len());
@@ -2828,7 +2832,11 @@ mod tests {
     // Equivalence tests: vectorised path must produce identical final
     // state to the scalar `insert_or_sum_batch` for every input shape.
 
-    fn scalar_then_vec_state(keys: &[i64], vals: &[f64], cap: usize) -> (Vec<(i64, f64)>, Vec<(i64, f64)>) {
+    fn scalar_then_vec_state(
+        keys: &[i64],
+        vals: &[f64],
+        cap: usize,
+    ) -> (Vec<(i64, f64)>, Vec<(i64, f64)>) {
         let mut scalar = RobinHoodI64F64::with_capacity(cap);
         scalar.insert_or_sum_batch(keys, vals);
         let mut s_pairs: Vec<(i64, f64)> = scalar.iter().collect();
@@ -2895,7 +2903,13 @@ mod tests {
         assert_eq!(s.len(), v.len());
         for (a, b) in s.iter().zip(v.iter()) {
             assert_eq!(a.0, b.0);
-            assert!((a.1 - b.1).abs() < 1e-9, "diverged at key {}: {} vs {}", a.0, a.1, b.1);
+            assert!(
+                (a.1 - b.1).abs() < 1e-9,
+                "diverged at key {}: {} vs {}",
+                a.0,
+                a.1,
+                b.1
+            );
         }
     }
 
@@ -2910,7 +2924,13 @@ mod tests {
         assert_eq!(s.len(), v.len());
         for (a, b) in s.iter().zip(v.iter()) {
             assert_eq!(a.0, b.0);
-            assert!((a.1 - b.1).abs() < 1e-6, "diverged at key {}: {} vs {}", a.0, a.1, b.1);
+            assert!(
+                (a.1 - b.1).abs() < 1e-6,
+                "diverged at key {}: {} vs {}",
+                a.0,
+                a.1,
+                b.1
+            );
         }
     }
 

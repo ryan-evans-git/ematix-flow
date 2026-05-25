@@ -11,8 +11,7 @@ use std::time::Instant;
 // Apache Impala "splash" bloom layout — 256-bit block, 8 × u32 lanes,
 // 8 independent salted hashes per probe.
 const SPLASH_SALT: [u32; 8] = [
-    0x47b6137b, 0x44974d91, 0x8824ad5b, 0xa2b7289d,
-    0x705495c7, 0x2df1424b, 0x9efc4947, 0x5c6bfb31,
+    0x47b6137b, 0x44974d91, 0x8824ad5b, 0xa2b7289d, 0x705495c7, 0x2df1424b, 0x9efc4947, 0x5c6bfb31,
 ];
 
 struct SplashBloom {
@@ -106,9 +105,7 @@ fn time_loop(label: &str, probe: impl Fn(i64) -> bool, probes: &[i64]) -> (f64, 
         }
     }
     let ns_per = t0.elapsed().as_nanos() as f64 / probes.len() as f64;
-    println!(
-        "  {label:<40} {ns_per:6.2} ns/probe   hits={hits_timed} (warmup={hits})"
-    );
+    println!("  {label:<40} {ns_per:6.2} ns/probe   hits={hits_timed} (warmup={hits})");
     (ns_per, hits_timed)
 }
 
@@ -144,10 +141,16 @@ fn run_shape(label: &str, n_keys: i64, n_probes: usize, hit_rate: f64) {
         splash.insert_i64(*k);
     }
 
-    let (bloom_ns, bloom_hits) =
-        time_loop("BloomFilter (current)", |v| bloom.might_contain_i64(v), &probes);
-    let (splash_ns, splash_hits) =
-        time_loop("SplashBloom (Impala-style)", |v| splash.might_contain_i64(v), &probes);
+    let (bloom_ns, bloom_hits) = time_loop(
+        "BloomFilter (current)",
+        |v| bloom.might_contain_i64(v),
+        &probes,
+    );
+    let (splash_ns, splash_hits) = time_loop(
+        "SplashBloom (Impala-style)",
+        |v| splash.might_contain_i64(v),
+        &probes,
+    );
 
     println!(
         "  speedup: {:.2}x   FP delta: bloom={} splash={}",
@@ -161,13 +164,28 @@ fn main() {
     println!("Lever 5 — Apache Impala splash bloom A/B");
 
     // Q17-shape: small build, miss-dominant
-    run_shape("Q17-shape (small build, ~0.1% hit)", 2_044, 1_000_000, 0.001);
+    run_shape(
+        "Q17-shape (small build, ~0.1% hit)",
+        2_044,
+        1_000_000,
+        0.001,
+    );
 
     // Q05 o⋈l-shape: medium build, ~15% hit
-    run_shape("Q05-o⋈l-shape (2.3M build, ~15% hit)", 2_300_000, 1_000_000, 0.15);
+    run_shape(
+        "Q05-o⋈l-shape (2.3M build, ~15% hit)",
+        2_300_000,
+        1_000_000,
+        0.15,
+    );
 
     // FK-shape (Q05 c⋈o, Q18 customer⋈orders): ~100% hit
-    run_shape("FK-shape (1.5M build, ~100% hit)", 1_500_000, 1_000_000, 1.0);
+    run_shape(
+        "FK-shape (1.5M build, ~100% hit)",
+        1_500_000,
+        1_000_000,
+        1.0,
+    );
 
     // High-selectivity (Q21-like): tiny build, miss-dominant
     run_shape("Q21-shape (~500 keys, ~0.05% hit)", 500, 1_000_000, 0.0005);

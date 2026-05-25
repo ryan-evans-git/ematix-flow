@@ -232,15 +232,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 fn short(s: &str) -> String {
     let s = s.replace('\n', " ");
-    if s.len() > 160 { format!("{}…", &s[..160]) } else { s }
+    if s.len() > 160 {
+        format!("{}…", &s[..160])
+    } else {
+        s
+    }
 }
 
-fn compare(
-    emat: &[Vec<Cell>],
-    duck: &[Vec<Cell>],
-    fp_rtol: f64,
-    max_diffs: usize,
-) -> Outcome {
+fn compare(emat: &[Vec<Cell>], duck: &[Vec<Cell>], fp_rtol: f64, max_diffs: usize) -> Outcome {
     if emat.len() != duck.len() {
         let diffs: Vec<(String, String)> = emat
             .iter()
@@ -274,7 +273,10 @@ fn compare(
 }
 
 fn rows_equal(a: &[Cell], b: &[Cell], fp_rtol: f64) -> bool {
-    a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| cells_equal(x, y, fp_rtol))
+    a.len() == b.len()
+        && a.iter()
+            .zip(b.iter())
+            .all(|(x, y)| cells_equal(x, y, fp_rtol))
 }
 
 // --------- DuckDB ----------
@@ -339,7 +341,10 @@ fn duckdb_cell(row: &duckdb::Row, idx: usize) -> Cell {
 
 // --------- ematix-flow ----------
 
-async fn run_ematix(data_dir: &Path, sql: &str) -> Result<Vec<Vec<Cell>>, Box<dyn std::error::Error>> {
+async fn run_ematix(
+    data_dir: &Path,
+    sql: &str,
+) -> Result<Vec<Vec<Cell>>, Box<dyn std::error::Error>> {
     use arrow_array::ArrayRef;
 
     let mut builder = SessionStateBuilder::new()
@@ -428,8 +433,9 @@ async fn run_ematix(data_dir: &Path, sql: &str) -> Result<Vec<Vec<Cell>>, Box<dy
 
         // Also dump the physical plan to inspect build/probe sides.
         let phys = ctx.state().create_physical_plan(&plan).await?;
-        let formatted =
-            datafusion::physical_plan::displayable(phys.as_ref()).indent(true).to_string();
+        let formatted = datafusion::physical_plan::displayable(phys.as_ref())
+            .indent(true)
+            .to_string();
         eprintln!("=== PHYSICAL PLAN ===\n{formatted}=====================");
     }
     let batches = ctx.sql(sql).await?.collect().await?;
@@ -469,9 +475,7 @@ fn arrow_cell(arr: &arrow_array::ArrayRef, row: usize) -> Cell {
         DataType::UInt16 => Cell::Int(arr.as_primitive::<UInt16Type>().value(row) as i64),
         DataType::UInt32 => Cell::Int(arr.as_primitive::<UInt32Type>().value(row) as i64),
         DataType::UInt64 => Cell::Int(arr.as_primitive::<UInt64Type>().value(row) as i64),
-        DataType::Float32 => {
-            Cell::Float(arr.as_primitive::<Float32Type>().value(row) as f64)
-        }
+        DataType::Float32 => Cell::Float(arr.as_primitive::<Float32Type>().value(row) as f64),
         DataType::Float64 => Cell::Float(arr.as_primitive::<Float64Type>().value(row)),
         DataType::Date32 => Cell::Date(arr.as_primitive::<Date32Type>().value(row)),
         DataType::Date64 => Cell::Int(arr.as_primitive::<Date64Type>().value(row)),
