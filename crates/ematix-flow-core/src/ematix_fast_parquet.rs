@@ -104,6 +104,64 @@ impl BridgeFilter {
         sel.clamp(0.0, 1.0)
     }
 
+    /// Σ.AE.4 (2026-05-26): pass-rate estimate for partition_statistics
+    /// that ONLY counts predicates whose FilterExec is being dropped
+    /// from the plan. For Inexact-declared user filters (StringEq
+    /// under our string-gate; all user filters under default mode),
+    /// FilterExec sits on top of the scan and DataFusion's planner
+    /// already applies the predicate's selectivity on the scan's
+    /// reported cardinality. Pre-applying it here would double-count.
+    ///
+    /// Q10 SF=10 lineitem returnflag was double-counted, fooling
+    /// the planner into picking the wrong HashJoin build side
+    /// (+17% wall-time regression).
+    ///
+    /// Two classes count toward the pass-rate:
+    ///
+    /// 1. **Always-injected predicates** — bloom/set/range predicates
+    ///    added by the Σ.Q.L9 sideband rule via `with_added_predicates`.
+    ///    These never have a residual FilterExec; the scan is the
+    ///    only operator applying them. Q21 SF=10's −17% default-mode
+    ///    win came from threading bloom selectivity into the stats.
+    ///
+    /// 2. **Exact-declared user predicates** — i32 range/IN when
+    ///    `EMAT_EXACT_PUSHDOWN=1`. supports_filters_pushdown returns
+    ///    Exact for these, so DataFusion drops their FilterExec.
+    pub fn estimate_dropped_filter_pass_rate(
+        &self,
+        full_col_stats: &[datafusion::common::stats::ColumnStatistics],
+        exact_opt_in: bool,
+    ) -> f64 {
+        let mut sel = 1.0_f64;
+        for p in &self.predicates {
+            let residual_dropped = match p {
+                // Σ.Q.L9 / Σ.S.B injection: always added without
+                // FilterExec — scan is the only filter step.
+                ColumnPredicate::I64InBloom { .. }
+                | ColumnPredicate::I64InSet { .. }
+                | ColumnPredicate::I64Range { .. } => true,
+                // User-pushed Exact-declarable predicates: Exact only
+                // when the env-var gate is on.
+                ColumnPredicate::I32Range { .. } | ColumnPredicate::I32In { .. } => {
+                    exact_opt_in
+                }
+                // Strings stay Inexact under our string-gate;
+                // FilterExec retains them. F64 / column-pair never
+                // pushed. StringLike retained conservatively.
+                _ => false,
+            };
+            if !residual_dropped {
+                continue;
+            }
+            let col = p.col_idx();
+            let Some(stats) = full_col_stats.get(col) else {
+                return 0.5;
+            };
+            sel *= p.estimate_pass_rate(stats);
+        }
+        sel.clamp(0.0, 1.0)
+    }
+
     /// Σ.E5 Phase 1.8: store the predictor's verdict so the streaming
     /// reader doesn't have to re-compute it per RG.
     pub fn with_predicted_pass_rate(mut self, p: f64) -> Self {
@@ -2149,20 +2207,36 @@ impl ExecutionPlan for EmatixFastParquetExec {
             None => self.num_rows,
             _ => 0,
         };
-        // Σ.AE.1 (2026-05-26): when a BridgeFilter is pushed down,
-        // multiply the row count by the estimated pass rate so the
-        // planner picks join build sides based on POST-filter
-        // cardinality. Otherwise Exact pushdown breaks badly on
+        // Σ.AE.1 / Σ.AE.4 (2026-05-26): when a BridgeFilter is pushed
+        // down AND Exact pushdown is enabled (so FilterExec is being
+        // dropped for some predicates), report the post-filter
+        // cardinality for those predicates so the planner picks join
+        // build sides correctly. Otherwise Exact pushdown breaks
         // queries like Q21 — the planner sees orders at unfiltered
         // 15M, picks lineitem (60M) as the build side, and
         // catastrophically regresses (+124% in the 2026-05-26 Exact
-        // bench). The pass-rate estimator at line 92 was already
-        // implemented for the parallel-bitmap dispatch — same input,
-        // same column stats.
+        // bench).
+        //
+        // Critically, only apply pass-rate for the Exact-declared
+        // predicates. For Inexact-declared ones (string predicates
+        // under our string-gate; all predicates under default mode),
+        // FilterExec is still in the plan and DataFusion's planner
+        // applies the predicate's selectivity on top of our reported
+        // cardinality. Pre-applying it here would double-count: Q10
+        // SF=10's lineitem returnflag filter double-counted to 1.8M
+        // (vs honest 15M), fooling the planner into picking lineitem
+        // as the build side (15M-row hash) and regressing wall time
+        // by +17% / ~40 ms.
+        let exact_opt_in = std::env::var_os("EMAT_EXACT_PUSHDOWN").is_some();
         let (rows, filtered) = if let Some(filter) = &self.filter {
-            let sel = filter.estimate_pass_rate(&self.column_stats);
-            let r = ((raw_rows as f64) * sel) as usize;
-            (r.max(1), true)
+            let sel = filter
+                .estimate_dropped_filter_pass_rate(&self.column_stats, exact_opt_in);
+            if sel < 1.0 {
+                let r = ((raw_rows as f64) * sel) as usize;
+                (r.max(1), true)
+            } else {
+                (raw_rows, false)
+            }
         } else {
             (raw_rows, false)
         };
