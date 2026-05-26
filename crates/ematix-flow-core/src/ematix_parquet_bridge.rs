@@ -845,6 +845,30 @@ pub fn filter_f64_column_to_bitmap_dense(
     col: usize,
     predicate: impl Fn(f64) -> bool,
 ) -> DfResult<(Vec<u8>, usize)> {
+    let (bitmap, total, _values) =
+        filter_f64_column_to_bitmap_dense_with_values(path, rg, col, predicate)?;
+    Ok((bitmap, total))
+}
+
+/// Π.16 variant: same as [`filter_f64_column_to_bitmap_dense`] but
+/// also returns the fully-decoded `Vec<f64>` so callers can reuse it
+/// for downstream projection without paying for a second
+/// Snappy-decompress + plain-decode pass.
+///
+/// Motivated by Q06 SF=10 where `l_discount` appears in BOTH the
+/// WHERE and the SELECT — the current path decodes it twice. See
+/// `docs/PI_16_Q06_PROFILE.md` for the profile evidence.
+///
+/// Bench-gated wire-up via BridgeFilter is left for the consumer
+/// because the cached `Vec<f64>` is heavy (8 bytes × rg row count ≈
+/// 8 MB per RG at SF=10) — the calling code needs to decide when it's
+/// worth retaining vs reading from cold storage twice.
+pub fn filter_f64_column_to_bitmap_dense_with_values(
+    path: &std::path::Path,
+    rg: usize,
+    col: usize,
+    predicate: impl Fn(f64) -> bool,
+) -> DfResult<(Vec<u8>, usize, Vec<f64>)> {
     let file = ParquetFile::open(path).map_err(|e| ext(format!("ParquetFile::open: {e}")))?;
     let md = file.metadata().map_err(|e| ext(format!("metadata: {e}")))?;
     let cm = md.row_groups[rg].columns[col]
@@ -860,7 +884,7 @@ pub fn filter_f64_column_to_bitmap_dense(
             bitmap[row >> 3] |= 1 << (row & 7);
         }
     }
-    Ok((bitmap, total))
+    Ok((bitmap, total, values))
 }
 
 /// Σ.E5: dense fallback for BYTE_ARRAY bitmap filter. Used when the
