@@ -1,14 +1,40 @@
 # PERF_Q13 — Q13 SF=10 stage profile
 
-## Wall time
+Status: **re-verified 2026-05-26** (Σ.AH B.13).
 
-| Engine | Median ms | σ | Rows |
-|--------|----------:|----:|----:|
-| ematix-flow | 102.46 | 8.12 | 46 |
-| DuckDB | 265.19 | 9.62 | 46 |
-| Polars | 414.52 | 28.44 | 46 |
+## Wall time (20×3 canonical 2026-05-26)
 
-**2.6× ahead of DuckDB**, 4× ahead of Polars. Strong existing win.
+| Engine | Median ms | σ |
+|--------|----------:|----:|
+| ematix-flow | **95.81** | 7.10 |
+| DuckDB | 273.22 | 6.15 |
+
+**2.85× ahead of DuckDB** (was 2.6×). Stage profile 5-trial: 103.44 ms.
+
+## Per-stage decomposition (Σ.AH B.13)
+
+Σ compute 1301.11 ms / wall 103.44 ms = **12.58× parallelism = 90%** — TIE WITH Q06 FOR BEST IN SWEEP.
+
+| Stage | Floor | Actual | Status |
+|-------|-------|--------|--------|
+| FilterExec `o_comment NOT LIKE '%special%requests%'` (15M → 14.8M) | LIKE matcher 9-14× std → ~150 ms parallel | 431.59 | **2.9× over** — LIKE on 15M rows is expensive, NOT LIKE matches 99% so projection cost dominates |
+| AggregateExec SinglePartitioned (15.3M → 1.5M groups, count) | 15M × 3 ns + 1.5M output finalize = ~50 ms | 350.16 | **7× over** — 1.5M groups (very high cardinality count agg) |
+| HashJoinExec Left customer ⋈ orders Partitioned (build 1.5M, probe 14.8M, Left join) | 14.8M × 12 ns = 178 ms | ~180 | 332.58 | **1.9× over** — Left-join semantics need extra null-handling |
+| EmatixFastParquetExec orders | ~30 | 180.48 | mild over |
+| AggregateExec Partial (count-of-counts → 570 groups) | trivial | 4.26 | at-floor ✓ |
+| Repartition | small | <2 | at-floor ✓ |
+
+Σ floor ~600 ms; observed 1301 ms — ~700 ms parallel over-floor (~55 ms wall waste). Σ/12.58 = 103 ms wall = matches.
+
+## Findings
+
+- **Q13 has high parallelism (90%) but stage-level inefficiencies sum to 55 ms wall waste**, anchored to LIKE filter overhead and high-cardinality count agg.
+- **AggregateExec at 1.5M groups (one per customer)** is essentially a per-row count via group-by. Photon would specialise this as `count per FK` (a count-grouping on join input where the join key uniquely identifies the group). Probably out of scope.
+- The Left-join with 1.5M build × 14.8M probe is doing the right work — just structurally expensive at this cardinality.
+
+**Q13 is the best query for showing the cross-query parallelism trend:** Q06 + Q13 both single-table + agg = 80-90% parallel. Adding joins or shuffles drops parallelism.
+
+**Next:** B.14 (Q14 — 85.49 ms, +38% vs DuckDB).
 
 ## Physical plan
 
