@@ -1,18 +1,28 @@
 # PERF_Q01 — Q01 SF=10 stage profile
 
-Status: profiled 2026-05-25.
+Status: **re-verified 2026-05-26** (Σ.AH Phase B.1). Originally profiled 2026-05-25.
 Hardware: M-series arm64, 14 cores.
 Data: `examples/tpch/data/sf10/lineitem.parquet`, Snappy, 58 row groups, 60M rows.
 
-## Wall time (median of 5 trials, 2 warmups)
+## Wall time
 
-| Engine | Median ms | σ | Rows |
-|--------|----------:|----:|----:|
-| ematix-flow | 264.12 | 13.62 | 4 |
-| DuckDB | 244.31 | 9.01 | 4 |
-| Polars | 444.59 | 138.38 | 4 |
+### 2026-05-26 refresh (20 trials × 3 warmups, post-Σ.AG.7 bare invocation — canonical)
 
-We are 8% behind DuckDB, 1.68× ahead of Polars. Win margin small; floor is close.
+| Engine | Median ms | σ |
+|--------|----------:|----:|
+| ematix-flow | **235.38** | 10.52 |
+| DuckDB | 237.23 | 4.14 |
+
+ematix and DuckDB are now in a statistical tie at SF=10 (ematix 1% faster, well inside the SF=10 noise band). Down from −8% vs DuckDB at the 2026-05-25 profile.
+
+### Stage profile (5 trials × 2 warmups, current run for this verify)
+
+- per-trial (ms): [226.07, 234.11, 235.94, 234.46, 236.12]
+- median: 234.46 ms
+
+### 2026-05-25 baseline (for delta tracking, deprecated)
+
+ematix-flow 264.12 ± 13.62, DuckDB 244.31, Polars 444.59. The 264 → 234 ms gain (−11%) is the cumulative impact of: (1) StringView `new_unchecked` (candidate #1, landed 2026-05-25); (2) Σ.AE post-filter cardinality + bitmap-stash + Arc-shared buffer; (3) ematix-parquet 0.16.x SIMD parity; (4) Σ.AG.7 plan cache default-on (Q01 is cacheable; ~0.7 ms saved per repeat trial).
 
 ## Physical plan (post-optimizer)
 
@@ -30,19 +40,15 @@ into one pass over each batch. There is no separate FilterExec or AggregateExec 
 function-level self-time (macOS `sample` at 1kHz over a ~10s run, 40 trials) to expand the
 black box.
 
-## Per-stage breakdown (operator-level, 5 trials median)
+## Per-stage breakdown (operator-level, 5 trials median, 2026-05-26)
 
 | Operator | Median ms compute | Out rows |
 |----------|------------------:|---------:|
-| EmatixFastParquetExec | 1791 (parallel, 6.77× wall) | 59,986,052 |
+| EmatixFastParquetExec | 1765.74 (parallel, 7.53× wall) | 59,986,052 |
 | FusedAggregateExec | 0 (work credited to upstream pull) | 0 |
 | ProjectionExec | 0 | 4 |
 
-`elapsed_compute` for `EmatixFastParquetExec` accumulates time spent inside its `next()`
-calls, which inline the downstream `FusedAggregateExec::process_batch`. The 6.77× ratio
-means ~6.77 of 14 cores were busy on average — half the cores are starved. The plan runs
-14 partitions but the scan reads sequentially within each row group, so partitions that
-finish their RGs early go idle.
+`elapsed_compute` for `EmatixFastParquetExec` accumulates time spent inside its `next()` calls, which inline the downstream `FusedAggregateExec::process_batch`. The parallel ratio improved from 6.77× → 7.53× since 2026-05-25 (more cores busy on average), but **half the cores are still starved** at end-of-stream. Plan runs 14 partitions but the scan reads sequentially within each row group, and partitions that finish their RGs early go idle. Candidate #4 still relevant.
 
 ## Function self-time (samply / macOS `sample`, 4kHz, work threads only)
 
@@ -62,25 +68,23 @@ Top contributors, aggregated by family:
 
 ## Theoretical floor
 
-Per-stage lower bounds for Q01 SF=10, parallel across 14 cores:
+Per-stage lower bounds for Q01 SF=10, parallel across 14 cores. **Constants per Phase A.1 audit (2026-05-26 appendix):**
 
 | Stage | Floor formula | Floor (ms) |
 |-------|---------------|-----------:|
 | File I/O (page cache warm) | ~80 MB compressed bytes / 5 GB/s | ~16 |
-| Snappy decompress | 880 MB uncompressed / (2 GB/s × 14) = 31 ms serial-equivalent | 31 |
-| PLAIN i64/f64 unpack + DICT utf8 decode | 60M × 1 ns/row / 14 | 4 |
-| Filter (l_shipdate i32 cmp on 60M rows) | 60M × 0.5 ns/row / 14 | 2 |
-| Multi-agg (4 groups, 4 sums + 4 avg-num/denom + count) | 60M × 2 ns/row / 14 | 9 |
+| Snappy decompress | 880 MB uncompressed / (1.61 GB/s × 14) | 39 |
+| PLAIN i64/f64 unpack + DICT utf8 decode | 60M × 0.6-1 ns/row / 14 | 3-4 |
+| Filter (l_shipdate i32 cmp on 60M rows) | 60M × 0.62 ns/row / 14 | 2.7 |
+| Multi-agg (4 groups, 4 sums + 4 avg-num/denom + count) | 60M × 2.17 ns/row / 14 | 9.3 |
 | Final assembly | — | ~1 |
-| **Floor (Snappy)** | | **~63 ms** |
-| **Actual** | | **~264 ms** |
-| **Waste ratio** | | **4.2×** |
+| **Floor (Snappy, revised)** | | **~71 ms** |
+| **Actual** | | **234.46 ms (was 264.12)** |
+| **Waste ratio** | | **3.3× (was 4.2×)** |
 
-DuckDB hits 244 ms on the same file, so this floor model is too optimistic vs what any
-production engine achieves today on this shape. Most of the gap is from memory bandwidth
-and cache-line traffic that the simple decode-rate model ignores — touching 3.8 GB of
-column data once is not free even at 80 GB/s aggregate bandwidth, since each column
-gets compared and accumulated separately rather than fused.
+DuckDB hits 237 ms on the same file — within 1% of ematix — so this floor model is still too optimistic vs what any production engine achieves on this shape. Most of the gap is **memory bandwidth and cache-line traffic** that the simple decode-rate model ignores: touching 3.8 GB of column data once is not free even at 80 GB/s aggregate bandwidth, since each column gets compared and accumulated separately rather than fused into a single sweep over the row.
+
+Updated since 2026-05-25: floor moved up 8 ms (63 → 71) using audit-verified 1.61 GB/s Snappy constant (was 2.0 GB/s). Actual moved down 30 ms. Net waste-vs-floor ratio improved 4.2× → 3.3×.
 
 ## Waste candidates worth targeting
 
@@ -144,6 +148,21 @@ Potential lever: shuffle RG assignment by predicted decompressed bytes (we have 
 
 In order of expected payoff vs effort:
 
-1. **Try `new_unchecked`** for StringViewArray + DictionaryArray construction in `emat_arrow_reader.rs`. Re-bench Q01 SF=10 and 22q geomean.
-2. **Microbench `FilterMultiAggSpec::process_batch`** to find the 16× gap to floor. Likely decimal128 or per-batch boolean-mask materialisation.
-3. **Investigate scan parallelism imbalance** as a 22q-wide lever (not Q01-specific).
+1. ~~**Try `new_unchecked`** for StringViewArray + DictionaryArray construction~~ — **LANDED 2026-05-25**.
+2. **Microbench `FilterMultiAggSpec::process_batch`** to find the gap to floor (now 3.3× rather than 4.2×, but still 165 ms of "waste" — the highest absolute candidate). Likely decimal128 or per-batch boolean-mask materialisation.
+3. **Investigate scan parallelism imbalance** as a 22q-wide lever — Q01 ran at 7.53/14 effective cores (was 6.77/14). Improvement is real but ceiling is the same. If a future change pushes Q01 past 11/14 effective cores, that's ~50 ms of wall time at the same floor.
+
+---
+
+## Verify pass — 2026-05-26 (Σ.AH B.1)
+
+**What changed since 2026-05-25:**
+- Wall time: 264 → 234 ms (−11%) without any Q01-specific work landing. Source: cumulative tax from Σ.AE bitmap-stash, ematix-parquet 0.16.x SIMD parity, Σ.AG.7 plan cache default-on.
+- Parallel ratio: 6.77 → 7.53× (more cores busy on average).
+- vs DuckDB: was −8% behind, now +0.8% ahead (statistical tie at SF=10 noise band).
+
+**Waste candidates still relevant:** #2 (FilterMultiAggSpec process_batch — same kernel, same gap) and #4 (parallelism ceiling — improved but not closed). Σ.AH Phase C should fold these into the cross-query synthesis if other scan-heavy queries show the same scan-parallelism ceiling.
+
+**No new candidate identified.** Q01 didn't surface a new structural inefficiency that hadn't already been documented in 2026-05-25.
+
+**Next:** B.2 (Q21, 311.87 ms — largest absolute wall time, biggest absolute-waste candidate).
