@@ -644,12 +644,25 @@ impl ColumnPredicate {
     pub fn is_exact_safe(&self) -> bool {
         match self {
             // Integer comparisons + discrete membership are byte-level
-            // unambiguous.
+            // unambiguous AND BridgeFilter's dict-popcount-aware
+            // i32 kernel beats DataFusion's FilterExec at SF=10.
             ColumnPredicate::I32Range { .. } | ColumnPredicate::I32In { .. } => true,
-            // Byte-equality matches Arrow's `eq_utf8`.
+            // Σ.AE.1 (2026-05-26): Byte-equality matches Arrow's
+            // `eq_utf8` semantically, BUT FilterExec running on
+            // already-decoded Arrow batches is *faster* than
+            // BridgeFilter on parquet-encoded strings for the
+            // TPC-H string-filter shapes — Arrow's string-eq kernel
+            // is highly tuned for contiguous batches. So even
+            // though string predicates COULD be declared Exact,
+            // doing so regresses Q03 (`c_mktsegment='BUILDING'`)
+            // and similar at SF=10. Keep them Inexact so
+            // FilterExec runs after the BridgeFilter has reduced
+            // the row count. The bridge still does the heavy
+            // filter; the residual FilterExec is cheap on the
+            // already-narrow surviving rows.
             ColumnPredicate::StringEq { .. }
             | ColumnPredicate::StringNotEq { .. }
-            | ColumnPredicate::StringIn { .. } => true,
+            | ColumnPredicate::StringIn { .. } => false,
             // LIKE is Exact only when `LikeMatcher::compile` accepts
             // the pattern (no `_`, no escape). Otherwise our matcher
             // can't represent the pattern → Inexact.
@@ -2131,15 +2144,35 @@ impl ExecutionPlan for EmatixFastParquetExec {
         // side, which is suboptimal for queries like Q21 where
         // pre-filter cardinalities are wildly different across joined
         // tables (e.g. nation = 25 rows vs lineitem = 6 M).
-        let rows = match partition {
+        let raw_rows = match partition {
             Some(p) if p < self.assignments.len() => self.num_rows / self.assignments.len().max(1),
             None => self.num_rows,
             _ => 0,
         };
+        // Σ.AE.1 (2026-05-26): when a BridgeFilter is pushed down,
+        // multiply the row count by the estimated pass rate so the
+        // planner picks join build sides based on POST-filter
+        // cardinality. Otherwise Exact pushdown breaks badly on
+        // queries like Q21 — the planner sees orders at unfiltered
+        // 15M, picks lineitem (60M) as the build side, and
+        // catastrophically regresses (+124% in the 2026-05-26 Exact
+        // bench). The pass-rate estimator at line 92 was already
+        // implemented for the parallel-bitmap dispatch — same input,
+        // same column stats.
+        let (rows, filtered) = if let Some(filter) = &self.filter {
+            let sel = filter.estimate_pass_rate(&self.column_stats);
+            let r = ((raw_rows as f64) * sel) as usize;
+            (r.max(1), true)
+        } else {
+            (raw_rows, false)
+        };
         let mut s = Statistics::new_unknown(&self.schema);
-        // Exact for whole-table; per-partition is an even split, so
-        // mark Inexact to signal the planner not to over-rely on it.
-        s.num_rows = if partition.is_none() {
+        // Mark Inexact whenever a filter is in play — even our Exact-
+        // safe predicates ride a selectivity estimate, not a true
+        // count. Without the filter we keep the precise count.
+        s.num_rows = if filtered {
+            datafusion::common::stats::Precision::Inexact(rows)
+        } else if partition.is_none() {
             datafusion::common::stats::Precision::Exact(rows)
         } else {
             datafusion::common::stats::Precision::Inexact(rows)
