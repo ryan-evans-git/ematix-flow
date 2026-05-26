@@ -81,9 +81,23 @@ Compared to historical milestone (0.738 / 17 wins at SF=10):
 
 ## Deferred future work
 
-- **Π.16** (ematix-parquet sibling repo): Snappy+agg-kernel decode
-  bottleneck — closes Q06+Q15 SF=10 gaps to Polars.
+- **Π.16** (ematix-parquet sibling repo): Q06/Q15 SF=10 decode gap to Polars.
+  - **Key finding** (2026-05-26 probe): Polars uses literally the same
+    `snap::raw::Decoder` we do (verified at
+    `~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/polars-parquet-0.52.0/src/parquet/compression.rs:176-187`).
+    The Snappy decode call site is functionally identical. The
+    16-18 ms gap is therefore NOT in Snappy itself — it's spread
+    across page-decode / filter-build / projection-decode phases.
+  - Q06 SF=10 stage breakdown (our engine, from `q06_sf10_breakdown`):
+    filter (3 predicates → bitmap) 46.55 ms + projection+agg 37 ms ≈
+    83 ms total. Polars does the same in 64 ms.
+  - Closing the gap needs samply/perf profiling to find the actual
+    hotspot, then targeted SIMD or micro-opts in ematix-parquet.
+    Multi-day work; deferred.
 - **Σ.AE**: physical-plan follow-up to Σ.AD so dim-join pushdown
-  doesn't regress Q07/Q21 SF=10 wall-time.
+  doesn't regress Q07/Q21 SF=10 wall-time. The structurally-correct
+  plan inserts a `CoalescePartitionsExec` between two CollectLeft
+  joins; the new shape needs partition-aware emit OR static-IN-list
+  pushdown to avoid the coalesce.
 - **Magic-set rewriting** for Q05/Q07 logical layer (multi-day infra).
 - **Bushy join planner** for Q08 (multi-week).
