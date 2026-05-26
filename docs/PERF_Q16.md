@@ -1,14 +1,41 @@
 # PERF_Q16 — Q16 SF=10 stage profile
 
-## Wall time
+Status: **re-verified 2026-05-26** (Σ.AH B.16).
 
-| Engine | Median ms | σ | Rows |
-|--------|----------:|----:|----:|
-| ematix-flow | 50.22 | 0.63 | 27,840 |
-| DuckDB | 66.20 | 0.61 | 27,840 |
-| Polars | 176.11 | 17.67 | 27,840 |
+## Wall time (20×3 canonical 2026-05-26)
 
-**24% ahead of DuckDB**, 3.5× ahead of Polars.
+| Engine | Median ms | σ |
+|--------|----------:|----:|
+| ematix-flow | **50.01** | 1.53 |
+| DuckDB | 68.51 | 2.49 |
+
+**27% ahead of DuckDB** (was 24%). Stage profile 5-trial: 49.57 ms.
+
+## Per-stage decomposition
+
+Σ compute 393.35 ms / wall 49.57 ms = **7.94× parallelism = 57%**.
+
+| Stage | Floor | Actual | Status |
+|-------|-------|--------|--------|
+| AggregateExec FinalPartitioned (distinct step, 1.19M → 364k groups, 4-col key) | ~30 ms | 50.94 | 1.7× over (4-col key) |
+| AggregateExec Partial (distinct step) | ~30 ms | 39.43 | at-floor ✓ |
+| RepartitionExec on 4-col key (1.19M rows) | ~25 ms | 23.35 | at-floor ✓ |
+| RepartitionExec (partsupp 8M) | ~80 ms | 20.38 | sub-floor (async) |
+| EmatixFastParquetExec part (2M → 307k via filter+LIKE) | ~20 ms | 14.03 | at-floor ✓ |
+| AggregateExec FinalPartitioned (count → 27k groups, 3-col key) | ~10 ms | 6.86 | mild over |
+| RepartitionExec on 3-col key (365k rows) | small | 6.17 | at-floor ✓ |
+| EmatixFastParquetExec supplier (100k) | trivial | 5.23 | mild |
+| FilterExec residuals, top ops | small | <3 each | at-floor ✓ |
+
+Σ floor ~270 ms; observed 393 ms — ~120 ms over-floor (~15 ms wall). Σ/7.94 = 49.5 ms wall = matches observed.
+
+## Findings
+
+- **Q16 at realistic floor with mild over-floor on the 4-col distinct group-by (50 ms Partial+Final for 364k groups).**
+- The distinct-as-groupby pattern (group-by 4-col key then count distinct ps_suppkey) is structurally expensive. DuckDB and ematix both pay it; we win via faster ingest. No new lever.
+- Q16's 3-clause part filter (`p_brand != x AND p_type NOT LIKE y AND p_size IN [8 vals]`) is residual FilterExec (cost 2.56 ms) — small but non-zero. The NOT-LIKE pushdown into scan would save the residual at ~3 ms wall.
+
+**Next:** B.17 (Q17 — 175.26 ms, −6% behind DuckDB; correlated-subquery shape).
 
 ## Physical plan
 
