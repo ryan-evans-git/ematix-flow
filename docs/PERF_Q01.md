@@ -66,25 +66,54 @@ Top contributors, aggregated by family:
 
 (Sum < 100% because the long tail of < 0.05%-each functions adds another ~45%.)
 
-## Theoretical floor
+## Theoretical floor (revised 2026-05-26 — per-column + parallelism-aware)
 
-Per-stage lower bounds for Q01 SF=10, parallel across 14 cores. **Constants per Phase A.1 audit (2026-05-26 appendix):**
+Q01 SF=10, 60M rows × 7 columns. Each column has very different compression — the prior uniform 1.61 GB/s estimate was wrong.
+
+### Per-column Snappy decompress floor (from `snappy_decompress_probe` 2026-05-26):
+
+| Column | Ratio | Throughput | Unc bytes (60M rows) | Per-thread decode | 14-core parallel |
+|--------|------:|-----------:|---------------------:|------------------:|-----------------:|
+| l_quantity (f64→dict) | ≈ 1.00 | 10.43 GB/s | ~45 MB | 4 ms | 0.3 ms |
+| l_extendedprice (f64) | 0.73 | 1.66 GB/s | 492 MB | 296 ms | 21 ms |
+| l_discount (f64, est) | ~0.73 | ~1.66 GB/s | ~492 MB | 296 ms | 21 ms |
+| l_tax (f64, est) | ~0.73 | ~1.66 GB/s | ~492 MB | 296 ms | 21 ms |
+| l_returnflag (char→dict) | ≈ 1.00 | ~10 GB/s | ~60 MB | 6 ms | 0.4 ms |
+| l_linestatus (char→dict) | ≈ 1.00 | ~10 GB/s | ~60 MB | 6 ms | 0.4 ms |
+| l_shipdate (i32, est) | ~0.73 | ~1.66 GB/s | ~240 MB | 144 ms | 10 ms |
+| **Sum (parallel 14-core)** | | | **~1.88 GB** | | **~74 ms** |
+
+### Full per-stage floor (parallel-equivalent, 14 cores, perfect parallelism):
 
 | Stage | Floor formula | Floor (ms) |
 |-------|---------------|-----------:|
-| File I/O (page cache warm) | ~80 MB compressed bytes / 5 GB/s | ~16 |
-| Snappy decompress | 880 MB uncompressed / (1.61 GB/s × 14) | 39 |
-| PLAIN i64/f64 unpack + DICT utf8 decode | 60M × 0.6-1 ns/row / 14 | 3-4 |
-| Filter (l_shipdate i32 cmp on 60M rows) | 60M × 0.62 ns/row / 14 | 2.7 |
-| Multi-agg (4 groups, 4 sums + 4 avg-num/denom + count) | 60M × 2.17 ns/row / 14 | 9.3 |
-| Final assembly | — | ~1 |
-| **Floor (Snappy, revised)** | | **~71 ms** |
-| **Actual** | | **234.46 ms (was 264.12)** |
-| **Waste ratio** | | **3.3× (was 4.2×)** |
+| File I/O (page cache warm, ~300 MB compressed for the 7 cols) | 300 MB / 5 GB/s | ~60 ms serial → effectively masked by parallel decode |
+| Snappy decompress (column-weighted, see table above) | (slow cols × 0.73 ratio dominate) | **74 ms** |
+| PLAIN / DICT unpack | 60M × 0.6-1 ns/row / 14 | 3-4 ms |
+| Filter (l_shipdate i32 cmp on 60M rows) | 60M × 0.62 ns/row / 14 | 2.7 ms |
+| Multi-agg (4 groups, 4 sums + 4 avg + count) | 60M × 2.17 ns/row / 14 | 9.3 ms |
+| Final assembly | — | ~1 ms |
+| **Floor (perfect parallelism)** | | **~90 ms** |
+| **Actual wall** | | **234.46 ms** |
+| **Gap to floor** | | **144 ms / 2.6×** |
 
-DuckDB hits 237 ms on the same file — within 1% of ematix — so this floor model is still too optimistic vs what any production engine achieves on this shape. Most of the gap is **memory bandwidth and cache-line traffic** that the simple decode-rate model ignores: touching 3.8 GB of column data once is not free even at 80 GB/s aggregate bandwidth, since each column gets compared and accumulated separately rather than fused into a single sweep over the row.
+### Where the 144 ms gap actually goes
 
-Updated since 2026-05-25: floor moved up 8 ms (63 → 71) using audit-verified 1.61 GB/s Snappy constant (was 2.0 GB/s). Actual moved down 30 ms. Net waste-vs-floor ratio improved 4.2× → 3.3×.
+From the 2026-05-25 self-time profile + the 2026-05-26 stage profile:
+
+- **EmatixFastParquetExec parallel compute: 1765.74 ms / 14 cores = 126 ms per-thread.** This is what one thread does end-to-end on its 4 RGs.
+- **Observed parallel speedup: 7.53× (not 14×) = 54% effective.** Wall is 1765.74 / 7.53 = 234 ms.
+- **Parallelism loss = (1/0.54 − 1) × 126 ms ≈ 108 ms** — the end-of-stream straggler effect. Each partition reads its 4 RGs sequentially; partitions that finish first idle while the slowest finishes.
+
+So the 144 ms gap breaks down as:
+- **~108 ms** = parallelism imbalance (54% effective, not 100%). Most of the gap.
+- **~36 ms** = per-thread work above the ~90 ms perfect-parallel floor.
+
+The per-thread 126 ms vs the 90 ms floor means each thread is paying ~36 ms over its share of the bandwidth + kernel floor. Likely sources (from 2026-05-25 samply):
+- Arrow buffer allocations + ref-count churn between batches (the 45% "tail" in self-time): ~25 ms / thread
+- FusedAgg `process_batch` per-row work above the 2.17 ns/row floor: ~10 ms / thread
+
+DuckDB hits 237 ms — same wall, presumably also at ~54% effective parallelism on this scan. The fact that we're at parity with DuckDB suggests both engines are hitting the same parallelism ceiling on TPC-H SF=10 lineitem scans.
 
 ## Waste candidates worth targeting
 
@@ -144,13 +173,27 @@ Potential lever: shuffle RG assignment by predicted decompressed bytes (we have 
 1. **Canonical SF=10 `lineitem.parquet` is Snappy**; LZ4 sibling lives at `lineitem.lz4.parquet` (deliberately, for the Q06 sensitivity panel). Documented so future profile sessions don't get confused.
 2. **`StringViewArray::try_new` validation is dead weight in our reader path** — has correctness shortcut available via `new_unchecked`, blocking ~9% of Q01 SF=10 self-time.
 
-## Next levers to evaluate
+## Σ.AH waste candidate ranking (revised 2026-05-26)
 
-In order of expected payoff vs effort:
+Now anchored to the per-component decomposition above:
 
-1. ~~**Try `new_unchecked`** for StringViewArray + DictionaryArray construction~~ — **LANDED 2026-05-25**.
-2. **Microbench `FilterMultiAggSpec::process_batch`** to find the gap to floor (now 3.3× rather than 4.2×, but still 165 ms of "waste" — the highest absolute candidate). Likely decimal128 or per-batch boolean-mask materialisation.
-3. **Investigate scan parallelism imbalance** as a 22q-wide lever — Q01 ran at 7.53/14 effective cores (was 6.77/14). Improvement is real but ceiling is the same. If a future change pushes Q01 past 11/14 effective cores, that's ~50 ms of wall time at the same floor.
+| Rank | Candidate | Est. wall savings | Confidence | Notes |
+|-----:|-----------|------------------:|:----------:|-------|
+| 1 | **Scan parallelism imbalance** (54% → 80% effective) | **~50 ms** (234 → ~180) | medium | Sub-RG splitting OR shuffle RG assignment by predicted decode cost. 22q-wide lever — every scan-heavy query pays this. |
+| 2 | **Arrow buffer allocation tail** (45% self-time tail) | ~10-15 ms | low | Per-batch Arc<Buffer> ref-count churn + small slice allocations. Hard to attack without restructuring batch flow. |
+| 3 | FusedAgg `process_batch` above 2.17 ns/row floor | ~5 ms | medium | Decimal128 arithmetic OR per-batch boolean-mask materialization. Microbench needed to confirm. |
+| 4 | ~~StringViewArray validation~~ | — | — | **LANDED 2026-05-25**. |
+| 5 | Snappy → LZ4_RAW codec swap on canonical file | ~3-4 ms | high | Known knob, deferred (industry convention). |
+
+## Findings to capture as memories
+
+1. **The 2026-05-25 PERF_Q01.md theoretical floor of 71 ms was too optimistic** — using a uniform Snappy constant on a 7-column projection with very different per-column compressibility undercounts the bandwidth-bound work. The correct per-column-weighted floor is ~74 ms for decompress alone, ~90 ms total for the perfect-parallelism case.
+2. **Q01's biggest single waste is parallelism imbalance, not kernel inefficiency.** 54% effective parallelism on a 14-partition scan-heavy plan; ~108 ms / 234 ms wall is unrealised parallelism. Same pattern likely on every scan-heavy SF=10 query.
+
+## Next levers from Q01
+
+1. **Cross-query check (Phase C):** measure effective parallelism on every scan-heavy SF=10 query (Q03/Q06/Q12/Q14/Q19). If all show ~54% effective parallelism, parallelism imbalance is a top-priority arc (Σ.AH.X candidate).
+2. **Defer Q01-specific microbench of FilterMultiAggSpec::process_batch** — the wall savings are bounded by the parallelism ceiling. A faster `process_batch` doesn't help if cores still idle at end-of-stream. Re-evaluate after the parallelism fix.
 
 ---
 
@@ -161,8 +204,6 @@ In order of expected payoff vs effort:
 - Parallel ratio: 6.77 → 7.53× (more cores busy on average).
 - vs DuckDB: was −8% behind, now +0.8% ahead (statistical tie at SF=10 noise band).
 
-**Waste candidates still relevant:** #2 (FilterMultiAggSpec process_batch — same kernel, same gap) and #4 (parallelism ceiling — improved but not closed). Σ.AH Phase C should fold these into the cross-query synthesis if other scan-heavy queries show the same scan-parallelism ceiling.
+**Floor revision (the user's pushback):** the 2026-05-25 floor of 71 ms used a uniform Snappy constant. Replaced with per-column-weighted floor (74 ms decompress + agg/filter overhead = ~90 ms perfect-parallel). The 144 ms gap now breaks down as **~108 ms parallelism imbalance + ~36 ms per-thread overhead above kernel floor**. The parallelism imbalance is the dominant waste candidate, replacing FusedAgg microbench as the top priority.
 
-**No new candidate identified.** Q01 didn't surface a new structural inefficiency that hadn't already been documented in 2026-05-25.
-
-**Next:** B.2 (Q21, 311.87 ms — largest absolute wall time, biggest absolute-waste candidate).
+**Next:** B.3 (Q03 — 145.74 ms, statistical tie with DuckDB).
