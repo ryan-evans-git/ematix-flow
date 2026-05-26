@@ -974,7 +974,12 @@ pub struct EmatArrowBatchReader {
     /// batch via Arrow's SIMD `filter` kernel after the zero-copy
     /// slice of `cur_rg_columns`. Cleared on RG boundary by
     /// `load_row_group` / `load_row_group_dense`.
-    cur_rg_filter_bitmap: Option<Vec<u8>>,
+    /// Σ.AE.3 (2026-05-26): stored as Arc-shared `Buffer` (not raw
+    /// `Vec<u8>`) so `slice_batch` clones it cheaply on each batch
+    /// rather than copying ~125 KB via `Buffer::from_slice_ref` per
+    /// 65k-row batch (the Vec<u8> form regressed Q03 SF=10 +5% Exact
+    /// mode through cumulative per-batch buffer allocation).
+    cur_rg_filter_bitmap: Option<datafusion::arrow::buffer::Buffer>,
     /// Next row index within the current RG.
     cur_rg_row: usize,
     /// Total rows in the current RG.
@@ -1102,7 +1107,8 @@ impl EmatArrowBatchReader {
             self.cur_rg_total = self.cached_md.row_groups[rg].num_rows as usize;
             self.load_row_group_dense(rg)?;
             if std::env::var_os("EMAT_EXACT_PUSHDOWN").is_some() {
-                self.cur_rg_filter_bitmap = Some(bitmap);
+                self.cur_rg_filter_bitmap =
+                    Some(datafusion::arrow::buffer::Buffer::from_vec(bitmap));
             }
             return Ok(());
         }
@@ -1374,7 +1380,7 @@ impl EmatArrowBatchReader {
 
         self.cur_rg_total = total;
         self.cur_rg_columns = Some(cols);
-        self.cur_rg_filter_bitmap = Some(bitmap);
+        self.cur_rg_filter_bitmap = Some(datafusion::arrow::buffer::Buffer::from_vec(bitmap));
         self.cur_rg_row = 0;
 
         if timing {
@@ -1599,19 +1605,20 @@ impl EmatArrowBatchReader {
         // pipeline shape FilterExec would have provided if pushdown
         // were Inexact; with Exact pushdown, this is the only filter
         // step in the plan for the pushed predicate.
-        if let Some(bm) = self.cur_rg_filter_bitmap.as_ref() {
+        if let Some(buf) = self.cur_rg_filter_bitmap.as_ref() {
             let timing = std::env::var_os("EMAT_TIMING").is_some();
             let t_filter = if timing {
                 Some(std::time::Instant::now())
             } else {
                 None
             };
-            // Build a BooleanBuffer that points into the bitmap with
-            // the batch's row offset. BooleanBuffer takes a Buffer +
-            // start bit + length, so we can window the bitmap without
-            // copying.
+            // Σ.AE.3 (2026-05-26): clone the cached Buffer (Arc bump,
+            // not a memcpy) and window into it. Previously did
+            // `Buffer::from_slice_ref(&Vec<u8>)` per slice_batch call,
+            // which copied the whole bitmap each time (~125 KB × 15
+            // batches/RG → ~7.5 MB of copies per Q03 partition).
             let bool_buf =
-                datafusion::arrow::buffer::BooleanBuffer::new(Buffer::from_slice_ref(bm), start, n);
+                datafusion::arrow::buffer::BooleanBuffer::new(buf.clone(), start, n);
             let predicate_arr = arrow_array::BooleanArray::new(bool_buf, None);
             let filtered = datafusion::arrow::compute::filter_record_batch(&batch, &predicate_arr)
                 .map_err(|e| ext(format!("filter_record_batch: {e}")))?;
