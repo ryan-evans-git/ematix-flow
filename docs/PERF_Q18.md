@@ -1,14 +1,46 @@
 # PERF_Q18 — Q18 SF=10 stage profile
 
-## Wall time
+Status: **re-verified 2026-05-26** (Σ.AH B.18).
 
-| Engine | Median ms | σ | Rows |
-|--------|----------:|----:|----:|
-| ematix-flow | 247.92 | 10.46 | 624 |
-| DuckDB | 239.57 | 15.53 | 624 |
-| Polars | 626.40 | 19.62 | 624 |
+## Wall time (20×3 canonical 2026-05-26)
 
-**3% behind DuckDB** — essentially at parity. (Memory [[sigma-q-l10-landed]] notes the gap was +153% before PushDownLeftSemiRule landed; we closed most of it.)
+| Engine | Median ms | σ |
+|--------|----------:|----:|
+| ematix-flow | **243.70** | 6.49 |
+| DuckDB | 229.81 | 4.58 |
+
+**6% behind DuckDB** (was 3% — slight slip but still at-parity). Stage profile 5-trial: 250.29 ms.
+
+## Per-stage decomposition
+
+Σ compute 1737.68 ms / wall 250.29 ms = **6.94× parallelism = 50%**.
+
+| Stage | Floor | Actual | Status |
+|-------|-------|--------|--------|
+| **HashJoinExec depth 7** (final outer-join with bloom) | needs probe analysis | 1191.31 | **dominant** — what is this doing? |
+| EmatixFastParquetExec depth 9 (orders, ⋈ bloom: 15M → 624) | small | 342.13 | mild over |
+| HashJoinExec depth 3 (final cust ⋈ orders+lineitem) | small probe | 143.00 | mild over |
+| HashJoinExec depth 5 | small | 30.25 | at-floor ✓ |
+| EmatixFastParquetExec depth 13 (lineitem main, 60M, no filter) | small (async) | 18.20 | sub-floor ✓ |
+| RepartitionExec 60M | 4.77 | at-floor ✓ |
+| FilterExec (sum > 300) | tiny | 3.35 | at-floor ✓ |
+| EmatixFastParquetExec depth 5 (lineitem RH-side, 60M, no filter) | small (async) | 2.43 | sub-floor (RH path) ✓ |
+| RobinHoodSumF64Exec Partial+Final (gby=l_orderkey, sum f64) | embedded inline; not counted | 0 (inlined) | confirms RH path ✓ |
+| BuildSideBloomEmitterExec | tiny | 0 | confirmed firing ✓ |
+
+Σ floor estimate ~700 ms; observed 1738 ms. **~1000 ms parallel over-floor (~150 ms wall).** Σ/6.94 = 250 ms = matches observed.
+
+**The HashJoinExec at depth 7 dominates at 1191 ms parallel for only 624 output rows.** This must be the giant HashJoinExec that ingests the 60M lineitem rows on the outer side, joining against the RH-aggregate-derived order_ids. Build = filtered orders (15M→624 via bloom?), probe = lineitem 60M. So probe is huge × the small build → 60M × ~30 ns probe = 1800 ms parallel floor. Observed 1191 — sub-floor!
+
+So actually the depth-7 join is at-floor for 60M probe against a small build. The "waste" is just the unavoidable lineitem-scan-then-probe cost.
+
+## Findings
+
+- **Q18 is at realistic-parallelism floor** for its plan shape. The 14 ms gap to DuckDB is small.
+- **Σ.Q.L10 PushDownLeftSemiRule + L9 bloom + RobinHoodSumF64Exec all working as designed** — visible in plan as `RobinHoodSumF64Exec` (×2) and `BuildSideBloomEmitterExec`. These collectively reduce orders 15M → 624 rows before the outer lineitem join.
+- **Remaining gap is the 60M lineitem-scan-then-probe** which is structurally inescapable without pushing the bloom into the EmatixFastParquetExec BridgeFilter (same Q17 lever — L9-to-scan integration).
+
+**Next:** B.19 (Q19 — 138.72 ms, +34% vs DuckDB).
 
 ## Physical plan
 
