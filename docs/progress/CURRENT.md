@@ -1,12 +1,14 @@
 # Current progress
 
-**Active plan:** [`docs/plans/CURRENT.md`](../plans/CURRENT.md) — Σ.T V5 Tier 1: universal amplifying-with-scale levers (L3 PGO → L13 custom hash join → L14 dict-preserved default)
-**Started:** 2026-05-25
-**Active phase:** Phase 1 — L3 PGO release build
-**Active story:** Story 1.1 — cargo-pgo install + instrumented build pipeline
+**Active plan:** [`docs/plans/CURRENT.md`](../plans/CURRENT.md) — Σ.AH: clean-slate Q01-Q22 SF=10 execution-plan inefficiency review (per-stage waste survey on post-Σ.AG.7 numbers)
+**Started:** 2026-05-26
+**Active phase:** Phase A — methodology refresh
+**Active story:** A.1 — audit `STAGE_PROFILING_METHODOLOGY.md` constants against post-Σ.AG.7 reality
 
-Phase 1 estimate: 1 week. Phase 2 estimate: 2-3 person-quarters. Phase 3 estimate: 4-6 weeks.
+Phase A estimate: 0.5–1 day. Phase B estimate: 3 person-days (22 queries × 30–60 min, hard 2-hour cap each). Phase C estimate: 1 day. Phase D estimate: 1 day.
 
-**Roadmap parent:** [`docs/PHASE_SIGMA_T_SF10_WEAKNESS_CLOSURE_V5.md`](../PHASE_SIGMA_T_SF10_WEAKNESS_CLOSURE_V5.md) §1 Tier 1.
+**Branch policy:** local commits only on this plan; no PRs until a Phase D arc is sized and gated.
 
-**Deferred:** [`docs/plans/sidecar-deferred.md`](../plans/sidecar-deferred.md) — V5 Tier 5 sidecar read+adaptive work; resumes after Phase 3 or as a parallel track.
+**Previous active plan (archived 2026-05-26):** [`docs/plans/archive/2026-05-25-sigma-t-v5-tier-1.md`](../plans/archive/2026-05-25-sigma-t-v5-tier-1.md) — Σ.T V5 Tier 1 (L13 custom hash join, Story 2.1 not started). May resume after this survey's Phase D depending on the arc ranking.
+
+**Deferred:** [`docs/plans/sidecar-deferred.md`](../plans/sidecar-deferred.md) — V5 Tier 5 sidecar read+adaptive work.
