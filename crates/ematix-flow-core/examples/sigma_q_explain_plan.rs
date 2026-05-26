@@ -59,13 +59,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let sql = std::fs::read_to_string(format!("examples/tpch/queries/q{q:02}.sql"))?;
     let df = ctx.sql(&sql).await?;
-    let df = if std::env::var("EMAT_REORDER").is_ok() {
-        let optimized = df.into_optimized_plan()?;
-        println!("=== Q{q:02} optimized LogicalPlan (pre-reorder) ===");
+    if std::env::var("EMAT_DUMP_LOGICAL").is_ok() {
+        println!("=== Q{q:02} unoptimized LogicalPlan ===");
+        println!("{}", df.logical_plan().display_indent());
+        let optimized = df.clone().into_optimized_plan()?;
+        println!("\n=== Q{q:02} optimized LogicalPlan ===");
         println!("{}", optimized.display_indent());
-        let rewritten =
-            ematix_flow_core::join_reorder::reorder_inner_joins(optimized)?;
-        println!("\n=== Q{q:02} optimized LogicalPlan (POST-reorder) ===");
+    }
+    let df = if std::env::var("EMAT_REORDER").is_ok() || std::env::var("EMAT_AGG_SEMI").is_ok() {
+        let optimized = df.into_optimized_plan()?;
+        println!("=== Q{q:02} optimized LogicalPlan (pre-rewrite) ===");
+        println!("{}", optimized.display_indent());
+        let mut rewritten = optimized;
+        if std::env::var("EMAT_AGG_SEMI").is_ok() {
+            rewritten = ematix_flow_core::agg_filter_pushdown::push_filter_into_agg(rewritten)?;
+        }
+        if std::env::var("EMAT_REORDER").is_ok() {
+            rewritten = ematix_flow_core::join_reorder::reorder_inner_joins(rewritten)?;
+        }
+        println!("\n=== Q{q:02} optimized LogicalPlan (POST-rewrite) ===");
         println!("{}", rewritten.display_indent());
         ctx.execute_logical_plan(rewritten).await?
     } else {

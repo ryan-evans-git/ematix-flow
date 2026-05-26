@@ -319,21 +319,56 @@ async fn run_ematix_flow(data_dir: &Path, sql: &str) -> Trial {
     // reorder, then hands the rewritten plan to `execute_logical_plan`
     // (which skips logical optimization — predicate pushdown /
     // projection pruning ran in the first pass).
+    //
+    // Σ.U Phase 1 (2026-05-26): optional agg-side LeftSemi
+    // pushdown. Opt-in via `EMAT_AGG_SEMI=1`. Pushes a Filter
+    // subtree as LeftSemi into an Aggregate's input so the agg only
+    // sees rows whose group key survives the outer filter. Targets
+    // Q17's correlated-subquery shape.
     let reorder_on = std::env::var("EMAT_REORDER")
         .ok()
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
-    let df = if reorder_on {
+    let agg_semi_on = std::env::var("EMAT_AGG_SEMI")
+        .ok()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let df = if reorder_on || agg_semi_on {
         match df.into_optimized_plan() {
-            Ok(plan) => match ematix_flow_core::join_reorder::reorder_inner_joins(plan) {
-                Ok(rewritten) => match ctx.execute_logical_plan(rewritten).await {
+            Ok(plan) => {
+                let plan = if agg_semi_on {
+                    match ematix_flow_core::agg_filter_pushdown::push_filter_into_agg(plan) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            return Trial::Fail(format!(
+                                "agg_semi: {}",
+                                short(&e.to_string())
+                            ));
+                        }
+                    }
+                } else {
+                    plan
+                };
+                let plan = if reorder_on {
+                    match ematix_flow_core::join_reorder::reorder_inner_joins(plan) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            return Trial::Fail(format!(
+                                "reorder: {}",
+                                short(&e.to_string())
+                            ));
+                        }
+                    }
+                } else {
+                    plan
+                };
+                match ctx.execute_logical_plan(plan).await {
                     Ok(d) => d,
                     Err(e) => {
-                        return Trial::Fail(format!("reorder exec: {}", short(&e.to_string())));
+                        return Trial::Fail(format!("rewrite exec: {}", short(&e.to_string())));
                     }
-                },
-                Err(e) => return Trial::Fail(format!("reorder: {}", short(&e.to_string()))),
-            },
+                }
+            }
             Err(e) => return Trial::Fail(format!("optimize: {}", short(&e.to_string()))),
         }
     } else {

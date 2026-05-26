@@ -147,6 +147,13 @@ pub mod dict_routing;
 // reorder and falls back to FROM-clause order. See
 // `docs/PHASE_SIGMA_T_JOIN_REORDER.md`.
 pub mod join_reorder;
+// Σ.U (2026-05-26): push a filter as LeftSemi into an Aggregate's
+// input scan. Targets Q17 SF=10 where DF decorrelates the
+// correlated `(SELECT 0.2*AVG(l_quantity) WHERE l_partkey=outer.p_partkey)`
+// into an Aggregate-over-full-lineitem joined back to filtered
+// part, but the agg still runs on all 60M rows producing 10.8M
+// groups when only ~200 partkeys actually matter.
+pub mod agg_filter_pushdown;
 // Σ.L.2 (2026-05-21): adaptive runtime workload feedback. Persists
 // per-shape probe outcomes + per-query observability (selectivity,
 // hash collision rate) to a SQLite file (~/.ematix/workload.db by
