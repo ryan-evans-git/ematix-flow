@@ -1,14 +1,39 @@
 # PERF_Q20 — Q20 SF=10 stage profile
 
-## Wall time
+Status: **re-verified 2026-05-26** (Σ.AH B.20).
 
-| Engine | Median ms | σ | Rows |
-|--------|----------:|----:|----:|
-| ematix-flow | 127.14 | 57.92 | 1,804 |
-| DuckDB | 143.27 | 3.77 | 1,804 |
-| Polars | 257.24 | 26.55 | 1,804 |
+## Wall time (20×3 canonical 2026-05-26)
 
-**11% ahead of DuckDB**, 2× ahead of Polars. (High σ 57.92 = cold-vs-warm cache variance.)
+| Engine | Median ms | σ |
+|--------|----------:|----:|
+| ematix-flow | **131.47** | 4.34 |
+| DuckDB | 150.94 | 4.39 |
+
+**13% ahead of DuckDB** (was 11%). σ stabilised: 57.92 → 4.34 (RG cache default-on). Stage profile 5-trial: 126.51 ms.
+
+## Per-stage decomposition
+
+Σ compute 951.35 ms / wall 126.51 ms = **7.52× parallelism = 54%**.
+
+| Stage | Floor | Actual | Status |
+|-------|-------|--------|--------|
+| Top HashJoinExec depths 6,4 (multi-join chain) | ~50 ms | 45.72 + 40.30 = 86 ms | mild over |
+| FilterExec residual (availqty > 0.5*sum residual) | 21k rows | 15.43 | mild over |
+| RepartitionExec 9M | ~30 ms | 13.98 | sub-floor (async) |
+| EmatixFastParquetExec part (2M → 4054 via LIKE) | ~10 | 6.91 | at-floor ✓ |
+| FilterExec (9.1M residual) | small | 5.21 | at-floor ✓ |
+| EmatixFastParquetExec partsupp (8M, RG cache) | small | 0.72 | sub-floor (cache hit?) |
+| HashJoin top + nation joins | small | <1 each | at-floor ✓ |
+
+Σ floor ~250 ms; observed 951 ms (most credited to async-pipelined upstream, see top stages above). Σ/7.52 = 126 ms wall = matches.
+
+## Findings
+
+- **Q20 at realistic-parallelism floor.** σ stabilised by Σ.O.c.2 default-on (57.92 → 4.34).
+- **Σ.Q.L9 + L10 + RobinHoodSumF64TwoKeyExec (2-key sum agg)** all firing visibly in the plan (BuildSideBloomEmitterExec + RightSemi + 2-key sum). Memory `[[lever4]]` notes 2-key Robin Hood was committed but not enabled by default per the codegen-sensitivity gate. Q20 confirms it's effective when it does fire.
+- 5th query confirming σ stabilisation from RG cache default-on (Q08/Q12/Q15/Q19/Q20).
+
+**Next:** B.21 (Q21 — 311.87 ms, +30% vs DuckDB; biggest absolute wall).
 
 ## Physical plan
 
