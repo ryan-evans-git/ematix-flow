@@ -150,12 +150,23 @@ impl PlanCache {
             return rebuild_plan_tree(&entry.physical_template);
         }
         // Slow path: full SQL → DataFrame → logical → physical.
-        // Cache the OPTIMIZED LogicalPlan (`df.logical_plan()` returns
-        // the plan after analyzer + optimizer have run) and the
-        // resulting PhysicalPlan template.
         let df = ctx.sql(sql).await?;
         let logical = Arc::new(df.logical_plan().clone());
         let physical = ctx.state().create_physical_plan(&logical).await?;
+        // Σ.AG.4 (2026-05-26): only cache plans whose every operator
+        // is re-execute-safe via with_new_children. Plans containing
+        // BuildSideBloomEmitterExec (Σ.Q.L9) carry an Arc<RuntimeBloomSideband>
+        // that's populated by the emitter on first execute; rebuilds
+        // via with_new_children clone the Arc, so trial-2 sees stale
+        // (or cleared) sideband state and the scan filter rejects
+        // every row (Q21 SF=1: 411 rows → 0 rows on rep 2+). For
+        // these plans, skip the cache entirely and re-physicalize
+        // each time. The slow path (~0.8 ms) is still cheaper than
+        // re-running the user's query, just not as fast as the
+        // template rebuild.
+        if !is_cacheable(&physical) {
+            return rebuild_plan_tree(&physical);
+        }
         self.insert(
             key,
             CacheEntry {
@@ -243,6 +254,52 @@ impl Default for PlanCache {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Σ.AG.4 (2026-05-26): plan-tree predicate — returns true iff every
+/// operator in the tree is safe to clone-and-rebuild via
+/// `with_new_children`.
+///
+/// Refuses for:
+///
+/// - `BuildSideBloomEmitterExec` — populates an Arc<RuntimeBloomSideband>
+///   on first execute that subsequent rebuilds clone (not re-populate).
+///
+/// - `HashJoinExec` with `mode=CollectLeft` AND `join_type=LeftSemi`
+///   or `LeftAnti`. DataFusion's CollectLeft probe side uses a
+///   "visited" bitmap on the build-side hash table to track which
+///   rows have produced output. The bitmap is held in the cached
+///   `JoinLeftData` and survives `with_new_children` rebuilds. After
+///   rep 0 marks every build row as visited, rep 1+ on the same
+///   cached state finds no unvisited rows → empty output.
+///
+/// Empirically verified at 22q SF=1: with the BuildSide-only gate,
+/// Q20/Q21/Q22 still return 0 rows on rep 2+ (411→0, 186→0, 7→0).
+/// All three have at least one CollectLeft + LeftSemi or LeftAnti
+/// join. Q18 (LeftSemi but Partitioned mode) caches safely.
+///
+/// Other operators (RepartitionExec, AggregateExec, Inner/RightSemi
+/// HashJoinExec, FilterExec, ProjectionExec, SortExec, EmatixFastParquetExec)
+/// re-execute safely.
+pub fn is_cacheable(plan: &Arc<dyn ExecutionPlan>) -> bool {
+    if plan.name() == "BuildSideBloomEmitterExec" {
+        return false;
+    }
+    if plan.name() == "HashJoinExec" {
+        if let Some(hj) = plan
+            .as_any()
+            .downcast_ref::<datafusion::physical_plan::joins::HashJoinExec>()
+        {
+            use datafusion::common::JoinType;
+            use datafusion::physical_plan::joins::PartitionMode;
+            if matches!(hj.partition_mode(), PartitionMode::CollectLeft)
+                && matches!(hj.join_type(), JoinType::LeftSemi | JoinType::LeftAnti)
+            {
+                return false;
+            }
+        }
+    }
+    plan.children().iter().all(|c| is_cacheable(c))
 }
 
 /// Σ.AG.2 (2026-05-26): bottom-up rebuild of a cached PhysicalPlan

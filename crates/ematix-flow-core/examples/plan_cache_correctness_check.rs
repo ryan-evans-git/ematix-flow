@@ -42,11 +42,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let cache = PlanCache::new();
 
-    for (name, sql) in [("Q06", Q06_SQL), ("Q15", Q15_SQL), ("Q21", Q21_SQL)] {
-        println!("\n=== {name} ===");
-        for rep in 0..5 {
-            let t = std::time::Instant::now();
-            let plan = cache.get_or_plan(&ctx, sql).await?;
+    // Test all 22 queries; print row counts per rep so we can spot
+    // any query where the cache returns different rows on rep 0 vs
+    // reps 1-4 (i.e. stateful operators that aren't reset by
+    // with_new_children).
+    let dir_str = dir.to_string_lossy();
+    let workspace =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().and_then(|p| p.parent()).unwrap().to_path_buf();
+    let queries_dir = workspace.join("examples/tpch/queries");
+    let mut broken: Vec<u8> = Vec::new();
+    for q in 1u8..=22 {
+        let sql_path = queries_dir.join(format!("q{q:02}.sql"));
+        let sql = std::fs::read_to_string(&sql_path)?;
+        print!("Q{q:02} ");
+        let mut row_counts: Vec<usize> = Vec::with_capacity(5);
+        for _ in 0..5 {
+            let plan = cache.get_or_plan(&ctx, &sql).await?;
             let mut total = 0usize;
             for p in 0..plan.output_partitioning().partition_count() {
                 let mut s = plan.execute(p, ctx.task_ctx())?;
@@ -54,11 +65,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     total += b.num_rows();
                 }
             }
-            let ms = t.elapsed().as_secs_f64() * 1000.0;
-            println!("  rep {rep}: {ms:7.2} ms, {total} rows");
+            row_counts.push(total);
+        }
+        let ok = row_counts.iter().all(|&c| c == row_counts[0]);
+        if ok {
+            println!("OK ({} rows × 5)", row_counts[0]);
+        } else {
+            println!("BROKEN {row_counts:?}");
+            broken.push(q);
         }
     }
+    println!("\nData dir: {dir_str}");
     let (h, m) = cache.stats();
-    println!("\ncache: hits={h} misses={m}");
+    println!("cache: hits={h} misses={m}");
+    if broken.is_empty() {
+        println!("ALL 22 queries cache-safe ✓");
+    } else {
+        println!("BROKEN queries: {broken:?}");
+    }
     Ok(())
 }

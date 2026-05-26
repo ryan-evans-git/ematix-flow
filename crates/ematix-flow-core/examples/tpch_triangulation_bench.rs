@@ -22,10 +22,11 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
 use datafusion::execution::session_state::SessionStateBuilder;
+use datafusion::physical_plan::ExecutionPlanProperties;
 use datafusion::prelude::{SessionConfig, SessionContext};
 use ematix_flow_core::bloom::ContextBlooms;
 use ematix_flow_core::dedupe_aggregate_rule::DedupeAggregateForFloatDeterminism;
@@ -45,6 +46,18 @@ use futures_util::TryStreamExt;
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+/// Σ.AG.4 (2026-05-26): process-global PlanCache shared across trials.
+/// Opt-in via `EMAT_PLAN_CACHE=1`. The cache's `is_cacheable` walker
+/// refuses to cache plans with `BuildSideBloomEmitterExec` or
+/// `HashJoinExec(mode=CollectLeft, join_type=LeftSemi|LeftAnti)`,
+/// which carry execute-state not reset by `with_new_children`.
+/// Uncacheable plans fall back to full re-physicalize per trial.
+static PLAN_CACHE: OnceLock<ematix_flow_core::plan_cache::PlanCache> = OnceLock::new();
+
+fn plan_cache() -> &'static ematix_flow_core::plan_cache::PlanCache {
+    PLAN_CACHE.get_or_init(ematix_flow_core::plan_cache::PlanCache::new)
+}
 
 const TPCH_TABLES: &[&str] = &[
     "region", "nation", "supplier", "customer", "part", "partsupp", "orders", "lineitem",
@@ -290,6 +303,63 @@ async fn run_ematix_flow(data_dir: &Path, sql: &str) -> Trial {
         .ok()
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
+
+    // Σ.AG.4 (2026-05-26): plan cache short-circuit. Active only for
+    // the "vanilla" path (no per-trial logical rewriting), where the
+    // cached LogicalPlan + PhysicalPlan template is functionally
+    // identical across trials. Bypassed for plans with stateful
+    // operators via is_cacheable in PlanCache::get_or_plan.
+    let plan_cache_on = std::env::var("EMAT_PLAN_CACHE")
+        .ok()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let reorder_on_check = std::env::var("EMAT_REORDER")
+        .ok()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let agg_semi_on_check = std::env::var("EMAT_AGG_SEMI")
+        .ok()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let dim_push_on_check = std::env::var("EMAT_DIM_PUSH")
+        .ok()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let any_rewrite =
+        reorder_on_check || agg_semi_on_check || dim_push_on_check || bloom_pushdown;
+
+    if plan_cache_on && !any_rewrite {
+        let t0 = Instant::now();
+        let plan = match plan_cache().get_or_plan(&ctx, sql).await {
+            Ok(p) => p,
+            Err(e) => return Trial::Fail(format!("plan cache: {}", short(&e.to_string()))),
+        };
+        let mut total_rows = 0usize;
+        for p in 0..plan.output_partitioning().partition_count() {
+            let mut s = match plan.execute(p, ctx.task_ctx()) {
+                Ok(s) => s,
+                Err(e) => return Trial::Fail(format!("execute: {}", short(&e.to_string()))),
+            };
+            loop {
+                match s.try_next().await {
+                    Ok(Some(b)) => total_rows += b.num_rows(),
+                    Ok(None) => break,
+                    Err(e) => {
+                        return Trial::Fail(format!("collect: {}", short(&e.to_string())));
+                    }
+                }
+            }
+        }
+        let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        if let Some(rule) = bloom_rule.as_ref() {
+            rule.set(ContextBlooms::default());
+        }
+        return Trial::Pass {
+            elapsed_ms,
+            rows: total_rows,
+        };
+    }
+
     let t0 = Instant::now();
     if let (true, Some(rule)) = (bloom_pushdown, bloom_rule.as_ref()) {
         match ctx.sql(sql).await {
