@@ -544,6 +544,12 @@ async fn build_ematix_ctx(
                 }));
         }
     }
+    // Σ.AE: opt-in late physical-optimizer rule that surgically drops
+    // redundant FilterExec conjuncts already evaluated exactly by
+    // BridgeFilter. Default OFF — enable via
+    // `EMAT_DROP_REDUNDANT_FILTER=1` to A/B against the Inexact
+    // baseline.
+    builder = ematix_flow_core::drop_redundant_filter_rule::install_drop_redundant_filter_rule(builder);
     // Σ.Q.L4′: install the in-scan bloom pushdown rule with an empty
     // shared bloom slot. `run_ematix_flow` swaps the slot's contents
     // before each timed query when EMAT_BLOOM_PUSHDOWN=1.

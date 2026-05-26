@@ -154,6 +154,12 @@ pub mod join_reorder;
 // part, but the agg still runs on all 60M rows producing 10.8M
 // groups when only ~200 partkeys actually matter.
 pub mod agg_filter_pushdown;
+// Σ.AE (2026-05-26): late physical-optimizer rule that surgically
+// drops redundant FilterExec conjuncts when the underlying
+// EmatixFastParquetExec's BridgeFilter has already evaluated them
+// exactly. Spike for the "filter double-decode" pattern documented in
+// docs/PI_16_Q06_PROFILE.md. Opt-in via `EMAT_DROP_REDUNDANT_FILTER=1`.
+pub mod drop_redundant_filter_rule;
 // Σ.AD (2026-05-25): pre-plan walker that pushes small filtered-dim
 // Inner joins (nation/region with name filters) down adjacent to their
 // FK table's scan inside an Inner-join chain. Targets Q07 where
