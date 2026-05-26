@@ -1,14 +1,43 @@
 # PERF_Q22 — Q22 SF=10 stage profile
 
-## Wall time
+Status: **re-verified 2026-05-26** (Σ.AH B.22 — final query).
 
-| Engine | Median ms | σ | Rows |
-|--------|----------:|----:|----:|
-| ematix-flow | 23.63 | 1.72 | 7 |
-| DuckDB | 139.45 | 45.37 | 7 |
-| Polars | 112.28 | 2.78 | 7 |
+## Wall time (20×3 canonical 2026-05-26)
 
-**5.9× ahead of DuckDB**, 4.8× ahead of Polars. Biggest relative win in the suite.
+| Engine | Median ms | σ |
+|--------|----------:|----:|
+| ematix-flow | **23.35** | 2.20 |
+| DuckDB | 149.95 | 6.75 |
+
+**6.4× ahead of DuckDB** (was 5.9×; widened). Biggest relative win in suite (−84%). Stage profile 5-trial: 22.13 ms.
+
+## Per-stage decomposition
+
+Σ compute 328.56 ms / wall 22.13 ms = **14.85× parallelism = 106%** — exceeds 14 cores via async pipelining (same as Q21).
+
+| Stage | Floor | Actual | Status |
+|-------|-------|--------|--------|
+| HashJoinExec depth 8 (LeftAnti customer ⋈ orders, build 1.5M, probe 15M) | 15M × 12 ns = 180 ms; build 1.5M × 5 ns = 7.5 = ~190 ms | ~190 | 123.64 | **sub-floor** ✓ |
+| FilterExec ×2 (substr c_phone IN, 1.5M → 419k each) | ~30 each | 29.67 + 27.13 = 57 | at-floor ✓ |
+| RepartitionExec on customer | small | 10.86 | at-floor ✓ |
+| RepartitionExec on orders 15M | small (async) | 1.13 | sub-floor ✓ |
+| ProjectionExec | small | 0.57 | at-floor ✓ |
+| AggregateExec FinalPartitioned (98 → 14 → 7 groups) | trivial | 0.40 + 0.07 = 0.47 | at-floor ✓ |
+| customer scans ×2 (1.5M, 2 RGs each, cache makes 2nd ~free) | ~3 ms first; ~0 second | 0.23 + 0.03 = 0.26 | sub-floor ✓ (RG cache) |
+| orders scan (15M, no filter) | small (async) | 0.29 | sub-floor ✓ |
+
+Σ floor ~250 ms; observed 328 ms — ~80 ms parallel over-floor (~5 ms wall). Σ/14.85 = 22 ms wall = matches observed.
+
+## Findings
+
+- **Q22 is essentially at-floor — sub-floor on most stages thanks to async pipelining + RG cache replay of the 2nd customer scan.**
+- **Customer 2-RG scan is the EXCEPTION where 2-RG works in our favor** — small enough that 2-partition parallelism is sufficient. Compare with Q03/Q05/Q07/Q08 where customer's 2-RG limit bottlenecks larger pipelines.
+- **Q22 LeftAnti HashJoin at sub-floor** (123 ms vs ~190 floor) — DataFusion's LeftAnti probe optimisation works well; same early-exit benefit as Q04's LeftSemi.
+- **6.4× wins over DuckDB likely come from: (a) RG cache for 2× customer scan, (b) RobinHood SUM(f64) for the final agg (memory `[[sigma-nf3-beats-stock]]`), (c) DuckDB pays comparatively higher per-row cost on substr+IN filter.**
+
+**No Q22-specific lever needed.** Already at-floor.
+
+**Σ.AH Phase B COMPLETE — all 22 queries reviewed.** See Phase C synthesis next.
 
 ## Physical plan
 
