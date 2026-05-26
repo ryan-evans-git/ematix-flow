@@ -44,6 +44,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 
 use datafusion::error::DataFusionError;
+use datafusion::logical_expr::LogicalPlan;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::SessionContext;
 
@@ -57,7 +58,17 @@ pub struct PlanCache {
 }
 
 struct PlanCacheInner {
-    entries: HashMap<CacheKey, Arc<dyn ExecutionPlan>>,
+    /// Σ.AG (2026-05-26): cache the optimized LogicalPlan, not the
+    /// physical plan. PhysicalPlan operators (RepartitionExec,
+    /// AggregateExec, HashJoinExec) carry per-execute internal state
+    /// — caching `Arc<dyn ExecutionPlan>` and calling `execute()`
+    /// twice panics on the second call. LogicalPlan is immutable; we
+    /// re-physicalize it on each cache hit via
+    /// `ctx.state().create_physical_plan(&logical)`. That skips the
+    /// expensive SQL parse + analyzer + logical optimizer (which
+    /// includes our custom Inject* rules) and only re-runs the much
+    /// cheaper physical planner.
+    entries: HashMap<CacheKey, Arc<LogicalPlan>>,
     /// Insertion order — first is oldest. Simple ring; for v1 size is
     /// small (default 1024) so linear scan on eviction is fine.
     order: Vec<CacheKey>,
@@ -93,7 +104,7 @@ impl PlanCache {
         }
     }
 
-    /// Plan if needed, return the (possibly cached) ExecutionPlan.
+    /// Plan if needed, return a fresh ExecutionPlan.
     /// Idiomatic call site replaces:
     ///
     /// ```text
@@ -106,21 +117,31 @@ impl PlanCache {
     /// ```text
     /// let plan = cache.get_or_plan(&ctx, sql).await?;
     /// ```
+    ///
+    /// Σ.AG (2026-05-26): always returns a FRESH ExecutionPlan tree.
+    /// On cache hit, we still re-run the physical planner against the
+    /// cached LogicalPlan — physical plan operators are stateful and
+    /// not safe to re-execute. The win is the skipped SQL parse +
+    /// analyzer + logical optimizer (where our custom Inject*Rule
+    /// chain lives, ~0.7-0.9 ms / query on Q06 SF=1).
     pub async fn get_or_plan(
         &self,
         ctx: &SessionContext,
         sql: &str,
     ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
         let key = self.key_for(sql);
-        // Fast path: hit.
-        if let Some(plan) = self.try_get(&key) {
-            return Ok(plan);
+        // Fast path: hit on the LogicalPlan; re-physicalize.
+        if let Some(logical) = self.try_get(&key) {
+            return ctx.state().create_physical_plan(&logical).await;
         }
-        // Slow path: plan then cache.
+        // Slow path: full SQL → DataFrame → logical → cache logical →
+        // create physical plan. Cache the OPTIMIZED LogicalPlan
+        // (`df.logical_plan()` returns the plan after analyzer +
+        // optimizer have run).
         let df = ctx.sql(sql).await?;
-        let plan = df.create_physical_plan().await?;
-        self.insert(key, plan.clone());
-        Ok(plan)
+        let logical = Arc::new(df.logical_plan().clone());
+        self.insert(key, logical.clone());
+        ctx.state().create_physical_plan(&logical).await
     }
 
     fn key_for(&self, sql: &str) -> CacheKey {
@@ -131,7 +152,7 @@ impl PlanCache {
         }
     }
 
-    fn try_get(&self, key: &CacheKey) -> Option<Arc<dyn ExecutionPlan>> {
+    fn try_get(&self, key: &CacheKey) -> Option<Arc<LogicalPlan>> {
         let mut inner = self.inner.lock().unwrap();
         let cloned = inner.entries.get(key).cloned();
         if cloned.is_some() {
@@ -142,7 +163,7 @@ impl PlanCache {
         cloned
     }
 
-    fn insert(&self, key: CacheKey, plan: Arc<dyn ExecutionPlan>) {
+    fn insert(&self, key: CacheKey, plan: Arc<LogicalPlan>) {
         let mut inner = self.inner.lock().unwrap();
         if let std::collections::hash_map::Entry::Occupied(mut e) = inner.entries.entry(key.clone())
         {
