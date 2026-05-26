@@ -56,8 +56,8 @@ Per-stage floor in **summed CPU ms** (units match `elapsed_compute_ms`). Floor f
 
 | Stage | Floor formula | Floor (sum ms) | Actual (sum ms) | Over floor | Per-row ratio |
 |-------|---------------|---------------:|----------------:|-----------:|---------------|
-| FilterExec l_shipdate (60M i32 cmp) | 60M × 0.62 ns | 37 | 110.57 | **+74 (3×)** | 1.85 ns/row vs 0.62 floor |
-| FilterExec o_orderdate (15M i32 cmp) | 15M × 0.62 ns | 9 | 22.43 | +13 (2.5×) | 1.49 ns/row |
+| FilterExec l_shipdate (60M in, 32M out, 3 cols project) | 60M × 0.5 ns kernel + 32M × 12 B / 70 GB/s aggr = 30 + 77 | **107** | 110.57 | **+3** | **at-floor** ✓ (corrected B.4 — projection cost included) |
+| FilterExec o_orderdate (15M in, 7.3M out, 2 cols project) | 15M × 0.5 ns + 7.3M × 8 B / 70 GB/s = 7.5 + 8 | **15.5** | 22.43 | +7 (1.4×) | mild over — see Q04 for proj cost model |
 | HashJoinExec cust ⋈ orders probe (7.3M) | 7.3M × 12 ns | 88 | 68.62 | **−19 (0.78×)** | 9.4 ns/row — at-floor ✓ |
 | HashJoinExec (cust+orders) ⋈ lineitem probe (32M) | 32M × 12 ns (L2) to 30 ns (L3) | 384–960 | 332.84 | **−51** | 10.4 ns/row — at L2-floor (build 1.46M = 47 MB just barely fits L2 cluster) |
 | RepartitionExec 32M rows (memcpy + Hash) | 32M × ~3 ns | 96 | 77.16 | −19 | near-floor |
@@ -123,11 +123,11 @@ Worth a sample-profile pass to confirm.
 
 | Rank | Candidate | Wall savings | Confidence | Notes |
 |-----:|-----------|-------------:|:----------:|-------|
-| 1 | **FilterExec batch-boundary overhead** (3× kernel floor) | ~11 ms | medium | Q03 + Q02 both show ~3× kernel-floor on FilterExec (1.85 vs 0.62 ns/row). Cross-query lever: fuse FilterExec into scan or downstream operator to eliminate post-filter row-projection. |
-| 2 | **L9 bloom pushdown** (cust+orders)→lineitem at scan time | ~15-25 ms | medium-low | Pre-2026-05-25 candidate. Check whether L9 already fires on Q03 — if it does, this is closed; if it doesn't, scan output drops 60M → ~302k. Memory note flagged this as a candidate but it was never verified. |
-| 3 | **Customer scan 2-partition bottleneck** | ~5 ms | medium | customer.parquet has only 2 RGs at SF=10 — only 2 threads at scan time. Re-emit with more RGs (cheap fix, customer is small). |
-| 4 | **Parallelism imbalance (47% → 60%)** | ~28 ms | low | Same lever as Q01/Q02. Structural limit from pipeline shape. Hard to push without rebalancing RG assignment. |
-| 5 | **L9 + late-mat fusion** — push l_shipdate filter into lineitem scan | ~10 ms | low | `EMAT_FORCE_PARALLEL_BITMAP=1` and friends; previously rejected as default-on but may be safe for single-predicate i32 filters. |
+| 1 | **L9 bloom pushdown** (cust+orders)→lineitem at scan time | ~15-25 ms | medium-low | Pre-2026-05-25 candidate. Check whether L9 already fires on Q03 — if it does, this is closed; if it doesn't, scan output drops 60M → ~302k. |
+| 2 | **Customer scan 2-partition bottleneck** | ~5 ms | medium | customer.parquet has only 2 RGs at SF=10 — only 2 threads at scan time. Re-emit with more RGs (cheap fix, customer is small). |
+| 3 | **Parallelism imbalance (47% → 60%)** | ~28 ms | low | Same lever as Q01/Q02. Structural limit from pipeline shape. Hard to push without rebalancing RG assignment. |
+| 4 | **L9 + late-mat fusion** — push l_shipdate filter into lineitem scan | ~10 ms | low | `EMAT_FORCE_PARALLEL_BITMAP=1` and friends; previously rejected as default-on but may be safe for single-predicate i32 filters. |
+| ~~5~~ | ~~FilterExec batch-boundary overhead~~ | — | — | **RETRACTED in B.4.** Was based on a kernel-only floor (0.62 ns/row); correct floor includes projection memcpy (`out_rows × out_cols × 4 B / 70 GB/s aggregate`). With projection cost, Q03's FilterExec is at-floor. |
 
 ## Findings to capture as memories
 
