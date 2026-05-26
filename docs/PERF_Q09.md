@@ -1,14 +1,17 @@
 # PERF_Q09 — Q09 SF=10 stage profile
 
+Status: **re-verified 2026-05-26** (Σ.AH Phase B.9). Originally profiled 2026-05-25.
+
 ## Wall time
 
-| Engine | Median ms | σ | Rows |
-|--------|----------:|----:|----:|
-| ematix-flow | 278.33 | 18.53 | 175 |
-| DuckDB | 318.26 | 12.18 | 175 |
-| Polars | 441.81 | 19.05 | 175 |
+### 2026-05-26 refresh (20 trials × 3 warmups, post-Σ.AG.7 bare invocation — canonical)
 
-**13% ahead of DuckDB**, 1.6× ahead of Polars.
+| Engine | Median ms | σ |
+|--------|----------:|----:|
+| ematix-flow | **273.41** | 7.76 |
+| DuckDB | 313.32 | 4.27 |
+
+**13% ahead of DuckDB** (unchanged from 2026-05-25). Stage profile 5-trial: 277.97 ms.
 
 ## Physical plan
 
@@ -29,36 +32,86 @@ SortPreservingMergeExec [nation ASC, o_year DESC]
               lineitem                              -- 60M, no filter
 ```
 
-## Per-stage breakdown (top 8)
+## Per-stage breakdown (2026-05-26)
 
 | Rank | Operator | Depth | Median ms | Out rows |
 |-----:|:---------|------:|----------:|---------:|
-| 1 | HashJoinExec (part_filt ⋈ lineitem) | 16 | 506.25 | 3,261,613 |
-| 2 | HashJoinExec (above ⋈ supplier) | 9 | 444.70 | 3,261,613 |
-| 3 | HashJoinExec (above ⋈ partsupp 2-key) | 12 | 303.65 | 3,261,613 |
-| 4 | EmatixFastParquetExec (lineitem) | 18 | 180.56 | 59,986,052 |
-| 5 | AggregateExec (Partial gby=2 cols, sum f64) | 5 | 64.17 | 2,450 |
-| 6 | EmatixFastParquetExec (orders) | 11 | 55.24 | 15,000,000 |
-| 7 | HashJoinExec (above ⋈ orders) | 15 | 42.17 | 3,261,613 |
-| 8 | ProjectionExec | 6 | 31.80 | 3,261,613 |
+| 1 | **HashJoinExec part_filt ⋈ lineitem** Partitioned (build 108k=L2-fit, probe 60M) | 16 | **521.25** | 3,261,613 |
+| 2 | **HashJoinExec orders ⋈ above** Partitioned (build 15M=L3-spill, probe 3.26M) | 9 | **443.81** | 3,261,613 |
+| 3 | **HashJoinExec ⋈ partsupp 2-key** Partitioned (build partsupp 8M=128 MB DRAM, 2-key, probe 3.26M) | 12 | **322.77** | 3,261,613 |
+| 4 | EmatixFastParquetExec lineitem (6 cols, no filter) | 18 | 231.62 | 59,986,052 |
+| 5 | EmatixFastParquetExec orders (2 cols, no filter) | 11 | 168.72 | 15,000,000 |
+| 6 | HashJoinExec supplier ⋈ above CollectLeft (build 100k, probe 3.26M) | 15 | 68.08 | 3,261,613 |
+| 7 | ProjectionExec (3.26M rows) | 6 | 45.89 | 3,261,613 |
+| 8 | RepartitionExec | 13 | 32.43 | 3,261,613 |
+| 9 | **AggregateExec Partial** (3.26M → 2450 groups, gby=(Utf8 nation, i32 year), sum f64) | 5 | **31.13** | 2,450 |
+| 10 | RepartitionExec | 10 | 24.08 | 3,261,613 |
+| 11 | FilterExec p_name LIKE '%green%' (2M → 108k = 5.4%) | 18 | 22.92 | 108,782 |
+| 12 | HashJoinExec nation ⋈ above CollectLeft | 7 | 20.93 | 3,261,613 |
 
-Σ median compute: 1737 ms. Wall median 276 ms. Parallel speedup ≈ 6.28×.
+Σ median compute: **1948.30 ms**. Wall: 277.97 ms. **Effective parallelism: 7.01× = 50%.**
 
-## Theoretical floor
+## Theoretical floor (per-stage, projection-cost-aware)
 
-| Stage | Floor (ms) |
-|-------|-----------:|
-| lineitem scan + decode 60M × 6 cols | 18 |
-| partsupp scan 8M × 3 cols | 5 |
-| orders scan 15M × 2 cols | 4 |
-| part scan + LIKE filter (1.5M × 2) | 2 |
-| supplier/nation | <1 |
-| HashJoin part_filt 10k build × lineitem 60M probe × 15 ns / 14 | 64 |
-| HashJoin chain remaining | ~10 |
-| Hash agg (2450 groups, partial+final, f64 sum) | 3 |
-| **Floor** | **~110 ms** |
-| **Actual** | **276 ms** |
-| **Waste ratio** | **2.5×** |
+| Stage | Floor formula | Floor (sum ms) | Actual | Status |
+|-------|---------------|---------------:|-------:|--------|
+| Lineitem scan (60M × 6 cols) | 3 GB unc / (3 GB/s × 14) | ~1000 | 231.62 | sub-floor (async pipelining) |
+| Orders scan (15M × 2 cols) | small | ~100 | 168.72 | sub-floor |
+| HashJoin part_filt ⋈ lineitem (build 108k=L2, probe 60M) | 60M × 10 ns L2-probe | ~600 | 521.25 | at-floor ✓ |
+| HashJoin orders⋈above (build 15M=120 MB→DRAM, probe 3.26M) | 15M × 10 ns build + 3.26M × 30 ns probe = 150 + 98 = 248 | ~250 | 443.81 | **1.8× over** — build-side mis-order (build 120 MB > probe 78 MB) |
+| HashJoin partsupp 2-key (build 8M=128 MB→DRAM, probe 3.26M, 2-key) | 8M × 10 ns DRAM build + 3.26M × 40 ns 2-key DRAM probe = 80 + 130 = 210 | ~210 | 322.77 | **1.5× over** — partsupp build dominates |
+| HashJoin supplier⋈above CollectLeft (build 100k=L2, probe 3.26M) | 3.26M × 15 ns = 49 | ~50 | 68.08 | 1.4× over |
+| FilterExec p_name LIKE '%green%' (2M in, 108k out) | LIKE matcher 9-14× std → ~15 ns/row × 2M = 30 ms | ~30 | 22.92 | at-floor ✓ |
+| AggregateExec Partial (3.26M rows → 2450 groups, 2-col gby) | 2-col gby ~10 ns/row × 3.26M = ~33 | ~30 | 31.13 | **at-floor for 2-col** ✓ |
+| Repartition/Projection ops | memcpy + light work | ~80 | ~145 | mild over |
+| Nation ⋈ above, top joins | trivial | ~20 | 20.93 | at-floor ✓ |
+| **Σ floor sum** | | **~1370 ms** | **1948 ms** | |
+| **Σ effective-parallelism floor** | 1948 / 7.01 = | | **278 ms wall** | matches observed ✓ |
+
+**Q09 has ~570 ms of identifiable waste over kernel floor** — biggest absolute over-floor in the sweep so far. The two biggest offenders are joins where the build side spills out of cache:
+- **orders⋈above (depth 9): 444 ms vs 248 ms floor** = 196 ms parallel over-floor (~28 ms wall)
+- **partsupp 2-key (depth 12): 323 vs 210 floor** = 113 ms parallel (~16 ms wall)
+
+These are L3 / DRAM-spill builds. Both are structural: the planner picks the larger table as build because it doesn't track per-table cardinalities post-filter accurately.
+
+## Σ.AH waste candidate ranking
+
+| Rank | Candidate | Mechanism | Wall savings | Confidence |
+|-----:|-----------|-----------|-------------:|:----------:|
+| 1 | **L9 Partitioned-mode bloom: part_filt (108k) → lineitem (60M) AND part_filt → partsupp (8M)** | Drops lineitem 60M → ~3.3M and partsupp 8M → ~108k pre-decode. Critically, partsupp pre-filter changes the 2-key join build from 128 MB → 1.7 MB (L1!). Massive cascade. | **~80-100 ms** | medium |
+| 2 | **HashJoinExec orders ⋈ above build-side swap** (depth 9) | Build 15M = 120 MB > probe 3.26M = 78 MB → swap → probe L3-resident build of 78 MB | ~28 ms | low (optimizer rule) |
+| 3 | **HashJoinExec partsupp 2-key build-side swap** (depth 12) | Build partsupp 8M = 128 MB > probe 3.26M = 78 MB → swap → probe smaller build | ~16 ms | low (compound-key swap is harder) |
+| 4 | **Multi-column compound-key Robin Hood agg** | 2-col gby (Utf8 + i32) currently at 10 ns/row vs Robin-Hood single-key at 3 ns/row. Σ.R.2 was rejected for single-col i64 AVG; compound-key SUM extension is different shape. | ~7 ms (31→10 sum ms = ~3 ms wall) | low |
+| 5 | **Effective parallelism 50% → 60%** | Partial→Final agg + 6-table chain | ~15 ms wall | low (structural) |
+
+## Findings to capture as memories
+
+- **Q09 has the most identifiable absolute over-floor waste in the sweep** (~570 ms parallel = ~80 ms wall). Same root cause as Q05/Q07/Q08: large-build joins spilling caches when a runtime bloom could pre-filter the build.
+- **L9 Partitioned-mode extension would compound-effect on Q09**: pre-filter BOTH lineitem and partsupp via part_filt's keys. This converts the 128 MB partsupp 2-key build into a 1.7 MB build, moving the 2-key join from DRAM-bound to L1-bound. **Best single lever for Q09.**
+- **2-key joins where one build > probe size show up in Q07/Q08/Q09** — generalised optimizer-level side-swap rule increasingly important. Q09 has TWO such joins (depth 9 and depth 12).
+- **Q09's 2-col group-by aggregate at 10 ns/row** is the realistic floor for (Utf8, i32) keys — Robin Hood was for i64 keys and a compound version would be a different kernel. Not the biggest lever.
+
+## Next levers from Q09
+
+1. **L9 Partitioned-mode extension** — pattern across Q05/Q07/Q08/Q09 now (4 queries). Q09 specifically gets BOTH lineitem and partsupp pre-filtered → biggest cascade. **Top Σ.AH cluster candidate**.
+2. **Build-side swap rule** — now seen on Q07 + Q08 + Q09. Defer to Σ.T-style cost-based rewrite, OR add a narrow rule for build > probe shape.
+3. **Defer compound-key Robin Hood** — Q09 alone insufficient justification.
+
+---
+
+## Verify pass — 2026-05-26 (Σ.AH B.9)
+
+**What changed since 2026-05-25:**
+- Wall: 278.33 → 273.41 ms canonical (−2%). σ stable.
+- vs DuckDB: −13% ahead (unchanged).
+- Plan structure: unchanged.
+- L9 still NOT firing on part_filt → lineitem OR part_filt → partsupp (no `BuildSideBloomEmitterExec` in plan).
+
+**New per-stage decomposition** identifies the partsupp 2-key build at 128 MB (DRAM-bound) as a co-dominant waste with the orders⋈above build-side mis-order. The Q09 waste is structural: two large-build joins (depths 9 and 12) where the optimizer picked the wrong build side.
+
+**Σ.AH top candidate strengthened:** L9 Partitioned-mode extension would compound-effect on Q09 (drops both lineitem AND partsupp via the same part_filt bloom). This makes Q09 the canonical test case for the L9 Partitioned-mode arc.
+
+**Next:** B.10 (Q10 — 231.97 ms; we win by 43% vs DuckDB; biggest win margin of any query).
 
 ## Waste candidates
 
