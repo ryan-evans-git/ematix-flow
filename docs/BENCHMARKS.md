@@ -9,36 +9,33 @@ Plan: [`docs/PHASE_SIGMA_PLAN.md`](PHASE_SIGMA_PLAN.md).
 
 ---
 
-## TL;DR — release-refresh, M3 Pro (2026-05-24)
+## TL;DR — release-refresh, M3 Pro (2026-05-26, post-Σ.AG.7)
 
-**Latest 4-engine SF=1 release bench — 20 timed trials after 3 warmups,
-all four engines on the same hardware and same Parquet files:**
+**SF=1 (3-engine, 20 trials × 3 warmups, bare invocation):**
 
 | Engine  | Geomean ematix-flow speedup | Range          | Wins  |
 |---|---:|---|---:|
 | **ematix-flow** (single-node) | — | — | **20 / 22** |
-| DuckDB                        | **2.21×** | 0.96× – 8.71× | 0    |
-| Polars                        | **3.19×** | 0.74× – 553.7× | 2 (Q06, Q15) |
-| PySpark (`local[*]`)          | **13.33×** | 3.04× – 41.07× | 0    |
+| DuckDB                        | ~2.4× | 0.98× – 17.6× | 0 |
+| Polars                        | ~2.6× | 0.75× – 515× | 2 (Q06, Q15) |
 
-**SF=10 (production scale, ~10 GB) — same harness, same hardware,
-same day, 20 trials × 3 warmups:**
+**SF=10 (production scale, ~10 GB; ematix + DuckDB, Polars skipped):**
 
 | Engine  | Geomean ematix-flow speedup | Range          | Wins  |
 |---|---:|---|---:|
-| **ematix-flow** (single-node) | — | — | **14 / 22** |
-| DuckDB                        | **1.27×** | 0.77× – 4.29× | 6 (Q01, Q05, Q07, Q08, Q17, Q18) |
-| Polars                        | **3.55×** | 0.80× – 99.93× (n=21) | 2 (Q06, Q15) |
-| PySpark (`local[*]`)          | **10.74×** | 2.74× – 30.84× | 0    |
+| **ematix-flow** (single-node) | — | — | **15 / 22** |
+| DuckDB                        | ~1.34× | 0.80× – 6.42× | 7 (Q03 tie, Q05, Q06, Q07, Q08, Q17, Q18) |
 
-> **SF=10 noise band.** Two back-to-back clean runs on the same binary
-> moved between 11 and 14 ematix wins (per-query medians shifted 5–29%
-> in the same direction for **both** ematix-flow and DuckDB — system
-> thermal effect, not engine). Published numbers above are from the
-> thermally-cleanest of two runs. Treat **11–14 wins as the
-> steady-state SF=10 range**, with 17 achievable under unusually clean
-> conditions. Raw logs for both runs are checked in under
-> `bench-results/release-2026-05-24/` in the repo root.
+> **Σ.AG.7 default-on change.** As of commit 71f1618, the plan cache
+> and every winning lever default ON in the triangulation bench. A bare
+> `cargo run --release ... --example tpch_triangulation_bench` reaches
+> the milestone config — no env vars required. Set any of
+> `EMAT_PLAN_CACHE / PUSH_SEMI / RH_SUM_F64 / RT_BLOOM_* / ALL_TABLES_EMAT
+> / RG_DECODE_CACHE = 0` to disable a specific lever for A/B benching.
+
+> **SF=10 noise band.** Per-query medians shift ±5–15% across
+> back-to-back runs from thermal effects (both engines move together).
+> Treat **13–17 ematix wins as the steady-state SF=10 range**.
 
 The full per-query table + provenance / config / caveats live on the
 public docs site:
