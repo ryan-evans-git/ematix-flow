@@ -310,10 +310,16 @@ async fn run_ematix_flow(data_dir: &Path, sql: &str) -> Trial {
     // cached LogicalPlan + PhysicalPlan template is functionally
     // identical across trials. Bypassed for plans with stateful
     // operators via is_cacheable in PlanCache::get_or_plan.
+    //
+    // Σ.AG.6 (2026-05-26): default ON at milestone config. SharedSubtreeExec
+    // gate closed the last stale-data hole — the cache only stores plan
+    // structure, every hit rebuilds a fresh executable tree via
+    // `with_new_children`, and TableProviders re-read on every execute.
+    // Set `EMAT_PLAN_CACHE=0` to disable for A/B benching.
     let plan_cache_on = std::env::var("EMAT_PLAN_CACHE")
         .ok()
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
+        .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+        .unwrap_or(true);
     let reorder_on_check = std::env::var("EMAT_REORDER")
         .ok()
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
