@@ -2,8 +2,8 @@
 
 **Active plan:** [`docs/plans/CURRENT.md`](../plans/CURRENT.md) — **Σ.AH.2: L9 emitter Partitioned-mode extension**
 **Started:** 2026-05-26 (promoted from Σ.AH Phase D arc shell)
-**Active phase:** Pre-work
-**Active story:** Σ.AH.4 chore — customer.parquet re-emit with 14 row groups (30-60 min). Then Story 1 (partition-aware bloom merge).
+**Active phase:** Pre-work DONE → Story 1 next
+**Active story:** Σ.AH.4 closed 2026-05-26 (partition-count generalization, code-only; baseline data preserved). Next: Story 1 (partition-aware bloom merge).
 
 **Predicted impact:** ~150-200 ms wall across Q05/Q07/Q08/Q09 = 3-6 pp SF=10 geomean. Solo target; cascade with Σ.AH.1 adds another 2-3 pp.
 
@@ -26,7 +26,7 @@ The Σ.AH survey (Phases A-D) completed 2026-05-26 and archived to [`docs/plans/
 
 **Σ.AH.3 (build-vs-probe side-swap)** drafted at [`docs/plans/sigma-ah-arc-3.md`](../plans/sigma-ah-arc-3.md). Opportunistic; activates after AH.1+AH.2.
 
-**Σ.AH.4 (customer.parquet re-emit chore)** queued as pre-work in AH.2's CURRENT.md.
+**Σ.AH.4 (partition-count generalization)** completed 2026-05-26 as code-only commit; the original parquet re-emit was reverted to preserve the captured baseline.
 
 **Σ.AH.5/AH.6** parallel-track candidates; not currently active.
 

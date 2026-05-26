@@ -3,7 +3,7 @@
 **Status:** active
 **Created:** 2026-05-26 (promoted from Σ.AH Phase D arc shell)
 **Active phase:** Pre-work (Σ.AH.4 chore) → Story 1
-**Active story:** Σ.AH.4 pre-work (customer.parquet re-emit), then Story 1 (partition-aware bloom merge)
+**Active story:** Σ.AH.4 pre-work (partition-count generalization — code-only), then Story 1 (partition-aware bloom merge)
 **Branch policy:** local commits only on this plan. PR only after Story 4 wall-time gate passes.
 **Predecessor plan:** [`docs/plans/archive/2026-05-26-sigma-ah-survey.md`](./archive/2026-05-26-sigma-ah-survey.md) — Σ.AH survey (closed 2026-05-26 after Phase D).
 **Sibling arc shells (drafted, not active):** [Σ.AH.1](sigma-ah-arc-1.md), [Σ.AH.3](sigma-ah-arc-3.md).
@@ -88,24 +88,28 @@ Per `[[sigma-r2-rejected]]` precedent: **microbench pass + wall-time fail = reje
 
 ---
 
-## Pre-work — Σ.AH.4 chore (customer.parquet re-emit)
+## Pre-work — Σ.AH.4 chore (partition-count generalization, code-only)
 
-**Status:** queued before Story 1.
-**Effort:** 30-60 minutes.
-**Expected impact:** ~3-5 ms wall on Q03/Q05/Q07/Q08/Q10 (clears bench-gate noise floor before Σ.AH.2 measurement).
-**Risk:** none — data-prep only.
+**Status:** DONE 2026-05-26 (code-only — original data-prep scope deferred to preserve captured baseline).
+**Effort:** ~30 minutes actual.
+**Expected impact:** **zero measurable wall change on the canonical M3 Pro box** — `available_parallelism()` returns the same 14 as the previous hardcode. Pure portability/maintenance commit.
+**Risk:** none.
 
-### Tasks
+**Scope change (2026-05-26):** the original chore re-emitted `customer.parquet` from 2 RGs → N RGs to lift partition-count-aware parallelism. While probing this, we observed the data-prep would invalidate every wall-time number measured across Phase A-D (all 22 PERF_Q\*.md docs reference the original Snappy/2-RG customer.parquet). Decision: **revert the parquet file to its pristine state**; keep only the code-level partition-count generalization, which has no perf impact on the bench box but lifts a portability constraint.
 
-- [ ] Read current `examples/tpch/data/sf10/customer.parquet` row-group layout (`pyarrow` or similar). Confirm 2 RGs.
-- [ ] Re-emit at the existing TPC-H SF=10 row count (1.5M) with target RG count = 14 (matches partition count). Use `pyarrow.parquet.write_table(row_group_size=~107k)`.
-- [ ] Run `cargo run --release -p ematix-flow-core --example tpch_validate` against SF=10 to confirm row counts unchanged.
-- [ ] Run `tpch_triangulation_bench` SF=10 with TPCH_QUERIES=2,3,5,7,8,10 to confirm small wall drop on those queries (no regression on others).
-- [ ] Commit data-prep + bench result snapshot.
+### Tasks (revised)
 
-**Exit criteria:** SF=10 22q validate passes byte-identical; Q03/Q05/Q07/Q08/Q10 each shift ≥ −2 ms wall or stable.
+- [x] Inspect current `examples/tpch/data/sf10/customer.parquet` row-group layout (2 RGs, 1048576 + 451424, parquet-rs 58.1.0, Snappy). Confirmed via pyarrow.
+- [x] **Reverted** any re-emit; restored from `customer.parquet.bak` to keep baseline measurement valid.
+- [x] Drop hardcoded `target_partitions(14)` from `tpch_validate.rs` (was the only example with no env override). Replace with `PARTITIONS` env override + `std::thread::available_parallelism()` default.
+- [x] Change `tpch_triangulation_bench.rs` and `stage_profiler.rs` defaults from `14` to `available_parallelism()` (env override unchanged).
+- [x] Update stale "`target_partitions=14`" string in bench's results-doc footer.
+- [x] Smoke test: `tpch_validate` SF=10 passes byte-identical against the untouched baseline data.
+- [x] Commit (this commit).
 
-**Then:** Story 1.
+**Exit criteria:** all 22 SF=10 queries pass `tpch_validate` row-by-row + value-by-value (no perf gate — there's no data change to measure).
+
+**Then:** Story 1 (partition-aware bloom merge).
 
 ---
 

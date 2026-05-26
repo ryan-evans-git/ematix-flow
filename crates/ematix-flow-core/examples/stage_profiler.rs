@@ -310,7 +310,11 @@ async fn build_ctx(
     let partitions: usize = std::env::var("PARTITIONS")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(14);
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(14)
+        });
     // Mirror milestone-default rule set in tpch_triangulation_bench's
     // "all" path, minus the bloom-pushdown rule (which only fires when
     // EMAT_BLOOM_PUSHDOWN=1, off here for fewer moving parts).

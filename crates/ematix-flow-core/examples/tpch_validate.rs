@@ -347,8 +347,16 @@ async fn run_ematix(
 ) -> Result<Vec<Vec<Cell>>, Box<dyn std::error::Error>> {
     use arrow_array::ArrayRef;
 
+    let partitions: usize = std::env::var("PARTITIONS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(14)
+        });
     let mut builder = SessionStateBuilder::new()
-        .with_config(SessionConfig::new().with_target_partitions(14))
+        .with_config(SessionConfig::new().with_target_partitions(partitions))
         .with_default_features()
         .with_physical_optimizer_rule(Arc::new(DedupeAggregateForFloatDeterminism::default()))
         .with_physical_optimizer_rule(Arc::new(EnableDictGroupCountRule))

@@ -513,15 +513,16 @@ async fn build_ematix_ctx(
     //   "v040"                  — dict + multi + sum (matches v0.4.0)
     //   "dedupe"                — dedupe only
     let rules = std::env::var("EMAT_RULES").unwrap_or_else(|_| "all".to_string());
+    let partitions: usize = std::env::var("PARTITIONS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(14)
+        });
     let mut builder = SessionStateBuilder::new()
-        .with_config(
-            SessionConfig::new().with_target_partitions(
-                std::env::var("PARTITIONS")
-                    .ok()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(14),
-            ),
-        )
+        .with_config(SessionConfig::new().with_target_partitions(partitions))
         .with_default_features();
     if matches!(rules.as_str(), "all" | "dedupe") {
         builder = builder
@@ -905,8 +906,9 @@ fn write_benchmarks_md(
     writeln!(
         s,
         "- DuckDB runs at default settings (in-memory `read_parquet` views). \
-         ematix-flow runs with `target_partitions=14` and the InjectFusedQ1/Q3/Q5/Q6/Q12 \
-         + EnableDictGroupCount physical-optimizer rules registered."
+         ematix-flow runs with `target_partitions = std::thread::available_parallelism()` \
+         (override via `PARTITIONS=N`) and the InjectFusedQ1/Q3/Q5/Q6/Q12 + \
+         EnableDictGroupCount physical-optimizer rules registered."
     )
     .unwrap();
 
