@@ -2,7 +2,8 @@
 
 **Active plan:** [`docs/plans/CURRENT.md`](../plans/CURRENT.md) — Σ.AH: clean-slate Q01-Q22 SF=10 execution-plan inefficiency review (per-stage waste survey on post-Σ.AG.7 numbers)
 **Started:** 2026-05-26
-**Active phase:** Phase C — cross-query synthesis (B complete 2026-05-26)
+**Active phase:** Phase D — arc shells (C complete 2026-05-26)
+**Phase C summary:** Synthesis written to `docs/PERF_REVIEW_2026_05.md`. 6 arc candidates ranked (Σ.AH.1-6); 4 rejection re-look flags surfaced (Σ.S.B cascade, Σ.Q.L11, Σ.R.2, Σ.T). Combined wall-time impact estimate: 400-500 ms across 8-10 queries = ~8-12 pp SF=10 geomean.
 **Phase B summary:** All 22 PERF_Q*.md files updated. Methodology corrections discovered mid-sweep: projection-cost-aware FilterExec floor (B.4), per-column Snappy floor (B.1 redo). Major correction: Q05 dominant operator was misidentified in 2026-05-25 — corrected B.5.
 
 **Phase A summary (commit `0821002`):** Audit appendix appended to `STAGE_PROFILING_METHODOLOGY.md`. 6 VERIFIED, 1 STALE (hash agg 10K-1M groups moved from 5-15 ns/row → 3-7 ns/row post-Σ.N.f), 5 UNVERIFIED (accept as published). A.2 skipped (threshold ≥3 STALE not reached).
