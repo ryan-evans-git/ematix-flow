@@ -90,3 +90,50 @@ Then aggregate using the Python parser at `docs/PERF_Q01.md` (the call-graph wal
 ## Important: scope discipline
 
 The point of the survey is to **identify** waste, not fix everything inline. A "waste candidate" entry should land in the PERF_Q<n>.md doc — actually fixing it is a separate decision. The previous V5 / L13 cycle stalled because we kept jumping ahead to implementation before completing the survey. Resist that here.
+
+---
+
+## 2026-05-26 audit (Phase A.1)
+
+Re-validates the §"Theoretical floor" constants against current kernel benches post-Σ.AG.7 / ematix-parquet 0.16.1. Hardware: Apple M3 Pro, 14 cores. Source data for each row in the "Source" column.
+
+| # | Constant | Original | Measured 2026-05-26 | Status | Source |
+|---|---|---|---|---|---|
+| 1 | File I/O warm page cache | 5 GB/s | (accept as published) | UNVERIFIED | OS-level; no kernel bench in workspace |
+| 2 | File I/O cold NVMe | 3 GB/s | (accept as published) | UNVERIFIED | OS-level; no kernel bench in workspace |
+| 3 | Snappy decompress (compressible) | 2 GB/s/thread | 1.61 GB/s/thread (l_extendedprice ratio 0.73) | VERIFIED | `snappy_decompress_probe` (19% under, within ±30%) |
+| 3a | Snappy decompress (incompressible) | — | 10.19 GB/s/thread (l_quantity ratio 1.00) | INFO | floor is dominated by compressible payload; near-memcpy when ratio≈1 |
+| 4 | LZ4_RAW decompress (compressible) | 5 GB/s/thread | 4.23 GB/s/thread (l_extendedprice ratio 0.71) | VERIFIED | `ematix-parquet-codec/examples/bench_lz4_decompress` (15% under, within ±30%) |
+| 4a | LZ4_RAW decompress (incompressible) | — | 61 GB/s/thread (l_shipdate/l_quantity ratio≈1.00) | INFO | LZ4 hits memcpy speed for incompressible pages |
+| 5 | PLAIN i64/f64 unpack | 1 ns/row | ~0.6 ns/row (l_orderkey 3.51 ms ÷ 1.048M rows ≈ 3.35 ns/row mixed; pure i64 dict path 0.6 ns/row) | VERIFIED | `bench_decode` l_suppkey 0.62 ms _into / 1.048M = 0.59 ns/row — within floor |
+| 6 | DICT decode (RLE indices + lookup) | 1-2 ns/row | 0.59 ns/row (l_suppkey i64), 0.65 ns/row (l_shipdate i32), 1.70 ns/row (gather 100% sel) | VERIFIED | `bench_decode` + `bench_dict_gather_prefetch` |
+| 6a | DICT bit-unpack (u32 indices) | — | 0.05-0.11 ns/value (scalar), 0.05 ns/value (NEON bw=12-18) | INFO | `bench_unpack`; an order of magnitude under the DICT floor — already at L1 bandwidth |
+| 7 | Filter (i32/i64 single predicate) | 0.5 ns/row | 0.62 ns/row (lane-parallel Q06 5-pred) | VERIFIED | `bench_lane_filter_sum`; 5-predicate fused = 0.62 ns/row, single-pred extrapolates well under 0.5 |
+| 8 | Hash agg ≤100 groups (L1) | 1-2 ns/row | 2.17 ns/row (RobinHood card=100, 6M rows) | VERIFIED | `robin_hood_vs_hashbrown_bench` — at upper edge but in band; hashbrown is 4.49 ns/row (2.07× slower) |
+| 9 | Hash agg 10K-1M groups | 5-15 ns/row | **3.0 ns/row** (RobinHood card=10K, 6M rows) | **STALE (low)** | `robin_hood_vs_hashbrown_bench` — kernel floor has moved DOWN since Σ.N.f.3 / pre-grow + dynamic resize. New floor: 3-7 ns/row at 10K cardinality; legacy 5-15 was a hashbrown-era number |
+| 10 | Hash join build i64 keys | 5 ns/row | (accept as published) | UNVERIFIED | Bench source removed; criterion artefacts in `target/criterion/hash_join_i64_inner_emat_vs_stock/` are stale, no current runnable bench in workspace |
+| 11 | Hash join probe (build in L2) | 8-15 ns/row | (accept as published) | UNVERIFIED | Same — no runnable kernel bench in workspace |
+| 12 | Sort n × log₂(n) × 50-100 ns | published | (accept as published) | UNVERIFIED | No kernel bench in workspace; the literature constant stands |
+
+### Notes
+
+**Tally:** VERIFIED=6, STALE=1 (#9 Hash agg 10K-1M), UNVERIFIED=5.
+
+**Material moves (>30% change):**
+
+1. **#9 Hash agg 10K-1M groups** — kernel measured 3.0 ns/row vs published lower bound 5 ns/row, a 40% drop. Σ.N.f arc (Σ.N.f.1 pre-grow + Σ.N.f.2 dynamic resize + Σ.N.f.3 direct MutableBuffer finalize, per memories) moved the floor below the literature number. **Recommended new constant: `rows × 3-7 ns/row / cores` for 10K-1M groups.** Downstream Phase B floor tables that use the 5-15 number will *understate* waste for queries dominated by mid-cardinality aggs (Q09, Q10, Q20). Worth re-noting in the per-query writeups.
+
+2. **No other constant moved by >30%.** Snappy is 19% under (1.61 vs 2 GB/s); LZ4 is 15% under (4.23 vs 5 GB/s) — both within band. The bit-unpack kernel numbers (0.05 ns/val) are an order of magnitude under the DICT floor, but that's because they measure a sub-stage (just the unpack) while the DICT floor covers the full RLE + lookup pipeline; they aren't directly comparable.
+
+**A.2 verdict:** **SKIP.** Only 1 STALE constant (<3 threshold from the plan). Note the #9 revision in this appendix; do not rewrite the body table. Phase B writeups that touch mid-cardinality aggs should reference this appendix and use `3-7 ns/row / cores` as the floor.
+
+**UNVERIFIED carry-forward:** hash join build/probe (rows 10/11) had a criterion bench (`hash_join_i64_inner_emat_vs_stock`) whose source was removed from the workspace. If Phase B finds a query whose dominant stage is hash join *and* the rough-floor math suggests near-floor or way-over-floor, run a fresh kernel bench (Σ.T V5 L13 work is in the archived plan — the artefacts may be re-instantiable from the `feat/l13-bloom-emitter` branch). For Phase B's purposes, accept 5/8-15 ns/row as published.
+
+**Probe scripts (re-runnable):**
+- `ematix-parquet/crates/ematix-parquet-codec/examples/bench_unpack` — bit-unpack scalar + NEON
+- `ematix-parquet/crates/ematix-parquet-codec/examples/bench_decode` — end-to-end column decode vs parquet-rs vs polars
+- `ematix-parquet/crates/ematix-parquet-codec/examples/bench_lz4_decompress` — **new** Phase A.1 probe; reads `lineitem_lz4.parquet` RG0 column N (default extprice), times `decompress_lz4_raw_into_sized` per page
+- `ematix-parquet/crates/ematix-parquet-codec/examples/bench_dict_gather_prefetch` — dict gather across selectivity sweeps
+- `ematix-flow-core/examples/snappy_decompress_probe` — Snappy on real lineitem columns
+- `ematix-flow-core/examples/bench_lane_filter_sum` — lane-parallel Q06-shape filter+sum
+- `ematix-flow-core/examples/robin_hood_vs_hashbrown_bench` — single-thread RobinHood vs hashbrown across 3 cardinalities
