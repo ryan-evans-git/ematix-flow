@@ -1,14 +1,47 @@
 # PERF_Q10 — Q10 SF=10 stage profile
 
-## Wall time
+Status: **re-verified 2026-05-26** (Σ.AH Phase B.10).
 
-| Engine | Median ms | σ | Rows |
-|--------|----------:|----:|----:|
-| ematix-flow | 258.29 | 5.36 | 381,105 |
-| DuckDB | 427.45 | 20.24 | 381,105 |
-| Polars | 4,122.30 | 124.30 | 381,105 |
+## Wall time (20×3 canonical 2026-05-26)
 
-**39% ahead of DuckDB**, 16× ahead of Polars. Big ematix win.
+| Engine | Median ms | σ |
+|--------|----------:|----:|
+| ematix-flow | **231.97** | 9.02 |
+| DuckDB | 408.76 | 7.78 |
+
+**43% ahead of DuckDB** — biggest win margin of any query. Stage profile 5-trial: 237.52 ms.
+
+## Per-stage (current; Σ compute 2026.34 ms / wall 237.52 ms → **8.53× parallelism = 61%**)
+
+| Stage | Floor (proj-aware) | Actual sum | Status |
+|-------|-------------------:|-----------:|--------|
+| HashJoin (cust+orders) ⋈ lineitem (build 573k=L2, probe 14.8M) | 14.8M × 12 ns = 178 ms | 824.47 | **4.6× over** (build > probe? No — probe 14.8M > build 573k. So why slow?) |
+| EmatixFastParquetExec lineitem + l_returnflag='R' BridgeFilter (60M → 14.8M) | ~600 ms | 478.76 | **sub-floor** (scan pushdown working ✓) |
+| RepartitionExec (573k Hash(o_orderkey)) | ~30 ms | 268.62 | 9× over — surprising; the 573k is small |
+| AggregateExec Partial (1.15M → 482k groups, 7-col key) | ~28 ms (10 ns × 1.15M ×~2.5 for 7-col) | 159.13 | **5.7× over** — 7-col gby very expensive |
+| HashJoin cust ⋈ orders (build 1.5M, probe 573k) | 573k × 15 ns = 9 ms; build 1.5M × 5 ns = 7.5 ms | ~17 ms | 131.77 | **7.8× over** — build >> probe (1.5M build, 573k probe) |
+| AggregateExec FinalPartitioned | ~30 ms | 68.78 | 2.3× over |
+| RepartitionExec | ~20 | 39.40 | mild over |
+| Sort + SortPreservingMerge | ~20 | 27 | at-floor ✓ |
+
+**Σ floor sum: ~930 ms; observed 2026 ms. ~1100 ms over-floor parallel waste (~130 ms wall).**
+
+## Σ.AH waste candidates
+
+| Rank | Candidate | Wall savings | Confidence | Notes |
+|-----:|-----------|-------------:|:----------:|-------|
+| 1 | **Group-by functional-dependency simplifier** (c_custkey unique → group by 1 col, project 6 others) | ~50 ms | medium | 7-col gby compute 159+69 = 228 ms parallel. Drop to ~30 ms (i64-only key, RH-eligible). 7-col-gby is the dominant inefficiency. |
+| 2 | **HashJoin (cust+orders) ⋈ lineitem at 824 ms** vs 178 ms floor — needs samply | ~30 ms | low | Build is small (573k → L2) but probe is 14.8M; 824/14.8M = 56 ns/row probe is 5× the L2 floor of 12 ns. Possible cache thrashing from 14 partitions × 573k = 47 MB total build (each partition's build ~3.3 MB but L2 cluster shared). |
+| 3 | **HashJoin cust ⋈ orders build-vs-probe mis-order** (build 1.5M > probe 573k) | ~7 ms | low | Same Q07/Q08/Q09 pattern. |
+| 4 | **Customer 2-RG bottleneck** | ~3 ms | high | Same Q03/Q05/Q07/Q08. |
+
+## Findings
+
+- **Q10 is +43% ahead of DuckDB but has the most "still-could-improve" waste** — 7-col gby is the dominant lever. Memory `feedback_no_tpch_hardcoding.md` requires generalised, not Q-specific; functional-dependency simplifier is a generalised pattern (any UNIQUE-key passthrough).
+- **Q10 confirms l_returnflag = string filter pushdown WORKS** (60M → 14.8M during scan), in contrast to l_shipdate > date which doesn't push (Q03/Q07).
+- 4th query showing **build-vs-probe mis-order** (Q07, Q08, Q09, Q10).
+
+**Next:** B.11 (Q11 — 11.59 ms; smallest by far, 62% ahead of DuckDB).
 
 ## Physical plan
 
