@@ -1,14 +1,35 @@
 # PERF_Q11 — Q11 SF=10 stage profile
 
-## Wall time
+Status: **re-verified 2026-05-26** (Σ.AH B.11).
 
-| Engine | Median ms | σ | Rows |
-|--------|----------:|----:|----:|
-| ematix-flow | 12.13 | 0.45 | 0 |
-| DuckDB | 26.15 | 1.41 | 0 |
-| Polars | 34.85 | 0.98 | 0 |
+## Wall time (20×3 canonical 2026-05-26)
 
-**54% ahead of DuckDB**, 2.9× ahead of Polars. Strong dominant.
+| Engine | Median ms | σ |
+|--------|----------:|----:|
+| ematix-flow | **11.59** | 0.64 |
+| DuckDB | 30.70 | 2.94 |
+
+**62% ahead of DuckDB** (was 54%). Stage profile 5-trial: 9.70 ms.
+
+## Per-stage decomposition
+
+Σ compute 74.56 ms / wall 9.70 ms = **7.69× parallelism = 55%**.
+
+| Stage | Floor | Actual | Status |
+|-------|-------|--------|--------|
+| partsupp scans ×2 (8M rows × 3 cols each) — RG decode cache closes 2nd | 1st ~10; 2nd ~free | 2.46 + 2.23 | **sub-floor** (cache hit ✓) |
+| AggregateExec Partial+Final on ps_partkey (8M → 304k) | 8M × 3 ns = 24 ms parallel | 6.43 + 5.19 + 6.86 = 18.5 | at-floor ✓ |
+| HashJoin supplier ⋈ partsupp (CollectLeft) | 8M × 15 ns / 14 = 9 ms | 1.18 + 0.90 = 2.08 | sub-floor ✓ |
+| NestedLoopJoinExec final filter | trivial | 6.86 | mild over (NL sequential) |
+| Top ops | trivial | <1 | ✓ |
+
+Σ floor ~55 ms; observed 74.56 ms. Σ/parallelism = 9.7 ms wall ≈ observed.
+
+## Findings
+
+**Q11 is at realistic-parallelism floor.** RG decode cache closes the partsupp double-scan (2nd scan 2.23 ms ≈ 1st scan 2.46 ms — cache hit confirmed). No new candidate. Too small for meaningful levers.
+
+**Next:** B.12 (Q12 — 87.64 ms; +24% vs DuckDB).
 
 (All 3 engines return 0 rows — Q11's "important parts" threshold of 0.0001 × total nation-stock-value happens to be > the max partkey-stock-value for this SF=10 GERMANY-filtered dataset.)
 
