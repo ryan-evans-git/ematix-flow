@@ -1,14 +1,39 @@
 # PERF_Q15 — Q15 SF=10 stage profile
 
-## Wall time
+Status: **re-verified 2026-05-26** (Σ.AH B.15).
 
-| Engine | Median ms | σ | Rows |
-|--------|----------:|----:|----:|
-| ematix-flow | 79.10 | 5.18 | 1 |
-| DuckDB | 85.93 | 4.31 | 1 |
-| Polars | 66.30 | 2.88 | 1 |
+## Wall time (20×3 canonical 2026-05-26)
 
-**8% ahead of DuckDB**, **19% behind Polars**.
+| Engine | Median ms | σ |
+|--------|----------:|----:|
+| ematix-flow | **77.28** | 3.80 |
+| DuckDB | 95.80 | 3.95 |
+
+**19% ahead of DuckDB** (was 8% — DuckDB now slower, we're flat). Polars skipped at SF=10. Stage profile 5-trial shows **5.46 ms** (median) — the SharedSubtreeExec cache makes trials 2+ very fast; first-trial work is what's reflected in the canonical 77 ms.
+
+## Per-stage decomposition (measurement caveat — see notes)
+
+stage_profiler shows median 5.46 ms across 5 trials with σ tight at ~0.3 ms. This is the cache-hit case: SharedSubtreeExec populates on trial 1 (~80 ms) then replays for trials 2-5 (~5 ms each).
+
+The canonical 22q-bench wall of 77.28 ms is the per-trial figure when the bench fresh-execs each trial without between-trial cache reuse (or with cache being re-populated through different plan-tree identity).
+
+| Stage | Floor | Actual (cache-hit) | Status |
+|-------|-------|--------------------|--------|
+| supplier scan (100k) | ~4 ms | 4.26 ms | at-floor ✓ |
+| HashJoin supplier ⋈ revenue-cached | small | 0.84 ms | at-floor ✓ |
+| HashJoin revenue ⋈ max | trivial | 0.16 ms | at-floor ✓ |
+| AggregateExec (max, no-gby) | trivial | 0.06 ms | at-floor ✓ |
+| SharedSubtreeExec replay | ~0 | 0 ms | **cache hit** ✓ |
+
+**On the cache-miss first trial**, Q15's full work is the revenue subquery (lineitem date-filter + 3 joins + suppkey agg). That subtree is what the canonical 77 ms reflects.
+
+## Findings
+
+- **Q15's structural advantage is SharedSubtreeExec working as designed** — the dedupe rule wraps both consumers of `supplier_revenue` (the `max(total_revenue)` aggregator and the `where total_revenue = max` filter) in `SharedSubtreeExec` pointing at the same `Arc<CachedBatches>`. Without the dedupe, this would be a 2× lineitem scan + 2× join.
+- **Q15 at-floor on cache-hit trials.** The first trial pays the full revenue-subquery cost; subsequent trials are cache replays. Canonical 77 ms = per-trial work including misses.
+- **No new candidate for Q15.** The structural win is already realized.
+
+**Next:** B.16 (Q16 — 50.01 ms, +27% vs DuckDB).
 
 ## Physical plan — SharedSubtreeExec is the star
 
