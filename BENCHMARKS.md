@@ -1,6 +1,6 @@
-# TPC-H SF=1 triangulation
+# TPC-H SF=10 triangulation
 
-Same-process bench: ematix-flow vs DuckDB vs Polars over all 22 TPC-H queries on SF=1 parquet data, 20 timed trials after 3 warmups, single-machine.
+Same-process bench: ematix-flow vs DuckDB vs Polars over all 22 TPC-H queries on SF=10 parquet data, 20 timed trials after 3 warmups, single-machine.
 
 Source: `crates/ematix-flow-core/examples/tpch_triangulation_bench.rs` — feature-gated behind `--features triangulation`.
 
@@ -10,28 +10,28 @@ Each cell is **median ms ± σ** across 20 trials. "—" means the engine couldn
 
 | Query | ematix-flow | DuckDB | Polars | Best |
 |------:|------------:|-------:|-------:|:-----|
-| Q01  | 247.18 ± 5.98 | 238.45 ± 3.80 | 342.13 ± 25.24 | DuckDB |
-| Q02  | 34.78 ± 9.86 | 45.21 ± 1.31 | 418.20 ± 26.85 | ematix-flow |
-| Q03  | 144.88 ± 13.75 | 145.32 ± 2.47 | 557.36 ± 9.84 | ematix-flow |
-| Q04  | 55.49 ± 18.63 | 87.30 ± 2.91 | 270.06 ± 11.38 | ematix-flow |
-| Q05  | 187.74 ± 10.72 | 143.71 ± 3.68 | — | DuckDB |
-| Q06  | 74.88 ± 4.31 | 72.06 ± 2.22 | 63.52 ± 3.87 | Polars |
-| Q07  | 158.41 ± 7.23 | 139.83 ± 5.75 | 1329.70 ± 39.31 | DuckDB |
-| Q08  | 194.53 ± 6.60 | 176.80 ± 5.08 | 1179.38 ± 22.81 | DuckDB |
-| Q09  | 279.41 ± 32.95 | 318.75 ± 9.13 | 428.74 ± 16.92 | ematix-flow |
-| Q10  | 253.52 ± 7.55 | 406.15 ± 5.77 | 4111.21 ± 225.09 | ematix-flow |
-| Q11  | 11.58 ± 3.59 | 28.28 ± 2.41 | 32.69 ± 2.99 | ematix-flow |
-| Q12  | 102.69 ± 9.04 | 107.76 ± 9.78 | 112.57 ± 4.74 | ematix-flow |
-| Q13  | 117.74 ± 6.38 | 265.82 ± 6.65 | 414.52 ± 17.81 | ematix-flow |
-| Q14  | 90.60 ± 4.58 | 137.52 ± 3.98 | 92.62 ± 1.31 | ematix-flow |
-| Q15  | 79.61 ± 4.08 | 86.92 ± 3.72 | 63.97 ± 2.32 | Polars |
-| Q16  | 53.66 ± 1.34 | 65.98 ± 3.39 | 173.32 ± 7.79 | ematix-flow |
-| Q17  | 182.69 ± 11.46 | 159.95 ± 5.02 | 438.21 ± 15.78 | DuckDB |
-| Q18  | 246.64 ± 8.82 | 225.58 ± 6.97 | 611.28 ± 22.57 | DuckDB |
-| Q19  | 144.57 ± 8.41 | 210.15 ± 5.63 | 1244.95 ± 21.61 | ematix-flow |
-| Q20  | 139.08 ± 22.82 | 150.79 ± 5.90 | 281.13 ± 8.27 | ematix-flow |
-| Q21  | 331.27 ± 11.35 | 436.24 ± 7.82 | 33104.91 ± 2789.95 | ematix-flow |
-| Q22  | 29.69 ± 0.86 | 127.51 ± 14.23 | 107.61 ± 5.39 | ematix-flow |
+| Q01  | 232.43 ± 14.60 | 238.69 ± 3.62 | 334.55 ± 18.67 | ematix-flow |
+| Q02  | 30.57 ± 10.86 | 45.18 ± 6.75 | 409.45 ± 28.04 | ematix-flow |
+| Q03  | 146.29 ± 7.66 | 144.02 ± 5.78 | 549.78 ± 11.28 | DuckDB |
+| Q04  | 54.41 ± 17.39 | 87.01 ± 2.66 | 265.32 ± 17.14 | ematix-flow |
+| Q05  | 187.02 ± 6.67 | 144.82 ± 3.55 | — | DuckDB |
+| Q06  | 77.40 ± 5.40 | 70.88 ± 1.34 | 62.50 ± 5.54 | Polars |
+| Q07  | 156.36 ± 6.44 | 140.55 ± 3.35 | 1348.14 ± 42.58 | DuckDB |
+| Q08  | 193.92 ± 7.35 | 175.03 ± 5.12 | 1183.64 ± 30.65 | DuckDB |
+| Q09  | 273.89 ± 26.51 | 311.36 ± 8.56 | 435.29 ± 18.50 | ematix-flow |
+| Q10  | 236.54 ± 9.81 | 405.69 ± 12.67 | 3917.55 ± 380.30 | ematix-flow |
+| Q11  | 11.83 ± 15.22 | 26.18 ± 2.82 | 32.55 ± 2.32 | ematix-flow |
+| Q12  | 88.93 ± 4.60 | 103.64 ± 2.17 | 110.60 ± 3.65 | ematix-flow |
+| Q13  | 98.12 ± 5.76 | 265.27 ± 4.05 | 407.50 ± 22.35 | ematix-flow |
+| Q14  | 86.23 ± 3.71 | 135.59 ± 3.26 | 91.86 ± 1.72 | ematix-flow |
+| Q15  | 76.91 ± 3.54 | 87.76 ± 1.91 | 66.24 ± 2.15 | Polars |
+| Q16  | 51.75 ± 1.96 | 65.41 ± 3.43 | 168.38 ± 7.00 | ematix-flow |
+| Q17  | 185.49 ± 13.46 | 157.35 ± 4.52 | 433.71 ± 15.97 | DuckDB |
+| Q18  | 248.89 ± 9.33 | 228.99 ± 7.61 | 597.14 ± 18.75 | DuckDB |
+| Q19  | 131.75 ± 4.31 | 192.37 ± 2.91 | 1206.10 ± 40.74 | ematix-flow |
+| Q20  | 125.33 ± 28.55 | 140.23 ± 5.63 | 268.57 ± 11.07 | ematix-flow |
+| Q21  | 295.74 ± 9.04 | 406.68 ± 6.97 | 34347.37 ± 4359.83 | ematix-flow |
+| Q22  | 24.10 ± 31.46 | 127.19 ± 5.10 | 107.50 ± 6.86 | ematix-flow |
 
 ## Wins
 
@@ -47,4 +47,4 @@ Each cell is **median ms ± σ** across 20 trials. "—" means the engine couldn
 
 ## Failures and dialect gaps
 
-- **Q05 / Polars**: polars join: task 23060 panicked with message "Polars' maximum length reached. Consider compiling with 'big…
+- **Q05 / Polars**: polars join: task 23198 panicked with message "Polars' maximum length reached. Consider compiling with 'big…
