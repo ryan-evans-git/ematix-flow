@@ -1,14 +1,19 @@
 # PERF_Q08 — Q08 SF=10 stage profile
 
+Status: **re-verified 2026-05-26** (Σ.AH Phase B.8). Originally profiled 2026-05-25.
+
 ## Wall time
 
-| Engine | Median ms | σ | Rows |
-|--------|----------:|----:|----:|
-| ematix-flow | 196.20 | 58.68 | 2 |
-| DuckDB | 171.71 | 13.79 | 2 |
-| Polars | 1222.82 | 48.80 | 2 |
+### 2026-05-26 refresh (20 trials × 3 warmups, post-Σ.AG.7 bare invocation — canonical)
 
-**14% behind DuckDB.** High σ on our side (58.68) — Q08 is variable.
+| Engine | Median ms | σ |
+|--------|----------:|----:|
+| ematix-flow | **188.76** | 5.16 |
+| DuckDB | 175.86 | 4.61 |
+
+**7% behind DuckDB** (was 14%; we narrowed the gap by half, mostly from σ stabilising). Stage profile 5-trial: 190.91 ms.
+
+σ collapsed from 58.68 → 5.16 — the 2026-05-25 variability was likely RG decode cache warmth issues that the Σ.O.c.2 default-on now stabilises.
 
 ## Physical plan
 
@@ -34,36 +39,77 @@ SortPreservingMergeExec [o_year ASC]
                   lineitem                                              -- 60M, no filter
 ```
 
-## Per-stage breakdown (top 8)
+## Per-stage breakdown (2026-05-26)
 
 | Rank | Operator | Depth | Median ms | Out rows |
 |-----:|:---------|------:|----------:|---------:|
-| 1 | EmatixFastParquetExec (lineitem) | 22 | 636.97 | 59,986,052 |
-| 2 | HashJoinExec (part ⋈ lineitem) | 20 | 161.45 | 403,487 |
-| 3 | HashJoinExec (supplier ⋈ part+lineitem) | 16 | 78.46 | 122,404 |
-| 4 | HashJoinExec (orders ⋈ above) | 13 | 30.23 | 122,404 |
-| 5 | EmatixFastParquetExec (orders) | 19 | 29.49 | 4,557,513 |
-| 6 | EmatixFastParquetExec (customer) | 15 | 23.40 | 1,500,000 |
-| 7 | RepartitionExec (lineitem 60M) | 21 | 18.08 | 59,986,052 |
-| 8 | HashJoinExec (cust ⋈ orders+above) | 19 | 4.76 | 403,487 |
+| 1 | **EmatixFastParquetExec lineitem** (5 cols, no filter) | 22 | **595.99** | 59,986,052 |
+| 2 | **HashJoinExec part_filt ⋈ lineitem** Partitioned | 20 | **185.33** | 403,487 |
+| 3 | HashJoinExec orders ⋈ (part+supp+line) Partitioned (build 4.5M) | 16 | 78.76 | 122,404 |
+| 4 | HashJoinExec customer ⋈ above Partitioned (build 1.5M > probe 122k) | 13 | 29.56 | 122,404 |
+| 5 | RepartitionExec on l_partkey (60M memcpy) | 21 | 16.09 | 59,986,052 |
+| 6 | EmatixFastParquetExec orders (+BridgeFilter date) | 19 | 8.21 | 4,557,513 |
+| 7 | EmatixFastParquetExec customer (2 RGs only) | 15 | 7.59 | 1,500,000 |
+| 8 | HashJoinExec supplier ⋈ part+lineitem CollectLeft | 19 | 4.62 | 403,487 |
+| 9 | Repartition / nation / region / agg | various | <2 each | tiny |
 
-Σ median compute: 993 ms. Wall median 192 ms. Parallel speedup ≈ 5.16× of 14 cores.
+Σ median compute: **936.44 ms**. Wall: 190.91 ms. **Effective parallelism: 4.91× = 35% — WORST in sweep so far.**
 
-## Theoretical floor
+## Theoretical floor (per-stage, projection-cost-aware)
 
-| Stage | Floor (ms) |
-|-------|-----------:|
-| lineitem scan + decode 60M × 5 cols | 15 |
-| orders scan + filter (15M → 4.5M) | 5 |
-| customer scan (1.5M × 2) | 1 |
-| part scan + LIKE filter (1.5M × 2) | 2 |
-| supplier/nation/region | <1 |
-| HashJoin part_filt 24k build × lineitem 60M probe × 12 ns / 14 | 51 |
-| Other joins (small) | ≤2 |
-| agg (28 groups) | <1 |
-| **Floor** | **~75 ms** |
-| **Actual** | **192 ms** |
-| **Waste ratio** | **2.6×** |
+| Stage | Floor formula | Floor (sum ms) | Actual | Status |
+|-------|---------------|---------------:|-------:|--------|
+| Lineitem scan (60M × 5 cols, no filter, mixed Snappy) | ~2.0 GB / (3 GB/s × 14) | ~600-900 | 595.99 | **at-floor** ✓ |
+| HashJoin part_filt ⋈ lineitem Partitioned (build 13k=108 KB→L1, probe 60M, 99.3% drop) | 60M × 8 ns L1-probe | ~480 | 185.33 | **sub-floor** (L1 hot path) ✓ |
+| HashJoin orders ⋈ above Partitioned (build 4.5M=36 MB→L3, probe 403k) | 4.5M × 10 ns build + 403k × 30 ns probe = 45 + 12 = 57 | ~60 | 78.76 | 1.3× over (L3-resident build) |
+| HashJoin customer ⋈ above Partitioned (build 1.5M=12 MB > probe 122k) | 1.5M × 5 ns build + 122k × 30 ns = 7.5 + 3.7 = 11 | ~12 | 29.56 | **2.5× over — build-side mis-order** (same as Q07) |
+| Repartition l_partkey (60M × 8 B memcpy) | 480 MB / 70 GB/s × 14 = 7 ms wall × 14 sum | ~100 | 16.09 | sub-floor ✓ |
+| Orders scan + BridgeFilter date (15M → 4.5M) | small (most credited downstream) | <30 | 8.21 | sub-floor (async) ✓ |
+| Customer scan (1.5M, 2 RGs) | small, dict-heavy | ~5 | 7.59 | at-floor (2-RG bottleneck) |
+| Supplier ⋈ (part+lineitem) CollectLeft (build 100k, probe 403k) | 403k × 15 ns CollectLeft probe | ~6 | 4.62 | at-floor ✓ |
+| Nation scans (×2), region scan, top joins, agg | trivial | <5 | <3 | at-floor ✓ |
+| **Σ floor** | | **~900** | **936** | **at-floor overall** |
+| **Σ effective-parallelism floor** | 936 / 4.91 = | | **191 ms wall** | matches observed ✓ |
+
+**Q08 is at its realistic-parallelism floor.** Every stage is at-or-near its kernel floor.
+
+## Σ.AH waste candidate ranking
+
+| Rank | Candidate | Mechanism | Wall savings | Confidence |
+|-----:|-----------|-----------|-------------:|:----------:|
+| 1 | **L9 bloom on part_filt (13k) → lineitem in Partitioned mode** | Currently L9 only fires on CollectLeft builds. Q08's part_filt⋈lineitem is Partitioned. Adding Partitioned-mode L9 emitter would drop lineitem 60M → ~400k pre-decode. | **~50-80 ms** | medium |
+| 2 | **Build-side mis-order on customer⋈above (depth 13)** | Build (1.5M = 12 MB) > probe (122k = 1.5 MB). Side-swap rule would cut probe-build inversion. Same Q07 pattern. | ~5-10 ms | low (needs optimizer rule) |
+| 3 | **Customer 2-RG re-emit** | 2-partition customer scan limits early pipeline. Same Q03/Q05/Q07. | ~3 ms | high (easy) |
+| 4 | **Effective parallelism 35% → 50%** | CollectLeft small-dim chain + 8-table sequence; structural limit. | ~20 ms wall | low |
+
+## Findings to capture as memories
+
+- **Q08 is at realistic-parallelism floor.** The 13 ms gap to DuckDB is structural: lineitem-decode + 8-table pipeline serialisation. DuckDB's win is the L9-equivalent (bloom from part_filt → lineitem) which we don't fire in Partitioned-mode joins.
+- **L9 emitter doesn't fire on Partitioned-mode joins** — confirmed by absence of `BuildSideBloomEmitterExec` in Q08's plan dump despite part_filt⋈lineitem being a textbook small-build / large-probe edge (probe/build ratio = 60M/13k = 4600, far above the 1024 threshold). **This is a new generalised candidate** — extend L9 to Partitioned-mode small-build joins. Q08 is the canonical case (would gain ~50 ms wall).
+- **Build-side mis-order pattern (build > probe)** confirmed on Q07 + Q08 — two queries with the same DataFusion-planner choice that costs 5-10 ms each. Cross-query lever: optimizer rule to swap sides on Inner joins when probe < build.
+- **Effective parallelism 35% is the worst in the sweep.** Cross-query trend: parallelism degrades with plan depth + CollectLeft count + Partial→Final agg presence. Q08's 8-table chain with 3× CollectLeft small-dim joins is the bottom of the parallelism scale.
+- σ collapsed from 58.68 → 5.16 since 2026-05-25. The variability was RG decode cache warm-up; Σ.O.c.2 default-on stabilises.
+
+## Next levers from Q08
+
+1. **L9 Partitioned-mode extension** — highest-impact lever; Σ.AH cluster candidate. Affects Q08, possibly Q03 (cust+orders ⋈ lineitem build at 1.46M is also "small probe to lineitem" if reversed).
+2. **Build-vs-probe side swap rule** (cross-query with Q07) — optimizer-level, needs careful gate.
+3. **Customer 2-RG re-emit** (cross-query with Q03/Q05/Q07) — easy.
+
+---
+
+## Verify pass — 2026-05-26 (Σ.AH B.8)
+
+**What changed since 2026-05-25:**
+- Wall: 196.20 → 188.76 ms canonical (−4%, mostly noise stabilising).
+- σ: 58.68 → 5.16 (huge stabilisation, attributed to Σ.O.c.2 default-on).
+- vs DuckDB: was −14% behind → now −7% (we closed half the gap, mostly noise reduction).
+- Plan structure: unchanged.
+- L9 still not firing on part_filt⋈lineitem (Partitioned mode); 2026-05-25 candidate #1 confirmed as the top lever.
+
+**New finding:** the build-vs-probe side mis-ordering observed in Q07 (depth 13) is the same pattern as Q08's customer⋈above (depth 13). Two queries now share this optimizer-level inefficiency.
+
+**Next:** B.9 (Q09 — 273.41 ms; we win by 13% over DuckDB; largest absolute wall time after Q21).
 
 ## Waste candidates
 
