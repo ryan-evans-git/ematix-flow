@@ -1,14 +1,38 @@
 # PERF_Q19 — Q19 SF=10 stage profile
 
-## Wall time
+Status: **re-verified 2026-05-26** (Σ.AH B.19).
 
-| Engine | Median ms | σ | Rows |
-|--------|----------:|----:|----:|
-| ematix-flow | 139.49 | 8.05 | 1 |
-| DuckDB | 203.11 | 3.81 | 1 |
-| Polars | 1229.20 | 22.29 | 1 |
+## Wall time (20×3 canonical 2026-05-26)
 
-**31% ahead of DuckDB**, 8.8× ahead of Polars.
+| Engine | Median ms | σ |
+|--------|----------:|----:|
+| ematix-flow | **138.72** | 13.54 |
+| DuckDB | 210.30 | 4.55 |
+
+**34% ahead of DuckDB** (was 31%). σ elevated (13.54) — Q19 has some run-to-run variance. Stage profile 5-trial: 139.90 ms.
+
+## Per-stage decomposition
+
+Σ compute 1437.06 ms / wall 139.90 ms = **10.27× parallelism = 73%**.
+
+| Stage | Floor | Actual | Status |
+|-------|-------|--------|--------|
+| EmatixFastParquetExec lineitem (5 cols, 60M → 2.14M via BridgeFilter) | full 60M decode with mixed Snappy | ~600-900 | 1334.65 | **1.6× over** — heavy decode for OR-of-AND filter |
+| EmatixFastParquetExec part (2M → 4754 after p_brand/container/size filter) | ~20 | 27.98 | mild over |
+| FilterExec residual (per-table predicates) | small | 25.36 + 24.04 = 49.4 | at-floor ✓ |
+| HashJoinExec (part_filt ⋈ lineitem-filt) Partitioned + 3-way OR-of-AND filter | build 4754 = L1, probe 2.14M | ~15 | 15.62 | at-floor ✓ |
+| RepartitionExec 1.28M | ~10 | 9.18 | at-floor ✓ |
+| AggregateExec (sum no-gby) | trivial | 0.04 | at-floor ✓ |
+
+Σ floor ~700 ms; observed 1437 ms — ~700 ms over-floor parallel (~70 ms wall). Σ/10.27 = 140 ms wall = matches observed.
+
+## Findings
+
+- **Q19 at realistic-parallelism floor** with the dominant cost being the lineitem scan + multi-predicate filter pushdown (60M → 2.14M). 
+- **The 3-way OR-of-AND filter on (p_brand, p_container, p_size, l_quantity)** isn't pushed as a single BridgeFilter — it's split into per-table FilterExecs + a HashJoin residual filter. The per-table parts ARE pushed (l_shipmode IN, l_shipinstruct EQ, l_quantity OR-bands) per the scan output of 2.14M < 60M. Memory notes "DataFusion already pushes per-table predicates from Q19's OR-of-AND" — confirmed.
+- Q19's effective parallelism 73% is mid-pack — not bottlenecked by CollectLeft chains.
+
+**Next:** B.20 (Q20 — 131.47 ms, +13% vs DuckDB).
 
 ## Physical plan
 
