@@ -59,8 +59,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let sql = std::fs::read_to_string(format!("examples/tpch/queries/q{q:02}.sql"))?;
     let df = ctx.sql(&sql).await?;
+    let df = if std::env::var("EMAT_REORDER").is_ok() {
+        let optimized = df.into_optimized_plan()?;
+        println!("=== Q{q:02} optimized LogicalPlan (pre-reorder) ===");
+        println!("{}", optimized.display_indent());
+        let rewritten =
+            ematix_flow_core::join_reorder::reorder_inner_joins(optimized)?;
+        println!("\n=== Q{q:02} optimized LogicalPlan (POST-reorder) ===");
+        println!("{}", rewritten.display_indent());
+        ctx.execute_logical_plan(rewritten).await?
+    } else {
+        df
+    };
     let plan = df.create_physical_plan().await?;
-    println!("=== Q{q:02} structural plan ===");
+    println!("\n=== Q{q:02} physical plan ===");
     println!("{}", displayable(plan.as_ref()).indent(true));
     Ok(())
 }

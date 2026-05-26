@@ -185,10 +185,31 @@ What the MVP does:
 - FK-aware output cardinality. The cost model uses leaf-side estimated rows (table size × filter selectivity from min/max). Output cardinality after join (`|A|×|B|/NDV`) isn't modeled — for left-deep TPC-H chains this is fine because the join graph is a tree and NDV ≈ smaller table's row count.
 - Q07/Q08-shape OR predicate splitting (`n_name=FRANCE AND n_name=GERMANY OR ...`). Separate Phase.
 
-### Phase 3 — Bench validation (~1 week)
-- Single-query A/B Q05/Q07/Q08/Q17/Q18 (15-trial, 3-warmup)
-- 22q SF=10 geomean check
-- **Bench gate:** 22q geomean ≤ 0.74 AND zero query-level regression > +5%. Anything worse and we revert before merging.
+### Phase 3 — Bench validation — PARTIAL 2026-05-25
+
+Wired `reorder_inner_joins` into `tpch_triangulation_bench` as opt-in via `EMAT_REORDER=1`. Iterated picker through three designs:
+
+| Picker | Q05 SF=10 | Q08 SF=10 | Notes |
+|---|---:|---:|---|
+| MVP smallest-first | **194 ms → 6259 ms (+32×)** | — | Catastrophic. customer⋈supplier nation-fanout created 120M intermediate. |
+| Cumulative-min greedy | 192 ms → 262 ms (+36%) | 192 → 284 ms (+47%) | Not catastrophic. Picks lineitem⋈supplier FK before customer (which has nation fanout). |
+| **Selinger left-deep DP** | **194 ms → 203 ms (+5%, in noise)** | 189 → 281 ms (+49%) | DP closes Q05 but Q08 still loses. |
+
+**Q05 SF=10 baseline:** 22q geomean **0.729 / 16 wins** (reorder OFF). Historical milestone 0.738 / 17 wins — within ±3pp noise band. Phase 1 stats wire-up did NOT drift baseline. Q15 at 0.982 is the borderline win that flipped.
+
+**Why Q08 still regresses** (post-DP): my cost model gives string-equality predicates a flat 0.1 selectivity. Q08's `p_type = 'ECONOMY ANODIZED STEEL'` is actually ~0.001 selective (200 / 200K parts). DP can't see how selective the part filter really is, so it picks orders-first (lower cumulative cost in the model) instead of part-first (lower actual wall time). Improving string-equality selectivity is the next iteration.
+
+**Ambiguity guard:** added `chain_has_ambiguous_names()` — bails the chain when any column name appears in multiple leaves (Q07/Q08 self-join `nation n1, n2`). Without this, predicate-routing routes via name-only matching and silently picks the wrong nation reference.
+
+### Phase 4 — Harden + integrate — NOT REACHED
+
+Was: opt-in flag, default-on after Phase 3 gate. Gate didn't pass (Q08 regression). Phase 4 deferred until cost-model is sharpened.
+
+### Disposition
+
+- The module + bench wire-up land as **opt-in infrastructure**, default OFF. 5 unit tests pass.
+- Σ.T's findings led to a broader audit (`/tmp/q_plans/q*.plan`) that ranked 10 plan-level inefficiencies across the 22 queries. The TOP findings (Q17 decorrelation, Q18 LeftSemi-through-Inner, CSE generalization for Q02/Q11/Q21/Q22) are not join-reorder problems — they're separate levers.
+- Next iteration on Σ.T should plumb proper string-equality selectivity (parquet bloom-filter NDV, or distinct_count from row-group stats where present) before re-running Q08.
 
 ### Phase 4 — Harden + integrate (~1 week)
 - Opt-in flag `EMAT_REORDER=1`

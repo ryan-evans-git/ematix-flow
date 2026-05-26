@@ -312,6 +312,33 @@ async fn run_ematix_flow(data_dir: &Path, sql: &str) -> Trial {
         Ok(d) => d,
         Err(e) => return Trial::Fail(format!("plan: {}", short(&e.to_string()))),
     };
+    // Σ.T Phase 3 (2026-05-25): optional join-reorder pre-plan walker.
+    // Opt-in via `EMAT_REORDER=1`. Runs DataFusion's logical
+    // optimizer to expand `Cross Join + Filter` → Inner Join, then
+    // applies the connectivity-aware cardinality-minimizing greedy
+    // reorder, then hands the rewritten plan to `execute_logical_plan`
+    // (which skips logical optimization — predicate pushdown /
+    // projection pruning ran in the first pass).
+    let reorder_on = std::env::var("EMAT_REORDER")
+        .ok()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let df = if reorder_on {
+        match df.into_optimized_plan() {
+            Ok(plan) => match ematix_flow_core::join_reorder::reorder_inner_joins(plan) {
+                Ok(rewritten) => match ctx.execute_logical_plan(rewritten).await {
+                    Ok(d) => d,
+                    Err(e) => {
+                        return Trial::Fail(format!("reorder exec: {}", short(&e.to_string())));
+                    }
+                },
+                Err(e) => return Trial::Fail(format!("reorder: {}", short(&e.to_string()))),
+            },
+            Err(e) => return Trial::Fail(format!("optimize: {}", short(&e.to_string()))),
+        }
+    } else {
+        df
+    };
     let stream = match df.execute_stream().await {
         Ok(s) => s,
         Err(e) => return Trial::Fail(format!("execute_stream: {}", short(&e.to_string()))),
