@@ -22,8 +22,10 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use arrow_ipc::writer::FileWriter as ArrowIpcWriter;
-use datafusion::prelude::SessionContext;
+use datafusion::execution::session_state::SessionStateBuilder;
+use datafusion::prelude::{SessionConfig, SessionContext};
 use ematix_flow_core::ematix_fast_parquet::EmatixFastParquetTableProvider;
+use ematix_flow_core::preset;
 use ematix_flow_distributed::work_unit::{Input, Output, Query, WorkUnit, WorkUnitMetrics};
 
 #[derive(Debug, thiserror::Error)]
@@ -82,7 +84,19 @@ pub async fn execute_work_unit(wu: &WorkUnit) -> Result<WorkUnitMetrics, RunShar
     };
 
     // ---- 3. Build session + register tables ----
-    let ctx = SessionContext::new();
+    //
+    // Σ.V (2026-05-26): install the ematix preset rule chain so a
+    // CLI shard produces the same plan shape as the bench. Before
+    // this change the CLI ran with vanilla DataFusion — losing
+    // Σ.Q.L10 LeftSemi pushdown, Σ.Q.L1b RobinHood SUM, Σ.Q.L9
+    // bloom sideband, and the Σ.D/Σ.E/Σ.G inject rules.
+    let state = preset::with_optimizer_rules(
+        SessionStateBuilder::new()
+            .with_config(SessionConfig::new())
+            .with_default_features(),
+    )
+    .build();
+    let ctx = SessionContext::new_with_state(state);
     let decode_start = Instant::now();
     for table in tables {
         let parquet_path = parquet_path_for_table(&prefix_path, table)

@@ -56,6 +56,9 @@ use crate::dict_aggregate_rule::EnableDictGroupCountRule;
 use crate::ematix_fast_parquet::EmatixFastParquetTableProvider;
 use crate::fused_aggregate_filter_multi_agg_rule::InjectFilterMultiAggRule;
 use crate::fused_aggregate_filter_sum_rule::InjectFilterSumRule;
+use crate::push_down_left_semi_rule::PushDownLeftSemiRule;
+use crate::robin_hood_sum_f64_exec::EnableRobinHoodSumF64Rule;
+use crate::runtime_bloom_sideband_rule::EnableRuntimeBloomSidebandRule;
 use crate::shared_subtree_exec::SharedSubtreeRegistry;
 
 /// Attach ematix-flow's optimiser rule chain to a `SessionStateBuilder`.
@@ -80,6 +83,26 @@ use crate::shared_subtree_exec::SharedSubtreeRegistry;
 ///    aggregate SQL pattern → `FusedAggregateExec<FilterMultiAggSpec>`.
 /// 4. `InjectFilterSumRule` — generic SUM-over-Filter SQL →
 ///    `FusedAggregateExec<FilterSumSpec>`.
+/// 5. `SwapSemiJoinBuildSideRule` — when one input to a semi/anti
+///    join has stronger cardinality stats than the other, swap so
+///    the smaller side becomes build. Closes Q18's inverted
+///    build-side bug.
+/// 6. `PushDownLeftSemiRule` (Σ.Q.L10, logical) — pushes a top-level
+///    LeftSemi join through Inner joins down to the target table,
+///    eliminating an N×M intermediate that would otherwise be built
+///    first.
+/// 7. `EnableRobinHoodSumF64Rule` (Σ.Q.L1b) — routes
+///    SUM(Float64)/COUNT GROUP BY Int64 through `RobinHoodSumF64Exec`
+///    which beats DataFusion's stock vectorised AggregateExec by 1-5%.
+/// 8. `EnableRuntimeBloomSidebandRule` (Σ.Q.L9 / Σ.Q.L15) — threads
+///    a runtime bloom between HashJoinExec build and probe-side
+///    EmatixFastParquetExec, pruning the probe scan at decode time.
+///    Configured with ratio=1024, allow_inner_join=true,
+///    require_filtered_build=true (the milestone config).
+///
+/// Σ.V alignment (2026-05-26): rules 6/7/8 were previously default-on
+/// in the bench but missing from this preset — library users got
+/// different plans than what we benchmarked. Now aligned.
 ///
 /// The dedupe rule's `SharedSubtreeRegistry` is freshly allocated per
 /// call to `with_optimizer_rules` and lives for the resulting
@@ -112,7 +135,38 @@ pub fn with_optimizer_rules_and_registry(
         .with_physical_optimizer_rule(Arc::new(InjectFilterSumRule))
         .with_physical_optimizer_rule(Arc::new(
             crate::swap_semi_join_build_rule::SwapSemiJoinBuildSideRule,
-        ));
+        ))
+        // Σ.V (2026-05-26): align preset with the bench's milestone
+        // config. The bench has these three rules default-on but
+        // preset.rs was missing them — library users got materially
+        // different plan shapes than what we benchmarked. See
+        // [[Σ.V — preset alignment]].
+        //
+        // PushDownLeftSemiRule (Σ.Q.L10): LOGICAL rule that pushes a
+        // top-level LeftSemi join through Inner joins down to its
+        // target table, eliminating the N×M intermediate that would
+        // otherwise be built first. Closes Q18-shape gap to DuckDB
+        // when the rule was introduced (memory: Q18 SF=10 -54% at
+        // commit 50825c9, before other levers stacked).
+        .with_optimizer_rule(Arc::new(PushDownLeftSemiRule))
+        // EnableRobinHoodSumF64Rule (Σ.Q.L1b): routes
+        // SUM(Float64)/COUNT GROUP BY Int64 through
+        // RobinHoodSumF64Exec which beats DataFusion's stock
+        // vectorised AggregateExec by 1-5% (memory: project_sigma_nf3_beats_stock).
+        .with_physical_optimizer_rule(Arc::new(EnableRobinHoodSumF64Rule))
+        // EnableRuntimeBloomSidebandRule (Σ.Q.L9 / Σ.Q.L15):
+        // threads a runtime bloom sideband between HashJoinExec
+        // build and probe-side EmatixFastParquetExec. The
+        // milestone config uses ratio=1024 (gates out L4'-style
+        // net-negative s⋈l firings while keeping small-dim→fact
+        // wins), allow_inner_join=true (Σ.Q.L15), and
+        // require_filtered_build=true (don't bloom on FK joins —
+        // [[l9_bloom_consumer_findings]]).
+        .with_physical_optimizer_rule(Arc::new(EnableRuntimeBloomSidebandRule {
+            min_probe_to_build_ratio: 1024,
+            allow_inner_join: true,
+            require_filtered_build: true,
+        }));
     (builder, registry)
 }
 

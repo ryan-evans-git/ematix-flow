@@ -204,11 +204,12 @@ struct AggBranchInfo {
 fn find_agg_branch(plan: &LogicalPlan) -> Option<AggBranchInfo> {
     match plan {
         LogicalPlan::Aggregate(agg) => {
-            // Aggregate input must reach a TableScan via transparent
-            // nodes (Projection, Filter, SubqueryAlias).
-            if !ends_in_table_scan(&agg.input) {
-                return None;
-            }
+            // Σ.U Phase 1.1 (2026-05-26): the aggregate's input can be
+            // any subtree that produces the group-by columns — not just
+            // a TableScan. Q02 has a 4-table Inner Join (partsupp ⋈
+            // supplier ⋈ nation ⋈ region) under the agg; Q17 has a
+            // single TableScan. Both are valid targets — we wrap the
+            // entire agg.input in a LeftSemi, not just the TableScan.
             let group_by_cols: Vec<Column> = agg
                 .group_expr
                 .iter()
@@ -220,21 +221,20 @@ fn find_agg_branch(plan: &LogicalPlan) -> Option<AggBranchInfo> {
             if group_by_cols.is_empty() {
                 return None;
             }
+            // Sanity: the input schema must expose every group-by column
+            // (always true post-optimization, but guard defensively).
+            let input_schema = agg.input.schema();
+            if !group_by_cols
+                .iter()
+                .all(|gc| input_schema.fields().iter().any(|f| f.name() == &gc.name))
+            {
+                return None;
+            }
             Some(AggBranchInfo { group_by_cols })
         }
         LogicalPlan::Projection(p) => find_agg_branch(&p.input),
         LogicalPlan::SubqueryAlias(s) => find_agg_branch(&s.input),
         _ => None,
-    }
-}
-
-fn ends_in_table_scan(plan: &LogicalPlan) -> bool {
-    match plan {
-        LogicalPlan::TableScan(_) => true,
-        LogicalPlan::Projection(p) => ends_in_table_scan(&p.input),
-        LogicalPlan::Filter(f) => ends_in_table_scan(&f.input),
-        LogicalPlan::SubqueryAlias(s) => ends_in_table_scan(&s.input),
-        _ => false,
     }
 }
 
@@ -311,7 +311,7 @@ fn splice_left_semi_into_agg(
     filter_col: &Column,
     filter_subtree: LogicalPlan,
 ) -> Option<std::sync::Arc<LogicalPlan>> {
-    let rewritten = splice_recurse(agg_side, agg_col, filter_col, &filter_subtree, false)?;
+    let rewritten = splice_recurse(agg_side, agg_col, filter_col, &filter_subtree)?;
     Some(std::sync::Arc::new(rewritten))
 }
 
@@ -320,20 +320,28 @@ fn splice_recurse(
     agg_col: &Column,
     filter_col: &Column,
     filter_subtree: &LogicalPlan,
-    inside_agg: bool,
 ) -> Option<LogicalPlan> {
     use std::sync::Arc;
     match plan {
         LogicalPlan::Aggregate(agg) => {
-            // Once we enter the aggregate, future TableScans get
-            // wrapped.
-            let new_input = splice_recurse(
-                &agg.input,
-                agg_col,
-                filter_col,
-                filter_subtree,
-                true,
-            )?;
+            // Σ.U Phase 1.1 (2026-05-26): wrap the aggregate's input
+            // directly in LeftSemi. This generalises across:
+            //   - Q17: agg.input is `TableScan: lineitem` — wrap it
+            //   - Q02: agg.input is a `Projection → Inner Join (4-table)`
+            //          — wrap the whole subtree
+            // The LeftSemi joins the agg's input (which produces
+            // `agg_col` by definition) with the filter subtree on
+            // `agg_col = filter_col`.
+            let on_expr = Expr::BinaryExpr(BinaryExpr {
+                left: Box::new(Expr::Column(agg_col.clone())),
+                op: Operator::Eq,
+                right: Box::new(Expr::Column(filter_col.clone())),
+            });
+            let new_input = LogicalPlanBuilder::from(agg.input.as_ref().clone())
+                .join_on(filter_subtree.clone(), JoinType::LeftSemi, [on_expr])
+                .ok()?
+                .build()
+                .ok()?;
             let new_agg = LogicalPlan::Aggregate(
                 Aggregate::try_new(
                     Arc::new(new_input),
@@ -345,8 +353,7 @@ fn splice_recurse(
             Some(new_agg)
         }
         LogicalPlan::Projection(p) => {
-            let new_input =
-                splice_recurse(&p.input, agg_col, filter_col, filter_subtree, inside_agg)?;
+            let new_input = splice_recurse(&p.input, agg_col, filter_col, filter_subtree)?;
             let new_proj = LogicalPlanBuilder::from(new_input)
                 .project(p.expr.clone())
                 .ok()?
@@ -355,28 +362,13 @@ fn splice_recurse(
             Some(new_proj)
         }
         LogicalPlan::SubqueryAlias(s) => {
-            let new_input =
-                splice_recurse(&s.input, agg_col, filter_col, filter_subtree, inside_agg)?;
+            let new_input = splice_recurse(&s.input, agg_col, filter_col, filter_subtree)?;
             let new_sa = LogicalPlanBuilder::from(new_input)
                 .alias(s.alias.clone())
                 .ok()?
                 .build()
                 .ok()?;
             Some(new_sa)
-        }
-        LogicalPlan::TableScan(_ts) if inside_agg => {
-            // This is the agg's TableScan — wrap in LeftSemi.
-            let on_expr = Expr::BinaryExpr(BinaryExpr {
-                left: Box::new(Expr::Column(agg_col.clone())),
-                op: Operator::Eq,
-                right: Box::new(Expr::Column(filter_col.clone())),
-            });
-            let semi = LogicalPlanBuilder::from(plan.clone())
-                .join_on(filter_subtree.clone(), JoinType::LeftSemi, [on_expr])
-                .ok()?
-                .build()
-                .ok()?;
-            Some(semi)
         }
         _ => Some(plan.clone()),
     }
@@ -482,6 +474,83 @@ mod tests {
         assert!(
             new_dump.contains("LeftSemi"),
             "rewritten plan must contain a LeftSemi node:\n{new_dump}"
+        );
+        Ok(())
+    }
+
+    /// Σ.U Phase 1.1: also fires on Q02 (correlated MIN subquery
+    /// over partsupp ⋈ supplier ⋈ nation ⋈ region(EUROPE)). The agg's
+    /// input here is a 4-table Inner Join, not a single TableScan —
+    /// the generalised splice wraps the entire input in LeftSemi.
+    #[tokio::test]
+    async fn fires_on_q02_shape() -> DfResult<()> {
+        let Some(dir) = sf1_dir() else {
+            eprintln!("skip: sf1 missing");
+            return Ok(());
+        };
+        let ctx = SessionContext::new();
+        register_tpch(&ctx, &dir).await?;
+        let sql = std::fs::read_to_string(
+            dir.parent()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .join("queries/q02.sql"),
+        )
+        .ok();
+        let Some(sql) = sql else {
+            eprintln!("skip: q02.sql missing");
+            return Ok(());
+        };
+        let df = ctx.sql(&sql).await?;
+        let optimized = df.into_optimized_plan()?;
+        let rewritten = push_filter_into_agg(optimized.clone())?;
+        let orig_dump = format!("{}", optimized.display_indent());
+        let new_dump = format!("{}", rewritten.display_indent());
+        assert_ne!(orig_dump, new_dump, "Q02 rewrite must change plan");
+        assert!(
+            new_dump.contains("LeftSemi"),
+            "rewritten Q02 plan must contain a LeftSemi:\n{new_dump}"
+        );
+        Ok(())
+    }
+
+    /// Σ.U Phase 1.1: Q02 end-to-end correctness — rewrite must
+    /// produce the same row set as baseline.
+    #[tokio::test]
+    async fn rewrite_preserves_q02_result() -> DfResult<()> {
+        let Some(dir) = sf1_dir() else {
+            eprintln!("skip: sf1 missing");
+            return Ok(());
+        };
+        let ctx = SessionContext::new();
+        register_tpch(&ctx, &dir).await?;
+        let sql = std::fs::read_to_string(
+            dir.parent()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .join("queries/q02.sql"),
+        )
+        .ok();
+        let Some(sql) = sql else {
+            eprintln!("skip: q02.sql missing");
+            return Ok(());
+        };
+        // Baseline.
+        let df_baseline = ctx.sql(&sql).await?;
+        let baseline_batches = df_baseline.collect().await?;
+        let baseline_rows: usize = baseline_batches.iter().map(|b| b.num_rows()).sum();
+        // Rewritten.
+        let df_new = ctx.sql(&sql).await?;
+        let optimized = df_new.into_optimized_plan()?;
+        let rewritten = push_filter_into_agg(optimized)?;
+        let df_new = ctx.execute_logical_plan(rewritten).await?;
+        let new_batches = df_new.collect().await?;
+        let new_rows: usize = new_batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(
+            baseline_rows, new_rows,
+            "Q02 rewrite changed row count: baseline={baseline_rows}, rewritten={new_rows}"
         );
         Ok(())
     }
