@@ -68,30 +68,44 @@ SortPreservingMergeExec [s_acctbal DESC, ...]
 
 Σ median compute across all nodes: 188.40 ms. Wall median 32.49 ms. Parallel speedup ≈ 5.80× of 14 cores.
 
-## Theoretical floor (Phase A.1 audit-revised constants)
+## Theoretical floor (Phase A.1 audit-revised + per-stage waste, 2026-05-26)
 
 Q02 SF=10, parallel across 14 cores. Snappy 1.61 GB/s, hash agg 3 ns/row (10K-1M groups, revised), filter 0.62 ns/row, hash join 5/10 ns/row (build/probe, unverified).
 
-| Stage | Floor formula | Floor (ms) |
-|-------|---------------|-----------:|
-| 1× partsupp scan, 3 cols (cache makes 2nd ~free) | 8M × 16 B / (1.61 GB/s × 14) ≈ 130 MB / 22.5 GB/s | 5.8 |
-| 1× part scan, ~5 cols (100k rows, ~30 MB compressed) | scan small, dominated by LIKE | 0.5 |
-| Filter part LIKE '%BRASS' on 100k rows | 100k × 5 ns/row / 14 ≈ 0.04 | <0.1 |
-| Filter region.r_name='EUROPE' (5 rows) | trivial | <0.1 |
-| supplier / nation / region scans | trivial | <0.5 |
-| 5 HashJoinExec builds | all ≤ 31k rows; 5 ns/row each | <0.5 |
-| Largest probe (part_filt build 7854 ⋈ partsupp 8M) | 8M × 10 ns/row / 14 | 5.7 |
-| Next probe (1.18M agg output ⋈ part_filt × partsupp) | 1.18M × 10 ns / 14 | 0.8 |
-| AGG Partial: 8M rows → 1.18M groups (MIN f64) | 8M × 3 ns/row / 14 | 1.7 |
-| AGG Final: 1.18M rows → 1.18M groups (no further reduction) | 1.18M × 3 ns/row / 14 | 0.25 |
-| Sort 4667 × 4 cols | n × log₂(n) × 75 ns / 14 | <0.1 |
-| **Floor (revised)** | | **~14 ms** |
-| **Actual (5-trial stage profile)** | | **32.96 ms** |
-| **Waste ratio** | | **2.4×** |
+### Effective parallelism
 
-Floor was ~18 ms with old constants; revised down to ~14 ms because (a) RG decode cache makes the 2nd partsupp scan ~free, (b) hash agg constant moved from 8 → 3 ns/row per Phase A.1 audit.
+- **Σ median compute / wall = 5.71×** (was 5.80×). Only **41% effective parallelism on 14 cores** — worse than Q01 (54%). Q02's plan has more sequential pipeline stages (CollectLeft small-dim joins on 1 thread + Partial→RepartitionExec→Final agg chain) which reduces achievable parallelism vs a flat scan.
 
-Wall actually dropped (36 → 33 ms), but floor dropped more (18 → 14), so waste ratio **worsened from 1.8× → 2.4×**. There's more "missing performance" to find than we thought; the 2026-05-25 floor was too generous.
+### Per-stage actual vs floor
+
+| Stage | Parallel floor | Parallel actual | Gap | Note |
+|-------|---------------:|----------------:|----:|------|
+| partsupp scan #1 (8M rows, 3 cols) | ~3 ms | 3.41 ms | +0.4 ms | **near-floor** ✓ |
+| partsupp scan #2 (cache hit) | ~0.2 ms | 0.20 ms | 0 | **RG cache closes** ✓ |
+| part scan + LIKE filter (100k rows) | ~1 ms | 6.86 ms | **+5.9 ms** | **6× over floor** — LIKE matcher hot? StringView decode? |
+| supplier/nation/region scans | trivial | trivial | 0 | ✓ |
+| Hash agg Partial (8M → 1.18M groups, MIN f64) | 1.7 ms | 24.48 ms | **+22.8 ms** | **14× over floor** — Partial doing 8M-row work that produces ≈ no reduction |
+| Hash agg Final (1.18M → 1.18M, no further reduction) | 0.25 ms | 36.42 ms | **+36.2 ms** | **146× over floor** — pure overhead; group key = partition key |
+| HashJoin depth 11 (part_filt 7854 ⋈ partsupp 8M) | 5.7 ms | 22.87 ms | **+17.2 ms** | **4× over floor** — probe side at ~57k rows/core/ms (slow) |
+| HashJoin depth 13 (compound key on 1.18M ⋈ 31k) | ~1.7 ms (2× single-key) | 25.30 ms | **+23.6 ms** | **15× over floor** — compound-key probe (p_partkey, ps_supplycost) |
+| HashJoin depth 9 (1.6M output) | ~0.8 ms | 19.65 ms | **+18.9 ms** | **25× over floor** — needs deeper look |
+| HashJoin depth 3 (final assemble, 4667 rows out) | trivial | 12.28 ms | **+12 ms** | **large overhead** for small output |
+| **Floor (sum, parallel-equivalent)** | | | **~14 ms** | |
+| **Actual wall** | | **32.96 ms** | | |
+| **Gap to floor** | | | **~19 ms (2.4×)** | |
+
+### Where the 19 ms gap goes
+
+Total operator excess over floor: ~137 ms parallel work (sum of all the +N gap columns above). With 41% effective parallelism, that maps to ~137 / 5.71 = **24 ms of "excess wall"**. Plus ~14 ms of floor wall = 38 ms expected. Observed: 33 ms (close enough; some excess overlaps with other stages).
+
+The dominant per-stage gaps:
+1. **AGG Final at 36 ms parallel over a 0.25 ms floor** — entirely orchestration overhead. Group key (ps_partkey) = partition key, so Final is a no-op reduction.
+2. **AGG Partial at 22.8 ms parallel over a 1.7 ms floor** — same root cause: doing reduction work on data already partitioned correctly.
+3. **HashJoin depth 13 (compound key) at 23.6 ms over floor** — 2-key hashing is structurally ~2× single-key.
+4. **HashJoin depth 9 + 11 + 3** — collectively ~50 ms parallel over floor, source unclear (likely batch-boundary overhead in the probe loop).
+5. **part scan + LIKE at 5.9 ms over floor** — small but surprising; LIKE matcher kernel is fast per [[sigma-e5-like-kernel]] (9-14× std), so the gap is somewhere else (StringView decode? bitmap materialisation?).
+
+Floor was ~18 ms with old constants; revised down to ~14 ms because (a) RG cache makes 2nd partsupp scan ~free, (b) hash agg constant moved from 8 → 3 ns/row per Phase A.1 audit. Wall dropped less (36 → 33), so waste ratio **worsened from 1.8× → 2.4×**.
 
 ## Waste candidates
 
@@ -119,20 +133,23 @@ region/nation/supplier are tiny enough that CollectLeft is correct. No change.
 
 ## Findings to capture as memories
 
-- Q02 SF=10 is at **2.4× floor** (was 1.8× with old constants) — we're 35% ahead of DuckDB, but the absolute waste (~19 ms) is still meaningful.
+- Q02 SF=10 is at **2.4× floor** (was 1.8× with old constants). Absolute gap to floor: ~19 ms on a 33 ms query.
 - **The RG decode cache closes the double-scan pattern for FREE.** Q02 shows a 3.41 ms → 0.20 ms drop on the second partsupp scan. This generalises: any query that scans the same table twice (Q11, Q15, Q21 subquery patterns) gets the same benefit. Cross-query memory candidate.
-- **Partial+Final agg on partitioning key is wasted Partial work.** Confirmed across Q02 (1.18M Partial → 1.18M Final, no reduction). Worth a 22q sweep before designing a fix.
-- **Compound-key probe on (p_partkey, ps_supplycost)** at depth 13 dominates remaining waste (25 ms parallel). Two-key hash probe is ~2× slower per row than single-key. Σ.AH.2 (compound-key Robin Hood) extension territory if pattern shows in Q09/Q10/Q20.
+- **Partial+Final agg on the partitioning key is ~59 ms of pure overhead.** AGG Final at 36 ms parallel over a 0.25 ms floor (146× over floor!) — pure orchestration since group key (ps_partkey) = partition key. Cross-query lever: any plan where `RepartitionExec(hash on K)` feeds `AggregateExec(group by K, Partial)` is paying for nothing.
+- **Q02 effective parallelism is 41% — worse than Q01's 54%.** CollectLeft + Partial→Final pipeline serialise more than Q01's flat scan. Parallelism imbalance is a 22q pattern, not Q01-specific.
+- **Compound-key probe on 2 keys (depth 13) costs ~2× single-key.** Structural; needs compound-key Robin Hood or rewrite as 2-step probe.
 
-## Σ.AH waste candidate ranking (current)
+## Σ.AH waste candidate ranking (current, per-stage anchored)
 
 After candidate #1 is now closed by RG cache:
 
-| Rank | Stage / lever | Parallel ms | Est. wall savings | Confidence | Notes |
-|-----:|---------------|------------:|------------------:|:----------:|-------|
-| 1 | Partial agg redundant when group-by ≡ partition key | ~24 ms | ~1.5 ms | high | Σ.AH cluster candidate; check Q03/Q05/Q10 for same shape |
-| 2 | Compound-key HashJoin probe (depth 13) on 2 keys | ~25 ms | ~1.5 ms | medium | Could rewrite as 2-step single-key probe + filter; or compound-key Robin Hood |
-| 3 | part_filt ⋈ partsupp probe (8M rows, partial filter) | ~23 ms | ~1 ms | medium | Already near 10 ns/row probe floor; bloom-from-part_filt could drop 8M→31k pre-decode |
+| Rank | Stage / lever | Parallel waste | Est. wall savings | Confidence | Notes |
+|-----:|---------------|---------------:|------------------:|:----------:|-------|
+| 1 | **AGG Partial+Final on partitioning key** | ~59 ms (24+36) | **~4 ms (12%)** | high | Group key (ps_partkey) = partition key after RepartitionExec → both Partial AND Final are pure overhead. Pre-plan rule: skip Partial when RepartitionExec hash key ⊇ agg group keys. Cross-query candidate (Q03/Q05/Q10/Q20 likely same). |
+| 2 | **Compound-key HashJoin probe (depth 13)** | ~24 ms | ~1.5 ms | medium | 2-key probing structurally ~2× single-key. Compound-key Robin Hood OR reformulate as 2-step. |
+| 3 | **HashJoin depths 9 + 11 + 3 over-floor** | ~50 ms | ~3 ms | low-medium | Source unclear — batch-boundary overhead in probe loops? Needs samply self-time data. Investigate per-batch overhead before designing fix. |
+| 4 | **Parallelism imbalance (41% effective)** | ~14 ms wall potential | ~10 ms if pushed to 60% | medium | Q01 had same pattern at 54%; Q02 is worse due to CollectLeft + pipeline serialisation. Lever crosses all queries. |
+| 5 | **part scan + LIKE pattern over floor** | ~6 ms | ~0.5 ms | low | 6× over floor on a 100k-row scan with LIKE — small absolute. May be StringView decode, not LIKE itself. Defer. |
 
 ## Next levers from Q02
 
@@ -150,6 +167,8 @@ After candidate #1 is now closed by RG cache:
 - **RG decode cache closed the partsupp double-scan candidate.** The 2nd partsupp scan dropped from 3.5 ms → 0.20 ms.
 - Floor moved DOWN (18 → 14 ms) from audit-revised constants; waste ratio worsened from 1.8× → 2.4×. There's more "missing performance" to chase than the old floor suggested, but absolute wall headroom (~15 ms = 4× wall improvement potential) is still modest.
 
-**No fundamentally new candidate identified;** existing #2 (Partial+Final on partitioning key) re-confirmed as the biggest lever, and a new compound-key HashJoin observation added to the ranking. Both worth carrying to Phase C for cross-query pattern detection rather than chasing in Q02 alone.
+**Per-stage decomposition (added per user feedback):** revealed that **AGG Final at 36 ms parallel / 0.25 ms floor (146× over)** is the single biggest absolute-waste stage in the query. The Partial+Final agg pattern is doing pure orchestration when the partition key equals the group-by key (RepartitionExec hashes on ps_partkey → AggregateExec groups by ps_partkey → both stages just re-shuffle and re-hash identical data). This is a clear cross-query candidate — pattern shows wherever the planner's RepartitionExec aligns with the agg's group-by columns.
+
+**Effective parallelism: 41% (worse than Q01's 54%).** Q02's CollectLeft small-dim joins + Partial→Final pipeline serialise more than Q01's flat scan. Same generalised lever as Q01's #1 candidate, just with different mechanics.
 
 **Next:** B.3 (Q03, 145.74 ms SF=10 vs DuckDB 145.58 — statistical tie, but third-largest absolute wall time).
