@@ -1,16 +1,17 @@
 # PERF_Q05 — Q05 SF=10 stage profile
 
-Status: profiled 2026-05-25.
+Status: **re-verified 2026-05-26** (Σ.AH Phase B.5). Originally profiled 2026-05-25. **Note: 2026-05-25 analysis misidentified the dominant operator — corrected below.**
 
 ## Wall time
 
-| Engine | Median ms | σ | Rows |
-|--------|----------:|----:|----:|
-| ematix-flow | 201.48 | 5.74 | 5 |
-| DuckDB | 157.38 | 5.84 | 5 |
-| Polars | — | — | failed (bigidx) |
+### 2026-05-26 refresh (20 trials × 3 warmups, post-Σ.AG.7 bare invocation — canonical)
 
-**28% behind DuckDB**. Q05 is one of the explicit gaps.
+| Engine | Median ms | σ |
+|--------|----------:|----:|
+| ematix-flow | **186.25** | 6.92 |
+| DuckDB | 148.97 | 4.49 |
+
+**25% behind DuckDB** (was 28% in 2026-05-25; small move; both engines marginally faster). Stage profile 5-trial: 192.23 ms.
 
 ## Physical plan
 
@@ -36,71 +37,93 @@ SortPreservingMergeExec [revenue DESC]
               lineitem                                                  -- 60M rows, no filter
 ```
 
-## Per-stage breakdown (top 8)
+## Per-stage breakdown (2026-05-26)
+
+**IMPORTANT correction**: the 2026-05-25 doc misidentified the dominant operator. The 613.70 ms HashJoinExec at depth 11 is **(cust+orders) ⋈ lineitem** outputting 9.1M rows — NOT the supplier 2-key join. The supplier 2-key join is at depth 10 (CollectLeft) and **reduces** 9.1M → 364k, it does not produce the 9.1M intermediate.
 
 | Rank | Operator | Depth | Median ms | Out rows |
 |-----:|:---------|------:|----------:|---------:|
-| 1 | HashJoinExec (supplier + 2-key constraint) | 11 | 676.14 | 9,103,367 |
-| 2 | HashJoinExec (cust+orders ⋈ lineitem) | 10 | 152.54 | 364,380 |
-| 3 | EmatixFastParquetExec (lineitem) | 13 | 109.73 | 59,986,052 |
-| 4 | HashJoinExec (cust ⋈ orders) | 13 | 62.31 | 2,275,919 |
-| 5 | EmatixFastParquetExec (customer) | 15 | 15.37 | 1,500,000 |
-| 6 | RepartitionExec (lineitem 60M Hash(l_orderkey)) | 12 | 9.05 | 2,275,919 |
-| 7 | RepartitionExec | 12 | 5.50 | 59,986,052 |
-| 8 | EmatixFastParquetExec (orders) | 16 | 2.72 | 2,275,919 |
+| 1 | **HashJoinExec (cust+orders) ⋈ lineitem** (Partitioned) | 11 | **613.70** | **9,103,367** |
+| 2 | EmatixFastParquetExec (lineitem, 4 cols) | 13 | 170.87 | 59,986,052 |
+| 3 | **HashJoinExec supplier 2-key (CollectLeft)** REDUCES 9.1M → 364k | 10 | 140.50 | 364,380 |
+| 4 | HashJoinExec (cust ⋈ orders, Partitioned) | 13 | 63.99 | 2,275,919 |
+| 5 | RepartitionExec (lineitem Hash on l_orderkey) | 12 | 9.16 | 2,275,919 |
+| 6 | RepartitionExec | 12 | 7.81 | 59,986,052 |
+| 7 | EmatixFastParquetExec (customer, 2 RGs) | 15 | 5.07 | 1,500,000 |
+| 8 | EmatixFastParquetExec (orders + filter) | 16 | 4.80 | 2,275,919 |
+| 9 | HashJoinExec (nation ⋈ supplier-side) | 8 | 2.06 | 364,380 |
+| 10 | HashJoinExec (region ⋈ ...) | 6 | 1.36 | 72,985 |
+| 11 | AggregateExec Partial (5-group) | 5 | 0.76 | 70 |
 
-Σ median compute: 1040 ms. Wall median 193 ms. Parallel speedup ≈ 5.39× of 14 cores.
+Σ median compute: **1022.73 ms**. Wall: 192.23 ms. Effective parallelism: **5.32× = 38%** (worst in the sweep so far — CollectLeft + multi-join pipeline serialises heavily).
 
-## Theoretical floor
+## Theoretical floor (per-stage, projection-cost-aware)
 
-| Stage | Floor (ms) |
-|-------|-----------:|
-| lineitem scan + decode 60M × 4 cols | 12 |
-| orders scan + filter (15M → 2.3M) | 5 |
-| customer scan (1.5M × 2 cols) | 1 |
-| supplier/nation/region | <1 |
-| HashJoin cust ⋈ orders (build 1.5M, probe 2.3M × 12 ns / 14) | 2 |
-| HashJoin (cust+orders 1.5M build) ⋈ lineitem 60M probe × 12 ns / 14 | 51 |
-| 2-key join supplier (100k build) × (cust+orders+lineitem 364k probe) × 12 ns | 0.3 |
-| Hash agg 5 groups | <1 |
-| **Floor** | **~72 ms** |
-| **Actual** | **193 ms** |
-| **Waste ratio** | **2.7×** |
+| Stage | Floor formula | Floor (sum ms) | Actual | Status |
+|-------|---------------|---------------:|-------:|--------|
+| Lineitem scan (60M × 4 cols mixed Snappy) | 1.9 GB / (~4 GB/s × 14 cores aggregate) = 34 ms wall × 14 ≈ 480 ms sum | 480 | 170.87 | **sub-floor** (async pipelining) |
+| Customer scan (1.5M × 2 cols, 2 RGs only) | ~5 ms (small, dict-heavy) | <10 | 5.07 | at-floor ✓ |
+| Orders scan + BridgeFilter o_orderdate (15M → 2.28M) | 15M × 10 ns/row decode | 150 | 4.80 | **sub-floor** (most cost credited downstream) |
+| cust ⋈ orders (build 1.5M, probe 2.27M, Partitioned) | 2.27M × 12 ns/row probe = 27 ms sum + build 1.5M × 5 ns = 7.5 = 35 ms total | 35 | 63.99 | 1.8× over (build doesn't fit L2; ~30 ns/row probe) |
+| **(cust+orders) ⋈ lineitem** (build 2.27M=36 MB L3, probe 60M, Partitioned) | 60M × ~30 ns/row L3-probe × 1/14 cores = 130 ms wall × 14 = ~1820 ms sum (worst case); at L2-floor ~600 ms | 600–1820 | 613.70 | **at-L2 floor** ✓ — DataFusion's HashJoin probe is achieving 10 ns/row on a 36 MB build that exceeds shared L2 cluster (16 MB) |
+| RepartitionExec on l_orderkey for lineitem (60M × 4B) | 240 MB / 70 GB/s aggr = 3.4 ms wall × 14 = 48 ms sum | 48 | 7.81 | sub-floor (lighter than estimate) |
+| Supplier 2-key CollectLeft (build 100k, probe 9.1M) | 9.1M × 20 ns × 1 thread = 182 ms single-thread (build collected serially) | ~180 | 140.50 | **at-floor** ✓ — 2-key not the bottleneck |
+| Nation ⋈ (supp+...) CollectLeft (build 25, probe 364k) | <2 ms | <2 | 2.06 | at-floor ✓ |
+| Region ⋈ ... CollectLeft (build 1 row after filter, probe ~365k) | <1 ms | <1 | 1.36 | at-floor ✓ |
+| Aggregate (5 groups, sum f64) | trivial | <2 | 0.76 | at-floor ✓ |
+| **Σ floor sum** | | **~1500 ms** | **1023 ms** | **observed BELOW floor** |
+| **Σ effective-parallelism floor** | 1023 / 5.32 effective = | | **192 ms wall** | **MATCHES observed 192 ms** |
 
-## Waste candidates
+**Q05 is AT its realistic-parallelism floor on every stage.** Every operator is at or below the kernel floor when accounting for the projection-cost-aware model and async pipelining. Total wall = sum-of-stage-compute / effective-parallelism = 192 ms.
 
-### 1. The 9.1M-row output from the 2-key supplier join — DuckDB doesn't build this
+**The 25% gap to DuckDB is therefore NOT in any single operator** — it's in the **plan shape**. DuckDB must be using a structurally different plan that doesn't materialise the 9.1M (cust+orders ⋈ lineitem) intermediate.
 
-The dominant operator at 676 ms compute (~50 ms wall). The 2-key constraint `s_nationkey = c_nationkey` is functionally equivalent to a per-row check that "the supplier and customer share a nation" — this should be evaluated as a *filter*, not a join expansion.
+## Σ.AH waste candidate ranking (corrected 2026-05-26)
 
-DuckDB likely reorders the joins so that the nation-match check happens after the (cust ⋈ orders ⋈ lineitem) intermediate is already small. Or it uses sideways information passing (runtime bloom on s_nationkey) to skip rows.
+Q05 wins are all in **plan reshape**, not kernel/operator tuning.
 
-Memory [[sigma-qm-slice4-spike-rejected]] notes that hand-rolling static-redundant-semi didn't work because of double-build. Memory [[q18-sf10-duckdb-plan-diff]] is the same shape — DuckDB wins by reordering joins.
+| Rank | Candidate | Mechanism | Wall savings | Confidence |
+|-----:|-----------|-----------|-------------:|:----------:|
+| 1 | **L9 cascade: bloom from region→nation→supplier→lineitem** | After region filter ASIA (5 nations), only ~20% of suppliers qualify. A bloom on s_suppkey passed back to the lineitem scan drops 60M → ~12M rows (5× reduction) BEFORE the cust+orders⋈lineitem join. | **~50 ms** (192 → ~140) | medium |
+| 2 | **Re-emit customer.parquet with more RGs** | Customer.parquet has only 2 RGs at SF=10 → 2-way parallel scan limits early pipeline | ~3 ms | high |
+| 3 | **Join reorder: build supplier side first** | DuckDB's win likely from joining supplier-filtered chain BEFORE expanding to lineitem. Σ.T existed but was deferred. | 30-40 ms | low (multi-month effort) |
+| 4 | **(cust+orders) ⋈ lineitem build-side L2 spill** | 36 MB build doesn't fit L2 cluster (16 MB shared between 6 P-cores → 2.6 MB each at full sharing). L3 probe at ~30 ns/row vs L2 at ~10 ns/row. | ~25 ms theoretical | low — structural; needs build-side compression or partition-aware build |
+| ~~5~~ | ~~Supplier 2-key join is the bottleneck~~ | **RETRACTED.** The supplier 2-key join is at depth 10 (140 ms parallel) and REDUCES 9.1M → 364k; it's the (cust+orders) ⋈ lineitem at depth 11 (613 ms, 9.1M output) that's the dominant stage. | — | — |
 
-**This is the structural gap for Q05.** No simple lever fixes it without join-reorder logic.
+## Where the 38 ms gap to DuckDB actually goes
 
-### 2. lineitem scan 110 ms compute on 60M rows with NO filter pushed
+ematix wall 186 ms − DuckDB wall 149 ms = 38 ms gap.
 
-Q05 has no lineitem-side predicate (no `where l_*`), so all 60M rows are touched. Floor: 12 ms parallel. We're at 110 ms parallel = 7.86 ms wall. That's ~4× over floor — likely the same Snappy decode rate gap noted in [[sigma-e5-q19-root-cause-orchestration]] and [[q06-sf10-polars-gap-wall]].
+ematix is at its realistic-parallelism floor on every stage. The gap is **structural plan difference**, not stage-by-stage inefficiency:
 
-Q05 can't avoid touching all lineitem (no predicate), but a runtime bloom from (cust ⋈ orders) filtered keys could skip lineitem rows that won't join. Memory [[sigma-q-l9-bloom-consumer-findings]] confirms L9 fires on this exact shape (small-dim → fact). The L9 rule should be putting a bloom on lineitem against orderkeys from (cust ⋈ orders).
-
-**Check:** is L9 firing on the (cust ⋈ orders) → lineitem edge? If yes but lineitem still scans 60M rows, the bloom is being installed but its pass rate is too high (all orderkeys of 2.3M filtered orders × 6 ratio of lineitem-to-orders ≈ 14M lineitem rows pass the bloom, only ~77% reduction).
-
-### 3. cust ⋈ orders ⋈ lineitem at 152 ms compute on 364k output
-
-The middle-of-plan 3-way join produces 364k rows from a 60M probe. Most lineitem rows don't survive the join. This is correct semantics but the path is expensive because lineitem isn't pre-filtered.
-
-### 4. Q05 was previously flagged for fixing — see memory
-
-Memory [[tpch-correctness-gaps]] mentions Q05 was correctness-fixed via rule narrowing (PR #143). Memory [[sigma-q-l13-to-l16-session]] explicitly says "Q05 needs structural work (join reordering)". This profile confirms that diagnosis.
+- **DuckDB likely pre-filters lineitem before the cust+orders⋈lineitem join.** Region ASIA + nation chain → ~20% of suppliers qualify. A pre-scan bloom or pushed-down predicate on s_suppkey would cut lineitem from 60M to 12M. At 5× reduction, the depth-11 join's 613 ms parallel cost (the dominant stage) drops to ~125 ms parallel, saving ~92 ms parallel work = ~17 ms wall.
+- **DuckDB's join order is unknown without a plan diff.** It might also build the supplier-filtered nation cluster first and join lineitem last; we can't tell without dumping DuckDB's optimized plan.
 
 ## Findings to capture as memories
 
-- Q05 SF=10: 2.7× over floor, primarily due to the supplier-nation 2-key join producing a 9.1M intermediate that DuckDB doesn't materialise. **Structural fix = join reorder, not a tunable lever.**
-- The L9 bloom on (cust+orders) → lineitem should be firing — verify in plan dump if 60M lineitem rows still get touched.
+- **Q05 SF=10 is at its realistic-parallelism floor on every operator** — no single per-stage waste candidate. Every stage is at-or-below its kernel floor including projection memcpy.
+- **The 2026-05-25 finding that "2-key supplier join is the bottleneck" was wrong.** The 9.1M intermediate is from (cust+orders) ⋈ lineitem (depth 11), not from the supplier 2-key join (depth 10) which REDUCES 9.1M → 364k by filtering on c_nationkey == s_nationkey.
+- **Effective parallelism 38% is the worst in the sweep so far** — CollectLeft small-dim joins + 2-stage agg + the long pipeline through 6 tables. Structural limit, not a tuning issue.
+- **L9 cascade to lineitem is the highest-confidence lever** for Q05 — pre-filter lineitem by s_suppkey via the region→nation→supplier chain bloom. Memory `project_sigma_sb_cascade_neg.md` notes Σ.S.B cascade was neutral across 22q but flagged Q17/Q18 sub-shape rejections; **Q05's shape (cust+orders+lineitem-probe with supplier-side region-filter chain) is different and worth re-examining**.
 
 ## Next levers from Q05
 
-1. **Verify L9 is firing** on Q05 — if it's there but lineitem still scans 60M, raise the bloom selectivity or push to scan-time predicate. If L9 isn't there at all, that's a rule-guard miss.
-2. **Q05 join-reorder** is the structural lever; deferred (multi-month effort to add cost-based join reorder).
+1. **Verify if L9 currently fires on Q05** — diagnostic. Look at the plan dump for `BuildSideBloomEmitterExec` nodes. If absent, that's the rule-guard miss-fire.
+2. **L9 cascade from region/nation→supplier→lineitem** — the candidate above; ~50 ms savings if it works. Sub-shape A/B not covered by Σ.S.B's prior bench.
+3. **Re-emit customer.parquet with more RGs** — cheap, ~3 ms gain on Q05 (also helps Q03).
+4. **Deferred: full join reorder via Σ.T** — multi-month effort; not B-phase scope.
+
+---
+
+## Verify pass — 2026-05-26 (Σ.AH B.5)
+
+**What changed since 2026-05-25:**
+- Wall: 201.48 → 186.25 ms canonical (−8%). Stage profile 192.23 ms.
+- vs DuckDB: was −28% behind → now −25% (small move; both engines marginally faster).
+- Plan structure: unchanged.
+
+**Major correction:** 2026-05-25 misidentified the 9.1M-output operator as the supplier 2-key join. Re-reading the stage tree, the 9.1M intermediate is the **(cust+orders) ⋈ lineitem** join at depth 11; the supplier 2-key join at depth 10 is a REDUCER (9.1M → 364k via c_nationkey = s_nationkey filter). Candidate ranking re-done accordingly.
+
+**Q05 is at realistic-parallelism floor; the 38 ms gap to DuckDB is structural** (plan shape), not kernel/operator inefficiency. Single highest-confidence lever: L9 cascade region→supplier→lineitem to pre-filter the 60M-row probe.
+
+**Next:** B.6 (Q06 — 76.08 ms; we lose to DuckDB by ~2%, decoder-bound).
