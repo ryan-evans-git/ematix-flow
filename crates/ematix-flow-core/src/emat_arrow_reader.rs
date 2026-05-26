@@ -1080,9 +1080,31 @@ impl EmatArrowBatchReader {
         // decode work outweighs the bitmap-construction + per-row
         // gather overhead. Phase 1.8 may misfire (stats inaccurate)
         // so keep the actual-popcount fallback as a safety net.
+        //
+        // Σ.AE.2 (2026-05-26): under Exact pushdown, FilterExec is
+        // dropped from the plan, so the BridgeFilter is the ONLY
+        // row filter. If we fall back to dense here without saving
+        // the bitmap, rows that should be filtered out are emitted.
+        // Q01 SF=10 leaked ~2.9% rows on boundary RGs (l_shipdate
+        // spans the cutoff); Q03 leaked ~26× rows (two filtered
+        // tables × Cartesian explosion). Stash the bitmap before
+        // the dense decode so slice_batch applies it per-batch via
+        // Arrow's SIMD filter (same shape as
+        // load_row_group_parallel_bitmap_dense at line 1355).
+        //
+        // Gate on EMAT_EXACT_PUSHDOWN: under Inexact (default),
+        // FilterExec is still in the plan and the per-batch SIMD
+        // filter is redundant work (~+9% Q01 SF=1 baseline regression
+        // when ungated). With the gate the default-mode path is
+        // bit-identical to pre-fix behavior; only Exact mode (which
+        // would otherwise emit wrong rows) gains the bitmap apply.
         if total > 0 && popcount * 3 > total {
             self.cur_rg_total = self.cached_md.row_groups[rg].num_rows as usize;
-            return self.load_row_group_dense(rg);
+            self.load_row_group_dense(rg)?;
+            if std::env::var_os("EMAT_EXACT_PUSHDOWN").is_some() {
+                self.cur_rg_filter_bitmap = Some(bitmap);
+            }
+            return Ok(());
         }
 
         // 2. Parallel masked-decode of each projected column. Same
