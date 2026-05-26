@@ -40,7 +40,50 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ctx.register_table(*t, Arc::new(prov))?;
     }
 
+    // Σ.AG.5 (2026-05-26): Q15 hits SharedSubtreeExec batch replay
+    // at ~0.6 ms — flagging "too fast?" check. Run Q15 once with NO
+    // cache (fresh ctx; produces baseline rows), then 3x via the
+    // cache, dumping the first ~5 cells of the result row each time
+    // to verify byte-identical output.
+    {
+        let df = ctx.sql(Q15_SQL).await?;
+        let batches = df.collect().await?;
+        let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+        println!("Q15 baseline (no cache): {total} rows");
+        if let Some(b) = batches.iter().find(|b| b.num_rows() > 0) {
+            let pretty = datafusion::arrow::util::pretty::pretty_format_batches(&[b.clone()])?;
+            println!("{pretty}");
+        }
+    }
+
     let cache = PlanCache::new();
+
+    println!("\nQ15 via cache, 3 reps:");
+    for rep in 0..3 {
+        let plan = cache.get_or_plan(&ctx, Q15_SQL).await?;
+        let plan: Arc<dyn datafusion::physical_plan::ExecutionPlan> =
+            if plan.output_partitioning().partition_count() > 1 {
+                Arc::new(
+                    datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec::new(
+                        plan,
+                    ),
+                )
+            } else {
+                plan
+            };
+        let mut s = plan.execute(0, ctx.task_ctx())?;
+        let mut batches = Vec::new();
+        while let Some(b) = s.try_next().await? {
+            batches.push(b);
+        }
+        let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+        println!("  rep {rep}: {total} rows");
+        if let Some(b) = batches.iter().find(|b| b.num_rows() > 0) {
+            let pretty = datafusion::arrow::util::pretty::pretty_format_batches(&[b.clone()])?;
+            println!("{pretty}");
+        }
+    }
+    println!();
 
     // Test all 22 queries; print row counts per rep so we can spot
     // any query where the cache returns different rows on rep 0 vs

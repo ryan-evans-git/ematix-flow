@@ -270,6 +270,14 @@ impl Default for PlanCache {
 ///   rep 0 marks every build row as visited, rep 1+ on the same
 ///   cached state finds no unvisited rows → empty output.
 ///
+/// - `SharedSubtreeExec` — caches the materialised RecordBatch output
+///   of a subtree in an Arc<CachedBatches>. `with_new_children`
+///   returns `self`, so a rebuilt plan still points at the same
+///   cached batches. That's correct WITHIN a single query execution
+///   (the whole point of CSE), but ACROSS executions the underlying
+///   table data may have changed — replay would serve stale batches.
+///   The plan cache must not assume that result data is invariant.
+///
 /// Empirically verified at 22q SF=1: with the BuildSide-only gate,
 /// Q20/Q21/Q22 still return 0 rows on rep 2+ (411→0, 186→0, 7→0).
 /// All three have at least one CollectLeft + LeftSemi or LeftAnti
@@ -280,6 +288,9 @@ impl Default for PlanCache {
 /// re-execute safely.
 pub fn is_cacheable(plan: &Arc<dyn ExecutionPlan>) -> bool {
     if plan.name() == "BuildSideBloomEmitterExec" {
+        return false;
+    }
+    if plan.name() == "SharedSubtreeExec" {
         return false;
     }
     if plan.name() == "HashJoinExec" {
