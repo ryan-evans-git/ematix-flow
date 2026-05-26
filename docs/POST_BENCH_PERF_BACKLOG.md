@@ -160,19 +160,48 @@ A `RepartitionExec: RoundRobinBatch(14)` followed by `RepartitionExec: Hash([col
 - SF=10 result: 15 wins / 5 DuckDB / 2 Polars (geomean ratio ematix/DuckDB ≈ 0.77 at 5 trials; vs historical 0.738 / 17 wins at 20 trials)
 - 22/22 row-level correctness PASS at both SF=1 and SF=10
 
-The slight regression (17→15 wins) is within 5-trial noise but the structural items above are real and worth ranking.
+The slight regression (17→15 wins) is within 5-trial noise.
 
-Ranked perf items by expected gain × effort:
+## Σ.Y/Σ.Z/Σ.AA deferred — engineering vs noise (2026-05-25)
 
-1. **Cheap one-rule fixes**
-   - RoundRobin→Hash dropper (cross-cutting, 7 queries affected).
-2. **Medium**
-   - Σ.P CSE extension (Q11, Q17 part subtree, Q21).
-3. **Bigger**
-   - Q05 composite-key split.
-   - Q22 subset-CSE.
-   - Q10 FD-aware aggregate.
-4. **Multi-week**
-   - Q08 bushy join planner.
+After scoping each backlog item against bench noise:
 
-Work through them in order; bench after each.
+| Item | Real gap (SF=10) | σ_ematix | gap÷σ | Engineering | Verdict |
+|------|------------------|----------|-------|-------------|---------|
+| Q05 composite-split + bloom cascade | 52 ms | 9.12 ms | 5.7σ | Magic-set rewriting infra (multi-day) | **DEFER** — multi-day infra; significant regression risk per [[optimizer-codegen-sensitivity]]. |
+| Q07 magic-set rewriting | 24 ms | 3.10 ms | 7.7σ | Same as Q05 — depends on static-IN-pushdown infrastructure | **DEFER** — same as Q05. |
+| Q08 bushy join planner | 21 ms | 23.86 ms | 0.9σ | Multi-week | **SKIP** — gap < noise; Σ.T's prior attempts regressed. |
+| Q11 partsupp subtree CSE | (we win 13ms) | — | — | Σ.P generalization (medium) | **SKIP** — speculative wins-on-top. |
+| Q17 part subtree CSE | 24 ms | 16.29 ms | 1.5σ | Partition-aware Σ.P extension | **DEFER** — expected impact 5-8 ms (1/3 of gap); rest is kernel-level. |
+| Q21 lineitem CSE | (we win 100ms) | — | — | Σ.P extension | **SKIP** — speculative; we already beat DuckDB by 33%. |
+| Q22 customer subset-CSE | (we win 100ms) | — | — | Σ.P + subset-equivalence | **SKIP** — speculative; we already win 5×. |
+| Q10 FD-aware aggregate | (we win 167ms) | — | — | Multi-week (PK propagation) | **SKIP** — audit claim was FALSE: DuckDB groups same way. |
+| RoundRobin→Hash dropper | (claimed cross-cutting) | — | — | One physical rule | **SKIP** — verified pattern doesn't exist (always has Filter between RoundRobin and Hash; the audit was a misread). |
+
+**Why defer rather than implement:**
+1. Σ.X audit was unreliable in 3 places (Q18 retracted, RoundRobin pattern misread, sigma_q_explain_plan misconfigured). The remaining items' real impacts are now sized vs the 5-trial bench noise floor.
+2. For real SF=10 losses (Q05/Q07): the fix-class is multi-day infrastructure (magic-set rewriting) carrying historical regression risk patterns ([[Σ.Q.L13 LANDED — parallel-bitmap dispatch flipped to opt-in]], [[REJECTED: Σ.R.2 RobinHoodAvgF64Exec]]).
+3. For Q17: the gap is 1.5σ — borderline statistical signal — and the realistic fix saves ~5-8 ms (1/3 of the gap).
+4. For speculative wins-on-top: we already beat DuckDB by 5-10× on those queries; closing further is academic.
+
+**What's been done at this checkpoint:**
+- Σ.U Phase 1 LeftSemi-through-agg (Q17/Q02 correctness).
+- Σ.V preset alignment (production paths now match bench).
+- Σ.X correctness gate: 22/22 PASS at SF=1+SF=10.
+- Σ.X plan-diff audit + 3 dumper bug fixes ([Q18 retracted](docs/POST_BENCH_PERF_BACKLOG.md), preset.rs wiring).
+
+**Next steps:**
+- ~~Σ.AB: same plan-diff exercise vs Polars (where Polars beats us at SF=10: Q06, Q15).~~ — DONE 2026-05-25. See below.
+- Σ.AC: 20-trial SF=1+SF=10 rebench to ground-truth the current state with low noise.
+
+## Σ.AB — Polars plan-diff (2026-05-25)
+
+Methodology: dumped Polars optimized LogicalPlan via `polars_plan_dump.rs` for the two SF=10 queries where Polars beats us (Q06, Q15), structurally compared with our ematix plans.
+
+**Q06** (Polars 64.77 ms vs ematix 78.82 ms = +21.6%): Polars optimized plan is `Parquet SCAN → SELECTION (filter pushed) → AGGREGATE`. **Plan structure identical to ours.** No plan-level fix exists; the gap is at the parquet decode layer (memory: [[project_q06_sf10_polars_gap_wall]] — l_extendedprice Snappy at 1.73 GB/s is the floor; hand-rolled fast path regressed 17% on real Q06).
+
+**Q15** (Polars 66.72 ms vs ematix 77.91 ms = +16.8%): Polars optimized plan shows `CACHE[id: 1769dc16-...]` wrapping the revenue agg subtree, referenced by both the inner-join consumer AND the `max()` subquery. **This is functionally identical to our Σ.P `SharedSubtreeExec`** — both engines CSE the duplicated subtree. The 11 ms gap is at the agg kernel + lineitem decode layer, not the plan layer.
+
+**Verdict:** zero plan-level actionable items from the Polars comparison. Both queries' gaps are codec/kernel issues, already documented in memory.
+
+If Σ.AC confirms we've drifted from milestone, revisit the deferred items above with profile-led investigation rather than plan-led audit.
