@@ -57,18 +57,28 @@ pub struct PlanCache {
     capacity: usize,
 }
 
+/// Σ.AG (2026-05-26): cache the optimized LogicalPlan. PhysicalPlan
+/// operators (RepartitionExec, AggregateExec) carry per-execute
+/// internal state — caching `Arc<dyn ExecutionPlan>` and calling
+/// `execute()` twice panics on the second call. LogicalPlan is
+/// immutable.
+///
+/// Σ.AG.2 (2026-05-26): also stash a PhysicalPlan template alongside
+/// the LogicalPlan. On hit, instead of re-physicalizing (which is the
+/// dominant plan cost ~0.6 ms), bottom-up rebuild the cached
+/// PhysicalPlan tree via `with_new_children` — DataFusion's operator
+/// `with_new_children` constructors create fresh internal state.
+/// Skips the physical planner entirely.
+struct CacheEntry {
+    logical: Arc<LogicalPlan>,
+    /// PhysicalPlan template for fast-rebuild via with_new_children.
+    /// None means we have to re-physicalize on next hit (e.g., the
+    /// cached template was just consumed and is dirty).
+    physical_template: Arc<dyn ExecutionPlan>,
+}
+
 struct PlanCacheInner {
-    /// Σ.AG (2026-05-26): cache the optimized LogicalPlan, not the
-    /// physical plan. PhysicalPlan operators (RepartitionExec,
-    /// AggregateExec, HashJoinExec) carry per-execute internal state
-    /// — caching `Arc<dyn ExecutionPlan>` and calling `execute()`
-    /// twice panics on the second call. LogicalPlan is immutable; we
-    /// re-physicalize it on each cache hit via
-    /// `ctx.state().create_physical_plan(&logical)`. That skips the
-    /// expensive SQL parse + analyzer + logical optimizer (which
-    /// includes our custom Inject* rules) and only re-runs the much
-    /// cheaper physical planner.
-    entries: HashMap<CacheKey, Arc<LogicalPlan>>,
+    entries: HashMap<CacheKey, CacheEntry>,
     /// Insertion order — first is oldest. Simple ring; for v1 size is
     /// small (default 1024) so linear scan on eviction is fine.
     order: Vec<CacheKey>,
@@ -130,18 +140,33 @@ impl PlanCache {
         sql: &str,
     ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
         let key = self.key_for(sql);
-        // Fast path: hit on the LogicalPlan; re-physicalize.
-        if let Some(logical) = self.try_get(&key) {
-            return ctx.state().create_physical_plan(&logical).await;
+        // Σ.AG.2 (2026-05-26): fast path — rebuild the cached
+        // PhysicalPlan template by bottom-up `with_new_children`.
+        // Each operator's constructor creates a fresh node with no
+        // execute-state baggage. ~10× cheaper than re-physicalizing
+        // (no logical→physical translation, no physical-optimizer
+        // rules).
+        if let Some(entry) = self.try_get(&key) {
+            return rebuild_plan_tree(&entry.physical_template);
         }
-        // Slow path: full SQL → DataFrame → logical → cache logical →
-        // create physical plan. Cache the OPTIMIZED LogicalPlan
-        // (`df.logical_plan()` returns the plan after analyzer +
-        // optimizer have run).
+        // Slow path: full SQL → DataFrame → logical → physical.
+        // Cache the OPTIMIZED LogicalPlan (`df.logical_plan()` returns
+        // the plan after analyzer + optimizer have run) and the
+        // resulting PhysicalPlan template.
         let df = ctx.sql(sql).await?;
         let logical = Arc::new(df.logical_plan().clone());
-        self.insert(key, logical.clone());
-        ctx.state().create_physical_plan(&logical).await
+        let physical = ctx.state().create_physical_plan(&logical).await?;
+        self.insert(
+            key,
+            CacheEntry {
+                logical,
+                physical_template: physical.clone(),
+            },
+        );
+        // Return a freshly-rebuilt tree so the FIRST execute gets a
+        // clean tree too (the inserted template is never executed —
+        // it's only ever the source for with_new_children rebuilds).
+        rebuild_plan_tree(&physical)
     }
 
     fn key_for(&self, sql: &str) -> CacheKey {
@@ -152,9 +177,12 @@ impl PlanCache {
         }
     }
 
-    fn try_get(&self, key: &CacheKey) -> Option<Arc<LogicalPlan>> {
+    fn try_get(&self, key: &CacheKey) -> Option<CacheEntry> {
         let mut inner = self.inner.lock().unwrap();
-        let cloned = inner.entries.get(key).cloned();
+        let cloned = inner.entries.get(key).map(|e| CacheEntry {
+            logical: e.logical.clone(),
+            physical_template: e.physical_template.clone(),
+        });
         if cloned.is_some() {
             inner.hits += 1;
         } else {
@@ -163,11 +191,11 @@ impl PlanCache {
         cloned
     }
 
-    fn insert(&self, key: CacheKey, plan: Arc<LogicalPlan>) {
+    fn insert(&self, key: CacheKey, entry: CacheEntry) {
         let mut inner = self.inner.lock().unwrap();
         if let std::collections::hash_map::Entry::Occupied(mut e) = inner.entries.entry(key.clone())
         {
-            e.insert(plan);
+            e.insert(entry);
             return;
         }
         if inner.entries.len() >= self.capacity {
@@ -178,7 +206,7 @@ impl PlanCache {
             }
         }
         inner.order.push(key.clone());
-        inner.entries.insert(key, plan);
+        inner.entries.insert(key, entry);
     }
 
     /// Caller invokes after register_table / deregister_table to
@@ -215,6 +243,31 @@ impl Default for PlanCache {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Σ.AG.2 (2026-05-26): bottom-up rebuild of a cached PhysicalPlan
+/// tree. Walks `template` recursively and calls `with_new_children`
+/// at each node — DataFusion's standard contract is that
+/// `with_new_children` returns a NEW operator instance with no
+/// execute-state carried from the old one. RepartitionExec,
+/// AggregateExec, HashJoinExec, FilterExec, ProjectionExec etc. all
+/// honor this. Source-leaf operators like our EmatixFastParquetExec
+/// have stateless `execute()` and can safely return `self` from
+/// `with_new_children` (their state lives in spawned tasks, not the
+/// node).
+///
+/// On a re-execute, this rebuild costs O(plan-nodes) — ~5-15
+/// constructor calls per query, vs the ~0.6 ms of full re-physicalize
+/// (which runs the physical planner + physical optimizer rules).
+fn rebuild_plan_tree(
+    template: &Arc<dyn ExecutionPlan>,
+) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
+    let new_children: Vec<Arc<dyn ExecutionPlan>> = template
+        .children()
+        .iter()
+        .map(|c| rebuild_plan_tree(*c))
+        .collect::<Result<Vec<_>, _>>()?;
+    template.clone().with_new_children(new_children)
 }
 
 /// SQL canonicalisation for cache key matching. v1: whitespace +
