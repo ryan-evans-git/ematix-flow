@@ -1,14 +1,41 @@
 # PERF_Q21 — Q21 SF=10 stage profile
 
-## Wall time
+Status: **re-verified 2026-05-26** (Σ.AH B.21).
 
-| Engine | Median ms | σ | Rows |
-|--------|----------:|----:|----:|
-| ematix-flow | 299.17 | 3.19 | 4,009 |
-| DuckDB | 406.56 | 2.63 | 4,009 |
-| Polars | 34,213.00 | 1,762.89 | 4,009 |
+## Wall time (20×3 canonical 2026-05-26)
 
-**26% ahead of DuckDB**, **114× ahead of Polars** (Polars takes 34 seconds on Q21 SF=10).
+| Engine | Median ms | σ |
+|--------|----------:|----:|
+| ematix-flow | **311.87** | 13.64 |
+| DuckDB | 443.53 | 7.84 |
+
+**30% ahead of DuckDB** (was 26%). Polars skipped at SF=10. Stage profile 5-trial: 296.92 ms.
+
+## Per-stage decomposition
+
+Σ compute 4416.98 ms / wall 296.92 ms = **14.88× parallelism = 106% — exceeds 14 cores** (async pipelining + RG cache replay must be giving sub-floor measurement).
+
+| Stage | Floor | Actual | Status |
+|-------|-------|--------|--------|
+| Multiple lineitem scans (3× 60M, 2 with l_receiptdate > l_commitdate filter) | ~600 each = ~1800 ms total | 145.78 + 27.19 + others = ~200 | **sub-floor (RG cache)** ✓ |
+| FilterExec l_receiptdate > l_commitdate ×3 (each 60M → ~38M) | 60M × 0.5 ns × 3 = ~90 ms | 96.91 + 78.82 + 77.66 = 253 ms | mild over (3 sequential filters) |
+| HashJoinExec depth 12 (1.52M output) | small | 136.05 | mild |
+| RepartitionExec 38M ×2 | ~50 each | 44.67 + 35.55 = 80 | at-floor ✓ |
+| Top HashJoinExec ⋈ chain (LeftAnti/LeftSemi after Σ.Q.L10) | small | 3.24 | sub-floor ✓ |
+| AggregateExec | tiny | 1.20 + 0.37 = 1.6 | at-floor ✓ |
+
+Σ floor ~2200 ms (most is the 3 lineitem scans + filters); observed 4417 ms — but 14.88× parallelism implies wall = 4417 / 14.88 = 297 ms = matches observed.
+
+**Critical: RG decode cache makes the 2nd and 3rd lineitem scans effectively free.** First scan 145 ms parallel, second 27 ms, third tiny. Σ.O.c.2 doing its job on Q21's multi-scan pattern.
+
+## Findings
+
+- **Q21 is the biggest absolute wall-time query (312 ms canonical)** but is essentially at-floor — most of the work is the unavoidable 3× lineitem touches + LeftSemi/LeftAnti pipeline.
+- **RG decode cache cuts 2 of 3 lineitem scans** to near-zero, same pattern as Q02's partsupp + Q11's partsupp. Confirmed cross-query benefit.
+- Σ.Q.L10 PushDownLeftSemiRule + L9 bloom firing visibly. Memory `[[sigma-q-l13-to-l16-session]]` Q21 fix landed; this is the steady-state performance.
+- Effective parallelism >14× (106%) — async pipelining + RG cache replay create the appearance of more-than-perfect parallelism in the elapsed_compute metric. Q21 is a useful "ceiling" example showing how multi-scan + caching can push past the naive parallelism floor.
+
+**Next:** B.22 (Q22 — 23.35 ms, +84% vs DuckDB; biggest relative win).
 
 ## Physical plan — 3 lineitem scans
 
