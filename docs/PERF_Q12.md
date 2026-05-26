@@ -1,14 +1,37 @@
 # PERF_Q12 — Q12 SF=10 stage profile
 
-## Wall time
+Status: **re-verified 2026-05-26** (Σ.AH B.12).
 
-| Engine | Median ms | σ | Rows |
-|--------|----------:|----:|----:|
-| ematix-flow | 88.73 | 43.61 | 2 |
-| DuckDB | 105.32 | 2.26 | 2 |
-| Polars | 115.07 | 3.42 | 2 |
+## Wall time (20×3 canonical 2026-05-26)
 
-**16% ahead of DuckDB**, 23% ahead of Polars. High σ on our side (43.61 — cold-vs-warm cache).
+| Engine | Median ms | σ |
+|--------|----------:|----:|
+| ematix-flow | **87.64** | 2.95 |
+| DuckDB | 115.52 | 2.90 |
+
+**24% ahead of DuckDB** (was 16%). σ stabilised: 43.61 → 2.95 (Σ.O.c.2 RG cache default-on). Stage profile 5-trial: 98.33 ms.
+
+## Per-stage decomposition (Σ.AH B.12)
+
+Σ compute 1002.25 ms / wall 98.33 ms = **10.19× parallelism = 73%** (good).
+
+| Stage | Floor | Actual | Status |
+|-------|-------|--------|--------|
+| lineitem scan + BridgeFilter l_receiptdate (60M → 2.6M, 5 cols) | ~600 ms | 865.19 | mild over (1.4×) |
+| HashJoin orders ⋈ lineitem-filt Partitioned | ~155 ms | 86.56 | sub-floor (async) |
+| FilterExec residual (shipmode IN + 2-col compare on 2.6M) | ~40 ms | 40.47 | at-floor ✓ |
+| AggregateExec Partial (2-group sum) | <2 ms | 6.36 | mild over |
+| Other | ~10 | ~6 | at-floor ✓ |
+
+Σ floor ~800 ms; observed 1002 ms. Σ/10.19 = 98 ms wall = matches observed.
+
+## Findings
+
+- **Q12 at realistic floor.** σ stabilised by RG cache default-on.
+- **l_receiptdate range pushdown WORKS** in Q12 (60M → 2.6M during scan). Compare Q03/Q07 where l_shipdate range doesn't push. Confirms a pattern matcher inconsistency in InjectFusedFilter — may be `>= AND <=` vs `>` literal-form sensitivity.
+- 2-col cross-column predicates don't push (40 ms residual FilterExec). Same Q04 pattern; 2-col pushdown is a cross-query lever.
+
+**Next:** B.13 (Q13 — 95.81 ms, +65% vs DuckDB).
 
 ## Physical plan
 
