@@ -270,9 +270,42 @@ For completeness, the Phase B sweep ruled out (or confirmed mitigated):
 
 ---
 
+## Recommended sequencing (Phase D — added 2026-05-26)
+
+Three arc shells drafted:
+- [`docs/plans/sigma-ah-arc-1.md`](plans/sigma-ah-arc-1.md) — L9 scan-level integration
+- [`docs/plans/sigma-ah-arc-2.md`](plans/sigma-ah-arc-2.md) — L9 Partitioned-mode extension
+- [`docs/plans/sigma-ah-arc-3.md`](plans/sigma-ah-arc-3.md) — Build-vs-probe side-swap
+
+**Recommended next CURRENT.md: Σ.AH.2 (L9 Partitioned-mode extension).**
+
+Three reasons:
+
+1. **Biggest aggregate impact for the lowest mechanism risk.** ~150-200 ms across 4 queries (Q05/Q07/Q08/Q09) versus Σ.AH.1's ~120 ms across 2. The mechanism mirrors the existing CollectLeft L9 path; the new code is the partition-aware bloom merge, which is well-bounded.
+2. **Unblocks the cascade.** Σ.AH.1's biggest payoff requires Σ.AH.2 to be live — the cascade benefits (Q05/Q07/Q08/Q09 getting bloom-at-scan-time on Partitioned joins) only materialise when both arcs ship. Σ.AH.2 first lets us measure Σ.AH.1's solo value (Q17/Q18) more cleanly.
+3. **Lower codegen-tax risk than Σ.AH.3.** Σ.AH.2 extends an existing rule's predicate; Σ.AH.3 introduces a fresh pre-plan walker. Per `[[optimizer-codegen-sensitivity]]` the rule-install cost is real and should be paid one arc at a time.
+
+**Pre-work before Σ.AH.2 starts:** ship Σ.AH.4 (customer.parquet re-emit) as a chore. It's a data-prep change with no codegen, takes <30 minutes, and clears 3-5 ms of noise across Q02/Q03/Q05/Q07/Q08 — making the Σ.AH.2 bench gate measurable.
+
+**Sequencing after Σ.AH.2 lands:**
+- **If Σ.AH.2 ships clean** (geomean −3 pp, Q08+Q09 hit gates): promote Σ.AH.1 to CURRENT. Σ.AH.1's expected impact grows because the cascade is now reachable.
+- **If Σ.AH.2 fails the gate**: don't pivot to Σ.AH.1 immediately — Σ.AH.1 inherits Σ.AH.2's partition-merge mechanism for its cascade benefit, so a Σ.AH.2 failure modes are informative about Σ.AH.1's viability too. Instead, pivot to Σ.AH.3 (side-swap; independent of bloom work) or Σ.AH.5 (functional-dep group-by; orthogonal).
+
+**Σ.AH.3 sequencing:** comes after Σ.AH.2 → Σ.AH.1 succeed. It opportunistically picks up another 60 ms on top, with tight per-query no-regression bar so existing wins don't decay.
+
+**Σ.AH.5/AH.6:** parallel-tracks; can be picked up by an independent contributor while AH.1/2/3 progress. AH.5 is single-query (Q10) so its bench gate is narrow. AH.6 is a tuning pass within an existing module (Σ.AE.2) so the codegen-tax risk is minimal.
+
+**Comparison with archived Σ.T V5 Tier 1 (L13 custom hash join):** the archived plan's L13 work would have built a custom hash-join kernel to beat DataFusion's HashJoinExec. The Phase B sweep shows DataFusion's HashJoinExec is at-or-below kernel floor on every per-stage measurement (Q03 / Q07 / Q08 / Q09 / Q18 all show probe-rates at 10-12 ns/row — at the published L2 floor). **L13's premise — that the kernel is slow — doesn't survive Phase B's evidence.** Σ.T's narrow piece (build-side swap) lives on as Σ.AH.3; the broader L13 custom kernel is now in the rejection-re-look pile.
+
+This `CURRENT.md` archives when Σ.AH.2's CURRENT.md takes over.
+
+---
+
 ## Related plans
 
 - Plan doc: [`docs/plans/CURRENT.md`](plans/CURRENT.md) — Σ.AH structure
+- Arc shells: [Σ.AH.1](plans/sigma-ah-arc-1.md), [Σ.AH.2](plans/sigma-ah-arc-2.md), [Σ.AH.3](plans/sigma-ah-arc-3.md)
 - Methodology: [`docs/STAGE_PROFILING_METHODOLOGY.md`](STAGE_PROFILING_METHODOLOGY.md) (incl. 2026-05-26 audit appendix)
 - Per-query writeups: `docs/PERF_Q01.md` through `docs/PERF_Q22.md`
 - Bench baseline: [`BENCHMARKS.md`](../BENCHMARKS.md)
+- Archived (superseded by this review): [`docs/plans/archive/2026-05-25-sigma-t-v5-tier-1.md`](plans/archive/2026-05-25-sigma-t-v5-tier-1.md)
