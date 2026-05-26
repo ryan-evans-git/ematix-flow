@@ -130,12 +130,13 @@ A `RepartitionExec: RoundRobinBatch(14)` followed by `RepartitionExec: Hash([col
 - **Fix class:** logical/physical — extend Σ.P (`SharedSubtreeExec`) coverage to recognise the post-rewrite duplicated `part`-filter subtree across the outer join + RightSemi probe-build. Plus separately a bloom-side dynamic-filter pushdown to lineitem (a Σ.J.2.b.vi extension to scalar-subquery correlations).
 - **Plan correctness:** OK.
 
-#### Q18 — LeftSemi attached AFTER the big join, not before (the 1.12× SF=10 gap)
+<!-- Q18 entry retracted 2026-05-25: the original audit ran plan dumps via
+     `sigma_q_explain_plan.rs` which did NOT register `PushDownLeftSemiRule`.
+     With the rule active (it IS in preset.rs and default-on in the bench),
+     Q18's LeftSemi sits directly above `TableScan: orders`, exactly matching
+     DuckDB. The +12% SF=10 wall-time is non-plan (kernel/decode/hash).
+     The explain dumper has been updated to match the bench's optimizer set. -->
 
-- **DuckDB:** applies `HASH_JOIN(SEMI, o_orderkey=#0)` on the **orders** side BEFORE joining lineitem — orders is filtered from 15M → 3M rows, then customer⋈orders⋈lineitem runs on 3M-driven probes.
-- **Ematix:** `RightSemi` sits at the TOP, AFTER the full lineitem⋈(customer⋈orders) Inner join. The Inner Join runs against the full 60M lineitem stream; RightSemi prunes downstream. Σ.U successfully extracted the LeftSemi into the LogicalPlan but the physical planner did not push it through the chain of Inner joins to filter `orders` first.
-- **Fix class:** physical rule — semi-join reorder ahead of a chain of Inner joins when the semi-key is a join-key (commute `Semi(o_orderkey)` past `Inner(customer.c_custkey=orders.o_custkey)` and `Inner(orders.o_orderkey=lineitem.l_orderkey)`).
-- **Plan correctness:** OK.
 
 ### WE-BETTER (informational)
 
@@ -165,7 +166,6 @@ Ranked perf items by expected gain × effort:
 
 1. **Cheap one-rule fixes**
    - RoundRobin→Hash dropper (cross-cutting, 7 queries affected).
-   - Q18 semi-join reorder past Inner-join chain.
 2. **Medium**
    - Σ.P CSE extension (Q11, Q17 part subtree, Q21).
 3. **Bigger**

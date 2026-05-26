@@ -18,6 +18,7 @@ use ematix_flow_core::ematix_fast_parquet::EmatixFastParquetTableProvider;
 use ematix_flow_core::fast_parquet::FastParquetTableProvider;
 use ematix_flow_core::fused_aggregate_filter_multi_agg_rule::InjectFilterMultiAggRule;
 use ematix_flow_core::fused_aggregate_filter_sum_rule::InjectFilterSumRule;
+use ematix_flow_core::push_down_left_semi_rule::PushDownLeftSemiRule;
 use ematix_flow_core::robin_hood_sum_f64_exec::EnableRobinHoodSumF64Rule;
 use ematix_flow_core::swap_semi_join_build_rule::SwapSemiJoinBuildSideRule;
 
@@ -37,6 +38,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let state = SessionStateBuilder::new()
         .with_config(SessionConfig::new().with_target_partitions(14))
         .with_default_features()
+        .with_optimizer_rule(Arc::new(PushDownLeftSemiRule))
         .with_physical_optimizer_rule(Arc::new(DedupeAggregateForFloatDeterminism::default()))
         .with_physical_optimizer_rule(Arc::new(EnableDictGroupCountRule))
         .with_physical_optimizer_rule(Arc::new(InjectFilterMultiAggRule))
