@@ -2,8 +2,8 @@
 
 **Active plan:** [`docs/plans/CURRENT.md`](../plans/CURRENT.md) — Σ.AH: clean-slate Q01-Q22 SF=10 execution-plan inefficiency review (per-stage waste survey on post-Σ.AG.7 numbers)
 **Started:** 2026-05-26
-**Active phase:** Phase B — 22-query sweep (Phase A complete; A.2 skipped)
-**Active story:** B.1 (Q01 verify) or B.2 (Q21 fresh) — parallel-eligible
+**Active phase:** Phase C — cross-query synthesis (B complete 2026-05-26)
+**Phase B summary:** All 22 PERF_Q*.md files updated. Methodology corrections discovered mid-sweep: projection-cost-aware FilterExec floor (B.4), per-column Snappy floor (B.1 redo). Major correction: Q05 dominant operator was misidentified in 2026-05-25 — corrected B.5.
 
 **Phase A summary (commit `0821002`):** Audit appendix appended to `STAGE_PROFILING_METHODOLOGY.md`. 6 VERIFIED, 1 STALE (hash agg 10K-1M groups moved from 5-15 ns/row → 3-7 ns/row post-Σ.N.f), 5 UNVERIFIED (accept as published). A.2 skipped (threshold ≥3 STALE not reached).
 
