@@ -333,7 +333,15 @@ async fn run_ematix_flow(data_dir: &Path, sql: &str) -> Trial {
         .ok()
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
-    let df = if reorder_on || agg_semi_on {
+    // Σ.AD (2026-05-25): pushes simple dim-join (no extra filter slot,
+    // single equi-key) down adjacent to the FK table's scan inside an
+    // Inner-join chain. Targets Q07's `Inner(s_nationkey = n1.n_nationkey)`
+    // sitting above supplier⋈lineitem. Opt-in via `EMAT_DIM_PUSH=1`.
+    let dim_push_on = std::env::var("EMAT_DIM_PUSH")
+        .ok()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let df = if reorder_on || agg_semi_on || dim_push_on {
         match df.into_optimized_plan() {
             Ok(plan) => {
                 let plan = if agg_semi_on {
@@ -342,6 +350,19 @@ async fn run_ematix_flow(data_dir: &Path, sql: &str) -> Trial {
                         Err(e) => {
                             return Trial::Fail(format!(
                                 "agg_semi: {}",
+                                short(&e.to_string())
+                            ));
+                        }
+                    }
+                } else {
+                    plan
+                };
+                let plan = if dim_push_on {
+                    match ematix_flow_core::dim_join_pushdown::push_dim_join_into_chain(plan) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            return Trial::Fail(format!(
+                                "dim_push: {}",
                                 short(&e.to_string())
                             ));
                         }
@@ -688,13 +709,24 @@ fn write_benchmarks_md(
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| data_dir.display().to_string());
 
+    // Derive the SF label from the data directory name (sf1, sf10, sf100,
+    // ...) so the report title doesn't lie when running against larger
+    // factors. Falls back to the bare data_rel when the directory doesn't
+    // match the `sf<N>` convention.
+    let sf_label = data_rel
+        .rsplit('/')
+        .next()
+        .and_then(|name| name.strip_prefix("sf"))
+        .map(|n| format!("SF={n}"))
+        .unwrap_or_else(|| data_rel.clone());
+
     let mut s = String::new();
-    writeln!(s, "# TPC-H SF=1 triangulation").unwrap();
+    writeln!(s, "# TPC-H {sf_label} triangulation").unwrap();
     writeln!(s).unwrap();
     writeln!(
         s,
         "Same-process bench: ematix-flow vs DuckDB vs Polars over all 22 TPC-H queries on \
-         SF=1 parquet data, {trials} timed trials after {warmups} warmups, single-machine."
+         {sf_label} parquet data, {trials} timed trials after {warmups} warmups, single-machine."
     )
     .unwrap();
     writeln!(s).unwrap();

@@ -154,6 +154,14 @@ pub mod join_reorder;
 // part, but the agg still runs on all 60M rows producing 10.8M
 // groups when only ~200 partkeys actually matter.
 pub mod agg_filter_pushdown;
+// Σ.AD (2026-05-25): pre-plan walker that pushes small filtered-dim
+// Inner joins (nation/region with name filters) down adjacent to their
+// FK table's scan inside an Inner-join chain. Targets Q07 where
+// `Inner Join(supplier.s_nationkey = n1.n_nationkey)` currently sits at
+// the top of the tree above `supplier ⋈ lineitem`. The pre-Σ.AD plan
+// broadcasts full 100K supplier; the post-Σ.AD plan filters supplier
+// to ~8K via the nation join BEFORE the fact-fact broadcast.
+pub mod dim_join_pushdown;
 // Σ.L.2 (2026-05-21): adaptive runtime workload feedback. Persists
 // per-shape probe outcomes + per-query observability (selectivity,
 // hash collision rate) to a SQLite file (~/.ematix/workload.db by

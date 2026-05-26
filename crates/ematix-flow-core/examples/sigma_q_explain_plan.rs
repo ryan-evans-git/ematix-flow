@@ -70,13 +70,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("\n=== Q{q:02} optimized LogicalPlan ===");
         println!("{}", optimized.display_indent());
     }
-    let df = if std::env::var("EMAT_REORDER").is_ok() || std::env::var("EMAT_AGG_SEMI").is_ok() {
+    if std::env::var("EMAT_REORDER").is_ok()
+        || std::env::var("EMAT_AGG_SEMI").is_ok()
+        || std::env::var("EMAT_DIM_PUSH").is_ok()
+    {} // expand the conditional below
+    let df = if std::env::var("EMAT_REORDER").is_ok()
+        || std::env::var("EMAT_AGG_SEMI").is_ok()
+        || std::env::var("EMAT_DIM_PUSH").is_ok()
+    {
         let optimized = df.into_optimized_plan()?;
         println!("=== Q{q:02} optimized LogicalPlan (pre-rewrite) ===");
         println!("{}", optimized.display_indent());
         let mut rewritten = optimized;
         if std::env::var("EMAT_AGG_SEMI").is_ok() {
             rewritten = ematix_flow_core::agg_filter_pushdown::push_filter_into_agg(rewritten)?;
+        }
+        if std::env::var("EMAT_DIM_PUSH").is_ok() {
+            rewritten = ematix_flow_core::dim_join_pushdown::push_dim_join_into_chain(rewritten)?;
         }
         if std::env::var("EMAT_REORDER").is_ok() {
             rewritten = ematix_flow_core::join_reorder::reorder_inner_joins(rewritten)?;
