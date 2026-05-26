@@ -12,15 +12,9 @@ use std::sync::Arc;
 use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::physical_plan::displayable;
 use datafusion::prelude::{SessionConfig, SessionContext};
-use ematix_flow_core::dedupe_aggregate_rule::DedupeAggregateForFloatDeterminism;
-use ematix_flow_core::dict_aggregate_rule::EnableDictGroupCountRule;
 use ematix_flow_core::ematix_fast_parquet::EmatixFastParquetTableProvider;
 use ematix_flow_core::fast_parquet::FastParquetTableProvider;
-use ematix_flow_core::fused_aggregate_filter_multi_agg_rule::InjectFilterMultiAggRule;
-use ematix_flow_core::fused_aggregate_filter_sum_rule::InjectFilterSumRule;
-use ematix_flow_core::push_down_left_semi_rule::PushDownLeftSemiRule;
-use ematix_flow_core::robin_hood_sum_f64_exec::EnableRobinHoodSumF64Rule;
-use ematix_flow_core::swap_semi_join_build_rule::SwapSemiJoinBuildSideRule;
+use ematix_flow_core::preset;
 
 const TPCH_TABLES: &[&str] = &[
     "region", "nation", "supplier", "customer", "part", "partsupp", "orders", "lineitem",
@@ -35,22 +29,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dir =
         std::env::var("TPCH_DATA_DIR").unwrap_or_else(|_| "examples/tpch/data/sf10".to_string());
 
-    let state = SessionStateBuilder::new()
-        .with_config(SessionConfig::new().with_target_partitions(14))
-        .with_default_features()
-        .with_optimizer_rule(Arc::new(PushDownLeftSemiRule))
-        .with_physical_optimizer_rule(Arc::new(DedupeAggregateForFloatDeterminism::default()))
-        .with_physical_optimizer_rule(Arc::new(EnableDictGroupCountRule))
-        .with_physical_optimizer_rule(Arc::new(InjectFilterMultiAggRule))
-        .with_physical_optimizer_rule(Arc::new(InjectFilterSumRule))
-        .with_physical_optimizer_rule(Arc::new(SwapSemiJoinBuildSideRule))
-        .with_physical_optimizer_rule(Arc::new(EnableRobinHoodSumF64Rule))
-        .build();
+    // Match the bench's milestone rule set 1:1 via preset.rs so plan
+    // dumps reflect what the bench actually runs. Σ.X audit caught
+    // two divergences here (missing PushDownLeftSemi rule + missing
+    // all-tables-Emat registration) — preset.rs is the single source
+    // of truth.
+    let state = preset::with_optimizer_rules(
+        SessionStateBuilder::new()
+            .with_config(SessionConfig::new().with_target_partitions(14))
+            .with_default_features(),
+    )
+    .build();
     let ctx = SessionContext::new_with_state(state);
 
+    // Match the bench's `EMAT_ALL_TABLES_EMAT=1` default: every table
+    // registered as `EmatixFastParquetTableProvider` so the L9 bloom
+    // sideband rule can target any scan. Set `EMAT_ALL_TABLES_EMAT=0`
+    // to revert to lineitem-only Emat for A/B diagnosis.
+    let all_emat = std::env::var("EMAT_ALL_TABLES_EMAT")
+        .ok()
+        .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+        .unwrap_or(true);
     for t in TPCH_TABLES {
         let path = PathBuf::from(&dir).join(format!("{t}.parquet"));
-        if *t == "lineitem" {
+        if all_emat || *t == "lineitem" {
             let prov = EmatixFastParquetTableProvider::try_new(path.to_string_lossy())?;
             ctx.register_table(*t, Arc::new(prov))?;
         } else {
