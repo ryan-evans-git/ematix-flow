@@ -27,6 +27,7 @@ use std::time::Instant;
 
 use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::physical_plan::ExecutionPlanProperties;
+use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::prelude::{SessionConfig, SessionContext};
 use ematix_flow_core::bloom::ContextBlooms;
 use ematix_flow_core::dedupe_aggregate_rule::DedupeAggregateForFloatDeterminism;
@@ -334,20 +335,28 @@ async fn run_ematix_flow(data_dir: &Path, sql: &str) -> Trial {
             Ok(p) => p,
             Err(e) => return Trial::Fail(format!("plan cache: {}", short(&e.to_string()))),
         };
-        let mut total_rows = 0usize;
-        for p in 0..plan.output_partitioning().partition_count() {
-            let mut s = match plan.execute(p, ctx.task_ctx()) {
-                Ok(s) => s,
-                Err(e) => return Trial::Fail(format!("execute: {}", short(&e.to_string()))),
+        // Match `df.execute_stream()` parallelism: wrap multi-partition
+        // plans in CoalescePartitionsExec so partition drains happen
+        // concurrently inside DataFusion's coordinator, not sequentially
+        // in a `for p in 0..N` loop on the bench side (which serialised
+        // Q21 SF=10 and gave +30% wall — Q21's 14-partition CollectLeft
+        // pipelines need to overlap to keep cores warm).
+        let plan: Arc<dyn datafusion::physical_plan::ExecutionPlan> =
+            if plan.output_partitioning().partition_count() > 1 {
+                Arc::new(CoalescePartitionsExec::new(plan))
+            } else {
+                plan
             };
-            loop {
-                match s.try_next().await {
-                    Ok(Some(b)) => total_rows += b.num_rows(),
-                    Ok(None) => break,
-                    Err(e) => {
-                        return Trial::Fail(format!("collect: {}", short(&e.to_string())));
-                    }
-                }
+        let mut s = match plan.execute(0, ctx.task_ctx()) {
+            Ok(s) => s,
+            Err(e) => return Trial::Fail(format!("execute: {}", short(&e.to_string()))),
+        };
+        let mut total_rows = 0usize;
+        loop {
+            match s.try_next().await {
+                Ok(Some(b)) => total_rows += b.num_rows(),
+                Ok(None) => break,
+                Err(e) => return Trial::Fail(format!("collect: {}", short(&e.to_string()))),
             }
         }
         let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;

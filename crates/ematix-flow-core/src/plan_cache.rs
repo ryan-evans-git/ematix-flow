@@ -154,18 +154,15 @@ impl PlanCache {
         let logical = Arc::new(df.logical_plan().clone());
         let physical = ctx.state().create_physical_plan(&logical).await?;
         // Σ.AG.4 (2026-05-26): only cache plans whose every operator
-        // is re-execute-safe via with_new_children. Plans containing
-        // BuildSideBloomEmitterExec (Σ.Q.L9) carry an Arc<RuntimeBloomSideband>
-        // that's populated by the emitter on first execute; rebuilds
-        // via with_new_children clone the Arc, so trial-2 sees stale
-        // (or cleared) sideband state and the scan filter rejects
-        // every row (Q21 SF=1: 411 rows → 0 rows on rep 2+). For
-        // these plans, skip the cache entirely and re-physicalize
-        // each time. The slow path (~0.8 ms) is still cheaper than
-        // re-running the user's query, just not as fast as the
-        // template rebuild.
+        // is re-execute-safe via with_new_children. For uncacheable
+        // plans, return the freshly-physicalized plan directly —
+        // it's already a clean tree (never executed), so no need to
+        // rebuild it via with_new_children, which would just allocate
+        // another tree's worth of operator nodes for no benefit
+        // (Q21 SF=10 regressed +32% from the wasted rebuild walk on
+        // its 15-node plan before this short-circuit landed).
         if !is_cacheable(&physical) {
-            return rebuild_plan_tree(&physical);
+            return Ok(physical);
         }
         self.insert(
             key,
