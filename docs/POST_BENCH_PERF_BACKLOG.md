@@ -112,15 +112,67 @@ A `RepartitionExec: RoundRobinBatch(14)` followed by `RepartitionExec: Hash([col
 
 ---
 
+## Plan-diff audit vs DuckDB SF=10 (post-Σ.U/V, 2026-05-25)
+
+**Methodology:** per-query structural diff of physical plans, not wall-time. Only NEW we-worse cases appear here — items already listed above are not duplicated. Source plans: `/tmp/ematix_plans_su/q??.plan` (ematix with Σ.U on), `/tmp/duckdb_plans/q??.plan` (DuckDB EXPLAIN).
+
+**Bench numbers that motivated this audit (5-trial 22q SF=10, Σ.U + Σ.V on):**
+- Wins: ematix 15 / DuckDB 5 / Polars 2
+- DuckDB beat us on: Q05 (1.35×), Q06 (1.07×), Q07 (1.18×), Q08 (1.12×), Q15 (1.13×), Q17 (1.15×), Q18 (1.12×)
+- Polars beat us on: Q06, Q15
+
+### WE-WORSE (new) — items to add to backlog
+
+#### Q17 — DELIM_JOIN / dedup-share missing (the 1.15× SF=10 gap)
+
+- **DuckDB:** `LEFT_DELIM_JOIN(p_partkey IS NOT DISTINCT)` with a `DELIM_SCAN` feeding the avg-subquery's `HASH_JOIN(l_partkey=p_partkey)`. The filtered `part` set (2k rows) is materialised **once** and reused on both the outer join and the inner-correlated avg subquery. DuckDB also injects `l_partkey IN BF(p_partkey)` dynamic-filter into the outer lineitem scan.
+- **Ematix:** Σ.U LeftSemi pushdown into the avg-subquery's lineitem reference is correct, but the `part` subtree is REBUILT — two `part.parquet` scans, two `Hash([p_partkey])` repartitions, two `FilterExec(p_brand=Brand#23 AND p_container=MED BOX)`.
+- **Fix class:** logical/physical — extend Σ.P (`SharedSubtreeExec`) coverage to recognise the post-rewrite duplicated `part`-filter subtree across the outer join + RightSemi probe-build. Plus separately a bloom-side dynamic-filter pushdown to lineitem (a Σ.J.2.b.vi extension to scalar-subquery correlations).
+- **Plan correctness:** OK.
+
+#### Q18 — LeftSemi attached AFTER the big join, not before (the 1.12× SF=10 gap)
+
+- **DuckDB:** applies `HASH_JOIN(SEMI, o_orderkey=#0)` on the **orders** side BEFORE joining lineitem — orders is filtered from 15M → 3M rows, then customer⋈orders⋈lineitem runs on 3M-driven probes.
+- **Ematix:** `RightSemi` sits at the TOP, AFTER the full lineitem⋈(customer⋈orders) Inner join. The Inner Join runs against the full 60M lineitem stream; RightSemi prunes downstream. Σ.U successfully extracted the LeftSemi into the LogicalPlan but the physical planner did not push it through the chain of Inner joins to filter `orders` first.
+- **Fix class:** physical rule — semi-join reorder ahead of a chain of Inner joins when the semi-key is a join-key (commute `Semi(o_orderkey)` past `Inner(customer.c_custkey=orders.o_custkey)` and `Inner(orders.o_orderkey=lineitem.l_orderkey)`).
+- **Plan correctness:** OK.
+
+### WE-BETTER (informational)
+
+- Q01, Q06 — `FusedAggregateExec` collapses scan+filter+multi-agg into one kernel; DuckDB runs them as separate operators.
+- Q12, Q14, Q19 — single in-filter `HashJoinExec` with predicate folded into the join, no double-scan of part.
+- Q15 — `SharedSubtreeExec` (Σ.P) shares the per-supplier revenue aggregate between outer join and `max()` subquery.
+- Q20 — `RightSemi(part⋈partsupp)` then `Inner(partsupp⋈lineitem agg)` keeps lineitem-side aggregate isolated.
+
+### SAME (informational)
+
+- Q02, Q03, Q04, Q09, Q10, Q11, Q13, Q14, Q16, Q19, Q20 — structurally equivalent join graphs to DuckDB. Wins/losses driven by codec, decode, or kernel speed, not plan shape.
+- Q06, Q15 — gap is below the plan layer (Snappy decode floor; SharedSubtree replay cost). Already tracked in memory (`project_q06_sf10_polars_gap_wall.md`).
+
+---
+
 ## Tracking after Σ.X bench
 
-Once Σ.X re-baselines 22q at SF=1 and SF=10 with Σ.U + Σ.V active:
+Σ.X re-baselined 22q at SF=1 and SF=10 with Σ.U + Σ.V active (2026-05-25):
 
-1. Compare new geomean to historical 0.738 / 17 wins (the milestone reference).
-2. Re-audit any wall-time regressions to confirm they're not structural (the "where did the lost work go" diagnostic — per the correctness-first framing).
-3. Rank these perf items by expected gain × effort:
-   - Cheap one-rule fixes: RoundRobin→Hash dropper.
-   - Medium: Σ.P CSE extension (Q11, Q21).
-   - Bigger: Q05 composite-key split, Q22 subset-CSE, Q10 FD-aware agg.
-   - Multi-week: Q08 bushy join planner.
-4. Work through them in order; bench after each.
+- SF=1 result: 20 wins / 0 DuckDB / 2 Polars (Q06, Q15)
+- SF=10 result: 15 wins / 5 DuckDB / 2 Polars (geomean ratio ematix/DuckDB ≈ 0.77 at 5 trials; vs historical 0.738 / 17 wins at 20 trials)
+- 22/22 row-level correctness PASS at both SF=1 and SF=10
+
+The slight regression (17→15 wins) is within 5-trial noise but the structural items above are real and worth ranking.
+
+Ranked perf items by expected gain × effort:
+
+1. **Cheap one-rule fixes**
+   - RoundRobin→Hash dropper (cross-cutting, 7 queries affected).
+   - Q18 semi-join reorder past Inner-join chain.
+2. **Medium**
+   - Σ.P CSE extension (Q11, Q17 part subtree, Q21).
+3. **Bigger**
+   - Q05 composite-key split.
+   - Q22 subset-CSE.
+   - Q10 FD-aware aggregate.
+4. **Multi-week**
+   - Q08 bushy join planner.
+
+Work through them in order; bench after each.
