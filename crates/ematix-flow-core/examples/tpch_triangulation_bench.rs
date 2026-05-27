@@ -67,23 +67,37 @@ fn plan_cache() -> &'static ematix_flow_core::plan_cache::PlanCache {
 /// anything. That uniformly regresses non-matching queries by ~3-8%
 /// (plan cache miss every trial), masking the matching queries' wins.
 ///
-/// This cache memoizes "does the agg-semi rewrite actually change
-/// the plan for this SQL?" per-process. First trial pays the
-/// detection cost (one extra TreeNode walk on the optimized plan);
-/// subsequent trials short-circuit. Only used to gate the
-/// `any_rewrite` flag — the cached value is `(any_rewrite_fires,)`.
-static AGG_SEMI_FIRES_CACHE: OnceLock<Mutex<HashMap<String, bool>>> = OnceLock::new();
+/// `FIRES_CACHE` memoizes per-(rule, SQL) "does this rule actually
+/// change the plan?" so subsequent trials short-circuit. First trial
+/// pays one logical-opt + one TreeNode walk per enabled rule; warmup
+/// discards this. Only used to gate the `any_rewrite` flag.
+type FiresKey = (RewriteRule, String);
 
-fn agg_semi_fires_cache() -> &'static Mutex<HashMap<String, bool>> {
-    AGG_SEMI_FIRES_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum RewriteRule {
+    AggSemi,
+    DimPush,
+    Reorder,
+    ReorderShapeGated,
 }
 
-/// Returns true iff `push_filter_into_agg(optimized_plan)` would
-/// produce a structurally different plan. Caches per SQL.
-async fn agg_semi_fires_for_sql(ctx: &SessionContext, sql: &str) -> bool {
+static FIRES_CACHE: OnceLock<Mutex<HashMap<FiresKey, bool>>> = OnceLock::new();
+
+fn fires_cache() -> &'static Mutex<HashMap<FiresKey, bool>> {
+    FIRES_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Returns true iff applying `rule` to the optimized plan of `sql`
+/// produces a structurally different plan. Caches per (rule, SQL).
+async fn rewrite_fires_for_sql(
+    ctx: &SessionContext,
+    sql: &str,
+    rule: RewriteRule,
+) -> bool {
+    let key: FiresKey = (rule, sql.to_string());
     {
-        let guard = agg_semi_fires_cache().lock().unwrap();
-        if let Some(&fires) = guard.get(sql) {
+        let guard = fires_cache().lock().unwrap();
+        if let Some(&fires) = guard.get(&key) {
             return fires;
         }
     }
@@ -96,19 +110,33 @@ async fn agg_semi_fires_for_sql(ctx: &SessionContext, sql: &str) -> bool {
         Err(_) => return false,
     };
     let pre = format!("{}", optimized.display_indent());
-    let rewritten = match ematix_flow_core::agg_filter_pushdown::push_filter_into_agg(
-        optimized.clone(),
-    ) {
+    let rewritten = match rule {
+        RewriteRule::AggSemi => {
+            ematix_flow_core::agg_filter_pushdown::push_filter_into_agg(optimized.clone())
+        }
+        RewriteRule::DimPush => {
+            ematix_flow_core::dim_join_pushdown::push_dim_join_into_chain(optimized.clone())
+        }
+        RewriteRule::Reorder => {
+            ematix_flow_core::join_reorder::reorder_inner_joins(optimized.clone())
+        }
+        RewriteRule::ReorderShapeGated => {
+            ematix_flow_core::join_reorder::reorder_inner_joins_shape_gated(optimized.clone())
+        }
+    };
+    let rewritten = match rewritten {
         Ok(p) => p,
         Err(_) => return false,
     };
     let post = format!("{}", rewritten.display_indent());
     let fires = pre != post;
-    agg_semi_fires_cache()
-        .lock()
-        .unwrap()
-        .insert(sql.to_string(), fires);
+    fires_cache().lock().unwrap().insert(key, fires);
     fires
+}
+
+/// Convenience wrapper preserved for the agg-semi call site.
+async fn agg_semi_fires_for_sql(ctx: &SessionContext, sql: &str) -> bool {
+    rewrite_fires_for_sql(ctx, sql, RewriteRule::AggSemi).await
 }
 
 const TPCH_TABLES: &[&str] = &[
@@ -387,14 +415,38 @@ async fn run_ematix_flow(data_dir: &Path, sql: &str) -> Trial {
         .ok()
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
-    // Σ.AJ.1 Lever C harness fix: only bypass the plan cache for
-    // queries where the agg-semi rewrite actually changes the plan.
-    // Without this, all 22 queries pay the plan-cache-bypass cost when
-    // EMAT_AGG_SEMI=1 even though Σ.U fires on only 2.
+    // Σ.AJ.1 Lever C harness fix (2026-05-27): only bypass the plan
+    // cache for queries where the pre-plan rewrite actually changes
+    // the plan. Without per-SQL detection, all 22 queries pay the
+    // plan-cache-bypass cost when ANY rewrite env var is set, masking
+    // wins under the noise of uniform non-matching regressions.
+    //
+    // Each rule's actual-fires check runs the rule once on a cloned
+    // optimized plan during the first trial for that SQL, then
+    // memoizes the result. See `rewrite_fires_for_sql` above.
+    let reorder_shape_gated_check = std::env::var("EMAT_REORDER_SHAPE_GATED")
+        .ok()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
     let agg_semi_actually_fires =
         agg_semi_on_check && agg_semi_fires_for_sql(&ctx, sql).await;
-    let any_rewrite =
-        reorder_on_check || agg_semi_actually_fires || dim_push_on_check || bloom_pushdown;
+    let dim_push_actually_fires =
+        dim_push_on_check && rewrite_fires_for_sql(&ctx, sql, RewriteRule::DimPush).await;
+    let reorder_actually_fires = reorder_on_check
+        && rewrite_fires_for_sql(
+            &ctx,
+            sql,
+            if reorder_shape_gated_check {
+                RewriteRule::ReorderShapeGated
+            } else {
+                RewriteRule::Reorder
+            },
+        )
+        .await;
+    let any_rewrite = reorder_actually_fires
+        || agg_semi_actually_fires
+        || dim_push_actually_fires
+        || bloom_pushdown;
 
     if plan_cache_on && !any_rewrite {
         let t0 = Instant::now();
