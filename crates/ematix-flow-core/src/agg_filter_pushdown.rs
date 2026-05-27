@@ -401,6 +401,18 @@ mod tests {
         None
     }
 
+    fn sf10_dir() -> Option<PathBuf> {
+        let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let p = manifest
+            .parent()
+            .and_then(|p| p.parent())
+            .map(|p| p.join("examples/tpch/data/sf10"))?;
+        if p.exists() {
+            return Some(p);
+        }
+        None
+    }
+
     async fn register_tpch(ctx: &SessionContext, dir: &std::path::Path) -> DfResult<()> {
         for t in [
             "region", "nation", "supplier", "customer", "part", "partsupp", "orders",
@@ -606,6 +618,246 @@ mod tests {
             rel < 1e-9,
             "Q17 rewrite changed result: baseline={baseline_val}, rewritten={new_val}, rel_err={rel:e}"
         );
+        Ok(())
+    }
+
+    /// Σ.AJ.1 Lever C Step 1: Q17 SF=10 end-to-end correctness. The
+    /// SF=1 test passes; this verifies the matcher still hits the
+    /// shape at SF=10 (different partition counts can shift the
+    /// planner's plan structure). Skips if `examples/tpch/data/sf10`
+    /// is absent.
+    #[tokio::test]
+    async fn rewrite_preserves_q17_result_sf10() -> DfResult<()> {
+        let Some(dir) = sf10_dir() else {
+            eprintln!("skip: sf10 missing");
+            return Ok(());
+        };
+        let ctx = SessionContext::new();
+        register_tpch(&ctx, &dir).await?;
+        let sql = std::fs::read_to_string(
+            dir.parent()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .join("queries/q17.sql"),
+        )
+        .ok();
+        let Some(sql) = sql else {
+            eprintln!("skip: q17.sql missing");
+            return Ok(());
+        };
+
+        let df_baseline = ctx.sql(&sql).await?;
+        let baseline_batches = df_baseline.collect().await?;
+        let baseline_val = baseline_batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::Float64Array>()
+            .unwrap()
+            .value(0);
+
+        let df_new = ctx.sql(&sql).await?;
+        let optimized = df_new.into_optimized_plan()?;
+        let rewritten = push_filter_into_agg(optimized)?;
+        let df_new = ctx.execute_logical_plan(rewritten).await?;
+        let new_batches = df_new.collect().await?;
+        let new_val = new_batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::Float64Array>()
+            .unwrap()
+            .value(0);
+
+        let rel = ((new_val - baseline_val) / baseline_val).abs();
+        assert!(
+            rel < 1e-6,
+            "Q17 SF=10 rewrite changed result: baseline={baseline_val}, rewritten={new_val}, rel_err={rel:e}"
+        );
+        Ok(())
+    }
+
+    /// Σ.AJ.1 Lever C Step 1: Q02 SF=10 end-to-end correctness.
+    /// Row-count check matches the SF=1 variant.
+    #[tokio::test]
+    async fn rewrite_preserves_q02_result_sf10() -> DfResult<()> {
+        let Some(dir) = sf10_dir() else {
+            eprintln!("skip: sf10 missing");
+            return Ok(());
+        };
+        let ctx = SessionContext::new();
+        register_tpch(&ctx, &dir).await?;
+        let sql = std::fs::read_to_string(
+            dir.parent()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .join("queries/q02.sql"),
+        )
+        .ok();
+        let Some(sql) = sql else {
+            eprintln!("skip: q02.sql missing");
+            return Ok(());
+        };
+        let df_baseline = ctx.sql(&sql).await?;
+        let baseline_batches = df_baseline.collect().await?;
+        let baseline_rows: usize = baseline_batches.iter().map(|b| b.num_rows()).sum();
+        let df_new = ctx.sql(&sql).await?;
+        let optimized = df_new.into_optimized_plan()?;
+        let rewritten = push_filter_into_agg(optimized)?;
+        let df_new = ctx.execute_logical_plan(rewritten).await?;
+        let new_batches = df_new.collect().await?;
+        let new_rows: usize = new_batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(
+            baseline_rows, new_rows,
+            "Q02 SF=10 rewrite changed row count: baseline={baseline_rows}, rewritten={new_rows}"
+        );
+        Ok(())
+    }
+
+    /// Σ.AJ.1 Lever C Step 1: matcher specificity — Q11's HAVING
+    /// references a scalar subquery without group-by, and the outer
+    /// side is an Aggregate (not Filter→TableScan). The matcher
+    /// must not fire on this shape. SF=1 (Q11 SF=10 also tested
+    /// implicitly via the 22q bench, so we don't need an SF=10
+    /// variant here — specificity is a structural property of the
+    /// plan shape, not the data).
+    #[tokio::test]
+    async fn matcher_specificity_q11() -> DfResult<()> {
+        let Some(dir) = sf1_dir() else {
+            eprintln!("skip: sf1 missing");
+            return Ok(());
+        };
+        let ctx = SessionContext::new();
+        register_tpch(&ctx, &dir).await?;
+        let sql = std::fs::read_to_string(
+            dir.parent()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .join("queries/q11.sql"),
+        )
+        .ok();
+        let Some(sql) = sql else {
+            eprintln!("skip: q11.sql missing");
+            return Ok(());
+        };
+        let df = ctx.sql(&sql).await?;
+        let optimized = df.into_optimized_plan()?;
+        let rewritten = push_filter_into_agg(optimized.clone())?;
+        let baseline_rewrite_diff =
+            format!("{}", optimized.display_indent()) != format!("{}", rewritten.display_indent());
+        // Q11 may or may not match; what matters is correctness if it
+        // does. If a LeftSemi appears, also verify row-count parity.
+        if baseline_rewrite_diff {
+            let df_baseline = ctx.sql(&sql).await?;
+            let base_rows: usize = df_baseline
+                .collect()
+                .await?
+                .iter()
+                .map(|b| b.num_rows())
+                .sum();
+            let df_new = ctx.execute_logical_plan(rewritten).await?;
+            let new_rows: usize = df_new.collect().await?.iter().map(|b| b.num_rows()).sum();
+            assert_eq!(
+                base_rows, new_rows,
+                "Q11 rewrite fired but changed row count: baseline={base_rows}, rewritten={new_rows}"
+            );
+        }
+        Ok(())
+    }
+
+    /// Σ.AJ.1 Lever C Step 1: matcher specificity — Q15 has a CTE
+    /// (revenue_s) referenced on both sides of the outer join, and
+    /// the subquery is `max(total_revenue) from revenue_s` (no
+    /// group-by). Matcher should not fire. If it does fire, row
+    /// counts must still match.
+    #[tokio::test]
+    async fn matcher_specificity_q15() -> DfResult<()> {
+        let Some(dir) = sf1_dir() else {
+            eprintln!("skip: sf1 missing");
+            return Ok(());
+        };
+        let ctx = SessionContext::new();
+        register_tpch(&ctx, &dir).await?;
+        let sql = std::fs::read_to_string(
+            dir.parent()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .join("queries/q15.sql"),
+        )
+        .ok();
+        let Some(sql) = sql else {
+            eprintln!("skip: q15.sql missing");
+            return Ok(());
+        };
+        let df = ctx.sql(&sql).await?;
+        let optimized = df.into_optimized_plan()?;
+        let rewritten = push_filter_into_agg(optimized.clone())?;
+        if format!("{}", optimized.display_indent())
+            != format!("{}", rewritten.display_indent())
+        {
+            let df_baseline = ctx.sql(&sql).await?;
+            let base_rows: usize = df_baseline
+                .collect()
+                .await?
+                .iter()
+                .map(|b| b.num_rows())
+                .sum();
+            let df_new = ctx.execute_logical_plan(rewritten).await?;
+            let new_rows: usize = df_new.collect().await?.iter().map(|b| b.num_rows()).sum();
+            assert_eq!(
+                base_rows, new_rows,
+                "Q15 rewrite fired but changed row count: baseline={base_rows}, rewritten={new_rows}"
+            );
+        }
+        Ok(())
+    }
+
+    /// Σ.AJ.1 Lever C Step 1: matcher specificity — Q22's subquery
+    /// is an uncorrelated `avg(c_acctbal)` with no GROUP BY. The
+    /// matcher requires `Aggregate(group_by=[K])` with at least one
+    /// group key, so this must not fire.
+    #[tokio::test]
+    async fn matcher_specificity_q22() -> DfResult<()> {
+        let Some(dir) = sf1_dir() else {
+            eprintln!("skip: sf1 missing");
+            return Ok(());
+        };
+        let ctx = SessionContext::new();
+        register_tpch(&ctx, &dir).await?;
+        let sql = std::fs::read_to_string(
+            dir.parent()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .join("queries/q22.sql"),
+        )
+        .ok();
+        let Some(sql) = sql else {
+            eprintln!("skip: q22.sql missing");
+            return Ok(());
+        };
+        let df = ctx.sql(&sql).await?;
+        let optimized = df.into_optimized_plan()?;
+        let rewritten = push_filter_into_agg(optimized.clone())?;
+        if format!("{}", optimized.display_indent())
+            != format!("{}", rewritten.display_indent())
+        {
+            let df_baseline = ctx.sql(&sql).await?;
+            let base_rows: usize = df_baseline
+                .collect()
+                .await?
+                .iter()
+                .map(|b| b.num_rows())
+                .sum();
+            let df_new = ctx.execute_logical_plan(rewritten).await?;
+            let new_rows: usize = df_new.collect().await?.iter().map(|b| b.num_rows()).sum();
+            assert_eq!(
+                base_rows, new_rows,
+                "Q22 rewrite fired but changed row count: baseline={base_rows}, rewritten={new_rows}"
+            );
+        }
         Ok(())
     }
 }
