@@ -1059,6 +1059,77 @@ impl EmatArrowBatchReader {
         filter: BridgeFilter,
         path: std::path::PathBuf,
     ) -> DfResult<()> {
+        // Σ.AH.2 Story 1'.4 Stage 1 (2026-05-26): fused bloom-probe
+        // path. For runtime-injected i64-only filters (I64InBloom,
+        // I64InSet, I64Range from the L9 sideband), the filter
+        // column is ALWAYS in the projection (it's the HashJoin's
+        // join key, which the projection above us already selects).
+        // So we can:
+        //   1. Dense-decode all projected columns (existing path)
+        //   2. Walk the already-decoded i64 buffer for the filter
+        //      column to build the bitmap (no second decode)
+        //   3. Stash the bitmap; slice_batch applies it per-batch
+        //      via Arrow's SIMD filter (existing Σ.AE.2 hook).
+        //
+        // Saves: one full decode + one Snappy decompress of the
+        // filter column (~6 ms/partition on SF=10 lineitem.l_partkey;
+        // saving ~25-30 ms wall after parallel-overlap).
+        //
+        // Opt-in via `EMAT_L9_FUSED_PROBE=1`. Default OFF until the
+        // full 6-stage arc (Stages 2-4 follow) lands and 22q SF=10
+        // bench confirms no regression.
+        if filter.is_runtime_i64_only()
+            && std::env::var_os("EMAT_L9_FUSED_PROBE").is_some()
+        {
+            self.cur_rg_total = self.cached_md.row_groups[rg].num_rows as usize;
+            self.load_row_group_dense(rg)?;
+            // Find the predicate's target column in the projection.
+            // Walk cur_rg_columns to extract the i64 buffer.
+            let cols = self.cur_rg_columns.as_ref().ok_or_else(|| {
+                ext("load_row_group_dense returned without cur_rg_columns".to_string())
+            })?;
+            // The predicate's col_idx is a FILE-schema index. Map to
+            // projection index via self.projection (which is also a
+            // file-schema-indexed Vec).
+            let target_proj_idx = filter
+                .single_runtime_i64_col()
+                .and_then(|file_col| self.projection.iter().position(|&l| l == file_col));
+            let Some(proj_idx) = target_proj_idx else {
+                // Target column not in projection (shouldn't happen
+                // for L9-emitted predicates — the bloom key IS the
+                // join key which the projection includes). Fall
+                // through to masked path as safety.
+                self.cur_rg_columns = None;
+                return self.load_row_group_masked_legacy(rg, filter, path);
+            };
+            // Extract i64 values from the decoded column. Arrow's
+            // `Buffer::typed_data::<i64>()` validates alignment +
+            // length and returns a `&[i64]` view (no copy).
+            let i64_values: &[i64] = match &cols[proj_idx] {
+                DecodedColumn::Int64 { data, .. } => data.typed_data::<i64>(),
+                _ => {
+                    self.cur_rg_columns = None;
+                    return self.load_row_group_masked_legacy(rg, filter, path);
+                }
+            };
+            let (_col, bitmap) = filter
+                .probe_i64_values_from_decoded(i64_values)
+                .ok_or_else(|| ext("probe_i64_values_from_decoded unexpectedly None"))?;
+            self.cur_rg_filter_bitmap =
+                Some(datafusion::arrow::buffer::Buffer::from_vec(bitmap));
+            return Ok(());
+        }
+        self.load_row_group_masked_legacy(rg, filter, path)
+    }
+
+    /// Σ.AH.2 Story 1'.4 — original masked path, kept for the
+    /// non-fused dispatch (user-pushed filters, opt-out).
+    fn load_row_group_masked_legacy(
+        &mut self,
+        rg: usize,
+        filter: BridgeFilter,
+        path: std::path::PathBuf,
+    ) -> DfResult<()> {
         // Σ.Q.L13 (2026-05-23): parallel-bitmap+dense path is opt-IN
         // via `EMAT_FORCE_PARALLEL_BITMAP=1`. The path was previously
         // default-ON when `predicted_pass_rate > 0.33`, citing an SF=1

@@ -215,6 +215,60 @@ impl BridgeFilter {
     pub fn predicates_len(&self) -> usize {
         self.predicates.len()
     }
+
+    /// Σ.AH.2 Story 1'.4 Stage 1 — apply all runtime-i64 predicates
+    /// against an already-decoded i64 column. Returns
+    /// `Some((target_file_col_idx, bitmap))` when the filter is
+    /// `is_runtime_i64_only()` AND all predicates target the same
+    /// column. Returns `None` otherwise so the caller can fall back
+    /// to the masked path.
+    ///
+    /// The point: skips the duplicate decode of the filter column.
+    /// The masked path calls `build_bitmap` which RE-DECODES the
+    /// column from the file (~6 ms per 1M-row partition on
+    /// lineitem.l_partkey). The fused path reuses the buffer that
+    /// `load_row_group_dense` already produced.
+    /// Σ.AH.2 Story 1'.4 Stage 1 — file-schema column index that all
+    /// runtime-i64 predicates target, or `None` if not runtime-i64-only
+    /// or if predicates target multiple columns.
+    pub fn single_runtime_i64_col(&self) -> Option<usize> {
+        if !self.is_runtime_i64_only() {
+            return None;
+        }
+        let first = self.predicates.first()?.col_idx();
+        if self.predicates.iter().all(|p| p.col_idx() == first) {
+            Some(first)
+        } else {
+            None
+        }
+    }
+
+    pub fn probe_i64_values_from_decoded(&self, values: &[i64]) -> Option<(usize, Vec<u8>)> {
+        if !self.is_runtime_i64_only() {
+            return None;
+        }
+        let first_col = match self.predicates.first() {
+            Some(p) => p.col_idx(),
+            None => return None,
+        };
+        if !self.predicates.iter().all(|p| p.col_idx() == first_col) {
+            return None;
+        }
+        let total = values.len();
+        let mut bitmap = vec![0u8; total.div_ceil(8)];
+        for (row, &v) in values.iter().enumerate() {
+            let pass = self.predicates.iter().all(|p| match p {
+                ColumnPredicate::I64InBloom { bloom, .. } => bloom.might_contain_i64(v),
+                ColumnPredicate::I64InSet { set, .. } => set.contains(v),
+                ColumnPredicate::I64Range { lo, hi, .. } => v >= *lo && v <= *hi,
+                _ => false, // unreachable since is_runtime_i64_only
+            });
+            if pass {
+                bitmap[row >> 3] |= 1 << (row & 7);
+            }
+        }
+        Some((first_col, bitmap))
+    }
 }
 
 #[derive(Debug, Clone)]
