@@ -130,6 +130,14 @@ The real gap was the **ratio gate**: it correctly identified the AH.2 target joi
 
 **Stretch gap surfaced by Q09:** the matcher defaults to 0.2 for `StringLike` (and ranges via And-of-bounds). Q09's `p_name LIKE '%green%'` therefore still shows `build_rows = 400k` and fails the ratio gate. A future lever (Σ.AH.7, queued in CURRENT.md) would evaluate LIKE predicates against the dict-page entries at planner time to count matching keys, then use `matches/distinct_count` as the selectivity. Cost: O(distinct_count) per LIKE; risk: low (planner-only). **Out of Story 1'.3 scope.**
 
+## 5c. Stage 4 attempted + reverted (2026-05-26)
+
+Tried a "filter-once-per-RG" variant: after Stage 1's dense decode + bitmap construction, apply `filter_record_batch` ONCE on the full RG via converting `cur_rg_columns` (DecodedColumn) → ArrayRef → RecordBatch → filter → store result in a new `cur_rg_filtered_arrays` field; `slice_batch` then slices from the pre-filtered arrays via zero-copy `Array::slice`.
+
+**Result:** broke correctness on **4 queries (Q07, Q08, Q12, Q21)** — `18/22 PASS`. Wall savings on Q08 were ~4 ms (188 → 185 ms) but the conversion path via `slice_decoded(&col, 0, total_pre, target)` for non-primitive columns (StringView, DictUtf8) has a latent bug at the full-RG slice scenario. Reverted; captured as a deferred follow-up.
+
+ROI assessment: Stage 1+2 already closed 95% of the Story 1'.3 wall regression. Stage 4's marginal wall delta (~1-2 ms) doesn't justify the depth of investigation needed to fix the StringView/DictUtf8 full-slice path. Stage 4 stays deferred — pickable up later if 22q SF=10 sweep shows it's still on the critical path.
+
 ## 5b. Story 1'.4 — six-stage L9 decode-path optimisation arc (2026-05-26)
 
 After Story 1'.3 committed the cardinality fix and demonstrated Q08 wall +55 ms regression, Story 1'.4 first tried a simple dense-then-bitmap fallback (Option B in design notes). Empirical stage profile showed Option B was essentially the same cost as masked decode (2251 ms vs 2277 ms lineitem-scan compute) — the bottleneck isn't the masked-decode tax, it's the bloom probe itself + per-batch SIMD filter, which BOTH paths pay.
