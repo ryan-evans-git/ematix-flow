@@ -130,6 +130,25 @@ The real gap was the **ratio gate**: it correctly identified the AH.2 target joi
 
 **Stretch gap surfaced by Q09:** the matcher defaults to 0.2 for `StringLike` (and ranges via And-of-bounds). Q09's `p_name LIKE '%green%'` therefore still shows `build_rows = 400k` and fails the ratio gate. A future lever (Σ.AH.7, queued in CURRENT.md) would evaluate LIKE predicates against the dict-page entries at planner time to count matching keys, then use `matches/distinct_count` as the selectivity. Cost: O(distinct_count) per LIKE; risk: low (planner-only). **Out of Story 1'.3 scope.**
 
+## 5b. Story 1'.4 — six-stage L9 decode-path optimisation arc (2026-05-26)
+
+After Story 1'.3 committed the cardinality fix and demonstrated Q08 wall +55 ms regression, Story 1'.4 first tried a simple dense-then-bitmap fallback (Option B in design notes). Empirical stage profile showed Option B was essentially the same cost as masked decode (2251 ms vs 2277 ms lineitem-scan compute) — the bottleneck isn't the masked-decode tax, it's the bloom probe itself + per-batch SIMD filter, which BOTH paths pay.
+
+Reframed analysis: Q08's part_filt → lineitem firing adds ~106 ms/partition to scan but saves only ~65 ms/partition downstream. Net +41 ms wall. To recover the regression we need to attack the scan cost itself, not just the masked-decode path. Six stages, in order:
+
+| # | Optimisation | Expected wall Δ | Effort |
+|---|---|---|---|
+| 1+5 | Fuse bloom probe into dense decode, SIMD-friendly kernel | −25 ms | 1-2 days |
+| 3 | Inline bitmap as one parallel-decode column | −5 ms | 0.5 day |
+| 2 | Cache decompressed pages across build_bitmap + dense | −10 ms | 0.5 day |
+| 4 | Sideband bitmap to HashJoin, skip per-batch filter | −8 ms | 1-2 days |
+
+Plus:
+- **Stage 5 — clustering gate**: `build_size / probe_distinct_count >= threshold` predicate at L9 firing. Safety net for shapes where the optimisations don't fully recover. Cheap (~2 hours).
+- **Stage 6 — 22q SF=10 A/B + default-on flip**: if geomean ≥ baseline post-optimisations, flip both `EMAT_L9_TIGHT_CARDINALITY` and the clustering gate to default-on.
+
+Hard-stop conditions: 22q geomean regression > 2 pp at any check-in, or per-query regression > 5% on existing L9 wins (Q07 ≤ 175 ms, Q17 ≤ 230 ms).
+
 ## 6. What this means for Stories 2-5
 
 The Story 2 ("rule extension to Partitioned-mode") in the plan also evaporates — the rule already fires on Partitioned. Story 2's *spirit* (open the L9 fire on the four AH.2 target queries) is now Story 1' above.

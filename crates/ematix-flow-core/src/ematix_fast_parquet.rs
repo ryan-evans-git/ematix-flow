@@ -182,6 +182,39 @@ impl BridgeFilter {
     pub fn extend(&mut self, more: Vec<ColumnPredicate>) {
         self.predicates.extend(more);
     }
+
+    /// Σ.AH.2 Story 1'.4 — true iff every predicate in this filter is
+    /// a runtime-injected i64-only shape (`I64InBloom`, `I64InSet`,
+    /// `I64Range`). These shapes share two properties that make the
+    /// dense-then-post-filter path always-win vs the masked-decode
+    /// path:
+    /// 1. The probe column is always already in the projection
+    ///    (it's the HashJoin's join key, projected for the join).
+    /// 2. The per-row predicate eval is cheap (bloom probe ~1.4 ns,
+    ///    set lookup ~5 ns, range compare ~1 ns).
+    ///
+    /// User-pushed predicates (`I32Range`, `I32In`, `F64Range`,
+    /// `StringEq`, `StringLike`, ...) stay on the masked-decode path
+    /// because they may target non-projected columns and benefit
+    /// from page-level skip when the column's value distribution
+    /// allows it.
+    pub fn is_runtime_i64_only(&self) -> bool {
+        !self.predicates.is_empty()
+            && self.predicates.iter().all(|p| {
+                matches!(
+                    p,
+                    ColumnPredicate::I64InBloom { .. }
+                        | ColumnPredicate::I64InSet { .. }
+                        | ColumnPredicate::I64Range { .. }
+                )
+            })
+    }
+
+    /// Number of pushed predicates. Used by trace/diagnostic code
+    /// (`EMAT_L9_TRACE`, stage_profiler) — not on the hot path.
+    pub fn predicates_len(&self) -> usize {
+        self.predicates.len()
+    }
 }
 
 #[derive(Debug, Clone)]
