@@ -1407,7 +1407,7 @@ impl EmatixFastParquetTableProvider {
         // `partition_statistics` returns real cardinality info to the
         // planner. Reuses the helper in `fast_parquet.rs` — both
         // providers read the same parquet-rs `ParquetMetaData`.
-        let column_stats = Arc::new(crate::fast_parquet::aggregate_column_statistics(
+        let mut column_stats = Arc::new(crate::fast_parquet::aggregate_column_statistics(
             reader.metadata(),
             schema.as_ref(),
         ));
@@ -1455,6 +1455,68 @@ impl EmatixFastParquetTableProvider {
             }
         }
         let column_is_dict_encoded: Arc<Vec<bool>> = Arc::new(all_dict);
+
+        // Σ.AH.2 Story 1'.2 (2026-05-26) — for every column that has
+        // a dictionary page in EVERY row group, read each dict page's
+        // `num_values` and take the MAX across RGs as a distinct_count
+        // estimate. Without this, `ColumnStatistics::distinct_count`
+        // stays Absent and `ColumnPredicate::StringEq::estimate_pass_rate`
+        // falls through to its 0.1 default — over-estimating
+        // post-filter cardinality on TPC-H string-Eq filters (p_type
+        // shows 200k vs real 13k), which then fails the L9 ratio gate.
+        // Taking the max-per-RG is a lower bound on global distinct
+        // count (uniformly-distributed columns give exact; clustered
+        // columns give a conservative under-estimate, which is the
+        // safe direction for the bloom rule — slight under-count of
+        // distinct keeps post-filter rows estimated high, biasing
+        // the gate against false-positive blooms).
+        //
+        // Note: this is decoupled from `column_is_dict_encoded` (which
+        // also requires `page_encoding_stats` for LIKE pushdown safety).
+        // We only need the dict page to exist — even mixed dict+PLAIN
+        // data pages still have a dict that tells us distinct count.
+        //
+        // Cost: one decode of each dict page (typically 1-10 KB per
+        // RG); a few ms per provider construction. Cached for the
+        // session via `column_stats`.
+        {
+            use datafusion::common::stats::Precision;
+            use datafusion::parquet::column::page::Page;
+            let mut column_stats_vec: Vec<datafusion::common::stats::ColumnStatistics> =
+                (*column_stats).clone();
+            'col: for col_idx in 0..num_cols_in_schema {
+                // Confirm every RG has a dict page.
+                for rg in reader.metadata().row_groups() {
+                    if col_idx >= rg.num_columns() {
+                        continue 'col;
+                    }
+                    if rg.column(col_idx).dictionary_page_offset().is_none() {
+                        continue 'col;
+                    }
+                }
+                let mut max_distinct: usize = 0;
+                let mut any_dict = false;
+                for rg_idx in 0..num_row_groups {
+                    let Ok(rg) = reader.get_row_group(rg_idx) else {
+                        continue 'col;
+                    };
+                    let Ok(mut page_reader) = rg.get_column_page_reader(col_idx) else {
+                        continue 'col;
+                    };
+                    match page_reader.get_next_page() {
+                        Ok(Some(Page::DictionaryPage { num_values, .. })) => {
+                            max_distinct = max_distinct.max(num_values as usize);
+                            any_dict = true;
+                        }
+                        _ => continue 'col,
+                    }
+                }
+                if any_dict && max_distinct > 0 {
+                    column_stats_vec[col_idx].distinct_count = Precision::Inexact(max_distinct);
+                }
+            }
+            column_stats = Arc::new(column_stats_vec);
+        }
 
         // Σ.E5 per-filter Exact (2026-05-19): per-column no-nulls
         // flag. `null_count_opt() == Some(0)` for every RG = safe.
@@ -3872,6 +3934,104 @@ mod tests {
         assert_eq!(
             cs_b.max_value,
             Precision::Exact(ScalarValue::Int64(Some(99_900)))
+        );
+    }
+
+    /// Σ.AH.2 Story 1'.2 — on the actual TPC-H SF=10 part.parquet,
+    /// the p_type column should land with `distinct_count =
+    /// Inexact(150)` (150 unique p_type values in TPC-H). Skipped if
+    /// the SF=10 dataset isn't present (e.g. CI).
+    #[tokio::test]
+    async fn tpch_part_p_type_distinct_count_is_150() {
+        use datafusion::common::stats::Precision;
+        use std::path::PathBuf;
+        let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let path = manifest
+            .parent()
+            .and_then(|p| p.parent())
+            .map(|p| p.join("examples/tpch/data/sf10/part.parquet"));
+        let Some(path) = path.filter(|p| p.exists()) else {
+            eprintln!("TPC-H SF=10 part.parquet not present; skipping");
+            return;
+        };
+        let provider =
+            EmatixFastParquetTableProvider::try_new(path.to_string_lossy().to_string()).unwrap();
+        let stats = provider.statistics().unwrap();
+        // p_type is field index 4 in part schema
+        let cs = &stats.column_statistics[4];
+        assert!(
+            matches!(cs.distinct_count, Precision::Inexact(n) if n == 150),
+            "p_type distinct_count should be Inexact(150), got {:?}",
+            cs.distinct_count
+        );
+    }
+
+    /// Σ.AH.2 Story 1'.2 (2026-05-26) — for dict-encoded string
+    /// columns, `column_stats[col].distinct_count` should be populated
+    /// from the parquet dict-page `num_values` (max across RGs).
+    /// Without this, `ColumnPredicate::StringEq::estimate_pass_rate`
+    /// falls through to its 0.1 default and the L9 ratio gate
+    /// over-estimates post-filter cardinality.
+    ///
+    /// Builds a parquet file with a Utf8 column carrying 5 distinct
+    /// values × 1000 rows. After construction, distinct_count should
+    /// be `Inexact(5)` (dict pages will dedup the 5 entries).
+    #[tokio::test]
+    async fn dict_encoded_string_column_populates_distinct_count() {
+        use datafusion::common::stats::Precision;
+        use datafusion::parquet::basic::{Compression, Repetition, Type as PhysicalType};
+        use datafusion::parquet::column::writer::ColumnWriter;
+        use datafusion::parquet::data_type::ByteArray;
+        use datafusion::parquet::file::properties::WriterProperties;
+        use datafusion::parquet::file::writer::SerializedFileWriter;
+        use datafusion::parquet::schema::types::Type as PType;
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+
+        let pschema = Arc::new(
+            PType::group_type_builder("schema")
+                .with_fields(vec![Arc::new(
+                    PType::primitive_type_builder("s", PhysicalType::BYTE_ARRAY)
+                        .with_repetition(Repetition::REQUIRED)
+                        .with_converted_type(datafusion::parquet::basic::ConvertedType::UTF8)
+                        .build()
+                        .unwrap(),
+                )])
+                .build()
+                .unwrap(),
+        );
+        let props = Arc::new(
+            WriterProperties::builder()
+                .set_compression(Compression::SNAPPY)
+                .set_dictionary_enabled(true)
+                .build(),
+        );
+        let file = File::create(&path).unwrap();
+        let mut writer = SerializedFileWriter::new(file, pschema, props).unwrap();
+        let mut rg = writer.next_row_group().unwrap();
+        // 5 distinct values × 200 reps = 1000 rows. Dict page will
+        // carry exactly 5 entries.
+        let values: Vec<ByteArray> = (0..1000)
+            .map(|i| ByteArray::from(format!("v{}", i % 5).into_bytes()))
+            .collect();
+        let mut col = rg.next_column().unwrap().unwrap();
+        if let ColumnWriter::ByteArrayColumnWriter(t) = col.untyped() {
+            t.write_batch(&values, None, None).unwrap();
+        }
+        col.close().unwrap();
+        rg.close().unwrap();
+        writer.close().unwrap();
+
+        let provider =
+            EmatixFastParquetTableProvider::try_new(path.to_string_lossy().to_string()).unwrap();
+        let stats = provider.statistics().expect("provider must publish stats");
+        let cs = &stats.column_statistics[0];
+        assert_eq!(
+            cs.distinct_count,
+            Precision::Inexact(5),
+            "dict-encoded string col should report distinct_count=Inexact(5), got {:?}",
+            cs.distinct_count
         );
     }
 }
