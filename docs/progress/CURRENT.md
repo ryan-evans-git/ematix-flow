@@ -2,8 +2,9 @@
 
 **Active plan:** [`docs/plans/CURRENT.md`](../plans/CURRENT.md) — **Σ.AH.2: L9 emitter Partitioned-mode extension**
 **Started:** 2026-05-26 (promoted from Σ.AH Phase D arc shell)
-**Active phase:** Pre-work DONE → Story 1 next
-**Active story:** Σ.AH.4 closed 2026-05-26 (partition-count generalization, code-only; baseline data preserved). Next: Story 1 (partition-aware bloom merge).
+**Active phase:** Σ.AH.2 CLOSED 2026-05-26 — net-zero 22q SF=10 wall, original hypothesis refuted.
+**What landed:** dict-page distinct_count populated as infrastructure; fused-probe path opt-in via `EMAT_L9_FUSED_PROBE=1`. See `memory:[[sigma-ah-2-arc-closed]]` for the full closure summary.
+**Next plan candidates:** Σ.AH.1 (L9 scan-level integration) and Σ.AH.3 (build-vs-probe swap) drafts remain; awaiting user direction on which to promote.
 
 **Predicted impact:** ~150-200 ms wall across Q05/Q07/Q08/Q09 = 3-6 pp SF=10 geomean. Solo target; cascade with Σ.AH.1 adds another 2-3 pp.
 

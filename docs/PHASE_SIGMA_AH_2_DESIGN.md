@@ -130,6 +130,47 @@ The real gap was the **ratio gate**: it correctly identified the AH.2 target joi
 
 **Stretch gap surfaced by Q09:** the matcher defaults to 0.2 for `StringLike` (and ranges via And-of-bounds). Q09's `p_name LIKE '%green%'` therefore still shows `build_rows = 400k` and fails the ratio gate. A future lever (Σ.AH.7, queued in CURRENT.md) would evaluate LIKE predicates against the dict-page entries at planner time to count matching keys, then use `matches/distinct_count` as the selectivity. Cost: O(distinct_count) per LIKE; risk: low (planner-only). **Out of Story 1'.3 scope.**
 
+## 5e. Arc closure (2026-05-26)
+
+After Stages 0–6 of the 6-stage optimisation arc, the final 22q SF=10 A/B (5 trials × fused-OFF vs fused-ON) shows **net-neutral wall-time** at scale:
+
+- Total wall across 22 queries: 3235.68 ms (OFF) → 3238.00 ms (ON), Δ = +2.3 ms (~0.07%).
+- Per-query: most within ±2 ms (noise); a few queries with Δ > 1σ in either direction but no clear pattern.
+- Notable: Q07 +9.5 ms (fused ON), Q21 −14 ms (fused ON), Q06 −5 ms, Q03 −6 ms. These mostly track random noise on benchmark-to-benchmark variation.
+
+22/22 `tpch_validate` PASS under all flag combinations explored.
+
+**Decision: ship as opt-in, no default flip.** The fused-probe path is correct and measurably faster on Q08-in-isolation (247 → 188 ms), but at 22q geomean scale the gain washes out + Q07 mildly regresses (unexplained, likely noise). Keep `EMAT_L9_FUSED_PROBE=1` and `EMAT_L9_TIGHT_CARDINALITY=1` opt-in.
+
+### What banked
+
+| Commit | What it delivers |
+|---|---|
+| `956d65f` Story 1'.2 | `column_stats.distinct_count` populated from parquet dict-page headers (max-per-RG). Infrastructure for accurate selectivity in any rule, not just L9. |
+| `f30034f` Story 1'.3 | `EMAT_L9_TIGHT_CARDINALITY=1` opt-in: rule-level selectivity calc that uses column_stats directly (bypasses DataFusion's 0.2 default for string-Eq). Wall-negative alone on Q08 but the primitive is right. |
+| `8c9a3c2` Story 1'.4 Stage 1 | `EMAT_L9_FUSED_PROBE=1` opt-in: fused bloom probe over the already-decoded i64 buffer. Avoids the double-decode of the filter column in the masked path. |
+| `d45e148` Stage 2 | Chunk-of-8 SIMD-friendly byte-packing in `probe_i64_values_from_decoded`. |
+| `e5222d7` Stage 4 revert | Filter-once-per-RG path attempted; 4q correctness bug in StringView/DictUtf8 full-slice conversion. Deferred. |
+
+### What didn't bank
+
+- **Stage 3 (page cache)** — moot once Stage 1 removed the double-decode.
+- **Stage 5 (clustering gate)** — heuristic `build_size / probe_distinct` had wrong direction: small build with tight-cardinality enabled is HIGH ROI not LOW (Q07 nation-chain build=1 / probe_distinct=25 = 0.04 was a win, not a loss). The real ROI driver is probe-decode cost (Q08's 60M lineitem) which the heuristic doesn't model.
+- **Stage 6 (default-on flip)** — 22q SF=10 result was net-zero; no flip warranted.
+
+### What was learned (capturable as memories)
+
+1. **L9 ROI depends on probe-decode cost, not on `build / probe_distinct`.** Q07's nation-chain wins because customer is only 1.5M rows (cheap probe). Q08's part_filt loses because lineitem is 60M (expensive probe), and the bloom probe + per-batch filter eats the downstream savings.
+2. **Parquet dict-page `num_values` is a viable proxy for `distinct_count`** when the writer doesn't populate the optional Statistics.distinct_count field (every TPC-H file in our suite). Max-per-RG is a safe lower bound: exact on uniformly-distributed columns, conservative on clustered.
+3. **DataFusion's `FilterExec.statistics()` doesn't use `ColumnStatistics.distinct_count`** for string-Eq selectivity — falls through to 0.2 default. Our rule must compute selectivity itself if it cares.
+4. **"Filter once per RG" via re-converting DecodedColumn → ArrayRef → filter → reslice has a latent StringView/DictUtf8 bug.** Investigation deferred; the per-batch SIMD filter Arrow uses is fast enough that the optimization wasn't worth chasing.
+
+## 5d. Stage 5 attempted + reverted (2026-05-26)
+
+Tried `build_size / probe_distinct_count < threshold → skip` as a clustering ROI gate (cheap, ~2 hours). 22q `tpch_validate` 22/22 PASS, **but Q07 regressed +120 ms** (162 → 283 ms) because tight cardinality reduces Q07's nation-chain build_rows estimate to 1 (was 64 via the `.max(64)` fallback), and 1/25 = 0.04 falsely failed the gate. Q07's nation→customer was *previously* winning with that same shape — the build size is small *because* the upstream filter was very selective, not because the bloom is unhelpful.
+
+**The right ROI driver is probe-decode cost, not `build / probe_distinct`.** A bloom on 1.5M-row customer is cheap to probe; a bloom on 60M-row lineitem is expensive. The heuristic conflated these. Reverted. The clustering-gate framing doesn't have a clean answer; properly modelling per-row downstream-savings vs bloom-probe cost would require execution-time information the planner doesn't have.
+
 ## 5c. Stage 4 attempted + reverted (2026-05-26)
 
 Tried a "filter-once-per-RG" variant: after Stage 1's dense decode + bitmap construction, apply `filter_record_batch` ONCE on the full RG via converting `cur_rg_columns` (DecodedColumn) → ArrayRef → RecordBatch → filter → store result in a new `cur_rg_filtered_arrays` field; `slice_batch` then slices from the pre-filtered arrays via zero-copy `Array::slice`.

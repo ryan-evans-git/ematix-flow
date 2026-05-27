@@ -1,10 +1,11 @@
 # Σ.AH.2 — L9 emitter Partitioned-mode extension
 
-**Status:** active
+**Status:** CLOSED 2026-05-26 — 22q SF=10 result net-zero; original 4-6 pp prediction empirically refuted.
 **Created:** 2026-05-26 (promoted from Σ.AH Phase D arc shell)
-**Active phase:** Pre-work (Σ.AH.4 chore) → Story 1
-**Active story:** Σ.AH.4 pre-work (partition-count generalization — code-only), then Story 1 (partition-aware bloom merge)
-**Branch policy:** local commits only on this plan. PR only after Story 4 wall-time gate passes.
+**Active phase:** **arc closed**. See `docs/PHASE_SIGMA_AH_2_DESIGN.md` § 5e for the closure summary and `memory:[[sigma-ah-2-arc-closed]]` for the takeaway.
+**What banked (committed):** Σ.AH.4 partition-count generalization (`d3c42cb`), Story 1'.2 dict-page distinct_count (`956d65f`), Story 1'.4 Stage 1 fused-probe (`8c9a3c2`), Stage 2 SIMD-friendly probe loop (`d45e148`). All `EMAT_L9_*` flags are opt-in.
+**What didn't bank:** Story 1'.3 tight cardinality (`f30034f`) wall-negative without safety net; Stage 4 filter-once-per-RG had StringView/DictUtf8 bug; Stage 5 clustering gate had wrong-direction heuristic; Stage 6 default-on flip net-zero.
+**Branch policy:** local commits only on this plan. No PR.
 **Predecessor plan:** [`docs/plans/archive/2026-05-26-sigma-ah-survey.md`](./archive/2026-05-26-sigma-ah-survey.md) — Σ.AH survey (closed 2026-05-26 after Phase D).
 **Sibling arc shells (drafted, not active):** [Σ.AH.1](sigma-ah-arc-1.md), [Σ.AH.3](sigma-ah-arc-3.md).
 
