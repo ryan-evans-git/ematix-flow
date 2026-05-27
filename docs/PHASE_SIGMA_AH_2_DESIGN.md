@@ -120,6 +120,16 @@ The right Story 1 work is **not** "design a partition-aware merge" (already exis
 - ~~Partition-aware emitter (Story 1.3)~~ — emitter already partition-aware.
 - ~~Re-test existing CollectLeft path (Story 1.4)~~ — was meant to verify a not-yet-written refactor; with no refactor needed, this collapses into the 22q `tpch_validate` smoke test.
 
+## 5a. Empirical pivot during implementation (2026-05-26)
+
+Story 1'.1's "filter-equivalent walker" premise was **also overturned** when Q08's plan dump was inspected: the existing `build_subtree_has_filter` already recurses through every child node (including HashAgg/Repartition/HashJoin), so the 13 "no FilterExec" skips are all on **legitimately unfiltered** raw scans (nation, customer, supplier as direct build sides). The walker doesn't need relaxing — the gate is doing its job there.
+
+The real gap was the **ratio gate**: it correctly identified the AH.2 target joins as filter-bearing, but their `build_rows` estimate came from DataFusion's `FilterExec.statistics()`, which uses a default 0.2 selectivity for string-Eq predicates (`p_type='ECONOMY...'` → 2M × 0.2 = 400k vs real 13k). Even with the dict-distinct fix from Story 1'.2 populating `distinct_count = Inexact(150)`, DataFusion's FilterExec doesn't consult `distinct_count` for string-Eq.
+
+**Story 1'.3 (actual landed work):** an emat-stats-aware override `estimate_build_rows_via_emat_stats` in the L9 rule, gated by `EMAT_L9_TIGHT_CARDINALITY=1`. Walks the build subtree for `FilterExec` + `EmatixFastParquetExec`, computes `raw × selectivity` directly using our column_stats. Handles `col=literal → 1/distinct`, `AND → ×`, `OR → max`. Q08's part_filt → lineitem now WRAPs (`build_rows = 13333`, ratio gate passes). Q03's canonical reject case still correctly skipped.
+
+**Stretch gap surfaced by Q09:** the matcher defaults to 0.2 for `StringLike` (and ranges via And-of-bounds). Q09's `p_name LIKE '%green%'` therefore still shows `build_rows = 400k` and fails the ratio gate. A future lever (Σ.AH.7, queued in CURRENT.md) would evaluate LIKE predicates against the dict-page entries at planner time to count matching keys, then use `matches/distinct_count` as the selectivity. Cost: O(distinct_count) per LIKE; risk: low (planner-only). **Out of Story 1'.3 scope.**
+
 ## 6. What this means for Stories 2-5
 
 The Story 2 ("rule extension to Partitioned-mode") in the plan also evaporates — the rule already fires on Partitioned. Story 2's *spirit* (open the L9 fire on the four AH.2 target queries) is now Story 1' above.

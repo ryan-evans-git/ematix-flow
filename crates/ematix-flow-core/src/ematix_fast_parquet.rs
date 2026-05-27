@@ -1980,6 +1980,22 @@ impl EmatixFastParquetExec {
         &self.path
     }
 
+    /// Σ.AH.2 Story 1'.3 — projected per-column statistics carrying
+    /// min/max/null_count/distinct_count. Indexed by the Exec's own
+    /// (projected) schema, NOT by file-schema indices. Exposed for
+    /// the L9 sideband rule so it can compute filter selectivity
+    /// using accurate distinct_count populated by Story 1'.2 instead
+    /// of relying on DataFusion's default-0.2 FilterExec selectivity.
+    pub fn column_stats(&self) -> &[datafusion::common::stats::ColumnStatistics] {
+        &self.column_stats
+    }
+
+    /// Σ.AH.2 Story 1'.3 — raw (pre-filter) total rows in the file.
+    /// Used by the L9 rule's emat-stats-aware build-rows estimate.
+    pub fn num_rows(&self) -> usize {
+        self.num_rows
+    }
+
     /// Σ.Q.L4′ — append extra predicates (e.g. I64InBloom from a
     /// build-side bloom emitter) onto this scan's BridgeFilter. If
     /// no filter existed, creates one from the supplied predicates.

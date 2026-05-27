@@ -497,7 +497,20 @@ fn estimate_probe_scan_rows(scan: &EmatixFastParquetExec) -> Option<usize> {
 
 /// Best-effort row-count estimate for the build subtree. Uses
 /// `partition_statistics` when available, sums across partitions.
+///
+/// Σ.AH.2 Story 1'.3 (2026-05-26): when `EMAT_L9_TIGHT_CARDINALITY=1`,
+/// first try the emat-stats-aware path that uses
+/// `EmatixFastParquetExec::column_stats().distinct_count` (populated
+/// by Story 1'.2 from parquet dict pages) to compute filter
+/// selectivity directly, bypassing DataFusion's `FilterExec.statistics()`
+/// which doesn't use distinct_count for string-Eq predicates and
+/// falls back to a 0.2 default.
 fn estimate_build_rows(plan: &dyn ExecutionPlan) -> Option<usize> {
+    if std::env::var_os("EMAT_L9_TIGHT_CARDINALITY").is_some() {
+        if let Some(tight) = estimate_build_rows_via_emat_stats(plan) {
+            return Some(tight);
+        }
+    }
     let n = plan.output_partitioning().partition_count();
     let mut total: usize = 0;
     let mut have_any = false;
@@ -511,6 +524,105 @@ fn estimate_build_rows(plan: &dyn ExecutionPlan) -> Option<usize> {
         }
     }
     if have_any { Some(total.max(64)) } else { None }
+}
+
+/// Σ.AH.2 Story 1'.3 — emat-stats-aware build-rows estimate. Returns
+/// `Some(rows)` only when the build subtree contains a `FilterExec`
+/// sitting (transitively) above exactly one `EmatixFastParquetExec`.
+/// Computes selectivity from the predicate directly using emat
+/// column_stats (which carry accurate `distinct_count` from dict
+/// pages — Story 1'.2). Returns `None` for any other shape so the
+/// caller falls back to the standard partition_statistics path.
+fn estimate_build_rows_via_emat_stats(plan: &dyn ExecutionPlan) -> Option<usize> {
+    let predicate = find_filter_predicate(plan)?;
+    let (raw, column_stats) = find_emat_scan_stats(plan)?;
+    let sel = estimate_filter_selectivity_via_emat_stats(&predicate, &column_stats);
+    Some(((raw as f64 * sel).round() as usize).max(1))
+}
+
+/// Walk a plan subtree returning the first `FilterExec`'s predicate.
+fn find_filter_predicate(
+    plan: &dyn ExecutionPlan,
+) -> Option<Arc<dyn datafusion::physical_expr::PhysicalExpr>> {
+    use datafusion::physical_plan::filter::FilterExec;
+    if let Some(f) = plan.as_any().downcast_ref::<FilterExec>() {
+        return Some(f.predicate().clone());
+    }
+    for c in plan.children() {
+        if let Some(p) = find_filter_predicate(c.as_ref()) {
+            return Some(p);
+        }
+    }
+    None
+}
+
+/// Walk a plan subtree returning the first `EmatixFastParquetExec`'s
+/// `(raw_row_count, column_stats)` pair.
+fn find_emat_scan_stats(
+    plan: &dyn ExecutionPlan,
+) -> Option<(
+    usize,
+    Vec<datafusion::common::stats::ColumnStatistics>,
+)> {
+    if let Some(s) = plan.as_any().downcast_ref::<EmatixFastParquetExec>() {
+        return Some((s.num_rows(), s.column_stats().to_vec()));
+    }
+    for c in plan.children() {
+        if let Some(p) = find_emat_scan_stats(c.as_ref()) {
+            return Some(p);
+        }
+    }
+    None
+}
+
+/// Σ.AH.2 Story 1'.3 — predicate selectivity using emat column_stats.
+/// Mirrors the structure of DataFusion's selectivity calc but uses
+/// our populated `distinct_count` for string-Eq predicates instead
+/// of falling back to the 0.2 default.
+///
+/// Handled shapes:
+/// - `col = literal` → `1 / distinct_count(col)` when available
+/// - `expr AND expr` → product of children's selectivity
+/// - `expr OR expr`  → conservative max of children's selectivity
+/// - anything else   → 0.2 (same conservative default as DataFusion)
+fn estimate_filter_selectivity_via_emat_stats(
+    predicate: &Arc<dyn datafusion::physical_expr::PhysicalExpr>,
+    column_stats: &[datafusion::common::stats::ColumnStatistics],
+) -> f64 {
+    use datafusion::common::stats::Precision;
+    use datafusion::logical_expr::Operator;
+    use datafusion::physical_expr::expressions::{BinaryExpr, Literal};
+    if let Some(bin) = predicate.as_any().downcast_ref::<BinaryExpr>() {
+        match bin.op() {
+            Operator::And => {
+                let l = estimate_filter_selectivity_via_emat_stats(bin.left(), column_stats);
+                let r = estimate_filter_selectivity_via_emat_stats(bin.right(), column_stats);
+                return (l * r).clamp(0.0, 1.0);
+            }
+            Operator::Or => {
+                let l = estimate_filter_selectivity_via_emat_stats(bin.left(), column_stats);
+                let r = estimate_filter_selectivity_via_emat_stats(bin.right(), column_stats);
+                return l.max(r).clamp(0.0, 1.0);
+            }
+            Operator::Eq => {
+                if let Some(col) = bin.left().as_any().downcast_ref::<Column>() {
+                    if bin.right().as_any().downcast_ref::<Literal>().is_some() {
+                        if let Some(cs) = column_stats.get(col.index()) {
+                            let n = match cs.distinct_count {
+                                Precision::Exact(n) | Precision::Inexact(n) => n,
+                                _ => 0,
+                            };
+                            if n > 0 {
+                                return 1.0 / n as f64;
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    0.2
 }
 
 #[cfg(test)]

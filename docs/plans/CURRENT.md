@@ -285,6 +285,10 @@ Q07 already gets a CollectLeft L9 on nation→customer (memory `[[sigma-q-l13-to
 - **Σ.AH.5 functional-dep group-by simplifier** — Q10-specific, parallel track.
 - **Σ.AH.6 selectivity-gate tune** — Σ.AE.2 tuning, parallel track.
 
+## Future levers (queued, not active)
+
+- **Σ.AH.7 — `StringLike` selectivity from dict pages.** Story 1'.3's selectivity matcher handles `col = literal` (1/distinct_count) and `AND`/`OR` composition, but defaults to 0.2 for `StringLike`. **Q09's `p_name LIKE '%green%'` therefore still hits the conservative default** — `build_rows` shows 400k vs the real ~200k, fails the L9 ratio gate on lineitem 60M, no bloom fires. Q09 was an AH.2 target query so this is the gap. **Lever:** for dict-encoded columns, evaluate the LIKE predicate against the dict entries at planner time to count matching keys, then use `matches/distinct_count` as the selectivity. Cost: O(distinct_count) per LIKE predicate at plan time. Risk: low (planner-only).
+
 ---
 
 ## Cross-references
