@@ -2,9 +2,12 @@
 
 **Active plan:** [`docs/plans/CURRENT.md`](../plans/CURRENT.md) — **Σ.AH.2: L9 emitter Partitioned-mode extension**
 **Started:** 2026-05-26 (promoted from Σ.AH Phase D arc shell)
-**Active phase:** Σ.AH.2 CLOSED 2026-05-26 — net-zero 22q SF=10 wall, original hypothesis refuted.
-**What landed:** dict-page distinct_count populated as infrastructure; fused-probe path opt-in via `EMAT_L9_FUSED_PROBE=1`. See `memory:[[sigma-ah-2-arc-closed]]` for the full closure summary.
-**Next plan candidates:** Σ.AH.1 (L9 scan-level integration) and Σ.AH.3 (build-vs-probe swap) drafts remain; awaiting user direction on which to promote.
+**Active plan:** [`docs/plans/CURRENT.md`](../plans/CURRENT.md) — **Σ.AH.1: L9 scan-level integration (push bloom into BridgeFilter)**
+**Started:** 2026-05-27 (promoted from arc shell after Σ.AH.2 closure).
+**Active phase:** Story 1 — bridge plumbing (extend BridgeFilter to carry a decode-time bloom).
+**Predicted impact:** ~80 ms wall on Q17 + ~40 ms on Q18 = ~2 pp SF=10 geomean. Bloom-skip at decode time changes L9 from "save HashJoin work" to "save decode work" — directly attacking the bottleneck Σ.AH.2 surfaced.
+**Effort estimate:** 3-4 person-weeks. Risk: M-H (plan-time sync race is the hard part).
+**Branch policy:** local commits only on this plan. PR only after Story 4 wall-time gate clears.
 
 **Predicted impact:** ~150-200 ms wall across Q05/Q07/Q08/Q09 = 3-6 pp SF=10 geomean. Solo target; cascade with Σ.AH.1 adds another 2-3 pp.
 

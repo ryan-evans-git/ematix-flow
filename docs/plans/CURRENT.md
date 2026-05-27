@@ -1,81 +1,85 @@
-# Σ.AH.2 — L9 emitter Partitioned-mode extension
+# Σ.AH.1 — L9 scan-level integration (push bloom into BridgeFilter)
 
-**Status:** CLOSED 2026-05-26 — 22q SF=10 result net-zero; original 4-6 pp prediction empirically refuted.
-**Created:** 2026-05-26 (promoted from Σ.AH Phase D arc shell)
-**Active phase:** **arc closed**. See `docs/PHASE_SIGMA_AH_2_DESIGN.md` § 5e for the closure summary and `memory:[[sigma-ah-2-arc-closed]]` for the takeaway.
-**What banked (committed):** Σ.AH.4 partition-count generalization (`d3c42cb`), Story 1'.2 dict-page distinct_count (`956d65f`), Story 1'.4 Stage 1 fused-probe (`8c9a3c2`), Stage 2 SIMD-friendly probe loop (`d45e148`). All `EMAT_L9_*` flags are opt-in.
-**What didn't bank:** Story 1'.3 tight cardinality (`f30034f`) wall-negative without safety net; Stage 4 filter-once-per-RG had StringView/DictUtf8 bug; Stage 5 clustering gate had wrong-direction heuristic; Stage 6 default-on flip net-zero.
-**Branch policy:** local commits only on this plan. No PR.
-**Predecessor plan:** [`docs/plans/archive/2026-05-26-sigma-ah-survey.md`](./archive/2026-05-26-sigma-ah-survey.md) — Σ.AH survey (closed 2026-05-26 after Phase D).
-**Sibling arc shells (drafted, not active):** [Σ.AH.1](sigma-ah-arc-1.md), [Σ.AH.3](sigma-ah-arc-3.md).
+**Status:** active
+**Created:** 2026-05-27 (promoted from arc shell at [`sigma-ah-arc-1.md`](sigma-ah-arc-1.md))
+**Active phase:** Story 1 (bridge plumbing)
+**Branch policy:** local commits only on this plan. PR only after Story 4 wall-time gate clears.
+**Predecessor plan:** [`docs/plans/archive/2026-05-27-sigma-ah-2.md`](./archive/2026-05-27-sigma-ah-2.md) — Σ.AH.2 closed 2026-05-26 with net-zero 22q SF=10; banked dict-distinct + fused-probe as opt-in. See memory `[[sigma-ah-2-arc-closed]]` for the empirical findings that motivate this arc's framing.
+**Sibling arc shells (drafted, not active):** [Σ.AH.3](sigma-ah-arc-3.md).
 
 ---
 
 ## Hypothesis
 
-The current `BuildSideBloomEmitterExec` only wraps **CollectLeft** joins (small-build broadcast joins). Four queries in the 22q SF=10 suite show textbook small-build / large-probe **Partitioned-mode** Inner joins that currently miss the L9 bloom optimisation:
+The L9 build-side bloom is currently consumed at **post-decode** time — rows are decoded then dropped by the per-batch filter. Σ.AH.2 confirmed this is a wash on large probes (Q08 lineitem 60M: bloom probe + per-batch filter cost ~100 ms / partition, vs downstream HashJoin savings of ~65 ms = net +41 ms wall).
 
-| Query | Build (Partitioned) | Probe (Partitioned) | Probe/build ratio | Currently fires L9? |
-|-------|---------------------|---------------------|------------------:|---------------------|
-| Q05 | part_filt → ~100k rows | lineitem 60M | 600× | ❌ |
-| Q07 | nation+cust merge → 120k | lineitem 18M | 150× | ❌ (operator level only on nation→customer edge) |
-| Q08 | part_filt 13k | lineitem 60M | 4600× | ❌ |
-| Q09 | part_filt 108k | lineitem 60M AND partsupp 8M | 555× / 74× | ❌ (compound cascade target) |
+**Σ.AH.1 pushes the bloom into the BridgeFilter / decode loop** so rows whose join key isn't in the bloom **skip decoding entirely** — never paying the per-column read + decompress + emit cost. This changes L9's economics from "save downstream HashJoin work" to "save decode work" (the actual bottleneck for lineitem-heavy queries).
 
-All four clear the existing 1024 threshold easily but the rule's pattern-match excludes Partitioned mode. Extending the rule will unlock the bloom in these shapes.
+**Concrete payoff target**: Q17's lineitem main scan currently decodes 60M rows to emit 61k (output ratio 1:1000). At 1093 ms parallel decode, bloom-skipping 99.9% of rows should drop decode to ~50 ms parallel = **−1000 ms compute, ~−80 ms wall** at 14 partitions.
 
-**Cascade with Σ.AH.1 (L9 scan-level integration):** Σ.AH.2 alone delivers operator-level bloom filtering on these Partitioned joins. The bigger payoff comes when Σ.AH.1 also lands and the bloom filters at decode time. Q09 is the canonical cascade target — the bloom can drop partsupp 8M → ~108k pre-build, shrinking its 2-key 128 MB DRAM-bound build to ~1.7 MB L1-resident.
+## Empirical context from Σ.AH.2 arc closure
+
+The just-completed Σ.AH.2 arc surfaced four pieces of evidence that frame Σ.AH.1 differently than the original shell:
+
+1. **L9 ROI is driven by probe-decode cost** (not by `build / probe_distinct` ratio). Post-decode bloom filtering doesn't save the decode work, so L9 only pays off when downstream operations are dominant. Σ.AH.1 attacks this directly: bloom *prevents* the decode.
+
+2. **The masked-decode path is structurally net-negative on random-distribution columns.** Even Stage 1's fused-probe (which avoids the duplicate filter-column decode) still pays per-batch filter cost. Pushing bloom into the decode loop means we don't pay per-batch filter at all — the rows simply don't materialize.
+
+3. **dict-distinct infrastructure** (Story 1'.2, banked at `956d65f`) makes accurate distinct_count available for downstream selectivity. Σ.AH.1 can use it when sizing the bloom OR when deciding whether bloom-pushdown is worth it.
+
+4. **The Stage 4 filter-once-per-RG attempt had a StringView/DictUtf8 conversion bug.** That bug is *upstream* of where Σ.AH.1 operates (Σ.AH.1 doesn't try to convert decoded columns — it short-circuits before decoding). So the failure mode is different and arguably simpler.
 
 ## Impact estimate
 
 | Source | Wall savings | Confidence |
-|--------|-------------:|:----------:|
-| Q05 part_filt → lineitem | ~30 ms | medium |
-| Q07 expanded chain | ~20 ms | low (Q07 already at-floor; partial cascade) |
-| Q08 part_filt → lineitem | ~50-80 ms | medium |
-| Q09 part_filt → lineitem AND partsupp | ~50 ms (without AH.1) / ~80 ms (with AH.1 cascade) | medium |
-| **Solo total** | **~150-180 ms wall** | medium |
-| **With Σ.AH.1 cascade** | **~200 ms wall** | medium |
+|---|---:|:----:|
+| Q17 main lineitem scan (decode-skip 99.9% of rows) | ~80 ms | medium-high (well-characterized in PERF_Q17.md) |
+| Q18 lineitem scan via orders→lineitem bloom | ~40 ms | medium |
+| **Solo direct total** | **~120 ms wall** | medium |
+| Cascade with Σ.AH.2 unlocking (Q05/Q07/Q08/Q09) | +~130 ms | low (requires Σ.AH.2 to bank perf gains, which it didn't) |
 
-**Geomean target: ≥ −3 pp at 22q SF=10** (Σ.AH.2 alone), additional −2-3 pp when Σ.AH.1 lands too.
+**Geomean target: ≥ −2 pp at 22q SF=10** (Σ.AH.1 solo). The cascade prediction is now lower-confidence given Σ.AH.2's net-zero result — many of the cascade fires Σ.AH.2 attempted to unlock either weren't bottlenecks or had per-batch filter overhead that Σ.AH.1's decode-skip would similarly need to bypass.
 
 ## Effort estimate
 
-**2-3 person-weeks.** Most of the new code is the partition-aware bloom merge (Story 1). The rule extension (Story 2) is small. The bench gate + soak (Stories 3-5) takes the bulk of calendar time.
+**3-4 person-weeks.** The decode-time bloom probe is non-trivial; the plan-time synchronisation between build-side completion and probe-side scan startup is the hard part.
 
 ## Risk level
 
-**Medium.** Mechanism mirrors existing CollectLeft path so kernel risk is low. Main risks are (1) partition-aware merge serialisation (could backfire like Σ.Q.L13's parallel-bitmap dispatch did — memory `[[sigma-q-l13-landed]]`) and (2) accidentally regressing Q07's existing CollectLeft nation→customer L9 fire.
+**M-H.** Three concrete risks (highest-first):
+
+1. **Plan-time sync race.** If the bloom isn't ready when the probe-side scan starts, the scan either blocks (kills parallelism) or misses the bloom-skip on early RGs (degrades to current behaviour). The Σ.Q.L16 deferred-peek fix (`[[sigma-q-l13-to-l16-session]]`) addressed a similar problem at the post-decode level — Σ.AH.1 needs the same shape but at decode-time.
+2. **Kernel-bench-doesn't-predict-wall-time.** Per `[[sigma-r2-rejected]]` and the Σ.AH.2 arc-closure finding. Story 3 wall-time gate is the real bar.
+3. **Σ.AE.2 selectivity-gate interaction.** Both decode-time bloom and the selectivity gate consume the row stream. Composition order matters — bloom should apply first (drops rows pre-decode) before any post-decode bitmap operation.
 
 ---
 
 ## Bench gate (ship-if / reject-if)
 
-### Microbench (Story 1 gate)
+### Microbench (Story 2 gate)
 
-**Kernel:** partition-aware bloom merge — combining N partial blooms from N hash partitions into one shared bloom.
+**Kernel:** in-scan bloom probe (probe i64 key during decode) measured against the existing `bloom.rs::might_contain_i64` hot path.
 
-**Threshold:** ≤ 1 ms wall to merge 14 × 100k-row partials. **Reject if > 5 ms.** Per `[[optimizer-codegen-sensitivity]]` precedent — kernel ops on the critical path of every join must be sub-ms.
+**Threshold:** in-scan bloom probe ≤ **1.5× the cost of the per-row standalone bloom probe** (~1.4 ns/probe per `[[sigma-s-a]]`). I.e., ≤ 2.1 ns/value in the in-scan position. Reject if > 2.5 ns/value.
 
-### Wall-time (Story 3 gate)
+### Wall-time (Story 4 gate)
 
 **Required (all must pass):**
-- Q08 SF=10 wall drop ≥ **30 ms** (189 → ≤ 159 ms)
-- Q09 SF=10 wall drop ≥ **50 ms** (273 → ≤ 223 ms)
-- 22q SF=10 geomean improves ≥ **3 pp**
+- Q17 SF=10 wall drop ≥ **60 ms** (266 → ≤ 206 ms in the current baseline from Stage 6 22q sweep)
+- 22q SF=10 geomean improves ≥ **2 pp**
 - No single query regresses > **5%** (per Σ.O.c.2 noise band audit)
 
 **Bonus:**
-- Q05 SF=10 wall drop ≥ 30 ms (186 → ≤ 156 ms)
+- Q18 SF=10 wall drop ≥ 30 ms (355 → ≤ 325 ms current baseline)
 
 ### Reject-if (any of the following)
 
-- Microbench bloom merge > 5 ms wall (Story 1 gate)
-- Any query regresses > 5% on canonical 20-trial bench
-- Q07's existing CollectLeft nation→customer L9 pass-rate degrades (regression check, not just wall)
-- Partition-aware merge introduces a sync barrier that serialises 14-partition probe-side scans (same pattern as Σ.Q.L13 backfire)
+- Microbench bloom probe > 2.5 ns/value (Story 2 gate)
+- Any query regresses > 5% on canonical 5-trial bench
+- Plan-time sync cost > 2 ms wall (build-side hash must complete before probe-side scan; if the sync barrier serialises Partitioned-mode joins, the parallelism gain is lost)
+- **Q07 ≤ 175 ms must hold** (nation-chain L9 win must not regress — Σ.AH.2 stress-tested this constraint and we should keep it)
 
-Per `[[sigma-r2-rejected]]` precedent: **microbench pass + wall-time fail = reject.** No exceptions.
+Per `[[sigma-r2-rejected]]` and `[[sigma-ah-2-arc-closed]]` precedent: **microbench pass + wall-time fail = reject.**
 
 ---
 
@@ -83,168 +87,135 @@ Per `[[sigma-r2-rejected]]` precedent: **microbench pass + wall-time fail = reje
 
 1. **Local commits only.** No PRs until Story 4 wall-time gate clears.
 2. **No new PhysicalOptimizerRule** (`[[optimizer-codegen-sensitivity]]`) — extend `EnableRuntimeBloomSidebandRule`.
-3. **TDD** per `[[feedback-tdd]]` — bloom-merge correctness tests precede the merge implementation.
-4. **No TPC-H-specific hardcoding** per `[[feedback-no-tpch-hardcoding]]` — the rule fires on any small-build Partitioned Inner-equijoin.
-5. **Bench-gate every story exit.** Microbench at Story 1; wall-time at Story 3; soak at Story 5.
+3. **TDD** per `[[feedback-tdd]]` — decode-time bloom-skip correctness tests precede the kernel work.
+4. **No TPC-H-specific hardcoding** per `[[feedback-no-tpch-hardcoding]]` — must work on any small-build / large-probe Inner-equijoin.
+5. **Bench-gate every story exit.** Microbench at Story 2; wall-time at Story 4; soak at Story 5.
 
 ---
 
-## Pre-work — Σ.AH.4 chore (partition-count generalization, code-only)
+## Story skeleton
 
-**Status:** DONE 2026-05-26 (code-only — original data-prep scope deferred to preserve captured baseline).
-**Effort:** ~30 minutes actual.
-**Expected impact:** **zero measurable wall change on the canonical M3 Pro box** — `available_parallelism()` returns the same 14 as the previous hardcode. Pure portability/maintenance commit.
-**Risk:** none.
+### Story 1 — bridge plumbing [ACTIVE]
 
-**Scope change (2026-05-26):** the original chore re-emitted `customer.parquet` from 2 RGs → N RGs to lift partition-count-aware parallelism. While probing this, we observed the data-prep would invalidate every wall-time number measured across Phase A-D (all 22 PERF_Q\*.md docs reference the original Snappy/2-RG customer.parquet). Decision: **revert the parquet file to its pristine state**; keep only the code-level partition-count generalization, which has no perf impact on the bench box but lifts a portability constraint.
+**Time budget:** 3-5 days.
 
-### Tasks (revised)
-
-- [x] Inspect current `examples/tpch/data/sf10/customer.parquet` row-group layout (2 RGs, 1048576 + 451424, parquet-rs 58.1.0, Snappy). Confirmed via pyarrow.
-- [x] **Reverted** any re-emit; restored from `customer.parquet.bak` to keep baseline measurement valid.
-- [x] Drop hardcoded `target_partitions(14)` from `tpch_validate.rs` (was the only example with no env override). Replace with `PARTITIONS` env override + `std::thread::available_parallelism()` default.
-- [x] Change `tpch_triangulation_bench.rs` and `stage_profiler.rs` defaults from `14` to `available_parallelism()` (env override unchanged).
-- [x] Update stale "`target_partitions=14`" string in bench's results-doc footer.
-- [x] Smoke test: `tpch_validate` SF=10 passes byte-identical against the untouched baseline data.
-- [x] Commit (this commit).
-
-**Exit criteria:** all 22 SF=10 queries pass `tpch_validate` row-by-row + value-by-value (no perf gate — there's no data change to measure).
-
-**Then:** Story 1 (partition-aware bloom merge).
-
----
-
-## Story 1 — partition-aware bloom merge [PENDING pre-work]
-
-**Status:** `[ ]` (gated on pre-work)
-**Time budget:** 3-4 days.
-
-**Goal:** when a Partitioned-mode build runs across N (= 14) hash partitions, each partition independently inserts into a partial bloom; the emitter merges all 14 partials into a single shared `BloomFilter` before any probe-side scan can consume it.
-
-**Open design question (decide in Story 1):** **synchronous merge at end-of-build** vs **lock-free union as builds complete**. Synchronous is simpler but introduces a sync barrier (same pattern as Σ.Q.L13 backfire). Lock-free is safer for parallelism but harder to write correctly. **Default: lock-free with bitwise-OR per 64-bit word**, since `BloomFilter` is `split-block` and per-block bitwise-OR is correct without locks.
+**Goal:** extend `BridgeFilter` to accept an `Arc<BloomFilter>` for one of its columns. At decode time, for each emitted row, check bloom; drop row if absent. Correctness tests: bloom-included-set matches probe output for every row.
 
 ### Tasks
 
-- [ ] **Story 1.0 — design doc.** Pick sync vs lock-free merge. Document the choice in `docs/PHASE_SIGMA_AH_2_DESIGN.md` (1-2 pages). Include correctness proof: `BloomFilter::union(a, b) == BloomFilter::insert_all(a.items ∪ b.items)`.
-- [ ] **Story 1.1 — `BloomFilter::union` kernel + correctness tests.** Add a `pub fn union(&self, other: &BloomFilter) -> BloomFilter` (or in-place `merge_into`) to `bloom.rs`. Property-based test: insert random items into A, B; verify `union(A, B).contains(x) == (A.contains(x) || B.contains(x))` for all `x` (true positives) AND FPR ≤ 2× single-bloom FPR.
-- [ ] **Story 1.2 — microbench: merge cost on 14 × 100k-item partials.** Add `bench_bloom_merge` example. Microbench threshold: ≤ 1 ms wall to merge 14 partials of 100k items each (10 bits/key sizing).
-- [ ] **Story 1.3 — partition-aware emitter.** Extend `BuildSideBloomEmitterExec` to accept a `Vec<Arc<Mutex<BloomFilter>>>` (one per partition) instead of a single `Arc<RuntimeBloomSideband>`. On partition close, the partition's bloom is union-merged into the shared sideband. Add a `pending_partitions: AtomicUsize` counter; consumers poll until it hits 0 OR consume incrementally if lock-free.
-- [ ] **Story 1.4 — re-test existing CollectLeft path.** The CollectLeft path uses N=1, so the partition-aware emitter must reduce to the single-partition case without overhead. Add a test that exercises this regression case.
+- [ ] **Story 1.1 — design doc.** Document the bloom-in-BridgeFilter wire-up: where the bloom lives (BridgeFilter field vs separate sideband stash), how it composes with existing predicates (And-with-decode-mask), how the decode loop probes. 1-2 page doc at `docs/PHASE_SIGMA_AH_1_DESIGN.md`. Include the answer to: does the bloom apply BEFORE or AFTER the existing bitmap-from-other-predicates? (Probably AFTER — bloom is per-row, other preds may have been page-skipped already.)
+- [ ] **Story 1.2 — extend `ColumnPredicate::I64InBloom` to be evaluable at decode time.** Today it's evaluated via `BridgeFilter::build_bitmap` (post-decode). Add a per-row probe path inside the i64 column decode loop: when decoding a value, immediately check the bloom; if miss, set the bitmap-bit to 0 (skip downstream).
+- [ ] **Story 1.3 — kernel test.** Build a small parquet with 1M i64 values, bloom containing 1k of them. Verify the decode-time-probe path emits exactly 1k rows with values matching the bloom-included set.
+- [ ] **Story 1.4 — 22q `tpch_validate` smoke test.** With the path active (env-gated), all 22 queries must produce byte-identical results to DuckDB.
 
 **Exit criteria:**
-- [ ] `BloomFilter::union` ships with correctness tests; FPR audit confirms ≤ 2× single-bloom.
-- [ ] Microbench `bench_bloom_merge` shows ≤ 1 ms wall on 14 × 100k.
-- [ ] Existing CollectLeft L9 unit tests still pass byte-identically.
-- [ ] Design doc captures the sync-vs-lock-free decision + rationale.
+- [ ] `ColumnPredicate::I64InBloom` evaluable at decode time
+- [ ] Kernel correctness test passes
+- [ ] 22q `tpch_validate` byte-identical
 
-**Next:** Story 2 (rule extension).
+**Next:** Story 2 (kernel optimisation pass + microbench gate).
 
 ---
 
-## Story 2 — rule extension to Partitioned-mode [PENDING Story 1]
+### Story 2 — kernel optimisation pass + microbench gate [PENDING Story 1]
 
-**Status:** `[ ]`
 **Time budget:** 2-3 days.
 
-**Goal:** `EnableRuntimeBloomSidebandRule` currently fires on `HashJoinExec(mode = CollectLeft)`. Extend the pattern to also fire on `HashJoinExec(mode = Partitioned)` when `probe_rows / build_rows ≥ ratio` (using `EMAT_RT_BLOOM_RATIO` env, default 1024 — same threshold as CollectLeft).
+**Goal:** SIMD-friendly bloom probe in the decode loop. Microbench against the existing post-decode bloom probe; gate per criteria above.
 
 ### Tasks
 
-- [ ] **Story 2.1 — pattern match + cardinality estimate.** Extend the rule's `optimize` walk to recognise Partitioned-mode joins. Use `partition_statistics` from `EmatixFastParquetTableProvider` (memory `[[sigma-ae-complete]]`) for post-filter row counts.
-- [ ] **Story 2.2 — wire the partition-aware emitter from Story 1.3.** For each qualifying Partitioned join, wrap the build with the partition-aware `BuildSideBloomEmitterExec`. Target the probe-side scan via the same `RuntimeBloomSideband` mechanism.
-- [ ] **Story 2.3 — guard against regression on existing CollectLeft fires.** Q07's nation → customer L9 must continue firing identically. Add a non-regression test that verifies the same plan is produced for Q07's nation join post-rule-extension.
-- [ ] **Story 2.4 — opt-in flag wiring.** Land behind `EMAT_L9_PARTITIONED=1`. Default OFF until Story 3 wall-time gate clears.
+- [ ] **Story 2.1 — microbench harness.** Compare per-row decode-time bloom probe vs the existing post-decode probe. Same i64 column, same bloom, same selectivity. Measure ns/value.
+- [ ] **Story 2.2 — splash-bloom layout in the decode loop.** Reuse Σ.S.A's data-parallel probe (per-lane salt). Ensure LLVM vectorises the per-row probe inside the decode hot path.
+- [ ] **Story 2.3 — chunk-of-8 byte-packing.** Reuse Σ.AH.2 Story 1'.4 Stage 2's chunk-of-8 byte-packing pattern for the bitmap construction in the decode loop.
 
 **Exit criteria:**
-- [ ] Q05/Q07/Q08/Q09 plan dumps show `BuildSideBloomEmitterExec` on the Partitioned join edges (verified via plan-explain text comparison).
-- [ ] Q01-Q22 row counts byte-identical to pre-rule baseline (correctness suite).
-- [ ] CollectLeft fires unchanged.
+- [ ] Microbench shows ≤ 2.1 ns/value in the in-scan position
+- [ ] Microbench reject threshold (> 2.5 ns/value) not hit
 
-**Next:** Story 3 (wall-time bench gate).
+**Next:** Story 3 (scan-side bloom hand-off).
 
 ---
 
-## Story 3 — wall-time bench gate [PENDING Story 2]
+### Story 3 — scan-side bloom hand-off [PENDING Story 2]
 
-**Status:** `[ ]`
-**Time budget:** 1 day (bench + analysis).
+**Time budget:** 4-5 days.
+
+**Goal:** the sync mechanism. The scan thread needs to know when the bloom is ready. Two options per the arc shell:
+- (a) Bloom is `Option<Arc<...>>` and checked per-batch; consume only after non-None (no sync barrier, but early RGs miss the bloom). **Preferred.**
+- (b) The scan blocks on a one-shot at startup (kills parallelism).
 
 ### Tasks
 
-- [ ] Run `tpch_triangulation_bench` SF=10 with `EMAT_L9_PARTITIONED=1` set, 20 trials × 3 warmups (canonical config). Compare against the post-Σ.AH.4 baseline.
-- [ ] Verify gates per the Bench gate section above: Q08 ≥ 30 ms drop, Q09 ≥ 50 ms drop, geomean ≥ 3 pp, no query > 5% regression.
-- [ ] Run with `EMAT_L9_PARTITIONED=0` immediately after for A/B; confirm baseline unchanged.
-- [ ] If Story 3 fails: per `[[sigma-r2-rejected]]` precedent, REJECT and capture findings in a memory entry. Do NOT proceed to Story 4.
+- [ ] **Story 3.1 — extend `EmatixFastParquetExec` to consult the runtime sideband AT DECODE TIME.** Existing flow: sideband peeked at the start of `execute()`, BridgeFilter assembled, then scan runs. New flow: sideband re-checked per RG (or per batch) — when the bloom appears, future RGs apply it.
+- [ ] **Story 3.2 — quantify the "first-RG-misses-bloom" cost.** How many RGs typically run before the bloom is published? With the Σ.Q.L16 peek-wait (200 ms timeout), the bloom should arrive within ~6 ms for small builds (Q17 part_filt 2k rows). For large builds it might take 50-100 ms. Measure on Q17.
+- [ ] **Story 3.3 — fallback when the bloom never arrives (timeout).** Same as today: scan proceeds without bloom.
 
 **Exit criteria:**
-- [ ] Bench gate clears OR a clean rejection memory is filed.
+- [ ] Q17 trace shows ≥ 90% of RGs decode WITH the bloom applied
+- [ ] No sync barrier (`std::thread` blocking) introduced in the hot path
 
-**Next:** Story 4 (cascade verification with AH.1 if it's live, else skip to Story 5).
+**Next:** Story 4 (rule extension + wall-time bench gate).
 
 ---
 
-## Story 4 — cascade verification with Σ.AH.1 [PENDING Story 3]
+### Story 4 — rule extension + wall-time bench gate [PENDING Story 3]
 
-**Status:** `[ ]` (conditional on Σ.AH.1 being live; skip if not)
-**Time budget:** 0.5 day.
+**Time budget:** 1 day.
 
-**Goal:** if Σ.AH.1 (L9 scan-level integration) is also live by the time Story 3 lands, verify the cascade: Q09's partsupp 2-key build should drop from 128 MB DRAM-bound to ~1.7 MB L1-resident.
+**Goal:** Update `EnableRuntimeBloomSidebandRule` to additionally point the bloom at the probe-side scan, not just the operator. Run the 22q SF=10 bench.
 
 ### Tasks
 
-- [ ] Stage profile Q09 with both `EMAT_L9_PARTITIONED=1` AND Σ.AH.1's flag (whatever it ends up being).
-- [ ] Verify partsupp 2-key join build size measured via `stage_profiler` output drops to ≤ 5 MB.
-- [ ] Verify Q09 wall drops ≥ 80 ms (vs the solo Σ.AH.2 number from Story 3).
-- [ ] Document the cascade impact in `docs/PERF_REVIEW_2026_05.md` (append a "Cascade results" section).
+- [ ] **Story 4.1 — pass-through wiring.** The rule already establishes the (build_emitter, sideband, probe_scan) chain. Extend the scan-side write to include the BloomFilter Arc (Story 1 added the BridgeFilter field; Story 3 added the runtime hand-off).
+- [ ] **Story 4.2 — 22q SF=10 A/B.** EMAT_L9_BRIDGE_PUSH=1 vs default. 5 trials × 2 modes.
+- [ ] **Story 4.3 — Q17 + Q18 single-query gate.** Q17 wall drop ≥ 60 ms; Q18 ≥ 30 ms bonus.
+- [ ] **Story 4.4 — regression sweep.** No query > 5% slower than baseline. Q07 ≤ 175 ms (existing nation-chain win).
 
 **Exit criteria:**
-- [ ] Cascade impact measured and documented OR explicit "AH.1 not yet live, Story 4 skipped" note.
+- [ ] All gates above clear
+- [ ] If gates fail: REJECT per `[[sigma-r2-rejected]]` precedent; capture finding in memory
 
-**Next:** Story 5 (default-on flip).
+**Next:** Story 5 (soak + default-on flip).
 
 ---
 
-## Story 5 — soak + default-on flip [PENDING Story 3 (or 4)]
+### Story 5 — soak + default-on flip [PENDING Story 4]
 
-**Status:** `[ ]`
 **Time budget:** 24-hour soak + 1 day to ship the flip.
 
 ### Tasks
 
-- [ ] Run 3 back-to-back full bench runs across 24 hours to confirm no drift. Per `[[sigma-q-l13-to-l16-session]]` precedent — multi-run stability is the bar for default-on.
-- [ ] Update `tpch_triangulation_bench.rs` to flip the default for `EMAT_L9_PARTITIONED` from OFF → ON (env becomes opt-OUT via `=0`).
-- [ ] Update `feedback_full_bench_env_checklist.md` memory entry to reflect the new default.
-- [ ] Update `BENCHMARKS.md` with the new numbers.
-- [ ] Final commit + tag the new milestone bench result.
+- [ ] Run 3 back-to-back 22q SF=10 benches across 24 hours.
+- [ ] If stable, flip `EMAT_L9_BRIDGE_PUSH` default OFF → ON.
+- [ ] Update memory + BENCHMARKS.md.
+- [ ] Final commit + tag.
 
 **Exit criteria:**
-- [ ] Σ.AH.2 default-ON.
-- [ ] Updated memory + BENCHMARKS.md.
-- [ ] Σ.AH.2 plan ready to archive; promote next arc (likely Σ.AH.1) to CURRENT.md.
+- [ ] Σ.AH.1 default-ON.
+- [ ] BENCHMARKS.md updated.
+- [ ] Σ.AH.1 plan ready to archive; promote next arc (Σ.AH.3) to CURRENT.md.
 
 ---
 
 ## Bench environment SOP
 
-Per `feedback_full_bench_env_checklist.md` (post-Σ.AG.7 defaults are sufficient — no env vars needed for the milestone baseline). For Σ.AH.2 A/B specifically:
+Per `[[feedback-full-bench-env-checklist]]`. Σ.AH.1-specific A/B:
 
 ```bash
 cargo build --release -p ematix-flow-core --example tpch_triangulation_bench --features triangulation
 cargo build --release -p ematix-flow-core --example stage_profiler
 
-# A/B for Story 3 wall-time gate
-TPCH_DATA_DIR=examples/tpch/data/sf10 \
-TPCH_TRIALS=20 TPCH_WARMUPS=3 \
-TPCH_SKIP_POLARS=1 \
-TPCH_OUT=/tmp/bench-2026-XX-XX/sf10-baseline.md \
-./target/release/examples/tpch_triangulation_bench
+# A/B for Story 4 wall-time gate
+TPCH_DATA_DIR=examples/tpch/data/sf10 TPCH_TRIALS=5 TPCH_WARMUPS=2 \
+  TPCH_SKIP_POLARS=1 TPCH_SKIP_DUCKDB=1 \
+  TPCH_OUT=/tmp/bench-XX-XX/sf10-baseline.md \
+  ./target/release/examples/tpch_triangulation_bench
 
-EMAT_L9_PARTITIONED=1 \
-TPCH_DATA_DIR=examples/tpch/data/sf10 \
-TPCH_TRIALS=20 TPCH_WARMUPS=3 \
-TPCH_SKIP_POLARS=1 \
-TPCH_OUT=/tmp/bench-2026-XX-XX/sf10-l9part.md \
-./target/release/examples/tpch_triangulation_bench
+EMAT_L9_BRIDGE_PUSH=1 TPCH_DATA_DIR=examples/tpch/data/sf10 TPCH_TRIALS=5 TPCH_WARMUPS=2 \
+  TPCH_SKIP_POLARS=1 TPCH_SKIP_DUCKDB=1 \
+  TPCH_OUT=/tmp/bench-XX-XX/sf10-bridge-push.md \
+  ./target/release/examples/tpch_triangulation_bench
 ```
 
 Canonical hardware: Apple M3 Pro, 14 cores. Don't switch mid-arc.
@@ -253,17 +224,21 @@ Canonical hardware: Apple M3 Pro, 14 cores. Don't switch mid-arc.
 
 ## Open questions
 
-### OQ-AH.2-A: bloom merge sync vs lock-free?
+### OQ-AH.1-A: bloom-in-BridgeFilter vs separate field?
 
-**Default: lock-free with per-block bitwise-OR.** Decide at Story 1.0. If lock-free turns out subtler than expected, fall back to synchronous merge at end-of-build and add the sync-barrier cost to the Story 1 microbench gate (must still be ≤ 1 ms wall).
+**Default: a new `BridgeFilter` field, `Option<(usize, Arc<BloomFilter>)>` = (file_col_idx, bloom).** This co-locates the bloom with the existing predicate state. Decode-time: when probing the target column's value, check the bloom and set the bitmap bit. Decided at Story 1.1.
 
-### OQ-AH.2-B: should AH.1 land first?
+### OQ-AH.1-B: per-batch sideband poll vs per-RG?
 
-The cascade (Story 4) requires AH.1. **Default: AH.2 first per the Phase C sequencing recommendation** — AH.2 is lower risk, the solo impact is already material, and AH.1's mechanism is harder. AH.1 picks up the cascade benefit once AH.2 is live.
+**Default: per-RG.** Less overhead than per-batch (RGs are 50k-1M rows, batches are 8k-65k). The bloom-pubsub latency is on the order of ms; checking at RG boundaries amortises better. Decided at Story 3.
 
-### OQ-AH.2-C: what if Q07's existing nation→customer L9 fires differently post-rule-extension?
+### OQ-AH.1-C: how does this compose with Σ.AE.2's selectivity gate?
 
-Q07 already gets a CollectLeft L9 on nation→customer (memory `[[sigma-q-l13-to-l16-session]]`). The rule extension to Partitioned could inadvertently re-route Q07's bloom. **Default: Story 2.3 explicitly tests Q07's plan stability before allowing any Partitioned-fire on Q07.**
+**Default: bloom applies first.** The selectivity-gate computes `popcount * 3 > total → fall back to dense decode`. If the bloom drops 99% of rows pre-decode, the post-bloom bitmap has ~1% popcount, so the gate correctly stays on the masked path. Verify in Story 1.3.
+
+### OQ-AH.1-D: should Σ.AH.1 default-on imply EMAT_L9_FUSED_PROBE default-on?
+
+The fused-probe (Σ.AH.2 banked) was opt-in because 22q net-zero. If Σ.AH.1 makes L9 firings strictly faster, the fused-probe path also becomes strictly faster (since it's only routing). Consider flipping fused-probe default-on at Story 5 if Σ.AH.1's bench gate clears.
 
 ---
 
@@ -271,34 +246,31 @@ Q07 already gets a CollectLeft L9 on nation→customer (memory `[[sigma-q-l13-to
 
 | Risk | Mitigation |
 |---|---|
-| **Partition-aware merge serialises (Σ.Q.L13 backfire pattern).** | Default lock-free; if forced synchronous, microbench gate ≤ 1 ms wall. |
-| **Q07 existing CollectLeft L9 regresses from rule expansion.** | Story 2.3 non-regression test. |
-| **Codegen-tax even from rule extension.** | Watch baseline geomean during Story 2; bloom-not-firing case must not regress. |
-| **Compound cascade with Σ.AH.1 doesn't materialise as predicted.** | Story 4 explicitly verifies the partsupp build-size drop; if it doesn't show, AH.1's predicted cascade is questioned. |
-| **Q09 partsupp build is 2-key composite — bloom on a single key may not narrow as expected.** | Build the bloom on the larger-cardinality key (ps_partkey); audit selectivity before declaring success. |
+| **Plan-time sync race** (highest risk). | Per-RG poll, no blocking. First-RG-misses-bloom cost quantified in Story 3.2. |
+| **Microbench-doesn't-predict-wall** (`[[sigma-r2-rejected]]`). | Story 2 gates microbench; Story 4 gates wall-time; both must pass. |
+| **Σ.AE.2 selectivity-gate interaction.** | Story 1.1 design doc specifies the composition order. Story 1.4 validates 22q correctness. |
+| **L9 ROI failed to materialize in Σ.AH.2.** | The mechanism is different (skip decode vs filter after decode). Q17's lineitem scan is the canonical "decode is the bottleneck" case — exactly what Σ.AH.1 attacks. |
+| **First-RG-misses-bloom degrades Q17 win.** | Story 3.2 measures. If > 20% of RGs miss the bloom, Q17 saving drops from 80 ms to ~64 ms — still above the 60 ms gate. |
 
 ---
 
 ## Out of scope
 
-- **Σ.AH.1 implementation** — separate arc, draft at [`docs/plans/sigma-ah-arc-1.md`](sigma-ah-arc-1.md).
 - **Σ.AH.3 build-vs-probe side-swap** — separate arc, draft at [`docs/plans/sigma-ah-arc-3.md`](sigma-ah-arc-3.md).
 - **Σ.AH.5 functional-dep group-by simplifier** — Q10-specific, parallel track.
 - **Σ.AH.6 selectivity-gate tune** — Σ.AE.2 tuning, parallel track.
-
-## Future levers (queued, not active)
-
-- **Σ.AH.7 — `StringLike` selectivity from dict pages.** Story 1'.3's selectivity matcher handles `col = literal` (1/distinct_count) and `AND`/`OR` composition, but defaults to 0.2 for `StringLike`. **Q09's `p_name LIKE '%green%'` therefore still hits the conservative default** — `build_rows` shows 400k vs the real ~200k, fails the L9 ratio gate on lineitem 60M, no bloom fires. Q09 was an AH.2 target query so this is the gap. **Lever:** for dict-encoded columns, evaluate the LIKE predicate against the dict entries at planner time to count matching keys, then use `matches/distinct_count` as the selectivity. Cost: O(distinct_count) per LIKE predicate at plan time. Risk: low (planner-only).
+- **Σ.AH.7 StringLike selectivity from dict-page entries** — queued per Σ.AH.2 closure for Q09 enablement.
 
 ---
 
 ## Cross-references
 
-- Phase C synthesis: [`docs/PERF_REVIEW_2026_05.md`](../PERF_REVIEW_2026_05.md)
-- Arc shell (parent): this file expands [`docs/plans/sigma-ah-arc-2.md`](sigma-ah-arc-2.md)
-- Per-query evidence: [Q05](../PERF_Q05.md), [Q07](../PERF_Q07.md), [Q08](../PERF_Q08.md), [Q09](../PERF_Q09.md)
-- Existing CollectLeft L9: memory `[[sigma-q-l9-landed]]`
-- L9 timing/firing fixes: memory `[[sigma-q-l13-to-l16-session]]`
-- Partition-aware merge risk precedent: memory `[[sigma-q-l13-landed]]` (parallel-bitmap dispatch 43× regression)
+- Empirical context: [`docs/PHASE_SIGMA_AH_2_DESIGN.md`](../PHASE_SIGMA_AH_2_DESIGN.md) § 5e arc closure
+- Arc shell (parent): this file expands [`docs/plans/sigma-ah-arc-1.md`](sigma-ah-arc-1.md)
+- Per-query evidence: [Q17](../PERF_Q17.md), [Q18](../PERF_Q18.md)
+- Existing operator-level L9: memory `[[sigma-q-l9-landed]]`, `[[sigma-q-l13-to-l16-session]]`
+- Σ.AH.2 arc closure: memory `[[sigma-ah-2-arc-closed]]`
+- Plan cache + safe-reuse: memory `[[sigma-ag-complete]]`
+- Σ.AE.2 selectivity gate: memory `[[sigma-ae-complete]]`
 - Bench env: memory `[[feedback-full-bench-env-checklist]]`
-- Tooling: [stage_profiler.rs](../../crates/ematix-flow-core/examples/stage_profiler.rs), [tpch_triangulation_bench.rs](../../crates/ematix-flow-core/examples/tpch_triangulation_bench.rs), [bloom.rs](../../crates/ematix-flow-core/src/bloom.rs), [BuildSideBloomEmitterExec](../../crates/ematix-flow-core/src/build_side_bloom_emitter_exec.rs)
+- Tooling: [stage_profiler.rs](../../crates/ematix-flow-core/examples/stage_profiler.rs), [tpch_triangulation_bench.rs](../../crates/ematix-flow-core/examples/tpch_triangulation_bench.rs), [bloom.rs](../../crates/ematix-flow-core/src/bloom.rs), [ematix_fast_parquet.rs](../../crates/ematix-flow-core/src/ematix_fast_parquet.rs)
