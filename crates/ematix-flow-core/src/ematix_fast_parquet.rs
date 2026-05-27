@@ -256,6 +256,37 @@ impl BridgeFilter {
         }
         let total = values.len();
         let mut bitmap = vec![0u8; total.div_ceil(8)];
+
+        // Σ.AH.2 Story 1'.4 Stage 2 — chunk-of-8 byte-packing inner
+        // loop for the single-predicate fast path. Processes 8 i64
+        // values per iteration, builds one bitmap byte at a time.
+        // LLVM unrolls the inner per-lane chain and vectorises the
+        // bloom probe across lanes (per Σ.S.A's splash layout, which
+        // exposes the data-parallel probe). Faster than the scalar
+        // `for (row, &v)` loop because bit-set's
+        // read-modify-write pattern (`bitmap[row>>3] |= 1<<(row&7)`)
+        // serialised the inner loop through the bitmap array.
+        if self.predicates.len() == 1 {
+            match &self.predicates[0] {
+                ColumnPredicate::I64InBloom { bloom, .. } => {
+                    probe_chunks_into_bitmap(values, &mut bitmap, |v| bloom.might_contain_i64(v));
+                    return Some((first_col, bitmap));
+                }
+                ColumnPredicate::I64InSet { set, .. } => {
+                    probe_chunks_into_bitmap(values, &mut bitmap, |v| set.contains(v));
+                    return Some((first_col, bitmap));
+                }
+                ColumnPredicate::I64Range { lo, hi, .. } => {
+                    let (lo, hi) = (*lo, *hi);
+                    probe_chunks_into_bitmap(values, &mut bitmap, |v| v >= lo && v <= hi);
+                    return Some((first_col, bitmap));
+                }
+                _ => {}
+            }
+        }
+
+        // Multi-predicate AND path (slower; rarely fires in practice
+        // since the L9 emitter usually injects just one predicate).
         for (row, &v) in values.iter().enumerate() {
             let pass = self.predicates.iter().all(|p| match p {
                 ColumnPredicate::I64InBloom { bloom, .. } => bloom.might_contain_i64(v),
@@ -268,6 +299,56 @@ impl BridgeFilter {
             }
         }
         Some((first_col, bitmap))
+    }
+}
+
+/// Σ.AH.2 Story 1'.4 Stage 2 — process 8 i64 values per loop
+/// iteration, packing the per-value boolean result into one bitmap
+/// byte. Avoids the read-modify-write bitmap pattern of the scalar
+/// `for (row, &v)` loop, which serialised the inner loop through
+/// `bitmap[row>>3] |= 1<<(row&7)`. The 8-lane unroll lets LLVM
+/// vectorise the predicate evaluation across lanes.
+#[inline(always)]
+fn probe_chunks_into_bitmap(values: &[i64], bitmap: &mut [u8], probe: impl Fn(i64) -> bool) {
+    let chunks = values.chunks_exact(8);
+    let rem = chunks.remainder();
+    let n_chunks = values.len() / 8;
+    for (chunk_idx, chunk) in chunks.enumerate() {
+        let mut byte = 0u8;
+        // Explicit unroll — LLVM auto-unrolls anyway but spelling it
+        // out makes the bit-position constants obvious to the
+        // optimizer.
+        if probe(chunk[0]) {
+            byte |= 1 << 0;
+        }
+        if probe(chunk[1]) {
+            byte |= 1 << 1;
+        }
+        if probe(chunk[2]) {
+            byte |= 1 << 2;
+        }
+        if probe(chunk[3]) {
+            byte |= 1 << 3;
+        }
+        if probe(chunk[4]) {
+            byte |= 1 << 4;
+        }
+        if probe(chunk[5]) {
+            byte |= 1 << 5;
+        }
+        if probe(chunk[6]) {
+            byte |= 1 << 6;
+        }
+        if probe(chunk[7]) {
+            byte |= 1 << 7;
+        }
+        bitmap[chunk_idx] = byte;
+    }
+    for (i, &v) in rem.iter().enumerate() {
+        let row = n_chunks * 8 + i;
+        if probe(v) {
+            bitmap[row >> 3] |= 1 << (row & 7);
+        }
     }
 }
 
