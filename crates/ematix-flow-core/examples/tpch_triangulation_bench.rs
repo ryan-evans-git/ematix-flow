@@ -994,27 +994,34 @@ async fn run_ematix_flow(data_dir: &Path, sql: &str) -> Trial {
     // Σ.AΩ Phase 1.6 (2026-05-28): default ON. The race-aware
     // recommender (`recommend_target_partitions_via_race`) consults
     // `partition_race_outcomes` first, falls through to Phase 1.5's
-    // observation-aware path on cold start, and finally to Phase
-    // 1.3's plan-time formula. The strict 22q SF=10 A/B verifying
-    // this path at SF=10 produced net -69.06 ms (-2.08%) with 1
-    // clear Q18 WIN (-34.84 ms) and 0 regressions; the race verdicts
-    // discriminate Q17 (cores wins, 32% margin) from Q18 (formula
-    // wins, 26% margin) cleanly. Set EMAT_AUTO_TARGET_PARTITIONS=0
-    // to disable for A/B benching.
+    // Σ.AΩ re-assessment (2026-05-28): DEFAULT FLIPPED BACK TO OFF.
+    // The Phase 1.7/2.2 default-on flips were premised on prefilled
+    // race verdicts (EMAT_RACE_PREFILL / EMAT_BATCH_RACE_PREFILL), but
+    // (a) nothing populates the log in normal operation — empty log →
+    // recommender returns None → no-op, so the "default-on win" never
+    // materialised for real users; and (b) the verdicts go stale:
+    // re-prefilled against the current binary (post metadata-cache +
+    // dict-distinct flip + ematix-parquet 0.16.3) the batch race now
+    // picks 64K (default) for every shape — the Q17→128K win decayed.
+    // A fresh strict 22q SF=10 A/B (autotune OFF vs ON, freshly
+    // prefilled) was net +0.94% (slightly slower), 0 clear wins:
+    // the isolated per-shape race doesn't predict full-query wall time
+    // (Q18/Q20/Q21 got *slower* with the 112-partition routing the
+    // race "won"). Same trap as Σ.L.3.c / Σ.N.e. Static defaults win.
+    // See `[[project_sigma_aomega_reassessment]]`. Opt in with
+    // EMAT_AUTO_TARGET_PARTITIONS=1 (+ a prefill) for experiments.
     let auto_target_partitions = std::env::var("EMAT_AUTO_TARGET_PARTITIONS")
         .ok()
         .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
-        .unwrap_or(true);
-    // Σ.AΩ Phase 2.2 (2026-05-28): default ON. The 22q SF=10 strict A/B
-    // with the 10%-margin race produced net -10.90 ms with Q17 -37.6 ms
-    // WIN and 0 regressions; race-prefill must populate the DB first
-    // (via `EMAT_BATCH_RACE_PREFILL=1`) or the recommender returns
-    // None for every shape and DEFAULT_BATCH_SIZE applies. Set
-    // EMAT_AUTO_BATCH_SIZE=0 to disable for A/B benching.
+        .unwrap_or(false);
+    // Σ.AΩ re-assessment (2026-05-28): default OFF — see the
+    // target_partitions note above. The batch-size race verdict
+    // decayed to "pick 64K" on the current binary, so this lever is
+    // a no-op even when prefilled. Opt in with EMAT_AUTO_BATCH_SIZE=1.
     let auto_batch_size = std::env::var("EMAT_AUTO_BATCH_SIZE")
         .ok()
         .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
-        .unwrap_or(true);
+        .unwrap_or(false);
     let auto_rec = if auto_target_partitions || auto_batch_size {
         auto_target_partitions_lookup(data_dir, sql).await
     } else {
