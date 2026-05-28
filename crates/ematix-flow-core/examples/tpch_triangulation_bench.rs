@@ -369,11 +369,85 @@ async fn run_one(engine: Engine, data_dir: &Path, sql: &str) -> Trial {
 
 // ---------- ematix-flow ----------
 
+/// Σ.AΩ Phase 1.2 cache for the plan-time `target_partitions`
+/// recommender. Keys are SQL strings; values are `Some(n)` when the
+/// query should be routed to a context with `target_partitions = n`,
+/// or `None` when the session default suffices (recommendation = cores).
+///
+/// First call per SQL builds a minimal SessionContext just to parse
+/// the SQL into a LogicalPlan, runs the recommender, caches the
+/// result. Subsequent calls hit the cache.
+static AUTO_PARTITIONS_CACHE: OnceLock<Mutex<HashMap<String, Option<usize>>>> = OnceLock::new();
+
+fn auto_partitions_cache() -> &'static Mutex<HashMap<String, Option<usize>>> {
+    AUTO_PARTITIONS_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+async fn auto_target_partitions_lookup(data_dir: &Path, sql: &str) -> Option<usize> {
+    {
+        let guard = auto_partitions_cache().lock().unwrap();
+        if let Some(v) = guard.get(sql) {
+            return *v;
+        }
+    }
+    let session_cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(14);
+    let recommendation =
+        compute_auto_target_partitions(data_dir, sql, session_cores).await;
+    auto_partitions_cache()
+        .lock()
+        .unwrap()
+        .insert(sql.to_string(), recommendation);
+    recommendation
+}
+
+async fn compute_auto_target_partitions(
+    data_dir: &Path,
+    sql: &str,
+    session_cores: usize,
+) -> Option<usize> {
+    // Build a minimal SessionContext just to parse SQL.
+    let ctx = SessionContext::new();
+    for t in TPCH_TABLES {
+        let path = data_dir.join(format!("{t}.parquet"));
+        if !path.exists() {
+            return None;
+        }
+        if *t == "lineitem" {
+            let prov =
+                EmatixFastParquetTableProvider::try_new(path.to_string_lossy()).ok()?;
+            ctx.register_table(*t, Arc::new(prov)).ok()?;
+        } else {
+            let prov = FastParquetTableProvider::try_new(path.to_string_lossy()).ok()?;
+            ctx.register_table(*t, Arc::new(prov)).ok()?;
+        }
+    }
+    let df = ctx.sql(sql).await.ok()?;
+    let plan = df.into_optimized_plan().ok()?;
+    let n =
+        ematix_flow_core::auto_target_partitions::recommend_target_partitions(&plan, session_cores);
+    if n > session_cores { Some(n) } else { None }
+}
+
 async fn run_ematix_flow(data_dir: &Path, sql: &str) -> Trial {
-    let (ctx, bloom_rule) = match build_ematix_ctx(data_dir).await {
-        Ok(c) => c,
-        Err(e) => return Trial::Fail(format!("ctx build: {e}")),
+    // Σ.AΩ Phase 1.2: when EMAT_AUTO_TARGET_PARTITIONS=1, look up the
+    // pre-computed plan-time recommendation for this SQL. Cache miss
+    // means recommender hasn't seen this SQL — fall back to default.
+    let auto_target_partitions = std::env::var("EMAT_AUTO_TARGET_PARTITIONS")
+        .ok()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let target_partitions_override = if auto_target_partitions {
+        auto_target_partitions_lookup(data_dir, sql).await
+    } else {
+        None
     };
+    let (ctx, bloom_rule) =
+        match build_ematix_ctx(data_dir, target_partitions_override).await {
+            Ok(c) => c,
+            Err(e) => return Trial::Fail(format!("ctx build: {e}")),
+        };
     // Σ.Q.L4′: when EMAT_BLOOM_PUSHDOWN=1, pre-execute small Inner-
     // equijoin build sides via the local emitter and install the
     // resulting ContextBlooms into the shared rule slot before timing
@@ -642,6 +716,7 @@ async fn run_ematix_flow(data_dir: &Path, sql: &str) -> Trial {
 
 async fn build_ematix_ctx(
     data_dir: &Path,
+    target_partitions_override: Option<usize>,
 ) -> Result<(SessionContext, Option<Arc<EnableInBloomScanPushdownRule>>), Box<dyn std::error::Error>>
 {
     // EMAT_RULES env knob for A/B benching. Defaults to "all" (production
@@ -652,7 +727,7 @@ async fn build_ematix_ctx(
     //   "v040"                  — dict + multi + sum (matches v0.4.0)
     //   "dedupe"                — dedupe only
     let rules = std::env::var("EMAT_RULES").unwrap_or_else(|_| "all".to_string());
-    let partitions: usize = std::env::var("PARTITIONS")
+    let session_partitions: usize = std::env::var("PARTITIONS")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or_else(|| {
@@ -660,6 +735,12 @@ async fn build_ematix_ctx(
                 .map(|n| n.get())
                 .unwrap_or(14)
         });
+    // Σ.AΩ Phase 1.2 (2026-05-28): per-query target_partitions override.
+    // When the plan-time recommender (auto_target_partitions) detects a
+    // high-cardinality GROUP BY aggregate, the override raises this
+    // query's target_partitions above the session default so DataFusion's
+    // EnforceDistribution naturally propagates the higher count.
+    let partitions = target_partitions_override.unwrap_or(session_partitions);
     let mut builder = SessionStateBuilder::new()
         .with_config(SessionConfig::new().with_target_partitions(partitions))
         .with_default_features();
