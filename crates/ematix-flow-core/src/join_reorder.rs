@@ -90,6 +90,102 @@ struct InnerJoinChain {
     extra_filter: Option<Expr>,
 }
 
+/// Σ.AH.X Lever G — shape predicates for narrowing `reorder_inner_joins`
+/// to chains where the cardinality estimator is empirically reliable.
+///
+/// **Why this exists**: Σ.AH.3 spike (`[[sigma-ah-3-arc-closed]]`) measured
+/// SF=10 22q A/B with the existing `reorder_inner_joins` and found:
+/// - Q10 (cust ⋈ orders ⋈ lineitem ⋈ nation, 4 leaves, no LIKE) → **-25 ms** stable win
+/// - Q07-inner (nation⋈supp⋈cust⋈orders⋈lineitem, 5 leaves) → +46 ms regression
+/// - Q09 (6 leaves, includes `p_name LIKE '%green%'` filter) → +91 ms regression
+///
+/// The cardinality estimator under-counts in two situations:
+/// 1. **String-LIKE predicate selectivity defaults to 0.2** (DataFusion's
+///    fallback) — completely wrong for typical `%substring%` filters
+///    which are usually < 0.01 selective.
+/// 2. **Long chains** (≥ 5 leaves) — Selinger DP enumerates 2^N orderings,
+///    and the cost model's per-step errors compound exponentially.
+///
+/// Lever G's predicate REJECTS chains exhibiting either shape, falling
+/// back to the original plan order. Only emits the reorder when both
+/// gates pass.
+#[derive(Debug, Clone, Copy)]
+pub struct ReorderOpts {
+    /// Maximum leaves in the chain. Chains with more leaves are too
+    /// noisy for the current cost model. Default 4 (catches Q10's
+    /// 4-leaf shape, rejects Q07-inner 5+ and Q09 6+).
+    pub max_leaves: usize,
+    /// Reject chains where any leaf has a string-LIKE filter
+    /// (DataFusion's selectivity for LIKE defaults to 0.2 which is
+    /// wildly wrong). Default true.
+    pub reject_string_like: bool,
+    /// Reject chains where any join's `on` clause references an
+    /// aggregate-result column (e.g. `min(partsupp.ps_supplycost)`).
+    /// These appear when DataFusion decorrelates a correlated
+    /// subquery into a Join + Aggregate — the cardinality of the
+    /// aggregated side is hard to estimate (it depends on group-by
+    /// distinct count which the estimator doesn't always have).
+    /// Q02 22q SF=10 measurement (Σ.AH.X Lever G bench): reordering
+    /// Q02's decorrelated `min(ps_supplycost)` subquery chain
+    /// regressed Q02 +23%. Default true.
+    pub reject_aggregate_join_keys: bool,
+    /// When a chain is rejected (by any gate), also skip descent into
+    /// its sub-tree. This prevents partial reorders of inner
+    /// sub-chains when the outer is rejected for being too big.
+    ///
+    /// Example: Q07 has a 6-leaf outer chain (rejected for ambiguous
+    /// nation×nation), but `transform_down` would otherwise descend
+    /// and reorder a 4-leaf inner sub-chain. With `jump_on_reject=true`,
+    /// the entire tree under a rejected chain is left untouched.
+    ///
+    /// Defaults: true in `ReorderOpts::default()` (safer); false in
+    /// `unsafe_no_shape_gate()` (preserves the Σ.T DP behavior that
+    /// reorders any reachable sub-chain).
+    pub jump_on_reject: bool,
+    /// Σ.AL (2026-05-27): when set, skip descent into LeftSemi /
+    /// LeftAnti joins. Inner-join chains inside a (NOT) EXISTS-
+    /// decorrelated subquery rely on the build/probe ordering for
+    /// L9 bloom cascade chains; reordering them moves which Inner
+    /// Join builds the bloom and can emit it too late to filter the
+    /// downstream fact scan.
+    ///
+    /// Empirically observed on Q21 SF=10: Lever G's reorder produced
+    /// a +47 ms regression by disrupting the L9 cascade between
+    /// supplier⋈lineitem and orders⋈lineitem. With this gate, the
+    /// reorder is suppressed inside (NOT) EXISTS subqueries and the
+    /// regression vanishes.
+    ///
+    /// Default true.
+    pub reject_under_left_semi_anti: bool,
+}
+
+impl Default for ReorderOpts {
+    fn default() -> Self {
+        Self {
+            max_leaves: 4,
+            reject_string_like: true,
+            reject_aggregate_join_keys: true,
+            jump_on_reject: true,
+            reject_under_left_semi_anti: true,
+        }
+    }
+}
+
+impl ReorderOpts {
+    /// Permissive options — accept any chain with ≥ 3 leaves and no
+    /// ambiguous names. Equivalent to pre-Lever-G behavior. Used by
+    /// the original `reorder_inner_joins` entry point for back-compat.
+    pub fn unsafe_no_shape_gate() -> Self {
+        Self {
+            max_leaves: usize::MAX,
+            reject_string_like: false,
+            reject_aggregate_join_keys: false,
+            jump_on_reject: false,
+            reject_under_left_semi_anti: false,
+        }
+    }
+}
+
 /// Public entry. Walks `plan` bottom-up, looking for runs of
 /// `Inner Join`. Each such run is flattened, reordered
 /// selectivity-first, and re-emitted as a left-deep chain. Anything
@@ -100,30 +196,171 @@ struct InnerJoinChain {
 /// shape we can't model, cross-product chain, schema mismatch when
 /// rebuilding) the original sub-plan is preserved — this is a
 /// best-effort optimizer, not a correctness-critical one.
+///
+/// **Permissive entry point** — runs the Selinger DP on any chain
+/// with ≥ 3 leaves and no ambiguous column names. The Σ.AH.3 spike
+/// showed this regresses Q07/Q08/Q09 at SF=10 because the cardinality
+/// estimator's per-step errors compound on long chains and on
+/// string-LIKE filters. Use `reorder_inner_joins_shape_gated` for
+/// the safer Lever G behavior that bands the reorder to shapes the
+/// estimator can model accurately.
 pub fn reorder_inner_joins(plan: LogicalPlan) -> DfResult<LogicalPlan> {
+    reorder_inner_joins_with_opts(plan, ReorderOpts::unsafe_no_shape_gate())
+}
+
+/// Σ.AH.X Lever G entry point — same mechanism as `reorder_inner_joins`
+/// but applies a tightened shape predicate (`ReorderOpts::default()` =
+/// max 4 leaves + reject string-LIKE filters). Empirically isolates
+/// Q10's clean -25 ms reorder win at SF=10 without taking the Q07/Q09
+/// regressions that the permissive entry point produces.
+///
+/// Designed for production use (post-Lever-G). The permissive entry
+/// point remains for tests and ad-hoc benching where exercising
+/// long-chain DP is the point.
+pub fn reorder_inner_joins_shape_gated(plan: LogicalPlan) -> DfResult<LogicalPlan> {
+    reorder_inner_joins_with_opts(plan, ReorderOpts::default())
+}
+
+/// Σ.AH.X Lever G entry point: same as `reorder_inner_joins` but with
+/// caller-controlled shape gating via `opts`.
+pub fn reorder_inner_joins_with_opts(plan: LogicalPlan, opts: ReorderOpts) -> DfResult<LogicalPlan> {
     let transformed = plan.transform_down(|node| match node {
+        // Σ.AL (2026-05-27): when the gate is set, skip descent into
+        // LeftSemi / LeftAnti subtrees. The L9 bloom cascade inside a
+        // (NOT) EXISTS-decorrelated subquery depends on the original
+        // Inner Join build/probe ordering; reordering it forces the
+        // bloom to be emitted too late to filter downstream fact scans
+        // (Q21 SF=10 +47 ms regression). See PHASE_SIGMA_AL_DESIGN.md.
+        LogicalPlan::Join(ref j)
+            if opts.reject_under_left_semi_anti
+                && matches!(j.join_type, JoinType::LeftSemi | JoinType::LeftAnti) =>
+        {
+            Ok(Transformed::new(node, false, TreeNodeRecursion::Jump))
+        }
         LogicalPlan::Join(ref join) if join.join_type == JoinType::Inner => {
-            match flatten_inner_join_chain(&node) {
-                Some(chain) if chain.leaves.len() >= 3 && !chain_has_ambiguous_names(&chain) => match rebuild_reordered(&chain) {
-                    Some(rebuilt) => Ok(Transformed::new(
-                        rebuilt,
-                        true,
-                        // Don't descend into the rebuilt subtree —
-                        // we've already processed the whole chain
-                        // atomically. Without Jump, transform_down
-                        // would recurse and re-flatten our own
-                        // output, potentially picking up dependent
-                        // inner-join subtrees we already enumerated.
-                        TreeNodeRecursion::Jump,
-                    )),
-                    None => Ok(Transformed::no(node)),
-                },
-                _ => Ok(Transformed::no(node)),
+            // Flatten the chain rooted at this Inner Join.
+            let flat = flatten_inner_join_chain(&node);
+            // Did this chain reach the gate (i.e., is it an Inner-join
+            // chain at all)? Used to decide whether `jump_on_reject`
+            // applies — only Inner-join chains get the gate; arbitrary
+            // non-Join nodes are always descended.
+            let is_inner_join_chain = flat.is_some();
+            match flat {
+                Some(chain)
+                    if chain.leaves.len() >= 3
+                        && chain.leaves.len() <= opts.max_leaves
+                        && !chain_has_ambiguous_names(&chain)
+                        && !(opts.reject_string_like && chain_has_string_like_filter(&chain))
+                        && !(opts.reject_aggregate_join_keys && chain_has_aggregate_join_key(&chain)) =>
+                {
+                    match rebuild_reordered(&chain) {
+                        Some(rebuilt) => Ok(Transformed::new(
+                            rebuilt,
+                            true,
+                            // Don't descend into the rebuilt subtree —
+                            // we've already processed the whole chain
+                            // atomically. Without Jump, transform_down
+                            // would recurse and re-flatten our own
+                            // output, potentially picking up dependent
+                            // inner-join subtrees we already enumerated.
+                            TreeNodeRecursion::Jump,
+                        )),
+                        None => Ok(Transformed::no(node)),
+                    }
+                }
+                _ => {
+                    // Σ.AH.X Lever G: when an Inner-join chain is rejected
+                    // (too many leaves, LIKE filter, ambiguous names, etc.)
+                    // and `jump_on_reject` is set, also skip descent. This
+                    // prevents partial reorders of inner sub-chains inside
+                    // a rejected outer chain (the Q07 +45 ms regression
+                    // pattern).
+                    if opts.jump_on_reject && is_inner_join_chain {
+                        Ok(Transformed::new(node, false, TreeNodeRecursion::Jump))
+                    } else {
+                        Ok(Transformed::no(node))
+                    }
+                }
             }
         }
         _ => Ok(Transformed::no(node)),
     })?;
     Ok(transformed.data)
+}
+
+/// Σ.AH.X Lever G — detect whether any leaf in the chain has a
+/// `LIKE` predicate. Walks each leaf looking for a `LogicalPlan::Filter`
+/// whose predicate contains an `Expr::Like` at any nesting level.
+///
+/// The DataFusion logical optimizer defaults LIKE selectivity to 0.2
+/// (the generic "unknown predicate" fallback) which is typically off
+/// by 10-100× on real `%substring%` filters. Reordering chains that
+/// include LIKE-filtered leaves leads to bad cost-model decisions.
+fn chain_has_string_like_filter(chain: &InnerJoinChain) -> bool {
+    chain.leaves.iter().any(|leaf| leaf_has_like_filter(leaf))
+}
+
+fn leaf_has_like_filter(plan: &LogicalPlan) -> bool {
+    use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+    let mut found = false;
+    let _ = plan.apply(|node| {
+        if let LogicalPlan::Filter(f) = node {
+            if expr_contains_like(&f.predicate) {
+                found = true;
+                return Ok(TreeNodeRecursion::Stop);
+            }
+        }
+        Ok(TreeNodeRecursion::Continue)
+    });
+    found
+}
+
+fn expr_contains_like(expr: &Expr) -> bool {
+    use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+    let mut found = false;
+    let _ = expr.apply(|e| {
+        if matches!(e, Expr::Like(_) | Expr::SimilarTo(_)) {
+            found = true;
+            return Ok(TreeNodeRecursion::Stop);
+        }
+        Ok(TreeNodeRecursion::Continue)
+    });
+    found
+}
+
+/// Σ.AH.X Lever G — detect whether any join in the chain has an
+/// `on` clause where either side is an aggregate-result column.
+///
+/// When DataFusion decorrelates `WHERE x = (SELECT MIN(y) ...)` into
+/// a Join + Aggregate, the join's equi-predicate references the
+/// aggregate output column (e.g. `min(partsupp.ps_supplycost)`).
+/// The cardinality of the aggregated side depends on the group-by
+/// distinct count, which the estimator doesn't reliably know. Q02
+/// 22q SF=10: reordering this shape regressed Q02 +23%.
+///
+/// Heuristic: a Column's `name` starts with one of the standard
+/// SQL aggregate function names followed by `(`. This catches the
+/// post-decorrelation `min(...)`, `max(...)`, `sum(...)`, `avg(...)`,
+/// `count(...)` patterns.
+fn chain_has_aggregate_join_key(chain: &InnerJoinChain) -> bool {
+    chain
+        .equi_preds
+        .iter()
+        .any(|(l, r)| column_name_is_aggregate(l) || column_name_is_aggregate(r))
+}
+
+fn column_name_is_aggregate(col: &Column) -> bool {
+    let n = &col.name;
+    n.starts_with("min(")
+        || n.starts_with("max(")
+        || n.starts_with("sum(")
+        || n.starts_with("avg(")
+        || n.starts_with("count(")
+        || n.starts_with("MIN(")
+        || n.starts_with("MAX(")
+        || n.starts_with("SUM(")
+        || n.starts_with("AVG(")
+        || n.starts_with("COUNT(")
 }
 
 /// Walk down through `Inner Join` nodes, accumulating leaves +
@@ -1053,9 +1290,224 @@ mod tests {
                 (0..arr.len()).map(|i| arr.value(i)).collect::<Vec<_>>()
             })
             .collect();
+        // Sanity: shape-gated entry point should NOT change this 3-table
+        // chain because it's at the bound (≥3 leaves, ≤4 leaves, no LIKE).
+        // Both entries reorder it. Just a smoke check that the gated path
+        // doesn't accidentally reject the small case.
+        let gated = reorder_inner_joins_shape_gated(original.clone())?;
+        assert_ne!(
+            format!("{}", original.display_indent()),
+            format!("{}", gated.display_indent()),
+            "shape-gated reorder should also fire on this 3-table chain"
+        );
+
         assert_eq!(
             orig_rows, new_rows,
             "join reorder changed query semantics: original {orig_rows:?} vs rewritten {new_rows:?}"
+        );
+        Ok(())
+    }
+
+    /// Σ.AH.X Lever G — `reorder_inner_joins_shape_gated` must NOT
+    /// reorder a 5-leaf chain (catches Q07's inner subchain that
+    /// regresses +46 ms at SF=10 under the permissive path). Same
+    /// chain DOES reorder under `reorder_inner_joins` (permissive).
+    #[tokio::test]
+    async fn lever_g_rejects_long_chain() -> DfResult<()> {
+        let Some(dir) = sf1_dir() else {
+            eprintln!("skipping: sf1 data missing");
+            return Ok(());
+        };
+        let ctx = SessionContext::new();
+        register_tpch(&ctx, &dir).await?;
+        // 5-leaf Inner-join chain: nation, supplier, customer, orders, lineitem.
+        // Mirrors Q07's inner subchain shape that the spike showed regresses.
+        let sql = "SELECT n.n_name, COUNT(*) \
+                   FROM nation n \
+                   JOIN supplier s ON n.n_nationkey = s.s_nationkey \
+                   JOIN lineitem l ON s.s_suppkey = l.l_suppkey \
+                   JOIN orders o ON l.l_orderkey = o.o_orderkey \
+                   JOIN customer c ON o.o_custkey = c.c_custkey \
+                   GROUP BY n.n_name";
+        let df = ctx.sql(sql).await?;
+        let original = df.into_optimized_plan()?;
+
+        // Permissive path: chain has 5 leaves ≥ 3 + no ambiguous names → reorder fires
+        let permissive = reorder_inner_joins(original.clone())?;
+        assert_ne!(
+            format!("{}", original.display_indent()),
+            format!("{}", permissive.display_indent()),
+            "permissive entry should reorder a 5-leaf chain"
+        );
+
+        // Shape-gated path: 5 leaves > max_leaves(4) → reject, plan unchanged
+        let gated = reorder_inner_joins_shape_gated(original.clone())?;
+        assert_eq!(
+            format!("{}", original.display_indent()),
+            format!("{}", gated.display_indent()),
+            "shape-gated entry should NOT reorder a 5-leaf chain (max_leaves=4)"
+        );
+        Ok(())
+    }
+
+    /// Σ.AH.X Lever G — `reorder_inner_joins_shape_gated` must NOT
+    /// reorder a chain containing a string-LIKE filter (catches Q09).
+    #[tokio::test]
+    async fn lever_g_rejects_string_like_filter() -> DfResult<()> {
+        let Some(dir) = sf1_dir() else {
+            eprintln!("skipping: sf1 data missing");
+            return Ok(());
+        };
+        let ctx = SessionContext::new();
+        register_tpch(&ctx, &dir).await?;
+        // 3-leaf chain (within the leaf budget) but with a LIKE filter
+        // on `part`. Shape gate should reject.
+        let sql = "SELECT p.p_name, l.l_quantity \
+                   FROM part p \
+                   JOIN lineitem l ON p.p_partkey = l.l_partkey \
+                   JOIN orders o ON l.l_orderkey = o.o_orderkey \
+                   WHERE p.p_name LIKE '%green%'";
+        let df = ctx.sql(sql).await?;
+        let original = df.into_optimized_plan()?;
+
+        // Permissive entry: 3 leaves, no ambiguous names → reorder fires
+        let permissive = reorder_inner_joins(original.clone())?;
+        assert_ne!(
+            format!("{}", original.display_indent()),
+            format!("{}", permissive.display_indent()),
+            "permissive entry should reorder a 3-leaf chain even with LIKE"
+        );
+
+        // Shape-gated: LIKE filter detected → reject, plan unchanged
+        let gated = reorder_inner_joins_shape_gated(original.clone())?;
+        assert_eq!(
+            format!("{}", original.display_indent()),
+            format!("{}", gated.display_indent()),
+            "shape-gated entry should NOT reorder a chain containing a LIKE filter"
+        );
+        Ok(())
+    }
+
+    /// Σ.AH.X Lever G — `reorder_inner_joins_shape_gated` MUST still
+    /// reorder Q10-shape chains (4 leaves, no LIKE). Direct counter-test
+    /// to the rejection tests above: the gate doesn't block all reorders,
+    /// only the ones the estimator can't model.
+    #[tokio::test]
+    async fn lever_g_allows_q10_shape() -> DfResult<()> {
+        let Some(dir) = sf1_dir() else {
+            eprintln!("skipping: sf1 data missing");
+            return Ok(());
+        };
+        let ctx = SessionContext::new();
+        register_tpch(&ctx, &dir).await?;
+        // 4-leaf Inner-join chain matching Q10's shape: customer, orders, lineitem, nation
+        let sql = "SELECT c.c_custkey, SUM(l.l_extendedprice) \
+                   FROM customer c \
+                   JOIN orders o ON c.c_custkey = o.o_custkey \
+                   JOIN lineitem l ON o.o_orderkey = l.l_orderkey \
+                   JOIN nation n ON c.c_nationkey = n.n_nationkey \
+                   WHERE o.o_orderdate >= '1993-10-01' \
+                   GROUP BY c.c_custkey";
+        let df = ctx.sql(sql).await?;
+        let original = df.into_optimized_plan()?;
+
+        // Both entries should reorder this — 4 leaves at the bound, no LIKE
+        let gated = reorder_inner_joins_shape_gated(original.clone())?;
+        assert_ne!(
+            format!("{}", original.display_indent()),
+            format!("{}", gated.display_indent()),
+            "shape-gated entry should reorder Q10-shape (4 leaves, no LIKE)"
+        );
+        Ok(())
+    }
+
+    /// Σ.AL (2026-05-27) — `reorder_inner_joins_shape_gated` MUST refuse
+    /// to descend into LeftSemi / LeftAnti join subtrees. The L9 bloom
+    /// cascade inside a (NOT) EXISTS-decorrelated subquery depends on
+    /// Inner Join build/probe ordering; reordering it forces the bloom
+    /// to be emitted too late to filter downstream fact scans (Q21
+    /// SF=10 +47 ms regression seen during Σ.AH.X Lever G re-validation).
+    #[tokio::test]
+    async fn lever_g_blocks_under_left_semi_anti_q21_shape() -> DfResult<()> {
+        let Some(dir) = sf1_dir() else {
+            eprintln!("skipping: sf1 data missing");
+            return Ok(());
+        };
+        let ctx = SessionContext::new();
+        register_tpch(&ctx, &dir).await?;
+        let sql = std::fs::read_to_string(
+            dir.parent()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .join("queries/q21.sql"),
+        )
+        .ok();
+        let Some(sql) = sql else {
+            eprintln!("skipping: q21.sql missing");
+            return Ok(());
+        };
+        let df = ctx.sql(&sql).await?;
+        let original = df.into_optimized_plan()?;
+        let gated = reorder_inner_joins_shape_gated(original.clone())?;
+        assert_eq!(
+            format!("{}", original.display_indent()),
+            format!("{}", gated.display_indent()),
+            "Σ.AL gate must block all reorder under Q21's LeftAnti/LeftSemi"
+        );
+        Ok(())
+    }
+
+    /// Σ.AL — direct unit test for the `reject_under_left_semi_anti`
+    /// option. Without the gate, the inner Inner-join chain reorders.
+    /// With the gate, it stays put.
+    #[tokio::test]
+    async fn lever_g_gate_toggle_for_left_semi_subtree() -> DfResult<()> {
+        let Some(dir) = sf1_dir() else {
+            eprintln!("skipping: sf1 data missing");
+            return Ok(());
+        };
+        let ctx = SessionContext::new();
+        register_tpch(&ctx, &dir).await?;
+        // Inner-join 4-leaf chain wrapped in LeftSemi (simulating
+        // a NOT EXISTS-decorrelated subquery shape):
+        // select s_name from supplier s where exists (
+        //   select 1 from orders o, lineitem l, nation n
+        //   where o.o_custkey = ... and l.l_orderkey = o.o_orderkey
+        //   and l.l_suppkey = s.s_suppkey and n.n_nationkey = s.s_nationkey
+        // )
+        // Use Q21 since it organically has this shape.
+        let sql = std::fs::read_to_string(
+            dir.parent()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .join("queries/q21.sql"),
+        )
+        .ok();
+        let Some(sql) = sql else {
+            eprintln!("skipping: q21.sql missing");
+            return Ok(());
+        };
+        let df = ctx.sql(&sql).await?;
+        let original = df.into_optimized_plan()?;
+
+        // With gate OFF: the reorder fires inside the LeftSemi subtree.
+        let mut opts_no_gate = ReorderOpts::default();
+        opts_no_gate.reject_under_left_semi_anti = false;
+        let no_gate = reorder_inner_joins_with_opts(original.clone(), opts_no_gate)?;
+        assert_ne!(
+            format!("{}", original.display_indent()),
+            format!("{}", no_gate.display_indent()),
+            "Without Σ.AL gate, reorder should descend into LeftSemi and fire"
+        );
+
+        // With gate ON (default): the reorder is blocked.
+        let with_gate = reorder_inner_joins_shape_gated(original.clone())?;
+        assert_eq!(
+            format!("{}", original.display_indent()),
+            format!("{}", with_gate.display_indent()),
+            "With Σ.AL gate, reorder must NOT fire under LeftSemi"
         );
         Ok(())
     }
