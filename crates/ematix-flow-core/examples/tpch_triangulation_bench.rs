@@ -325,6 +325,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
+    // Σ.AΩ Phase 2.1: batch-size race prefill mode.
+    let batch_race_prefill_mode = std::env::var("EMAT_BATCH_RACE_PREFILL")
+        .ok()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if batch_race_prefill_mode {
+        batch_race_prefill_observations(&data_dir, &queries_dir, &query_subset).await?;
+        return Ok(());
+    }
+
     println!("=== TPC-H 22 triangulation bench ===");
     println!("    data:    {}", data_dir.display());
     println!("    queries: {} ({:?})", query_subset.len(), query_subset);
@@ -414,6 +424,13 @@ async fn run_one(engine: Engine, data_dir: &Path, sql: &str) -> Trial {
 struct AutoPartitionsRec {
     target_partitions: Option<usize>,
     shape_hash: Option<String>,
+    /// Σ.AΩ Phase 2.1: per-shape batch-size override from
+    /// `batch_size_race_outcomes`. None means "use DEFAULT_BATCH_SIZE
+    /// (or whatever `EMAT_BATCH_SIZE` env var says)". When
+    /// `EMAT_AUTO_BATCH_SIZE=1`, run_ematix_flow sets
+    /// `EMAT_BATCH_SIZE` to this value just before constructing the
+    /// providers so they pick it up via `env_batch_size()`.
+    batch_size_override: Option<u32>,
 }
 
 static AUTO_PARTITIONS_CACHE: OnceLock<Mutex<HashMap<String, AutoPartitionsRec>>> = OnceLock::new();
@@ -506,9 +523,13 @@ async fn compute_auto_target_partitions(
     );
     let shape_hash =
         ematix_flow_core::auto_target_partitions::qualifying_aggregate_shape_hash(&plan);
+    // Σ.AΩ Phase 2.1: per-shape batch-size override from race log.
+    let batch_size_override =
+        ematix_flow_core::auto_target_partitions::recommend_batch_size_via_race(&plan, log);
     AutoPartitionsRec {
         target_partitions: if n > session_cores { Some(n) } else { None },
         shape_hash,
+        batch_size_override,
     }
 }
 
@@ -658,6 +679,79 @@ async fn prefill_observations(
         }
         if let Some(rule) = bloom_rule.as_ref() {
             rule.set(ContextBlooms::default());
+        }
+    }
+    println!();
+    Ok(())
+}
+
+/// Σ.AΩ Phase 2.1 — 3-way batch-size race. Runs each query twice at
+/// 32K, 64K, and 128K batch sizes (taking the min on each side),
+/// picks the winner via `pick_batch_size_winner`, records to
+/// `batch_size_race_outcomes`. Uses the same shape hash as Phase
+/// 1.6's partition race so the same prefill DB covers both arcs.
+async fn batch_race_prefill_observations(
+    data_dir: &Path,
+    queries_dir: &Path,
+    query_subset: &[u8],
+) -> Result<(), Box<dyn std::error::Error>> {
+    use ematix_flow_core::workload_log::pick_batch_size_winner;
+    let Some(log) = workload_log() else {
+        println!("EMAT_BATCH_RACE_PREFILL: workload_log unavailable — skip");
+        return Ok(());
+    };
+    println!("=== Σ.AΩ Phase 2.1 batch-size race prefill ===");
+    println!("    data:    {}", data_dir.display());
+    println!("    queries: {} ({:?})", query_subset.len(), query_subset);
+    println!();
+    for &q in query_subset {
+        let sql_path = queries_dir.join(format!("q{q:02}.sql"));
+        let Ok(sql) = std::fs::read_to_string(&sql_path) else {
+            continue;
+        };
+        let shape_hash = match compute_shape_hash(data_dir, &sql).await {
+            Some(h) => h,
+            None => {
+                println!("  Q{q:02}: no qualifying aggregate — skip");
+                continue;
+            }
+        };
+        // Three candidate batch sizes; take the min of two reps each
+        // (Σ.L.1 pattern). Default (64K) goes first so OS cache is
+        // warmed on the side most likely to win.
+        let mut ms_by_size: [(u32, f64); 3] = [(65_536, f64::INFINITY); 3];
+        ms_by_size[0] = (65_536, f64::INFINITY);
+        ms_by_size[1] = (32_768, f64::INFINITY);
+        ms_by_size[2] = (131_072, f64::INFINITY);
+        let mut bad = false;
+        for slot in &mut ms_by_size {
+            let size = slot.0;
+            unsafe { std::env::set_var("EMAT_BATCH_SIZE", size.to_string()) };
+            let r1 = time_one(data_dir, &sql, None).await;
+            let r2 = time_one(data_dir, &sql, None).await;
+            slot.1 = match (r1, r2) {
+                (Some(a), Some(b)) => a.min(b),
+                (Some(x), None) | (None, Some(x)) => x,
+                (None, None) => {
+                    bad = true;
+                    break;
+                }
+            };
+        }
+        unsafe { std::env::remove_var("EMAT_BATCH_SIZE") };
+        if bad {
+            println!("  Q{q:02}: batch-size timing failed — skip");
+            continue;
+        }
+        let ms_32k = ms_by_size.iter().find(|p| p.0 == 32_768).unwrap().1;
+        let ms_64k = ms_by_size.iter().find(|p| p.0 == 65_536).unwrap().1;
+        let ms_128k = ms_by_size.iter().find(|p| p.0 == 131_072).unwrap().1;
+        let winner = pick_batch_size_winner(ms_32k, ms_64k, ms_128k);
+        match log.record_batch_size_race(&shape_hash, ms_32k, ms_64k, ms_128k, winner) {
+            Ok(()) => println!(
+                "  Q{q:02}: 32K={ms_32k:.1}ms 64K={ms_64k:.1}ms 128K={ms_128k:.1}ms → winner={winner} (hash={shape_hash})"
+            ),
+            Err(e) => println!("  Q{q:02}: record batch race fail: {e}"),
         }
     }
     println!();
@@ -898,12 +992,38 @@ async fn run_ematix_flow(data_dir: &Path, sql: &str) -> Trial {
         .ok()
         .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
         .unwrap_or(true);
-    let auto_rec = if auto_target_partitions {
+    // Σ.AΩ Phase 2.1: when EMAT_AUTO_BATCH_SIZE=1, the recommender
+    // also looks up a per-shape batch-size winner from
+    // `batch_size_race_outcomes`. We always run
+    // `auto_target_partitions_lookup` if either knob is on so the
+    // shape hash + verdicts get cached once per (process, SQL).
+    let auto_batch_size = std::env::var("EMAT_AUTO_BATCH_SIZE")
+        .ok()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let auto_rec = if auto_target_partitions || auto_batch_size {
         auto_target_partitions_lookup(data_dir, sql).await
     } else {
         AutoPartitionsRec::default()
     };
-    let target_partitions_override = auto_rec.target_partitions;
+    let target_partitions_override = if auto_target_partitions {
+        auto_rec.target_partitions
+    } else {
+        None
+    };
+    // Σ.AΩ Phase 2.1: set EMAT_BATCH_SIZE just before constructing
+    // the providers so `env_batch_size()` in the readers picks up
+    // the per-shape verdict. SAFETY: bench coordinator is single-
+    // threaded at this point (next trial of this SQL waits for
+    // this one), so the env-var write doesn't race with reader-
+    // side reads in this or other queries.
+    if auto_batch_size {
+        if let Some(b) = auto_rec.batch_size_override {
+            unsafe { std::env::set_var("EMAT_BATCH_SIZE", b.to_string()) };
+        } else {
+            unsafe { std::env::remove_var("EMAT_BATCH_SIZE") };
+        }
+    }
     let (ctx, bloom_rule) =
         match build_ematix_ctx(data_dir, target_partitions_override).await {
             Ok(c) => c,

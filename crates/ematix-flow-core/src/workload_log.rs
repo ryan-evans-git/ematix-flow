@@ -24,6 +24,10 @@
 //!   Σ.L.1-style speculative race writes here; the recommender reads
 //!   `winner_partitions` directly, bypassing the heavy-join gate.
 //!   Added in schema_version 3.
+//! - `batch_size_race_outcomes` — per shape hash, wall times at three
+//!   `DEFAULT_BATCH_SIZE` candidates (32K, 64K, 128K). Σ.AΩ Phase 2.1's
+//!   3-way race writes here; the recommender reads `winner_batch_size`
+//!   directly. Added in schema_version 4.
 //!
 //! ## Why SQLite (not a flat file)
 //!
@@ -136,7 +140,17 @@ impl WorkloadLog {
                 last_seen_unix     INTEGER NOT NULL,
                 PRIMARY KEY (shape_hash)
             );
-            INSERT OR IGNORE INTO schema_version (version) VALUES (3);
+            CREATE TABLE IF NOT EXISTS batch_size_race_outcomes (
+                shape_hash         TEXT NOT NULL,
+                ms_32k             REAL NOT NULL,
+                ms_64k             REAL NOT NULL,
+                ms_128k            REAL NOT NULL,
+                winner_batch_size  INTEGER NOT NULL,
+                n_observations     INTEGER NOT NULL DEFAULT 1,
+                last_seen_unix     INTEGER NOT NULL,
+                PRIMARY KEY (shape_hash)
+            );
+            INSERT OR IGNORE INTO schema_version (version) VALUES (4);
             "#,
         )
         .map_err(WorkloadLogError::Db)?;
@@ -490,6 +504,135 @@ pub fn pick_partition_race_winner(
     }
 }
 
+/// Σ.AΩ Phase 2.1 — three-way batch-size race winner. Pairs (32K, ms_32k),
+/// (64K, ms_64k), (128K, ms_128k). Picks the fastest size, but a
+/// non-default candidate must beat 64K by ≥ 5 % to override the
+/// shipping default — same noise-margin discipline as Σ.L.1 +
+/// Phase 1.6. On all-tied or both-non-default-tied input, 64K wins.
+pub fn pick_batch_size_winner(ms_32k: f64, ms_64k: f64, ms_128k: f64) -> u32 {
+    const DEFAULT_BATCH: u32 = 65_536;
+    const SMALL_BATCH: u32 = 32_768;
+    const LARGE_BATCH: u32 = 131_072;
+    // Non-default candidates have to beat 64K by 5 % to override.
+    let small_wins = ms_32k <= ms_64k * 0.95;
+    let large_wins = ms_128k <= ms_64k * 0.95;
+    match (small_wins, large_wins) {
+        (true, true) => {
+            if ms_32k <= ms_128k {
+                SMALL_BATCH
+            } else {
+                LARGE_BATCH
+            }
+        }
+        (true, false) => SMALL_BATCH,
+        (false, true) => LARGE_BATCH,
+        (false, false) => DEFAULT_BATCH,
+    }
+}
+
+/// Σ.AΩ Phase 2.1 — race outcome for the three-way batch-size race.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BatchSizeRaceOutcome {
+    pub ms_32k: f64,
+    pub ms_64k: f64,
+    pub ms_128k: f64,
+    pub winner_batch_size: u32,
+    pub n_observations: i64,
+}
+
+impl WorkloadLog {
+    /// Σ.AΩ Phase 2.1 — record a 3-way batch-size race outcome.
+    /// Wall times at each candidate batch size + the winner chosen
+    /// by `pick_batch_size_winner`. EWMA-smooths the ms values on
+    /// repeated observations and re-evaluates the winner on each
+    /// update so smoothing can flip the verdict if the workload
+    /// drifts.
+    pub fn record_batch_size_race(
+        &self,
+        shape_hash: &str,
+        ms_32k: f64,
+        ms_64k: f64,
+        ms_128k: f64,
+        winner_batch_size: u32,
+    ) -> Result<(), WorkloadLogError> {
+        let now = unix_now();
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            r#"
+            INSERT INTO batch_size_race_outcomes
+              (shape_hash, ms_32k, ms_64k, ms_128k,
+               winner_batch_size, n_observations, last_seen_unix)
+            VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6)
+            ON CONFLICT (shape_hash) DO UPDATE SET
+              ms_32k  = 0.7 * ms_32k  + 0.3 * excluded.ms_32k,
+              ms_64k  = 0.7 * ms_64k  + 0.3 * excluded.ms_64k,
+              ms_128k = 0.7 * ms_128k + 0.3 * excluded.ms_128k,
+              -- Re-evaluate winner after EWMA smoothing.
+              winner_batch_size = CASE
+                  WHEN ((0.7 * ms_32k  + 0.3 * excluded.ms_32k)
+                        <= (0.7 * ms_64k + 0.3 * excluded.ms_64k) * 0.95)
+                    AND ((0.7 * ms_32k  + 0.3 * excluded.ms_32k)
+                         <= (0.7 * ms_128k + 0.3 * excluded.ms_128k))
+                  THEN 32768
+                  WHEN ((0.7 * ms_128k + 0.3 * excluded.ms_128k)
+                        <= (0.7 * ms_64k + 0.3 * excluded.ms_64k) * 0.95)
+                  THEN 131072
+                  ELSE 65536
+                END,
+              n_observations = n_observations + 1,
+              last_seen_unix = excluded.last_seen_unix
+            "#,
+            params![
+                shape_hash,
+                ms_32k,
+                ms_64k,
+                ms_128k,
+                winner_batch_size as i64,
+                now,
+            ],
+        )
+        .map_err(WorkloadLogError::Db)?;
+        Ok(())
+    }
+
+    /// Σ.AΩ Phase 2.1 — consult batch-size race verdict.
+    pub fn consult_batch_size_race(
+        &self,
+        shape_hash: &str,
+        min_observations: i64,
+    ) -> Result<Option<BatchSizeRaceOutcome>, WorkloadLogError> {
+        let conn = self.conn.lock().unwrap();
+        let row = conn
+            .query_row(
+                r#"
+                SELECT ms_32k, ms_64k, ms_128k,
+                       winner_batch_size, n_observations
+                  FROM batch_size_race_outcomes
+                 WHERE shape_hash = ?1
+                "#,
+                params![shape_hash],
+                |r| {
+                    Ok(BatchSizeRaceOutcome {
+                        ms_32k: r.get::<_, f64>(0)?,
+                        ms_64k: r.get::<_, f64>(1)?,
+                        ms_128k: r.get::<_, f64>(2)?,
+                        winner_batch_size: r.get::<_, i64>(3)? as u32,
+                        n_observations: r.get::<_, i64>(4)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(WorkloadLogError::Db)?;
+        Ok(row.and_then(|o| {
+            if o.n_observations >= min_observations {
+                Some(o)
+            } else {
+                None
+            }
+        }))
+    }
+}
+
 fn unix_now() -> i64 {
     SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -690,6 +833,63 @@ mod tests {
             .unwrap();
         assert_eq!(o17.winner_partitions, 14);
         assert_eq!(o18.winner_partitions, 112);
+    }
+
+    #[test]
+    fn batch_size_winner_default_when_no_margin() {
+        // All ties → 64K (default) wins.
+        assert_eq!(pick_batch_size_winner(100.0, 100.0, 100.0), 65_536);
+        // 64K barely beaten by 32K (4%) → 64K still wins (need 5%).
+        assert_eq!(pick_batch_size_winner(96.0, 100.0, 100.0), 65_536);
+        // 32K beats 64K by 5% exactly → 32K wins.
+        assert_eq!(pick_batch_size_winner(95.0, 100.0, 100.0), 32_768);
+        // 128K beats 64K by 10% → 128K wins.
+        assert_eq!(pick_batch_size_winner(100.0, 100.0, 90.0), 131_072);
+        // Both 32K and 128K beat 64K by > 5%; pick the faster of the two.
+        assert_eq!(pick_batch_size_winner(80.0, 100.0, 90.0), 32_768);
+        assert_eq!(pick_batch_size_winner(90.0, 100.0, 80.0), 131_072);
+    }
+
+    #[test]
+    fn batch_size_race_round_trip() {
+        let log = WorkloadLog::open_in_memory().unwrap();
+        // Q17 SF=10: 128K wins by 20%.
+        log.record_batch_size_race("q17_shape", 250.0, 194.0, 155.0, 131_072)
+            .unwrap();
+        let o = log
+            .consult_batch_size_race("q17_shape", 1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(o.winner_batch_size, 131_072);
+        assert_eq!(o.n_observations, 1);
+        assert!((o.ms_32k - 250.0).abs() < 1e-6);
+        assert!((o.ms_64k - 194.0).abs() < 1e-6);
+        assert!((o.ms_128k - 155.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn batch_size_race_distinct_shapes() {
+        let log = WorkloadLog::open_in_memory().unwrap();
+        // Q17-shape: 128K wins
+        log.record_batch_size_race("q17", 250.0, 194.0, 155.0, 131_072)
+            .unwrap();
+        // Q08-shape: 64K is best
+        log.record_batch_size_race("q08", 256.0, 206.0, 282.0, 65_536)
+            .unwrap();
+        assert_eq!(
+            log.consult_batch_size_race("q17", 1)
+                .unwrap()
+                .unwrap()
+                .winner_batch_size,
+            131_072
+        );
+        assert_eq!(
+            log.consult_batch_size_race("q08", 1)
+                .unwrap()
+                .unwrap()
+                .winner_batch_size,
+            65_536
+        );
     }
 
     #[test]

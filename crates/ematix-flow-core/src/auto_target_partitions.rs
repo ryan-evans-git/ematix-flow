@@ -494,6 +494,30 @@ pub fn recommend_target_partitions_with_log(
     }
 }
 
+/// Σ.AΩ Phase 2.1 — batch-size recommender. Looks up the qualifying
+/// aggregate shape hash and consults `batch_size_race_outcomes`. If
+/// a verdict exists, returns `Some(winner_batch_size)`. Returns
+/// `None` when no shape hash is available or no race verdict has
+/// been recorded yet — callers should fall back to the static
+/// `DEFAULT_BATCH_SIZE` in that case.
+///
+/// Race-key reuse: this shares the same `aggregate_shape_hash` with
+/// Phase 1.4/1.6 so the partition-routing race and the batch-size
+/// race address the same shapes by identical keys. A query that
+/// `recommend_target_partitions_via_race` routes is exactly the
+/// query this can re-batch.
+pub fn recommend_batch_size_via_race(
+    plan: &LogicalPlan,
+    log: Option<&WorkloadLog>,
+) -> Option<u32> {
+    let log = log?;
+    let shape_hash = qualifying_aggregate_shape_hash(plan)?;
+    log.consult_batch_size_race(&shape_hash, MIN_OBSERVATIONS_FOR_CONSULT)
+        .ok()
+        .flatten()
+        .map(|o| o.winner_batch_size)
+}
+
 /// Σ.AΩ Phase 1.6 — race-aware recommender. Consults
 /// `partition_race_outcomes` first; if a verdict exists, uses the
 /// race winner directly (bypassing the Phase 1.4 cardinality +
@@ -834,6 +858,25 @@ mod tests {
             recommend_target_partitions_via_race(&plan_q18, 14, Some(&log)),
             112,
             "Q18 race verdict says formula wins"
+        );
+
+        // Σ.AΩ Phase 2.1 — batch-size race uses same shape hash.
+        // No verdict yet → None (caller falls back to DEFAULT_BATCH_SIZE).
+        assert_eq!(recommend_batch_size_via_race(&plan_q17, Some(&log)), None);
+        assert_eq!(recommend_batch_size_via_race(&plan_q18, Some(&log)), None);
+        // Record Q17 → 128K wins (matches the sweep finding), Q18 → 64K
+        // (default holds; the sweep shows 64K is best for Q18).
+        log.record_batch_size_race(&h17_str, 250.0, 194.0, 155.0, 131_072)?;
+        log.record_batch_size_race(&h18_str, 409.0, 380.0, 383.0, 65_536)?;
+        assert_eq!(
+            recommend_batch_size_via_race(&plan_q17, Some(&log)),
+            Some(131_072),
+            "Q17 should route to 128K (sweep -39 ms / -20% win)"
+        );
+        assert_eq!(
+            recommend_batch_size_via_race(&plan_q18, Some(&log)),
+            Some(65_536),
+            "Q18 should stay at 64K (default is best)"
         );
 
         Ok(())
