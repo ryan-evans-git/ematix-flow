@@ -166,7 +166,22 @@ pub fn with_optimizer_rules_and_registry(
             min_probe_to_build_ratio: 1024,
             allow_inner_join: true,
             require_filtered_build: true,
+            // Σ.AH.3 Story 2a: per-partition absolute build-size ceiling.
+            // OPT-IN — default 0 (disabled). Story 2a measured no baseline
+            // wall-time effect (existing require_filtered_build + ratio gate
+            // already screen out FK-bloom emits; this gate only sees Inner
+            // joins with pre-filtered builds which turn out to be net-positive).
+            // Override via `EMAT_L9_MAX_EXPECTED_KEYS=N` if a future shape
+            // exposes a regression the existing gates miss.
+            max_expected_keys_per_partition: 0,
         }));
+    // Σ.AJ.1 Lever B POC: opt-in via EMAT_L9_BROADCAST_SIBLINGS=1.
+    // Default OFF. See `crates/ematix-flow-core/src/broadcast_sibling_blooms_rule.rs`.
+    let builder = if std::env::var_os("EMAT_L9_BROADCAST_SIBLINGS").is_some() {
+        crate::broadcast_sibling_blooms_rule::install_broadcast_sibling_blooms_rule(builder)
+    } else {
+        builder
+    };
     (builder, registry)
 }
 

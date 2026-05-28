@@ -89,6 +89,17 @@ impl BridgeFilterSideband {
         self.inner.read().unwrap().is_some()
     }
 
+    /// Σ.AJ.1: identity check via inner Arc pointer.
+    ///
+    /// Two cloned `BridgeFilterSideband` instances share the same
+    /// inner storage; `ptr_eq` returns true iff both clones trace back
+    /// to the same `BridgeFilterSideband::new()` allocation. Used by
+    /// the broadcast-siblings rule to find the scan that holds a
+    /// given emitter's primary sideband.
+    pub fn ptr_eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
     /// Σ.Q.L16: await publication, or `timeout`, whichever comes first.
     /// Returns true if a publish happened (already or during the wait),
     /// false on timeout. Safe to call multiple times — it short-circuits

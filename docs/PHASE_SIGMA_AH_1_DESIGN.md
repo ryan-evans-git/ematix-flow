@@ -1,8 +1,8 @@
 # Σ.AH.1 — L9 scan-level integration: design
 
-**Status:** Story 1.1 deliverable, drafted 2026-05-27.
+**Status:** **REJECTED 2026-05-27** via Phase 0 spike — see § 4. Decision documented in memory `[[sigma-ah-1-arc-rejected]]`.
 **Arc shell:** [`docs/plans/sigma-ah-arc-1.md`](plans/sigma-ah-arc-1.md).
-**Active plan:** [`docs/plans/CURRENT.md`](plans/CURRENT.md).
+**Active plan:** archived at [`docs/plans/archive/2026-05-27-sigma-ah-1.md`](plans/archive/2026-05-27-sigma-ah-1.md).
 
 ## 1. Decision summary
 
@@ -55,7 +55,50 @@ Also a stage profile of Q17 in the fused-probe-on mode to see which stage domina
 
 `/tmp/sigma-ah-1-spike/q17-q18-q07-baseline-vs-fused-vs-fused+tight.md` with the table + stage profile interpretation. Decision documented in this file as a § 4 update.
 
-## 4. If Outcome A — what shipping looks like
+## 4. Phase 0 result (2026-05-27): Outcome C — arc REJECTED
+
+Spike ran at SF=10, Apple M3 Pro 14 cores, 10 timed trials × 2 warmups, three modes:
+
+| Query | A (baseline) | B (EMAT_L9_FUSED_PROBE=1) | Δ B-A | C (fused + EMAT_L9_TIGHT_CARDINALITY=1) | Δ C-A | Gate |
+|---|---:|---:|---:|---:|---:|:---|
+| Q07 | 166.86 ± 7.52 | 158.95 ± 7.81 | **-7.91** | 178.00 ± 6.65 | **+11.14** | ≤ 175 ms |
+| Q17 | 293.44 ± 5.88 | 286.55 ± 9.46 | **-6.89** | 261.11 ± 8.15 | **-32.33** | ≥ 60 ms drop |
+| Q18 | 346.81 ± 16.86 | 347.55 ± 31.02 | +0.74 | 386.84 ± 57.25 | +40.03 | ≥ 30 ms drop |
+
+**Neither mode clears the arc-shell gates.** Mode B is directional but tiny. Mode C unlocks Q17 -32 ms (still half the 60 ms gate) at the cost of Q07 (+11 ms, fails the ≤175 ms guard) and Q18 (+40 ms, regression).
+
+### Q17 stage profile (mode B, fused-probe ON)
+
+```
+HashJoinExec depth 4    elapsed_compute = 4367 ms   <-- outer Inner join lineitem×subquery
+AggregateExec depth 6   elapsed_compute = 1994 ms   <-- FinalPartitioned AVG group-by
+EmatixFastParquetExec depth 9   186 ms              <-- inner lineitem scan (AVG side)
+EmatixFastParquetExec depth 8   155 ms              <-- outer lineitem scan (bloom side)
+Wall median: 276 ms; total elapsed_compute: 6970 ms (25× ratio → high parallel overlap)
+```
+
+The outer lineitem scan — the one the L9 bloom would filter at decode time — is **155 ms of 6970 ms total compute**. The shell's prediction (-80 ms by skipping decode) cannot exist: there is no 80 ms of bloom-filterable decode to skip on Q17. The HashJoin probe and AVG accumulation dominate, both **downstream** of the L9 mechanism.
+
+### Why Outcome B's lever (dict-aware bloom probe) also wouldn't help
+
+The arc shell § 5 proposed swapping per-row bloom probes for per-dict-entry probes, predicting ~80 ms Q17 savings from "84 ms / partition" of per-row probe cost. The stage profile refutes this: the outer scan including its probe is only 155 ms total elapsed_compute. Even eliminating the probe entirely would save at most that fraction, and most of it is decode, not probe.
+
+### Decision
+
+**Reject Σ.AH.1.** The arc's mechanism (push bloom into BridgeFilter to skip decode) doesn't have the decode it would skip — Q17's bottleneck is the downstream HashJoin + AVG, not the L9-filterable scan.
+
+The opt-in Σ.AH.2 Stage 1 path (`EMAT_L9_FUSED_PROBE=1`) stands as banked infra. Mode B is a real -7 ms Q07 / -7 ms Q17 win on these queries, but the existing Σ.AH.2 arc closure already showed that flipping it default-on is net-zero at 22q geomean.
+
+**Pivot:** Q17 / Q18 gaps are operator-level (HashJoin probe + AVG accumulate). Future levers should attack those operators directly, not L9. Candidates queued:
+- Σ.AH.3 (build-vs-probe side-swap) — operator-level join-order rewrite, not decode-level
+- Q17 / Q18 specific HashJoin probe optimization (subquery materialization, build-side reuse)
+
+### Artefacts
+
+- `/tmp/sigma-ah-1-spike/A-baseline.md`, `B-fused.md`, `C-fused-tight.md` — wall-time numbers per mode
+- Q17 stage profile preserved in this section
+
+## ~~4. If Outcome A — what shipping looks like~~ (NOT TAKEN)
 
 Trivial: flip `EMAT_L9_FUSED_PROBE` default-on in the env-var dispatch (one line in `emat_arrow_reader.rs`). 22q SF=10 A/B confirms no regression elsewhere (the Σ.AH.2 Stage 6 attempt showed this is approximately net-zero at 22q scale; Σ.AH.1 only wins if Q17/Q18 specifically gain ≥ 60/30 ms).
 

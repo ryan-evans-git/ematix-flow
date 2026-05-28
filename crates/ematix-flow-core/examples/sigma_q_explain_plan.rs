@@ -89,7 +89,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             rewritten = ematix_flow_core::dim_join_pushdown::push_dim_join_into_chain(rewritten)?;
         }
         if std::env::var("EMAT_REORDER").is_ok() {
-            rewritten = ematix_flow_core::join_reorder::reorder_inner_joins(rewritten)?;
+            // Σ.AH.X Lever G: default is the permissive path (preserves
+            // Σ.T behavior); opt into the gated path via `EMAT_REORDER_SHAPE_GATED=1`.
+            let gated = std::env::var("EMAT_REORDER_SHAPE_GATED")
+                .ok()
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+            rewritten = if gated {
+                ematix_flow_core::join_reorder::reorder_inner_joins_shape_gated(rewritten)?
+            } else {
+                ematix_flow_core::join_reorder::reorder_inner_joins(rewritten)?
+            };
         }
         println!("\n=== Q{q:02} optimized LogicalPlan (POST-rewrite) ===");
         println!("{}", rewritten.display_indent());

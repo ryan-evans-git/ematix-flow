@@ -1075,12 +1075,25 @@ impl EmatArrowBatchReader {
         // filter column (~6 ms/partition on SF=10 lineitem.l_partkey;
         // saving ~25-30 ms wall after parallel-overlap).
         //
-        // Opt-in via `EMAT_L9_FUSED_PROBE=1`. Default OFF until the
-        // full 6-stage arc (Stages 2-4 follow) lands and 22q SF=10
-        // bench confirms no regression.
-        if filter.is_runtime_i64_only()
-            && std::env::var_os("EMAT_L9_FUSED_PROBE").is_some()
-        {
+        // **Default ON** as of 2026-05-27 (Σ.AI.2). Two independent
+        // interleaved A/B/A/B strict benches (22q SF=10, 4 invocations
+        // each side) showed net **-1.26% and -2.27% faster** with the
+        // fused-probe path, driven primarily by Q21 (-40 to -54 ms
+        // / -10 to -14%). No clear regressions above the 2σ noise bar
+        // in either run (Q10 +3.6% appeared in one run but not the
+        // other; treated as edge-of-noise). Earlier "loose" benches
+        // (single-invocation, no caffeinate/taskpolicy discipline)
+        // reported net regressions that turned out to be sequential-
+        // block-order artifact — see `[[sigma-ai-1-strict-bench-landed]]`
+        // and the interleaved A/B harness at `scripts/bench/strict_ab.sh`.
+        //
+        // Opt-OUT via `EMAT_L9_FUSED_PROBE=0` (or `false`) for ad-hoc
+        // A/B work or if a future workload exposes a real regression.
+        let fused_probe_enabled = std::env::var("EMAT_L9_FUSED_PROBE")
+            .ok()
+            .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+            .unwrap_or(true);
+        if filter.is_runtime_i64_only() && fused_probe_enabled {
             self.cur_rg_total = self.cached_md.row_groups[rg].num_rows as usize;
             self.load_row_group_dense(rg)?;
             // Find the predicate's target column in the projection.
