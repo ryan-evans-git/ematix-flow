@@ -504,18 +504,24 @@ pub fn pick_partition_race_winner(
     }
 }
 
-/// Σ.AΩ Phase 2.1 — three-way batch-size race winner. Pairs (32K, ms_32k),
-/// (64K, ms_64k), (128K, ms_128k). Picks the fastest size, but a
-/// non-default candidate must beat 64K by ≥ 5 % to override the
-/// shipping default — same noise-margin discipline as Σ.L.1 +
-/// Phase 1.6. On all-tied or both-non-default-tied input, 64K wins.
+/// Σ.AΩ Phase 2.1 — three-way batch-size race winner. Picks the
+/// fastest size, but a non-default candidate must beat 64K by ≥ 10 %
+/// to override the shipping default.
+///
+/// The 10 % margin (wider than Σ.L.1's / Phase 1.6's 5 %) handles the
+/// observation that race-prefill at 2-3 reps × 3 sizes is noisier
+/// than the partition race's 2-rep × 2-paths case: with three
+/// candidates competing, the chance one looks artificially fast on a
+/// noisy run is higher. The first Phase 2.1 A/B used a 5 % margin
+/// and misrouted Q18 (true margin ≈ 6 % vs cores) — the wider
+/// margin gives noisy race-prefills room to default back to 64K.
 pub fn pick_batch_size_winner(ms_32k: f64, ms_64k: f64, ms_128k: f64) -> u32 {
     const DEFAULT_BATCH: u32 = 65_536;
     const SMALL_BATCH: u32 = 32_768;
     const LARGE_BATCH: u32 = 131_072;
-    // Non-default candidates have to beat 64K by 5 % to override.
-    let small_wins = ms_32k <= ms_64k * 0.95;
-    let large_wins = ms_128k <= ms_64k * 0.95;
+    // Non-default candidates have to beat 64K by 10 % to override.
+    let small_wins = ms_32k <= ms_64k * 0.90;
+    let large_wins = ms_128k <= ms_64k * 0.90;
     match (small_wins, large_wins) {
         (true, true) => {
             if ms_32k <= ms_128k {
@@ -567,15 +573,17 @@ impl WorkloadLog {
               ms_32k  = 0.7 * ms_32k  + 0.3 * excluded.ms_32k,
               ms_64k  = 0.7 * ms_64k  + 0.3 * excluded.ms_64k,
               ms_128k = 0.7 * ms_128k + 0.3 * excluded.ms_128k,
-              -- Re-evaluate winner after EWMA smoothing.
+              -- Re-evaluate winner after EWMA smoothing. 10% margin
+              -- (vs 5% in Σ.L.1/Phase 1.6) to handle the wider noise
+              -- floor of a 3-way race vs a 2-way race.
               winner_batch_size = CASE
                   WHEN ((0.7 * ms_32k  + 0.3 * excluded.ms_32k)
-                        <= (0.7 * ms_64k + 0.3 * excluded.ms_64k) * 0.95)
+                        <= (0.7 * ms_64k + 0.3 * excluded.ms_64k) * 0.90)
                     AND ((0.7 * ms_32k  + 0.3 * excluded.ms_32k)
                          <= (0.7 * ms_128k + 0.3 * excluded.ms_128k))
                   THEN 32768
                   WHEN ((0.7 * ms_128k + 0.3 * excluded.ms_128k)
-                        <= (0.7 * ms_64k + 0.3 * excluded.ms_64k) * 0.95)
+                        <= (0.7 * ms_64k + 0.3 * excluded.ms_64k) * 0.90)
                   THEN 131072
                   ELSE 65536
                 END,
@@ -839,15 +847,15 @@ mod tests {
     fn batch_size_winner_default_when_no_margin() {
         // All ties → 64K (default) wins.
         assert_eq!(pick_batch_size_winner(100.0, 100.0, 100.0), 65_536);
-        // 64K barely beaten by 32K (4%) → 64K still wins (need 5%).
-        assert_eq!(pick_batch_size_winner(96.0, 100.0, 100.0), 65_536);
-        // 32K beats 64K by 5% exactly → 32K wins.
-        assert_eq!(pick_batch_size_winner(95.0, 100.0, 100.0), 32_768);
-        // 128K beats 64K by 10% → 128K wins.
-        assert_eq!(pick_batch_size_winner(100.0, 100.0, 90.0), 131_072);
-        // Both 32K and 128K beat 64K by > 5%; pick the faster of the two.
-        assert_eq!(pick_batch_size_winner(80.0, 100.0, 90.0), 32_768);
-        assert_eq!(pick_batch_size_winner(90.0, 100.0, 80.0), 131_072);
+        // 64K beaten by 32K by 9% → 64K still wins (need 10%).
+        assert_eq!(pick_batch_size_winner(91.0, 100.0, 100.0), 65_536);
+        // 32K beats 64K by exactly 10% → 32K wins.
+        assert_eq!(pick_batch_size_winner(90.0, 100.0, 100.0), 32_768);
+        // 128K beats 64K by 15% → 128K wins.
+        assert_eq!(pick_batch_size_winner(100.0, 100.0, 85.0), 131_072);
+        // Both 32K and 128K beat 64K by > 10%; pick the faster of the two.
+        assert_eq!(pick_batch_size_winner(80.0, 100.0, 85.0), 32_768);
+        assert_eq!(pick_batch_size_winner(85.0, 100.0, 80.0), 131_072);
     }
 
     #[test]

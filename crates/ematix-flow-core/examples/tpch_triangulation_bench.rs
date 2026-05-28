@@ -447,6 +447,15 @@ fn auto_partitions_cache() -> &'static Mutex<HashMap<String, AutoPartitionsRec>>
 static WORKLOAD_LOG: OnceLock<Option<Arc<ematix_flow_core::workload_log::WorkloadLog>>> =
     OnceLock::new();
 
+/// Σ.AΩ Phase 2.2 — snapshot of `EMAT_BATCH_SIZE` at process start so
+/// queries without a race verdict can restore it instead of clobbering
+/// to "unset" when the auto-batch-size lever is on.
+static ORIGINAL_BATCH_SIZE: OnceLock<Option<String>> = OnceLock::new();
+
+fn original_batch_size_env() -> &'static Option<String> {
+    ORIGINAL_BATCH_SIZE.get_or_init(|| std::env::var("EMAT_BATCH_SIZE").ok())
+}
+
 fn workload_log() -> Option<&'static Arc<ematix_flow_core::workload_log::WorkloadLog>> {
     WORKLOAD_LOG
         .get_or_init(|| {
@@ -727,16 +736,20 @@ async fn batch_race_prefill_observations(
         for slot in &mut ms_by_size {
             let size = slot.0;
             unsafe { std::env::set_var("EMAT_BATCH_SIZE", size.to_string()) };
+            // Three reps × take min. The 3rd rep is critical for the
+            // wider-noise-floor case where 2 reps occasionally let an
+            // outlier slip through; min-of-3 cuts that tail.
             let r1 = time_one(data_dir, &sql, None).await;
             let r2 = time_one(data_dir, &sql, None).await;
-            slot.1 = match (r1, r2) {
-                (Some(a), Some(b)) => a.min(b),
-                (Some(x), None) | (None, Some(x)) => x,
-                (None, None) => {
-                    bad = true;
-                    break;
-                }
-            };
+            let r3 = time_one(data_dir, &sql, None).await;
+            slot.1 = [r1, r2, r3]
+                .into_iter()
+                .flatten()
+                .fold(f64::INFINITY, f64::min);
+            if !slot.1.is_finite() {
+                bad = true;
+                break;
+            }
         }
         unsafe { std::env::remove_var("EMAT_BATCH_SIZE") };
         if bad {
@@ -992,15 +1005,16 @@ async fn run_ematix_flow(data_dir: &Path, sql: &str) -> Trial {
         .ok()
         .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
         .unwrap_or(true);
-    // Σ.AΩ Phase 2.1: when EMAT_AUTO_BATCH_SIZE=1, the recommender
-    // also looks up a per-shape batch-size winner from
-    // `batch_size_race_outcomes`. We always run
-    // `auto_target_partitions_lookup` if either knob is on so the
-    // shape hash + verdicts get cached once per (process, SQL).
+    // Σ.AΩ Phase 2.2 (2026-05-28): default ON. The 22q SF=10 strict A/B
+    // with the 10%-margin race produced net -10.90 ms with Q17 -37.6 ms
+    // WIN and 0 regressions; race-prefill must populate the DB first
+    // (via `EMAT_BATCH_RACE_PREFILL=1`) or the recommender returns
+    // None for every shape and DEFAULT_BATCH_SIZE applies. Set
+    // EMAT_AUTO_BATCH_SIZE=0 to disable for A/B benching.
     let auto_batch_size = std::env::var("EMAT_AUTO_BATCH_SIZE")
         .ok()
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
+        .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+        .unwrap_or(true);
     let auto_rec = if auto_target_partitions || auto_batch_size {
         auto_target_partitions_lookup(data_dir, sql).await
     } else {
@@ -1017,11 +1031,21 @@ async fn run_ematix_flow(data_dir: &Path, sql: &str) -> Trial {
     // threaded at this point (next trial of this SQL waits for
     // this one), so the env-var write doesn't race with reader-
     // side reads in this or other queries.
+    //
+    // Original-batch-size preservation: a query without a per-shape
+    // verdict resets to whatever the user set at process start
+    // (captured in ORIGINAL_BATCH_SIZE), not to "unset". This way a
+    // user-supplied `EMAT_BATCH_SIZE=8192` survives queries that
+    // have no race verdict.
     if auto_batch_size {
+        let original = original_batch_size_env();
         if let Some(b) = auto_rec.batch_size_override {
             unsafe { std::env::set_var("EMAT_BATCH_SIZE", b.to_string()) };
         } else {
-            unsafe { std::env::remove_var("EMAT_BATCH_SIZE") };
+            match original {
+                Some(v) => unsafe { std::env::set_var("EMAT_BATCH_SIZE", v) },
+                None => unsafe { std::env::remove_var("EMAT_BATCH_SIZE") },
+            }
         }
     }
     let (ctx, bloom_rule) =
