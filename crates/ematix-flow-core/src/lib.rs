@@ -175,6 +175,14 @@ pub mod dim_join_pushdown;
 // blows L3 at the default 14-partition layout. Opt-in via
 // EMAT_AGG_PARTITION_BOOST=1.
 pub mod agg_partition_boost;
+// Σ.AΩ Phase 1.1 (2026-05-28): plan-time `target_partitions` routing.
+// Walks the LogicalPlan looking for high-cardinality GROUP BY
+// aggregations and recommends a session target_partitions value that
+// keeps the FinalPartitioned hash table cache-resident. Used by the
+// bench harness to route Q18-shape queries to a SessionContext with
+// boosted partitions BEFORE physical planning — letting DataFusion's
+// EnforceDistribution propagate the count naturally.
+pub mod auto_target_partitions;
 // Σ.L.2 (2026-05-21): adaptive runtime workload feedback. Persists
 // per-shape probe outcomes + per-query observability (selectivity,
 // hash collision rate) to a SQLite file (~/.ematix/workload.db by
