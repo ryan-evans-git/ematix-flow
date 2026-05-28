@@ -48,10 +48,12 @@ use std::sync::Arc;
 
 use datafusion::datasource::DefaultTableSource;
 use datafusion::logical_expr::{Aggregate, Expr, JoinType, LogicalPlan, TableScan};
+use datafusion::physical_plan::ExecutionPlan;
+use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode};
 
 use crate::ematix_fast_parquet::EmatixFastParquetTableProvider;
 use crate::fast_parquet::FastParquetTableProvider;
-use crate::workload_log::{AggregateObservation, WorkloadLog};
+use crate::workload_log::{AggregateObservation, WorkloadLog, WorkloadLogError};
 
 /// Target group count per output partition. Same constant as
 /// `agg_partition_boost::TARGET_GROUPS_PER_PARTITION` (50K) — derived
@@ -490,6 +492,103 @@ pub fn recommend_target_partitions_with_log(
             }
         }
     }
+}
+
+/// Σ.AΩ Phase 1.5 — public-API physical-plan walker. Finds the
+/// `Aggregate*Exec` (mode = Final / FinalPartitioned / Single /
+/// SinglePartitioned) with non-empty group_expr and the largest
+/// `output_rows` metric in `plan`. Returns `(input_rows,
+/// output_groups)` of that operator, or `None` if no qualifying
+/// aggregate is found (e.g., query has no GROUP BY, or the plan
+/// hasn't been executed yet so metrics are zero).
+///
+/// **Custom flow-core aggregate operators** (RobinHoodSumF64Exec,
+/// FusedAggregate*Exec, DictGroupCountExec, etc.) replace stock
+/// `AggregateExec` in shape-matched plans. The walker matches them
+/// by `ExecutionPlan::name()` substring, excluding "Partial" so
+/// only the terminal aggregation is counted.
+///
+/// `input_rows` is read from the aggregate's first child's
+/// `output_rows` metric — for a typical Partial → Repartition →
+/// Final pipeline this equals the partial-aggregate row count
+/// (groups × source partitions), not the raw scan rows. Sufficient
+/// for the Phase 1.4 recommender, which only uses `output_groups`.
+pub fn largest_groupby_agg_cardinalities(
+    plan: &dyn ExecutionPlan,
+) -> Option<(u64, u64)> {
+    let mut best = (0u64, 0u64);
+    walk_agg_metrics(plan, &mut best);
+    if best.1 > 0 { Some(best) } else { None }
+}
+
+fn walk_agg_metrics(plan: &dyn ExecutionPlan, best: &mut (u64, u64)) {
+    let mut matched = false;
+    if let Some(agg) = plan.as_any().downcast_ref::<AggregateExec>() {
+        matched = true;
+        let mode_is_terminal = matches!(
+            agg.mode(),
+            AggregateMode::Final
+                | AggregateMode::FinalPartitioned
+                | AggregateMode::Single
+                | AggregateMode::SinglePartitioned
+        );
+        let has_groups = !agg.group_expr().expr().is_empty();
+        if mode_is_terminal && has_groups {
+            consider_agg_node(plan, best);
+        }
+    }
+    if !matched {
+        let n = plan.name();
+        let is_aggregate_like = (n.contains("Aggregate")
+            || n.contains("Agg")
+            || n == "DictGroupCountExec"
+            || n.contains("FusedAggregate"))
+            && !n.contains("Partial");
+        if is_aggregate_like {
+            consider_agg_node(plan, best);
+        }
+    }
+    for child in plan.children() {
+        walk_agg_metrics(child.as_ref(), best);
+    }
+}
+
+fn consider_agg_node(plan: &dyn ExecutionPlan, best: &mut (u64, u64)) {
+    let Some(metrics) = plan.metrics() else {
+        return;
+    };
+    let output_rows = metrics.output_rows().unwrap_or(0) as u64;
+    if output_rows > best.1 {
+        let input_rows = plan
+            .children()
+            .first()
+            .and_then(|c| c.metrics())
+            .and_then(|m| m.output_rows())
+            .unwrap_or(0) as u64;
+        *best = (input_rows, output_rows);
+    }
+}
+
+/// Σ.AΩ Phase 1.5 — convenience: walk `physical_plan` for the
+/// qualifying aggregate's cardinalities and record them to `log`
+/// under `shape_hash`. Returns `Ok(true)` if an observation was
+/// recorded, `Ok(false)` if no qualifying aggregate was found.
+///
+/// Call this AFTER the physical plan has been fully executed
+/// (otherwise metrics will be zero). Cheap enough (~µs) to invoke on
+/// every query execution; Σ.L.2's EWMA smooths across runs.
+pub fn record_observation_from_physical_plan(
+    physical_plan: &dyn ExecutionPlan,
+    shape_hash: &str,
+    log: &WorkloadLog,
+) -> Result<bool, WorkloadLogError> {
+    let Some((input_rows, output_groups)) =
+        largest_groupby_agg_cardinalities(physical_plan)
+    else {
+        return Ok(false);
+    };
+    log.record_aggregate_observation(shape_hash, input_rows, output_groups)?;
+    Ok(true)
 }
 
 #[cfg(test)]

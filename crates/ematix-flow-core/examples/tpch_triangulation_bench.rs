@@ -610,8 +610,6 @@ async fn prefill_observations(
                 }
             }
         }
-        // Walk for the largest-group-by AggregateExec(Final) and
-        // record its (input_rows, output_groups).
         if std::env::var("EMAT_PREFILL_DUMP")
             .ok()
             .map(|v| v == "1")
@@ -620,17 +618,26 @@ async fn prefill_observations(
             println!("  Q{q:02} physical plan after execute:");
             dump_plan_metrics(plan.as_ref(), 2);
         }
-        let (input_rows, output_groups) = largest_groupby_agg_cardinalities(plan.as_ref());
-        if output_groups > 0 {
-            match log.record_aggregate_observation(&hash, input_rows, output_groups) {
-                Ok(()) => println!(
+        match ematix_flow_core::auto_target_partitions::record_observation_from_physical_plan(
+            plan.as_ref(),
+            &hash,
+            log,
+        ) {
+            Ok(true) => {
+                let (input_rows, output_groups) =
+                    ematix_flow_core::auto_target_partitions::largest_groupby_agg_cardinalities(
+                        plan.as_ref(),
+                    )
+                    .unwrap_or((0, 0));
+                println!(
                     "  Q{q:02}: recorded {} input rows / {} groups (hash={})",
                     input_rows, output_groups, hash
-                ),
-                Err(e) => println!("  Q{q:02}: record fail: {e}"),
+                );
             }
-        } else {
-            println!("  Q{q:02}: no group-by AggregateExec(Final) found — skip");
+            Ok(false) => {
+                println!("  Q{q:02}: no group-by terminal aggregate found — skip");
+            }
+            Err(e) => println!("  Q{q:02}: record fail: {e}"),
         }
         if let Some(rule) = bloom_rule.as_ref() {
             rule.set(ContextBlooms::default());
@@ -638,73 +645,6 @@ async fn prefill_observations(
     }
     println!();
     Ok(())
-}
-
-/// Walks `plan` looking for the `AggregateExec(Final|FinalPartitioned)`
-/// with non-empty group_expr and the largest output_rows. Returns
-/// (input_rows, output_rows) of that aggregate, or (0, 0) if none
-/// found. Input rows are read from the aggregate's first child's
-/// own output_rows metric — for a typical Partial → Repartition →
-/// Final pipeline this equals the partial-aggregate row count
-/// (groups × source partitions), not the raw scan rows. Sufficient
-/// for the Phase 1.4 recommender, which only uses output_groups.
-fn largest_groupby_agg_cardinalities(
-    plan: &dyn datafusion::physical_plan::ExecutionPlan,
-) -> (u64, u64) {
-    let mut best = (0u64, 0u64);
-    walk_agg_metrics(plan, &mut best);
-    best
-}
-
-fn walk_agg_metrics(
-    plan: &dyn datafusion::physical_plan::ExecutionPlan,
-    best: &mut (u64, u64),
-) {
-    use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode};
-    let mut matched = false;
-    // Stock DataFusion AggregateExec — Σ.U Phase 1 may rewrite some
-    // SUM/AVG aggregates into custom flow-core operators (handled
-    // below), so we keep the AggregateExec branch as the primary
-    // path for AVG and other shapes that don't trigger a custom rule.
-    if let Some(agg) = plan.as_any().downcast_ref::<AggregateExec>() {
-        matched = true;
-        // Σ.AΩ Phase 1.4: include Single + SinglePartitioned in
-        // addition to the multi-partition Final modes. Q17's inner
-        // AVG agg and Q18's outer GROUP BY agg both materialize as
-        // mode=Single after Σ.U / Σ.Q.L10 pushdowns; restricting to
-        // Final/FinalPartitioned would miss them entirely.
-        let mode_is_terminal = matches!(
-            agg.mode(),
-            AggregateMode::Final
-                | AggregateMode::FinalPartitioned
-                | AggregateMode::Single
-                | AggregateMode::SinglePartitioned
-        );
-        let has_groups = !agg.group_expr().expr().is_empty();
-        if mode_is_terminal && has_groups {
-            consider_agg_node(plan, best);
-        }
-    }
-    if !matched {
-        // Custom flow-core aggregate operators (RobinHoodSumF64Exec,
-        // RobinHoodAggregateExec, DictGroupCountExec, FusedAggregate*)
-        // replace AggregateExec in shape-matched plans. Match by name
-        // since they aren't trivially downcastable from here without
-        // pulling in the generic types. The "Partial" suffix exclusion
-        // skips the pre-aggregation half of two-stage pipelines.
-        let n = plan.name();
-        let is_aggregate_like = (n.contains("Aggregate")
-            || n.contains("Agg")
-            || n == "DictGroupCountExec"
-            || n.contains("FusedAggregate"))
-            && !n.contains("Partial");
-        if is_aggregate_like {
-            consider_agg_node(plan, best);
-        }
-    }
-    for child in plan.children() {
-        walk_agg_metrics(child.as_ref(), best);
-    }
 }
 
 /// Σ.AΩ Phase 1.4 — dump every operator's (name, output_rows) in a
@@ -723,25 +663,6 @@ fn dump_plan_metrics(
     println!("    {}{} (output_rows={})", "  ".repeat(depth), n, output_rows);
     for child in plan.children() {
         dump_plan_metrics(child.as_ref(), depth + 1);
-    }
-}
-
-fn consider_agg_node(
-    plan: &dyn datafusion::physical_plan::ExecutionPlan,
-    best: &mut (u64, u64),
-) {
-    let Some(metrics) = plan.metrics() else {
-        return;
-    };
-    let output_rows = metrics.output_rows().unwrap_or(0) as u64;
-    if output_rows > best.1 {
-        let input_rows = plan
-            .children()
-            .first()
-            .and_then(|c| c.metrics())
-            .and_then(|m| m.output_rows())
-            .unwrap_or(0) as u64;
-        *best = (input_rows, output_rows);
     }
 }
 
@@ -877,6 +798,23 @@ async fn run_ematix_flow(data_dir: &Path, sql: &str) -> Trial {
         if let Some(rule) = bloom_rule.as_ref() {
             rule.set(ContextBlooms::default());
         }
+        // Σ.AΩ Phase 1.5: record observed aggregate cardinality AFTER
+        // elapsed_ms is captured, so the recording cost (~µs) doesn't
+        // leak into the timed window. The Σ.L.2 EWMA smooths across
+        // trials/invocations; within a single process the per-SQL
+        // recommendation cache is stable, so changing observations
+        // mid-process doesn't alter target_partitions for this trial.
+        if let (true, Some(shape_hash), Some(log)) = (
+            auto_target_partitions,
+            auto_rec.shape_hash.as_deref(),
+            workload_log(),
+        ) {
+            let _ = ematix_flow_core::auto_target_partitions::record_observation_from_physical_plan(
+                plan.as_ref(),
+                shape_hash,
+                log,
+            );
+        }
         return Trial::Pass {
             elapsed_ms,
             rows: total_rows,
@@ -1009,9 +947,26 @@ async fn run_ematix_flow(data_dir: &Path, sql: &str) -> Trial {
     } else {
         df
     };
-    let stream = match df.execute_stream().await {
+    // Σ.AΩ Phase 1.5: replace `df.execute_stream()` with explicit
+    // `create_physical_plan() + execute(0)` so we keep a handle to
+    // the executed plan after drain. The post-drain handle is what
+    // `record_observation_from_physical_plan` walks for the largest
+    // group-by aggregate's metrics. Behaviour matches DataFusion's
+    // `execute_stream`: wrap multi-partition plans in
+    // `CoalescePartitionsExec` and execute partition 0.
+    let plan = match df.create_physical_plan().await {
+        Ok(p) => p,
+        Err(e) => return Trial::Fail(format!("plan: {}", short(&e.to_string()))),
+    };
+    let plan: Arc<dyn datafusion::physical_plan::ExecutionPlan> =
+        if plan.output_partitioning().partition_count() > 1 {
+            Arc::new(CoalescePartitionsExec::new(plan))
+        } else {
+            plan
+        };
+    let stream = match plan.execute(0, ctx.task_ctx()) {
         Ok(s) => s,
-        Err(e) => return Trial::Fail(format!("execute_stream: {}", short(&e.to_string()))),
+        Err(e) => return Trial::Fail(format!("execute: {}", short(&e.to_string()))),
     };
     let batches: Result<Vec<_>, _> = stream.try_collect().await;
     let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
@@ -1020,6 +975,19 @@ async fn run_ematix_flow(data_dir: &Path, sql: &str) -> Trial {
     // windows above).
     if let Some(rule) = bloom_rule.as_ref() {
         rule.set(ContextBlooms::default());
+    }
+    // Σ.AΩ Phase 1.5: record observed cardinality AFTER elapsed_ms,
+    // before returning. See the plan-cache branch above for rationale.
+    if let (true, Some(shape_hash), Some(log)) = (
+        auto_target_partitions,
+        auto_rec.shape_hash.as_deref(),
+        workload_log(),
+    ) {
+        let _ = ematix_flow_core::auto_target_partitions::record_observation_from_physical_plan(
+            plan.as_ref(),
+            shape_hash,
+            log,
+        );
     }
     match batches {
         Ok(b) => Trial::Pass {
