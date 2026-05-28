@@ -150,9 +150,13 @@ impl RobinHoodSumF64Exec {
         // Bound below by the previous default and above by a cap that
         // guards against bad stats blowing memory. 32M buckets × 24 B =
         // ~768 MB per partition worst case.
-        const MIN_INIT_CAP: usize = 65_536;
+        // Σ.AΩ Phase 2.6 (E.3): floor overridable via `EMAT_RH_INITIAL_CAP`.
+        let min_init_cap: usize = std::env::var("EMAT_RH_INITIAL_CAP")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(65_536);
         const MAX_INIT_CAP: usize = 32 * 1024 * 1024;
-        let init_cap = raw_cap.clamp(MIN_INIT_CAP, MAX_INIT_CAP);
+        let init_cap = raw_cap.clamp(min_init_cap, MAX_INIT_CAP);
         Ok(Self {
             input,
             group_col_idx,

@@ -181,9 +181,13 @@ impl RobinHoodAvgF64Exec {
             RobinHoodAvgF64Mode::Partial => per_partition_rows / 4,
             RobinHoodAvgF64Mode::FinalPartitioned => per_partition_rows,
         };
-        const MIN_INIT_CAP: usize = 65_536;
+        // Σ.AΩ Phase 2.6 (E.3): floor overridable via `EMAT_RH_INITIAL_CAP`.
+        let min_init_cap: usize = std::env::var("EMAT_RH_INITIAL_CAP")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(65_536);
         const MAX_INIT_CAP: usize = 32 * 1024 * 1024;
-        let init_cap = raw_cap.clamp(MIN_INIT_CAP, MAX_INIT_CAP);
+        let init_cap = raw_cap.clamp(min_init_cap, MAX_INIT_CAP);
 
         Ok(Self {
             input,

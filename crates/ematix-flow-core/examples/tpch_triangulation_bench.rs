@@ -1286,12 +1286,21 @@ async fn run_ematix_flow(data_dir: &Path, sql: &str) -> Trial {
                         .ok()
                         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                         .unwrap_or(false);
-                    let reorder_fn: fn(_) -> _ = if gated {
-                        ematix_flow_core::join_reorder::reorder_inner_joins_shape_gated
+                    // Σ.AΩ Phase 2.5 (C.1): override max_leaves on the
+                    // shape-gated path only. Default 4; sweep {3,4,5,6}.
+                    let max_leaves_env: Option<usize> = std::env::var("EMAT_REORDER_MAX_LEAVES")
+                        .ok()
+                        .and_then(|s| s.parse().ok());
+                    let reorder_result = if gated {
+                        let mut opts = ematix_flow_core::join_reorder::ReorderOpts::default();
+                        if let Some(n) = max_leaves_env {
+                            opts.max_leaves = n;
+                        }
+                        ematix_flow_core::join_reorder::reorder_inner_joins_with_opts(plan, opts)
                     } else {
-                        ematix_flow_core::join_reorder::reorder_inner_joins
+                        ematix_flow_core::join_reorder::reorder_inner_joins(plan)
                     };
-                    match reorder_fn(plan) {
+                    match reorder_result {
                         Ok(p) => p,
                         Err(e) => {
                             return Trial::Fail(format!(
