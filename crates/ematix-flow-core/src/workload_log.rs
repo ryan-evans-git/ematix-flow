@@ -19,6 +19,11 @@
 //!   partition boosts on small-cardinality aggregates that the
 //!   plan-time `TableScan.num_rows()` estimator over-counts. Added in
 //!   schema_version 2.
+//! - `partition_race_outcomes` — per shape hash, the wall times at
+//!   the plan-time formula partition count vs cores. Σ.AΩ Phase 1.6's
+//!   Σ.L.1-style speculative race writes here; the recommender reads
+//!   `winner_partitions` directly, bypassing the heavy-join gate.
+//!   Added in schema_version 3.
 //!
 //! ## Why SQLite (not a flat file)
 //!
@@ -120,7 +125,18 @@ impl WorkloadLog {
                 last_seen_unix    INTEGER NOT NULL,
                 PRIMARY KEY (shape_hash)
             );
-            INSERT OR IGNORE INTO schema_version (version) VALUES (2);
+            CREATE TABLE IF NOT EXISTS partition_race_outcomes (
+                shape_hash         TEXT NOT NULL,
+                formula_partitions INTEGER NOT NULL,
+                cores_partitions   INTEGER NOT NULL,
+                formula_ms         REAL NOT NULL,
+                cores_ms           REAL NOT NULL,
+                winner_partitions  INTEGER NOT NULL,
+                n_observations     INTEGER NOT NULL DEFAULT 1,
+                last_seen_unix     INTEGER NOT NULL,
+                PRIMARY KEY (shape_hash)
+            );
+            INSERT OR IGNORE INTO schema_version (version) VALUES (3);
             "#,
         )
         .map_err(WorkloadLogError::Db)?;
@@ -347,6 +363,133 @@ pub struct AggregateObservation {
     pub n_observations: i64,
 }
 
+/// Σ.AΩ Phase 1.6 — winner verdict from a 2-way partition-routing
+/// race (formula partitions vs cores). The recommender consumes
+/// `winner_partitions` directly.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PartitionRaceOutcome {
+    pub formula_partitions: u32,
+    pub cores_partitions: u32,
+    pub formula_ms: f64,
+    pub cores_ms: f64,
+    pub winner_partitions: u32,
+    pub n_observations: i64,
+}
+
+impl WorkloadLog {
+    /// Σ.AΩ Phase 1.6 — record a partition-routing race outcome.
+    /// `winner_partitions` should be picked by the caller via a 5%
+    /// margin rule (matches Σ.L.1's `dict_wins` semantics): formula
+    /// wins iff `formula_ms <= cores_ms * 0.95`, else cores wins.
+    /// EWMA-smooths wall times on subsequent observations.
+    pub fn record_partition_race(
+        &self,
+        shape_hash: &str,
+        formula_partitions: u32,
+        cores_partitions: u32,
+        formula_ms: f64,
+        cores_ms: f64,
+        winner_partitions: u32,
+    ) -> Result<(), WorkloadLogError> {
+        let now = unix_now();
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            r#"
+            INSERT INTO partition_race_outcomes
+              (shape_hash, formula_partitions, cores_partitions,
+               formula_ms, cores_ms, winner_partitions,
+               n_observations, last_seen_unix)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7)
+            ON CONFLICT (shape_hash) DO UPDATE SET
+              formula_ms        = 0.7 * formula_ms + 0.3 * excluded.formula_ms,
+              cores_ms          = 0.7 * cores_ms   + 0.3 * excluded.cores_ms,
+              -- Re-evaluate winner on each observation in case the
+              -- 5%-margin verdict flipped after smoothing.
+              winner_partitions = CASE
+                  WHEN (0.7 * formula_ms + 0.3 * excluded.formula_ms)
+                       <= (0.7 * cores_ms + 0.3 * excluded.cores_ms) * 0.95
+                  THEN formula_partitions
+                  ELSE cores_partitions
+                END,
+              n_observations    = n_observations + 1,
+              last_seen_unix    = excluded.last_seen_unix
+            "#,
+            params![
+                shape_hash,
+                formula_partitions as i64,
+                cores_partitions as i64,
+                formula_ms,
+                cores_ms,
+                winner_partitions as i64,
+                now,
+            ],
+        )
+        .map_err(WorkloadLogError::Db)?;
+        Ok(())
+    }
+
+    /// Σ.AΩ Phase 1.6 — consult the partition-race verdict. Returns
+    /// `Some(outcome)` iff this shape has been observed at least
+    /// `min_observations` times. The recommender uses
+    /// `outcome.winner_partitions` directly.
+    pub fn consult_partition_race(
+        &self,
+        shape_hash: &str,
+        min_observations: i64,
+    ) -> Result<Option<PartitionRaceOutcome>, WorkloadLogError> {
+        let conn = self.conn.lock().unwrap();
+        let row = conn
+            .query_row(
+                r#"
+                SELECT formula_partitions, cores_partitions,
+                       formula_ms, cores_ms,
+                       winner_partitions, n_observations
+                  FROM partition_race_outcomes
+                 WHERE shape_hash = ?1
+                "#,
+                params![shape_hash],
+                |r| {
+                    Ok(PartitionRaceOutcome {
+                        formula_partitions: r.get::<_, i64>(0)? as u32,
+                        cores_partitions: r.get::<_, i64>(1)? as u32,
+                        formula_ms: r.get::<_, f64>(2)?,
+                        cores_ms: r.get::<_, f64>(3)?,
+                        winner_partitions: r.get::<_, i64>(4)? as u32,
+                        n_observations: r.get::<_, i64>(5)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(WorkloadLogError::Db)?;
+        Ok(row.and_then(|o| {
+            if o.n_observations >= min_observations {
+                Some(o)
+            } else {
+                None
+            }
+        }))
+    }
+}
+
+/// Σ.AΩ Phase 1.6 — picks the race winner using the same 5%-margin
+/// rule as [`crate::dict_routing::ProbeResult::dict_wins`]. Formula
+/// only wins if it beats cores by ≥ 5 %; otherwise cores wins (we
+/// prefer the lower partition count when timings are close, since
+/// it has less coordination overhead and matches the shipping
+/// default).
+pub fn pick_partition_race_winner(
+    formula_partitions: u32,
+    cores_partitions: u32,
+    formula_ms: f64,
+    cores_ms: f64,
+) -> u32 {
+    if formula_ms <= cores_ms * 0.95 {
+        formula_partitions
+    } else {
+        cores_partitions
+    }
+}
+
 fn unix_now() -> i64 {
     SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -497,5 +640,72 @@ mod tests {
             log.consult_aggregate_observation("never_seen", 1).unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn partition_race_picks_formula_when_faster_by_5pct() {
+        // 100ms vs 110ms — formula beats cores by >5%, formula wins.
+        assert_eq!(pick_partition_race_winner(112, 14, 100.0, 110.0), 112);
+        // 100ms vs 105ms — within 5% (105 * 0.95 = 99.75), cores wins
+        // since we prefer the lower count on ties.
+        assert_eq!(pick_partition_race_winner(112, 14, 100.0, 105.0), 14);
+        // 100ms vs 200ms — formula wins clearly.
+        assert_eq!(pick_partition_race_winner(112, 14, 100.0, 200.0), 112);
+        // 200ms vs 100ms — cores wins clearly.
+        assert_eq!(pick_partition_race_winner(112, 14, 200.0, 100.0), 14);
+    }
+
+    #[test]
+    fn partition_race_round_trip() {
+        let log = WorkloadLog::open_in_memory().unwrap();
+        // Q18-like: formula 112 wins by lots
+        log.record_partition_race("q18_shape", 112, 14, 300.0, 360.0, 112)
+            .unwrap();
+        let o = log
+            .consult_partition_race("q18_shape", 1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(o.winner_partitions, 112);
+        assert_eq!(o.formula_partitions, 112);
+        assert_eq!(o.cores_partitions, 14);
+        assert!((o.formula_ms - 300.0).abs() < 1e-6);
+        assert!((o.cores_ms - 360.0).abs() < 1e-6);
+        assert_eq!(o.n_observations, 1);
+    }
+
+    #[test]
+    fn partition_race_distinct_shapes() {
+        let log = WorkloadLog::open_in_memory().unwrap();
+        log.record_partition_race("q17_shape", 112, 14, 200.0, 150.0, 14)
+            .unwrap();
+        log.record_partition_race("q18_shape", 112, 14, 300.0, 360.0, 112)
+            .unwrap();
+        let o17 = log
+            .consult_partition_race("q17_shape", 1)
+            .unwrap()
+            .unwrap();
+        let o18 = log
+            .consult_partition_race("q18_shape", 1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(o17.winner_partitions, 14);
+        assert_eq!(o18.winner_partitions, 112);
+    }
+
+    #[test]
+    fn partition_race_ewma_can_flip_winner() {
+        // Record-1: formula 300ms vs cores 360ms — formula wins.
+        let log = WorkloadLog::open_in_memory().unwrap();
+        log.record_partition_race("shape_x", 112, 14, 300.0, 360.0, 112)
+            .unwrap();
+        // Record-2: formula degrades to 500ms vs cores stays at 360ms.
+        //   EWMA formula_ms = 0.7*300 + 0.3*500 = 360
+        //   EWMA cores_ms   = 0.7*360 + 0.3*360 = 360
+        //   formula_ms (360) > cores_ms (360) * 0.95 (342) → cores wins
+        log.record_partition_race("shape_x", 112, 14, 500.0, 360.0, 14)
+            .unwrap();
+        let o = log.consult_partition_race("shape_x", 1).unwrap().unwrap();
+        assert_eq!(o.n_observations, 2);
+        assert_eq!(o.winner_partitions, 14);
     }
 }

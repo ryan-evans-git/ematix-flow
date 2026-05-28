@@ -494,6 +494,37 @@ pub fn recommend_target_partitions_with_log(
     }
 }
 
+/// Σ.AΩ Phase 1.6 — race-aware recommender. Consults
+/// `partition_race_outcomes` first; if a verdict exists, uses the
+/// race winner directly (bypassing the Phase 1.4 cardinality +
+/// heavy-join heuristic). Falls back to
+/// [`recommend_target_partitions_with_log`] otherwise so cold-start
+/// queries still benefit from Phase 1.4's reasoning.
+///
+/// The race table is keyed by `aggregate_shape_hash`, so this
+/// function is a no-op (returns `session_cores`) for queries with no
+/// qualifying aggregate. That matches Phase 1.4/1.5 semantics — only
+/// queries with a shape hash get routed.
+pub fn recommend_target_partitions_via_race(
+    plan: &LogicalPlan,
+    session_cores: usize,
+    log: Option<&WorkloadLog>,
+) -> usize {
+    let Some(shape_hash) = qualifying_aggregate_shape_hash(plan) else {
+        return recommend_target_partitions(plan, session_cores);
+    };
+    if let Some(log) = log {
+        if let Ok(Some(race)) =
+            log.consult_partition_race(&shape_hash, MIN_OBSERVATIONS_FOR_CONSULT)
+        {
+            return race.winner_partitions as usize;
+        }
+    }
+    // No race verdict yet — Phase 1.5 logic (observation-aware with
+    // heavy-join gate) handles the cold-start case.
+    recommend_target_partitions_with_log(plan, session_cores, log)
+}
+
 /// Σ.AΩ Phase 1.5 — public-API physical-plan walker. Finds the
 /// `Aggregate*Exec` (mode = Final / FinalPartitioned / Single /
 /// SinglePartitioned) with non-empty group_expr and the largest
@@ -773,6 +804,36 @@ mod tests {
             recommend_target_partitions_with_log(&plan_q18, 14, Some(&log)),
             112,
             "Q18 with observation 624<50K BUT ≥2 large scans → plan boost"
+        );
+
+        // Σ.AΩ Phase 1.6 — race verdict overrides Phase 1.4 reasoning.
+        // Before any race observation, the race-aware recommender
+        // falls through to Phase 1.5 (same answer as above).
+        assert_eq!(
+            recommend_target_partitions_via_race(&plan_q17, 14, Some(&log)),
+            14,
+            "Q17 no race verdict → Phase 1.5 fallback (cores)"
+        );
+        assert_eq!(
+            recommend_target_partitions_via_race(&plan_q18, 14, Some(&log)),
+            112,
+            "Q18 no race verdict → Phase 1.5 fallback (boost)"
+        );
+
+        // Record race verdicts: cores wins Q17, formula wins Q18.
+        log.record_partition_race(&h17_str, 112, 14, 200.0, 152.0, 14)?;
+        log.record_partition_race(&h18_str, 112, 14, 300.0, 360.0, 112)?;
+
+        // Race-aware recommender uses winner directly.
+        assert_eq!(
+            recommend_target_partitions_via_race(&plan_q17, 14, Some(&log)),
+            14,
+            "Q17 race verdict says cores wins"
+        );
+        assert_eq!(
+            recommend_target_partitions_via_race(&plan_q18, 14, Some(&log)),
+            112,
+            "Q18 race verdict says formula wins"
         );
 
         Ok(())

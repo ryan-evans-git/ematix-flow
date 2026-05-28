@@ -311,6 +311,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
+    // Σ.AΩ Phase 1.6: race prefill mode. Runs each query twice at
+    // the formula partition count and twice at session cores, takes
+    // min on each side, records the verdict to
+    // `partition_race_outcomes`. The recommender then consults the
+    // race log first via `recommend_target_partitions_via_race`.
+    let race_prefill_mode = std::env::var("EMAT_RACE_PREFILL")
+        .ok()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if race_prefill_mode {
+        race_prefill_observations(&data_dir, &queries_dir, &query_subset).await?;
+        return Ok(());
+    }
+
     println!("=== TPC-H 22 triangulation bench ===");
     println!("    data:    {}", data_dir.display());
     println!("    queries: {} ({:?})", query_subset.len(), query_subset);
@@ -482,7 +496,10 @@ async fn compute_auto_target_partitions(
         return AutoPartitionsRec::default();
     };
     let log = workload_log().map(|a| a.as_ref());
-    let n = ematix_flow_core::auto_target_partitions::recommend_target_partitions_with_log(
+    // Σ.AΩ Phase 1.6: race-aware recommender consults
+    // partition_race_outcomes first; falls through to Phase 1.5's
+    // observation-aware path on cold start (no race verdict yet).
+    let n = ematix_flow_core::auto_target_partitions::recommend_target_partitions_via_race(
         &plan,
         session_cores,
         log,
@@ -645,6 +662,206 @@ async fn prefill_observations(
     }
     println!();
     Ok(())
+}
+
+/// Σ.AΩ Phase 1.6 — Σ.L.1-style 2-way partition race. For each query
+/// with a qualifying aggregate shape, runs the query twice at the
+/// plan-time formula partition count and twice at session cores,
+/// takes the min wall time on each side, picks a winner via the
+/// `pick_partition_race_winner` 5%-margin rule, and records the
+/// verdict to the `partition_race_outcomes` table.
+///
+/// After race prefill, mode B in a strict A/B run consults the
+/// race verdict directly and bypasses Phase 1.4's heuristic — Q17's
+/// cores-wins verdict and Q18's formula-wins verdict are decided by
+/// empirical wall time rather than by the
+/// distinct-large-table predicate.
+async fn race_prefill_observations(
+    data_dir: &Path,
+    queries_dir: &Path,
+    query_subset: &[u8],
+) -> Result<(), Box<dyn std::error::Error>> {
+    use ematix_flow_core::workload_log::pick_partition_race_winner;
+    let Some(log) = workload_log() else {
+        println!("EMAT_RACE_PREFILL: workload_log unavailable — skip");
+        return Ok(());
+    };
+    println!("=== Σ.AΩ Phase 1.6 race prefill ===");
+    println!("    data:    {}", data_dir.display());
+    println!("    queries: {} ({:?})", query_subset.len(), query_subset);
+    println!();
+
+    let session_cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(14);
+
+    for &q in query_subset {
+        let sql_path = queries_dir.join(format!("q{q:02}.sql"));
+        let Ok(sql) = std::fs::read_to_string(&sql_path) else {
+            continue;
+        };
+        // Phase 1.3 formula recommendation for this SQL. Compute it
+        // without the log to get the plan-time-only answer (so the
+        // race is genuinely formula-vs-cores, not log-vs-cores).
+        let formula_partitions = match compute_formula_partitions(
+            data_dir,
+            &sql,
+            session_cores,
+        )
+        .await
+        {
+            Some(n) => n,
+            None => {
+                println!("  Q{q:02}: no qualifying aggregate — skip");
+                continue;
+            }
+        };
+        if formula_partitions == session_cores {
+            println!(
+                "  Q{q:02}: formula == cores ({session_cores}) — no race needed"
+            );
+            continue;
+        }
+        // Need the shape hash to key the race outcome. Recompute via
+        // the same mini-ctx the recommender uses (one parse, cheap).
+        let shape_hash = match compute_shape_hash(data_dir, &sql).await {
+            Some(h) => h,
+            None => {
+                println!("  Q{q:02}: shape hash unavailable — skip");
+                continue;
+            }
+        };
+
+        // Two reps at each partition count; take the min (Σ.L.1
+        // pattern). Default first to warm OS cache, then formula —
+        // matches the order in `dict_routing::probe_dict_vs_default`.
+        let cores_ms_1 = time_one(data_dir, &sql, Some(session_cores)).await;
+        let formula_ms_1 = time_one(data_dir, &sql, Some(formula_partitions)).await;
+        let cores_ms_2 = time_one(data_dir, &sql, Some(session_cores)).await;
+        let formula_ms_2 = time_one(data_dir, &sql, Some(formula_partitions)).await;
+        let cores_ms = match (cores_ms_1, cores_ms_2) {
+            (Some(a), Some(b)) => a.min(b),
+            (Some(x), None) | (None, Some(x)) => x,
+            (None, None) => {
+                println!("  Q{q:02}: cores-side timing failed — skip");
+                continue;
+            }
+        };
+        let formula_ms = match (formula_ms_1, formula_ms_2) {
+            (Some(a), Some(b)) => a.min(b),
+            (Some(x), None) | (None, Some(x)) => x,
+            (None, None) => {
+                println!("  Q{q:02}: formula-side timing failed — skip");
+                continue;
+            }
+        };
+        let winner = pick_partition_race_winner(
+            formula_partitions as u32,
+            session_cores as u32,
+            formula_ms,
+            cores_ms,
+        );
+        if let Err(e) = log.record_partition_race(
+            &shape_hash,
+            formula_partitions as u32,
+            session_cores as u32,
+            formula_ms,
+            cores_ms,
+            winner,
+        ) {
+            println!("  Q{q:02}: record race fail: {e}");
+        } else {
+            println!(
+                "  Q{q:02}: formula({formula_partitions})={formula_ms:.2}ms vs cores({session_cores})={cores_ms:.2}ms → winner={winner} (hash={shape_hash})"
+            );
+        }
+    }
+    println!();
+    Ok(())
+}
+
+async fn compute_formula_partitions(
+    data_dir: &Path,
+    sql: &str,
+    session_cores: usize,
+) -> Option<usize> {
+    let ctx = SessionContext::new();
+    for t in TPCH_TABLES {
+        let path = data_dir.join(format!("{t}.parquet"));
+        if !path.exists() {
+            return None;
+        }
+        if *t == "lineitem" {
+            let prov = EmatixFastParquetTableProvider::try_new(path.to_string_lossy()).ok()?;
+            ctx.register_table(*t, Arc::new(prov)).ok()?;
+        } else {
+            let prov = FastParquetTableProvider::try_new(path.to_string_lossy()).ok()?;
+            ctx.register_table(*t, Arc::new(prov)).ok()?;
+        }
+    }
+    let df = ctx.sql(sql).await.ok()?;
+    let plan = df.into_optimized_plan().ok()?;
+    let n = ematix_flow_core::auto_target_partitions::recommend_target_partitions(
+        &plan,
+        session_cores,
+    );
+    Some(n)
+}
+
+async fn compute_shape_hash(data_dir: &Path, sql: &str) -> Option<String> {
+    let ctx = SessionContext::new();
+    for t in TPCH_TABLES {
+        let path = data_dir.join(format!("{t}.parquet"));
+        if !path.exists() {
+            return None;
+        }
+        if *t == "lineitem" {
+            let prov = EmatixFastParquetTableProvider::try_new(path.to_string_lossy()).ok()?;
+            ctx.register_table(*t, Arc::new(prov)).ok()?;
+        } else {
+            let prov = FastParquetTableProvider::try_new(path.to_string_lossy()).ok()?;
+            ctx.register_table(*t, Arc::new(prov)).ok()?;
+        }
+    }
+    let df = ctx.sql(sql).await.ok()?;
+    let plan = df.into_optimized_plan().ok()?;
+    ematix_flow_core::auto_target_partitions::qualifying_aggregate_shape_hash(&plan)
+}
+
+/// Σ.AΩ Phase 1.6 — runs the query end-to-end at the requested
+/// partition count and returns wall-ms. Applies the same default-on
+/// logical rewrites as `run_ematix_flow` so race timings reflect
+/// what the bench will actually execute.
+async fn time_one(data_dir: &Path, sql: &str, partitions: Option<usize>) -> Option<f64> {
+    let (ctx, bloom_rule) = build_ematix_ctx(data_dir, partitions).await.ok()?;
+    let df = ctx.sql(sql).await.ok()?;
+    let logical_plan = df.into_optimized_plan().ok()?;
+    let logical_plan =
+        ematix_flow_core::agg_filter_pushdown::push_filter_into_agg(logical_plan).ok()?;
+    let logical_plan =
+        ematix_flow_core::dim_join_pushdown::push_dim_join_into_chain(logical_plan).ok()?;
+    let df = ctx.execute_logical_plan(logical_plan).await.ok()?;
+    let t0 = Instant::now();
+    let plan = df.create_physical_plan().await.ok()?;
+    let plan: Arc<dyn datafusion::physical_plan::ExecutionPlan> =
+        if plan.output_partitioning().partition_count() > 1 {
+            Arc::new(CoalescePartitionsExec::new(plan))
+        } else {
+            plan
+        };
+    let mut stream = plan.execute(0, ctx.task_ctx()).ok()?;
+    loop {
+        match stream.try_next().await {
+            Ok(Some(_)) => {}
+            Ok(None) => break,
+            Err(_) => return None,
+        }
+    }
+    let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    if let Some(rule) = bloom_rule.as_ref() {
+        rule.set(ContextBlooms::default());
+    }
+    Some(elapsed_ms)
 }
 
 /// Σ.AΩ Phase 1.4 — dump every operator's (name, output_rows) in a
