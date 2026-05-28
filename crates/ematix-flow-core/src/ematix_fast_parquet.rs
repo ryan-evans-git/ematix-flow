@@ -22,9 +22,10 @@
 //! [`crate::fast_parquet::FastParquetTableProvider`].
 
 use std::any::Any;
+use std::collections::HashMap;
 use std::fs::File;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use arrow_array::{Array, RecordBatch};
 use arrow_schema::{DataType, Schema, SchemaRef};
@@ -1474,6 +1475,54 @@ pub struct EmatixFastParquetTableProvider {
     streaming_arrow_reader: bool,
 }
 
+/// Σ.Q06.SF10 (2026-05-28): cached metadata-derived state for
+/// `EmatixFastParquetTableProvider`. Populating these on every
+/// `try_new` call is expensive — `column_stats` runs the dict-page
+/// distinct-count walk (Σ.AH.2 Story 1'.2), which decompresses every
+/// dict page of every row group with Snappy. For SF=10 lineitem
+/// that's up to 928 Snappy decompresses per construction. Profiled
+/// at ~2 ms/Q06-trial in `EMAT_SKIP_DICT_DISTINCT=1` A/B but the
+/// underlying SerializedPageReader cost is higher when accumulated
+/// across all 22 queries. Cache lives in `provider_meta_cache()`
+/// keyed by (canonical-path, file-size, mtime-nanos) so a file
+/// edit invalidates the entry.
+#[derive(Clone)]
+struct CachedProviderMeta {
+    schema: SchemaRef,
+    num_row_groups: usize,
+    num_rows: usize,
+    rg_num_rows: Arc<Vec<usize>>,
+    column_stats: Arc<Vec<datafusion::common::stats::ColumnStatistics>>,
+    column_is_dict_encoded: Arc<Vec<bool>>,
+    column_has_no_nulls: Arc<Vec<bool>>,
+}
+
+type ProviderMetaCacheKey = (PathBuf, u64, u128);
+
+static PROVIDER_META_CACHE: OnceLock<Mutex<HashMap<ProviderMetaCacheKey, CachedProviderMeta>>> =
+    OnceLock::new();
+
+fn provider_meta_cache() -> &'static Mutex<HashMap<ProviderMetaCacheKey, CachedProviderMeta>> {
+    PROVIDER_META_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Build a stable cache key from a file path. Uses canonical path +
+/// `len` + `mtime` (nanos) so the entry invalidates when the file
+/// changes underneath us. Returns `None` if any stat-call fails —
+/// the caller then bypasses the cache and constructs fresh.
+fn provider_meta_cache_key(path: &str) -> Option<ProviderMetaCacheKey> {
+    let canonical = std::fs::canonicalize(path).ok()?;
+    let metadata = std::fs::metadata(&canonical).ok()?;
+    let size = metadata.len();
+    let mtime_nanos = metadata
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    Some((canonical, size, mtime_nanos))
+}
+
 impl EmatixFastParquetTableProvider {
     /// Open the parquet file, validate that every column is one of the
     /// primitive types the bridge supports, and build the Arrow
@@ -1481,6 +1530,23 @@ impl EmatixFastParquetTableProvider {
     /// callers don't discover this mid-scan.
     pub fn try_new(path: impl Into<String>) -> DfResult<Self> {
         let path = path.into();
+        // Σ.Q06.SF10 (2026-05-28): check process-global metadata cache
+        // first. On hit, skip the entire SerializedFileReader path
+        // (Snappy decompress of dict pages, encoding-stats walk,
+        // no-nulls walk) and build `Self` directly from cached Arc'd
+        // fields. Opt-out via `EMAT_NO_PROVIDER_CACHE=1`.
+        let use_cache = std::env::var("EMAT_NO_PROVIDER_CACHE")
+            .ok()
+            .map(|v| !(v == "1" || v.eq_ignore_ascii_case("true")))
+            .unwrap_or(true);
+        if use_cache {
+            if let Some(key) = provider_meta_cache_key(&path) {
+                let cached = provider_meta_cache().lock().unwrap().get(&key).cloned();
+                if let Some(meta) = cached {
+                    return Ok(Self::from_cached_meta(path, meta));
+                }
+            }
+        }
         let file = File::open(&path).map_err(|e| {
             DataFusionError::External(
                 format!("EmatixFastParquetTableProvider: open `{path}`: {e}").into(),
@@ -1647,7 +1713,18 @@ impl EmatixFastParquetTableProvider {
         // Cost: one decode of each dict page (typically 1-10 KB per
         // RG); a few ms per provider construction. Cached for the
         // session via `column_stats`.
-        {
+        // Σ.Q06.SF10 spike (2026-05-28): the dict-page distinct-count
+        // walk below decompresses every dict page of every RG of every
+        // column — for SF=10 lineitem that's up to 928 Snappy
+        // decompresses, ~19 ms of main-thread CPU per provider
+        // construction. Skippable via `EMAT_SKIP_DICT_DISTINCT=1` to
+        // measure the impact before adding a proper process-global
+        // cache. Default OFF (preserves existing behaviour).
+        let skip_dict_distinct = std::env::var("EMAT_SKIP_DICT_DISTINCT")
+            .ok()
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        if !skip_dict_distinct {
             use datafusion::common::stats::Precision;
             use datafusion::parquet::column::page::Page;
             let mut column_stats_vec: Vec<datafusion::common::stats::ColumnStatistics> =
@@ -1705,6 +1782,24 @@ impl EmatixFastParquetTableProvider {
         }
         let column_has_no_nulls: Arc<Vec<bool>> = Arc::new(no_nulls);
 
+        // Σ.Q06.SF10: populate the process-global cache before
+        // returning. Subsequent constructions for the same file
+        // skip the SerializedPageReader path entirely.
+        if use_cache {
+            if let Some(key) = provider_meta_cache_key(&path) {
+                let meta = CachedProviderMeta {
+                    schema: schema.clone(),
+                    num_row_groups,
+                    num_rows,
+                    rg_num_rows: rg_num_rows.clone(),
+                    column_stats: column_stats.clone(),
+                    column_is_dict_encoded: column_is_dict_encoded.clone(),
+                    column_has_no_nulls: column_has_no_nulls.clone(),
+                };
+                provider_meta_cache().lock().unwrap().insert(key, meta);
+            }
+        }
+
         Ok(Self {
             path,
             schema,
@@ -1730,6 +1825,25 @@ impl EmatixFastParquetTableProvider {
             // Q13/Q16/Q19/Q22). Closing them is the next bite.
             streaming_arrow_reader: true,
         })
+    }
+
+    /// Σ.Q06.SF10 (2026-05-28): fast-path constructor used when the
+    /// process-global metadata cache has an entry for this file.
+    /// Defaults match `try_new`'s slow-path return.
+    fn from_cached_meta(path: String, meta: CachedProviderMeta) -> Self {
+        Self {
+            path,
+            schema: meta.schema,
+            num_row_groups: meta.num_row_groups,
+            num_rows: meta.num_rows,
+            rg_num_rows: meta.rg_num_rows,
+            column_stats: meta.column_stats,
+            column_is_dict_encoded: meta.column_is_dict_encoded,
+            column_has_no_nulls: meta.column_has_no_nulls,
+            late_mat: true,
+            dict_preservation: false,
+            streaming_arrow_reader: true,
+        }
     }
 
     /// Σ.E5a: opt into / out of the Π.10 late-materialisation path.
