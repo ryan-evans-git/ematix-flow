@@ -13,6 +13,12 @@
 //!   row counts (for future cost-based decisions).
 //! - `predicate_selectivity` — per (table, col, op), observed
 //!   selectivity ratios for Σ.L.3 + Σ.L.5.
+//! - `aggregate_observations` — per `LogicalPlan` aggregate shape
+//!   hash, observed input rows + output group cardinality. Consumed
+//!   by Σ.AΩ Phase 1.4's runtime-feedback recommender to refuse
+//!   partition boosts on small-cardinality aggregates that the
+//!   plan-time `TableScan.num_rows()` estimator over-counts. Added in
+//!   schema_version 2.
 //!
 //! ## Why SQLite (not a flat file)
 //!
@@ -106,7 +112,15 @@ impl WorkloadLog {
                 last_seen_unix  INTEGER NOT NULL,
                 PRIMARY KEY (table_name, col_name, op)
             );
-            INSERT OR IGNORE INTO schema_version (version) VALUES (1);
+            CREATE TABLE IF NOT EXISTS aggregate_observations (
+                shape_hash        TEXT NOT NULL,
+                agg_input_rows    INTEGER NOT NULL,
+                agg_output_groups INTEGER NOT NULL,
+                n_observations    INTEGER NOT NULL DEFAULT 1,
+                last_seen_unix    INTEGER NOT NULL,
+                PRIMARY KEY (shape_hash)
+            );
+            INSERT OR IGNORE INTO schema_version (version) VALUES (2);
             "#,
         )
         .map_err(WorkloadLogError::Db)?;
@@ -255,6 +269,82 @@ impl WorkloadLog {
             .map_err(WorkloadLogError::Db)?;
         Ok(r)
     }
+
+    /// Σ.AΩ Phase 1.4 — record observed aggregate cardinalities for a
+    /// `LogicalPlan` aggregate shape. `shape_hash` is computed by
+    /// `auto_target_partitions::aggregate_shape_hash`. Updates via
+    /// EWMA (α=0.3) on subsequent observations.
+    pub fn record_aggregate_observation(
+        &self,
+        shape_hash: &str,
+        agg_input_rows: u64,
+        agg_output_groups: u64,
+    ) -> Result<(), WorkloadLogError> {
+        let now = unix_now();
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            r#"
+            INSERT INTO aggregate_observations
+              (shape_hash, agg_input_rows, agg_output_groups, n_observations, last_seen_unix)
+            VALUES (?1, ?2, ?3, 1, ?4)
+            ON CONFLICT (shape_hash) DO UPDATE SET
+              agg_input_rows    = CAST(0.7 * agg_input_rows    + 0.3 * excluded.agg_input_rows    AS INTEGER),
+              agg_output_groups = CAST(0.7 * agg_output_groups + 0.3 * excluded.agg_output_groups AS INTEGER),
+              n_observations    = n_observations + 1,
+              last_seen_unix    = excluded.last_seen_unix
+            "#,
+            params![shape_hash, agg_input_rows as i64, agg_output_groups as i64, now],
+        )
+        .map_err(WorkloadLogError::Db)?;
+        Ok(())
+    }
+
+    /// Σ.AΩ Phase 1.4 — consult observed aggregate cardinalities for
+    /// a shape. Returns `Some(observation)` iff we've seen this shape
+    /// at least `min_observations` times. The recommender uses the
+    /// returned `agg_output_groups` as the partition-sizing signal in
+    /// place of the plan-time `TableScan.num_rows()` upper bound.
+    pub fn consult_aggregate_observation(
+        &self,
+        shape_hash: &str,
+        min_observations: i64,
+    ) -> Result<Option<AggregateObservation>, WorkloadLogError> {
+        let conn = self.conn.lock().unwrap();
+        let row = conn
+            .query_row(
+                r#"
+                SELECT agg_input_rows, agg_output_groups, n_observations
+                  FROM aggregate_observations
+                 WHERE shape_hash = ?1
+                "#,
+                params![shape_hash],
+                |r| {
+                    Ok(AggregateObservation {
+                        agg_input_rows: r.get::<_, i64>(0)? as u64,
+                        agg_output_groups: r.get::<_, i64>(1)? as u64,
+                        n_observations: r.get::<_, i64>(2)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(WorkloadLogError::Db)?;
+        Ok(row.and_then(|o| {
+            if o.n_observations >= min_observations {
+                Some(o)
+            } else {
+                None
+            }
+        }))
+    }
+}
+
+/// Σ.AΩ Phase 1.4 — observed cardinalities for one `LogicalPlan`
+/// aggregate shape, returned by `consult_aggregate_observation`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AggregateObservation {
+    pub agg_input_rows: u64,
+    pub agg_output_groups: u64,
+    pub n_observations: i64,
 }
 
 fn unix_now() -> i64 {
@@ -352,5 +442,60 @@ mod tests {
         // Re-init the same connection via init_schema again — should
         // not error (CREATE TABLE IF NOT EXISTS).
         WorkloadLog::init_schema(&log1.conn.lock().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn aggregate_observation_round_trip() {
+        let log = WorkloadLog::open_in_memory().unwrap();
+        // First observation: n=1, below min=2 → None
+        log.record_aggregate_observation("q17_shape", 30_000, 200)
+            .unwrap();
+        assert_eq!(
+            log.consult_aggregate_observation("q17_shape", 2).unwrap(),
+            None
+        );
+        // Second observation: n=2 → returns the EWMA'd reading
+        log.record_aggregate_observation("q17_shape", 32_000, 210)
+            .unwrap();
+        let obs = log
+            .consult_aggregate_observation("q17_shape", 2)
+            .unwrap()
+            .unwrap();
+        // EWMA: 0.7 * 30_000 + 0.3 * 32_000 = 30_600
+        assert_eq!(obs.agg_input_rows, 30_600);
+        // EWMA: 0.7 * 200 + 0.3 * 210 = 203
+        assert_eq!(obs.agg_output_groups, 203);
+        assert_eq!(obs.n_observations, 2);
+    }
+
+    #[test]
+    fn aggregate_observation_distinct_shapes() {
+        // Two different shape hashes should not collide. Q17 and Q18
+        // inner aggs have distinct hashes, so they get distinct rows.
+        let log = WorkloadLog::open_in_memory().unwrap();
+        log.record_aggregate_observation("q17_shape", 30_000, 200)
+            .unwrap();
+        log.record_aggregate_observation("q18_shape", 4_370, 624)
+            .unwrap();
+        // Bring both above min_observations=1
+        let o17 = log
+            .consult_aggregate_observation("q17_shape", 1)
+            .unwrap()
+            .unwrap();
+        let o18 = log
+            .consult_aggregate_observation("q18_shape", 1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(o17.agg_output_groups, 200);
+        assert_eq!(o18.agg_output_groups, 624);
+    }
+
+    #[test]
+    fn aggregate_observation_missing_shape_returns_none() {
+        let log = WorkloadLog::open_in_memory().unwrap();
+        assert_eq!(
+            log.consult_aggregate_observation("never_seen", 1).unwrap(),
+            None
+        );
     }
 }

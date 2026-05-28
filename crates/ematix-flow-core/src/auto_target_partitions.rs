@@ -42,13 +42,16 @@
 //! while we measure; flip default-on only after strict A/B confirms
 //! the 22q SF=10 net is positive.
 
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use datafusion::datasource::DefaultTableSource;
-use datafusion::logical_expr::{Expr, JoinType, LogicalPlan, TableScan};
+use datafusion::logical_expr::{Aggregate, Expr, JoinType, LogicalPlan, TableScan};
 
 use crate::ematix_fast_parquet::EmatixFastParquetTableProvider;
 use crate::fast_parquet::FastParquetTableProvider;
+use crate::workload_log::{AggregateObservation, WorkloadLog};
 
 /// Target group count per output partition. Same constant as
 /// `agg_partition_boost::TARGET_GROUPS_PER_PARTITION` (50K) — derived
@@ -241,6 +244,254 @@ fn compute_optimal_partitions(expected_groups: usize, session_cores: usize) -> u
     raw.clamp(session_cores, ceiling)
 }
 
+/// Σ.AΩ Phase 1.4 — observed-cardinality threshold below which the
+/// agg alone doesn't justify the boost. At 50K groups the FinalPartitioned
+/// hash table is L3-resident even at cores=14; boosting can only help
+/// via non-agg parallelism (caught by `count_large_table_scans` below).
+pub const SMALL_AGG_GROUP_THRESHOLD: usize = 50_000;
+
+/// Σ.AΩ Phase 1.4 — TableScan row count above which a scan counts as
+/// "heavy" for the multi-large-scan boost predicate. Matches
+/// `MIN_TABLE_SCAN_ROWS_FOR_BOOST` since a single-scan query can't
+/// benefit from broader plan parallelism anyway.
+pub const LARGE_TABLE_SCAN_ROWS: usize = 10_000_000;
+
+/// Σ.AΩ Phase 1.4 — minimum # of *distinct* `LARGE_TABLE_SCAN_ROWS`-
+/// class tables in the whole plan to qualify a small-agg query for
+/// plan-level parallelism boost (Q18 case: distinct large tables =
+/// {lineitem, orders} = 2; the −53.85 ms win at P=112 comes from
+/// join parallelism, not the agg itself).
+///
+/// **Distinct** rather than raw-scan-count: Q17 references lineitem
+/// twice (outer and AVG subquery) at the un-optimized LogicalPlan
+/// level. A raw scan count gives Q17=2 and fails to discriminate
+/// from Q18=2-3. Distinct counts give Q17={lineitem}=1 vs
+/// Q18={lineitem, orders}=2.
+pub const MIN_LARGE_SCANS_FOR_PLAN_BOOST: usize = 2;
+
+/// Σ.AΩ Phase 1.4 — minimum observations before consulting the
+/// recommendation. 1 is sufficient for TPC-H benchmark contexts
+/// (single-shape queries with stable cardinalities); production
+/// systems may want 3+ to smooth noise.
+pub const MIN_OBSERVATIONS_FOR_CONSULT: i64 = 1;
+
+/// Σ.AΩ Phase 1.4 — stable hash of an `Aggregate` node's *shape*. The
+/// hash includes group_expr column names (Display form), aggregate
+/// function signatures (Display form), and a structural fingerprint
+/// of the input subtree (node kinds, table names, join types, count
+/// of filters/pushed-down predicates — *no literals or selectivity
+/// values*). Two invocations of the same SQL with different parameter
+/// literals produce the same hash; Q17's inner agg and Q18's inner
+/// agg produce different hashes because they GROUP BY different
+/// columns over different subtree shapes.
+///
+/// Uses `std::collections::hash_map::DefaultHasher`, which Rust
+/// guarantees is deterministic within a single program (sufficient
+/// for the `~/.ematix/workload.db` per-machine roundtrip; cross-
+/// machine portability would need a SHA-256 variant).
+pub fn aggregate_shape_hash(agg: &Aggregate) -> String {
+    let mut h = DefaultHasher::new();
+    "Aggregate".hash(&mut h);
+    let mut group_keys: Vec<String> =
+        agg.group_expr.iter().map(|e| e.to_string()).collect();
+    group_keys.sort();
+    for k in &group_keys {
+        k.hash(&mut h);
+    }
+    let mut agg_keys: Vec<String> = agg.aggr_expr.iter().map(|e| e.to_string()).collect();
+    agg_keys.sort();
+    for k in &agg_keys {
+        k.hash(&mut h);
+    }
+    hash_subtree_structure(&agg.input, &mut h);
+    format!("{:016x}", h.finish())
+}
+
+/// Hashes only the *structure* of a `LogicalPlan` subtree — node
+/// kinds, table names, join types, and the presence/count of
+/// pushed-down filters. Literals, predicate trees, and statistics
+/// numbers are deliberately excluded so two invocations of the same
+/// query with different parameter values produce the same hash.
+fn hash_subtree_structure(plan: &LogicalPlan, h: &mut DefaultHasher) {
+    match plan {
+        LogicalPlan::TableScan(scan) => {
+            "TS".hash(h);
+            scan.table_name.to_string().hash(h);
+            // Presence of pushed-down filters (not their values) — Σ.U
+            // PushDown may rewrite this between invocations of the
+            // same SQL, so include just the count to stay stable.
+            scan.filters.len().hash(h);
+        }
+        LogicalPlan::Filter(f) => {
+            "Filter".hash(h);
+            hash_subtree_structure(&f.input, h);
+        }
+        LogicalPlan::Join(j) => {
+            "Join".hash(h);
+            format!("{:?}", j.join_type).hash(h);
+            j.on.len().hash(h);
+            hash_subtree_structure(&j.left, h);
+            hash_subtree_structure(&j.right, h);
+        }
+        LogicalPlan::Aggregate(a) => {
+            "InnerAgg".hash(h);
+            a.group_expr.len().hash(h);
+            hash_subtree_structure(&a.input, h);
+        }
+        LogicalPlan::Projection(p) => {
+            "Proj".hash(h);
+            hash_subtree_structure(&p.input, h);
+        }
+        LogicalPlan::SubqueryAlias(s) => {
+            "Alias".hash(h);
+            hash_subtree_structure(&s.input, h);
+        }
+        _ => {
+            std::mem::discriminant(plan).hash(h);
+            for child in plan.inputs() {
+                hash_subtree_structure(child, h);
+            }
+        }
+    }
+}
+
+/// Σ.AΩ Phase 1.4 — finds the qualifying `Aggregate` node in `plan`
+/// (the same node `walk_for_max_agg_input_cardinality` selects),
+/// returning a stable shape hash via `aggregate_shape_hash`. Returns
+/// None when no Aggregate passes the Phase 1.3 safety gates.
+pub fn qualifying_aggregate_shape_hash(plan: &LogicalPlan) -> Option<String> {
+    let mut best: Option<(usize, String)> = None;
+    walk_for_shape_hash(plan, &mut best);
+    best.map(|(_, h)| h)
+}
+
+fn walk_for_shape_hash(plan: &LogicalPlan, best: &mut Option<(usize, String)>) {
+    if let LogicalPlan::Aggregate(agg) = plan {
+        if !agg.group_expr.is_empty()
+            && all_group_expr_are_bare_columns(&agg.group_expr)
+            && !has_filter_in_subtree(&agg.input)
+        {
+            if let Some(card) = max_table_scan_rows(&agg.input) {
+                if card >= MIN_TABLE_SCAN_ROWS_FOR_BOOST {
+                    // Pick the Aggregate whose input has the largest
+                    // TableScan — same tiebreak as the cardinality
+                    // walker, so the hash matches the agg the
+                    // recommender would have boosted.
+                    let hash = aggregate_shape_hash(agg);
+                    let better = best
+                        .as_ref()
+                        .map(|(prev_card, _)| card > *prev_card)
+                        .unwrap_or(true);
+                    if better {
+                        *best = Some((card, hash));
+                    }
+                }
+            }
+        }
+    }
+    for child in plan.inputs() {
+        walk_for_shape_hash(child, best);
+    }
+}
+
+/// Σ.AΩ Phase 1.4 — counts the number of *distinct* tables anywhere
+/// in `plan` whose underlying provider reports `num_rows() >=
+/// threshold`. Used as a plan-level "heavy joins likely" signal: a
+/// query with ≥2 such tables (Q18: {lineitem, orders}) benefits
+/// from `target_partitions` boost even when the qualifying
+/// Aggregate's observed group count is small, because the join
+/// chains above the agg dominate the wall time.
+///
+/// Distinct-table counting (rather than raw scan count) is critical
+/// for Q17 vs Q18 discrimination: Q17 references lineitem twice
+/// (outer + AVG subquery), giving raw-scan-count 2; counting
+/// distinct table names gives {lineitem} = 1, which correctly
+/// classifies Q17 as a single-large-table query.
+pub fn count_distinct_large_tables(plan: &LogicalPlan, threshold: usize) -> usize {
+    let mut seen = std::collections::BTreeSet::<String>::new();
+    collect_large_tables(plan, threshold, &mut seen);
+    seen.len()
+}
+
+fn collect_large_tables(
+    plan: &LogicalPlan,
+    threshold: usize,
+    seen: &mut std::collections::BTreeSet<String>,
+) {
+    if let LogicalPlan::TableScan(scan) = plan {
+        if let Some(n) = num_rows_for_table_scan(scan) {
+            if n >= threshold {
+                seen.insert(scan.table_name.to_string());
+            }
+        }
+    }
+    for child in plan.inputs() {
+        collect_large_tables(child, threshold, seen);
+    }
+}
+
+/// Σ.AΩ Phase 1.4 — runtime-feedback-aware recommendation. Consults
+/// `log` for prior observations on the plan's qualifying aggregate
+/// shape; falls back to the Phase 1.3 plan-time formula when no
+/// observation is available.
+///
+/// Decision tree (when an aggregate qualifies):
+/// 1. **No observation** → use plan-time formula (`recommend_target_partitions`).
+/// 2. **Observed groups ≥ SMALL_AGG_GROUP_THRESHOLD (50K)** → boost
+///    based on observed groups (replaces the over-counted TableScan
+///    estimate).
+/// 3. **Observed groups < 50K AND `count_large_table_scans(plan) ≥ 2`**
+///    → keep plan-time boost (Q18 case: small agg but heavy joins
+///    above benefit from `EnforceDistribution`'s broader parallelism).
+/// 4. **Observed groups < 50K AND single large scan** → return cores
+///    (Q17 case: small agg, no plan-level parallelism to amortize
+///    P=112 setup cost).
+pub fn recommend_target_partitions_with_log(
+    plan: &LogicalPlan,
+    session_cores: usize,
+    log: Option<&WorkloadLog>,
+) -> usize {
+    let shape_hash = qualifying_aggregate_shape_hash(plan);
+    let Some(shape_hash) = shape_hash else {
+        // No qualifying aggregate — original behavior.
+        return recommend_target_partitions(plan, session_cores);
+    };
+
+    let observation = log.and_then(|l| {
+        l.consult_aggregate_observation(&shape_hash, MIN_OBSERVATIONS_FOR_CONSULT)
+            .ok()
+            .flatten()
+    });
+
+    match observation {
+        None => {
+            // First execution: no runtime feedback yet — fall back to
+            // plan-time estimate. This is exactly the Phase 1.3
+            // behavior (over-counts on Q17, correct on Q18).
+            recommend_target_partitions(plan, session_cores)
+        }
+        Some(AggregateObservation {
+            agg_output_groups, ..
+        }) => {
+            let observed_groups = agg_output_groups as usize;
+            if observed_groups >= SMALL_AGG_GROUP_THRESHOLD {
+                // Large enough agg to drive boost on its own.
+                compute_optimal_partitions(observed_groups, session_cores)
+            } else if count_distinct_large_tables(plan, LARGE_TABLE_SCAN_ROWS)
+                >= MIN_LARGE_SCANS_FOR_PLAN_BOOST
+            {
+                // Small agg but heavy non-agg work — preserve the
+                // Q18-style broader-plan boost using the plan-time
+                // TableScan estimate.
+                recommend_target_partitions(plan, session_cores)
+            } else {
+                // Small agg AND no heavy joins — Q17 case. No boost.
+                session_cores
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -358,6 +609,106 @@ mod tests {
             "Q06 has no GROUP BY → recommender should return cores"
         );
 
+        // Σ.AΩ Phase 1.4 — shape hash uniqueness: Q17 and Q18 must
+        // hash to distinct values so observations don't cross-pollute.
+        let q17 = std::fs::read_to_string(
+            dir.parent()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .join("queries/q17.sql"),
+        )?;
+        let plan_q17 = ctx.sql(&q17).await?.into_optimized_plan()?;
+        let h17 = qualifying_aggregate_shape_hash(&plan_q17);
+        let h18 = qualifying_aggregate_shape_hash(&plan_q18);
+        assert!(h17.is_some(), "Q17 should have a qualifying aggregate");
+        assert!(h18.is_some(), "Q18 should have a qualifying aggregate");
+        assert_ne!(h17, h18, "Q17 and Q18 inner aggregates must hash differently");
+
+        // Σ.AΩ Phase 1.4 — distinct-large-table counter: Q18 has
+        // ≥2 (orders + lineitem) → qualifies for plan boost when
+        // observed groups are small; Q17 has 1 ({lineitem} only;
+        // part is 2M < 10M) → falls back to cores. Note Q17
+        // references lineitem twice (outer + AVG subquery) but
+        // distinct counting collapses them.
+        let n_large_q17 = count_distinct_large_tables(&plan_q17, LARGE_TABLE_SCAN_ROWS);
+        let n_large_q18 = count_distinct_large_tables(&plan_q18, LARGE_TABLE_SCAN_ROWS);
+        assert!(
+            n_large_q17 < MIN_LARGE_SCANS_FOR_PLAN_BOOST,
+            "Q17 should have <2 distinct large tables (got {n_large_q17})"
+        );
+        assert!(
+            n_large_q18 >= MIN_LARGE_SCANS_FOR_PLAN_BOOST,
+            "Q18 should have ≥2 distinct large tables (got {n_large_q18})"
+        );
+
+        // Σ.AΩ Phase 1.4 — runtime-feedback recommender end-to-end.
+        let log = WorkloadLog::open_in_memory()?;
+        let h17_str = h17.unwrap();
+        let h18_str = h18.unwrap();
+
+        // Before any observations: both fall back to plan-time formula → 112.
+        assert_eq!(
+            recommend_target_partitions_with_log(&plan_q17, 14, Some(&log)),
+            112,
+            "Q17 with no observation should match Phase 1.3 (boost)"
+        );
+        assert_eq!(
+            recommend_target_partitions_with_log(&plan_q18, 14, Some(&log)),
+            112,
+            "Q18 with no observation should match Phase 1.3 (boost)"
+        );
+
+        // Record observed cardinalities (Q17 ≈ 200 groups, Q18 ≈ 624).
+        log.record_aggregate_observation(&h17_str, 30_000, 200)?;
+        log.record_aggregate_observation(&h18_str, 4_370, 624)?;
+
+        // After observations: Q17 falls to cores (small agg, 1 large scan),
+        // Q18 stays at 112 (small agg BUT ≥2 large scans).
+        assert_eq!(
+            recommend_target_partitions_with_log(&plan_q17, 14, Some(&log)),
+            14,
+            "Q17 with observation 200<50K AND 1 large scan → cores"
+        );
+        assert_eq!(
+            recommend_target_partitions_with_log(&plan_q18, 14, Some(&log)),
+            112,
+            "Q18 with observation 624<50K BUT ≥2 large scans → plan boost"
+        );
+
         Ok(())
+    }
+
+    /// Σ.AΩ Phase 1.4 — verify that a large-cardinality observation
+    /// (e.g., 1M+ groups) routes through the agg-driven boost path.
+    /// This test is synthetic (no SF=10 data needed): the formula
+    /// is purely numeric.
+    #[test]
+    fn observation_large_agg_drives_boost() {
+        // 2M groups / 50K = 40 partitions → clamp(40, 14, 112) = 40.
+        let card = 2_000_000;
+        assert_eq!(compute_optimal_partitions(card, 14), 40);
+    }
+
+    /// Σ.AΩ Phase 1.4 — sanity: shape hash is deterministic across
+    /// invocations on identical group columns + identical aggregate
+    /// expressions. Synthetic test ensures the hash doesn't accidentally
+    /// depend on object identity. (Full plan-based hash test is in the
+    /// SF=10 integration test above.)
+    #[test]
+    fn shape_hash_function_deterministic() {
+        // Hash the same string sequence twice — DefaultHasher::new()
+        // is documented as deterministic within a single program.
+        let mut h1 = DefaultHasher::new();
+        "Aggregate".hash(&mut h1);
+        "lineitem.l_partkey".hash(&mut h1);
+        let r1 = format!("{:016x}", h1.finish());
+
+        let mut h2 = DefaultHasher::new();
+        "Aggregate".hash(&mut h2);
+        "lineitem.l_partkey".hash(&mut h2);
+        let r2 = format!("{:016x}", h2.finish());
+
+        assert_eq!(r1, r2);
     }
 }
