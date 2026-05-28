@@ -84,6 +84,26 @@ pub struct EnableRuntimeBloomSidebandRule {
     /// they're intrinsically selective. Disable via
     /// `EMAT_L9_REQUIRE_FILTERED_BUILD=0` for benchmarking.
     pub require_filtered_build: bool,
+    /// Σ.AH.3 Story 2a (2026-05-27): absolute per-partition build-size
+    /// ceiling. Refuses bloom emit when the estimated per-partition
+    /// build key count exceeds this threshold, regardless of the
+    /// build/probe ratio. Motivated by the AH.3 reorder spike showing
+    /// L9 over-fires on non-selective FK columns (Q07 post-reorder
+    /// fires emits at 3571 / 3571 / 50000 expected_keys_per_partition,
+    /// adding ~+45 ms wall) and by the AH.2 closure pattern where
+    /// baseline Q08 fires L9 with build=400k → +55 ms regression that
+    /// fused-probe only partially mitigates.
+    ///
+    /// The existing `min_probe_to_build_ratio` gate only rejects
+    /// fact⋈fact joins (build ≈ probe / 4); it permits a 938K build
+    /// on a 60M probe. At ~1.4 ns/probe × 60M rows, even a 50K bloom
+    /// adds ~84 ms / partition of probe cost.
+    ///
+    /// Default 25_000 per partition. Catches the AH.3 reorder bad
+    /// fires + AH.2 baseline Q08 default-mode 400k fire while keeping
+    /// the Q08-tight-cardinality 13k fire (mitigated by fused-probe).
+    /// 0 disables the gate. Override via `EMAT_L9_MAX_EXPECTED_KEYS=N`.
+    pub max_expected_keys_per_partition: usize,
 }
 
 impl Default for EnableRuntimeBloomSidebandRule {
@@ -109,10 +129,24 @@ impl Default for EnableRuntimeBloomSidebandRule {
             .ok()
             .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
             .unwrap_or(true);
+        // Σ.AH.3 Story 2a: per-partition absolute ceiling on build size.
+        // OPT-IN — default 0 (disabled). The Story 2a bench measured no
+        // baseline wall-time improvement (existing `require_filtered_build`
+        // + `min_probe_to_build_ratio` already screen out the FK-bloom
+        // pattern; my gate only sees Inner-join emits with pre-filtered
+        // builds, which are net-positive per Q07 reorder measurement).
+        // Lever remains opt-in via `EMAT_L9_MAX_EXPECTED_KEYS=N` for
+        // hypothetical future shape regressions where the existing gates
+        // are insufficient.
+        let max_expected_keys_per_partition = std::env::var("EMAT_L9_MAX_EXPECTED_KEYS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
         Self {
             min_probe_to_build_ratio: ratio,
             allow_inner_join,
             require_filtered_build,
+            max_expected_keys_per_partition,
         }
     }
 }
@@ -147,9 +181,34 @@ impl PhysicalOptimizerRule for EnableRuntimeBloomSidebandRule {
             // (file-schema vs projected-schema col_idx mismatch) closes
             // the silent-wrong-sums bug that originally motivated the
             // default-off. Tests opt in via `allow_inner_join: true`.
-            if matches!(hj.join_type(), JoinType::Inner) && !self.allow_inner_join {
+            // Σ.AM.1 (2026-05-27, banked as opt-in): allow Inner L9
+            // fire when the build subtree contains a LeftSemi/LeftAnti.
+            //
+            // Q18 SF=10 bench showed this delivers no incremental win:
+            // L9 already fires on the inner customer⋈orders join and
+            // emits a bloom that pre-filters lineitem to 4.37K rows
+            // before reaching the top Inner HJ. Σ.AM.1's additional
+            // bloom on the outer HJ is redundant (lineitem only attaches
+            // one sideband) and adds ~15ms cumulative build_time per
+            // partition. Net Q18 wall: +1.50 ms (noise).
+            //
+            // The mechanism is correct but the value is zero on the
+            // current shape — kept as opt-in infra for future shapes
+            // where the inner-HJ bloom path doesn't cover the outer.
+            // Default OFF; set `EMAT_L9_INNER_WITH_SEMI=1` to enable.
+            let am1_enabled = std::env::var("EMAT_L9_INNER_WITH_SEMI")
+                .ok()
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+            let build_has_semi = am1_enabled && build_subtree_has_semi_filter(hj.left());
+            if matches!(hj.join_type(), JoinType::Inner)
+                && !self.allow_inner_join
+                && !build_has_semi
+            {
                 if trace {
-                    eprintln!("[L9.trace] skip Inner — allow_inner_join=false");
+                    eprintln!(
+                        "[L9.trace] skip Inner — allow_inner_join=false, no LeftSemi/LeftAnti in build"
+                    );
                 }
                 return Ok(Transformed::no(node));
             }
@@ -285,7 +344,23 @@ impl PhysicalOptimizerRule for EnableRuntimeBloomSidebandRule {
             // of the probe). For TPC-H this gates out the
             // dimension⋈fact and fact⋈fact joins (build ≈ probe / 4)
             // while keeping semi-join shapes (build ≈ probe / 1000+).
-            let build_rows = estimate_build_rows(build.as_ref());
+            // Σ.AM.1: when the build contains a LeftSemi/LeftAnti, the
+            // estimator (which doesn't see through HashJoinExec) gives
+            // the unfiltered LEFT cardinality (e.g. 1.5M customer for
+            // Q18's build) rather than the actual semi-filtered output
+            // (~624 rows). Cap the estimate at 10K when this shape is
+            // detected — generous enough for any selective subquery,
+            // tight enough to pass the 64× ratio gate against a 60M
+            // probe (10K × 64 = 640K < 60M).
+            let build_rows = if build_has_semi {
+                Some(
+                    estimate_build_rows(build.as_ref())
+                        .unwrap_or(10_000)
+                        .min(10_000),
+                )
+            } else {
+                estimate_build_rows(build.as_ref())
+            };
             let probe_rows = estimate_probe_scan_rows(&scan_arc);
             if trace {
                 eprintln!(
@@ -324,6 +399,24 @@ impl PhysicalOptimizerRule for EnableRuntimeBloomSidebandRule {
             // partition statistics. Falls back to a generous default
             // (50K) when stats are unavailable.
             let expected_keys = build_rows.unwrap_or(50_000);
+
+            // Σ.AH.3 Story 2a — absolute per-partition build-size gate.
+            // Reject when the per-partition bloom would be too large to
+            // pay back its probe cost. Mirrors BuildSideBloomEmitterExec's
+            // own per-partition computation: `(total / n_part).max(64)`.
+            if self.max_expected_keys_per_partition > 0 {
+                let n_part = build.output_partitioning().partition_count().max(1);
+                let per_part = (expected_keys / n_part).max(64);
+                if per_part > self.max_expected_keys_per_partition {
+                    if trace {
+                        eprintln!(
+                            "[L9.trace] skip — expected_keys_per_partition={per_part} > ceiling={} (total={expected_keys}, n_part={n_part})",
+                            self.max_expected_keys_per_partition
+                        );
+                    }
+                    return Ok(Transformed::no(node));
+                }
+            }
 
             let wrapped_build: Arc<dyn ExecutionPlan> = Arc::new(BuildSideBloomEmitterExec::try_new(
                 build,
@@ -478,6 +571,32 @@ fn build_subtree_has_filter(plan: &Arc<dyn ExecutionPlan>) -> bool {
         return true;
     }
     plan.children().iter().any(|c| build_subtree_has_filter(c))
+}
+
+/// Σ.AM.1 (2026-05-27) — returns true iff the build subtree contains
+/// a `HashJoinExec` whose join_type is `LeftSemi` or `LeftAnti`.
+///
+/// Such a join intrinsically filters its LEFT input by membership in
+/// the RIGHT input. The build-side output cardinality is therefore
+/// upper-bounded by `min(|left|, distinct_keys(right))` — typically
+/// much smaller than DataFusion's `partition_statistics` estimate
+/// (which doesn't see through HashJoinExec).
+///
+/// Use case (Q18 SF=10): top Inner HJ's build = customer ⋈
+/// LeftSemi(orders, sum-filtered-lineitem). Build output is 624 rows
+/// at runtime, but the estimator says ~1.5M. Without this gate, L9's
+/// default `allow_inner_join=false` skips the join entirely. With
+/// this gate, we recognize the semi-filtered build and allow L9 fire.
+fn build_subtree_has_semi_filter(plan: &Arc<dyn ExecutionPlan>) -> bool {
+    use datafusion::common::JoinType;
+    if let Some(hj) = plan.as_any().downcast_ref::<HashJoinExec>() {
+        if matches!(hj.join_type(), JoinType::LeftSemi | JoinType::LeftAnti) {
+            return true;
+        }
+    }
+    plan.children()
+        .iter()
+        .any(|c| build_subtree_has_semi_filter(c))
 }
 
 /// Σ.Q.L9 selectivity gate — best-effort row-count estimate for the
@@ -703,6 +822,9 @@ mod tests {
                 // FilterExec in the build path — they're verifying
                 // the wrap mechanism, not the selectivity heuristic.
                 require_filtered_build: false,
+                // Story 2a: disable the absolute-build-size gate for
+                // these wrap-mechanism tests (tiny inputs anyway).
+                max_expected_keys_per_partition: 0,
             }))
             .build();
         let ctx = SessionContext::new_with_state(state);
@@ -769,6 +891,9 @@ mod tests {
                 // FilterExec in the build path — they're verifying
                 // the wrap mechanism, not the selectivity heuristic.
                 require_filtered_build: false,
+                // Story 2a: disable the absolute-build-size gate for
+                // these wrap-mechanism tests (tiny inputs anyway).
+                max_expected_keys_per_partition: 0,
             }))
             .build();
         let ctx = SessionContext::new_with_state(state);
@@ -823,5 +948,178 @@ mod tests {
         let batches = df.collect().await.unwrap();
         let row_count: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(row_count, 60, "wrong row count with L9 descent active");
+    }
+
+    /// Σ.AH.3 Story 2a — verify the absolute per-partition build-size
+    /// gate skips bloom emit when the estimated build exceeds the
+    /// threshold. Uses the same lineitem/supplier mini-parquets as the
+    /// wrap test but sets `max_expected_keys_per_partition: 4` — below
+    /// supplier's 25-row build (per-partition ≈ 25/4=6 rounded to
+    /// .max(64)=64 floor, but with threshold=4 the .max(64) per-part
+    /// floor still exceeds the gate so wrap is rejected).
+    #[tokio::test]
+    async fn gate_skips_when_build_exceeds_max_expected_keys() {
+        let li = tmp_parquet("lineitem_gate");
+        let sp = tmp_parquet("supplier_gate");
+        write_lineitem(&li);
+        write_supplier(&sp);
+
+        let cfg = SessionConfig::new().with_target_partitions(4);
+        let state = SessionStateBuilder::new()
+            .with_default_features()
+            .with_config(cfg)
+            .with_physical_optimizer_rule(Arc::new(EnableRuntimeBloomSidebandRule {
+                min_probe_to_build_ratio: 0,
+                allow_inner_join: true,
+                require_filtered_build: false,
+                // Per-partition computation uses .max(64) floor inside
+                // BuildSideBloomEmitterExec; setting the gate to 4
+                // forces rejection (any emit would exceed 4 per partition
+                // because of the 64 floor).
+                max_expected_keys_per_partition: 4,
+            }))
+            .build();
+        let ctx = SessionContext::new_with_state(state);
+        ctx.register_table(
+            "lineitem",
+            Arc::new(EmatixFastParquetTableProvider::try_new(li.to_string_lossy()).unwrap()),
+        )
+        .unwrap();
+        ctx.register_table(
+            "supplier",
+            Arc::new(FastParquetTableProvider::try_new(sp.to_string_lossy()).unwrap()),
+        )
+        .unwrap();
+
+        let df = ctx
+            .sql("SELECT l_orderkey FROM supplier JOIN lineitem ON s_suppkey = l_suppkey")
+            .await
+            .unwrap();
+        let plan = df.clone().create_physical_plan().await.unwrap();
+        let s = format!("{plan:?}");
+        // Gate should fire — no wrap installed.
+        assert!(
+            !s.contains("BuildSideBloomEmitterExec"),
+            "expected the L9 wrapper to be SKIPPED by the gate, but found it:\n{s}"
+        );
+        // Output correctness — query still produces 500 rows.
+        let batches = df.collect().await.unwrap();
+        let row_count: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(row_count, 500, "wrong row count when gate skips emit");
+    }
+
+    /// Σ.AH.3 Story 2a — converse: with a generous threshold (1_000_000)
+    /// the gate is no-op and the wrap fires. Guards against the gate
+    /// firing too aggressively.
+    #[tokio::test]
+    async fn gate_allows_emit_when_build_below_max_expected_keys() {
+        let li = tmp_parquet("lineitem_gate2");
+        let sp = tmp_parquet("supplier_gate2");
+        write_lineitem(&li);
+        write_supplier(&sp);
+
+        let cfg = SessionConfig::new().with_target_partitions(4);
+        let state = SessionStateBuilder::new()
+            .with_default_features()
+            .with_config(cfg)
+            .with_physical_optimizer_rule(Arc::new(EnableRuntimeBloomSidebandRule {
+                min_probe_to_build_ratio: 0,
+                allow_inner_join: true,
+                require_filtered_build: false,
+                max_expected_keys_per_partition: 1_000_000,
+            }))
+            .build();
+        let ctx = SessionContext::new_with_state(state);
+        ctx.register_table(
+            "lineitem",
+            Arc::new(EmatixFastParquetTableProvider::try_new(li.to_string_lossy()).unwrap()),
+        )
+        .unwrap();
+        ctx.register_table(
+            "supplier",
+            Arc::new(FastParquetTableProvider::try_new(sp.to_string_lossy()).unwrap()),
+        )
+        .unwrap();
+
+        let df = ctx
+            .sql("SELECT l_orderkey FROM supplier JOIN lineitem ON s_suppkey = l_suppkey")
+            .await
+            .unwrap();
+        let plan = df.create_physical_plan().await.unwrap();
+        let s = format!("{plan:?}");
+        assert!(
+            s.contains("BuildSideBloomEmitterExec"),
+            "expected the L9 wrapper to fire under the generous gate; plan:\n{s}"
+        );
+    }
+
+    /// Σ.AM.1 (2026-05-27): unit-level verification of the helper —
+    /// `build_subtree_has_semi_filter` must return true for a plan
+    /// containing a LeftSemi or LeftAnti HashJoinExec, and false
+    /// otherwise. End-to-end validation lives in the Q18 SF=10 bench;
+    /// the helper test guards against regressions of the walker
+    /// itself.
+    #[tokio::test]
+    async fn helper_detects_left_semi_in_build_subtree() {
+        let li = tmp_parquet("lineitem_am1");
+        let sp = tmp_parquet("supplier_am1");
+        write_lineitem(&li);
+        write_supplier(&sp);
+
+        let cfg = SessionConfig::new().with_target_partitions(4);
+        let state = SessionStateBuilder::new()
+            .with_default_features()
+            .with_config(cfg)
+            .build();
+        let ctx = SessionContext::new_with_state(state);
+        ctx.register_table(
+            "lineitem",
+            Arc::new(EmatixFastParquetTableProvider::try_new(li.to_string_lossy()).unwrap()),
+        )
+        .unwrap();
+        ctx.register_table(
+            "supplier",
+            Arc::new(FastParquetTableProvider::try_new(sp.to_string_lossy()).unwrap()),
+        )
+        .unwrap();
+
+        // Plain join: no LeftSemi or LeftAnti.
+        let plain = ctx
+            .sql("SELECT l_orderkey FROM supplier JOIN lineitem ON s_suppkey = l_suppkey")
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+        let plain_arc: Arc<dyn ExecutionPlan> = plain;
+        assert!(
+            !build_subtree_has_semi_filter(&plain_arc),
+            "plain inner join must not be detected as semi-filtered"
+        );
+
+        // EXISTS subquery typically produces LeftSemi (or RightSemi /
+        // LeftAnti depending on shape). The helper only matches
+        // LeftSemi/LeftAnti — that's the Q18 shape after Σ.Q.L10.
+        let semi = ctx
+            .sql(
+                "SELECT s_suppkey FROM supplier \
+                 WHERE EXISTS (SELECT 1 FROM lineitem WHERE l_suppkey = s_suppkey)",
+            )
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+        let semi_arc: Arc<dyn ExecutionPlan> = semi;
+        let dump = format!("{semi_arc:?}");
+        // The plan must contain SOME semi shape — DataFusion may
+        // produce LeftSemi or RightSemi depending on cost. We only
+        // assert the helper agrees with itself.
+        let has_left_semi_in_dump = dump.contains("LeftSemi") || dump.contains("LeftAnti");
+        assert_eq!(
+            build_subtree_has_semi_filter(&semi_arc),
+            has_left_semi_in_dump,
+            "helper output must match presence of LeftSemi/LeftAnti in plan dump"
+        );
     }
 }
