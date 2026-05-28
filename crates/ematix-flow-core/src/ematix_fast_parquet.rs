@@ -1713,54 +1713,87 @@ impl EmatixFastParquetTableProvider {
         // Cost: one decode of each dict page (typically 1-10 KB per
         // RG); a few ms per provider construction. Cached for the
         // session via `column_stats`.
-        // Σ.Q06.SF10 spike (2026-05-28): the dict-page distinct-count
-        // walk below decompresses every dict page of every RG of every
-        // column — for SF=10 lineitem that's up to 928 Snappy
-        // decompresses, ~19 ms of main-thread CPU per provider
-        // construction. Skippable via `EMAT_SKIP_DICT_DISTINCT=1` to
-        // measure the impact before adding a proper process-global
-        // cache. Default OFF (preserves existing behaviour).
+        // Σ.Q06.SF10.5.a (2026-05-28): dict-page distinct-count walk
+        // via ematix-parquet — reads only the uncompressed Thrift
+        // page header at each dict_page_offset, no Snappy decompress.
+        // See `crate::emat_parquet_metadata`. The diagnostic harness
+        // at `examples/q06_dict_distinct_compare.rs` confirms the
+        // ematix-parquet walker produces byte-identical num_values
+        // to the parquet-rs `SerializedPageReader::get_next_page`
+        // path on TPC-H lineitem SF=10 (all 16 columns match).
+        //
+        // Default ON; `EMAT_DICT_DISTINCT_VIA_EMAT=0` reverts to the
+        // legacy parquet-rs path for A/B work, `EMAT_SKIP_DICT_DISTINCT=1`
+        // skips the walk entirely.
         let skip_dict_distinct = std::env::var("EMAT_SKIP_DICT_DISTINCT")
             .ok()
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
+        let use_emat_dict_distinct = std::env::var("EMAT_DICT_DISTINCT_VIA_EMAT")
+            .ok()
+            .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+            .unwrap_or(true);
         if !skip_dict_distinct {
             use datafusion::common::stats::Precision;
-            use datafusion::parquet::column::page::Page;
-            let mut column_stats_vec: Vec<datafusion::common::stats::ColumnStatistics> =
-                (*column_stats).clone();
-            'col: for col_idx in 0..num_cols_in_schema {
-                // Confirm every RG has a dict page.
-                for rg in reader.metadata().row_groups() {
-                    if col_idx >= rg.num_columns() {
-                        continue 'col;
-                    }
-                    if rg.column(col_idx).dictionary_page_offset().is_none() {
-                        continue 'col;
-                    }
-                }
-                let mut max_distinct: usize = 0;
-                let mut any_dict = false;
-                for rg_idx in 0..num_row_groups {
-                    let Ok(rg) = reader.get_row_group(rg_idx) else {
-                        continue 'col;
-                    };
-                    let Ok(mut page_reader) = rg.get_column_page_reader(col_idx) else {
-                        continue 'col;
-                    };
-                    match page_reader.get_next_page() {
-                        Ok(Some(Page::DictionaryPage { num_values, .. })) => {
-                            max_distinct = max_distinct.max(num_values as usize);
-                            any_dict = true;
+            if use_emat_dict_distinct {
+                // Opt-in ematix-parquet path (no Snappy decompress).
+                if let Ok(distinct_maxes) =
+                    crate::emat_parquet_metadata::dict_distinct_max_per_column(
+                        &path,
+                        num_cols_in_schema,
+                    )
+                {
+                    let mut column_stats_vec: Vec<datafusion::common::stats::ColumnStatistics> =
+                        (*column_stats).clone();
+                    for col_idx in 0..num_cols_in_schema {
+                        if let Some(max_distinct) =
+                            distinct_maxes.get(col_idx).copied().flatten()
+                        {
+                            if max_distinct > 0 {
+                                column_stats_vec[col_idx].distinct_count =
+                                    Precision::Inexact(max_distinct);
+                            }
                         }
-                        _ => continue 'col,
+                    }
+                    column_stats = Arc::new(column_stats_vec);
+                }
+            } else {
+                // Default: parquet-rs path (decompresses each dict page).
+                use datafusion::parquet::column::page::Page;
+                let mut column_stats_vec: Vec<datafusion::common::stats::ColumnStatistics> =
+                    (*column_stats).clone();
+                'col: for col_idx in 0..num_cols_in_schema {
+                    for rg in reader.metadata().row_groups() {
+                        if col_idx >= rg.num_columns() {
+                            continue 'col;
+                        }
+                        if rg.column(col_idx).dictionary_page_offset().is_none() {
+                            continue 'col;
+                        }
+                    }
+                    let mut max_distinct: usize = 0;
+                    let mut any_dict = false;
+                    for rg_idx in 0..num_row_groups {
+                        let Ok(rg) = reader.get_row_group(rg_idx) else {
+                            continue 'col;
+                        };
+                        let Ok(mut page_reader) = rg.get_column_page_reader(col_idx) else {
+                            continue 'col;
+                        };
+                        match page_reader.get_next_page() {
+                            Ok(Some(Page::DictionaryPage { num_values, .. })) => {
+                                max_distinct = max_distinct.max(num_values as usize);
+                                any_dict = true;
+                            }
+                            _ => continue 'col,
+                        }
+                    }
+                    if any_dict && max_distinct > 0 {
+                        column_stats_vec[col_idx].distinct_count = Precision::Inexact(max_distinct);
                     }
                 }
-                if any_dict && max_distinct > 0 {
-                    column_stats_vec[col_idx].distinct_count = Precision::Inexact(max_distinct);
-                }
+                column_stats = Arc::new(column_stats_vec);
             }
-            column_stats = Arc::new(column_stats_vec);
         }
 
         // Σ.E5 per-filter Exact (2026-05-19): per-column no-nulls

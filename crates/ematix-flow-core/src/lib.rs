@@ -32,6 +32,11 @@ pub mod ematix_fast_parquet;
 // for the Q1-shape workload. See
 // `docs/PHASE_SIGMA_E5_PARQUET_RS_ELIMINATION.md` §E5.1.
 pub mod emat_arrow_reader;
+// Σ.Q06.SF10.5.a (2026-05-28): ematix-parquet-based metadata helpers
+// replacing specific parquet-rs paths inside
+// `EmatixFastParquetTableProvider::try_new`. Currently exposes the
+// decompress-free dict-distinct walk; other walks are follow-ups.
+pub mod emat_parquet_metadata;
 // Σ.E5.6 scaffold: intra-RG page-streaming column decoders. The
 // trait + first concrete impl (Float64) — not yet wired into
 // EmatixFastParquetExec. Closes the architectural first-batch latency
