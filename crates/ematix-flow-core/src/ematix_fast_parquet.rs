@@ -1742,13 +1742,30 @@ impl EmatixFastParquetTableProvider {
             .ok()
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
+        // Σ.Q06.SF10.5.h.1: small-table-only dict-distinct walk. The
+        // walk default-flipped OFF in .5.h because populating
+        // distinct_count perturbed DataFusion's cost-based plan on
+        // Q17/Q18/Q21 (lineitem/orders-heavy) — a planner effect, NOT
+        // an L9 over-fire (L9 firings are byte-identical with/without
+        // the walk, verified by EMAT_L9_TRACE). The harm is tied to
+        // LARGE fact-table distinct_count; small dimension tables
+        // (part/supplier/customer/...) benefit (Q02). This gate runs
+        // the walk only when the file has ≤ `EMAT_DICT_DISTINCT_MAX_ROWS`
+        // rows (default 0 = off, preserving .5.h). Set e.g.
+        // `EMAT_DICT_DISTINCT_MAX_ROWS=10000000` to walk everything
+        // except lineitem (60M) + orders (15M) at SF=10.
+        let max_rows_for_walk: usize = std::env::var("EMAT_DICT_DISTINCT_MAX_ROWS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        let walk_by_size = max_rows_for_walk > 0 && num_rows <= max_rows_for_walk;
         // Legacy `EMAT_SKIP_DICT_DISTINCT=1` still forces skip for
         // explicit A/B work, but the default behaviour is now skip.
         let force_skip = std::env::var("EMAT_SKIP_DICT_DISTINCT")
             .ok()
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
-        let skip_dict_distinct = force_skip || !dict_distinct_enabled;
+        let skip_dict_distinct = force_skip || !(dict_distinct_enabled || walk_by_size);
         let use_emat_dict_distinct = std::env::var("EMAT_DICT_DISTINCT_VIA_EMAT")
             .ok()
             .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
