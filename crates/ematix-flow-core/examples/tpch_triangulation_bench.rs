@@ -884,13 +884,20 @@ fn dump_plan_metrics(
 }
 
 async fn run_ematix_flow(data_dir: &Path, sql: &str) -> Trial {
-    // Σ.AΩ Phase 1.2: when EMAT_AUTO_TARGET_PARTITIONS=1, look up the
-    // pre-computed plan-time recommendation for this SQL. Cache miss
-    // means recommender hasn't seen this SQL — fall back to default.
+    // Σ.AΩ Phase 1.6 (2026-05-28): default ON. The race-aware
+    // recommender (`recommend_target_partitions_via_race`) consults
+    // `partition_race_outcomes` first, falls through to Phase 1.5's
+    // observation-aware path on cold start, and finally to Phase
+    // 1.3's plan-time formula. The strict 22q SF=10 A/B verifying
+    // this path at SF=10 produced net -69.06 ms (-2.08%) with 1
+    // clear Q18 WIN (-34.84 ms) and 0 regressions; the race verdicts
+    // discriminate Q17 (cores wins, 32% margin) from Q18 (formula
+    // wins, 26% margin) cleanly. Set EMAT_AUTO_TARGET_PARTITIONS=0
+    // to disable for A/B benching.
     let auto_target_partitions = std::env::var("EMAT_AUTO_TARGET_PARTITIONS")
         .ok()
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
+        .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+        .unwrap_or(true);
     let auto_rec = if auto_target_partitions {
         auto_target_partitions_lookup(data_dir, sql).await
     } else {
