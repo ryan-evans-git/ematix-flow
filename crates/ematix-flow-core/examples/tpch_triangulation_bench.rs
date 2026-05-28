@@ -411,10 +411,15 @@ async fn run_ematix_flow(data_dir: &Path, sql: &str) -> Trial {
         .ok()
         .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
         .unwrap_or(true);
+    // Σ.AK (2026-05-27): default ON. Σ.AD's dim-join pushdown gated
+    // by the Q10-shape predicate (fact_side_has_competing_filtered_dim
+    // in dim_join_pushdown.rs). Strict A/B vs current defaults shows
+    // net -74.98 ms (-2.39%), Q10 -66 ms WIN, no regression > 5%. Set
+    // EMAT_DIM_PUSH=0 to disable for A/B benching.
     let dim_push_on_check = std::env::var("EMAT_DIM_PUSH")
         .ok()
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
+        .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+        .unwrap_or(true);
     // Σ.AJ.1 Lever C harness fix (2026-05-27): only bypass the plan
     // cache for queries where the pre-plan rewrite actually changes
     // the plan. Without per-SQL detection, all 22 queries pay the
@@ -532,14 +537,16 @@ async fn run_ematix_flow(data_dir: &Path, sql: &str) -> Trial {
         .ok()
         .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
         .unwrap_or(true);
-    // Σ.AD (2026-05-25): pushes simple dim-join (no extra filter slot,
-    // single equi-key) down adjacent to the FK table's scan inside an
-    // Inner-join chain. Targets Q07's `Inner(s_nationkey = n1.n_nationkey)`
-    // sitting above supplier⋈lineitem. Opt-in via `EMAT_DIM_PUSH=1`.
+    // Σ.AD (2026-05-25) + Σ.AK (2026-05-27): dim-join pushdown gated
+    // by Q10-shape predicate. Default ON. Targets Q10's customer×orders
+    // chain (-23% / -66 ms at SF=10). The Σ.AK predicate blocks the
+    // rule on Q07/Q21/Q03 shapes (competing filtered dim in fact_side
+    // would force CollectLeft-after-Coalesce inversion). Set
+    // EMAT_DIM_PUSH=0 to disable for A/B benching.
     let dim_push_on = std::env::var("EMAT_DIM_PUSH")
         .ok()
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
+        .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+        .unwrap_or(true);
     let df = if reorder_on || agg_semi_on || dim_push_on {
         match df.into_optimized_plan() {
             Ok(plan) => {
