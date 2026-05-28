@@ -252,12 +252,3 @@ codegen-units = 1
 # ematix-iceberg is intentionally NOT yet a flow-side dep — Phase 3+
 # of docs/plans/CURRENT.md will wire it in when we surface Iceberg-
 # managed tables.
-
-# Σ.Q06.SF10.6 (2026-05-28): local patch to bench the cached-footer-
-# parse fix in ParquetFile (read_chunk_raw was re-parsing the whole
-# thrift footer per column-chunk). Points at the sibling working tree.
-# Remove + bump the registry pin once the change is published.
-[patch.crates-io]
-ematix-parquet-codec = { path = "../ematix-parquet/crates/ematix-parquet-codec" }
-ematix-parquet-format = { path = "../ematix-parquet/crates/ematix-parquet-format" }
-ematix-parquet-io = { path = "../ematix-parquet/crates/ematix-parquet-io" }
