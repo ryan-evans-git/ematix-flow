@@ -181,7 +181,7 @@ fn promote_dict_encoded_to_dictionary(
 ///   - `null_count`: sum across row groups (Exact iff every RG had Exact)
 ///   - `min_value`:  min across row groups
 ///   - `max_value`:  max across row groups
-pub(crate) fn aggregate_column_statistics(
+pub fn aggregate_column_statistics(
     meta: &datafusion::parquet::file::metadata::ParquetMetaData,
     arrow_schema: &datafusion::arrow::datatypes::Schema,
 ) -> Vec<ColumnStatistics> {

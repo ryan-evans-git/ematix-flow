@@ -35,10 +35,267 @@
 //! `[[ematix_parquet_repo]]` memory entries for context.
 
 use std::path::Path;
+use std::sync::Arc;
 
+use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use datafusion::common::stats::Precision;
+use datafusion::common::{ColumnStatistics, ScalarValue};
 use ematix_parquet_format::compact::Cursor;
-use ematix_parquet_format::metadata::{read_page_header, ColumnChunk, FileMetaData};
+use ematix_parquet_format::metadata::{read_page_header, ColumnChunk, FileMetaData, SchemaElement};
+use ematix_parquet_format::types::{ConvertedType, Encoding, ParquetType};
 use ematix_parquet_io::ParquetFile;
+
+/// All the metadata-derived fields `EmatixFastParquetTableProvider::try_new`
+/// needs, computed in one pass from the parsed thrift footer via
+/// ematix-parquet — replacing the parquet-rs `ArrowReaderMetadata::load`
+/// + `SerializedFileReader` path entirely (Σ.Q06.SF10.5.c). The schema
+/// is the RAW Arrow schema (Utf8 for byte-array string columns); the
+/// caller applies the Σ.E5 Utf8→Utf8View promotion + type validation.
+pub struct EmatProviderMetadata {
+    pub schema: SchemaRef,
+    pub num_rows: usize,
+    pub num_row_groups: usize,
+    pub rg_num_rows: Vec<usize>,
+    pub column_stats: Vec<ColumnStatistics>,
+    pub column_is_dict_encoded: Vec<bool>,
+    pub column_has_no_nulls: Vec<bool>,
+}
+
+/// Map a leaf `SchemaElement` to an Arrow `DataType`. Covers the
+/// primitive types `EmatixFastParquetTableProvider` supports
+/// (Int32/Int64/Float64/Date32/Utf8) plus a few neighbours; unsupported
+/// physical types fall through to a placeholder the provider's own
+/// validation rejects (matching the pre-5.c behaviour where parquet-rs
+/// produced a type the validator then refused).
+fn arrow_type_for(se: &SchemaElement<'_>) -> DataType {
+    let is_date = matches!(se.converted_type, Some(ConvertedType::Date))
+        || matches!(
+            se.logical_type,
+            Some(ematix_parquet_format::metadata::LogicalType::Date)
+        );
+    let is_string = matches!(se.converted_type, Some(ConvertedType::Utf8))
+        || matches!(
+            se.logical_type,
+            Some(ematix_parquet_format::metadata::LogicalType::String)
+        );
+    match se.column_type {
+        Some(ParquetType::Boolean) => DataType::Boolean,
+        Some(ParquetType::Int32) if is_date => DataType::Date32,
+        Some(ParquetType::Int32) => DataType::Int32,
+        Some(ParquetType::Int64) => DataType::Int64,
+        Some(ParquetType::Float) => DataType::Float32,
+        Some(ParquetType::Double) => DataType::Float64,
+        Some(ParquetType::ByteArray) if is_string => DataType::Utf8,
+        Some(ParquetType::ByteArray) => DataType::Binary,
+        // Int96 / FixedLenByteArray / None: not bridge-supported; emit a
+        // placeholder the provider validation will reject.
+        _ => DataType::Binary,
+    }
+}
+
+/// Build the RAW Arrow schema from `FileMetaData.schema`. Handles the
+/// flat (no nested groups) shape that the bridge targets: schema[0] is
+/// the root group, schema[1..] are leaf columns in order. Returns the
+/// fields in column-chunk order so they align with `row_groups[].columns[]`.
+fn arrow_schema_from_metadata(meta: &FileMetaData<'_>) -> Result<SchemaRef, EmatMetadataError> {
+    if meta.schema.is_empty() {
+        return Err(EmatMetadataError::Metadata("empty schema".into()));
+    }
+    let mut fields: Vec<Field> = Vec::with_capacity(meta.schema.len().saturating_sub(1));
+    // Skip schema[0] (root). Each subsequent element with a physical
+    // column_type is a leaf. A group node (num_children set, no
+    // column_type) would mean a nested schema — the bridge doesn't
+    // support those, so bail so the caller can fall back.
+    for se in meta.schema.iter().skip(1) {
+        if se.column_type.is_none() {
+            return Err(EmatMetadataError::Metadata(
+                "nested/group schema not supported by ematix metadata mapper".into(),
+            ));
+        }
+        let name = std::str::from_utf8(se.name)
+            .map_err(|_| EmatMetadataError::Metadata("non-utf8 column name".into()))?
+            .to_string();
+        let nullable = !matches!(
+            se.repetition_type,
+            Some(ematix_parquet_format::types::FieldRepetitionType::Required)
+        );
+        fields.push(Field::new(name, arrow_type_for(se), nullable));
+    }
+    Ok(Arc::new(Schema::new(fields)))
+}
+
+/// Parse a min/max stat byte slice into a typed `ScalarValue` for the
+/// numeric Arrow types the provider exposes. Returns `None` for types
+/// we don't summarise (strings, binary) — matching
+/// `fast_parquet::aggregate_column_statistics`, which only carries
+/// numeric min/max.
+fn scalar_from_le_bytes(ty: &DataType, b: &[u8]) -> Option<ScalarValue> {
+    match ty {
+        DataType::Int32 => b
+            .get(..4)
+            .map(|s| ScalarValue::Int32(Some(i32::from_le_bytes(s.try_into().unwrap())))),
+        DataType::Date32 => b
+            .get(..4)
+            .map(|s| ScalarValue::Date32(Some(i32::from_le_bytes(s.try_into().unwrap())))),
+        DataType::Int64 => b
+            .get(..8)
+            .map(|s| ScalarValue::Int64(Some(i64::from_le_bytes(s.try_into().unwrap())))),
+        DataType::Float64 => b
+            .get(..8)
+            .map(|s| ScalarValue::Float64(Some(f64::from_le_bytes(s.try_into().unwrap())))),
+        DataType::Float32 => b
+            .get(..4)
+            .map(|s| ScalarValue::Float32(Some(f32::from_le_bytes(s.try_into().unwrap())))),
+        _ => None,
+    }
+}
+
+/// Σ.Q06.SF10.5.c — load every metadata-derived field
+/// `EmatixFastParquetTableProvider::try_new` needs in one pass, via
+/// ematix-parquet, replacing parquet-rs's `ArrowReaderMetadata::load`
+/// + `SerializedFileReader`. Returns the RAW schema (Utf8, not
+/// Utf8View-promoted) so the caller can apply its Σ.E5 promotion +
+/// type validation unchanged.
+///
+/// Stats semantics mirror `fast_parquet::aggregate_column_statistics`:
+/// per leaf column, fold row-group stats into one `ColumnStatistics`
+/// — null_count summed (Exact iff every RG had it), min = min across
+/// RGs, max = max across RGs, numeric types only. distinct_count left
+/// Absent (the optional dict-page walk enriches it separately).
+pub fn load_provider_metadata<P: AsRef<Path>>(
+    path: P,
+) -> Result<EmatProviderMetadata, EmatMetadataError> {
+    let pf = ParquetFile::open(path.as_ref()).map_err(|e| EmatMetadataError::Io(e.to_string()))?;
+    let meta = pf
+        .metadata()
+        .map_err(|e| EmatMetadataError::Metadata(e.to_string()))?;
+
+    let schema = arrow_schema_from_metadata(&meta)?;
+    let num_cols = schema.fields().len();
+    let num_rows = meta.num_rows.max(0) as usize;
+    let num_row_groups = meta.row_groups.len();
+    let rg_num_rows: Vec<usize> = meta
+        .row_groups
+        .iter()
+        .map(|rg| rg.num_rows.max(0) as usize)
+        .collect();
+
+    // Per-column aggregation across row groups.
+    let mut null_count: Vec<Option<i64>> = vec![Some(0); num_cols];
+    let mut min_sv: Vec<Option<ScalarValue>> = vec![None; num_cols];
+    let mut max_sv: Vec<Option<ScalarValue>> = vec![None; num_cols];
+    let mut no_nulls: Vec<bool> = vec![true; num_cols];
+    // is_dict: every data page in every RG must be dict-encoded.
+    let mut all_dict: Vec<bool> = vec![true; num_cols];
+
+    for rg in &meta.row_groups {
+        let cols = rg.columns.len().min(num_cols);
+        for col_idx in 0..num_cols {
+            let arrow_ty = schema.field(col_idx).data_type().clone();
+            if col_idx >= cols {
+                null_count[col_idx] = None;
+                no_nulls[col_idx] = false;
+                all_dict[col_idx] = false;
+                continue;
+            }
+            let Some(cm) = rg.columns[col_idx].meta_data.as_ref() else {
+                null_count[col_idx] = None;
+                no_nulls[col_idx] = false;
+                all_dict[col_idx] = false;
+                continue;
+            };
+
+            // --- null_count + no_nulls + min/max from Statistics ---
+            match cm.statistics.as_ref() {
+                Some(stats) => {
+                    match (stats.null_count, null_count[col_idx]) {
+                        (Some(nc), Some(curr)) => {
+                            null_count[col_idx] = Some(curr.saturating_add(nc.max(0)))
+                        }
+                        _ => null_count[col_idx] = None,
+                    }
+                    if stats.null_count != Some(0) {
+                        no_nulls[col_idx] = false;
+                    }
+                    // Prefer the current `*_value` fields, fall back to
+                    // the deprecated `min`/`max`.
+                    let min_b = stats.min_value.or(stats.min);
+                    let max_b = stats.max_value.or(stats.max);
+                    if let Some(b) = min_b {
+                        if let Some(v) = scalar_from_le_bytes(&arrow_ty, b) {
+                            match &min_sv[col_idx] {
+                                Some(curr) if !(v < *curr) => {}
+                                _ => min_sv[col_idx] = Some(v),
+                            }
+                        }
+                    }
+                    if let Some(b) = max_b {
+                        if let Some(v) = scalar_from_le_bytes(&arrow_ty, b) {
+                            match &max_sv[col_idx] {
+                                Some(curr) if !(v > *curr) => {}
+                                _ => max_sv[col_idx] = Some(v),
+                            }
+                        }
+                    }
+                }
+                None => {
+                    null_count[col_idx] = None;
+                    no_nulls[col_idx] = false;
+                }
+            }
+
+            // --- is_dict_encoded: needs a dict page + all data pages dict ---
+            if all_dict[col_idx] {
+                if cm.dictionary_page_offset.is_none() {
+                    all_dict[col_idx] = false;
+                } else {
+                    match cm.encoding_stats.as_ref() {
+                        Some(es) => {
+                            let ok = es.iter().all(|s| {
+                                !matches!(
+                                    s.page_type,
+                                    ematix_parquet_format::types::PageType::DataPage
+                                        | ematix_parquet_format::types::PageType::DataPageV2
+                                ) || matches!(
+                                    s.encoding,
+                                    Encoding::RleDictionary | Encoding::PlainDictionary
+                                )
+                            });
+                            if !ok {
+                                all_dict[col_idx] = false;
+                            }
+                        }
+                        None => all_dict[col_idx] = false,
+                    }
+                }
+            }
+        }
+    }
+
+    let column_stats: Vec<ColumnStatistics> = (0..num_cols)
+        .map(|i| ColumnStatistics {
+            null_count: match null_count[i] {
+                Some(n) => Precision::Exact(n.max(0) as usize),
+                None => Precision::Absent,
+            },
+            max_value: max_sv[i].clone().map(Precision::Exact).unwrap_or(Precision::Absent),
+            min_value: min_sv[i].clone().map(Precision::Exact).unwrap_or(Precision::Absent),
+            sum_value: Precision::Absent,
+            distinct_count: Precision::Absent,
+            byte_size: Precision::Absent,
+        })
+        .collect();
+
+    Ok(EmatProviderMetadata {
+        schema,
+        num_rows,
+        num_row_groups,
+        rg_num_rows,
+        column_stats,
+        column_is_dict_encoded: all_dict,
+        column_has_no_nulls: no_nulls,
+    })
+}
 
 /// For each leaf column in `meta.row_groups[].columns[]`, return the
 /// MAX of `DictionaryPageHeader.num_values` across all row groups

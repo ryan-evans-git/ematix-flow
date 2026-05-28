@@ -23,6 +23,10 @@
 
 use std::any::Any;
 use std::collections::HashMap;
+// Σ.Q06.SF10.5.c: `try_new` no longer opens the file directly (metadata
+// comes from ematix-parquet); `std::fs::File` is now only used by the
+// parquet-rs writer in the test fixtures.
+#[cfg(test)]
 use std::fs::File;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -45,9 +49,6 @@ use datafusion::physical_plan::{
     SendableRecordBatchStream,
 };
 use futures_util::StreamExt;
-
-use datafusion::parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
-use datafusion::parquet::file::reader::{FileReader, SerializedFileReader};
 
 use crate::emat_arrow_reader::EmatArrowBatchReaderBuilder;
 use crate::ematix_parquet_bridge::{
@@ -1547,21 +1548,23 @@ impl EmatixFastParquetTableProvider {
                 }
             }
         }
-        let file = File::open(&path).map_err(|e| {
-            DataFusionError::External(
-                format!("EmatixFastParquetTableProvider: open `{path}`: {e}").into(),
-            )
-        })?;
-        // Use parquet-rs to extract the Arrow schema. The bridge
-        // operates on raw column chunks; we still need parquet-rs
-        // to translate parquet types into Arrow types for the
-        // RecordBatch schema we'll build.
-        let opts = ArrowReaderOptions::new();
-        let meta = ArrowReaderMetadata::load(&file, opts).map_err(|e| {
+        // Σ.Q06.SF10.5.c (2026-05-28): load all metadata-derived state
+        // (raw schema, num_rows, num_row_groups, rg_num_rows,
+        // column_stats, column_is_dict_encoded, column_has_no_nulls)
+        // in one pass via ematix-parquet — NO parquet-rs. Byte-identical
+        // to the old `ArrowReaderMetadata::load` + `SerializedFileReader`
+        // path, verified across all 8 TPC-H tables by
+        // `examples/emat_meta_parity.rs` (0 mismatches).
+        let em = crate::emat_parquet_metadata::load_provider_metadata(&path).map_err(|e| {
             DataFusionError::External(
                 format!("EmatixFastParquetTableProvider: load metadata: {e}").into(),
             )
         })?;
+        let num_rows = em.num_rows;
+        let num_row_groups = em.num_row_groups;
+        let rg_num_rows: Arc<Vec<usize>> = Arc::new(em.rg_num_rows);
+        let column_is_dict_encoded: Arc<Vec<bool>> = Arc::new(em.column_is_dict_encoded);
+        let column_has_no_nulls: Arc<Vec<bool>> = Arc::new(em.column_has_no_nulls);
         // Σ.E5 (2026-05-18): promote Utf8 → Utf8View at `try_new` time.
         // The streaming reader path emits `StringViewArray`, and that's
         // the default since Σ.E5.4.b. Previously this promotion only
@@ -1573,7 +1576,7 @@ impl EmatixFastParquetTableProvider {
         // — no builder calls). `with_streaming_arrow_reader(false)`
         // reverts the promotion for the bridge path. Dict preservation
         // composes via its own Utf8→Dictionary rewrite.
-        let raw_schema = meta.schema().clone();
+        let raw_schema = em.schema.clone();
         let promoted_fields: Vec<Arc<arrow_schema::Field>> = raw_schema
             .fields()
             .iter()
@@ -1615,80 +1618,13 @@ impl EmatixFastParquetTableProvider {
             }
         }
 
-        let reader = SerializedFileReader::new(File::open(&path).map_err(|e| {
-            DataFusionError::External(
-                format!("EmatixFastParquetTableProvider: reopen `{path}`: {e}").into(),
-            )
-        })?)
-        .map_err(|e| {
-            DataFusionError::External(
-                format!("EmatixFastParquetTableProvider: SerializedFileReader: {e}").into(),
-            )
-        })?;
-        let fmd = reader.metadata().file_metadata();
-        let num_rows = fmd.num_rows() as usize;
-        let num_row_groups = reader.metadata().num_row_groups();
-        let rg_num_rows: Arc<Vec<usize>> = Arc::new(
-            reader
-                .metadata()
-                .row_groups()
-                .iter()
-                .map(|rg| rg.num_rows() as usize)
-                .collect(),
-        );
-
-        // Σ.E5 (2026-05-18): aggregate typed per-column stats so
-        // `partition_statistics` returns real cardinality info to the
-        // planner. Reuses the helper in `fast_parquet.rs` — both
-        // providers read the same parquet-rs `ParquetMetaData`.
-        let mut column_stats = Arc::new(crate::fast_parquet::aggregate_column_statistics(
-            reader.metadata(),
-            schema.as_ref(),
-        ));
-
-        // Σ.E5: detect columns where EVERY row group has every data
-        // page dict-encoded (RleDictionary or PlainDictionary).
-        // Mere `dictionary_page_offset.is_some()` isn't sufficient —
-        // writers can include a dict page AND fall back to PLAIN for
-        // some data pages mid-chunk (Q13's o_comment, Q20's p_name).
-        // We check via `encoding_stats`: every data page must be
-        // dict-encoded. Used by supports_filters_pushdown to gate
-        // LIKE acceptance — dict-encoded columns let the per-entry
-        // predicate eval run O(|dict|).
-        use datafusion::parquet::basic::{Encoding as PqEnc, PageType as PqPageType};
+        // num_rows / num_row_groups / rg_num_rows / column_is_dict_encoded
+        // / column_has_no_nulls all came from `em` (Σ.Q06.SF10.5.c) above.
+        // `column_stats` here carries the aggregated numeric min/max +
+        // null_count; the gated dict-distinct walk below may enrich
+        // distinct_count.
         let num_cols_in_schema = schema.fields().len();
-        let mut all_dict: Vec<bool> = vec![true; num_cols_in_schema];
-        for rg in reader.metadata().row_groups() {
-            #[allow(clippy::needless_range_loop)]
-            for col_idx in 0..num_cols_in_schema.min(rg.columns().len()) {
-                if !all_dict[col_idx] {
-                    continue;
-                }
-                let col = rg.column(col_idx);
-                if col.dictionary_page_offset().is_none() {
-                    all_dict[col_idx] = false;
-                    continue;
-                }
-                // Must have encoding stats AND every data page must
-                // be dict-encoded.
-                let Some(stats) = col.page_encoding_stats() else {
-                    // Stats absent — conservatively mark non-dict to
-                    // avoid false-positive LIKE pushdowns.
-                    all_dict[col_idx] = false;
-                    continue;
-                };
-                let all_data_pages_dict = stats.iter().all(|s| {
-                    !matches!(
-                        s.page_type,
-                        PqPageType::DATA_PAGE | PqPageType::DATA_PAGE_V2
-                    ) || matches!(s.encoding, PqEnc::RLE_DICTIONARY | PqEnc::PLAIN_DICTIONARY)
-                });
-                if !all_data_pages_dict {
-                    all_dict[col_idx] = false;
-                }
-            }
-        }
-        let column_is_dict_encoded: Arc<Vec<bool>> = Arc::new(all_dict);
+        let mut column_stats = Arc::new(em.column_stats);
 
         // Σ.AH.2 Story 1'.2 (2026-05-26) — for every column that has
         // a dictionary page in EVERY row group, read each dict page's
@@ -1733,11 +1669,11 @@ impl EmatixFastParquetTableProvider {
         // Story 1'.3 finding ("emat-stats-aware selectivity helps")
         // has been outpaced by post-2026-05-26 L9 changes.
         //
-        // Opt back in via `EMAT_DICT_DISTINCT=1`; the legacy
-        // parquet-rs walker is still available via
-        // `EMAT_DICT_DISTINCT=1 EMAT_DICT_DISTINCT_VIA_EMAT=0`.
-        // The proper fix is at the L9 selectivity gate, not here —
-        // tracked as Σ.Q06.SF10.5.h follow-up.
+        // Opt back in via `EMAT_DICT_DISTINCT=1`. The proper fix is at
+        // the L9 selectivity gate, not here — tracked as Σ.Q06.SF10.5.h
+        // follow-up. (The legacy parquet-rs walker was removed in
+        // Σ.Q06.SF10.5.c; only the ematix-parquet header-only walk
+        // remains.)
         let dict_distinct_enabled = std::env::var("EMAT_DICT_DISTINCT")
             .ok()
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
@@ -1766,91 +1702,28 @@ impl EmatixFastParquetTableProvider {
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
         let skip_dict_distinct = force_skip || !(dict_distinct_enabled || walk_by_size);
-        let use_emat_dict_distinct = std::env::var("EMAT_DICT_DISTINCT_VIA_EMAT")
-            .ok()
-            .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
-            .unwrap_or(true);
         if !skip_dict_distinct {
             use datafusion::common::stats::Precision;
-            if use_emat_dict_distinct {
-                // Opt-in ematix-parquet path (no Snappy decompress).
-                if let Ok(distinct_maxes) =
-                    crate::emat_parquet_metadata::dict_distinct_max_per_column(
-                        &path,
-                        num_cols_in_schema,
-                    )
-                {
-                    let mut column_stats_vec: Vec<datafusion::common::stats::ColumnStatistics> =
-                        (*column_stats).clone();
-                    for col_idx in 0..num_cols_in_schema {
-                        if let Some(max_distinct) =
-                            distinct_maxes.get(col_idx).copied().flatten()
-                        {
-                            if max_distinct > 0 {
-                                column_stats_vec[col_idx].distinct_count =
-                                    Precision::Inexact(max_distinct);
-                            }
-                        }
-                    }
-                    column_stats = Arc::new(column_stats_vec);
-                }
-            } else {
-                // Default: parquet-rs path (decompresses each dict page).
-                use datafusion::parquet::column::page::Page;
+            // ematix-parquet header-only walk (no Snappy decompress).
+            if let Ok(distinct_maxes) =
+                crate::emat_parquet_metadata::dict_distinct_max_per_column(
+                    &path,
+                    num_cols_in_schema,
+                )
+            {
                 let mut column_stats_vec: Vec<datafusion::common::stats::ColumnStatistics> =
                     (*column_stats).clone();
-                'col: for col_idx in 0..num_cols_in_schema {
-                    for rg in reader.metadata().row_groups() {
-                        if col_idx >= rg.num_columns() {
-                            continue 'col;
+                for col_idx in 0..num_cols_in_schema {
+                    if let Some(max_distinct) = distinct_maxes.get(col_idx).copied().flatten() {
+                        if max_distinct > 0 {
+                            column_stats_vec[col_idx].distinct_count =
+                                Precision::Inexact(max_distinct);
                         }
-                        if rg.column(col_idx).dictionary_page_offset().is_none() {
-                            continue 'col;
-                        }
-                    }
-                    let mut max_distinct: usize = 0;
-                    let mut any_dict = false;
-                    for rg_idx in 0..num_row_groups {
-                        let Ok(rg) = reader.get_row_group(rg_idx) else {
-                            continue 'col;
-                        };
-                        let Ok(mut page_reader) = rg.get_column_page_reader(col_idx) else {
-                            continue 'col;
-                        };
-                        match page_reader.get_next_page() {
-                            Ok(Some(Page::DictionaryPage { num_values, .. })) => {
-                                max_distinct = max_distinct.max(num_values as usize);
-                                any_dict = true;
-                            }
-                            _ => continue 'col,
-                        }
-                    }
-                    if any_dict && max_distinct > 0 {
-                        column_stats_vec[col_idx].distinct_count = Precision::Inexact(max_distinct);
                     }
                 }
                 column_stats = Arc::new(column_stats_vec);
             }
         }
-
-        // Σ.E5 per-filter Exact (2026-05-19): per-column no-nulls
-        // flag. `null_count_opt() == Some(0)` for every RG = safe.
-        // Stats missing → conservatively false (may have nulls).
-        let mut no_nulls: Vec<bool> = vec![true; num_cols_in_schema];
-        for rg in reader.metadata().row_groups() {
-            #[allow(clippy::needless_range_loop)]
-            for col_idx in 0..num_cols_in_schema.min(rg.columns().len()) {
-                if !no_nulls[col_idx] {
-                    continue;
-                }
-                let col = rg.column(col_idx);
-                match col.statistics().and_then(|s| s.null_count_opt()) {
-                    Some(0) => {}
-                    _ => no_nulls[col_idx] = false,
-                }
-            }
-        }
-        let column_has_no_nulls: Arc<Vec<bool>> = Arc::new(no_nulls);
 
         // Σ.Q06.SF10: populate the process-global cache before
         // returning. Subsequent constructions for the same file
