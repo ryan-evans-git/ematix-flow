@@ -1722,13 +1722,33 @@ impl EmatixFastParquetTableProvider {
         // to the parquet-rs `SerializedPageReader::get_next_page`
         // path on TPC-H lineitem SF=10 (all 16 columns match).
         //
-        // Default ON; `EMAT_DICT_DISTINCT_VIA_EMAT=0` reverts to the
-        // legacy parquet-rs path for A/B work, `EMAT_SKIP_DICT_DISTINCT=1`
-        // skips the walk entirely.
-        let skip_dict_distinct = std::env::var("EMAT_SKIP_DICT_DISTINCT")
+        // Σ.Q06.SF10.5.h (2026-05-28): the walk itself default-flipped
+        // to SKIP. Strict 22q SF=10 A/B (walk on vs walk off, both
+        // with cache, autotune disabled): net **-4.35% (-145.09 ms)**
+        // — Q18 -26.55% (-97 ms), Q17 -21.52% (-41 ms), Q21 -18.11%
+        // (-64 ms) all clear >2σ wins; Q02 +9.77% (+2.9 ms) only
+        // regression. The populated distinct_count drives L9's
+        // selectivity gate to fire blooms whose probe overhead
+        // exceeds the savings on Q17/Q18/Q21 shapes. The Σ.AH.2
+        // Story 1'.3 finding ("emat-stats-aware selectivity helps")
+        // has been outpaced by post-2026-05-26 L9 changes.
+        //
+        // Opt back in via `EMAT_DICT_DISTINCT=1`; the legacy
+        // parquet-rs walker is still available via
+        // `EMAT_DICT_DISTINCT=1 EMAT_DICT_DISTINCT_VIA_EMAT=0`.
+        // The proper fix is at the L9 selectivity gate, not here —
+        // tracked as Σ.Q06.SF10.5.h follow-up.
+        let dict_distinct_enabled = std::env::var("EMAT_DICT_DISTINCT")
             .ok()
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
+        // Legacy `EMAT_SKIP_DICT_DISTINCT=1` still forces skip for
+        // explicit A/B work, but the default behaviour is now skip.
+        let force_skip = std::env::var("EMAT_SKIP_DICT_DISTINCT")
+            .ok()
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        let skip_dict_distinct = force_skip || !dict_distinct_enabled;
         let use_emat_dict_distinct = std::env::var("EMAT_DICT_DISTINCT_VIA_EMAT")
             .ok()
             .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
