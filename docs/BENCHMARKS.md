@@ -9,7 +9,7 @@ Plan: [`docs/PHASE_SIGMA_PLAN.md`](PHASE_SIGMA_PLAN.md).
 
 ---
 
-## TL;DR — release-refresh, M3 Pro (2026-05-26, post-Σ.AG.7)
+## TL;DR — release-refresh, M3 Pro (2026-05-27, post-Σ.AJ.1 Lever C + Σ.AK)
 
 **SF=1 (3-engine, 20 trials × 3 warmups, bare invocation):**
 
@@ -24,18 +24,31 @@ Plan: [`docs/PHASE_SIGMA_PLAN.md`](PHASE_SIGMA_PLAN.md).
 | Engine  | Geomean ematix-flow speedup | Range          | Wins  |
 |---|---:|---|---:|
 | **ematix-flow** (single-node) | — | — | **15 / 22** |
-| DuckDB                        | ~1.34× | 0.80× – 6.42× | 7 (Q03 tie, Q05, Q06, Q07, Q08, Q17, Q18) |
+| DuckDB                        | ~1.35× | 0.70× – 6.20× | 7 (Q01, Q05, Q06, Q07, Q08, Q17, Q18) |
+
+> **Σ.AJ.1 + Σ.AK gap-narrowing (2026-05-27).** Commits `8bd3f39` (Lever C
+> agg-side LeftSemi pushdown default-on) and `3c56db9` (Q10
+> shape-predicate dim-push default-on) cumulatively cut 22q SF=10 wall
+> by ~300 ms (-9%). The win COUNT is unchanged at 15/22, but the gap
+> shape transformed: **Q17 narrowed from ~1.31× DuckDB-faster to 1.09×**
+> (now within 8% of DuckDB); Q01 and Q06 are now effectively tied
+> (DuckDB by <2%); Q07, Q08 narrowed to within 5-7%. Q18 remains the
+> widest DuckDB win at 1.42× (235 ms vs 335 ms).
 
 > **Σ.AG.7 default-on change.** As of commit 71f1618, the plan cache
 > and every winning lever default ON in the triangulation bench. A bare
 > `cargo run --release ... --example tpch_triangulation_bench` reaches
 > the milestone config — no env vars required. Set any of
 > `EMAT_PLAN_CACHE / PUSH_SEMI / RH_SUM_F64 / RT_BLOOM_* / ALL_TABLES_EMAT
-> / RG_DECODE_CACHE = 0` to disable a specific lever for A/B benching.
+> / RG_DECODE_CACHE / AGG_SEMI / DIM_PUSH = 0` to disable a specific
+> lever for A/B benching.
 
 > **SF=10 noise band.** Per-query medians shift ±5–15% across
 > back-to-back runs from thermal effects (both engines move together).
-> Treat **13–17 ematix wins as the steady-state SF=10 range**.
+> Treat **13–17 ematix wins as the steady-state SF=10 range**. The
+> strict-A/B harness (`scripts/bench/strict_ab.sh`) drops median CV to
+> 1.30–1.96% via `caffeinate -i` + `taskpolicy -a` + discard-first
+> + median-of-medians; use it when measuring lever-level effects.
 
 The full per-query table + provenance / config / caveats live on the
 public docs site:
