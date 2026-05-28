@@ -168,6 +168,13 @@ pub mod drop_redundant_filter_rule;
 // broadcasts full 100K supplier; the post-Σ.AD plan filters supplier
 // to ~8K via the nation join BEFORE the fact-fact broadcast.
 pub mod dim_join_pushdown;
+// Σ.AN.1 (2026-05-28): physical optimizer rule that boosts the
+// partition count of RepartitionExec(Hash) → AggregateExec(FinalPartitioned)
+// pipelines whose agg output cardinality exceeds the per-partition
+// L3-fit budget. Targets Q18 SF=10's 15M-group SUM agg that
+// blows L3 at the default 14-partition layout. Opt-in via
+// EMAT_AGG_PARTITION_BOOST=1.
+pub mod agg_partition_boost;
 // Σ.L.2 (2026-05-21): adaptive runtime workload feedback. Persists
 // per-shape probe outcomes + per-query observability (selectivity,
 // hash collision rate) to a SQLite file (~/.ematix/workload.db by
@@ -273,6 +280,14 @@ pub mod fk_chain;
 // the build-side bloom to each via a per-scan sideband (build runs
 // once; bloom Arc shared). Install via install_cascading_bloom_rule.
 pub mod runtime_bloom_cascading_rule;
+// Σ.AJ.1 Lever B POC (2026-05-27): plan-wide broadcast of bloom
+// emitters to sibling same-parquet-path scans. Specifically targets
+// Q17's correlated AVG-subquery shape where the subquery's lineitem
+// scan can use the part-filter bloom but isn't reachable from the
+// HashJoin-local probe-subtree walk that the cascading rule uses.
+// Opt-in via EMAT_L9_BROADCAST_SIBLINGS=1; default OFF. Unsafe for
+// Q21-shape (correlated subqueries with different join semantics).
+pub mod broadcast_sibling_blooms_rule;
 // Σ.U.A (2026-05-24): Apache-Impala-style lane-parallel filter-sum
 // kernel. Generalises the splash-bloom pattern (see `bloom.rs`) to
 // the "M predicate clauses + SUM-of-product" shape that covers Q06,

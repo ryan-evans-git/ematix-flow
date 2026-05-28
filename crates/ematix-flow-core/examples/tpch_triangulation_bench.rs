@@ -719,6 +719,20 @@ async fn build_ematix_ctx(
     if rh_sum_f64_enabled {
         builder = builder.with_physical_optimizer_rule(Arc::new(EnableRobinHoodSumF64Rule));
     }
+    // Σ.AN.1 (2026-05-28): per-operator partition routing for
+    // high-cardinality FinalPartitioned aggregates. Opt-in via
+    // EMAT_AGG_PARTITION_BOOST=1. Q18 SF=10 target: -20 to -30 ms
+    // by routing the 15M-group SUM aggregate's repartition from
+    // cores (=14) to 112 (8× cores). See PHASE_SIGMA_AN_1_DESIGN.md.
+    let agg_partition_boost_enabled = std::env::var("EMAT_AGG_PARTITION_BOOST")
+        .ok()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if agg_partition_boost_enabled {
+        builder = builder.with_physical_optimizer_rule(Arc::new(
+            ematix_flow_core::agg_partition_boost::AggPartitionBoostRule,
+        ));
+    }
     // Σ.Q.L9: threads a sideband between HashJoinExec build and
     // probe-side EmatixFastParquetExec so the build-side bloom is
     // captured as a side-effect of the regular HashJoin build phase.
