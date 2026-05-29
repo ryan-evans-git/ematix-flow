@@ -332,6 +332,7 @@ async fn build_ctx(
             min_probe_to_build_ratio: 1024,
             allow_inner_join: true,
             require_filtered_build: true,
+            max_expected_keys_per_partition: 0,
         }))
         .with_optimizer_rule(Arc::new(PushDownLeftSemiRule));
     let state = builder.build();
