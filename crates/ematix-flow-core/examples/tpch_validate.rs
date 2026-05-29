@@ -403,6 +403,7 @@ async fn run_ematix(
                 min_probe_to_build_ratio: 1024,
                 allow_inner_join: true,
                 require_filtered_build: true,
+                max_expected_keys_per_partition: 0,
             }
         } else {
             EnableRuntimeBloomSidebandRule::default()
