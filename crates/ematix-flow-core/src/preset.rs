@@ -182,6 +182,27 @@ pub fn with_optimizer_rules_and_registry(
     } else {
         builder
     };
+    // Σ.BR Phase 2 (2026-05-29): production wiring for the join reorder. The
+    // walker was previously applied only in the bench harness, so library
+    // users never got it. Install it as a QueryPlanner (NOT an OptimizerRule —
+    // that would re-open the 5–8% codegen-tax, [[optimizer-codegen-sensitivity]])
+    // so it runs post-optimization, matching the validated bench config. The
+    // shape-gated entry carries the scale gate (≥100M-row fact → cap 6, else 4),
+    // ambiguous-names / aggregate-key / LIKE / LeftSemi-anti / composite-leaf
+    // guards, so it fires only on chains the cost model can size — at SF=100
+    // this lands the Q05 funnel (−14.7%) with no regressor. Default ON;
+    // `EMAT_REORDER_QP=0` disables for A/B.
+    let reorder_qp_on = std::env::var("EMAT_REORDER_QP")
+        .ok()
+        .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+        .unwrap_or(true);
+    let builder = if reorder_qp_on {
+        builder.with_query_planner(Arc::new(
+            crate::reorder_query_planner::ReorderQueryPlanner,
+        ))
+    } else {
+        builder
+    };
     (builder, registry)
 }
 

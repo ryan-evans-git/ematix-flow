@@ -157,6 +157,22 @@ pub struct ReorderOpts {
     ///
     /// Default true.
     pub reject_under_left_semi_anti: bool,
+    /// Σ.BR Phase 2 (2026-05-29): scale gate. When the largest leaf in a
+    /// chain has at least `min_rows` rows, raise the effective `max_leaves`
+    /// to `bumped`. `Some((min_rows, bumped))` or `None` to disable.
+    ///
+    /// Rationale: the 6-leaf dimensional funnels (Q05, Q09) only pay off at
+    /// scale — measured SF=100 Q05 −10.1% but ~neutral at SF=10 — and the
+    /// SF=10 "regressors" (Q07/Q02/Q11/Q21) are caught by the *other*
+    /// guards (ambiguous-names / aggregate-key / jump-on-reject / semi-anti),
+    /// NOT by the leaf cap. So raising the cap only in the large-fact regime
+    /// admits the funnels without re-admitting the regressors, and leaves
+    /// SF=1/SF=10 behaviour (largest leaf < `min_rows`) untouched. The
+    /// scale-invariant cost ratio cannot encode this — see
+    /// PHASE_SIGMA_BR_JOIN_REORDER.md §5. Default `Some((100_000_000, 6))`:
+    /// fires only for ≥100M-row facts (SF=100 lineitem 600M bumps; SF=10
+    /// 60M does not).
+    pub scale_bump: Option<(u64, usize)>,
 }
 
 impl Default for ReorderOpts {
@@ -167,6 +183,7 @@ impl Default for ReorderOpts {
             reject_aggregate_join_keys: true,
             jump_on_reject: true,
             reject_under_left_semi_anti: true,
+            scale_bump: Some((100_000_000, 6)),
         }
     }
 }
@@ -182,6 +199,7 @@ impl ReorderOpts {
             reject_aggregate_join_keys: false,
             jump_on_reject: false,
             reject_under_left_semi_anti: false,
+            scale_bump: None,
         }
     }
 }
@@ -238,49 +256,76 @@ pub fn reorder_inner_joins_with_opts(plan: LogicalPlan, opts: ReorderOpts) -> Df
             Ok(Transformed::new(node, false, TreeNodeRecursion::Jump))
         }
         LogicalPlan::Join(ref join) if join.join_type == JoinType::Inner => {
-            // Flatten the chain rooted at this Inner Join.
-            let flat = flatten_inner_join_chain(&node);
-            // Did this chain reach the gate (i.e., is it an Inner-join
-            // chain at all)? Used to decide whether `jump_on_reject`
-            // applies — only Inner-join chains get the gate; arbitrary
-            // non-Join nodes are always descended.
-            let is_inner_join_chain = flat.is_some();
-            match flat {
-                Some(chain)
-                    if chain.leaves.len() >= 3
-                        && chain.leaves.len() <= opts.max_leaves
-                        && !chain_has_ambiguous_names(&chain)
-                        && !(opts.reject_string_like && chain_has_string_like_filter(&chain))
-                        && !(opts.reject_aggregate_join_keys && chain_has_aggregate_join_key(&chain)) =>
-                {
-                    match rebuild_reordered(&chain) {
-                        Some(rebuilt) => Ok(Transformed::new(
-                            rebuilt,
-                            true,
-                            // Don't descend into the rebuilt subtree —
-                            // we've already processed the whole chain
-                            // atomically. Without Jump, transform_down
-                            // would recurse and re-flatten our own
-                            // output, potentially picking up dependent
-                            // inner-join subtrees we already enumerated.
-                            TreeNodeRecursion::Jump,
-                        )),
-                        None => Ok(Transformed::no(node)),
+            // Flatten the chain rooted at this Inner Join. Only Inner-join
+            // chains reach the gate; on rejection `jump_on_reject` decides
+            // whether to also skip descent into sub-chains.
+            match flatten_inner_join_chain(&node) {
+                Some(chain) => {
+                    let n = chain.leaves.len();
+                    // Σ.BR Phase 2 (2026-05-29): scale gate. Raise the leaf
+                    // cap to `bumped` when the chain touches a large fact
+                    // table — the SF=100 regime where the dimensional funnel
+                    // pays off (Q05 −10%, Q09 win at 6 leaves). Below the
+                    // threshold the conservative cap holds, so SF=1/SF=10
+                    // behaviour is unchanged. The regressors (Q07/Q02/Q11/
+                    // Q21) are rejected by the *other* guards, not the cap,
+                    // so raising it only admits the funnels. See
+                    // PHASE_SIGMA_BR_JOIN_REORDER.md §5 "guard attribution".
+                    let largest_leaf_rows =
+                        chain.leaves.iter().map(estimate_leaf_card).max().unwrap_or(0);
+                    let effective_max_leaves = match opts.scale_bump {
+                        Some((min_rows, bumped)) if largest_leaf_rows >= min_rows => {
+                            bumped.max(opts.max_leaves)
+                        }
+                        _ => opts.max_leaves,
+                    };
+                    let too_few = n < 3;
+                    let too_many = n > effective_max_leaves;
+                    let ambiguous = chain_has_ambiguous_names(&chain);
+                    let like =
+                        opts.reject_string_like && chain_has_string_like_filter(&chain);
+                    let aggkey = opts.reject_aggregate_join_keys
+                        && chain_has_aggregate_join_key(&chain);
+                    // Σ.BR Phase 2: reject if any leaf is a composite (non-
+                    // TableScan) subtree the cost model can't estimate — its
+                    // sentinel cardinality poisons the DP (Q10 regression).
+                    let composite = !chain.leaves.iter().all(leaf_is_estimable);
+                    let pass =
+                        !too_few && !too_many && !ambiguous && !like && !aggkey && !composite;
+                    if std::env::var("EMAT_REORDER_DEBUG").is_ok() {
+                        eprintln!(
+                            "[reorder-gate] leaves={n} largest_leaf={largest_leaf_rows} eff_max_leaves={effective_max_leaves} too_few={too_few} too_many={too_many} ambiguous={ambiguous} like={like} aggkey={aggkey} composite={composite} -> {}",
+                            if pass { "PASS" } else { "REJECT" }
+                        );
                     }
-                }
-                _ => {
-                    // Σ.AH.X Lever G: when an Inner-join chain is rejected
-                    // (too many leaves, LIKE filter, ambiguous names, etc.)
-                    // and `jump_on_reject` is set, also skip descent. This
-                    // prevents partial reorders of inner sub-chains inside
-                    // a rejected outer chain (the Q07 +45 ms regression
-                    // pattern).
-                    if opts.jump_on_reject && is_inner_join_chain {
+                    if pass {
+                        match rebuild_reordered(&chain) {
+                            Some(rebuilt) => Ok(Transformed::new(
+                                rebuilt,
+                                true,
+                                // Don't descend into the rebuilt subtree —
+                                // we've already processed the whole chain
+                                // atomically. Without Jump, transform_down
+                                // would recurse and re-flatten our own
+                                // output, potentially picking up dependent
+                                // inner-join subtrees we already enumerated.
+                                TreeNodeRecursion::Jump,
+                            )),
+                            None => Ok(Transformed::no(node)),
+                        }
+                    } else if opts.jump_on_reject {
+                        // Σ.AH.X Lever G: when an Inner-join chain is rejected
+                        // (too many leaves, LIKE filter, ambiguous names, etc.)
+                        // and `jump_on_reject` is set, also skip descent. This
+                        // prevents partial reorders of inner sub-chains inside
+                        // a rejected outer chain (the Q07 +45 ms regression
+                        // pattern).
                         Ok(Transformed::new(node, false, TreeNodeRecursion::Jump))
                     } else {
                         Ok(Transformed::no(node))
                     }
                 }
+                None => Ok(Transformed::no(node)),
             }
         }
         _ => Ok(Transformed::no(node)),
@@ -523,6 +568,28 @@ fn estimate_leaf_card(plan: &LogicalPlan) -> u64 {
     }
 }
 
+/// Σ.BR Phase 2 (2026-05-29): is this leaf a base-table scan the cost model
+/// can actually estimate? Mirrors the recursable arms of
+/// `estimate_leaf_card` exactly — a leaf is estimable iff it bottoms out in
+/// a `TableScan` through Filter/Projection/SubqueryAlias wrappers. A leaf
+/// that contains a Join (e.g. the `Filter(orders⋈lineitem)` composite that
+/// `dim_join_pushdown` produces and `flatten_inner_join_chain` can't descend
+/// through) hits the `u64::MAX/2` sentinel branch → its cardinality is
+/// garbage (~e18), which poisons the leftmost-build-cost DP and makes it
+/// front-load a tiny dimension (Q10 SF=100: `nation⋈customer` pulled early,
+/// materialising 15M rows, +14% regression). Chains with such a leaf must
+/// NOT be reordered — the model can't see them. See
+/// PHASE_SIGMA_BR_JOIN_REORDER.md §5.
+fn leaf_is_estimable(plan: &LogicalPlan) -> bool {
+    match plan {
+        LogicalPlan::TableScan(_) => true,
+        LogicalPlan::Filter(f) => leaf_is_estimable(&f.input),
+        LogicalPlan::Projection(p) => leaf_is_estimable(&p.input),
+        LogicalPlan::SubqueryAlias(s) => leaf_is_estimable(&s.input),
+        _ => false,
+    }
+}
+
 fn scale_card(rows: u64, sel: f64) -> u64 {
     let s = sel.clamp(0.0, 1.0);
     ((rows as f64) * s).round().max(1.0) as u64
@@ -713,6 +780,57 @@ fn derive_transitive_equi_edges(
     out
 }
 
+/// Replay the DP cost recurrence along a FIXED leaf order (used for the
+/// input/no-reorder baseline so we can compute the modeled cost ratio of
+/// reordering). Mirrors the inner-loop cost logic in `rebuild_reordered`
+/// exactly: cost = Σ intermediate cardinalities, charging the leftmost
+/// leaf (Σ.BR.1a). A step that doesn't connect to the in-scope set is a
+/// Cartesian product (denom = 1) — finite but huge, which is the honest
+/// cost of forcing that order. Returns `(cost, final_card)`.
+fn cost_of_fixed_order(
+    order: &[usize],
+    cards: &[u64],
+    chain: &InnerJoinChain,
+    all_equi: &[(Column, Column)],
+) -> Option<(u64, u64)> {
+    let first = *order.first()?;
+    let mut placed: Vec<usize> = vec![first];
+    let mut cost = cards[first].max(1);
+    let mut card = cards[first].max(1);
+    for &i in &order[1..] {
+        let leaf_schema = chain.leaves[i].schema();
+        let mut connecting: Vec<(Column, Column)> = Vec::new();
+        for (l, r) in all_equi {
+            let l_in_leaf = column_in_schema(l, leaf_schema);
+            let r_in_leaf = column_in_schema(r, leaf_schema);
+            let mut connects = false;
+            for &p in &placed {
+                let ps = chain.leaves[p].schema();
+                let l_in_p = column_in_schema(l, ps);
+                let r_in_p = column_in_schema(r, ps);
+                if (l_in_leaf && r_in_p) || (r_in_leaf && l_in_p) {
+                    connects = true;
+                    break;
+                }
+            }
+            if connects {
+                connecting.push((l.clone(), r.clone()));
+            }
+        }
+        let denom = if connecting.is_empty() {
+            1
+        } else {
+            estimate_max_ndv_for_preds(&connecting, chain, &placed, i).max(1)
+        };
+        let new_card = ((card as u128 * cards[i] as u128) / denom as u128)
+            .min(u128::from(u64::MAX)) as u64;
+        card = new_card.max(1);
+        cost = cost.saturating_add(card);
+        placed.push(i);
+    }
+    Some((cost, card))
+}
+
 /// Build a fresh left-deep chain over `chain.leaves` in
 /// ascending-cardinality order. Each equi predicate is re-attached to
 /// the first join where both columns are in scope.
@@ -875,6 +993,24 @@ fn rebuild_reordered(chain: &InnerJoinChain) -> Option<LogicalPlan> {
             "[reorder] DP chose order = {order:?} cost={} final_card={}",
             final_state.cost, final_state.card
         );
+    }
+
+    // Σ.BR Phase 2 prereq (2026-05-29): emit the modeled cost of the
+    // input (no-reorder) order vs the chosen order, so a SF=1 sweep can
+    // tell us whether a single cost-improvement threshold separates the
+    // wall-time wins (Q05/Q08) from the regressors (Q07/Q02/Q11/Q21).
+    // `is_noop` flags chains where the DP reproduced the input order
+    // (the rewrite bails just below) — those should show ratio ≈ 1.0.
+    if std::env::var("EMAT_REORDER_COST").is_ok() {
+        let input_order: Vec<usize> = (0..n).collect();
+        if let Some((in_cost, _)) = cost_of_fixed_order(&input_order, &cards, chain, &all_equi) {
+            let ratio = final_state.cost as f64 / in_cost.max(1) as f64;
+            let is_noop = order.iter().enumerate().all(|(i, idx)| *idx == i);
+            eprintln!(
+                "[reorder-cost] noop={is_noop} input_cost={in_cost} chosen_cost={} ratio={ratio:.4} input_order={input_order:?} chosen_order={order:?}",
+                final_state.cost
+            );
+        }
     }
 
     let mut placed: Vec<bool> = vec![false; n];
@@ -1417,6 +1553,106 @@ mod tests {
             Some("region"),
             "Q05 reorder must put region (1 row after ASIA filter) as the \
              deepest-left leaf, not the lineitem fact table:\n{}",
+            rewritten.display_indent(),
+        );
+        Ok(())
+    }
+
+    /// Σ.BR Phase 2 — the scale gate. Shape-gated REJECTS Q05's 6-leaf
+    /// funnel at the default 4-leaf cap (the SF=1/SF=10 regime, where the
+    /// largest leaf is below the row threshold), but ADMITS it once the
+    /// scale bump raises the cap to 6. This is the lever that turns on the
+    /// SF=100 Q05 −10% funnel without re-admitting the SF=10 regressors —
+    /// those trip the ambiguous-names / aggregate-key / semi-anti guards,
+    /// not the leaf cap (PHASE_SIGMA_BR_JOIN_REORDER.md §5).
+    #[tokio::test]
+    async fn scale_bump_admits_q05_funnel() -> DfResult<()> {
+        let Some(dir) = sf1_dir() else {
+            eprintln!("skipping: sf1 data missing");
+            return Ok(());
+        };
+        let ctx = SessionContext::new();
+        register_tpch(&ctx, &dir).await?;
+        let sql = std::fs::read_to_string(
+            dir.parent().unwrap().parent().unwrap().join("queries/q05.sql"),
+        )
+        .ok();
+        let Some(sql) = sql else {
+            eprintln!("skipping: q05.sql not found");
+            return Ok(());
+        };
+        let df = ctx.sql(&sql).await?;
+        let optimized = df.into_optimized_plan()?;
+
+        // No scale bump + cap 4: Q05's 6-leaf chain is rejected (too_many),
+        // plan unchanged — the SF=1/SF=10 shape-gated behaviour.
+        let no_bump = ReorderOpts {
+            scale_bump: None,
+            ..ReorderOpts::default()
+        };
+        let gated = reorder_inner_joins_with_opts(optimized.clone(), no_bump)?;
+        assert_eq!(
+            format!("{}", optimized.display_indent()),
+            format!("{}", gated.display_indent()),
+            "without scale bump, shape-gated must reject Q05's 6-leaf chain (cap=4)"
+        );
+
+        // Scale bump with threshold 0 (always fires) raises the cap to 6 →
+        // Q05 reorders, region (1 row after the ASIA filter) leads.
+        let with_bump = ReorderOpts {
+            scale_bump: Some((0, 6)),
+            ..ReorderOpts::default()
+        };
+        let rewritten = reorder_inner_joins_with_opts(optimized.clone(), with_bump)?;
+        assert_eq!(
+            leftmost_table_scan(&rewritten).as_deref(),
+            Some("region"),
+            "with scale bump (cap=6), shape-gated must reorder Q05 to region-first:\n{}",
+            rewritten.display_indent(),
+        );
+        Ok(())
+    }
+
+    /// Σ.BR Phase 2 — composite-leaf guard. After `dim_join_pushdown`
+    /// rewrites Q10 into filter-style joins, the `orders⋈lineitem` subtree
+    /// becomes a composite leaf that `estimate_leaf_card` can't size (it
+    /// hits the `u64::MAX/2` sentinel → ~e18). That poisoned the
+    /// leftmost-build-cost DP into front-loading the 25-row `nation`, which
+    /// at SF=100 materialised a 15M-row `nation⋈customer` intermediate and
+    /// regressed Q10 +14%. With the guard the reorder must NO-OP on such a
+    /// chain. (Without dim_push the same query reorders fine — all TableScan
+    /// leaves — see `lever_g_allows_q10_shape`.)
+    #[tokio::test]
+    async fn rejects_composite_leaf_after_dim_push() -> DfResult<()> {
+        let Some(dir) = sf1_dir() else {
+            eprintln!("skipping: sf1 data missing");
+            return Ok(());
+        };
+        let ctx = SessionContext::new();
+        register_tpch(&ctx, &dir).await?;
+        let sql = std::fs::read_to_string(
+            dir.parent().unwrap().parent().unwrap().join("queries/q10.sql"),
+        )
+        .ok();
+        let Some(sql) = sql else {
+            eprintln!("skipping: q10.sql not found");
+            return Ok(());
+        };
+        let df = ctx.sql(&sql).await?;
+        let optimized = df.into_optimized_plan()?;
+        // dim_push first (as the bench pipeline does) → composite leaf.
+        let pushed = crate::dim_join_pushdown::push_dim_join_into_chain(optimized)?;
+        // Scale bump always-on (threshold 0) to isolate the composite-leaf
+        // guard from the leaf-count cap.
+        let opts = ReorderOpts {
+            scale_bump: Some((0, 6)),
+            ..ReorderOpts::default()
+        };
+        let rewritten = reorder_inner_joins_with_opts(pushed.clone(), opts)?;
+        assert_eq!(
+            format!("{}", pushed.display_indent()),
+            format!("{}", rewritten.display_indent()),
+            "reorder must no-op on a chain with a composite (orders⋈lineitem) leaf:\n{}",
             rewritten.display_indent(),
         );
         Ok(())

@@ -216,6 +216,238 @@ exists): **1b** string-eq NDV selectivity in `predicate_selectivity` (`col=lit`
   ambiguous-names, LeftSemi/Anti) — they encode real SF=10 regressions
   (Q02/Q07/Q21) that still apply.
 
+#### Phase 2 measured (2026-05-29, cooled HW): SF=10 regressors do NOT flip at SF=100 → **scale-gate alone is net-negative**
+Interleaved per-query OFF-vs-permissive-ON A/B at SF=100 (canary-verified
+cool: Q14 854ms vs 925 clean; per-query OFF→ON back-to-back so thermal
+drift hits both arms equally), 5 trials / 2 warmups:
+
+| query | OFF (ms) | ON (ms) | Δ | verdict |
+|-------|---------:|--------:|--:|---------|
+| Q05 | 2349.6 | 2112.7 | **−10.1%** | WIN (funnel) |
+| Q08 | 2448.0 | 2448.8 | ~0% | neutral |
+| Q07 | 1997.7 | 2435.5 | **+21.9%** | REGRESS |
+| Q11 | 293.4 | 352.0 | **+20.0%** | REGRESS |
+| Q21 | 3682.8 | 4110.8 | **+11.6%** | REGRESS |
+| Q02 | 348.7 | 371.6 | **+6.6%** | REGRESS |
+
+**This refutes the V5 §5.2 thesis that the regressors would flip to wins at
+scale.** They stay regressors, and big (Q07 +22%, Q11 +20%). So a pure
+scale-gate that fires the *permissive* path above a size threshold is
+**net-negative** — it fires all six and the four regressions swamp Q05's
+single win. The scale gate is necessary (it preserves SF=1/SF=10) but
+**not sufficient**: Phase 2 also needs **shape discrimination** that admits
+Q05's funnel while rejecting Q07/Q02/Q11/Q21. The existing shape-gated
+guards reject the regressors but ALSO reject Q05/Q08 (even at
+`max_leaves=8`, post-2a; only Q10 fires) — so the open Phase 2 task is to
+pin *which* guard rejects Q05 and relax exactly that one without
+re-admitting the regressors. Raw numbers: `/tmp/sf100_reorder_ab.txt`.
+
+#### Phase 2 guard attribution (2026-05-29): the blocker for Q05 is **only `max_leaves`** — regressors are caught by *other* guards
+Added per-guard gate logging (`[reorder-gate]` under `EMAT_REORDER_DEBUG`)
+and read each query's guard verdicts (ambiguous / like / aggkey are
+max_leaves-independent):
+
+| query | leaves | ambiguous | like | aggkey | other | rejected by |
+|-------|-------:|-----------|------|--------|-------|-------------|
+| Q05 WIN | 6 | false | false | false | — | **only `too_many` (max_leaves=4)** |
+| Q09 WIN | 6 | false | false | false | — | **only `too_many`** |
+| Q07 reg | 6 | **true** | false | false | — | ambiguous-names |
+| Q02 reg | 6 | **true** | **true** | **true** | — | all three |
+| Q08 (neutral) | 8 | **true** | false | false | — | ambiguous + too_many |
+| Q11 reg | 3 | false | false | false | `jump_on_reject` at a 2-leaf `too_few` chain above it | jump-on-reject |
+| Q21 reg | — | — | — | — | LeftSemi/Anti node → walker Jumps before the gate | `reject_under_left_semi_anti` |
+
+**So Q05/Q09 (both wins) are blocked *purely* by the 4-leaf cap; every
+regressor trips a *different, semantic* guard.** Raising `max_leaves` to 6
+admits Q05/Q09 while ambiguous-names (Q07/Q08), all-guards (Q02),
+jump-on-reject (Q11) and semi/anti-jump (Q21) keep the regressors out.
+This is the surgical lever Phase 2 was looking for.
+
+**Caveats for the implementation (not a flat bump):**
+1. `lever_g_rejects_long_chain` asserts shape-gated rejects a *synthetic*
+   single-nation 5-leaf chain at `max_leaves=4` (no ambiguous names, since
+   TPC-H columns are table-prefixed). A flat bump to 6 makes that chain
+   newly fire → the test breaks and must be re-framed (its "5-leaf ⇒
+   reject" premise is exactly the policy we're revising). For the *actual*
+   22q suite, the only chains admitted by 4→6 are Q05/Q09 (wins) + Q10
+   (already fires) — but the synthetic test shows a flat global bump is
+   broader than the suite needs.
+2. Because the SF=100 win is scale-dependent (Q05 −10% at SF=100, ~neutral
+   SF=10), the bump should be **scale-gated**: raise `max_leaves` to 6 only
+   when largest-leaf `num_rows ≥ threshold`. Below it, keep 4.
+3. **Harness bug** (`tpch_triangulation_bench`): the fires-detection probe
+   `rewrite_fires_for_sql` hardcodes `reorder_inner_joins_shape_gated`
+   (default `max_leaves=4`), ignoring `EMAT_REORDER_MAX_LEAVES`; the timed
+   path's env override also proved flaky. Validating the bump cleanly needs
+   either the env wired through both call sites or a direct default change.
+4. **Ambiguous-names is load-bearing** — it rejects Q07 and Q08. It's
+   plausibly a genuine proxy (Q07's dual-`nation` OR-pair both *creates*
+   the ambiguity and *causes* the regression), but it's worth a confirming
+   thought before relying on it as the regressor gate.
+
+Open Phase 2 implementation: scale-gated `max_leaves`-6 + re-frame the
+long-chain test + a clean 22q SF=100 A/B on cooled HW + production
+OptimizerRule wiring (walkers aren't in `preset.rs`).
+
+#### Phase 2 IMPLEMENTED + VALIDATED (2026-05-29): scale-gate lands the Q05 win, but Q10 (pre-existing) regresses → default-on still a wash
+Implemented `ReorderOpts::scale_bump: Option<(min_rows, bumped_leaves)>`,
+default `Some((100_000_000, 6))`. In `reorder_inner_joins_with_opts` the
+gate computes `effective_max_leaves = if largest_leaf_rows ≥ min_rows {
+bumped } else { max_leaves }`. Baked into `ReorderOpts::default()` so both
+the shape-gated entry point and the bench inherit it; `unsafe_no_shape_gate`
+sets `None`. New test `scale_bump_admits_q05_funnel` (14/14 join_reorder
+tests green); the old `lever_g_rejects_long_chain` **still passes unchanged**
+because at SF=1 the largest leaf (6M) is below the 100M threshold → no bump
+→ the 5-leaf chain is still rejected. So no test reframe was needed — the
+scale-gate preserves SF=1/SF=10 behaviour exactly. (Q09 turned out NOT to
+be admitted — its `p_name LIKE '%green%'` trips the LIKE guard, which the
+guard doc explicitly says "catches Q09". So the SF=100 firing set is just
+{Q05, Q10}.)
+
+**SF=100 firing-set probe** (cooled HW, scale-gated default): only **Q05**
+(newly admitted, `[5,4,0,1,2,3]`) and **Q10** (`[2,0,1]`, already fired at
+cap 4) fire. Nothing else.
+
+**SF=100 A/B** (interleaved OFF vs shape-gated-ON, 8 trials × 2 reps,
+canary-verified cool 852ms; agg_semi + dim_push ON in both arms):
+
+| query | OFF (ms) | ON (ms) | Δ | rows |
+|-------|---------:|--------:|--:|------|
+| Q05 (newly admitted) | 2603 / 2483 | 2113 / 2219 | **−18.8% / −10.6%** WIN | 5 = 5 ✓ |
+| Q10 (pre-existing fire) | 2899 / 2999 | 3231 / 3483 | **+11.5% / +16.2%** REGRESS | 3.88M = 3.88M ✓ |
+
+Correctness: all row counts identical OFF↔ON.
+
+**Verdict: the scale-gate works — it admits Q05 and delivers a clean
+−14.7% SF=100 win, correctness preserved. BUT turning the shape-gated path
+on at SF=100 is a *wash*: Q05 −380ms is cancelled by a Q10 +400ms
+regression.** Crucially, **Q10 is a 3-leaf chain that fires at the base
+cap of 4 — the scale-bump did NOT introduce it; it's pre-existing Lever-G
+behaviour that regresses at SF=100 (the inverse of Q05: Q10 was a *win* at
+SF=10, −20ms).** So the scale-gate is sound and ships the Q05 win as opt-in
+infra, but **default-on at SF=100 is blocked on a *second* sub-lever**:
+gate Q10's 3-leaf customer⋈orders⋈lineitem firing OUT at SF=100 (a scale
+*ceiling* for that shape), or diagnose the Q10 reorder↔dim_push / build-side
+interaction that flips it negative at scale. Numbers:
+`/tmp/sf100_scalegate_ab.txt`, `/tmp/sf100_q5q10_clean.txt`.
+
+#### Phase 2 Q10 root cause + FIX (2026-05-29): composite-leaf guard
+Plan-diff (`sigma_q_explain_plan`, Q10 SF=100, OFF vs ON):
+- **OFF:** `nation` is a 25-row `CollectLeft` broadcast on the *outermost*
+  join — a cheap decoration applied last, after the fact joins narrow.
+- **ON (reorder `[2,0,1]`):** `nation⋈customer` pulled *early* (CollectLeft),
+  materialising a **15M-row** wide intermediate that becomes the **build
+  side** of a Partitioned join vs orders⋈lineitem. Cheap at SF=10 (customer
+  1.5M); +14% at SF=100 (15M).
+
+**Why the DP front-loaded the tiny nation:** the reorder chain has only 3
+"leaves" and **leaf[1] = `Filter(orders⋈lineitem)` is a composite subtree**
+(dim_push emits filter-style joins that `flatten_inner_join_chain` can't
+descend through). `estimate_leaf_card` hits its `u64::MAX/2` sentinel for a
+Join → `× 0.3` filter selectivity = **2.77e18**. With Σ.BR.1a charging the
+leftmost leaf its cardinality, placing the fact subtree first "costs" 2.77e18
+→ astronomically avoided → the DP parks the 25-row nation leftmost instead.
+So the garbage composite-leaf estimate *inverts* the order. This is the
+concrete **reorder↔dim_push interaction**.
+
+**Fix (committed in-tree, 15/15 tests green):** `leaf_is_estimable(plan)`
+mirrors `estimate_leaf_card`'s recursable arms (TableScan through
+Filter/Projection/SubqueryAlias). A new **unconditional** gate guard
+`composite = !chain.leaves.iter().all(leaf_is_estimable)` rejects any chain
+with a leaf the cost model can't size. Q10's composite `(orders⋈lineitem)`
+leaf → REJECT → reorder no-ops → +14% gone. Q05's leaves are all real
+TableScans (customer 15M, orders 11.25M, lineitem 600M, supplier 1M, nation
+25, region 1) → still fires → −14.7% win preserved. New test
+`rejects_composite_leaf_after_dim_push` (runs Q10 → dim_push → asserts
+reorder no-op). Principled, not query-specific: "only reorder chains whose
+leaves are base tables the cost model can estimate."
+
+**Post-fix SF=100 A/B** (cooled, canary 812ms, 8 trials × 2 reps, correctness ✓):
+
+| query | OFF (ms) | ON (ms) | Δ |
+|-------|---------:|--------:|--:|
+| Q05 | 2501 / 2365 | 2157 / 2186 | **−13.7% / −7.6%** (avg −10.7%) WIN |
+| Q10 | 2780 / 2985 | 2965 / 3006 | **+6.6% / +0.7%** — neutral (was +13.8%) |
+
+**The Q10 regression is eliminated** (was a tight +13.8% across both reps;
+now +0.7% rep2 flat, +6.6% rep1 within Q10's ±6-9% noise band — both ON
+ranges overlap OFF). The composite guard rejects Q10's poisoned chain; the
+bench then fires a benign 4-leaf `[1,2,0,3]` (orders-first / nation-last,
+the DuckDB-style order) that's near-neutral. **Net SF=100 flips from a wash
+to positive:** Q05 −260ms vs Q10 ~+100ms (noise) → net ~−160ms. Numbers:
+`/tmp/sf100_postfix_ab.txt`.
+
+**Phase 2 status:** scale-gate + composite-leaf guard together make
+shape-gated reorder **net-positive at SF=100** (Q05 win, no regressor),
+SF=1/SF=10 unchanged, 15/15 join_reorder tests green.
+
+#### Phase 2 production wiring (2026-05-29): `ReorderQueryPlanner` in `preset.rs`
+The reorder previously ran only in the bench harness; library users (anyone
+through `preset::with_optimizer_rules`) never got it. Wired it in as a
+**`QueryPlanner`** (`crates/ematix-flow-core/src/reorder_query_planner.rs`),
+NOT an `OptimizerRule` — the latter joins the optimizer's compiled rule loop
+and has cost 5–8% geomean across unrelated queries
+([[optimizer-codegen-sensitivity]]); a QueryPlanner runs once per query at
+physical-planning time, *outside* that loop, and **post-optimization**, which
+also exactly reproduces the validated bench config (reorder applied to the
+already-optimized plan). `ReorderQueryPlanner` applies
+`reorder_inner_joins_shape_gated` then delegates to `DefaultPhysicalPlanner`
+(mirrors `DefaultQueryPlanner`). Installed in
+`with_optimizer_rules_and_registry` via `with_query_planner`, **default ON**,
+`EMAT_REORDER_QP=0` to disable. The bench is unaffected (it builds its own
+`SessionStateBuilder`, not via preset, and keeps its manual reorder for A/B).
+Tests: `reorder_query_planner` 1/1, `preset` 4/4 (planner installed by default
+doesn't break the dict/cache tests), `join_reorder` 15/15.
+
+**Remaining:** a perf confirmation *through the preset path* — the
+triangulation bench uses its own context, so a preset-backed timing harness
+(or pointing the bench at preset) is the gate before claiming the library-user
+win. Mechanism + correctness are validated; the codegen tax is structurally
+avoided (QueryPlanner ≠ OptimizerRule). All code uncommitted.
+
+#### Phase 2 prereq (2026-05-29): a **cost-improvement gate is NOT viable** — use the scale gate
+Before building a "fire only when modeled cost improves substantially"
+gate, we instrumented the DP to emit the modeled input-order vs
+chosen-order cost for every chain it fires on (`EMAT_REORDER_COST=1`,
+helper `cost_of_fixed_order`), and ran the permissive path over all 22q
+at SF=1. Ratio = `chosen_cost / input_cost` (lower = bigger modeled win),
+strongest firing chain per query:
+
+| ratio | query | wall-time class | input_cost | chosen_cost |
+|------:|-------|-----------------|-----------:|------------:|
+| 0.0199 | Q11 | **REGRESS** (SF=10) | 1,632,000 | 32,401 |
+| 0.0398 | Q21 | **REGRESS** (SF=10) | 1,824,407 | 72,544 |
+| 0.0633 | Q02 | **REGRESS** (SF=10) | 2,560,000 | 162,006 |
+| 0.1566 | Q05 | WIN (SF=100 −9.8%) | 622,570 | 97,514 |
+| 0.3040 | Q07 | **REGRESS** (SF=10) | 721,142 | 219,251 |
+| 0.3465 | Q09 | WIN (SF=10 −18ms) | 14,462,912 | 5,011,001 |
+| 0.4554 | Q10 | WIN (SF=10 −20ms) | 269,250 | 122,625 |
+| 0.5304 | Q08 | WIN (SF=100 −5%) | 376,197 | 199,536 |
+
+**No single threshold separates wins from regressors**, and the signal is
+*inverted* at the strong end:
+- The three queries the model is MOST confident about (Q11/Q21/Q02,
+  ratio 0.02–0.06, "10–50× less work") are all **regressors**. The
+  cardinality reduction the DP credits is waste the runtime levers (L9
+  bloom, semi-join pushdown) ALREADY eliminate at SF=10 — so the modeled
+  gain double-counts, and the reorder only adds plan churn / build-side
+  disruption on top.
+- The named counterexample alone is conclusive: regressor **Q07 (0.304)
+  sits strictly between wins Q05 (0.157) and Q08 (0.530)** — not linearly
+  separable by any threshold.
+- **Root reason the ratio can't work:** it is **scale-invariant by
+  construction** (both costs scale ~linearly with SF), so it carries zero
+  information about the one axis that actually decides the outcome —
+  absolute scale (SF=100 wins, SF=10 neutral/regress). Absolute modeled
+  cost at SF=1 doesn't separate either (regressors have the *larger* costs
+  here). Conclusion: gate on a **scale signal** (largest-leaf `num_rows`,
+  per Phase 2 above) validated by SF=100 wall-time — NOT on the model's
+  cost or cost-ratio. The model's improvement estimate is uncorrelated
+  (even anti-correlated) with marginal wall-time on current HW.
+
+The `EMAT_REORDER_COST` instrumentation stays as infra for future
+estimator work.
+
 ### Phase 3 — Bushy escalation — ONLY IF Phase 2 leaves Q05/Q08 short — ~2 wk
 - Extend the DP state from `order: Vec<usize>` (left-deep) to subset-pair
   enumeration: `best[S] = min over (S1,S2 partition of S) of
