@@ -611,7 +611,14 @@ fn predicate_selectivity(expr: &Expr, ts: &TableScan) -> f64 {
     };
 
     match expr {
-        // col = lit  →  1/NDV ≈ 1/(max-min+1) for int columns, else 0.1
+        // col = lit  →  1/NDV. Σ.BR.1b (#186): prefer the column's
+        // `distinct_count` (populated for dict-encoded string columns from
+        // parquet dict-page headers, see Σ.AH.2 Story 1'.2), so selective
+        // string equalities are modelled realistically instead of the old
+        // flat 0.1 — e.g. Q08 `p_type = 'ECONOMY ANODIZED STEEL'` is ~1/150,
+        // not 0.1 (the flat value made the selective `part` filter look 15×
+        // weaker, the original reason the DP put `orders` before `part`).
+        // Fall back to the int min/max range, then to 0.1 if neither is known.
         Expr::BinaryExpr(BinaryExpr {
             left,
             op: Op::Eq,
@@ -620,20 +627,29 @@ fn predicate_selectivity(expr: &Expr, ts: &TableScan) -> f64 {
             (Some(col), Some(_lit)) => match col_idx(&col) {
                 Some(i) if i < stats.column_statistics.len() => {
                     let cs = &stats.column_statistics[i];
-                    match (&cs.min_value, &cs.max_value) {
-                        (
-                            Precision::Exact(ScalarValue::Int32(Some(lo)))
-                            | Precision::Inexact(ScalarValue::Int32(Some(lo))),
-                            Precision::Exact(ScalarValue::Int32(Some(hi)))
-                            | Precision::Inexact(ScalarValue::Int32(Some(hi))),
-                        ) => 1.0 / ((hi - lo + 1).max(1) as f64),
-                        (
-                            Precision::Exact(ScalarValue::Int64(Some(lo)))
-                            | Precision::Inexact(ScalarValue::Int64(Some(lo))),
-                            Precision::Exact(ScalarValue::Int64(Some(hi)))
-                            | Precision::Inexact(ScalarValue::Int64(Some(hi))),
-                        ) => 1.0 / ((hi - lo + 1).max(1) as f64),
-                        _ => 0.1,
+                    let ndv: Option<f64> = match cs.distinct_count {
+                        Precision::Exact(dc) | Precision::Inexact(dc) if dc > 0 => {
+                            Some(dc as f64)
+                        }
+                        _ => match (&cs.min_value, &cs.max_value) {
+                            (
+                                Precision::Exact(ScalarValue::Int32(Some(lo)))
+                                | Precision::Inexact(ScalarValue::Int32(Some(lo))),
+                                Precision::Exact(ScalarValue::Int32(Some(hi)))
+                                | Precision::Inexact(ScalarValue::Int32(Some(hi))),
+                            ) => Some((hi - lo + 1).max(1) as f64),
+                            (
+                                Precision::Exact(ScalarValue::Int64(Some(lo)))
+                                | Precision::Inexact(ScalarValue::Int64(Some(lo))),
+                                Precision::Exact(ScalarValue::Int64(Some(hi)))
+                                | Precision::Inexact(ScalarValue::Int64(Some(hi))),
+                            ) => Some((hi - lo + 1).max(1) as f64),
+                            _ => None,
+                        },
+                    };
+                    match ndv {
+                        Some(n) => 1.0 / n,
+                        None => 0.1,
                     }
                 }
                 _ => 0.1,
@@ -1223,6 +1239,10 @@ fn leaf_col_ndv(plan: &LogicalPlan, col: &Column) -> u64 {
     if let Precision::Exact(dc) | Precision::Inexact(dc) = cs.distinct_count {
         return dc as u64;
     }
+    let num_rows = match stats.num_rows {
+        Precision::Exact(n) | Precision::Inexact(n) => Some(n as u64),
+        _ => None,
+    };
     let lo = match &cs.min_value {
         Precision::Exact(v) | Precision::Inexact(v) => scalar_to_i128(v),
         _ => None,
@@ -1232,11 +1252,22 @@ fn leaf_col_ndv(plan: &LogicalPlan, col: &Column) -> u64 {
         _ => None,
     };
     match (lo, hi) {
-        (Some(l), Some(h)) if h >= l => ((h - l + 1).max(1) as u64).min(u64::MAX / 2),
-        _ => match stats.num_rows {
-            Precision::Exact(n) | Precision::Inexact(n) => n as u64,
-            _ => u64::MAX / 2,
-        },
+        (Some(l), Some(h)) if h >= l => {
+            // Σ.BR.1c (#187): NDV ≤ row count is a hard upper bound, so cap
+            // the min/max-range estimate at `num_rows`. Sparse integer keys
+            // report a range width far above their true distinct count —
+            // e.g. TPC-H `o_orderkey` spans 1..6M but `orders` has only 1.5M
+            // rows, so its true NDV is 1.5M, not the 6M the raw range gives.
+            // Without the cap the range-NDV inflates join denominators and
+            // makes PK-FK intermediates look more selective than they are.
+            // Falls through to the raw range when `num_rows` is unknown.
+            let range = ((h - l + 1).max(1) as u64).min(u64::MAX / 2);
+            match num_rows {
+                Some(n) => range.min(n.max(1)),
+                None => range,
+            }
+        }
+        _ => num_rows.unwrap_or(u64::MAX / 2),
     }
 }
 
