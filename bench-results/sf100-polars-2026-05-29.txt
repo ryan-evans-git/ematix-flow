@@ -1,0 +1,80 @@
+SF=100 Polars — query-by-query, TRIALS=2 WARMUPS=1 — Fri May 29 01:26:49 EDT 2026
+--- Q01 ---
+    output:  /tmp/polars_sf100_q.md
+  Polars       79083.87 ms ± 259.23  (4 rows)
+wrote /tmp/polars_sf100_q.md
+--- Q02 ---
+    output:  /tmp/polars_sf100_q.md
+  Polars       53109.00 ms ± 7570.37  (47107 rows)
+wrote /tmp/polars_sf100_q.md
+--- Q03 ---
+    output:  /tmp/polars_sf100_q.md
+  Polars       30103.01 ms ± 1023.95  (1131041 rows)
+wrote /tmp/polars_sf100_q.md
+--- Q04 ---
+    output:  /tmp/polars_sf100_q.md
+  Polars       6549.67 ms ± 626.64  (5 rows)
+wrote /tmp/polars_sf100_q.md
+--- Q05 ---
+    output:  /tmp/polars_sf100_q.md
+--- Q06 ---
+    output:  /tmp/polars_sf100_q.md
+  Polars        539.93 ms ±  5.49  (1 rows)
+wrote /tmp/polars_sf100_q.md
+--- Q07 ---
+    output:  /tmp/polars_sf100_q.md
+  Polars       95946.42 ms ± 4053.97  (4 rows)
+wrote /tmp/polars_sf100_q.md
+--- Q08 ---
+    output:  /tmp/polars_sf100_q.md
+--- Q09 ---
+    output:  /tmp/polars_sf100_q.md
+  Polars       21438.27 ms ± 779.92  (175 rows)
+wrote /tmp/polars_sf100_q.md
+--- Q10 ---
+    output:  /tmp/polars_sf100_q.md
+--- Q11 ---
+    output:  /tmp/polars_sf100_q.md
+  Polars        411.92 ms ±  0.20  (0 rows)
+wrote /tmp/polars_sf100_q.md
+--- Q12 ---
+    output:  /tmp/polars_sf100_q.md
+  Polars       1112.30 ms ±  9.66  (2 rows)
+wrote /tmp/polars_sf100_q.md
+--- Q13 ---
+    output:  /tmp/polars_sf100_q.md
+  Polars       5114.44 ms ± 358.69  (45 rows)
+wrote /tmp/polars_sf100_q.md
+--- Q14 ---
+    output:  /tmp/polars_sf100_q.md
+  Polars        894.73 ms ±  4.30  (1 rows)
+wrote /tmp/polars_sf100_q.md
+--- Q15 ---
+    output:  /tmp/polars_sf100_q.md
+  Polars        890.03 ms ±  2.26  (1 rows)
+wrote /tmp/polars_sf100_q.md
+--- Q16 ---
+    output:  /tmp/polars_sf100_q.md
+  Polars       1808.60 ms ± 42.70  (27840 rows)
+wrote /tmp/polars_sf100_q.md
+--- Q17 ---
+    output:  /tmp/polars_sf100_q.md
+  Polars       9536.06 ms ± 335.31  (1 rows)
+wrote /tmp/polars_sf100_q.md
+--- Q18 ---
+    output:  /tmp/polars_sf100_q.md
+  Polars       15572.24 ms ± 744.99  (6398 rows)
+wrote /tmp/polars_sf100_q.md
+--- Q19 ---
+    output:  /tmp/polars_sf100_q.md
+--- Q20 ---
+    output:  /tmp/polars_sf100_q.md
+  Polars       6692.33 ms ± 2797.26  (17971 rows)
+wrote /tmp/polars_sf100_q.md
+--- Q21 ---
+    output:  /tmp/polars_sf100_q.md
+--- Q22 ---
+    output:  /tmp/polars_sf100_q.md
+  Polars       1254.51 ms ± 35.46  (7 rows)
+wrote /tmp/polars_sf100_q.md
+=== done Fri May 29 01:46:26 EDT 2026 ===

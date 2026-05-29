@@ -1,0 +1,95 @@
+=== TPC-H 22 triangulation bench ===
+    data:    examples/tpch/data/sf100
+    queries: 22 ([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22])
+    trials:  3 (after 1 warmups)
+    output:  bench-results/sf100-ematix-duckdb-2026-05-29.md
+
+--- Q01 ---
+  ematix-flow  2156.58 ms ± 23.77  (4 rows)
+  DuckDB       2259.80 ms ± 33.27  (4 rows)
+
+--- Q02 ---
+  ematix-flow   333.00 ms ± 25.21  (47107 rows)
+  DuckDB        411.70 ms ± 15.33  (47107 rows)
+
+--- Q03 ---
+  ematix-flow  1405.21 ms ± 12.25  (1131041 rows)
+  DuckDB       1432.88 ms ± 11.70  (1131041 rows)
+
+--- Q04 ---
+  ematix-flow   781.15 ms ±  7.14  (5 rows)
+  DuckDB        844.05 ms ± 12.54  (5 rows)
+
+--- Q05 ---
+  ematix-flow  2274.80 ms ± 18.80  (5 rows)
+  DuckDB       1539.51 ms ± 25.53  (5 rows)
+
+--- Q06 ---
+  ematix-flow   451.19 ms ±  6.03  (1 rows)
+  DuckDB        769.29 ms ± 22.85  (1 rows)
+
+--- Q07 ---
+  ematix-flow  1881.34 ms ± 17.86  (4 rows)
+  DuckDB       1994.65 ms ±  6.82  (4 rows)
+
+--- Q08 ---
+  ematix-flow  2353.01 ms ± 30.33  (2 rows)
+  DuckDB       2706.47 ms ± 14.31  (2 rows)
+
+--- Q09 ---
+  ematix-flow  7532.44 ms ± 456.53  (175 rows)
+  DuckDB       8696.76 ms ± 1325.11  (175 rows)
+
+--- Q10 ---
+  ematix-flow  3089.75 ms ± 125.78  (3884218 rows)
+  DuckDB       2673.18 ms ± 22.34  (3884218 rows)
+
+--- Q11 ---
+  ematix-flow   303.84 ms ± 30.66  (0 rows)
+  DuckDB        229.72 ms ±  2.95  (0 rows)
+
+--- Q12 ---
+  ematix-flow   930.21 ms ± 29.40  (2 rows)
+  DuckDB       1093.55 ms ± 10.63  (2 rows)
+
+--- Q13 ---
+  ematix-flow  1890.23 ms ± 39.75  (45 rows)
+  DuckDB       2356.82 ms ± 11.14  (45 rows)
+
+--- Q14 ---
+  ematix-flow   762.30 ms ± 29.34  (1 rows)
+  DuckDB       1166.51 ms ± 23.04  (1 rows)
+
+--- Q15 ---
+  ematix-flow  FAIL: execute: Internal error: Assertion failed: self.mode != PartitionMode::Partitioned || left_partitions == right_partitions: Invalid HashJoinExec, part
+  DuckDB       1632.03 ms ± 28.48  (1 rows)
+
+--- Q16 ---
+  ematix-flow   496.45 ms ±  7.48  (27840 rows)
+  DuckDB        419.96 ms ± 11.36  (27840 rows)
+
+--- Q17 ---
+  ematix-flow  1807.95 ms ± 10.18  (1 rows)
+  DuckDB       1516.82 ms ± 35.85  (1 rows)
+
+--- Q18 ---
+  ematix-flow  6953.26 ms ± 335.21  (6398 rows)
+  DuckDB       2317.39 ms ± 13.97  (6398 rows)
+
+--- Q19 ---
+  ematix-flow  1118.16 ms ±  2.18  (1 rows)
+  DuckDB       1507.25 ms ± 19.95  (1 rows)
+
+--- Q20 ---
+  ematix-flow  1795.12 ms ± 36.55  (17971 rows)
+  DuckDB       1933.26 ms ± 22.67  (17971 rows)
+
+--- Q21 ---
+  ematix-flow  3693.53 ms ± 76.86  (39950 rows)
+  DuckDB       4359.60 ms ± 196.54  (39950 rows)
+
+--- Q22 ---
+  ematix-flow   420.11 ms ± 18.11  (7 rows)
+  DuckDB        575.93 ms ±  9.10  (7 rows)
+
+wrote bench-results/sf100-ematix-duckdb-2026-05-29.md
