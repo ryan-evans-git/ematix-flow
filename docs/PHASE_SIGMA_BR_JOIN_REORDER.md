@@ -573,9 +573,28 @@ faces:
   live in different leaves with no existing `on` edge, synthesize the implied
   equi predicate. Logically redundant ⇒ result-preserving; it only gives the
   planner freedom. Guard the ambiguous-name trap with qualified columns.
-- **2b (filter propagation — the general win):** for a class with a
-  literal-equality or a value-set derivable from a filtered small dimension,
-  emit the derived predicate onto the other members' scans. Phase after 2a.
+- **2b (filter propagation — the general win): NOT PURSUED (2026-05-29) — it
+  splits into a half DataFusion already ships and a half that's fundamentally
+  runtime.**
+  - *Plan-time-literal half* (`a.x = b.x` ∧ `P(a.x)` ⇒ `P(b.x)` for a sargable
+    `P` on the join key): **already implemented by DataFusion's stock
+    `push_down_filter::infer_join_predicates`** (`infer_join_predicates_from_predicates`
+    + `try_build_predicate`/`replace_col` rewrite the predicate across the
+    equi-join key pairs, with inner-join / null-restrict gating —
+    datafusion-optimizer-53.1.0/src/push_down_filter.rs:568,625). ematix-flow
+    gets it for free; re-implementing it as a walker would be pure duplication.
+    And it's moot for TPC-H anyway: **no TPC-H query filters on a join-key
+    column** (every dimension filter is on a descriptive attribute — `r_name`,
+    `p_type`, `c_mktsegment`, dates).
+  - *Data-dependent half* (the doc's own `r_name='ASIA'` → qualifying
+    `nationkeys` → prune `customer`/`lineitem` scans): the surviving key set is
+    **not knowable at plan time** (it depends on which dimension rows pass the
+    descriptive filter), so it is inherently a **runtime** technique — exactly
+    what the **L9 bloom sideband** already does (build a bloom from the filtered
+    dimension's join keys, probe the fact scan). There is no plan-time lever to
+    add here.
+  - Net: 2b is a non-lever for both ematix-flow and the TPC-H floor. Closed
+    without code.
 - Host: pre-plan walker (consistent with reorder; avoids the optimizer-rule
   codegen tax, [[optimizer-codegen-sensitivity]]). Compose: equivalence pass →
   reorder.
