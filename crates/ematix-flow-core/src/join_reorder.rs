@@ -605,6 +605,114 @@ fn extract_literal(e: &Expr) -> Option<ScalarValue> {
     }
 }
 
+/// Σ.BR.2a — transitive equi-predicate (equivalence-class) inference,
+/// pure name-level core. Union-find over the column names in `edges`;
+/// return the implied edges (same-class pairs) not already present, as
+/// name pairs. Logically redundant ⇒ result-preserving when added to the
+/// join conjunction; they only give the reorder DP more connectivity
+/// (Q05: `c_nationkey=s_nationkey` ∧ `s_nationkey=n_nationkey` ⇒
+/// `c_nationkey=n_nationkey`). Capped at `MAX_CLASS` members to avoid
+/// predicate explosion on pathological wide equalities.
+fn derive_transitive_name_edges(edges: &[(String, String)]) -> Vec<(String, String)> {
+    use std::collections::{HashMap, HashSet};
+    const MAX_CLASS: usize = 8;
+
+    let mut id: HashMap<String, usize> = HashMap::new();
+    for (a, b) in edges {
+        let next = id.len();
+        id.entry(a.clone()).or_insert(next);
+        let next = id.len();
+        id.entry(b.clone()).or_insert(next);
+    }
+    let n = id.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    // Union-find (no path compression — classes are tiny).
+    let mut parent: Vec<usize> = (0..n).collect();
+    fn find(parent: &[usize], mut x: usize) -> usize {
+        while parent[x] != x {
+            x = parent[x];
+        }
+        x
+    }
+    for (a, b) in edges {
+        let ra = find(&parent, id[a]);
+        let rb = find(&parent, id[b]);
+        if ra != rb {
+            parent[ra] = rb;
+        }
+    }
+    let mut members_by_root: HashMap<usize, Vec<String>> = HashMap::new();
+    for (name, &i) in &id {
+        let r = find(&parent, i);
+        members_by_root.entry(r).or_default().push(name.clone());
+    }
+    let mut existing: HashSet<(String, String)> = HashSet::new();
+    for (a, b) in edges {
+        existing.insert((a.clone(), b.clone()));
+        existing.insert((b.clone(), a.clone()));
+    }
+    let mut out: Vec<(String, String)> = Vec::new();
+    for (_root, mut members) in members_by_root {
+        if members.len() < 2 || members.len() > MAX_CLASS {
+            continue;
+        }
+        members.sort(); // deterministic emission
+        for i in 0..members.len() {
+            for j in (i + 1)..members.len() {
+                let pair = (members[i].clone(), members[j].clone());
+                if !existing.contains(&pair) {
+                    out.push(pair);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Σ.BR.2a — resolve the name-level derived edges back to `Column`s.
+/// Only keep a derived edge whose two names each resolve to exactly one
+/// (distinct) leaf — callers gate on `!chain_has_ambiguous_names`, so a
+/// name maps to a unique leaf. Returns implied `(Column, Column)` edges
+/// to append to the chain's equi predicates.
+fn derive_transitive_equi_edges(
+    equi_preds: &[(Column, Column)],
+    leaves: &[LogicalPlan],
+) -> Vec<(Column, Column)> {
+    use std::collections::HashMap;
+    let name_edges: Vec<(String, String)> = equi_preds
+        .iter()
+        .map(|(l, r)| (l.name.clone(), r.name.clone()))
+        .collect();
+    let derived = derive_transitive_name_edges(&name_edges);
+    if derived.is_empty() {
+        return Vec::new();
+    }
+    // name → a Column instance seen in equi_preds (preserves qualifier).
+    let mut col_of: HashMap<&str, &Column> = HashMap::new();
+    for (l, r) in equi_preds {
+        col_of.entry(l.name.as_str()).or_insert(l);
+        col_of.entry(r.name.as_str()).or_insert(r);
+    }
+    let leaf_of = |name: &str| -> Option<usize> {
+        leaves
+            .iter()
+            .position(|leaf| leaf.schema().fields().iter().any(|f| f.name() == name))
+    };
+    let mut out = Vec::new();
+    for (a, b) in derived {
+        let (Some(ca), Some(cb)) = (col_of.get(a.as_str()), col_of.get(b.as_str())) else {
+            continue;
+        };
+        match (leaf_of(&a), leaf_of(&b)) {
+            (Some(la), Some(lb)) if la != lb => out.push(((*ca).clone(), (*cb).clone())),
+            _ => {}
+        }
+    }
+    out
+}
+
 /// Build a fresh left-deep chain over `chain.leaves` in
 /// ascending-cardinality order. Each equi predicate is re-attached to
 /// the first join where both columns are in scope.
@@ -615,6 +723,17 @@ fn rebuild_reordered(chain: &InnerJoinChain) -> Option<LogicalPlan> {
         .map(estimate_leaf_card)
         .collect();
     let n = chain.leaves.len();
+
+    // Σ.BR.2a: enrich the join graph with transitively-implied equi edges
+    // (e.g. Q05 `c_nationkey=s_nationkey` ∧ `s_nationkey=n_nationkey` ⇒
+    // `c_nationkey=n_nationkey`) so the DP can reach orderings the literal
+    // predicate set doesn't connect — here, funnelling the ASIA-filtered
+    // `nation` directly into `customer` instead of through a 25-distinct
+    // `supplier` nationkey blowup. Redundant ⇒ result-preserving; the
+    // rebuild attaches each implied edge when both endpoints come into
+    // scope (so all originals + derived land on real joins).
+    let mut all_equi = chain.equi_preds.clone();
+    all_equi.extend(derive_transitive_equi_edges(&chain.equi_preds, &chain.leaves));
 
     if std::env::var("EMAT_REORDER_DEBUG").is_ok() {
         eprintln!("[reorder] chain with {n} leaves");
@@ -695,7 +814,7 @@ fn rebuild_reordered(chain: &InnerJoinChain) -> Option<LogicalPlan> {
             // Check if `i` connects to any leaf in `prev`.
             let leaf_schema = chain.leaves[i].schema();
             let mut connecting: Vec<(Column, Column)> = Vec::new();
-            for (l, r) in &chain.equi_preds {
+            for (l, r) in &all_equi {
                 let l_in_leaf = column_in_schema(l, leaf_schema);
                 let r_in_leaf = column_in_schema(r, leaf_schema);
                 let mut connects_to_prev = false;
@@ -762,7 +881,7 @@ fn rebuild_reordered(chain: &InnerJoinChain) -> Option<LogicalPlan> {
     for &i in &order {
         placed[i] = true;
     }
-    let mut remaining_preds: Vec<(Column, Column)> = chain.equi_preds.clone();
+    let mut remaining_preds: Vec<(Column, Column)> = all_equi.clone();
 
     // Bail if the connectivity-greedy order matches the input order —
     // no-op rewrites just churn the plan.
@@ -1235,6 +1354,29 @@ mod tests {
         Ok(())
     }
 
+    /// Σ.BR.2a — the union-find core derives the one missing transitive
+    /// edge from Q05's nationkey chain and nothing spurious.
+    #[test]
+    fn derive_transitive_edges_q05_nationkey_triangle() {
+        let edges = vec![
+            ("c_nationkey".to_string(), "s_nationkey".to_string()),
+            ("s_nationkey".to_string(), "n_nationkey".to_string()),
+        ];
+        let derived = derive_transitive_name_edges(&edges);
+        assert_eq!(
+            derived.len(),
+            1,
+            "expected exactly the one implied edge, got {derived:?}"
+        );
+        let got: std::collections::HashSet<&str> = [derived[0].0.as_str(), derived[0].1.as_str()]
+            .into_iter()
+            .collect();
+        assert!(
+            got.contains("c_nationkey") && got.contains("n_nationkey"),
+            "expected derived c_nationkey=n_nationkey, got {derived:?}"
+        );
+    }
+
     /// Σ.BR Phase 1 — cost-model acceptance gate (TDD). The DP must
     /// reproduce DuckDB's dimension-funnel order on Q05: the smallest
     /// dimension (region, filtered to 1 row by r_name='ASIA') is the
@@ -1243,15 +1385,14 @@ mod tests {
     /// cost 0 + over-optimistic FK-NDV), which regressed Q05 at SF=100.
     /// See PHASE_SIGMA_BR_JOIN_REORDER.md §4.2.
     ///
-    /// IGNORED pending Σ.BR.2: Q05's optimized join graph has
-    /// `c_nationkey = s_nationkey` and `s_nationkey = n_nationkey` but
-    /// NOT the transitive `c_nationkey = n_nationkey`, so `customer` is
-    /// tethered to `supplier` on a 25-distinct nationkey join. No cost
-    /// model can reach region-first without first deriving that edge —
-    /// that's the equivalence-class pass (Σ.BR.2). 1a alone gets Q05 to
-    /// orders-first (off lineitem-first), not region-first.
+    /// Σ.BR.2a unblocks this: Q05's optimized join graph has
+    /// `c_nationkey = s_nationkey` and `s_nationkey = n_nationkey` but NOT
+    /// the transitive `c_nationkey = n_nationkey`, so `customer` was
+    /// tethered to `supplier` on a 25-distinct nationkey join. The
+    /// equivalence-class pass derives that edge, letting the ASIA-filtered
+    /// `nation` funnel into `customer`; the 1a cost model then picks
+    /// region-first.
     #[tokio::test]
-    #[ignore = "Σ.BR.2: needs transitive equi-predicate inference (derive c_nationkey=n_nationkey); see PHASE_SIGMA_BR_JOIN_REORDER.md"]
     async fn reorders_q05_to_region_first() -> DfResult<()> {
         let Some(dir) = sf1_dir() else {
             eprintln!("skipping: sf1 data missing");

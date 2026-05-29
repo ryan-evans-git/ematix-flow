@@ -264,6 +264,16 @@ exists): **1b** string-eq NDV selectivity in `predicate_selectivity` (`col=lit`
 
 ## 9. Σ.BR.2 — equivalence-class / transitive equi-predicate pass (Q05 + general)
 
+**Status: 2a LANDED 2026-05-29.** The transitive-edge derivation is wired into
+the reorder DP's connectivity; `reorders_q05_to_region_first` is green. At
+SF=100 Q05 now picks the DuckDB funnel
+`region→nation→customer→orders→lineitem→supplier` and **wins −9.8%**
+(2395→2160 ms, vs +6–10% before), variance tightened ±120→±24 ms; Q08 holds
+**−5.0%**. Both row-count-correct. `rewrite_preserves_query_result` confirms the
+implied edges are result-preserving. **2b (filter propagation) remains;** so do
+the deferred 1b/1c cost-model refinements (not needed for Q05's order — 2a+1a
+sufficed).
+
 **Why (confirmed 2026-05-29 against the real plan).** Q05's optimized plan has
 `c_nationkey = s_nationkey` ∧ `s_nationkey = n_nationkey` but NOT the transitive
 `c_nationkey = n_nationkey`. DataFusion's default logical optimizer doesn't
