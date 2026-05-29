@@ -403,7 +403,24 @@ doesn't break the dict/cache tests), `join_reorder` 15/15.
 triangulation bench uses its own context, so a preset-backed timing harness
 (or pointing the bench at preset) is the gate before claiming the library-user
 win. Mechanism + correctness are validated; the codegen tax is structurally
-avoided (QueryPlanner ≠ OptimizerRule). All code uncommitted.
+avoided (QueryPlanner ≠ OptimizerRule). (Committed f1a456b; harness 8d83ada.)
+
+#### Phase 2 / #194 (2026-05-29): generalised to the full walker pipeline (`FlowQueryPlanner`)
+The first preset-path timing run (8d83ada) showed the library path was in a
+different regime from the bench — because preset installed *only* the reorder,
+not the bench's full pre-plan walker pipeline. `ReorderQueryPlanner` →
+**`FlowQueryPlanner`** (`crates/ematix-flow-core/src/flow_query_planner.rs`):
+applies **agg_semi → dim_push → reorder** in bench order, each self-gated
+(`EMAT_AGG_SEMI` / `EMAT_DIM_PUSH` / `EMAT_REORDER_QP`, default ON, opt-out),
+then delegates to `DefaultPhysicalPlanner`. So library users now get the same
+pre-plan rewrites the bench validates (agg_semi: Q17/Q08/Q18; dim_push: Q10;
+reorder: Q05). (Partition/batch autotune is OFF even in the bench since
+b190613, so it's not a parity gap.) **Correctness gate: SF=1 row counts
+identical ON vs all-OFF across all 22 queries (0 mismatches)**; new test
+`plans_all_tpch_queries_through_library_path` plans all 22 through the
+pipeline; preset 4/4, join_reorder 15/15 green. Remaining: SF=100 timing
+parity through preset, still blocked on freed memory (the harness drove big
+queries into swap — see 8d83ada).
 
 #### Phase 2 prereq (2026-05-29): a **cost-improvement gate is NOT viable** — use the scale gate
 Before building a "fire only when modeled cost improves substantially"

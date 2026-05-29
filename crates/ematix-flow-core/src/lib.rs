@@ -152,11 +152,12 @@ pub mod dict_routing;
 // reorder and falls back to FROM-clause order. See
 // `docs/PHASE_SIGMA_T_JOIN_REORDER.md`.
 pub mod join_reorder;
-// Σ.BR Phase 2 (2026-05-29): production wiring — a QueryPlanner wrapper that
-// applies the join reorder post-optimization so it reaches library users
-// (preset.rs), not just the bench harness. Avoids the OptimizerRule codegen
-// tax by running outside the optimizer's compiled rule loop.
-pub mod reorder_query_planner;
+// Σ.BR Phase 2 / #194 (2026-05-29): production wiring — a QueryPlanner wrapper
+// that applies the ematix pre-plan walker pipeline (agg_semi → dim_push →
+// reorder) post-optimization so it reaches library users (preset.rs), not just
+// the bench harness. Avoids the OptimizerRule codegen tax by running outside
+// the optimizer's compiled rule loop.
+pub mod flow_query_planner;
 // Σ.U (2026-05-26): push a filter as LeftSemi into an Aggregate's
 // input scan. Targets Q17 SF=10 where DF decorrelates the
 // correlated `(SELECT 0.2*AVG(l_quantity) WHERE l_partkey=outer.p_partkey)`

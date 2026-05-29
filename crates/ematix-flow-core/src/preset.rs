@@ -182,24 +182,25 @@ pub fn with_optimizer_rules_and_registry(
     } else {
         builder
     };
-    // Σ.BR Phase 2 (2026-05-29): production wiring for the join reorder. The
-    // walker was previously applied only in the bench harness, so library
-    // users never got it. Install it as a QueryPlanner (NOT an OptimizerRule —
-    // that would re-open the 5–8% codegen-tax, [[optimizer-codegen-sensitivity]])
-    // so it runs post-optimization, matching the validated bench config. The
-    // shape-gated entry carries the scale gate (≥100M-row fact → cap 6, else 4),
-    // ambiguous-names / aggregate-key / LIKE / LeftSemi-anti / composite-leaf
-    // guards, so it fires only on chains the cost model can size — at SF=100
-    // this lands the Q05 funnel (−14.7%) with no regressor. Default ON;
-    // `EMAT_REORDER_QP=0` disables for A/B.
-    let reorder_qp_on = std::env::var("EMAT_REORDER_QP")
-        .ok()
-        .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
-        .unwrap_or(true);
-    let builder = if reorder_qp_on {
-        builder.with_query_planner(Arc::new(
-            crate::reorder_query_planner::ReorderQueryPlanner,
-        ))
+    // Σ.BR Phase 2 / #194 (2026-05-29): production wiring for the ematix
+    // pre-plan walker pipeline (agg_semi → dim_push → reorder). These walkers
+    // were previously applied only in the bench harness, so library users got
+    // a different (slower) plan regime for the queries that use them
+    // (Q17/Q08/Q18 via agg_semi, Q10 via dim_push, Q05 via reorder). Install
+    // them as a QueryPlanner (NOT OptimizerRules — that would re-open the 5–8%
+    // codegen-tax, [[optimizer-codegen-sensitivity]]) so they run
+    // post-optimization, matching the validated bench config. Each step is
+    // self-gated inside FlowQueryPlanner (EMAT_AGG_SEMI / EMAT_DIM_PUSH /
+    // EMAT_REORDER_QP, all default ON, opt-OUT). Installed unless all three
+    // are disabled.
+    let flow_qp_on = ["EMAT_AGG_SEMI", "EMAT_DIM_PUSH", "EMAT_REORDER_QP"].iter().any(|var| {
+        std::env::var(var)
+            .ok()
+            .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+            .unwrap_or(true)
+    });
+    let builder = if flow_qp_on {
+        builder.with_query_planner(Arc::new(crate::flow_query_planner::FlowQueryPlanner))
     } else {
         builder
     };
