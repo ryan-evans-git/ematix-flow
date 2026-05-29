@@ -661,10 +661,15 @@ fn rebuild_reordered(chain: &InnerJoinChain) -> Option<LogicalPlan> {
 
     let mut dp: Vec<Option<DpState>> = vec![None; 1usize << n];
 
-    // Base case: single-leaf subsets — cost 0, card = leaf size.
+    // Base case: single-leaf subsets. Σ.BR.1a (2026-05-29): seed
+    // cost = leaf card (NOT 0). The leftmost leaf is the build side of
+    // the first join, so its size must be charged — otherwise the DP
+    // parks the largest table leftmost for free (Q05 put lineitem(600M)
+    // first, inverting DuckDB's funnel; Q08 put orders before the
+    // selective part). See PHASE_SIGMA_BR_JOIN_REORDER.md §4.2.
     for i in 0..n {
         dp[1 << i] = Some(DpState {
-            cost: 0,
+            cost: cards[i].max(1),
             card: cards[i].max(1),
             order: vec![i],
         });
@@ -1230,6 +1235,87 @@ mod tests {
         Ok(())
     }
 
+    /// Σ.BR Phase 1 — cost-model acceptance gate (TDD). The DP must
+    /// reproduce DuckDB's dimension-funnel order on Q05: the smallest
+    /// dimension (region, filtered to 1 row by r_name='ASIA') is the
+    /// deepest-left leaf — NOT the 600M-row lineitem fact table. With the
+    /// pre-Σ.BR cost model the DP put lineitem leftmost (base case charged
+    /// cost 0 + over-optimistic FK-NDV), which regressed Q05 at SF=100.
+    /// See PHASE_SIGMA_BR_JOIN_REORDER.md §4.2.
+    ///
+    /// IGNORED pending Σ.BR.2: Q05's optimized join graph has
+    /// `c_nationkey = s_nationkey` and `s_nationkey = n_nationkey` but
+    /// NOT the transitive `c_nationkey = n_nationkey`, so `customer` is
+    /// tethered to `supplier` on a 25-distinct nationkey join. No cost
+    /// model can reach region-first without first deriving that edge —
+    /// that's the equivalence-class pass (Σ.BR.2). 1a alone gets Q05 to
+    /// orders-first (off lineitem-first), not region-first.
+    #[tokio::test]
+    #[ignore = "Σ.BR.2: needs transitive equi-predicate inference (derive c_nationkey=n_nationkey); see PHASE_SIGMA_BR_JOIN_REORDER.md"]
+    async fn reorders_q05_to_region_first() -> DfResult<()> {
+        let Some(dir) = sf1_dir() else {
+            eprintln!("skipping: sf1 data missing");
+            return Ok(());
+        };
+        let ctx = SessionContext::new();
+        register_tpch(&ctx, &dir).await?;
+        let sql = std::fs::read_to_string(
+            dir.parent().unwrap().parent().unwrap().join("queries/q05.sql"),
+        )
+        .ok();
+        let Some(sql) = sql else {
+            eprintln!("skipping: q05.sql not found");
+            return Ok(());
+        };
+        let df = ctx.sql(&sql).await?;
+        let optimized = df.into_optimized_plan()?;
+        let rewritten = reorder_inner_joins(optimized.clone())?;
+        let leftmost = leftmost_table_scan(&rewritten);
+        assert_eq!(
+            leftmost.as_deref(),
+            Some("region"),
+            "Q05 reorder must put region (1 row after ASIA filter) as the \
+             deepest-left leaf, not the lineitem fact table:\n{}",
+            rewritten.display_indent(),
+        );
+        Ok(())
+    }
+
+    /// Σ.BR Phase 1 — acceptance gate for Q08: the selective `part` filter
+    /// (p_type = 'ECONOMY ANODIZED STEEL', ~1/150 of parts) must lead so its
+    /// join narrows lineitem early — DuckDB's order. Pre-Σ.BR the DP put
+    /// `orders` first (string-eq selectivity flat 0.1 + leftmost cost 0),
+    /// regressing Q08 +42% at SF=10 / +26% at SF=100.
+    #[tokio::test]
+    async fn reorders_q08_to_part_first() -> DfResult<()> {
+        let Some(dir) = sf1_dir() else {
+            eprintln!("skipping: sf1 data missing");
+            return Ok(());
+        };
+        let ctx = SessionContext::new();
+        register_tpch(&ctx, &dir).await?;
+        let sql = std::fs::read_to_string(
+            dir.parent().unwrap().parent().unwrap().join("queries/q08.sql"),
+        )
+        .ok();
+        let Some(sql) = sql else {
+            eprintln!("skipping: q08.sql not found");
+            return Ok(());
+        };
+        let df = ctx.sql(&sql).await?;
+        let optimized = df.into_optimized_plan()?;
+        let rewritten = reorder_inner_joins(optimized.clone())?;
+        let leftmost = leftmost_table_scan(&rewritten);
+        assert_eq!(
+            leftmost.as_deref(),
+            Some("part"),
+            "Q08 reorder must put part (selective p_type filter) as the \
+             deepest-left leaf:\n{}",
+            rewritten.display_indent(),
+        );
+        Ok(())
+    }
+
     /// End-to-end correctness: after reorder, executing the rewritten
     /// plan must return the same rows as the original. The reorder
     /// changes the join topology — it must NOT change the result set.
@@ -1361,10 +1447,15 @@ mod tests {
         let ctx = SessionContext::new();
         register_tpch(&ctx, &dir).await?;
         // 3-leaf chain (within the leaf budget) but with a LIKE filter
-        // on `part`. Shape gate should reject.
+        // on `part`. Shape gate should reject. FROM starts with the
+        // largest table (lineitem) so the permissive reorder demonstrably
+        // fires (moves the small `part` leaf to the front). With FROM
+        // part-first the Σ.BR.1a cost model already agrees with the input
+        // order and correctly no-ops — which wouldn't exercise the
+        // "permissive doesn't gate LIKE" contract this test checks.
         let sql = "SELECT p.p_name, l.l_quantity \
-                   FROM part p \
-                   JOIN lineitem l ON p.p_partkey = l.l_partkey \
+                   FROM lineitem l \
+                   JOIN part p ON p.p_partkey = l.l_partkey \
                    JOIN orders o ON l.l_orderkey = o.o_orderkey \
                    WHERE p.p_name LIKE '%green%'";
         let df = ctx.sql(sql).await?;
