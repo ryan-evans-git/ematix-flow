@@ -418,9 +418,30 @@ reorder: Q05). (Partition/batch autotune is OFF even in the bench since
 b190613, so it's not a parity gap.) **Correctness gate: SF=1 row counts
 identical ON vs all-OFF across all 22 queries (0 mismatches)**; new test
 `plans_all_tpch_queries_through_library_path` plans all 22 through the
-pipeline; preset 4/4, join_reorder 15/15 green. Remaining: SF=100 timing
-parity through preset, still blocked on freed memory (the harness drove big
-queries into swap — see 8d83ada).
+pipeline; preset 4/4, join_reorder 15/15 green.
+
+#### Phase 2 / #194b (2026-05-29): re-optimize the rewritten plan — TIMING GATE CLOSED
+The first clean preset-path A/B (machine quiet) showed the reorder **neutral**
+on Q05 (ON 2603 vs OFF 2629, −1%) even though the funnel was plan-confirmed —
+and reorder-ON ran ~0.5s slower through preset than the bench. Root cause:
+`SessionState::create_physical_plan` optimizes the plan and *then* calls the
+query planner, so `FlowQueryPlanner` receives an already-optimized plan,
+applies the walkers (which restructure the joins), and goes straight to
+physical planning — the reordered plan is **never re-optimized**, leaving
+filters/projections positioned for the old join order. The bench re-optimizes
+implicitly (`execute_logical_plan(...).collect()` re-runs the optimizer on the
+reordered plan), which is why its −14.7% appeared and preset's didn't.
+
+Fix: `FlowQueryPlanner::create_physical_plan` now calls
+`session_state.optimize(&rewritten)` after the walkers (best-effort,
+falls back on error). Safe — the bench proves the reorder survives
+re-optimization (else its ON-vs-OFF delta would collapse to zero). Re-validated
+SF=100 (quiet machine, 4 trials, ±1%): **Q05 reorder ON 2351 ± 25 vs OFF
+2598 ± 27 = −9.5% WIN** (was −1% pre-fix; ON now ≈ the bench's reorder-ON
+~2.1s). `plans_all_tpch_queries_through_library_path` still green. **The Q05
+SF=100 funnel win now reaches library users through the preset path** — the
+production-wiring perf gate is closed. (Earlier 40s/128s preset times were
+post-session swap + post-reboot daemon storm, not a real regime gap.)
 
 #### Phase 2 prereq (2026-05-29): a **cost-improvement gate is NOT viable** — use the scale gate
 Before building a "fire only when modeled cost improves substantially"

@@ -89,6 +89,20 @@ impl QueryPlanner for FlowQueryPlanner {
         session_state: &SessionState,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let planned = Self::rewrite(logical_plan.clone());
+        // Σ.BR Phase 2 / #194b (2026-05-29): re-optimize the rewritten plan.
+        // `SessionState::create_physical_plan` optimizes the plan and *then*
+        // invokes the query planner, so the plan we receive is already
+        // optimized — but our walkers (esp. the reorder) restructure the joins
+        // AFTER that pass, leaving filters/projections positioned for the old
+        // order. The bench re-optimizes implicitly (it applies the walkers,
+        // then `execute_logical_plan(...).collect()` re-runs the optimizer on
+        // the reordered plan); the QueryPlanner does not. Without this, the
+        // reordered Q05 funnel ran ~0.5s slower through preset than the bench
+        // and the −14.7% SF=100 win evaporated to ~neutral. Re-running the
+        // logical optimizer here re-pushes filters/projections through the new
+        // join order, matching the bench. Best-effort: fall back to the
+        // un-re-optimized plan on error (correctness is unaffected either way).
+        let planned = session_state.optimize(&planned).unwrap_or(planned);
         DefaultPhysicalPlanner::default()
             .create_physical_plan(&planned, session_state)
             .await
