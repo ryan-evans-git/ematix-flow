@@ -1966,6 +1966,18 @@ impl TableProvider for EmatixFastParquetTableProvider {
                 .map(|_| TableProviderFilterPushDown::Unsupported)
                 .collect());
         }
+        // Σ.Q06.SF10.7 diagnostic: force all filters to stay in
+        // DataFusion's residual FilterExec (no pushdown), so filter-
+        // bearing scans run the dense streaming path instead of the
+        // per-RG late-mat masked path. Tests whether the late-mat
+        // orchestration — not the decode kernels — is the Q06 SF=10
+        // bottleneck.
+        if std::env::var_os("EMAT_NO_FILTER_PUSHDOWN").is_some() {
+            return Ok(filters
+                .iter()
+                .map(|_| TableProviderFilterPushDown::Unsupported)
+                .collect());
+        }
         // Σ.E5 #517 (2026-05-19): streaming reader's masked-decode
         // path now uses dict-preserved Utf8View — same shape as the
         // dense fast path (dict_views: Vec<u128> cache + 16-byte
@@ -2251,6 +2263,33 @@ impl EmatixFastParquetExec {
             properties: self.properties.clone(),
             metrics: ExecutionPlanMetricsSet::new(),
         }))
+    }
+
+    /// Σ.Q06.SF10.8 — return a filter-stripped clone that takes the
+    /// dense streaming decode path. When a downstream `FusedAggregateExec`
+    /// re-applies the predicate itself, the scan's pushed-down
+    /// `BridgeFilter` is redundant — and the masked late-materialization
+    /// decode it triggers is ~2× slower than dense decode feeding the
+    /// JIT fused filter-agg kernel (Q06 SF=10: ~89→~55 ms). Keeps any
+    /// runtime sideband (callers gate on its absence so join-probe
+    /// scans keep their L9 bloom). See [[q06-masked-pushdown-waste]].
+    pub fn without_filter(&self) -> Arc<Self> {
+        Arc::new(Self {
+            path: self.path.clone(),
+            schema: self.schema.clone(),
+            file_schema: self.file_schema.clone(),
+            projection: self.projection.clone(),
+            assignments: self.assignments.clone(),
+            num_rows: self.num_rows,
+            rg_num_rows: self.rg_num_rows.clone(),
+            filter: None,
+            late_mat: self.late_mat,
+            streaming_arrow_reader: self.streaming_arrow_reader,
+            column_stats: self.column_stats.clone(),
+            runtime_sideband: self.runtime_sideband.clone(),
+            properties: self.properties.clone(),
+            metrics: ExecutionPlanMetricsSet::new(),
+        })
     }
 
     fn clone_internals(&self) -> Self {
@@ -2552,6 +2591,42 @@ impl ExecutionPlan for EmatixFastParquetExec {
         };
         s.column_statistics = self.column_stats.clone();
         Ok(s)
+    }
+}
+
+/// Σ.Q06.SF10.8 — descend through single-child wrapper operators and
+/// strip the redundant static `BridgeFilter` from any
+/// `EmatixFastParquetExec` that carries no runtime sideband, returning
+/// a dense-decode clone. Stops at leaves and multi-child nodes (joins),
+/// so scans feeding a join keep their pushdown — that preserves the
+/// join queries (Q12/Q19), while the fused-agg shape (Q06/Q01/Q14) has
+/// only linear operators between the fused op and its scan.
+///
+/// ONLY sound to call on the input of a `FusedAggregateExec`, which
+/// re-applies the predicate from the dropped `FilterExec` itself — so
+/// the scan's pre-filter is pure redundant (and slow, masked) work.
+/// See [[q06-masked-pushdown-waste]].
+pub fn strip_redundant_scan_filter(
+    plan: Arc<dyn ExecutionPlan>,
+) -> Arc<dyn ExecutionPlan> {
+    if let Some(scan) = plan.as_any().downcast_ref::<EmatixFastParquetExec>() {
+        if scan.filter().is_some() && scan.runtime_sideband().is_none() {
+            return scan.without_filter();
+        }
+        return plan;
+    }
+    let children = plan.children();
+    if children.len() != 1 {
+        return plan;
+    }
+    let child = Arc::clone(children[0]);
+    let new_child = strip_redundant_scan_filter(Arc::clone(&child));
+    if Arc::ptr_eq(&new_child, &child) {
+        return plan;
+    }
+    match Arc::clone(&plan).with_new_children(vec![new_child]) {
+        Ok(p) => p,
+        Err(_) => plan,
     }
 }
 
