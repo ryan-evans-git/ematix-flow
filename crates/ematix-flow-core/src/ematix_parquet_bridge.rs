@@ -29,8 +29,9 @@
 //! (Π.10 `read_column_*_masked_into`) is the canonical Q14
 //! implementation and replaced the older bespoke fused exec.
 
-use std::path::Path;
-use std::sync::Arc;
+use std::collections::{HashMap, VecDeque};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use arrow_array::builder::ArrayBuilder;
 use arrow_array::types::UInt32Type;
@@ -56,6 +57,143 @@ use ematix_parquet_codec::read::{
 };
 use ematix_parquet_format::types::{CompressionCodec, Encoding};
 use ematix_parquet_io::{PageWalker, ParquetFile};
+
+/// Σ.Q06.SF10.7 — scale-aware process cache of opened `ParquetFile`
+/// handles.
+///
+/// `ParquetFile::open` reads the whole footer and the first
+/// `cached_metadata()` thrift-parses it. The filtered scan re-opens
+/// the same file ~4×/row-group (one per predicate in `build_bitmap`
+/// plus the projection pass), and *each* re-parses the *entire*
+/// footer. So redundant-parse cost scales as **N_rg²**: opens ∝ N_rg
+/// and footer-parse ∝ N_rg. At SF=10 (58 RGs) that's ~68 ms of CPU
+/// that the A/B proved is fully absorbed by thread idle slack
+/// (wall-neutral). At SF=100 (~580 RGs) it is ~100× larger and must
+/// break onto the critical path; at SF=1000, ~10000×.
+///
+/// So the cache is **gated on row-group count** — engaged only for
+/// files with more than [`parquet_file_cache_min_rg`] row groups.
+/// Below that (every SF=10 table) `open_cached` is a thin pass-through
+/// that opens fresh and never touches the cache map, so the default
+/// SF=10 path is byte-for-byte the prior behaviour. Above it, the
+/// footer is read + parsed once per file and shared (`read_range` is
+/// pread-based / lock-free, so the `Arc` is safe across the
+/// per-partition decode threads), collapsing O(N_rg²) → O(N_rg).
+///
+/// Keyed by (size, mtime) so a rewritten file invalidates. Bounded
+/// (FIFO) so a long-running worker scanning many distinct large files
+/// does not leak file descriptors. Hard-disable with
+/// `EMAT_NO_PARQUET_FILE_CACHE=1`; tune the threshold with
+/// `EMAT_PARQUET_FILE_CACHE_MIN_RG` (e.g. `0` forces caching on for
+/// A/B at SF=10).
+struct ParquetFileCache {
+    map: HashMap<PathBuf, (u64, u128, Arc<ParquetFile>)>,
+    order: VecDeque<PathBuf>,
+    cap: usize,
+}
+
+static PARQUET_FILE_CACHE: OnceLock<Mutex<ParquetFileCache>> = OnceLock::new();
+
+/// Row-group count above which a file is worth caching. SF=10 tables
+/// are all below 128 (lineitem is 58); SF=100 lineitem (~580) is well
+/// above. Override via `EMAT_PARQUET_FILE_CACHE_MIN_RG`.
+fn parquet_file_cache_min_rg() -> usize {
+    static MIN_RG: OnceLock<usize> = OnceLock::new();
+    *MIN_RG.get_or_init(|| {
+        std::env::var("EMAT_PARQUET_FILE_CACHE_MIN_RG")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(128)
+    })
+}
+
+fn parquet_file_cache_disabled() -> bool {
+    static DISABLED: OnceLock<bool> = OnceLock::new();
+    *DISABLED.get_or_init(|| std::env::var("EMAT_NO_PARQUET_FILE_CACHE").is_ok())
+}
+
+fn file_size_mtime(path: &Path) -> Option<(u64, u128)> {
+    let m = std::fs::metadata(path).ok()?;
+    let mtime = m
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    Some((m.len(), mtime))
+}
+
+/// Open `path`, returning a process-cached `Arc<ParquetFile>` for
+/// large files (see [`ParquetFileCache`]). Small files pass through to
+/// a fresh open with no `stat` and only a single lock-peek of overhead.
+pub fn open_cached(path: &Path) -> DfResult<Arc<ParquetFile>> {
+    let open_fresh = || {
+        ParquetFile::open(path)
+            .map(Arc::new)
+            .map_err(|e| ext(format!("ParquetFile::open: {e}")))
+    };
+    if parquet_file_cache_disabled() {
+        return open_fresh();
+    }
+    let cache = PARQUET_FILE_CACHE.get_or_init(|| {
+        Mutex::new(ParquetFileCache {
+            map: HashMap::new(),
+            order: VecDeque::new(),
+            cap: 256,
+        })
+    });
+
+    // Peek: only large files are ever inserted, so a hit here means
+    // "known large". Clone the tuple out and drop the lock before the
+    // freshness `stat` syscall. Small/unknown files miss cheaply (one
+    // lock + hashmap probe, no stat).
+    let cached = {
+        let guard = cache.lock().unwrap();
+        guard.map.get(path).cloned()
+    };
+    if let Some((size0, mtime0, f)) = cached {
+        if let Some((size, mtime)) = file_size_mtime(path) {
+            if size == size0 && mtime == mtime0 {
+                return Ok(f);
+            }
+        }
+        // Stale (rewritten) or unstattable → fall through to re-open.
+    }
+
+    // Miss / unknown / small / stale. Open and learn the row-group
+    // count (this also warms the handle's memoized metadata, reused by
+    // the decode that follows — no extra parse).
+    let f = open_fresh()?;
+    let n_rg = f
+        .cached_metadata()
+        .map(|m| m.row_groups.len())
+        .unwrap_or(0);
+    if n_rg <= parquet_file_cache_min_rg() {
+        return Ok(f); // small file — never cached
+    }
+    let Some((size, mtime)) = file_size_mtime(path) else {
+        return Ok(f); // can't key it → don't cache
+    };
+    let mut guard = cache.lock().unwrap();
+    // A concurrent miss may have inserted while we opened — prefer the
+    // existing entry so every caller shares one handle (and its parse).
+    if let Some((s, m, existing)) = guard.map.get(path) {
+        if *s == size && *m == mtime {
+            return Ok(Arc::clone(existing));
+        }
+    }
+    if !guard.map.contains_key(path) && guard.order.len() >= guard.cap {
+        if let Some(old) = guard.order.pop_front() {
+            guard.map.remove(&old);
+        }
+    }
+    let key = path.to_path_buf();
+    if !guard.order.contains(&key) {
+        guard.order.push_back(key.clone());
+    }
+    guard.map.insert(key, (size, mtime, Arc::clone(&f)));
+    Ok(f)
+}
 
 /// Decode an INT32 column chunk to a contiguous `Int32Array`.
 ///
@@ -98,8 +236,8 @@ pub fn decode_column_chunk_byte_array(
     rg: usize,
     col: usize,
 ) -> DfResult<Arc<StringArray>> {
-    let file = ParquetFile::open(path).map_err(|e| ext(format!("ParquetFile::open: {e}")))?;
-    let md = file.metadata().map_err(|e| ext(format!("metadata: {e}")))?;
+    let file = open_cached(path)?;
+    let md = file.cached_metadata().map_err(|e| ext(format!("metadata: {e}")))?;
     let cm = md.row_groups[rg].columns[col]
         .meta_data
         .as_ref()
@@ -227,8 +365,8 @@ pub fn decode_column_chunk_byte_array_dict_preserved(
     rg: usize,
     col: usize,
 ) -> DfResult<Arc<DictionaryArray<UInt32Type>>> {
-    let file = ParquetFile::open(path).map_err(|e| ext(format!("ParquetFile::open: {e}")))?;
-    let raw = read_column_byte_array_dict_preserved(&file, rg, col).map_err(|e| {
+    let file = open_cached(path)?;
+    let raw = read_column_byte_array_dict_preserved(&*file, rg, col).map_err(|e| {
         ext(format!(
             "read_column_byte_array_dict_preserved (rg={rg}, col={col}): {e}"
         ))
@@ -278,8 +416,8 @@ fn decode_dict_chunk_generic<T: Copy>(
     col: usize,
     decode_plain: impl Fn(&[u8]) -> DfResult<Vec<T>>,
 ) -> DfResult<Vec<T>> {
-    let file = ParquetFile::open(path).map_err(|e| ext(format!("ParquetFile::open: {e}")))?;
-    let md = file.metadata().map_err(|e| ext(format!("metadata: {e}")))?;
+    let file = open_cached(path)?;
+    let md = file.cached_metadata().map_err(|e| ext(format!("metadata: {e}")))?;
     let cm = md.row_groups[rg].columns[col]
         .meta_data
         .as_ref()
@@ -389,8 +527,8 @@ pub fn filter_i32_column_to_bitmap(
     col: usize,
     predicate: impl Fn(i32) -> bool,
 ) -> DfResult<(Vec<u8>, usize)> {
-    let file = ParquetFile::open(path).map_err(|e| ext(format!("ParquetFile::open: {e}")))?;
-    let md = file.metadata().map_err(|e| ext(format!("metadata: {e}")))?;
+    let file = open_cached(path)?;
+    let md = file.cached_metadata().map_err(|e| ext(format!("metadata: {e}")))?;
     let cm = md.row_groups[rg].columns[col]
         .meta_data
         .as_ref()
@@ -496,8 +634,8 @@ fn gather_chunk_typed<T: Copy>(
     decode_dict_plain: impl Fn(&[u8]) -> DfResult<Vec<T>>,
     decode_plain_page: impl Fn(&[u8]) -> DfResult<Vec<T>>,
 ) -> DfResult<Vec<T>> {
-    let file = ParquetFile::open(path).map_err(|e| ext(format!("ParquetFile::open: {e}")))?;
-    let md = file.metadata().map_err(|e| ext(format!("metadata: {e}")))?;
+    let file = open_cached(path)?;
+    let md = file.cached_metadata().map_err(|e| ext(format!("metadata: {e}")))?;
     let cm = md.row_groups[rg].columns[col]
         .meta_data
         .as_ref()
@@ -699,12 +837,12 @@ pub fn filter_byte_array_to_bitmap(
     col: usize,
     predicate: impl Fn(&[u8]) -> bool,
 ) -> DfResult<(Vec<u8>, usize)> {
-    let file = ParquetFile::open(path).map_err(|e| ext(format!("ParquetFile::open: {e}")))?;
+    let file = open_cached(path)?;
     let mut dict_bytes: Vec<u8> = Vec::new();
     let mut dict_offsets: Vec<u32> = Vec::new();
     let mut indices: Vec<u32> = Vec::new();
     read_column_byte_array_dict_preserved_into(
-        &file,
+        &*file,
         rg,
         col,
         &mut dict_bytes,
@@ -755,8 +893,8 @@ pub fn filter_f64_column_to_bitmap(
     col: usize,
     predicate: impl Fn(f64) -> bool,
 ) -> DfResult<(Vec<u8>, usize)> {
-    let file = ParquetFile::open(path).map_err(|e| ext(format!("ParquetFile::open: {e}")))?;
-    let md = file.metadata().map_err(|e| ext(format!("metadata: {e}")))?;
+    let file = open_cached(path)?;
+    let md = file.cached_metadata().map_err(|e| ext(format!("metadata: {e}")))?;
     let cm = md.row_groups[rg].columns[col]
         .meta_data
         .as_ref()
@@ -869,15 +1007,15 @@ pub fn filter_f64_column_to_bitmap_dense_with_values(
     col: usize,
     predicate: impl Fn(f64) -> bool,
 ) -> DfResult<(Vec<u8>, usize, Vec<f64>)> {
-    let file = ParquetFile::open(path).map_err(|e| ext(format!("ParquetFile::open: {e}")))?;
-    let md = file.metadata().map_err(|e| ext(format!("metadata: {e}")))?;
+    let file = open_cached(path)?;
+    let md = file.cached_metadata().map_err(|e| ext(format!("metadata: {e}")))?;
     let cm = md.row_groups[rg].columns[col]
         .meta_data
         .as_ref()
         .ok_or_else(|| ext("column missing meta_data"))?;
     let total = cm.num_values as usize;
     let all_ones = vec![0xFFu8; total.div_ceil(8)];
-    let values = masked_decode_f64(&file, rg, col, &all_ones)?;
+    let values = masked_decode_f64(&*file, rg, col, &all_ones)?;
     let mut bitmap = vec![0u8; total.div_ceil(8)];
     for (row, &v) in values.iter().enumerate() {
         if predicate(v) {
@@ -897,15 +1035,15 @@ pub fn filter_byte_array_to_bitmap_dense(
     col: usize,
     predicate: impl Fn(&[u8]) -> bool,
 ) -> DfResult<(Vec<u8>, usize)> {
-    let file = ParquetFile::open(path).map_err(|e| ext(format!("ParquetFile::open: {e}")))?;
-    let md = file.metadata().map_err(|e| ext(format!("metadata: {e}")))?;
+    let file = open_cached(path)?;
+    let md = file.cached_metadata().map_err(|e| ext(format!("metadata: {e}")))?;
     let cm = md.row_groups[rg].columns[col]
         .meta_data
         .as_ref()
         .ok_or_else(|| ext("column missing meta_data"))?;
     let total = cm.num_values as usize;
     let all_ones = vec![0xFFu8; total.div_ceil(8)];
-    let values = masked_decode_byte_array(&file, rg, col, &all_ones)?;
+    let values = masked_decode_byte_array(&*file, rg, col, &all_ones)?;
     if values.len() != total {
         return Err(ext(format!(
             "byte_array dense filter: decoded {} rows, expected {total}",
@@ -930,8 +1068,8 @@ pub fn rg_i64_min_max(
     rg: usize,
     col: usize,
 ) -> DfResult<Option<(i64, i64)>> {
-    let file = ParquetFile::open(path).map_err(|e| ext(format!("ParquetFile::open: {e}")))?;
-    let md = file.metadata().map_err(|e| ext(format!("metadata: {e}")))?;
+    let file = open_cached(path)?;
+    let md = file.cached_metadata().map_err(|e| ext(format!("metadata: {e}")))?;
     let cm = md.row_groups[rg].columns[col]
         .meta_data
         .as_ref()
@@ -957,8 +1095,8 @@ pub fn rg_i64_min_max(
 /// without decoding it. Used as the bitmap size when an RG is
 /// short-circuited by an `I64Range` predicate.
 pub fn rg_num_values(path: &std::path::Path, rg: usize, col: usize) -> DfResult<usize> {
-    let file = ParquetFile::open(path).map_err(|e| ext(format!("ParquetFile::open: {e}")))?;
-    let md = file.metadata().map_err(|e| ext(format!("metadata: {e}")))?;
+    let file = open_cached(path)?;
+    let md = file.cached_metadata().map_err(|e| ext(format!("metadata: {e}")))?;
     let cm = md.row_groups[rg].columns[col]
         .meta_data
         .as_ref()
@@ -977,15 +1115,15 @@ pub fn filter_i64_column_to_bitmap_dense(
     col: usize,
     predicate: impl Fn(i64) -> bool,
 ) -> DfResult<(Vec<u8>, usize)> {
-    let file = ParquetFile::open(path).map_err(|e| ext(format!("ParquetFile::open: {e}")))?;
-    let md = file.metadata().map_err(|e| ext(format!("metadata: {e}")))?;
+    let file = open_cached(path)?;
+    let md = file.cached_metadata().map_err(|e| ext(format!("metadata: {e}")))?;
     let cm = md.row_groups[rg].columns[col]
         .meta_data
         .as_ref()
         .ok_or_else(|| ext("column missing meta_data"))?;
     let total = cm.num_values as usize;
     let all_ones = vec![0xFFu8; total.div_ceil(8)];
-    let values = masked_decode_i64(&file, rg, col, &all_ones)?;
+    let values = masked_decode_i64(&*file, rg, col, &all_ones)?;
     let mut bitmap = vec![0u8; total.div_ceil(8)];
     for (row, &v) in values.iter().enumerate() {
         if predicate(v) {
@@ -1008,7 +1146,7 @@ pub fn filter_i32_column_to_bitmap_dense(
 ) -> DfResult<(Vec<u8>, usize)> {
     // Decode the whole column via the existing masked-decode kernel
     // with an all-ones mask. Then apply the predicate.
-    let md = file.metadata().map_err(|e| ext(format!("metadata: {e}")))?;
+    let md = file.cached_metadata().map_err(|e| ext(format!("metadata: {e}")))?;
     let cm = md.row_groups[rg].columns[col]
         .meta_data
         .as_ref()

@@ -481,11 +481,9 @@ impl BridgeFilter {
                         Ok(r) => r,
                         Err(_) => {
                             let pc2 = pclone.clone();
-                            let file = ematix_parquet_io::ParquetFile::open(path).map_err(|e| {
-                                DataFusionError::External(format!("ParquetFile::open: {e}").into())
-                            })?;
+                            let file = crate::ematix_parquet_bridge::open_cached(path)?;
                             filter_i32_column_to_bitmap_dense(
-                                &file,
+                                &*file,
                                 rg,
                                 *col_idx,
                                 move |v: i32| pc2.eval_i32(v),
@@ -526,12 +524,10 @@ impl BridgeFilter {
                     // Decode both cols dense via masked_decode_i32
                     // with all-ones masks. Same shape as the F64 dense
                     // path. Apply the op pairwise to build the bitmap.
-                    use crate::ematix_parquet_bridge::masked_decode_i32;
-                    let file = ematix_parquet_io::ParquetFile::open(path).map_err(|e| {
-                        DataFusionError::External(format!("ParquetFile::open: {e}").into())
-                    })?;
+                    use crate::ematix_parquet_bridge::{masked_decode_i32, open_cached};
+                    let file = open_cached(path)?;
                     let md = file
-                        .metadata()
+                        .cached_metadata()
                         .map_err(|e| DataFusionError::External(format!("metadata: {e}").into()))?;
                     let total = md.row_groups[rg].columns[*left_col]
                         .meta_data
@@ -539,8 +535,8 @@ impl BridgeFilter {
                         .map(|m| m.num_values as usize)
                         .unwrap_or(0);
                     let all_ones = vec![0xFFu8; total.div_ceil(8)];
-                    let left = masked_decode_i32(&file, rg, *left_col, &all_ones)?;
-                    let right = masked_decode_i32(&file, rg, *right_col, &all_ones)?;
+                    let left = masked_decode_i32(&*file, rg, *left_col, &all_ones)?;
+                    let right = masked_decode_i32(&*file, rg, *right_col, &all_ones)?;
                     if left.len() != right.len() || left.len() != total {
                         return Err(DataFusionError::External(
                             format!(
@@ -3136,11 +3132,10 @@ fn decode_one_rg_filtered_late_mat(
     // Open the parquet file once for this row group. The masked_into
     // façade caches column-chunk bytes internally; opening the
     // ParquetFile is the only IO setup we need.
-    let file = ematix_parquet_io::ParquetFile::open(path).map_err(|e| {
-        DataFusionError::External(
-            format!("EmatixFastParquetExec (late_mat): ParquetFile::open: {e}").into(),
-        )
-    })?;
+    // Σ.Q06.SF10.7: reuse a process-cached handle so the footer is
+    // read + parsed once per file rather than once per (row-group ×
+    // pass). build_bitmap + masked_decode below all share it.
+    let file = crate::ematix_parquet_bridge::open_cached(path)?;
     // Σ.E5 #513: multi-column AND bitmap via BridgeFilter.
     let (bitmap, _total) = filter.build_bitmap(path, rg)?;
 
@@ -3164,27 +3159,27 @@ fn decode_one_rg_filtered_late_mat(
         let field = schema.field(out_idx);
         let arr: Arc<dyn arrow_array::Array> = match field.data_type() {
             DataType::Int32 => {
-                let vals = masked_decode_i32(&file, rg, col_idx, &bitmap)?;
+                let vals = masked_decode_i32(&*file, rg, col_idx, &bitmap)?;
                 check_len(vals.len(), matches, field.name(), "Int32")?;
                 Arc::new(arrow_array::Int32Array::from(vals))
             }
             DataType::Date32 => {
-                let vals = masked_decode_i32(&file, rg, col_idx, &bitmap)?;
+                let vals = masked_decode_i32(&*file, rg, col_idx, &bitmap)?;
                 check_len(vals.len(), matches, field.name(), "Date32")?;
                 Arc::new(arrow_array::Date32Array::from(vals))
             }
             DataType::Int64 => {
-                let vals = masked_decode_i64(&file, rg, col_idx, &bitmap)?;
+                let vals = masked_decode_i64(&*file, rg, col_idx, &bitmap)?;
                 check_len(vals.len(), matches, field.name(), "Int64")?;
                 Arc::new(arrow_array::Int64Array::from(vals))
             }
             DataType::Float64 => {
-                let vals = masked_decode_f64(&file, rg, col_idx, &bitmap)?;
+                let vals = masked_decode_f64(&*file, rg, col_idx, &bitmap)?;
                 check_len(vals.len(), matches, field.name(), "Float64")?;
                 Arc::new(arrow_array::Float64Array::from(vals))
             }
             DataType::Utf8 => {
-                let vals = masked_decode_byte_array(&file, rg, col_idx, &bitmap)?;
+                let vals = masked_decode_byte_array(&*file, rg, col_idx, &bitmap)?;
                 check_len(vals.len(), matches, field.name(), "Utf8")?;
                 let mut sb = arrow_array::builder::StringBuilder::with_capacity(
                     vals.len(),
@@ -3211,7 +3206,7 @@ fn decode_one_rg_filtered_late_mat(
                 // emission so it can be the integration target when
                 // pushdown is re-enabled on the streaming-default
                 // reader (which reports Utf8View in its schema).
-                let vals = masked_decode_byte_array(&file, rg, col_idx, &bitmap)?;
+                let vals = masked_decode_byte_array(&*file, rg, col_idx, &bitmap)?;
                 check_len(vals.len(), matches, field.name(), "Utf8View")?;
                 let total_bytes: usize = vals.iter().map(|v| v.len()).sum();
                 let mut sb = arrow_array::builder::StringViewBuilder::with_capacity(vals.len())
