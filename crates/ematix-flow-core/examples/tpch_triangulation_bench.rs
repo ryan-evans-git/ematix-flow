@@ -1444,7 +1444,7 @@ async fn build_ematix_ctx(
         .unwrap_or(false);
     if force_collect_left_enabled {
         builder = builder
-            .with_physical_optimizer_rule(Arc::new(ForceCollectLeftForSemiBoundedBuildRule));
+            .with_physical_optimizer_rule(Arc::new(ForceCollectLeftForSemiBoundedBuildRule::default()));
     }
     // Σ.Q.L10: logical-plan rewrite — push LeftSemi past Inner joins
     // down to its target table. Closes the Q18-shape structural gap

@@ -147,7 +147,7 @@ pub fn with_optimizer_rules_and_registry(
         // RightSemi. Was opt-in (EMAT_FORCE_COLLECT_LEFT); now default-on
         // to match the settled decision + ship the banked win.
         .with_physical_optimizer_rule(Arc::new(
-            crate::force_collect_left_semi_build_rule::ForceCollectLeftForSemiBoundedBuildRule,
+            crate::force_collect_left_semi_build_rule::ForceCollectLeftForSemiBoundedBuildRule::default(),
         ))
         // Σ.V (2026-05-26): align preset with the bench's milestone
         // config. The bench has these three rules default-on but

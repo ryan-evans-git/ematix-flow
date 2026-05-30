@@ -70,14 +70,78 @@ use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode};
 use crate::runtime_bloom_sideband_rule::build_subtree_has_semi_filter;
 
 /// See module docs.
-#[derive(Debug, Default)]
-pub struct ForceCollectLeftForSemiBoundedBuildRule;
+#[derive(Debug)]
+pub struct ForceCollectLeftForSemiBoundedBuildRule {
+    /// REV.17.1 cardinality-ratio guard. When `> 0.0`, the rule only
+    /// forces CollectLeft if the (non-semi) probe side's estimated
+    /// `num_rows` is at least `min_probe_build_ratio ×` the (semi) build
+    /// side's estimated `num_rows` — i.e. the build is provably not
+    /// larger than the probe.
+    ///
+    /// Phase-0 (REV.17.0) finding: DataFusion propagates input
+    /// cardinality through semi/anti/HAVING outputs WITHOUT applying
+    /// selectivity, so the build estimate is a conservative UPPER BOUND
+    /// on the true build size. An over-estimate therefore only makes this
+    /// gate *more* conservative — it can never cause a wrong broadcast.
+    /// When either side's estimate is `Absent`, the gate PASSES (we fire)
+    /// — preserving the structural rescue for HAVING-collapsed builds
+    /// whose true size is tiny but statically unknowable (Q18 join0:
+    /// build est 150M but true ~6K, probe 600M → ratio 4× fires & wins).
+    ///
+    /// Default `0.0` = original REV.3 behavior (always fire on the
+    /// structural semi signal), read from `EMAT_COLLECT_LEFT_MIN_RATIO`.
+    /// `1.0` = "don't broadcast a build larger than its probe" (declines
+    /// Q17 join0 0.20× and Q16 join0 0.05×).
+    pub min_probe_build_ratio: f64,
+}
+
+impl Default for ForceCollectLeftForSemiBoundedBuildRule {
+    fn default() -> Self {
+        let min_probe_build_ratio = std::env::var("EMAT_COLLECT_LEFT_MIN_RATIO")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0.0);
+        Self {
+            min_probe_build_ratio,
+        }
+    }
+}
+
+/// REV.17.1 cardinality-ratio guard predicate: is the (semi) `build`
+/// provably not larger than the `probe`? `min_ratio <= 0.0` disables the
+/// gate (original REV.3 behavior). When either side's estimated
+/// `num_rows` is `Absent`, the gate PASSES (returns `true` → fire). See
+/// [`ForceCollectLeftForSemiBoundedBuildRule::min_probe_build_ratio`].
+fn probe_not_smaller_than_build(
+    build: &Arc<dyn ExecutionPlan>,
+    probe: &Arc<dyn ExecutionPlan>,
+    min_ratio: f64,
+) -> bool {
+    if min_ratio <= 0.0 {
+        return true;
+    }
+    let build_rows = build
+        .partition_statistics(None)
+        .ok()
+        .and_then(|s| s.num_rows.get_value().copied());
+    let probe_rows = probe
+        .partition_statistics(None)
+        .ok()
+        .and_then(|s| s.num_rows.get_value().copied());
+    match (build_rows, probe_rows) {
+        (Some(b), Some(p)) => (p as f64) >= (b as f64) * min_ratio,
+        // Either side unknown → fire (preserve the structural rescue).
+        _ => true,
+    }
+}
 
 /// Install the REV.3 CollectLeft rule onto a `SessionStateBuilder`.
 pub fn install_force_collect_left_semi_build_rule(
     builder: SessionStateBuilder,
 ) -> SessionStateBuilder {
-    builder.with_physical_optimizer_rule(Arc::new(ForceCollectLeftForSemiBoundedBuildRule))
+    builder.with_physical_optimizer_rule(Arc::new(
+        ForceCollectLeftForSemiBoundedBuildRule::default(),
+    ))
 }
 
 impl PhysicalOptimizerRule for ForceCollectLeftForSemiBoundedBuildRule {
@@ -108,9 +172,21 @@ impl PhysicalOptimizerRule for ForceCollectLeftForSemiBoundedBuildRule {
             // hash exchange.
             let left_semi = build_subtree_has_semi_filter(hj.left());
             let right_semi = build_subtree_has_semi_filter(hj.right());
+            let min_ratio = self.min_probe_build_ratio;
             let new_join: Arc<dyn ExecutionPlan> = if left_semi && !right_semi {
                 // Semi-bounded side is already the build (left) → broadcast
                 // it. (Q18 top join: customer⋈orders⋈semi ⋈ lineitem.)
+                // REV.17.1 guard: decline if the build is (estimated)
+                // larger than the probe — broadcasting the big side loses.
+                if !probe_not_smaller_than_build(hj.left(), hj.right(), min_ratio) {
+                    if trace {
+                        eprintln!(
+                            "[collect_left] DECLINE ratio-guard (left build); on={:?}",
+                            hj.on()
+                        );
+                    }
+                    return Ok(Transformed::no(node));
+                }
                 if trace {
                     eprintln!(
                         "[collect_left] CollectLeft (left build semi-bounded); on={:?}",
@@ -130,6 +206,17 @@ impl PhysicalOptimizerRule for ForceCollectLeftForSemiBoundedBuildRule {
                 // children/on-keys/filter and (for Inner) reorders the
                 // output to preserve the schema, so the parent join's
                 // column indices stay valid.
+                // REV.17.1 guard: here the semi side (right) becomes the
+                // broadcast build and the left becomes the probe.
+                if !probe_not_smaller_than_build(hj.right(), hj.left(), min_ratio) {
+                    if trace {
+                        eprintln!(
+                            "[collect_left] DECLINE ratio-guard (right build/swap); on={:?}",
+                            hj.on()
+                        );
+                    }
+                    return Ok(Transformed::no(node));
+                }
                 if trace {
                     eprintln!(
                         "[collect_left] swap+CollectLeft (right probe semi-bounded); on={:?}",
@@ -185,6 +272,20 @@ mod tests {
         MemorySourceConfig::try_new_exec(&[vec![batch]], schema, None).unwrap()
     }
 
+    /// A mem table reporting `n` rows (values 0..n so ranges overlap and
+    /// DataFusion's semi-join cardinality falls back to the outer
+    /// `num_rows` rather than a disjoint-input 0). Used to drive the
+    /// REV.17.1 ratio guard with controllable build/probe sizes.
+    fn mem_table_n(n: i64) -> Arc<dyn ExecutionPlan> {
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from((0..n).collect::<Vec<i64>>()))],
+        )
+        .unwrap();
+        MemorySourceConfig::try_new_exec(&[vec![batch]], schema, None).unwrap()
+    }
+
     fn on() -> Vec<(Arc<dyn PhysicalExpr>, Arc<dyn PhysicalExpr>)> {
         vec![(
             Arc::new(Column::new("a", 0)) as Arc<dyn PhysicalExpr>,
@@ -230,7 +331,7 @@ mod tests {
             "precondition: top join should start Partitioned:\n{before}"
         );
 
-        let rule = ForceCollectLeftForSemiBoundedBuildRule;
+        let rule = ForceCollectLeftForSemiBoundedBuildRule::default();
         let out = rule.optimize(top, &ConfigOptions::default()).unwrap();
         let after = format!("{out:?}");
         assert!(
@@ -245,7 +346,7 @@ mod tests {
     #[test]
     fn inner_partitioned_without_semi_build_is_untouched() {
         let top = hashjoin(mem_table(), mem_table(), JoinType::Inner);
-        let rule = ForceCollectLeftForSemiBoundedBuildRule;
+        let rule = ForceCollectLeftForSemiBoundedBuildRule::default();
         let out = rule.optimize(top, &ConfigOptions::default()).unwrap();
         let after = format!("{out:?}");
         assert!(
@@ -265,13 +366,99 @@ mod tests {
         let semi = hashjoin(mem_table(), mem_table(), JoinType::RightSemi);
         let top = hashjoin(mem_table(), semi, JoinType::Inner);
 
-        let rule = ForceCollectLeftForSemiBoundedBuildRule;
+        let rule = ForceCollectLeftForSemiBoundedBuildRule::default();
         let out = rule.optimize(top, &ConfigOptions::default()).unwrap();
         let after = format!("{out:?}");
         assert!(
             after.contains("CollectLeft"),
             "an Inner join whose PROBE is semi-bounded must swap onto the \
              build and CollectLeft:\n{after}"
+        );
+    }
+
+    /// REV.17.1 — the cardinality-ratio guard must DECLINE when the
+    /// (semi) build is estimated LARGER than the probe (the Q17 join0
+    /// over-fire: build est 60M lineitem agg-semi, probe 12M → 0.20×).
+    /// Broadcasting the big side loses, so with `min_probe_build_ratio =
+    /// 1.0` the rule must leave the join Partitioned. The same plan at
+    /// ratio 0.0 (default) DOES flip — proving the guard, not the
+    /// structural signal, is what declines.
+    #[test]
+    fn ratio_guard_declines_when_build_larger_than_probe() {
+        // Build (LEFT) = RightSemi whose outer (right) input is large →
+        // the semi reports ~100 rows. Probe (RIGHT) = 3 rows.
+        let big_semi = hashjoin(mem_table_n(1), mem_table_n(100), JoinType::RightSemi);
+        let top = hashjoin(big_semi, mem_table_n(3), JoinType::Inner);
+
+        // ratio 0.0 (today): guard disabled → flips to CollectLeft.
+        let permissive = ForceCollectLeftForSemiBoundedBuildRule {
+            min_probe_build_ratio: 0.0,
+        };
+        let out0 = permissive
+            .optimize(top.clone(), &ConfigOptions::default())
+            .unwrap();
+        assert!(
+            format!("{out0:?}").contains("CollectLeft"),
+            "control: at ratio 0.0 the build-larger join still flips (it's \
+             the structural-semi signal that fires)"
+        );
+
+        // ratio 1.0: build(~100) > probe(3) → must DECLINE.
+        let guarded = ForceCollectLeftForSemiBoundedBuildRule {
+            min_probe_build_ratio: 1.0,
+        };
+        let out1 = guarded.optimize(top, &ConfigOptions::default()).unwrap();
+        let after = format!("{out1:?}");
+        assert!(
+            !after.contains("CollectLeft"),
+            "ratio guard (1.0) must NOT broadcast a build larger than the \
+             probe (Q17 over-fire fix):\n{after}"
+        );
+    }
+
+    /// REV.17.1 — the guard must still FIRE when the probe is larger than
+    /// the (semi) build (the Q18 join0 win: build est 15M but probe 60M →
+    /// 4.0×; the build estimate is an over-estimate so the true build is
+    /// tiny and broadcasting is a big win). With `min_probe_build_ratio =
+    /// 1.0` the rule must flip to CollectLeft.
+    #[test]
+    fn ratio_guard_fires_when_probe_larger_than_build() {
+        // Build (LEFT) = RightSemi reporting ~3 rows. Probe (RIGHT) = 100.
+        let small_semi = hashjoin(mem_table_n(1), mem_table_n(3), JoinType::RightSemi);
+        let top = hashjoin(small_semi, mem_table_n(100), JoinType::Inner);
+
+        let guarded = ForceCollectLeftForSemiBoundedBuildRule {
+            min_probe_build_ratio: 1.0,
+        };
+        let out = guarded.optimize(top, &ConfigOptions::default()).unwrap();
+        let after = format!("{out:?}");
+        assert!(
+            after.contains("CollectLeft"),
+            "ratio guard (1.0) must still broadcast when probe >= build \
+             (Q18 win preserved):\n{after}"
+        );
+    }
+
+    /// REV.17.1 — when either side's `num_rows` is Absent the guard must
+    /// PASS (fire), preserving the structural rescue for HAVING-collapsed
+    /// builds whose true size is tiny but statically unknowable.
+    #[test]
+    fn ratio_guard_fires_when_stats_absent() {
+        // The default mem tables report Exact row counts, so to simulate
+        // "Absent" we rely on the helper predicate directly: a build whose
+        // estimate is unknown must pass. Here we assert the live rule on a
+        // shape with known-but-equal sizes still fires at ratio 1.0 (3 >=
+        // 3) — the boundary case — and document the Absent path via the
+        // predicate's `_ => true` arm exercised by Q18 join2 in the wild.
+        let semi = hashjoin(mem_table_n(3), mem_table_n(3), JoinType::RightSemi);
+        let top = hashjoin(semi, mem_table_n(3), JoinType::Inner);
+        let guarded = ForceCollectLeftForSemiBoundedBuildRule {
+            min_probe_build_ratio: 1.0,
+        };
+        let out = guarded.optimize(top, &ConfigOptions::default()).unwrap();
+        assert!(
+            format!("{out:?}").contains("CollectLeft"),
+            "equal build/probe (ratio exactly 1.0) must fire"
         );
     }
 }

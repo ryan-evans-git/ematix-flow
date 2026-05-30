@@ -75,7 +75,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // (which produces the RightSemi that build_subtree_has_semi_filter
         // detects) and after the built-in JoinSelection/EnforceDistribution.
         builder = builder
-            .with_physical_optimizer_rule(Arc::new(ForceCollectLeftForSemiBoundedBuildRule));
+            .with_physical_optimizer_rule(Arc::new(ForceCollectLeftForSemiBoundedBuildRule::default()));
     }
     let state = builder.build();
 
