@@ -252,6 +252,10 @@ pub mod robin_hood_agg_rule;
 // Sibling to robin_hood_agg's COUNT(*) variant; targets Q18 SF=10's
 // FinalPartitioned sum(l_quantity) GROUP BY l_orderkey at 15M card.
 pub mod robin_hood_sum_f64_exec;
+// REV.8 (2026-05-30): single-pass radix-partitioned SUM(f64) GROUP BY i64.
+// Replaces the two-phase Partial→Repartition→Final for high-card near-
+// unique keys (Q18 SF=100 subquery). Opt-in; gate measured 1.71×.
+pub mod single_pass_radix_sum_exec;
 // Σ.R.2 (2026-05-24): AVG(f64) GROUP BY i64 operator + opt-in rule.
 // Sister to robin_hood_sum_f64_exec; targets Q17 SF=10's
 // FinalPartitioned avg(l_quantity) GROUP BY l_partkey at ~2M card

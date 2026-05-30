@@ -1479,8 +1479,22 @@ async fn build_ematix_ctx(
         .ok()
         .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
         .unwrap_or(true);
-    if rh_sum_f64_enabled {
-        builder = builder.with_physical_optimizer_rule(Arc::new(EnableRobinHoodSumF64Rule));
+    // REV.8: single-pass radix agg replaces the WHOLE Partial→Repartition→
+    // Final for high-card SUM(f64) GROUP BY i64 (Q18 SF=100 subquery, ~150M
+    // groups). Gate measured 1.71× vs the two-phase. It must match an
+    // AggregateExec(Partial), so it is mutually exclusive with the
+    // RobinHood-sum rewrite (which would replace the Partial first) — when
+    // EMAT_SINGLE_PASS_RADIX=1 it pre-empts rh_sum. Opt-in for A/B.
+    let single_pass_radix_enabled = std::env::var("EMAT_SINGLE_PASS_RADIX")
+        .ok()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if single_pass_radix_enabled {
+        builder = builder.with_physical_optimizer_rule(Arc::new(
+            ematix_flow_core::single_pass_radix_sum_exec::EnableSinglePassRadixSumRule::default(),
+        ));
+    } else if rh_sum_f64_enabled {
+        builder = builder.with_physical_optimizer_rule(Arc::new(EnableRobinHoodSumF64Rule::default()));
     }
     // Σ.AN.1 (2026-05-28): per-operator partition routing for
     // high-cardinality FinalPartitioned aggregates. Opt-in via

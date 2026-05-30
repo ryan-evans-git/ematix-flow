@@ -1698,6 +1698,17 @@ impl RobinHoodSumF64GlobalRadixAgg {
         self.spill.as_ref().map_or(0, |s| s.spilled_rows.iter().sum())
     }
 
+    /// REV.8 — consume the aggregator and return its per-bin micro-tables
+    /// (one per radix bin). Must be called after [`Self::finish`]. The
+    /// single-pass-radix operator uses this to merge bin `b` across input
+    /// partitions: because the bin = `hash(key) >> shift` is identical in
+    /// every partition's aggregator, bin `b` holds the same key space
+    /// everywhere, so a per-bin cross-partition merge is complete.
+    pub fn into_tables(self) -> Vec<RobinHoodI64F64> {
+        debug_assert!(self.finished, "into_tables called before finish()");
+        self.tables
+    }
+
     /// Radix-partition a batch into the per-bin append buffers via a single
     /// fused tag+scatter pass (one hash per key — REV.6: no double-hash).
     /// Triggers the over-budget action if the buffered rows cross the cap.
