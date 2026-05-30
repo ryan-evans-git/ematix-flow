@@ -136,6 +136,19 @@ pub fn with_optimizer_rules_and_registry(
         .with_physical_optimizer_rule(Arc::new(
             crate::swap_semi_join_build_rule::SwapSemiJoinBuildSideRule,
         ))
+        // ForceCollectLeftForSemiBoundedBuildRule (REV.3): forces
+        // PartitionMode::CollectLeft on Inner joins whose build side is
+        // semi-bounded (shrunk by a pushed LeftSemi/RightSemi), then
+        // re-runs EnforceDistribution to drop the now-unnecessary
+        // probe-side repartition (the Σ.BS "repair partitioning after a
+        // structural rewrite" pattern). Q18 SF=100: 6652 -> 398 ms
+        // (16.7x), value-validated — all 22 queries PASS vs DuckDB at
+        // SF=100 with this on. Runs right after SwapSemi so it sees the
+        // RightSemi. Was opt-in (EMAT_FORCE_COLLECT_LEFT); now default-on
+        // to match the settled decision + ship the banked win.
+        .with_physical_optimizer_rule(Arc::new(
+            crate::force_collect_left_semi_build_rule::ForceCollectLeftForSemiBoundedBuildRule,
+        ))
         // Σ.V (2026-05-26): align preset with the bench's milestone
         // config. The bench has these three rules default-on but
         // preset.rs was missing them — library users got materially
