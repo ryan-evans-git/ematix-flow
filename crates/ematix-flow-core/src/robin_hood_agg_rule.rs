@@ -42,6 +42,7 @@ use std::sync::Arc;
 use datafusion::arrow::datatypes::DataType;
 use datafusion::common::Result as DfResult;
 use datafusion::common::config::ConfigOptions;
+use datafusion::common::stats::Precision;
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::physical_expr::expressions::Column;
@@ -63,12 +64,36 @@ use crate::robin_hood_agg::{RobinHoodAggregateExec, RobinHoodMode};
 /// let ctx = SessionContext::new_with_state(state.build());
 /// ```
 pub fn install_robin_hood_rule(builder: SessionStateBuilder) -> SessionStateBuilder {
-    builder.with_physical_optimizer_rule(Arc::new(EnableRobinHoodAggregateRule))
+    builder.with_physical_optimizer_rule(Arc::new(EnableRobinHoodAggregateRule::default()))
 }
 
 /// Σ.N.d rule.
-#[derive(Debug, Default)]
-pub struct EnableRobinHoodAggregateRule;
+///
+/// REV.11 (2026-05-30): cardinality-gated, mirroring REV.10 on the sum
+/// sibling ([`crate::robin_hood_sum_f64_exec::EnableRobinHoodSumF64Rule`]).
+/// The single-table RobinHood COUNT agg WINS at low/mid cardinality
+/// (1.16-1.54× vs hashbrown, [[sigma-nf3-beats-stock]]) but THRASHES once
+/// groups vastly exceed the largest pre-sized table (`MAX_INIT_CAP` = 32M)
+/// — the same failure mode that made Q18 SF=100's 150M-group SUM subquery
+/// 12× slower under RobinHood. This rule is opt-in (not in the default
+/// chain), so the bug never bit production, but the gate makes it safe for
+/// anyone who installs it. The rule refuses the rewrite when estimated
+/// groups exceed `max_groups`.
+#[derive(Debug)]
+pub struct EnableRobinHoodAggregateRule {
+    pub max_groups: usize,
+}
+
+impl Default for EnableRobinHoodAggregateRule {
+    fn default() -> Self {
+        // Default = MAX_INIT_CAP (32M); env-overridable for A/B + tuning.
+        let max_groups = std::env::var("EMAT_RH_COUNT_MAX_GROUPS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(32 * 1024 * 1024);
+        Self { max_groups }
+    }
+}
 
 impl PhysicalOptimizerRule for EnableRobinHoodAggregateRule {
     fn optimize(
@@ -76,6 +101,7 @@ impl PhysicalOptimizerRule for EnableRobinHoodAggregateRule {
         plan: Arc<dyn ExecutionPlan>,
         _config: &ConfigOptions,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
+        let max_groups = self.max_groups;
         // Σ.N.e — per-node rewrite. Walks bottom-up, so Partial
         // matches FIRST and is replaced before Final sees its input.
         // Final's matcher then verifies the input chain leads to a
@@ -90,15 +116,32 @@ impl PhysicalOptimizerRule for EnableRobinHoodAggregateRule {
                         let real = partial.input().clone();
                         // Input column type guard.
                         if real.schema().field(col_idx).data_type() == &DataType::Int64 {
-                            let new = RobinHoodAggregateExec::try_new_full(
-                                real,
-                                col_idx,
-                                None,
-                                RobinHoodMode::Partial,
-                                group_out_name,
-                                count_out_name,
-                            )?;
-                            return Ok(Transformed::yes(Arc::new(new) as Arc<dyn ExecutionPlan>));
+                            // REV.11 cardinality gate (mirrors REV.10 on the
+                            // sum sibling). Estimate groups from input rows
+                            // (~4 rows/group, matching the operator's init_cap
+                            // heuristic). If groups would blow past the largest
+                            // pre-sized table, the single-table RobinHood agg
+                            // thrashes — leave it to DataFusion's stock agg.
+                            let est_groups = match real.partition_statistics(None) {
+                                Ok(s) => match s.num_rows {
+                                    Precision::Exact(n) | Precision::Inexact(n) => n / 4,
+                                    _ => 0,
+                                },
+                                Err(_) => 0,
+                            };
+                            if est_groups <= max_groups {
+                                let new = RobinHoodAggregateExec::try_new_full(
+                                    real,
+                                    col_idx,
+                                    None,
+                                    RobinHoodMode::Partial,
+                                    group_out_name,
+                                    count_out_name,
+                                )?;
+                                return Ok(Transformed::yes(
+                                    Arc::new(new) as Arc<dyn ExecutionPlan>
+                                ));
+                            }
                         }
                     }
                 }
@@ -409,6 +452,61 @@ mod tests {
         assert!(
             !s.contains("RobinHoodAggregateExec"),
             "rule fired on multi-agg — that's wrong. Got:\n{s}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rule_gated_off_at_high_cardinality() {
+        // REV.11: with max_groups=0, any non-empty input counts as "high
+        // card", so the rule must REFUSE the rewrite — DataFusion's stock
+        // vectorised agg handles very high cardinality far better (Q18
+        // SF=100's 150M-group sibling agg was 12× slower under RobinHood).
+        // Mirrors the default 32M gate that leaves Q18's 150M-group agg to
+        // stock.
+        let cfg = datafusion::prelude::SessionConfig::new().with_target_partitions(4);
+        let state = SessionStateBuilder::new()
+            .with_default_features()
+            .with_config(cfg)
+            .with_physical_optimizer_rule(Arc::new(EnableRobinHoodAggregateRule {
+                max_groups: 0,
+            }))
+            .build();
+        let ctx = SessionContext::new_with_state(state);
+        register_int64_t(&ctx);
+        let df = ctx
+            .sql("SELECT k, COUNT(*) FROM t GROUP BY k")
+            .await
+            .unwrap();
+        let plan = df.create_physical_plan().await.unwrap();
+        let s = format!("{plan:?}");
+        assert!(
+            !s.contains("RobinHoodAggregateExec"),
+            "rule fired despite max_groups=0 high-card gate — Got:\n{s}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rule_fires_under_generous_gate() {
+        // With a generous gate (12-row test table ≪ cap), the rule fires.
+        let cfg = datafusion::prelude::SessionConfig::new().with_target_partitions(4);
+        let state = SessionStateBuilder::new()
+            .with_default_features()
+            .with_config(cfg)
+            .with_physical_optimizer_rule(Arc::new(EnableRobinHoodAggregateRule {
+                max_groups: 1_000_000,
+            }))
+            .build();
+        let ctx = SessionContext::new_with_state(state);
+        register_int64_t(&ctx);
+        let df = ctx
+            .sql("SELECT k, COUNT(*) FROM t GROUP BY k")
+            .await
+            .unwrap();
+        let plan = df.create_physical_plan().await.unwrap();
+        let s = format!("{plan:?}");
+        assert!(
+            s.contains("RobinHoodAggregateExec"),
+            "rule didn't fire under a generous gate — Got:\n{s}"
         );
     }
 }

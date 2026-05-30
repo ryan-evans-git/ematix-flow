@@ -408,11 +408,35 @@ impl ExecutionPlan for RobinHoodAvgF64Exec {
 // ---------------------------------------------------------------------
 
 pub fn install_robin_hood_avg_f64_rule(builder: SessionStateBuilder) -> SessionStateBuilder {
-    builder.with_physical_optimizer_rule(Arc::new(EnableRobinHoodAvgF64Rule))
+    builder.with_physical_optimizer_rule(Arc::new(EnableRobinHoodAvgF64Rule::default()))
 }
 
-#[derive(Debug, Default)]
-pub struct EnableRobinHoodAvgF64Rule;
+/// Σ.R.2 rule.
+///
+/// REV.11 (2026-05-30): cardinality-gated, mirroring REV.10 on the sum
+/// sibling ([`crate::robin_hood_sum_f64_exec::EnableRobinHoodSumF64Rule`]).
+/// The single-table RobinHood AVG agg wins at low/mid cardinality but
+/// THRASHES once groups vastly exceed the largest pre-sized table
+/// (`MAX_INIT_CAP` = 32M) — the failure mode that made Q18 SF=100's
+/// 150M-group SUM subquery 12× slower under RobinHood. Opt-in (not in the
+/// default chain), so the bug never bit production, but the gate makes it
+/// safe for anyone who installs it. Refuses the rewrite when estimated
+/// groups exceed `max_groups`.
+#[derive(Debug)]
+pub struct EnableRobinHoodAvgF64Rule {
+    pub max_groups: usize,
+}
+
+impl Default for EnableRobinHoodAvgF64Rule {
+    fn default() -> Self {
+        // Default = MAX_INIT_CAP (32M); env-overridable for A/B + tuning.
+        let max_groups = std::env::var("EMAT_RH_AVG_F64_MAX_GROUPS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(32 * 1024 * 1024);
+        Self { max_groups }
+    }
+}
 
 impl PhysicalOptimizerRule for EnableRobinHoodAvgF64Rule {
     fn optimize(
@@ -420,6 +444,7 @@ impl PhysicalOptimizerRule for EnableRobinHoodAvgF64Rule {
         plan: Arc<dyn ExecutionPlan>,
         _config: &ConfigOptions,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
+        let max_groups = self.max_groups;
         let result = plan.transform_up(|node| {
             if let Some(agg) = node.as_any().downcast_ref::<AggregateExec>() {
                 if matches!(agg.mode(), AggregateMode::Partial) {
@@ -429,15 +454,32 @@ impl PhysicalOptimizerRule for EnableRobinHoodAvgF64Rule {
                         if in_schema.field(m.group_col_idx).data_type() == &DataType::Int64
                             && in_schema.field(m.value_col_idx).data_type() == &DataType::Float64
                         {
-                            let new = RobinHoodAvgF64Exec::try_new(
-                                input,
-                                m.group_col_idx,
-                                m.value_col_idx,
-                                RobinHoodAvgF64Mode::Partial,
-                                m.group_out_name,
-                                m.avg_out_name,
-                            )?;
-                            return Ok(Transformed::yes(Arc::new(new) as Arc<dyn ExecutionPlan>));
+                            // REV.11 cardinality gate (mirrors REV.10 on the
+                            // sum sibling). Estimate groups from input rows
+                            // (~4 rows/group, matching init_cap). If groups
+                            // would blow past the largest pre-sized table, the
+                            // single-table RobinHood agg thrashes — leave it to
+                            // DataFusion's stock vectorised agg.
+                            let est_groups = match input.partition_statistics(None) {
+                                Ok(s) => match s.num_rows {
+                                    Precision::Exact(n) | Precision::Inexact(n) => n / 4,
+                                    _ => 0,
+                                },
+                                Err(_) => 0,
+                            };
+                            if est_groups <= max_groups {
+                                let new = RobinHoodAvgF64Exec::try_new(
+                                    input,
+                                    m.group_col_idx,
+                                    m.value_col_idx,
+                                    RobinHoodAvgF64Mode::Partial,
+                                    m.group_out_name,
+                                    m.avg_out_name,
+                                )?;
+                                return Ok(Transformed::yes(
+                                    Arc::new(new) as Arc<dyn ExecutionPlan>
+                                ));
+                            }
                         }
                     }
                 }
@@ -803,5 +845,50 @@ mod tests {
             }
         }
         assert_eq!(found, n_groups as usize);
+    }
+
+    #[tokio::test]
+    async fn rule_gated_off_at_high_cardinality() {
+        // REV.11: with max_groups=0, any non-empty input counts as "high
+        // card", so the rule must REFUSE — DataFusion's stock vectorised
+        // agg handles very high cardinality far better (Q18 SF=100's
+        // 150M-group sibling agg was 12× slower under RobinHood).
+        let cfg = SessionConfig::new().with_target_partitions(4);
+        let state = SessionStateBuilder::new()
+            .with_default_features()
+            .with_config(cfg)
+            .with_physical_optimizer_rule(Arc::new(EnableRobinHoodAvgF64Rule { max_groups: 0 }))
+            .build();
+        let ctx = SessionContext::new_with_state(state);
+        register_q17_shape_table(&ctx, "t");
+        let df = ctx.sql("SELECT k, AVG(v) FROM t GROUP BY k").await.unwrap();
+        let plan = df.create_physical_plan().await.unwrap();
+        let s = format!("{plan:?}");
+        assert!(
+            !s.contains("RobinHoodAvgF64Exec"),
+            "rule fired despite max_groups=0 high-card gate — Got:\n{s}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rule_fires_under_generous_gate() {
+        // With a generous gate (16-row test table ≪ cap), the rule fires.
+        let cfg = SessionConfig::new().with_target_partitions(4);
+        let state = SessionStateBuilder::new()
+            .with_default_features()
+            .with_config(cfg)
+            .with_physical_optimizer_rule(Arc::new(EnableRobinHoodAvgF64Rule {
+                max_groups: 1_000_000,
+            }))
+            .build();
+        let ctx = SessionContext::new_with_state(state);
+        register_q17_shape_table(&ctx, "t");
+        let df = ctx.sql("SELECT k, AVG(v) FROM t GROUP BY k").await.unwrap();
+        let plan = df.create_physical_plan().await.unwrap();
+        let s = format!("{plan:?}");
+        assert!(
+            s.contains("RobinHoodAvgF64Exec"),
+            "rule didn't fire under a generous gate — Got:\n{s}"
+        );
     }
 }
