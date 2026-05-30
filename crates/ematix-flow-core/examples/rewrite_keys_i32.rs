@@ -23,12 +23,15 @@ async fn main() -> datafusion::error::Result<()> {
     let out = env::var("OUT_DIR").expect("OUT_DIR");
     std::fs::create_dir_all(&out).expect("create OUT_DIR");
 
-    // Q18's keys: c_custkey, o_orderkey, o_custkey, l_orderkey. (DuckDB
-    // compresses exactly these.)
+    // REV.13 measure-first: Q18 keys (c_custkey, o_orderkey, o_custkey,
+    // l_orderkey) + Q17 keys (l_partkey, p_partkey). All fit i32 at SF=100
+    // (orderkey ~600M, partkey/custkey ≤20M). DuckDB compresses exactly
+    // these. lineitem carries BOTH l_orderkey and l_partkey.
     let tables: Vec<(&str, Vec<&str>)> = vec![
         ("customer", vec!["c_custkey"]),
         ("orders", vec!["o_orderkey", "o_custkey"]),
-        ("lineitem", vec!["l_orderkey"]),
+        ("lineitem", vec!["l_orderkey", "l_partkey"]),
+        ("part", vec!["p_partkey"]),
     ];
 
     let ctx = SessionContext::new();

@@ -378,7 +378,7 @@ async fn run_ematix(
             ematix_flow_core::force_collect_left_semi_build_rule::ForceCollectLeftForSemiBoundedBuildRule,
         ));
     }
-    builder = builder.with_physical_optimizer_rule(Arc::new(EnableRobinHoodSumF64Rule));
+    builder = builder.with_physical_optimizer_rule(Arc::new(EnableRobinHoodSumF64Rule::default()));
     // Σ.Q.L15: Inner-L9 + tight ratio + all-Emat. **Default ON at
     // milestone config**; set `L15=0` to revert to pre-L15.
     let l15 = std::env::var("L15")

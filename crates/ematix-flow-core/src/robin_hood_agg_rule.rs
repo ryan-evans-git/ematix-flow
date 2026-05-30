@@ -60,7 +60,7 @@ use crate::robin_hood_agg::{RobinHoodAggregateExec, RobinHoodMode};
 /// ```ignore
 /// let state = SessionStateBuilder::new()
 ///     .with_default_features()
-///     .with_physical_optimizer_rule(Arc::new(EnableRobinHoodAggregateRule));
+///     .with_physical_optimizer_rule(Arc::new(EnableRobinHoodAggregateRule::default()));
 /// let ctx = SessionContext::new_with_state(state.build());
 /// ```
 pub fn install_robin_hood_rule(builder: SessionStateBuilder) -> SessionStateBuilder {
