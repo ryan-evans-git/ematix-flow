@@ -326,11 +326,32 @@ impl ExecutionPlan for RobinHoodSumF64Exec {
 // ---------------------------------------------------------------------
 
 pub fn install_robin_hood_sum_f64_rule(builder: SessionStateBuilder) -> SessionStateBuilder {
-    builder.with_physical_optimizer_rule(Arc::new(EnableRobinHoodSumF64Rule))
+    builder.with_physical_optimizer_rule(Arc::new(EnableRobinHoodSumF64Rule::default()))
 }
 
-#[derive(Debug, Default)]
-pub struct EnableRobinHoodSumF64Rule;
+/// REV.10 (2026-05-30): cardinality-gated. The single-table RobinHood agg
+/// WINS at low/mid cardinality (1-5% over stock at 10K-2M groups,
+/// [[sigma-nf3-beats-stock]]) but THRASHES catastrophically once groups
+/// vastly exceed the largest pre-sized table (`MAX_INIT_CAP` = 32M):
+/// Q18 SF=100's 150M-group `SUM(l_quantity) GROUP BY l_orderkey` subquery
+/// ran **12× SLOWER** than DataFusion's stock vectorised two-phase
+/// (7963 ms vs 646 ms). The rule now refuses the rewrite when estimated
+/// groups exceed `max_groups`, leaving very-high-card aggs to stock.
+#[derive(Debug)]
+pub struct EnableRobinHoodSumF64Rule {
+    pub max_groups: usize,
+}
+
+impl Default for EnableRobinHoodSumF64Rule {
+    fn default() -> Self {
+        // Default = MAX_INIT_CAP (32M); env-overridable for A/B + tuning.
+        let max_groups = std::env::var("EMAT_RH_SUM_F64_MAX_GROUPS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(32 * 1024 * 1024);
+        Self { max_groups }
+    }
+}
 
 impl PhysicalOptimizerRule for EnableRobinHoodSumF64Rule {
     fn optimize(
@@ -338,6 +359,7 @@ impl PhysicalOptimizerRule for EnableRobinHoodSumF64Rule {
         plan: Arc<dyn ExecutionPlan>,
         _config: &ConfigOptions,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
+        let max_groups = self.max_groups;
         let result = plan.transform_up(|node| {
             if let Some(agg) = node.as_any().downcast_ref::<AggregateExec>() {
                 if matches!(agg.mode(), AggregateMode::Partial) {
@@ -347,15 +369,32 @@ impl PhysicalOptimizerRule for EnableRobinHoodSumF64Rule {
                         if in_schema.field(m.group_col_idx).data_type() == &DataType::Int64
                             && in_schema.field(m.value_col_idx).data_type() == &DataType::Float64
                         {
-                            let new = RobinHoodSumF64Exec::try_new(
-                                input,
-                                m.group_col_idx,
-                                m.value_col_idx,
-                                RobinHoodSumF64Mode::Partial,
-                                m.group_out_name,
-                                m.sum_out_name,
-                            )?;
-                            return Ok(Transformed::yes(Arc::new(new) as Arc<dyn ExecutionPlan>));
+                            // REV.10 cardinality gate. Estimate groups from
+                            // input rows (Partial sees raw rows; ~4 rows/group
+                            // for the Q18-shape SUM agg, mirroring the
+                            // init_cap heuristic). If groups would blow past
+                            // the largest pre-sized table, the single-table
+                            // RobinHood agg thrashes — leave it to stock.
+                            let est_groups = match input.partition_statistics(None) {
+                                Ok(s) => match s.num_rows {
+                                    Precision::Exact(n) | Precision::Inexact(n) => n / 4,
+                                    _ => 0,
+                                },
+                                Err(_) => 0,
+                            };
+                            if est_groups <= max_groups {
+                                let new = RobinHoodSumF64Exec::try_new(
+                                    input,
+                                    m.group_col_idx,
+                                    m.value_col_idx,
+                                    RobinHoodSumF64Mode::Partial,
+                                    m.group_out_name,
+                                    m.sum_out_name,
+                                )?;
+                                return Ok(Transformed::yes(
+                                    Arc::new(new) as Arc<dyn ExecutionPlan>
+                                ));
+                            }
                         }
                     }
                 }
@@ -613,6 +652,52 @@ mod tests {
         assert!(
             !s.contains("RobinHoodSumF64Exec"),
             "rule fired on multi-agg — that's wrong. Got:\n{s}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rule_gated_off_at_high_cardinality() {
+        // REV.10: with max_groups=0, any non-empty input is "high card",
+        // so the rule must REFUSE the rewrite (stock vectorised agg handles
+        // very high cardinality far better — Q18 SF=100's 150M-group
+        // subquery was 12× slower under RobinHood). Mirrors the default
+        // 32M gate that leaves Q18's 150M-group agg to stock.
+        let cfg = SessionConfig::new().with_target_partitions(4);
+        let state = SessionStateBuilder::new()
+            .with_default_features()
+            .with_config(cfg)
+            .with_physical_optimizer_rule(Arc::new(EnableRobinHoodSumF64Rule { max_groups: 0 }))
+            .build();
+        let ctx = SessionContext::new_with_state(state);
+        register_q18_shape_table(&ctx, "t");
+        let df = ctx.sql("SELECT k, SUM(v) FROM t GROUP BY k").await.unwrap();
+        let plan = df.create_physical_plan().await.unwrap();
+        let s = format!("{plan:?}");
+        assert!(
+            !s.contains("RobinHoodSumF64Exec"),
+            "rule fired despite max_groups=0 high-card gate — Got:\n{s}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rule_fires_under_generous_gate() {
+        // With a generous gate (16-row test table ≪ cap), the rule fires.
+        let cfg = SessionConfig::new().with_target_partitions(4);
+        let state = SessionStateBuilder::new()
+            .with_default_features()
+            .with_config(cfg)
+            .with_physical_optimizer_rule(Arc::new(EnableRobinHoodSumF64Rule {
+                max_groups: 1_000_000,
+            }))
+            .build();
+        let ctx = SessionContext::new_with_state(state);
+        register_q18_shape_table(&ctx, "t");
+        let df = ctx.sql("SELECT k, SUM(v) FROM t GROUP BY k").await.unwrap();
+        let plan = df.create_physical_plan().await.unwrap();
+        let s = format!("{plan:?}");
+        assert!(
+            s.contains("RobinHoodSumF64Exec"),
+            "rule didn't fire under a generous gate — Got:\n{s}"
         );
     }
 }

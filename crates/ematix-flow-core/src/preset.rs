@@ -153,7 +153,7 @@ pub fn with_optimizer_rules_and_registry(
         // SUM(Float64)/COUNT GROUP BY Int64 through
         // RobinHoodSumF64Exec which beats DataFusion's stock
         // vectorised AggregateExec by 1-5% (memory: project_sigma_nf3_beats_stock).
-        .with_physical_optimizer_rule(Arc::new(EnableRobinHoodSumF64Rule))
+        .with_physical_optimizer_rule(Arc::new(EnableRobinHoodSumF64Rule::default()))
         // EnableRuntimeBloomSidebandRule (Σ.Q.L9 / Σ.Q.L15):
         // threads a runtime bloom sideband between HashJoinExec
         // build and probe-side EmatixFastParquetExec. The
