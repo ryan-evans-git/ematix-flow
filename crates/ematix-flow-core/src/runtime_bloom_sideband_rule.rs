@@ -573,8 +573,9 @@ fn build_subtree_has_filter(plan: &Arc<dyn ExecutionPlan>) -> bool {
     plan.children().iter().any(|c| build_subtree_has_filter(c))
 }
 
-/// Σ.AM.1 (2026-05-27) — returns true iff the build subtree contains
-/// a `HashJoinExec` whose join_type is `LeftSemi` or `LeftAnti`.
+/// Σ.AM.1 (2026-05-27), extended REV.2 (2026-05-30) — returns true
+/// iff the build subtree contains a `HashJoinExec` whose join_type is
+/// any semi/anti variant (`LeftSemi`/`LeftAnti`/`RightSemi`/`RightAnti`).
 ///
 /// Such a join intrinsically filters its LEFT input by membership in
 /// the RIGHT input. The build-side output cardinality is therefore
@@ -587,10 +588,21 @@ fn build_subtree_has_filter(plan: &Arc<dyn ExecutionPlan>) -> bool {
 /// at runtime, but the estimator says ~1.5M. Without this gate, L9's
 /// default `allow_inner_join=false` skips the join entirely. With
 /// this gate, we recognize the semi-filtered build and allow L9 fire.
-fn build_subtree_has_semi_filter(plan: &Arc<dyn ExecutionPlan>) -> bool {
+pub(crate) fn build_subtree_has_semi_filter(plan: &Arc<dyn ExecutionPlan>) -> bool {
     use datafusion::common::JoinType;
     if let Some(hj) = plan.as_any().downcast_ref::<HashJoinExec>() {
-        if matches!(hj.join_type(), JoinType::LeftSemi | JoinType::LeftAnti) {
+        // REV.2 (2026-05-30): match all four semi/anti variants, not
+        // just Left*. `SwapSemiJoinBuildSideRule` flips Q18's semi to
+        // `RightSemi` (so the ~624-key agg-bounded side becomes the
+        // build), and that `RightSemi` sits inside the top Inner join's
+        // build subtree. Matching only `LeftSemi`/`LeftAnti` made the
+        // `EMAT_L9_INNER_WITH_SEMI` path a silent no-op on Q18 (verified
+        // via `EMAT_L9_TRACE=1`). Symmetric with the swap rule, which
+        // already handles all four variants.
+        if matches!(
+            hj.join_type(),
+            JoinType::LeftSemi | JoinType::LeftAnti | JoinType::RightSemi | JoinType::RightAnti
+        ) {
             return true;
         }
     }
@@ -1120,6 +1132,93 @@ mod tests {
             build_subtree_has_semi_filter(&semi_arc),
             has_left_semi_in_dump,
             "helper output must match presence of LeftSemi/LeftAnti in plan dump"
+        );
+    }
+
+    /// REV.2 (2026-05-30) — `build_subtree_has_semi_filter` must also
+    /// detect `RightSemi` / `RightAnti`, not just the Left* variants.
+    ///
+    /// Q18's selective IN-subquery semi-join, after
+    /// `SwapSemiJoinBuildSideRule` flips it (LeftSemi → RightSemi so the
+    /// 624-key agg becomes the build side), lands as a `RightSemi`
+    /// nested inside the TOP Inner join's build subtree. The detector
+    /// previously matched only `LeftSemi | LeftAnti`, so the Σ.AM.1
+    /// `EMAT_L9_INNER_WITH_SEMI` path silently no-op'd on Q18: the top
+    /// Inner join was skipped at the `allow_inner_join` gate and its
+    /// 60M-row lineitem probe was never bloom-pruned before the hash
+    /// repartition. (Confirmed via `EMAT_L9_TRACE=1`: combo B printed
+    /// `skip Inner — no LeftSemi/LeftAnti in build` despite the
+    /// RightSemi being present.) This is the load-bearing gap behind
+    /// the Q18 SF=100 2.53× loss vs DuckDB.
+    #[test]
+    fn helper_detects_right_semi_in_build_subtree() {
+        use datafusion::arrow::array::{Int64Array, RecordBatch};
+        use datafusion::arrow::datatypes::{Field, Schema};
+        use datafusion::common::{JoinType, NullEquality};
+        use datafusion::datasource::memory::MemorySourceConfig;
+        use datafusion::physical_expr::PhysicalExpr;
+        use datafusion::physical_plan::joins::PartitionMode;
+
+        fn mem_table(name: &str) -> Arc<dyn ExecutionPlan> {
+            let schema = Arc::new(Schema::new(vec![Field::new(name, DataType::Int64, false)]));
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int64Array::from(vec![1i64, 2, 3]))],
+            )
+            .unwrap();
+            MemorySourceConfig::try_new_exec(&[vec![batch]], schema, None).unwrap()
+        }
+
+        let on = vec![(
+            Arc::new(Column::new("a", 0)) as Arc<dyn PhysicalExpr>,
+            Arc::new(Column::new("a", 0)) as Arc<dyn PhysicalExpr>,
+        )];
+        let right_semi: Arc<dyn ExecutionPlan> = Arc::new(
+            HashJoinExec::try_new(
+                mem_table("a"),
+                mem_table("a"),
+                on,
+                None,
+                &JoinType::RightSemi,
+                None,
+                PartitionMode::Partitioned,
+                NullEquality::NullEqualsNothing,
+                false,
+            )
+            .unwrap(),
+        );
+
+        assert!(
+            build_subtree_has_semi_filter(&right_semi),
+            "build_subtree_has_semi_filter must detect a RightSemi join \
+             (Q18's post-swap semi shape). Without it, the Σ.AM.1 \
+             inner-with-semi path no-ops and the top Inner join's lineitem \
+             probe is never bloom-pruned."
+        );
+
+        // Symmetric negative: a plain Inner join (no semi/anti anywhere)
+        // must still return false so the gate doesn't over-fire.
+        let inner_on = vec![(
+            Arc::new(Column::new("a", 0)) as Arc<dyn PhysicalExpr>,
+            Arc::new(Column::new("a", 0)) as Arc<dyn PhysicalExpr>,
+        )];
+        let inner: Arc<dyn ExecutionPlan> = Arc::new(
+            HashJoinExec::try_new(
+                mem_table("a"),
+                mem_table("a"),
+                inner_on,
+                None,
+                &JoinType::Inner,
+                None,
+                PartitionMode::Partitioned,
+                NullEquality::NullEqualsNothing,
+                false,
+            )
+            .unwrap(),
+        );
+        assert!(
+            !build_subtree_has_semi_filter(&inner),
+            "a plain Inner join must not be detected as semi-filtered"
         );
     }
 }

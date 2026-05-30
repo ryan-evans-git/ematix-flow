@@ -42,6 +42,7 @@ use ematix_flow_core::push_down_left_semi_rule::PushDownLeftSemiRule;
 use ematix_flow_core::robin_hood_sum_f64_exec::EnableRobinHoodSumF64Rule;
 use ematix_flow_core::runtime_bloom_cascading_rule::EnableCascadingBloomRule;
 use ematix_flow_core::runtime_bloom_sideband_rule::EnableRuntimeBloomSidebandRule;
+use ematix_flow_core::force_collect_left_semi_build_rule::ForceCollectLeftForSemiBoundedBuildRule;
 use ematix_flow_core::swap_semi_join_build_rule::SwapSemiJoinBuildSideRule;
 use futures_util::TryStreamExt;
 
@@ -1431,6 +1432,19 @@ async fn build_ematix_ctx(
         .unwrap_or_else(|| matches!(rules.as_str(), "all" | "swap"));
     if swap_enabled {
         builder = builder.with_physical_optimizer_rule(Arc::new(SwapSemiJoinBuildSideRule));
+    }
+    // REV.3: force CollectLeft on Inner joins with a semi-bounded build
+    // (Q18-class) so the 60M/600M-row probe streams with NO hash
+    // exchange (re-run EnforceDistribution drops the probe repartition +
+    // coalesces the tiny build). Runs after SwapSemi so it sees the
+    // RightSemi. Opt-in via EMAT_FORCE_COLLECT_LEFT=1 for A/B.
+    let force_collect_left_enabled = std::env::var("EMAT_FORCE_COLLECT_LEFT")
+        .ok()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if force_collect_left_enabled {
+        builder = builder
+            .with_physical_optimizer_rule(Arc::new(ForceCollectLeftForSemiBoundedBuildRule));
     }
     // Σ.Q.L10: logical-plan rewrite — push LeftSemi past Inner joins
     // down to its target table. Closes the Q18-shape structural gap

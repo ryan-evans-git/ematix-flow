@@ -21,6 +21,7 @@ use ematix_flow_core::fused_aggregate_filter_sum_rule::InjectFilterSumRule;
 use ematix_flow_core::push_down_left_semi_rule::PushDownLeftSemiRule;
 use ematix_flow_core::robin_hood_sum_f64_exec::EnableRobinHoodSumF64Rule;
 use ematix_flow_core::runtime_bloom_sideband_rule::EnableRuntimeBloomSidebandRule;
+use ematix_flow_core::force_collect_left_semi_build_rule::ForceCollectLeftForSemiBoundedBuildRule;
 use ematix_flow_core::swap_semi_join_build_rule::SwapSemiJoinBuildSideRule;
 
 const TPCH_TABLES: &[&str] = &[
@@ -46,6 +47,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let rt_bloom = env_on("EMAT_RT_BLOOM_SIDEBAND");
     let rh_sum_f64 = env_on("EMAT_RH_SUM_F64");
     let push_semi = env_on("EMAT_PUSH_SEMI");
+    let force_collect_left = env_on("EMAT_FORCE_COLLECT_LEFT");
 
     let mut builder = SessionStateBuilder::new()
         .with_config(SessionConfig::new().with_target_partitions(14))
@@ -67,6 +69,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if rt_bloom {
         builder = builder
             .with_physical_optimizer_rule(Arc::new(EnableRuntimeBloomSidebandRule::default()));
+    }
+    if force_collect_left {
+        // REV.3 — appended last so it runs AFTER SwapSemiJoinBuildSide
+        // (which produces the RightSemi that build_subtree_has_semi_filter
+        // detects) and after the built-in JoinSelection/EnforceDistribution.
+        builder = builder
+            .with_physical_optimizer_rule(Arc::new(ForceCollectLeftForSemiBoundedBuildRule));
     }
     let state = builder.build();
 

@@ -371,6 +371,13 @@ async fn run_ematix(
     }
     builder = builder.with_optimizer_rule(Arc::new(PushDownLeftSemiRule));
     builder = builder.with_physical_optimizer_rule(Arc::new(SwapSemiJoinBuildSideRule));
+    // REV.3 — force CollectLeft on Inner joins with semi-bounded builds.
+    // Opt-in via EMAT_FORCE_COLLECT_LEFT=1 to value-check correctness.
+    if std::env::var_os("EMAT_FORCE_COLLECT_LEFT").is_some() {
+        builder = builder.with_physical_optimizer_rule(Arc::new(
+            ematix_flow_core::force_collect_left_semi_build_rule::ForceCollectLeftForSemiBoundedBuildRule,
+        ));
+    }
     builder = builder.with_physical_optimizer_rule(Arc::new(EnableRobinHoodSumF64Rule));
     // Σ.Q.L15: Inner-L9 + tight ratio + all-Emat. **Default ON at
     // milestone config**; set `L15=0` to revert to pre-L15.

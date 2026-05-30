@@ -84,6 +84,11 @@ pub mod dedupe_aggregate_rule;
 // AggregateExec (i.e., is bounded-small) but the build side doesn't.
 // Fixes Q18 SF=10 build-on-60M-rows inversion. See module docs.
 pub mod swap_semi_join_build_rule;
+// REV.3: force CollectLeft on Inner joins whose build is semi-bounded
+// (Q18-class), eliminating the 60M/600M-row probe-side hash repartition
+// that JoinSelection picks because the build's stats are Absent. See
+// module docs.
+pub mod force_collect_left_semi_build_rule;
 // Σ.Q.L10: logical-plan rewrite — push a LeftSemi join down past
 // Inner joins so it filters its target table directly, eliminating
 // the giant intermediate that gets semi-filtered at the top of the
