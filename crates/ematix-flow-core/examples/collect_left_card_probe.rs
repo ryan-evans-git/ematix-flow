@@ -83,9 +83,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Production preset: milestone rules + FlowQueryPlanner +
     // ForceCollectLeftForSemiBoundedBuildRule (default-on). So the
     // dumped plan is exactly what production runs.
+    let mut session_config = SessionConfig::new().with_target_partitions(14);
+    // REV.17.2: mirror the bench knob so the dumped plan reflects a raised
+    // collect-left threshold (see which joins newly flip to CollectLeft).
+    if let Some(rows) = std::env::var("EMAT_COLLECT_LEFT_THRESHOLD_ROWS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+    {
+        let opts = session_config.options_mut();
+        opts.optimizer.hash_join_single_partition_threshold_rows = rows;
+        opts.optimizer.hash_join_single_partition_threshold = rows.saturating_mul(64);
+    }
     let builder = ematix_flow_core::preset::with_optimizer_rules(
         SessionStateBuilder::new()
-            .with_config(SessionConfig::new().with_target_partitions(14))
+            .with_config(session_config)
             .with_default_features(),
     );
     let ctx = SessionContext::new_with_state(builder.build());

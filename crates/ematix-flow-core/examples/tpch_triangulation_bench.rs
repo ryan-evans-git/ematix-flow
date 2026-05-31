@@ -1410,8 +1410,25 @@ async fn build_ematix_ctx(
     // query's target_partitions above the session default so DataFusion's
     // EnforceDistribution naturally propagates the higher count.
     let partitions = target_partitions_override.unwrap_or(session_partitions);
+    let mut session_config = SessionConfig::new().with_target_partitions(partitions);
+    // REV.17.2 (2026-05-30): optionally raise DataFusion's collect-left
+    // threshold so its OWN JoinSelection broadcasts provably-small dim
+    // builds (Q17 j1/j2 ~4M, Q16 j1 ~200K) that the default 128K-row
+    // threshold otherwise leaves hash-Partitioned (= a fact-side shuffle).
+    // Default unset = stock DataFusion behavior.
+    if let Some(rows) = std::env::var("EMAT_COLLECT_LEFT_THRESHOLD_ROWS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+    {
+        let opts = session_config.options_mut();
+        opts.optimizer.hash_join_single_partition_threshold_rows = rows;
+        // Make the row count the binding constraint: lift the byte cap
+        // (default 1 MB) well above a small-row build so it isn't rejected
+        // on bytes. 64 B/row is a generous upper bound for TPC-H keys.
+        opts.optimizer.hash_join_single_partition_threshold = rows.saturating_mul(64);
+    }
     let mut builder = SessionStateBuilder::new()
-        .with_config(SessionConfig::new().with_target_partitions(partitions))
+        .with_config(session_config)
         .with_default_features();
     if matches!(rules.as_str(), "all" | "dedupe") {
         builder = builder
