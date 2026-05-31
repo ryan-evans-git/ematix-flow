@@ -237,6 +237,14 @@ name = "tpch_triangulation_bench"
 path = "examples/tpch_triangulation_bench.rs"
 required-features = ["triangulation"]
 
+# Σ.AB plan-diff diagnostic: dump Polars's unoptimized + optimized
+# LogicalPlan for a TPC-H query. Imports `polars` directly, so it is
+# gated behind the `triangulation` feature like the triangulation bench.
+[[example]]
+name = "polars_plan_dump"
+path = "examples/polars_plan_dump.rs"
+required-features = ["triangulation"]
+
 # Σ.E3b.1 bench: `COUNT(*) GROUP BY dict_col` —
 # `DictGroupCountExec` vs DataFusion's default `AggregateExec` on a
 # synthetic dict-encoded fixture sized to amplify the per-row hot

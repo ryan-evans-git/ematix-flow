@@ -3692,7 +3692,7 @@ checksum = "91622ff5e7162018101f2fea40d6ebf4a78bbe5a49736a2020649edf9693679e"
 
 [[package]]
 name = "ematix-flow-cli"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "arrow-array",
  "arrow-ipc",
@@ -3722,7 +3722,7 @@ dependencies = [
 
 [[package]]
 name = "ematix-flow-core"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "apache-avro",
  "arrow-array",
@@ -3793,7 +3793,7 @@ dependencies = [
 
 [[package]]
 name = "ematix-flow-distributed"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -3817,7 +3817,7 @@ dependencies = [
 
 [[package]]
 name = "ematix-flow-py"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -3833,9 +3833,9 @@ dependencies = [
 
 [[package]]
 name = "ematix-parquet-codec"
-version = "0.16.2"
+version = "0.16.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ca45bca39da7d3672a8034fa51850ab3b9c36cc6e86d0a5488a32196a6ee53fb"
+checksum = "61c6bc2b695d0fa61dde0421805f253dd711912ae70e549ccc68a2121e790c0b"
 dependencies = [
  "brotli",
  "ematix-parquet-format",
@@ -3848,15 +3848,15 @@ dependencies = [
 
 [[package]]
 name = "ematix-parquet-format"
-version = "0.16.2"
+version = "0.16.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0d129a1ab215eb83f5aac797bd15adea3039c1e0a3ec3cbe805f9b845e872fb5"
+checksum = "bb1236303ad79e5cb92c898a52ad49d2f897c0cfd667275a4b25cd10301ebbcd"
 
 [[package]]
 name = "ematix-parquet-io"
-version = "0.16.2"
+version = "0.16.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d8e28e44f88c15c96af7888d225b505e5bfd68c726066669efd04d4188152117"
+checksum = "116064bd7cb839291d7970188112eefce93fc5377d4ce91b6e770fc3e73a4ba0"
 dependencies = [
  "ematix-parquet-format",
 ]

@@ -16,6 +16,7 @@ use ematix_flow_core::dedupe_aggregate_rule::DedupeAggregateForFloatDeterminism;
 use ematix_flow_core::dict_aggregate_rule::EnableDictGroupCountRule;
 use ematix_flow_core::ematix_fast_parquet::EmatixFastParquetTableProvider;
 use ematix_flow_core::fast_parquet::FastParquetTableProvider;
+use ematix_flow_core::force_collect_left_semi_build_rule::ForceCollectLeftForSemiBoundedBuildRule;
 use ematix_flow_core::fused_aggregate_filter_multi_agg_rule::InjectFilterMultiAggRule;
 use ematix_flow_core::fused_aggregate_filter_sum_rule::InjectFilterSumRule;
 use ematix_flow_core::push_down_left_semi_rule::PushDownLeftSemiRule;
@@ -46,6 +47,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let rt_bloom = env_on("EMAT_RT_BLOOM_SIDEBAND");
     let rh_sum_f64 = env_on("EMAT_RH_SUM_F64");
     let push_semi = env_on("EMAT_PUSH_SEMI");
+    let force_collect_left = env_on("EMAT_FORCE_COLLECT_LEFT");
 
     let mut builder = SessionStateBuilder::new()
         .with_config(SessionConfig::new().with_target_partitions(14))
@@ -62,11 +64,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         builder = builder.with_physical_optimizer_rule(Arc::new(SwapSemiJoinBuildSideRule));
     }
     if rh_sum_f64 {
-        builder = builder.with_physical_optimizer_rule(Arc::new(EnableRobinHoodSumF64Rule));
+        builder =
+            builder.with_physical_optimizer_rule(Arc::new(EnableRobinHoodSumF64Rule::default()));
     }
     if rt_bloom {
         builder = builder
             .with_physical_optimizer_rule(Arc::new(EnableRuntimeBloomSidebandRule::default()));
+    }
+    if force_collect_left {
+        // REV.3 — appended last so it runs AFTER SwapSemiJoinBuildSide
+        // (which produces the RightSemi that build_subtree_has_semi_filter
+        // detects) and after the built-in JoinSelection/EnforceDistribution.
+        builder = builder.with_physical_optimizer_rule(Arc::new(
+            ForceCollectLeftForSemiBoundedBuildRule::default(),
+        ));
     }
     let state = builder.build();
 

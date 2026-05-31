@@ -216,6 +216,20 @@ impl BuildSideBloomEmitterExec {
     pub fn extra_targets(&self) -> &[(usize, BridgeFilterSideband)] {
         &self.extra_targets
     }
+
+    /// Σ.AJ.1: handle to the wrapped input subtree.
+    /// Needed by the broadcast-siblings rule to rebuild a new emitter
+    /// with extended extras while preserving the same build subtree.
+    pub fn input(&self) -> &Arc<dyn ExecutionPlan> {
+        &self.input
+    }
+
+    /// Σ.AJ.1: the total expected build-side key count, used to size
+    /// the bloom. Stored internally as per-partition × n_partitions —
+    /// reconstructs the value passed to `try_new_with_extras`.
+    pub fn expected_total_keys(&self) -> usize {
+        self.expected_keys_per_partition * self.n_partitions
+    }
 }
 
 impl DisplayAs for BuildSideBloomEmitterExec {

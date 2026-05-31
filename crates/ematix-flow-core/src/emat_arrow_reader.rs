@@ -974,7 +974,12 @@ pub struct EmatArrowBatchReader {
     /// batch via Arrow's SIMD `filter` kernel after the zero-copy
     /// slice of `cur_rg_columns`. Cleared on RG boundary by
     /// `load_row_group` / `load_row_group_dense`.
-    cur_rg_filter_bitmap: Option<Vec<u8>>,
+    /// Σ.AE.3 (2026-05-26): stored as Arc-shared `Buffer` (not raw
+    /// `Vec<u8>`) so `slice_batch` clones it cheaply on each batch
+    /// rather than copying ~125 KB via `Buffer::from_slice_ref` per
+    /// 65k-row batch (the Vec<u8> form regressed Q03 SF=10 +5% Exact
+    /// mode through cumulative per-batch buffer allocation).
+    cur_rg_filter_bitmap: Option<datafusion::arrow::buffer::Buffer>,
     /// Next row index within the current RG.
     cur_rg_row: usize,
     /// Total rows in the current RG.
@@ -1054,6 +1059,89 @@ impl EmatArrowBatchReader {
         filter: BridgeFilter,
         path: std::path::PathBuf,
     ) -> DfResult<()> {
+        // Σ.AH.2 Story 1'.4 Stage 1 (2026-05-26): fused bloom-probe
+        // path. For runtime-injected i64-only filters (I64InBloom,
+        // I64InSet, I64Range from the L9 sideband), the filter
+        // column is ALWAYS in the projection (it's the HashJoin's
+        // join key, which the projection above us already selects).
+        // So we can:
+        //   1. Dense-decode all projected columns (existing path)
+        //   2. Walk the already-decoded i64 buffer for the filter
+        //      column to build the bitmap (no second decode)
+        //   3. Stash the bitmap; slice_batch applies it per-batch
+        //      via Arrow's SIMD filter (existing Σ.AE.2 hook).
+        //
+        // Saves: one full decode + one Snappy decompress of the
+        // filter column (~6 ms/partition on SF=10 lineitem.l_partkey;
+        // saving ~25-30 ms wall after parallel-overlap).
+        //
+        // **Default ON** as of 2026-05-27 (Σ.AI.2). Two independent
+        // interleaved A/B/A/B strict benches (22q SF=10, 4 invocations
+        // each side) showed net **-1.26% and -2.27% faster** with the
+        // fused-probe path, driven primarily by Q21 (-40 to -54 ms
+        // / -10 to -14%). No clear regressions above the 2σ noise bar
+        // in either run (Q10 +3.6% appeared in one run but not the
+        // other; treated as edge-of-noise). Earlier "loose" benches
+        // (single-invocation, no caffeinate/taskpolicy discipline)
+        // reported net regressions that turned out to be sequential-
+        // block-order artifact — see `[[sigma-ai-1-strict-bench-landed]]`
+        // and the interleaved A/B harness at `scripts/bench/strict_ab.sh`.
+        //
+        // Opt-OUT via `EMAT_L9_FUSED_PROBE=0` (or `false`) for ad-hoc
+        // A/B work or if a future workload exposes a real regression.
+        let fused_probe_enabled = std::env::var("EMAT_L9_FUSED_PROBE")
+            .ok()
+            .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+            .unwrap_or(true);
+        if filter.is_runtime_i64_only() && fused_probe_enabled {
+            self.cur_rg_total = self.cached_md.row_groups[rg].num_rows as usize;
+            self.load_row_group_dense(rg)?;
+            // Find the predicate's target column in the projection.
+            // Walk cur_rg_columns to extract the i64 buffer.
+            let cols = self.cur_rg_columns.as_ref().ok_or_else(|| {
+                ext("load_row_group_dense returned without cur_rg_columns".to_string())
+            })?;
+            // The predicate's col_idx is a FILE-schema index. Map to
+            // projection index via self.projection (which is also a
+            // file-schema-indexed Vec).
+            let target_proj_idx = filter
+                .single_runtime_i64_col()
+                .and_then(|file_col| self.projection.iter().position(|&l| l == file_col));
+            let Some(proj_idx) = target_proj_idx else {
+                // Target column not in projection (shouldn't happen
+                // for L9-emitted predicates — the bloom key IS the
+                // join key which the projection includes). Fall
+                // through to masked path as safety.
+                self.cur_rg_columns = None;
+                return self.load_row_group_masked_legacy(rg, filter, path);
+            };
+            // Extract i64 values from the decoded column. Arrow's
+            // `Buffer::typed_data::<i64>()` validates alignment +
+            // length and returns a `&[i64]` view (no copy).
+            let i64_values: &[i64] = match &cols[proj_idx] {
+                DecodedColumn::Int64 { data, .. } => data.typed_data::<i64>(),
+                _ => {
+                    self.cur_rg_columns = None;
+                    return self.load_row_group_masked_legacy(rg, filter, path);
+                }
+            };
+            let (_col, bitmap) = filter
+                .probe_i64_values_from_decoded(i64_values)
+                .ok_or_else(|| ext("probe_i64_values_from_decoded unexpectedly None"))?;
+            self.cur_rg_filter_bitmap = Some(datafusion::arrow::buffer::Buffer::from_vec(bitmap));
+            return Ok(());
+        }
+        self.load_row_group_masked_legacy(rg, filter, path)
+    }
+
+    /// Σ.AH.2 Story 1'.4 — original masked path, kept for the
+    /// non-fused dispatch (user-pushed filters, opt-out).
+    fn load_row_group_masked_legacy(
+        &mut self,
+        rg: usize,
+        filter: BridgeFilter,
+        path: std::path::PathBuf,
+    ) -> DfResult<()> {
         // Σ.Q.L13 (2026-05-23): parallel-bitmap+dense path is opt-IN
         // via `EMAT_FORCE_PARALLEL_BITMAP=1`. The path was previously
         // default-ON when `predicted_pass_rate > 0.33`, citing an SF=1
@@ -1080,9 +1168,32 @@ impl EmatArrowBatchReader {
         // decode work outweighs the bitmap-construction + per-row
         // gather overhead. Phase 1.8 may misfire (stats inaccurate)
         // so keep the actual-popcount fallback as a safety net.
+        //
+        // Σ.AE.2 (2026-05-26): under Exact pushdown, FilterExec is
+        // dropped from the plan, so the BridgeFilter is the ONLY
+        // row filter. If we fall back to dense here without saving
+        // the bitmap, rows that should be filtered out are emitted.
+        // Q01 SF=10 leaked ~2.9% rows on boundary RGs (l_shipdate
+        // spans the cutoff); Q03 leaked ~26× rows (two filtered
+        // tables × Cartesian explosion). Stash the bitmap before
+        // the dense decode so slice_batch applies it per-batch via
+        // Arrow's SIMD filter (same shape as
+        // load_row_group_parallel_bitmap_dense at line 1355).
+        //
+        // Gate on EMAT_EXACT_PUSHDOWN: under Inexact (default),
+        // FilterExec is still in the plan and the per-batch SIMD
+        // filter is redundant work (~+9% Q01 SF=1 baseline regression
+        // when ungated). With the gate the default-mode path is
+        // bit-identical to pre-fix behavior; only Exact mode (which
+        // would otherwise emit wrong rows) gains the bitmap apply.
         if total > 0 && popcount * 3 > total {
             self.cur_rg_total = self.cached_md.row_groups[rg].num_rows as usize;
-            return self.load_row_group_dense(rg);
+            self.load_row_group_dense(rg)?;
+            if std::env::var_os("EMAT_EXACT_PUSHDOWN").is_some() {
+                self.cur_rg_filter_bitmap =
+                    Some(datafusion::arrow::buffer::Buffer::from_vec(bitmap));
+            }
+            return Ok(());
         }
 
         // 2. Parallel masked-decode of each projected column. Same
@@ -1352,7 +1463,7 @@ impl EmatArrowBatchReader {
 
         self.cur_rg_total = total;
         self.cur_rg_columns = Some(cols);
-        self.cur_rg_filter_bitmap = Some(bitmap);
+        self.cur_rg_filter_bitmap = Some(datafusion::arrow::buffer::Buffer::from_vec(bitmap));
         self.cur_rg_row = 0;
 
         if timing {
@@ -1577,19 +1688,19 @@ impl EmatArrowBatchReader {
         // pipeline shape FilterExec would have provided if pushdown
         // were Inexact; with Exact pushdown, this is the only filter
         // step in the plan for the pushed predicate.
-        if let Some(bm) = self.cur_rg_filter_bitmap.as_ref() {
+        if let Some(buf) = self.cur_rg_filter_bitmap.as_ref() {
             let timing = std::env::var_os("EMAT_TIMING").is_some();
             let t_filter = if timing {
                 Some(std::time::Instant::now())
             } else {
                 None
             };
-            // Build a BooleanBuffer that points into the bitmap with
-            // the batch's row offset. BooleanBuffer takes a Buffer +
-            // start bit + length, so we can window the bitmap without
-            // copying.
-            let bool_buf =
-                datafusion::arrow::buffer::BooleanBuffer::new(Buffer::from_slice_ref(bm), start, n);
+            // Σ.AE.3 (2026-05-26): clone the cached Buffer (Arc bump,
+            // not a memcpy) and window into it. Previously did
+            // `Buffer::from_slice_ref(&Vec<u8>)` per slice_batch call,
+            // which copied the whole bitmap each time (~125 KB × 15
+            // batches/RG → ~7.5 MB of copies per Q03 partition).
+            let bool_buf = datafusion::arrow::buffer::BooleanBuffer::new(buf.clone(), start, n);
             let predicate_arr = arrow_array::BooleanArray::new(bool_buf, None);
             let filtered = datafusion::arrow::compute::filter_record_batch(&batch, &predicate_arr)
                 .map_err(|e| ext(format!("filter_record_batch: {e}")))?;
@@ -2730,8 +2841,13 @@ fn slice_decoded(c: &DecodedColumn, start: usize, n: usize, target: &DataType) -
             // against the corresponding `data_buffers[block_id]` so
             // the (block_id, offset) coordinates are valid and the
             // bytes are valid UTF-8 (parquet Utf8 logical type).
-            let arr = StringViewArray::try_new(views_buf, data_buffers.clone(), None::<NullBuffer>)
-                .expect("StringViewArray::try_new on internally-built views");
+            // `new_unchecked` saves ~9% of self-time on Q01 SF=10
+            // (`validate_string_view` + `core::str::from_utf8` in the
+            // 2026-05 stage profile); `force_validate` feature still
+            // enables validation in debug.
+            let arr = unsafe {
+                StringViewArray::new_unchecked(views_buf, data_buffers.clone(), None::<NullBuffer>)
+            };
             Arc::new(arr)
         }
         DecodedColumn::DictUtf8 {

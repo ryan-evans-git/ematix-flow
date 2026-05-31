@@ -181,7 +181,7 @@ fn promote_dict_encoded_to_dictionary(
 ///   - `null_count`: sum across row groups (Exact iff every RG had Exact)
 ///   - `min_value`:  min across row groups
 ///   - `max_value`:  max across row groups
-pub(crate) fn aggregate_column_statistics(
+pub fn aggregate_column_statistics(
     meta: &datafusion::parquet::file::metadata::ParquetMetaData,
     arrow_schema: &datafusion::arrow::datatypes::Schema,
 ) -> Vec<ColumnStatistics> {
@@ -681,14 +681,17 @@ impl TableProvider for FastParquetTableProvider {
     /// so logical optimizer rules can distinguish dim vs fact tables.
     /// `num_rows` is read from parquet `FileMetadata::num_rows` at
     /// registration time, so it's exact for unfiltered scans.
+    /// Σ.T Phase 1 (2026-05-25): surface the typed per-column
+    /// min/max/null_count already aggregated on construction. Mirrors
+    /// the EmatixFastParquetTableProvider fix — the logical join
+    /// planner needs predicate selectivity, not just `num_rows`.
+    /// `partition_statistics` on the Exec has returned these all
+    /// along (line 1016).
     fn statistics(&self) -> Option<datafusion::common::Statistics> {
         Some(datafusion::common::Statistics {
             num_rows: datafusion::common::stats::Precision::Exact(self.num_rows),
             total_byte_size: datafusion::common::stats::Precision::Absent,
-            column_statistics: vec![
-                datafusion::common::ColumnStatistics::new_unknown();
-                self.schema.fields().len()
-            ],
+            column_statistics: (*self.column_stats).clone(),
         })
     }
 
@@ -1869,5 +1872,141 @@ mod tests {
             .value(0);
         let rel = ((v - v_ref) / v_ref).abs();
         assert!(rel < 1e-10, "pruned={v}, ref={v_ref}, rel_err={rel:e}");
+    }
+
+    /// Σ.T Phase 1 (2026-05-25): FastParquetTableProvider's `statistics()`
+    /// must surface the same typed per-column min/max/null_count that
+    /// `partition_statistics` on the Exec returns. This is the provider
+    /// used for all non-lineitem TPC-H tables (region, nation, customer,
+    /// orders, supplier, part, partsupp) — exactly the dim tables whose
+    /// predicate selectivity drives the Q05 / Q08 join-reorder decisions.
+    #[test]
+    fn table_provider_statistics_exposes_typed_column_stats() {
+        use datafusion::common::ScalarValue;
+        use datafusion::common::stats::Precision;
+        use datafusion::parquet::basic::{Compression, Repetition, Type as PhysicalType};
+        use datafusion::parquet::column::writer::ColumnWriter;
+        use datafusion::parquet::file::properties::WriterProperties;
+        use datafusion::parquet::file::writer::SerializedFileWriter;
+        use datafusion::parquet::schema::types::Type as PType;
+        use std::fs::File;
+        use std::sync::Arc;
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+
+        let pschema = Arc::new(
+            PType::group_type_builder("schema")
+                .with_fields(vec![Arc::new(
+                    PType::primitive_type_builder("k", PhysicalType::INT32)
+                        .with_repetition(Repetition::REQUIRED)
+                        .build()
+                        .unwrap(),
+                )])
+                .build()
+                .unwrap(),
+        );
+        let props = Arc::new(
+            WriterProperties::builder()
+                .set_compression(Compression::SNAPPY)
+                .build(),
+        );
+        let file = File::create(&path).unwrap();
+        let mut writer = SerializedFileWriter::new(file, pschema, props).unwrap();
+        let mut rg = writer.next_row_group().unwrap();
+        let k: Vec<i32> = (100..200).collect();
+        let mut col = rg.next_column().unwrap().unwrap();
+        if let ColumnWriter::Int32ColumnWriter(t) = col.untyped() {
+            t.write_batch(&k, None, None).unwrap();
+        }
+        col.close().unwrap();
+        rg.close().unwrap();
+        writer.close().unwrap();
+
+        let provider =
+            FastParquetTableProvider::try_new(path.to_string_lossy().to_string()).unwrap();
+        let stats = provider.statistics().expect("provider must publish stats");
+        assert_eq!(stats.num_rows, Precision::Exact(100));
+        assert_eq!(stats.column_statistics.len(), 1);
+        let cs = &stats.column_statistics[0];
+        assert_eq!(cs.null_count, Precision::Exact(0));
+        assert_eq!(
+            cs.min_value,
+            Precision::Exact(ScalarValue::Int32(Some(100)))
+        );
+        assert_eq!(
+            cs.max_value,
+            Precision::Exact(ScalarValue::Int32(Some(199)))
+        );
+    }
+
+    /// Σ.T Phase 1: aggregation across multiple row groups must compute
+    /// the global min/max correctly (not per-RG). Real TPC-H lineitem
+    /// has 58 RGs at SF=10; this miniature test guards the fold.
+    #[test]
+    fn column_stats_aggregate_across_row_groups() {
+        use datafusion::common::ScalarValue;
+        use datafusion::common::stats::Precision;
+        use datafusion::parquet::basic::{Compression, Repetition, Type as PhysicalType};
+        use datafusion::parquet::column::writer::ColumnWriter;
+        use datafusion::parquet::file::properties::WriterProperties;
+        use datafusion::parquet::file::writer::SerializedFileWriter;
+        use datafusion::parquet::schema::types::Type as PType;
+        use std::fs::File;
+        use std::sync::Arc;
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        let pschema = Arc::new(
+            PType::group_type_builder("schema")
+                .with_fields(vec![Arc::new(
+                    PType::primitive_type_builder("v", PhysicalType::INT64)
+                        .with_repetition(Repetition::REQUIRED)
+                        .build()
+                        .unwrap(),
+                )])
+                .build()
+                .unwrap(),
+        );
+        // Force three row groups: row-group sizes of 50 each.
+        let props = Arc::new(
+            WriterProperties::builder()
+                .set_compression(Compression::SNAPPY)
+                .set_max_row_group_row_count(Some(50))
+                .build(),
+        );
+        let file = File::create(&path).unwrap();
+        let mut writer = SerializedFileWriter::new(file, pschema, props).unwrap();
+        for (lo, hi) in [(1_000i64, 1_050), (5_000, 5_050), (200, 250)] {
+            let mut rg = writer.next_row_group().unwrap();
+            let v: Vec<i64> = (lo..hi).collect();
+            let mut col = rg.next_column().unwrap().unwrap();
+            if let ColumnWriter::Int64ColumnWriter(t) = col.untyped() {
+                t.write_batch(&v, None, None).unwrap();
+            }
+            col.close().unwrap();
+            rg.close().unwrap();
+        }
+        writer.close().unwrap();
+
+        let provider =
+            FastParquetTableProvider::try_new(path.to_string_lossy().to_string()).unwrap();
+        let stats = provider.statistics().unwrap();
+        let cs = &stats.column_statistics[0];
+        // Three RGs: [1000, 1049], [5000, 5049], [200, 249]
+        // Global min = 200, global max = 5049
+        assert_eq!(
+            cs.min_value,
+            Precision::Exact(ScalarValue::Int64(Some(200))),
+            "min across RGs must be the smallest, got {:?}",
+            cs.min_value
+        );
+        assert_eq!(
+            cs.max_value,
+            Precision::Exact(ScalarValue::Int64(Some(5049))),
+            "max across RGs must be the largest, got {:?}",
+            cs.max_value
+        );
+        assert_eq!(cs.null_count, Precision::Exact(0));
     }
 }

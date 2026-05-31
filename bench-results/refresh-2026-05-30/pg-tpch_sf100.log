@@ -1,0 +1,24 @@
+=== Postgres TPC-H: db=tpch_sf100 trials=1 warmups=1 (EXPLAIN ANALYZE Execution Time) ===
+Q01  FAILED: ERROR:  canceling statement due to statement timeout
+Q02    26053.96 ms
+Q03  FAILED: ERROR:  canceling statement due to statement timeout
+Q04  FAILED: ERROR:  canceling statement due to statement timeout
+Q05  FAILED: ERROR:  canceling statement due to statement timeout
+Q06  FAILED: ERROR:  canceling statement due to statement timeout
+Q07  FAILED: ERROR:  canceling statement due to statement timeout
+Q08  FAILED: ERROR:  canceling statement due to statement timeout
+Q09  FAILED: ERROR:  canceling statement due to statement timeout
+Q10  FAILED: ERROR:  canceling statement due to statement timeout
+Q11    60108.15 ms
+Q12  FAILED: ERROR:  canceling statement due to statement timeout
+Q13    86673.61 ms
+Q14  FAILED: ERROR:  canceling statement due to statement timeout
+Q15  FAILED: ERROR:  canceling statement due to statement timeout
+Q16    29143.59 ms
+Q17  FAILED: ERROR:  canceling statement due to statement timeout
+Q18  FAILED: ERROR:  canceling statement due to statement timeout
+Q19    52107.32 ms
+Q20  FAILED: ERROR:  canceling statement due to statement timeout
+Q21  FAILED: ERROR:  canceling statement due to statement timeout
+Q22    16804.54 ms
+=== done tpch_sf100 ===

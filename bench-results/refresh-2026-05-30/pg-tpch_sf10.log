@@ -1,0 +1,24 @@
+=== Postgres TPC-H: db=tpch_sf10 trials=5 warmups=1 (EXPLAIN ANALYZE Execution Time) ===
+Q01     4305.63 ms
+Q02     2221.65 ms
+Q03     3488.24 ms
+Q04      904.73 ms
+Q05     3232.93 ms
+Q06     1373.49 ms
+Q07     2188.49 ms
+Q08     1339.63 ms
+Q09     7431.00 ms
+Q10     3362.26 ms
+Q11      577.55 ms
+Q12     3541.90 ms
+Q13    10988.63 ms
+Q14      813.47 ms
+Q15     1606.08 ms
+Q16     1097.66 ms
+Q17     5386.74 ms
+Q18    19845.98 ms
+Q19      148.24 ms
+Q20     3279.20 ms
+Q21     6952.43 ms
+Q22      203.37 ms
+=== done tpch_sf10 ===

@@ -93,6 +93,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Display impls, parse with arrow-csv into our pinned arrow 58
     // ABI, write Parquet. Helper macro keeps the per-table boilerplate
     // tight.
+    // Stream each table in row chunks so SF=100+ doesn't build the whole
+    // table CSV as one in-memory String (SF=100 lineitem ≈ 78 GB → OOM on
+    // a 36 GB box). Per chunk: accumulate CHUNK_ROWS rows of CSV, parse to
+    // RecordBatches, append to one ArrowWriter; finalize once. Peak memory
+    // ≈ one chunk (~260 MB for lineitem) regardless of scale factor.
+    const CHUNK_ROWS: usize = 2_000_000;
     macro_rules! gen_table {
         ($name:literal, $schema:expr, $generator:expr, $csv:ident) => {{
             let path = out.join(concat!($name, ".parquet"));
@@ -100,12 +106,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("    skip {} (already exists)", path.display());
             } else {
                 println!("    gen  {}", path.display());
-                let mut csv = String::new();
-                writeln!(&mut csv, "{}", $csv::header())?;
+                let schema = $schema;
+                let mut writer = open_parquet_writer(&path, schema.clone())?;
+                let header = format!("{}\n", $csv::header());
+                let mut csv = String::with_capacity(96 << 20);
+                csv.push_str(&header);
+                let mut chunk_rows = 0usize;
+                let mut total_rows: i64 = 0;
                 for row in $generator.iter() {
                     writeln!(&mut csv, "{}", $csv::new(row))?;
+                    chunk_rows += 1;
+                    if chunk_rows >= CHUNK_ROWS {
+                        total_rows += flush_csv_chunk(&mut writer, schema.clone(), &csv)?;
+                        csv.clear();
+                        csv.push_str(&header);
+                        chunk_rows = 0;
+                    }
                 }
-                write_parquet(&path, $schema, csv.into_bytes())?;
+                if chunk_rows > 0 {
+                    total_rows += flush_csv_chunk(&mut writer, schema.clone(), &csv)?;
+                }
+                writer.close()?;
+                println!("         {total_rows} rows");
             }
         }};
     }
@@ -158,32 +180,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn write_parquet(
+fn open_parquet_writer(
     path: &Path,
     schema: Arc<Schema>,
-    csv_bytes: Vec<u8>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let cursor = Cursor::new(csv_bytes);
-    let reader = ReaderBuilder::new(schema.clone())
-        .with_header(true)
-        .with_batch_size(64 * 1024)
-        .build(cursor)?;
-
+) -> Result<ArrowWriter<File>, Box<dyn std::error::Error>> {
     let file = File::create(path)?;
     let props = WriterProperties::builder()
         .set_compression(Compression::SNAPPY)
         .build();
-    let mut writer = ArrowWriter::try_new(file, schema, Some(props))?;
+    Ok(ArrowWriter::try_new(file, schema, Some(props))?)
+}
 
-    let mut total_rows: i64 = 0;
+// Parse one in-memory CSV chunk (header line + up to CHUNK_ROWS data rows)
+// into RecordBatches and append them to the open writer. Bounded memory:
+// the chunk String plus one 64K-row batch at a time. Returns rows written.
+fn flush_csv_chunk(
+    writer: &mut ArrowWriter<File>,
+    schema: Arc<Schema>,
+    csv: &str,
+) -> Result<i64, Box<dyn std::error::Error>> {
+    let cursor = Cursor::new(csv.as_bytes().to_vec());
+    let reader = ReaderBuilder::new(schema)
+        .with_header(true)
+        .with_batch_size(64 * 1024)
+        .build(cursor)?;
+    let mut rows: i64 = 0;
     for batch in reader {
         let batch: RecordBatch = batch?;
-        total_rows += batch.num_rows() as i64;
+        rows += batch.num_rows() as i64;
         writer.write(&batch)?;
     }
-    writer.close()?;
-    println!("         {total_rows} rows");
-    Ok(())
+    Ok(rows)
 }
 
 // TPC-H spec § 1.4.1 schemas. DECIMAL(15,2) / DECIMAL(12,2) columns

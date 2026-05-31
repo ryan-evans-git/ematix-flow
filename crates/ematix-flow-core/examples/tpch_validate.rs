@@ -347,8 +347,16 @@ async fn run_ematix(
 ) -> Result<Vec<Vec<Cell>>, Box<dyn std::error::Error>> {
     use arrow_array::ArrayRef;
 
+    let partitions: usize = std::env::var("PARTITIONS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(14)
+        });
     let mut builder = SessionStateBuilder::new()
-        .with_config(SessionConfig::new().with_target_partitions(14))
+        .with_config(SessionConfig::new().with_target_partitions(partitions))
         .with_default_features()
         .with_physical_optimizer_rule(Arc::new(DedupeAggregateForFloatDeterminism::default()))
         .with_physical_optimizer_rule(Arc::new(EnableDictGroupCountRule))
@@ -363,7 +371,19 @@ async fn run_ematix(
     }
     builder = builder.with_optimizer_rule(Arc::new(PushDownLeftSemiRule));
     builder = builder.with_physical_optimizer_rule(Arc::new(SwapSemiJoinBuildSideRule));
-    builder = builder.with_physical_optimizer_rule(Arc::new(EnableRobinHoodSumF64Rule));
+    // REV.3/17.3 — force CollectLeft (semi-bounded) + relative broadcast,
+    // both via ::default(). DEFAULT-ON to value-validate the production
+    // preset config; opt-out via EMAT_FORCE_COLLECT_LEFT=0.
+    let force_cl = std::env::var("EMAT_FORCE_COLLECT_LEFT")
+        .ok()
+        .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
+        .unwrap_or(true);
+    if force_cl {
+        builder = builder.with_physical_optimizer_rule(Arc::new(
+            ematix_flow_core::force_collect_left_semi_build_rule::ForceCollectLeftForSemiBoundedBuildRule::default(),
+        ));
+    }
+    builder = builder.with_physical_optimizer_rule(Arc::new(EnableRobinHoodSumF64Rule::default()));
     // Σ.Q.L15: Inner-L9 + tight ratio + all-Emat. **Default ON at
     // milestone config**; set `L15=0` to revert to pre-L15.
     let l15 = std::env::var("L15")
@@ -395,6 +415,7 @@ async fn run_ematix(
                 min_probe_to_build_ratio: 1024,
                 allow_inner_join: true,
                 require_filtered_build: true,
+                max_expected_keys_per_partition: 0,
             }
         } else {
             EnableRuntimeBloomSidebandRule::default()

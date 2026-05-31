@@ -22,9 +22,14 @@
 //! [`crate::fast_parquet::FastParquetTableProvider`].
 
 use std::any::Any;
+use std::collections::HashMap;
+// Σ.Q06.SF10.5.c: `try_new` no longer opens the file directly (metadata
+// comes from ematix-parquet); `std::fs::File` is now only used by the
+// parquet-rs writer in the test fixtures.
+#[cfg(test)]
 use std::fs::File;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use arrow_array::{Array, RecordBatch};
 use arrow_schema::{DataType, Schema, SchemaRef};
@@ -44,9 +49,6 @@ use datafusion::physical_plan::{
     SendableRecordBatchStream,
 };
 use futures_util::StreamExt;
-
-use datafusion::parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
-use datafusion::parquet::file::reader::{FileReader, SerializedFileReader};
 
 use crate::emat_arrow_reader::EmatArrowBatchReaderBuilder;
 use crate::ematix_parquet_bridge::{
@@ -104,6 +106,62 @@ impl BridgeFilter {
         sel.clamp(0.0, 1.0)
     }
 
+    /// Σ.AE.4 (2026-05-26): pass-rate estimate for partition_statistics
+    /// that ONLY counts predicates whose FilterExec is being dropped
+    /// from the plan. For Inexact-declared user filters (StringEq
+    /// under our string-gate; all user filters under default mode),
+    /// FilterExec sits on top of the scan and DataFusion's planner
+    /// already applies the predicate's selectivity on the scan's
+    /// reported cardinality. Pre-applying it here would double-count.
+    ///
+    /// Q10 SF=10 lineitem returnflag was double-counted, fooling
+    /// the planner into picking the wrong HashJoin build side
+    /// (+17% wall-time regression).
+    ///
+    /// Two classes count toward the pass-rate:
+    ///
+    /// 1. **Always-injected predicates** — bloom/set/range predicates
+    ///    added by the Σ.Q.L9 sideband rule via `with_added_predicates`.
+    ///    These never have a residual FilterExec; the scan is the
+    ///    only operator applying them. Q21 SF=10's −17% default-mode
+    ///    win came from threading bloom selectivity into the stats.
+    ///
+    /// 2. **Exact-declared user predicates** — i32 range/IN when
+    ///    `EMAT_EXACT_PUSHDOWN=1`. supports_filters_pushdown returns
+    ///    Exact for these, so DataFusion drops their FilterExec.
+    pub fn estimate_dropped_filter_pass_rate(
+        &self,
+        full_col_stats: &[datafusion::common::stats::ColumnStatistics],
+        exact_opt_in: bool,
+    ) -> f64 {
+        let mut sel = 1.0_f64;
+        for p in &self.predicates {
+            let residual_dropped = match p {
+                // Σ.Q.L9 / Σ.S.B injection: always added without
+                // FilterExec — scan is the only filter step.
+                ColumnPredicate::I64InBloom { .. }
+                | ColumnPredicate::I64InSet { .. }
+                | ColumnPredicate::I64Range { .. } => true,
+                // User-pushed Exact-declarable predicates: Exact only
+                // when the env-var gate is on.
+                ColumnPredicate::I32Range { .. } | ColumnPredicate::I32In { .. } => exact_opt_in,
+                // Strings stay Inexact under our string-gate;
+                // FilterExec retains them. F64 / column-pair never
+                // pushed. StringLike retained conservatively.
+                _ => false,
+            };
+            if !residual_dropped {
+                continue;
+            }
+            let col = p.col_idx();
+            let Some(stats) = full_col_stats.get(col) else {
+                return 0.5;
+            };
+            sel *= p.estimate_pass_rate(stats);
+        }
+        sel.clamp(0.0, 1.0)
+    }
+
     /// Σ.E5 Phase 1.8: store the predictor's verdict so the streaming
     /// reader doesn't have to re-compute it per RG.
     pub fn with_predicted_pass_rate(mut self, p: f64) -> Self {
@@ -123,6 +181,174 @@ impl BridgeFilter {
     /// dict-aware fast-path predicates run before the bloom probe.
     pub fn extend(&mut self, more: Vec<ColumnPredicate>) {
         self.predicates.extend(more);
+    }
+
+    /// Σ.AH.2 Story 1'.4 — true iff every predicate in this filter is
+    /// a runtime-injected i64-only shape (`I64InBloom`, `I64InSet`,
+    /// `I64Range`). These shapes share two properties that make the
+    /// dense-then-post-filter path always-win vs the masked-decode
+    /// path:
+    /// 1. The probe column is always already in the projection
+    ///    (it's the HashJoin's join key, projected for the join).
+    /// 2. The per-row predicate eval is cheap (bloom probe ~1.4 ns,
+    ///    set lookup ~5 ns, range compare ~1 ns).
+    ///
+    /// User-pushed predicates (`I32Range`, `I32In`, `F64Range`,
+    /// `StringEq`, `StringLike`, ...) stay on the masked-decode path
+    /// because they may target non-projected columns and benefit
+    /// from page-level skip when the column's value distribution
+    /// allows it.
+    pub fn is_runtime_i64_only(&self) -> bool {
+        !self.predicates.is_empty()
+            && self.predicates.iter().all(|p| {
+                matches!(
+                    p,
+                    ColumnPredicate::I64InBloom { .. }
+                        | ColumnPredicate::I64InSet { .. }
+                        | ColumnPredicate::I64Range { .. }
+                )
+            })
+    }
+
+    /// Number of pushed predicates. Used by trace/diagnostic code
+    /// (`EMAT_L9_TRACE`, stage_profiler) — not on the hot path.
+    pub fn predicates_len(&self) -> usize {
+        self.predicates.len()
+    }
+
+    /// Σ.AH.2 Story 1'.4 Stage 1 — apply all runtime-i64 predicates
+    /// against an already-decoded i64 column. Returns
+    /// `Some((target_file_col_idx, bitmap))` when the filter is
+    /// `is_runtime_i64_only()` AND all predicates target the same
+    /// column. Returns `None` otherwise so the caller can fall back
+    /// to the masked path.
+    ///
+    /// The point: skips the duplicate decode of the filter column.
+    /// The masked path calls `build_bitmap` which RE-DECODES the
+    /// column from the file (~6 ms per 1M-row partition on
+    /// lineitem.l_partkey). The fused path reuses the buffer that
+    /// `load_row_group_dense` already produced.
+    /// Σ.AH.2 Story 1'.4 Stage 1 — file-schema column index that all
+    /// runtime-i64 predicates target, or `None` if not runtime-i64-only
+    /// or if predicates target multiple columns.
+    pub fn single_runtime_i64_col(&self) -> Option<usize> {
+        if !self.is_runtime_i64_only() {
+            return None;
+        }
+        let first = self.predicates.first()?.col_idx();
+        if self.predicates.iter().all(|p| p.col_idx() == first) {
+            Some(first)
+        } else {
+            None
+        }
+    }
+
+    pub fn probe_i64_values_from_decoded(&self, values: &[i64]) -> Option<(usize, Vec<u8>)> {
+        if !self.is_runtime_i64_only() {
+            return None;
+        }
+        let first_col = match self.predicates.first() {
+            Some(p) => p.col_idx(),
+            None => return None,
+        };
+        if !self.predicates.iter().all(|p| p.col_idx() == first_col) {
+            return None;
+        }
+        let total = values.len();
+        let mut bitmap = vec![0u8; total.div_ceil(8)];
+
+        // Σ.AH.2 Story 1'.4 Stage 2 — chunk-of-8 byte-packing inner
+        // loop for the single-predicate fast path. Processes 8 i64
+        // values per iteration, builds one bitmap byte at a time.
+        // LLVM unrolls the inner per-lane chain and vectorises the
+        // bloom probe across lanes (per Σ.S.A's splash layout, which
+        // exposes the data-parallel probe). Faster than the scalar
+        // `for (row, &v)` loop because bit-set's
+        // read-modify-write pattern (`bitmap[row>>3] |= 1<<(row&7)`)
+        // serialised the inner loop through the bitmap array.
+        if self.predicates.len() == 1 {
+            match &self.predicates[0] {
+                ColumnPredicate::I64InBloom { bloom, .. } => {
+                    probe_chunks_into_bitmap(values, &mut bitmap, |v| bloom.might_contain_i64(v));
+                    return Some((first_col, bitmap));
+                }
+                ColumnPredicate::I64InSet { set, .. } => {
+                    probe_chunks_into_bitmap(values, &mut bitmap, |v| set.contains(v));
+                    return Some((first_col, bitmap));
+                }
+                ColumnPredicate::I64Range { lo, hi, .. } => {
+                    let (lo, hi) = (*lo, *hi);
+                    probe_chunks_into_bitmap(values, &mut bitmap, |v| v >= lo && v <= hi);
+                    return Some((first_col, bitmap));
+                }
+                _ => {}
+            }
+        }
+
+        // Multi-predicate AND path (slower; rarely fires in practice
+        // since the L9 emitter usually injects just one predicate).
+        for (row, &v) in values.iter().enumerate() {
+            let pass = self.predicates.iter().all(|p| match p {
+                ColumnPredicate::I64InBloom { bloom, .. } => bloom.might_contain_i64(v),
+                ColumnPredicate::I64InSet { set, .. } => set.contains(v),
+                ColumnPredicate::I64Range { lo, hi, .. } => v >= *lo && v <= *hi,
+                _ => false, // unreachable since is_runtime_i64_only
+            });
+            if pass {
+                bitmap[row >> 3] |= 1 << (row & 7);
+            }
+        }
+        Some((first_col, bitmap))
+    }
+}
+
+/// Σ.AH.2 Story 1'.4 Stage 2 — process 8 i64 values per loop
+/// iteration, packing the per-value boolean result into one bitmap
+/// byte. Avoids the read-modify-write bitmap pattern of the scalar
+/// `for (row, &v)` loop, which serialised the inner loop through
+/// `bitmap[row>>3] |= 1<<(row&7)`. The 8-lane unroll lets LLVM
+/// vectorise the predicate evaluation across lanes.
+#[inline(always)]
+fn probe_chunks_into_bitmap(values: &[i64], bitmap: &mut [u8], probe: impl Fn(i64) -> bool) {
+    let chunks = values.chunks_exact(8);
+    let rem = chunks.remainder();
+    let n_chunks = values.len() / 8;
+    for (chunk_idx, chunk) in chunks.enumerate() {
+        let mut byte = 0u8;
+        // Explicit unroll — LLVM auto-unrolls anyway but spelling it
+        // out makes the bit-position constants obvious to the
+        // optimizer.
+        if probe(chunk[0]) {
+            byte |= 1 << 0;
+        }
+        if probe(chunk[1]) {
+            byte |= 1 << 1;
+        }
+        if probe(chunk[2]) {
+            byte |= 1 << 2;
+        }
+        if probe(chunk[3]) {
+            byte |= 1 << 3;
+        }
+        if probe(chunk[4]) {
+            byte |= 1 << 4;
+        }
+        if probe(chunk[5]) {
+            byte |= 1 << 5;
+        }
+        if probe(chunk[6]) {
+            byte |= 1 << 6;
+        }
+        if probe(chunk[7]) {
+            byte |= 1 << 7;
+        }
+        bitmap[chunk_idx] = byte;
+    }
+    for (i, &v) in rem.iter().enumerate() {
+        let row = n_chunks * 8 + i;
+        if probe(v) {
+            bitmap[row >> 3] |= 1 << (row & 7);
+        }
     }
 }
 
@@ -253,9 +479,7 @@ impl BridgeFilter {
                         Ok(r) => r,
                         Err(_) => {
                             let pc2 = pclone.clone();
-                            let file = ematix_parquet_io::ParquetFile::open(path).map_err(|e| {
-                                DataFusionError::External(format!("ParquetFile::open: {e}").into())
-                            })?;
+                            let file = crate::ematix_parquet_bridge::open_cached(path)?;
                             filter_i32_column_to_bitmap_dense(
                                 &file,
                                 rg,
@@ -298,12 +522,10 @@ impl BridgeFilter {
                     // Decode both cols dense via masked_decode_i32
                     // with all-ones masks. Same shape as the F64 dense
                     // path. Apply the op pairwise to build the bitmap.
-                    use crate::ematix_parquet_bridge::masked_decode_i32;
-                    let file = ematix_parquet_io::ParquetFile::open(path).map_err(|e| {
-                        DataFusionError::External(format!("ParquetFile::open: {e}").into())
-                    })?;
+                    use crate::ematix_parquet_bridge::{masked_decode_i32, open_cached};
+                    let file = open_cached(path)?;
                     let md = file
-                        .metadata()
+                        .cached_metadata()
                         .map_err(|e| DataFusionError::External(format!("metadata: {e}").into()))?;
                     let total = md.row_groups[rg].columns[*left_col]
                         .meta_data
@@ -644,12 +866,25 @@ impl ColumnPredicate {
     pub fn is_exact_safe(&self) -> bool {
         match self {
             // Integer comparisons + discrete membership are byte-level
-            // unambiguous.
+            // unambiguous AND BridgeFilter's dict-popcount-aware
+            // i32 kernel beats DataFusion's FilterExec at SF=10.
             ColumnPredicate::I32Range { .. } | ColumnPredicate::I32In { .. } => true,
-            // Byte-equality matches Arrow's `eq_utf8`.
+            // Σ.AE.1 (2026-05-26): Byte-equality matches Arrow's
+            // `eq_utf8` semantically, BUT FilterExec running on
+            // already-decoded Arrow batches is *faster* than
+            // BridgeFilter on parquet-encoded strings for the
+            // TPC-H string-filter shapes — Arrow's string-eq kernel
+            // is highly tuned for contiguous batches. So even
+            // though string predicates COULD be declared Exact,
+            // doing so regresses Q03 (`c_mktsegment='BUILDING'`)
+            // and similar at SF=10. Keep them Inexact so
+            // FilterExec runs after the BridgeFilter has reduced
+            // the row count. The bridge still does the heavy
+            // filter; the residual FilterExec is cheap on the
+            // already-narrow surviving rows.
             ColumnPredicate::StringEq { .. }
             | ColumnPredicate::StringNotEq { .. }
-            | ColumnPredicate::StringIn { .. } => true,
+            | ColumnPredicate::StringIn { .. } => false,
             // LIKE is Exact only when `LikeMatcher::compile` accepts
             // the pattern (no `_`, no escape). Otherwise our matcher
             // can't represent the pattern → Inexact.
@@ -1235,6 +1470,54 @@ pub struct EmatixFastParquetTableProvider {
     streaming_arrow_reader: bool,
 }
 
+/// Σ.Q06.SF10 (2026-05-28): cached metadata-derived state for
+/// `EmatixFastParquetTableProvider`. Populating these on every
+/// `try_new` call is expensive — `column_stats` runs the dict-page
+/// distinct-count walk (Σ.AH.2 Story 1'.2), which decompresses every
+/// dict page of every row group with Snappy. For SF=10 lineitem
+/// that's up to 928 Snappy decompresses per construction. Profiled
+/// at ~2 ms/Q06-trial in `EMAT_SKIP_DICT_DISTINCT=1` A/B but the
+/// underlying SerializedPageReader cost is higher when accumulated
+/// across all 22 queries. Cache lives in `provider_meta_cache()`
+/// keyed by (canonical-path, file-size, mtime-nanos) so a file
+/// edit invalidates the entry.
+#[derive(Clone)]
+struct CachedProviderMeta {
+    schema: SchemaRef,
+    num_row_groups: usize,
+    num_rows: usize,
+    rg_num_rows: Arc<Vec<usize>>,
+    column_stats: Arc<Vec<datafusion::common::stats::ColumnStatistics>>,
+    column_is_dict_encoded: Arc<Vec<bool>>,
+    column_has_no_nulls: Arc<Vec<bool>>,
+}
+
+type ProviderMetaCacheKey = (PathBuf, u64, u128);
+
+static PROVIDER_META_CACHE: OnceLock<Mutex<HashMap<ProviderMetaCacheKey, CachedProviderMeta>>> =
+    OnceLock::new();
+
+fn provider_meta_cache() -> &'static Mutex<HashMap<ProviderMetaCacheKey, CachedProviderMeta>> {
+    PROVIDER_META_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Build a stable cache key from a file path. Uses canonical path +
+/// `len` + `mtime` (nanos) so the entry invalidates when the file
+/// changes underneath us. Returns `None` if any stat-call fails —
+/// the caller then bypasses the cache and constructs fresh.
+fn provider_meta_cache_key(path: &str) -> Option<ProviderMetaCacheKey> {
+    let canonical = std::fs::canonicalize(path).ok()?;
+    let metadata = std::fs::metadata(&canonical).ok()?;
+    let size = metadata.len();
+    let mtime_nanos = metadata
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    Some((canonical, size, mtime_nanos))
+}
+
 impl EmatixFastParquetTableProvider {
     /// Open the parquet file, validate that every column is one of the
     /// primitive types the bridge supports, and build the Arrow
@@ -1242,21 +1525,40 @@ impl EmatixFastParquetTableProvider {
     /// callers don't discover this mid-scan.
     pub fn try_new(path: impl Into<String>) -> DfResult<Self> {
         let path = path.into();
-        let file = File::open(&path).map_err(|e| {
-            DataFusionError::External(
-                format!("EmatixFastParquetTableProvider: open `{path}`: {e}").into(),
-            )
-        })?;
-        // Use parquet-rs to extract the Arrow schema. The bridge
-        // operates on raw column chunks; we still need parquet-rs
-        // to translate parquet types into Arrow types for the
-        // RecordBatch schema we'll build.
-        let opts = ArrowReaderOptions::new();
-        let meta = ArrowReaderMetadata::load(&file, opts).map_err(|e| {
+        // Σ.Q06.SF10 (2026-05-28): check process-global metadata cache
+        // first. On hit, skip the entire SerializedFileReader path
+        // (Snappy decompress of dict pages, encoding-stats walk,
+        // no-nulls walk) and build `Self` directly from cached Arc'd
+        // fields. Opt-out via `EMAT_NO_PROVIDER_CACHE=1`.
+        let use_cache = std::env::var("EMAT_NO_PROVIDER_CACHE")
+            .ok()
+            .map(|v| !(v == "1" || v.eq_ignore_ascii_case("true")))
+            .unwrap_or(true);
+        if use_cache {
+            if let Some(key) = provider_meta_cache_key(&path) {
+                let cached = provider_meta_cache().lock().unwrap().get(&key).cloned();
+                if let Some(meta) = cached {
+                    return Ok(Self::from_cached_meta(path, meta));
+                }
+            }
+        }
+        // Σ.Q06.SF10.5.c (2026-05-28): load all metadata-derived state
+        // (raw schema, num_rows, num_row_groups, rg_num_rows,
+        // column_stats, column_is_dict_encoded, column_has_no_nulls)
+        // in one pass via ematix-parquet — NO parquet-rs. Byte-identical
+        // to the old `ArrowReaderMetadata::load` + `SerializedFileReader`
+        // path, verified across all 8 TPC-H tables by
+        // `examples/emat_meta_parity.rs` (0 mismatches).
+        let em = crate::emat_parquet_metadata::load_provider_metadata(&path).map_err(|e| {
             DataFusionError::External(
                 format!("EmatixFastParquetTableProvider: load metadata: {e}").into(),
             )
         })?;
+        let num_rows = em.num_rows;
+        let num_row_groups = em.num_row_groups;
+        let rg_num_rows: Arc<Vec<usize>> = Arc::new(em.rg_num_rows);
+        let column_is_dict_encoded: Arc<Vec<bool>> = Arc::new(em.column_is_dict_encoded);
+        let column_has_no_nulls: Arc<Vec<bool>> = Arc::new(em.column_has_no_nulls);
         // Σ.E5 (2026-05-18): promote Utf8 → Utf8View at `try_new` time.
         // The streaming reader path emits `StringViewArray`, and that's
         // the default since Σ.E5.4.b. Previously this promotion only
@@ -1268,7 +1570,7 @@ impl EmatixFastParquetTableProvider {
         // — no builder calls). `with_streaming_arrow_reader(false)`
         // reverts the promotion for the bridge path. Dict preservation
         // composes via its own Utf8→Dictionary rewrite.
-        let raw_schema = meta.schema().clone();
+        let raw_schema = em.schema.clone();
         let promoted_fields: Vec<Arc<arrow_schema::Field>> = raw_schema
             .fields()
             .iter()
@@ -1310,99 +1612,129 @@ impl EmatixFastParquetTableProvider {
             }
         }
 
-        let reader = SerializedFileReader::new(File::open(&path).map_err(|e| {
-            DataFusionError::External(
-                format!("EmatixFastParquetTableProvider: reopen `{path}`: {e}").into(),
-            )
-        })?)
-        .map_err(|e| {
-            DataFusionError::External(
-                format!("EmatixFastParquetTableProvider: SerializedFileReader: {e}").into(),
-            )
-        })?;
-        let fmd = reader.metadata().file_metadata();
-        let num_rows = fmd.num_rows() as usize;
-        let num_row_groups = reader.metadata().num_row_groups();
-        let rg_num_rows: Arc<Vec<usize>> = Arc::new(
-            reader
-                .metadata()
-                .row_groups()
-                .iter()
-                .map(|rg| rg.num_rows() as usize)
-                .collect(),
-        );
-
-        // Σ.E5 (2026-05-18): aggregate typed per-column stats so
-        // `partition_statistics` returns real cardinality info to the
-        // planner. Reuses the helper in `fast_parquet.rs` — both
-        // providers read the same parquet-rs `ParquetMetaData`.
-        let column_stats = Arc::new(crate::fast_parquet::aggregate_column_statistics(
-            reader.metadata(),
-            schema.as_ref(),
-        ));
-
-        // Σ.E5: detect columns where EVERY row group has every data
-        // page dict-encoded (RleDictionary or PlainDictionary).
-        // Mere `dictionary_page_offset.is_some()` isn't sufficient —
-        // writers can include a dict page AND fall back to PLAIN for
-        // some data pages mid-chunk (Q13's o_comment, Q20's p_name).
-        // We check via `encoding_stats`: every data page must be
-        // dict-encoded. Used by supports_filters_pushdown to gate
-        // LIKE acceptance — dict-encoded columns let the per-entry
-        // predicate eval run O(|dict|).
-        use datafusion::parquet::basic::{Encoding as PqEnc, PageType as PqPageType};
+        // num_rows / num_row_groups / rg_num_rows / column_is_dict_encoded
+        // / column_has_no_nulls all came from `em` (Σ.Q06.SF10.5.c) above.
+        // `column_stats` here carries the aggregated numeric min/max +
+        // null_count; the gated dict-distinct walk below may enrich
+        // distinct_count.
         let num_cols_in_schema = schema.fields().len();
-        let mut all_dict: Vec<bool> = vec![true; num_cols_in_schema];
-        for rg in reader.metadata().row_groups() {
-            #[allow(clippy::needless_range_loop)]
-            for col_idx in 0..num_cols_in_schema.min(rg.columns().len()) {
-                if !all_dict[col_idx] {
-                    continue;
-                }
-                let col = rg.column(col_idx);
-                if col.dictionary_page_offset().is_none() {
-                    all_dict[col_idx] = false;
-                    continue;
-                }
-                // Must have encoding stats AND every data page must
-                // be dict-encoded.
-                let Some(stats) = col.page_encoding_stats() else {
-                    // Stats absent — conservatively mark non-dict to
-                    // avoid false-positive LIKE pushdowns.
-                    all_dict[col_idx] = false;
-                    continue;
-                };
-                let all_data_pages_dict = stats.iter().all(|s| {
-                    !matches!(
-                        s.page_type,
-                        PqPageType::DATA_PAGE | PqPageType::DATA_PAGE_V2
-                    ) || matches!(s.encoding, PqEnc::RLE_DICTIONARY | PqEnc::PLAIN_DICTIONARY)
-                });
-                if !all_data_pages_dict {
-                    all_dict[col_idx] = false;
-                }
-            }
-        }
-        let column_is_dict_encoded: Arc<Vec<bool>> = Arc::new(all_dict);
+        let mut column_stats = Arc::new(em.column_stats);
 
-        // Σ.E5 per-filter Exact (2026-05-19): per-column no-nulls
-        // flag. `null_count_opt() == Some(0)` for every RG = safe.
-        // Stats missing → conservatively false (may have nulls).
-        let mut no_nulls: Vec<bool> = vec![true; num_cols_in_schema];
-        for rg in reader.metadata().row_groups() {
-            #[allow(clippy::needless_range_loop)]
-            for col_idx in 0..num_cols_in_schema.min(rg.columns().len()) {
-                if !no_nulls[col_idx] {
-                    continue;
+        // Σ.AH.2 Story 1'.2 (2026-05-26) — for every column that has
+        // a dictionary page in EVERY row group, read each dict page's
+        // `num_values` and take the MAX across RGs as a distinct_count
+        // estimate. Without this, `ColumnStatistics::distinct_count`
+        // stays Absent and `ColumnPredicate::StringEq::estimate_pass_rate`
+        // falls through to its 0.1 default — over-estimating
+        // post-filter cardinality on TPC-H string-Eq filters (p_type
+        // shows 200k vs real 13k), which then fails the L9 ratio gate.
+        // Taking the max-per-RG is a lower bound on global distinct
+        // count (uniformly-distributed columns give exact; clustered
+        // columns give a conservative under-estimate, which is the
+        // safe direction for the bloom rule — slight under-count of
+        // distinct keeps post-filter rows estimated high, biasing
+        // the gate against false-positive blooms).
+        //
+        // Note: this is decoupled from `column_is_dict_encoded` (which
+        // also requires `page_encoding_stats` for LIKE pushdown safety).
+        // We only need the dict page to exist — even mixed dict+PLAIN
+        // data pages still have a dict that tells us distinct count.
+        //
+        // Cost: one decode of each dict page (typically 1-10 KB per
+        // RG); a few ms per provider construction. Cached for the
+        // session via `column_stats`.
+        // Σ.Q06.SF10.5.a (2026-05-28): dict-page distinct-count walk
+        // via ematix-parquet — reads only the uncompressed Thrift
+        // page header at each dict_page_offset, no Snappy decompress.
+        // See `crate::emat_parquet_metadata`. The diagnostic harness
+        // at `examples/q06_dict_distinct_compare.rs` confirms the
+        // ematix-parquet walker produces byte-identical num_values
+        // to the parquet-rs `SerializedPageReader::get_next_page`
+        // path on TPC-H lineitem SF=10 (all 16 columns match).
+        //
+        // Σ.Q06.SF10.5.h (2026-05-28): the walk itself default-flipped
+        // to SKIP. Strict 22q SF=10 A/B (walk on vs walk off, both
+        // with cache, autotune disabled): net **-4.35% (-145.09 ms)**
+        // — Q18 -26.55% (-97 ms), Q17 -21.52% (-41 ms), Q21 -18.11%
+        // (-64 ms) all clear >2σ wins; Q02 +9.77% (+2.9 ms) only
+        // regression. The populated distinct_count drives L9's
+        // selectivity gate to fire blooms whose probe overhead
+        // exceeds the savings on Q17/Q18/Q21 shapes. The Σ.AH.2
+        // Story 1'.3 finding ("emat-stats-aware selectivity helps")
+        // has been outpaced by post-2026-05-26 L9 changes.
+        //
+        // Opt back in via `EMAT_DICT_DISTINCT=1`. The proper fix is at
+        // the L9 selectivity gate, not here — tracked as Σ.Q06.SF10.5.h
+        // follow-up. (The legacy parquet-rs walker was removed in
+        // Σ.Q06.SF10.5.c; only the ematix-parquet header-only walk
+        // remains.)
+        let dict_distinct_enabled = std::env::var("EMAT_DICT_DISTINCT")
+            .ok()
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        // Σ.Q06.SF10.5.h.1: small-table-only dict-distinct walk. The
+        // walk default-flipped OFF in .5.h because populating
+        // distinct_count perturbed DataFusion's cost-based plan on
+        // Q17/Q18/Q21 (lineitem/orders-heavy) — a planner effect, NOT
+        // an L9 over-fire (L9 firings are byte-identical with/without
+        // the walk, verified by EMAT_L9_TRACE). The harm is tied to
+        // LARGE fact-table distinct_count; small dimension tables
+        // (part/supplier/customer/...) benefit (Q02). This gate runs
+        // the walk only when the file has ≤ `EMAT_DICT_DISTINCT_MAX_ROWS`
+        // rows (default 0 = off, preserving .5.h). Set e.g.
+        // `EMAT_DICT_DISTINCT_MAX_ROWS=10000000` to walk everything
+        // except lineitem (60M) + orders (15M) at SF=10.
+        let max_rows_for_walk: usize = std::env::var("EMAT_DICT_DISTINCT_MAX_ROWS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        let walk_by_size = max_rows_for_walk > 0 && num_rows <= max_rows_for_walk;
+        // Legacy `EMAT_SKIP_DICT_DISTINCT=1` still forces skip for
+        // explicit A/B work, but the default behaviour is now skip.
+        let force_skip = std::env::var("EMAT_SKIP_DICT_DISTINCT")
+            .ok()
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        let skip_dict_distinct = force_skip || !(dict_distinct_enabled || walk_by_size);
+        if !skip_dict_distinct {
+            use datafusion::common::stats::Precision;
+            // ematix-parquet header-only walk (no Snappy decompress).
+            if let Ok(distinct_maxes) = crate::emat_parquet_metadata::dict_distinct_max_per_column(
+                &path,
+                num_cols_in_schema,
+            ) {
+                let mut column_stats_vec: Vec<datafusion::common::stats::ColumnStatistics> =
+                    (*column_stats).clone();
+                #[allow(clippy::needless_range_loop)] // col_idx also indexes distinct_maxes
+                for col_idx in 0..num_cols_in_schema {
+                    if let Some(max_distinct) = distinct_maxes.get(col_idx).copied().flatten() {
+                        if max_distinct > 0 {
+                            column_stats_vec[col_idx].distinct_count =
+                                Precision::Inexact(max_distinct);
+                        }
+                    }
                 }
-                let col = rg.column(col_idx);
-                match col.statistics().and_then(|s| s.null_count_opt()) {
-                    Some(0) => {}
-                    _ => no_nulls[col_idx] = false,
-                }
+                column_stats = Arc::new(column_stats_vec);
             }
         }
-        let column_has_no_nulls: Arc<Vec<bool>> = Arc::new(no_nulls);
+
+        // Σ.Q06.SF10: populate the process-global cache before
+        // returning. Subsequent constructions for the same file
+        // skip the SerializedPageReader path entirely.
+        if use_cache {
+            if let Some(key) = provider_meta_cache_key(&path) {
+                let meta = CachedProviderMeta {
+                    schema: schema.clone(),
+                    num_row_groups,
+                    num_rows,
+                    rg_num_rows: rg_num_rows.clone(),
+                    column_stats: column_stats.clone(),
+                    column_is_dict_encoded: column_is_dict_encoded.clone(),
+                    column_has_no_nulls: column_has_no_nulls.clone(),
+                };
+                provider_meta_cache().lock().unwrap().insert(key, meta);
+            }
+        }
 
         Ok(Self {
             path,
@@ -1429,6 +1761,25 @@ impl EmatixFastParquetTableProvider {
             // Q13/Q16/Q19/Q22). Closing them is the next bite.
             streaming_arrow_reader: true,
         })
+    }
+
+    /// Σ.Q06.SF10 (2026-05-28): fast-path constructor used when the
+    /// process-global metadata cache has an entry for this file.
+    /// Defaults match `try_new`'s slow-path return.
+    fn from_cached_meta(path: String, meta: CachedProviderMeta) -> Self {
+        Self {
+            path,
+            schema: meta.schema,
+            num_row_groups: meta.num_row_groups,
+            num_rows: meta.num_rows,
+            rg_num_rows: meta.rg_num_rows,
+            column_stats: meta.column_stats,
+            column_is_dict_encoded: meta.column_is_dict_encoded,
+            column_has_no_nulls: meta.column_has_no_nulls,
+            late_mat: true,
+            dict_preservation: false,
+            streaming_arrow_reader: true,
+        }
     }
 
     /// Σ.E5a: opt into / out of the Π.10 late-materialisation path.
@@ -1565,14 +1916,21 @@ impl TableProvider for EmatixFastParquetTableProvider {
     /// so logical optimizer rules can distinguish dim vs fact tables.
     /// `num_rows` is read from parquet `FileMetadata::num_rows` at
     /// registration time, so it's exact for unfiltered scans.
+    ///
+    /// Σ.T Phase 1 (2026-05-25): also surface the typed per-column
+    /// min/max/null_count that `try_new` already cached on
+    /// `self.column_stats` (via `aggregate_column_statistics`). Without
+    /// this the logical join planner can only distinguish tables by
+    /// row count — predicate selectivity stays invisible, so
+    /// region/nation filters never propagate to "join smaller pool
+    /// first" decisions. The Exec's `partition_statistics` has
+    /// returned these all along; this just plumbs the same data to
+    /// the TableProvider surface used by logical planning.
     fn statistics(&self) -> Option<datafusion::common::Statistics> {
         Some(datafusion::common::Statistics {
             num_rows: datafusion::common::stats::Precision::Exact(self.num_rows),
             total_byte_size: datafusion::common::stats::Precision::Absent,
-            column_statistics: vec![
-                datafusion::common::ColumnStatistics::new_unknown();
-                self.schema.fields().len()
-            ],
+            column_statistics: (*self.column_stats).clone(),
         })
     }
 
@@ -1600,6 +1958,18 @@ impl TableProvider for EmatixFastParquetTableProvider {
         filters: &[&Expr],
     ) -> DfResult<Vec<TableProviderFilterPushDown>> {
         if self.dict_preservation {
+            return Ok(filters
+                .iter()
+                .map(|_| TableProviderFilterPushDown::Unsupported)
+                .collect());
+        }
+        // Σ.Q06.SF10.7 diagnostic: force all filters to stay in
+        // DataFusion's residual FilterExec (no pushdown), so filter-
+        // bearing scans run the dense streaming path instead of the
+        // per-RG late-mat masked path. Tests whether the late-mat
+        // orchestration — not the decode kernels — is the Q06 SF=10
+        // bottleneck.
+        if std::env::var_os("EMAT_NO_FILTER_PUSHDOWN").is_some() {
             return Ok(filters
                 .iter()
                 .map(|_| TableProviderFilterPushDown::Unsupported)
@@ -1840,6 +2210,22 @@ impl EmatixFastParquetExec {
         &self.path
     }
 
+    /// Σ.AH.2 Story 1'.3 — projected per-column statistics carrying
+    /// min/max/null_count/distinct_count. Indexed by the Exec's own
+    /// (projected) schema, NOT by file-schema indices. Exposed for
+    /// the L9 sideband rule so it can compute filter selectivity
+    /// using accurate distinct_count populated by Story 1'.2 instead
+    /// of relying on DataFusion's default-0.2 FilterExec selectivity.
+    pub fn column_stats(&self) -> &[datafusion::common::stats::ColumnStatistics] {
+        &self.column_stats
+    }
+
+    /// Σ.AH.2 Story 1'.3 — raw (pre-filter) total rows in the file.
+    /// Used by the L9 rule's emat-stats-aware build-rows estimate.
+    pub fn num_rows(&self) -> usize {
+        self.num_rows
+    }
+
     /// Σ.Q.L4′ — append extra predicates (e.g. I64InBloom from a
     /// build-side bloom emitter) onto this scan's BridgeFilter. If
     /// no filter existed, creates one from the supplied predicates.
@@ -1874,6 +2260,33 @@ impl EmatixFastParquetExec {
             properties: self.properties.clone(),
             metrics: ExecutionPlanMetricsSet::new(),
         }))
+    }
+
+    /// Σ.Q06.SF10.8 — return a filter-stripped clone that takes the
+    /// dense streaming decode path. When a downstream `FusedAggregateExec`
+    /// re-applies the predicate itself, the scan's pushed-down
+    /// `BridgeFilter` is redundant — and the masked late-materialization
+    /// decode it triggers is ~2× slower than dense decode feeding the
+    /// JIT fused filter-agg kernel (Q06 SF=10: ~89→~55 ms). Keeps any
+    /// runtime sideband (callers gate on its absence so join-probe
+    /// scans keep their L9 bloom). See [[q06-masked-pushdown-waste]].
+    pub fn without_filter(&self) -> Arc<Self> {
+        Arc::new(Self {
+            path: self.path.clone(),
+            schema: self.schema.clone(),
+            file_schema: self.file_schema.clone(),
+            projection: self.projection.clone(),
+            assignments: self.assignments.clone(),
+            num_rows: self.num_rows,
+            rg_num_rows: self.rg_num_rows.clone(),
+            filter: None,
+            late_mat: self.late_mat,
+            streaming_arrow_reader: self.streaming_arrow_reader,
+            column_stats: self.column_stats.clone(),
+            runtime_sideband: self.runtime_sideband.clone(),
+            properties: self.properties.clone(),
+            metrics: ExecutionPlanMetricsSet::new(),
+        })
     }
 
     fn clone_internals(&self) -> Self {
@@ -2124,21 +2537,90 @@ impl ExecutionPlan for EmatixFastParquetExec {
         // side, which is suboptimal for queries like Q21 where
         // pre-filter cardinalities are wildly different across joined
         // tables (e.g. nation = 25 rows vs lineitem = 6 M).
-        let rows = match partition {
+        let raw_rows = match partition {
             Some(p) if p < self.assignments.len() => self.num_rows / self.assignments.len().max(1),
             None => self.num_rows,
             _ => 0,
         };
+        // Σ.AE.1 / Σ.AE.4 (2026-05-26): when a BridgeFilter is pushed
+        // down AND Exact pushdown is enabled (so FilterExec is being
+        // dropped for some predicates), report the post-filter
+        // cardinality for those predicates so the planner picks join
+        // build sides correctly. Otherwise Exact pushdown breaks
+        // queries like Q21 — the planner sees orders at unfiltered
+        // 15M, picks lineitem (60M) as the build side, and
+        // catastrophically regresses (+124% in the 2026-05-26 Exact
+        // bench).
+        //
+        // Critically, only apply pass-rate for the Exact-declared
+        // predicates. For Inexact-declared ones (string predicates
+        // under our string-gate; all predicates under default mode),
+        // FilterExec is still in the plan and DataFusion's planner
+        // applies the predicate's selectivity on top of our reported
+        // cardinality. Pre-applying it here would double-count: Q10
+        // SF=10's lineitem returnflag filter double-counted to 1.8M
+        // (vs honest 15M), fooling the planner into picking lineitem
+        // as the build side (15M-row hash) and regressing wall time
+        // by +17% / ~40 ms.
+        let exact_opt_in = std::env::var_os("EMAT_EXACT_PUSHDOWN").is_some();
+        let (rows, filtered) = if let Some(filter) = &self.filter {
+            let sel = filter.estimate_dropped_filter_pass_rate(&self.column_stats, exact_opt_in);
+            if sel < 1.0 {
+                let r = ((raw_rows as f64) * sel) as usize;
+                (r.max(1), true)
+            } else {
+                (raw_rows, false)
+            }
+        } else {
+            (raw_rows, false)
+        };
         let mut s = Statistics::new_unknown(&self.schema);
-        // Exact for whole-table; per-partition is an even split, so
-        // mark Inexact to signal the planner not to over-rely on it.
-        s.num_rows = if partition.is_none() {
+        // Mark Inexact whenever a filter is in play — even our Exact-
+        // safe predicates ride a selectivity estimate, not a true
+        // count. Without the filter we keep the precise count.
+        s.num_rows = if filtered {
+            datafusion::common::stats::Precision::Inexact(rows)
+        } else if partition.is_none() {
             datafusion::common::stats::Precision::Exact(rows)
         } else {
             datafusion::common::stats::Precision::Inexact(rows)
         };
         s.column_statistics = self.column_stats.clone();
         Ok(s)
+    }
+}
+
+/// Σ.Q06.SF10.8 — descend through single-child wrapper operators and
+/// strip the redundant static `BridgeFilter` from any
+/// `EmatixFastParquetExec` that carries no runtime sideband, returning
+/// a dense-decode clone. Stops at leaves and multi-child nodes (joins),
+/// so scans feeding a join keep their pushdown — that preserves the
+/// join queries (Q12/Q19), while the fused-agg shape (Q06/Q01/Q14) has
+/// only linear operators between the fused op and its scan.
+///
+/// ONLY sound to call on the input of a `FusedAggregateExec`, which
+/// re-applies the predicate from the dropped `FilterExec` itself — so
+/// the scan's pre-filter is pure redundant (and slow, masked) work.
+/// See [[q06-masked-pushdown-waste]].
+pub fn strip_redundant_scan_filter(plan: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
+    if let Some(scan) = plan.as_any().downcast_ref::<EmatixFastParquetExec>() {
+        if scan.filter().is_some() && scan.runtime_sideband().is_none() {
+            return scan.without_filter();
+        }
+        return plan;
+    }
+    let children = plan.children();
+    if children.len() != 1 {
+        return plan;
+    }
+    let child = Arc::clone(children[0]);
+    let new_child = strip_redundant_scan_filter(Arc::clone(&child));
+    if Arc::ptr_eq(&new_child, &child) {
+        return plan;
+    }
+    match Arc::clone(&plan).with_new_children(vec![new_child]) {
+        Ok(p) => p,
+        Err(_) => plan,
     }
 }
 
@@ -2719,11 +3201,10 @@ fn decode_one_rg_filtered_late_mat(
     // Open the parquet file once for this row group. The masked_into
     // façade caches column-chunk bytes internally; opening the
     // ParquetFile is the only IO setup we need.
-    let file = ematix_parquet_io::ParquetFile::open(path).map_err(|e| {
-        DataFusionError::External(
-            format!("EmatixFastParquetExec (late_mat): ParquetFile::open: {e}").into(),
-        )
-    })?;
+    // Σ.Q06.SF10.7: reuse a process-cached handle so the footer is
+    // read + parsed once per file rather than once per (row-group ×
+    // pass). build_bitmap + masked_decode below all share it.
+    let file = crate::ematix_parquet_bridge::open_cached(path)?;
     // Σ.E5 #513: multi-column AND bitmap via BridgeFilter.
     let (bitmap, _total) = filter.build_bitmap(path, rg)?;
 
@@ -3648,6 +4129,216 @@ mod tests {
         assert!(
             fp_rate < 0.05,
             "bloom false-positive rate {fp_rate:.4} exceeds 5%"
+        );
+    }
+
+    /// Σ.T Phase 1 (2026-05-25): `TableProvider::statistics()` must
+    /// surface per-column min/max/null_count derived from parquet
+    /// row-group metadata. Without this the logical planner has only
+    /// `num_rows` to work with, so it can't reorder joins by
+    /// predicate selectivity.
+    ///
+    /// The infra (`aggregate_column_statistics` + cached `column_stats`)
+    /// is already in place — used by `partition_statistics` on the
+    /// Exec — but the TableProvider's own `statistics()` impl ignored
+    /// it and returned `new_unknown` for every column. This test
+    /// guards the wire-up.
+    #[tokio::test]
+    async fn table_provider_statistics_exposes_typed_column_stats() {
+        use datafusion::common::ScalarValue;
+        use datafusion::common::stats::Precision;
+        use datafusion::parquet::basic::{Compression, Repetition, Type as PhysicalType};
+        use datafusion::parquet::column::writer::ColumnWriter;
+        use datafusion::parquet::file::properties::WriterProperties;
+        use datafusion::parquet::file::writer::SerializedFileWriter;
+        use datafusion::parquet::schema::types::Type as PType;
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+
+        let pschema = Arc::new(
+            PType::group_type_builder("schema")
+                .with_fields(vec![
+                    Arc::new(
+                        PType::primitive_type_builder("a", PhysicalType::INT32)
+                            .with_repetition(Repetition::REQUIRED)
+                            .build()
+                            .unwrap(),
+                    ),
+                    Arc::new(
+                        PType::primitive_type_builder("b", PhysicalType::INT64)
+                            .with_repetition(Repetition::REQUIRED)
+                            .build()
+                            .unwrap(),
+                    ),
+                ])
+                .build()
+                .unwrap(),
+        );
+        let props = Arc::new(
+            WriterProperties::builder()
+                .set_compression(Compression::SNAPPY)
+                .build(),
+        );
+        let file = File::create(&path).unwrap();
+        let mut writer = SerializedFileWriter::new(file, pschema, props).unwrap();
+        let mut rg = writer.next_row_group().unwrap();
+        let a: Vec<i32> = (10..1010).collect();
+        let mut col = rg.next_column().unwrap().unwrap();
+        if let ColumnWriter::Int32ColumnWriter(t) = col.untyped() {
+            t.write_batch(&a, None, None).unwrap();
+        }
+        col.close().unwrap();
+        let b: Vec<i64> = (0..1000i64).map(|i| i * 100).collect();
+        let mut col = rg.next_column().unwrap().unwrap();
+        if let ColumnWriter::Int64ColumnWriter(t) = col.untyped() {
+            t.write_batch(&b, None, None).unwrap();
+        }
+        col.close().unwrap();
+        rg.close().unwrap();
+        writer.close().unwrap();
+
+        let provider =
+            EmatixFastParquetTableProvider::try_new(path.to_string_lossy().to_string()).unwrap();
+        let stats = provider.statistics().expect("provider must publish stats");
+        assert_eq!(stats.num_rows, Precision::Exact(1000));
+        assert_eq!(
+            stats.column_statistics.len(),
+            2,
+            "one ColumnStatistics per schema field"
+        );
+
+        // Column `a` — i32 in [10, 1009], no nulls
+        let cs_a = &stats.column_statistics[0];
+        assert_eq!(
+            cs_a.null_count,
+            Precision::Exact(0),
+            "column a: null_count should be Exact(0), got {:?}",
+            cs_a.null_count
+        );
+        assert_eq!(
+            cs_a.min_value,
+            Precision::Exact(ScalarValue::Int32(Some(10))),
+            "column a: min_value should be Exact(10), got {:?}",
+            cs_a.min_value
+        );
+        assert_eq!(
+            cs_a.max_value,
+            Precision::Exact(ScalarValue::Int32(Some(1009))),
+            "column a: max_value should be Exact(1009), got {:?}",
+            cs_a.max_value
+        );
+
+        // Column `b` — i64 in [0, 99_900]
+        let cs_b = &stats.column_statistics[1];
+        assert_eq!(cs_b.null_count, Precision::Exact(0));
+        assert_eq!(
+            cs_b.min_value,
+            Precision::Exact(ScalarValue::Int64(Some(0)))
+        );
+        assert_eq!(
+            cs_b.max_value,
+            Precision::Exact(ScalarValue::Int64(Some(99_900)))
+        );
+    }
+
+    /// Σ.AH.2 Story 1'.2 — on the actual TPC-H SF=10 part.parquet,
+    /// the p_type column should land with `distinct_count =
+    /// Inexact(150)` (150 unique p_type values in TPC-H). Skipped if
+    /// the SF=10 dataset isn't present (e.g. CI).
+    #[tokio::test]
+    #[ignore = "dict-distinct walk is opt-in (default-skipped, EMAT_DICT_DISTINCT); see commit 22e1f6e — run with EMAT_DICT_DISTINCT=1"]
+    async fn tpch_part_p_type_distinct_count_is_150() {
+        use datafusion::common::stats::Precision;
+        use std::path::PathBuf;
+        let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let path = manifest
+            .parent()
+            .and_then(|p| p.parent())
+            .map(|p| p.join("examples/tpch/data/sf10/part.parquet"));
+        let Some(path) = path.filter(|p| p.exists()) else {
+            eprintln!("TPC-H SF=10 part.parquet not present; skipping");
+            return;
+        };
+        let provider =
+            EmatixFastParquetTableProvider::try_new(path.to_string_lossy().to_string()).unwrap();
+        let stats = provider.statistics().unwrap();
+        // p_type is field index 4 in part schema
+        let cs = &stats.column_statistics[4];
+        assert!(
+            matches!(cs.distinct_count, Precision::Inexact(n) if n == 150),
+            "p_type distinct_count should be Inexact(150), got {:?}",
+            cs.distinct_count
+        );
+    }
+
+    /// Σ.AH.2 Story 1'.2 (2026-05-26) — for dict-encoded string
+    /// columns, `column_stats[col].distinct_count` should be populated
+    /// from the parquet dict-page `num_values` (max across RGs).
+    /// Without this, `ColumnPredicate::StringEq::estimate_pass_rate`
+    /// falls through to its 0.1 default and the L9 ratio gate
+    /// over-estimates post-filter cardinality.
+    ///
+    /// Builds a parquet file with a Utf8 column carrying 5 distinct
+    /// values × 1000 rows. After construction, distinct_count should
+    /// be `Inexact(5)` (dict pages will dedup the 5 entries).
+    #[tokio::test]
+    #[ignore = "dict-distinct walk is opt-in (default-skipped, EMAT_DICT_DISTINCT); see commit 22e1f6e — run with EMAT_DICT_DISTINCT=1"]
+    async fn dict_encoded_string_column_populates_distinct_count() {
+        use datafusion::common::stats::Precision;
+        use datafusion::parquet::basic::{Compression, Repetition, Type as PhysicalType};
+        use datafusion::parquet::column::writer::ColumnWriter;
+        use datafusion::parquet::data_type::ByteArray;
+        use datafusion::parquet::file::properties::WriterProperties;
+        use datafusion::parquet::file::writer::SerializedFileWriter;
+        use datafusion::parquet::schema::types::Type as PType;
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+
+        let pschema = Arc::new(
+            PType::group_type_builder("schema")
+                .with_fields(vec![Arc::new(
+                    PType::primitive_type_builder("s", PhysicalType::BYTE_ARRAY)
+                        .with_repetition(Repetition::REQUIRED)
+                        .with_converted_type(datafusion::parquet::basic::ConvertedType::UTF8)
+                        .build()
+                        .unwrap(),
+                )])
+                .build()
+                .unwrap(),
+        );
+        let props = Arc::new(
+            WriterProperties::builder()
+                .set_compression(Compression::SNAPPY)
+                .set_dictionary_enabled(true)
+                .build(),
+        );
+        let file = File::create(&path).unwrap();
+        let mut writer = SerializedFileWriter::new(file, pschema, props).unwrap();
+        let mut rg = writer.next_row_group().unwrap();
+        // 5 distinct values × 200 reps = 1000 rows. Dict page will
+        // carry exactly 5 entries.
+        let values: Vec<ByteArray> = (0..1000)
+            .map(|i| ByteArray::from(format!("v{}", i % 5).into_bytes()))
+            .collect();
+        let mut col = rg.next_column().unwrap().unwrap();
+        if let ColumnWriter::ByteArrayColumnWriter(t) = col.untyped() {
+            t.write_batch(&values, None, None).unwrap();
+        }
+        col.close().unwrap();
+        rg.close().unwrap();
+        writer.close().unwrap();
+
+        let provider =
+            EmatixFastParquetTableProvider::try_new(path.to_string_lossy().to_string()).unwrap();
+        let stats = provider.statistics().expect("provider must publish stats");
+        let cs = &stats.column_statistics[0];
+        assert_eq!(
+            cs.distinct_count,
+            Precision::Inexact(5),
+            "dict-encoded string col should report distinct_count=Inexact(5), got {:?}",
+            cs.distinct_count
         );
     }
 }

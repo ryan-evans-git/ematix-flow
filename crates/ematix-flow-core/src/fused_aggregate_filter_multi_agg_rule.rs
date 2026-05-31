@@ -346,6 +346,19 @@ fn try_build_replacement(matched: &MatchedSubtree) -> DfResult<Option<Arc<dyn Ex
         Err(_) => return Ok(None),
     };
 
+    // Σ.Q06.SF10.8: the fused multi-agg kernel re-applies the predicate,
+    // so a pushed-down BridgeFilter on the scan is redundant; its masked
+    // late-mat decode is ~2× slower than dense decode feeding the JIT
+    // kernel. Strip it (the spec above already resolved its column
+    // indices against the original scan schema, which is unchanged).
+    // Default-on; validated net-positive in the 22q SF=10 strict A/B
+    // (0 regressions). Opt out with EMAT_NO_STRIP_FUSED_SCAN_FILTER=1.
+    let scan = if std::env::var_os("EMAT_NO_STRIP_FUSED_SCAN_FILTER").is_some() {
+        scan
+    } else {
+        crate::ematix_fast_parquet::strip_redundant_scan_filter(scan)
+    };
+
     // Σ.G.2f.3 perf (2026-05-19): FusedAggregateExec now fans out
     // *internally* via async-channel MPMC, so we don't need to wrap
     // the scan in RepartitionExec(RoundRobinBatch) anymore. The agg

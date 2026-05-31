@@ -17,6 +17,32 @@ edit_uri: edit/main/docs/
 # below; everything under docs/ is served at /<basename>/.
 docs_dir: docs
 
+# The repo's docs/ tree also holds ~100 internal engineering artifacts
+# (Σ/REV phase plans, PERF_* reviews, plans/archive/*) that cross-link
+# heavily and aren't part of the published site. Build + link-check only
+# the curated nav pages; everything else is excluded (gitignore-style:
+# drop all .md, then re-include the nav set). This keeps `--strict` green
+# and the public site focused on user-facing docs.
+exclude_docs: |
+  *.md
+  !index.md
+  !USER_GUIDE.md
+  !ROADMAP.md
+  !RELEASE.md
+  !PRD.md
+  !IMPLEMENTATION_PLAN.md
+  !MULTI_BACKEND_PLAN.md
+  !ERGONOMICS_PLAN.md
+  !ML_FEATURE_STORE_PLAN.md
+  !NORMALIZATION_TRANSFORMS_PLAN.md
+  !SQL_TRANSFORMS_PLAN.md
+  !PHASE_39_4_WINDOWS.md
+  !PHASE_39_5_SESSIONS.md
+  !PHASE_39_5B_JOINS.md
+  !UNIFIED_PIPELINE_API.md
+  !ICEBERG_PLAN.md
+  !CICD_PLAN.md
+
 theme:
   name: material
   # Custom partial template overrides (live in /overrides/). Used

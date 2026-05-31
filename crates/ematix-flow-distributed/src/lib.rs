@@ -179,13 +179,28 @@ impl DistributedBackend {
             // Empty-peers degenerate cluster: skip the distributed
             // planner so the context can run plans locally without
             // needing remote workers. Tests + dev use this path.
-            return Arc::new(SessionContext::new());
+            //
+            // Σ.V (2026-05-26): even on the local-only path,
+            // install the ematix preset rules so this code path
+            // produces the same plan shape as the bench / production
+            // peer-mesh path.
+            let builder = ematix_flow_core::preset::with_optimizer_rules(
+                SessionStateBuilder::new().with_default_features(),
+            );
+            return Arc::new(SessionContext::new_with_state(builder.build()));
         }
         let resolver = StaticWorkerResolver {
             urls: self.peers.clone(),
         };
-        let mut builder = SessionStateBuilder::new()
-            .with_default_features()
+        // Σ.V (2026-05-26): apply ematix's preset rules before adding
+        // the distributed-specific ones. The preset's logical/physical
+        // optimizers compose cleanly with the distributed planner —
+        // they rewrite the plan before the distributed planner shards
+        // it, so the same plan shape ships across the peer mesh.
+        let mut builder = ematix_flow_core::preset::with_optimizer_rules(
+            SessionStateBuilder::new().with_default_features(),
+        );
+        builder = builder
             .with_physical_optimizer_rule(Arc::new(DistributedPhysicalOptimizerRule))
             .with_distributed_worker_resolver(resolver);
         // Σ.B follow-up: install the TLS-aware channel resolver

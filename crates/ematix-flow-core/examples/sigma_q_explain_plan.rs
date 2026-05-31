@@ -12,14 +12,9 @@ use std::sync::Arc;
 use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::physical_plan::displayable;
 use datafusion::prelude::{SessionConfig, SessionContext};
-use ematix_flow_core::dedupe_aggregate_rule::DedupeAggregateForFloatDeterminism;
-use ematix_flow_core::dict_aggregate_rule::EnableDictGroupCountRule;
 use ematix_flow_core::ematix_fast_parquet::EmatixFastParquetTableProvider;
 use ematix_flow_core::fast_parquet::FastParquetTableProvider;
-use ematix_flow_core::fused_aggregate_filter_multi_agg_rule::InjectFilterMultiAggRule;
-use ematix_flow_core::fused_aggregate_filter_sum_rule::InjectFilterSumRule;
-use ematix_flow_core::robin_hood_sum_f64_exec::EnableRobinHoodSumF64Rule;
-use ematix_flow_core::swap_semi_join_build_rule::SwapSemiJoinBuildSideRule;
+use ematix_flow_core::preset;
 
 const TPCH_TABLES: &[&str] = &[
     "region", "nation", "supplier", "customer", "part", "partsupp", "orders", "lineitem",
@@ -34,21 +29,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dir =
         std::env::var("TPCH_DATA_DIR").unwrap_or_else(|_| "examples/tpch/data/sf10".to_string());
 
-    let state = SessionStateBuilder::new()
-        .with_config(SessionConfig::new().with_target_partitions(14))
-        .with_default_features()
-        .with_physical_optimizer_rule(Arc::new(DedupeAggregateForFloatDeterminism::default()))
-        .with_physical_optimizer_rule(Arc::new(EnableDictGroupCountRule))
-        .with_physical_optimizer_rule(Arc::new(InjectFilterMultiAggRule))
-        .with_physical_optimizer_rule(Arc::new(InjectFilterSumRule))
-        .with_physical_optimizer_rule(Arc::new(SwapSemiJoinBuildSideRule))
-        .with_physical_optimizer_rule(Arc::new(EnableRobinHoodSumF64Rule))
-        .build();
+    // Match the bench's milestone rule set 1:1 via preset.rs so plan
+    // dumps reflect what the bench actually runs. Σ.X audit caught
+    // two divergences here (missing PushDownLeftSemi rule + missing
+    // all-tables-Emat registration) — preset.rs is the single source
+    // of truth.
+    let state = preset::with_optimizer_rules(
+        SessionStateBuilder::new()
+            .with_config(SessionConfig::new().with_target_partitions(14))
+            .with_default_features(),
+    )
+    .build();
     let ctx = SessionContext::new_with_state(state);
 
+    // Match the bench's `EMAT_ALL_TABLES_EMAT=1` default: every table
+    // registered as `EmatixFastParquetTableProvider` so the L9 bloom
+    // sideband rule can target any scan. Set `EMAT_ALL_TABLES_EMAT=0`
+    // to revert to lineitem-only Emat for A/B diagnosis.
+    let all_emat = std::env::var("EMAT_ALL_TABLES_EMAT")
+        .ok()
+        .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+        .unwrap_or(true);
     for t in TPCH_TABLES {
         let path = PathBuf::from(&dir).join(format!("{t}.parquet"));
-        if *t == "lineitem" {
+        if all_emat || *t == "lineitem" {
             let prov = EmatixFastParquetTableProvider::try_new(path.to_string_lossy())?;
             ctx.register_table(*t, Arc::new(prov))?;
         } else {
@@ -59,8 +63,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let sql = std::fs::read_to_string(format!("examples/tpch/queries/q{q:02}.sql"))?;
     let df = ctx.sql(&sql).await?;
+    if std::env::var("EMAT_DUMP_LOGICAL").is_ok() {
+        println!("=== Q{q:02} unoptimized LogicalPlan ===");
+        println!("{}", df.logical_plan().display_indent());
+        let optimized = df.clone().into_optimized_plan()?;
+        println!("\n=== Q{q:02} optimized LogicalPlan ===");
+        println!("{}", optimized.display_indent());
+    }
+    let df = if std::env::var("EMAT_REORDER").is_ok()
+        || std::env::var("EMAT_AGG_SEMI").is_ok()
+        || std::env::var("EMAT_DIM_PUSH").is_ok()
+    {
+        let optimized = df.into_optimized_plan()?;
+        println!("=== Q{q:02} optimized LogicalPlan (pre-rewrite) ===");
+        println!("{}", optimized.display_indent());
+        let mut rewritten = optimized;
+        if std::env::var("EMAT_AGG_SEMI").is_ok() {
+            rewritten = ematix_flow_core::agg_filter_pushdown::push_filter_into_agg(rewritten)?;
+        }
+        if std::env::var("EMAT_DIM_PUSH").is_ok() {
+            rewritten = ematix_flow_core::dim_join_pushdown::push_dim_join_into_chain(rewritten)?;
+        }
+        if std::env::var("EMAT_REORDER").is_ok() {
+            // Σ.AH.X Lever G: default is the permissive path (preserves
+            // Σ.T behavior); opt into the gated path via `EMAT_REORDER_SHAPE_GATED=1`.
+            let gated = std::env::var("EMAT_REORDER_SHAPE_GATED")
+                .ok()
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+            rewritten = if gated {
+                ematix_flow_core::join_reorder::reorder_inner_joins_shape_gated(rewritten)?
+            } else {
+                ematix_flow_core::join_reorder::reorder_inner_joins(rewritten)?
+            };
+        }
+        println!("\n=== Q{q:02} optimized LogicalPlan (POST-rewrite) ===");
+        println!("{}", rewritten.display_indent());
+        ctx.execute_logical_plan(rewritten).await?
+    } else {
+        df
+    };
     let plan = df.create_physical_plan().await?;
-    println!("=== Q{q:02} structural plan ===");
+    println!("\n=== Q{q:02} physical plan ===");
     println!("{}", displayable(plan.as_ref()).indent(true));
     Ok(())
 }

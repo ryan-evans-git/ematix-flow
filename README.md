@@ -57,11 +57,12 @@ flow run-due --module my_pipelines    # cron-style; drop into systemd / cron / k
 
 ## Why ematix-flow
 
-- **Fast.** TPC-H SF=1, 22 queries, single Apple M3 Pro: **1.79× faster than
-  DuckDB**, **2.76× faster than Polars**, **13.4× faster than single-node
-  PySpark** (geomean across 20 timed trials × 5 warmups). 19 / 22 wins
-  outright; **beats DuckDB on 21 / 22 queries** and **Polars on 20 / 22**.
-  Full numbers and reproducer in [Benchmarks](#benchmarks).
+- **Fast.** TPC-H, 22 queries, single Apple M3 Pro, measured at three
+  scales: ematix-flow takes **22 / 22** at SF=1 (**2.67×** DuckDB,
+  **4.90×** Polars, **20×** single-node PySpark), **18 / 22** at SF=10,
+  and **16 / 22** at SF=100 — still ahead of DuckDB where the data
+  spills out of cache, and it *widens* the hardest query there (Q18
+  SF=100, 5.8×). Full numbers and reproducer in [Benchmarks](#benchmarks).
 - **Scheduling + DAG, no service to operate.** Pipelines carry their own
   cron schedule and `depends_on=` edges (with cycle detection and exponential-
   backoff retries). Run `flow run-due` from cron, systemd, a k8s `CronJob`,
@@ -1462,74 +1463,66 @@ the [Install](#install) extras and the
 <a id="benchmarks"></a>
 ## Benchmarks and comparisons
 
-### TPC-H SF=1, all 22 queries
+### TPC-H — SF=1 / SF=10 / SF=100, all 22 queries
 
-Every TPC-H query, four engines, same M3 Pro / SF=1 / Parquet,
-post-Σ.P (2026-05-22, **20 timed trials after 5 warmups**):
+Five engines, the same Apple M3 Pro, the same Parquet files
+(2026-05-31 refresh). ematix-flow + DuckDB are **co-measured in one
+process** (10 timed trials after 3 warmups, medians) so thermal drift
+hits both equally; Polars runs the same in-process harness; PySpark is
+`local[*]` on the JVM; Postgres 14 is `EXPLAIN ANALYZE` Execution Time.
 
-| Query | **ematix-flow** | DuckDB | Polars | PySpark | Best |
-|---|---:|---:|---:|---:|:---|
-| Q01 | **27.80** | 44.76 | 36.46 | 196.5 | ematix-flow |
-| Q02 | **9.65**  | 17.64 | 45.93 | 290.7 | ematix-flow |
-| Q03 | **13.89** | 32.36 | 44.97 | 288.2 | ematix-flow |
-| Q04 | **12.58** | 22.15 | 24.04 | 226.1 | ematix-flow |
-| Q05 | **21.29** | 30.47 | 10760.71 | 364.2 | ematix-flow |
-| Q06 | 10.75 | 12.08 | **9.97** | 68.3 | Polars |
-| Q07 | **27.04** | 31.60 | 109.74 | 286.8 | ematix-flow |
-| Q08 | **20.37** | 38.77 | 97.57 | 209.8 | ematix-flow |
-| Q09 | **33.08** | 61.82 | 47.70 | 461.3 | ematix-flow |
-| Q10 | **29.74** | 66.62 | 109.17 | 421.9 | ematix-flow |
-| Q11 | **7.84**  | 9.97 | 9.17 | 139.1 | ematix-flow |
-| Q12 | **14.21** | 24.26 | 18.37 | 288.4 | ematix-flow |
-| Q13 | **41.87** | 144.56 | 116.36 | 694.2 | ematix-flow |
-| Q14 | **11.20** | 24.36 | 12.22 | 138.3 | ematix-flow |
-| Q15 | 11.39 | 16.22 | **11.27** | 166.4 | Polars |
-| Q16 | **8.61**  | 26.48 | 20.68 | 211.5 | ematix-flow |
-| Q17 | 36.67 | **30.05** | 39.27 | 239.4 | DuckDB |
-| Q18 | **49.25** | 53.30 | 55.35 | 569.1 | ematix-flow |
-| Q19 | **17.69** | 37.55 | 100.97 | 111.4 | ematix-flow |
-| Q20 | **15.36** | 38.52 | 21.90 | 148.8 | ematix-flow |
-| Q21 | **41.11** | 84.42 | 691.68 | 648.5 | ematix-flow |
-| Q22 | **8.26**  | 23.48 | 12.52 | 280.2 | ematix-flow |
+| Scale | ematix-flow wins | vs DuckDB | vs Polars | vs PySpark | vs Postgres |
+|---|:--|--:|--:|--:|--:|
+| **SF=1** (~1 GB, in-cache) | **22 / 22** | 2.67× | 4.90× | 20.5× | 18.8× |
+| **SF=10** (~10 GB) | **18 / 22** | 1.46× | 4.53× | 13.9× | 25.2× |
+| **SF=100** (~100 GB) | **16 / 22** | 1.32× | 6.64× | 10.8× | 89× † |
 
-All times in milliseconds. 20-trial median for ematix-flow / DuckDB /
-Polars (after 5 warmups, same-process, `triangulation` feature). The
-PySpark column is the v0.4.0 (2026-05-20) baseline at 3-trial median
-on PySpark 4.1.1 / JDK 23 (`local[*]`, `spark.sql.shuffle.partitions=8`,
-adaptive enabled) — left unchanged because we now bench PySpark in
-distributed mode on AWS (see `infra/test-validation-distributed/`)
-rather than single-node.
+Geomean of competitor ÷ ematix-flow across the 22 queries (Polars n=21
+at SF=10 / n=17 at SF=100; **†** Postgres ran 6 / 22 at SF=100 under a
+90 s cap). DuckDB's wins are the multi-fact joins it reorders well
+(Q07 / Q08 at SF=10; Q07 / Q09 / Q10 / Q17 / Q20 at SF=100); ematix-flow
+still leads at every scale and *widens* the hardest query — **Q18
+SF=100: 377 ms vs DuckDB's 2 193 ms (5.8×)** on the v0.9.0
+scale-relative broadcast-join rule. Full tables, tabbed by scale, are on
+the docs site: [ematix.dev/reference/benchmarks](https://ematix.dev/reference/benchmarks).
+SF=1 in full (the README's headline scale):
 
-**Headline:** geomean **1.79× faster than DuckDB**, **2.76× faster
-than Polars**, **13.4× faster than single-node PySpark**. ematix-flow
-wins **19 / 22** queries outright; **beats DuckDB on 21 / 22** (only
-Q17 is a 6 ms loss) and **Polars on 20 / 22** (Q06 / Q15 are
-sub-millisecond ties). Polars's Q05 outlier (~11 s) is a planner
-blowup on the canonical TPC-H Q05 shape — flagged but not a release
-blocker. The bench moved from 10×3 to 20×5 trials because sub-15 ms
-queries needed more samples to settle (Q06 swung ±15 ms run-to-run at
-the old cadence; ±0.5 ms now).
+| Query | ematix-flow | DuckDB | Polars | PySpark | Postgres |
+|---|--:|--:|--:|--:|--:|
+| Q01 | **16.1** | 47.6 | 39.3 | 167 | 411 |
+| Q02 | **6.8** | 16.2 | 48.0 | 190 | 123 |
+| Q03 | **9.1** | 31.2 | 47.4 | 257 | 163 |
+| Q04 | **9.7** | 21.6 | 24.8 | 184 | 94.6 |
+| Q05 | **6.8** | 30.3 | 11,141 | 335 | 226 |
+| Q06 | **0.9** | 12.0 | 10.1 | 41.5 | 218 |
+| Q07 | **26.2** | 31.3 | 118 | 260 | 1,262 |
+| Q08 | **12.3** | 37.3 | 95.0 | 182 | 99.7 |
+| Q09 | **16.2** | 52.9 | 48.7 | 583 | 820 |
+| Q10 | **23.2** | 57.0 | 135 | 362 | 355 |
+| Q11 | **5.0** | 9.0 | 9.3 | 119 | 36.3 |
+| Q12 | **12.7** | 23.1 | 19.3 | 269 | 361 |
+| Q13 | **8.6** | 130 | 122 | 684 | 871 |
+| Q14 | **9.8** | 21.0 | 12.6 | 114 | 69.8 |
+| Q15 | **10.8** | 13.2 | 11.6 | 127 | 140 |
+| Q16 | **7.1** | 20.6 | 22.0 | 205 | 113 |
+| Q17 | **14.1** | 24.0 | 42.8 | 233 | 398 |
+| Q18 | **24.0** | 43.1 | 58.6 | 560 | 1,154 |
+| Q19 | **14.4** | 31.9 | 109 | 86.0 | 31.9 |
+| Q20 | **14.4** | 27.4 | 23.1 | 106 | 147 |
+| Q21 | **32.7** | 69.0 | 741 | 628 | 609 |
+| Q22 | **7.8** | 19.6 | 13.0 | 354 | 24.1 |
 
-**What changed since v0.4.0**: a sequence of optimiser + runtime
-shipped in this session under the Σ.J / K / L / M / N / O / P arc.
-The headline correctness fix is **Σ.P session-scoped subquery CSE** —
-TPC-H Q15 was occasionally returning 0 rows (parallel f64 SUM
-non-determinism across a duplicated CTE) and is now bit-exact AND
-33% faster vs v0.4.0, courtesy of a new `SharedSubtreeExec` that
-serves the duplicated subtree from a shared `Arc<CachedBatches>`.
-The 22-query geomean improved -10% vs v0.4.0's ruleset on the same
-engine — eleven queries faster (>5%), zero regressions (>5%). The
-underlying primitives (RobinHoodAggregateExec, multi-bloom Flight
-transport, plan caching, persistent row-group decode cache,
-adaptive predicate reorder) are documented in `docs/PHASE_SIGMA_*.md`
-and the [[sigma-p-subquery-cse]] note.
+Median ms, fastest per row in **bold**; ematix-flow + DuckDB
+co-measured in one process. Polars runs hand-translated `.polars.sql`
+variants where its planner rejects the canonical shape (semantically
+identical); its Q05 SF=1 outlier (~11 s) is a known planner blowup.
+ematix-flow takes all 22 at SF=1, with the biggest margins on the
+join-heavy queries (Q05 4.5×, Q09 3.3×, Q13 15×, Q16 2.9×) where the
+fused-aggregate + push-LeftSemi + runtime-bloom rules do the work.
 
-Polars wins are measured from hand-translated `.polars.sql`
-variants under `examples/tpch/queries/` — implicit `FROM a, b, c`
-rewritten as explicit `JOIN ... ON`, INTERVAL literals pre-resolved,
-semantically identical to the canonical TPC-H text.
-
-Full methodology + per-engine reproducers in
+Raw logs for this refresh are in
+[`bench-results/refresh-2026-05-30/`](bench-results/refresh-2026-05-30/);
+full methodology + per-engine reproducers in
 [`BENCHMARKS.md`](BENCHMARKS.md).
 
 ### How the speedups land
@@ -1537,7 +1530,7 @@ Full methodology + per-engine reproducers in
 Two layers do the work, both transparent at the SQL level:
 
 1. **`EmatixFastParquetTableProvider`** — the default parquet scan,
-   backed by [ematix-parquet 0.12.0](https://github.com/ryan-evans-git/ematix-parquet)
+   backed by [ematix-parquet 0.16.3](https://github.com/ryan-evans-git/ematix-parquet)
    (a hand-rolled decoder we ship as a sibling crate). Adds row-group-parallel
    decode, parallel per-page Snappy decompression, dict-preserved `Utf8View`,
    buffer-reuse on the hot path, and small-bit-width NEON+AVX2 SIMD kernels

@@ -77,6 +77,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_physical_optimizer_rule(Arc::new(InjectFilterSumRule));
     builder = builder.with_optimizer_rule(Arc::new(PushDownLeftSemiRule));
     builder = builder.with_physical_optimizer_rule(Arc::new(SwapSemiJoinBuildSideRule));
+    // REV.17.3: mirror production preset — force CollectLeft on
+    // semi-bounded builds + scale-relative broadcast of small dim builds
+    // (both via ::default()), so profiles reflect the production hot path.
+    builder = builder.with_physical_optimizer_rule(Arc::new(
+        ematix_flow_core::force_collect_left_semi_build_rule::ForceCollectLeftForSemiBoundedBuildRule::default(),
+    ));
     // Σ.Q.L1b: matches the triangulation bench's gating on
     // EMAT_RH_SUM_F64=1. Default-off avoids the ~7% geomean codegen
     // tax from [[optimizer-codegen-sensitivity]] when the operator
@@ -86,7 +92,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false)
     {
-        builder = builder.with_physical_optimizer_rule(Arc::new(EnableRobinHoodSumF64Rule));
+        builder =
+            builder.with_physical_optimizer_rule(Arc::new(EnableRobinHoodSumF64Rule::default()));
     }
     // Σ.Q.L15: ratio=1024 is the perf-validated setting from the
     // triangulation bench. `Default::default()` uses ratio=64 which
@@ -103,6 +110,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         min_probe_to_build_ratio: bloom_ratio,
         allow_inner_join: allow_inner,
         require_filtered_build: false,
+        max_expected_keys_per_partition: 0,
     }));
     let state = builder.build();
     let ctx = SessionContext::new_with_state(state);

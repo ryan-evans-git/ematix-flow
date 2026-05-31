@@ -32,6 +32,11 @@ pub mod ematix_fast_parquet;
 // for the Q1-shape workload. See
 // `docs/PHASE_SIGMA_E5_PARQUET_RS_ELIMINATION.md` §E5.1.
 pub mod emat_arrow_reader;
+// Σ.Q06.SF10.5.a (2026-05-28): ematix-parquet-based metadata helpers
+// replacing specific parquet-rs paths inside
+// `EmatixFastParquetTableProvider::try_new`. Currently exposes the
+// decompress-free dict-distinct walk; other walks are follow-ups.
+pub mod emat_parquet_metadata;
 // Σ.E5.6 scaffold: intra-RG page-streaming column decoders. The
 // trait + first concrete impl (Float64) — not yet wired into
 // EmatixFastParquetExec. Closes the architectural first-batch latency
@@ -79,6 +84,11 @@ pub mod dedupe_aggregate_rule;
 // AggregateExec (i.e., is bounded-small) but the build side doesn't.
 // Fixes Q18 SF=10 build-on-60M-rows inversion. See module docs.
 pub mod swap_semi_join_build_rule;
+// REV.3: force CollectLeft on Inner joins whose build is semi-bounded
+// (Q18-class), eliminating the 60M/600M-row probe-side hash repartition
+// that JoinSelection picks because the build's stats are Absent. See
+// module docs.
+pub mod force_collect_left_semi_build_rule;
 // Σ.Q.L10: logical-plan rewrite — push a LeftSemi join down past
 // Inner joins so it filters its target table directly, eliminating
 // the giant intermediate that gets semi-filtered at the top of the
@@ -140,6 +150,55 @@ pub mod dict_aggregate_rule;
 // Lives outside the physical optimiser to avoid the LLVM-codegen
 // perturbation cost recorded in optimizer-codegen-sensitivity.
 pub mod dict_routing;
+// Σ.T (2026-05-25): selectivity-first inner-join reorder. Pre-plan
+// walker pattern (same precedent as dict_routing — explicit caller
+// invocation, no PhysicalOptimizerRule, no codegen tax). Targets
+// Q05 / Q08 SF=10 where DataFusion 53.1 has no cost-based join
+// reorder and falls back to FROM-clause order. See
+// `docs/PHASE_SIGMA_T_JOIN_REORDER.md`.
+pub mod join_reorder;
+// Σ.BR Phase 2 / #194 (2026-05-29): production wiring — a QueryPlanner wrapper
+// that applies the ematix pre-plan walker pipeline (agg_semi → dim_push →
+// reorder) post-optimization so it reaches library users (preset.rs), not just
+// the bench harness. Avoids the OptimizerRule codegen tax by running outside
+// the optimizer's compiled rule loop.
+pub mod flow_query_planner;
+// Σ.U (2026-05-26): push a filter as LeftSemi into an Aggregate's
+// input scan. Targets Q17 SF=10 where DF decorrelates the
+// correlated `(SELECT 0.2*AVG(l_quantity) WHERE l_partkey=outer.p_partkey)`
+// into an Aggregate-over-full-lineitem joined back to filtered
+// part, but the agg still runs on all 60M rows producing 10.8M
+// groups when only ~200 partkeys actually matter.
+pub mod agg_filter_pushdown;
+// Σ.AE (2026-05-26): late physical-optimizer rule that surgically
+// drops redundant FilterExec conjuncts when the underlying
+// EmatixFastParquetExec's BridgeFilter has already evaluated them
+// exactly. Spike for the "filter double-decode" pattern documented in
+// docs/PI_16_Q06_PROFILE.md. Opt-in via `EMAT_DROP_REDUNDANT_FILTER=1`.
+pub mod drop_redundant_filter_rule;
+// Σ.AD (2026-05-25): pre-plan walker that pushes small filtered-dim
+// Inner joins (nation/region with name filters) down adjacent to their
+// FK table's scan inside an Inner-join chain. Targets Q07 where
+// `Inner Join(supplier.s_nationkey = n1.n_nationkey)` currently sits at
+// the top of the tree above `supplier ⋈ lineitem`. The pre-Σ.AD plan
+// broadcasts full 100K supplier; the post-Σ.AD plan filters supplier
+// to ~8K via the nation join BEFORE the fact-fact broadcast.
+pub mod dim_join_pushdown;
+// Σ.AN.1 (2026-05-28): physical optimizer rule that boosts the
+// partition count of RepartitionExec(Hash) → AggregateExec(FinalPartitioned)
+// pipelines whose agg output cardinality exceeds the per-partition
+// L3-fit budget. Targets Q18 SF=10's 15M-group SUM agg that
+// blows L3 at the default 14-partition layout. Opt-in via
+// EMAT_AGG_PARTITION_BOOST=1.
+pub mod agg_partition_boost;
+// Σ.AΩ Phase 1.1 (2026-05-28): plan-time `target_partitions` routing.
+// Walks the LogicalPlan looking for high-cardinality GROUP BY
+// aggregations and recommends a session target_partitions value that
+// keeps the FinalPartitioned hash table cache-resident. Used by the
+// bench harness to route Q18-shape queries to a SessionContext with
+// boosted partitions BEFORE physical planning — letting DataFusion's
+// EnforceDistribution propagate the count naturally.
+pub mod auto_target_partitions;
 // Σ.L.2 (2026-05-21): adaptive runtime workload feedback. Persists
 // per-shape probe outcomes + per-query observability (selectivity,
 // hash collision rate) to a SQLite file (~/.ematix/workload.db by
@@ -193,6 +252,10 @@ pub mod robin_hood_agg_rule;
 // Sibling to robin_hood_agg's COUNT(*) variant; targets Q18 SF=10's
 // FinalPartitioned sum(l_quantity) GROUP BY l_orderkey at 15M card.
 pub mod robin_hood_sum_f64_exec;
+// REV.8 (2026-05-30): single-pass radix-partitioned SUM(f64) GROUP BY i64.
+// Replaces the two-phase Partial→Repartition→Final for high-card near-
+// unique keys (Q18 SF=100 subquery). Opt-in; gate measured 1.71×.
+pub mod single_pass_radix_sum_exec;
 // Σ.R.2 (2026-05-24): AVG(f64) GROUP BY i64 operator + opt-in rule.
 // Sister to robin_hood_sum_f64_exec; targets Q17 SF=10's
 // FinalPartitioned avg(l_quantity) GROUP BY l_partkey at ~2M card
@@ -245,6 +308,14 @@ pub mod fk_chain;
 // the build-side bloom to each via a per-scan sideband (build runs
 // once; bloom Arc shared). Install via install_cascading_bloom_rule.
 pub mod runtime_bloom_cascading_rule;
+// Σ.AJ.1 Lever B POC (2026-05-27): plan-wide broadcast of bloom
+// emitters to sibling same-parquet-path scans. Specifically targets
+// Q17's correlated AVG-subquery shape where the subquery's lineitem
+// scan can use the part-filter bloom but isn't reachable from the
+// HashJoin-local probe-subtree walk that the cascading rule uses.
+// Opt-in via EMAT_L9_BROADCAST_SIBLINGS=1; default OFF. Unsafe for
+// Q21-shape (correlated subqueries with different join semantics).
+pub mod broadcast_sibling_blooms_rule;
 // Σ.U.A (2026-05-24): Apache-Impala-style lane-parallel filter-sum
 // kernel. Generalises the splash-bloom pattern (see `bloom.rs`) to
 // the "M predicate clauses + SUM-of-product" shape that covers Q06,

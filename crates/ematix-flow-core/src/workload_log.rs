@@ -13,6 +13,21 @@
 //!   row counts (for future cost-based decisions).
 //! - `predicate_selectivity` — per (table, col, op), observed
 //!   selectivity ratios for Σ.L.3 + Σ.L.5.
+//! - `aggregate_observations` — per `LogicalPlan` aggregate shape
+//!   hash, observed input rows + output group cardinality. Consumed
+//!   by Σ.AΩ Phase 1.4's runtime-feedback recommender to refuse
+//!   partition boosts on small-cardinality aggregates that the
+//!   plan-time `TableScan.num_rows()` estimator over-counts. Added in
+//!   schema_version 2.
+//! - `partition_race_outcomes` — per shape hash, the wall times at
+//!   the plan-time formula partition count vs cores. Σ.AΩ Phase 1.6's
+//!   Σ.L.1-style speculative race writes here; the recommender reads
+//!   `winner_partitions` directly, bypassing the heavy-join gate.
+//!   Added in schema_version 3.
+//! - `batch_size_race_outcomes` — per shape hash, wall times at three
+//!   `DEFAULT_BATCH_SIZE` candidates (32K, 64K, 128K). Σ.AΩ Phase 2.1's
+//!   3-way race writes here; the recommender reads `winner_batch_size`
+//!   directly. Added in schema_version 4.
 //!
 //! ## Why SQLite (not a flat file)
 //!
@@ -106,7 +121,36 @@ impl WorkloadLog {
                 last_seen_unix  INTEGER NOT NULL,
                 PRIMARY KEY (table_name, col_name, op)
             );
-            INSERT OR IGNORE INTO schema_version (version) VALUES (1);
+            CREATE TABLE IF NOT EXISTS aggregate_observations (
+                shape_hash        TEXT NOT NULL,
+                agg_input_rows    INTEGER NOT NULL,
+                agg_output_groups INTEGER NOT NULL,
+                n_observations    INTEGER NOT NULL DEFAULT 1,
+                last_seen_unix    INTEGER NOT NULL,
+                PRIMARY KEY (shape_hash)
+            );
+            CREATE TABLE IF NOT EXISTS partition_race_outcomes (
+                shape_hash         TEXT NOT NULL,
+                formula_partitions INTEGER NOT NULL,
+                cores_partitions   INTEGER NOT NULL,
+                formula_ms         REAL NOT NULL,
+                cores_ms           REAL NOT NULL,
+                winner_partitions  INTEGER NOT NULL,
+                n_observations     INTEGER NOT NULL DEFAULT 1,
+                last_seen_unix     INTEGER NOT NULL,
+                PRIMARY KEY (shape_hash)
+            );
+            CREATE TABLE IF NOT EXISTS batch_size_race_outcomes (
+                shape_hash         TEXT NOT NULL,
+                ms_32k             REAL NOT NULL,
+                ms_64k             REAL NOT NULL,
+                ms_128k            REAL NOT NULL,
+                winner_batch_size  INTEGER NOT NULL,
+                n_observations     INTEGER NOT NULL DEFAULT 1,
+                last_seen_unix     INTEGER NOT NULL,
+                PRIMARY KEY (shape_hash)
+            );
+            INSERT OR IGNORE INTO schema_version (version) VALUES (4);
             "#,
         )
         .map_err(WorkloadLogError::Db)?;
@@ -255,6 +299,346 @@ impl WorkloadLog {
             .map_err(WorkloadLogError::Db)?;
         Ok(r)
     }
+
+    /// Σ.AΩ Phase 1.4 — record observed aggregate cardinalities for a
+    /// `LogicalPlan` aggregate shape. `shape_hash` is computed by
+    /// `auto_target_partitions::aggregate_shape_hash`. Updates via
+    /// EWMA (α=0.3) on subsequent observations.
+    pub fn record_aggregate_observation(
+        &self,
+        shape_hash: &str,
+        agg_input_rows: u64,
+        agg_output_groups: u64,
+    ) -> Result<(), WorkloadLogError> {
+        let now = unix_now();
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            r#"
+            INSERT INTO aggregate_observations
+              (shape_hash, agg_input_rows, agg_output_groups, n_observations, last_seen_unix)
+            VALUES (?1, ?2, ?3, 1, ?4)
+            ON CONFLICT (shape_hash) DO UPDATE SET
+              agg_input_rows    = CAST(0.7 * agg_input_rows    + 0.3 * excluded.agg_input_rows    AS INTEGER),
+              agg_output_groups = CAST(0.7 * agg_output_groups + 0.3 * excluded.agg_output_groups AS INTEGER),
+              n_observations    = n_observations + 1,
+              last_seen_unix    = excluded.last_seen_unix
+            "#,
+            params![shape_hash, agg_input_rows as i64, agg_output_groups as i64, now],
+        )
+        .map_err(WorkloadLogError::Db)?;
+        Ok(())
+    }
+
+    /// Σ.AΩ Phase 1.4 — consult observed aggregate cardinalities for
+    /// a shape. Returns `Some(observation)` iff we've seen this shape
+    /// at least `min_observations` times. The recommender uses the
+    /// returned `agg_output_groups` as the partition-sizing signal in
+    /// place of the plan-time `TableScan.num_rows()` upper bound.
+    pub fn consult_aggregate_observation(
+        &self,
+        shape_hash: &str,
+        min_observations: i64,
+    ) -> Result<Option<AggregateObservation>, WorkloadLogError> {
+        let conn = self.conn.lock().unwrap();
+        let row = conn
+            .query_row(
+                r#"
+                SELECT agg_input_rows, agg_output_groups, n_observations
+                  FROM aggregate_observations
+                 WHERE shape_hash = ?1
+                "#,
+                params![shape_hash],
+                |r| {
+                    Ok(AggregateObservation {
+                        agg_input_rows: r.get::<_, i64>(0)? as u64,
+                        agg_output_groups: r.get::<_, i64>(1)? as u64,
+                        n_observations: r.get::<_, i64>(2)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(WorkloadLogError::Db)?;
+        Ok(row.and_then(|o| {
+            if o.n_observations >= min_observations {
+                Some(o)
+            } else {
+                None
+            }
+        }))
+    }
+}
+
+/// Σ.AΩ Phase 1.4 — observed cardinalities for one `LogicalPlan`
+/// aggregate shape, returned by `consult_aggregate_observation`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AggregateObservation {
+    pub agg_input_rows: u64,
+    pub agg_output_groups: u64,
+    pub n_observations: i64,
+}
+
+/// Σ.AΩ Phase 1.6 — winner verdict from a 2-way partition-routing
+/// race (formula partitions vs cores). The recommender consumes
+/// `winner_partitions` directly.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PartitionRaceOutcome {
+    pub formula_partitions: u32,
+    pub cores_partitions: u32,
+    pub formula_ms: f64,
+    pub cores_ms: f64,
+    pub winner_partitions: u32,
+    pub n_observations: i64,
+}
+
+impl WorkloadLog {
+    /// Σ.AΩ Phase 1.6 — record a partition-routing race outcome.
+    /// `winner_partitions` should be picked by the caller via a 5%
+    /// margin rule (matches Σ.L.1's `dict_wins` semantics): formula
+    /// wins iff `formula_ms <= cores_ms * 0.95`, else cores wins.
+    /// EWMA-smooths wall times on subsequent observations.
+    pub fn record_partition_race(
+        &self,
+        shape_hash: &str,
+        formula_partitions: u32,
+        cores_partitions: u32,
+        formula_ms: f64,
+        cores_ms: f64,
+        winner_partitions: u32,
+    ) -> Result<(), WorkloadLogError> {
+        let now = unix_now();
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            r#"
+            INSERT INTO partition_race_outcomes
+              (shape_hash, formula_partitions, cores_partitions,
+               formula_ms, cores_ms, winner_partitions,
+               n_observations, last_seen_unix)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7)
+            ON CONFLICT (shape_hash) DO UPDATE SET
+              formula_ms        = 0.7 * formula_ms + 0.3 * excluded.formula_ms,
+              cores_ms          = 0.7 * cores_ms   + 0.3 * excluded.cores_ms,
+              -- Re-evaluate winner on each observation in case the
+              -- 5%-margin verdict flipped after smoothing.
+              winner_partitions = CASE
+                  WHEN (0.7 * formula_ms + 0.3 * excluded.formula_ms)
+                       <= (0.7 * cores_ms + 0.3 * excluded.cores_ms) * 0.95
+                  THEN formula_partitions
+                  ELSE cores_partitions
+                END,
+              n_observations    = n_observations + 1,
+              last_seen_unix    = excluded.last_seen_unix
+            "#,
+            params![
+                shape_hash,
+                formula_partitions as i64,
+                cores_partitions as i64,
+                formula_ms,
+                cores_ms,
+                winner_partitions as i64,
+                now,
+            ],
+        )
+        .map_err(WorkloadLogError::Db)?;
+        Ok(())
+    }
+
+    /// Σ.AΩ Phase 1.6 — consult the partition-race verdict. Returns
+    /// `Some(outcome)` iff this shape has been observed at least
+    /// `min_observations` times. The recommender uses
+    /// `outcome.winner_partitions` directly.
+    pub fn consult_partition_race(
+        &self,
+        shape_hash: &str,
+        min_observations: i64,
+    ) -> Result<Option<PartitionRaceOutcome>, WorkloadLogError> {
+        let conn = self.conn.lock().unwrap();
+        let row = conn
+            .query_row(
+                r#"
+                SELECT formula_partitions, cores_partitions,
+                       formula_ms, cores_ms,
+                       winner_partitions, n_observations
+                  FROM partition_race_outcomes
+                 WHERE shape_hash = ?1
+                "#,
+                params![shape_hash],
+                |r| {
+                    Ok(PartitionRaceOutcome {
+                        formula_partitions: r.get::<_, i64>(0)? as u32,
+                        cores_partitions: r.get::<_, i64>(1)? as u32,
+                        formula_ms: r.get::<_, f64>(2)?,
+                        cores_ms: r.get::<_, f64>(3)?,
+                        winner_partitions: r.get::<_, i64>(4)? as u32,
+                        n_observations: r.get::<_, i64>(5)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(WorkloadLogError::Db)?;
+        Ok(row.and_then(|o| {
+            if o.n_observations >= min_observations {
+                Some(o)
+            } else {
+                None
+            }
+        }))
+    }
+}
+
+/// Σ.AΩ Phase 1.6 — picks the race winner using the same 5%-margin
+/// rule as [`crate::dict_routing::ProbeResult::dict_wins`]. Formula
+/// only wins if it beats cores by ≥ 5 %; otherwise cores wins (we
+/// prefer the lower partition count when timings are close, since
+/// it has less coordination overhead and matches the shipping
+/// default).
+pub fn pick_partition_race_winner(
+    formula_partitions: u32,
+    cores_partitions: u32,
+    formula_ms: f64,
+    cores_ms: f64,
+) -> u32 {
+    if formula_ms <= cores_ms * 0.95 {
+        formula_partitions
+    } else {
+        cores_partitions
+    }
+}
+
+/// Σ.AΩ Phase 2.1 — three-way batch-size race winner. Picks the
+/// fastest size, but a non-default candidate must beat 64K by ≥ 10 %
+/// to override the shipping default.
+///
+/// The 10 % margin (wider than Σ.L.1's / Phase 1.6's 5 %) handles the
+/// observation that race-prefill at 2-3 reps × 3 sizes is noisier
+/// than the partition race's 2-rep × 2-paths case: with three
+/// candidates competing, the chance one looks artificially fast on a
+/// noisy run is higher. The first Phase 2.1 A/B used a 5 % margin
+/// and misrouted Q18 (true margin ≈ 6 % vs cores) — the wider
+/// margin gives noisy race-prefills room to default back to 64K.
+pub fn pick_batch_size_winner(ms_32k: f64, ms_64k: f64, ms_128k: f64) -> u32 {
+    const DEFAULT_BATCH: u32 = 65_536;
+    const SMALL_BATCH: u32 = 32_768;
+    const LARGE_BATCH: u32 = 131_072;
+    // Non-default candidates have to beat 64K by 10 % to override.
+    let small_wins = ms_32k <= ms_64k * 0.90;
+    let large_wins = ms_128k <= ms_64k * 0.90;
+    match (small_wins, large_wins) {
+        (true, true) => {
+            if ms_32k <= ms_128k {
+                SMALL_BATCH
+            } else {
+                LARGE_BATCH
+            }
+        }
+        (true, false) => SMALL_BATCH,
+        (false, true) => LARGE_BATCH,
+        (false, false) => DEFAULT_BATCH,
+    }
+}
+
+/// Σ.AΩ Phase 2.1 — race outcome for the three-way batch-size race.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BatchSizeRaceOutcome {
+    pub ms_32k: f64,
+    pub ms_64k: f64,
+    pub ms_128k: f64,
+    pub winner_batch_size: u32,
+    pub n_observations: i64,
+}
+
+impl WorkloadLog {
+    /// Σ.AΩ Phase 2.1 — record a 3-way batch-size race outcome.
+    /// Wall times at each candidate batch size + the winner chosen
+    /// by `pick_batch_size_winner`. EWMA-smooths the ms values on
+    /// repeated observations and re-evaluates the winner on each
+    /// update so smoothing can flip the verdict if the workload
+    /// drifts.
+    pub fn record_batch_size_race(
+        &self,
+        shape_hash: &str,
+        ms_32k: f64,
+        ms_64k: f64,
+        ms_128k: f64,
+        winner_batch_size: u32,
+    ) -> Result<(), WorkloadLogError> {
+        let now = unix_now();
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            r#"
+            INSERT INTO batch_size_race_outcomes
+              (shape_hash, ms_32k, ms_64k, ms_128k,
+               winner_batch_size, n_observations, last_seen_unix)
+            VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6)
+            ON CONFLICT (shape_hash) DO UPDATE SET
+              ms_32k  = 0.7 * ms_32k  + 0.3 * excluded.ms_32k,
+              ms_64k  = 0.7 * ms_64k  + 0.3 * excluded.ms_64k,
+              ms_128k = 0.7 * ms_128k + 0.3 * excluded.ms_128k,
+              -- Re-evaluate winner after EWMA smoothing. 10% margin
+              -- (vs 5% in Σ.L.1/Phase 1.6) to handle the wider noise
+              -- floor of a 3-way race vs a 2-way race.
+              winner_batch_size = CASE
+                  WHEN ((0.7 * ms_32k  + 0.3 * excluded.ms_32k)
+                        <= (0.7 * ms_64k + 0.3 * excluded.ms_64k) * 0.90)
+                    AND ((0.7 * ms_32k  + 0.3 * excluded.ms_32k)
+                         <= (0.7 * ms_128k + 0.3 * excluded.ms_128k))
+                  THEN 32768
+                  WHEN ((0.7 * ms_128k + 0.3 * excluded.ms_128k)
+                        <= (0.7 * ms_64k + 0.3 * excluded.ms_64k) * 0.90)
+                  THEN 131072
+                  ELSE 65536
+                END,
+              n_observations = n_observations + 1,
+              last_seen_unix = excluded.last_seen_unix
+            "#,
+            params![
+                shape_hash,
+                ms_32k,
+                ms_64k,
+                ms_128k,
+                winner_batch_size as i64,
+                now,
+            ],
+        )
+        .map_err(WorkloadLogError::Db)?;
+        Ok(())
+    }
+
+    /// Σ.AΩ Phase 2.1 — consult batch-size race verdict.
+    pub fn consult_batch_size_race(
+        &self,
+        shape_hash: &str,
+        min_observations: i64,
+    ) -> Result<Option<BatchSizeRaceOutcome>, WorkloadLogError> {
+        let conn = self.conn.lock().unwrap();
+        let row = conn
+            .query_row(
+                r#"
+                SELECT ms_32k, ms_64k, ms_128k,
+                       winner_batch_size, n_observations
+                  FROM batch_size_race_outcomes
+                 WHERE shape_hash = ?1
+                "#,
+                params![shape_hash],
+                |r| {
+                    Ok(BatchSizeRaceOutcome {
+                        ms_32k: r.get::<_, f64>(0)?,
+                        ms_64k: r.get::<_, f64>(1)?,
+                        ms_128k: r.get::<_, f64>(2)?,
+                        winner_batch_size: r.get::<_, i64>(3)? as u32,
+                        n_observations: r.get::<_, i64>(4)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(WorkloadLogError::Db)?;
+        Ok(row.and_then(|o| {
+            if o.n_observations >= min_observations {
+                Some(o)
+            } else {
+                None
+            }
+        }))
+    }
 }
 
 fn unix_now() -> i64 {
@@ -352,5 +736,175 @@ mod tests {
         // Re-init the same connection via init_schema again — should
         // not error (CREATE TABLE IF NOT EXISTS).
         WorkloadLog::init_schema(&log1.conn.lock().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn aggregate_observation_round_trip() {
+        let log = WorkloadLog::open_in_memory().unwrap();
+        // First observation: n=1, below min=2 → None
+        log.record_aggregate_observation("q17_shape", 30_000, 200)
+            .unwrap();
+        assert_eq!(
+            log.consult_aggregate_observation("q17_shape", 2).unwrap(),
+            None
+        );
+        // Second observation: n=2 → returns the EWMA'd reading
+        log.record_aggregate_observation("q17_shape", 32_000, 210)
+            .unwrap();
+        let obs = log
+            .consult_aggregate_observation("q17_shape", 2)
+            .unwrap()
+            .unwrap();
+        // EWMA: 0.7 * 30_000 + 0.3 * 32_000 = 30_600
+        assert_eq!(obs.agg_input_rows, 30_600);
+        // EWMA: 0.7 * 200 + 0.3 * 210 = 203
+        assert_eq!(obs.agg_output_groups, 203);
+        assert_eq!(obs.n_observations, 2);
+    }
+
+    #[test]
+    fn aggregate_observation_distinct_shapes() {
+        // Two different shape hashes should not collide. Q17 and Q18
+        // inner aggs have distinct hashes, so they get distinct rows.
+        let log = WorkloadLog::open_in_memory().unwrap();
+        log.record_aggregate_observation("q17_shape", 30_000, 200)
+            .unwrap();
+        log.record_aggregate_observation("q18_shape", 4_370, 624)
+            .unwrap();
+        // Bring both above min_observations=1
+        let o17 = log
+            .consult_aggregate_observation("q17_shape", 1)
+            .unwrap()
+            .unwrap();
+        let o18 = log
+            .consult_aggregate_observation("q18_shape", 1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(o17.agg_output_groups, 200);
+        assert_eq!(o18.agg_output_groups, 624);
+    }
+
+    #[test]
+    fn aggregate_observation_missing_shape_returns_none() {
+        let log = WorkloadLog::open_in_memory().unwrap();
+        assert_eq!(
+            log.consult_aggregate_observation("never_seen", 1).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn partition_race_picks_formula_when_faster_by_5pct() {
+        // 100ms vs 110ms — formula beats cores by >5%, formula wins.
+        assert_eq!(pick_partition_race_winner(112, 14, 100.0, 110.0), 112);
+        // 100ms vs 105ms — within 5% (105 * 0.95 = 99.75), cores wins
+        // since we prefer the lower count on ties.
+        assert_eq!(pick_partition_race_winner(112, 14, 100.0, 105.0), 14);
+        // 100ms vs 200ms — formula wins clearly.
+        assert_eq!(pick_partition_race_winner(112, 14, 100.0, 200.0), 112);
+        // 200ms vs 100ms — cores wins clearly.
+        assert_eq!(pick_partition_race_winner(112, 14, 200.0, 100.0), 14);
+    }
+
+    #[test]
+    fn partition_race_round_trip() {
+        let log = WorkloadLog::open_in_memory().unwrap();
+        // Q18-like: formula 112 wins by lots
+        log.record_partition_race("q18_shape", 112, 14, 300.0, 360.0, 112)
+            .unwrap();
+        let o = log.consult_partition_race("q18_shape", 1).unwrap().unwrap();
+        assert_eq!(o.winner_partitions, 112);
+        assert_eq!(o.formula_partitions, 112);
+        assert_eq!(o.cores_partitions, 14);
+        assert!((o.formula_ms - 300.0).abs() < 1e-6);
+        assert!((o.cores_ms - 360.0).abs() < 1e-6);
+        assert_eq!(o.n_observations, 1);
+    }
+
+    #[test]
+    fn partition_race_distinct_shapes() {
+        let log = WorkloadLog::open_in_memory().unwrap();
+        log.record_partition_race("q17_shape", 112, 14, 200.0, 150.0, 14)
+            .unwrap();
+        log.record_partition_race("q18_shape", 112, 14, 300.0, 360.0, 112)
+            .unwrap();
+        let o17 = log.consult_partition_race("q17_shape", 1).unwrap().unwrap();
+        let o18 = log.consult_partition_race("q18_shape", 1).unwrap().unwrap();
+        assert_eq!(o17.winner_partitions, 14);
+        assert_eq!(o18.winner_partitions, 112);
+    }
+
+    #[test]
+    fn batch_size_winner_default_when_no_margin() {
+        // All ties → 64K (default) wins.
+        assert_eq!(pick_batch_size_winner(100.0, 100.0, 100.0), 65_536);
+        // 64K beaten by 32K by 9% → 64K still wins (need 10%).
+        assert_eq!(pick_batch_size_winner(91.0, 100.0, 100.0), 65_536);
+        // 32K beats 64K by exactly 10% → 32K wins.
+        assert_eq!(pick_batch_size_winner(90.0, 100.0, 100.0), 32_768);
+        // 128K beats 64K by 15% → 128K wins.
+        assert_eq!(pick_batch_size_winner(100.0, 100.0, 85.0), 131_072);
+        // Both 32K and 128K beat 64K by > 10%; pick the faster of the two.
+        assert_eq!(pick_batch_size_winner(80.0, 100.0, 85.0), 32_768);
+        assert_eq!(pick_batch_size_winner(85.0, 100.0, 80.0), 131_072);
+    }
+
+    #[test]
+    fn batch_size_race_round_trip() {
+        let log = WorkloadLog::open_in_memory().unwrap();
+        // Q17 SF=10: 128K wins by 20%.
+        log.record_batch_size_race("q17_shape", 250.0, 194.0, 155.0, 131_072)
+            .unwrap();
+        let o = log
+            .consult_batch_size_race("q17_shape", 1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(o.winner_batch_size, 131_072);
+        assert_eq!(o.n_observations, 1);
+        assert!((o.ms_32k - 250.0).abs() < 1e-6);
+        assert!((o.ms_64k - 194.0).abs() < 1e-6);
+        assert!((o.ms_128k - 155.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn batch_size_race_distinct_shapes() {
+        let log = WorkloadLog::open_in_memory().unwrap();
+        // Q17-shape: 128K wins
+        log.record_batch_size_race("q17", 250.0, 194.0, 155.0, 131_072)
+            .unwrap();
+        // Q08-shape: 64K is best
+        log.record_batch_size_race("q08", 256.0, 206.0, 282.0, 65_536)
+            .unwrap();
+        assert_eq!(
+            log.consult_batch_size_race("q17", 1)
+                .unwrap()
+                .unwrap()
+                .winner_batch_size,
+            131_072
+        );
+        assert_eq!(
+            log.consult_batch_size_race("q08", 1)
+                .unwrap()
+                .unwrap()
+                .winner_batch_size,
+            65_536
+        );
+    }
+
+    #[test]
+    fn partition_race_ewma_can_flip_winner() {
+        // Record-1: formula 300ms vs cores 360ms — formula wins.
+        let log = WorkloadLog::open_in_memory().unwrap();
+        log.record_partition_race("shape_x", 112, 14, 300.0, 360.0, 112)
+            .unwrap();
+        // Record-2: formula degrades to 500ms vs cores stays at 360ms.
+        //   EWMA formula_ms = 0.7*300 + 0.3*500 = 360
+        //   EWMA cores_ms   = 0.7*360 + 0.3*360 = 360
+        //   formula_ms (360) > cores_ms (360) * 0.95 (342) → cores wins
+        log.record_partition_race("shape_x", 112, 14, 500.0, 360.0, 14)
+            .unwrap();
+        let o = log.consult_partition_race("shape_x", 1).unwrap().unwrap();
+        assert_eq!(o.n_observations, 2);
+        assert_eq!(o.winner_partitions, 14);
     }
 }

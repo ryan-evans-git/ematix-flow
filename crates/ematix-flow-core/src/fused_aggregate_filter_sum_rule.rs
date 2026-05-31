@@ -246,6 +246,20 @@ fn try_match_filter_sum_plan(
 
     let input_name_refs: Vec<&str> = input_names.iter().map(String::as_str).collect();
     let spec = FilterSumSpec::try_new(jit_spec, &input_name_refs, &scan.schema(), &output_name)?;
+    // Σ.Q06.SF10.8: the fused SUM kernel re-applies the predicate itself,
+    // so a pushed-down BridgeFilter on the scan is redundant — and its
+    // masked late-mat decode is ~2× slower than dense decode feeding the
+    // JIT kernel. Strip it so the scan dense-decodes. Validated by 22q
+    // SF=10 strict A/B: Q06 75.7→36.4 ms (−52%, beats Polars), 0
+    // regressions across the suite (the strip only fires on a single
+    // filtered EmatScan with no join/bloom in between — see
+    // `strip_redundant_scan_filter`). Default-on; opt out with
+    // EMAT_NO_STRIP_FUSED_SCAN_FILTER=1. See [[q06-masked-pushdown-waste]].
+    let scan = if std::env::var_os("EMAT_NO_STRIP_FUSED_SCAN_FILTER").is_some() {
+        scan
+    } else {
+        crate::ematix_fast_parquet::strip_redundant_scan_filter(scan)
+    };
     let exec = FusedAggregateExec::try_new(scan, spec)?;
     Ok(Some(Arc::new(exec) as Arc<dyn ExecutionPlan>))
 }

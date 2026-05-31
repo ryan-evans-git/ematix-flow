@@ -80,6 +80,7 @@ use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::config::ConfigOptions;
 use datafusion::error::Result as DfResult;
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
+use datafusion::physical_optimizer::enforce_distribution::EnforceDistribution;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode};
 // CoalesceBatchesExec is deprecated in favor of arrow-rs BatchCoalescer
@@ -125,7 +126,7 @@ impl PhysicalOptimizerRule for DedupeAggregateForFloatDeterminism {
     fn optimize(
         &self,
         plan: Arc<dyn ExecutionPlan>,
-        _config: &ConfigOptions,
+        config: &ConfigOptions,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
         // Pass 1: walk plan top-down, hash each Final-mode AggregateExec
         // subtree that contains an f64 column. Count occurrences. The
@@ -185,7 +186,44 @@ impl PhysicalOptimizerRule for DedupeAggregateForFloatDeterminism {
             }
             Ok(Transformed::no(node))
         })?;
-        Ok(rewritten.data)
+
+        if !rewritten.transformed {
+            return Ok(rewritten.data);
+        }
+
+        // Σ.BS — repair partitioning after the wrap.
+        //
+        // This rule runs LAST in the physical pipeline (custom rules are
+        // appended after `JoinSelection` / `EnforceDistribution` /
+        // `SanityCheckPlan`). When a duplicated f64 aggregate feeds a
+        // `HashJoinExec(PartitionMode::Partitioned)` — which happens once
+        // the build side is large enough, i.e. at SF≥100 — the optimizer
+        // has already committed both join inputs to N hash-partitions.
+        // The agg's own `Hash[key]` output satisfied the join's
+        // requirement directly, so there is NO `RepartitionExec` above it
+        // to act as a buffer. Wrapping the agg in `SharedSubtreeExec`
+        // (which reports `UnknownPartitioning(1)`) then collapses that
+        // side from N → 1 partitions, and the join's execute()-time
+        // invariant `left_partitions == right_partitions` fails with
+        // "Invalid HashJoinExec, partition count mismatch N!=1". At
+        // SF=1/10 the build side is small, `JoinSelection` picks
+        // `CollectLeft` (left must be 1 partition — which the wrapper
+        // satisfies), and the bug stays hidden.
+        //
+        // Re-running `EnforceDistribution` on the wrapped plan re-derives
+        // each parent's required input distribution from scratch and
+        // inserts the `RepartitionExec` (Hash on the join key) above the
+        // `SharedSubtreeExec` for the join consumer, while leaving the
+        // scalar-MAX consumer coalesced to 1 partition — restoring a
+        // valid, correct plan. The re-hash of the collapsed single stream
+        // by the join key reproduces the hash distribution the sibling
+        // side already uses, so results are unchanged.
+        //
+        // Gated on `rewritten.transformed`, so this only runs on plans
+        // that actually contain a duplicated f64 aggregate (Q15 in TPC-H);
+        // the other 21 queries returned early via the `dupes.is_empty()`
+        // check above and never reach here.
+        EnforceDistribution::new().optimize(rewritten.data, config)
     }
 
     fn name(&self) -> &str {
@@ -430,6 +468,151 @@ mod tests {
             rows_per_run.iter().all(|&n| n == 1),
             "Q15-shape must return exactly 1 row deterministically; \
              got per-run row counts: {rows_per_run:?}"
+        );
+    }
+
+    /// Σ.BS — Q15 SF=100 partition-mismatch regression guard.
+    ///
+    /// At SF=1/10 the `supplier ⋈ revenue0` join is small enough that
+    /// `JoinSelection` picks `PartitionMode::CollectLeft` (which only
+    /// requires the build side to be 1 partition — satisfied by
+    /// `SharedSubtreeExec`'s `UnknownPartitioning(1)`). At SF=100 the
+    /// build side exceeds the single-partition threshold, so
+    /// `JoinSelection` picks `PartitionMode::Partitioned`, and
+    /// `EnforceDistribution` repartitions both join inputs to N
+    /// hash-partitions. The agg's `Hash[l_suppkey]` output already
+    /// satisfies the join's `Hash[supplier_no]` requirement, so NO
+    /// `RepartitionExec` is inserted above it. This rule then wraps that
+    /// agg in `SharedSubtreeExec`, collapsing its side from N → 1
+    /// partitions with nothing above to restore the count. The
+    /// `HashJoinExec(Partitioned)` then fails its execute()-time
+    /// assertion: "Invalid HashJoinExec, partition count mismatch N!=1".
+    ///
+    /// We reproduce the SF=100 plan shape cheaply at SF=1 data size by
+    /// zeroing the single-partition threshold (forcing `Partitioned`).
+    /// Before the fix this errors; after it returns the single
+    /// max-revenue supplier.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn q15_partitioned_join_survives_shared_subtree_collapse() {
+        use datafusion::arrow::array::{Float64Array, Int64Array, RecordBatch, StringArray};
+        use datafusion::arrow::datatypes::{Field, Schema};
+        use datafusion::datasource::MemTable;
+        use datafusion::execution::session_state::SessionStateBuilder;
+        use datafusion::physical_plan::{collect, displayable};
+        use datafusion::prelude::{SessionConfig, SessionContext};
+
+        // supplier(s_suppkey, s_name) — 64 suppliers.
+        let n_suppliers = 64_i64;
+        let supplier_schema = Arc::new(Schema::new(vec![
+            Field::new("s_suppkey", DataType::Int64, false),
+            Field::new("s_name", DataType::Utf8, false),
+        ]));
+        let supplier_batch = RecordBatch::try_new(
+            supplier_schema.clone(),
+            vec![
+                Arc::new(Int64Array::from((0..n_suppliers).collect::<Vec<_>>())),
+                Arc::new(StringArray::from(
+                    (0..n_suppliers)
+                        .map(|i| format!("Supplier#{i:03}"))
+                        .collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .unwrap();
+        let supplier_mt =
+            Arc::new(MemTable::try_new(supplier_schema, vec![vec![supplier_batch]]).unwrap());
+
+        // lineitem(l_suppkey, l_extendedprice, l_discount) — 32 rows/supplier.
+        let lineitem_schema = Arc::new(Schema::new(vec![
+            Field::new("l_suppkey", DataType::Int64, false),
+            Field::new("l_extendedprice", DataType::Float64, false),
+            Field::new("l_discount", DataType::Float64, false),
+        ]));
+        let (mut l_supp, mut l_price, mut l_disc) = (Vec::new(), Vec::new(), Vec::new());
+        for s in 0..n_suppliers {
+            for r in 0..32_i64 {
+                l_supp.push(s);
+                l_price.push((r as f64 + 1.0) * 1000.0 + (s as f64) * 7.0);
+                l_disc.push(((r % 10) as f64) * 0.01);
+            }
+        }
+        let lineitem_batch = RecordBatch::try_new(
+            lineitem_schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(l_supp)),
+                Arc::new(Float64Array::from(l_price)),
+                Arc::new(Float64Array::from(l_disc)),
+            ],
+        )
+        .unwrap();
+        let lineitem_mt =
+            Arc::new(MemTable::try_new(lineitem_schema, vec![vec![lineitem_batch]]).unwrap());
+
+        // Force PartitionMode::Partitioned even on tiny inputs — this is
+        // what SF=100 does naturally (build side exceeds the single-
+        // partition threshold).
+        let mut config = SessionConfig::new().with_target_partitions(4);
+        config
+            .options_mut()
+            .optimizer
+            .hash_join_single_partition_threshold = 0;
+        config
+            .options_mut()
+            .optimizer
+            .hash_join_single_partition_threshold_rows = 0;
+
+        let state = SessionStateBuilder::new()
+            .with_config(config)
+            .with_default_features()
+            .with_physical_optimizer_rule(Arc::new(DedupeAggregateForFloatDeterminism::default()))
+            .build();
+        let ctx = SessionContext::new_with_state(state);
+        ctx.register_table("supplier", supplier_mt).unwrap();
+        ctx.register_table("lineitem", lineitem_mt).unwrap();
+
+        // Real TPC-H Q15 shape: revenue0 CTE referenced twice (joined to
+        // supplier + inside the scalar MAX subquery) → duplicated f64 agg.
+        let sql = "
+            WITH revenue0 AS (
+                SELECT l_suppkey AS supplier_no,
+                       sum(l_extendedprice * (1 - l_discount)) AS total_revenue
+                FROM lineitem
+                GROUP BY l_suppkey
+            )
+            SELECT s.s_suppkey, s.s_name, r.total_revenue
+            FROM supplier s, revenue0 r
+            WHERE s.s_suppkey = r.supplier_no
+              AND r.total_revenue = (SELECT max(total_revenue) FROM revenue0)
+            ORDER BY s.s_suppkey
+        ";
+
+        let plan = ctx
+            .sql(sql)
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+        let plan_str = displayable(plan.as_ref()).indent(true).to_string();
+        // Guard against vacuous pass: we must actually be exercising a
+        // Partitioned hash join AND the dedupe wrap, else the bug can't
+        // manifest.
+        assert!(
+            plan_str.contains("mode=Partitioned"),
+            "test must exercise PartitionMode::Partitioned; plan:\n{plan_str}"
+        );
+        assert!(
+            plan_str.contains("SharedSubtreeExec"),
+            "dedupe rule must have wrapped the duplicated revenue0 agg; plan:\n{plan_str}"
+        );
+
+        let batches = collect(plan, ctx.task_ctx())
+            .await
+            .expect("Q15 Partitioned plan must execute without a partition-count mismatch");
+        let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(
+            rows, 1,
+            "Q15 returns exactly one (max-revenue) supplier; got {rows} rows"
         );
     }
 

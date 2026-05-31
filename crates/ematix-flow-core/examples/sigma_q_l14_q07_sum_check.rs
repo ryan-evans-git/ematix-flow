@@ -64,6 +64,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             min_probe_to_build_ratio: 64,
             allow_inner_join: allow_inner,
             require_filtered_build: false,
+            max_expected_keys_per_partition: 0,
         }));
         let state = builder.build();
         let ctx = SessionContext::new_with_state(state);

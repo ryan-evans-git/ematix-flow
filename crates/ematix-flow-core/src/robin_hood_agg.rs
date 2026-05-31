@@ -46,6 +46,7 @@
 
 use std::iter::Iterator;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 const INITIAL_CAPACITY: usize = 64;
 const MAX_LOAD_FACTOR_NUMERATOR: usize = 7;
@@ -1396,6 +1397,495 @@ impl RobinHoodSumF64RadixAgg {
     /// Iterate (key, value) pairs across all micro-tables. Order is
     /// (radix-bin, bucket) — neither stable across reps nor sorted by
     /// key. Callers that care should sort downstream.
+    pub fn iter(&self) -> impl Iterator<Item = (i64, f64)> + '_ {
+        self.tables.iter().flat_map(|t| t.iter())
+    }
+}
+
+// ---------------------------------------------------------------------
+// REV.5.b — CORRECTED global-partition `SUM(f64) GROUP BY i64` aggregator.
+//
+// Fixes the per-1024-row-binning flaw in `RobinHoodSumF64RadixAgg` above
+// (which revisits all bins every chunk → no sustained cache residency,
+// and LOST its microbench 0.48–0.99× vs single-table). This version does
+// TRUE global partitioning, streaming-compatible:
+//   1. `ingest_batch` scatter-APPENDS rows into persistent per-bin
+//      buffers (no aggregation yet).
+//   2. When buffered rows exceed a memory budget, `drain_all` flushes
+//      EVERY bin's accumulated rows into its micro-table in one large
+//      wave (so each table stays cache-hot for its wave) and frees the
+//      raw buffers.
+//   3. `finish` drains the remainder; `iter`/`len` read the tables.
+//
+// Microbench (examples/bench_radix_agg.rs `run_radix_global`): wins
+// 1.31–1.39× @ 4M keys, 1.09–1.37× @ 38M keys vs the single-table agg.
+//
+// The incremental drain bounds peak raw-buffer memory to ~budget, so N
+// concurrent operator partitions don't thrash at SF=100 (full buffering
+// of one Partial partition is ~690 MB; 14 of them ≈ 10 GB).
+// ---------------------------------------------------------------------
+
+/// splitmix64 finalizer for the partition hash — the top `radix_bits`
+/// bits pick the bin. Independent of the micro-tables' internal
+/// `hash_i64` slotting; it only needs to map identical keys to the same
+/// bin, which preserves correctness for any deterministic hash.
+#[inline]
+fn radix_part_hash(k: i64) -> u64 {
+    let mut z = (k as u64).wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+/// Process-unique sequence so concurrent aggregators (one per partition
+/// thread) write to non-colliding spill files.
+static SPILL_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// REV.5.b — disk-spill backend for the radix aggregator. One append-only
+/// spill file per bin, created lazily on first spill. Rows are written as
+/// raw native-endian `[i64 key][f64 val]` pairs (16 B/row) and streamed
+/// back sequentially at finish. A spilled bin is drained exactly once
+/// (disk rows, then the in-memory tail) into its micro-table, which stays
+/// cache-resident for the whole drain — the residency win, preserved
+/// under a memory bound instead of given up to a mid-stream re-visit.
+struct SpillStore {
+    dir: std::path::PathBuf,
+    files: Vec<Option<std::fs::File>>,
+    spilled_rows: Vec<usize>,
+    /// Reused serialisation scratch (rebuilt per spill, never grows past
+    /// the largest single spill).
+    scratch: Vec<u8>,
+    id: u64,
+}
+
+impl SpillStore {
+    fn new(dir: std::path::PathBuf, n_bins: usize) -> Self {
+        let id = SPILL_SEQ.fetch_add(1, Ordering::Relaxed);
+        Self {
+            dir,
+            files: (0..n_bins).map(|_| None).collect(),
+            spilled_rows: vec![0usize; n_bins],
+            scratch: Vec::new(),
+            id,
+        }
+    }
+
+    fn path_for(&self, bin: usize) -> std::path::PathBuf {
+        self.dir
+            .join(format!("ematix-radix-spill-{}-{}.bin", self.id, bin))
+    }
+
+    /// Append a bin's buffered rows to its spill file (create on first use).
+    fn spill_bin(&mut self, bin: usize, keys: &[i64], vals: &[f64]) -> std::io::Result<()> {
+        debug_assert_eq!(keys.len(), vals.len());
+        if keys.is_empty() {
+            return Ok(());
+        }
+        if self.files[bin].is_none() {
+            let f = std::fs::OpenOptions::new()
+                .create(true)
+                .read(true)
+                .append(true)
+                .open(self.path_for(bin))?;
+            self.files[bin] = Some(f);
+        }
+        self.scratch.clear();
+        self.scratch.reserve(keys.len() * 16);
+        for i in 0..keys.len() {
+            self.scratch.extend_from_slice(&keys[i].to_ne_bytes());
+            self.scratch.extend_from_slice(&vals[i].to_ne_bytes());
+        }
+        use std::io::Write;
+        self.files[bin].as_mut().unwrap().write_all(&self.scratch)?;
+        self.spilled_rows[bin] += keys.len();
+        Ok(())
+    }
+
+    /// Move a bin's spill file out into a streaming reader (rewound to
+    /// start). Returns `None` if the bin never spilled. The reader removes
+    /// the spill file on drop.
+    fn take_reader(&mut self, bin: usize, chunk: usize) -> std::io::Result<Option<SpillReader>> {
+        match self.files[bin].take() {
+            None => Ok(None),
+            Some(mut file) => {
+                use std::io::{Seek, SeekFrom};
+                file.seek(SeekFrom::Start(0))?;
+                let chunk = chunk.max(1);
+                Ok(Some(SpillReader {
+                    file,
+                    path: self.path_for(bin),
+                    raw: vec![0u8; chunk * 16],
+                    keys: vec![0i64; chunk],
+                    vals: vec![0f64; chunk],
+                }))
+            }
+        }
+    }
+}
+
+impl Drop for SpillStore {
+    fn drop(&mut self) {
+        // Best-effort cleanup of any spill files not yet drained (e.g. on
+        // early drop before finish()).
+        for bin in 0..self.files.len() {
+            if self.files[bin].is_some() {
+                let _ = std::fs::remove_file(self.path_for(bin));
+            }
+        }
+    }
+}
+
+/// Streaming reader over one bin's spill file. Decodes `[i64][f64]` rows
+/// into reusable `keys`/`vals` buffers, `chunk` rows at a time.
+struct SpillReader {
+    file: std::fs::File,
+    path: std::path::PathBuf,
+    raw: Vec<u8>,
+    keys: Vec<i64>,
+    vals: Vec<f64>,
+}
+
+impl SpillReader {
+    /// Fill `self.keys`/`self.vals` with the next block of rows. Returns
+    /// the row count (0 = EOF). Handles short reads by accumulating until
+    /// the chunk buffer is full or EOF.
+    fn read_chunk(&mut self) -> std::io::Result<usize> {
+        use std::io::Read;
+        let cap = self.raw.len();
+        let mut filled = 0usize;
+        while filled < cap {
+            match self.file.read(&mut self.raw[filled..]) {
+                Ok(0) => break,
+                Ok(n) => filled += n,
+                Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        debug_assert_eq!(filled % 16, 0, "spill file truncated mid-row");
+        let rows = filled / 16;
+        for r in 0..rows {
+            let o = r * 16;
+            self.keys[r] = i64::from_ne_bytes(self.raw[o..o + 8].try_into().unwrap());
+            self.vals[r] = f64::from_ne_bytes(self.raw[o + 8..o + 16].try_into().unwrap());
+        }
+        Ok(rows)
+    }
+}
+
+impl Drop for SpillReader {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// REV.5.b — global-partition `SUM(f64) GROUP BY i64` aggregator with a
+/// memory-bounded incremental drain. See the module banner above.
+///
+/// Layout: rows are radix-partitioned **on ingest** into per-bin append
+/// buffers (`bin_keys[b]`, `bin_vals[b]`). At `finish()` each bin's
+/// contiguous buffer is drained once into its own micro-table, which
+/// stays cache-resident for the whole drain — DuckDB's shape, and the
+/// source of the residency win. A single fused tag+scatter pass per batch
+/// hashes each key exactly once (REV.6: no double-hash).
+///
+/// If the buffered rows exceed `drain_threshold_rows`, the over-budget
+/// action is *aggregate-and-clear* (mid-stream drain) — memory-safe but it
+/// re-visits partitions, eroding residency. The spill-backed variant
+/// (`new_with_spill`) instead pushes cold partitions to disk and drains
+/// each exactly once at finish, preserving residency under a memory bound.
+pub struct RobinHoodSumF64GlobalRadixAgg {
+    tables: Vec<RobinHoodI64F64>,
+    /// Per-bin append buffers — rows are partitioned here on ingest.
+    bin_keys: Vec<Vec<i64>>,
+    bin_vals: Vec<Vec<f64>>,
+    /// Total rows currently buffered across all bins (drives the budget).
+    buffered_rows: usize,
+    /// Reused batch-local tag scratch (one hash/row, reused for scatter).
+    tag_scratch: Vec<u16>,
+    n_bins: usize,
+    shift: u32,
+    /// Drain once buffered rows reach this many (= budget / 16 B).
+    drain_threshold_rows: usize,
+    /// Optional disk-spill backend; `None` = pure in-memory (mid-stream
+    /// aggregate-drain on over-budget).
+    spill: Option<SpillStore>,
+    /// Reused drain scratch for the vectorised per-bin insert.
+    scratch_slots: Vec<usize>,
+    scratch_hit: Vec<bool>,
+    finished: bool,
+}
+
+impl RobinHoodSumF64GlobalRadixAgg {
+    /// `radix_bits` → `2^radix_bits` bins (≤ 4096). `per_table_cap` sizes
+    /// each micro-table (caller passes `total_card_est / n_bins`).
+    /// `mem_budget_bytes` caps the per-bin input buffers; the over-budget
+    /// action fires once buffered rows would exceed it (each row = 16 B:
+    /// i64 key + f64 value). Floored at one 1024-row chunk.
+    ///
+    /// Pure in-memory: over-budget aggregates the current buffers into the
+    /// tables and clears them (mid-stream re-visit — gives up residency to
+    /// stay memory-safe). For the residency-preserving variant, see
+    /// [`Self::new_with_spill`].
+    pub fn new(radix_bits: u8, per_table_cap: usize, mem_budget_bytes: usize) -> Self {
+        Self::build(radix_bits, per_table_cap, mem_budget_bytes, None)
+    }
+
+    /// Spill-backed variant (REV.5.b — DuckDB's shape). When buffered rows
+    /// exceed the budget, cold partitions are written to disk under
+    /// `spill_dir` rather than aggregated; at `finish()` each partition is
+    /// read back and aggregated **exactly once** into its table, which
+    /// stays cache-resident for that whole drain. Memory-bounded (input
+    /// buffering capped at the budget) but residency-preserving.
+    pub fn new_with_spill(
+        radix_bits: u8,
+        per_table_cap: usize,
+        mem_budget_bytes: usize,
+        spill_dir: std::path::PathBuf,
+    ) -> Self {
+        let nb = 1usize << radix_bits;
+        Self::build(
+            radix_bits,
+            per_table_cap,
+            mem_budget_bytes,
+            Some(SpillStore::new(spill_dir, nb)),
+        )
+    }
+
+    fn build(
+        radix_bits: u8,
+        per_table_cap: usize,
+        mem_budget_bytes: usize,
+        spill: Option<SpillStore>,
+    ) -> Self {
+        assert!(
+            radix_bits <= 12,
+            "radix_bits must be ≤ 12; got {radix_bits}"
+        );
+        let nb = 1usize << radix_bits;
+        let mut tables = Vec::with_capacity(nb);
+        for _ in 0..nb {
+            tables.push(RobinHoodI64F64::with_capacity(per_table_cap));
+        }
+        let shift = if radix_bits == 0 {
+            0
+        } else {
+            usize::BITS - radix_bits as u32
+        };
+        let drain_threshold_rows = (mem_budget_bytes / 16).max(1024);
+        Self {
+            tables,
+            bin_keys: (0..nb).map(|_| Vec::new()).collect(),
+            bin_vals: (0..nb).map(|_| Vec::new()).collect(),
+            buffered_rows: 0,
+            tag_scratch: Vec::new(),
+            n_bins: nb,
+            shift,
+            drain_threshold_rows,
+            spill,
+            scratch_slots: vec![0usize; 1024],
+            scratch_hit: vec![false; 1024],
+            finished: false,
+        }
+    }
+
+    pub fn n_tables(&self) -> usize {
+        self.tables.len()
+    }
+
+    /// True if the spill backend wrote at least one partition to disk.
+    pub fn did_spill(&self) -> bool {
+        self.total_spilled_rows() > 0
+    }
+
+    /// Total rows written to disk across all bins (0 if not spilling).
+    pub fn total_spilled_rows(&self) -> usize {
+        self.spill
+            .as_ref()
+            .map_or(0, |s| s.spilled_rows.iter().sum())
+    }
+
+    /// REV.8 — consume the aggregator and return its per-bin micro-tables
+    /// (one per radix bin). Must be called after [`Self::finish`]. The
+    /// single-pass-radix operator uses this to merge bin `b` across input
+    /// partitions: because the bin = `hash(key) >> shift` is identical in
+    /// every partition's aggregator, bin `b` holds the same key space
+    /// everywhere, so a per-bin cross-partition merge is complete.
+    pub fn into_tables(self) -> Vec<RobinHoodI64F64> {
+        debug_assert!(self.finished, "into_tables called before finish()");
+        self.tables
+    }
+
+    /// Radix-partition a batch into the per-bin append buffers via a single
+    /// fused tag+scatter pass (one hash per key — REV.6: no double-hash).
+    /// Triggers the over-budget action if the buffered rows cross the cap.
+    pub fn ingest_batch(&mut self, keys: &[i64], vals: &[f64]) {
+        assert_eq!(
+            keys.len(),
+            vals.len(),
+            "ingest_batch: keys and values must be same length"
+        );
+        debug_assert!(!self.finished, "ingest_batch called after finish()");
+        let m = keys.len();
+        if m == 0 {
+            return;
+        }
+        let nb = self.n_bins;
+        if nb == 1 {
+            // Degenerate single-bin: append straight into bin 0.
+            self.bin_keys[0].extend_from_slice(keys);
+            self.bin_vals[0].extend_from_slice(vals);
+        } else {
+            let shift = self.shift;
+            if self.tag_scratch.len() < m {
+                self.tag_scratch.resize(m, 0);
+            }
+            // Pass 1: tag each key + histogram (one hash/key, reused below).
+            let mut counts = [0u32; 4096];
+            #[allow(clippy::needless_range_loop)] // `i` indexes keys + tag_scratch in lockstep
+            for i in 0..m {
+                let b = (radix_part_hash(keys[i]) >> shift) as usize;
+                self.tag_scratch[i] = b as u16;
+                counts[b] += 1;
+            }
+            // Reserve each touched bin once so the scatter-append below is a
+            // pure write (no realloc churn mid-loop).
+            #[allow(clippy::needless_range_loop)] // `b` indexes counts + bin_keys + bin_vals
+            for b in 0..nb {
+                let c = counts[b] as usize;
+                if c > 0 {
+                    self.bin_keys[b].reserve(c);
+                    self.bin_vals[b].reserve(c);
+                }
+            }
+            // Pass 2: scatter-append into the persistent per-bin buffers.
+            for i in 0..m {
+                let b = self.tag_scratch[i] as usize;
+                self.bin_keys[b].push(keys[i]);
+                self.bin_vals[b].push(vals[i]);
+            }
+        }
+        self.buffered_rows += m;
+        if self.buffered_rows >= self.drain_threshold_rows {
+            self.over_budget();
+        }
+    }
+
+    /// Buffered rows crossed the cap. In-memory mode aggregates the current
+    /// buffers into the tables (re-visits partitions). Spill mode pushes
+    /// them to disk, deferring aggregation to a single pass at finish.
+    fn over_budget(&mut self) {
+        if self.spill.is_some() {
+            self.spill_all_bins();
+        } else {
+            self.drain_to_tables();
+        }
+    }
+
+    /// In-memory drain (over-budget + finish): aggregate each bin's current
+    /// buffer into its persistent table, then clear. Accumulates correctly
+    /// across repeated calls — tables persist, so keys repeated across
+    /// drains sum into the same group.
+    fn drain_to_tables(&mut self) {
+        let nb = self.n_bins;
+        for b in 0..nb {
+            if self.bin_keys[b].is_empty() {
+                continue;
+            }
+            self.tables[b].insert_or_sum_batch_vectorised_with_scratch(
+                &self.bin_keys[b],
+                &self.bin_vals[b],
+                &mut self.scratch_slots,
+                &mut self.scratch_hit,
+            );
+            self.bin_keys[b].clear();
+            self.bin_vals[b].clear();
+        }
+        self.buffered_rows = 0;
+    }
+
+    /// Spill-mode over-budget: append each non-empty bin's buffer to its
+    /// on-disk spill file and clear it. Aggregation is deferred to
+    /// `finalize_spilled` so each partition is drained exactly once.
+    fn spill_all_bins(&mut self) {
+        let nb = self.n_bins;
+        for b in 0..nb {
+            if self.bin_keys[b].is_empty() {
+                continue;
+            }
+            self.spill
+                .as_mut()
+                .expect("spill_all_bins without spill backend")
+                .spill_bin(b, &self.bin_keys[b], &self.bin_vals[b])
+                .expect("radix spill write failed");
+            self.bin_keys[b].clear();
+            self.bin_vals[b].clear();
+        }
+        self.buffered_rows = 0;
+    }
+
+    /// Spill-mode finish: for each bin, aggregate its disk-spilled rows
+    /// (streamed back in chunks) then its in-memory tail into the table —
+    /// exactly once, so the table stays cache-resident for the whole bin.
+    fn finalize_spilled(&mut self) {
+        let nb = self.n_bins;
+        const READ_CHUNK: usize = 8192;
+        for b in 0..nb {
+            // 1. Disk-spilled rows, if any (reader removes the file on drop).
+            let reader = self
+                .spill
+                .as_mut()
+                .expect("finalize_spilled without spill backend")
+                .take_reader(b, READ_CHUNK)
+                .expect("spill open failed");
+            if let Some(mut reader) = reader {
+                loop {
+                    let n = reader.read_chunk().expect("spill read failed");
+                    if n == 0 {
+                        break;
+                    }
+                    self.tables[b].insert_or_sum_batch_vectorised_with_scratch(
+                        &reader.keys[..n],
+                        &reader.vals[..n],
+                        &mut self.scratch_slots,
+                        &mut self.scratch_hit,
+                    );
+                }
+            }
+            // 2. In-memory tail.
+            if !self.bin_keys[b].is_empty() {
+                self.tables[b].insert_or_sum_batch_vectorised_with_scratch(
+                    &self.bin_keys[b],
+                    &self.bin_vals[b],
+                    &mut self.scratch_slots,
+                    &mut self.scratch_hit,
+                );
+                self.bin_keys[b].clear();
+                self.bin_vals[b].clear();
+            }
+        }
+        self.buffered_rows = 0;
+    }
+
+    /// Drain remaining buffers. Must be called before `iter`/`len`.
+    pub fn finish(&mut self) {
+        if self.spill.is_some() {
+            self.finalize_spilled();
+        } else {
+            self.drain_to_tables();
+        }
+        self.finished = true;
+    }
+
+    /// Total groups across all bins. Valid only after `finish()`.
+    pub fn len(&self) -> usize {
+        self.tables.iter().map(|t| t.len()).sum()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// `(key, sum)` across all bins. Valid only after `finish()`.
     pub fn iter(&self) -> impl Iterator<Item = (i64, f64)> + '_ {
         self.tables.iter().flat_map(|t| t.iter())
     }
@@ -3218,6 +3708,264 @@ mod tests {
                 "lost or wrong value for key {k} after per-bin grow"
             );
         }
+    }
+
+    // -----------------------------------------------------------------
+    // REV.5.b — RobinHoodSumF64GlobalRadixAgg (corrected global-partition)
+    // -----------------------------------------------------------------
+
+    /// Ingest in `batch`-row batches + finish, vs the single-table
+    /// baseline. Returns sorted (single, global) (key,sum) pairs.
+    fn global_radix_vs_single(
+        keys: &[i64],
+        vals: &[f64],
+        radix_bits: u8,
+        per_table_cap: usize,
+        mem_budget_bytes: usize,
+        batch: usize,
+    ) -> (Vec<(i64, f64)>, Vec<(i64, f64)>) {
+        let total_cap = per_table_cap.saturating_mul(1usize << radix_bits);
+        let mut single = RobinHoodI64F64::with_capacity(total_cap.max(64));
+        single.insert_or_sum_batch_vectorised(keys, vals);
+        let mut s: Vec<(i64, f64)> = single.iter().collect();
+        s.sort_by_key(|(k, _)| *k);
+
+        let mut g = RobinHoodSumF64GlobalRadixAgg::new(radix_bits, per_table_cap, mem_budget_bytes);
+        let mut o = 0;
+        while o < keys.len() {
+            let e = (o + batch).min(keys.len());
+            g.ingest_batch(&keys[o..e], &vals[o..e]);
+            o = e;
+        }
+        g.finish();
+        let mut r: Vec<(i64, f64)> = g.iter().collect();
+        r.sort_by_key(|(k, _)| *k);
+        (s, r)
+    }
+
+    fn assert_pairs_eq(s: &[(i64, f64)], r: &[(i64, f64)]) {
+        assert_eq!(
+            s.len(),
+            r.len(),
+            "group count differs: single={} global={}",
+            s.len(),
+            r.len()
+        );
+        for (a, b) in s.iter().zip(r.iter()) {
+            assert_eq!(a.0, b.0, "key mismatch");
+            assert!(
+                (a.1 - b.1).abs() < 1e-6,
+                "sum diverged at key {}: single={} global={}",
+                a.0,
+                a.1,
+                b.1
+            );
+        }
+    }
+
+    #[test]
+    fn global_radix_empty() {
+        let mut g = RobinHoodSumF64GlobalRadixAgg::new(6, 64, 1 << 20);
+        g.ingest_batch(&[], &[]);
+        g.finish();
+        assert_eq!(g.len(), 0);
+        assert!(g.is_empty());
+    }
+
+    #[test]
+    fn global_radix_matches_single_high_card() {
+        // 50K distinct keys, ingested in 8192-row batches, 256 bins.
+        let n = 50_000;
+        let keys: Vec<i64> = (0..n as i64).collect();
+        let vals: Vec<f64> = (0..n).map(|i| (i as f64) + 0.125).collect();
+        let (s, r) = global_radix_vs_single(&keys, &vals, 8, 256, 1 << 26, 8192);
+        assert_pairs_eq(&s, &r);
+    }
+
+    #[test]
+    fn global_radix_matches_single_low_card_sums() {
+        // 100K rows / 500 distinct keys → heavy accumulation per key.
+        let n = 100_000;
+        let card = 500i64;
+        let keys: Vec<i64> = (0..n).map(|i| (i as i64) % card).collect();
+        let vals: Vec<f64> = (0..n).map(|i| (i as f64) * 0.25).collect();
+        let (s, r) = global_radix_vs_single(&keys, &vals, 6, 128, 1 << 26, 8192);
+        assert_pairs_eq(&s, &r);
+    }
+
+    #[test]
+    fn global_radix_incremental_drain_correct() {
+        // Tiny 16 KB budget (~1024 rows) forces MANY mid-stream drains;
+        // result must still match single-table (drains accumulate into
+        // the persistent micro-tables, incl. keys repeated across drains).
+        let n = 40_000;
+        let keys: Vec<i64> = (0..n as i64).map(|k| k % 7000).collect();
+        let vals: Vec<f64> = (0..n).map(|i| ((i * 3) % 97) as f64 + 0.5).collect();
+        let (s, r) = global_radix_vs_single(&keys, &vals, 6, 256, 16 * 1024, 4096);
+        assert_pairs_eq(&s, &r);
+    }
+
+    #[test]
+    fn global_radix_bits_zero_degrades_to_single() {
+        let n = 8_000;
+        let keys: Vec<i64> = (0..n as i64).map(|k| k % 300).collect();
+        let vals: Vec<f64> = (0..n).map(|i| (i as f64) * 0.5).collect();
+        let (s, r) = global_radix_vs_single(&keys, &vals, 0, 1024, 1 << 26, 8192);
+        assert_pairs_eq(&s, &r);
+    }
+
+    #[test]
+    fn global_radix_sums_same_key_across_many_batches() {
+        // Same key in every batch + a small budget → must sum across
+        // batches AND across incremental drains.
+        let batches = 50usize;
+        let per = 1000usize;
+        let mut g = RobinHoodSumF64GlobalRadixAgg::new(4, 16, 8 * 1024);
+        for _ in 0..batches {
+            g.ingest_batch(&vec![42i64; per], &vec![1.0f64; per]);
+        }
+        g.finish();
+        assert_eq!(g.len(), 1);
+        let pairs: Vec<(i64, f64)> = g.iter().collect();
+        assert_eq!(pairs[0].0, 42);
+        assert!((pairs[0].1 - (batches * per) as f64).abs() < 1e-6);
+    }
+
+    // -----------------------------------------------------------------
+    // REV.5.b — spill-backed global radix (memory-bounded, disk-backed).
+    // The residency win preserved under a memory bound: over-budget
+    // partitions go to disk and are aggregated exactly once at finish.
+    // -----------------------------------------------------------------
+
+    static SPILL_TEST_SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+    /// A fresh, empty temp dir unique to this test (process id + counter),
+    /// so the post-finish "no leftover spill files" assertion is exact and
+    /// parallel tests never collide.
+    fn fresh_spill_dir() -> std::path::PathBuf {
+        let n = SPILL_TEST_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let d = std::env::temp_dir().join(format!(
+            "ematix-radix-spill-test-{}-{}",
+            std::process::id(),
+            n
+        ));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// Spill-backed aggregator vs single-table. Returns sorted (single,
+    /// global) pairs + whether spilling fired, and asserts spill files are
+    /// cleaned up after finish().
+    fn global_radix_spill_vs_single(
+        keys: &[i64],
+        vals: &[f64],
+        radix_bits: u8,
+        per_table_cap: usize,
+        mem_budget_bytes: usize,
+        batch: usize,
+    ) -> (Vec<(i64, f64)>, Vec<(i64, f64)>, bool) {
+        let total_cap = per_table_cap.saturating_mul(1usize << radix_bits);
+        let mut single = RobinHoodI64F64::with_capacity(total_cap.max(64));
+        single.insert_or_sum_batch_vectorised(keys, vals);
+        let mut s: Vec<(i64, f64)> = single.iter().collect();
+        s.sort_by_key(|(k, _)| *k);
+
+        let dir = fresh_spill_dir();
+        let mut g = RobinHoodSumF64GlobalRadixAgg::new_with_spill(
+            radix_bits,
+            per_table_cap,
+            mem_budget_bytes,
+            dir.clone(),
+        );
+        let mut o = 0;
+        while o < keys.len() {
+            let e = (o + batch).min(keys.len());
+            g.ingest_batch(&keys[o..e], &vals[o..e]);
+            o = e;
+        }
+        g.finish();
+        let spilled = g.did_spill();
+        let mut r: Vec<(i64, f64)> = g.iter().collect();
+        r.sort_by_key(|(k, _)| *k);
+        let leftover = std::fs::read_dir(&dir).map(|rd| rd.count()).unwrap_or(0);
+        assert_eq!(
+            leftover, 0,
+            "spill files not cleaned up after finish ({leftover} left)"
+        );
+        drop(g);
+        let _ = std::fs::remove_dir_all(&dir);
+        (s, r, spilled)
+    }
+
+    #[test]
+    fn global_radix_spill_matches_single_high_card() {
+        // 50K distinct keys, tiny 16 KB budget → many spills across 256 bins.
+        let n = 50_000;
+        let keys: Vec<i64> = (0..n as i64).collect();
+        let vals: Vec<f64> = (0..n).map(|i| (i as f64) + 0.125).collect();
+        let (s, r, spilled) = global_radix_spill_vs_single(&keys, &vals, 8, 256, 16 * 1024, 8192);
+        assert!(spilled, "expected spilling under a 16 KB budget");
+        assert_pairs_eq(&s, &r);
+    }
+
+    #[test]
+    fn global_radix_spill_low_card_heavy_accumulation() {
+        // 100K rows / 500 distinct → heavy per-key sums spanning many spills.
+        let n = 100_000;
+        let card = 500i64;
+        let keys: Vec<i64> = (0..n).map(|i| (i as i64) % card).collect();
+        let vals: Vec<f64> = (0..n).map(|i| (i as f64) * 0.25).collect();
+        let (s, r, spilled) = global_radix_spill_vs_single(&keys, &vals, 6, 128, 16 * 1024, 4096);
+        assert!(spilled);
+        assert_pairs_eq(&s, &r);
+    }
+
+    #[test]
+    fn global_radix_spill_no_trigger_matches_single() {
+        // Budget far exceeds the data → spill backend present but never
+        // fires; result matches single-table (the in-RAM residency path).
+        let n = 20_000;
+        let keys: Vec<i64> = (0..n as i64).collect();
+        let vals: Vec<f64> = (0..n).map(|i| (i as f64) + 0.5).collect();
+        let (s, r, spilled) = global_radix_spill_vs_single(&keys, &vals, 6, 512, 1 << 26, 8192);
+        assert!(!spilled, "did not expect spilling under a 64 MB budget");
+        assert_pairs_eq(&s, &r);
+    }
+
+    #[test]
+    fn global_radix_spill_single_bin_degenerate() {
+        // radix_bits=0 (one bin) + tiny budget → degenerate path still
+        // spills bin 0 and aggregates correctly.
+        let n = 30_000;
+        let keys: Vec<i64> = (0..n as i64).map(|k| k % 4000).collect();
+        let vals: Vec<f64> = (0..n).map(|i| ((i * 7) % 13) as f64 + 0.5).collect();
+        let (s, r, spilled) = global_radix_spill_vs_single(&keys, &vals, 0, 4096, 16 * 1024, 4096);
+        assert!(spilled);
+        assert_pairs_eq(&s, &r);
+    }
+
+    #[test]
+    fn global_radix_spill_sums_same_key_across_batches() {
+        // Same key every batch + tiny budget → must sum across batches AND
+        // across many disk spills, then clean up.
+        let batches = 60usize;
+        let per = 1000usize;
+        let dir = fresh_spill_dir();
+        let mut g = RobinHoodSumF64GlobalRadixAgg::new_with_spill(4, 16, 8 * 1024, dir.clone());
+        for _ in 0..batches {
+            g.ingest_batch(&vec![7i64; per], &vec![2.0f64; per]);
+        }
+        g.finish();
+        assert!(g.did_spill());
+        assert_eq!(g.len(), 1);
+        let pairs: Vec<(i64, f64)> = g.iter().collect();
+        assert_eq!(pairs[0].0, 7);
+        assert!((pairs[0].1 - (batches * per) as f64 * 2.0).abs() < 1e-6);
+        let leftover = std::fs::read_dir(&dir).map(|rd| rd.count()).unwrap_or(0);
+        assert_eq!(leftover, 0, "spill files left after finish");
+        drop(g);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
