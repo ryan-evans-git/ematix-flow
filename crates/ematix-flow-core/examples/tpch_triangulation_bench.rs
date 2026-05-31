@@ -26,8 +26,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 use datafusion::execution::session_state::SessionStateBuilder;
-use datafusion::physical_plan::ExecutionPlanProperties;
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
+use datafusion::physical_plan::ExecutionPlanProperties;
 use datafusion::prelude::{SessionConfig, SessionContext};
 use ematix_flow_core::bloom::ContextBlooms;
 use ematix_flow_core::dedupe_aggregate_rule::DedupeAggregateForFloatDeterminism;
@@ -38,7 +38,7 @@ use ematix_flow_core::force_collect_left_semi_build_rule::ForceCollectLeftForSem
 use ematix_flow_core::fused_aggregate_filter_multi_agg_rule::InjectFilterMultiAggRule;
 use ematix_flow_core::fused_aggregate_filter_sum_rule::InjectFilterSumRule;
 use ematix_flow_core::inbloom_scan_pushdown_rule::EnableInBloomScanPushdownRule;
-use ematix_flow_core::local_bloom_emitter::{LocalBloomOptions, emit_build_side_blooms_local};
+use ematix_flow_core::local_bloom_emitter::{emit_build_side_blooms_local, LocalBloomOptions};
 use ematix_flow_core::push_down_left_semi_rule::PushDownLeftSemiRule;
 use ematix_flow_core::robin_hood_sum_f64_exec::EnableRobinHoodSumF64Rule;
 use ematix_flow_core::runtime_bloom_cascading_rule::EnableCascadingBloomRule;
@@ -1515,6 +1515,21 @@ async fn build_ematix_ctx(
     } else if rh_sum_f64_enabled {
         builder =
             builder.with_physical_optimizer_rule(Arc::new(EnableRobinHoodSumF64Rule::default()));
+    }
+    // REV.18c: COUNT(*) GROUP BY i64 and AVG(f64) GROUP BY i64 RobinHood
+    // kernels are OPT-IN. The operator crossover sweep shows all three only
+    // beat stock in the 200K–256K group band; no SF=10 TPC-H query lands a
+    // matching shape there (Q18 SUM/l_orderkey ≈15M groups, Q13 COUNT/o_custkey
+    // ≈1M — both gated out at 256K). Env-gated here for the default-on A/B.
+    if std::env::var("EMAT_RH_COUNT").ok().as_deref() == Some("1") {
+        builder = builder.with_physical_optimizer_rule(Arc::new(
+            ematix_flow_core::robin_hood_agg_rule::EnableRobinHoodAggregateRule::default(),
+        ));
+    }
+    if std::env::var("EMAT_RH_AVG").ok().as_deref() == Some("1") {
+        builder = builder.with_physical_optimizer_rule(Arc::new(
+            ematix_flow_core::robin_hood_avg_f64_exec::EnableRobinHoodAvgF64Rule::default(),
+        ));
     }
     // Σ.AN.1 (2026-05-28): per-operator partition routing for
     // high-cardinality FinalPartitioned aggregates. Opt-in via
