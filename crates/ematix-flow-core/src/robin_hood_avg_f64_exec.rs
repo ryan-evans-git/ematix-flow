@@ -427,13 +427,20 @@ pub struct EnableRobinHoodAvgF64Rule {
     pub max_groups: usize,
 }
 
+/// REV.18 (2026-05-31): tightened 32M → 256K, matching the RobinHoodSumF64
+/// finding. This AVG rule is OPT-IN (not in preset.rs / bench; Σ.R.2 rejected
+/// it — Q17 SF=10 +40-55%), so the old 32M default never bit production — but
+/// it's the SAME row-at-a-time open-addressing kernel, which loses to
+/// DataFusion's vectorised columnar agg above ~256K groups (see
+/// DEFAULT_RH_SUM_F64_MAX_GROUPS). Tightened defensively against re-enable.
+pub const DEFAULT_RH_AVG_F64_MAX_GROUPS: usize = 256 * 1024;
+
 impl Default for EnableRobinHoodAvgF64Rule {
     fn default() -> Self {
-        // Default = MAX_INIT_CAP (32M); env-overridable for A/B + tuning.
         let max_groups = std::env::var("EMAT_RH_AVG_F64_MAX_GROUPS")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(32 * 1024 * 1024);
+            .unwrap_or(DEFAULT_RH_AVG_F64_MAX_GROUPS);
         Self { max_groups }
     }
 }
