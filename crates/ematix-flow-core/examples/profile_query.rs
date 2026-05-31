@@ -77,6 +77,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_physical_optimizer_rule(Arc::new(InjectFilterSumRule));
     builder = builder.with_optimizer_rule(Arc::new(PushDownLeftSemiRule));
     builder = builder.with_physical_optimizer_rule(Arc::new(SwapSemiJoinBuildSideRule));
+    // REV.17.3: mirror production preset — force CollectLeft on
+    // semi-bounded builds + scale-relative broadcast of small dim builds
+    // (both via ::default()), so profiles reflect the production hot path.
+    builder = builder.with_physical_optimizer_rule(Arc::new(
+        ematix_flow_core::force_collect_left_semi_build_rule::ForceCollectLeftForSemiBoundedBuildRule::default(),
+    ));
     // Σ.Q.L1b: matches the triangulation bench's gating on
     // EMAT_RH_SUM_F64=1. Default-off avoids the ~7% geomean codegen
     // tax from [[optimizer-codegen-sensitivity]] when the operator
