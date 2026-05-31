@@ -73,6 +73,36 @@ fn l9_set_threshold() -> usize {
         .unwrap_or(DEFAULT_L9_SET_THRESHOLD)
 }
 
+/// KEYS.1 — true iff a join-key `DataType` losslessly widens to `i64`, so it
+/// can ride the i64-domain runtime bloom/set sideband (`insert_i64` /
+/// `might_contain_i64`) with only a widen-on-read at the build side and the
+/// native-i64 read at the probe side.
+///
+/// Accepted: the signed/unsigned integer widths that fit in i64 plus the
+/// date types (which are i32/i64 day/ms counts underneath). Excluded by
+/// design — each needs a DIFFERENT structure, tracked as follow-ups:
+///   * `UInt64` — can exceed `i64::MAX`; needs a parallel u64 bloom.
+///   * `Float32/64` — float equi-join is a semantic anti-pattern and bit-
+///     pattern hashing is unsafe across encodings.
+///   * `Utf8 / Utf8View / Dictionary` — need a byte/hash bloom + a string
+///     probe kernel (a separate, larger mechanism).
+///   * `Decimal128/256` — 128/256-bit, don't fit i64.
+pub fn widens_to_i64(dt: &datafusion::arrow::datatypes::DataType) -> bool {
+    use datafusion::arrow::datatypes::DataType;
+    matches!(
+        dt,
+        DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::Date32
+            | DataType::Date64
+    )
+}
+
 /// Σ.Q.L9 — Wrapper exec that emits a build-side bloom to a sideband.
 #[derive(Debug)]
 pub struct BuildSideBloomEmitterExec {
@@ -170,12 +200,11 @@ impl BuildSideBloomEmitterExec {
                 "BuildSideBloomEmitterExec: key_col_idx={key_col_idx} out of bounds"
             )));
         }
-        if in_schema.field(key_col_idx).data_type()
-            != &datafusion::arrow::datatypes::DataType::Int64
-        {
+        let key_dt = in_schema.field(key_col_idx).data_type();
+        if !widens_to_i64(key_dt) {
             return Err(DataFusionError::Internal(format!(
-                "BuildSideBloomEmitterExec: key column must be Int64, got {:?}",
-                in_schema.field(key_col_idx).data_type()
+                "BuildSideBloomEmitterExec: key column must widen to i64 \
+                 (Int8/16/32/64, UInt8/16/32, Date32/64), got {key_dt:?}"
             )));
         }
         let n_partitions = input.output_partitioning().partition_count().max(1);
@@ -323,8 +352,30 @@ impl ExecutionPlan for BuildSideBloomEmitterExec {
         // partition owns the locals).
         let mapped = upstream.map(move |batch_res| match batch_res {
             Ok(batch) => {
-                let arr = batch.column(key_col_idx);
-                if let Some(i64s) = arr.as_any().downcast_ref::<Int64Array>() {
+                // KEYS.1: widen any i64-domain key (Int8/16/32, UInt8/16/32,
+                // Date32/64) to Int64 so the bloom/set/range logic below is
+                // unchanged. Lossless by the `widens_to_i64` construction gate.
+                // The forwarded `batch` is the ORIGINAL (unchanged) — only the
+                // bloom INSERTION sees the widened copy. Native Int64 keys skip
+                // the cast (clone is a cheap Arc bump).
+                let raw = batch.column(key_col_idx);
+                let key_arr: datafusion::arrow::array::ArrayRef =
+                    if raw.data_type() == &datafusion::arrow::datatypes::DataType::Int64 {
+                        raw.clone()
+                    } else {
+                        match datafusion::arrow::compute::cast(
+                            raw,
+                            &datafusion::arrow::datatypes::DataType::Int64,
+                        ) {
+                            Ok(a) => a,
+                            // Castability is guaranteed by widens_to_i64 at
+                            // construction; on the impossible failure, surface
+                            // it rather than silently building an incomplete
+                            // bloom (which would drop valid probe rows).
+                            Err(e) => return Err(DataFusionError::from(e)),
+                        }
+                    };
+                if let Some(i64s) = key_arr.as_any().downcast_ref::<Int64Array>() {
                     let mut bloom_guard = local_for_map.lock().unwrap();
                     let mut set_guard = local_set_for_map.lock().unwrap();
                     let mut range_guard = local_range_for_map.lock().unwrap();
@@ -675,6 +726,94 @@ mod tests {
                 assert!(!set.contains(0));
             }
             other => panic!("expected I64InSet, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn widens_to_i64_accepts_integer_and_date_family_only() {
+        use arrow_schema::DataType as Dt;
+        // i64-domain: ride the existing i64 bloom by lossless widening.
+        for dt in [
+            Dt::Int8,
+            Dt::Int16,
+            Dt::Int32,
+            Dt::Int64,
+            Dt::UInt8,
+            Dt::UInt16,
+            Dt::UInt32,
+            Dt::Date32,
+            Dt::Date64,
+        ] {
+            assert!(widens_to_i64(&dt), "{dt:?} should widen to i64");
+        }
+        // Need a DIFFERENT bloom (u64 / byte-hash) — must NOT be accepted by
+        // the i64 sideband: UInt64 can overflow i64; floats are an equi-join
+        // anti-pattern + bit-pattern hazard; strings need a byte/hash bloom.
+        for dt in [
+            Dt::UInt64,
+            Dt::Float32,
+            Dt::Float64,
+            Dt::Utf8,
+            Dt::Utf8View,
+            Dt::Boolean,
+        ] {
+            assert!(
+                !widens_to_i64(&dt),
+                "{dt:?} must NOT ride the i64 sideband (needs a different bloom)"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn widens_int32_build_key_into_i64_sideband() {
+        // KEYS.1: an Int32 build key (e.g. a downcast-narrowed `*key` column)
+        // must build the SAME i64-domain sideband as a native Int64 key —
+        // values widen losslessly. RED before the `widens_to_i64`
+        // generalization (the constructor errored "key column must be Int64",
+        // which is why narrowing silently dropped the L9 bloom and regressed
+        // Q21 +48%).
+        use arrow_array::Int32Array;
+        let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int32, false)]));
+        let make32 = |keys: Vec<i32>| {
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(keys))]).unwrap()
+        };
+        let ctx = SessionContext::new();
+        let mt = MemTable::try_new(
+            schema.clone(),
+            vec![vec![make32(vec![1, 2, 3])], vec![make32(vec![4, 5, 6, 7])]],
+        )
+        .unwrap();
+        ctx.register_table("t", Arc::new(mt)).unwrap();
+        let plan = ctx
+            .sql("SELECT k FROM t")
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+
+        let sideband = BridgeFilterSideband::new();
+        let wrapper =
+            BuildSideBloomEmitterExec::try_new(plan, 0, 42, sideband.clone(), 16).unwrap();
+        let n = wrapper.properties().output_partitioning().partition_count();
+        for p in 0..n {
+            let mut s = wrapper
+                .execute(p, Arc::new(TaskContext::default()))
+                .unwrap();
+            while let Some(_b) = s.try_next().await.unwrap() {}
+        }
+        let preds = sideband.peek().expect("sideband was not published to");
+        assert_eq!(preds.len(), 1, "expected one predicate, got {preds:?}");
+        match &preds[0] {
+            ColumnPredicate::I64InSet { col_idx, set } => {
+                assert_eq!(*col_idx, 42);
+                assert_eq!(set.len(), 7, "7 distinct widened keys");
+                for k in 1i64..=7 {
+                    assert!(set.contains(k), "missing widened key {k}");
+                }
+                assert!(!set.contains(999));
+            }
+            other => panic!("expected I64InSet from a widened Int32 build, got {other:?}"),
         }
     }
 

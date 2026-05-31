@@ -26,7 +26,6 @@
 
 use std::sync::Arc;
 
-use datafusion::arrow::datatypes::DataType;
 use datafusion::common::Result as DfResult;
 use datafusion::common::config::ConfigOptions;
 use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode};
@@ -38,7 +37,7 @@ use datafusion::physical_plan::ExecutionPlanProperties;
 use datafusion::physical_plan::joins::HashJoinExec;
 
 use crate::bridge_filter_sideband::BridgeFilterSideband;
-use crate::build_side_bloom_emitter_exec::BuildSideBloomEmitterExec;
+use crate::build_side_bloom_emitter_exec::{BuildSideBloomEmitterExec, widens_to_i64};
 use crate::ematix_fast_parquet::EmatixFastParquetExec;
 
 /// Install the L9 runtime-sideband rule.
@@ -261,21 +260,28 @@ impl PhysicalOptimizerRule for EnableRuntimeBloomSidebandRule {
                     }
                     continue;
                 };
+                // KEYS.1: accept any join key that losslessly widens to i64
+                // (Int8/16/32/64, UInt8/16/32, Date32/64), not just Int64.
+                // The bloom is an i64-domain structure; the build emitter
+                // widens on insert and the probe reads the native i64 parquet
+                // column, so an Int32 key (e.g. a downcast-narrowed `*key`)
+                // is byte-for-byte equivalent. Before this the rule silently
+                // skipped narrowed keys → lost the probe-side bloom (Q21 +48%).
                 let l_dt = build.schema().field(lcol.index()).data_type().clone();
                 let r_dt = probe.schema().field(rcol.index()).data_type().clone();
-                if l_dt != DataType::Int64 {
+                if !widens_to_i64(&l_dt) {
                     if trace {
                         eprintln!(
-                            "[L9.trace] skip — build key {} not Int64 (is {l_dt:?})",
+                            "[L9.trace] skip — build key {} doesn't widen to i64 (is {l_dt:?})",
                             lcol.name()
                         );
                     }
                     continue;
                 }
-                if r_dt != DataType::Int64 {
+                if !widens_to_i64(&r_dt) {
                     if trace {
                         eprintln!(
-                            "[L9.trace] skip — probe key {} not Int64 (is {r_dt:?})",
+                            "[L9.trace] skip — probe key {} doesn't widen to i64 (is {r_dt:?})",
                             rcol.name()
                         );
                     }
@@ -1150,7 +1156,7 @@ mod tests {
     #[test]
     fn helper_detects_right_semi_in_build_subtree() {
         use datafusion::arrow::array::{Int64Array, RecordBatch};
-        use datafusion::arrow::datatypes::{Field, Schema};
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
         use datafusion::common::{JoinType, NullEquality};
         use datafusion::datasource::memory::MemorySourceConfig;
         use datafusion::physical_expr::PhysicalExpr;
