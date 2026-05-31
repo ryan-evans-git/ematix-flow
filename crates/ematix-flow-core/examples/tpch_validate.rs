@@ -371,9 +371,14 @@ async fn run_ematix(
     }
     builder = builder.with_optimizer_rule(Arc::new(PushDownLeftSemiRule));
     builder = builder.with_physical_optimizer_rule(Arc::new(SwapSemiJoinBuildSideRule));
-    // REV.3 — force CollectLeft on Inner joins with semi-bounded builds.
-    // Opt-in via EMAT_FORCE_COLLECT_LEFT=1 to value-check correctness.
-    if std::env::var_os("EMAT_FORCE_COLLECT_LEFT").is_some() {
+    // REV.3/17.3 — force CollectLeft (semi-bounded) + relative broadcast,
+    // both via ::default(). DEFAULT-ON to value-validate the production
+    // preset config; opt-out via EMAT_FORCE_COLLECT_LEFT=0.
+    let force_cl = std::env::var("EMAT_FORCE_COLLECT_LEFT")
+        .ok()
+        .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
+        .unwrap_or(true);
+    if force_cl {
         builder = builder.with_physical_optimizer_rule(Arc::new(
             ematix_flow_core::force_collect_left_semi_build_rule::ForceCollectLeftForSemiBoundedBuildRule::default(),
         ));

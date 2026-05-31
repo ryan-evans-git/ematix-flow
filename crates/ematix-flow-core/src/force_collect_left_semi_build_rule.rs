@@ -91,8 +91,32 @@ pub struct ForceCollectLeftForSemiBoundedBuildRule {
     /// Default `0.0` = original REV.3 behavior (always fire on the
     /// structural semi signal), read from `EMAT_COLLECT_LEFT_MIN_RATIO`.
     /// `1.0` = "don't broadcast a build larger than its probe" (declines
-    /// Q17 join0 0.20× and Q16 join0 0.05×).
+    /// Q17 join0 0.20× and Q16 join0 0.05×). NOTE: REV.17.1 measured
+    /// `1.0` net-NEGATIVE (Q16 +252% — broadcasting a "big" build that
+    /// avoids a hash-shuffle can still win), so this stays `0.0` in
+    /// production; kept as opt-in infra.
     pub min_probe_build_ratio: f64,
+
+    /// REV.17.3 scale-relative broadcast gate. When `> 0.0`, an Inner
+    /// `Partitioned` `HashJoinExec` whose build subtree contains NO
+    /// semi/anti filter (a plain dimension⋈fact join) is forced to
+    /// `CollectLeft` (broadcasting the SMALL side) when the larger side's
+    /// estimated `num_rows` is at least `broadcast_ratio ×` the smaller
+    /// side's — i.e. the small side is broadcast and the large side
+    /// streams with NO hash exchange (DuckDB's default broadcast-small-
+    /// dimension behaviour). This auto-scales (it's a RATIO, not an
+    /// absolute row count), so it's near-inert at SF=1/10 and aggressive
+    /// at SF=100. Unlike [`Self::min_probe_build_ratio`] it requires BOTH
+    /// estimates to be known (no over-estimate safety here — we need a
+    /// real ratio) and inherently skips the Q16-j0 trap (build ≫ probe →
+    /// won't fire). REV.17.2 (SF=100, via the equivalent config-threshold)
+    /// measured 8 wins (Q03 −37%…Q08 −8%) / net −10.2%. REV.17.3 ships the
+    /// rule form, multi-scale gated DEFAULT-ON: SF=100 net −9.8% (9 wins),
+    /// SF=10 −7.2%, SF=1 −4.1%, zero real regressions, all 22 row counts
+    /// identical at every scale. Read from
+    /// `EMAT_COLLECT_LEFT_BROADCAST_RATIO`; default `16.0` = on, opt-out
+    /// with `=0`.
+    pub broadcast_ratio: f64,
 }
 
 impl Default for ForceCollectLeftForSemiBoundedBuildRule {
@@ -101,8 +125,17 @@ impl Default for ForceCollectLeftForSemiBoundedBuildRule {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(0.0);
+        // REV.17.3: DEFAULT-ON. Multi-scale gated (SF=100 −9.8%, SF=10
+        // −7.2%, SF=1 −4.1%, zero real regressions, all 22 row counts
+        // identical). K=16 is the broadcast break-even ratio. Opt-out via
+        // EMAT_COLLECT_LEFT_BROADCAST_RATIO=0.
+        let broadcast_ratio = std::env::var("EMAT_COLLECT_LEFT_BROADCAST_RATIO")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(16.0);
         Self {
             min_probe_build_ratio,
+            broadcast_ratio,
         }
     }
 }
@@ -224,8 +257,59 @@ impl PhysicalOptimizerRule for ForceCollectLeftForSemiBoundedBuildRule {
                     );
                 }
                 hj.swap_inputs(PartitionMode::CollectLeft)?
+            } else if !left_semi && !right_semi && self.broadcast_ratio > 0.0 {
+                // REV.17.3 scale-relative broadcast: a plain dimension⋈fact
+                // Inner join (no semi/anti in either subtree). Broadcast the
+                // SMALL side when the other is `broadcast_ratio ×` larger, so
+                // the large fact side streams with no hash exchange. Requires
+                // BOTH estimates known (a real ratio, no over-estimate
+                // safety). Inherently skips the Q16-j0 trap: when the build
+                // is larger than the probe, neither inequality holds.
+                let lrows = hj
+                    .left()
+                    .partition_statistics(None)
+                    .ok()
+                    .and_then(|s| s.num_rows.get_value().copied());
+                let rrows = hj
+                    .right()
+                    .partition_statistics(None)
+                    .ok()
+                    .and_then(|s| s.num_rows.get_value().copied());
+                let k = self.broadcast_ratio;
+                match (lrows, rrows) {
+                    (Some(l), Some(r)) if l > 0 && (r as f64) >= (l as f64) * k => {
+                        // Left is the small build, right the large probe →
+                        // broadcast left (no swap).
+                        if trace {
+                            eprintln!(
+                                "[collect_left] relative CollectLeft (left small build, r/l={:.0}); on={:?}",
+                                r as f64 / l as f64,
+                                hj.on()
+                            );
+                        }
+                        Arc::new(
+                            hj.builder()
+                                .with_partition_mode(PartitionMode::CollectLeft)
+                                .build()?,
+                        )
+                    }
+                    (Some(l), Some(r)) if r > 0 && (l as f64) >= (r as f64) * k => {
+                        // Right is the small build → swap it onto the build
+                        // side, then broadcast.
+                        if trace {
+                            eprintln!(
+                                "[collect_left] relative swap+CollectLeft (right small build, l/r={:.0}); on={:?}",
+                                l as f64 / r as f64,
+                                hj.on()
+                            );
+                        }
+                        hj.swap_inputs(PartitionMode::CollectLeft)?
+                    }
+                    _ => return Ok(Transformed::no(node)),
+                }
             } else {
-                // Neither side, or both sides, semi-bounded → leave alone.
+                // Neither side semi-bounded (and relative broadcast off), or
+                // both sides semi-bounded → leave alone.
                 return Ok(Transformed::no(node));
             };
             Ok(Transformed::yes(new_join))
@@ -393,6 +477,7 @@ mod tests {
         // ratio 0.0 (today): guard disabled → flips to CollectLeft.
         let permissive = ForceCollectLeftForSemiBoundedBuildRule {
             min_probe_build_ratio: 0.0,
+            broadcast_ratio: 0.0,
         };
         let out0 = permissive
             .optimize(top.clone(), &ConfigOptions::default())
@@ -406,6 +491,7 @@ mod tests {
         // ratio 1.0: build(~100) > probe(3) → must DECLINE.
         let guarded = ForceCollectLeftForSemiBoundedBuildRule {
             min_probe_build_ratio: 1.0,
+            broadcast_ratio: 0.0,
         };
         let out1 = guarded.optimize(top, &ConfigOptions::default()).unwrap();
         let after = format!("{out1:?}");
@@ -429,6 +515,7 @@ mod tests {
 
         let guarded = ForceCollectLeftForSemiBoundedBuildRule {
             min_probe_build_ratio: 1.0,
+            broadcast_ratio: 0.0,
         };
         let out = guarded.optimize(top, &ConfigOptions::default()).unwrap();
         let after = format!("{out:?}");
@@ -454,11 +541,90 @@ mod tests {
         let top = hashjoin(semi, mem_table_n(3), JoinType::Inner);
         let guarded = ForceCollectLeftForSemiBoundedBuildRule {
             min_probe_build_ratio: 1.0,
+            broadcast_ratio: 0.0,
         };
         let out = guarded.optimize(top, &ConfigOptions::default()).unwrap();
         assert!(
             format!("{out:?}").contains("CollectLeft"),
             "equal build/probe (ratio exactly 1.0) must fire"
+        );
+    }
+
+    /// REV.17.3 — a plain dimension⋈fact Inner join (NEITHER side
+    /// semi-bounded) must broadcast the SMALL side when the other is
+    /// `broadcast_ratio ×` larger (the missed Q17 j1/j2-style dim⋈fact
+    /// win). Here build(10) ≪ probe(1000), ratio 16 → flips to CollectLeft.
+    #[test]
+    fn relative_broadcast_fires_when_probe_much_larger() {
+        let top = hashjoin(mem_table_n(10), mem_table_n(1000), JoinType::Inner);
+        let rule = ForceCollectLeftForSemiBoundedBuildRule {
+            min_probe_build_ratio: 0.0,
+            broadcast_ratio: 16.0,
+        };
+        let out = rule.optimize(top, &ConfigOptions::default()).unwrap();
+        let after = format!("{out:?}");
+        assert!(
+            after.contains("CollectLeft"),
+            "relative broadcast must flip a small-build/large-probe Inner \
+             join to CollectLeft:\n{after}"
+        );
+    }
+
+    /// REV.17.3 — when the two sides are SIMILAR in size (ratio below
+    /// `broadcast_ratio`) the relative gate must NOT fire — broadcasting a
+    /// non-trivially-large build is the over-broadcast that regressed Q21
+    /// at the aggressive threshold.
+    #[test]
+    fn relative_broadcast_skips_similar_sizes() {
+        let top = hashjoin(mem_table_n(100), mem_table_n(200), JoinType::Inner);
+        let rule = ForceCollectLeftForSemiBoundedBuildRule {
+            min_probe_build_ratio: 0.0,
+            broadcast_ratio: 16.0,
+        };
+        let out = rule.optimize(top, &ConfigOptions::default()).unwrap();
+        let after = format!("{out:?}");
+        assert!(
+            !after.contains("CollectLeft"),
+            "relative broadcast must NOT fire when sides are similar in size \
+             (200 < 100×16):\n{after}"
+        );
+    }
+
+    /// REV.17.3 — default `broadcast_ratio = 0.0` disables the relative
+    /// branch entirely (zero production change until the multi-scale gate
+    /// passes): a small-build/large-probe Inner join stays Partitioned.
+    #[test]
+    fn relative_broadcast_off_at_zero() {
+        let top = hashjoin(mem_table_n(10), mem_table_n(1000), JoinType::Inner);
+        let rule = ForceCollectLeftForSemiBoundedBuildRule {
+            min_probe_build_ratio: 0.0,
+            broadcast_ratio: 0.0,
+        };
+        let out = rule.optimize(top, &ConfigOptions::default()).unwrap();
+        let after = format!("{out:?}");
+        assert!(
+            !after.contains("CollectLeft"),
+            "relative branch must be inert at broadcast_ratio 0.0:\n{after}"
+        );
+    }
+
+    /// REV.17.3 — the relative broadcast gate is DEFAULT-ON (multi-scale
+    /// gated). Production preset + the benches all construct the rule via
+    /// `::default()`, so a bare default must carry `broadcast_ratio = 16`
+    /// and broadcast a small-build/large-probe Inner join. (Assumes
+    /// `EMAT_COLLECT_LEFT_BROADCAST_RATIO` unset in the test env.)
+    #[test]
+    fn default_enables_relative_broadcast() {
+        let rule = ForceCollectLeftForSemiBoundedBuildRule::default();
+        assert_eq!(
+            rule.broadcast_ratio, 16.0,
+            "REV.17.3: relative broadcast must default ON (16.0)"
+        );
+        let top = hashjoin(mem_table_n(10), mem_table_n(1000), JoinType::Inner);
+        let out = rule.optimize(top, &ConfigOptions::default()).unwrap();
+        assert!(
+            format!("{out:?}").contains("CollectLeft"),
+            "default-on rule must broadcast a small-build/large-probe Inner join"
         );
     }
 }

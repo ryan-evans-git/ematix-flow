@@ -1454,11 +1454,14 @@ async fn build_ematix_ctx(
     // (Q18-class) so the 60M/600M-row probe streams with NO hash
     // exchange (re-run EnforceDistribution drops the probe repartition +
     // coalesces the tiny build). Runs after SwapSemi so it sees the
-    // RightSemi. Opt-in via EMAT_FORCE_COLLECT_LEFT=1 for A/B.
+    // RightSemi. DEFAULT-ON to match the production preset (REV.15 force
+    // CollectLeft + REV.17.3 relative broadcast, both via ::default()) so a
+    // bare bench run mirrors production and future regressions surface.
+    // Opt-out via EMAT_FORCE_COLLECT_LEFT=0 (for A/B isolation).
     let force_collect_left_enabled = std::env::var("EMAT_FORCE_COLLECT_LEFT")
         .ok()
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
+        .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
+        .unwrap_or(true);
     if force_collect_left_enabled {
         builder = builder
             .with_physical_optimizer_rule(Arc::new(ForceCollectLeftForSemiBoundedBuildRule::default()));
