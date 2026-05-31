@@ -31,13 +31,13 @@ use std::sync::Arc;
 
 use datafusion::arrow::array::{Float64Array, Int64Array, RecordBatch};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
-use datafusion::common::DataFusionError;
-use datafusion::common::Result as DfResult;
 use datafusion::common::config::ConfigOptions;
 use datafusion::common::stats::Precision;
 use datafusion::common::tree_node::{Transformed, TreeNode};
-use datafusion::execution::TaskContext;
+use datafusion::common::DataFusionError;
+use datafusion::common::Result as DfResult;
 use datafusion::execution::session_state::SessionStateBuilder;
+use datafusion::execution::TaskContext;
 use datafusion::physical_expr::expressions::Column;
 use datafusion::physical_expr::{EquivalenceProperties, Partitioning};
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
@@ -340,6 +340,10 @@ pub fn install_robin_hood_sum_f64_rule(builder: SessionStateBuilder) -> SessionS
 #[derive(Debug)]
 pub struct EnableRobinHoodSumF64Rule {
     pub max_groups: usize,
+    /// REV.18d lower bound: below this est_groups the row-at-a-time kernel
+    /// loses to stock (gate-calibration sweep), so the rule no-ops and leaves
+    /// the agg to DataFusion. See [`DEFAULT_RH_SUM_F64_MIN_GROUPS`].
+    pub min_groups: usize,
 }
 
 /// REV.18 (2026-05-31): tightened from 32M → 256K. The 32M default only
@@ -358,13 +362,30 @@ pub struct EnableRobinHoodSumF64Rule {
 /// 256K is the conservative tightening. Env `EMAT_RH_SUM_F64_MAX_GROUPS`.
 pub const DEFAULT_RH_SUM_F64_MAX_GROUPS: usize = 256 * 1024;
 
+/// REV.18d (2026-05-31) lower bound, gate-calibration measured. At ~4
+/// rows/group (so est_groups ≈ actual groups, which is what the `rows/4` gate
+/// assumes), the RobinHoodSumF64 operator has NO win band in the firing
+/// regime — it loses 1.0–2.0× below ~128K est_groups and only reaches ~tie
+/// above. Its earlier "win" needed ~30 rows/group / millions of rows, which
+/// the `est = rows/4` gate can't reach (it only fires at ≤~1.05M rows). So the
+/// lower bound is harm-reduction: refuse the rewrite on small SUM aggs where
+/// the kernel loses. Env `EMAT_RH_SUM_F64_MIN_GROUPS`.
+pub const DEFAULT_RH_SUM_F64_MIN_GROUPS: usize = 128 * 1024;
+
 impl Default for EnableRobinHoodSumF64Rule {
     fn default() -> Self {
         let max_groups = std::env::var("EMAT_RH_SUM_F64_MAX_GROUPS")
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(DEFAULT_RH_SUM_F64_MAX_GROUPS);
-        Self { max_groups }
+        let min_groups = std::env::var("EMAT_RH_SUM_F64_MIN_GROUPS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(DEFAULT_RH_SUM_F64_MIN_GROUPS);
+        Self {
+            max_groups,
+            min_groups,
+        }
     }
 }
 
@@ -375,6 +396,7 @@ impl PhysicalOptimizerRule for EnableRobinHoodSumF64Rule {
         _config: &ConfigOptions,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
         let max_groups = self.max_groups;
+        let min_groups = self.min_groups;
         let result = plan.transform_up(|node| {
             if let Some(agg) = node.as_any().downcast_ref::<AggregateExec>() {
                 if matches!(agg.mode(), AggregateMode::Partial) {
@@ -397,7 +419,7 @@ impl PhysicalOptimizerRule for EnableRobinHoodSumF64Rule {
                                 },
                                 Err(_) => 0,
                             };
-                            if est_groups <= max_groups {
+                            if est_groups >= min_groups && est_groups <= max_groups {
                                 let new = RobinHoodSumF64Exec::try_new(
                                     input,
                                     m.group_col_idx,
@@ -545,12 +567,17 @@ mod tests {
 
     fn make_ctx_with_rule() -> SessionContext {
         let cfg = SessionConfig::new().with_target_partitions(4);
-        let state = install_robin_hood_sum_f64_rule(
-            SessionStateBuilder::new()
-                .with_default_features()
-                .with_config(cfg),
-        )
-        .build();
+        // min_groups: 0 so the REV.18d lower bound doesn't suppress firing on
+        // the tiny test tables — these tests exercise the kernel mechanics +
+        // correctness; the lower bound itself is covered by a dedicated test.
+        let state = SessionStateBuilder::new()
+            .with_default_features()
+            .with_config(cfg)
+            .with_physical_optimizer_rule(Arc::new(EnableRobinHoodSumF64Rule {
+                min_groups: 0,
+                max_groups: usize::MAX,
+            }))
+            .build();
         SessionContext::new_with_state(state)
     }
 
@@ -681,7 +708,10 @@ mod tests {
         let state = SessionStateBuilder::new()
             .with_default_features()
             .with_config(cfg)
-            .with_physical_optimizer_rule(Arc::new(EnableRobinHoodSumF64Rule { max_groups: 0 }))
+            .with_physical_optimizer_rule(Arc::new(EnableRobinHoodSumF64Rule {
+                min_groups: 0,
+                max_groups: 0,
+            }))
             .build();
         let ctx = SessionContext::new_with_state(state);
         register_q18_shape_table(&ctx, "t");
@@ -702,6 +732,7 @@ mod tests {
             .with_default_features()
             .with_config(cfg)
             .with_physical_optimizer_rule(Arc::new(EnableRobinHoodSumF64Rule {
+                min_groups: 0,
                 max_groups: 1_000_000,
             }))
             .build();
@@ -714,6 +745,40 @@ mod tests {
             s.contains("RobinHoodSumF64Exec"),
             "rule didn't fire under a generous gate — Got:\n{s}"
         );
+    }
+
+    #[tokio::test]
+    async fn rule_gated_off_below_min_groups() {
+        // REV.18d lower bound: below min_groups est_groups the kernel loses to
+        // stock, so the rule must REFUSE the rewrite. The 16-row Q18-shape
+        // table has est_groups = 4 ≪ 1000, so with min_groups=1000 the plan
+        // must keep DataFusion's stock AggregateExec.
+        let cfg = SessionConfig::new().with_target_partitions(4);
+        let state = SessionStateBuilder::new()
+            .with_default_features()
+            .with_config(cfg)
+            .with_physical_optimizer_rule(Arc::new(EnableRobinHoodSumF64Rule {
+                min_groups: 1_000,
+                max_groups: usize::MAX,
+            }))
+            .build();
+        let ctx = SessionContext::new_with_state(state);
+        register_q18_shape_table(&ctx, "t");
+        let df = ctx.sql("SELECT k, SUM(v) FROM t GROUP BY k").await.unwrap();
+        let plan = df.create_physical_plan().await.unwrap();
+        let s = format!("{plan:?}");
+        assert!(
+            !s.contains("RobinHoodSumF64Exec"),
+            "rule fired below the min_groups lower bound — Got:\n{s}"
+        );
+    }
+
+    #[test]
+    fn rev18d_default_min_gate_is_set() {
+        // REV.18d: production must get a non-zero lower bound (harm-reduction),
+        // and it must sit below the upper bound so a fire band exists.
+        assert!(DEFAULT_RH_SUM_F64_MIN_GROUPS > 0);
+        assert!(DEFAULT_RH_SUM_F64_MIN_GROUPS < DEFAULT_RH_SUM_F64_MAX_GROUPS);
     }
 
     #[test]

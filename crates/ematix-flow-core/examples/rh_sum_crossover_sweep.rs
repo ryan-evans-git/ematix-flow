@@ -83,6 +83,7 @@ fn build_ctx(batches: &[RecordBatch], rh_on: bool) -> SessionContext {
         // max_groups = MAX so the rule always fires — we measure the OPERATOR,
         // not the gate.
         builder = builder.with_physical_optimizer_rule(Arc::new(EnableRobinHoodSumF64Rule {
+            min_groups: 0,
             max_groups: usize::MAX,
         }));
     }

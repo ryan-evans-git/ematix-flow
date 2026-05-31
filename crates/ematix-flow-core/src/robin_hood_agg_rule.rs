@@ -40,15 +40,15 @@
 use std::sync::Arc;
 
 use datafusion::arrow::datatypes::DataType;
-use datafusion::common::Result as DfResult;
 use datafusion::common::config::ConfigOptions;
 use datafusion::common::stats::Precision;
 use datafusion::common::tree_node::{Transformed, TreeNode};
+use datafusion::common::Result as DfResult;
 use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::physical_expr::expressions::Column;
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
-use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode};
+use datafusion::physical_plan::ExecutionPlan;
 
 use crate::robin_hood_agg::{RobinHoodAggregateExec, RobinHoodMode};
 
@@ -82,6 +82,9 @@ pub fn install_robin_hood_rule(builder: SessionStateBuilder) -> SessionStateBuil
 #[derive(Debug)]
 pub struct EnableRobinHoodAggregateRule {
     pub max_groups: usize,
+    /// REV.18d lower bound: below this est_groups the row-at-a-time kernel
+    /// loses to stock, so the rule no-ops. See [`DEFAULT_RH_COUNT_MIN_GROUPS`].
+    pub min_groups: usize,
 }
 
 /// REV.18 (2026-05-31): tightened 32M → 256K, matching the RobinHoodSumF64
@@ -92,13 +95,27 @@ pub struct EnableRobinHoodAggregateRule {
 /// defensively so enabling the rule can't reintroduce the REV.18 footgun.
 pub const DEFAULT_RH_COUNT_MAX_GROUPS: usize = 256 * 1024;
 
+/// REV.18d (2026-05-31) lower bound, gate-calibration measured. At ~4
+/// rows/group (so est_groups ≈ actual groups), `COUNT(*) GROUP BY i64` through
+/// RobinHood has a real win band of **[64K, 256K]** est_groups (0.79–0.89× of
+/// stock); below ~64K it loses (1.1–1.8×). The lower bound confines firing to
+/// the win band so the rule is safe to enable. Env `EMAT_RH_COUNT_MIN_GROUPS`.
+pub const DEFAULT_RH_COUNT_MIN_GROUPS: usize = 64 * 1024;
+
 impl Default for EnableRobinHoodAggregateRule {
     fn default() -> Self {
         let max_groups = std::env::var("EMAT_RH_COUNT_MAX_GROUPS")
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(DEFAULT_RH_COUNT_MAX_GROUPS);
-        Self { max_groups }
+        let min_groups = std::env::var("EMAT_RH_COUNT_MIN_GROUPS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(DEFAULT_RH_COUNT_MIN_GROUPS);
+        Self {
+            max_groups,
+            min_groups,
+        }
     }
 }
 
@@ -109,6 +126,7 @@ impl PhysicalOptimizerRule for EnableRobinHoodAggregateRule {
         _config: &ConfigOptions,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
         let max_groups = self.max_groups;
+        let min_groups = self.min_groups;
         // Σ.N.e — per-node rewrite. Walks bottom-up, so Partial
         // matches FIRST and is replaced before Final sees its input.
         // Final's matcher then verifies the input chain leads to a
@@ -136,7 +154,7 @@ impl PhysicalOptimizerRule for EnableRobinHoodAggregateRule {
                                 },
                                 Err(_) => 0,
                             };
-                            if est_groups <= max_groups {
+                            if est_groups >= min_groups && est_groups <= max_groups {
                                 let new = RobinHoodAggregateExec::try_new_full(
                                     real,
                                     col_idx,
@@ -279,12 +297,17 @@ mod tests {
     /// FinalPartitioned→Partial shape).
     fn make_ctx_with_rule() -> SessionContext {
         let cfg = datafusion::prelude::SessionConfig::new().with_target_partitions(4);
-        let state = install_robin_hood_rule(
-            SessionStateBuilder::new()
-                .with_default_features()
-                .with_config(cfg),
-        )
-        .build();
+        // min_groups: 0 so the REV.18d lower bound doesn't suppress firing on
+        // the tiny test tables — these tests exercise kernel mechanics +
+        // correctness; the lower bound itself has a dedicated test.
+        let state = SessionStateBuilder::new()
+            .with_default_features()
+            .with_config(cfg)
+            .with_physical_optimizer_rule(Arc::new(EnableRobinHoodAggregateRule {
+                min_groups: 0,
+                max_groups: usize::MAX,
+            }))
+            .build();
         SessionContext::new_with_state(state)
     }
 
@@ -474,7 +497,10 @@ mod tests {
         let state = SessionStateBuilder::new()
             .with_default_features()
             .with_config(cfg)
-            .with_physical_optimizer_rule(Arc::new(EnableRobinHoodAggregateRule { max_groups: 0 }))
+            .with_physical_optimizer_rule(Arc::new(EnableRobinHoodAggregateRule {
+                min_groups: 0,
+                max_groups: 0,
+            }))
             .build();
         let ctx = SessionContext::new_with_state(state);
         register_int64_t(&ctx);
@@ -498,6 +524,7 @@ mod tests {
             .with_default_features()
             .with_config(cfg)
             .with_physical_optimizer_rule(Arc::new(EnableRobinHoodAggregateRule {
+                min_groups: 0,
                 max_groups: 1_000_000,
             }))
             .build();
@@ -513,5 +540,42 @@ mod tests {
             s.contains("RobinHoodAggregateExec"),
             "rule didn't fire under a generous gate — Got:\n{s}"
         );
+    }
+
+    #[tokio::test]
+    async fn rule_gated_off_below_min_groups() {
+        // REV.18d lower bound: below min_groups est_groups the kernel loses to
+        // stock, so the rule must REFUSE the rewrite. The 12-row table has
+        // est_groups = 3 ≪ 1000, so with min_groups=1000 the plan must keep
+        // DataFusion's stock AggregateExec.
+        let cfg = datafusion::prelude::SessionConfig::new().with_target_partitions(4);
+        let state = SessionStateBuilder::new()
+            .with_default_features()
+            .with_config(cfg)
+            .with_physical_optimizer_rule(Arc::new(EnableRobinHoodAggregateRule {
+                min_groups: 1_000,
+                max_groups: usize::MAX,
+            }))
+            .build();
+        let ctx = SessionContext::new_with_state(state);
+        register_int64_t(&ctx);
+        let df = ctx
+            .sql("SELECT k, COUNT(*) FROM t GROUP BY k")
+            .await
+            .unwrap();
+        let plan = df.create_physical_plan().await.unwrap();
+        let s = format!("{plan:?}");
+        assert!(
+            !s.contains("RobinHoodAggregateExec"),
+            "rule fired below the min_groups lower bound — Got:\n{s}"
+        );
+    }
+
+    #[test]
+    fn rev18d_default_min_gate_is_set() {
+        // REV.18d: the win band is [64K, 256K]; the lower bound must be > 0
+        // and below the upper bound so a non-empty fire band exists.
+        assert!(DEFAULT_RH_COUNT_MIN_GROUPS > 0);
+        assert!(DEFAULT_RH_COUNT_MIN_GROUPS < DEFAULT_RH_COUNT_MAX_GROUPS);
     }
 }

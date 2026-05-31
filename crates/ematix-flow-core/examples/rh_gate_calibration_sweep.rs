@@ -1,24 +1,22 @@
-//! REV.18b — operator-level crossover sweep for ALL THREE RobinHood agg
-//! kernels vs stock DataFusion `AggregateExec`, across the distinct-group
-//! count. Re-measures whether — now that each kernel is gated at 256K groups
-//! (`DEFAULT_RH_*_MAX_GROUPS`) — any kernel actually WINS inside its gated
-//! window and therefore deserves to be flipped default-ON.
+//! REV.18d — gate-calibration sweep for the RobinHood agg kernels.
 //!
-//!   SUM  : `SELECT k, SUM(v)   FROM t GROUP BY k`  (currently default-ON)
-//!   COUNT: `SELECT k, COUNT(*) FROM t GROUP BY k`  (currently opt-in)
-//!   AVG  : `SELECT k, AVG(v)   FROM t GROUP BY k`  (currently opt-in)
+//! The three rules gate on `est_groups = input_rows / 4` (a row-count proxy
+//! assuming ~4 rows/group, the Q18 design shape), firing when
+//! `est_groups <= max_groups` (256K). So the gate ONLY fires when the
+//! aggregate input has <= ~1.05M rows. The earlier operator sweep
+//! (`rh_crossover_sweep_all.rs`) ran at a fixed 6M rows → est_groups = 1.5M
+//! at every point → the production gate would never have fired on any of it.
 //!
-//! Each kernel's rule is installed with `max_groups = usize::MAX` so the rule
-//! always fires — we measure the OPERATOR, not the gate. The decision-relevant
-//! window is groups <= 256K (left of the `|GATE|` marker); a kernel that loses
-//! even there should be demoted to opt-in, one that wins there justifies
-//! default-ON (modulo the 22q codegen-tax A/B, which is a separate step).
-//!
-//! Fixed 6M rows so total work is constant; only the distinct group count
-//! varies (6000 rows/group at 1K groups -> 1 row/group at 6M).
+//! This sweep measures the kernels in the regime where the gate ACTUALLY
+//! fires. It generates data at ~4 rows/group so that `est_groups` (= rows/4,
+//! the gate variable) equals the actual distinct-group count. We sweep
+//! `est_groups` across the 256K boundary and report RH/stock per kernel, so
+//! we can set a lower bound that confines firing to the win band — or learn
+//! that no win band exists in the firing regime (in which case the kernels
+//! cannot be made default-on-worthy and should stay opt-in).
 //!
 //! Run:
-//!   cargo run --release -p ematix-flow-core --example rh_crossover_sweep_all
+//!   cargo run --release -p ematix-flow-core --example rh_gate_calibration_sweep
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -30,18 +28,24 @@ use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::ExecutionPlanProperties;
 use datafusion::prelude::{SessionConfig, SessionContext};
-use ematix_flow_core::robin_hood_agg_rule::EnableRobinHoodAggregateRule;
-use ematix_flow_core::robin_hood_avg_f64_exec::EnableRobinHoodAvgF64Rule;
-use ematix_flow_core::robin_hood_sum_f64_exec::EnableRobinHoodSumF64Rule;
+use ematix_flow_core::robin_hood_agg_rule::{
+    EnableRobinHoodAggregateRule, DEFAULT_RH_COUNT_MAX_GROUPS, DEFAULT_RH_COUNT_MIN_GROUPS,
+};
+use ematix_flow_core::robin_hood_avg_f64_exec::{
+    EnableRobinHoodAvgF64Rule, DEFAULT_RH_AVG_F64_MAX_GROUPS, DEFAULT_RH_AVG_F64_MIN_GROUPS,
+};
+use ematix_flow_core::robin_hood_sum_f64_exec::{
+    EnableRobinHoodSumF64Rule, DEFAULT_RH_SUM_F64_MAX_GROUPS, DEFAULT_RH_SUM_F64_MIN_GROUPS,
+};
 use futures_util::TryStreamExt;
 
-const N_ROWS: usize = 6_000_000;
-const CARDS: &[usize] = &[
-    1_000, 10_000, 50_000, 100_000, 200_000, 256_000, 500_000, 1_000_000, 2_000_000, 6_000_000,
+/// est_groups values to probe (= the gate variable = input_rows / 4). Each
+/// row count is 4× this so rows/group ≈ 4 and est_groups ≈ actual groups.
+const EST_GROUPS: &[usize] = &[
+    8_192, 16_384, 32_768, 65_536, 131_072, 196_608, 262_144, 393_216, 524_288,
 ];
-const GATE: usize = 256 * 1024;
-const TRIALS: usize = 7;
-const WARMUPS: usize = 2;
+const TRIALS: usize = 11;
+const WARMUPS: usize = 3;
 const BATCH: usize = 8192;
 
 fn target_partitions() -> usize {
@@ -50,7 +54,7 @@ fn target_partitions() -> usize {
         .unwrap_or(8)
 }
 
-fn gen_batches(card: usize) -> Vec<RecordBatch> {
+fn gen_batches(card: usize, n_rows: usize) -> Vec<RecordBatch> {
     let schema = Arc::new(Schema::new(vec![
         Field::new("k", DataType::Int64, false),
         Field::new("v", DataType::Float64, false),
@@ -58,8 +62,8 @@ fn gen_batches(card: usize) -> Vec<RecordBatch> {
     let mut batches = Vec::new();
     let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
     let mut produced = 0usize;
-    while produced < N_ROWS {
-        let take = BATCH.min(N_ROWS - produced);
+    while produced < n_rows {
+        let take = BATCH.min(n_rows - produced);
         let mut ks = Vec::with_capacity(take);
         let mut vs = Vec::with_capacity(take);
         for i in 0..take {
@@ -123,6 +127,11 @@ async fn median(ctx: &SessionContext, sql: &str) -> f64 {
     xs[xs.len() / 2]
 }
 
+// max_groups = MAX so we measure the OPERATOR across the whole range, then
+// overlay the proposed [CAND_LOWER, UPPER_GATE] band as a fire-marker.
+// min_groups: 0, max_groups: MAX → gate always passes, so we measure the
+// OPERATOR across the whole est_groups range; the production fire band is
+// overlaid separately via `band_for`.
 fn rule_for(kernel: &str) -> Arc<dyn PhysicalOptimizerRule + Send + Sync> {
     match kernel {
         "SUM" => Arc::new(EnableRobinHoodSumF64Rule {
@@ -141,6 +150,19 @@ fn rule_for(kernel: &str) -> Arc<dyn PhysicalOptimizerRule + Send + Sync> {
     }
 }
 
+/// Production fire band per kernel = [DEFAULT_*_MIN, DEFAULT_*_MAX], now locked
+/// into the rule gates. `|FIRE|` marks rows where the gated rule would run;
+/// confirm every |FIRE| row is a win (SUM has no win band — harm-reduction
+/// only, so its band rows should be ~tie, not losses).
+fn band_for(kernel: &str) -> (usize, usize) {
+    match kernel {
+        "SUM" => (DEFAULT_RH_SUM_F64_MIN_GROUPS, DEFAULT_RH_SUM_F64_MAX_GROUPS),
+        "COUNT" => (DEFAULT_RH_COUNT_MIN_GROUPS, DEFAULT_RH_COUNT_MAX_GROUPS),
+        "AVG" => (DEFAULT_RH_AVG_F64_MIN_GROUPS, DEFAULT_RH_AVG_F64_MAX_GROUPS),
+        _ => unreachable!(),
+    }
+}
+
 fn sql_for(kernel: &str) -> &'static str {
     match kernel {
         "SUM" => "SELECT k, SUM(v) FROM t GROUP BY k",
@@ -152,24 +174,28 @@ fn sql_for(kernel: &str) -> &'static str {
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
-    println!("REV.18b operator crossover — RobinHood{{Sum,Count,Avg}} vs stock AggregateExec");
+    println!("REV.18d gate-calibration — RobinHood{{Sum,Count,Avg}} in the GATE-FIRING regime");
     println!(
-        "{N_ROWS} rows fixed, GROUP BY i64-k, {TRIALS} trials +{WARMUPS} warmup, {} partitions",
+        "~4 rows/group so est_groups (= rows/4, the gate variable) ≈ actual groups; \
+         {TRIALS} trials +{WARMUPS} warmup, {} partitions",
         target_partitions()
     );
     println!(
-        "gate = {GATE} groups (DEFAULT_RH_*_MAX_GROUPS); win left of |GATE| justifies default-ON\n"
+        "fire band = the locked [DEFAULT_*_MIN, DEFAULT_*_MAX] gate per kernel; \
+         |FIRE| marks where the gated rule would actually run\n"
     );
 
     for kernel in ["SUM", "COUNT", "AVG"] {
-        println!("=== {kernel}(… ) GROUP BY k ===");
+        let (lo, hi) = band_for(kernel);
+        println!("=== {kernel}  (fire band [{lo}, {hi}] est_groups) ===");
         println!(
-            "{:>11} {:>10} {:>12} {:>12} {:>10}  {}",
-            "groups", "rows/grp", "RH_on ms", "stock ms", "RH/stock", "verdict"
+            "{:>11} {:>10} {:>11} {:>11} {:>9}  {:<10} {}",
+            "est_groups", "rows", "RH_on ms", "stock ms", "RH/stock", "verdict", "gate"
         );
         let sql = sql_for(kernel);
-        for &card in CARDS {
-            let batches = gen_batches(card);
+        for &g in EST_GROUPS {
+            let n_rows = g * 4;
+            let batches = gen_batches(g, n_rows);
             let ctx_on = build_ctx(&batches, Some(rule_for(kernel)));
             let ctx_off = build_ctx(&batches, None);
             let on = median(&ctx_on, sql).await;
@@ -182,10 +208,9 @@ async fn main() {
             } else {
                 "~tie"
             };
-            let gate_mark = if card <= GATE { " " } else { "|GATE crossed|" };
+            let gate = if g >= lo && g <= hi { "|FIRE|" } else { " " };
             println!(
-                "{card:>11} {:>10} {on:>12.3} {off:>12.3} {ratio:>8.2}x  {verdict}{gate_mark}",
-                N_ROWS / card
+                "{g:>11} {n_rows:>10} {on:>11.3} {off:>11.3} {ratio:>8.2}x  {verdict:<10} {gate}"
             );
         }
         println!();
