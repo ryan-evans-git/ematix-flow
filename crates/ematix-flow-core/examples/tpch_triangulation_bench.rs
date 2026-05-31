@@ -977,6 +977,27 @@ fn dump_plan_metrics(plan: &dyn datafusion::physical_plan::ExecutionPlan, depth:
     }
 }
 
+/// KEYS.3 dig-in — dump the executed physical plan once per process when
+/// `EMAT_DUMP_PLAN` is set, labelled with the downcast arm so off-vs-on dumps
+/// are self-identifying. Once-guarded so it fires on the first trial only.
+fn maybe_dump_plan(plan: &Arc<dyn datafusion::physical_plan::ExecutionPlan>) {
+    use std::sync::Once;
+    static DUMPED: Once = Once::new();
+    if std::env::var_os("EMAT_DUMP_PLAN").is_some() {
+        DUMPED.call_once(|| {
+            let arm = if std::env::var_os("EMAT_DOWNCAST_KEYS").is_some() {
+                "downcast=ON"
+            } else {
+                "downcast=OFF"
+            };
+            eprintln!(
+                "=== EMAT PHYSICAL PLAN ({arm}) ===\n{}=== END PLAN ===",
+                datafusion::physical_plan::displayable(plan.as_ref()).indent(true)
+            );
+        });
+    }
+}
+
 async fn run_ematix_flow(data_dir: &Path, sql: &str) -> Trial {
     // Σ.AΩ Phase 1.6 (2026-05-28): default ON. The race-aware
     // recommender (`recommend_target_partitions_via_race`) consults
@@ -1142,6 +1163,7 @@ async fn run_ematix_flow(data_dir: &Path, sql: &str) -> Trial {
             } else {
                 plan
             };
+        maybe_dump_plan(&plan);
         let mut s = match plan.execute(0, ctx.task_ctx()) {
             Ok(s) => s,
             Err(e) => return Trial::Fail(format!("execute: {}", short(&e.to_string()))),
@@ -1324,6 +1346,7 @@ async fn run_ematix_flow(data_dir: &Path, sql: &str) -> Trial {
         } else {
             plan
         };
+    maybe_dump_plan(&plan);
     let stream = match plan.execute(0, ctx.task_ctx()) {
         Ok(s) => s,
         Err(e) => return Trial::Fail(format!("execute: {}", short(&e.to_string()))),

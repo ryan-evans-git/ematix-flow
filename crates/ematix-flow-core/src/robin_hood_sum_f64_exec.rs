@@ -342,13 +342,28 @@ pub struct EnableRobinHoodSumF64Rule {
     pub max_groups: usize,
 }
 
+/// REV.18 (2026-05-31): tightened from 32M → 256K. The 32M default only
+/// lowered the gate enough to fix Q18 SF=100 (150M groups); it still let the
+/// kernel fire on Q18 SF=1/10 (est 1.5M/15M groups), where it is ~12× SLOWER
+/// than DataFusion's stock vectorised `AggregateExec` (SF=1: 27 vs 2.2 ms;
+/// SF=10: 207 vs 17 ms — measured). Root cause is NOT a bug: the kernel is a
+/// correct Robin Hood table (splitmix64 hash, 70%-load, auto-sized) but a
+/// ROW-AT-A-TIME open-addressing agg structurally can't match a vectorised
+/// columnar group-by at scale (the Σ.N.f lesson — microbench wins are vs
+/// hashbrown, not vs DataFusion's operator). The operator crossover sweep put
+/// any win regime at best in a narrow ~100–250K band; above that it always
+/// loses. 256K leaves the only TPC-H trigger (Q18, ≥1.5M groups) to stock,
+/// recovering −91% on Q18 SF=10 with no other query affected (Q18 is the sole
+/// `SUM(f64) GROUP BY i64` shape). Candidate for full opt-in demotion later;
+/// 256K is the conservative tightening. Env `EMAT_RH_SUM_F64_MAX_GROUPS`.
+pub const DEFAULT_RH_SUM_F64_MAX_GROUPS: usize = 256 * 1024;
+
 impl Default for EnableRobinHoodSumF64Rule {
     fn default() -> Self {
-        // Default = MAX_INIT_CAP (32M); env-overridable for A/B + tuning.
         let max_groups = std::env::var("EMAT_RH_SUM_F64_MAX_GROUPS")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(32 * 1024 * 1024);
+            .unwrap_or(DEFAULT_RH_SUM_F64_MAX_GROUPS);
         Self { max_groups }
     }
 }
@@ -660,8 +675,8 @@ mod tests {
         // REV.10: with max_groups=0, any non-empty input is "high card",
         // so the rule must REFUSE the rewrite (stock vectorised agg handles
         // very high cardinality far better — Q18 SF=100's 150M-group
-        // subquery was 12× slower under RobinHood). Mirrors the default
-        // 32M gate that leaves Q18's 150M-group agg to stock.
+        // subquery was 12× slower under RobinHood). Mirrors the REV.18
+        // default 256K gate that leaves Q18's 1.5M+-group agg to stock.
         let cfg = SessionConfig::new().with_target_partitions(4);
         let state = SessionStateBuilder::new()
             .with_default_features()
@@ -698,6 +713,20 @@ mod tests {
         assert!(
             s.contains("RobinHoodSumF64Exec"),
             "rule didn't fire under a generous gate — Got:\n{s}"
+        );
+    }
+
+    #[test]
+    fn rev18_default_gate_excludes_q18_scale() {
+        // REV.18: the default gate must leave Q18-scale aggs (est ≥ ~1.5M
+        // groups already at SF=1) to stock — the row-at-a-time kernel is ~12×
+        // slower than DataFusion's vectorised AggregateExec at that
+        // cardinality (measured: Q18 SF=1 27 vs 2.2 ms, SF=10 207 vs 17 ms).
+        // Guards against a silent revert to the old 32M default.
+        assert!(
+            DEFAULT_RH_SUM_F64_MAX_GROUPS < 1_500_000,
+            "default RH-sum gate {DEFAULT_RH_SUM_F64_MAX_GROUPS} must exclude \
+             Q18's ~1.5M-group SF=1 agg"
         );
     }
 }
