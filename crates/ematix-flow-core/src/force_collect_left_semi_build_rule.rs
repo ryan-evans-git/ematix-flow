@@ -57,15 +57,15 @@
 
 use std::sync::Arc;
 
-use datafusion::common::JoinType;
 use datafusion::common::config::ConfigOptions;
 use datafusion::common::tree_node::{Transformed, TreeNode};
+use datafusion::common::JoinType;
 use datafusion::error::Result;
 use datafusion::execution::session_state::SessionStateBuilder;
-use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_optimizer::enforce_distribution::EnforceDistribution;
-use datafusion::physical_plan::ExecutionPlan;
+use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode};
+use datafusion::physical_plan::ExecutionPlan;
 
 use crate::runtime_bloom_sideband_rule::build_subtree_has_semi_filter;
 
@@ -196,10 +196,27 @@ impl PhysicalOptimizerRule for ForceCollectLeftForSemiBoundedBuildRule {
             let Some(hj) = node.as_any().downcast_ref::<HashJoinExec>() else {
                 return Ok(Transformed::no(node));
             };
-            // Only Inner joins in Partitioned mode are candidates. (Semi/
-            // anti joins are handled by SwapSemiJoinBuildSideRule; other
-            // modes are already CollectLeft or Auto.)
-            if !matches!(hj.join_type(), JoinType::Inner) {
+            // REV.17.4b: Inner OR semi/anti joins in Partitioned mode are
+            // candidates. The semi-bounded arms + the relative-broadcast SWAP
+            // arm stay Inner-only — swapping a semi/anti join flips
+            // LeftSemi↔RightSemi (asymmetric output side), too risky. A
+            // semi/anti join reaches ONLY the no-swap left-small relative arm,
+            // where forcing CollectLeft is a physical PartitionMode change
+            // (valid + semantics-preserving for every join type).
+            // REV.17.4b opt-out (default ON): `EMAT_COLLECT_LEFT_SEMI_BROADCAST=0`
+            // reverts to the REV.17.3 Inner-only relative broadcast.
+            let semi_broadcast =
+                !matches!(std::env::var("EMAT_COLLECT_LEFT_SEMI_BROADCAST").as_deref(), Ok("0"));
+            let is_inner = matches!(hj.join_type(), JoinType::Inner);
+            let is_semi_anti = semi_broadcast
+                && matches!(
+                    hj.join_type(),
+                    JoinType::LeftSemi
+                        | JoinType::RightSemi
+                        | JoinType::LeftAnti
+                        | JoinType::RightAnti
+                );
+            if !is_inner && !is_semi_anti {
                 return Ok(Transformed::no(node));
             }
             if !matches!(hj.partition_mode(), PartitionMode::Partitioned) {
@@ -211,8 +228,11 @@ impl PhysicalOptimizerRule for ForceCollectLeftForSemiBoundedBuildRule {
             // Partitioned). We want that side to be the BUILD and to be
             // broadcast (CollectLeft), so the large side streams with no
             // hash exchange.
-            let left_semi = build_subtree_has_semi_filter(hj.left());
-            let right_semi = build_subtree_has_semi_filter(hj.right());
+            // Semi-bounded detection drives the Inner-only arms below; force
+            // false for semi/anti joins so they fall straight through to the
+            // no-swap relative-broadcast arm (the only one safe for them).
+            let left_semi = is_inner && build_subtree_has_semi_filter(hj.left());
+            let right_semi = is_inner && build_subtree_has_semi_filter(hj.right());
             let min_ratio = self.min_probe_build_ratio;
             let new_join: Arc<dyn ExecutionPlan> = if left_semi && !right_semi {
                 // Semi-bounded side is already the build (left) → broadcast
@@ -301,9 +321,11 @@ impl PhysicalOptimizerRule for ForceCollectLeftForSemiBoundedBuildRule {
                                 .build()?,
                         )
                     }
-                    (Some(l), Some(r)) if r > 0 && (l as f64) >= (r as f64) * k => {
+                    (Some(l), Some(r)) if is_inner && r > 0 && (l as f64) >= (r as f64) * k => {
                         // Right is the small build → swap it onto the build
-                        // side, then broadcast.
+                        // side, then broadcast. INNER-ONLY: swapping a
+                        // semi/anti join flips LeftSemi↔RightSemi (asymmetric
+                        // output side) — declined for safety (falls to `_`).
                         if trace {
                             eprintln!(
                                 "[collect_left] relative swap+CollectLeft (right small build, l/r={:.0}); on={:?}",
@@ -614,6 +636,62 @@ mod tests {
             !after.contains("CollectLeft"),
             "relative branch must be inert at broadcast_ratio 0.0:\n{after}"
         );
+    }
+
+    /// REV.17.4b — the relative broadcast extends to semi/anti join TYPES via
+    /// the NO-SWAP left-small arm: a LeftSemi (or RightSemi/anti) Partitioned
+    /// join with a small LEFT build and a `broadcast_ratio ×` larger RIGHT
+    /// probe must flip to CollectLeft. Forcing CollectLeft is a physical
+    /// PartitionMode change — valid + semantics-preserving for every join type
+    /// (no swap, so LeftSemi stays LeftSemi). Inner-only before REV.17.4b.
+    #[test]
+    fn relative_broadcast_extends_to_semi_small_left() {
+        for jt in [
+            JoinType::LeftSemi,
+            JoinType::RightSemi,
+            JoinType::LeftAnti,
+            JoinType::RightAnti,
+        ] {
+            let top = hashjoin(mem_table_n(10), mem_table_n(1000), jt);
+            let rule = ForceCollectLeftForSemiBoundedBuildRule {
+                min_probe_build_ratio: 0.0,
+                broadcast_ratio: 16.0,
+            };
+            let out = rule.optimize(top, &ConfigOptions::default()).unwrap();
+            let after = format!("{out:?}");
+            assert!(
+                after.contains("CollectLeft"),
+                "relative broadcast must flip a small-LEFT/large-RIGHT {jt:?} \
+                 join to CollectLeft (no swap):\n{after}"
+            );
+        }
+    }
+
+    /// REV.17.4b — the SWAP arm stays Inner-only: a semi/anti join with a
+    /// small RIGHT (which an Inner join would swap onto the build) must NOT be
+    /// rewritten — swapping flips LeftSemi↔RightSemi (asymmetric output). It
+    /// stays Partitioned rather than risk a semantic change.
+    #[test]
+    fn relative_broadcast_does_not_swap_semi_small_right() {
+        for jt in [
+            JoinType::LeftSemi,
+            JoinType::RightSemi,
+            JoinType::LeftAnti,
+            JoinType::RightAnti,
+        ] {
+            let top = hashjoin(mem_table_n(1000), mem_table_n(10), jt);
+            let rule = ForceCollectLeftForSemiBoundedBuildRule {
+                min_probe_build_ratio: 0.0,
+                broadcast_ratio: 16.0,
+            };
+            let out = rule.optimize(top, &ConfigOptions::default()).unwrap();
+            let after = format!("{out:?}");
+            assert!(
+                !after.contains("CollectLeft"),
+                "swap arm must stay Inner-only — a small-RIGHT {jt:?} join \
+                 must NOT be swapped/broadcast:\n{after}"
+            );
+        }
     }
 
     /// REV.17.3 — the relative broadcast gate is DEFAULT-ON (multi-scale
