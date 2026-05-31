@@ -54,7 +54,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut mism = 0usize;
         // schema: field count + names + types + nullability
         if em.schema.fields().len() != pq_schema.fields().len() {
-            println!("  {t}: SCHEMA LEN {} vs {}", em.schema.fields().len(), pq_schema.fields().len());
+            println!(
+                "  {t}: SCHEMA LEN {} vs {}",
+                em.schema.fields().len(),
+                pq_schema.fields().len()
+            );
             mism += 1;
         } else {
             for (i, (ef, pf)) in em
@@ -67,7 +71,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if ef.name() != pf.name() || ef.data_type() != pf.data_type() {
                     println!(
                         "  {t}.col[{i}] schema mismatch: emat({}:{:?}) vs pqrs({}:{:?})",
-                        ef.name(), ef.data_type(), pf.name(), pf.data_type()
+                        ef.name(),
+                        ef.data_type(),
+                        pf.name(),
+                        pf.data_type()
                     );
                     mism += 1;
                 }
@@ -82,12 +89,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             mism += 1;
         }
         // column_stats: null_count + min + max
+        // Index loop: walks two parallel Vecs (em.column_stats + pq_stats) by the same i.
+        #[allow(clippy::needless_range_loop)]
         for i in 0..em.column_stats.len().min(pq_stats.len()) {
             let e = &em.column_stats[i];
             let p = &pq_stats[i];
-            let prec_eq = |a: &Precision<usize>, b: &Precision<usize>| format!("{a:?}") == format!("{b:?}");
+            let prec_eq =
+                |a: &Precision<usize>, b: &Precision<usize>| format!("{a:?}") == format!("{b:?}");
             let sv_eq = |a: &Precision<datafusion::common::ScalarValue>,
-                         b: &Precision<datafusion::common::ScalarValue>| format!("{a:?}") == format!("{b:?}");
+                         b: &Precision<datafusion::common::ScalarValue>| {
+                format!("{a:?}") == format!("{b:?}")
+            };
             if !prec_eq(&e.null_count, &p.null_count)
                 || !sv_eq(&e.min_value, &p.min_value)
                 || !sv_eq(&e.max_value, &p.max_value)
@@ -99,8 +111,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 mism += 1;
             }
         }
-        println!("{t}: {} cols, {} rows, {} RG — {}", em.schema.fields().len(), em.num_rows, em.num_row_groups,
-            if mism == 0 { "OK".to_string() } else { format!("{mism} MISMATCH") });
+        println!(
+            "{t}: {} cols, {} rows, {} RG — {}",
+            em.schema.fields().len(),
+            em.num_rows,
+            em.num_row_groups,
+            if mism == 0 {
+                "OK".to_string()
+            } else {
+                format!("{mism} MISMATCH")
+            }
+        );
         total_mismatch += mism;
     }
     println!("\nTOTAL MISMATCHES: {total_mismatch}");

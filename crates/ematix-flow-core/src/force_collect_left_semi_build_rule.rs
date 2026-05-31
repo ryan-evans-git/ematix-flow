@@ -172,9 +172,8 @@ fn probe_not_smaller_than_build(
 pub fn install_force_collect_left_semi_build_rule(
     builder: SessionStateBuilder,
 ) -> SessionStateBuilder {
-    builder.with_physical_optimizer_rule(Arc::new(
-        ForceCollectLeftForSemiBoundedBuildRule::default(),
-    ))
+    builder
+        .with_physical_optimizer_rule(Arc::new(ForceCollectLeftForSemiBoundedBuildRule::default()))
 }
 
 impl PhysicalOptimizerRule for ForceCollectLeftForSemiBoundedBuildRule {

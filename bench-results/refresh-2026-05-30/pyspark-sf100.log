@@ -1,0 +1,197 @@
+WARNING: Using incubator modules: jdk.incubator.vector
+Using Spark's default log4j profile: org/apache/spark/log4j2-defaults.properties
+26/05/30 22:32:08 WARN Utils: Your hostname, Developer-Macbook.local, resolves to a loopback address: 127.0.0.1; using 192.168.1.209 instead (on interface en0)
+26/05/30 22:32:08 WARN Utils: Set SPARK_LOCAL_IP if you need to bind to another address
+Using Spark's default log4j profile: org/apache/spark/log4j2-defaults.properties
+Setting default log level to "WARN".
+To adjust logging level use sc.setLogLevel(newLevel). For SparkR, use setLogLevel(newLevel).
+26/05/30 22:32:08 WARN NativeCodeLoader: Unable to load native-hadoop library for your platform... using builtin-java classes where applicable
+26/05/30 22:34:54 WARN DAGScheduler: Broadcasting large task binary with size 1046.0 KiB
+26/05/30 22:35:16 WARN DAGScheduler: Broadcasting large task binary with size 1153.1 KiB
+26/05/30 22:35:21 WARN DAGScheduler: Broadcasting large task binary with size 1145.2 KiB
+26/05/30 22:35:21 WARN DAGScheduler: Broadcasting large task binary with size 1145.3 KiB
+26/05/30 22:35:21 WARN DAGScheduler: Broadcasting large task binary with size 1143.0 KiB
+26/05/30 22:35:33 WARN DAGScheduler: Broadcasting large task binary with size 1046.0 KiB
+26/05/30 22:35:55 WARN DAGScheduler: Broadcasting large task binary with size 1153.1 KiB
+26/05/30 22:36:00 WARN DAGScheduler: Broadcasting large task binary with size 1145.2 KiB
+26/05/30 22:36:00 WARN DAGScheduler: Broadcasting large task binary with size 1145.3 KiB
+26/05/30 22:36:00 WARN DAGScheduler: Broadcasting large task binary with size 1143.0 KiB
+26/05/30 22:36:11 WARN DAGScheduler: Broadcasting large task binary with size 1046.0 KiB
+26/05/30 22:36:32 WARN DAGScheduler: Broadcasting large task binary with size 1153.1 KiB
+26/05/30 22:36:38 WARN DAGScheduler: Broadcasting large task binary with size 1145.2 KiB
+26/05/30 22:36:38 WARN DAGScheduler: Broadcasting large task binary with size 1145.3 KiB
+26/05/30 22:36:38 WARN DAGScheduler: Broadcasting large task binary with size 1143.0 KiB
+26/05/30 22:36:48 WARN DAGScheduler: Broadcasting large task binary with size 1048.3 KiB
+26/05/30 22:36:48 WARN DAGScheduler: Broadcasting large task binary with size 1048.3 KiB
+26/05/30 22:36:51 WARN DAGScheduler: Broadcasting large task binary with size 1108.7 KiB
+26/05/30 22:36:53 WARN DAGScheduler: Broadcasting large task binary with size 2.1 MiB
+26/05/30 22:36:54 WARN DAGScheduler: Broadcasting large task binary with size 2.1 MiB
+26/05/30 22:36:54 WARN DAGScheduler: Broadcasting large task binary with size 2.1 MiB
+26/05/30 22:36:54 WARN DAGScheduler: Broadcasting large task binary with size 2.1 MiB
+26/05/30 22:37:02 WARN DAGScheduler: Broadcasting large task binary with size 1048.3 KiB
+26/05/30 22:37:02 WARN DAGScheduler: Broadcasting large task binary with size 1048.3 KiB
+26/05/30 22:37:04 WARN DAGScheduler: Broadcasting large task binary with size 1108.7 KiB
+26/05/30 22:37:07 WARN DAGScheduler: Broadcasting large task binary with size 2.1 MiB
+26/05/30 22:37:07 WARN DAGScheduler: Broadcasting large task binary with size 2.1 MiB
+26/05/30 22:37:07 WARN DAGScheduler: Broadcasting large task binary with size 2.1 MiB
+26/05/30 22:37:07 WARN DAGScheduler: Broadcasting large task binary with size 2.1 MiB
+26/05/30 22:37:14 WARN DAGScheduler: Broadcasting large task binary with size 1048.3 KiB
+26/05/30 22:37:14 WARN DAGScheduler: Broadcasting large task binary with size 1048.3 KiB
+26/05/30 22:37:17 WARN DAGScheduler: Broadcasting large task binary with size 1108.7 KiB
+26/05/30 22:37:19 WARN DAGScheduler: Broadcasting large task binary with size 2.1 MiB
+26/05/30 22:37:20 WARN DAGScheduler: Broadcasting large task binary with size 2.1 MiB
+26/05/30 22:37:20 WARN DAGScheduler: Broadcasting large task binary with size 2.1 MiB
+26/05/30 22:37:20 WARN DAGScheduler: Broadcasting large task binary with size 2.1 MiB
+26/05/30 22:37:36 WARN DAGScheduler: Broadcasting large task binary with size 1045.2 KiB
+26/05/30 22:37:43 WARN DAGScheduler: Broadcasting large task binary with size 1181.8 KiB
+26/05/30 22:37:43 WARN DAGScheduler: Broadcasting large task binary with size 1177.5 KiB
+26/05/30 22:37:43 WARN DAGScheduler: Broadcasting large task binary with size 1177.5 KiB
+26/05/30 22:37:43 WARN DAGScheduler: Broadcasting large task binary with size 1173.1 KiB
+26/05/30 22:38:00 WARN DAGScheduler: Broadcasting large task binary with size 1045.2 KiB
+26/05/30 22:38:06 WARN DAGScheduler: Broadcasting large task binary with size 1181.8 KiB
+26/05/30 22:38:07 WARN DAGScheduler: Broadcasting large task binary with size 1177.5 KiB
+26/05/30 22:38:07 WARN DAGScheduler: Broadcasting large task binary with size 1177.5 KiB
+26/05/30 22:38:07 WARN DAGScheduler: Broadcasting large task binary with size 1173.1 KiB
+26/05/30 22:38:24 WARN DAGScheduler: Broadcasting large task binary with size 1045.2 KiB
+26/05/30 22:38:30 WARN DAGScheduler: Broadcasting large task binary with size 1181.8 KiB
+26/05/30 22:38:31 WARN DAGScheduler: Broadcasting large task binary with size 1177.5 KiB
+26/05/30 22:38:31 WARN DAGScheduler: Broadcasting large task binary with size 1177.5 KiB
+26/05/30 22:38:31 WARN DAGScheduler: Broadcasting large task binary with size 1173.1 KiB
+26/05/30 22:50:26 WARN DAGScheduler: Broadcasting large task binary with size 1049.8 KiB
+26/05/30 22:50:28 WARN DAGScheduler: Broadcasting large task binary with size 1143.0 KiB
+26/05/30 22:50:32 WARN DAGScheduler: Broadcasting large task binary with size 1049.8 KiB
+26/05/30 22:50:34 WARN DAGScheduler: Broadcasting large task binary with size 1143.0 KiB
+26/05/30 22:50:38 WARN DAGScheduler: Broadcasting large task binary with size 1049.8 KiB
+26/05/30 22:50:40 WARN DAGScheduler: Broadcasting large task binary with size 1143.0 KiB
+26/05/30 22:50:58 WARN DAGScheduler: Broadcasting large task binary with size 1049.2 KiB
+26/05/30 22:50:58 WARN DAGScheduler: Broadcasting large task binary with size 1162.7 KiB
+26/05/30 22:51:35 WARN DAGScheduler: Broadcasting large task binary with size 1138.1 KiB
+26/05/30 22:51:35 WARN DAGScheduler: Broadcasting large task binary with size 1140.2 KiB
+26/05/30 22:51:35 WARN DAGScheduler: Broadcasting large task binary with size 1137.6 KiB
+26/05/30 22:51:53 WARN DAGScheduler: Broadcasting large task binary with size 1049.2 KiB
+26/05/30 22:51:53 WARN DAGScheduler: Broadcasting large task binary with size 1162.7 KiB
+26/05/30 22:52:30 WARN DAGScheduler: Broadcasting large task binary with size 1138.1 KiB
+26/05/30 22:52:30 WARN DAGScheduler: Broadcasting large task binary with size 1140.2 KiB
+26/05/30 22:52:30 WARN DAGScheduler: Broadcasting large task binary with size 1137.6 KiB
+26/05/30 22:52:48 WARN DAGScheduler: Broadcasting large task binary with size 1049.2 KiB
+26/05/30 22:52:48 WARN DAGScheduler: Broadcasting large task binary with size 1162.7 KiB
+26/05/30 22:53:26 WARN DAGScheduler: Broadcasting large task binary with size 1138.1 KiB
+26/05/30 22:53:26 WARN DAGScheduler: Broadcasting large task binary with size 1140.2 KiB
+26/05/30 22:53:26 WARN DAGScheduler: Broadcasting large task binary with size 1137.6 KiB
+==> data dir: examples/tpch/data/sf100
+==> trials per query: 2 (after 1 warm-up)
+
+==> Spark 4.1.1, JDK /opt/homebrew/opt/openjdk
+-- q01 --
+  q01 trial 1/2: 5112.54 ms
+  q01 trial 2/2: 5255.27 ms
+
+-- q02 --
+  q02 trial 1/2: 6836.40 ms
+  q02 trial 2/2: 6557.02 ms
+
+-- q03 --
+  q03 trial 1/2: 26128.78 ms
+  q03 trial 2/2: 26126.28 ms
+
+-- q04 --
+  q04 trial 1/2: 10635.17 ms
+  q04 trial 2/2: 10451.37 ms
+
+-- q05 --
+  q05 trial 1/2: 38291.96 ms
+  q05 trial 2/2: 37997.67 ms
+
+-- q06 --
+  q06 trial 1/2: 1102.98 ms
+  q06 trial 2/2: 1181.33 ms
+
+-- q07 --
+  q07 trial 1/2: 12993.24 ms
+  q07 trial 2/2: 12556.91 ms
+
+-- q08 --
+  q08 trial 1/2: 23375.43 ms
+  q08 trial 2/2: 23845.44 ms
+
+-- q09 --
+  q09 trial 1/2: 55748.47 ms
+  q09 trial 2/2: 78461.03 ms
+
+-- q10 --
+  q10 trial 1/2: 26625.15 ms
+  q10 trial 2/2: 22553.93 ms
+
+-- q11 --
+  q11 trial 1/2: 5169.64 ms
+  q11 trial 2/2: 6108.92 ms
+
+-- q12 --
+  q12 trial 1/2: 6566.95 ms
+  q12 trial 2/2: 6397.49 ms
+
+-- q13 --
+  q13 trial 1/2: 13924.66 ms
+  q13 trial 2/2: 14958.81 ms
+
+-- q14 --
+  q14 trial 1/2: 2638.11 ms
+  q14 trial 2/2: 2607.21 ms
+
+-- q15 --
+  q15 trial 1/2: 5129.87 ms
+  q15 trial 2/2: 5154.77 ms
+
+-- q16 --
+  q16 trial 1/2: 5436.59 ms
+  q16 trial 2/2: 4588.13 ms
+
+-- q17 --
+  q17 trial 1/2: 48597.37 ms
+  q17 trial 2/2: 47048.83 ms
+
+-- q18 --
+  q18 trial 1/2: 54762.59 ms
+  q18 trial 2/2: 53650.37 ms
+
+-- q19 --
+  q19 trial 1/2: 3095.53 ms
+  q19 trial 2/2: 3106.66 ms
+
+-- q20 --
+  q20 trial 1/2: 5615.08 ms
+  q20 trial 2/2: 5748.03 ms
+
+-- q21 --
+  q21 trial 1/2: 55030.24 ms
+  q21 trial 2/2: 56135.53 ms
+
+-- q22 --
+  q22 trial 1/2: 5163.91 ms
+  q22 trial 2/2: 5050.19 ms
+
+=== Results ===
+| Query | DataFusion (ms) | PySpark (ms) | DF/PySpark | PySpark trials min/max (ms) | rows |
+|---|---|---|---|---|---|
+| Q01 |  48.7 |  5183.9 | 0.009 | 5112.5 / 5255.3 | 4 |
+| Q02 |   TBD |  6696.7 | — | 6557.0 / 6836.4 | 47107 |
+| Q03 |  34.6 | 26127.5 | 0.001 | 26126.3 / 26128.8 | 1131041 |
+| Q04 |   TBD | 10543.3 | — | 10451.4 / 10635.2 | 5 |
+| Q05 |   TBD | 38144.8 | — | 37997.7 / 38292.0 | 5 |
+| Q06 |  18.2 |  1142.2 | 0.016 | 1103.0 / 1181.3 | 1 |
+| Q07 |   TBD | 12775.1 | — | 12556.9 / 12993.2 | 4 |
+| Q08 |   TBD | 23610.4 | — | 23375.4 / 23845.4 | 2 |
+| Q09 |   TBD | 67104.7 | — | 55748.5 / 78461.0 | 175 |
+| Q10 |   TBD | 24589.5 | — | 22553.9 / 26625.2 | 3884218 |
+| Q11 |   TBD |  5639.3 | — | 5169.6 / 6108.9 | 0 |
+| Q12 |   TBD |  6482.2 | — | 6397.5 / 6566.9 | 2 |
+| Q13 |   TBD | 14441.7 | — | 13924.7 / 14958.8 | 45 |
+| Q14 |   TBD |  2622.7 | — | 2607.2 / 2638.1 | 1 |
+| Q15 |   TBD |  5142.3 | — | 5129.9 / 5154.8 | 1 |
+| Q16 |   TBD |  5012.4 | — | 4588.1 / 5436.6 | 27840 |
+| Q17 |   TBD | 47823.1 | — | 47048.8 / 48597.4 | 1 |
+| Q18 |   TBD | 54206.5 | — | 53650.4 / 54762.6 | 6398 |
+| Q19 |  38.0 |  3101.1 | 0.012 | 3095.5 / 3106.7 | 1 |
+| Q20 |   TBD |  5681.6 | — | 5615.1 / 5748.0 | 17971 |
+| Q21 |   TBD | 55582.9 | — | 55030.2 / 56135.5 | 39950 |
+| Q22 |   TBD |  5107.0 | — | 5050.2 / 5163.9 | 7 |

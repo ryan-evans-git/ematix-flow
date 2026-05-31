@@ -58,7 +58,10 @@ async fn main() -> datafusion::error::Result<()> {
             "COPY (SELECT {} FROM \"{t}\") TO '{outpath}' STORED AS PARQUET",
             proj.join(", ")
         );
-        println!("rewriting {t} ({} cols, keys→Int32: {keys:?}) -> {outpath}", schema.fields().len());
+        println!(
+            "rewriting {t} ({} cols, keys→Int32: {keys:?}) -> {outpath}",
+            schema.fields().len()
+        );
         ctx.sql(&sql).await?.collect().await?;
     }
     println!("done");

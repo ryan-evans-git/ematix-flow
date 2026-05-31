@@ -1128,8 +1128,7 @@ impl EmatArrowBatchReader {
             let (_col, bitmap) = filter
                 .probe_i64_values_from_decoded(i64_values)
                 .ok_or_else(|| ext("probe_i64_values_from_decoded unexpectedly None"))?;
-            self.cur_rg_filter_bitmap =
-                Some(datafusion::arrow::buffer::Buffer::from_vec(bitmap));
+            self.cur_rg_filter_bitmap = Some(datafusion::arrow::buffer::Buffer::from_vec(bitmap));
             return Ok(());
         }
         self.load_row_group_masked_legacy(rg, filter, path)
@@ -1701,8 +1700,7 @@ impl EmatArrowBatchReader {
             // `Buffer::from_slice_ref(&Vec<u8>)` per slice_batch call,
             // which copied the whole bitmap each time (~125 KB × 15
             // batches/RG → ~7.5 MB of copies per Q03 partition).
-            let bool_buf =
-                datafusion::arrow::buffer::BooleanBuffer::new(buf.clone(), start, n);
+            let bool_buf = datafusion::arrow::buffer::BooleanBuffer::new(buf.clone(), start, n);
             let predicate_arr = arrow_array::BooleanArray::new(bool_buf, None);
             let filtered = datafusion::arrow::compute::filter_record_batch(&batch, &predicate_arr)
                 .map_err(|e| ext(format!("filter_record_batch: {e}")))?;

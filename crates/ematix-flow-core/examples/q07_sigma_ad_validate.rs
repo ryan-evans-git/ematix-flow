@@ -45,17 +45,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             max_rel = rel;
         }
         if rel > 1e-6 {
-            return Err(format!(
-                "row {i}: baseline={b}, rewritten={r}, rel_err={rel:e}"
-            )
-            .into());
+            return Err(format!("row {i}: baseline={b}, rewritten={r}, rel_err={rel:e}").into());
         }
     }
-    println!("Q07 SF=10 Σ.AD: PASS ({} rows, max rel err = {:e})", baseline.len(), max_rel);
+    println!(
+        "Q07 SF=10 Σ.AD: PASS ({} rows, max rel err = {:e})",
+        baseline.len(),
+        max_rel
+    );
     Ok(())
 }
 
-async fn run(dir: &std::path::Path, sql: &str, with_dim_push: bool) -> Result<Vec<f64>, Box<dyn std::error::Error>> {
+async fn run(
+    dir: &std::path::Path,
+    sql: &str,
+    with_dim_push: bool,
+) -> Result<Vec<f64>, Box<dyn std::error::Error>> {
     let state = preset::with_optimizer_rules(
         SessionStateBuilder::new()
             .with_config(SessionConfig::new().with_target_partitions(14))
@@ -64,7 +69,10 @@ async fn run(dir: &std::path::Path, sql: &str, with_dim_push: bool) -> Result<Ve
     .build();
     let ctx = SessionContext::new_with_state(state);
     for t in TPCH_TABLES {
-        let path = dir.join(format!("{t}.parquet")).to_string_lossy().to_string();
+        let path = dir
+            .join(format!("{t}.parquet"))
+            .to_string_lossy()
+            .to_string();
         let prov = EmatixFastParquetTableProvider::try_new(path)?;
         ctx.register_table(*t, Arc::new(prov))?;
     }

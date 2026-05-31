@@ -34,6 +34,7 @@ use ematix_flow_core::dedupe_aggregate_rule::DedupeAggregateForFloatDeterminism;
 use ematix_flow_core::dict_aggregate_rule::EnableDictGroupCountRule;
 use ematix_flow_core::ematix_fast_parquet::EmatixFastParquetTableProvider;
 use ematix_flow_core::fast_parquet::FastParquetTableProvider;
+use ematix_flow_core::force_collect_left_semi_build_rule::ForceCollectLeftForSemiBoundedBuildRule;
 use ematix_flow_core::fused_aggregate_filter_multi_agg_rule::InjectFilterMultiAggRule;
 use ematix_flow_core::fused_aggregate_filter_sum_rule::InjectFilterSumRule;
 use ematix_flow_core::inbloom_scan_pushdown_rule::EnableInBloomScanPushdownRule;
@@ -42,7 +43,6 @@ use ematix_flow_core::push_down_left_semi_rule::PushDownLeftSemiRule;
 use ematix_flow_core::robin_hood_sum_f64_exec::EnableRobinHoodSumF64Rule;
 use ematix_flow_core::runtime_bloom_cascading_rule::EnableCascadingBloomRule;
 use ematix_flow_core::runtime_bloom_sideband_rule::EnableRuntimeBloomSidebandRule;
-use ematix_flow_core::force_collect_left_semi_build_rule::ForceCollectLeftForSemiBoundedBuildRule;
 use ematix_flow_core::swap_semi_join_build_rule::SwapSemiJoinBuildSideRule;
 use futures_util::TryStreamExt;
 
@@ -90,11 +90,7 @@ fn fires_cache() -> &'static Mutex<HashMap<FiresKey, bool>> {
 
 /// Returns true iff applying `rule` to the optimized plan of `sql`
 /// produces a structurally different plan. Caches per (rule, SQL).
-async fn rewrite_fires_for_sql(
-    ctx: &SessionContext,
-    sql: &str,
-    rule: RewriteRule,
-) -> bool {
+async fn rewrite_fires_for_sql(ctx: &SessionContext, sql: &str, rule: RewriteRule) -> bool {
     let key: FiresKey = (rule, sql.to_string());
     {
         let guard = fires_cache().lock().unwrap();
@@ -477,8 +473,7 @@ async fn auto_target_partitions_lookup(data_dir: &Path, sql: &str) -> AutoPartit
     let session_cores = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(14);
-    let recommendation =
-        compute_auto_target_partitions(data_dir, sql, session_cores).await;
+    let recommendation = compute_auto_target_partitions(data_dir, sql, session_cores).await;
     auto_partitions_cache()
         .lock()
         .unwrap()
@@ -499,9 +494,7 @@ async fn compute_auto_target_partitions(
             return AutoPartitionsRec::default();
         }
         if *t == "lineitem" {
-            let Ok(prov) =
-                EmatixFastParquetTableProvider::try_new(path.to_string_lossy())
-            else {
+            let Ok(prov) = EmatixFastParquetTableProvider::try_new(path.to_string_lossy()) else {
                 return AutoPartitionsRec::default();
             };
             if ctx.register_table(*t, Arc::new(prov)).is_err() {
@@ -811,23 +804,16 @@ async fn race_prefill_observations(
         // Phase 1.3 formula recommendation for this SQL. Compute it
         // without the log to get the plan-time-only answer (so the
         // race is genuinely formula-vs-cores, not log-vs-cores).
-        let formula_partitions = match compute_formula_partitions(
-            data_dir,
-            &sql,
-            session_cores,
-        )
-        .await
-        {
-            Some(n) => n,
-            None => {
-                println!("  Q{q:02}: no qualifying aggregate — skip");
-                continue;
-            }
-        };
+        let formula_partitions =
+            match compute_formula_partitions(data_dir, &sql, session_cores).await {
+                Some(n) => n,
+                None => {
+                    println!("  Q{q:02}: no qualifying aggregate — skip");
+                    continue;
+                }
+            };
         if formula_partitions == session_cores {
-            println!(
-                "  Q{q:02}: formula == cores ({session_cores}) — no race needed"
-            );
+            println!("  Q{q:02}: formula == cores ({session_cores}) — no race needed");
             continue;
         }
         // Need the shape hash to key the race outcome. Recompute via
@@ -909,10 +895,8 @@ async fn compute_formula_partitions(
     }
     let df = ctx.sql(sql).await.ok()?;
     let plan = df.into_optimized_plan().ok()?;
-    let n = ematix_flow_core::auto_target_partitions::recommend_target_partitions(
-        &plan,
-        session_cores,
-    );
+    let n =
+        ematix_flow_core::auto_target_partitions::recommend_target_partitions(&plan, session_cores);
     Some(n)
 }
 
@@ -975,17 +959,19 @@ async fn time_one(data_dir: &Path, sql: &str, partitions: Option<usize>) -> Opti
 /// Σ.AΩ Phase 1.4 — dump every operator's (name, output_rows) in a
 /// tree so the prefill mode can confirm where the aggregate
 /// cardinality actually lives. Activated when `EMAT_PREFILL_DUMP=1`.
-fn dump_plan_metrics(
-    plan: &dyn datafusion::physical_plan::ExecutionPlan,
-    depth: usize,
-) {
+fn dump_plan_metrics(plan: &dyn datafusion::physical_plan::ExecutionPlan, depth: usize) {
     let n = plan.name();
     let output_rows = plan
         .metrics()
         .and_then(|m| m.output_rows())
         .map(|r| r.to_string())
         .unwrap_or_else(|| "—".to_string());
-    println!("    {}{} (output_rows={})", "  ".repeat(depth), n, output_rows);
+    println!(
+        "    {}{} (output_rows={})",
+        "  ".repeat(depth),
+        n,
+        output_rows
+    );
     for child in plan.children() {
         dump_plan_metrics(child.as_ref(), depth + 1);
     }
@@ -1056,11 +1042,10 @@ async fn run_ematix_flow(data_dir: &Path, sql: &str) -> Trial {
             }
         }
     }
-    let (ctx, bloom_rule) =
-        match build_ematix_ctx(data_dir, target_partitions_override).await {
-            Ok(c) => c,
-            Err(e) => return Trial::Fail(format!("ctx build: {e}")),
-        };
+    let (ctx, bloom_rule) = match build_ematix_ctx(data_dir, target_partitions_override).await {
+        Ok(c) => c,
+        Err(e) => return Trial::Fail(format!("ctx build: {e}")),
+    };
     // Σ.Q.L4′: when EMAT_BLOOM_PUSHDOWN=1, pre-execute small Inner-
     // equijoin build sides via the local emitter and install the
     // resulting ContextBlooms into the shared rule slot before timing
@@ -1120,8 +1105,7 @@ async fn run_ematix_flow(data_dir: &Path, sql: &str) -> Trial {
         .ok()
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
-    let agg_semi_actually_fires =
-        agg_semi_on_check && agg_semi_fires_for_sql(&ctx, sql).await;
+    let agg_semi_actually_fires = agg_semi_on_check && agg_semi_fires_for_sql(&ctx, sql).await;
     let dim_push_actually_fires =
         dim_push_on_check && rewrite_fires_for_sql(&ctx, sql, RewriteRule::DimPush).await;
     let reorder_actually_fires = reorder_on_check
@@ -1258,10 +1242,7 @@ async fn run_ematix_flow(data_dir: &Path, sql: &str) -> Trial {
                     match ematix_flow_core::agg_filter_pushdown::push_filter_into_agg(plan) {
                         Ok(p) => p,
                         Err(e) => {
-                            return Trial::Fail(format!(
-                                "agg_semi: {}",
-                                short(&e.to_string())
-                            ));
+                            return Trial::Fail(format!("agg_semi: {}", short(&e.to_string())));
                         }
                     }
                 } else {
@@ -1271,10 +1252,7 @@ async fn run_ematix_flow(data_dir: &Path, sql: &str) -> Trial {
                     match ematix_flow_core::dim_join_pushdown::push_dim_join_into_chain(plan) {
                         Ok(p) => p,
                         Err(e) => {
-                            return Trial::Fail(format!(
-                                "dim_push: {}",
-                                short(&e.to_string())
-                            ));
+                            return Trial::Fail(format!("dim_push: {}", short(&e.to_string())));
                         }
                     }
                 } else {
@@ -1311,10 +1289,7 @@ async fn run_ematix_flow(data_dir: &Path, sql: &str) -> Trial {
                     match reorder_result {
                         Ok(p) => p,
                         Err(e) => {
-                            return Trial::Fail(format!(
-                                "reorder: {}",
-                                short(&e.to_string())
-                            ));
+                            return Trial::Fail(format!("reorder: {}", short(&e.to_string())));
                         }
                     }
                 } else {
@@ -1463,8 +1438,9 @@ async fn build_ematix_ctx(
         .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
         .unwrap_or(true);
     if force_collect_left_enabled {
-        builder = builder
-            .with_physical_optimizer_rule(Arc::new(ForceCollectLeftForSemiBoundedBuildRule::default()));
+        builder = builder.with_physical_optimizer_rule(Arc::new(
+            ForceCollectLeftForSemiBoundedBuildRule::default(),
+        ));
     }
     // Σ.Q.L10: logical-plan rewrite — push LeftSemi past Inner joins
     // down to its target table. Closes the Q18-shape structural gap
@@ -1514,7 +1490,8 @@ async fn build_ematix_ctx(
             ematix_flow_core::single_pass_radix_sum_exec::EnableSinglePassRadixSumRule::default(),
         ));
     } else if rh_sum_f64_enabled {
-        builder = builder.with_physical_optimizer_rule(Arc::new(EnableRobinHoodSumF64Rule::default()));
+        builder =
+            builder.with_physical_optimizer_rule(Arc::new(EnableRobinHoodSumF64Rule::default()));
     }
     // Σ.AN.1 (2026-05-28): per-operator partition routing for
     // high-cardinality FinalPartitioned aggregates. Opt-in via
@@ -1591,14 +1568,18 @@ async fn build_ematix_ctx(
     // BridgeFilter. Default OFF — enable via
     // `EMAT_DROP_REDUNDANT_FILTER=1` to A/B against the Inexact
     // baseline.
-    builder = ematix_flow_core::drop_redundant_filter_rule::install_drop_redundant_filter_rule(builder);
+    builder =
+        ematix_flow_core::drop_redundant_filter_rule::install_drop_redundant_filter_rule(builder);
     // Σ.AJ.1 Lever B POC: opt-in via EMAT_L9_BROADCAST_SIBLINGS=1.
     // Runs after the L9 sideband rule to broadcast existing bloom
     // emitters to sibling same-parquet-path scans elsewhere in the
     // plan (specifically the Q17 part⋈lineitem bloom → subquery
     // lineitem.l_partkey scan pattern).
     if std::env::var_os("EMAT_L9_BROADCAST_SIBLINGS").is_some() {
-        builder = ematix_flow_core::broadcast_sibling_blooms_rule::install_broadcast_sibling_blooms_rule(builder);
+        builder =
+            ematix_flow_core::broadcast_sibling_blooms_rule::install_broadcast_sibling_blooms_rule(
+                builder,
+            );
     }
     // Σ.Q.L4′: install the in-scan bloom pushdown rule with an empty
     // shared bloom slot. `run_ematix_flow` swaps the slot's contents
@@ -1806,6 +1787,7 @@ fn write_benchmarks_md(
     writeln!(s, "|------:|------------:|-------:|-------:|:-----|").unwrap();
     let mut wins: BTreeMap<Engine, usize> = BTreeMap::new();
     for (q, per_engine) in results {
+        #[allow(clippy::type_complexity)] // (mean, stddev, trials) summary tuple per engine
         let cells: Vec<(Engine, Option<(f64, f64, usize)>)> = Engine::all()
             .iter()
             .map(|e| (*e, per_engine.get(e).and_then(|r| r.summarize())))

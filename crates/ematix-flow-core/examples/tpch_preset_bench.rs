@@ -32,15 +32,28 @@ const TPCH_TABLES: &[&str] = &[
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let q: u8 = std::env::var("Q").ok().and_then(|s| s.parse().ok()).unwrap_or(5);
+    let q: u8 = std::env::var("Q")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(5);
     let dir =
         std::env::var("TPCH_DATA_DIR").unwrap_or_else(|_| "examples/tpch/data/sf1".to_string());
-    let trials: usize = std::env::var("TRIALS").ok().and_then(|s| s.parse().ok()).unwrap_or(5);
-    let warmups: usize = std::env::var("WARMUPS").ok().and_then(|s| s.parse().ok()).unwrap_or(2);
+    let trials: usize = std::env::var("TRIALS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(5);
+    let warmups: usize = std::env::var("WARMUPS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(2);
     let partitions: usize = std::env::var("PARTITIONS")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(14));
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(14)
+        });
 
     // The library path: preset installs the milestone rules + the
     // ReorderQueryPlanner (gated by EMAT_REORDER_QP, default ON).

@@ -7,7 +7,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-(no entries yet — anything landing on `main` after v0.8.0 goes here)
+(no entries yet — anything landing on `main` after v0.9.0 goes here)
+
+## [0.9.0] — 2026-05-31
+
+Perf release. No Python API changes; the surface from v0.8.0 is
+unchanged. The work is in the query optimizer's join handling at scale,
+the aggregate-rule cardinality gates, and a full benchmark refresh.
+
+### Added
+
+- **Three-scale TPC-H benchmark refresh** — all 22 queries across
+  **SF=1 / SF=10 / SF=100** and five engines (ematix-flow, DuckDB,
+  Polars, single-node PySpark, Postgres 14) on the same hardware + the
+  same Parquet files. ematix-flow + DuckDB are co-measured in one
+  process (10 trials × 3 warmups). Wins: **22 / 22** (SF=1),
+  **18 / 22** (SF=10), **16 / 22** (SF=100). Raw logs under
+  `bench-results/refresh-2026-05-30/`; full numbers + caveats at
+  [ematix.dev/reference/benchmarks](https://ematix.dev/reference/benchmarks),
+  now tabbed by scale.
+
+### Changed
+
+- **Scale-relative broadcast join**
+  (`ForceCollectLeftForSemiBoundedBuildRule`) — when a plain
+  dimension⋈fact Inner join has a probe side ≥ 16× the build, the build
+  is broadcast via `CollectLeft` instead of hash-repartitioned.
+  DataFusion's own gate is an absolute byte/row threshold that misses
+  this at scale; the new gate is scale-relative and default-on
+  (`EMAT_COLLECT_LEFT_BROADCAST_RATIO`, default 16). **Q18 SF=100:
+  377 ms vs DuckDB 2 193 ms (5.8×)**; net-positive across scales too
+  (SF=100 −9.8 %, SF=10 −7.2 %, SF=1 −4.1 %, zero regressions).
+- **Cardinality-gated Robin-Hood aggregates** — the fused `SUM(f64)` /
+  `COUNT` / `AVG … GROUP BY` operators now refuse to fire above a
+  group-cardinality ceiling, where DataFusion's vectorised hash
+  aggregate wins. Fixes a ~9× Q18 SF=100 regression the SUM rule caused
+  when the group count exploded (600 M-row `GROUP BY l_orderkey`).
+- **CollectLeft for semi-bounded builds** — runtime-bloom semi-detection
+  extended to `RightSemi` / `RightAnti`, so a build side bounded by a
+  semi-join is broadcast. Q18 SF=10.
+- **Cost-model join reorder, default-on at scale** — NDV-realistic
+  selectivity (string-equality + FK-cardinality cap) and a leftmost-leaf
+  build-cost charge in the DP enumeration. Unblocks the Q05 / Q08 join
+  funnels at SF=10 / SF=100.
+
+### Fixed
+
+- **Q15 SF=100 correctness** — repaired partitioning after the
+  shared-subtree dedupe wrap (re-run `EnforceDistribution`). All 22
+  queries match DuckDB row-for-row at every scale.
+
+### Dependencies
+
+- **ematix-parquet 0.16.3** — scale-aware footer cache collapses the
+  O(N_rg²) footer re-parse on wide row-group files (Q06 SF=10).
 
 ## [0.8.0] — 2026-05-25
 
@@ -1194,7 +1247,9 @@ Highlights of what's NOT in v0.1.0:
 - Iceberg-style transactional updates against object stores (use
   Delta for that today).
 
-[Unreleased]: https://github.com/ryan-evans-git/ematix-flow/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/ryan-evans-git/ematix-flow/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/ryan-evans-git/ematix-flow/compare/v0.8.0...v0.9.0
+[0.8.0]: https://github.com/ryan-evans-git/ematix-flow/compare/v0.5.0...v0.8.0
 [0.5.0]: https://github.com/ryan-evans-git/ematix-flow/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/ryan-evans-git/ematix-flow/compare/v0.1.0...v0.4.0
 [0.1.0]: https://github.com/ryan-evans-git/ematix-flow/releases/tag/v0.1.0

@@ -7,15 +7,13 @@
 //! consume ~446 ms parallel compute (~32 ms equivalent single-thread).
 //!
 //! Four variants:
-//!   1. std HashMap<(i64,i64), f64>   — generic baseline
-//!   2. Packed-i64 RobinHood          — pack (l_partkey, l_suppkey)
-//!                                       into a single i64; use existing
-//!                                       RobinHoodI64F64
-//!   3. Custom TwoKeyRH               — fused 2-key Robin Hood (the
-//!                                       full Lever #4 build's hot loop
-//!                                       in microcosm)
-//!   4. DataFusion AggregateExec      — actual ground-truth comparator
-//!                                       (per Σ.R.2 memo prescription)
+//!   1. std HashMap<(i64,i64), f64> — generic baseline
+//!   2. Packed-i64 RobinHood — pack (l_partkey, l_suppkey) into a single
+//!      i64; use existing RobinHoodI64F64
+//!   3. Custom TwoKeyRH — fused 2-key Robin Hood (the full Lever #4
+//!      build's hot loop in microcosm)
+//!   4. DataFusion AggregateExec — actual ground-truth comparator (per
+//!      Σ.R.2 memo prescription)
 //!
 //! Gate decision per the Σ.R.2 memo:
 //!   - If variant 2 OR 3 beats variant 1 by ≥20% AND finishes the
@@ -341,10 +339,7 @@ async fn main() {
         "  2. packed-i64 RH (scalar)       : {:7.2} ms   groups={}",
         m_prh, prh_groups as i64
     );
-    println!(
-        "  2v.packed-i64 RH (vectorised)   : {:7.2} ms",
-        m_prh_vec
-    );
+    println!("  2v.packed-i64 RH (vectorised)   : {:7.2} ms", m_prh_vec);
     println!(
         "  3. custom 2-key RobinHood       : {:7.2} ms   groups={}",
         m_custom, custom_groups as i64

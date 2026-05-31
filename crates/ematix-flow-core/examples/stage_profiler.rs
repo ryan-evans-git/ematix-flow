@@ -135,7 +135,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!();
 
     // Aggregate by tree path.
-    let mut agg: std::collections::BTreeMap<Vec<usize>, AggNode> = std::collections::BTreeMap::new();
+    let mut agg: std::collections::BTreeMap<Vec<usize>, AggNode> =
+        std::collections::BTreeMap::new();
     for tr in &per_trial {
         for n in &tr.nodes {
             let entry = agg.entry(n.path.clone()).or_insert_with(|| AggNode {
@@ -171,8 +172,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!();
     println!("| Rank | Operator | Depth | Median ms | Min ms | Max ms | Out rows |");
     println!("|-----:|:---------|------:|----------:|-------:|-------:|---------:|");
-    let total_compute_ms: f64 =
-        rows_sorted.iter().map(|n| median(&to_f64(&n.elapsed_ns_per_trial)) / 1e6).sum();
+    let total_compute_ms: f64 = rows_sorted
+        .iter()
+        .map(|n| median(&to_f64(&n.elapsed_ns_per_trial)) / 1e6)
+        .sum();
     let median_wall = median(&wall_ms_vec);
     for (i, n) in rows_sorted.iter().take(25).enumerate() {
         let v_ns = to_f64(&n.elapsed_ns_per_trial);
@@ -273,7 +276,11 @@ fn walk(
 
 fn short_name(n: &str) -> String {
     // Some operator names are very long display strings — trim.
-    if let Some(idx) = n.find(':') { n[..idx].to_string() } else { n.to_string() }
+    if let Some(idx) = n.find(':') {
+        n[..idx].to_string()
+    } else {
+        n.to_string()
+    }
 }
 
 fn to_f64(v: &[u64]) -> Vec<f64> {
@@ -301,7 +308,11 @@ fn median_usize(v: &[usize]) -> usize {
     let mut s = v.to_vec();
     s.sort();
     let n = s.len();
-    if n % 2 == 1 { s[n / 2] } else { (s[n / 2 - 1] + s[n / 2]) / 2 }
+    if n % 2 == 1 {
+        s[n / 2]
+    } else {
+        (s[n / 2 - 1] + s[n / 2]) / 2
+    }
 }
 
 async fn build_ctx(
@@ -327,7 +338,7 @@ async fn build_ctx(
         .with_physical_optimizer_rule(Arc::new(InjectFilterMultiAggRule))
         .with_physical_optimizer_rule(Arc::new(InjectFilterSumRule))
         .with_physical_optimizer_rule(Arc::new(SwapSemiJoinBuildSideRule))
-        .with_physical_optimizer_rule(Arc::new(EnableRobinHoodSumF64Rule))
+        .with_physical_optimizer_rule(Arc::new(EnableRobinHoodSumF64Rule::default()))
         .with_physical_optimizer_rule(Arc::new(EnableRuntimeBloomSidebandRule {
             min_probe_to_build_ratio: 1024,
             allow_inner_join: true,
@@ -338,7 +349,10 @@ async fn build_ctx(
     let state = builder.build();
     let ctx = SessionContext::new_with_state(state);
     for t in TPCH_TABLES {
-        let path = data_dir.join(format!("{t}.parquet")).to_string_lossy().into_owned();
+        let path = data_dir
+            .join(format!("{t}.parquet"))
+            .to_string_lossy()
+            .into_owned();
         let prov = EmatixFastParquetTableProvider::try_new(path)?;
         ctx.register_table(*t, Arc::new(prov))?;
     }

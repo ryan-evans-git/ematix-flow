@@ -91,7 +91,9 @@ pub fn push_filter_into_agg(plan: LogicalPlan) -> DfResult<LogicalPlan> {
 
 /// Try the Q17-shape rewrite on a single Inner Join node.
 fn try_rewrite_q17_shape(plan: &LogicalPlan) -> Option<LogicalPlan> {
-    let LogicalPlan::Join(j) = plan else { return None };
+    let LogicalPlan::Join(j) = plan else {
+        return None;
+    };
     if j.join_type != JoinType::Inner {
         return None;
     }
@@ -121,19 +123,16 @@ fn try_rewrite_q17_shape(plan: &LogicalPlan) -> Option<LogicalPlan> {
     // un-aliased column (`lineitem.l_partkey`) from the agg's own
     // group_by — that's the column qualifier visible to the LeftSemi
     // we're about to splice INSIDE the SubqueryAlias wrapper.
-    let (filter_col, inner_agg_col) = j.on.iter().find_map(|(l, r)| {
-        match (l, r) {
-            (Expr::Column(lc), Expr::Column(rc)) => {
-                let (filter_c, agg_c) =
-                    if agg_on_right { (lc, rc) } else { (rc, lc) };
-                let inner = agg_info
-                    .group_by_cols
-                    .iter()
-                    .find(|gc| gc.name == agg_c.name)?;
-                Some((filter_c.clone(), inner.clone()))
-            }
-            _ => None,
+    let (filter_col, inner_agg_col) = j.on.iter().find_map(|(l, r)| match (l, r) {
+        (Expr::Column(lc), Expr::Column(rc)) => {
+            let (filter_c, agg_c) = if agg_on_right { (lc, rc) } else { (rc, lc) };
+            let inner = agg_info
+                .group_by_cols
+                .iter()
+                .find(|gc| gc.name == agg_c.name)?;
+            Some((filter_c.clone(), inner.clone()))
         }
+        _ => None,
     })?;
 
     // Find a clone-able filter subtree on the filter side that
@@ -178,13 +177,15 @@ fn try_rewrite_q17_shape(plan: &LogicalPlan) -> Option<LogicalPlan> {
         .join_on(
             new_right.as_ref().clone(),
             JoinType::Inner,
-            j.on.iter().map(|(l, r)| {
-                Expr::BinaryExpr(BinaryExpr {
-                    left: Box::new(l.clone()),
-                    op: Operator::Eq,
-                    right: Box::new(r.clone()),
+            j.on.iter()
+                .map(|(l, r)| {
+                    Expr::BinaryExpr(BinaryExpr {
+                        left: Box::new(l.clone()),
+                        op: Operator::Eq,
+                        right: Box::new(r.clone()),
+                    })
                 })
-            }).chain(j.filter.iter().cloned()),
+                .chain(j.filter.iter().cloned()),
         )
         .ok()?
         .build()
@@ -242,10 +243,7 @@ fn find_agg_branch(plan: &LogicalPlan) -> Option<AggBranchInfo> {
 /// filtered `TableScan` via `partial_filters`) on the filter side
 /// that produces `target_col` and is small enough to be worth
 /// cloning.
-fn find_filter_subtree_producing(
-    plan: &LogicalPlan,
-    target_col: &Column,
-) -> Option<LogicalPlan> {
+fn find_filter_subtree_producing(plan: &LogicalPlan, target_col: &Column) -> Option<LogicalPlan> {
     // Walk down looking for a Filter node whose Filter expression
     // references target_col's table (or any column from the same
     // TableScan that produces target_col).
@@ -274,12 +272,11 @@ fn find_filter_subtree_producing(
 
 fn scan_produces_column(plan: &LogicalPlan, col: &Column) -> bool {
     match plan {
-        LogicalPlan::TableScan(ts) => {
-            ts.projected_schema
-                .fields()
-                .iter()
-                .any(|f| f.name() == &col.name)
-        }
+        LogicalPlan::TableScan(ts) => ts
+            .projected_schema
+            .fields()
+            .iter()
+            .any(|f| f.name() == &col.name),
         LogicalPlan::Filter(f) => scan_produces_column(&f.input, col),
         LogicalPlan::Projection(p) => scan_produces_column(&p.input, col),
         LogicalPlan::SubqueryAlias(s) => scan_produces_column(&s.input, col),
@@ -415,8 +412,7 @@ mod tests {
 
     async fn register_tpch(ctx: &SessionContext, dir: &std::path::Path) -> DfResult<()> {
         for t in [
-            "region", "nation", "supplier", "customer", "part", "partsupp", "orders",
-            "lineitem",
+            "region", "nation", "supplier", "customer", "part", "partsupp", "orders", "lineitem",
         ] {
             let path = dir.join(format!("{t}.parquet"));
             if t == "lineitem" {
@@ -794,9 +790,7 @@ mod tests {
         let df = ctx.sql(&sql).await?;
         let optimized = df.into_optimized_plan()?;
         let rewritten = push_filter_into_agg(optimized.clone())?;
-        if format!("{}", optimized.display_indent())
-            != format!("{}", rewritten.display_indent())
-        {
+        if format!("{}", optimized.display_indent()) != format!("{}", rewritten.display_indent()) {
             let df_baseline = ctx.sql(&sql).await?;
             let base_rows: usize = df_baseline
                 .collect()
@@ -841,9 +835,7 @@ mod tests {
         let df = ctx.sql(&sql).await?;
         let optimized = df.into_optimized_plan()?;
         let rewritten = push_filter_into_agg(optimized.clone())?;
-        if format!("{}", optimized.display_indent())
-            != format!("{}", rewritten.display_indent())
-        {
+        if format!("{}", optimized.display_indent()) != format!("{}", rewritten.display_indent()) {
             let df_baseline = ctx.sql(&sql).await?;
             let base_rows: usize = df_baseline
                 .collect()

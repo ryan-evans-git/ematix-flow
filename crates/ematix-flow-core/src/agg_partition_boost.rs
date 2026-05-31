@@ -63,10 +63,10 @@
 
 use std::sync::Arc;
 
+use datafusion::common::DataFusionError;
 use datafusion::common::config::ConfigOptions;
 use datafusion::common::stats::Precision;
 use datafusion::common::tree_node::{Transformed, TreeNode};
-use datafusion::common::DataFusionError;
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode};
 use datafusion::physical_plan::repartition::RepartitionExec;
@@ -161,7 +161,7 @@ impl PhysicalOptimizerRule for AggPartitionBoostRule {
             // Estimate cardinality from the repartition's input (= agg's
             // input upstream). Use num_rows as upper bound on distinct
             // groups.
-            let estimated_groups = estimate_group_cardinality(&rep.input());
+            let estimated_groups = estimate_group_cardinality(rep.input());
             let session_cores = current_n.max(1);
             let optimal_n = compute_optimal_partitions(estimated_groups, session_cores);
 

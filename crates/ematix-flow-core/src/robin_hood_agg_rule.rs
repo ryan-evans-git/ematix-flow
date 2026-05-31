@@ -467,9 +467,7 @@ mod tests {
         let state = SessionStateBuilder::new()
             .with_default_features()
             .with_config(cfg)
-            .with_physical_optimizer_rule(Arc::new(EnableRobinHoodAggregateRule {
-                max_groups: 0,
-            }))
+            .with_physical_optimizer_rule(Arc::new(EnableRobinHoodAggregateRule { max_groups: 0 }))
             .build();
         let ctx = SessionContext::new_with_state(state);
         register_int64_t(&ctx);

@@ -330,7 +330,7 @@ fn rebuild_plan_tree(
     let new_children: Vec<Arc<dyn ExecutionPlan>> = template
         .children()
         .iter()
-        .map(|c| rebuild_plan_tree(*c))
+        .map(|c| rebuild_plan_tree(c))
         .collect::<Result<Vec<_>, _>>()?;
     template.clone().with_new_children(new_children)
 }

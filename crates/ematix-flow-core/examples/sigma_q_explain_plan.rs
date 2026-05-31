@@ -70,10 +70,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("\n=== Q{q:02} optimized LogicalPlan ===");
         println!("{}", optimized.display_indent());
     }
-    if std::env::var("EMAT_REORDER").is_ok()
-        || std::env::var("EMAT_AGG_SEMI").is_ok()
-        || std::env::var("EMAT_DIM_PUSH").is_ok()
-    {} // expand the conditional below
     let df = if std::env::var("EMAT_REORDER").is_ok()
         || std::env::var("EMAT_AGG_SEMI").is_ok()
         || std::env::var("EMAT_DIM_PUSH").is_ok()

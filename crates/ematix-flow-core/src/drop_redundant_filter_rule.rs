@@ -215,7 +215,9 @@ impl PhysicalOptimizerRule for DropRedundantBridgeFilterRule {
             // conjuncts.
             let new_pred = conjunction(leftover);
             let new_filter = FilterExec::try_new(new_pred, input.clone())?;
-            Ok(Transformed::yes(Arc::new(new_filter) as Arc<dyn ExecutionPlan>))
+            Ok(Transformed::yes(
+                Arc::new(new_filter) as Arc<dyn ExecutionPlan>
+            ))
         })?;
         Ok(transformed.data)
     }
@@ -291,11 +293,7 @@ fn flip_op(op: Operator) -> Option<Operator> {
 
 /// Does the `BridgeFilter` predicate cover `(op, literal)` on the
 /// matching column?
-fn predicate_matches(
-    p: &ColumnPredicate,
-    op: Operator,
-    literal: &ScalarValue,
-) -> bool {
+fn predicate_matches(p: &ColumnPredicate, op: Operator, literal: &ScalarValue) -> bool {
     match p {
         ColumnPredicate::I32Range { clauses, .. } => clauses.iter().any(|c| {
             c.op == op

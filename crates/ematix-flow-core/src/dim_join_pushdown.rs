@@ -121,7 +121,9 @@ pub fn push_dim_join_into_chain(plan: LogicalPlan) -> DfResult<LogicalPlan> {
 
 /// Try the dim-pushdown rewrite on a single Inner Join node.
 fn try_rewrite(plan: &LogicalPlan) -> Option<LogicalPlan> {
-    let LogicalPlan::Join(j) = plan else { return None };
+    let LogicalPlan::Join(j) = plan else {
+        return None;
+    };
     if j.join_type != JoinType::Inner {
         return None;
     }
@@ -253,10 +255,7 @@ fn try_rewrite(plan: &LogicalPlan) -> Option<LogicalPlan> {
 /// plan; pushing the outer dim through it forces a
 /// `CoalescePartitionsExec` between two CollectLeft layers, costing
 /// more than the original push saves (see `Σ.AD` module header).
-fn fact_side_has_competing_filtered_dim(
-    fact_side: &LogicalPlan,
-    target_table: &str,
-) -> bool {
+fn fact_side_has_competing_filtered_dim(fact_side: &LogicalPlan, target_table: &str) -> bool {
     let mut found_competing = false;
     let _ = fact_side.apply(|node| {
         if let LogicalPlan::Join(j) = node {
@@ -266,9 +265,7 @@ fn fact_side_has_competing_filtered_dim(
                         if let Some(name) = dim_subtree_leaf_table(side) {
                             if name != target_table {
                                 found_competing = true;
-                                return Ok(
-                                    datafusion::common::tree_node::TreeNodeRecursion::Stop,
-                                );
+                                return Ok(datafusion::common::tree_node::TreeNodeRecursion::Stop);
                             }
                         }
                     }
@@ -398,18 +395,30 @@ fn splice_dim_join_at_scan(
     // Recurse through nodes that preserve the target table's schema.
     match plan {
         LogicalPlan::Filter(f) => {
-            let new_input =
-                splice_dim_join_at_scan(&f.input, target_table, fact_col, dim_col, dim_subtree, dim_cols, found_count)?;
-            let new_filter = datafusion::logical_expr::Filter::try_new(
-                f.predicate.clone(),
-                Arc::new(new_input),
-            )
-            .ok()?;
+            let new_input = splice_dim_join_at_scan(
+                &f.input,
+                target_table,
+                fact_col,
+                dim_col,
+                dim_subtree,
+                dim_cols,
+                found_count,
+            )?;
+            let new_filter =
+                datafusion::logical_expr::Filter::try_new(f.predicate.clone(), Arc::new(new_input))
+                    .ok()?;
             Some(LogicalPlan::Filter(new_filter))
         }
         LogicalPlan::Projection(p) => {
-            let new_input =
-                splice_dim_join_at_scan(&p.input, target_table, fact_col, dim_col, dim_subtree, dim_cols, found_count)?;
+            let new_input = splice_dim_join_at_scan(
+                &p.input,
+                target_table,
+                fact_col,
+                dim_col,
+                dim_subtree,
+                dim_cols,
+                found_count,
+            )?;
             // Extend the projection expressions with any dim columns
             // not already present. Without this, intermediate
             // projections narrow the column set and the dim columns
@@ -434,8 +443,15 @@ fn splice_dim_join_at_scan(
             Some(new_proj)
         }
         LogicalPlan::SubqueryAlias(s) => {
-            let new_input =
-                splice_dim_join_at_scan(&s.input, target_table, fact_col, dim_col, dim_subtree, dim_cols, found_count)?;
+            let new_input = splice_dim_join_at_scan(
+                &s.input,
+                target_table,
+                fact_col,
+                dim_col,
+                dim_subtree,
+                dim_cols,
+                found_count,
+            )?;
             let new_sa = LogicalPlanBuilder::from(new_input)
                 .alias(s.alias.clone())
                 .ok()?
@@ -448,10 +464,8 @@ fn splice_dim_join_at_scan(
             // — the target table can't be in both sides of the same
             // join (would be a self-join, ambiguous case we already
             // catch via multi-match guard).
-            let left_has =
-                subtree_contains_table(&j.left, target_table);
-            let right_has =
-                subtree_contains_table(&j.right, target_table);
+            let left_has = subtree_contains_table(&j.left, target_table);
+            let right_has = subtree_contains_table(&j.right, target_table);
             if left_has && !right_has {
                 let new_left = splice_dim_join_at_scan(
                     &j.left,
@@ -467,13 +481,15 @@ fn splice_dim_join_at_scan(
                     .join_on(
                         j.right.as_ref().clone(),
                         JoinType::Inner,
-                        j.on.iter().map(|(l, r)| {
-                            Expr::BinaryExpr(BinaryExpr {
-                                left: Box::new(l.clone()),
-                                op: Operator::Eq,
-                                right: Box::new(r.clone()),
+                        j.on.iter()
+                            .map(|(l, r)| {
+                                Expr::BinaryExpr(BinaryExpr {
+                                    left: Box::new(l.clone()),
+                                    op: Operator::Eq,
+                                    right: Box::new(r.clone()),
+                                })
                             })
-                        }).chain(j.filter.iter().cloned()),
+                            .chain(j.filter.iter().cloned()),
                     )
                     .ok()?
                     .build()
@@ -492,13 +508,15 @@ fn splice_dim_join_at_scan(
                     .join_on(
                         new_right,
                         JoinType::Inner,
-                        j.on.iter().map(|(l, r)| {
-                            Expr::BinaryExpr(BinaryExpr {
-                                left: Box::new(l.clone()),
-                                op: Operator::Eq,
-                                right: Box::new(r.clone()),
+                        j.on.iter()
+                            .map(|(l, r)| {
+                                Expr::BinaryExpr(BinaryExpr {
+                                    left: Box::new(l.clone()),
+                                    op: Operator::Eq,
+                                    right: Box::new(r.clone()),
+                                })
                             })
-                        }).chain(j.filter.iter().cloned()),
+                            .chain(j.filter.iter().cloned()),
                     )
                     .ok()?
                     .build()
@@ -565,8 +583,7 @@ mod tests {
 
     async fn register_tpch(ctx: &SessionContext, dir: &std::path::Path) -> DfResult<()> {
         for t in [
-            "region", "nation", "supplier", "customer", "part", "partsupp", "orders",
-            "lineitem",
+            "region", "nation", "supplier", "customer", "part", "partsupp", "orders", "lineitem",
         ] {
             let path = dir.join(format!("{t}.parquet"));
             let prov = EmatixFastParquetTableProvider::try_new(path.to_string_lossy())?;

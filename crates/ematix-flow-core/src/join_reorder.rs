@@ -241,7 +241,10 @@ pub fn reorder_inner_joins_shape_gated(plan: LogicalPlan) -> DfResult<LogicalPla
 
 /// Σ.AH.X Lever G entry point: same as `reorder_inner_joins` but with
 /// caller-controlled shape gating via `opts`.
-pub fn reorder_inner_joins_with_opts(plan: LogicalPlan, opts: ReorderOpts) -> DfResult<LogicalPlan> {
+pub fn reorder_inner_joins_with_opts(
+    plan: LogicalPlan,
+    opts: ReorderOpts,
+) -> DfResult<LogicalPlan> {
     let transformed = plan.transform_down(|node| match node {
         // Σ.AL (2026-05-27): when the gate is set, skip descent into
         // LeftSemi / LeftAnti subtrees. The L9 bloom cascade inside a
@@ -342,7 +345,7 @@ pub fn reorder_inner_joins_with_opts(plan: LogicalPlan, opts: ReorderOpts) -> Df
 /// by 10-100× on real `%substring%` filters. Reordering chains that
 /// include LIKE-filtered leaves leads to bad cost-model decisions.
 fn chain_has_string_like_filter(chain: &InnerJoinChain) -> bool {
-    chain.leaves.iter().any(|leaf| leaf_has_like_filter(leaf))
+    chain.leaves.iter().any(leaf_has_like_filter)
 }
 
 fn leaf_has_like_filter(plan: &LogicalPlan) -> bool {
@@ -472,9 +475,7 @@ fn flatten_recurse(
         // SubqueryAlias is NOT transparent: it rewrites column
         // refs (`customer.c_custkey` → `c.c_custkey`). Treating it
         // as a leaf preserves aliased names for downstream consumers.
-        LogicalPlan::Projection(p) => {
-            flatten_recurse(&p.input, leaves, equi, extra_filters)
-        }
+        LogicalPlan::Projection(p) => flatten_recurse(&p.input, leaves, equi, extra_filters),
         _ => {
             leaves.push(plan.clone());
             Some(())
@@ -483,21 +484,19 @@ fn flatten_recurse(
 }
 
 fn and_all(exprs: Vec<Expr>) -> Option<Expr> {
-    exprs.into_iter().reduce(|acc, e| Expr::BinaryExpr(BinaryExpr {
-        left: Box::new(acc),
-        op: Operator::And,
-        right: Box::new(e),
-    }))
+    exprs.into_iter().reduce(|acc, e| {
+        Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(acc),
+            op: Operator::And,
+            right: Box::new(e),
+        })
+    })
 }
 
 /// Split `expr` on top-level `AND` and route each conjunct: a
 /// `col = col` clause goes into `equi`, anything else into
 /// `leftover`. Recursive on `AND` to flatten nested conjunctions.
-fn split_and_harvest_equi(
-    expr: Expr,
-    equi: &mut Vec<(Column, Column)>,
-    leftover: &mut Vec<Expr>,
-) {
+fn split_and_harvest_equi(expr: Expr, equi: &mut Vec<(Column, Column)>, leftover: &mut Vec<Expr>) {
     match expr {
         Expr::BinaryExpr(BinaryExpr {
             left,
@@ -599,16 +598,15 @@ fn scale_card(rows: u64, sel: f64) -> u64 {
 /// fractional value if we can. Uses the per-column min/max + null_count
 /// from `TableScan::source.statistics()`.
 fn predicate_selectivity(expr: &Expr, ts: &TableScan) -> f64 {
-    use datafusion::common::stats::Precision;
     use Operator as Op;
+    use datafusion::common::stats::Precision;
 
     let Some(stats) = table_provider_stats(ts) else {
         return 1.0;
     };
     let schema = ts.source.schema();
-    let col_idx = |c: &Column| -> Option<usize> {
-        schema.fields().iter().position(|f| f.name() == &c.name)
-    };
+    let col_idx =
+        |c: &Column| -> Option<usize> { schema.fields().iter().position(|f| f.name() == &c.name) };
 
     match expr {
         // col = lit  →  1/NDV. Σ.BR.1b (#186): prefer the column's
@@ -628,9 +626,7 @@ fn predicate_selectivity(expr: &Expr, ts: &TableScan) -> f64 {
                 Some(i) if i < stats.column_statistics.len() => {
                     let cs = &stats.column_statistics[i];
                     let ndv: Option<f64> = match cs.distinct_count {
-                        Precision::Exact(dc) | Precision::Inexact(dc) if dc > 0 => {
-                            Some(dc as f64)
-                        }
+                        Precision::Exact(dc) | Precision::Inexact(dc) if dc > 0 => Some(dc as f64),
                         _ => match (&cs.min_value, &cs.max_value) {
                             (
                                 Precision::Exact(ScalarValue::Int32(Some(lo)))
@@ -838,8 +834,8 @@ fn cost_of_fixed_order(
         } else {
             estimate_max_ndv_for_preds(&connecting, chain, &placed, i).max(1)
         };
-        let new_card = ((card as u128 * cards[i] as u128) / denom as u128)
-            .min(u128::from(u64::MAX)) as u64;
+        let new_card =
+            ((card as u128 * cards[i] as u128) / denom as u128).min(u128::from(u64::MAX)) as u64;
         card = new_card.max(1);
         cost = cost.saturating_add(card);
         placed.push(i);
@@ -851,11 +847,7 @@ fn cost_of_fixed_order(
 /// ascending-cardinality order. Each equi predicate is re-attached to
 /// the first join where both columns are in scope.
 fn rebuild_reordered(chain: &InnerJoinChain) -> Option<LogicalPlan> {
-    let cards: Vec<u64> = chain
-        .leaves
-        .iter()
-        .map(estimate_leaf_card)
-        .collect();
+    let cards: Vec<u64> = chain.leaves.iter().map(estimate_leaf_card).collect();
     let n = chain.leaves.len();
 
     // Σ.BR.2a: enrich the join graph with transitively-implied equi edges
@@ -867,7 +859,10 @@ fn rebuild_reordered(chain: &InnerJoinChain) -> Option<LogicalPlan> {
     // rebuild attaches each implied edge when both endpoints come into
     // scope (so all originals + derived land on real joins).
     let mut all_equi = chain.equi_preds.clone();
-    all_equi.extend(derive_transitive_equi_edges(&chain.equi_preds, &chain.leaves));
+    all_equi.extend(derive_transitive_equi_edges(
+        &chain.equi_preds,
+        &chain.leaves,
+    ));
 
     if std::env::var("EMAT_REORDER_DEBUG").is_ok() {
         eprintln!("[reorder] chain with {n} leaves");
@@ -875,7 +870,11 @@ fn rebuild_reordered(chain: &InnerJoinChain) -> Option<LogicalPlan> {
             eprintln!(
                 "  leaf[{i}] est_card={} schema_fields={:?}",
                 cards[i],
-                leaf.schema().fields().iter().map(|f| f.name()).collect::<Vec<_>>()
+                leaf.schema()
+                    .fields()
+                    .iter()
+                    .map(|f| f.name())
+                    .collect::<Vec<_>>()
             );
         }
     }
@@ -937,6 +936,7 @@ fn rebuild_reordered(chain: &InnerJoinChain) -> Option<LogicalPlan> {
         }
         let mut best: Option<DpState> = None;
         // Try every leaf `i` as the LAST one added.
+        #[allow(clippy::needless_range_loop)] // `i` is a subset bit position, not a pure index
         for i in 0..n {
             if subset & (1 << i) == 0 {
                 continue;
@@ -968,11 +968,9 @@ fn rebuild_reordered(chain: &InnerJoinChain) -> Option<LogicalPlan> {
             if connecting.is_empty() {
                 continue; // would be Cartesian
             }
-            let max_ndv =
-                estimate_max_ndv_for_preds(&connecting, chain, &prev_state.order, i);
+            let max_ndv = estimate_max_ndv_for_preds(&connecting, chain, &prev_state.order, i);
             let denom = max_ndv.max(1);
-            let new_card = ((prev_state.card as u128 * cards[i] as u128)
-                / denom as u128)
+            let new_card = ((prev_state.card as u128 * cards[i] as u128) / denom as u128)
                 .min(u128::from(u64::MAX)) as u64;
             let new_card = new_card.max(1);
             let new_cost = prev_state.cost.saturating_add(new_card);
@@ -1050,6 +1048,7 @@ fn rebuild_reordered(chain: &InnerJoinChain) -> Option<LogicalPlan> {
     // schemas at that step.
     let mut current = LogicalPlanBuilder::from(chain.leaves[order[0]].clone());
 
+    #[allow(clippy::needless_range_loop)] // `step` indexes the chosen `order` permutation
     for step in 1..n {
         let leaf_idx = order[step];
         let leaf = chain.leaves[leaf_idx].clone();
@@ -1075,16 +1074,8 @@ fn rebuild_reordered(chain: &InnerJoinChain) -> Option<LogicalPlan> {
         // predicates through `Join::filter`, which causes the
         // planner to fall back to NestedLoopJoinExec (O(N×M)).
         // Q05 SF=10 with the filter path regressed 35× vs baseline.
-        let (left_keys, right_keys): (Vec<Column>, Vec<Column>) = matching
-            .into_iter()
-            .map(|(l, r)| (l, r))
-            .unzip();
-        current = match current.join(
-            leaf,
-            JoinType::Inner,
-            (left_keys, right_keys),
-            None,
-        ) {
+        let (left_keys, right_keys): (Vec<Column>, Vec<Column>) = matching.into_iter().unzip();
+        current = match current.join(leaf, JoinType::Inner, (left_keys, right_keys), None) {
             Ok(b) => b,
             Err(e) => {
                 if std::env::var("EMAT_REORDER_DEBUG").is_ok() {
@@ -1117,14 +1108,17 @@ fn rebuild_reordered(chain: &InnerJoinChain) -> Option<LogicalPlan> {
     Some(built)
 }
 
+/// A pair of equi-join columns: `(left, right)`.
+type ColumnPair = (Column, Column);
+
 /// Among `preds`, return the ones whose left column is in `cur_schema`
 /// AND right column is in `leaf_schema` (or vice versa, after swap).
 /// Remaining predicates are returned for the next step.
 fn partition_predicates_in_scope(
-    preds: &[(Column, Column)],
+    preds: &[ColumnPair],
     cur_schema: &DFSchemaRef,
     leaf_schema: &DFSchemaRef,
-) -> (Vec<(Column, Column)>, Vec<(Column, Column)>) {
+) -> (Vec<ColumnPair>, Vec<ColumnPair>) {
     let mut matched = Vec::new();
     let mut leftover = Vec::new();
     for (l, r) in preds {
@@ -1327,14 +1321,7 @@ mod tests {
     async fn register_tpch(ctx: &SessionContext, dir: &std::path::Path) -> DfResult<()> {
         use std::sync::Arc;
         for t in [
-            "region",
-            "nation",
-            "supplier",
-            "customer",
-            "part",
-            "partsupp",
-            "orders",
-            "lineitem",
+            "region", "nation", "supplier", "customer", "part", "partsupp", "orders", "lineitem",
         ] {
             let path = dir.join(format!("{t}.parquet"));
             if t == "lineitem" {
@@ -1568,7 +1555,11 @@ mod tests {
         let ctx = SessionContext::new();
         register_tpch(&ctx, &dir).await?;
         let sql = std::fs::read_to_string(
-            dir.parent().unwrap().parent().unwrap().join("queries/q05.sql"),
+            dir.parent()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .join("queries/q05.sql"),
         )
         .ok();
         let Some(sql) = sql else {
@@ -1605,7 +1596,11 @@ mod tests {
         let ctx = SessionContext::new();
         register_tpch(&ctx, &dir).await?;
         let sql = std::fs::read_to_string(
-            dir.parent().unwrap().parent().unwrap().join("queries/q05.sql"),
+            dir.parent()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .join("queries/q05.sql"),
         )
         .ok();
         let Some(sql) = sql else {
@@ -1662,7 +1657,11 @@ mod tests {
         let ctx = SessionContext::new();
         register_tpch(&ctx, &dir).await?;
         let sql = std::fs::read_to_string(
-            dir.parent().unwrap().parent().unwrap().join("queries/q10.sql"),
+            dir.parent()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .join("queries/q10.sql"),
         )
         .ok();
         let Some(sql) = sql else {
@@ -1703,7 +1702,11 @@ mod tests {
         let ctx = SessionContext::new();
         register_tpch(&ctx, &dir).await?;
         let sql = std::fs::read_to_string(
-            dir.parent().unwrap().parent().unwrap().join("queries/q08.sql"),
+            dir.parent()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .join("queries/q08.sql"),
         )
         .ok();
         let Some(sql) = sql else {
@@ -1992,8 +1995,10 @@ mod tests {
         let original = df.into_optimized_plan()?;
 
         // With gate OFF: the reorder fires inside the LeftSemi subtree.
-        let mut opts_no_gate = ReorderOpts::default();
-        opts_no_gate.reject_under_left_semi_anti = false;
+        let opts_no_gate = ReorderOpts {
+            reject_under_left_semi_anti: false,
+            ..Default::default()
+        };
         let no_gate = reorder_inner_joins_with_opts(original.clone(), opts_no_gate)?;
         assert_ne!(
             format!("{}", original.display_indent()),

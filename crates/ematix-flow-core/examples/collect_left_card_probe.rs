@@ -47,9 +47,9 @@ use std::sync::Arc;
 use datafusion::common::JoinType;
 use datafusion::common::stats::Precision;
 use datafusion::execution::session_state::SessionStateBuilder;
-use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties};
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode};
+use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties};
 use datafusion::prelude::{SessionConfig, SessionContext};
 use ematix_flow_core::ematix_fast_parquet::EmatixFastParquetTableProvider;
 use ematix_flow_core::fast_parquet::FastParquetTableProvider;
@@ -131,7 +131,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "\n  [join {i}] {:?}  mode={:?}{}",
                 hj.join_type(),
                 mode,
-                if fired { "   <-- CollectLeft (our rule fired)" } else { "" },
+                if fired {
+                    "   <-- CollectLeft (our rule fired)"
+                } else {
+                    ""
+                },
             );
             describe_side(&ctx, "LEFT (build) ", hj.left()).await;
             describe_side(&ctx, "RIGHT (probe)", hj.right()).await;
@@ -166,11 +170,14 @@ async fn describe_side(ctx: &SessionContext, label: &str, side: &Arc<dyn Executi
     // above are usually enough; enable counting only to spot-check one
     // query (it re-plans per count to avoid the shared-node hazard).
     let do_count = std::env::var("EMAT_PROBE_COUNT").is_ok();
-    let want_count = do_count
-        && (semi || leaf.map(|n| n <= EXEC_FOOTPRINT_LIMIT).unwrap_or(false));
+    let want_count = do_count && (semi || leaf.map(|n| n <= EXEC_FOOTPRINT_LIMIT).unwrap_or(false));
     if want_count {
         let (n, capped) = count_rows(ctx, side.clone()).await;
-        println!("  ACTUAL_rows={}{}", n, if capped { "+ (capped)" } else { "" });
+        println!(
+            "  ACTUAL_rows={}{}",
+            n,
+            if capped { "+ (capped)" } else { "" }
+        );
     } else {
         println!();
     }
@@ -187,7 +194,11 @@ async fn verdict(_ctx: &SessionContext, hj: &HashJoinExec) {
     let lrows = lstat.as_ref().and_then(|s| s.num_rows.get_value().copied());
     let rrows = rstat.as_ref().and_then(|s| s.num_rows.get_value().copied());
     if let (Some(b), Some(p)) = (lrows, rrows) {
-        let ratio = if b == 0 { f64::INFINITY } else { p as f64 / b as f64 };
+        let ratio = if b == 0 {
+            f64::INFINITY
+        } else {
+            p as f64 / b as f64
+        };
         let read = if ratio >= 8.0 {
             "probe >> build  => broadcast WINS"
         } else if ratio <= 0.125 {

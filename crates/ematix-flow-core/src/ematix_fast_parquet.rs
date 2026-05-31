@@ -144,9 +144,7 @@ impl BridgeFilter {
                 | ColumnPredicate::I64Range { .. } => true,
                 // User-pushed Exact-declarable predicates: Exact only
                 // when the env-var gate is on.
-                ColumnPredicate::I32Range { .. } | ColumnPredicate::I32In { .. } => {
-                    exact_opt_in
-                }
+                ColumnPredicate::I32Range { .. } | ColumnPredicate::I32In { .. } => exact_opt_in,
                 // Strings stay Inexact under our string-gate;
                 // FilterExec retains them. F64 / column-pair never
                 // pushed. StringLike retained conservatively.
@@ -483,7 +481,7 @@ impl BridgeFilter {
                             let pc2 = pclone.clone();
                             let file = crate::ematix_parquet_bridge::open_cached(path)?;
                             filter_i32_column_to_bitmap_dense(
-                                &*file,
+                                &file,
                                 rg,
                                 *col_idx,
                                 move |v: i32| pc2.eval_i32(v),
@@ -535,8 +533,8 @@ impl BridgeFilter {
                         .map(|m| m.num_values as usize)
                         .unwrap_or(0);
                     let all_ones = vec![0xFFu8; total.div_ceil(8)];
-                    let left = masked_decode_i32(&*file, rg, *left_col, &all_ones)?;
-                    let right = masked_decode_i32(&*file, rg, *right_col, &all_ones)?;
+                    let left = masked_decode_i32(&file, rg, *left_col, &all_ones)?;
+                    let right = masked_decode_i32(&file, rg, *right_col, &all_ones)?;
                     if left.len() != right.len() || left.len() != total {
                         return Err(DataFusionError::External(
                             format!(
@@ -1701,14 +1699,13 @@ impl EmatixFastParquetTableProvider {
         if !skip_dict_distinct {
             use datafusion::common::stats::Precision;
             // ematix-parquet header-only walk (no Snappy decompress).
-            if let Ok(distinct_maxes) =
-                crate::emat_parquet_metadata::dict_distinct_max_per_column(
-                    &path,
-                    num_cols_in_schema,
-                )
-            {
+            if let Ok(distinct_maxes) = crate::emat_parquet_metadata::dict_distinct_max_per_column(
+                &path,
+                num_cols_in_schema,
+            ) {
                 let mut column_stats_vec: Vec<datafusion::common::stats::ColumnStatistics> =
                     (*column_stats).clone();
+                #[allow(clippy::needless_range_loop)] // col_idx also indexes distinct_maxes
                 for col_idx in 0..num_cols_in_schema {
                     if let Some(max_distinct) = distinct_maxes.get(col_idx).copied().flatten() {
                         if max_distinct > 0 {
@@ -2567,8 +2564,7 @@ impl ExecutionPlan for EmatixFastParquetExec {
         // by +17% / ~40 ms.
         let exact_opt_in = std::env::var_os("EMAT_EXACT_PUSHDOWN").is_some();
         let (rows, filtered) = if let Some(filter) = &self.filter {
-            let sel = filter
-                .estimate_dropped_filter_pass_rate(&self.column_stats, exact_opt_in);
+            let sel = filter.estimate_dropped_filter_pass_rate(&self.column_stats, exact_opt_in);
             if sel < 1.0 {
                 let r = ((raw_rows as f64) * sel) as usize;
                 (r.max(1), true)
@@ -2606,9 +2602,7 @@ impl ExecutionPlan for EmatixFastParquetExec {
 /// re-applies the predicate from the dropped `FilterExec` itself — so
 /// the scan's pre-filter is pure redundant (and slow, masked) work.
 /// See [[q06-masked-pushdown-waste]].
-pub fn strip_redundant_scan_filter(
-    plan: Arc<dyn ExecutionPlan>,
-) -> Arc<dyn ExecutionPlan> {
+pub fn strip_redundant_scan_filter(plan: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
     if let Some(scan) = plan.as_any().downcast_ref::<EmatixFastParquetExec>() {
         if scan.filter().is_some() && scan.runtime_sideband().is_none() {
             return scan.without_filter();
@@ -3234,27 +3228,27 @@ fn decode_one_rg_filtered_late_mat(
         let field = schema.field(out_idx);
         let arr: Arc<dyn arrow_array::Array> = match field.data_type() {
             DataType::Int32 => {
-                let vals = masked_decode_i32(&*file, rg, col_idx, &bitmap)?;
+                let vals = masked_decode_i32(&file, rg, col_idx, &bitmap)?;
                 check_len(vals.len(), matches, field.name(), "Int32")?;
                 Arc::new(arrow_array::Int32Array::from(vals))
             }
             DataType::Date32 => {
-                let vals = masked_decode_i32(&*file, rg, col_idx, &bitmap)?;
+                let vals = masked_decode_i32(&file, rg, col_idx, &bitmap)?;
                 check_len(vals.len(), matches, field.name(), "Date32")?;
                 Arc::new(arrow_array::Date32Array::from(vals))
             }
             DataType::Int64 => {
-                let vals = masked_decode_i64(&*file, rg, col_idx, &bitmap)?;
+                let vals = masked_decode_i64(&file, rg, col_idx, &bitmap)?;
                 check_len(vals.len(), matches, field.name(), "Int64")?;
                 Arc::new(arrow_array::Int64Array::from(vals))
             }
             DataType::Float64 => {
-                let vals = masked_decode_f64(&*file, rg, col_idx, &bitmap)?;
+                let vals = masked_decode_f64(&file, rg, col_idx, &bitmap)?;
                 check_len(vals.len(), matches, field.name(), "Float64")?;
                 Arc::new(arrow_array::Float64Array::from(vals))
             }
             DataType::Utf8 => {
-                let vals = masked_decode_byte_array(&*file, rg, col_idx, &bitmap)?;
+                let vals = masked_decode_byte_array(&file, rg, col_idx, &bitmap)?;
                 check_len(vals.len(), matches, field.name(), "Utf8")?;
                 let mut sb = arrow_array::builder::StringBuilder::with_capacity(
                     vals.len(),
@@ -3281,7 +3275,7 @@ fn decode_one_rg_filtered_late_mat(
                 // emission so it can be the integration target when
                 // pushdown is re-enabled on the streaming-default
                 // reader (which reports Utf8View in its schema).
-                let vals = masked_decode_byte_array(&*file, rg, col_idx, &bitmap)?;
+                let vals = masked_decode_byte_array(&file, rg, col_idx, &bitmap)?;
                 check_len(vals.len(), matches, field.name(), "Utf8View")?;
                 let total_bytes: usize = vals.iter().map(|v| v.len()).sum();
                 let mut sb = arrow_array::builder::StringViewBuilder::with_capacity(vals.len())
@@ -4151,8 +4145,8 @@ mod tests {
     /// guards the wire-up.
     #[tokio::test]
     async fn table_provider_statistics_exposes_typed_column_stats() {
-        use datafusion::common::stats::Precision;
         use datafusion::common::ScalarValue;
+        use datafusion::common::stats::Precision;
         use datafusion::parquet::basic::{Compression, Repetition, Type as PhysicalType};
         use datafusion::parquet::column::writer::ColumnWriter;
         use datafusion::parquet::file::properties::WriterProperties;
@@ -4253,6 +4247,7 @@ mod tests {
     /// Inexact(150)` (150 unique p_type values in TPC-H). Skipped if
     /// the SF=10 dataset isn't present (e.g. CI).
     #[tokio::test]
+    #[ignore = "dict-distinct walk is opt-in (default-skipped, EMAT_DICT_DISTINCT); see commit 22e1f6e — run with EMAT_DICT_DISTINCT=1"]
     async fn tpch_part_p_type_distinct_count_is_150() {
         use datafusion::common::stats::Precision;
         use std::path::PathBuf;
@@ -4288,6 +4283,7 @@ mod tests {
     /// values × 1000 rows. After construction, distinct_count should
     /// be `Inexact(5)` (dict pages will dedup the 5 entries).
     #[tokio::test]
+    #[ignore = "dict-distinct walk is opt-in (default-skipped, EMAT_DICT_DISTINCT); see commit 22e1f6e — run with EMAT_DICT_DISTINCT=1"]
     async fn dict_encoded_string_column_populates_distinct_count() {
         use datafusion::common::stats::Precision;
         use datafusion::parquet::basic::{Compression, Repetition, Type as PhysicalType};

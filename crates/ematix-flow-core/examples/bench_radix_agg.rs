@@ -8,6 +8,7 @@
 //! Q18 partial-agg cardinality (one of N scan partitions):
 //!   - SF=10:  ~4M distinct orderkeys / partial
 //!   - SF=100: ~38M distinct orderkeys / partial
+//!
 //! Keys are near-unique within a partition (lineitem is ~sorted by
 //! orderkey; each partial sees a contiguous range), so we model them as
 //! sequential-unique — the hash scatters them, exercising the random-
@@ -27,7 +28,10 @@ use ematix_flow_core::robin_hood_agg::{
 };
 
 fn env_usize(name: &str, default: usize) -> usize {
-    std::env::var(name).ok().and_then(|s| s.parse().ok()).unwrap_or(default)
+    std::env::var(name)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(default)
 }
 
 fn median(mut v: Vec<f64>) -> f64 {
@@ -57,7 +61,11 @@ fn run_radix_global(keys: &[i64], vals: &[f64], radix_bits: u8) -> (f64, usize) 
     let n = keys.len();
     let nb = 1usize << radix_bits;
     let per = (n / nb).max(1024);
-    let shift = if radix_bits == 0 { 0 } else { 64 - radix_bits as u32 };
+    let shift = if radix_bits == 0 {
+        0
+    } else {
+        64 - radix_bits as u32
+    };
     let t = Instant::now();
 
     // Pass 1: tag every row + histogram bin sizes.
@@ -98,7 +106,12 @@ fn run_radix_global(keys: &[i64], vals: &[f64], radix_bits: u8) -> (f64, usize) 
             continue;
         }
         let mut tbl = RobinHoodI64F64::with_capacity(per);
-        tbl.insert_or_sum_batch_vectorised_with_scratch(&pkeys[s..e], &pvals[s..e], &mut slots, &mut hit);
+        tbl.insert_or_sum_batch_vectorised_with_scratch(
+            &pkeys[s..e],
+            &pvals[s..e],
+            &mut slots,
+            &mut hit,
+        );
         groups += tbl.len();
     }
     (t.elapsed().as_secs_f64() * 1e3, groups)
@@ -114,7 +127,9 @@ fn main() {
     let keys: Vec<i64> = (0..n as i64).collect();
     let vals: Vec<f64> = (0..n).map(|i| ((i % 50) + 1) as f64).collect();
 
-    println!("== radix-agg microbench: N={n} distinct keys, BATCH={BATCH}, radix_bits={radix_bits}, trials={trials} ==");
+    println!(
+        "== radix-agg microbench: N={n} distinct keys, BATCH={BATCH}, radix_bits={radix_bits}, trials={trials} =="
+    );
 
     // --- single-table (current operator path) ---
     let run_single = || -> (f64, usize) {
@@ -125,7 +140,12 @@ fn main() {
         let mut o = 0;
         while o < n {
             let e = (o + BATCH).min(n);
-            agg.insert_or_sum_batch_vectorised_with_scratch(&keys[o..e], &vals[o..e], &mut slots, &mut hit);
+            agg.insert_or_sum_batch_vectorised_with_scratch(
+                &keys[o..e],
+                &vals[o..e],
+                &mut slots,
+                &mut hit,
+            );
             o = e;
         }
         (t.elapsed().as_secs_f64() * 1e3, agg.len())
@@ -194,11 +214,26 @@ fn main() {
     let (_, global_groups) = run_radix_global(&keys, &vals, radix_bits);
     let (_, stream_groups) = run_stream();
     let (_, spill_groups, spill_fired) = run_spill();
-    assert_eq!(single_groups, n, "single: expected {n} groups, got {single_groups}");
-    assert_eq!(radix_groups, n, "radix per-chunk: expected {n} groups, got {radix_groups}");
-    assert_eq!(global_groups, n, "radix global: expected {n} groups, got {global_groups}");
-    assert_eq!(stream_groups, n, "stream: expected {n} groups, got {stream_groups}");
-    assert_eq!(spill_groups, n, "spill: expected {n} groups, got {spill_groups}");
+    assert_eq!(
+        single_groups, n,
+        "single: expected {n} groups, got {single_groups}"
+    );
+    assert_eq!(
+        radix_groups, n,
+        "radix per-chunk: expected {n} groups, got {radix_groups}"
+    );
+    assert_eq!(
+        global_groups, n,
+        "radix global: expected {n} groups, got {global_groups}"
+    );
+    assert_eq!(
+        stream_groups, n,
+        "stream: expected {n} groups, got {stream_groups}"
+    );
+    assert_eq!(
+        spill_groups, n,
+        "spill: expected {n} groups, got {spill_groups}"
+    );
 
     let mut single_ms = Vec::new();
     let mut radix_ms = Vec::new();
@@ -218,7 +253,10 @@ fn main() {
     let st = median(stream_ms);
     let sp = median(spill_ms);
     let mrows = n as f64 / 1e6;
-    println!("  single-table                 : {s:8.1} ms  ({:6.1} M rows/s)", mrows / (s / 1e3));
+    println!(
+        "  single-table                 : {s:8.1} ms  ({:6.1} M rows/s)",
+        mrows / (s / 1e3)
+    );
     println!(
         "  radix per-chunk(b={radix_bits})         : {r:8.1} ms  ({:6.1} M rows/s)  {:.2}x vs single",
         mrows / (r / 1e3),
@@ -238,7 +276,11 @@ fn main() {
         "  radix SPILL  bounded(b={radix_bits},{mem_budget_mb}MB) : {sp:8.1} ms  ({:6.1} M rows/s)  {:.2}x vs single  [{}]",
         mrows / (sp / 1e3),
         s / sp,
-        if spill_fired { "spilled to disk" } else { "in-RAM, no spill" }
+        if spill_fired {
+            "spilled to disk"
+        } else {
+            "in-RAM, no spill"
+        }
     );
     println!("  groups: {single_groups} (all)");
 }

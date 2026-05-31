@@ -86,10 +86,7 @@ pub const MIN_TABLE_SCAN_ROWS_FOR_BOOST: usize = 10_000_000;
 /// - For TableScans whose source is `EmatixFastParquetTableProvider`
 ///   or `FastParquetTableProvider`, uses `num_rows()` exactly.
 /// - Fallback to a 1M default when stats are unavailable.
-pub fn recommend_target_partitions(
-    plan: &LogicalPlan,
-    session_cores: usize,
-) -> usize {
+pub fn recommend_target_partitions(plan: &LogicalPlan, session_cores: usize) -> usize {
     let max_card = walk_for_max_agg_input_cardinality(plan).unwrap_or(0);
     if max_card == 0 {
         return session_cores;
@@ -227,10 +224,7 @@ fn num_rows_for_table_scan(scan: &TableScan) -> Option<usize> {
     {
         return Some(emat.num_rows());
     }
-    if let Some(fp) = provider
-        .as_any()
-        .downcast_ref::<FastParquetTableProvider>()
-    {
+    if let Some(fp) = provider.as_any().downcast_ref::<FastParquetTableProvider>() {
         return Some(fp.num_rows());
     }
     None
@@ -294,8 +288,7 @@ pub const MIN_OBSERVATIONS_FOR_CONSULT: i64 = 1;
 pub fn aggregate_shape_hash(agg: &Aggregate) -> String {
     let mut h = DefaultHasher::new();
     "Aggregate".hash(&mut h);
-    let mut group_keys: Vec<String> =
-        agg.group_expr.iter().map(|e| e.to_string()).collect();
+    let mut group_keys: Vec<String> = agg.group_expr.iter().map(|e| e.to_string()).collect();
     group_keys.sort();
     for k in &group_keys {
         k.hash(&mut h);
@@ -506,10 +499,7 @@ pub fn recommend_target_partitions_with_log(
 /// race address the same shapes by identical keys. A query that
 /// `recommend_target_partitions_via_race` routes is exactly the
 /// query this can re-batch.
-pub fn recommend_batch_size_via_race(
-    plan: &LogicalPlan,
-    log: Option<&WorkloadLog>,
-) -> Option<u32> {
+pub fn recommend_batch_size_via_race(plan: &LogicalPlan, log: Option<&WorkloadLog>) -> Option<u32> {
     let log = log?;
     let shape_hash = qualifying_aggregate_shape_hash(plan)?;
     log.consult_batch_size_race(&shape_hash, MIN_OBSERVATIONS_FOR_CONSULT)
@@ -568,9 +558,7 @@ pub fn recommend_target_partitions_via_race(
 /// Final pipeline this equals the partial-aggregate row count
 /// (groups × source partitions), not the raw scan rows. Sufficient
 /// for the Phase 1.4 recommender, which only uses `output_groups`.
-pub fn largest_groupby_agg_cardinalities(
-    plan: &dyn ExecutionPlan,
-) -> Option<(u64, u64)> {
+pub fn largest_groupby_agg_cardinalities(plan: &dyn ExecutionPlan) -> Option<(u64, u64)> {
     let mut best = (0u64, 0u64);
     walk_agg_metrics(plan, &mut best);
     if best.1 > 0 { Some(best) } else { None }
@@ -637,9 +625,7 @@ pub fn record_observation_from_physical_plan(
     shape_hash: &str,
     log: &WorkloadLog,
 ) -> Result<bool, WorkloadLogError> {
-    let Some((input_rows, output_groups)) =
-        largest_groupby_agg_cardinalities(physical_plan)
-    else {
+    let Some((input_rows, output_groups)) = largest_groupby_agg_cardinalities(physical_plan) else {
         return Ok(false);
     };
     log.record_aggregate_observation(shape_hash, input_rows, output_groups)?;
@@ -705,8 +691,7 @@ mod tests {
         }
         let ctx = SessionContext::new();
         for t in [
-            "region", "nation", "supplier", "customer", "part", "partsupp", "orders",
-            "lineitem",
+            "region", "nation", "supplier", "customer", "part", "partsupp", "orders", "lineitem",
         ] {
             let path = dir.join(format!("{t}.parquet"));
             if t == "lineitem" {
@@ -728,7 +713,10 @@ mod tests {
         )?;
         let plan_q18 = ctx.sql(&q18).await?.into_optimized_plan()?;
         let n_q18 = recommend_target_partitions(&plan_q18, 14);
-        assert_eq!(n_q18, 112, "Q18 should clamp to ceiling 112 (60M ÷ 50K = 1200 clamped to 14×8)");
+        assert_eq!(
+            n_q18, 112,
+            "Q18 should clamp to ceiling 112 (60M ÷ 50K = 1200 clamped to 14×8)"
+        );
 
         // Q11 — partsupp aggregation with WHERE n_name='GERMANY' filter.
         // Phase 1.3 rejects via has_filter_in_subtree gate (avoiding
@@ -777,7 +765,10 @@ mod tests {
         let h18 = qualifying_aggregate_shape_hash(&plan_q18);
         assert!(h17.is_some(), "Q17 should have a qualifying aggregate");
         assert!(h18.is_some(), "Q18 should have a qualifying aggregate");
-        assert_ne!(h17, h18, "Q17 and Q18 inner aggregates must hash differently");
+        assert_ne!(
+            h17, h18,
+            "Q17 and Q18 inner aggregates must hash differently"
+        );
 
         // Σ.AΩ Phase 1.4 — distinct-large-table counter: Q18 has
         // ≥2 (orders + lineitem) → qualifies for plan boost when

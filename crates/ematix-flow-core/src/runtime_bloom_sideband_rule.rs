@@ -691,10 +691,7 @@ fn find_filter_predicate(
 /// `(raw_row_count, column_stats)` pair.
 fn find_emat_scan_stats(
     plan: &dyn ExecutionPlan,
-) -> Option<(
-    usize,
-    Vec<datafusion::common::stats::ColumnStatistics>,
-)> {
+) -> Option<(usize, Vec<datafusion::common::stats::ColumnStatistics>)> {
     if let Some(s) = plan.as_any().downcast_ref::<EmatixFastParquetExec>() {
         return Some((s.num_rows(), s.column_stats().to_vec()));
     }

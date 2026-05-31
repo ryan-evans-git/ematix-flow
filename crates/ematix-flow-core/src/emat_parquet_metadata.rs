@@ -41,14 +41,14 @@ use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::common::stats::Precision;
 use datafusion::common::{ColumnStatistics, ScalarValue};
 use ematix_parquet_format::compact::Cursor;
-use ematix_parquet_format::metadata::{read_page_header, ColumnChunk, FileMetaData, SchemaElement};
+use ematix_parquet_format::metadata::{ColumnChunk, FileMetaData, SchemaElement, read_page_header};
 use ematix_parquet_format::types::{ConvertedType, Encoding, ParquetType};
 use ematix_parquet_io::ParquetFile;
 
 /// All the metadata-derived fields `EmatixFastParquetTableProvider::try_new`
 /// needs, computed in one pass from the parsed thrift footer via
 /// ematix-parquet — replacing the parquet-rs `ArrowReaderMetadata::load`
-/// + `SerializedFileReader` path entirely (Σ.Q06.SF10.5.c). The schema
+/// and `SerializedFileReader` path entirely (Σ.Q06.SF10.5.c). The schema
 /// is the RAW Arrow schema (Utf8 for byte-array string columns); the
 /// caller applies the Σ.E5 Utf8→Utf8View promotion + type validation.
 pub struct EmatProviderMetadata {
@@ -153,7 +153,7 @@ fn scalar_from_le_bytes(ty: &DataType, b: &[u8]) -> Option<ScalarValue> {
 /// Σ.Q06.SF10.5.c — load every metadata-derived field
 /// `EmatixFastParquetTableProvider::try_new` needs in one pass, via
 /// ematix-parquet, replacing parquet-rs's `ArrowReaderMetadata::load`
-/// + `SerializedFileReader`. Returns the RAW schema (Utf8, not
+/// and `SerializedFileReader`. Returns the RAW schema (Utf8, not
 /// Utf8View-promoted) so the caller can apply its Σ.E5 promotion +
 /// type validation unchanged.
 ///
@@ -224,16 +224,18 @@ pub fn load_provider_metadata<P: AsRef<Path>>(
                     if let Some(b) = min_b {
                         if let Some(v) = scalar_from_le_bytes(&arrow_ty, b) {
                             match &min_sv[col_idx] {
-                                Some(curr) if !(v < *curr) => {}
-                                _ => min_sv[col_idx] = Some(v),
+                                Some(curr) if v < *curr => min_sv[col_idx] = Some(v),
+                                None => min_sv[col_idx] = Some(v),
+                                _ => {}
                             }
                         }
                     }
                     if let Some(b) = max_b {
                         if let Some(v) = scalar_from_le_bytes(&arrow_ty, b) {
                             match &max_sv[col_idx] {
-                                Some(curr) if !(v > *curr) => {}
-                                _ => max_sv[col_idx] = Some(v),
+                                Some(curr) if v > *curr => max_sv[col_idx] = Some(v),
+                                None => max_sv[col_idx] = Some(v),
+                                _ => {}
                             }
                         }
                     }
@@ -278,8 +280,14 @@ pub fn load_provider_metadata<P: AsRef<Path>>(
                 Some(n) => Precision::Exact(n.max(0) as usize),
                 None => Precision::Absent,
             },
-            max_value: max_sv[i].clone().map(Precision::Exact).unwrap_or(Precision::Absent),
-            min_value: min_sv[i].clone().map(Precision::Exact).unwrap_or(Precision::Absent),
+            max_value: max_sv[i]
+                .clone()
+                .map(Precision::Exact)
+                .unwrap_or(Precision::Absent),
+            min_value: min_sv[i]
+                .clone()
+                .map(Precision::Exact)
+                .unwrap_or(Precision::Absent),
             sum_value: Precision::Absent,
             distinct_count: Precision::Absent,
             byte_size: Precision::Absent,

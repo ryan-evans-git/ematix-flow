@@ -18,7 +18,9 @@ const TPCH_TABLES: &[&str] = &[
 ];
 
 const Q15_SQL: &str = include_str!("../../../examples/tpch/queries/q15.sql");
+#[allow(dead_code)] // reference SQL kept alongside Q15 for ad-hoc plan-cache checks
 const Q21_SQL: &str = include_str!("../../../examples/tpch/queries/q21.sql");
+#[allow(dead_code)] // reference SQL kept alongside Q15 for ad-hoc plan-cache checks
 const Q06_SQL: &str = include_str!("../../../examples/tpch/queries/q06.sql");
 
 #[tokio::main(flavor = "multi_thread")]
@@ -51,7 +53,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let total: usize = batches.iter().map(|b| b.num_rows()).sum();
         println!("Q15 baseline (no cache): {total} rows");
         if let Some(b) = batches.iter().find(|b| b.num_rows() > 0) {
-            let pretty = datafusion::arrow::util::pretty::pretty_format_batches(&[b.clone()])?;
+            let pretty =
+                datafusion::arrow::util::pretty::pretty_format_batches(std::slice::from_ref(b))?;
             println!("{pretty}");
         }
     }
@@ -79,7 +82,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let total: usize = batches.iter().map(|b| b.num_rows()).sum();
         println!("  rep {rep}: {total} rows");
         if let Some(b) = batches.iter().find(|b| b.num_rows() > 0) {
-            let pretty = datafusion::arrow::util::pretty::pretty_format_batches(&[b.clone()])?;
+            let pretty =
+                datafusion::arrow::util::pretty::pretty_format_batches(std::slice::from_ref(b))?;
             println!("{pretty}");
         }
     }
@@ -90,8 +94,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // reps 1-4 (i.e. stateful operators that aren't reset by
     // with_new_children).
     let dir_str = dir.to_string_lossy();
-    let workspace =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().and_then(|p| p.parent()).unwrap().to_path_buf();
+    let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|p| p.parent())
+        .unwrap()
+        .to_path_buf();
     let queries_dir = workspace.join("examples/tpch/queries");
     let mut broken: Vec<u8> = Vec::new();
     for q in 1u8..=22 {

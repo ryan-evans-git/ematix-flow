@@ -44,6 +44,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .collect();
 
     let mut pq_rs_max: Vec<Option<usize>> = vec![None; num_cols];
+    // Index loop: col_idx indexes reader column metadata, not just pq_rs_max.
+    #[allow(clippy::needless_range_loop)]
     for col_idx in 0..num_cols {
         // Bail if any RG lacks a dict for this column.
         let mut all_have_dict = true;
@@ -85,20 +87,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // ematix-parquet walk
-    let emat_max = ematix_flow_core::emat_parquet_metadata::dict_distinct_max_per_column(
-        &path_str, num_cols,
-    )?;
+    let emat_max =
+        ematix_flow_core::emat_parquet_metadata::dict_distinct_max_per_column(&path_str, num_cols)?;
 
-    println!("{:>4}  {:<22}  {:>12}  {:>12}  {}",
-        "col", "name", "parquet_rs", "ematix_emat", "verdict");
+    println!(
+        "{:>4}  {:<22}  {:>12}  {:>12}  verdict",
+        "col", "name", "parquet_rs", "ematix_emat"
+    );
     println!("{}", "-".repeat(74));
     let mut mismatches: usize = 0;
     let mut only_rs: usize = 0;
     let mut only_emat: usize = 0;
     let mut both_some_equal: usize = 0;
     let mut both_none: usize = 0;
+    // Index loop: i indexes leaf_names (via .get) and pq_rs_max in parallel.
+    #[allow(clippy::needless_range_loop)]
     for i in 0..num_cols {
-        let name = leaf_names.get(i).cloned().unwrap_or_else(|| format!("?{i}"));
+        let name = leaf_names
+            .get(i)
+            .cloned()
+            .unwrap_or_else(|| format!("?{i}"));
         let a = pq_rs_max[i];
         let b = emat_max.get(i).copied().flatten();
         let verdict = match (a, b) {

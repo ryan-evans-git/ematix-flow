@@ -61,6 +61,7 @@ async fn run_q07(
         min_probe_to_build_ratio: ratio,
         allow_inner_join: allow_inner,
         require_filtered_build: false,
+        max_expected_keys_per_partition: 0,
     }));
     let state = builder.build();
     let ctx = SessionContext::new_with_state(state);

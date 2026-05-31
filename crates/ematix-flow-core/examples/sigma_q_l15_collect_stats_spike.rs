@@ -49,7 +49,7 @@ async fn run_q07(collect_stats: bool) -> Result<(f64, f64, f64), Box<dyn std::er
         .with_physical_optimizer_rule(Arc::new(InjectFilterSumRule));
     builder = builder.with_optimizer_rule(Arc::new(PushDownLeftSemiRule));
     builder = builder.with_physical_optimizer_rule(Arc::new(SwapSemiJoinBuildSideRule));
-    builder = builder.with_physical_optimizer_rule(Arc::new(EnableRobinHoodSumF64Rule));
+    builder = builder.with_physical_optimizer_rule(Arc::new(EnableRobinHoodSumF64Rule::default()));
     builder =
         builder.with_physical_optimizer_rule(Arc::new(EnableRuntimeBloomSidebandRule::default()));
     let state = builder.build();

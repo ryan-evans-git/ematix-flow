@@ -1882,8 +1882,8 @@ mod tests {
     /// predicate selectivity drives the Q05 / Q08 join-reorder decisions.
     #[test]
     fn table_provider_statistics_exposes_typed_column_stats() {
-        use datafusion::common::stats::Precision;
         use datafusion::common::ScalarValue;
+        use datafusion::common::stats::Precision;
         use datafusion::parquet::basic::{Compression, Repetition, Type as PhysicalType};
         use datafusion::parquet::column::writer::ColumnWriter;
         use datafusion::parquet::file::properties::WriterProperties;
@@ -1930,8 +1930,14 @@ mod tests {
         assert_eq!(stats.column_statistics.len(), 1);
         let cs = &stats.column_statistics[0];
         assert_eq!(cs.null_count, Precision::Exact(0));
-        assert_eq!(cs.min_value, Precision::Exact(ScalarValue::Int32(Some(100))));
-        assert_eq!(cs.max_value, Precision::Exact(ScalarValue::Int32(Some(199))));
+        assert_eq!(
+            cs.min_value,
+            Precision::Exact(ScalarValue::Int32(Some(100)))
+        );
+        assert_eq!(
+            cs.max_value,
+            Precision::Exact(ScalarValue::Int32(Some(199)))
+        );
     }
 
     /// Σ.T Phase 1: aggregation across multiple row groups must compute
@@ -1939,8 +1945,8 @@ mod tests {
     /// has 58 RGs at SF=10; this miniature test guards the fold.
     #[test]
     fn column_stats_aggregate_across_row_groups() {
-        use datafusion::common::stats::Precision;
         use datafusion::common::ScalarValue;
+        use datafusion::common::stats::Precision;
         use datafusion::parquet::basic::{Compression, Repetition, Type as PhysicalType};
         use datafusion::parquet::column::writer::ColumnWriter;
         use datafusion::parquet::file::properties::WriterProperties;
@@ -1966,7 +1972,7 @@ mod tests {
         let props = Arc::new(
             WriterProperties::builder()
                 .set_compression(Compression::SNAPPY)
-                .set_max_row_group_size(50)
+                .set_max_row_group_row_count(Some(50))
                 .build(),
         );
         let file = File::create(&path).unwrap();

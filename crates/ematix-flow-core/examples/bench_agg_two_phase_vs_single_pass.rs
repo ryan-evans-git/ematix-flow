@@ -32,7 +32,10 @@ use std::time::Instant;
 use ematix_flow_core::robin_hood_agg::RobinHoodI64F64;
 
 fn env_usize(name: &str, default: usize) -> usize {
-    std::env::var(name).ok().and_then(|s| s.parse().ok()).unwrap_or(default)
+    std::env::var(name)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(default)
 }
 
 fn median(mut v: Vec<f64>) -> f64 {
@@ -117,7 +120,13 @@ fn two_phase(keys: &[i64], vals: &[f64], p: usize, distinct: usize) -> (f64, usi
 /// Single-pass radix shape (DuckDB): P parallel radix-scatters of RAW rows
 /// into B bins, a barrier, then a per-bin aggregate-once (each bin combined
 /// exactly once — no second hash pass).
-fn single_pass(keys: &[i64], vals: &[f64], p: usize, b_bins: usize, distinct: usize) -> (f64, usize) {
+fn single_pass(
+    keys: &[i64],
+    vals: &[f64],
+    p: usize,
+    b_bins: usize,
+    distinct: usize,
+) -> (f64, usize) {
     let n = keys.len();
     let chunk = n.div_ceil(p);
     let t0 = Instant::now();
@@ -235,9 +244,7 @@ fn main() {
     }
 
     let speedup = tp_ms / best_ms;
-    println!(
-        "\n  BEST single_pass: {best_ms:.1} ms (B={best_b}) = {speedup:.2}x vs two_phase"
-    );
+    println!("\n  BEST single_pass: {best_ms:.1} ms (B={best_b}) = {speedup:.2}x vs two_phase");
     println!(
         "  GATE (>=1.25x to build the operator): {}",
         if speedup >= 1.25 {

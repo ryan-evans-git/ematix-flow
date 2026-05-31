@@ -170,7 +170,10 @@ mod tests {
             let Ok(sql) = std::fs::read_to_string(&path) else {
                 continue;
             };
-            let df = ctx.sql(&sql).await.unwrap_or_else(|e| panic!("Q{q:02} sql: {e}"));
+            let df = ctx
+                .sql(&sql)
+                .await
+                .unwrap_or_else(|e| panic!("Q{q:02} sql: {e}"));
             let plan = df
                 .create_physical_plan()
                 .await

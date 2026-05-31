@@ -812,10 +812,7 @@ mod tests {
         // Q18-like: formula 112 wins by lots
         log.record_partition_race("q18_shape", 112, 14, 300.0, 360.0, 112)
             .unwrap();
-        let o = log
-            .consult_partition_race("q18_shape", 1)
-            .unwrap()
-            .unwrap();
+        let o = log.consult_partition_race("q18_shape", 1).unwrap().unwrap();
         assert_eq!(o.winner_partitions, 112);
         assert_eq!(o.formula_partitions, 112);
         assert_eq!(o.cores_partitions, 14);
@@ -831,14 +828,8 @@ mod tests {
             .unwrap();
         log.record_partition_race("q18_shape", 112, 14, 300.0, 360.0, 112)
             .unwrap();
-        let o17 = log
-            .consult_partition_race("q17_shape", 1)
-            .unwrap()
-            .unwrap();
-        let o18 = log
-            .consult_partition_race("q18_shape", 1)
-            .unwrap()
-            .unwrap();
+        let o17 = log.consult_partition_race("q17_shape", 1).unwrap().unwrap();
+        let o18 = log.consult_partition_race("q18_shape", 1).unwrap().unwrap();
         assert_eq!(o17.winner_partitions, 14);
         assert_eq!(o18.winner_partitions, 112);
     }

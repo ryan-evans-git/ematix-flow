@@ -3692,7 +3692,7 @@ checksum = "91622ff5e7162018101f2fea40d6ebf4a78bbe5a49736a2020649edf9693679e"
 
 [[package]]
 name = "ematix-flow-cli"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "arrow-array",
  "arrow-ipc",
@@ -3722,7 +3722,7 @@ dependencies = [
 
 [[package]]
 name = "ematix-flow-core"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "apache-avro",
  "arrow-array",
@@ -3793,7 +3793,7 @@ dependencies = [
 
 [[package]]
 name = "ematix-flow-distributed"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -3817,7 +3817,7 @@ dependencies = [
 
 [[package]]
 name = "ematix-flow-py"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "arrow",
  "arrow-array",

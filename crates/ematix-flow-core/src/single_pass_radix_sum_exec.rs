@@ -44,24 +44,24 @@ use std::sync::Arc;
 
 use datafusion::arrow::array::{Array, Float64Array, Int64Array, RecordBatch};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
-use datafusion::common::Result as DfResult;
-use datafusion::common::stats::Precision;
 use datafusion::common::DataFusionError;
+use datafusion::common::Result as DfResult;
+use datafusion::common::config::ConfigOptions;
+use datafusion::common::stats::Precision;
+use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::execution::TaskContext;
+use datafusion::execution::session_state::SessionStateBuilder;
+use datafusion::physical_expr::expressions::Column;
 use datafusion::physical_expr::{EquivalenceProperties, Partitioning};
+use datafusion::physical_optimizer::PhysicalOptimizerRule;
+use datafusion::physical_optimizer::enforce_distribution::EnforceDistribution;
+use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
     SendableRecordBatchStream,
 };
-use datafusion::common::config::ConfigOptions;
-use datafusion::common::tree_node::{Transformed, TreeNode};
-use datafusion::execution::session_state::SessionStateBuilder;
-use datafusion::physical_expr::expressions::Column;
-use datafusion::physical_optimizer::PhysicalOptimizerRule;
-use datafusion::physical_optimizer::enforce_distribution::EnforceDistribution;
-use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode};
 use futures_util::stream::{self, TryStreamExt};
 
 use crate::robin_hood_agg::{RobinHoodI64F64, RobinHoodSumF64GlobalRadixAgg};
@@ -352,11 +352,8 @@ impl ExecutionPlan for SinglePassRadixSumF64Exec {
                 let end = (off + OUTPUT_BATCH_ROWS).min(total);
                 let kb = Int64Array::from(all_keys[off..end].to_vec());
                 let vb = Float64Array::from(all_sums[off..end].to_vec());
-                let rb = RecordBatch::try_new(
-                    out_schema.clone(),
-                    vec![Arc::new(kb), Arc::new(vb)],
-                )
-                .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+                let rb = RecordBatch::try_new(out_schema.clone(), vec![Arc::new(kb), Arc::new(vb)])
+                    .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
                 batches.push(rb);
                 off = end;
             }
@@ -544,7 +541,10 @@ mod tests {
     fn batch(ks: Vec<i64>, vs: Vec<f64>) -> RecordBatch {
         RecordBatch::try_new(
             schema_kv(),
-            vec![Arc::new(Int64Array::from(ks)), Arc::new(Float64Array::from(vs))],
+            vec![
+                Arc::new(Int64Array::from(ks)),
+                Arc::new(Float64Array::from(vs)),
+            ],
         )
         .unwrap()
     }
@@ -607,7 +607,13 @@ mod tests {
         assert_eq!(a.len(), b.len(), "group count: {} vs {}", a.len(), b.len());
         for (x, y) in a.iter().zip(b.iter()) {
             assert_eq!(x.0, y.0, "key mismatch");
-            assert!((x.1 - y.1).abs() < 1e-6, "sum at {}: {} vs {}", x.0, x.1, y.1);
+            assert!(
+                (x.1 - y.1).abs() < 1e-6,
+                "sum at {}: {} vs {}",
+                x.0,
+                x.1,
+                y.1
+            );
         }
     }
 
@@ -648,7 +654,10 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn matches_stock_single_partition() {
-        let parts = vec![vec![batch(vec![7, 7, 7, 8, 9, 9], vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0])]];
+        let parts = vec![vec![batch(
+            vec![7, 7, 7, 8, 9, 9],
+            vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+        )]];
         let got = run_single_pass(parts.clone()).await;
         let want = run_stock(parts).await;
         assert_eq_pairs(&got, &want);
@@ -729,7 +738,10 @@ mod tests {
         let parts = vec![vec![batch(vec![1, 2, 3], vec![1.0, 2.0, 3.0])]];
         let ctx = ctx_with_rule(0);
         register_kv(&ctx, "t", parts);
-        let df = ctx.sql("SELECT k, COUNT(*) FROM t GROUP BY k").await.unwrap();
+        let df = ctx
+            .sql("SELECT k, COUNT(*) FROM t GROUP BY k")
+            .await
+            .unwrap();
         let plan = df.create_physical_plan().await.unwrap();
         let s = format!("{plan:?}");
         assert!(

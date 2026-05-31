@@ -127,7 +127,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut stmt = conn.prepare(&q06_sql)?;
             let mut rows = stmt.query([])?;
             let mut n = 0usize;
-            while let Some(_) = rows.next()? {
+            while rows.next()?.is_some() {
                 n += 1;
             }
             let ms = t.elapsed().as_secs_f64() * 1000.0;

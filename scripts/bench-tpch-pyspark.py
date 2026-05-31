@@ -69,13 +69,19 @@ def build_spark() -> SparkSession:
     # Spark 4.x supports JDK 17/21; we set the flag so JDK 23 (Homebrew's
     # `openjdk` cask) also works for local benching.
     java_opts = "-Djava.security.manager=allow"
+    # Driver memory + shuffle partitions are env-overridable so the same
+    # harness scales from SF=1 (4g / 8 parts) up to SF=100 (e.g. 16g / 64
+    # parts) where 600M-row shuffles need a bigger heap + finer partitions
+    # to spill cleanly. Defaults preserve the original SF=1/SF=10 config.
+    driver_mem = os.environ.get("SPARK_DRIVER_MEM", "4g")
+    shuffle_parts = os.environ.get("SPARK_SHUFFLE_PARTS", "8")
     return (
         SparkSession.builder.master("local[*]")
         .appName("ematix-flow-tpch-bench")
-        .config("spark.driver.memory", "4g")
+        .config("spark.driver.memory", driver_mem)
         .config("spark.driver.extraJavaOptions", java_opts)
         .config("spark.executor.extraJavaOptions", java_opts)
-        .config("spark.sql.shuffle.partitions", "8")
+        .config("spark.sql.shuffle.partitions", shuffle_parts)
         .config("spark.sql.adaptive.enabled", "true")
         .config("spark.ui.showConsoleProgress", "false")
         .config("spark.driver.bindAddress", "127.0.0.1")

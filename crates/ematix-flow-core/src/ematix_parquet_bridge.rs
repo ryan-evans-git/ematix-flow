@@ -164,10 +164,7 @@ pub fn open_cached(path: &Path) -> DfResult<Arc<ParquetFile>> {
     // count (this also warms the handle's memoized metadata, reused by
     // the decode that follows — no extra parse).
     let f = open_fresh()?;
-    let n_rg = f
-        .cached_metadata()
-        .map(|m| m.row_groups.len())
-        .unwrap_or(0);
+    let n_rg = f.cached_metadata().map(|m| m.row_groups.len()).unwrap_or(0);
     if n_rg <= parquet_file_cache_min_rg() {
         return Ok(f); // small file — never cached
     }
@@ -237,7 +234,9 @@ pub fn decode_column_chunk_byte_array(
     col: usize,
 ) -> DfResult<Arc<StringArray>> {
     let file = open_cached(path)?;
-    let md = file.cached_metadata().map_err(|e| ext(format!("metadata: {e}")))?;
+    let md = file
+        .cached_metadata()
+        .map_err(|e| ext(format!("metadata: {e}")))?;
     let cm = md.row_groups[rg].columns[col]
         .meta_data
         .as_ref()
@@ -366,7 +365,7 @@ pub fn decode_column_chunk_byte_array_dict_preserved(
     col: usize,
 ) -> DfResult<Arc<DictionaryArray<UInt32Type>>> {
     let file = open_cached(path)?;
-    let raw = read_column_byte_array_dict_preserved(&*file, rg, col).map_err(|e| {
+    let raw = read_column_byte_array_dict_preserved(&file, rg, col).map_err(|e| {
         ext(format!(
             "read_column_byte_array_dict_preserved (rg={rg}, col={col}): {e}"
         ))
@@ -417,7 +416,9 @@ fn decode_dict_chunk_generic<T: Copy>(
     decode_plain: impl Fn(&[u8]) -> DfResult<Vec<T>>,
 ) -> DfResult<Vec<T>> {
     let file = open_cached(path)?;
-    let md = file.cached_metadata().map_err(|e| ext(format!("metadata: {e}")))?;
+    let md = file
+        .cached_metadata()
+        .map_err(|e| ext(format!("metadata: {e}")))?;
     let cm = md.row_groups[rg].columns[col]
         .meta_data
         .as_ref()
@@ -528,7 +529,9 @@ pub fn filter_i32_column_to_bitmap(
     predicate: impl Fn(i32) -> bool,
 ) -> DfResult<(Vec<u8>, usize)> {
     let file = open_cached(path)?;
-    let md = file.cached_metadata().map_err(|e| ext(format!("metadata: {e}")))?;
+    let md = file
+        .cached_metadata()
+        .map_err(|e| ext(format!("metadata: {e}")))?;
     let cm = md.row_groups[rg].columns[col]
         .meta_data
         .as_ref()
@@ -635,7 +638,9 @@ fn gather_chunk_typed<T: Copy>(
     decode_plain_page: impl Fn(&[u8]) -> DfResult<Vec<T>>,
 ) -> DfResult<Vec<T>> {
     let file = open_cached(path)?;
-    let md = file.cached_metadata().map_err(|e| ext(format!("metadata: {e}")))?;
+    let md = file
+        .cached_metadata()
+        .map_err(|e| ext(format!("metadata: {e}")))?;
     let cm = md.row_groups[rg].columns[col]
         .meta_data
         .as_ref()
@@ -842,7 +847,7 @@ pub fn filter_byte_array_to_bitmap(
     let mut dict_offsets: Vec<u32> = Vec::new();
     let mut indices: Vec<u32> = Vec::new();
     read_column_byte_array_dict_preserved_into(
-        &*file,
+        &file,
         rg,
         col,
         &mut dict_bytes,
@@ -894,7 +899,9 @@ pub fn filter_f64_column_to_bitmap(
     predicate: impl Fn(f64) -> bool,
 ) -> DfResult<(Vec<u8>, usize)> {
     let file = open_cached(path)?;
-    let md = file.cached_metadata().map_err(|e| ext(format!("metadata: {e}")))?;
+    let md = file
+        .cached_metadata()
+        .map_err(|e| ext(format!("metadata: {e}")))?;
     let cm = md.row_groups[rg].columns[col]
         .meta_data
         .as_ref()
@@ -1008,14 +1015,16 @@ pub fn filter_f64_column_to_bitmap_dense_with_values(
     predicate: impl Fn(f64) -> bool,
 ) -> DfResult<(Vec<u8>, usize, Vec<f64>)> {
     let file = open_cached(path)?;
-    let md = file.cached_metadata().map_err(|e| ext(format!("metadata: {e}")))?;
+    let md = file
+        .cached_metadata()
+        .map_err(|e| ext(format!("metadata: {e}")))?;
     let cm = md.row_groups[rg].columns[col]
         .meta_data
         .as_ref()
         .ok_or_else(|| ext("column missing meta_data"))?;
     let total = cm.num_values as usize;
     let all_ones = vec![0xFFu8; total.div_ceil(8)];
-    let values = masked_decode_f64(&*file, rg, col, &all_ones)?;
+    let values = masked_decode_f64(&file, rg, col, &all_ones)?;
     let mut bitmap = vec![0u8; total.div_ceil(8)];
     for (row, &v) in values.iter().enumerate() {
         if predicate(v) {
@@ -1036,14 +1045,16 @@ pub fn filter_byte_array_to_bitmap_dense(
     predicate: impl Fn(&[u8]) -> bool,
 ) -> DfResult<(Vec<u8>, usize)> {
     let file = open_cached(path)?;
-    let md = file.cached_metadata().map_err(|e| ext(format!("metadata: {e}")))?;
+    let md = file
+        .cached_metadata()
+        .map_err(|e| ext(format!("metadata: {e}")))?;
     let cm = md.row_groups[rg].columns[col]
         .meta_data
         .as_ref()
         .ok_or_else(|| ext("column missing meta_data"))?;
     let total = cm.num_values as usize;
     let all_ones = vec![0xFFu8; total.div_ceil(8)];
-    let values = masked_decode_byte_array(&*file, rg, col, &all_ones)?;
+    let values = masked_decode_byte_array(&file, rg, col, &all_ones)?;
     if values.len() != total {
         return Err(ext(format!(
             "byte_array dense filter: decoded {} rows, expected {total}",
@@ -1069,7 +1080,9 @@ pub fn rg_i64_min_max(
     col: usize,
 ) -> DfResult<Option<(i64, i64)>> {
     let file = open_cached(path)?;
-    let md = file.cached_metadata().map_err(|e| ext(format!("metadata: {e}")))?;
+    let md = file
+        .cached_metadata()
+        .map_err(|e| ext(format!("metadata: {e}")))?;
     let cm = md.row_groups[rg].columns[col]
         .meta_data
         .as_ref()
@@ -1096,7 +1109,9 @@ pub fn rg_i64_min_max(
 /// short-circuited by an `I64Range` predicate.
 pub fn rg_num_values(path: &std::path::Path, rg: usize, col: usize) -> DfResult<usize> {
     let file = open_cached(path)?;
-    let md = file.cached_metadata().map_err(|e| ext(format!("metadata: {e}")))?;
+    let md = file
+        .cached_metadata()
+        .map_err(|e| ext(format!("metadata: {e}")))?;
     let cm = md.row_groups[rg].columns[col]
         .meta_data
         .as_ref()
@@ -1116,14 +1131,16 @@ pub fn filter_i64_column_to_bitmap_dense(
     predicate: impl Fn(i64) -> bool,
 ) -> DfResult<(Vec<u8>, usize)> {
     let file = open_cached(path)?;
-    let md = file.cached_metadata().map_err(|e| ext(format!("metadata: {e}")))?;
+    let md = file
+        .cached_metadata()
+        .map_err(|e| ext(format!("metadata: {e}")))?;
     let cm = md.row_groups[rg].columns[col]
         .meta_data
         .as_ref()
         .ok_or_else(|| ext("column missing meta_data"))?;
     let total = cm.num_values as usize;
     let all_ones = vec![0xFFu8; total.div_ceil(8)];
-    let values = masked_decode_i64(&*file, rg, col, &all_ones)?;
+    let values = masked_decode_i64(&file, rg, col, &all_ones)?;
     let mut bitmap = vec![0u8; total.div_ceil(8)];
     for (row, &v) in values.iter().enumerate() {
         if predicate(v) {
@@ -1146,7 +1163,9 @@ pub fn filter_i32_column_to_bitmap_dense(
 ) -> DfResult<(Vec<u8>, usize)> {
     // Decode the whole column via the existing masked-decode kernel
     // with an all-ones mask. Then apply the predicate.
-    let md = file.cached_metadata().map_err(|e| ext(format!("metadata: {e}")))?;
+    let md = file
+        .cached_metadata()
+        .map_err(|e| ext(format!("metadata: {e}")))?;
     let cm = md.row_groups[rg].columns[col]
         .meta_data
         .as_ref()

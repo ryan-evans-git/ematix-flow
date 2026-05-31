@@ -1,0 +1,73 @@
+=== TPC-H 22 triangulation bench ===
+    data:    examples/tpch/data/sf10
+    queries: 22 ([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22])
+    trials:  10 (after 3 warmups)
+    output:  bench-results/refresh-2026-05-30/ematix-sf10.md
+
+--- Q01 ---
+  ematix-flow   248.24 ms ±  7.33  (4 rows)
+
+--- Q02 ---
+  ematix-flow    32.58 ms ±  0.37  (4667 rows)
+
+--- Q03 ---
+  ematix-flow   162.00 ms ± 10.63  (114003 rows)
+
+--- Q04 ---
+  ematix-flow    62.09 ms ±  2.91  (5 rows)
+
+--- Q05 ---
+  ematix-flow   216.74 ms ±  3.93  (5 rows)
+
+--- Q06 ---
+  ematix-flow    38.39 ms ±  7.36  (1 rows)
+
+--- Q07 ---
+  ematix-flow   180.93 ms ± 16.71  (4 rows)
+
+--- Q08 ---
+  ematix-flow   207.66 ms ±  7.30  (2 rows)
+
+--- Q09 ---
+  ematix-flow   312.92 ms ±  9.48  (175 rows)
+
+--- Q10 ---
+  ematix-flow   224.72 ms ±  6.64  (381105 rows)
+
+--- Q11 ---
+  ematix-flow    12.76 ms ±  1.71  (0 rows)
+
+--- Q12 ---
+  ematix-flow    99.30 ms ±  4.02  (2 rows)
+
+--- Q13 ---
+  ematix-flow   110.75 ms ± 15.17  (46 rows)
+
+--- Q14 ---
+  ematix-flow    88.31 ms ±  4.23  (1 rows)
+
+--- Q15 ---
+  ematix-flow    82.99 ms ±  6.09  (1 rows)
+
+--- Q16 ---
+  ematix-flow    56.35 ms ±  1.81  (27840 rows)
+
+--- Q17 ---
+  ematix-flow   142.10 ms ±  9.10  (1 rows)
+
+--- Q18 ---
+  ematix-flow   257.85 ms ±  6.84  (624 rows)
+
+--- Q19 ---
+  ematix-flow   140.72 ms ±  6.47  (1 rows)
+
+--- Q20 ---
+  ematix-flow   138.53 ms ±  6.02  (1804 rows)
+
+--- Q21 ---
+  ematix-flow   291.91 ms ±  5.08  (4009 rows)
+
+--- Q22 ---
+  ematix-flow    25.48 ms ±  1.25  (7 rows)
+
+wrote bench-results/refresh-2026-05-30/ematix-sf10.md

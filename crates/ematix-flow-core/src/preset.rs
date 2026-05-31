@@ -206,12 +206,14 @@ pub fn with_optimizer_rules_and_registry(
     // self-gated inside FlowQueryPlanner (EMAT_AGG_SEMI / EMAT_DIM_PUSH /
     // EMAT_REORDER_QP, all default ON, opt-OUT). Installed unless all three
     // are disabled.
-    let flow_qp_on = ["EMAT_AGG_SEMI", "EMAT_DIM_PUSH", "EMAT_REORDER_QP"].iter().any(|var| {
-        std::env::var(var)
-            .ok()
-            .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
-            .unwrap_or(true)
-    });
+    let flow_qp_on = ["EMAT_AGG_SEMI", "EMAT_DIM_PUSH", "EMAT_REORDER_QP"]
+        .iter()
+        .any(|var| {
+            std::env::var(var)
+                .ok()
+                .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+                .unwrap_or(true)
+        });
     let builder = if flow_qp_on {
         builder.with_query_planner(Arc::new(crate::flow_query_planner::FlowQueryPlanner))
     } else {

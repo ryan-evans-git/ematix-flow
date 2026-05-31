@@ -73,9 +73,7 @@ use crate::fk_chain::{fk_chain_stem, share_fk_chain};
 /// that bypasses the cascading rule's self-sibling-same-path guard
 /// and is unsafe for queries where multiple same-path scans serve
 /// semantically different join contexts (Q21-shape).
-pub fn install_broadcast_sibling_blooms_rule(
-    builder: SessionStateBuilder,
-) -> SessionStateBuilder {
+pub fn install_broadcast_sibling_blooms_rule(builder: SessionStateBuilder) -> SessionStateBuilder {
     builder.with_physical_optimizer_rule(Arc::new(BroadcastSiblingBloomsRule))
 }
 
@@ -193,16 +191,13 @@ fn collect_emitter_infos(plan: &Arc<dyn ExecutionPlan>, out: &mut Vec<EmitterInf
 /// scan lives, the column name (looked up from the scan's file schema),
 /// and the path.
 struct ResolvedEmitter {
-    emitter_idx: usize,         // index into emitter_infos
+    emitter_idx: usize, // index into emitter_infos
     primary_path: String,
     primary_col_name: String,
     primary_scan_arc: Arc<dyn ExecutionPlan>,
 }
 
-fn resolve_primary(
-    plan: &Arc<dyn ExecutionPlan>,
-    info: &EmitterInfo,
-) -> Option<ResolvedEmitter> {
+fn resolve_primary(plan: &Arc<dyn ExecutionPlan>, info: &EmitterInfo) -> Option<ResolvedEmitter> {
     let primary = find_scan_with_sideband(plan, &info.primary_sideband)?;
     let scan = primary.as_any().downcast_ref::<EmatixFastParquetExec>()?;
     // target_col_idx is a FILE-schema index (Σ.Q.L14). Look up the
@@ -284,10 +279,7 @@ fn collect_sibling_candidates(
         // Must NOT already have a sideband (avoid double-attach).
         if scan.runtime_sideband().is_some() {
             if trace {
-                eprintln!(
-                    "[broadcast] skip {} — already has sideband",
-                    scan.path()
-                );
+                eprintln!("[broadcast] skip {} — already has sideband", scan.path());
             }
             return;
         }
@@ -296,9 +288,7 @@ fn collect_sibling_candidates(
         let file_schema = scan.file_schema();
         let mut match_idx: Option<usize> = None;
         for (i, field) in file_schema.fields().iter().enumerate() {
-            if share_fk_chain(field.name(), &r.primary_col_name)
-                && scan.projection().contains(&i)
-            {
+            if share_fk_chain(field.name(), &r.primary_col_name) && scan.projection().contains(&i) {
                 match_idx = Some(i);
                 break;
             }
@@ -334,9 +324,7 @@ fn rewrite_plan_with_broadcasts(
         for em in all {
             for att in &em.attachments {
                 if Arc::ptr_eq(&node, &att.scan_arc) {
-                    if let Some(scan) =
-                        node.as_any().downcast_ref::<EmatixFastParquetExec>()
-                    {
+                    if let Some(scan) = node.as_any().downcast_ref::<EmatixFastParquetExec>() {
                         let new = scan.with_runtime_sideband(att.new_sideband.clone());
                         return Ok(Transformed::yes(new as Arc<dyn ExecutionPlan>));
                     }
@@ -346,9 +334,7 @@ fn rewrite_plan_with_broadcasts(
         // Replace each emitter with one having extended extras.
         for em in all {
             if Arc::ptr_eq(&node, &em.emitter_arc) {
-                if let Some(emitter) =
-                    node.as_any().downcast_ref::<BuildSideBloomEmitterExec>()
-                {
+                if let Some(emitter) = node.as_any().downcast_ref::<BuildSideBloomEmitterExec>() {
                     let mut new_extras: Vec<(usize, BridgeFilterSideband)> =
                         emitter.extra_targets().to_vec();
                     for att in &em.attachments {
@@ -363,7 +349,7 @@ fn rewrite_plan_with_broadcasts(
                         emitter.expected_total_keys(),
                     )?;
                     return Ok(Transformed::yes(
-                        Arc::new(new_emitter) as Arc<dyn ExecutionPlan>,
+                        Arc::new(new_emitter) as Arc<dyn ExecutionPlan>
                     ));
                 }
             }

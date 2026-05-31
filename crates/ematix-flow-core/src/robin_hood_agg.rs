@@ -1471,7 +1471,8 @@ impl SpillStore {
     }
 
     fn path_for(&self, bin: usize) -> std::path::PathBuf {
-        self.dir.join(format!("ematix-radix-spill-{}-{}.bin", self.id, bin))
+        self.dir
+            .join(format!("ematix-radix-spill-{}-{}.bin", self.id, bin))
     }
 
     /// Append a bin's buffered rows to its spill file (create on first use).
@@ -1656,7 +1657,10 @@ impl RobinHoodSumF64GlobalRadixAgg {
         mem_budget_bytes: usize,
         spill: Option<SpillStore>,
     ) -> Self {
-        assert!(radix_bits <= 12, "radix_bits must be ≤ 12; got {radix_bits}");
+        assert!(
+            radix_bits <= 12,
+            "radix_bits must be ≤ 12; got {radix_bits}"
+        );
         let nb = 1usize << radix_bits;
         let mut tables = Vec::with_capacity(nb);
         for _ in 0..nb {
@@ -1695,7 +1699,9 @@ impl RobinHoodSumF64GlobalRadixAgg {
 
     /// Total rows written to disk across all bins (0 if not spilling).
     pub fn total_spilled_rows(&self) -> usize {
-        self.spill.as_ref().map_or(0, |s| s.spilled_rows.iter().sum())
+        self.spill
+            .as_ref()
+            .map_or(0, |s| s.spilled_rows.iter().sum())
     }
 
     /// REV.8 — consume the aggregator and return its per-bin micro-tables
@@ -1735,6 +1741,7 @@ impl RobinHoodSumF64GlobalRadixAgg {
             }
             // Pass 1: tag each key + histogram (one hash/key, reused below).
             let mut counts = [0u32; 4096];
+            #[allow(clippy::needless_range_loop)] // `i` indexes keys + tag_scratch in lockstep
             for i in 0..m {
                 let b = (radix_part_hash(keys[i]) >> shift) as usize;
                 self.tag_scratch[i] = b as u16;
@@ -1742,6 +1749,7 @@ impl RobinHoodSumF64GlobalRadixAgg {
             }
             // Reserve each touched bin once so the scatter-append below is a
             // pure write (no realloc churn mid-loop).
+            #[allow(clippy::needless_range_loop)] // `b` indexes counts + bin_keys + bin_vals
             for b in 0..nb {
                 let c = counts[b] as usize;
                 if c > 0 {
@@ -3736,7 +3744,13 @@ mod tests {
     }
 
     fn assert_pairs_eq(s: &[(i64, f64)], r: &[(i64, f64)]) {
-        assert_eq!(s.len(), r.len(), "group count differs: single={} global={}", s.len(), r.len());
+        assert_eq!(
+            s.len(),
+            r.len(),
+            "group count differs: single={} global={}",
+            s.len(),
+            r.len()
+        );
         for (a, b) in s.iter().zip(r.iter()) {
             assert_eq!(a.0, b.0, "key mismatch");
             assert!(
@@ -3830,8 +3844,11 @@ mod tests {
     /// parallel tests never collide.
     fn fresh_spill_dir() -> std::path::PathBuf {
         let n = SPILL_TEST_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let d = std::env::temp_dir()
-            .join(format!("ematix-radix-spill-test-{}-{}", std::process::id(), n));
+        let d = std::env::temp_dir().join(format!(
+            "ematix-radix-spill-test-{}-{}",
+            std::process::id(),
+            n
+        ));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
@@ -3872,7 +3889,10 @@ mod tests {
         let mut r: Vec<(i64, f64)> = g.iter().collect();
         r.sort_by_key(|(k, _)| *k);
         let leftover = std::fs::read_dir(&dir).map(|rd| rd.count()).unwrap_or(0);
-        assert_eq!(leftover, 0, "spill files not cleaned up after finish ({leftover} left)");
+        assert_eq!(
+            leftover, 0,
+            "spill files not cleaned up after finish ({leftover} left)"
+        );
         drop(g);
         let _ = std::fs::remove_dir_all(&dir);
         (s, r, spilled)

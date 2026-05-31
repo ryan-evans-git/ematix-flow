@@ -9,68 +9,133 @@ Plan: [`docs/PHASE_SIGMA_PLAN.md`](PHASE_SIGMA_PLAN.md).
 
 ---
 
-## TL;DR — release-refresh, M3 Pro (2026-05-27, post-Σ.AJ.1 Lever C + Σ.AK)
+## TL;DR — release refresh v0.9.0, M3 Pro (2026-05-31)
 
-**SF=1 (3-engine, 20 trials × 3 warmups, bare invocation):**
+Five engines, all 22 TPC-H queries, three scale factors, the same machine
+and the same Parquet files. **ematix-flow and DuckDB are co-measured in a
+single process** (10 timed trials after 3 warmups, medians) so thermal
+drift applies equally to the head-to-head that matters. Polars runs the
+same in-process harness; PySpark is `local[*]` on the JVM; Postgres 14 is
+`EXPLAIN ANALYZE` Execution Time (B-tree indexed + `ANALYZE`d). The
+fastest engine per query is **bold**. All 22 row counts + sums match
+DuckDB at every scale.
 
-| Engine  | Geomean ematix-flow speedup | Range          | Wins  |
-|---|---:|---|---:|
-| **ematix-flow** (single-node) | — | — | **20 / 22** |
-| DuckDB                        | ~2.4× | 0.98× – 17.6× | 0 |
-| Polars                        | ~2.6× | 0.75× – 515× | 2 (Q06, Q15) |
+### SF=1 — ~1 GB · fits in cache
 
-**SF=10 (production scale, ~10 GB; ematix + DuckDB, Polars skipped):**
+- **Wins (fastest median per query):** ematix-flow **22 / 22**, DuckDB 0, Polars 0, PySpark 0, Postgres 0.
+- **Geomean ematix-flow speedup:** 2.67× vs DuckDB · 4.90× vs Polars · 20.46× vs PySpark · 18.81× vs Postgres.
 
-| Engine  | Geomean ematix-flow speedup | Range          | Wins  |
-|---|---:|---|---:|
-| **ematix-flow** (single-node) | — | — | **15 / 22** |
-| DuckDB                        | ~1.35× | 0.70× – 6.20× | 7 (Q01, Q05, Q06, Q07, Q08, Q17, Q18) |
+| Query | ematix-flow | DuckDB | Polars | PySpark | Postgres |
+|---|--:|--:|--:|--:|--:|
+| Q01 | **16.1** | 47.6 | 39.3 | 167 | 411 |
+| Q02 | **6.8** | 16.2 | 48.0 | 190 | 123 |
+| Q03 | **9.1** | 31.2 | 47.4 | 257 | 163 |
+| Q04 | **9.7** | 21.6 | 24.8 | 184 | 94.6 |
+| Q05 | **6.8** | 30.3 | 11,141 | 335 | 226 |
+| Q06 | **0.9** | 12.0 | 10.1 | 41.5 | 218 |
+| Q07 | **26.2** | 31.3 | 118 | 260 | 1,262 |
+| Q08 | **12.3** | 37.3 | 95.0 | 182 | 99.7 |
+| Q09 | **16.2** | 52.9 | 48.7 | 583 | 820 |
+| Q10 | **23.2** | 57.0 | 135 | 362 | 355 |
+| Q11 | **5.0** | 9.0 | 9.3 | 119 | 36.3 |
+| Q12 | **12.7** | 23.1 | 19.3 | 269 | 361 |
+| Q13 | **8.6** | 130 | 122 | 684 | 871 |
+| Q14 | **9.8** | 21.0 | 12.6 | 114 | 69.8 |
+| Q15 | **10.8** | 13.2 | 11.6 | 127 | 140 |
+| Q16 | **7.1** | 20.6 | 22.0 | 205 | 113 |
+| Q17 | **14.1** | 24.0 | 42.8 | 233 | 398 |
+| Q18 | **24.0** | 43.1 | 58.6 | 560 | 1,154 |
+| Q19 | **14.4** | 31.9 | 109 | 86.0 | 31.9 |
+| Q20 | **14.4** | 27.4 | 23.1 | 106 | 147 |
+| Q21 | **32.7** | 69.0 | 741 | 628 | 609 |
+| Q22 | **7.8** | 19.6 | 13.0 | 354 | 24.1 |
 
-> **Σ.AJ.1 + Σ.AK gap-narrowing (2026-05-27).** Commits `8bd3f39` (Lever C
-> agg-side LeftSemi pushdown default-on) and `3c56db9` (Q10
-> shape-predicate dim-push default-on) cumulatively cut 22q SF=10 wall
-> by ~300 ms (-9%). The win COUNT is unchanged at 15/22, but the gap
-> shape transformed: **Q17 narrowed from ~1.31× DuckDB-faster to 1.09×**
-> (now within 8% of DuckDB); Q01 and Q06 are now effectively tied
-> (DuckDB by <2%); Q07, Q08 narrowed to within 5-7%. Q18 remains the
-> widest DuckDB win at 1.42× (235 ms vs 335 ms).
+### SF=10 — ~10 GB · production scale
 
-> **Σ.AG.7 default-on change.** As of commit 71f1618, the plan cache
-> and every winning lever default ON in the triangulation bench. A bare
-> `cargo run --release ... --example tpch_triangulation_bench` reaches
-> the milestone config — no env vars required. Set any of
-> `EMAT_PLAN_CACHE / PUSH_SEMI / RH_SUM_F64 / RT_BLOOM_* / ALL_TABLES_EMAT
-> / RG_DECODE_CACHE / AGG_SEMI / DIM_PUSH = 0` to disable a specific
-> lever for A/B benching.
+- **Wins (fastest median per query):** ematix-flow **18 / 22**, DuckDB 3, Polars 1, PySpark 0, Postgres 0.
+- **Geomean ematix-flow speedup:** 1.46× vs DuckDB · 4.53× (n=21) vs Polars · 13.93× vs PySpark · 25.24× vs Postgres.
 
-> **SF=10 noise band.** Per-query medians shift ±5–15% across
-> back-to-back runs from thermal effects (both engines move together).
-> Treat **13–17 ematix wins as the steady-state SF=10 range**. The
-> strict-A/B harness (`scripts/bench/strict_ab.sh`) drops median CV to
-> 1.30–1.96% via `caffeinate -i` + `taskpolicy -a` + discard-first
-> + median-of-medians; use it when measuring lever-level effects.
+| Query | ematix-flow | DuckDB | Polars | PySpark | Postgres |
+|---|--:|--:|--:|--:|--:|
+| Q01 | **214** | 243 | 342 | 732 | 4,306 |
+| Q02 | **23.8** | 37.8 | 418 | 599 | 2,222 |
+| Q03 | **78.3** | 138 | 557 | 2,722 | 3,488 |
+| Q04 | **52.4** | 82.3 | 270 | 1,711 | 905 |
+| Q05 | **101** | 133 | — | 4,589 | 3,233 |
+| Q06 | **34.8** | 70.2 | 63.5 | 205 | 1,373 |
+| Q07 | 146 | **130** | 1,330 | 3,737 | 2,188 |
+| Q08 | 184 | **158** | 1,179 | 940 | 1,340 |
+| Q09 | **260** | 265 | 429 | 2,187 | 7,431 |
+| Q10 | **197** | 358 | 4,111 | 2,355 | 3,362 |
+| Q11 | **13.1** | 23.2 | 32.7 | 197 | 578 |
+| Q12 | **81.8** | 105 | 113 | 826 | 3,542 |
+| Q13 | **94.4** | 238 | 415 | 2,069 | 10,989 |
+| Q14 | **80.0** | 119 | 92.6 | 379 | 813 |
+| Q15 | 69.8 | 76.8 | **64.0** | 645 | 1,606 |
+| Q16 | **27.4** | 54.8 | 173 | 638 | 1,098 |
+| Q17 | **132** | 143 | 438 | 3,956 | 5,387 |
+| Q18 | 198 | **194** | 611 | 6,953 | 19,846 |
+| Q19 | **120** | 178 | 1,245 | 493 | 148 |
+| Q20 | **119** | 129 | 281 | 419 | 3,279 |
+| Q21 | **255** | 358 | 33,105 | 7,523 | 6,952 |
+| Q22 | **22.6** | 114 | 108 | 628 | 203 |
 
-The full per-query table + provenance / config / caveats live on the
-public docs site:
-[ematix.dev/reference/benchmarks](https://ematix.dev/reference/benchmarks).
-The harness-emitted top-level `BENCHMARKS.md` in the repo root holds the
-auto-generated 3-engine view (ematix-flow / DuckDB / Polars); PySpark
-is captured separately by `scripts/bench-tpch-pyspark.py` because
-Spark needs a JVM out-of-process.
+### SF=100 — ~100 GB · out-of-core
 
-The bench config is the same in every cell: `TPCH_TRIALS=20
-TPCH_WARMUPS=3 cargo run --release -p ematix-flow-core --example
-tpch_triangulation_bench --features triangulation` and
-`python scripts/bench-tpch-pyspark.py --data-dir examples/tpch/data/sf1
---trials 20 --warmups 3`.
+- **Wins (fastest median per query):** ematix-flow **16 / 22**, DuckDB 5, Polars 1, PySpark 0, Postgres 0.
+- **Geomean ematix-flow speedup:** 1.32× vs DuckDB · 6.64× (n=17) vs Polars · 10.84× vs PySpark · 89.28× (n=6) vs Postgres.
 
-> **Q06 footnote.** ematix-flow's Q06 22q-battery cell shows median
-> 13.65 ms ± **257.77** σ — one outlier trial out of 20 (likely JIT/
-> thermal contention after five preceding queries). Re-running Q06
-> in isolation under the same 20/3 config gives **9.22 ± 0.60 ms**
-> — i.e. ematix-flow narrowly beats Polars when Q06 isn't preceded by
-> other queries. We keep the 22q-battery median in the table because
-> every other cell has the same provenance.
+| Query | ematix-flow | DuckDB | Polars | PySpark | Postgres |
+|---|--:|--:|--:|--:|--:|
+| Q01 | **2,131** | 2,270 | 79,084 | 5,184 | — |
+| Q02 | **259** | 378 | 53,109 | 6,697 | 26,054 |
+| Q03 | **911** | 2,763 | 30,103 | 26,128 | — |
+| Q04 | **773** | 843 | 6,550 | 10,543 | — |
+| Q05 | **1,295** | 1,500 | — | 38,145 | — |
+| Q06 | **436** | 708 | 540 | 1,142 | — |
+| Q07 | 1,742 | **1,582** | 95,946 | 12,775 | — |
+| Q08 | **2,247** | 2,629 | — | 23,610 | — |
+| Q09 | 7,085 | **6,627** | 21,438 | 67,105 | — |
+| Q10 | 3,019 | **2,532** | — | 24,590 | — |
+| Q11 | **197** | 209 | 412 | 5,639 | 60,108 |
+| Q12 | **921** | 1,100 | 1,112 | 6,482 | — |
+| Q13 | **1,874** | 2,212 | 5,114 | 14,442 | 86,674 |
+| Q14 | **776** | 1,454 | 895 | 2,623 | — |
+| Q15 | 909 | 913 | **890** | 5,142 | — |
+| Q16 | **143** | 357 | 1,809 | 5,012 | 29,144 |
+| Q17 | 1,759 | **1,521** | 9,536 | 47,823 | — |
+| Q18 | **377** | 2,193 | 15,572 | 54,206 | — |
+| Q19 | **1,131** | 1,475 | — | 3,101 | 52,107 |
+| Q20 | 1,953 | **1,664** | 6,692 | 5,682 | — |
+| Q21 | **4,019** | 4,279 | — | 55,583 | — |
+| Q22 | **441** | 577 | 1,255 | 5,107 | 16,805 |
+
+> **Provenance.** ematix-flow + DuckDB are fresh co-measured runs
+> (`bench-results/refresh-2026-05-30/emat-duck-sf{1,10,100}.md`). Polars
+> and PySpark at SF=1 / SF=10 are carried from the 2026-05-24 refresh on
+> the same machine; SF=100 Polars + PySpark and all Postgres numbers are
+> fresh. Polars can't run several canonical TPC-H shapes (we feed it
+> semantically-identical `q??.polars.sql` variants); Q05 overflows its
+> default 32-bit row index at SF >= 10. Postgres ran with a 90 s
+> per-query cap at SF=100 — 16 / 22 heavy queries timed out, so its
+> SF=100 geomean covers only the 6 that finished.
+
+> **Config.** ematix-flow runs the production preset, no env vars:
+> `target_partitions = cores` plus the fused-aggregate, dict-group-count,
+> push-LeftSemi, runtime-bloom, cardinality-gated Robin-Hood, and
+> scale-relative-broadcast rules — exactly what `pip install ematix-flow`
+> gives you. DuckDB runs at defaults (in-memory `read_parquet`). To
+> disable a specific lever for A/B benching set any of
+> `EMAT_PUSH_SEMI / RH_SUM_F64 / RT_BLOOM_* / RG_DECODE_CACHE / AGG_SEMI /
+> DIM_PUSH / COLLECT_LEFT_BROADCAST_RATIO = 0`.
+
+> **Thermal band (SF=10 / SF=100).** Back-to-back runs drift +-5-20% as
+> the M3 Pro heats; ematix-flow and DuckDB move together. Co-measuring in
+> one process is exactly why the head-to-head holds. The strict-A/B
+> harness (`scripts/bench/strict_ab.sh`) drops median CV to ~1.3-2.0%
+> via `caffeinate -i` + `taskpolicy -a` + discard-first; use it for
+> lever-level effects.
+
 
 ---
 

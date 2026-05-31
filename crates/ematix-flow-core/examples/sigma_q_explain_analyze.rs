@@ -16,12 +16,12 @@ use ematix_flow_core::dedupe_aggregate_rule::DedupeAggregateForFloatDeterminism;
 use ematix_flow_core::dict_aggregate_rule::EnableDictGroupCountRule;
 use ematix_flow_core::ematix_fast_parquet::EmatixFastParquetTableProvider;
 use ematix_flow_core::fast_parquet::FastParquetTableProvider;
+use ematix_flow_core::force_collect_left_semi_build_rule::ForceCollectLeftForSemiBoundedBuildRule;
 use ematix_flow_core::fused_aggregate_filter_multi_agg_rule::InjectFilterMultiAggRule;
 use ematix_flow_core::fused_aggregate_filter_sum_rule::InjectFilterSumRule;
 use ematix_flow_core::push_down_left_semi_rule::PushDownLeftSemiRule;
 use ematix_flow_core::robin_hood_sum_f64_exec::EnableRobinHoodSumF64Rule;
 use ematix_flow_core::runtime_bloom_sideband_rule::EnableRuntimeBloomSidebandRule;
-use ematix_flow_core::force_collect_left_semi_build_rule::ForceCollectLeftForSemiBoundedBuildRule;
 use ematix_flow_core::swap_semi_join_build_rule::SwapSemiJoinBuildSideRule;
 
 const TPCH_TABLES: &[&str] = &[
@@ -64,7 +64,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         builder = builder.with_physical_optimizer_rule(Arc::new(SwapSemiJoinBuildSideRule));
     }
     if rh_sum_f64 {
-        builder = builder.with_physical_optimizer_rule(Arc::new(EnableRobinHoodSumF64Rule));
+        builder =
+            builder.with_physical_optimizer_rule(Arc::new(EnableRobinHoodSumF64Rule::default()));
     }
     if rt_bloom {
         builder = builder
@@ -74,8 +75,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // REV.3 — appended last so it runs AFTER SwapSemiJoinBuildSide
         // (which produces the RightSemi that build_subtree_has_semi_filter
         // detects) and after the built-in JoinSelection/EnforceDistribution.
-        builder = builder
-            .with_physical_optimizer_rule(Arc::new(ForceCollectLeftForSemiBoundedBuildRule::default()));
+        builder = builder.with_physical_optimizer_rule(Arc::new(
+            ForceCollectLeftForSemiBoundedBuildRule::default(),
+        ));
     }
     let state = builder.build();
 
