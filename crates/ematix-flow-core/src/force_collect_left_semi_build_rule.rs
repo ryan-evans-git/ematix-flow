@@ -116,6 +116,15 @@ pub struct ForceCollectLeftForSemiBoundedBuildRule {
     /// identical at every scale. Read from
     /// `EMAT_COLLECT_LEFT_BROADCAST_RATIO`; default `16.0` = on, opt-out
     /// with `=0`.
+    ///
+    /// REV.17.4a swept K ∈ {8, 16, 32} and confirmed 16 is optimal: K=32 is
+    /// too conservative (declines the Q03/Q05 dim⋈fact broadcasts at SF=10,
+    /// +80%); K=8 is a wash at SF=10 and at SF=100 merely REDISTRIBUTES —
+    /// it broadcasts more aggressively (Q03 −16%, Q05 −11%, Q17 −11%, Q18
+    /// −19%, Q21 −9%) but regresses the three HEAVIEST queries (Q08 +11%,
+    /// Q09 +10%, Q10 +8% — Q09 is 7.4 s), netting −0.1%. 16 captures the big
+    /// broadcasts without the heavy-query tail regressions. Do not retune
+    /// without a fresh SF=100 sweep.
     pub broadcast_ratio: f64,
 }
 
