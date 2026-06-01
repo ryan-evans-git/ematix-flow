@@ -1783,10 +1783,21 @@ impl EmatixFastParquetTableProvider {
         // rows (default 0 = off, preserving .5.h). Set e.g.
         // `EMAT_DICT_DISTINCT_MAX_ROWS=10000000` to walk everything
         // except lineitem (60M) + orders (15M) at SF=10.
+        // REV.19 single-flag UX: the NDV-corrected build-side lever
+        // (`EMAT_NDV_BUILD_SIDE=1`, `force_collect_left_semi_build_rule`) needs
+        // `distinct_count` populated for the dimension tables it corrects, so
+        // when it is on and no explicit cap is given we default the walk to the
+        // small-table cap (10M) — includes TPC-H dimensions (part 2M / supplier
+        // / customer 1.5M / nation / region), excludes the large fact tables
+        // (lineitem 60M, orders 15M at SF=10) whose `distinct_count` perturbs
+        // the planner (Σ.Q06.SF10.5.h). An explicit `EMAT_DICT_DISTINCT_MAX_ROWS`
+        // always overrides. Scale caveat: at SF=100 part is 20M > 10M, so set
+        // the cap explicitly there.
+        let ndv_build_side = std::env::var("EMAT_NDV_BUILD_SIDE").as_deref() == Ok("1");
         let max_rows_for_walk: usize = std::env::var("EMAT_DICT_DISTINCT_MAX_ROWS")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
+            .unwrap_or(if ndv_build_side { 10_000_000 } else { 0 });
         let walk_by_size = max_rows_for_walk > 0 && num_rows <= max_rows_for_walk;
         // Legacy `EMAT_SKIP_DICT_DISTINCT=1` still forces skip for
         // explicit A/B work, but the default behaviour is now skip.

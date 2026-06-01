@@ -57,15 +57,23 @@
 
 use std::sync::Arc;
 
+use datafusion::common::JoinType;
 use datafusion::common::config::ConfigOptions;
 use datafusion::common::tree_node::{Transformed, TreeNode};
-use datafusion::common::JoinType;
 use datafusion::error::Result;
 use datafusion::execution::session_state::SessionStateBuilder;
-use datafusion::physical_optimizer::enforce_distribution::EnforceDistribution;
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
-use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode};
+use datafusion::physical_optimizer::enforce_distribution::EnforceDistribution;
 use datafusion::physical_plan::ExecutionPlan;
+use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode};
+
+// REV.19 NDV-corrected build-side selection (opt-in) imports.
+use datafusion::common::stats::Precision;
+use datafusion::logical_expr::Operator;
+use datafusion::physical_expr::expressions::{BinaryExpr, Column, Literal};
+use datafusion::physical_expr::utils::split_conjunction;
+use datafusion::physical_plan::filter::FilterExec;
+use datafusion::scalar::ScalarValue;
 
 use crate::runtime_bloom_sideband_rule::build_subtree_has_semi_filter;
 
@@ -177,6 +185,120 @@ fn probe_not_smaller_than_build(
     }
 }
 
+/// REV.19 — minimum distinct count for a string-equality filter to be
+/// eligible for NDV correction. Below this the column isn't meaningfully
+/// "low cardinality"; and since we only ever SHRINK an estimate (cap at
+/// 1.0), this also guards the trivial `N=1` case.
+const NDV_MIN_DISTINCT: usize = 2;
+
+/// REV.19 — the true selectivity `1/N` of a `col = lit` equality relative
+/// to the flat `default_sel` DataFusion's `FilterExec` actually applied to
+/// it, capped at `1.0`. The cap means the correction only ever *shrinks* an
+/// estimate: a filter that is *less* selective than the default (`N` small)
+/// is left uncorrected — the safe direction for a build-side decision (we
+/// never manufacture a swap by inflating a side).
+fn eq_ndv_correction(distinct: usize, default_sel: f64) -> f64 {
+    if distinct < NDV_MIN_DISTINCT || default_sel <= 0.0 {
+        return 1.0;
+    }
+    ((1.0 / distinct as f64) / default_sel).min(1.0)
+}
+
+/// True iff `v` is a non-null UTF-8 string literal (the only literal kind
+/// for which DataFusion's interval analyzer declines `check_support`, hence
+/// falls back to `default_selectivity` and ignores `distinct_count`).
+fn is_utf8_literal(v: &ScalarValue) -> bool {
+    matches!(
+        v,
+        ScalarValue::Utf8(Some(_))
+            | ScalarValue::Utf8View(Some(_))
+            | ScalarValue::LargeUtf8(Some(_))
+    )
+}
+
+/// Product of [`eq_ndv_correction`] over every `string_col = string_lit`
+/// equality conjunct of `predicate` whose filtered column carries a known
+/// `distinct_count` in `child_stats`. The column index in the predicate refers
+/// to the filter's input schema, which is exactly how `child_stats`
+/// (`input().partition_statistics`) is indexed. Pure (no plan) so it is
+/// directly unit-testable.
+fn predicate_ndv_factor(
+    predicate: &Arc<dyn datafusion::physical_expr::PhysicalExpr>,
+    child_stats: &datafusion::common::Statistics,
+    default_sel: f64,
+) -> f64 {
+    let mut factor = 1.0_f64;
+    for conj in split_conjunction(predicate) {
+        let Some(bin) = conj.as_any().downcast_ref::<BinaryExpr>() else {
+            continue;
+        };
+        if *bin.op() != Operator::Eq {
+            continue;
+        }
+        // `Column = Literal` in either operand order.
+        let (col, lit) = match (
+            bin.left().as_any().downcast_ref::<Column>(),
+            bin.right().as_any().downcast_ref::<Literal>(),
+        ) {
+            (Some(c), Some(l)) => (c, l),
+            _ => match (
+                bin.left().as_any().downcast_ref::<Literal>(),
+                bin.right().as_any().downcast_ref::<Column>(),
+            ) {
+                (Some(l), Some(c)) => (c, l),
+                _ => continue,
+            },
+        };
+        if !is_utf8_literal(lit.value()) {
+            continue;
+        }
+        let Some(cs) = child_stats.column_statistics.get(col.index()) else {
+            continue;
+        };
+        let distinct = match cs.distinct_count {
+            Precision::Exact(n) | Precision::Inexact(n) => n,
+            Precision::Absent => continue,
+        };
+        factor *= eq_ndv_correction(distinct, default_sel);
+    }
+    factor
+}
+
+/// [`predicate_ndv_factor`] for a `FilterExec`, sourcing the predicate, its
+/// input column statistics, and the `default_selectivity` DataFusion applied.
+fn filter_ndv_factor(filter: &FilterExec) -> f64 {
+    let default_sel = filter.default_selectivity() as f64 / 100.0;
+    let Ok(child_stats) = filter.input().partition_statistics(None) else {
+        return 1.0;
+    };
+    predicate_ndv_factor(filter.predicate(), &child_stats, default_sel)
+}
+
+/// REV.19 — walk `plan`'s subtree and return the product of every
+/// `FilterExec`'s [`filter_ndv_factor`]. Always `≤ 1.0`; strictly `< 1.0`
+/// iff some low-NDV string-equality filter in the subtree was under-credited
+/// by DataFusion's flat `default_selectivity`. Multiplying a join side's
+/// reported `num_rows` by this re-bases the estimate; the correction
+/// propagates ~multiplicatively through downstream joins/projections (a join's
+/// output scales ~linearly with a filtered input).
+fn ndv_correction_factor(plan: &Arc<dyn ExecutionPlan>) -> f64 {
+    let mut factor = 1.0_f64;
+    if let Some(filter) = plan.as_any().downcast_ref::<FilterExec>() {
+        factor *= filter_ndv_factor(filter);
+    }
+    for child in plan.children() {
+        factor *= ndv_correction_factor(child);
+    }
+    factor
+}
+
+/// Reported `num_rows` for a join side, if statically known.
+fn reported_rows(plan: &Arc<dyn ExecutionPlan>) -> Option<usize> {
+    plan.partition_statistics(None)
+        .ok()
+        .and_then(|s| s.num_rows.get_value().copied())
+}
+
 /// Install the REV.3 CollectLeft rule onto a `SessionStateBuilder`.
 pub fn install_force_collect_left_semi_build_rule(
     builder: SessionStateBuilder,
@@ -221,6 +343,47 @@ impl PhysicalOptimizerRule for ForceCollectLeftForSemiBoundedBuildRule {
             }
             if !matches!(hj.partition_mode(), PartitionMode::Partitioned) {
                 return Ok(Transformed::no(node));
+            }
+            // REV.19 NDV-corrected build-side selection (opt-in, default OFF).
+            // DataFusion's `FilterExec` never consults `distinct_count`: its
+            // interval analyzer doesn't `check_support` string equality, so a
+            // low-NDV string filter (e.g. `p_type='ECONOMY ANODIZED STEEL'`,
+            // true 1/150) is credited only the flat `default_selectivity`
+            // (≈20%), over-estimating the filtered side ~30×. When that
+            // over-estimate hides a build-side inversion — `JoinSelection`
+            // built the reported-smaller (LEFT) side, but NDV-corrected sizes
+            // say the RIGHT (probe) is actually smaller — swap so the truly
+            // smaller side builds. Keeps Partitioned mode; `swap_inputs`
+            // preserves Inner semantics + repairs the output schema, and
+            // `EnforceDistribution` re-runs below. General (any low-NDV
+            // equality filter, not TPC-H-specific); requires the dict-distinct
+            // walk (`EMAT_DICT_DISTINCT_MAX_ROWS`) to populate `distinct_count`.
+            // Default OFF per [[optimizer-codegen-sensitivity]]; the env check
+            // short-circuits before any subtree walk when unset. Opt in with
+            // `EMAT_NDV_BUILD_SIDE=1`.
+            if is_inner && std::env::var("EMAT_NDV_BUILD_SIDE").as_deref() == Ok("1") {
+                let lf = ndv_correction_factor(hj.left());
+                let rf = ndv_correction_factor(hj.right());
+                // Only act when some side was actually under-credited.
+                if lf < 1.0 || rf < 1.0 {
+                    if let (Some(l), Some(r)) =
+                        (reported_rows(hj.left()), reported_rows(hj.right()))
+                    {
+                        let corrected_left = l as f64 * lf;
+                        let corrected_right = r as f64 * rf;
+                        if corrected_right < corrected_left {
+                            if trace {
+                                eprintln!(
+                                    "[collect_left] NDV build-side swap (corrected L={corrected_left:.0} R={corrected_right:.0}, lf={lf:.4} rf={rf:.4}); on={:?}",
+                                    hj.on()
+                                );
+                            }
+                            return Ok(Transformed::yes(
+                                hj.swap_inputs(PartitionMode::Partitioned)?,
+                            ));
+                        }
+                    }
+                }
             }
             // Determine which side is semi/anti-bounded — the structural
             // signal that it is genuinely small (DataFusion's stats report
@@ -711,6 +874,131 @@ mod tests {
         assert!(
             format!("{out:?}").contains("CollectLeft"),
             "default-on rule must broadcast a small-build/large-probe Inner join"
+        );
+    }
+
+    // ---- REV.19 NDV-corrected build-side selection ----
+
+    use datafusion::common::stats::{ColumnStatistics, Statistics};
+
+    /// One-column input statistics with an optional `distinct_count`.
+    fn stats_with_distinct(num_rows: usize, distinct0: Option<usize>) -> Statistics {
+        let cs0 = ColumnStatistics {
+            distinct_count: match distinct0 {
+                Some(n) => Precision::Inexact(n),
+                None => Precision::Absent,
+            },
+            ..Default::default()
+        };
+        Statistics {
+            num_rows: Precision::Inexact(num_rows),
+            total_byte_size: Precision::Absent,
+            column_statistics: vec![cs0],
+        }
+    }
+
+    fn string_eq(col_idx: usize, val: &str) -> Arc<dyn datafusion::physical_expr::PhysicalExpr> {
+        Arc::new(BinaryExpr::new(
+            Arc::new(Column::new("s", col_idx)),
+            Operator::Eq,
+            Arc::new(Literal::new(ScalarValue::Utf8(Some(val.to_string())))),
+        ))
+    }
+
+    /// The correction shrinks a genuinely-selective filter (N=150, the
+    /// TPC-H `p_type` cardinality) and caps at 1.0 for filters that are
+    /// *less* selective than DataFusion's flat default (so we never inflate).
+    #[test]
+    fn eq_ndv_correction_shrinks_low_ndv_and_caps_high() {
+        let f = eq_ndv_correction(150, 0.2);
+        assert!(
+            (f - 0.033_33).abs() < 1e-4,
+            "N=150 vs 0.2 ≈ 0.0333, got {f}"
+        );
+        // N=2 → 1/2 = 0.5 > 0.2 (less selective than default) → capped at 1.0.
+        assert_eq!(eq_ndv_correction(2, 0.2), 1.0);
+        // Below the distinct floor → no correction.
+        assert_eq!(eq_ndv_correction(1, 0.2), 1.0);
+    }
+
+    /// A `p_type = 'literal'`-shaped string equality on an N=150 column is
+    /// corrected to ~1/30 of DataFusion's 20%-default estimate.
+    #[test]
+    fn predicate_ndv_factor_corrects_string_eq() {
+        let stats = stats_with_distinct(2_000_000, Some(150));
+        let pred = string_eq(0, "ECONOMY ANODIZED STEEL");
+        let f = predicate_ndv_factor(&pred, &stats, 0.2);
+        assert!(
+            (f - 0.033_33).abs() < 1e-4,
+            "string-eq on N=150 ≈ 0.033, got {f}"
+        );
+    }
+
+    /// No `distinct_count` (dict-distinct walk off) → neutral, never a swap.
+    #[test]
+    fn predicate_ndv_factor_absent_distinct_is_neutral() {
+        let stats = stats_with_distinct(2_000_000, None);
+        let pred = string_eq(0, "x");
+        assert_eq!(
+            predicate_ndv_factor(&pred, &stats, 0.2),
+            1.0,
+            "absent distinct_count must not correct"
+        );
+    }
+
+    /// Numeric equality is handled by DataFusion's interval analyzer (it is
+    /// `check_support`ed), so we must NOT double-correct it.
+    #[test]
+    fn predicate_ndv_factor_ignores_numeric_eq() {
+        let stats = stats_with_distinct(2_000_000, Some(150));
+        let pred: Arc<dyn datafusion::physical_expr::PhysicalExpr> = Arc::new(BinaryExpr::new(
+            Arc::new(Column::new("n", 0)),
+            Operator::Eq,
+            Arc::new(Literal::new(ScalarValue::Int64(Some(5)))),
+        ));
+        assert_eq!(
+            predicate_ndv_factor(&pred, &stats, 0.2),
+            1.0,
+            "numeric equality must not be NDV-corrected"
+        );
+    }
+
+    /// In `s = 'x' AND n > 5` only the string-equality conjunct corrects.
+    #[test]
+    fn predicate_ndv_factor_handles_conjunction() {
+        let stats = stats_with_distinct(2_000_000, Some(150));
+        let s_eq = string_eq(0, "x");
+        let n_gt: Arc<dyn datafusion::physical_expr::PhysicalExpr> = Arc::new(BinaryExpr::new(
+            Arc::new(Column::new("n", 0)),
+            Operator::Gt,
+            Arc::new(Literal::new(ScalarValue::Int64(Some(5)))),
+        ));
+        let conj: Arc<dyn datafusion::physical_expr::PhysicalExpr> =
+            Arc::new(BinaryExpr::new(s_eq, Operator::And, n_gt));
+        let f = predicate_ndv_factor(&conj, &stats, 0.2);
+        assert!(
+            (f - 0.033_33).abs() < 1e-4,
+            "only the string-eq corrects, got {f}"
+        );
+    }
+
+    /// The lever is OFF by default: `EMAT_NDV_BUILD_SIDE` unset must leave a
+    /// plain Partitioned Inner join untouched (no swap, no CollectLeft from
+    /// this arm). Guards the default-path / codegen-tax invariant.
+    #[test]
+    fn ndv_build_side_off_by_default() {
+        // Two equal-size sides, no relative-broadcast trigger, no semi.
+        let top = hashjoin(mem_table_n(100), mem_table_n(100), JoinType::Inner);
+        let rule = ForceCollectLeftForSemiBoundedBuildRule {
+            min_probe_build_ratio: 0.0,
+            broadcast_ratio: 0.0,
+        };
+        let before = format!("{top:?}");
+        let out = rule.optimize(top, &ConfigOptions::default()).unwrap();
+        assert_eq!(
+            before,
+            format!("{out:?}"),
+            "with EMAT_NDV_BUILD_SIDE unset the plan must be unchanged"
         );
     }
 }
