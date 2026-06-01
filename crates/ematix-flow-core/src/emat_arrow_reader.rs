@@ -1169,6 +1169,20 @@ impl EmatArrowBatchReader {
         // gather overhead. Phase 1.8 may misfire (stats inaccurate)
         // so keep the actual-popcount fallback as a safety net.
         //
+        // REV.23 (2026-05-31): threshold LOWERED 1/3 → 1/10. The
+        // per-column masked gather is memory-LATENCY-bound (strided
+        // scatter of survivors) and plateaus at ~7 cores; dense decode
+        // is bandwidth-bound and scales to all cores. For an
+        // UNCLUSTERED filter (e.g. l_shipdate, uniform across pages)
+        // masked skips zero pages — it decompresses everything dense
+        // does, then adds the non-scaling gather, so it is pure
+        // overhead. Calibrated on TPC-H SF=10: routing the masked scan
+        // to dense is a clear win at every pass rate ≥15% (Q07 30% −25%,
+        // Q08 30%, Q10 25%, Q20/Q16 15%) and a loss only at ≤4.3%
+        // (Q12 4.3% +49%, Q19 3.6% +23%). A clean gap in (0.043, 0.148);
+        // 0.10 sits in it. Env-tunable via EMAT_MASKED_DENSE_PASSRATE.
+        // See [[rev20-q07-q08-decode-bound]] REV.23.
+        //
         // Σ.AE.2 (2026-05-26): under Exact pushdown, FilterExec is
         // dropped from the plan, so the BridgeFilter is the ONLY
         // row filter. If we fall back to dense here without saving
@@ -1186,7 +1200,7 @@ impl EmatArrowBatchReader {
         // when ungated). With the gate the default-mode path is
         // bit-identical to pre-fix behavior; only Exact mode (which
         // would otherwise emit wrong rows) gains the bitmap apply.
-        if total > 0 && popcount * 3 > total {
+        if should_route_masked_to_dense(popcount, total, masked_dense_passrate_threshold()) {
             self.cur_rg_total = self.cached_md.row_groups[rg].num_rows as usize;
             self.load_row_group_dense(rg)?;
             if std::env::var_os("EMAT_EXACT_PUSHDOWN").is_some() {
@@ -1770,6 +1784,29 @@ impl Iterator for EmatArrowBatchReader {
 // ============================================================
 // Per-column masked decode (Σ.E5 #516 late-mat path)
 // ============================================================
+
+/// REV.23 — pass-rate above which a user-filtered scan routes to dense
+/// decode (`load_row_group_dense` + FilterExec/SIMD compaction) instead of
+/// the per-column masked gather. Default 0.10, calibrated on TPC-H SF=10
+/// (dense-winners all ≥0.15 pass, masked-winners all ≤0.043 — clean gap;
+/// 0.10 sits in it). Env-tunable via `EMAT_MASKED_DENSE_PASSRATE` for A/B
+/// sweeps and for workloads with clustered selective filters that page-skip.
+pub(crate) fn masked_dense_passrate_threshold() -> f64 {
+    std::env::var("EMAT_MASKED_DENSE_PASSRATE")
+        .ok()
+        .and_then(|s| s.parse::<f64>().ok())
+        .filter(|v| v.is_finite() && (0.0..=1.0).contains(v))
+        .unwrap_or(0.10)
+}
+
+/// REV.23 — true iff a masked scan with this `popcount`/`total` should fall
+/// back to dense decode. Pure helper so the gate decision is unit-testable
+/// without a reader + parquet file. Strictly-greater so a 0.0 threshold
+/// keeps an all-pass RG on dense (matches the prior `popcount*3 > total`
+/// strict-comparison semantics).
+pub(crate) fn should_route_masked_to_dense(popcount: usize, total: usize, threshold: f64) -> bool {
+    total > 0 && (popcount as f64) > threshold * (total as f64)
+}
 
 /// Decode one projected column applying the row bitmap. Pages whose
 /// bitmap-popcount is zero are skipped inside the underlying
@@ -2951,6 +2988,39 @@ mod tests {
             Field::new("c_i64", DataType::Int64, false),
             Field::new("c_f64", DataType::Float64, false),
         ]))
+    }
+
+    #[test]
+    fn rev23_masked_dense_gate_calibration() {
+        // Calibrated on TPC-H SF=10: dense-winners all ≥0.15 pass rate,
+        // masked-winners all ≤0.043 — a clean gap. Default threshold 0.10
+        // must route the winners to dense and keep the losers on the masked
+        // gather. See [[rev20-q07-q08-decode-bound]] REV.23.
+        let t = 0.10;
+        // dense-winners (route to dense):
+        assert!(should_route_masked_to_dense(304, 1000, t), "Q07/Q08 ~30%");
+        assert!(should_route_masked_to_dense(250, 1000, t), "Q10 ~25%");
+        assert!(should_route_masked_to_dense(150, 1000, t), "Q16/Q20 ~15%");
+        assert!(should_route_masked_to_dense(486, 1000, t), "Q03 ~49%");
+        // masked-winners (keep masked):
+        assert!(!should_route_masked_to_dense(43, 1000, t), "Q12 ~4.3%");
+        assert!(!should_route_masked_to_dense(36, 1000, t), "Q19 ~3.6%");
+        assert!(!should_route_masked_to_dense(1, 1000, t), "Q17 ~0.1%");
+        // empty RG never routes
+        assert!(!should_route_masked_to_dense(0, 0, t));
+        // strict boundary: exactly 10% stays masked, just above flips
+        assert!(!should_route_masked_to_dense(100, 1000, t));
+        assert!(should_route_masked_to_dense(101, 1000, t));
+        // the calibrated gap (0.043, 0.148) — the default threshold lands in it
+        assert!(0.043 < t && t < 0.148);
+    }
+
+    #[test]
+    fn rev23_threshold_default_is_calibrated() {
+        // Only assert the default when the override env is unset (normal run).
+        if std::env::var_os("EMAT_MASKED_DENSE_PASSRATE").is_none() {
+            assert_eq!(masked_dense_passrate_threshold(), 0.10);
+        }
     }
 
     #[test]

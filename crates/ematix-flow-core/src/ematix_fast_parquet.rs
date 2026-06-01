@@ -3424,9 +3424,39 @@ fn decode_one_rg_filtered_late_mat(
     // pass). build_bitmap + masked_decode below all share it.
     let file = crate::ematix_parquet_bridge::open_cached(path)?;
     // Σ.E5 #513: multi-column AND bitmap via BridgeFilter.
-    let (bitmap, _total) = filter.build_bitmap(path, rg)?;
+    let (bitmap, total) = filter.build_bitmap(path, rg)?;
 
     let matches: usize = bitmap.iter().map(|b| b.count_ones() as usize).sum();
+
+    // REV.23 — same masked→dense routing gate as the streaming reader
+    // (emat_arrow_reader::load_row_group_masked_legacy). This non-streaming
+    // late-mat path is only live under dict-preservation
+    // (`with_dict_preservation` forces `streaming_arrow_reader=false`), but it
+    // has the identical latency-bound per-column gather, so above the pass-rate
+    // threshold we decode dense (`decode_one_rg`, which handles every dtype incl.
+    // Dictionary(UInt32,Utf8)) and compact with Arrow's SIMD `filter_record_batch`
+    // — bandwidth-bound, scales to all cores. Result rows are identical to the
+    // masked path. See [[rev20-q07-q08-decode-bound]] REV.23.
+    if crate::emat_arrow_reader::should_route_masked_to_dense(
+        matches,
+        total,
+        crate::emat_arrow_reader::masked_dense_passrate_threshold(),
+    ) {
+        let dense = decode_one_rg(path, rg, schema, projection)?;
+        let bool_buf = datafusion::arrow::buffer::BooleanBuffer::new(
+            datafusion::arrow::buffer::Buffer::from_vec(bitmap),
+            0,
+            total,
+        );
+        let mask = arrow_array::BooleanArray::new(bool_buf, None);
+        return datafusion::arrow::compute::filter_record_batch(&dense, &mask).map_err(|e| {
+            DataFusionError::External(
+                format!("EmatixFastParquetExec (late_mat dense-route): filter_record_batch: {e}")
+                    .into(),
+            )
+        });
+    }
+
     let mut columns: Vec<Arc<dyn arrow_array::Array>> = Vec::with_capacity(projection.len());
     let check_len = |got: usize, want: usize, name: &str, kind: &str| -> DfResult<()> {
         if got != want {
@@ -3601,9 +3631,63 @@ mod tests {
     /// Int64→Int32 once at the stream boundary (`narrow_stream_to_advertised`).
     /// This catches any decode entry point that mis-handles the narrowed key,
     /// since they ALL flow through that one cast.
+    /// REV.23 — the non-streaming late-mat path's masked→dense gate produces
+    /// identical, correct rows on both sides of the threshold. High pass rate
+    /// (>10%) takes the new dense-decode + SIMD `filter_record_batch` branch;
+    /// low pass rate (<10%) takes the per-column masked gather. Both must
+    /// return exactly the rows passing the predicate.
+    #[test]
+    fn rev23_late_mat_dense_route_matches_masked() {
+        use ematix_parquet_codec::write::{ColumnData, write_table_to_path};
+        use ematix_parquet_format::types::CompressionCodec;
+
+        let dir = std::env::temp_dir().join(format!("rev23_latemat_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("t.parquet");
+        let c: Vec<i32> = (0..1000).collect();
+        write_table_to_path(
+            &path,
+            &[("c", ColumnData::I32(&c))],
+            CompressionCodec::Uncompressed,
+        )
+        .unwrap();
+
+        let schema: SchemaRef =
+            Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+                "c",
+                DataType::Int32,
+                false,
+            )]));
+
+        let mk = |lt: i32| {
+            BridgeFilter::new(vec![ColumnPredicate::I32Range {
+                col_idx: 0,
+                clauses: vec![RangeClause {
+                    op: datafusion::logical_expr::Operator::Lt,
+                    literal_i32: lt,
+                }],
+            }])
+        };
+
+        let check = |lt: i32| {
+            let batch = decode_one_rg_filtered_late_mat(&path, 0, &schema, &[0], &mk(lt)).unwrap();
+            assert_eq!(batch.num_rows(), lt as usize, "row count for c < {lt}");
+            let col = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<arrow_array::Int32Array>()
+                .unwrap();
+            assert_eq!(col.value(0), 0);
+            assert_eq!(col.value(lt as usize - 1), lt - 1);
+        };
+
+        check(600); // 60% pass → dense-route branch (REV.23)
+        check(50); // 5% pass → masked-gather branch
+    }
+
     #[tokio::test]
     async fn keys2_narrows_i64_key_to_i32_losslessly() {
-        use ematix_parquet_codec::write::{write_table_to_path, ColumnData};
+        use ematix_parquet_codec::write::{ColumnData, write_table_to_path};
         use ematix_parquet_format::types::CompressionCodec;
 
         let dir = std::env::temp_dir().join(format!("keys2_test_{}", std::process::id()));
