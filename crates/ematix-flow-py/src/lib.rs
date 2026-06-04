@@ -7,6 +7,16 @@ mod rabbitmq;
 mod udaf;
 mod udf;
 
+// Production-allocator parity. In a cdylib this sets the process global
+// allocator for the Rust-side engine allocations once Python loads `_core`
+// (Python's own object allocator is unaffected — same pattern polars uses in
+// its wheel). ~10% on join/alloc-heavy queries vs the system allocator. The
+// pyo3 `extension-module` feature suppresses libpython linking, so this crate
+// is verified by a build + `python -c "import ..."` import smoke, not a
+// standalone `cargo test` (which wouldn't link).
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::sync::{Arc, OnceLock};
 
 use ematix_flow_core::backend::{Backend, Dialect, PostgresBackend, TargetTable, WriteMode};

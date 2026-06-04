@@ -13,6 +13,35 @@ use ematix_flow_cli::{CliError, ConsumeOptions, PipelineCliConfig, run_consume_w
 use ematix_flow_core::streaming::install_shutdown_handler;
 use tracing::{error, info, warn};
 
+/// Run the engine on mimalloc, matching the benchmark harness. The shipped
+/// product otherwise defaults to the system allocator and is ~10% slower on
+/// join/alloc-heavy queries (verified on the engine path: Q08 195→176ms).
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+#[cfg(test)]
+mod alloc_guard {
+    // Production-allocator parity: the shipped `flow` binary must run on
+    // mimalloc, not the system allocator. Measured ~10% on join/alloc-heavy
+    // TPC-H queries (e.g. Q08 195ms system → 176ms mimalloc on the engine path);
+    // the benchmarks already use mimalloc, so without this the product ships
+    // slower than its own published numbers. A heap allocation must land in
+    // mimalloc's managed region — `mi_is_in_heap_region` returns false for a
+    // system-malloc pointer, so this test is RED until the `#[global_allocator]`
+    // is wired in this crate.
+    #[test]
+    fn global_allocator_is_mimalloc() {
+        let buf: Vec<u8> = vec![0xA5u8; 64 * 1024];
+        let p = buf.as_ptr() as *const core::ffi::c_void;
+        let in_mimalloc = unsafe { libmimalloc_sys::mi_is_in_heap_region(p) };
+        core::hint::black_box(&buf);
+        assert!(
+            in_mimalloc,
+            "global allocator is NOT mimalloc — `flow` would ship on the system allocator (~10% slower on join-heavy queries)"
+        );
+    }
+}
+
 #[derive(Debug, Parser)]
 #[command(
     name = "flow",

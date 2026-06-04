@@ -40,6 +40,13 @@ use ematix_flow_core::robin_hood_sum_f64_exec::EnableRobinHoodSumF64Rule;
 use ematix_flow_core::runtime_bloom_sideband_rule::EnableRuntimeBloomSidebandRule;
 use ematix_flow_core::swap_semi_join_build_rule::SwapSemiJoinBuildSideRule;
 
+// Match the triangulation bench / stage_profiler: production runs on mimalloc,
+// not the macOS system allocator. Profiling without this overstates malloc cost.
+// Match the triangulation bench / stage_profiler: production runs on mimalloc,
+// not the macOS system allocator. Profiling without this overstates malloc cost.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 const TPCH_TABLES: &[&str] = &[
     "customer", "lineitem", "nation", "orders", "part", "partsupp", "region", "supplier",
 ];

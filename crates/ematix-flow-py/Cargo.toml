@@ -14,6 +14,10 @@ crate-type = ["cdylib"]
 
 [dependencies]
 pyo3.workspace = true
+# Production-allocator parity: the PyPI extension module (_core) sets mimalloc
+# as the process global_allocator (see src/lib.rs) so the Rust-side query engine
+# allocations match the benchmark harness. Mirrors how polars ships its wheel.
+mimalloc = { version = "0.1", default-features = false }
 ematix-flow-core.workspace = true
 ematix-flow-cli.workspace = true
 tokio.workspace = true

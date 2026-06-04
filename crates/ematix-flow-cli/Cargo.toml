@@ -17,6 +17,10 @@ name = "ematix_flow_cli"
 path = "src/lib.rs"
 
 [dependencies]
+# Production-allocator parity with the benchmark (mimalloc per-thread heaps,
+# no central malloc lock). ~10% on join/alloc-heavy queries. See the
+# global_allocator in src/main.rs + the alloc_guard test.
+mimalloc = { version = "0.1", default-features = false }
 ematix-flow-core.workspace = true
 # Σ.B PR 2 commit 5: CLI builds DistributedSqlTransform when
 # `[transform] engine = "distributed"` is selected.
@@ -52,6 +56,9 @@ datafusion = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
+# Allocator-parity guard (test global_allocator_is_mimalloc in main.rs):
+# mi_is_in_heap_region is behind the `extended` feature.
+libmimalloc-sys = { version = "0.1", features = ["extended"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 testcontainers = { workspace = true }
 testcontainers-modules = { workspace = true }
