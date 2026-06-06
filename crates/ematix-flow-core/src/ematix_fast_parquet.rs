@@ -34,8 +34,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use arrow_array::{Array, RecordBatch};
 use arrow_schema::{DataType, Schema, SchemaRef};
 use datafusion::catalog::{Session, TableProvider};
-use datafusion::common::stats::Statistics;
 use datafusion::common::ScalarValue;
+use datafusion::common::stats::Statistics;
 use datafusion::datasource::TableType;
 use datafusion::error::{DataFusionError, Result as DfResult};
 use datafusion::execution::TaskContext;
@@ -57,7 +57,7 @@ use crate::ematix_parquet_bridge::{
     masked_decode_byte_array, masked_decode_f64, masked_decode_i32, masked_decode_i64,
     sparse_gather_chunk_f64, sparse_gather_chunk_i32, sparse_gather_chunk_i64,
 };
-use crate::fast_parquet::{extract_range_predicate, RangePredicate};
+use crate::fast_parquet::{RangePredicate, extract_range_predicate};
 
 /// Phase 3 predicate: single-column conjunction of `column OP literal`
 /// Multi-column predicate set, AND-combined. Each `ColumnPredicate`
@@ -823,11 +823,7 @@ impl ColumnPredicate {
             ColumnPredicate::StringLike { negated, .. } => {
                 // No cheap way to estimate LIKE; assume substring
                 // matches are uncommon. NOT LIKE inverts.
-                if *negated {
-                    0.9
-                } else {
-                    0.1
-                }
+                if *negated { 0.9 } else { 0.1 }
             }
             // Refused-for-pushdown shapes; never reach here in practice.
             ColumnPredicate::F64Range { .. } | ColumnPredicate::I32ColumnPair { .. } => 0.5,
@@ -1000,11 +996,7 @@ impl ColumnPredicate {
                 pattern, negated, ..
             } => {
                 let m = matches_sql_like(pattern.as_str(), v);
-                if *negated {
-                    !m
-                } else {
-                    m
-                }
+                if *negated { !m } else { m }
             }
             _ => false,
         }
@@ -2227,6 +2219,7 @@ impl TableProvider for EmatixFastParquetTableProvider {
             self.late_mat,
             self.streaming_arrow_reader,
             projected_col_stats,
+            Arc::clone(&self.column_has_no_nulls),
         )?))
     }
 }
@@ -2269,6 +2262,12 @@ pub struct EmatixFastParquetExec {
     /// of `Statistics::new_unknown`. Same shape as
     /// `FastParquetExec.column_stats`.
     column_stats: Vec<datafusion::common::stats::ColumnStatistics>,
+    /// PV.M.7 — per-(file-schema-indexed) "column has no nulls" flags,
+    /// threaded from the provider. The masked-decode kernels carry no
+    /// def-levels, so the projection-prune fusion may only declare a
+    /// range predicate Exact (drop its residual FilterExec) on a
+    /// null-free column. File-indexed to match `BridgeFilter` col_idx.
+    column_has_no_nulls: Arc<Vec<bool>>,
     /// Σ.Q.L9 — runtime sideband for mid-query predicate injection.
     /// `None` = no sideband attached (normal case). When set, the
     /// scan's `execute()` consults this AFTER the build phase of any
@@ -2294,6 +2293,7 @@ impl EmatixFastParquetExec {
         late_mat: bool,
         streaming_arrow_reader: bool,
         column_stats: Vec<datafusion::common::stats::ColumnStatistics>,
+        column_has_no_nulls: Arc<Vec<bool>>,
     ) -> DfResult<Self> {
         let eq_props = EquivalenceProperties::new(schema.clone());
         let properties = Arc::new(PlanProperties::new(
@@ -2315,6 +2315,7 @@ impl EmatixFastParquetExec {
             late_mat,
             streaming_arrow_reader,
             column_stats,
+            column_has_no_nulls,
             runtime_sideband: None,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
@@ -2387,6 +2388,30 @@ impl EmatixFastParquetExec {
         self.num_rows
     }
 
+    // PV.M.7 — accessors for rebuilding a projection-pruned scan via
+    // `try_new` (drop filter-only output columns from the decode
+    // projection, keeping the BridgeFilter, to avoid the double
+    // Snappy-decompress of the predicate column).
+    pub fn decode_schema_ref(&self) -> &SchemaRef {
+        &self.decode_schema
+    }
+    pub fn assignments(&self) -> &[Vec<usize>] {
+        &self.assignments
+    }
+    pub fn rg_num_rows_arc(&self) -> &Arc<Vec<usize>> {
+        &self.rg_num_rows
+    }
+    pub fn exec_late_mat(&self) -> bool {
+        self.late_mat
+    }
+    pub fn exec_streaming_arrow_reader(&self) -> bool {
+        self.streaming_arrow_reader
+    }
+    /// PV.M.7 — file-schema-indexed "column has no nulls" flags.
+    pub fn column_has_no_nulls(&self) -> &[bool] {
+        &self.column_has_no_nulls
+    }
+
     /// Σ.Q.L4′ — append extra predicates (e.g. I64InBloom from a
     /// build-side bloom emitter) onto this scan's BridgeFilter. If
     /// no filter existed, creates one from the supplied predicates.
@@ -2418,6 +2443,7 @@ impl EmatixFastParquetExec {
             late_mat: self.late_mat,
             streaming_arrow_reader: self.streaming_arrow_reader,
             column_stats: self.column_stats.clone(),
+            column_has_no_nulls: self.column_has_no_nulls.clone(),
             runtime_sideband: self.runtime_sideband.clone(),
             properties: self.properties.clone(),
             metrics: ExecutionPlanMetricsSet::new(),
@@ -2446,6 +2472,7 @@ impl EmatixFastParquetExec {
             late_mat: self.late_mat,
             streaming_arrow_reader: self.streaming_arrow_reader,
             column_stats: self.column_stats.clone(),
+            column_has_no_nulls: self.column_has_no_nulls.clone(),
             runtime_sideband: self.runtime_sideband.clone(),
             properties: self.properties.clone(),
             metrics: ExecutionPlanMetricsSet::new(),
@@ -2466,6 +2493,7 @@ impl EmatixFastParquetExec {
             late_mat: self.late_mat,
             streaming_arrow_reader: self.streaming_arrow_reader,
             column_stats: self.column_stats.clone(),
+            column_has_no_nulls: self.column_has_no_nulls.clone(),
             runtime_sideband: self.runtime_sideband.clone(),
             properties: self.properties.clone(),
             metrics: ExecutionPlanMetricsSet::new(),
@@ -4547,8 +4575,8 @@ mod tests {
     /// guards the wire-up.
     #[tokio::test]
     async fn table_provider_statistics_exposes_typed_column_stats() {
-        use datafusion::common::stats::Precision;
         use datafusion::common::ScalarValue;
+        use datafusion::common::stats::Precision;
         use datafusion::parquet::basic::{Compression, Repetition, Type as PhysicalType};
         use datafusion::parquet::column::writer::ColumnWriter;
         use datafusion::parquet::file::properties::WriterProperties;
