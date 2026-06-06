@@ -1,0 +1,19 @@
+[package]
+name = "ematix-flow-push"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "PV.1 — morsel-driven PUSH pipeline kernel (fused scan→filter→project→probe). Sibling crate to ematix-flow-core; pure kernel with no DataFusion or Arrow dependency, so the optimizer-codegen-sensitivity tax stays in ematix-flow-core only when PV.2 wires it into an ExecutionPlan."
+
+[dependencies]
+# Intentionally empty (pure std). The kernel is primitive-typed
+# (i64/f64 slices, u32 selection indices). Per
+# project_optimizer_codegen_sensitivity.md, keeping perf-sensitive
+# code out of ematix-flow-core avoids the 5-8% LLVM-codegen tax that
+# new rule-walked operators have repeatedly paid. The HashTable
+# probe fallback uses std::collections::HashMap (SipHash) — faithful
+# to the PV.1 Phase-0 prototype's baseline; a faster fallback
+# (ematix-flow-hash-join RobinHood) is a later optimization.
