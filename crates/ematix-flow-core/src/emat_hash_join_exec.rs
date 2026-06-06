@@ -160,16 +160,31 @@ impl ExecutionPlan for EmatixHashJoinExec {
 
         let fut = async move {
             // Build once, shared across probe partitions.
+            //
+            // SF100.6 v2: parallel build-side drain. v1 (sequential `for p in
+            // 0..nparts`) serialized the decode/drain of all 14 build partitions
+            // into one task → caught the predicted single-threaded-build wall on
+            // Q10 SF=100 (5.73M wide-string cust⋈orders rows, never completed a
+            // trial in ~45min). Now: spawn `nparts` concurrent drain tasks via
+            // `try_join_all` so the build side decodes in parallel (matches the
+            // probe side's parallelism). The hash-table INSERT stays serial — a
+            // smaller next-step lever; reclaiming the drain is what the dig's
+            // metrics localized as dominant.
             let joiner = build_once
                 .get_or_try_init(|| async {
                     let nparts = left.output_partitioning().partition_count();
-                    let mut batches = Vec::new();
-                    for p in 0..nparts {
-                        let mut s = left.execute(p, build_ctx.clone())?;
-                        while let Some(b) = s.try_next().await? {
-                            batches.push(b);
+                    let drain_futs = (0..nparts).map(|p| {
+                        let left = left.clone();
+                        let ctx = build_ctx.clone();
+                        async move {
+                            let s = left.execute(p, ctx)?;
+                            let v: Vec<RecordBatch> = s.try_collect().await?;
+                            Ok::<Vec<RecordBatch>, DataFusionError>(v)
                         }
-                    }
+                    });
+                    let per_part: Vec<Vec<RecordBatch>> =
+                        futures_util::future::try_join_all(drain_futs).await?;
+                    let batches: Vec<RecordBatch> = per_part.into_iter().flatten().collect();
                     EmatHashJoiner::try_build(
                         &batches,
                         build_key_idx,

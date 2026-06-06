@@ -30,7 +30,9 @@ use datafusion::config::ConfigOptions;
 use datafusion::physical_expr::expressions::Column;
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::ExecutionPlan;
+use datafusion::physical_plan::coalesce_batches::CoalesceBatchesExec;
 use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode};
+use datafusion::physical_plan::repartition::RepartitionExec;
 
 use crate::emat_hash_join::JoinColumn;
 use crate::emat_hash_join_exec::EmatixHashJoinExec;
@@ -40,6 +42,37 @@ pub struct SwapEmatixHashJoinRule;
 
 fn widens_to_i64(dt: &DataType) -> bool {
     matches!(dt, DataType::Int64 | DataType::Int32)
+}
+
+/// SF100.6 — opt-in (with `EMAT_HASH_JOIN=1`) extension to ALSO swap
+/// `PartitionMode::Partitioned` joins, not just CollectLeft. EmatixHashJoinExec
+/// requires only `UnspecifiedDistribution` and builds a single shared table
+/// probed in-place, so stripping the Partitioned join's RepartitionExec inputs
+/// yields the DuckDB-style no-shuffle parallel-probe join that DataFusion lacks
+/// as a stock operator. Tightly gated by the probe-cardinality floor (the v1
+/// build is single-threaded, so this must be a big-fact probe to pay off).
+fn partitioned_enabled() -> bool {
+    std::env::var("EMAT_HJ_PARTITIONED")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+/// Strip Hash `RepartitionExec` / `CoalesceBatchesExec` wrappers to recover the
+/// pre-shuffle input. Both preserve schema (so the join's key indices + output
+/// name-mapping stay valid) and, for a same-count hash repartition (the SF=100
+/// fact-join case), partition count too. EmatixHashJoinExec then sees no
+/// required distribution → EnforceDistribution inserts no shuffle.
+fn strip_shuffle(plan: &Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
+    let mut cur = plan.clone();
+    loop {
+        if let Some(rp) = cur.as_any().downcast_ref::<RepartitionExec>() {
+            cur = rp.input().clone();
+        } else if let Some(cb) = cur.as_any().downcast_ref::<CoalesceBatchesExec>() {
+            cur = cb.input().clone();
+        } else {
+            return cur;
+        }
+    }
 }
 
 /// HJ.5c — the *reliable* probe-cardinality signal: the largest base-SCAN row
@@ -66,9 +99,14 @@ fn try_swap(hj: &HashJoinExec) -> Option<EmatixHashJoinExec> {
     if *hj.join_type() != JoinType::Inner {
         return None;
     }
-    if *hj.partition_mode() != PartitionMode::CollectLeft {
-        return None;
-    }
+    // CollectLeft: DataFusion already collected the build → inputs used as-is.
+    // Partitioned (opt-in EMAT_HJ_PARTITIONED=1): strip the RepartitionExec
+    // shuffles below, giving a no-shuffle parallel-probe join.
+    let partitioned = match *hj.partition_mode() {
+        PartitionMode::CollectLeft => false,
+        PartitionMode::Partitioned if partitioned_enabled() => true,
+        _ => return None,
+    };
     if hj.filter().is_some() {
         return None;
     }
@@ -113,6 +151,12 @@ fn try_swap(hj: &HashJoinExec) -> Option<EmatixHashJoinExec> {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
+    // Partitioned-mode swap with NO cardinality gate would risk single-threading
+    // a huge build → refuse. The gate is exactly what restricts us to the
+    // big-fact probe join (e.g. orders⋈lineitem) and away from dim⋈dim joins.
+    if partitioned && min_probe == 0 && ratio == 0 {
+        return None;
+    }
     if min_probe > 0 || ratio > 0 {
         // HJ.5c: scan-anchored, not join-output-estimate. Probe = RIGHT subtree's
         // largest base scan; build = LEFT subtree's largest base scan (only used
@@ -153,9 +197,16 @@ fn try_swap(hj: &HashJoinExec) -> Option<EmatixHashJoinExec> {
         });
     }
 
+    // Partitioned: strip the RepartitionExec inputs so the swapped operator's
+    // UnspecifiedDistribution leaves no shuffle. CollectLeft: inputs as-is.
+    let (build_input, probe_input) = if partitioned {
+        (strip_shuffle(hj.left()), strip_shuffle(hj.right()))
+    } else {
+        (hj.left().clone(), hj.right().clone())
+    };
     Some(EmatixHashJoinExec::new(
-        hj.left().clone(),
-        hj.right().clone(),
+        build_input,
+        probe_input,
         lcol.index(),
         rcol.index(),
         output,

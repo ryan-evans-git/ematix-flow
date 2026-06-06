@@ -75,12 +75,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ctx = SessionContext::new_with_state(builder.build());
     register_tables(&ctx, &data_dir)?;
 
-    // Warm OS cache + any process-level caches.
-    let _ = ctx.sql(&sql).await?.collect().await?;
-    let _ = ctx.sql(&sql).await?.collect().await?;
-
+    // EXPLAIN_PLAN_ONLY=1 → plain EXPLAIN (no execution, no warm-up): inspect the
+    // physical plan STRUCTURE (join mode, RepartitionExec) without paying the
+    // (possibly pathological / timeout-prone) execution. Default = EXPLAIN ANALYZE.
+    let plan_only = std::env::var("EXPLAIN_PLAN_ONLY").ok().as_deref() == Some("1");
+    if !plan_only {
+        // Warm OS cache + any process-level caches.
+        let _ = ctx.sql(&sql).await?.collect().await?;
+        let _ = ctx.sql(&sql).await?.collect().await?;
+    }
+    let explain_kw = if plan_only { "EXPLAIN" } else { "EXPLAIN ANALYZE" };
     let batches = ctx
-        .sql(&format!("EXPLAIN ANALYZE {sql}"))
+        .sql(&format!("{explain_kw} {sql}"))
         .await?
         .collect()
         .await?;
