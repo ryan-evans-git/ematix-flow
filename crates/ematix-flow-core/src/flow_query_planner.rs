@@ -103,9 +103,43 @@ impl QueryPlanner for FlowQueryPlanner {
         // join order, matching the bench. Best-effort: fall back to the
         // un-re-optimized plan on error (correctness is unaffected either way).
         let planned = session_state.optimize(&planned).unwrap_or(planned);
-        DefaultPhysicalPlanner::default()
+
+        // PV.3b (EMAT_PUSH_PIPELINE=1, default OFF): rebuild the star's
+        // fact-probing dim groups as a single fused push pipeline. The reorder
+        // runs AFTER the logical optimizer (so the optimizer never sees — and
+        // can't undo — the FusedProbeNode) and is planned by FusedProbePlanner.
+        // Best-effort: reconstruct returns None on any unsupported shape, and
+        // the FusedProbePlanner is registered only on this gated path so the
+        // default planner stays byte-identical when OFF.
+        if crate::push_fusion_rule::enabled() {
+            let planned = match crate::push_fusion_rule::reconstruct(&planned) {
+                Some(p) => p,
+                None => planned,
+            };
+            let planner = DefaultPhysicalPlanner::with_extension_planners(vec![Arc::new(
+                crate::fused_probe_node::FusedProbePlanner,
+            )]);
+            let plan = planner
+                .create_physical_plan(&planned, session_state)
+                .await?;
+            return match crate::fuse_push_pipeline_rule::fuse_push_pipelines(plan.clone()) {
+                Ok(fused) => Ok(fused),
+                Err(_) => Ok(plan),
+            };
+        }
+
+        let plan = DefaultPhysicalPlanner::default()
             .create_physical_plan(&planned, session_state)
-            .await
+            .await?;
+        // PV.3 (EMAT_PUSH_PIPELINE=1, default OFF): fuse CollectLeft
+        // membership-reduction joins on a sideband-free EMAT fact scan into
+        // EmatPushPipelineExec. Runs LAST, after the physical optimizer has
+        // assigned partition modes + any L9 sideband (its gates read those).
+        // Best-effort: a transform error falls back to the stock plan.
+        match crate::fuse_push_pipeline_rule::fuse_push_pipelines(plan.clone()) {
+            Ok(fused) => Ok(fused),
+            Err(_) => Ok(plan),
+        }
     }
 }
 

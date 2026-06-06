@@ -3758,6 +3758,8 @@ dependencies = [
  "deadpool-postgres",
  "deltalake",
  "duckdb",
+ "ematix-flow-hash-join",
+ "ematix-flow-push",
  "ematix-parquet-codec",
  "ematix-parquet-format",
  "ematix-parquet-io",
@@ -3824,6 +3826,18 @@ dependencies = [
  "tracing",
  "url",
 ]
+
+[[package]]
+name = "ematix-flow-hash-join"
+version = "0.9.0"
+dependencies = [
+ "criterion",
+ "rand 0.9.4",
+]
+
+[[package]]
+name = "ematix-flow-push"
+version = "0.9.0"
 
 [[package]]
 name = "ematix-flow-py"

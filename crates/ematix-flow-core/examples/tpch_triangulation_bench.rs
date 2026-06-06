@@ -26,8 +26,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 use datafusion::execution::session_state::SessionStateBuilder;
-use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::ExecutionPlanProperties;
+use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::prelude::{SessionConfig, SessionContext};
 use ematix_flow_core::bloom::ContextBlooms;
 use ematix_flow_core::dedupe_aggregate_rule::DedupeAggregateForFloatDeterminism;
@@ -38,7 +38,7 @@ use ematix_flow_core::force_collect_left_semi_build_rule::ForceCollectLeftForSem
 use ematix_flow_core::fused_aggregate_filter_multi_agg_rule::InjectFilterMultiAggRule;
 use ematix_flow_core::fused_aggregate_filter_sum_rule::InjectFilterSumRule;
 use ematix_flow_core::inbloom_scan_pushdown_rule::EnableInBloomScanPushdownRule;
-use ematix_flow_core::local_bloom_emitter::{emit_build_side_blooms_local, LocalBloomOptions};
+use ematix_flow_core::local_bloom_emitter::{LocalBloomOptions, emit_build_side_blooms_local};
 use ematix_flow_core::push_down_left_semi_rule::PushDownLeftSemiRule;
 use ematix_flow_core::robin_hood_sum_f64_exec::EnableRobinHoodSumF64Rule;
 use ematix_flow_core::runtime_bloom_cascading_rule::EnableCascadingBloomRule;

@@ -29,13 +29,13 @@ use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::ExecutionPlanProperties;
 use datafusion::prelude::{SessionConfig, SessionContext};
 use ematix_flow_core::robin_hood_agg_rule::{
-    EnableRobinHoodAggregateRule, DEFAULT_RH_COUNT_MAX_GROUPS, DEFAULT_RH_COUNT_MIN_GROUPS,
+    DEFAULT_RH_COUNT_MAX_GROUPS, DEFAULT_RH_COUNT_MIN_GROUPS, EnableRobinHoodAggregateRule,
 };
 use ematix_flow_core::robin_hood_avg_f64_exec::{
-    EnableRobinHoodAvgF64Rule, DEFAULT_RH_AVG_F64_MAX_GROUPS, DEFAULT_RH_AVG_F64_MIN_GROUPS,
+    DEFAULT_RH_AVG_F64_MAX_GROUPS, DEFAULT_RH_AVG_F64_MIN_GROUPS, EnableRobinHoodAvgF64Rule,
 };
 use ematix_flow_core::robin_hood_sum_f64_exec::{
-    EnableRobinHoodSumF64Rule, DEFAULT_RH_SUM_F64_MAX_GROUPS, DEFAULT_RH_SUM_F64_MIN_GROUPS,
+    DEFAULT_RH_SUM_F64_MAX_GROUPS, DEFAULT_RH_SUM_F64_MIN_GROUPS, EnableRobinHoodSumF64Rule,
 };
 use futures_util::TryStreamExt;
 

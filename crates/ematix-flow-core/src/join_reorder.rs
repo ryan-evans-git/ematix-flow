@@ -81,13 +81,19 @@ fn table_provider_stats(ts: &TableScan) -> Option<Statistics> {
 /// to the new left-deep chain by name lookup against the in-scope
 /// schema at each step.
 #[derive(Debug)]
-struct InnerJoinChain {
-    leaves: Vec<LogicalPlan>,
-    equi_preds: Vec<(Column, Column)>,
+/// Flattened inner-join region: the leaves + the equi-edge graph among
+/// them. `pub(crate)` so the PV.3b push-fusion recognizer
+/// ([`crate::push_fusion_rule`]) can reuse the same flattening (it descends
+/// transparently through the optimizer's column-pruning Projections and
+/// keeps `SubqueryAlias` leaves distinct, so `n1`/`n2` stay separate and
+/// `equi_preds` carry relation-qualified columns).
+pub(crate) struct InnerJoinChain {
+    pub(crate) leaves: Vec<LogicalPlan>,
+    pub(crate) equi_preds: Vec<(Column, Column)>,
     /// Filter expressions that sat directly on the original Join's
     /// `filter` slot (non-equi conditions). Preserved as a single
     /// AND-conjunction applied to the rebuilt chain root.
-    extra_filter: Option<Expr>,
+    pub(crate) extra_filter: Option<Expr>,
 }
 
 /// Σ.AH.X Lever G — shape predicates for narrowing `reorder_inner_joins`
@@ -414,7 +420,7 @@ fn column_name_is_aggregate(col: &Column) -> bool {
 /// Walk down through `Inner Join` nodes, accumulating leaves +
 /// equi-join predicates. Returns `None` if the subtree isn't a pure
 /// inner-join chain (e.g. has an outer join inside it).
-fn flatten_inner_join_chain(plan: &LogicalPlan) -> Option<InnerJoinChain> {
+pub(crate) fn flatten_inner_join_chain(plan: &LogicalPlan) -> Option<InnerJoinChain> {
     let mut leaves: Vec<LogicalPlan> = Vec::new();
     let mut equi: Vec<(Column, Column)> = Vec::new();
     let mut extra_filters: Vec<Expr> = Vec::new();

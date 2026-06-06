@@ -422,6 +422,12 @@ async fn run_ematix(
         };
         builder = builder.with_physical_optimizer_rule(Arc::new(l9_rule));
     }
+    // HJ.4: SIMD-tag/RobinHood join-probe swap. Dormant unless EMAT_HASH_JOIN=1
+    // (Tag path additionally via EMAT_HJ_TAG=1); registered last so the join's
+    // partition_mode is already assigned. No-op for default validation runs.
+    builder = builder.with_physical_optimizer_rule(Arc::new(
+        ematix_flow_core::swap_emat_hash_join_rule::SwapEmatixHashJoinRule,
+    ));
     let state = builder.build();
     let ctx = SessionContext::new_with_state(state);
     for t in TPCH_TABLES {

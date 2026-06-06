@@ -40,15 +40,15 @@
 use std::sync::Arc;
 
 use datafusion::arrow::datatypes::DataType;
+use datafusion::common::Result as DfResult;
 use datafusion::common::config::ConfigOptions;
 use datafusion::common::stats::Precision;
 use datafusion::common::tree_node::{Transformed, TreeNode};
-use datafusion::common::Result as DfResult;
 use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::physical_expr::expressions::Column;
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
-use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode};
 use datafusion::physical_plan::ExecutionPlan;
+use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode};
 
 use crate::robin_hood_agg::{RobinHoodAggregateExec, RobinHoodMode};
 

@@ -46,35 +46,33 @@ const SIM_BLOOM_KEYS: &[i64] = &[
     95537, 96569, 97597, 98621, 99649, 99990, 99000,
 ];
 
-/// T1: decode-only. Sum of computed expressions touching all 5 cols.
-/// `sum(col % small_prime)` avoids stats-based short-circuit (DuckDB's
-/// `count(col)` and `max(col)` can be answered from parquet stats).
+/// Q08 LATE-MAT CEILING — B: full dense decode of all 5 Q08 lineitem
+/// cols (l_partkey, l_orderkey, l_suppkey, l_extendedprice, l_discount),
+/// NO filter. This is ≈ what our current Q08 plan pays at the scan
+/// (all 60M rows, all 5 cols). B − A = payload decode cost = the
+/// MAX a perfect bloom-driven late-materialization could remove.
 fn t1_sql() -> String {
     "SELECT \
        sum(l_extendedprice * (1.0 - l_discount)), \
-       sum(l_orderkey % 7) + sum(l_suppkey % 11), \
-       sum(extract(year FROM l_shipdate)) \
+       sum(l_partkey % 7) + sum(l_suppkey % 11) + sum(l_orderkey % 13) \
      FROM lineitem"
         .to_string()
 }
 
-/// T2: T1 + date-range filter. Adds column predicate evaluation. The
-/// shipdate filter is the same as Q07's. Row-group stats may prune
-/// some groups; the filter still needs per-row evaluation for the
-/// surviving groups' boundary pages.
+/// Q08 LATE-MAT CEILING — A: decode just the two MANDATORY join keys
+/// (l_partkey for BF(p_partkey), l_orderkey for BF(o_orderkey)). These
+/// MUST be decoded to apply any bloom; this is the irreducible decode
+/// floor for a bloom-pushdown lineitem scan. (`% prime` defeats any
+/// stats short-circuit.)
 fn t2_sql() -> String {
-    "SELECT \
-       sum(l_extendedprice * (1.0 - l_discount)), \
-       sum(l_orderkey % 7) + sum(l_suppkey % 11) \
-     FROM lineitem \
-     WHERE l_shipdate BETWEEN DATE '1995-01-01' AND DATE '1996-12-31'"
-        .to_string()
+    "SELECT sum(l_partkey % 7) + sum(l_orderkey % 11) FROM lineitem".to_string()
 }
 
-/// T3: T2 + IN-list on l_suppkey. Simulates the cost of L9's runtime
-/// bloom: a per-row membership test against ~100 keys. If T3 - T2 is
-/// large for ematix but small for DuckDB, the IN-list / bloom-apply
-/// path is the lever (not raw decode).
+/// Q08 LATE-MAT CEILING — C: all 5 Q08 cols + a SELECTIVE membership
+/// filter on l_suppkey (~100/100000 = ~0.1% pass ≈ Q08's 37K-of-60M
+/// bloom selectivity). If our provider's masked-decode path skips
+/// payload-column page-decompress for filtered rows, C collapses toward
+/// A (the 2-key cost). If C ≈ B, decompress is unskippable (REV.20).
 fn t3_sql() -> String {
     let in_list = SIM_BLOOM_KEYS
         .iter()
@@ -84,10 +82,9 @@ fn t3_sql() -> String {
     format!(
         "SELECT \
            sum(l_extendedprice * (1.0 - l_discount)), \
-           sum(l_orderkey % 7) \
+           sum(l_partkey % 7) + sum(l_suppkey % 11) + sum(l_orderkey % 13) \
          FROM lineitem \
-         WHERE l_shipdate BETWEEN DATE '1995-01-01' AND DATE '1996-12-31' \
-           AND l_suppkey IN ({in_list})"
+         WHERE l_suppkey IN ({in_list})"
     )
 }
 
@@ -157,19 +154,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let tests: &[(&str, String, &str)] = &[
         (
-            "T1 decode-only (5 cols)",
+            "B: 5-col full decode",
             t1_sql(),
-            "All 5 Q07 cols, no filter",
+            "all 5 Q08 cols, no filter (≈current Q08 scan)",
         ),
         (
-            "T2 decode+date filter",
+            "A: 2-key decode (floor)",
             t2_sql(),
-            "4 cols + l_shipdate predicate",
+            "l_partkey+l_orderkey only (mandatory for bloom)",
         ),
         (
-            "T3 decode+date+IN(100)",
+            "C: 5-col + IN(~0.1%)",
             t3_sql(),
-            "3 cols + date + 100-key IN-list",
+            "all 5 cols + selective l_suppkey IN(100)",
         ),
     ];
 

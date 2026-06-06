@@ -119,6 +119,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         require_filtered_build: false,
         max_expected_keys_per_partition: 0,
     }));
+    // HJ.3: swap rule runs last; no-op unless EMAT_HASH_JOIN=1.
+    builder = builder.with_physical_optimizer_rule(Arc::new(
+        ematix_flow_core::swap_emat_hash_join_rule::SwapEmatixHashJoinRule,
+    ));
     let state = builder.build();
     let ctx = SessionContext::new_with_state(state);
 

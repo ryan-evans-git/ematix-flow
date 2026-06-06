@@ -31,13 +31,13 @@ use std::sync::Arc;
 
 use datafusion::arrow::array::{Float64Array, Int64Array, RecordBatch};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use datafusion::common::DataFusionError;
+use datafusion::common::Result as DfResult;
 use datafusion::common::config::ConfigOptions;
 use datafusion::common::stats::Precision;
 use datafusion::common::tree_node::{Transformed, TreeNode};
-use datafusion::common::DataFusionError;
-use datafusion::common::Result as DfResult;
-use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::execution::TaskContext;
+use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::physical_expr::expressions::Column;
 use datafusion::physical_expr::{EquivalenceProperties, Partitioning};
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
