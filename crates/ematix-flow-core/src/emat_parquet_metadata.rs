@@ -78,10 +78,28 @@ fn arrow_type_for(se: &SchemaElement<'_>) -> DataType {
             se.logical_type,
             Some(ematix_parquet_format::metadata::LogicalType::String)
         );
+    // KEYS.4.a — an INT64 column marked UINT_64 (legacy converted_type or
+    // modern logical_type Integer{bit_width:64,is_signed:false}) is surfaced
+    // as UInt64 so it is decoded, compared, sorted, and aggregated unsigned
+    // end-to-end. Fixes the latent ORDER BY/range bug for values >= 2^63
+    // (the i64 reading inverts ordering). TPC-H has no unsigned columns, so
+    // this arm never fires on the 22q bench (tpch_validate stays 22/22); it
+    // only changes columns genuinely marked UINT_64.
+    let is_unsigned_64 = matches!(se.converted_type, Some(ConvertedType::Uint64))
+        || matches!(
+            se.logical_type,
+            Some(ematix_parquet_format::metadata::LogicalType::Integer(
+                ematix_parquet_format::metadata::IntType {
+                    bit_width: 64,
+                    is_signed: false,
+                }
+            ))
+        );
     match se.column_type {
         Some(ParquetType::Boolean) => DataType::Boolean,
         Some(ParquetType::Int32) if is_date => DataType::Date32,
         Some(ParquetType::Int32) => DataType::Int32,
+        Some(ParquetType::Int64) if is_unsigned_64 => DataType::UInt64,
         Some(ParquetType::Int64) => DataType::Int64,
         Some(ParquetType::Float) => DataType::Float32,
         Some(ParquetType::Double) => DataType::Float64,
@@ -563,6 +581,60 @@ mod tests {
         assert_eq!(
             scalar_from_le_bytes(&DataType::Int64, &(-7i64).to_le_bytes()),
             Some(ScalarValue::Int64(Some(-7)))
+        );
+    }
+
+    /// KEYS.4.a — an INT64 column carrying the UINT_64 marker (legacy
+    /// converted_type OR modern logical_type Integer{64,unsigned}) maps to
+    /// DataType::UInt64 so it is processed unsigned end-to-end. A plain
+    /// INT64 (incl. signed Integer{64}) stays Int64 — TPC-H has no unsigned
+    /// columns, so the flip is inert on the 22q bench.
+    #[test]
+    fn arrow_type_for_maps_uint64_marker_to_uint64() {
+        use ematix_parquet_format::metadata::{IntType, LogicalType, SchemaElement};
+        use ematix_parquet_format::types::{ConvertedType, ParquetType};
+        fn se<'a>(ct: Option<ConvertedType>, lt: Option<LogicalType<'a>>) -> SchemaElement<'a> {
+            SchemaElement {
+                column_type: Some(ParquetType::Int64),
+                type_length: None,
+                repetition_type: None,
+                name: b"k",
+                num_children: None,
+                converted_type: ct,
+                scale: None,
+                precision: None,
+                field_id: None,
+                logical_type: lt,
+            }
+        }
+        // Legacy converted_type marker.
+        assert_eq!(
+            arrow_type_for(&se(Some(ConvertedType::Uint64), None)),
+            DataType::UInt64
+        );
+        // Modern logical_type marker.
+        assert_eq!(
+            arrow_type_for(&se(
+                None,
+                Some(LogicalType::Integer(IntType {
+                    bit_width: 64,
+                    is_signed: false,
+                })),
+            )),
+            DataType::UInt64
+        );
+        // Plain INT64 stays Int64 (the TPC-H / no-regression case).
+        assert_eq!(arrow_type_for(&se(None, None)), DataType::Int64);
+        // Signed Integer{64} stays Int64.
+        assert_eq!(
+            arrow_type_for(&se(
+                None,
+                Some(LogicalType::Integer(IntType {
+                    bit_width: 64,
+                    is_signed: true,
+                })),
+            )),
+            DataType::Int64
         );
     }
 
