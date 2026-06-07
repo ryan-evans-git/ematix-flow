@@ -970,6 +970,79 @@ mod tests {
         );
     }
 
+    /// KEYS.5.d — a string build above EMAT_L9_SET_THRESHOLD (32_768)
+    /// overflows the exact set, so the emitter publishes a StringInBloom.
+    /// This drives the StringInBloom branch of build_bitmap end-to-end and
+    /// proves bloom false-positives are caught by the residual join (the
+    /// final row count stays exact). Both sides have >32_768 distinct keys,
+    /// so the path is the bloom regardless of which side becomes the build.
+    #[tokio::test]
+    async fn rule_string_join_uses_bloom_above_threshold() {
+        let dim = tmp_parquet("dim_bloom_str");
+        let fact = tmp_parquet("fact_bloom_str");
+        // dim: 33_000 distinct keys (> 32_768 → set overflows → bloom).
+        let dim_keys: Vec<String> = (0..33_000).map(|i| format!("d{i:06}")).collect();
+        let dim_refs: Vec<&str> = dim_keys.iter().map(|s| s.as_str()).collect();
+        write_utf8_parquet(&dim, ("d_key", &dim_refs), None);
+        // fact: 40_000 rows; first 20_000 match dim (d000000..d019999), last
+        // 20_000 don't (z...). 40_000 distinct keys → also the bloom path if
+        // it ends up the build side.
+        let fact_keys: Vec<String> = (0..40_000)
+            .map(|i| {
+                if i < 20_000 {
+                    format!("d{i:06}")
+                } else {
+                    format!("z{i:06}")
+                }
+            })
+            .collect();
+        let fact_refs: Vec<&str> = fact_keys.iter().map(|s| s.as_str()).collect();
+        let fact_vals: Vec<i64> = (0..40_000).collect();
+        write_utf8_parquet(&fact, ("f_key", &fact_refs), Some(("f_val", &fact_vals)));
+
+        let cfg = SessionConfig::new().with_target_partitions(4);
+        let state = SessionStateBuilder::new()
+            .with_default_features()
+            .with_config(cfg)
+            .with_physical_optimizer_rule(Arc::new(EnableRuntimeBloomSidebandRule {
+                min_probe_to_build_ratio: 0,
+                allow_inner_join: true,
+                require_filtered_build: false,
+                max_expected_keys_per_partition: 0,
+            }))
+            .build();
+        let ctx = SessionContext::new_with_state(state);
+        ctx.register_table(
+            "dim",
+            Arc::new(EmatixFastParquetTableProvider::try_new(dim.to_string_lossy()).unwrap()),
+        )
+        .unwrap();
+        ctx.register_table(
+            "fact",
+            Arc::new(EmatixFastParquetTableProvider::try_new(fact.to_string_lossy()).unwrap()),
+        )
+        .unwrap();
+
+        let df = ctx
+            .sql("SELECT f_val FROM dim JOIN fact ON d_key = f_key")
+            .await
+            .unwrap();
+        let plan = df.clone().create_physical_plan().await.unwrap();
+        let s = format!("{plan:?}");
+        assert!(
+            s.contains("BuildSideBloomEmitterExec"),
+            "expected the L9 wrapper on the bloom-path string join:\n{s}"
+        );
+        // Exactly the 20_000 matching fact rows — any bloom false-positives on
+        // the 20_000 z-keys are dropped by the residual HashJoin equality test.
+        let batches = df.collect().await.unwrap();
+        let row_count: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(
+            row_count, 20_000,
+            "bloom-path string join must stay exact (residual join filters FPs)"
+        );
+    }
+
     /// Σ.Q.L9 extension — verify the rule fires on a join whose
     /// probe side is itself a HashJoinExec. Mirrors Q18's RightSemi
     /// shape where the outer join's bloom needs to descend through

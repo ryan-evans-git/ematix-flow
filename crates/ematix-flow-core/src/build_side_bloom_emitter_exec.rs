@@ -1388,6 +1388,66 @@ mod tests {
         }
     }
 
+    fn make_str_batch_opt(keys: Vec<Option<&str>>) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Utf8, true)]));
+        RecordBatch::try_new(schema, vec![Arc::new(arrow_array::StringArray::from(keys))]).unwrap()
+    }
+
+    #[tokio::test]
+    async fn string_build_skips_null_keys() {
+        // KEYS.5.d — NULL keys never match an equi-join; the emitter's
+        // for_each_non_null_str must skip them, so the published StringInSet
+        // carries only the distinct NON-null build keys (no empty-string or
+        // phantom entry for the nulls).
+        let ctx = SessionContext::new();
+        let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Utf8, true)]));
+        let mt = MemTable::try_new(
+            schema.clone(),
+            vec![vec![make_str_batch_opt(vec![
+                Some("A"),
+                None,
+                Some("B"),
+                None,
+                Some("A"), // dup
+                Some("C"),
+            ])]],
+        )
+        .unwrap();
+        ctx.register_table("t", Arc::new(mt)).unwrap();
+        let plan = ctx
+            .sql("SELECT k FROM t")
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+
+        let sideband = BridgeFilterSideband::new();
+        let wrapper = BuildSideBloomEmitterExec::try_new(plan, 0, 5, sideband.clone(), 16).unwrap();
+        let n = wrapper.properties().output_partitioning().partition_count();
+        for p in 0..n {
+            let mut s = wrapper
+                .execute(p, Arc::new(TaskContext::default()))
+                .unwrap();
+            while let Some(_b) = s.try_next().await.unwrap() {}
+        }
+        let preds = sideband.peek().expect("sideband was not published to");
+        match &preds[0] {
+            ColumnPredicate::StringInSet { col_idx, set } => {
+                assert_eq!(*col_idx, 5);
+                assert_eq!(set.len(), 3, "expected only the 3 distinct non-null keys");
+                for k in ["A", "B", "C"] {
+                    assert!(set.contains(k), "missing key {k}");
+                }
+                assert!(
+                    !set.contains(""),
+                    "the nulls must not appear as empty strings"
+                );
+            }
+            other => panic!("expected StringInSet, got {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn forwards_batches_unchanged() {
         let ctx = SessionContext::new();
