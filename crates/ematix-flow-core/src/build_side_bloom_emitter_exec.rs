@@ -81,7 +81,6 @@ fn l9_set_threshold() -> usize {
 /// Accepted: the signed/unsigned integer widths that fit in i64 plus the
 /// date types (which are i32/i64 day/ms counts underneath). Excluded by
 /// design — each needs a DIFFERENT structure, tracked as follow-ups:
-///   * `UInt64` — can exceed `i64::MAX`; needs a parallel u64 bloom.
 ///   * `Float32/64` — float equi-join is a semantic anti-pattern and bit-
 ///     pattern hashing is unsafe across encodings.
 ///   * `Utf8 / Utf8View / Dictionary` — need a byte/hash bloom + a string
@@ -98,6 +97,13 @@ pub fn widens_to_i64(dt: &datafusion::arrow::datatypes::DataType) -> bool {
             | DataType::UInt8
             | DataType::UInt16
             | DataType::UInt32
+            // KEYS.4.d-part2: UInt64 joins the i64 bloom domain via a
+            // bit-pattern reinterpret (NOT a value widening). Equality is
+            // bit-based, so a u64 build key and a u64 probe key with the
+            // same value have identical i64 bits on both sides. The emitter
+            // bitcasts u64→i64 at insert (see the cast site); the probe
+            // already reads i64 bits (UInt64 decodes to DecodedColumn::Int64).
+            | DataType::UInt64
             | DataType::Date32
             | DataType::Date64
     )
@@ -362,6 +368,24 @@ impl ExecutionPlan for BuildSideBloomEmitterExec {
                 let key_arr: datafusion::arrow::array::ArrayRef =
                     if raw.data_type() == &datafusion::arrow::datatypes::DataType::Int64 {
                         raw.clone()
+                    } else if raw.data_type() == &datafusion::arrow::datatypes::DataType::UInt64 {
+                        // KEYS.4.d-part2: u64 → i64 by BIT REINTERPRET, not
+                        // arrow `cast` (which nulls values >= 2^63 under the
+                        // default safe options, silently dropping those build
+                        // keys from the bloom → false negatives → lost join
+                        // rows). Equality is bit-pattern based; the probe side
+                        // reads the same i64 bits (UInt64 decodes to
+                        // DecodedColumn::Int64), so identical u64 values match.
+                        let u = raw
+                            .as_any()
+                            .downcast_ref::<datafusion::arrow::array::UInt64Array>()
+                            .expect("data_type()==UInt64 guarantees UInt64Array");
+                        let scalar = datafusion::arrow::buffer::ScalarBuffer::<i64>::new(
+                            u.values().inner().clone(),
+                            0,
+                            u.len(),
+                        );
+                        std::sync::Arc::new(Int64Array::new(scalar, u.nulls().cloned()))
                     } else {
                         match datafusion::arrow::compute::cast(
                             raw,
@@ -732,7 +756,9 @@ mod tests {
     #[test]
     fn widens_to_i64_accepts_integer_and_date_family_only() {
         use arrow_schema::DataType as Dt;
-        // i64-domain: ride the existing i64 bloom by lossless widening.
+        // i64-domain: ride the existing i64 bloom. Signed/small-unsigned/date
+        // types widen losslessly; UInt64 rides via a bit reinterpret
+        // (KEYS.4.d-part2) since equality is bit-pattern based.
         for dt in [
             Dt::Int8,
             Dt::Int16,
@@ -741,22 +767,16 @@ mod tests {
             Dt::UInt8,
             Dt::UInt16,
             Dt::UInt32,
+            Dt::UInt64,
             Dt::Date32,
             Dt::Date64,
         ] {
-            assert!(widens_to_i64(&dt), "{dt:?} should widen to i64");
+            assert!(widens_to_i64(&dt), "{dt:?} should ride the i64 sideband");
         }
-        // Need a DIFFERENT bloom (u64 / byte-hash) — must NOT be accepted by
-        // the i64 sideband: UInt64 can overflow i64; floats are an equi-join
-        // anti-pattern + bit-pattern hazard; strings need a byte/hash bloom.
-        for dt in [
-            Dt::UInt64,
-            Dt::Float32,
-            Dt::Float64,
-            Dt::Utf8,
-            Dt::Utf8View,
-            Dt::Boolean,
-        ] {
+        // Need a DIFFERENT bloom — must NOT be accepted by the i64 sideband:
+        // floats are an equi-join anti-pattern + bit-pattern hazard; strings
+        // need a byte/hash bloom.
+        for dt in [Dt::Float32, Dt::Float64, Dt::Utf8, Dt::Utf8View, Dt::Boolean] {
             assert!(
                 !widens_to_i64(&dt),
                 "{dt:?} must NOT ride the i64 sideband (needs a different bloom)"
@@ -814,6 +834,64 @@ mod tests {
                 assert!(!set.contains(999));
             }
             other => panic!("expected I64InSet from a widened Int32 build, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn uint64_build_key_rides_i64_sideband_via_bitcast() {
+        // KEYS.4.d-part2: a UInt64 build key rides the i64 sideband via a
+        // bit reinterpret. Values >= 2^63 — which arrow's value-cast would
+        // null under safe options — must still land in the set as their i64
+        // bit pattern so a u64 probe with the same value matches. Also
+        // exercises 4.d-part1: 2^63 bitcasts to i64::MIN (the old empty
+        // sentinel), which the has_min fix makes a storable key.
+        use arrow_array::UInt64Array;
+        let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::UInt64, false)]));
+        let keys: Vec<u64> = vec![5, 1u64 << 63, u64::MAX, 7];
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(UInt64Array::from(keys.clone()))])
+                .unwrap();
+        let ctx = SessionContext::new();
+        let mt = MemTable::try_new(schema.clone(), vec![vec![batch]]).unwrap();
+        ctx.register_table("t", Arc::new(mt)).unwrap();
+        let plan = ctx
+            .sql("SELECT k FROM t")
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+
+        let sideband = BridgeFilterSideband::new();
+        let wrapper =
+            BuildSideBloomEmitterExec::try_new(plan, 0, 42, sideband.clone(), 16).unwrap();
+        let n = wrapper.properties().output_partitioning().partition_count();
+        for p in 0..n {
+            let mut s = wrapper
+                .execute(p, Arc::new(TaskContext::default()))
+                .unwrap();
+            while let Some(_b) = s.try_next().await.unwrap() {}
+        }
+        let preds = sideband.peek().expect("sideband was not published to");
+        assert_eq!(preds.len(), 1, "expected one predicate, got {preds:?}");
+        match &preds[0] {
+            ColumnPredicate::I64InSet { col_idx, set } => {
+                assert_eq!(*col_idx, 42);
+                // Every u64 key present as its i64 bit pattern (the
+                // load-bearing ones are 2^63 == i64::MIN and u64::MAX == -1,
+                // which a value-cast would have dropped).
+                for k in &keys {
+                    assert!(
+                        set.contains(*k as i64),
+                        "u64 key {k} missing (i64 bits {})",
+                        *k as i64
+                    );
+                }
+                assert!(set.contains((1u64 << 63) as i64)); // i64::MIN (sentinel)
+                assert!(set.contains(u64::MAX as i64)); // -1
+                assert!(!set.contains(123)); // a non-key
+            }
+            other => panic!("expected I64InSet from a u64 build, got {other:?}"),
         }
     }
 
