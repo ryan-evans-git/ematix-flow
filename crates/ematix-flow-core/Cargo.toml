@@ -71,9 +71,9 @@ object_store = { workspace = true }
 # to produce Arrow arrays from column chunks without going through
 # parquet-rs's ParquetRecordBatchReader. Long-term: alternate backend
 # for FastParquetExec.
-ematix-parquet-codec = "0.16.2"
-ematix-parquet-format = "0.16.2"
-ematix-parquet-io = "0.16.2"
+ematix-parquet-codec = "0.17"
+ematix-parquet-format = "0.17"
+ematix-parquet-io = "0.17"
 deltalake = { workspace = true }
 datafusion = { workspace = true }
 cranelift = { workspace = true }
