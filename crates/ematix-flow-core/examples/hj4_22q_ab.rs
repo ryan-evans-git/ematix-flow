@@ -116,11 +116,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let parts = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(14);
-    let warmups = 2;
-    let trials = 7;
+    let warmups: usize = std::env::var("TPCH_WARMUPS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(2);
+    let trials: usize = std::env::var("TPCH_TRIALS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(7);
+    // TPCH_QUERIES=8,9,2,11 → run only those (focused SF=100 subset); default = all.
+    let query_filter: Option<Vec<u8>> = std::env::var("TPCH_QUERIES").ok().map(|s| {
+        s.split(',')
+            .filter_map(|t| t.trim().parse::<u8>().ok())
+            .collect()
+    });
 
     println!(
-        "HJ.5 22q SF=10 native-vs-Tag A/B — data={} parts={parts} trials={trials}\n",
+        "HJ.5 22q native-vs-Tag A/B — data={} parts={parts} warmups={warmups} trials={trials}\n",
         data_dir.display()
     );
     println!(
@@ -136,6 +148,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut mismatches: Vec<u8> = Vec::new();
 
     for q in 1..=22u8 {
+        if let Some(ref qs) = query_filter {
+            if !qs.contains(&q) {
+                continue;
+            }
+        }
         let sql_path = queries_dir.join(format!("q{q:02}.sql"));
         let sql = match std::fs::read_to_string(&sql_path) {
             Ok(s) => s,

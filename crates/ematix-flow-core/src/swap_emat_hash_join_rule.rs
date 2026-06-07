@@ -24,7 +24,6 @@
 use std::sync::Arc;
 
 use arrow_schema::DataType;
-use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::common::{JoinType, Result as DfResult};
 use datafusion::config::ConfigOptions;
 use datafusion::physical_expr::expressions::Column;
@@ -125,24 +124,22 @@ fn try_swap(hj: &HashJoinExec) -> Option<EmatixHashJoinExec> {
         return None;
     }
 
-    // HJ.5b — probe-vs-build cardinality gate. The custom operator pays off only
-    // on a FACT-probing join: the PROBE (RIGHT, since build=LEFT/CollectLeft)
-    // must be (a) absolutely large (≥ `EMAT_HJ_MIN_PROBE`, default 1M) AND (b)
-    // large RELATIVE to the build (≥ `EMAT_HJ_RATIO` × build rows, default 50).
-    // The RATIO is the fact-vs-dim signal: Q08 part⋈lineitem ≈ 4600× passes;
-    // dim⋈dim joins (Q02/Q11) ≈ 1× block — an absolute floor alone over-fires on
-    // them because DataFusion OVER-estimates their join-output cardinality, while
-    // dropping the absolute floor would lose the orders/mid-probe wins (Q07/Q21).
-    // `num_rows` Absent on either side → block (the wins probe a fact scan with
-    // KNOWN large stats). Set both envs 0 to disable.
-    // Default 12M = best-measured at SF=10 (HJ.5c): scan-anchored, sits between
-    // partsupp (8M) and orders (15M) so dim⋈dim joins (Q02/Q11) block while
-    // orders/lineitem-probing star joins fire → −1..−3.3% suite, no large stable
-    // regressions (only noisy Q17). CAVEAT — this absolute threshold is
-    // SF-specific (wrong at SF=100, where partsupp is 80M); a scan-anchored RATIO
-    // (probe_scan ≥ K × build_scan, scale-invariant) is the proper default-on
-    // gate, now reliable since both sides use scan stats. `EMAT_HJ_RATIO` enables
-    // it. The earlier ESTIMATE-based ratio failed; scan-anchored should not.
+    // HJ.5c — absolute probe-cardinality gate. The kernel's per-row miss-rejection
+    // saving only exceeds its (≈fixed) tag-table build cost when the PROBE (RIGHT,
+    // since build = LEFT/CollectLeft) is large in ABSOLUTE rows. `EMAT_HJ_MIN_PROBE`
+    // (default 12M) is that floor, scan-anchored to parquet file stats (the
+    // reliable signal; mid-chain join-output estimates over/under-fire). At SF≤1
+    // even the fact table is < 12M so the lever stays dormant — fine, those queries
+    // are sub-millisecond. NOTE — an absolute floor is the ONLY workable gate here:
+    // a *relative* gate cannot separate "lineitem@SF10 = 60M" (fire) from
+    // "partsupp@SF100 = 80M" (the same rows, in a query with no fact table) because
+    // both are simply "the biggest table in their query". Two relative gates were
+    // measured and refuted — build-RATIO false-fires Q02/Q11 (their build anchors
+    // on a tiny dim → huge ratio, +40/+30%); fraction-of-plan-max ALSO false-fires
+    // Q02/Q11 (partsupp IS their plan_max, so probe ≥ 50%·max trivially holds).
+    // The probe must clear the floor; Absent probe stats → block (a real fact probe
+    // has known stats). `EMAT_HJ_RATIO` (default 0/off) is an optional extra
+    // build-ratio constraint kept for A/B reproducibility.
     let min_probe: usize = std::env::var("EMAT_HJ_MIN_PROBE")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -151,21 +148,16 @@ fn try_swap(hj: &HashJoinExec) -> Option<EmatixHashJoinExec> {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
-    // Partitioned-mode swap with NO cardinality gate would risk single-threading
-    // a huge build → refuse. The gate is exactly what restricts us to the
-    // big-fact probe join (e.g. orders⋈lineitem) and away from dim⋈dim joins.
     if partitioned && min_probe == 0 && ratio == 0 {
         return None;
     }
-    if min_probe > 0 || ratio > 0 {
-        // HJ.5c: scan-anchored, not join-output-estimate. Probe = RIGHT subtree's
-        // largest base scan; build = LEFT subtree's largest base scan (only used
-        // when the ratio knob is enabled).
-        match (
-            max_leaf_scan_rows(hj.right()),
-            max_leaf_scan_rows(hj.left()),
-        ) {
-            (Some(pr), Some(br)) if pr >= min_probe && pr >= ratio.saturating_mul(br.max(1)) => {}
+    let probe_scan = max_leaf_scan_rows(hj.right())?;
+    if probe_scan < min_probe {
+        return None;
+    }
+    if ratio > 0 {
+        match max_leaf_scan_rows(hj.left()) {
+            Some(br) if probe_scan >= ratio.saturating_mul(br.max(1)) => {}
             _ => return None,
         }
     }
@@ -214,6 +206,76 @@ fn try_swap(hj: &HashJoinExec) -> Option<EmatixHashJoinExec> {
     ))
 }
 
+/// A `HashJoinExec` carrying a non-equi residual `filter` is the physical
+/// signature of a correlated-subquery / range join — Q17's
+/// `l_quantity < 0.2*avg(l_quantity)`, Q20's qty-vs-`0.5*sum`. These come from
+/// decorrelating a scalar/aggregate subquery.
+fn is_filtered_hash_join(node: &Arc<dyn ExecutionPlan>) -> bool {
+    node.as_any()
+        .downcast_ref::<HashJoinExec>()
+        .map(|hj| hj.filter().is_some())
+        .unwrap_or(false)
+}
+
+/// Top-down rewrite that swaps eligible joins to `EmatixHashJoinExec`, EXCEPT
+/// inside the subtree of a filtered (correlated-subquery / range) join.
+///
+/// Why the exclusion (HJ.5c, Q17 dig): the SIMD-tag kernel wins when a big-fact
+/// Inner probe is a meaningful fraction of the query and its reduction
+/// propagates. Under a filtered join the opposite holds — the decorrelated
+/// subquery aggregate dominates the cost (Q17: a 2 M-group `avg` over a second
+/// 60 M lineitem scan), so making the fact probe faster barely moves the total
+/// while the operator's overhead shows up net-negative (measured Q17 +51%,
+/// fresh-ctx canonical harness; it does NOT yield to any probe-cardinality gate
+/// because the probe genuinely IS the 60 M fact). `blocked` is set once we
+/// descend below such a join and propagates to the whole subtree.
+fn rewrite_node(
+    node: Arc<dyn ExecutionPlan>,
+    blocked: bool,
+    trace: bool,
+    batch_size: usize,
+) -> DfResult<Arc<dyn ExecutionPlan>> {
+    let child_blocked = blocked || is_filtered_hash_join(&node);
+    let children = node.children();
+    let mut new_children = Vec::with_capacity(children.len());
+    let mut changed = false;
+    for c in children {
+        let nc = rewrite_node(c.clone(), child_blocked, trace, batch_size)?;
+        if !Arc::ptr_eq(&nc, c) {
+            changed = true;
+        }
+        new_children.push(nc);
+    }
+    let node = if changed {
+        node.with_new_children(new_children)?
+    } else {
+        node
+    };
+    if !blocked {
+        if let Some(hj) = node.as_any().downcast_ref::<HashJoinExec>() {
+            if let Some(exec) = try_swap(hj) {
+                if trace {
+                    eprintln!(
+                        "[HJ.swap] Inner join on=[(build@{}, probe@{})] → EmatixHashJoinExec (+coalesce {batch_size})",
+                        exec.build_key_idx(),
+                        exec.probe_key_idx()
+                    );
+                }
+                let coalesced: Arc<dyn ExecutionPlan> = Arc::new(CoalesceBatchesExec::new(
+                    Arc::new(exec) as Arc<dyn ExecutionPlan>,
+                    batch_size,
+                ));
+                return Ok(coalesced);
+            } else if trace {
+                eprintln!("[HJ.swap] skip HashJoinExec (shape gate not met)");
+            }
+        }
+    } else if trace && node.as_any().downcast_ref::<HashJoinExec>().is_some() {
+        eprintln!("[HJ.swap] skip HashJoinExec (under filtered/correlated-subquery join)");
+    }
+    Ok(node)
+}
+
 impl PhysicalOptimizerRule for SwapEmatixHashJoinRule {
     fn name(&self) -> &str {
         "SwapEmatixHashJoinRule"
@@ -227,7 +289,7 @@ impl PhysicalOptimizerRule for SwapEmatixHashJoinRule {
     fn optimize(
         &self,
         plan: Arc<dyn ExecutionPlan>,
-        _config: &ConfigOptions,
+        config: &ConfigOptions,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
         // Opt-in. Dormant unless explicitly enabled.
         let enabled = std::env::var("EMAT_HASH_JOIN")
@@ -238,22 +300,111 @@ impl PhysicalOptimizerRule for SwapEmatixHashJoinRule {
             return Ok(plan);
         }
         let trace = std::env::var_os("EMAT_HASH_JOIN_TRACE").is_some();
-        let out = plan.transform_up(|node| {
-            if let Some(hj) = node.as_any().downcast_ref::<HashJoinExec>() {
-                if let Some(exec) = try_swap(hj) {
-                    if trace {
-                        eprintln!(
-                            "[HJ.swap] Inner/CollectLeft join on=[({}@{}, {}@{})] → EmatixHashJoinExec",
-                            "build", exec.build_key_idx(), "probe", exec.probe_key_idx()
-                        );
-                    }
-                    return Ok(Transformed::yes(Arc::new(exec) as Arc<dyn ExecutionPlan>));
-                } else if trace {
-                    eprintln!("[HJ.swap] skip HashJoinExec (shape gate not met)");
-                }
-            }
-            Ok(Transformed::no(node))
-        })?;
-        Ok(out.data)
+        // `batch_size` feeds the post-swap CoalesceBatchesExec (HJ.5c): the kernel
+        // emits ONE output batch per probe input batch, so a low-hit-rate fact probe
+        // produces tiny survivor batches (Q17: 61.4 K rows over 916 batches ≈ 67
+        // rows/batch). DataFusion's native HashJoinExec emits ~`batch_size`-row
+        // batches; re-coalescing matches that so the downstream Repartition/join
+        // don't choke on micro-batches (Q17 dig: downstream build 2.4→27.5 ms).
+        let batch_size = config.execution.batch_size;
+        rewrite_node(plan, false, trace, batch_size)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datafusion::arrow::array::{Int64Array, RecordBatch};
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::common::NullEquality;
+    use datafusion::datasource::memory::MemorySourceConfig;
+    use datafusion::physical_expr::PhysicalExpr;
+    use datafusion::physical_plan::expressions::Column;
+
+    fn mem(name: &str, n: i64) -> Arc<dyn ExecutionPlan> {
+        let schema = Arc::new(Schema::new(vec![Field::new(name, DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from((0..n).collect::<Vec<i64>>()))],
+        )
+        .unwrap();
+        MemorySourceConfig::try_new_exec(&[vec![batch]], schema, None).unwrap()
+    }
+
+    // Distinct column names (build "b", probe "a") so the output name-mapping is
+    // unambiguous (two "a" columns would trip the ambiguity bail, not the gate).
+    fn inner_collect_left(
+        build: Arc<dyn ExecutionPlan>,
+        probe: Arc<dyn ExecutionPlan>,
+    ) -> HashJoinExec {
+        let on: Vec<(Arc<dyn PhysicalExpr>, Arc<dyn PhysicalExpr>)> =
+            vec![(Arc::new(Column::new("b", 0)), Arc::new(Column::new("a", 0)))];
+        HashJoinExec::try_new(
+            build,
+            probe,
+            on,
+            None,
+            &JoinType::Inner,
+            None,
+            PartitionMode::CollectLeft,
+            NullEquality::NullEqualsNothing,
+            false,
+        )
+        .unwrap()
+    }
+
+    /// The absolute probe floor blocks a tiny probe; with the floor disabled, the
+    /// shape gate (Inner / CollectLeft / single i64 key / no filter) passes.
+    #[test]
+    fn try_swap_floor_then_shape_gate() {
+        let hj = inner_collect_left(mem("b", 3), mem("a", 3));
+        // Default 12M floor → a 3-row probe is blocked.
+        unsafe { std::env::remove_var("EMAT_HJ_MIN_PROBE") };
+        assert!(
+            try_swap(&hj).is_none(),
+            "tiny probe must be blocked by the 12M absolute floor"
+        );
+        // Floor disabled → the shape gate alone admits this Inner i64 CollectLeft.
+        unsafe { std::env::set_var("EMAT_HJ_MIN_PROBE", "0") };
+        let admitted = try_swap(&hj).is_some();
+        unsafe { std::env::remove_var("EMAT_HJ_MIN_PROBE") };
+        assert!(
+            admitted,
+            "Inner/CollectLeft/single-i64-key/no-filter must swap once the floor is disabled"
+        );
+    }
+
+    /// A non-Inner join is never swapped (the kernel is Inner-only).
+    #[test]
+    fn try_swap_rejects_non_inner() {
+        let on: Vec<(Arc<dyn PhysicalExpr>, Arc<dyn PhysicalExpr>)> =
+            vec![(Arc::new(Column::new("b", 0)), Arc::new(Column::new("a", 0)))];
+        let hj = HashJoinExec::try_new(
+            mem("b", 3),
+            mem("a", 3),
+            on,
+            None,
+            &JoinType::LeftSemi,
+            None,
+            PartitionMode::CollectLeft,
+            NullEquality::NullEqualsNothing,
+            false,
+        )
+        .unwrap();
+        unsafe { std::env::set_var("EMAT_HJ_MIN_PROBE", "0") };
+        let got = try_swap(&hj);
+        unsafe { std::env::remove_var("EMAT_HJ_MIN_PROBE") };
+        assert!(got.is_none(), "LeftSemi must not swap (Inner-only kernel)");
+    }
+
+    /// The correlated-subquery/range-join discriminator: a plain (unfiltered)
+    /// HashJoinExec is not flagged; the rewrite only blocks subtrees under a
+    /// join carrying a non-equi residual `filter`.
+    #[test]
+    fn is_filtered_hash_join_false_for_plain_join() {
+        let hj: Arc<dyn ExecutionPlan> = Arc::new(inner_collect_left(mem("b", 3), mem("a", 3)));
+        assert!(!is_filtered_hash_join(&hj));
+        // A non-join node is likewise not flagged.
+        assert!(!is_filtered_hash_join(&mem("a", 3)));
     }
 }
