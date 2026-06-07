@@ -189,6 +189,10 @@ pub mod dict_routing;
 // reorder and falls back to FROM-clause order. See
 // `docs/PHASE_SIGMA_T_JOIN_REORDER.md`.
 pub mod join_reorder;
+// #315 / DIST.1a: TPC-H scale-factor-aware query parameters (Q11's
+// `FRACTION = 0.0001 / SF` HAVING threshold). Keeps Q11 non-degenerate at
+// SF≥10 across every harness/engine.
+pub mod tpch_params;
 // Σ.BR Phase 2 / #194 (2026-05-29): production wiring — a QueryPlanner wrapper
 // that applies the ematix pre-plan walker pipeline (agg_semi → dim_push →
 // reorder) post-optimization so it reaches library users (preset.rs), not just

@@ -140,6 +140,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(PathBuf::from)
         .unwrap_or_else(|_| workspace.join("examples/tpch/data/sf1"));
     let queries_dir = workspace.join("examples/tpch/queries");
+    // #315: scale Q11's HAVING fraction (0.0001 / SF) so it isn't degenerate at
+    // SF>=10. Derived from the data-dir name; both DuckDB and ematix below run
+    // the SAME scaled SQL, keeping the comparison apples-to-apples.
+    let scale_factor = ematix_flow_core::tpch_params::scale_factor_from_data_dir(&data_dir);
 
     let query_subset: Vec<u8> = std::env::var("TPCH_QUERIES")
         .ok()
@@ -172,7 +176,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for q in &query_subset {
         let sql_path = queries_dir.join(format!("q{q:02}.sql"));
         let sql = match std::fs::read_to_string(&sql_path) {
-            Ok(s) => s,
+            Ok(s) => ematix_flow_core::tpch_params::apply_tpch_query_params(*q, &s, scale_factor),
             Err(_) => {
                 println!("Q{q:02}: SKIP (no SQL file at {})", sql_path.display());
                 skip_count += 1;

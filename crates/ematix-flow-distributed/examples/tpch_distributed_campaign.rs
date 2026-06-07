@@ -37,12 +37,22 @@ use std::time::Instant;
 use async_trait::async_trait;
 use datafusion::arrow::array::RecordBatch;
 use datafusion::common::DataFusionError;
-use datafusion::execution::session_state::SessionStateBuilder;
-use datafusion::prelude::SessionContext;
+use datafusion::execution::session_state::{SessionState, SessionStateBuilder};
+use datafusion::prelude::{SessionConfig, SessionContext};
 use datafusion_distributed::{
     CompressionType, DistributedExt, DistributedPhysicalOptimizerRule, WorkerResolver,
 };
 use ematix_flow_core::preset;
+// Bench-parity rule set (NO_DISTRIBUTE diagnostic) — mirrors examples/explain_query.rs.
+use ematix_flow_core::dedupe_aggregate_rule::DedupeAggregateForFloatDeterminism;
+use ematix_flow_core::dict_aggregate_rule::EnableDictGroupCountRule;
+use ematix_flow_core::force_collect_left_semi_build_rule::ForceCollectLeftForSemiBoundedBuildRule;
+use ematix_flow_core::fused_aggregate_filter_multi_agg_rule::InjectFilterMultiAggRule;
+use ematix_flow_core::fused_aggregate_filter_sum_rule::InjectFilterSumRule;
+use ematix_flow_core::push_down_left_semi_rule::PushDownLeftSemiRule;
+use ematix_flow_core::runtime_bloom_sideband_rule::EnableRuntimeBloomSidebandRule;
+use ematix_flow_core::swap_emat_hash_join_rule::SwapEmatixHashJoinRule;
+use ematix_flow_core::swap_semi_join_build_rule::SwapSemiJoinBuildSideRule;
 use serde::Serialize;
 use url::Url;
 
@@ -153,6 +163,95 @@ fn median_trials_3_5(ms: &[f64]) -> f64 {
     median(&ms[2..5])
 }
 
+/// Build the campaign `SessionState`.
+///
+/// Rule set is chosen by `RULESET`:
+///   - `bench` (DEFAULT): the production triangulation bench's EXPLICIT rule
+///     chain on plain parquet — the plan that runs Q05 SF=10 in ~214ms
+///     single-node (76× faster than preset). Mirrors examples/explain_query.rs.
+///   - `preset`: the public-library default (`preset::with_optimizer_rules`),
+///     kept as the diagnostic reference for the #315 Q05 pathology.
+///
+/// `distributed` appends `DistributedPhysicalOptimizerRule` LAST (the standard
+/// datafusion-distributed integration: split the *fully-optimized* plan into
+/// network stages) + the worker resolver + LZ4_FRAME exchange compression. The
+/// old code added the distributed rule BEFORE preset's rules, so preset ran on
+/// an already stage-split plan — part of what we're isolating here.
+///
+/// Custom emat operators (BloomEmitter via EnableRuntimeBloomSidebandRule,
+/// EmatixHashJoinExec via SwapEmatixHashJoinRule) emit physical nodes that
+/// datafusion-distributed must serialize across the Flight mesh. They are
+/// gated OUT of the distributed `bench` arm unless DIST_CUSTOM_OPS=1, so we can
+/// first establish whether the *standard*-operator rules alone survive
+/// distribution and fix Q05.
+fn build_session_state(distributed: bool, resolver: StaticPeers) -> SessionState {
+    let use_preset = matches!(std::env::var("RULESET").as_deref(), Ok("preset"));
+    // Custom-operator rules: always on single-node; opt-in for distributed.
+    let custom_ops = !distributed || std::env::var_os("DIST_CUSTOM_OPS").is_some();
+
+    // TARGET_PARTITIONS: positive int → with_target_partitions(N); "default"/"0"
+    // leaves DataFusion's default (available_parallelism). Lets us A/B the
+    // partition count — the suspected real Q05 lever (the old preset/distributed
+    // builder never set it; the bench arm set 14). Unset ⇒ 14 (bench parity).
+    let mut cfg = SessionConfig::new().with_collect_statistics(true);
+    match std::env::var("TARGET_PARTITIONS").ok().as_deref() {
+        Some("default") | Some("0") => {}
+        Some(n) if n.parse::<usize>().is_ok() => {
+            cfg = cfg.with_target_partitions(n.parse::<usize>().unwrap());
+        }
+        _ => cfg = cfg.with_target_partitions(14),
+    }
+    eprintln!(
+        "  (ruleset={} distributed={} custom_ops={} target_partitions={})",
+        if use_preset { "preset" } else { "bench" },
+        distributed,
+        custom_ops,
+        cfg.target_partitions(),
+    );
+
+    let base = SessionStateBuilder::new()
+        .with_config(cfg)
+        .with_default_features();
+
+    let mut builder = if use_preset {
+        // Library default. Note: preset already bundles SwapSemiJoinBuildSideRule,
+        // ForceCollectLeftForSemiBoundedBuildRule, PushDownLeftSemiRule, the bloom
+        // sideband rule, and the FlowQueryPlanner reorder — so "add the build-side
+        // subset" is a no-op against preset; the Q05 lever is elsewhere.
+        preset::with_optimizer_rules_and_registry(base).0
+    } else {
+        // Explicit bench-parity chain (the 214ms single-node Q05 plan).
+        base.with_optimizer_rule(Arc::new(PushDownLeftSemiRule))
+            .with_physical_optimizer_rule(Arc::new(DedupeAggregateForFloatDeterminism::default()))
+            .with_physical_optimizer_rule(Arc::new(EnableDictGroupCountRule))
+            .with_physical_optimizer_rule(Arc::new(InjectFilterMultiAggRule))
+            .with_physical_optimizer_rule(Arc::new(InjectFilterSumRule))
+            .with_physical_optimizer_rule(Arc::new(SwapSemiJoinBuildSideRule))
+            .with_physical_optimizer_rule(Arc::new(
+                ForceCollectLeftForSemiBoundedBuildRule::default(),
+            ))
+    };
+
+    // Custom emat operators — only in the bench arm, gated for distributed.
+    if !use_preset && custom_ops {
+        builder = builder
+            .with_physical_optimizer_rule(Arc::new(EnableRuntimeBloomSidebandRule::default()))
+            .with_physical_optimizer_rule(Arc::new(SwapEmatixHashJoinRule));
+    }
+
+    if distributed {
+        builder = builder
+            .with_physical_optimizer_rule(Arc::new(DistributedPhysicalOptimizerRule))
+            .with_distributed_worker_resolver(resolver);
+        builder
+            .with_distributed_compression(Some(CompressionType::LZ4_FRAME))
+            .expect("LZ4_FRAME is a valid compression type")
+            .build()
+    } else {
+        builder.build()
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let peers = parse_peers();
@@ -203,16 +302,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(|s| Url::parse(s).unwrap_or_else(|e| panic!("bad EMATIX_PEERS url '{s}': {e}")))
         .collect();
     let resolver = StaticPeers { urls };
-    let (builder, _registry) = preset::with_optimizer_rules_and_registry(
-        SessionStateBuilder::new()
-            .with_default_features()
-            .with_physical_optimizer_rule(Arc::new(DistributedPhysicalOptimizerRule))
-            .with_distributed_worker_resolver(resolver),
-    );
-    let state = builder
-        .with_distributed_compression(Some(CompressionType::LZ4_FRAME))
-        .expect("LZ4_FRAME is a valid compression type")
-        .build();
+    // Rule chain + topology selected by RULESET (bench|preset) and NO_DISTRIBUTE
+    // (single-node vs the Flight mesh). See build_session_state.
+    let distributed = std::env::var_os("NO_DISTRIBUTE").is_none();
+    let state = build_session_state(distributed, resolver);
     let ctx = Arc::new(SessionContext::from(state));
     for table in TPCH_TABLES {
         let p = data_dir.join(format!("{table}.parquet"));
@@ -220,11 +313,58 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .await?;
     }
 
+    // CUSTOM_SQL=<sql> — run one ad-hoc query through the distributed ctx
+    // (diagnostic for DIST.1a). Prints row count + a 1-batch sample, or the
+    // distributed EXPLAIN when EXPLAIN_ONLY=1. Returns after.
+    if let Ok(custom) = std::env::var("CUSTOM_SQL") {
+        eprintln!("--- CUSTOM_SQL ---");
+        if std::env::var_os("EXPLAIN_ONLY").is_some() {
+            let b = ctx.sql(&format!("EXPLAIN {custom}")).await?.collect().await?;
+            if let Ok(t) = datafusion::arrow::util::pretty::pretty_format_batches(&b) {
+                println!("{t}");
+            }
+        } else {
+            let b = run_query(&ctx, &custom).await?;
+            let rows: usize = b.iter().map(|x| x.num_rows()).sum();
+            eprintln!("  rows={rows}");
+            let head: Vec<_> = b.into_iter().take(1).collect();
+            if let Ok(t) = datafusion::arrow::util::pretty::pretty_format_batches(&head) {
+                println!("{t}");
+            }
+        }
+        return Ok(());
+    }
+
     let mut queries = BTreeMap::new();
     for n in query_subset {
-        let sql = read_query(&workspace_root, n);
+        // #315: scale Q11's HAVING fraction (0.0001 / SF) so it isn't
+        // degenerate (0 rows) at SF>=10. No-op for q!=11 / SF<=1.
+        let sql = ematix_flow_core::tpch_params::apply_tpch_query_params(
+            n,
+            &read_query(&workspace_root, n),
+            scale_factor,
+        );
         let label = format!("Q{n:02}");
         eprintln!("--- {label} ---");
+
+        // EXPLAIN_ONLY=1 — dump the distributed plan (logical + physical with
+        // network/stage boundaries) and skip execution. Diagnostic for the
+        // Q11/Q15 0-rows distributed correctness bug (SF100/DIST.1a).
+        if std::env::var_os("EXPLAIN_ONLY").is_some() {
+            match ctx.sql(&format!("EXPLAIN {sql}")).await {
+                Ok(df) => match df.collect().await {
+                    Ok(batches) => {
+                        match datafusion::arrow::util::pretty::pretty_format_batches(&batches) {
+                            Ok(t) => println!("{t}"),
+                            Err(e) => eprintln!("  pretty err: {e}"),
+                        }
+                    }
+                    Err(e) => eprintln!("  EXPLAIN collect failed: {e}"),
+                },
+                Err(e) => eprintln!("  EXPLAIN failed: {e}"),
+            }
+            continue;
+        }
 
         // Warmups (untimed, but verify it runs cleanly).
         for w in 0..warmups {

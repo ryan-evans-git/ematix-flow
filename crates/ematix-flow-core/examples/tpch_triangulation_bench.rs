@@ -259,6 +259,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(PathBuf::from)
         .unwrap_or_else(|_| workspace.join("examples/tpch/data/sf1"));
     let queries_dir = workspace.join("examples/tpch/queries");
+    // #315: Q11's HAVING fraction is 0.0001 / SF — scale it so SF>=10 isn't
+    // degenerate (0 rows for every engine). Applied to all engines' SQL below.
+    let scale_factor = ematix_flow_core::tpch_params::scale_factor_from_data_dir(&data_dir);
     let out_path = std::env::var("TPCH_OUT")
         .map(PathBuf::from)
         .unwrap_or_else(|_| workspace.join("BENCHMARKS.md"));
@@ -345,8 +348,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("--- Q{q:02} ---");
         let sql_path = queries_dir.join(format!("q{q:02}.sql"));
         let polars_sql_path = queries_dir.join(format!("q{q:02}.polars.sql"));
-        let sql = std::fs::read_to_string(&sql_path)?;
-        let polars_sql = std::fs::read_to_string(&polars_sql_path).ok();
+        let sql = ematix_flow_core::tpch_params::apply_tpch_query_params(
+            q,
+            &std::fs::read_to_string(&sql_path)?,
+            scale_factor,
+        );
+        let polars_sql = std::fs::read_to_string(&polars_sql_path)
+            .ok()
+            .map(|s| ematix_flow_core::tpch_params::apply_tpch_query_params(q, &s, scale_factor));
 
         let mut per_engine: BTreeMap<Engine, EngineResult> = BTreeMap::new();
         let selected = Engine::selected();
