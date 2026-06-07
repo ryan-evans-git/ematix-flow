@@ -37,7 +37,9 @@ use datafusion::physical_plan::ExecutionPlanProperties;
 use datafusion::physical_plan::joins::HashJoinExec;
 
 use crate::bridge_filter_sideband::BridgeFilterSideband;
-use crate::build_side_bloom_emitter_exec::{BuildSideBloomEmitterExec, widens_to_i64};
+use crate::build_side_bloom_emitter_exec::{
+    BuildSideBloomEmitterExec, is_string_key, widens_to_i64,
+};
 use crate::ematix_fast_parquet::EmatixFastParquetExec;
 
 /// Install the L9 runtime-sideband rule.
@@ -269,19 +271,21 @@ impl PhysicalOptimizerRule for EnableRuntimeBloomSidebandRule {
                 // skipped narrowed keys → lost the probe-side bloom (Q21 +48%).
                 let l_dt = build.schema().field(lcol.index()).data_type().clone();
                 let r_dt = probe.schema().field(rcol.index()).data_type().clone();
-                if !widens_to_i64(&l_dt) {
+                // KEYS.1 + KEYS.5: accept either an i64-domain key pair
+                // (Int*/UInt*/Date* — rides the i64 bloom/set) OR a UTF-8
+                // string key pair (Utf8/Utf8View/LargeUtf8 — rides the
+                // StringInBloom/StringInSet sideband). Both sides must share
+                // the domain; an equi-join can't cross int↔string, and a
+                // mixed pair is left alone (no sideband). The build emitter
+                // auto-dispatches on the build key's type and the probe scan
+                // applies whichever ColumnPredicate the sideband publishes.
+                let i64_pair = widens_to_i64(&l_dt) && widens_to_i64(&r_dt);
+                let string_pair = is_string_key(&l_dt) && is_string_key(&r_dt);
+                if !i64_pair && !string_pair {
                     if trace {
                         eprintln!(
-                            "[L9.trace] skip — build key {} doesn't widen to i64 (is {l_dt:?})",
-                            lcol.name()
-                        );
-                    }
-                    continue;
-                }
-                if !widens_to_i64(&r_dt) {
-                    if trace {
-                        eprintln!(
-                            "[L9.trace] skip — probe key {} doesn't widen to i64 (is {r_dt:?})",
+                            "[L9.trace] skip — key pair {}/{} is neither i64-domain nor string ({l_dt:?}/{r_dt:?})",
+                            lcol.name(),
                             rcol.name()
                         );
                     }
@@ -875,6 +879,95 @@ mod tests {
         // mod 50 → 20 rows per l_suppkey value. Only s_suppkey in
         // [0,25) participate → 25 × 20 = 500.
         assert_eq!(row_count, 500);
+    }
+
+    /// KEYS.5.c — write a parquet with a UTF-8 string column (+ optional
+    /// i64 payload) via the arrow `ArrowWriter`, which emits the UTF8
+    /// converted_type so `arrow_type_for` surfaces it as `Utf8` (the in-tree
+    /// `write_table_to_path` writes byte arrays with no marker → `Binary`,
+    /// which wouldn't exercise the string-key path).
+    fn write_utf8_parquet(
+        path: &std::path::Path,
+        str_col: (&str, &[&str]),
+        i64_col: Option<(&str, &[i64])>,
+    ) {
+        use arrow_array::{ArrayRef, Int64Array, RecordBatch, StringArray};
+        use arrow_schema::{DataType, Field, Schema};
+        use datafusion::parquet::arrow::ArrowWriter;
+
+        let mut fields = vec![Field::new(str_col.0, DataType::Utf8, false)];
+        let mut arrays: Vec<ArrayRef> = vec![Arc::new(StringArray::from(str_col.1.to_vec()))];
+        if let Some((name, vals)) = i64_col {
+            fields.push(Field::new(name, DataType::Int64, false));
+            arrays.push(Arc::new(Int64Array::from(vals.to_vec())));
+        }
+        let schema = Arc::new(Schema::new(fields));
+        let batch = RecordBatch::try_new(schema.clone(), arrays).unwrap();
+        let file = std::fs::File::create(path).unwrap();
+        let mut w = ArrowWriter::try_new(file, schema, None).unwrap();
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+    }
+
+    /// KEYS.5.c — the rule must route a STRING-keyed join through the
+    /// sideband: wrap the build with a BuildSideBloomEmitterExec (which emits
+    /// StringInBloom/StringInSet for a string key) and thread it into the
+    /// probe-side Emat scan. RED before the gate relaxation: `widens_to_i64`
+    /// declined Utf8 on both sides, so the equi-key found no match → no wrap.
+    #[tokio::test]
+    async fn rule_wraps_string_keyed_join() {
+        let dim = tmp_parquet("dim_str");
+        let fact = tmp_parquet("fact_str");
+        // dim: 3 distinct string keys (small → becomes the build side).
+        write_utf8_parquet(&dim, ("d_key", &["FRANCE", "GERMANY", "BRAZIL"]), None);
+        // fact: 30 rows; f_key cycles 6 values (3 match dim, 3 don't).
+        let cycle = ["FRANCE", "GERMANY", "BRAZIL", "JAPAN", "PERU", "CHINA"];
+        let keys: Vec<&str> = (0..30).map(|i| cycle[i % 6]).collect();
+        let vals: Vec<i64> = (0..30).collect();
+        write_utf8_parquet(&fact, ("f_key", &keys), Some(("f_val", &vals)));
+
+        let cfg = SessionConfig::new().with_target_partitions(4);
+        let state = SessionStateBuilder::new()
+            .with_default_features()
+            .with_config(cfg)
+            .with_physical_optimizer_rule(Arc::new(EnableRuntimeBloomSidebandRule {
+                min_probe_to_build_ratio: 0,
+                allow_inner_join: true,
+                require_filtered_build: false,
+                max_expected_keys_per_partition: 0,
+            }))
+            .build();
+        let ctx = SessionContext::new_with_state(state);
+        ctx.register_table(
+            "dim",
+            Arc::new(EmatixFastParquetTableProvider::try_new(dim.to_string_lossy()).unwrap()),
+        )
+        .unwrap();
+        ctx.register_table(
+            "fact",
+            Arc::new(EmatixFastParquetTableProvider::try_new(fact.to_string_lossy()).unwrap()),
+        )
+        .unwrap();
+
+        let df = ctx
+            .sql("SELECT f_val FROM dim JOIN fact ON d_key = f_key")
+            .await
+            .unwrap();
+        let plan = df.clone().create_physical_plan().await.unwrap();
+        let s = format!("{plan:?}");
+        assert!(
+            s.contains("BuildSideBloomEmitterExec"),
+            "expected the L9 wrapper for a string-keyed join:\n{s}"
+        );
+        // Correctness: 3 matching keys × 5 occurrences each (30/6) = 15 rows.
+        // The sideband is selectivity-only — the residual join still runs, so
+        // the count is identical with or without the wrap.
+        let batches = df.collect().await.unwrap();
+        let row_count: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(
+            row_count, 15,
+            "wrong row count for string-keyed join with L9 active"
+        );
     }
 
     /// Σ.Q.L9 extension — verify the rule fires on a join whose
