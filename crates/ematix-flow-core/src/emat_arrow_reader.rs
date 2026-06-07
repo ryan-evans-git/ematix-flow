@@ -47,7 +47,7 @@ use arrow_array::builder::{ArrayBuilder, StringBuilder, make_view};
 use arrow_array::types::UInt32Type;
 use arrow_array::{
     Array, ArrayRef, Date32Array, DictionaryArray, Float64Array, Int32Array, Int64Array,
-    RecordBatch, StringArray, StringViewArray, UInt32Array,
+    RecordBatch, StringArray, StringViewArray, UInt32Array, UInt64Array,
 };
 use arrow_schema::{DataType, SchemaRef};
 // Buffer types come in via datafusion's arrow re-export — keeps this
@@ -616,7 +616,9 @@ fn column_physical_type(
 fn validate_type_pair(name: &str, phys: ParquetType, target: &DataType) -> DfResult<()> {
     let ok = match target {
         DataType::Int32 | DataType::Date32 => phys == ParquetType::Int32,
-        DataType::Int64 => phys == ParquetType::Int64,
+        // KEYS.4.b: UInt64 is physically stored as INT64 (parquet's only
+        // 64-bit integer width); surfaced via a zero-copy bit reinterpret.
+        DataType::Int64 | DataType::UInt64 => phys == ParquetType::Int64,
         DataType::Float64 => phys == ParquetType::Double,
         DataType::Utf8 | DataType::Utf8View => phys == ParquetType::ByteArray,
         DataType::Dictionary(k, v) => {
@@ -630,7 +632,7 @@ fn validate_type_pair(name: &str, phys: ParquetType, target: &DataType) -> DfRes
         return Err(DataFusionError::NotImplemented(format!(
             "EmatArrowBatchReader: column `{name}`: parquet physical type {phys:?} not yet \
              supported with target Arrow type {target:?} \
-             (supported: Int32/Date32←INT32, Int64←INT64, Float64←DOUBLE, \
+             (supported: Int32/Date32←INT32, Int64/UInt64←INT64, Float64←DOUBLE, \
               Utf8/Utf8View/Dictionary(UInt32,Utf8)←BYTE_ARRAY)"
         )));
     }
@@ -1836,7 +1838,9 @@ fn masked_decode_one_column(
                 n_rows: popcount,
             })
         }
-        DataType::Int64 => {
+        // KEYS.4.b: UInt64 shares the physical INT64 decode; stored as a
+        // DecodedColumn::Int64 buffer and reinterpreted in `slice_decoded`.
+        DataType::Int64 | DataType::UInt64 => {
             let v = masked_decode_i64(file, rg, leaf, bitmap)
                 .map_err(|e| ext(format!("masked i64 leaf {leaf}: {e}")))?;
             if v.len() != popcount {
@@ -2008,7 +2012,9 @@ fn decode_one_column(
                 n_rows,
             })
         }
-        DataType::Int64 => {
+        // KEYS.4.b: UInt64 shares the physical INT64 decode (see
+        // `masked_decode_one_column`); interpretation deferred to `slice_decoded`.
+        DataType::Int64 | DataType::UInt64 => {
             let v = decode_dict_chunk_typed::<i64>(file, chunk_buf, cm, |b| {
                 decode_plain_i64(b).map_err(|e| ext(format!("plain i64: {e}")))
             })?;
@@ -2828,6 +2834,22 @@ fn append_utf8(builder: &mut StringBuilder, bytes: &[u8]) -> DfResult<()> {
 /// (zero-copy). For `StringView` we share the backing data buffer
 /// across all slices and emit a fresh views array per slice.
 /// For `DictUtf8` we share the `values` and slice the indices.
+/// KEYS.4.b — reinterpret an INT64 physical value buffer as a
+/// `UInt64Array`, zero-copy and bit-for-bit. Parquet's only ≥5-byte
+/// integer width is INT64, so an unsigned 64-bit column is stored as
+/// INT64 on disk and must surface as UInt64 without altering the bits:
+/// values ≥ 2^63 differ from their i64 reading only in interpretation,
+/// not representation. `i64` and `u64` share layout and 8-byte
+/// alignment, so the value buffer is reused as-is — no copy, no decode.
+/// Dormant until KEYS.4.a flips `arrow_type_for` to present such columns
+/// as UInt64; this is the single bitcast surface both readers funnel
+/// through (see `ematix_fast_parquet`'s decode arms).
+#[inline]
+pub(crate) fn u64_array_from_i64_buffer(buf: Buffer, len: usize) -> UInt64Array {
+    let scalar = ScalarBuffer::<u64>::new(buf, 0, len);
+    UInt64Array::new(scalar, None)
+}
+
 fn slice_decoded(c: &DecodedColumn, start: usize, n: usize, target: &DataType) -> ArrayRef {
     match c {
         DecodedColumn::Int32 { data, .. } => {
@@ -2845,8 +2867,15 @@ fn slice_decoded(c: &DecodedColumn, start: usize, n: usize, target: &DataType) -
         }
         DecodedColumn::Int64 { data, .. } => {
             let sliced = data.slice_with_length(start * 8, n * 8);
-            let scalar = ScalarBuffer::<i64>::new(sliced, 0, n);
-            Arc::new(Int64Array::new(scalar, None))
+            match target {
+                // KEYS.4.b: a UInt64 column is physically INT64; the same
+                // 8-byte buffer is reinterpreted bit-for-bit (zero-copy).
+                DataType::UInt64 => Arc::new(u64_array_from_i64_buffer(sliced, n)),
+                _ => {
+                    let scalar = ScalarBuffer::<i64>::new(sliced, 0, n);
+                    Arc::new(Int64Array::new(scalar, None))
+                }
+            }
         }
         DecodedColumn::Float64 { data, .. } => {
             let sliced = data.slice_with_length(start * 8, n * 8);
@@ -2964,6 +2993,46 @@ mod tests {
         ));
         let _ = std::fs::create_dir_all(&dir);
         dir.join(format!("{name}.parquet"))
+    }
+
+    // KEYS.4.b — a UInt64 column is physically stored as INT64 (parquet's
+    // only 64-bit integer width), so it must surface as a UInt64Array
+    // bit-for-bit. The value 2^63 (= i64::MIN's bit pattern) is a normal
+    // u64, not a wrapped negative — this is the latent ORDER BY / range
+    // correctness bug that type-faithful u64 fixes. The bitcast is
+    // zero-copy: i64 and u64 share layout, so the physical buffer is
+    // reinterpreted, never re-decoded.
+    #[test]
+    fn slice_decoded_uint64_bitcasts_from_i64_buffer() {
+        use arrow_array::UInt64Array;
+        let vals: Vec<i64> = vec![0, 1, -1, i64::MIN, 42];
+        let n = vals.len();
+        let col = DecodedColumn::Int64 {
+            data: Buffer::from_vec(vals),
+            n_rows: n,
+        };
+        let arr = slice_decoded(&col, 0, n, &DataType::UInt64);
+        let u = arr
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .expect("slice_decoded should yield a UInt64Array for a UInt64 target");
+        assert_eq!(u.values(), &[0u64, 1, u64::MAX, 1u64 << 63, 42]);
+
+        // Int64 target unchanged — no regression for the common path.
+        let arr_i = slice_decoded(&col, 0, n, &DataType::Int64);
+        assert!(arr_i.as_any().downcast_ref::<Int64Array>().is_some());
+
+        // Mid-RG slice still bitcasts correctly (zero-copy offset).
+        let mid = slice_decoded(&col, 2, 2, &DataType::UInt64);
+        let m = mid.as_any().downcast_ref::<UInt64Array>().unwrap();
+        assert_eq!(m.values(), &[u64::MAX, 1u64 << 63]);
+    }
+
+    #[test]
+    fn validate_type_pair_accepts_uint64_over_int64() {
+        assert!(validate_type_pair("k", ParquetType::Int64, &DataType::UInt64).is_ok());
+        // still rejected over a non-INT64 physical type
+        assert!(validate_type_pair("k", ParquetType::Double, &DataType::UInt64).is_err());
     }
 
     fn write_three_primitives(path: &std::path::Path, n: usize) {

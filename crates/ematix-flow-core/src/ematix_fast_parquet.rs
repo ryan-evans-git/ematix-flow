@@ -1690,13 +1690,14 @@ impl EmatixFastParquetTableProvider {
             match field.data_type() {
                 DataType::Int32
                 | DataType::Int64
+                | DataType::UInt64
                 | DataType::Float64
                 | DataType::Date32
                 | DataType::Utf8
                 | DataType::Utf8View => {}
                 other => {
                     return Err(DataFusionError::NotImplemented(format!(
-                        "EmatixFastParquetTableProvider: column `{}` has type {other:?}; bridge supports Int32/Int64/Float64/Date32/Utf8/Utf8View only — use FastParquetTableProvider",
+                        "EmatixFastParquetTableProvider: column `{}` has type {other:?}; bridge supports Int32/Int64/UInt64/Float64/Date32/Utf8/Utf8View only — use FastParquetTableProvider",
                         field.name()
                     )));
                 }
@@ -3400,6 +3401,16 @@ fn decode_one_rg_filtered(
                 debug_assert_eq!(vals.len(), matches);
                 Arc::new(arrow_array::Int64Array::from(vals))
             }
+            // KEYS.4.b: UInt64 is physically INT64 — gather i64 then
+            // reinterpret the buffer bit-for-bit (zero-copy, shared helper).
+            DataType::UInt64 => {
+                let vals = sparse_gather_chunk_i64(path, rg, col_idx, &bitmap)?;
+                debug_assert_eq!(vals.len(), matches);
+                let buf = datafusion::arrow::buffer::Buffer::from_vec(vals);
+                Arc::new(crate::emat_arrow_reader::u64_array_from_i64_buffer(
+                    buf, matches,
+                ))
+            }
             DataType::Float64 => {
                 let vals = sparse_gather_chunk_f64(path, rg, col_idx, &bitmap)?;
                 debug_assert_eq!(vals.len(), matches);
@@ -3529,6 +3540,15 @@ fn decode_one_rg_filtered_late_mat(
                 check_len(vals.len(), matches, field.name(), "Int64")?;
                 Arc::new(arrow_array::Int64Array::from(vals))
             }
+            // KEYS.4.b: UInt64 = physical INT64, reinterpreted zero-copy.
+            DataType::UInt64 => {
+                let vals = masked_decode_i64(&file, rg, col_idx, &bitmap)?;
+                check_len(vals.len(), matches, field.name(), "UInt64")?;
+                let buf = datafusion::arrow::buffer::Buffer::from_vec(vals);
+                Arc::new(crate::emat_arrow_reader::u64_array_from_i64_buffer(
+                    buf, matches,
+                ))
+            }
             DataType::Float64 => {
                 let vals = masked_decode_f64(&file, rg, col_idx, &bitmap)?;
                 check_len(vals.len(), matches, field.name(), "Float64")?;
@@ -3620,6 +3640,16 @@ fn decode_one_rg(
             }
             DataType::Int64 => {
                 decode_column_chunk_i64(path, rg, col_idx)? as Arc<dyn arrow_array::Array>
+            }
+            // KEYS.4.b: UInt64 = physical INT64; reuse the i64 chunk
+            // decode and reinterpret its value buffer bit-for-bit.
+            DataType::UInt64 => {
+                let a = decode_column_chunk_i64(path, rg, col_idx)?;
+                let len = a.len();
+                let buf = a.values().inner().clone();
+                Arc::new(crate::emat_arrow_reader::u64_array_from_i64_buffer(
+                    buf, len,
+                ))
             }
             DataType::Float64 => {
                 decode_column_chunk_f64(path, rg, col_idx)? as Arc<dyn arrow_array::Array>
