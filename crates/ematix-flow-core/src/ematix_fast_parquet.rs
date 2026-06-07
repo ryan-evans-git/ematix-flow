@@ -141,7 +141,11 @@ impl BridgeFilter {
                 // FilterExec — scan is the only filter step.
                 ColumnPredicate::I64InBloom { .. }
                 | ColumnPredicate::I64InSet { .. }
-                | ColumnPredicate::I64Range { .. } => true,
+                | ColumnPredicate::I64Range { .. }
+                // KEYS.5 — string runtime sideband is injected the same
+                // way (no residual FilterExec; the scan applies it).
+                | ColumnPredicate::StringInBloom { .. }
+                | ColumnPredicate::StringInSet { .. } => true,
                 // User-pushed Exact-declarable predicates: Exact only
                 // when the env-var gate is on.
                 ColumnPredicate::I32Range { .. } | ColumnPredicate::I32In { .. } => exact_opt_in,
@@ -432,6 +436,31 @@ pub enum ColumnPredicate {
     /// covers ~100% of l_partkey so no RG is skipped — the lever is
     /// query-shape dependent.
     I64Range { col_idx: usize, lo: i64, hi: i64 },
+    /// KEYS.5 (2026-06-07) — Bloom-filter membership probe on a
+    /// *string* column. The string analog of `I64InBloom`: pre-built
+    /// by `BuildSideBloomEmitterExec` from a string join key's build
+    /// side (e.g. a filtered nation/region name set) and pushed into
+    /// the probe-side scan so rows whose join key isn't in the bloom
+    /// skip the residual join probe. Approximate by design (FPR > 0);
+    /// the residual equi-join still runs — this is selectivity
+    /// reduction, not correctness. Hashing is byte-level
+    /// (`bloom.might_contain_str`), so it is encoding-independent: it
+    /// works against dict-encoded or PLAIN string columns alike via
+    /// `BridgeFilter::build_bitmap`'s existing string decode path.
+    StringInBloom {
+        col_idx: usize,
+        bloom: Arc<crate::bloom::BloomFilter>,
+    },
+    /// KEYS.5 (2026-06-07) — exact string membership probe. The string
+    /// analog of `I64InSet`: used when the build side is small enough
+    /// that an exact set (zero false positives) beats the probabilistic
+    /// bloom. The emitter falls back to `StringInBloom` past the set
+    /// threshold. `HashSet<String>::contains` borrows `&str`, so the
+    /// per-probe check allocates nothing.
+    StringInSet {
+        col_idx: usize,
+        set: Arc<std::collections::HashSet<String>>,
+    },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -632,7 +661,14 @@ impl BridgeFilter {
                 ColumnPredicate::StringEq { col_idx, .. }
                 | ColumnPredicate::StringNotEq { col_idx, .. }
                 | ColumnPredicate::StringIn { col_idx, .. }
-                | ColumnPredicate::StringLike { col_idx, .. } => {
+                | ColumnPredicate::StringLike { col_idx, .. }
+                // KEYS.5 — the string runtime sideband shapes decode the
+                // same byte-array column and evaluate via `eval_str`
+                // (bloom.might_contain_str / set.contains). Reusing this
+                // arm gives them the dict-preserved fast path + dense
+                // fallback for free.
+                | ColumnPredicate::StringInBloom { col_idx, .. }
+                | ColumnPredicate::StringInSet { col_idx, .. } => {
                     let pclone = p.clone();
                     // Try dict-preserved fast path; fall back to dense
                     // on PLAIN-encoded high-cardinality columns
@@ -699,6 +735,8 @@ impl ColumnPredicate {
             ColumnPredicate::I64InBloom { col_idx, .. } => *col_idx,
             ColumnPredicate::I64InSet { col_idx, .. } => *col_idx,
             ColumnPredicate::I64Range { col_idx, .. } => *col_idx,
+            ColumnPredicate::StringInBloom { col_idx, .. } => *col_idx,
+            ColumnPredicate::StringInSet { col_idx, .. } => *col_idx,
         }
     }
 
@@ -850,6 +888,11 @@ impl ColumnPredicate {
             // (Q05/Q07/Q08 dim filters), so 0.3 is a conservative
             // win-leaning estimate.
             ColumnPredicate::I64Range { .. } => 0.3,
+            // KEYS.5 — string runtime sideband. Mirror the i64 shapes:
+            // bloom ~0.2 (FP-leaning, build small by construction),
+            // exact set ~0.1 (no FP, smallest builds).
+            ColumnPredicate::StringInBloom { .. } => 0.2,
+            ColumnPredicate::StringInSet { .. } => 0.1,
         }
     }
 
@@ -916,6 +959,11 @@ impl ColumnPredicate {
             // as the L9 bloom/set: selectivity reduction, not
             // replacement.
             ColumnPredicate::I64Range { .. } => false,
+            // KEYS.5 — string runtime sideband is approximate (bloom)
+            // or selectivity-reducing (set); the residual string
+            // equi-join must still run. Inexact, like the i64 shapes.
+            ColumnPredicate::StringInBloom { .. } => false,
+            ColumnPredicate::StringInSet { .. } => false,
         }
     }
 
@@ -998,6 +1046,12 @@ impl ColumnPredicate {
                 let m = matches_sql_like(pattern.as_str(), v);
                 if *negated { !m } else { m }
             }
+            // KEYS.5 — string runtime sideband probe. Byte-level hash
+            // membership (bloom) / exact membership (set). False
+            // positives on the bloom are part of the contract; the
+            // residual string equi-join still runs.
+            ColumnPredicate::StringInBloom { bloom, .. } => bloom.might_contain_str(v),
+            ColumnPredicate::StringInSet { set, .. } => set.contains(v),
             _ => false,
         }
     }
@@ -2685,6 +2739,12 @@ impl ExecutionPlan for EmatixFastParquetExec {
                                     ColumnPredicate::I64InBloom { col_idx, .. } => {
                                         format!("I64InBloom(col={col_idx})")
                                     }
+                                    ColumnPredicate::StringInBloom { col_idx, .. } => {
+                                        format!("StringInBloom(col={col_idx})")
+                                    }
+                                    ColumnPredicate::StringInSet { col_idx, .. } => {
+                                        format!("StringInSet(col={col_idx})")
+                                    }
                                     _ => "other".to_string(),
                                 })
                                 .collect();
@@ -3688,6 +3748,77 @@ fn decode_one_rg(
 mod tests {
     use super::*;
     use datafusion::prelude::SessionContext;
+
+    /// KEYS.5 story (a) — the string runtime sideband predicates
+    /// (`StringInBloom` / `StringInSet`) must (1) probe correctly via
+    /// `eval_str` — bloom by byte-hash membership, set by exact
+    /// membership; (2) report their target column via `col_idx`; and
+    /// (3) classify as inexact (`is_exact_safe() == false`) so the
+    /// residual string equi-join is preserved, exactly like the i64
+    /// sideband shapes. This is the unit under test for story (a); the
+    /// emitter (story b) and end-to-end join (story d) build on it.
+    #[test]
+    fn keys5_string_runtime_predicates_probe_and_classify() {
+        use crate::bloom::BloomFilter;
+
+        // --- StringInBloom: byte-level membership, no false negatives.
+        let mut b = BloomFilter::with_capacity(64, 16);
+        for k in ["FRANCE", "GERMANY", "BRAZIL"] {
+            b.insert_str(k);
+        }
+        let bloom = Arc::new(b);
+        let pred = ColumnPredicate::StringInBloom {
+            col_idx: 3,
+            bloom: bloom.clone(),
+        };
+        // Inserted keys must ALWAYS pass (blooms have no false negatives).
+        for k in ["FRANCE", "GERMANY", "BRAZIL"] {
+            assert!(pred.eval_str(k), "StringInBloom missed inserted key {k}");
+        }
+        // eval_str must DELEGATE to the bloom exactly — including absent
+        // keys, where agreement holds regardless of any false positive.
+        for k in [
+            "FRANCE",
+            "GERMANY",
+            "BRAZIL",
+            "ARGENTINA",
+            "JAPAN",
+            "UNITED KINGDOM",
+            "zzz",
+            "",
+        ] {
+            assert_eq!(
+                pred.eval_str(k),
+                bloom.might_contain_str(k),
+                "StringInBloom eval_str disagrees with bloom for {k:?}"
+            );
+        }
+        assert_eq!(pred.col_idx(), 3);
+        assert!(
+            !pred.is_exact_safe(),
+            "runtime string bloom must be inexact (residual join still runs)"
+        );
+
+        // --- StringInSet: exact membership, zero false positives.
+        let set: std::collections::HashSet<String> =
+            ["FRANCE", "GERMANY"].iter().map(|s| s.to_string()).collect();
+        let pred = ColumnPredicate::StringInSet {
+            col_idx: 7,
+            set: Arc::new(set),
+        };
+        assert!(pred.eval_str("FRANCE"));
+        assert!(pred.eval_str("GERMANY"));
+        assert!(
+            !pred.eval_str("BRAZIL"),
+            "absent key must not match the exact set"
+        );
+        assert!(!pred.eval_str(""), "empty key must not match");
+        assert_eq!(pred.col_idx(), 7);
+        assert!(
+            !pred.is_exact_safe(),
+            "runtime string set must be inexact (residual join still runs)"
+        );
+    }
 
     /// KEYS.2 — an INT64 key column whose values fit i32 is advertised as
     /// Int32 (downcast on) and decodes losslessly through the streaming
