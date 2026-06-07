@@ -34,7 +34,9 @@
 use std::sync::Arc;
 
 use arrow_array::builder::make_view;
-use arrow_array::{ArrayRef, Date32Array, Float64Array, Int32Array, Int64Array, StringViewArray};
+use arrow_array::{
+    ArrayRef, Date32Array, Float64Array, Int32Array, Int64Array, StringViewArray, UInt64Array,
+};
 use arrow_schema::DataType;
 use datafusion::arrow::buffer::{Buffer, NullBuffer, ScalarBuffer};
 use datafusion::error::{DataFusionError, Result as DfResult};
@@ -153,10 +155,20 @@ impl PrimitiveType for i64 {
     fn decode_plain(bytes: &[u8]) -> DfResult<Vec<Self>> {
         decode_plain_i64(bytes).map_err(|e| ext(format!("plain i64: {e}")))
     }
-    fn make_array(slice: &[Self], _target: &DataType) -> ArrayRef {
+    fn make_array(slice: &[Self], target: &DataType) -> ArrayRef {
         let buf = Buffer::from_slice_ref(slice);
-        let scalar = ScalarBuffer::<i64>::new(buf, 0, slice.len());
-        Arc::new(Int64Array::new(scalar, None))
+        match target {
+            // KEYS.4.b — UInt64 is physically INT64; reinterpret the same
+            // bytes as u64 (bit-for-bit, parallel to i32's Date32 branch).
+            DataType::UInt64 => {
+                let scalar = ScalarBuffer::<u64>::new(buf, 0, slice.len());
+                Arc::new(UInt64Array::new(scalar, None))
+            }
+            _ => {
+                let scalar = ScalarBuffer::<i64>::new(buf, 0, slice.len());
+                Arc::new(Int64Array::new(scalar, None))
+            }
+        }
     }
 }
 
@@ -744,7 +756,11 @@ impl EmatPageStreamingReader {
                 DataType::Int32 | DataType::Date32 => {
                     Box::new(Int32PageStream::new(&self.file, cm)?)
                 }
-                DataType::Int64 => Box::new(Int64PageStream::new(&self.file, cm)?),
+                // KEYS.4.b — UInt64 shares the i64 page-decode; make_array
+                // reinterprets the buffer as UInt64Array.
+                DataType::Int64 | DataType::UInt64 => {
+                    Box::new(Int64PageStream::new(&self.file, cm)?)
+                }
                 DataType::Float64 => Box::new(Float64PageStream::new(&self.file, cm)?),
                 DataType::Utf8View => Box::new(StringViewPageStream::new(&self.file, cm)?),
                 other => {
@@ -979,7 +995,11 @@ impl EmatInlineStreamingReader {
                 DataType::Int32 | DataType::Date32 => {
                     Box::new(Int32PageStream::new(&self.file, cm)?)
                 }
-                DataType::Int64 => Box::new(Int64PageStream::new(&self.file, cm)?),
+                // KEYS.4.b — UInt64 shares the i64 page-decode; make_array
+                // reinterprets the buffer as UInt64Array.
+                DataType::Int64 | DataType::UInt64 => {
+                    Box::new(Int64PageStream::new(&self.file, cm)?)
+                }
                 DataType::Float64 => Box::new(Float64PageStream::new(&self.file, cm)?),
                 DataType::Utf8View => Box::new(StringViewPageStream::new(&self.file, cm)?),
                 other => {
