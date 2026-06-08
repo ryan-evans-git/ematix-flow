@@ -7,7 +7,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-(no entries yet — anything landing on `main` after v0.9.0 goes here)
+(no entries yet — anything landing on `main` after v0.10.0 goes here)
+
+## [0.10.0] — 2026-06-07
+
+Perf + capability release. No Python API changes; the surface from v0.9.0
+is unchanged. Highlights: type-faithful `u64` join keys, a string
+runtime-bloom sideband, mimalloc in the shipped binaries, and a
+three-scale benchmark refresh.
+
+### Added
+
+- **String runtime-bloom sideband (KEYS.5)** — the L9 build-side bloom /
+  exact-set sideband now covers UTF-8 string join keys
+  (`StringInBloom` / `StringInSet`), the byte-hash analog of the i64
+  domain. A string equi-join's build side publishes the set/bloom into
+  the probe-side parquet scan, pruning rows before the residual join.
+  Default-on (rides the existing runtime-bloom rule); inert on TPC-H
+  (all-integer FK->PK joins), it benefits real-world string-keyed joins.
+- **Type-faithful `u64` columns (KEYS.4)** — `UINT_64` Parquet columns
+  now surface and process as unsigned end-to-end (zero-copy i64<->u64
+  bitcast), fixing a latent `ORDER BY` / range bug for values >= 2^63
+  (i64 ordering != u64). u64 join keys ride the i64 runtime bloom via a
+  bit-pattern reinterpret. Proven with a synthetic end-to-end test.
+- **Opt-in execution operators (infra, default-off)** — a push-vectorized
+  morsel engine + push-kernel crate, an `EmatixHashJoin` kernel/operator
+  with a no-shuffle partitioned-build swap, and a `CombineAgg` +
+  `I64SumF64` morsel aggregate. All env-gated; banked for future
+  default-on work.
+- **Three-scale TPC-H benchmark refresh (2026-06-07, Apple M4 Max)** —
+  all 22 queries across SF=1 / SF=10 / SF=100. Wins: **22 / 22** (SF=1),
+  **21 / 22** (SF=10, was 18), **18 / 22** (SF=100, was 16); geomean vs
+  DuckDB 3.03x / 1.67x / 1.29x. Q18 SF=10 245 -> 20.6 ms. Full numbers at
+  [ematix.dev/reference/benchmarks](https://ematix.dev/reference/benchmarks).
+
+### Changed
+
+- **mimalloc as the global allocator** in the shipped binaries — lower
+  allocation churn on the scan / aggregate hot paths.
+- **Q15 default-on CSE-parallel drain + masked-fusion pushdown** — the
+  shared-subtree aggregate drains its partitions concurrently and the
+  EXACT masked-fusion pushdown prunes a redundant decode (PV.M.7); Q15
+  SF=10 reaches Polars parity.
+
+### Fixed
+
+- **`I64Set` 2^63 sentinel** — the runtime exact-set now spans the full
+  i64 domain (`i64::MIN` is a storable key, not the empty sentinel).
+- **Join-reorder stats gate** — the scale-relative bump ignores
+  Absent/sentinel leaf cardinalities, fixing a Q05 plan regression.
+- **TPC-H Q11 SF-fraction** — the benchmark query constant now scales as
+  `0.0001 / SF` (the static value returned 0 rows at SF >= 10).
+
+### Dependencies
+
+- **ematix-parquet 0.17.0** — INT64->i32 downcast-on-read + the SIMD
+  i64->i{32,16,8} narrowing kernel that erases the downcast decode tax.
 
 ## [0.9.0] — 2026-05-31
 

@@ -5,10 +5,12 @@ members = [
     "crates/ematix-flow-py",
     "crates/ematix-flow-cli",
     "crates/ematix-flow-distributed",
+    "crates/ematix-flow-hash-join",
+    "crates/ematix-flow-push",
 ]
 
 [workspace.package]
-version = "0.9.0"
+version = "0.10.0"
 edition = "2024"
 rust-version = "1.85"
 license = "Apache-2.0"
@@ -244,11 +246,11 @@ sqlparser = { version = "0.61", features = ["visitor"] }
 lto = "thin"
 codegen-units = 1
 
-# ematix-parquet v0.16.1 on crates.io as of 2026-05-25. Bumped from
-# v0.15.0 to pick up the sidecar-index capability (Π.17–Π.20: sorted /
-# Bloom / composite / inverted-text indexes) and the `ematix-iceberg`
-# crate (Π.21–Π.22: manifest walker + file-level prune). flow-core's
-# `ematix-parquet-* = "0.16"` pin resolves directly from the registry.
-# ematix-iceberg is intentionally NOT yet a flow-side dep — Phase 3+
-# of docs/plans/CURRENT.md will wire it in when we surface Iceberg-
-# managed tables.
+# ematix-parquet v0.17.0 on crates.io as of 2026-06-07. Bumped from
+# v0.16.x to pick up REV.12 (stats-driven INT32/INT64 downcast-on-read
+# decoders) + REV.14 (auto-vectorized i64→i{32,16,8} narrowing that
+# erases the downcast decode tax). flow-core's `ematix-parquet-* =
+# "0.17"` pin resolves directly from the registry. ematix-iceberg is
+# intentionally NOT yet a flow-side dep — Phase 3+ of
+# docs/plans/CURRENT.md will wire it in when we surface Iceberg-managed
+# tables.

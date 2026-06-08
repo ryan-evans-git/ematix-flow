@@ -57,12 +57,12 @@ flow run-due --module my_pipelines    # cron-style; drop into systemd / cron / k
 
 ## Why ematix-flow
 
-- **Fast.** TPC-H, 22 queries, single Apple M3 Pro, measured at three
-  scales: ematix-flow takes **22 / 22** at SF=1 (**2.67×** DuckDB,
-  **4.90×** Polars, **20×** single-node PySpark), **18 / 22** at SF=10,
-  and **16 / 22** at SF=100 — still ahead of DuckDB where the data
+- **Fast.** TPC-H, 22 queries, single Apple M4 Max, measured at three
+  scales: ematix-flow takes **22 / 22** at SF=1 (**3.03×** DuckDB,
+  **5.04×** Polars, **22×** single-node PySpark), **21 / 22** at SF=10,
+  and **18 / 22** at SF=100 — still ahead of DuckDB where the data
   spills out of cache, and it *widens* the hardest query there (Q18
-  SF=100, 5.8×). Full numbers and reproducer in [Benchmarks](#benchmarks).
+  SF=100, 5.7×). Full numbers and reproducer in [Benchmarks](#benchmarks).
 - **Scheduling + DAG, no service to operate.** Pipelines carry their own
   cron schedule and `depends_on=` edges (with cycle detection and exponential-
   backoff retries). Run `flow run-due` from cron, systemd, a k8s `CronJob`,
@@ -1465,52 +1465,54 @@ the [Install](#install) extras and the
 
 ### TPC-H — SF=1 / SF=10 / SF=100, all 22 queries
 
-Five engines, the same Apple M3 Pro, the same Parquet files
-(2026-05-31 refresh). ematix-flow + DuckDB are **co-measured in one
-process** (10 timed trials after 3 warmups, medians) so thermal drift
-hits both equally; Polars runs the same in-process harness; PySpark is
-`local[*]` on the JVM; Postgres 14 is `EXPLAIN ANALYZE` Execution Time.
+Five engines, the same Apple M4 Max, the same Parquet files
+(2026-06-07 refresh — ematix-flow / DuckDB / Polars freshly co-measured;
+PySpark + Postgres carried from the 2026-05-31 baseline on the same
+machine). ematix-flow + DuckDB are **co-measured in one process** (10
+timed trials after 3 warmups at SF=1 / SF=10; 3 after 1 at SF=100,
+medians) so thermal drift hits both equally; Polars runs the same
+in-process harness; PySpark is `local[*]` on the JVM; Postgres 14 is
+`EXPLAIN ANALYZE` Execution Time.
 
 | Scale | ematix-flow wins | vs DuckDB | vs Polars | vs PySpark | vs Postgres |
 |---|:--|--:|--:|--:|--:|
-| **SF=1** (~1 GB, in-cache) | **22 / 22** | 2.67× | 4.90× | 20.5× | 18.8× |
-| **SF=10** (~10 GB) | **18 / 22** | 1.46× | 4.53× | 13.9× | 25.2× |
-| **SF=100** (~100 GB) | **16 / 22** | 1.32× | 6.64× | 10.8× | 89× † |
+| **SF=1** (~1 GB, in-cache) | **22 / 22** | 3.03× | 5.04× | 21.9× | 20.1× |
+| **SF=10** (~10 GB) | **21 / 22** | 1.67× | 4.90× | 14.5× | 26.2× |
+| **SF=100** (~100 GB) | **18 / 22** | 1.29× | 5.91× | 9.7× | 72× † |
 
 Geomean of competitor ÷ ematix-flow across the 22 queries (Polars n=21
 at SF=10 / n=17 at SF=100; **†** Postgres ran 6 / 22 at SF=100 under a
 90 s cap). DuckDB's wins are the multi-fact joins it reorders well
-(Q07 / Q08 at SF=10; Q07 / Q09 / Q10 / Q17 / Q20 at SF=100); ematix-flow
-still leads at every scale and *widens* the hardest query — **Q18
-SF=100: 377 ms vs DuckDB's 2 193 ms (5.8×)** on the v0.9.0
-scale-relative broadcast-join rule. Full tables, tabbed by scale, are on
+(Q08 at SF=10; Q10 / Q20 / Q22 at SF=100); ematix-flow still leads at
+every scale and *widens* the hardest query — **Q18 SF=100: 495 ms vs
+DuckDB's 2 812 ms (5.7×)** on the scale-relative broadcast-join rule. Full tables, tabbed by scale, are on
 the docs site: [ematix.dev/reference/benchmarks](https://ematix.dev/reference/benchmarks).
 SF=1 in full (the README's headline scale):
 
 | Query | ematix-flow | DuckDB | Polars | PySpark | Postgres |
 |---|--:|--:|--:|--:|--:|
-| Q01 | **16.1** | 47.6 | 39.3 | 167 | 411 |
-| Q02 | **6.8** | 16.2 | 48.0 | 190 | 123 |
-| Q03 | **9.1** | 31.2 | 47.4 | 257 | 163 |
-| Q04 | **9.7** | 21.6 | 24.8 | 184 | 94.6 |
-| Q05 | **6.8** | 30.3 | 11,141 | 335 | 226 |
-| Q06 | **0.9** | 12.0 | 10.1 | 41.5 | 218 |
-| Q07 | **26.2** | 31.3 | 118 | 260 | 1,262 |
-| Q08 | **12.3** | 37.3 | 95.0 | 182 | 99.7 |
-| Q09 | **16.2** | 52.9 | 48.7 | 583 | 820 |
-| Q10 | **23.2** | 57.0 | 135 | 362 | 355 |
-| Q11 | **5.0** | 9.0 | 9.3 | 119 | 36.3 |
-| Q12 | **12.7** | 23.1 | 19.3 | 269 | 361 |
-| Q13 | **8.6** | 130 | 122 | 684 | 871 |
-| Q14 | **9.8** | 21.0 | 12.6 | 114 | 69.8 |
-| Q15 | **10.8** | 13.2 | 11.6 | 127 | 140 |
-| Q16 | **7.1** | 20.6 | 22.0 | 205 | 113 |
-| Q17 | **14.1** | 24.0 | 42.8 | 233 | 398 |
-| Q18 | **24.0** | 43.1 | 58.6 | 560 | 1,154 |
-| Q19 | **14.4** | 31.9 | 109 | 86.0 | 31.9 |
-| Q20 | **14.4** | 27.4 | 23.1 | 106 | 147 |
-| Q21 | **32.7** | 69.0 | 741 | 628 | 609 |
-| Q22 | **7.8** | 19.6 | 13.0 | 354 | 24.1 |
+| Q01 | **17.1** | 48.5 | 38.6 | 167 | 411 |
+| Q02 | **6.96** | 17.6 | 47.9 | 190 | 123 |
+| Q03 | **9.60** | 32.8 | 46.5 | 257 | 163 |
+| Q04 | **10.3** | 22.3 | 23.8 | 184 | 94.6 |
+| Q05 | **6.58** | 31.7 | 8,949 | 335 | 226 |
+| Q06 | **0.94** | 13.1 | 10.5 | 41.5 | 218 |
+| Q07 | **27.0** | 32.9 | 118 | 260 | 1,262 |
+| Q08 | **11.4** | 39.4 | 96.7 | 182 | 99.7 |
+| Q09 | **17.4** | 55.6 | 47.5 | 583 | 820 |
+| Q10 | **27.2** | 60.6 | 111 | 362 | 355 |
+| Q11 | **6.05** | 9.72 | 8.87 | 119 | 36.3 |
+| Q12 | **14.4** | 25.1 | 19.2 | 269 | 361 |
+| Q13 | **9.15** | 141 | 118 | 684 | 871 |
+| Q14 | **10.2** | 22.3 | 12.3 | 114 | 69.8 |
+| Q15 | **10.4** | 14.1 | 11.2 | 127 | 140 |
+| Q16 | **7.68** | 21.4 | 21.2 | 205 | 113 |
+| Q17 | **14.8** | 24.7 | 39.0 | 233 | 398 |
+| Q18 | **1.55** | 45.7 | 56.6 | 560 | 1,154 |
+| Q19 | **15.5** | 34.4 | 105 | 86.0 | 31.9 |
+| Q20 | **16.7** | 28.9 | 22.4 | 106 | 147 |
+| Q21 | **35.0** | 74.5 | 721 | 628 | 609 |
+| Q22 | **8.47** | 20.9 | 13.6 | 354 | 24.1 |
 
 Median ms, fastest per row in **bold**; ematix-flow + DuckDB
 co-measured in one process. Polars runs hand-translated `.polars.sql`

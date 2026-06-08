@@ -1,17 +1,18 @@
 //! Q06.b debug — walk pages of l_shipdate in lineitem_lz4.parquet to
 //! see if PageHeader parsing succeeds and which page version DuckDB
 //! wrote.
+#![allow(clippy::manual_checked_ops)]
 
 use ematix_parquet_io::ParquetFile;
 use ematix_parquet_io::pages::PageWalker;
 use std::path::PathBuf;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let path = PathBuf::from("examples/tpch/data/sf10/lineitem_lz4.parquet");
+    let path = PathBuf::from("examples/tpch/data/sf10/lineitem.parquet");
     let file = ParquetFile::open(&path)?;
     let md = file.metadata()?;
 
-    for col_name in &["l_shipdate", "l_quantity", "l_extendedprice"] {
+    for col_name in &["l_extendedprice", "l_discount", "l_suppkey", "l_partkey"] {
         let col = md.row_groups[0]
             .columns
             .iter()
@@ -36,50 +37,64 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let limit = length as usize;
         let mut w = PageWalker::with_byte_limit(&chunk, limit);
         let mut page_idx = 0;
+        let mut data_pages = 0u64;
+        let mut total_values = 0u64;
+        let mut min_vals = u64::MAX;
+        let mut max_vals = 0u64;
         loop {
             match w.next_page() {
-                Ok(Some((hdr, body))) => {
-                    let kind = if hdr.data_page_header.is_some() {
-                        "V1"
-                    } else if hdr.data_page_header_v2.is_some() {
-                        "V2"
-                    } else if hdr.dictionary_page_header.is_some() {
-                        "Dict"
-                    } else {
-                        "?"
-                    };
-                    println!(
-                        "  page #{page_idx}  type={:?} kind={kind}  csize={}  usize={}  body.len()={}",
-                        hdr.page_type,
-                        hdr.compressed_page_size,
-                        hdr.uncompressed_page_size,
-                        body.len()
-                    );
-                    if let Some(ref v2) = hdr.data_page_header_v2 {
-                        println!(
-                            "      v2: rep_len={} def_len={} num_values={} is_compressed={}",
-                            v2.repetition_levels_byte_length,
-                            v2.definition_levels_byte_length,
-                            v2.num_values,
-                            v2.is_compressed,
-                        );
+                Ok(Some((hdr, _body))) => {
+                    // num_values lives in V1 data_page_header or V2 header.
+                    let nv = hdr
+                        .data_page_header
+                        .as_ref()
+                        .map(|h| h.num_values as u64)
+                        .or_else(|| {
+                            hdr.data_page_header_v2
+                                .as_ref()
+                                .map(|h| h.num_values as u64)
+                        });
+                    if let Some(nv) = nv {
+                        data_pages += 1;
+                        total_values += nv;
+                        min_vals = min_vals.min(nv);
+                        max_vals = max_vals.max(nv);
+                        if page_idx < 4 {
+                            println!(
+                                "  data page #{data_pages}  num_values={nv}  csize={}  usize={}",
+                                hdr.compressed_page_size, hdr.uncompressed_page_size
+                            );
+                        }
                     }
                     page_idx += 1;
-                    if page_idx > 8 {
-                        println!("  (truncated)");
-                        break;
-                    }
                 }
-                Ok(None) => {
-                    println!("  end-of-chunk at page #{page_idx}");
-                    break;
-                }
+                Ok(None) => break,
                 Err(e) => {
                     println!("  ERROR at page #{page_idx}: {e}");
                     break;
                 }
             }
         }
+        let avg = if data_pages > 0 {
+            total_values / data_pages
+        } else {
+            0
+        };
+        println!(
+            "  >>> {col_name}: {data_pages} data pages, total_values={total_values}, \
+             values/page avg={avg} min={} max={max_vals}",
+            if min_vals == u64::MAX { 0 } else { min_vals }
+        );
+        // At Q08 selectivity (37,234 survivors of 60M = 0.062%), the chance a
+        // page of P values has >=1 survivor is 1-(1-0.00062)^P. Report the
+        // page-skip fraction a perfect late-mat could achieve.
+        let p = avg as f64;
+        let hit = 1.0 - (1.0 - 0.00062f64).powf(p);
+        println!(
+            "  >>> at 0.062% scatter, ~{:.1}% of pages contain a survivor => late-mat could skip ~{:.1}% of payload decompress",
+            hit * 100.0,
+            (1.0 - hit) * 100.0
+        );
     }
     Ok(())
 }

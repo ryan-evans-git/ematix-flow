@@ -73,6 +73,101 @@ fn l9_set_threshold() -> usize {
         .unwrap_or(DEFAULT_L9_SET_THRESHOLD)
 }
 
+/// KEYS.1 — true iff a join-key `DataType` losslessly widens to `i64`, so it
+/// can ride the i64-domain runtime bloom/set sideband (`insert_i64` /
+/// `might_contain_i64`) with only a widen-on-read at the build side and the
+/// native-i64 read at the probe side.
+///
+/// Accepted: the signed/unsigned integer widths that fit in i64 plus the
+/// date types (which are i32/i64 day/ms counts underneath). Excluded by
+/// design — each needs a DIFFERENT structure, tracked as follow-ups:
+///   * `Float32/64` — float equi-join is a semantic anti-pattern and bit-
+///     pattern hashing is unsafe across encodings.
+///   * `Utf8 / Utf8View / Dictionary` — need a byte/hash bloom + a string
+///     probe kernel (a separate, larger mechanism).
+///   * `Decimal128/256` — 128/256-bit, don't fit i64.
+pub fn widens_to_i64(dt: &datafusion::arrow::datatypes::DataType) -> bool {
+    use datafusion::arrow::datatypes::DataType;
+    matches!(
+        dt,
+        DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            // KEYS.4.d-part2: UInt64 joins the i64 bloom domain via a
+            // bit-pattern reinterpret (NOT a value widening). Equality is
+            // bit-based, so a u64 build key and a u64 probe key with the
+            // same value have identical i64 bits on both sides. The emitter
+            // bitcasts u64→i64 at insert (see the cast site); the probe
+            // already reads i64 bits (UInt64 decodes to DecodedColumn::Int64).
+            | DataType::UInt64
+            | DataType::Date32
+            | DataType::Date64
+    )
+}
+
+/// KEYS.5 — true iff a join-key `DataType` is a UTF-8 string family that
+/// rides the *string* runtime sideband (`StringInBloom` / `StringInSet`,
+/// byte-hash membership) instead of the i64 domain. Mutually exclusive with
+/// [`widens_to_i64`]. `Dictionary`-encoded strings are not matched here — the
+/// build side materialises them to Utf8/Utf8View before this point; a native
+/// dict-key fast path is a future refinement.
+pub fn is_string_key(dt: &datafusion::arrow::datatypes::DataType) -> bool {
+    use datafusion::arrow::datatypes::DataType;
+    matches!(
+        dt,
+        DataType::Utf8 | DataType::Utf8View | DataType::LargeUtf8
+    )
+}
+
+/// KEYS.5 — invoke `f` once per non-null value of a UTF-8 string column,
+/// covering the three array layouts a build side may produce (Utf8 / LargeUtf8
+/// / Utf8View). No-op on non-string arrays (unreachable — callers gate on
+/// [`is_string_key`]).
+fn for_each_non_null_str(arr: &datafusion::arrow::array::ArrayRef, mut f: impl FnMut(&str)) {
+    use datafusion::arrow::array::{LargeStringArray, StringArray, StringViewArray};
+    use datafusion::arrow::datatypes::DataType;
+    match arr.data_type() {
+        DataType::Utf8 => {
+            let a = arr
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("data_type()==Utf8 guarantees StringArray");
+            for i in 0..a.len() {
+                if a.is_valid(i) {
+                    f(a.value(i));
+                }
+            }
+        }
+        DataType::LargeUtf8 => {
+            let a = arr
+                .as_any()
+                .downcast_ref::<LargeStringArray>()
+                .expect("data_type()==LargeUtf8 guarantees LargeStringArray");
+            for i in 0..a.len() {
+                if a.is_valid(i) {
+                    f(a.value(i));
+                }
+            }
+        }
+        DataType::Utf8View => {
+            let a = arr
+                .as_any()
+                .downcast_ref::<StringViewArray>()
+                .expect("data_type()==Utf8View guarantees StringViewArray");
+            for i in 0..a.len() {
+                if a.is_valid(i) {
+                    f(a.value(i));
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Σ.Q.L9 — Wrapper exec that emits a build-side bloom to a sideband.
 #[derive(Debug)]
 pub struct BuildSideBloomEmitterExec {
@@ -103,6 +198,13 @@ pub struct BuildSideBloomEmitterExec {
     /// partition's `Option` is `None`, we fall back to publishing
     /// `I64InBloom` from the local_blooms.
     local_sets: Arc<Mutex<Vec<Option<I64Set>>>>,
+    /// KEYS.5 — per-partition exact STRING set, the string analog of
+    /// `local_sets`. Populated only when the build key is a UTF-8 string (see
+    /// [`is_string_key`]); empty/unused on the i64 path. `Some(set)` while the
+    /// partition stayed under [`l9_set_threshold`]; `None` once it overflowed
+    /// → publish falls back to a `StringInBloom` from `local_blooms` (which is
+    /// type-agnostic — `insert_str` writes byte-hashes into the same filter).
+    local_string_sets: Arc<Mutex<Vec<Option<std::collections::HashSet<String>>>>>,
     /// Lever 3 — per-partition (min, max) of build-side keys. An
     /// entry is `None` when the partition saw zero keys. At publish
     /// time the global (min, max) is the union of per-partition
@@ -170,12 +272,12 @@ impl BuildSideBloomEmitterExec {
                 "BuildSideBloomEmitterExec: key_col_idx={key_col_idx} out of bounds"
             )));
         }
-        if in_schema.field(key_col_idx).data_type()
-            != &datafusion::arrow::datatypes::DataType::Int64
-        {
+        let key_dt = in_schema.field(key_col_idx).data_type();
+        if !widens_to_i64(key_dt) && !is_string_key(key_dt) {
             return Err(DataFusionError::Internal(format!(
-                "BuildSideBloomEmitterExec: key column must be Int64, got {:?}",
-                in_schema.field(key_col_idx).data_type()
+                "BuildSideBloomEmitterExec: key column must widen to i64 \
+                 (Int8/16/32/64, UInt8/16/32, Date32/64) or be a UTF-8 string \
+                 (Utf8/Utf8View/LargeUtf8), got {key_dt:?}"
             )));
         }
         let n_partitions = input.output_partitioning().partition_count().max(1);
@@ -194,6 +296,7 @@ impl BuildSideBloomEmitterExec {
             extra_targets,
             local_blooms: Arc::new(Mutex::new(Vec::with_capacity(n_partitions))),
             local_sets: Arc::new(Mutex::new(Vec::with_capacity(n_partitions))),
+            local_string_sets: Arc::new(Mutex::new(Vec::with_capacity(n_partitions))),
             local_ranges: Arc::new(Mutex::new(Vec::with_capacity(n_partitions))),
             completed: Arc::new(AtomicUsize::new(0)),
             n_partitions,
@@ -277,6 +380,11 @@ impl ExecutionPlan for BuildSideBloomEmitterExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> DfResult<SendableRecordBatchStream> {
+        // KEYS.5 — string keys ride a dedicated StringInBloom/StringInSet
+        // accumulation path; everything else stays on the i64 domain below.
+        if is_string_key(self.input.schema().field(self.key_col_idx).data_type()) {
+            return self.execute_string(partition, context);
+        }
         let key_col_idx = self.key_col_idx;
         let target_col_idx = self.target_col_idx;
         let sideband = self.sideband.clone();
@@ -323,8 +431,48 @@ impl ExecutionPlan for BuildSideBloomEmitterExec {
         // partition owns the locals).
         let mapped = upstream.map(move |batch_res| match batch_res {
             Ok(batch) => {
-                let arr = batch.column(key_col_idx);
-                if let Some(i64s) = arr.as_any().downcast_ref::<Int64Array>() {
+                // KEYS.1: widen any i64-domain key (Int8/16/32, UInt8/16/32,
+                // Date32/64) to Int64 so the bloom/set/range logic below is
+                // unchanged. Lossless by the `widens_to_i64` construction gate.
+                // The forwarded `batch` is the ORIGINAL (unchanged) — only the
+                // bloom INSERTION sees the widened copy. Native Int64 keys skip
+                // the cast (clone is a cheap Arc bump).
+                let raw = batch.column(key_col_idx);
+                let key_arr: datafusion::arrow::array::ArrayRef =
+                    if raw.data_type() == &datafusion::arrow::datatypes::DataType::Int64 {
+                        raw.clone()
+                    } else if raw.data_type() == &datafusion::arrow::datatypes::DataType::UInt64 {
+                        // KEYS.4.d-part2: u64 → i64 by BIT REINTERPRET, not
+                        // arrow `cast` (which nulls values >= 2^63 under the
+                        // default safe options, silently dropping those build
+                        // keys from the bloom → false negatives → lost join
+                        // rows). Equality is bit-pattern based; the probe side
+                        // reads the same i64 bits (UInt64 decodes to
+                        // DecodedColumn::Int64), so identical u64 values match.
+                        let u = raw
+                            .as_any()
+                            .downcast_ref::<datafusion::arrow::array::UInt64Array>()
+                            .expect("data_type()==UInt64 guarantees UInt64Array");
+                        let scalar = datafusion::arrow::buffer::ScalarBuffer::<i64>::new(
+                            u.values().inner().clone(),
+                            0,
+                            u.len(),
+                        );
+                        std::sync::Arc::new(Int64Array::new(scalar, u.nulls().cloned()))
+                    } else {
+                        match datafusion::arrow::compute::cast(
+                            raw,
+                            &datafusion::arrow::datatypes::DataType::Int64,
+                        ) {
+                            Ok(a) => a,
+                            // Castability is guaranteed by widens_to_i64 at
+                            // construction; on the impossible failure, surface
+                            // it rather than silently building an incomplete
+                            // bloom (which would drop valid probe rows).
+                            Err(e) => return Err(DataFusionError::from(e)),
+                        }
+                    };
+                if let Some(i64s) = key_arr.as_any().downcast_ref::<Int64Array>() {
                     let mut bloom_guard = local_for_map.lock().unwrap();
                     let mut set_guard = local_set_for_map.lock().unwrap();
                     let mut range_guard = local_range_for_map.lock().unwrap();
@@ -607,6 +755,215 @@ impl ExecutionPlan for BuildSideBloomEmitterExec {
     }
 }
 
+impl BuildSideBloomEmitterExec {
+    /// KEYS.5 — string-key analog of the i64 path in [`Self::execute`].
+    /// Accumulates the Utf8/Utf8View/LargeUtf8 build key into a byte-hash
+    /// `BloomFilter` (`insert_str`) AND an exact `HashSet<String>`, forwarding
+    /// every batch unchanged. On the last partition's finalize it publishes a
+    /// `StringInSet` (when every partition stayed under the set threshold) or
+    /// a `StringInBloom` (on overflow) to the primary sideband and each
+    /// cascade extra. No `I64Range` is emitted — strings have no ordered
+    /// runtime predicate. Mirrors the i64 path's per-partition-finish merge so
+    /// the cascade / timing guarantees are identical.
+    fn execute_string(
+        &self,
+        partition: usize,
+        context: Arc<TaskContext>,
+    ) -> DfResult<SendableRecordBatchStream> {
+        let key_col_idx = self.key_col_idx;
+        let target_col_idx = self.target_col_idx;
+        let sideband = self.sideband.clone();
+        let extra_targets = self.extra_targets.clone();
+        let local_blooms = self.local_blooms.clone();
+        let local_string_sets = self.local_string_sets.clone();
+        let completed = self.completed.clone();
+        let n_partitions = self.n_partitions;
+        let expected_per_part = self.expected_keys_per_partition;
+        let in_schema: SchemaRef = self.input.schema();
+        let set_threshold = l9_set_threshold();
+
+        // Per-partition local bloom (type-agnostic — fed via insert_str) plus
+        // an exact string set; both wrapped so the per-batch map closure and
+        // the stream-end finalize can touch them. Uncontended (one partition
+        // owns its locals).
+        let local_inner = Arc::new(Mutex::new(BloomFilter::for_keys(expected_per_part)));
+        let local_for_map = local_inner.clone();
+        let initial_set_cap = expected_per_part.min(set_threshold);
+        let local_set_inner: Arc<Mutex<Option<std::collections::HashSet<String>>>> =
+            Arc::new(Mutex::new(Some(std::collections::HashSet::with_capacity(
+                initial_set_cap,
+            ))));
+        let local_set_for_map = local_set_inner.clone();
+
+        let upstream = self.input.execute(partition, context)?;
+        let mapped = upstream.map(move |batch_res| match batch_res {
+            Ok(batch) => {
+                let raw = batch.column(key_col_idx);
+                {
+                    let mut bloom_guard = local_for_map.lock().unwrap();
+                    let mut set_guard = local_set_for_map.lock().unwrap();
+                    for_each_non_null_str(raw, |s| {
+                        bloom_guard.insert_str(s);
+                        if let Some(set) = set_guard.as_mut() {
+                            // Only allocate a String on a genuinely new key —
+                            // build sides are often dup-heavy (FK→PK probe of a
+                            // pre-grouped dim).
+                            if !set.contains(s) {
+                                set.insert(s.to_string());
+                            }
+                            if set.len() > set_threshold {
+                                *set_guard = None;
+                            }
+                        }
+                    });
+                }
+                Ok(batch)
+            }
+            Err(e) => Err(e),
+        });
+
+        let stream = futures_util::stream::unfold(
+            (
+                Box::pin(mapped),
+                false,
+                local_inner,
+                local_set_inner,
+                local_blooms,
+                local_string_sets,
+                completed,
+                sideband,
+                target_col_idx,
+                extra_targets,
+                n_partitions,
+                set_threshold,
+            ),
+            move |(
+                mut inner,
+                finalized,
+                local_bloom,
+                local_set,
+                shared_blooms,
+                shared_string_sets,
+                completed,
+                sideband,
+                target_col_idx,
+                extra_targets,
+                n_partitions,
+                set_threshold,
+            )| async move {
+                match inner.next().await {
+                    Some(item) => Some((
+                        item,
+                        (
+                            inner,
+                            finalized,
+                            local_bloom,
+                            local_set,
+                            shared_blooms,
+                            shared_string_sets,
+                            completed,
+                            sideband,
+                            target_col_idx,
+                            extra_targets,
+                            n_partitions,
+                            set_threshold,
+                        ),
+                    )),
+                    None => {
+                        if !finalized {
+                            let bloom = std::mem::replace(
+                                &mut *local_bloom.lock().unwrap(),
+                                BloomFilter::for_keys(1),
+                            );
+                            let set_opt = local_set.lock().unwrap().take();
+                            shared_blooms.lock().unwrap().push(bloom);
+                            shared_string_sets.lock().unwrap().push(set_opt);
+                            let prev = completed.fetch_add(1, Ordering::SeqCst);
+                            if prev + 1 == n_partitions {
+                                // Last partition — drain + merge + publish.
+                                let sets: Vec<Option<std::collections::HashSet<String>>> =
+                                    shared_string_sets.lock().unwrap().drain(..).collect();
+
+                                // Exact set IFF every partition kept its set
+                                // AND the union stays under the threshold;
+                                // otherwise fall back to the merged bloom.
+                                let all_some = sets.iter().all(|s| s.is_some());
+                                let shared_set: Option<Arc<std::collections::HashSet<String>>> =
+                                    if all_some {
+                                        let mut merged: std::collections::HashSet<String> =
+                                            std::collections::HashSet::with_capacity(set_threshold);
+                                        let mut overflow = false;
+                                        for s in sets.iter().flatten() {
+                                            for v in s {
+                                                merged.insert(v.clone());
+                                            }
+                                            if merged.len() > set_threshold {
+                                                overflow = true;
+                                                break;
+                                            }
+                                        }
+                                        if overflow {
+                                            None
+                                        } else {
+                                            Some(Arc::new(merged))
+                                        }
+                                    } else {
+                                        None
+                                    };
+
+                                let shared_bloom: Option<Arc<BloomFilter>> = if shared_set.is_none()
+                                {
+                                    let mut all_blooms = shared_blooms.lock().unwrap();
+                                    if let Some(mut merged) = all_blooms.pop() {
+                                        while let Some(other) = all_blooms.pop() {
+                                            let _ = merged.union_with(&other);
+                                        }
+                                        Some(Arc::new(merged))
+                                    } else {
+                                        None
+                                    }
+                                } else {
+                                    None
+                                };
+
+                                // Σ.S.B — emit to primary AND each cascade
+                                // extra; the set/bloom Arc is shared, only the
+                                // col_idx changes per-sideband.
+                                let mut all_targets: Vec<(usize, &BridgeFilterSideband)> =
+                                    Vec::with_capacity(1 + extra_targets.len());
+                                all_targets.push((target_col_idx, &sideband));
+                                for (ci, sb) in extra_targets.iter() {
+                                    all_targets.push((*ci, sb));
+                                }
+                                for (col_idx, sb) in all_targets.into_iter() {
+                                    let mut preds: Vec<ColumnPredicate> = Vec::with_capacity(1);
+                                    if let Some(set_arc) = &shared_set {
+                                        preds.push(ColumnPredicate::StringInSet {
+                                            col_idx,
+                                            set: Arc::clone(set_arc),
+                                        });
+                                    } else if let Some(bloom_arc) = &shared_bloom {
+                                        preds.push(ColumnPredicate::StringInBloom {
+                                            col_idx,
+                                            bloom: Arc::clone(bloom_arc),
+                                        });
+                                    }
+                                    if !preds.is_empty() {
+                                        sb.publish(preds);
+                                    }
+                                }
+                            }
+                        }
+                        None
+                    }
+                }
+            },
+        );
+
+        Ok(Box::pin(RecordBatchStreamAdapter::new(in_schema, stream)))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -678,6 +1035,156 @@ mod tests {
         }
     }
 
+    #[test]
+    fn widens_to_i64_accepts_integer_and_date_family_only() {
+        use arrow_schema::DataType as Dt;
+        // i64-domain: ride the existing i64 bloom. Signed/small-unsigned/date
+        // types widen losslessly; UInt64 rides via a bit reinterpret
+        // (KEYS.4.d-part2) since equality is bit-pattern based.
+        for dt in [
+            Dt::Int8,
+            Dt::Int16,
+            Dt::Int32,
+            Dt::Int64,
+            Dt::UInt8,
+            Dt::UInt16,
+            Dt::UInt32,
+            Dt::UInt64,
+            Dt::Date32,
+            Dt::Date64,
+        ] {
+            assert!(widens_to_i64(&dt), "{dt:?} should ride the i64 sideband");
+        }
+        // Need a DIFFERENT bloom — must NOT be accepted by the i64 sideband:
+        // floats are an equi-join anti-pattern + bit-pattern hazard; strings
+        // need a byte/hash bloom.
+        for dt in [
+            Dt::Float32,
+            Dt::Float64,
+            Dt::Utf8,
+            Dt::Utf8View,
+            Dt::Boolean,
+        ] {
+            assert!(
+                !widens_to_i64(&dt),
+                "{dt:?} must NOT ride the i64 sideband (needs a different bloom)"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn widens_int32_build_key_into_i64_sideband() {
+        // KEYS.1: an Int32 build key (e.g. a downcast-narrowed `*key` column)
+        // must build the SAME i64-domain sideband as a native Int64 key —
+        // values widen losslessly. RED before the `widens_to_i64`
+        // generalization (the constructor errored "key column must be Int64",
+        // which is why narrowing silently dropped the L9 bloom and regressed
+        // Q21 +48%).
+        use arrow_array::Int32Array;
+        let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int32, false)]));
+        let make32 = |keys: Vec<i32>| {
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(keys))]).unwrap()
+        };
+        let ctx = SessionContext::new();
+        let mt = MemTable::try_new(
+            schema.clone(),
+            vec![vec![make32(vec![1, 2, 3])], vec![make32(vec![4, 5, 6, 7])]],
+        )
+        .unwrap();
+        ctx.register_table("t", Arc::new(mt)).unwrap();
+        let plan = ctx
+            .sql("SELECT k FROM t")
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+
+        let sideband = BridgeFilterSideband::new();
+        let wrapper =
+            BuildSideBloomEmitterExec::try_new(plan, 0, 42, sideband.clone(), 16).unwrap();
+        let n = wrapper.properties().output_partitioning().partition_count();
+        for p in 0..n {
+            let mut s = wrapper
+                .execute(p, Arc::new(TaskContext::default()))
+                .unwrap();
+            while let Some(_b) = s.try_next().await.unwrap() {}
+        }
+        let preds = sideband.peek().expect("sideband was not published to");
+        assert_eq!(preds.len(), 1, "expected one predicate, got {preds:?}");
+        match &preds[0] {
+            ColumnPredicate::I64InSet { col_idx, set } => {
+                assert_eq!(*col_idx, 42);
+                assert_eq!(set.len(), 7, "7 distinct widened keys");
+                for k in 1i64..=7 {
+                    assert!(set.contains(k), "missing widened key {k}");
+                }
+                assert!(!set.contains(999));
+            }
+            other => panic!("expected I64InSet from a widened Int32 build, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn uint64_build_key_rides_i64_sideband_via_bitcast() {
+        // KEYS.4.d-part2: a UInt64 build key rides the i64 sideband via a
+        // bit reinterpret. Values >= 2^63 — which arrow's value-cast would
+        // null under safe options — must still land in the set as their i64
+        // bit pattern so a u64 probe with the same value matches. Also
+        // exercises 4.d-part1: 2^63 bitcasts to i64::MIN (the old empty
+        // sentinel), which the has_min fix makes a storable key.
+        use arrow_array::UInt64Array;
+        let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::UInt64, false)]));
+        let keys: Vec<u64> = vec![5, 1u64 << 63, u64::MAX, 7];
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(UInt64Array::from(keys.clone()))],
+        )
+        .unwrap();
+        let ctx = SessionContext::new();
+        let mt = MemTable::try_new(schema.clone(), vec![vec![batch]]).unwrap();
+        ctx.register_table("t", Arc::new(mt)).unwrap();
+        let plan = ctx
+            .sql("SELECT k FROM t")
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+
+        let sideband = BridgeFilterSideband::new();
+        let wrapper =
+            BuildSideBloomEmitterExec::try_new(plan, 0, 42, sideband.clone(), 16).unwrap();
+        let n = wrapper.properties().output_partitioning().partition_count();
+        for p in 0..n {
+            let mut s = wrapper
+                .execute(p, Arc::new(TaskContext::default()))
+                .unwrap();
+            while let Some(_b) = s.try_next().await.unwrap() {}
+        }
+        let preds = sideband.peek().expect("sideband was not published to");
+        assert_eq!(preds.len(), 1, "expected one predicate, got {preds:?}");
+        match &preds[0] {
+            ColumnPredicate::I64InSet { col_idx, set } => {
+                assert_eq!(*col_idx, 42);
+                // Every u64 key present as its i64 bit pattern (the
+                // load-bearing ones are 2^63 == i64::MIN and u64::MAX == -1,
+                // which a value-cast would have dropped).
+                for k in &keys {
+                    assert!(
+                        set.contains(*k as i64),
+                        "u64 key {k} missing (i64 bits {})",
+                        *k as i64
+                    );
+                }
+                assert!(set.contains((1u64 << 63) as i64)); // i64::MIN (sentinel)
+                assert!(set.contains(u64::MAX as i64)); // -1
+                assert!(!set.contains(123)); // a non-key
+            }
+            other => panic!("expected I64InSet from a u64 build, got {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn publishes_bloom_when_build_exceeds_set_threshold() {
         // L9.HashSet — with a build that genuinely exceeds the 32K
@@ -728,6 +1235,216 @@ mod tests {
                 }
             }
             other => panic!("expected I64InBloom after overflow, got {other:?}"),
+        }
+    }
+
+    fn make_str_batch(keys: Vec<&str>) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Utf8, false)]));
+        RecordBatch::try_new(schema, vec![Arc::new(arrow_array::StringArray::from(keys))]).unwrap()
+    }
+
+    #[tokio::test]
+    async fn publishes_small_string_build_as_string_in_set() {
+        // KEYS.5.b — a small Utf8 build key publishes a StringInSet
+        // (exact, 0 FP) carrying every distinct build-side string, deduped
+        // across partitions. RED before the string path: try_new errored on
+        // the widens_to_i64 gate (Utf8 declined), so .unwrap() panicked.
+        let ctx = SessionContext::new();
+        let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Utf8, false)]));
+        let mt = MemTable::try_new(
+            schema.clone(),
+            vec![
+                vec![make_str_batch(vec!["FRANCE", "GERMANY"])],
+                vec![make_str_batch(vec!["BRAZIL"])],
+                vec![make_str_batch(vec!["FRANCE", "ARGENTINA"])], // FRANCE dup across parts
+            ],
+        )
+        .unwrap();
+        ctx.register_table("t", Arc::new(mt)).unwrap();
+        let plan = ctx
+            .sql("SELECT k FROM t")
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+
+        let sideband = BridgeFilterSideband::new();
+        let wrapper = BuildSideBloomEmitterExec::try_new(plan, 0, 7, sideband.clone(), 16).unwrap();
+        let n = wrapper.properties().output_partitioning().partition_count();
+        for p in 0..n {
+            let mut s = wrapper
+                .execute(p, Arc::new(TaskContext::default()))
+                .unwrap();
+            while let Some(_b) = s.try_next().await.unwrap() {}
+        }
+        let preds = sideband.peek().expect("sideband was not published to");
+        assert_eq!(preds.len(), 1, "expected StringInSet only, got {preds:?}");
+        match &preds[0] {
+            ColumnPredicate::StringInSet { col_idx, set } => {
+                assert_eq!(*col_idx, 7);
+                assert_eq!(set.len(), 4, "expected 4 distinct keys (FRANCE deduped)");
+                for k in ["FRANCE", "GERMANY", "BRAZIL", "ARGENTINA"] {
+                    assert!(set.contains(k), "missing key {k}");
+                }
+                assert!(!set.contains("JAPAN"));
+            }
+            other => panic!("expected StringInSet, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn publishes_utf8view_string_build_as_string_in_set() {
+        // KEYS.5.b — the build key can arrive as Utf8View (ematix decodes
+        // TPC-H strings to StringView), not just Utf8; the emitter handles it.
+        use arrow_array::StringViewArray;
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "k",
+            DataType::Utf8View,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(StringViewArray::from(vec![
+                "ASIA", "EUROPE", "ASIA",
+            ]))],
+        )
+        .unwrap();
+        let ctx = SessionContext::new();
+        let mt = MemTable::try_new(schema.clone(), vec![vec![batch]]).unwrap();
+        ctx.register_table("t", Arc::new(mt)).unwrap();
+        let plan = ctx
+            .sql("SELECT k FROM t")
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+
+        let sideband = BridgeFilterSideband::new();
+        let wrapper = BuildSideBloomEmitterExec::try_new(plan, 0, 3, sideband.clone(), 16).unwrap();
+        let n = wrapper.properties().output_partitioning().partition_count();
+        for p in 0..n {
+            let mut s = wrapper
+                .execute(p, Arc::new(TaskContext::default()))
+                .unwrap();
+            while let Some(_b) = s.try_next().await.unwrap() {}
+        }
+        let preds = sideband.peek().expect("sideband was not published to");
+        match &preds[0] {
+            ColumnPredicate::StringInSet { col_idx, set } => {
+                assert_eq!(*col_idx, 3);
+                assert_eq!(set.len(), 2, "ASIA deduped");
+                assert!(set.contains("ASIA") && set.contains("EUROPE"));
+            }
+            other => panic!("expected StringInSet from a Utf8View build, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn publishes_string_bloom_when_build_exceeds_threshold() {
+        // KEYS.5.b — past the set threshold the string path falls back to a
+        // StringInBloom (byte-hash membership). 40_000 distinct strings
+        // overflow the 32_768 default without mutating env (avoids races).
+        let n_keys = 40_000usize;
+        let owned: Vec<String> = (0..n_keys).map(|i| format!("k{i:08}")).collect();
+        let keys: Vec<&str> = owned.iter().map(|s| s.as_str()).collect();
+        let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Utf8, false)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(arrow_array::StringArray::from(keys))],
+        )
+        .unwrap();
+        let ctx = SessionContext::new();
+        let mt = MemTable::try_new(schema.clone(), vec![vec![batch]]).unwrap();
+        ctx.register_table("t", Arc::new(mt)).unwrap();
+        let plan = ctx
+            .sql("SELECT k FROM t")
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+
+        let sideband = BridgeFilterSideband::new();
+        let wrapper =
+            BuildSideBloomEmitterExec::try_new(plan, 0, 9, sideband.clone(), n_keys).unwrap();
+        let n = wrapper.properties().output_partitioning().partition_count();
+        for p in 0..n {
+            let mut s = wrapper
+                .execute(p, Arc::new(TaskContext::default()))
+                .unwrap();
+            while let Some(_b) = s.try_next().await.unwrap() {}
+        }
+        let preds = sideband.peek().expect("sideband was not published to");
+        match &preds[0] {
+            ColumnPredicate::StringInBloom { col_idx, bloom } => {
+                assert_eq!(*col_idx, 9);
+                for k in ["k00000000", "k00001000", "k00039999"] {
+                    assert!(bloom.might_contain_str(k), "missing {k}");
+                }
+            }
+            other => panic!("expected StringInBloom after overflow, got {other:?}"),
+        }
+    }
+
+    fn make_str_batch_opt(keys: Vec<Option<&str>>) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Utf8, true)]));
+        RecordBatch::try_new(schema, vec![Arc::new(arrow_array::StringArray::from(keys))]).unwrap()
+    }
+
+    #[tokio::test]
+    async fn string_build_skips_null_keys() {
+        // KEYS.5.d — NULL keys never match an equi-join; the emitter's
+        // for_each_non_null_str must skip them, so the published StringInSet
+        // carries only the distinct NON-null build keys (no empty-string or
+        // phantom entry for the nulls).
+        let ctx = SessionContext::new();
+        let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Utf8, true)]));
+        let mt = MemTable::try_new(
+            schema.clone(),
+            vec![vec![make_str_batch_opt(vec![
+                Some("A"),
+                None,
+                Some("B"),
+                None,
+                Some("A"), // dup
+                Some("C"),
+            ])]],
+        )
+        .unwrap();
+        ctx.register_table("t", Arc::new(mt)).unwrap();
+        let plan = ctx
+            .sql("SELECT k FROM t")
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+
+        let sideband = BridgeFilterSideband::new();
+        let wrapper = BuildSideBloomEmitterExec::try_new(plan, 0, 5, sideband.clone(), 16).unwrap();
+        let n = wrapper.properties().output_partitioning().partition_count();
+        for p in 0..n {
+            let mut s = wrapper
+                .execute(p, Arc::new(TaskContext::default()))
+                .unwrap();
+            while let Some(_b) = s.try_next().await.unwrap() {}
+        }
+        let preds = sideband.peek().expect("sideband was not published to");
+        match &preds[0] {
+            ColumnPredicate::StringInSet { col_idx, set } => {
+                assert_eq!(*col_idx, 5);
+                assert_eq!(set.len(), 3, "expected only the 3 distinct non-null keys");
+                for k in ["A", "B", "C"] {
+                    assert!(set.contains(k), "missing key {k}");
+                }
+                assert!(
+                    !set.contains(""),
+                    "the nulls must not appear as empty strings"
+                );
+            }
+            other => panic!("expected StringInSet, got {other:?}"),
         }
     }
 

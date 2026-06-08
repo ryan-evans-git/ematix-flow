@@ -259,6 +259,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(PathBuf::from)
         .unwrap_or_else(|_| workspace.join("examples/tpch/data/sf1"));
     let queries_dir = workspace.join("examples/tpch/queries");
+    // #315: Q11's HAVING fraction is 0.0001 / SF — scale it so SF>=10 isn't
+    // degenerate (0 rows for every engine). Applied to all engines' SQL below.
+    let scale_factor = ematix_flow_core::tpch_params::scale_factor_from_data_dir(&data_dir);
     let out_path = std::env::var("TPCH_OUT")
         .map(PathBuf::from)
         .unwrap_or_else(|_| workspace.join("BENCHMARKS.md"));
@@ -345,8 +348,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("--- Q{q:02} ---");
         let sql_path = queries_dir.join(format!("q{q:02}.sql"));
         let polars_sql_path = queries_dir.join(format!("q{q:02}.polars.sql"));
-        let sql = std::fs::read_to_string(&sql_path)?;
-        let polars_sql = std::fs::read_to_string(&polars_sql_path).ok();
+        let sql = ematix_flow_core::tpch_params::apply_tpch_query_params(
+            q,
+            &std::fs::read_to_string(&sql_path)?,
+            scale_factor,
+        );
+        let polars_sql = std::fs::read_to_string(&polars_sql_path)
+            .ok()
+            .map(|s| ematix_flow_core::tpch_params::apply_tpch_query_params(q, &s, scale_factor));
 
         let mut per_engine: BTreeMap<Engine, EngineResult> = BTreeMap::new();
         let selected = Engine::selected();
@@ -977,6 +986,27 @@ fn dump_plan_metrics(plan: &dyn datafusion::physical_plan::ExecutionPlan, depth:
     }
 }
 
+/// KEYS.3 dig-in — dump the executed physical plan once per process when
+/// `EMAT_DUMP_PLAN` is set, labelled with the downcast arm so off-vs-on dumps
+/// are self-identifying. Once-guarded so it fires on the first trial only.
+fn maybe_dump_plan(plan: &Arc<dyn datafusion::physical_plan::ExecutionPlan>) {
+    use std::sync::Once;
+    static DUMPED: Once = Once::new();
+    if std::env::var_os("EMAT_DUMP_PLAN").is_some() {
+        DUMPED.call_once(|| {
+            let arm = if std::env::var_os("EMAT_DOWNCAST_KEYS").is_some() {
+                "downcast=ON"
+            } else {
+                "downcast=OFF"
+            };
+            eprintln!(
+                "=== EMAT PHYSICAL PLAN ({arm}) ===\n{}=== END PLAN ===",
+                datafusion::physical_plan::displayable(plan.as_ref()).indent(true)
+            );
+        });
+    }
+}
+
 async fn run_ematix_flow(data_dir: &Path, sql: &str) -> Trial {
     // Σ.AΩ Phase 1.6 (2026-05-28): default ON. The race-aware
     // recommender (`recommend_target_partitions_via_race`) consults
@@ -1142,6 +1172,7 @@ async fn run_ematix_flow(data_dir: &Path, sql: &str) -> Trial {
             } else {
                 plan
             };
+        maybe_dump_plan(&plan);
         let mut s = match plan.execute(0, ctx.task_ctx()) {
             Ok(s) => s,
             Err(e) => return Trial::Fail(format!("execute: {}", short(&e.to_string()))),
@@ -1324,6 +1355,7 @@ async fn run_ematix_flow(data_dir: &Path, sql: &str) -> Trial {
         } else {
             plan
         };
+    maybe_dump_plan(&plan);
     let stream = match plan.execute(0, ctx.task_ctx()) {
         Ok(s) => s,
         Err(e) => return Trial::Fail(format!("execute: {}", short(&e.to_string()))),
@@ -1492,6 +1524,21 @@ async fn build_ematix_ctx(
     } else if rh_sum_f64_enabled {
         builder =
             builder.with_physical_optimizer_rule(Arc::new(EnableRobinHoodSumF64Rule::default()));
+    }
+    // REV.18c: COUNT(*) GROUP BY i64 and AVG(f64) GROUP BY i64 RobinHood
+    // kernels are OPT-IN. The operator crossover sweep shows all three only
+    // beat stock in the 200K–256K group band; no SF=10 TPC-H query lands a
+    // matching shape there (Q18 SUM/l_orderkey ≈15M groups, Q13 COUNT/o_custkey
+    // ≈1M — both gated out at 256K). Env-gated here for the default-on A/B.
+    if std::env::var("EMAT_RH_COUNT").ok().as_deref() == Some("1") {
+        builder = builder.with_physical_optimizer_rule(Arc::new(
+            ematix_flow_core::robin_hood_agg_rule::EnableRobinHoodAggregateRule::default(),
+        ));
+    }
+    if std::env::var("EMAT_RH_AVG").ok().as_deref() == Some("1") {
+        builder = builder.with_physical_optimizer_rule(Arc::new(
+            ematix_flow_core::robin_hood_avg_f64_exec::EnableRobinHoodAvgF64Rule::default(),
+        ));
     }
     // Σ.AN.1 (2026-05-28): per-operator partition routing for
     // high-cardinality FinalPartitioned aggregates. Opt-in via

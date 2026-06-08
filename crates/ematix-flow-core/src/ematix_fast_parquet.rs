@@ -141,7 +141,11 @@ impl BridgeFilter {
                 // FilterExec — scan is the only filter step.
                 ColumnPredicate::I64InBloom { .. }
                 | ColumnPredicate::I64InSet { .. }
-                | ColumnPredicate::I64Range { .. } => true,
+                | ColumnPredicate::I64Range { .. }
+                // KEYS.5 — string runtime sideband is injected the same
+                // way (no residual FilterExec; the scan applies it).
+                | ColumnPredicate::StringInBloom { .. }
+                | ColumnPredicate::StringInSet { .. } => true,
                 // User-pushed Exact-declarable predicates: Exact only
                 // when the env-var gate is on.
                 ColumnPredicate::I32Range { .. } | ColumnPredicate::I32In { .. } => exact_opt_in,
@@ -432,6 +436,31 @@ pub enum ColumnPredicate {
     /// covers ~100% of l_partkey so no RG is skipped — the lever is
     /// query-shape dependent.
     I64Range { col_idx: usize, lo: i64, hi: i64 },
+    /// KEYS.5 (2026-06-07) — Bloom-filter membership probe on a
+    /// *string* column. The string analog of `I64InBloom`: pre-built
+    /// by `BuildSideBloomEmitterExec` from a string join key's build
+    /// side (e.g. a filtered nation/region name set) and pushed into
+    /// the probe-side scan so rows whose join key isn't in the bloom
+    /// skip the residual join probe. Approximate by design (FPR > 0);
+    /// the residual equi-join still runs — this is selectivity
+    /// reduction, not correctness. Hashing is byte-level
+    /// (`bloom.might_contain_str`), so it is encoding-independent: it
+    /// works against dict-encoded or PLAIN string columns alike via
+    /// `BridgeFilter::build_bitmap`'s existing string decode path.
+    StringInBloom {
+        col_idx: usize,
+        bloom: Arc<crate::bloom::BloomFilter>,
+    },
+    /// KEYS.5 (2026-06-07) — exact string membership probe. The string
+    /// analog of `I64InSet`: used when the build side is small enough
+    /// that an exact set (zero false positives) beats the probabilistic
+    /// bloom. The emitter falls back to `StringInBloom` past the set
+    /// threshold. `HashSet<String>::contains` borrows `&str`, so the
+    /// per-probe check allocates nothing.
+    StringInSet {
+        col_idx: usize,
+        set: Arc<std::collections::HashSet<String>>,
+    },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -632,7 +661,14 @@ impl BridgeFilter {
                 ColumnPredicate::StringEq { col_idx, .. }
                 | ColumnPredicate::StringNotEq { col_idx, .. }
                 | ColumnPredicate::StringIn { col_idx, .. }
-                | ColumnPredicate::StringLike { col_idx, .. } => {
+                | ColumnPredicate::StringLike { col_idx, .. }
+                // KEYS.5 — the string runtime sideband shapes decode the
+                // same byte-array column and evaluate via `eval_str`
+                // (bloom.might_contain_str / set.contains). Reusing this
+                // arm gives them the dict-preserved fast path + dense
+                // fallback for free.
+                | ColumnPredicate::StringInBloom { col_idx, .. }
+                | ColumnPredicate::StringInSet { col_idx, .. } => {
                     let pclone = p.clone();
                     // Try dict-preserved fast path; fall back to dense
                     // on PLAIN-encoded high-cardinality columns
@@ -699,6 +735,8 @@ impl ColumnPredicate {
             ColumnPredicate::I64InBloom { col_idx, .. } => *col_idx,
             ColumnPredicate::I64InSet { col_idx, .. } => *col_idx,
             ColumnPredicate::I64Range { col_idx, .. } => *col_idx,
+            ColumnPredicate::StringInBloom { col_idx, .. } => *col_idx,
+            ColumnPredicate::StringInSet { col_idx, .. } => *col_idx,
         }
     }
 
@@ -850,6 +888,11 @@ impl ColumnPredicate {
             // (Q05/Q07/Q08 dim filters), so 0.3 is a conservative
             // win-leaning estimate.
             ColumnPredicate::I64Range { .. } => 0.3,
+            // KEYS.5 — string runtime sideband. Mirror the i64 shapes:
+            // bloom ~0.2 (FP-leaning, build small by construction),
+            // exact set ~0.1 (no FP, smallest builds).
+            ColumnPredicate::StringInBloom { .. } => 0.2,
+            ColumnPredicate::StringInSet { .. } => 0.1,
         }
     }
 
@@ -916,6 +959,11 @@ impl ColumnPredicate {
             // as the L9 bloom/set: selectivity reduction, not
             // replacement.
             ColumnPredicate::I64Range { .. } => false,
+            // KEYS.5 — string runtime sideband is approximate (bloom)
+            // or selectivity-reducing (set); the residual string
+            // equi-join must still run. Inexact, like the i64 shapes.
+            ColumnPredicate::StringInBloom { .. } => false,
+            ColumnPredicate::StringInSet { .. } => false,
         }
     }
 
@@ -998,6 +1046,12 @@ impl ColumnPredicate {
                 let m = matches_sql_like(pattern.as_str(), v);
                 if *negated { !m } else { m }
             }
+            // KEYS.5 — string runtime sideband probe. Byte-level hash
+            // membership (bloom) / exact membership (set). False
+            // positives on the bloom are part of the contract; the
+            // residual string equi-join still runs.
+            ColumnPredicate::StringInBloom { bloom, .. } => bloom.might_contain_str(v),
+            ColumnPredicate::StringInSet { set, .. } => set.contains(v),
             _ => false,
         }
     }
@@ -1468,6 +1522,15 @@ pub struct EmatixFastParquetTableProvider {
     ///     a follow-up can rejoin pushdown once the unfiltered path is
     ///     verified.
     streaming_arrow_reader: bool,
+    /// KEYS.2 (2026-05-31): full-schema column indices of INT64 join/group
+    /// KEYS that were narrowed to advertised `Int32` (set in `try_new_opt`
+    /// when `EMAT_DOWNCAST_KEYS` is on AND the column's stats proved its
+    /// range fits i32). Empty in the common case (downcast off / no fitting
+    /// key) → `decode_schema()` returns the advertised schema unchanged and
+    /// the scan adds zero narrowing overhead. Rides through the `mut self`
+    /// builder methods untouched: narrowing is independent of the Utf8View /
+    /// Dictionary string rewrites, so a narrowed key stays Int32 regardless.
+    narrowed_leaves: Arc<Vec<usize>>,
 }
 
 /// Σ.Q06.SF10 (2026-05-28): cached metadata-derived state for
@@ -1518,13 +1581,67 @@ fn provider_meta_cache_key(path: &str) -> Option<ProviderMetaCacheKey> {
     Some((canonical, size, mtime_nanos))
 }
 
+/// KEYS.2 — env gate for narrowing INT64 join/group keys to Int32 on read.
+/// Off unless `EMAT_DOWNCAST_KEYS` is set (additive, opt-in, default OFF).
+fn key_downcast_enabled() -> bool {
+    std::env::var_os("EMAT_DOWNCAST_KEYS").is_some()
+}
+
+/// KEYS.2 — a column whose name denotes a join/group KEY (ends in "key":
+/// orderkey/partkey/suppkey/custkey/nationkey/regionkey). Only these are
+/// narrowed — an INT64 measure that gets summed would pay a per-row
+/// re-widen with no hash/sort benefit.
+fn is_downcast_key_name(name: &str) -> bool {
+    name.to_ascii_lowercase().ends_with("key")
+}
+
+/// KEYS.2 — true iff column `idx`'s stats prove every value fits i32
+/// (`[i32::MIN, i32::MAX]`), so an INT64→Int32 narrowing is lossless.
+/// Conservative: returns false when stats are Absent or not Int64-typed
+/// (can't prove → don't narrow). Keeps the narrowing safe at any scale
+/// factor — e.g. l_orderkey crosses i32::MAX around SF≈350, at which point
+/// this gate stops narrowing it automatically.
+fn int64_col_fits_i32(stats: &[datafusion::common::stats::ColumnStatistics], idx: usize) -> bool {
+    use datafusion::common::stats::Precision;
+    use datafusion::scalar::ScalarValue;
+    let Some(cs) = stats.get(idx) else {
+        return false;
+    };
+    let as_i64 = |p: &Precision<ScalarValue>| -> Option<i64> {
+        match p {
+            Precision::Exact(ScalarValue::Int64(Some(v)))
+            | Precision::Inexact(ScalarValue::Int64(Some(v))) => Some(*v),
+            _ => None,
+        }
+    };
+    match (as_i64(&cs.min_value), as_i64(&cs.max_value)) {
+        (Some(min), Some(max)) => min >= i32::MIN as i64 && max <= i32::MAX as i64,
+        _ => false,
+    }
+}
+
 impl EmatixFastParquetTableProvider {
     /// Open the parquet file, validate that every column is one of the
     /// primitive types the bridge supports, and build the Arrow
     /// schema. Errors immediately if any column is unsupported so
     /// callers don't discover this mid-scan.
     pub fn try_new(path: impl Into<String>) -> DfResult<Self> {
+        Self::try_new_opt(path, key_downcast_enabled())
+    }
+
+    /// KEYS.2 — `try_new` with an explicit downcast-keys flag so tests can
+    /// exercise the i32-key narrowing without mutating a process-global env
+    /// var (which would race other parallel tests). Production `try_new`
+    /// passes `key_downcast_enabled()`.
+    fn try_new_opt(path: impl Into<String>, downcast_keys: bool) -> DfResult<Self> {
         let path = path.into();
+        // KEYS.2: when the i32-key downcast is enabled, bypass the
+        // process-global meta cache entirely (read AND write). The cache
+        // stores the FINAL schema, which is env-dependent under downcast;
+        // skipping it guarantees the narrowing decision always reflects the
+        // flag and never pollutes a non-downcast build in the same process.
+        // The flag is experimental opt-in, so try_new perf here is
+        // irrelevant.
         // Σ.Q06.SF10 (2026-05-28): check process-global metadata cache
         // first. On hit, skip the entire SerializedFileReader path
         // (Snappy decompress of dict pages, encoding-stats walk,
@@ -1533,7 +1650,8 @@ impl EmatixFastParquetTableProvider {
         let use_cache = std::env::var("EMAT_NO_PROVIDER_CACHE")
             .ok()
             .map(|v| !(v == "1" || v.eq_ignore_ascii_case("true")))
-            .unwrap_or(true);
+            .unwrap_or(true)
+            && !downcast_keys;
         if use_cache {
             if let Some(key) = provider_meta_cache_key(&path) {
                 let cached = provider_meta_cache().lock().unwrap().get(&key).cloned();
@@ -1571,13 +1689,39 @@ impl EmatixFastParquetTableProvider {
         // reverts the promotion for the bridge path. Dict preservation
         // composes via its own Utf8→Dictionary rewrite.
         let raw_schema = em.schema.clone();
+        // KEYS.2 (2026-05-31): when EMAT_DOWNCAST_KEYS is set, narrow an
+        // INT64 join/group KEY column to Int32 IFF the column's stats prove
+        // every value fits i32. DataFusion then hashes/sorts a 4-byte key
+        // (smaller hash tables + better cache residency — DuckDB's
+        // `__internal_compress_integral_uinteger`). Lossless (stats-gated);
+        // same-domain keys (FK↔PK) narrow consistently across tables so join
+        // key types still match. Decode-side narrowing lives in
+        // `emat_arrow_reader::decode_one_column` (Int32 target + INT64 phys).
+        // (`downcast_keys` was bound at the top of try_new.)
+        // Record which leaves were Int64→Int32 narrowed so the scan can
+        // hand readers a native-width `decode_schema` and cast Int64→Int32
+        // once at the stream boundary (KEYS.2). Readers stay type-uniform —
+        // they decode the on-disk width and never need to know about
+        // narrowing — so we can't silently miss a decode entry point.
+        let mut narrowed_leaves: Vec<usize> = Vec::new();
         let promoted_fields: Vec<Arc<arrow_schema::Field>> = raw_schema
             .fields()
             .iter()
-            .map(|f| {
+            .enumerate()
+            .map(|(idx, f)| {
                 if matches!(f.data_type(), DataType::Utf8) {
                     Arc::new(
                         arrow_schema::Field::new(f.name(), DataType::Utf8View, f.is_nullable())
+                            .with_metadata(f.metadata().clone()),
+                    )
+                } else if downcast_keys
+                    && matches!(f.data_type(), DataType::Int64)
+                    && is_downcast_key_name(f.name())
+                    && int64_col_fits_i32(&em.column_stats, idx)
+                {
+                    narrowed_leaves.push(idx);
+                    Arc::new(
+                        arrow_schema::Field::new(f.name(), DataType::Int32, f.is_nullable())
                             .with_metadata(f.metadata().clone()),
                     )
                 } else {
@@ -1589,6 +1733,7 @@ impl EmatixFastParquetTableProvider {
             promoted_fields,
             raw_schema.metadata().clone(),
         ));
+        let narrowed_leaves: Arc<Vec<usize>> = Arc::new(narrowed_leaves);
 
         // Validate: every column must be one of the types the bridge
         // can decode. Anything else, defer to FastParquetTableProvider.
@@ -1599,13 +1744,14 @@ impl EmatixFastParquetTableProvider {
             match field.data_type() {
                 DataType::Int32
                 | DataType::Int64
+                | DataType::UInt64
                 | DataType::Float64
                 | DataType::Date32
                 | DataType::Utf8
                 | DataType::Utf8View => {}
                 other => {
                     return Err(DataFusionError::NotImplemented(format!(
-                        "EmatixFastParquetTableProvider: column `{}` has type {other:?}; bridge supports Int32/Int64/Float64/Date32/Utf8/Utf8View only — use FastParquetTableProvider",
+                        "EmatixFastParquetTableProvider: column `{}` has type {other:?}; bridge supports Int32/Int64/UInt64/Float64/Date32/Utf8/Utf8View only — use FastParquetTableProvider",
                         field.name()
                     )));
                 }
@@ -1684,10 +1830,21 @@ impl EmatixFastParquetTableProvider {
         // rows (default 0 = off, preserving .5.h). Set e.g.
         // `EMAT_DICT_DISTINCT_MAX_ROWS=10000000` to walk everything
         // except lineitem (60M) + orders (15M) at SF=10.
+        // REV.19 single-flag UX: the NDV-corrected build-side lever
+        // (`EMAT_NDV_BUILD_SIDE=1`, `force_collect_left_semi_build_rule`) needs
+        // `distinct_count` populated for the dimension tables it corrects, so
+        // when it is on and no explicit cap is given we default the walk to the
+        // small-table cap (10M) — includes TPC-H dimensions (part 2M / supplier
+        // / customer 1.5M / nation / region), excludes the large fact tables
+        // (lineitem 60M, orders 15M at SF=10) whose `distinct_count` perturbs
+        // the planner (Σ.Q06.SF10.5.h). An explicit `EMAT_DICT_DISTINCT_MAX_ROWS`
+        // always overrides. Scale caveat: at SF=100 part is 20M > 10M, so set
+        // the cap explicitly there.
+        let ndv_build_side = std::env::var("EMAT_NDV_BUILD_SIDE").as_deref() == Ok("1");
         let max_rows_for_walk: usize = std::env::var("EMAT_DICT_DISTINCT_MAX_ROWS")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
+            .unwrap_or(if ndv_build_side { 10_000_000 } else { 0 });
         let walk_by_size = max_rows_for_walk > 0 && num_rows <= max_rows_for_walk;
         // Legacy `EMAT_SKIP_DICT_DISTINCT=1` still forces skip for
         // explicit A/B work, but the default behaviour is now skip.
@@ -1760,6 +1917,7 @@ impl EmatixFastParquetTableProvider {
             // predicates that don't push down on either path (Q07/
             // Q13/Q16/Q19/Q22). Closing them is the next bite.
             streaming_arrow_reader: true,
+            narrowed_leaves,
         })
     }
 
@@ -1779,6 +1937,10 @@ impl EmatixFastParquetTableProvider {
             late_mat: true,
             dict_preservation: false,
             streaming_arrow_reader: true,
+            // The provider meta cache is bypassed when EMAT_DOWNCAST_KEYS is
+            // on (see `use_cache` in try_new_opt), so a cached entry always
+            // reflects a non-narrowed schema → no narrowed leaves.
+            narrowed_leaves: Arc::new(Vec::new()),
         }
     }
 
@@ -1887,6 +2049,40 @@ impl EmatixFastParquetTableProvider {
     /// Whether the Σ.E5.1.b streaming reader path is enabled.
     pub fn streaming_arrow_reader(&self) -> bool {
         self.streaming_arrow_reader
+    }
+
+    /// KEYS.2 — the native-width schema the decode path should produce: the
+    /// advertised schema with every narrowed key (`narrowed_leaves`) widened
+    /// back to its on-disk `Int64`. `scan()` hands this to the readers so
+    /// they decode at the physical width (type-uniform, no per-site narrowing
+    /// logic), and `execute()` casts Int64→Int32 once at the stream boundary.
+    /// When no key was narrowed (the default — downcast off) this equals the
+    /// advertised schema, so the cast wrapper is skipped and the path is
+    /// bit-identical to before.
+    fn decode_schema(&self) -> SchemaRef {
+        if self.narrowed_leaves.is_empty() {
+            return self.schema.clone();
+        }
+        let fields: Vec<Arc<arrow_schema::Field>> = self
+            .schema
+            .fields()
+            .iter()
+            .enumerate()
+            .map(|(i, f)| {
+                if self.narrowed_leaves.contains(&i) {
+                    Arc::new(
+                        arrow_schema::Field::new(f.name(), DataType::Int64, f.is_nullable())
+                            .with_metadata(f.metadata().clone()),
+                    )
+                } else {
+                    f.clone()
+                }
+            })
+            .collect();
+        Arc::new(Schema::new_with_metadata(
+            fields,
+            self.schema.metadata().clone(),
+        ))
     }
 
     pub fn path(&self) -> &str {
@@ -2030,6 +2226,10 @@ impl TableProvider for EmatixFastParquetTableProvider {
             .unwrap_or_else(|| (0..self.schema.fields().len()).collect());
         let projected_schema: Schema = self.schema.project(&projection)?;
         let projected_schema: SchemaRef = Arc::new(projected_schema);
+        // KEYS.2 — native-width schema the readers decode to (equals
+        // `projected_schema` unless a key was narrowed; see `decode_schema`).
+        let projected_decode_schema: SchemaRef =
+            Arc::new(self.decode_schema().project(&projection)?);
 
         let target_partitions = state.config_options().execution.target_partitions;
         let num_rgs = self.num_row_groups;
@@ -2064,6 +2264,7 @@ impl TableProvider for EmatixFastParquetTableProvider {
         Ok(Arc::new(EmatixFastParquetExec::try_new(
             self.path.clone(),
             projected_schema,
+            projected_decode_schema,
             Arc::clone(&self.schema),
             projection,
             assignments,
@@ -2073,6 +2274,7 @@ impl TableProvider for EmatixFastParquetTableProvider {
             self.late_mat,
             self.streaming_arrow_reader,
             projected_col_stats,
+            Arc::clone(&self.column_has_no_nulls),
         )?))
     }
 }
@@ -2082,6 +2284,11 @@ impl TableProvider for EmatixFastParquetTableProvider {
 pub struct EmatixFastParquetExec {
     path: String,
     schema: SchemaRef,
+    /// KEYS.2 — projected native-width schema the readers decode to. Equals
+    /// `schema` unless a key was narrowed Int64→Int32 (then that column is
+    /// Int64 here, Int32 in `schema`). `execute()` hands this to the decode
+    /// path and casts to `schema` once at the stream boundary.
+    decode_schema: SchemaRef,
     /// Full (unprojected) file schema. Σ.E5 (2026-05-19): exposed so
     /// `InjectFusedQ*Rule` can resolve `BridgeFilter` col_idx →
     /// column name when matching the Exact-mode shape.
@@ -2110,6 +2317,12 @@ pub struct EmatixFastParquetExec {
     /// of `Statistics::new_unknown`. Same shape as
     /// `FastParquetExec.column_stats`.
     column_stats: Vec<datafusion::common::stats::ColumnStatistics>,
+    /// PV.M.7 — per-(file-schema-indexed) "column has no nulls" flags,
+    /// threaded from the provider. The masked-decode kernels carry no
+    /// def-levels, so the projection-prune fusion may only declare a
+    /// range predicate Exact (drop its residual FilterExec) on a
+    /// null-free column. File-indexed to match `BridgeFilter` col_idx.
+    column_has_no_nulls: Arc<Vec<bool>>,
     /// Σ.Q.L9 — runtime sideband for mid-query predicate injection.
     /// `None` = no sideband attached (normal case). When set, the
     /// scan's `execute()` consults this AFTER the build phase of any
@@ -2125,6 +2338,7 @@ impl EmatixFastParquetExec {
     pub fn try_new(
         path: String,
         schema: SchemaRef,
+        decode_schema: SchemaRef,
         file_schema: SchemaRef,
         projection: Vec<usize>,
         assignments: Vec<Vec<usize>>,
@@ -2134,6 +2348,7 @@ impl EmatixFastParquetExec {
         late_mat: bool,
         streaming_arrow_reader: bool,
         column_stats: Vec<datafusion::common::stats::ColumnStatistics>,
+        column_has_no_nulls: Arc<Vec<bool>>,
     ) -> DfResult<Self> {
         let eq_props = EquivalenceProperties::new(schema.clone());
         let properties = Arc::new(PlanProperties::new(
@@ -2145,6 +2360,7 @@ impl EmatixFastParquetExec {
         Ok(Self {
             path,
             schema,
+            decode_schema,
             file_schema,
             projection,
             assignments,
@@ -2154,6 +2370,7 @@ impl EmatixFastParquetExec {
             late_mat,
             streaming_arrow_reader,
             column_stats,
+            column_has_no_nulls,
             runtime_sideband: None,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
@@ -2226,6 +2443,30 @@ impl EmatixFastParquetExec {
         self.num_rows
     }
 
+    // PV.M.7 — accessors for rebuilding a projection-pruned scan via
+    // `try_new` (drop filter-only output columns from the decode
+    // projection, keeping the BridgeFilter, to avoid the double
+    // Snappy-decompress of the predicate column).
+    pub fn decode_schema_ref(&self) -> &SchemaRef {
+        &self.decode_schema
+    }
+    pub fn assignments(&self) -> &[Vec<usize>] {
+        &self.assignments
+    }
+    pub fn rg_num_rows_arc(&self) -> &Arc<Vec<usize>> {
+        &self.rg_num_rows
+    }
+    pub fn exec_late_mat(&self) -> bool {
+        self.late_mat
+    }
+    pub fn exec_streaming_arrow_reader(&self) -> bool {
+        self.streaming_arrow_reader
+    }
+    /// PV.M.7 — file-schema-indexed "column has no nulls" flags.
+    pub fn column_has_no_nulls(&self) -> &[bool] {
+        &self.column_has_no_nulls
+    }
+
     /// Σ.Q.L4′ — append extra predicates (e.g. I64InBloom from a
     /// build-side bloom emitter) onto this scan's BridgeFilter. If
     /// no filter existed, creates one from the supplied predicates.
@@ -2247,6 +2488,7 @@ impl EmatixFastParquetExec {
         Ok(Arc::new(Self {
             path: self.path.clone(),
             schema: self.schema.clone(),
+            decode_schema: self.decode_schema.clone(),
             file_schema: self.file_schema.clone(),
             projection: self.projection.clone(),
             assignments: self.assignments.clone(),
@@ -2256,6 +2498,7 @@ impl EmatixFastParquetExec {
             late_mat: self.late_mat,
             streaming_arrow_reader: self.streaming_arrow_reader,
             column_stats: self.column_stats.clone(),
+            column_has_no_nulls: self.column_has_no_nulls.clone(),
             runtime_sideband: self.runtime_sideband.clone(),
             properties: self.properties.clone(),
             metrics: ExecutionPlanMetricsSet::new(),
@@ -2274,6 +2517,7 @@ impl EmatixFastParquetExec {
         Arc::new(Self {
             path: self.path.clone(),
             schema: self.schema.clone(),
+            decode_schema: self.decode_schema.clone(),
             file_schema: self.file_schema.clone(),
             projection: self.projection.clone(),
             assignments: self.assignments.clone(),
@@ -2283,6 +2527,7 @@ impl EmatixFastParquetExec {
             late_mat: self.late_mat,
             streaming_arrow_reader: self.streaming_arrow_reader,
             column_stats: self.column_stats.clone(),
+            column_has_no_nulls: self.column_has_no_nulls.clone(),
             runtime_sideband: self.runtime_sideband.clone(),
             properties: self.properties.clone(),
             metrics: ExecutionPlanMetricsSet::new(),
@@ -2293,6 +2538,7 @@ impl EmatixFastParquetExec {
         Self {
             path: self.path.clone(),
             schema: self.schema.clone(),
+            decode_schema: self.decode_schema.clone(),
             file_schema: self.file_schema.clone(),
             projection: self.projection.clone(),
             assignments: self.assignments.clone(),
@@ -2302,6 +2548,7 @@ impl EmatixFastParquetExec {
             late_mat: self.late_mat,
             streaming_arrow_reader: self.streaming_arrow_reader,
             column_stats: self.column_stats.clone(),
+            column_has_no_nulls: self.column_has_no_nulls.clone(),
             runtime_sideband: self.runtime_sideband.clone(),
             properties: self.properties.clone(),
             metrics: ExecutionPlanMetricsSet::new(),
@@ -2352,6 +2599,11 @@ impl ExecutionPlan for EmatixFastParquetExec {
         let path = self.path.clone();
         let projection = self.projection.clone();
         let schema = self.schema.clone();
+        // KEYS.2 — readers decode to the native-width schema; the cast to
+        // the advertised `schema` (narrowed keys) happens once on the output
+        // stream below. `decode_schema == schema` when nothing was narrowed
+        // (default), so the cast wrapper is a no-op there.
+        let decode_schema = self.decode_schema.clone();
         // Σ.Q.L9 — runtime sideband consumption. At execute() time
         // (which for the probe side of a HashJoinExec runs AFTER the
         // build phase has fully drained — see the L9 module doc), peek
@@ -2406,7 +2658,7 @@ impl ExecutionPlan for EmatixFastParquetExec {
         if runtime_sideband.is_none() {
             let stream = build_partition_stream_dispatch(
                 path,
-                schema.clone(),
+                decode_schema.clone(),
                 projection,
                 row_groups,
                 base_filter,
@@ -2416,6 +2668,7 @@ impl ExecutionPlan for EmatixFastParquetExec {
                 outer_partitions,
                 self.rg_num_rows.clone(),
             );
+            let stream = narrow_stream_to_advertised(stream, &decode_schema, schema.clone());
             return Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream))
                 as SendableRecordBatchStream);
         }
@@ -2443,7 +2696,9 @@ impl ExecutionPlan for EmatixFastParquetExec {
         // deferred peek still doesn't help them. For Q18 that's the
         // orders scan inside customer⋈orders.
         let path_for_async = path.clone();
-        let schema_for_async = schema.clone();
+        // KEYS.2 — readers decode to native width; the cast to `schema`
+        // happens on the flattened stream below.
+        let schema_for_async = decode_schema.clone();
         let projection_for_async = projection.clone();
         let row_groups_for_async = row_groups.clone();
         let column_stats_for_async = column_stats.clone();
@@ -2484,6 +2739,12 @@ impl ExecutionPlan for EmatixFastParquetExec {
                                     ColumnPredicate::I64InBloom { col_idx, .. } => {
                                         format!("I64InBloom(col={col_idx})")
                                     }
+                                    ColumnPredicate::StringInBloom { col_idx, .. } => {
+                                        format!("StringInBloom(col={col_idx})")
+                                    }
+                                    ColumnPredicate::StringInSet { col_idx, .. } => {
+                                        format!("StringInSet(col={col_idx})")
+                                    }
                                     _ => "other".to_string(),
                                 })
                                 .collect();
@@ -2522,6 +2783,7 @@ impl ExecutionPlan for EmatixFastParquetExec {
         let stream = futures_util::stream::once(inner_stream_fut)
             .flatten()
             .boxed();
+        let stream = narrow_stream_to_advertised(stream, &decode_schema, schema.clone());
         Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)) as SendableRecordBatchStream)
     }
 
@@ -2622,6 +2884,62 @@ pub fn strip_redundant_scan_filter(plan: Arc<dyn ExecutionPlan>) -> Arc<dyn Exec
         Ok(p) => p,
         Err(_) => plan,
     }
+}
+
+/// KEYS.2 — narrow a reader's native-width batch stream to the provider's
+/// advertised schema. The decode path (every reader family + the bridge)
+/// produces columns at the on-disk width given by `decode_schema`; when the
+/// provider narrowed an INT64 key to advertised `Int32`, this casts those
+/// columns Int64→Int32 (lossless by the `int64_col_fits_i32` stats gate).
+///
+/// This is the single choke point for the narrowing: because every reader
+/// flows through `execute()`'s output stream, casting here covers the eager,
+/// masked, page-streaming, inline-streaming and bridge paths at once — no
+/// per-decode-site narrowing logic that could silently miss a path.
+///
+/// When `decode_schema == advertised` (the default — downcast off, or no
+/// key fit i32) the stream is returned untouched, so the hot path is
+/// bit-identical and adds zero overhead.
+fn narrow_stream_to_advertised(
+    stream: futures_util::stream::BoxStream<'static, DfResult<RecordBatch>>,
+    decode_schema: &SchemaRef,
+    advertised: SchemaRef,
+) -> futures_util::stream::BoxStream<'static, DfResult<RecordBatch>> {
+    use futures_util::StreamExt;
+    if decode_schema.fields() == advertised.fields() {
+        return stream;
+    }
+    stream
+        .map(move |item| item.and_then(|b| narrow_batch_to_schema(b, &advertised)))
+        .boxed()
+}
+
+/// Cast each column of `batch` whose type differs from `advertised` to the
+/// advertised type (KEYS.2: Int64→Int32). Matching columns pass through by
+/// reference (Arc clone), so only the narrowed key columns pay a cast.
+fn narrow_batch_to_schema(batch: RecordBatch, advertised: &SchemaRef) -> DfResult<RecordBatch> {
+    use datafusion::arrow::compute::cast;
+    let mut cols: Vec<Arc<dyn Array>> = Vec::with_capacity(batch.num_columns());
+    for (i, col) in batch.columns().iter().enumerate() {
+        let want = advertised.field(i).data_type();
+        if col.data_type() == want {
+            cols.push(col.clone());
+        } else {
+            let c = cast(col, want).map_err(|e| {
+                DataFusionError::External(
+                    format!(
+                        "KEYS.2 narrow cast col {i} ({:?} -> {:?}): {e}",
+                        col.data_type(),
+                        want
+                    )
+                    .into(),
+                )
+            })?;
+            cols.push(c);
+        }
+    }
+    RecordBatch::try_new(advertised.clone(), cols)
+        .map_err(|e| DataFusionError::External(format!("KEYS.2 narrow rebatch: {e}").into()))
 }
 
 /// Σ.Q.L9 — choose between the streaming reader path and the
@@ -3143,6 +3461,16 @@ fn decode_one_rg_filtered(
                 debug_assert_eq!(vals.len(), matches);
                 Arc::new(arrow_array::Int64Array::from(vals))
             }
+            // KEYS.4.b: UInt64 is physically INT64 — gather i64 then
+            // reinterpret the buffer bit-for-bit (zero-copy, shared helper).
+            DataType::UInt64 => {
+                let vals = sparse_gather_chunk_i64(path, rg, col_idx, &bitmap)?;
+                debug_assert_eq!(vals.len(), matches);
+                let buf = datafusion::arrow::buffer::Buffer::from_vec(vals);
+                Arc::new(crate::emat_arrow_reader::u64_array_from_i64_buffer(
+                    buf, matches,
+                ))
+            }
             DataType::Float64 => {
                 let vals = sparse_gather_chunk_f64(path, rg, col_idx, &bitmap)?;
                 debug_assert_eq!(vals.len(), matches);
@@ -3206,9 +3534,39 @@ fn decode_one_rg_filtered_late_mat(
     // pass). build_bitmap + masked_decode below all share it.
     let file = crate::ematix_parquet_bridge::open_cached(path)?;
     // Σ.E5 #513: multi-column AND bitmap via BridgeFilter.
-    let (bitmap, _total) = filter.build_bitmap(path, rg)?;
+    let (bitmap, total) = filter.build_bitmap(path, rg)?;
 
     let matches: usize = bitmap.iter().map(|b| b.count_ones() as usize).sum();
+
+    // REV.23 — same masked→dense routing gate as the streaming reader
+    // (emat_arrow_reader::load_row_group_masked_legacy). This non-streaming
+    // late-mat path is only live under dict-preservation
+    // (`with_dict_preservation` forces `streaming_arrow_reader=false`), but it
+    // has the identical latency-bound per-column gather, so above the pass-rate
+    // threshold we decode dense (`decode_one_rg`, which handles every dtype incl.
+    // Dictionary(UInt32,Utf8)) and compact with Arrow's SIMD `filter_record_batch`
+    // — bandwidth-bound, scales to all cores. Result rows are identical to the
+    // masked path. See [[rev20-q07-q08-decode-bound]] REV.23.
+    if crate::emat_arrow_reader::should_route_masked_to_dense(
+        matches,
+        total,
+        crate::emat_arrow_reader::masked_dense_passrate_threshold(),
+    ) {
+        let dense = decode_one_rg(path, rg, schema, projection)?;
+        let bool_buf = datafusion::arrow::buffer::BooleanBuffer::new(
+            datafusion::arrow::buffer::Buffer::from_vec(bitmap),
+            0,
+            total,
+        );
+        let mask = arrow_array::BooleanArray::new(bool_buf, None);
+        return datafusion::arrow::compute::filter_record_batch(&dense, &mask).map_err(|e| {
+            DataFusionError::External(
+                format!("EmatixFastParquetExec (late_mat dense-route): filter_record_batch: {e}")
+                    .into(),
+            )
+        });
+    }
+
     let mut columns: Vec<Arc<dyn arrow_array::Array>> = Vec::with_capacity(projection.len());
     let check_len = |got: usize, want: usize, name: &str, kind: &str| -> DfResult<()> {
         if got != want {
@@ -3241,6 +3599,15 @@ fn decode_one_rg_filtered_late_mat(
                 let vals = masked_decode_i64(&file, rg, col_idx, &bitmap)?;
                 check_len(vals.len(), matches, field.name(), "Int64")?;
                 Arc::new(arrow_array::Int64Array::from(vals))
+            }
+            // KEYS.4.b: UInt64 = physical INT64, reinterpreted zero-copy.
+            DataType::UInt64 => {
+                let vals = masked_decode_i64(&file, rg, col_idx, &bitmap)?;
+                check_len(vals.len(), matches, field.name(), "UInt64")?;
+                let buf = datafusion::arrow::buffer::Buffer::from_vec(vals);
+                Arc::new(crate::emat_arrow_reader::u64_array_from_i64_buffer(
+                    buf, matches,
+                ))
             }
             DataType::Float64 => {
                 let vals = masked_decode_f64(&file, rg, col_idx, &bitmap)?;
@@ -3334,6 +3701,16 @@ fn decode_one_rg(
             DataType::Int64 => {
                 decode_column_chunk_i64(path, rg, col_idx)? as Arc<dyn arrow_array::Array>
             }
+            // KEYS.4.b: UInt64 = physical INT64; reuse the i64 chunk
+            // decode and reinterpret its value buffer bit-for-bit.
+            DataType::UInt64 => {
+                let a = decode_column_chunk_i64(path, rg, col_idx)?;
+                let len = a.len();
+                let buf = a.values().inner().clone();
+                Arc::new(crate::emat_arrow_reader::u64_array_from_i64_buffer(
+                    buf, len,
+                ))
+            }
             DataType::Float64 => {
                 decode_column_chunk_f64(path, rg, col_idx)? as Arc<dyn arrow_array::Array>
             }
@@ -3371,6 +3748,222 @@ fn decode_one_rg(
 mod tests {
     use super::*;
     use datafusion::prelude::SessionContext;
+
+    /// KEYS.5 story (a) — the string runtime sideband predicates
+    /// (`StringInBloom` / `StringInSet`) must (1) probe correctly via
+    /// `eval_str` — bloom by byte-hash membership, set by exact
+    /// membership; (2) report their target column via `col_idx`; and
+    /// (3) classify as inexact (`is_exact_safe() == false`) so the
+    /// residual string equi-join is preserved, exactly like the i64
+    /// sideband shapes. This is the unit under test for story (a); the
+    /// emitter (story b) and end-to-end join (story d) build on it.
+    #[test]
+    fn keys5_string_runtime_predicates_probe_and_classify() {
+        use crate::bloom::BloomFilter;
+
+        // --- StringInBloom: byte-level membership, no false negatives.
+        let mut b = BloomFilter::with_capacity(64, 16);
+        for k in ["FRANCE", "GERMANY", "BRAZIL"] {
+            b.insert_str(k);
+        }
+        let bloom = Arc::new(b);
+        let pred = ColumnPredicate::StringInBloom {
+            col_idx: 3,
+            bloom: bloom.clone(),
+        };
+        // Inserted keys must ALWAYS pass (blooms have no false negatives).
+        for k in ["FRANCE", "GERMANY", "BRAZIL"] {
+            assert!(pred.eval_str(k), "StringInBloom missed inserted key {k}");
+        }
+        // eval_str must DELEGATE to the bloom exactly — including absent
+        // keys, where agreement holds regardless of any false positive.
+        for k in [
+            "FRANCE",
+            "GERMANY",
+            "BRAZIL",
+            "ARGENTINA",
+            "JAPAN",
+            "UNITED KINGDOM",
+            "zzz",
+            "",
+        ] {
+            assert_eq!(
+                pred.eval_str(k),
+                bloom.might_contain_str(k),
+                "StringInBloom eval_str disagrees with bloom for {k:?}"
+            );
+        }
+        assert_eq!(pred.col_idx(), 3);
+        assert!(
+            !pred.is_exact_safe(),
+            "runtime string bloom must be inexact (residual join still runs)"
+        );
+
+        // --- StringInSet: exact membership, zero false positives.
+        let set: std::collections::HashSet<String> = ["FRANCE", "GERMANY"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let pred = ColumnPredicate::StringInSet {
+            col_idx: 7,
+            set: Arc::new(set),
+        };
+        assert!(pred.eval_str("FRANCE"));
+        assert!(pred.eval_str("GERMANY"));
+        assert!(
+            !pred.eval_str("BRAZIL"),
+            "absent key must not match the exact set"
+        );
+        assert!(!pred.eval_str(""), "empty key must not match");
+        assert_eq!(pred.col_idx(), 7);
+        assert!(
+            !pred.is_exact_safe(),
+            "runtime string set must be inexact (residual join still runs)"
+        );
+    }
+
+    /// KEYS.2 — an INT64 key column whose values fit i32 is advertised as
+    /// Int32 (downcast on) and decodes losslessly through the streaming
+    /// path; a same-fitting NON-key i64 column stays Int64 (name gate), and
+    /// downcast-off leaves the key Int64 (control).
+    ///
+    /// The value round-trip exercises the full streaming decode path: a 1000-
+    /// row single-RG file routes through the page-streaming reader, which
+    /// decodes the key at its native INT64 width; `execute()` then casts
+    /// Int64→Int32 once at the stream boundary (`narrow_stream_to_advertised`).
+    /// This catches any decode entry point that mis-handles the narrowed key,
+    /// since they ALL flow through that one cast.
+    /// REV.23 — the non-streaming late-mat path's masked→dense gate produces
+    /// identical, correct rows on both sides of the threshold. High pass rate
+    /// (>10%) takes the new dense-decode + SIMD `filter_record_batch` branch;
+    /// low pass rate (<10%) takes the per-column masked gather. Both must
+    /// return exactly the rows passing the predicate.
+    #[test]
+    fn rev23_late_mat_dense_route_matches_masked() {
+        use ematix_parquet_codec::write::{ColumnData, write_table_to_path};
+        use ematix_parquet_format::types::CompressionCodec;
+
+        let dir = std::env::temp_dir().join(format!("rev23_latemat_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("t.parquet");
+        let c: Vec<i32> = (0..1000).collect();
+        write_table_to_path(
+            &path,
+            &[("c", ColumnData::I32(&c))],
+            CompressionCodec::Uncompressed,
+        )
+        .unwrap();
+
+        let schema: SchemaRef =
+            Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+                "c",
+                DataType::Int32,
+                false,
+            )]));
+
+        let mk = |lt: i32| {
+            BridgeFilter::new(vec![ColumnPredicate::I32Range {
+                col_idx: 0,
+                clauses: vec![RangeClause {
+                    op: datafusion::logical_expr::Operator::Lt,
+                    literal_i32: lt,
+                }],
+            }])
+        };
+
+        let check = |lt: i32| {
+            let batch = decode_one_rg_filtered_late_mat(&path, 0, &schema, &[0], &mk(lt)).unwrap();
+            assert_eq!(batch.num_rows(), lt as usize, "row count for c < {lt}");
+            let col = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<arrow_array::Int32Array>()
+                .unwrap();
+            assert_eq!(col.value(0), 0);
+            assert_eq!(col.value(lt as usize - 1), lt - 1);
+        };
+
+        check(600); // 60% pass → dense-route branch (REV.23)
+        check(50); // 5% pass → masked-gather branch
+    }
+
+    #[tokio::test]
+    async fn keys2_narrows_i64_key_to_i32_losslessly() {
+        use ematix_parquet_codec::write::{ColumnData, write_table_to_path};
+        use ematix_parquet_format::types::CompressionCodec;
+
+        let dir = std::env::temp_dir().join(format!("keys2_test_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("t.parquet");
+
+        // l_orderkey: i64, max 599_400_000 < i32::MAX → key + fits → narrow.
+        // l_extra:    i64, also fits i32 but NOT a "*key" name → stays Int64.
+        let orderkey: Vec<i64> = (0..1000).map(|i| i * 600_000).collect();
+        let extra: Vec<i64> = (0..1000).collect();
+        write_table_to_path(
+            &path,
+            &[
+                ("l_orderkey", ColumnData::I64(&orderkey)),
+                ("l_extra", ColumnData::I64(&extra)),
+            ],
+            CompressionCodec::Uncompressed,
+        )
+        .unwrap();
+        let p = path.to_str().unwrap();
+
+        // Downcast ON: l_orderkey → Int32; l_extra stays Int64 (name gate).
+        let prov = EmatixFastParquetTableProvider::try_new_opt(p, true).unwrap();
+        let sch = prov.schema();
+        assert_eq!(
+            sch.field_with_name("l_orderkey").unwrap().data_type(),
+            &DataType::Int32,
+            "key with i32-fitting stats should narrow to Int32"
+        );
+        assert_eq!(
+            sch.field_with_name("l_extra").unwrap().data_type(),
+            &DataType::Int64,
+            "non-key i64 must stay Int64 even though it fits i32"
+        );
+
+        // Values round-trip losslessly through the streaming decode path.
+        let ctx = SessionContext::new();
+        ctx.register_table("t", Arc::new(prov)).unwrap();
+        let batches = ctx
+            .sql("SELECT l_orderkey FROM t ORDER BY l_orderkey")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let got: Vec<i32> = batches
+            .iter()
+            .flat_map(|b| {
+                b.column(0)
+                    .as_any()
+                    .downcast_ref::<arrow_array::Int32Array>()
+                    .expect("l_orderkey must decode as Int32Array")
+                    .values()
+                    .to_vec()
+            })
+            .collect();
+        let expect: Vec<i32> = orderkey.iter().map(|&x| x as i32).collect();
+        assert_eq!(
+            got, expect,
+            "narrowed values must equal original i64 cast i32"
+        );
+
+        // Downcast OFF: l_orderkey stays Int64 (control).
+        let prov_off = EmatixFastParquetTableProvider::try_new_opt(p, false).unwrap();
+        assert_eq!(
+            prov_off
+                .schema()
+                .field_with_name("l_orderkey")
+                .unwrap()
+                .data_type(),
+            &DataType::Int64,
+            "downcast-off must leave the key Int64"
+        );
+    }
 
     fn lineitem_path() -> Option<String> {
         // Resolution order:

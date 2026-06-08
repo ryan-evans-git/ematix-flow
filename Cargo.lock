@@ -2483,6 +2483,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "cty"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b365fabc795046672053e29c954733ec3b05e4be654ab130fe8f1f94d7051f35"
+
+[[package]]
 name = "curl-sys"
 version = "0.4.88+curl-8.20.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3692,7 +3698,7 @@ checksum = "91622ff5e7162018101f2fea40d6ebf4a78bbe5a49736a2020649edf9693679e"
 
 [[package]]
 name = "ematix-flow-cli"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "arrow-array",
  "arrow-ipc",
@@ -3704,6 +3710,8 @@ dependencies = [
  "ematix-flow-core",
  "ematix-flow-distributed",
  "futures-util",
+ "libmimalloc-sys",
+ "mimalloc",
  "prometheus",
  "rdkafka",
  "reqwest 0.12.28",
@@ -3722,7 +3730,7 @@ dependencies = [
 
 [[package]]
 name = "ematix-flow-core"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "apache-avro",
  "arrow-array",
@@ -3750,6 +3758,8 @@ dependencies = [
  "deadpool-postgres",
  "deltalake",
  "duckdb",
+ "ematix-flow-hash-join",
+ "ematix-flow-push",
  "ematix-parquet-codec",
  "ematix-parquet-format",
  "ematix-parquet-io",
@@ -3793,7 +3803,7 @@ dependencies = [
 
 [[package]]
 name = "ematix-flow-distributed"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -3804,6 +3814,8 @@ dependencies = [
  "ematix-flow-core",
  "futures-util",
  "http 1.4.0",
+ "libmimalloc-sys",
+ "mimalloc",
  "rcgen",
  "serde",
  "serde_json",
@@ -3816,8 +3828,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "ematix-flow-hash-join"
+version = "0.10.0"
+dependencies = [
+ "criterion",
+ "rand 0.9.4",
+]
+
+[[package]]
+name = "ematix-flow-push"
+version = "0.10.0"
+
+[[package]]
 name = "ematix-flow-py"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -3826,6 +3850,7 @@ dependencies = [
  "ematix-flow-cli",
  "ematix-flow-core",
  "futures-util",
+ "mimalloc",
  "pyo3",
  "serde_json",
  "tokio",
@@ -3833,9 +3858,9 @@ dependencies = [
 
 [[package]]
 name = "ematix-parquet-codec"
-version = "0.16.3"
+version = "0.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "61c6bc2b695d0fa61dde0421805f253dd711912ae70e549ccc68a2121e790c0b"
+checksum = "b5dd7a9cc5b3ba7cd7bf450a64662be1691b6a30171987a1c31aa7571d743b93"
 dependencies = [
  "brotli",
  "ematix-parquet-format",
@@ -3848,15 +3873,15 @@ dependencies = [
 
 [[package]]
 name = "ematix-parquet-format"
-version = "0.16.3"
+version = "0.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bb1236303ad79e5cb92c898a52ad49d2f897c0cfd667275a4b25cd10301ebbcd"
+checksum = "83389038c04c82cfd3f69e885a01c200bfaa3fc99784fd85271d12689aa4d836"
 
 [[package]]
 name = "ematix-parquet-io"
-version = "0.16.3"
+version = "0.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "116064bd7cb839291d7970188112eefce93fc5377d4ce91b6e770fc3e73a4ba0"
+checksum = "d60dad0a80c8bbdfe430c0b4e140a370c6192ea18cfc53a7b6e072b8112aa9dc"
 dependencies = [
  "ematix-parquet-format",
 ]
@@ -5436,6 +5461,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6a45a52f43e1c16f667ccfe4dd8c85b7f7c204fd5e3bf46c5b0db9a5c3c0b8e9"
 dependencies = [
  "cc",
+ "cty",
 ]
 
 [[package]]

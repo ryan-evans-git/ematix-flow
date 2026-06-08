@@ -66,7 +66,13 @@ const INITIAL_CAPACITY: usize = 64;
 pub struct I64Set {
     buckets: Vec<i64>,
     mask: usize,
+    /// Count of keys stored in `buckets` (excludes the [`EMPTY`] sentinel
+    /// value, which is tracked by `has_min`). Drives the load-factor grow.
     len: usize,
+    /// KEYS.4 — whether the [`EMPTY`] bit pattern (`i64::MIN` = the u64 2^63
+    /// key) is a member. Tracked out-of-band because that value doubles as the
+    /// empty-slot sentinel, so it cannot live in `buckets`.
+    has_min: bool,
 }
 
 impl Default for I64Set {
@@ -88,6 +94,7 @@ impl I64Set {
             buckets: vec![EMPTY; cap],
             mask: cap - 1,
             len: 0,
+            has_min: false,
         }
     }
 
@@ -99,15 +106,16 @@ impl I64Set {
             buckets: vec![EMPTY; cap],
             mask: cap - 1,
             len: 0,
+            has_min: false,
         }
     }
 
     pub fn len(&self) -> usize {
-        self.len
+        self.len + self.has_min as usize
     }
 
     pub fn is_empty(&self) -> bool {
-        self.len == 0
+        self.len == 0 && !self.has_min
     }
 
     pub fn capacity(&self) -> usize {
@@ -125,12 +133,16 @@ impl I64Set {
         ((v as u64).wrapping_mul(MULT) >> 32) as usize & self.mask
     }
 
-    /// Insert `v` into the set. Returns `true` if `v` was new,
-    /// `false` if it was already present or if `v == i64::MIN`
-    /// (the empty sentinel).
+    /// Insert `v` into the set. Returns `true` if `v` was new, `false` if it
+    /// was already present. `v == i64::MIN` (the u64 2^63 key) is stored
+    /// out-of-band via `has_min`.
     pub fn insert(&mut self, v: i64) -> bool {
         if v == EMPTY {
-            return false;
+            if self.has_min {
+                return false;
+            }
+            self.has_min = true;
+            return true;
         }
         if self.len * 2 >= self.buckets.len() {
             self.grow();
@@ -154,7 +166,7 @@ impl I64Set {
     #[inline(always)]
     pub fn contains(&self, v: i64) -> bool {
         if v == EMPTY {
-            return false;
+            return self.has_min;
         }
         let mut s = self.slot(v);
         loop {
@@ -192,11 +204,19 @@ impl I64Set {
                 self.insert(b);
             }
         }
+        if other.has_min {
+            self.has_min = true;
+        }
     }
 
-    /// Iterate over the keys in bucket order (NOT insertion order).
+    /// Iterate over the keys in bucket order (NOT insertion order). The
+    /// out-of-band `i64::MIN` key (if present) is yielded last.
     pub fn iter(&self) -> impl Iterator<Item = i64> + '_ {
-        self.buckets.iter().copied().filter(|&b| b != EMPTY)
+        self.buckets
+            .iter()
+            .copied()
+            .filter(|&b| b != EMPTY)
+            .chain(self.has_min.then_some(EMPTY))
     }
 
     fn grow(&mut self) {
@@ -279,11 +299,26 @@ mod tests {
     }
 
     #[test]
-    fn empty_sentinel_is_rejected() {
+    fn i64_min_is_a_real_key() {
+        // KEYS.4: i64::MIN (= the u64 2^63 bit pattern) must be a storable key,
+        // not rejected. A UInt64 join key of exactly 2^63 bitcasts to i64::MIN,
+        // and the exact-set path must contain it. (i64::MIN was the empty-slot
+        // sentinel; it is now tracked out-of-band so the full 64-bit domain is
+        // representable.)
         let mut s = I64Set::new();
-        assert!(!s.insert(i64::MIN));
-        assert!(!s.contains(i64::MIN));
-        assert_eq!(s.len(), 0);
+        assert!(s.insert(i64::MIN), "first insert of i64::MIN should be new");
+        assert!(s.contains(i64::MIN));
+        assert!(!s.insert(i64::MIN), "duplicate i64::MIN insert is not new");
+        assert_eq!(s.len(), 1);
+        // Coexists with ordinary keys.
+        assert!(s.insert(42));
+        assert!(s.contains(42));
+        assert!(s.contains(i64::MIN));
+        assert_eq!(s.len(), 2);
+        // i64::MIN appears in iteration.
+        let got: Vec<i64> = s.iter().collect();
+        assert!(got.contains(&i64::MIN), "iter must yield i64::MIN");
+        assert!(got.contains(&42));
     }
 
     #[test]

@@ -81,13 +81,19 @@ fn table_provider_stats(ts: &TableScan) -> Option<Statistics> {
 /// to the new left-deep chain by name lookup against the in-scope
 /// schema at each step.
 #[derive(Debug)]
-struct InnerJoinChain {
-    leaves: Vec<LogicalPlan>,
-    equi_preds: Vec<(Column, Column)>,
+/// Flattened inner-join region: the leaves + the equi-edge graph among
+/// them. `pub(crate)` so the PV.3b push-fusion recognizer
+/// ([`crate::push_fusion_rule`]) can reuse the same flattening (it descends
+/// transparently through the optimizer's column-pruning Projections and
+/// keeps `SubqueryAlias` leaves distinct, so `n1`/`n2` stay separate and
+/// `equi_preds` carry relation-qualified columns).
+pub(crate) struct InnerJoinChain {
+    pub(crate) leaves: Vec<LogicalPlan>,
+    pub(crate) equi_preds: Vec<(Column, Column)>,
     /// Filter expressions that sat directly on the original Join's
     /// `filter` slot (non-equi conditions). Preserved as a single
     /// AND-conjunction applied to the rebuilt chain root.
-    extra_filter: Option<Expr>,
+    pub(crate) extra_filter: Option<Expr>,
 }
 
 /// Σ.AH.X Lever G — shape predicates for narrowing `reorder_inner_joins`
@@ -274,16 +280,31 @@ pub fn reorder_inner_joins_with_opts(
                     // Q21) are rejected by the *other* guards, not the cap,
                     // so raising it only admits the funnels. See
                     // PHASE_SIGMA_BR_JOIN_REORDER.md §5 "guard attribution".
-                    let largest_leaf_rows =
-                        chain.leaves.iter().map(estimate_leaf_card).max().unwrap_or(0);
-                    let effective_max_leaves = match opts.scale_bump {
-                        Some((min_rows, bumped)) if largest_leaf_rows >= min_rows => {
-                            bumped.max(opts.max_leaves)
-                        }
-                        _ => opts.max_leaves,
-                    };
+                    // #316: the effective cap. `scale_bump` must key off a REAL
+                    // largest-leaf row count — never the `u64::MAX/2` sentinel that
+                    // `estimate_leaf_card` returns for `Precision::Absent` stats. On
+                    // a provider without row stats (plain `register_parquet` at
+                    // logical-plan time) every leaf is Absent; the old
+                    // `largest_leaf >= min_rows` test treated that ~2^63 as ">= 100M"
+                    // and bumped the cap 4→6, wrongly admitting Q05's 6-way funnel →
+                    // DP on garbage cards → 72× regression (memory:
+                    // dist1-local-bench-findings).
+                    let eff_max_leaves = effective_max_leaves(&chain, &opts);
+                    // #316: a chain with NO leaf carrying a real row count can't be
+                    // cost-ordered — the DP would optimise on the sentinel and pick a
+                    // garbage order. Don't reorder what we can't cost. Gated on
+                    // `scale_bump` being enabled so `unsafe_no_shape_gate`
+                    // (scale_bump None) keeps its permissive "reorder anything"
+                    // contract, and real-stats chains (every SF=1/SF=10/SF=100 bench
+                    // path) are never blind.
+                    let blind = reorder_stats_aware_gate_on()
+                        && opts.scale_bump.is_some()
+                        && !chain
+                            .leaves
+                            .iter()
+                            .any(|l| estimate_leaf_card_known(l).is_some());
                     let too_few = n < 3;
-                    let too_many = n > effective_max_leaves;
+                    let too_many = n > eff_max_leaves;
                     let ambiguous = chain_has_ambiguous_names(&chain);
                     let like =
                         opts.reject_string_like && chain_has_string_like_filter(&chain);
@@ -293,11 +314,16 @@ pub fn reorder_inner_joins_with_opts(
                     // TableScan) subtree the cost model can't estimate — its
                     // sentinel cardinality poisons the DP (Q10 regression).
                     let composite = !chain.leaves.iter().all(leaf_is_estimable);
-                    let pass =
-                        !too_few && !too_many && !ambiguous && !like && !aggkey && !composite;
+                    let pass = !too_few
+                        && !too_many
+                        && !ambiguous
+                        && !like
+                        && !aggkey
+                        && !composite
+                        && !blind;
                     if std::env::var("EMAT_REORDER_DEBUG").is_ok() {
                         eprintln!(
-                            "[reorder-gate] leaves={n} largest_leaf={largest_leaf_rows} eff_max_leaves={effective_max_leaves} too_few={too_few} too_many={too_many} ambiguous={ambiguous} like={like} aggkey={aggkey} composite={composite} -> {}",
+                            "[reorder-gate] leaves={n} eff_max_leaves={eff_max_leaves} too_few={too_few} too_many={too_many} ambiguous={ambiguous} like={like} aggkey={aggkey} composite={composite} blind={blind} -> {}",
                             if pass { "PASS" } else { "REJECT" }
                         );
                     }
@@ -414,7 +440,7 @@ fn column_name_is_aggregate(col: &Column) -> bool {
 /// Walk down through `Inner Join` nodes, accumulating leaves +
 /// equi-join predicates. Returns `None` if the subtree isn't a pure
 /// inner-join chain (e.g. has an outer join inside it).
-fn flatten_inner_join_chain(plan: &LogicalPlan) -> Option<InnerJoinChain> {
+pub(crate) fn flatten_inner_join_chain(plan: &LogicalPlan) -> Option<InnerJoinChain> {
     let mut leaves: Vec<LogicalPlan> = Vec::new();
     let mut equi: Vec<(Column, Column)> = Vec::new();
     let mut extra_filters: Vec<Expr> = Vec::new();
@@ -564,6 +590,85 @@ fn estimate_leaf_card(plan: &LogicalPlan) -> u64 {
         LogicalPlan::Projection(p) => estimate_leaf_card(&p.input),
         LogicalPlan::SubqueryAlias(s) => estimate_leaf_card(&s.input),
         _ => u64::MAX / 2,
+    }
+}
+
+/// #316: like [`estimate_leaf_card`] but returns `None` when the leaf has NO
+/// real row-count statistic (`Precision::Absent`) or isn't an estimable scan —
+/// instead of the `u64::MAX / 2` sentinel. The shape gate's `scale_bump`
+/// decision must key off a REAL cardinality: a provider without row stats
+/// (e.g. plain `register_parquet` at logical-plan time, before parquet metadata
+/// is read) reports Absent for every leaf, and treating that ~2^63 sentinel as
+/// ">= the bump threshold" wrongly admitted Q05's 6-way funnel through the leaf
+/// cap (72× regression — memory `[[dist1-local-bench-findings]]` / #316).
+fn estimate_leaf_card_known(plan: &LogicalPlan) -> Option<u64> {
+    use datafusion::common::stats::Precision;
+    match plan {
+        LogicalPlan::TableScan(ts) => {
+            let stats = table_provider_stats(ts);
+            let rows = stats.as_ref().and_then(|s| match s.num_rows {
+                Precision::Exact(n) | Precision::Inexact(n) => Some(n as u64),
+                Precision::Absent => None,
+            })?;
+            let sel = ts
+                .filters
+                .iter()
+                .map(|e| predicate_selectivity(e, ts))
+                .fold(1.0f64, |acc, s| acc * s);
+            Some(scale_card(rows, sel))
+        }
+        LogicalPlan::Filter(f) => estimate_leaf_card_known(&f.input).map(|b| scale_card(b, 0.3)),
+        LogicalPlan::Projection(p) => estimate_leaf_card_known(&p.input),
+        LogicalPlan::SubqueryAlias(s) => estimate_leaf_card_known(&s.input),
+        _ => None,
+    }
+}
+
+/// #316: opt-out for the stats-aware reorder gate. Default ON. Set
+/// `EMAT_REORDER_STATS_AWARE_GATE=0` (or `false`) to restore the legacy
+/// behaviour (scale_bump keys off `estimate_leaf_card`'s sentinel; no
+/// blind-reject) — used for the strict A/B that validates this fix, and as a
+/// safety valve. INERT on real-stats providers (the production Emat path),
+/// where `estimate_leaf_card_known == estimate_leaf_card`.
+fn reorder_stats_aware_gate_on() -> bool {
+    std::env::var("EMAT_REORDER_STATS_AWARE_GATE")
+        .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+        .unwrap_or(true)
+}
+
+/// #316: effective leaf cap for `chain` under `opts`. With the stats-aware gate
+/// ON (default), `scale_bump` fires ONLY when some leaf has a REAL
+/// (non-sentinel) row count `>= min_rows` — never on the Absent sentinel.
+/// Without any real stat the bump can't fire, so the conservative `max_leaves`
+/// cap holds and large funnels (Q05's 6-way) are correctly rejected, exactly as
+/// at SF=1/SF=10 with real stats. With the gate OFF, the legacy
+/// sentinel-inclusive estimate is used (the pre-#316 behaviour, for A/B).
+/// Extracted as a pure fn so the gate decision is unit-testable.
+fn effective_max_leaves(chain: &InnerJoinChain, opts: &ReorderOpts) -> usize {
+    let largest: Option<u64> = if reorder_stats_aware_gate_on() {
+        chain
+            .leaves
+            .iter()
+            .filter_map(estimate_leaf_card_known)
+            .max()
+    } else {
+        // Legacy: `estimate_leaf_card` falls back to the `u64::MAX/2` sentinel
+        // for Absent stats, so this is always `Some(..)` — reproduces the
+        // pre-#316 bump-on-sentinel behaviour for the strict A/B.
+        Some(
+            chain
+                .leaves
+                .iter()
+                .map(estimate_leaf_card)
+                .max()
+                .unwrap_or(0),
+        )
+    };
+    match opts.scale_bump {
+        Some((min_rows, bumped)) if largest.is_some_and(|c| c >= min_rows) => {
+            bumped.max(opts.max_leaves)
+        }
+        _ => opts.max_leaves,
     }
 }
 
@@ -2014,5 +2119,105 @@ mod tests {
             "With Σ.AL gate, reorder must NOT fire under LeftSemi"
         );
         Ok(())
+    }
+
+    // ───────────────────── #316: scale_bump must ignore Absent stats ─────
+    // The reorder runs at logical-plan time. On a provider without row-count
+    // statistics (plain `register_parquet`), every leaf's `num_rows` is
+    // `Precision::Absent`, so `estimate_leaf_card` returns the `u64::MAX/2`
+    // sentinel (~2^63). The old gate treated that as ">= the 100M scale_bump
+    // threshold", raised the leaf cap 4→6, and admitted Q05's 6-way funnel →
+    // DP on garbage cards → 72× regression. These tests pin the fix WITHOUT
+    // any data files (the SF=1-dependent tests skip when data is missing).
+
+    /// A `TableProvider` that reports NO statistics, reproducing the
+    /// plain-`register_parquet`/no-stats logical-plan condition.
+    #[derive(Debug)]
+    struct NoStatsTable {
+        schema: datafusion::arrow::datatypes::SchemaRef,
+    }
+
+    #[async_trait::async_trait]
+    impl datafusion::catalog::TableProvider for NoStatsTable {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+        fn schema(&self) -> datafusion::arrow::datatypes::SchemaRef {
+            self.schema.clone()
+        }
+        fn table_type(&self) -> datafusion::datasource::TableType {
+            datafusion::datasource::TableType::Base
+        }
+        fn statistics(&self) -> Option<datafusion::common::Statistics> {
+            None // → Precision::Absent for num_rows
+        }
+        async fn scan(
+            &self,
+            _state: &dyn datafusion::catalog::Session,
+            _projection: Option<&Vec<usize>>,
+            _filters: &[Expr],
+            _limit: Option<usize>,
+        ) -> DfResult<std::sync::Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
+            Ok(std::sync::Arc::new(
+                datafusion::physical_plan::empty::EmptyExec::new(self.schema.clone()),
+            ))
+        }
+    }
+
+    /// A `TableScan` leaf over a no-stats provider with a single Int64 column.
+    fn no_stats_scan(i: usize) -> LogicalPlan {
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        let schema = std::sync::Arc::new(Schema::new(vec![Field::new(
+            format!("c{i}"),
+            DataType::Int64,
+            false,
+        )]));
+        let provider = std::sync::Arc::new(NoStatsTable { schema });
+        LogicalPlanBuilder::scan(
+            format!("t{i}"),
+            datafusion::datasource::provider_as_source(provider),
+            None,
+        )
+        .unwrap()
+        .build()
+        .unwrap()
+    }
+
+    /// Mechanism: a no-stats leaf reports `None` (unknown), not the sentinel.
+    #[test]
+    fn estimate_leaf_card_known_is_none_without_stats() {
+        let scan = no_stats_scan(0);
+        assert_eq!(
+            estimate_leaf_card_known(&scan),
+            None,
+            "a no-stats leaf must report unknown (None), not a sentinel"
+        );
+        assert!(
+            estimate_leaf_card(&scan) > 1_000_000_000,
+            "estimate_leaf_card still returns the large sentinel for no-stats leaves \
+             (got {})",
+            estimate_leaf_card(&scan)
+        );
+    }
+
+    /// The bug + fix: a 6-leaf chain whose leaves have NO row stats must NOT
+    /// trip the `scale_bump`. Before the fix the sentinel satisfied `>= 100M`
+    /// and the effective cap rose to 6 (admitting the funnel); after the fix
+    /// the bump can't fire without a real stat, so the cap stays 4 and the
+    /// 6-way chain is rejected (`6 > 4`).
+    #[test]
+    fn scale_bump_ignores_sentinel_leaf_cards() {
+        let chain = InnerJoinChain {
+            leaves: (0..6).map(no_stats_scan).collect(),
+            equi_preds: vec![],
+            extra_filter: None,
+        };
+        assert_eq!(chain.leaves.len(), 6);
+        assert_eq!(
+            effective_max_leaves(&chain, &ReorderOpts::default()),
+            4,
+            "scale_bump must NOT fire on Absent/sentinel leaf cards — the 6-way \
+             chain must stay above the cap (4) and be rejected"
+        );
     }
 }

@@ -78,10 +78,28 @@ fn arrow_type_for(se: &SchemaElement<'_>) -> DataType {
             se.logical_type,
             Some(ematix_parquet_format::metadata::LogicalType::String)
         );
+    // KEYS.4.a — an INT64 column marked UINT_64 (legacy converted_type or
+    // modern logical_type Integer{bit_width:64,is_signed:false}) is surfaced
+    // as UInt64 so it is decoded, compared, sorted, and aggregated unsigned
+    // end-to-end. Fixes the latent ORDER BY/range bug for values >= 2^63
+    // (the i64 reading inverts ordering). TPC-H has no unsigned columns, so
+    // this arm never fires on the 22q bench (tpch_validate stays 22/22); it
+    // only changes columns genuinely marked UINT_64.
+    let is_unsigned_64 = matches!(se.converted_type, Some(ConvertedType::Uint64))
+        || matches!(
+            se.logical_type,
+            Some(ematix_parquet_format::metadata::LogicalType::Integer(
+                ematix_parquet_format::metadata::IntType {
+                    bit_width: 64,
+                    is_signed: false,
+                }
+            ))
+        );
     match se.column_type {
         Some(ParquetType::Boolean) => DataType::Boolean,
         Some(ParquetType::Int32) if is_date => DataType::Date32,
         Some(ParquetType::Int32) => DataType::Int32,
+        Some(ParquetType::Int64) if is_unsigned_64 => DataType::UInt64,
         Some(ParquetType::Int64) => DataType::Int64,
         Some(ParquetType::Float) => DataType::Float32,
         Some(ParquetType::Double) => DataType::Float64,
@@ -140,6 +158,14 @@ fn scalar_from_le_bytes(ty: &DataType, b: &[u8]) -> Option<ScalarValue> {
         DataType::Int64 => b
             .get(..8)
             .map(|s| ScalarValue::Int64(Some(i64::from_le_bytes(s.try_into().unwrap())))),
+        // KEYS.4.c: a UInt64 column is physically INT64 but its min/max
+        // are unsigned — emit `ScalarValue::UInt64` so the cross-RG fold
+        // and DataFusion's pruning compare unsigned (a value >= 2^63 must
+        // not read as a negative i64). The 8 stat bytes are the same; only
+        // the interpretation differs.
+        DataType::UInt64 => b
+            .get(..8)
+            .map(|s| ScalarValue::UInt64(Some(u64::from_le_bytes(s.try_into().unwrap())))),
         DataType::Float64 => b
             .get(..8)
             .map(|s| ScalarValue::Float64(Some(f64::from_le_bytes(s.try_into().unwrap())))),
@@ -532,6 +558,84 @@ mod tests {
             Err(EmatMetadataError::Io(_)) => {}
             other => panic!("expected Io error, got {other:?}"),
         }
+    }
+
+    /// KEYS.4.c — a UInt64 column's parquet min/max stats must parse as
+    /// an unsigned `ScalarValue::UInt64`, not signed Int64. The value 2^63
+    /// is a normal u64 (9223372036854775808); read as i64 it would be the
+    /// most-negative value, inverting min/max and any prune bound. The
+    /// cross-RG fold (min/max via `ScalarValue` ordering) compares UInt64
+    /// unsigned, so emitting UInt64 makes the whole stats path correct.
+    #[test]
+    fn scalar_from_le_bytes_uint64_is_unsigned() {
+        let two63: u64 = 1 << 63;
+        let sv = scalar_from_le_bytes(&DataType::UInt64, &two63.to_le_bytes());
+        assert_eq!(sv, Some(ScalarValue::UInt64(Some(two63))));
+
+        // The cross-RG fold relies on UInt64 comparing unsigned: 2^63 > 5.
+        assert!(ScalarValue::UInt64(Some(two63)) > ScalarValue::UInt64(Some(5)));
+        // The same bits read as i64 would compare < 5 — the bug we avoid.
+        assert!((two63 as i64) < 5);
+
+        // Int64 still parses signed (no regression).
+        assert_eq!(
+            scalar_from_le_bytes(&DataType::Int64, &(-7i64).to_le_bytes()),
+            Some(ScalarValue::Int64(Some(-7)))
+        );
+    }
+
+    /// KEYS.4.a — an INT64 column carrying the UINT_64 marker (legacy
+    /// converted_type OR modern logical_type Integer{64,unsigned}) maps to
+    /// DataType::UInt64 so it is processed unsigned end-to-end. A plain
+    /// INT64 (incl. signed Integer{64}) stays Int64 — TPC-H has no unsigned
+    /// columns, so the flip is inert on the 22q bench.
+    #[test]
+    fn arrow_type_for_maps_uint64_marker_to_uint64() {
+        use ematix_parquet_format::metadata::{IntType, LogicalType, SchemaElement};
+        use ematix_parquet_format::types::{ConvertedType, ParquetType};
+        fn se<'a>(ct: Option<ConvertedType>, lt: Option<LogicalType<'a>>) -> SchemaElement<'a> {
+            SchemaElement {
+                column_type: Some(ParquetType::Int64),
+                type_length: None,
+                repetition_type: None,
+                name: b"k",
+                num_children: None,
+                converted_type: ct,
+                scale: None,
+                precision: None,
+                field_id: None,
+                logical_type: lt,
+            }
+        }
+        // Legacy converted_type marker.
+        assert_eq!(
+            arrow_type_for(&se(Some(ConvertedType::Uint64), None)),
+            DataType::UInt64
+        );
+        // Modern logical_type marker.
+        assert_eq!(
+            arrow_type_for(&se(
+                None,
+                Some(LogicalType::Integer(IntType {
+                    bit_width: 64,
+                    is_signed: false,
+                })),
+            )),
+            DataType::UInt64
+        );
+        // Plain INT64 stays Int64 (the TPC-H / no-regression case).
+        assert_eq!(arrow_type_for(&se(None, None)), DataType::Int64);
+        // Signed Integer{64} stays Int64.
+        assert_eq!(
+            arrow_type_for(&se(
+                None,
+                Some(LogicalType::Integer(IntType {
+                    bit_width: 64,
+                    is_signed: true,
+                })),
+            )),
+            DataType::Int64
+        );
     }
 
     // Σ.Q06.SF10.5.a integration semantics (PageHeader window size,

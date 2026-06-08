@@ -12,6 +12,9 @@ description = "Distributed batch SQL execution for ematix-flow via datafusion-di
 name = "ematix_flow_distributed"
 
 [dependencies]
+# Production-allocator parity (used by the flow-worker bin's global_allocator;
+# see src/bin/flow_worker.rs + the alloc_guard test).
+mimalloc = { version = "0.1", default-features = false }
 ematix-flow-core = { workspace = true }
 async-trait = "0.1"
 datafusion = { workspace = true }
@@ -44,6 +47,8 @@ path = "src/bin/flow_worker.rs"
 
 [dev-dependencies]
 tempfile = "3"
+# Allocator-parity guard (alloc_guard test in src/bin/flow_worker.rs).
+libmimalloc-sys = { version = "0.1", features = ["extended"] }
 # Σ.B PR 3 integration test: spawn N in-process workers in the test
 # itself + bind to a free port via TcpListener, then connect a
 # coordinator. Avoids Docker dependency for the cross-pod test.

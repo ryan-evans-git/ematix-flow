@@ -179,8 +179,29 @@ impl PhysicalOptimizerRule for DedupeAggregateForFloatDeterminism {
                 let h = subtree_hash(&node);
                 if dupes.contains(&h) {
                     let cached = registry.get_or_create(h, node.schema());
+                    // PV.M.7: fuse redundant bridge FilterExecs into the
+                    // masked scan BEFORE sealing the subtree. After the wrap,
+                    // SharedSubtreeExec.children()==[] makes the inner
+                    // FilterExec→scan unreachable to every later physical rule
+                    // (this is the ONLY place with the unwrapped subtree in
+                    // hand). The fusion is schema-preserving (a ProjectionExec
+                    // replaces the FilterExec's projection), so the registry
+                    // key `node.schema()` stays valid. Sealed CSE subtrees are
+                    // never InjectFused-eligible, so there is no collision.
+                    let inner = if cse_filter_fusion_enabled() {
+                        crate::drop_redundant_filter_rule::fuse_redundant_bridge_filters(
+                            node.clone(),
+                        )?
+                    } else {
+                        node.clone()
+                    };
+                    debug_assert_eq!(
+                        inner.schema(),
+                        node.schema(),
+                        "PV.M.7 CSE filter-fusion must preserve subtree schema"
+                    );
                     let wrapped: Arc<dyn ExecutionPlan> =
-                        Arc::new(SharedSubtreeExec::new(node.clone(), cached));
+                        Arc::new(SharedSubtreeExec::new(inner, cached));
                     return Ok(Transformed::yes(wrapped));
                 }
             }
@@ -245,6 +266,37 @@ fn has_float_aggregate(agg: &AggregateExec) -> bool {
         .fields()
         .iter()
         .any(|f| matches!(f.data_type(), DataType::Float64))
+}
+
+/// PV.M.7 — gate for fusing redundant bridge FilterExecs into the masked
+/// scan inside CSE-sealed subtrees. DEFAULT-ON (#308); `EMAT_CSE_FILTER_FUSION=0`
+/// (or `false`) disables — the A/B off-arm and a regression escape hatch.
+///
+/// Default-on is safe and free, but NOT a wall-time win at the operating
+/// points we ship/bench. The masked-fusion projection-prunes the filter-only
+/// column out of the scan's DECODE projection, removing one redundant Snappy
+/// decompress of `l_shipdate` — real CPU work, but on a 14-core box (and even
+/// at SF=100) that saving lands OFF the wall-clock critical path, so Q15 is
+/// wall-neutral: order-balanced interleaved A/B measured −0.6% (SF=10 Phase-2
+/// on), −0.3% (SF=10 Phase-2 off), −0.7%/+0.7% median/trimmed (SF=100) — all
+/// within jitter. (The "−8%" from the original spike was cross-process thermal
+/// drift in the two-process q15_full_ab, since absorbed by REV.22/REV.23.)
+///
+/// It ships default-on anyway because it is provably zero-cost-zero-risk and
+/// banks the CPU saving + a generalizable shape rule: blast radius is EXACTLY
+/// Q15 (the only CSE'd `Agg→Filter(i32-range,no-nulls)→EmatixScan` shape) —
+/// 21 of 22 queries fire 0× (identical code path, two back-to-back 22q A/Bs
+/// confirm the inert band is pure noise), correctness is byte-identical at
+/// SF=10 AND SF=100, and there is NO codegen tax (the helper is compiled in
+/// regardless; this is a runtime branch, so the binary is identical to the
+/// opt-in build). Any future CSE'd-filter-on-fact-scan query where decode IS
+/// on the critical path (lower core count, higher SF, CPU-contended
+/// concurrency) gets the win automatically.
+fn cse_filter_fusion_enabled() -> bool {
+    std::env::var("EMAT_CSE_FILTER_FUSION")
+        .ok()
+        .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
+        .unwrap_or(true)
 }
 
 /// Structural hash of an ExecutionPlan subtree. Two subtrees with the
@@ -357,6 +409,39 @@ fn hash_node(node: &Arc<dyn ExecutionPlan>, h: &mut DefaultHasher) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // PV.M.7 #308: the masked-fusion default flipped ON. It is wall-time-
+    // neutral on Q15 at SF=10/100 (a CPU-work saving — one fewer l_shipdate
+    // Snappy decompress — that lands off the wall-clock critical path) but
+    // proven zero-regression: blast radius is exactly Q15 (2 fuse sites),
+    // 21 queries fire 0×, byte-identical correctness at SF=10+SF=100, no
+    // codegen tax (runtime branch). Default-on banks the free CPU saving and
+    // the generalizable shape rule; explicit `=0`/`false` still disables (the
+    // A/B off-arm + any future regression escape hatch).
+    #[test]
+    fn cse_filter_fusion_defaults_on_and_respects_explicit_off() {
+        // SAFETY: single-threaded mutation of a process env var that no other
+        // test in this crate reads; saved + restored around the assertions.
+        let saved = std::env::var_os("EMAT_CSE_FILTER_FUSION");
+        unsafe {
+            std::env::remove_var("EMAT_CSE_FILTER_FUSION");
+            assert!(cse_filter_fusion_enabled(), "absent var → default ON");
+
+            std::env::set_var("EMAT_CSE_FILTER_FUSION", "0");
+            assert!(!cse_filter_fusion_enabled(), "\"0\" → OFF");
+
+            std::env::set_var("EMAT_CSE_FILTER_FUSION", "false");
+            assert!(!cse_filter_fusion_enabled(), "\"false\" → OFF");
+
+            std::env::set_var("EMAT_CSE_FILTER_FUSION", "1");
+            assert!(cse_filter_fusion_enabled(), "\"1\" → ON");
+
+            match saved {
+                Some(v) => std::env::set_var("EMAT_CSE_FILTER_FUSION", v),
+                None => std::env::remove_var("EMAT_CSE_FILTER_FUSION"),
+            }
+        }
+    }
 
     #[test]
     fn rule_name_smoke() {

@@ -1,0 +1,25 @@
+[package]
+name = "ematix-flow-hash-join"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Σ.T V5 L13 — custom hash-join kernel (Robin Hood, i64-specialised). Sibling crate to ematix-flow-core; pure kernel with no DataFusion or Arrow dependency."
+
+[dependencies]
+# Intentionally empty. The kernel is primitive-typed (i64, u32,
+# slices) so the optimizer-codegen-sensitivity tax from new
+# PhysicalOptimizerRule perturbation lands in ematix-flow-core only
+# when Story 2.5 wires the kernel into a DataFusion ExecutionPlan.
+# See `project_optimizer_codegen_sensitivity.md` for the rationale
+# behind sibling-crate isolation.
+
+[dev-dependencies]
+criterion = { workspace = true }
+rand = "0.9"
+
+[[bench]]
+name = "kernel_benchmark_baseline"
+harness = false

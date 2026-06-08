@@ -17,6 +17,38 @@ pub mod duckdb_backend;
 // See `fast_parquet.rs` for the day-2/day-3 probe results that
 // motivated this.
 pub mod fast_parquet;
+// HJ.3 (2026-06-04): Arrow bridge + (next) ExecutionPlan for the L13
+// RobinHood hash-join kernel. Targets Q08's part⋈lineitem probe, where
+// ematix does ~1010ms more summed work than DuckDB (60M vs 37K probes).
+pub mod emat_hash_join;
+// HJ.3: the EmatixHashJoinExec ExecutionPlan that probes the L13 kernel
+// (CollectLeft Inner, i64 key); installed only on the validated shape by
+// the pre-plan swap rule. Everything else stays on stock DataFusion.
+pub mod emat_hash_join_exec;
+// PV.2: EmatPushPipelineExec — fused push-pipeline ExecutionPlan node
+// (morsel kernel inside; hand-constructed for the Q08 shape, PV.3
+// generalises). Opt-in scaffold; not on any production plan path yet.
+pub mod emat_push_pipeline_exec;
+// PV.M.8: CombineAggExec — fused single-i64-key SUM(f64) aggregate that
+// replaces Partial→hash-Repartition→Final with inline per-partition tables
+// + direct parallel combine (no shuffle). Opt-in via the swap rule.
+pub mod combine_agg_exec;
+// HJ.3: pre-plan rule that swaps stock HashJoinExec → EmatixHashJoinExec
+// on the validated shape (Inner, CollectLeft, single i64 key). Opt-in
+// via EMAT_HASH_JOIN=1.
+pub mod swap_emat_hash_join_rule;
+// PV.3: physical recognizer that swaps a CollectLeft membership-reduction
+// join (sideband-free EMAT fact scan) → EmatPushPipelineExec. Installed as a
+// post-physical transform in FlowQueryPlanner. Opt-in via EMAT_PUSH_PIPELINE=1.
+pub mod fuse_push_pipeline_rule;
+// PV.3b: push-fusion recognizer (logical-plan join-reorder) — the ANALYSIS
+// layer (find fact + dim-groups in the Q08 star/snowflake). Reconstruction +
+// wiring build on this. Opt-in via EMAT_PUSH_PIPELINE=1.
+pub mod push_fusion_rule;
+// PV.3b: the fused-probe custom logical node + its ExtensionPlanner. The
+// recognizer's S6 reconstruction emits a FusedProbeNode the planner turns into
+// EmatPushPipelineExec (mechanism b — no physical re-detection).
+pub mod fused_probe_node;
 // Bridge from ematix-parquet kernel output (Vec<T>, Vec<u8> bitmap,
 // etc.) to Arrow arrays. Foundation for replacing parquet-rs under
 // FastParquetExec. See module docstring for the integration plan.
@@ -157,6 +189,10 @@ pub mod dict_routing;
 // reorder and falls back to FROM-clause order. See
 // `docs/PHASE_SIGMA_T_JOIN_REORDER.md`.
 pub mod join_reorder;
+// #315 / DIST.1a: TPC-H scale-factor-aware query parameters (Q11's
+// `FRACTION = 0.0001 / SF` HAVING threshold). Keeps Q11 non-degenerate at
+// SF≥10 across every harness/engine.
+pub mod tpch_params;
 // Σ.BR Phase 2 / #194 (2026-05-29): production wiring — a QueryPlanner wrapper
 // that applies the ematix pre-plan walker pipeline (agg_semi → dim_push →
 // reorder) post-optimization so it reaches library users (preset.rs), not just

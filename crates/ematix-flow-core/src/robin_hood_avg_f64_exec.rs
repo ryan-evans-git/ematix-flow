@@ -425,16 +425,40 @@ pub fn install_robin_hood_avg_f64_rule(builder: SessionStateBuilder) -> SessionS
 #[derive(Debug)]
 pub struct EnableRobinHoodAvgF64Rule {
     pub max_groups: usize,
+    /// REV.18d lower bound: below this est_groups the row-at-a-time kernel
+    /// loses to stock, so the rule no-ops. See [`DEFAULT_RH_AVG_F64_MIN_GROUPS`].
+    pub min_groups: usize,
 }
+
+/// REV.18 (2026-05-31): tightened 32M → 256K, matching the RobinHoodSumF64
+/// finding. This AVG rule is OPT-IN (not in preset.rs / bench; Σ.R.2 rejected
+/// it — Q17 SF=10 +40-55%), so the old 32M default never bit production — but
+/// it's the SAME row-at-a-time open-addressing kernel, which loses to
+/// DataFusion's vectorised columnar agg above ~256K groups (see
+/// DEFAULT_RH_SUM_F64_MAX_GROUPS). Tightened defensively against re-enable.
+pub const DEFAULT_RH_AVG_F64_MAX_GROUPS: usize = 256 * 1024;
+
+/// REV.18d (2026-05-31) lower bound, gate-calibration measured. At ~4
+/// rows/group (so est_groups ≈ actual groups), `AVG(f64) GROUP BY i64` through
+/// RobinHood has a win band of **[128K, 256K]** est_groups (0.85–0.95× of
+/// stock); below ~128K it ties or loses (up to 2× at tiny sizes). The lower
+/// bound confines firing to the win band. Env `EMAT_RH_AVG_F64_MIN_GROUPS`.
+pub const DEFAULT_RH_AVG_F64_MIN_GROUPS: usize = 128 * 1024;
 
 impl Default for EnableRobinHoodAvgF64Rule {
     fn default() -> Self {
-        // Default = MAX_INIT_CAP (32M); env-overridable for A/B + tuning.
         let max_groups = std::env::var("EMAT_RH_AVG_F64_MAX_GROUPS")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(32 * 1024 * 1024);
-        Self { max_groups }
+            .unwrap_or(DEFAULT_RH_AVG_F64_MAX_GROUPS);
+        let min_groups = std::env::var("EMAT_RH_AVG_F64_MIN_GROUPS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(DEFAULT_RH_AVG_F64_MIN_GROUPS);
+        Self {
+            max_groups,
+            min_groups,
+        }
     }
 }
 
@@ -445,6 +469,7 @@ impl PhysicalOptimizerRule for EnableRobinHoodAvgF64Rule {
         _config: &ConfigOptions,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
         let max_groups = self.max_groups;
+        let min_groups = self.min_groups;
         let result = plan.transform_up(|node| {
             if let Some(agg) = node.as_any().downcast_ref::<AggregateExec>() {
                 if matches!(agg.mode(), AggregateMode::Partial) {
@@ -467,7 +492,7 @@ impl PhysicalOptimizerRule for EnableRobinHoodAvgF64Rule {
                                 },
                                 Err(_) => 0,
                             };
-                            if est_groups <= max_groups {
+                            if est_groups >= min_groups && est_groups <= max_groups {
                                 let new = RobinHoodAvgF64Exec::try_new(
                                     input,
                                     m.group_col_idx,
@@ -611,6 +636,7 @@ fn find_robin_hood_avg_f64_partial(
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::assertions_on_constants)]
     use super::*;
     use arrow_array::{Float64Array, Int64Array, RecordBatch};
     use arrow_schema::{DataType, Field, Schema};
@@ -620,12 +646,17 @@ mod tests {
 
     fn make_ctx_with_rule() -> SessionContext {
         let cfg = SessionConfig::new().with_target_partitions(4);
-        let state = install_robin_hood_avg_f64_rule(
-            SessionStateBuilder::new()
-                .with_default_features()
-                .with_config(cfg),
-        )
-        .build();
+        // min_groups: 0 so the REV.18d lower bound doesn't suppress firing on
+        // the tiny test tables — these tests exercise kernel mechanics +
+        // correctness; the lower bound itself has a dedicated test.
+        let state = SessionStateBuilder::new()
+            .with_default_features()
+            .with_config(cfg)
+            .with_physical_optimizer_rule(Arc::new(EnableRobinHoodAvgF64Rule {
+                min_groups: 0,
+                max_groups: usize::MAX,
+            }))
+            .build();
         SessionContext::new_with_state(state)
     }
 
@@ -745,12 +776,14 @@ mod tests {
     #[tokio::test]
     async fn rule_no_op_on_non_int64_groupby() {
         let cfg = SessionConfig::new().with_target_partitions(4);
-        let state = install_robin_hood_avg_f64_rule(
-            SessionStateBuilder::new()
-                .with_default_features()
-                .with_config(cfg),
-        )
-        .build();
+        let state = SessionStateBuilder::new()
+            .with_default_features()
+            .with_config(cfg)
+            .with_physical_optimizer_rule(Arc::new(EnableRobinHoodAvgF64Rule {
+                min_groups: 0,
+                max_groups: usize::MAX,
+            }))
+            .build();
         let ctx = SessionContext::new_with_state(state);
         let schema = Arc::new(Schema::new(vec![
             Field::new("k", DataType::Utf8, false),
@@ -783,12 +816,14 @@ mod tests {
     async fn high_cardinality_matches_stock() {
         // 2K keys × 30 rows/key across 4 partitions — Q17-ish shape.
         let cfg = SessionConfig::new().with_target_partitions(4);
-        let state = install_robin_hood_avg_f64_rule(
-            SessionStateBuilder::new()
-                .with_default_features()
-                .with_config(cfg),
-        )
-        .build();
+        let state = SessionStateBuilder::new()
+            .with_default_features()
+            .with_config(cfg)
+            .with_physical_optimizer_rule(Arc::new(EnableRobinHoodAvgF64Rule {
+                min_groups: 0,
+                max_groups: usize::MAX,
+            }))
+            .build();
         let ctx = SessionContext::new_with_state(state);
 
         let schema = Arc::new(Schema::new(vec![
@@ -857,7 +892,10 @@ mod tests {
         let state = SessionStateBuilder::new()
             .with_default_features()
             .with_config(cfg)
-            .with_physical_optimizer_rule(Arc::new(EnableRobinHoodAvgF64Rule { max_groups: 0 }))
+            .with_physical_optimizer_rule(Arc::new(EnableRobinHoodAvgF64Rule {
+                min_groups: 0,
+                max_groups: 0,
+            }))
             .build();
         let ctx = SessionContext::new_with_state(state);
         register_q17_shape_table(&ctx, "t");
@@ -878,6 +916,7 @@ mod tests {
             .with_default_features()
             .with_config(cfg)
             .with_physical_optimizer_rule(Arc::new(EnableRobinHoodAvgF64Rule {
+                min_groups: 0,
                 max_groups: 1_000_000,
             }))
             .build();
@@ -890,5 +929,39 @@ mod tests {
             s.contains("RobinHoodAvgF64Exec"),
             "rule didn't fire under a generous gate — Got:\n{s}"
         );
+    }
+
+    #[tokio::test]
+    async fn rule_gated_off_below_min_groups() {
+        // REV.18d lower bound: below min_groups est_groups the kernel loses to
+        // stock, so the rule must REFUSE the rewrite. The 16-row Q17-shape
+        // table has est_groups = 4 ≪ 1000, so with min_groups=1000 the plan
+        // must keep DataFusion's stock AggregateExec.
+        let cfg = SessionConfig::new().with_target_partitions(4);
+        let state = SessionStateBuilder::new()
+            .with_default_features()
+            .with_config(cfg)
+            .with_physical_optimizer_rule(Arc::new(EnableRobinHoodAvgF64Rule {
+                min_groups: 1_000,
+                max_groups: usize::MAX,
+            }))
+            .build();
+        let ctx = SessionContext::new_with_state(state);
+        register_q17_shape_table(&ctx, "t");
+        let df = ctx.sql("SELECT k, AVG(v) FROM t GROUP BY k").await.unwrap();
+        let plan = df.create_physical_plan().await.unwrap();
+        let s = format!("{plan:?}");
+        assert!(
+            !s.contains("RobinHoodAvgF64Exec"),
+            "rule fired below the min_groups lower bound — Got:\n{s}"
+        );
+    }
+
+    #[test]
+    fn rev18d_default_min_gate_is_set() {
+        // REV.18d: win band [128K, 256K]; lower bound must be > 0 and below the
+        // upper bound so a non-empty fire band exists.
+        assert!(DEFAULT_RH_AVG_F64_MIN_GROUPS > 0);
+        assert!(DEFAULT_RH_AVG_F64_MIN_GROUPS < DEFAULT_RH_AVG_F64_MAX_GROUPS);
     }
 }

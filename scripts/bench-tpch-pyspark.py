@@ -104,13 +104,37 @@ def register_tables(spark: SparkSession, data_dir: Path) -> None:
         spark.read.parquet(str(path)).createOrReplaceTempView(table)
 
 
-def load_query(name: str) -> str:
+def scale_factor_from_data_dir(data_dir: Path) -> int:
+    """Derive the integer scale factor from a trailing `sf<N>` path component
+    (e.g. .../data/sf10 -> 10). Returns 1 when absent (mini/unknown layouts).
+    Mirrors ematix_flow_core::tpch_params::scale_factor_from_data_dir."""
+    for part in reversed(data_dir.parts):
+        if part.startswith("sf"):
+            try:
+                return int(part[2:])
+            except ValueError:
+                pass
+    return 1
+
+
+def apply_q11_fraction(name: str, sql: str, scale_factor: int) -> str:
+    """#315: TPC-H Q11's HAVING threshold parameter is FRACTION = 0.0001 / SF.
+    The q11.sql file holds the SF=1 value; at SF>=10 that's degenerate (0 rows
+    for every engine). Scale it so Spark measures a real Q11, matching the
+    ematix/DuckDB harnesses. No-op for q!=11 or SF<=1."""
+    if name == "q11" and scale_factor > 1:
+        return sql.replace("0.0001", f"(0.0001 / {scale_factor})", 1)
+    return sql
+
+
+def load_query(name: str, scale_factor: int = 1) -> str:
     path = QUERY_FILES[name]
     raw = path.read_text()
     # Strip terminating semicolons — Spark's `spark.sql()` rejects
     # them. The .sql files have them so DataFusion's harness + a human
     # reading the file see standard SQL.
-    return raw.strip().rstrip(";").strip()
+    sql = raw.strip().rstrip(";").strip()
+    return apply_q11_fraction(name, sql, scale_factor)
 
 
 def time_query(spark: SparkSession, sql: str) -> tuple[float, int]:
@@ -127,8 +151,10 @@ def median_then_range(values: list[float]) -> tuple[float, float, float]:
     return statistics.median(values), min(values), max(values)
 
 
-def run(spark: SparkSession, name: str, trials: int, warmups: int = 1) -> dict[str, float]:
-    sql = load_query(name)
+def run(
+    spark: SparkSession, name: str, trials: int, warmups: int = 1, scale_factor: int = 1
+) -> dict[str, float]:
+    sql = load_query(name, scale_factor)
 
     # Warm-ups: N untimed runs to let the JIT + Catalyst codegen settle.
     row_count = 0
@@ -150,6 +176,7 @@ def run(spark: SparkSession, name: str, trials: int, warmups: int = 1) -> dict[s
     median, lo, hi = median_then_range(timings)
     return {
         "median_ms": median * 1000,
+        "first_trial_ms": (timings[0] * 1000) if timings else float("nan"),
         "min_ms": lo * 1000,
         "max_ms": hi * 1000,
         "rows": row_count,
@@ -227,16 +254,44 @@ def main() -> None:
     print(f"==> Spark {spark.version}, JDK {os.environ.get('JAVA_HOME', 'system default')}")
     register_tables(spark, args.data_dir)
 
+    scale_factor = scale_factor_from_data_dir(Path(args.data_dir))
+    if scale_factor > 1:
+        print(f"==> scale factor {scale_factor} (Q11 fraction scaled to 0.0001/{scale_factor})")
+
     results: dict[str, dict[str, float]] = {}
     for name in QUERY_NAMES:
         print(f"-- {name} --")
         try:
-            results[name] = run(spark, name, args.trials, args.warmups)
+            results[name] = run(spark, name, args.trials, args.warmups, scale_factor)
         except Exception as e:  # noqa: BLE001 — surface, don't kill the run
             print(f"  FAIL: {e}")
         print()
 
     spark.stop()
+
+    # #209: emit a campaign-shaped JSON (Q{NN} keys, same shape as the ematix
+    # distributed campaign) for cross-engine comparison. Opt-in via env.
+    json_out = os.environ.get("PYSPARK_JSON_OUT")
+    if json_out:
+        import json as _json
+
+        payload = {
+            "engine": "pyspark",
+            "scale_factor": scale_factor,
+            "cluster_size": 1,  # local[*] — single JVM, all cores
+            "queries": {
+                f"Q{int(name[1:]):02d}": {
+                    "median_ms": r["median_ms"],
+                    "first_trial_ms": r.get("first_trial_ms", r["median_ms"]),
+                    "min_ms": r.get("min_ms"),
+                    "max_ms": r.get("max_ms"),
+                    "rows_returned": int(r["rows"]),
+                }
+                for name, r in results.items()
+            },
+        }
+        Path(json_out).write_text(_json.dumps(payload, indent=2))
+        print(f"==> wrote {json_out}")
 
     print("=== Results ===")
     print(emit_markdown(results, DATAFUSION_BASELINE_M3PRO_SF1_MS))

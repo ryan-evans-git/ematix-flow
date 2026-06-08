@@ -111,13 +111,21 @@ use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::logical_expr::Operator;
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_expr::expressions::{BinaryExpr, Column, Literal};
-use datafusion::physical_expr::utils::{conjunction, split_conjunction};
+use datafusion::physical_expr::utils::split_conjunction;
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::filter::FilterExec;
+use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::scalar::ScalarValue;
 
 use crate::ematix_fast_parquet::{ColumnPredicate, EmatixFastParquetExec};
+
+/// Number of FilterExec→scan fusions `fuse_redundant_bridge_filters`
+/// has performed this process. Lets the 22q A/B harness detect, per
+/// query, whether the PV.M.7 path actually fired (so the geomean is
+/// gated to queries that exercised it and inertness is asserted on the
+/// rest) — the analog of `CSE_PARALLEL_POPULATES` for the Phase-2 lever.
+pub static PV_M7_FUSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Install the Σ.AE rule. Only registers the rule if
 /// `EMAT_DROP_REDUNDANT_FILTER=1` is set in the environment at
@@ -152,75 +160,223 @@ impl PhysicalOptimizerRule for DropRedundantBridgeFilterRule {
         plan: Arc<dyn ExecutionPlan>,
         _config: &ConfigOptions,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
-        let trace = std::env::var_os("EMAT_DROP_REDUNDANT_FILTER_TRACE").is_some();
-        let transformed = plan.transform_up(|node| {
-            let Some(filter) = node.as_any().downcast_ref::<FilterExec>() else {
-                return Ok(Transformed::no(node));
-            };
-            let input = filter.input();
-            let Some(scan) = input.as_any().downcast_ref::<EmatixFastParquetExec>() else {
-                return Ok(Transformed::no(node));
-            };
-            let Some(bridge) = scan.filter() else {
-                return Ok(Transformed::no(node));
-            };
-            // Π.16.1/Σ.AE spike: skip the `column_has_no_nulls` check.
-            // TPC-H tables have no nulls on the columns we filter on,
-            // and plumbing the per-column flag from the provider through
-            // EmatixFastParquetExec is left for a follow-up. The
-            // existing `EMAT_EXACT_PUSHDOWN` opt-in does check this; if
-            // this spike graduates we'd plumb the bool array through
-            // `try_new` and check it here.
-            // Decompose the FilterExec's predicate into AND-conjuncts.
-            let conjuncts: Vec<Arc<dyn PhysicalExpr>> = split_conjunction(filter.predicate())
-                .into_iter()
-                .cloned()
-                .collect();
-            // Partition: those matched by a BridgeFilter exact-safe
-            // predicate (= droppable) vs leftover (must stay in
-            // FilterExec).
-            let mut leftover: Vec<Arc<dyn PhysicalExpr>> = Vec::with_capacity(conjuncts.len());
-            let mut dropped = 0usize;
-            for c in &conjuncts {
-                if let Some(matched) = match_against_bridge(c, bridge, scan)
-                    && matched.is_exact_safe()
-                {
-                    dropped += 1;
-                    continue;
-                }
-                leftover.push(c.clone());
-            }
-            if dropped == 0 {
-                if trace {
-                    eprintln!(
-                        "[Σ.AE] no_match conjuncts={} bridge_preds={}",
-                        conjuncts.len(),
-                        bridge.predicates().len(),
-                    );
-                }
-                return Ok(Transformed::no(node));
-            }
+        // RECONCILED (#308): delegate to the canonical
+        // `fuse_redundant_bridge_filters` so there is ONE audited
+        // implementation. That helper supersedes this rule's original
+        // spike body in two load-bearing ways: (1) it checks
+        // `column_has_no_nulls` (the masked-decode kernels carry no
+        // def-levels, so dropping a range predicate on a nullable
+        // column could leak NULLs SQL range semantics reject — the old
+        // body skipped this), and (2) on a full drop it projection-PRUNES
+        // the filter-only column out of the scan's decode projection
+        // (the actual win — avoids the double Snappy-decompress), where
+        // the old body returned the bare scan and silently widened the
+        // schema. It is full-drop-only (no partial-drop / leftover
+        // rebuild), which is strictly safer: a leftover conjunct leaves
+        // the whole FilterExec untouched. This rule stays opt-in
+        // (`EMAT_DROP_REDUNDANT_FILTER=1`) for probing a *direct*
+        // `FilterExec → EmatixScan` (not CSE-sealed); the default path is
+        // the DedupeAgg call site. Trace via `EMAT_CSE_FILTER_FUSION_TRACE`.
+        fuse_redundant_bridge_filters(plan)
+    }
+}
+
+/// PV.M.7 — projection-aware, null-safe masked-fusion of a
+/// `FilterExec → EmatixFastParquetExec` subtree, callable from a
+/// host rule that has the **unwrapped** subtree in hand (the CSE
+/// `SharedSubtreeExec` seals its child off, so the standalone
+/// `DropRedundantBridgeFilterRule` can never reach Q15's revenue
+/// scan — `DedupeAggregateForFloatDeterminism` calls this on `node`
+/// BEFORE wrapping).
+///
+/// Fixes two gaps in the spike rule above: (1) checks
+/// `column_has_no_nulls` (the masked-decode kernels carry no
+/// def-levels, so dropping a range predicate on a nullable column
+/// could leak NULLs that SQL range semantics reject); (2) preserves
+/// the `FilterExec`'s projection by leaving a `ProjectionExec` in
+/// place (the spike returned the bare scan, which silently widened
+/// the output schema when the FilterExec projected filter-only
+/// columns away — Q15's FilterExec drops `l_shipdate`).
+///
+/// Conservative: only fuses when EVERY conjunct is covered by an
+/// `is_exact_safe()` + null-free BridgeFilter predicate (full drop).
+/// A leftover conjunct (e.g. an F64 range, or a nullable column)
+/// leaves the whole FilterExec untouched — never a partial drop,
+/// so there is no residual-vs-dropped double-count to reason about.
+pub fn fuse_redundant_bridge_filters(
+    plan: Arc<dyn ExecutionPlan>,
+) -> DfResult<Arc<dyn ExecutionPlan>> {
+    let trace = std::env::var_os("EMAT_CSE_FILTER_FUSION_TRACE").is_some();
+    let out = plan.transform_up(|node| {
+        let Some(filter) = node.as_any().downcast_ref::<FilterExec>() else {
+            return Ok(Transformed::no(node));
+        };
+        let input = filter.input();
+        // Look through transparent single-child wrappers (CooperativeExec from
+        // EnsureCooperative, CoalesceBatchesExec) that may sit between the
+        // FilterExec and the scan depending on physical-rule ordering. They
+        // preserve schema + row count, so the FilterExec's projection indices
+        // still address the scan's output columns.
+        let Some((scan_node, wrappers)) = peel_to_emat_scan(input) else {
+            return Ok(Transformed::no(node));
+        };
+        let scan = scan_node
+            .as_any()
+            .downcast_ref::<EmatixFastParquetExec>()
+            .expect("peel_to_emat_scan guarantees an EmatixFastParquetExec");
+        let Some(bridge) = scan.filter() else {
+            return Ok(Transformed::no(node));
+        };
+        let conjuncts: Vec<Arc<dyn PhysicalExpr>> = split_conjunction(filter.predicate())
+            .into_iter()
+            .cloned()
+            .collect();
+        if conjuncts.is_empty() {
+            return Ok(Transformed::no(node));
+        }
+        // Every conjunct must be covered by an exact-safe bridge predicate
+        // on a NULL-FREE column, else bail (no partial drop). The null-free
+        // requirement is load-bearing: the fused path drops the residual
+        // FilterExec that would otherwise re-reject NULLs the masked-decode
+        // kernels (no def-levels) could leak. `column_has_no_nulls` is
+        // file-schema-indexed, matching the predicate's `col_idx`.
+        let no_nulls = scan.column_has_no_nulls();
+        let all_covered = conjuncts.iter().all(|c| {
+            matches!(
+                match_against_bridge(c, bridge, scan),
+                Some(p) if p.is_exact_safe()
+                    && no_nulls.get(p.col_idx()).copied().unwrap_or(false)
+            )
+        });
+        if !all_covered {
             if trace {
                 eprintln!(
-                    "[Σ.AE] dropped={dropped} leftover={} bridge_preds={}",
-                    leftover.len(),
-                    bridge.predicates().len(),
+                    "[PV.M.7] skip: not-all-covered conjuncts={} bridge_preds={}",
+                    conjuncts.len(),
+                    bridge.predicates().len()
                 );
             }
-            // All conjuncts were redundant → drop FilterExec entirely.
-            if leftover.is_empty() {
-                return Ok(Transformed::yes(input.clone()));
+            return Ok(Transformed::no(node));
+        }
+        // Full drop. THE WIN is pruning the filter-only column out of the
+        // scan's DECODE projection (so the predicate column is decoded once
+        // for the bitmap, not a second time to materialise it through the
+        // scan's output) — NOT merely dropping the FilterExec. Rebuild the
+        // scan via `try_new` with its output narrowed to exactly the
+        // FilterExec's kept columns; the BridgeFilter keeps referencing the
+        // now-unprojected predicate column, which the decode path reads for
+        // the bitmap only (the EXACT-pushdown shape).
+        let result: Arc<dyn ExecutionPlan> = match filter.projection().as_ref() {
+            // v1 declines scans carrying a runtime sideband (L9 resolves it
+            // on first poll); CSE'd revenue subtrees don't have one.
+            Some(proj) if scan.runtime_sideband().is_none() => {
+                let keep: Vec<usize> = proj.to_vec(); // output indices into scan schema
+                let new_projection: Vec<usize> =
+                    keep.iter().map(|&j| scan.projection()[j]).collect();
+                let new_schema = Arc::new(input.schema().project(&keep)?);
+                let new_decode = Arc::new(scan.decode_schema_ref().project(&keep)?);
+                let new_stats: Vec<_> = keep
+                    .iter()
+                    .map(|&j| scan.column_stats()[j].clone())
+                    .collect();
+                let pruned = EmatixFastParquetExec::try_new(
+                    scan.path().to_string(),
+                    new_schema,
+                    new_decode,
+                    scan.file_schema().clone(),
+                    new_projection,
+                    scan.assignments().to_vec(),
+                    scan.num_rows(),
+                    scan.rg_num_rows_arc().clone(),
+                    scan.filter().cloned(),
+                    scan.exec_late_mat(),
+                    scan.exec_streaming_arrow_reader(),
+                    new_stats,
+                    Arc::new(scan.column_has_no_nulls().to_vec()),
+                )?;
+                // Re-apply the transparent wrappers over the pruned scan.
+                rewrap_transparent(Arc::new(pruned), &wrappers)?
             }
-            // Partial drop: rebuild FilterExec with the remaining
-            // conjuncts.
-            let new_pred = conjunction(leftover);
-            let new_filter = FilterExec::try_new(new_pred, input.clone())?;
-            Ok(Transformed::yes(
-                Arc::new(new_filter) as Arc<dyn ExecutionPlan>
-            ))
-        })?;
-        Ok(transformed.data)
+            // Sideband present (rare here) — keep the safe ProjectionExec
+            // fallback: drops the FilterExec but not the double-decompress.
+            Some(proj) => {
+                let child_schema = input.schema();
+                let exprs: Vec<(Arc<dyn PhysicalExpr>, String)> = proj
+                    .iter()
+                    .map(|p| {
+                        let f = child_schema.field(*p);
+                        (
+                            Arc::new(Column::new(f.name(), *p)) as Arc<dyn PhysicalExpr>,
+                            f.name().to_string(),
+                        )
+                    })
+                    .collect();
+                Arc::new(ProjectionExec::try_new(exprs, input.clone())?)
+            }
+            // No projection: scan already outputs exactly what's needed.
+            None => input.clone(),
+        };
+        PV_M7_FUSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if trace {
+            let pruned = scan.runtime_sideband().is_none() && filter.projection().is_some();
+            eprintln!(
+                "[PV.M.7] FUSED: dropped FilterExec ({} conjuncts) → {}",
+                conjuncts.len(),
+                if pruned {
+                    "projection-pruned masked scan"
+                } else if filter.projection().is_some() {
+                    "masked scan + ProjectionExec (sideband fallback)"
+                } else {
+                    "masked scan"
+                }
+            );
+        }
+        Ok(Transformed::yes(result))
+    })?;
+    Ok(out.data)
+}
+
+/// Peel transparent single-child wrappers (`CooperativeExec` from
+/// `EnsureCooperative`, `CoalesceBatchesExec`) off `input` to reach the
+/// `EmatixFastParquetExec`. Returns the scan node plus the wrappers
+/// (top-to-bottom) to re-apply over a rewritten scan. Both wrappers preserve
+/// schema + row count, so looking through them is safe and the FilterExec's
+/// projection indices still address the scan's output columns.
+#[allow(clippy::type_complexity)]
+fn peel_to_emat_scan(
+    input: &Arc<dyn ExecutionPlan>,
+) -> Option<(Arc<dyn ExecutionPlan>, Vec<Arc<dyn ExecutionPlan>>)> {
+    let mut wrappers: Vec<Arc<dyn ExecutionPlan>> = Vec::new();
+    let mut cur = input.clone();
+    loop {
+        if cur
+            .as_any()
+            .downcast_ref::<EmatixFastParquetExec>()
+            .is_some()
+        {
+            return Some((cur, wrappers));
+        }
+        let transparent = matches!(cur.name(), "CooperativeExec" | "CoalesceBatchesExec");
+        if transparent && cur.children().len() == 1 {
+            let child = cur.children()[0].clone();
+            wrappers.push(cur);
+            cur = child;
+        } else {
+            return None;
+        }
     }
+}
+
+/// Re-apply `wrappers` (outermost-first) over `inner` via `with_new_children`.
+fn rewrap_transparent(
+    inner: Arc<dyn ExecutionPlan>,
+    wrappers: &[Arc<dyn ExecutionPlan>],
+) -> DfResult<Arc<dyn ExecutionPlan>> {
+    let mut cur = inner;
+    for w in wrappers.iter().rev() {
+        cur = Arc::clone(w).with_new_children(vec![cur])?;
+    }
+    Ok(cur)
 }
 
 /// Try to recognize `physical_expr` as a known `ColumnPredicate`
@@ -339,5 +495,114 @@ fn literal_str_eq(literal: &ScalarValue, target: &str) -> bool {
         | ScalarValue::Utf8View(Some(s))
         | ScalarValue::LargeUtf8(Some(s)) => s == target,
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod pv_m7_tests {
+    use super::*;
+    use crate::ematix_fast_parquet::EmatixFastParquetTableProvider;
+    use datafusion::arrow::array::{Array, Float64Array};
+    use datafusion::execution::session_state::SessionStateBuilder;
+    use datafusion::physical_plan::{collect, displayable};
+    use datafusion::prelude::{SessionConfig, SessionContext};
+    use std::path::PathBuf;
+
+    fn sf1_lineitem() -> Option<PathBuf> {
+        let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let p = manifest
+            .parent()
+            .and_then(|p| p.parent())
+            .map(|p| p.join("examples/tpch/data/sf1/lineitem.parquet"))?;
+        p.exists().then_some(p)
+    }
+
+    fn ptext(p: &Arc<dyn ExecutionPlan>) -> String {
+        format!("{}", displayable(p.as_ref()).indent(true))
+    }
+
+    async fn sum_col0(plan: Arc<dyn ExecutionPlan>, ctx: &SessionContext) -> f64 {
+        let batches = collect(plan, ctx.task_ctx()).await.unwrap();
+        let mut s = 0.0f64;
+        for b in &batches {
+            let c = b.column(0).as_any().downcast_ref::<Float64Array>().unwrap();
+            for i in 0..c.len() {
+                if c.is_valid(i) {
+                    s += c.value(i);
+                }
+            }
+        }
+        s
+    }
+
+    /// PV.M.7 — the helper drops a fully-covered i32-range FilterExec and
+    /// rebuilds the scan with the filter-only column pruned from the decode
+    /// projection (output narrows from 3 → 2 cols), with a byte-identical sum.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn fuses_i32_range_filter_into_pruned_scan() {
+        let Some(path) = sf1_lineitem() else {
+            eprintln!("PV.M.7 test skipped: examples/tpch/data/sf1/lineitem.parquet absent");
+            return;
+        };
+        let state = SessionStateBuilder::new()
+            .with_config(SessionConfig::new().with_target_partitions(4))
+            .with_default_features()
+            .build();
+        let ctx = SessionContext::new_with_state(state);
+        ctx.register_table(
+            "lineitem",
+            Arc::new(EmatixFastParquetTableProvider::try_new(path.to_string_lossy()).unwrap()),
+        )
+        .unwrap();
+        let plan = ctx
+            .sql(
+                "SELECT l_extendedprice, l_discount FROM lineitem \
+                 WHERE l_shipdate >= DATE '1996-01-01' AND l_shipdate < DATE '1996-04-01'",
+            )
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+
+        // Precondition: an Inexact FilterExec sits over the Ematix scan.
+        assert!(
+            ptext(&plan).contains("FilterExec"),
+            "expected a FilterExec to fuse:\n{}",
+            ptext(&plan)
+        );
+        let before = sum_col0(plan.clone(), &ctx).await;
+
+        let fused = fuse_redundant_bridge_filters(plan).unwrap();
+        let txt = ptext(&fused);
+        assert!(
+            !txt.contains("FilterExec"),
+            "FilterExec must be dropped:\n{txt}"
+        );
+        assert!(
+            txt.contains("EmatixFastParquetExec"),
+            "the scan must remain:\n{txt}"
+        );
+        // Filter-only l_shipdate pruned from the scan's decode projection →
+        // output is exactly [l_extendedprice, l_discount].
+        assert_eq!(
+            fused.schema().fields().len(),
+            2,
+            "output must narrow to [extprice, discount]:\n{txt}"
+        );
+
+        // Correctness: same SUM value (no rows gained/lost, no NULL leak).
+        // Relative-epsilon, not byte-identical: the original (FilterExec) and
+        // fused (pruned-scan) plans legitimately emit survivors in a different
+        // partition/batch order, so the f64 accumulation differs in the low
+        // bits. Production Q15 IS byte-identical because it carries the
+        // DedupeAggregateForFloatDeterminism sort-then-sum wrapper; this raw
+        // standalone sum does not, so the order is free.
+        let after = sum_col0(fused, &ctx).await;
+        let rel = (before - after).abs() / before.abs().max(1.0);
+        assert!(
+            rel < 1e-9,
+            "fusion changed the result beyond float-order noise: {before} vs {after} (rel {rel:.2e})"
+        );
     }
 }

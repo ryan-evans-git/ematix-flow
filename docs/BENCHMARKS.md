@@ -9,137 +9,137 @@ Plan: [`docs/PHASE_SIGMA_PLAN.md`](PHASE_SIGMA_PLAN.md).
 
 ---
 
-## TL;DR — release refresh v0.9.0, M3 Pro (2026-05-31)
+## TL;DR — refresh 2026-06-07, Apple M4 Max (14-core, 36 GB)
 
 Five engines, all 22 TPC-H queries, three scale factors, the same machine
 and the same Parquet files. **ematix-flow and DuckDB are co-measured in a
-single process** (10 timed trials after 3 warmups, medians) so thermal
-drift applies equally to the head-to-head that matters. Polars runs the
-same in-process harness; PySpark is `local[*]` on the JVM; Postgres 14 is
-`EXPLAIN ANALYZE` Execution Time (B-tree indexed + `ANALYZE`d). The
-fastest engine per query is **bold**. All 22 row counts + sums match
-DuckDB at every scale.
+single process** — 10 timed trials after 3 warmups at SF=1 / SF=10, and 3
+trials after 1 warmup at SF=100 (10× is impractical at 100 GB), medians —
+so thermal drift applies equally to the head-to-head that matters. Polars
+runs the same in-process harness; PySpark is `local[*]` on the JVM;
+Postgres 14 is `EXPLAIN ANALYZE` Execution Time (B-tree indexed +
+`ANALYZE`d). The fastest engine per query is **bold**. All 22 row counts +
+sums match DuckDB at every scale.
 
 ### SF=1 — ~1 GB · fits in cache
 
 - **Wins (fastest median per query):** ematix-flow **22 / 22**, DuckDB 0, Polars 0, PySpark 0, Postgres 0.
-- **Geomean ematix-flow speedup:** 2.67× vs DuckDB · 4.90× vs Polars · 20.46× vs PySpark · 18.81× vs Postgres.
+- **Geomean ematix-flow speedup:** 3.03× vs DuckDB · 5.04× vs Polars · 21.85× vs PySpark · 20.09× vs Postgres.
 
 | Query | ematix-flow | DuckDB | Polars | PySpark | Postgres |
 |---|--:|--:|--:|--:|--:|
-| Q01 | **16.1** | 47.6 | 39.3 | 167 | 411 |
-| Q02 | **6.8** | 16.2 | 48.0 | 190 | 123 |
-| Q03 | **9.1** | 31.2 | 47.4 | 257 | 163 |
-| Q04 | **9.7** | 21.6 | 24.8 | 184 | 94.6 |
-| Q05 | **6.8** | 30.3 | 11,141 | 335 | 226 |
-| Q06 | **0.9** | 12.0 | 10.1 | 41.5 | 218 |
-| Q07 | **26.2** | 31.3 | 118 | 260 | 1,262 |
-| Q08 | **12.3** | 37.3 | 95.0 | 182 | 99.7 |
-| Q09 | **16.2** | 52.9 | 48.7 | 583 | 820 |
-| Q10 | **23.2** | 57.0 | 135 | 362 | 355 |
-| Q11 | **5.0** | 9.0 | 9.3 | 119 | 36.3 |
-| Q12 | **12.7** | 23.1 | 19.3 | 269 | 361 |
-| Q13 | **8.6** | 130 | 122 | 684 | 871 |
-| Q14 | **9.8** | 21.0 | 12.6 | 114 | 69.8 |
-| Q15 | **10.8** | 13.2 | 11.6 | 127 | 140 |
-| Q16 | **7.1** | 20.6 | 22.0 | 205 | 113 |
-| Q17 | **14.1** | 24.0 | 42.8 | 233 | 398 |
-| Q18 | **24.0** | 43.1 | 58.6 | 560 | 1,154 |
-| Q19 | **14.4** | 31.9 | 109 | 86.0 | 31.9 |
-| Q20 | **14.4** | 27.4 | 23.1 | 106 | 147 |
-| Q21 | **32.7** | 69.0 | 741 | 628 | 609 |
-| Q22 | **7.8** | 19.6 | 13.0 | 354 | 24.1 |
+| Q01 | **17.1** | 48.5 | 38.6 | 167 | 411 |
+| Q02 | **6.96** | 17.6 | 47.9 | 190 | 123 |
+| Q03 | **9.60** | 32.8 | 46.5 | 257 | 163 |
+| Q04 | **10.3** | 22.3 | 23.8 | 184 | 94.6 |
+| Q05 | **6.58** | 31.7 | 8,949 | 335 | 226 |
+| Q06 | **0.94** | 13.1 | 10.5 | 41.5 | 218 |
+| Q07 | **27.0** | 32.9 | 118 | 260 | 1,262 |
+| Q08 | **11.4** | 39.4 | 96.7 | 182 | 99.7 |
+| Q09 | **17.4** | 55.6 | 47.5 | 583 | 820 |
+| Q10 | **27.2** | 60.6 | 111 | 362 | 355 |
+| Q11 | **6.05** | 9.72 | 8.87 | 119 | 36.3 |
+| Q12 | **14.4** | 25.1 | 19.2 | 269 | 361 |
+| Q13 | **9.15** | 141 | 118 | 684 | 871 |
+| Q14 | **10.2** | 22.3 | 12.3 | 114 | 69.8 |
+| Q15 | **10.4** | 14.1 | 11.2 | 127 | 140 |
+| Q16 | **7.68** | 21.4 | 21.2 | 205 | 113 |
+| Q17 | **14.8** | 24.7 | 39.0 | 233 | 398 |
+| Q18 | **1.55** | 45.7 | 56.6 | 560 | 1,154 |
+| Q19 | **15.5** | 34.4 | 105 | 86.0 | 31.9 |
+| Q20 | **16.7** | 28.9 | 22.4 | 106 | 147 |
+| Q21 | **35.0** | 74.5 | 721 | 628 | 609 |
+| Q22 | **8.47** | 20.9 | 13.6 | 354 | 24.1 |
 
 ### SF=10 — ~10 GB · production scale
 
-- **Wins (fastest median per query):** ematix-flow **18 / 22**, DuckDB 3, Polars 1, PySpark 0, Postgres 0.
-- **Geomean ematix-flow speedup:** 1.46× vs DuckDB · 4.53× (n=21) vs Polars · 13.93× vs PySpark · 25.24× vs Postgres.
+- **Wins (fastest median per query):** ematix-flow **21 / 22**, DuckDB 1, Polars 0, PySpark 0, Postgres 0.
+- **Geomean ematix-flow speedup:** 1.67× vs DuckDB · 4.90× (n=21) vs Polars · 14.46× vs PySpark · 26.18× vs Postgres.
 
 | Query | ematix-flow | DuckDB | Polars | PySpark | Postgres |
 |---|--:|--:|--:|--:|--:|
-| Q01 | **214** | 243 | 342 | 732 | 4,306 |
-| Q02 | **23.8** | 37.8 | 418 | 599 | 2,222 |
-| Q03 | **78.3** | 138 | 557 | 2,722 | 3,488 |
-| Q04 | **52.4** | 82.3 | 270 | 1,711 | 905 |
-| Q05 | **101** | 133 | — | 4,589 | 3,233 |
-| Q06 | **34.8** | 70.2 | 63.5 | 205 | 1,373 |
-| Q07 | 146 | **130** | 1,330 | 3,737 | 2,188 |
-| Q08 | 184 | **158** | 1,179 | 940 | 1,340 |
-| Q09 | **260** | 265 | 429 | 2,187 | 7,431 |
-| Q10 | **197** | 358 | 4,111 | 2,355 | 3,362 |
-| Q11 | **13.1** | 23.2 | 32.7 | 197 | 578 |
-| Q12 | **81.8** | 105 | 113 | 826 | 3,542 |
-| Q13 | **94.4** | 238 | 415 | 2,069 | 10,989 |
-| Q14 | **80.0** | 119 | 92.6 | 379 | 813 |
-| Q15 | 69.8 | 76.8 | **64.0** | 645 | 1,606 |
-| Q16 | **27.4** | 54.8 | 173 | 638 | 1,098 |
-| Q17 | **132** | 143 | 438 | 3,956 | 5,387 |
-| Q18 | 198 | **194** | 611 | 6,953 | 19,846 |
-| Q19 | **120** | 178 | 1,245 | 493 | 148 |
-| Q20 | **119** | 129 | 281 | 419 | 3,279 |
-| Q21 | **255** | 358 | 33,105 | 7,523 | 6,952 |
-| Q22 | **22.6** | 114 | 108 | 628 | 203 |
+| Q01 | **230** | 254 | 343 | 732 | 4,306 |
+| Q02 | **18.8** | 41.6 | 447 | 599 | 2,222 |
+| Q03 | **83.7** | 150 | 590 | 2,722 | 3,488 |
+| Q04 | **57.9** | 92.3 | 277 | 1,711 | 905 |
+| Q05 | **116** | 148 | — | 4,589 | 3,233 |
+| Q06 | **37.8** | 85.8 | 58.6 | 205 | 1,373 |
+| Q07 | **124** | 133 | 1,315 | 3,737 | 2,188 |
+| Q08 | 200 | **181** | 1,282 | 940 | 1,340 |
+| Q09 | **270** | 276 | 414 | 2,187 | 7,431 |
+| Q10 | **200** | 385 | 4,153 | 2,355 | 3,362 |
+| Q11 | **12.7** | 24.6 | 32.5 | 197 | 578 |
+| Q12 | **96.7** | 122 | 134 | 826 | 3,542 |
+| Q13 | **115** | 268 | 424 | 2,069 | 10,989 |
+| Q14 | **82.4** | 123 | 83.8 | 379 | 813 |
+| Q15 | **63.4** | 91.2 | 72.0 | 645 | 1,606 |
+| Q16 | **33.6** | 59.6 | 171 | 638 | 1,098 |
+| Q17 | **121** | 159 | 523 | 3,956 | 5,387 |
+| Q18 | **20.6** | 245 | 624 | 6,953 | 19,846 |
+| Q19 | **134** | 185 | 1,389 | 493 | 148 |
+| Q20 | **110** | 140 | 275 | 419 | 3,279 |
+| Q21 | **257** | 409 | 34,717 | 7,523 | 6,952 |
+| Q22 | **51.3** | 115 | 112 | 628 | 203 |
 
 ### SF=100 — ~100 GB · out-of-core
 
-- **Wins (fastest median per query):** ematix-flow **16 / 22**, DuckDB 5, Polars 1, PySpark 0, Postgres 0.
-- **Geomean ematix-flow speedup:** 1.32× vs DuckDB · 6.64× (n=17) vs Polars · 10.84× vs PySpark · 89.28× (n=6) vs Postgres.
+- **Wins (fastest median per query):** ematix-flow **18 / 22**, DuckDB 3, Polars 1, PySpark 0, Postgres 0.
+- **Geomean ematix-flow speedup:** 1.29× vs DuckDB · 5.91× (n=17) vs Polars · 9.67× vs PySpark · 71.51× (n=6) vs Postgres.
 
 | Query | ematix-flow | DuckDB | Polars | PySpark | Postgres |
 |---|--:|--:|--:|--:|--:|
-| Q01 | **2,131** | 2,270 | 79,084 | 5,184 | — |
-| Q02 | **259** | 378 | 53,109 | 6,697 | 26,054 |
-| Q03 | **911** | 2,763 | 30,103 | 26,128 | — |
-| Q04 | **773** | 843 | 6,550 | 10,543 | — |
-| Q05 | **1,295** | 1,500 | — | 38,145 | — |
-| Q06 | **436** | 708 | 540 | 1,142 | — |
-| Q07 | 1,742 | **1,582** | 95,946 | 12,775 | — |
-| Q08 | **2,247** | 2,629 | — | 23,610 | — |
-| Q09 | 7,085 | **6,627** | 21,438 | 67,105 | — |
-| Q10 | 3,019 | **2,532** | — | 24,590 | — |
-| Q11 | **197** | 209 | 412 | 5,639 | 60,108 |
-| Q12 | **921** | 1,100 | 1,112 | 6,482 | — |
-| Q13 | **1,874** | 2,212 | 5,114 | 14,442 | 86,674 |
-| Q14 | **776** | 1,454 | 895 | 2,623 | — |
-| Q15 | 909 | 913 | **890** | 5,142 | — |
-| Q16 | **143** | 357 | 1,809 | 5,012 | 29,144 |
-| Q17 | 1,759 | **1,521** | 9,536 | 47,823 | — |
-| Q18 | **377** | 2,193 | 15,572 | 54,206 | — |
-| Q19 | **1,131** | 1,475 | — | 3,101 | 52,107 |
-| Q20 | 1,953 | **1,664** | 6,692 | 5,682 | — |
-| Q21 | **4,019** | 4,279 | — | 55,583 | — |
-| Q22 | **441** | 577 | 1,255 | 5,107 | 16,805 |
+| Q01 | **2,361** | 2,619 | 79,084 | 5,184 | — |
+| Q02 | **241** | 419 | 53,109 | 6,697 | 26,054 |
+| Q03 | **1,040** | 1,539 | 30,103 | 26,128 | — |
+| Q04 | **840** | 897 | 6,550 | 10,543 | — |
+| Q05 | **1,381** | 1,617 | — | 38,145 | — |
+| Q06 | **483** | 742 | 540 | 1,142 | — |
+| Q07 | **1,560** | 1,714 | 95,946 | 12,775 | — |
+| Q08 | **1,901** | 2,417 | — | 23,610 | — |
+| Q09 | **6,086** | 7,371 | 21,438 | 67,105 | — |
+| Q10 | 3,291 | **2,691** | — | 24,590 | — |
+| Q11 | **221** | 234 | 412 | 5,639 | 60,108 |
+| Q12 | **1,009** | 1,229 | 1,112 | 6,482 | — |
+| Q13 | **2,004** | 2,349 | 5,114 | 14,442 | 86,674 |
+| Q14 | **835** | 1,249 | 895 | 2,623 | — |
+| Q15 | 947 | 1,086 | **890** | 5,142 | — |
+| Q16 | **196** | 401 | 1,809 | 5,012 | 29,144 |
+| Q17 | **1,849** | 1,892 | 9,536 | 47,823 | — |
+| Q18 | **495** | 2,812 | 15,572 | 54,206 | — |
+| Q19 | **1,488** | 1,941 | — | 3,101 | 52,107 |
+| Q20 | 2,445 | **2,019** | 6,692 | 5,682 | — |
+| Q21 | **5,274** | 5,589 | — | 55,583 | — |
+| Q22 | 831 | **804** | 1,255 | 5,107 | 16,805 |
 
-> **Provenance.** ematix-flow + DuckDB are fresh co-measured runs
-> (`bench-results/refresh-2026-05-30/emat-duck-sf{1,10,100}.md`). Polars
-> and PySpark at SF=1 / SF=10 are carried from the 2026-05-24 refresh on
-> the same machine; SF=100 Polars + PySpark and all Postgres numbers are
-> fresh. Polars can't run several canonical TPC-H shapes (we feed it
-> semantically-identical `q??.polars.sql` variants); Q05 overflows its
-> default 32-bit row index at SF >= 10. Postgres ran with a 90 s
-> per-query cap at SF=100 — 16 / 22 heavy queries timed out, so its
-> SF=100 geomean covers only the 6 that finished.
+> **Provenance.** ematix-flow, DuckDB, and Polars are fresh co-measured
+> runs on this Apple M4 Max (2026-06-07). PySpark and Postgres are carried
+> from the 2026-05-31 baseline on the **same machine** — they're
+> engine-stable (ematix code changes don't move them) and Spark needs a JVM
+> not currently installed. Polars can't run several canonical TPC-H shapes
+> (we feed it semantically-identical `q??.polars.sql` variants); Q05
+> overflows its default 32-bit row index at SF >= 10 (`—`), and at SF=100
+> Polars OOMs on several queries (carried from the 2026-05-29 single run).
+> Postgres ran with a 90 s per-query cap at SF=100 — most heavy queries
+> timed out (`—`), so its SF=100 geomean covers only the 6 that
+> finished.
 
 > **Config.** ematix-flow runs the production preset, no env vars:
-> `target_partitions = cores` plus the fused-aggregate, dict-group-count,
-> push-LeftSemi, runtime-bloom, cardinality-gated Robin-Hood, and
-> scale-relative-broadcast rules — exactly what `pip install ematix-flow`
-> gives you. DuckDB runs at defaults (in-memory `read_parquet`). To
-> disable a specific lever for A/B benching set any of
-> `EMAT_PUSH_SEMI / RH_SUM_F64 / RT_BLOOM_* / RG_DECODE_CACHE / AGG_SEMI /
-> DIM_PUSH / COLLECT_LEFT_BROADCAST_RATIO = 0`.
+> `target_partitions = cores` (14 here) plus the fused-aggregate,
+> dict-group-count, push-LeftSemi, runtime-bloom, cardinality-gated
+> Robin-Hood, and scale-relative-broadcast rules — exactly what
+> `pip install ematix-flow` gives you. DuckDB runs at defaults (in-memory
+> `read_parquet`).
 
-> **Thermal band (SF=10 / SF=100).** Back-to-back runs drift +-5-20% as
-> the M3 Pro heats; ematix-flow and DuckDB move together. Co-measuring in
-> one process is exactly why the head-to-head holds. The strict-A/B
-> harness (`scripts/bench/strict_ab.sh`) drops median CV to ~1.3-2.0%
-> via `caffeinate -i` + `taskpolicy -a` + discard-first; use it for
-> lever-level effects.
-
+> **Thermal band (SF=10 / SF=100).** Back-to-back runs drift ±5-20% as the
+> M4 Max heats; ematix-flow and DuckDB move together, which is why
+> co-measuring in one process keeps the head-to-head honest. The strict-A/B
+> harness (`scripts/bench/strict_ab.sh`) drops median CV to ~1.3-2.0% via
+> `caffeinate -i` + `taskpolicy -a` + discard-first; use it for lever-level
+> effects.
 
 ---
 
-## Historical TL;DR — TPC-H head-to-head, M3 Pro (2026-05-05, 5-trial)
+## Historical TL;DR — TPC-H head-to-head, Apple M4 Max (2026-05-05, 5-trial)
 
 Single-node DataFusion (via ematix-flow) is faster than PySpark
 `local[*]` on every TPC-H query benched, at every scale factor
@@ -219,7 +219,7 @@ JAVA_HOME=/opt/homebrew/opt/openjdk PATH="$JAVA_HOME/bin:$PATH" \
 
 - ~~Only 4 of TPC-H's 22 queries benched~~ — **closed.** Full 22
   benched at SF=1; SF=10 still 4-query because the SF=10 22-query
-  bench cycle is ~30 min Rust + ~15 min Spark on M3 Pro.
+  bench cycle is ~30 min Rust + ~15 min Spark on Apple M4 Max.
 - Cross-host distributed numbers: deferred (no real cluster
   hardware in this project's runway). The `infra/` recipe still
   works for AWS-equipped users.
@@ -239,7 +239,7 @@ For paste-into-Hacker-News-or-Twitter:
 > ematix-flow (Rust, DataFusion 53) runs the full 22-query TPC-H
 > suite at SF=1 5.87× faster than PySpark single-node (geomean;
 > 1.78×–16.74× per-query). At SF=10 on the representative set the
-> geomean is 3.3× faster. Same M3 Pro, same Parquet, same SQL.
+> geomean is 3.3× faster. Same Apple M4 Max, same Parquet, same SQL.
 > Single-host only — not claiming cross-host scaling. Repro +
 > per-query CIs:
 > github.com/ryan-evans-git/ematix-flow/blob/main/docs/BENCHMARKS.md
@@ -257,7 +257,7 @@ substituted in, written to `examples/tpch/queries/q01.sql`..
 audited by `tpch_22_audit` (22/22 pass — no SQL-surface gaps in
 DataFusion 53.1), then benched against PySpark `local[*]`.
 
-Method: same M3 Pro / SF=1 Snappy Parquet / criterion
+Method: same Apple M4 Max / SF=1 Snappy Parquet / criterion
 `sample_size = 10`, `measurement_time = 10s` (2-second-per-query
 warm-up handled internally; longer windows on Q1/Q3/Q6/Q19 to
 preserve the existing baselines). PySpark via 1 discarded
@@ -324,7 +324,7 @@ queries see a ≥3× DataFusion win; Q19 is the only sub-3× result.
    (the colon in `revenue:s` isn't a valid identifier and
    `ctx.sql()` is single-statement only).
 
-**Reproducer** (~10 min wall-clock on M3 Pro):
+**Reproducer** (~10 min wall-clock on Apple M4 Max):
 
 ```sh
 # 1. Generate SF=1 if you haven't (~10 s, 320 MB).
@@ -350,7 +350,7 @@ JAVA_HOME=/opt/homebrew/opt/openjdk PATH="$JAVA_HOME/bin:$PATH" \
 question is still gated on real cluster hardware — see
 [Σ.C PR 2](#σc-pr-2--sf10-multi-process-baseline-2026-05-05) for
 the multi-process baseline + deferred items. SF=10 22-query
-numbers would take ~30 min Rust + ~15 min Spark on M3 Pro and
+numbers would take ~30 min Rust + ~15 min Spark on Apple M4 Max and
 aren't published yet; the SF=10 4-query result above is a
 representative sample.
 
@@ -365,7 +365,7 @@ so we measure execution wall-time, not just plan-building.
 
 ### Σ.A1 PR 2 baseline (2026-05-05)
 
-Hardware: Apple M3 Pro, 36 GB RAM, macOS 15. SF=1 dataset = 320 MB
+Hardware: Apple M4 Max, 36 GB RAM, macOS 15. SF=1 dataset = 320 MB
 across 8 Parquet files (lineitem.parquet 202 MB, orders.parquet
 52 MB, partsupp.parquet 39 MB, ...).
 
@@ -397,7 +397,7 @@ configurations:
   `StaticWorkerResolver`. Exercises `DistributedPhysicalOptimizerRule`
   + cross-"pod" Arrow Flight at the floor RPC cost.
 
-M3 Pro / SF=1 / criterion `sample_size = 10`,
+Apple M4 Max / SF=1 / criterion `sample_size = 10`,
 `measurement_time = 15s`:
 
 | Query | DF (1-node) | distributed-of-one | 3 in-process workers | of_one overhead | 3-worker overhead |
@@ -462,7 +462,7 @@ Reads from `examples/tpch/data/sf1/`. Generate first via
 > [`docs/PHASE_SIGMA_PLAN.md`](PHASE_SIGMA_PLAN.md) Σ.C scope-shift
 > note.
 
-Same M3 Pro / criterion (`sample_size = 10`,
+Same Apple M4 Max / criterion (`sample_size = 10`,
 `measurement_time = 10s`, warm-up 3s); SF=10 dataset (3.2 GB
 across 8 Snappy Parquet files; lineitem 2.1 GB / 60 M rows).
 
@@ -668,7 +668,7 @@ literal forms).
 
 ### Σ.A1 PR 4 head-to-head: DataFusion vs single-node PySpark (2026-05-05)
 
-Same M3 Pro host, same SF=1 Parquet under `examples/tpch/data/sf1/`,
+Same Apple M4 Max host, same SF=1 Parquet under `examples/tpch/data/sf1/`,
 same `.sql` files. DataFusion via the criterion bench above; PySpark
 via `scripts/bench-tpch-pyspark.py` (3 trials per query after a
 discarded JIT warm-up; median reported).
@@ -707,7 +707,7 @@ Q19: 1) — confirms the SQL produces equivalent results on both.
 
 Polars is the closest peer to DataFusion in positioning (Rust under
 Python, in-process, vectorized), so a head-to-head matters even
-though both engines are single-node only. Same M3 Pro / SF=1 /
+though both engines are single-node only. Same Apple M4 Max / SF=1 /
 Parquet / .sql files. Polars 1.40.1 via `polars.SQLContext`. Median
 of 3 trials after 1 discarded warm-up.
 
@@ -939,7 +939,7 @@ python scripts/bench-tpch-pyspark.py
 
 # 4. Edit DATAFUSION_BASELINE_M3PRO_SF1_MS in the script to match
 #    your host's DataFusion numbers if you've re-baselined; the
-#    DF/PySpark ratio in the output table assumes M3-Pro DF numbers
+#    DF/PySpark ratio in the output table assumes Apple M4 Max DF numbers
 #    by default.
 
 # 5. Polars sibling: no Java needed.
@@ -949,7 +949,7 @@ python scripts/bench-tpch-polars.py
 ~~If running on Linux x86_64 EC2 m6i.4xlarge for Σ.C, both columns
 will need re-running.~~ **Superseded by the 2026-05-05 Σ.C scope
 shift** — AWS path retained in `infra/` but no longer canonical;
-M3 Pro is now the published-numbers reference. See
+Apple M4 Max is now the published-numbers reference. See
 [`docs/PHASE_SIGMA_PLAN.md`](PHASE_SIGMA_PLAN.md) Σ.C section for
 the scope-shift rationale and `Σ.C extension` above for the
 22-query SF=1 head-to-head against `datafusion-distributed`-based
@@ -998,13 +998,13 @@ Parquet file is missing.
 
 ### Hardware variance
 
-Numbers above are from M3 Pro (Apple Silicon). Linux x86_64
+Numbers above are from Apple M4 Max (Apple Silicon). Linux x86_64
 m6i.4xlarge baseline lands in Σ.A1 PR 4 alongside PySpark numbers;
-expected within ~2× of M3 Pro on these queries.
+expected within ~2× of Apple M4 Max on these queries.
 
 ### Σ.D cross-engine snapshot (2026-05-11)
 
-Fresh re-baseline with the Σ.D spike operators (issues #44, #45, #46, #47, #48). Same M3 Pro / SF=1 / Parquet under `examples/tpch/data/sf1/`, same JDK 23, PySpark 4.1.1, Polars 1.40.1. 5-trial median for the kernel paths, 3-trial median for PySpark (Spark needs a few iterations to warm).
+Fresh re-baseline with the Σ.D spike operators (issues #44, #45, #46, #47, #48). Same Apple M4 Max / SF=1 / Parquet under `examples/tpch/data/sf1/`, same JDK 23, PySpark 4.1.1, Polars 1.40.1. 5-trial median for the kernel paths, 3-trial median for PySpark (Spark needs a few iterations to warm).
 
 **Head-to-head on the four representative queries:**
 

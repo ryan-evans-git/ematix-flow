@@ -12,6 +12,15 @@ description = "Rust core for ematix-flow: declarative table management + load st
 name = "ematix_flow_core"
 
 [dependencies]
+# HJ.3 (2026-06-04): the L13 pure-kernel hash-join table (Robin Hood,
+# i64-specialised). Sibling crate, no DataFusion/Arrow dep — the
+# EmatixHashJoinExec operator + Arrow bridge live HERE so the
+# codegen-sensitivity tax stays local to the consumer.
+ematix-flow-hash-join = { path = "../ematix-flow-hash-join" }
+# PV.1 (2026-06-04): the morsel-driven PUSH pipeline kernel. Sibling
+# crate, pure (no DataFusion/Arrow); the EmatPushPipelineExec glue
+# lands here in PV.2 so the codegen tax stays local to the consumer.
+ematix-flow-push = { path = "../ematix-flow-push" }
 # Σ.G.2f.3: MPMC channel for FusedAggregateExec's direct fan-out
 # (skips RepartitionExec's per-output-partition mpsc setup).
 async-channel = "2"
@@ -62,9 +71,9 @@ object_store = { workspace = true }
 # to produce Arrow arrays from column chunks without going through
 # parquet-rs's ParquetRecordBatchReader. Long-term: alternate backend
 # for FastParquetExec.
-ematix-parquet-codec = "0.16.2"
-ematix-parquet-format = "0.16.2"
-ematix-parquet-io = "0.16.2"
+ematix-parquet-codec = "0.17"
+ematix-parquet-format = "0.17"
+ematix-parquet-io = "0.17"
 deltalake = { workspace = true }
 datafusion = { workspace = true }
 cranelift = { workspace = true }
@@ -243,6 +252,20 @@ required-features = ["triangulation"]
 [[example]]
 name = "polars_plan_dump"
 path = "examples/polars_plan_dump.rs"
+required-features = ["triangulation"]
+
+# PV.M.0 morsel de-risk: Q15 subtree-vs-tail decomposition, ematix vs
+# Polars. Uses `polars` directly → triangulation-gated.
+[[example]]
+name = "q15_decompose_ab"
+path = "examples/q15_decompose_ab.rs"
+required-features = ["triangulation"]
+
+# PV.M.3: profile Polars decoding the Q15 SCALAR f64 stage (competitor
+# leaf self-time, to diff against the ematix profile). Polars → gated.
+[[example]]
+name = "polars_f64_profile"
+path = "examples/polars_f64_profile.rs"
 required-features = ["triangulation"]
 
 # Σ.E3b.1 bench: `COUNT(*) GROUP BY dict_col` —
