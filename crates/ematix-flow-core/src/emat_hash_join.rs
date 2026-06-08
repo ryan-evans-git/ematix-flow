@@ -73,7 +73,11 @@ fn key_as_i64(col: &ArrayRef) -> Option<(Vec<i64>, Option<Vec<bool>>)> {
     });
     if let Some(a) = col.as_any().downcast_ref::<Int64Array>() {
         Some((a.values().to_vec(), nulls))
-    } else { col.as_any().downcast_ref::<Int32Array>().map(|a| (a.values().iter().map(|&v| v as i64).collect(), nulls)) }
+    } else {
+        col.as_any()
+            .downcast_ref::<Int32Array>()
+            .map(|a| (a.values().iter().map(|&v| v as i64).collect(), nulls))
+    }
 }
 
 /// Built hash table + retained build-side rows, ready to probe.
