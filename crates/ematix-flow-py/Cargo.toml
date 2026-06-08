@@ -17,7 +17,12 @@ pyo3.workspace = true
 # Production-allocator parity: the PyPI extension module (_core) sets mimalloc
 # as the process global_allocator (see src/lib.rs) so the Rust-side query engine
 # allocations match the benchmark harness. Mirrors how polars ships its wheel.
-mimalloc = { version = "0.1", default-features = false }
+# `local_dynamic_tls` is REQUIRED here: the cdylib is dlopen'd by CPython, and
+# mimalloc's default initial-exec TLS model doesn't fit glibc's static-TLS
+# surplus -> `import ematix_flow` fails with "cannot allocate memory in static
+# TLS block" on Linux. local-dynamic TLS resolves it on demand. (The CLI/worker
+# binaries are loaded at startup, not dlopen'd, so they keep the faster default.)
+mimalloc = { version = "0.1", default-features = false, features = ["local_dynamic_tls"] }
 ematix-flow-core.workspace = true
 ematix-flow-cli.workspace = true
 tokio.workspace = true
