@@ -73,11 +73,7 @@ fn key_as_i64(col: &ArrayRef) -> Option<(Vec<i64>, Option<Vec<bool>>)> {
     });
     if let Some(a) = col.as_any().downcast_ref::<Int64Array>() {
         Some((a.values().to_vec(), nulls))
-    } else if let Some(a) = col.as_any().downcast_ref::<Int32Array>() {
-        Some((a.values().iter().map(|&v| v as i64).collect(), nulls))
-    } else {
-        None
-    }
+    } else { col.as_any().downcast_ref::<Int32Array>().map(|a| (a.values().iter().map(|&v| v as i64).collect(), nulls)) }
 }
 
 /// Built hash table + retained build-side rows, ready to probe.
@@ -140,7 +136,7 @@ impl EmatHashJoiner {
             for (b, n) in build_batches.iter().zip(per_batch_nulls.iter()) {
                 match n {
                     Some(nn) => v.extend_from_slice(nn),
-                    None => v.extend(std::iter::repeat(true).take(b.num_rows())),
+                    None => v.extend(std::iter::repeat_n(true, b.num_rows())),
                 }
             }
             Some(v)

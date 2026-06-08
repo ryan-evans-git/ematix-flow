@@ -89,7 +89,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "PV.3b PRODUCTION A/A (triple-walker) — data={}",
         data_dir.display()
     );
-    println!("{:<6} {:<6} {:<9} {}", "query", "fired", "result", "detail");
+    println!("{:<6} {:<6} {:<9} detail", "query", "fired", "result");
 
     let mut fired_count = 0;
     let mut fail = 0;

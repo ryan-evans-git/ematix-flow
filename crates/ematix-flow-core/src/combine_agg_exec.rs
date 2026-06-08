@@ -26,6 +26,7 @@
 //!   `Float64`;
 //! - output schema `[group_key, sum]` (DataFusion's group-then-aggregate
 //!   column order).
+//!
 //! The rule gates on these + non-null columns and falls back to the stock
 //! DataFusion agg otherwise (same discipline as PV.M.7).
 
@@ -59,8 +60,7 @@ const OUT_BATCH_ROWS: usize = 8192;
 /// Diagnostic counter: number of times `CombineAggExec::execute(0)` ran its
 /// combine (one per query that actually hit the operator). Lets the A/B
 /// harness confirm the operator fired vs. fell through.
-pub static COMBINE_AGG_FIRES: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+pub static COMBINE_AGG_FIRES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Diagnostic (ns, opt-in via reading): wall of the build phase (drain all
 /// partitions + local shard-aggregate — decode-bound) vs the combine phase
 /// (parallel shard merge). Split tells intrinsic-barrier from fixable combine.
@@ -111,7 +111,11 @@ impl CombineAggExec {
 
 impl std::fmt::Debug for CombineAggExec {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "CombineAggExec(group+sum, hint={})", self.group_card_hint)
+        write!(
+            f,
+            "CombineAggExec(group+sum, hint={})",
+            self.group_card_hint
+        )
     }
 }
 
@@ -203,8 +207,9 @@ impl ExecutionPlan for CombineAggExec {
                     let g = group_expr.clone();
                     let v = value_expr.clone();
                     handles.push(tokio::spawn(async move {
-                        let mut shards: Vec<I64SumF64> =
-                            (0..r).map(|_| I64SumF64::with_capacity(shard_hint)).collect();
+                        let mut shards: Vec<I64SumF64> = (0..r)
+                            .map(|_| I64SumF64::with_capacity(shard_hint))
+                            .collect();
                         while let Some(batch) = s.try_next().await? {
                             ingest_batch_sharded(&mut shards, r, &g, &v, &batch)?;
                         }
@@ -219,8 +224,9 @@ impl ExecutionPlan for CombineAggExec {
                 }
             } else {
                 for mut s in streams {
-                    let mut shards: Vec<I64SumF64> =
-                        (0..r).map(|_| I64SumF64::with_capacity(shard_hint)).collect();
+                    let mut shards: Vec<I64SumF64> = (0..r)
+                        .map(|_| I64SumF64::with_capacity(shard_hint))
+                        .collect();
                     while let Some(batch) = s.try_next().await? {
                         ingest_batch_sharded(&mut shards, r, &group_expr, &value_expr, &batch)?;
                     }
@@ -232,8 +238,10 @@ impl ExecutionPlan for CombineAggExec {
             // Disjoint shards (same routing everywhere) ⇒ lock-free; each thread
             // touches only its small tables. Off the async workers (CPU-bound).
             COMBINE_AGG_FIRES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            COMBINE_AGG_BUILD_NANOS
-                .fetch_add(t0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+            COMBINE_AGG_BUILD_NANOS.fetch_add(
+                t0.elapsed().as_nanos() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
             let t1 = std::time::Instant::now();
             let (keys, sums) = if can_spawn {
                 tokio::task::spawn_blocking(move || combine_sharded(built, r, shard_hint))
@@ -244,11 +252,15 @@ impl ExecutionPlan for CombineAggExec {
             } else {
                 combine_sharded(built, r, shard_hint)
             };
-            COMBINE_AGG_COMBINE_NANOS
-                .fetch_add(t1.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+            COMBINE_AGG_COMBINE_NANOS.fetch_add(
+                t1.elapsed().as_nanos() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
 
             let batches = to_batches(&out_schema, keys, sums)?;
-            Ok::<_, DataFusionError>(stream::iter(batches.into_iter().map(Ok::<_, DataFusionError>)))
+            Ok::<_, DataFusionError>(stream::iter(
+                batches.into_iter().map(Ok::<_, DataFusionError>),
+            ))
         };
 
         let s = fut.try_flatten_stream();
@@ -313,7 +325,11 @@ fn ingest_batch_sharded(
 /// the keys with `route(k)==s`, so the `r` scoped threads merge disjoint key
 /// sets in parallel with no contention, each touching only small dense tables.
 /// Per-key sums accumulate in partition order (0..n) → deterministic.
-fn combine_sharded(built: Vec<Vec<I64SumF64>>, r: usize, shard_hint: usize) -> (Vec<i64>, Vec<f64>) {
+fn combine_sharded(
+    built: Vec<Vec<I64SumF64>>,
+    r: usize,
+    shard_hint: usize,
+) -> (Vec<i64>, Vec<f64>) {
     if built.is_empty() {
         return (Vec::new(), Vec::new());
     }
@@ -441,13 +457,8 @@ impl PhysicalOptimizerRule for EnableCombineAggRule {
             // group). Safe for FK keys (l_suppkey); before default-on, gate on
             // a provably-non-null key (PV.M.7 column_has_no_nulls) + add a null
             // group. tpch_validate is the correctness gate meanwhile.
-            let op = CombineAggExec::new(
-                scan_input,
-                group_expr,
-                value_expr,
-                final_agg.schema(),
-                hint,
-            );
+            let op =
+                CombineAggExec::new(scan_input, group_expr, value_expr, final_agg.schema(), hint);
             Ok(Transformed::yes(Arc::new(op) as Arc<dyn ExecutionPlan>))
         })?;
         if !rewritten.transformed {
@@ -473,18 +484,21 @@ fn final_is_single_group_single_sum(agg: &AggregateExec) -> bool {
         return false;
     }
     let aggs = agg.aggr_expr();
-    aggs.len() == 1
-        && aggs[0].fun().name().eq_ignore_ascii_case("sum")
-        && !aggs[0].is_distinct()
+    aggs.len() == 1 && aggs[0].fun().name().eq_ignore_ascii_case("sum") && !aggs[0].is_distinct()
 }
 
 /// Walk the single-child chain (through Repartition/Coalesce) to a `Partial`
 /// agg with one group key + one non-distinct `SUM(<expr>)`. Returns its input
 /// and the group/value EXPRESSIONS — unlike the radix matcher, the SUM input
 /// may be a computed expr (Q15's `l_extendedprice*(1-l_discount)`).
+#[allow(clippy::type_complexity)]
 fn find_partial_sum_expr(
     plan: &Arc<dyn ExecutionPlan>,
-) -> Option<(Arc<dyn ExecutionPlan>, Arc<dyn PhysicalExpr>, Arc<dyn PhysicalExpr>)> {
+) -> Option<(
+    Arc<dyn ExecutionPlan>,
+    Arc<dyn PhysicalExpr>,
+    Arc<dyn PhysicalExpr>,
+)> {
     let mut cur = plan.clone();
     loop {
         if let Some(agg) = cur.as_any().downcast_ref::<AggregateExec>() {

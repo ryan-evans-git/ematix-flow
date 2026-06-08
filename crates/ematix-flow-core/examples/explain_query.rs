@@ -84,7 +84,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let _ = ctx.sql(&sql).await?.collect().await?;
         let _ = ctx.sql(&sql).await?.collect().await?;
     }
-    let explain_kw = if plan_only { "EXPLAIN" } else { "EXPLAIN ANALYZE" };
+    let explain_kw = if plan_only {
+        "EXPLAIN"
+    } else {
+        "EXPLAIN ANALYZE"
+    };
     let batches = ctx
         .sql(&format!("{explain_kw} {sql}"))
         .await?

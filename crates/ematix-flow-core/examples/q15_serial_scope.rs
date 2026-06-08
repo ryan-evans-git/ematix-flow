@@ -97,7 +97,9 @@ fn build_ctx(data_dir: &Path, parts: usize) -> Result<SessionContext, Box<dyn st
                 .skip_partial_aggregation_probe_rows_threshold = 1;
         }
     }
-    let builder = SessionStateBuilder::new().with_config(cfg).with_default_features();
+    let builder = SessionStateBuilder::new()
+        .with_config(cfg)
+        .with_default_features();
     let state = ematix_flow_core::preset::with_optimizer_rules(builder).build();
     let ctx = SessionContext::new_with_state(state);
     for t in TPCH_TABLES {
@@ -105,7 +107,9 @@ fn build_ctx(data_dir: &Path, parts: usize) -> Result<SessionContext, Box<dyn st
         if *t == "lineitem" || *t == "orders" {
             ctx.register_table(
                 *t,
-                Arc::new(EmatixFastParquetTableProvider::try_new(p.to_string_lossy())?),
+                Arc::new(EmatixFastParquetTableProvider::try_new(
+                    p.to_string_lossy(),
+                )?),
             )?;
         } else {
             ctx.register_table(
@@ -136,7 +140,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let data_dir = std::env::var("TPCH_DATA_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("examples/tpch/data/sf10"));
-    let trials: usize = std::env::var("TRIALS").ok().and_then(|s| s.parse().ok()).unwrap_or(11);
+    let trials: usize = std::env::var("TRIALS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(11);
     let warmups = 3;
     let plist: Vec<usize> = std::env::var("PARTS_SWEEP")
         .ok()
@@ -145,7 +152,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // EXPLAIN ANALYZE mode: dump per-operator metrics for REVENUE at PARTITIONS.
     if std::env::var_os("EXPLAIN").is_some() {
-        let p: usize = std::env::var("PARTITIONS").ok().and_then(|s| s.parse().ok()).unwrap_or(14);
+        let p: usize = std::env::var("PARTITIONS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(14);
         let which = std::env::var("EXPLAIN_PLAN").unwrap_or_else(|_| "REVENUE".to_string());
         let sql = match which.as_str() {
             "SCALAR" => SCALAR,
@@ -175,9 +185,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    println!("PV.M.8 Phase-0 — Q15 serial-section scope — data={} trials={trials}", data_dir.display());
+    println!(
+        "PV.M.8 Phase-0 — Q15 serial-section scope — data={} trials={trials}",
+        data_dir.display()
+    );
     println!("plans: REVENUE (agg only) / REVMAX (+2nd consumer+max) / FULL (+join+sort)\n");
-    println!("{:<9} {:>6} {:>10} {:>10} {:>10}", "plan", "P", "ms", "speedup", "rows");
+    println!(
+        "{:<9} {:>6} {:>10} {:>10} {:>10}",
+        "plan", "P", "ms", "speedup", "rows"
+    );
 
     for (label, sql) in [
         ("COUNT", COUNTQ),

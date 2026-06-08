@@ -74,7 +74,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     register(&ctx, &data_dir)?;
 
     println!("PV.3 A/A correctness gate — data={}", data_dir.display());
-    println!("{:<6} {:<6} {:<8} {}", "query", "fired", "result", "detail");
+    println!("{:<6} {:<6} {:<8} detail", "query", "fired", "result");
 
     let mut fired_count = 0;
     let mut fail = 0;

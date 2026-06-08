@@ -63,7 +63,7 @@ struct Dims {
 }
 
 fn all_ones_mask(nrows: usize) -> Vec<u8> {
-    let nb = (nrows + 7) / 8;
+    let nb = nrows.div_ceil(8);
     let mut m = vec![0xFFu8; nb];
     let rem = nrows % 8;
     if rem != 0 {

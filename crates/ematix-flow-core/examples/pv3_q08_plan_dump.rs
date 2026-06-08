@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::physical_plan::aggregates::AggregateExec;
-use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode};
+use datafusion::physical_plan::joins::HashJoinExec;
 use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties, displayable};
 use datafusion::prelude::{SessionConfig, SessionContext};

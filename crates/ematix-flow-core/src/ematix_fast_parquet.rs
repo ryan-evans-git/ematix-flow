@@ -3800,8 +3800,10 @@ mod tests {
         );
 
         // --- StringInSet: exact membership, zero false positives.
-        let set: std::collections::HashSet<String> =
-            ["FRANCE", "GERMANY"].iter().map(|s| s.to_string()).collect();
+        let set: std::collections::HashSet<String> = ["FRANCE", "GERMANY"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         let pred = ColumnPredicate::StringInSet {
             col_idx: 7,
             set: Arc::new(set),

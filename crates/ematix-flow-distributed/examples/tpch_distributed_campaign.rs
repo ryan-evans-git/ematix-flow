@@ -319,7 +319,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Ok(custom) = std::env::var("CUSTOM_SQL") {
         eprintln!("--- CUSTOM_SQL ---");
         if std::env::var_os("EXPLAIN_ONLY").is_some() {
-            let b = ctx.sql(&format!("EXPLAIN {custom}")).await?.collect().await?;
+            let b = ctx
+                .sql(&format!("EXPLAIN {custom}"))
+                .await?
+                .collect()
+                .await?;
             if let Ok(t) = datafusion::arrow::util::pretty::pretty_format_batches(&b) {
                 println!("{t}");
             }

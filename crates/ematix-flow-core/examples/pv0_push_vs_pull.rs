@@ -24,6 +24,7 @@
 //!
 //! Env: TPCH_DATA_DIR (dir holding lineitem.parquet), TRIALS (default 9),
 //!      NDV (build-side distinct key count, default 13333).
+#![allow(clippy::type_complexity)]
 
 use std::sync::Arc;
 use std::time::Instant;

@@ -21,6 +21,8 @@
 //! lever's first ship). The rule runs after the built-in physical rules,
 //! so `partition_mode()` is already assigned.
 
+#![allow(deprecated)] // CoalesceBatchesExec deprecated upstream; BatchCoalescer migration is a follow-up
+
 use std::sync::Arc;
 
 use arrow_schema::DataType;

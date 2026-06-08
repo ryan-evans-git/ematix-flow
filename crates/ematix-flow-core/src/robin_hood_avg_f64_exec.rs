@@ -636,6 +636,7 @@ fn find_robin_hood_avg_f64_partial(
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::assertions_on_constants)]
     use super::*;
     use arrow_array::{Float64Array, Int64Array, RecordBatch};
     use arrow_schema::{DataType, Field, Schema};

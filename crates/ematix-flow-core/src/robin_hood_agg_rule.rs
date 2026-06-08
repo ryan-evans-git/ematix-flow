@@ -283,6 +283,7 @@ fn find_robin_hood_partial(plan: &Arc<dyn ExecutionPlan>) -> Option<Arc<dyn Exec
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::assertions_on_constants)]
     use super::*;
     use arrow_array::{Int64Array, RecordBatch};
     use arrow_schema::{DataType, Field, Schema};

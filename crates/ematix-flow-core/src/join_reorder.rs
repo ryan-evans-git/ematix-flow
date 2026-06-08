@@ -646,12 +646,23 @@ fn reorder_stats_aware_gate_on() -> bool {
 /// Extracted as a pure fn so the gate decision is unit-testable.
 fn effective_max_leaves(chain: &InnerJoinChain, opts: &ReorderOpts) -> usize {
     let largest: Option<u64> = if reorder_stats_aware_gate_on() {
-        chain.leaves.iter().filter_map(estimate_leaf_card_known).max()
+        chain
+            .leaves
+            .iter()
+            .filter_map(estimate_leaf_card_known)
+            .max()
     } else {
         // Legacy: `estimate_leaf_card` falls back to the `u64::MAX/2` sentinel
         // for Absent stats, so this is always `Some(..)` — reproduces the
         // pre-#316 bump-on-sentinel behaviour for the strict A/B.
-        Some(chain.leaves.iter().map(estimate_leaf_card).max().unwrap_or(0))
+        Some(
+            chain
+                .leaves
+                .iter()
+                .map(estimate_leaf_card)
+                .max()
+                .unwrap_or(0),
+        )
     };
     match opts.scale_bump {
         Some((min_rows, bumped)) if largest.is_some_and(|c| c >= min_rows) => {

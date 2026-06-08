@@ -13,6 +13,7 @@
 //! Usage:
 //!   cargo run --release -p ematix-flow-core --example f64_masked_vs_dense -- \
 //!     examples/tpch/data/sf10/lineitem.parquet
+#![allow(clippy::needless_range_loop)]
 
 use std::time::Instant;
 

@@ -31,8 +31,9 @@ use ematix_flow_core::swap_semi_join_build_rule::SwapSemiJoinBuildSideRule;
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-const TPCH_TABLES: &[&str] =
-    &["customer", "lineitem", "nation", "orders", "part", "partsupp", "region", "supplier"];
+const TPCH_TABLES: &[&str] = &[
+    "customer", "lineitem", "nation", "orders", "part", "partsupp", "region", "supplier",
+];
 
 fn build_ctx(data_dir: &Path) -> Result<SessionContext, Box<dyn std::error::Error>> {
     // Mirror examples/explain_query.rs's production rule set so STOCK reproduces
@@ -60,7 +61,9 @@ fn build_ctx(data_dir: &Path) -> Result<SessionContext, Box<dyn std::error::Erro
         if *t == "lineitem" || *t == "orders" {
             ctx.register_table(
                 *t,
-                Arc::new(EmatixFastParquetTableProvider::try_new(p.to_string_lossy())?),
+                Arc::new(EmatixFastParquetTableProvider::try_new(
+                    p.to_string_lossy(),
+                )?),
             )?;
         } else {
             ctx.register_table(
@@ -88,7 +91,10 @@ fn set_arm(envs: &[(&str, &str)]) {
     }
 }
 
-async fn run_once(data_dir: &Path, sql: &str) -> Result<(f64, usize, f64), Box<dyn std::error::Error>> {
+async fn run_once(
+    data_dir: &Path,
+    sql: &str,
+) -> Result<(f64, usize, f64), Box<dyn std::error::Error>> {
     let ctx = build_ctx(data_dir)?;
     let plan = ctx.sql(sql).await?.create_physical_plan().await?;
     let t = Instant::now();
@@ -116,8 +122,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let data_dir = std::env::var("TPCH_DATA_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("examples/tpch/data/sf100"));
-    let trials: usize = std::env::var("TRIALS").ok().and_then(|s| s.parse().ok()).unwrap_or(5);
-    let rounds: usize = std::env::var("ROUNDS").ok().and_then(|s| s.parse().ok()).unwrap_or(2);
+    let trials: usize = std::env::var("TRIALS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(5);
+    let rounds: usize = std::env::var("ROUNDS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(2);
     let sql = std::fs::read_to_string(data_dir.join("../../queries/q10.sql"))
         .or_else(|_| std::fs::read_to_string("examples/tpch/queries/q10.sql"))?;
 
@@ -159,7 +171,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "Q10 SF=100 no-shuffle A/B  data={}  trials={trials} rounds={rounds}",
         data_dir.display()
     );
-    println!("{:<14} {:>10} {:>10} {:>18}", "arm", "median_ms", "rows", "checksum");
+    println!(
+        "{:<14} {:>10} {:>10} {:>18}",
+        "arm", "median_ms", "rows", "checksum"
+    );
     let mut meds = Vec::new();
     for (ai, (name, _)) in arms.iter().enumerate() {
         let m = median(per_arm[ai].clone());
@@ -169,7 +184,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let stock = meds[0];
     for (ai, (name, _)) in arms.iter().enumerate().skip(1) {
-        println!("{name:<14} vs STOCK: {:.3}× ({:+.1}%)", meds[ai] / stock, (meds[ai] - stock) / stock * 100.0);
+        println!(
+            "{name:<14} vs STOCK: {:.3}× ({:+.1}%)",
+            meds[ai] / stock,
+            (meds[ai] - stock) / stock * 100.0
+        );
     }
     set_arm(&[]);
     Ok(())

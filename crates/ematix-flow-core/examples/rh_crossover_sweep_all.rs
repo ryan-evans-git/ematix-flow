@@ -164,8 +164,8 @@ async fn main() {
     for kernel in ["SUM", "COUNT", "AVG"] {
         println!("=== {kernel}(… ) GROUP BY k ===");
         println!(
-            "{:>11} {:>10} {:>12} {:>12} {:>10}  {}",
-            "groups", "rows/grp", "RH_on ms", "stock ms", "RH/stock", "verdict"
+            "{:>11} {:>10} {:>12} {:>12} {:>10}  verdict",
+            "groups", "rows/grp", "RH_on ms", "stock ms", "RH/stock"
         );
         let sql = sql_for(kernel);
         for &card in CARDS {

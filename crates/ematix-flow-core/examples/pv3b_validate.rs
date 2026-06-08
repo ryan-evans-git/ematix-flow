@@ -17,6 +17,7 @@
 //! Usage:
 //!   TPCH_DATA_DIR=examples/tpch/data/sf1 \
 //!     cargo run --release -p ematix-flow-core --example pv3b_validate
+#![allow(clippy::doc_lazy_continuation)]
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -73,7 +74,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     register(&ctx, &data_dir)?;
 
     println!("PV.3b A/A correctness gate — data={}", data_dir.display());
-    println!("{:<6} {:<6} {:<9} {}", "query", "fired", "result", "detail");
+    println!("{:<6} {:<6} {:<9} detail", "query", "fired", "result");
 
     let stock_planner = DefaultPhysicalPlanner::default();
     let fused_planner =

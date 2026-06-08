@@ -43,8 +43,9 @@ use ematix_flow_core::fast_parquet::FastParquetTableProvider;
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-const TPCH_TABLES: &[&str] =
-    &["customer", "lineitem", "nation", "orders", "part", "partsupp", "region", "supplier"];
+const TPCH_TABLES: &[&str] = &[
+    "customer", "lineitem", "nation", "orders", "part", "partsupp", "region", "supplier",
+];
 
 // Q15's CTE input, ungrouped: one row per qualifying lineitem.
 const EXTRACT: &str = "\
@@ -77,7 +78,10 @@ struct Tbl {
 impl Tbl {
     fn with_groups(distinct_hint: usize) -> Self {
         let cap = next_pow2(distinct_hint * 2); // load < 0.5
-        Tbl { keys: vec![EMPTY; cap], vals: vec![0.0; cap] }
+        Tbl {
+            keys: vec![EMPTY; cap],
+            vals: vec![0.0; cap],
+        }
     }
     #[inline(always)]
     fn add(&mut self, k: i64, v: f64) {
@@ -196,7 +200,10 @@ fn partitioned(keys: &[i64], vals: &[f64], distinct: usize, p: usize) -> (f64, u
         }
         hs.into_iter().map(|h| h.join().unwrap()).collect()
     });
-    (parts.iter().map(|x| x.0).sum(), parts.iter().map(|x| x.1).sum())
+    (
+        parts.iter().map(|x| x.0).sum(),
+        parts.iter().map(|x| x.1).sum(),
+    )
 }
 
 fn median(mut v: Vec<f64>) -> f64 {
@@ -206,15 +213,25 @@ fn median(mut v: Vec<f64>) -> f64 {
 
 fn build_ctx(data_dir: &Path) -> Result<SessionContext, Box<dyn std::error::Error>> {
     let cfg = SessionConfig::new().with_target_partitions(14);
-    let builder = SessionStateBuilder::new().with_config(cfg).with_default_features();
+    let builder = SessionStateBuilder::new()
+        .with_config(cfg)
+        .with_default_features();
     let state = ematix_flow_core::preset::with_optimizer_rules(builder).build();
     let ctx = SessionContext::new_with_state(state);
     for t in TPCH_TABLES {
         let p = data_dir.join(format!("{t}.parquet"));
         if *t == "lineitem" || *t == "orders" {
-            ctx.register_table(*t, Arc::new(EmatixFastParquetTableProvider::try_new(p.to_string_lossy())?))?;
+            ctx.register_table(
+                *t,
+                Arc::new(EmatixFastParquetTableProvider::try_new(
+                    p.to_string_lossy(),
+                )?),
+            )?;
         } else {
-            ctx.register_table(*t, Arc::new(FastParquetTableProvider::try_new(p.to_string_lossy())?))?;
+            ctx.register_table(
+                *t,
+                Arc::new(FastParquetTableProvider::try_new(p.to_string_lossy())?),
+            )?;
         }
     }
     Ok(ctx)
@@ -225,7 +242,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let data_dir = std::env::var("TPCH_DATA_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("examples/tpch/data/sf10"));
-    let trials: usize = std::env::var("TRIALS").ok().and_then(|s| s.parse().ok()).unwrap_or(9);
+    let trials: usize = std::env::var("TRIALS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(9);
     let warmups = 3;
 
     // Extract the real Q15-filtered (suppkey, revenue) once.
@@ -235,8 +255,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut keys: Vec<i64> = Vec::new();
     let mut vals: Vec<f64> = Vec::new();
     for b in &batches {
-        let k = b.column(0).as_any().downcast_ref::<Int64Array>().expect("l_suppkey i64");
-        let v = b.column(1).as_any().downcast_ref::<Float64Array>().expect("rev f64");
+        let k = b
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("l_suppkey i64");
+        let v = b
+            .column(1)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .expect("rev f64");
         for i in 0..b.num_rows() {
             keys.push(k.value(i));
             vals.push(v.value(i));
@@ -245,8 +273,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let n = keys.len();
     let (gt_sum, gt_groups) = st_global(&keys, &vals, 200_000);
     println!("PV-morsel Q15 agg-kernel spike — {n} rows → {gt_groups} groups, Σrev={gt_sum:.1}");
-    println!("(DataFusion baseline: REVENUE P=14 ≈ 65ms, of which groupby ADDS ~13ms over SCALAR 52ms, scales 5.68×)\n");
-    println!("{:<14} {:>4} {:>10} {:>9} {:>12}", "arm", "P", "ms", "scaling", "checksum_ok");
+    println!(
+        "(DataFusion baseline: REVENUE P=14 ≈ 65ms, of which groupby ADDS ~13ms over SCALAR 52ms, scales 5.68×)\n"
+    );
+    println!(
+        "{:<14} {:>4} {:>10} {:>9} {:>12}",
+        "arm", "P", "ms", "scaling", "checksum_ok"
+    );
 
     let run = |arm: &str, f: &dyn Fn(usize) -> (f64, usize), plist: &[usize]| {
         let mut base = 0.0f64;
@@ -273,10 +306,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let plist = [1usize, 2, 4, 8, 10, 14];
     run("ST_GLOBAL", &|_| st_global(&keys, &vals, 200_000), &[1]);
-    run("SERIAL_COMB", &|p| serial_combine(&keys, &vals, 200_000, p), &plist);
-    run("PARTITIONED", &|p| partitioned(&keys, &vals, 200_000, p), &plist);
+    run(
+        "SERIAL_COMB",
+        &|p| serial_combine(&keys, &vals, 200_000, p),
+        &plist,
+    );
+    run(
+        "PARTITIONED",
+        &|p| partitioned(&keys, &vals, 200_000, p),
+        &plist,
+    );
 
-    println!("GO if PARTITIONED scales ≫5.68× (and P=14 abs-ms ≪13ms ⇒ DataFusion's groupby cost is mostly exchange).");
-    println!("KILL if PARTITIONED also walls ~5-6× ⇒ agg is combine/BW-bound at 100K groups; accept Q15 parity, lever is SF=100.");
+    println!(
+        "GO if PARTITIONED scales ≫5.68× (and P=14 abs-ms ≪13ms ⇒ DataFusion's groupby cost is mostly exchange)."
+    );
+    println!(
+        "KILL if PARTITIONED also walls ~5-6× ⇒ agg is combine/BW-bound at 100K groups; accept Q15 parity, lever is SF=100."
+    );
     Ok(())
 }

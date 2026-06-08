@@ -36,24 +36,6 @@ use tonic::transport::Server;
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-#[cfg(test)]
-mod alloc_guard {
-    // The shipped `flow-worker` binary must run on mimalloc, not the system
-    // allocator. `mi_is_in_heap_region` returns false for a system-malloc
-    // pointer, so this is RED without the `#[global_allocator]` above.
-    #[test]
-    fn global_allocator_is_mimalloc() {
-        let buf: Vec<u8> = vec![0xA5u8; 64 * 1024];
-        let p = buf.as_ptr() as *const core::ffi::c_void;
-        let in_mimalloc = unsafe { libmimalloc_sys::mi_is_in_heap_region(p) };
-        core::hint::black_box(&buf);
-        assert!(
-            in_mimalloc,
-            "global allocator is NOT mimalloc — `flow-worker` would ship on the system allocator"
-        );
-    }
-}
-
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     let mut bind_addr = "0.0.0.0".to_string();
@@ -158,4 +140,22 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .serve(addr)
         .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod alloc_guard {
+    // The shipped `flow-worker` binary must run on mimalloc, not the system
+    // allocator. `mi_is_in_heap_region` returns false for a system-malloc
+    // pointer, so this is RED without the `#[global_allocator]` above.
+    #[test]
+    fn global_allocator_is_mimalloc() {
+        let buf: Vec<u8> = vec![0xA5u8; 64 * 1024];
+        let p = buf.as_ptr() as *const core::ffi::c_void;
+        let in_mimalloc = unsafe { libmimalloc_sys::mi_is_in_heap_region(p) };
+        core::hint::black_box(&buf);
+        assert!(
+            in_mimalloc,
+            "global allocator is NOT mimalloc — `flow-worker` would ship on the system allocator"
+        );
+    }
 }

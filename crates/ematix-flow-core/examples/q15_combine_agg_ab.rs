@@ -32,8 +32,9 @@ use ematix_flow_core::fast_parquet::FastParquetTableProvider;
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-const TPCH_TABLES: &[&str] =
-    &["customer", "lineitem", "nation", "orders", "part", "partsupp", "region", "supplier"];
+const TPCH_TABLES: &[&str] = &[
+    "customer", "lineitem", "nation", "orders", "part", "partsupp", "region", "supplier",
+];
 
 const REVENUE: &str = "\
 SELECT l_suppkey, SUM(l_extendedprice * (1 - l_discount)) AS total_revenue \
@@ -74,7 +75,9 @@ fn median(mut v: Vec<f64>) -> f64 {
 
 fn build_ctx(data_dir: &Path, parts: usize) -> Result<SessionContext, Box<dyn std::error::Error>> {
     let cfg = SessionConfig::new().with_target_partitions(parts);
-    let builder = SessionStateBuilder::new().with_config(cfg).with_default_features();
+    let builder = SessionStateBuilder::new()
+        .with_config(cfg)
+        .with_default_features();
     // Append the (self-env-gated) CombineAgg rule after the preset chain.
     let state = ematix_flow_core::preset::with_optimizer_rules(builder)
         .with_physical_optimizer_rule(Arc::new(EnableCombineAggRule))
@@ -83,9 +86,17 @@ fn build_ctx(data_dir: &Path, parts: usize) -> Result<SessionContext, Box<dyn st
     for t in TPCH_TABLES {
         let p = data_dir.join(format!("{t}.parquet"));
         if *t == "lineitem" || *t == "orders" {
-            ctx.register_table(*t, Arc::new(EmatixFastParquetTableProvider::try_new(p.to_string_lossy())?))?;
+            ctx.register_table(
+                *t,
+                Arc::new(EmatixFastParquetTableProvider::try_new(
+                    p.to_string_lossy(),
+                )?),
+            )?;
         } else {
-            ctx.register_table(*t, Arc::new(FastParquetTableProvider::try_new(p.to_string_lossy())?))?;
+            ctx.register_table(
+                *t,
+                Arc::new(FastParquetTableProvider::try_new(p.to_string_lossy())?),
+            )?;
         }
     }
     Ok(ctx)
@@ -125,8 +136,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let data_dir = std::env::var("TPCH_DATA_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("examples/tpch/data/sf10"));
-    let trials: usize = std::env::var("TRIALS").ok().and_then(|s| s.parse().ok()).unwrap_or(11);
-    let rounds: usize = std::env::var("ROUNDS").ok().and_then(|s| s.parse().ok()).unwrap_or(3);
+    let trials: usize = std::env::var("TRIALS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(11);
+    let rounds: usize = std::env::var("ROUNDS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(3);
     let parts = 14usize;
     let warmups = 3;
 
@@ -142,11 +159,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
         let _ = run_once(&data_dir, parts, sql).await; // warm
         let ctx = build_ctx(&data_dir, parts)?;
-        let batches = ctx.sql(&format!("EXPLAIN ANALYZE {sql}")).await?.collect().await?;
+        let batches = ctx
+            .sql(&format!("EXPLAIN ANALYZE {sql}"))
+            .await?
+            .collect()
+            .await?;
         println!("=== EXPLAIN ANALYZE {which} (EMAT_COMBINE_AGG=1) @ P={parts} ===");
         for b in &batches {
             let col = b.column(b.num_columns() - 1);
-            if let Some(a) = col.as_any().downcast_ref::<datafusion::arrow::array::StringArray>() {
+            if let Some(a) = col
+                .as_any()
+                .downcast_ref::<datafusion::arrow::array::StringArray>()
+            {
                 for i in 0..a.len() {
                     println!("{}", a.value(i));
                 }
@@ -175,13 +199,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let fires = COMBINE_AGG_FIRES.load(Ordering::Relaxed).max(1);
         let build_ms = COMBINE_AGG_BUILD_NANOS.load(Ordering::Relaxed) as f64 / 1e6 / fires as f64;
         let comb_ms = COMBINE_AGG_COMBINE_NANOS.load(Ordering::Relaxed) as f64 / 1e6 / fires as f64;
-        println!("SPLIT REVENUE ON @ P={parts}: total≈{:.2}ms  build_phase={build_ms:.2}ms  combine={comb_ms:.3}ms  (fires={fires})", median(walls));
-        println!("(build_phase = drain all partitions + local agg, decode-bound; combine = parallel shard merge)");
+        println!(
+            "SPLIT REVENUE ON @ P={parts}: total≈{:.2}ms  build_phase={build_ms:.2}ms  combine={comb_ms:.3}ms  (fires={fires})",
+            median(walls)
+        );
+        println!(
+            "(build_phase = drain all partitions + local agg, decode-bound; combine = parallel shard merge)"
+        );
         return Ok(());
     }
 
-    println!("PV.M.8 Stage-4a — CombineAggExec A/B (off vs on) @ P={parts}  data={}", data_dir.display());
-    println!("{:<9} {:<4} {:>10} {:>7} {:>14}", "plan", "arm", "ms", "fires", "checksum");
+    println!(
+        "PV.M.8 Stage-4a — CombineAggExec A/B (off vs on) @ P={parts}  data={}",
+        data_dir.display()
+    );
+    println!(
+        "{:<9} {:<4} {:>10} {:>7} {:>14}",
+        "plan", "arm", "ms", "fires", "checksum"
+    );
 
     for (label, sql) in [("REVENUE", REVENUE), ("REVMAX", REVMAX), ("FULL", FULL)] {
         // Interleaved off/on across rounds → beats within-process drift.
@@ -225,8 +260,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         let m_off = median(off);
         let m_on = median(on);
-        println!("{label:<9} {:<4} {m_off:>10.2} {fires_off:>7} {cs_off:>14.1}", "OFF");
-        println!("{label:<9} {:<4} {m_on:>10.2} {fires_on:>7} {cs_on:>14.1}", "ON");
+        println!(
+            "{label:<9} {:<4} {m_off:>10.2} {fires_off:>7} {cs_off:>14.1}",
+            "OFF"
+        );
+        println!(
+            "{label:<9} {:<4} {m_on:>10.2} {fires_on:>7} {cs_on:>14.1}",
+            "ON"
+        );
         let delta = (m_on - m_off) / m_off * 100.0;
         let cs_ok = (cs_off - cs_on).abs() / cs_off.abs().max(1.0) < 1e-9;
         println!(
@@ -235,6 +276,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
     println!("GO if REVENUE ON fires>0, on/off < 1.0 (faster), checksum_match=true.");
-    println!("FULL is expected fires=0 (agg is CSE-wrapped → Phase-1b); must stay correct + ~unchanged.");
+    println!(
+        "FULL is expected fires=0 (agg is CSE-wrapped → Phase-1b); must stay correct + ~unchanged."
+    );
     Ok(())
 }

@@ -189,8 +189,8 @@ async fn main() {
         let (lo, hi) = band_for(kernel);
         println!("=== {kernel}  (fire band [{lo}, {hi}] est_groups) ===");
         println!(
-            "{:>11} {:>10} {:>11} {:>11} {:>9}  {:<10} {}",
-            "est_groups", "rows", "RH_on ms", "stock ms", "RH/stock", "verdict", "gate"
+            "{:>11} {:>10} {:>11} {:>11} {:>9}  {:<10} gate",
+            "est_groups", "rows", "RH_on ms", "stock ms", "RH/stock", "verdict"
         );
         let sql = sql_for(kernel);
         for &g in EST_GROUPS {

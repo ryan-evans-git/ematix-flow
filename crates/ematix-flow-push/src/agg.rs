@@ -347,7 +347,9 @@ mod tests {
         let mut vals = Vec::new();
         let mut s: u64 = 0x1234_5678;
         for _ in 0..50_000 {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             keys.push((s >> 40) as i64 % 3000 - 1500); // negatives too
             vals.push(((s >> 20) & 0xffff) as f64 * 0.5);
         }

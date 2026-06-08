@@ -19,6 +19,7 @@
 //! Usage:
 //!   TPCH_DATA_DIR=examples/tpch/data/sf10 TRIALS=11 \
 //!     cargo run --release -p ematix-flow-core --example pv3b_q08_ab
+#![allow(clippy::doc_lazy_continuation, clippy::doc_overindented_list_items)]
 
 use std::collections::HashMap;
 use std::path::PathBuf;

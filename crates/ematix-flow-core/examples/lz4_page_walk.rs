@@ -1,6 +1,7 @@
 //! Q06.b debug — walk pages of l_shipdate in lineitem_lz4.parquet to
 //! see if PageHeader parsing succeeds and which page version DuckDB
 //! wrote.
+#![allow(clippy::manual_checked_ops)]
 
 use ematix_parquet_io::ParquetFile;
 use ematix_parquet_io::pages::PageWalker;

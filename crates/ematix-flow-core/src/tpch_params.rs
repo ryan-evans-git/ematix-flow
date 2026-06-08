@@ -58,7 +58,10 @@ mod tests {
         assert_eq!(scale_factor_from_data_dir(Path::new("/x/data/sf100")), 100);
         assert_eq!(scale_factor_from_data_dir(Path::new("/x/data/sf1")), 1);
         // No `sf<N>` component → safe default 1 (mini fixtures, ad-hoc dirs).
-        assert_eq!(scale_factor_from_data_dir(Path::new("/x/data/tpch_mini")), 1);
+        assert_eq!(
+            scale_factor_from_data_dir(Path::new("/x/data/tpch_mini")),
+            1
+        );
         assert_eq!(scale_factor_from_data_dir(Path::new("relative/sf10")), 10);
     }
 
@@ -68,8 +71,14 @@ mod tests {
                    select sum(ps_supplycost * ps_availqty) * 0.0001 from partsupp)";
         // SF=10 → 0.0001 / 10
         let s10 = apply_tpch_query_params(11, q11, 10);
-        assert!(s10.contains("(0.0001 / 10)"), "SF=10 scaling missing:\n{s10}");
-        assert!(!s10.contains("* 0.0001 from"), "raw fraction still present:\n{s10}");
+        assert!(
+            s10.contains("(0.0001 / 10)"),
+            "SF=10 scaling missing:\n{s10}"
+        );
+        assert!(
+            !s10.contains("* 0.0001 from"),
+            "raw fraction still present:\n{s10}"
+        );
         // SF=100 → 0.0001 / 100
         assert!(apply_tpch_query_params(11, q11, 100).contains("(0.0001 / 100)"));
         // SF=1 → unchanged (file already holds the SF=1 value).

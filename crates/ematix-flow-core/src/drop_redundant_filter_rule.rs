@@ -342,6 +342,7 @@ pub fn fuse_redundant_bridge_filters(
 /// (top-to-bottom) to re-apply over a rewritten scan. Both wrappers preserve
 /// schema + row count, so looking through them is safe and the FilterExec's
 /// projection indices still address the scan's output columns.
+#[allow(clippy::type_complexity)]
 fn peel_to_emat_scan(
     input: &Arc<dyn ExecutionPlan>,
 ) -> Option<(Arc<dyn ExecutionPlan>, Vec<Arc<dyn ExecutionPlan>>)> {
