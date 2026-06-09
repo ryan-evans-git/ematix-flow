@@ -469,7 +469,20 @@ async fn run_ematix(
             .to_string();
         eprintln!("=== PHYSICAL PLAN ===\n{formatted}=====================");
     }
-    let batches = ctx.sql(sql).await?.collect().await?;
+    // Σ.Q20: validate the transitive semi-pushdown (no-op on the other
+    // 21 queries; rewrites Q20). Default-on; EMAT_Q20_TRANSITIVE_SEMI=0 to skip.
+    let batches = if std::env::var("EMAT_Q20_TRANSITIVE_SEMI")
+        .ok()
+        .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+        .unwrap_or(true)
+    {
+        let optimized = ctx.sql(sql).await?.into_optimized_plan()?;
+        let optimized =
+            ematix_flow_core::agg_filter_pushdown::push_transitive_semi_into_agg(optimized)?;
+        ctx.execute_logical_plan(optimized).await?.collect().await?
+    } else {
+        ctx.sql(sql).await?.collect().await?
+    };
     let mut out: Vec<Vec<Cell>> = Vec::new();
     for batch in &batches {
         let n_rows = batch.num_rows();

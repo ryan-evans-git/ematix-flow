@@ -80,6 +80,7 @@ enum RewriteRule {
     DimPush,
     Reorder,
     ReorderShapeGated,
+    Q20Semi,
 }
 
 static FIRES_CACHE: OnceLock<Mutex<HashMap<FiresKey, bool>>> = OnceLock::new();
@@ -119,6 +120,9 @@ async fn rewrite_fires_for_sql(ctx: &SessionContext, sql: &str, rule: RewriteRul
         }
         RewriteRule::ReorderShapeGated => {
             ematix_flow_core::join_reorder::reorder_inner_joins_shape_gated(optimized.clone())
+        }
+        RewriteRule::Q20Semi => {
+            ematix_flow_core::agg_filter_pushdown::push_transitive_semi_into_agg(optimized.clone())
         }
     };
     let rewritten = match rewritten {
@@ -623,6 +627,21 @@ async fn prefill_observations(
                     continue;
                 }
             };
+        let logical_plan =
+            match ematix_flow_core::agg_filter_pushdown::push_transitive_semi_into_agg(logical_plan)
+            {
+                Ok(p) => p,
+                Err(e) => {
+                    println!("  Q{q:02}: q20_semi fail: {}", short(&e.to_string()));
+                    continue;
+                }
+            };
+        if std::env::var_os("EMAT_DUMP_LOGICAL").is_some() {
+            println!(
+                "  Q{q:02} optimized logical plan (post agg_semi+dim_push):\n{}",
+                logical_plan.display_indent()
+            );
+        }
         let df = match ctx.execute_logical_plan(logical_plan).await {
             Ok(d) => d,
             Err(e) => {
@@ -941,6 +960,8 @@ async fn time_one(data_dir: &Path, sql: &str, partitions: Option<usize>) -> Opti
         ematix_flow_core::agg_filter_pushdown::push_filter_into_agg(logical_plan).ok()?;
     let logical_plan =
         ematix_flow_core::dim_join_pushdown::push_dim_join_into_chain(logical_plan).ok()?;
+    let logical_plan =
+        ematix_flow_core::agg_filter_pushdown::push_transitive_semi_into_agg(logical_plan).ok()?;
     let df = ctx.execute_logical_plan(logical_plan).await.ok()?;
     let t0 = Instant::now();
     let plan = df.create_physical_plan().await.ok()?;
@@ -1149,9 +1170,19 @@ async fn run_ematix_flow(data_dir: &Path, sql: &str) -> Trial {
             },
         )
         .await;
+    // Σ.Q20: bypass the plan cache when the transitive semi-pushdown
+    // actually fires (Q20 only), so the timed path applies it instead of
+    // serving the vanilla cached plan. Default-on; EMAT_Q20_TRANSITIVE_SEMI=0 off.
+    let q20_semi_on_check = std::env::var("EMAT_Q20_TRANSITIVE_SEMI")
+        .ok()
+        .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+        .unwrap_or(true);
+    let q20_semi_actually_fires =
+        q20_semi_on_check && rewrite_fires_for_sql(&ctx, sql, RewriteRule::Q20Semi).await;
     let any_rewrite = reorder_actually_fires
         || agg_semi_actually_fires
         || dim_push_actually_fires
+        || q20_semi_actually_fires
         || bloom_pushdown;
 
     if plan_cache_on && !any_rewrite {
@@ -1289,6 +1320,29 @@ async fn run_ematix_flow(data_dir: &Path, sql: &str) -> Trial {
                 } else {
                     plan
                 };
+                // Σ.Q20: transitive semi-pushdown (forest-parts → lineitem
+                // correlated-agg). Default-on; EMAT_Q20_TRANSITIVE_SEMI=0 to disable.
+                let plan = if std::env::var("EMAT_Q20_TRANSITIVE_SEMI")
+                    .ok()
+                    .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+                    .unwrap_or(true)
+                {
+                    match ematix_flow_core::agg_filter_pushdown::push_transitive_semi_into_agg(plan)
+                    {
+                        Ok(p) => p,
+                        Err(e) => {
+                            return Trial::Fail(format!("q20_semi: {}", short(&e.to_string())));
+                        }
+                    }
+                } else {
+                    plan
+                };
+                if std::env::var_os("EMAT_DUMP_LOGICAL").is_some() {
+                    eprintln!(
+                        "=== Q timed logical plan (post agg_semi+dim_push+q20_semi) ===\n{}",
+                        plan.display_indent()
+                    );
+                }
                 let plan = if reorder_on {
                     // Σ.AH.X Lever G (closed 2026-05-27): the shape-gated
                     // entry point exists and works on focused subsets

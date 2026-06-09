@@ -89,6 +89,194 @@ pub fn push_filter_into_agg(plan: LogicalPlan) -> DfResult<LogicalPlan> {
     Ok(transformed.data)
 }
 
+/// Σ.Q20 — transitive semi-pushdown into a correlated-aggregate.
+///
+/// Generalises [`push_filter_into_agg`] to the Q20 shape: the
+/// aggregate-side join key is matched to the OTHER side's key, but
+/// that other side is constrained NOT by a direct `Filter → TableScan`
+/// but TRANSITIVELY by a semi/inner-join to a small filtered dim. For
+/// Q20:
+///
+/// ```text
+///   Inner Join(partsupp_filt, lineitem_agg, on ps_partkey=l_partkey, ps_suppkey=l_suppkey)
+///     partsupp_filt = partsupp  ⋉/⋈  (part WHERE p_name LIKE 'forest%')   on ps_partkey=p_partkey
+///     lineitem_agg = Aggregate(group_by=[l_partkey,l_suppkey], sum(l_quantity)) → lineitem
+/// ```
+///
+/// Since `l_partkey = ps_partkey ∈ {p_partkey | forest}`, the rule
+/// splices `LeftSemi(lineitem, forest_parts, l_partkey = p_partkey)`
+/// below the aggregate — cutting the agg input from all-1994-lineitem
+/// to just forest-part lineitem. Correctness mirrors Σ.U transitively.
+///
+/// Best-effort: any shape mismatch passes through unchanged.
+pub fn push_transitive_semi_into_agg(plan: LogicalPlan) -> DfResult<LogicalPlan> {
+    let mut fires: usize = 0;
+    let transformed = plan.transform_down(|node| match node {
+        LogicalPlan::Join(ref join) if join.join_type == JoinType::Inner => {
+            match try_rewrite_q20_transitive_shape(&node) {
+                Some(rewritten) => {
+                    fires += 1;
+                    Ok(Transformed::yes(rewritten))
+                }
+                None => Ok(Transformed::no(node)),
+            }
+        }
+        _ => Ok(Transformed::no(node)),
+    })?;
+    if std::env::var("EMAT_SIGMA_Q20_DEBUG").is_ok() {
+        eprintln!("[Σ.Q20] fires={fires}");
+    }
+    Ok(transformed.data)
+}
+
+/// Try the Q20 transitive-semi rewrite on a single Inner Join node.
+///
+/// Mirrors [`try_rewrite_q17_shape`] but, instead of a direct
+/// `Filter → TableScan` on the filter side, the join key is
+/// constrained TRANSITIVELY by a semi/inner-join to a small filtered
+/// dim. The dim subtree (+ its key) is spliced as a `LeftSemi` below
+/// the aggregate.
+fn try_rewrite_q20_transitive_shape(plan: &LogicalPlan) -> Option<LogicalPlan> {
+    let LogicalPlan::Join(j) = plan else {
+        return None;
+    };
+    if j.join_type != JoinType::Inner || j.on.is_empty() {
+        return None;
+    }
+
+    let (agg_side, filter_side, agg_on_right) =
+        match (find_agg_branch(&j.left), find_agg_branch(&j.right)) {
+            (None, Some(_)) => (&j.right, &j.left, true),
+            (Some(_), None) => (&j.left, &j.right, false),
+            _ => return None,
+        };
+    let agg_info = find_agg_branch(agg_side)?;
+
+    // For each equi-pair, see whether the agg key is a group-by column
+    // AND the matching filter-side key is constrained by a transitive
+    // dim semi. Use the first pair that yields a rewrite (Q20: the
+    // partkey pair — suppkey has no dim filter).
+    for (l, r) in &j.on {
+        let (Expr::Column(lc), Expr::Column(rc)) = (l, r) else {
+            continue;
+        };
+        let (filter_c, agg_c) = if agg_on_right { (lc, rc) } else { (rc, lc) };
+        let Some(inner_agg_col) = agg_info
+            .group_by_cols
+            .iter()
+            .find(|gc| gc.name == agg_c.name)
+        else {
+            continue;
+        };
+        let Some((dim_subtree, dim_key)) = find_transitive_dim_semi(filter_side, filter_c) else {
+            continue;
+        };
+
+        // Splice LeftSemi(agg_input, dim_subtree) on (inner_agg_col = dim_key).
+        let Some(new_agg_side) =
+            splice_left_semi_into_agg(agg_side, inner_agg_col, &dim_key, dim_subtree)
+        else {
+            continue;
+        };
+
+        let new_left;
+        let new_right;
+        if agg_on_right {
+            new_left = j.left.clone();
+            new_right = new_agg_side;
+        } else {
+            new_left = new_agg_side;
+            new_right = j.right.clone();
+        }
+        return LogicalPlanBuilder::from(new_left.as_ref().clone())
+            .join_on(
+                new_right.as_ref().clone(),
+                JoinType::Inner,
+                j.on.iter()
+                    .map(|(l, r)| {
+                        Expr::BinaryExpr(BinaryExpr {
+                            left: Box::new(l.clone()),
+                            op: Operator::Eq,
+                            right: Box::new(r.clone()),
+                        })
+                    })
+                    .chain(j.filter.iter().cloned()),
+            )
+            .ok()?
+            .build()
+            .ok();
+    }
+    None
+}
+
+/// When `plan` constrains `filter_col` via a semi/inner join to a
+/// small filtered dim, return `(dim_subtree, dim_key)` — the dim's
+/// subtree (cloneable as a LeftSemi build) and the column it joins on.
+/// Walks through Projection/SubqueryAlias/Filter wrappers and recurses
+/// into join children so the constraining join can be nested.
+fn find_transitive_dim_semi(
+    plan: &LogicalPlan,
+    filter_col: &Column,
+) -> Option<(LogicalPlan, Column)> {
+    match plan {
+        LogicalPlan::Join(j)
+            if matches!(
+                j.join_type,
+                JoinType::LeftSemi | JoinType::RightSemi | JoinType::Inner
+            ) =>
+        {
+            for (l, r) in &j.on {
+                let (Expr::Column(lc), Expr::Column(rc)) = (l, r) else {
+                    continue;
+                };
+                // filter_col may sit on either side of the equi-pair;
+                // the OTHER side's key is the dim key.
+                let (dim_key, dim_side) = if lc.name == filter_col.name {
+                    (rc.clone(), &j.right)
+                } else if rc.name == filter_col.name {
+                    (lc.clone(), &j.left)
+                } else {
+                    continue;
+                };
+                if let Some(dim_subtree) = small_filtered_dim_subtree(dim_side) {
+                    return Some((dim_subtree, dim_key));
+                }
+            }
+            find_transitive_dim_semi(&j.left, filter_col)
+                .or_else(|| find_transitive_dim_semi(&j.right, filter_col))
+        }
+        LogicalPlan::Projection(p) => find_transitive_dim_semi(&p.input, filter_col),
+        LogicalPlan::SubqueryAlias(s) => find_transitive_dim_semi(&s.input, filter_col),
+        LogicalPlan::Filter(f) => find_transitive_dim_semi(&f.input, filter_col),
+        _ => None,
+    }
+}
+
+/// A subtree is a "small filtered dim" if, descending through
+/// Projection/SubqueryAlias wrappers, it reaches a `Filter` directly
+/// over a `TableScan`. This is the same shape `is_worth_pushing`
+/// requires, but tolerant of wrapper nodes (Q20's forest-parts is
+/// `SubqueryAlias → Projection → Filter → TableScan`). Returns a clone
+/// of the whole subtree (wrappers included) on success.
+fn small_filtered_dim_subtree(plan: &LogicalPlan) -> Option<LogicalPlan> {
+    fn reaches_filter_scan(p: &LogicalPlan) -> bool {
+        match p {
+            LogicalPlan::Filter(f) => {
+                matches!(f.input.as_ref(), LogicalPlan::TableScan(_))
+                    || reaches_filter_scan(&f.input)
+            }
+            LogicalPlan::Projection(pr) => reaches_filter_scan(&pr.input),
+            LogicalPlan::SubqueryAlias(s) => reaches_filter_scan(&s.input),
+            _ => false,
+        }
+    }
+    if reaches_filter_scan(plan) {
+        Some(plan.clone())
+    } else {
+        None
+    }
+}
+
 /// Try the Q17-shape rewrite on a single Inner Join node.
 fn try_rewrite_q17_shape(plan: &LogicalPlan) -> Option<LogicalPlan> {
     let LogicalPlan::Join(j) = plan else {
@@ -848,6 +1036,150 @@ mod tests {
             assert_eq!(
                 base_rows, new_rows,
                 "Q22 rewrite fired but changed row count: baseline={base_rows}, rewritten={new_rows}"
+            );
+        }
+        Ok(())
+    }
+
+    /// Σ.Q20: fires on the Q20 transitive shape — the forest-parts
+    /// semi (`partsupp ⋉ part WHERE forest`) is pushed as a NEW
+    /// `LeftSemi` below the lineitem correlated aggregate, keyed on
+    /// `l_partkey`.
+    #[tokio::test]
+    async fn fires_on_q20_shape() -> DfResult<()> {
+        let Some(dir) = sf1_dir() else {
+            eprintln!("skip: sf1 missing");
+            return Ok(());
+        };
+        let ctx = SessionContext::new();
+        register_tpch(&ctx, &dir).await?;
+        let sql = std::fs::read_to_string(
+            dir.parent()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .join("queries/q20.sql"),
+        )
+        .ok();
+        let Some(sql) = sql else {
+            eprintln!("skip: q20.sql missing");
+            return Ok(());
+        };
+        let df = ctx.sql(&sql).await?;
+        let optimized = df.into_optimized_plan()?;
+        let rewritten = push_transitive_semi_into_agg(optimized.clone())?;
+        let orig_dump = format!("{}", optimized.display_indent());
+        let new_dump = format!("{}", rewritten.display_indent());
+        assert_ne!(
+            orig_dump, new_dump,
+            "Q20 transitive rewrite should change the plan; got identical:\n{orig_dump}"
+        );
+        let orig_semis = orig_dump.matches("LeftSemi").count();
+        let new_semis = new_dump.matches("LeftSemi").count();
+        assert!(
+            new_semis > orig_semis,
+            "Q20 rewrite must ADD a LeftSemi (orig={orig_semis}, new={new_semis}):\n{new_dump}"
+        );
+        assert!(
+            new_dump.contains("l_partkey ="),
+            "the spliced LeftSemi must key on l_partkey:\n{new_dump}"
+        );
+        Ok(())
+    }
+
+    /// Σ.Q20 end-to-end correctness: the transitive semi-pushdown must
+    /// not change Q20's result. The spliced LeftSemi only drops
+    /// lineitem rows the outer join already discards (l_partkey =
+    /// ps_partkey ∈ forest-parts), so the row set is identical.
+    #[tokio::test]
+    async fn rewrite_preserves_q20_result() -> DfResult<()> {
+        let Some(dir) = sf1_dir() else {
+            eprintln!("skip: sf1 missing");
+            return Ok(());
+        };
+        let ctx = SessionContext::new();
+        register_tpch(&ctx, &dir).await?;
+        let sql = std::fs::read_to_string(
+            dir.parent()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .join("queries/q20.sql"),
+        )
+        .ok();
+        let Some(sql) = sql else {
+            eprintln!("skip: q20.sql missing");
+            return Ok(());
+        };
+
+        // Baseline: sorted (s_name, s_address) tuples.
+        let extract = |batches: &[datafusion::arrow::record_batch::RecordBatch]| -> Vec<String> {
+            use datafusion::arrow::array::StringViewArray;
+            let mut rows = Vec::new();
+            for b in batches {
+                let names = b.column(0).as_any().downcast_ref::<StringViewArray>();
+                let addrs = b.column(1).as_any().downcast_ref::<StringViewArray>();
+                if let (Some(n), Some(a)) = (names, addrs) {
+                    for i in 0..b.num_rows() {
+                        rows.push(format!("{}|{}", n.value(i), a.value(i)));
+                    }
+                }
+            }
+            rows.sort();
+            rows
+        };
+        let baseline_batches = ctx.sql(&sql).await?.collect().await?;
+        let baseline = extract(&baseline_batches);
+
+        let optimized = ctx.sql(&sql).await?.into_optimized_plan()?;
+        let rewritten = push_transitive_semi_into_agg(optimized)?;
+        let new_batches = ctx.execute_logical_plan(rewritten).await?.collect().await?;
+        let new = extract(&new_batches);
+
+        assert!(!baseline.is_empty(), "Q20 baseline produced no rows");
+        assert_eq!(
+            baseline.len(),
+            new.len(),
+            "Q20 transitive rewrite changed row count: baseline={}, rewritten={}",
+            baseline.len(),
+            new.len()
+        );
+        assert_eq!(
+            baseline, new,
+            "Q20 transitive rewrite changed the (s_name, s_address) result set"
+        );
+        Ok(())
+    }
+
+    /// Σ.Q20 specificity: the transitive rule is a NO-OP on shapes it
+    /// doesn't target — Q02 (correlated MIN over partsupp, but the
+    /// filter side is a direct `Filter → TableScan` handled by Σ.U, not
+    /// the transitive-dim-semi path) and Q17 (single-table correlated
+    /// AVG, no dim semi at all).
+    #[tokio::test]
+    async fn transitive_no_op_on_q02_q17() -> DfResult<()> {
+        let Some(dir) = sf1_dir() else {
+            eprintln!("skip: sf1 missing");
+            return Ok(());
+        };
+        let ctx = SessionContext::new();
+        register_tpch(&ctx, &dir).await?;
+        for q in ["q02", "q17"] {
+            let path = dir
+                .parent()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .join(format!("queries/{q}.sql"));
+            let Some(sql) = std::fs::read_to_string(&path).ok() else {
+                continue;
+            };
+            let optimized = ctx.sql(&sql).await?.into_optimized_plan()?;
+            let rewritten = push_transitive_semi_into_agg(optimized.clone())?;
+            assert_eq!(
+                format!("{}", optimized.display_indent()),
+                format!("{}", rewritten.display_indent()),
+                "{q}: transitive semi rule must be a no-op (targets only the Q20 dim-semi→agg shape)"
             );
         }
         Ok(())
