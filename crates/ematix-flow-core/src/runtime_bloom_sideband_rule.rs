@@ -1192,26 +1192,31 @@ mod tests {
         );
     }
 
-    /// KEYS.5.d — a string build above EMAT_L9_SET_THRESHOLD (32_768)
-    /// overflows the exact set, so the emitter publishes a StringInBloom.
-    /// This drives the StringInBloom branch of build_bitmap end-to-end and
+    /// KEYS.5.d — a string build above EMAT_L9_SET_THRESHOLD overflows
+    /// the exact set, so the emitter publishes a StringInBloom. This
+    /// drives the StringInBloom branch of build_bitmap end-to-end and
     /// proves bloom false-positives are caught by the residual join (the
-    /// final row count stays exact). Both sides have >32_768 distinct keys,
-    /// so the path is the bloom regardless of which side becomes the build.
+    /// final row count stays exact). Both sides exceed the threshold,
+    /// so the path is the bloom regardless of which side becomes the
+    /// build. Sized off `l9_set_threshold()` so it tracks the default
+    /// (L9.SETCAP raised it).
     #[tokio::test]
     async fn rule_string_join_uses_bloom_above_threshold() {
         let dim = tmp_parquet("dim_bloom_str");
         let fact = tmp_parquet("fact_bloom_str");
-        // dim: 33_000 distinct keys (> 32_768 → set overflows → bloom).
-        let dim_keys: Vec<String> = (0..33_000).map(|i| format!("d{i:06}")).collect();
+        // dim: threshold+16 distinct keys (set overflows → bloom).
+        let n_over = crate::build_side_bloom_emitter_exec::l9_set_threshold() + 16;
+        let dim_keys: Vec<String> = (0..n_over).map(|i| format!("d{i:06}")).collect();
         let dim_refs: Vec<&str> = dim_keys.iter().map(|s| s.as_str()).collect();
         write_utf8_parquet(&dim, ("d_key", &dim_refs), None);
-        // fact: 40_000 rows; first 20_000 match dim (d000000..d019999), last
-        // 20_000 don't (z...). 40_000 distinct keys → also the bloom path if
-        // it ends up the build side.
-        let fact_keys: Vec<String> = (0..40_000)
+        // fact: n_over+more rows; first half match dim, rest don't (z...).
+        // Also above the threshold so the bloom path holds if it ends up
+        // the build side.
+        let n_fact = n_over + 16;
+        let half_fact = n_fact / 2;
+        let fact_keys: Vec<String> = (0..n_fact)
             .map(|i| {
-                if i < 20_000 {
+                if i < half_fact {
                     format!("d{i:06}")
                 } else {
                     format!("z{i:06}")
@@ -1219,7 +1224,7 @@ mod tests {
             })
             .collect();
         let fact_refs: Vec<&str> = fact_keys.iter().map(|s| s.as_str()).collect();
-        let fact_vals: Vec<i64> = (0..40_000).collect();
+        let fact_vals: Vec<i64> = (0..n_fact as i64).collect();
         write_utf8_parquet(&fact, ("f_key", &fact_refs), Some(("f_val", &fact_vals)));
 
         let cfg = SessionConfig::new().with_target_partitions(4);
@@ -1258,12 +1263,12 @@ mod tests {
             s.contains("BuildSideBloomEmitterExec"),
             "expected the L9 wrapper on the bloom-path string join:\n{s}"
         );
-        // Exactly the 20_000 matching fact rows — any bloom false-positives on
-        // the 20_000 z-keys are dropped by the residual HashJoin equality test.
+        // Exactly the matching fact rows — any bloom false-positives on
+        // the z-keys are dropped by the residual HashJoin equality test.
         let batches = df.collect().await.unwrap();
         let row_count: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(
-            row_count, 20_000,
+            row_count, half_fact,
             "bloom-path string join must stay exact (residual join filters FPs)"
         );
     }

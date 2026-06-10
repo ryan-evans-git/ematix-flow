@@ -60,13 +60,21 @@ use crate::i64_set::I64Set;
 
 /// L9.HashSet (2026-05-24) — publish an exact `I64Set` instead of a
 /// probabilistic `BloomFilter` when the total accumulated build size
-/// is at or below this many keys. Default = 32_768 (256 KB / set);
-/// override via `EMAT_L9_SET_THRESHOLD`. See [`i64_set`] module docs
-/// for why this is faster on small builds.
-const DEFAULT_L9_SET_THRESHOLD: usize = 32_768;
+/// is at or below this many keys. Override via `EMAT_L9_SET_THRESHOLD`.
+/// See [`i64_set`] module docs for why this is faster on small builds.
+///
+/// L9.SETCAP (2026-06-10): raised 32_768 → 262_144. With L9.SETSIZE
+/// (set sized by actual keys) the memory bound is ~16 MB transient at
+/// the cap, and with L9.PROBEORDER the probe runs masked after the
+/// cheap static predicates, so a larger exact set no longer risks a
+/// full-table probe. Exact sets beat blooms per-probe (1.3 vs 17.2
+/// ns at 2K keys) and have zero false positives → smaller downstream.
+/// Measured: Q20 SF=100 1405 → 1236 ms (forest-parts 217K keys now
+/// publish exact instead of falling to the bloom).
+const DEFAULT_L9_SET_THRESHOLD: usize = 262_144;
 
 #[inline]
-fn l9_set_threshold() -> usize {
+pub(crate) fn l9_set_threshold() -> usize {
     std::env::var("EMAT_L9_SET_THRESHOLD")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -410,7 +418,18 @@ impl ExecutionPlan for BuildSideBloomEmitterExec {
         // stream-end finalize (transfer-into-shared) can both touch
         // them. Mutex is uncontended in practice — one partition owns
         // its locals.
-        let local_inner = Arc::new(Mutex::new(BloomFilter::for_keys(expected_per_part)));
+        // L9.BLOOMSIZE (2026-06-10): floor the incremental bloom's
+        // sizing at the set threshold. This bloom is only PUBLISHED
+        // when sets overflow — i.e. when this partition (or the merged
+        // total) holds ≥ set_threshold keys — so sizing it by the
+        // plan-time estimate alone saturates it whenever the estimate
+        // lies low (Q20 SF=100: estimate 714/partition, actual 15.5K →
+        // fp ≈ 100% → the probe-side scan paid 600M probes for zero
+        // filtering). The floor costs ~40KB per partition and bounds
+        // the overload at roughly actual/threshold.
+        let local_inner = Arc::new(Mutex::new(BloomFilter::for_keys(
+            expected_per_part.max(l9_set_threshold()),
+        )));
         let local_for_map = local_inner.clone();
         // Set option: `Some(_)` while still under threshold; replaced
         // with `None` (and dropped) once it overflows. Sized for the
@@ -680,14 +699,44 @@ impl ExecutionPlan for BuildSideBloomEmitterExec {
 
                                 let shared_bloom: Option<Arc<BloomFilter>> = if shared_set.is_none()
                                 {
-                                    let mut all_blooms = shared_blooms.lock().unwrap();
-                                    if let Some(mut merged) = all_blooms.pop() {
-                                        while let Some(other) = all_blooms.pop() {
-                                            let _ = merged.union_with(&other);
+                                    // L9.BLOOMSIZE (2026-06-10): when every
+                                    // partition's exact set survived (only
+                                    // the MERGED count crossed the
+                                    // threshold), the true keys are all here
+                                    // — build a right-sized bloom from them
+                                    // instead of unioning the incremental
+                                    // per-partition blooms, whose sizing came
+                                    // from the plan-time estimate. Q20
+                                    // SF=100: estimate 10K vs 217K actual
+                                    // forest-part keys -> the union bloom
+                                    // saturated (fp ~100%) and the lineitem
+                                    // scan paid 600M probes for zero
+                                    // filtering.
+                                    if all_some {
+                                        let total_keys: usize =
+                                            sets.iter().flatten().map(|s| s.len()).sum();
+                                        let mut rebuilt = BloomFilter::for_keys(total_keys.max(64));
+                                        for s in sets.iter().flatten() {
+                                            for k in s.iter() {
+                                                rebuilt.insert_i64(k);
+                                            }
                                         }
-                                        Some(Arc::new(merged))
+                                        Some(Arc::new(rebuilt))
                                     } else {
-                                        None
+                                        // Some partition's set itself
+                                        // overflowed — exact keys are gone;
+                                        // union the incremental blooms
+                                        // (floored at the set threshold, so
+                                        // overload is bounded).
+                                        let mut all_blooms = shared_blooms.lock().unwrap();
+                                        if let Some(mut merged) = all_blooms.pop() {
+                                            while let Some(other) = all_blooms.pop() {
+                                                let _ = merged.union_with(&other);
+                                            }
+                                            Some(Arc::new(merged))
+                                        } else {
+                                            None
+                                        }
                                     }
                                 } else {
                                     None
@@ -802,7 +851,18 @@ impl BuildSideBloomEmitterExec {
         // an exact string set; both wrapped so the per-batch map closure and
         // the stream-end finalize can touch them. Uncontended (one partition
         // owns its locals).
-        let local_inner = Arc::new(Mutex::new(BloomFilter::for_keys(expected_per_part)));
+        // L9.BLOOMSIZE (2026-06-10): floor the incremental bloom's
+        // sizing at the set threshold. This bloom is only PUBLISHED
+        // when sets overflow — i.e. when this partition (or the merged
+        // total) holds ≥ set_threshold keys — so sizing it by the
+        // plan-time estimate alone saturates it whenever the estimate
+        // lies low (Q20 SF=100: estimate 714/partition, actual 15.5K →
+        // fp ≈ 100% → the probe-side scan paid 600M probes for zero
+        // filtering). The floor costs ~40KB per partition and bounds
+        // the overload at roughly actual/threshold.
+        let local_inner = Arc::new(Mutex::new(BloomFilter::for_keys(
+            expected_per_part.max(l9_set_threshold()),
+        )));
         let local_for_map = local_inner.clone();
         let initial_set_cap = expected_per_part.min(set_threshold);
         let local_set_inner: Arc<Mutex<Option<std::collections::HashSet<String>>>> =
@@ -929,14 +989,44 @@ impl BuildSideBloomEmitterExec {
 
                                 let shared_bloom: Option<Arc<BloomFilter>> = if shared_set.is_none()
                                 {
-                                    let mut all_blooms = shared_blooms.lock().unwrap();
-                                    if let Some(mut merged) = all_blooms.pop() {
-                                        while let Some(other) = all_blooms.pop() {
-                                            let _ = merged.union_with(&other);
+                                    // L9.BLOOMSIZE (2026-06-10): when every
+                                    // partition's exact set survived (only
+                                    // the MERGED count crossed the
+                                    // threshold), the true keys are all here
+                                    // — build a right-sized bloom from them
+                                    // instead of unioning the incremental
+                                    // per-partition blooms, whose sizing came
+                                    // from the plan-time estimate. Q20
+                                    // SF=100: estimate 10K vs 217K actual
+                                    // forest-part keys -> the union bloom
+                                    // saturated (fp ~100%) and the lineitem
+                                    // scan paid 600M probes for zero
+                                    // filtering.
+                                    if all_some {
+                                        let total_keys: usize =
+                                            sets.iter().flatten().map(|s| s.len()).sum();
+                                        let mut rebuilt = BloomFilter::for_keys(total_keys.max(64));
+                                        for s in sets.iter().flatten() {
+                                            for k in s {
+                                                rebuilt.insert_str(k);
+                                            }
                                         }
-                                        Some(Arc::new(merged))
+                                        Some(Arc::new(rebuilt))
                                     } else {
-                                        None
+                                        // Some partition's set itself
+                                        // overflowed — exact keys are gone;
+                                        // union the incremental blooms
+                                        // (floored at the set threshold, so
+                                        // overload is bounded).
+                                        let mut all_blooms = shared_blooms.lock().unwrap();
+                                        if let Some(mut merged) = all_blooms.pop() {
+                                            while let Some(other) = all_blooms.pop() {
+                                                let _ = merged.union_with(&other);
+                                            }
+                                            Some(Arc::new(merged))
+                                        } else {
+                                            None
+                                        }
                                     }
                                 } else {
                                     None
@@ -1203,13 +1293,13 @@ mod tests {
 
     #[tokio::test]
     async fn publishes_bloom_when_build_exceeds_set_threshold() {
-        // L9.HashSet — with a build that genuinely exceeds the 32K
-        // default threshold, every partition's set overflows and we
-        // fall back to the bloom path. We use 40_000 distinct keys
-        // (well past 32_768) to drive the overflow without mutating
-        // the global env var (which would race with other parallel
-        // tests in this crate).
-        let n_keys = 40_000i64;
+        // L9.HashSet — with a build that genuinely exceeds the set
+        // threshold, every partition's set overflows and we fall back
+        // to the bloom path. Sized off `l9_set_threshold()` so the
+        // test tracks the default (L9.SETCAP raised it) without
+        // mutating the global env var (which would race with other
+        // parallel tests in this crate).
+        let n_keys = l9_set_threshold() as i64 + 16;
         let keys: Vec<i64> = (0..n_keys).collect();
         let ctx = SessionContext::new();
         let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, false)]));
@@ -1252,6 +1342,95 @@ mod tests {
             }
             other => panic!("expected I64InBloom after overflow, got {other:?}"),
         }
+    }
+
+    /// L9.BLOOMSIZE — drive a build through the emitter with a LYING
+    /// `expected_keys` (the plan-time estimate the L9 rule produces;
+    /// Q20 SF=100 estimated 714/partition while 15.5K arrived) and
+    /// return the published bloom's false-positive rate on absent keys.
+    async fn overflow_bloom_fp_rate(partitions: Vec<Vec<i64>>, expected_keys: usize) -> f64 {
+        let ctx = SessionContext::new();
+        let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, false)]));
+        let max_key = partitions.iter().flatten().copied().max().unwrap_or(0);
+        let parts: Vec<Vec<RecordBatch>> = partitions
+            .into_iter()
+            .map(|keys| vec![make_batch(keys)])
+            .collect();
+        let mt = MemTable::try_new(schema.clone(), parts).unwrap();
+        ctx.register_table("t", Arc::new(mt)).unwrap();
+        let plan = ctx
+            .sql("SELECT k FROM t")
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+        let sideband = BridgeFilterSideband::new();
+        let wrapper =
+            BuildSideBloomEmitterExec::try_new(plan, 0, 42, sideband.clone(), expected_keys)
+                .unwrap();
+        let n = wrapper.properties().output_partitioning().partition_count();
+        for p in 0..n {
+            let mut s = wrapper
+                .execute(p, Arc::new(TaskContext::default()))
+                .unwrap();
+            while let Some(_batch) = s.try_next().await.unwrap() {}
+        }
+        let preds = sideband.peek().expect("sideband was not published to");
+        let bloom = preds
+            .iter()
+            .find_map(|p| match p {
+                ColumnPredicate::I64InBloom { bloom, .. } => Some(bloom.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("expected I64InBloom after overflow, got {preds:?}"));
+        let absent_probes = 20_000;
+        let fp = (0..absent_probes)
+            .filter(|i| bloom.might_contain_i64(max_key + 1 + i))
+            .count();
+        fp as f64 / absent_probes as f64
+    }
+
+    /// L9.BLOOMSIZE (2026-06-10) — when every partition's exact set
+    /// survives locally but the MERGED count exceeds the threshold,
+    /// the published bloom must be rebuilt from the exact keys at the
+    /// true size, NOT unioned from the per-partition incremental
+    /// blooms sized by the (wrong) plan-time estimate. Pre-fix: 40K
+    /// keys into blooms sized for 64 → saturated → fp ≈ 100% → the
+    /// probe-side scan pays 600M probes for zero filtering (Q20
+    /// SF=100, forest-parts 217K keys vs estimate 10K).
+    #[tokio::test]
+    async fn bloomsize_overflow_bloom_rebuilt_from_exact_keys() {
+        // 2 partitions × (threshold/2 + 8) keys: each local set
+        // survives (< threshold), the merged total overflows → bloom
+        // fallback. Sized off `l9_set_threshold()` so the test tracks
+        // the default.
+        let half = (l9_set_threshold() / 2 + 8) as i64;
+        let p0: Vec<i64> = (0..half).collect();
+        let p1: Vec<i64> = (half..half * 2).collect();
+        let fp = overflow_bloom_fp_rate(vec![p0, p1], 64).await;
+        assert!(
+            fp < 0.05,
+            "rebuilt-from-keys bloom must be right-sized; absent-key fp was {fp:.3}"
+        );
+    }
+
+    /// L9.BLOOMSIZE floor — when a partition's local set ITSELF
+    /// overflows (keys lost; rebuild impossible), the incremental
+    /// local bloom must have been sized at least for the set
+    /// threshold, bounding the overload when the estimate lied. 40K
+    /// keys in one partition with estimate=64: pre-fix fp ≈ 100%
+    /// (625× overload); with the threshold floor the overload is
+    /// ~1.25× → fp stays single-digit.
+    #[tokio::test]
+    async fn bloomsize_local_overflow_bloom_floored_at_threshold() {
+        let n = l9_set_threshold() as i64 + 8;
+        let p0: Vec<i64> = (0..n).collect();
+        let fp = overflow_bloom_fp_rate(vec![p0], 64).await;
+        assert!(
+            fp < 0.10,
+            "local incremental bloom must be floored at the set threshold; fp was {fp:.3}"
+        );
     }
 
     fn make_str_batch(keys: Vec<&str>) -> RecordBatch {
@@ -1360,9 +1539,10 @@ mod tests {
     #[tokio::test]
     async fn publishes_string_bloom_when_build_exceeds_threshold() {
         // KEYS.5.b — past the set threshold the string path falls back to a
-        // StringInBloom (byte-hash membership). 40_000 distinct strings
-        // overflow the 32_768 default without mutating env (avoids races).
-        let n_keys = 40_000usize;
+        // StringInBloom (byte-hash membership). Sized off
+        // `l9_set_threshold()` to overflow the default without
+        // mutating env (avoids races).
+        let n_keys = l9_set_threshold() + 16;
         let owned: Vec<String> = (0..n_keys).map(|i| format!("k{i:08}")).collect();
         let keys: Vec<&str> = owned.iter().map(|s| s.as_str()).collect();
         let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Utf8, false)]));
@@ -1579,7 +1759,7 @@ mod tests {
     /// own col_idx.
     #[tokio::test]
     async fn extras_share_bloom_arc_when_overflowing() {
-        let n_keys = 40_000i64; // overflows default 32K threshold
+        let n_keys = l9_set_threshold() as i64 + 16; // overflows the default threshold
         let keys: Vec<i64> = (0..n_keys).collect();
         let ctx = SessionContext::new();
         let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, false)]));

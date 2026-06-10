@@ -1095,43 +1095,77 @@ impl EmatArrowBatchReader {
             .ok()
             .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
             .unwrap_or(true);
-        if filter.is_runtime_i64_only() && fused_probe_enabled {
+        // L9.PROBEORDER (2026-06-10): the fused arm now covers ANY
+        // filter that carries a runtime membership probe (set/bloom)
+        // — including ones bundled with static predicates (Q20's
+        // shipdate range + forest-partkey set; Q08's p_type + part
+        // set). `eval_on_decoded_views` evaluates statics first and
+        // masks the probe to survivors, so the expensive per-row
+        // probe no longer runs on rows a 2-comparison range already
+        // killed (Q20 SF=100: 600M probes → 91M). The previous
+        // runtime-i64-ONLY gate sent the bundled shape to the legacy
+        // path, which re-decodes every predicate column from the file
+        // on top of the dense decode. Static-only pushdowns (Q12/Q19
+        // user filters, no probe) keep the legacy masked path — at
+        // their ≤4.3% pass rates the masked gather beats dense
+        // materialize (REV.23).
+        if fused_probe_enabled && (filter.is_runtime_i64_only() || filter.has_runtime_probe()) {
             self.cur_rg_total = self.cached_md.row_groups[rg].num_rows as usize;
             self.load_row_group_dense(rg)?;
-            // Find the predicate's target column in the projection.
-            // Walk cur_rg_columns to extract the i64 buffer.
             let cols = self.cur_rg_columns.as_ref().ok_or_else(|| {
                 ext("load_row_group_dense returned without cur_rg_columns".to_string())
             })?;
-            // The predicate's col_idx is a FILE-schema index. Map to
-            // projection index via self.projection (which is also a
-            // file-schema-indexed Vec).
-            let target_proj_idx = filter
-                .single_runtime_i64_col()
-                .and_then(|file_col| self.projection.iter().position(|&l| l == file_col));
-            let Some(proj_idx) = target_proj_idx else {
-                // Target column not in projection (shouldn't happen
-                // for L9-emitted predicates — the bloom key IS the
-                // join key which the projection includes). Fall
-                // through to masked path as safety.
-                self.cur_rg_columns = None;
-                return self.load_row_group_masked_legacy(rg, filter, path);
-            };
-            // Extract i64 values from the decoded column. Arrow's
-            // `Buffer::typed_data::<i64>()` validates alignment +
-            // length and returns a `&[i64]` view (no copy).
-            let i64_values: &[i64] = match &cols[proj_idx] {
-                DecodedColumn::Int64 { data, .. } => data.typed_data::<i64>(),
-                _ => {
-                    self.cur_rg_columns = None;
-                    return self.load_row_group_masked_legacy(rg, filter, path);
+            // Predicate col_idx values are FILE-schema indices; map
+            // each through self.projection into the decoded set. Any
+            // unresolvable column (not projected / string repr) makes
+            // eval return None → legacy fallback below.
+            let projection = &self.projection;
+            let eval = filter.eval_on_decoded_views(|file_col| {
+                let proj_idx = projection.iter().position(|&l| l == file_col)?;
+                match &cols[proj_idx] {
+                    DecodedColumn::Int64 { data, .. } => Some(
+                        crate::ematix_fast_parquet::DecodedView::I64(data.typed_data::<i64>()),
+                    ),
+                    DecodedColumn::Int32 { data, .. } => Some(
+                        crate::ematix_fast_parquet::DecodedView::I32(data.typed_data::<i32>()),
+                    ),
+                    DecodedColumn::Float64 { data, .. } => Some(
+                        crate::ematix_fast_parquet::DecodedView::F64(data.typed_data::<f64>()),
+                    ),
+                    _ => None,
                 }
-            };
-            let (_col, bitmap) = filter
-                .probe_i64_values_from_decoded(i64_values)
-                .ok_or_else(|| ext("probe_i64_values_from_decoded unexpectedly None"))?;
-            self.cur_rg_filter_bitmap = Some(datafusion::arrow::buffer::Buffer::from_vec(bitmap));
-            return Ok(());
+            });
+            if let Some((bitmap, total)) = eval {
+                // Route by ACTUAL popcount, not a plan-time estimate:
+                // stash the bitmap (per-batch Arrow gather) only when
+                // the surviving fraction is low; above the threshold,
+                // DISCARD it and emit dense — the downstream join /
+                // FilterExec re-applies every one of these inexact-by-
+                // design predicates, so discarding is always correct
+                // and the only sunk cost is the (statics-masked,
+                // cheap) probe. Measured SF=100: Q10 2676 vs 2836 and
+                // Q18 3019 vs 3304 with always-stash — the ~4-15%-pass
+                // bloom gathers of 24-91M rows cost more than the
+                // relieved probes. (An always-stash arm was briefly
+                // adopted off a Q05 +9% reading that turned out to be
+                // post-build thermal drift — Q05 carries no wrap at
+                // all; the trace shows every candidate gate-rejected.)
+                // Same REV.23 threshold: gather wins ≤4.3%, dense wins
+                // ≥15%, 0.10 sits in the gap.
+                let popcount: usize = bitmap.iter().map(|b| b.count_ones() as usize).sum();
+                if total == 0
+                    || (popcount as f64 / total as f64) <= masked_dense_passrate_threshold()
+                {
+                    self.cur_rg_filter_bitmap =
+                        Some(datafusion::arrow::buffer::Buffer::from_vec(bitmap));
+                }
+                return Ok(());
+            }
+            // Some predicate column isn't decodable from the dense
+            // projection (string predicate, col not projected). Drop
+            // the dense decode and use the legacy bitmap path.
+            self.cur_rg_columns = None;
+            return self.load_row_group_masked_legacy(rg, filter, path);
         }
         self.load_row_group_masked_legacy(rg, filter, path)
     }

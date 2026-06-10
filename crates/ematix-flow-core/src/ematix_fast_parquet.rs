@@ -304,6 +304,232 @@ impl BridgeFilter {
         }
         Some((first_col, bitmap))
     }
+
+    /// L9.PROBEORDER — does this filter carry a runtime membership
+    /// probe (set/bloom) from the L9 sideband? These are the expensive
+    /// per-row predicates (hash + lookup vs 2 comparisons); the fused
+    /// multi-predicate path orders them LAST so they only run on rows
+    /// that survived the cheap static predicates.
+    pub fn has_runtime_probe(&self) -> bool {
+        self.predicates.iter().any(|p| {
+            matches!(
+                p,
+                ColumnPredicate::I64InSet { .. } | ColumnPredicate::I64InBloom { .. }
+            )
+        })
+    }
+
+    /// L9.PROBEORDER (2026-06-10) — evaluate ALL predicates against
+    /// already-decoded column buffers, in cost order: static
+    /// comparisons (ranges / IN / column-pair) build the bitmap first,
+    /// then set/bloom membership probes run MASKED — only on rows
+    /// still set. On Q20 SF=100 the unordered path probed the 217K-key
+    /// partkey set on all 600M rows (+2.4s CPU) even though the
+    /// bundled shipdate range leaves only 15% alive; masked ordering
+    /// probes 91M instead.
+    ///
+    /// `resolve` maps a FILE-schema column index to the decoded buffer
+    /// view (the caller holds the dense-decoded row group). Returns
+    /// `None` — caller falls back to the legacy double-decode path —
+    /// when any predicate targets an unresolvable column (not in the
+    /// projection / unsupported decoded repr) or is a string shape
+    /// (dict-preserved string eval stays in `build_bitmap`), or when
+    /// resolved column lengths disagree.
+    pub(crate) fn eval_on_decoded_views<'a>(
+        &self,
+        resolve: impl Fn(usize) -> Option<DecodedView<'a>>,
+    ) -> Option<(Vec<u8>, usize)> {
+        if self.predicates.is_empty() {
+            return None;
+        }
+        // Resolve + validate every predicate's column(s) up front so a
+        // late unsupported predicate can't leave a half-built bitmap.
+        enum Bound<'p, 'a> {
+            I64(&'p ColumnPredicate, &'a [i64]),
+            I32(&'p ColumnPredicate, &'a [i32]),
+            F64(&'p ColumnPredicate, &'a [f64]),
+            I32Pair {
+                left: &'a [i32],
+                right: &'a [i32],
+                op: Operator,
+            },
+        }
+        let mut statics: Vec<Bound<'_, 'a>> = Vec::new();
+        let mut probes: Vec<Bound<'_, 'a>> = Vec::new();
+        let mut total: Option<usize> = None;
+        let check_len = |len: usize, total: &mut Option<usize>| -> bool {
+            match total {
+                None => {
+                    *total = Some(len);
+                    true
+                }
+                Some(t) => *t == len,
+            }
+        };
+        for p in &self.predicates {
+            match p {
+                ColumnPredicate::I64Range { col_idx, .. } => {
+                    let DecodedView::I64(v) = resolve(*col_idx)? else {
+                        return None;
+                    };
+                    if !check_len(v.len(), &mut total) {
+                        return None;
+                    }
+                    statics.push(Bound::I64(p, v));
+                }
+                ColumnPredicate::I64InSet { col_idx, .. }
+                | ColumnPredicate::I64InBloom { col_idx, .. } => {
+                    let DecodedView::I64(v) = resolve(*col_idx)? else {
+                        return None;
+                    };
+                    if !check_len(v.len(), &mut total) {
+                        return None;
+                    }
+                    probes.push(Bound::I64(p, v));
+                }
+                ColumnPredicate::I32Range { col_idx, .. }
+                | ColumnPredicate::I32In { col_idx, .. } => {
+                    let DecodedView::I32(v) = resolve(*col_idx)? else {
+                        return None;
+                    };
+                    if !check_len(v.len(), &mut total) {
+                        return None;
+                    }
+                    statics.push(Bound::I32(p, v));
+                }
+                ColumnPredicate::F64Range { col_idx, .. } => {
+                    let DecodedView::F64(v) = resolve(*col_idx)? else {
+                        return None;
+                    };
+                    if !check_len(v.len(), &mut total) {
+                        return None;
+                    }
+                    statics.push(Bound::F64(p, v));
+                }
+                ColumnPredicate::I32ColumnPair {
+                    left_col,
+                    right_col,
+                    op,
+                } => {
+                    let DecodedView::I32(left) = resolve(*left_col)? else {
+                        return None;
+                    };
+                    let DecodedView::I32(right) = resolve(*right_col)? else {
+                        return None;
+                    };
+                    if !check_len(left.len(), &mut total) || left.len() != right.len() {
+                        return None;
+                    }
+                    statics.push(Bound::I32Pair {
+                        left,
+                        right,
+                        op: *op,
+                    });
+                }
+                // String shapes need the dict-preserved decode path.
+                _ => return None,
+            }
+        }
+        let total = total?;
+        let mut bitmap = vec![0u8; total.div_ceil(8)];
+
+        let eval_row = |b: &Bound<'_, 'a>, row: usize| -> bool {
+            match b {
+                Bound::I64(p, v) => match p {
+                    ColumnPredicate::I64Range { lo, hi, .. } => v[row] >= *lo && v[row] <= *hi,
+                    ColumnPredicate::I64InSet { set, .. } => set.contains(v[row]),
+                    ColumnPredicate::I64InBloom { bloom, .. } => bloom.might_contain_i64(v[row]),
+                    _ => unreachable!("Bound::I64 holds only i64 predicate shapes"),
+                },
+                Bound::I32(p, v) => p.eval_i32(v[row]),
+                Bound::F64(p, v) => p.eval_f64(v[row]),
+                Bound::I32Pair { left, right, op } => {
+                    let (l, r) = (left[row], right[row]);
+                    match op {
+                        Operator::Lt => l < r,
+                        Operator::LtEq => l <= r,
+                        Operator::Gt => l > r,
+                        Operator::GtEq => l >= r,
+                        Operator::Eq => l == r,
+                        Operator::NotEq => l != r,
+                        _ => false,
+                    }
+                }
+            }
+        };
+
+        let mut first = true;
+        for b in statics.iter().chain(probes.iter()) {
+            if first {
+                // Full pass, chunk-of-8 byte packing (avoids the
+                // read-modify-write bitmap serialisation).
+                match b {
+                    Bound::I64(p, v) => match p {
+                        ColumnPredicate::I64Range { lo, hi, .. } => {
+                            let (lo, hi) = (*lo, *hi);
+                            probe_chunks_into_bitmap(v, &mut bitmap, |x| x >= lo && x <= hi);
+                        }
+                        ColumnPredicate::I64InSet { set, .. } => {
+                            probe_chunks_into_bitmap(v, &mut bitmap, |x| set.contains(x));
+                        }
+                        ColumnPredicate::I64InBloom { bloom, .. } => {
+                            probe_chunks_into_bitmap(v, &mut bitmap, |x| {
+                                bloom.might_contain_i64(x)
+                            });
+                        }
+                        _ => unreachable!("Bound::I64 holds only i64 predicate shapes"),
+                    },
+                    _ => {
+                        for row in 0..total {
+                            if eval_row(b, row) {
+                                bitmap[row >> 3] |= 1 << (row & 7);
+                            }
+                        }
+                    }
+                }
+                first = false;
+            } else {
+                and_eval_masked(&mut bitmap, total, |row| eval_row(b, row));
+            }
+            // Early exit: nothing survives, later predicates are moot.
+            if bitmap.iter().all(|&x| x == 0) {
+                break;
+            }
+        }
+        Some((bitmap, total))
+    }
+}
+
+/// L9.PROBEORDER — view over an already-decoded column buffer, used by
+/// [`BridgeFilter::eval_on_decoded_views`]. The reader maps its
+/// `DecodedColumn` reprs into these slices (zero-copy `typed_data`).
+pub(crate) enum DecodedView<'a> {
+    I64(&'a [i64]),
+    I32(&'a [i32]),
+    F64(&'a [f64]),
+}
+
+/// L9.PROBEORDER — AND a predicate into `bitmap`, evaluating ONLY rows
+/// whose bit is currently set (whole zero bytes are skipped, so cost
+/// scales with surviving rows, not total rows). `eval` takes the row
+/// index so mixed column types and column-pair predicates share one
+/// helper.
+fn and_eval_masked(bitmap: &mut [u8], n_rows: usize, eval: impl Fn(usize) -> bool) {
+    for (byte_idx, b) in bitmap.iter_mut().enumerate() {
+        let mut cur = *b;
+        if cur == 0 {
+            continue;
+        }
+        let base = byte_idx << 3;
+        while cur != 0 {
+            let bit = cur.trailing_zeros() as usize;
+            let row = base + bit;
+            if row >= n_rows || !eval(row) {
+                *b &= !(1u8 << bit);
+            }
+            cur &= cur - 1;
+        }
+    }
 }
 
 /// Σ.AH.2 Story 1'.4 Stage 2 — process 8 i64 values per loop
@@ -3748,6 +3974,139 @@ fn decode_one_rg(
 mod tests {
     use super::*;
     use datafusion::prelude::SessionContext;
+
+    /// L9.PROBEORDER — `and_eval_masked` must evaluate ONLY rows whose
+    /// bit is set (the masked-probe contract: probe cost scales with
+    /// survivors, not total rows). A counting closure proves the skip:
+    /// 4 of 16 rows set → exactly 4 evals, on exactly those rows.
+    #[test]
+    fn probeorder_and_eval_masked_skips_cleared_rows() {
+        use std::cell::RefCell;
+        // rows 1, 3, 8, 15 set
+        let mut bitmap = vec![0b0000_1010u8, 0b1000_0001u8];
+        let evaluated: RefCell<Vec<usize>> = RefCell::new(Vec::new());
+        and_eval_masked(&mut bitmap, 16, |row| {
+            evaluated.borrow_mut().push(row);
+            row != 3 // miss on row 3 → cleared
+        });
+        assert_eq!(
+            *evaluated.borrow(),
+            vec![1, 3, 8, 15],
+            "must evaluate exactly the set rows, in order"
+        );
+        assert_eq!(bitmap, vec![0b0000_0010u8, 0b1000_0001u8]);
+
+        // Tail guard: bit set past n_rows must be cleared without eval.
+        let mut tail = vec![0b1100_0000u8];
+        let count: RefCell<usize> = RefCell::new(0);
+        and_eval_masked(&mut tail, 7, |_| {
+            *count.borrow_mut() += 1;
+            true
+        });
+        assert_eq!(*count.borrow(), 1, "row 7 is past n_rows=7 → no eval");
+        assert_eq!(tail, vec![0b0100_0000u8]);
+    }
+
+    /// L9.PROBEORDER — multi-type AND on decoded buffers: an i32 range
+    /// (the Q20 shipdate analog) plus an i64 exact-set probe (the
+    /// forest-partkey analog) must produce the same bitmap as a manual
+    /// row-by-row AND, with the probe ordered after the static.
+    #[test]
+    fn probeorder_eval_on_decoded_multi_type_and() {
+        use crate::i64_set::I64Set;
+        let dates: Vec<i32> = (0..32).map(|i| 7000 + (i % 4)).collect(); // 25% in [7000,7000]
+        let keys: Vec<i64> = (0..32).map(|i| i as i64).collect();
+        let mut set = I64Set::with_keys(16);
+        for k in [0i64, 4, 8, 12, 16, 20, 24, 28, 3, 7] {
+            set.insert(k);
+        }
+        let set = std::sync::Arc::new(set);
+        let filter = BridgeFilter::new(vec![
+            // Probe FIRST in predicate order — eval must still run it last.
+            ColumnPredicate::I64InSet {
+                col_idx: 1,
+                set: set.clone(),
+            },
+            ColumnPredicate::I32Range {
+                col_idx: 10,
+                clauses: vec![
+                    RangeClause {
+                        op: Operator::GtEq,
+                        literal_i32: 7000,
+                    },
+                    RangeClause {
+                        op: Operator::LtEq,
+                        literal_i32: 7000,
+                    },
+                ],
+            },
+        ]);
+        let (bitmap, total) = filter
+            .eval_on_decoded_views(|col| match col {
+                1 => Some(DecodedView::I64(&keys)),
+                10 => Some(DecodedView::I32(&dates)),
+                _ => None,
+            })
+            .expect("all columns resolvable → must evaluate");
+        assert_eq!(total, 32);
+        for row in 0..32usize {
+            let expect = dates[row] == 7000 && set.contains(keys[row]);
+            let got = bitmap[row >> 3] & (1 << (row & 7)) != 0;
+            assert_eq!(got, expect, "row {row}");
+        }
+    }
+
+    /// L9.PROBEORDER — fallback contract: a string predicate or an
+    /// unresolvable column must return None (caller falls back to the
+    /// legacy build_bitmap path); resolved-length mismatch likewise.
+    #[test]
+    fn probeorder_eval_on_decoded_falls_back_to_none() {
+        use crate::i64_set::I64Set;
+        let keys: Vec<i64> = (0..8).collect();
+        let set = std::sync::Arc::new(I64Set::with_keys(4));
+        let probe = ColumnPredicate::I64InSet {
+            col_idx: 1,
+            set: set.clone(),
+        };
+
+        // String predicate present → None.
+        let f = BridgeFilter::new(vec![
+            probe.clone(),
+            ColumnPredicate::StringEq {
+                col_idx: 2,
+                value: "x".into(),
+            },
+        ]);
+        assert!(
+            f.eval_on_decoded_views(|_| Some(DecodedView::I64(&keys)))
+                .is_none()
+        );
+
+        // Unresolvable column → None.
+        let f = BridgeFilter::new(vec![probe.clone()]);
+        assert!(f.eval_on_decoded_views(|_| None).is_none());
+
+        // Length mismatch across predicate columns → None.
+        let short: Vec<i32> = vec![7000; 4];
+        let f = BridgeFilter::new(vec![
+            probe,
+            ColumnPredicate::I32Range {
+                col_idx: 10,
+                clauses: vec![RangeClause {
+                    op: Operator::Eq,
+                    literal_i32: 7000,
+                }],
+            },
+        ]);
+        assert!(
+            f.eval_on_decoded_views(|col| match col {
+                1 => Some(DecodedView::I64(&keys)),
+                10 => Some(DecodedView::I32(&short)),
+                _ => None,
+            })
+            .is_none()
+        );
+    }
 
     /// KEYS.5 story (a) — the string runtime sideband predicates
     /// (`StringInBloom` / `StringInSet`) must (1) probe correctly via
