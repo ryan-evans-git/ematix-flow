@@ -307,6 +307,50 @@ pub fn install_force_collect_left_semi_build_rule(
         .with_physical_optimizer_rule(Arc::new(ForceCollectLeftForSemiBoundedBuildRule::default()))
 }
 
+/// Q16.SWAP — SEMI-only variant of
+/// [`build_subtree_has_semi_filter`]: true iff the subtree contains a
+/// Left/RightSemi join. Semi output is bounded by the membership-key
+/// count (usually tiny — Q18's HAVING build: 624 keys); anti output is
+/// bounded by its KEPT side (usually large), so anti must not signal
+/// "bounded-small" to the force arms.
+fn subtree_has_semi_only_filter(plan: &Arc<dyn ExecutionPlan>) -> bool {
+    if let Some(hj) = plan.as_any().downcast_ref::<HashJoinExec>() {
+        if matches!(hj.join_type(), JoinType::LeftSemi | JoinType::RightSemi) {
+            return true;
+        }
+    }
+    plan.children()
+        .iter()
+        .any(|c| subtree_has_semi_only_filter(c))
+}
+
+/// Q16.SWAP — when a side's FIRST shaping node (through partition-
+/// shuffling pass-throughs) is an anti join, return the kept-side
+/// child's known row count as that side's effective cardinality. The
+/// anti output can never exceed it; for a selective anti build it ≈
+/// equals it (Q16: 79.96M of 80M partsupp rows survive the 479-key
+/// complaint anti). Returns `None` for any other shape so the caller
+/// falls back to reported statistics.
+fn anti_topped_bound(plan: &Arc<dyn ExecutionPlan>) -> Option<usize> {
+    let any = plan.as_any();
+    if any.is::<datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec>()
+        || any.is::<datafusion::physical_plan::repartition::RepartitionExec>()
+        || any.is::<datafusion::physical_plan::projection::ProjectionExec>()
+        || any.is::<datafusion::physical_plan::coalesce_batches::CoalesceBatchesExec>()
+    {
+        return anti_topped_bound(plan.children().first()?);
+    }
+    let hj = any.downcast_ref::<HashJoinExec>()?;
+    let kept: &Arc<dyn ExecutionPlan> = match hj.join_type() {
+        JoinType::LeftAnti => hj.left(),
+        JoinType::RightAnti => hj.right(),
+        _ => return None,
+    };
+    kept.partition_statistics(None)
+        .ok()
+        .and_then(|s| s.num_rows.get_value().copied())
+}
+
 impl PhysicalOptimizerRule for ForceCollectLeftForSemiBoundedBuildRule {
     fn optimize(
         &self,
@@ -385,17 +429,29 @@ impl PhysicalOptimizerRule for ForceCollectLeftForSemiBoundedBuildRule {
                     }
                 }
             }
-            // Determine which side is semi/anti-bounded — the structural
+            // Determine which side is semi-bounded — the structural
             // signal that it is genuinely small (DataFusion's stats report
             // `Absent` for it, which is why JoinSelection picked
             // Partitioned). We want that side to be the BUILD and to be
             // broadcast (CollectLeft), so the large side streams with no
             // hash exchange.
+            //
+            // Q16.SWAP (2026-06-10): SEMI variants only. An ANTI-bounded
+            // side is NOT small — an anti-join against a selective build
+            // passes ~all of its kept input (Q16 SF=100: partsupp
+            // RightAnti vs 479 complaint suppliers → 79.96M of 80M
+            // survive). The previous 4-variant detection swapped that
+            // 80M side onto the build: a 502 ms single-threaded
+            // CollectLeft build probed by 2.97M filtered parts. Anti-
+            // topped sides are instead sized by their kept-side child's
+            // cardinality in the relative arm below (the honest upper
+            // bound), which routes the Q16 shape to "small left builds,
+            // no swap".
             // Semi-bounded detection drives the Inner-only arms below; force
             // false for semi/anti joins so they fall straight through to the
             // no-swap relative-broadcast arm (the only one safe for them).
-            let left_semi = is_inner && build_subtree_has_semi_filter(hj.left());
-            let right_semi = is_inner && build_subtree_has_semi_filter(hj.right());
+            let left_semi = is_inner && subtree_has_semi_only_filter(hj.left());
+            let right_semi = is_inner && subtree_has_semi_only_filter(hj.right());
             let min_ratio = self.min_probe_build_ratio;
             let new_join: Arc<dyn ExecutionPlan> = if left_semi && !right_semi {
                 // Semi-bounded side is already the build (left) → broadcast
@@ -456,16 +512,24 @@ impl PhysicalOptimizerRule for ForceCollectLeftForSemiBoundedBuildRule {
                 // BOTH estimates known (a real ratio, no over-estimate
                 // safety). Inherently skips the Q16-j0 trap: when the build
                 // is larger than the probe, neither inequality holds.
-                let lrows = hj
-                    .left()
-                    .partition_statistics(None)
-                    .ok()
-                    .and_then(|s| s.num_rows.get_value().copied());
-                let rrows = hj
-                    .right()
-                    .partition_statistics(None)
-                    .ok()
-                    .and_then(|s| s.num_rows.get_value().copied());
+                // Q16.SWAP: an anti-topped side reports either Absent
+                // or a bogus-small estimate (DF can't model anti
+                // selectivity) — both mis-route this arm. Override
+                // with the kept-side child's cardinality: the anti
+                // output can never exceed it, and for selective anti
+                // builds it ≈ equals it.
+                let lrows = anti_topped_bound(hj.left()).or_else(|| {
+                    hj.left()
+                        .partition_statistics(None)
+                        .ok()
+                        .and_then(|s| s.num_rows.get_value().copied())
+                });
+                let rrows = anti_topped_bound(hj.right()).or_else(|| {
+                    hj.right()
+                        .partition_statistics(None)
+                        .ok()
+                        .and_then(|s| s.num_rows.get_value().copied())
+                });
                 let k = self.broadcast_ratio;
                 match (lrows, rrows) {
                     (Some(l), Some(r)) if l > 0 && (r as f64) >= (l as f64) * k => {
@@ -650,6 +714,60 @@ mod tests {
             after.contains("CollectLeft"),
             "an Inner join whose PROBE is semi-bounded must swap onto the \
              build and CollectLeft:\n{after}"
+        );
+    }
+
+    /// Q16.SWAP (2026-06-10) — an ANTI-bounded side is NOT small: an
+    /// anti-join against a selective build passes ~all of its kept
+    /// input (Q16 SF=100: partsupp RightAnti vs 479 complaint
+    /// suppliers → 79.96M of 80M survive). Treating it like a
+    /// semi-bounded side made the rule SWAP it onto the build —
+    /// a 79.96M-row single-threaded CollectLeft build (502 ms serial)
+    /// probed by 2.97M filtered parts. The rule must instead keep the
+    /// genuinely-small left as the build: anti-topped sides count as
+    /// their kept-side child's cardinality (the honest upper bound),
+    /// which routes Q16's shape through the relative-broadcast arm as
+    /// "left small build, no swap".
+    #[test]
+    fn anti_bounded_probe_is_not_swapped_onto_the_build() {
+        // Probe (RIGHT) = RightAnti(tiny build=5, kept side=100K) →
+        // output ≈ 100K (LARGE). Build (LEFT) = 1K rows (small).
+        let anti = hashjoin(mem_table_n(5), mem_table_n(100_000), JoinType::RightAnti);
+        let top = hashjoin(mem_table_n(1_000), anti, JoinType::Inner);
+
+        let rule = ForceCollectLeftForSemiBoundedBuildRule::default();
+        let out = rule.optimize(top, &ConfigOptions::default()).unwrap();
+
+        // The Inner join must end CollectLeft with the SMALL (left)
+        // side as the build — the anti subtree must stay on the probe.
+        let mut found = false;
+        fn find_inner(plan: &Arc<dyn ExecutionPlan>, found: &mut bool) {
+            if let Some(hj) = plan.as_any().downcast_ref::<HashJoinExec>() {
+                if matches!(hj.join_type(), JoinType::Inner) {
+                    *found = true;
+                    assert!(
+                        matches!(hj.partition_mode(), PartitionMode::CollectLeft),
+                        "anti-shape Inner join should still CollectLeft (build the small side)"
+                    );
+                    assert!(
+                        !build_subtree_has_semi_filter(hj.left()),
+                        "the anti subtree must NOT be the build side:\n{plan:?}"
+                    );
+                    assert!(
+                        build_subtree_has_semi_filter(hj.right()),
+                        "the anti subtree must remain the probe side:\n{plan:?}"
+                    );
+                    return;
+                }
+            }
+            for c in plan.children() {
+                find_inner(c, found);
+            }
+        }
+        find_inner(&out, &mut found);
+        assert!(
+            found,
+            "expected an Inner HashJoinExec in the output:\n{out:?}"
         );
     }
 
