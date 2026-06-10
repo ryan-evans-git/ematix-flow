@@ -198,13 +198,31 @@ impl ExecutionPlan for EmatixHashJoinExec {
                 .await?
                 .clone();
 
-            // Probe: stream this partition's right batches through the kernel.
-            let right_stream = right.execute(partition, ctx)?;
-            let mapped = right_stream.map(move |rb| {
-                let rb: RecordBatch = rb?;
-                joiner.probe(&rb).map_err(DataFusionError::Internal)
-            });
-            Ok::<_, DataFusionError>(mapped)
+            // Probe. RADIX.2 spike: if the build is radix-partitioned, BUFFER this
+            // partition's probe batches then B-scatter-probe them in one call —
+            // each execute() gets temporal cache locality (one ~L2 sub-table active
+            // at a time; 14 execute()s → ~14 sub-tables ≈ cache-resident, no global
+            // shuffle). This is a pipeline-breaker (collect-before-probe) → it pays
+            // the decode/probe-overlap loss the wall A/B is measuring. Otherwise:
+            // the streaming per-batch probe that overlaps decode.
+            if joiner.is_radix() {
+                let batches: Vec<RecordBatch> =
+                    right.execute(partition, ctx)?.try_collect().await?;
+                let out = joiner
+                    .probe_radix_all(&batches)
+                    .map_err(DataFusionError::Internal)?;
+                Ok::<_, DataFusionError>(
+                    futures_util::stream::iter(vec![Ok::<RecordBatch, DataFusionError>(out)])
+                        .boxed(),
+                )
+            } else {
+                let right_stream = right.execute(partition, ctx)?;
+                let mapped = right_stream.map(move |rb| {
+                    let rb: RecordBatch = rb?;
+                    joiner.probe(&rb).map_err(DataFusionError::Internal)
+                });
+                Ok::<_, DataFusionError>(mapped.boxed())
+            }
         };
 
         let s = fut.try_flatten_stream();

@@ -30,7 +30,9 @@ use arrow_schema::SchemaRef;
 // take/interleave via datafusion's re-exported arrow (arrow-select is only a
 // dev-dependency of flow-core; this keeps the bridge in non-test builds).
 use datafusion::arrow::compute::{interleave, take};
-use ematix_flow_hash_join::{ProbeMatch, RobinHoodHashJoinI64Table, TaggedJoinI64U32};
+use ematix_flow_hash_join::{
+    ProbeMatch, RadixTaggedJoin, RobinHoodHashJoinI64Table, TaggedJoinI64U32,
+};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// HJ.4 fire counters (observability for the wall A/B): how many build sides
@@ -38,6 +40,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// `examples/hj4_q08_wall_ab.rs` to confirm which kernel ran.
 pub static TAG_BUILDS: AtomicU64 = AtomicU64::new(0);
 pub static RH_BUILDS: AtomicU64 = AtomicU64::new(0);
+/// RADIX.2 spike: how many build sides resolved to the radix-partitioned table.
+pub static RADIX_BUILDS: AtomicU64 = AtomicU64::new(0);
 
 /// HJ.4 opt-in (in addition to `EMAT_HASH_JOIN=1`): prefer the SIMD-tag probe
 /// table for key-UNIQUE build sides (e.g. a dimension PK). Falls back to the
@@ -48,10 +52,30 @@ fn tag_probe_enabled() -> bool {
         .unwrap_or(false)
 }
 
-/// The resolved probe structure: SIMD-tag (unique build) or chained RobinHood.
+/// RADIX.2 spike opt-in (`EMAT_HJ_RADIX=1`, in addition to `EMAT_HASH_JOIN=1`):
+/// build a per-partition [`RadixTaggedJoin`] (key-UNIQUE only) + probe via the
+/// per-execute B-scatter path ([`EmatHashJoiner::probe_radix_all`]) — the
+/// pipeline-breaking morsel join under wall-test. Default OFF.
+fn radix_enabled() -> bool {
+    std::env::var("EMAT_HJ_RADIX")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+/// Radix bit-count from build occupancy: target ~4-8K rows/partition so each
+/// sub-table is ~L2-resident (Phase-0 kernel sweep: N=1024 best for 5.7M).
+/// Parametric — never query-specific (no-TPC-H-hardcoding).
+fn radix_bits_for(build_rows: usize) -> u32 {
+    let log2 = usize::BITS - build_rows.max(1).leading_zeros(); // ⌈log2⌉-ish
+    log2.saturating_sub(12).clamp(6, 14)
+}
+
+/// The resolved probe structure: SIMD-tag (unique build), chained RobinHood, or
+/// the radix-partitioned table (unique build, B-scatter probe).
 enum ProbeTable {
     RobinHood(RobinHoodHashJoinI64Table),
     Tag(TaggedJoinI64U32),
+    Radix(RadixTaggedJoin),
 }
 
 /// Source of an output column: a column index on the build side or the
@@ -148,9 +172,22 @@ impl EmatHashJoiner {
             None
         };
 
-        // HJ.4: prefer the SIMD-tag table when opted in AND the build is
-        // key-unique (try_build returns None on a duplicate key → fall back).
-        let table = if tag_probe_enabled() {
+        // RADIX.2 spike: radix-partitioned table takes priority when opted in AND
+        // the build is key-unique. None on duplicate → fall back to chained RobinHood.
+        let table = if radix_enabled() {
+            match RadixTaggedJoin::try_build(&keys, nulls.as_deref(), radix_bits_for(keys.len())) {
+                Some(r) => {
+                    RADIX_BUILDS.fetch_add(1, Ordering::Relaxed);
+                    ProbeTable::Radix(r)
+                }
+                None => {
+                    let mut t = RobinHoodHashJoinI64Table::with_capacity(keys.len());
+                    t.insert_batch(&keys, nulls.as_deref(), 0);
+                    RH_BUILDS.fetch_add(1, Ordering::Relaxed);
+                    ProbeTable::RobinHood(t)
+                }
+            }
+        } else if tag_probe_enabled() {
             match TaggedJoinI64U32::try_build(&keys, nulls.as_deref(), 0) {
                 Some(t) => {
                     TAG_BUILDS.fetch_add(1, Ordering::Relaxed);
@@ -185,7 +222,15 @@ impl EmatHashJoiner {
         match &self.table {
             ProbeTable::RobinHood(t) => t.len(),
             ProbeTable::Tag(t) => t.len(),
+            ProbeTable::Radix(r) => r.len(),
         }
+    }
+
+    /// RADIX.2: true when this joiner built a radix-partitioned table → the
+    /// operator drives the per-execute B-scatter path ([`Self::probe_radix_all`])
+    /// instead of the streaming [`Self::probe`].
+    pub fn is_radix(&self) -> bool {
+        matches!(self.table, ProbeTable::Radix(_))
     }
 
     /// Number of retained (un-concatenated) build batches. SF100.7 diagnostic:
@@ -211,6 +256,9 @@ impl EmatHashJoiner {
         match &self.table {
             ProbeTable::RobinHood(t) => t.probe_batch(&keys, nulls.as_deref(), 0, &mut matches),
             ProbeTable::Tag(t) => t.probe_batch(&keys, nulls.as_deref(), 0, &mut matches),
+            // Per-batch B-scatter (correct, but cross-batch locality only comes from
+            // the operator's collected-set path; this keeps `probe` total).
+            ProbeTable::Radix(r) => r.probe_batch(&keys, nulls.as_deref(), 0, &mut matches),
         }
 
         let probe_idx = UInt32Array::from_iter_values(matches.iter().map(|m| m.probe_row_idx));
@@ -257,6 +305,102 @@ impl EmatHashJoiner {
         RecordBatch::try_new(self.output_schema.clone(), cols)
             .map_err(|e| format!("assemble output batch: {e}"))
     }
+
+    /// RADIX.2 B-scatter probe over a COLLECTED set of probe batches (the
+    /// operator buffers one probe partition, then calls this once). Scatters all
+    /// probe keys into the radix partition buffers, probes each sub-table
+    /// partition-by-partition (temporal cache locality — one ~L2-resident
+    /// sub-table active at a time), and gathers ONE output batch via `interleave`
+    /// over both the collected probe batches and the un-concatenated build
+    /// batches. Match order is by radix partition — irrelevant for an Inner join
+    /// feeding an aggregate. Errors if called on a non-radix joiner.
+    pub fn probe_radix_all(&self, probe_batches: &[RecordBatch]) -> Result<RecordBatch, String> {
+        let radix = match &self.table {
+            ProbeTable::Radix(r) => r,
+            _ => return Err("probe_radix_all on a non-radix joiner".into()),
+        };
+        if probe_batches.is_empty() {
+            return Ok(RecordBatch::new_empty(self.output_schema.clone()));
+        }
+        let n_part = radix.num_partitions();
+        // Probe-side global-row → (batch, local) offset map (trailing total).
+        let mut p_off: Vec<u32> = Vec::with_capacity(probe_batches.len() + 1);
+        let mut acc = 0u32;
+        for b in probe_batches {
+            p_off.push(acc);
+            acc = acc
+                .checked_add(b.num_rows() as u32)
+                .ok_or("probe side exceeds u32::MAX rows")?;
+        }
+        p_off.push(acc);
+        // Scatter (key, global_probe_row) into N partition buffers.
+        let est = acc as usize / n_part + 1;
+        let mut bk: Vec<Vec<i64>> = (0..n_part).map(|_| Vec::with_capacity(est)).collect();
+        let mut bx: Vec<Vec<u32>> = (0..n_part).map(|_| Vec::with_capacity(est)).collect();
+        for (bi, b) in probe_batches.iter().enumerate() {
+            let (keys, nulls) =
+                key_as_i64(b.column(self.probe_key_idx)).ok_or("unsupported probe key type")?;
+            let base = p_off[bi];
+            for (i, &k) in keys.iter().enumerate() {
+                if let Some(m) = &nulls {
+                    if !m[i] {
+                        continue; // NULL probe key never matches
+                    }
+                }
+                let p = radix.partition_of(k);
+                bk[p].push(k);
+                bx[p].push(base + i as u32);
+            }
+        }
+        // Per-partition probe — one cache-resident sub-table at a time.
+        let mut matches: Vec<ProbeMatch> = Vec::new();
+        for p in 0..n_part {
+            radix.subtable(p).probe_pairs(&bk[p], &bx[p], &mut matches);
+        }
+        // Gather one output batch. Both sides via `interleave` over their
+        // un-concatenated batches (matches are grouped by partition, so probe
+        // rows span the collected batches just as build rows do).
+        let probe_pairs: Vec<(usize, usize)> = matches
+            .iter()
+            .map(|m| locate_in(&p_off, m.probe_row_idx))
+            .collect();
+        let build_pairs: Vec<(usize, usize)> = matches
+            .iter()
+            .map(|m| self.locate(m.build_row_idx))
+            .collect();
+        let cols: Vec<ArrayRef> = self
+            .output
+            .iter()
+            .map(|jc| match jc {
+                JoinColumn::Probe(i) => {
+                    let arrays: Vec<&dyn Array> = probe_batches
+                        .iter()
+                        .map(|b| b.column(*i).as_ref())
+                        .collect();
+                    interleave(&arrays, &probe_pairs)
+                }
+                JoinColumn::Build(i) => {
+                    let arrays: Vec<&dyn Array> = self
+                        .build_batches
+                        .iter()
+                        .map(|b| b.column(*i).as_ref())
+                        .collect();
+                    interleave(&arrays, &build_pairs)
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("radix gather: {e}"))?;
+        RecordBatch::try_new(self.output_schema.clone(), cols)
+            .map_err(|e| format!("assemble radix output batch: {e}"))
+    }
+}
+
+/// Map a global row index to `(batch, local)` given ascending batch offsets with
+/// a trailing total — the probe-side mirror of [`EmatHashJoiner::locate`].
+#[inline]
+fn locate_in(offsets: &[u32], global: u32) -> (usize, usize) {
+    let k = offsets.partition_point(|&o| o <= global) - 1;
+    (k, (global - offsets[k]) as usize)
 }
 
 #[cfg(test)]
@@ -411,5 +555,59 @@ mod tests {
         assert!(got.contains(&("c0".to_string(), 40)), "batch2 payload");
         assert!(got.contains(&("b0".to_string(), 30)), "batch1 payload");
         assert!(got.contains(&("a0".to_string(), 10)), "batch0 payload");
+    }
+
+    #[test]
+    fn radix_probe_all_matches_naive_cross_batch() {
+        // RADIX.2: force radix mode, build across 2 batches, probe across 2 batches
+        // → exercises the scatter + the cross-batch interleave gather on BOTH sides.
+        // (No other test reads EMAT_HJ_RADIX; set is scoped tightly around the build.)
+        unsafe { std::env::set_var("EMAT_HJ_RADIX", "1") };
+        let b0 = kv_batch(vec![10, 20, 30], vec!["a", "b", "c"]); // build rows 0,1,2
+        let b1 = kv_batch(vec![40, 50], vec!["d", "e"]); // build rows 3,4
+        let out_schema = Arc::new(Schema::new(vec![
+            Field::new("v", DataType::Utf8, false),   // build payload
+            Field::new("k", DataType::Int64, false),  // build key
+            Field::new("pk", DataType::Int64, false), // probe key
+        ]));
+        let j = EmatHashJoiner::try_build(
+            &[b0, b1],
+            0,
+            0,
+            vec![
+                JoinColumn::Build(1),
+                JoinColumn::Build(0),
+                JoinColumn::Probe(0),
+            ],
+            out_schema,
+        )
+        .unwrap();
+        unsafe { std::env::remove_var("EMAT_HJ_RADIX") };
+        assert!(j.is_radix(), "EMAT_HJ_RADIX → radix-partitioned table");
+
+        let p0 = kv_batch(vec![20, 99, 40], vec!["p0", "p1", "p2"]);
+        let p1 = kv_batch(vec![10, 50, 30], vec!["p3", "p4", "p5"]);
+        let out = j.probe_radix_all(&[p0, p1]).unwrap();
+        // hits: 20→r1, 40→r3, 10→r0, 50→r4, 30→r2 ; 99 misses = 5 rows
+        assert_eq!(out.num_rows(), 5, "inner-join cardinality across batches");
+        let v = out
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let bk = out.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+        let pk = out.column(2).as_any().downcast_ref::<Int64Array>().unwrap();
+        let got: std::collections::HashSet<(String, i64, i64)> = (0..out.num_rows())
+            .map(|i| (v.value(i).to_string(), bk.value(i), pk.value(i)))
+            .collect();
+        for i in 0..out.num_rows() {
+            assert_eq!(bk.value(i), pk.value(i), "build key == probe key");
+        }
+        // cross-batch build payloads must resolve to the correct source batch
+        assert!(got.contains(&("b".into(), 20, 20)), "build batch0 key 20");
+        assert!(got.contains(&("d".into(), 40, 40)), "build batch1 key 40");
+        assert!(got.contains(&("a".into(), 10, 10)), "build batch0 key 10");
+        assert!(got.contains(&("e".into(), 50, 50)), "build batch1 key 50");
+        assert!(got.contains(&("c".into(), 30, 30)), "build batch0 key 30");
     }
 }

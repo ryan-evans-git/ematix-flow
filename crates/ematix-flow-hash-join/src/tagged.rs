@@ -222,6 +222,46 @@ impl TaggedJoinI64U32 {
             }
         }
     }
+
+    /// Build from explicit `(key, build_row_idx)` pairs. Unlike [`Self::try_build`]
+    /// (which derives the build-row index as `row_idx_base + i`), this takes an
+    /// arbitrary `idxs[i]` per key — needed by [`crate::radix::RadixTaggedJoin`],
+    /// where a radix scatter sends keys to partitions in non-sequential global
+    /// order. Callers must pre-filter NULL keys. Returns `None` on a duplicate
+    /// (same unique-key contract as `try_build`).
+    pub fn try_build_pairs(keys: &[i64], idxs: &[u32]) -> Option<Self> {
+        debug_assert_eq!(keys.len(), idxs.len());
+        let n = keys.len();
+        let cap = (n.saturating_mul(10) / 7).max(64).next_power_of_two();
+        let mut t = Self {
+            tags: vec![TAG_EMPTY; cap + GROUP],
+            keys: vec![0i64; cap + GROUP],
+            idx: vec![0u32; cap + GROUP],
+            mask: cap - 1,
+            len: 0,
+        };
+        for (&k, &ix) in keys.iter().zip(idxs.iter()) {
+            if !t.insert_unique(k, ix) {
+                return None; // duplicate → not unique → caller falls back
+            }
+        }
+        Some(t)
+    }
+
+    /// Probe with explicit per-key probe-row indices (the radix scatter carries
+    /// each probe key's original row index alongside it). NULLs pre-filtered.
+    /// One [`ProbeMatch`] per hit.
+    pub fn probe_pairs(&self, keys: &[i64], probe_idxs: &[u32], out: &mut Vec<ProbeMatch>) {
+        debug_assert_eq!(keys.len(), probe_idxs.len());
+        for (&k, &pix) in keys.iter().zip(probe_idxs.iter()) {
+            if let Some(bi) = self.probe_one(k) {
+                out.push(ProbeMatch {
+                    probe_row_idx: pix,
+                    build_row_idx: bi,
+                });
+            }
+        }
+    }
 }
 
 #[cfg(test)]
