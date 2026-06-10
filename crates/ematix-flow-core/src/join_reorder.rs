@@ -189,9 +189,31 @@ impl Default for ReorderOpts {
             reject_aggregate_join_keys: true,
             jump_on_reject: true,
             reject_under_left_semi_anti: true,
-            scale_bump: Some((100_000_000, 6)),
+            scale_bump: scale_bump_from(
+                std::env::var("EMAT_REORDER_BUMP_MIN_ROWS").ok().as_deref(),
+                std::env::var("EMAT_REORDER_BUMP_LEAVES").ok().as_deref(),
+            ),
         }
     }
+}
+
+/// Q05.SF10 (2026-06-10): env-tunable scale-bump. The Σ.BR Phase-2 default
+/// `(100M, 6)` admits the 6-leaf dimensional funnels only when a ≥100M-row
+/// fact participates (SF=100 lineitem). `EMAT_REORDER_BUMP_MIN_ROWS` /
+/// `EMAT_REORDER_BUMP_LEAVES` move that boundary without a rebuild — the
+/// fresh Q05 SF=10 profile shows the un-reordered plan materialises a 9.1M
+/// row (c⋈o)⋈lineitem intermediate that the funnel order would cut 5×, so
+/// the 2026-05-29 "neutral at SF=10" verdict needs re-measurement as the
+/// engine moves. Unparseable or missing values fall back to the Phase-2
+/// defaults; the gate itself stays structural (largest leaf in the chain).
+fn scale_bump_from(min_rows: Option<&str>, leaves: Option<&str>) -> Option<(u64, usize)> {
+    let min_rows = min_rows
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(100_000_000);
+    let leaves = leaves
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .unwrap_or(6);
+    Some((min_rows, leaves))
 }
 
 impl ReorderOpts {
@@ -1404,6 +1426,23 @@ mod tests {
     use crate::fast_parquet::FastParquetTableProvider;
     use datafusion::prelude::SessionContext;
     use std::path::PathBuf;
+
+    /// Q05.SF10 — the env-tunable scale bump parses overrides and falls
+    /// back to the Σ.BR Phase-2 defaults `(100M, 6)` on missing/garbage
+    /// input. Pure-function test (no env mutation → parallel-safe).
+    #[test]
+    fn scale_bump_env_parser_defaults_and_overrides() {
+        assert_eq!(scale_bump_from(None, None), Some((100_000_000, 6)));
+        assert_eq!(
+            scale_bump_from(Some("50000000"), None),
+            Some((50_000_000, 6))
+        );
+        assert_eq!(scale_bump_from(Some(" 0 "), Some("8")), Some((0, 8)));
+        assert_eq!(
+            scale_bump_from(Some("not-a-number"), Some("")),
+            Some((100_000_000, 6))
+        );
+    }
 
     fn sf1_dir() -> Option<PathBuf> {
         if let Ok(env) = std::env::var("TPCH_DATA_DIR") {

@@ -6,7 +6,8 @@
 //!
 //!   1. `agg_semi`  (`agg_filter_pushdown::push_filter_into_agg`)
 //!   2. `dim_push`  (`dim_join_pushdown::push_dim_join_into_chain`)
-//!   3. `reorder`   (`join_reorder::reorder_inner_joins_shape_gated`)
+//!   3. `q20_semi`  (`agg_filter_pushdown::push_transitive_semi_into_agg`)
+//!   4. `reorder`   (`join_reorder::reorder_inner_joins_shape_gated`)
 //!
 //! then delegates to the default physical planner. Installed via
 //! `SessionStateBuilder::with_query_planner` in [`crate::preset`], so library
@@ -30,6 +31,7 @@
 //! env-gated to mirror the bench's flags, all default ON (opt-OUT):
 //!   - `EMAT_AGG_SEMI=0`   disables the agg-semi pushdown
 //!   - `EMAT_DIM_PUSH=0`   disables the dim-join pushdown
+//!   - `EMAT_Q20_SEMI=0`   disables the q20 transitive semi-pushdown
 //!   - `EMAT_REORDER_QP=0` disables the join reorder
 
 use std::sync::Arc;
@@ -69,6 +71,20 @@ impl FlowQueryPlanner {
         }
         if enabled("EMAT_DIM_PUSH") {
             if let Ok(p) = crate::dim_join_pushdown::push_dim_join_into_chain(plan.clone()) {
+                plan = p;
+            }
+        }
+        // Σ.Q20 / Q20.WIRE (EMAT_Q20_SEMI=0 to disable): transitive semi-pushdown.
+        // Mirrors the bench order (agg_semi → dim_push → q20_semi). When a
+        // correlated agg's join key is transitively constrained by a semi-join
+        // to a small filtered dim (Q20: lineitem⋉partsupp⋉forest-parts), it
+        // splices a `LeftSemi(lineitem, forest_parts, l_partkey=p_partkey)` below
+        // the correlated agg — the −34% SF=10 Q20 win the bench measured but the
+        // preset previously did NOT ship. Inert on every other TPC-H shape
+        // (proven by `agg_filter_pushdown::tests::transitive_no_op_on_q02_q17`
+        // + `rewrite_preserves_q20_result`). Best-effort; runs before reorder.
+        if enabled("EMAT_Q20_SEMI") {
+            if let Ok(p) = crate::agg_filter_pushdown::push_transitive_semi_into_agg(plan.clone()) {
                 plan = p;
             }
         }
@@ -215,5 +231,47 @@ mod tests {
             let rendered = format!("{}", displayable(plan.as_ref()).indent(true));
             assert!(!rendered.is_empty(), "Q{q:02} produced an empty plan");
         }
+    }
+
+    /// Q20.WIRE: production (preset) must SHIP the q20 transitive-semi win the
+    /// bench measured (−34% SF=10 Q20). `FlowQueryPlanner::rewrite` must apply
+    /// `push_transitive_semi_into_agg`, which on the Q20 shape splices an extra
+    /// `LeftSemi` (keyed on `l_partkey`) below the lineitem correlated agg.
+    /// Compared against the exact PRE-wiring chain (agg_semi → dim_push →
+    /// reorder), the wired rewrite must produce strictly more LeftSemi joins.
+    #[tokio::test]
+    async fn rewrite_applies_q20_transitive_semi() {
+        let Some((ctx, dir)) = ctx_with_planner().await else {
+            eprintln!("skipping: sf1 data missing");
+            return;
+        };
+        let path = dir
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("queries/q20.sql");
+        let Ok(sql) = std::fs::read_to_string(&path) else {
+            eprintln!("skipping: q20.sql missing");
+            return;
+        };
+        let optimized = ctx.sql(&sql).await.unwrap().into_optimized_plan().unwrap();
+
+        // The exact PRE-Q20.WIRE chain (agg_semi → dim_push → reorder).
+        let mut no_q20 = optimized.clone();
+        no_q20 = crate::agg_filter_pushdown::push_filter_into_agg(no_q20.clone()).unwrap_or(no_q20);
+        no_q20 =
+            crate::dim_join_pushdown::push_dim_join_into_chain(no_q20.clone()).unwrap_or(no_q20);
+        no_q20 =
+            crate::join_reorder::reorder_inner_joins_shape_gated(no_q20.clone()).unwrap_or(no_q20);
+        let no_q20_dump = format!("{}", no_q20.display_indent());
+
+        let after = format!("{}", FlowQueryPlanner::rewrite(optimized).display_indent());
+
+        assert!(
+            after.matches("LeftSemi").count() > no_q20_dump.matches("LeftSemi").count(),
+            "FlowQueryPlanner::rewrite must apply the q20 transitive semi (an added LeftSemi on \
+             l_partkey vs the no-q20 chain).\nno_q20:\n{no_q20_dump}\nafter:\n{after}"
+        );
     }
 }

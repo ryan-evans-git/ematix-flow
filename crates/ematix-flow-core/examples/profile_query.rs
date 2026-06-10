@@ -118,6 +118,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         allow_inner_join: allow_inner,
         require_filtered_build: false,
         max_expected_keys_per_partition: 0,
+        min_probe_proj_cols: 0,
     }));
     // HJ.3: swap rule runs last; no-op unless EMAT_HASH_JOIN=1.
     builder = builder.with_physical_optimizer_rule(Arc::new(

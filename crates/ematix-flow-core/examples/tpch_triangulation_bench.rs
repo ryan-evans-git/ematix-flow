@@ -1661,6 +1661,7 @@ async fn build_ematix_ctx(
                     allow_inner_join: allow_inner,
                     require_filtered_build,
                     max_expected_keys_per_partition: max_keys,
+                    min_probe_proj_cols: 0,
                 }));
         }
     }

@@ -644,7 +644,23 @@ impl ExecutionPlan for BuildSideBloomEmitterExec {
                                 // pair below.
                                 let all_some = sets.iter().all(|s| s.is_some());
                                 let shared_set: Option<Arc<I64Set>> = if all_some {
-                                    let mut merged = I64Set::with_keys(set_threshold);
+                                    // L9.SETSIZE (2026-06-10): size the published set by
+                                    // the ACTUAL key count with miss-heavy headroom, not
+                                    // by the threshold. The probe workload is ~all-misses
+                                    // (Q08: 60M lineitem probes vs 13.45K part keys =
+                                    // 99.3% miss), and linear-probing miss cost grows
+                                    // sharply with load factor. `with_keys(threshold)`
+                                    // accidentally sized every published set at 65,536
+                                    // slots (20.5% load for Q08); resizing to 8× actual
+                                    // keys (≈6% load) measured Q08 −18% wall (180.8/182.7
+                                    // → 150.4/145.4, interleaved A/B/A/B). The sum is an
+                                    // upper bound (duplicates across partitions only
+                                    // shrink the true merged count), which is the safe
+                                    // direction for sizing.
+                                    let total_keys: usize =
+                                        sets.iter().flatten().map(|s| s.len()).sum();
+                                    let mut merged =
+                                        I64Set::with_keys(total_keys.saturating_mul(8).max(64));
                                     let mut overflow = false;
                                     for s in sets.iter().flatten() {
                                         merged.extend(s);

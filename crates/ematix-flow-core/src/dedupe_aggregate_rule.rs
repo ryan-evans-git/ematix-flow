@@ -45,17 +45,16 @@
 //! - Only fires when an aggregate is *actually* duplicated, which is
 //!   a rare structural shape (only Q15 in TPC-H 22).
 //!
-//! ## Session-scoping
+//! ## Query-scoping (BF, 2026-06-09)
 //!
-//! The registry is shared across all queries on the same
-//! `SessionContext`. Two queries with the same f64-aggregate subtree
-//! hit the same cache entry — the second query replays the first
-//! query's batches without re-executing.
-//!
-//! Construct the rule via [`DedupeAggregateForFloatDeterminism::with_registry`]
-//! so callers control registry lifetime. The `default()` impl creates
-//! a fresh per-rule registry (still session-scoped — lives for the
-//! life of the `SessionState`).
+//! Caching is scoped PER-QUERY: `optimize()` allocates a fresh
+//! `SharedSubtreeRegistry` per call, so the cache only collapses THIS query's
+//! duplicate subtrees (Q15's two f64 SUMs) into one computation. Cross-query
+//! sharing was removed — on a long-lived `SessionContext` it (a) accumulated
+//! `CachedBatches` across queries (degrading later queries) and (b) memoized
+//! across queries, serving a STALE cached result on a re-run. The `registry`
+//! field / [`with_registry`](DedupeAggregateForFloatDeterminism::with_registry)
+//! are retained for API back-compat but no longer drive caching.
 //!
 //! ## Structural hash
 //!
@@ -98,11 +97,15 @@ use crate::shared_subtree_exec::{SharedSubtreeExec, SharedSubtreeRegistry};
 /// `PhysicalOptimizerRule` that wraps duplicated f64-aggregate subtrees
 /// in `SharedSubtreeExec` so both consumers share one cached computation.
 ///
-/// Construct via [`with_registry`] when you want cross-query cache
-/// sharing within a session (recommended). `default()` is a convenience
-/// that allocates a fresh per-rule registry.
+/// BF (2026-06-09): caching is now scoped PER-QUERY — `optimize()` allocates a
+/// fresh `SharedSubtreeRegistry` per call. The `registry` field / [`with_registry`]
+/// / [`registry`](Self::registry) accessor are retained for API back-compat but
+/// no longer share cache across queries (cross-query sharing degraded long-lived
+/// contexts and served stale memoized results). `default()` is the normal way to
+/// construct the rule.
 #[derive(Debug)]
 pub struct DedupeAggregateForFloatDeterminism {
+    /// Retained for API back-compat; not used for caching (see struct doc).
     registry: Arc<SharedSubtreeRegistry>,
 }
 
@@ -167,7 +170,19 @@ impl PhysicalOptimizerRule for DedupeAggregateForFloatDeterminism {
         // leaf to subsequent plan walks (children() = []), so the walk
         // stops once we replace and doesn't descend into the wrapped
         // subtree.
-        let registry = self.registry.clone();
+        // BF (2026-06-09): use a FRESH registry per optimize() call (= per
+        // query), NOT the ctx-lifetime `self.registry`. A shared registry
+        // (a) accumulates CachedBatches across queries → a long-lived ctx
+        // degrades 1.3-1.5× (SF=10: Q13 116→170ms, Q22 25→45ms), and (b)
+        // cross-query MEMOIZES — `get_or_create(h)` returns a prior query's
+        // cached batches on a hash match, so re-running a query serves a
+        // STALE result (Q15 SF=10: 7.9ms stale vs 78ms honest). The registry
+        // is only needed to make THIS query's duplicate subtrees (same hash,
+        // same optimize() call) share one computation; a per-call registry
+        // preserves that within-query CSE while being concurrent-safe and
+        // free of cross-query state. (`self.registry` is retained for API
+        // back-compat but no longer drives caching.)
+        let registry = Arc::new(SharedSubtreeRegistry::new());
         let rewritten = plan.transform_down(|node| {
             if let Some(agg) = node.as_any().downcast_ref::<AggregateExec>()
                 && matches!(
@@ -556,6 +571,96 @@ mod tests {
         );
     }
 
+    /// BF (2026-06-09): the SharedSubtreeRegistry MUST be scoped PER-QUERY, not
+    /// shared across queries on a long-lived ctx. A ctx-lifetime registry (a)
+    /// accumulates `CachedBatches` across queries → degrades a reused ctx
+    /// 1.3-1.5× (measured SF=10: Q13 116→170, Q22 25→45), and (b) cross-query
+    /// MEMOIZES → re-running a query returns STALE cached batches (Q15 SF=10
+    /// reused-ctx 7.9ms stale vs 78ms honest = a correctness bug). The fix:
+    /// `optimize()` uses a fresh registry per call. Guard: two physical plans
+    /// of the SAME query on ONE ctx (same rule instance) must NOT share a
+    /// `CachedBatches` Arc — else query N memoizes query N-1's result.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn shared_subtree_registry_is_scoped_per_query() {
+        use crate::shared_subtree_exec::{CachedBatches, SharedSubtreeExec};
+        use datafusion::arrow::array::{Float64Array, Int64Array, RecordBatch};
+        use datafusion::arrow::datatypes::{Field, Schema};
+        use datafusion::datasource::MemTable;
+        use datafusion::execution::session_state::SessionStateBuilder;
+        use datafusion::prelude::{SessionConfig, SessionContext};
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("supplier", DataType::Int64, false),
+            Field::new("revenue", DataType::Float64, false),
+        ]));
+        let mut suppliers: Vec<i64> = Vec::new();
+        let mut revenues: Vec<f64> = Vec::new();
+        for s in 0..14_i64 {
+            for r in 0..100_i64 {
+                suppliers.push(s);
+                revenues.push((r as f64 + 1.0) * 0.1 + (s as f64) * 17.3);
+            }
+        }
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(suppliers)),
+                Arc::new(Float64Array::from(revenues)),
+            ],
+        )
+        .unwrap();
+        let mt = Arc::new(MemTable::try_new(schema, vec![vec![batch]]).unwrap());
+
+        // ONE ctx, ONE rule instance → its registry persists across queries.
+        let state = SessionStateBuilder::new()
+            .with_config(SessionConfig::new().with_target_partitions(4))
+            .with_default_features()
+            .with_physical_optimizer_rule(Arc::new(DedupeAggregateForFloatDeterminism::default()))
+            .build();
+        let ctx = SessionContext::new_with_state(state);
+        ctx.register_table("revenue_t", mt).unwrap();
+
+        let sql = "
+            WITH r AS (SELECT supplier, sum(revenue) AS total FROM revenue_t GROUP BY supplier)
+            SELECT r.supplier, r.total FROM r WHERE r.total = (SELECT max(total) FROM r)
+            ORDER BY r.supplier
+        ";
+
+        fn find_cached(p: &Arc<dyn ExecutionPlan>) -> Option<Arc<CachedBatches>> {
+            if let Some(s) = p.as_any().downcast_ref::<SharedSubtreeExec>() {
+                return Some(s.cached().clone());
+            }
+            for c in p.children() {
+                if let Some(f) = find_cached(c) {
+                    return Some(f);
+                }
+            }
+            None
+        }
+
+        let plan1 = ctx
+            .sql(sql)
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+        let plan2 = ctx
+            .sql(sql)
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+        let c1 = find_cached(&plan1).expect("query 1 must wrap a SharedSubtreeExec");
+        let c2 = find_cached(&plan2).expect("query 2 must wrap a SharedSubtreeExec");
+        assert!(
+            !Arc::ptr_eq(&c1, &c2),
+            "two plans of the same query on one ctx share a CachedBatches Arc — \
+             registry is not per-query scoped (cross-query stale memoization + accumulation)"
+        );
+    }
+
     /// Σ.BS — Q15 SF=100 partition-mismatch regression guard.
     ///
     /// At SF=1/10 the `supplier ⋈ revenue0` join is small enough that
@@ -701,13 +806,15 @@ mod tests {
         );
     }
 
-    /// Cross-query cache hit. Two consecutive Q15-shape queries on the
-    /// SAME `SessionContext` (so SAME `SharedSubtreeRegistry`) should:
-    ///   1. First query populates: registry grows to ≥1 entry, and the
-    ///      cached entry is marked `is_populated()`.
-    ///   2. Second query reuses the cache: registry size doesn't grow.
+    /// BF (2026-06-09): caching is now PER-QUERY. An externally-provided
+    /// `SharedSubtreeRegistry` installed via `with_registry` is NO LONGER used
+    /// for cross-query caching — that degraded long-lived contexts (accumulation)
+    /// and served stale memoized results. Two consecutive Q15-shape queries on
+    /// the SAME ctx must: (1) leave the external registry EMPTY, and (2) each
+    /// return the correct single row (within-query CSE still works via the
+    /// fresh per-query registry created inside `optimize()`).
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn cross_query_cache_hit() {
+    async fn external_registry_not_used_for_cross_query_cache() {
         use datafusion::arrow::array::{Float64Array, Int64Array, RecordBatch};
         use datafusion::arrow::datatypes::{Field, Schema};
         use datafusion::datasource::MemTable;
@@ -762,29 +869,30 @@ mod tests {
             ORDER BY r.supplier
         ";
 
-        assert_eq!(registry.len(), 0, "registry starts empty");
+        assert_eq!(registry.len(), 0, "external registry starts empty");
 
-        // First query — populates the cache.
+        // First query — within-query CSE works, but the EXTERNAL registry is
+        // never touched (optimize() uses a fresh per-query registry).
         let df = ctx.sql(sql).await.unwrap();
         let batches1 = df.collect().await.unwrap();
         let rows1: usize = batches1.iter().map(|b| b.num_rows()).sum();
-        assert_eq!(rows1, 1);
-        let entries_after_first = registry.len();
-        assert!(
-            entries_after_first >= 1,
-            "expected ≥1 cache entry after first query, got {entries_after_first}",
+        assert_eq!(rows1, 1, "Q15-shape returns exactly one row");
+        assert_eq!(
+            registry.len(),
+            0,
+            "external registry must stay empty — caching is per-query, not cross-query",
         );
 
-        // Second query — same shape on same context. Cache hit. The
-        // structural hash is deterministic, so no new entries are added.
+        // Second query — same shape, same ctx. No cross-query state, no stale
+        // memoization, no accumulation.
         let df = ctx.sql(sql).await.unwrap();
         let batches2 = df.collect().await.unwrap();
         let rows2: usize = batches2.iter().map(|b| b.num_rows()).sum();
-        assert_eq!(rows2, 1);
+        assert_eq!(rows2, 1, "second run is independently correct");
         assert_eq!(
             registry.len(),
-            entries_after_first,
-            "second query should reuse the existing cache entries, not add new ones",
+            0,
+            "external registry must remain empty after a second query (no accumulation)",
         );
     }
 }

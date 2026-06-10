@@ -187,6 +187,9 @@ pub fn with_optimizer_rules_and_registry(
             // Override via `EMAT_L9_MAX_EXPECTED_KEYS=N` if a future shape
             // exposes a regression the existing gates miss.
             max_expected_keys_per_partition: 0,
+            // L9.WIDTH (2026-06-10): probe-payoff gate, env-defaulted (4).
+            // See the field docs in runtime_bloom_sideband_rule.rs.
+            min_probe_proj_cols: EnableRuntimeBloomSidebandRule::default().min_probe_proj_cols,
         }));
     // Σ.AJ.1 Lever B POC: opt-in via EMAT_L9_BROADCAST_SIBLINGS=1.
     // Default OFF. See `crates/ematix-flow-core/src/broadcast_sibling_blooms_rule.rs`.
@@ -333,13 +336,15 @@ mod tests {
         );
     }
 
-    /// `with_optimizer_rules_and_registry` exposes the registry so
-    /// callers can probe cross-query cache hits. Two Q15-shape queries
-    /// on the same SessionContext should produce 1 row each and the
-    /// registry should hold ≥1 entry after the first query (the
-    /// duplicated f64 aggregate), with no growth on the second.
+    /// BF (2026-06-09): caching is now PER-QUERY (the dedupe rule allocates a
+    /// fresh registry per `optimize()` call). The externally-exposed registry
+    /// handle from `with_optimizer_rules_and_registry` therefore stays EMPTY —
+    /// cross-query caching was removed because it degraded long-lived contexts
+    /// (accumulation) and served stale memoized results. Two Q15-shape queries
+    /// on the same ctx must each return 1 row (within-query CSE still works),
+    /// and the handle must remain empty (no cross-query accumulation).
     #[tokio::test(flavor = "multi_thread")]
-    async fn registry_handle_observes_cross_query_cache_hit() {
+    async fn registry_handle_stays_empty_caching_is_per_query() {
         use datafusion::arrow::array::{Float64Array, Int64Array, RecordBatch};
         use datafusion::arrow::datatypes::{DataType, Field, Schema};
         use datafusion::datasource::MemTable;
@@ -385,7 +390,7 @@ mod tests {
             WHERE r.total = (SELECT max(total) FROM r)
         ";
 
-        assert_eq!(registry.len(), 0);
+        assert_eq!(registry.len(), 0, "registry handle starts empty");
         let n1: usize = ctx
             .sql(sql)
             .await
@@ -396,11 +401,11 @@ mod tests {
             .iter()
             .map(|b| b.num_rows())
             .sum();
-        assert_eq!(n1, 1);
-        let after_first = registry.len();
-        assert!(
-            after_first >= 1,
-            "expected ≥1 cache entry, got {after_first}"
+        assert_eq!(n1, 1, "Q15-shape returns one row (within-query CSE works)");
+        assert_eq!(
+            registry.len(),
+            0,
+            "external registry handle stays empty — caching is per-query, not cross-query",
         );
 
         let n2: usize = ctx
@@ -413,11 +418,14 @@ mod tests {
             .iter()
             .map(|b| b.num_rows())
             .sum();
-        assert_eq!(n2, 1);
+        assert_eq!(
+            n2, 1,
+            "second run independently correct (no stale memoization)"
+        );
         assert_eq!(
             registry.len(),
-            after_first,
-            "second query must reuse the cache, not allocate new entries",
+            0,
+            "registry handle still empty after a second query (no cross-query accumulation)",
         );
     }
 
