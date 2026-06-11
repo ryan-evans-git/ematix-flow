@@ -134,6 +134,10 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 # topic + subscription on the emulator via its REST API.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 tempfile = "3"
+# WIN.SF100.SWEEP — `mi_collect(true)` between bench measurements
+# (EMAT_MI_COLLECT=1): returns mimalloc-retained heap to the OS so the
+# page cache isn't starved across a 22-query sweep. Examples-only.
+libmimalloc-sys = { version = "0.1", features = ["extended"] }
 criterion = { workspace = true }
 # Bench-only: hand-written `filter_record_batch` baseline used as
 # the "<10% overhead vs raw" comparator for the DataFusion filter

@@ -21,6 +21,10 @@ path = "src/lib.rs"
 # no central malloc lock). ~10% on join/alloc-heavy queries. See the
 # global_allocator in src/main.rs + the alloc_guard test.
 mimalloc = { version = "0.1", default-features = false }
+# WIN.SF100.SWEEP — `mi_collect(true)` at work-unit completion returns
+# mimalloc-retained heap to the OS (run_shard.rs); retention measured
+# 10-17GB across a SF=100 sweep, starving the page cache.
+libmimalloc-sys = { version = "0.1", features = ["extended"] }
 ematix-flow-core.workspace = true
 # Σ.B PR 2 commit 5: CLI builds DistributedSqlTransform when
 # `[transform] engine = "distributed"` is selected.

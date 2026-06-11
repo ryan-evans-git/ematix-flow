@@ -420,6 +420,13 @@ pub struct EmatArrowBatchReaderBuilder {
     /// Σ.O.c.1 — private row-group decode cache (`Vec<DecodedColumn>`
     /// keyed by file/rg/projection). Bypassed when `filter` is set.
     rg_decode_cache: Option<std::sync::Arc<RowGroupDecodeCache>>,
+    /// L9.ADAPT LATE-ARM — a tight-rescued wrap's sideband whose build
+    /// hadn't published when the scan started. `load_row_group` peeks
+    /// it at each row-group boundary and merges the published
+    /// predicates into `self.filter` once they land — the probe never
+    /// stalls waiting for the build (the wait-based design cost Q17
+    /// +31% in-sweep when a cold build blew through its 60ms budget).
+    late_arm: Option<crate::bridge_filter_sideband::BridgeFilterSideband>,
 }
 
 impl EmatArrowBatchReaderBuilder {
@@ -435,6 +442,7 @@ impl EmatArrowBatchReaderBuilder {
             path: None,
             decode_cache: None,
             rg_decode_cache: None,
+            late_arm: None,
         }
     }
 
@@ -478,6 +486,22 @@ impl EmatArrowBatchReaderBuilder {
     pub fn with_filter(mut self, filter: BridgeFilter, path: std::path::PathBuf) -> Self {
         self.filter = Some(filter);
         self.path = Some(path);
+        self
+    }
+
+    /// L9.ADAPT LATE-ARM — attach a not-yet-published sideband. The
+    /// reader adopts its predicates mid-scan at a row-group boundary.
+    /// Sets `path` (required by the masked-decode the armed filter
+    /// triggers) without requiring a static filter.
+    pub fn with_late_arm(
+        mut self,
+        sb: crate::bridge_filter_sideband::BridgeFilterSideband,
+        path: std::path::PathBuf,
+    ) -> Self {
+        self.late_arm = Some(sb);
+        if self.path.is_none() {
+            self.path = Some(path);
+        }
         self
     }
 
@@ -588,6 +612,7 @@ impl EmatArrowBatchReaderBuilder {
             path: self.path,
             decode_cache: self.decode_cache,
             rg_decode_cache: self.rg_decode_cache,
+            late_arm: self.late_arm,
             cur_rg_idx: 0,
             cur_rg_columns: None,
             cur_rg_filter_bitmap: None,
@@ -965,6 +990,10 @@ pub struct EmatArrowBatchReader {
     pub(crate) rg_decode_cache: Option<std::sync::Arc<RowGroupDecodeCache>>,
 
     // ---- iteration state ----
+    /// L9.ADAPT LATE-ARM — pending sideband; see the builder field.
+    /// `Some` until the publish lands (then merged into `filter` and
+    /// taken), or for the whole scan if the build never publishes.
+    late_arm: Option<crate::bridge_filter_sideband::BridgeFilterSideband>,
     /// Index into `row_groups`; `cur_rg_idx == row_groups.len()`
     /// signals end-of-stream.
     cur_rg_idx: usize,
@@ -1332,6 +1361,32 @@ impl EmatArrowBatchReader {
     }
 
     fn load_row_group(&mut self, rg: usize) -> DfResult<()> {
+        // L9.ADAPT LATE-ARM — adopt a tight-rescued wrap's published
+        // predicates at the row-group boundary. One `is_ready()` read
+        // per RG until the build lands; arming merges the predicates
+        // into `self.filter` (attaching the shared Guard-2 disarm
+        // counters) so this and all later RGs filter. Row groups
+        // decoded before the publish simply flow unfiltered — the
+        // join re-applies every inexact-by-design predicate, so
+        // mid-scan adoption is correct by construction.
+        if let Some(sb) = &self.late_arm {
+            if sb.is_ready() {
+                if let Some(extras) = sb.peek() {
+                    if !extras.is_empty() {
+                        let mut bf = self
+                            .filter
+                            .take()
+                            .unwrap_or_else(|| BridgeFilter::new(Vec::new()));
+                        bf.extend(extras);
+                        if sb.tight_admitted() {
+                            bf.set_probe_disarm(sb.probe_disarm_handle());
+                        }
+                        self.filter = Some(bf);
+                    }
+                }
+                self.late_arm = None;
+            }
+        }
         // Σ.E5.6: use the cached metadata snapshot — no thrift re-parse.
         self.cur_rg_total = self.cached_md.row_groups[rg].num_rows as usize;
         // Σ.E5 Phase 1.6: clear any per-RG filter bitmap left from a
@@ -3865,5 +3920,72 @@ mod tests {
         let _ = read_all_with_rg_cache(&path, schema_three_primitives(), cache.clone());
         // Entry is larger than cap → skipped, cache stays empty.
         assert_eq!(cache.len(), 0);
+    }
+
+    /// L9.ADAPT LATE-ARM — a tight-rescued wrap's sideband published
+    /// MID-SCAN must be adopted at the next row-group boundary: RG0
+    /// (decoded before the publish) flows dense; RG1 (after) is
+    /// filtered by the published set. Rows skipped by the late filter
+    /// are a superset-of-matches concern only — the join re-applies
+    /// the predicate — but the test pins that the reader (a) does not
+    /// stall, (b) arms exactly once, and (c) attaches the Guard-2
+    /// disarm counters on arm.
+    #[test]
+    fn late_arm_adopts_published_predicates_at_rg_boundary() {
+        use crate::bridge_filter_sideband::BridgeFilterSideband;
+        use crate::ematix_fast_parquet::ColumnPredicate;
+        use crate::i64_set::I64Set;
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        use ematix_parquet_codec::write::{ColumnData, write_table_to_path_with_row_group_size};
+
+        let path = tmp_parquet("late_arm_two_rgs");
+        // 2 RGs × 64 rows of i64 keys 0..128.
+        let keys: Vec<i64> = (0..128).collect();
+        write_table_to_path_with_row_group_size(
+            &path,
+            &[("k", ColumnData::I64(&keys))],
+            CompressionCodec::Uncompressed,
+            64,
+        )
+        .unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, false)]));
+
+        let sb = BridgeFilterSideband::new().mark_tight_admitted();
+        let file = ParquetFile::open(&path).unwrap();
+        let mut rdr = EmatArrowBatchReaderBuilder::new(file, schema)
+            .with_projection(vec![0])
+            .with_late_arm(sb.clone(), path.clone())
+            .build()
+            .unwrap();
+
+        // RG0: sideband unpublished → dense, all 64 rows.
+        let rg0_rows: usize = {
+            let b = rdr.next().unwrap().unwrap();
+            b.num_rows()
+        };
+        assert_eq!(rg0_rows, 64, "pre-publish RG flows dense (no stall)");
+        assert!(rdr.late_arm.is_some(), "still armed-pending before publish");
+
+        // Publish a 2-key set between RG boundaries.
+        let mut set = I64Set::with_keys(2);
+        set.insert(70);
+        set.insert(99);
+        sb.publish(vec![ColumnPredicate::I64InSet {
+            col_idx: 0,
+            set: std::sync::Arc::new(set),
+        }]);
+
+        // RG1: filter adopted → only keys {70, 99} survive.
+        let mut post_rows = 0usize;
+        while let Some(b) = rdr.next().transpose().unwrap() {
+            post_rows += b.num_rows();
+        }
+        assert_eq!(post_rows, 2, "post-publish RG is filtered by the set");
+        assert!(rdr.late_arm.is_none(), "armed exactly once, handle taken");
+        let f = rdr.filter.as_ref().expect("filter installed on arm");
+        assert!(
+            f.probe_disarm().is_some(),
+            "Guard-2 disarm counters attached on arm (tight sideband)"
+        );
     }
 }

@@ -162,6 +162,19 @@ pub async fn execute_work_unit(wu: &WorkUnit) -> Result<WorkUnitMetrics, RunShar
     let output_write_ms = write_start.elapsed().as_millis() as u64;
 
     let wall_ms = started.elapsed().as_millis() as u64;
+    // WIN.SF100.SWEEP — return freed heap to the OS at work-unit
+    // completion (outside the timed region). The worker runs mimalloc
+    // (see main.rs `#[global_allocator]`), which retains freed segments
+    // per thread: an instrumented SF=100 22-query sweep measured
+    // 10-17GB of retained heap starving the OS page cache — every big
+    // query re-read its full column set from disk on every run (60-68GB
+    // of pageins per pass vs DuckDB's 2-4GB on identical files).
+    // `mi_collect(true)` between queries measured −5% geomean at SF=100
+    // and is the same discipline DuckDB gets implicitly from dropping
+    // its per-call connection. Opt-out: EMAT_MI_COLLECT=0.
+    if std::env::var("EMAT_MI_COLLECT").ok().as_deref() != Some("0") {
+        unsafe { libmimalloc_sys::mi_collect(true) };
+    }
     Ok(WorkUnitMetrics {
         work_unit_id: wu.id.clone(),
         query: match &wu.query {

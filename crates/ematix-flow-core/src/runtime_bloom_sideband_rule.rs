@@ -381,7 +381,11 @@ impl PhysicalOptimizerRule for EnableRuntimeBloomSidebandRule {
             // detected — generous enough for any selective subquery,
             // tight enough to pass the 64× ratio gate against a 60M
             // probe (10K × 64 = 640K < 60M).
-            let build_rows = if build_has_semi {
+            // Default (stats-only) estimate; Σ.AM.1 semi-cap as before.
+            // L9.ADAPT (lazy rescue): the default path NEVER consults the
+            // NDV stats — default-admitted wraps keep today's estimates,
+            // sizing, and behavior byte-for-byte.
+            let default_build_rows = if build_has_semi {
                 Some(
                     estimate_build_rows(build.as_ref())
                         .unwrap_or(10_000)
@@ -390,84 +394,120 @@ impl PhysicalOptimizerRule for EnableRuntimeBloomSidebandRule {
             } else {
                 estimate_build_rows(build.as_ref())
             };
-            // L9.ADAPT — also compute the DEFAULT (stats-only) estimate so
-            // wraps the default estimator would have rejected get marked
-            // tight-admitted and carry the scoped guards (width floor +
-            // publish-wait budget). Wraps both estimators admit keep
-            // today's exact behavior.
-            let tight_mode = tight_cardinality_enabled();
-            let default_build_rows = if !tight_mode {
-                build_rows
-            } else if build_has_semi {
-                Some(
-                    estimate_build_rows_mode(build.as_ref(), false)
-                        .unwrap_or(10_000)
-                        .min(10_000),
-                )
-            } else {
-                estimate_build_rows_mode(build.as_ref(), false)
-            };
             let probe_rows = estimate_probe_scan_rows(&scan_arc);
             if trace {
                 eprintln!(
-                    "[L9.trace] {:?} join — build_rows={build_rows:?} probe_rows={probe_rows:?} ratio_gate={}",
+                    "[L9.trace] {:?} join — build_rows={default_build_rows:?} probe_rows={probe_rows:?} ratio_gate={}",
                     hj.join_type(),
                     self.min_probe_to_build_ratio
                 );
             }
-            if self.min_probe_to_build_ratio > 0 {
-                if let (Some(b), Some(p)) = (build_rows, probe_rows) {
-                    if b.saturating_mul(self.min_probe_to_build_ratio) >= p {
-                        if trace {
-                            eprintln!(
-                                "[L9.trace] skip — gate rejects: b({b}) × ratio({}) >= p({p})",
-                                self.min_probe_to_build_ratio
-                            );
-                        }
-                        return Ok(Transformed::no(node));
+            let ratio_rejects = |b: Option<usize>| -> bool {
+                self.min_probe_to_build_ratio > 0
+                    && matches!((b, probe_rows), (Some(b), Some(p))
+                        if b.saturating_mul(self.min_probe_to_build_ratio) >= p)
+            };
+            let mut build_rows = default_build_rows;
+            let mut tight_only = false;
+            if ratio_rejects(default_build_rows) {
+                // L9.ADAPT lazy tight rescue — the default estimator said
+                // no. Opt-in NDV mode may rescue the wrap, but ONLY behind
+                // cheap pre-gates so the stats walk runs on a handful of
+                // candidate joins, not every join of every query (the
+                // eager dual-estimate design taxed all 22 queries and
+                // re-sized default-admitted wraps — both measured
+                // regressions, 2026-06-11 sweep):
+                //   1. probe ≥ 8M rows — the per-row probe + publish race
+                //      only pays on big scans (SF=1 facts are ≤6M: the
+                //      locked 22/22 scale never takes this path);
+                //   2. probe scan ≥ 3 projected cols — measured boundary:
+                //      Q08's 5-col wrap wins −18%, Q17's 2-col wraps lose;
+                //   3. Guard 1 — the scan's existing bundle must stay
+                //      fused-evaluable once the runtime probe is added
+                //      (string statics forced Q19's whole bundle onto the
+                //      legacy per-predicate re-decode path for +102%).
+                if !tight_cardinality_enabled() {
+                    if trace {
+                        let b = default_build_rows.unwrap_or(0);
+                        eprintln!(
+                            "[L9.trace] skip — gate rejects: b({b}) × ratio({}) >= p({})",
+                            self.min_probe_to_build_ratio,
+                            probe_rows.unwrap_or(0)
+                        );
                     }
+                    return Ok(Transformed::no(node));
                 }
+                if probe_rows.unwrap_or(0) < TIGHT_MIN_PROBE_ROWS {
+                    if trace {
+                        eprintln!(
+                            "[L9.trace] skip — tight rescue refused: probe {} < {TIGHT_MIN_PROBE_ROWS} rows (relief can't pay the probe+publish race on a small scan)",
+                            probe_rows.unwrap_or(0)
+                        );
+                    }
+                    return Ok(Transformed::no(node));
+                }
+                if scan_arc.projection().len() < TIGHT_MIN_PROBE_PROJ_COLS {
+                    if trace {
+                        eprintln!(
+                            "[L9.trace] skip — probe scan projects {} cols < min {TIGHT_MIN_PROBE_PROJ_COLS} (tight_only=true; narrow-payload wrap loses: scan-probe cost exceeds the cheap join it relieves)",
+                            scan_arc.projection().len(),
+                        );
+                    }
+                    return Ok(Transformed::no(node));
+                }
+                if !tight_probe_bundle_fused_evaluable(
+                    scan_arc.pushed_filter(),
+                    scan_arc.projection(),
+                    probe_scan_col_idx,
+                ) {
+                    if trace {
+                        eprintln!(
+                            "[L9.trace] skip — tight-only wrap refused: probe bundle not fused-evaluable (string/unprojected predicate or unprojected key would force legacy re-decode)"
+                        );
+                    }
+                    return Ok(Transformed::no(node));
+                }
+                // Pre-gates pass — NOW pay the NDV stats walk.
+                let tight_est = if build_has_semi {
+                    Some(
+                        estimate_build_rows_mode(build.as_ref(), true)
+                            .unwrap_or(10_000)
+                            .min(10_000),
+                    )
+                } else {
+                    estimate_build_rows_mode(build.as_ref(), true)
+                };
+                if tight_est.is_none() || ratio_rejects(tight_est) {
+                    if trace {
+                        eprintln!(
+                            "[L9.trace] skip — gate rejects (tight too): b({:?}) × ratio({}) >= p({})",
+                            tight_est,
+                            self.min_probe_to_build_ratio,
+                            probe_rows.unwrap_or(0)
+                        );
+                    }
+                    return Ok(Transformed::no(node));
+                }
+                build_rows = tight_est;
+                tight_only = true;
             }
-            // L9.WIDTH (2026-06-10): probe-payoff gate. The scan-level
-            // predicate's economics: it adds a per-row set/bloom probe +
-            // batch compaction over the FULL scan (60M rows on TPC-H facts)
-            // and saves (a) the join's per-row probe and (b) the payload
-            // columns flowing downstream. Measured per-operator: Q08's wide
-            // join (5-col probe payload) cost 13ns/row → wrap nets −30ms;
-            // Q17's narrow joins (2-col) cost 2ns/row → two wraps ADDED
-            // 1.5s CPU (+15-50ms wall). The payoff tracks the probe scan's
-            // projected width — wide scans both feed expensive joins and
-            // amortize the probe against more saved column flow. Gate:
-            // wrap only when the probe scan projects ≥ `min_probe_proj_cols`
-            // columns (struct field, env-defaulted to 4 in `Default`;
-            // calibrated on the Q08-win / Q17-regress boundary). NOTE: it is
-            // a partial guard — Q02's regressing wrap passes it (wide
-            // partsupp scan, cheap join), which is part of why the
-            // NDV-tight estimate stays opt-in.
-            // L9.ADAPT — tight-admitted wraps (default estimator would have
-            // rejected; payoff unproven) get the width floor; everything
-            // else keeps the configured (default 0 = disabled) value.
-            let tight_only = tight_mode
-                && admitted_only_by_tight(
-                    build_rows,
-                    default_build_rows,
-                    probe_rows,
-                    self.min_probe_to_build_ratio,
-                );
-            let min_proj_cols = effective_min_proj_cols(tight_only, self.min_probe_proj_cols);
-            if scan_arc.projection().len() < min_proj_cols {
+            // L9.WIDTH (2026-06-10): general probe-payoff gate, configured
+            // value (default 0 = disabled); the tight path enforced its
+            // own ≥3 floor above. See the Q08-win / Q17-regress boundary
+            // measurements in the rescue block.
+            if scan_arc.projection().len() < self.min_probe_proj_cols {
                 if trace {
                     eprintln!(
                         "[L9.trace] skip — probe scan projects {} cols < min {} (tight_only={tight_only}; narrow-payload wrap loses: scan-probe cost exceeds the cheap join it relieves)",
                         scan_arc.projection().len(),
-                        min_proj_cols
+                        self.min_probe_proj_cols
                     );
                 }
                 return Ok(Transformed::no(node));
             }
             if trace {
                 eprintln!(
-                    "[L9.trace] WRAP {:?} join — expected_keys={}",
+                    "[L9.trace] WRAP {:?} join — expected_keys={} tight_only={tight_only}",
                     hj.join_type(),
                     build_rows.unwrap_or(50_000)
                 );
@@ -713,71 +753,83 @@ fn estimate_probe_scan_rows(scan: &EmatixFastParquetExec) -> Option<usize> {
     }
 }
 
-/// Best-effort row-count estimate for the build subtree. Uses
-/// `partition_statistics` when available, sums across partitions.
+/// Best-effort row-count estimate for the build subtree (DEFAULT mode —
+/// plan statistics only). Uses `partition_statistics` when available,
+/// sums across partitions.
 ///
-/// Σ.AH.2 Story 1'.3 (2026-05-26): when `EMAT_L9_TIGHT_CARDINALITY=1`,
-/// first try the emat-stats-aware path that uses
-/// `EmatixFastParquetExec::column_stats().distinct_count` (populated
-/// by Story 1'.2 from parquet dict pages) to compute filter
-/// selectivity directly, bypassing DataFusion's `FilterExec.statistics()`
-/// which doesn't use distinct_count for string-Eq predicates and
-/// falls back to a 0.2 default.
+/// L9.ADAPT (lazy rescue, 2026-06-11): this is ALWAYS the stats-only
+/// estimate. The NDV-tight path (`estimate_build_rows_mode(plan, true)`)
+/// runs only inside the rescue branch, AFTER the default gate rejected
+/// and the cheap pre-gates passed — the eager dual-estimate design
+/// consulted NDV stats on every join of every query and re-sized
+/// default-admitted wraps' expected_keys, both measured regressions.
 fn estimate_build_rows(plan: &dyn ExecutionPlan) -> Option<usize> {
-    estimate_build_rows_mode(plan, tight_cardinality_enabled())
+    estimate_build_rows_mode(plan, false)
 }
 
-/// L9.ADAPT — is the tight (NDV) cardinality estimate enabled?
-/// **Still OPT-IN** (`EMAT_L9_TIGHT_CARDINALITY=1`). L9.ADAPT hardened
-/// the opt-in mode with two scoped guards — the tight-only width floor
-/// (fixes Q17's narrow-scan wrap, +16%→−10% dedicated) and the
-/// total-probe-rows publish-wait budget (bounds Q02's stall mechanism)
-/// — and the dedicated A/Bs looked shippable (Q08 −19.5%, Q17 −10%,
-/// Q07 +2%). The default-ON flip was then REVERTED by the 22q sweep
-/// gate: Q19 +102% (its lineitem bundle carries STRING statics, so the
-/// fused-probe arm can't engage and the wrap drives the scan down the
-/// legacy masked path with per-predicate string re-decodes) and Q17
-/// +27% IN-SWEEP (mechanism unresolved; contradicts its own dedicated
-/// A/B). Plan-time guard composition keeps surfacing new failure modes
-/// — default-on needs the runtime per-RG disarm + a fused-arm
-/// engageability precondition, gated on the full sweep per iteration.
+/// L9.ADAPT — is the tight (NDV) rescue enabled? **DEFAULT ON** as of
+/// the third design (2026-06-11; opt-out `EMAT_L9_TIGHT_CARDINALITY=0`).
+///
+/// Design history — each predecessor was killed by the 22q sweep gate:
+/// (1) Eager tight estimates everywhere: Q19 +102% (string statics →
+///     legacy re-decode; fixed by Guard 1) plus re-sized expected_keys
+///     on default-admitted wraps.
+/// (2) Eager dual estimates + width floor 3 + publish-wait budget:
+///     dedicated A/Bs clean, but in-sweep Q17 +31% — TWO stacked
+///     mechanisms: the 60ms probe-row-scaled wait was fully eaten by a
+///     COLD build (full stall, no early bloom), and carrying the wrap
+///     forced the 3-col probe scan off the inline-streaming reader.
+/// (3) Current: LAZY rescue (only default-REJECTED joins, pre-gated on
+///     ≥8M probe rows / ≥4 projected probe cols / Guard-1 fused-
+///     evaluable bundle) plus LATE-ARM (never stall; the reader adopts
+///     the published predicate at the next row-group boundary) plus
+///     the Guard-2 runtime disarm. Verified on 3 alternating-order
+///     interleaved 22q SF=10 pairs: Q08 −19.9% (the DuckDB flip),
+///     Q17 −2.1%, geomean −1.64%, no same-sign regression above noise;
+///     tpch_validate 22/22 at SF=1 + SF=10; SF=1 plans are untouched
+///     by construction (probe-rows pre-gate exceeds every SF=1 fact).
 pub(crate) fn tight_cardinality_enabled() -> bool {
-    std::env::var("EMAT_L9_TIGHT_CARDINALITY").as_deref() == Ok("1")
+    std::env::var("EMAT_L9_TIGHT_CARDINALITY").as_deref() != Ok("0")
 }
 
-/// L9.ADAPT — a wrap is "tight-admitted" iff the tight estimate passes
-/// the probe/build ratio gate while the default estimate would have been
-/// rejected by it. Only those wraps carry the stricter tight guards;
-/// anything the default estimator already admits keeps today's behavior
-/// (Q07's winning 2-col nation blooms must not see the width floor).
-fn admitted_only_by_tight(
-    tight_est: Option<usize>,
-    default_est: Option<usize>,
-    probe_rows: Option<usize>,
-    ratio: usize,
-) -> bool {
-    if ratio == 0 {
-        return false;
-    }
-    let (Some(t), Some(d), Some(p)) = (tight_est, default_est, probe_rows) else {
-        return false;
-    };
-    t.saturating_mul(ratio) < p && d.saturating_mul(ratio) >= p
-}
-
-/// L9.ADAPT — width floor for tight-admitted wraps. Measured boundary:
-/// Q17's 2-3-col wraps lose (+16% — the probe key is decoded anyway, so
-/// a narrow scan has almost no masked-decode relief to pay for the
-/// probe), Q08's 5-col wrap wins (−18%). Default-admitted wraps keep the
+/// L9.ADAPT — width floor for tight-rescued wraps. Measured boundary
+/// (twice): Q17's 3-col wrap loses +25-31% in-sweep, Q08's 5-col wrap
+/// wins −19.5%. Two stacked costs price out narrow scans: (a) the
+/// probe key is decoded anyway, so a narrow scan has little
+/// masked-decode relief to sell; (b) carrying a filter (or pending
+/// late-arm sideband) forces the scan OFF the inline-streaming reader
+/// onto the eager whole-RG reader — Σ.E5's auto-inline win for
+/// multi-RG fact partitions is forfeited, ~30-45ms cold on a 60M-row
+/// scan. A wide probe both relieves more downstream flow and
+/// amortizes that routing loss. Default-admitted wraps keep the
 /// configured value (global floor measured +88% on Q07).
-const TIGHT_MIN_PROBE_PROJ_COLS: usize = 3;
+const TIGHT_MIN_PROBE_PROJ_COLS: usize = 4;
 
-fn effective_min_proj_cols(tight_admitted: bool, configured: usize) -> usize {
-    if tight_admitted {
-        configured.max(TIGHT_MIN_PROBE_PROJ_COLS)
-    } else {
-        configured
-    }
+/// L9.ADAPT — minimum TOTAL probe-scan rows for the tight rescue. The
+/// per-row probe + publish race only pays back on big scans (Q08's 60M
+/// lineitem probe wins −20%; Q02's 2M partsupp probe lost +85% to the
+/// publish race). 8M also keeps SF=1 entirely on the default path
+/// (largest SF=1 fact scan = 6M lineitem rows) — the locked 22/22
+/// scale never changes plans under this mode.
+const TIGHT_MIN_PROBE_ROWS: usize = 8_000_000;
+
+/// L9.ADAPT Guard 1 — can the probe scan's bundle stay on the fused
+/// masked-decode path once the runtime probe is added? True iff every
+/// EXISTING static is a fused-evaluable shape targeting a projected
+/// column AND the join-key column itself is projected (the published
+/// set/bloom predicate targets it). A `None` filter is trivially
+/// evaluable. Applied only to tight-admitted wraps: Q19's string
+/// statics (l_shipmode IN / l_shipinstruct =) flipped its whole bundle
+/// onto the legacy per-predicate re-decode path for +102%.
+fn tight_probe_bundle_fused_evaluable(
+    filter: Option<&crate::ematix_fast_parquet::BridgeFilter>,
+    projection: &[usize],
+    probe_scan_col_idx: usize,
+) -> bool {
+    let statics_ok = filter
+        .map(|f| f.statics_fused_evaluable(projection))
+        .unwrap_or(true);
+    statics_ok && projection.contains(&probe_scan_col_idx)
 }
 
 fn estimate_build_rows_mode(plan: &dyn ExecutionPlan, tight: bool) -> Option<usize> {
@@ -1072,62 +1124,65 @@ mod tests {
     use ematix_parquet_codec::write::{ColumnData, write_table_to_path};
     use ematix_parquet_format::types::CompressionCodec;
 
-    /// L9.ADAPT — a wrap is "tight-admitted" iff the tight (NDV) estimate
-    /// passes the probe/build ratio gate while the default estimate would
-    /// have been rejected. Those wraps get the stricter width floor +
-    /// publish-wait budget; wraps the default estimator already admits
-    /// keep today's exact behavior.
+    /// L9.ADAPT lazy rescue — the pre-gate constants encode measured
+    /// boundaries: the probe-rows floor keeps SF=1 (6M-row facts) and
+    /// small-probe shapes (Q02's 2M partsupp, +85% to the publish race)
+    /// off the rescue path entirely, while Q08's 60M probe qualifies;
+    /// the width floor separates Q17's losing 2-col wraps from Q08's
+    /// winning 5-col wrap.
     #[test]
-    fn admitted_only_by_tight_truth_table() {
-        // Q08 shape: default 400K rejected (400K×1024 ≥ 60M), tight 13.3K admitted.
-        assert!(admitted_only_by_tight(
-            Some(13_333),
-            Some(400_000),
-            Some(59_986_052),
-            1024
-        ));
-        // Both estimates admit (Q18 HAVING-cap shape) → not tight-only.
-        assert!(!admitted_only_by_tight(
-            Some(2_000),
-            Some(2_000),
-            Some(59_986_052),
-            1024
-        ));
-        // Default estimate unavailable → the gate would have skipped in
-        // default mode too (it only rejects when both sides are Some).
-        assert!(!admitted_only_by_tight(
-            Some(13_333),
-            None,
-            Some(59_986_052),
-            1024
-        ));
-        // No probe estimate → gate never rejected anyone.
-        assert!(!admitted_only_by_tight(
-            Some(13_333),
-            Some(400_000),
-            None,
-            1024
-        ));
-        // Ratio gate disabled → nothing is tight-only.
-        assert!(!admitted_only_by_tight(
-            Some(13_333),
-            Some(400_000),
-            Some(59_986_052),
-            0
-        ));
+    fn tight_rescue_pre_gate_constants() {
+        // Q08 lineitem probe qualifies; Q02 partsupp and SF=1 lineitem don't.
+        assert!(59_986_052 >= TIGHT_MIN_PROBE_ROWS);
+        assert!(2_000_000 < TIGHT_MIN_PROBE_ROWS);
+        assert!(
+            6_001_215 < TIGHT_MIN_PROBE_ROWS,
+            "SF=1 lineitem stays default-path"
+        );
+        // Width boundary: Q17's 3-col wrap refused (measured +25-31%
+        // in-sweep, twice), Q08's 5-col wrap allowed (−19.5%).
+        assert!(3 < TIGHT_MIN_PROBE_PROJ_COLS);
+        assert!(5 >= TIGHT_MIN_PROBE_PROJ_COLS);
     }
 
-    /// L9.ADAPT — tight-admitted wraps get a width floor of 3 projected
-    /// columns (measured: Q17's 2-3-col wraps lose +16%, Q08's 5-col wrap
-    /// wins −18%); default-admitted wraps keep the configured value
-    /// (Q07's winning 2-col nation blooms must not be blocked: a global
-    /// width gate measured +88% on Q07).
+    /// L9.ADAPT Guard 1 — tight wraps are refused when the probe scan's
+    /// existing bundle would force the legacy re-decode path: string
+    /// statics (the Q19 +102% mechanism), unprojected predicate columns,
+    /// or an unprojected join-key column. No filter at all (Q08's bare
+    /// lineitem scan) is trivially evaluable.
     #[test]
-    fn tight_width_floor() {
-        assert_eq!(effective_min_proj_cols(false, 0), 0);
-        assert_eq!(effective_min_proj_cols(false, 4), 4);
-        assert_eq!(effective_min_proj_cols(true, 0), 3);
-        assert_eq!(effective_min_proj_cols(true, 5), 5);
+    fn tight_probe_bundle_gate() {
+        use crate::ematix_fast_parquet::{BridgeFilter, ColumnPredicate};
+        let proj = [0usize, 1, 2, 4, 5];
+
+        // Q08 shape: no pushed statics, key projected → allowed.
+        assert!(tight_probe_bundle_fused_evaluable(None, &proj, 1));
+        // Key column not projected → refused even with no statics.
+        assert!(!tight_probe_bundle_fused_evaluable(None, &proj, 9));
+
+        // Q19 shape: string static in the bundle → refused.
+        let q19 = BridgeFilter::new(vec![ColumnPredicate::StringIn {
+            col_idx: 4,
+            values: vec!["AIR".into(), "AIR REG".into()],
+        }]);
+        assert!(!tight_probe_bundle_fused_evaluable(Some(&q19), &proj, 1));
+
+        // Q20 shape: numeric range on a projected column → allowed.
+        let q20 = BridgeFilter::new(vec![ColumnPredicate::I64Range {
+            col_idx: 4,
+            lo: 9131,
+            hi: 9496,
+        }]);
+        assert!(tight_probe_bundle_fused_evaluable(Some(&q20), &proj, 1));
+
+        // Numeric static on an UNPROJECTED column → refused (fused
+        // resolve would fail at runtime → legacy fallback).
+        let unproj = BridgeFilter::new(vec![ColumnPredicate::I64Range {
+            col_idx: 9,
+            lo: 0,
+            hi: 1,
+        }]);
+        assert!(!tight_probe_bundle_fused_evaluable(Some(&unproj), &proj, 1));
     }
 
     fn tmp_parquet(name: &str) -> std::path::PathBuf {

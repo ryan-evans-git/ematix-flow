@@ -127,6 +127,35 @@ fn duckdb_explain(data_dir: &Path, sql: &str) -> Result<String, String> {
     Ok(out)
 }
 
+/// WIN.SF100.SWEEP — current process RSS in MB (via `ps`, ~10 ms fork;
+/// called OUTSIDE the timed regions only). Lets per-trial stderr
+/// markers carry the allocator-retention curve across the sweep.
+fn rss_mb() -> f64 {
+    std::process::Command::new("ps")
+        .args(["-o", "rss=", "-p", &std::process::id().to_string()])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .and_then(|s| s.trim().parse::<f64>().ok())
+        .map(|kb| kb / 1024.0)
+        .unwrap_or(f64::NAN)
+}
+
+/// WIN.SF100.SWEEP — return mimalloc-retained heap to the OS after
+/// each measurement (outside the timed region), DEFAULT ON (opt-out
+/// `EMAT_MI_COLLECT=0`), mirroring the production worker's identical
+/// hook in `run_shard.rs::execute_work_unit`. The instrumented
+/// 2026-06-11 sweep showed this process retaining 10-17GB of freed
+/// heap across the SF=100 pass, starving the page cache: every big
+/// query re-read its full column set from disk EVERY trial (60-68GB
+/// pageins/pass) while DuckDB's pass (same files, own allocator,
+/// conn-per-call) paged in ~2-4GB. Measured −5% geomean at SF=100.
+fn mi_collect_if_requested() {
+    if std::env::var("EMAT_MI_COLLECT").ok().as_deref() != Some("0") {
+        unsafe { libmimalloc_sys::mi_collect(true) };
+    }
+}
+
 fn median(v: &mut [f64]) -> f64 {
     if v.is_empty() {
         return f64::NAN;
@@ -344,16 +373,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Warmup (untimed): warm OS page cache + ematix internals for every query.
-    for _ in 0..warmups {
+    for wi in 0..warmups {
         for (q, sql) in &sqls {
             if !skip_ematix {
-                if let Err(e) = time_ematix(&ctx, sql).await {
-                    eprintln!("warm ematix Q{q:02} ERR: {e}");
+                match time_ematix(&ctx, sql).await {
+                    Ok((ms, _)) => eprintln!(
+                        "[trial] eng=ematix q={q:02} warm{wi} ms={ms:.1} rss_mb={:.0}",
+                        rss_mb()
+                    ),
+                    Err(e) => eprintln!("warm ematix Q{q:02} ERR: {e}"),
                 }
+                mi_collect_if_requested();
             }
             if !skip_duckdb {
-                if let Err(e) = time_duckdb(&data_dir, sql) {
-                    eprintln!("warm duckdb Q{q:02} ERR: {e}");
+                match time_duckdb(&data_dir, sql) {
+                    Ok((ms, _)) => eprintln!(
+                        "[trial] eng=duckdb q={q:02} warm{wi} ms={ms:.1} rss_mb={:.0}",
+                        rss_mb()
+                    ),
+                    Err(e) => eprintln!("warm duckdb Q{q:02} ERR: {e}"),
                 }
             }
         }
@@ -364,7 +402,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut d_times: std::collections::BTreeMap<u8, Vec<f64>> = Default::default();
     let mut e_rows: std::collections::BTreeMap<u8, usize> = Default::default();
     let mut d_rows: std::collections::BTreeMap<u8, usize> = Default::default();
-    for _ in 0..trials {
+    for ti in 0..trials {
         for (q, sql) in &sqls {
             // PRODUCTION FIDELITY: build a FRESH ctx per measurement, exactly like
             // run_shard.rs (one ctx per query). The ctx build is OUTSIDE the timed
@@ -377,15 +415,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let q_ctx = build_ematix_ctx(&data_dir)?;
                 match time_ematix(&q_ctx, sql).await {
                     Ok((ms, r)) => {
+                        eprintln!(
+                            "[trial] eng=ematix q={q:02} ti={ti} ms={ms:.1} rss_mb={:.0}",
+                            rss_mb()
+                        );
                         e_times.entry(*q).or_default().push(ms);
                         e_rows.insert(*q, r);
                     }
                     Err(e) => eprintln!("ematix Q{q:02} ERR: {e}"),
                 }
+                mi_collect_if_requested();
             }
             if !skip_duckdb {
                 match time_duckdb(&data_dir, sql) {
                     Ok((ms, r)) => {
+                        eprintln!(
+                            "[trial] eng=duckdb q={q:02} ti={ti} ms={ms:.1} rss_mb={:.0}",
+                            rss_mb()
+                        );
                         d_times.entry(*q).or_default().push(ms);
                         d_rows.insert(*q, r);
                     }
