@@ -149,6 +149,17 @@ pub fn with_optimizer_rules_and_registry(
         .with_physical_optimizer_rule(Arc::new(
             crate::force_collect_left_semi_build_rule::ForceCollectLeftForSemiBoundedBuildRule::default(),
         ))
+        // RANGE.AGG (2026-06-10): collapse Partial→hash-shuffle→Final
+        // into one SinglePartitioned aggregate when the single group
+        // key is provably the file's cluster key (row-group min/max
+        // ranges monotone; splits placed only at strict key gaps so no
+        // group spans a partition). Q18 SF=100: the 600M-row/150M-group
+        // SUM drops from 43.5s CPU (two-phase + 2.2 GB shuffle) to one
+        // private-table pass per partition. Declines (stock plan) on
+        // any non-clustered key. Opt-out EMAT_RANGE_AGG=0.
+        .with_physical_optimizer_rule(Arc::new(
+            crate::clustered_agg_rule::ClusteredSinglePhaseAggRule,
+        ))
         // Σ.V (2026-05-26): align preset with the bench's milestone
         // config. The bench has these three rules default-on but
         // preset.rs was missing them — library users got materially

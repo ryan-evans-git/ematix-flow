@@ -2780,6 +2780,24 @@ impl EmatixFastParquetExec {
             metrics: ExecutionPlanMetricsSet::new(),
         }
     }
+
+    /// RANGE.AGG — rebuild this scan with an explicit row-group →
+    /// partition assignment (used to re-chunk at key-disjoint
+    /// boundaries so a cluster-key group-by can aggregate each
+    /// partition independently). Partition count changes, so the plan
+    /// properties are rebuilt.
+    pub fn with_assignments(&self, assignments: Vec<Vec<usize>>) -> Arc<Self> {
+        let mut next = self.clone_internals();
+        let eq_props = EquivalenceProperties::new(next.schema.clone());
+        next.properties = Arc::new(PlanProperties::new(
+            eq_props,
+            Partitioning::UnknownPartitioning(assignments.len().max(1)),
+            EmissionType::Incremental,
+            Boundedness::Bounded,
+        ));
+        next.assignments = assignments;
+        Arc::new(next)
+    }
 }
 
 impl DisplayAs for EmatixFastParquetExec {

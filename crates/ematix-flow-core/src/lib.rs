@@ -32,6 +32,7 @@ pub mod emat_push_pipeline_exec;
 // PV.M.8: CombineAggExec — fused single-i64-key SUM(f64) aggregate that
 // replaces Partial→hash-Repartition→Final with inline per-partition tables
 // + direct parallel combine (no shuffle). Opt-in via the swap rule.
+pub mod clustered_agg_rule;
 pub mod combine_agg_exec;
 // HJ.3: pre-plan rule that swaps stock HashJoinExec → EmatixHashJoinExec
 // on the validated shape (Inner, CollectLeft, single i64 key). Opt-in

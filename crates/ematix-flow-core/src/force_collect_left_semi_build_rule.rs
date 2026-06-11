@@ -75,6 +75,7 @@ use datafusion::physical_expr::utils::split_conjunction;
 use datafusion::physical_plan::filter::FilterExec;
 use datafusion::scalar::ScalarValue;
 
+#[cfg(test)]
 use crate::runtime_bloom_sideband_rule::build_subtree_has_semi_filter;
 
 /// See module docs.
@@ -331,6 +332,7 @@ fn subtree_has_semi_only_filter(plan: &Arc<dyn ExecutionPlan>) -> bool {
 /// equals it (Q16: 79.96M of 80M partsupp rows survive the 479-key
 /// complaint anti). Returns `None` for any other shape so the caller
 /// falls back to reported statistics.
+#[allow(deprecated)] // CoalesceBatchesExec still appears in DF 53 plans
 fn anti_topped_bound(plan: &Arc<dyn ExecutionPlan>) -> Option<usize> {
     let any = plan.as_any();
     if any.is::<datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec>()
