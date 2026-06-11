@@ -2966,6 +2966,20 @@ impl ExecutionPlan for EmatixFastParquetExec {
                     .ok()
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(200);
+                // L9.ADAPT — tight-admitted wraps (payoff unproven by
+                // the default estimator) get a wait budget scaled to
+                // the TOTAL scan size instead of the flat timeout:
+                // stalling the part-scan partitions behind a ~15 ms
+                // MIN-subquery build cost Q02 SF=10 +85% for a wrap
+                // that could never pay on a 2 M-row probe, while Q08's
+                // ~35 ms filtered-part build is worth waiting for on a
+                // 60 M-row probe.
+                let timeout_ms = if sb.tight_admitted() {
+                    let total_scan_rows: usize = rg_num_rows_for_async.iter().sum();
+                    tight_peek_budget_ms(total_scan_rows, timeout_ms)
+                } else {
+                    timeout_ms
+                };
                 let _ = sb
                     .wait_for_publish(std::time::Duration::from_millis(timeout_ms))
                     .await;
@@ -3988,10 +4002,46 @@ fn decode_one_rg(
     })
 }
 
+/// L9.ADAPT — publish-wait budget for tight-admitted wraps: 1M TOTAL scan
+/// rows buy 1 ms of stall, capped at the configured peek timeout. The
+/// build is shared by every probe partition, so the latency the wrap may
+/// impose must scale with the total relief it can deliver (probe size),
+/// not with any one partition's decode work — a per-partition budget let
+/// Q02's few fat part partitions absorb a ~15ms subquery publish (+85%
+/// on a 19ms query), while Q08's ~35ms filtered-part build is worth the
+/// wait precisely because the probe is 60M rows. Default-admitted wraps
+/// keep the flat timeout — their payoff is already proven (Σ.Q.L16).
+pub(crate) fn tight_peek_budget_ms(total_scan_rows: usize, cap_ms: u64) -> u64 {
+    ((total_scan_rows / 1_000_000) as u64).min(cap_ms)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use datafusion::prelude::SessionContext;
+
+    /// L9.ADAPT — tight-admitted wraps wait for the build publish only as
+    /// long as the TOTAL probe size justifies (1M rows ≈ 1ms of stall
+    /// budget, capped at the configured timeout). The build is shared by
+    /// every probe partition, so its latency tolerance must scale with the
+    /// total relief the wrap can deliver, NOT per-partition decode work —
+    /// a per-partition budget gave Q02's few fat part partitions ~20ms
+    /// each, fully absorbing the ~15ms MIN-subquery publish (+85% on a
+    /// 19ms query, measured), while Q08's slow-but-worth-it ~35ms part
+    /// build needs the 60M-row probe's full 60ms allowance.
+    #[test]
+    fn tight_peek_budget_scales_with_total_probe_rows() {
+        // Q02 part scan: 2M total rows → 2ms budget (publish at ~15ms
+        // misses; the scan proceeds unfiltered, losing ~2ms not ~16ms).
+        assert_eq!(tight_peek_budget_ms(2_000_000, 200), 2);
+        // Q08 lineitem: 60M total rows → 60ms budget (catches the ~35ms
+        // filtered-part build publish; the −19% win depends on it).
+        assert_eq!(tight_peek_budget_ms(59_986_052, 200), 59);
+        // Big scans cap at the configured timeout.
+        assert_eq!(tight_peek_budget_ms(300_000_000, 200), 200);
+        // Tiny scans get (effectively) no stall budget.
+        assert_eq!(tight_peek_budget_ms(500_000, 200), 0);
+    }
 
     /// L9.PROBEORDER — `and_eval_masked` must evaluate ONLY rows whose
     /// bit is set (the masked-probe contract: probe cost scales with

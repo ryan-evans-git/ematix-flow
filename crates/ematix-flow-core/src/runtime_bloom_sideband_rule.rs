@@ -390,6 +390,23 @@ impl PhysicalOptimizerRule for EnableRuntimeBloomSidebandRule {
             } else {
                 estimate_build_rows(build.as_ref())
             };
+            // L9.ADAPT — also compute the DEFAULT (stats-only) estimate so
+            // wraps the default estimator would have rejected get marked
+            // tight-admitted and carry the scoped guards (width floor +
+            // publish-wait budget). Wraps both estimators admit keep
+            // today's exact behavior.
+            let tight_mode = tight_cardinality_enabled();
+            let default_build_rows = if !tight_mode {
+                build_rows
+            } else if build_has_semi {
+                Some(
+                    estimate_build_rows_mode(build.as_ref(), false)
+                        .unwrap_or(10_000)
+                        .min(10_000),
+                )
+            } else {
+                estimate_build_rows_mode(build.as_ref(), false)
+            };
             let probe_rows = estimate_probe_scan_rows(&scan_arc);
             if trace {
                 eprintln!(
@@ -427,11 +444,21 @@ impl PhysicalOptimizerRule for EnableRuntimeBloomSidebandRule {
             // a partial guard — Q02's regressing wrap passes it (wide
             // partsupp scan, cheap join), which is part of why the
             // NDV-tight estimate stays opt-in.
-            let min_proj_cols = self.min_probe_proj_cols;
+            // L9.ADAPT — tight-admitted wraps (default estimator would have
+            // rejected; payoff unproven) get the width floor; everything
+            // else keeps the configured (default 0 = disabled) value.
+            let tight_only = tight_mode
+                && admitted_only_by_tight(
+                    build_rows,
+                    default_build_rows,
+                    probe_rows,
+                    self.min_probe_to_build_ratio,
+                );
+            let min_proj_cols = effective_min_proj_cols(tight_only, self.min_probe_proj_cols);
             if scan_arc.projection().len() < min_proj_cols {
                 if trace {
                     eprintln!(
-                        "[L9.trace] skip — probe scan projects {} cols < min {} (narrow-payload wrap loses: scan-probe cost exceeds the cheap join it relieves)",
+                        "[L9.trace] skip — probe scan projects {} cols < min {} (tight_only={tight_only}; narrow-payload wrap loses: scan-probe cost exceeds the cheap join it relieves)",
                         scan_arc.projection().len(),
                         min_proj_cols
                     );
@@ -449,7 +476,11 @@ impl PhysicalOptimizerRule for EnableRuntimeBloomSidebandRule {
             // Σ.Q.L9: allocate the sideband, wrap the build child,
             // rewrite the probe subtree to thread the sideband into
             // the matching EmatixFastParquetExec.
-            let sideband = BridgeFilterSideband::new();
+            let sideband = if tight_only {
+                BridgeFilterSideband::new().mark_tight_admitted()
+            } else {
+                BridgeFilterSideband::new()
+            };
 
             // Estimate expected build-side keys from the build's
             // partition statistics. Falls back to a generous default
@@ -693,6 +724,63 @@ fn estimate_probe_scan_rows(scan: &EmatixFastParquetExec) -> Option<usize> {
 /// which doesn't use distinct_count for string-Eq predicates and
 /// falls back to a 0.2 default.
 fn estimate_build_rows(plan: &dyn ExecutionPlan) -> Option<usize> {
+    estimate_build_rows_mode(plan, tight_cardinality_enabled())
+}
+
+/// L9.ADAPT — is the tight (NDV) cardinality estimate enabled?
+/// **Still OPT-IN** (`EMAT_L9_TIGHT_CARDINALITY=1`). L9.ADAPT hardened
+/// the opt-in mode with two scoped guards — the tight-only width floor
+/// (fixes Q17's narrow-scan wrap, +16%→−10% dedicated) and the
+/// total-probe-rows publish-wait budget (bounds Q02's stall mechanism)
+/// — and the dedicated A/Bs looked shippable (Q08 −19.5%, Q17 −10%,
+/// Q07 +2%). The default-ON flip was then REVERTED by the 22q sweep
+/// gate: Q19 +102% (its lineitem bundle carries STRING statics, so the
+/// fused-probe arm can't engage and the wrap drives the scan down the
+/// legacy masked path with per-predicate string re-decodes) and Q17
+/// +27% IN-SWEEP (mechanism unresolved; contradicts its own dedicated
+/// A/B). Plan-time guard composition keeps surfacing new failure modes
+/// — default-on needs the runtime per-RG disarm + a fused-arm
+/// engageability precondition, gated on the full sweep per iteration.
+pub(crate) fn tight_cardinality_enabled() -> bool {
+    std::env::var("EMAT_L9_TIGHT_CARDINALITY").as_deref() == Ok("1")
+}
+
+/// L9.ADAPT — a wrap is "tight-admitted" iff the tight estimate passes
+/// the probe/build ratio gate while the default estimate would have been
+/// rejected by it. Only those wraps carry the stricter tight guards;
+/// anything the default estimator already admits keeps today's behavior
+/// (Q07's winning 2-col nation blooms must not see the width floor).
+fn admitted_only_by_tight(
+    tight_est: Option<usize>,
+    default_est: Option<usize>,
+    probe_rows: Option<usize>,
+    ratio: usize,
+) -> bool {
+    if ratio == 0 {
+        return false;
+    }
+    let (Some(t), Some(d), Some(p)) = (tight_est, default_est, probe_rows) else {
+        return false;
+    };
+    t.saturating_mul(ratio) < p && d.saturating_mul(ratio) >= p
+}
+
+/// L9.ADAPT — width floor for tight-admitted wraps. Measured boundary:
+/// Q17's 2-3-col wraps lose (+16% — the probe key is decoded anyway, so
+/// a narrow scan has almost no masked-decode relief to pay for the
+/// probe), Q08's 5-col wrap wins (−18%). Default-admitted wraps keep the
+/// configured value (global floor measured +88% on Q07).
+const TIGHT_MIN_PROBE_PROJ_COLS: usize = 3;
+
+fn effective_min_proj_cols(tight_admitted: bool, configured: usize) -> usize {
+    if tight_admitted {
+        configured.max(TIGHT_MIN_PROBE_PROJ_COLS)
+    } else {
+        configured
+    }
+}
+
+fn estimate_build_rows_mode(plan: &dyn ExecutionPlan, tight: bool) -> Option<usize> {
     // L9.EST (2026-06-10): structural caps for builds whose true output the
     // statistics CANNOT see. The fresh Q18 SF=10 trace showed the estimator
     // crediting a `Filter(sum(qty)>300)`-over-Aggregate build with the raw
@@ -706,10 +794,10 @@ fn estimate_build_rows(plan: &dyn ExecutionPlan) -> Option<usize> {
     // estimator so every consumer (ratio gate, expected_keys sizing) agrees.
     const SELECTIVE_SHAPE_CAP: usize = 10_000;
     if build_top_is_selective_shape(plan) {
-        let est = estimate_build_rows_uncapped(plan).unwrap_or(SELECTIVE_SHAPE_CAP);
+        let est = estimate_build_rows_uncapped(plan, tight).unwrap_or(SELECTIVE_SHAPE_CAP);
         return Some(est.min(SELECTIVE_SHAPE_CAP));
     }
-    estimate_build_rows_uncapped(plan)
+    estimate_build_rows_uncapped(plan, tight)
 }
 
 /// Walk through pass-through operators (projection / coalesce / repartition)
@@ -762,29 +850,24 @@ fn first_shaping_node_is_aggregate(p: &dyn ExecutionPlan) -> bool {
     p.as_any().downcast_ref::<AggregateExec>().is_some()
 }
 
-fn estimate_build_rows_uncapped(plan: &dyn ExecutionPlan) -> Option<usize> {
-    // L9.EST (2026-06-10): the emat-stats path (NDV-corrected string-eq
-    // selectivity, now backed by the rule-local lazy dict-page walk —
-    // `local_dict_ndv` — so the global stats JoinSelection reads stay
-    // untouched) remains OPT-IN via `EMAT_L9_TIGHT_CARDINALITY=1`.
-    //
-    // Why not default-on: it admits Inner-join wraps whose payoff depends
-    // on the relieved join's per-row cost, which plan-time shape does NOT
-    // predict. Measured per-query (interleaved A/B, SF=10): Q08 −30ms WIN
-    // (its part⋈lineitem probe cost 13ns/row → the scan-level set probe
-    // is cheaper), but Q17 +25ms and Q02 +11ms REGRESS (their relieved
-    // joins cost ~2ns/row — DataFusion's miss-dominated probe against a
-    // tiny build is nearly free, so the added 60M/8M-row scan probes are
-    // pure overhead). 1 win / 2 losses → not a default. The Q08 win is
-    // real and reproducible with the flag; promoting it needs a runtime
-    // (adaptive) gate, not a better plan-time estimate.
-    if std::env::var("EMAT_L9_TIGHT_CARDINALITY")
-        .as_deref()
-        .map(|v| v == "1")
-        == Ok(true)
-    {
-        if let Some(tight) = estimate_build_rows_via_emat_stats(plan) {
-            return Some(tight);
+fn estimate_build_rows_uncapped(plan: &dyn ExecutionPlan, tight: bool) -> Option<usize> {
+    // L9.EST (2026-06-10) / L9.ADAPT (2026-06-11): the emat-stats path
+    // (NDV-corrected string-eq selectivity, backed by the rule-local lazy
+    // dict-page walk — `local_dict_ndv` — so the global stats
+    // JoinSelection reads stay untouched) remains OPT-IN — see
+    // `tight_cardinality_enabled` for the default-on attempt's post-
+    // mortem. When enabled, it admits Inner-join wraps whose payoff
+    // plan-time shape alone could not predict (Q08 −19.5% WIN, but
+    // Q17 +16% / Q02 +85% regressed); the gate site therefore computes
+    // BOTH estimates and marks wraps the default estimator would have
+    // rejected as tight-admitted, applying two scoped guards: the
+    // `TIGHT_MIN_PROBE_PROJ_COLS` width floor (Q17-class: narrow scans
+    // have no masked-decode relief to pay for the probe) and the
+    // `tight_peek_budget_ms` publish-wait budget (Q02-class: a fast scan
+    // must not stall behind a slow subquery build).
+    if tight {
+        if let Some(tight_est) = estimate_build_rows_via_emat_stats(plan) {
+            return Some(tight_est);
         }
     }
     let n = plan.output_partitioning().partition_count();
@@ -988,6 +1071,64 @@ mod tests {
     use datafusion::prelude::{SessionConfig, SessionContext};
     use ematix_parquet_codec::write::{ColumnData, write_table_to_path};
     use ematix_parquet_format::types::CompressionCodec;
+
+    /// L9.ADAPT — a wrap is "tight-admitted" iff the tight (NDV) estimate
+    /// passes the probe/build ratio gate while the default estimate would
+    /// have been rejected. Those wraps get the stricter width floor +
+    /// publish-wait budget; wraps the default estimator already admits
+    /// keep today's exact behavior.
+    #[test]
+    fn admitted_only_by_tight_truth_table() {
+        // Q08 shape: default 400K rejected (400K×1024 ≥ 60M), tight 13.3K admitted.
+        assert!(admitted_only_by_tight(
+            Some(13_333),
+            Some(400_000),
+            Some(59_986_052),
+            1024
+        ));
+        // Both estimates admit (Q18 HAVING-cap shape) → not tight-only.
+        assert!(!admitted_only_by_tight(
+            Some(2_000),
+            Some(2_000),
+            Some(59_986_052),
+            1024
+        ));
+        // Default estimate unavailable → the gate would have skipped in
+        // default mode too (it only rejects when both sides are Some).
+        assert!(!admitted_only_by_tight(
+            Some(13_333),
+            None,
+            Some(59_986_052),
+            1024
+        ));
+        // No probe estimate → gate never rejected anyone.
+        assert!(!admitted_only_by_tight(
+            Some(13_333),
+            Some(400_000),
+            None,
+            1024
+        ));
+        // Ratio gate disabled → nothing is tight-only.
+        assert!(!admitted_only_by_tight(
+            Some(13_333),
+            Some(400_000),
+            Some(59_986_052),
+            0
+        ));
+    }
+
+    /// L9.ADAPT — tight-admitted wraps get a width floor of 3 projected
+    /// columns (measured: Q17's 2-3-col wraps lose +16%, Q08's 5-col wrap
+    /// wins −18%); default-admitted wraps keep the configured value
+    /// (Q07's winning 2-col nation blooms must not be blocked: a global
+    /// width gate measured +88% on Q07).
+    #[test]
+    fn tight_width_floor() {
+        assert_eq!(effective_min_proj_cols(false, 0), 0);
+        assert_eq!(effective_min_proj_cols(false, 4), 4);
+        assert_eq!(effective_min_proj_cols(true, 0), 3);
+        assert_eq!(effective_min_proj_cols(true, 5), 5);
+    }
 
     fn tmp_parquet(name: &str) -> std::path::PathBuf {
         let dir =

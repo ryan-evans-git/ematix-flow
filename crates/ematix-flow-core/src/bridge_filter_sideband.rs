@@ -50,11 +50,34 @@ use crate::ematix_fast_parquet::ColumnPredicate;
 pub struct BridgeFilterSideband {
     inner: Arc<RwLock<Option<Vec<ColumnPredicate>>>>,
     notify: Arc<tokio::sync::Notify>,
+    /// L9.ADAPT — set when the wrap that owns this sideband was admitted
+    /// ONLY by the tight (NDV) cardinality estimate (the default
+    /// estimator's ratio gate would have rejected it). The probe-side
+    /// peek applies a row-scaled wait budget to these wraps instead of
+    /// the flat timeout: a tight-admitted wrap's payoff is unproven, so
+    /// the scan must not stall behind a slow build longer than its own
+    /// decode work justifies (Q02's 1-key wrap behind a ~15 ms
+    /// MIN-subquery build stalled a 19 ms query by +81%). Set once at
+    /// plan time before the sideband fans out — plain field, clones
+    /// carry it.
+    tight_admitted: bool,
 }
 
 impl BridgeFilterSideband {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// L9.ADAPT — mark this sideband's wrap as tight-admitted (builder
+    /// style; call before cloning into emitter + scan).
+    pub fn mark_tight_admitted(mut self) -> Self {
+        self.tight_admitted = true;
+        self
+    }
+
+    /// L9.ADAPT — was this wrap admitted only by the tight estimator?
+    pub fn tight_admitted(&self) -> bool {
+        self.tight_admitted
     }
 
     /// Publish a set of predicates into the sideband. Replaces any
@@ -155,5 +178,20 @@ mod tests {
         assert_eq!(got.len(), 1);
         // Both sides see the empty state.
         assert!(!sb1.is_ready());
+    }
+
+    /// L9.ADAPT — wraps admitted only by the tight (NDV) estimator carry
+    /// a marker so the probe-side peek applies the stricter wait budget.
+    /// Default false (existing wraps keep today's behavior); set before
+    /// the sideband fans out to emitter + scan, so clones carry it.
+    #[test]
+    fn tight_admitted_marker_roundtrip() {
+        let sb = BridgeFilterSideband::new();
+        assert!(!sb.tight_admitted());
+        let sb = sb.mark_tight_admitted();
+        assert!(sb.tight_admitted());
+        let clone = sb.clone();
+        assert!(clone.tight_admitted());
+        assert!(sb.ptr_eq(&clone));
     }
 }

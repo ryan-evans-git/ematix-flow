@@ -1130,10 +1130,7 @@ pub type RgRangesAndCounts = (Vec<Option<(i64, i64)>>, Vec<usize>);
 /// RG pays one full footer parse per call (58-RG SF=10 lineitem: 116
 /// parses ≈ 23 ms of plan time, measured). Plan-time callers must use
 /// this instead.
-pub fn rg_i64_ranges_and_counts(
-    path: &std::path::Path,
-    col: usize,
-) -> DfResult<RgRangesAndCounts> {
+pub fn rg_i64_ranges_and_counts(path: &std::path::Path, col: usize) -> DfResult<RgRangesAndCounts> {
     let file = open_cached(path)?;
     let md = file
         .cached_metadata()
