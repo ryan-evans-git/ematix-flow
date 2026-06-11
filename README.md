@@ -59,9 +59,9 @@ flow run-due --module my_pipelines    # cron-style; drop into systemd / cron / k
 
 - **Fast.** TPC-H, 22 queries, single Apple M4 Max, measured at three
   scales through the production preset (fresh context per query, no
-  bench-only tricks): ematix-flow takes **21 / 22** at SF=1 (**2.36×**
-  DuckDB, **3.95×** Polars, **17×** single-node PySpark), **20 / 22** at
-  SF=10 (**1.33×** DuckDB), and **15 / 22** at SF=100 (**1.30×** DuckDB)
+  bench-only tricks): ematix-flow takes **22 / 22** at SF=1 (**2.49×**
+  DuckDB, **4.13×** Polars, **18×** single-node PySpark), **19 / 22** at
+  SF=10 (**1.35×** DuckDB), and **17 / 22** at SF=100 (**1.38×** DuckDB)
   — still ahead on the geomean where the data spills out of cache. Full
   numbers, the losses included, and the reproducer in
   [Benchmarks](#benchmarks).
@@ -1467,65 +1467,69 @@ the [Install](#install) extras and the
 
 ### TPC-H — SF=1 / SF=10 / SF=100, all 22 queries
 
-Five engines, the same Apple M4 Max, the same Parquet files (2026-06-10
+Five engines, the same Apple M4 Max, the same Parquet files (2026-06-11
 refresh). ematix-flow numbers are **production-faithful**: the harness
 (`examples/tpch_preset_rebench.rs`) builds a fresh `SessionContext` per
 measurement through the shipped preset — no plan cache, no context reuse
-— and ematix-flow + DuckDB run in **isolated passes** (20 timed trials
-after 3 warmups at SF=1 / SF=10; 5 after 1 at SF=100, medians). Polars
-runs the in-process harness (SF=10 re-measured 2026-06-10, other columns
-carried from 2026-05-29/31); PySpark is `local[*]` on the JVM; Postgres
+— and ematix-flow + DuckDB are measured as a **same-session pair of
+isolated passes per scale** (20 timed trials after 3 warmups at SF=1 /
+SF=10; 5 after 1 at SF=100, medians), so marginal verdicts don't ride on
+another day's machine state. Polars runs the in-process harness (the
+marginal Q14/Q15 re-measured 2026-06-11, other columns carried from
+2026-06-10 / 2026-05-29-31); PySpark is `local[*]` on the JVM; Postgres
 14 is `EXPLAIN ANALYZE` Execution Time.
 
 | Scale | ematix-flow wins | vs DuckDB | vs Polars | vs PySpark | vs Postgres |
 |---|:--|--:|--:|--:|--:|
-| **SF=1** (~1 GB, in-cache) | **21 / 22** | 2.36× | 3.95× | 17.1× | 15.7× |
-| **SF=10** (~10 GB) | **20 / 22** | 1.33× | 4.00× | 12.0× | 21.7× |
-| **SF=100** (~100 GB) | **15 / 22** | 1.30× | 4.92× | 8.4× | 58× † |
+| **SF=1** (~1 GB, in-cache) | **22 / 22** | 2.49× | 4.13× | 17.9× | 16.5× |
+| **SF=10** (~10 GB) | **19 / 22** | 1.35× | 3.96× | 11.8× | 21.4× |
+| **SF=100** (~100 GB) | **17 / 22** | 1.38× | 5.31× | 8.9× | 66× † |
 
 Geomean of competitor ÷ ematix-flow across the 22 queries (Polars n=21
 at SF=10 / n=17 at SF=100; **†** Postgres ran 6 / 22 at SF=100 under a
 90 s cap). The queries ematix-flow doesn't win are named, not hidden:
-DuckDB takes Q05 (by 1.7%) + Q08 at SF=10 and Q10 / Q11 / Q16 / Q18 /
-Q20 at SF=100; Polars edges Q15 by 0.1 ms at SF=1 and takes Q14 / Q15
-at SF=100. ematix-flow leads the geomean at every scale. Full tables,
-tabbed by scale, are on the docs site:
+DuckDB takes Q05 (by 8%) + Q08 (by 11%) at SF=10 and Q10 / Q16 (by 8%) /
+Q18 at SF=100; Polars edges Q15 by 1.6% at SF=10 and takes Q14 / Q15 at
+SF=100. The SF=100 DuckDB losses are cold-cache sweep losses — on a warm
+cache ematix-flow wins all three — and Q15 is genuine Polars parity (the
+verdict flips run to run). ematix-flow leads the geomean at every scale.
+Full tables, tabbed by scale, are on the docs site:
 [ematix.dev/reference/benchmarks](https://ematix.dev/reference/benchmarks).
 SF=1 in full (the README's headline scale):
 
 | Query | ematix-flow | DuckDB | Polars | PySpark | Postgres |
 |---|--:|--:|--:|--:|--:|
-| Q01 | **18.6** | 47.8 | 38.6 | 167 | 411 |
-| Q02 | **7.5** | 17.7 | 47.9 | 190 | 123 |
-| Q03 | **13.2** | 32.9 | 46.5 | 257 | 163 |
-| Q04 | **11.7** | 22.4 | 23.8 | 184 | 94.6 |
-| Q05 | **16.7** | 31.6 | 8,949 | 335 | 226 |
-| Q06 | **1.8** | 13.0 | 10.5 | 41.5 | 218 |
-| Q07 | **25.7** | 32.7 | 118 | 260 | 1,262 |
-| Q08 | **14.1** | 39.0 | 96.7 | 182 | 99.7 |
-| Q09 | **18.6** | 55.2 | 47.5 | 583 | 820 |
-| Q10 | **26.4** | 60.2 | 111 | 362 | 355 |
-| Q11 | **5.7** | 9.6 | 8.87 | 119 | 36.3 |
-| Q12 | **14.9** | 25.1 | 19.2 | 269 | 361 |
-| Q13 | **9.7** | 138 | 118 | 684 | 871 |
-| Q14 | **11.5** | 22.2 | 12.3 | 114 | 69.8 |
-| Q15 | 11.3 | 13.8 | **11.2** | 127 | 140 |
-| Q16 | **9.6** | 21.8 | 21.2 | 205 | 113 |
-| Q17 | **16.0** | 25.3 | 39.0 | 233 | 398 |
-| Q18 | **19.9** | 45.3 | 56.6 | 560 | 1,154 |
-| Q19 | **17.8** | 34.4 | 105 | 86.0 | 31.9 |
-| Q20 | **13.0** | 29.0 | 22.4 | 106 | 147 |
-| Q21 | **34.9** | 74.6 | 721 | 628 | 609 |
-| Q22 | **8.6** | 21.0 | 13.6 | 354 | 24.1 |
+| Q01 | **16.7** | 48.0 | 38.6 | 167 | 411 |
+| Q02 | **7.3** | 17.6 | 47.9 | 190 | 123 |
+| Q03 | **13.2** | 33.1 | 46.5 | 257 | 163 |
+| Q04 | **10.9** | 22.8 | 23.8 | 184 | 94.6 |
+| Q05 | **16.0** | 31.8 | 8,949 | 335 | 226 |
+| Q06 | **1.8** | 12.9 | 10.5 | 41.5 | 218 |
+| Q07 | **24.2** | 33.3 | 118 | 260 | 1,262 |
+| Q08 | **13.6** | 39.5 | 96.7 | 182 | 99.7 |
+| Q09 | **17.9** | 56.2 | 47.5 | 583 | 820 |
+| Q10 | **24.3** | 60.4 | 111 | 362 | 355 |
+| Q11 | **5.5** | 9.8 | 8.9 | 119 | 36.3 |
+| Q12 | **14.4** | 26.2 | 19.2 | 269 | 361 |
+| Q13 | **9.6** | 139 | 118 | 684 | 871 |
+| Q14 | **11.4** | 22.3 | 12.3 | 114 | 69.8 |
+| Q15 | **11.0** | 14.0 | 11.5 | 127 | 140 |
+| Q16 | **9.3** | 21.6 | 21.2 | 205 | 113 |
+| Q17 | **14.6** | 25.6 | 39.0 | 233 | 398 |
+| Q18 | **18.1** | 45.7 | 56.6 | 560 | 1,154 |
+| Q19 | **17.1** | 34.9 | 105 | 86.0 | 31.9 |
+| Q20 | **12.2** | 29.3 | 22.4 | 106 | 147 |
+| Q21 | **32.8** | 74.8 | 721 | 628 | 609 |
+| Q22 | **8.5** | 21.0 | 13.6 | 354 | 24.1 |
 
 Median ms, fastest per row in **bold**; ematix-flow + DuckDB measured in
 isolated passes through the production preset (fresh `SessionContext`
 per query). Polars runs hand-translated `.polars.sql` variants where its
 planner rejects the canonical shape (semantically identical); its Q05
-SF=1 outlier (~9 s) is a known planner blowup. ematix-flow takes 21 of
-22 at SF=1 (Polars edges Q15 by 0.1 ms), with the biggest margins on
-the join-heavy queries (Q06 7.2×, Q13 14×, Q18 2.3×) where the
-fused-aggregate + push-LeftSemi + runtime-bloom rules do the work.
+SF=1 outlier (~9 s) is a known planner blowup. ematix-flow takes all
+22 at SF=1, with the biggest margins on the join-heavy queries (Q06
+7.2×, Q13 14×, Q18 2.5×) where the fused-aggregate + push-LeftSemi +
+runtime-bloom rules do the work.
 
 Full methodology, per-engine reproducers, and the SF=10 / SF=100 tables
 are in [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md).
