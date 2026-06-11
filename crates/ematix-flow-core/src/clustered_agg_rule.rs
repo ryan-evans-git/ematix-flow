@@ -267,19 +267,20 @@ impl PhysicalOptimizerRule for ClusteredSinglePhaseAggRule {
             let n_rgs: usize = scan.assignments().iter().map(|c| c.len()).sum();
             // Re-chunk over ALL row groups in file order (the existing
             // assignment is contiguous chunking; we rebuild from scratch).
-            let mut ranges: Vec<Option<(i64, i64)>> = Vec::with_capacity(n_rgs);
-            for rg in 0..n_rgs {
-                ranges.push(
-                    crate::ematix_parquet_bridge::rg_i64_min_max(&path, rg, file_col)
-                        .ok()
-                        .flatten(),
-                );
+            // ONE footer parse for the whole sweep — the per-RG bridge
+            // calls re-parse the footer per call on files below the
+            // handle cache's row-group threshold (58-RG SF=10 lineitem:
+            // 116 parses = +23 ms plan time, measured on Q18).
+            let Ok((mut ranges, mut rg_rows)) =
+                crate::ematix_parquet_bridge::rg_i64_ranges_and_counts(&path, file_col)
+            else {
+                return Ok(Transformed::no(node));
+            };
+            if ranges.len() < n_rgs {
+                return Ok(Transformed::no(node));
             }
-            let rg_rows: Vec<usize> = (0..n_rgs)
-                .map(|rg| {
-                    crate::ematix_parquet_bridge::rg_num_values(&path, rg, file_col).unwrap_or(0)
-                })
-                .collect();
+            ranges.truncate(n_rgs);
+            rg_rows.truncate(n_rgs);
             let target = config.execution.target_partitions.max(2);
             let Some(chunks) = plan_disjoint_chunks(&ranges, &rg_rows, target) else {
                 if trace {
@@ -384,7 +385,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("t.parquet");
         let props = WriterProperties::builder()
-            .set_max_row_group_size(123)
+            .set_max_row_group_row_count(Some(123))
             .build();
         let f = std::fs::File::create(&path).unwrap();
         let mut w = ArrowWriter::try_new(f, schema, Some(props)).unwrap();
