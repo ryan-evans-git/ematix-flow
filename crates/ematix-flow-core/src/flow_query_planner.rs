@@ -88,6 +88,23 @@ impl FlowQueryPlanner {
                 plan = p;
             }
         }
+        // Σ.Q05 / #352 (OPT-IN: EMAT_TRANSITIVE_DIM_SEMI=1 until the 22q
+        // sweep gate flips it): transitive dim-semi into deep join inputs.
+        // When a filtered dim constrains a mid-dim scan and the key class
+        // reaches a deep scan only transitively (Q05: customer via
+        // c_nationkey = s_nationkey = n_nationkey), splice
+        // `T ⋉ (mid-dim ⋈ dim)` below — Q05's orders⋈customer build drops
+        // 2.28M → 456K keys at SF=10, which the L9 tight rescue (deep-semi
+        // cap) then turns into a 3%-pass-rate lineitem scan wrap, DuckDB's
+        // runtime-scan-filter shape. No-op on the other 21 TPC-H shapes
+        // (pinned by `transitive_join_semi_no_op_on_direct_dim_shapes`).
+        if std::env::var("EMAT_TRANSITIVE_DIM_SEMI").as_deref() == Ok("1") {
+            if let Ok(p) =
+                crate::agg_filter_pushdown::push_transitive_dim_semi_into_join_chain(plan.clone())
+            {
+                plan = p;
+            }
+        }
         if enabled("EMAT_REORDER_QP") {
             if let Ok(p) = crate::join_reorder::reorder_inner_joins_shape_gated(plan.clone()) {
                 plan = p;
@@ -272,6 +289,53 @@ mod tests {
             after.matches("LeftSemi").count() > no_q20_dump.matches("LeftSemi").count(),
             "FlowQueryPlanner::rewrite must apply the q20 transitive semi (an added LeftSemi on \
              l_partkey vs the no-q20 chain).\nno_q20:\n{no_q20_dump}\nafter:\n{after}"
+        );
+    }
+
+    /// Σ.Q05 / #352: with `EMAT_TRANSITIVE_DIM_SEMI=1` the planner
+    /// rewrite must splice `customer ⋉ (nation ⋈ region[ASIA])` into
+    /// Q05 (and survive the downstream reorder step); without the env
+    /// the rule stays off — OPT-IN until the 22q sweep gate flips it.
+    #[tokio::test]
+    async fn rewrite_applies_q05_transitive_dim_semi_opt_in() {
+        let Some((ctx, dir)) = ctx_with_planner().await else {
+            eprintln!("skipping: sf1 data missing");
+            return;
+        };
+        let path = dir
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("queries/q05.sql");
+        let Ok(sql) = std::fs::read_to_string(&path) else {
+            eprintln!("skipping: q05.sql missing");
+            return;
+        };
+        let optimized = ctx.sql(&sql).await.unwrap().into_optimized_plan().unwrap();
+
+        let off = format!(
+            "{}",
+            FlowQueryPlanner::rewrite(optimized.clone()).display_indent()
+        );
+        // SAFETY: test-local toggle; the only readers are rewrite() calls,
+        // and the rule is a no-op on every shape other tests plan.
+        unsafe { std::env::set_var("EMAT_TRANSITIVE_DIM_SEMI", "1") };
+        let on = format!("{}", FlowQueryPlanner::rewrite(optimized).display_indent());
+        unsafe { std::env::remove_var("EMAT_TRANSITIVE_DIM_SEMI") };
+
+        assert!(
+            !off.contains("customer.c_nationkey = nation.n_nationkey"),
+            "rule must stay OFF without the env (opt-in):\n{off}"
+        );
+        assert!(
+            on.contains("customer.c_nationkey = nation.n_nationkey"),
+            "EMAT_TRANSITIVE_DIM_SEMI=1 must splice the customer⋉nation⋈region semi \
+             through the full rewrite chain (incl. reorder):\n{on}"
+        );
+        assert!(
+            on.matches("LeftSemi").count() > off.matches("LeftSemi").count(),
+            "the splice must ADD a LeftSemi.\noff:\n{off}\non:\n{on}"
         );
     }
 }

@@ -480,6 +480,18 @@ async fn run_ematix(
         let optimized = ctx.sql(sql).await?.into_optimized_plan()?;
         let optimized =
             ematix_flow_core::agg_filter_pushdown::push_transitive_semi_into_agg(optimized)?;
+        // Σ.Q05 (#352): the transitive dim-semi is perf-OPT-IN
+        // (EMAT_TRANSITIVE_DIM_SEMI=1) in the planner/bench, but
+        // validate exercises it BY DEFAULT so every correctness run
+        // checks the splice (no-op on the other 21 queries; rewrites
+        // Q05). EMAT_TRANSITIVE_DIM_SEMI=0 to skip here too.
+        let optimized = if std::env::var("EMAT_TRANSITIVE_DIM_SEMI").as_deref() != Ok("0") {
+            ematix_flow_core::agg_filter_pushdown::push_transitive_dim_semi_into_join_chain(
+                optimized,
+            )?
+        } else {
+            optimized
+        };
         ctx.execute_logical_plan(optimized).await?.collect().await?
     } else {
         ctx.sql(sql).await?.collect().await?

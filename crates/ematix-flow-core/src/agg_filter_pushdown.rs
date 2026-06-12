@@ -129,7 +129,362 @@ pub fn push_transitive_semi_into_agg(plan: LogicalPlan) -> DfResult<LogicalPlan>
     Ok(transformed.data)
 }
 
-/// Try the Q20 transitive-semi rewrite on a single Inner Join node.
+/// Σ.Q05 — transitive dim-semi pushdown into a join chain (#352).
+///
+/// Generalises [`push_transitive_semi_into_agg`] from aggregate inputs
+/// to arbitrary deep join inputs. When an Inner equi-join constrains a
+/// bare mid-dim scan `M` by a small filtered dim `D` (Q05:
+/// `nation ⋈ region[r_name='ASIA']`), and the equivalence class of
+/// `M`'s join keys reaches a scan `T` only TRANSITIVELY (≥2 equi-join
+/// hops — Q05: `c_nationkey = s_nationkey = n_nationkey`, customer
+/// never directly joins nation), splice `T ⋉ (M ⋈ D)` below `T`:
+///
+/// ```text
+///   Inner Join: n_regionkey = r_regionkey            (anchor J)
+///     ... ⋈ supplier ⋈ ((customer ⋈ orders) ⋈ lineitem)
+///                         └─ TableScan: customer  →  LeftSemi: c_nationkey = n_nationkey
+///                                                      ├─ TableScan: customer
+///                                                      └─ nation ⋈ region[ASIA]   (M ⋈ D clone)
+///     TableScan: nation (M)
+///     Filter(r_name='ASIA') → TableScan: region (D)
+/// ```
+///
+/// The hop ≥ 2 gate is the payoff boundary, not a safety one: a hop-1
+/// (direct) join edge already gets the constraint at its own join — and
+/// the L9 runtime-bloom machinery covers exactly that case — so direct
+/// shapes (Q02/Q07/Q08/Q10/Q11/Q21 dim chains) pass through unchanged.
+/// Correctness mirrors Σ.U/Σ.Q20 transitively: every harvested equi-edge
+/// comes from an Inner/semi join, so any `T` row the semi drops would
+/// have been dropped by those joins anyway. Best-effort: any shape
+/// mismatch passes through unchanged.
+pub fn push_transitive_dim_semi_into_join_chain(plan: LogicalPlan) -> DfResult<LogicalPlan> {
+    let mut fires: usize = 0;
+    let transformed = plan.transform_down(|node| match node {
+        LogicalPlan::Join(ref join) if join.join_type == JoinType::Inner => {
+            match try_rewrite_transitive_dim_semi(&node) {
+                Some(rewritten) => {
+                    fires += 1;
+                    Ok(Transformed::yes(rewritten))
+                }
+                None => Ok(Transformed::no(node)),
+            }
+        }
+        _ => Ok(Transformed::no(node)),
+    })?;
+    if std::env::var("EMAT_SIGMA_Q05_DEBUG").is_ok() {
+        eprintln!("[Σ.Q05] fires={fires}");
+    }
+    Ok(transformed.data)
+}
+
+/// Try the transitive dim-semi rewrite on a single Inner Join node.
+///
+/// Anchor shape: `Inner Join(S, D) on S.k = D.k` where `D` is a small
+/// filtered dim ([`small_filtered_dim_subtree`]) and `S.k` is produced
+/// by a unique bare scan `M` inside `S` (the mid-dim — Q05: nation).
+/// From `M`'s columns, walk the equivalence classes induced by `S`'s
+/// Inner/semi equi-join edges with hop counts; any class column at
+/// hop ≥ 2 owned by a unique scan `T` is a transitive target. The
+/// deepest such `T` (most joins between it and the anchor — the most
+/// intermediate work the semi can shrink) gets `T ⋉ (M ⋈ D)` spliced
+/// below it. One splice per anchor.
+fn try_rewrite_transitive_dim_semi(plan: &LogicalPlan) -> Option<LogicalPlan> {
+    let LogicalPlan::Join(j) = plan else {
+        return None;
+    };
+    if j.join_type != JoinType::Inner || j.on.is_empty() {
+        return None;
+    }
+    for dim_on_right in [true, false] {
+        let (s_side, d_side) = if dim_on_right {
+            (&j.left, &j.right)
+        } else {
+            (&j.right, &j.left)
+        };
+        let Some(dim_subtree) = small_filtered_dim_subtree(d_side) else {
+            continue;
+        };
+        let Some(dim_table) = leaf_scan_table_name(&dim_subtree) else {
+            continue;
+        };
+        for (l, r) in &j.on {
+            let (Expr::Column(lc), Expr::Column(rc)) = (l, r) else {
+                continue;
+            };
+            let (s_key, d_key) = if dim_on_right { (lc, rc) } else { (rc, lc) };
+            // Mid-dim M: the unique scan inside S producing the anchor key.
+            let (m_found, m_count) = locate_scan_for_column(s_side, s_key, 0);
+            let Some((m_scan, m_depth)) = m_found else {
+                continue;
+            };
+            if m_count != 1 {
+                continue;
+            }
+            // The rule clones M into the semi build — refuse fact-sized
+            // mid-dims outright when the provider can say (belt; the
+            // depth gate below is the principled guard).
+            if scan_raw_rows(&m_scan).is_some_and(|n| n > MID_DIM_MAX_ROWS) {
+                continue;
+            }
+            // Equivalence classes over S's Inner/semi equi-edges, seeded
+            // from M's columns (hop 0), tracking each column's seed.
+            let mut edges: Vec<(Column, Column)> = Vec::new();
+            collect_inner_equi_edges(s_side, &mut edges);
+            let mut hops: std::collections::HashMap<Column, (usize, Column)> =
+                std::collections::HashMap::new();
+            for (a, b) in &edges {
+                for c in [a, b] {
+                    if scan_resolves_column(&m_scan, c) {
+                        hops.entry(c.clone()).or_insert((0, c.clone()));
+                    }
+                }
+            }
+            if hops.is_empty() {
+                continue;
+            }
+            // Relax edges to a fixpoint (classes are tiny; edges few).
+            loop {
+                let mut changed = false;
+                for (a, b) in &edges {
+                    for (from, to) in [(a, b), (b, a)] {
+                        if let Some((h, seed)) = hops.get(from).cloned() {
+                            let next = (h + 1, seed);
+                            match hops.get(to) {
+                                Some((eh, _)) if *eh <= next.0 => {}
+                                _ => {
+                                    hops.insert((*to).clone(), next);
+                                    changed = true;
+                                }
+                            }
+                        }
+                    }
+                }
+                if !changed {
+                    break;
+                }
+            }
+            // Transitive targets: hop ≥ 2, unique owning scan, not M
+            // itself, DEEPER than M (the constraint must flow downhill —
+            // a shallower target is upstream of nothing the semi could
+            // shrink, and inverted shapes like Q09's part⋈lineitem
+            // anchor would otherwise clone a fact scan as the build to
+            // filter a 25-row dim), not already semi-guarded against
+            // this dim. Pick the deepest.
+            let mut best: Option<(LogicalPlan, usize, Column, Column)> = None;
+            for (col, (hop, seed)) in &hops {
+                if *hop < 2 {
+                    continue;
+                }
+                let (t_found, t_count) = locate_scan_for_column(s_side, col, 0);
+                let Some((t_scan, t_depth)) = t_found else {
+                    continue;
+                };
+                if t_count != 1 || t_scan == m_scan || t_depth <= m_depth {
+                    continue;
+                }
+                if semi_guard_exists(s_side, col, &dim_table) {
+                    continue;
+                }
+                if best.as_ref().is_none_or(|(_, d, _, _)| t_depth > *d) {
+                    best = Some((t_scan, t_depth, col.clone(), seed.clone()));
+                }
+            }
+            let Some((t_scan, _, t_col, seed_col)) = best else {
+                continue;
+            };
+
+            // Composite dim build: M ⋈ D on the anchor's own equi-pair.
+            // Built with explicit equi-keys (not `join_on`) so the semi
+            // hash-joins even on paths that skip re-optimization.
+            let build = LogicalPlanBuilder::from(m_scan.clone())
+                .join(
+                    dim_subtree.clone(),
+                    JoinType::Inner,
+                    (vec![s_key.clone()], vec![d_key.clone()]),
+                    None,
+                )
+                .ok()?
+                .build()
+                .ok()?;
+
+            // Splice T ⋉ build below the target scan (schema-preserving,
+            // so every ancestor node clones over unchanged).
+            let mut done = false;
+            let new_s = (*s_side.as_ref())
+                .clone()
+                .transform_down(|node| {
+                    if !done && node == t_scan {
+                        done = true;
+                        let semi = LogicalPlanBuilder::from(node.clone())
+                            .join(
+                                build.clone(),
+                                JoinType::LeftSemi,
+                                (vec![t_col.clone()], vec![seed_col.clone()]),
+                                None,
+                            )
+                            .and_then(|b| b.build());
+                        return match semi {
+                            Ok(s) => Ok(Transformed::yes(s)),
+                            Err(_) => Ok(Transformed::no(node)),
+                        };
+                    }
+                    Ok(Transformed::no(node))
+                })
+                .ok()?;
+            if !done || !new_s.transformed {
+                continue;
+            }
+            let (new_left, new_right) = if dim_on_right {
+                (new_s.data, d_side.as_ref().clone())
+            } else {
+                (d_side.as_ref().clone(), new_s.data)
+            };
+            return LogicalPlanBuilder::from(new_left)
+                .join_on(
+                    new_right,
+                    JoinType::Inner,
+                    j.on.iter()
+                        .map(|(l, r)| {
+                            Expr::BinaryExpr(BinaryExpr {
+                                left: Box::new(l.clone()),
+                                op: Operator::Eq,
+                                right: Box::new(r.clone()),
+                            })
+                        })
+                        .chain(j.filter.iter().cloned()),
+                )
+                .ok()?
+                .build()
+                .ok();
+        }
+    }
+    None
+}
+
+/// Sanity cap on the mid-dim scan the rule clones into the semi build.
+/// The depth gate is the principled guard; this bound just refuses
+/// fact-sized clones outright when the provider exposes row counts
+/// (8M = above every TPC-H dim at SF ≤ 100, below every fact at SF ≥ 10).
+const MID_DIM_MAX_ROWS: usize = 8_000_000;
+
+/// Raw row count of a `TableScan` via its provider's statistics, when
+/// the source exposes them (`DefaultTableSource` over our providers
+/// does — footer counts, no I/O). `None` = unknown, caller stays
+/// permissive and relies on the structural gates.
+fn scan_raw_rows(scan: &LogicalPlan) -> Option<usize> {
+    use datafusion::common::stats::Precision;
+    use datafusion::datasource::DefaultTableSource;
+    let LogicalPlan::TableScan(ts) = scan else {
+        return None;
+    };
+    let src = ts
+        .source
+        .as_any()
+        .downcast_ref::<DefaultTableSource>()?
+        .table_provider
+        .clone();
+    match src.statistics()?.num_rows {
+        Precision::Exact(n) | Precision::Inexact(n) => Some(n),
+        Precision::Absent => None,
+    }
+}
+
+/// Qualifier-aware: does this `TableScan` node's projected schema
+/// resolve `col` (relation qualifier included)?
+fn scan_resolves_column(scan: &LogicalPlan, col: &Column) -> bool {
+    if let LogicalPlan::TableScan(ts) = scan {
+        return ts.projected_schema.index_of_column(col).is_ok();
+    }
+    false
+}
+
+/// Locate the `TableScan` in `plan` resolving `col` (qualifier-aware).
+/// Returns `(Some((scan_clone, join_depth)), occurrence_count)`; depth
+/// counts Join nodes above the scan. `occurrence_count > 1` means the
+/// column is ambiguous in this subtree (self-joins) — callers skip.
+fn locate_scan_for_column(
+    plan: &LogicalPlan,
+    col: &Column,
+    depth: usize,
+) -> (Option<(LogicalPlan, usize)>, usize) {
+    if let LogicalPlan::TableScan(_) = plan {
+        return if scan_resolves_column(plan, col) {
+            (Some((plan.clone(), depth)), 1)
+        } else {
+            (None, 0)
+        };
+    }
+    let child_depth = if matches!(plan, LogicalPlan::Join(_)) {
+        depth + 1
+    } else {
+        depth
+    };
+    let mut found = None;
+    let mut count = 0;
+    for c in plan.inputs() {
+        let (f, n) = locate_scan_for_column(c, col, child_depth);
+        if found.is_none() {
+            found = f;
+        }
+        count += n;
+    }
+    (found, count)
+}
+
+/// Harvest equi-join column pairs from every Inner/LeftSemi/RightSemi
+/// join in the subtree. Only these join types let a key constraint
+/// propagate to surviving rows (an outer join's ON does not).
+fn collect_inner_equi_edges(plan: &LogicalPlan, out: &mut Vec<(Column, Column)>) {
+    if let LogicalPlan::Join(j) = plan {
+        if matches!(
+            j.join_type,
+            JoinType::Inner | JoinType::LeftSemi | JoinType::RightSemi
+        ) {
+            for (l, r) in &j.on {
+                if let (Expr::Column(lc), Expr::Column(rc)) = (l, r) {
+                    out.push((lc.clone(), rc.clone()));
+                }
+            }
+        }
+    }
+    for c in plan.inputs() {
+        collect_inner_equi_edges(c, out);
+    }
+}
+
+/// First (leftmost-descent) `TableScan` table name in the subtree —
+/// the dim subtrees this rule clones are linear wrapper chains.
+fn leaf_scan_table_name(plan: &LogicalPlan) -> Option<String> {
+    if let LogicalPlan::TableScan(ts) = plan {
+        return Some(ts.table_name.to_string());
+    }
+    plan.inputs().first().and_then(|c| leaf_scan_table_name(c))
+}
+
+/// Idempotency guard: is there already a `LeftSemi` in the subtree
+/// whose left side resolves `t_col` and whose build scans `dim_table`?
+fn semi_guard_exists(plan: &LogicalPlan, t_col: &Column, dim_table: &str) -> bool {
+    if let LogicalPlan::Join(j) = plan {
+        if j.join_type == JoinType::LeftSemi
+            && j.left.schema().index_of_column(t_col).is_ok()
+            && subtree_scans_table(&j.right, dim_table)
+        {
+            return true;
+        }
+    }
+    plan.inputs()
+        .iter()
+        .any(|c| semi_guard_exists(c, t_col, dim_table))
+}
+
+fn subtree_scans_table(plan: &LogicalPlan, table: &str) -> bool {
+    if let LogicalPlan::TableScan(ts) = plan {
+        return ts.table_name.to_string() == table;
+    }
+    plan.inputs().iter().any(|c| subtree_scans_table(c, table))
+}
+
+/// Try the Q17-shape rewrite on a single Inner Join node.
 ///
 /// Mirrors [`try_rewrite_q17_shape`] but, instead of a direct
 /// `Filter → TableScan` on the filter side, the join key is
@@ -1180,6 +1535,168 @@ mod tests {
                 format!("{}", optimized.display_indent()),
                 format!("{}", rewritten.display_indent()),
                 "{q}: transitive semi rule must be a no-op (targets only the Q20 dim-semi→agg shape)"
+            );
+        }
+        Ok(())
+    }
+
+    async fn q_sql(dir: &std::path::Path, q: &str) -> Option<String> {
+        std::fs::read_to_string(
+            dir.parent()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .join(format!("queries/{q}.sql")),
+        )
+        .ok()
+    }
+
+    /// Σ.Q05 (#352): the transitive dim-semi rule fires on the Q05
+    /// snowflake — customer is constrained by `nation ⋈ region[ASIA]`
+    /// only through the supplier hop (`c_nationkey = s_nationkey =
+    /// n_nationkey`), so a `LeftSemi(customer, nation ⋈ region)` is
+    /// spliced below customer, shrinking the orders⋈customer build
+    /// the lineitem join probes from (2.28M → 456K keys at SF=10).
+    #[tokio::test]
+    async fn transitive_join_semi_fires_on_q05_shape() -> DfResult<()> {
+        let Some(dir) = sf1_dir() else {
+            eprintln!("skip: sf1 missing");
+            return Ok(());
+        };
+        let ctx = SessionContext::new();
+        register_tpch(&ctx, &dir).await?;
+        let Some(sql) = q_sql(&dir, "q05").await else {
+            eprintln!("skip: q05.sql missing");
+            return Ok(());
+        };
+        let optimized = ctx.sql(&sql).await?.into_optimized_plan()?;
+        let rewritten = push_transitive_dim_semi_into_join_chain(optimized.clone())?;
+        let orig_dump = format!("{}", optimized.display_indent());
+        let new_dump = format!("{}", rewritten.display_indent());
+        assert_ne!(
+            orig_dump, new_dump,
+            "Q05 transitive dim-semi must change the plan; got identical:\n{orig_dump}"
+        );
+        assert!(
+            new_dump.contains("LeftSemi Join: customer.c_nationkey = nation.n_nationkey"),
+            "expected LeftSemi(customer, nation⋈region) keyed c_nationkey = n_nationkey:\n{new_dump}"
+        );
+        // The semi build clones nation + region below customer: both
+        // scans now appear twice.
+        assert_eq!(
+            new_dump.matches("TableScan: region").count(),
+            2,
+            "region scan must be cloned into the semi build:\n{new_dump}"
+        );
+        assert_eq!(
+            new_dump.matches("TableScan: nation").count(),
+            2,
+            "nation scan must be cloned into the semi build:\n{new_dump}"
+        );
+        // Idempotent: a second application must not splice again.
+        let twice = push_transitive_dim_semi_into_join_chain(rewritten)?;
+        assert_eq!(
+            new_dump,
+            format!("{}", twice.display_indent()),
+            "second application must be a no-op (idempotency guard)"
+        );
+        Ok(())
+    }
+
+    /// Σ.Q05 end-to-end correctness: the spliced semi only drops
+    /// customer rows whose nation is non-ASIA — rows the original
+    /// supplier⋈nation⋈region joins discard anyway — so the (n_name,
+    /// revenue) result set is identical (float-sum tolerance only).
+    #[tokio::test]
+    async fn transitive_join_semi_preserves_q05_result() -> DfResult<()> {
+        let Some(dir) = sf1_dir() else {
+            eprintln!("skip: sf1 missing");
+            return Ok(());
+        };
+        let ctx = SessionContext::new();
+        register_tpch(&ctx, &dir).await?;
+        let Some(sql) = q_sql(&dir, "q05").await else {
+            eprintln!("skip: q05.sql missing");
+            return Ok(());
+        };
+        let extract =
+            |batches: &[datafusion::arrow::record_batch::RecordBatch]| -> Vec<(String, f64)> {
+                use datafusion::arrow::array::{Float64Array, StringViewArray};
+                let mut rows = Vec::new();
+                for b in batches {
+                    let names = b.column(0).as_any().downcast_ref::<StringViewArray>();
+                    let revs = b.column(1).as_any().downcast_ref::<Float64Array>();
+                    if let (Some(n), Some(r)) = (names, revs) {
+                        for i in 0..b.num_rows() {
+                            rows.push((n.value(i).to_string(), r.value(i)));
+                        }
+                    }
+                }
+                rows.sort_by(|a, b| a.0.cmp(&b.0));
+                rows
+            };
+        let baseline_batches = ctx.sql(&sql).await?.collect().await?;
+        let baseline = extract(&baseline_batches);
+
+        let optimized = ctx.sql(&sql).await?.into_optimized_plan()?;
+        let rewritten = push_transitive_dim_semi_into_join_chain(optimized)?;
+        let new_batches = ctx.execute_logical_plan(rewritten).await?.collect().await?;
+        let new = extract(&new_batches);
+
+        assert!(!baseline.is_empty(), "Q05 baseline produced no rows");
+        assert_eq!(
+            baseline.len(),
+            new.len(),
+            "Q05 rewrite changed row count: baseline={}, rewritten={}",
+            baseline.len(),
+            new.len()
+        );
+        for ((bn, bv), (nn, nv)) in baseline.iter().zip(new.iter()) {
+            assert_eq!(bn, nn, "Q05 rewrite changed the nation set");
+            assert!(
+                (bv - nv).abs() <= 1e-3 * bv.abs().max(1.0),
+                "Q05 rewrite changed revenue for {bn}: {bv} vs {nv}"
+            );
+        }
+        Ok(())
+    }
+
+    /// Σ.Q05 specificity — the transitive-only (hop ≥ 2) gate: every
+    /// other TPC-H dim constraint rides a DIRECT join edge (customer or
+    /// supplier joins the filtered dim's mid-dim immediately), which the
+    /// join itself + L9 blooms already handle. The rule must pass those
+    /// shapes through byte-identical.
+    #[tokio::test]
+    async fn transitive_join_semi_no_op_on_direct_dim_shapes() -> DfResult<()> {
+        let Some(dir) = sf1_dir() else {
+            eprintln!("skip: sf1 missing");
+            return Ok(());
+        };
+        let ctx = SessionContext::new();
+        register_tpch(&ctx, &dir).await?;
+        // Every TPC-H query except Q05. Documented per-shape reasons:
+        // direct join edges (q02/q03/q07/q08/q10/q11/q21 — the dim's
+        // constraint lands at hop 1, which the join itself + L9 blooms
+        // already cover), inverted mid-dim (q09 — lineitem would be the
+        // "mid-dim" and the hop-2 target nation is SHALLOWER, killed by
+        // the downhill gate), opposite-LeftSemi-side chains (q20 — the
+        // supplier⋈nation[CANADA] anchor's S side is a bare supplier
+        // scan; the lineitem chain hangs on the other side of the outer
+        // LeftSemi, outside the anchor), or no filtered-dim anchor at
+        // all (the rest). Blast radius = exactly Q05.
+        for q in [
+            "q01", "q02", "q03", "q04", "q06", "q07", "q08", "q09", "q10", "q11", "q12", "q13",
+            "q14", "q15", "q16", "q17", "q18", "q19", "q20", "q21", "q22",
+        ] {
+            let Some(sql) = q_sql(&dir, q).await else {
+                continue;
+            };
+            let optimized = ctx.sql(&sql).await?.into_optimized_plan()?;
+            let rewritten = push_transitive_dim_semi_into_join_chain(optimized.clone())?;
+            assert_eq!(
+                format!("{}", optimized.display_indent()),
+                format!("{}", rewritten.display_indent()),
+                "{q}: transitive dim-semi must be a no-op on this shape"
             );
         }
         Ok(())

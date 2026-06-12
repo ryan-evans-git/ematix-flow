@@ -849,7 +849,38 @@ fn estimate_build_rows_mode(plan: &dyn ExecutionPlan, tight: bool) -> Option<usi
         let est = estimate_build_rows_uncapped(plan, tight).unwrap_or(SELECTIVE_SHAPE_CAP);
         return Some(est.min(SELECTIVE_SHAPE_CAP));
     }
+    // L9.ADAPT.Q05 (#352, TIGHT mode only): a semi join ANYWHERE in the
+    // build bounds its output by the semi's key set — the Σ.AM.1 insight
+    // extended past the top shaping node. The Σ.Q05 transitive splice
+    // produces exactly this shape (`Inner(customer ⋉ nation⋈region,
+    // orders)`, true output 456K at SF=10) and plan statistics cannot
+    // see through the deep semi, so the uncapped estimate ratio-rejects
+    // a 3%-pass-rate wrap. Tight-only keeps the v3 contract: the default
+    // path stays stats-only, default-admitted wraps are byte-identical,
+    // and a wrongly-capped admit is bounded by the rescue pre-gates +
+    // the Guard-2 runtime disarm.
+    if tight && subtree_has_semi_filter_dyn(plan) {
+        let est = estimate_build_rows_uncapped(plan, tight).unwrap_or(SELECTIVE_SHAPE_CAP);
+        return Some(est.min(SELECTIVE_SHAPE_CAP));
+    }
     estimate_build_rows_uncapped(plan, tight)
+}
+
+/// `build_subtree_has_semi_filter` over a `&dyn` plan (the estimator
+/// works on `&dyn ExecutionPlan`; the rule-site walker takes `&Arc`).
+fn subtree_has_semi_filter_dyn(plan: &dyn ExecutionPlan) -> bool {
+    use datafusion::common::JoinType;
+    if let Some(hj) = plan.as_any().downcast_ref::<HashJoinExec>() {
+        if matches!(
+            hj.join_type(),
+            JoinType::LeftSemi | JoinType::LeftAnti | JoinType::RightSemi | JoinType::RightAnti
+        ) {
+            return true;
+        }
+    }
+    plan.children()
+        .iter()
+        .any(|c| subtree_has_semi_filter_dyn(c.as_ref()))
 }
 
 /// Walk through pass-through operators (projection / coalesce / repartition)
@@ -1133,16 +1164,14 @@ mod tests {
     #[test]
     fn tight_rescue_pre_gate_constants() {
         // Q08 lineitem probe qualifies; Q02 partsupp and SF=1 lineitem don't.
-        assert!(59_986_052 >= TIGHT_MIN_PROBE_ROWS);
-        assert!(2_000_000 < TIGHT_MIN_PROBE_ROWS);
-        assert!(
-            6_001_215 < TIGHT_MIN_PROBE_ROWS,
-            "SF=1 lineitem stays default-path"
-        );
+        const { assert!(59_986_052 >= TIGHT_MIN_PROBE_ROWS) };
+        const { assert!(2_000_000 < TIGHT_MIN_PROBE_ROWS) };
+        // SF=1 lineitem (6,001,215 rows) stays default-path.
+        const { assert!(6_001_215 < TIGHT_MIN_PROBE_ROWS) };
         // Width boundary: Q17's 3-col wrap refused (measured +25-31%
         // in-sweep, twice), Q08's 5-col wrap allowed (−19.5%).
-        assert!(3 < TIGHT_MIN_PROBE_PROJ_COLS);
-        assert!(5 >= TIGHT_MIN_PROBE_PROJ_COLS);
+        const { assert!(3 < TIGHT_MIN_PROBE_PROJ_COLS) };
+        const { assert!(5 >= TIGHT_MIN_PROBE_PROJ_COLS) };
     }
 
     /// L9.ADAPT Guard 1 — tight wraps are refused when the probe scan's
@@ -1821,6 +1850,93 @@ mod tests {
         assert!(
             !build_subtree_has_semi_filter(&inner),
             "a plain Inner join must not be detected as semi-filtered"
+        );
+    }
+
+    /// L9.ADAPT.Q05 (#352) — the TIGHT-mode estimator must extend the
+    /// Σ.AM.1 selective-shape cap to builds that contain a semi join
+    /// ANYWHERE (not just as the top shaping node). The Σ.Q05 splice
+    /// produces exactly this shape — `Inner(customer ⋉ dim, orders)` —
+    /// where plan statistics can't see through the deep semi and the
+    /// uncapped estimate ratio-rejects a 3%-pass-rate wrap. The DEFAULT
+    /// mode must stay stats-only byte-for-byte (the v3 lazy-rescue
+    /// contract: default-admitted wraps keep today's estimates).
+    #[test]
+    fn tight_mode_caps_deep_semi_builds() {
+        use datafusion::arrow::array::{Int64Array, RecordBatch};
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::common::{JoinType, NullEquality};
+        use datafusion::datasource::memory::MemorySourceConfig;
+        use datafusion::physical_expr::PhysicalExpr;
+        use datafusion::physical_plan::joins::PartitionMode;
+
+        fn mem_table_n(rows: i64) -> Arc<dyn ExecutionPlan> {
+            let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int64Array::from_iter_values(0..rows))],
+            )
+            .unwrap();
+            MemorySourceConfig::try_new_exec(&[vec![batch]], schema, None).unwrap()
+        }
+        fn join(
+            jt: JoinType,
+            l: Arc<dyn ExecutionPlan>,
+            r: Arc<dyn ExecutionPlan>,
+        ) -> Arc<dyn ExecutionPlan> {
+            let on = vec![(
+                Arc::new(Column::new("a", 0)) as Arc<dyn PhysicalExpr>,
+                Arc::new(Column::new("a", 0)) as Arc<dyn PhysicalExpr>,
+            )];
+            Arc::new(
+                HashJoinExec::try_new(
+                    l,
+                    r,
+                    on,
+                    None,
+                    &jt,
+                    None,
+                    PartitionMode::Partitioned,
+                    NullEquality::NullEqualsNothing,
+                    false,
+                )
+                .unwrap(),
+            )
+        }
+
+        // Inner( LeftSemi(60K, 60K), 60K ) — semi DEEP in the build.
+        let deep = join(
+            JoinType::Inner,
+            join(JoinType::LeftSemi, mem_table_n(60_000), mem_table_n(60_000)),
+            mem_table_n(60_000),
+        );
+        assert!(
+            !build_top_is_selective_shape(deep.as_ref()),
+            "top is Inner — the existing top-shape cap must NOT cover this"
+        );
+        let default_est = estimate_build_rows_mode(deep.as_ref(), false);
+        let uncapped = estimate_build_rows_uncapped(deep.as_ref(), false);
+        assert_eq!(
+            default_est, uncapped,
+            "DEFAULT mode must stay stats-only on deep-semi builds (v3 contract)"
+        );
+        assert!(
+            default_est.is_none_or(|e| e > 10_000),
+            "test setup must make the uncapped estimate exceed the cap \
+             (or be unresolvable) so the cap is observable, got {default_est:?}"
+        );
+        let tight_est = estimate_build_rows_mode(deep.as_ref(), true);
+        assert!(
+            tight_est.is_some_and(|e| e <= 10_000),
+            "TIGHT mode must cap a deep-semi build at the Σ.AM.1 constant, got {tight_est:?}"
+        );
+
+        // A semi-free Inner build must NOT take the tight cap.
+        let no_semi = join(JoinType::Inner, mem_table_n(60_000), mem_table_n(60_000));
+        assert_eq!(
+            estimate_build_rows_mode(no_semi.as_ref(), true),
+            estimate_build_rows_uncapped(no_semi.as_ref(), true),
+            "tight mode must not cap semi-free builds"
         );
     }
 
