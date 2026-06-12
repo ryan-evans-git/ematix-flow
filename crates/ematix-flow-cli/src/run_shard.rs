@@ -171,8 +171,13 @@ pub async fn execute_work_unit(wu: &WorkUnit) -> Result<WorkUnitMetrics, RunShar
     // of pageins per pass vs DuckDB's 2-4GB on identical files).
     // `mi_collect(true)` between queries measured −5% geomean at SF=100
     // and is the same discipline DuckDB gets implicitly from dropping
-    // its per-call connection. Opt-out: EMAT_MI_COLLECT=0.
-    if std::env::var("EMAT_MI_COLLECT").ok().as_deref() != Some("0") {
+    // its per-call connection. MI.GATE (2026-06-12): the SAME collect
+    // is a +6.1% geomean TAX on small working sets (SF=10 interleaved
+    // A/B; up to +25% on short queries — no cache pressure to relieve,
+    // the next query just re-faults the torn-down heap), so it now
+    // fires only above a peak-RSS threshold (default 6GB; see
+    // `heap_pressure`). EMAT_MI_COLLECT: 0=never, 1=always, unset=auto.
+    if ematix_flow_core::heap_pressure::should_mi_collect() {
         unsafe { libmimalloc_sys::mi_collect(true) };
     }
     Ok(WorkUnitMetrics {

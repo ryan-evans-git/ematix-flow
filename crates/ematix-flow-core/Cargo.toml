@@ -12,6 +12,9 @@ description = "Rust core for ematix-flow: declarative table management + load st
 name = "ematix_flow_core"
 
 [dependencies]
+# MI.GATE (2026-06-12): getrusage peak-RSS read for the heap_pressure
+# mi_collect gate (shared by the bench harness and the worker).
+libc = "0.2"
 # HJ.3 (2026-06-04): the L13 pure-kernel hash-join table (Robin Hood,
 # i64-specialised). Sibling crate, no DataFusion/Arrow dep — the
 # EmatixHashJoinExec operator + Arrow bridge live HERE so the

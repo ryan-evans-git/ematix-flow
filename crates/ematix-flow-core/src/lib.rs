@@ -17,6 +17,10 @@ pub mod duckdb_backend;
 // See `fast_parquet.rs` for the day-2/day-3 probe results that
 // motivated this.
 pub mod fast_parquet;
+// MI.GATE (2026-06-12): peak-RSS pressure gate for between-query
+// mi_collect — −5% at SF=100 (page-cache relief), +6.1% TAX at SF=10
+// (heap re-fault churn); collect only above the RSS threshold.
+pub mod heap_pressure;
 // HJ.3 (2026-06-04): Arrow bridge + (next) ExecutionPlan for the L13
 // RobinHood hash-join kernel. Targets Q08's part⋈lineitem probe, where
 // ematix does ~1010ms more summed work than DuckDB (60M vs 37K probes).

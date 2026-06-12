@@ -150,8 +150,14 @@ fn rss_mb() -> f64 {
 /// query re-read its full column set from disk EVERY trial (60-68GB
 /// pageins/pass) while DuckDB's pass (same files, own allocator,
 /// conn-per-call) paged in ~2-4GB. Measured −5% geomean at SF=100.
+/// MI.GATE (2026-06-12): the unconditional default measured a +6.1%
+/// geomean TAX at SF=10 (interleaved A/B/A/B; up to +25% on sub-60ms
+/// queries) — with no page-cache pressure to relieve, every collect
+/// tears down the warm heap and the next trial re-faults it. Now
+/// pressure-gated on peak RSS (shared `heap_pressure` helper, same
+/// behavior as the production worker): 0=never, 1=always, unset=auto.
 fn mi_collect_if_requested() {
-    if std::env::var("EMAT_MI_COLLECT").ok().as_deref() != Some("0") {
+    if ematix_flow_core::heap_pressure::should_mi_collect() {
         unsafe { libmimalloc_sys::mi_collect(true) };
     }
 }
