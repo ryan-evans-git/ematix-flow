@@ -468,7 +468,7 @@ impl PhysicalOptimizerRule for EnableRuntimeBloomSidebandRule {
                     return Ok(Transformed::no(node));
                 }
                 // Pre-gates pass — NOW pay the NDV stats walk.
-                let tight_est = if build_has_semi {
+                let tight_admit = if build_has_semi {
                     Some(
                         estimate_build_rows_mode(build.as_ref(), true)
                             .unwrap_or(10_000)
@@ -477,18 +477,32 @@ impl PhysicalOptimizerRule for EnableRuntimeBloomSidebandRule {
                 } else {
                     estimate_build_rows_mode(build.as_ref(), true)
                 };
-                if tight_est.is_none() || ratio_rejects(tight_est) {
+                if tight_admit.is_none() || ratio_rejects(tight_admit) {
                     if trace {
                         eprintln!(
                             "[L9.trace] skip — gate rejects (tight too): b({:?}) × ratio({}) >= p({})",
-                            tight_est,
+                            tight_admit,
                             self.min_probe_to_build_ratio,
                             probe_rows.unwrap_or(0)
                         );
                     }
                     return Ok(Transformed::no(node));
                 }
-                build_rows = tight_est;
+                // L9.ADAPT.Q05 SIZING (2026-06-12): the selective-shape
+                // caps are ADMISSION devices, not sizing — feeding Q05's
+                // 456K-key spliced semi build into a 10K-sized bloom
+                // saturated it (>10% effective pass), Guard-2 disarmed
+                // the probes, and the wrap paid pure reader-routing tax
+                // (+12.6% measured, 3 same-sign interleaved pairs). Size
+                // from the UNCAPPED estimate; when the stats can't see
+                // through the build at all, fall back to 2× the publish
+                // set cap so any semi-bounded build the rescue admits
+                // fits without saturating. Uncapped == admitted when no
+                // cap applied (Q08's 13K wrap stays byte-identical).
+                let tight_size = estimate_build_rows_uncapped(build.as_ref(), true)
+                    .unwrap_or(524_288)
+                    .max(tight_admit.unwrap_or(0));
+                build_rows = Some(tight_size);
                 tight_only = true;
             }
             // L9.WIDTH (2026-06-10): general probe-payoff gate, configured
