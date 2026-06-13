@@ -153,13 +153,20 @@ fn rss_mb() -> f64 {
 /// MI.GATE (2026-06-12): the unconditional default measured a +6.1%
 /// geomean TAX at SF=10 (interleaved A/B/A/B; up to +25% on sub-60ms
 /// queries) — with no page-cache pressure to relieve, every collect
-/// tears down the warm heap and the next trial re-faults it. Now
-/// pressure-gated on peak RSS (shared `heap_pressure` helper, same
-/// behavior as the production worker): 0=never, 1=always, unset=auto.
-fn mi_collect_if_requested() {
-    if ematix_flow_core::heap_pressure::should_mi_collect() {
+/// tears down the warm heap and the next trial re-faults it.
+/// MI.GATE.2/3: the peak-RSS-only gate self-latched (a 20×3 SF=10
+/// sweep ratchets ru_maxrss past 6144MB inside the warmups, so every
+/// measured trial collected anyway), and ru_majflt is a dead signal
+/// for read()-based file IO. Gate v3 (shared `heap_pressure` helper,
+/// same behavior as the production worker) gates on CURRENT RSS vs
+/// max(6144MB, RAM/4): 0=never, 1=always, unset=auto. Returns whether
+/// it collected, for the [trial] log.
+fn mi_collect_if_requested() -> bool {
+    let collect = ematix_flow_core::heap_pressure::should_mi_collect();
+    if collect {
         unsafe { libmimalloc_sys::mi_collect(true) };
     }
+    collect
 }
 
 fn median(v: &mut [f64]) -> f64 {
@@ -382,14 +389,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for wi in 0..warmups {
         for (q, sql) in &sqls {
             if !skip_ematix {
-                match time_ematix(&ctx, sql).await {
+                let res = time_ematix(&ctx, sql).await;
+                let collected = mi_collect_if_requested();
+                match res {
                     Ok((ms, _)) => eprintln!(
-                        "[trial] eng=ematix q={q:02} warm{wi} ms={ms:.1} rss_mb={:.0}",
-                        rss_mb()
+                        "[trial] eng=ematix q={q:02} warm{wi} ms={ms:.1} rss_mb={:.0} cur_mb={:.0} collect={}",
+                        rss_mb(),
+                        ematix_flow_core::heap_pressure::current_rss_mb().unwrap_or(0.0),
+                        collected as u8
                     ),
                     Err(e) => eprintln!("warm ematix Q{q:02} ERR: {e}"),
                 }
-                mi_collect_if_requested();
             }
             if !skip_duckdb {
                 match time_duckdb(&data_dir, sql) {
@@ -419,18 +429,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // (build_ematix_ctx == preset::with_optimizer_rules == run_shard.rs).
             if !skip_ematix {
                 let q_ctx = build_ematix_ctx(&data_dir)?;
-                match time_ematix(&q_ctx, sql).await {
+                let res = time_ematix(&q_ctx, sql).await;
+                let collected = mi_collect_if_requested();
+                match res {
                     Ok((ms, r)) => {
                         eprintln!(
-                            "[trial] eng=ematix q={q:02} ti={ti} ms={ms:.1} rss_mb={:.0}",
-                            rss_mb()
+                            "[trial] eng=ematix q={q:02} ti={ti} ms={ms:.1} rss_mb={:.0} cur_mb={:.0} collect={}",
+                            rss_mb(),
+                            ematix_flow_core::heap_pressure::current_rss_mb().unwrap_or(0.0),
+                            collected as u8
                         );
                         e_times.entry(*q).or_default().push(ms);
                         e_rows.insert(*q, r);
                     }
                     Err(e) => eprintln!("ematix Q{q:02} ERR: {e}"),
                 }
-                mi_collect_if_requested();
             }
             if !skip_duckdb {
                 match time_duckdb(&data_dir, sql) {
