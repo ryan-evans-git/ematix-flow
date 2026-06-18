@@ -33,6 +33,7 @@ use datafusion::arrow::compute::{interleave, take};
 use ematix_flow_hash_join::{
     ProbeMatch, RadixTaggedJoin, RobinHoodHashJoinI64Table, TaggedJoinI64U32,
 };
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// HJ.4 fire counters (observability for the wall A/B): how many build sides
@@ -84,6 +85,15 @@ enum ProbeTable {
 pub enum JoinColumn {
     Build(usize),
     Probe(usize),
+    /// Q10-flip increment 3: emit the matched build row's **global** index as a
+    /// `UInt32Array` instead of interleave-gathering a (wide) build column. A
+    /// downstream `LateGatherExec` resolves these ids back to the wide build
+    /// columns at the (far smaller) aggregate output, so the wide strings never
+    /// flow through the join's multi-million-row intermediate. The id is the
+    /// same global index the gather path feeds to [`EmatHashJoiner::locate`] /
+    /// `build_offsets`, so a shared-build `LateGatherExec` can `interleave` the
+    /// wide columns from the identical un-concatenated `build_batches`.
+    BuildRowId,
 }
 
 /// Extract an i64 key vector + optional per-row validity from an Arrow
@@ -282,6 +292,11 @@ impl EmatHashJoiner {
             .iter()
             .map(|jc| match jc {
                 JoinColumn::Probe(i) => take(probe.column(*i), &probe_idx, None),
+                // Q10-flip increment 3: emit the global build row index in lieu
+                // of gathering a wide build column (no string memcpy here).
+                JoinColumn::BuildRowId => Ok(Arc::new(UInt32Array::from_iter_values(
+                    matches.iter().map(|m| m.build_row_idx),
+                )) as ArrayRef),
                 JoinColumn::Build(i) => {
                     if single {
                         take(
@@ -304,6 +319,49 @@ impl EmatHashJoiner {
 
         RecordBatch::try_new(self.output_schema.clone(), cols)
             .map_err(|e| format!("assemble output batch: {e}"))
+    }
+
+    /// Q10-flip increment 3, step 2: resolve a set of **global** build row ids
+    /// (as emitted by [`JoinColumn::BuildRowId`]) back to the requested wide
+    /// build columns, gathering from the SAME un-concatenated `build_batches`.
+    /// The deferred half of late materialization: a `LateGatherExec` that shares
+    /// this joiner's build calls it at the (small) aggregate output, so the wide
+    /// strings never traverse the join's multi-million-row intermediate.
+    ///
+    /// `ids` is assumed non-null (the row-id column is non-nullable by
+    /// construction); its raw `u32` values index globally across all build
+    /// batches. `col_idxs` are column positions in the build schema; the
+    /// returned arrays match `col_idxs` order, each `ids.len()` rows long.
+    pub fn gather_build_cols(
+        &self,
+        ids: &UInt32Array,
+        col_idxs: &[usize],
+    ) -> Result<Vec<ArrayRef>, String> {
+        // Single build batch → global id == local row → plain `take` (byte-
+        // identical to the probe-side single-batch fast path).
+        if self.build_batches.len() == 1 {
+            return col_idxs
+                .iter()
+                .map(|&c| {
+                    take(self.build_batches[0].column(c), ids, None)
+                        .map_err(|e| format!("late-gather take: {e}"))
+                })
+                .collect();
+        }
+        // Many batches → resolve each global id to (batch, local) ONCE, then
+        // `interleave` each requested column — no build-side concatenation.
+        let pairs: Vec<(usize, usize)> = ids.values().iter().map(|&g| self.locate(g)).collect();
+        col_idxs
+            .iter()
+            .map(|&c| {
+                let arrays: Vec<&dyn Array> = self
+                    .build_batches
+                    .iter()
+                    .map(|b| b.column(c).as_ref())
+                    .collect();
+                interleave(&arrays, &pairs).map_err(|e| format!("late-gather interleave: {e}"))
+            })
+            .collect()
     }
 
     /// RADIX.2 B-scatter probe over a COLLECTED set of probe batches (the
@@ -379,6 +437,11 @@ impl EmatHashJoiner {
                         .collect();
                     interleave(&arrays, &probe_pairs)
                 }
+                // Q10-flip increment 3: global build row index (radix matches
+                // carry the same global `build_row_idx` as the streaming path).
+                JoinColumn::BuildRowId => Ok(Arc::new(UInt32Array::from_iter_values(
+                    matches.iter().map(|m| m.build_row_idx),
+                )) as ArrayRef),
                 JoinColumn::Build(i) => {
                     let arrays: Vec<&dyn Array> = self
                         .build_batches
@@ -609,5 +672,135 @@ mod tests {
         assert!(got.contains(&("a".into(), 10, 10)), "build batch0 key 10");
         assert!(got.contains(&("e".into(), 50, 50)), "build batch1 key 50");
         assert!(got.contains(&("c".into(), 30, 30)), "build batch0 key 30");
+    }
+
+    #[test]
+    fn build_row_id_emits_global_build_index() {
+        // Q10-flip increment 3, step 1: `JoinColumn::BuildRowId` emits the
+        // matched build row's GLOBAL index as a UInt32Array instead of
+        // interleave-gathering a (wide) build column — so a downstream
+        // LateGatherExec can resolve the wide strings at the small aggregate
+        // output rather than carry them through the join's intermediate.
+        //
+        // Multi-batch build → the emitted id MUST be the global index (spanning
+        // batches via build_offsets), and resolving the build key by that id
+        // must reproduce exactly what the parallel Build(0) gather emits for the
+        // same output row. Includes a duplicate key (20) split across batch0 and
+        // batch2 to pin that both source rows surface with distinct ids.
+        let b0 = kv_batch(vec![10, 20], vec!["a0", "a1"]); // global 0,1
+        let b1 = kv_batch(vec![30], vec!["b0"]); // global 2
+        let b2 = kv_batch(vec![40, 20], vec!["c0", "c1"]); // global 3,4
+        let probe = kv_batch(vec![20, 40, 30, 10], vec!["p0", "p1", "p2", "p3"]);
+        let out_schema = Arc::new(Schema::new(vec![
+            Field::new("build_rowid", DataType::UInt32, false),
+            Field::new("k", DataType::Int64, false), // build key (direct gather)
+            Field::new("pk", DataType::Int64, false), // probe key
+        ]));
+        let j = EmatHashJoiner::try_build(
+            &[b0, b1, b2],
+            0,
+            0,
+            vec![
+                JoinColumn::BuildRowId,
+                JoinColumn::Build(0),
+                JoinColumn::Probe(0),
+            ],
+            out_schema,
+        )
+        .unwrap();
+        let out = j.probe(&probe).unwrap();
+        assert_eq!(out.num_rows(), 5, "inner-join cardinality across batches");
+        let rid = out
+            .column(0)
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .unwrap();
+        let bk = out.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+        let pk = out.column(2).as_any().downcast_ref::<Int64Array>().unwrap();
+        // Ground truth: global build index → build key.
+        let build_key_by_global: [i64; 5] = [10, 20, 30, 40, 20];
+        for i in 0..out.num_rows() {
+            let id = rid.value(i) as usize;
+            assert!(id < 5, "build row id within range");
+            assert_eq!(
+                build_key_by_global[id],
+                bk.value(i),
+                "BuildRowId resolves to the same build row as Build(0)"
+            );
+            assert_eq!(bk.value(i), pk.value(i), "matched key equality");
+        }
+        // The dup key 20 must surface BOTH its source build rows (global 1 & 4).
+        let ids: std::collections::HashSet<u32> =
+            (0..out.num_rows()).map(|i| rid.value(i)).collect();
+        assert!(
+            ids.contains(&1) && ids.contains(&4),
+            "both dup-key build rows emitted by distinct global id"
+        );
+    }
+
+    #[test]
+    fn gather_build_cols_resolves_global_ids_multi_batch() {
+        // Q10-flip increment 3, step 2: `gather_build_cols` is the inverse of
+        // BuildRowId — given global build ids (as a LateGatherExec would hold at
+        // the agg output), interleave the wide build columns back from the SAME
+        // un-concatenated build_batches. Pins the global-id → (batch,local) map,
+        // incl. the cross-batch dup key (ids 1 & 4 both key=20, payloads a1/c1).
+        let b0 = kv_batch(vec![10, 20], vec!["a0", "a1"]); // global 0,1
+        let b1 = kv_batch(vec![30], vec!["b0"]); // global 2
+        let b2 = kv_batch(vec![40, 20], vec!["c0", "c1"]); // global 3,4
+        let out_schema = Arc::new(Schema::new(vec![Field::new(
+            "build_rowid",
+            DataType::UInt32,
+            false,
+        )]));
+        let j = EmatHashJoiner::try_build(
+            &[b0, b1, b2],
+            0,
+            0,
+            vec![JoinColumn::BuildRowId],
+            out_schema,
+        )
+        .unwrap();
+        assert_eq!(j.build_batch_count(), 3, "multi-batch → interleave path");
+        let ids = UInt32Array::from(vec![1u32, 4, 2, 0]);
+        // request col 1 = payload "v", then col 0 = key "k" (order preserved).
+        let cols = j.gather_build_cols(&ids, &[1, 0]).unwrap();
+        assert_eq!(cols.len(), 2);
+        let v = cols[0].as_any().downcast_ref::<StringArray>().unwrap();
+        let k = cols[1].as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(
+            (0..ids.len()).map(|i| v.value(i)).collect::<Vec<_>>(),
+            vec!["a1", "c1", "b0", "a0"],
+            "global id → correct payload across batches"
+        );
+        assert_eq!(
+            k.values(),
+            &[20i64, 20, 30, 10],
+            "global id → correct key across batches"
+        );
+    }
+
+    #[test]
+    fn gather_build_cols_single_batch_take_path() {
+        // Single build batch → global id == local row → plain `take`.
+        let b = kv_batch(vec![10, 20, 30], vec!["x", "y", "z"]);
+        let out_schema = Arc::new(Schema::new(vec![Field::new(
+            "build_rowid",
+            DataType::UInt32,
+            false,
+        )]));
+        let j = EmatHashJoiner::try_build(
+            std::slice::from_ref(&b),
+            0,
+            0,
+            vec![JoinColumn::BuildRowId],
+            out_schema,
+        )
+        .unwrap();
+        assert_eq!(j.build_batch_count(), 1, "single-batch → take fast path");
+        let ids = UInt32Array::from(vec![2u32, 0, 1, 2]);
+        let cols = j.gather_build_cols(&ids, &[0]).unwrap();
+        let k = cols[0].as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(k.values(), &[30i64, 10, 20, 30]);
     }
 }

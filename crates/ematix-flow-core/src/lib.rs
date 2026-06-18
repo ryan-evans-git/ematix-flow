@@ -29,6 +29,11 @@ pub mod emat_hash_join;
 // (CollectLeft Inner, i64 key); installed only on the validated shape by
 // the pre-plan swap rule. Everything else stays on stock DataFusion.
 pub mod emat_hash_join_exec;
+// Q10-flip increment 3: LateGatherExec — re-attaches wide build columns
+// (customer strings) at the aggregate output via a shared join build +
+// `__cust_rowid`, so they never flow through the join intermediate. INERT
+// until the FlowQueryPlanner walker (step 4) installs it.
+pub mod late_gather_exec;
 // PV.2: EmatPushPipelineExec — fused push-pipeline ExecutionPlan node
 // (morsel kernel inside; hand-constructed for the Q08 shape, PV.3
 // generalises). Opt-in scaffold; not on any production plan path yet.
