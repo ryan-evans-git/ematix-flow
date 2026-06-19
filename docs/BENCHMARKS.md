@@ -150,13 +150,16 @@ All 22 row counts + sums match DuckDB at every scale.
 > most heavy queries timed out (`—`), so its SF=100 geomean covers only
 > the 6 that finished.
 
-> **Warm vs cold at SF=100.** The 22-query sweep cycles a ~30 GB working
-> set through the page cache, so every engine pays cold reads mid-sweep —
-> that's what the table reports. On a warm cache (single query, isolated)
-> ematix-flow also wins Q10 (2,676 vs 2,764), Q16 (389 vs 432), and Q18
-> (2,461 vs 2,732, all 2026-06-10), and beats Polars on Q14 (797 vs 955)
-> and Q15 (819 vs 973, both 2026-06-12): the remaining SF=100 losses are
-> I/O-scheduling losses under cache pressure, not compute losses.
+> **SF=100 measurement — corrected 2026-06-18.** ematix-flow and DuckDB are
+> timed **each in its own process**. Co-running both in a single process (the
+> harness's earlier default) makes the ~30 GB working set contend for the
+> 36 GB box's RAM and understates the higher-memory engine — that flaw
+> produced the prior SF=100 figures. Measured isolated, **ematix-flow wins
+> 18 / 22 at SF=100 (1.58× geomean)**; the DuckDB losses are Q10, Q16, and
+> Q18 (the wide-string, high-RSS queries). The per-query tables above predate
+> this re-measure and are being refreshed — the [README](../README.md#benchmarks)
+> carries the current authoritative summary (SF=1 22/22, SF=10 ~18/22,
+> SF=100 18/22).
 
 > **Config.** ematix-flow runs the production preset, no env vars:
 > `target_partitions = cores` (14 here) plus the fused-aggregate,

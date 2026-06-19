@@ -58,11 +58,12 @@ flow run-due --module my_pipelines    # cron-style; drop into systemd / cron / k
 ## Why ematix-flow
 
 - **Fast.** TPC-H, 22 queries, single Apple M4 Max, measured at three
-  scales through the production preset (fresh context per query, no
-  bench-only tricks): ematix-flow takes **22 / 22** at SF=1 (**2.36×**
-  DuckDB, **4.22×** Polars, **18×** single-node PySpark), **16 / 22** at
-  SF=10 (**1.21×** DuckDB), and **15 / 22** at SF=100 (**1.30×** DuckDB)
-  — still ahead on the geomean where the data spills out of cache. Full
+  scales through the production preset (fresh context per query, each
+  engine in its own process — no bench-only tricks): ematix-flow takes
+  **22 / 22** at SF=1 (**2.34×** DuckDB, **4.22×** Polars, **18×**
+  single-node PySpark), **18 / 22** at SF=10 (**1.23×** DuckDB), and
+  **18 / 22** at SF=100 (**1.58×** DuckDB) — ahead on the geomean at
+  every scale. Full
   numbers, the losses included, and the reproducer in
   [Benchmarks](#benchmarks).
 - **Scheduling + DAG, no service to operate.** Pipelines carry their own
@@ -1467,34 +1468,32 @@ the [Install](#install) extras and the
 
 ### TPC-H — SF=1 / SF=10 / SF=100, all 22 queries
 
-Five engines, the same Apple M4 Max, the same Parquet files (2026-06-11
+Five engines, the same Apple M4 Max, the same Parquet files (2026-06-18
 refresh). ematix-flow numbers are **production-faithful**: the harness
 (`examples/tpch_preset_rebench.rs`) builds a fresh `SessionContext` per
-measurement through the shipped preset — no plan cache, no context reuse
-— and ematix-flow + DuckDB are measured as a **same-session pair of
-isolated passes per scale** (20 timed trials after 3 warmups at SF=1 /
-SF=10; 5 after 1 at SF=100, medians), so marginal verdicts don't ride on
-another day's machine state. Polars runs the in-process harness (the
-marginal Q14/Q15 re-measured 2026-06-11, other columns carried from
-2026-06-10 / 2026-05-29-31); PySpark is `local[*]` on the JVM; Postgres
-14 is `EXPLAIN ANALYZE` Execution Time.
+measurement through the shipped preset — no plan cache, no context reuse.
+ematix-flow and DuckDB are each timed **in their own process** (medians of
+5 trials after 2 warmups); at SF=100 that isolation is essential — the
+~30 GB working set exceeds the 36 GB box, so co-running both engines in one
+process makes them contend for RAM and understates whichever uses more
+memory. Polars runs the in-process harness (Q14/Q15 re-measured 2026-06-11,
+other columns carried from 2026-06-10 / 2026-05-29-31); PySpark is
+`local[*]` on the JVM; Postgres 14 is `EXPLAIN ANALYZE` Execution Time.
 
 | Scale | ematix-flow wins | vs DuckDB | vs Polars | vs PySpark | vs Postgres |
 |---|:--|--:|--:|--:|--:|
-| **SF=1** (~1 GB, in-cache) | **22 / 22** | 2.36× | 4.22× | 18.3× | 16.8× |
-| **SF=10** (~10 GB) | **16 / 22** | 1.21× | 3.77× | 11.3× | 20.5× |
-| **SF=100** (~100 GB) | **15 / 22** | 1.30× | 4.60× | 7.8× | 58× † |
+| **SF=1** (~1 GB, in-cache) | **22 / 22** | 2.34× | 4.22× | 18.3× | 16.8× |
+| **SF=10** (~10 GB) | **18 / 22** | 1.23× | 3.77× | 11.3× | 20.5× |
+| **SF=100** (~100 GB) | **18 / 22** | 1.58× | 4.60× | 7.8× | 58× † |
 
 Geomean of competitor ÷ ematix-flow across the 22 queries (Polars n=21
 at SF=10 / n=17 at SF=100; **†** Postgres ran 6 / 22 at SF=100 under a
 90 s cap). The queries ematix-flow doesn't win are named, not hidden:
-DuckDB takes Q05 (by 12%) at SF=10 plus three parity-class verdicts
-(Q07 by 5%, Q09 by 0.4%, Q18 by 8% — these flip with machine state), and
-Q10 / Q11 (by 5%) / Q16 / Q18 at SF=100; Polars edges Q14 / Q15 by 3-4%
-at SF=10 and takes Q12 / Q14 / Q15 at SF=100. The SF=100 losses are
-cold-cache sweep losses — on a warm cache ematix-flow wins Q10, Q16,
-Q18, Q14, and Q15 outright. ematix-flow leads the geomean at every
-scale.
+at SF=10 DuckDB takes Q05, Q07, and Q18 (each within ~12-17%); at SF=100
+DuckDB takes Q10 (the wide-string customer aggregate), Q16, and Q18, with
+Q11 a tie. Polars edges Q14 / Q15 by 3-4% at SF=10 and takes Q12 / Q14 /
+Q15 at SF=100. ematix-flow leads the geomean at every scale — 2.34× (SF=1),
+1.23× (SF=10), 1.58× (SF=100).
 Full tables, tabbed by scale, are on the docs site:
 [ematix.dev/reference/benchmarks](https://ematix.dev/reference/benchmarks).
 SF=1 in full (the README's headline scale):
