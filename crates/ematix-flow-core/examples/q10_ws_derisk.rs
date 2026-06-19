@@ -197,7 +197,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             times[i].push(time_once(c, sql).await?);
         }
     }
-    let meds: Vec<f64> = times.iter_mut().map(|v| med(v)).collect();
+    let meds: Vec<f64> = times.iter_mut().map(&med).collect();
 
     println!("\n=== Q10 SF=100 wide-string de-risk ({trials} interleaved trials, median) ===");
     let base = meds[0];
