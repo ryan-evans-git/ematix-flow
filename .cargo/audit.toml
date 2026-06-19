@@ -34,4 +34,24 @@ ignore = [
     "RUSTSEC-2026-0104",
     "RUSTSEC-2026-0098",
     "RUSTSEC-2026-0099",
+    # ----------------------------------------------------------------
+    # Two advisories in `pyo3 0.28.3`, the Python-binding crate. The fix
+    # line is pyo3 0.29.0, but `arrow-pyarrow 58.0.0` (transitive via the
+    # Arrow 58 / DataFusion 53 stack) pins `pyo3 = "^0.28"`, and pyo3-ffi
+    # links the native `python` library — only one pyo3 version can exist
+    # in the dependency tree. Reaching pyo3 0.29 therefore requires bumping
+    # the whole Arrow/DataFusion ecosystem (multi-week migration); tracked
+    # for that upgrade.
+    #
+    # Risk assessment for ematix-flow (a data-movement library, not a host
+    # for untrusted Python):
+    # - RUSTSEC-2026-0176: OOB read in `nth`/`nth_back` for PyList/PyTuple
+    #   iterators. Our bindings iterate Python collections normally; they
+    #   don't call `.nth()` with attacker-controlled indices.
+    # - RUSTSEC-2026-0177: missing `Sync` bound on `PyCFunction::new_closure`.
+    #   Our bindings don't build PyCFunction closures shared across threads.
+    # Net: not blocker-grade for our threat model. Re-audit on the
+    # Arrow/DataFusion bump that unblocks pyo3 0.29.
+    "RUSTSEC-2026-0176",
+    "RUSTSEC-2026-0177",
 ]
