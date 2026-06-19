@@ -17,6 +17,10 @@ pub mod duckdb_backend;
 // See `fast_parquet.rs` for the day-2/day-3 probe results that
 // motivated this.
 pub mod fast_parquet;
+// MI.GATE (2026-06-12): peak-RSS pressure gate for between-query
+// mi_collect — −5% at SF=100 (page-cache relief), +6.1% TAX at SF=10
+// (heap re-fault churn); collect only above the RSS threshold.
+pub mod heap_pressure;
 // HJ.3 (2026-06-04): Arrow bridge + (next) ExecutionPlan for the L13
 // RobinHood hash-join kernel. Targets Q08's part⋈lineitem probe, where
 // ematix does ~1010ms more summed work than DuckDB (60M vs 37K probes).
@@ -25,6 +29,11 @@ pub mod emat_hash_join;
 // (CollectLeft Inner, i64 key); installed only on the validated shape by
 // the pre-plan swap rule. Everything else stays on stock DataFusion.
 pub mod emat_hash_join_exec;
+// Q10-flip increment 3: LateGatherExec — re-attaches wide build columns
+// (customer strings) at the aggregate output via a shared join build +
+// `__cust_rowid`, so they never flow through the join intermediate. INERT
+// until the FlowQueryPlanner walker (step 4) installs it.
+pub mod late_gather_exec;
 // PV.2: EmatPushPipelineExec — fused push-pipeline ExecutionPlan node
 // (morsel kernel inside; hand-constructed for the Q08 shape, PV.3
 // generalises). Opt-in scaffold; not on any production plan path yet.
@@ -32,6 +41,7 @@ pub mod emat_push_pipeline_exec;
 // PV.M.8: CombineAggExec — fused single-i64-key SUM(f64) aggregate that
 // replaces Partial→hash-Repartition→Final with inline per-partition tables
 // + direct parallel combine (no shuffle). Opt-in via the swap rule.
+pub mod clustered_agg_rule;
 pub mod combine_agg_exec;
 // HJ.3: pre-plan rule that swaps stock HashJoinExec → EmatixHashJoinExec
 // on the validated shape (Inner, CollectLeft, single i64 key). Opt-in

@@ -420,6 +420,7 @@ async fn run_ematix(
                 allow_inner_join: true,
                 require_filtered_build: true,
                 max_expected_keys_per_partition: 0,
+                min_probe_proj_cols: 0,
             }
         } else {
             EnableRuntimeBloomSidebandRule::default()
@@ -469,7 +470,32 @@ async fn run_ematix(
             .to_string();
         eprintln!("=== PHYSICAL PLAN ===\n{formatted}=====================");
     }
-    let batches = ctx.sql(sql).await?.collect().await?;
+    // Σ.Q20: validate the transitive semi-pushdown (no-op on the other
+    // 21 queries; rewrites Q20). Default-on; EMAT_Q20_TRANSITIVE_SEMI=0 to skip.
+    let batches = if std::env::var("EMAT_Q20_TRANSITIVE_SEMI")
+        .ok()
+        .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+        .unwrap_or(true)
+    {
+        let optimized = ctx.sql(sql).await?.into_optimized_plan()?;
+        let optimized =
+            ematix_flow_core::agg_filter_pushdown::push_transitive_semi_into_agg(optimized)?;
+        // Σ.Q05 (#352): the transitive dim-semi is perf-OPT-IN
+        // (EMAT_TRANSITIVE_DIM_SEMI=1) in the planner/bench, but
+        // validate exercises it BY DEFAULT so every correctness run
+        // checks the splice (no-op on the other 21 queries; rewrites
+        // Q05). EMAT_TRANSITIVE_DIM_SEMI=0 to skip here too.
+        let optimized = if std::env::var("EMAT_TRANSITIVE_DIM_SEMI").as_deref() != Ok("0") {
+            ematix_flow_core::agg_filter_pushdown::push_transitive_dim_semi_into_join_chain(
+                optimized,
+            )?
+        } else {
+            optimized
+        };
+        ctx.execute_logical_plan(optimized).await?.collect().await?
+    } else {
+        ctx.sql(sql).await?.collect().await?
+    };
     let mut out: Vec<Vec<Cell>> = Vec::new();
     for batch in &batches {
         let n_rows = batch.num_rows();

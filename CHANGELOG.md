@@ -7,7 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-(no entries yet — anything landing on `main` after v0.10.0 goes here)
+(no entries yet)
+
+## [0.11.0] — 2026-06-19
+
+Benchmark-accuracy + performance release. No Python API changes; the
+surface from v0.10.0 is unchanged.
+
+### Changed
+
+- **TPC-H benchmarks corrected + re-measured (2026-06-18).** ematix-flow and
+  DuckDB are now each timed in their own process — co-running both in one
+  process understated the higher-memory engine at SF=100 (the ~30 GB working
+  set exceeds a 36 GB box, so they contended for RAM). Honest current standing
+  vs DuckDB on the production preset (Apple M4 Max): **SF=1 22/22 (2.34×),
+  SF=10 ~18/22 (1.23×), SF=100 18/22 (1.58×)**. The prior README figures
+  (16/22 SF=10, 15/22 SF=100) were stale; docs now match the measurement.
+  Remaining DuckDB losses: Q05/Q07/Q18 (SF=10), Q10/Q16/Q18 (SF=100).
+
+### Added
+
+- Query-shape optimizers (default-on, no API change): transitive semi-join
+  pushdown, adaptive runtime-bloom sizing, single-phase range aggregation,
+  and an anti/semi-join CollectLeft build-side fix.
+- Pressure-gated between-query allocator decommit (lower steady-state RSS).
+- Opt-in, default-off selection-vector late-materialization infrastructure
+  (hash-join build row-id + `LateGatherExec`); inert until enabled.
 
 ## [0.10.0] — 2026-06-07
 

@@ -73,6 +73,11 @@ pub struct BridgeFilter {
     /// (high-sel) and serial-bitmap+masked-decode (low-sel) paths.
     /// 0.5 = unknown (no stats), conservative default.
     predicted_pass_rate: f64,
+    /// L9.ADAPT Guard 2 — shared runtime probe-disarm counters, set by
+    /// the scan's `execute()` when merging a TIGHT-ADMITTED sideband's
+    /// published predicates. `None` (the default, and all non-tight
+    /// wraps): probe behavior is unchanged.
+    probe_disarm: Option<Arc<crate::bridge_filter_sideband::ProbeDisarm>>,
 }
 
 impl BridgeFilter {
@@ -83,7 +88,50 @@ impl BridgeFilter {
         Self {
             predicates,
             predicted_pass_rate: 0.5,
+            probe_disarm: None,
         }
+    }
+
+    /// L9.ADAPT Guard 2 — attach the tight-admitted wrap's shared
+    /// disarm counters. Called by the scan's `execute()` right after
+    /// merging the sideband's published predicates.
+    pub fn set_probe_disarm(&mut self, d: Arc<crate::bridge_filter_sideband::ProbeDisarm>) {
+        self.probe_disarm = Some(d);
+    }
+
+    /// L9.ADAPT Guard 2 — the attached disarm counters, if this filter
+    /// carries probes from a tight-rescued wrap. Test-only observer
+    /// (the hot path reads the field directly).
+    #[cfg(test)]
+    pub(crate) fn probe_disarm(&self) -> Option<&Arc<crate::bridge_filter_sideband::ProbeDisarm>> {
+        self.probe_disarm.as_ref()
+    }
+
+    /// L9.ADAPT Guard 1 — can `eval_on_decoded_views` evaluate every
+    /// predicate currently in this filter against the given decode
+    /// projection? Used at WRAP time by the L9 rule: a tight-admitted
+    /// wrap whose probe scan carries a non-fused-evaluable static
+    /// (string shape, or a column outside the projection) would push
+    /// the whole bundle off the masked-decode path onto the legacy
+    /// per-predicate re-decode path — Q19's l_shipmode/l_shipinstruct
+    /// statics cost +102% that way. Keep the arm list in lockstep with
+    /// `eval_on_decoded_views`' bind loop.
+    pub fn statics_fused_evaluable(&self, projection: &[usize]) -> bool {
+        self.predicates.iter().all(|p| match p {
+            ColumnPredicate::I64Range { col_idx, .. }
+            | ColumnPredicate::I64InSet { col_idx, .. }
+            | ColumnPredicate::I64InBloom { col_idx, .. }
+            | ColumnPredicate::I32Range { col_idx, .. }
+            | ColumnPredicate::I32In { col_idx, .. }
+            | ColumnPredicate::F64Range { col_idx, .. } => projection.contains(col_idx),
+            ColumnPredicate::I32ColumnPair {
+                left_col,
+                right_col,
+                ..
+            } => projection.contains(left_col) && projection.contains(right_col),
+            // String shapes (and any future repr) force the legacy path.
+            _ => false,
+        })
     }
 
     /// Σ.E5 Phase 1.8: combined pass-rate estimate across all
@@ -303,6 +351,288 @@ impl BridgeFilter {
             }
         }
         Some((first_col, bitmap))
+    }
+
+    /// L9.PROBEORDER — does this filter carry a runtime membership
+    /// probe (set/bloom) from the L9 sideband? These are the expensive
+    /// per-row predicates (hash + lookup vs 2 comparisons); the fused
+    /// multi-predicate path orders them LAST so they only run on rows
+    /// that survived the cheap static predicates.
+    pub fn has_runtime_probe(&self) -> bool {
+        self.predicates.iter().any(|p| {
+            matches!(
+                p,
+                ColumnPredicate::I64InSet { .. } | ColumnPredicate::I64InBloom { .. }
+            )
+        })
+    }
+
+    /// L9.PROBEORDER (2026-06-10) — evaluate ALL predicates against
+    /// already-decoded column buffers, in cost order: static
+    /// comparisons (ranges / IN / column-pair) build the bitmap first,
+    /// then set/bloom membership probes run MASKED — only on rows
+    /// still set. On Q20 SF=100 the unordered path probed the 217K-key
+    /// partkey set on all 600M rows (+2.4s CPU) even though the
+    /// bundled shipdate range leaves only 15% alive; masked ordering
+    /// probes 91M instead.
+    ///
+    /// `resolve` maps a FILE-schema column index to the decoded buffer
+    /// view (the caller holds the dense-decoded row group). Returns
+    /// `None` — caller falls back to the legacy double-decode path —
+    /// when any predicate targets an unresolvable column (not in the
+    /// projection / unsupported decoded repr) or is a string shape
+    /// (dict-preserved string eval stays in `build_bitmap`), or when
+    /// resolved column lengths disagree.
+    /// L9.ADAPT Guard 2 — when this filter carries a `probe_disarm`
+    /// handle (tight-admitted wrap), each call records the marginal
+    /// probe outcome (statics-survivors in vs post-probe survivors
+    /// out); once `disarmed(threshold)`, the probes are SKIPPED:
+    /// statics still evaluate (cheap, still route stash-vs-dense), and
+    /// a probe-only filter returns an all-ones bitmap whose pass-rate
+    /// routes the row group to dense emission — exactly the no-filter
+    /// behavior. Correct by construction: every runtime probe is
+    /// inexact-by-design and re-applied by the join.
+    pub(crate) fn eval_on_decoded_views<'a>(
+        &self,
+        resolve: impl Fn(usize) -> Option<DecodedView<'a>>,
+    ) -> Option<(Vec<u8>, usize)> {
+        if self.predicates.is_empty() {
+            return None;
+        }
+        let skip_probes = self
+            .probe_disarm
+            .as_ref()
+            .map(|d| d.disarmed(crate::emat_arrow_reader::masked_dense_passrate_threshold()))
+            .unwrap_or(false);
+        // Resolve + validate every predicate's column(s) up front so a
+        // late unsupported predicate can't leave a half-built bitmap.
+        enum Bound<'p, 'a> {
+            I64(&'p ColumnPredicate, &'a [i64]),
+            I32(&'p ColumnPredicate, &'a [i32]),
+            F64(&'p ColumnPredicate, &'a [f64]),
+            I32Pair {
+                left: &'a [i32],
+                right: &'a [i32],
+                op: Operator,
+            },
+        }
+        let mut statics: Vec<Bound<'_, 'a>> = Vec::new();
+        let mut probes: Vec<Bound<'_, 'a>> = Vec::new();
+        let mut total: Option<usize> = None;
+        let check_len = |len: usize, total: &mut Option<usize>| -> bool {
+            match total {
+                None => {
+                    *total = Some(len);
+                    true
+                }
+                Some(t) => *t == len,
+            }
+        };
+        for p in &self.predicates {
+            match p {
+                ColumnPredicate::I64Range { col_idx, .. } => {
+                    let DecodedView::I64(v) = resolve(*col_idx)? else {
+                        return None;
+                    };
+                    if !check_len(v.len(), &mut total) {
+                        return None;
+                    }
+                    statics.push(Bound::I64(p, v));
+                }
+                ColumnPredicate::I64InSet { col_idx, .. }
+                | ColumnPredicate::I64InBloom { col_idx, .. } => {
+                    let DecodedView::I64(v) = resolve(*col_idx)? else {
+                        return None;
+                    };
+                    if !check_len(v.len(), &mut total) {
+                        return None;
+                    }
+                    // Guard 2 — disarmed probes still resolve (so
+                    // `total` is known for a probe-only filter) but
+                    // never evaluate.
+                    if !skip_probes {
+                        probes.push(Bound::I64(p, v));
+                    }
+                }
+                ColumnPredicate::I32Range { col_idx, .. }
+                | ColumnPredicate::I32In { col_idx, .. } => {
+                    let DecodedView::I32(v) = resolve(*col_idx)? else {
+                        return None;
+                    };
+                    if !check_len(v.len(), &mut total) {
+                        return None;
+                    }
+                    statics.push(Bound::I32(p, v));
+                }
+                ColumnPredicate::F64Range { col_idx, .. } => {
+                    let DecodedView::F64(v) = resolve(*col_idx)? else {
+                        return None;
+                    };
+                    if !check_len(v.len(), &mut total) {
+                        return None;
+                    }
+                    statics.push(Bound::F64(p, v));
+                }
+                ColumnPredicate::I32ColumnPair {
+                    left_col,
+                    right_col,
+                    op,
+                } => {
+                    let DecodedView::I32(left) = resolve(*left_col)? else {
+                        return None;
+                    };
+                    let DecodedView::I32(right) = resolve(*right_col)? else {
+                        return None;
+                    };
+                    if !check_len(left.len(), &mut total) || left.len() != right.len() {
+                        return None;
+                    }
+                    statics.push(Bound::I32Pair {
+                        left,
+                        right,
+                        op: *op,
+                    });
+                }
+                // String shapes need the dict-preserved decode path.
+                _ => return None,
+            }
+        }
+        let total = total?;
+        // Guard 2 — every predicate was a disarmed probe: emit an
+        // all-ones bitmap (tail bits zeroed) so popcount routing sees
+        // pass-rate 1.0 and the caller discards it and emits dense —
+        // exactly the no-filter behavior.
+        if statics.is_empty() && probes.is_empty() {
+            let mut bitmap = vec![0xFFu8; total.div_ceil(8)];
+            if total % 8 != 0 {
+                if let Some(last) = bitmap.last_mut() {
+                    *last = 0xFFu8 >> (8 - total % 8);
+                }
+            }
+            return Some((bitmap, total));
+        }
+        let mut bitmap = vec![0u8; total.div_ceil(8)];
+
+        let eval_row = |b: &Bound<'_, 'a>, row: usize| -> bool {
+            match b {
+                Bound::I64(p, v) => match p {
+                    ColumnPredicate::I64Range { lo, hi, .. } => v[row] >= *lo && v[row] <= *hi,
+                    ColumnPredicate::I64InSet { set, .. } => set.contains(v[row]),
+                    ColumnPredicate::I64InBloom { bloom, .. } => bloom.might_contain_i64(v[row]),
+                    _ => unreachable!("Bound::I64 holds only i64 predicate shapes"),
+                },
+                Bound::I32(p, v) => p.eval_i32(v[row]),
+                Bound::F64(p, v) => p.eval_f64(v[row]),
+                Bound::I32Pair { left, right, op } => {
+                    let (l, r) = (left[row], right[row]);
+                    match op {
+                        Operator::Lt => l < r,
+                        Operator::LtEq => l <= r,
+                        Operator::Gt => l > r,
+                        Operator::GtEq => l >= r,
+                        Operator::Eq => l == r,
+                        Operator::NotEq => l != r,
+                        _ => false,
+                    }
+                }
+            }
+        };
+
+        let mut first = true;
+        let apply = |b: &Bound<'_, 'a>, bitmap: &mut Vec<u8>, first: &mut bool| {
+            if *first {
+                // Full pass, chunk-of-8 byte packing (avoids the
+                // read-modify-write bitmap serialisation).
+                match b {
+                    Bound::I64(p, v) => match p {
+                        ColumnPredicate::I64Range { lo, hi, .. } => {
+                            let (lo, hi) = (*lo, *hi);
+                            probe_chunks_into_bitmap(v, bitmap, |x| x >= lo && x <= hi);
+                        }
+                        ColumnPredicate::I64InSet { set, .. } => {
+                            probe_chunks_into_bitmap(v, bitmap, |x| set.contains(x));
+                        }
+                        ColumnPredicate::I64InBloom { bloom, .. } => {
+                            probe_chunks_into_bitmap(v, bitmap, |x| bloom.might_contain_i64(x));
+                        }
+                        _ => unreachable!("Bound::I64 holds only i64 predicate shapes"),
+                    },
+                    _ => {
+                        for row in 0..total {
+                            if eval_row(b, row) {
+                                bitmap[row >> 3] |= 1 << (row & 7);
+                            }
+                        }
+                    }
+                }
+                *first = false;
+            } else {
+                and_eval_masked(bitmap, total, |row| eval_row(b, row));
+            }
+        };
+        for b in statics.iter() {
+            apply(b, &mut bitmap, &mut first);
+            // Early exit: nothing survives, later predicates are moot.
+            if bitmap.iter().all(|&x| x == 0) {
+                break;
+            }
+        }
+        // Guard 2 — capture the statics-survivor count so the probes'
+        // MARGINAL pass-rate can be recorded (only when this filter
+        // carries a disarm handle; one extra popcount per row group,
+        // ~µs against a multi-ms decode).
+        let probe_seen = if self.probe_disarm.is_some() && !probes.is_empty() {
+            Some(if first {
+                total // no statics ran; probes see every row
+            } else {
+                bitmap.iter().map(|b| b.count_ones() as usize).sum()
+            })
+        } else {
+            None
+        };
+        for b in probes.iter() {
+            apply(b, &mut bitmap, &mut first);
+            if bitmap.iter().all(|&x| x == 0) {
+                break;
+            }
+        }
+        if let (Some(d), Some(seen)) = (self.probe_disarm.as_ref(), probe_seen) {
+            let passed: usize = bitmap.iter().map(|b| b.count_ones() as usize).sum();
+            d.record(seen, passed);
+        }
+        Some((bitmap, total))
+    }
+}
+
+/// L9.PROBEORDER — view over an already-decoded column buffer, used by
+/// [`BridgeFilter::eval_on_decoded_views`]. The reader maps its
+/// `DecodedColumn` reprs into these slices (zero-copy `typed_data`).
+pub(crate) enum DecodedView<'a> {
+    I64(&'a [i64]),
+    I32(&'a [i32]),
+    F64(&'a [f64]),
+}
+
+/// L9.PROBEORDER — AND a predicate into `bitmap`, evaluating ONLY rows
+/// whose bit is currently set (whole zero bytes are skipped, so cost
+/// scales with surviving rows, not total rows). `eval` takes the row
+/// index so mixed column types and column-pair predicates share one
+/// helper.
+fn and_eval_masked(bitmap: &mut [u8], n_rows: usize, eval: impl Fn(usize) -> bool) {
+    for (byte_idx, b) in bitmap.iter_mut().enumerate() {
+        let mut cur = *b;
+        if cur == 0 {
+            continue;
+        }
+        let base = byte_idx << 3;
+        while cur != 0 {
+            let bit = cur.trailing_zeros() as usize;
+            let row = base + bit;
+            if row >= n_rows || !eval(row) {
+                *b &= !(1u8 << bit);
+            }
+            cur &= cur - 1;
+        }
     }
 }
 
@@ -1432,6 +1762,7 @@ fn extract_bridge_filter(
     Some(BridgeFilter {
         predicates: merged,
         predicted_pass_rate: 0.5,
+        probe_disarm: None,
     })
 }
 
@@ -2392,6 +2723,14 @@ impl EmatixFastParquetExec {
 
     /// Σ.Q.L9 — the attached runtime sideband, if any. Used by the
     /// planner rule to verify it threaded the sideband correctly.
+    /// L9.ADAPT Guard 1 — the plan-time pushed-down filter (user
+    /// statics), if any. The L9 rule inspects it before tight-admitting
+    /// a wrap: a bundle the fused arm can't evaluate would drag the
+    /// whole scan onto the legacy re-decode path.
+    pub fn pushed_filter(&self) -> Option<&BridgeFilter> {
+        self.filter.as_ref()
+    }
+
     pub fn runtime_sideband(&self) -> Option<&crate::bridge_filter_sideband::BridgeFilterSideband> {
         self.runtime_sideband.as_ref()
     }
@@ -2554,6 +2893,24 @@ impl EmatixFastParquetExec {
             metrics: ExecutionPlanMetricsSet::new(),
         }
     }
+
+    /// RANGE.AGG — rebuild this scan with an explicit row-group →
+    /// partition assignment (used to re-chunk at key-disjoint
+    /// boundaries so a cluster-key group-by can aggregate each
+    /// partition independently). Partition count changes, so the plan
+    /// properties are rebuilt.
+    pub fn with_assignments(&self, assignments: Vec<Vec<usize>>) -> Arc<Self> {
+        let mut next = self.clone_internals();
+        let eq_props = EquivalenceProperties::new(next.schema.clone());
+        next.properties = Arc::new(PlanProperties::new(
+            eq_props,
+            Partitioning::UnknownPartitioning(assignments.len().max(1)),
+            EmissionType::Incremental,
+            Boundedness::Bounded,
+        ));
+        next.assignments = assignments;
+        Arc::new(next)
+    }
 }
 
 impl DisplayAs for EmatixFastParquetExec {
@@ -2667,6 +3024,7 @@ impl ExecutionPlan for EmatixFastParquetExec {
                 streaming_arrow_reader,
                 outer_partitions,
                 self.rg_num_rows.clone(),
+                None,
             );
             let stream = narrow_stream_to_advertised(stream, &decode_schema, schema.clone());
             return Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream))
@@ -2709,22 +3067,41 @@ impl ExecutionPlan for EmatixFastParquetExec {
             // sideband possibly populated by an upstream build phase
             // that has since completed.
             let mut filter = base_filter;
+            let mut late_arm: Option<crate::bridge_filter_sideband::BridgeFilterSideband> = None;
             if let Some(sb) = &runtime_sideband {
-                // Σ.Q.L16: brief wait for the build-side bloom to be
-                // published. Without this, the probe partitions race
-                // past the build on small-build joins (Q17 SF=10 had
-                // filtered_part = 2K rows building in ~6 ms, but 12 of
-                // 14 lineitem partitions peeked None and ran full
-                // 60 M rows). Default timeout 200 ms — small enough
-                // that big-build joins time out cleanly and proceed
-                // un-bloomed, large enough to absorb fast builds.
-                let timeout_ms: u64 = std::env::var("EMAT_L9_PEEK_TIMEOUT_MS")
-                    .ok()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(200);
-                let _ = sb
-                    .wait_for_publish(std::time::Duration::from_millis(timeout_ms))
-                    .await;
+                if sb.tight_admitted() {
+                    // L9.ADAPT LATE-ARM — tight-rescued wraps (payoff
+                    // unproven by the default estimator) never stall
+                    // the probe. The earlier probe-row-scaled wait
+                    // budget granted Q17's 60M probe a 60ms stall;
+                    // dedicated runs publish the warm ~2K-part build
+                    // in ~6ms and win (113 vs 129ms), but IN-SWEEP the
+                    // cold build blows through the budget — the probe
+                    // pays the full stall and STILL gets no early
+                    // bloom (+31%). Instead: peek once without
+                    // waiting; if unpublished, hand the sideband to
+                    // the reader, which adopts the predicate at the
+                    // next row-group boundary once the build lands.
+                    if !sb.is_ready() {
+                        late_arm = Some(sb.clone());
+                    }
+                } else {
+                    // Σ.Q.L16: brief wait for the build-side bloom to be
+                    // published. Without this, the probe partitions race
+                    // past the build on small-build joins (Q17 SF=10 had
+                    // filtered_part = 2K rows building in ~6 ms, but 12 of
+                    // 14 lineitem partitions peeked None and ran full
+                    // 60 M rows). Default timeout 200 ms — small enough
+                    // that big-build joins time out cleanly and proceed
+                    // un-bloomed, large enough to absorb fast builds.
+                    let timeout_ms: u64 = std::env::var("EMAT_L9_PEEK_TIMEOUT_MS")
+                        .ok()
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(200);
+                    let _ = sb
+                        .wait_for_publish(std::time::Duration::from_millis(timeout_ms))
+                        .await;
+                }
                 let peeked = sb.peek();
                 if trace_l9 {
                     let path_short = std::path::Path::new(&path_for_async)
@@ -2761,6 +3138,13 @@ impl ExecutionPlan for EmatixFastParquetExec {
                     if !extras.is_empty() {
                         let mut bf = filter.unwrap_or_else(|| BridgeFilter::new(Vec::new()));
                         bf.extend(extras);
+                        // L9.ADAPT Guard 2 — tight-admitted wraps carry
+                        // the shared disarm counters so the reader can
+                        // stop probing once the published set provably
+                        // doesn't prune (payoff unproven at plan time).
+                        if sb.tight_admitted() {
+                            bf.set_probe_disarm(sb.probe_disarm_handle());
+                        }
                         let p = bf.estimate_pass_rate(&column_stats_for_async);
                         filter = Some(bf.with_predicted_pass_rate(p));
                     }
@@ -2777,6 +3161,7 @@ impl ExecutionPlan for EmatixFastParquetExec {
                 streaming_arrow_reader,
                 outer_partitions,
                 rg_num_rows_for_async,
+                late_arm,
             )
         };
 
@@ -2959,6 +3344,13 @@ fn build_partition_stream_dispatch(
     streaming_arrow_reader: bool,
     outer_partitions: usize,
     rg_num_rows: Arc<Vec<usize>>,
+    // L9.ADAPT LATE-ARM — a tight-rescued wrap whose build hadn't
+    // published at execute() time. Consumed by the eager streaming
+    // reader (the only path big tight probes take: the ≥8M-row
+    // rescue pre-gate means multi-RG fact partitions, which the
+    // auto-pick routes to `EmatArrowBatchReader`); the reader adopts
+    // the published predicate at the next row-group boundary.
+    late_arm: Option<crate::bridge_filter_sideband::BridgeFilterSideband>,
 ) -> futures_util::stream::BoxStream<'static, DfResult<RecordBatch>> {
     if streaming_arrow_reader {
         // Σ.E5.1.c — per-partition column-decode thread budget; keep
@@ -2986,8 +3378,11 @@ fn build_partition_stream_dispatch(
             rg_num_rows.len(),
             filter,
             baseline,
+            late_arm,
         )
     } else {
+        // Late-arm has no consumer on this path; the sideband predicate
+        // simply never applies (the join re-filters — correct, no relief).
         build_partition_stream(
             path, schema, projection, row_groups, filter, late_mat, baseline,
         )
@@ -3175,6 +3570,8 @@ fn build_streaming_partition_stream(
     // EmatArrowBatchReaderBuilder::with_filter when present.
     filter: Option<BridgeFilter>,
     baseline: BaselineMetrics,
+    // L9.ADAPT LATE-ARM — see `build_partition_stream_dispatch`.
+    late_arm: Option<crate::bridge_filter_sideband::BridgeFilterSideband>,
 ) -> futures_util::stream::BoxStream<'static, DfResult<RecordBatch>> {
     use futures_util::StreamExt;
 
@@ -3277,7 +3674,11 @@ fn build_streaming_partition_stream(
         // streaming reader (`EmatArrowBatchReader`) supports it today.
         // Inline + page-streaming readers don't have a masked-decode
         // branch yet — force them off.
-        let has_filter = filter.is_some();
+        // L9.ADAPT LATE-ARM — a pending sideband counts as a filter for
+        // reader routing: only the eager reader supports masked decode
+        // and the row-group-boundary arm. (When the wait-based design
+        // armed BEFORE dispatch, an armed scan took this same path.)
+        let has_filter = filter.is_some() || late_arm.is_some();
         // Σ.E5 (2026-05-19): auto-inline for large multi-RG partitions.
         //
         // The eager reader decodes a whole RG before emitting any batch.
@@ -3378,9 +3779,14 @@ fn build_streaming_partition_stream(
                 .with_projection(projection)
                 .with_row_groups(row_groups)
                 .with_parallelism_budget(parallelism_budget);
+            if let Some(sb) = late_arm.clone() {
+                builder = builder.with_late_arm(sb, path_buf.clone());
+            }
             if let Some(f) = filter.clone() {
                 builder = builder.with_filter(f, path_buf.clone());
-            } else if let Some(cache) = crate::emat_arrow_reader::process_rg_decode_cache() {
+            } else if late_arm.is_none()
+                && let Some(cache) = crate::emat_arrow_reader::process_rg_decode_cache()
+            {
                 // Σ.O.c.2 — wire process-wide RG decode cache (off by
                 // default; opt-in via `EMAT_RG_DECODE_CACHE=1`). Only
                 // attached when no filter is set; filter outputs are
@@ -3748,6 +4154,269 @@ fn decode_one_rg(
 mod tests {
     use super::*;
     use datafusion::prelude::SessionContext;
+
+    /// L9.PROBEORDER — `and_eval_masked` must evaluate ONLY rows whose
+    /// bit is set (the masked-probe contract: probe cost scales with
+    /// survivors, not total rows). A counting closure proves the skip:
+    /// 4 of 16 rows set → exactly 4 evals, on exactly those rows.
+    #[test]
+    fn probeorder_and_eval_masked_skips_cleared_rows() {
+        use std::cell::RefCell;
+        // rows 1, 3, 8, 15 set
+        let mut bitmap = vec![0b0000_1010u8, 0b1000_0001u8];
+        let evaluated: RefCell<Vec<usize>> = RefCell::new(Vec::new());
+        and_eval_masked(&mut bitmap, 16, |row| {
+            evaluated.borrow_mut().push(row);
+            row != 3 // miss on row 3 → cleared
+        });
+        assert_eq!(
+            *evaluated.borrow(),
+            vec![1, 3, 8, 15],
+            "must evaluate exactly the set rows, in order"
+        );
+        assert_eq!(bitmap, vec![0b0000_0010u8, 0b1000_0001u8]);
+
+        // Tail guard: bit set past n_rows must be cleared without eval.
+        let mut tail = vec![0b1100_0000u8];
+        let count: RefCell<usize> = RefCell::new(0);
+        and_eval_masked(&mut tail, 7, |_| {
+            *count.borrow_mut() += 1;
+            true
+        });
+        assert_eq!(*count.borrow(), 1, "row 7 is past n_rows=7 → no eval");
+        assert_eq!(tail, vec![0b0100_0000u8]);
+    }
+
+    /// L9.PROBEORDER — multi-type AND on decoded buffers: an i32 range
+    /// (the Q20 shipdate analog) plus an i64 exact-set probe (the
+    /// forest-partkey analog) must produce the same bitmap as a manual
+    /// row-by-row AND, with the probe ordered after the static.
+    #[test]
+    fn probeorder_eval_on_decoded_multi_type_and() {
+        use crate::i64_set::I64Set;
+        let dates: Vec<i32> = (0..32).map(|i| 7000 + (i % 4)).collect(); // 25% in [7000,7000]
+        let keys: Vec<i64> = (0..32).map(|i| i as i64).collect();
+        let mut set = I64Set::with_keys(16);
+        for k in [0i64, 4, 8, 12, 16, 20, 24, 28, 3, 7] {
+            set.insert(k);
+        }
+        let set = std::sync::Arc::new(set);
+        let filter = BridgeFilter::new(vec![
+            // Probe FIRST in predicate order — eval must still run it last.
+            ColumnPredicate::I64InSet {
+                col_idx: 1,
+                set: set.clone(),
+            },
+            ColumnPredicate::I32Range {
+                col_idx: 10,
+                clauses: vec![
+                    RangeClause {
+                        op: Operator::GtEq,
+                        literal_i32: 7000,
+                    },
+                    RangeClause {
+                        op: Operator::LtEq,
+                        literal_i32: 7000,
+                    },
+                ],
+            },
+        ]);
+        let (bitmap, total) = filter
+            .eval_on_decoded_views(|col| match col {
+                1 => Some(DecodedView::I64(&keys)),
+                10 => Some(DecodedView::I32(&dates)),
+                _ => None,
+            })
+            .expect("all columns resolvable → must evaluate");
+        assert_eq!(total, 32);
+        for row in 0..32usize {
+            let expect = dates[row] == 7000 && set.contains(keys[row]);
+            let got = bitmap[row >> 3] & (1 << (row & 7)) != 0;
+            assert_eq!(got, expect, "row {row}");
+        }
+    }
+
+    /// L9.PROBEORDER — fallback contract: a string predicate or an
+    /// unresolvable column must return None (caller falls back to the
+    /// legacy build_bitmap path); resolved-length mismatch likewise.
+    #[test]
+    fn probeorder_eval_on_decoded_falls_back_to_none() {
+        use crate::i64_set::I64Set;
+        let keys: Vec<i64> = (0..8).collect();
+        let set = std::sync::Arc::new(I64Set::with_keys(4));
+        let probe = ColumnPredicate::I64InSet {
+            col_idx: 1,
+            set: set.clone(),
+        };
+
+        // String predicate present → None.
+        let f = BridgeFilter::new(vec![
+            probe.clone(),
+            ColumnPredicate::StringEq {
+                col_idx: 2,
+                value: "x".into(),
+            },
+        ]);
+        assert!(
+            f.eval_on_decoded_views(|_| Some(DecodedView::I64(&keys)))
+                .is_none()
+        );
+
+        // Unresolvable column → None.
+        let f = BridgeFilter::new(vec![probe.clone()]);
+        assert!(f.eval_on_decoded_views(|_| None).is_none());
+
+        // Length mismatch across predicate columns → None.
+        let short: Vec<i32> = vec![7000; 4];
+        let f = BridgeFilter::new(vec![
+            probe,
+            ColumnPredicate::I32Range {
+                col_idx: 10,
+                clauses: vec![RangeClause {
+                    op: Operator::Eq,
+                    literal_i32: 7000,
+                }],
+            },
+        ]);
+        assert!(
+            f.eval_on_decoded_views(|col| match col {
+                1 => Some(DecodedView::I64(&keys)),
+                10 => Some(DecodedView::I32(&short)),
+                _ => None,
+            })
+            .is_none()
+        );
+    }
+
+    /// L9.ADAPT Guard 1 — `statics_fused_evaluable` must mirror
+    /// `eval_on_decoded_views`' bind loop: numeric shapes on projected
+    /// columns pass; string shapes or unprojected columns fail (they
+    /// would force the legacy per-predicate re-decode — the Q19 +102%
+    /// mechanism). Empty filter is vacuously evaluable.
+    #[test]
+    fn adapt_statics_fused_evaluable_truth_table() {
+        let proj = [1usize, 5, 10];
+        // Numeric statics on projected columns → true.
+        let f = BridgeFilter::new(vec![
+            ColumnPredicate::I32Range {
+                col_idx: 10,
+                clauses: vec![RangeClause {
+                    op: Operator::GtEq,
+                    literal_i32: 7000,
+                }],
+            },
+            ColumnPredicate::F64Range {
+                col_idx: 5,
+                clauses: vec![],
+            },
+        ]);
+        assert!(f.statics_fused_evaluable(&proj));
+
+        // String static (Q19's l_shipmode IN shape) → false.
+        let f = BridgeFilter::new(vec![ColumnPredicate::StringIn {
+            col_idx: 10,
+            values: vec!["AIR".into(), "AIR REG".into()],
+        }]);
+        assert!(!f.statics_fused_evaluable(&proj));
+
+        // Numeric static on an UNPROJECTED column → false (the fused
+        // resolve can't map it to a decoded buffer).
+        let f = BridgeFilter::new(vec![ColumnPredicate::I32Range {
+            col_idx: 99,
+            clauses: vec![],
+        }]);
+        assert!(!f.statics_fused_evaluable(&proj));
+
+        // Column-pair: both projected → true; one out → false.
+        let pair_ok = BridgeFilter::new(vec![ColumnPredicate::I32ColumnPair {
+            left_col: 1,
+            right_col: 10,
+            op: Operator::Lt,
+        }]);
+        assert!(pair_ok.statics_fused_evaluable(&proj));
+        let pair_bad = BridgeFilter::new(vec![ColumnPredicate::I32ColumnPair {
+            left_col: 1,
+            right_col: 99,
+            op: Operator::Lt,
+        }]);
+        assert!(!pair_bad.statics_fused_evaluable(&proj));
+
+        // Empty filter → vacuously true.
+        assert!(BridgeFilter::new(vec![]).statics_fused_evaluable(&proj));
+    }
+
+    /// L9.ADAPT Guard 2 — eval with a disarm handle: (1) records the
+    /// probes' MARGINAL outcome (statics-survivors in, post-probe
+    /// survivors out); (2) once disarmed, skips the probe — statics
+    /// keep filtering, and a probe-only filter degrades to an all-ones
+    /// bitmap (pass-rate 1.0 → caller discards it and emits dense).
+    #[test]
+    fn adapt_probe_disarm_records_and_skips() {
+        use crate::bridge_filter_sideband::ProbeDisarm;
+        use crate::i64_set::I64Set;
+
+        let keys: Vec<i64> = (0..16).collect();
+        let dates: Vec<i32> = (0..16).map(|i| if i < 8 { 7000 } else { 0 }).collect();
+        let mut set = I64Set::with_keys(4);
+        for k in [0i64, 1, 2, 3] {
+            set.insert(k);
+        }
+        let set = Arc::new(set);
+        let mk_filter = || {
+            BridgeFilter::new(vec![
+                ColumnPredicate::I32Range {
+                    col_idx: 10,
+                    clauses: vec![RangeClause {
+                        op: Operator::Eq,
+                        literal_i32: 7000,
+                    }],
+                },
+                ColumnPredicate::I64InSet {
+                    col_idx: 1,
+                    set: set.clone(),
+                },
+            ])
+        };
+        let resolve = |col: usize| match col {
+            1 => Some(DecodedView::I64(&keys)),
+            10 => Some(DecodedView::I32(&dates)),
+            _ => None,
+        };
+
+        // Armed: probe applies (4 of 8 statics-survivors pass) and the
+        // marginal outcome is recorded.
+        let disarm = Arc::new(ProbeDisarm::default());
+        let mut f = mk_filter();
+        f.set_probe_disarm(disarm.clone());
+        let (bitmap, total) = f.eval_on_decoded_views(resolve).unwrap();
+        assert_eq!(total, 16);
+        let pop: usize = bitmap.iter().map(|b| b.count_ones() as usize).sum();
+        assert_eq!(pop, 4, "rows 0-3 pass both static and set");
+        // seen = 8 statics survivors, passed = 4.
+        assert!(!disarm.disarmed(0.10), "below MIN_ROWS floor");
+
+        // Force-disarm, then eval again: the probe must NOT apply —
+        // all 8 statics survivors stay set.
+        disarm.record(ProbeDisarm::MIN_ROWS, ProbeDisarm::MIN_ROWS);
+        assert!(disarm.disarmed(0.10));
+        let (bitmap, _) = f.eval_on_decoded_views(resolve).unwrap();
+        let pop: usize = bitmap.iter().map(|b| b.count_ones() as usize).sum();
+        assert_eq!(pop, 8, "disarmed probe skipped; statics still filter");
+
+        // Probe-only filter + disarmed → all-ones bitmap (tail masked).
+        let mut probe_only = BridgeFilter::new(vec![ColumnPredicate::I64InSet {
+            col_idx: 1,
+            set: set.clone(),
+        }]);
+        probe_only.set_probe_disarm(disarm.clone());
+        let short_keys: Vec<i64> = (0..11).collect();
+        let (bitmap, total) = probe_only
+            .eval_on_decoded_views(|_| Some(DecodedView::I64(&short_keys)))
+            .unwrap();
+        assert_eq!(total, 11);
+        let pop: usize = bitmap.iter().map(|b| b.count_ones() as usize).sum();
+        assert_eq!(pop, 11, "all-ones with tail bits zeroed");
+    }
 
     /// KEYS.5 story (a) — the string runtime sideband predicates
     /// (`StringInBloom` / `StringInSet`) must (1) probe correctly via

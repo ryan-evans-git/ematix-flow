@@ -57,11 +57,13 @@
 //!   lives in [`skew`].
 
 pub mod build_side;
+pub mod radix;
 pub mod skew;
 pub mod table;
 pub mod tagged;
 
 pub use build_side::{BuildSide, BuildSideReason, SideStats, StatsSource, choose};
+pub use radix::RadixTaggedJoin;
 pub use skew::{OverflowTable, SkewAnalysis, observe as observe_skew};
 pub use table::{ProbeMatch, RobinHoodHashJoinI64Table};
 pub use tagged::TaggedJoinI64U32;

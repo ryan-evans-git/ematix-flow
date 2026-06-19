@@ -105,6 +105,19 @@ pub struct EnableRuntimeBloomSidebandRule {
     /// the Q08-tight-cardinality 13k fire (mitigated by fused-probe).
     /// 0 disables the gate. Override via `EMAT_L9_MAX_EXPECTED_KEYS=N`.
     pub max_expected_keys_per_partition: usize,
+    /// L9.WIDTH (2026-06-10) — probe-payoff guard for the OPT-IN
+    /// tight-cardinality mode: wrap only when the probe-side scan projects
+    /// at least this many columns. **Default 0 = disabled.** Bisecting a
+    /// Q07 +125% / Q21 +45% regression showed the pre-existing default
+    /// fires (Q07's two nation-IN blooms on 2-col supplier/customer
+    /// probes, Σ.Y) are large WINNERS — projected width does NOT separate
+    /// winning from losing wraps in general. The gate exists to pair with
+    /// `EMAT_L9_TIGHT_CARDINALITY=1`, whose NDV-tightened estimates admit
+    /// Inner-join wraps of unpredictable payoff (Q08 −30ms WIN at 5 cols;
+    /// Q17 +25ms LOSS at 2-3 cols; Q02 +11ms LOSS at 5 cols — width
+    /// blocks Q17's losers only). Override via
+    /// `EMAT_L9_MIN_PROBE_PROJ_COLS=N`.
+    pub min_probe_proj_cols: usize,
 }
 
 impl Default for EnableRuntimeBloomSidebandRule {
@@ -143,11 +156,17 @@ impl Default for EnableRuntimeBloomSidebandRule {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
+        // L9.WIDTH — see the field docs; env override for tuning.
+        let min_probe_proj_cols = std::env::var("EMAT_L9_MIN_PROBE_PROJ_COLS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
         Self {
             min_probe_to_build_ratio: ratio,
             allow_inner_join,
             require_filtered_build,
             max_expected_keys_per_partition,
+            min_probe_proj_cols,
         }
     }
 }
@@ -362,7 +381,11 @@ impl PhysicalOptimizerRule for EnableRuntimeBloomSidebandRule {
             // detected — generous enough for any selective subquery,
             // tight enough to pass the 64× ratio gate against a 60M
             // probe (10K × 64 = 640K < 60M).
-            let build_rows = if build_has_semi {
+            // Default (stats-only) estimate; Σ.AM.1 semi-cap as before.
+            // L9.ADAPT (lazy rescue): the default path NEVER consults the
+            // NDV stats — default-admitted wraps keep today's estimates,
+            // sizing, and behavior byte-for-byte.
+            let default_build_rows = if build_has_semi {
                 Some(
                     estimate_build_rows(build.as_ref())
                         .unwrap_or(10_000)
@@ -374,27 +397,131 @@ impl PhysicalOptimizerRule for EnableRuntimeBloomSidebandRule {
             let probe_rows = estimate_probe_scan_rows(&scan_arc);
             if trace {
                 eprintln!(
-                    "[L9.trace] {:?} join — build_rows={build_rows:?} probe_rows={probe_rows:?} ratio_gate={}",
+                    "[L9.trace] {:?} join — build_rows={default_build_rows:?} probe_rows={probe_rows:?} ratio_gate={}",
                     hj.join_type(),
                     self.min_probe_to_build_ratio
                 );
             }
-            if self.min_probe_to_build_ratio > 0 {
-                if let (Some(b), Some(p)) = (build_rows, probe_rows) {
-                    if b.saturating_mul(self.min_probe_to_build_ratio) >= p {
-                        if trace {
-                            eprintln!(
-                                "[L9.trace] skip — gate rejects: b({b}) × ratio({}) >= p({p})",
-                                self.min_probe_to_build_ratio
-                            );
-                        }
-                        return Ok(Transformed::no(node));
+            let ratio_rejects = |b: Option<usize>| -> bool {
+                self.min_probe_to_build_ratio > 0
+                    && matches!((b, probe_rows), (Some(b), Some(p))
+                        if b.saturating_mul(self.min_probe_to_build_ratio) >= p)
+            };
+            let mut build_rows = default_build_rows;
+            let mut tight_only = false;
+            if ratio_rejects(default_build_rows) {
+                // L9.ADAPT lazy tight rescue — the default estimator said
+                // no. Opt-in NDV mode may rescue the wrap, but ONLY behind
+                // cheap pre-gates so the stats walk runs on a handful of
+                // candidate joins, not every join of every query (the
+                // eager dual-estimate design taxed all 22 queries and
+                // re-sized default-admitted wraps — both measured
+                // regressions, 2026-06-11 sweep):
+                //   1. probe ≥ 8M rows — the per-row probe + publish race
+                //      only pays on big scans (SF=1 facts are ≤6M: the
+                //      locked 22/22 scale never takes this path);
+                //   2. probe scan ≥ 3 projected cols — measured boundary:
+                //      Q08's 5-col wrap wins −18%, Q17's 2-col wraps lose;
+                //   3. Guard 1 — the scan's existing bundle must stay
+                //      fused-evaluable once the runtime probe is added
+                //      (string statics forced Q19's whole bundle onto the
+                //      legacy per-predicate re-decode path for +102%).
+                if !tight_cardinality_enabled() {
+                    if trace {
+                        let b = default_build_rows.unwrap_or(0);
+                        eprintln!(
+                            "[L9.trace] skip — gate rejects: b({b}) × ratio({}) >= p({})",
+                            self.min_probe_to_build_ratio,
+                            probe_rows.unwrap_or(0)
+                        );
                     }
+                    return Ok(Transformed::no(node));
                 }
+                if probe_rows.unwrap_or(0) < TIGHT_MIN_PROBE_ROWS {
+                    if trace {
+                        eprintln!(
+                            "[L9.trace] skip — tight rescue refused: probe {} < {TIGHT_MIN_PROBE_ROWS} rows (relief can't pay the probe+publish race on a small scan)",
+                            probe_rows.unwrap_or(0)
+                        );
+                    }
+                    return Ok(Transformed::no(node));
+                }
+                if scan_arc.projection().len() < TIGHT_MIN_PROBE_PROJ_COLS {
+                    if trace {
+                        eprintln!(
+                            "[L9.trace] skip — probe scan projects {} cols < min {TIGHT_MIN_PROBE_PROJ_COLS} (tight_only=true; narrow-payload wrap loses: scan-probe cost exceeds the cheap join it relieves)",
+                            scan_arc.projection().len(),
+                        );
+                    }
+                    return Ok(Transformed::no(node));
+                }
+                if !tight_probe_bundle_fused_evaluable(
+                    scan_arc.pushed_filter(),
+                    scan_arc.projection(),
+                    probe_scan_col_idx,
+                ) {
+                    if trace {
+                        eprintln!(
+                            "[L9.trace] skip — tight-only wrap refused: probe bundle not fused-evaluable (string/unprojected predicate or unprojected key would force legacy re-decode)"
+                        );
+                    }
+                    return Ok(Transformed::no(node));
+                }
+                // Pre-gates pass — NOW pay the NDV stats walk.
+                let tight_admit = if build_has_semi {
+                    Some(
+                        estimate_build_rows_mode(build.as_ref(), true)
+                            .unwrap_or(10_000)
+                            .min(10_000),
+                    )
+                } else {
+                    estimate_build_rows_mode(build.as_ref(), true)
+                };
+                if tight_admit.is_none() || ratio_rejects(tight_admit) {
+                    if trace {
+                        eprintln!(
+                            "[L9.trace] skip — gate rejects (tight too): b({:?}) × ratio({}) >= p({})",
+                            tight_admit,
+                            self.min_probe_to_build_ratio,
+                            probe_rows.unwrap_or(0)
+                        );
+                    }
+                    return Ok(Transformed::no(node));
+                }
+                // L9.ADAPT.Q05 SIZING (2026-06-12): the selective-shape
+                // caps are ADMISSION devices, not sizing — feeding Q05's
+                // 456K-key spliced semi build into a 10K-sized bloom
+                // saturated it (>10% effective pass), Guard-2 disarmed
+                // the probes, and the wrap paid pure reader-routing tax
+                // (+12.6% measured, 3 same-sign interleaved pairs). Size
+                // from the UNCAPPED estimate; when the stats can't see
+                // through the build at all, fall back to 2× the publish
+                // set cap so any semi-bounded build the rescue admits
+                // fits without saturating. Uncapped == admitted when no
+                // cap applied (Q08's 13K wrap stays byte-identical).
+                let tight_size = estimate_build_rows_uncapped(build.as_ref(), true)
+                    .unwrap_or(524_288)
+                    .max(tight_admit.unwrap_or(0));
+                build_rows = Some(tight_size);
+                tight_only = true;
+            }
+            // L9.WIDTH (2026-06-10): general probe-payoff gate, configured
+            // value (default 0 = disabled); the tight path enforced its
+            // own ≥3 floor above. See the Q08-win / Q17-regress boundary
+            // measurements in the rescue block.
+            if scan_arc.projection().len() < self.min_probe_proj_cols {
+                if trace {
+                    eprintln!(
+                        "[L9.trace] skip — probe scan projects {} cols < min {} (tight_only={tight_only}; narrow-payload wrap loses: scan-probe cost exceeds the cheap join it relieves)",
+                        scan_arc.projection().len(),
+                        self.min_probe_proj_cols
+                    );
+                }
+                return Ok(Transformed::no(node));
             }
             if trace {
                 eprintln!(
-                    "[L9.trace] WRAP {:?} join — expected_keys={}",
+                    "[L9.trace] WRAP {:?} join — expected_keys={} tight_only={tight_only}",
                     hj.join_type(),
                     build_rows.unwrap_or(50_000)
                 );
@@ -403,7 +530,11 @@ impl PhysicalOptimizerRule for EnableRuntimeBloomSidebandRule {
             // Σ.Q.L9: allocate the sideband, wrap the build child,
             // rewrite the probe subtree to thread the sideband into
             // the matching EmatixFastParquetExec.
-            let sideband = BridgeFilterSideband::new();
+            let sideband = if tight_only {
+                BridgeFilterSideband::new().mark_tight_admitted()
+            } else {
+                BridgeFilterSideband::new()
+            };
 
             // Estimate expected build-side keys from the build's
             // partition statistics. Falls back to a generous default
@@ -636,20 +767,204 @@ fn estimate_probe_scan_rows(scan: &EmatixFastParquetExec) -> Option<usize> {
     }
 }
 
-/// Best-effort row-count estimate for the build subtree. Uses
-/// `partition_statistics` when available, sums across partitions.
+/// Best-effort row-count estimate for the build subtree (DEFAULT mode —
+/// plan statistics only). Uses `partition_statistics` when available,
+/// sums across partitions.
 ///
-/// Σ.AH.2 Story 1'.3 (2026-05-26): when `EMAT_L9_TIGHT_CARDINALITY=1`,
-/// first try the emat-stats-aware path that uses
-/// `EmatixFastParquetExec::column_stats().distinct_count` (populated
-/// by Story 1'.2 from parquet dict pages) to compute filter
-/// selectivity directly, bypassing DataFusion's `FilterExec.statistics()`
-/// which doesn't use distinct_count for string-Eq predicates and
-/// falls back to a 0.2 default.
+/// L9.ADAPT (lazy rescue, 2026-06-11): this is ALWAYS the stats-only
+/// estimate. The NDV-tight path (`estimate_build_rows_mode(plan, true)`)
+/// runs only inside the rescue branch, AFTER the default gate rejected
+/// and the cheap pre-gates passed — the eager dual-estimate design
+/// consulted NDV stats on every join of every query and re-sized
+/// default-admitted wraps' expected_keys, both measured regressions.
 fn estimate_build_rows(plan: &dyn ExecutionPlan) -> Option<usize> {
-    if std::env::var_os("EMAT_L9_TIGHT_CARDINALITY").is_some() {
-        if let Some(tight) = estimate_build_rows_via_emat_stats(plan) {
-            return Some(tight);
+    estimate_build_rows_mode(plan, false)
+}
+
+/// L9.ADAPT — is the tight (NDV) rescue enabled? **DEFAULT ON** as of
+/// the third design (2026-06-11; opt-out `EMAT_L9_TIGHT_CARDINALITY=0`).
+///
+/// Design history — each predecessor was killed by the 22q sweep gate:
+/// (1) Eager tight estimates everywhere: Q19 +102% (string statics →
+///     legacy re-decode; fixed by Guard 1) plus re-sized expected_keys
+///     on default-admitted wraps.
+/// (2) Eager dual estimates + width floor 3 + publish-wait budget:
+///     dedicated A/Bs clean, but in-sweep Q17 +31% — TWO stacked
+///     mechanisms: the 60ms probe-row-scaled wait was fully eaten by a
+///     COLD build (full stall, no early bloom), and carrying the wrap
+///     forced the 3-col probe scan off the inline-streaming reader.
+/// (3) Current: LAZY rescue (only default-REJECTED joins, pre-gated on
+///     ≥8M probe rows / ≥4 projected probe cols / Guard-1 fused-
+///     evaluable bundle) plus LATE-ARM (never stall; the reader adopts
+///     the published predicate at the next row-group boundary) plus
+///     the Guard-2 runtime disarm. Verified on 3 alternating-order
+///     interleaved 22q SF=10 pairs: Q08 −19.9% (the DuckDB flip),
+///     Q17 −2.1%, geomean −1.64%, no same-sign regression above noise;
+///     tpch_validate 22/22 at SF=1 + SF=10; SF=1 plans are untouched
+///     by construction (probe-rows pre-gate exceeds every SF=1 fact).
+pub(crate) fn tight_cardinality_enabled() -> bool {
+    std::env::var("EMAT_L9_TIGHT_CARDINALITY").as_deref() != Ok("0")
+}
+
+/// L9.ADAPT — width floor for tight-rescued wraps. Measured boundary
+/// (twice): Q17's 3-col wrap loses +25-31% in-sweep, Q08's 5-col wrap
+/// wins −19.5%. Two stacked costs price out narrow scans: (a) the
+/// probe key is decoded anyway, so a narrow scan has little
+/// masked-decode relief to sell; (b) carrying a filter (or pending
+/// late-arm sideband) forces the scan OFF the inline-streaming reader
+/// onto the eager whole-RG reader — Σ.E5's auto-inline win for
+/// multi-RG fact partitions is forfeited, ~30-45ms cold on a 60M-row
+/// scan. A wide probe both relieves more downstream flow and
+/// amortizes that routing loss. Default-admitted wraps keep the
+/// configured value (global floor measured +88% on Q07).
+const TIGHT_MIN_PROBE_PROJ_COLS: usize = 4;
+
+/// L9.ADAPT — minimum TOTAL probe-scan rows for the tight rescue. The
+/// per-row probe + publish race only pays back on big scans (Q08's 60M
+/// lineitem probe wins −20%; Q02's 2M partsupp probe lost +85% to the
+/// publish race). 8M also keeps SF=1 entirely on the default path
+/// (largest SF=1 fact scan = 6M lineitem rows) — the locked 22/22
+/// scale never changes plans under this mode.
+const TIGHT_MIN_PROBE_ROWS: usize = 8_000_000;
+
+/// L9.ADAPT Guard 1 — can the probe scan's bundle stay on the fused
+/// masked-decode path once the runtime probe is added? True iff every
+/// EXISTING static is a fused-evaluable shape targeting a projected
+/// column AND the join-key column itself is projected (the published
+/// set/bloom predicate targets it). A `None` filter is trivially
+/// evaluable. Applied only to tight-admitted wraps: Q19's string
+/// statics (l_shipmode IN / l_shipinstruct =) flipped its whole bundle
+/// onto the legacy per-predicate re-decode path for +102%.
+fn tight_probe_bundle_fused_evaluable(
+    filter: Option<&crate::ematix_fast_parquet::BridgeFilter>,
+    projection: &[usize],
+    probe_scan_col_idx: usize,
+) -> bool {
+    let statics_ok = filter
+        .map(|f| f.statics_fused_evaluable(projection))
+        .unwrap_or(true);
+    statics_ok && projection.contains(&probe_scan_col_idx)
+}
+
+fn estimate_build_rows_mode(plan: &dyn ExecutionPlan, tight: bool) -> Option<usize> {
+    // L9.EST (2026-06-10): structural caps for builds whose true output the
+    // statistics CANNOT see. The fresh Q18 SF=10 trace showed the estimator
+    // crediting a `Filter(sum(qty)>300)`-over-Aggregate build with the raw
+    // 60M-row lineitem leaf (true output: 624 rows — off by 10^5), and a
+    // semi-join output with its probe child's 15M. Both shapes are
+    // *intrinsically* selective: a HAVING-style value-filter over a GROUP BY
+    // keeps few groups, and a semi/anti join exists to filter. Cap them at
+    // the Σ.AM.1 constant (10K — generous for any selective subquery, tight
+    // enough that the ratio gate still only admits large probes: 10K × 1024
+    // ≈ 10.2M). Mirrors the Σ.AM.1 `build_has_semi` cap but lives in the
+    // estimator so every consumer (ratio gate, expected_keys sizing) agrees.
+    const SELECTIVE_SHAPE_CAP: usize = 10_000;
+    if build_top_is_selective_shape(plan) {
+        let est = estimate_build_rows_uncapped(plan, tight).unwrap_or(SELECTIVE_SHAPE_CAP);
+        return Some(est.min(SELECTIVE_SHAPE_CAP));
+    }
+    // L9.ADAPT.Q05 (#352, TIGHT mode only): a semi join ANYWHERE in the
+    // build bounds its output by the semi's key set — the Σ.AM.1 insight
+    // extended past the top shaping node. The Σ.Q05 transitive splice
+    // produces exactly this shape (`Inner(customer ⋉ nation⋈region,
+    // orders)`, true output 456K at SF=10) and plan statistics cannot
+    // see through the deep semi, so the uncapped estimate ratio-rejects
+    // a 3%-pass-rate wrap. Tight-only keeps the v3 contract: the default
+    // path stays stats-only, default-admitted wraps are byte-identical,
+    // and a wrongly-capped admit is bounded by the rescue pre-gates +
+    // the Guard-2 runtime disarm.
+    if tight && subtree_has_semi_filter_dyn(plan) {
+        let est = estimate_build_rows_uncapped(plan, tight).unwrap_or(SELECTIVE_SHAPE_CAP);
+        return Some(est.min(SELECTIVE_SHAPE_CAP));
+    }
+    estimate_build_rows_uncapped(plan, tight)
+}
+
+/// `build_subtree_has_semi_filter` over a `&dyn` plan (the estimator
+/// works on `&dyn ExecutionPlan`; the rule-site walker takes `&Arc`).
+fn subtree_has_semi_filter_dyn(plan: &dyn ExecutionPlan) -> bool {
+    use datafusion::common::JoinType;
+    if let Some(hj) = plan.as_any().downcast_ref::<HashJoinExec>() {
+        if matches!(
+            hj.join_type(),
+            JoinType::LeftSemi | JoinType::LeftAnti | JoinType::RightSemi | JoinType::RightAnti
+        ) {
+            return true;
+        }
+    }
+    plan.children()
+        .iter()
+        .any(|c| subtree_has_semi_filter_dyn(c.as_ref()))
+}
+
+/// Walk through pass-through operators (projection / coalesce / repartition)
+/// and report whether the first row-shaping operator of the build subtree is
+/// a semi/anti join or a HAVING-style `FilterExec` directly over an
+/// `AggregateExec` — the two shapes whose output cardinality plan-time
+/// statistics structurally over-estimate (they see through to the leaf).
+fn build_top_is_selective_shape(plan: &dyn ExecutionPlan) -> bool {
+    use datafusion::common::JoinType;
+    use datafusion::physical_plan::filter::FilterExec;
+    if is_pass_through_node(plan) {
+        return plan
+            .children()
+            .first()
+            .is_some_and(|c| build_top_is_selective_shape(c.as_ref()));
+    }
+    if let Some(hj) = plan.as_any().downcast_ref::<HashJoinExec>() {
+        return matches!(
+            hj.join_type(),
+            JoinType::LeftSemi | JoinType::LeftAnti | JoinType::RightSemi | JoinType::RightAnti
+        );
+    }
+    if let Some(f) = plan.as_any().downcast_ref::<FilterExec>() {
+        // HAVING shape: the filter's input (through pass-throughs) is an
+        // aggregate — i.e. a value-filter on aggregated groups.
+        return first_shaping_node_is_aggregate(f.input().as_ref());
+    }
+    false
+}
+
+fn is_pass_through_node(p: &dyn ExecutionPlan) -> bool {
+    use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
+    use datafusion::physical_plan::projection::ProjectionExec;
+    use datafusion::physical_plan::repartition::RepartitionExec;
+    p.as_any().downcast_ref::<ProjectionExec>().is_some()
+        || p.as_any()
+            .downcast_ref::<CoalescePartitionsExec>()
+            .is_some()
+        || p.as_any().downcast_ref::<RepartitionExec>().is_some()
+}
+
+fn first_shaping_node_is_aggregate(p: &dyn ExecutionPlan) -> bool {
+    use datafusion::physical_plan::aggregates::AggregateExec;
+    if is_pass_through_node(p) {
+        return p
+            .children()
+            .first()
+            .is_some_and(|c| first_shaping_node_is_aggregate(c.as_ref()));
+    }
+    p.as_any().downcast_ref::<AggregateExec>().is_some()
+}
+
+fn estimate_build_rows_uncapped(plan: &dyn ExecutionPlan, tight: bool) -> Option<usize> {
+    // L9.EST (2026-06-10) / L9.ADAPT (2026-06-11): the emat-stats path
+    // (NDV-corrected string-eq selectivity, backed by the rule-local lazy
+    // dict-page walk — `local_dict_ndv` — so the global stats
+    // JoinSelection reads stay untouched) remains OPT-IN — see
+    // `tight_cardinality_enabled` for the default-on attempt's post-
+    // mortem. When enabled, it admits Inner-join wraps whose payoff
+    // plan-time shape alone could not predict (Q08 −19.5% WIN, but
+    // Q17 +16% / Q02 +85% regressed); the gate site therefore computes
+    // BOTH estimates and marks wraps the default estimator would have
+    // rejected as tight-admitted, applying two scoped guards: the
+    // `TIGHT_MIN_PROBE_PROJ_COLS` width floor (Q17-class: narrow scans
+    // have no masked-decode relief to pay for the probe) and the
+    // `tight_peek_budget_ms` publish-wait budget (Q02-class: a fast scan
+    // must not stall behind a slow subquery build).
+    if tight {
+        if let Some(tight_est) = estimate_build_rows_via_emat_stats(plan) {
+            return Some(tight_est);
         }
     }
     let n = plan.output_partitioning().partition_count();
@@ -676,9 +991,60 @@ fn estimate_build_rows(plan: &dyn ExecutionPlan) -> Option<usize> {
 /// caller falls back to the standard partition_statistics path.
 fn estimate_build_rows_via_emat_stats(plan: &dyn ExecutionPlan) -> Option<usize> {
     let predicate = find_filter_predicate(plan)?;
-    let (raw, column_stats) = find_emat_scan_stats(plan)?;
-    let sel = estimate_filter_selectivity_via_emat_stats(&predicate, &column_stats);
+    let (raw, column_stats, scan_meta) = find_emat_scan_stats(plan)?;
+    let sel = estimate_filter_selectivity_via_emat_stats(&predicate, &column_stats, &|proj_idx| {
+        let file_idx = scan_meta.projection.get(proj_idx).copied()?;
+        local_dict_ndv(&scan_meta.path, raw, file_idx)
+    });
     Some(((raw as f64 * sel).round() as usize).max(1))
+}
+
+/// L9.NDV (2026-06-10): on-demand, **rule-local** dict-page NDV for one
+/// column of one parquet file. The global dict-distinct walk
+/// (`EMAT_DICT_DISTINCT`) stays default-OFF because populating
+/// `ColumnStatistics::distinct_count` perturbs DataFusion's JoinSelection
+/// (Σ.Q06.SF10.5.h; re-confirmed 2026-06-10: it flips Q08's c⋈o and o⋈l to
+/// CollectLeft and regresses Q08 +15%). This helper gives the L9 gate the
+/// same truth WITHOUT writing it into the stats the planner reads: it walks
+/// the dict-page headers lazily (header-only, no decompress), memoizes per
+/// file, and refuses files larger than `EMAT_L9_NDV_MAX_ROWS` (default 10M
+/// — dimensions yes, facts no) so plan-time cost stays microscopic.
+fn local_dict_ndv(path: &str, file_rows: usize, col_idx: usize) -> Option<usize> {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use std::sync::OnceLock;
+    let max_rows: usize = std::env::var("EMAT_L9_NDV_MAX_ROWS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(10_000_000);
+    if max_rows == 0 || file_rows > max_rows {
+        return None;
+    }
+    // One memoized walk per file, sized at a fixed generous width so every
+    // later column lookup hits the same cached Vec (the walker clamps to the
+    // row groups' real column count; surplus entries stay None). Columns
+    // beyond `WALK_WIDTH` simply can't resolve NDV — acceptable for the
+    // selectivity heuristic this feeds.
+    const WALK_WIDTH: usize = 256;
+    if col_idx >= WALK_WIDTH {
+        return None;
+    }
+    /// Per-file memo of the walk result (None = walk failed for that file).
+    type NdvCacheEntry = Option<std::sync::Arc<Vec<Option<usize>>>>;
+    static CACHE: OnceLock<Mutex<HashMap<String, NdvCacheEntry>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let per_col = {
+        let mut guard = cache.lock().ok()?;
+        guard
+            .entry(path.to_string())
+            .or_insert_with(|| {
+                crate::emat_parquet_metadata::dict_distinct_max_per_column(path, WALK_WIDTH)
+                    .ok()
+                    .map(std::sync::Arc::new)
+            })
+            .clone()
+    }?;
+    per_col.get(col_idx).copied().flatten().filter(|n| *n > 0)
 }
 
 /// Walk a plan subtree returning the first `FilterExec`'s predicate.
@@ -698,12 +1064,30 @@ fn find_filter_predicate(
 }
 
 /// Walk a plan subtree returning the first `EmatixFastParquetExec`'s
-/// `(raw_row_count, column_stats)` pair.
+/// `(raw_row_count, column_stats, scan_meta)`. `scan_meta` carries the
+/// file path + projected→file column mapping so the selectivity calc can
+/// resolve dict-page NDV lazily (L9.NDV) when `distinct_count` is Absent.
+struct EmatScanMeta {
+    path: String,
+    projection: Vec<usize>,
+}
+
 fn find_emat_scan_stats(
     plan: &dyn ExecutionPlan,
-) -> Option<(usize, Vec<datafusion::common::stats::ColumnStatistics>)> {
+) -> Option<(
+    usize,
+    Vec<datafusion::common::stats::ColumnStatistics>,
+    EmatScanMeta,
+)> {
     if let Some(s) = plan.as_any().downcast_ref::<EmatixFastParquetExec>() {
-        return Some((s.num_rows(), s.column_stats().to_vec()));
+        return Some((
+            s.num_rows(),
+            s.column_stats().to_vec(),
+            EmatScanMeta {
+                path: s.path().to_string(),
+                projection: s.projection().to_vec(),
+            },
+        ));
     }
     for c in plan.children() {
         if let Some(p) = find_emat_scan_stats(c.as_ref()) {
@@ -719,13 +1103,17 @@ fn find_emat_scan_stats(
 /// of falling back to the 0.2 default.
 ///
 /// Handled shapes:
-/// - `col = literal` → `1 / distinct_count(col)` when available
+/// - `col = literal` → `1 / distinct_count(col)` when available, else
+///   `1 / lazy_ndv(col)` (L9.NDV — the rule-local dict-page walk; keeps
+///   the global stats Absent so JoinSelection's plan choices are
+///   untouched)
 /// - `expr AND expr` → product of children's selectivity
 /// - `expr OR expr`  → conservative max of children's selectivity
 /// - anything else   → 0.2 (same conservative default as DataFusion)
 fn estimate_filter_selectivity_via_emat_stats(
     predicate: &Arc<dyn datafusion::physical_expr::PhysicalExpr>,
     column_stats: &[datafusion::common::stats::ColumnStatistics],
+    lazy_ndv: &dyn Fn(usize) -> Option<usize>,
 ) -> f64 {
     use datafusion::common::stats::Precision;
     use datafusion::logical_expr::Operator;
@@ -733,26 +1121,34 @@ fn estimate_filter_selectivity_via_emat_stats(
     if let Some(bin) = predicate.as_any().downcast_ref::<BinaryExpr>() {
         match bin.op() {
             Operator::And => {
-                let l = estimate_filter_selectivity_via_emat_stats(bin.left(), column_stats);
-                let r = estimate_filter_selectivity_via_emat_stats(bin.right(), column_stats);
+                let l =
+                    estimate_filter_selectivity_via_emat_stats(bin.left(), column_stats, lazy_ndv);
+                let r =
+                    estimate_filter_selectivity_via_emat_stats(bin.right(), column_stats, lazy_ndv);
                 return (l * r).clamp(0.0, 1.0);
             }
             Operator::Or => {
-                let l = estimate_filter_selectivity_via_emat_stats(bin.left(), column_stats);
-                let r = estimate_filter_selectivity_via_emat_stats(bin.right(), column_stats);
+                let l =
+                    estimate_filter_selectivity_via_emat_stats(bin.left(), column_stats, lazy_ndv);
+                let r =
+                    estimate_filter_selectivity_via_emat_stats(bin.right(), column_stats, lazy_ndv);
                 return l.max(r).clamp(0.0, 1.0);
             }
             Operator::Eq => {
                 if let Some(col) = bin.left().as_any().downcast_ref::<Column>() {
                     if bin.right().as_any().downcast_ref::<Literal>().is_some() {
-                        if let Some(cs) = column_stats.get(col.index()) {
-                            let n = match cs.distinct_count {
+                        let mut n = column_stats
+                            .get(col.index())
+                            .map(|cs| match cs.distinct_count {
                                 Precision::Exact(n) | Precision::Inexact(n) => n,
                                 _ => 0,
-                            };
-                            if n > 0 {
-                                return 1.0 / n as f64;
-                            }
+                            })
+                            .unwrap_or(0);
+                        if n == 0 {
+                            n = lazy_ndv(col.index()).unwrap_or(0);
+                        }
+                        if n > 0 {
+                            return 1.0 / n as f64;
                         }
                     }
                 }
@@ -772,6 +1168,65 @@ mod tests {
     use datafusion::prelude::{SessionConfig, SessionContext};
     use ematix_parquet_codec::write::{ColumnData, write_table_to_path};
     use ematix_parquet_format::types::CompressionCodec;
+
+    /// L9.ADAPT lazy rescue — the pre-gate constants encode measured
+    /// boundaries: the probe-rows floor keeps SF=1 (6M-row facts) and
+    /// small-probe shapes (Q02's 2M partsupp, +85% to the publish race)
+    /// off the rescue path entirely, while Q08's 60M probe qualifies;
+    /// the width floor separates Q17's losing 2-col wraps from Q08's
+    /// winning 5-col wrap.
+    #[test]
+    fn tight_rescue_pre_gate_constants() {
+        // Q08 lineitem probe qualifies; Q02 partsupp and SF=1 lineitem don't.
+        const { assert!(59_986_052 >= TIGHT_MIN_PROBE_ROWS) };
+        const { assert!(2_000_000 < TIGHT_MIN_PROBE_ROWS) };
+        // SF=1 lineitem (6,001,215 rows) stays default-path.
+        const { assert!(6_001_215 < TIGHT_MIN_PROBE_ROWS) };
+        // Width boundary: Q17's 3-col wrap refused (measured +25-31%
+        // in-sweep, twice), Q08's 5-col wrap allowed (−19.5%).
+        const { assert!(3 < TIGHT_MIN_PROBE_PROJ_COLS) };
+        const { assert!(5 >= TIGHT_MIN_PROBE_PROJ_COLS) };
+    }
+
+    /// L9.ADAPT Guard 1 — tight wraps are refused when the probe scan's
+    /// existing bundle would force the legacy re-decode path: string
+    /// statics (the Q19 +102% mechanism), unprojected predicate columns,
+    /// or an unprojected join-key column. No filter at all (Q08's bare
+    /// lineitem scan) is trivially evaluable.
+    #[test]
+    fn tight_probe_bundle_gate() {
+        use crate::ematix_fast_parquet::{BridgeFilter, ColumnPredicate};
+        let proj = [0usize, 1, 2, 4, 5];
+
+        // Q08 shape: no pushed statics, key projected → allowed.
+        assert!(tight_probe_bundle_fused_evaluable(None, &proj, 1));
+        // Key column not projected → refused even with no statics.
+        assert!(!tight_probe_bundle_fused_evaluable(None, &proj, 9));
+
+        // Q19 shape: string static in the bundle → refused.
+        let q19 = BridgeFilter::new(vec![ColumnPredicate::StringIn {
+            col_idx: 4,
+            values: vec!["AIR".into(), "AIR REG".into()],
+        }]);
+        assert!(!tight_probe_bundle_fused_evaluable(Some(&q19), &proj, 1));
+
+        // Q20 shape: numeric range on a projected column → allowed.
+        let q20 = BridgeFilter::new(vec![ColumnPredicate::I64Range {
+            col_idx: 4,
+            lo: 9131,
+            hi: 9496,
+        }]);
+        assert!(tight_probe_bundle_fused_evaluable(Some(&q20), &proj, 1));
+
+        // Numeric static on an UNPROJECTED column → refused (fused
+        // resolve would fail at runtime → legacy fallback).
+        let unproj = BridgeFilter::new(vec![ColumnPredicate::I64Range {
+            col_idx: 9,
+            lo: 0,
+            hi: 1,
+        }]);
+        assert!(!tight_probe_bundle_fused_evaluable(Some(&unproj), &proj, 1));
+    }
 
     fn tmp_parquet(name: &str) -> std::path::PathBuf {
         let dir =
@@ -844,6 +1299,9 @@ mod tests {
                 // Story 2a: disable the absolute-build-size gate for
                 // these wrap-mechanism tests (tiny inputs anyway).
                 max_expected_keys_per_partition: 0,
+                // Width gate off: fixtures are 1-2 column synthetic tables
+                // exercising the wrap mechanics, not the payoff heuristic.
+                min_probe_proj_cols: 0,
             }))
             .build();
         let ctx = SessionContext::new_with_state(state);
@@ -935,6 +1393,9 @@ mod tests {
                 allow_inner_join: true,
                 require_filtered_build: false,
                 max_expected_keys_per_partition: 0,
+                // Width gate off: fixtures are 1-2 column synthetic tables
+                // exercising the wrap mechanics, not the payoff heuristic.
+                min_probe_proj_cols: 0,
             }))
             .build();
         let ctx = SessionContext::new_with_state(state);
@@ -970,26 +1431,31 @@ mod tests {
         );
     }
 
-    /// KEYS.5.d — a string build above EMAT_L9_SET_THRESHOLD (32_768)
-    /// overflows the exact set, so the emitter publishes a StringInBloom.
-    /// This drives the StringInBloom branch of build_bitmap end-to-end and
+    /// KEYS.5.d — a string build above EMAT_L9_SET_THRESHOLD overflows
+    /// the exact set, so the emitter publishes a StringInBloom. This
+    /// drives the StringInBloom branch of build_bitmap end-to-end and
     /// proves bloom false-positives are caught by the residual join (the
-    /// final row count stays exact). Both sides have >32_768 distinct keys,
-    /// so the path is the bloom regardless of which side becomes the build.
+    /// final row count stays exact). Both sides exceed the threshold,
+    /// so the path is the bloom regardless of which side becomes the
+    /// build. Sized off `l9_set_threshold()` so it tracks the default
+    /// (L9.SETCAP raised it).
     #[tokio::test]
     async fn rule_string_join_uses_bloom_above_threshold() {
         let dim = tmp_parquet("dim_bloom_str");
         let fact = tmp_parquet("fact_bloom_str");
-        // dim: 33_000 distinct keys (> 32_768 → set overflows → bloom).
-        let dim_keys: Vec<String> = (0..33_000).map(|i| format!("d{i:06}")).collect();
+        // dim: threshold+16 distinct keys (set overflows → bloom).
+        let n_over = crate::build_side_bloom_emitter_exec::l9_set_threshold() + 16;
+        let dim_keys: Vec<String> = (0..n_over).map(|i| format!("d{i:06}")).collect();
         let dim_refs: Vec<&str> = dim_keys.iter().map(|s| s.as_str()).collect();
         write_utf8_parquet(&dim, ("d_key", &dim_refs), None);
-        // fact: 40_000 rows; first 20_000 match dim (d000000..d019999), last
-        // 20_000 don't (z...). 40_000 distinct keys → also the bloom path if
-        // it ends up the build side.
-        let fact_keys: Vec<String> = (0..40_000)
+        // fact: n_over+more rows; first half match dim, rest don't (z...).
+        // Also above the threshold so the bloom path holds if it ends up
+        // the build side.
+        let n_fact = n_over + 16;
+        let half_fact = n_fact / 2;
+        let fact_keys: Vec<String> = (0..n_fact)
             .map(|i| {
-                if i < 20_000 {
+                if i < half_fact {
                     format!("d{i:06}")
                 } else {
                     format!("z{i:06}")
@@ -997,7 +1463,7 @@ mod tests {
             })
             .collect();
         let fact_refs: Vec<&str> = fact_keys.iter().map(|s| s.as_str()).collect();
-        let fact_vals: Vec<i64> = (0..40_000).collect();
+        let fact_vals: Vec<i64> = (0..n_fact as i64).collect();
         write_utf8_parquet(&fact, ("f_key", &fact_refs), Some(("f_val", &fact_vals)));
 
         let cfg = SessionConfig::new().with_target_partitions(4);
@@ -1009,6 +1475,9 @@ mod tests {
                 allow_inner_join: true,
                 require_filtered_build: false,
                 max_expected_keys_per_partition: 0,
+                // Width gate off: fixtures are 1-2 column synthetic tables
+                // exercising the wrap mechanics, not the payoff heuristic.
+                min_probe_proj_cols: 0,
             }))
             .build();
         let ctx = SessionContext::new_with_state(state);
@@ -1033,12 +1502,12 @@ mod tests {
             s.contains("BuildSideBloomEmitterExec"),
             "expected the L9 wrapper on the bloom-path string join:\n{s}"
         );
-        // Exactly the 20_000 matching fact rows — any bloom false-positives on
-        // the 20_000 z-keys are dropped by the residual HashJoin equality test.
+        // Exactly the matching fact rows — any bloom false-positives on
+        // the z-keys are dropped by the residual HashJoin equality test.
         let batches = df.collect().await.unwrap();
         let row_count: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(
-            row_count, 20_000,
+            row_count, half_fact,
             "bloom-path string join must stay exact (residual join filters FPs)"
         );
     }
@@ -1075,6 +1544,9 @@ mod tests {
                 // Story 2a: disable the absolute-build-size gate for
                 // these wrap-mechanism tests (tiny inputs anyway).
                 max_expected_keys_per_partition: 0,
+                // Width gate off: fixtures are 1-2 column synthetic tables
+                // exercising the wrap mechanics, not the payoff heuristic.
+                min_probe_proj_cols: 0,
             }))
             .build();
         let ctx = SessionContext::new_with_state(state);
@@ -1158,6 +1630,8 @@ mod tests {
                 // forces rejection (any emit would exceed 4 per partition
                 // because of the 64 floor).
                 max_expected_keys_per_partition: 4,
+                // Width gate off: narrow synthetic fixtures.
+                min_probe_proj_cols: 0,
             }))
             .build();
         let ctx = SessionContext::new_with_state(state);
@@ -1208,6 +1682,8 @@ mod tests {
                 allow_inner_join: true,
                 require_filtered_build: false,
                 max_expected_keys_per_partition: 1_000_000,
+                // Width gate off: narrow synthetic fixtures.
+                min_probe_proj_cols: 0,
             }))
             .build();
         let ctx = SessionContext::new_with_state(state);
@@ -1389,5 +1865,285 @@ mod tests {
             !build_subtree_has_semi_filter(&inner),
             "a plain Inner join must not be detected as semi-filtered"
         );
+    }
+
+    /// L9.ADAPT.Q05 (#352) — the TIGHT-mode estimator must extend the
+    /// Σ.AM.1 selective-shape cap to builds that contain a semi join
+    /// ANYWHERE (not just as the top shaping node). The Σ.Q05 splice
+    /// produces exactly this shape — `Inner(customer ⋉ dim, orders)` —
+    /// where plan statistics can't see through the deep semi and the
+    /// uncapped estimate ratio-rejects a 3%-pass-rate wrap. The DEFAULT
+    /// mode must stay stats-only byte-for-byte (the v3 lazy-rescue
+    /// contract: default-admitted wraps keep today's estimates).
+    #[test]
+    fn tight_mode_caps_deep_semi_builds() {
+        use datafusion::arrow::array::{Int64Array, RecordBatch};
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::common::{JoinType, NullEquality};
+        use datafusion::datasource::memory::MemorySourceConfig;
+        use datafusion::physical_expr::PhysicalExpr;
+        use datafusion::physical_plan::joins::PartitionMode;
+
+        fn mem_table_n(rows: i64) -> Arc<dyn ExecutionPlan> {
+            let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int64Array::from_iter_values(0..rows))],
+            )
+            .unwrap();
+            MemorySourceConfig::try_new_exec(&[vec![batch]], schema, None).unwrap()
+        }
+        fn join(
+            jt: JoinType,
+            l: Arc<dyn ExecutionPlan>,
+            r: Arc<dyn ExecutionPlan>,
+        ) -> Arc<dyn ExecutionPlan> {
+            let on = vec![(
+                Arc::new(Column::new("a", 0)) as Arc<dyn PhysicalExpr>,
+                Arc::new(Column::new("a", 0)) as Arc<dyn PhysicalExpr>,
+            )];
+            Arc::new(
+                HashJoinExec::try_new(
+                    l,
+                    r,
+                    on,
+                    None,
+                    &jt,
+                    None,
+                    PartitionMode::Partitioned,
+                    NullEquality::NullEqualsNothing,
+                    false,
+                )
+                .unwrap(),
+            )
+        }
+
+        // Inner( LeftSemi(60K, 60K), 60K ) — semi DEEP in the build.
+        let deep = join(
+            JoinType::Inner,
+            join(JoinType::LeftSemi, mem_table_n(60_000), mem_table_n(60_000)),
+            mem_table_n(60_000),
+        );
+        assert!(
+            !build_top_is_selective_shape(deep.as_ref()),
+            "top is Inner — the existing top-shape cap must NOT cover this"
+        );
+        let default_est = estimate_build_rows_mode(deep.as_ref(), false);
+        let uncapped = estimate_build_rows_uncapped(deep.as_ref(), false);
+        assert_eq!(
+            default_est, uncapped,
+            "DEFAULT mode must stay stats-only on deep-semi builds (v3 contract)"
+        );
+        assert!(
+            default_est.is_none_or(|e| e > 10_000),
+            "test setup must make the uncapped estimate exceed the cap \
+             (or be unresolvable) so the cap is observable, got {default_est:?}"
+        );
+        let tight_est = estimate_build_rows_mode(deep.as_ref(), true);
+        assert!(
+            tight_est.is_some_and(|e| e <= 10_000),
+            "TIGHT mode must cap a deep-semi build at the Σ.AM.1 constant, got {tight_est:?}"
+        );
+
+        // A semi-free Inner build must NOT take the tight cap.
+        let no_semi = join(JoinType::Inner, mem_table_n(60_000), mem_table_n(60_000));
+        assert_eq!(
+            estimate_build_rows_mode(no_semi.as_ref(), true),
+            estimate_build_rows_uncapped(no_semi.as_ref(), true),
+            "tight mode must not cap semi-free builds"
+        );
+    }
+
+    /// L9.EST — `build_top_is_selective_shape` must flag the two shapes
+    /// whose plan-time row estimates are structurally wrong by orders of
+    /// magnitude (fresh Q18 SF=10 trace: semi build estimated 15M, true
+    /// 624; HAVING build estimated 60M, true 624), and must NOT flag a
+    /// plain Inner join or a filter over a leaf.
+    #[test]
+    fn selective_shape_detects_semi_and_having_builds() {
+        use datafusion::arrow::array::{Int64Array, RecordBatch};
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::common::{JoinType, NullEquality};
+        use datafusion::datasource::memory::MemorySourceConfig;
+        use datafusion::physical_expr::PhysicalExpr;
+        use datafusion::physical_expr::aggregate::AggregateExprBuilder;
+        use datafusion::physical_plan::aggregates::{
+            AggregateExec, AggregateMode, PhysicalGroupBy,
+        };
+        use datafusion::physical_plan::expressions::{BinaryExpr, lit};
+        use datafusion::physical_plan::filter::FilterExec;
+        use datafusion::physical_plan::joins::PartitionMode;
+
+        fn mem_table() -> Arc<dyn ExecutionPlan> {
+            let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int64Array::from(vec![1i64, 2, 3]))],
+            )
+            .unwrap();
+            MemorySourceConfig::try_new_exec(&[vec![batch]], schema, None).unwrap()
+        }
+        fn join(jt: JoinType) -> Arc<dyn ExecutionPlan> {
+            let on = vec![(
+                Arc::new(Column::new("a", 0)) as Arc<dyn PhysicalExpr>,
+                Arc::new(Column::new("a", 0)) as Arc<dyn PhysicalExpr>,
+            )];
+            Arc::new(
+                HashJoinExec::try_new(
+                    mem_table(),
+                    mem_table(),
+                    on,
+                    None,
+                    &jt,
+                    None,
+                    PartitionMode::Partitioned,
+                    NullEquality::NullEqualsNothing,
+                    false,
+                )
+                .unwrap(),
+            )
+        }
+
+        // Semi/anti joins at the top of the build → selective.
+        assert!(build_top_is_selective_shape(
+            join(JoinType::RightSemi).as_ref()
+        ));
+        assert!(build_top_is_selective_shape(
+            join(JoinType::LeftSemi).as_ref()
+        ));
+        // Inner join → not selective (its output can exceed both inputs).
+        assert!(!build_top_is_selective_shape(
+            join(JoinType::Inner).as_ref()
+        ));
+
+        // HAVING shape: Filter over Aggregate → selective.
+        let input = mem_table();
+        let sum = AggregateExprBuilder::new(
+            datafusion::functions_aggregate::sum::sum_udaf(),
+            vec![Arc::new(Column::new("a", 0)) as Arc<dyn PhysicalExpr>],
+        )
+        .schema(input.schema())
+        .alias("sum_a")
+        .build()
+        .map(Arc::new)
+        .unwrap();
+        let group_by = PhysicalGroupBy::new_single(vec![(
+            Arc::new(Column::new("a", 0)) as Arc<dyn PhysicalExpr>,
+            "a".to_string(),
+        )]);
+        let agg: Arc<dyn ExecutionPlan> = Arc::new(
+            AggregateExec::try_new(
+                AggregateMode::Single,
+                group_by,
+                vec![sum],
+                vec![None],
+                input.clone(),
+                input.schema(),
+            )
+            .unwrap(),
+        );
+        let having_pred = Arc::new(BinaryExpr::new(
+            Arc::new(Column::new("sum_a", 1)),
+            datafusion::logical_expr::Operator::Gt,
+            lit(300i64),
+        )) as Arc<dyn PhysicalExpr>;
+        let having: Arc<dyn ExecutionPlan> =
+            Arc::new(FilterExec::try_new(having_pred, agg).unwrap());
+        assert!(
+            build_top_is_selective_shape(having.as_ref()),
+            "Filter over Aggregate (HAVING) must be detected as selective"
+        );
+
+        // Filter over a plain leaf → NOT the HAVING shape.
+        let leaf_pred = Arc::new(BinaryExpr::new(
+            Arc::new(Column::new("a", 0)),
+            datafusion::logical_expr::Operator::Gt,
+            lit(1i64),
+        )) as Arc<dyn PhysicalExpr>;
+        let leaf_filter: Arc<dyn ExecutionPlan> =
+            Arc::new(FilterExec::try_new(leaf_pred, mem_table()).unwrap());
+        assert!(!build_top_is_selective_shape(leaf_filter.as_ref()));
+
+        // And the estimator must cap a selective-shape build at the
+        // Σ.AM.1 constant even though the underlying stats say 3 rows
+        // (here) or 60M (Q18) — the cap is what unlocks the ratio gate.
+        let est = estimate_build_rows(having.as_ref());
+        assert!(
+            est.is_some() && est.unwrap() <= 10_000,
+            "HAVING build estimate must be capped at 10K, got {est:?}"
+        );
+    }
+
+    /// L9.NDV — when `distinct_count` is Absent (the global dict-distinct
+    /// walk stays default-off because it perturbs JoinSelection), the
+    /// emat-stats estimate path must fall back to the rule-local lazy
+    /// dict-page NDV: a 150-distinct string filter over 3000 rows
+    /// estimates ~20 rows (3000/150), not 600 (3000 × the 0.2 default).
+    /// The global stats the planner reads must stay Absent. (The path is
+    /// opt-in via `EMAT_L9_TIGHT_CARDINALITY=1` — see
+    /// `estimate_build_rows_uncapped` for the measured win/loss split —
+    /// so the test exercises the inner fn directly.)
+    #[tokio::test]
+    async fn estimate_build_rows_uses_lazy_dict_ndv() {
+        use datafusion::physical_plan::filter::FilterExec;
+
+        let path = tmp_parquet("ndv_part");
+        // 150 distinct ptype values × 20 reps = 3000 rows, plus an i64 key.
+        let vals: Vec<String> = (0..3000).map(|i| format!("v{:03}", i % 150)).collect();
+        let val_refs: Vec<&str> = vals.iter().map(|s| s.as_str()).collect();
+        let keys: Vec<i64> = (0..3000).collect();
+        write_utf8_parquet(&path, ("ptype", &val_refs), Some(("pkey", &keys)));
+
+        let ctx = SessionContext::new();
+        let provider =
+            EmatixFastParquetTableProvider::try_new(path.to_string_lossy().to_string()).unwrap();
+        ctx.register_table("part_t", Arc::new(provider)).unwrap();
+        let df = ctx
+            .sql("SELECT pkey FROM part_t WHERE ptype = 'v007'")
+            .await
+            .unwrap();
+        let plan = ctx
+            .state()
+            .create_physical_plan(&df.into_optimized_plan().unwrap())
+            .await
+            .unwrap();
+
+        // Locate the FilterExec (the provider declares string-eq Inexact, so
+        // a FilterExec survives above the scan).
+        fn find_filter(plan: &Arc<dyn ExecutionPlan>) -> Option<Arc<dyn ExecutionPlan>> {
+            if plan.as_any().downcast_ref::<FilterExec>().is_some() {
+                return Some(plan.clone());
+            }
+            for c in plan.children() {
+                if let Some(f) = find_filter(c) {
+                    return Some(f);
+                }
+            }
+            None
+        }
+        let filter = find_filter(&plan).expect("plan must keep a FilterExec for ptype='v007'");
+
+        let est =
+            estimate_build_rows_via_emat_stats(filter.as_ref()).expect("estimate must resolve");
+        assert!(
+            est <= 60,
+            "NDV-corrected estimate must be ~3000/150 = 20 (≤60 with rounding), got {est} — \
+             the 0.2 fallback would give 600"
+        );
+
+        // Isolation: the scan's globally-visible stats must still carry an
+        // Absent distinct_count (JoinSelection's view is untouched).
+        let (_, column_stats, _) = find_emat_scan_stats(filter.as_ref()).unwrap();
+        for cs in &column_stats {
+            assert!(
+                matches!(
+                    cs.distinct_count,
+                    datafusion::common::stats::Precision::Absent
+                ),
+                "global distinct_count must stay Absent (got {:?}) — populating it \
+                 flips JoinSelection plans (the Σ.Q06.SF10.5.h regression)",
+                cs.distinct_count
+            );
+        }
     }
 }

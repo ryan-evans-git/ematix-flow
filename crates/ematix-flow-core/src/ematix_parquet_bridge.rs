@@ -1119,6 +1119,45 @@ pub fn rg_num_values(path: &std::path::Path, rg: usize, col: usize) -> DfResult<
     Ok(cm.num_values as usize)
 }
 
+/// Per-row-group `(min, max)` i64 range (None when stats are absent or
+/// not 8-byte) paired with the per-RG value count.
+pub type RgRangesAndCounts = (Vec<Option<(i64, i64)>>, Vec<usize>);
+
+/// RANGE.AGG — per-row-group `(min, max)` stats and value counts for one
+/// column, all from a SINGLE footer parse. The per-RG variants above
+/// each call `open_cached`, and files below the cache's row-group
+/// threshold are never inserted — so a plan-time sweep calling them per
+/// RG pays one full footer parse per call (58-RG SF=10 lineitem: 116
+/// parses ≈ 23 ms of plan time, measured). Plan-time callers must use
+/// this instead.
+pub fn rg_i64_ranges_and_counts(path: &std::path::Path, col: usize) -> DfResult<RgRangesAndCounts> {
+    let file = open_cached(path)?;
+    let md = file
+        .cached_metadata()
+        .map_err(|e| ext(format!("metadata: {e}")))?;
+    let n = md.row_groups.len();
+    let mut ranges = Vec::with_capacity(n);
+    let mut counts = Vec::with_capacity(n);
+    for rg in &md.row_groups {
+        let cm = rg.columns.get(col).and_then(|c| c.meta_data.as_ref());
+        let range = cm.and_then(|c| c.statistics.as_ref()).and_then(|stats| {
+            let mn = stats.min_value.or(stats.min)?;
+            let mx = stats.max_value.or(stats.max)?;
+            if mn.len() == 8 && mx.len() == 8 {
+                Some((
+                    i64::from_le_bytes(mn.try_into().unwrap()),
+                    i64::from_le_bytes(mx.try_into().unwrap()),
+                ))
+            } else {
+                None
+            }
+        });
+        ranges.push(range);
+        counts.push(cm.map(|c| c.num_values as usize).unwrap_or(0));
+    }
+    Ok((ranges, counts))
+}
+
 /// Σ.Q.L4′: build a row bitmap from an INT64 column. Used for bloom-
 /// filter probe pushdown on i64 join keys (l_orderkey, l_partkey,
 /// l_suppkey, o_orderkey, ...). PLAIN dense decode for now — TPC-H
@@ -1280,6 +1319,31 @@ mod tests {
         //    and parquet-rs's typed column readers) can run in CI.
         let mini = PathBuf::from(crate::test_support::tpch_mini_dir()).join("lineitem.parquet");
         mini.exists().then_some(mini)
+    }
+
+    /// RANGE.AGG plan-time sweep: the bulk stats reader must agree with
+    /// the per-RG readers on every row group, from ONE footer parse.
+    #[test]
+    fn bulk_rg_i64_ranges_and_counts_matches_per_rg() {
+        let Some(path) = lineitem_path() else { return };
+        let f = open_cached(&path).unwrap();
+        let n_rgs = f.cached_metadata().unwrap().row_groups.len();
+        // l_orderkey is file col 0 (physical INT64) in every fixture.
+        let (ranges, counts) = rg_i64_ranges_and_counts(&path, 0).unwrap();
+        assert_eq!(ranges.len(), n_rgs);
+        assert_eq!(counts.len(), n_rgs);
+        for rg in 0..n_rgs {
+            assert_eq!(
+                ranges[rg],
+                rg_i64_min_max(&path, rg, 0).unwrap(),
+                "rg {rg} range"
+            );
+            assert_eq!(
+                counts[rg],
+                rg_num_values(&path, rg, 0).unwrap(),
+                "rg {rg} count"
+            );
+        }
     }
 
     fn pr_read_i32(path: &PathBuf, rg: usize, col: usize) -> Vec<i32> {

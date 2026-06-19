@@ -85,6 +85,8 @@ fn set_arm(envs: &[(&str, &str)]) {
         std::env::remove_var("EMAT_HASH_JOIN");
         std::env::remove_var("EMAT_HJ_PARTITIONED");
         std::env::remove_var("EMAT_HJ_MIN_PROBE");
+        std::env::remove_var("EMAT_HJ_RADIX");
+        std::env::remove_var("EMAT_HJ_TAG");
         for (k, v) in envs {
             std::env::set_var(k, v);
         }
@@ -135,12 +137,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let arms: Vec<(&str, Vec<(&str, &str)>)> = vec![
         ("STOCK", vec![]),
-        ("HJ_COLLECT", vec![("EMAT_HASH_JOIN", "1")]),
         (
             "HJ_NOSHUFFLE",
             vec![
                 ("EMAT_HASH_JOIN", "1"),
                 ("EMAT_HJ_PARTITIONED", "1"),
+                ("EMAT_HJ_MIN_PROBE", "300000000"),
+            ],
+        ),
+        // RADIX.2 spike: the per-partition radix build + per-execute B-scatter probe.
+        (
+            "HJ_RADIX",
+            vec![
+                ("EMAT_HASH_JOIN", "1"),
+                ("EMAT_HJ_PARTITIONED", "1"),
+                ("EMAT_HJ_RADIX", "1"),
                 ("EMAT_HJ_MIN_PROBE", "300000000"),
             ],
         ),
@@ -190,6 +201,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             (meds[ai] - stock) / stock * 100.0
         );
     }
+    // Confirm the radix table actually built (vs silently falling back to the
+    // chained RobinHood on a non-unique build) — RADIX_BUILDS>0 ⟹ HJ_RADIX engaged.
+    use std::sync::atomic::Ordering::Relaxed;
+    println!(
+        "[build counters] radix={} tag={} robinhood={}",
+        ematix_flow_core::emat_hash_join::RADIX_BUILDS.load(Relaxed),
+        ematix_flow_core::emat_hash_join::TAG_BUILDS.load(Relaxed),
+        ematix_flow_core::emat_hash_join::RH_BUILDS.load(Relaxed),
+    );
     set_arm(&[]);
     Ok(())
 }

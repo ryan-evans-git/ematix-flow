@@ -21,6 +21,7 @@ use datafusion::common::{DataFusionError, Result as DfResult};
 use datafusion::execution::TaskContext;
 use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
+use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricBuilder, MetricsSet};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
@@ -44,6 +45,11 @@ pub struct EmatixHashJoinExec {
     /// Shared across probe partitions: the first to execute builds the
     /// hash table; the rest await the same `Arc<EmatHashJoiner>`.
     build_once: Arc<OnceCell<Arc<EmatHashJoiner>>>,
+    /// Q10-flip increment 1: surface the otherwise-hidden build/probe cost
+    /// (the operator reported `metrics=[]`, blocking the parallel-build and
+    /// late-materialization de-risk). `build_time` is the serial hash-table
+    /// insert (timed once inside the build closure); `probe_time` the probe.
+    metrics: ExecutionPlanMetricsSet,
 }
 
 impl EmatixHashJoinExec {
@@ -73,6 +79,7 @@ impl EmatixHashJoinExec {
             schema: output_schema,
             properties,
             build_once: Arc::new(OnceCell::new()),
+            metrics: ExecutionPlanMetricsSet::new(),
         }
     }
 
@@ -119,6 +126,10 @@ impl ExecutionPlan for EmatixHashJoinExec {
         &self.properties
     }
 
+    fn metrics(&self) -> Option<MetricsSet> {
+        Some(self.metrics.clone_inner())
+    }
+
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![&self.left, &self.right]
     }
@@ -157,8 +168,12 @@ impl ExecutionPlan for EmatixHashJoinExec {
         let out_schema = self.schema.clone();
         let stream_schema = self.schema.clone();
         let build_ctx = ctx.clone();
+        let metrics = self.metrics.clone();
 
         let fut = async move {
+            // Q10-flip increment 1: time the (serial) build insert once + the probe.
+            let build_time = MetricBuilder::new(&metrics).subset_time("build_time", partition);
+            let probe_time = MetricBuilder::new(&metrics).subset_time("probe_time", partition);
             // Build once, shared across probe partitions.
             //
             // SF100.6 v2: parallel build-side drain. v1 (sequential `for p in
@@ -172,6 +187,7 @@ impl ExecutionPlan for EmatixHashJoinExec {
             // metrics localized as dominant.
             let joiner = build_once
                 .get_or_try_init(|| async {
+                    let _build_timer = build_time.timer();
                     let nparts = left.output_partitioning().partition_count();
                     let drain_futs = (0..nparts).map(|p| {
                         let left = left.clone();
@@ -198,13 +214,33 @@ impl ExecutionPlan for EmatixHashJoinExec {
                 .await?
                 .clone();
 
-            // Probe: stream this partition's right batches through the kernel.
-            let right_stream = right.execute(partition, ctx)?;
-            let mapped = right_stream.map(move |rb| {
-                let rb: RecordBatch = rb?;
-                joiner.probe(&rb).map_err(DataFusionError::Internal)
-            });
-            Ok::<_, DataFusionError>(mapped)
+            // Probe. RADIX.2 spike: if the build is radix-partitioned, BUFFER this
+            // partition's probe batches then B-scatter-probe them in one call —
+            // each execute() gets temporal cache locality (one ~L2 sub-table active
+            // at a time; 14 execute()s → ~14 sub-tables ≈ cache-resident, no global
+            // shuffle). This is a pipeline-breaker (collect-before-probe) → it pays
+            // the decode/probe-overlap loss the wall A/B is measuring. Otherwise:
+            // the streaming per-batch probe that overlaps decode.
+            if joiner.is_radix() {
+                let batches: Vec<RecordBatch> =
+                    right.execute(partition, ctx)?.try_collect().await?;
+                let _t = probe_time.timer();
+                let out = joiner
+                    .probe_radix_all(&batches)
+                    .map_err(DataFusionError::Internal)?;
+                Ok::<_, DataFusionError>(
+                    futures_util::stream::iter(vec![Ok::<RecordBatch, DataFusionError>(out)])
+                        .boxed(),
+                )
+            } else {
+                let right_stream = right.execute(partition, ctx)?;
+                let mapped = right_stream.map(move |rb| {
+                    let rb: RecordBatch = rb?;
+                    let _t = probe_time.timer();
+                    joiner.probe(&rb).map_err(DataFusionError::Internal)
+                });
+                Ok::<_, DataFusionError>(mapped.boxed())
+            }
         };
 
         let s = fut.try_flatten_stream();
