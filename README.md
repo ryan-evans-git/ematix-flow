@@ -60,10 +60,11 @@ flow run-due --module my_pipelines    # cron-style; drop into systemd / cron / k
 - **Fast.** TPC-H, 22 queries, single Apple M4 Max, measured at three
   scales through the production preset (fresh context per query, each
   engine in its own process — no bench-only tricks): ematix-flow takes
-  **22 / 22** at SF=1 (**2.34×** DuckDB, **4.22×** Polars, **18×**
-  single-node PySpark), **18 / 22** at SF=10 (**1.23×** DuckDB), and
-  **18 / 22** at SF=100 (**1.58×** DuckDB) — ahead on the geomean at
-  every scale. Full
+  **22 / 22** at SF=1 (**2.35×** DuckDB, **3.89×** Polars, **17×**
+  single-node PySpark), **17 / 22** at SF=10 (**1.24×** DuckDB), and
+  **16 / 22** at SF=100 (**1.58×** DuckDB) — fastest of all five
+  engines; head-to-head it beats DuckDB on 22 / 19 / 18 of 22 in the
+  same isolated protocol, and leads the geomean at every scale. Full
   numbers, the losses included, and the reproducer in
   [Benchmarks](#benchmarks).
 - **Scheduling + DAG, no service to operate.** Pipelines carry their own
@@ -80,12 +81,11 @@ flow run-due --module my_pipelines    # cron-style; drop into systemd / cron / k
   delivery, credential redaction, structured run history, Prometheus +
   OpenTelemetry metrics, Slack alerts.
 
-> Status: **v0.4.0 on PyPI** as `ematix-flow` (alpha). All four surfaces —
+> Status: **v0.11.0 on PyPI** as `ematix-flow` (alpha). All four surfaces —
 > declarative pipelines, multi-backend, streaming, stream processing — are
-> shipped end-to-end. The next release adds
-> `@ematix.warehouse_pipeline` (cron + retries + DAG for warehouse
-> sources/targets), AWS Glue Schema Registry, and timezone-aware cron
-> schedules; see CHANGELOG for the in-flight slice plan.
+> shipped end-to-end, with warehouse pipelines (cron + retries + DAG),
+> Schema Registry (Confluent + AWS Glue), and timezone-aware cron
+> schedules. See CHANGELOG for the release history.
 
 ---
 
@@ -1482,46 +1482,48 @@ other columns carried from 2026-06-10 / 2026-05-29-31); PySpark is
 
 | Scale | ematix-flow wins | vs DuckDB | vs Polars | vs PySpark | vs Postgres |
 |---|:--|--:|--:|--:|--:|
-| **SF=1** (~1 GB, in-cache) | **22 / 22** | 2.34× | 4.22× | 18.3× | 16.8× |
-| **SF=10** (~10 GB) | **18 / 22** | 1.23× | 3.77× | 11.3× | 20.5× |
-| **SF=100** (~100 GB) | **18 / 22** | 1.58× | 4.60× | 7.8× | 58× † |
+| **SF=1** (~1 GB, in-cache) | **22 / 22** | 2.35× | 3.89× | 16.8× | 15.5× |
+| **SF=10** (~10 GB) | **17 / 22** | 1.24× | 3.72× | 11.1× | 20.2× |
+| **SF=100** (~100 GB) | **16 / 22** | 1.58× | 4.70× | 7.9× | 62× † |
 
 Geomean of competitor ÷ ematix-flow across the 22 queries (Polars n=21
 at SF=10 / n=17 at SF=100; **†** Postgres ran 6 / 22 at SF=100 under a
-90 s cap). The queries ematix-flow doesn't win are named, not hidden:
-at SF=10 DuckDB takes Q05, Q07, and Q18 (each within ~12-17%); at SF=100
-DuckDB takes Q10 (the wide-string customer aggregate), Q16, and Q18, with
-Q11 a tie. Polars edges Q14 / Q15 by 3-4% at SF=10 and takes Q12 / Q14 /
-Q15 at SF=100. ematix-flow leads the geomean at every scale — 2.34× (SF=1),
-1.23× (SF=10), 1.58× (SF=100).
+90 s cap). The "wins" column is fastest-of-all-five; head-to-head, the
+apples-to-apples comparison is ematix-flow vs DuckDB in the same isolated
+protocol — **22 / 19 / 18** of 22. The queries ematix-flow doesn't win are
+named, not hidden: at SF=10 DuckDB takes Q05, Q07, and Q18 (each within
+~13-21%) and Polars edges Q14 / Q15; at SF=100 DuckDB takes Q10 (the
+wide-string customer aggregate), Q16, and Q18 (Q11 a 0.1 ms tie) and Polars
+takes Q06 / Q14. ematix-flow leads the geomean at every scale — 2.35× (SF=1),
+1.24× (SF=10), 1.58× (SF=100).
 Full tables, tabbed by scale, are on the docs site:
 [ematix.dev/reference/benchmarks](https://ematix.dev/reference/benchmarks).
 SF=1 in full (the README's headline scale):
 
 | Query | ematix-flow | DuckDB | Polars | PySpark | Postgres |
 |---|--:|--:|--:|--:|--:|
-| Q01 | **17.1** | 45.6 | 38.6 | 167 | 411 |
-| Q02 | **7.1** | 16.5 | 47.9 | 190 | 123 |
-| Q03 | **12.8** | 30.9 | 46.5 | 257 | 163 |
-| Q04 | **10.5** | 21.2 | 23.8 | 184 | 94.6 |
-| Q05 | **15.4** | 29.7 | 8,949 | 335 | 226 |
-| Q06 | **1.7** | 12.0 | 10.5 | 41.5 | 218 |
-| Q07 | **24.3** | 31.1 | 118 | 260 | 1,262 |
-| Q08 | **13.3** | 36.8 | 96.7 | 182 | 99.7 |
-| Q09 | **17.4** | 51.9 | 47.5 | 583 | 820 |
-| Q10 | **24.6** | 56.8 | 111 | 362 | 355 |
-| Q11 | **5.3** | 9.0 | 8.9 | 119 | 36.3 |
-| Q12 | **13.9** | 23.5 | 19.2 | 269 | 361 |
-| Q13 | **9.0** | 128 | 118 | 684 | 871 |
-| Q14 | **11.4** | 20.8 | 12.3 | 114 | 69.8 |
-| Q15 | **10.9** | 12.9 | 11.5 | 127 | 140 |
-| Q16 | **9.0** | 20.3 | 21.2 | 205 | 113 |
-| Q17 | **15.0** | 24.2 | 39.0 | 233 | 398 |
-| Q18 | **18.1** | 43.1 | 56.6 | 560 | 1,154 |
-| Q19 | **17.3** | 32.1 | 105 | 86.0 | 31.9 |
-| Q20 | **11.9** | 26.7 | 22.4 | 106 | 147 |
-| Q21 | **32.2** | 69.9 | 721 | 628 | 609 |
-| Q22 | **8.1** | 19.6 | 13.6 | 354 | 24.1 |
+| Q01 | **18.2** | 47.4 | 38.6 | 167 | 411 |
+| Q02 | **7.8** | 18.3 | 47.9 | 190 | 123 |
+| Q03 | **14.2** | 33.5 | 46.5 | 257 | 163 |
+| Q04 | **11.7** | 22.6 | 23.8 | 184 | 94.6 |
+| Q05 | **17.1** | 32.0 | 8,949 | 335 | 226 |
+| Q06 | **1.9** | 12.8 | 10.5 | 41.5 | 218 |
+| Q07 | **26.5** | 33.1 | 118 | 260 | 1,262 |
+| Q08 | **14.0** | 39.3 | 96.7 | 182 | 99.7 |
+| Q09 | **18.8** | 55.3 | 47.5 | 583 | 820 |
+| Q10 | **28.0** | 60.9 | 111 | 362 | 355 |
+| Q11 | **6.0** | 10.1 | 8.9 | 119 | 36.3 |
+| Q12 | **15.0** | 24.8 | 19.2 | 269 | 361 |
+| Q13 | **10.4** | 142 | 118 | 684 | 871 |
+| Q14 | **11.5** | 22.0 | 12.3 | 114 | 69.8 |
+| Q15 | **10.9** | 13.8 | 11.5 | 127 | 140 |
+| Q16 | **10.0** | 21.7 | 21.2 | 205 | 113 |
+| Q17 | **15.8** | 25.6 | 39.0 | 233 | 398 |
+| Q18 | **19.0** | 44.9 | 56.6 | 560 | 1,154 |
+| Q19 | **18.0** | 35.3 | 105 | 86.0 | 31.9 |
+| Q20 | **13.1** | 29.0 | 22.4 | 106 | 147 |
+| Q21 | **34.8** | 76.5 | 721 | 628 | 609 |
+| Q22 | **8.7** | 21.1 | 13.6 | 354 | 24.1 |
 
 Median ms, fastest per row in **bold**; ematix-flow + DuckDB measured in
 isolated passes through the production preset (fresh `SessionContext`
