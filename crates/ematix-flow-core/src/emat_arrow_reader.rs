@@ -59,7 +59,10 @@ use crate::ematix_fast_parquet::BridgeFilter;
 use crate::ematix_parquet_bridge::{
     masked_decode_byte_array, masked_decode_f64, masked_decode_i32, masked_decode_i64,
 };
-use ematix_parquet_codec::compression::{decompress_snappy_into, decompress_zstd_into};
+use ematix_parquet_codec::compression::{
+    decompress_lz4_raw_into, decompress_lz4_raw_into_sized, decompress_snappy_into,
+    decompress_zstd_into,
+};
 use ematix_parquet_codec::dict::decode_rle_dictionary_into;
 use ematix_parquet_codec::plain::{
     decode_plain_byte_array, decode_plain_f64, decode_plain_i32, decode_plain_i64,
@@ -2165,7 +2168,12 @@ fn decode_dict_chunk_typed<T: Copy>(
         .next_page()
         .map_err(|e| ext(format!("next_page (first): {e}")))?
         .ok_or_else(|| ext("empty chunk"))?;
-    decompress_into(codec, first_body, &mut scratch)?;
+    decompress_into_sized(
+        codec,
+        first_body,
+        first_hdr.uncompressed_page_size as usize,
+        &mut scratch,
+    )?;
 
     let dict: Vec<T> = if first_hdr.dictionary_page_header.is_some() {
         decode_plain(&scratch)?
@@ -2200,7 +2208,12 @@ fn decode_dict_chunk_typed<T: Copy>(
             .as_ref()
             .ok_or_else(|| ext("v2 pages not yet supported"))?;
         let n = dph.num_values as usize;
-        decompress_into(codec, body, &mut scratch)?;
+        decompress_into_sized(
+            codec,
+            body,
+            hdr.uncompressed_page_size as usize,
+            &mut scratch,
+        )?;
         match dph.encoding {
             Encoding::RleDictionary | Encoding::PlainDictionary => {
                 decode_rle_dictionary_into(&scratch, &dict, n, &mut out)
@@ -3053,9 +3066,37 @@ fn decompress_into(codec: CompressionCodec, body: &[u8], out: &mut Vec<u8>) -> D
         CompressionCodec::Zstd => {
             decompress_zstd_into(body, out).map_err(|e| ext(format!("zstd: {e}")))
         }
+        CompressionCodec::Lz4Raw => {
+            // LZ4_RAW page bodies (parquet's frameless LZ4 variant). This
+            // size-less entry scans the block tags to recover the
+            // uncompressed length; the primitive decode path calls
+            // `decompress_into_sized` with the page header's declared size to
+            // skip that scan on high-entropy columns. Shared kernel lives in
+            // the sibling `ematix-parquet-codec`.
+            decompress_lz4_raw_into(body, out).map_err(|e| ext(format!("lz4_raw: {e}")))
+        }
         other => Err(ext(format!(
             "codec {other:?} not yet supported in emat_arrow_reader"
         ))),
+    }
+}
+
+/// Like `decompress_into` but uses the page header's declared uncompressed
+/// size for LZ4_RAW — the fast sized path that skips the block-tag scan the
+/// size-less variant pays (the scan dominates on high-entropy columns like
+/// foreign keys). Falls back to size-less if the declared size is wrong.
+/// Non-LZ4 codecs ignore the hint and delegate to `decompress_into`.
+fn decompress_into_sized(
+    codec: CompressionCodec,
+    body: &[u8],
+    uncompressed_size: usize,
+    out: &mut Vec<u8>,
+) -> DfResult<()> {
+    match codec {
+        CompressionCodec::Lz4Raw => decompress_lz4_raw_into_sized(body, uncompressed_size, out)
+            .or_else(|_| decompress_lz4_raw_into(body, out))
+            .map_err(|e| ext(format!("lz4_raw: {e}"))),
+        _ => decompress_into(codec, body, out),
     }
 }
 
@@ -3211,6 +3252,53 @@ mod tests {
             .unwrap();
         assert_eq!(f64_arr.value(0), 0.0);
         assert_eq!(f64_arr.value(1), 0.5);
+    }
+
+    #[test]
+    fn roundtrip_lz4_raw() {
+        // Guards the production reader's LZ4_RAW decode (the `Lz4Raw` arm +
+        // `decompress_into_sized`). Before this the reader hard-errored on
+        // LZ4_RAW parquet ("codec Lz4Raw not yet supported"). Multiple row
+        // groups exercise both the first-page and subsequent-page decompress
+        // callsites; every value is verified (not just a spot-check).
+        let path = tmp_parquet("roundtrip_lz4");
+        let n = 100_000usize;
+        let i32s: Vec<i32> = (0..n as i32).collect();
+        let i64s: Vec<i64> = (0..n as i64).map(|x| x * 7).collect();
+        let f64s: Vec<f64> = (0..n).map(|x| x as f64 * 0.5).collect();
+        write_table_to_path_with_row_group_size(
+            &path,
+            &[
+                ("c_i32", ColumnData::I32(&i32s)),
+                ("c_i64", ColumnData::I64(&i64s)),
+                ("c_f64", ColumnData::F64(&f64s)),
+            ],
+            CompressionCodec::Lz4Raw,
+            40_000, // → 3 row groups
+        )
+        .unwrap();
+
+        let file = ParquetFile::open(&path).unwrap();
+        let reader = EmatArrowBatchReaderBuilder::new(file, schema_three_primitives())
+            .build()
+            .unwrap();
+        let batches: Vec<RecordBatch> = reader.map(|b| b.unwrap()).collect();
+        let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, n, "LZ4_RAW decode must yield every row");
+
+        let mut gi = 0usize;
+        for b in &batches {
+            let c0 = b.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+            let c1 = b.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+            let c2 = b.column(2).as_any().downcast_ref::<Float64Array>().unwrap();
+            for r in 0..b.num_rows() {
+                assert_eq!(c0.value(r), i32s[gi]);
+                assert_eq!(c1.value(r), i64s[gi]);
+                assert_eq!(c2.value(r), f64s[gi]);
+                gi += 1;
+            }
+        }
+        assert_eq!(gi, n, "LZ4_RAW decode must yield every value in order");
     }
 
     #[test]
