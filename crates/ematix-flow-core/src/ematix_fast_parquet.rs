@@ -3386,12 +3386,25 @@ pub struct EmatixFastParquetExec {
     /// extra filter — correctness never depends on it (the join re-applies
     /// every key). Empty in every pre-existing plan shape.
     extra_runtime_sidebands: Vec<crate::bridge_filter_sideband::BridgeFilterSideband>,
-    /// Morsel-engine P2 spike: a shared work-stealing queue over all of
-    /// this scan's kept row groups, created once at construction and
-    /// shared across partition streams. Consulted by `execute()` only
-    /// when `EMAT_MORSEL_STEAL=1` (otherwise the static per-partition
-    /// assignment is used). See [`crate::emat_arrow_reader::SharedRgCursor`].
-    morsel_cursor: Arc<crate::emat_arrow_reader::SharedRgCursor>,
+    /// Morsel-engine P2: this scan's kept row groups (sorted), used to
+    /// mint a fresh work-stealing cursor per execution.
+    morsel_rgs: Arc<Vec<usize>>,
+    /// Morsel-engine P2: the work-stealing cursor for the CURRENT
+    /// execution, keyed by `TaskContext` identity (held as a `Weak` so a
+    /// reused address can't alias a finished run). All partition streams
+    /// of one execution share the same `Arc<TaskContext>` → they share a
+    /// cursor; a new execution mints a fresh, undrained one. This makes
+    /// the lever safe under plan reuse (plan cache / multi-trial), unlike
+    /// a single cursor created at construction. `EMAT_MORSEL_STEAL` only.
+    #[allow(clippy::type_complexity)]
+    morsel_state: Arc<
+        std::sync::Mutex<
+            Option<(
+                std::sync::Weak<TaskContext>,
+                Arc<crate::emat_arrow_reader::SharedRgCursor>,
+            )>,
+        >,
+    >,
     properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
 }
@@ -3413,12 +3426,13 @@ impl EmatixFastParquetExec {
         column_stats: Vec<datafusion::common::stats::ColumnStatistics>,
         column_has_no_nulls: Arc<Vec<bool>>,
     ) -> DfResult<Self> {
-        // Morsel-engine P2 spike: one shared work-stealing queue over all
-        // kept row groups (the union of the per-partition assignments).
-        // Sorted for determinism; dynamic pull means order barely matters.
+        // Morsel-engine P2: the kept row groups (union of the per-partition
+        // assignments), sorted. A fresh cursor is minted per execution from
+        // this in `morsel_cursor_for`. Dynamic pull makes order immaterial.
         let mut all_rgs: Vec<usize> = assignments.iter().flatten().copied().collect();
         all_rgs.sort_unstable();
-        let morsel_cursor = Arc::new(crate::emat_arrow_reader::SharedRgCursor::new(all_rgs));
+        let morsel_rgs = Arc::new(all_rgs);
+        let morsel_state = Arc::new(std::sync::Mutex::new(None));
 
         let eq_props = EquivalenceProperties::new(schema.clone());
         let properties = Arc::new(PlanProperties::new(
@@ -3443,10 +3457,36 @@ impl EmatixFastParquetExec {
             column_has_no_nulls,
             runtime_sideband: None,
             extra_runtime_sidebands: Vec::new(),
-            morsel_cursor,
+            morsel_rgs,
+            morsel_state,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
         })
+    }
+
+    /// Morsel-engine P2: get (or mint) the work-stealing cursor for THIS
+    /// execution. Keyed by `TaskContext` identity: all partition streams of
+    /// one execution receive the same `Arc<TaskContext>` (shared cursor),
+    /// while a new execution gets a fresh, undrained cursor. The `Weak`
+    /// guard means a reused `TaskContext` address from a finished run won't
+    /// alias a drained cursor. Safe under plan reuse (plan cache / trials).
+    fn morsel_cursor_for(
+        &self,
+        ctx: &Arc<TaskContext>,
+    ) -> Arc<crate::emat_arrow_reader::SharedRgCursor> {
+        let mut slot = self.morsel_state.lock().unwrap();
+        if let Some((weak, cur)) = slot.as_ref() {
+            if let Some(existing) = weak.upgrade() {
+                if Arc::ptr_eq(&existing, ctx) {
+                    return cur.clone();
+                }
+            }
+        }
+        let cur = Arc::new(crate::emat_arrow_reader::SharedRgCursor::new(
+            (*self.morsel_rgs).clone(),
+        ));
+        *slot = Some((Arc::downgrade(ctx), cur.clone()));
+        cur
     }
 
     /// Σ.Q.L9 — attach a runtime sideband. The scan will consult this
@@ -3602,7 +3642,8 @@ impl EmatixFastParquetExec {
             column_has_no_nulls: self.column_has_no_nulls.clone(),
             runtime_sideband: self.runtime_sideband.clone(),
             extra_runtime_sidebands: self.extra_runtime_sidebands.clone(),
-            morsel_cursor: self.morsel_cursor.clone(),
+            morsel_rgs: self.morsel_rgs.clone(),
+            morsel_state: self.morsel_state.clone(),
             properties: self.properties.clone(),
             metrics: ExecutionPlanMetricsSet::new(),
         }))
@@ -3633,7 +3674,8 @@ impl EmatixFastParquetExec {
             column_has_no_nulls: self.column_has_no_nulls.clone(),
             runtime_sideband: self.runtime_sideband.clone(),
             extra_runtime_sidebands: self.extra_runtime_sidebands.clone(),
-            morsel_cursor: self.morsel_cursor.clone(),
+            morsel_rgs: self.morsel_rgs.clone(),
+            morsel_state: self.morsel_state.clone(),
             properties: self.properties.clone(),
             metrics: ExecutionPlanMetricsSet::new(),
         })
@@ -3656,7 +3698,8 @@ impl EmatixFastParquetExec {
             column_has_no_nulls: self.column_has_no_nulls.clone(),
             runtime_sideband: self.runtime_sideband.clone(),
             extra_runtime_sidebands: self.extra_runtime_sidebands.clone(),
-            morsel_cursor: self.morsel_cursor.clone(),
+            morsel_rgs: self.morsel_rgs.clone(),
+            morsel_state: self.morsel_state.clone(),
             properties: self.properties.clone(),
             metrics: ExecutionPlanMetricsSet::new(),
         }
@@ -3762,7 +3805,7 @@ impl ExecutionPlan for EmatixFastParquetExec {
     fn execute(
         &self,
         partition: usize,
-        _context: Arc<TaskContext>,
+        context: Arc<TaskContext>,
     ) -> DfResult<SendableRecordBatchStream> {
         let row_groups = self.assignments.get(partition).cloned().unwrap_or_default();
         let path = self.path.clone();
@@ -3852,7 +3895,7 @@ impl ExecutionPlan for EmatixFastParquetExec {
         // idle decode threads steal heavy RGs instead of being stuck with
         // a cost-blind static `rg % N` assignment (see P1 findings).
         let morsel_cursor = if std::env::var("EMAT_MORSEL_STEAL").ok().as_deref() == Some("1") {
-            Some(self.morsel_cursor.clone())
+            Some(self.morsel_cursor_for(&context))
         } else {
             None
         };
