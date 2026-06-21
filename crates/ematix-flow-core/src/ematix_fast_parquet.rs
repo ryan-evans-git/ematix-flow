@@ -3386,6 +3386,12 @@ pub struct EmatixFastParquetExec {
     /// extra filter — correctness never depends on it (the join re-applies
     /// every key). Empty in every pre-existing plan shape.
     extra_runtime_sidebands: Vec<crate::bridge_filter_sideband::BridgeFilterSideband>,
+    /// Morsel-engine P2 spike: a shared work-stealing queue over all of
+    /// this scan's kept row groups, created once at construction and
+    /// shared across partition streams. Consulted by `execute()` only
+    /// when `EMAT_MORSEL_STEAL=1` (otherwise the static per-partition
+    /// assignment is used). See [`crate::emat_arrow_reader::SharedRgCursor`].
+    morsel_cursor: Arc<crate::emat_arrow_reader::SharedRgCursor>,
     properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
 }
@@ -3407,6 +3413,13 @@ impl EmatixFastParquetExec {
         column_stats: Vec<datafusion::common::stats::ColumnStatistics>,
         column_has_no_nulls: Arc<Vec<bool>>,
     ) -> DfResult<Self> {
+        // Morsel-engine P2 spike: one shared work-stealing queue over all
+        // kept row groups (the union of the per-partition assignments).
+        // Sorted for determinism; dynamic pull means order barely matters.
+        let mut all_rgs: Vec<usize> = assignments.iter().flatten().copied().collect();
+        all_rgs.sort_unstable();
+        let morsel_cursor = Arc::new(crate::emat_arrow_reader::SharedRgCursor::new(all_rgs));
+
         let eq_props = EquivalenceProperties::new(schema.clone());
         let properties = Arc::new(PlanProperties::new(
             eq_props,
@@ -3430,6 +3443,7 @@ impl EmatixFastParquetExec {
             column_has_no_nulls,
             runtime_sideband: None,
             extra_runtime_sidebands: Vec::new(),
+            morsel_cursor,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
         })
@@ -3588,6 +3602,7 @@ impl EmatixFastParquetExec {
             column_has_no_nulls: self.column_has_no_nulls.clone(),
             runtime_sideband: self.runtime_sideband.clone(),
             extra_runtime_sidebands: self.extra_runtime_sidebands.clone(),
+            morsel_cursor: self.morsel_cursor.clone(),
             properties: self.properties.clone(),
             metrics: ExecutionPlanMetricsSet::new(),
         }))
@@ -3618,6 +3633,7 @@ impl EmatixFastParquetExec {
             column_has_no_nulls: self.column_has_no_nulls.clone(),
             runtime_sideband: self.runtime_sideband.clone(),
             extra_runtime_sidebands: self.extra_runtime_sidebands.clone(),
+            morsel_cursor: self.morsel_cursor.clone(),
             properties: self.properties.clone(),
             metrics: ExecutionPlanMetricsSet::new(),
         })
@@ -3640,6 +3656,7 @@ impl EmatixFastParquetExec {
             column_has_no_nulls: self.column_has_no_nulls.clone(),
             runtime_sideband: self.runtime_sideband.clone(),
             extra_runtime_sidebands: self.extra_runtime_sidebands.clone(),
+            morsel_cursor: self.morsel_cursor.clone(),
             properties: self.properties.clone(),
             metrics: ExecutionPlanMetricsSet::new(),
         }
@@ -3830,6 +3847,16 @@ impl ExecutionPlan for EmatixFastParquetExec {
         let streaming_arrow_reader = self.streaming_arrow_reader;
         let outer_partitions = self.properties.partitioning.partition_count().max(1);
 
+        // Morsel-engine P2 spike: opt-in dynamic work-stealing RG pull.
+        // All partition streams share one cursor over this scan's RGs, so
+        // idle decode threads steal heavy RGs instead of being stuck with
+        // a cost-blind static `rg % N` assignment (see P1 findings).
+        let morsel_cursor = if std::env::var("EMAT_MORSEL_STEAL").ok().as_deref() == Some("1") {
+            Some(self.morsel_cursor.clone())
+        } else {
+            None
+        };
+
         // Σ.Q.L9 — fast path when no runtime sideband is attached
         // (the common case for queries without the L9 rule installed
         // or for scans that aren't probe-side targets of any join).
@@ -3852,6 +3879,7 @@ impl ExecutionPlan for EmatixFastParquetExec {
                 self.rg_num_rows.clone(),
                 None,
                 narrow_i64_leaves,
+                morsel_cursor,
             );
             let stream = narrow_stream_to_advertised(stream, &decode_schema, schema.clone());
             return Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream))
@@ -4040,6 +4068,9 @@ impl ExecutionPlan for EmatixFastParquetExec {
                 rg_num_rows_for_async,
                 late_arm,
                 narrow_i64_leaves,
+                // Morsel P2 doesn't cover the L9-sideband (deferred-
+                // peek) path; keep static assignment here.
+                None,
             )
         };
 
@@ -4234,6 +4265,9 @@ fn build_partition_stream_dispatch(
     // The page-streaming / inline / whole-RG-bridge families ignore
     // this and keep decode-wide + boundary-cast.
     narrow_i64_leaves: Vec<usize>,
+    // Morsel-engine P2 spike: shared work-stealing RG queue (None = the
+    // default static per-partition assignment).
+    shared_cursor: Option<Arc<crate::emat_arrow_reader::SharedRgCursor>>,
 ) -> futures_util::stream::BoxStream<'static, DfResult<RecordBatch>> {
     if streaming_arrow_reader {
         // Σ.E5.1.c — per-partition column-decode thread budget; keep
@@ -4276,6 +4310,7 @@ fn build_partition_stream_dispatch(
             baseline,
             late_arm,
             narrow_i64_leaves,
+            shared_cursor,
         )
     } else {
         // Late-arm has no consumer on this path; the sideband predicate
@@ -4485,6 +4520,10 @@ fn build_streaming_partition_stream(
     // NARROW.DEC — narrowed key leaves for the eager reader (only);
     // see `build_partition_stream_dispatch`.
     narrow_i64_leaves: Vec<usize>,
+    // Morsel-engine P2 spike: when set, this partition's reader pulls
+    // RGs from the shared work queue instead of its static assignment,
+    // and is forced onto the eager reader so every RG is decoded once.
+    shared_cursor: Option<Arc<crate::emat_arrow_reader::SharedRgCursor>>,
 ) -> futures_util::stream::BoxStream<'static, DfResult<RecordBatch>> {
     use futures_util::StreamExt;
 
@@ -4627,8 +4666,15 @@ fn build_streaming_partition_stream(
             && !cache_active
             && row_groups.len() > 1
             && partition_rows >= large_partition_threshold;
-        let use_inline = !has_filter && force_inline.unwrap_or(auto_inline);
-        let use_page_streaming = if has_filter {
+        // Morsel-engine P2 spike: force the eager reader when a shared
+        // cursor is attached — it's the only reader wired to pull from
+        // the shared queue, and routing some partitions to inline/page
+        // would leave their static RGs decoded twice (or never).
+        let use_inline =
+            shared_cursor.is_none() && !has_filter && force_inline.unwrap_or(auto_inline);
+        let use_page_streaming = if shared_cursor.is_some() {
+            false
+        } else if has_filter {
             false
         } else if force_page {
             !use_inline
@@ -4701,6 +4747,10 @@ fn build_streaming_partition_stream(
             }
             if let Some(sb) = late_arm.clone() {
                 builder = builder.with_late_arm(sb, path_buf.clone());
+            }
+            // Morsel-engine P2 spike: dynamic work-stealing RG pull.
+            if let Some(cursor) = shared_cursor.clone() {
+                builder = builder.with_shared_rg_cursor(cursor);
             }
             if let Some(f) = filter.clone() {
                 builder = builder.with_filter(f, path_buf.clone());
