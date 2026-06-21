@@ -113,12 +113,20 @@ pub fn recommend_target_partitions(plan: &LogicalPlan, session_cores: usize) -> 
 // cardinality estimate to get wrong, which is what makes it safe to default ON.
 // ---------------------------------------------------------------------------
 
-/// Multiplier applied to a scalar-aggregation query's `target_partitions`.
-/// 2× was the measured optimum on M4 Max SF=10 (p14→p28).
+/// Multiplier for a scalar aggregation **over a join** (Q14/Q17/Q19). 2× was
+/// the measured optimum on M4 Max SF=10 — a join's hash build fragments under
+/// heavier over-sharding, so it stops short of the decode-bound multiplier.
 pub const SCALAR_AGG_PARTITION_MULTIPLIER: usize = 2;
 
+/// Multiplier for a **join-free** scalar aggregation — a pure scan → filter →
+/// scalar-agg pipeline (Q06). With no join to fragment, the only bottleneck is
+/// scan-decode, so it oversubscribes harder to hide per-row-group decode
+/// latency. Measured M4 Max SF=10: Q06 4× = 22.6 ms vs 2× = 27.2 ms (−16.8%),
+/// matching the morsel P1 partition sweep (Q06 p14/p28/p56 = 37/34/28 ms).
+pub const SCALAR_AGG_DECODE_BOUND_MULTIPLIER: usize = 4;
+
 /// Hard cap on the oversubscribed partition count, to keep the lever sane on
-/// very-high-core boxes (where 2× cores could over-shard).
+/// very-high-core boxes (where the multiplier × cores could over-shard).
 pub const SCALAR_AGG_MAX_PARTITIONS: usize = 64;
 
 /// Whether the scalar-aggregation partition-oversubscription lever is enabled.
@@ -153,24 +161,41 @@ pub fn is_scalar_aggregation(plan: &LogicalPlan) -> bool {
     }
 }
 
-/// The effective oversubscription multiplier. Defaults to
-/// [`SCALAR_AGG_PARTITION_MULTIPLIER`] (2×); `EMAT_SCALAR_AGG_MULT=N` overrides
-/// it for floor-finding sweeps (the morsel P1 data shows scalar/decode-bound
-/// queries can keep improving past 2× — e.g. Q06 p14→p56 = 37→28 ms).
-fn scalar_agg_multiplier() -> usize {
-    std::env::var("EMAT_SCALAR_AGG_MULT")
+/// The oversubscription multiplier for a scalar-agg `plan`:
+/// [`SCALAR_AGG_DECODE_BOUND_MULTIPLIER`] (4×) when the plan has no join — a
+/// pure scan→filter→scalar-agg pipeline whose only bottleneck is scan-decode —
+/// and [`SCALAR_AGG_PARTITION_MULTIPLIER`] (2×) otherwise (a join's hash build
+/// fragments under heavier over-sharding). `EMAT_SCALAR_AGG_MULT=N` forces a
+/// fixed value for both shapes (floor-finding sweeps).
+fn scalar_agg_multiplier_for_plan(plan: &LogicalPlan) -> usize {
+    if let Some(forced) = std::env::var("EMAT_SCALAR_AGG_MULT")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|&m| m >= 1)
-        .unwrap_or(SCALAR_AGG_PARTITION_MULTIPLIER)
+    {
+        return forced;
+    }
+    if plan_has_join(plan) {
+        SCALAR_AGG_PARTITION_MULTIPLIER
+    } else {
+        SCALAR_AGG_DECODE_BOUND_MULTIPLIER
+    }
+}
+
+/// True if `plan` contains any `Join` node, anywhere reachable via `inputs()`.
+fn plan_has_join(plan: &LogicalPlan) -> bool {
+    if matches!(plan, LogicalPlan::Join(_)) {
+        return true;
+    }
+    plan.inputs().iter().any(|i| plan_has_join(i))
 }
 
 /// The oversubscribed partition count for a scalar aggregation, clamped to
 /// `[session_target_partitions, SCALAR_AGG_MAX_PARTITIONS]` so it never reduces
 /// the configured parallelism and never over-shards on big boxes.
-fn oversubscribed_scalar_partitions(session_target_partitions: usize) -> usize {
+fn oversubscribed_scalar_partitions(session_target_partitions: usize, multiplier: usize) -> usize {
     session_target_partitions
-        .saturating_mul(scalar_agg_multiplier())
+        .saturating_mul(multiplier)
         .min(SCALAR_AGG_MAX_PARTITIONS)
         .max(session_target_partitions)
 }
@@ -181,7 +206,10 @@ fn oversubscribed_scalar_partitions(session_target_partitions: usize) -> usize {
 /// and the lever is enabled, otherwise `session_target_partitions` unchanged.
 pub fn scalar_agg_target_partitions(plan: &LogicalPlan, session_target_partitions: usize) -> usize {
     if scalar_agg_boost_enabled() && is_scalar_aggregation(plan) {
-        oversubscribed_scalar_partitions(session_target_partitions)
+        oversubscribed_scalar_partitions(
+            session_target_partitions,
+            scalar_agg_multiplier_for_plan(plan),
+        )
     } else {
         session_target_partitions
     }
@@ -764,16 +792,18 @@ mod tests {
     // --- Scalar-agg oversubscription (morsel down-payment) ---
 
     #[test]
-    fn oversubscribe_doubles_and_clamps() {
-        // M4 Max: 14 → 28 (the measured optimum).
-        assert_eq!(oversubscribed_scalar_partitions(14), 28);
-        // Never reduces below the session default.
-        assert_eq!(oversubscribed_scalar_partitions(1), 2);
-        // Hard cap at 64 on big boxes...
-        assert_eq!(oversubscribed_scalar_partitions(40), 64); // 2×40=80 → 64
-        // ...but a session default ALREADY above the cap is preserved
-        // (max() guard), never reduced.
-        assert_eq!(oversubscribed_scalar_partitions(70), 70);
+    fn oversubscribe_clamps() {
+        // joined scalar agg (2×): M4 Max 14 → 28 (measured optimum).
+        assert_eq!(oversubscribed_scalar_partitions(14, 2), 28);
+        // join-free decode-bound (4×): 14 → 56 (Q06 floor).
+        assert_eq!(oversubscribed_scalar_partitions(14, 4), 56);
+        // never reduces below the session default.
+        assert_eq!(oversubscribed_scalar_partitions(1, 2), 2);
+        // hard cap at 64 (2×40=80 → 64; 4×20=80 → 64).
+        assert_eq!(oversubscribed_scalar_partitions(40, 2), 64);
+        assert_eq!(oversubscribed_scalar_partitions(20, 4), 64);
+        // a session default already above the cap is preserved, never reduced.
+        assert_eq!(oversubscribed_scalar_partitions(70, 2), 70);
     }
 
     #[test]
@@ -787,7 +817,7 @@ mod tests {
             Field::new("b", DataType::Utf8, false),
         ]);
 
-        // SELECT count(a) FROM t  → scalar (empty GROUP BY)
+        // SELECT count(a) FROM t  → scalar (empty GROUP BY), join-free → 4×
         let scalar = table_scan(Some("t"), &schema, None)
             .unwrap()
             .aggregate(Vec::<Expr>::new(), vec![count(col("a"))])
@@ -795,6 +825,11 @@ mod tests {
             .build()
             .unwrap();
         assert!(is_scalar_aggregation(&scalar));
+        assert!(!plan_has_join(&scalar));
+        assert_eq!(
+            scalar_agg_multiplier_for_plan(&scalar),
+            SCALAR_AGG_DECODE_BOUND_MULTIPLIER
+        );
 
         // ...still scalar through a Limit passthrough wrapper.
         let scalar_limited = LogicalPlanBuilder::from(scalar.clone())
@@ -803,6 +838,30 @@ mod tests {
             .build()
             .unwrap();
         assert!(is_scalar_aggregation(&scalar_limited));
+
+        // scalar agg OVER A JOIN → still scalar, but join present → 2×
+        let right = table_scan(Some("u"), &schema, None)
+            .unwrap()
+            .build()
+            .unwrap();
+        let joined = LogicalPlanBuilder::from(
+            table_scan(Some("t"), &schema, None)
+                .unwrap()
+                .build()
+                .unwrap(),
+        )
+        .join(right, JoinType::Inner, (vec!["t.a"], vec!["u.a"]), None)
+        .unwrap()
+        .aggregate(Vec::<Expr>::new(), vec![count(col("t.a"))])
+        .unwrap()
+        .build()
+        .unwrap();
+        assert!(is_scalar_aggregation(&joined));
+        assert!(plan_has_join(&joined));
+        assert_eq!(
+            scalar_agg_multiplier_for_plan(&joined),
+            SCALAR_AGG_PARTITION_MULTIPLIER
+        );
 
         // SELECT count(a) FROM t GROUP BY b  → NOT scalar
         let grouped = table_scan(Some("t"), &schema, None)
