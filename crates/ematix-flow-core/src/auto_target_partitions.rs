@@ -138,6 +138,19 @@ pub fn scalar_agg_boost_enabled() -> bool {
         .unwrap_or(true)
 }
 
+/// Whether the Gate-B join-free LOW-cardinality GROUP BY boost is enabled
+/// (default ON; opt out with `EMAT_LOWCARD_GROUPBY_BOOST=0`). Distinct from
+/// [`scalar_agg_boost_enabled`] so the dictionary-NDV-driven Gate-B mechanism
+/// can be A/B'd or disabled independently of the scalar-agg boost. Gated by
+/// BOTH flags in [`scalar_agg_target_partitions`] (the master switch still
+/// turns everything off).
+pub fn low_card_groupby_boost_enabled() -> bool {
+    std::env::var("EMAT_LOWCARD_GROUPBY_BOOST")
+        .ok()
+        .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+        .unwrap_or(true)
+}
+
 /// Returns `true` if `plan` produces its result via a SCALAR aggregation — an
 /// `Aggregate` with an empty `group_expr` — modulo result-shape-preserving
 /// passthrough wrappers (`Projection` / `Sort` / `Limit` / `SubqueryAlias`)
@@ -200,19 +213,148 @@ fn oversubscribed_scalar_partitions(session_target_partitions: usize, multiplier
         .max(session_target_partitions)
 }
 
+// ---------------------------------------------------------------------------
+// Gate-B (2026-06-21): join-free LOW-CARDINALITY GROUP BY oversubscription.
+//
+// A join-free `GROUP BY` over a small number of groups (Q01: GROUP BY
+// l_returnflag, l_linestatus → 6 groups over a 6M-row scan) is bottlenecked
+// on scan-decode exactly like a join-free SCALAR agg (Q06): the
+// FinalPartitioned hash-table merge is trivially cheap at low cardinality, so
+// the only thing to parallelize is decode. It therefore earns the same
+// decode-bound 4× oversubscription.
+//
+// This is DISJOINT from both other boosts by construction:
+//   * `is_scalar_aggregation` matches only EMPTY group_expr → never overlaps.
+//   * the high-card boost (`walk_for_max_agg_input_cardinality`) estimates
+//     group count from input ROWS and so must EXCLUDE filtered aggregates
+//     (a WHERE shrinks the true group count below the row count). Gate-B
+//     estimates group count from DICTIONARY cardinality instead, which a
+//     WHERE filter does not perturb — that is precisely why Gate-B can boost
+//     Q01 (which is filtered on l_shipdate) where the high-card path cannot.
+//
+// Safety: the NDV per group column is read from the parquet dictionary page
+// headers (exact for fully dict-encoded columns) — a high-card group key like
+// l_orderkey is PLAIN-encoded, so `dict_cardinality` returns None and the gate
+// stays shut. The product threshold is kept conservative; a mis-fire is at
+// worst a bounded 4× partition change (perf-only, never a wrong answer) and is
+// opt-out via `EMAT_SCALAR_AGG_BOOST=0`.
+// ---------------------------------------------------------------------------
+
+/// Product of per-group-column distinct counts at/under which a join-free
+/// GROUP BY is treated as decode-bound (same rationale as
+/// [`SMALL_AGG_GROUP_THRESHOLD`]: the FinalPartitioned hash table is
+/// L3-resident, so the only lever left is parallel decode).
+pub const DECODE_BOUND_GROUPBY_MAX_GROUPS: usize = 50_000;
+
+/// Walk result-shape-preserving passthroughs (`Projection`/`Sort`/`Limit`/
+/// `SubqueryAlias`) down to the top `Aggregate`, if any.
+fn top_aggregate(plan: &LogicalPlan) -> Option<&Aggregate> {
+    let mut node = plan;
+    loop {
+        match node {
+            LogicalPlan::Aggregate(agg) => return Some(agg),
+            LogicalPlan::Projection(p) => node = p.input.as_ref(),
+            LogicalPlan::Sort(s) => node = s.input.as_ref(),
+            LogicalPlan::Limit(l) => node = l.input.as_ref(),
+            LogicalPlan::SubqueryAlias(s) => node = s.input.as_ref(),
+            _ => return None,
+        }
+    }
+}
+
+/// Collect every `TableScan` reachable from `plan`.
+fn collect_table_scans<'a>(plan: &'a LogicalPlan, out: &mut Vec<&'a TableScan>) {
+    if let LogicalPlan::TableScan(scan) = plan {
+        out.push(scan);
+    }
+    for child in plan.inputs() {
+        collect_table_scans(child, out);
+    }
+}
+
+/// Pure core of Gate-B: return the product of group-column distinct counts for
+/// a join-free, bare-column `GROUP BY`, sourcing each column's NDV from the
+/// `ndv_of` closure. Returns `None` if the plan isn't a join-free GROUP BY of
+/// bare columns, or if any group column's NDV is unavailable. Factored out
+/// (NDV via closure) so the plan-shape logic is unit-testable without a real
+/// parquet provider.
+fn low_card_groupby_count_with<F>(plan: &LogicalPlan, ndv_of: F) -> Option<usize>
+where
+    F: Fn(&str) -> Option<usize>,
+{
+    if plan_has_join(plan) {
+        return None;
+    }
+    let agg = top_aggregate(plan)?;
+    if agg.group_expr.is_empty() || !all_group_expr_are_bare_columns(&agg.group_expr) {
+        return None;
+    }
+    let mut product: usize = 1;
+    for e in &agg.group_expr {
+        let Expr::Column(col) = e else { return None };
+        let ndv = ndv_of(col.name.as_str())?;
+        product = product.saturating_mul(ndv.max(1));
+    }
+    Some(product)
+}
+
+/// Production Gate-B estimate: resolve the plan's single EMAT parquet provider
+/// and use its planner-safe dictionary-cardinality peek as the NDV source.
+/// Returns `None` unless the plan reduces to exactly one
+/// [`EmatixFastParquetTableProvider`] scan (so it can't apply to multi-table
+/// or non-parquet plans).
+fn est_low_card_groupby_count(plan: &LogicalPlan) -> Option<usize> {
+    let mut scans: Vec<&TableScan> = Vec::new();
+    collect_table_scans(plan, &mut scans);
+    let [scan] = scans.as_slice() else {
+        return None;
+    };
+    let dts = scan.source.as_any().downcast_ref::<DefaultTableSource>()?;
+    let provider = Arc::clone(&dts.table_provider);
+    // `schema()` / `as_any()` are `TableProvider` trait methods — callable on the
+    // `dyn TableProvider` object without importing the trait; `dict_cardinality`
+    // is an inherent method on the concrete provider.
+    let schema = provider.schema();
+    let emat = provider
+        .as_any()
+        .downcast_ref::<EmatixFastParquetTableProvider>()?;
+    low_card_groupby_count_with(plan, |name| {
+        emat.dict_cardinality(schema.index_of(name).ok()?)
+    })
+}
+
+/// True iff `plan` is a join-free, bare-column GROUP BY whose dictionary-exact
+/// group cardinality is ≤ [`DECODE_BOUND_GROUPBY_MAX_GROUPS`] — the Gate-B
+/// decode-bound shape (Q01).
+fn is_decode_bound_low_card_groupby(plan: &LogicalPlan) -> bool {
+    est_low_card_groupby_count(plan).is_some_and(|n| n <= DECODE_BOUND_GROUPBY_MAX_GROUPS)
+}
+
 /// Given the session's configured `session_target_partitions`, returns the
 /// `target_partitions` to use for `plan`: oversubscribed (see
 /// [`oversubscribed_scalar_partitions`]) when the query is a scalar aggregation
 /// and the lever is enabled, otherwise `session_target_partitions` unchanged.
 pub fn scalar_agg_target_partitions(plan: &LogicalPlan, session_target_partitions: usize) -> usize {
-    if scalar_agg_boost_enabled() && is_scalar_aggregation(plan) {
-        oversubscribed_scalar_partitions(
+    if !scalar_agg_boost_enabled() {
+        return session_target_partitions;
+    }
+    // Scalar aggregation (empty group_expr): Q06/Q14/Q17/Q19.
+    if is_scalar_aggregation(plan) {
+        return oversubscribed_scalar_partitions(
             session_target_partitions,
             scalar_agg_multiplier_for_plan(plan),
-        )
-    } else {
-        session_target_partitions
+        );
     }
+    // Gate-B: join-free LOW-cardinality GROUP BY (Q01). Decode-bound like a
+    // join-free scalar agg, so it gets the same multiplier (4×, since the plan
+    // has no join — and `EMAT_SCALAR_AGG_MULT` overrides both shapes alike).
+    if low_card_groupby_boost_enabled() && is_decode_bound_low_card_groupby(plan) {
+        return oversubscribed_scalar_partitions(
+            session_target_partitions,
+            scalar_agg_multiplier_for_plan(plan),
+        );
+    }
+    session_target_partitions
 }
 
 /// Walks `plan` looking for `Aggregate(group_expr=non-empty)` whose
@@ -878,6 +1020,149 @@ mod tests {
             .build()
             .unwrap();
         assert!(!is_scalar_aggregation(&plain));
+    }
+
+    /// Gate-B pure logic: join-free low-card GROUP BY detection + product,
+    /// with NDV injected via a closure (no real parquet provider needed).
+    #[test]
+    fn gate_b_low_card_groupby_pure_logic() {
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::functions_aggregate::expr_fn::count;
+        use datafusion::logical_expr::{LogicalPlanBuilder, col, table_scan};
+
+        let schema = Schema::new(vec![
+            Field::new("a", DataType::Int64, false),  // measure
+            Field::new("rf", DataType::Utf8, false),  // low-card group key
+            Field::new("ls", DataType::Utf8, false),  // low-card group key
+            Field::new("ok", DataType::Int64, false), // high-card group key
+        ]);
+
+        // Mock dict-NDV source: low-card cols Some(small); high-card Some(big);
+        // anything else (not dict-encoded) → None.
+        let ndv = |name: &str| -> Option<usize> {
+            match name {
+                "rf" => Some(3),
+                "ls" => Some(2),
+                "ok" => Some(1_500_000),
+                _ => None,
+            }
+        };
+
+        // Q01 shape: join-free GROUP BY rf, ls → product 6 → low-card.
+        let q01 = table_scan(Some("t"), &schema, None)
+            .unwrap()
+            .aggregate(vec![col("rf"), col("ls")], vec![count(col("a"))])
+            .unwrap()
+            .build()
+            .unwrap();
+        assert_eq!(low_card_groupby_count_with(&q01, ndv), Some(6));
+        assert!(
+            low_card_groupby_count_with(&q01, ndv)
+                .is_some_and(|n| n <= DECODE_BOUND_GROUPBY_MAX_GROUPS)
+        );
+
+        // High-card GROUP BY ok → product 1.5M → over threshold (gate shut).
+        let hi = table_scan(Some("t"), &schema, None)
+            .unwrap()
+            .aggregate(vec![col("ok")], vec![count(col("a"))])
+            .unwrap()
+            .build()
+            .unwrap();
+        assert_eq!(low_card_groupby_count_with(&hi, ndv), Some(1_500_000));
+        assert!(
+            low_card_groupby_count_with(&hi, ndv)
+                .is_none_or(|n| n > DECODE_BOUND_GROUPBY_MAX_GROUPS)
+        );
+
+        // Group column with no dict-NDV available → None → gate can't fire.
+        let unknown = table_scan(Some("t"), &schema, None)
+            .unwrap()
+            .aggregate(vec![col("a")], vec![count(col("rf"))])
+            .unwrap()
+            .build()
+            .unwrap();
+        assert_eq!(low_card_groupby_count_with(&unknown, ndv), None);
+
+        // Scalar agg (empty group_expr) → None here (handled by scalar path).
+        let scalar = table_scan(Some("t"), &schema, None)
+            .unwrap()
+            .aggregate(Vec::<Expr>::new(), vec![count(col("a"))])
+            .unwrap()
+            .build()
+            .unwrap();
+        assert_eq!(low_card_groupby_count_with(&scalar, ndv), None);
+
+        // Low-card GROUP BY OVER A JOIN → excluded (Gate-B is join-free only).
+        let right = table_scan(Some("u"), &schema, None)
+            .unwrap()
+            .build()
+            .unwrap();
+        let joined = LogicalPlanBuilder::from(
+            table_scan(Some("t"), &schema, None)
+                .unwrap()
+                .build()
+                .unwrap(),
+        )
+        .join(right, JoinType::Inner, (vec!["t.a"], vec!["u.a"]), None)
+        .unwrap()
+        .aggregate(vec![col("t.rf")], vec![count(col("t.a"))])
+        .unwrap()
+        .build()
+        .unwrap();
+        assert_eq!(low_card_groupby_count_with(&joined, ndv), None);
+    }
+
+    /// Gate-B end-to-end against real SF=10 lineitem: Q01's GROUP BY
+    /// l_returnflag, l_linestatus (6 groups) over a single join-free scan must
+    /// (a) resolve a tiny dict-NDV product via `dict_cardinality`, and
+    /// (b) boost `scalar_agg_target_partitions` above session cores. Skipped if
+    /// SF=10 data is missing. Validates the provider accessor + downcast +
+    /// name→index mapping that the pure-logic test can't.
+    #[tokio::test]
+    async fn gate_b_fires_for_q01_sf10() -> Result<(), Box<dyn std::error::Error>> {
+        use crate::ematix_fast_parquet::EmatixFastParquetTableProvider;
+        use datafusion::prelude::SessionContext;
+        use std::path::PathBuf;
+        use std::sync::Arc;
+
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .map(|p| p.join("examples/tpch/data/sf10"));
+        let Some(dir) = dir else { return Ok(()) };
+        if !dir.exists() {
+            eprintln!("skip: sf10 data missing");
+            return Ok(());
+        }
+        let ctx = SessionContext::new();
+        let path = dir.join("lineitem.parquet");
+        let prov = EmatixFastParquetTableProvider::try_new(path.to_string_lossy())?;
+        ctx.register_table("lineitem", Arc::new(prov))?;
+
+        let q01 = std::fs::read_to_string(
+            dir.parent()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .join("queries/q01.sql"),
+        )?;
+        let plan = ctx.sql(&q01).await?.into_optimized_plan()?;
+
+        // The dict-NDV product for the two low-card group keys is tiny.
+        let est = est_low_card_groupby_count(&plan);
+        assert!(
+            est.is_some_and(|n| n <= DECODE_BOUND_GROUPBY_MAX_GROUPS),
+            "Q01 low-card group estimate should be Some(small); got {est:?} \
+             (are l_returnflag/l_linestatus dict-encoded in every RG?)"
+        );
+
+        // …so Gate-B boosts the join-free decode-bound query above cores.
+        let boosted = scalar_agg_target_partitions(&plan, 14);
+        assert!(
+            boosted > 14,
+            "Gate-B should oversubscribe Q01 above session cores; got {boosted}"
+        );
+        Ok(())
     }
 
     /// Integration test against real Q18 SF=10 logical plan. Verifies
