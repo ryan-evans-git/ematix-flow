@@ -32,6 +32,7 @@
 //!   - `EMAT_AGG_SEMI=0`   disables the agg-semi pushdown
 //!   - `EMAT_DIM_PUSH=0`   disables the dim-join pushdown
 //!   - `EMAT_Q20_SEMI=0`   disables the q20 transitive semi-pushdown
+//!   - `EMAT_TRANSITIVE_DIM_SEMI=0` disables the Q05 transitive dim-semi splice
 //!   - `EMAT_REORDER_QP=0` disables the join reorder
 
 use std::sync::Arc;
@@ -88,17 +89,21 @@ impl FlowQueryPlanner {
                 plan = p;
             }
         }
-        // Σ.Q05 / #352 (OPT-IN: EMAT_TRANSITIVE_DIM_SEMI=1 until the 22q
-        // sweep gate flips it): transitive dim-semi into deep join inputs.
-        // When a filtered dim constrains a mid-dim scan and the key class
-        // reaches a deep scan only transitively (Q05: customer via
-        // c_nationkey = s_nationkey = n_nationkey), splice
-        // `T ⋉ (mid-dim ⋈ dim)` below — Q05's orders⋈customer build drops
-        // 2.28M → 456K keys at SF=10, which the L9 tight rescue (deep-semi
-        // cap) then turns into a 3%-pass-rate lineitem scan wrap, DuckDB's
-        // runtime-scan-filter shape. No-op on the other 21 TPC-H shapes
-        // (pinned by `transitive_join_semi_no_op_on_direct_dim_shapes`).
-        if std::env::var("EMAT_TRANSITIVE_DIM_SEMI").as_deref() == Ok("1") {
+        // Σ.Q05 / #352 (DEFAULT-ON, opt-out EMAT_TRANSITIVE_DIM_SEMI=0):
+        // transitive dim-semi into deep join inputs. When a filtered dim
+        // constrains a mid-dim scan and the key class reaches a deep scan only
+        // transitively (Q05: customer via c_nationkey = s_nationkey =
+        // n_nationkey), splice `T ⋉ (mid-dim ⋈ dim)` below — Q05's
+        // orders⋈customer build drops 2.28M → 456K keys at SF=10, which the L9
+        // tight rescue (deep-semi cap) then turns into a ~4%-pass-rate lineitem
+        // scan wrap (60M → 2.56M), DuckDB's runtime-scan-filter shape. No-op on
+        // the other 21 TPC-H shapes (pinned by
+        // `transitive_join_semi_no_op_on_direct_dim_shapes` + verified Q17
+        // plan-identity). Flipped default-on after the 2026-06-21 22q SF=10
+        // sweep gate: Q05 147→131 ms (DuckDB 141) = the 22nd SF=10 win; depends
+        // on the build_side_bloom drop-cap fix (#159) so the 456K-key build
+        // emits a right-sized (~0.85% FP) bloom rather than a saturated one.
+        if enabled("EMAT_TRANSITIVE_DIM_SEMI") {
             if let Ok(p) =
                 crate::agg_filter_pushdown::push_transitive_dim_semi_into_join_chain(plan.clone())
             {
@@ -318,12 +323,13 @@ mod tests {
         );
     }
 
-    /// Σ.Q05 / #352: with `EMAT_TRANSITIVE_DIM_SEMI=1` the planner
-    /// rewrite must splice `customer ⋉ (nation ⋈ region[ASIA])` into
-    /// Q05 (and survive the downstream reorder step); without the env
-    /// the rule stays off — OPT-IN until the 22q sweep gate flips it.
+    /// Σ.Q05 / #352: the planner rewrite splices `customer ⋉ (nation ⋈
+    /// region[ASIA])` into Q05 BY DEFAULT (the 2026-06-21 22q SF=10 sweep gate
+    /// flipped it default-on — it turns Q05 from a ~7% DuckDB loss into a
+    /// ~1.07× win and is plan-inert on the other 21 shapes). Opt-out via
+    /// `EMAT_TRANSITIVE_DIM_SEMI=0`.
     #[tokio::test]
-    async fn rewrite_applies_q05_transitive_dim_semi_opt_in() {
+    async fn rewrite_applies_q05_transitive_dim_semi_default_on() {
         let Some((ctx, dir)) = ctx_with_planner().await else {
             eprintln!("skipping: sf1 data missing");
             return;
@@ -340,28 +346,30 @@ mod tests {
         };
         let optimized = ctx.sql(&sql).await.unwrap().into_optimized_plan().unwrap();
 
-        let off = format!(
+        // SAFETY: test-local toggle; the only env reader is rewrite(), and this
+        // is the sole test mutating EMAT_TRANSITIVE_DIM_SEMI.
+        // Default (env unset): the splice fires.
+        unsafe { std::env::remove_var("EMAT_TRANSITIVE_DIM_SEMI") };
+        let on = format!(
             "{}",
             FlowQueryPlanner::rewrite(optimized.clone()).display_indent()
         );
-        // SAFETY: test-local toggle; the only readers are rewrite() calls,
-        // and the rule is a no-op on every shape other tests plan.
-        unsafe { std::env::set_var("EMAT_TRANSITIVE_DIM_SEMI", "1") };
-        let on = format!("{}", FlowQueryPlanner::rewrite(optimized).display_indent());
+        // Opt-out (env=0): the splice stays off.
+        unsafe { std::env::set_var("EMAT_TRANSITIVE_DIM_SEMI", "0") };
+        let off = format!("{}", FlowQueryPlanner::rewrite(optimized).display_indent());
         unsafe { std::env::remove_var("EMAT_TRANSITIVE_DIM_SEMI") };
 
         assert!(
-            !off.contains("customer.c_nationkey = nation.n_nationkey"),
-            "rule must stay OFF without the env (opt-in):\n{off}"
+            on.contains("customer.c_nationkey = nation.n_nationkey"),
+            "splice must fire BY DEFAULT (default-on):\n{on}"
         );
         assert!(
-            on.contains("customer.c_nationkey = nation.n_nationkey"),
-            "EMAT_TRANSITIVE_DIM_SEMI=1 must splice the customer⋉nation⋈region semi \
-             through the full rewrite chain (incl. reorder):\n{on}"
+            !off.contains("customer.c_nationkey = nation.n_nationkey"),
+            "EMAT_TRANSITIVE_DIM_SEMI=0 must opt OUT:\n{off}"
         );
         assert!(
             on.matches("LeftSemi").count() > off.matches("LeftSemi").count(),
-            "the splice must ADD a LeftSemi.\noff:\n{off}\non:\n{on}"
+            "the splice must ADD a LeftSemi when on.\noff:\n{off}\non:\n{on}"
         );
     }
 }
