@@ -25,6 +25,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Opt out with `EMAT_SCALAR_AGG_BOOST=0`; `EMAT_SCALAR_AGG_MULT=N` forces a
   fixed multiplier.
 
+- **Gate-B: join-free low-cardinality `GROUP BY` partition oversubscription
+  (default-on).** Extends the scalar-agg boost to a query that is a join-free
+  `GROUP BY` over a *small* number of groups (TPC-H Q01: `GROUP BY
+  l_returnflag, l_linestatus` → 6 groups over a 6M-row scan). Such a query is
+  decode-bound exactly like a join-free scalar agg — the FinalPartitioned hash
+  table is trivially L3-resident at low cardinality, so the only thing to
+  parallelize is scan-decode — and it gets the same 4× oversubscription. The
+  group cardinality is read from the parquet **dictionary page headers** via a
+  new planner-safe `EmatixFastParquetTableProvider::dict_cardinality()` peek
+  (exact NDV for fully dict-encoded columns, read decompress-free and memoized;
+  deliberately *not* written into `column_stats` so it can't perturb the cost
+  model). The gate fires only when every group column is fully dict-encoded
+  with a product ≤ 50K, so a high-cardinality key (e.g. `l_orderkey`, which is
+  PLAIN-encoded) yields `None` and the gate stays shut. Unlike the row-count
+  based high-card boost, the dictionary estimate is unaffected by a `WHERE`
+  filter, so Gate-B can boost Q01 (filtered on `l_shipdate`) where the
+  high-card path correctly abstains. Strict interleaved A/B (Apple M4 Max,
+  SF=10): **Q01 −6.0% (228→214 ms)**, the only query above the 2σ bar; 0
+  regressions across the other 21; `tpch_validate` Q01 matches DuckDB at the
+  boosted partition count. Opt out with `EMAT_LOWCARD_GROUPBY_BOOST=0`.
+
 ## [0.11.0] — 2026-06-19
 
 Benchmark-accuracy + performance release. No Python API changes; the

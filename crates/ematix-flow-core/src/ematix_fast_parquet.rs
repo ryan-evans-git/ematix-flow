@@ -1862,6 +1862,16 @@ pub struct EmatixFastParquetTableProvider {
     /// builder methods untouched: narrowing is independent of the Utf8View /
     /// Dictionary string rewrites, so a narrowed key stays Int32 regardless.
     narrowed_leaves: Arc<Vec<usize>>,
+    /// Gate-B (2026-06-21): lazily-filled, memoized per-column dictionary
+    /// cardinality (MAX `DictionaryPageHeader.num_values` across row groups),
+    /// `None` for columns not dict-encoded in every RG. Read decompress-free
+    /// from dict page headers on first `dict_cardinality()` call and cached
+    /// here, so it costs nothing unless a join-free low-card GROUP BY plan
+    /// actually queries it (Q01). Deliberately NOT written into
+    /// `column_stats.distinct_count` — keeping it out of the planner-visible
+    /// stats avoids the cost-model perturbation that makes the dict-distinct
+    /// walk unsafe to run eagerly for fact tables (Σ.Q06.SF10.5.h).
+    dict_cardinality_memo: Arc<OnceLock<Vec<Option<usize>>>>,
 }
 
 /// Σ.Q06.SF10 (2026-05-28): cached metadata-derived state for
@@ -2249,6 +2259,7 @@ impl EmatixFastParquetTableProvider {
             // Q13/Q16/Q19/Q22). Closing them is the next bite.
             streaming_arrow_reader: true,
             narrowed_leaves,
+            dict_cardinality_memo: Arc::new(OnceLock::new()),
         })
     }
 
@@ -2272,6 +2283,7 @@ impl EmatixFastParquetTableProvider {
             // on (see `use_cache` in try_new_opt), so a cached entry always
             // reflects a non-narrowed schema → no narrowed leaves.
             narrowed_leaves: Arc::new(Vec::new()),
+            dict_cardinality_memo: Arc::new(OnceLock::new()),
         }
     }
 
@@ -2287,6 +2299,43 @@ impl EmatixFastParquetTableProvider {
     /// Whether the late-mat path is enabled (Σ.E5a).
     pub fn late_mat(&self) -> bool {
         self.late_mat
+    }
+
+    /// Gate-B (2026-06-21): exact distinct-value count for column `col_idx`
+    /// when it is dictionary-encoded in *every* row group, else `None`.
+    ///
+    /// For a fully dict-encoded column the per-row-group dictionary holds
+    /// exactly that RG's distinct values, so the MAX `num_values` across RGs
+    /// is the column's NDV (an exact value for the common single-RG-domain
+    /// case; a lower bound only for pathologically value-clustered columns,
+    /// which the sole caller guards against with a conservative threshold).
+    ///
+    /// Read decompress-free from the dict page headers
+    /// ([`crate::emat_parquet_metadata::dict_distinct_max_per_column`]) on the
+    /// first call and memoized for the provider's lifetime. Returns `None`
+    /// (never panics) on any read error. This is a *planner-safe* NDV peek:
+    /// the value is NOT written into `column_stats.distinct_count`, so it
+    /// cannot perturb the cost model — that perturbation, not the I/O, is why
+    /// the dict-distinct walk is otherwise skipped for fact tables
+    /// (Σ.Q06.SF10.5.h).
+    pub fn dict_cardinality(&self, col_idx: usize) -> Option<usize> {
+        // Fast reject without touching the file: a column that isn't dict in
+        // every RG has no reliable dict-NDV (and a high-card group key like
+        // l_orderkey is PLAIN, so this short-circuits it with zero I/O).
+        if !self
+            .column_is_dict_encoded
+            .get(col_idx)
+            .copied()
+            .unwrap_or(false)
+        {
+            return None;
+        }
+        let memo = self.dict_cardinality_memo.get_or_init(|| {
+            let n = self.schema.fields().len();
+            crate::emat_parquet_metadata::dict_distinct_max_per_column(&self.path, n)
+                .unwrap_or_else(|_| vec![None; n])
+        });
+        memo.get(col_idx).copied().flatten()
     }
 
     /// Σ.E3b: opt into reader-level dict preservation for Utf8
