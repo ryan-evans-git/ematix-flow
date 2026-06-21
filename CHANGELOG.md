@@ -18,33 +18,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   join (Q14/Q17/Q19) → 2× (a join's hash build fragments under heavier
   over-sharding). The gate is "final aggregation has empty `group_expr`", so it
   is disjoint from every `GROUP BY` query by construction and cannot touch the
-  high-cardinality aggregations that regress under oversubscription. Strict
-  interleaved A/B (Apple M4 Max, SF=10): **Q17 −30.5%, Q06 −29.8%, Q19 −7.5%**,
-  net 22q −3.2%; every non-scalar query runs a byte-identical plan;
-  `tpch_validate` Q06/Q14/Q17/Q19 match DuckDB at the boosted partition counts.
-  Opt out with `EMAT_SCALAR_AGG_BOOST=0`; `EMAT_SCALAR_AGG_MULT=N` forces a
-  fixed multiplier.
+  high-cardinality aggregations that regress under oversubscription. Measured on
+  the **production preset path** (`tpch_preset_bench`, the config the distributed
+  worker runs — not the triangulation harness), Apple M4 Max, SF=10, median of 5
+  invocations × 20 trials, boost off vs on: **Q17 −32.7% (128.5→86.4 ms), Q06
+  −25.3% (38.0→28.3 ms), Q19 −2.4%**; every non-scalar query runs a
+  byte-identical plan; `tpch_validate` Q06/Q14/Q17/Q19 match DuckDB at the
+  boosted partition counts. Opt out with `EMAT_SCALAR_AGG_BOOST=0`;
+  `EMAT_SCALAR_AGG_MULT=N` forces a fixed multiplier.
 
-- **Gate-B: join-free low-cardinality `GROUP BY` partition oversubscription
-  (default-on).** Extends the scalar-agg boost to a query that is a join-free
-  `GROUP BY` over a *small* number of groups (TPC-H Q01: `GROUP BY
-  l_returnflag, l_linestatus` → 6 groups over a 6M-row scan). Such a query is
-  decode-bound exactly like a join-free scalar agg — the FinalPartitioned hash
-  table is trivially L3-resident at low cardinality, so the only thing to
-  parallelize is scan-decode — and it gets the same 4× oversubscription. The
-  group cardinality is read from the parquet **dictionary page headers** via a
-  new planner-safe `EmatixFastParquetTableProvider::dict_cardinality()` peek
-  (exact NDV for fully dict-encoded columns, read decompress-free and memoized;
-  deliberately *not* written into `column_stats` so it can't perturb the cost
-  model). The gate fires only when every group column is fully dict-encoded
-  with a product ≤ 50K, so a high-cardinality key (e.g. `l_orderkey`, which is
-  PLAIN-encoded) yields `None` and the gate stays shut. Unlike the row-count
-  based high-card boost, the dictionary estimate is unaffected by a `WHERE`
-  filter, so Gate-B can boost Q01 (filtered on `l_shipdate`) where the
-  high-card path correctly abstains. Strict interleaved A/B (Apple M4 Max,
-  SF=10): **Q01 −6.0% (228→214 ms)**, the only query above the 2σ bar; 0
-  regressions across the other 21; `tpch_validate` Q01 matches DuckDB at the
-  boosted partition count. Opt out with `EMAT_LOWCARD_GROUPBY_BOOST=0`.
+- **Planner-safe dictionary-cardinality peek + Gate-B low-card `GROUP BY`
+  oversubscription (opt-in, default-OFF infra).** Adds
+  `EmatixFastParquetTableProvider::dict_cardinality(col_idx)` — a planner-safe
+  exact-NDV peek for fully dict-encoded columns, read decompress-free from the
+  dict page headers and memoized, deliberately *not* written into
+  `column_stats` so it cannot perturb the cost model. On top of it, "Gate-B"
+  oversubscribes partitions for a join-free low-cardinality `GROUP BY` (the
+  product of group-column dict-NDVs ≤ 50K). **Default OFF after a faithful
+  preset-path re-measure:** the lever's only TPC-H target (Q01) is **neutral**
+  in production (+1.9%, within noise) because Q01's plan is a fused
+  multi-aggregate over 60M rows that is CPU-throughput-bound — it saturates all
+  cores at the default partition count, so oversubscribing the scan has no
+  decode-latency stall to hide (unlike the genuinely scalar Q06/Q17). The
+  triangulation-bench −6% that motivated it did not replicate on the preset
+  path. The dict-cardinality peek is correct, reusable infra; the boost is
+  retained as opt-in for future decode-latency-bound low-card shapes via
+  `EMAT_LOWCARD_GROUPBY_BOOST=1`.
 
 ## [0.11.0] — 2026-06-19
 

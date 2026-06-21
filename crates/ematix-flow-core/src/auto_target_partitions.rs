@@ -138,17 +138,29 @@ pub fn scalar_agg_boost_enabled() -> bool {
         .unwrap_or(true)
 }
 
-/// Whether the Gate-B join-free LOW-cardinality GROUP BY boost is enabled
-/// (default ON; opt out with `EMAT_LOWCARD_GROUPBY_BOOST=0`). Distinct from
-/// [`scalar_agg_boost_enabled`] so the dictionary-NDV-driven Gate-B mechanism
-/// can be A/B'd or disabled independently of the scalar-agg boost. Gated by
-/// BOTH flags in [`scalar_agg_target_partitions`] (the master switch still
-/// turns everything off).
+/// Whether the Gate-B join-free LOW-cardinality GROUP BY boost is enabled.
+///
+/// **Default OFF (opt-in via `EMAT_LOWCARD_GROUPBY_BOOST=1`).** The lever was
+/// shipped default-on (PR #157) on the strength of a triangulation-bench Q01
+/// −6% A/B, but a faithful **preset-path** re-measure (the config the
+/// distributed worker / `tpch_preset_bench` actually run) showed it is neutral
+/// on Q01 (+1.9%, within noise). Root cause: Q01's plan is
+/// `FusedAggregateExec(FilterMultiAgg) → EmatixFastParquetExec`, and the fused
+/// 8-aggregate compute over 60M rows is **CPU-throughput-bound** — it saturates
+/// all cores at the default partition count, so oversubscribing the scan adds
+/// no benefit (there is no decode-LATENCY stall to hide, unlike the genuinely
+/// scalar Q06/Q17). The gate's premise ("a low-card group-by is decode-bound
+/// like a scalar agg") does not hold when the per-group aggregate is heavy.
+/// The mechanism (dictionary-NDV peek + downcast) is correct and kept as
+/// opt-in infra for future decode-latency-bound low-card shapes; it just isn't
+/// a win on TPC-H. Distinct flag from [`scalar_agg_boost_enabled`] so it can be
+/// A/B'd independently; gated by BOTH flags in
+/// [`scalar_agg_target_partitions`].
 pub fn low_card_groupby_boost_enabled() -> bool {
     std::env::var("EMAT_LOWCARD_GROUPBY_BOOST")
         .ok()
-        .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
-        .unwrap_or(true)
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
 }
 
 /// Returns `true` if `plan` produces its result via a SCALAR aggregation — an
@@ -1148,7 +1160,10 @@ mod tests {
         )?;
         let plan = ctx.sql(&q01).await?.into_optimized_plan()?;
 
-        // The dict-NDV product for the two low-card group keys is tiny.
+        // The dict-cardinality machinery works on real data: the dict-NDV
+        // product for the two low-card group keys resolves to a tiny number
+        // (proves the planner-safe dict_cardinality peek + provider downcast +
+        // name→index mapping all work end-to-end against real parquet).
         let est = est_low_card_groupby_count(&plan);
         assert!(
             est.is_some_and(|n| n <= DECODE_BOUND_GROUPBY_MAX_GROUPS),
@@ -1156,11 +1171,14 @@ mod tests {
              (are l_returnflag/l_linestatus dict-encoded in every RG?)"
         );
 
-        // …so Gate-B boosts the join-free decode-bound query above cores.
-        let boosted = scalar_agg_target_partitions(&plan, 14);
-        assert!(
-            boosted > 14,
-            "Gate-B should oversubscribe Q01 above session cores; got {boosted}"
+        // Gate-B is OPT-IN (default off): a faithful preset-path re-measure
+        // showed it neutral on Q01 (the fused multi-agg is CPU-bound, not
+        // decode-latency-bound — see `low_card_groupby_boost_enabled` docs), so
+        // the DEFAULT path must NOT boost. (Opt in via EMAT_LOWCARD_GROUPBY_BOOST=1.)
+        assert_eq!(
+            scalar_agg_target_partitions(&plan, 14),
+            14,
+            "Gate-B is opt-in (default off) → no partition boost by default"
         );
         Ok(())
     }
