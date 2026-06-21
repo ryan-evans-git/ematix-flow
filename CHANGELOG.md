@@ -45,6 +45,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   retained as opt-in for future decode-latency-bound low-card shapes via
   `EMAT_LOWCARD_GROUPBY_BOOST=1`.
 
+- **LZ4_RAW parquet storage: `optimize-table` tool + reader support.** New
+  `optimize-table` example/tool rewrites a parquet table with **per-column codec
+  selection** — LZ4_RAW for compressible columns, UNCOMPRESSED for incompressible
+  ones (ratio ≈ 1.0, where there's nothing to decompress) — and the production
+  `emat_arrow_reader` now decodes LZ4_RAW. Tables stored LZ4_RAW read **19–28%
+  faster** on ematix than Snappy, because the engine's SIMD LZ4 decode beats its
+  Snappy decode. This is a **storage/product feature** (faster reads on tables
+  ematix owns), not a competitive-benchmark lever — other engines decode LZ4
+  faster too, so it does not change the relative TPC-H standing (see
+  `docs/plans/PARQUET_WRITER_SCOPE.md`).
+
 ## [0.11.0] — 2026-06-19
 
 Benchmark-accuracy + performance release. No Python API changes; the
