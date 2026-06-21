@@ -555,6 +555,74 @@ async fn compute_auto_target_partitions(
     }
 }
 
+/// Scalar-final-agg partition oversubscription (morsel-engine down-payment,
+/// default ON; `EMAT_SCALAR_AGG_BOOST=0` to disable). Memoized per SQL string:
+/// builds a minimal plan ONCE and returns `Some(2×session_partitions)` when the
+/// query's result is a scalar aggregate (TPC-H Q06/Q14/Q17/Q19), else `None`.
+/// Mirrors the production `FlowQueryPlanner` boost so the bench measures the
+/// exact shipped mechanism (both reach the scan via `target_partitions`).
+static SCALAR_AGG_CACHE: OnceLock<Mutex<HashMap<String, Option<usize>>>> = OnceLock::new();
+
+fn scalar_agg_cache() -> &'static Mutex<HashMap<String, Option<usize>>> {
+    SCALAR_AGG_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The session `target_partitions` `build_ematix_ctx` will use (PARTITIONS env,
+/// else available_parallelism). Kept in sync with that fn so the 2× boost is
+/// relative to the same base.
+fn bench_session_partitions() -> usize {
+    std::env::var("PARTITIONS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(14)
+        })
+}
+
+async fn scalar_agg_partitions_lookup(data_dir: &Path, sql: &str) -> Option<usize> {
+    {
+        let guard = scalar_agg_cache().lock().unwrap();
+        if let Some(v) = guard.get(sql) {
+            return *v;
+        }
+    }
+    let result = compute_scalar_agg_partitions(data_dir, sql).await;
+    scalar_agg_cache()
+        .lock()
+        .unwrap()
+        .insert(sql.to_string(), result);
+    result
+}
+
+async fn compute_scalar_agg_partitions(data_dir: &Path, sql: &str) -> Option<usize> {
+    let session_partitions = bench_session_partitions();
+    // Minimal SessionContext just to parse + optimize the SQL for shape
+    // detection (partition count is irrelevant to scalar-agg detection).
+    let ctx = SessionContext::new();
+    for t in TPCH_TABLES {
+        let path = data_dir.join(format!("{t}.parquet"));
+        if !path.exists() {
+            return None;
+        }
+        if *t == "lineitem" {
+            let prov = EmatixFastParquetTableProvider::try_new(path.to_string_lossy()).ok()?;
+            ctx.register_table(*t, Arc::new(prov)).ok()?;
+        } else {
+            let prov = FastParquetTableProvider::try_new(path.to_string_lossy()).ok()?;
+            ctx.register_table(*t, Arc::new(prov)).ok()?;
+        }
+    }
+    let df = ctx.sql(sql).await.ok()?;
+    let plan = df.into_optimized_plan().ok()?;
+    let n = ematix_flow_core::auto_target_partitions::scalar_agg_target_partitions(
+        &plan,
+        session_partitions,
+    );
+    (n > session_partitions).then_some(n)
+}
+
 /// Σ.AΩ Phase 1.4 — populate `aggregate_observations` for every
 /// query in `query_subset` by executing each once at the session-
 /// default partition count and walking the physical plan for the
@@ -1096,6 +1164,18 @@ async fn run_ematix_flow(data_dir: &Path, sql: &str) -> Trial {
         auto_rec.target_partitions
     } else {
         None
+    };
+    // Scalar-final-agg partition oversubscription (morsel-engine down-payment,
+    // default ON; opt-out EMAT_SCALAR_AGG_BOOST=0). Mirrors production's
+    // FlowQueryPlanner boost: scalar-aggregate queries (Q06/Q14/Q17/Q19) get
+    // 2× target_partitions. Only applies when the auto path hasn't already
+    // chosen an override. Memoized per SQL, so only trial 1 builds the probe.
+    let target_partitions_override = match target_partitions_override {
+        Some(n) => Some(n),
+        None if ematix_flow_core::auto_target_partitions::scalar_agg_boost_enabled() => {
+            scalar_agg_partitions_lookup(data_dir, sql).await
+        }
+        None => None,
     };
     // Σ.AΩ Phase 2.1: set EMAT_BATCH_SIZE just before constructing
     // the providers so `env_batch_size()` in the readers picks up
