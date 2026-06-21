@@ -86,10 +86,10 @@ impl PhysicalOptimizerRule for BroadcastSiblingBloomsRule {
         plan: Arc<dyn ExecutionPlan>,
         _config: &ConfigOptions,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
-        if std::env::var_os("EMAT_L9_BROADCAST_SIBLINGS").is_none() {
+        if !crate::flags::present("EMAT_L9_BROADCAST_SIBLINGS") {
             return Ok(plan);
         }
-        let trace = std::env::var_os("EMAT_L9_TRACE").is_some();
+        let trace = crate::flags::present("EMAT_L9_TRACE");
 
         // Pass 1: identify emitters + primary target scans.
         //

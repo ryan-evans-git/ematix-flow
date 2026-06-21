@@ -343,7 +343,7 @@ pub fn reorder_inner_joins_with_opts(
                         && !aggkey
                         && !composite
                         && !blind;
-                    if std::env::var("EMAT_REORDER_DEBUG").is_ok() {
+                    if crate::flags::present("EMAT_REORDER_DEBUG") {
                         eprintln!(
                             "[reorder-gate] leaves={n} eff_max_leaves={eff_max_leaves} too_few={too_few} too_many={too_many} ambiguous={ambiguous} like={like} aggkey={aggkey} composite={composite} blind={blind} -> {}",
                             if pass { "PASS" } else { "REJECT" }
@@ -653,9 +653,7 @@ fn estimate_leaf_card_known(plan: &LogicalPlan) -> Option<u64> {
 /// safety valve. INERT on real-stats providers (the production Emat path),
 /// where `estimate_leaf_card_known == estimate_leaf_card`.
 fn reorder_stats_aware_gate_on() -> bool {
-    std::env::var("EMAT_REORDER_STATS_AWARE_GATE")
-        .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
-        .unwrap_or(true)
+    crate::flags::enabled("EMAT_REORDER_STATS_AWARE_GATE")
 }
 
 /// #316: effective leaf cap for `chain` under `opts`. With the stats-aware gate
@@ -991,7 +989,7 @@ fn rebuild_reordered(chain: &InnerJoinChain) -> Option<LogicalPlan> {
         &chain.leaves,
     ));
 
-    if std::env::var("EMAT_REORDER_DEBUG").is_ok() {
+    if crate::flags::present("EMAT_REORDER_DEBUG") {
         eprintln!("[reorder] chain with {n} leaves");
         for (i, leaf) in chain.leaves.iter().enumerate() {
             eprintln!(
@@ -1021,7 +1019,7 @@ fn rebuild_reordered(chain: &InnerJoinChain) -> Option<LogicalPlan> {
     // Bail to greedy fallback if N > MAX_DP_LEAVES.
     const MAX_DP_LEAVES: usize = 12;
     if n > MAX_DP_LEAVES {
-        if std::env::var("EMAT_REORDER_DEBUG").is_ok() {
+        if crate::flags::present("EMAT_REORDER_DEBUG") {
             eprintln!("[reorder] BAIL: chain too long for DP ({n} > {MAX_DP_LEAVES})");
         }
         return None;
@@ -1129,7 +1127,7 @@ fn rebuild_reordered(chain: &InnerJoinChain) -> Option<LogicalPlan> {
     let final_state = dp[total - 1].as_ref()?;
     let order = final_state.order.clone();
 
-    if std::env::var("EMAT_REORDER_DEBUG").is_ok() {
+    if crate::flags::present("EMAT_REORDER_DEBUG") {
         eprintln!(
             "[reorder] DP chose order = {order:?} cost={} final_card={}",
             final_state.cost, final_state.card
@@ -1142,7 +1140,7 @@ fn rebuild_reordered(chain: &InnerJoinChain) -> Option<LogicalPlan> {
     // wall-time wins (Q05/Q08) from the regressors (Q07/Q02/Q11/Q21).
     // `is_noop` flags chains where the DP reproduced the input order
     // (the rewrite bails just below) — those should show ratio ≈ 1.0.
-    if std::env::var("EMAT_REORDER_COST").is_ok() {
+    if crate::flags::present("EMAT_REORDER_COST") {
         let input_order: Vec<usize> = (0..n).collect();
         if let Some((in_cost, _)) = cost_of_fixed_order(&input_order, &cards, chain, &all_equi) {
             let ratio = final_state.cost as f64 / in_cost.max(1) as f64;
@@ -1166,7 +1164,7 @@ fn rebuild_reordered(chain: &InnerJoinChain) -> Option<LogicalPlan> {
         return None;
     }
 
-    if std::env::var("EMAT_REORDER_DEBUG").is_ok() {
+    if crate::flags::present("EMAT_REORDER_DEBUG") {
         eprintln!("[reorder] chosen order = {order:?}");
     }
 
@@ -1187,7 +1185,7 @@ fn rebuild_reordered(chain: &InnerJoinChain) -> Option<LogicalPlan> {
         if matching.is_empty() {
             // Shouldn't happen given the connectivity check above,
             // but defensive guard.
-            if std::env::var("EMAT_REORDER_DEBUG").is_ok() {
+            if crate::flags::present("EMAT_REORDER_DEBUG") {
                 eprintln!(
                     "[reorder] BAIL at rebuild: step {step} leaf[{leaf_idx}] no preds in scope"
                 );
@@ -1205,7 +1203,7 @@ fn rebuild_reordered(chain: &InnerJoinChain) -> Option<LogicalPlan> {
         current = match current.join(leaf, JoinType::Inner, (left_keys, right_keys), None) {
             Ok(b) => b,
             Err(e) => {
-                if std::env::var("EMAT_REORDER_DEBUG").is_ok() {
+                if crate::flags::present("EMAT_REORDER_DEBUG") {
                     eprintln!("[reorder] BAIL: join at step {step} err: {e}");
                 }
                 return None;
@@ -1215,7 +1213,7 @@ fn rebuild_reordered(chain: &InnerJoinChain) -> Option<LogicalPlan> {
 
     // All predicates should be placed.
     if !remaining_preds.is_empty() {
-        if std::env::var("EMAT_REORDER_DEBUG").is_ok() {
+        if crate::flags::present("EMAT_REORDER_DEBUG") {
             eprintln!(
                 "[reorder] BAIL: {} predicates unplaced after rebuild",
                 remaining_preds.len()

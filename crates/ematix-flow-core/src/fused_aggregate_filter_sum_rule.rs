@@ -255,7 +255,7 @@ fn try_match_filter_sum_plan(
     // filtered EmatScan with no join/bloom in between — see
     // `strip_redundant_scan_filter`). Default-on; opt out with
     // EMAT_NO_STRIP_FUSED_SCAN_FILTER=1. See [[q06-masked-pushdown-waste]].
-    let scan = if std::env::var_os("EMAT_NO_STRIP_FUSED_SCAN_FILTER").is_some() {
+    let scan = if crate::flags::present("EMAT_NO_STRIP_FUSED_SCAN_FILTER") {
         scan
     } else {
         crate::ematix_fast_parquet::strip_redundant_scan_filter(scan)

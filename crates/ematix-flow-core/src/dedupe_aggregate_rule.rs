@@ -308,10 +308,7 @@ fn has_float_aggregate(agg: &AggregateExec) -> bool {
 /// on the critical path (lower core count, higher SF, CPU-contended
 /// concurrency) gets the win automatically.
 fn cse_filter_fusion_enabled() -> bool {
-    std::env::var("EMAT_CSE_FILTER_FUSION")
-        .ok()
-        .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
-        .unwrap_or(true)
+    crate::flags::enabled("EMAT_CSE_FILTER_FUSION")
 }
 
 /// Structural hash of an ExecutionPlan subtree. Two subtrees with the

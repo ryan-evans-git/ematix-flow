@@ -139,18 +139,12 @@ pub struct ForceCollectLeftForSemiBoundedBuildRule {
 
 impl Default for ForceCollectLeftForSemiBoundedBuildRule {
     fn default() -> Self {
-        let min_probe_build_ratio = std::env::var("EMAT_COLLECT_LEFT_MIN_RATIO")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0.0);
+        let min_probe_build_ratio = crate::flags::f64_or("EMAT_COLLECT_LEFT_MIN_RATIO", 0.0);
         // REV.17.3: DEFAULT-ON. Multi-scale gated (SF=100 −9.8%, SF=10
         // −7.2%, SF=1 −4.1%, zero real regressions, all 22 row counts
         // identical). K=16 is the broadcast break-even ratio. Opt-out via
         // EMAT_COLLECT_LEFT_BROADCAST_RATIO=0.
-        let broadcast_ratio = std::env::var("EMAT_COLLECT_LEFT_BROADCAST_RATIO")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(16.0);
+        let broadcast_ratio = crate::flags::f64_or("EMAT_COLLECT_LEFT_BROADCAST_RATIO", 16.0);
         Self {
             min_probe_build_ratio,
             broadcast_ratio,
@@ -359,7 +353,7 @@ impl PhysicalOptimizerRule for ForceCollectLeftForSemiBoundedBuildRule {
         plan: Arc<dyn ExecutionPlan>,
         config: &ConfigOptions,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let trace = std::env::var_os("EMAT_COLLECT_LEFT_TRACE").is_some();
+        let trace = crate::flags::present("EMAT_COLLECT_LEFT_TRACE");
         let rewritten = plan.transform_up(|node| {
             let Some(hj) = node.as_any().downcast_ref::<HashJoinExec>() else {
                 return Ok(Transformed::no(node));
@@ -407,7 +401,7 @@ impl PhysicalOptimizerRule for ForceCollectLeftForSemiBoundedBuildRule {
             // Default OFF per [[optimizer-codegen-sensitivity]]; the env check
             // short-circuits before any subtree walk when unset. Opt in with
             // `EMAT_NDV_BUILD_SIDE=1`.
-            if is_inner && std::env::var("EMAT_NDV_BUILD_SIDE").as_deref() == Ok("1") {
+            if is_inner && crate::flags::opt_in("EMAT_NDV_BUILD_SIDE") {
                 let lf = ndv_correction_factor(hj.left());
                 let rf = ndv_correction_factor(hj.right());
                 // Only act when some side was actually under-credited.

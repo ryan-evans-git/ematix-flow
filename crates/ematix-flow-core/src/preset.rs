@@ -204,7 +204,7 @@ pub fn with_optimizer_rules_and_registry(
         }));
     // Σ.AJ.1 Lever B POC: opt-in via EMAT_L9_BROADCAST_SIBLINGS=1.
     // Default OFF. See `crates/ematix-flow-core/src/broadcast_sibling_blooms_rule.rs`.
-    let builder = if std::env::var_os("EMAT_L9_BROADCAST_SIBLINGS").is_some() {
+    let builder = if crate::flags::present("EMAT_L9_BROADCAST_SIBLINGS") {
         crate::broadcast_sibling_blooms_rule::install_broadcast_sibling_blooms_rule(builder)
     } else {
         builder
@@ -226,12 +226,7 @@ pub fn with_optimizer_rules_and_registry(
     // if all three walkers are disabled.
     let flow_qp_on = ["EMAT_AGG_SEMI", "EMAT_DIM_PUSH", "EMAT_REORDER_QP"]
         .iter()
-        .any(|var| {
-            std::env::var(var)
-                .ok()
-                .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
-                .unwrap_or(true)
-        })
+        .any(|var| crate::flags::enabled(var))
         || crate::auto_target_partitions::scalar_agg_boost_enabled();
     let builder = if flow_qp_on {
         builder.with_query_planner(Arc::new(crate::flow_query_planner::FlowQueryPlanner))

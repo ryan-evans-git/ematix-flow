@@ -44,10 +44,7 @@ use crate::join_reorder::flatten_inner_join_chain;
 
 /// `true` iff `EMAT_PUSH_PIPELINE=1` (shared with the PV.3 physical fuse).
 pub fn enabled() -> bool {
-    std::env::var("EMAT_PUSH_PIPELINE")
-        .ok()
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
+    crate::flags::opt_in("EMAT_PUSH_PIPELINE")
 }
 
 /// One dimension group: the non-fact leaves reachable from a single fact FK.

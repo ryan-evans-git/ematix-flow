@@ -173,7 +173,7 @@ impl PhysicalOptimizerRule for InjectFilterMultiAggRule {
 fn try_match_filter_multi_agg_plan(
     node: &Arc<dyn ExecutionPlan>,
 ) -> DfResult<Option<Arc<dyn ExecutionPlan>>> {
-    if std::env::var_os("EMAT_DISABLE_FILTER_MULTI_AGG").is_some() {
+    if crate::flags::present("EMAT_DISABLE_FILTER_MULTI_AGG") {
         return Ok(None);
     }
     let Some(matched) = filter_multi_agg_shape().try_match(node) else {
@@ -353,7 +353,7 @@ fn try_build_replacement(matched: &MatchedSubtree) -> DfResult<Option<Arc<dyn Ex
     // indices against the original scan schema, which is unchanged).
     // Default-on; validated net-positive in the 22q SF=10 strict A/B
     // (0 regressions). Opt out with EMAT_NO_STRIP_FUSED_SCAN_FILTER=1.
-    let scan = if std::env::var_os("EMAT_NO_STRIP_FUSED_SCAN_FILTER").is_some() {
+    let scan = if crate::flags::present("EMAT_NO_STRIP_FUSED_SCAN_FILTER") {
         scan
     } else {
         crate::ematix_fast_parquet::strip_redundant_scan_filter(scan)
@@ -368,11 +368,9 @@ fn try_build_replacement(matched: &MatchedSubtree) -> DfResult<Option<Arc<dyn Ex
     // EMAT_FILTER_MULTI_AGG_USE_REPARTITION=1 re-enables the old
     // RepartitionExec-based fanout for A/B testing.
     let input_for_fused: Arc<dyn ExecutionPlan> =
-        if std::env::var_os("EMAT_FILTER_MULTI_AGG_USE_REPARTITION").is_some() {
-            let target_partitions: usize = std::env::var("EMAT_FILTER_MULTI_AGG_FANOUT")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(18);
+        if crate::flags::present("EMAT_FILTER_MULTI_AGG_USE_REPARTITION") {
+            let target_partitions: usize =
+                crate::flags::usize_or("EMAT_FILTER_MULTI_AGG_FANOUT", 18);
             let scan_partitions = scan.properties().partitioning.partition_count();
             if target_partitions > scan_partitions {
                 Arc::new(RepartitionExec::try_new(

@@ -132,10 +132,7 @@ pub const SCALAR_AGG_MAX_PARTITIONS: usize = 64;
 /// Whether the scalar-aggregation partition-oversubscription lever is enabled.
 /// Default ON; opt out with `EMAT_SCALAR_AGG_BOOST=0` (or `false`).
 pub fn scalar_agg_boost_enabled() -> bool {
-    std::env::var("EMAT_SCALAR_AGG_BOOST")
-        .ok()
-        .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
-        .unwrap_or(true)
+    crate::flags::enabled("EMAT_SCALAR_AGG_BOOST")
 }
 
 /// Whether the Gate-B join-free LOW-cardinality GROUP BY boost is enabled.
@@ -157,10 +154,7 @@ pub fn scalar_agg_boost_enabled() -> bool {
 /// A/B'd independently; gated by BOTH flags in
 /// [`scalar_agg_target_partitions`].
 pub fn low_card_groupby_boost_enabled() -> bool {
-    std::env::var("EMAT_LOWCARD_GROUPBY_BOOST")
-        .ok()
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
+    crate::flags::opt_in("EMAT_LOWCARD_GROUPBY_BOOST")
 }
 
 /// Returns `true` if `plan` produces its result via a SCALAR aggregation — an

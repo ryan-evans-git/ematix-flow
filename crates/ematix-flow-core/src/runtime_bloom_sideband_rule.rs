@@ -127,22 +127,16 @@ impl Default for EnableRuntimeBloomSidebandRule {
         // (build/probe ≈ 1/4) where the bloom can't be selective.
         // Honor `EMAT_RT_BLOOM_SELECTIVITY=N` override at construction
         // for ad-hoc bench tuning.
-        let ratio = std::env::var("EMAT_RT_BLOOM_SELECTIVITY")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(64);
+        let ratio = crate::flags::usize_or("EMAT_RT_BLOOM_SELECTIVITY", 64);
         // Σ.Q.L14 (2026-05-23): default-OFF for Inner joins even with
         // the col_idx bug fixed. The L4'-style "bloom-on-FK is
         // net-negative" pattern holds whenever the join's build is
         // unfiltered. Opt-in via `EMAT_RT_BLOOM_INNER_JOIN=1` when
         // the build IS pre-filtered.
-        let allow_inner_join = std::env::var_os("EMAT_RT_BLOOM_INNER_JOIN").is_some();
+        let allow_inner_join = crate::flags::present("EMAT_RT_BLOOM_INNER_JOIN");
         // L9.SelectiveBuild defaults to true. Override via
         // `EMAT_L9_REQUIRE_FILTERED_BUILD=0` for A/B benching.
-        let require_filtered_build = std::env::var("EMAT_L9_REQUIRE_FILTERED_BUILD")
-            .ok()
-            .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
-            .unwrap_or(true);
+        let require_filtered_build = crate::flags::enabled("EMAT_L9_REQUIRE_FILTERED_BUILD");
         // Σ.AH.3 Story 2a: per-partition absolute ceiling on build size.
         // OPT-IN — default 0 (disabled). The Story 2a bench measured no
         // baseline wall-time improvement (existing `require_filtered_build`
@@ -152,15 +146,10 @@ impl Default for EnableRuntimeBloomSidebandRule {
         // Lever remains opt-in via `EMAT_L9_MAX_EXPECTED_KEYS=N` for
         // hypothetical future shape regressions where the existing gates
         // are insufficient.
-        let max_expected_keys_per_partition = std::env::var("EMAT_L9_MAX_EXPECTED_KEYS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
+        let max_expected_keys_per_partition =
+            crate::flags::usize_or("EMAT_L9_MAX_EXPECTED_KEYS", 0);
         // L9.WIDTH — see the field docs; env override for tuning.
-        let min_probe_proj_cols = std::env::var("EMAT_L9_MIN_PROBE_PROJ_COLS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
+        let min_probe_proj_cols = crate::flags::usize_or("EMAT_L9_MIN_PROBE_PROJ_COLS", 0);
         Self {
             min_probe_to_build_ratio: ratio,
             allow_inner_join,
@@ -182,7 +171,7 @@ impl PhysicalOptimizerRule for EnableRuntimeBloomSidebandRule {
         // line reason for fire / skip. Helps explain missing wraps
         // (column-type mismatch, no probe scan reachable, gate
         // rejection). No-op when the env var is unset.
-        let trace = std::env::var_os("EMAT_L9_TRACE").is_some();
+        let trace = crate::flags::present("EMAT_L9_TRACE");
         plan.transform_up(|node| {
             let Some(hj) = node.as_any().downcast_ref::<HashJoinExec>() else {
                 return Ok(Transformed::no(node));
@@ -216,10 +205,7 @@ impl PhysicalOptimizerRule for EnableRuntimeBloomSidebandRule {
             // current shape — kept as opt-in infra for future shapes
             // where the inner-HJ bloom path doesn't cover the outer.
             // Default OFF; set `EMAT_L9_INNER_WITH_SEMI=1` to enable.
-            let am1_enabled = std::env::var("EMAT_L9_INNER_WITH_SEMI")
-                .ok()
-                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-                .unwrap_or(false);
+            let am1_enabled = crate::flags::opt_in("EMAT_L9_INNER_WITH_SEMI");
             let build_has_semi = am1_enabled && build_subtree_has_semi_filter(hj.left());
             if matches!(hj.join_type(), JoinType::Inner)
                 && !self.allow_inner_join
@@ -1013,10 +999,7 @@ fn local_dict_ndv(path: &str, file_rows: usize, col_idx: usize) -> Option<usize>
     use std::collections::HashMap;
     use std::sync::Mutex;
     use std::sync::OnceLock;
-    let max_rows: usize = std::env::var("EMAT_L9_NDV_MAX_ROWS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(10_000_000);
+    let max_rows: usize = crate::flags::usize_or("EMAT_L9_NDV_MAX_ROWS", 10_000_000);
     if max_rows == 0 || file_rows > max_rows {
         return None;
     }

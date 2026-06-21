@@ -53,9 +53,7 @@ fn widens_to_i64(dt: &DataType) -> bool {
 /// as a stock operator. Tightly gated by the probe-cardinality floor (the v1
 /// build is single-threaded, so this must be a big-fact probe to pay off).
 fn partitioned_enabled() -> bool {
-    std::env::var("EMAT_HJ_PARTITIONED")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
+    crate::flags::opt_in("EMAT_HJ_PARTITIONED")
 }
 
 /// Strip Hash `RepartitionExec` / `CoalesceBatchesExec` wrappers to recover the
@@ -142,14 +140,8 @@ fn try_swap(hj: &HashJoinExec) -> Option<EmatixHashJoinExec> {
     // The probe must clear the floor; Absent probe stats → block (a real fact probe
     // has known stats). `EMAT_HJ_RATIO` (default 0/off) is an optional extra
     // build-ratio constraint kept for A/B reproducibility.
-    let min_probe: usize = std::env::var("EMAT_HJ_MIN_PROBE")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(12_000_000);
-    let ratio: usize = std::env::var("EMAT_HJ_RATIO")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
+    let min_probe: usize = crate::flags::usize_or("EMAT_HJ_MIN_PROBE", 12_000_000);
+    let ratio: usize = crate::flags::usize_or("EMAT_HJ_RATIO", 0);
     if partitioned && min_probe == 0 && ratio == 0 {
         return None;
     }
@@ -294,14 +286,11 @@ impl PhysicalOptimizerRule for SwapEmatixHashJoinRule {
         config: &ConfigOptions,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
         // Opt-in. Dormant unless explicitly enabled.
-        let enabled = std::env::var("EMAT_HASH_JOIN")
-            .ok()
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
+        let enabled = crate::flags::opt_in("EMAT_HASH_JOIN");
         if !enabled {
             return Ok(plan);
         }
-        let trace = std::env::var_os("EMAT_HASH_JOIN_TRACE").is_some();
+        let trace = crate::flags::present("EMAT_HASH_JOIN_TRACE");
         // `batch_size` feeds the post-swap CoalesceBatchesExec (HJ.5c): the kernel
         // emits ONE output batch per probe input batch, so a low-hit-rate fact probe
         // produces tiny survivor batches (Q17: 61.4 K rows over 916 batches ≈ 67
