@@ -4742,9 +4742,7 @@ fn build_streaming_partition_stream(
         // would leave their static RGs decoded twice (or never).
         let use_inline =
             shared_cursor.is_none() && !has_filter && force_inline.unwrap_or(auto_inline);
-        let use_page_streaming = if shared_cursor.is_some() {
-            false
-        } else if has_filter {
+        let use_page_streaming = if shared_cursor.is_some() || has_filter {
             false
         } else if force_page {
             !use_inline

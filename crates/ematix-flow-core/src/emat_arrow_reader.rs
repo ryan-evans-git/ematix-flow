@@ -2451,10 +2451,9 @@ impl Iterator for EmatArrowBatchReader {
                 // from the shared work queue if one is attached, else
                 // walk the static per-partition assignment.
                 let rg = match &self.shared_cursor {
-                    Some(cursor) => match cursor.pop() {
-                        Some(rg) => rg,
-                        None => return None,
-                    },
+                    // `?` returns None from `next()` (end of stream) when the
+                    // shared work queue is drained.
+                    Some(cursor) => cursor.pop()?,
                     None => {
                         if self.cur_rg_idx >= self.row_groups.len() {
                             return None;
