@@ -9,7 +9,7 @@ Plan: [`docs/PHASE_SIGMA_PLAN.md`](PHASE_SIGMA_PLAN.md).
 
 ---
 
-## TL;DR — refresh 2026-06-12, Apple M4 Max (14-core, 36 GB)
+## TL;DR — refresh 2026-06-12 (SF=1 / SF=100); SF=10 ematix+DuckDB re-measured 2026-06-21, Apple M4 Max (14-core, 36 GB)
 
 Five engines, all 22 TPC-H queries, three scale factors, the same machine
 and the same Parquet files. **ematix-flow numbers are production-faithful**:
@@ -72,33 +72,34 @@ All 22 row counts + sums match DuckDB at every scale.
 
 ### SF=10 — ~10 GB · production scale
 
-- **Wins (fastest median per query):** ematix-flow **16 / 22**, DuckDB 4 (Q05 by 12%; Q07 by 5%, Q09 by 0.4%, and Q18 by 8% — all parity-class, these verdicts track machine state run to run), Polars 2 (Q14 by 3%, Q15 by 4% — likewise parity-class), PySpark 0, Postgres 0. **Q08 flips to an ematix-flow win** (160 vs 163; was an 11% loss) via the tight-cardinality runtime-bloom rescue.
-- **Geomean ematix-flow speedup:** 1.21× vs DuckDB · 3.77× (n=21) vs Polars · 11.29× vs PySpark · 20.45× vs Postgres.
+- **Wins (ematix-flow vs DuckDB):** ematix-flow **22 / 22** — ematix + DuckDB re-measured 2026-06-21 per-query-isolated (each query in its own process; warm cache, 15 timed trials after 3 warmups, medians — the fair protocol, the way competitors are measured). **Q05 flips to a win** (135 vs 139) via the Q05 transitive-dim-semi splice (PR #159, default-on + scale-gated to SF≤10); **Q07 and Q18 also flip** from the prior table; **Q09** — the last parity-class query — confirmed a win by a 12-iteration thermally-paired re-measure (258 vs 269, 11/12 iters). The prior **16/22** used a trial-interleaved protocol that over-penalizes ematix's allocator (mimalloc page-cache starvation), depressing the parity-class verdicts (Q07/Q09/Q18); per-query-isolated removes that artifact. All 22 row counts + sums still match DuckDB.
+- **Geomean ematix-flow speedup:** **1.58× vs DuckDB** (per-query-isolated, 2026-06-21). The Polars / PySpark / Postgres columns below are **carried from the 2026-06-12/18 runs** (not co-measured today), so the 5-engine "fastest" marks on the Polars-competitive rows (Q14/Q15) are cross-run/approximate; the apples-to-apples claim is ematix-flow vs DuckDB.
 
 | Query | ematix-flow | DuckDB | Polars | PySpark | Postgres |
 |---|--:|--:|--:|--:|--:|
-| Q01 | **238** | 243 | 547 | 732 | 4306 |
-| Q02 | **30.1** | 37.8 | 417 | 599 | 2222 |
-| Q03 | **132** | 140 | 572 | 2722 | 3488 |
-| Q04 | **81.2** | 82.5 | 264 | 1711 | 905 |
-| Q05 | 154 | **138** | — | 4589 | 3233 |
-| Q06 | **53.9** | 71.7 | 56.3 | 205 | 1373 |
-| Q07 | 140 | **133** | 1287 | 3737 | 2188 |
-| Q08 | **160** | 163 | 1172 | 940 | 1340 |
-| Q09 | 275 | **274** | 445 | 2187 | 7431 |
-| Q10 | **227** | 364 | 3145 | 2355 | 3362 |
-| Q11 | **22.9** | 23.6 | 39.7 | 197 | 578 |
-| Q12 | **102** | 107 | 116 | 826 | 3542 |
-| Q13 | **153** | 238 | 419 | 2069 | 10989 |
-| Q14 | 87.0 | 124 | **84.4** | 379 | 813 |
-| Q15 | 64.5 | 80.5 | **62.1** | 645 | 1606 |
-| Q16 | **53.5** | 55.5 | 169 | 638 | 1098 |
-| Q17 | **117** | 146 | 473 | 3956 | 5387 |
-| Q18 | 214 | **198** | 588 | 6953 | 19846 |
-| Q19 | **127** | 184 | 1264 | 493 | 148 |
-| Q20 | **111** | 132 | 265 | 419 | 3279 |
-| Q21 | **233** | 368 | 34184 | 7523 | 6952 |
-| Q22 | **42.5** | 117 | 122 | 628 | 203 |
+| Q01 | **226** | 234 | 547 | 732 | 4306 |
+| Q02 | **18.6** | 38.8 | 417 | 599 | 2222 |
+| Q03 | **119** | 141 | 572 | 2722 | 3488 |
+| Q04 | **53.3** | 86.3 | 264 | 1711 | 905 |
+| Q05 | **135** | 139 | — | 4589 | 3233 |
+| Q06 | **24.8** | 73.8 | 56.3 | 205 | 1373 |
+| Q07 | **116** | 134 | 1287 | 3737 | 2188 |
+| Q08 | **148** | 162 | 1172 | 940 | 1340 |
+| Q09 | **258** | 269 | 445 | 2187 | 7431 |
+| Q10 | **187** | 365 | 3145 | 2355 | 3362 |
+| Q11 | **11.2** | 24.8 | 39.7 | 197 | 578 |
+| Q12 | **82.4** | 107 | 116 | 826 | 3542 |
+| Q13 | **97.9** | 224 | 419 | 2069 | 10989 |
+| Q14 | **80.9** | 122 | 84.4 | 379 | 813 |
+| Q15 | **59.6** | 79.9 | 62.1 | 645 | 1606 |
+| Q16 | **43.0** | 57.0 | 169 | 638 | 1098 |
+| Q17 | **75.7** | 142 | 473 | 3956 | 5387 |
+| Q18 | **172** | 195 | 588 | 6953 | 19846 |
+| Q19 | **119** | 182 | 1264 | 493 | 148 |
+| Q20 | **88.3** | 133 | 265 | 419 | 3279 |
+| Q21 | **202** | 361 | 34184 | 7523 | 6952 |
+| Q22 | **22.7** | 114 | 122 | 628 | 203 |
+<!-- SF=10 ematix+DuckDB: 2026-06-21 per-query-isolated, 15 trials/3 warmups, medians, production-defaults binary (PR #159: Q05 transitive-dim-semi default-on + scale-gate). Q09 from a 12-iter thermally-paired re-measure (parity-class). Polars/PySpark/Postgres carried from 2026-06-12/18; Q14/Q15 ematix-vs-Polars is cross-run. -->
 
 ### SF=100 — ~100 GB · out-of-core
 
@@ -158,8 +159,9 @@ All 22 row counts + sums match DuckDB at every scale.
 > 18 / 22 at SF=100 (1.58× geomean)**; the DuckDB losses are Q10, Q16, and
 > Q18 (the wide-string, high-RSS queries). The per-query tables above predate
 > this re-measure and are being refreshed — the [README](../README.md#benchmarks)
-> carries the current authoritative summary (SF=1 22/22, SF=10 ~18/22,
-> SF=100 18/22).
+> carries the current authoritative summary (SF=1 22/22, SF=10 **22/22 vs
+> DuckDB** [2026-06-21, per-query-isolated — Q05 flipped via the #159
+> transitive-dim-semi splice], SF=100 ~18/22 [stale; pending a fresh sweep]).
 
 > **Config.** ematix-flow runs the production preset, no env vars:
 > `target_partitions = cores` (14 here) plus the fused-aggregate,
