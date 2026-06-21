@@ -220,6 +220,10 @@ pub fn with_optimizer_rules_and_registry(
     // self-gated inside FlowQueryPlanner (EMAT_AGG_SEMI / EMAT_DIM_PUSH /
     // EMAT_REORDER_QP, all default ON, opt-OUT). Installed unless all three
     // are disabled.
+    // FlowQueryPlanner also carries the scalar-agg partition-oversubscription
+    // boost (morsel down-payment, 2026-06-20), which is independent of the
+    // three walkers — so keep the planner installed when that lever is on even
+    // if all three walkers are disabled.
     let flow_qp_on = ["EMAT_AGG_SEMI", "EMAT_DIM_PUSH", "EMAT_REORDER_QP"]
         .iter()
         .any(|var| {
@@ -227,7 +231,8 @@ pub fn with_optimizer_rules_and_registry(
                 .ok()
                 .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
                 .unwrap_or(true)
-        });
+        })
+        || crate::auto_target_partitions::scalar_agg_boost_enabled();
     let builder = if flow_qp_on {
         builder.with_query_planner(Arc::new(crate::flow_query_planner::FlowQueryPlanner))
     } else {

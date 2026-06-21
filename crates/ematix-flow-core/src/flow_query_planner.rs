@@ -122,6 +122,32 @@ impl QueryPlanner for FlowQueryPlanner {
         session_state: &SessionState,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let planned = Self::rewrite(logical_plan.clone());
+        // Scalar-agg partition oversubscription (morsel-engine down-payment,
+        // 2026-06-20): a query whose result is a SCALAR aggregate (no GROUP BY
+        // — TPC-H Q06/Q14/Q17/Q19) plans with 2× `target_partitions` so the
+        // upstream scan-decode and joins parallelize (hiding per-row-group
+        // decode latency) while the single-row final merge stays ~free.
+        // Measured M4 Max SF=10: Q17 −28%, Q06 −10%, no regressions. Disjoint
+        // from every GROUP BY query by construction (`is_scalar_aggregation`
+        // matches ONLY empty group_expr), so it cannot touch the
+        // high-cardinality aggregations that regress under oversubscription.
+        //
+        // Mechanism: clone the session state with the boosted count and thread
+        // it through BOTH the re-optimize below AND the physical planner, so
+        // `EnforceDistribution` propagates the count and each `scan()` reads it
+        // (the scan's partition count = min(num_row_groups, target_partitions)).
+        // Opt out: `EMAT_SCALAR_AGG_BOOST=0`.
+        let session_default = session_state.config().options().execution.target_partitions;
+        let boosted =
+            crate::auto_target_partitions::scalar_agg_target_partitions(&planned, session_default);
+        let boosted_state = if boosted > session_default {
+            let mut s = session_state.clone();
+            s.config_mut().options_mut().execution.target_partitions = boosted;
+            Some(s)
+        } else {
+            None
+        };
+        let session_state = boosted_state.as_ref().unwrap_or(session_state);
         // Σ.BR Phase 2 / #194b (2026-05-29): re-optimize the rewritten plan.
         // `SessionState::create_physical_plan` optimizes the plan and *then*
         // invokes the query planner, so the plan we receive is already
