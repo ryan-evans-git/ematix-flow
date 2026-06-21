@@ -7,7 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-(no entries yet)
+### Added
+
+- **Scalar-aggregation partition oversubscription (default-on; morsel-engine
+  down-payment).** A query whose result is a scalar aggregation — no `GROUP BY`
+  (TPC-H Q06/Q14/Q17/Q19) — plans with oversubscribed `target_partitions` so
+  the upstream scan-decode and joins parallelize across the extra partitions
+  while the single-row final merge stays ~free. Shape-aware multiplier: a
+  join-free scan→agg (Q06) is purely decode-bound → 4×; a scalar agg over a
+  join (Q14/Q17/Q19) → 2× (a join's hash build fragments under heavier
+  over-sharding). The gate is "final aggregation has empty `group_expr`", so it
+  is disjoint from every `GROUP BY` query by construction and cannot touch the
+  high-cardinality aggregations that regress under oversubscription. Strict
+  interleaved A/B (Apple M4 Max, SF=10): **Q17 −30.5%, Q06 −29.8%, Q19 −7.5%**,
+  net 22q −3.2%; every non-scalar query runs a byte-identical plan;
+  `tpch_validate` Q06/Q14/Q17/Q19 match DuckDB at the boosted partition counts.
+  Opt out with `EMAT_SCALAR_AGG_BOOST=0`; `EMAT_SCALAR_AGG_MULT=N` forces a
+  fixed multiplier.
 
 ## [0.11.0] — 2026-06-19
 
