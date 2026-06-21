@@ -153,6 +153,8 @@ pub mod emat_arrow_reader;
 // Morsel-engine P1 de-risk: env-gated per-RG decode trace (per-core
 // busy/idle timeline). See docs/plans/MORSEL_ENGINE.md.
 pub mod morsel_trace;
+// Morsel-engine P2: shape-gate work-stealing decode on for join-feeding scans.
+pub mod enable_morsel_steal_rule;
 // Σ.Q06.SF10.5.a (2026-05-28): ematix-parquet-based metadata helpers
 // replacing specific parquet-rs paths inside
 // `EmatixFastParquetTableProvider::try_new`. Currently exposes the

@@ -617,6 +617,15 @@ pub fn with_optimizer_rules_overridden(
     builder = builder.with_physical_optimizer_rule(Arc::new(
         crate::fused_cumulative_window::InjectCumulativeWindowRule,
     ));
+    // Morsel-engine P2: shape-gate work-stealing decode ON for scans that
+    // feed a join (Q14/Q17/Q18 −6..−18%); leaves scan→fused-agg (Q06)
+    // alone, where the concurrent-decode contention tax has nothing to
+    // overlap and regresses. Runs LAST so it sees the final join shape and
+    // preserves any L9 sideband via clone_internals. `EMAT_MORSEL_STEAL=1/0`
+    // force-overrides per-scan. See enable_morsel_steal_rule.
+    builder = builder.with_physical_optimizer_rule(Arc::new(
+        crate::enable_morsel_steal_rule::EnableMorselStealRule,
+    ));
     let flow_qp_on = o.flow_query_planner
         && (["EMAT_AGG_SEMI", "EMAT_DIM_PUSH", "EMAT_REORDER_QP"]
             .iter()

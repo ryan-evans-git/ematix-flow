@@ -3405,6 +3405,12 @@ pub struct EmatixFastParquetExec {
             )>,
         >,
     >,
+    /// Morsel-engine P2: per-scan opt-in for work-stealing decode, set by
+    /// `EnableMorselStealRule` for scans that feed a join (where balancing
+    /// the scan lets the join pipeline overlap). Off for scan→agg shapes
+    /// (Q06-class), where the decode contention tax has nothing to overlap
+    /// and regresses. `EMAT_MORSEL_STEAL=1/0` force-overrides this flag.
+    morsel_steal: bool,
     properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
 }
@@ -3459,9 +3465,18 @@ impl EmatixFastParquetExec {
             extra_runtime_sidebands: Vec::new(),
             morsel_rgs,
             morsel_state,
+            morsel_steal: false,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
         })
+    }
+
+    /// Morsel-engine P2: return a clone with work-stealing decode enabled
+    /// for this scan. Set by `EnableMorselStealRule` on join-feeding scans.
+    pub fn with_morsel_steal(&self) -> Arc<Self> {
+        let mut next = self.clone_internals();
+        next.morsel_steal = true;
+        Arc::new(next)
     }
 
     /// Morsel-engine P2: get (or mint) the work-stealing cursor for THIS
@@ -3644,6 +3659,7 @@ impl EmatixFastParquetExec {
             extra_runtime_sidebands: self.extra_runtime_sidebands.clone(),
             morsel_rgs: self.morsel_rgs.clone(),
             morsel_state: self.morsel_state.clone(),
+            morsel_steal: self.morsel_steal,
             properties: self.properties.clone(),
             metrics: ExecutionPlanMetricsSet::new(),
         }))
@@ -3676,6 +3692,7 @@ impl EmatixFastParquetExec {
             extra_runtime_sidebands: self.extra_runtime_sidebands.clone(),
             morsel_rgs: self.morsel_rgs.clone(),
             morsel_state: self.morsel_state.clone(),
+            morsel_steal: self.morsel_steal,
             properties: self.properties.clone(),
             metrics: ExecutionPlanMetricsSet::new(),
         })
@@ -3700,6 +3717,7 @@ impl EmatixFastParquetExec {
             extra_runtime_sidebands: self.extra_runtime_sidebands.clone(),
             morsel_rgs: self.morsel_rgs.clone(),
             morsel_state: self.morsel_state.clone(),
+            morsel_steal: self.morsel_steal,
             properties: self.properties.clone(),
             metrics: ExecutionPlanMetricsSet::new(),
         }
@@ -3894,7 +3912,16 @@ impl ExecutionPlan for EmatixFastParquetExec {
         // All partition streams share one cursor over this scan's RGs, so
         // idle decode threads steal heavy RGs instead of being stuck with
         // a cost-blind static `rg % N` assignment (see P1 findings).
-        let morsel_cursor = if std::env::var("EMAT_MORSEL_STEAL").ok().as_deref() == Some("1") {
+        // Morsel-engine P2: work-stealing decode. Default honors the
+        // per-scan flag set by `EnableMorselStealRule` (on for join-feeding
+        // scans). `EMAT_MORSEL_STEAL=1` forces it on everywhere, `=0`
+        // forces off everywhere (the A/B baseline).
+        let steal = match std::env::var("EMAT_MORSEL_STEAL").ok().as_deref() {
+            Some("1") => true,
+            Some("0") => false,
+            _ => self.morsel_steal,
+        };
+        let morsel_cursor = if steal {
             Some(self.morsel_cursor_for(&context))
         } else {
             None
