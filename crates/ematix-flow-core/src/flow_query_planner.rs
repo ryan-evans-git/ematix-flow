@@ -45,13 +45,9 @@ use datafusion::logical_expr::LogicalPlan;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_planner::{DefaultPhysicalPlanner, PhysicalPlanner};
 
-/// `true` unless the env var is set to `0`/`false` (default ON, opt-out).
-fn enabled(var: &str) -> bool {
-    std::env::var(var)
-        .ok()
-        .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
-        .unwrap_or(true)
-}
+// Default-ON gate reader (opt out with `=0`/`false`). Canonical definition lives
+// in `crate::flags`; re-exported here so the planner's gate call sites are unchanged.
+use crate::flags::enabled;
 
 /// A [`QueryPlanner`] that applies the ematix pre-plan walker pipeline
 /// (agg-semi → dim-push → reorder) to the optimized logical plan before

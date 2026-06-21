@@ -6,6 +6,8 @@ pub mod backend;
 pub mod cdc;
 pub mod ddl;
 pub mod delta_backend;
+/// Central `EMAT_*` env-flag accessors + active-config dump (see `docs/EMAT_FLAGS.md`).
+pub mod flags;
 // Σ.A2 PR 1: SQL dialect translator. Namespaced (`ematix_flow_core::
 // dialect::Dialect`) so it doesn't collide with `backend::Dialect`,
 // which names backend kinds (Postgres / MySQL / Kafka / …) rather

@@ -231,17 +231,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // LEVER-MATCH GUARD: ctx is built via preset::with_optimizer_rules (== run_shard.rs
     // production). A publish-grade run must use PRODUCTION DEFAULTS — no EMAT_* lever
     // override — or we'd bench a config we don't ship. Warn loudly if any is set.
-    let emat_overrides: Vec<String> = std::env::vars()
-        .filter(|(k, _)| k.starts_with("EMAT_"))
-        .map(|(k, v)| format!("{k}={v}"))
-        .collect();
-    if emat_overrides.is_empty() {
+    // Canonical active-config dump (crate::flags) — single source of truth for which
+    // EMAT_* overrides are in effect, with "disables default" annotation on default-ON gates.
+    let active = ematix_flow_core::flags::dump_active();
+    if active == "none (shipped defaults)" {
         eprintln!("levers: PRODUCTION DEFAULTS (no EMAT_* override) — matches run_shard.rs");
     } else {
-        eprintln!(
-            "⚠ NON-DEFAULT LEVERS SET (bench may differ from production): {}",
-            emat_overrides.join(" ")
-        );
+        eprintln!("⚠ NON-DEFAULT LEVERS SET (bench may differ from production): {active}");
     }
 
     let ctx = build_ematix_ctx(&data_dir)?;
