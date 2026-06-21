@@ -1923,13 +1923,25 @@ impl EmatArrowBatchReader {
         // previous RG's selectivity-gate fallback.
         self.cur_rg_filter_bitmap = None;
 
+        // Morsel-engine P1: time the whole per-RG decode (the single
+        // decode work-unit) regardless of which sub-path fires, so the
+        // trace reconstructs a per-core busy/idle timeline. No-op unless
+        // EMAT_MORSEL_TRACE=1.
+        let _span = crate::morsel_trace::start_span();
+
         // Σ.E5 (#516): late-mat path — when a filter is set, decode the
         // filter column to a bitmap, then masked-decode each projected
         // column. Pages with zero bitmap-popcount are skipped entirely.
-        if let (Some(filter), Some(path)) = (&self.filter, &self.path) {
-            return self.load_row_group_masked(rg, filter.clone(), path.clone());
-        }
-        self.load_row_group_dense(rg)
+        let masked = match (&self.filter, &self.path) {
+            (Some(filter), Some(path)) => Some((filter.clone(), path.clone())),
+            _ => None,
+        };
+        let res = match masked {
+            Some((filter, path)) => self.load_row_group_masked(rg, filter, path),
+            None => self.load_row_group_dense(rg),
+        };
+        crate::morsel_trace::end_span(_span, rg, self.cur_rg_total, self.projection.len());
+        res
     }
 
     /// Σ.E5 Phase 1.8: parallel bitmap+dense path. Spawns one thread

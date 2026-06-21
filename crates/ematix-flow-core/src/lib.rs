@@ -150,6 +150,9 @@ pub mod iceberg_stamp;
 // for the Q1-shape workload. See
 // `docs/PHASE_SIGMA_E5_PARQUET_RS_ELIMINATION.md` §E5.1.
 pub mod emat_arrow_reader;
+// Morsel-engine P1 de-risk: env-gated per-RG decode trace (per-core
+// busy/idle timeline). See docs/plans/MORSEL_ENGINE.md.
+pub mod morsel_trace;
 // Σ.Q06.SF10.5.a (2026-05-28): ematix-parquet-based metadata helpers
 // replacing specific parquet-rs paths inside
 // `EmatixFastParquetTableProvider::try_new`. Currently exposes the
