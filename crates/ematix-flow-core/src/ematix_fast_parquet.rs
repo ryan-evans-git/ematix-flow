@@ -2361,6 +2361,17 @@ impl EmatixFastParquetTableProvider {
             // Σ.E5 follow-up: `try_new` now auto-promotes Utf8 → Utf8View
             // for the streaming reader default, so dict preservation has
             // to recognise both shapes when rewriting to Dictionary.
+            //
+            // NOTE (2026-06-21): dict_preservation is OPT-IN and known-fragile on
+            // standard parquet — it hard-errors on PLAIN-fallback string columns
+            // AND silently mis-groups on multi-row-group dict columns (per-RG
+            // dictionaries are not code-unified, e.g. Q01 returns 6 groups vs 4).
+            // The safe production default is dict_preservation=false (work_unit
+            // Execution::default). Making dict-preservation robust requires
+            // cross-row-group dict-code unification + full dense-path type
+            // support — a dedicated engine project, NOT a per-page fallback.
+            // Until then this rewrites every string column to Dictionary (the
+            // original behavior) so failures stay LOUD rather than silently wrong.
             let fields = self
                 .schema
                 .fields()

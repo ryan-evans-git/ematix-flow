@@ -292,6 +292,29 @@ fn try_rewrite_transitive_dim_semi(plan: &LogicalPlan) -> Option<LogicalPlan> {
             let Some((t_scan, _, t_col, seed_col)) = best else {
                 continue;
             };
+            // Σ.Q05 SCALE-GATE (2026-06-21): the splice trades a semi build-chain
+            // over the target `T` (Q05: customer) for join-intermediate relief.
+            // It pays when `T` is small (SF≤10 customer 1.5M: Q05 −10%, flips vs
+            // DuckDB) but REGRESSES when `T` is large (SF=100 customer 15M: Q05
+            // is decode/IO-bound so the relief is masked while the 15M-row semi
+            // build-chain is unamortised — measured +25%). Fire only below the
+            // target threshold; unknown size ⇒ fire (mirrors MID_DIM_MAX_ROWS).
+            // Master opt-out: EMAT_TRANSITIVE_DIM_SEMI=0 (flow_query_planner).
+            if std::env::var("EMAT_SIGMA_Q05_DEBUG").is_ok() {
+                eprintln!(
+                    "[Σ.Q05] target raw_rows={:?} threshold={} -> {}",
+                    scan_raw_rows(&t_scan),
+                    TRANSITIVE_SEMI_MAX_TARGET_ROWS,
+                    if scan_raw_rows(&t_scan).is_some_and(|n| n > TRANSITIVE_SEMI_MAX_TARGET_ROWS) {
+                        "SKIP"
+                    } else {
+                        "fire"
+                    }
+                );
+            }
+            if scan_raw_rows(&t_scan).is_some_and(|n| n > TRANSITIVE_SEMI_MAX_TARGET_ROWS) {
+                continue;
+            }
 
             // Composite dim build: M ⋈ D on the anchor's own equi-pair.
             // Built with explicit equi-keys (not `join_on`) so the semi
@@ -366,6 +389,15 @@ fn try_rewrite_transitive_dim_semi(plan: &LogicalPlan) -> Option<LogicalPlan> {
 /// fact-sized clones outright when the provider exposes row counts
 /// (8M = above every TPC-H dim at SF ≤ 100, below every fact at SF ≥ 10).
 const MID_DIM_MAX_ROWS: usize = 8_000_000;
+
+/// Σ.Q05 scale-gate: fire the transitive-dim-semi splice only when the semi'd
+/// target `T` (Q05: customer — a dim that scales linearly with SF) is below this
+/// row count. The splice's build-chain (RightSemi over T, then T ⋈ orders, then
+/// a |ASIA-orders|-key bloom) costs ~ T's size; the join-intermediate relief it
+/// buys pays at SF≤10 (customer 1.5M → Q05 −10%, flips vs DuckDB) but is masked
+/// at SF=100 (customer 15M, Q05 decode/IO-bound → +25% regression). 5M splits
+/// SF=10 (customer 1.5M fires) from SF=100 (15M skips); unknown size ⇒ fire.
+const TRANSITIVE_SEMI_MAX_TARGET_ROWS: usize = 5_000_000;
 
 /// Raw row count of a `TableScan` via its provider's statistics, when
 /// the source exposes them (`DefaultTableSource` over our providers

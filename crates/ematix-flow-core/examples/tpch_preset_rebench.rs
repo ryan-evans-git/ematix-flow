@@ -50,9 +50,27 @@ fn build_ematix_ctx(data_dir: &Path) -> Result<SessionContext, Box<dyn std::erro
     }
     let state = builder.build();
     let ctx = SessionContext::new_with_state(state);
+    // CANONICAL PROVIDER CONFIG (2026-06-21): dict_preservation=FALSE, late_mat=TRUE.
+    // dict_preservation=true HARD-ERRORS on standard parquet whenever the writer
+    // PLAIN-falls-back a high-card string column ("dict-preserved read: data page
+    // is PLAIN-encoded") — breaks Q09/Q10/Q13 + regresses Q01/Q05/Q07. It is only
+    // safe on all-dict (ematix-written) data, so it must be OPT-IN, never default.
+    // NOTE: run_shard.rs reads wu.execution.with_dict_preservation, whose
+    // work_unit Execution::default is now false (fixed in this change) — the
+    // correct/safe default; it was previously true, a latent production bug.
+    let dictp = std::env::var("EMAT_DICT_PRESERVATION")
+        .ok()
+        .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+        .unwrap_or(false);
+    let latem = std::env::var("EMAT_LATE_MAT")
+        .ok()
+        .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+        .unwrap_or(true);
     for t in TPCH_TABLES {
         let path = data_dir.join(format!("{t}.parquet"));
-        let provider = EmatixFastParquetTableProvider::try_new(path.to_string_lossy().to_string())?;
+        let provider = EmatixFastParquetTableProvider::try_new(path.to_string_lossy().to_string())?
+            .with_dict_preservation(dictp)
+            .with_late_mat(latem);
         ctx.register_table(*t, Arc::new(provider))?;
     }
     Ok(ctx)
@@ -385,81 +403,121 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    // Warmup (untimed): warm OS page cache + ematix internals for every query.
-    for wi in 0..warmups {
-        for (q, sql) in &sqls {
-            if !skip_ematix {
-                let res = time_ematix(&ctx, sql).await;
-                let collected = mi_collect_if_requested();
-                match res {
-                    Ok((ms, _)) => eprintln!(
-                        "[trial] eng=ematix q={q:02} warm{wi} ms={ms:.1} rss_mb={:.0} cur_mb={:.0} collect={}",
-                        rss_mb(),
-                        ematix_flow_core::heap_pressure::current_rss_mb().unwrap_or(0.0),
-                        collected as u8
-                    ),
-                    Err(e) => eprintln!("warm ematix Q{q:02} ERR: {e}"),
-                }
-            }
-            if !skip_duckdb {
-                match time_duckdb(&data_dir, sql) {
-                    Ok((ms, _)) => eprintln!(
-                        "[trial] eng=duckdb q={q:02} warm{wi} ms={ms:.1} rss_mb={:.0}",
-                        rss_mb()
-                    ),
-                    Err(e) => eprintln!("warm duckdb Q{q:02} ERR: {e}"),
-                }
-            }
-        }
-    }
-
-    // Timed, interleaved per query per trial.
+    let query_major = std::env::var_os("QUERY_MAJOR").is_some();
     let mut e_times: std::collections::BTreeMap<u8, Vec<f64>> = Default::default();
     let mut d_times: std::collections::BTreeMap<u8, Vec<f64>> = Default::default();
     let mut e_rows: std::collections::BTreeMap<u8, usize> = Default::default();
     let mut d_rows: std::collections::BTreeMap<u8, usize> = Default::default();
-    for ti in 0..trials {
+
+    // QUERY_MAJOR=1 — CONSECUTIVE-WARM publish protocol: each query's warmups
+    // then its timed trials run consecutively, before moving to the next query
+    // (vs the default trial-major interleave that round-robins all 22 per trial
+    // and accumulates thermal + mimalloc-retention pressure across the sweep).
+    // See [[project_sf10_protocol_dependence]] (consecutive-warm ~20/22 vs
+    // trial-major interleaved 17/22). Engines still isolated via SKIP_*.
+    if query_major {
         for (q, sql) in &sqls {
-            // PRODUCTION FIDELITY: build a FRESH ctx per measurement, exactly like
-            // run_shard.rs (one ctx per query). The ctx build is OUTSIDE the timed
-            // region (time_ematix only times sql+collect), so it doesn't pollute the
-            // number — it just makes every measurement a cold production query,
-            // immune to the #340 cross-query ctx accumulator that inflates small
-            // queries on a reused ctx. Same levers as production by construction
-            // (build_ematix_ctx == preset::with_optimizer_rules == run_shard.rs).
             if !skip_ematix {
-                let q_ctx = build_ematix_ctx(&data_dir)?;
-                let res = time_ematix(&q_ctx, sql).await;
-                let collected = mi_collect_if_requested();
-                match res {
-                    Ok((ms, r)) => {
-                        eprintln!(
-                            "[trial] eng=ematix q={q:02} ti={ti} ms={ms:.1} rss_mb={:.0} cur_mb={:.0} collect={}",
-                            rss_mb(),
-                            ematix_flow_core::heap_pressure::current_rss_mb().unwrap_or(0.0),
-                            collected as u8
-                        );
+                for _ in 0..warmups {
+                    let wc = build_ematix_ctx(&data_dir)?;
+                    let _ = time_ematix(&wc, sql).await;
+                    let _ = mi_collect_if_requested();
+                }
+                for _ in 0..trials {
+                    let qc = build_ematix_ctx(&data_dir)?;
+                    if let Ok((ms, r)) = time_ematix(&qc, sql).await {
                         e_times.entry(*q).or_default().push(ms);
                         e_rows.insert(*q, r);
                     }
-                    Err(e) => eprintln!("ematix Q{q:02} ERR: {e}"),
+                    let _ = mi_collect_if_requested();
                 }
             }
             if !skip_duckdb {
-                match time_duckdb(&data_dir, sql) {
-                    Ok((ms, r)) => {
-                        eprintln!(
-                            "[trial] eng=duckdb q={q:02} ti={ti} ms={ms:.1} rss_mb={:.0}",
-                            rss_mb()
-                        );
+                for _ in 0..warmups {
+                    let _ = time_duckdb(&data_dir, sql);
+                }
+                for _ in 0..trials {
+                    if let Ok((ms, r)) = time_duckdb(&data_dir, sql) {
                         d_times.entry(*q).or_default().push(ms);
                         d_rows.insert(*q, r);
                     }
-                    Err(e) => eprintln!("duckdb Q{q:02} ERR: {e}"),
+                }
+            }
+            eprintln!("[qmajor] done q={q:02}");
+        }
+    } else {
+        // Warmup (untimed): warm OS page cache + ematix internals for every query.
+        for wi in 0..warmups {
+            for (q, sql) in &sqls {
+                if !skip_ematix {
+                    let res = time_ematix(&ctx, sql).await;
+                    let collected = mi_collect_if_requested();
+                    match res {
+                        Ok((ms, _)) => eprintln!(
+                            "[trial] eng=ematix q={q:02} warm{wi} ms={ms:.1} rss_mb={:.0} cur_mb={:.0} collect={}",
+                            rss_mb(),
+                            ematix_flow_core::heap_pressure::current_rss_mb().unwrap_or(0.0),
+                            collected as u8
+                        ),
+                        Err(e) => eprintln!("warm ematix Q{q:02} ERR: {e}"),
+                    }
+                }
+                if !skip_duckdb {
+                    match time_duckdb(&data_dir, sql) {
+                        Ok((ms, _)) => eprintln!(
+                            "[trial] eng=duckdb q={q:02} warm{wi} ms={ms:.1} rss_mb={:.0}",
+                            rss_mb()
+                        ),
+                        Err(e) => eprintln!("warm duckdb Q{q:02} ERR: {e}"),
+                    }
                 }
             }
         }
-    }
+
+        // Timed, interleaved per query per trial.
+        for ti in 0..trials {
+            for (q, sql) in &sqls {
+                // PRODUCTION FIDELITY: build a FRESH ctx per measurement, exactly like
+                // run_shard.rs (one ctx per query). The ctx build is OUTSIDE the timed
+                // region (time_ematix only times sql+collect), so it doesn't pollute the
+                // number — it just makes every measurement a cold production query,
+                // immune to the #340 cross-query ctx accumulator that inflates small
+                // queries on a reused ctx. Same levers as production by construction
+                // (build_ematix_ctx == preset::with_optimizer_rules == run_shard.rs).
+                if !skip_ematix {
+                    let q_ctx = build_ematix_ctx(&data_dir)?;
+                    let res = time_ematix(&q_ctx, sql).await;
+                    let collected = mi_collect_if_requested();
+                    match res {
+                        Ok((ms, r)) => {
+                            eprintln!(
+                                "[trial] eng=ematix q={q:02} ti={ti} ms={ms:.1} rss_mb={:.0} cur_mb={:.0} collect={}",
+                                rss_mb(),
+                                ematix_flow_core::heap_pressure::current_rss_mb().unwrap_or(0.0),
+                                collected as u8
+                            );
+                            e_times.entry(*q).or_default().push(ms);
+                            e_rows.insert(*q, r);
+                        }
+                        Err(e) => eprintln!("ematix Q{q:02} ERR: {e}"),
+                    }
+                }
+                if !skip_duckdb {
+                    match time_duckdb(&data_dir, sql) {
+                        Ok((ms, r)) => {
+                            eprintln!(
+                                "[trial] eng=duckdb q={q:02} ti={ti} ms={ms:.1} rss_mb={:.0}",
+                                rss_mb()
+                            );
+                            d_times.entry(*q).or_default().push(ms);
+                            d_rows.insert(*q, r);
+                        }
+                        Err(e) => eprintln!("duckdb Q{q:02} ERR: {e}"),
+                    }
+                }
+            }
+        }
+    } // end else (trial-major interleave)
 
     // Report.
     println!(
