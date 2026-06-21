@@ -50,9 +50,27 @@ fn build_ematix_ctx(data_dir: &Path) -> Result<SessionContext, Box<dyn std::erro
     }
     let state = builder.build();
     let ctx = SessionContext::new_with_state(state);
+    // CANONICAL PROVIDER CONFIG (2026-06-21): dict_preservation=FALSE, late_mat=TRUE.
+    // dict_preservation=true HARD-ERRORS on standard parquet whenever the writer
+    // PLAIN-falls-back a high-card string column ("dict-preserved read: data page
+    // is PLAIN-encoded") — breaks Q09/Q10/Q13 + regresses Q01/Q05/Q07. It is only
+    // safe on all-dict (ematix-written) data, so it must be OPT-IN, never default.
+    // NOTE: run_shard.rs reads wu.execution.with_dict_preservation, whose
+    // work_unit Execution::default is now false (fixed in this change) — the
+    // correct/safe default; it was previously true, a latent production bug.
+    let dictp = std::env::var("EMAT_DICT_PRESERVATION")
+        .ok()
+        .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+        .unwrap_or(false);
+    let latem = std::env::var("EMAT_LATE_MAT")
+        .ok()
+        .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+        .unwrap_or(true);
     for t in TPCH_TABLES {
         let path = data_dir.join(format!("{t}.parquet"));
-        let provider = EmatixFastParquetTableProvider::try_new(path.to_string_lossy().to_string())?;
+        let provider = EmatixFastParquetTableProvider::try_new(path.to_string_lossy().to_string())?
+            .with_dict_preservation(dictp)
+            .with_late_mat(latem);
         ctx.register_table(*t, Arc::new(provider))?;
     }
     Ok(ctx)

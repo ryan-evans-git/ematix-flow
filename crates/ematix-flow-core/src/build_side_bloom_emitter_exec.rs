@@ -81,6 +81,34 @@ pub(crate) fn l9_set_threshold() -> usize {
         .unwrap_or(DEFAULT_L9_SET_THRESHOLD)
 }
 
+/// L9.BLOOMSIZE.2 (2026-06-21) — the per-partition exact-set MEMORY
+/// DROP cap, decoupled from (and ≥) the exact-set PUBLISH threshold
+/// above. During insertion the local exact set is kept until it
+/// exceeds this many keys (a memory bound); the exact-set-vs-bloom
+/// PUBLISH decision still uses `l9_set_threshold`. Keeping the keys
+/// past the publish threshold — but under this cap — lets the finalize
+/// REBUILD a correctly-sized `for_keys(actual)` bloom even when a large
+/// build is coalesced to ONE partition (the CollectLeft case). Q05: the
+/// 456K-key ASIA-orders semi build coalesces to one partition; pre-fix
+/// its lone set overflowed `set_threshold` (262K) mid-insertion, dropped
+/// its keys, and fell back to an incremental bloom floored at the
+/// threshold but holding ~1.7× its keys → ~12-18% false-positive → over
+/// the reader's 10% dense-discard gate → the lineitem scan filtered
+/// NOTHING. Bounds transient memory at ~`cap * 16 B` per overflowing
+/// partition (~64 MB at the default). Override via `EMAT_L9_SET_DROP_CAP`.
+const DEFAULT_L9_SET_DROP_CAP: usize = 4_194_304;
+
+#[inline]
+pub(crate) fn l9_set_drop_cap() -> usize {
+    std::env::var("EMAT_L9_SET_DROP_CAP")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_L9_SET_DROP_CAP)
+        // Never below the publish threshold — a drop cap under the
+        // publish threshold would re-create the original bug.
+        .max(l9_set_threshold())
+}
+
 /// KEYS.1 — true iff a join-key `DataType` losslessly widens to `i64`, so it
 /// can ride the i64-domain runtime bloom/set sideband (`insert_i64` /
 /// `might_contain_i64`) with only a widen-on-read at the build side and the
@@ -412,6 +440,10 @@ impl ExecutionPlan for BuildSideBloomEmitterExec {
         // once at execute() time so the map closure stays branch-free
         // on env lookups.
         let set_threshold = l9_set_threshold();
+        // L9.BLOOMSIZE.2 — memory drop cap (≥ set_threshold), decoupled
+        // from the publish threshold so a large coalesced build keeps its
+        // exact keys for the finalize to rebuild a right-sized bloom.
+        let set_drop_cap = l9_set_drop_cap();
 
         // Per-partition local bloom + set. Both are wrapped in
         // Arc<Mutex<…>> so the map closure (per-batch updates) and the
@@ -519,7 +551,7 @@ impl ExecutionPlan for BuildSideBloomEmitterExec {
                             bloom_guard.insert_i64(v);
                             if let Some(s) = set_guard.as_mut() {
                                 s.insert(v);
-                                if s.len() > set_threshold {
+                                if s.len() > set_drop_cap {
                                     *set_guard = None;
                                 }
                             }
@@ -531,7 +563,7 @@ impl ExecutionPlan for BuildSideBloomEmitterExec {
                                 bloom_guard.insert_i64(v);
                                 if let Some(s) = set_guard.as_mut() {
                                     s.insert(v);
-                                    if s.len() > set_threshold {
+                                    if s.len() > set_drop_cap {
                                         *set_guard = None;
                                     }
                                 }
@@ -662,40 +694,33 @@ impl ExecutionPlan for BuildSideBloomEmitterExec {
                                 // predicate per (col_idx, sideband)
                                 // pair below.
                                 let all_some = sets.iter().all(|s| s.is_some());
-                                let shared_set: Option<Arc<I64Set>> = if all_some {
-                                    // L9.SETSIZE (2026-06-10): size the published set by
-                                    // the ACTUAL key count with miss-heavy headroom, not
-                                    // by the threshold. The probe workload is ~all-misses
-                                    // (Q08: 60M lineitem probes vs 13.45K part keys =
-                                    // 99.3% miss), and linear-probing miss cost grows
-                                    // sharply with load factor. `with_keys(threshold)`
-                                    // accidentally sized every published set at 65,536
-                                    // slots (20.5% load for Q08); resizing to 8× actual
-                                    // keys (≈6% load) measured Q08 −18% wall (180.8/182.7
-                                    // → 150.4/145.4, interleaved A/B/A/B). The sum is an
-                                    // upper bound (duplicates across partitions only
-                                    // shrink the true merged count), which is the safe
-                                    // direction for sizing.
-                                    let total_keys: usize =
-                                        sets.iter().flatten().map(|s| s.len()).sum();
-                                    let mut merged =
-                                        I64Set::with_keys(total_keys.saturating_mul(8).max(64));
-                                    let mut overflow = false;
-                                    for s in sets.iter().flatten() {
-                                        merged.extend(s);
-                                        if merged.len() > set_threshold {
-                                            overflow = true;
-                                            break;
+                                // L9.BLOOMSIZE.2 — hoisted; reused by the bloom-rebuild
+                                // branch below. The sum is an upper bound (cross-partition
+                                // dupes only shrink the true merged count); the build side
+                                // is hash-partitioned so each key lands in one partition →
+                                // it equals the true distinct count in practice.
+                                let total_keys: usize =
+                                    sets.iter().flatten().map(|s| s.len()).sum();
+                                // Publish an EXACT set only when the merged total fits
+                                // under the publish threshold. Above it we want a bloom
+                                // (cheaper per-probe across a 60M-row scan), rebuilt from
+                                // the surviving exact keys below — so DON'T allocate the
+                                // (potentially tens-of-MB) merged set just to discard it.
+                                // L9.SETSIZE (2026-06-10): size the kept set at 8× actual
+                                // keys (≈6% load) — the probe workload is ~all-miss (Q08:
+                                // 60M probes vs 13.45K keys = 99.3% miss) and linear-probe
+                                // miss cost grows sharply with load (Q08 −18% wall).
+                                let shared_set: Option<Arc<I64Set>> =
+                                    if all_some && total_keys <= set_threshold {
+                                        let mut merged =
+                                            I64Set::with_keys(total_keys.saturating_mul(8).max(64));
+                                        for s in sets.iter().flatten() {
+                                            merged.extend(s);
                                         }
-                                    }
-                                    if overflow {
-                                        None
-                                    } else {
                                         Some(Arc::new(merged))
-                                    }
-                                } else {
-                                    None
-                                };
+                                    } else {
+                                        None
+                                    };
 
                                 let shared_bloom: Option<Arc<BloomFilter>> = if shared_set.is_none()
                                 {
@@ -1430,6 +1455,32 @@ mod tests {
         assert!(
             fp < 0.10,
             "local incremental bloom must be floored at the set threshold; fp was {fp:.3}"
+        );
+    }
+
+    /// L9.BLOOMSIZE Q05-scale — a SINGLE coalesced partition holding
+    /// well above the set threshold (Q05's CollectLeft build is the
+    /// 456K-key ASIA-orders semi, coalesced to one partition before the
+    /// emitter) must still publish a LOW-FP bloom. This is the gap the
+    /// `bloomsize_local_overflow_bloom_floored_at_threshold` test
+    /// missed: it used threshold+8 keys (1.0× load → 0.85% fp), but at
+    /// ~1.7-2× the threshold the floored incremental bloom hits ~10-16%
+    /// fp — which EXCEEDS the reader's 10% dense-discard gate, so the
+    /// probe-side scan filters NOTHING (Q05 lineitem stayed 60M; the
+    /// −11% bloom-reduce lever was inert). Fix: the set's memory DROP
+    /// cap (`l9_set_drop_cap`) is decoupled from — and far above — the
+    /// exact-set PUBLISH threshold (`l9_set_threshold`), so the keys
+    /// survive insertion and the finalize rebuilds a `for_keys(actual)`
+    /// bloom regardless of how the build was partitioned.
+    #[tokio::test]
+    async fn bloomsize_single_partition_above_threshold_low_fp() {
+        let n = (l9_set_threshold() * 2) as i64;
+        let p0: Vec<i64> = (0..n).collect();
+        let fp = overflow_bloom_fp_rate(vec![p0], 64).await;
+        assert!(
+            fp < 0.05,
+            "single coalesced partition at 2x the set threshold must rebuild a \
+             right-sized bloom (decoupled drop cap); absent-key fp was {fp:.3}"
         );
     }
 

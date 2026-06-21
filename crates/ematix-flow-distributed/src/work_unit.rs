@@ -115,8 +115,12 @@ pub struct Execution {
     #[serde(default)]
     pub threads: Option<usize>,
     /// Engage `EmatixFastParquetTableProvider::with_dict_preservation`.
-    /// Defaults to `true` (Σ.E3b standard).
-    #[serde(default = "default_true")]
+    /// Defaults to `false` (2026-06-21): dict-preservation HARD-ERRORS on
+    /// standard parquet whose writer PLAIN-falls-back a high-card string
+    /// column ("dict-preserved read: data page is PLAIN-encoded"), breaking
+    /// Q09/Q10/Q13-class queries. It is only safe on all-dict (ematix-written)
+    /// data, so it is opt-in. (Was `true` — a latent correctness bug.)
+    #[serde(default)]
     pub with_dict_preservation: bool,
     /// Engage late-materialization on FastParquet. Defaults to
     /// `true` (Σ.E5a standard).
@@ -131,7 +135,9 @@ impl Default for Execution {
     fn default() -> Self {
         Self {
             threads: None,
-            with_dict_preservation: true,
+            // false: dict-preservation hard-errors on PLAIN-fallback string
+            // columns in standard parquet (see field doc) — opt-in only.
+            with_dict_preservation: false,
             with_late_mat: true,
             with_adaptive_predicate: true,
         }
@@ -231,8 +237,12 @@ mod tests {
         let wu: WorkUnit = serde_json::from_str(json).expect("parse");
         // Schema default applied
         assert_eq!(wu.schema, WorkUnit::default_schema());
-        // Execution defaults: all opt-ins true, threads unset
-        assert!(wu.execution.with_dict_preservation);
+        // Execution defaults: dict_preservation OFF (PLAIN-fallback safety),
+        // late_mat + adaptive_predicate ON, threads unset.
+        assert!(
+            !wu.execution.with_dict_preservation,
+            "dict_preservation must default OFF — true hard-errors on PLAIN-fallback string columns"
+        );
         assert!(wu.execution.with_late_mat);
         assert!(wu.execution.with_adaptive_predicate);
         assert_eq!(wu.execution.threads, None);
