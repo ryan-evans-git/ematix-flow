@@ -104,14 +104,10 @@ pub const DEFAULT_RH_COUNT_MIN_GROUPS: usize = 64 * 1024;
 
 impl Default for EnableRobinHoodAggregateRule {
     fn default() -> Self {
-        let max_groups = std::env::var("EMAT_RH_COUNT_MAX_GROUPS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(DEFAULT_RH_COUNT_MAX_GROUPS);
-        let min_groups = std::env::var("EMAT_RH_COUNT_MIN_GROUPS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(DEFAULT_RH_COUNT_MIN_GROUPS);
+        let max_groups =
+            crate::flags::usize_or("EMAT_RH_COUNT_MAX_GROUPS", DEFAULT_RH_COUNT_MAX_GROUPS);
+        let min_groups =
+            crate::flags::usize_or("EMAT_RH_COUNT_MIN_GROUPS", DEFAULT_RH_COUNT_MIN_GROUPS);
         Self {
             max_groups,
             min_groups,

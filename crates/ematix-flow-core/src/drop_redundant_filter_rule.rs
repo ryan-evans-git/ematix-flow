@@ -132,7 +132,7 @@ pub static PV_M7_FUSES: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomic
 /// builder time — keeps the rule out of the default optimizer
 /// pipeline so the Inexact-pushdown regime stays unchanged.
 pub fn install_drop_redundant_filter_rule(builder: SessionStateBuilder) -> SessionStateBuilder {
-    if std::env::var_os("EMAT_DROP_REDUNDANT_FILTER").is_some() {
+    if crate::flags::present("EMAT_DROP_REDUNDANT_FILTER") {
         builder.with_physical_optimizer_rule(Arc::new(DropRedundantBridgeFilterRule))
     } else {
         builder
@@ -206,7 +206,7 @@ impl PhysicalOptimizerRule for DropRedundantBridgeFilterRule {
 pub fn fuse_redundant_bridge_filters(
     plan: Arc<dyn ExecutionPlan>,
 ) -> DfResult<Arc<dyn ExecutionPlan>> {
-    let trace = std::env::var_os("EMAT_CSE_FILTER_FUSION_TRACE").is_some();
+    let trace = crate::flags::present("EMAT_CSE_FILTER_FUSION_TRACE");
     let out = plan.transform_up(|node| {
         let Some(filter) = node.as_any().downcast_ref::<FilterExec>() else {
             return Ok(Transformed::no(node));

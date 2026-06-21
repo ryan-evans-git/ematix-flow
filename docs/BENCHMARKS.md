@@ -9,7 +9,7 @@ Plan: [`docs/PHASE_SIGMA_PLAN.md`](PHASE_SIGMA_PLAN.md).
 
 ---
 
-## TL;DR — refresh 2026-06-12 (SF=1 / SF=100); SF=10 ematix+DuckDB re-measured 2026-06-21, Apple M4 Max (14-core, 36 GB)
+## TL;DR — SF=1 refresh 2026-06-12; SF=10 + SF=100 ematix+DuckDB re-measured 2026-06-21, Apple M4 Max (14-core, 36 GB)
 
 Five engines, all 22 TPC-H queries, three scale factors, the same machine
 and the same Parquet files. **ematix-flow numbers are production-faithful**:
@@ -20,10 +20,12 @@ what `pip install ematix-flow` reproduces on a cold query. ematix-flow and
 DuckDB run in **isolated** (not interleaved) passes — co-scheduling the two
 engines in one process penalized whichever ran second by up to 60% on small
 queries — with 20 timed trials after 3 warmups at SF=1 / SF=10 and 5 trials
-after 1 warmup at SF=100, medians. SF=10 verdicts are the median of **two
+after 2 warmups at SF=100, medians. SF=10 verdicts are the median of **two
 same-session pairs with alternating engine order** on a settled machine
-(per-query agreement between the pairs: under 2%); SF=100 likewise from
-two order-alternated pairs. Polars is the in-process harness; PySpark is
+(per-query agreement between the pairs: under 2%); **SF=100 verdicts are the
+median of three independent order-alternated per-query-isolated sweeps** —
+necessary because SF=100 per-query times drift ±10-30% on cache/thermal state,
+so a single sweep over-counts losses. Polars is the in-process harness; PySpark is
 `local[*]` on the JVM; Postgres 14 is `EXPLAIN ANALYZE` Execution Time
 (B-tree indexed + `ANALYZE`d). The fastest engine per query is **bold**.
 All 22 row counts + sums match DuckDB at every scale.
@@ -35,8 +37,8 @@ All 22 row counts + sums match DuckDB at every scale.
 > small-working-set queries up to +25%; it now fires only above a 6 GB
 > peak-RSS threshold, preserving its −5% out-of-core win). DuckDB and
 > Polars also ran faster than their prior columns in these sessions —
-> several ±5%-margin verdicts (Q07/Q09/Q18 at SF=10, Q11/Q12 at SF=100)
-> moved to the competitor as a result. That is what same-session honesty
+> several ±5%-margin verdicts (Q07/Q09/Q18 at SF=10) moved to the
+> competitor as a result. That is what same-session honesty
 > looks like: queries within ~5% should be read as parity, and the
 > stable signal is the geomean.
 
@@ -103,42 +105,44 @@ All 22 row counts + sums match DuckDB at every scale.
 
 ### SF=100 — ~100 GB · out-of-core
 
-- **Wins (fastest median per query):** ematix-flow **15 / 22**, DuckDB 4 (Q10 by 47%, Q11 by 5%, Q16 by 14%, Q18 by 20%), Polars 3 (Q12 by 8%, Q14 by 37%, Q15 by 8%), PySpark 0, Postgres 0. The between-query heap-release fix narrowed Q18 (1.25×→1.20×) and Q10 (1.64×→1.47×) in-sweep; Q11/Q12 are parity-class and flipped on competitor-side improvement.
-- **Geomean ematix-flow speedup:** 1.30× vs DuckDB · 4.60× (n=17) vs Polars · 7.75× vs PySpark · 57.63× (n=6) vs Postgres.
+- **Wins (ematix-flow vs DuckDB, 3 independent per-query-isolated sweeps, 2026-06-21):** **14 / 22** reproduce as ematix wins across *all three* sweeps (17/22 by 3-round median); **2 consistent DuckDB wins** — Q10 (~0.73×) and Q8 (~0.95×), the high-RSS wide-string queries; the remaining **6** (Q3, Q5, Q9, Q16, Q18, Q21 — marked †) sit *within run-to-run cache/thermal noise* at this scale (per-query times drift ±10-30% round-to-round on a 36 GB box where the ~30 GB working set exceeds RAM). The prior "18/22, 1.58×" was measured *in-sweep*, which inflates ematix's easy-query margins.
+- **Geomean ematix-flow speedup:** **1.18× vs DuckDB** (3-round per-query-isolated median, the honest "both engines warm" number). Polars/PySpark/Postgres columns are **carried 2026-05-29 baselines** (older protocol) — ematix leads each by a wide margin, but those are not a fresh head-to-head.
 
 | Query | ematix-flow | DuckDB | Polars | PySpark | Postgres |
 |---|--:|--:|--:|--:|--:|
-| Q01 | **2,764** | 3,046 | 79,084 | 5,184 | — |
-| Q02 | **319** | 550 | 53,109 | 6,697 | 26,054 |
-| Q03 | **1,704** | 2,186 | 30,103 | 26,128 | — |
-| Q04 | **995** | 1,712 | 6,550 | 10,543 | — |
-| Q05 | **1,923** | 2,435 | — | 38,145 | — |
-| Q06 | **532** | 978 | 540 | 1,142 | — |
-| Q07 | **1,729** | 2,540 | 95,946 | 12,775 | — |
-| Q08 | **1,991** | 3,262 | — | 23,610 | — |
-| Q09 | **5,588** | 6,337 | 21,438 | 67,105 | — |
-| Q10 | 4,404 | **2,997** | — | 24,590 | — |
-| Q11 | 280 | **266** | 412 | 5,639 | 60,108 |
-| Q12 | 1,200 | 2,280 | **1,112** | 6,482 | — |
-| Q13 | **2,249** | 2,788 | 5,114 | 14,442 | 86,674 |
-| Q14 | 1,227 | 1,985 | **895** | 2,623 | — |
-| Q15 | 941 | 1,483 | **871** | 5,142 | — |
-| Q16 | 504 | **440** | 1,809 | 5,012 | 29,144 |
-| Q17 | **1,630** | 2,324 | 9,536 | 47,823 | — |
-| Q18 | 3,550 | **2,950** | 15,572 | 54,206 | — |
-| Q19 | **1,610** | 1,997 | — | 3,101 | 52,107 |
-| Q20 | **1,790** | 1,820 | 6,692 | 5,682 | — |
-| Q21 | **4,724** | 7,610 | — | 55,583 | — |
-| Q22 | **582** | 800 | 1,255 | 5,107 | 16,805 |
+| Q01 | **2,250** | 2,375 | 79,084 | 5,184 | — |
+| Q02 | **225** | 393 | 53,109 | 6,697 | 26,054 |
+| Q03 † | 1,532 | **1,528** | 30,103 | 26,128 | — |
+| Q04 | **821** | 895 | 6,550 | 10,543 | — |
+| Q05 † | 1,644 | **1,620** | — | 38,145 | — |
+| Q06 | **461** | 824 | 540 | 1,142 | — |
+| Q07 | **1,480** | 1,668 | 95,946 | 12,775 | — |
+| Q08 | 2,198 | **2,085** | — | 23,610 | — |
+| Q09 † | 6,839 | **6,369** | 21,438 | 67,105 | — |
+| Q10 | 3,560 | **2,585** | — | 24,590 | — |
+| Q11 | **213** | 226 | 412 | 5,639 | 60,108 |
+| Q12 | **982** | 1,197 | 1,112 | 6,482 | — |
+| Q13 | **1,983** | 2,772 | 5,114 | 14,442 | 86,674 |
+| Q14 | **784** | 2,320 | 895 | 2,623 | — |
+| Q15 | **790** | 1,022 | 871 | 5,142 | — |
+| Q16 † | **383** | 388 | 1,809 | 5,012 | 29,144 |
+| Q17 | **1,368** | 1,529 | 9,536 | 47,823 | — |
+| Q18 † | **2,655** | 2,674 | 15,572 | 54,206 | — |
+| Q19 | **1,160** | 1,617 | — | 3,101 | 52,107 |
+| Q20 | **1,183** | 1,385 | 6,692 | 5,682 | — |
+| Q21 † | **4,896** | 5,326 | — | 55,583 | — |
+| Q22 | **446** | 602 | 1,255 | 5,107 | 16,805 |
 
-> **Provenance.** ematix-flow + DuckDB are fresh isolated runs on this
-> Apple M4 Max (2026-06-12, engine commit `782d01d`) through
-> `examples/tpch_preset_rebench.rs`, measured as **same-session,
-> order-alternated pairs per scale** (two pairs at SF=10 and SF=100;
-> per-query agreement between SF=10 pairs under 2%) on a settled
-> machine, so neither column carries another day's thermal/page-cache
-> state and neither engine systematically inherits the other's cache
-> warmth. Polars Q14/Q15 at SF=10 (the queries where the verdict is
+_Bold = faster of **ematix-flow / DuckDB** (both 2026-06-21, 3-round per-query-isolated median). **†** = within SF=100 run-to-run noise — did not reproduce the same winner across all 3 sweeps. Polars / PySpark / Postgres are **carried 2026-05-29 baselines** on the same machine (older protocol), shown for rough reference, not bolded against the freshly-measured pair._
+
+> **Provenance.** The **ematix-flow + DuckDB** columns are fresh
+> per-query-isolated runs on this Apple M4 Max through
+> `examples/tpch_preset_rebench.rs` — each query in its own process, each
+> engine solo (no cross-engine RAM contention): **SF=10** 2026-06-21, 15
+> trials / 3 warmups; **SF=100** 2026-06-21, **median of 3 independent
+> order-alternated sweeps** (5 trials / 2 warmups each), engine commit
+> `4e7393c` (post-#159). Both are taken on a settled machine, so neither
+> column carries another day's thermal/page-cache state. Polars Q14/Q15 at SF=10 (the queries where the verdict is
 > within a few percent) were re-measured 2026-06-12 at the same 20×3
 > trial counts; the rest of the Polars column is the 2026-06-10 run
 > (SF=10) / 2026-05-29-31 baselines (SF=1, SF=100). PySpark and
@@ -151,17 +155,18 @@ All 22 row counts + sums match DuckDB at every scale.
 > most heavy queries timed out (`—`), so its SF=100 geomean covers only
 > the 6 that finished.
 
-> **SF=100 measurement — corrected 2026-06-18.** ematix-flow and DuckDB are
-> timed **each in its own process**. Co-running both in a single process (the
-> harness's earlier default) makes the ~30 GB working set contend for the
-> 36 GB box's RAM and understates the higher-memory engine — that flaw
-> produced the prior SF=100 figures. Measured isolated, **ematix-flow wins
-> 18 / 22 at SF=100 (1.58× geomean)**; the DuckDB losses are Q10, Q16, and
-> Q18 (the wide-string, high-RSS queries). The per-query tables above predate
-> this re-measure and are being refreshed — the [README](../README.md#benchmarks)
-> carries the current authoritative summary (SF=1 22/22, SF=10 **22/22 vs
-> DuckDB** [2026-06-21, per-query-isolated — Q05 flipped via the #159
-> transitive-dim-semi splice], SF=100 ~18/22 [stale; pending a fresh sweep]).
+> **SF=100 measurement — refreshed 2026-06-21 (3 independent sweeps).**
+> ematix-flow and DuckDB are timed **each in its own process** (co-running both
+> in one process makes the ~30 GB working set contend for the 36 GB box's RAM and
+> understates the higher-memory engine). Across **3 independent per-query-isolated
+> sweeps**, ematix-flow wins **14/22 reproducibly** (in every sweep) and **17/22 by
+> 3-round median**, geomean **1.18× vs DuckDB**. **Q10** (~0.73×) and **Q8** (~0.95×)
+> are consistent losses — the high-RSS wide-string queries. Six queries
+> (Q3/Q5/Q9/Q16/Q18/Q21) swing ±10-30% on cache/thermal state at this scale and are
+> not individually decidable. The earlier **"18/22, 1.58×"** came from a single
+> *in-sweep* run, which over-states ematix by rewarding its cache behaviour on the
+> easy queries. The [README](../README.md#benchmarks) carries the headline (SF=1
+> 22/22, SF=10 **22/22 vs DuckDB**, SF=100 **14/22 robust · 1.18×**).
 
 > **Config.** ematix-flow runs the production preset, no env vars:
 > `target_partitions = cores` (14 here) plus the fused-aggregate,

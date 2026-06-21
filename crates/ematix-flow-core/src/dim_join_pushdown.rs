@@ -113,7 +113,7 @@ pub fn push_dim_join_into_chain(plan: LogicalPlan) -> DfResult<LogicalPlan> {
         }
         _ => Ok(Transformed::no(node)),
     })?;
-    if std::env::var("EMAT_SIGMA_AD_DEBUG").is_ok() {
+    if crate::flags::present("EMAT_SIGMA_AD_DEBUG") {
         eprintln!("[Σ.AD] fires={fires}");
     }
     Ok(transformed.data)
@@ -225,7 +225,7 @@ fn try_rewrite(plan: &LogicalPlan) -> Option<LogicalPlan> {
     let _ = dim_on_right; // suppress unused warning
     let result = new_fact_side;
 
-    if std::env::var("EMAT_SIGMA_AD_DEBUG").is_ok() {
+    if crate::flags::present("EMAT_SIGMA_AD_DEBUG") {
         eprintln!(
             "[Σ.AD] rewrote outer join on ({}.{} = {}.{}); pushed down to {}",
             lcol.relation

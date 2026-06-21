@@ -49,10 +49,7 @@ use crate::ematix_fast_parquet::EmatixFastParquetExec;
 
 /// `true` iff `EMAT_PUSH_PIPELINE` is set to `1`/`true` (default OFF).
 pub fn enabled() -> bool {
-    std::env::var("EMAT_PUSH_PIPELINE")
-        .ok()
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
+    crate::flags::opt_in("EMAT_PUSH_PIPELINE")
 }
 
 fn widens_to_i64(dt: &DataType) -> bool {
@@ -196,7 +193,7 @@ pub fn fuse_push_pipelines(plan: Arc<dyn ExecutionPlan>) -> DfResult<Arc<dyn Exe
 pub fn fuse_push_pipelines_always(
     plan: Arc<dyn ExecutionPlan>,
 ) -> DfResult<Arc<dyn ExecutionPlan>> {
-    let trace = std::env::var_os("EMAT_PUSH_PIPELINE_TRACE").is_some();
+    let trace = crate::flags::present("EMAT_PUSH_PIPELINE_TRACE");
     let out = plan.transform_up(|node| {
         if let Some(hj) = node.as_any().downcast_ref::<HashJoinExec>() {
             if let Some(fused) = try_fuse(hj) {

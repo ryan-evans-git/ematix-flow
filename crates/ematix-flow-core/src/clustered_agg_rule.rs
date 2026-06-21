@@ -67,10 +67,7 @@ use crate::ematix_fast_parquet::EmatixFastParquetExec;
 
 /// `true` unless `EMAT_RANGE_AGG=0`/`false` (default ON, opt-out).
 fn enabled() -> bool {
-    std::env::var("EMAT_RANGE_AGG")
-        .ok()
-        .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
-        .unwrap_or(true)
+    crate::flags::enabled("EMAT_RANGE_AGG")
 }
 
 /// Plan key-disjoint partition chunks from per-row-group `[min, max]`

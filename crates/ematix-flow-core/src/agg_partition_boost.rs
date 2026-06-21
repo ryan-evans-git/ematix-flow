@@ -107,14 +107,11 @@ impl PhysicalOptimizerRule for AggPartitionBoostRule {
         plan: Arc<dyn ExecutionPlan>,
         _config: &ConfigOptions,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
-        let enabled = std::env::var("EMAT_AGG_PARTITION_BOOST")
-            .ok()
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
+        let enabled = crate::flags::opt_in("EMAT_AGG_PARTITION_BOOST");
         if !enabled {
             return Ok(plan);
         }
-        let trace = std::env::var_os("EMAT_AGG_PARTITION_BOOST_TRACE").is_some();
+        let trace = crate::flags::present("EMAT_AGG_PARTITION_BOOST_TRACE");
 
         plan.transform_up(|node| {
             // Match the agg layer. We recognize both DataFusion's

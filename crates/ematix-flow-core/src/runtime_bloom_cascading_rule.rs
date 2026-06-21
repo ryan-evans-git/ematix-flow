@@ -75,19 +75,10 @@ pub struct EnableCascadingBloomRule {
 
 impl Default for EnableCascadingBloomRule {
     fn default() -> Self {
-        let ratio = std::env::var("EMAT_RT_BLOOM_SELECTIVITY")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(64);
-        let allow_inner_join = std::env::var_os("EMAT_RT_BLOOM_INNER_JOIN").is_some();
-        let require_filtered_build = std::env::var("EMAT_L9_REQUIRE_FILTERED_BUILD")
-            .ok()
-            .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
-            .unwrap_or(true);
-        let max_extras_per_emitter = std::env::var("EMAT_L9_CASCADE_MAX")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(4);
+        let ratio = crate::flags::usize_or("EMAT_RT_BLOOM_SELECTIVITY", 64);
+        let allow_inner_join = crate::flags::present("EMAT_RT_BLOOM_INNER_JOIN");
+        let require_filtered_build = crate::flags::enabled("EMAT_L9_REQUIRE_FILTERED_BUILD");
+        let max_extras_per_emitter = crate::flags::usize_or("EMAT_L9_CASCADE_MAX", 4);
         Self {
             min_probe_to_build_ratio: ratio,
             allow_inner_join,
@@ -103,7 +94,7 @@ impl PhysicalOptimizerRule for EnableCascadingBloomRule {
         plan: Arc<dyn ExecutionPlan>,
         _config: &ConfigOptions,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
-        let trace = std::env::var_os("EMAT_L9_TRACE").is_some();
+        let trace = crate::flags::present("EMAT_L9_TRACE");
         plan.transform_up(|node| {
             let Some(hj) = node.as_any().downcast_ref::<HashJoinExec>() else {
                 return Ok(Transformed::no(node));

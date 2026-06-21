@@ -61,12 +61,12 @@ flow run-due --module my_pipelines    # cron-style; drop into systemd / cron / k
   scales through the production preset (fresh context per query, each
   engine in its own process — no bench-only tricks): ematix-flow takes
   **22 / 22** at SF=1 (**2.35×** DuckDB, **3.89×** Polars, **17×**
-  single-node PySpark), **17 / 22** at SF=10 (**1.24×** DuckDB), and
-  **16 / 22** at SF=100 (**1.58×** DuckDB) — fastest of all five
-  engines; head-to-head it beats DuckDB on 22 / 19 / 18 of 22 in the
-  same isolated protocol, and leads the geomean at every scale. Full
-  numbers, the losses included, and the reproducer in
-  [Benchmarks](#benchmarks).
+  single-node PySpark), **22 / 22** at SF=10 (**1.58×** DuckDB), and
+  **14 / 22** at SF=100 (**1.18×** DuckDB) — head-to-head vs DuckDB it
+  wins **22 / 22 / 14** of 22 in the same isolated protocol (at SF=100,
+  Q8 + Q10 are consistent losses and 6 more sit within run-to-run noise),
+  and leads the geomean at every scale. Full numbers, the losses
+  included, and the reproducer in [Benchmarks](#benchmarks).
 - **Scheduling + DAG, no service to operate.** Pipelines carry their own
   cron schedule and `depends_on=` edges (with cycle detection and exponential-
   backoff retries). Run `flow run-due` from cron, systemd, a k8s `CronJob`,
@@ -1480,22 +1480,25 @@ memory. Polars runs the in-process harness (Q14/Q15 re-measured 2026-06-11,
 other columns carried from 2026-06-10 / 2026-05-29-31); PySpark is
 `local[*]` on the JVM; Postgres 14 is `EXPLAIN ANALYZE` Execution Time.
 
-| Scale | ematix-flow wins | vs DuckDB | vs Polars | vs PySpark | vs Postgres |
+| Scale | wins vs DuckDB | DuckDB geomean | vs Polars | vs PySpark | vs Postgres |
 |---|:--|--:|--:|--:|--:|
 | **SF=1** (~1 GB, in-cache) | **22 / 22** | 2.35× | 3.89× | 16.8× | 15.5× |
-| **SF=10** (~10 GB) | **17 / 22** | 1.24× | 3.72× | 11.1× | 20.2× |
-| **SF=100** (~100 GB) | **16 / 22** | 1.58× | 4.70× | 7.9× | 62× † |
+| **SF=10** (~10 GB) | **22 / 22** | 1.58× | 3.72× | 11.1× | 20.2× |
+| **SF=100** (~100 GB) | **14 / 22** ‡ | 1.18× | 4.70× | 7.9× | 62× † |
 
-Geomean of competitor ÷ ematix-flow across the 22 queries (Polars n=21
-at SF=10 / n=17 at SF=100; **†** Postgres ran 6 / 22 at SF=100 under a
-90 s cap). The "wins" column is fastest-of-all-five; head-to-head, the
-apples-to-apples comparison is ematix-flow vs DuckDB in the same isolated
-protocol — **22 / 19 / 18** of 22. The queries ematix-flow doesn't win are
-named, not hidden: at SF=10 DuckDB takes Q05, Q07, and Q18 (each within
-~13-21%) and Polars edges Q14 / Q15; at SF=100 DuckDB takes Q10 (the
-wide-string customer aggregate), Q16, and Q18 (Q11 a 0.1 ms tie) and Polars
-takes Q06 / Q14. ematix-flow leads the geomean at every scale — 2.35× (SF=1),
-1.24× (SF=10), 1.58× (SF=100).
+The Polars / PySpark / Postgres columns are geomean of competitor ÷
+ematix-flow across the 22 queries (Polars n=21 at SF=10 / n=17 at SF=100;
+**†** Postgres ran 6 / 22 at SF=100 under a 90 s cap) — **carried from
+earlier runs**, not co-measured today. The **wins vs DuckDB** column is
+head-to-head in the same isolated protocol — **22 / 22 / 14** of 22. The
+queries ematix-flow doesn't win are named, not hidden: at SF=1 and SF=10 it
+wins **every** query vs DuckDB (Q05 flipped via the #159 transitive-dim-semi
+splice — the 22nd SF=10 win); **‡** at SF=100, across 3 independent sweeps
+DuckDB consistently takes **Q10** (~0.73×) and **Q8** (~0.95×) — the
+wide-string / high-RSS queries — and 6 more (Q3/Q5/Q9/Q16/Q18/Q21) swing
+±10-30% on cache/thermal state and aren't individually decidable. ematix-flow
+leads the DuckDB geomean at every scale — 2.35× (SF=1), 1.58× (SF=10),
+1.18× (SF=100).
 Full tables, tabbed by scale, are on the docs site:
 [ematix.dev/reference/benchmarks](https://ematix.dev/reference/benchmarks).
 SF=1 in full (the README's headline scale):
