@@ -49,6 +49,9 @@ pub mod combine_agg_exec;
 // payload cols by first-occurrence + interleave gather. Operator + opt-in rule build
 // on this. Correct ONLY under the functional dependency the rule proves.
 pub mod fd_aggregate;
+// FdAggregateExec — single-phase SUM GROUP BY (i64 key + FD payload) operator built
+// on fd_aggregate. Requires HashPartitioned([key]) input; opt-in swap rule installs it.
+pub mod fd_aggregate_exec;
 // HJ.3: pre-plan rule that swaps stock HashJoinExec → EmatixHashJoinExec
 // on the validated shape (Inner, CollectLeft, single i64 key). Opt-in
 // via EMAT_HASH_JOIN=1.

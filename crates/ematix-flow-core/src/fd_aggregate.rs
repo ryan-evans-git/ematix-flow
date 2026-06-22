@@ -244,8 +244,16 @@ mod tests {
         let pa = p[0].as_any().downcast_ref::<StringArray>().unwrap();
         let mut out: BTreeMap<Option<i64>, (Option<f64>, String)> = BTreeMap::new();
         for i in 0..ka.len() {
-            let key = if ka.is_null(i) { None } else { Some(ka.value(i)) };
-            let sum = if sa.is_null(i) { None } else { Some(sa.value(i)) };
+            let key = if ka.is_null(i) {
+                None
+            } else {
+                Some(ka.value(i))
+            };
+            let sum = if sa.is_null(i) {
+                None
+            } else {
+                Some(sa.value(i))
+            };
             out.insert(key, (sum, pa.value(i).to_string()));
         }
         out
@@ -312,9 +320,15 @@ mod tests {
         assert_eq!(acc.num_groups(), 1);
         let (k, s, p) = acc.finalize().unwrap();
         assert_eq!(k.len(), 1);
-        assert_eq!(s.as_any().downcast_ref::<Float64Array>().unwrap().value(0), 4.0);
         assert_eq!(
-            p[0].as_any().downcast_ref::<StringArray>().unwrap().value(0),
+            s.as_any().downcast_ref::<Float64Array>().unwrap().value(0),
+            4.0
+        );
+        assert_eq!(
+            p[0].as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .value(0),
             "a"
         );
     }
