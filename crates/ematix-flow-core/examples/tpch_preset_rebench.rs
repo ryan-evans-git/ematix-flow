@@ -575,7 +575,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "[peak] skip_ematix={} skip_duckdb={} qids={} peak_rss_mb={:.0}",
         skip_ematix as u8,
         skip_duckdb as u8,
-        qids.iter().map(|q| q.to_string()).collect::<Vec<_>>().join("."),
+        qids.iter()
+            .map(|q| q.to_string())
+            .collect::<Vec<_>>()
+            .join("."),
         ematix_flow_core::heap_pressure::peak_rss_mb().unwrap_or(0.0)
     );
 
