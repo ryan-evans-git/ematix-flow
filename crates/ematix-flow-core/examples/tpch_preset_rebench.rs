@@ -159,6 +159,45 @@ fn rss_mb() -> f64 {
         .unwrap_or(f64::NAN)
 }
 
+/// SF=100 DIAG — cumulative process CPU seconds (user+sys, ALL threads incl.
+/// the in-process DuckDB pool) via `getrusage`. Diff around a timed region →
+/// that region's total CPU; `cpu_s / wall_s` = mean cores busy = parallel
+/// efficiency (14 cores on this box). ~ns, no fork; call adjacent to the timed
+/// region. Distinguishes "we do the same work as DuckDB but use fewer cores"
+/// (parallel-efficiency loss) from "we do more work" (compute-excess loss).
+fn cpu_secs() -> f64 {
+    let mut u: libc::rusage = unsafe { std::mem::zeroed() };
+    if unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut u) } != 0 {
+        return f64::NAN;
+    }
+    let tv = |t: libc::timeval| t.tv_sec as f64 + t.tv_usec as f64 / 1e6;
+    tv(u.ru_utime) + tv(u.ru_stime)
+}
+
+/// SF=100 DIAG — cumulative system page-ins (pages faulted from disk) from
+/// `vm_stat`. Diff around a region × 16 KiB page = MB read from disk during it.
+/// THE cache-pressure signal: a "warm" timed trial that still pages in GBs is
+/// re-reading its column set every run because the working set exceeds the page
+/// cache (the SF=100 cold-read class). System-wide (not process-local) and a
+/// ~10 ms fork — call OUTSIDE the timed region only; interpret at pass scale.
+fn pageins() -> u64 {
+    std::process::Command::new("vm_stat")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .and_then(|s| {
+            s.lines()
+                .find(|l| l.contains("Pageins"))
+                .map(|l| l.to_string())
+        })
+        .and_then(|l| l.split_whitespace().last().map(|t| t.to_string()))
+        .and_then(|t| t.trim_end_matches('.').parse::<u64>().ok())
+        .unwrap_or(0)
+}
+
+/// Page size for `pageins()` MB accounting — 16 KiB on Apple Silicon.
+const PAGE_BYTES: f64 = 16384.0;
+
 /// WIN.SF100.SWEEP — return mimalloc-retained heap to the OS after
 /// each measurement (outside the timed region), DEFAULT ON (opt-out
 /// `EMAT_MI_COLLECT=0`), mirroring the production worker's identical
@@ -482,12 +521,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // (build_ematix_ctx == preset::with_optimizer_rules == run_shard.rs).
                 if !skip_ematix {
                     let q_ctx = build_ematix_ctx(&data_dir)?;
+                    let (cpu0, pi0) = (cpu_secs(), pageins());
                     let res = time_ematix(&q_ctx, sql).await;
+                    let cpu_s = cpu_secs() - cpu0;
+                    let pin_mb = pageins().saturating_sub(pi0) as f64 * PAGE_BYTES / 1e6;
                     let collected = mi_collect_if_requested();
                     match res {
                         Ok((ms, r)) => {
+                            let eff = if ms > 0.0 { cpu_s / (ms / 1000.0) } else { 0.0 };
                             eprintln!(
-                                "[trial] eng=ematix q={q:02} ti={ti} ms={ms:.1} rss_mb={:.0} cur_mb={:.0} collect={}",
+                                "[trial] eng=ematix q={q:02} ti={ti} ms={ms:.1} rss_mb={:.0} cur_mb={:.0} collect={} cpu_s={cpu_s:.2} eff={eff:.1} pin_mb={pin_mb:.0}",
                                 rss_mb(),
                                 ematix_flow_core::heap_pressure::current_rss_mb().unwrap_or(0.0),
                                 collected as u8
@@ -499,10 +542,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 if !skip_duckdb {
-                    match time_duckdb(&data_dir, sql) {
+                    let (cpu0, pi0) = (cpu_secs(), pageins());
+                    let res = time_duckdb(&data_dir, sql);
+                    let cpu_s = cpu_secs() - cpu0;
+                    let pin_mb = pageins().saturating_sub(pi0) as f64 * PAGE_BYTES / 1e6;
+                    match res {
                         Ok((ms, r)) => {
+                            let eff = if ms > 0.0 { cpu_s / (ms / 1000.0) } else { 0.0 };
                             eprintln!(
-                                "[trial] eng=duckdb q={q:02} ti={ti} ms={ms:.1} rss_mb={:.0}",
+                                "[trial] eng=duckdb q={q:02} ti={ti} ms={ms:.1} rss_mb={:.0} cpu_s={cpu_s:.2} eff={eff:.1} pin_mb={pin_mb:.0}",
                                 rss_mb()
                             );
                             d_times.entry(*q).or_default().push(ms);
@@ -514,6 +562,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     } // end else (trial-major interleave)
+
+    // SF=100 DIAG — final process peak RSS (getrusage, monotone). Meaningful
+    // only in an ISOLATED run (SKIP_EMATIX=1 or SKIP_DUCKDB=1): then it is that
+    // one engine's peak. The diagnostic driver pairs two isolated runs to
+    // compare ematix-vs-DuckDB peak RSS without the in-process pollution that
+    // an interleaved run would cause (DuckDB is the same process here).
+    // `qids` lets the classifier attribute this peak to a single query when the
+    // diagnostic driver runs one query per isolated process (peak RSS is
+    // process-wide and monotone, so it is per-query only with one query/process).
+    eprintln!(
+        "[peak] skip_ematix={} skip_duckdb={} qids={} peak_rss_mb={:.0}",
+        skip_ematix as u8,
+        skip_duckdb as u8,
+        qids.iter()
+            .map(|q| q.to_string())
+            .collect::<Vec<_>>()
+            .join("."),
+        ematix_flow_core::heap_pressure::peak_rss_mb().unwrap_or(0.0)
+    );
 
     // Report.
     println!(
