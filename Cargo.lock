@@ -3732,6 +3732,7 @@ dependencies = [
 name = "ematix-flow-core"
 version = "0.11.0"
 dependencies = [
+ "ahash 0.8.12",
  "apache-avro",
  "arrow-array",
  "arrow-cast",
@@ -3767,6 +3768,7 @@ dependencies = [
  "futures-util",
  "google-cloud-auth",
  "google-cloud-pubsub",
+ "hashbrown 0.16.1",
  "hyperloglogplus",
  "lapin",
  "libc",

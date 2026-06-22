@@ -45,12 +45,12 @@ pub mod emat_push_pipeline_exec;
 // + direct parallel combine (no shuffle). Opt-in via the swap rule.
 pub mod clustered_agg_rule;
 pub mod combine_agg_exec;
-// FD-aware SUM-agg kernel (Q10 SF=100 lever): hash i64 key only, carry FD-determined
-// payload cols by first-occurrence + interleave gather. Operator + opt-in rule build
-// on this. Correct ONLY under the functional dependency the rule proves.
+// FD-aware SUM-agg kernel (Q10 SF=100 lever): row-encode an FD-minimal composite key
+// subset only, carry FD-determined group cols by first-occurrence + interleave gather.
+// Operator + opt-in rule build on this. Correct ONLY under the FD the rule proves.
 pub mod fd_aggregate;
-// FdAggregateExec — single-phase SUM GROUP BY (i64 key + FD payload) operator built
-// on fd_aggregate. Requires HashPartitioned([key]) input; opt-in swap rule installs it.
+// FdAggregateExec — single-phase SUM GROUP BY grouping on an FD-minimal key subset of
+// the group exprs. Requires HashPartitioned([key subset]) input; opt-in rule installs it.
 pub mod fd_aggregate_exec;
 // HJ.3: pre-plan rule that swaps stock HashJoinExec → EmatixHashJoinExec
 // on the validated shape (Inner, CollectLeft, single i64 key). Opt-in

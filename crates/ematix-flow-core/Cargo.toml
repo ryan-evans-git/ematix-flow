@@ -52,6 +52,11 @@ regex = "1"
 # substring search (two-way + AVX2/NEON). Used by the like_matcher
 # module to evaluate LIKE patterns Photon-style on raw byte slices.
 memchr = "2"
+# FD-aggregate kernel (Q10 SF=100 lever): arrow row-format composite group key +
+# raw open-addressing table, mirroring DataFusion's GroupValuesRows. Versions
+# match what DataFusion already locks transitively (no new downloads).
+ahash = "0.8"
+hashbrown = "0.16"
 arrow-array = { workspace = true }
 arrow-schema = { workspace = true }
 arrow-csv = { workspace = true }

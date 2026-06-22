@@ -24,7 +24,13 @@ use datafusion::arrow::compute::take;
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::datasource::MemTable;
+use datafusion::physical_expr::Partitioning;
+use datafusion::physical_expr::PhysicalExpr;
+use datafusion::physical_expr::expressions::Column;
+use datafusion::physical_plan::collect;
+use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::prelude::{SessionConfig, SessionContext};
+use ematix_flow_core::fd_aggregate_exec::FdAggregateExec;
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -376,6 +382,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (batch, schema) = gen_data(rows, groups);
     eprintln!("generated.");
 
+    // Faithful parallel input: a real scan yields many partitions (row groups), so the
+    // RepartitionExec/aggregate read in parallel. A 1-partition MemTable serializes the
+    // RepartitionExec INPUT side single-threaded (eff≈1), starving the operator — an
+    // artifact, not an operator flaw. Split the single batch into P partitions for BOTH
+    // DataFusion-driven arms (A and K).
+    let n_input_parts = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(8);
+    let parts: Vec<Vec<RecordBatch>> = {
+        let n = batch.num_rows();
+        let chunk = n.div_ceil(n_input_parts);
+        (0..n_input_parts)
+            .filter_map(|p| {
+                let off = p * chunk;
+                (off < n).then(|| vec![batch.slice(off, chunk.min(n - off))])
+            })
+            .collect()
+    };
+    eprintln!("split into {} input partitions", parts.len());
+
     let sql = "select c_custkey, c_name, sum(revenue) as revenue, c_acctbal, n_name, \
         c_address, c_phone, c_comment from t \
         group by c_custkey, c_name, c_acctbal, c_phone, n_name, c_address, c_comment";
@@ -383,14 +409,85 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ArmA: DataFusion's real multi-column (7-col) group-by kernel.
     let run_a = || {
         let schema = schema.clone();
-        let batch = batch.clone();
+        let parts = parts.clone();
         let sql = sql.to_string();
         async move {
             let ctx = SessionContext::new_with_config(SessionConfig::new());
-            let mem = MemTable::try_new(schema, vec![vec![batch]]).unwrap();
+            let mem = MemTable::try_new(schema, parts).unwrap();
             ctx.register_table("t", Arc::new(mem)).unwrap();
             let df = ctx.sql(&sql).await.unwrap();
             let batches = df.collect().await.unwrap();
+            let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+            rows
+        }
+    };
+
+    // ArmK: the REAL FdAggregateExec operator end-to-end —
+    //   scan -> RepartitionExec(Hash[c_custkey, n_name]) -> FdAggregateExec (single phase).
+    // This is the FAITHFUL operator cost: it pays the real repartition (streaming, so
+    // RSS-safe at SF=100) materializing the wide payload per batch, PLUS the production
+    // RowConverter+ahash+collision-safe kernel — unlike the idealized index-scatter arms
+    // above (which never materialize wide strings outside the final gather). If this beats
+    // ArmA, the operator is the real win; the rule is justified.
+    let run_k = || {
+        let schema = schema.clone();
+        let parts = parts.clone();
+        async move {
+            let ctx = SessionContext::new_with_config(SessionConfig::new());
+            let nparts = ctx.state().config().target_partitions();
+            let mem = MemTable::try_new(schema, parts).unwrap();
+            ctx.register_table("t", Arc::new(mem)).unwrap();
+            let child = ctx
+                .sql(
+                    "SELECT c_custkey, c_name, c_acctbal, c_phone, n_name, c_address, \
+                     c_comment, revenue FROM t",
+                )
+                .await
+                .unwrap()
+                .create_physical_plan()
+                .await
+                .unwrap();
+            // Group exprs in Q10 GROUP BY order; FD-minimal key = {c_custkey(0), n_name(4)}.
+            let group_exprs: Vec<(Arc<dyn PhysicalExpr>, String)> = vec![
+                (
+                    Arc::new(Column::new("c_custkey", 0)),
+                    "c_custkey".to_string(),
+                ),
+                (Arc::new(Column::new("c_name", 1)), "c_name".to_string()),
+                (
+                    Arc::new(Column::new("c_acctbal", 2)),
+                    "c_acctbal".to_string(),
+                ),
+                (Arc::new(Column::new("c_phone", 3)), "c_phone".to_string()),
+                (Arc::new(Column::new("n_name", 4)), "n_name".to_string()),
+                (
+                    Arc::new(Column::new("c_address", 5)),
+                    "c_address".to_string(),
+                ),
+                (
+                    Arc::new(Column::new("c_comment", 6)),
+                    "c_comment".to_string(),
+                ),
+            ];
+            let key_positions = vec![0usize, 4usize];
+            let key_exprs: Vec<Arc<dyn PhysicalExpr>> = key_positions
+                .iter()
+                .map(|&p| group_exprs[p].0.clone())
+                .collect();
+            let repart = Arc::new(
+                RepartitionExec::try_new(child, Partitioning::Hash(key_exprs, nparts)).unwrap(),
+            );
+            let op = Arc::new(
+                FdAggregateExec::try_new(
+                    repart,
+                    group_exprs,
+                    key_positions,
+                    Arc::new(Column::new("revenue", 7)),
+                    "revenue".to_string(),
+                )
+                .unwrap(),
+            );
+            let batches = collect(op, ctx.task_ctx()).await.unwrap();
             let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
             rows
         }
@@ -526,5 +623,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
     };
     println!("VERDICT (composite {{c_custkey, n_name}} — the Q10 key): {comp_verdict}");
+
+    // ArmK : the REAL operator (repartition + production kernel) — the number that
+    // actually decides whether to build the rule.
+    for _ in 0..warmups {
+        let _ = run_k().await;
+    }
+    let (mut wk, mut ck2) = (Vec::new(), Vec::new());
+    let mut k_rows = 0usize;
+    for _ in 0..trials {
+        let c0 = cpu_secs();
+        let t = Instant::now();
+        k_rows = run_k().await;
+        wk.push(t.elapsed().as_secs_f64() * 1000.0);
+        ck2.push(cpu_secs() - c0);
+    }
+    let (wkm, ckm) = (median(&mut wk), median(&mut ck2));
+    println!(
+        "{:<22} {wkm:>9.1} {ckm:>9.2} {:>6.1} {:>12}",
+        "K: real operator",
+        ckm / (wkm / 1000.0),
+        k_rows
+    );
+    let k_ok = k_rows == a_rows;
+    let k_verdict = if k_ok && wkm < wam {
+        format!(
+            "GO ✓  (operator {wkm:.0}ms < A {wam:.0}ms, {:.2}x wall; CPU-work A/K = {:.2}x)",
+            wam / wkm,
+            cam / ckm
+        )
+    } else if k_ok {
+        format!("NO-GO ✗  (operator {wkm:.0}ms !< A {wam:.0}ms — repartition-take erodes the win)")
+    } else {
+        format!("NO-GO ✗  (operator incorrect: {k_rows} groups vs {a_rows})")
+    };
+    println!("VERDICT (REAL FdAggregateExec operator vs DataFusion): {k_verdict}");
     Ok(())
 }
