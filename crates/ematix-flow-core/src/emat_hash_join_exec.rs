@@ -89,6 +89,17 @@ impl EmatixHashJoinExec {
     pub fn probe_key_idx(&self) -> usize {
         self.probe_key_idx
     }
+
+    /// Q10-flip increment 3 (wiring): hand the SHARED build handle to a
+    /// downstream [`crate::late_gather_exec::LateGatherExec`] so it can
+    /// `gather_build_cols` the wide build columns at the (far smaller) aggregate
+    /// output from the IDENTICAL resident build batches — no customer re-scan.
+    /// Valid only when this exact operator instance stays in the executed plan
+    /// (the build is initialized lazily on first `execute`); do not call
+    /// `with_new_children` on it after sharing, as that mints a fresh `OnceCell`.
+    pub fn build_once(&self) -> Arc<OnceCell<Arc<EmatHashJoiner>>> {
+        self.build_once.clone()
+    }
 }
 
 impl std::fmt::Debug for EmatixHashJoinExec {
