@@ -191,6 +191,19 @@ a ~9% WIN over DuckDB.** The wide-string late-mat lever (§2) is real AND realiz
 §3a/§3b/§3c "kernel gap / at-floor" conclusions are SUPERSEDED — the gap was the gather's
 batch granularity + build serialization, both cheaply fixable.
 
+**★ prod-D CORRECTION (controlled A/B): the batch-size lever is ISOLATED-only.** The
+§3d numbers above are ISOLATED-WARM (single query). A controlled preset in-sweep A/B
+(`tpch_preset_rebench` fresh_ctx) shows a GLOBAL batch=1M REGRESSES every query at
+SF100 (1.06–1.42×) and SF10 (1.02–1.12×) — larger batches bloat in-flight RSS and evict
+the 36GB page cache (box artifact). So a global bump is NO-GO. The ROBUST cross-protocol
+signal is that late-mat does **~15–20% less CPU** than stock at every batch size. The
+production design is a **per-scan large batch for the late-mat BUILD scan only** (the
+build holds the same 15M customer rows regardless of batch granularity → no extra RSS;
+lineitem/probe stay 8192 → no global eviction) — gets the cheap StringView gather without
+the in-sweep cost. UNMEASURED; validate in prod-C on the preset in-sweep path. The
+"~9% over DuckDB" headline is an isolated-warm (floor-regime) result; in-sweep is the
+box-artifact regime where both engines suffer.
+
 **Still a SPIKE — productionization (the real remaining work):**
 - **FD-detect planner rule** (correctness-critical): fire only when the group key ⊇ a
   PROVEN PK functionally determining the wide cols. The spike picks the key by NAME.

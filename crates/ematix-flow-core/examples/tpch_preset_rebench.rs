@@ -35,9 +35,18 @@ const TPCH_TABLES: &[&str] = &[
 
 /// EXACT production context (mirrors run_shard.rs lines 93-110).
 fn build_ematix_ctx(data_dir: &Path) -> Result<SessionContext, Box<dyn std::error::Error>> {
+    // prod-D probe: EMAT_BATCH_SIZE overrides the default 8192-row batch size. The
+    // Q10 late-mat reattach wants few, large build batches; this measures the broad
+    // 22q effect of a larger global batch size at SF=100 vs the SF=10 regression risk.
+    let mut config = SessionConfig::new();
+    if let Ok(n) = std::env::var("EMAT_BATCH_SIZE").map(|s| s.parse::<usize>()) {
+        if let Ok(n) = n {
+            config = config.with_batch_size(n);
+        }
+    }
     let mut builder = preset::with_optimizer_rules(
         SessionStateBuilder::new()
-            .with_config(SessionConfig::new())
+            .with_config(config)
             .with_default_features(),
     );
     // EMAT_TEST_HJ_SWAP=1: install the (NOT-in-preset) EmatixHashJoin swap rule so
