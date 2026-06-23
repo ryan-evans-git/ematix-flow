@@ -290,3 +290,68 @@ cheap. The alternative (match DuckDB's in-place wide-key kernels: compressed gro
 - `crates/ematix-flow-core/examples/q10_lategather_e2e.rs` — the kill-gate spike.
 - `crates/ematix-flow-core/src/emat_hash_join_exec.rs` — added `pub fn build_once()` accessor.
 - Fresh DuckDB profile: `duckdb_profile_dump 10` SF=100 (20.5 CPU-s / 1950ms).
+
+---
+
+## §5 PRODUCTIONIZATION — DELIVERED (2026-06-23, `feat/fd-agg-composite`)
+
+The banked spike is now a sound, general, committed production rule (opt-in
+`EMAT_LATE_MAT_AGG=1`, default OFF). It fires on Q10 ONLY across all 22 queries
+and is correct everywhere.
+
+### What shipped
+- **prod-A** (`90fafd4`) — `EmatixFastParquetTableProvider::with_primary_key` +
+  `TableProvider::constraints()`. Declared PK (a catalog's DDL), NOT inferred from
+  parquet stats. DataFusion derives `{pk}→{cols}` and propagates it to the
+  aggregate input (verified on the real Q10 plan: `{c_custkey}→{5 wide cols}`,
+  `n_name` correctly NOT covered).
+- **prod-B** (`2e7a668` detector, recognizer commit) — `late_mat_agg.rs`:
+  `fd_minimal_group_key` (FD-closure key reduction) + `analyze`/`reconstruct` +
+  `LateMatAggNode` (`UserDefinedLogicalNodeCore`). Recognizes the sound shape:
+  anchor = declared-PK group col that FD-determines the wide cols; fold a dim into
+  the build ONLY when it joins via its OWN declared PK (many-to-one → build stays
+  1:1 with the anchor → grouping the build-rowid ≡ grouping the full wide key);
+  split build/probe on the single anchor-PK = fact-FK edge.
+- **prod-C** (`late_mat_agg_planner.rs`) — `LateMatAggPlanner` (`ExtensionPlanner`)
+  expands the node into `EmatixHashJoinExec(BuildRowId)` → `Repartition(rowid)` →
+  `AggregateExec(rowid)` → `LateGatherExec`. Aggregates rebuilt physically via
+  `create_physical_expr`. Wired into `FlowQueryPlanner` (mirrors the PV.3b path).
+  Also: `EmatixHashJoinExec::with_new_children` now PRESERVES the shared
+  `build_once` (the physical optimizer rewrites the join's children after
+  `LateGatherExec` captured it — a fresh cell left the gatherer pointing at an
+  uninitialized build).
+- **prod-E** gates — env-free soundness test: over ALL 22q with every PK declared
+  the rewrite fires on **Q10 only** and is row-for-row identical to stock; SF1
+  end-to-end correctness (direct + through FlowQueryPlanner); full lib suite 1233/0.
+
+### The win IS realized through the shipped path — but it's COUPLED to batch size
+`q10_late_mat_prod_ab` (production planner, SF=100, isolated-warm, M4 Max):
+
+| arm | exec batch | wall | CPU | vs DuckDB (~1950–2250) |
+|---|---|---|---|---|
+| stock | 8192 (default) | 2809ms | 35.8 | loss |
+| stock | 1M | 2123ms | 25.3 | parity (−24% from batch alone) |
+| **late-mat** | **1M** | **1941ms** | **22.7** | **WIN** (−8.6% more) |
+
+- The late-mat rewrite reaches the spike's number (1941 ≈ 1982–2101) through
+  production code — **rule #1 vindicated again**: the win is real and realizable
+  end-to-end, not a spike artifact.
+- **Coupling (the key finding, profiled not inferred):** the wide build cols are
+  Utf8View; `LateGatherExec` interleaves them across the retained build batches —
+  cheap ONLY with few large batches. At the default 8192 the build emits ~1830
+  sources and late-mat is a net **LOSS** (2858 vs 2809). **Batch size is a RUNTIME
+  `TaskContext` parameter** (the build's `HashJoinExec` output sizing reads it at
+  execute time); a plan-time per-build re-plan is dead (profiled: 8192-row build
+  batches regardless) and was removed. The build inherits the SESSION batch.
+- A global large batch also speeds the 600M-row probe fact decode (the −24% on
+  stock), but **prod-D found a global bump regresses the other 21 queries**, so a
+  default-on late-mat is **blocked on a query-scoped batch mechanism**.
+
+### Verdict
+SHIP **opt-in** (`EMAT_LATE_MAT_AGG=1`), banked as correct, default-inert,
+zero-regression infra — paired with a large session batch for the wide-string-
+aggregate workload (then Q10 SF=100 = 1941ms, beats DuckDB, −31% vs default
+stock). **Default-on follow-on:** a query-scoped execution batch size — e.g. the
+recognizer emits a "preferred batch size" hint the session honors for THIS query
+only — which would also unlock prod-D's general large-batch SF=100 wins without
+the 22q regression.
