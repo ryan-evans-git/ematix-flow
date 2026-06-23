@@ -391,3 +391,36 @@ ships opt-in (`EMAT_LATE_MAT_AGG=1`), now a self-contained −31% Q10 SF=100 win
 **Bonus:** `BatchSizeOverrideExec` is general infra — it also unblocks prod-D's
 broader SF=100 large-batch wins (NO-GO only because they were global) by scoping
 a large batch to any shape that benefits.
+
+---
+
+## §7 PATH TO DEFAULT-ON — PK wiring + 22q A/B gate CLEARED (2026-06-23)
+
+- **PK wiring** (`tpch_preset_rebench`): declares the TPC-H PKs (harness
+  scaffolding; a real catalog uses DDL) when `EMAT_TPCH_PK=1` OR the rule is on,
+  so late-mat fires on the production-faithful preset path. Default off → baseline
+  byte-identical.
+- **Shape gate** (`EMAT_LM_MIN_WIDE_COLS`, default 3): the recognizer ALSO fired
+  on Q18 in the preset path (the ematix walkers reshape it into a late-mat star) —
+  a +28% SF=10 regression (correct but slow: Q18 drops only 1 wide string,
+  c_name; the CollectLeft+reattach doesn't pay). Gate requires ≥3 string-typed
+  group columns: Q10 carries 5 (fires/wins), Q18 carries 1 (gated out). General,
+  not TPC-H-keyed.
+
+**22q SF=10 A/B gate (preset path, interleaved 3-round, baseline vs full package
+PK+rule+gate):** every query within ±4% (the SF=10 noise floor), **Q10 −3.9%
+(neutral), ZERO regressions.** Q18 +1.5% (was +28%). The FD-on-catalog effect
+(declaring PKs) is captured here and is neutral. ★ A first sequential A-then-B run
+showed a spurious uniform +3-4% offset = cross-run thermal drift; interleaving
+removed it (Q10 — the only query the rule touches — was the tell at +0.7% vs
+PK-only). **Q10 SF=100 with the gate: still fires + wins (2018ms/21.7 CPU vs stock
+2915/31.8 = 31% faster, beats DuckDB, exact-correct).**
+
+### Default-on status
+GATES CLEARED: rule fires Q10-only (shape gate), SF=10 22q regression-free, SF=100
+Q10 +31% win, correct everywhere. Flipping the library default to on is LOW RISK —
+it only activates where PKs are declared AND the ≥3-wide-string star shape exists
+(inert otherwise). Remaining nice-to-have before the flip: a SF=100 22q sweep to
+confirm the FD-on-catalog effect is also neutral at SF=100 (box-artifact-
+dominated; the isolated Q10 win + SF=10 22q neutrality are the strong evidence).
+Shipped opt-in (`EMAT_LATE_MAT_AGG=1`) and ready to flip on the user's call.
