@@ -50,6 +50,12 @@ pub struct EmatixHashJoinExec {
     /// late-materialization de-risk). `build_time` is the serial hash-table
     /// insert (timed once inside the build closure); `probe_time` the probe.
     metrics: ExecutionPlanMetricsSet,
+    /// P2' build/probe overlap baked in per-instance (not just the global
+    /// `EMAT_HJ_OVERLAP` env). The late-mat planner sets this `true`: overlap is
+    /// REQUIRED for the Q10 win (without it the serial 15M build is not hidden
+    /// behind the probe decode — measured SF=100: eff 7.9 / 2779ms vs eff 10.5 /
+    /// 2322ms with). `execute()` enables overlap when this OR the env is set.
+    overlap: bool,
 }
 
 impl EmatixHashJoinExec {
@@ -80,7 +86,15 @@ impl EmatixHashJoinExec {
             properties,
             build_once: Arc::new(OnceCell::new()),
             metrics: ExecutionPlanMetricsSet::new(),
+            overlap: false,
         }
+    }
+
+    /// Bake in P2' build/probe overlap for this instance (the late-mat planner
+    /// uses this — overlap is required for the Q10 win, see the `overlap` field).
+    pub fn with_overlap(mut self, on: bool) -> Self {
+        self.overlap = on;
+        self
     }
 
     pub fn build_key_idx(&self) -> usize {
@@ -183,6 +197,7 @@ impl ExecutionPlan for EmatixHashJoinExec {
             properties,
             build_once: self.build_once.clone(),
             metrics: self.metrics.clone(),
+            overlap: self.overlap,
         }))
     }
 
@@ -201,6 +216,7 @@ impl ExecutionPlan for EmatixHashJoinExec {
         let stream_schema = self.schema.clone();
         let build_ctx = ctx.clone();
         let metrics = self.metrics.clone();
+        let self_overlap = self.overlap;
 
         let fut = async move {
             // Q10-flip increment 1: time the (serial) build insert once + the probe.
@@ -226,9 +242,10 @@ impl ExecutionPlan for EmatixHashJoinExec {
             // right drain so it overlaps the build; buffer the probe input (the
             // downstream agg/sort breaks the pipeline anyway). Default OFF — the blast
             // radius is buffering the probe side, which only some shapes can afford.
-            let overlap = std::env::var("EMAT_HJ_OVERLAP")
-                .map(|v| v != "0")
-                .unwrap_or(false);
+            let overlap = self_overlap
+                || std::env::var("EMAT_HJ_OVERLAP")
+                    .map(|v| v != "0")
+                    .unwrap_or(false);
             let right_pre = if overlap {
                 let right = right.clone();
                 let ctx = ctx.clone();

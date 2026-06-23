@@ -180,7 +180,22 @@ impl QueryPlanner for FlowQueryPlanner {
                 let planner = DefaultPhysicalPlanner::with_extension_planners(vec![Arc::new(
                     crate::late_mat_agg_planner::LateMatAggPlanner,
                 )]);
-                return planner.create_physical_plan(&rewritten, session_state).await;
+                let plan = planner.create_physical_plan(&rewritten, session_state).await?;
+                // Query-scoped large batch: the LateGather reattach (Utf8View
+                // interleave over the retained build batches) AND the probe fact
+                // decode are cheap only at a large batch — but a GLOBAL bump
+                // regresses the other 21 queries (prod-D). Wrap ONLY this query's
+                // root in a BatchSizeOverrideExec so the large batch is scoped to
+                // the recognized late-mat query (Q10): the win lands at the
+                // session default batch with no 22q regression. Default 1M;
+                // `EMAT_LATE_MAT_BATCH=0` disables (use the session batch, for A/B).
+                let batch = crate::flags::usize_or("EMAT_LATE_MAT_BATCH", 1_048_576);
+                if batch > 0 {
+                    return Ok(Arc::new(
+                        crate::batch_size_override_exec::BatchSizeOverrideExec::new(plan, batch),
+                    ));
+                }
+                return Ok(plan);
             }
         }
 

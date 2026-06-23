@@ -106,14 +106,23 @@ impl ExtensionPlanner for LateMatAggPlanner {
             emat_fields.push(Field::new(f.name(), f.data_type().clone(), f.is_nullable()));
         }
         let emat_schema: SchemaRef = Arc::new(Schema::new(emat_fields));
-        let join = Arc::new(EmatixHashJoinExec::new(
-            build,
-            probe,
-            build_key,
-            probe_key,
-            out_cols,
-            emat_schema.clone(),
-        ));
+        // Overlap is REQUIRED for the win: it hides the serial build (15M-row
+        // customer⋈nation at SF=100) behind the probe fact decode (measured
+        // SF=100: eff 7.9/2779ms without vs eff 10.5/2322ms with). Baked in here
+        // rather than via the global `EMAT_HJ_OVERLAP` env. `EMAT_LM_OVERLAP=0`
+        // opts out (for A/B).
+        let overlap = crate::flags::usize_or("EMAT_LM_OVERLAP", 1) != 0;
+        let join = Arc::new(
+            EmatixHashJoinExec::new(
+                build,
+                probe,
+                build_key,
+                probe_key,
+                out_cols,
+                emat_schema.clone(),
+            )
+            .with_overlap(overlap),
+        );
         let build_once = join.build_once();
         let join_dyn: Arc<dyn ExecutionPlan> = join;
 

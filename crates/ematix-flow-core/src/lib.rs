@@ -42,6 +42,9 @@ pub mod late_mat_agg;
 // prod-C: the late-materialization ExtensionPlanner that expands a LateMatAggNode
 // into the EmatixHashJoinExec(BuildRowId) + agg + LateGatherExec subtree.
 pub mod late_mat_agg_planner;
+// Query-scoped execution batch-size override (the late-mat win's batch lever,
+// applied to ONE query without a global session change — prod-D regression-free).
+pub mod batch_size_override_exec;
 // PV.2: EmatPushPipelineExec — fused push-pipeline ExecutionPlan node
 // (morsel kernel inside; hand-constructed for the Q08 shape, PV.3
 // generalises). Opt-in scaffold; not on any production plan path yet.
