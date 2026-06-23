@@ -71,25 +71,24 @@ impl ExtensionPlanner for LateMatAggPlanner {
                 physical_inputs.len()
             )));
         }
-        // prod-D PERF LEVER: re-plan the BUILD child with a large scan batch size
-        // (default 1M, `EMAT_LM_BUILD_BATCH`). The wide build cols are Utf8View;
-        // the LateGather reattach `interleave`s them across the retained build
-        // batches — at the session 8192 that is ~1830 sources (15M build at
-        // SF100) of byte-copied StringView (~2.2s), but few large batches share
-        // buffers → a near-free gather. Build-LOCAL (the probe keeps the session
-        // batch size, so the prod-D "global 1M is NO-GO" regression is avoided).
-        // `=0` disables the re-plan (use the session-batch build, for A/B).
-        let build_batch = crate::flags::usize_or("EMAT_LM_BUILD_BATCH", 1_048_576);
-        let build = if build_batch > 0 && logical_inputs.len() == 2 {
-            let mut s = session_state.clone();
-            s.config_mut().options_mut().execution.batch_size = build_batch;
-            match planner.create_physical_plan(logical_inputs[0], &s).await {
-                Ok(p) => p,
-                Err(_) => physical_inputs[0].clone(), // best-effort fallback
-            }
-        } else {
-            physical_inputs[0].clone()
-        };
+        // BATCH-SIZE LEVER (prod-D / prod-E finding, 2026-06-23): the wide build
+        // cols are Utf8View, and the LateGather reattach `interleave`s them across
+        // the retained build batches. At the session 8192 that is ~1830 sources
+        // (15M build at SF100) of byte-copied StringView; few LARGE batches share
+        // buffers → near-free gather, which is what flips Q10 to a win (SF100
+        // isolated: late-mat 1941ms / 22.7 CPU vs DuckDB ~1950-2250, vs stock
+        // 2809ms at the default batch). Crucially this batch size is a RUNTIME
+        // `TaskContext` parameter (the build's `HashJoinExec` output sizing reads
+        // it at execute time — a plan-time re-plan of this child does NOT change
+        // it; profiled dead). So the build inherits whatever the session/execution
+        // batch is: the win is realized when the session runs a large batch
+        // (`SessionConfig::with_batch_size`), which also speeds the probe fact
+        // decode (−24% stock alone). Per prod-D a GLOBAL large batch regresses the
+        // other 21 queries, so default-on is blocked on a query-scoped batch
+        // mechanism; the rule ships opt-in (`EMAT_LATE_MAT_AGG`) paired with a
+        // large session batch for the wide-string-aggregate workload.
+        let _ = (planner, logical_inputs); // (no plan-time batch override exists)
+        let build = physical_inputs[0].clone();
         let probe = physical_inputs[1].clone();
         let probe_schema = probe.schema();
 
