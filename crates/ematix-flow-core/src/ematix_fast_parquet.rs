@@ -1872,6 +1872,16 @@ pub struct EmatixFastParquetTableProvider {
     /// stats avoids the cost-model perturbation that makes the dict-distinct
     /// walk unsafe to run eagerly for fact tables (Σ.Q06.SF10.5.h).
     dict_cardinality_memo: Arc<OnceLock<Vec<Option<usize>>>>,
+    /// Q10 wide-string late-mat (prod-A): EXPLICITLY-declared table constraints
+    /// (a PrimaryKey on the unique key column), surfaced via
+    /// [`TableProvider::constraints`]. DataFusion then derives the functional
+    /// dependency `{pk} -> {all cols}` on the scan and propagates it through
+    /// Inner joins + projections, so the wide-string late-materialization rule
+    /// can prove the FD-minimal group key. `None` (the default) → no constraint,
+    /// the rule never fires. SOUND ONLY because the PK is asserted by the
+    /// catalog/DDL (like any SQL PK), NOT inferred from parquet stats (which
+    /// carry no sound global-uniqueness proof). Set via [`Self::with_primary_key`].
+    constraints: Option<datafusion::common::Constraints>,
 }
 
 /// Σ.Q06.SF10 (2026-05-28): cached metadata-derived state for
@@ -2260,6 +2270,7 @@ impl EmatixFastParquetTableProvider {
             streaming_arrow_reader: true,
             narrowed_leaves,
             dict_cardinality_memo: Arc::new(OnceLock::new()),
+            constraints: None,
         })
     }
 
@@ -2284,7 +2295,23 @@ impl EmatixFastParquetTableProvider {
             // reflects a non-narrowed schema → no narrowed leaves.
             narrowed_leaves: Arc::new(Vec::new()),
             dict_cardinality_memo: Arc::new(OnceLock::new()),
+            constraints: None,
         }
+    }
+
+    /// Q10 wide-string late-mat (prod-A): declare a PRIMARY KEY on the given
+    /// column indices, surfaced via [`TableProvider::constraints`]. DataFusion
+    /// derives `{pk} -> {all cols}` and propagates it to aggregate inputs so the
+    /// late-materialization rule can prove an FD-minimal group key. The caller
+    /// (catalog / table registration) ASSERTS uniqueness — this is a soundness
+    /// contract identical to a SQL `PRIMARY KEY`, NOT inferred from data. A wrong
+    /// declaration yields wrong query results, exactly as a wrong DDL PK would.
+    pub fn with_primary_key(mut self, key_col_indices: Vec<usize>) -> Self {
+        use datafusion::common::{Constraint, Constraints};
+        self.constraints = Some(Constraints::new_unverified(vec![Constraint::PrimaryKey(
+            key_col_indices,
+        )]));
+        self
     }
 
     /// Σ.E5a: opt into / out of the Π.10 late-materialisation path.
@@ -2497,6 +2524,14 @@ impl TableProvider for EmatixFastParquetTableProvider {
     }
     fn table_type(&self) -> TableType {
         TableType::Base
+    }
+
+    /// Q10 wide-string late-mat (prod-A): surface the explicitly-declared
+    /// PRIMARY KEY (if any) so DataFusion derives + propagates the functional
+    /// dependency the late-materialization rule needs. `None` unless
+    /// [`Self::with_primary_key`] was called — zero behavioral change otherwise.
+    fn constraints(&self) -> Option<&datafusion::common::Constraints> {
+        self.constraints.as_ref()
     }
 
     /// Σ.Q.M (2026-05-23): expose the file-metadata-derived row count
@@ -4614,6 +4649,113 @@ mod tests {
 
         check(600); // 60% pass → dense-route branch (REV.23)
         check(50); // 5% pass → masked-gather branch
+    }
+
+    /// Q10 late-mat prod-A: `with_primary_key` surfaces a PrimaryKey constraint.
+    #[test]
+    fn with_primary_key_surfaces_pk_constraint() {
+        use ematix_parquet_codec::write::{ColumnData, write_table_to_path};
+        use ematix_parquet_format::types::CompressionCodec;
+        let dir = std::env::temp_dir().join(format!("pk_constraint_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("c.parquet");
+        let k: Vec<i64> = (0..100).collect();
+        let v: Vec<i64> = (1000..1100).collect();
+        write_table_to_path(
+            &path,
+            &[
+                ("c_custkey", ColumnData::I64(&k)),
+                ("c_extra", ColumnData::I64(&v)),
+            ],
+            CompressionCodec::Uncompressed,
+        )
+        .unwrap();
+        let p = EmatixFastParquetTableProvider::try_new(path.to_str().unwrap()).unwrap();
+        assert!(p.constraints().is_none(), "no PK by default");
+        let p = p.with_primary_key(vec![0]);
+        let c = p.constraints().expect("PK declared");
+        assert_eq!(c.len(), 1, "exactly one constraint");
+        assert!(
+            matches!(&c[0], datafusion::common::Constraint::PrimaryKey(cols) if cols == &[0]),
+            "PrimaryKey([0])"
+        );
+    }
+
+    /// Q10 late-mat prod-A: a declared PK derives an FD that DataFusion propagates
+    /// THROUGH an inner join to the aggregate input — the foundation the
+    /// late-materialization recognizer relies on. Differential: present iff PK declared.
+    #[tokio::test]
+    async fn declared_pk_propagates_fd_to_aggregate_input() {
+        use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+        use datafusion::logical_expr::LogicalPlan;
+        use datafusion::prelude::SessionContext;
+        use ematix_parquet_codec::write::{ColumnData, write_table_to_path};
+        use ematix_parquet_format::types::CompressionCodec;
+
+        let dir = std::env::temp_dir().join(format!("pk_fd_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let cust = dir.join("customer.parquet");
+        let ord = dir.join("orders.parquet");
+        let ck: Vec<i64> = (0..100).collect();
+        let cx: Vec<i64> = (1000..1100).collect();
+        write_table_to_path(
+            &cust,
+            &[
+                ("c_custkey", ColumnData::I64(&ck)),
+                ("c_extra", ColumnData::I64(&cx)),
+            ],
+            CompressionCodec::Uncompressed,
+        )
+        .unwrap();
+        let ok: Vec<i64> = (0..100).collect();
+        let oc: Vec<i64> = (0..100).collect();
+        write_table_to_path(
+            &ord,
+            &[
+                ("o_orderkey", ColumnData::I64(&ok)),
+                ("o_custkey", ColumnData::I64(&oc)),
+            ],
+            CompressionCodec::Uncompressed,
+        )
+        .unwrap();
+
+        let sql = "select c_custkey, c_extra, sum(o_orderkey) as s \
+            from customer, orders where c_custkey = o_custkey \
+            group by c_custkey, c_extra";
+
+        // Returns whether the aggregate input carries ANY functional dependency.
+        async fn agg_input_has_fd(pk: bool, cust: &str, ord: &str, sql: &str) -> bool {
+            let ctx = SessionContext::new();
+            let cp = EmatixFastParquetTableProvider::try_new(cust).unwrap();
+            let cp = if pk { cp.with_primary_key(vec![0]) } else { cp };
+            ctx.register_table("customer", Arc::new(cp)).unwrap();
+            ctx.register_table(
+                "orders",
+                Arc::new(EmatixFastParquetTableProvider::try_new(ord).unwrap()),
+            )
+            .unwrap();
+            let plan = ctx.sql(sql).await.unwrap().into_optimized_plan().unwrap();
+            let mut has = false;
+            plan.apply(|n| {
+                if let LogicalPlan::Aggregate(a) = n {
+                    has = !a.input.schema().functional_dependencies().is_empty();
+                }
+                Ok(TreeNodeRecursion::Continue)
+            })
+            .unwrap();
+            has
+        }
+
+        let c = cust.to_str().unwrap();
+        let o = ord.to_str().unwrap();
+        assert!(
+            agg_input_has_fd(true, c, o, sql).await,
+            "declared PK must propagate an FD to the aggregate input (through the join)"
+        );
+        assert!(
+            !agg_input_has_fd(false, c, o, sql).await,
+            "without a declared PK there is no FD (control)"
+        );
     }
 
     #[tokio::test]
