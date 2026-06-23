@@ -164,6 +164,26 @@ impl QueryPlanner for FlowQueryPlanner {
         // un-re-optimized plan on error (correctness is unaffected either way).
         let planned = session_state.optimize(&planned).unwrap_or(planned);
 
+        // prod-C (EMAT_LATE_MAT_AGG=1, default OFF): wide-string late
+        // materialization. When the optimized plan exposes an FD-reducible wide
+        // aggregate over a star whose anchor PK functionally determines the wide
+        // group columns (Q10: customer⋈nation → 7 wide group cols), rewrite the
+        // Aggregate into a `LateMatAggNode` and plan it with the
+        // `LateMatAggPlanner`: the wide strings are carried only as a u32
+        // build-rowid through the join + aggregate and gathered at the (far
+        // smaller) aggregate outputs from the resident build — no re-scan.
+        // Best-effort: `reconstruct` returns None on every other shape, and the
+        // extension planner is registered ONLY on this gated path, so the
+        // default planner stays byte-identical when the flag is off.
+        if crate::late_mat_agg::enabled() {
+            if let Some(rewritten) = crate::late_mat_agg::reconstruct(&planned) {
+                let planner = DefaultPhysicalPlanner::with_extension_planners(vec![Arc::new(
+                    crate::late_mat_agg_planner::LateMatAggPlanner,
+                )]);
+                return planner.create_physical_plan(&rewritten, session_state).await;
+            }
+        }
+
         // PV.3b (EMAT_PUSH_PIPELINE=1, default OFF): rebuild the star's
         // fact-probing dim groups as a single fused push pipeline. The reorder
         // runs AFTER the logical optimizer (so the optimizer never sees — and
@@ -243,6 +263,102 @@ mod tests {
             ctx.register_table(t, Arc::new(prov)).ok()?;
         }
         Some((ctx, dir))
+    }
+
+    /// Q10 tables registered WITH declared PKs (customer/orders/nation) +
+    /// FlowQueryPlanner — the production path the prod-C late-mat wiring needs.
+    async fn q10_ctx_with_planner() -> Option<(SessionContext, PathBuf)> {
+        let dir = sf1_dir()?;
+        let state = SessionStateBuilder::new()
+            .with_config(SessionConfig::new().with_target_partitions(4))
+            .with_default_features()
+            .with_query_planner(Arc::new(FlowQueryPlanner))
+            .build();
+        let ctx = SessionContext::new_with_state(state);
+        let reg = |t: &str, pk: Option<usize>| {
+            let path = dir.join(format!("{t}.parquet"));
+            let mut p =
+                EmatixFastParquetTableProvider::try_new(path.to_string_lossy().into_owned())
+                    .unwrap();
+            if let Some(i) = pk {
+                p = p.with_primary_key(vec![i]);
+            }
+            ctx.register_table(t, Arc::new(p)).unwrap();
+        };
+        reg("customer", Some(0));
+        reg("orders", Some(0));
+        reg("lineitem", None);
+        reg("nation", Some(0));
+        Some((ctx, dir))
+    }
+
+    /// prod-C WIRING: through the production `FlowQueryPlanner`, with
+    /// `EMAT_LATE_MAT_AGG=1` Q10 plans into the late-materialization subtree
+    /// (EmatixHashJoinExec + LateGatherExec) AND returns results identical to the
+    /// flag-off (stock) path. With the flag off the plan is unchanged (no
+    /// LateGatherExec). This is the sole test mutating `EMAT_LATE_MAT_AGG`.
+    #[tokio::test]
+    async fn flow_planner_wires_late_mat_agg_on_q10() {
+        use datafusion::arrow::array::{Array, Float64Array};
+        use datafusion::physical_plan::collect;
+
+        let Some((ctx, dir)) = q10_ctx_with_planner().await else {
+            eprintln!("skip: no SF=1 data");
+            return;
+        };
+        let sql = std::fs::read_to_string("examples/tpch/queries/q10.sql")
+            .or_else(|_| std::fs::read_to_string(dir.join("../../queries/q10.sql")))
+            .unwrap();
+        let sql = sql.trim().trim_end_matches(';');
+
+        let checksum = |batches: &[datafusion::arrow::record_batch::RecordBatch]| {
+            let (mut rows, mut sum) = (0usize, 0.0f64);
+            for b in batches {
+                rows += b.num_rows();
+                if let Ok(i) = b.schema().index_of("revenue") {
+                    if let Some(a) = b.column(i).as_any().downcast_ref::<Float64Array>() {
+                        for j in 0..a.len() {
+                            if a.is_valid(j) {
+                                sum += a.value(j);
+                            }
+                        }
+                    }
+                }
+            }
+            (rows, sum)
+        };
+
+        // SAFETY: test-local toggle; no other test reads/writes EMAT_LATE_MAT_AGG,
+        // and the flag defaults off so a transient set only affects the late-mat
+        // shape (Q10 with PKs), which no other test runs.
+        unsafe { std::env::remove_var("EMAT_LATE_MAT_AGG") };
+        let off_plan = ctx.sql(sql).await.unwrap().create_physical_plan().await.unwrap();
+        let off_dump = format!("{}", displayable(off_plan.as_ref()).indent(true));
+        assert!(
+            !off_dump.contains("LateGatherExec"),
+            "flag OFF must NOT rewrite the plan:\n{off_dump}"
+        );
+        let off_out = collect(off_plan, ctx.task_ctx()).await.unwrap();
+
+        unsafe { std::env::set_var("EMAT_LATE_MAT_AGG", "1") };
+        let on_plan = ctx.sql(sql).await.unwrap().create_physical_plan().await.unwrap();
+        let on_dump = format!("{}", displayable(on_plan.as_ref()).indent(true));
+        unsafe { std::env::remove_var("EMAT_LATE_MAT_AGG") };
+
+        assert!(
+            on_dump.contains("LateGatherExec") && on_dump.contains("EmatixHashJoinExec"),
+            "flag ON must wire the late-mat subtree:\n{on_dump}"
+        );
+        let on_out = collect(on_plan, ctx.task_ctx()).await.unwrap();
+
+        let (or, os) = checksum(&off_out);
+        let (nr, ns) = checksum(&on_out);
+        assert_eq!(or, nr, "row count: stock {or} vs late-mat {nr}");
+        assert!(
+            (os - ns).abs() < os.abs() * 1e-9 + 1e-6,
+            "revenue sum: stock {os:.4} vs late-mat {ns:.4}"
+        );
+        assert!(or > 0, "sanity: Q10 SF1 returns rows");
     }
 
     /// The planner must plan every TPC-H query through the library path

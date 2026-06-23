@@ -155,14 +155,35 @@ impl ExecutionPlan for EmatixHashJoinExec {
                 children.len()
             )));
         }
-        Ok(Arc::new(Self::new(
-            children[0].clone(),
-            children[1].clone(),
-            self.build_key_idx,
-            self.probe_key_idx,
-            self.output.clone(),
-            self.schema.clone(),
-        )))
+        // PRESERVE the shared `build_once` (and metrics) across a child swap
+        // rather than minting a fresh `OnceCell`. The physical optimizer
+        // (EnforceDistribution/CoalesceBatches) rewrites this node's children
+        // AFTER a downstream `LateGatherExec` has captured `build_once()` — a
+        // fresh cell there would leave the gatherer pointing at a never-
+        // initialized build ("shared join build not initialized"). The cell is
+        // empty pre-execution and keyed to the (logically equivalent) build
+        // side, so carrying it forward is sound; mirrors `LateGatherExec`.
+        let left = children[0].clone();
+        let right = children[1].clone();
+        let eq = EquivalenceProperties::new(self.schema.clone());
+        let partitioning = right.output_partitioning().clone();
+        let properties = Arc::new(PlanProperties::new(
+            eq,
+            partitioning,
+            EmissionType::Incremental,
+            Boundedness::Bounded,
+        ));
+        Ok(Arc::new(Self {
+            left,
+            right,
+            build_key_idx: self.build_key_idx,
+            probe_key_idx: self.probe_key_idx,
+            output: self.output.clone(),
+            schema: self.schema.clone(),
+            properties,
+            build_once: self.build_once.clone(),
+            metrics: self.metrics.clone(),
+        }))
     }
 
     fn execute(
