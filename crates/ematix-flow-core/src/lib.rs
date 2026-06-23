@@ -36,6 +36,9 @@ pub mod emat_hash_join_exec;
 // `__cust_rowid`, so they never flow through the join intermediate. INERT
 // until the FlowQueryPlanner walker (step 4) installs it.
 pub mod late_gather_exec;
+// Q10 prod-B: FD-minimal grouping-key detector (sound core of the wide-string
+// late-materialization recognizer). The recognizer rule + ExtensionPlanner build on it.
+pub mod late_mat_agg;
 // PV.2: EmatPushPipelineExec — fused push-pipeline ExecutionPlan node
 // (morsel kernel inside; hand-constructed for the Q08 shape, PV.3
 // generalises). Opt-in scaffold; not on any production plan path yet.
