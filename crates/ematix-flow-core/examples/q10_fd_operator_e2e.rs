@@ -266,6 +266,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ctx = build_ctx(&data_dir)?;
     let key = ["c_custkey", "n_name"];
 
+    // EMAT_EXPLAIN_ANALYZE=1: per-operator compute breakdown of the STOCK Q10 plan
+    // (localizes where the SF=100 COMPUTE-EXCESS lives — decode vs join vs agg). Warm
+    // once, then print the annotated-with-metrics plan tree.
+    if std::env::var("EMAT_EXPLAIN_ANALYZE").is_ok() {
+        let _ = collect(
+            ctx.sql(sql).await?.create_physical_plan().await?,
+            ctx.task_ctx(),
+        )
+        .await?;
+        let ea = ctx
+            .sql(&format!("EXPLAIN ANALYZE {sql}"))
+            .await?
+            .collect()
+            .await?;
+        for b in &ea {
+            let c = b.column(b.num_columns() - 1);
+            if let Some(s) = c
+                .as_any()
+                .downcast_ref::<datafusion::arrow::array::StringArray>()
+            {
+                for i in 0..s.len() {
+                    println!("{}", s.value(i));
+                }
+            }
+        }
+        return Ok(());
+    }
+
     println!("Q10 FD-operator e2e spike  data={data_dir}  warmups={warmups} trials={trials}");
     // One plan just to confirm the swap fires + dump structure (never executed below).
     let stock0 = ctx.sql(sql).await?.create_physical_plan().await?;
