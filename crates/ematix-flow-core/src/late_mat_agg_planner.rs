@@ -268,6 +268,131 @@ mod tests {
         (rows, sum)
     }
 
+    /// Order-insensitive whole-result checksum: row count + the sum of every
+    /// Float64 / Int64 column across all batches (a value-change or lost/added
+    /// group moves it). Strong enough to catch a misfiring rewrite.
+    fn full_checksum(batches: &[RecordBatch]) -> (usize, f64) {
+        use datafusion::arrow::array::Int64Array;
+        let mut rows = 0usize;
+        let mut sum = 0.0f64;
+        for b in batches {
+            rows += b.num_rows();
+            for c in b.columns() {
+                if let Some(a) = c.as_any().downcast_ref::<Float64Array>() {
+                    for i in 0..a.len() {
+                        if a.is_valid(i) {
+                            sum += a.value(i);
+                        }
+                    }
+                } else if let Some(a) = c.as_any().downcast_ref::<Int64Array>() {
+                    for i in 0..a.len() {
+                        if a.is_valid(i) {
+                            sum += a.value(i) as f64;
+                        }
+                    }
+                }
+            }
+        }
+        (rows, sum)
+    }
+
+    /// All 8 TPC-H tables with their REAL declared primary keys (composite where
+    /// applicable) + FlowQueryPlanner — the full catalog the recognizer sees.
+    async fn all_tpch_ctx(dir: &Path) -> SessionContext {
+        use datafusion::execution::session_state::SessionStateBuilder;
+        let state = SessionStateBuilder::new()
+            .with_config(SessionConfig::new().with_target_partitions(4))
+            .with_default_features()
+            .build();
+        let ctx = SessionContext::new_with_state(state);
+        // (table, PK column indices in the standard TPC-H parquet schema).
+        let pks: &[(&str, &[usize])] = &[
+            ("region", &[0]),
+            ("nation", &[0]),
+            ("supplier", &[0]),
+            ("customer", &[0]),
+            ("part", &[0]),
+            ("partsupp", &[0, 1]),
+            ("orders", &[0]),
+            ("lineitem", &[0, 3]),
+        ];
+        for (t, pk) in pks {
+            let path = dir.join(format!("{t}.parquet"));
+            let prov = EmatixFastParquetTableProvider::try_new(path.to_string_lossy().into_owned())
+                .unwrap()
+                .with_primary_key(pk.to_vec());
+            ctx.register_table(*t, Arc::new(prov)).unwrap();
+        }
+        ctx
+    }
+
+    /// SOUNDNESS GATE (env-free): over ALL 22 TPC-H queries with every table's PK
+    /// declared, wherever `reconstruct` fires the late-mat plan must produce
+    /// results identical to stock — and it MUST fire on Q10. Queries where it
+    /// returns None are inert by construction (the stock plan is used verbatim).
+    /// This is the inertness + no-misfire proof for the whole suite.
+    #[tokio::test]
+    async fn late_mat_inert_or_correct_across_all_22() {
+        let Some(dir) = sf1_dir() else {
+            eprintln!("skip: no SF=1 data");
+            return;
+        };
+        let ctx = all_tpch_ctx(&dir).await;
+        let mut fired: Vec<u8> = Vec::new();
+        for q in 1..=22u8 {
+            let path = format!("examples/tpch/queries/q{q:02}.sql");
+            let sql = std::fs::read_to_string(&path)
+                .or_else(|_| std::fs::read_to_string(dir.join(format!("../../queries/q{q:02}.sql"))))
+                .unwrap_or_default();
+            if sql.trim().is_empty() {
+                continue;
+            }
+            let sql = sql.trim().trim_end_matches(';');
+            let logical = ctx
+                .sql(sql)
+                .await
+                .unwrap_or_else(|e| panic!("Q{q:02} sql: {e}"))
+                .into_optimized_plan()
+                .unwrap();
+
+            let Some(rewritten) = reconstruct(&logical) else {
+                continue; // inert on this shape — stock path used verbatim
+            };
+            fired.push(q);
+
+            let stock = collect(
+                ctx.state().create_physical_plan(&logical).await.unwrap(),
+                ctx.task_ctx(),
+            )
+            .await
+            .unwrap();
+            let planner =
+                DefaultPhysicalPlanner::with_extension_planners(vec![Arc::new(LateMatAggPlanner)]);
+            let late = collect(
+                planner
+                    .create_physical_plan(&rewritten, &ctx.state())
+                    .await
+                    .unwrap_or_else(|e| panic!("Q{q:02} late-mat plan: {e}")),
+                ctx.task_ctx(),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("Q{q:02} late-mat exec: {e}"));
+
+            let (sr, ss) = full_checksum(&stock);
+            let (lr, ls) = full_checksum(&late);
+            assert_eq!(sr, lr, "Q{q:02}: row count stock {sr} vs late {lr} (MISFIRE)");
+            assert!(
+                (ss - ls).abs() < ss.abs() * 1e-9 + 1e-3,
+                "Q{q:02}: checksum stock {ss:.4} vs late {ls:.4} (MISFIRE)"
+            );
+        }
+        eprintln!("late-mat recognizer fired on: {fired:?}");
+        assert!(
+            fired.contains(&10),
+            "the recognizer must fire on Q10 (fired on: {fired:?})"
+        );
+    }
+
     /// END-TO-END (prod-C): the late-mat plan must produce row-for-row identical
     /// results (count + revenue sum, order-independent) to the stock Q10 plan at
     /// SF=1 — the correctness gate before any wiring / perf measurement.
