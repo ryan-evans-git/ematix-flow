@@ -355,3 +355,39 @@ stock). **Default-on follow-on:** a query-scoped execution batch size — e.g. t
 recognizer emits a "preferred batch size" hint the session honors for THIS query
 only — which would also unlock prod-D's general large-batch SF=100 wins without
 the 22q regression.
+
+---
+
+## §6 QUERY-SCOPED BATCH HINT — win lands at the DEFAULT session batch (2026-06-23)
+
+§5's "coupled to a global batch" blocker is RESOLVED. The large batch is now
+applied per-query, scoped to the recognized late-mat query, so the win lands with
+no session change and no 22q regression.
+
+- **`batch_size_override_exec.rs` — `BatchSizeOverrideExec`**: a pass-through node
+  that at `execute()` threads a `TaskContext` with an overridden
+  `SessionConfig::batch_size` to its subtree (batch size is a RUNTIME param, so
+  this is the only correct hook). `FlowQueryPlanner` wraps the late-mat plan's
+  ROOT in it (default 1M, `EMAT_LATE_MAT_BATCH`). Other queries get no wrapper.
+- **`EmatixHashJoinExec.with_overlap(true)`** — overlap baked into the late-mat
+  join per-instance (was global `EMAT_HJ_OVERLAP` env). REQUIRED: it hides the
+  serial 15M-row build behind the probe decode (SF=100: eff 7.9/2779ms without
+  vs 10.5/2322ms with).
+
+**Result (SF=100, isolated, ONLY `EMAT_LATE_MAT_AGG=1`, no other env):**
+
+| arm | wall | CPU |
+|---|---|---|
+| stock | 3001ms | 33.1 |
+| **late-mat** | **2061ms** | **21.7** → **31% faster, beats DuckDB ~1950-2250** |
+
+The win is now self-contained in the rule at the session-default batch. Remaining
+for default-on: (1) declare TPC-H PKs in the production registration (the rule
+needs them to fire); (2) the 22q SF=10/100 strict A/B with PKs declared, to
+confirm the FD-on-the-catalog plan perturbation is neutral on the other 21
+queries (the recognizer already proven to fire Q10-only + correct). Until then it
+ships opt-in (`EMAT_LATE_MAT_AGG=1`), now a self-contained −31% Q10 SF=100 win.
+
+**Bonus:** `BatchSizeOverrideExec` is general infra — it also unblocks prod-D's
+broader SF=100 large-batch wins (NO-GO only because they were global) by scoping
+a large batch to any shape that benefits.
