@@ -75,11 +75,31 @@ fn build_ematix_ctx(data_dir: &Path) -> Result<SessionContext, Box<dyn std::erro
         .ok()
         .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
         .unwrap_or(true);
+    // TPC-H primary keys (harness scaffolding — a real catalog declares these via
+    // DDL; the SHIPPED library has no TPC-H hardcoding). Declared when
+    // EMAT_TPCH_PK=1 OR the late-mat rule is enabled (it needs the PK-derived FDs
+    // to fire). Off by default → the baseline path is byte-identical.
+    let declare_pk = std::env::var("EMAT_TPCH_PK").map(|v| v != "0").unwrap_or(false)
+        || ematix_flow_core::late_mat_agg::enabled();
+    let tpch_pk = |t: &str| -> Option<Vec<usize>> {
+        Some(match t {
+            "region" | "nation" | "supplier" | "customer" | "part" | "orders" => vec![0],
+            "partsupp" => vec![0, 1],      // (ps_partkey, ps_suppkey)
+            "lineitem" => vec![0, 3],      // (l_orderkey, l_linenumber)
+            _ => return None,
+        })
+    };
     for t in TPCH_TABLES {
         let path = data_dir.join(format!("{t}.parquet"));
-        let provider = EmatixFastParquetTableProvider::try_new(path.to_string_lossy().to_string())?
-            .with_dict_preservation(dictp)
-            .with_late_mat(latem);
+        let mut provider =
+            EmatixFastParquetTableProvider::try_new(path.to_string_lossy().to_string())?
+                .with_dict_preservation(dictp)
+                .with_late_mat(latem);
+        if declare_pk {
+            if let Some(pk) = tpch_pk(t) {
+                provider = provider.with_primary_key(pk);
+            }
+        }
         ctx.register_table(*t, Arc::new(provider))?;
     }
     Ok(ctx)

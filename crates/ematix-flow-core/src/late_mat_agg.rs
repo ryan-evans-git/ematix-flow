@@ -19,6 +19,7 @@ use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
+use datafusion::arrow::datatypes::DataType;
 use datafusion::common::{
     Column, Constraint, DFSchemaRef, DataFusionError, FunctionalDependencies, Result,
 };
@@ -268,6 +269,27 @@ fn analyze_agg(agg: &Aggregate) -> Option<LateMatShape> {
 
     // A real FD reduction must exist (else nothing wide to late-materialize).
     fd_minimal_group_key(&group_idx, fds)?;
+
+    // SHAPE GATE: late-materialization pays only when SEVERAL wide string columns
+    // would otherwise be carried through the join intermediate. Count the
+    // string-typed group columns; require ≥ EMAT_LM_MIN_WIDE_COLS (default 3).
+    // Q10 carries 5 wide strings (the win); a 1-wide-string aggregate whose other
+    // group cols are numeric (e.g. Q18 after the preset walkers reshape it) does
+    // NOT pay for the CollectLeft build + reattach (measured SF=10: +28%), so it
+    // is gated out. Shape-based + general — NOT TPC-H-keyed.
+    let min_wide = crate::flags::usize_or("EMAT_LM_MIN_WIDE_COLS", 3);
+    let wide_cols = group_idx
+        .iter()
+        .filter(|&&i| {
+            matches!(
+                in_schema.field(i).data_type(),
+                DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+            )
+        })
+        .count();
+    if wide_cols < min_wide {
+        return None;
+    }
 
     // Anchor PK = the group column whose FD-closure covers the most group columns
     // (≥2 → it actually determines wide columns to drop from the carried key).
