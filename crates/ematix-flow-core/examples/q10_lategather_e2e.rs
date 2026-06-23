@@ -68,9 +68,20 @@ fn median(v: &mut [f64]) -> f64 {
 }
 
 fn build_ctx(data_dir: &str) -> Result<SessionContext, Box<dyn std::error::Error>> {
+    // EMAT_BATCH_SIZE: a large value makes scans emit few, large batches. The
+    // late-gather reattach `interleave`s the wide StringView build cols across the
+    // retained build batches; at the default 8192 the 15M build = ~1830 sources →
+    // byte-copying interleave (~2.2s). Fewer sources → near-free StringView
+    // buffer-sharing gather.
+    let mut cfg = SessionConfig::new();
+    if let Ok(bs) = std::env::var("EMAT_BATCH_SIZE") {
+        if let Ok(n) = bs.parse::<usize>() {
+            cfg = cfg.with_batch_size(n);
+        }
+    }
     let state = preset::with_optimizer_rules(
         SessionStateBuilder::new()
-            .with_config(SessionConfig::new())
+            .with_config(cfg)
             .with_default_features(),
     )
     .build();
@@ -320,20 +331,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    // Correctness gate.
-    let stock_out = collect(fresh_stock(&ctx).await?, ctx.task_ctx()).await?;
-    let late_out = collect(make_late(&ctx).await?.0, ctx.task_ctx()).await?;
-    let (sr, ss) = checksum(&stock_out);
-    let (kr, ks) = checksum(&late_out);
-    let correct = sr == kr && (ss - ks).abs() < (ss.abs() * 1e-9 + 1e-6);
-    println!(
-        "correctness: stock=({sr} rows, sum {ss:.2})  late=({kr} rows, sum {ks:.2})  => {}",
-        if correct { "MATCH ✓" } else { "MISMATCH ✗" }
-    );
-    if !correct {
-        println!("ABORT: late-mat plan differs from stock — the spike shape is wrong.");
-        return Ok(());
-    }
+    // Correctness gate. Skipped in single-arm ISOLATED mode (ARM=stock|late) — a
+    // late-mat collect here retains a 15M build in mimalloc that starves page cache
+    // and pollutes the subsequent isolated stock timing (the SF100 box artifact).
+    let arm_early = std::env::var("ARM").unwrap_or_else(|_| "ab".into());
+    if arm_early == "ab" {
+        let stock_out = collect(fresh_stock(&ctx).await?, ctx.task_ctx()).await?;
+        let late_out = collect(make_late(&ctx).await?.0, ctx.task_ctx()).await?;
+        let (sr, ss) = checksum(&stock_out);
+        let (kr, ks) = checksum(&late_out);
+        let correct = sr == kr && (ss - ks).abs() < (ss.abs() * 1e-9 + 1e-6);
+        println!(
+            "correctness: stock=({sr} rows, sum {ss:.2})  late=({kr} rows, sum {ks:.2})  => {}",
+            if correct { "MATCH ✓" } else { "MISMATCH ✗" }
+        );
+        if !correct {
+            println!("ABORT: late-mat plan differs from stock — the spike shape is wrong.");
+            return Ok(());
+        }
+    } // end correctness gate (ab-mode only)
 
     // EMAT_EXPLAIN_ANALYZE: collect the late plan once (warm) then dump per-node
     // metrics bottom-up to localize where the late-mat CPU goes.
@@ -344,16 +360,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let _ = collect(p.clone(), ctx.task_ctx()).await?;
         fn dump(node: &Arc<dyn ExecutionPlan>, depth: usize) {
             let name = node.name();
+            // Full metric set (so EmatixHashJoinExec's build_time/probe_time show).
             let m = node
                 .metrics()
-                .map(|s| {
-                    let s = s.aggregate_by_name();
-                    format!(
-                        "elapsed_compute={:?} output_rows={:?}",
-                        s.elapsed_compute(),
-                        s.output_rows()
-                    )
-                })
+                .map(|s| s.aggregate_by_name().to_string())
+                .filter(|s| !s.is_empty())
                 .unwrap_or_else(|| "metrics=[]".into());
             println!("{}{name}  {m}", "  ".repeat(depth));
             for c in node.children() {

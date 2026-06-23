@@ -196,6 +196,31 @@ impl ExecutionPlan for EmatixHashJoinExec {
             // probe side's parallelism). The hash-table INSERT stays serial — a
             // smaller next-step lever; reclaiming the drain is what the dig's
             // metrics localized as dominant.
+            // P2' (gated, EMAT_HJ_OVERLAP=1): start the probe-side decode CONCURRENTLY
+            // with the build. Otherwise the LEFT build fully completes before
+            // `right.execute()` is polled, serializing ~build_time of LEFT decode that
+            // could overlap the (long-pole) probe-side decode. Measured on Q10 SF=100:
+            // build_time=1.08s ran ENTIRELY before the 148M-lineitem probe side started
+            // (~40% of wall near-serial → eff 7 vs the narrow plan's 12). Spawn the
+            // right drain so it overlaps the build; buffer the probe input (the
+            // downstream agg/sort breaks the pipeline anyway). Default OFF — the blast
+            // radius is buffering the probe side, which only some shapes can afford.
+            let overlap = std::env::var("EMAT_HJ_OVERLAP")
+                .map(|v| v != "0")
+                .unwrap_or(false);
+            let right_pre = if overlap {
+                let right = right.clone();
+                let ctx = ctx.clone();
+                Some(tokio::spawn(async move {
+                    right
+                        .execute(partition, ctx)?
+                        .try_collect::<Vec<RecordBatch>>()
+                        .await
+                }))
+            } else {
+                None
+            };
+
             let joiner = build_once
                 .get_or_try_init(|| async {
                     let _build_timer = build_time.timer();
@@ -224,6 +249,29 @@ impl ExecutionPlan for EmatixHashJoinExec {
                 })
                 .await?
                 .clone();
+
+            // P2' overlap: the probe side was decoded concurrently with the build →
+            // probe the buffered batches now (the build is hidden behind it).
+            if let Some(handle) = right_pre {
+                let batches = handle
+                    .await
+                    .map_err(|e| DataFusionError::Execution(format!("probe-drain task: {e}")))??;
+                let _t = probe_time.timer();
+                if joiner.is_radix() {
+                    let out = joiner
+                        .probe_radix_all(&batches)
+                        .map_err(DataFusionError::Internal)?;
+                    return Ok::<_, DataFusionError>(
+                        futures_util::stream::iter(vec![Ok::<RecordBatch, DataFusionError>(out)])
+                            .boxed(),
+                    );
+                }
+                let outs: Vec<Result<RecordBatch, DataFusionError>> = batches
+                    .iter()
+                    .map(|rb| joiner.probe(rb).map_err(DataFusionError::Internal))
+                    .collect();
+                return Ok(futures_util::stream::iter(outs).boxed());
+            }
 
             // Probe. RADIX.2 spike: if the build is radix-partitioned, BUFFER this
             // partition's probe batches then B-scatter-probe them in one call —

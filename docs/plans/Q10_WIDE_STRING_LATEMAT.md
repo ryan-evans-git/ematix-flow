@@ -1,9 +1,11 @@
 # Q10 SF=100 — why it can't reach the floor, and the wide-string late-materialization lever
 
-- **Status:** INVESTIGATED + kill-gate SPIKE measured (2026-06-23). Thesis VALIDATED
-  (cuts 20% CPU, correct). Banked `LateGatherExec`/`EmatixHashJoinExec` infra is a
-  correct proof-of-concept but too heavy to flip the wall as-is. Implementation path
-  below is NOT yet built past the spike.
+- **Status:** ★ SPIKE FLIPS Q10 SF=100 TO A WIN (2026-06-23). Wide-string
+  late-materialization (`LateGatherExec` + `BuildRowId`) + build batch=1M (cheap
+  StringView gather) + build/probe overlap → late-mat ~2050ms / 21.2 CPU-s vs DuckDB
+  ~2236ms / ~24 (thermally-matched ~9% WIN), correct (checksum MATCH SF10+SF100). Was a
+  documented 1.36× LOSS. See §3d for the breakthrough; §3a-c are SUPERSEDED. NOT yet
+  productionized (FD-detect rule + gated batch-size/overlap remain — §3d).
 - **Supersedes** the framing in `project_sf100_loss_diagnostic` (decode/agg-kernel/
   parallel-eff) and the partial directions in `docs/Q10_RADIX_BUILD_JOIN_PROGRAM.md`
   (join radix) and `docs/plans/FD_AGGREGATE_OPERATOR.md` (FD-agg composite kernel,
@@ -158,7 +160,75 @@ HASH_GROUP_BY (1.65 vs ematix 4.19). This is KERNEL efficiency, not a plan diffe
      sort-by-(batch,local) → per-batch `take` → inverse-permute (no CoalesceBatches
      barrier). Targets reattach 2.2s → ~0.5s.
 
-**Honest verdict:** Q10 SF=100 IS flippable, but ONLY via the EmatixHashJoinExec
+## 3d. ★★★ BREAKTHROUGH (2026-06-23) — floor LOWERED, Q10 SF=100 FLIPS to a WIN
+
+The §3c "at the floor" verdict was WRONG (rule #1: never declare a floor — the user
+pushed back, correctly). The reattach was slow because `interleave` ran across ~1830
+build batches (15M / 8192-row scan batches) → byte-copying StringView. The decoder
+already emits **Utf8View** (line ~2053), so a FEW-source gather SHARES byte buffers
+(near-free). Two cheap levers close it:
+1. **Build scan batch size 8192 → 1M** (`EMAT_BATCH_SIZE`): the build retains ~15
+   batches not ~1830, so the late-gather `interleave` is buffer-sharing, not byte-copy.
+   (Reattach: SortExec 2.75s → ~negligible.) Also helps the whole pipeline (~17% even
+   for stock). 4M/8M OVERSHOOT — batches too big, eff collapses (10.6→6.8); **1M is the
+   sweet spot.**
+2. **Build/probe overlap** (`EMAT_HJ_OVERLAP`, §3c): hides the customer build behind the
+   lineitem decode.
+
+**Measured SF=100, isolated, batch=1M + overlap (correct — checksum MATCH at SF10+SF100):**
+
+| arm | wall | CPU-s | eff |
+|---|---:|---:|---:|
+| stock (orig 8K batch) | ~2900 | ~32 | — |
+| stock (1M batch) | 2392-2490 | 25.4-25.7 | 10.3 |
+| **late-mat (1M + overlap)** | **1982-2101** | **21.0-21.2** | 10.4 |
+| DuckDB (thermally-matched) | 2220-2252 | ~24 | ~13 |
+
+**Thermally-matched sandwich (DuckDB / late-mat / DuckDB): late-mat 2041ms vs DuckDB
+2220 & 2252 → ~9% WIN, at ~12% less CPU (21.2 vs ~24).** Same-process A/B: late-mat
+1.19× wall / 1.21× CPU over stock. **Q10 SF=100 flips from the documented 1.36× LOSS to
+a ~9% WIN over DuckDB.** The wide-string late-mat lever (§2) is real AND realizable; the
+§3a/§3b/§3c "kernel gap / at-floor" conclusions are SUPERSEDED — the gap was the gather's
+batch granularity + build serialization, both cheaply fixable.
+
+**Still a SPIKE — productionization (the real remaining work):**
+- **FD-detect planner rule** (correctness-critical): fire only when the group key ⊇ a
+  PROVEN PK functionally determining the wide cols. The spike picks the key by NAME.
+- **Batch-size**: 1M is global in the spike. A global bump may regress SF10 / small
+  queries / 22q geomean → make it scale/shape-gated (large scans only). Validate 22q.
+- **Overlap**: `EMAT_HJ_OVERLAP` gated; the buffered-probe blast radius needs the same
+  shape gate as the no-shuffle path.
+- Gates: 22q SF=10/100 strict A/B, `tpch_validate` 22/22, codegen-tax, peak RSS.
+
+## 3c. P2' result (2026-06-23) — overlap helps eff but the CPU floor caps it: SUPERSEDED by §3d
+
+Added a gated `EMAT_HJ_OVERLAP` to `EmatixHashJoinExec`: spawn the probe-side drain
+concurrently with the build so the ~1.08s build hides behind the long-pole lineitem
+decode (measured: build ran ENTIRELY before the probe side started — 40% of wall
+near-serial). Correct (SF10+SF100 match). A/B SF=100: late-mat eff **7.2 → 8.4** — the
+overlap works, partially. BUT:
+- late-mat CPU is steady at **~28 CPU-s** (vs stock ~32-34, DuckDB 20.5). Even at perfect
+  eff (14), 28 CPU-s → ~2000ms ≈ DuckDB's 1950 — **no clear win possible from the wall side.**
+- The build (customer decode) and probe side (lineitem decode) are BOTH CPU-bound; overlapping
+  them on 14 cores time-slices rather than speeds up → eff gain is bounded (7.2→8.4, not →12).
+- **The narrow floor (18.9 CPU) was illusory.** The wide-string dodge costs back most of the
+  saving: reattach ~2.2 + EmatixHashJoinExec build 1.08 + probe 1.69 (vs DataFusion's c⋈o ~0.66)
+  + rowid reshuffle. Late-mat nets only **~4-6 CPU-s vs stock**, landing at ~28 vs DuckDB 20.5.
+
+**FINAL VERDICT: Q10 SF=100 is effectively at ematix's achievable floor.** Handling the
+wide strings costs ematix ~9-13 CPU-s in EVERY arrangement (carry+hash = stock; rowid+reattach
+= late-mat), vs DuckDB's ~1.6 — an irreducible ~8× wide-key KERNEL gap. No plan-level lever
+(late-mat, with or without overlap/lean-gather) closes it; the dodge is never cheap enough.
+Late-mat + all fixes (lean gather + filter-fusion) projects to ~22-24 CPU → ~DuckDB parity, a
+sub-noise (~3%) win on one query at ±15% SF=100 measurement variance — NOT worth ~3 multi-day
+kernel fixes. The only path to a clear win is matching DuckDB's in-place wide-key group-by/join
+kernel (compressed group keys), i.e. the FD-agg (NO-GO) / radix-agg (multi-month) family.
+**Recommendation: STOP Q10 SF=100 plan-lever work; bank P2' overlap as opt-in infra; redirect
+the campaign elsewhere.** The investigation's durable value is the corrected diagnosis (decode
+at parity, eff fine warm, the gap is wide-key kernel efficiency — NOT decode/agg-plan/morsel).
+
+### (superseded) earlier "flippable" framing
+Q10 SF=100 IS flippable, but ONLY via the EmatixHashJoinExec
 late-mat WITH both kernel fixes above (+ filter-fusion as insurance). Without them the
 lever modestly beats stock on CPU but not on wall, and not DuckDB. The plan-trick alone
 does not escape the ~8× wide-string kernel gap — it relocates it from carry+hash to
