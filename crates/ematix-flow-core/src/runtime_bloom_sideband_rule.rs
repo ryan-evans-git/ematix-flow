@@ -395,6 +395,13 @@ impl PhysicalOptimizerRule for EnableRuntimeBloomSidebandRule {
             };
             let mut build_rows = default_build_rows;
             let mut tight_only = false;
+            // L9.DIMSEL.RT — when the DIMSEL rescue admits a filtered-dim→fact
+            // bloom, carry the dim's total row count so the emitter can apply
+            // the RUNTIME build-selectivity disarm at publish time (plan-time
+            // selectivity is the useless 0.2 constant; the real selectivity is
+            // `actual_build_keys / dim_total`, knowable only once the build
+            // drains). `Some((dim_total, max_sel))` ⇒ gate the emitter.
+            let mut dimsel_gate: Option<(usize, f64)> = None;
             if ratio_rejects(default_build_rows) {
                 // L9.ADAPT lazy tight rescue — the default estimator said
                 // no. Opt-in NDV mode may rescue the wrap, but ONLY behind
@@ -470,21 +477,34 @@ impl PhysicalOptimizerRule for EnableRuntimeBloomSidebandRule {
                     // the build is a single filtered dim scan whose filter keeps
                     // ≤ `EMAT_L9_DIM_BLOOM_SEL` of the dim. (Pre-gates already
                     // passed: probe ≥ 8M rows, ≥ proj cols, fused-evaluable.)
+                    // (dim_total, plan-time sel). dim_total feeds the RUNTIME
+                    // gate; sel is the plan-time 0.2 constant (kept only as a
+                    // cheap admission sanity check — the real decision is the
+                    // emitter's runtime build-selectivity disarm).
                     let dimsel = if dim_bloom_enabled() {
                         single_dim_scan_total(build.as_ref()).and_then(|dim_total| {
                             default_build_rows
-                                .map(|b| b as f64 / dim_total.max(1) as f64)
+                                .map(|b| (dim_total, b as f64 / dim_total.max(1) as f64))
                         })
                     } else {
                         None
                     };
                     match dimsel {
-                        Some(sel) if sel <= dim_bloom_max_sel() => {
+                        Some((dim_total, sel)) if sel <= dim_bloom_max_sel() => {
+                            // Arm the RUNTIME build-selectivity gate. Plan-time
+                            // can't separate Q9's win from Q3/Q8/Q21's losses
+                            // (all estimate sel=0.2); the emitter re-checks
+                            // `actual_build_keys / dim_total` at publish time and
+                            // disarms (publishes empty) when the bloom would drop
+                            // too little of the probe. 0 ⇒ runtime gate disabled.
+                            let rt_max = dim_bloom_rt_max_sel();
+                            if rt_max > 0.0 {
+                                dimsel_gate = Some((dim_total, rt_max));
+                            }
                             if trace {
                                 eprintln!(
-                                    "[L9.trace] DIMSEL admit — filter_sel={sel:.3} ≤ {} (bloom drops ~{:.0}% of probe; ratio gate bypassed)",
+                                    "[L9.trace] DIMSEL admit — plan_sel={sel:.3} ≤ {}, dim_total={dim_total}, rt_gate≤{rt_max} (runtime disarm decides at publish)",
                                     dim_bloom_max_sel(),
-                                    (1.0 - sel) * 100.0
                                 );
                             }
                             // fall through to sizing below (tight path)
@@ -497,7 +517,7 @@ impl PhysicalOptimizerRule for EnableRuntimeBloomSidebandRule {
                                     self.min_probe_to_build_ratio,
                                     probe_rows.unwrap_or(0),
                                     match dimsel {
-                                        Some(s) => format!("; DIMSEL filter_sel={s:.3} > {}", dim_bloom_max_sel()),
+                                        Some((_, s)) => format!("; DIMSEL filter_sel={s:.3} > {}", dim_bloom_max_sel()),
                                         None => String::new(),
                                     }
                                 );
@@ -553,6 +573,38 @@ impl PhysicalOptimizerRule for EnableRuntimeBloomSidebandRule {
             } else {
                 BridgeFilterSideband::new()
             };
+            // L9.DIMSEL.RT — DIMSEL-admitted wraps carry the no-late-arm marker
+            // so an eager-polled probe falls back to base instead of routing
+            // eager to await a (possibly disarmed) publish.
+            let sideband = if dimsel_gate.is_some() {
+                sideband.mark_dimsel_gated()
+            } else {
+                sideband
+            };
+
+            // L9.DIMSEL.RT dedup — never let a DIMSEL fire attach to a probe
+            // scan that a LOWER fire (processed earlier in transform_up) already
+            // wrapped: a scan holds ONE sideband, so the second wrap would
+            // DISPLACE the first, orphaning it. Q8 hit exactly this — the
+            // orders→lineitem DIMSEL fire overwrote the beneficial
+            // part→lineitem bloom on the shared lineitem scan, then disarmed
+            // itself → lineitem fully unfiltered (+43%). Scoped to DIMSEL
+            // (byte-identical when the lever is off); the matched `scan_node`
+            // already reflects the lower fire's rewrite.
+            if dimsel_gate.is_some()
+                && scan_node
+                    .as_any()
+                    .downcast_ref::<EmatixFastParquetExec>()
+                    .map(|s| s.runtime_sideband().is_some())
+                    .unwrap_or(false)
+            {
+                if trace {
+                    eprintln!(
+                        "[L9.trace] DIMSEL skip — probe scan already wrapped by a lower fire (would displace it)"
+                    );
+                }
+                return Ok(Transformed::no(node));
+            }
 
             // Estimate expected build-side keys from the build's
             // partition statistics. Falls back to a generous default
@@ -577,13 +629,20 @@ impl PhysicalOptimizerRule for EnableRuntimeBloomSidebandRule {
                 }
             }
 
-            let wrapped_build: Arc<dyn ExecutionPlan> = Arc::new(BuildSideBloomEmitterExec::try_new(
+            let mut emitter = BuildSideBloomEmitterExec::try_new(
                 build,
                 build_key_idx,
                 probe_scan_col_idx,
                 sideband.clone(),
                 expected_keys,
-            )?);
+            )?;
+            // L9.DIMSEL.RT — attach the runtime build-selectivity disarm to
+            // DIMSEL-admitted wraps. No-op for every other (default / tight /
+            // semi) wrap, which leave `dimsel_gate` None → byte-identical.
+            if let Some((dim_total, max_sel)) = dimsel_gate {
+                emitter = emitter.with_rt_sel_gate(dim_total, max_sel);
+            }
+            let wrapped_build: Arc<dyn ExecutionPlan> = Arc::new(emitter);
 
             let new_probe = rewrite_probe_subtree(&probe, &scan_node, &sideband)?;
 
@@ -842,6 +901,20 @@ pub(crate) fn dim_bloom_enabled() -> bool {
 /// Default 0.5 (`EMAT_L9_DIM_BLOOM_SEL`).
 fn dim_bloom_max_sel() -> f64 {
     crate::flags::f64_or("EMAT_L9_DIM_BLOOM_SEL", 0.5)
+}
+
+/// L9.DIMSEL.RT (2026-06-24) — RUNTIME build-selectivity threshold. Plan-time
+/// selectivity is a useless constant (0.2 for every filtered dim), so the
+/// plan-time `dim_bloom_max_sel` gate can't separate a winning dim bloom from a
+/// losing one. The real discriminator is measured at the build's PUBLISH time:
+/// `actual_build_keys / dim_total`. The emitter publishes the bloom only when
+/// that ratio is ≤ this (i.e. the bloom drops ≥ `1 - this` of the probe);
+/// otherwise it publishes an empty (disarmed) set. SF=10 separates cleanly:
+/// Q9/Q20 part filters keep ~1-6%, Q3/Q8/Q21 customer/orders filters keep
+/// 20-50%. Default 0.10 (`EMAT_L9_DIM_BLOOM_RT_SEL`); 0 disables the runtime
+/// gate (revert to always-publish).
+fn dim_bloom_rt_max_sel() -> f64 {
+    crate::flags::f64_or("EMAT_L9_DIM_BLOOM_RT_SEL", 0.10)
 }
 
 /// If `plan` (a join's build subtree) is anchored on EXACTLY ONE

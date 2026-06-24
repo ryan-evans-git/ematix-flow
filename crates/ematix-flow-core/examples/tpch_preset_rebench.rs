@@ -379,6 +379,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
+    // EMAT_DUMP_PLAN=1: print the FAITHFUL preset physical plan (display) for
+    // each query and exit. Diagnostic only — the explain_query example
+    // hand-mirrors rules and diverges from this preset path.
+    if std::env::var_os("EMAT_DUMP_PLAN").is_some() {
+        use datafusion::physical_plan::displayable;
+        for (q, sql) in &sqls {
+            let df = ctx.sql(sql).await?;
+            let plan = df.create_physical_plan().await?;
+            println!("==== Q{q:02} preset physical plan ====");
+            println!("{}", displayable(plan.as_ref()).indent(false));
+        }
+        return Ok(());
+    }
+
     // EMAT_PLANTIME=1: time PLANNING only (ctx.state().create_physical_plan =
     // optimize -> FlowQueryPlanner -> physical planning), excluding execution.
     if std::env::var_os("EMAT_PLANTIME").is_some() {

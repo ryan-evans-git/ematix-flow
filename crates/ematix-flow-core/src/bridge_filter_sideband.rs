@@ -112,6 +112,17 @@ pub struct BridgeFilterSideband {
     /// plan time before the sideband fans out — plain field, clones
     /// carry it.
     tight_admitted: bool,
+    /// L9.DIMSEL.RT (2026-06-24) — set when this wrap was admitted by the
+    /// L9.DIMSEL rescue (a filtered-dim→fact bloom) AND carries the runtime
+    /// build-selectivity gate. Such wraps must NOT late-arm: a dim→fact probe
+    /// scan that is itself eager-polled (on a build side upstream) races past
+    /// the build, peeks None, and — if it late-armed — would route to the eager
+    /// whole-RG reader to wait for a publish that may turn out empty (the Q3
+    /// `customer⋈orders` +50ms). For these wraps a missed peek just falls back
+    /// to the base path (inline reader), forgoing the bloom that pass — correct
+    /// and cheap. When the probe IS lazy-polled (Q9 lineitem) the build has
+    /// already published by first peek, so this never costs the win.
+    dimsel_gated: bool,
     /// L9.ADAPT Guard 2 — shared runtime probe-outcome counters for
     /// this wrap. The scan threads a handle into the extended
     /// `BridgeFilter` iff the wrap is tight-admitted; the reader
@@ -135,6 +146,18 @@ impl BridgeFilterSideband {
     /// L9.ADAPT — was this wrap admitted only by the tight estimator?
     pub fn tight_admitted(&self) -> bool {
         self.tight_admitted
+    }
+
+    /// L9.DIMSEL.RT — mark this sideband's wrap as DIMSEL-gated (builder
+    /// style; call before cloning into emitter + scan). See the field docs.
+    pub fn mark_dimsel_gated(mut self) -> Self {
+        self.dimsel_gated = true;
+        self
+    }
+
+    /// L9.DIMSEL.RT — is this a DIMSEL-gated wrap (no late-arm)?
+    pub fn dimsel_gated(&self) -> bool {
+        self.dimsel_gated
     }
 
     /// L9.ADAPT Guard 2 — handle to this wrap's shared probe-disarm

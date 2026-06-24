@@ -3177,7 +3177,15 @@ impl ExecutionPlan for EmatixFastParquetExec {
                     // waiting; if unpublished, hand the sideband to
                     // the reader, which adopts the predicate at the
                     // next row-group boundary once the build lands.
-                    if !sb.is_ready() {
+                    // L9.DIMSEL.RT — DIMSEL-gated wraps do NOT late-arm. An
+                    // eager-polled dim→fact probe (Q3 orders) races past the
+                    // build, peeks None, and late-arming would route it to the
+                    // eager whole-RG reader to await a publish that may be empty
+                    // (the disarm) — pure +routing cost. Falling back to base
+                    // here keeps it on the inline reader. A lazy-polled probe
+                    // (Q9 lineitem) already sees is_ready()=true so never
+                    // reaches this branch and keeps its bloom.
+                    if !sb.is_ready() && !sb.dimsel_gated() {
                         late_arm = Some(sb.clone());
                     }
                 } else {
