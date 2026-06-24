@@ -39,10 +39,8 @@ fn build_ematix_ctx(data_dir: &Path) -> Result<SessionContext, Box<dyn std::erro
     // Q10 late-mat reattach wants few, large build batches; this measures the broad
     // 22q effect of a larger global batch size at SF=100 vs the SF=10 regression risk.
     let mut config = SessionConfig::new();
-    if let Ok(n) = std::env::var("EMAT_BATCH_SIZE").map(|s| s.parse::<usize>()) {
-        if let Ok(n) = n {
-            config = config.with_batch_size(n);
-        }
+    if let Ok(Ok(n)) = std::env::var("EMAT_BATCH_SIZE").map(|s| s.parse::<usize>()) {
+        config = config.with_batch_size(n);
     }
     let mut builder = preset::with_optimizer_rules(
         SessionStateBuilder::new()
@@ -79,13 +77,15 @@ fn build_ematix_ctx(data_dir: &Path) -> Result<SessionContext, Box<dyn std::erro
     // DDL; the SHIPPED library has no TPC-H hardcoding). Declared when
     // EMAT_TPCH_PK=1 OR the late-mat rule is enabled (it needs the PK-derived FDs
     // to fire). Off by default → the baseline path is byte-identical.
-    let declare_pk = std::env::var("EMAT_TPCH_PK").map(|v| v != "0").unwrap_or(false)
+    let declare_pk = std::env::var("EMAT_TPCH_PK")
+        .map(|v| v != "0")
+        .unwrap_or(false)
         || ematix_flow_core::late_mat_agg::enabled();
     let tpch_pk = |t: &str| -> Option<Vec<usize>> {
         Some(match t {
             "region" | "nation" | "supplier" | "customer" | "part" | "orders" => vec![0],
-            "partsupp" => vec![0, 1],      // (ps_partkey, ps_suppkey)
-            "lineitem" => vec![0, 3],      // (l_orderkey, l_linenumber)
+            "partsupp" => vec![0, 1], // (ps_partkey, ps_suppkey)
+            "lineitem" => vec![0, 3], // (l_orderkey, l_linenumber)
             _ => return None,
         })
     };

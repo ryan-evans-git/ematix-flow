@@ -187,8 +187,13 @@ impl ExtensionPlanner for LateMatAggPlanner {
         for k in 0..node.aggr_expr.len() {
             output.push(LateGatherColumn::Input(1 + k));
         }
-        let late: Arc<dyn ExecutionPlan> =
-            Arc::new(LateGatherExec::new(agg, build_once, 0, output, final_schema));
+        let late: Arc<dyn ExecutionPlan> = Arc::new(LateGatherExec::new(
+            agg,
+            build_once,
+            0,
+            output,
+            final_schema,
+        ));
         Ok(Some(late))
     }
 }
@@ -206,7 +211,9 @@ fn unwrap_alias(e: &Expr) -> &Expr {
 /// projection's flat column names.
 fn strip_qualifiers(e: Expr) -> Result<Expr> {
     Ok(e.transform(|x| match x {
-        Expr::Column(c) => Ok(Transformed::yes(Expr::Column(Column::new_unqualified(c.name)))),
+        Expr::Column(c) => Ok(Transformed::yes(Expr::Column(Column::new_unqualified(
+            c.name,
+        )))),
         other => Ok(Transformed::no(other)),
     })?
     .data)
@@ -350,7 +357,9 @@ mod tests {
         for q in 1..=22u8 {
             let path = format!("examples/tpch/queries/q{q:02}.sql");
             let sql = std::fs::read_to_string(&path)
-                .or_else(|_| std::fs::read_to_string(dir.join(format!("../../queries/q{q:02}.sql"))))
+                .or_else(|_| {
+                    std::fs::read_to_string(dir.join(format!("../../queries/q{q:02}.sql")))
+                })
                 .unwrap_or_default();
             if sql.trim().is_empty() {
                 continue;
@@ -388,7 +397,10 @@ mod tests {
 
             let (sr, ss) = full_checksum(&stock);
             let (lr, ls) = full_checksum(&late);
-            assert_eq!(sr, lr, "Q{q:02}: row count stock {sr} vs late {lr} (MISFIRE)");
+            assert_eq!(
+                sr, lr,
+                "Q{q:02}: row count stock {sr} vs late {lr} (MISFIRE)"
+            );
             assert!(
                 (ss - ls).abs() < ss.abs() * 1e-9 + 1e-3,
                 "Q{q:02}: checksum stock {ss:.4} vs late {ls:.4} (MISFIRE)"

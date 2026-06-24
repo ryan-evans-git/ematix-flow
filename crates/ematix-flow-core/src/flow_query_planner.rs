@@ -180,7 +180,9 @@ impl QueryPlanner for FlowQueryPlanner {
                 let planner = DefaultPhysicalPlanner::with_extension_planners(vec![Arc::new(
                     crate::late_mat_agg_planner::LateMatAggPlanner,
                 )]);
-                let plan = planner.create_physical_plan(&rewritten, session_state).await?;
+                let plan = planner
+                    .create_physical_plan(&rewritten, session_state)
+                    .await?;
                 // Query-scoped large batch: the LateGather reattach (Utf8View
                 // interleave over the retained build batches) AND the probe fact
                 // decode are cheap only at a large batch — but a GLOBAL bump
@@ -347,7 +349,13 @@ mod tests {
         // The flag is now DEFAULT-ON (opt-out), so the OFF arm must set `=0`
         // explicitly (removing the var would leave it on).
         unsafe { std::env::set_var("EMAT_LATE_MAT_AGG", "0") };
-        let off_plan = ctx.sql(sql).await.unwrap().create_physical_plan().await.unwrap();
+        let off_plan = ctx
+            .sql(sql)
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
         let off_dump = format!("{}", displayable(off_plan.as_ref()).indent(true));
         assert!(
             !off_dump.contains("LateGatherExec"),
@@ -356,7 +364,13 @@ mod tests {
         let off_out = collect(off_plan, ctx.task_ctx()).await.unwrap();
 
         unsafe { std::env::set_var("EMAT_LATE_MAT_AGG", "1") };
-        let on_plan = ctx.sql(sql).await.unwrap().create_physical_plan().await.unwrap();
+        let on_plan = ctx
+            .sql(sql)
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
         let on_dump = format!("{}", displayable(on_plan.as_ref()).indent(true));
         unsafe { std::env::remove_var("EMAT_LATE_MAT_AGG") };
 

@@ -159,9 +159,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Ok(v) = std::env::var("EMAT_EXPLAIN_ANALYZE") {
         let variant = if v == "1" { "stock".to_string() } else { v };
         println!("== EXPLAIN ANALYZE variant={variant} ==");
-        return explain_analyze(&ctx, &sql_for(&variant))
-            .await
-            .map_err(Into::into);
+        return explain_analyze(&ctx, &sql_for(&variant)).await;
     }
 
     println!("Q10 wide-string prize bound  data={data_dir}  warmups={warmups} trials={trials}\n");

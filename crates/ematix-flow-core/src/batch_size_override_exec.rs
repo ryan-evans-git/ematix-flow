@@ -126,7 +126,7 @@ mod tests {
     use datafusion::physical_expr::{EquivalenceProperties, Partitioning};
     use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-    use datafusion::physical_plan::{collect, ExecutionPlanProperties};
+    use datafusion::physical_plan::{ExecutionPlanProperties, collect};
     use datafusion::prelude::SessionContext;
 
     /// A leaf that RECORDS the `batch_size` of the context it is executed with,
@@ -147,7 +147,11 @@ mod tests {
                 EmissionType::Incremental,
                 Boundedness::Bounded,
             ));
-            Self { seen, schema, props }
+            Self {
+                seen,
+                schema,
+                props,
+            }
         }
     }
     impl DisplayAs for ProbeExec {

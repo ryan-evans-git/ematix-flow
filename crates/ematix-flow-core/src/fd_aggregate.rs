@@ -237,6 +237,10 @@ impl FdSumAccumulator {
 
 #[cfg(test)]
 mod tests {
+    // `acc.ingest(&[keys.clone()], …, vec![keys, …])` clones `keys` for the
+    // 1-element slice because `keys` is ALSO moved in the same call — a borrow
+    // (the `from_ref` the lint suggests) would conflict with that move.
+    #![allow(clippy::cloned_ref_to_slice_refs)]
     use super::*;
     use datafusion::arrow::array::{Float64Array, Int64Array, StringArray};
     use std::sync::Arc;

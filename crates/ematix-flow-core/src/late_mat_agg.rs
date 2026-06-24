@@ -412,7 +412,9 @@ fn analyze_agg(agg: &Aggregate) -> Option<LateMatShape> {
         .ok()?
         .build()
         .ok()?;
-    let build_key_pos = group_col.iter().position(|c| c.name == anchor_pk_col.name)?;
+    let build_key_pos = group_col
+        .iter()
+        .position(|c| c.name == anchor_pk_col.name)?;
 
     // ---- Probe subtree (probe leaves) projected to [probe_fk, agg-arg cols…]. ----
     let probe_idxs: Vec<usize> = (0..leaves.len()).filter(|&i| !in_build[i]).collect();
@@ -489,7 +491,12 @@ impl PartialEq for LateMatAggNode {
 impl Eq for LateMatAggNode {}
 impl PartialOrd for LateMatAggNode {
     fn partial_cmp(&self, o: &Self) -> Option<Ordering> {
-        let render = |n: &Self| n.aggr_expr.iter().map(|e| format!("{e}")).collect::<Vec<_>>();
+        let render = |n: &Self| {
+            n.aggr_expr
+                .iter()
+                .map(|e| format!("{e}"))
+                .collect::<Vec<_>>()
+        };
         (&self.inputs, self.build_key_pos, self.n_group, render(self)).partial_cmp(&(
             &o.inputs,
             o.build_key_pos,
@@ -581,7 +588,8 @@ fn replace_aggregate(plan: &LogicalPlan) -> Option<LogicalPlan> {
         | LogicalPlan::Limit(_) => {
             let input = plan.inputs().first().copied()?;
             let new_input = replace_aggregate(input)?;
-            plan.with_new_exprs(plan.expressions(), vec![new_input]).ok()
+            plan.with_new_exprs(plan.expressions(), vec![new_input])
+                .ok()
         }
         _ => None,
     }
@@ -734,7 +742,11 @@ mod tests {
             .iter()
             .map(|f| f.name().clone())
             .collect();
-        assert_eq!(build_cols.len(), 7, "build projects exactly the 7 group cols");
+        assert_eq!(
+            build_cols.len(),
+            7,
+            "build projects exactly the 7 group cols"
+        );
         assert!(build_cols.iter().any(|c| c == "c_custkey"));
         assert!(build_cols.iter().any(|c| c == "n_name"), "n_name folded in");
         let build_dump = format!("{}", shape.build.display_indent());
@@ -759,7 +771,10 @@ mod tests {
         assert!(probe_cols.iter().any(|c| c == "l_discount"));
         let probe_dump = format!("{}", shape.probe.display_indent());
         assert!(probe_dump.contains("orders") && probe_dump.contains("lineitem"));
-        assert!(!probe_dump.contains("nation"), "probe excludes the build dims");
+        assert!(
+            !probe_dump.contains("nation"),
+            "probe excludes the build dims"
+        );
 
         assert_eq!(
             shape.build.schema().field(shape.build_key_pos).name(),
@@ -813,7 +828,8 @@ mod tests {
         };
         let ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(4));
         for t in ["customer", "orders", "lineitem", "nation"] {
-            ctx.register_table(t, Arc::new(prov(&dir, t, None))).unwrap();
+            ctx.register_table(t, Arc::new(prov(&dir, t, None)))
+                .unwrap();
         }
         let logical = ctx
             .sql(&q10_sql(&dir))

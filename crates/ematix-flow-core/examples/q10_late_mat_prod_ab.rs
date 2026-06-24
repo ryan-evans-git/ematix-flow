@@ -58,10 +58,8 @@ fn build_ctx(data_dir: &Path) -> Result<SessionContext, Box<dyn std::error::Erro
     // the only way to make the build emit few large batches; it affects the
     // probe too, which is why prod-D flagged a global bump as a 22q regression).
     let mut cfg = SessionConfig::new();
-    if let Ok(n) = std::env::var("EMAT_EXEC_BATCH").map(|s| s.parse::<usize>()) {
-        if let Ok(n) = n {
-            cfg = cfg.with_batch_size(n);
-        }
+    if let Ok(Ok(n)) = std::env::var("EMAT_EXEC_BATCH").map(|s| s.parse::<usize>()) {
+        cfg = cfg.with_batch_size(n);
     }
     let state = preset::with_optimizer_rules(
         SessionStateBuilder::new()
@@ -119,11 +117,17 @@ fn set_late(on: bool) {
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let data_dir = std::env::var("TPCH_DATA_DIR")
-        .unwrap_or_else(|_| "examples/tpch/data/sf100".to_string());
+    let data_dir =
+        std::env::var("TPCH_DATA_DIR").unwrap_or_else(|_| "examples/tpch/data/sf100".to_string());
     let data_dir = Path::new(&data_dir);
-    let trials: usize = std::env::var("TRIALS").ok().and_then(|s| s.parse().ok()).unwrap_or(5);
-    let warmups: usize = std::env::var("WARMUPS").ok().and_then(|s| s.parse().ok()).unwrap_or(2);
+    let trials: usize = std::env::var("TRIALS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(5);
+    let warmups: usize = std::env::var("WARMUPS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(2);
     // Plan cache off so the flag toggle re-plans each arm.
     unsafe { std::env::set_var("EMAT_PLAN_CACHE", "0") };
     let ctx = build_ctx(data_dir)?;
@@ -149,7 +153,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         set_late(true);
         let p = ctx.sql(Q10).await?.create_physical_plan().await?;
         set_late(false);
-        let dump = format!("{}", datafusion::physical_plan::displayable(p.as_ref()).indent(true));
+        let dump = format!(
+            "{}",
+            datafusion::physical_plan::displayable(p.as_ref()).indent(true)
+        );
         let wired = dump.contains("LateGatherExec") && dump.contains("EmatixHashJoinExec");
         println!("late arm wires late-mat subtree: {wired}");
         if std::env::var_os("DUMP_PLAN").is_some() {
@@ -255,10 +262,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         wl.push(t.elapsed().as_secs_f64() * 1000.0);
         cl.push(cpu_secs() - c0);
     }
-    let (wsm, csm, wlm, clm) = (median(&mut ws), median(&mut cs), median(&mut wl), median(&mut cl));
-    println!("\n{:<10} {:>9} {:>8} {:>6}", "arm", "wall_ms", "cpu_s", "eff");
-    println!("{:<10} {wsm:>9.1} {csm:>8.2} {:>6.1}", "stock", csm / (wsm / 1000.0));
-    println!("{:<10} {wlm:>9.1} {clm:>8.2} {:>6.1}", "late-mat", clm / (wlm / 1000.0));
+    let (wsm, csm, wlm, clm) = (
+        median(&mut ws),
+        median(&mut cs),
+        median(&mut wl),
+        median(&mut cl),
+    );
+    println!(
+        "\n{:<10} {:>9} {:>8} {:>6}",
+        "arm", "wall_ms", "cpu_s", "eff"
+    );
+    println!(
+        "{:<10} {wsm:>9.1} {csm:>8.2} {:>6.1}",
+        "stock",
+        csm / (wsm / 1000.0)
+    );
+    println!(
+        "{:<10} {wlm:>9.1} {clm:>8.2} {:>6.1}",
+        "late-mat",
+        clm / (wlm / 1000.0)
+    );
     println!(
         "\nQ10 prod: stock {wsm:.0}ms vs late-mat {wlm:.0}ms => {:.3}x wall ({:.3}x CPU)",
         wsm / wlm,

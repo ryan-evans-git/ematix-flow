@@ -101,6 +101,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "\nPK declaration changes the optimized plan for: {:?} (of 22).",
         changed
     );
-    println!("(rule OFF → this is the FD-on-catalog blast radius; the rule itself fires Q10-only.)");
+    println!(
+        "(rule OFF → this is the FD-on-catalog blast radius; the rule itself fires Q10-only.)"
+    );
     Ok(())
 }
