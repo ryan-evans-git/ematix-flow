@@ -367,7 +367,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let _ = time_ematix(&qctx, sql).await;
             }
             let mut t = Vec::new();
-            for _ in 0..8 {
+            for _ in 0..trials.max(1) {
                 // fresh ctx each timed run = bench parity (empty registry)
                 let fctx = build_ematix_ctx(&data_dir)?;
                 if let Ok((ms, _)) = time_ematix(&fctx, sql).await {
