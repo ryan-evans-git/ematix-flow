@@ -776,8 +776,11 @@ impl ExecutionPlan for BuildSideBloomEmitterExec {
                                     // partition alone exceeded the multi-MB drop
                                     // cap — far too large to be a selective
                                     // dimension → treat as over-threshold.
-                                    let actual_keys =
-                                        if all_some { total_keys } else { l9_set_drop_cap() };
+                                    let actual_keys = if all_some {
+                                        total_keys
+                                    } else {
+                                        l9_set_drop_cap()
+                                    };
                                     let sel = actual_keys as f64 / (dim_total.max(1) as f64);
                                     let trace =
                                         std::env::var("EMAT_L9_TRACE").as_deref() == Ok("1");
@@ -1100,8 +1103,11 @@ impl BuildSideBloomEmitterExec {
                                 if let Some((dim_total, max_sel)) = rt_sel_gate {
                                     let total_keys: usize =
                                         sets.iter().flatten().map(|s| s.len()).sum();
-                                    let actual_keys =
-                                        if all_some { total_keys } else { l9_set_drop_cap() };
+                                    let actual_keys = if all_some {
+                                        total_keys
+                                    } else {
+                                        l9_set_drop_cap()
+                                    };
                                     let sel = actual_keys as f64 / (dim_total.max(1) as f64);
                                     let trace =
                                         std::env::var("EMAT_L9_TRACE").as_deref() == Ok("1");
