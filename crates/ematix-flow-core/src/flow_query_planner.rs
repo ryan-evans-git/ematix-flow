@@ -343,10 +343,10 @@ mod tests {
             (rows, sum)
         };
 
-        // SAFETY: test-local toggle; no other test reads/writes EMAT_LATE_MAT_AGG,
-        // and the flag defaults off so a transient set only affects the late-mat
-        // shape (Q10 with PKs), which no other test runs.
-        unsafe { std::env::remove_var("EMAT_LATE_MAT_AGG") };
+        // SAFETY: test-local toggle; no other test reads/writes EMAT_LATE_MAT_AGG.
+        // The flag is now DEFAULT-ON (opt-out), so the OFF arm must set `=0`
+        // explicitly (removing the var would leave it on).
+        unsafe { std::env::set_var("EMAT_LATE_MAT_AGG", "0") };
         let off_plan = ctx.sql(sql).await.unwrap().create_physical_plan().await.unwrap();
         let off_dump = format!("{}", displayable(off_plan.as_ref()).indent(true));
         assert!(

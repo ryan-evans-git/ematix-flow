@@ -424,3 +424,27 @@ it only activates where PKs are declared AND the ≥3-wide-string star shape exi
 confirm the FD-on-catalog effect is also neutral at SF=100 (box-artifact-
 dominated; the isolated Q10 win + SF=10 22q neutrality are the strong evidence).
 Shipped opt-in (`EMAT_LATE_MAT_AGG=1`) and ready to flip on the user's call.
+
+---
+
+## §8 SF100 22q SWEEP CLEARED → FLIPPED DEFAULT-ON (2026-06-23)
+
+- **FD plan-inertness (`fd_plandiff`)**: declaring the TPC-H PKs changes the
+  optimized physical plan for **0 of 22** queries (rule off). DataFusion does not
+  use the declared FDs to restructure any TPC-H plan → the FD-on-catalog effect is
+  structurally INERT, not merely statistically neutral.
+- **SF=100 22q A/B (preset path, order-BALANCED 4-round — A & B each run first 2×
+  / second 2× to cancel the within-round page-cache ordering bias on the 36GB
+  box):**
+  - **Q10 −24.1%** (3623→2752ms) — the win holds in-sweep under cache pressure.
+  - **No query exceeds +6%** (SF=100 noise floor); the 21 are centered on zero
+    (several negative). The +9–12% on Q12/Q13/Q17 in a first A-then-B-only run was
+    pure ordering bias (B always second → colder cache); balancing removed it.
+    Guaranteed by the plan-diff (byte-identical plans → identical work).
+
+**ALL GATES CLEARED** → flipped `EMAT_LATE_MAT_AGG` **default-ON** (opt-out `=0`):
+fires Q10-only, correct everywhere, SF=10 + SF=100 22q regression-free, Q10
+SF=100 −24%/−31% win over DuckDB, FD plan-inert, full lib suite 1234/0. Inert
+without declared PKs + the ≥3-wide-string star, so default-on is safe for any
+catalog (the win materializes where a catalog declares its PKs — the harness does
+so as scaffolding; real users via DDL).

@@ -104,10 +104,14 @@ pub fn fd_minimal_group_key(
 // recognizer + `FusedProbeNode`/`FusedProbePlanner` pair.
 // ===================================================================
 
-/// `true` iff `EMAT_LATE_MAT_AGG=1` (opt-in; default OFF until the prod-E gates
-/// clear). Read once at physical-planning time, never on a hot path.
+/// `true` unless `EMAT_LATE_MAT_AGG=0` — DEFAULT-ON (opt-out) as of 2026-06-23,
+/// after the gates cleared: fires Q10-only (shape gate ≥3 wide strings), correct
+/// everywhere, SF=10/SF=100 22q regression-free (declaring PKs is plan-inert on
+/// all 22 — `fd_plandiff`), Q10 SF=100 −24% in-sweep / −31% isolated (beats
+/// DuckDB). Inert without declared PKs + the wide-string star shape, so default-on
+/// is safe for any catalog. Read once at physical-planning time, never hot.
 pub fn enabled() -> bool {
-    crate::flags::opt_in("EMAT_LATE_MAT_AGG")
+    crate::flags::enabled("EMAT_LATE_MAT_AGG")
 }
 
 /// The recognized + validated late-materialization shape. SOUND by construction:
