@@ -448,3 +448,42 @@ SF=100 −24%/−31% win over DuckDB, FD plan-inert, full lib suite 1234/0. Iner
 without declared PKs + the ≥3-wide-string star, so default-on is safe for any
 catalog (the win materializes where a catalog declares its PKs — the harness does
 so as scaffolding; real users via DDL).
+
+---
+
+## §9 CORRECTION — Q10 late-mat is ~PARITY vs DuckDB, NOT a win (2026-06-24, rule #1 inward)
+
+§5–§8 overstate the result. They state late-mat "beats DuckDB" / a "−24–31% win over
+DuckDB". That is WRONG, for two reasons:
+
+1. **The −24/−31% is vs STOCK EMATIX, not DuckDB.** Late-mat 2018ms vs *stock ematix*
+   2914ms = −31%. That part is real — late-mat genuinely removes most of Q10's
+   wide-string cost.
+2. **"Beats DuckDB" used a stale/static DuckDB floor.** The `q10_late_mat_prod_ab`
+   example printed `DuckDB SF=100 floor: ~1950-2250ms` as a *comment* — it never
+   measured DuckDB. I compared late-mat's 2018 against the high end (2250) of a
+   *remembered* range instead of the actual floor (~1950).
+
+**Measuring DuckDB FRESH in the same run** (`tpch_preset_rebench`, isolated-warm, both
+engines):
+
+| box | late-mat | DuckDB (measured) | ratio |
+|---|---|---|---|
+| cool (earlier) | 2018 | ~1950 | **1.04× (slight loss)** |
+| degraded (06-24, both ~1.6× slower) | 3340 | 3143 | **1.06×** |
+
+**True verdict: late-mat CLOSES Q10 from a ~1.5× loss to ~PARITY (≈1.05×).** A large,
+real improvement — the loss is nearly eliminated — but Q10 sits at parity-to-slight-loss
+with DuckDB, *not ahead*.
+
+Two further honest notes:
+- **Regime-dependence:** the rule's benefit is −31% in a reused-ctx/warm regime but only
+  ~−4% in the production-faithful fresh-ctx-per-trial regime on a degraded (cold-cache,
+  thermally-throttled) box. The 1M-batch lever pays when the query is warm/CPU-bound;
+  it's swamped when cold/IO-bound (cold lineitem reads dominate).
+- **Not a wiring bug:** `EMAT_EXPLAIN` confirms the shipped path emits
+  `BatchSizeOverrideExec(1M) → LateGatherExec → AggregateExec(rowid) → EmatixHashJoinExec`.
+  The feature works as designed; the *framing* was the error.
+
+The feature stays shipped (default-on): it is correct everywhere and closes Q10's loss.
+But the honest scoreboard entry is **"Q10: ~1.5× loss → parity"**, not a win.
