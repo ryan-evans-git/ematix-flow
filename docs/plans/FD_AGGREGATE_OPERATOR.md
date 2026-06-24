@@ -67,3 +67,35 @@ wrong answers. Mirror `robin_hood_agg_rule.rs` for the shape match + `transform_
   move the 22q geomean (the [[optimizer-codegen-sensitivity]] tax); if it did, move the
   kernel to a sibling crate.
 - Decision: default-on iff Q10 flips AND 22q neutral AND correct; else banked opt-in.
+
+## VERDICT (2026-06-22): NO-GO — banked as opt-in infra, rule NOT built
+
+Stories 1+2 shipped (composite-key kernel `fd_aggregate.rs` + operator
+`fd_aggregate_exec.rs`, 10 tests, correct). Then the load-bearing END-TO-END
+measurement (`q10_fd_operator_e2e` — splices `FdAggregateExec` into Q10's real plan
+over real parquet, checksum-verified MATCH at both scales) **killed the lever**:
+
+| scale | stock wall | FD-agg wall | ratio | stock CPU | FD-agg CPU |
+|---|---|---|---|---|---|
+| SF=10  | 214 ms  | 234 ms   | **0.92×** (9% slower)  | 2.16 | 2.10 |
+| SF=100 | 4647 ms | 13790 ms | **0.34×** (3× slower)  | 39.8 | 74.3 |
+
+**Root cause (the synthetic microbench was a strawman):** `q10_agg_kernel_bench` fed
+*few large* `StringArray` batches and showed the operator at 1.10× (a "GO"). But the
+real join pipeline delivers *hundreds of small* batches per partition, so the kernel's
+**retain-all-batches + finalize `interleave`-gather** of 3.88M group reps scattered
+across ~130 batches/partition is pathologically cache-hostile and burns 1.87× the CPU.
+This is exactly the streaming-incremental group-value materialization DataFusion's
+`GroupValuesRows` already does well — the narrow-key-encode saving (~0.2 CPU-s) is
+swamped by the gather pathology and the worse parallelism (eff 8.6→5.4).
+
+**Campaign insight:** stock Q10 SF=100 is **39.8 CPU-s total**; the SF=100 root-cause's
+"4.86 CPU-s group-id" is only **~12%** of the query. The agg was never where Q10's gap
+lives — it's the joins/decode (the other ~88%). Any agg-kernel lever was capped at ~12%.
+Future Q10 SF=100 work should target the join/decode path, not the aggregate.
+
+**Status:** kernel + operator + both benches are correct, tested, default-OFF (no rule
+fires them), zero codegen/default risk — banked as opt-in infra. Story 3 (FD-detect
+rule) and Story 4 (gate) are **NOT built** (negative ROI). To ever revisit, the kernel
+would need copy-on-first incremental group-value storage (not retain+gather) — but that
+is what DataFusion already does, so the ceiling stays ~12%.

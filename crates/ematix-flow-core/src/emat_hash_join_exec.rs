@@ -50,6 +50,12 @@ pub struct EmatixHashJoinExec {
     /// late-materialization de-risk). `build_time` is the serial hash-table
     /// insert (timed once inside the build closure); `probe_time` the probe.
     metrics: ExecutionPlanMetricsSet,
+    /// P2' build/probe overlap baked in per-instance (not just the global
+    /// `EMAT_HJ_OVERLAP` env). The late-mat planner sets this `true`: overlap is
+    /// REQUIRED for the Q10 win (without it the serial 15M build is not hidden
+    /// behind the probe decode — measured SF=100: eff 7.9 / 2779ms vs eff 10.5 /
+    /// 2322ms with). `execute()` enables overlap when this OR the env is set.
+    overlap: bool,
 }
 
 impl EmatixHashJoinExec {
@@ -80,7 +86,15 @@ impl EmatixHashJoinExec {
             properties,
             build_once: Arc::new(OnceCell::new()),
             metrics: ExecutionPlanMetricsSet::new(),
+            overlap: false,
         }
+    }
+
+    /// Bake in P2' build/probe overlap for this instance (the late-mat planner
+    /// uses this — overlap is required for the Q10 win, see the `overlap` field).
+    pub fn with_overlap(mut self, on: bool) -> Self {
+        self.overlap = on;
+        self
     }
 
     pub fn build_key_idx(&self) -> usize {
@@ -88,6 +102,17 @@ impl EmatixHashJoinExec {
     }
     pub fn probe_key_idx(&self) -> usize {
         self.probe_key_idx
+    }
+
+    /// Q10-flip increment 3 (wiring): hand the SHARED build handle to a
+    /// downstream [`crate::late_gather_exec::LateGatherExec`] so it can
+    /// `gather_build_cols` the wide build columns at the (far smaller) aggregate
+    /// output from the IDENTICAL resident build batches — no customer re-scan.
+    /// Valid only when this exact operator instance stays in the executed plan
+    /// (the build is initialized lazily on first `execute`); do not call
+    /// `with_new_children` on it after sharing, as that mints a fresh `OnceCell`.
+    pub fn build_once(&self) -> Arc<OnceCell<Arc<EmatHashJoiner>>> {
+        self.build_once.clone()
     }
 }
 
@@ -144,14 +169,36 @@ impl ExecutionPlan for EmatixHashJoinExec {
                 children.len()
             )));
         }
-        Ok(Arc::new(Self::new(
-            children[0].clone(),
-            children[1].clone(),
-            self.build_key_idx,
-            self.probe_key_idx,
-            self.output.clone(),
-            self.schema.clone(),
-        )))
+        // PRESERVE the shared `build_once` (and metrics) across a child swap
+        // rather than minting a fresh `OnceCell`. The physical optimizer
+        // (EnforceDistribution/CoalesceBatches) rewrites this node's children
+        // AFTER a downstream `LateGatherExec` has captured `build_once()` — a
+        // fresh cell there would leave the gatherer pointing at a never-
+        // initialized build ("shared join build not initialized"). The cell is
+        // empty pre-execution and keyed to the (logically equivalent) build
+        // side, so carrying it forward is sound; mirrors `LateGatherExec`.
+        let left = children[0].clone();
+        let right = children[1].clone();
+        let eq = EquivalenceProperties::new(self.schema.clone());
+        let partitioning = right.output_partitioning().clone();
+        let properties = Arc::new(PlanProperties::new(
+            eq,
+            partitioning,
+            EmissionType::Incremental,
+            Boundedness::Bounded,
+        ));
+        Ok(Arc::new(Self {
+            left,
+            right,
+            build_key_idx: self.build_key_idx,
+            probe_key_idx: self.probe_key_idx,
+            output: self.output.clone(),
+            schema: self.schema.clone(),
+            properties,
+            build_once: self.build_once.clone(),
+            metrics: self.metrics.clone(),
+            overlap: self.overlap,
+        }))
     }
 
     fn execute(
@@ -169,6 +216,7 @@ impl ExecutionPlan for EmatixHashJoinExec {
         let stream_schema = self.schema.clone();
         let build_ctx = ctx.clone();
         let metrics = self.metrics.clone();
+        let self_overlap = self.overlap;
 
         let fut = async move {
             // Q10-flip increment 1: time the (serial) build insert once + the probe.
@@ -185,6 +233,32 @@ impl ExecutionPlan for EmatixHashJoinExec {
             // probe side's parallelism). The hash-table INSERT stays serial — a
             // smaller next-step lever; reclaiming the drain is what the dig's
             // metrics localized as dominant.
+            // P2' (gated, EMAT_HJ_OVERLAP=1): start the probe-side decode CONCURRENTLY
+            // with the build. Otherwise the LEFT build fully completes before
+            // `right.execute()` is polled, serializing ~build_time of LEFT decode that
+            // could overlap the (long-pole) probe-side decode. Measured on Q10 SF=100:
+            // build_time=1.08s ran ENTIRELY before the 148M-lineitem probe side started
+            // (~40% of wall near-serial → eff 7 vs the narrow plan's 12). Spawn the
+            // right drain so it overlaps the build; buffer the probe input (the
+            // downstream agg/sort breaks the pipeline anyway). Default OFF — the blast
+            // radius is buffering the probe side, which only some shapes can afford.
+            let overlap = self_overlap
+                || std::env::var("EMAT_HJ_OVERLAP")
+                    .map(|v| v != "0")
+                    .unwrap_or(false);
+            let right_pre = if overlap {
+                let right = right.clone();
+                let ctx = ctx.clone();
+                Some(tokio::spawn(async move {
+                    right
+                        .execute(partition, ctx)?
+                        .try_collect::<Vec<RecordBatch>>()
+                        .await
+                }))
+            } else {
+                None
+            };
+
             let joiner = build_once
                 .get_or_try_init(|| async {
                     let _build_timer = build_time.timer();
@@ -213,6 +287,29 @@ impl ExecutionPlan for EmatixHashJoinExec {
                 })
                 .await?
                 .clone();
+
+            // P2' overlap: the probe side was decoded concurrently with the build →
+            // probe the buffered batches now (the build is hidden behind it).
+            if let Some(handle) = right_pre {
+                let batches = handle
+                    .await
+                    .map_err(|e| DataFusionError::Execution(format!("probe-drain task: {e}")))??;
+                let _t = probe_time.timer();
+                if joiner.is_radix() {
+                    let out = joiner
+                        .probe_radix_all(&batches)
+                        .map_err(DataFusionError::Internal)?;
+                    return Ok::<_, DataFusionError>(
+                        futures_util::stream::iter(vec![Ok::<RecordBatch, DataFusionError>(out)])
+                            .boxed(),
+                    );
+                }
+                let outs: Vec<Result<RecordBatch, DataFusionError>> = batches
+                    .iter()
+                    .map(|rb| joiner.probe(rb).map_err(DataFusionError::Internal))
+                    .collect();
+                return Ok(futures_util::stream::iter(outs).boxed());
+            }
 
             // Probe. RADIX.2 spike: if the build is radix-partitioned, BUFFER this
             // partition's probe batches then B-scatter-probe them in one call —

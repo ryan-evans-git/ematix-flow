@@ -35,9 +35,16 @@ const TPCH_TABLES: &[&str] = &[
 
 /// EXACT production context (mirrors run_shard.rs lines 93-110).
 fn build_ematix_ctx(data_dir: &Path) -> Result<SessionContext, Box<dyn std::error::Error>> {
+    // prod-D probe: EMAT_BATCH_SIZE overrides the default 8192-row batch size. The
+    // Q10 late-mat reattach wants few, large build batches; this measures the broad
+    // 22q effect of a larger global batch size at SF=100 vs the SF=10 regression risk.
+    let mut config = SessionConfig::new();
+    if let Ok(Ok(n)) = std::env::var("EMAT_BATCH_SIZE").map(|s| s.parse::<usize>()) {
+        config = config.with_batch_size(n);
+    }
     let mut builder = preset::with_optimizer_rules(
         SessionStateBuilder::new()
-            .with_config(SessionConfig::new())
+            .with_config(config)
             .with_default_features(),
     );
     // EMAT_TEST_HJ_SWAP=1: install the (NOT-in-preset) EmatixHashJoin swap rule so
@@ -66,11 +73,33 @@ fn build_ematix_ctx(data_dir: &Path) -> Result<SessionContext, Box<dyn std::erro
         .ok()
         .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
         .unwrap_or(true);
+    // TPC-H primary keys (harness scaffolding — a real catalog declares these via
+    // DDL; the SHIPPED library has no TPC-H hardcoding). Declared when
+    // EMAT_TPCH_PK=1 OR the late-mat rule is enabled (it needs the PK-derived FDs
+    // to fire). Off by default → the baseline path is byte-identical.
+    let declare_pk = std::env::var("EMAT_TPCH_PK")
+        .map(|v| v != "0")
+        .unwrap_or(false)
+        || ematix_flow_core::late_mat_agg::enabled();
+    let tpch_pk = |t: &str| -> Option<Vec<usize>> {
+        Some(match t {
+            "region" | "nation" | "supplier" | "customer" | "part" | "orders" => vec![0],
+            "partsupp" => vec![0, 1], // (ps_partkey, ps_suppkey)
+            "lineitem" => vec![0, 3], // (l_orderkey, l_linenumber)
+            _ => return None,
+        })
+    };
     for t in TPCH_TABLES {
         let path = data_dir.join(format!("{t}.parquet"));
-        let provider = EmatixFastParquetTableProvider::try_new(path.to_string_lossy().to_string())?
-            .with_dict_preservation(dictp)
-            .with_late_mat(latem);
+        let mut provider =
+            EmatixFastParquetTableProvider::try_new(path.to_string_lossy().to_string())?
+                .with_dict_preservation(dictp)
+                .with_late_mat(latem);
+        if declare_pk {
+            if let Some(pk) = tpch_pk(t) {
+                provider = provider.with_primary_key(pk);
+            }
+        }
         ctx.register_table(*t, Arc::new(provider))?;
     }
     Ok(ctx)
@@ -338,7 +367,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let _ = time_ematix(&qctx, sql).await;
             }
             let mut t = Vec::new();
-            for _ in 0..8 {
+            for _ in 0..trials.max(1) {
                 // fresh ctx each timed run = bench parity (empty registry)
                 let fctx = build_ematix_ctx(&data_dir)?;
                 if let Ok((ms, _)) = time_ematix(&fctx, sql).await {
