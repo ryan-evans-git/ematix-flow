@@ -252,6 +252,19 @@ pub struct BuildSideBloomEmitterExec {
     n_partitions: usize,
     /// Used to size each partition's local bloom.
     expected_keys_per_partition: usize,
+    /// L9.DIMSEL.RT (2026-06-24) — runtime build-side selectivity gate for
+    /// filtered-DIMENSION→FACT blooms admitted by the L9.DIMSEL rescue. Plan
+    /// time cannot tell a winning dim bloom (Q9 `part LIKE '%green%'`, keeps
+    /// ~5% of part) from a losing one (Q3 `c_mktsegment=`, keeps 20%; Q8/Q21
+    /// orders date/status, 28-50%) — every filtered dim estimates the same
+    /// generic `filter_sel=0.2`. But the TRUE selectivity is knowable at
+    /// PUBLISH time: `actual_build_keys / dim_total` is exactly the fraction of
+    /// the fact the bloom lets through. When `Some((dim_total, max_sel))` and
+    /// that ratio exceeds `max_sel`, the finalize publishes an EMPTY predicate
+    /// set (the sideband still flips `is_ready()`, so the probe takes the base
+    /// path — no filter, no late-arm, no routing cost) instead of the bloom.
+    /// `None` (the default) leaves every existing wrap byte-identical.
+    rt_sel_gate: Option<(usize, f64)>,
     properties: Arc<PlanProperties>,
 }
 
@@ -337,8 +350,24 @@ impl BuildSideBloomEmitterExec {
             completed: Arc::new(AtomicUsize::new(0)),
             n_partitions,
             expected_keys_per_partition,
+            rt_sel_gate: None,
             properties,
         })
+    }
+
+    /// L9.DIMSEL.RT — attach the runtime build-selectivity gate (builder
+    /// style; call right after construction). `dim_total` is the dimension
+    /// table's total (pre-filter) row count; `max_sel` is the maximum
+    /// build-keys/dim-total ratio at which the bloom is still published. Above
+    /// it the finalize publishes an empty (disarmed) set. See the field docs.
+    pub fn with_rt_sel_gate(mut self, dim_total: usize, max_sel: f64) -> Self {
+        self.rt_sel_gate = Some((dim_total, max_sel));
+        self
+    }
+
+    /// L9.DIMSEL.RT — the attached runtime build-selectivity gate, if any.
+    pub fn rt_sel_gate(&self) -> Option<(usize, f64)> {
+        self.rt_sel_gate
     }
 
     pub fn key_col_idx(&self) -> usize {
@@ -394,6 +423,21 @@ impl ExecutionPlan for BuildSideBloomEmitterExec {
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![&self.input]
     }
+    /// This wrapper forwards every batch unchanged — same row count, same
+    /// per-column stats. Delegate to the input so a parent operator's
+    /// cardinality estimate is unaffected by the wrap. Without this the
+    /// default impl returns `Absent`, which made an upstream join's
+    /// `estimate_build_rows` come back `None` → the L9 ratio gate (which
+    /// treats `None` as "not rejected") admitted a net-negative SECONDARY
+    /// bloom that the un-wrapped plan correctly rejected (the Q3 +40%
+    /// `(customer⋈orders)→lineitem` fire that appeared only when the inner
+    /// customer→orders DIMSEL wrap was present). Pure correctness fix.
+    fn partition_statistics(
+        &self,
+        partition: Option<usize>,
+    ) -> DfResult<datafusion::common::Statistics> {
+        self.input.partition_statistics(partition)
+    }
     fn with_new_children(
         self: Arc<Self>,
         mut children: Vec<Arc<dyn ExecutionPlan>>,
@@ -401,14 +445,19 @@ impl ExecutionPlan for BuildSideBloomEmitterExec {
         let new_input = children.pop().ok_or_else(|| {
             DataFusionError::Internal("BuildSideBloomEmitterExec requires exactly 1 child".into())
         })?;
-        Ok(Arc::new(Self::try_new_with_extras(
+        let mut rebuilt = Self::try_new_with_extras(
             new_input,
             self.key_col_idx,
             self.target_col_idx,
             self.sideband.clone(),
             self.extra_targets.clone(),
             self.expected_keys_per_partition * self.n_partitions,
-        )?))
+        )?;
+        // L9.DIMSEL.RT — preserve the runtime build-selectivity gate (a fresh
+        // child must not silently drop the disarm, or a re-planned wrap would
+        // always-fire the dim bloom regardless of measured selectivity).
+        rebuilt.rt_sel_gate = self.rt_sel_gate;
+        Ok(Arc::new(rebuilt))
     }
 
     fn execute(
@@ -444,6 +493,9 @@ impl ExecutionPlan for BuildSideBloomEmitterExec {
         // from the publish threshold so a large coalesced build keeps its
         // exact keys for the finalize to rebuild a right-sized bloom.
         let set_drop_cap = l9_set_drop_cap();
+        // L9.DIMSEL.RT — runtime build-selectivity gate (Copy; captured by the
+        // finalize closure below). None ⇒ no gate ⇒ existing behavior.
+        let rt_sel_gate = self.rt_sel_gate;
 
         // Per-partition local bloom + set. Both are wrapped in
         // Arc<Mutex<…>> so the map closure (per-batch updates) and the
@@ -701,6 +753,58 @@ impl ExecutionPlan for BuildSideBloomEmitterExec {
                                 // it equals the true distinct count in practice.
                                 let total_keys: usize =
                                     sets.iter().flatten().map(|s| s.len()).sum();
+
+                                // L9.DIMSEL.RT — runtime build-selectivity
+                                // disarm. The L9.DIMSEL rescue admits a
+                                // filtered-dim→fact bloom that the plan-time
+                                // ratio gate rejected, because plan-time can't
+                                // see the real filter selectivity (every
+                                // filtered dim estimates 0.2). Here at finalize
+                                // we DO know it: actual build keys / dim_total
+                                // is the exact fraction of the fact the bloom
+                                // lets through. If the bloom would drop too
+                                // little of the probe to pay its routing + probe
+                                // cost, publish EMPTY (the sideband still flips
+                                // is_ready() so the probe peeks Some([]) → adds
+                                // no filter, never late-arms, stays on the base
+                                // reader path). This is what separates Q9's win
+                                // (part LIKE '%green%', ~5% kept) from Q3/Q8/Q21
+                                // (customer/orders filters, 20-50% kept).
+                                if let Some((dim_total, max_sel)) = rt_sel_gate {
+                                    // Surviving sets ⇒ exact distinct count; an
+                                    // overflowed partition (None) means one
+                                    // partition alone exceeded the multi-MB drop
+                                    // cap — far too large to be a selective
+                                    // dimension → treat as over-threshold.
+                                    let actual_keys = if all_some {
+                                        total_keys
+                                    } else {
+                                        l9_set_drop_cap()
+                                    };
+                                    let sel = actual_keys as f64 / (dim_total.max(1) as f64);
+                                    let trace =
+                                        std::env::var("EMAT_L9_TRACE").as_deref() == Ok("1");
+                                    if sel > max_sel {
+                                        if trace {
+                                            eprintln!(
+                                                "[L9.trace] DIMSEL.RT disarm — build_keys={actual_keys} / dim_total={dim_total} = {sel:.3} > {max_sel} (bloom drops only ~{:.0}% of probe; publishing empty)",
+                                                (1.0 - sel) * 100.0
+                                            );
+                                        }
+                                        sideband.publish(Vec::new());
+                                        for (_, sb) in extra_targets.iter() {
+                                            sb.publish(Vec::new());
+                                        }
+                                        return None;
+                                    }
+                                    if trace {
+                                        eprintln!(
+                                            "[L9.trace] DIMSEL.RT keep — build_keys={actual_keys} / dim_total={dim_total} = {sel:.3} ≤ {max_sel} (bloom drops ~{:.0}% of probe)",
+                                            (1.0 - sel) * 100.0
+                                        );
+                                    }
+                                }
+
                                 // Publish an EXACT set only when the merged total fits
                                 // under the publish threshold. Above it we want a bloom
                                 // (cheaper per-probe across a 60M-row scan), rebuilt from
@@ -871,6 +975,9 @@ impl BuildSideBloomEmitterExec {
         let expected_per_part = self.expected_keys_per_partition;
         let in_schema: SchemaRef = self.input.schema();
         let set_threshold = l9_set_threshold();
+        // L9.DIMSEL.RT — runtime build-selectivity gate (Copy; captured by the
+        // finalize closure below). None ⇒ no gate ⇒ existing behavior.
+        let rt_sel_gate = self.rt_sel_gate;
 
         // Per-partition local bloom (type-agnostic — fed via insert_str) plus
         // an exact string set; both wrapped so the per-batch map closure and
@@ -989,6 +1096,40 @@ impl BuildSideBloomEmitterExec {
                                 // AND the union stays under the threshold;
                                 // otherwise fall back to the merged bloom.
                                 let all_some = sets.iter().all(|s| s.is_some());
+
+                                // L9.DIMSEL.RT — runtime build-selectivity
+                                // disarm (string-key analog of the i64 path).
+                                // See that path for the rationale.
+                                if let Some((dim_total, max_sel)) = rt_sel_gate {
+                                    let total_keys: usize =
+                                        sets.iter().flatten().map(|s| s.len()).sum();
+                                    let actual_keys = if all_some {
+                                        total_keys
+                                    } else {
+                                        l9_set_drop_cap()
+                                    };
+                                    let sel = actual_keys as f64 / (dim_total.max(1) as f64);
+                                    let trace =
+                                        std::env::var("EMAT_L9_TRACE").as_deref() == Ok("1");
+                                    if sel > max_sel {
+                                        if trace {
+                                            eprintln!(
+                                                "[L9.trace] DIMSEL.RT disarm (str) — build_keys={actual_keys} / dim_total={dim_total} = {sel:.3} > {max_sel} (publishing empty)"
+                                            );
+                                        }
+                                        sideband.publish(Vec::new());
+                                        for (_, sb) in extra_targets.iter() {
+                                            sb.publish(Vec::new());
+                                        }
+                                        return None;
+                                    }
+                                    if trace {
+                                        eprintln!(
+                                            "[L9.trace] DIMSEL.RT keep (str) — build_keys={actual_keys} / dim_total={dim_total} = {sel:.3} ≤ {max_sel}"
+                                        );
+                                    }
+                                }
+
                                 let shared_set: Option<Arc<std::collections::HashSet<String>>> =
                                     if all_some {
                                         let mut merged: std::collections::HashSet<String> =
@@ -1164,6 +1305,59 @@ mod tests {
             }
             other => panic!("expected I64InSet, got {other:?}"),
         }
+    }
+
+    /// L9.DIMSEL.RT — the runtime build-selectivity gate. With a gate of
+    /// `(dim_total, max_sel)`, the emitter publishes the real set/bloom only
+    /// when `actual_build_keys / dim_total <= max_sel`; above it it publishes
+    /// an EMPTY (disarmed) predicate set. The 9-key build below is run twice:
+    /// once with a generous dim_total (kept) and once with a tiny one (so the
+    /// 9 keys exceed the threshold → disarm).
+    #[tokio::test]
+    async fn dimsel_rt_gate_keeps_or_disarms() {
+        async fn run(dim_total: usize, max_sel: f64) -> Vec<ColumnPredicate> {
+            let ctx = SessionContext::new();
+            let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, false)]));
+            let mt = MemTable::try_new(
+                schema.clone(),
+                vec![vec![make_batch(vec![1, 2, 3, 4, 5, 6, 7, 8, 9])]],
+            )
+            .unwrap();
+            ctx.register_table("t", Arc::new(mt)).unwrap();
+            let plan = ctx
+                .sql("SELECT k FROM t")
+                .await
+                .unwrap()
+                .create_physical_plan()
+                .await
+                .unwrap();
+            let sideband = BridgeFilterSideband::new();
+            let wrapper = BuildSideBloomEmitterExec::try_new(plan, 0, 42, sideband.clone(), 16)
+                .unwrap()
+                .with_rt_sel_gate(dim_total, max_sel);
+            let n = wrapper.properties().output_partitioning().partition_count();
+            for p in 0..n {
+                let mut s = wrapper
+                    .execute(p, Arc::new(TaskContext::default()))
+                    .unwrap();
+                while let Some(_b) = s.try_next().await.unwrap() {}
+            }
+            // The gate always publishes (empty when disarmed) → is_ready() so
+            // the probe takes the base path instead of late-arming.
+            assert!(sideband.is_ready(), "gate must publish (ready) either way");
+            sideband.take().unwrap()
+        }
+
+        // 9 keys / 1000 dim = 0.009 ≤ 0.5 → KEEP (real set published).
+        let kept = run(1000, 0.5).await;
+        assert_eq!(kept.len(), 1, "kept: expected the real predicate");
+        assert!(matches!(kept[0], ColumnPredicate::I64InSet { .. }));
+        // 9 keys / 10 dim = 0.9 > 0.5 → DISARM (empty published).
+        let disarmed = run(10, 0.5).await;
+        assert!(
+            disarmed.is_empty(),
+            "disarmed: expected empty predicate set, got {disarmed:?}"
+        );
     }
 
     #[test]

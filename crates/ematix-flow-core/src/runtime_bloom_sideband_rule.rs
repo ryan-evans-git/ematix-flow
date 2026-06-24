@@ -395,6 +395,13 @@ impl PhysicalOptimizerRule for EnableRuntimeBloomSidebandRule {
             };
             let mut build_rows = default_build_rows;
             let mut tight_only = false;
+            // L9.DIMSEL.RT — when the DIMSEL rescue admits a filtered-dim→fact
+            // bloom, carry the dim's total row count so the emitter can apply
+            // the RUNTIME build-selectivity disarm at publish time (plan-time
+            // selectivity is the useless 0.2 constant; the real selectivity is
+            // `actual_build_keys / dim_total`, knowable only once the build
+            // drains). `Some((dim_total, max_sel))` ⇒ gate the emitter.
+            let mut dimsel_gate: Option<(usize, f64)> = None;
             if ratio_rejects(default_build_rows) {
                 // L9.ADAPT lazy tight rescue — the default estimator said
                 // no. Opt-in NDV mode may rescue the wrap, but ONLY behind
@@ -464,15 +471,60 @@ impl PhysicalOptimizerRule for EnableRuntimeBloomSidebandRule {
                     estimate_build_rows_mode(build.as_ref(), true)
                 };
                 if tight_admit.is_none() || ratio_rejects(tight_admit) {
-                    if trace {
-                        eprintln!(
-                            "[L9.trace] skip — gate rejects (tight too): b({:?}) × ratio({}) >= p({})",
-                            tight_admit,
-                            self.min_probe_to_build_ratio,
-                            probe_rows.unwrap_or(0)
-                        );
+                    // L9.DIMSEL rescue (opt-in): the NDV ratio still rejects on
+                    // absolute build size, but a SELECTIVE filtered-dimension
+                    // build makes a selective FACT bloom regardless — admit when
+                    // the build is a single filtered dim scan whose filter keeps
+                    // ≤ `EMAT_L9_DIM_BLOOM_SEL` of the dim. (Pre-gates already
+                    // passed: probe ≥ 8M rows, ≥ proj cols, fused-evaluable.)
+                    // (dim_total, plan-time sel). dim_total feeds the RUNTIME
+                    // gate; sel is the plan-time 0.2 constant (kept only as a
+                    // cheap admission sanity check — the real decision is the
+                    // emitter's runtime build-selectivity disarm).
+                    let dimsel = if dim_bloom_enabled() {
+                        single_dim_scan_total(build.as_ref()).and_then(|dim_total| {
+                            default_build_rows
+                                .map(|b| (dim_total, b as f64 / dim_total.max(1) as f64))
+                        })
+                    } else {
+                        None
+                    };
+                    match dimsel {
+                        Some((dim_total, sel)) if sel <= dim_bloom_max_sel() => {
+                            // Arm the RUNTIME build-selectivity gate. Plan-time
+                            // can't separate Q9's win from Q3/Q8/Q21's losses
+                            // (all estimate sel=0.2); the emitter re-checks
+                            // `actual_build_keys / dim_total` at publish time and
+                            // disarms (publishes empty) when the bloom would drop
+                            // too little of the probe. 0 ⇒ runtime gate disabled.
+                            let rt_max = dim_bloom_rt_max_sel();
+                            if rt_max > 0.0 {
+                                dimsel_gate = Some((dim_total, rt_max));
+                            }
+                            if trace {
+                                eprintln!(
+                                    "[L9.trace] DIMSEL admit — plan_sel={sel:.3} ≤ {}, dim_total={dim_total}, rt_gate≤{rt_max} (runtime disarm decides at publish)",
+                                    dim_bloom_max_sel(),
+                                );
+                            }
+                            // fall through to sizing below (tight path)
+                        }
+                        _ => {
+                            if trace {
+                                eprintln!(
+                                    "[L9.trace] skip — gate rejects (tight too): b({:?}) × ratio({}) >= p({}){}",
+                                    tight_admit,
+                                    self.min_probe_to_build_ratio,
+                                    probe_rows.unwrap_or(0),
+                                    match dimsel {
+                                        Some((_, s)) => format!("; DIMSEL filter_sel={s:.3} > {}", dim_bloom_max_sel()),
+                                        None => String::new(),
+                                    }
+                                );
+                            }
+                            return Ok(Transformed::no(node));
+                        }
                     }
-                    return Ok(Transformed::no(node));
                 }
                 // L9.ADAPT.Q05 SIZING (2026-06-12): the selective-shape
                 // caps are ADMISSION devices, not sizing — feeding Q05's
@@ -521,6 +573,38 @@ impl PhysicalOptimizerRule for EnableRuntimeBloomSidebandRule {
             } else {
                 BridgeFilterSideband::new()
             };
+            // L9.DIMSEL.RT — DIMSEL-admitted wraps carry the no-late-arm marker
+            // so an eager-polled probe falls back to base instead of routing
+            // eager to await a (possibly disarmed) publish.
+            let sideband = if dimsel_gate.is_some() {
+                sideband.mark_dimsel_gated()
+            } else {
+                sideband
+            };
+
+            // L9.DIMSEL.RT dedup — never let a DIMSEL fire attach to a probe
+            // scan that a LOWER fire (processed earlier in transform_up) already
+            // wrapped: a scan holds ONE sideband, so the second wrap would
+            // DISPLACE the first, orphaning it. Q8 hit exactly this — the
+            // orders→lineitem DIMSEL fire overwrote the beneficial
+            // part→lineitem bloom on the shared lineitem scan, then disarmed
+            // itself → lineitem fully unfiltered (+43%). Scoped to DIMSEL
+            // (byte-identical when the lever is off); the matched `scan_node`
+            // already reflects the lower fire's rewrite.
+            if dimsel_gate.is_some()
+                && scan_node
+                    .as_any()
+                    .downcast_ref::<EmatixFastParquetExec>()
+                    .map(|s| s.runtime_sideband().is_some())
+                    .unwrap_or(false)
+            {
+                if trace {
+                    eprintln!(
+                        "[L9.trace] DIMSEL skip — probe scan already wrapped by a lower fire (would displace it)"
+                    );
+                }
+                return Ok(Transformed::no(node));
+            }
 
             // Estimate expected build-side keys from the build's
             // partition statistics. Falls back to a generous default
@@ -545,13 +629,20 @@ impl PhysicalOptimizerRule for EnableRuntimeBloomSidebandRule {
                 }
             }
 
-            let wrapped_build: Arc<dyn ExecutionPlan> = Arc::new(BuildSideBloomEmitterExec::try_new(
+            let mut emitter = BuildSideBloomEmitterExec::try_new(
                 build,
                 build_key_idx,
                 probe_scan_col_idx,
                 sideband.clone(),
                 expected_keys,
-            )?);
+            )?;
+            // L9.DIMSEL.RT — attach the runtime build-selectivity disarm to
+            // DIMSEL-admitted wraps. No-op for every other (default / tight /
+            // semi) wrap, which leave `dimsel_gate` None → byte-identical.
+            if let Some((dim_total, max_sel)) = dimsel_gate {
+                emitter = emitter.with_rt_sel_gate(dim_total, max_sel);
+            }
+            let wrapped_build: Arc<dyn ExecutionPlan> = Arc::new(emitter);
 
             let new_probe = rewrite_probe_subtree(&probe, &scan_node, &sideband)?;
 
@@ -790,6 +881,60 @@ fn estimate_build_rows(plan: &dyn ExecutionPlan) -> Option<usize> {
 ///     by construction (probe-rows pre-gate exceeds every SF=1 fact).
 pub(crate) fn tight_cardinality_enabled() -> bool {
     std::env::var("EMAT_L9_TIGHT_CARDINALITY").as_deref() != Ok("0")
+}
+
+/// L9.DIMSEL (2026-06-24, opt-in `EMAT_L9_DIM_BLOOM`, default OFF) — admit a
+/// filtered-DIMENSION→FACT bloom that the build/probe ratio gate rejects on
+/// absolute build size. The ratio gate uses `build_rows / probe_rows` as the
+/// bloom-selectivity proxy, which is WRONG for a filtered dimension: the bloom on
+/// the fact's FK drops `1 - (filtered_dim_rows / total_dim_rows)` of the probe,
+/// independent of how the dim size compares to the fact. Q9 `part(LIKE %green%)
+/// ⋈ lineitem`: the part filter keeps ~5-20% of parts, so the bloom on
+/// `l_partkey` drops ~80-95% of 600M lineitem — highly beneficial — yet the 1M+
+/// build trips the 1024× ratio gate. This admits exactly that shape.
+pub(crate) fn dim_bloom_enabled() -> bool {
+    crate::flags::opt_in("EMAT_L9_DIM_BLOOM")
+}
+
+/// Max dim-filter selectivity (kept fraction) the L9.DIMSEL rescue admits — the
+/// bloom must drop at least `1 - this` of the probe to pay its per-row cost.
+/// Default 0.5 (`EMAT_L9_DIM_BLOOM_SEL`).
+fn dim_bloom_max_sel() -> f64 {
+    crate::flags::f64_or("EMAT_L9_DIM_BLOOM_SEL", 0.5)
+}
+
+/// L9.DIMSEL.RT (2026-06-24) — RUNTIME build-selectivity threshold. Plan-time
+/// selectivity is a useless constant (0.2 for every filtered dim), so the
+/// plan-time `dim_bloom_max_sel` gate can't separate a winning dim bloom from a
+/// losing one. The real discriminator is measured at the build's PUBLISH time:
+/// `actual_build_keys / dim_total`. The emitter publishes the bloom only when
+/// that ratio is ≤ this (i.e. the bloom drops ≥ `1 - this` of the probe);
+/// otherwise it publishes an empty (disarmed) set. SF=10 separates cleanly:
+/// Q9/Q20 part filters keep ~1-6%, Q3/Q8/Q21 customer/orders filters keep
+/// 20-50%. Default 0.10 (`EMAT_L9_DIM_BLOOM_RT_SEL`); 0 disables the runtime
+/// gate (revert to always-publish).
+fn dim_bloom_rt_max_sel() -> f64 {
+    crate::flags::f64_or("EMAT_L9_DIM_BLOOM_RT_SEL", 0.10)
+}
+
+/// If `plan` (a join's build subtree) is anchored on EXACTLY ONE
+/// `EmatixFastParquetExec`, return that scan's TOTAL (pre-filter) row count.
+/// `None` for multi-scan builds (snowflake dims) where the single-dimension
+/// filter-selectivity model doesn't apply.
+fn single_dim_scan_total(plan: &dyn ExecutionPlan) -> Option<usize> {
+    fn walk(p: &dyn ExecutionPlan, count: &mut usize, total: &mut Option<usize>) {
+        if let Some(scan) = p.as_any().downcast_ref::<EmatixFastParquetExec>() {
+            *count += 1;
+            *total = estimate_probe_scan_rows(scan);
+            return;
+        }
+        for c in p.children() {
+            walk(c.as_ref(), count, total);
+        }
+    }
+    let (mut count, mut total) = (0usize, None);
+    walk(plan, &mut count, &mut total);
+    (count == 1).then_some(total).flatten()
 }
 
 /// L9.ADAPT — width floor for tight-rescued wraps. Measured boundary
@@ -2128,5 +2273,86 @@ mod tests {
                 cs.distinct_count
             );
         }
+    }
+
+    // ===== L9.DIMSEL (EMAT_L9_DIM_BLOOM) — single_dim_scan_total helper =====
+
+    /// A filtered single-dimension build is anchored on exactly ONE Emat scan;
+    /// `single_dim_scan_total` returns that scan's TOTAL (pre-filter) row count
+    /// (the denominator of the dim-filter selectivity), not the filtered output.
+    #[tokio::test]
+    async fn single_dim_scan_total_one_filtered_dim() {
+        let path = tmp_parquet("dimsel_part");
+        // 1000 parts; ptype cycles 10 values so 'v07' keeps ~100 (10%).
+        let vals: Vec<String> = (0..1000).map(|i| format!("v{:02}", i % 10)).collect();
+        let val_refs: Vec<&str> = vals.iter().map(|s| s.as_str()).collect();
+        let keys: Vec<i64> = (0..1000).collect();
+        write_utf8_parquet(&path, ("ptype", &val_refs), Some(("pkey", &keys)));
+
+        let ctx = SessionContext::new();
+        ctx.register_table(
+            "part_t",
+            Arc::new(
+                EmatixFastParquetTableProvider::try_new(path.to_string_lossy().to_string())
+                    .unwrap(),
+            ),
+        )
+        .unwrap();
+        let df = ctx
+            .sql("SELECT pkey FROM part_t WHERE ptype = 'v07'")
+            .await
+            .unwrap();
+        let plan = ctx
+            .state()
+            .create_physical_plan(&df.into_optimized_plan().unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            single_dim_scan_total(plan.as_ref()),
+            Some(1000),
+            "one Emat scan → its pre-filter total (1000), so dim-filter selectivity \
+             = filtered(~100)/1000 ≈ 0.10"
+        );
+    }
+
+    /// A multi-scan build (a join) is NOT a single filtered dimension — the
+    /// single-dimension selectivity model doesn't apply, so the helper returns
+    /// `None` (the dim-sel rescue then declines).
+    #[tokio::test]
+    async fn single_dim_scan_total_none_for_multi_scan() {
+        let a = tmp_parquet("dimsel_a");
+        let b = tmp_parquet("dimsel_b");
+        write_utf8_parquet(&a, ("x", &["p", "q"]), Some(("k", &[1i64, 2])));
+        write_utf8_parquet(&b, ("y", &["r", "s"]), Some(("k", &[1i64, 2])));
+        let ctx = SessionContext::new();
+        ctx.register_table(
+            "ta",
+            Arc::new(
+                EmatixFastParquetTableProvider::try_new(a.to_string_lossy().to_string()).unwrap(),
+            ),
+        )
+        .unwrap();
+        ctx.register_table(
+            "tb",
+            Arc::new(
+                EmatixFastParquetTableProvider::try_new(b.to_string_lossy().to_string()).unwrap(),
+            ),
+        )
+        .unwrap();
+        let df = ctx
+            .sql("SELECT ta.k FROM ta JOIN tb ON ta.k = tb.k")
+            .await
+            .unwrap();
+        let plan = ctx
+            .state()
+            .create_physical_plan(&df.into_optimized_plan().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            single_dim_scan_total(plan.as_ref()),
+            None,
+            "two Emat scans → not a single-dimension build"
+        );
     }
 }
