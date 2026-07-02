@@ -164,6 +164,23 @@ impl QueryPlanner for FlowQueryPlanner {
         // un-re-optimized plan on error (correctness is unaffected either way).
         let planned = session_state.optimize(&planned).unwrap_or(planned);
 
+        // Σ.AH.5 (EMAT_FD_GROUPBY=1, default OFF): functional-dependency
+        // GROUP BY simplifier. When a declared-unique group column provably
+        // determines every other group column (Q10: c_custkey → the 5 wide
+        // customer strings via schema FDs + n_name via the nation PK-fold),
+        // group on it ALONE and re-attach the determined columns after
+        // aggregation (min carriers + a restoring projection) — the wide
+        // strings leave the AggregateExec Partial/FinalPartitioned hash key
+        // while the plan shape (joins, agg operators) stays stock. Runs
+        // BEFORE the late-mat recognizer: once the key is reduced, late-mat's
+        // ≥3-wide-string shape gate stands down, so the two never stack.
+        // Best-effort: `simplify` returns None on every unproven shape.
+        let planned = if crate::fd_groupby_simplify::enabled() {
+            crate::fd_groupby_simplify::simplify(&planned).unwrap_or(planned)
+        } else {
+            planned
+        };
+
         // prod-C (EMAT_LATE_MAT_AGG=1, default OFF): wide-string late
         // materialization. When the optimized plan exposes an FD-reducible wide
         // aggregate over a star whose anchor PK functionally determines the wide
@@ -248,6 +265,12 @@ mod tests {
     use datafusion::physical_plan::displayable;
     use datafusion::prelude::{SessionConfig, SessionContext};
     use std::path::PathBuf;
+    use std::sync::Mutex;
+
+    /// Serializes the tests that mutate `EMAT_*` process env vars (late-mat +
+    /// fd-groupby): a flag set in one test must not leak into the other's
+    /// planning window. Held across each test's full plan+collect span.
+    static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
     fn sf1_dir() -> Option<PathBuf> {
         if let Ok(env) = std::env::var("TPCH_DATA_DIR") {
@@ -319,6 +342,7 @@ mod tests {
         use datafusion::arrow::array::{Array, Float64Array};
         use datafusion::physical_plan::collect;
 
+        let _env = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let Some((ctx, dir)) = q10_ctx_with_planner().await else {
             eprintln!("skip: no SF=1 data");
             return;
@@ -386,6 +410,108 @@ mod tests {
         assert!(
             (os - ns).abs() < os.abs() * 1e-9 + 1e-6,
             "revenue sum: stock {os:.4} vs late-mat {ns:.4}"
+        );
+        assert!(or > 0, "sanity: Q10 SF1 returns rows");
+    }
+
+    /// Σ.AH.5 WIRING: through the production `FlowQueryPlanner`, with
+    /// `EMAT_FD_GROUPBY=1` Q10's aggregate groups on the single unique key
+    /// (min carriers re-attach the 6 determined columns) AND returns results
+    /// identical to the flag-off path. With the flag off (opt-in default) the
+    /// plan carries no min carrier. This is the sole test mutating
+    /// `EMAT_FD_GROUPBY`. It also pins the rule's PRECEDENCE over late-mat:
+    /// with both eligible, the reduced key defuses late-mat's shape gate
+    /// (no LateGatherExec in the ON plan).
+    #[tokio::test]
+    async fn flow_planner_wires_fd_groupby_on_q10() {
+        use datafusion::arrow::array::{Array, Float64Array};
+        use datafusion::physical_plan::collect;
+
+        let _env = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let Some((ctx, dir)) = q10_ctx_with_planner().await else {
+            eprintln!("skip: no SF=1 data");
+            return;
+        };
+        let sql = std::fs::read_to_string("examples/tpch/queries/q10.sql")
+            .or_else(|_| std::fs::read_to_string(dir.join("../../queries/q10.sql")))
+            .unwrap();
+        let sql = sql.trim().trim_end_matches(';');
+
+        let checksum = |batches: &[datafusion::arrow::record_batch::RecordBatch]| {
+            let (mut rows, mut sum) = (0usize, 0.0f64);
+            for b in batches {
+                rows += b.num_rows();
+                if let Ok(i) = b.schema().index_of("revenue") {
+                    if let Some(a) = b.column(i).as_any().downcast_ref::<Float64Array>() {
+                        for j in 0..a.len() {
+                            if a.is_valid(j) {
+                                sum += a.value(j);
+                            }
+                        }
+                    }
+                }
+            }
+            (rows, sum)
+        };
+
+        // OFF arm (opt-in flag: absence = off). The plan must not carry the
+        // min-carrier signature regardless of the late-mat default.
+        // SAFETY: test-local toggle; no other test reads/writes EMAT_FD_GROUPBY.
+        unsafe { std::env::remove_var("EMAT_FD_GROUPBY") };
+        let off_plan = ctx
+            .sql(sql)
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+        let off_dump = format!("{}", displayable(off_plan.as_ref()).indent(true));
+        assert!(
+            !off_dump.contains("min(customer.c_name)"),
+            "flag OFF must NOT rewrite the group key:\n{off_dump}"
+        );
+        let off_out = collect(off_plan, ctx.task_ctx()).await.unwrap();
+
+        unsafe { std::env::set_var("EMAT_FD_GROUPBY", "1") };
+        let on_plan = ctx
+            .sql(sql)
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+        let on_dump = format!("{}", displayable(on_plan.as_ref()).indent(true));
+        unsafe { std::env::remove_var("EMAT_FD_GROUPBY") };
+
+        assert!(
+            on_dump.contains("min(customer.c_name)")
+                && on_dump.contains("min(nation.n_name)")
+                && on_dump.contains("min(customer.c_comment)"),
+            "flag ON must carry the determined columns as min aggregates:\n{on_dump}"
+        );
+        // No AggregateExec group key may contain a wide string any more.
+        for (i, _) in on_dump.match_indices("gby=[") {
+            let gby = &on_dump[i..on_dump[i..]
+                .find(']')
+                .map(|e| i + e)
+                .unwrap_or(on_dump.len())];
+            assert!(
+                !gby.contains("c_name") && !gby.contains("c_comment") && !gby.contains("n_name"),
+                "flag ON must not hash wide strings in a group key: `{gby}`\n{on_dump}"
+            );
+        }
+        assert!(
+            !on_dump.contains("LateGatherExec"),
+            "fd-groupby takes precedence — late-mat must stand down:\n{on_dump}"
+        );
+        let on_out = collect(on_plan, ctx.task_ctx()).await.unwrap();
+
+        let (or, os) = checksum(&off_out);
+        let (nr, ns) = checksum(&on_out);
+        assert_eq!(or, nr, "row count: stock {or} vs fd-groupby {nr}");
+        assert!(
+            (os - ns).abs() < os.abs() * 1e-9 + 1e-6,
+            "revenue sum: stock {os:.4} vs fd-groupby {ns:.4}"
         );
         assert!(or > 0, "sanity: Q10 SF1 returns rows");
     }

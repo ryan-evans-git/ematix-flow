@@ -30,7 +30,7 @@
 //! data — see [`crate::ematix_fast_parquet::EmatixFastParquetTableProvider::with_primary_key`]):
 //!
 //! 1. **Schema FDs** ([`crate::late_mat_agg::fd_closure`] over the aggregate
-//!    input's [`FunctionalDependencies`]): DataFusion derives `{pk} → {cols}`
+//!    input's [`datafusion::common::FunctionalDependencies`]): DataFusion derives `{pk} → {cols}`
 //!    from a declared PK and propagates it through joins/projections. This
 //!    covers same-table determined columns (Q10: `c_custkey → 5 customer cols`).
 //! 2. **PK-fold extension** (the [`crate::late_mat_agg`] prod-B argument): a
@@ -60,7 +60,7 @@ use std::collections::{BTreeSet, HashSet, VecDeque};
 use std::sync::Arc;
 
 use datafusion::arrow::datatypes::DataType;
-use datafusion::common::{Column, FunctionalDependencies};
+use datafusion::common::Column;
 use datafusion::functions_aggregate::expr_fn::min;
 use datafusion::logical_expr::{Aggregate, Expr, LogicalPlan, Projection};
 
