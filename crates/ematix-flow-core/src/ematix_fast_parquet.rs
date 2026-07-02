@@ -3056,6 +3056,30 @@ impl ExecutionPlan for EmatixFastParquetExec {
         // stream below. `decode_schema == schema` when nothing was narrowed
         // (default), so the cast wrapper is a no-op there.
         let decode_schema = self.decode_schema.clone();
+        // NARROW.DEC — file-leaf indices of narrowed keys that the eager
+        // streaming reader should decode DIRECTLY at Int32 (downcast-on-
+        // read; opt-in via EMAT_NARROW_KEY_DECODE). Derived from the
+        // (advertised, decode) schema pair: a projected column that is
+        // Int32 advertised but Int64 in the decode schema is exactly a
+        // KEYS.2-narrowed key. Empty (the default, and whenever
+        // EMAT_DOWNCAST_KEYS narrowed nothing) keeps every reader
+        // bit-identical; the boundary cast below still reconciles any
+        // reader family that decodes wide.
+        let narrow_i64_leaves: Vec<usize> = if crate::flags::opt_in("EMAT_NARROW_KEY_DECODE") {
+            schema
+                .fields()
+                .iter()
+                .zip(decode_schema.fields().iter())
+                .enumerate()
+                .filter(|(_, (adv, dec))| {
+                    matches!(adv.data_type(), DataType::Int32)
+                        && matches!(dec.data_type(), DataType::Int64)
+                })
+                .map(|(i, _)| self.projection[i])
+                .collect()
+        } else {
+            Vec::new()
+        };
         // Σ.Q.L9 — runtime sideband consumption. At execute() time
         // (which for the probe side of a HashJoinExec runs AFTER the
         // build phase has fully drained — see the L9 module doc), peek
@@ -3120,6 +3144,7 @@ impl ExecutionPlan for EmatixFastParquetExec {
                 outer_partitions,
                 self.rg_num_rows.clone(),
                 None,
+                narrow_i64_leaves,
             );
             let stream = narrow_stream_to_advertised(stream, &decode_schema, schema.clone());
             return Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream))
@@ -3265,6 +3290,7 @@ impl ExecutionPlan for EmatixFastParquetExec {
                 outer_partitions,
                 rg_num_rows_for_async,
                 late_arm,
+                narrow_i64_leaves,
             )
         };
 
@@ -3454,6 +3480,11 @@ fn build_partition_stream_dispatch(
     // auto-pick routes to `EmatArrowBatchReader`); the reader adopts
     // the published predicate at the next row-group boundary.
     late_arm: Option<crate::bridge_filter_sideband::BridgeFilterSideband>,
+    // NARROW.DEC — file-leaf indices of narrowed keys the eager
+    // streaming reader decodes directly at Int32 (see execute()).
+    // The page-streaming / inline / whole-RG-bridge families ignore
+    // this and keep decode-wide + boundary-cast.
+    narrow_i64_leaves: Vec<usize>,
 ) -> futures_util::stream::BoxStream<'static, DfResult<RecordBatch>> {
     if streaming_arrow_reader {
         // Σ.E5.1.c — per-partition column-decode thread budget; keep
@@ -3482,6 +3513,7 @@ fn build_partition_stream_dispatch(
             filter,
             baseline,
             late_arm,
+            narrow_i64_leaves,
         )
     } else {
         // Late-arm has no consumer on this path; the sideband predicate
@@ -3675,6 +3707,9 @@ fn build_streaming_partition_stream(
     baseline: BaselineMetrics,
     // L9.ADAPT LATE-ARM — see `build_partition_stream_dispatch`.
     late_arm: Option<crate::bridge_filter_sideband::BridgeFilterSideband>,
+    // NARROW.DEC — narrowed key leaves for the eager reader (only);
+    // see `build_partition_stream_dispatch`.
+    narrow_i64_leaves: Vec<usize>,
 ) -> futures_util::stream::BoxStream<'static, DfResult<RecordBatch>> {
     use futures_util::StreamExt;
 
@@ -3882,6 +3917,13 @@ fn build_streaming_partition_stream(
                 .with_projection(projection)
                 .with_row_groups(row_groups)
                 .with_parallelism_budget(parallelism_budget);
+            // NARROW.DEC — only the eager reader narrows at decode; the
+            // builder rewrites the matching fields Int64→Int32 so this
+            // reader emits Int32Array natively (the boundary cast then
+            // passes those columns through by reference).
+            if !narrow_i64_leaves.is_empty() {
+                builder = builder.with_narrow_i64_leaves(narrow_i64_leaves);
+            }
             if let Some(sb) = late_arm.clone() {
                 builder = builder.with_late_arm(sb, path_buf.clone());
             }
@@ -4844,6 +4886,101 @@ mod tests {
         );
     }
 
+    /// NARROW.DEC — `EMAT_NARROW_KEY_DECODE` toggles the downcast-on-
+    /// read path end-to-end through the provider: with the flag ON the
+    /// eager streaming reader decodes the narrowed key directly at
+    /// Int32 (fire counter moves); with the flag OFF the decode stays
+    /// wide + boundary-cast. Both paths must produce IDENTICAL query
+    /// results on data with negatives and both i32 extremes.
+    ///
+    /// Multi-RG file (3 RGs) so the dispatch routes to the eager
+    /// `EmatArrowBatchReader` (single-RG files route to the page-
+    /// streaming reader, which deliberately stays on decode-wide).
+    #[tokio::test]
+    async fn narrow_key_decode_flag_toggles_path_with_identical_results() {
+        use ematix_parquet_codec::write::{ColumnData, write_table_to_path_with_row_group_size};
+        use ematix_parquet_format::types::CompressionCodec;
+
+        let dir = std::env::temp_dir().join(format!("narrow_flag_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("t.parquet");
+
+        let n = 999usize;
+        let mut key: Vec<i64> = (0..n as i64).map(|x| x * 37 - 400_000).collect();
+        key[0] = i32::MIN as i64;
+        key[n - 1] = i32::MAX as i64;
+        let val: Vec<f64> = (0..n).map(|x| x as f64 * 1.5).collect();
+        write_table_to_path_with_row_group_size(
+            &path,
+            &[
+                ("l_orderkey", ColumnData::I64(&key)),
+                ("l_val", ColumnData::F64(&val)),
+            ],
+            CompressionCodec::Uncompressed,
+            n / 3, // → 3 row groups → eager streaming reader
+        )
+        .unwrap();
+        let p = path.to_str().unwrap();
+
+        async fn collect_keys(p: &str) -> Vec<i32> {
+            let prov = EmatixFastParquetTableProvider::try_new_opt(p, true).unwrap();
+            assert_eq!(
+                prov.schema()
+                    .field_with_name("l_orderkey")
+                    .unwrap()
+                    .data_type(),
+                &DataType::Int32,
+                "stats-fitting key must advertise Int32 under downcast"
+            );
+            let ctx = SessionContext::new();
+            ctx.register_table("t", Arc::new(prov)).unwrap();
+            let batches = ctx
+                .sql("SELECT l_orderkey FROM t ORDER BY l_orderkey")
+                .await
+                .unwrap()
+                .collect()
+                .await
+                .unwrap();
+            batches
+                .iter()
+                .flat_map(|b| {
+                    b.column(0)
+                        .as_any()
+                        .downcast_ref::<arrow_array::Int32Array>()
+                        .expect("l_orderkey must surface as Int32Array")
+                        .values()
+                        .to_vec()
+                })
+                .collect()
+        }
+
+        // Control: flag OFF → decode-wide + boundary cast.
+        // (Scoped tightly; parallel tests seeing the flag mid-window
+        // would still produce identical results by this test's own
+        // invariant, so the set/remove is race-benign.)
+        unsafe { std::env::remove_var("EMAT_NARROW_KEY_DECODE") };
+        let wide = collect_keys(p).await;
+
+        // Flag ON → downcast-on-read; fire counter must move.
+        let before =
+            crate::emat_arrow_reader::NARROW_KEY_DECODES.load(std::sync::atomic::Ordering::Relaxed);
+        unsafe { std::env::set_var("EMAT_NARROW_KEY_DECODE", "1") };
+        let narrow = collect_keys(p).await;
+        unsafe { std::env::remove_var("EMAT_NARROW_KEY_DECODE") };
+        let after =
+            crate::emat_arrow_reader::NARROW_KEY_DECODES.load(std::sync::atomic::Ordering::Relaxed);
+
+        assert_eq!(narrow, wide, "flag ON/OFF must return identical results");
+        let mut expect: Vec<i32> = key.iter().map(|&x| x as i32).collect();
+        expect.sort_unstable();
+        assert_eq!(narrow, expect, "values must round-trip the source data");
+        assert!(
+            after > before,
+            "EMAT_NARROW_KEY_DECODE=1 must route through the downcast decode \
+             (counter {before} → {after})"
+        );
+    }
+
     fn lineitem_path() -> Option<String> {
         // Resolution order:
         //   1. `$TPCH_DATA_DIR` developer override.
@@ -4862,6 +4999,156 @@ mod tests {
         let mini =
             std::path::PathBuf::from(crate::test_support::tpch_mini_dir()).join("lineitem.parquet");
         mini.exists().then(|| mini.to_string_lossy().into_owned())
+    }
+
+    /// NARROW.DEC micro-verification (NOT a benchmark) — TPC-H Q09, the
+    /// join-heavy query whose partsupp 2-key build is the narrowing
+    /// target, executed ONCE with the narrowed path off and once with
+    /// it on (`EMAT_DOWNCAST_KEYS` via `try_new_opt(_, true)` +
+    /// `EMAT_NARROW_KEY_DECODE=1`), asserting identical results.
+    ///
+    /// Data resolution matches `lineitem_path()`: set `TPCH_DATA_DIR`
+    /// (e.g. the real SF=1 dataset) for the full-scale run; CI falls
+    /// back to the synthetic mini fixture. The mini fixture's `p_name`
+    /// has no TPC-H color words, so the LIKE pattern is parameterised
+    /// (`%green%` on real data, `%part%` on the mini) — the plan shape
+    /// (6-table join + 2-col group-by + sum) is identical either way.
+    ///
+    /// The sum is compared with FP-relative tolerance: multi-partition
+    /// f64 aggregation is order-sensitive run-to-run independent of the
+    /// flag (same policy as `examples/tpch_validate.rs`).
+    #[tokio::test]
+    async fn narrow_key_decode_q09_identity_on_off() {
+        // Resolve the data dir (real SF=1 via TPCH_DATA_DIR / workspace
+        // layout, else mini fixture).
+        let (dir, mini): (std::path::PathBuf, bool) = {
+            let cand = std::env::var("TPCH_DATA_DIR")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|_| std::path::PathBuf::from("examples/tpch/data/sf1"));
+            if cand.join("lineitem.parquet").exists() {
+                (cand, false)
+            } else {
+                (
+                    std::path::PathBuf::from(crate::test_support::tpch_mini_dir()),
+                    true,
+                )
+            }
+        };
+        let like = if mini { "%part%" } else { "%green%" };
+        let q09 = format!(
+            "select nation, o_year, sum(amount) as sum_profit from ( \
+               select n_name as nation, \
+                      extract(year from o_orderdate) as o_year, \
+                      l_extendedprice * (1 - l_discount) - ps_supplycost * l_quantity as amount \
+               from part, supplier, lineitem, partsupp, orders, nation \
+               where s_suppkey = l_suppkey and ps_suppkey = l_suppkey \
+                 and ps_partkey = l_partkey and p_partkey = l_partkey \
+                 and o_orderkey = l_orderkey and s_nationkey = n_nationkey \
+                 and p_name like '{like}' \
+             ) as profit group by nation, o_year order by nation, o_year desc"
+        );
+
+        // (nation, o_year, sum_profit) rows, already ORDER BY'd.
+        async fn run(dir: &std::path::Path, downcast: bool, sql: &str) -> Vec<(String, i64, f64)> {
+            const TABLES: &[&str] = &[
+                "part", "supplier", "lineitem", "partsupp", "orders", "nation",
+            ];
+            let ctx = SessionContext::new();
+            for t in TABLES {
+                let path = dir.join(format!("{t}.parquet"));
+                let prov = EmatixFastParquetTableProvider::try_new_opt(
+                    path.to_str().unwrap().to_string(),
+                    downcast,
+                )
+                .unwrap();
+                ctx.register_table(*t, Arc::new(prov)).unwrap();
+            }
+            let batches = ctx.sql(sql).await.unwrap().collect().await.unwrap();
+            let mut rows = Vec::new();
+            for b in &batches {
+                let nation = b.column(0);
+                let year = b.column(1);
+                let profit = b
+                    .column(2)
+                    .as_any()
+                    .downcast_ref::<arrow_array::Float64Array>()
+                    .expect("sum_profit is f64");
+                for r in 0..b.num_rows() {
+                    let n = nation
+                        .as_any()
+                        .downcast_ref::<arrow_array::StringArray>()
+                        .map(|a| a.value(r).to_string())
+                        .or_else(|| {
+                            nation
+                                .as_any()
+                                .downcast_ref::<arrow_array::StringViewArray>()
+                                .map(|a| a.value(r).to_string())
+                        })
+                        .expect("nation is a string column");
+                    // extract(year) surfaces as some integer/f64 width
+                    // depending on planner version — normalise via i64.
+                    let y = match year.data_type() {
+                        DataType::Int32 => year
+                            .as_any()
+                            .downcast_ref::<arrow_array::Int32Array>()
+                            .unwrap()
+                            .value(r) as i64,
+                        DataType::Int64 => year
+                            .as_any()
+                            .downcast_ref::<arrow_array::Int64Array>()
+                            .unwrap()
+                            .value(r),
+                        DataType::Float64 => year
+                            .as_any()
+                            .downcast_ref::<arrow_array::Float64Array>()
+                            .unwrap()
+                            .value(r) as i64,
+                        other => panic!("unexpected o_year type {other:?}"),
+                    };
+                    rows.push((n, y, profit.value(r)));
+                }
+            }
+            rows
+        }
+
+        // Arm A — narrowing fully OFF (wide Int64 keys everywhere).
+        unsafe { std::env::remove_var("EMAT_NARROW_KEY_DECODE") };
+        let wide = run(&dir, false, &q09).await;
+        assert!(
+            !wide.is_empty(),
+            "Q09 must return rows on the resolved dataset (pattern {like})"
+        );
+
+        // Arm B — narrowed keys + narrow decode ON.
+        let before =
+            crate::emat_arrow_reader::NARROW_KEY_DECODES.load(std::sync::atomic::Ordering::Relaxed);
+        unsafe { std::env::set_var("EMAT_NARROW_KEY_DECODE", "1") };
+        let narrow = run(&dir, true, &q09).await;
+        unsafe { std::env::remove_var("EMAT_NARROW_KEY_DECODE") };
+        let after =
+            crate::emat_arrow_reader::NARROW_KEY_DECODES.load(std::sync::atomic::Ordering::Relaxed);
+
+        assert_eq!(
+            wide.len(),
+            narrow.len(),
+            "row-count mismatch between wide and narrowed Q09"
+        );
+        for (i, (w, n)) in wide.iter().zip(narrow.iter()).enumerate() {
+            assert_eq!(w.0, n.0, "row {i}: nation mismatch");
+            assert_eq!(w.1, n.1, "row {i}: o_year mismatch");
+            let mag = w.2.abs().max(n.2.abs()).max(1.0);
+            assert!(
+                ((w.2 - n.2).abs() / mag) <= 1e-6,
+                "row {i}: sum_profit diverged: wide={} narrow={}",
+                w.2,
+                n.2
+            );
+        }
+        assert!(
+            after > before,
+            "narrow decode must have fired on the multi-RG fact scans \
+             (counter {before} → {after})"
+        );
     }
 
     #[tokio::test]
