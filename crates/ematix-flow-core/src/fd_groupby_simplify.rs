@@ -100,6 +100,20 @@ fn min_carriable(dt: &DataType) -> bool {
     )
 }
 
+/// Keep only the NON-NULLABLE-source functional dependencies. A NULLABLE
+/// source (SQL `UNIQUE`, which admits multiple NULL keys) is NOT sound for
+/// group-key reduction: `GROUP BY` collapses every NULL anchor value into ONE
+/// group, so a NULL anchor does not determine the other columns. Today the
+/// provider can only declare PRIMARY KEYs (non-nullable), so this is
+/// defense-in-depth against future `UNIQUE` constraints or other FD sources.
+fn non_nullable_fds(
+    fds: &datafusion::common::FunctionalDependencies,
+) -> datafusion::common::FunctionalDependencies {
+    datafusion::common::FunctionalDependencies::new(
+        fds.iter().filter(|d| !d.nullable).cloned().collect(),
+    )
+}
+
 /// The proven analysis: `group_expr[anchor_pos]` functionally determines every
 /// other group column (positions `determined`, in original group order).
 struct FdGroupKey {
@@ -111,7 +125,8 @@ struct FdGroupKey {
 /// module docs for the two proof paths.
 fn analyze_agg(agg: &Aggregate) -> Option<FdGroupKey> {
     let in_schema = agg.input.schema();
-    let fds = in_schema.functional_dependencies();
+    let fds = non_nullable_fds(in_schema.functional_dependencies());
+    let fds = &fds;
 
     // Group columns → schema indices; bail on any non-column group expression
     // (grouping sets, computed keys) and on duplicate group columns.
@@ -651,5 +666,20 @@ mod tests {
         if std::env::var_os("EMAT_FD_GROUPBY").is_none() {
             assert!(!enabled(), "EMAT_FD_GROUPBY must default OFF");
         }
+    }
+
+    /// SOUNDNESS: a NULLABLE-source FD (SQL UNIQUE — multiple NULL keys land
+    /// in ONE group) must be discarded before the closure; only PK-derived
+    /// (non-nullable) deps may justify a reduction.
+    #[test]
+    fn nullable_source_fds_are_discarded() {
+        use datafusion::common::{FunctionalDependence, FunctionalDependencies};
+        let fds = FunctionalDependencies::new(vec![
+            FunctionalDependence::new(vec![0], vec![1, 2], true), // UNIQUE-like
+            FunctionalDependence::new(vec![3], vec![4], false),   // PK-like
+        ]);
+        let kept = non_nullable_fds(&fds);
+        assert_eq!(kept.iter().count(), 1, "nullable dep dropped");
+        assert_eq!(kept.iter().next().unwrap().source_indices, vec![3]);
     }
 }
