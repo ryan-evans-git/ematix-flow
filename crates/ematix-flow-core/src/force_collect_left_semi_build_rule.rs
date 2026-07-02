@@ -151,8 +151,17 @@ pub struct ForceCollectLeftForSemiBoundedBuildRule {
     /// safety direction), and the join is swapped when the corrected
     /// probe is at least [`Self::date_build_side_ratio`] × smaller than
     /// the corrected build. Keeps Partitioned mode (a side swap, not a
-    /// broadcast). Read from `EMAT_DATE_BUILD_SIDE=1`.
-    pub date_build_side: bool,
+    /// broadcast).
+    ///
+    /// Σ.AI.5 (2026-07-02) — SCALE-GATED tri-state: `Some(true)` force on
+    /// (`EMAT_DATE_BUILD_SIDE=1`), `Some(false)` force off (`=0`), `None`
+    /// = AUTO — resolved **at rule-application time** against
+    /// [`crate::scale_class::large_scale_seen`] (the rule is constructed
+    /// at session-build time, BEFORE table registration, so the env is
+    /// snapshotted here but the scale class must not be). Campaign
+    /// evidence: with `EMAT_NDV_BUILD_SIDE` this flips Q10 SF=100
+    /// (−947 ms); plan-inert at SF=10 (preset path routes around it).
+    pub date_build_side: Option<bool>,
 
     /// Σ.AH.3 — conservative swap margin for [`Self::date_build_side`]:
     /// only swap when `corrected_build ≥ ratio × corrected_probe`
@@ -169,8 +178,10 @@ impl Default for ForceCollectLeftForSemiBoundedBuildRule {
         // identical). K=16 is the broadcast break-even ratio. Opt-out via
         // EMAT_COLLECT_LEFT_BROADCAST_RATIO=0.
         let broadcast_ratio = crate::flags::f64_or("EMAT_COLLECT_LEFT_BROADCAST_RATIO", 16.0);
-        // Σ.AH.3: opt-in, default OFF per [[optimizer-codegen-sensitivity]].
-        let date_build_side = crate::flags::opt_in("EMAT_DATE_BUILD_SIDE");
+        // Σ.AI.5: tri-state — explicit env wins both ways; None = AUTO,
+        // resolved at apply time (scale class isn't known at session
+        // build, which happens before table registration).
+        let date_build_side = crate::flags::tri_state("EMAT_DATE_BUILD_SIDE");
         let date_build_side_ratio = crate::flags::f64_or("EMAT_DATE_BUILD_SIDE_RATIO", 2.0);
         Self {
             min_probe_build_ratio,
@@ -570,10 +581,12 @@ impl PhysicalOptimizerRule for ForceCollectLeftForSemiBoundedBuildRule {
             // `EnforceDistribution` re-runs below. General (any low-NDV
             // equality filter, not TPC-H-specific); requires the dict-distinct
             // walk (`EMAT_DICT_DISTINCT_MAX_ROWS`) to populate `distinct_count`.
-            // Default OFF per [[optimizer-codegen-sensitivity]]; the env check
-            // short-circuits before any subtree walk when unset. Opt in with
-            // `EMAT_NDV_BUILD_SIDE=1`.
-            if is_inner && crate::flags::opt_in("EMAT_NDV_BUILD_SIDE") {
+            // Σ.AI.5 (2026-07-02): SCALE-GATED tri-state — `=1` force on,
+            // `=0` force off, unset = AUTO (on only for SF≥100-class
+            // datasets; with the date swap this flips Q10 SF=100 −947 ms,
+            // neutral at SF=10). The gate check short-circuits before any
+            // subtree walk when it resolves off.
+            if is_inner && crate::flags::scale_gated_large("EMAT_NDV_BUILD_SIDE") {
                 let lf = ndv_correction_factor(hj.left());
                 let rf = ndv_correction_factor(hj.right());
                 // Only act when some side was actually under-credited.
@@ -606,7 +619,11 @@ impl PhysicalOptimizerRule for ForceCollectLeftForSemiBoundedBuildRule {
             // the corrected probe. Keeps Partitioned mode; `swap_inputs`
             // preserves Inner semantics + output schema (re-projection), and
             // `EnforceDistribution` re-runs below.
-            if is_inner && self.date_build_side {
+            if is_inner
+                && self
+                    .date_build_side
+                    .unwrap_or_else(crate::scale_class::large_scale_seen)
+            {
                 let rf = date_correction_factor(hj.right());
                 if rf < 1.0 {
                     if let (Some(l), Some(r)) =
@@ -804,6 +821,35 @@ mod tests {
     use datafusion::physical_expr::PhysicalExpr;
     use datafusion::physical_plan::expressions::Column;
 
+    /// Σ.AI.5 — the date-swap default is TRI-STATE: `Default::default()`
+    /// snapshots the env as `None` (AUTO, resolved at apply time against
+    /// the scale class), `Some(true)` for `=1`, `Some(false)` for `=0`.
+    /// Env window is tight; this is the only test mutating
+    /// EMAT_DATE_BUILD_SIDE (plan-level swap tests construct the rule
+    /// with explicit fields precisely to avoid env races).
+    #[test]
+    fn date_build_side_default_snapshots_tristate() {
+        unsafe { std::env::remove_var("EMAT_DATE_BUILD_SIDE") };
+        assert_eq!(
+            ForceCollectLeftForSemiBoundedBuildRule::default().date_build_side,
+            None,
+            "unset => AUTO"
+        );
+        unsafe { std::env::set_var("EMAT_DATE_BUILD_SIDE", "1") };
+        assert_eq!(
+            ForceCollectLeftForSemiBoundedBuildRule::default().date_build_side,
+            Some(true),
+            "=1 => force ON"
+        );
+        unsafe { std::env::set_var("EMAT_DATE_BUILD_SIDE", "0") };
+        assert_eq!(
+            ForceCollectLeftForSemiBoundedBuildRule::default().date_build_side,
+            Some(false),
+            "=0 => force OFF"
+        );
+        unsafe { std::env::remove_var("EMAT_DATE_BUILD_SIDE") };
+    }
+
     fn mem_table() -> Arc<dyn ExecutionPlan> {
         let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
         let batch = RecordBatch::try_new(
@@ -990,7 +1036,7 @@ mod tests {
         let permissive = ForceCollectLeftForSemiBoundedBuildRule {
             min_probe_build_ratio: 0.0,
             broadcast_ratio: 0.0,
-            date_build_side: false,
+            date_build_side: Some(false),
             date_build_side_ratio: 2.0,
         };
         let out0 = permissive
@@ -1006,7 +1052,7 @@ mod tests {
         let guarded = ForceCollectLeftForSemiBoundedBuildRule {
             min_probe_build_ratio: 1.0,
             broadcast_ratio: 0.0,
-            date_build_side: false,
+            date_build_side: Some(false),
             date_build_side_ratio: 2.0,
         };
         let out1 = guarded.optimize(top, &ConfigOptions::default()).unwrap();
@@ -1032,7 +1078,7 @@ mod tests {
         let guarded = ForceCollectLeftForSemiBoundedBuildRule {
             min_probe_build_ratio: 1.0,
             broadcast_ratio: 0.0,
-            date_build_side: false,
+            date_build_side: Some(false),
             date_build_side_ratio: 2.0,
         };
         let out = guarded.optimize(top, &ConfigOptions::default()).unwrap();
@@ -1060,7 +1106,7 @@ mod tests {
         let guarded = ForceCollectLeftForSemiBoundedBuildRule {
             min_probe_build_ratio: 1.0,
             broadcast_ratio: 0.0,
-            date_build_side: false,
+            date_build_side: Some(false),
             date_build_side_ratio: 2.0,
         };
         let out = guarded.optimize(top, &ConfigOptions::default()).unwrap();
@@ -1080,7 +1126,7 @@ mod tests {
         let rule = ForceCollectLeftForSemiBoundedBuildRule {
             min_probe_build_ratio: 0.0,
             broadcast_ratio: 16.0,
-            date_build_side: false,
+            date_build_side: Some(false),
             date_build_side_ratio: 2.0,
         };
         let out = rule.optimize(top, &ConfigOptions::default()).unwrap();
@@ -1102,7 +1148,7 @@ mod tests {
         let rule = ForceCollectLeftForSemiBoundedBuildRule {
             min_probe_build_ratio: 0.0,
             broadcast_ratio: 16.0,
-            date_build_side: false,
+            date_build_side: Some(false),
             date_build_side_ratio: 2.0,
         };
         let out = rule.optimize(top, &ConfigOptions::default()).unwrap();
@@ -1123,7 +1169,7 @@ mod tests {
         let rule = ForceCollectLeftForSemiBoundedBuildRule {
             min_probe_build_ratio: 0.0,
             broadcast_ratio: 0.0,
-            date_build_side: false,
+            date_build_side: Some(false),
             date_build_side_ratio: 2.0,
         };
         let out = rule.optimize(top, &ConfigOptions::default()).unwrap();
@@ -1152,7 +1198,7 @@ mod tests {
             let rule = ForceCollectLeftForSemiBoundedBuildRule {
                 min_probe_build_ratio: 0.0,
                 broadcast_ratio: 16.0,
-                date_build_side: false,
+                date_build_side: Some(false),
                 date_build_side_ratio: 2.0,
             };
             let out = rule.optimize(top, &ConfigOptions::default()).unwrap();
@@ -1181,7 +1227,7 @@ mod tests {
             let rule = ForceCollectLeftForSemiBoundedBuildRule {
                 min_probe_build_ratio: 0.0,
                 broadcast_ratio: 16.0,
-                date_build_side: false,
+                date_build_side: Some(false),
                 date_build_side_ratio: 2.0,
             };
             let out = rule.optimize(top, &ConfigOptions::default()).unwrap();
@@ -1329,7 +1375,7 @@ mod tests {
         let rule = ForceCollectLeftForSemiBoundedBuildRule {
             min_probe_build_ratio: 0.0,
             broadcast_ratio: 0.0,
-            date_build_side: false,
+            date_build_side: Some(false),
             date_build_side_ratio: 2.0,
         };
         let before = format!("{top:?}");
@@ -1565,7 +1611,7 @@ mod tests {
         let rule = ForceCollectLeftForSemiBoundedBuildRule {
             min_probe_build_ratio: 0.0,
             broadcast_ratio: 0.0,
-            date_build_side: true,
+            date_build_side: Some(true),
             date_build_side_ratio: 2.0,
         };
         let out = rule.optimize(top, &ConfigOptions::default()).unwrap();
@@ -1603,7 +1649,7 @@ mod tests {
         let rule = ForceCollectLeftForSemiBoundedBuildRule {
             min_probe_build_ratio: 0.0,
             broadcast_ratio: 0.0,
-            date_build_side: false,
+            date_build_side: Some(false),
             date_build_side_ratio: 2.0,
         };
         let out = rule.optimize(top, &ConfigOptions::default()).unwrap();
@@ -1626,7 +1672,7 @@ mod tests {
         let rule = ForceCollectLeftForSemiBoundedBuildRule {
             min_probe_build_ratio: 0.0,
             broadcast_ratio: 0.0,
-            date_build_side: true,
+            date_build_side: Some(true),
             date_build_side_ratio: 2.0,
         };
         let out = rule.optimize(top, &ConfigOptions::default()).unwrap();
@@ -1647,7 +1693,7 @@ mod tests {
         let rule = ForceCollectLeftForSemiBoundedBuildRule {
             min_probe_build_ratio: 0.0,
             broadcast_ratio: 0.0,
-            date_build_side: true,
+            date_build_side: Some(true),
             date_build_side_ratio: 2.0,
         };
         let out = rule.optimize(top, &ConfigOptions::default()).unwrap();
@@ -1669,7 +1715,7 @@ mod tests {
         let rule = ForceCollectLeftForSemiBoundedBuildRule {
             min_probe_build_ratio: 0.0,
             broadcast_ratio: 0.0,
-            date_build_side: true,
+            date_build_side: Some(true),
             date_build_side_ratio: 2.0,
         };
         let out = rule.optimize(top, &ConfigOptions::default()).unwrap();

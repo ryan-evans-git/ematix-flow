@@ -408,6 +408,15 @@ impl BridgeFilter {
         // late unsupported predicate can't leave a half-built bitmap.
         enum Bound<'p, 'a> {
             I64(&'p ColumnPredicate, &'a [i64]),
+            /// NARROW.DEC × L9 (2026-07-02): an i64-domain predicate
+            /// bound to a KEYS.2-narrowed key decoded at Int32
+            /// (`EMAT_NARROW_KEY_DECODE`). Each value widens `as i64`
+            /// on eval — lossless, the narrowing is stats-proven to
+            /// fit i32. Without this binding the whole filter bailed
+            /// to the legacy per-predicate re-decode path (Q08 SF=100:
+            /// the L9 part→lineitem bloom wrap went +62 ms → +4.4 s
+            /// whenever narrow keys were also on).
+            I64onI32(&'p ColumnPredicate, &'a [i32]),
             I32(&'p ColumnPredicate, &'a [i32]),
             F64(&'p ColumnPredicate, &'a [f64]),
             I32Pair {
@@ -430,28 +439,45 @@ impl BridgeFilter {
         };
         for p in &self.predicates {
             match p {
-                ColumnPredicate::I64Range { col_idx, .. } => {
-                    let DecodedView::I64(v) = resolve(*col_idx)? else {
-                        return None;
-                    };
-                    if !check_len(v.len(), &mut total) {
-                        return None;
+                ColumnPredicate::I64Range { col_idx, .. } => match resolve(*col_idx)? {
+                    DecodedView::I64(v) => {
+                        if !check_len(v.len(), &mut total) {
+                            return None;
+                        }
+                        statics.push(Bound::I64(p, v));
                     }
-                    statics.push(Bound::I64(p, v));
-                }
+                    // Narrowed key decoded at Int32: widen per value.
+                    DecodedView::I32(v) => {
+                        if !check_len(v.len(), &mut total) {
+                            return None;
+                        }
+                        statics.push(Bound::I64onI32(p, v));
+                    }
+                    _ => return None,
+                },
                 ColumnPredicate::I64InSet { col_idx, .. }
                 | ColumnPredicate::I64InBloom { col_idx, .. } => {
-                    let DecodedView::I64(v) = resolve(*col_idx)? else {
-                        return None;
+                    let bound = match resolve(*col_idx)? {
+                        DecodedView::I64(v) => {
+                            if !check_len(v.len(), &mut total) {
+                                return None;
+                            }
+                            Bound::I64(p, v)
+                        }
+                        // Narrowed key decoded at Int32: widen per value.
+                        DecodedView::I32(v) => {
+                            if !check_len(v.len(), &mut total) {
+                                return None;
+                            }
+                            Bound::I64onI32(p, v)
+                        }
+                        _ => return None,
                     };
-                    if !check_len(v.len(), &mut total) {
-                        return None;
-                    }
                     // Guard 2 — disarmed probes still resolve (so
                     // `total` is known for a probe-only filter) but
                     // never evaluate.
                     if !skip_probes {
-                        probes.push(Bound::I64(p, v));
+                        probes.push(bound);
                     }
                 }
                 ColumnPredicate::I32Range { col_idx, .. }
@@ -521,6 +547,15 @@ impl BridgeFilter {
                     ColumnPredicate::I64InBloom { bloom, .. } => bloom.might_contain_i64(v[row]),
                     _ => unreachable!("Bound::I64 holds only i64 predicate shapes"),
                 },
+                Bound::I64onI32(p, v) => {
+                    let x = v[row] as i64;
+                    match p {
+                        ColumnPredicate::I64Range { lo, hi, .. } => x >= *lo && x <= *hi,
+                        ColumnPredicate::I64InSet { set, .. } => set.contains(x),
+                        ColumnPredicate::I64InBloom { bloom, .. } => bloom.might_contain_i64(x),
+                        _ => unreachable!("Bound::I64onI32 holds only i64 predicate shapes"),
+                    }
+                }
                 Bound::I32(p, v) => p.eval_i32(v[row]),
                 Bound::F64(p, v) => p.eval_f64(v[row]),
                 Bound::I32Pair { left, right, op } => {
@@ -556,6 +591,26 @@ impl BridgeFilter {
                             probe_chunks_into_bitmap(v, bitmap, |x| bloom.might_contain_i64(x));
                         }
                         _ => unreachable!("Bound::I64 holds only i64 predicate shapes"),
+                    },
+                    // Narrowed-key binding: same chunked pass, widening
+                    // each i32 value into the i64 predicate domain.
+                    Bound::I64onI32(p, v) => match p {
+                        ColumnPredicate::I64Range { lo, hi, .. } => {
+                            let (lo, hi) = (*lo, *hi);
+                            probe_chunks_into_bitmap(v, bitmap, |x| {
+                                let x = x as i64;
+                                x >= lo && x <= hi
+                            });
+                        }
+                        ColumnPredicate::I64InSet { set, .. } => {
+                            probe_chunks_into_bitmap(v, bitmap, |x| set.contains(x as i64));
+                        }
+                        ColumnPredicate::I64InBloom { bloom, .. } => {
+                            probe_chunks_into_bitmap(v, bitmap, |x| {
+                                bloom.might_contain_i64(x as i64)
+                            });
+                        }
+                        _ => unreachable!("Bound::I64onI32 holds only i64 predicate shapes"),
                     },
                     _ => {
                         for row in 0..total {
@@ -643,7 +698,7 @@ fn and_eval_masked(bitmap: &mut [u8], n_rows: usize, eval: impl Fn(usize) -> boo
 /// `bitmap[row>>3] |= 1<<(row&7)`. The 8-lane unroll lets LLVM
 /// vectorise the predicate evaluation across lanes.
 #[inline(always)]
-fn probe_chunks_into_bitmap(values: &[i64], bitmap: &mut [u8], probe: impl Fn(i64) -> bool) {
+fn probe_chunks_into_bitmap<T: Copy>(values: &[T], bitmap: &mut [u8], probe: impl Fn(T) -> bool) {
     let chunks = values.chunks_exact(8);
     let rem = chunks.remainder();
     let n_chunks = values.len() / 8;
@@ -1933,9 +1988,16 @@ fn provider_meta_cache_key(path: &str) -> Option<ProviderMetaCacheKey> {
 }
 
 /// KEYS.2 — env gate for narrowing INT64 join/group keys to Int32 on read.
-/// Off unless `EMAT_DOWNCAST_KEYS` is set (additive, opt-in, default OFF).
+/// Σ.AI.5 (2026-07-02): SCALE-GATED tri-state. `EMAT_DOWNCAST_KEYS=1`
+/// forces on, `=0` forces off; unset = AUTO — on only for SF≥100-class
+/// datasets (`scale_class`, campaign evidence: Q09 SF=100 −1075 ms, but
+/// net +10% across 22q at SF=10 with 11 clear regressions). Callers must
+/// have called `scale_class::observe_file` for the dataset first (both
+/// `try_new` paths do) so AUTO resolves order-independently.
+/// NOTE: this replaces the pre-campaign presence semantics
+/// (`EMAT_DOWNCAST_KEYS=0` used to mean ON; it now means OFF).
 fn key_downcast_enabled() -> bool {
-    std::env::var_os("EMAT_DOWNCAST_KEYS").is_some()
+    crate::flags::scale_gated_large("EMAT_DOWNCAST_KEYS")
 }
 
 /// KEYS.2 — a column whose name denotes a join/group KEY (ends in "key":
@@ -1977,6 +2039,12 @@ impl EmatixFastParquetTableProvider {
     /// schema. Errors immediately if any column is unsupported so
     /// callers don't discover this mid-scan.
     pub fn try_new(path: impl Into<String>) -> DfResult<Self> {
+        let path = path.into();
+        // Σ.AI.5: record the dataset's scale BEFORE resolving the
+        // narrow-keys tri-state, so AUTO sees this dataset (sibling
+        // scan makes it registration-order independent — region at 5
+        // rows classifies by its lineitem sibling).
+        crate::scale_class::observe_file(&path);
         Self::try_new_opt(path, key_downcast_enabled())
     }
 
@@ -2191,7 +2259,9 @@ impl EmatixFastParquetTableProvider {
         // the planner (Σ.Q06.SF10.5.h). An explicit `EMAT_DICT_DISTINCT_MAX_ROWS`
         // always overrides. Scale caveat: at SF=100 part is 20M > 10M, so set
         // the cap explicitly there.
-        let ndv_build_side = std::env::var("EMAT_NDV_BUILD_SIDE").as_deref() == Ok("1");
+        // Σ.AI.5 (2026-07-02): tri-state — `=1` on, `=0` off, unset = AUTO
+        // (on for SF≥100-class datasets; `observe_file` ran in try_new).
+        let ndv_build_side = crate::flags::scale_gated_large("EMAT_NDV_BUILD_SIDE");
         let max_rows_for_walk: usize = std::env::var("EMAT_DICT_DISTINCT_MAX_ROWS")
             .ok()
             .and_then(|s| s.parse().ok())
@@ -3065,21 +3135,26 @@ impl ExecutionPlan for EmatixFastParquetExec {
         // EMAT_DOWNCAST_KEYS narrowed nothing) keeps every reader
         // bit-identical; the boundary cast below still reconciles any
         // reader family that decodes wide.
-        let narrow_i64_leaves: Vec<usize> = if crate::flags::opt_in("EMAT_NARROW_KEY_DECODE") {
-            schema
-                .fields()
-                .iter()
-                .zip(decode_schema.fields().iter())
-                .enumerate()
-                .filter(|(_, (adv, dec))| {
-                    matches!(adv.data_type(), DataType::Int32)
-                        && matches!(dec.data_type(), DataType::Int64)
-                })
-                .map(|(i, _)| self.projection[i])
-                .collect()
-        } else {
-            Vec::new()
-        };
+        // Σ.AI.5 (2026-07-02): tri-state, gated with EMAT_DOWNCAST_KEYS
+        // (unset = AUTO = on at SF≥100 scale). Narrowing only exists when
+        // the downcast advertised Int32 (the schema-pair filter below), so
+        // AUTO here follows the downcast's own resolution.
+        let narrow_i64_leaves: Vec<usize> =
+            if crate::flags::scale_gated_large("EMAT_NARROW_KEY_DECODE") {
+                schema
+                    .fields()
+                    .iter()
+                    .zip(decode_schema.fields().iter())
+                    .enumerate()
+                    .filter(|(_, (adv, dec))| {
+                        matches!(adv.data_type(), DataType::Int32)
+                            && matches!(dec.data_type(), DataType::Int64)
+                    })
+                    .map(|(i, _)| self.projection[i])
+                    .collect()
+            } else {
+                Vec::new()
+            };
         // Σ.Q.L9 — runtime sideband consumption. At execute() time
         // (which for the probe side of a HashJoinExec runs AFTER the
         // build phase has fully drained — see the L9 module doc), peek
@@ -4563,6 +4638,95 @@ mod tests {
         assert_eq!(pop, 11, "all-ones with tail bits zeroed");
     }
 
+    /// NARROW.DEC × L9 (2026-07-02, Q08 SF=100 composition hazard) —
+    /// an i64-domain runtime probe (`I64InSet` / `I64InBloom`) and an
+    /// `I64Range` static must bind a `DecodedView::I32` (a KEYS.2-
+    /// narrowed key decoded at Int32 under `EMAT_NARROW_KEY_DECODE`)
+    /// by widening per value, instead of returning `None`. The `None`
+    /// bail sent the WHOLE bundle to the legacy per-predicate re-decode
+    /// path — on SF=100 lineitem (600M rows) that re-decode turned the
+    /// L9 part→lineitem bloom wrap from +62 ms into +4.4 s whenever
+    /// narrow keys were also on (the campaign's ALL-ON Q08 explosion).
+    #[test]
+    fn narrow_dec_i64_probe_binds_i32_view_by_widening() {
+        use crate::i64_set::I64Set;
+
+        let keys_i32: Vec<i32> = (0..32).collect();
+        let mut set = I64Set::with_keys(4);
+        for k in [3i64, 9, 20, 31] {
+            set.insert(k);
+        }
+        let set = Arc::new(set);
+
+        // I64InSet over an i32 view: must evaluate (widened), not bail.
+        let f = BridgeFilter::new(vec![ColumnPredicate::I64InSet {
+            col_idx: 1,
+            set: set.clone(),
+        }]);
+        let (bitmap, total) = f
+            .eval_on_decoded_views(|col| match col {
+                1 => Some(DecodedView::I32(&keys_i32)),
+                _ => None,
+            })
+            .expect("i64 probe over a narrowed i32 view must evaluate, not fall back");
+        assert_eq!(total, 32);
+        for row in 0..32usize {
+            let expect = set.contains(row as i64);
+            let got = bitmap[row >> 3] & (1 << (row & 7)) != 0;
+            assert_eq!(got, expect, "row {row}");
+        }
+
+        // I64InBloom over an i32 view: no false negatives on members.
+        let mut bloom = crate::bloom::BloomFilter::for_keys(16);
+        for k in [3i64, 9, 20, 31] {
+            bloom.insert_i64(k);
+        }
+        let bloom = Arc::new(bloom);
+        let f = BridgeFilter::new(vec![ColumnPredicate::I64InBloom {
+            col_idx: 1,
+            bloom: bloom.clone(),
+        }]);
+        let (bitmap, total) = f
+            .eval_on_decoded_views(|col| match col {
+                1 => Some(DecodedView::I32(&keys_i32)),
+                _ => None,
+            })
+            .expect("i64 bloom over a narrowed i32 view must evaluate, not fall back");
+        assert_eq!(total, 32);
+        for k in [3usize, 9, 20, 31] {
+            assert!(
+                bitmap[k >> 3] & (1 << (k & 7)) != 0,
+                "bloom must not false-negative member row {k}"
+            );
+        }
+
+        // I64Range static over an i32 view widens too, and composes
+        // with a probe on the same narrowed column (statics first).
+        let f = BridgeFilter::new(vec![
+            ColumnPredicate::I64Range {
+                col_idx: 1,
+                lo: 8,
+                hi: 24,
+            },
+            ColumnPredicate::I64InSet {
+                col_idx: 1,
+                set: set.clone(),
+            },
+        ]);
+        let (bitmap, total) = f
+            .eval_on_decoded_views(|col| match col {
+                1 => Some(DecodedView::I32(&keys_i32)),
+                _ => None,
+            })
+            .expect("i64 range + probe over a narrowed i32 view must evaluate");
+        assert_eq!(total, 32);
+        for row in 0..32usize {
+            let expect = (8..=24).contains(&row) && set.contains(row as i64);
+            let got = bitmap[row >> 3] & (1 << (row & 7)) != 0;
+            assert_eq!(got, expect, "row {row}");
+        }
+    }
+
     /// KEYS.5 story (a) — the string runtime sideband predicates
     /// (`StringInBloom` / `StringInSet`) must (1) probe correctly via
     /// `eval_str` — bloom by byte-hash membership, set by exact
@@ -4999,6 +5163,74 @@ mod tests {
         let mini =
             std::path::PathBuf::from(crate::test_support::tpch_mini_dir()).join("lineitem.parquet");
         mini.exists().then(|| mini.to_string_lossy().into_owned())
+    }
+
+    /// Σ.AI.5 SCALE-GATE (2026-07-02 campaign gating) — the narrow-keys
+    /// schema advertisement is tri-state on `EMAT_DOWNCAST_KEYS`:
+    ///   1. unset + small-scale stats → AUTO-OFF (keys stay Int64),
+    ///   2. unset + SF≥100-class stats (row-count threshold injected via
+    ///      `EMAT_LARGE_SCALE_MIN_ROWS` — the same footer stats the
+    ///      production gate reads) → AUTO-ON (fitting keys advertise Int32),
+    ///   3. `=0` beats auto-ON, 4. `=1` beats auto-OFF.
+    ///
+    /// Env windows are kept tight; this is the only test mutating
+    /// EMAT_DOWNCAST_KEYS (the other downcast tests use `try_new_opt`'s
+    /// explicit flag precisely to avoid env races).
+    #[test]
+    fn downcast_keys_scale_gated_auto() {
+        let Some(p) = lineitem_path() else {
+            eprintln!("skip: no lineitem fixture");
+            return;
+        };
+        let orderkey_type = |prov: &EmatixFastParquetTableProvider| {
+            use datafusion::catalog::TableProvider as _;
+            prov.schema()
+                .field_with_name("l_orderkey")
+                .expect("lineitem has l_orderkey")
+                .data_type()
+                .clone()
+        };
+
+        // 1. AUTO below scale → Int64 (unchanged advertisement).
+        unsafe { std::env::remove_var("EMAT_DOWNCAST_KEYS") };
+        unsafe { std::env::remove_var("EMAT_LARGE_SCALE_MIN_ROWS") };
+        let prov = EmatixFastParquetTableProvider::try_new(p.clone()).unwrap();
+        assert_eq!(
+            orderkey_type(&prov),
+            DataType::Int64,
+            "AUTO below scale must not narrow"
+        );
+
+        // 2. AUTO at (injected) large-scale stats → Int32. Every fixture
+        //    lineitem (mini = 280 rows, SF=1 = 6M) exceeds 100 rows and
+        //    its l_orderkey fits i32.
+        unsafe { std::env::set_var("EMAT_LARGE_SCALE_MIN_ROWS", "100") };
+        let prov = EmatixFastParquetTableProvider::try_new(p.clone()).unwrap();
+        assert_eq!(
+            orderkey_type(&prov),
+            DataType::Int32,
+            "AUTO at large-scale stats must narrow fitting keys"
+        );
+
+        // 3. Force-off beats auto-ON.
+        unsafe { std::env::set_var("EMAT_DOWNCAST_KEYS", "0") };
+        let prov = EmatixFastParquetTableProvider::try_new(p.clone()).unwrap();
+        assert_eq!(
+            orderkey_type(&prov),
+            DataType::Int64,
+            "=0 must force OFF even at large scale"
+        );
+        unsafe { std::env::remove_var("EMAT_LARGE_SCALE_MIN_ROWS") };
+
+        // 4. Force-on beats auto-OFF.
+        unsafe { std::env::set_var("EMAT_DOWNCAST_KEYS", "1") };
+        let prov = EmatixFastParquetTableProvider::try_new(p.clone()).unwrap();
+        unsafe { std::env::remove_var("EMAT_DOWNCAST_KEYS") };
+        assert_eq!(
+            orderkey_type(&prov),
+            DataType::Int32,
+            "=1 must force ON below scale"
+        );
     }
 
     /// NARROW.DEC micro-verification (NOT a benchmark) — TPC-H Q09, the

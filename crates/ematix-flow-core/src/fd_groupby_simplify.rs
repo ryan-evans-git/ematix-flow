@@ -67,10 +67,16 @@ use datafusion::logical_expr::{Aggregate, Expr, LogicalPlan, Projection};
 use crate::join_reorder::flatten_inner_join_chain;
 use crate::late_mat_agg::{fd_closure, join_root, leaf_of_column, leaf_pk_names};
 
-/// Opt-in gate: `EMAT_FD_GROUPBY=1` enables the rewrite (default OFF). Read
-/// once at physical-planning time (in [`crate::flow_query_planner`]), never hot.
+/// Σ.AI.5 (2026-07-02) SCALE-GATED tri-state gate: `EMAT_FD_GROUPBY=1`
+/// forces on, `=0` forces off, unset = AUTO — on only for SF≥100-class
+/// datasets ([`crate::scale_class`]; campaign: Q10 SF=100 −99 ms, no
+/// regressions anywhere, gated consistently with its sibling levers).
+/// Read at physical-planning time (in [`crate::flow_query_planner`]) —
+/// after table registration, so AUTO sees the dataset's scale. The
+/// rewrite additionally needs declared PKs to prove FDs; without a
+/// catalog PK it is plan-inert regardless of this gate.
 pub fn enabled() -> bool {
-    crate::flags::opt_in("EMAT_FD_GROUPBY")
+    crate::flags::scale_gated_large("EMAT_FD_GROUPBY")
 }
 
 /// Group-column datatypes the `min` carrier is known-cheap and total-ordered
@@ -660,11 +666,21 @@ mod tests {
         );
     }
 
-    /// The gate is OPT-IN: default environment leaves the rule disabled.
+    /// Σ.AI.5 — with the var unset the gate is AUTO: OFF unless the
+    /// process has observed an SF≥100-class dataset. Test fixtures are
+    /// all far below the shipped 300M-row threshold, so in this test
+    /// process AUTO must resolve OFF (the auto-ON arm is exercised in
+    /// `flow_query_planner`'s scale-gated plan-diff test via the
+    /// `EMAT_LARGE_SCALE_MIN_ROWS` override).
     #[test]
-    fn flag_is_opt_in_default_off() {
-        if std::env::var_os("EMAT_FD_GROUPBY").is_none() {
-            assert!(!enabled(), "EMAT_FD_GROUPBY must default OFF");
+    fn flag_defaults_off_below_large_scale() {
+        if std::env::var_os("EMAT_FD_GROUPBY").is_none()
+            && std::env::var_os("EMAT_LARGE_SCALE_MIN_ROWS").is_none()
+        {
+            assert!(
+                !enabled(),
+                "EMAT_FD_GROUPBY must default OFF below SF≥100 scale"
+            );
         }
     }
 
