@@ -234,6 +234,12 @@ impl PhysicalOptimizerRule for ClusteredSinglePhaseAggRule {
                 return Ok(Transformed::no(node));
             }
             let Some(scan) = unwrap_to_emat_scan(partial.input()) else {
+                if trace {
+                    eprintln!(
+                        "[range_agg] DECLINE: Partial input is not an Emat scan (got {})",
+                        partial.input().name()
+                    );
+                }
                 return Ok(Transformed::no(node));
             };
             // The scan must be a plain dense scan: no pushed filter or
@@ -241,6 +247,12 @@ impl PhysicalOptimizerRule for ClusteredSinglePhaseAggRule {
             // but excluded from the first surface), and the group key
             // must resolve to a projected column.
             if scan.filter().is_some() || scan.runtime_sideband().is_some() {
+                if trace {
+                    eprintln!(
+                        "[range_agg] DECLINE {}: scan carries a filter/sideband",
+                        scan.path()
+                    );
+                }
                 return Ok(Transformed::no(node));
             }
             // Resolve the group key to the scan's FILE column index.
@@ -254,9 +266,22 @@ impl PhysicalOptimizerRule for ClusteredSinglePhaseAggRule {
                 .as_any()
                 .downcast_ref::<datafusion::physical_expr::expressions::Column>()
             else {
+                if trace {
+                    eprintln!(
+                        "[range_agg] DECLINE {}: group key is not a bare column",
+                        scan.path()
+                    );
+                }
                 return Ok(Transformed::no(node));
             };
             let Some(&file_col) = scan.projection().get(col.index()) else {
+                if trace {
+                    eprintln!(
+                        "[range_agg] DECLINE {}: group col idx {} outside scan projection",
+                        scan.path(),
+                        col.index()
+                    );
+                }
                 return Ok(Transformed::no(node));
             };
             // ---- prove clustering from RG stats + plan disjoint chunks
@@ -271,9 +296,22 @@ impl PhysicalOptimizerRule for ClusteredSinglePhaseAggRule {
             let Ok((mut ranges, mut rg_rows)) =
                 crate::ematix_parquet_bridge::rg_i64_ranges_and_counts(&path, file_col)
             else {
+                if trace {
+                    eprintln!(
+                        "[range_agg] DECLINE {}: RG stats sweep failed for col {file_col}",
+                        scan.path()
+                    );
+                }
                 return Ok(Transformed::no(node));
             };
             if ranges.len() < n_rgs {
+                if trace {
+                    eprintln!(
+                        "[range_agg] DECLINE {}: footer has {} RGs < {n_rgs} assigned",
+                        scan.path(),
+                        ranges.len()
+                    );
+                }
                 return Ok(Transformed::no(node));
             }
             ranges.truncate(n_rgs);

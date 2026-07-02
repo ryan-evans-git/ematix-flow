@@ -73,6 +73,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   faster too, so it does not change the relative TPC-H standing (see
   `docs/plans/PARQUET_WRITER_SCOPE.md`).
 
+### Fixed
+
+- **Strict harness measured Q18 SF=100 on a plan production never runs
+  (−1510 ms "loss" was a harness artifact).** The strict bench
+  (`tpch_triangulation_bench`) and the value-validation harness
+  (`tpch_validate`) build their optimizer chains manually and never
+  installed `ClusteredSinglePhaseAggRule` (RANGE.AGG), a production-preset
+  default since f15d2fc (2026-06-10) — the mirror image of the Σ.V
+  alignment bug. The 2026-07-01 campaign therefore planned Q18's inner
+  subquery as the two-phase Partial → 2.2 GB hash-shuffle →
+  FinalPartitioned aggregate over 600M rows / 150M groups. Both harnesses
+  now install the rule at the preset's registration position (self-gated
+  on `EMAT_RANGE_AGG`), pinned by `bench_preset_parity_tests`. Measured
+  (M4 Max, warm, 3 trials, solo): Q18 SF=100 3457±213 ms / 19.1 GB RSS →
+  **2485±74 ms / 16.3 GB** (DuckDB 2149±32); SF=10/SF=1 plans unchanged
+  (skew-gate decline). Residual ~300 ms gap analysed in
+  `docs/PERF_Q18.md` (EnforceDistribution re-inserts the 600M-row input
+  shuffle under the SinglePartitioned agg). Also: RANGE.AGG decline paths
+  now all trace under `EMAT_RANGE_AGG_TRACE`, and a missing
+  `ndv_max_rows` in a Σ.AH.1 pinning-test initializer that broke
+  `cargo test --lib` compilation on main is fixed.
+
 ## [0.11.0] — 2026-06-19
 
 Benchmark-accuracy + performance release. No Python API changes; the
