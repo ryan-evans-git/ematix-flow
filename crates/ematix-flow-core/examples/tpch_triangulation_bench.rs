@@ -1667,6 +1667,22 @@ async fn build_ematix_ctx(
             ForceCollectLeftForSemiBoundedBuildRule::default(),
         ));
     }
+    // RANGE.AGG (f15d2fc): collapse Partial→hash-shuffle→Final into one
+    // SinglePartitioned aggregate when the single group key is provably
+    // the file's cluster key. Production-preset default since 2026-06-10
+    // (preset.rs), but this bench never installed it, so the strict
+    // harness measured Q18 SF=100 on the two-phase 600M-row/150M-group
+    // agg plan (43.5s CPU + 2.2 GB shuffle) that preset users never run —
+    // the 2026-07-01 campaign's −1510 ms Q18 "loss" was this parity gap,
+    // not an engine regression. Same registration position as the preset
+    // (after ForceCollectLeft, before the RobinHood-sum rewrite). The
+    // rule self-gates on EMAT_RANGE_AGG (default ON, =0 to disable for
+    // A/B) and declines wherever the key isn't cluster-proven (Q18 SF=10
+    // declines via the skew gate — plan there is unchanged). Pinned by
+    // `bench_preset_parity_tests`.
+    builder = builder.with_physical_optimizer_rule(Arc::new(
+        ematix_flow_core::clustered_agg_rule::ClusteredSinglePhaseAggRule,
+    ));
     // Σ.Q.L10: logical-plan rewrite — push LeftSemi past Inner joins
     // down to its target table. Closes the Q18-shape structural gap
     // to DuckDB (semi-filter pushed to wrap orders directly,
@@ -2156,4 +2172,138 @@ fn short(msg: &str) -> String {
         .chars()
         .take(140)
         .collect()
+}
+
+/// Bench↔preset parity pins (2026-07-02, perf/q18-sf100-dig).
+///
+/// The strict harness measures "production defaults" through THIS
+/// example's `build_ematix_ctx`, which constructs its rule chain
+/// manually instead of calling `preset::with_optimizer_rules`. That
+/// duplication already bit once in each direction: Σ.V (2026-05-26)
+/// found three rules default-on in the bench but missing from the
+/// preset; this module pins the inverse gap found in the Q18 SF=100
+/// dig — RANGE.AGG (`ClusteredSinglePhaseAggRule`, preset-default
+/// since f15d2fc) was never installed here, so the 2026-07-01
+/// campaign measured Q18 SF=100 on the two-phase 150M-group agg plan
+/// (43.5s CPU) that production/preset users never execute, reporting
+/// a −1510 ms "loss" that is a harness artifact.
+///
+/// Run: `cargo test -p ematix-flow-core --example
+/// tpch_triangulation_bench --features triangulation`.
+#[cfg(test)]
+mod bench_preset_parity_tests {
+    use super::*;
+
+    /// Write one tiny valid parquet and copy it to every TPC-H table
+    /// name so `build_ematix_ctx` can register a full catalog. The
+    /// lineitem file is Q18-shaped and physically clustered on
+    /// `l_orderkey` with strict row-group key gaps (8 RGs × 125 rows,
+    /// 5 rows/key ⇒ every RG boundary is a strict gap), so RANGE.AGG
+    /// is eligible to fire on the Q18 inner-subquery shape.
+    fn write_fixture_dir() -> std::path::PathBuf {
+        use arrow_array::{Float64Array, Int64Array, RecordBatch};
+        use arrow_schema::{DataType, Field, Schema};
+        use datafusion::parquet::arrow::ArrowWriter;
+        use datafusion::parquet::file::properties::WriterProperties;
+
+        let dir = std::env::temp_dir().join(format!(
+            "tpch_bench_parity_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let n = 1000i64;
+        let keys: Vec<i64> = (0..n).map(|i| i / 5).collect();
+        let quantities: Vec<f64> = (0..n).map(|_| 1.0).collect();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("l_orderkey", DataType::Int64, false),
+            Field::new("l_quantity", DataType::Float64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(keys)),
+                Arc::new(Float64Array::from(quantities)),
+            ],
+        )
+        .unwrap();
+        let lineitem = dir.join("lineitem.parquet");
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(125))
+            .build();
+        let f = std::fs::File::create(&lineitem).unwrap();
+        let mut w = ArrowWriter::try_new(f, schema, Some(props)).unwrap();
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+
+        for t in TPCH_TABLES {
+            if *t != "lineitem" {
+                std::fs::copy(&lineitem, dir.join(format!("{t}.parquet"))).unwrap();
+            }
+        }
+        dir
+    }
+
+    /// Parity pin: the strict bench session must carry the production
+    /// preset's RANGE.AGG rule. Guards against the Q18 SF=100 harness
+    /// artifact recurring (and its inverse — the rule leaving the
+    /// preset without leaving here would trip the preset's own docs).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn strict_bench_session_carries_range_agg_rule() {
+        let dir = write_fixture_dir();
+        let (ctx, _bloom) = build_ematix_ctx(&dir, None).await.unwrap();
+        let names: Vec<String> = ctx
+            .state()
+            .physical_optimizers()
+            .iter()
+            .map(|r| r.name().to_string())
+            .collect();
+        assert!(
+            names
+                .iter()
+                .any(|n| n == "ematix_flow_clustered_single_phase_agg"),
+            "strict bench session is missing the production-preset \
+             ClusteredSinglePhaseAggRule (RANGE.AGG, preset.rs since \
+             f15d2fc) — the harness would re-measure Q18 SF=100 on a \
+             plan production never runs. Installed rules: {names:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Plan-diff pin: the Q18 inner-subquery shape (single-key GROUP
+    /// BY over cluster-keyed lineitem + HAVING) must plan as ONE
+    /// SinglePartitioned aggregate through the bench session — the
+    /// same rewrite `preset::with_optimizer_rules` produces — instead
+    /// of the Partial → hash-shuffle → FinalPartitioned triple.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn q18_subquery_shape_plans_single_phase_through_bench_session() {
+        let dir = write_fixture_dir();
+        let (ctx, _bloom) = build_ematix_ctx(&dir, None).await.unwrap();
+        let sql = "select l_orderkey from lineitem \
+                   group by l_orderkey having sum(l_quantity) > 300";
+        let plan = ctx
+            .sql(sql)
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+        let rendered =
+            datafusion::physical_plan::displayable(plan.as_ref())
+                .indent(true)
+                .to_string();
+        assert!(
+            rendered.contains("SinglePartitioned"),
+            "Q18 subquery shape must take the RANGE.AGG single-phase \
+             plan through the strict bench session (clustered \
+             l_orderkey, strict RG gaps).\nPlan:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("mode=FinalPartitioned"),
+            "two-phase agg survived — RANGE.AGG did not fire.\n\
+             Plan:\n{rendered}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
