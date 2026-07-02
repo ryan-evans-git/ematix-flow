@@ -1561,6 +1561,7 @@ mod tests {
                 require_filtered_build: false,
                 max_expected_keys_per_partition: 0,
                 min_probe_proj_cols: 0,
+                ndv_max_rows: DEFAULT_L9_NDV_MAX_ROWS,
             }))
             .build();
         let ctx = SessionContext::new_with_state(state);
