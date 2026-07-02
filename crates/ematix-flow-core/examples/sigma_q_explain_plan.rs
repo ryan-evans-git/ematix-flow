@@ -106,5 +106,66 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let plan = df.create_physical_plan().await?;
     println!("\n=== Q{q:02} physical plan ===");
     println!("{}", displayable(plan.as_ref()).indent(true));
+
+    // Σ.AH.3 premise probe: for every HashJoinExec, print join type,
+    // partition mode, and each side's REPORTED `num_rows` estimate — the
+    // numbers `JoinSelection` (and any stats-driven swap rule) actually
+    // sees. A "mis-ordered build" only exists *for a stats-driven rule*
+    // when reported build rows exceed reported probe rows; if the runtime
+    // rows are inverted but the estimates are not, the gap is estimation
+    // (NDV/LIKE selectivity), not side-selection.
+    println!("\n=== Q{q:02} HashJoinExec build/probe reported cardinality ===");
+    dump_join_stats(&plan, 0);
     Ok(())
+}
+
+fn dump_join_stats(plan: &Arc<dyn datafusion::physical_plan::ExecutionPlan>, depth: usize) {
+    use datafusion::physical_plan::joins::HashJoinExec;
+    if let Some(hj) = plan.as_any().downcast_ref::<HashJoinExec>() {
+        let rows = |side: &Arc<dyn datafusion::physical_plan::ExecutionPlan>| {
+            side.partition_statistics(None)
+                .ok()
+                .map(|s| format!("{:?}", s.num_rows))
+                .unwrap_or_else(|| "err".to_string())
+        };
+        println!(
+            "depth={depth} {:?} {:?} on={:?} build(L)={} probe(R)={}",
+            hj.join_type(),
+            hj.partition_mode(),
+            hj.on(),
+            rows(hj.left()),
+            rows(hj.right()),
+        );
+    }
+    if let Some(f) = plan
+        .as_any()
+        .downcast_ref::<datafusion::physical_plan::filter::FilterExec>()
+    {
+        let out_rows = plan
+            .partition_statistics(None)
+            .ok()
+            .map(|s| format!("{:?}", s.num_rows))
+            .unwrap_or_else(|| "err".to_string());
+        let in_stats = f.input().partition_statistics(None).ok();
+        let in_rows = in_stats
+            .as_ref()
+            .map(|s| format!("{:?}", s.num_rows))
+            .unwrap_or_else(|| "err".to_string());
+        println!(
+            "depth={depth} FilterExec pred={} default_sel={} in_rows={in_rows} out_rows={out_rows}",
+            f.predicate(),
+            f.default_selectivity(),
+        );
+        if let Some(s) = in_stats {
+            for (i, cs) in s.column_statistics.iter().enumerate() {
+                println!(
+                    "  input col{i}: min={:?} max={:?} distinct={:?}",
+                    cs.min_value, cs.max_value, cs.distinct_count
+                );
+            }
+        }
+    }
+    for child in plan.children() {
+        dump_join_stats(child, depth + 1);
+    }
 }
