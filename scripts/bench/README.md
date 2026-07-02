@@ -66,9 +66,18 @@ B="cargo build --release --example tpch_triangulation_bench --features triangula
 $B
 
 # 1. Latency rebaseline (all levers at defaults), per SF.
-scripts/bench/strict_22q.sh --sf 1   --triangulate --isolate --out bench-results/strict-sf1
-scripts/bench/strict_22q.sh --sf 10  --triangulate --isolate --out bench-results/strict-sf10
-scripts/bench/strict_22q.sh --sf 100 --triangulate --isolate --trials 5 --out bench-results/strict-sf100
+#    SOLO passes per engine — engines never share a process (RAM/thermal
+#    isolation; the 2026-06-21 provenance protocol). Diff the summaries.
+for sf in 1 10 100; do
+  t=10; [[ $sf == 100 ]] && t=5
+  scripts/bench/strict_22q.sh --sf $sf --engine ematix --isolate --trials $t --out bench-results/strict-sf$sf-ematix
+  scripts/bench/strict_22q.sh --sf $sf --engine duckdb --isolate --trials $t --out bench-results/strict-sf$sf-duckdb
+  python3 scripts/bench/strict_diff.py \
+      --a bench-results/strict-sf$sf-ematix/strict-22q-summary.md \
+      --b bench-results/strict-sf$sf-duckdb/strict-22q-summary.md \
+      --label-a ematix --label-b duckdb \
+      --out bench-results/strict-sf$sf-verdicts.md
+done
 
 # 2. Per-lever A/B (repeat per lever flag, ematix-only).
 scripts/bench/strict_ab.sh --sf 10 --env-b "EMAT_<LEVER>=1" --out /tmp/ab-<lever>-sf10

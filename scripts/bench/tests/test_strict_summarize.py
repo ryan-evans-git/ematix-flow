@@ -96,6 +96,58 @@ def test_env_json_missing_file_fails_loudly(tmp_path):
     assert proc.returncode != 0
 
 
+def mk_run_col(medians: dict[int, float], col: int, sigma: float = 1.0) -> str:
+    """Table with only column `col` populated (0=ematix,1=duckdb,2=polars),
+    matching a solo-engine run where other engines render as em-dash."""
+    header = "| Query | ematix-flow | DuckDB | Polars |\n|---|---|---|---|\n"
+    rows = []
+    for q, m in medians.items():
+        cells = ["—", "—", "—"]
+        cells[col] = f"{m:.2f} ± {sigma:.2f}"
+        rows.append(f"| Q{q:02d}  | {cells[0]} | {cells[1]} | {cells[2]} |\n")
+    return header + "".join(rows)
+
+
+def test_engine_column_selection_duckdb(tmp_path):
+    """--engine duckdb parses the DuckDB column of a solo-duckdb run
+    (ematix column is em-dash)."""
+    proc, out = run_summarize(
+        tmp_path,
+        [mk_run_col({1: 200.0, 6: 70.0}, col=1),
+         mk_run_col({1: 210.0, 6: 74.0}, col=1),
+         mk_run_col({1: 205.0, 6: 72.0}, col=1)],
+        extra_args=("--engine", "duckdb"),
+    )
+    assert proc.returncode == 0, proc.stderr
+    text = out.read_text()
+    assert "| Q01 | 205.00 |" in text
+    assert "| Q06 | 72.00 |" in text
+
+
+def test_engine_default_is_ematix_first_column(tmp_path):
+    """Without --engine the first (ematix) column is parsed — the
+    pre-existing behavior."""
+    proc, out = run_summarize(
+        tmp_path,
+        [mk_run_col({1: 100.0}, col=0), mk_run_col({1: 102.0}, col=0),
+         mk_run_col({1: 104.0}, col=0)],
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "| Q01 | 102.00 |" in out.read_text()
+
+
+def test_engine_column_all_dashes_warns_empty(tmp_path):
+    """Asking for a column that is all em-dash must fail loudly, not
+    write an empty summary."""
+    proc, _ = run_summarize(
+        tmp_path,
+        [mk_run_col({1: 100.0}, col=0), mk_run_col({1: 102.0}, col=0),
+         mk_run_col({1: 104.0}, col=0)],
+        extra_args=("--engine", "duckdb"),
+    )
+    assert proc.returncode != 0
+
+
 def test_isolated_layout_concatenated_rows_parse(tmp_path):
     """Per-query isolation concatenates single-query tables into one
     run file; the parser must aggregate all rows found."""

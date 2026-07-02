@@ -42,11 +42,20 @@
 #
 # Usage:
 #   scripts/bench/strict_22q.sh [--sf 1|10|100] [--invocations N]
+#                               [--engine ematix|duckdb|polars]
 #                               [--triangulate] [--isolate]
 #                               [--plan-cache on|off]
 #                               [--cache-policy warm|cold]
 #                               [--env "KEY=VAL KEY2=VAL2"]
 #                               [--queries "1,6,14"] [--out PATH]
+#
+#   Cross-engine VERDICT runs are two solo passes (never one shared
+#   process — engines contend for RAM/thermals and the second-measured
+#   loses up to 60% on small queries):
+#     strict_22q.sh --sf 100 --engine ematix --isolate --out .../ematix
+#     strict_22q.sh --sf 100 --engine duckdb --isolate --out .../duckdb
+#     strict_diff.py --a .../ematix/strict-22q-summary.md \
+#                    --b .../duckdb/strict-22q-summary.md --out diff.md
 #
 #   --isolate runs each query in its OWN process per invocation
 #   (per-query isolation: fresh planner, fresh in-process caches).
@@ -79,6 +88,9 @@ TRIALS=10                  # within-invocation timed trials
 WARMUPS=2                  # within-invocation warm-up trials (per `tpch_triangulation_bench`)
 COOLDOWN_SEC=15            # fallback pause between invocations (adaptive: skipped when thermally clean)
 TRIANGULATE=0              # default: ematix-only (skip Polars + DuckDB)
+ENGINE="ematix"            # solo engine (ematix|duckdb|polars); verdict
+                           # runs measure each engine in its own pass so
+                           # they never contend for RAM in one process
 ISOLATE=0                  # per-query process isolation
 PLAN_CACHE="off"           # explicit EMAT_PLAN_CACHE (see header §6)
 CACHE_POLICY="warm"        # warm|cold page-cache policy
@@ -98,6 +110,7 @@ while [[ $# -gt 0 ]]; do
         --warmups) WARMUPS="$2"; shift 2 ;;
         --cooldown) COOLDOWN_SEC="$2"; shift 2 ;;
         --triangulate) TRIANGULATE=1; shift ;;
+        --engine) ENGINE="$2"; shift 2 ;;
         --isolate) ISOLATE=1; shift ;;
         --plan-cache) PLAN_CACHE="$2"; shift 2 ;;
         --cache-policy) CACHE_POLICY="$2"; shift 2 ;;
@@ -148,7 +161,14 @@ COMMON_ENV=(
     "$PC_ENV"
 )
 if [[ "$TRIANGULATE" != "1" ]]; then
-    COMMON_ENV+=("TPCH_SKIP_POLARS=1" "TPCH_SKIP_DUCKDB=1")
+    # Solo-engine pass: skip the other two so engines never share a
+    # process (per-engine RAM/thermal isolation — the verdict protocol).
+    case "$ENGINE" in
+        ematix) COMMON_ENV+=("TPCH_SKIP_POLARS=1" "TPCH_SKIP_DUCKDB=1") ;;
+        duckdb) COMMON_ENV+=("TPCH_SKIP_POLARS=1" "TPCH_SKIP_EMATIX=1") ;;
+        polars) COMMON_ENV+=("TPCH_SKIP_DUCKDB=1" "TPCH_SKIP_EMATIX=1") ;;
+        *) echo "ERROR: --engine must be ematix|duckdb|polars" >&2; exit 2 ;;
+    esac
 fi
 
 QUERY_LIST="${QUERIES:-$(seq -s, 1 22)}"
@@ -241,6 +261,7 @@ SUMMARY="$OUT/strict-22q-summary.md"
 python3 "$REPO/scripts/bench/strict_summarize.py" \
     --runs "$OUT/run-"*.md \
     --discard-first \
+    --engine "$ENGINE" \
     --env-json "$OUT/env.json" \
     --out "$SUMMARY"
 
