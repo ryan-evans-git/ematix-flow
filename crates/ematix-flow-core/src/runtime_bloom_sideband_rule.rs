@@ -1467,6 +1467,91 @@ mod tests {
         assert_eq!(row_count, 500);
     }
 
+    /// Σ.AH.1 re-audit (2026-07-01) — pin the claim `PERF_REVIEW_2026_05`
+    /// § Σ.AH.1 got wrong: the L9 bloom is NOT consumed at HashJoinExec
+    /// level. The rule threads the emitter's `BridgeFilterSideband` into
+    /// the probe-side `EmatixFastParquetExec` itself (same instance,
+    /// `ptr_eq`), so the published predicate is merged into the scan's
+    /// `BridgeFilter` before decode. A test like this at spec-writing
+    /// time would have caught the stale premise. See
+    /// `docs/PHASE_SIGMA_AH_1_DESIGN.md` § 11.
+    #[tokio::test]
+    async fn wrap_threads_emitter_sideband_into_probe_scan() {
+        let li = tmp_parquet("li_sideband_pin");
+        let sp = tmp_parquet("sp_sideband_pin");
+        write_lineitem(&li);
+        write_supplier(&sp);
+
+        let cfg = SessionConfig::new().with_target_partitions(4);
+        // Gates off: this pins the threading mechanism, not the
+        // admission heuristics (those have their own tests, e.g.
+        // `tight_rescue_pre_gate_constants`).
+        let state = SessionStateBuilder::new()
+            .with_default_features()
+            .with_config(cfg)
+            .with_physical_optimizer_rule(Arc::new(EnableRuntimeBloomSidebandRule {
+                min_probe_to_build_ratio: 0,
+                allow_inner_join: true,
+                require_filtered_build: false,
+                max_expected_keys_per_partition: 0,
+                min_probe_proj_cols: 0,
+            }))
+            .build();
+        let ctx = SessionContext::new_with_state(state);
+        ctx.register_table(
+            "lineitem",
+            Arc::new(EmatixFastParquetTableProvider::try_new(li.to_string_lossy()).unwrap()),
+        )
+        .unwrap();
+        ctx.register_table(
+            "supplier",
+            Arc::new(FastParquetTableProvider::try_new(sp.to_string_lossy()).unwrap()),
+        )
+        .unwrap();
+
+        let plan = ctx
+            .sql("SELECT l_orderkey FROM supplier JOIN lineitem ON s_suppkey = l_suppkey")
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+
+        // Collect the emitter's sideband and every emat scan's sideband.
+        let mut emitter_sidebands: Vec<BridgeFilterSideband> = Vec::new();
+        let mut scan_sidebands: Vec<Option<BridgeFilterSideband>> = Vec::new();
+        let _ = plan.clone().transform_up(|node| {
+            if let Some(em) = node.as_any().downcast_ref::<BuildSideBloomEmitterExec>() {
+                emitter_sidebands.push(em.sideband().clone());
+            }
+            if let Some(scan) = node.as_any().downcast_ref::<EmatixFastParquetExec>() {
+                scan_sidebands.push(scan.runtime_sideband().cloned());
+            }
+            Ok(Transformed::no(node))
+        });
+
+        assert_eq!(
+            emitter_sidebands.len(),
+            1,
+            "expected exactly one L9 emitter wrap:\n{plan:?}"
+        );
+        let threaded: Vec<&BridgeFilterSideband> = scan_sidebands
+            .iter()
+            .flatten()
+            .filter(|sb| sb.ptr_eq(&emitter_sidebands[0]))
+            .collect();
+        assert_eq!(
+            threaded.len(),
+            1,
+            "the emitter's sideband must be threaded into exactly one \
+             probe-side EmatixFastParquetExec (scan-decode-level \
+             consumption, not HashJoinExec-level): emitters={} scans \
+             with sideband={}\n{plan:?}",
+            emitter_sidebands.len(),
+            scan_sidebands.iter().flatten().count(),
+        );
+    }
+
     /// KEYS.5.c — write a parquet with a UTF-8 string column (+ optional
     /// i64 payload) via the arrow `ArrowWriter`, which emits the UTF8
     /// converted_type so `arrow_type_for` surfaces it as `Utf8` (the in-tree
