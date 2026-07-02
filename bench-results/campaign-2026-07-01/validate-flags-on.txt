@@ -1,0 +1,32 @@
+=== TPC-H value validation: ematix-flow vs DuckDB ===
+data: /Users/ryanevans/RustroverProjects/ematix-flow/examples/tpch/data/sf1
+queries: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22]
+FP relative tolerance: 1e-6
+
+Q01: PASS (4 rows match)
+Q02: PASS (460 rows match)
+Q03: PASS (11620 rows match)
+Q04: PASS (5 rows match)
+Q05: PASS (5 rows match)
+Q06: PASS (1 rows match)
+Q07: PASS (4 rows match)
+Q08: PASS (2 rows match)
+Q09: PASS (175 rows match)
+Q10: PASS (37967 rows match)
+Q11: PASS (1048 rows match)
+Q12: PASS (2 rows match)
+Q13: PASS (42 rows match)
+Q14: PASS (1 rows match)
+Q15: PASS (1 rows match)
+Q16: PASS (18314 rows match)
+Q17: PASS (1 rows match)
+Q18: PASS (57 rows match)
+Q19: PASS (1 rows match)
+Q20: PASS (186 rows match)
+Q21: PASS (411 rows match)
+Q22: PASS (7 rows match)
+
+--- summary ---
+PASS:    22
+FAIL:    0
+SKIP:    0
