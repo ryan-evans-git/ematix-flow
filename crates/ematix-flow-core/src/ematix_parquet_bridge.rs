@@ -47,13 +47,14 @@ use ematix_parquet_codec::dict::{
     build_dict_predicate_mask, decode_rle_dictionary_into, decode_rle_dictionary_predicate_bitmap,
     gather_dict_at_bitmap_into,
 };
+use ematix_parquet_codec::downcast::NarrowedI64;
 use ematix_parquet_codec::plain::{
     decode_plain_byte_array, decode_plain_f64, decode_plain_i32, decode_plain_i64,
 };
 use ematix_parquet_codec::read::{
     read_column_byte_array_dict_preserved, read_column_byte_array_dict_preserved_into,
     read_column_byte_array_masked_into, read_column_f64_masked_into, read_column_i32_masked_into,
-    read_column_i64_masked_into,
+    read_column_i64_downcast, read_column_i64_masked_into,
 };
 use ematix_parquet_format::types::{CompressionCodec, Encoding};
 use ematix_parquet_io::{PageWalker, ParquetFile};
@@ -817,6 +818,68 @@ pub fn masked_decode_i64(
     Ok(out)
 }
 
+/// NARROW.DEC — decode an INT64 column chunk directly at the narrowest
+/// integer width its row-group statistics prove safe (ematix-parquet
+/// v0.17 REV.12 downcast-on-read; REV.14 made the narrowing decode
+/// speed-neutral), re-widened to the `i32` that KEYS.2's narrowed
+/// schema advertises. Unlike `decode wide + cast`, no transient
+/// `Vec<i64>` is materialised when the stats prove a narrow target
+/// (~8 MB saved per SF=100 lineitem RG per key column).
+///
+/// Only sound for columns the caller already proved fit `i32`
+/// (KEYS.2's `int64_col_fits_i32` stats gate) — but the decode does
+/// not TRUST the caller: when the codec's own per-RG stats can't
+/// prove a narrow target it falls back to a checked per-value narrow
+/// that errors (never wraps) on any value outside `i32`.
+pub fn decode_column_chunk_i64_downcast_to_i32(
+    file: &ParquetFile,
+    rg: usize,
+    col: usize,
+) -> DfResult<Vec<i32>> {
+    let narrowed = read_column_i64_downcast(file, rg, col).map_err(|e| {
+        ext(format!(
+            "read_column_i64_downcast (rg={rg}, col={col}): {e}"
+        ))
+    })?;
+    narrowed_i64_into_i32(narrowed, rg, col)
+}
+
+/// NARROW.DEC — re-widen a [`NarrowedI64`] to the `i32` representation
+/// the narrowed Arrow schema advertises. Sub-i32 targets widen
+/// losslessly; the defensive `U32`/`I64` fallbacks (stats absent or
+/// not narrow-provable) go through a checked narrow.
+fn narrowed_i64_into_i32(n: NarrowedI64, rg: usize, col: usize) -> DfResult<Vec<i32>> {
+    Ok(match n {
+        NarrowedI64::I8(v) => v.into_iter().map(i32::from).collect(),
+        NarrowedI64::U8(v) => v.into_iter().map(i32::from).collect(),
+        NarrowedI64::I16(v) => v.into_iter().map(i32::from).collect(),
+        NarrowedI64::U16(v) => v.into_iter().map(i32::from).collect(),
+        NarrowedI64::I32(v) => v,
+        NarrowedI64::U32(v) => {
+            i64s_into_i32_checked(v.into_iter().map(i64::from).collect(), rg, col)?
+        }
+        NarrowedI64::I64(v) => i64s_into_i32_checked(v, rg, col)?,
+    })
+}
+
+/// NARROW.DEC — checked `Vec<i64>` → `Vec<i32>` narrow. Errors (never
+/// wraps) on the first value outside `i32`. Used by the downcast
+/// fallback above and by the masked-decode path (which decodes wide
+/// through `read_column_i64_masked_into` and narrows the — small —
+/// survivor set).
+pub(crate) fn i64s_into_i32_checked(v: Vec<i64>, rg: usize, col: usize) -> DfResult<Vec<i32>> {
+    v.into_iter()
+        .map(|x| {
+            i32::try_from(x).map_err(|_| {
+                ext(format!(
+                    "narrow decode (rg={rg}, col={col}): value {x} does not fit i32 — \
+                     stats gate and data disagree; refusing to wrap"
+                ))
+            })
+        })
+        .collect()
+}
+
 /// Façade-level masked-decode for DOUBLE columns.
 pub fn masked_decode_f64(
     file: &ParquetFile,
@@ -1568,6 +1631,96 @@ mod tests {
             let theirs = pr_read_i32(&path, rg, 10);
             let ours_vals: &[i32] = ours.values();
             assert_eq!(ours_vals, theirs.as_slice(), "mismatch in RG {rg}");
+        }
+    }
+
+    // ---------- NARROW.DEC — downcast-on-read oracle tests ----------
+
+    fn write_i64_file(name: &str, vals: &[i64]) -> PathBuf {
+        use ematix_parquet_codec::write::{ColumnData, write_table_to_path};
+        let dir = std::env::temp_dir().join(format!("narrow_dec_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join(name);
+        write_table_to_path(
+            &path,
+            &[("k_key", ColumnData::I64(vals))],
+            CompressionCodec::Uncompressed,
+        )
+        .unwrap();
+        path
+    }
+
+    /// The narrow decode must produce EXACTLY the wide decode's values
+    /// on i32-fitting data with negatives and both i32 extremes — the
+    /// result-identity contract the narrowed schema relies on.
+    #[test]
+    fn narrow_decode_matches_wide_on_negatives_and_i32_edges() {
+        let vals: Vec<i64> = vec![
+            0,
+            -1,
+            1,
+            i32::MIN as i64,
+            i32::MAX as i64,
+            -123_456_789,
+            987_654_321,
+            42,
+        ];
+        let path = write_i64_file("edges.parquet", &vals);
+        let file = open_cached(&path).unwrap();
+        let narrow = decode_column_chunk_i64_downcast_to_i32(&file, 0, 0).unwrap();
+        let wide = decode_column_chunk_i64(&path, 0, 0).unwrap();
+        assert_eq!(narrow.len(), wide.len());
+        let widened: Vec<i64> = narrow.iter().map(|&x| x as i64).collect();
+        assert_eq!(
+            widened.as_slice(),
+            wide.values(),
+            "narrow decode must round-trip the wide values exactly"
+        );
+    }
+
+    /// Small-domain values (fit i8/i16) must re-widen to the same i32s —
+    /// exercises the sub-i32 NarrowedI64 variants when the writer emits
+    /// stats, and the checked fallback when it doesn't.
+    #[test]
+    fn narrow_decode_matches_wide_on_small_domain() {
+        let vals: Vec<i64> = (-100..100).collect();
+        let path = write_i64_file("small.parquet", &vals);
+        let file = open_cached(&path).unwrap();
+        let narrow = decode_column_chunk_i64_downcast_to_i32(&file, 0, 0).unwrap();
+        let expect: Vec<i32> = vals.iter().map(|&x| x as i32).collect();
+        assert_eq!(narrow, expect);
+    }
+
+    /// Values outside i32 must ERROR (checked narrow), never wrap: the
+    /// decode does not trust the planner's stats gate.
+    #[test]
+    fn narrow_decode_rejects_out_of_range_values() {
+        let vals: Vec<i64> = vec![0, i32::MAX as i64 + 1, 7];
+        let path = write_i64_file("overflow.parquet", &vals);
+        let file = open_cached(&path).unwrap();
+        let err = decode_column_chunk_i64_downcast_to_i32(&file, 0, 0)
+            .expect_err("out-of-i32 value must refuse to narrow");
+        assert!(
+            format!("{err}").contains("does not fit i32"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// Oracle against the wide path on the lineitem fixture's
+    /// l_orderkey (file col 0, physical INT64, always i32-fitting at
+    /// mini/SF=1 scale).
+    #[test]
+    fn narrow_decode_orderkey_matches_wide_all_rgs() {
+        let Some(path) = lineitem_path() else {
+            return;
+        };
+        let file = open_cached(&path).unwrap();
+        let n_rgs = file.cached_metadata().unwrap().row_groups.len();
+        for rg in 0..n_rgs {
+            let narrow = decode_column_chunk_i64_downcast_to_i32(&file, rg, 0).unwrap();
+            let wide = pr_read_i64(&path, rg, 0);
+            let widened: Vec<i64> = narrow.iter().map(|&x| x as i64).collect();
+            assert_eq!(widened, wide, "rg {rg}: narrow != wide");
         }
     }
 }
