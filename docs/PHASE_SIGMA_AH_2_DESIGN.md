@@ -223,6 +223,46 @@ The "lock-free per-block bitwise-OR" alternative was considered in the plan, but
 - [ ] Q03 trace shows the cust+orders → lineitem join is **still** skipped (the relaxed gate must not regress this).
 - [ ] No 22q SF=10 wall-time regression > 5% on any query under `EMAT_L9_RELAX_GATE=1`.
 
+## 5f. Σ.AH.2 re-audit at SF=100 + the `EMAT_L9_PARTITIONED` slice (2026-07-01)
+
+Re-ran the `EMAT_L9_TRACE=1` audit on the four target queries at SF=10 AND
+SF=100 against the post-L9.ADAPT / post-L9.DIMSEL.RT (PR #165) tree. Findings:
+
+1. **§2.3 confirmed and now PINNED.** The rule remains PartitionMode-agnostic:
+   Q05 SF=100 wraps two `mode=Partitioned` joins in production defaults today.
+   New plan-diff tests (`partitioned_mode_join_gets_bloom_emitter`,
+   `partitioned_mode_bloom_publishes_and_results_stay_exact`,
+   `collect_left_join_wraps_identically`) force `PartitionMode::Partitioned`
+   on a Q08-shaped fixture and pin the wrap, the N>1 per-partition merge, the
+   sideband publish, and result exactness — previously nothing would go red if
+   a mode gate were (re-)introduced.
+2. **The remaining Σ.AH.2 gap is SCALE, not mode.** Every non-fire on the
+   target queries is a defensible gate rejection except the Q08 SF=100
+   `part_filt → lineitem` edge (one of the two consistent SF=100 DuckDB
+   losses; classified COMPUTE-EXCESS in `SF100_LOSS_DIAGNOSTIC.md`): the
+   L9.NDV walk refuses part.parquet (20M rows > the 10M
+   `EMAT_L9_NDV_MAX_ROWS` default), so `p_type='…'` falls back to the 0.2
+   selectivity (→ 4M) and the 1024× gate rejects a true-267K build against a
+   600M probe (real ratio ≈ 2250). At SF=10 the same edge fires by default
+   (part = 2M rows < ceiling; the L9.ADAPT −19.9% win).
+3. **The slice:** `EMAT_L9_PARTITIONED=1` (OPT-IN, default OFF) raises the
+   resolved NDV ceiling 10M → 32M — every SF=100 dimension in (part 20M,
+   customer 15M), every fact still out (lineitem 60M+ at SF≥10, partsupp 80M,
+   orders 150M). Explicit `EMAT_L9_NDV_MAX_ROWS` wins over both defaults. The
+   ceiling is now a rule field (`ndv_max_rows`) threaded into
+   `local_dict_ndv`, so the semantics are unit-testable without env races.
+   Verified at SF=100: the Q08 edge WRAPs (`expected_keys=133333`,
+   tight-sized); all other skips unchanged. Flag-off plans byte-identical.
+4. **Q09's part-LIKE edge is NOT this slice.** `p_name LIKE '%green%'` has no
+   NDV-based selectivity (the §5a stretch gap) — that edge is owned by the
+   L9.DIMSEL / L9.DIMSEL.RT lever (opt-in `EMAT_L9_DIM_BLOOM`, PR #165),
+   which composes with this flag (DIMSEL runs only after the tight ratio
+   rejects; the raised ceiling doesn't change LIKE's 0.2 fallback).
+
+Default-on remains gated on the strict A/B campaign (arc Story 3/5
+thresholds: Q08 SF=100 wall drop, 22q geomean, no single-query regression
+> 5%, tpch_validate 22/22 at every scale).
+
 ## 9. References
 
 - Empirical trace dump: `bvlu53d5l` (`grep '^\[L9\.trace\]'`)
