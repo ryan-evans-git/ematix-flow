@@ -510,6 +510,10 @@ impl FastParquetTableProvider {
     /// count. Fails if the file is missing or unreadable.
     pub fn try_new(path: impl Into<String>) -> DfResult<Self> {
         let path: String = path.into();
+        // Σ.AI.5: fold this dataset into the process scale class so the
+        // scale-gated levers' AUTO default resolves even when a session
+        // registers only FastParquet providers.
+        crate::scale_class::observe_file(&path);
         let file = File::open(&path).map_err(|e| {
             DataFusionError::External(
                 format!("FastParquetTableProvider: cannot open `{path}`: {e}").into(),

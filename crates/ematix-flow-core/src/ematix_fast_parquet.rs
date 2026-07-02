@@ -1988,9 +1988,16 @@ fn provider_meta_cache_key(path: &str) -> Option<ProviderMetaCacheKey> {
 }
 
 /// KEYS.2 — env gate for narrowing INT64 join/group keys to Int32 on read.
-/// Off unless `EMAT_DOWNCAST_KEYS` is set (additive, opt-in, default OFF).
+/// Σ.AI.5 (2026-07-02): SCALE-GATED tri-state. `EMAT_DOWNCAST_KEYS=1`
+/// forces on, `=0` forces off; unset = AUTO — on only for SF≥100-class
+/// datasets (`scale_class`, campaign evidence: Q09 SF=100 −1075 ms, but
+/// net +10% across 22q at SF=10 with 11 clear regressions). Callers must
+/// have called `scale_class::observe_file` for the dataset first (both
+/// `try_new` paths do) so AUTO resolves order-independently.
+/// NOTE: this replaces the pre-campaign presence semantics
+/// (`EMAT_DOWNCAST_KEYS=0` used to mean ON; it now means OFF).
 fn key_downcast_enabled() -> bool {
-    std::env::var_os("EMAT_DOWNCAST_KEYS").is_some()
+    crate::flags::scale_gated_large("EMAT_DOWNCAST_KEYS")
 }
 
 /// KEYS.2 — a column whose name denotes a join/group KEY (ends in "key":
@@ -2032,6 +2039,12 @@ impl EmatixFastParquetTableProvider {
     /// schema. Errors immediately if any column is unsupported so
     /// callers don't discover this mid-scan.
     pub fn try_new(path: impl Into<String>) -> DfResult<Self> {
+        let path = path.into();
+        // Σ.AI.5: record the dataset's scale BEFORE resolving the
+        // narrow-keys tri-state, so AUTO sees this dataset (sibling
+        // scan makes it registration-order independent — region at 5
+        // rows classifies by its lineitem sibling).
+        crate::scale_class::observe_file(&path);
         Self::try_new_opt(path, key_downcast_enabled())
     }
 
@@ -2246,7 +2259,9 @@ impl EmatixFastParquetTableProvider {
         // the planner (Σ.Q06.SF10.5.h). An explicit `EMAT_DICT_DISTINCT_MAX_ROWS`
         // always overrides. Scale caveat: at SF=100 part is 20M > 10M, so set
         // the cap explicitly there.
-        let ndv_build_side = std::env::var("EMAT_NDV_BUILD_SIDE").as_deref() == Ok("1");
+        // Σ.AI.5 (2026-07-02): tri-state — `=1` on, `=0` off, unset = AUTO
+        // (on for SF≥100-class datasets; `observe_file` ran in try_new).
+        let ndv_build_side = crate::flags::scale_gated_large("EMAT_NDV_BUILD_SIDE");
         let max_rows_for_walk: usize = std::env::var("EMAT_DICT_DISTINCT_MAX_ROWS")
             .ok()
             .and_then(|s| s.parse().ok())
@@ -3120,21 +3135,26 @@ impl ExecutionPlan for EmatixFastParquetExec {
         // EMAT_DOWNCAST_KEYS narrowed nothing) keeps every reader
         // bit-identical; the boundary cast below still reconciles any
         // reader family that decodes wide.
-        let narrow_i64_leaves: Vec<usize> = if crate::flags::opt_in("EMAT_NARROW_KEY_DECODE") {
-            schema
-                .fields()
-                .iter()
-                .zip(decode_schema.fields().iter())
-                .enumerate()
-                .filter(|(_, (adv, dec))| {
-                    matches!(adv.data_type(), DataType::Int32)
-                        && matches!(dec.data_type(), DataType::Int64)
-                })
-                .map(|(i, _)| self.projection[i])
-                .collect()
-        } else {
-            Vec::new()
-        };
+        // Σ.AI.5 (2026-07-02): tri-state, gated with EMAT_DOWNCAST_KEYS
+        // (unset = AUTO = on at SF≥100 scale). Narrowing only exists when
+        // the downcast advertised Int32 (the schema-pair filter below), so
+        // AUTO here follows the downcast's own resolution.
+        let narrow_i64_leaves: Vec<usize> =
+            if crate::flags::scale_gated_large("EMAT_NARROW_KEY_DECODE") {
+                schema
+                    .fields()
+                    .iter()
+                    .zip(decode_schema.fields().iter())
+                    .enumerate()
+                    .filter(|(_, (adv, dec))| {
+                        matches!(adv.data_type(), DataType::Int32)
+                            && matches!(dec.data_type(), DataType::Int64)
+                    })
+                    .map(|(i, _)| self.projection[i])
+                    .collect()
+            } else {
+                Vec::new()
+            };
         // Σ.Q.L9 — runtime sideband consumption. At execute() time
         // (which for the probe side of a HashJoinExec runs AFTER the
         // build phase has fully drained — see the L9 module doc), peek
@@ -5143,6 +5163,74 @@ mod tests {
         let mini =
             std::path::PathBuf::from(crate::test_support::tpch_mini_dir()).join("lineitem.parquet");
         mini.exists().then(|| mini.to_string_lossy().into_owned())
+    }
+
+    /// Σ.AI.5 SCALE-GATE (2026-07-02 campaign gating) — the narrow-keys
+    /// schema advertisement is tri-state on `EMAT_DOWNCAST_KEYS`:
+    ///   1. unset + small-scale stats → AUTO-OFF (keys stay Int64),
+    ///   2. unset + SF≥100-class stats (row-count threshold injected via
+    ///      `EMAT_LARGE_SCALE_MIN_ROWS` — the same footer stats the
+    ///      production gate reads) → AUTO-ON (fitting keys advertise Int32),
+    ///   3. `=0` beats auto-ON, 4. `=1` beats auto-OFF.
+    ///
+    /// Env windows are kept tight; this is the only test mutating
+    /// EMAT_DOWNCAST_KEYS (the other downcast tests use `try_new_opt`'s
+    /// explicit flag precisely to avoid env races).
+    #[test]
+    fn downcast_keys_scale_gated_auto() {
+        let Some(p) = lineitem_path() else {
+            eprintln!("skip: no lineitem fixture");
+            return;
+        };
+        let orderkey_type = |prov: &EmatixFastParquetTableProvider| {
+            use datafusion::catalog::TableProvider as _;
+            prov.schema()
+                .field_with_name("l_orderkey")
+                .expect("lineitem has l_orderkey")
+                .data_type()
+                .clone()
+        };
+
+        // 1. AUTO below scale → Int64 (unchanged advertisement).
+        unsafe { std::env::remove_var("EMAT_DOWNCAST_KEYS") };
+        unsafe { std::env::remove_var("EMAT_LARGE_SCALE_MIN_ROWS") };
+        let prov = EmatixFastParquetTableProvider::try_new(p.clone()).unwrap();
+        assert_eq!(
+            orderkey_type(&prov),
+            DataType::Int64,
+            "AUTO below scale must not narrow"
+        );
+
+        // 2. AUTO at (injected) large-scale stats → Int32. Every fixture
+        //    lineitem (mini = 280 rows, SF=1 = 6M) exceeds 100 rows and
+        //    its l_orderkey fits i32.
+        unsafe { std::env::set_var("EMAT_LARGE_SCALE_MIN_ROWS", "100") };
+        let prov = EmatixFastParquetTableProvider::try_new(p.clone()).unwrap();
+        assert_eq!(
+            orderkey_type(&prov),
+            DataType::Int32,
+            "AUTO at large-scale stats must narrow fitting keys"
+        );
+
+        // 3. Force-off beats auto-ON.
+        unsafe { std::env::set_var("EMAT_DOWNCAST_KEYS", "0") };
+        let prov = EmatixFastParquetTableProvider::try_new(p.clone()).unwrap();
+        assert_eq!(
+            orderkey_type(&prov),
+            DataType::Int64,
+            "=0 must force OFF even at large scale"
+        );
+        unsafe { std::env::remove_var("EMAT_LARGE_SCALE_MIN_ROWS") };
+
+        // 4. Force-on beats auto-OFF.
+        unsafe { std::env::set_var("EMAT_DOWNCAST_KEYS", "1") };
+        let prov = EmatixFastParquetTableProvider::try_new(p.clone()).unwrap();
+        unsafe { std::env::remove_var("EMAT_DOWNCAST_KEYS") };
+        assert_eq!(
+            orderkey_type(&prov),
+            DataType::Int32,
+            "=1 must force ON below scale"
+        );
     }
 
     /// NARROW.DEC micro-verification (NOT a benchmark) — TPC-H Q09, the

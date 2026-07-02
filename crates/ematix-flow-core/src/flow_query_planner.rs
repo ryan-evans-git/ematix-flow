@@ -420,9 +420,10 @@ mod tests {
     /// Σ.AH.5 WIRING: through the production `FlowQueryPlanner`, with
     /// `EMAT_FD_GROUPBY=1` Q10's aggregate groups on the single unique key
     /// (min carriers re-attach the 6 determined columns) AND returns results
-    /// identical to the flag-off path. With the flag off (opt-in default) the
-    /// plan carries no min carrier. This is the sole test mutating
-    /// `EMAT_FD_GROUPBY`. It also pins the rule's PRECEDENCE over late-mat:
+    /// identical to the flag-off path. With the flag off (scale-gated: off at
+    /// SF=1 fixture scale) the plan carries no min carrier. EMAT_FD_GROUPBY is
+    /// mutated only here and in `flow_planner_fd_groupby_scale_gated_auto`
+    /// (both ENV_MUTEX-serialized). It also pins the rule's PRECEDENCE over late-mat:
     /// with both eligible, the reduced key defuses late-mat's shape gate
     /// (no LateGatherExec in the ON plan).
     // See flow_planner_wires_late_mat_agg_on_q10 — same intentional span.
@@ -519,6 +520,70 @@ mod tests {
             "revenue sum: stock {os:.4} vs fd-groupby {ns:.4}"
         );
         assert!(or > 0, "sanity: Q10 SF1 returns rows");
+    }
+
+    /// Σ.AI.5 SCALE-GATE plan-diff (2026-07-02 campaign gating): with
+    /// `EMAT_FD_GROUPBY` UNSET the lever is AUTO —
+    ///   1. auto-OFF at SF≤10-class stats (shipped 300M threshold; the
+    ///      SF=1 fixture is 6M),
+    ///   2. auto-ON when the dataset classifies SF≥100
+    ///      (`EMAT_LARGE_SCALE_MIN_ROWS=1000000` lowers the threshold so
+    ///      the SF=1 fixture's lineitem crosses it — row-count injection,
+    ///      the same stats the production gate reads),
+    ///   3. explicit `=0` beats auto-ON (force-off), and
+    ///   4. explicit `=1` beats auto-OFF (force-on).
+    /// Serialized with the other planner env tests via ENV_MUTEX; this
+    /// and `flow_planner_wires_fd_groupby_on_q10` are the only tests
+    /// mutating EMAT_FD_GROUPBY / EMAT_LARGE_SCALE_MIN_ROWS.
+    // ENV_MUTEX intentionally spans the awaits (see the late-mat test).
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn flow_planner_fd_groupby_scale_gated_auto() {
+        let _env = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let Some((ctx, dir)) = q10_ctx_with_planner().await else {
+            eprintln!("skip: no SF=1 data");
+            return;
+        };
+        let sql = std::fs::read_to_string("examples/tpch/queries/q10.sql")
+            .or_else(|_| std::fs::read_to_string(dir.join("../../queries/q10.sql")))
+            .unwrap();
+        let sql = sql.trim().trim_end_matches(';').to_string();
+
+        let dump = |ctx: SessionContext, sql: String| async move {
+            let plan = ctx
+                .sql(&sql)
+                .await
+                .unwrap()
+                .create_physical_plan()
+                .await
+                .unwrap();
+            format!("{}", displayable(plan.as_ref()).indent(true))
+        };
+        let fires = |d: &str| d.contains("min(customer.c_name)");
+
+        // SAFETY: env windows are serialized by ENV_MUTEX and restored below.
+        // 1. AUTO at small scale → off.
+        unsafe { std::env::remove_var("EMAT_FD_GROUPBY") };
+        unsafe { std::env::remove_var("EMAT_LARGE_SCALE_MIN_ROWS") };
+        let d = dump(ctx.clone(), sql.clone()).await;
+        assert!(!fires(&d), "AUTO below scale must NOT rewrite:\n{d}");
+
+        // 2. AUTO at (injected) SF≥100-class stats → on.
+        unsafe { std::env::set_var("EMAT_LARGE_SCALE_MIN_ROWS", "1000000") };
+        let d = dump(ctx.clone(), sql.clone()).await;
+        assert!(fires(&d), "AUTO at large-scale stats must rewrite:\n{d}");
+
+        // 3. Force-off beats auto-ON.
+        unsafe { std::env::set_var("EMAT_FD_GROUPBY", "0") };
+        let d = dump(ctx.clone(), sql.clone()).await;
+        assert!(!fires(&d), "=0 must force OFF even at large scale:\n{d}");
+
+        // 4. Force-on beats auto-OFF.
+        unsafe { std::env::remove_var("EMAT_LARGE_SCALE_MIN_ROWS") };
+        unsafe { std::env::set_var("EMAT_FD_GROUPBY", "1") };
+        let d = dump(ctx.clone(), sql.clone()).await;
+        unsafe { std::env::remove_var("EMAT_FD_GROUPBY") };
+        assert!(fires(&d), "=1 must force ON below scale:\n{d}");
     }
 
     /// The planner must plan every TPC-H query through the library path

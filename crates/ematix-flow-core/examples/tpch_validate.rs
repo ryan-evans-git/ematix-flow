@@ -439,11 +439,15 @@ async fn run_ematix(
     let state = builder.build();
     let ctx = SessionContext::new_with_state(state);
     // Σ.AH.5: the FD group-by simplifier needs the PK-derived FDs to fire, so
-    // validating it (EMAT_FD_GROUPBY=1) declares the TPC-H primary keys —
-    // harness scaffolding like tpch_preset_rebench's EMAT_TPCH_PK (a real
-    // catalog declares PKs via DDL; the shipped library has no TPC-H
-    // hardcoding). Off by default → the baseline registration is unchanged.
-    let fd_groupby = ematix_flow_core::fd_groupby_simplify::enabled();
+    // validating it declares the TPC-H primary keys — harness scaffolding like
+    // tpch_preset_rebench's EMAT_TPCH_PK (a real catalog declares PKs via DDL;
+    // the shipped library has no TPC-H hardcoding).
+    // Σ.AI.5: the lever is now scale-gated tri-state and this read happens
+    // BEFORE registration (scale unknown), so declare PKs unless the lever is
+    // FORCED off — PK declaration is plan-inert when the rule doesn't fire
+    // (pinned by flow_query_planner's FD-on-catalog plan-diff test), and the
+    // rule's own gate (resolved post-registration) makes the final call.
+    let fd_groupby = ematix_flow_core::flags::tri_state("EMAT_FD_GROUPBY") != Some(false);
     let tpch_pk = |t: &str| -> Option<Vec<usize>> {
         Some(match t {
             "region" | "nation" | "supplier" | "customer" | "part" | "orders" => vec![0],
