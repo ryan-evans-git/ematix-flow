@@ -351,6 +351,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("    trials:  {trials} (after {warmups} warmups)");
     println!("    output:  {}", out_path.display());
     println!();
+    // Σ.AI.3: single-invocation numbers under-estimate cross-invocation
+    // variance by 5-10x and reuse in-process session state that the
+    // competitor engines don't get. Verdict-grade comparisons must go
+    // through the strict wrappers.
+    println!(
+        "    NOTE: single-invocation output is SMOKE-GRADE only. For win/loss\n\
+         \x20   claims use scripts/bench/strict_22q.sh / strict_ab.sh /\n\
+         \x20   strict_throughput.sh (see scripts/bench/README.md)."
+    );
+    println!();
 
     let mut results: BTreeMap<u8, BTreeMap<Engine, EngineResult>> = BTreeMap::new();
 
@@ -1990,6 +2000,16 @@ fn write_benchmarks_md(
 
     let mut s = String::new();
     writeln!(s, "# TPC-H {sf_label} triangulation").unwrap();
+    writeln!(s).unwrap();
+    writeln!(
+        s,
+        "> **SMOKE-GRADE OUTPUT.** Single-invocation, same-process numbers: \
+         cross-invocation variance is 5-10x what the ± column suggests, and \
+         ematix reuses in-process session state competitors don't get. \
+         Verdict-grade win/loss claims must come from the strict protocol \
+         (`scripts/bench/README.md`)."
+    )
+    .unwrap();
     writeln!(s).unwrap();
     writeln!(
         s,
