@@ -178,6 +178,16 @@ Ranked by `wall_savings × confidence × query_count`. Each arc clusters Q-speci
 
 **Bench gate:** trivial; any improvement on Q03/Q05/Q07 confirms.
 
+**Status (2026-07-01): DONE.** `tpch_generate --reemit <file> --rg-rows <N>`
+(same arrow-rs writer stack as generation, row-count-verified, atomic
+replace). Re-emitted: SF=1 customer 1→15 RGs (10k rows/rg), SF=10
+customer 2→15 RGs (100k rows/rg), and — same pathology, found during
+the re-emit — SF=100 **supplier** 1→14 RGs (72k rows/rg; it shipped as
+a single 1M-row group, capping that scan at 1-way parallelism).
+SF=100 customer already had 15 RGs. Value-validation vs DuckDB after
+re-emit: SF=1 all 22 PASS; SF=10 Q03/Q05/Q07/Q08/Q10/Q22 PASS; SF=100
+Q20/Q21 PASS. Bench gate runs with the Σ.AH.2 A/B campaign.
+
 ---
 
 ### Σ.AH.5 — Functional-dependency group-by simplifier

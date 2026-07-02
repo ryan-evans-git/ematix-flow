@@ -45,11 +45,23 @@ const USAGE: &str = "\
 
 Usage:
     tpch_generate --sf <FACTOR> --out <DIR>
+    tpch_generate --reemit <FILE.parquet> --rg-rows <N>
 
 Options:
     --sf <FACTOR>   TPC-H scale factor (1, 10, 100, 1000). Required.
     --out <DIR>     Output directory. One Parquet file per TPC-H table.
                     Created if missing. Required.
+
+    --reemit <FILE> Σ.AH.4: rewrite an existing Parquet file in place
+                    with a different row-group size, through the SAME
+                    arrow-rs writer stack as generation (byte-faithful
+                    encodings — an external writer would not be).
+                    Verifies row count before atomically replacing
+                    the original.
+    --rg-rows <N>   Max rows per row group for --reemit. Pick so the
+                    row-group count is >= the machine's core count: a
+                    2-row-group customer.parquet caps that scan at
+                    2-way parallelism no matter how many cores exist.
 
 Each table file is named `<table>.parquet` (lineitem.parquet, etc.)
 and uses Snappy compression. Existing files are skipped — delete
@@ -60,6 +72,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().skip(1).collect();
     let mut sf: Option<f64> = None;
     let mut out: Option<PathBuf> = None;
+    let mut reemit: Option<PathBuf> = None;
+    let mut rg_rows: Option<usize> = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -72,6 +86,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 out = Some(PathBuf::from(args.get(i + 1).ok_or("--out needs a value")?));
                 i += 2;
             }
+            "--reemit" => {
+                reemit = Some(PathBuf::from(
+                    args.get(i + 1).ok_or("--reemit needs a value")?,
+                ));
+                i += 2;
+            }
+            "--rg-rows" => {
+                rg_rows = Some(args.get(i + 1).ok_or("--rg-rows needs a value")?.parse()?);
+                i += 2;
+            }
             "-h" | "--help" => {
                 println!("{USAGE}");
                 return Ok(());
@@ -81,6 +105,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 std::process::exit(2);
             }
         }
+    }
+
+    if let Some(path) = reemit {
+        let rg = rg_rows.ok_or("--reemit requires --rg-rows")?;
+        return reemit_with_rg_size(&path, rg);
     }
 
     let sf = sf.ok_or("--sf is required")?;
@@ -189,6 +218,53 @@ fn open_parquet_writer(
         .set_compression(Compression::SNAPPY)
         .build();
     Ok(ArrowWriter::try_new(file, schema, Some(props))?)
+}
+
+/// Σ.AH.4: stream-copy an existing Parquet file through the same writer
+/// stack with a bounded row-group size, then atomically replace the
+/// original. A dimension file with fewer row groups than the machine has
+/// cores caps that scan's parallelism (customer.parquet at SF=10 shipped
+/// with 2 row groups → 2-way scans on a 14-core box).
+fn reemit_with_rg_size(path: &Path, rg_rows: usize) -> Result<(), Box<dyn std::error::Error>> {
+    use datafusion::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+    let src = File::open(path)?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(src)?;
+    let before_rgs = builder.metadata().num_row_groups();
+    let before_rows: i64 = builder.metadata().file_metadata().num_rows();
+    let schema = builder.schema().clone();
+    let reader = builder.build()?;
+
+    let tmp = path.with_extension("parquet.reemit-tmp");
+    let props = WriterProperties::builder()
+        .set_compression(Compression::SNAPPY)
+        .set_max_row_group_row_count(Some(rg_rows))
+        .build();
+    let mut writer = ArrowWriter::try_new(File::create(&tmp)?, schema, Some(props))?;
+
+    let mut written: i64 = 0;
+    for batch in reader {
+        let batch: RecordBatch = batch?;
+        written += batch.num_rows() as i64;
+        writer.write(&batch)?;
+    }
+    let meta = writer.close()?;
+    let after_rgs = meta.row_groups().len();
+
+    if written != before_rows {
+        fs::remove_file(&tmp)?;
+        return Err(format!(
+            "row-count mismatch re-emitting {}: read {before_rows}, wrote {written} — original untouched",
+            path.display()
+        )
+        .into());
+    }
+    fs::rename(&tmp, path)?;
+    println!(
+        "==> re-emitted {}: {before_rgs} -> {after_rgs} row groups ({written} rows, <= {rg_rows} rows/rg)",
+        path.display()
+    );
+    Ok(())
 }
 
 // Parse one in-memory CSV chunk (header line + up to CHUNK_ROWS data rows)
