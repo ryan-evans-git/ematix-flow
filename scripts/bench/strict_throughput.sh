@@ -21,13 +21,21 @@
 # DuckDB: its own defaults) — at N=100 on a laptop this oversubscribes
 # heavily BY DESIGN; that contention is the thing being measured.
 #
-# MEMORY WARNING: N=100 at SF=100 means 100 processes against ~34 GB of
-# parquet. On a 36 GB machine expect page-cache thrash; consider
-# --streams "1,10" for SF=100 or run on a bigger box.
+# MEMORY SAFETY (learned the hard way — an uncapped s100 launch OOM'd
+# and force-restarted a 36 GB machine TWICE): stream processes launch
+# through a counting gate. At most MAX_INFLIGHT engine processes exist
+# at any instant; the remaining logical streams queue and start as slots
+# free. "N streams" therefore means N logical streams SATURATING
+# MAX_INFLIGHT slots — makespan and QPH keep their sustained-throughput
+# meaning; per-query percentiles reflect contention at the cap, not at
+# N. The cap is recorded in batch.json so summaries are attributable.
+# A pre-batch memory gate additionally refuses to launch when free+
+# inactive memory is under MIN_FREE_GB.
 #
 # Usage:
 #   strict_throughput.sh [--sf N] [--streams "1,10,100"]
 #                        [--engines "ematix,duckdb"] [--batches 4]
+#                        [--max-inflight K] [--min-free-gb G]
 #                        [--plan-cache on|off] [--out PATH]
 #
 # Outputs:
@@ -42,6 +50,8 @@ SF=10
 STREAMS="1,10,100"
 ENGINES="ematix,duckdb"
 BATCHES=4                  # first discarded per (engine, N)
+MAX_INFLIGHT=10            # hard cap on concurrent engine processes
+MIN_FREE_GB=6              # refuse to launch a batch below this headroom
 PLAN_CACHE="off"           # per-process cache is fresh anyway; kept for parity
 OUT="/tmp/strict-throughput-$(date +%Y%m%d-%H%M%S)"
 
@@ -53,6 +63,8 @@ while [[ $# -gt 0 ]]; do
         --streams) STREAMS="$2"; shift 2 ;;
         --engines) ENGINES="$2"; shift 2 ;;
         --batches) BATCHES="$2"; shift 2 ;;
+        --max-inflight) MAX_INFLIGHT="$2"; shift 2 ;;
+        --min-free-gb) MIN_FREE_GB="$2"; shift 2 ;;
         --plan-cache) PLAN_CACHE="$2"; shift 2 ;;
         --out) OUT="$2"; shift 2 ;;
         -h|--help) usage; exit 0 ;;
@@ -90,6 +102,22 @@ engine_skip_env() {
     esac
 }
 
+# Free + inactive memory in whole GB (macOS vm_stat; 16 KiB pages on AS).
+mem_available_gb() {
+    vm_stat | awk '
+        /page size of/       { ps = $8 }
+        /Pages free/         { gsub("\\.",""); free = $3 }
+        /Pages inactive/     { gsub("\\.",""); inact = $3 }
+        END { printf "%d", (free + inact) * ps / 1073741824 }'
+}
+
+# Block while >= MAX_INFLIGHT children are alive (bash 3.2: no wait -n).
+inflight_gate() {
+    while (( $(jobs -rp | wc -l) >= MAX_INFLIGHT )); do
+        sleep 0.2
+    done
+}
+
 run_batch() {
     local engine="$1" n="$2" batch="$3"
     local bdir="$OUT/$engine/s$n/batch-$batch"
@@ -104,10 +132,17 @@ run_batch() {
     thermal_wait 120
     local pre_therm; pre_therm="$(thermal_state)"
 
+    local avail; avail="$(mem_available_gb)"
+    if (( avail < MIN_FREE_GB )); then
+        echo "  ABORT $engine s$n batch $batch: only ${avail} GB free+inactive (< ${MIN_FREE_GB} GB gate) — not launching" >&2
+        return 1
+    fi
+
     local start_ms end_ms
     start_ms="$(python3 -c 'import time; print(int(time.time()*1000))')"
     local pids=()
     for s in $(seq 1 "$n"); do
+        inflight_gate
         local perm; perm="$(perm_for_stream "$s")"
         # shellcheck disable=SC2086
         caffeinate -i /usr/bin/env $skip_env $PC_ENV \
@@ -130,6 +165,7 @@ run_batch() {
   "streams": $n,
   "batch": $batch,
   "makespan_ms": $((end_ms - start_ms)),
+  "max_inflight": $MAX_INFLIGHT,
   "stream_failures": $failures,
   "thermal_pre": "$pre_therm",
   "thermal_post": "$post_therm"

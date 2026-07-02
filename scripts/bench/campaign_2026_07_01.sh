@@ -120,15 +120,15 @@ ab100 all-on         "$ALL_ON" "3,5,8,9,10,16,18,21"
 
 # ---- Phase 6: throughput ----------------------------------------------
 if ! phase_done "$OUT/tput-sf10/throughput-summary.md"; then
-    log "phase throughput SF=10 streams 1,10,100"
+    log "phase throughput SF=10 streams 1,10,100 (inflight cap 10 — an uncapped s100 OOM-restarted this box twice)"
     "$SB/strict_throughput.sh" --sf 10 --streams "1,10,100" \
-        --engines "ematix,duckdb" --batches 4 \
+        --engines "ematix,duckdb" --batches 4 --max-inflight 10 \
         --out "$OUT/tput-sf10" >> "$LOG" 2>&1
 fi
 if ! phase_done "$OUT/tput-sf100/throughput-summary.md"; then
-    log "phase throughput SF=100 streams 1,10 (RAM guard: no s100 at SF100)"
+    log "phase throughput SF=100 streams 1,10 (inflight cap 3 — multi-GB per-process heaps at SF100)"
     "$SB/strict_throughput.sh" --sf 100 --streams "1,10" \
-        --engines "ematix,duckdb" --batches 3 \
+        --engines "ematix,duckdb" --batches 3 --max-inflight 3 \
         --out "$OUT/tput-sf100" >> "$LOG" 2>&1
 fi
 
