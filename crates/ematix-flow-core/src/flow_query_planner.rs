@@ -337,6 +337,9 @@ mod tests {
     /// (EmatixHashJoinExec + LateGatherExec) AND returns results identical to the
     /// flag-off (stock) path. With the flag off the plan is unchanged (no
     /// LateGatherExec). This is the sole test mutating `EMAT_LATE_MAT_AGG`.
+    // ENV_MUTEX intentionally spans the awaits: it serializes the whole
+    // env-var-mutating test body against its sibling, not a data access.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn flow_planner_wires_late_mat_agg_on_q10() {
         use datafusion::arrow::array::{Array, Float64Array};
@@ -422,6 +425,8 @@ mod tests {
     /// `EMAT_FD_GROUPBY`. It also pins the rule's PRECEDENCE over late-mat:
     /// with both eligible, the reduced key defuses late-mat's shape gate
     /// (no LateGatherExec in the ON plan).
+    // See flow_planner_wires_late_mat_agg_on_q10 — same intentional span.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn flow_planner_wires_fd_groupby_on_q10() {
         use datafusion::arrow::array::{Array, Float64Array};
