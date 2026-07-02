@@ -2289,10 +2289,9 @@ mod bench_preset_parity_tests {
             .create_physical_plan()
             .await
             .unwrap();
-        let rendered =
-            datafusion::physical_plan::displayable(plan.as_ref())
-                .indent(true)
-                .to_string();
+        let rendered = datafusion::physical_plan::displayable(plan.as_ref())
+            .indent(true)
+            .to_string();
         assert!(
             rendered.contains("SinglePartitioned"),
             "Q18 subquery shape must take the RANGE.AGG single-phase \

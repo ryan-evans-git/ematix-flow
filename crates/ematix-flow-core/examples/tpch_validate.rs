@@ -387,6 +387,18 @@ async fn run_ematix(
             ematix_flow_core::force_collect_left_semi_build_rule::ForceCollectLeftForSemiBoundedBuildRule::default(),
         ));
     }
+    // RANGE.AGG (f15d2fc): production-preset default since 2026-06-10,
+    // but this harness (like the strict bench, fixed alongside) never
+    // installed it — so value validation never exercised the
+    // single-phase cluster-key agg plan the preset actually runs (the
+    // exact class of silent-corruption risk this script exists for:
+    // a mis-placed chunk split would split a group's sum across two
+    // output rows). Same registration position as preset.rs (after
+    // ForceCollectLeft, before the RobinHood-sum rewrite); self-gated
+    // on EMAT_RANGE_AGG (default ON, =0 to disable).
+    builder = builder.with_physical_optimizer_rule(Arc::new(
+        ematix_flow_core::clustered_agg_rule::ClusteredSinglePhaseAggRule,
+    ));
     builder = builder.with_physical_optimizer_rule(Arc::new(EnableRobinHoodSumF64Rule::default()));
     // Σ.Q.L15: Inner-L9 + tight ratio + all-Emat. **Default ON at
     // milestone config**; set `L15=0` to revert to pre-L15.
