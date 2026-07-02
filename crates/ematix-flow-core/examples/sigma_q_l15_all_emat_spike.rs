@@ -59,6 +59,9 @@ async fn run_q07(
         require_filtered_build: false,
         max_expected_keys_per_partition: 0,
         min_probe_proj_cols: 0,
+        // Σ.AH.2: env-resolved NDV ceiling (EMAT_L9_NDV_MAX_ROWS /
+        // EMAT_L9_PARTITIONED) + any future fields track the default.
+        ..EnableRuntimeBloomSidebandRule::default()
     }));
     let state = builder.build();
     let ctx = SessionContext::new_with_state(state);
