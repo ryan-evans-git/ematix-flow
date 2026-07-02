@@ -94,6 +94,10 @@ run_batch() {
     local engine="$1" n="$2" batch="$3"
     local bdir="$OUT/$engine/s$n/batch-$batch"
     mkdir -p "$bdir"
+    if [[ -s "$bdir/batch.json" ]]; then
+        echo "  $engine s$n batch $batch: SKIP (batch.json exists — resume)"
+        return 0
+    fi
     local skip_env
     skip_env="$(engine_skip_env "$engine")"
 
