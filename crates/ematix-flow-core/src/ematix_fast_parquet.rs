@@ -5604,6 +5604,163 @@ mod tests {
         );
     }
 
+    /// Σ.AH.1 re-audit (2026-07-01) — pin scan-decode-level consumption
+    /// of a published runtime predicate. `PERF_REVIEW_2026_05` § Σ.AH.1
+    /// claimed the L9 bloom was "consumed at HashJoinExec level — rows
+    /// decoded then dropped"; in reality a sideband-published
+    /// `I64InBloom` filters the SCAN's own output (no join anywhere in
+    /// the plan), under BOTH decode arms:
+    ///
+    /// - fused probe (default ON since Σ.AI.2): dense decode + bitmap +
+    ///   per-batch SIMD filter;
+    /// - `EMAT_L9_FUSED_PROBE=0` legacy: `build_bitmap` + Π.10
+    ///   `read_column_*_masked_into` masked decode (the literal
+    ///   "skip decode of bloom-missing rows" arm).
+    ///
+    /// Both must emit exactly the bloom-passing rows (inexact by design
+    /// — false positives included; a downstream join re-applies). An
+    /// all-pass predicate routes to dense (REV.23 pass-rate gate) with
+    /// every row emitted. A test like this at spec-writing time would
+    /// have caught the stale premise. See
+    /// `docs/PHASE_SIGMA_AH_1_DESIGN.md` § 11.
+    #[tokio::test]
+    async fn published_sideband_filters_rows_at_scan_decode_level() {
+        use crate::bloom::BloomFilter;
+        use datafusion::common::tree_node::{Transformed, TreeNode};
+        use ematix_parquet_codec::write::{ColumnData, write_table_to_path};
+        use ematix_parquet_format::types::CompressionCodec;
+
+        let dir = std::env::temp_dir().join(format!("sideband_scan_pin_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("t.parquet");
+        // Non-"*key" column names so KEYS.2 narrowing can't reshape the
+        // schema under the test.
+        let k: Vec<i64> = (0..4096).collect();
+        let v: Vec<i64> = (0..4096).map(|x| x * 3).collect();
+        write_table_to_path(
+            &path,
+            &[("ka", ColumnData::I64(&k)), ("vb", ColumnData::I64(&v))],
+            CompressionCodec::Uncompressed,
+        )
+        .unwrap();
+
+        // Bloom over every 64th key → ~1.6% pass (+ ~1% FPs), safely
+        // under the 10% masked→dense routing threshold, so the bitmap
+        // is stashed and the scan output is actually filtered.
+        let build: Vec<i64> = (0..4096i64).step_by(64).collect();
+        let mut b = BloomFilter::for_keys(build.len());
+        for &x in &build {
+            b.insert_i64(x);
+        }
+        let bloom = Arc::new(b);
+        // Oracle: exactly the bloom-passing rows, in file order. The
+        // bloom is deterministic, so this is exact (FPs included).
+        let expected: Vec<i64> = k
+            .iter()
+            .copied()
+            .filter(|&x| bloom.might_contain_i64(x))
+            .collect();
+        assert!(expected.len() >= build.len(), "bloom lost inserted keys");
+        assert!(
+            (expected.len() as f64) < 0.10 * k.len() as f64,
+            "fixture must stay under the dense-routing threshold \
+             (pass {} of {})",
+            expected.len(),
+            k.len()
+        );
+
+        let prov = EmatixFastParquetTableProvider::try_new(path.to_str().unwrap()).unwrap();
+        let ctx = SessionContext::new();
+        ctx.register_table("t", Arc::new(prov)).unwrap();
+        let plan = ctx
+            .sql("SELECT ka, vb FROM t")
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+
+        // Attach a sideband to the scan and publish BEFORE execute; the
+        // scan's deferred first-poll peek must merge the predicate into
+        // its BridgeFilter (ematix_fast_parquet.rs execute()).
+        let sideband = crate::bridge_filter_sideband::BridgeFilterSideband::new();
+        sideband.publish(vec![ColumnPredicate::I64InBloom {
+            col_idx: 0,
+            bloom: bloom.clone(),
+        }]);
+        let sb_for_walk = sideband.clone();
+        let plan = plan
+            .transform_up(move |node| {
+                if let Some(scan) = node.as_any().downcast_ref::<EmatixFastParquetExec>() {
+                    Ok(Transformed::yes(
+                        scan.with_runtime_sideband(sb_for_walk.clone()) as Arc<dyn ExecutionPlan>,
+                    ))
+                } else {
+                    Ok(Transformed::no(node))
+                }
+            })
+            .unwrap()
+            .data;
+
+        async fn scan_keys(plan: &Arc<dyn ExecutionPlan>, ctx: &SessionContext) -> Vec<i64> {
+            let batches = datafusion::physical_plan::collect(plan.clone(), ctx.task_ctx())
+                .await
+                .unwrap();
+            batches
+                .iter()
+                .flat_map(|b| {
+                    b.column(0)
+                        .as_any()
+                        .downcast_ref::<arrow_array::Int64Array>()
+                        .expect("ka must decode as Int64Array")
+                        .values()
+                        .to_vec()
+                })
+                .collect()
+        }
+
+        // Arm 1 — fused probe (default ON): the scan emits ONLY the
+        // bloom-passing rows. No join exists to do it for us.
+        let got_fused = scan_keys(&plan, &ctx).await;
+        assert_eq!(
+            got_fused, expected,
+            "fused arm: scan output must be exactly the bloom-passing rows"
+        );
+
+        // Arm 2 — legacy masked decode (`EMAT_L9_FUSED_PROBE=0`): same
+        // rows via build_bitmap + read_column_*_masked_into. Restore the
+        // prior value afterwards (both arms are result-identical, so a
+        // concurrent reader momentarily seeing "0" stays correct).
+        let prior = std::env::var("EMAT_L9_FUSED_PROBE").ok();
+        unsafe { std::env::set_var("EMAT_L9_FUSED_PROBE", "0") };
+        let got_masked = scan_keys(&plan, &ctx).await;
+        match prior {
+            Some(p) => unsafe { std::env::set_var("EMAT_L9_FUSED_PROBE", p) },
+            None => unsafe { std::env::remove_var("EMAT_L9_FUSED_PROBE") },
+        }
+        assert_eq!(
+            got_masked, expected,
+            "legacy masked arm must emit the same rows as the fused arm"
+        );
+
+        // Arm 3 — all-pass predicate: pass rate 100% > threshold, so
+        // REV.23 routes to dense (bitmap discarded); every row emitted,
+        // results unchanged (downstream re-applies inexact predicates).
+        let mut all = BloomFilter::for_keys(k.len());
+        for &x in &k {
+            all.insert_i64(x);
+        }
+        sideband.publish(vec![ColumnPredicate::I64InBloom {
+            col_idx: 0,
+            bloom: Arc::new(all),
+        }]);
+        let got_dense = scan_keys(&plan, &ctx).await;
+        assert_eq!(
+            got_dense, k,
+            "all-pass predicate must dense-route and emit every row"
+        );
+    }
+
     /// Σ.T Phase 1 (2026-05-25): `TableProvider::statistics()` must
     /// surface per-column min/max/null_count derived from parquet
     /// row-group metadata. Without this the logical planner has only
