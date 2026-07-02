@@ -105,3 +105,43 @@ Floor for cold subtree = ~18 ms; both engines pay ~70 ms = ~4× over floor. Same
 ## Next levers
 
 (none new — Q15 is solved within the cold-cache regime by SharedSubtreeExec; bench artifact noted)
+
+## Closure note — SF=100 partition-mismatch crash resolved (verified 2026-07-01)
+
+The Q15 SF=100 crash recorded in the 2026-05-29 sweep
+(`bench-results/sf100-ematix-duckdb-2026-05-29.md`: "execute: Internal
+error: Assertion failed: self.mode != PartitionMode::Partitioned ||
+left_partitions == ri…") is **resolved as of commit `f144e85`**
+(`fix(Σ.BS): repair partitioning after Q15 SharedSubtreeExec wrap —
+unblocks SF=100`, 2026-05-29), which is in `main`.
+
+- **Assertion source**: DataFusion `HashJoinExec::execute`
+  (`datafusion-physical-plan-53.1.0/src/joins/hash_join/exec.rs:1267`) —
+  "Invalid HashJoinExec, partition count mismatch {left}!={right}".
+- **Trigger conditions**: the `DedupeAggregateForFloatDeterminism` rule
+  (registered by `tpch_triangulation_bench`, i.e. `EMAT_RULES=all|dedupe`)
+  wraps Q15's duplicated `revenue0` f64 aggregate in `SharedSubtreeExec`
+  (`UnknownPartitioning(1)`). When `JoinSelection` has chosen
+  `PartitionMode::Partitioned` for the `supplier ⋈ revenue0` join — build
+  side over the single-partition threshold, which happens naturally at
+  SF=100 — that wrap collapsed one join input N→1 with no
+  `RepartitionExec` above it. At SF=1/10 the join is `CollectLeft` (build
+  side must be 1 partition — the wrapper satisfies it), so only SF=100
+  crashed. Harness-specific: the preset/rebench path without the dedupe
+  rule never triggers it.
+- **Fix**: `f144e85` re-runs `EnforceDistribution` after the wrap
+  (gated on the rule actually transforming), restoring the hash
+  repartition above `SharedSubtreeExec`. Regression test:
+  `dedupe_aggregate_rule::tests::q15_partitioned_join_survives_shared_subtree_collapse`
+  (forces `Partitioned` via zeroed `hash_join_single_partition_threshold*`,
+  data-independent).
+- **Re-verification (2026-07-01, main @ `1724102`,
+  `tpch_triangulation_bench`, 1 trial / 0 warmups)**: SF=10 default
+  118 ms; SF=100 default 1255 ms (1 row — previously the crash config);
+  SF=1 and SF=10 with `PARTITIONS={3,5,28,100}` all pass; forced
+  `Partitioned` mode (`EMAT_COLLECT_LEFT_THRESHOLD_ROWS=0`) at
+  SF=1 (all four partition counts) and SF=10 all pass; regression test
+  green. Not partition-count-dependent post-fix. Note: SF=100
+  `supplier.parquet` was re-emitted with 14 row groups (Σ.AH.4) after the
+  original crash; the forced-Partitioned runs cover the old-layout
+  (1-row-group build side) shape regardless.
