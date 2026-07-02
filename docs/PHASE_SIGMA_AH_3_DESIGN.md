@@ -1,6 +1,7 @@
 # Σ.AH.3 — Build-vs-probe side-swap: design
 
 **Status:** **CLOSED 2026-05-27** with banked defensive infra; original arc framing rejected, but the dig-in surfaced one real (small) win and ruled out the L9-over-fire hypothesis. Memory: `[[sigma-ah-3-arc-closed]]`.
+**Re-look 2026-07-01:** § 4b — root cause of the Q10-shape inversion found (DataFusion 53 has NO Date32 interval analysis → flat 20% default on every date-range filter) and fixed as an opt-in arm on the existing walker (`EMAT_DATE_BUILD_SIDE=1`). Q08's inversion was already covered by REV.19 `EMAT_NDV_BUILD_SIDE=1`. The generic "reported-stats ratio swap rule" the arc originally specced remains WRONG — reported stats show no inversion on any target query; the inversions live entirely in estimation error.
 **Arc shell:** [`docs/plans/sigma-ah-arc-3.md`](plans/sigma-ah-arc-3.md).
 **Active plan:** [`docs/plans/CURRENT.md`](plans/CURRENT.md).
 **Predecessor lesson:** [Σ.AH.1 rejected](plans/archive/2026-05-27-sigma-ah-1.md) via 2-day spike that saved 3-4 weeks. Same discipline here.
@@ -181,6 +182,82 @@ Across all four modes, the `cust ⋈ orders` shape (Q10) shows the cleanest reor
 ### Story 2b / 2c not started
 
 Story 2b (Q10 shape-detect EMAT_REORDER) and Story 2c (combined 22q bench-gate) are no longer needed for AH.3 itself — the Story 2a finding eliminated the AH.3 framing. Q10 sliver moves to the Σ.AH.X salvage arc.
+
+## 4b. Re-look (2026-07-01) — root cause found, narrow slice shipped
+
+The PERF_REVIEW_2026_05 § Σ.AH.3 spec was re-opened with a premise-first audit
+(the sibling arcs had both found their specs stale). Verified against real
+SF=10 plans via the extended `sigma_q_explain_plan` probe (per-join reported
+cardinality + per-filter applied selectivity + input column min/max):
+
+### Premise findings
+
+1. **A reported-stats ratio swap rule can never fire on the claimed
+   instances.** Q08 depth-12: build customer `Exact(1.5M)` vs probe REPORTED
+   `Inexact(3M)` (true ~122k). Q10 cust⋈orders: build `Exact(1.5M)` vs probe
+   REPORTED `Inexact(3M)` (true 573k). `JoinSelection` sees NO inversion —
+   the inversion exists only at runtime. The gap is estimation, not
+   side-selection. (This is the mechanical reason behind the 2026-05-27
+   closure's "estimator is structurally inadequate" finding.)
+2. **Row-count stats ARE plumbed** (`EmatixFastParquetTableProvider` reports
+   Exact num_rows and Exact column min/max, including Date32). The failure is
+   downstream: **DataFusion 53's `FilterExec` selectivity interval analysis
+   does not support Date32** (`datafusion-physical-expr-53.1.0/src/intervals/
+   utils.rs::is_datatype_supported` = Int/UInt/Float only), so every TPC-H
+   date-range predicate — `check_support` fails for the whole conjunction —
+   gets the flat 20% `default_selectivity` despite Exact Date32 bounds being
+   present. Q10's window is 92d over a 2405d span ≈ 3.8% → interval-true
+   estimate ~573k, exactly the runtime probe.
+3. **Q08's inversion is the string-Eq NDV shape, not the date shape** (its
+   2-of-7-year window ≈ 30% is *less* selective than the 20% default), and is
+   already fixed by shipped REV.19 `EMAT_NDV_BUILD_SIDE=1` (verified: Q08
+   depth-12 AND depth-15 both swap; plan changes exactly as the spec asked).
+4. **In the FAITHFUL production-preset path the Q10 target join is already an
+   `EmatixHashJoinExec` in CollectLeft mode** (HJ.3/late-mat planner), so no
+   stock Partitioned `HashJoinExec` exists there for any swap rule to fix —
+   flag on/off is plan-identical in `tpch_preset_rebench`. The arm matters
+   for the canonical validate/library chain (stock DF join path).
+
+### What shipped (smallest safe slice)
+
+`EMAT_DATE_BUILD_SIDE=1` (default OFF) — a Date32-range analog of REV.19 as a
+new arm on the EXISTING `ForceCollectLeftForSemiBoundedBuildRule` walker (no
+new rule install, per `[[optimizer-codegen-sensitivity]]`): re-base each
+side's reported `num_rows` by the true `window/span` selectivity of subtree
+Date32 range filters (corrections only ever shrink, cap 1.0; guarded on
+`!check_support` so a future DataFusion adding Date32 intervals cannot
+double-correct), swap via `swap_inputs(Partitioned)` (Inner-only, schema
+re-projected) when corrected build ≥ 2× corrected probe
+(`EMAT_DATE_BUILD_SIDE_RATIO`).
+
+Evidence: Q10 SF=10 corrected probe = 573,566 (true 573.2K, <0.1% off) →
+swap fires; EXPLAIN ANALYZE `build_input_rows` 1.50M → 573.2K and join
+`elapsed_compute` 233ms → 82ms (−65% join-local CPU). Process wall single
+trials within noise (±30ms) — consistent with the § 4 closure finding that
+pure side-swap wall wins are modest; the SF=100 RSS angle (309.4 MB
+`build_mem_used` for the mis-ordered build) is the likelier payoff and is
+unmeasured. Results identical: 22/22 tpch_validate PASS at SF=1 flag ON;
+Q08+Q10 PASS (381,105 rows) at SF=10 flag ON. Q08 correctly unchanged under
+the date flag alone; composes cleanly with `EMAT_NDV_BUILD_SIDE=1`.
+
+### Remaining work
+
+- **A/B gate before any default-ON talk**: strict interleaved 22q at SF=10
+  (`scripts/bench/strict_ab.sh`) + SF=100 Q08/Q10 RSS measurement — the spec's
+  SF=100 "RSS-heavy mis-ordered builds" claim is the real prize and untested.
+- **Date correction is probe-revealing only at > 20% windows**: Q08-like
+  2-year windows cap at 1.0 by design. If those matter, the honest fix is
+  real interval math (upstream DataFusion Date32 support, or absolute
+  `window/span` estimation rather than default-relative correction).
+- **Composition**: NDV and date corrections currently apply in separate arms
+  (NDV wins ties by running first); folding both factors into one corrected
+  estimate would let mixed string+date chains (Q08 probe subtree) clear the
+  2× margin with sharper numbers.
+- **Q07/Q09/Q14**: not re-audited beyond § 4; Q09 remains blocked on LIKE
+  selectivity (Σ.AH.7 candidate).
+- **Preset-path coverage**: if the production preset should benefit, the
+  equivalent correction belongs in the `EmatixHashJoinExec` build-side pick /
+  HJ.3 gate, not this rule.
 
 ## ~~4. If Outcome A — what shipping looks like~~ (NOT TAKEN)
 
