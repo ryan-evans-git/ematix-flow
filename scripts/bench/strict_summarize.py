@@ -22,6 +22,7 @@ formatting per row, like:
 """
 
 import argparse
+import json
 import os
 import re
 import statistics
@@ -54,7 +55,20 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--discard-first", action="store_true",
                     help="exclude the first run (catches cold-start)")
     ap.add_argument("--out", required=True, help="write summary to this path")
+    ap.add_argument("--env-json", default=None,
+                    help="env.json from strict_common.sh capture_env; embeds "
+                         "machine/flag metadata in the summary header so no "
+                         "result table is machine-ambiguous")
     args = ap.parse_args(argv)
+
+    env = None
+    if args.env_json:
+        if not os.path.exists(args.env_json):
+            print(f"ERROR: --env-json file not found: {args.env_json}",
+                  file=sys.stderr)
+            return 2
+        with open(args.env_json) as f:
+            env = json.load(f)
 
     runs = sorted(args.runs)
     if len(runs) < 2:
@@ -106,7 +120,27 @@ def main(argv: list[str]) -> int:
 
     # Write summary.
     with open(args.out, "w") as f:
-        f.write("# Σ.AI.1 strict 22q SF=10 bench summary\n\n")
+        f.write("# Σ.AI.1 strict 22q bench summary\n\n")
+        if env:
+            # Run-scoped keys (sf, plan_cache, cache_policy) may sit at the
+            # top level or under "run" depending on the capture path.
+            run = {**env, **env.get("run", {})}
+            sf = run.get("sf", "?")
+            f.write(f"- Machine: {env.get('chip', '?')} "
+                    f"({env.get('perf_cores', '?')}P+"
+                    f"{env.get('efficiency_cores', '?')}E), "
+                    f"macOS {env.get('macos', '?')}, "
+                    f"power: {env.get('power_source', '?')}\n")
+            f.write(f"- Git: {env.get('git_sha', '?')[:12]} on "
+                    f"{env.get('git_branch', '?')} "
+                    f"(dirty: {env.get('git_dirty', '?')})\n")
+            f.write(f"- Data: SF={sf}; plan cache: "
+                    f"{run.get('plan_cache', '?')}; cache policy: "
+                    f"{run.get('cache_policy', '?')}\n")
+            f.write(f"- Engines: {env.get('engine_versions', {})}\n")
+            emat = {k: v for k, v in env.get("emat_env", {}).items()
+                    if k.startswith("EMAT_")}
+            f.write(f"- EMAT flags: {emat or '<none>'}\n\n")
         f.write(f"- Runs aggregated: {len(parsed)} of {len(runs) + len(discarded)} "
                 f"(discarded {len(discarded)} cold-start: "
                 f"{[os.path.basename(d) for d in discarded]})\n")
