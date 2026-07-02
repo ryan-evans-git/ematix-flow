@@ -1,5 +1,20 @@
 # Campaign report — 2026-07-01/02 (integration/campaign-2026-07-01)
 
+> **2026-07-02 ADDENDUM — superseded SF=100 verdicts.** After this
+> campaign, two follow-up arcs landed on main: (1) the Q18 dig found the
+> bench chain was missing production-default `ClusteredSinglePhaseAggRule`
+> (RANGE.AGG) — §1's SF=100 table under-states ematix on RANGE.AGG-eligible
+> shapes; (2) scale-gated auto defaults (row-count tri-state gating) plus
+> the `Bound::I64onI32` bloom-binding fix that turned the Q08 ALL-ON
+> hazard into a win. The corrected, quotable SF=100 standing lives in
+> `bench-results/final-sweep-2026-07-02/`: **auto defaults vs forced-off =
+> 16 clear wins / 1 tiny regression (Q15 +19.5 ms), net −8.3%**; **vs
+> DuckDB = 16 wins / 4 losses (Q01 −214, Q05 −331, Q16 −16, Q18 −283 ms)
+> / 2 noise**, ematix net +10.4% on sum-of-medians. SF=10 auto-vs-off is
+> noise-identical (gate correctly dormant). EMAT_L9_PARTITIONED re-checked
+> post-fix: still net-negative on Q08, stays opt-in. Q18's remaining
+> −283 ms has a designed arc (RANGE.AGG Stage 2, docs/PERF_Q18.md).
+
 **Machine:** Apple M4 Max (10P+4E, 36 GB), macOS 26.5.1, AC power.
 **Protocol:** strict harness only (`scripts/bench/README.md`) — solo-engine
 passes, per-query process isolation, thermal gating, plan cache OFF,
