@@ -61,6 +61,12 @@ pub mod fd_aggregate;
 // FdAggregateExec — single-phase SUM GROUP BY grouping on an FD-minimal key subset of
 // the group exprs. Requires HashPartitioned([key subset]) input; opt-in rule installs it.
 pub mod fd_aggregate_exec;
+// Σ.AH.5: functional-dependency GROUP BY simplifier — when a declared-unique
+// group column provably determines every other group column, group by it
+// alone and re-attach the determined columns after aggregation (min carriers
+// + a restoring projection). Plan-shape-preserving sibling of late_mat_agg.
+// Opt-in via EMAT_FD_GROUPBY=1.
+pub mod fd_groupby_simplify;
 // HJ.3: pre-plan rule that swaps stock HashJoinExec → EmatixHashJoinExec
 // on the validated shape (Inner, CollectLeft, single i64 key). Opt-in
 // via EMAT_HASH_JOIN=1.

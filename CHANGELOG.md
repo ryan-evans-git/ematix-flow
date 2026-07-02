@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Σ.AH.5 functional-dependency GROUP BY simplifier (opt-in
+  `EMAT_FD_GROUPBY=1`).** When a single declared-unique group column (a
+  declared PK) provably determines every other group column — via the
+  schema-FD closure for same-table columns plus the PK-fold argument for
+  dims joined on their own single-column PK — the aggregate groups on that
+  anchor alone and re-attaches the determined columns after aggregation
+  (`min` carriers + a restoring projection). TPC-H Q10's 7-column group key
+  (5 wide strings + `n_name` + `c_custkey`) reduces to the single i64
+  `c_custkey` and the aggregate collapses to single-phase
+  `SinglePartitioned`. Fires only on the proven shape (negative-tested: no
+  PK, FK-joined undetermined columns, composite PKs all bail); inert without
+  declared PKs; takes precedence over the default-on late-mat rule when both
+  are eligible. Correctness: plan-diff tests, `tpch_validate` 22/22 at SF=1
+  with the flag on, Q10 SF=10 value-match vs DuckDB. Ships opt-in pending
+  the canonical bench gate (informal SF=10 sanity is neutral-to-slightly
+  faster vs the stock 7-column hash).
+
 - **Scalar-aggregation partition oversubscription (default-on; morsel-engine
   down-payment).** A query whose result is a scalar aggregation — no `GROUP BY`
   (TPC-H Q06/Q14/Q17/Q19) — plans with oversubscribed `target_partitions` so

@@ -438,11 +438,30 @@ async fn run_ematix(
     ));
     let state = builder.build();
     let ctx = SessionContext::new_with_state(state);
+    // Σ.AH.5: the FD group-by simplifier needs the PK-derived FDs to fire, so
+    // validating it (EMAT_FD_GROUPBY=1) declares the TPC-H primary keys —
+    // harness scaffolding like tpch_preset_rebench's EMAT_TPCH_PK (a real
+    // catalog declares PKs via DDL; the shipped library has no TPC-H
+    // hardcoding). Off by default → the baseline registration is unchanged.
+    let fd_groupby = ematix_flow_core::fd_groupby_simplify::enabled();
+    let tpch_pk = |t: &str| -> Option<Vec<usize>> {
+        Some(match t {
+            "region" | "nation" | "supplier" | "customer" | "part" | "orders" => vec![0],
+            "partsupp" => vec![0, 1], // (ps_partkey, ps_suppkey)
+            "lineitem" => vec![0, 3], // (l_orderkey, l_linenumber)
+            _ => return None,
+        })
+    };
     for t in TPCH_TABLES {
         let path = data_dir.join(format!("{t}.parquet"));
         let use_emat = l15 || *t == "lineitem" || *t == "orders";
         if use_emat {
-            let prov = EmatixFastParquetTableProvider::try_new(path.to_string_lossy())?;
+            let mut prov = EmatixFastParquetTableProvider::try_new(path.to_string_lossy())?;
+            if fd_groupby {
+                if let Some(pk) = tpch_pk(t) {
+                    prov = prov.with_primary_key(pk);
+                }
+            }
             ctx.register_table(*t, Arc::new(prov))?;
         } else {
             let prov = FastParquetTableProvider::try_new(path.to_string_lossy())?;
@@ -492,6 +511,15 @@ async fn run_ematix(
             ematix_flow_core::agg_filter_pushdown::push_transitive_dim_semi_into_join_chain(
                 optimized,
             )?
+        } else {
+            optimized
+        };
+        // Σ.AH.5 (EMAT_FD_GROUPBY=1, default OFF): value-validate the FD
+        // group-by simplifier the same way the walkers above are validated —
+        // apply the pure rewrite to the optimized plan (fires on the proven
+        // unique-key shape only; None everywhere else).
+        let optimized = if ematix_flow_core::fd_groupby_simplify::enabled() {
+            ematix_flow_core::fd_groupby_simplify::simplify(&optimized).unwrap_or(optimized)
         } else {
             optimized
         };

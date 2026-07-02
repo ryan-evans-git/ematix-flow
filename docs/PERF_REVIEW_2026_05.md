@@ -202,6 +202,30 @@ Q20/Q21 PASS. Bench gate runs with the Σ.AH.2 A/B campaign.
 
 **Bench gate:** Q10 wall drop ≥ 30 ms AND 22q geomean stable.
 
+**Status (2026-07-01): LANDED as opt-in `EMAT_FD_GROUPBY=1`**
+(`fd_groupby_simplify.rs`; `feat/sigma-ah5-fd-groupby`). The v1 slice: when a
+single declared-unique group column provably determines every other group
+column — schema-FD closure (same-table) + the prod-B PK-fold argument (dims
+joined via their own single-col PK, which covers Q10's `n_name`) — the
+Aggregate groups on the anchor ALONE and the determined columns ride as `min`
+carriers with a restoring projection. Q10: 7-col key → single i64 `c_custkey`,
+and the agg collapses to single-phase `SinglePartitioned` (the input is
+already hash-partitioned on the anchor) — no Partial+FinalPartitioned split.
+Plan-shape-preserving sibling of the late-mat rule (which had landed
+default-on since this review and covers Q10's SF=100 RSS problem); fd-groupby
+takes precedence over late-mat when both are eligible. Correct: plan-diff +
+negative tests, `tpch_validate` 22/22 SF=1 and Q10 SF=10 vs DuckDB.
+**Informal SF=10 sanity (contended box, NOT the bench gate):** interleaved
+3-trial medians fd-groupby 187/192/197 ms vs stock-7-col 184/199/208 ms —
+neutral-to-slightly-faster; the spec'd ~50 ms did not materialize at SF=10
+because the `min` carriers still touch the wide strings per input row (the
+strings leave the hash key but not the aggregate input). REMAINING for the
+full arc: (1) the canonical 20×3 bench gate + SF=100 A/B vs late-mat before
+any default-on consideration; (2) partial key reduction (reduce without full
+coverage, e.g. `[c_custkey, n_name]` when a dim PK is undeclared); (3)
+composite-key anchors; (4) chains with residual non-equi join filters
+(conservatively bailed today); (5) Q13 analysis (structurally different).
+
 ---
 
 ### Σ.AH.6 — Σ.AE.2 selectivity-gate tune for 30% band

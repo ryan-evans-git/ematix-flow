@@ -77,6 +77,7 @@ Read in `src/`, default-OFF. Enable with `=1` (or, where noted, presence).
 | `EMAT_DOWNCAST_KEYS` | off (set to enable) | `.is_some()` | [ematix_fast_parquet.rs:1928](../crates/ematix-flow-core/src/ematix_fast_parquet.rs) | Downcast i64 flow-side join keys to i32 at decode. |
 | `EMAT_DROP_REDUNDANT_FILTER` | off (set to enable) | `.is_some()` | [drop_redundant_filter_rule.rs:135](../crates/ematix-flow-core/src/drop_redundant_filter_rule.rs) | Drop a filter made redundant by a fused scan predicate. |
 | `EMAT_EXACT_PUSHDOWN` | off (set to enable) | `.is_some()` | [ematix_fast_parquet.rs:2588](../crates/ematix-flow-core/src/ematix_fast_parquet.rs) | Σ.AE: exact (vs conservative) predicate pushdown into the scan. |
+| `EMAT_FD_GROUPBY` | off (set =1) | `opt_in()` | [fd_groupby_simplify.rs](../crates/ematix-flow-core/src/fd_groupby_simplify.rs) | Σ.AH.5: FD GROUP BY simplifier — when a declared-unique group column provably determines every other group column (schema FDs + dim PK-fold), group by it alone and re-attach the rest post-agg (min carriers + restoring projection). Q10: 7-col key → single i64 c_custkey. Needs declared PKs; plan-shape-preserving sibling of `EMAT_LATE_MAT_AGG` (takes precedence when both eligible). |
 | `EMAT_FILTER_MULTI_AGG_USE_REPARTITION` | off (set to enable) | `.is_some()` | [fused_aggregate_filter_multi_agg_rule.rs:371](../crates/ematix-flow-core/src/fused_aggregate_filter_multi_agg_rule.rs) | A/B: use RepartitionExec-based fanout for the fused filter→multi-agg. |
 | `EMAT_FORCE_PARALLEL_BITMAP` | off (set to enable) | `.is_some()` | [emat_arrow_reader.rs:1225](../crates/ematix-flow-core/src/emat_arrow_reader.rs) | Force parallel bitmap dispatch (L13: default-off — was 43× regression on lineitem+date). |
 | `EMAT_INLINE_STREAMING` | off (set =1) | `== "1"/"true"` | [ematix_fast_parquet.rs:3662](../crates/ematix-flow-core/src/ematix_fast_parquet.rs) | Force the inline (eager) reader path (overrides the auto inline/page dispatch). |
@@ -251,12 +252,12 @@ production rule, the harness toggles it before constructing rules manually.
 | Bucket | Count |
 | --- | --- |
 | Production gate (default-ON) | 18 |
-| Production gate (opt-in) | 27 |
+| Production gate (opt-in) | 28 |
 | Numeric tunable | 41 |
 | Diagnostic / trace | 21 |
 | Bench-harness only | 48 |
 | Comment-only (possibly dead) | 1 |
-| **Grand total (distinct flags)** | **156** |
+| **Grand total (distinct flags)** | **157** |
 
 > `EMAT_FAST_SNAPPY` is counted once, under Comment-only.
 > `EMAT_MI_COLLECT` is placed under Diagnostic/trace (allocator-operational,
