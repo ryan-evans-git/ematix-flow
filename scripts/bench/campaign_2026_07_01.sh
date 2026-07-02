@@ -82,10 +82,14 @@ ab() {
     local dir="$OUT/ab-sf10-$name"
     phase_done "$dir/diff.md" && return 0
     log "phase A/B SF=10: $name  [$envb]"
-    local qflag=()
-    [[ -n "$queries" ]] && qflag=(--queries "$queries")
-    "$SB/strict_ab.sh" --sf 10 --env-b "$envb" "${qflag[@]}" \
-        --out "$dir" >> "$LOG" 2>&1
+    # macOS ships bash 3.2, where "${empty[@]}" trips set -u — branch instead.
+    if [[ -n "$queries" ]]; then
+        "$SB/strict_ab.sh" --sf 10 --env-b "$envb" --queries "$queries" \
+            --out "$dir" >> "$LOG" 2>&1
+    else
+        "$SB/strict_ab.sh" --sf 10 --env-b "$envb" \
+            --out "$dir" >> "$LOG" 2>&1
+    fi
     grep -E "faster|WIN|regression|^\*\*Net" "$dir/diff.md" | tail -5 | tee -a "$LOG"
 }
 ab l9-partitioned "EMAT_L9_PARTITIONED=1"
