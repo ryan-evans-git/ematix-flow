@@ -286,6 +286,10 @@ pub mod workload_log;
 // twice. Scaffolding lands here; full scan-path integration is a
 // follow-up bite.
 pub mod scan_cache;
+// Σ.AI.5 (2026-07-02): dataset scale classification (table row-count
+// stats, the PR #159 convention) backing the scale-gated lever defaults
+// recommended by the 2026-07-01 campaign. See `flags::scale_gated_large`.
+pub mod scale_class;
 // Σ.L.5 (2026-05-21): workload-aware parquet write tuning. Reads
 // Σ.L.2's workload.db, emits recommendations for row-group size,
 // sort keys, bloom columns, dict columns, and compression codec.
