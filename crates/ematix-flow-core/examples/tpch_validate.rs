@@ -421,6 +421,9 @@ async fn run_ematix(
                 require_filtered_build: true,
                 max_expected_keys_per_partition: 0,
                 min_probe_proj_cols: 0,
+                // Σ.AH.2: env-resolved NDV ceiling (EMAT_L9_NDV_MAX_ROWS /
+                // EMAT_L9_PARTITIONED) + any future fields track the default.
+                ..EnableRuntimeBloomSidebandRule::default()
             }
         } else {
             EnableRuntimeBloomSidebandRule::default()

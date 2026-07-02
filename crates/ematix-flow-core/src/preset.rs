@@ -201,6 +201,10 @@ pub fn with_optimizer_rules_and_registry(
             // L9.WIDTH (2026-06-10): probe-payoff gate, env-defaulted (4).
             // See the field docs in runtime_bloom_sideband_rule.rs.
             min_probe_proj_cols: EnableRuntimeBloomSidebandRule::default().min_probe_proj_cols,
+            // Σ.AH.2 (2026-07-01): NDV-walk file ceiling, env-defaulted
+            // (10M; 32M under the EMAT_L9_PARTITIONED=1 opt-in so SF=100
+            // dimensions stay NDV-correctable). See the field docs.
+            ndv_max_rows: EnableRuntimeBloomSidebandRule::default().ndv_max_rows,
         }));
     // Σ.AJ.1 Lever B POC: opt-in via EMAT_L9_BROADCAST_SIBLINGS=1.
     // Default OFF. See `crates/ematix-flow-core/src/broadcast_sibling_blooms_rule.rs`.

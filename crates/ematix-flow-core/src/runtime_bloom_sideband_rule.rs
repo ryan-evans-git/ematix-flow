@@ -118,6 +118,50 @@ pub struct EnableRuntimeBloomSidebandRule {
     /// blocks Q17's losers only). Override via
     /// `EMAT_L9_MIN_PROBE_PROJ_COLS=N`.
     pub min_probe_proj_cols: usize,
+    /// Σ.AH.2 (2026-07-01) — file-size ceiling (in rows) for the
+    /// rule-local dict-page NDV walk that feeds the tight-cardinality
+    /// selectivity estimate. Files above the ceiling refuse the walk, so
+    /// their string-Eq filter selectivity falls back to DataFusion's 0.2
+    /// default — which is exactly what keeps the Q08 SF=100 part_filt →
+    /// lineitem edge un-bloomed: part at SF=100 is 20M rows > the 10M
+    /// default, so `p_type = '…'` estimates 20M × 0.2 = 4M and the 1024×
+    /// ratio gate rejects a true-267K build against a 600M probe (real
+    /// ratio ≈ 2250, comfortably in the bloom regime). The Partitioned-
+    /// scale opt-in (`EMAT_L9_PARTITIONED=1`) raises the resolved default
+    /// to 32M — admitting every SF=100 dimension (part 20M, customer 15M)
+    /// while still refusing the facts (lineitem 60M+ at SF≥10, partsupp
+    /// 80M, orders 150M at SF=100), preserving the original "dimensions
+    /// yes, facts no" intent one scale up. An explicit
+    /// `EMAT_L9_NDV_MAX_ROWS=N` always wins over both defaults.
+    pub ndv_max_rows: usize,
+}
+
+/// Σ.AH.2 — the flag-off NDV-walk ceiling (dimensions at SF≤10).
+const DEFAULT_L9_NDV_MAX_ROWS: usize = 10_000_000;
+/// Σ.AH.2 — the `EMAT_L9_PARTITIONED=1` ceiling (dimensions at SF=100).
+const PARTITIONED_SCALE_L9_NDV_MAX_ROWS: usize = 32_000_000;
+
+/// Σ.AH.2 — resolve the NDV-walk ceiling from an explicit override +
+/// the Partitioned-scale opt-in. Pure so tests can pin the semantics
+/// without racing on process-global env vars.
+fn resolve_l9_ndv_max_rows(explicit: Option<usize>, partitioned_scale: bool) -> usize {
+    match explicit {
+        Some(n) => n,
+        None if partitioned_scale => PARTITIONED_SCALE_L9_NDV_MAX_ROWS,
+        None => DEFAULT_L9_NDV_MAX_ROWS,
+    }
+}
+
+/// Σ.AH.2 — env-resolved NDV-walk ceiling: explicit
+/// `EMAT_L9_NDV_MAX_ROWS=N` wins; else 32M under `EMAT_L9_PARTITIONED=1`;
+/// else 10M.
+pub(crate) fn l9_ndv_max_rows() -> usize {
+    resolve_l9_ndv_max_rows(
+        std::env::var("EMAT_L9_NDV_MAX_ROWS")
+            .ok()
+            .and_then(|s| s.parse().ok()),
+        crate::flags::opt_in("EMAT_L9_PARTITIONED"),
+    )
 }
 
 impl Default for EnableRuntimeBloomSidebandRule {
@@ -156,6 +200,9 @@ impl Default for EnableRuntimeBloomSidebandRule {
             require_filtered_build,
             max_expected_keys_per_partition,
             min_probe_proj_cols,
+            // Σ.AH.2 — see the field docs; explicit EMAT_L9_NDV_MAX_ROWS
+            // wins, else EMAT_L9_PARTITIONED=1 raises 10M → 32M.
+            ndv_max_rows: l9_ndv_max_rows(),
         }
     }
 }
@@ -463,12 +510,12 @@ impl PhysicalOptimizerRule for EnableRuntimeBloomSidebandRule {
                 // Pre-gates pass — NOW pay the NDV stats walk.
                 let tight_admit = if build_has_semi {
                     Some(
-                        estimate_build_rows_mode(build.as_ref(), true)
+                        estimate_build_rows_mode(build.as_ref(), true, self.ndv_max_rows)
                             .unwrap_or(10_000)
                             .min(10_000),
                     )
                 } else {
-                    estimate_build_rows_mode(build.as_ref(), true)
+                    estimate_build_rows_mode(build.as_ref(), true, self.ndv_max_rows)
                 };
                 if tight_admit.is_none() || ratio_rejects(tight_admit) {
                     // L9.DIMSEL rescue (opt-in): the NDV ratio still rejects on
@@ -537,9 +584,10 @@ impl PhysicalOptimizerRule for EnableRuntimeBloomSidebandRule {
                 // set cap so any semi-bounded build the rescue admits
                 // fits without saturating. Uncapped == admitted when no
                 // cap applied (Q08's 13K wrap stays byte-identical).
-                let tight_size = estimate_build_rows_uncapped(build.as_ref(), true)
-                    .unwrap_or(524_288)
-                    .max(tight_admit.unwrap_or(0));
+                let tight_size =
+                    estimate_build_rows_uncapped(build.as_ref(), true, self.ndv_max_rows)
+                        .unwrap_or(524_288)
+                        .max(tight_admit.unwrap_or(0));
                 build_rows = Some(tight_size);
                 tight_only = true;
             }
@@ -855,7 +903,9 @@ fn estimate_probe_scan_rows(scan: &EmatixFastParquetExec) -> Option<usize> {
 /// consulted NDV stats on every join of every query and re-sized
 /// default-admitted wraps' expected_keys, both measured regressions.
 fn estimate_build_rows(plan: &dyn ExecutionPlan) -> Option<usize> {
-    estimate_build_rows_mode(plan, false)
+    // Σ.AH.2 — the ceiling is inert on the default (stats-only) path;
+    // pass the flag-off constant for clarity.
+    estimate_build_rows_mode(plan, false, DEFAULT_L9_NDV_MAX_ROWS)
 }
 
 /// L9.ADAPT — is the tight (NDV) rescue enabled? **DEFAULT ON** as of
@@ -977,7 +1027,11 @@ fn tight_probe_bundle_fused_evaluable(
     statics_ok && projection.contains(&probe_scan_col_idx)
 }
 
-fn estimate_build_rows_mode(plan: &dyn ExecutionPlan, tight: bool) -> Option<usize> {
+fn estimate_build_rows_mode(
+    plan: &dyn ExecutionPlan,
+    tight: bool,
+    ndv_max_rows: usize,
+) -> Option<usize> {
     // L9.EST (2026-06-10): structural caps for builds whose true output the
     // statistics CANNOT see. The fresh Q18 SF=10 trace showed the estimator
     // crediting a `Filter(sum(qty)>300)`-over-Aggregate build with the raw
@@ -991,7 +1045,8 @@ fn estimate_build_rows_mode(plan: &dyn ExecutionPlan, tight: bool) -> Option<usi
     // estimator so every consumer (ratio gate, expected_keys sizing) agrees.
     const SELECTIVE_SHAPE_CAP: usize = 10_000;
     if build_top_is_selective_shape(plan) {
-        let est = estimate_build_rows_uncapped(plan, tight).unwrap_or(SELECTIVE_SHAPE_CAP);
+        let est =
+            estimate_build_rows_uncapped(plan, tight, ndv_max_rows).unwrap_or(SELECTIVE_SHAPE_CAP);
         return Some(est.min(SELECTIVE_SHAPE_CAP));
     }
     // L9.ADAPT.Q05 (#352, TIGHT mode only): a semi join ANYWHERE in the
@@ -1005,10 +1060,11 @@ fn estimate_build_rows_mode(plan: &dyn ExecutionPlan, tight: bool) -> Option<usi
     // and a wrongly-capped admit is bounded by the rescue pre-gates +
     // the Guard-2 runtime disarm.
     if tight && subtree_has_semi_filter_dyn(plan) {
-        let est = estimate_build_rows_uncapped(plan, tight).unwrap_or(SELECTIVE_SHAPE_CAP);
+        let est =
+            estimate_build_rows_uncapped(plan, tight, ndv_max_rows).unwrap_or(SELECTIVE_SHAPE_CAP);
         return Some(est.min(SELECTIVE_SHAPE_CAP));
     }
-    estimate_build_rows_uncapped(plan, tight)
+    estimate_build_rows_uncapped(plan, tight, ndv_max_rows)
 }
 
 /// `build_subtree_has_semi_filter` over a `&dyn` plan (the estimator
@@ -1078,7 +1134,11 @@ fn first_shaping_node_is_aggregate(p: &dyn ExecutionPlan) -> bool {
     p.as_any().downcast_ref::<AggregateExec>().is_some()
 }
 
-fn estimate_build_rows_uncapped(plan: &dyn ExecutionPlan, tight: bool) -> Option<usize> {
+fn estimate_build_rows_uncapped(
+    plan: &dyn ExecutionPlan,
+    tight: bool,
+    ndv_max_rows: usize,
+) -> Option<usize> {
     // L9.EST (2026-06-10) / L9.ADAPT (2026-06-11): the emat-stats path
     // (NDV-corrected string-eq selectivity, backed by the rule-local lazy
     // dict-page walk — `local_dict_ndv` — so the global stats
@@ -1094,7 +1154,7 @@ fn estimate_build_rows_uncapped(plan: &dyn ExecutionPlan, tight: bool) -> Option
     // `tight_peek_budget_ms` publish-wait budget (Q02-class: a fast scan
     // must not stall behind a slow subquery build).
     if tight {
-        if let Some(tight_est) = estimate_build_rows_via_emat_stats(plan) {
+        if let Some(tight_est) = estimate_build_rows_via_emat_stats(plan, ndv_max_rows) {
             return Some(tight_est);
         }
     }
@@ -1120,12 +1180,15 @@ fn estimate_build_rows_uncapped(plan: &dyn ExecutionPlan, tight: bool) -> Option
 /// column_stats (which carry accurate `distinct_count` from dict
 /// pages — Story 1'.2). Returns `None` for any other shape so the
 /// caller falls back to the standard partition_statistics path.
-fn estimate_build_rows_via_emat_stats(plan: &dyn ExecutionPlan) -> Option<usize> {
+fn estimate_build_rows_via_emat_stats(
+    plan: &dyn ExecutionPlan,
+    ndv_max_rows: usize,
+) -> Option<usize> {
     let predicate = find_filter_predicate(plan)?;
     let (raw, column_stats, scan_meta) = find_emat_scan_stats(plan)?;
     let sel = estimate_filter_selectivity_via_emat_stats(&predicate, &column_stats, &|proj_idx| {
         let file_idx = scan_meta.projection.get(proj_idx).copied()?;
-        local_dict_ndv(&scan_meta.path, raw, file_idx)
+        local_dict_ndv(&scan_meta.path, raw, file_idx, ndv_max_rows)
     });
     Some(((raw as f64 * sel).round() as usize).max(1))
 }
@@ -1138,13 +1201,15 @@ fn estimate_build_rows_via_emat_stats(plan: &dyn ExecutionPlan) -> Option<usize>
 /// CollectLeft and regresses Q08 +15%). This helper gives the L9 gate the
 /// same truth WITHOUT writing it into the stats the planner reads: it walks
 /// the dict-page headers lazily (header-only, no decompress), memoizes per
-/// file, and refuses files larger than `EMAT_L9_NDV_MAX_ROWS` (default 10M
-/// — dimensions yes, facts no) so plan-time cost stays microscopic.
-fn local_dict_ndv(path: &str, file_rows: usize, col_idx: usize) -> Option<usize> {
+/// file, and refuses files larger than `max_rows` so plan-time cost stays
+/// microscopic. Σ.AH.2: the ceiling is resolved by the caller (rule field
+/// `ndv_max_rows` — explicit `EMAT_L9_NDV_MAX_ROWS` override, else 32M under
+/// `EMAT_L9_PARTITIONED=1`, else 10M — "dimensions yes, facts no" at the
+/// respective scale).
+fn local_dict_ndv(path: &str, file_rows: usize, col_idx: usize, max_rows: usize) -> Option<usize> {
     use std::collections::HashMap;
     use std::sync::Mutex;
     use std::sync::OnceLock;
-    let max_rows: usize = crate::flags::usize_or("EMAT_L9_NDV_MAX_ROWS", 10_000_000);
     if max_rows == 0 || file_rows > max_rows {
         return None;
     }
@@ -1430,6 +1495,7 @@ mod tests {
                 // Width gate off: fixtures are 1-2 column synthetic tables
                 // exercising the wrap mechanics, not the payoff heuristic.
                 min_probe_proj_cols: 0,
+                ndv_max_rows: DEFAULT_L9_NDV_MAX_ROWS,
             }))
             .build();
         let ctx = SessionContext::new_with_state(state);
@@ -1609,6 +1675,7 @@ mod tests {
                 // Width gate off: fixtures are 1-2 column synthetic tables
                 // exercising the wrap mechanics, not the payoff heuristic.
                 min_probe_proj_cols: 0,
+                ndv_max_rows: DEFAULT_L9_NDV_MAX_ROWS,
             }))
             .build();
         let ctx = SessionContext::new_with_state(state);
@@ -1691,6 +1758,7 @@ mod tests {
                 // Width gate off: fixtures are 1-2 column synthetic tables
                 // exercising the wrap mechanics, not the payoff heuristic.
                 min_probe_proj_cols: 0,
+                ndv_max_rows: DEFAULT_L9_NDV_MAX_ROWS,
             }))
             .build();
         let ctx = SessionContext::new_with_state(state);
@@ -1760,6 +1828,7 @@ mod tests {
                 // Width gate off: fixtures are 1-2 column synthetic tables
                 // exercising the wrap mechanics, not the payoff heuristic.
                 min_probe_proj_cols: 0,
+                ndv_max_rows: DEFAULT_L9_NDV_MAX_ROWS,
             }))
             .build();
         let ctx = SessionContext::new_with_state(state);
@@ -1845,6 +1914,7 @@ mod tests {
                 max_expected_keys_per_partition: 4,
                 // Width gate off: narrow synthetic fixtures.
                 min_probe_proj_cols: 0,
+                ndv_max_rows: DEFAULT_L9_NDV_MAX_ROWS,
             }))
             .build();
         let ctx = SessionContext::new_with_state(state);
@@ -1897,6 +1967,7 @@ mod tests {
                 max_expected_keys_per_partition: 1_000_000,
                 // Width gate off: narrow synthetic fixtures.
                 min_probe_proj_cols: 0,
+                ndv_max_rows: DEFAULT_L9_NDV_MAX_ROWS,
             }))
             .build();
         let ctx = SessionContext::new_with_state(state);
@@ -2141,8 +2212,8 @@ mod tests {
             !build_top_is_selective_shape(deep.as_ref()),
             "top is Inner — the existing top-shape cap must NOT cover this"
         );
-        let default_est = estimate_build_rows_mode(deep.as_ref(), false);
-        let uncapped = estimate_build_rows_uncapped(deep.as_ref(), false);
+        let default_est = estimate_build_rows_mode(deep.as_ref(), false, DEFAULT_L9_NDV_MAX_ROWS);
+        let uncapped = estimate_build_rows_uncapped(deep.as_ref(), false, DEFAULT_L9_NDV_MAX_ROWS);
         assert_eq!(
             default_est, uncapped,
             "DEFAULT mode must stay stats-only on deep-semi builds (v3 contract)"
@@ -2152,7 +2223,7 @@ mod tests {
             "test setup must make the uncapped estimate exceed the cap \
              (or be unresolvable) so the cap is observable, got {default_est:?}"
         );
-        let tight_est = estimate_build_rows_mode(deep.as_ref(), true);
+        let tight_est = estimate_build_rows_mode(deep.as_ref(), true, DEFAULT_L9_NDV_MAX_ROWS);
         assert!(
             tight_est.is_some_and(|e| e <= 10_000),
             "TIGHT mode must cap a deep-semi build at the Σ.AM.1 constant, got {tight_est:?}"
@@ -2161,8 +2232,8 @@ mod tests {
         // A semi-free Inner build must NOT take the tight cap.
         let no_semi = join(JoinType::Inner, mem_table_n(60_000), mem_table_n(60_000));
         assert_eq!(
-            estimate_build_rows_mode(no_semi.as_ref(), true),
-            estimate_build_rows_uncapped(no_semi.as_ref(), true),
+            estimate_build_rows_mode(no_semi.as_ref(), true, DEFAULT_L9_NDV_MAX_ROWS),
+            estimate_build_rows_uncapped(no_semi.as_ref(), true, DEFAULT_L9_NDV_MAX_ROWS),
             "tight mode must not cap semi-free builds"
         );
     }
@@ -2336,8 +2407,8 @@ mod tests {
         }
         let filter = find_filter(&plan).expect("plan must keep a FilterExec for ptype='v007'");
 
-        let est =
-            estimate_build_rows_via_emat_stats(filter.as_ref()).expect("estimate must resolve");
+        let est = estimate_build_rows_via_emat_stats(filter.as_ref(), DEFAULT_L9_NDV_MAX_ROWS)
+            .expect("estimate must resolve");
         assert!(
             est <= 60,
             "NDV-corrected estimate must be ~3000/150 = 20 (≤60 with rounding), got {est} — \
@@ -2438,6 +2509,357 @@ mod tests {
             single_dim_scan_total(plan.as_ref()),
             None,
             "two Emat scans → not a single-dimension build"
+        );
+    }
+
+    // ===== Σ.AH.2 — Partitioned-mode plan-diff pins =====
+    //
+    // The Σ.AH.2 arc shell (docs/plans/sigma-ah-arc-2.md) framed the work
+    // as "extend the CollectLeft-only emitter to Partitioned joins". The
+    // design doc (docs/PHASE_SIGMA_AH_2_DESIGN.md §2.3) refuted that: the
+    // rule pattern-matches join SHAPE, never PartitionMode, and the
+    // emitter's per-partition-bloom + all-drain OR-merge already handles
+    // N-partition builds. But nothing PINNED that — every optimize()-level
+    // test in this module runs a miniature join that the planner collapses
+    // to CollectLeft, so a future refactor could silently re-introduce a
+    // mode gate (or break the N-partition merge) without any test going
+    // red. These tests force PartitionMode::Partitioned (via the
+    // hash_join_single_partition_threshold knobs) on a Q08-shaped
+    // fixture — filtered small dim build ⋈ fact probe on an i64 key —
+    // and pin both the plan shape and the runtime publish.
+
+    /// Write a miniature "lineitem": `rows` rows, `l_partkey = i % n_keys`,
+    /// plus an i64 payload column.
+    fn write_fact_i64(path: &std::path::Path, rows: usize, n_keys: i64) {
+        let l_partkey: Vec<i64> = (0..rows as i64).map(|i| i % n_keys).collect();
+        let l_val: Vec<i64> = (0..rows as i64).collect();
+        write_table_to_path(
+            path,
+            &[
+                ("l_partkey", ColumnData::I64(&l_partkey)),
+                ("l_val", ColumnData::I64(&l_val)),
+            ],
+            CompressionCodec::Uncompressed,
+        )
+        .unwrap();
+    }
+
+    /// Q08-shaped miniature context: `part_t` (200 rows, `ptype` cycling
+    /// 10 values, `pkey` = row id) ⋈ `lineitem_t` (5000 rows, `l_partkey`
+    /// ∈ [0, 200)). `WHERE ptype = 'v07'` keeps 20 build keys; each key
+    /// matches 25 fact rows → 500 join rows. When `force_partitioned`,
+    /// the hash_join_single_partition_threshold knobs are zeroed so the
+    /// planner picks PartitionMode::Partitioned (the SF100 Q08/Q09 fact-
+    /// edge shape) instead of collapsing the tiny build to CollectLeft.
+    async fn q08_shaped_ctx(name: &str, force_partitioned: bool) -> SessionContext {
+        let part = tmp_parquet(&format!("{name}_part"));
+        let fact = tmp_parquet(&format!("{name}_fact"));
+        let ptypes: Vec<String> = (0..200).map(|i| format!("v{:02}", i % 10)).collect();
+        let ptype_refs: Vec<&str> = ptypes.iter().map(|s| s.as_str()).collect();
+        let pkeys: Vec<i64> = (0..200).collect();
+        write_utf8_parquet(&part, ("ptype", &ptype_refs), Some(("pkey", &pkeys)));
+        write_fact_i64(&fact, 5000, 200);
+
+        let mut cfg = SessionConfig::new().with_target_partitions(4);
+        if force_partitioned {
+            cfg.options_mut()
+                .optimizer
+                .hash_join_single_partition_threshold = 0;
+            cfg.options_mut()
+                .optimizer
+                .hash_join_single_partition_threshold_rows = 0;
+        }
+        let state = SessionStateBuilder::new()
+            .with_default_features()
+            .with_config(cfg)
+            .with_physical_optimizer_rule(Arc::new(EnableRuntimeBloomSidebandRule {
+                // Gate disabled for miniature data (the documented test
+                // convention); the fixture pins the WRAP MECHANISM on a
+                // Partitioned join, not the selectivity heuristic.
+                min_probe_to_build_ratio: 0,
+                allow_inner_join: true,
+                // Keep the preset's filtered-build requirement live —
+                // the Q08 shape (FilterExec in the build subtree) must
+                // satisfy it through the repartition the Partitioned
+                // planner inserts.
+                require_filtered_build: true,
+                max_expected_keys_per_partition: 0,
+                min_probe_proj_cols: 0,
+                ndv_max_rows: DEFAULT_L9_NDV_MAX_ROWS,
+            }))
+            .build();
+        let ctx = SessionContext::new_with_state(state);
+        ctx.register_table(
+            "part_t",
+            Arc::new(EmatixFastParquetTableProvider::try_new(part.to_string_lossy()).unwrap()),
+        )
+        .unwrap();
+        ctx.register_table(
+            "lineitem_t",
+            Arc::new(EmatixFastParquetTableProvider::try_new(fact.to_string_lossy()).unwrap()),
+        )
+        .unwrap();
+        ctx
+    }
+
+    const Q08_SHAPED_SQL: &str = "SELECT l_val FROM part_t \
+         JOIN lineitem_t ON pkey = l_partkey WHERE ptype = 'v07'";
+
+    /// Walk a physical plan collecting every node that satisfies `pred`.
+    fn find_nodes(
+        plan: &Arc<dyn ExecutionPlan>,
+        pred: &dyn Fn(&Arc<dyn ExecutionPlan>) -> bool,
+        out: &mut Vec<Arc<dyn ExecutionPlan>>,
+    ) {
+        if pred(plan) {
+            out.push(plan.clone());
+        }
+        for c in plan.children() {
+            find_nodes(c, pred, out);
+        }
+    }
+
+    /// Σ.AH.2 plan-diff — a PARTITIONED-mode Inner join meeting the L9
+    /// criteria (i64 equi-key, filtered build, Emat probe scan) gets the
+    /// bloom emitter, sized per-partition (N > 1), and the probe-side
+    /// scan (below the probe repartition) carries the sideband. Pins the
+    /// design-doc refutation: L9 is NOT CollectLeft-only.
+    #[tokio::test]
+    async fn partitioned_mode_join_gets_bloom_emitter() {
+        let ctx = q08_shaped_ctx("ah2_partitioned", true).await;
+        let df = ctx.sql(Q08_SHAPED_SQL).await.unwrap();
+        let plan = df.clone().create_physical_plan().await.unwrap();
+
+        // Fixture premise: the join must actually be Partitioned.
+        let mut joins = Vec::new();
+        find_nodes(
+            &plan,
+            &|n| n.as_any().downcast_ref::<HashJoinExec>().is_some(),
+            &mut joins,
+        );
+        assert!(!joins.is_empty(), "fixture must plan a HashJoinExec");
+        let hj = joins[0].as_any().downcast_ref::<HashJoinExec>().unwrap();
+        assert!(
+            matches!(
+                hj.partition_mode(),
+                datafusion::physical_plan::joins::PartitionMode::Partitioned
+            ),
+            "fixture premise broken: expected a Partitioned-mode join, got {:?}",
+            hj.partition_mode()
+        );
+
+        // The wrap must land on the Partitioned build side...
+        let mut emitters = Vec::new();
+        find_nodes(
+            &plan,
+            &|n| {
+                n.as_any()
+                    .downcast_ref::<BuildSideBloomEmitterExec>()
+                    .is_some()
+            },
+            &mut emitters,
+        );
+        assert_eq!(
+            emitters.len(),
+            1,
+            "expected exactly one L9 emitter on the Partitioned join, plan:\n{plan:?}"
+        );
+        // ...covering ALL N hash partitions (the per-partition local
+        // blooms + all-drain OR-merge path, not the CollectLeft N=1
+        // degenerate case).
+        let n_part = emitters[0].output_partitioning().partition_count();
+        assert!(
+            n_part > 1,
+            "Partitioned build must leave the emitter multi-partition (got {n_part})"
+        );
+
+        // And the probe-side Emat scan must carry the sideband.
+        let mut armed_scans = Vec::new();
+        find_nodes(
+            &plan,
+            &|n| {
+                n.as_any()
+                    .downcast_ref::<EmatixFastParquetExec>()
+                    .map(|s| s.runtime_sideband().is_some())
+                    .unwrap_or(false)
+            },
+            &mut armed_scans,
+        );
+        assert_eq!(
+            armed_scans.len(),
+            1,
+            "expected exactly one sideband-armed probe scan, plan:\n{plan:?}"
+        );
+    }
+
+    /// Σ.AH.2 runtime — executing the wrapped Partitioned join must (a)
+    /// produce exactly the unfiltered-join row count (the bloom is
+    /// selectivity-only; the residual join keeps results exact) and (b)
+    /// PUBLISH the merged bloom: every one of the N per-partition builds
+    /// drains, the locals OR-merge, and the sideband flips is_ready().
+    /// (b) is the Partitioned-specific mechanism — a lost or partial
+    /// merge would leave the sideband unpublished forever.
+    #[tokio::test]
+    async fn partitioned_mode_bloom_publishes_and_results_stay_exact() {
+        let ctx = q08_shaped_ctx("ah2_runtime", true).await;
+        let df = ctx.sql(Q08_SHAPED_SQL).await.unwrap();
+        let plan = df.create_physical_plan().await.unwrap();
+
+        let batches = datafusion::physical_plan::collect(plan.clone(), ctx.task_ctx())
+            .await
+            .unwrap();
+        let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        // 20 build keys ('v07' keeps pkey ≡ 7 mod 10) × 25 fact rows/key.
+        assert_eq!(rows, 500, "Partitioned-mode L9 wrap changed the result");
+
+        let mut emitters = Vec::new();
+        find_nodes(
+            &plan,
+            &|n| {
+                n.as_any()
+                    .downcast_ref::<BuildSideBloomEmitterExec>()
+                    .is_some()
+            },
+            &mut emitters,
+        );
+        assert_eq!(emitters.len(), 1, "fixture must wrap exactly one emitter");
+        let emitter = emitters[0]
+            .as_any()
+            .downcast_ref::<BuildSideBloomEmitterExec>()
+            .unwrap();
+        assert!(
+            emitter.sideband().is_ready(),
+            "all {} build partitions drained but the merged bloom never published",
+            emitters[0].output_partitioning().partition_count()
+        );
+    }
+
+    /// Σ.AH.2 control — the same fixture WITHOUT the forced-Partitioned
+    /// knobs collapses to CollectLeft and wraps identically. Paired with
+    /// the Partitioned test above, this pins that the rule treats the
+    /// two modes uniformly (mode never gates admission).
+    #[tokio::test]
+    async fn collect_left_join_wraps_identically() {
+        let ctx = q08_shaped_ctx("ah2_collectleft", false).await;
+        let df = ctx.sql(Q08_SHAPED_SQL).await.unwrap();
+        let plan = df.clone().create_physical_plan().await.unwrap();
+
+        let mut joins = Vec::new();
+        find_nodes(
+            &plan,
+            &|n| n.as_any().downcast_ref::<HashJoinExec>().is_some(),
+            &mut joins,
+        );
+        assert!(!joins.is_empty(), "fixture must plan a HashJoinExec");
+        let hj = joins[0].as_any().downcast_ref::<HashJoinExec>().unwrap();
+        assert!(
+            matches!(
+                hj.partition_mode(),
+                datafusion::physical_plan::joins::PartitionMode::CollectLeft
+            ),
+            "control premise broken: expected CollectLeft, got {:?}",
+            hj.partition_mode()
+        );
+        let s = format!("{plan:?}");
+        assert!(
+            s.contains("BuildSideBloomEmitterExec"),
+            "CollectLeft control must keep its wrap:\n{s}"
+        );
+        let batches = df.collect().await.unwrap();
+        let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(rows, 500, "CollectLeft control changed the result");
+    }
+
+    /// Σ.AH.2 — NDV-ceiling resolution semantics: an explicit
+    /// `EMAT_L9_NDV_MAX_ROWS` override always wins; otherwise
+    /// `EMAT_L9_PARTITIONED=1` raises 10M → 32M. The SF anchors pin the
+    /// "dimensions yes, facts no" intent at each scale: the flag-off
+    /// ceiling admits every SF=10 dimension (part 2M) but refuses
+    /// SF=100 part (20M) — the Q08 SF=100 loss mechanism — while the
+    /// flag-on ceiling admits SF=100 part/customer (20M/15M) and still
+    /// refuses the facts (lineitem 60M+ at SF≥10, partsupp 80M, orders
+    /// 150M at SF=100).
+    #[test]
+    fn resolve_ndv_ceiling_semantics() {
+        // Explicit override wins over both defaults.
+        assert_eq!(resolve_l9_ndv_max_rows(Some(123), false), 123);
+        assert_eq!(resolve_l9_ndv_max_rows(Some(123), true), 123);
+        // Flag defaults.
+        let off = resolve_l9_ndv_max_rows(None, false);
+        let on = resolve_l9_ndv_max_rows(None, true);
+        assert_eq!(off, DEFAULT_L9_NDV_MAX_ROWS);
+        assert_eq!(on, PARTITIONED_SCALE_L9_NDV_MAX_ROWS);
+        // Scale anchors.
+        assert!(2_000_000 <= off, "SF=10 part (2M) must stay admitted");
+        assert!(
+            20_000_000 > off,
+            "SF=100 part (20M) refused flag-off (the Q08 SF=100 gap)"
+        );
+        assert!(20_000_000 <= on, "SF=100 part (20M) admitted flag-on");
+        assert!(15_000_000 <= on, "SF=100 customer (15M) admitted flag-on");
+        assert!(59_986_052 > on, "SF=10 lineitem (60M) must stay refused");
+        assert!(80_000_000 > on, "SF=100 partsupp (80M) must stay refused");
+        assert!(150_000_000 > on, "SF=100 orders (150M) must stay refused");
+    }
+
+    /// Σ.AH.2 — the ceiling gates the tight NDV estimate end-to-end:
+    /// with the dim file ABOVE the ceiling the dict-page walk is
+    /// refused, string-Eq selectivity falls back to DataFusion's 0.2
+    /// default and the estimate balloons (3000 × 0.2 = 600 — the SF=100
+    /// Q08 condition in miniature, where 20M-row part → 4M → ratio
+    /// reject); with the file UNDER the ceiling the walk resolves 150
+    /// distinct values and the estimate tightens to ~3000/150 = 20
+    /// (which is what lets the real Q08 edge pass the 1024× gate).
+    #[tokio::test]
+    async fn ndv_ceiling_gates_tight_estimate() {
+        use datafusion::physical_plan::filter::FilterExec;
+
+        let path = tmp_parquet("ah2_ndv_ceiling");
+        let vals: Vec<String> = (0..3000).map(|i| format!("v{:03}", i % 150)).collect();
+        let val_refs: Vec<&str> = vals.iter().map(|s| s.as_str()).collect();
+        let keys: Vec<i64> = (0..3000).collect();
+        write_utf8_parquet(&path, ("ptype", &val_refs), Some(("pkey", &keys)));
+
+        let ctx = SessionContext::new();
+        let provider =
+            EmatixFastParquetTableProvider::try_new(path.to_string_lossy().to_string()).unwrap();
+        ctx.register_table("part_t", Arc::new(provider)).unwrap();
+        let df = ctx
+            .sql("SELECT pkey FROM part_t WHERE ptype = 'v007'")
+            .await
+            .unwrap();
+        let plan = ctx
+            .state()
+            .create_physical_plan(&df.into_optimized_plan().unwrap())
+            .await
+            .unwrap();
+        fn find_filter(plan: &Arc<dyn ExecutionPlan>) -> Option<Arc<dyn ExecutionPlan>> {
+            if plan.as_any().downcast_ref::<FilterExec>().is_some() {
+                return Some(plan.clone());
+            }
+            for c in plan.children() {
+                if let Some(f) = find_filter(c) {
+                    return Some(f);
+                }
+            }
+            None
+        }
+        let filter = find_filter(&plan).expect("plan must keep a FilterExec for ptype='v007'");
+
+        // Ceiling below the 3000-row file → walk refused → 0.2 fallback.
+        let above_ceiling = estimate_build_rows_via_emat_stats(filter.as_ref(), 1000)
+            .expect("estimate must still resolve via the 0.2 fallback");
+        assert_eq!(
+            above_ceiling, 600,
+            "a file above the NDV ceiling must fall back to 3000 × 0.2"
+        );
+        // Ceiling at the flag-off default → walk resolves → tight estimate.
+        let under_ceiling =
+            estimate_build_rows_via_emat_stats(filter.as_ref(), DEFAULT_L9_NDV_MAX_ROWS)
+                .expect("estimate must resolve");
+        assert!(
+            under_ceiling <= 60,
+            "under the ceiling the NDV-corrected estimate must be ~20, got {under_ceiling}"
         );
     }
 }

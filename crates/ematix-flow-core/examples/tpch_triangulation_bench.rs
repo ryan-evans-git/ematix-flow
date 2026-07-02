@@ -1801,6 +1801,9 @@ async fn build_ematix_ctx(
                     require_filtered_build,
                     max_expected_keys_per_partition: max_keys,
                     min_probe_proj_cols: 0,
+                    // Σ.AH.2: env-resolved NDV ceiling (EMAT_L9_NDV_MAX_ROWS /
+                    // EMAT_L9_PARTITIONED) + any future fields track the default.
+                    ..EnableRuntimeBloomSidebandRule::default()
                 }));
         }
     }
