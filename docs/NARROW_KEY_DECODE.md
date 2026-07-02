@@ -156,10 +156,13 @@ Strict A/B at SF=100 on the shared bench box, via
   untouched; flag-off control stays `Int64`.
 - Provider-level toggle test: `EMAT_NARROW_KEY_DECODE` flips the path
   (counter) with identical query results.
-- `tests/narrow_key_decode_q09.rs`: TPC-H Q09 (join-heavy) executed
-  once with flags off and once with both flags on, full result-set
-  equality (FP-tolerant on the profit sum). Runs on the mini fixture
-  in CI; point `TPCH_DATA_DIR` at SF=1 for the real-data run. NOT a
+- `ematix_fast_parquet::tests::narrow_key_decode_q09_identity_on_off`:
+  TPC-H Q09 (join-heavy) executed once with the narrowed path off and
+  once with it on, full result-set equality (FP-tolerant on the profit
+  sum). Runs on the synthetic mini fixture in CI (lives in the lib
+  tests because the fixture is crate-internal); point `TPCH_DATA_DIR`
+  at the SF=1 dataset for the real-data run — verified 2026-07-01 at
+  SF=1 (`%green%`, identical results, narrow counter fired). NOT a
   benchmark.
 
 Nulls: TPC-H keys are REQUIRED and the emat scan path is
