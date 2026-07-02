@@ -2355,4 +2355,261 @@ mod tests {
             "two Emat scans → not a single-dimension build"
         );
     }
+
+    // ===== Σ.AH.2 — Partitioned-mode plan-diff pins =====
+    //
+    // The Σ.AH.2 arc shell (docs/plans/sigma-ah-arc-2.md) framed the work
+    // as "extend the CollectLeft-only emitter to Partitioned joins". The
+    // design doc (docs/PHASE_SIGMA_AH_2_DESIGN.md §2.3) refuted that: the
+    // rule pattern-matches join SHAPE, never PartitionMode, and the
+    // emitter's per-partition-bloom + all-drain OR-merge already handles
+    // N-partition builds. But nothing PINNED that — every optimize()-level
+    // test in this module runs a miniature join that the planner collapses
+    // to CollectLeft, so a future refactor could silently re-introduce a
+    // mode gate (or break the N-partition merge) without any test going
+    // red. These tests force PartitionMode::Partitioned (via the
+    // hash_join_single_partition_threshold knobs) on a Q08-shaped
+    // fixture — filtered small dim build ⋈ fact probe on an i64 key —
+    // and pin both the plan shape and the runtime publish.
+
+    /// Write a miniature "lineitem": `rows` rows, `l_partkey = i % n_keys`,
+    /// plus an i64 payload column.
+    fn write_fact_i64(path: &std::path::Path, rows: usize, n_keys: i64) {
+        let l_partkey: Vec<i64> = (0..rows as i64).map(|i| i % n_keys).collect();
+        let l_val: Vec<i64> = (0..rows as i64).collect();
+        write_table_to_path(
+            path,
+            &[
+                ("l_partkey", ColumnData::I64(&l_partkey)),
+                ("l_val", ColumnData::I64(&l_val)),
+            ],
+            CompressionCodec::Uncompressed,
+        )
+        .unwrap();
+    }
+
+    /// Q08-shaped miniature context: `part_t` (200 rows, `ptype` cycling
+    /// 10 values, `pkey` = row id) ⋈ `lineitem_t` (5000 rows, `l_partkey`
+    /// ∈ [0, 200)). `WHERE ptype = 'v07'` keeps 20 build keys; each key
+    /// matches 25 fact rows → 500 join rows. When `force_partitioned`,
+    /// the hash_join_single_partition_threshold knobs are zeroed so the
+    /// planner picks PartitionMode::Partitioned (the SF100 Q08/Q09 fact-
+    /// edge shape) instead of collapsing the tiny build to CollectLeft.
+    async fn q08_shaped_ctx(name: &str, force_partitioned: bool) -> SessionContext {
+        let part = tmp_parquet(&format!("{name}_part"));
+        let fact = tmp_parquet(&format!("{name}_fact"));
+        let ptypes: Vec<String> = (0..200).map(|i| format!("v{:02}", i % 10)).collect();
+        let ptype_refs: Vec<&str> = ptypes.iter().map(|s| s.as_str()).collect();
+        let pkeys: Vec<i64> = (0..200).collect();
+        write_utf8_parquet(&part, ("ptype", &ptype_refs), Some(("pkey", &pkeys)));
+        write_fact_i64(&fact, 5000, 200);
+
+        let mut cfg = SessionConfig::new().with_target_partitions(4);
+        if force_partitioned {
+            cfg.options_mut()
+                .optimizer
+                .hash_join_single_partition_threshold = 0;
+            cfg.options_mut()
+                .optimizer
+                .hash_join_single_partition_threshold_rows = 0;
+        }
+        let state = SessionStateBuilder::new()
+            .with_default_features()
+            .with_config(cfg)
+            .with_physical_optimizer_rule(Arc::new(EnableRuntimeBloomSidebandRule {
+                // Gate disabled for miniature data (the documented test
+                // convention); the fixture pins the WRAP MECHANISM on a
+                // Partitioned join, not the selectivity heuristic.
+                min_probe_to_build_ratio: 0,
+                allow_inner_join: true,
+                // Keep the preset's filtered-build requirement live —
+                // the Q08 shape (FilterExec in the build subtree) must
+                // satisfy it through the repartition the Partitioned
+                // planner inserts.
+                require_filtered_build: true,
+                max_expected_keys_per_partition: 0,
+                min_probe_proj_cols: 0,
+            }))
+            .build();
+        let ctx = SessionContext::new_with_state(state);
+        ctx.register_table(
+            "part_t",
+            Arc::new(EmatixFastParquetTableProvider::try_new(part.to_string_lossy()).unwrap()),
+        )
+        .unwrap();
+        ctx.register_table(
+            "lineitem_t",
+            Arc::new(EmatixFastParquetTableProvider::try_new(fact.to_string_lossy()).unwrap()),
+        )
+        .unwrap();
+        ctx
+    }
+
+    const Q08_SHAPED_SQL: &str = "SELECT l_val FROM part_t \
+         JOIN lineitem_t ON pkey = l_partkey WHERE ptype = 'v07'";
+
+    /// Walk a physical plan collecting every node that satisfies `pred`.
+    fn find_nodes(
+        plan: &Arc<dyn ExecutionPlan>,
+        pred: &dyn Fn(&Arc<dyn ExecutionPlan>) -> bool,
+        out: &mut Vec<Arc<dyn ExecutionPlan>>,
+    ) {
+        if pred(plan) {
+            out.push(plan.clone());
+        }
+        for c in plan.children() {
+            find_nodes(c, pred, out);
+        }
+    }
+
+    /// Σ.AH.2 plan-diff — a PARTITIONED-mode Inner join meeting the L9
+    /// criteria (i64 equi-key, filtered build, Emat probe scan) gets the
+    /// bloom emitter, sized per-partition (N > 1), and the probe-side
+    /// scan (below the probe repartition) carries the sideband. Pins the
+    /// design-doc refutation: L9 is NOT CollectLeft-only.
+    #[tokio::test]
+    async fn partitioned_mode_join_gets_bloom_emitter() {
+        let ctx = q08_shaped_ctx("ah2_partitioned", true).await;
+        let df = ctx.sql(Q08_SHAPED_SQL).await.unwrap();
+        let plan = df.clone().create_physical_plan().await.unwrap();
+
+        // Fixture premise: the join must actually be Partitioned.
+        let mut joins = Vec::new();
+        find_nodes(
+            &plan,
+            &|n| n.as_any().downcast_ref::<HashJoinExec>().is_some(),
+            &mut joins,
+        );
+        assert!(!joins.is_empty(), "fixture must plan a HashJoinExec");
+        let hj = joins[0].as_any().downcast_ref::<HashJoinExec>().unwrap();
+        assert!(
+            matches!(
+                hj.partition_mode(),
+                datafusion::physical_plan::joins::PartitionMode::Partitioned
+            ),
+            "fixture premise broken: expected a Partitioned-mode join, got {:?}",
+            hj.partition_mode()
+        );
+
+        // The wrap must land on the Partitioned build side...
+        let mut emitters = Vec::new();
+        find_nodes(
+            &plan,
+            &|n| {
+                n.as_any()
+                    .downcast_ref::<BuildSideBloomEmitterExec>()
+                    .is_some()
+            },
+            &mut emitters,
+        );
+        assert_eq!(
+            emitters.len(),
+            1,
+            "expected exactly one L9 emitter on the Partitioned join, plan:\n{plan:?}"
+        );
+        // ...covering ALL N hash partitions (the per-partition local
+        // blooms + all-drain OR-merge path, not the CollectLeft N=1
+        // degenerate case).
+        let n_part = emitters[0].output_partitioning().partition_count();
+        assert!(
+            n_part > 1,
+            "Partitioned build must leave the emitter multi-partition (got {n_part})"
+        );
+
+        // And the probe-side Emat scan must carry the sideband.
+        let mut armed_scans = Vec::new();
+        find_nodes(
+            &plan,
+            &|n| {
+                n.as_any()
+                    .downcast_ref::<EmatixFastParquetExec>()
+                    .map(|s| s.runtime_sideband().is_some())
+                    .unwrap_or(false)
+            },
+            &mut armed_scans,
+        );
+        assert_eq!(
+            armed_scans.len(),
+            1,
+            "expected exactly one sideband-armed probe scan, plan:\n{plan:?}"
+        );
+    }
+
+    /// Σ.AH.2 runtime — executing the wrapped Partitioned join must (a)
+    /// produce exactly the unfiltered-join row count (the bloom is
+    /// selectivity-only; the residual join keeps results exact) and (b)
+    /// PUBLISH the merged bloom: every one of the N per-partition builds
+    /// drains, the locals OR-merge, and the sideband flips is_ready().
+    /// (b) is the Partitioned-specific mechanism — a lost or partial
+    /// merge would leave the sideband unpublished forever.
+    #[tokio::test]
+    async fn partitioned_mode_bloom_publishes_and_results_stay_exact() {
+        let ctx = q08_shaped_ctx("ah2_runtime", true).await;
+        let df = ctx.sql(Q08_SHAPED_SQL).await.unwrap();
+        let plan = df.create_physical_plan().await.unwrap();
+
+        let batches = datafusion::physical_plan::collect(plan.clone(), ctx.task_ctx())
+            .await
+            .unwrap();
+        let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        // 20 build keys ('v07' keeps pkey ≡ 7 mod 10) × 25 fact rows/key.
+        assert_eq!(rows, 500, "Partitioned-mode L9 wrap changed the result");
+
+        let mut emitters = Vec::new();
+        find_nodes(
+            &plan,
+            &|n| {
+                n.as_any()
+                    .downcast_ref::<BuildSideBloomEmitterExec>()
+                    .is_some()
+            },
+            &mut emitters,
+        );
+        assert_eq!(emitters.len(), 1, "fixture must wrap exactly one emitter");
+        let emitter = emitters[0]
+            .as_any()
+            .downcast_ref::<BuildSideBloomEmitterExec>()
+            .unwrap();
+        assert!(
+            emitter.sideband().is_ready(),
+            "all {} build partitions drained but the merged bloom never published",
+            emitters[0].output_partitioning().partition_count()
+        );
+    }
+
+    /// Σ.AH.2 control — the same fixture WITHOUT the forced-Partitioned
+    /// knobs collapses to CollectLeft and wraps identically. Paired with
+    /// the Partitioned test above, this pins that the rule treats the
+    /// two modes uniformly (mode never gates admission).
+    #[tokio::test]
+    async fn collect_left_join_wraps_identically() {
+        let ctx = q08_shaped_ctx("ah2_collectleft", false).await;
+        let df = ctx.sql(Q08_SHAPED_SQL).await.unwrap();
+        let plan = df.clone().create_physical_plan().await.unwrap();
+
+        let mut joins = Vec::new();
+        find_nodes(
+            &plan,
+            &|n| n.as_any().downcast_ref::<HashJoinExec>().is_some(),
+            &mut joins,
+        );
+        assert!(!joins.is_empty(), "fixture must plan a HashJoinExec");
+        let hj = joins[0].as_any().downcast_ref::<HashJoinExec>().unwrap();
+        assert!(
+            matches!(
+                hj.partition_mode(),
+                datafusion::physical_plan::joins::PartitionMode::CollectLeft
+            ),
+            "control premise broken: expected CollectLeft, got {:?}",
+            hj.partition_mode()
+        );
+        let s = format!("{plan:?}");
+        assert!(
+            s.contains("BuildSideBloomEmitterExec"),
+            "CollectLeft control must keep its wrap:\n{s}"
+        );
+        let batches = df.collect().await.unwrap();
+        let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(rows, 500, "CollectLeft control changed the result");
+    }
 }
