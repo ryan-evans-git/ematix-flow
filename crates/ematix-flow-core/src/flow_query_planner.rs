@@ -133,11 +133,24 @@ impl QueryPlanner for FlowQueryPlanner {
         // matches ONLY empty group_expr), so it cannot touch the
         // high-cardinality aggregations that regress under oversubscription.
         //
+        // Gate-B (RG-granularity retune, 2026-07-03) rides the same call: a
+        // join-free LOW-cardinality GROUP BY over a single multi-RG EMAT scan
+        // (Q01) plans with `target_partitions = num_row_groups` (capped at
+        // `EMAT_LOWCARD_BOOST_CAP × resolved_core_share()`), so `scan()`'s
+        // `min(num_rgs, target_partitions)` yields ONE row group per
+        // partition — removing the ceil-balanced tail (58 RGs / 14 partitions
+        // leaves two partitions with 5 RGs; measured Q01 SF=10 −7% at P=58).
+        // LOAD SAFETY: Gate-B's AUTO mode fires only when the process is
+        // effectively solo (resolved_core_share == available cores); under
+        // multi-process load the boost vanishes (oversubscription at 10
+        // streams measured −38% QPH). See `low_card_groupby_boost_active`.
+        //
         // Mechanism: clone the session state with the boosted count and thread
         // it through BOTH the re-optimize below AND the physical planner, so
         // `EnforceDistribution` propagates the count and each `scan()` reads it
         // (the scan's partition count = min(num_row_groups, target_partitions)).
-        // Opt out: `EMAT_SCALAR_AGG_BOOST=0`.
+        // Opt out: `EMAT_SCALAR_AGG_BOOST=0` (scalar) /
+        // `EMAT_LOWCARD_GROUPBY_BOOST=0` (Gate-B).
         let session_default = session_state.config().options().execution.target_partitions;
         let boosted =
             crate::auto_target_partitions::scalar_agg_target_partitions(&planned, session_default);

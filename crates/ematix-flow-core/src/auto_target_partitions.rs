@@ -135,26 +135,75 @@ pub fn scalar_agg_boost_enabled() -> bool {
     crate::flags::enabled("EMAT_SCALAR_AGG_BOOST")
 }
 
-/// Whether the Gate-B join-free LOW-cardinality GROUP BY boost is enabled.
+/// Whether the Gate-B join-free LOW-cardinality GROUP BY boost is active for
+/// this query (tri-state house pattern, Σ.AI.5 grammar):
 ///
-/// **Default OFF (opt-in via `EMAT_LOWCARD_GROUPBY_BOOST=1`).** The lever was
-/// shipped default-on (PR #157) on the strength of a triangulation-bench Q01
-/// −6% A/B, but a faithful **preset-path** re-measure (the config the
-/// distributed worker / `tpch_preset_bench` actually run) showed it is neutral
-/// on Q01 (+1.9%, within noise). Root cause: Q01's plan is
-/// `FusedAggregateExec(FilterMultiAgg) → EmatixFastParquetExec`, and the fused
-/// 8-aggregate compute over 60M rows is **CPU-throughput-bound** — it saturates
-/// all cores at the default partition count, so oversubscribing the scan adds
-/// no benefit (there is no decode-LATENCY stall to hide, unlike the genuinely
-/// scalar Q06/Q17). The gate's premise ("a low-card group-by is decode-bound
-/// like a scalar agg") does not hold when the per-group aggregate is heavy.
-/// The mechanism (dictionary-NDV peek + downcast) is correct and kept as
-/// opt-in infra for future decode-latency-bound low-card shapes; it just isn't
-/// a win on TPC-H. Distinct flag from [`scalar_agg_boost_enabled`] so it can be
-/// A/B'd independently; gated by BOTH flags in
-/// [`scalar_agg_target_partitions`].
-pub fn low_card_groupby_boost_enabled() -> bool {
-    crate::flags::opt_in("EMAT_LOWCARD_GROUPBY_BOOST")
+/// - `EMAT_LOWCARD_GROUPBY_BOOST=0` → force **OFF**.
+/// - `EMAT_LOWCARD_GROUPBY_BOOST=1` → force **ON** — diagnostic: bypasses the
+///   solo check below so A/Bs can exercise the lever under synthetic load.
+/// - unset → **AUTO: ON iff the process is effectively solo** (see below).
+///
+/// ## History (why the earlier default-OFF, and what changed)
+///
+/// Gate-B originally applied the scalar-agg 4× multiplier (14 → 56 partitions
+/// nominal, but ≤ `SCALAR_AGG_MAX_PARTITIONS`). Shipped default-on (PR #157)
+/// on a triangulation-bench Q01 −6%, then demoted to opt-in (#158) after a
+/// faithful preset-path re-measure showed Q01 neutral (+1.9%). The 2026-07-03
+/// PARTITIONS matrix (M4 Max, SF=10, strict binary, solo) explains why: the
+/// multiplier never reached balance. Q01's lineitem has 58 row groups with
+/// UNIFORM per-RG cost (dbgen); at P=14 the ceil-balanced assignment
+/// pigeonholes 58/14 into two partitions with 5 RGs (a +25% tail two
+/// producers pay while the rest idle). P=20/28 shave the tail but stay
+/// neutral (~231/~229 ms vs ~231 baseline); only **P=58 — one RG per
+/// partition — removes the tail entirely: ~215 ms, a consistent −7%**. LPT
+/// static balancing cannot help — with uniform costs this is the count
+/// pigeonhole, so RG-granularity partitioning is the only fix. Hence the
+/// retune: Gate-B now targets `num_row_groups` directly (see
+/// [`low_card_boosted_partitions`]) instead of multiplying the session count.
+///
+/// ## LOAD SAFETY — why AUTO requires "effectively solo"
+///
+/// The boost fires in AUTO only when
+/// `resolved_core_share() == available_cores()` — i.e. the partition registry
+/// sees `live == 1`, or legacy `EMAT_TARGET_PARTITIONS=0` mode, or a forced
+/// value equal to the core count. Under multi-process load the registry
+/// shrinks the per-process core share and this gate SHUTS: oversubscription
+/// under concurrent streams is measured poison (partitions 7 vs 2 at 10
+/// streams = −38% QPH), so the boost must vanish there. `=1` is the only way
+/// to get the boost under load, and it is deliberately diagnostic-only.
+///
+/// Distinct flag from [`scalar_agg_boost_enabled`] so the two levers A/B
+/// independently; the shapes are disjoint by construction (empty vs non-empty
+/// `group_expr`), so no query can ever receive both boosts.
+pub fn low_card_groupby_boost_active() -> bool {
+    low_card_groupby_boost_of(
+        crate::flags::tri_state("EMAT_LOWCARD_GROUPBY_BOOST"),
+        process_is_effectively_solo,
+    )
+}
+
+/// Pure core of [`low_card_groupby_boost_active`] (tri-state × solo decision
+/// table), factored out so the gate logic is unit-testable without racing on
+/// process-global env vars or the live partition registry.
+fn low_card_groupby_boost_of(tri: Option<bool>, solo: impl FnOnce() -> bool) -> bool {
+    match tri {
+        // Explicit env value wins in both directions; =1 bypasses the solo
+        // check (diagnostic force-on).
+        Some(forced) => forced,
+        // AUTO: default ON only when the process is effectively solo.
+        None => solo(),
+    }
+}
+
+/// True iff this process owns the whole box: the partition registry's
+/// resolved per-process core share equals `available_parallelism()` (registry
+/// sees `live == 1`, legacy `EMAT_TARGET_PARTITIONS=0`, or forced to exactly
+/// the core count). This is the LOAD-SAFETY check Gate-B's AUTO mode keys off:
+/// under multi-process load `resolved_core_share()` drops below the core
+/// count and the boost must vanish (oversubscription at 10 concurrent streams
+/// measured −38% QPH).
+fn process_is_effectively_solo() -> bool {
+    crate::partition_registry::resolved_core_share() == crate::partition_registry::available_cores()
 }
 
 /// Returns `true` if `plan` produces its result via a SCALAR aggregation — an
@@ -220,17 +269,24 @@ fn oversubscribed_scalar_partitions(session_target_partitions: usize, multiplier
 }
 
 // ---------------------------------------------------------------------------
-// Gate-B (2026-06-21): join-free LOW-CARDINALITY GROUP BY oversubscription.
+// Gate-B (2026-06-21; RG-granularity retune 2026-07-03): join-free
+// LOW-CARDINALITY GROUP BY partitioned at ROW-GROUP granularity.
 //
 // A join-free `GROUP BY` over a small number of groups (Q01: GROUP BY
-// l_returnflag, l_linestatus → 6 groups over a 6M-row scan) is bottlenecked
-// on scan-decode exactly like a join-free SCALAR agg (Q06): the
-// FinalPartitioned hash-table merge is trivially cheap at low cardinality, so
-// the only thing to parallelize is decode. It therefore earns the same
-// decode-bound 4× oversubscription.
+// l_returnflag, l_linestatus → 6 groups over the lineitem scan) has a
+// trivially cheap FinalPartitioned merge, so the only thing to parallelize is
+// the scan pipeline itself. The retuned policy sets `target_partitions` to
+// the scan's `num_row_groups` (capped, see `low_card_boosted_partitions`):
+// with `scan()` computing `num_partitions = min(num_rgs, target_partitions)`,
+// this yields ONE row group per partition, eliminating the ceil-balanced
+// count pigeonhole (58 RGs / 14 partitions → two partitions carry 5 RGs, a
+// +25% tail; uniform dbgen RG costs mean LPT cannot rebalance it). Measured
+// M4 Max SF=10: P=58 ~215 ms vs P=14 ~231 ms, a consistent −7%; the old 4×
+// multiplier plateaued at P=28 = neutral.
 //
 // This is DISJOINT from both other boosts by construction:
-//   * `is_scalar_aggregation` matches only EMPTY group_expr → never overlaps.
+//   * `is_scalar_aggregation` matches only EMPTY group_expr → never overlaps
+//     (Gate-B requires NON-empty group_expr), so no query gets both boosts.
 //   * the high-card boost (`walk_for_max_agg_input_cardinality`) estimates
 //     group count from input ROWS and so must EXCLUDE filtered aggregates
 //     (a WHERE shrinks the true group count below the row count). Gate-B
@@ -241,9 +297,22 @@ fn oversubscribed_scalar_partitions(session_target_partitions: usize, multiplier
 // Safety: the NDV per group column is read from the parquet dictionary page
 // headers (exact for fully dict-encoded columns) — a high-card group key like
 // l_orderkey is PLAIN-encoded, so `dict_cardinality` returns None and the gate
-// stays shut. The product threshold is kept conservative; a mis-fire is at
-// worst a bounded 4× partition change (perf-only, never a wrong answer) and is
-// opt-out via `EMAT_SCALAR_AGG_BOOST=0`.
+// stays shut. The join-free gate also excludes RANGE.AGG shapes (Q18's
+// clustered path has joins above its aggregate). A mis-fire is at worst a
+// bounded partition-count change (perf-only, never a wrong answer), capped at
+// `EMAT_LOWCARD_BOOST_CAP × resolved_core_share()`, and force-off via
+// `EMAT_LOWCARD_GROUPBY_BOOST=0`.
+//
+// Composition (verified 2026-07-03):
+//   * LPT RG assignment (`EMAT_BALANCED_RG_ASSIGN`) runs inside `scan()` with
+//     whatever partition count arrives — at one RG per partition it
+//     degenerates to the identity assignment.
+//   * The reader decode budget (`reader_decode_budget(share, partitions)`)
+//     becomes max(1, share/58) = 1 thread per producer — each producer
+//     decodes its single RG serially while 58 producers run concurrently.
+//   * Load safety: AUTO fires only when effectively solo (see
+//     `low_card_groupby_boost_active`); under multi-process load the boost
+//     vanishes (oversubscription at 10 streams measured −38% QPH).
 // ---------------------------------------------------------------------------
 
 /// Product of per-group-column distinct counts at/under which a join-free
@@ -304,12 +373,24 @@ where
     Some(product)
 }
 
+/// Gate-B plan estimate: the dict-NDV group-count product plus the scan's
+/// row-group count, resolved from the plan's single EMAT parquet provider.
+struct LowCardGroupByEstimate {
+    /// Product of the group columns' dictionary-exact distinct counts.
+    group_count: usize,
+    /// The scanned table's parquet row-group count — the RG-granularity
+    /// partition target.
+    num_row_groups: usize,
+}
+
 /// Production Gate-B estimate: resolve the plan's single EMAT parquet provider
-/// and use its planner-safe dictionary-cardinality peek as the NDV source.
-/// Returns `None` unless the plan reduces to exactly one
-/// [`EmatixFastParquetTableProvider`] scan (so it can't apply to multi-table
-/// or non-parquet plans).
-fn est_low_card_groupby_count(plan: &LogicalPlan) -> Option<usize> {
+/// and use its planner-safe dictionary-cardinality peek as the NDV source,
+/// alongside the provider's row-group count. Returns `None` unless the plan
+/// reduces to exactly one [`EmatixFastParquetTableProvider`] scan (so it can't
+/// apply to multi-table or non-parquet plans — this single-scan requirement
+/// also independently excludes every join shape, including Q18's RANGE.AGG
+/// clustered path, on top of `plan_has_join`).
+fn est_low_card_groupby(plan: &LogicalPlan) -> Option<LowCardGroupByEstimate> {
     let mut scans: Vec<&TableScan> = Vec::new();
     collect_table_scans(plan, &mut scans);
     let [scan] = scans.as_slice() else {
@@ -324,41 +405,97 @@ fn est_low_card_groupby_count(plan: &LogicalPlan) -> Option<usize> {
     let emat = provider
         .as_any()
         .downcast_ref::<EmatixFastParquetTableProvider>()?;
-    low_card_groupby_count_with(plan, |name| {
+    let group_count = low_card_groupby_count_with(plan, |name| {
         emat.dict_cardinality(schema.index_of(name).ok()?)
+    })?;
+    Some(LowCardGroupByEstimate {
+        group_count,
+        num_row_groups: emat.num_row_groups(),
     })
 }
 
-/// True iff `plan` is a join-free, bare-column GROUP BY whose dictionary-exact
-/// group cardinality is ≤ [`DECODE_BOUND_GROUPBY_MAX_GROUPS`] — the Gate-B
-/// decode-bound shape (Q01).
-fn is_decode_bound_low_card_groupby(plan: &LogicalPlan) -> bool {
-    est_low_card_groupby_count(plan).is_some_and(|n| n <= DECODE_BOUND_GROUPBY_MAX_GROUPS)
+/// Default multiplier on the per-process core share that caps Gate-B's
+/// RG-granularity partition count. Same 8× family as
+/// [`MAX_PARTITIONS_MULTIPLIER`] (Σ.AN.0's partition-sweep inflection).
+/// Override with `EMAT_LOWCARD_BOOST_CAP=N`.
+pub const LOWCARD_BOOST_CAP_MULTIPLIER: usize = 8;
+
+/// Gate-B's partition ceiling: `EMAT_LOWCARD_BOOST_CAP` (default
+/// [`LOWCARD_BOOST_CAP_MULTIPLIER`] = 8) × the partition registry's resolved
+/// per-process core share. At M4 Max solo (share 14) this is 112 — SF=10's 58
+/// RGs fit under it (one RG per partition); SF=100's 573 RGs clamp to it
+/// (ceil-balanced assignment then applies, with a proportionally smaller tail:
+/// 573/112 → 5-vs-6 RGs per partition = +20% tail worst case vs +25% at
+/// P=14... but spread over 112 producers).
+pub fn low_card_boost_cap() -> usize {
+    crate::flags::usize_or("EMAT_LOWCARD_BOOST_CAP", LOWCARD_BOOST_CAP_MULTIPLIER)
+        .saturating_mul(crate::partition_registry::resolved_core_share())
+}
+
+/// Gate-B RG-granularity partition policy (pure math, unit-tested):
+/// `num_row_groups` when it fits under `cap` — one RG per partition, the
+/// measured −7% Q01 SF=10 configuration. When `num_row_groups > cap` the
+/// boost DECLINES entirely (returns the session count): clamping to `cap`
+/// was measured +7–8% on Q01 SF=100 (573 RGs / 112 partitions restores a
+/// ceil tail while oversubscribing the cores 8× on an out-of-page-cache
+/// dataset) — partial granulation is worse than none. Never returns less
+/// than `session_target_partitions`, so a small table (SF=1 lineitem:
+/// 6 RGs < the 14-partition session default, where `scan()` already caps
+/// partitions at `num_rgs`) is left exactly as-is.
+fn low_card_boosted_partitions(
+    num_row_groups: usize,
+    cap: usize,
+    session_target_partitions: usize,
+) -> usize {
+    if num_row_groups > cap {
+        return session_target_partitions;
+    }
+    num_row_groups.max(session_target_partitions)
 }
 
 /// Given the session's configured `session_target_partitions`, returns the
-/// `target_partitions` to use for `plan`: oversubscribed (see
-/// [`oversubscribed_scalar_partitions`]) when the query is a scalar aggregation
-/// and the lever is enabled, otherwise `session_target_partitions` unchanged.
+/// `target_partitions` to use for `plan`:
+///
+/// - **Scalar aggregation** (empty `group_expr`; Q06/Q14/Q17/Q19), gated by
+///   `EMAT_SCALAR_AGG_BOOST` (default ON): oversubscribed via
+///   [`oversubscribed_scalar_partitions`].
+/// - **Gate-B low-card GROUP BY** (join-free, dict-NDV product ≤ 50K,
+///   multi-RG single EMAT scan; Q01), gated by
+///   [`low_card_groupby_boost_active`] (AUTO: ON iff effectively solo):
+///   RG-granularity via [`low_card_boosted_partitions`].
+/// - Otherwise `session_target_partitions` unchanged.
+///
+/// The two boosts are MUTUALLY EXCLUSIVE by construction (empty vs non-empty
+/// `group_expr`) and each is gated by its OWN flag, so either can be A/B'd
+/// cleanly without perturbing the other.
 pub fn scalar_agg_target_partitions(plan: &LogicalPlan, session_target_partitions: usize) -> usize {
-    if !scalar_agg_boost_enabled() {
-        return session_target_partitions;
-    }
     // Scalar aggregation (empty group_expr): Q06/Q14/Q17/Q19.
-    if is_scalar_aggregation(plan) {
+    if scalar_agg_boost_enabled() && is_scalar_aggregation(plan) {
         return oversubscribed_scalar_partitions(
             session_target_partitions,
             scalar_agg_multiplier_for_plan(plan),
         );
     }
-    // Gate-B: join-free LOW-cardinality GROUP BY (Q01). Decode-bound like a
-    // join-free scalar agg, so it gets the same multiplier (4×, since the plan
-    // has no join — and `EMAT_SCALAR_AGG_MULT` overrides both shapes alike).
-    if low_card_groupby_boost_enabled() && is_decode_bound_low_card_groupby(plan) {
-        return oversubscribed_scalar_partitions(
-            session_target_partitions,
-            scalar_agg_multiplier_for_plan(plan),
-        );
+    // Gate-B: join-free LOW-cardinality GROUP BY (Q01) at ROW-GROUP
+    // granularity. LOAD SAFETY: in AUTO the gate is open only when this
+    // process is effectively SOLO (`resolved_core_share() ==
+    // available_cores()` — registry live==1 or legacy mode); under
+    // multi-process load the boost MUST vanish (oversubscription at 10
+    // concurrent streams measured −38% QPH). `EMAT_LOWCARD_GROUPBY_BOOST=1`
+    // is the diagnostic force-on that bypasses the solo check; `=0` forces off.
+    if low_card_groupby_boost_active() {
+        if let Some(est) = est_low_card_groupby(plan) {
+            // Multi-RG gate: a single-row-group scan has nothing to
+            // re-granulate (and `low_card_boosted_partitions` would return
+            // the session count anyway); require ≥ 2 RGs explicitly.
+            if est.group_count <= DECODE_BOUND_GROUPBY_MAX_GROUPS && est.num_row_groups >= 2 {
+                return low_card_boosted_partitions(
+                    est.num_row_groups,
+                    low_card_boost_cap(),
+                    session_target_partitions,
+                );
+            }
+        }
     }
     session_target_partitions
 }
@@ -1157,24 +1294,161 @@ mod tests {
         // The dict-cardinality machinery works on real data: the dict-NDV
         // product for the two low-card group keys resolves to a tiny number
         // (proves the planner-safe dict_cardinality peek + provider downcast +
-        // name→index mapping all work end-to-end against real parquet).
-        let est = est_low_card_groupby_count(&plan);
+        // name→index mapping all work end-to-end against real parquet), and
+        // the estimate also carries the scan's row-group count (SF=10
+        // lineitem is multi-RG — 58 at the standard 1M-row RG size).
+        let est = est_low_card_groupby(&plan);
+        let (groups, num_rgs) = est
+            .as_ref()
+            .map(|e| (e.group_count, e.num_row_groups))
+            .expect("Q01 should resolve a Gate-B estimate against real SF=10 lineitem");
         assert!(
-            est.is_some_and(|n| n <= DECODE_BOUND_GROUPBY_MAX_GROUPS),
-            "Q01 low-card group estimate should be Some(small); got {est:?} \
+            groups <= DECODE_BOUND_GROUPBY_MAX_GROUPS,
+            "Q01 low-card group estimate should be small; got {groups} \
              (are l_returnflag/l_linestatus dict-encoded in every RG?)"
         );
+        assert!(
+            num_rgs >= 2,
+            "SF=10 lineitem must be multi-RG; got {num_rgs}"
+        );
 
-        // Gate-B is OPT-IN (default off): a faithful preset-path re-measure
-        // showed it neutral on Q01 (the fused multi-agg is CPU-bound, not
-        // decode-latency-bound — see `low_card_groupby_boost_enabled` docs), so
-        // the DEFAULT path must NOT boost. (Opt in via EMAT_LOWCARD_GROUPBY_BOOST=1.)
+        // Env-mutating arm — house rule: take EMAT_ENV_TEST_LOCK and restore
+        // the var before dropping the guard.
+        let _guard = crate::flags::EMAT_ENV_TEST_LOCK.lock().await;
+        let key = "EMAT_LOWCARD_GROUPBY_BOOST";
+        let prev = std::env::var(key).ok();
+
+        // =0 force-off: no boost regardless of solo state.
+        unsafe { std::env::set_var(key, "0") };
         assert_eq!(
             scalar_agg_target_partitions(&plan, 14),
             14,
-            "Gate-B is opt-in (default off) → no partition boost by default"
+            "EMAT_LOWCARD_GROUPBY_BOOST=0 must force the boost off"
         );
+
+        // =1 diagnostic force-on (bypasses the solo check): RG-granularity
+        // policy — num_rgs capped at EMAT_LOWCARD_BOOST_CAP × core share,
+        // never below the session count. At M4 Max solo defaults this is
+        // 58 partitions (one RG each); computed self-consistently here so the
+        // assertion is robust to core count / registry live-count variation.
+        unsafe { std::env::set_var(key, "1") };
+        let expect = num_rgs.min(low_card_boost_cap()).max(14);
+        let boosted = scalar_agg_target_partitions(&plan, 14);
+        assert_eq!(
+            boosted, expect,
+            "EMAT_LOWCARD_GROUPBY_BOOST=1 must apply the RG-granularity policy"
+        );
+        assert!(
+            boosted > 14,
+            "SF=10 (58 RGs > 14 session partitions) must actually boost; got {boosted}"
+        );
+
+        match prev {
+            Some(v) => unsafe { std::env::set_var(key, v) },
+            None => unsafe { std::env::remove_var(key) },
+        }
         Ok(())
+    }
+
+    /// Gate-B RG-granularity policy math (pure): 58 RGs (SF=10) → 58
+    /// (one RG per partition), 573 RGs (SF=100) → CAP, 6 RGs (SF=1) → the
+    /// session default (never reduces), CAP=0 → effectively disabled.
+    #[test]
+    fn gate_b_rg_granularity_policy_math() {
+        let cap = 112; // 8 × 14-core solo share (M4 Max)
+        assert_eq!(
+            low_card_boosted_partitions(58, cap, 14),
+            58,
+            "SF=10: 58 ≤ 112 → one RG per partition"
+        );
+        assert_eq!(
+            low_card_boosted_partitions(573, cap, 14),
+            14,
+            "SF=100: 573 > 112 → boost DECLINES (partial granulation measured \
+             +7–8% on Q01 SF=100: ceil tail + 8× oversubscription out-of-cache)"
+        );
+        assert_eq!(
+            low_card_boosted_partitions(6, cap, 14),
+            14,
+            "SF=1: 6 RGs < session 14 → unchanged (scan already caps at num_rgs)"
+        );
+        assert_eq!(
+            low_card_boosted_partitions(58, 0, 14),
+            14,
+            "CAP=0 disables the boost (falls back to the session count)"
+        );
+        assert_eq!(
+            low_card_boosted_partitions(1, cap, 14),
+            14,
+            "single-RG scan never boosts"
+        );
+    }
+
+    /// Gate-B activation decision table (pure): tri-state env override ×
+    /// solo check. `=0` force-off beats solo; `=1` diagnostic force-on
+    /// bypasses the solo requirement; AUTO (unset) requires effectively-solo
+    /// — the LOAD-SAFETY property (boost must vanish under multi-stream
+    /// load, where oversubscription measured −38% QPH).
+    #[test]
+    fn gate_b_tri_state_and_solo_gate() {
+        assert!(
+            !low_card_groupby_boost_of(Some(false), || true),
+            "=0 force-off wins even when solo"
+        );
+        assert!(
+            low_card_groupby_boost_of(Some(true), || false),
+            "=1 diagnostic force-on bypasses the solo check"
+        );
+        assert!(
+            low_card_groupby_boost_of(None, || true),
+            "AUTO + solo → ON (the new default-on shape)"
+        );
+        assert!(
+            !low_card_groupby_boost_of(None, || false),
+            "AUTO + multi-process load → OFF (load safety)"
+        );
+    }
+
+    /// The scalar-agg boost and Gate-B are mutually exclusive by
+    /// construction: `is_scalar_aggregation` requires EMPTY `group_expr`,
+    /// Gate-B (`low_card_groupby_count_with`) requires NON-empty
+    /// `group_expr`. No plan shape can satisfy both, so no query can ever
+    /// receive both boosts.
+    #[test]
+    fn scalar_and_gate_b_boosts_mutually_exclusive() {
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::functions_aggregate::expr_fn::count;
+        use datafusion::logical_expr::{col, table_scan};
+
+        let schema = Schema::new(vec![
+            Field::new("a", DataType::Int64, false),
+            Field::new("rf", DataType::Utf8, false),
+        ]);
+        let ndv = |name: &str| -> Option<usize> { (name == "rf").then_some(3) };
+
+        // Scalar shape (Q06): scalar path fires, Gate-B shape check is None.
+        let scalar = table_scan(Some("t"), &schema, None)
+            .unwrap()
+            .aggregate(Vec::<Expr>::new(), vec![count(col("a"))])
+            .unwrap()
+            .build()
+            .unwrap();
+        assert!(is_scalar_aggregation(&scalar));
+        assert_eq!(
+            low_card_groupby_count_with(&scalar, ndv),
+            None,
+            "empty group_expr can never qualify for Gate-B"
+        );
+
+        // Gate-B shape (Q01): Gate-B qualifies, scalar path must not.
+        let grouped = table_scan(Some("t"), &schema, None)
+            .unwrap()
+            .aggregate(vec![col("rf")], vec![count(col("a"))])
+            .unwrap()
+            .build()
+            .unwrap();
+        assert!(!is_scalar_aggregation(&grouped));
+        assert_eq!(low_card_groupby_count_with(&grouped, ndv), Some(3));
     }
 
     /// Integration test against real Q18 SF=10 logical plan. Verifies
@@ -1225,6 +1499,17 @@ mod tests {
         assert_eq!(
             n_q18, 112,
             "Q18 should clamp to ceiling 112 (60M ÷ 50K = 1200 clamped to 14×8)"
+        );
+
+        // Gate-B pin (RG-granularity retune, 2026-07-03): Q18 — the
+        // RANGE.AGG clustered-path shape — has joins above its aggregate and
+        // multiple table scans, so Gate-B's estimate must resolve to None:
+        // the low-card RG-granularity boost can never touch it, regardless
+        // of EMAT_LOWCARD_GROUPBY_BOOST (the flag gates a shape check that
+        // structurally excludes this plan).
+        assert!(
+            est_low_card_groupby(&plan_q18).is_none(),
+            "Q18 (joins above the agg, multi-scan) must never qualify for Gate-B"
         );
 
         // Q11 — partsupp aggregation with WHERE n_name='GERMANY' filter.
