@@ -9,7 +9,135 @@ Plan: [`docs/PHASE_SIGMA_PLAN.md`](PHASE_SIGMA_PLAN.md).
 
 ---
 
-## TL;DR — SF=1 refresh 2026-06-12; SF=10 + SF=100 ematix+DuckDB re-measured 2026-06-21, Apple M4 Max (14-core, 36 GB)
+## TL;DR — v0.12.0 release benchmark, 2026-07-03, Apple M4 Max (14-core, 36 GB)
+
+**ematix-flow vs DuckDB, strict protocol, one session, the exact
+`v0.12.0` code**: solo-engine passes, per-query process isolation,
+plan cache off, thermal gating, 10 trials × 2 warmups × 4 invocations
+(first discarded), medians, 2σ verdict bars, env.json provenance in
+`bench-results/release-v0.12.0/`. Production defaults only — no
+bench-only flags; the harness session is constructed from the shipped
+preset and pinned to it by parity tests.
+
+**Zero clear DuckDB wins at any scale.**
+
+| Scale | Clear ematix wins | Clear DuckDB wins | Noise/tie | Σ medians (ematix vs DuckDB) |
+|---|---|---|---|---|
+| SF=1 | **22 / 22** | 0 | 0 | 307 ms vs 806 ms (+163%) |
+| SF=10 | **17 / 22** | 0 | 5 | 2,411 ms vs 3,246 ms (+35%) |
+| SF=100 | **20 / 22** | 0 | 2 | 30,598 ms vs 41,270 ms (+35%) |
+
+### Concurrent-stream throughput ("tph"), QPH — 2026-07-03, same engine code
+
+Strict throughput protocol (seeded 22-query permutations per stream,
+solo engines, 4 batches first-discarded, memory-guarded). ematix runs
+its concurrency-aware defaults (`EMAT_TARGET_PARTITIONS` auto —
+cross-process registry sizes partitions, reader decode fan-out, and
+the rayon pool from one core share). Results:
+`bench-results/sched-arc-2026-07-03/`.
+
+| Config | ematix QPH | DuckDB QPH | ratio |
+|---|---:|---:|---|
+| SF=10, 1 stream | **27,462** | 21,405 | 1.28× |
+| SF=10, 10 streams | **28,333** | 26,463 | 1.07× |
+| SF=10, 100 streams | **26,073** | 25,824 | 1.01× |
+| SF=100, 1 stream | **2,212** | 1,814 | 1.22× |
+| SF=100, 10 streams | **1,581** | 1,118 | 1.41× |
+
+> Polars / PySpark / Postgres columns are NOT re-measured in this
+> release; see the historical 2026-06-21 five-engine section below
+> (engine-stable carried baselines). The strict apples-to-apples
+> comparison is ematix-flow vs DuckDB, co-measured above.
+
+### SF=1 — ~1 GB · fits in cache
+
+**22/22 clear wins.**
+
+| Query | ematix-flow ms | DuckDB ms | Δ ms | verdict (2σ) |
+|------:|---------------:|----------:|-----:|:------------|
+| Q01 | **19.48** | 49.32 | +29.84 | **ematix** |
+| Q02 | **7.53** | 18.28 | +10.75 | **ematix** |
+| Q03 | **13.10** | 32.78 | +19.68 | **ematix** |
+| Q04 | **11.31** | 23.31 | +12.00 | **ematix** |
+| Q05 | **12.05** | 31.42 | +19.37 | **ematix** |
+| Q06 | **1.73** | 13.39 | +11.66 | **ematix** |
+| Q07 | **25.18** | 34.30 | +9.12 | **ematix** |
+| Q08 | **14.68** | 39.44 | +24.76 | **ematix** |
+| Q09 | **18.74** | 56.33 | +37.59 | **ematix** |
+| Q10 | **20.66** | 41.99 | +21.33 | **ematix** |
+| Q11 | **5.58** | 9.82 | +4.24 | **ematix** |
+| Q12 | **14.80** | 25.44 | +10.64 | **ematix** |
+| Q13 | **9.04** | 142.94 | +133.90 | **ematix** |
+| Q14 | **11.49** | 23.03 | +11.54 | **ematix** |
+| Q15 | **11.31** | 14.86 | +3.55 | **ematix** |
+| Q16 | **9.31** | 21.94 | +12.63 | **ematix** |
+| Q17 | **14.17** | 25.77 | +11.60 | **ematix** |
+| Q18 | **18.27** | 45.81 | +27.54 | **ematix** |
+| Q19 | **17.60** | 36.36 | +18.76 | **ematix** |
+| Q20 | **12.35** | 30.41 | +18.06 | **ematix** |
+| Q21 | **34.27** | 77.90 | +43.63 | **ematix** |
+| Q22 | **4.20** | 11.16 | +6.96 | **ematix** |
+
+### SF=10 — ~10 GB · production scale
+
+**17 clear wins, 5 within the noise bar, 0 losses.** The 5 ties (Q01/Q03/Q05/Q08/Q09) all resolve inside the 2σ bar; ematix is nominally ahead in 3 of the 5.
+
+| Query | ematix-flow ms | DuckDB ms | Δ ms | verdict (2σ) |
+|------:|---------------:|----------:|-----:|:------------|
+| Q01 | **248.21** | 246.15 | -2.06 | ~tie |
+| Q02 | **19.27** | 39.23 | +19.96 | **ematix** |
+| Q03 | **129.27** | 135.99 | +6.72 | ~tie |
+| Q04 | **58.45** | 84.97 | +26.52 | **ematix** |
+| Q05 | **137.33** | 132.06 | -5.27 | ~tie |
+| Q06 | **25.40** | 75.54 | +50.14 | **ematix** |
+| Q07 | **118.35** | 135.24 | +16.89 | **ematix** |
+| Q08 | **146.69** | 157.32 | +10.63 | ~tie |
+| Q09 | **271.20** | 287.92 | +16.72 | ~tie |
+| Q10 | **192.72** | 221.48 | +28.76 | **ematix** |
+| Q11 | **11.41** | 25.41 | +14.00 | **ematix** |
+| Q12 | **86.45** | 108.99 | +22.54 | **ematix** |
+| Q13 | **102.40** | 232.85 | +130.45 | **ematix** |
+| Q14 | **82.01** | 125.52 | +43.51 | **ematix** |
+| Q15 | **61.76** | 81.11 | +19.35 | **ematix** |
+| Q16 | **44.22** | 57.40 | +13.18 | **ematix** |
+| Q17 | **80.29** | 147.09 | +66.80 | **ematix** |
+| Q18 | **177.73** | 199.20 | +21.47 | **ematix** |
+| Q19 | **122.03** | 188.93 | +66.90 | **ematix** |
+| Q20 | **91.88** | 136.71 | +44.83 | **ematix** |
+| Q21 | **180.33** | 374.52 | +194.19 | **ematix** |
+| Q22 | **23.74** | 52.65 | +28.91 | **ematix** |
+
+### SF=100 — ~100 GB · out-of-core
+
+**20 clear wins, 2 within the noise bar (Q01, Q16), 0 losses.**
+
+| Query | ematix-flow ms | DuckDB ms | Δ ms | verdict (2σ) |
+|------:|---------------:|----------:|-----:|:------------|
+| Q01 | **2460.74** | 2748.43 | +287.69 | ~tie |
+| Q02 | **195.20** | 337.23 | +142.03 | **ematix** |
+| Q03 | **1501.23** | 1859.57 | +358.34 | **ematix** |
+| Q04 | **850.24** | 1010.53 | +160.29 | **ematix** |
+| Q05 | **1434.49** | 1821.57 | +387.08 | **ematix** |
+| Q06 | **518.62** | 857.97 | +339.35 | **ematix** |
+| Q07 | **1476.11** | 1967.90 | +491.79 | **ematix** |
+| Q08 | **1654.67** | 2368.44 | +713.77 | **ematix** |
+| Q09 | **3494.58** | 4863.26 | +1368.68 | **ematix** |
+| Q10 | **1952.52** | 2412.38 | +459.86 | **ematix** |
+| Q11 | **184.46** | 245.59 | +61.13 | **ematix** |
+| Q12 | **1032.64** | 1357.39 | +324.75 | **ematix** |
+| Q13 | **1968.37** | 2885.50 | +917.13 | **ematix** |
+| Q14 | **826.95** | 1204.21 | +377.26 | **ematix** |
+| Q15 | **820.55** | 1156.65 | +336.10 | **ematix** |
+| Q16 | **404.19** | 467.95 | +63.76 | ~tie |
+| Q17 | **1483.75** | 1841.77 | +358.02 | **ematix** |
+| Q18 | **2150.23** | 2790.67 | +640.44 | **ematix** |
+| Q19 | **1226.71** | 1855.94 | +629.23 | **ematix** |
+| Q20 | **1144.17** | 1492.15 | +347.98 | **ematix** |
+| Q21 | **3467.07** | 5024.93 | +1557.86 | **ematix** |
+| Q22 | **350.17** | 699.76 | +349.59 | **ematix** |
+---
+
+## Historical TL;DR — five-engine tables (SF=1 2026-06-12; SF=10/SF=100 2026-06-21), Apple M4 Max
 
 Five engines, all 22 TPC-H queries, three scale factors, the same machine
 and the same Parquet files. **ematix-flow numbers are production-faithful**:
