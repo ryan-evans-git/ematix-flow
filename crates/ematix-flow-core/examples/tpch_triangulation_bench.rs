@@ -30,20 +30,10 @@ use datafusion::physical_plan::ExecutionPlanProperties;
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::prelude::{SessionConfig, SessionContext};
 use ematix_flow_core::bloom::ContextBlooms;
-use ematix_flow_core::dedupe_aggregate_rule::DedupeAggregateForFloatDeterminism;
-use ematix_flow_core::dict_aggregate_rule::EnableDictGroupCountRule;
 use ematix_flow_core::ematix_fast_parquet::EmatixFastParquetTableProvider;
 use ematix_flow_core::fast_parquet::FastParquetTableProvider;
-use ematix_flow_core::force_collect_left_semi_build_rule::ForceCollectLeftForSemiBoundedBuildRule;
-use ematix_flow_core::fused_aggregate_filter_multi_agg_rule::InjectFilterMultiAggRule;
-use ematix_flow_core::fused_aggregate_filter_sum_rule::InjectFilterSumRule;
 use ematix_flow_core::inbloom_scan_pushdown_rule::EnableInBloomScanPushdownRule;
 use ematix_flow_core::local_bloom_emitter::{LocalBloomOptions, emit_build_side_blooms_local};
-use ematix_flow_core::push_down_left_semi_rule::PushDownLeftSemiRule;
-use ematix_flow_core::robin_hood_sum_f64_exec::EnableRobinHoodSumF64Rule;
-use ematix_flow_core::runtime_bloom_cascading_rule::EnableCascadingBloomRule;
-use ematix_flow_core::runtime_bloom_sideband_rule::EnableRuntimeBloomSidebandRule;
-use ematix_flow_core::swap_semi_join_build_rule::SwapSemiJoinBuildSideRule;
 use futures_util::TryStreamExt;
 
 #[global_allocator]
@@ -61,27 +51,29 @@ fn plan_cache() -> &'static ematix_flow_core::plan_cache::PlanCache {
     PLAN_CACHE.get_or_init(ematix_flow_core::plan_cache::PlanCache::new)
 }
 
-/// Σ.AJ.1 Lever C bench-harness fix (2026-05-27): when an opt-in
-/// pre-plan walker (EMAT_AGG_SEMI / EMAT_DIM_PUSH / EMAT_REORDER) is
-/// enabled, the trial code path bypasses the plan cache for ALL 22
-/// queries — even those where the walker doesn't actually rewrite
-/// anything. That uniformly regresses non-matching queries by ~3-8%
-/// (plan cache miss every trial), masking the matching queries' wins.
+/// Σ.AJ.1 Lever C bench-harness fix (2026-05-27): when the opt-in
+/// EMAT_REORDER pre-plan walker is enabled, the trial code path
+/// bypasses the plan cache for ALL 22 queries — even those where the
+/// walker doesn't actually rewrite anything. That uniformly regresses
+/// non-matching queries by ~3-8% (plan cache miss every trial),
+/// masking the matching queries' wins.
 ///
 /// `FIRES_CACHE` memoizes per-(rule, SQL) "does this rule actually
 /// change the plan?" so subsequent trials short-circuit. First trial
 /// pays one logical-opt + one TreeNode walk per enabled rule; warmup
 /// discards this. Only used to gate the `any_rewrite` flag.
+///
+/// (2026-07-02 hardening: the agg_semi / dim_push / q20_semi / q05_semi
+/// variants are gone — those walkers now run inside the session's
+/// production `FlowQueryPlanner`, so cached plan templates already
+/// carry them and no bypass is needed. Only the legacy EMAT_REORDER
+/// manual walker still bypasses.)
 type FiresKey = (RewriteRule, String);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum RewriteRule {
-    AggSemi,
-    DimPush,
     Reorder,
     ReorderShapeGated,
-    Q20Semi,
-    Q05Semi,
 }
 
 static FIRES_CACHE: OnceLock<Mutex<HashMap<FiresKey, bool>>> = OnceLock::new();
@@ -110,25 +102,11 @@ async fn rewrite_fires_for_sql(ctx: &SessionContext, sql: &str, rule: RewriteRul
     };
     let pre = format!("{}", optimized.display_indent());
     let rewritten = match rule {
-        RewriteRule::AggSemi => {
-            ematix_flow_core::agg_filter_pushdown::push_filter_into_agg(optimized.clone())
-        }
-        RewriteRule::DimPush => {
-            ematix_flow_core::dim_join_pushdown::push_dim_join_into_chain(optimized.clone())
-        }
         RewriteRule::Reorder => {
             ematix_flow_core::join_reorder::reorder_inner_joins(optimized.clone())
         }
         RewriteRule::ReorderShapeGated => {
             ematix_flow_core::join_reorder::reorder_inner_joins_shape_gated(optimized.clone())
-        }
-        RewriteRule::Q20Semi => {
-            ematix_flow_core::agg_filter_pushdown::push_transitive_semi_into_agg(optimized.clone())
-        }
-        RewriteRule::Q05Semi => {
-            ematix_flow_core::agg_filter_pushdown::push_transitive_dim_semi_into_join_chain(
-                optimized.clone(),
-            )
         }
     };
     let rewritten = match rewritten {
@@ -139,11 +117,6 @@ async fn rewrite_fires_for_sql(ctx: &SessionContext, sql: &str, rule: RewriteRul
     let fires = pre != post;
     fires_cache().lock().unwrap().insert(key, fires);
     fires
-}
-
-/// Convenience wrapper preserved for the agg-semi call site.
-async fn agg_semi_fires_for_sql(ctx: &SessionContext, sql: &str) -> bool {
-    rewrite_fires_for_sql(ctx, sql, RewriteRule::AggSemi).await
 }
 
 const TPCH_TABLES: &[&str] = &[
@@ -260,6 +233,20 @@ impl EngineResult {
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Legacy lever-name compatibility (2026-07-02 hardening): the Q20
+    // transitive semi-pushdown used to be applied manually here, gated
+    // on `EMAT_Q20_TRANSITIVE_SEMI`; it now runs inside the production
+    // `FlowQueryPlanner`, whose gate is spelled `EMAT_Q20_SEMI`.
+    // Forward the historical spelling so documented A/B invocations
+    // keep working. SAFETY: first statement of main — no query has
+    // been planned yet, so no other thread is reading EMAT_* env
+    // (same coordination argument as the EMAT_BATCH_SIZE writes below).
+    if let (Ok(v), Err(_)) = (
+        std::env::var("EMAT_Q20_TRANSITIVE_SEMI"),
+        std::env::var("EMAT_Q20_SEMI"),
+    ) {
+        unsafe { std::env::set_var("EMAT_Q20_SEMI", v) };
+    }
     let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(|p| p.parent())
@@ -565,74 +552,6 @@ async fn compute_auto_target_partitions(
     }
 }
 
-/// Scalar-final-agg partition oversubscription (morsel-engine down-payment,
-/// default ON; `EMAT_SCALAR_AGG_BOOST=0` to disable). Memoized per SQL string:
-/// builds a minimal plan ONCE and returns `Some(2×session_partitions)` when the
-/// query's result is a scalar aggregate (TPC-H Q06/Q14/Q17/Q19), else `None`.
-/// Mirrors the production `FlowQueryPlanner` boost so the bench measures the
-/// exact shipped mechanism (both reach the scan via `target_partitions`).
-static SCALAR_AGG_CACHE: OnceLock<Mutex<HashMap<String, Option<usize>>>> = OnceLock::new();
-
-fn scalar_agg_cache() -> &'static Mutex<HashMap<String, Option<usize>>> {
-    SCALAR_AGG_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-/// The session `target_partitions` `build_ematix_ctx` will use (PARTITIONS env,
-/// else available_parallelism). Kept in sync with that fn so the 2× boost is
-/// relative to the same base.
-fn bench_session_partitions() -> usize {
-    std::env::var("PARTITIONS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or_else(|| {
-            std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(14)
-        })
-}
-
-async fn scalar_agg_partitions_lookup(data_dir: &Path, sql: &str) -> Option<usize> {
-    {
-        let guard = scalar_agg_cache().lock().unwrap();
-        if let Some(v) = guard.get(sql) {
-            return *v;
-        }
-    }
-    let result = compute_scalar_agg_partitions(data_dir, sql).await;
-    scalar_agg_cache()
-        .lock()
-        .unwrap()
-        .insert(sql.to_string(), result);
-    result
-}
-
-async fn compute_scalar_agg_partitions(data_dir: &Path, sql: &str) -> Option<usize> {
-    let session_partitions = bench_session_partitions();
-    // Minimal SessionContext just to parse + optimize the SQL for shape
-    // detection (partition count is irrelevant to scalar-agg detection).
-    let ctx = SessionContext::new();
-    for t in TPCH_TABLES {
-        let path = data_dir.join(format!("{t}.parquet"));
-        if !path.exists() {
-            return None;
-        }
-        if *t == "lineitem" {
-            let prov = EmatixFastParquetTableProvider::try_new(path.to_string_lossy()).ok()?;
-            ctx.register_table(*t, Arc::new(prov)).ok()?;
-        } else {
-            let prov = FastParquetTableProvider::try_new(path.to_string_lossy()).ok()?;
-            ctx.register_table(*t, Arc::new(prov)).ok()?;
-        }
-    }
-    let df = ctx.sql(sql).await.ok()?;
-    let plan = df.into_optimized_plan().ok()?;
-    let n = ematix_flow_core::auto_target_partitions::scalar_agg_target_partitions(
-        &plan,
-        session_partitions,
-    );
-    (n > session_partitions).then_some(n)
-}
-
 /// Σ.AΩ Phase 1.4 — populate `aggregate_observations` for every
 /// query in `query_subset` by executing each once at the session-
 /// default partition count and walking the physical plan for the
@@ -683,69 +602,14 @@ async fn prefill_observations(
                 continue;
             }
         };
-        // Apply the same default-on logical rewrites as run_ematix_flow's
-        // hot path so observed cardinalities match what the bench will
-        // actually execute. Σ.U PushDownLeftSemi (`agg_semi_on`) is
-        // critical here: without it Q17's inner AVG agg sees 60M rows
-        // / 2M groups instead of the ~30K / ~200 the routed bench gets.
-        let logical_plan = match df.into_optimized_plan() {
-            Ok(p) => p,
-            Err(e) => {
-                println!("  Q{q:02}: opt fail: {}", short(&e.to_string()));
-                continue;
-            }
-        };
-        let logical_plan =
-            match ematix_flow_core::agg_filter_pushdown::push_filter_into_agg(logical_plan) {
-                Ok(p) => p,
-                Err(e) => {
-                    println!("  Q{q:02}: agg_semi fail: {}", short(&e.to_string()));
-                    continue;
-                }
-            };
-        let logical_plan =
-            match ematix_flow_core::dim_join_pushdown::push_dim_join_into_chain(logical_plan) {
-                Ok(p) => p,
-                Err(e) => {
-                    println!("  Q{q:02}: dim_push fail: {}", short(&e.to_string()));
-                    continue;
-                }
-            };
-        let logical_plan =
-            match ematix_flow_core::agg_filter_pushdown::push_transitive_semi_into_agg(logical_plan)
-            {
-                Ok(p) => p,
-                Err(e) => {
-                    println!("  Q{q:02}: q20_semi fail: {}", short(&e.to_string()));
-                    continue;
-                }
-            };
-        let logical_plan = if std::env::var("EMAT_TRANSITIVE_DIM_SEMI").as_deref() == Ok("1") {
-            match ematix_flow_core::agg_filter_pushdown::push_transitive_dim_semi_into_join_chain(
-                logical_plan,
-            ) {
-                Ok(p) => p,
-                Err(e) => {
-                    println!("  Q{q:02}: q05_semi fail: {}", short(&e.to_string()));
-                    continue;
-                }
-            }
-        } else {
-            logical_plan
-        };
-        if std::env::var_os("EMAT_DUMP_LOGICAL").is_some() {
-            println!(
-                "  Q{q:02} optimized logical plan (post agg_semi+dim_push):\n{}",
-                logical_plan.display_indent()
-            );
-        }
-        let df = match ctx.execute_logical_plan(logical_plan).await {
-            Ok(d) => d,
-            Err(e) => {
-                println!("  Q{q:02}: exec_logical fail: {}", short(&e.to_string()));
-                continue;
-            }
-        };
+        // The production pre-plan walkers (agg_semi / dim_push /
+        // q20_semi / transitive dim-semi / shape-gated reorder) run
+        // inside the session's `FlowQueryPlanner` at physical-planning
+        // time (2026-07-02 hardening), so observed cardinalities match
+        // what the bench actually executes without manual
+        // re-application. Σ.U agg_semi is the critical one: without it
+        // Q17's inner AVG agg sees 60M rows / 2M groups instead of the
+        // ~30K / ~200 the routed bench gets.
         let plan = match df.create_physical_plan().await {
             Ok(p) => p,
             Err(e) => {
@@ -1046,28 +910,13 @@ async fn compute_shape_hash(data_dir: &Path, sql: &str) -> Option<String> {
 }
 
 /// Σ.AΩ Phase 1.6 — runs the query end-to-end at the requested
-/// partition count and returns wall-ms. Applies the same default-on
-/// logical rewrites as `run_ematix_flow` so race timings reflect
-/// what the bench will actually execute.
+/// partition count and returns wall-ms.
 async fn time_one(data_dir: &Path, sql: &str, partitions: Option<usize>) -> Option<f64> {
     let (ctx, bloom_rule) = build_ematix_ctx(data_dir, partitions).await.ok()?;
+    // Pre-plan walkers run inside the session's FlowQueryPlanner
+    // (2026-07-02 hardening) — race timings reflect what the bench
+    // actually executes without manual re-application.
     let df = ctx.sql(sql).await.ok()?;
-    let logical_plan = df.into_optimized_plan().ok()?;
-    let logical_plan =
-        ematix_flow_core::agg_filter_pushdown::push_filter_into_agg(logical_plan).ok()?;
-    let logical_plan =
-        ematix_flow_core::dim_join_pushdown::push_dim_join_into_chain(logical_plan).ok()?;
-    let logical_plan =
-        ematix_flow_core::agg_filter_pushdown::push_transitive_semi_into_agg(logical_plan).ok()?;
-    let logical_plan = if std::env::var("EMAT_TRANSITIVE_DIM_SEMI").as_deref() == Ok("1") {
-        ematix_flow_core::agg_filter_pushdown::push_transitive_dim_semi_into_join_chain(
-            logical_plan,
-        )
-        .ok()?
-    } else {
-        logical_plan
-    };
-    let df = ctx.execute_logical_plan(logical_plan).await.ok()?;
     let t0 = Instant::now();
     let plan = df.create_physical_plan().await.ok()?;
     let plan: Arc<dyn datafusion::physical_plan::ExecutionPlan> =
@@ -1175,18 +1024,13 @@ async fn run_ematix_flow(data_dir: &Path, sql: &str) -> Trial {
     } else {
         None
     };
-    // Scalar-final-agg partition oversubscription (morsel-engine down-payment,
-    // default ON; opt-out EMAT_SCALAR_AGG_BOOST=0). Mirrors production's
-    // FlowQueryPlanner boost: scalar-aggregate queries (Q06/Q14/Q17/Q19) get
-    // 2× target_partitions. Only applies when the auto path hasn't already
-    // chosen an override. Memoized per SQL, so only trial 1 builds the probe.
-    let target_partitions_override = match target_partitions_override {
-        Some(n) => Some(n),
-        None if ematix_flow_core::auto_target_partitions::scalar_agg_boost_enabled() => {
-            scalar_agg_partitions_lookup(data_dir, sql).await
-        }
-        None => None,
-    };
+    // Scalar-final-agg partition oversubscription (morsel-engine
+    // down-payment, default ON; opt-out EMAT_SCALAR_AGG_BOOST=0): since
+    // the 2026-07-02 hardening the bench session installs the production
+    // `FlowQueryPlanner` (via `preset::with_optimizer_rules_overridden`),
+    // which applies the 2× boost natively at physical-planning time —
+    // the old bench-side mirror (`scalar_agg_partitions_lookup`) was
+    // removed so the boost isn't applied twice.
     // Σ.AΩ Phase 2.1: set EMAT_BATCH_SIZE just before constructing
     // the providers so `env_batch_size()` in the readers picks up
     // the per-shape verdict. SAFETY: bench coordinator is single-
@@ -1239,43 +1083,35 @@ async fn run_ematix_flow(data_dir: &Path, sql: &str) -> Trial {
         .ok()
         .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
         .unwrap_or(true);
+    // 2026-07-02 hardening: the production pre-plan walkers (agg_semi /
+    // dim_push / q20_semi / transitive dim-semi / shape-gated reorder)
+    // now run inside the session's `FlowQueryPlanner` — the SAME code
+    // path production users execute — instead of being re-applied by
+    // hand here. Their A/B levers are the planner's own env gates
+    // (EMAT_AGG_SEMI / EMAT_DIM_PUSH / EMAT_Q20_SEMI /
+    // EMAT_TRANSITIVE_DIM_SEMI / EMAT_REORDER_QP, all default ON;
+    // main() forwards the legacy EMAT_Q20_TRANSITIVE_SEMI spelling).
+    // The plan cache's `get_or_plan` plans through
+    // `SessionState::create_physical_plan`, which invokes the planner,
+    // so cached templates already carry the rewrites — the old
+    // per-rule cache-bypass machinery is no longer needed.
+    //
+    // Σ.T Phase 3 legacy lever: `EMAT_REORDER=1` additionally
+    // pre-applies the PERMISSIVE `reorder_inner_joins` walker (the
+    // production planner only ever runs the shape-gated variant, via
+    // EMAT_REORDER_QP). Kept for Σ.T-style experiments; combine with
+    // `EMAT_REORDER_QP=0` to isolate it from the planner's reorder.
     let reorder_on_check = std::env::var("EMAT_REORDER")
         .ok()
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
-    // Σ.AJ.1 Lever C (2026-05-27): default ON. 22q SF=10 strict
-    // interleaved A/B (commit pending) shows net -225.91 ms (-6.64%)
-    // with 3 wins (Q08 -11, Q17 -104, Q18 -27) and zero >2σ
-    // regressions. Set EMAT_AGG_SEMI=0 to disable for A/B benching.
-    let agg_semi_on_check = std::env::var("EMAT_AGG_SEMI")
-        .ok()
-        .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
-        .unwrap_or(true);
-    // Σ.AK (2026-05-27): default ON. Σ.AD's dim-join pushdown gated
-    // by the Q10-shape predicate (fact_side_has_competing_filtered_dim
-    // in dim_join_pushdown.rs). Strict A/B vs current defaults shows
-    // net -74.98 ms (-2.39%), Q10 -66 ms WIN, no regression > 5%. Set
-    // EMAT_DIM_PUSH=0 to disable for A/B benching.
-    let dim_push_on_check = std::env::var("EMAT_DIM_PUSH")
-        .ok()
-        .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
-        .unwrap_or(true);
-    // Σ.AJ.1 Lever C harness fix (2026-05-27): only bypass the plan
-    // cache for queries where the pre-plan rewrite actually changes
-    // the plan. Without per-SQL detection, all 22 queries pay the
-    // plan-cache-bypass cost when ANY rewrite env var is set, masking
-    // wins under the noise of uniform non-matching regressions.
-    //
-    // Each rule's actual-fires check runs the rule once on a cloned
-    // optimized plan during the first trial for that SQL, then
-    // memoizes the result. See `rewrite_fires_for_sql` above.
     let reorder_shape_gated_check = std::env::var("EMAT_REORDER_SHAPE_GATED")
         .ok()
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
-    let agg_semi_actually_fires = agg_semi_on_check && agg_semi_fires_for_sql(&ctx, sql).await;
-    let dim_push_actually_fires =
-        dim_push_on_check && rewrite_fires_for_sql(&ctx, sql, RewriteRule::DimPush).await;
+    // Plan-cache bypass (Σ.AJ.1 Lever C harness fix): only bypass for
+    // queries where the manual rewrite actually changes the plan —
+    // memoized per SQL via `rewrite_fires_for_sql`.
     let reorder_actually_fires = reorder_on_check
         && rewrite_fires_for_sql(
             &ctx,
@@ -1287,28 +1123,7 @@ async fn run_ematix_flow(data_dir: &Path, sql: &str) -> Trial {
             },
         )
         .await;
-    // Σ.Q20: bypass the plan cache when the transitive semi-pushdown
-    // actually fires (Q20 only), so the timed path applies it instead of
-    // serving the vanilla cached plan. Default-on; EMAT_Q20_TRANSITIVE_SEMI=0 off.
-    let q20_semi_on_check = std::env::var("EMAT_Q20_TRANSITIVE_SEMI")
-        .ok()
-        .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
-        .unwrap_or(true);
-    let q20_semi_actually_fires =
-        q20_semi_on_check && rewrite_fires_for_sql(&ctx, sql, RewriteRule::Q20Semi).await;
-    // Σ.Q05 (#352): same plan-cache bypass for the transitive dim-semi
-    // (fires on Q05 only). OPT-IN — EMAT_TRANSITIVE_DIM_SEMI=1 — until
-    // the 22q sweep gate flips it; without the bypass the Σ.AG cache
-    // would serve the vanilla plan and mask the rewrite.
-    let q05_semi_on_check = std::env::var("EMAT_TRANSITIVE_DIM_SEMI").as_deref() == Ok("1");
-    let q05_semi_actually_fires =
-        q05_semi_on_check && rewrite_fires_for_sql(&ctx, sql, RewriteRule::Q05Semi).await;
-    let any_rewrite = reorder_actually_fires
-        || agg_semi_actually_fires
-        || dim_push_actually_fires
-        || q20_semi_actually_fires
-        || q05_semi_actually_fires
-        || bloom_pushdown;
+    let any_rewrite = reorder_actually_fires || bloom_pushdown;
 
     if plan_cache_on && !any_rewrite {
         let t0 = Instant::now();
@@ -1390,99 +1205,26 @@ async fn run_ematix_flow(data_dir: &Path, sql: &str) -> Trial {
         Ok(d) => d,
         Err(e) => return Trial::Fail(format!("plan: {}", short(&e.to_string()))),
     };
-    // Σ.T Phase 3 (2026-05-25): optional join-reorder pre-plan walker.
-    // Opt-in via `EMAT_REORDER=1`. Runs DataFusion's logical
-    // optimizer to expand `Cross Join + Filter` → Inner Join, then
-    // applies the connectivity-aware cardinality-minimizing greedy
-    // reorder, then hands the rewritten plan to `execute_logical_plan`
-    // (which skips logical optimization — predicate pushdown /
-    // projection pruning ran in the first pass).
-    //
-    // Σ.U Phase 1 (2026-05-26) + Σ.AJ.1 Lever C (2026-05-27): agg-side
-    // LeftSemi pushdown. Default ON. Pushes a Filter subtree as
-    // LeftSemi into an Aggregate's input so the agg only sees rows
-    // whose group key survives the outer filter. Targets correlated-
-    // subquery shapes (Q17 -104 ms, Q08 -11 ms, Q18 -27 ms at SF=10).
-    // Set EMAT_AGG_SEMI=0 to disable for A/B benching.
-    let reorder_on = std::env::var("EMAT_REORDER")
-        .ok()
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
-    let agg_semi_on = std::env::var("EMAT_AGG_SEMI")
-        .ok()
-        .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
-        .unwrap_or(true);
-    // Σ.AD (2026-05-25) + Σ.AK (2026-05-27): dim-join pushdown gated
-    // by Q10-shape predicate. Default ON. Targets Q10's customer×orders
-    // chain (-23% / -66 ms at SF=10). The Σ.AK predicate blocks the
-    // rule on Q07/Q21/Q03 shapes (competing filtered dim in fact_side
-    // would force CollectLeft-after-Coalesce inversion). Set
-    // EMAT_DIM_PUSH=0 to disable for A/B benching.
-    let dim_push_on = std::env::var("EMAT_DIM_PUSH")
-        .ok()
-        .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
-        .unwrap_or(true);
-    let df = if reorder_on || agg_semi_on || dim_push_on {
+    // Σ.T Phase 3 (2026-05-25) legacy lever: optional PERMISSIVE
+    // join-reorder pre-plan walker, opt-in via `EMAT_REORDER=1` (the
+    // production planner only ships the shape-gated variant). Runs
+    // DataFusion's logical optimizer to expand `Cross Join + Filter` →
+    // Inner Join, applies the connectivity-aware cardinality-minimizing
+    // greedy reorder, then hands the rewritten plan to
+    // `execute_logical_plan` — whose physical planning re-runs the
+    // session's FlowQueryPlanner pipeline on top. Combine with
+    // `EMAT_REORDER_QP=0` to isolate the permissive reorder from the
+    // planner's own shape-gated one.
+    let df = if reorder_actually_fires {
         match df.into_optimized_plan() {
             Ok(plan) => {
-                let plan = if agg_semi_on {
-                    match ematix_flow_core::agg_filter_pushdown::push_filter_into_agg(plan) {
-                        Ok(p) => p,
-                        Err(e) => {
-                            return Trial::Fail(format!("agg_semi: {}", short(&e.to_string())));
-                        }
-                    }
-                } else {
-                    plan
-                };
-                let plan = if dim_push_on {
-                    match ematix_flow_core::dim_join_pushdown::push_dim_join_into_chain(plan) {
-                        Ok(p) => p,
-                        Err(e) => {
-                            return Trial::Fail(format!("dim_push: {}", short(&e.to_string())));
-                        }
-                    }
-                } else {
-                    plan
-                };
-                // Σ.Q20: transitive semi-pushdown (forest-parts → lineitem
-                // correlated-agg). Default-on; EMAT_Q20_TRANSITIVE_SEMI=0 to disable.
-                let plan = if std::env::var("EMAT_Q20_TRANSITIVE_SEMI")
-                    .ok()
-                    .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
-                    .unwrap_or(true)
-                {
-                    match ematix_flow_core::agg_filter_pushdown::push_transitive_semi_into_agg(plan)
-                    {
-                        Ok(p) => p,
-                        Err(e) => {
-                            return Trial::Fail(format!("q20_semi: {}", short(&e.to_string())));
-                        }
-                    }
-                } else {
-                    plan
-                };
-                // Σ.Q05 (#352): transitive dim-semi into deep join inputs
-                // (customer ⋉ nation⋈region on Q05). OPT-IN:
-                // EMAT_TRANSITIVE_DIM_SEMI=1 until the 22q gate flips it.
-                let plan = if std::env::var("EMAT_TRANSITIVE_DIM_SEMI").as_deref() == Ok("1") {
-                    match ematix_flow_core::agg_filter_pushdown::push_transitive_dim_semi_into_join_chain(plan)
-                    {
-                        Ok(p) => p,
-                        Err(e) => {
-                            return Trial::Fail(format!("q05_semi: {}", short(&e.to_string())));
-                        }
-                    }
-                } else {
-                    plan
-                };
                 if std::env::var_os("EMAT_DUMP_LOGICAL").is_some() {
                     eprintln!(
-                        "=== Q timed logical plan (post agg_semi+dim_push+q20_semi+q05_semi) ===\n{}",
+                        "=== Q timed logical plan (pre EMAT_REORDER walker) ===\n{}",
                         plan.display_indent()
                     );
                 }
-                let plan = if reorder_on {
+                let plan = {
                     // Σ.AH.X Lever G (closed 2026-05-27): the shape-gated
                     // entry point exists and works on focused subsets
                     // (Q10 -20 ms, Q09 -18 ms reliably), but the 22q SF=10
@@ -1516,8 +1258,6 @@ async fn run_ematix_flow(data_dir: &Path, sql: &str) -> Trial {
                             return Trial::Fail(format!("reorder: {}", short(&e.to_string())));
                         }
                     }
-                } else {
-                    plan
                 };
                 match ctx.execute_logical_plan(plan).await {
                     Ok(d) => d,
@@ -1627,237 +1367,120 @@ async fn build_ematix_ctx(
         // on bytes. 64 B/row is a generous upper bound for TPC-H keys.
         opts.optimizer.hash_join_single_partition_threshold = rows.saturating_mul(64);
     }
-    let mut builder = SessionStateBuilder::new()
-        .with_config(session_config)
-        .with_default_features();
-    if matches!(rules.as_str(), "all" | "dedupe") {
-        builder = builder
-            .with_physical_optimizer_rule(Arc::new(DedupeAggregateForFloatDeterminism::default()));
-    }
-    if matches!(rules.as_str(), "all" | "v040") {
-        builder = builder
-            .with_physical_optimizer_rule(Arc::new(EnableDictGroupCountRule))
-            .with_physical_optimizer_rule(Arc::new(InjectFilterMultiAggRule))
-            .with_physical_optimizer_rule(Arc::new(InjectFilterSumRule));
-    }
-    // Σ.Q L2: opt-in semi-join build-side swap. ON by default in "all"
-    // and "swap"; OFF for "v040" / "none" / "dedupe" so A/B benches can
-    // isolate its impact.
-    let swap_enabled = std::env::var("EMAT_SWAP_SEMI")
-        .ok()
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or_else(|| matches!(rules.as_str(), "all" | "swap"));
-    if swap_enabled {
-        builder = builder.with_physical_optimizer_rule(Arc::new(SwapSemiJoinBuildSideRule));
-    }
-    // REV.3: force CollectLeft on Inner joins with a semi-bounded build
-    // (Q18-class) so the 60M/600M-row probe streams with NO hash
-    // exchange (re-run EnforceDistribution drops the probe repartition +
-    // coalesces the tiny build). Runs after SwapSemi so it sees the
-    // RightSemi. DEFAULT-ON to match the production preset (REV.15 force
-    // CollectLeft + REV.17.3 relative broadcast, both via ::default()) so a
-    // bare bench run mirrors production and future regressions surface.
-    // Opt-out via EMAT_FORCE_COLLECT_LEFT=0 (for A/B isolation).
-    let force_collect_left_enabled = std::env::var("EMAT_FORCE_COLLECT_LEFT")
-        .ok()
-        .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
-        .unwrap_or(true);
-    if force_collect_left_enabled {
-        builder = builder.with_physical_optimizer_rule(Arc::new(
-            ForceCollectLeftForSemiBoundedBuildRule::default(),
-        ));
-    }
-    // RANGE.AGG (f15d2fc): collapse Partial→hash-shuffle→Final into one
-    // SinglePartitioned aggregate when the single group key is provably
-    // the file's cluster key. Production-preset default since 2026-06-10
-    // (preset.rs), but this bench never installed it, so the strict
-    // harness measured Q18 SF=100 on the two-phase 600M-row/150M-group
-    // agg plan (43.5s CPU + 2.2 GB shuffle) that preset users never run —
-    // the 2026-07-01 campaign's −1510 ms Q18 "loss" was this parity gap,
-    // not an engine regression. Same registration position as the preset
-    // (after ForceCollectLeft, before the RobinHood-sum rewrite). The
-    // rule self-gates on EMAT_RANGE_AGG (default ON, =0 to disable for
-    // A/B) and declines wherever the key isn't cluster-proven (Q18 SF=10
-    // declines via the skew gate — plan there is unchanged). Pinned by
-    // `bench_preset_parity_tests`.
-    builder = builder.with_physical_optimizer_rule(Arc::new(
-        ematix_flow_core::clustered_agg_rule::ClusteredSinglePhaseAggRule,
-    ));
-    // Σ.Q.L10: logical-plan rewrite — push LeftSemi past Inner joins
-    // down to its target table. Closes the Q18-shape structural gap
-    // to DuckDB (semi-filter pushed to wrap orders directly,
-    // eliminating the 60M-row intermediate). **Default ON at the
-    // milestone config (0.738 / 17 wins SF=10);** set
-    // `EMAT_PUSH_SEMI=0` to disable for A/B benching.
+    // Σ.Q.L10: **Default ON at the milestone config (0.738 / 17 wins
+    // SF=10);** set `EMAT_PUSH_SEMI=0` to disable for A/B benching.
     let push_semi_enabled = std::env::var("EMAT_PUSH_SEMI")
         .ok()
         .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
         .unwrap_or(true);
-    if push_semi_enabled {
-        // Σ.Q.M (synthetic LeftSemi producer) MUST run BEFORE Σ.Q.L10
-        // (semi pushdown consumer). DataFusion runs custom rules in
-        // registration order, so add M first.
-        let synth_semi_enabled = std::env::var("EMAT_SYNTHETIC_LEFT_SEMI")
+    // 2026-07-02 hardening (docs/PERF_Q18.md § Hardening): the chain is
+    // now assembled by the PRODUCTION preset via
+    // `preset::with_optimizer_rules_overridden` — this harness only maps
+    // its documented EMAT_* A/B levers onto the preset's explicit, named
+    // `HarnessOverrides`. With no lever env set, the session is
+    // EXACTLY the production preset session (pinned by
+    // `bench_preset_parity_tests` below + the preset's own
+    // `production_chain_matches_pinned_names`). This closes the Σ.V /
+    // RANGE.AGG / Q05-walker class of copy-drift for good — and means
+    // the bench now ALSO ships the production `FlowQueryPlanner`
+    // (agg_semi → dim_push → q20_semi → transitive dim-semi →
+    // shape-gated reorder + scalar-agg boost), which the old
+    // hand-rolled chain only partially mirrored (the Q05 transitive
+    // dim-semi + shape-gated reorder were missing by default —
+    // bench-measured Q05 plans lacked the pass-1 L9 lineitem wrap
+    // production produces).
+    let overrides = ematix_flow_core::preset::HarnessOverrides {
+        // EMAT_RULES subsets ("all"/"none"/"v040"/"dedupe"/"swap").
+        dedupe_aggregate: matches!(rules.as_str(), "all" | "dedupe"),
+        inject_fused_rules: matches!(rules.as_str(), "all" | "v040"),
+        // Σ.Q L2: EMAT_SWAP_SEMI overrides; else ON for "all"/"swap".
+        swap_semi_join_build: std::env::var("EMAT_SWAP_SEMI")
             .ok()
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
-        if synth_semi_enabled {
-            builder = builder.with_optimizer_rule(Arc::new(
-                ematix_flow_core::synthetic_left_semi_rule::SyntheticLeftSemiRule,
-            ));
-        }
-        builder = builder.with_optimizer_rule(Arc::new(PushDownLeftSemiRule));
-    }
-    // Σ.Q.L1b: routes SUM(Float64) GROUP BY Int64 through
-    // RobinHoodSumF64Exec ([[sigma-nf3-beats-stock]]). **Default ON
-    // at milestone config** (closes Q22 −18 ms, Q04 −26 ms); set
-    // `EMAT_RH_SUM_F64=0` to disable for A/B.
-    let rh_sum_f64_enabled = std::env::var("EMAT_RH_SUM_F64")
-        .ok()
-        .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
-        .unwrap_or(true);
-    // REV.8: single-pass radix agg replaces the WHOLE Partial→Repartition→
-    // Final for high-card SUM(f64) GROUP BY i64 (Q18 SF=100 subquery, ~150M
-    // groups). Gate measured 1.71× vs the two-phase. It must match an
-    // AggregateExec(Partial), so it is mutually exclusive with the
-    // RobinHood-sum rewrite (which would replace the Partial first) — when
-    // EMAT_SINGLE_PASS_RADIX=1 it pre-empts rh_sum. Opt-in for A/B.
-    let single_pass_radix_enabled = std::env::var("EMAT_SINGLE_PASS_RADIX")
-        .ok()
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
-    if single_pass_radix_enabled {
-        builder = builder.with_physical_optimizer_rule(Arc::new(
-            ematix_flow_core::single_pass_radix_sum_exec::EnableSinglePassRadixSumRule::default(),
-        ));
-    } else if rh_sum_f64_enabled {
-        builder =
-            builder.with_physical_optimizer_rule(Arc::new(EnableRobinHoodSumF64Rule::default()));
-    }
-    // REV.18c: COUNT(*) GROUP BY i64 and AVG(f64) GROUP BY i64 RobinHood
-    // kernels are OPT-IN. The operator crossover sweep shows all three only
-    // beat stock in the 200K–256K group band; no SF=10 TPC-H query lands a
-    // matching shape there (Q18 SUM/l_orderkey ≈15M groups, Q13 COUNT/o_custkey
-    // ≈1M — both gated out at 256K). Env-gated here for the default-on A/B.
-    if std::env::var("EMAT_RH_COUNT").ok().as_deref() == Some("1") {
-        builder = builder.with_physical_optimizer_rule(Arc::new(
-            ematix_flow_core::robin_hood_agg_rule::EnableRobinHoodAggregateRule::default(),
-        ));
-    }
-    if std::env::var("EMAT_RH_AVG").ok().as_deref() == Some("1") {
-        builder = builder.with_physical_optimizer_rule(Arc::new(
-            ematix_flow_core::robin_hood_avg_f64_exec::EnableRobinHoodAvgF64Rule::default(),
-        ));
-    }
-    // Σ.AN.1 (2026-05-28): per-operator partition routing for
-    // high-cardinality FinalPartitioned aggregates. Opt-in via
-    // EMAT_AGG_PARTITION_BOOST=1. Q18 SF=10 target: -20 to -30 ms
-    // by routing the 15M-group SUM aggregate's repartition from
-    // cores (=14) to 112 (8× cores). See PHASE_SIGMA_AN_1_DESIGN.md.
-    let agg_partition_boost_enabled = std::env::var("EMAT_AGG_PARTITION_BOOST")
-        .ok()
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
-    if agg_partition_boost_enabled {
-        builder = builder.with_physical_optimizer_rule(Arc::new(
-            ematix_flow_core::agg_partition_boost::AggPartitionBoostRule,
-        ));
-    }
-    // Σ.Q.L9: threads a sideband between HashJoinExec build and
-    // probe-side EmatixFastParquetExec so the build-side bloom is
-    // captured as a side-effect of the regular HashJoin build phase.
-    // **Default ON at milestone config**; set `EMAT_RT_BLOOM_SIDEBAND=0`
-    // to disable for A/B.
-    let rt_bloom_enabled = std::env::var("EMAT_RT_BLOOM_SIDEBAND")
-        .ok()
-        .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
-        .unwrap_or(true);
-    if rt_bloom_enabled {
-        // Σ.Q.L15: tighter selectivity ratio + Inner-join L9 default
-        // ON at milestone config. ratio=1024 gates out the L4'-style
-        // net-negative s⋈l firing while still firing on small-dim →
-        // fact pushdowns. Set `EMAT_RT_BLOOM_RATIO=64` and
-        // `EMAT_RT_BLOOM_INNER_JOIN=0` to revert to pre-L15.
-        let ratio = std::env::var("EMAT_RT_BLOOM_RATIO")
+            .unwrap_or_else(|| matches!(rules.as_str(), "all" | "swap")),
+        // REV.3: EMAT_FORCE_COLLECT_LEFT=0 for A/B isolation.
+        force_collect_left: std::env::var("EMAT_FORCE_COLLECT_LEFT")
             .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(1024);
-        let allow_inner = std::env::var("EMAT_RT_BLOOM_INNER_JOIN")
+            .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
+            .unwrap_or(true),
+        // RANGE.AGG stays installed; A/B via its own EMAT_RANGE_AGG gate.
+        clustered_single_phase_agg: true,
+        // Σ.Q.L10: EMAT_PUSH_SEMI=0 to disable for A/B benching.
+        push_down_left_semi: push_semi_enabled,
+        // Σ.Q.M producer must precede the Σ.Q.L10 consumer, so it is
+        // only meaningful when push-semi is on (historical bench gate).
+        synthetic_left_semi: push_semi_enabled
+            && std::env::var("EMAT_SYNTHETIC_LEFT_SEMI")
+                .ok()
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false),
+        // Σ.Q.L1b: EMAT_RH_SUM_F64=0 to disable for A/B.
+        robin_hood_sum_f64: std::env::var("EMAT_RH_SUM_F64")
             .ok()
             .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
-            .unwrap_or(true);
-        let require_filtered_build = std::env::var("EMAT_L9_REQUIRE_FILTERED_BUILD")
+            .unwrap_or(true),
+        // REV.8: EMAT_SINGLE_PASS_RADIX=1 pre-empts the rh_sum rewrite.
+        single_pass_radix_replaces_rh_sum: std::env::var("EMAT_SINGLE_PASS_RADIX")
+            .ok()
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false),
+        // REV.18c opt-in RobinHood COUNT/AVG kernels.
+        robin_hood_count: std::env::var("EMAT_RH_COUNT").ok().as_deref() == Some("1"),
+        robin_hood_avg: std::env::var("EMAT_RH_AVG").ok().as_deref() == Some("1"),
+        // Σ.AN.1 opt-in partition routing.
+        agg_partition_boost: std::env::var("EMAT_AGG_PARTITION_BOOST")
+            .ok()
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false),
+        // Σ.Q.L9: EMAT_RT_BLOOM_SIDEBAND=0 to disable for A/B; the
+        // milestone fields (ratio=1024 / inner=on / filtered-build=on)
+        // are overridable via EMAT_RT_BLOOM_RATIO /
+        // EMAT_RT_BLOOM_INNER_JOIN / EMAT_L9_REQUIRE_FILTERED_BUILD.
+        runtime_bloom_sideband: std::env::var("EMAT_RT_BLOOM_SIDEBAND")
             .ok()
             .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
-            .unwrap_or(true);
-        // Σ.S.B legacy stem-fanout cascade — now selected via
-        // EMAT_L9_CASCADE_STEM=1 only. Σ.Q05.CHAIN repurposed
-        // EMAT_L9_CASCADE as the tri-state gate of the chain-cascade
-        // second phase INSIDE the base rule (=1 force, =0 off, unset
-        // auto), so setting it no longer swaps the rule out.
-        let cascade = ematix_flow_core::flags::opt_in("EMAT_L9_CASCADE_STEM");
-        if cascade {
-            let max_extras = std::env::var("EMAT_L9_CASCADE_MAX")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(4);
-            builder = builder.with_physical_optimizer_rule(Arc::new(EnableCascadingBloomRule {
-                min_probe_to_build_ratio: ratio,
-                allow_inner_join: allow_inner,
-                require_filtered_build,
-                max_extras_per_emitter: max_extras,
-            }));
-        } else {
-            // Σ.AH.3 Story 2a: per-partition build-size ceiling, opt-in.
-            let max_keys: usize = std::env::var("EMAT_L9_MAX_EXPECTED_KEYS")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0);
-            builder =
-                builder.with_physical_optimizer_rule(Arc::new(EnableRuntimeBloomSidebandRule {
-                    min_probe_to_build_ratio: ratio,
-                    allow_inner_join: allow_inner,
-                    require_filtered_build,
-                    max_expected_keys_per_partition: max_keys,
-                    min_probe_proj_cols: 0,
-                    // Σ.AH.2: env-resolved NDV ceiling (EMAT_L9_NDV_MAX_ROWS /
-                    // EMAT_L9_PARTITIONED) + any future fields track the default.
-                    ..EnableRuntimeBloomSidebandRule::default()
-                }));
-        }
-    }
-    // Σ.AE: opt-in late physical-optimizer rule that surgically drops
-    // redundant FilterExec conjuncts already evaluated exactly by
-    // BridgeFilter. Default OFF — enable via
-    // `EMAT_DROP_REDUNDANT_FILTER=1` to A/B against the Inexact
-    // baseline.
-    builder =
-        ematix_flow_core::drop_redundant_filter_rule::install_drop_redundant_filter_rule(builder);
-    // Σ.AJ.1 Lever B POC: opt-in via EMAT_L9_BROADCAST_SIBLINGS=1.
-    // Runs after the L9 sideband rule to broadcast existing bloom
-    // emitters to sibling same-parquet-path scans elsewhere in the
-    // plan (specifically the Q17 part⋈lineitem bloom → subquery
-    // lineitem.l_partkey scan pattern).
-    if std::env::var_os("EMAT_L9_BROADCAST_SIBLINGS").is_some() {
-        builder =
-            ematix_flow_core::broadcast_sibling_blooms_rule::install_broadcast_sibling_blooms_rule(
-                builder,
-            );
-    }
-    // Σ.Q.L4′: install the in-scan bloom pushdown rule with an empty
-    // shared bloom slot. `run_ematix_flow` swaps the slot's contents
-    // before each timed query when EMAT_BLOOM_PUSHDOWN=1.
-    let bloom_pushdown = std::env::var("EMAT_BLOOM_PUSHDOWN")
-        .ok()
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
-    let bloom_rule: Option<Arc<EnableInBloomScanPushdownRule>> = if bloom_pushdown {
-        let rule = Arc::new(EnableInBloomScanPushdownRule::default());
-        builder = builder.with_physical_optimizer_rule(rule.clone());
-        Some(rule)
-    } else {
-        None
+            .unwrap_or(true),
+        l9_min_probe_to_build_ratio: std::env::var("EMAT_RT_BLOOM_RATIO")
+            .ok()
+            .and_then(|s| s.parse().ok()),
+        l9_allow_inner_join: std::env::var("EMAT_RT_BLOOM_INNER_JOIN")
+            .ok()
+            .map(|v| v != "0" && !v.eq_ignore_ascii_case("false")),
+        l9_require_filtered_build: std::env::var("EMAT_L9_REQUIRE_FILTERED_BUILD")
+            .ok()
+            .map(|v| v != "0" && !v.eq_ignore_ascii_case("false")),
+        // Σ.S.B legacy stem-fanout cascade — EMAT_L9_CASCADE_STEM=1
+        // swaps the base L9 rule out (Σ.Q05.CHAIN repurposed
+        // EMAT_L9_CASCADE as the tri-state gate INSIDE the base rule).
+        l9_cascade_stem_max_extras: ematix_flow_core::flags::opt_in("EMAT_L9_CASCADE_STEM").then(
+            || {
+                std::env::var("EMAT_L9_CASCADE_MAX")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(4)
+            },
+        ),
+        l9_stock_defaults: false,
+        // Σ.AE: the installer itself no-ops unless
+        // EMAT_DROP_REDUNDANT_FILTER=1 (historical bench behavior).
+        drop_redundant_filter: true,
+        // Σ.Q.L4′: install the in-scan bloom pushdown rule with an
+        // empty shared slot; `run_ematix_flow` swaps the contents in
+        // per query when EMAT_BLOOM_PUSHDOWN=1.
+        in_bloom_scan_pushdown: std::env::var("EMAT_BLOOM_PUSHDOWN")
+            .ok()
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false),
+        swap_emat_hash_join: false,
+        flow_query_planner: true,
     };
+    let (builder, handles) = ematix_flow_core::preset::with_optimizer_rules_overridden(
+        SessionStateBuilder::new()
+            .with_config(session_config)
+            .with_default_features(),
+        &overrides,
+    );
+    let bloom_rule = handles.bloom_pushdown;
     let state = builder.build();
     let ctx = SessionContext::new_with_state(state);
     for t in TPCH_TABLES {
@@ -2177,25 +1800,170 @@ fn short(msg: &str) -> String {
         .collect()
 }
 
-/// Bench↔preset parity pins (2026-07-02, perf/q18-sf100-dig).
+/// Bench↔preset parity pins (2026-07-02, perf/q18-sf100-dig; extended
+/// same day by the chain-unification hardening).
 ///
-/// The strict harness measures "production defaults" through THIS
-/// example's `build_ematix_ctx`, which constructs its rule chain
-/// manually instead of calling `preset::with_optimizer_rules`. That
-/// duplication already bit once in each direction: Σ.V (2026-05-26)
-/// found three rules default-on in the bench but missing from the
-/// preset; this module pins the inverse gap found in the Q18 SF=100
-/// dig — RANGE.AGG (`ClusteredSinglePhaseAggRule`, preset-default
-/// since f15d2fc) was never installed here, so the 2026-07-01
-/// campaign measured Q18 SF=100 on the two-phase 150M-group agg plan
-/// (43.5s CPU) that production/preset users never execute, reporting
-/// a −1510 ms "loss" that is a harness artifact.
+/// History: the strict harness used to construct its rule chain
+/// manually instead of calling the preset, and the duplication bit
+/// once in each direction — Σ.V (2026-05-26) found three rules
+/// default-on in the bench but missing from the preset; the Q18 SF=100
+/// dig found the inverse (RANGE.AGG preset-default since f15d2fc but
+/// never installed here, corrupting a campaign's Q18 SF=100 verdicts);
+/// the Q05 cascade work found the bench still missing the production
+/// FlowQueryPlanner walkers (transitive dim-semi + shape-gated
+/// reorder). `build_ematix_ctx` now goes through
+/// `preset::with_optimizer_rules_overridden`, and this module pins
+/// FULL name-set equality (modulo the documented harness-only
+/// allowlist) so any re-fork trips immediately.
 ///
 /// Run: `cargo test -p ematix-flow-core --example
 /// tpch_triangulation_bench --features triangulation`.
 #[cfg(test)]
 mod bench_preset_parity_tests {
     use super::*;
+
+    /// Harness-only diagnostic rules the bench may install ON TOP of
+    /// the production chain — every one is opt-in via an env lever and
+    /// therefore ABSENT at default env (which is how these tests run).
+    /// Anything else appearing in the bench chain but not the preset
+    /// chain (or vice versa) is a parity bug.
+    const HARNESS_ONLY_PHYSICAL_RULES: &[&str] = &[
+        // EMAT_SINGLE_PASS_RADIX=1 (REPLACES the rh_sum rewrite)
+        "ematix_flow_enable_single_pass_radix_sum",
+        // EMAT_L9_CASCADE_STEM=1 (REPLACES the base L9 sideband rule)
+        "ematix_flow_enable_cascading_bloom",
+        // EMAT_RH_COUNT=1 / EMAT_RH_AVG=1
+        "ematix_flow_enable_robin_hood_agg",
+        "ematix_flow_enable_robin_hood_avg_f64",
+        // EMAT_AGG_PARTITION_BOOST=1
+        "AggPartitionBoostRule",
+        // EMAT_DROP_REDUNDANT_FILTER=1
+        "ematix_flow_drop_redundant_bridge_filter",
+        // EMAT_BLOOM_PUSHDOWN=1
+        "EnableInBloomScanPushdownRule",
+    ];
+    const HARNESS_ONLY_LOGICAL_RULES: &[&str] = &[
+        // EMAT_SYNTHETIC_LEFT_SEMI=1
+        "ematix_flow_synthetic_left_semi",
+    ];
+
+    /// THE drift tripwire: the strict bench session's ematix rule chain
+    /// (physical + logical, in registration order) must EQUAL the
+    /// production preset's, modulo the documented harness-only
+    /// allowlist. Adding a rule to `preset.rs` without going through
+    /// `with_optimizer_rules_overridden` — or re-forking the bench
+    /// chain — fails here.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn bench_rule_chain_name_set_equals_production_preset() {
+        use ematix_flow_core::preset;
+
+        let dir = write_fixture_dir();
+        let (ctx, _bloom) = build_ematix_ctx(&dir, Some(4)).await.unwrap();
+        let bench_state = ctx.state();
+        let preset_state = preset::with_optimizer_rules(
+            SessionStateBuilder::new()
+                .with_config(SessionConfig::new().with_target_partitions(4))
+                .with_default_features(),
+        )
+        .build();
+
+        let (bench_phys, bench_logi) = preset::ematix_rule_names(&bench_state);
+        let (preset_phys, preset_logi) = preset::ematix_rule_names(&preset_state);
+        let bench_phys: Vec<String> = bench_phys
+            .into_iter()
+            .filter(|n| !HARNESS_ONLY_PHYSICAL_RULES.contains(&n.as_str()))
+            .collect();
+        let bench_logi: Vec<String> = bench_logi
+            .into_iter()
+            .filter(|n| !HARNESS_ONLY_LOGICAL_RULES.contains(&n.as_str()))
+            .collect();
+        assert_eq!(
+            bench_phys, preset_phys,
+            "strict bench PHYSICAL rule chain diverged from the production \
+             preset (allowlist-filtered). If you changed the preset chain, \
+             it flows through with_optimizer_rules_overridden automatically \
+             — this failing means a rule was registered OUTSIDE the unified \
+             constructor, or a harness-only rule is missing from the \
+             documented allowlist."
+        );
+        assert_eq!(
+            bench_logi, preset_logi,
+            "strict bench LOGICAL rule chain diverged from the production preset"
+        );
+        // The preset also pins the chain content itself; re-assert here
+        // so a bench-session drift can never pass silently even if the
+        // preset test module is skipped.
+        assert_eq!(preset_phys, preset::PRODUCTION_PHYSICAL_RULE_NAMES);
+        assert_eq!(preset_logi, preset::PRODUCTION_LOGICAL_RULE_NAMES);
+        // Query planner parity: the bench must ship the production
+        // FlowQueryPlanner (the Q05 transitive-dim-semi / shape-gated
+        // reorder / scalar-agg-boost carrier).
+        assert_eq!(
+            format!("{:?}", bench_state.query_planner()),
+            format!("{:?}", preset_state.query_planner()),
+            "bench session's query planner differs from the production preset's"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Plan-identity pin: with identical providers + partitions, the
+    /// bench session and a pure-preset session must produce
+    /// byte-identical physical plans for the fixture's Q18 subquery
+    /// shape (covers rule CONFIG parity — e.g. the L9 milestone fields
+    /// — that name-set equality alone can't see).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn bench_fixture_plan_identical_to_preset_session() {
+        use ematix_flow_core::preset;
+
+        let dir = write_fixture_dir();
+        let sql = "select l_orderkey from lineitem \
+                   group by l_orderkey having sum(l_quantity) > 300";
+
+        let (bench_ctx, _bloom) = build_ematix_ctx(&dir, Some(4)).await.unwrap();
+
+        let preset_ctx = SessionContext::new_with_state(
+            preset::with_optimizer_rules(
+                SessionStateBuilder::new()
+                    .with_config(SessionConfig::new().with_target_partitions(4))
+                    .with_default_features(),
+            )
+            .build(),
+        );
+        for t in TPCH_TABLES {
+            let path = dir
+                .join(format!("{t}.parquet"))
+                .to_string_lossy()
+                .into_owned();
+            let prov = EmatixFastParquetTableProvider::try_new(path).unwrap();
+            preset_ctx.register_table(*t, Arc::new(prov)).unwrap();
+        }
+
+        let render = |ctx: &SessionContext| {
+            let ctx = ctx.clone();
+            let sql = sql.to_string();
+            async move {
+                let plan = ctx
+                    .sql(&sql)
+                    .await
+                    .unwrap()
+                    .create_physical_plan()
+                    .await
+                    .unwrap();
+                datafusion::physical_plan::displayable(plan.as_ref())
+                    .indent(true)
+                    .to_string()
+            }
+        };
+        let bench_plan = render(&bench_ctx).await;
+        let preset_plan = render(&preset_ctx).await;
+        assert_eq!(
+            bench_plan, preset_plan,
+            "bench session plans the fixture query differently from the \
+             production preset session — a rule CONFIG (not membership) \
+             diverged.\nbench:\n{bench_plan}\npreset:\n{preset_plan}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// Write one tiny valid parquet and copy it to every TPC-H table
     /// name so `build_ematix_ctx` can register a full catalog. The
