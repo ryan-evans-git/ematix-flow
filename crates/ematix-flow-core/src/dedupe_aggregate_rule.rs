@@ -432,8 +432,9 @@ mod tests {
     // A/B off-arm + any future regression escape hatch).
     #[test]
     fn cse_filter_fusion_defaults_on_and_respects_explicit_off() {
-        // SAFETY: single-threaded mutation of a process env var that no other
-        // test in this crate reads; saved + restored around the assertions.
+        // SAFETY: mutation window serialized by the crate-wide env lock;
+        // saved + restored around the assertions.
+        let _env = crate::flags::EMAT_ENV_TEST_LOCK.blocking_lock();
         let saved = std::env::var_os("EMAT_CSE_FILTER_FUSION");
         unsafe {
             std::env::remove_var("EMAT_CSE_FILTER_FUSION");

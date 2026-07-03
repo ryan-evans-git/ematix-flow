@@ -22,24 +22,40 @@ formatting per row, like:
 """
 
 import argparse
+import json
 import os
 import re
 import statistics
 import sys
 
 
-ROW_RE = re.compile(r'^\|\s*Q(\d{2})\s*\|\s*([\d.]+)\s*±\s*([\d.]+)\s*\|')
+# Column order in the triangulation table: ematix-flow, DuckDB, Polars.
+# Solo-engine runs (TPCH_SKIP_* on the others) leave absent columns as
+# "—", so parsing must be column-aware rather than first-number-wins.
+ENGINE_COLS = {"ematix": 0, "duckdb": 1, "polars": 2}
+
+Q_RE = re.compile(r'^Q(\d{2})')
+VAL_RE = re.compile(r'([\d.]+)\s*±\s*([\d.]+)')
 
 
-def parse_run(path: str) -> dict[str, tuple[float, float]]:
-    """Returns {query_id: (median_ms, within_run_sigma_ms)}."""
+def parse_run(path: str, engine: str = "ematix") -> dict[str, tuple[float, float]]:
+    """Returns {query_id: (median_ms, within_run_sigma_ms)} for `engine`'s
+    column."""
+    col = ENGINE_COLS[engine]
     rows: dict[str, tuple[float, float]] = {}
     with open(path) as f:
         for line in f:
-            m = ROW_RE.match(line)
-            if m:
-                q, med, sig = m.group(1), float(m.group(2)), float(m.group(3))
-                rows[q] = (med, sig)
+            if not line.startswith("|"):
+                continue
+            cells = [c.strip() for c in line.strip().strip("|").split("|")]
+            if not cells:
+                continue
+            qm = Q_RE.match(cells[0])
+            if not qm or len(cells) < col + 2:
+                continue
+            vm = VAL_RE.search(cells[col + 1])
+            if vm:
+                rows[qm.group(1)] = (float(vm.group(1)), float(vm.group(2)))
     return rows
 
 
@@ -54,7 +70,23 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--discard-first", action="store_true",
                     help="exclude the first run (catches cold-start)")
     ap.add_argument("--out", required=True, help="write summary to this path")
+    ap.add_argument("--env-json", default=None,
+                    help="env.json from strict_common.sh capture_env; embeds "
+                         "machine/flag metadata in the summary header so no "
+                         "result table is machine-ambiguous")
+    ap.add_argument("--engine", default="ematix", choices=sorted(ENGINE_COLS),
+                    help="which engine's column to aggregate (solo-engine "
+                         "verdict runs leave the other columns as em-dash)")
     args = ap.parse_args(argv)
+
+    env = None
+    if args.env_json:
+        if not os.path.exists(args.env_json):
+            print(f"ERROR: --env-json file not found: {args.env_json}",
+                  file=sys.stderr)
+            return 2
+        with open(args.env_json) as f:
+            env = json.load(f)
 
     runs = sorted(args.runs)
     if len(runs) < 2:
@@ -68,9 +100,11 @@ def main(argv: list[str]) -> int:
         print(f"ERROR: need ≥2 runs after discard-first (got {len(runs)})", file=sys.stderr)
         return 2
 
-    parsed = {os.path.basename(r): parse_run(r) for r in runs}
-    if not parsed:
-        print(f"ERROR: no rows parsed from runs", file=sys.stderr)
+    parsed = {os.path.basename(r): parse_run(r, args.engine) for r in runs}
+    if not any(parsed.values()):
+        print(f"ERROR: no rows parsed from runs for engine "
+              f"'{args.engine}' — wrong column or empty tables?",
+              file=sys.stderr)
         return 2
 
     # Quality check — every run must have the same query set.
@@ -106,7 +140,27 @@ def main(argv: list[str]) -> int:
 
     # Write summary.
     with open(args.out, "w") as f:
-        f.write("# Σ.AI.1 strict 22q SF=10 bench summary\n\n")
+        f.write(f"# Σ.AI.1 strict 22q bench summary — {args.engine}\n\n")
+        if env:
+            # Run-scoped keys (sf, plan_cache, cache_policy) may sit at the
+            # top level or under "run" depending on the capture path.
+            run = {**env, **env.get("run", {})}
+            sf = run.get("sf", "?")
+            f.write(f"- Machine: {env.get('chip', '?')} "
+                    f"({env.get('perf_cores', '?')}P+"
+                    f"{env.get('efficiency_cores', '?')}E), "
+                    f"macOS {env.get('macos', '?')}, "
+                    f"power: {env.get('power_source', '?')}\n")
+            f.write(f"- Git: {env.get('git_sha', '?')[:12]} on "
+                    f"{env.get('git_branch', '?')} "
+                    f"(dirty: {env.get('git_dirty', '?')})\n")
+            f.write(f"- Data: SF={sf}; plan cache: "
+                    f"{run.get('plan_cache', '?')}; cache policy: "
+                    f"{run.get('cache_policy', '?')}\n")
+            f.write(f"- Engines: {env.get('engine_versions', {})}\n")
+            emat = {k: v for k, v in env.get("emat_env", {}).items()
+                    if k.startswith("EMAT_")}
+            f.write(f"- EMAT flags: {emat or '<none>'}\n\n")
         f.write(f"- Runs aggregated: {len(parsed)} of {len(runs) + len(discarded)} "
                 f"(discarded {len(discarded)} cold-start: "
                 f"{[os.path.basename(d) for d in discarded]})\n")

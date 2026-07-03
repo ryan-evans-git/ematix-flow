@@ -76,6 +76,12 @@ use ematix_parquet_io::{PageWalker, ParquetFile};
 /// `DEFAULT_BATCH_SIZE` and DataFusion's pipelining sweet spot.
 pub const DEFAULT_BATCH_SIZE: usize = 65_536;
 
+/// NARROW.DEC fire counter (observability, mirrors `TAG_BUILDS` /
+/// `RH_BUILDS`): number of column chunks decoded through the
+/// downcast-on-read narrow path (`Int32` target over physical INT64).
+/// Read by tests and the A/B harness to prove which decode path ran.
+pub static NARROW_KEY_DECODES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 // ---------------------------------------------------------------------
 // Σ.O.c.1 — Private row-group decode cache.
 //
@@ -430,6 +436,13 @@ pub struct EmatArrowBatchReaderBuilder {
     /// stalls waiting for the build (the wait-based design cost Q17
     /// +31% in-sweep when a cold build blew through its 60ms budget).
     late_arm: Option<crate::bridge_filter_sideband::BridgeFilterSideband>,
+    /// NARROW.DEC — file-leaf indices of KEYS.2-narrowed INT64 key
+    /// columns that should decode DIRECTLY to `Int32` (downcast-on-
+    /// read) instead of decode-wide + boundary-cast. `build()` rewrites
+    /// the matching projected fields Int64→Int32 so the reader emits
+    /// `Int32Array` natively. Empty by default (bit-identical to the
+    /// pre-NARROW.DEC reader).
+    narrow_i64_leaves: Vec<usize>,
 }
 
 impl EmatArrowBatchReaderBuilder {
@@ -446,7 +459,20 @@ impl EmatArrowBatchReaderBuilder {
             decode_cache: None,
             rg_decode_cache: None,
             late_arm: None,
+            narrow_i64_leaves: Vec::new(),
         }
+    }
+
+    /// NARROW.DEC — declare the file-leaf indices of stats-proven
+    /// narrowed INT64 keys (KEYS.2's `narrowed_leaves`). Projected
+    /// leaves in this set whose schema field is `Int64` over a
+    /// physical INT64 column are rewritten to `Int32` at `build()`
+    /// and decode through `read_column_i64_downcast` — emitting
+    /// `Int32Array` directly, no transient `Vec<i64>`, no boundary
+    /// cast. Leaves not projected (or not Int64) are ignored.
+    pub fn with_narrow_i64_leaves(mut self, leaves: Vec<usize>) -> Self {
+        self.narrow_i64_leaves = leaves;
+        self
     }
 
     /// Σ.O.b — install a process-shared parquet decode cache. Across
@@ -597,15 +623,44 @@ impl EmatArrowBatchReaderBuilder {
         // Pre-validate each projected column's Arrow target against
         // its parquet physical type — fail-fast at build() so callers
         // get a clean error before they start iterating.
+        // NARROW.DEC — rewrite narrowed key leaves to their advertised
+        // Int32 BEFORE validation, so the reader emits `Int32Array`
+        // directly (downcast-on-read) and validation sees the final
+        // (target, phys) pairs. Only an `Int64` field over a physical
+        // INT64 leaf listed in `narrow_i64_leaves` is rewritten;
+        // everything else — including the empty default — is untouched.
+        let arrow_schema = if self.narrow_i64_leaves.is_empty() {
+            self.arrow_schema
+        } else {
+            let mut fields: Vec<Arc<arrow_schema::Field>> = Vec::with_capacity(projection.len());
+            for (proj_idx, &leaf) in projection.iter().enumerate() {
+                let f = self.arrow_schema.field(proj_idx);
+                if self.narrow_i64_leaves.contains(&leaf)
+                    && matches!(f.data_type(), DataType::Int64)
+                    && column_physical_type(&md, leaf)? == ParquetType::Int64
+                {
+                    fields.push(Arc::new(
+                        arrow_schema::Field::new(f.name(), DataType::Int32, f.is_nullable())
+                            .with_metadata(f.metadata().clone()),
+                    ));
+                } else {
+                    fields.push(Arc::new(f.clone()));
+                }
+            }
+            Arc::new(arrow_schema::Schema::new_with_metadata(
+                fields,
+                self.arrow_schema.metadata().clone(),
+            ))
+        };
         for (proj_idx, &leaf) in projection.iter().enumerate() {
             let phys = column_physical_type(&md, leaf)?;
-            let target = self.arrow_schema.field(proj_idx).data_type();
-            validate_type_pair(self.arrow_schema.field(proj_idx).name(), phys, target)?;
+            let target = arrow_schema.field(proj_idx).data_type();
+            validate_type_pair(arrow_schema.field(proj_idx).name(), phys, target)?;
         }
 
         Ok(EmatArrowBatchReader {
             file: self.file,
-            arrow_schema: self.arrow_schema,
+            arrow_schema,
             projection,
             row_groups,
             batch_size: self.batch_size,
@@ -643,7 +698,14 @@ fn column_physical_type(
 
 fn validate_type_pair(name: &str, phys: ParquetType, target: &DataType) -> DfResult<()> {
     let ok = match target {
-        DataType::Int32 | DataType::Date32 => phys == ParquetType::Int32,
+        // NARROW.DEC: an Int32 target over a physical INT64 column is
+        // the downcast-on-read shape installed by
+        // `with_narrow_i64_leaves` (KEYS.2 stats-proven key narrowing).
+        // `decode_one_column` / `masked_decode_one_column` self-route
+        // on the physical type and check-narrow, so the pair is safe.
+        // Date32 must stay INT32-only — no narrowing decode exists.
+        DataType::Int32 => phys == ParquetType::Int32 || phys == ParquetType::Int64,
+        DataType::Date32 => phys == ParquetType::Int32,
         // KEYS.4.b: UInt64 is physically stored as INT64 (parquet's only
         // 64-bit integer width); surfaced via a zero-copy bit reinterpret.
         DataType::Int64 | DataType::UInt64 => phys == ParquetType::Int64,
@@ -1185,7 +1247,13 @@ impl EmatArrowBatchReader {
                 // Same REV.23 threshold: gather wins ≤4.3%, dense wins
                 // ≥15%, 0.10 sits in the gap.
                 let popcount: usize = bitmap.iter().map(|b| b.count_ones() as usize).sum();
-                if total == 0
+                // Σ.Q05.CHAIN — a chain-intermediate filter's bitmap
+                // must APPLY regardless of the pass-rate routing: the
+                // next chain link samples this scan's output, and
+                // intermediate targets are dim-sized (per-batch filter
+                // is negligible). Everything else keeps REV.23.
+                if filter.apply_when_dense()
+                    || total == 0
                     || (popcount as f64 / total as f64) <= masked_dense_passrate_threshold()
                 {
                     self.cur_rg_filter_bitmap =
@@ -1271,7 +1339,10 @@ impl EmatArrowBatchReader {
         if should_route_masked_to_dense(popcount, total, masked_dense_passrate_threshold()) {
             self.cur_rg_total = self.cached_md.row_groups[rg].num_rows as usize;
             self.load_row_group_dense(rg)?;
-            if std::env::var_os("EMAT_EXACT_PUSHDOWN").is_some() {
+            // Σ.Q05.CHAIN — chain-intermediate filters must apply even
+            // when routed dense (see site above); Σ.AE.2 Exact mode
+            // stashes for correctness as before.
+            if filter.apply_when_dense() || std::env::var_os("EMAT_EXACT_PUSHDOWN").is_some() {
                 self.cur_rg_filter_bitmap =
                     Some(datafusion::arrow::buffer::Buffer::from_vec(bitmap));
             }
@@ -1284,6 +1355,7 @@ impl EmatArrowBatchReader {
         let projection = &self.projection;
         let schema = &self.arrow_schema;
         let file = &self.file;
+        let cached_md = &self.cached_md;
         let n_cols = projection.len();
         let cap = self.parallelism_budget.unwrap_or_else(|| {
             std::thread::available_parallelism()
@@ -1296,8 +1368,9 @@ impl EmatArrowBatchReader {
             let mut out = Vec::with_capacity(n_cols);
             for (proj_idx, &leaf) in projection.iter().enumerate() {
                 let target = schema.field(proj_idx).data_type();
+                let phys = cached_md.row_groups[rg].columns[leaf].column_type;
                 out.push(masked_decode_one_column(
-                    file, rg, leaf, &bitmap, popcount, target,
+                    file, rg, leaf, &bitmap, popcount, target, phys,
                 )?);
             }
             out
@@ -1318,8 +1391,9 @@ impl EmatArrowBatchReader {
                             }
                             let leaf = projection[i];
                             let target = schema.field(i).data_type();
+                            let phys = cached_md.row_groups[rg].columns[leaf].column_type;
                             let r = masked_decode_one_column(
-                                file, rg, leaf, bitmap_ref, popcount, target,
+                                file, rg, leaf, bitmap_ref, popcount, target, phys,
                             );
                             local.push((i, r));
                         }
@@ -1605,10 +1679,22 @@ impl EmatArrowBatchReader {
         let file = &self.file;
         let cached_md = &self.cached_md;
         let n_cols = projection.len();
+        // NARROW.DEC — `RgCacheKey` is type-blind (path/rg/leaf), so a
+        // narrow-decoded Int32 column must never be shared with a wide
+        // (Int64-schema) consumer of the same leaf or vice versa.
+        // Narrowed leaves bypass the cache entirely (get AND insert).
+        let is_narrowed = |i: usize, leaf: usize| -> bool {
+            matches!(schema.field(i).data_type(), DataType::Int32)
+                && cached_md.row_groups[rg].columns[leaf].column_type == ParquetType::Int64
+        };
         let mut cached_cols: Vec<Option<DecodedColumn>> = vec![None; n_cols];
         let mut miss_indices: Vec<usize> = Vec::new();
         if let (Some(cache), Some(path)) = (self.rg_decode_cache.as_ref(), self.path.as_ref()) {
             for (i, &leaf) in projection.iter().enumerate() {
+                if is_narrowed(i, leaf) {
+                    miss_indices.push(i);
+                    continue;
+                }
                 let key = RgCacheKey {
                     file_path: path.clone(),
                     row_group_idx: rg,
@@ -1731,6 +1817,11 @@ impl EmatArrowBatchReader {
         if let (Some(cache), Some(path)) = (self.rg_decode_cache.as_ref(), self.path.as_ref()) {
             for (m, &proj_idx) in miss_indices.iter().enumerate() {
                 let leaf = projection[proj_idx];
+                // NARROW.DEC — see the probe loop: narrowed leaves are
+                // never inserted (type-blind key).
+                if is_narrowed(proj_idx, leaf) {
+                    continue;
+                }
                 let key = RgCacheKey {
                     file_path: path.clone(),
                     row_group_idx: rg,
@@ -1914,9 +2005,35 @@ fn masked_decode_one_column(
     bitmap: &[u8],
     popcount: usize,
     target: &DataType,
+    // NARROW.DEC — the leaf's parquet physical type, so an Int32
+    // target over physical INT64 (downcast-on-read narrowed key) can
+    // route to the wide masked decode + checked narrow of the (small)
+    // survivor set instead of mis-decoding INT64 pages as i32.
+    phys: ParquetType,
 ) -> DfResult<DecodedColumn> {
     match target {
         DataType::Int32 | DataType::Date32 => {
+            if phys == ParquetType::Int64 {
+                // NARROW.DEC masked arm: decode wide at the mask (the
+                // masked kernel skips zero-popcount pages, so the wide
+                // transient is only the survivor rows), then checked-
+                // narrow. `validate_type_pair` restricts this pair to
+                // Int32 targets.
+                let v = masked_decode_i64(file, rg, leaf, bitmap)
+                    .map_err(|e| ext(format!("masked i64→i32 leaf {leaf}: {e}")))?;
+                if v.len() != popcount {
+                    return Err(ext(format!(
+                        "masked i64→i32 leaf {leaf}: got {} rows, expected {popcount}",
+                        v.len()
+                    )));
+                }
+                let v = crate::ematix_parquet_bridge::i64s_into_i32_checked(v, rg, leaf)?;
+                NARROW_KEY_DECODES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return Ok(DecodedColumn::Int32 {
+                    data: Buffer::from_vec(v),
+                    n_rows: popcount,
+                });
+            }
             let v = masked_decode_i32(file, rg, leaf, bitmap)
                 .map_err(|e| ext(format!("masked i32 leaf {leaf}: {e}")))?;
             if v.len() != popcount {
@@ -2095,6 +2212,23 @@ fn decode_one_column(
     let cm = &cached_md.row_groups[rg].columns[leaf];
     match target {
         DataType::Int32 | DataType::Date32 => {
+            // NARROW.DEC: Int32 target over a physical INT64 chunk =
+            // the downcast-on-read shape (KEYS.2 narrowed key +
+            // EMAT_NARROW_KEY_DECODE). Decode directly at the
+            // narrowest stats-proven width — no transient Vec<i64>,
+            // no boundary cast (`validate_type_pair` restricts the
+            // pair to Int32; Date32 can never land here).
+            if cm.column_type == ParquetType::Int64 {
+                let v = crate::ematix_parquet_bridge::decode_column_chunk_i64_downcast_to_i32(
+                    file, rg, leaf,
+                )?;
+                NARROW_KEY_DECODES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let n_rows = v.len();
+                return Ok(DecodedColumn::Int32 {
+                    data: Buffer::from_vec(v),
+                    n_rows,
+                });
+            }
             let v = decode_dict_chunk_typed::<i32>(file, chunk_buf, cm, |b| {
                 decode_plain_i32(b).map_err(|e| ext(format!("plain i32: {e}")))
             })?;
@@ -3116,9 +3250,14 @@ mod tests {
     use ematix_parquet_format::types::CompressionCodec;
 
     fn tmp_parquet(name: &str) -> std::path::PathBuf {
+        // Unique per CALL — see 01e6a50: PID+name-keyed fixture paths race
+        // under the parallel test runner (interleaved re-write vs read).
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
-            "emat_arrow_reader_test_{}_{}",
+            "emat_arrow_reader_test_{}_{}_{}",
             std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed),
             name
         ));
         let _ = std::fs::create_dir_all(&dir);
@@ -3163,6 +3302,206 @@ mod tests {
         assert!(validate_type_pair("k", ParquetType::Int64, &DataType::UInt64).is_ok());
         // still rejected over a non-INT64 physical type
         assert!(validate_type_pair("k", ParquetType::Double, &DataType::UInt64).is_err());
+    }
+
+    /// NARROW.DEC — the downcast-on-read pair (Int32 target over
+    /// physical INT64) validates; Date32 must NOT inherit it.
+    #[test]
+    fn validate_type_pair_accepts_int32_over_int64_but_not_date32() {
+        assert!(validate_type_pair("k", ParquetType::Int64, &DataType::Int32).is_ok());
+        assert!(validate_type_pair("k", ParquetType::Int32, &DataType::Int32).is_ok());
+        assert!(validate_type_pair("d", ParquetType::Int64, &DataType::Date32).is_err());
+    }
+
+    // ---------- NARROW.DEC — downcast-on-read reader tests ----------
+
+    /// Fixture: 3-RG file with an i32-fitting INT64 key (negatives +
+    /// both i32 extremes on the edge rows) and a payload column.
+    fn write_narrow_fixture(path: &std::path::Path, n: usize) -> (Vec<i64>, Vec<f64>) {
+        let mut keys: Vec<i64> = (0..n as i64).map(|x| x * 31 - 500_000).collect();
+        keys[0] = i32::MIN as i64;
+        keys[n - 1] = i32::MAX as i64;
+        let payload: Vec<f64> = (0..n).map(|x| x as f64 * 0.25).collect();
+        write_table_to_path_with_row_group_size(
+            path,
+            &[
+                ("k_key", ColumnData::I64(&keys)),
+                ("v", ColumnData::F64(&payload)),
+            ],
+            CompressionCodec::Uncompressed,
+            (n / 3).max(1), // → 3 row groups
+        )
+        .unwrap();
+        (keys, payload)
+    }
+
+    fn narrow_fixture_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("k_key", DataType::Int64, false),
+            Field::new("v", DataType::Float64, false),
+        ]))
+    }
+
+    /// Result identity on the dense path: a narrowed leaf must emit an
+    /// `Int32Array` whose values equal the wide (`Int64Array`) path's,
+    /// on data with negatives and the i32 min/max edges; the untouched
+    /// payload column stays byte-identical. The fire counter proves the
+    /// downcast decode ran (the flag/leaf-set toggles the path).
+    #[test]
+    fn narrow_dec_dense_reader_matches_wide_path() {
+        let path = tmp_parquet("narrow_dense");
+        let n = 999;
+        let (keys, payload) = write_narrow_fixture(&path, n);
+
+        // Wide (control): no narrow leaves → Int64Array, the default.
+        let file = ParquetFile::open(&path).unwrap();
+        let wide = EmatArrowBatchReaderBuilder::new(file, narrow_fixture_schema())
+            .build()
+            .unwrap();
+        let mut wide_keys: Vec<i64> = Vec::new();
+        for b in wide {
+            let b = b.unwrap();
+            let k = b
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("wide path must stay Int64");
+            wide_keys.extend(k.values());
+        }
+        assert_eq!(wide_keys, keys);
+
+        // Narrow: leaf 0 declared narrowed → Int32Array, same values.
+        let before = NARROW_KEY_DECODES.load(std::sync::atomic::Ordering::Relaxed);
+        let file = ParquetFile::open(&path).unwrap();
+        let narrow = EmatArrowBatchReaderBuilder::new(file, narrow_fixture_schema())
+            .with_narrow_i64_leaves(vec![0])
+            .build()
+            .unwrap();
+        assert_eq!(
+            narrow.schema().field(0).data_type(),
+            &DataType::Int32,
+            "narrowed leaf must advertise Int32 on the reader schema"
+        );
+        let mut narrow_keys: Vec<i64> = Vec::new();
+        let mut narrow_payload: Vec<f64> = Vec::new();
+        for b in narrow {
+            let b = b.unwrap();
+            let k = b
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .expect("narrowed leaf must emit Int32Array");
+            narrow_keys.extend(k.values().iter().map(|&x| x as i64));
+            let v = b
+                .column(1)
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .expect("payload must stay Float64");
+            narrow_payload.extend(v.values());
+        }
+        assert_eq!(narrow_keys, keys, "narrow path must equal wide path");
+        assert_eq!(narrow_payload, payload, "payload untouched");
+        let after = NARROW_KEY_DECODES.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            after >= before + 3,
+            "downcast decode must have fired once per RG (3 RGs): {before} → {after}"
+        );
+    }
+
+    /// Result identity on the masked (filter) path: same narrowed leaf,
+    /// with a low-pass-rate filter so the masked-gather branch runs.
+    #[test]
+    fn narrow_dec_masked_reader_matches_wide_path() {
+        use crate::ematix_fast_parquet::{ColumnPredicate, F64RangeClause};
+        use datafusion::logical_expr::Operator;
+
+        let path = tmp_parquet("narrow_masked");
+        let n = 999;
+        let (keys, _) = write_narrow_fixture(&path, n);
+        // Filter on the PAYLOAD column: v < 5.0 → 20 of RG0's 333 rows
+        // (6%) pass — under the 10% masked/dense threshold, so the
+        // masked-gather branch (not the inexact dense fallback) runs —
+        // while the narrowed KEY is a projected column. RG1/RG2 have
+        // zero matches (bitmap short-circuit).
+        let mk_filter = || {
+            BridgeFilter::new(vec![ColumnPredicate::F64Range {
+                col_idx: 1,
+                clauses: vec![F64RangeClause {
+                    op: Operator::Lt,
+                    literal_f64: 5.0,
+                }],
+            }])
+        };
+        let expected: Vec<i64> = keys
+            .iter()
+            .enumerate()
+            .filter(|&(i, _)| (i as f64 * 0.25) < 5.0)
+            .map(|(_, &k)| k)
+            .collect();
+
+        // Wide masked (control).
+        let file = ParquetFile::open(&path).unwrap();
+        let wide = EmatArrowBatchReaderBuilder::new(file, narrow_fixture_schema())
+            .with_filter(mk_filter(), path.clone())
+            .build()
+            .unwrap();
+        let mut wide_keys: Vec<i64> = Vec::new();
+        for b in wide {
+            let b = b.unwrap();
+            let k = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+            wide_keys.extend(k.values());
+        }
+        assert_eq!(wide_keys, expected, "wide masked control");
+
+        // Narrow masked.
+        let file = ParquetFile::open(&path).unwrap();
+        let narrow = EmatArrowBatchReaderBuilder::new(file, narrow_fixture_schema())
+            .with_filter(mk_filter(), path.clone())
+            .with_narrow_i64_leaves(vec![0])
+            .build()
+            .unwrap();
+        let mut narrow_keys: Vec<i64> = Vec::new();
+        for b in narrow {
+            let b = b.unwrap();
+            let k = b
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .expect("narrowed leaf must emit Int32Array on the masked path");
+            narrow_keys.extend(k.values().iter().map(|&x| x as i64));
+        }
+        assert_eq!(narrow_keys, expected, "narrow masked must equal wide");
+    }
+
+    /// A leaf declared narrow whose data does NOT fit i32 must error
+    /// loudly (checked narrow), never wrap.
+    #[test]
+    fn narrow_dec_out_of_range_leaf_errors() {
+        let path = tmp_parquet("narrow_overflow");
+        let big: Vec<i64> = vec![0, 1, i32::MAX as i64 + 10, 3];
+        write_table_to_path(
+            &path,
+            &[("k_key", ColumnData::I64(&big))],
+            CompressionCodec::Uncompressed,
+        )
+        .unwrap();
+        let file = ParquetFile::open(&path).unwrap();
+        let reader = EmatArrowBatchReaderBuilder::new(
+            file,
+            Arc::new(Schema::new(vec![Field::new(
+                "k_key",
+                DataType::Int64,
+                false,
+            )])),
+        )
+        .with_narrow_i64_leaves(vec![0])
+        .build()
+        .unwrap();
+        let results: Vec<DfResult<RecordBatch>> = reader.collect();
+        assert!(
+            results.iter().any(|r| r.is_err()),
+            "out-of-i32 data under a narrow-declared leaf must error, not wrap"
+        );
     }
 
     fn write_three_primitives(path: &std::path::Path, n: usize) {

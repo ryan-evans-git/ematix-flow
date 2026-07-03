@@ -1,6 +1,11 @@
 # PERF_Q18 — Q18 SF=10 stage profile
 
 Status: **re-verified 2026-05-26** (Σ.AH B.18).
+**2026-07-02:** the SF=10 sections below are partially historical — the
+RobinHoodSumF64 plan they show was gated out by REV.18 (2026-05-31; Q18
+now runs the stock two-phase agg at SF=10). For the SF=100 story, the
+current source of truth is [§ SF=100 dig (2026-07-02)](#sf100-dig-2026-07-02)
+at the bottom of this file.
 
 ## Wall time (20×3 canonical 2026-05-26)
 
@@ -124,3 +129,193 @@ Plan confirms `RobinHoodSumF64Exec` is being used for the `sum(l_quantity) gby l
 ## Next levers
 
 1. (Cross-Q for Q17 + Q18) **Double-scan L9** — detect when the same large fact table is scanned twice in a plan and propagate the most-selective bloom to both. Single rule extension could close residual gaps on Q17 and Q18.
+
+---
+
+<a name="sf100-dig-2026-07-02"></a>
+## SF=100 dig (2026-07-02) — the campaign's −1510 ms was a harness artifact; residual ~300 ms is the re-inserted input shuffle
+
+Branch `perf/q18-sf100-dig`. Context: the 2026-07-01 campaign
+(`bench-results/campaign-2026-07-01/REPORT.md`) called Q18 SF=100 the
+dominant remaining loss — ematix 4087.79 ms vs DuckDB 2578.07 ms
+(−1509.72, 2σ bar 647.76 — note the huge ematix variance), with no
+lever touching it.
+
+### Root cause: bench/production parity gap (inverse-Σ.V)
+
+The strict harness binary (`tpch_triangulation_bench`, behind
+`scripts/bench/strict_22q.sh`) builds its optimizer chain manually and
+**never installed `ClusteredSinglePhaseAggRule` (RANGE.AGG)** — a
+production-preset default since `f15d2fc` (2026-06-10), the very commit
+whose subject line is "Q18 SF=100 flips to a win". That June win was
+measured on the preset path (`tpch_preset_rebench` →
+`preset::with_optimizer_rules`). The strict campaign therefore planned
+Q18's inner subquery as the plan production users never run:
+
+```
+AggregateExec(FinalPartitioned, gby=l_orderkey)      -- 150M-group merge
+  RepartitionExec(Hash [l_orderkey], 14)             -- 2.2 GB shuffle
+    AggregateExec(Partial, gby=l_orderkey)           -- 150M-group table ×14
+      lineitem (573 RGs, 600M rows)
+```
+
+= the 43.5s-CPU two-phase shape f15d2fc replaced. `tpch_validate` had
+the same gap (the 22/22 value gate never exercised the single-phase
+plan). Both are fixed on this branch, pinned by
+`bench_preset_parity_tests` in the bench example. This is the mirror
+image of the Σ.V alignment bug (2026-05-26: rules on in the bench,
+missing from the preset) — same root disease: two hand-maintained
+copies of the production rule chain. See "hardening" below.
+
+### Measured (M4 Max 36 GB, warm cache, solo, plan cache off, 3 trials / 1 warmup)
+
+| Arm | Q18 SF=100 wall | peak RSS |
+|---|---:|---:|
+| ematix, strict binary pre-fix (= campaign config) | 3457.02 ± 212.72 ms | 19.06 GB |
+| ematix, strict binary + RANGE.AGG (this branch) | **2484.86 ± 73.51 ms** | 16.26 GB |
+| DuckDB, same protocol | 2149.49 ± 31.82 ms | 7.56 GB |
+
+−28% wall, −2.8 GB peak RSS, and the campaign's tell-tale variance
+(σ 213 → 74; the 150M-group two-phase tables churn memory) collapses.
+SF=10: RANGE.AGG declines via the skew gate (traced), plan and wall
+unchanged (164.36 ± 2.66 ms this protocol). SF=1: declines;
+`tpch_validate` 22/22 PASS with the rule installed.
+
+### Residual ~300 ms: EnforceDistribution re-inserts the input shuffle
+
+The fixed plan is single-phase but NOT shuffle-free:
+
+```
+AggregateExec(SinglePartitioned, gby=l_orderkey)
+  RepartitionExec(Hash [l_orderkey], 14)     -- ← 600M rows / ~9.6 GB, still here
+    EmatixFastParquetExec(14 key-disjoint chunks, 573 RGs)
+```
+
+`with_assignments` advertises `UnknownPartitioning`, and
+`AggregateExec(SinglePartitioned)` requires hash distribution on the
+group key, so the rule's own `EnforceDistribution` re-run inserts a
+hash repartition of the full 600M-row scan output. The f15d2fc design
+intent ("no shuffle — each chunk aggregates its own key range") is only
+half-realized: we save the two-phase double-hashing (the bigger half,
+measured above) but still pay the full-input exchange. DataFusion has
+no way to express "range-disjoint on the group key" — and falsely
+advertising `Partitioning::Hash` on the chunked scan would leak
+upward (the agg maps input partitioning to its output), letting the
+RightSemi join above elide ITS build-side repartition and mis-pair
+hash-partitions with range-chunks → wrong results. Verified same
+DataFusion (53.1.0) as at f15d2fc, so June's 2461 ms preset win was
+also measured with this shuffle present.
+
+### Proposed arc: RANGE.AGG Stage 2 — shuffle-free sandwich
+
+Confine the partitioning claim strictly to the agg's input and cap it
+above the agg so it cannot leak into join planning:
+
+1. `with_assignments_claiming_hash(group_key)` — the chunked scan
+   advertises `Partitioning::Hash([group_key], n)` (satisfies the
+   SinglePartitioned requirement; row-correct for aggregation because
+   chunks are key-disjoint — every group's rows land in exactly one
+   partition, which is all HashPartitioned distribution promises a
+   consumer).
+2. Wrap the rewritten agg in a partitioning-reset pass-through
+   (advertise `UnknownPartitioning(n)`, forward everything else) so
+   EnforceDistribution re-satisfies any DOWNSTREAM hash requirement
+   with a repartition of the agg's output — which for Q18 sits above
+   the `HAVING sum > 300` filter: ~10k rows instead of 600M.
+3. Plan-diff tests: (a) no RepartitionExec between the chunked scan
+   and the SinglePartitioned agg; (b) a RepartitionExec IS present
+   above the reset node when a partitioned join consumes it; (c) the
+   existing boundary-span e2e stays exact. Value gate: tpch_validate
+   22/22 at SF=1 + single-trial SF=100 value match.
+
+Expected impact: the shuffle moves ~9.6 GB (600M × 16 B) through
+14×14 exchange queues; eliminating it should be worth −200…−400 ms of
+the −335 ms residual → Q18 SF=100 at parity-to-win vs DuckDB. Risk:
+the partitioning claim interacting with EquivalenceProperties /
+plan-cache keys — hence the reset-node cap and the plan-diff pins.
+Effort: 1–2 days including a strict SF=100 A/B and an SF=10 22q
+regression sweep.
+
+### Stage 2 LANDED (2026-07-02, branch `perf/q18-range-agg-stage2`)
+
+The sandwich shipped as designed, with one premise adaptation:
+
+- `EmatixFastParquetExec::with_assignments_claiming_hash(chunks,
+  [group_key])` — claims `Partitioning::Hash([k], n)`; equivalence
+  properties rebuilt fresh (no facts derived from the claim).
+- `PartitionClaimResetExec` (new node, `partition_claim_reset_exec.rs`)
+  caps the claim directly above the rewritten SinglePartitioned agg:
+  advertises `UnknownPartitioning(n)` + fresh equivalences, forwards
+  streams/schema/statistics 1:1. Stateless → plan-cache-safe (the
+  cache keys on canonicalised SQL, not plan nodes; per-node
+  participation is only re-execute-safe `with_new_children`, which
+  builds a fresh instance).
+- `is_pass_through_node` in the L9 sideband rule now recognizes the
+  reset node — otherwise the Q18 HAVING shape (FilterExec → reset →
+  agg) loses its selective-build classification and the RightSemi
+  build-side bloom emit declines.
+
+**Divergence found vs the design:** DF 53.1's `add_hash_on_top`
+re-inserts the hash repartition when `target_partitions > child
+partition count` EVEN IF the child's partitioning satisfies the
+requirement. So the shuffle stays eliminated only when the planner
+achieves `chunks == target_partitions` — true at SF=100 (573 RGs,
+dense strict gaps → 14 chunks / 14 targets), and self-correcting
+otherwise (the re-inserted repartition genuinely re-hashes, so
+sparse-gap files silently fall back to Stage 1 behavior, never to
+wrong results).
+
+Verified plan (SF=100, strict binary, EMAT_DUMP_PLAN of the executed
+plan):
+
+```
+BuildSideBloomEmitterExec (RightSemi build side)
+  RepartitionExec(Hash [l_orderkey], 14)     -- ← moved HERE: post-HAVING rows
+    FilterExec sum > 300
+      PartitionClaimResetExec partitions=14
+        AggregateExec(SinglePartitioned, gby=l_orderkey)
+          EmatixFastParquetExec(14 chunks, 573 RGs)   -- ← NO shuffle below
+```
+
+The orders side keeps its `RepartitionExec(Hash [o_orderkey], 14)` —
+the claim did not leak. Leak pin: a lib test plans a Partitioned hash
+join over the capped agg and asserts the agg-output repartition sits
+above the reset node, the other side keeps its repartition, and the
+join values are exact.
+
+Value gates: `tpch_validate` 22/22 PASS at SF=1; Q18 SF=100 PASS vs
+DuckDB (6398 rows value-match); rows identical with
+`EMAT_RANGE_AGG=0`. Informal single trials (1 warmup, warm-ish cache,
+NOT the strict protocol): Stage 2 at 2439/2297 ms vs Stage 1
+(ec9e464 binary) at 4479/3151 ms — direction consistent with the
+−200…−400 ms estimate; the strict SF=100 A/B and SF=10 22q sweep
+remain to be run.
+
+### Hardening (recommended, separate from this branch)
+
+The three hand-maintained rule chains (preset, strict bench,
+tpch_validate) have now produced two inverse alignment bugs. Extract a
+single `preset`-driven constructor the harnesses call with their extra
+opt-in knobs layered on top, or at minimum extend
+`bench_preset_parity_tests` to assert name-set equality between the
+bench session's ematix rules and the preset's.
+
+### Re-baseline note
+
+The campaign REPORT's Q18 SF=100 row (−1510 ms, and the Σ-medians it
+feeds) should be re-measured under the strict protocol with the fixed
+binary before it is quoted further; the pending strict-protocol
+rebaseline covers this.
+
+### Stage 2 strict verdict (2026-07-02, post-merge 90e6c7c)
+
+Strict interleaved binary A/B (ec9e464 vs Stage-2 main, SF=100, isolate,
+4 pairs × 10 trials): **−371.9 ms (−15.5%), clear WIN** (2400.4 →
+2028.5 ms, 2σ bar 109.8). Fresh same-session DuckDB solo: 2384.5 ms.
+**Q18 SF=100 flips to a clear ematix win (+356 ms ahead).**
+Results: `bench-results/q18-stage2-2026-07-02/`. Note: an earlier A/B
+accidentally compared the stale ec9e464 binary against itself (masked
+cargo failure — the example needs `--features triangulation`); that run
+is preserved evidence of the same-binary noise floor: Q18 SF=100 solo
+invocations are bimodal (~2500/~2880 ms), so interleaved A/B is
+mandatory for verdicts here.

@@ -41,6 +41,38 @@ pub fn present(var: &str) -> bool {
     env::var(var).is_ok()
 }
 
+/// Tri-state gate (Σ.AI.5 scale-gated levers): explicit `=1`/`=true` →
+/// `Some(true)` (force ON), explicit `=0`/`=false` → `Some(false)` (force
+/// OFF), unset or unrecognized → `None` (AUTO — the caller decides, e.g.
+/// from [`crate::scale_class`]).
+pub fn tri_state(var: &str) -> Option<bool> {
+    tri_state_of(env::var(var).ok().as_deref())
+}
+
+/// Pure core of [`tri_state`] so tests can pin the parse table without
+/// racing on process-global env vars (the `resolve_l9_ndv_max_rows`
+/// convention).
+fn tri_state_of(val: Option<&str>) -> Option<bool> {
+    match val {
+        Some(v) if v == "1" || v.eq_ignore_ascii_case("true") => Some(true),
+        Some(v) if v == "0" || v.eq_ignore_ascii_case("false") => Some(false),
+        _ => None,
+    }
+}
+
+/// Σ.AI.5 scale-gated lever (2026-07-02 campaign gating): explicit env
+/// value wins in BOTH directions (`=1` force on, `=0` force off); unset =
+/// AUTO — default **ON** only when the process has observed an SF≥100-class
+/// dataset ([`crate::scale_class::large_scale_seen`]), default OFF below.
+/// Used by the levers the 2026-07-01 campaign proved pay only at SF=100
+/// scale: `EMAT_DOWNCAST_KEYS` + `EMAT_NARROW_KEY_DECODE` (Q09 −1075 ms,
+/// but net +10% at SF=10), `EMAT_DATE_BUILD_SIDE` + `EMAT_NDV_BUILD_SIDE`
+/// (Q10 −947 ms, neutral at SF=10), `EMAT_FD_GROUPBY` (Q10 −99 ms, no
+/// regressions — gated consistently with its siblings).
+pub fn scale_gated_large(var: &str) -> bool {
+    tri_state(var).unwrap_or_else(crate::scale_class::large_scale_seen)
+}
+
 /// Numeric tunable: parse the var as `usize`, else fall back to `default`.
 pub fn usize_or(var: &str, default: usize) -> usize {
     env::var(var)
@@ -130,6 +162,23 @@ pub fn dump_active() -> String {
         .join(", ")
 }
 
+/// Serializes every test in this crate that mutates a PRODUCTION `EMAT_*`
+/// environment variable. The environment is process-global and the parallel
+/// test runner interleaves tests freely, so two tests toggling flags — even
+/// different flags in different modules — can break each other's read-back
+/// assertions (observed: `EMAT_NARROW_KEY_DECODE` fire-counter flakes in
+/// `ematix_fast_parquet`, and `EMAT_LARGE_SCALE_MIN_ROWS` is mutated from two
+/// modules, which module-local locks cannot serialize). Async tests hold the
+/// guard across awaits — `tokio::sync::Mutex` makes that clippy-clean
+/// (`await_holding_lock`); sync tests use `blocking_lock()`.
+///
+/// Rule: any test doing `set_var`/`remove_var` on a real flag takes this lock
+/// first and restores the var before dropping the guard. Tests that only READ
+/// flags don't take it (pre-existing exposure, unchanged). `flags::tests`
+/// itself uses synthetic `EMAT_TEST_*` names and is exempt by design.
+#[cfg(test)]
+pub(crate) static EMAT_ENV_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -176,6 +225,37 @@ mod tests {
         assert!(!opt_in(k), "0 => off");
         set(k, "yes");
         assert!(!opt_in(k), "only 1/true count as on");
+        clear(k);
+    }
+
+    #[test]
+    fn tri_state_parse_table() {
+        // Pure parse table — no env mutation, no race.
+        assert_eq!(tri_state_of(None), None, "unset => AUTO");
+        assert_eq!(tri_state_of(Some("1")), Some(true), "1 => force ON");
+        assert_eq!(tri_state_of(Some("true")), Some(true));
+        assert_eq!(tri_state_of(Some("TRUE")), Some(true), "case-insensitive");
+        assert_eq!(tri_state_of(Some("0")), Some(false), "0 => force OFF");
+        assert_eq!(tri_state_of(Some("false")), Some(false));
+        assert_eq!(tri_state_of(Some("FALSE")), Some(false));
+        assert_eq!(
+            tri_state_of(Some("yes")),
+            None,
+            "unrecognized value => AUTO (documented in EMAT_FLAGS.md)"
+        );
+        assert_eq!(tri_state_of(Some("")), None, "set-but-empty => AUTO");
+    }
+
+    #[test]
+    fn scale_gated_large_env_overrides_beat_auto() {
+        // Unique var name (parallel-runner convention above). The AUTO arm
+        // is exercised end-to-end in scale_class + the plan-diff tests;
+        // here we pin only that explicit values win in both directions.
+        let k = "EMAT_TEST_SCALE_GATED_E";
+        set(k, "1");
+        assert!(scale_gated_large(k), "=1 forces ON at any scale");
+        set(k, "0");
+        assert!(!scale_gated_large(k), "=0 forces OFF at any scale");
         clear(k);
     }
 

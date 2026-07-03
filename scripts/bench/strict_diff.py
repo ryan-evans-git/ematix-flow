@@ -39,7 +39,17 @@ def main(argv):
     ap.add_argument("--a", required=True)
     ap.add_argument("--b", required=True)
     ap.add_argument("--out", required=True)
+    ap.add_argument("--label-a", default=None,
+                    help="engine/mode name for A (e.g. 'ematix'); switches "
+                         "verdicts to neutral '<label> faster' wording for "
+                         "cross-engine diffs")
+    ap.add_argument("--label-b", default=None)
     args = ap.parse_args(argv)
+
+    # Legacy wording (WIN/regression, B relative to A) unless labels given.
+    label_a, label_b = args.label_a, args.label_b
+    v_b_faster = f"{label_b} faster" if label_b else "WIN"
+    v_a_faster = f"{label_a} faster" if label_a else "regression"
 
     a = parse(args.a)
     b = parse(args.b)
@@ -55,9 +65,9 @@ def main(argv):
         if abs(delta) <= bar:
             verdict = "noise"
         elif delta < 0:
-            verdict = "WIN"
+            verdict = v_b_faster
         else:
-            verdict = "regression"
+            verdict = v_a_faster
         rows.append({
             "q": q,
             "a": a_med, "a_sigma": a_sig,
@@ -91,11 +101,11 @@ def main(argv):
         pct_total = (delta_total / total_a * 100) if total_a > 0 else 0.0
         f.write(f"**Net Δ**: {delta_total:+.2f} ms ({pct_total:+.2f}%)\n\n")
 
-        wins = [r for r in rows if r["verdict"] == "WIN"]
-        regs = [r for r in rows if r["verdict"] == "regression"]
-        f.write(f"**Clear wins (>2σ)**: {len(wins)}  ")
+        wins = [r for r in rows if r["verdict"] == v_b_faster]
+        regs = [r for r in rows if r["verdict"] == v_a_faster]
+        f.write(f"**Clear {v_b_faster} (>2σ)**: {len(wins)}  ")
         f.write(", ".join(f"Q{r['q']} {r['delta']:+.1f}ms" for r in wins) + "\n")
-        f.write(f"**Clear regressions (>2σ)**: {len(regs)}  ")
+        f.write(f"**Clear {v_a_faster} (>2σ)**: {len(regs)}  ")
         f.write(", ".join(f"Q{r['q']} {r['delta']:+.1f}ms" for r in regs) + "\n")
 
 

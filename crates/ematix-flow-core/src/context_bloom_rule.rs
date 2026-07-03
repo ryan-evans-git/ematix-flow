@@ -163,9 +163,17 @@ mod tests {
     use std::collections::HashMap;
 
     fn tmp_parquet(name: &str) -> std::path::PathBuf {
+        // Unique per CALL: on case-insensitive filesystems (macOS)
+        // `tmp_parquet("match")` and `tmp_parquet("Match")` otherwise
+        // collide on the SAME path, and the parallel runner interleaves
+        // one test's write with the other's provider read ("footer
+        // length 0 exceeds file size 0" flake).
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
-            "context_bloom_rule_test_{}_{}",
+            "context_bloom_rule_test_{}_{}_{}",
             std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed),
             name
         ));
         let _ = std::fs::create_dir_all(&dir);

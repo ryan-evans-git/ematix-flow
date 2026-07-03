@@ -1,0 +1,103 @@
+  [env] captured -> bench-results/q18-stage2-2026-07-02/ab-sf100-q18/env.json
+=== Σ.AI.2 strict interleaved A/B bench ===
+  sf:             100
+  invocations:    4 (first of each discarded)
+  trials/run:     10
+  warmups/run:    2
+  cooldown:       adaptive (fallback 15s)
+  triangulate:    0
+  isolate:        1
+  plan cache:     off (both sides)
+  cache policy:   warm
+  env A:          <none>
+  env B:          
+  output:         bench-results/q18-stage2-2026-07-02/ab-sf100-q18
+
+--- pair 1 / 4 ---
+  → mode A invocation 1 → bench-results/q18-stage2-2026-07-02/ab-sf100-q18/A/run-1.md
+  → mode B invocation 1 → bench-results/q18-stage2-2026-07-02/ab-sf100-q18/B/run-1.md
+--- pair 2 / 4 ---
+  → mode A invocation 2 → bench-results/q18-stage2-2026-07-02/ab-sf100-q18/A/run-2.md
+  → mode B invocation 2 → bench-results/q18-stage2-2026-07-02/ab-sf100-q18/B/run-2.md
+--- pair 3 / 4 ---
+  → mode A invocation 3 → bench-results/q18-stage2-2026-07-02/ab-sf100-q18/A/run-3.md
+  → mode B invocation 3 → bench-results/q18-stage2-2026-07-02/ab-sf100-q18/B/run-3.md
+--- pair 4 / 4 ---
+  → mode A invocation 4 → bench-results/q18-stage2-2026-07-02/ab-sf100-q18/A/run-4.md
+  → mode B invocation 4 → bench-results/q18-stage2-2026-07-02/ab-sf100-q18/B/run-4.md
+
+--- aggregating ---
+
+# Σ.AI.2 strict interleaved A/B diff
+
+- A summary: `A/strict-22q-summary.md`
+- B summary: `B/strict-22q-summary.md`
+
+Per-query Δ = B − A. Verdict uses 2× max(σ_A, σ_B) as the noise bar.
+
+| Query | A median | B median | Δ ms | Δ % | bar (2σ) | verdict |
+|------:|---------:|---------:|-----:|----:|---------:|:--------|
+| Q18 | 2400.39 | 2028.50 | -371.89 | -15.49% | 109.78 | WIN |
+
+**Sum of A medians**: 2400.39 ms
+**Sum of B medians**: 2028.50 ms
+**Net Δ**: -371.89 ms (-15.49%)
+
+**Clear WIN (>2σ)**: 1  Q18 -371.9ms
+**Clear regression (>2σ)**: 0  
+=== Σ.AI.1 strict bench protocol ===
+  sf:             100
+  invocations:    4 (first will be discarded)
+  trials/run:     10
+  warmups/run:    2
+  cooldown:       adaptive (fallback 15s)
+  triangulate:    0
+  isolate:        1
+  plan cache:     off
+  cache policy:   warm
+  queries:        18
+  extra env:      <none>
+  output dir:     bench-results/q18-stage2-2026-07-02/duckdb-sf100-q18
+
+  [env] captured -> bench-results/q18-stage2-2026-07-02/duckdb-sf100-q18/env.json
+--- invocation 1 / 4 → bench-results/q18-stage2-2026-07-02/duckdb-sf100-q18/run-1.md ---
+  [thermal] pre: nominal
+  (isolated: 1 per-query processes)
+  [thermal] post: nominal
+
+--- invocation 2 / 4 → bench-results/q18-stage2-2026-07-02/duckdb-sf100-q18/run-2.md ---
+  [thermal] pre: nominal
+  (isolated: 1 per-query processes)
+  [thermal] post: nominal
+
+--- invocation 3 / 4 → bench-results/q18-stage2-2026-07-02/duckdb-sf100-q18/run-3.md ---
+  [thermal] pre: nominal
+  (isolated: 1 per-query processes)
+  [thermal] post: nominal
+
+--- invocation 4 / 4 → bench-results/q18-stage2-2026-07-02/duckdb-sf100-q18/run-4.md ---
+  [thermal] pre: nominal
+  (isolated: 1 per-query processes)
+  [thermal] post: nominal
+
+--- aggregate summary written to bench-results/q18-stage2-2026-07-02/duckdb-sf100-q18/strict-22q-summary.md ---
+# Σ.AI.1 strict 22q bench summary — duckdb
+
+- Machine: Apple M4 Max (10P+4E), macOS 26.5.1, power: Now drawing from 'AC Power'
+- Git: e5fa14865964 on main (dirty: True)
+- Data: SF=100; plan cache: off; cache policy: warm
+- Engines: {'datafusion': '53.1.0', 'duckdb': '1.10503.1', 'ematix-parquet-codec': '0.17.0', 'polars': '0.52.0'}
+- EMAT flags: {'EMAT_PLAN_CACHE': '0'}
+
+- Runs aggregated: 3 of 4 (discarded 1 cold-start: ['run-1.md'])
+- Run files: ['run-2.md', 'run-3.md', 'run-4.md']
+
+| Query | median ms | mean ms | σ ms | CV% | per-run medians |
+|------:|----------:|--------:|-----:|----:|:----------------|
+| Q18 | 2384.48 | 2379.81 | 13.92 | 0.58% | 2364.2 / 2390.8 / 2384.5 |
+
+**Sum of medians**: 2384.48 ms  (primary, robust to single-run outliers)
+**Sum of means**: 2379.81 ms  (secondary)
+**Median CV**: 0.58%  (noise-floor across invocations)
+**Max CV**: 0.58%  (worst-case per-query noise — likely single-run outlier)
+ALL-MEASUREMENT-DONE

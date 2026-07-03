@@ -27,10 +27,19 @@
 //! ## Opt-in
 //!
 //! Install via [`install_cascading_bloom_rule`] OR opt in at
-//! runtime via the env var `EMAT_L9_CASCADE=1`. **Default off.**
-//! The L9 base rule and this rule are mutually exclusive — install
-//! one or the other, not both. Cascading is a strict superset so
-//! the L9 base behavior is preserved when no extra scans match.
+//! runtime via the env var `EMAT_L9_CASCADE_STEM=1` (harness
+//! wiring). **Default off.** The L9 base rule and this rule are
+//! mutually exclusive — install one or the other, not both.
+//! Cascading is a strict superset so the L9 base behavior is
+//! preserved when no extra scans match.
+//!
+//! Σ.Q05.CHAIN (2026-07-02): `EMAT_L9_CASCADE` was REPURPOSED as the
+//! tri-state gate of the chain-cascade second phase inside the base
+//! rule ([`crate::runtime_bloom_cascade_chain`]) — a different
+//! mechanism (per-link blooms along a filtered-dim build chain, one
+//! emitter per join) from this rule's stem fanout (ONE bloom shared
+//! across FK-stem-matching scans). Setting `EMAT_L9_CASCADE` no
+//! longer selects this rule.
 
 use std::sync::Arc;
 
@@ -384,8 +393,16 @@ mod tests {
     use ematix_parquet_format::types::CompressionCodec;
 
     fn tmp_parquet(name: &str) -> std::path::PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("cascade_rule_test_{}_{}", std::process::id(), name));
+        // Unique per CALL — see 01e6a50: PID+name-keyed fixture paths race
+        // under the parallel test runner (interleaved re-write vs read).
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "cascade_rule_test_{}_{}_{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed),
+            name
+        ));
         let _ = std::fs::create_dir_all(&dir);
         dir.join(format!("{name}.parquet"))
     }

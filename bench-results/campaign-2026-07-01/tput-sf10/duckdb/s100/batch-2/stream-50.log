@@ -1,0 +1,77 @@
+=== TPC-H 22 triangulation bench ===
+    data:    /Users/ryanevans/RustroverProjects/ematix-flow/examples/tpch/data/sf10
+    queries: 22 ([10, 13, 19, 5, 20, 1, 7, 14, 18, 2, 15, 17, 4, 6, 21, 3, 11, 22, 8, 12, 9, 16])
+    trials:  1 (after 0 warmups)
+    output:  /Users/ryanevans/RustroverProjects/ematix-flow/bench-results/campaign-2026-07-01/tput-sf10/duckdb/s100/batch-2/stream-50.md
+
+    NOTE: single-invocation output is SMOKE-GRADE only. For win/loss
+    claims use scripts/bench/strict_22q.sh / strict_ab.sh /
+    strict_throughput.sh (see scripts/bench/README.md).
+
+--- Q10 ---
+  DuckDB       1939.68 ms ±  0.00  (381105 rows)
+
+--- Q13 ---
+  DuckDB       2092.86 ms ±  0.00  (46 rows)
+
+--- Q19 ---
+  DuckDB       1581.03 ms ±  0.00  (1 rows)
+
+--- Q05 ---
+  DuckDB       1250.32 ms ±  0.00  (5 rows)
+
+--- Q20 ---
+  DuckDB       1252.78 ms ±  0.00  (1804 rows)
+
+--- Q01 ---
+  DuckDB       1923.29 ms ±  0.00  (4 rows)
+
+--- Q07 ---
+  DuckDB       1075.85 ms ±  0.00  (4 rows)
+
+--- Q14 ---
+  DuckDB        753.67 ms ±  0.00  (1 rows)
+
+--- Q18 ---
+  DuckDB       1762.86 ms ±  0.00  (624 rows)
+
+--- Q02 ---
+  DuckDB        161.64 ms ±  0.00  (4667 rows)
+
+--- Q15 ---
+  DuckDB        546.16 ms ±  0.00  (1 rows)
+
+--- Q17 ---
+  DuckDB       1062.33 ms ±  0.00  (1 rows)
+
+--- Q04 ---
+  DuckDB        571.55 ms ±  0.00  (5 rows)
+
+--- Q06 ---
+  DuckDB        599.67 ms ±  0.00  (1 rows)
+
+--- Q21 ---
+  DuckDB       2947.94 ms ±  0.00  (4009 rows)
+
+--- Q03 ---
+  DuckDB       1090.70 ms ±  0.00  (114003 rows)
+
+--- Q11 ---
+  DuckDB        110.57 ms ±  0.00  (8685 rows)
+
+--- Q22 ---
+  DuckDB        187.32 ms ±  0.00  (7 rows)
+
+--- Q08 ---
+  DuckDB       1227.27 ms ±  0.00  (2 rows)
+
+--- Q12 ---
+  DuckDB        687.15 ms ±  0.00  (2 rows)
+
+--- Q09 ---
+  DuckDB       1910.43 ms ±  0.00  (175 rows)
+
+--- Q16 ---
+  DuckDB        465.03 ms ±  0.00  (27840 rows)
+
+wrote /Users/ryanevans/RustroverProjects/ematix-flow/bench-results/campaign-2026-07-01/tput-sf10/duckdb/s100/batch-2/stream-50.md

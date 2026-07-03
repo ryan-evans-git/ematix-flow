@@ -1,0 +1,213 @@
+  [env] captured -> bench-results/q05-rebaseline-2026-07-03/ab-sf10-cascade/env.json
+=== Σ.AI.2 strict interleaved A/B bench ===
+  sf:             10
+  invocations:    4 (first of each discarded)
+  trials/run:     10
+  warmups/run:    2
+  cooldown:       adaptive (fallback 15s)
+  triangulate:    0
+  isolate:        1
+  plan cache:     off (both sides)
+  cache policy:   warm
+  env A:          <none>
+  env B:          EMAT_L9_CASCADE=0
+  output:         bench-results/q05-rebaseline-2026-07-03/ab-sf10-cascade
+
+--- pair 1 / 4 ---
+  → mode A invocation 1 → bench-results/q05-rebaseline-2026-07-03/ab-sf10-cascade/A/run-1.md
+  → mode B invocation 1 → bench-results/q05-rebaseline-2026-07-03/ab-sf10-cascade/B/run-1.md
+--- pair 2 / 4 ---
+  → mode A invocation 2 → bench-results/q05-rebaseline-2026-07-03/ab-sf10-cascade/A/run-2.md
+  → mode B invocation 2 → bench-results/q05-rebaseline-2026-07-03/ab-sf10-cascade/B/run-2.md
+--- pair 3 / 4 ---
+  → mode A invocation 3 → bench-results/q05-rebaseline-2026-07-03/ab-sf10-cascade/A/run-3.md
+  → mode B invocation 3 → bench-results/q05-rebaseline-2026-07-03/ab-sf10-cascade/B/run-3.md
+--- pair 4 / 4 ---
+  → mode A invocation 4 → bench-results/q05-rebaseline-2026-07-03/ab-sf10-cascade/A/run-4.md
+  → mode B invocation 4 → bench-results/q05-rebaseline-2026-07-03/ab-sf10-cascade/B/run-4.md
+
+--- aggregating ---
+
+# Σ.AI.2 strict interleaved A/B diff
+
+- A summary: `A/strict-22q-summary.md`
+- B summary: `B/strict-22q-summary.md`
+
+Per-query Δ = B − A. Verdict uses 2× max(σ_A, σ_B) as the noise bar.
+
+| Query | A median | B median | Δ ms | Δ % | bar (2σ) | verdict |
+|------:|---------:|---------:|-----:|----:|---------:|:--------|
+| Q05 | 129.00 | 128.42 | -0.58 | -0.45% | 2.36 | noise |
+
+**Sum of A medians**: 129.00 ms
+**Sum of B medians**: 128.42 ms
+**Net Δ**: -0.58 ms (-0.45%)
+
+**Clear WIN (>2σ)**: 0  
+**Clear regression (>2σ)**: 0  
+=== Σ.AI.1 strict bench protocol ===
+  sf:             10
+  invocations:    4 (first will be discarded)
+  trials/run:     10
+  warmups/run:    2
+  cooldown:       adaptive (fallback 15s)
+  triangulate:    0
+  isolate:        1
+  plan cache:     off
+  cache policy:   warm
+  queries:        5
+  extra env:      <none>
+  output dir:     bench-results/q05-rebaseline-2026-07-03/duckdb-sf10-q05
+
+  [env] captured -> bench-results/q05-rebaseline-2026-07-03/duckdb-sf10-q05/env.json
+--- invocation 1 / 4 → bench-results/q05-rebaseline-2026-07-03/duckdb-sf10-q05/run-1.md ---
+  [thermal] pre: nominal
+  (isolated: 1 per-query processes)
+  [thermal] post: nominal
+
+--- invocation 2 / 4 → bench-results/q05-rebaseline-2026-07-03/duckdb-sf10-q05/run-2.md ---
+  [thermal] pre: nominal
+  (isolated: 1 per-query processes)
+  [thermal] post: nominal
+
+--- invocation 3 / 4 → bench-results/q05-rebaseline-2026-07-03/duckdb-sf10-q05/run-3.md ---
+  [thermal] pre: nominal
+  (isolated: 1 per-query processes)
+  [thermal] post: nominal
+
+--- invocation 4 / 4 → bench-results/q05-rebaseline-2026-07-03/duckdb-sf10-q05/run-4.md ---
+  [thermal] pre: nominal
+  (isolated: 1 per-query processes)
+  [thermal] post: nominal
+
+--- aggregate summary written to bench-results/q05-rebaseline-2026-07-03/duckdb-sf10-q05/strict-22q-summary.md ---
+# Σ.AI.1 strict 22q bench summary — duckdb
+
+- Machine: Apple M4 Max (10P+4E), macOS 26.5.1, power: Now drawing from 'AC Power'
+- Git: 279fe817ae27 on main (dirty: True)
+- Data: SF=10; plan cache: off; cache policy: warm
+- Engines: {'datafusion': '53.1.0', 'duckdb': '1.10503.1', 'ematix-parquet-codec': '0.17.0', 'polars': '0.52.0'}
+- EMAT flags: {'EMAT_PLAN_CACHE': '0'}
+
+- Runs aggregated: 3 of 4 (discarded 1 cold-start: ['run-1.md'])
+- Run files: ['run-2.md', 'run-3.md', 'run-4.md']
+
+| Query | median ms | mean ms | σ ms | CV% | per-run medians |
+|------:|----------:|--------:|-----:|----:|:----------------|
+| Q05 | 128.21 | 128.35 | 1.29 | 1.01% | 128.2 / 127.1 / 129.7 |
+
+**Sum of medians**: 128.21 ms  (primary, robust to single-run outliers)
+**Sum of means**: 128.35 ms  (secondary)
+**Median CV**: 1.01%  (noise-floor across invocations)
+**Max CV**: 1.01%  (worst-case per-query noise — likely single-run outlier)
+=== Σ.AI.1 strict bench protocol ===
+  sf:             100
+  invocations:    4 (first will be discarded)
+  trials/run:     10
+  warmups/run:    2
+  cooldown:       adaptive (fallback 15s)
+  triangulate:    0
+  isolate:        1
+  plan cache:     off
+  cache policy:   warm
+  queries:        5
+  extra env:      <none>
+  output dir:     bench-results/q05-rebaseline-2026-07-03/ematix-sf100-q05
+
+  [env] captured -> bench-results/q05-rebaseline-2026-07-03/ematix-sf100-q05/env.json
+--- invocation 1 / 4 → bench-results/q05-rebaseline-2026-07-03/ematix-sf100-q05/run-1.md ---
+  [thermal] pre: nominal
+  (isolated: 1 per-query processes)
+  [thermal] post: nominal
+
+--- invocation 2 / 4 → bench-results/q05-rebaseline-2026-07-03/ematix-sf100-q05/run-2.md ---
+  [thermal] pre: nominal
+  (isolated: 1 per-query processes)
+  [thermal] post: nominal
+
+--- invocation 3 / 4 → bench-results/q05-rebaseline-2026-07-03/ematix-sf100-q05/run-3.md ---
+  [thermal] pre: nominal
+  (isolated: 1 per-query processes)
+  [thermal] post: nominal
+
+--- invocation 4 / 4 → bench-results/q05-rebaseline-2026-07-03/ematix-sf100-q05/run-4.md ---
+  [thermal] pre: nominal
+  (isolated: 1 per-query processes)
+  [thermal] post: nominal
+
+--- aggregate summary written to bench-results/q05-rebaseline-2026-07-03/ematix-sf100-q05/strict-22q-summary.md ---
+# Σ.AI.1 strict 22q bench summary — ematix
+
+- Machine: Apple M4 Max (10P+4E), macOS 26.5.1, power: Now drawing from 'AC Power'
+- Git: 279fe817ae27 on main (dirty: True)
+- Data: SF=100; plan cache: off; cache policy: warm
+- Engines: {'datafusion': '53.1.0', 'duckdb': '1.10503.1', 'ematix-parquet-codec': '0.17.0', 'polars': '0.52.0'}
+- EMAT flags: {'EMAT_PLAN_CACHE': '0'}
+
+- Runs aggregated: 3 of 4 (discarded 1 cold-start: ['run-1.md'])
+- Run files: ['run-2.md', 'run-3.md', 'run-4.md']
+
+| Query | median ms | mean ms | σ ms | CV% | per-run medians |
+|------:|----------:|--------:|-----:|----:|:----------------|
+| Q05 | 1330.55 | 1331.23 | 9.31 | 0.70% | 1322.3 / 1330.5 / 1340.9 |
+
+**Sum of medians**: 1330.55 ms  (primary, robust to single-run outliers)
+**Sum of means**: 1331.23 ms  (secondary)
+**Median CV**: 0.70%  (noise-floor across invocations)
+**Max CV**: 0.70%  (worst-case per-query noise — likely single-run outlier)
+=== Σ.AI.1 strict bench protocol ===
+  sf:             100
+  invocations:    4 (first will be discarded)
+  trials/run:     10
+  warmups/run:    2
+  cooldown:       adaptive (fallback 15s)
+  triangulate:    0
+  isolate:        1
+  plan cache:     off
+  cache policy:   warm
+  queries:        5
+  extra env:      <none>
+  output dir:     bench-results/q05-rebaseline-2026-07-03/duckdb-sf100-q05
+
+  [env] captured -> bench-results/q05-rebaseline-2026-07-03/duckdb-sf100-q05/env.json
+--- invocation 1 / 4 → bench-results/q05-rebaseline-2026-07-03/duckdb-sf100-q05/run-1.md ---
+  [thermal] pre: nominal
+  (isolated: 1 per-query processes)
+  [thermal] post: nominal
+
+--- invocation 2 / 4 → bench-results/q05-rebaseline-2026-07-03/duckdb-sf100-q05/run-2.md ---
+  [thermal] pre: nominal
+  (isolated: 1 per-query processes)
+  [thermal] post: nominal
+
+--- invocation 3 / 4 → bench-results/q05-rebaseline-2026-07-03/duckdb-sf100-q05/run-3.md ---
+  [thermal] pre: nominal
+  (isolated: 1 per-query processes)
+  [thermal] post: nominal
+
+--- invocation 4 / 4 → bench-results/q05-rebaseline-2026-07-03/duckdb-sf100-q05/run-4.md ---
+  [thermal] pre: nominal
+  (isolated: 1 per-query processes)
+  [thermal] post: nominal
+
+--- aggregate summary written to bench-results/q05-rebaseline-2026-07-03/duckdb-sf100-q05/strict-22q-summary.md ---
+# Σ.AI.1 strict 22q bench summary — duckdb
+
+- Machine: Apple M4 Max (10P+4E), macOS 26.5.1, power: Now drawing from 'AC Power'
+- Git: 279fe817ae27 on main (dirty: True)
+- Data: SF=100; plan cache: off; cache policy: warm
+- Engines: {'datafusion': '53.1.0', 'duckdb': '1.10503.1', 'ematix-parquet-codec': '0.17.0', 'polars': '0.52.0'}
+- EMAT flags: {'EMAT_PLAN_CACHE': '0'}
+
+- Runs aggregated: 3 of 4 (discarded 1 cold-start: ['run-1.md'])
+- Run files: ['run-2.md', 'run-3.md', 'run-4.md']
+
+| Query | median ms | mean ms | σ ms | CV% | per-run medians |
+|------:|----------:|--------:|-----:|----:|:----------------|
+| Q05 | 1504.79 | 1505.21 | 1.10 | 0.07% | 1506.5 / 1504.4 / 1504.8 |
+
+**Sum of medians**: 1504.79 ms  (primary, robust to single-run outliers)
+**Sum of means**: 1505.21 ms  (secondary)
+**Median CV**: 0.07%  (noise-floor across invocations)
+**Max CV**: 0.07%  (worst-case per-query noise — likely single-run outlier)
+Q05-MEASUREMENT-DONE

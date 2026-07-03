@@ -1,6 +1,6 @@
 # Σ.AH.1 — L9 scan-level integration: design
 
-**Status:** **REJECTED 2026-05-27** via Phase 0 spike — see § 4. Decision documented in memory `[[sigma-ah-1-arc-rejected]]`.
+**Status:** **REJECTED 2026-05-27** via Phase 0 spike — see § 4. Decision documented in memory `[[sigma-ah-1-arc-rejected]]`. **Re-audited 2026-07-01** — premise confirmed fully stale on current main; rejection stands. See § 11.
 **Arc shell:** [`docs/plans/sigma-ah-arc-1.md`](plans/sigma-ah-arc-1.md).
 **Active plan:** archived at [`docs/plans/archive/2026-05-27-sigma-ah-1.md`](plans/archive/2026-05-27-sigma-ah-1.md).
 
@@ -161,3 +161,127 @@ If the bloom pass rate IS high (e.g., bloom-on-FK net-negative pattern), the gat
 - Σ.E5 dict-decode infrastructure: memory `[[sigma-e5-multi-buffer-stringview]]`, `[[sigma-l1-speculative]]`
 - L9 timing/firing fixes: memory `[[sigma-q-l13-to-l16-session]]`
 - Page-index pruning rejection precedent (similar shape, similar reason): memory `[[page-index-q14-dead-end]]`
+
+## 11. Premise re-audit (2026-07-01) — spec confirmed fully stale; rejection stands
+
+A fresh audit of the `PERF_REVIEW_2026_05.md` § Σ.AH.1 premise against current
+main (post-`1724102`, i.e. after L9.ADAPT v3 default-on, L9.DIMSEL.RT, the KEYS
+string-sideband family, and the Σ.AI.2 fused-probe default flip — all landed
+AFTER the § 4 rejection). The spec's claim was:
+
+> Q17's lineitem main scan decodes all 60M rows and only THEN probes the bloom
+> at HashJoinExec level; scan-level bloom (push into `EmatixFastParquetExec`'s
+> `BridgeFilter`) would let filtered rows skip decode entirely (~80 ms Q17,
+> ~40 ms Q18 at SF=10).
+
+**Verdict: fully stale, on every clause.**
+
+### 11.1 The mechanism exists — and has for over a month, default-wired
+
+The bloom is NOT consumed at HashJoinExec level. The complete scan-decode-level
+path on current main:
+
+1. **Plan time** — `EnableRuntimeBloomSidebandRule` (installed by `preset`,
+   default) creates a `BridgeFilterSideband` per admitted equi-key, wrapping
+   the build side in `BuildSideBloomEmitterExec` and attaching the same
+   sideband to the probe-side scan via
+   `EmatixFastParquetExec::with_runtime_sideband`
+   ([runtime_bloom_sideband_rule.rs:759](../crates/ematix-flow-core/src/runtime_bloom_sideband_rule.rs)).
+   A planner-time variant for pre-built blooms exists too
+   (`EnableInBloomScanPushdownRule`, Σ.Q.L4′).
+2. **Execute (probe), first poll** — the scan peeks the sideband and merges the
+   published `I64InBloom` / `I64InSet` / `StringIn*` predicates into the
+   `BridgeFilter` handed to the reader
+   ([ematix_fast_parquet.rs:3240-3253](../crates/ematix-flow-core/src/ematix_fast_parquet.rs)).
+3. **Decode** — `load_row_group_masked`
+   ([emat_arrow_reader.rs:1090](../crates/ematix-flow-core/src/emat_arrow_reader.rs))
+   evaluates the probe at row-group decode time. Two arms:
+   - **Fused (default ON since 2026-05-27, Σ.AI.2)**: dense-decode projected
+     columns, probe the already-decoded key buffer (statics first, probe on
+     survivors), stash the bitmap for the per-batch SIMD filter when the pass
+     rate ≤ 10% (`EMAT_MASKED_DENSE_PASSRATE`), discard it and emit dense
+     above.
+   - **Legacy masked (`EMAT_L9_FUSED_PROBE=0`)**: `BridgeFilter::build_bitmap`
+     decodes only predicate columns, then the remaining projected columns
+     decode through Π.10 `read_column_*_masked_into` — the literal
+     "skip decode of rows that miss the bloom" the spec asked for.
+
+So the "skip decode entirely" mechanism not only exists (legacy arm), it was
+**empirically de-selected as the default**: REV.23 measured the masked gather
+LOSING to dense-decode + SIMD filter at every pass rate ≥ 15% on unclustered
+keys (masked skips no pages when matches are uniform; it decompresses
+everything dense does, plus a non-scaling gather). The spec's core mental model
+— "decode skipped = wall saved" — is inverted for exactly the Q17/Q18 join-key
+distributions it cites.
+
+### 11.2 Trace evidence (this audit, SF=10 single trial, `EMAT_L9_TRACE=1`)
+
+**Q17** (252.7 ms wall): NO L9 fire at all — all three candidate wraps refused
+by the empirically-tuned admission gates:
+
+```
+[L9.trace] RightSemi — build=400000 probe=59986052 → skip: probe scan projects 2 cols < min 4
+[L9.trace] Inner     — build=400000 probe=59986052 → skip: probe scan projects 3 cols < min 4
+[L9.trace] Inner     — build=59986052 probe=2000000 → skip: tight rescue refused: probe < 8000000
+```
+
+The width floor (`TIGHT_MIN_PROBE_PROJ_COLS = 4`) exists BECAUSE Q17's narrow
+wraps were measured losing +25-31% in-sweep, twice (pinned in
+`tight_rescue_pre_gate_constants`). The spec's premise that Q17 carries an
+operator-level bloom is doubly wrong on current main: Q17 carries **no bloom
+anywhere** — deliberately.
+
+**Q18** (415.0 ms wall): the RightSemi filter-set→orders wrap FIRES
+(`expected_keys=10000` → exact `I64InSet`, under the 262K set threshold), and
+all 14 orders partitions log `peek=Some([...])` — scan-decode-level
+consumption, observed live. The 15M-build → 60M-lineitem outer wrap is refused
+by the same width gate (2 projected cols), consistent with the § 4 profile
+showing the bottleneck is the downstream HashJoin probe, not decode.
+
+At SF=1 nothing fires (probe floor `TIGHT_MIN_PROBE_ROWS = 8M` > 6M lineitem)
+— by design.
+
+### 11.3 Why the predicted −80/−40 ms cannot exist
+
+Unchanged from § 4, and re-confirmed by the gate provenance above: the Phase 0
+stage profile showed Q17's bloom-targetable outer lineitem scan is 155 ms of
+6970 ms total elapsed_compute; Q17/Q18 walls are dominated by HashJoin probe +
+AVG accumulate, downstream of any scan-level mechanism. Post-rejection arcs
+attacked those directly instead (RANGE.AGG `f15d2fc` flipped Q18 SF=100 to a
+win; L9.DIMSEL `f4d629a` flipped Q9).
+
+The one *real* residual scan-side lever the PERF_Q17/Q18 notes identify — the
+SECOND lineitem scan (Q17's AVG subquery, Q18's outer probe) getting a
+propagated bloom — is the cascade/sibling-broadcast family
+(`runtime_bloom_cascading_rule`, `broadcast_sibling_blooms_rule`, Σ.AJ.1
+territory), not Σ.AH.1, and both mechanisms already exist as opt-ins with their
+own gate history.
+
+### 11.4 Disposition
+
+- **No implementation.** Anything Σ.AH.1-shaped would re-litigate gates that
+  were tuned by repeated 22q SF=10 sweeps.
+- **Pinning tests added** (the tests that would have caught the stale spec at
+  write time):
+  - `wrap_threads_emitter_sideband_into_probe_scan`
+    (runtime_bloom_sideband_rule.rs) — plan-diff: after the L9 rule fires, the
+    probe-side `EmatixFastParquetExec` carries the SAME sideband instance as
+    the `BuildSideBloomEmitterExec` (`ptr_eq`), i.e. the bloom is threaded to
+    the scan, not consumed at the join.
+  - `published_sideband_filters_rows_at_scan_decode_level`
+    (ematix_fast_parquet.rs) — execution: a published `I64InBloom` filters the
+    SCAN's own output (no join in the plan) under both the fused default and
+    `EMAT_L9_FUSED_PROBE=0` legacy masked-decode arm, with identical results;
+    an all-pass bloom routes to dense (REV.23) without changing results.
+- `PERF_REVIEW_2026_05.md` § Σ.AH.1 and the "L9 bloom → in-scan filter" levers
+  in `PERF_Q17.md` / `PERF_Q18.md` should be read as historical (pre-Σ.AH.2
+  Stage 1) snapshots; this section is the current source of truth.
+
+### 11.5 Audit artefacts
+
+- Q17/Q18 SF=10 trace: `EMAT_L9_TRACE=1 Q=17|18 TRIALS=1 WARMUPS=0
+  TPCH_DATA_DIR=examples/tpch/data/sf10 ./target/release/examples/tpch_preset_bench`
+  (2026-07-01; single-trial walls informal, not a benchmark).
+- Gate constants: `TIGHT_MIN_PROBE_ROWS`, `TIGHT_MIN_PROBE_PROJ_COLS`
+  (runtime_bloom_sideband_rule.rs), pass-rate routing
+  `masked_dense_passrate_threshold` (emat_arrow_reader.rs:1888).

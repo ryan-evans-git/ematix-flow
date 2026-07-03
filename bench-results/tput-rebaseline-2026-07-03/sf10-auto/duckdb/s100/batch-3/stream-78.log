@@ -1,0 +1,77 @@
+=== TPC-H 22 triangulation bench ===
+    data:    /Users/ryanevans/RustroverProjects/ematix-flow/examples/tpch/data/sf10
+    queries: 22 ([20, 12, 16, 3, 6, 17, 19, 1, 13, 8, 21, 18, 22, 11, 15, 5, 2, 14, 9, 10, 4, 7])
+    trials:  1 (after 0 warmups)
+    output:  bench-results/tput-rebaseline-2026-07-03/sf10-auto/duckdb/s100/batch-3/stream-78.md
+
+    NOTE: single-invocation output is SMOKE-GRADE only. For win/loss
+    claims use scripts/bench/strict_22q.sh / strict_ab.sh /
+    strict_throughput.sh (see scripts/bench/README.md).
+
+--- Q20 ---
+  DuckDB        756.86 ms ±  0.00  (1804 rows)
+
+--- Q12 ---
+  DuckDB        741.19 ms ±  0.00  (2 rows)
+
+--- Q16 ---
+  DuckDB        358.33 ms ±  0.00  (27840 rows)
+
+--- Q03 ---
+  DuckDB       1213.46 ms ±  0.00  (114003 rows)
+
+--- Q06 ---
+  DuckDB        496.74 ms ±  0.00  (1 rows)
+
+--- Q17 ---
+  DuckDB       1164.63 ms ±  0.00  (1 rows)
+
+--- Q19 ---
+  DuckDB       1574.85 ms ±  0.00  (1 rows)
+
+--- Q01 ---
+  DuckDB       2055.28 ms ±  0.00  (4 rows)
+
+--- Q13 ---
+  DuckDB       1853.81 ms ±  0.00  (46 rows)
+
+--- Q08 ---
+  DuckDB       1174.37 ms ±  0.00  (2 rows)
+
+--- Q21 ---
+  DuckDB       2988.50 ms ±  0.00  (4009 rows)
+
+--- Q18 ---
+  DuckDB       1714.60 ms ±  0.00  (624 rows)
+
+--- Q22 ---
+  DuckDB        288.18 ms ±  0.00  (7 rows)
+
+--- Q11 ---
+  DuckDB         53.23 ms ±  0.00  (8685 rows)
+
+--- Q15 ---
+  DuckDB        479.77 ms ±  0.00  (1 rows)
+
+--- Q05 ---
+  DuckDB        885.83 ms ±  0.00  (5 rows)
+
+--- Q02 ---
+  DuckDB        193.36 ms ±  0.00  (4667 rows)
+
+--- Q14 ---
+  DuckDB        810.89 ms ±  0.00  (1 rows)
+
+--- Q09 ---
+  DuckDB       2007.42 ms ±  0.00  (175 rows)
+
+--- Q10 ---
+  DuckDB       1832.80 ms ±  0.00  (381105 rows)
+
+--- Q04 ---
+  DuckDB        512.84 ms ±  0.00  (5 rows)
+
+--- Q07 ---
+  DuckDB        990.19 ms ±  0.00  (4 rows)
+
+wrote bench-results/tput-rebaseline-2026-07-03/sf10-auto/duckdb/s100/batch-3/stream-78.md

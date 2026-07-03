@@ -1,0 +1,77 @@
+=== TPC-H 22 triangulation bench ===
+    data:    /Users/ryanevans/RustroverProjects/ematix-flow/examples/tpch/data/sf10
+    queries: 22 ([17, 13, 20, 15, 19, 8, 6, 4, 21, 3, 9, 10, 11, 12, 1, 16, 5, 2, 18, 14, 22, 7])
+    trials:  1 (after 0 warmups)
+    output:  bench-results/tput-rebaseline-2026-07-03/sf10-auto/ematix/s100/batch-1/stream-26.md
+
+    NOTE: single-invocation output is SMOKE-GRADE only. For win/loss
+    claims use scripts/bench/strict_22q.sh / strict_ab.sh /
+    strict_throughput.sh (see scripts/bench/README.md).
+
+--- Q17 ---
+  ematix-flow   988.71 ms ±  0.00  (1 rows)
+
+--- Q13 ---
+  ematix-flow  1785.41 ms ±  0.00  (46 rows)
+
+--- Q20 ---
+  ematix-flow  1186.33 ms ±  0.00  (1804 rows)
+
+--- Q15 ---
+  ematix-flow   393.01 ms ±  0.00  (1 rows)
+
+--- Q19 ---
+  ematix-flow   463.33 ms ±  0.00  (1 rows)
+
+--- Q08 ---
+  ematix-flow  1162.36 ms ±  0.00  (2 rows)
+
+--- Q06 ---
+  ematix-flow   309.99 ms ±  0.00  (1 rows)
+
+--- Q04 ---
+  ematix-flow  1092.92 ms ±  0.00  (5 rows)
+
+--- Q21 ---
+  ematix-flow  3000.85 ms ±  0.00  (4009 rows)
+
+--- Q03 ---
+  ematix-flow  1306.79 ms ±  0.00  (114003 rows)
+
+--- Q09 ---
+  ematix-flow  4041.58 ms ±  0.00  (175 rows)
+
+--- Q10 ---
+  ematix-flow  1978.12 ms ±  0.00  (381105 rows)
+
+--- Q11 ---
+  ematix-flow   267.63 ms ±  0.00  (8685 rows)
+
+--- Q12 ---
+  ematix-flow  1148.61 ms ±  0.00  (2 rows)
+
+--- Q01 ---
+  ematix-flow  4516.00 ms ±  0.00  (4 rows)
+
+--- Q16 ---
+  ematix-flow   759.40 ms ±  0.00  (27840 rows)
+
+--- Q05 ---
+  ematix-flow  1379.06 ms ±  0.00  (5 rows)
+
+--- Q02 ---
+  ematix-flow   150.62 ms ±  0.00  (4667 rows)
+
+--- Q18 ---
+  ematix-flow  3442.30 ms ±  0.00  (624 rows)
+
+--- Q14 ---
+  ematix-flow   288.63 ms ±  0.00  (1 rows)
+
+--- Q22 ---
+  ematix-flow   533.24 ms ±  0.00  (7 rows)
+
+--- Q07 ---
+  ematix-flow  1007.17 ms ±  0.00  (4 rows)
+
+wrote bench-results/tput-rebaseline-2026-07-03/sf10-auto/ematix/s100/batch-1/stream-26.md

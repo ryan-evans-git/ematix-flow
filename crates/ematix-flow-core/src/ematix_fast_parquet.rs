@@ -78,6 +78,17 @@ pub struct BridgeFilter {
     /// published predicates. `None` (the default, and all non-tight
     /// wraps): probe behavior is unchanged.
     probe_disarm: Option<Arc<crate::bridge_filter_sideband::ProbeDisarm>>,
+    /// Σ.Q05.CHAIN — when true, the reader's masked→dense pass-rate
+    /// routing must STASH the bitmap (per-batch Arrow filter) instead
+    /// of discarding it above the REV.23 threshold. Set by the scan's
+    /// `execute()` when merging a CHAIN-INTERMEDIATE sideband's
+    /// predicates: a chain link's whole value is the rows it removes
+    /// from the NEXT link's build sample — a discarded bitmap silently
+    /// neuters the cascade (Q05: the 20%-pass nation/supplier blooms
+    /// sit above the 10% threshold). Chain intermediates are dim-sized
+    /// scans, so the per-batch filter cost is negligible. `false` (the
+    /// default, every other wrap): routing behavior unchanged.
+    apply_when_dense: bool,
 }
 
 impl BridgeFilter {
@@ -89,6 +100,7 @@ impl BridgeFilter {
             predicates,
             predicted_pass_rate: 0.5,
             probe_disarm: None,
+            apply_when_dense: false,
         }
     }
 
@@ -97,6 +109,19 @@ impl BridgeFilter {
     /// merging the sideband's published predicates.
     pub fn set_probe_disarm(&mut self, d: Arc<crate::bridge_filter_sideband::ProbeDisarm>) {
         self.probe_disarm = Some(d);
+    }
+
+    /// Σ.Q05.CHAIN — mark this filter as carrying a chain-intermediate
+    /// predicate whose bitmap must be APPLIED even when the pass-rate
+    /// routing picks the dense decode. See the field docs.
+    pub fn set_apply_when_dense(&mut self) {
+        self.apply_when_dense = true;
+    }
+
+    /// Σ.Q05.CHAIN — must the dense-routed bitmap be stashed (applied
+    /// per-batch) instead of discarded?
+    pub fn apply_when_dense(&self) -> bool {
+        self.apply_when_dense
     }
 
     /// L9.ADAPT Guard 2 — the attached disarm counters, if this filter
@@ -408,6 +433,15 @@ impl BridgeFilter {
         // late unsupported predicate can't leave a half-built bitmap.
         enum Bound<'p, 'a> {
             I64(&'p ColumnPredicate, &'a [i64]),
+            /// NARROW.DEC × L9 (2026-07-02): an i64-domain predicate
+            /// bound to a KEYS.2-narrowed key decoded at Int32
+            /// (`EMAT_NARROW_KEY_DECODE`). Each value widens `as i64`
+            /// on eval — lossless, the narrowing is stats-proven to
+            /// fit i32. Without this binding the whole filter bailed
+            /// to the legacy per-predicate re-decode path (Q08 SF=100:
+            /// the L9 part→lineitem bloom wrap went +62 ms → +4.4 s
+            /// whenever narrow keys were also on).
+            I64onI32(&'p ColumnPredicate, &'a [i32]),
             I32(&'p ColumnPredicate, &'a [i32]),
             F64(&'p ColumnPredicate, &'a [f64]),
             I32Pair {
@@ -430,28 +464,45 @@ impl BridgeFilter {
         };
         for p in &self.predicates {
             match p {
-                ColumnPredicate::I64Range { col_idx, .. } => {
-                    let DecodedView::I64(v) = resolve(*col_idx)? else {
-                        return None;
-                    };
-                    if !check_len(v.len(), &mut total) {
-                        return None;
+                ColumnPredicate::I64Range { col_idx, .. } => match resolve(*col_idx)? {
+                    DecodedView::I64(v) => {
+                        if !check_len(v.len(), &mut total) {
+                            return None;
+                        }
+                        statics.push(Bound::I64(p, v));
                     }
-                    statics.push(Bound::I64(p, v));
-                }
+                    // Narrowed key decoded at Int32: widen per value.
+                    DecodedView::I32(v) => {
+                        if !check_len(v.len(), &mut total) {
+                            return None;
+                        }
+                        statics.push(Bound::I64onI32(p, v));
+                    }
+                    _ => return None,
+                },
                 ColumnPredicate::I64InSet { col_idx, .. }
                 | ColumnPredicate::I64InBloom { col_idx, .. } => {
-                    let DecodedView::I64(v) = resolve(*col_idx)? else {
-                        return None;
+                    let bound = match resolve(*col_idx)? {
+                        DecodedView::I64(v) => {
+                            if !check_len(v.len(), &mut total) {
+                                return None;
+                            }
+                            Bound::I64(p, v)
+                        }
+                        // Narrowed key decoded at Int32: widen per value.
+                        DecodedView::I32(v) => {
+                            if !check_len(v.len(), &mut total) {
+                                return None;
+                            }
+                            Bound::I64onI32(p, v)
+                        }
+                        _ => return None,
                     };
-                    if !check_len(v.len(), &mut total) {
-                        return None;
-                    }
                     // Guard 2 — disarmed probes still resolve (so
                     // `total` is known for a probe-only filter) but
                     // never evaluate.
                     if !skip_probes {
-                        probes.push(Bound::I64(p, v));
+                        probes.push(bound);
                     }
                 }
                 ColumnPredicate::I32Range { col_idx, .. }
@@ -521,6 +572,15 @@ impl BridgeFilter {
                     ColumnPredicate::I64InBloom { bloom, .. } => bloom.might_contain_i64(v[row]),
                     _ => unreachable!("Bound::I64 holds only i64 predicate shapes"),
                 },
+                Bound::I64onI32(p, v) => {
+                    let x = v[row] as i64;
+                    match p {
+                        ColumnPredicate::I64Range { lo, hi, .. } => x >= *lo && x <= *hi,
+                        ColumnPredicate::I64InSet { set, .. } => set.contains(x),
+                        ColumnPredicate::I64InBloom { bloom, .. } => bloom.might_contain_i64(x),
+                        _ => unreachable!("Bound::I64onI32 holds only i64 predicate shapes"),
+                    }
+                }
                 Bound::I32(p, v) => p.eval_i32(v[row]),
                 Bound::F64(p, v) => p.eval_f64(v[row]),
                 Bound::I32Pair { left, right, op } => {
@@ -556,6 +616,26 @@ impl BridgeFilter {
                             probe_chunks_into_bitmap(v, bitmap, |x| bloom.might_contain_i64(x));
                         }
                         _ => unreachable!("Bound::I64 holds only i64 predicate shapes"),
+                    },
+                    // Narrowed-key binding: same chunked pass, widening
+                    // each i32 value into the i64 predicate domain.
+                    Bound::I64onI32(p, v) => match p {
+                        ColumnPredicate::I64Range { lo, hi, .. } => {
+                            let (lo, hi) = (*lo, *hi);
+                            probe_chunks_into_bitmap(v, bitmap, |x| {
+                                let x = x as i64;
+                                x >= lo && x <= hi
+                            });
+                        }
+                        ColumnPredicate::I64InSet { set, .. } => {
+                            probe_chunks_into_bitmap(v, bitmap, |x| set.contains(x as i64));
+                        }
+                        ColumnPredicate::I64InBloom { bloom, .. } => {
+                            probe_chunks_into_bitmap(v, bitmap, |x| {
+                                bloom.might_contain_i64(x as i64)
+                            });
+                        }
+                        _ => unreachable!("Bound::I64onI32 holds only i64 predicate shapes"),
                     },
                     _ => {
                         for row in 0..total {
@@ -643,7 +723,7 @@ fn and_eval_masked(bitmap: &mut [u8], n_rows: usize, eval: impl Fn(usize) -> boo
 /// `bitmap[row>>3] |= 1<<(row&7)`. The 8-lane unroll lets LLVM
 /// vectorise the predicate evaluation across lanes.
 #[inline(always)]
-fn probe_chunks_into_bitmap(values: &[i64], bitmap: &mut [u8], probe: impl Fn(i64) -> bool) {
+fn probe_chunks_into_bitmap<T: Copy>(values: &[T], bitmap: &mut [u8], probe: impl Fn(T) -> bool) {
     let chunks = values.chunks_exact(8);
     let rem = chunks.remainder();
     let n_chunks = values.len() / 8;
@@ -1763,6 +1843,7 @@ fn extract_bridge_filter(
         predicates: merged,
         predicted_pass_rate: 0.5,
         probe_disarm: None,
+        apply_when_dense: false,
     })
 }
 
@@ -1933,9 +2014,16 @@ fn provider_meta_cache_key(path: &str) -> Option<ProviderMetaCacheKey> {
 }
 
 /// KEYS.2 — env gate for narrowing INT64 join/group keys to Int32 on read.
-/// Off unless `EMAT_DOWNCAST_KEYS` is set (additive, opt-in, default OFF).
+/// Σ.AI.5 (2026-07-02): SCALE-GATED tri-state. `EMAT_DOWNCAST_KEYS=1`
+/// forces on, `=0` forces off; unset = AUTO — on only for SF≥100-class
+/// datasets (`scale_class`, campaign evidence: Q09 SF=100 −1075 ms, but
+/// net +10% across 22q at SF=10 with 11 clear regressions). Callers must
+/// have called `scale_class::observe_file` for the dataset first (both
+/// `try_new` paths do) so AUTO resolves order-independently.
+/// NOTE: this replaces the pre-campaign presence semantics
+/// (`EMAT_DOWNCAST_KEYS=0` used to mean ON; it now means OFF).
 fn key_downcast_enabled() -> bool {
-    std::env::var_os("EMAT_DOWNCAST_KEYS").is_some()
+    crate::flags::scale_gated_large("EMAT_DOWNCAST_KEYS")
 }
 
 /// KEYS.2 — a column whose name denotes a join/group KEY (ends in "key":
@@ -1977,6 +2065,12 @@ impl EmatixFastParquetTableProvider {
     /// schema. Errors immediately if any column is unsupported so
     /// callers don't discover this mid-scan.
     pub fn try_new(path: impl Into<String>) -> DfResult<Self> {
+        let path = path.into();
+        // Σ.AI.5: record the dataset's scale BEFORE resolving the
+        // narrow-keys tri-state, so AUTO sees this dataset (sibling
+        // scan makes it registration-order independent — region at 5
+        // rows classifies by its lineitem sibling).
+        crate::scale_class::observe_file(&path);
         Self::try_new_opt(path, key_downcast_enabled())
     }
 
@@ -2191,7 +2285,9 @@ impl EmatixFastParquetTableProvider {
         // the planner (Σ.Q06.SF10.5.h). An explicit `EMAT_DICT_DISTINCT_MAX_ROWS`
         // always overrides. Scale caveat: at SF=100 part is 20M > 10M, so set
         // the cap explicitly there.
-        let ndv_build_side = std::env::var("EMAT_NDV_BUILD_SIDE").as_deref() == Ok("1");
+        // Σ.AI.5 (2026-07-02): tri-state — `=1` on, `=0` off, unset = AUTO
+        // (on for SF≥100-class datasets; `observe_file` ran in try_new).
+        let ndv_build_side = crate::flags::scale_gated_large("EMAT_NDV_BUILD_SIDE");
         let max_rows_for_walk: usize = std::env::var("EMAT_DICT_DISTINCT_MAX_ROWS")
             .ok()
             .and_then(|s| s.parse().ok())
@@ -2755,6 +2851,17 @@ pub struct EmatixFastParquetExec {
     /// upstream HashJoin has had a chance to populate it; matching
     /// predicates are merged into the BridgeFilter before decode.
     runtime_sideband: Option<crate::bridge_filter_sideband::BridgeFilterSideband>,
+    /// Σ.Q05.CHAIN (2026-07-02) — ADDITIONAL runtime sidebands beyond the
+    /// primary slot. The L9 cascade-chain pass can want a second bloom on a
+    /// scan whose primary slot is already taken by a pass-1 wrap (Q05 SF=10:
+    /// the o⋈l tight wrap holds lineitem's primary with an `l_orderkey`
+    /// bloom; the supplier-chain bloom on `l_suppkey` rides here). Extras
+    /// are STRICTLY best-effort: `execute()` peeks each once (no wait, no
+    /// late-arm, no disarm threading) and merges any published non-empty
+    /// predicates. A missed publish just means that pass runs without the
+    /// extra filter — correctness never depends on it (the join re-applies
+    /// every key). Empty in every pre-existing plan shape.
+    extra_runtime_sidebands: Vec<crate::bridge_filter_sideband::BridgeFilterSideband>,
     properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
 }
@@ -2798,6 +2905,7 @@ impl EmatixFastParquetExec {
             column_stats,
             column_has_no_nulls,
             runtime_sideband: None,
+            extra_runtime_sidebands: Vec::new(),
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
         })
@@ -2828,6 +2936,27 @@ impl EmatixFastParquetExec {
 
     pub fn runtime_sideband(&self) -> Option<&crate::bridge_filter_sideband::BridgeFilterSideband> {
         self.runtime_sideband.as_ref()
+    }
+
+    /// Σ.Q05.CHAIN — attach an ADDITIONAL runtime sideband (used when the
+    /// primary slot is already occupied by another wrap). Best-effort
+    /// consumption: `execute()` peeks it once with no wait and no
+    /// late-arm. Returns a fresh Arc<Self> like
+    /// [`Self::with_runtime_sideband`].
+    pub fn with_extra_runtime_sideband(
+        &self,
+        sideband: crate::bridge_filter_sideband::BridgeFilterSideband,
+    ) -> Arc<Self> {
+        let mut next = self.clone_internals();
+        next.extra_runtime_sidebands.push(sideband);
+        Arc::new(next)
+    }
+
+    /// Σ.Q05.CHAIN — the additional (non-primary) runtime sidebands.
+    pub fn extra_runtime_sidebands(
+        &self,
+    ) -> &[crate::bridge_filter_sideband::BridgeFilterSideband] {
+        &self.extra_runtime_sidebands
     }
 
     /// Full (unprojected) file schema. Σ.E5: needed by
@@ -2934,6 +3063,7 @@ impl EmatixFastParquetExec {
             column_stats: self.column_stats.clone(),
             column_has_no_nulls: self.column_has_no_nulls.clone(),
             runtime_sideband: self.runtime_sideband.clone(),
+            extra_runtime_sidebands: self.extra_runtime_sidebands.clone(),
             properties: self.properties.clone(),
             metrics: ExecutionPlanMetricsSet::new(),
         }))
@@ -2963,6 +3093,7 @@ impl EmatixFastParquetExec {
             column_stats: self.column_stats.clone(),
             column_has_no_nulls: self.column_has_no_nulls.clone(),
             runtime_sideband: self.runtime_sideband.clone(),
+            extra_runtime_sidebands: self.extra_runtime_sidebands.clone(),
             properties: self.properties.clone(),
             metrics: ExecutionPlanMetricsSet::new(),
         })
@@ -2984,6 +3115,7 @@ impl EmatixFastParquetExec {
             column_stats: self.column_stats.clone(),
             column_has_no_nulls: self.column_has_no_nulls.clone(),
             runtime_sideband: self.runtime_sideband.clone(),
+            extra_runtime_sidebands: self.extra_runtime_sidebands.clone(),
             properties: self.properties.clone(),
             metrics: ExecutionPlanMetricsSet::new(),
         }
@@ -3000,6 +3132,50 @@ impl EmatixFastParquetExec {
         next.properties = Arc::new(PlanProperties::new(
             eq_props,
             Partitioning::UnknownPartitioning(assignments.len().max(1)),
+            EmissionType::Incremental,
+            Boundedness::Bounded,
+        ));
+        next.assignments = assignments;
+        Arc::new(next)
+    }
+
+    /// RANGE.AGG Stage 2 — like [`Self::with_assignments`], but the
+    /// rebuilt scan ADVERTISES `Partitioning::Hash(hash_exprs, n)`
+    /// instead of `UnknownPartitioning(n)`.
+    ///
+    /// This is a deliberate over-claim: the chunks are KEY-DISJOINT
+    /// (planned at strict row-group key gaps), not hash-distributed.
+    /// For a hash-distribution CONSUMER the claim is row-correct —
+    /// all HashPartitioned promises is that every distinct key's rows
+    /// land in exactly one partition, which key-disjoint chunking
+    /// guarantees — so `EnforceDistribution` accepts the scan as
+    /// direct input to an `AggregateExec(SinglePartitioned)` without
+    /// inserting a full-input hash shuffle (Q18 SF=100: 600M rows /
+    /// ~9.6 GB saved).
+    ///
+    /// SAFETY CONTRACT: the claim must NOT propagate past the
+    /// aggregation it feeds. Chunk boundaries do not coincide with
+    /// hash buckets, so a partitioned HashJoin that paired these
+    /// partitions with genuinely hash-repartitioned partitions of its
+    /// other side would silently drop matches. The caller
+    /// (`ClusteredSinglePhaseAggRule`) caps the rewritten aggregate
+    /// with a [`crate::partition_claim_reset_exec::PartitionClaimResetExec`]
+    /// so everything above sees `UnknownPartitioning` again. Do not
+    /// use this constructor without an equivalent cap.
+    ///
+    /// The equivalence properties are rebuilt fresh from the schema
+    /// (same as `with_assignments`) so no ordering/equivalence claims
+    /// are derived from the false hash claim.
+    pub fn with_assignments_claiming_hash(
+        &self,
+        assignments: Vec<Vec<usize>>,
+        hash_exprs: Vec<Arc<dyn datafusion::physical_expr::PhysicalExpr>>,
+    ) -> Arc<Self> {
+        let mut next = self.clone_internals();
+        let eq_props = EquivalenceProperties::new(next.schema.clone());
+        next.properties = Arc::new(PlanProperties::new(
+            eq_props,
+            Partitioning::Hash(hash_exprs, assignments.len().max(1)),
             EmissionType::Incremental,
             Boundedness::Bounded,
         ));
@@ -3056,6 +3232,35 @@ impl ExecutionPlan for EmatixFastParquetExec {
         // stream below. `decode_schema == schema` when nothing was narrowed
         // (default), so the cast wrapper is a no-op there.
         let decode_schema = self.decode_schema.clone();
+        // NARROW.DEC — file-leaf indices of narrowed keys that the eager
+        // streaming reader should decode DIRECTLY at Int32 (downcast-on-
+        // read; opt-in via EMAT_NARROW_KEY_DECODE). Derived from the
+        // (advertised, decode) schema pair: a projected column that is
+        // Int32 advertised but Int64 in the decode schema is exactly a
+        // KEYS.2-narrowed key. Empty (the default, and whenever
+        // EMAT_DOWNCAST_KEYS narrowed nothing) keeps every reader
+        // bit-identical; the boundary cast below still reconciles any
+        // reader family that decodes wide.
+        // Σ.AI.5 (2026-07-02): tri-state, gated with EMAT_DOWNCAST_KEYS
+        // (unset = AUTO = on at SF≥100 scale). Narrowing only exists when
+        // the downcast advertised Int32 (the schema-pair filter below), so
+        // AUTO here follows the downcast's own resolution.
+        let narrow_i64_leaves: Vec<usize> =
+            if crate::flags::scale_gated_large("EMAT_NARROW_KEY_DECODE") {
+                schema
+                    .fields()
+                    .iter()
+                    .zip(decode_schema.fields().iter())
+                    .enumerate()
+                    .filter(|(_, (adv, dec))| {
+                        matches!(adv.data_type(), DataType::Int32)
+                            && matches!(dec.data_type(), DataType::Int64)
+                    })
+                    .map(|(i, _)| self.projection[i])
+                    .collect()
+            } else {
+                Vec::new()
+            };
         // Σ.Q.L9 — runtime sideband consumption. At execute() time
         // (which for the probe side of a HashJoinExec runs AFTER the
         // build phase has fully drained — see the L9 module doc), peek
@@ -3093,6 +3298,7 @@ impl ExecutionPlan for EmatixFastParquetExec {
         // to first poll.
         let base_filter = self.filter.clone();
         let runtime_sideband = self.runtime_sideband.clone();
+        let extra_runtime_sidebands = self.extra_runtime_sidebands.clone();
         let column_stats = self.column_stats.clone();
         let trace_l9 = std::env::var("EMAT_L9_TRACE").ok().as_deref() == Some("1");
         let late_mat = self.late_mat;
@@ -3107,7 +3313,8 @@ impl ExecutionPlan for EmatixFastParquetExec {
         // SF=10 even when the sideband was None; that's pure waste
         // for plans that can't benefit. So: if there's no sideband,
         // skip the wrapper entirely and use the original eager path.
-        if runtime_sideband.is_none() {
+        // Σ.Q05.CHAIN — extras also require the deferred-peek wrapper.
+        if runtime_sideband.is_none() && extra_runtime_sidebands.is_empty() {
             let stream = build_partition_stream_dispatch(
                 path,
                 decode_schema.clone(),
@@ -3120,6 +3327,7 @@ impl ExecutionPlan for EmatixFastParquetExec {
                 outer_partitions,
                 self.rg_num_rows.clone(),
                 None,
+                narrow_i64_leaves,
             );
             let stream = narrow_stream_to_advertised(stream, &decode_schema, schema.clone());
             return Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream))
@@ -3248,6 +3456,48 @@ impl ExecutionPlan for EmatixFastParquetExec {
                         if sb.tight_admitted() {
                             bf.set_probe_disarm(sb.probe_disarm_handle());
                         }
+                        // Σ.Q05.CHAIN — intermediate chain links must
+                        // actually prune (the next link samples this
+                        // scan's output); tell the reader to keep the
+                        // bitmap even above the dense-route threshold.
+                        if sb.chain_intermediate() {
+                            bf.set_apply_when_dense();
+                        }
+                        let p = bf.estimate_pass_rate(&column_stats_for_async);
+                        filter = Some(bf.with_predicted_pass_rate(p));
+                    }
+                }
+            }
+            // Σ.Q05.CHAIN — additional sidebands (cascade extras). Best
+            // effort by design: peek once, no wait, no late-arm, no disarm
+            // threading (the primary keeps Guard 2 when it has one; with
+            // both merged into the same probe list the disarm judges their
+            // JOINT marginal pass-rate, which is the conservative
+            // direction). A not-yet-published extra just means this pass
+            // runs without that filter — the join re-applies every key so
+            // correctness never depends on the peek landing.
+            for esb in extra_runtime_sidebands.iter() {
+                let peeked = esb.peek();
+                if trace_l9 {
+                    let path_short = std::path::Path::new(&path_for_async)
+                        .file_name()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| path_for_async.clone());
+                    eprintln!(
+                        "[L9-trace] {path_short} p={partition} extra-sideband peek={}",
+                        match &peeked {
+                            Some(preds) => format!("Some(len={})", preds.len()),
+                            None => "None (bloom not published)".to_string(),
+                        }
+                    );
+                }
+                if let Some(preds) = peeked {
+                    if !preds.is_empty() {
+                        let mut bf = filter.unwrap_or_else(|| BridgeFilter::new(Vec::new()));
+                        bf.extend(preds);
+                        if esb.chain_intermediate() {
+                            bf.set_apply_when_dense();
+                        }
                         let p = bf.estimate_pass_rate(&column_stats_for_async);
                         filter = Some(bf.with_predicted_pass_rate(p));
                     }
@@ -3265,6 +3515,7 @@ impl ExecutionPlan for EmatixFastParquetExec {
                 outer_partitions,
                 rg_num_rows_for_async,
                 late_arm,
+                narrow_i64_leaves,
             )
         };
 
@@ -3454,19 +3705,37 @@ fn build_partition_stream_dispatch(
     // auto-pick routes to `EmatArrowBatchReader`); the reader adopts
     // the published predicate at the next row-group boundary.
     late_arm: Option<crate::bridge_filter_sideband::BridgeFilterSideband>,
+    // NARROW.DEC — file-leaf indices of narrowed keys the eager
+    // streaming reader decodes directly at Int32 (see execute()).
+    // The page-streaming / inline / whole-RG-bridge families ignore
+    // this and keep decode-wide + boundary-cast.
+    narrow_i64_leaves: Vec<usize>,
 ) -> futures_util::stream::BoxStream<'static, DfResult<RecordBatch>> {
     if streaming_arrow_reader {
         // Σ.E5.1.c — per-partition column-decode thread budget; keep
-        // total concurrent decode threads aligned to core count.
-        let total_threads = std::thread::available_parallelism()
-            .map(|p| p.get())
-            .unwrap_or(1);
-        let computed_budget = std::cmp::max(1, total_threads / outer_partitions);
+        // total concurrent decode threads aligned to THIS PROCESS'S
+        // core share, not the raw core count (campaign-2026-07-03: an
+        // `available_parallelism()` numerator undid the registry's
+        // partition reduction under concurrent processes — 7 scoped
+        // decode threads per 2-partition process; budget=1 measured
+        // 26,882 → 29,271 QPH at SF10 s10). Solo, `=0` legacy, and
+        // registry failure all resolve share == cores, so those paths
+        // compute the historical formula bit-identically.
+        let share = crate::partition_registry::resolved_core_share();
+        let computed_budget =
+            crate::partition_registry::reader_decode_budget(share, outer_partitions);
+        // Explicit env override keeps absolute precedence, unchanged.
         let budget = std::env::var("EMAT_READER_PARALLELISM_BUDGET")
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
             .map(|n| n.max(1))
             .unwrap_or(computed_budget);
+        if crate::flags::present("EMAT_DEBUG") {
+            eprintln!(
+                "[reader_budget] pid={} share={share} outer_partitions={outer_partitions} budget={budget}",
+                std::process::id()
+            );
+        }
         let partition_rows: usize = row_groups
             .iter()
             .map(|&rg| rg_num_rows.get(rg).copied().unwrap_or(0))
@@ -3482,6 +3751,7 @@ fn build_partition_stream_dispatch(
             filter,
             baseline,
             late_arm,
+            narrow_i64_leaves,
         )
     } else {
         // Late-arm has no consumer on this path; the sideband predicate
@@ -3551,11 +3821,14 @@ fn build_partition_stream(
 /// Threading note (Σ.E5.1.c): the reader internally fan-outs per-column decode
 /// across `min(n_cols, parallelism_budget)` scoped threads. The
 /// `EmatixFastParquetExec` partition wrapper computes a per-partition
-/// budget = `max(1, available_parallelism() / n_outer_partitions)` so
-/// the global thread count tracks the core count rather than the
-/// product `N_partitions × N_cols`. For Q1 SF=1 (6 outer partitions on
-/// 14 cores) the budget is 2 — total ≈ 12 concurrent threads instead
-/// of the 42 the naive `available_parallelism()` cap produced.
+/// budget = `max(1, core_share / n_outer_partitions)` — where
+/// `core_share` is [`crate::partition_registry::resolved_core_share`]
+/// (== `available_parallelism()` solo, the historical numerator) — so
+/// the per-process thread count tracks the process's fair core slice
+/// rather than the product `N_partitions × N_cols`. For Q1 SF=1 (6
+/// outer partitions on 14 cores, solo) the budget is 2 — total ≈ 12
+/// concurrent threads instead of the 42 the naive
+/// `available_parallelism()` cap produced.
 /// Shape-aware default for `inline_row_threshold`.
 ///
 /// The original 900_000-row constant was hand-calibrated for the
@@ -3675,6 +3948,9 @@ fn build_streaming_partition_stream(
     baseline: BaselineMetrics,
     // L9.ADAPT LATE-ARM — see `build_partition_stream_dispatch`.
     late_arm: Option<crate::bridge_filter_sideband::BridgeFilterSideband>,
+    // NARROW.DEC — narrowed key leaves for the eager reader (only);
+    // see `build_partition_stream_dispatch`.
+    narrow_i64_leaves: Vec<usize>,
 ) -> futures_util::stream::BoxStream<'static, DfResult<RecordBatch>> {
     use futures_util::StreamExt;
 
@@ -3882,6 +4158,13 @@ fn build_streaming_partition_stream(
                 .with_projection(projection)
                 .with_row_groups(row_groups)
                 .with_parallelism_budget(parallelism_budget);
+            // NARROW.DEC — only the eager reader narrows at decode; the
+            // builder rewrites the matching fields Int64→Int32 so this
+            // reader emits Int32Array natively (the boundary cast then
+            // passes those columns through by reference).
+            if !narrow_i64_leaves.is_empty() {
+                builder = builder.with_narrow_i64_leaves(narrow_i64_leaves);
+            }
             if let Some(sb) = late_arm.clone() {
                 builder = builder.with_late_arm(sb, path_buf.clone());
             }
@@ -4521,6 +4804,95 @@ mod tests {
         assert_eq!(pop, 11, "all-ones with tail bits zeroed");
     }
 
+    /// NARROW.DEC × L9 (2026-07-02, Q08 SF=100 composition hazard) —
+    /// an i64-domain runtime probe (`I64InSet` / `I64InBloom`) and an
+    /// `I64Range` static must bind a `DecodedView::I32` (a KEYS.2-
+    /// narrowed key decoded at Int32 under `EMAT_NARROW_KEY_DECODE`)
+    /// by widening per value, instead of returning `None`. The `None`
+    /// bail sent the WHOLE bundle to the legacy per-predicate re-decode
+    /// path — on SF=100 lineitem (600M rows) that re-decode turned the
+    /// L9 part→lineitem bloom wrap from +62 ms into +4.4 s whenever
+    /// narrow keys were also on (the campaign's ALL-ON Q08 explosion).
+    #[test]
+    fn narrow_dec_i64_probe_binds_i32_view_by_widening() {
+        use crate::i64_set::I64Set;
+
+        let keys_i32: Vec<i32> = (0..32).collect();
+        let mut set = I64Set::with_keys(4);
+        for k in [3i64, 9, 20, 31] {
+            set.insert(k);
+        }
+        let set = Arc::new(set);
+
+        // I64InSet over an i32 view: must evaluate (widened), not bail.
+        let f = BridgeFilter::new(vec![ColumnPredicate::I64InSet {
+            col_idx: 1,
+            set: set.clone(),
+        }]);
+        let (bitmap, total) = f
+            .eval_on_decoded_views(|col| match col {
+                1 => Some(DecodedView::I32(&keys_i32)),
+                _ => None,
+            })
+            .expect("i64 probe over a narrowed i32 view must evaluate, not fall back");
+        assert_eq!(total, 32);
+        for row in 0..32usize {
+            let expect = set.contains(row as i64);
+            let got = bitmap[row >> 3] & (1 << (row & 7)) != 0;
+            assert_eq!(got, expect, "row {row}");
+        }
+
+        // I64InBloom over an i32 view: no false negatives on members.
+        let mut bloom = crate::bloom::BloomFilter::for_keys(16);
+        for k in [3i64, 9, 20, 31] {
+            bloom.insert_i64(k);
+        }
+        let bloom = Arc::new(bloom);
+        let f = BridgeFilter::new(vec![ColumnPredicate::I64InBloom {
+            col_idx: 1,
+            bloom: bloom.clone(),
+        }]);
+        let (bitmap, total) = f
+            .eval_on_decoded_views(|col| match col {
+                1 => Some(DecodedView::I32(&keys_i32)),
+                _ => None,
+            })
+            .expect("i64 bloom over a narrowed i32 view must evaluate, not fall back");
+        assert_eq!(total, 32);
+        for k in [3usize, 9, 20, 31] {
+            assert!(
+                bitmap[k >> 3] & (1 << (k & 7)) != 0,
+                "bloom must not false-negative member row {k}"
+            );
+        }
+
+        // I64Range static over an i32 view widens too, and composes
+        // with a probe on the same narrowed column (statics first).
+        let f = BridgeFilter::new(vec![
+            ColumnPredicate::I64Range {
+                col_idx: 1,
+                lo: 8,
+                hi: 24,
+            },
+            ColumnPredicate::I64InSet {
+                col_idx: 1,
+                set: set.clone(),
+            },
+        ]);
+        let (bitmap, total) = f
+            .eval_on_decoded_views(|col| match col {
+                1 => Some(DecodedView::I32(&keys_i32)),
+                _ => None,
+            })
+            .expect("i64 range + probe over a narrowed i32 view must evaluate");
+        assert_eq!(total, 32);
+        for row in 0..32usize {
+            let expect = (8..=24).contains(&row) && set.contains(row as i64);
+            let got = bitmap[row >> 3] & (1 << (row & 7)) != 0;
+            assert_eq!(got, expect, "row {row}");
+        }
+    }
+
     /// KEYS.5 story (a) — the string runtime sideband predicates
     /// (`StringInBloom` / `StringInSet`) must (1) probe correctly via
     /// `eval_str` — bloom by byte-hash membership, set by exact
@@ -4844,6 +5216,111 @@ mod tests {
         );
     }
 
+    /// NARROW.DEC — `EMAT_NARROW_KEY_DECODE` toggles the downcast-on-
+    /// read path end-to-end through the provider: with the flag ON the
+    /// eager streaming reader decodes the narrowed key directly at
+    /// Int32 (fire counter moves); with the flag OFF the decode stays
+    /// wide + boundary-cast. Both paths must produce IDENTICAL query
+    /// results on data with negatives and both i32 extremes.
+    ///
+    /// Multi-RG file (3 RGs) so the dispatch routes to the eager
+    /// `EmatArrowBatchReader` (single-RG files route to the page-
+    /// streaming reader, which deliberately stays on decode-wide).
+    /// Serializes the tests that toggle process-global `EMAT_*` env vars
+    /// (`EMAT_NARROW_KEY_DECODE`, `EMAT_DOWNCAST_KEYS`,
+    /// `EMAT_LARGE_SCALE_MIN_ROWS`). Fire-counter / schema assertions break
+    /// if a sibling test clears a var mid-window (observed as "counter
+    /// 6 → 6" flakes). Crate-wide lock: `EMAT_LARGE_SCALE_MIN_ROWS` is also
+    /// mutated by `flow_query_planner` tests, which a module-local lock
+    /// cannot serialize.
+    use crate::flags::EMAT_ENV_TEST_LOCK as NARROW_KEY_ENV_LOCK;
+
+    #[tokio::test]
+    async fn narrow_key_decode_flag_toggles_path_with_identical_results() {
+        use ematix_parquet_codec::write::{ColumnData, write_table_to_path_with_row_group_size};
+        use ematix_parquet_format::types::CompressionCodec;
+
+        let _env_guard = NARROW_KEY_ENV_LOCK.lock().await;
+        let dir = std::env::temp_dir().join(format!("narrow_flag_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("t.parquet");
+
+        let n = 999usize;
+        let mut key: Vec<i64> = (0..n as i64).map(|x| x * 37 - 400_000).collect();
+        key[0] = i32::MIN as i64;
+        key[n - 1] = i32::MAX as i64;
+        let val: Vec<f64> = (0..n).map(|x| x as f64 * 1.5).collect();
+        write_table_to_path_with_row_group_size(
+            &path,
+            &[
+                ("l_orderkey", ColumnData::I64(&key)),
+                ("l_val", ColumnData::F64(&val)),
+            ],
+            CompressionCodec::Uncompressed,
+            n / 3, // → 3 row groups → eager streaming reader
+        )
+        .unwrap();
+        let p = path.to_str().unwrap();
+
+        async fn collect_keys(p: &str) -> Vec<i32> {
+            let prov = EmatixFastParquetTableProvider::try_new_opt(p, true).unwrap();
+            assert_eq!(
+                prov.schema()
+                    .field_with_name("l_orderkey")
+                    .unwrap()
+                    .data_type(),
+                &DataType::Int32,
+                "stats-fitting key must advertise Int32 under downcast"
+            );
+            let ctx = SessionContext::new();
+            ctx.register_table("t", Arc::new(prov)).unwrap();
+            let batches = ctx
+                .sql("SELECT l_orderkey FROM t ORDER BY l_orderkey")
+                .await
+                .unwrap()
+                .collect()
+                .await
+                .unwrap();
+            batches
+                .iter()
+                .flat_map(|b| {
+                    b.column(0)
+                        .as_any()
+                        .downcast_ref::<arrow_array::Int32Array>()
+                        .expect("l_orderkey must surface as Int32Array")
+                        .values()
+                        .to_vec()
+                })
+                .collect()
+        }
+
+        // Control: flag OFF → decode-wide + boundary cast.
+        // (Scoped tightly; parallel tests seeing the flag mid-window
+        // would still produce identical results by this test's own
+        // invariant, so the set/remove is race-benign.)
+        unsafe { std::env::remove_var("EMAT_NARROW_KEY_DECODE") };
+        let wide = collect_keys(p).await;
+
+        // Flag ON → downcast-on-read; fire counter must move.
+        let before =
+            crate::emat_arrow_reader::NARROW_KEY_DECODES.load(std::sync::atomic::Ordering::Relaxed);
+        unsafe { std::env::set_var("EMAT_NARROW_KEY_DECODE", "1") };
+        let narrow = collect_keys(p).await;
+        unsafe { std::env::remove_var("EMAT_NARROW_KEY_DECODE") };
+        let after =
+            crate::emat_arrow_reader::NARROW_KEY_DECODES.load(std::sync::atomic::Ordering::Relaxed);
+
+        assert_eq!(narrow, wide, "flag ON/OFF must return identical results");
+        let mut expect: Vec<i32> = key.iter().map(|&x| x as i32).collect();
+        expect.sort_unstable();
+        assert_eq!(narrow, expect, "values must round-trip the source data");
+        assert!(
+            after > before,
+            "EMAT_NARROW_KEY_DECODE=1 must route through the downcast decode \
+             (counter {before} → {after})"
+        );
+    }
+
     fn lineitem_path() -> Option<String> {
         // Resolution order:
         //   1. `$TPCH_DATA_DIR` developer override.
@@ -4862,6 +5339,229 @@ mod tests {
         let mini =
             std::path::PathBuf::from(crate::test_support::tpch_mini_dir()).join("lineitem.parquet");
         mini.exists().then(|| mini.to_string_lossy().into_owned())
+    }
+
+    /// Σ.AI.5 SCALE-GATE (2026-07-02 campaign gating) — the narrow-keys
+    /// schema advertisement is tri-state on `EMAT_DOWNCAST_KEYS`:
+    ///   1. unset + small-scale stats → AUTO-OFF (keys stay Int64),
+    ///   2. unset + SF≥100-class stats (row-count threshold injected via
+    ///      `EMAT_LARGE_SCALE_MIN_ROWS` — the same footer stats the
+    ///      production gate reads) → AUTO-ON (fitting keys advertise Int32),
+    ///   3. `=0` beats auto-ON, 4. `=1` beats auto-OFF.
+    ///
+    /// Env windows are kept tight; this is the only test mutating
+    /// EMAT_DOWNCAST_KEYS (the other downcast tests use `try_new_opt`'s
+    /// explicit flag precisely to avoid env races).
+    #[test]
+    fn downcast_keys_scale_gated_auto() {
+        // Sync test → blocking_lock (no tokio runtime here). Serializes the
+        // EMAT_DOWNCAST_KEYS / EMAT_LARGE_SCALE_MIN_ROWS windows below
+        // against every other env-mutating test in the crate.
+        let _env_guard = NARROW_KEY_ENV_LOCK.blocking_lock();
+        let Some(p) = lineitem_path() else {
+            eprintln!("skip: no lineitem fixture");
+            return;
+        };
+        let orderkey_type = |prov: &EmatixFastParquetTableProvider| {
+            use datafusion::catalog::TableProvider as _;
+            prov.schema()
+                .field_with_name("l_orderkey")
+                .expect("lineitem has l_orderkey")
+                .data_type()
+                .clone()
+        };
+
+        // 1. AUTO below scale → Int64 (unchanged advertisement).
+        unsafe { std::env::remove_var("EMAT_DOWNCAST_KEYS") };
+        unsafe { std::env::remove_var("EMAT_LARGE_SCALE_MIN_ROWS") };
+        let prov = EmatixFastParquetTableProvider::try_new(p.clone()).unwrap();
+        assert_eq!(
+            orderkey_type(&prov),
+            DataType::Int64,
+            "AUTO below scale must not narrow"
+        );
+
+        // 2. AUTO at (injected) large-scale stats → Int32. Every fixture
+        //    lineitem (mini = 280 rows, SF=1 = 6M) exceeds 100 rows and
+        //    its l_orderkey fits i32.
+        unsafe { std::env::set_var("EMAT_LARGE_SCALE_MIN_ROWS", "100") };
+        let prov = EmatixFastParquetTableProvider::try_new(p.clone()).unwrap();
+        assert_eq!(
+            orderkey_type(&prov),
+            DataType::Int32,
+            "AUTO at large-scale stats must narrow fitting keys"
+        );
+
+        // 3. Force-off beats auto-ON.
+        unsafe { std::env::set_var("EMAT_DOWNCAST_KEYS", "0") };
+        let prov = EmatixFastParquetTableProvider::try_new(p.clone()).unwrap();
+        assert_eq!(
+            orderkey_type(&prov),
+            DataType::Int64,
+            "=0 must force OFF even at large scale"
+        );
+        unsafe { std::env::remove_var("EMAT_LARGE_SCALE_MIN_ROWS") };
+
+        // 4. Force-on beats auto-OFF.
+        unsafe { std::env::set_var("EMAT_DOWNCAST_KEYS", "1") };
+        let prov = EmatixFastParquetTableProvider::try_new(p.clone()).unwrap();
+        unsafe { std::env::remove_var("EMAT_DOWNCAST_KEYS") };
+        assert_eq!(
+            orderkey_type(&prov),
+            DataType::Int32,
+            "=1 must force ON below scale"
+        );
+    }
+
+    /// NARROW.DEC micro-verification (NOT a benchmark) — TPC-H Q09, the
+    /// join-heavy query whose partsupp 2-key build is the narrowing
+    /// target, executed ONCE with the narrowed path off and once with
+    /// it on (`EMAT_DOWNCAST_KEYS` via `try_new_opt(_, true)` +
+    /// `EMAT_NARROW_KEY_DECODE=1`), asserting identical results.
+    ///
+    /// Data resolution matches `lineitem_path()`: set `TPCH_DATA_DIR`
+    /// (e.g. the real SF=1 dataset) for the full-scale run; CI falls
+    /// back to the synthetic mini fixture. The mini fixture's `p_name`
+    /// has no TPC-H color words, so the LIKE pattern is parameterised
+    /// (`%green%` on real data, `%part%` on the mini) — the plan shape
+    /// (6-table join + 2-col group-by + sum) is identical either way.
+    ///
+    /// The sum is compared with FP-relative tolerance: multi-partition
+    /// f64 aggregation is order-sensitive run-to-run independent of the
+    /// flag (same policy as `examples/tpch_validate.rs`).
+    #[tokio::test]
+    async fn narrow_key_decode_q09_identity_on_off() {
+        let _env_guard = NARROW_KEY_ENV_LOCK.lock().await;
+        // Resolve the data dir (real SF=1 via TPCH_DATA_DIR / workspace
+        // layout, else mini fixture).
+        let (dir, mini): (std::path::PathBuf, bool) = {
+            let cand = std::env::var("TPCH_DATA_DIR")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|_| std::path::PathBuf::from("examples/tpch/data/sf1"));
+            if cand.join("lineitem.parquet").exists() {
+                (cand, false)
+            } else {
+                (
+                    std::path::PathBuf::from(crate::test_support::tpch_mini_dir()),
+                    true,
+                )
+            }
+        };
+        let like = if mini { "%part%" } else { "%green%" };
+        let q09 = format!(
+            "select nation, o_year, sum(amount) as sum_profit from ( \
+               select n_name as nation, \
+                      extract(year from o_orderdate) as o_year, \
+                      l_extendedprice * (1 - l_discount) - ps_supplycost * l_quantity as amount \
+               from part, supplier, lineitem, partsupp, orders, nation \
+               where s_suppkey = l_suppkey and ps_suppkey = l_suppkey \
+                 and ps_partkey = l_partkey and p_partkey = l_partkey \
+                 and o_orderkey = l_orderkey and s_nationkey = n_nationkey \
+                 and p_name like '{like}' \
+             ) as profit group by nation, o_year order by nation, o_year desc"
+        );
+
+        // (nation, o_year, sum_profit) rows, already ORDER BY'd.
+        async fn run(dir: &std::path::Path, downcast: bool, sql: &str) -> Vec<(String, i64, f64)> {
+            const TABLES: &[&str] = &[
+                "part", "supplier", "lineitem", "partsupp", "orders", "nation",
+            ];
+            let ctx = SessionContext::new();
+            for t in TABLES {
+                let path = dir.join(format!("{t}.parquet"));
+                let prov = EmatixFastParquetTableProvider::try_new_opt(
+                    path.to_str().unwrap().to_string(),
+                    downcast,
+                )
+                .unwrap();
+                ctx.register_table(*t, Arc::new(prov)).unwrap();
+            }
+            let batches = ctx.sql(sql).await.unwrap().collect().await.unwrap();
+            let mut rows = Vec::new();
+            for b in &batches {
+                let nation = b.column(0);
+                let year = b.column(1);
+                let profit = b
+                    .column(2)
+                    .as_any()
+                    .downcast_ref::<arrow_array::Float64Array>()
+                    .expect("sum_profit is f64");
+                for r in 0..b.num_rows() {
+                    let n = nation
+                        .as_any()
+                        .downcast_ref::<arrow_array::StringArray>()
+                        .map(|a| a.value(r).to_string())
+                        .or_else(|| {
+                            nation
+                                .as_any()
+                                .downcast_ref::<arrow_array::StringViewArray>()
+                                .map(|a| a.value(r).to_string())
+                        })
+                        .expect("nation is a string column");
+                    // extract(year) surfaces as some integer/f64 width
+                    // depending on planner version — normalise via i64.
+                    let y = match year.data_type() {
+                        DataType::Int32 => year
+                            .as_any()
+                            .downcast_ref::<arrow_array::Int32Array>()
+                            .unwrap()
+                            .value(r) as i64,
+                        DataType::Int64 => year
+                            .as_any()
+                            .downcast_ref::<arrow_array::Int64Array>()
+                            .unwrap()
+                            .value(r),
+                        DataType::Float64 => year
+                            .as_any()
+                            .downcast_ref::<arrow_array::Float64Array>()
+                            .unwrap()
+                            .value(r) as i64,
+                        other => panic!("unexpected o_year type {other:?}"),
+                    };
+                    rows.push((n, y, profit.value(r)));
+                }
+            }
+            rows
+        }
+
+        // Arm A — narrowing fully OFF (wide Int64 keys everywhere).
+        unsafe { std::env::remove_var("EMAT_NARROW_KEY_DECODE") };
+        let wide = run(&dir, false, &q09).await;
+        assert!(
+            !wide.is_empty(),
+            "Q09 must return rows on the resolved dataset (pattern {like})"
+        );
+
+        // Arm B — narrowed keys + narrow decode ON.
+        let before =
+            crate::emat_arrow_reader::NARROW_KEY_DECODES.load(std::sync::atomic::Ordering::Relaxed);
+        unsafe { std::env::set_var("EMAT_NARROW_KEY_DECODE", "1") };
+        let narrow = run(&dir, true, &q09).await;
+        unsafe { std::env::remove_var("EMAT_NARROW_KEY_DECODE") };
+        let after =
+            crate::emat_arrow_reader::NARROW_KEY_DECODES.load(std::sync::atomic::Ordering::Relaxed);
+
+        assert_eq!(
+            wide.len(),
+            narrow.len(),
+            "row-count mismatch between wide and narrowed Q09"
+        );
+        for (i, (w, n)) in wide.iter().zip(narrow.iter()).enumerate() {
+            assert_eq!(w.0, n.0, "row {i}: nation mismatch");
+            assert_eq!(w.1, n.1, "row {i}: o_year mismatch");
+            let mag = w.2.abs().max(n.2.abs()).max(1.0);
+            assert!(
+                ((w.2 - n.2).abs() / mag) <= 1e-6,
+                "row {i}: sum_profit diverged: wide={} narrow={}",
+                w.2,
+                n.2
+            );
+        }
+        assert!(
+            after > before,
+            "narrow decode must have fired on the multi-RG fact scans \
+             (counter {before} → {after})"
+        );
     }
 
     #[tokio::test]
@@ -5601,6 +6301,167 @@ mod tests {
         assert!(
             fp_rate < 0.05,
             "bloom false-positive rate {fp_rate:.4} exceeds 5%"
+        );
+    }
+
+    /// Σ.AH.1 re-audit (2026-07-01) — pin scan-decode-level consumption
+    /// of a published runtime predicate. `PERF_REVIEW_2026_05` § Σ.AH.1
+    /// claimed the L9 bloom was "consumed at HashJoinExec level — rows
+    /// decoded then dropped"; in reality a sideband-published
+    /// `I64InBloom` filters the SCAN's own output (no join anywhere in
+    /// the plan), under BOTH decode arms:
+    ///
+    /// - fused probe (default ON since Σ.AI.2): dense decode + bitmap +
+    ///   per-batch SIMD filter;
+    /// - `EMAT_L9_FUSED_PROBE=0` legacy: `build_bitmap` + Π.10
+    ///   `read_column_*_masked_into` masked decode (the literal
+    ///   "skip decode of bloom-missing rows" arm).
+    ///
+    /// Both must emit exactly the bloom-passing rows (inexact by design
+    /// — false positives included; a downstream join re-applies). An
+    /// all-pass predicate routes to dense (REV.23 pass-rate gate) with
+    /// every row emitted. A test like this at spec-writing time would
+    /// have caught the stale premise. See
+    /// `docs/PHASE_SIGMA_AH_1_DESIGN.md` § 11.
+    #[tokio::test]
+    async fn published_sideband_filters_rows_at_scan_decode_level() {
+        use crate::bloom::BloomFilter;
+        use datafusion::common::tree_node::{Transformed, TreeNode};
+        use ematix_parquet_codec::write::{ColumnData, write_table_to_path};
+        use ematix_parquet_format::types::CompressionCodec;
+
+        // Crate-wide env lock: arm 2 below toggles EMAT_L9_FUSED_PROBE —
+        // result-identical for concurrent readers, but any test asserting
+        // on the fused PATH (fire counters) would flake mid-window.
+        let _env = NARROW_KEY_ENV_LOCK.lock().await;
+        let dir = std::env::temp_dir().join(format!("sideband_scan_pin_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("t.parquet");
+        // Non-"*key" column names so KEYS.2 narrowing can't reshape the
+        // schema under the test.
+        let k: Vec<i64> = (0..4096).collect();
+        let v: Vec<i64> = (0..4096).map(|x| x * 3).collect();
+        write_table_to_path(
+            &path,
+            &[("ka", ColumnData::I64(&k)), ("vb", ColumnData::I64(&v))],
+            CompressionCodec::Uncompressed,
+        )
+        .unwrap();
+
+        // Bloom over every 64th key → ~1.6% pass (+ ~1% FPs), safely
+        // under the 10% masked→dense routing threshold, so the bitmap
+        // is stashed and the scan output is actually filtered.
+        let build: Vec<i64> = (0..4096i64).step_by(64).collect();
+        let mut b = BloomFilter::for_keys(build.len());
+        for &x in &build {
+            b.insert_i64(x);
+        }
+        let bloom = Arc::new(b);
+        // Oracle: exactly the bloom-passing rows, in file order. The
+        // bloom is deterministic, so this is exact (FPs included).
+        let expected: Vec<i64> = k
+            .iter()
+            .copied()
+            .filter(|&x| bloom.might_contain_i64(x))
+            .collect();
+        assert!(expected.len() >= build.len(), "bloom lost inserted keys");
+        assert!(
+            (expected.len() as f64) < 0.10 * k.len() as f64,
+            "fixture must stay under the dense-routing threshold \
+             (pass {} of {})",
+            expected.len(),
+            k.len()
+        );
+
+        let prov = EmatixFastParquetTableProvider::try_new(path.to_str().unwrap()).unwrap();
+        let ctx = SessionContext::new();
+        ctx.register_table("t", Arc::new(prov)).unwrap();
+        let plan = ctx
+            .sql("SELECT ka, vb FROM t")
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+
+        // Attach a sideband to the scan and publish BEFORE execute; the
+        // scan's deferred first-poll peek must merge the predicate into
+        // its BridgeFilter (ematix_fast_parquet.rs execute()).
+        let sideband = crate::bridge_filter_sideband::BridgeFilterSideband::new();
+        sideband.publish(vec![ColumnPredicate::I64InBloom {
+            col_idx: 0,
+            bloom: bloom.clone(),
+        }]);
+        let sb_for_walk = sideband.clone();
+        let plan = plan
+            .transform_up(move |node| {
+                if let Some(scan) = node.as_any().downcast_ref::<EmatixFastParquetExec>() {
+                    Ok(Transformed::yes(
+                        scan.with_runtime_sideband(sb_for_walk.clone()) as Arc<dyn ExecutionPlan>,
+                    ))
+                } else {
+                    Ok(Transformed::no(node))
+                }
+            })
+            .unwrap()
+            .data;
+
+        async fn scan_keys(plan: &Arc<dyn ExecutionPlan>, ctx: &SessionContext) -> Vec<i64> {
+            let batches = datafusion::physical_plan::collect(plan.clone(), ctx.task_ctx())
+                .await
+                .unwrap();
+            batches
+                .iter()
+                .flat_map(|b| {
+                    b.column(0)
+                        .as_any()
+                        .downcast_ref::<arrow_array::Int64Array>()
+                        .expect("ka must decode as Int64Array")
+                        .values()
+                        .to_vec()
+                })
+                .collect()
+        }
+
+        // Arm 1 — fused probe (default ON): the scan emits ONLY the
+        // bloom-passing rows. No join exists to do it for us.
+        let got_fused = scan_keys(&plan, &ctx).await;
+        assert_eq!(
+            got_fused, expected,
+            "fused arm: scan output must be exactly the bloom-passing rows"
+        );
+
+        // Arm 2 — legacy masked decode (`EMAT_L9_FUSED_PROBE=0`): same
+        // rows via build_bitmap + read_column_*_masked_into. Restore the
+        // prior value afterwards (both arms are result-identical, so a
+        // concurrent reader momentarily seeing "0" stays correct).
+        let prior = std::env::var("EMAT_L9_FUSED_PROBE").ok();
+        unsafe { std::env::set_var("EMAT_L9_FUSED_PROBE", "0") };
+        let got_masked = scan_keys(&plan, &ctx).await;
+        match prior {
+            Some(p) => unsafe { std::env::set_var("EMAT_L9_FUSED_PROBE", p) },
+            None => unsafe { std::env::remove_var("EMAT_L9_FUSED_PROBE") },
+        }
+        assert_eq!(
+            got_masked, expected,
+            "legacy masked arm must emit the same rows as the fused arm"
+        );
+
+        // Arm 3 — all-pass predicate: pass rate 100% > threshold, so
+        // REV.23 routes to dense (bitmap discarded); every row emitted,
+        // results unchanged (downstream re-applies inexact predicates).
+        let mut all = BloomFilter::for_keys(k.len());
+        for &x in &k {
+            all.insert_i64(x);
+        }
+        sideband.publish(vec![ColumnPredicate::I64InBloom {
+            col_idx: 0,
+            bloom: Arc::new(all),
+        }]);
+        let got_dense = scan_keys(&plan, &ctx).await;
+        assert_eq!(
+            got_dense, k,
+            "all-pass predicate must dense-route and emit every row"
         );
     }
 

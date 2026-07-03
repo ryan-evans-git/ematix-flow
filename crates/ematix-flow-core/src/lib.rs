@@ -54,6 +54,11 @@ pub mod emat_push_pipeline_exec;
 // + direct parallel combine (no shuffle). Opt-in via the swap rule.
 pub mod clustered_agg_rule;
 pub mod combine_agg_exec;
+// RANGE.AGG Stage 2 (2026-07-02): partitioning-reset pass-through that
+// caps the chunked scan's `Partitioning::Hash` claim at the rewritten
+// SinglePartitioned aggregate, so the (deliberately false) claim can
+// never leak into join planning above.
+pub mod partition_claim_reset_exec;
 // FD-aware SUM-agg kernel (Q10 SF=100 lever): row-encode an FD-minimal composite key
 // subset only, carry FD-determined group cols by first-occurrence + interleave gather.
 // Operator + opt-in rule build on this. Correct ONLY under the FD the rule proves.
@@ -61,6 +66,12 @@ pub mod fd_aggregate;
 // FdAggregateExec — single-phase SUM GROUP BY grouping on an FD-minimal key subset of
 // the group exprs. Requires HashPartitioned([key subset]) input; opt-in rule installs it.
 pub mod fd_aggregate_exec;
+// Σ.AH.5: functional-dependency GROUP BY simplifier — when a declared-unique
+// group column provably determines every other group column, group by it
+// alone and re-attach the determined columns after aggregation (min carriers
+// + a restoring projection). Plan-shape-preserving sibling of late_mat_agg.
+// Opt-in via EMAT_FD_GROUPBY=1.
+pub mod fd_groupby_simplify;
 // HJ.3: pre-plan rule that swaps stock HashJoinExec → EmatixHashJoinExec
 // on the validated shape (Inner, CollectLeft, single i64 key). Opt-in
 // via EMAT_HASH_JOIN=1.
@@ -280,6 +291,10 @@ pub mod workload_log;
 // twice. Scaffolding lands here; full scan-path integration is a
 // follow-up bite.
 pub mod scan_cache;
+// Σ.AI.5 (2026-07-02): dataset scale classification (table row-count
+// stats, the PR #159 convention) backing the scale-gated lever defaults
+// recommended by the 2026-07-01 campaign. See `flags::scale_gated_large`.
+pub mod scale_class;
 // Σ.L.5 (2026-05-21): workload-aware parquet write tuning. Reads
 // Σ.L.2's workload.db, emits recommendations for row-group size,
 // sort keys, bloom columns, dict columns, and compression codec.
@@ -359,6 +374,10 @@ pub mod build_side_bloom_emitter_exec;
 // BuildSideBloomEmitterExec) and the probe-side EmatixFastParquetExec
 // (via with_runtime_sideband). Opt-in via install_runtime_bloom_sideband_rule.
 pub mod runtime_bloom_sideband_rule;
+// Σ.Q05.CHAIN (2026-07-02): second phase of the L9 rule — cascade
+// chains (filtered dim → … → large fact scan). Tri-state gated
+// (EMAT_L9_CASCADE / EMAT_MULTIKEY_BLOOM), conservative AUTO.
+pub mod runtime_bloom_cascade_chain;
 // Σ.S.B (2026-05-24): plan-time FK-chain detection helper shared by
 // the cascading-L9 prototype and the general rule. Pure-fn stem
 // extraction + plan walker that surfaces candidate EmatixFastParquetExec
@@ -409,6 +428,11 @@ pub mod mysql_backend;
 // PyO3 dependency. Glue Schema Registry decode + future warehouse
 // pipeline execution both route through this.
 pub mod objectstore_backend;
+// Concurrency-aware target_partitions (campaign-2026-07-01 §3 fix):
+// cross-process PID registry + the EMAT_TARGET_PARTITIONS tri-state so
+// N concurrent ematix processes stop oversubscribing cores N-fold.
+// Applied by the preset path (see preset::with_optimizer_rules_overridden).
+pub mod partition_registry;
 pub mod pg;
 pub mod py_callbacks;
 // Task #559 final slice: Rust-side invoker for warehouse-pipeline

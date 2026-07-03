@@ -28,6 +28,7 @@ The canonical helper is `fn enabled(var)` in
 | `== Ok("1")` / `== Ok("true")` / `.map(\|v\| v == "1"...).unwrap_or(false)` | **off** | set `FLAG=1` to enable |
 | `.is_ok()` / `.is_some()` | **off** | set `FLAG=<anything>` (presence-activated) |
 | `.parse()...unwrap_or(N)` | **`N`** | set `FLAG=<number>` to override |
+| `scale_gated_large("FLAG")` | **AUTO** (tri-state) | `=1` force ON, `=0` force OFF, unset = ON only for SF≥100-class datasets (any table ≥ 300M rows, `scale_class`); any other value = AUTO |
 
 > Note: a handful of flags documented in MEMORY.md as "default-on" (e.g.
 > `EMAT_PLAN_CACHE`, `EMAT_L9_CASCADE`, `EMAT_REORDER`) are **only read in the
@@ -64,6 +65,83 @@ These are read in `src/` and default to enabled. Disable with `=0`.
 | `EMAT_SCALAR_AGG_BOOST` | ON (set =0 to disable) | `.unwrap_or(true)` | [auto_target_partitions.rs:135](../crates/ematix-flow-core/src/auto_target_partitions.rs) | Scalar-aggregation partition oversubscription boost. |
 | `EMAT_TRANSITIVE_DIM_SEMI` | ON (set =0 to disable) | `enabled()` | [flow_query_planner.rs:106](../crates/ematix-flow-core/src/flow_query_planner.rs) | Σ.Q05/#352: transitive dim-semi splice into deep join inputs; the 22nd SF=10 win. |
 
+## Scale-gated levers (tri-state, Σ.AI.5)
+
+The 2026-07-01 campaign levers (`bench-results/campaign-2026-07-01/REPORT.md`
+§2/§4). Read via `flags::scale_gated_large()`: **explicit value wins in both
+directions** (`=1` force ON, `=0` force OFF); **unset = AUTO** — ON only when
+the process has observed an SF≥100-class dataset (any table footer ≥ 300M
+rows — SF=100 lineitem is 600M, SF=10 is 60M; sibling-`*.parquet` scan at
+provider construction makes this registration-order independent, see
+`crate::scale_class`). Threshold override: `EMAT_LARGE_SCALE_MIN_ROWS`.
+Unrecognized values (e.g. `=yes`) mean AUTO, not ON.
+
+| Flag | AUTO behavior | Owner file | Campaign evidence / purpose |
+| --- | --- | --- | --- |
+| `EMAT_DOWNCAST_KEYS` | ON at SF≥100 | [ematix_fast_parquet.rs (`key_downcast_enabled`)](../crates/ematix-flow-core/src/ematix_fast_parquet.rs) | KEYS.2 narrow i64 join/group keys to advertised Int32 (stats-proven). SF=100: Q09 **−1075 ms** (flips the loss — the DRAM-spill build goes cache-resident). SF=10: net **+10%**, 11 clear regressions → must stay off below scale. **Semantics change (2026-07-02):** was presence-activated; `=0` now means OFF. |
+| `EMAT_NARROW_KEY_DECODE` | ON at SF≥100 | [ematix_fast_parquet.rs (execute)](../crates/ematix-flow-core/src/ematix_fast_parquet.rs) | NARROW.DEC: decode narrowed keys directly at Int32. Gated together with `EMAT_DOWNCAST_KEYS` (only meaningful when the downcast advertised Int32). See `docs/NARROW_KEY_DECODE.md`. |
+| `EMAT_DATE_BUILD_SIDE` | ON at SF≥100 (resolved at rule-apply time) | [force_collect_left_semi_build_rule.rs](../crates/ematix-flow-core/src/force_collect_left_semi_build_rule.rs) | Σ.AH.3 date-range corrected build-side swap (DF 53 interval analysis has no Date32 → flat 20% selectivity inverts build sides). With the NDV swap: Q10 SF=100 **−947 ms** (flips the loss); neutral at SF=10. `Default::default()` snapshots the env tri-state; AUTO resolves per-apply because the rule is constructed before table registration. |
+| `EMAT_NDV_BUILD_SIDE` | ON at SF≥100 | [force_collect_left_semi_build_rule.rs](../crates/ematix-flow-core/src/force_collect_left_semi_build_rule.rs) + [ematix_fast_parquet.rs (dict-distinct walk cap)](../crates/ematix-flow-core/src/ematix_fast_parquet.rs) | True build-cardinality recovery via NDV; also widens the dict-distinct walk cap to 10M at provider construction. |
+| `EMAT_FD_GROUPBY` | ON at SF≥100 | [fd_groupby_simplify.rs](../crates/ematix-flow-core/src/fd_groupby_simplify.rs) | Σ.AH.5 FD GROUP BY simplifier. Q10 SF=100 **−99 ms**, no regressions anywhere — gated consistently with its sibling levers. Still needs declared PKs (plan-inert without a catalog PK). |
+
+**Deliberately NOT scale-gated:** `EMAT_L9_PARTITIONED` stays plain opt-in
+(below) — the campaign showed it net-negative outside Q09 (Q08 SF=100
++62 ms solo) and its ALL-ON composition hazard with narrow keys (Q08
++1461 ms) was root-caused to the fused bloom-probe path refusing
+`I64InBloom`/`I64InSet` on Int32-narrow-decoded keys and bailing to the
+legacy per-predicate re-decode — fixed in `BridgeFilter::eval_on_decoded_views`
+(widened i32 binding, 2026-07-02). Re-A/B before promoting it.
+
+## Concurrency-aware partitions (tri-state)
+
+The campaign-2026-07-01 §3 throughput fix: under N concurrent ematix
+processes, per-process `target_partitions = cores` oversubscribes the
+box N-fold (SF10 s10: 3.5× QPH collapse vs DuckDB; `PARTITIONS=2`
+recovered it). Owner: [partition_registry.rs](../crates/ematix-flow-core/src/partition_registry.rs),
+applied by the preset path (`preset::with_optimizer_rules_overridden`)
+whenever the session config still carries the DataFusion default.
+
+The resolved per-process core share S = `clamp(cores / live, 2, cores)`
+drives **three** per-process pools (campaign-2026-07-03: the strict
+throughput diagnostics proved the other two stayed sized at
+`available_parallelism()` per process and undid the partition
+reduction — reader budget 1 + bounded rayon measured 26,882 →
+29,271 QPH at SF10 s10, DuckDB parity):
+
+1. **`target_partitions`** — `partition_registry::resolve_target_partitions`,
+   applied at preset session build when the config still carries the
+   DataFusion default. Harness `PARTITIONS=N` keeps absolute precedence.
+2. **Reader column-decode fan-out** — the per-partition budget in
+   `EmatixFastParquetExec`'s streaming dispatch is
+   `max(1, S / outer_partitions)` (was
+   `available_parallelism() / outer_partitions`). Env escape:
+   `EMAT_READER_PARALLELISM_BUDGET=N` overrides the derived value
+   outright (unchanged precedence; see the tunables table).
+3. **Rayon global pool** (intra-column-chunk page decode) — sized once
+   per process at preset session build via
+   `rayon::ThreadPoolBuilder::build_global`, resolution below
+   (`EMAT_RAYON_BUDGET`). Env escapes: `RAYON_NUM_THREADS` set (rayon
+   honors it natively — ematix keeps hands off) or
+   `EMAT_RAYON_BUDGET=0` (legacy: rayon's own all-cores default). A
+   `build_global` failure (pool already built elsewhere) is silently
+   ignored.
+
+Solo, `EMAT_TARGET_PARTITIONS=0` legacy, and any registry failure all
+resolve S = full cores, so each pool's solo behavior is bit-identical
+to the pre-lever defaults by construction.
+
+| Flag | Default | Value/Notes | Owner file | Purpose |
+| --- | --- | --- | --- | --- |
+| `EMAT_TARGET_PARTITIONS` | **AUTO** (tri-state) | `=N` (N≥1) force `target_partitions=N`; `=0` legacy `available_parallelism()`; unset/unrecognized = AUTO — register in the cross-process PID registry and use `clamp(cores / live_ematix_processes, 2, cores)`. Solo process ⇒ full cores (bit-identical to legacy). Any registry failure degrades silently to legacy. The TPC-H harnesses' explicit `PARTITIONS=N` env takes precedence over this flag. Also the source of the core share S consumed by the reader budget and the rayon pool (above). | [partition_registry.rs](../crates/ematix-flow-core/src/partition_registry.rs) | Concurrency-aware per-process partition count + core share. |
+| `EMAT_RAYON_BUDGET` | **AUTO** (tri-state) | `=N` (N≥1) force the rayon global pool to N threads; `=0` legacy — leave rayon alone (its own default = all cores); unset/unrecognized = AUTO — size to the core share S. Ignored entirely when `RAYON_NUM_THREADS` is set (rayon-native precedence). | [partition_registry.rs](../crates/ematix-flow-core/src/partition_registry.rs) | Concurrency-aware rayon global-pool bound. |
+| `EMAT_PARTITION_REGISTRY_DIR` | `$TMPDIR/ematix-partition-registry` | path | [partition_registry.rs](../crates/ematix-flow-core/src/partition_registry.rs) | Registry directory override (test isolation / shared-tmpdir hygiene). |
+
+Observability: set `EMAT_DEBUG=<anything>` for one-line stderr traces
+of all three resolutions: `[partition_registry] ... target_partitions=`
+(per session build), `[reader_budget] pid= share= outer_partitions=
+budget=` (per partition-stream dispatch), and `[partition_registry]
+... rayon global pool num_threads=` (once per process).
+
 ## Production gate (opt-in)
 
 Read in `src/`, default-OFF. Enable with `=1` (or, where noted, presence).
@@ -74,7 +152,6 @@ Read in `src/`, default-OFF. Enable with `=1` (or, where noted, presence).
 | `EMAT_COMBINE_AGG` | off (set =1) | `== Ok("1"/"true"/"TRUE")` | [combine_agg_exec.rs:404](../crates/ematix-flow-core/src/combine_agg_exec.rs) | Swap `Partial→Repartition→Final` for `CombineAggExec` (single-i64-key SUM(f64)). |
 | `EMAT_DICT_DISTINCT` | off (set =1) | `== "1"/"true"`, else off | [ematix_fast_parquet.rs:2158](../crates/ematix-flow-core/src/ematix_fast_parquet.rs) | Header-only dict-distinct (NDV) walk during scan planning. |
 | `EMAT_DISABLE_FILTER_MULTI_AGG` | off (set to disable) | `.is_some()` | [fused_aggregate_filter_multi_agg_rule.rs:176](../crates/ematix-flow-core/src/fused_aggregate_filter_multi_agg_rule.rs) | **Kill-switch:** presence disables the fused filter→multi-agg rule. |
-| `EMAT_DOWNCAST_KEYS` | off (set to enable) | `.is_some()` | [ematix_fast_parquet.rs:1928](../crates/ematix-flow-core/src/ematix_fast_parquet.rs) | Downcast i64 flow-side join keys to i32 at decode. |
 | `EMAT_DROP_REDUNDANT_FILTER` | off (set to enable) | `.is_some()` | [drop_redundant_filter_rule.rs:135](../crates/ematix-flow-core/src/drop_redundant_filter_rule.rs) | Drop a filter made redundant by a fused scan predicate. |
 | `EMAT_EXACT_PUSHDOWN` | off (set to enable) | `.is_some()` | [ematix_fast_parquet.rs:2588](../crates/ematix-flow-core/src/ematix_fast_parquet.rs) | Σ.AE: exact (vs conservative) predicate pushdown into the scan. |
 | `EMAT_FILTER_MULTI_AGG_USE_REPARTITION` | off (set to enable) | `.is_some()` | [fused_aggregate_filter_multi_agg_rule.rs:371](../crates/ematix-flow-core/src/fused_aggregate_filter_multi_agg_rule.rs) | A/B: use RepartitionExec-based fanout for the fused filter→multi-agg. |
@@ -87,8 +164,8 @@ Read in `src/`, default-OFF. Enable with `=1` (or, where noted, presence).
 | `EMAT_L9_BROADCAST_SIBLINGS` | off (set to enable) | `.is_some()` | [broadcast_sibling_blooms_rule.rs:89](../crates/ematix-flow-core/src/broadcast_sibling_blooms_rule.rs) | Broadcast a build bloom to sibling scans sharing the key. |
 | `EMAT_L9_EMIT_RANGE` | off (set =1) | `== "1"/"true"`, else off | [build_side_bloom_emitter_exec.rs:795](../crates/ematix-flow-core/src/build_side_bloom_emitter_exec.rs) | Σ.S.B: also emit a `[min,max]` range alongside the bloom. |
 | `EMAT_L9_INNER_WITH_SEMI` | off (set =1) | `== "1"/"true"`, else off | [runtime_bloom_sideband_rule.rs:219](../crates/ematix-flow-core/src/runtime_bloom_sideband_rule.rs) | Σ.AM.1: allow inner-HJ bloom emit when build subtree has a semi-filter. |
+| `EMAT_L9_PARTITIONED` | off (set =1) | `opt_in()` | [runtime_bloom_sideband_rule.rs](../crates/ematix-flow-core/src/runtime_bloom_sideband_rule.rs) | Σ.AH.2: Partitioned-scale L9 — raises the tight-NDV file ceiling 10M → 32M rows so SF=100-class dimensions (part 20M) stay NDV-correctable and the Q08 SF=100 part_filt→lineitem edge WRAPs. Explicit `EMAT_L9_NDV_MAX_ROWS` wins. DELIBERATELY not scale-gated (see the scale-gated section): campaign net-negative outside Q09; its Q08×narrow-keys composition hazard is fixed (fused-probe i32 widening) but it needs a fresh strict A/B before promotion. |
 | `EMAT_LOWCARD_GROUPBY_BOOST` | off (set =1) | `== "1"/"true"`, else off | [auto_target_partitions.rs:160](../crates/ematix-flow-core/src/auto_target_partitions.rs) | Gate-B: low-card GROUP BY partition oversubscription (#158 demoted to opt-in). |
-| `EMAT_NDV_BUILD_SIDE` | off (set =1) | `== Ok("1")` | [force_collect_left_semi_build_rule.rs:410](../crates/ematix-flow-core/src/force_collect_left_semi_build_rule.rs) | True build-cardinality recovery via NDV (also widens dict-distinct walk cap). |
 | `EMAT_NO_FILTER_PUSHDOWN` | off (set to disable) | `.is_some()` | [ematix_fast_parquet.rs:2559](../crates/ematix-flow-core/src/ematix_fast_parquet.rs) | **Kill-switch:** presence disables filter pushdown into the scan. |
 | `EMAT_NO_PARQUET_FILE_CACHE` | off (set to disable) | `.is_ok()` | [ematix_parquet_bridge.rs:112](../crates/ematix-flow-core/src/ematix_parquet_bridge.rs) | **Kill-switch:** presence disables the parquet file-handle cache. |
 | `EMAT_NO_STRIP_FUSED_SCAN_FILTER` | off (set to disable) | `.is_some()` | [fused_aggregate_filter_sum_rule.rs:258](../crates/ematix-flow-core/src/fused_aggregate_filter_sum_rule.rs) | **Kill-switch:** presence keeps the redundant BridgeFilter (Q06 masked-pushdown strip off). |
@@ -107,6 +184,7 @@ Read in `src/` via `.parse()...unwrap_or(N)`. Default value is in the **Default*
 | `EMAT_BATCH_SIZE` | `65_536` | `DEFAULT_BATCH_SIZE` | [emat_arrow_reader.rs:288](../crates/ematix-flow-core/src/emat_arrow_reader.rs) | Reader output batch size (rows). |
 | `EMAT_COLLECT_LEFT_BROADCAST_RATIO` | `16.0` | f64 | [force_collect_left_semi_build_rule.rs:150](../crates/ematix-flow-core/src/force_collect_left_semi_build_rule.rs) | Probe/build ratio break-even for CollectLeft broadcast (`=0` disables). |
 | `EMAT_COLLECT_LEFT_MIN_RATIO` | `0.0` | f64 (0 = disabled) | [force_collect_left_semi_build_rule.rs:142](../crates/ematix-flow-core/src/force_collect_left_semi_build_rule.rs) | REV.17.1 cardinality-ratio guard (min probe/build). |
+| `EMAT_DATE_BUILD_SIDE_RATIO` | `2.0` | f64 (clamped ≥ 1.0) | [force_collect_left_semi_build_rule.rs:174](../crates/ematix-flow-core/src/force_collect_left_semi_build_rule.rs) | Σ.AH.3 swap margin: only swap when corrected build ≥ ratio × corrected probe (flap guard). |
 | `EMAT_COMBINE_AGG_HINT` | `131_072` | `1<<17` | [combine_agg_exec.rs:413](../crates/ematix-flow-core/src/combine_agg_exec.rs) | Per-partition group-table pre-size hint for CombineAggExec. |
 | `EMAT_DECODE_PARALLEL_THRESHOLD` | `4` | pages | [emat_arrow_reader.rs:2556](../crates/ematix-flow-core/src/emat_arrow_reader.rs) | Min pending pages before page-decode goes parallel. |
 | `EMAT_LATE_MAT_BATCH` | `1_048_576` | `usize_or` (`=0` disables) | [flow_query_planner.rs](../crates/ematix-flow-core/src/flow_query_planner.rs) | Query-scoped execution batch size the late-mat plan runs under (`BatchSizeOverrideExec`); few large batches make the Utf8View reattach a near-free buffer-sharing gather. |
@@ -118,19 +196,27 @@ Read in `src/` via `.parse()...unwrap_or(N)`. Default value is in the **Default*
 | `EMAT_HJ_RATIO` | `0` | 0 = off | [swap_emat_hash_join_rule.rs:149](../crates/ematix-flow-core/src/swap_emat_hash_join_rule.rs) | Optional extra build-ratio constraint for the HJ swap (A/B). |
 | `EMAT_INLINE_ROW_THRESHOLD` | `derive_inline_row_threshold(n_cols)` (~900k) | 0 = disable | [ematix_fast_parquet.rs:3694](../crates/ematix-flow-core/src/ematix_fast_parquet.rs) | Row threshold below which small single-RG files use the page-streaming reader. |
 | `EMAT_L9_CASCADE_MAX` | `4` | extras/emitter | [runtime_bloom_cascading_rule.rs:87](../crates/ematix-flow-core/src/runtime_bloom_cascading_rule.rs) | Max extra cascaded bloom targets per emitter. |
+| `EMAT_L9_CASCADE` | AUTO | `tri_state` | [runtime_bloom_cascade_chain.rs](../crates/ematix-flow-core/src/runtime_bloom_cascade_chain.rs) | Σ.Q05.CHAIN: cascade-CHAIN second phase of the L9 rule (filtered dim → … → large fact). `=1` force on (thresholds relaxed), `=0` off, unset = AUTO (chain start filtered, every build CollectLeft ≤ 4M rows, terminal scan ≥ 20M rows, ≥ 2 links). |
+| `EMAT_MULTIKEY_BLOOM` | AUTO | `tri_state` | [runtime_bloom_cascade_chain.rs](../crates/ematix-flow-core/src/runtime_bloom_cascade_chain.rs) | Σ.Q05.CHAIN: allow a chain link to emit a single-key bloom from a MULTI-key equi-join (superset pre-filter; the join still enforces all keys — Q05's 2-key supplier join). `=0` refuses multi-key links; `=1`/unset allow them inside an admitted chain. |
+| `EMAT_L9_CASCADE_MIN_TERMINAL_ROWS` | `20_000_000` (AUTO) / `0` (forced) | `usize` | [runtime_bloom_cascade_chain.rs](../crates/ematix-flow-core/src/runtime_bloom_cascade_chain.rs) | Σ.Q05.CHAIN: terminal-scan row floor — the chain must end at a scan at least this large. Explicit value wins over both mode defaults. |
+| `EMAT_L9_CASCADE_MAX_BUILD_ROWS` | `4_000_000` (AUTO) / unbounded (forced) | `usize` | [runtime_bloom_cascade_chain.rs](../crates/ematix-flow-core/src/runtime_bloom_cascade_chain.rs) | Σ.Q05.CHAIN: per-link ceiling on the emitting join's build-row estimate. |
+| `EMAT_L9_CASCADE_RT_SEL` | `0.5` | `f64`, 0 = off | [runtime_bloom_cascade_chain.rs](../crates/ematix-flow-core/src/runtime_bloom_cascade_chain.rs) | Σ.Q05.CHAIN: terminal-link runtime build-selectivity disarm — publish EMPTY when the chain kept more than this fraction of the terminal build's raw scan (the bloom would not prune enough to pay). |
+| `EMAT_L9_CASCADE_MAX_LINKS` | `4` | `usize` | [runtime_bloom_cascade_chain.rs](../crates/ematix-flow-core/src/runtime_bloom_cascade_chain.rs) | Σ.Q05.CHAIN: cap on links per chain. |
+| `EMAT_L9_CASCADE_TERMINAL_APPLY` | AUTO (= on only under `EMAT_L9_CASCADE=1`) | `tri_state` | [runtime_bloom_cascade_chain.rs](../crates/ematix-flow-core/src/runtime_bloom_cascade_chain.rs) | Σ.Q05.CHAIN: admit a BARE terminal (fact scan with no existing wrap) and force-apply its bitmap past the REV.23 dense-route discard. AUTO installs only COMPOSED terminals (extra sideband AND-ed with an existing sub-threshold wrap) — a bare ~20%-pass terminal costs the 60M scan its no-filter fast path (+35 ms wall measured) for a discarded bitmap. |
 | `EMAT_L9_MAX_EXPECTED_KEYS` | `0` | 0 = unbounded | [runtime_bloom_sideband_rule.rs:155](../crates/ematix-flow-core/src/runtime_bloom_sideband_rule.rs) | Σ.AH.3 Story-2a per-partition build-size ceiling (opt-in via >0). |
 | `EMAT_L9_MIN_PROBE_PROJ_COLS` | `0` | 0 = no min | [runtime_bloom_sideband_rule.rs:160](../crates/ematix-flow-core/src/runtime_bloom_sideband_rule.rs) | L9.WIDTH: min projected cols on the probe scan to justify the bloom. |
-| `EMAT_L9_NDV_MAX_ROWS` | `10_000_000` | 0 = skip | [runtime_bloom_sideband_rule.rs:1016](../crates/ematix-flow-core/src/runtime_bloom_sideband_rule.rs) | Max file rows for the L9 NDV probe. |
+| `EMAT_L9_NDV_MAX_ROWS` | `10_000_000` (`32_000_000` under `EMAT_L9_PARTITIONED=1`) | 0 = skip | [runtime_bloom_sideband_rule.rs](../crates/ematix-flow-core/src/runtime_bloom_sideband_rule.rs) | Max file rows for the L9 NDV probe; explicit value wins over both defaults (Σ.AH.2). |
 | `EMAT_L9_PEEK_TIMEOUT_MS` | `200` | ms | [ematix_fast_parquet.rs:3157](../crates/ematix-flow-core/src/ematix_fast_parquet.rs) | Sideband wait-for-publish timeout before proceeding un-bloomed. |
 | `EMAT_L9_SET_DROP_CAP` | `4_194_304` | clamped ≥ threshold | [build_side_bloom_emitter_exec.rs:103](../crates/ematix-flow-core/src/build_side_bloom_emitter_exec.rs) | L9.BLOOMSIZE.2: per-partition exact-set MEMORY drop cap. |
 | `EMAT_L9_SET_THRESHOLD` | `262_144` | rows | [build_side_bloom_emitter_exec.rs:78](../crates/ematix-flow-core/src/build_side_bloom_emitter_exec.rs) | L9 exact-set PUBLISH threshold (set vs bloom). |
+| `EMAT_LARGE_SCALE_MIN_ROWS` | `300_000_000` | `usize_or`, read at classification time | [scale_class.rs](../crates/ematix-flow-core/src/scale_class.rs) | Σ.AI.5: AUTO threshold for the scale-gated levers — a dataset is SF≥100-class when any table footer has ≥ this many rows (SF=100 lineitem 600M / SF=10 60M, 2× margin each side). Tests lower it to exercise the auto-ON arms against small fixtures. |
 | `EMAT_LARGE_PARTITION_ROWS` | `2_000_000` | rows | [ematix_fast_parquet.rs:3763](../crates/ematix-flow-core/src/ematix_fast_parquet.rs) | Threshold above which a partition is treated as "large" for reader routing. |
 | `EMAT_MASKED_DENSE_PASSRATE` | `0.10` | f64 in [0,1] | [emat_arrow_reader.rs:1889](../crates/ematix-flow-core/src/emat_arrow_reader.rs) | Pass-rate above which a masked filter decodes densely. |
 | `EMAT_MI_COLLECT_MIN_RSS_MB` | `max(6144, RAM/4)` | MB | [heap_pressure.rs:111](../crates/ematix-flow-core/src/heap_pressure.rs) | MI.GATE auto-mode RSS threshold for `mi_collect`. |
 | `EMAT_PARQUET_FILE_CACHE_MIN_RG` | `128` | row-groups | [ematix_parquet_bridge.rs:103](../crates/ematix-flow-core/src/ematix_parquet_bridge.rs) | Min row-groups for a file to enter the parquet file cache. |
 | `EMAT_PV4_BUFFER` | `64` | depth (min 1) | [emat_push_pipeline_exec.rs:79](../crates/ematix-flow-core/src/emat_push_pipeline_exec.rs) | PV4 overlap buffer depth (only when `EMAT_PV4_OVERLAP=1`). |
 | `EMAT_RANGE_AGG_MAX_SKEW` | `1.25` | f64 (≥1.0) | [clustered_agg_rule.rs:163](../crates/ematix-flow-core/src/clustered_agg_rule.rs) | Max chunk-size skew tolerated for RANGE.AGG to accept a clustering. |
-| `EMAT_READER_PARALLELISM_BUDGET` | `total_threads / outer_partitions` | min 1 | [ematix_fast_parquet.rs:3422](../crates/ematix-flow-core/src/ematix_fast_parquet.rs) | Per-reader decode parallelism budget. |
+| `EMAT_READER_PARALLELISM_BUDGET` | `core_share / outer_partitions` | min 1; overrides the registry-derived default (see "Concurrency-aware partitions") | [ematix_fast_parquet.rs](../crates/ematix-flow-core/src/ematix_fast_parquet.rs) | Per-reader decode parallelism budget. |
 | `EMAT_REORDER_BUMP_LEAVES` | `6` | leaves | [join_reorder.rs:194](../crates/ematix-flow-core/src/join_reorder.rs) | Leaf-count side of the reorder scale-bump (Q05.SF10). |
 | `EMAT_REORDER_BUMP_MIN_ROWS` | `100_000_000` | rows | [join_reorder.rs:193](../crates/ematix-flow-core/src/join_reorder.rs) | Min-rows side of the reorder scale-bump. |
 | `EMAT_RG_DECODE_CACHE_BYTES` | `1_073_741_824` (1 GiB) | bytes | [emat_arrow_reader.rs:237](../crates/ematix-flow-core/src/emat_arrow_reader.rs) | Capacity of the row-group decode cache (when enabled). |
@@ -204,7 +290,7 @@ production rule, the harness toggles it before constructing rules manually.
 | `EMAT_EXPLAIN_LOGICAL` | off | `== Some("1")` | [examples/sigma_q_explain_analyze.rs:117](../crates/ematix-flow-core/examples/sigma_q_explain_analyze.rs) | Diagnostic: explain logical plan (bench only). |
 | `EMAT_FORCE_COLLECT_LEFT` | harness | toggle | [examples/tpch_triangulation_bench.rs:1651](../crates/ematix-flow-core/examples/tpch_triangulation_bench.rs) | Bench: force the CollectLeft rule. |
 | `EMAT_FRESH_CTX` | off | `.is_some()` | [examples/tpch_preset_rebench.rs:299](../crates/ematix-flow-core/examples/tpch_preset_rebench.rs) | Bench: fresh SessionContext per measurement. |
-| `EMAT_L9_CASCADE` | off | `.is_some()` | [examples/tpch_validate.rs:399](../crates/ematix-flow-core/examples/tpch_validate.rs) | Bench: enable the L9 cascade rule. (See anchors note — MEMORY lists this as a lever; only the bench wires it.) |
+| `EMAT_L9_CASCADE_STEM` | off | `opt_in` | [examples/tpch_validate.rs](../crates/ematix-flow-core/examples/tpch_validate.rs) | Bench: swap in the LEGACY Σ.S.B stem-fanout cascading rule instead of the base L9 rule (was `EMAT_L9_CASCADE` before Σ.Q05.CHAIN repurposed that name). |
 | `EMAT_LATE_MAT` | harness | toggle | [examples/tpch_preset_rebench.rs:65](../crates/ematix-flow-core/examples/tpch_preset_rebench.rs) | Bench: late-materialization toggle. |
 | `EMAT_PLANTIME` | off | `.is_some()` | [examples/tpch_preset_rebench.rs:320](../crates/ematix-flow-core/examples/tpch_preset_rebench.rs) | Diagnostic: report plan time (bench only). |
 | `EMAT_PLAN_CACHE` | off (bench default-ON) | `.unwrap_or(true)` **in bench** | [examples/tpch_triangulation_bench.rs:1228](../crates/ematix-flow-core/examples/tpch_triangulation_bench.rs) | Σ.AG plan cache toggle. **Only read in the bench**; production (`preset.rs` → `plan_cache.rs::is_cacheable`) caches unconditionally. See anchors note. |
@@ -249,12 +335,12 @@ production rule, the harness toggles it before constructing rules manually.
 | Bucket | Count |
 | --- | --- |
 | Production gate (default-ON) | 18 |
-| Production gate (opt-in) | 27 |
+| Production gate (opt-in) | 28 |
 | Numeric tunable | 41 |
 | Diagnostic / trace | 21 |
 | Bench-harness only | 48 |
 | Comment-only (possibly dead) | 1 |
-| **Grand total (distinct flags)** | **156** |
+| **Grand total (distinct flags)** | **157** |
 
 > `EMAT_FAST_SNAPPY` is counted once, under Comment-only.
 > `EMAT_MI_COLLECT` is placed under Diagnostic/trace (allocator-operational,

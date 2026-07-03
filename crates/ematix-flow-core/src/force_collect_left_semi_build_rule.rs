@@ -135,6 +135,39 @@ pub struct ForceCollectLeftForSemiBoundedBuildRule {
     /// broadcasts without the heavy-query tail regressions. Do not retune
     /// without a fresh SF=100 sweep.
     pub broadcast_ratio: f64,
+
+    /// Σ.AH.3 (2026-07-01) — date-range corrected build-side swap for
+    /// Inner `Partitioned` joins (opt-in, default OFF). DataFusion 53's
+    /// interval analyzer does not `check_support` Date32
+    /// (`intervals/utils.rs::is_datatype_supported` covers Int/UInt/Float
+    /// only), so EVERY date-range filter — even with Exact min/max column
+    /// stats plumbed by `EmatixFastParquetTableProvider` — falls back to
+    /// the flat 20% `default_selectivity`. On TPC-H that over-estimates
+    /// the probe side of `cust ⋈ orders`-shaped joins ~5× (Q10 SF=10:
+    /// reported 3M, interval-true ~573k), hiding a build/probe inversion
+    /// from `JoinSelection`. When enabled, a side's reported `num_rows`
+    /// is re-based by the true `window/span` selectivity of its subtree's
+    /// Date32 range filters (only ever shrinking, cap 1.0 — the REV.19
+    /// safety direction), and the join is swapped when the corrected
+    /// probe is at least [`Self::date_build_side_ratio`] × smaller than
+    /// the corrected build. Keeps Partitioned mode (a side swap, not a
+    /// broadcast).
+    ///
+    /// Σ.AI.5 (2026-07-02) — SCALE-GATED tri-state: `Some(true)` force on
+    /// (`EMAT_DATE_BUILD_SIDE=1`), `Some(false)` force off (`=0`), `None`
+    /// = AUTO — resolved **at rule-application time** against
+    /// [`crate::scale_class::large_scale_seen`] (the rule is constructed
+    /// at session-build time, BEFORE table registration, so the env is
+    /// snapshotted here but the scale class must not be). Campaign
+    /// evidence: with `EMAT_NDV_BUILD_SIDE` this flips Q10 SF=100
+    /// (−947 ms); plan-inert at SF=10 (preset path routes around it).
+    pub date_build_side: Option<bool>,
+
+    /// Σ.AH.3 — conservative swap margin for [`Self::date_build_side`]:
+    /// only swap when `corrected_build ≥ ratio × corrected_probe`
+    /// (default `2.0`, the flap guard from the arc spec; values < 1.0 are
+    /// clamped to 1.0). Read from `EMAT_DATE_BUILD_SIDE_RATIO`.
+    pub date_build_side_ratio: f64,
 }
 
 impl Default for ForceCollectLeftForSemiBoundedBuildRule {
@@ -145,9 +178,16 @@ impl Default for ForceCollectLeftForSemiBoundedBuildRule {
         // identical). K=16 is the broadcast break-even ratio. Opt-out via
         // EMAT_COLLECT_LEFT_BROADCAST_RATIO=0.
         let broadcast_ratio = crate::flags::f64_or("EMAT_COLLECT_LEFT_BROADCAST_RATIO", 16.0);
+        // Σ.AI.5: tri-state — explicit env wins both ways; None = AUTO,
+        // resolved at apply time (scale class isn't known at session
+        // build, which happens before table registration).
+        let date_build_side = crate::flags::tri_state("EMAT_DATE_BUILD_SIDE");
+        let date_build_side_ratio = crate::flags::f64_or("EMAT_DATE_BUILD_SIDE_RATIO", 2.0);
         Self {
             min_probe_build_ratio,
             broadcast_ratio,
+            date_build_side,
+            date_build_side_ratio,
         }
     }
 }
@@ -287,6 +327,149 @@ fn ndv_correction_factor(plan: &Arc<dyn ExecutionPlan>) -> f64 {
     factor
 }
 
+/// Σ.AH.3 — Date32 day value from a column-statistics min/max bound
+/// (Exact or Inexact both accepted, mirroring the NDV distinct handling).
+fn date32_stat(p: &Precision<ScalarValue>) -> Option<i32> {
+    match p.get_value() {
+        Some(ScalarValue::Date32(Some(d))) => Some(*d),
+        _ => None,
+    }
+}
+
+/// Σ.AH.3 — true `window/span` selectivity of the Date32 range conjuncts
+/// of `predicate` relative to the flat `default_sel` DataFusion's
+/// `FilterExec` actually applied, capped at `1.0` (only ever shrinks — we
+/// never manufacture a swap by inflating a side; a window wider than the
+/// default is left uncorrected). Per-column inclusive day bounds are
+/// intersected across conjuncts (`>=`/`>`/`<=`/`<`/`=`, either operand
+/// order), then clamped to the column's known `[min, max]`; the span is
+/// `max − min + 1` days. Non-Date32 conjuncts are ignored: they are either
+/// `check_support`ed (numeric — no default was applied to them) or only
+/// shrink the true row count further, so ignoring them keeps the corrected
+/// estimate an over-estimate — the safe direction. Pure (no plan) so it is
+/// directly unit-testable.
+fn predicate_date_factor(
+    predicate: &Arc<dyn datafusion::physical_expr::PhysicalExpr>,
+    child_stats: &datafusion::common::Statistics,
+    default_sel: f64,
+) -> f64 {
+    use std::collections::BTreeMap;
+    // col index → (inclusive lower day, inclusive upper day)
+    let mut bounds: BTreeMap<usize, (Option<i32>, Option<i32>)> = BTreeMap::new();
+    for conj in split_conjunction(predicate) {
+        let Some(bin) = conj.as_any().downcast_ref::<BinaryExpr>() else {
+            continue;
+        };
+        // `Column OP Literal` in either operand order (flip OP when the
+        // literal is on the left: `lit < col` ≡ `col > lit`).
+        let (col, lit, op) = match (
+            bin.left().as_any().downcast_ref::<Column>(),
+            bin.right().as_any().downcast_ref::<Literal>(),
+        ) {
+            (Some(c), Some(l)) => (c, l, *bin.op()),
+            _ => match (
+                bin.left().as_any().downcast_ref::<Literal>(),
+                bin.right().as_any().downcast_ref::<Column>(),
+            ) {
+                (Some(l), Some(c)) => {
+                    let flipped = match bin.op() {
+                        Operator::Gt => Operator::Lt,
+                        Operator::GtEq => Operator::LtEq,
+                        Operator::Lt => Operator::Gt,
+                        Operator::LtEq => Operator::GtEq,
+                        Operator::Eq => Operator::Eq,
+                        _ => continue,
+                    };
+                    (c, l, flipped)
+                }
+                _ => continue,
+            },
+        };
+        let ScalarValue::Date32(Some(d)) = lit.value() else {
+            continue;
+        };
+        let d = *d;
+        let entry = bounds.entry(col.index()).or_insert((None, None));
+        let max_lo = |cur: Option<i32>, v: i32| Some(cur.map_or(v, |x| x.max(v)));
+        let min_hi = |cur: Option<i32>, v: i32| Some(cur.map_or(v, |x| x.min(v)));
+        match op {
+            Operator::Gt => entry.0 = max_lo(entry.0, d.saturating_add(1)),
+            Operator::GtEq => entry.0 = max_lo(entry.0, d),
+            Operator::Lt => entry.1 = min_hi(entry.1, d.saturating_sub(1)),
+            Operator::LtEq => entry.1 = min_hi(entry.1, d),
+            Operator::Eq => {
+                entry.0 = max_lo(entry.0, d);
+                entry.1 = min_hi(entry.1, d);
+            }
+            _ => continue,
+        }
+    }
+    let mut sel = 1.0_f64;
+    let mut corrected_any = false;
+    for (idx, (lo, hi)) in bounds {
+        let Some(cs) = child_stats.column_statistics.get(idx) else {
+            continue;
+        };
+        let (Some(smin), Some(smax)) = (date32_stat(&cs.min_value), date32_stat(&cs.max_value))
+        else {
+            continue;
+        };
+        if smax < smin {
+            continue;
+        }
+        let span = (smax as i64 - smin as i64 + 1) as f64;
+        let lo = lo.unwrap_or(smin).max(smin);
+        let hi = hi.unwrap_or(smax).min(smax);
+        let width = if hi >= lo {
+            (hi as i64 - lo as i64 + 1) as f64
+        } else {
+            0.0
+        };
+        sel *= width / span;
+        corrected_any = true;
+    }
+    if !corrected_any || default_sel <= 0.0 {
+        return 1.0;
+    }
+    (sel / default_sel).min(1.0)
+}
+
+/// [`predicate_date_factor`] for a `FilterExec`, sourcing the predicate,
+/// its input column statistics, and the `default_selectivity` DataFusion
+/// applied. Guarded on `!check_support(...)`: if DataFusion's interval
+/// analyzer DID support the predicate, no default was applied and a
+/// correction would double-count — this future-proofs a DataFusion
+/// upgrade that adds Date32 to `is_datatype_supported`.
+fn filter_date_factor(filter: &FilterExec) -> f64 {
+    if datafusion::physical_expr::intervals::utils::check_support(
+        filter.predicate(),
+        &filter.input().schema(),
+    ) {
+        return 1.0;
+    }
+    let default_sel = filter.default_selectivity() as f64 / 100.0;
+    let Ok(child_stats) = filter.input().partition_statistics(None) else {
+        return 1.0;
+    };
+    predicate_date_factor(filter.predicate(), &child_stats, default_sel)
+}
+
+/// Σ.AH.3 — walk `plan`'s subtree and return the product of every
+/// `FilterExec`'s [`filter_date_factor`]. Always `≤ 1.0`; strictly `< 1.0`
+/// iff some Date32 range filter in the subtree was under-credited by
+/// DataFusion's flat `default_selectivity`. Mirrors
+/// [`ndv_correction_factor`]'s multiplicative propagation model.
+fn date_correction_factor(plan: &Arc<dyn ExecutionPlan>) -> f64 {
+    let mut factor = 1.0_f64;
+    if let Some(filter) = plan.as_any().downcast_ref::<FilterExec>() {
+        factor *= filter_date_factor(filter);
+    }
+    for child in plan.children() {
+        factor *= date_correction_factor(child);
+    }
+    factor
+}
+
 /// Reported `num_rows` for a join side, if statically known.
 fn reported_rows(plan: &Arc<dyn ExecutionPlan>) -> Option<usize> {
     plan.partition_statistics(None)
@@ -398,10 +581,12 @@ impl PhysicalOptimizerRule for ForceCollectLeftForSemiBoundedBuildRule {
             // `EnforceDistribution` re-runs below. General (any low-NDV
             // equality filter, not TPC-H-specific); requires the dict-distinct
             // walk (`EMAT_DICT_DISTINCT_MAX_ROWS`) to populate `distinct_count`.
-            // Default OFF per [[optimizer-codegen-sensitivity]]; the env check
-            // short-circuits before any subtree walk when unset. Opt in with
-            // `EMAT_NDV_BUILD_SIDE=1`.
-            if is_inner && crate::flags::opt_in("EMAT_NDV_BUILD_SIDE") {
+            // Σ.AI.5 (2026-07-02): SCALE-GATED tri-state — `=1` force on,
+            // `=0` force off, unset = AUTO (on only for SF≥100-class
+            // datasets; with the date swap this flips Q10 SF=100 −947 ms,
+            // neutral at SF=10). The gate check short-circuits before any
+            // subtree walk when it resolves off.
+            if is_inner && crate::flags::scale_gated_large("EMAT_NDV_BUILD_SIDE") {
                 let lf = ndv_correction_factor(hj.left());
                 let rf = ndv_correction_factor(hj.right());
                 // Only act when some side was actually under-credited.
@@ -415,6 +600,43 @@ impl PhysicalOptimizerRule for ForceCollectLeftForSemiBoundedBuildRule {
                             if trace {
                                 eprintln!(
                                     "[collect_left] NDV build-side swap (corrected L={corrected_left:.0} R={corrected_right:.0}, lf={lf:.4} rf={rf:.4}); on={:?}",
+                                    hj.on()
+                                );
+                            }
+                            return Ok(Transformed::yes(
+                                hj.swap_inputs(PartitionMode::Partitioned)?,
+                            ));
+                        }
+                    }
+                }
+            }
+            // Σ.AH.3 date-range corrected build-side swap (opt-in, default
+            // OFF — see the field docs on [`Self::date_build_side`]). Fires
+            // only when the PROBE (right) was under-credited by a Date32
+            // range filter (`rf < 1.0`) — a build-side-only correction
+            // shrinks the already-smaller-estimated side and needs no swap —
+            // and the corrected build clears the conservative margin over
+            // the corrected probe. Keeps Partitioned mode; `swap_inputs`
+            // preserves Inner semantics + output schema (re-projection), and
+            // `EnforceDistribution` re-runs below.
+            if is_inner
+                && self
+                    .date_build_side
+                    .unwrap_or_else(crate::scale_class::large_scale_seen)
+            {
+                let rf = date_correction_factor(hj.right());
+                if rf < 1.0 {
+                    if let (Some(l), Some(r)) =
+                        (reported_rows(hj.left()), reported_rows(hj.right()))
+                    {
+                        let lf = date_correction_factor(hj.left());
+                        let corrected_left = l as f64 * lf;
+                        let corrected_right = r as f64 * rf;
+                        if corrected_left >= corrected_right * self.date_build_side_ratio.max(1.0)
+                        {
+                            if trace {
+                                eprintln!(
+                                    "[collect_left] date build-side swap (corrected L={corrected_left:.0} R={corrected_right:.0}, lf={lf:.4} rf={rf:.4}); on={:?}",
                                     hj.on()
                                 );
                             }
@@ -598,6 +820,39 @@ mod tests {
     use datafusion::datasource::memory::MemorySourceConfig;
     use datafusion::physical_expr::PhysicalExpr;
     use datafusion::physical_plan::expressions::Column;
+
+    /// Σ.AI.5 — the date-swap default is TRI-STATE: `Default::default()`
+    /// snapshots the env as `None` (AUTO, resolved at apply time against
+    /// the scale class), `Some(true)` for `=1`, `Some(false)` for `=0`.
+    /// Env window is tight; this is the only test mutating
+    /// EMAT_DATE_BUILD_SIDE (plan-level swap tests construct the rule
+    /// with explicit fields precisely to avoid env races).
+    #[test]
+    fn date_build_side_default_snapshots_tristate() {
+        // Crate-wide env lock: Default::default() snapshots the env; other
+        // tests constructing the rule mid-window would read this test's
+        // EMAT_DATE_BUILD_SIDE values.
+        let _env = crate::flags::EMAT_ENV_TEST_LOCK.blocking_lock();
+        unsafe { std::env::remove_var("EMAT_DATE_BUILD_SIDE") };
+        assert_eq!(
+            ForceCollectLeftForSemiBoundedBuildRule::default().date_build_side,
+            None,
+            "unset => AUTO"
+        );
+        unsafe { std::env::set_var("EMAT_DATE_BUILD_SIDE", "1") };
+        assert_eq!(
+            ForceCollectLeftForSemiBoundedBuildRule::default().date_build_side,
+            Some(true),
+            "=1 => force ON"
+        );
+        unsafe { std::env::set_var("EMAT_DATE_BUILD_SIDE", "0") };
+        assert_eq!(
+            ForceCollectLeftForSemiBoundedBuildRule::default().date_build_side,
+            Some(false),
+            "=0 => force OFF"
+        );
+        unsafe { std::env::remove_var("EMAT_DATE_BUILD_SIDE") };
+    }
 
     fn mem_table() -> Arc<dyn ExecutionPlan> {
         let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
@@ -785,6 +1040,8 @@ mod tests {
         let permissive = ForceCollectLeftForSemiBoundedBuildRule {
             min_probe_build_ratio: 0.0,
             broadcast_ratio: 0.0,
+            date_build_side: Some(false),
+            date_build_side_ratio: 2.0,
         };
         let out0 = permissive
             .optimize(top.clone(), &ConfigOptions::default())
@@ -799,6 +1056,8 @@ mod tests {
         let guarded = ForceCollectLeftForSemiBoundedBuildRule {
             min_probe_build_ratio: 1.0,
             broadcast_ratio: 0.0,
+            date_build_side: Some(false),
+            date_build_side_ratio: 2.0,
         };
         let out1 = guarded.optimize(top, &ConfigOptions::default()).unwrap();
         let after = format!("{out1:?}");
@@ -823,6 +1082,8 @@ mod tests {
         let guarded = ForceCollectLeftForSemiBoundedBuildRule {
             min_probe_build_ratio: 1.0,
             broadcast_ratio: 0.0,
+            date_build_side: Some(false),
+            date_build_side_ratio: 2.0,
         };
         let out = guarded.optimize(top, &ConfigOptions::default()).unwrap();
         let after = format!("{out:?}");
@@ -849,6 +1110,8 @@ mod tests {
         let guarded = ForceCollectLeftForSemiBoundedBuildRule {
             min_probe_build_ratio: 1.0,
             broadcast_ratio: 0.0,
+            date_build_side: Some(false),
+            date_build_side_ratio: 2.0,
         };
         let out = guarded.optimize(top, &ConfigOptions::default()).unwrap();
         assert!(
@@ -867,6 +1130,8 @@ mod tests {
         let rule = ForceCollectLeftForSemiBoundedBuildRule {
             min_probe_build_ratio: 0.0,
             broadcast_ratio: 16.0,
+            date_build_side: Some(false),
+            date_build_side_ratio: 2.0,
         };
         let out = rule.optimize(top, &ConfigOptions::default()).unwrap();
         let after = format!("{out:?}");
@@ -887,6 +1152,8 @@ mod tests {
         let rule = ForceCollectLeftForSemiBoundedBuildRule {
             min_probe_build_ratio: 0.0,
             broadcast_ratio: 16.0,
+            date_build_side: Some(false),
+            date_build_side_ratio: 2.0,
         };
         let out = rule.optimize(top, &ConfigOptions::default()).unwrap();
         let after = format!("{out:?}");
@@ -906,6 +1173,8 @@ mod tests {
         let rule = ForceCollectLeftForSemiBoundedBuildRule {
             min_probe_build_ratio: 0.0,
             broadcast_ratio: 0.0,
+            date_build_side: Some(false),
+            date_build_side_ratio: 2.0,
         };
         let out = rule.optimize(top, &ConfigOptions::default()).unwrap();
         let after = format!("{out:?}");
@@ -933,6 +1202,8 @@ mod tests {
             let rule = ForceCollectLeftForSemiBoundedBuildRule {
                 min_probe_build_ratio: 0.0,
                 broadcast_ratio: 16.0,
+                date_build_side: Some(false),
+                date_build_side_ratio: 2.0,
             };
             let out = rule.optimize(top, &ConfigOptions::default()).unwrap();
             let after = format!("{out:?}");
@@ -960,6 +1231,8 @@ mod tests {
             let rule = ForceCollectLeftForSemiBoundedBuildRule {
                 min_probe_build_ratio: 0.0,
                 broadcast_ratio: 16.0,
+                date_build_side: Some(false),
+                date_build_side_ratio: 2.0,
             };
             let out = rule.optimize(top, &ConfigOptions::default()).unwrap();
             let after = format!("{out:?}");
@@ -1106,6 +1379,8 @@ mod tests {
         let rule = ForceCollectLeftForSemiBoundedBuildRule {
             min_probe_build_ratio: 0.0,
             broadcast_ratio: 0.0,
+            date_build_side: Some(false),
+            date_build_side_ratio: 2.0,
         };
         let before = format!("{top:?}");
         let out = rule.optimize(top, &ConfigOptions::default()).unwrap();
@@ -1113,6 +1388,345 @@ mod tests {
             before,
             format!("{out:?}"),
             "with EMAT_NDV_BUILD_SIDE unset the plan must be unchanged"
+        );
+    }
+
+    // ---- Σ.AH.3 date-range corrected build-side swap ----
+
+    use datafusion::execution::TaskContext;
+    use datafusion::physical_expr::EquivalenceProperties;
+    use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
+    use datafusion::physical_plan::{
+        DisplayAs, DisplayFormatType, Partitioning, PlanProperties, SendableRecordBatchStream,
+    };
+
+    /// Plan-diff fixture: a leaf that reports `rows` and Exact Date32
+    /// min/max on column 1 (`d`), mirroring what
+    /// `EmatixFastParquetTableProvider` plumbs for a date column. Never
+    /// executed — statistics only.
+    #[derive(Debug)]
+    struct DateStatsExec {
+        rows: usize,
+        date_min: i32,
+        date_max: i32,
+        props: std::sync::Arc<PlanProperties>,
+    }
+
+    impl DateStatsExec {
+        fn new_exec(rows: usize, date_min: i32, date_max: i32) -> Arc<dyn ExecutionPlan> {
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("a", DataType::Int64, false),
+                Field::new("d", DataType::Date32, false),
+            ]));
+            let props = PlanProperties::new(
+                EquivalenceProperties::new(schema),
+                Partitioning::UnknownPartitioning(1),
+                EmissionType::Incremental,
+                Boundedness::Bounded,
+            );
+            Arc::new(Self {
+                rows,
+                date_min,
+                date_max,
+                props: Arc::new(props),
+            })
+        }
+    }
+
+    impl DisplayAs for DateStatsExec {
+        fn fmt_as(&self, _t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            write!(f, "DateStatsExec(rows={})", self.rows)
+        }
+    }
+
+    impl ExecutionPlan for DateStatsExec {
+        fn name(&self) -> &str {
+            "DateStatsExec"
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+        fn properties(&self) -> &std::sync::Arc<PlanProperties> {
+            &self.props
+        }
+        fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+            vec![]
+        }
+        fn with_new_children(
+            self: Arc<Self>,
+            _children: Vec<Arc<dyn ExecutionPlan>>,
+        ) -> Result<Arc<dyn ExecutionPlan>> {
+            Ok(self)
+        }
+        fn execute(
+            &self,
+            _partition: usize,
+            _context: Arc<TaskContext>,
+        ) -> Result<SendableRecordBatchStream> {
+            unreachable!("DateStatsExec is a plan-diff statistics fixture")
+        }
+        fn partition_statistics(&self, _partition: Option<usize>) -> Result<Statistics> {
+            let mut cols = vec![ColumnStatistics::new_unknown(); 2];
+            cols[1].min_value = Precision::Exact(ScalarValue::Date32(Some(self.date_min)));
+            cols[1].max_value = Precision::Exact(ScalarValue::Date32(Some(self.date_max)));
+            Ok(Statistics {
+                num_rows: Precision::Exact(self.rows),
+                total_byte_size: Precision::Absent,
+                column_statistics: cols,
+            })
+        }
+    }
+
+    /// `d >= lo AND d < hi_excl` over column index 1 — the Q10
+    /// `o_orderdate >= '1993-10-01' AND o_orderdate < '1994-01-01'` shape.
+    /// Date32 is not `check_support`ed in DataFusion 53, so `FilterExec`
+    /// reports the flat 20% default for this predicate.
+    fn date_range_filter(
+        input: Arc<dyn ExecutionPlan>,
+        lo: i32,
+        hi_excl: i32,
+    ) -> Arc<dyn ExecutionPlan> {
+        let ge: Arc<dyn datafusion::physical_expr::PhysicalExpr> = Arc::new(BinaryExpr::new(
+            Arc::new(Column::new("d", 1)),
+            Operator::GtEq,
+            Arc::new(Literal::new(ScalarValue::Date32(Some(lo)))),
+        ));
+        let lt: Arc<dyn datafusion::physical_expr::PhysicalExpr> = Arc::new(BinaryExpr::new(
+            Arc::new(Column::new("d", 1)),
+            Operator::Lt,
+            Arc::new(Literal::new(ScalarValue::Date32(Some(hi_excl)))),
+        ));
+        let pred: Arc<dyn datafusion::physical_expr::PhysicalExpr> =
+            Arc::new(BinaryExpr::new(ge, Operator::And, lt));
+        Arc::new(FilterExec::try_new(pred, input).unwrap())
+    }
+
+    /// One-column statistics whose column 0 carries Date32 min/max.
+    fn date_stats(min: i32, max: i32) -> Statistics {
+        let cs0 = ColumnStatistics {
+            min_value: Precision::Exact(ScalarValue::Date32(Some(min))),
+            max_value: Precision::Exact(ScalarValue::Date32(Some(max))),
+            ..Default::default()
+        };
+        Statistics {
+            num_rows: Precision::Exact(1_000_000),
+            total_byte_size: Precision::Absent,
+            column_statistics: vec![cs0],
+        }
+    }
+
+    /// `d >= lo AND d < hi_excl` over column index 0 (pure-fn tests).
+    fn date_range_pred(lo: i32, hi_excl: i32) -> Arc<dyn datafusion::physical_expr::PhysicalExpr> {
+        let ge: Arc<dyn datafusion::physical_expr::PhysicalExpr> = Arc::new(BinaryExpr::new(
+            Arc::new(Column::new("d", 0)),
+            Operator::GtEq,
+            Arc::new(Literal::new(ScalarValue::Date32(Some(lo)))),
+        ));
+        let lt: Arc<dyn datafusion::physical_expr::PhysicalExpr> = Arc::new(BinaryExpr::new(
+            Arc::new(Column::new("d", 0)),
+            Operator::Lt,
+            Arc::new(Literal::new(ScalarValue::Date32(Some(hi_excl)))),
+        ));
+        Arc::new(BinaryExpr::new(ge, Operator::And, lt))
+    }
+
+    /// Q10 numbers: a 92-day window over a 2406-day span is ~3.8%
+    /// selective; against the 20% flat default that is a ~0.19 factor.
+    #[test]
+    fn predicate_date_factor_corrects_narrow_range() {
+        let stats = date_stats(0, 2405);
+        let pred = date_range_pred(640, 732); // 92 days inclusive of [640, 731]
+        let f = predicate_date_factor(&pred, &stats, 0.2);
+        let expected = (92.0 / 2406.0) / 0.2;
+        assert!(
+            (f - expected).abs() < 1e-6,
+            "92d/2406d vs 0.2 default ≈ {expected}, got {f}"
+        );
+    }
+
+    /// Q08 numbers: a 2-year window (~30%) is LESS selective than the 20%
+    /// default — the correction must cap at 1.0 (only ever shrink).
+    #[test]
+    fn predicate_date_factor_caps_wide_range() {
+        let stats = date_stats(0, 2405);
+        let pred = date_range_pred(1096, 1827); // 731 days ≈ 30.4%
+        assert_eq!(
+            predicate_date_factor(&pred, &stats, 0.2),
+            1.0,
+            "a range wider than the default selectivity must not inflate"
+        );
+    }
+
+    /// No min/max on the date column → neutral, never a correction.
+    #[test]
+    fn predicate_date_factor_absent_bounds_is_neutral() {
+        let stats = stats_with_distinct(1_000_000, None); // no min/max
+        let pred = date_range_pred(640, 732);
+        assert_eq!(predicate_date_factor(&pred, &stats, 0.2), 1.0);
+    }
+
+    /// Numeric ranges are `check_support`ed by DataFusion's interval
+    /// analyzer (no default applied) — only Date32 literals correct.
+    #[test]
+    fn predicate_date_factor_ignores_numeric_range() {
+        let stats = date_stats(0, 2405);
+        let pred: Arc<dyn datafusion::physical_expr::PhysicalExpr> = Arc::new(BinaryExpr::new(
+            Arc::new(Column::new("n", 0)),
+            Operator::GtEq,
+            Arc::new(Literal::new(ScalarValue::Int64(Some(640)))),
+        ));
+        assert_eq!(predicate_date_factor(&pred, &stats, 0.2), 1.0);
+    }
+
+    /// A window disjoint from the column's [min, max] corrects to 0 —
+    /// the probe is provably empty, the strongest swap signal.
+    #[test]
+    fn predicate_date_factor_disjoint_range_is_zero() {
+        let stats = date_stats(0, 2405);
+        let pred = date_range_pred(3000, 3100);
+        assert_eq!(predicate_date_factor(&pred, &stats, 0.2), 0.0);
+    }
+
+    fn find_hj(plan: &Arc<dyn ExecutionPlan>) -> Option<Arc<dyn ExecutionPlan>> {
+        if plan.as_any().is::<HashJoinExec>() {
+            return Some(plan.clone());
+        }
+        plan.children().into_iter().find_map(find_hj)
+    }
+
+    fn subtree_has_filter(plan: &Arc<dyn ExecutionPlan>) -> bool {
+        if plan.as_any().is::<FilterExec>() {
+            return true;
+        }
+        plan.children().iter().any(|c| subtree_has_filter(c))
+    }
+
+    /// Q10 plan-diff: an Inner Partitioned join whose PROBE (right) is a
+    /// date-range filter that the flat default over-estimates must swap
+    /// the truly-smaller side onto the build, preserving the output
+    /// schema. Build 1000 rows vs probe reported 400 (2000 × 20%) but
+    /// corrected 400 × 0.05 = 20 → 1000 ≥ 2×20 fires.
+    #[test]
+    fn date_swap_fires_on_over_estimated_probe() {
+        // 10-day window over a 1000-day span: sel 1% → factor 0.05.
+        let probe = date_range_filter(DateStatsExec::new_exec(2_000, 0, 999), 100, 110);
+        let top = hashjoin(mem_table_n(1_000), probe, JoinType::Inner);
+        let schema_before = top.schema();
+        let rule = ForceCollectLeftForSemiBoundedBuildRule {
+            min_probe_build_ratio: 0.0,
+            broadcast_ratio: 0.0,
+            date_build_side: Some(true),
+            date_build_side_ratio: 2.0,
+        };
+        let out = rule.optimize(top, &ConfigOptions::default()).unwrap();
+        // The join must still be Partitioned (this is a side swap, not a
+        // broadcast) and its BUILD (left) subtree must now hold the
+        // date-filtered side.
+        let hj_plan = find_hj(&out).expect("plan must still contain a HashJoinExec");
+        let hj = hj_plan.as_any().downcast_ref::<HashJoinExec>().unwrap();
+        assert!(
+            matches!(hj.partition_mode(), PartitionMode::Partitioned),
+            "date swap must keep Partitioned mode:\n{out:?}"
+        );
+        assert!(
+            subtree_has_filter(hj.left()),
+            "after the swap the date-filtered side must be the BUILD (left):\n{out:?}"
+        );
+        assert!(
+            !subtree_has_filter(hj.right()),
+            "the un-filtered side must be the PROBE (right):\n{out:?}"
+        );
+        assert_eq!(
+            schema_before,
+            out.schema(),
+            "swap must preserve the output schema (swap_inputs re-projects)"
+        );
+    }
+
+    /// Flag OFF (default) → the same over-estimated-probe plan is
+    /// untouched. Guards the default-path / codegen-tax invariant.
+    #[test]
+    fn date_swap_off_by_default_leaves_plan_unchanged() {
+        let probe = date_range_filter(DateStatsExec::new_exec(2_000, 0, 999), 100, 110);
+        let top = hashjoin(mem_table_n(1_000), probe, JoinType::Inner);
+        let before = format!("{top:?}");
+        let rule = ForceCollectLeftForSemiBoundedBuildRule {
+            min_probe_build_ratio: 0.0,
+            broadcast_ratio: 0.0,
+            date_build_side: Some(false),
+            date_build_side_ratio: 2.0,
+        };
+        let out = rule.optimize(top, &ConfigOptions::default()).unwrap();
+        assert_eq!(
+            before,
+            format!("{out:?}"),
+            "with the date lever off the plan must be unchanged"
+        );
+    }
+
+    /// Near-equal corrected sides must NOT swap (flap guard): corrected
+    /// probe 120 vs build 200 is under the 2× margin.
+    #[test]
+    fn date_swap_declines_near_equal_sides() {
+        // 60-day window over a 1000-day span: sel 6% → factor 0.3;
+        // reported probe 400 → corrected 120. Build 200 < 240 → decline.
+        let probe = date_range_filter(DateStatsExec::new_exec(2_000, 0, 999), 100, 160);
+        let top = hashjoin(mem_table_n(200), probe, JoinType::Inner);
+        let before = format!("{top:?}");
+        let rule = ForceCollectLeftForSemiBoundedBuildRule {
+            min_probe_build_ratio: 0.0,
+            broadcast_ratio: 0.0,
+            date_build_side: Some(true),
+            date_build_side_ratio: 2.0,
+        };
+        let out = rule.optimize(top, &ConfigOptions::default()).unwrap();
+        assert_eq!(
+            before,
+            format!("{out:?}"),
+            "corrected sides within the swap margin must not swap"
+        );
+    }
+
+    /// Semi/anti joins are asymmetric — swapping flips LeftSemi↔RightSemi.
+    /// The date arm must be Inner-only; the existing semi rules own those.
+    #[test]
+    fn date_swap_leaves_semi_joins_alone() {
+        let probe = date_range_filter(DateStatsExec::new_exec(2_000, 0, 999), 100, 110);
+        let top = hashjoin(mem_table_n(1_000), probe, JoinType::LeftSemi);
+        let before = format!("{top:?}");
+        let rule = ForceCollectLeftForSemiBoundedBuildRule {
+            min_probe_build_ratio: 0.0,
+            broadcast_ratio: 0.0,
+            date_build_side: Some(true),
+            date_build_side_ratio: 2.0,
+        };
+        let out = rule.optimize(top, &ConfigOptions::default()).unwrap();
+        assert_eq!(
+            before,
+            format!("{out:?}"),
+            "a semi join must never be touched by the date swap arm"
+        );
+    }
+
+    /// A date filter on the BUILD side only (probe un-filtered) must not
+    /// swap: the correction shrinks the build, which is already the
+    /// smaller-estimated side — there is no inversion to fix.
+    #[test]
+    fn date_swap_ignores_build_side_filter() {
+        let build = date_range_filter(DateStatsExec::new_exec(2_000, 0, 999), 100, 110);
+        let top = hashjoin(build, mem_table_n(1_000), JoinType::Inner);
+        let before = format!("{top:?}");
+        let rule = ForceCollectLeftForSemiBoundedBuildRule {
+            min_probe_build_ratio: 0.0,
+            broadcast_ratio: 0.0,
+            date_build_side: Some(true),
+            date_build_side_ratio: 2.0,
+        };
+        let out = rule.optimize(top, &ConfigOptions::default()).unwrap();
+        assert_eq!(
+            before,
+            format!("{out:?}"),
+            "a build-side-only date filter must not trigger a swap"
         );
     }
 }

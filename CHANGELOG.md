@@ -7,7 +7,125 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.0] — 2026-07-03
+
+Competitive-milestone release: under the strict, provenance-stamped
+benchmark protocol, ematix-flow now leads DuckDB on **every** measured
+TPC-H configuration — single-stream latency at SF=1 (22/22), SF=10
+(21 wins + 1 tie), SF=100 (19 wins / 0 losses / 3 noise-band ties) and
+concurrent-stream throughput at all five scale × stream-count configs
+(SF=10 × {1,10,100} streams, SF=100 × {1,10}: 1.28×/1.07×/1.01× and
+1.22×/1.41× QPH respectively, co-measured). Full evidence with
+env.json provenance under `bench-results/`; canonical tables in
+`docs/BENCHMARKS.md`. No breaking Python API changes.
+
 ### Added
+
+- **RANGE.AGG Stage 2 — shuffle-free sandwich (default-on with RANGE.AGG).**
+  Stage 1 (0.11.x + the harness fix below) removed the two-phase
+  double-hash for cluster-key single-phase aggregation but still paid a
+  full-input hash exchange: `EnforceDistribution` re-inserted a 600M-row
+  (~9.6 GB at SF=100) `RepartitionExec` between the key-disjoint chunked
+  scan and the `SinglePartitioned` aggregate, because the scan advertised
+  `UnknownPartitioning`. The scan now claims `Partitioning::Hash([group_key])`
+  (row-correct: chunks are key-disjoint) and a new 1:1 pass-through
+  `PartitionClaimResetExec` caps the claim directly above the aggregate so
+  it cannot leak into join planning (a leaked claim would let a downstream
+  partitioned join elide its build-side repartition and mis-pair hash
+  partitions with range chunks → wrong results — pinned by a dedicated
+  leak-catcher test). Any downstream hash requirement is re-satisfied by
+  repartitioning the aggregate's ~10k-row output above the HAVING filter
+  instead of the 600M-row input. Strict interleaved binary A/B, Q18
+  SF=100: **−371.9 ms (−15.5%), 2400 → 2029 ms** — flipping Q18 from the
+  campaign's dominant loss to a clear win vs DuckDB's same-session
+  2384 ms. Sparse-gap files (chunks ≠ target partitions) self-correct to
+  Stage-1 behavior.
+
+- **Σ.Q05.CHAIN — multi-key runtime-bloom cascade chains (tri-state,
+  conservative AUTO).** The L9 sideband rule previously never emitted from
+  multi-key equi-joins; a single-key bloom from an AND-ed inner-join key
+  pair is a safe superset pre-filter (blooms have false positives, never
+  false negatives — the join still enforces all keys), and chain discovery
+  now walks dimension chains (region → nation → supplier → lineitem on
+  Q05's shape), installing per-link emitters innermost-first with runtime
+  disarm safety nets and composition with existing sideband wraps via new
+  extra-sideband slots on `EmatixFastParquetExec`. Gated by
+  `EMAT_L9_CASCADE` / `EMAT_MULTIKEY_BLOOM` (house tri-state; AUTO requires
+  a filtered chain start, CollectLeft builds ≤ 4M rows, terminal scan
+  ≥ 20M rows, ≥ 2 links, composed-terminal-only). AUTO installs on exactly
+  Q05@SF=10 across all 22 plans at both scales; strict A/B on top of the
+  production plan shape measured noise (−0.6 ms) — retained as
+  infrastructure for chain-shaped plans beyond TPC-H.
+
+- **Concurrency-aware `target_partitions` (`EMAT_TARGET_PARTITIONS`
+  tri-state + cross-process registry).** Each process registers a
+  PID-named file in `$TMPDIR/ematix-partition-registry`
+  (`EMAT_PARTITION_REGISTRY_DIR` override); at session build the preset
+  resolves a core share S = clamp(cores / live-registered, 2, cores)
+  (liveness-swept, 250 ms TTL cache, every failure degrades silently to
+  legacy all-cores). `=N` forces, `=0` is legacy, unset is AUTO; solo
+  behavior is unchanged by construction. The bench plan cache now keys on
+  `target_partitions` (stale-plan hazard under varying counts — found by
+  premise audit, regression-tested).
+
+- **Registry-driven pool sizing — the scheduler-arc close.** Two more
+  per-process pools sized at `available_parallelism()` were undoing the
+  registry reduction under multi-process load: the reader's scoped
+  column-decode fan-out (`cores/partitions` per partition) and rayon's
+  global page-decode pool. Both now derive from the same core share:
+  reader budget = max(1, S / partitions) (`EMAT_READER_PARALLELISM_BUDGET`
+  override unchanged), rayon = S (lazy once-per-process;
+  `RAYON_NUM_THREADS` respected; `EMAT_RAYON_BUDGET` tri-state escape).
+  Solo is bit-identical to the old formulas (pinned across a parameter
+  sweep). Measured at SF=10 × 10 streams: 26,882 → **29,271 QPH** in
+  diagnostics; final co-measured re-baseline: ematix leads every
+  throughput config (see release header). Diagnostics also established
+  that raising partitions under load is strictly worse (3/4/7 partitions
+  = −7/−13/−38%): plan width itself — exchanges, per-partition state — is
+  the dominant multi-stream cost, so "plan wide + admission control" was
+  rejected.
+
+- **Scale-gated auto defaults for the Σ.AH lever family.** Narrow-key
+  decode (`EMAT_NARROW_KEY_DECODE` + `EMAT_DOWNCAST_KEYS`), date
+  build-side swap (`EMAT_DATE_BUILD_SIDE` — root cause: DataFusion 53's
+  interval analysis has no `Date32` support, so date-range filters got a
+  flat 20% selectivity estimate and inverted build sides), NDV build-side
+  swap, and FD group-by are now tri-state (`=1` force / `=0` off / unset
+  auto) gated by a shared `scale_class` row-count threshold (300M rows;
+  `EMAT_LARGE_SCALE_MIN_ROWS` override): auto-ON at SF=100-class scans,
+  dormant below. Validated: SF=100 auto-vs-off = 16 clear wins / net
+  −8.3% (Q09 −612 ms, Q10 −1259 ms); SF=10 auto-vs-off noise-identical
+  across all 22 (gate correctly dormant). `EMAT_L9_PARTITIONED` stays
+  opt-in (still net-negative on Q08's shape).
+
+- **Strict benchmark harness (`scripts/bench/`) — the sole source of
+  truth for competitive claims.** Solo-engine passes, per-query process
+  isolation, interleaved A/B with 2σ verdict bars, thermal gating,
+  plan-cache-off default, cold/warm cache policy, env.json provenance
+  (machine, power, git SHA + dirty flag, engine versions, EMAT_* env) in
+  every result directory, binary A/B via `--bin-a/--bin-b`, and a
+  concurrent-streams throughput mode (seeded permutations, first-batch
+  discard, p50/p95/p99 + QPH, `--partitions legacy|auto|N`) with hard
+  memory guards (`--max-inflight`, `--min-free-gb` free-memory gate —
+  added after an uncapped 100-process launch OOM-restarted a 36 GB
+  machine). Python summarizers with unit tests.
+
+- **Σ.AH.5 functional-dependency GROUP BY simplifier (opt-in
+  `EMAT_FD_GROUPBY=1`).** When a single declared-unique group column (a
+  declared PK) provably determines every other group column — via the
+  schema-FD closure for same-table columns plus the PK-fold argument for
+  dims joined on their own single-column PK — the aggregate groups on that
+  anchor alone and re-attaches the determined columns after aggregation
+  (`min` carriers + a restoring projection). TPC-H Q10's 7-column group key
+  (5 wide strings + `n_name` + `c_custkey`) reduces to the single i64
+  `c_custkey` and the aggregate collapses to single-phase
+  `SinglePartitioned`. Fires only on the proven shape (negative-tested: no
+  PK, FK-joined undetermined columns, composite PKs all bail); inert without
+  declared PKs; takes precedence over the default-on late-mat rule when both
+  are eligible. Correctness: plan-diff tests, `tpch_validate` 22/22 at SF=1
+  with the flag on, Q10 SF=10 value-match vs DuckDB. Ships opt-in pending
+  the canonical bench gate (informal SF=10 sanity is neutral-to-slightly
+  faster vs the stock 7-column hash).
 
 - **Scalar-aggregation partition oversubscription (default-on; morsel-engine
   down-payment).** A query whose result is a scalar aggregation — no `GROUP BY`
@@ -55,6 +173,68 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ematix owns), not a competitive-benchmark lever — other engines decode LZ4
   faster too, so it does not change the relative TPC-H standing (see
   `docs/plans/PARQUET_WRITER_SCOPE.md`).
+
+### Fixed
+
+- **Q05 was measured on a non-production plan at BOTH scales — its
+  recorded losses were harness artifacts.** The strict bench binary's
+  hand-built session never ran production's `FlowQueryPlanner` passes
+  (transitive dim-semi splice + pass-1 L9 wraps), so Q05 planned with a
+  bare 60M/600M-row lineitem probe. This was the third bench/preset
+  drift incident; the rule chains are now UNIFIED: a single
+  preset-driven constructor (`preset::with_optimizer_rules_overridden` +
+  explicit `HarnessOverrides` for allowlisted harness deltas) is the only
+  chain-assembly path, pinned by name-set-equality and byte-identical-plan
+  parity tests in both harnesses plus a pinned-names tripwire on the
+  preset itself (all verified by negative control). Corrected verdicts:
+  Q05 SF=100 **ematix +174 ms clear win** (was "−331 ms loss"), SF=10
+  tie; fresh co-measured Q01 SF=100 = **+73 ms clear win** (was
+  "−214 ms"), Q16 = noise. Q05 was the only query whose plan shape
+  changed — all other historical numbers stand.
+
+- **Q08 ALL-ON composition hazard (+1461 ms) root-caused and fixed.**
+  BridgeFilter bloom predicates only bound to `DecodedView::I64`;
+  Int32-narrowed key columns fell back to a legacy re-decode path when
+  narrow-key decode and L9 blooms composed. New `Bound::I64onI32` widened
+  binding covers narrowed views in both the fused chunked pass and masked
+  eval — Q08 SF=100 is a clear win under the auto defaults.
+
+- **Test-suite flake classes eliminated crate-wide.** (1) PID+name-keyed
+  temp fixture paths let the parallel runner interleave one test's
+  re-write with another's read ("footer length 0 exceeds file size 0"),
+  with a case-insensitive-filesystem variant ("match"/"Match" colliding
+  on macOS): all 10 fixture helpers now embed a per-call atomic counter.
+  (2) Tests mutating process-global `EMAT_*` env vars raced each other
+  across modules: a single crate-wide `flags::EMAT_ENV_TEST_LOCK`
+  (tokio Mutex, clippy-clean across awaits) now serializes every
+  mutator. Verified with 10 consecutive clean full-suite runs.
+
+- **Σ.AH.4 row-group parallelism floors.** `tpch_generate --reemit
+  --rg-rows N` re-emits a parquet file with a chosen row-group size
+  (streamed, row-count-verified, atomic rename); canonical data files
+  with 1-2 row groups (SF=1/SF=10 customer, SF=100 supplier) re-emitted
+  to 14-15 RGs so scans parallelize (Q08 SF=100 flipped to a win from
+  this alone).
+
+- **Strict harness measured Q18 SF=100 on a plan production never runs
+  (−1510 ms "loss" was a harness artifact).** The strict bench
+  (`tpch_triangulation_bench`) and the value-validation harness
+  (`tpch_validate`) build their optimizer chains manually and never
+  installed `ClusteredSinglePhaseAggRule` (RANGE.AGG), a production-preset
+  default since f15d2fc (2026-06-10) — the mirror image of the Σ.V
+  alignment bug. The 2026-07-01 campaign therefore planned Q18's inner
+  subquery as the two-phase Partial → 2.2 GB hash-shuffle →
+  FinalPartitioned aggregate over 600M rows / 150M groups. Both harnesses
+  now install the rule at the preset's registration position (self-gated
+  on `EMAT_RANGE_AGG`), pinned by `bench_preset_parity_tests`. Measured
+  (M4 Max, warm, 3 trials, solo): Q18 SF=100 3457±213 ms / 19.1 GB RSS →
+  **2485±74 ms / 16.3 GB** (DuckDB 2149±32); SF=10/SF=1 plans unchanged
+  (skew-gate decline). Residual ~300 ms gap analysed in
+  `docs/PERF_Q18.md` (EnforceDistribution re-inserts the 600M-row input
+  shuffle under the SinglePartitioned agg). Also: RANGE.AGG decline paths
+  now all trace under `EMAT_RANGE_AGG_TRACE`, and a missing
+  `ndv_max_rows` in a Σ.AH.1 pinning-test initializer that broke
+  `cargo test --lib` compilation on main is fixed.
 
 ## [0.11.0] — 2026-06-19
 
@@ -1374,7 +1554,10 @@ Highlights of what's NOT in v0.1.0:
 - Iceberg-style transactional updates against object stores (use
   Delta for that today).
 
-[Unreleased]: https://github.com/ryan-evans-git/ematix-flow/compare/v0.9.0...HEAD
+[Unreleased]: https://github.com/ryan-evans-git/ematix-flow/compare/v0.12.0...HEAD
+[0.12.0]: https://github.com/ryan-evans-git/ematix-flow/compare/v0.11.0...v0.12.0
+[0.11.0]: https://github.com/ryan-evans-git/ematix-flow/compare/v0.10.0...v0.11.0
+[0.10.0]: https://github.com/ryan-evans-git/ematix-flow/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/ryan-evans-git/ematix-flow/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/ryan-evans-git/ematix-flow/compare/v0.5.0...v0.8.0
 [0.5.0]: https://github.com/ryan-evans-git/ematix-flow/compare/v0.4.0...v0.5.0

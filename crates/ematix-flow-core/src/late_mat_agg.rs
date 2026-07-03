@@ -33,7 +33,7 @@ use crate::join_reorder::flatten_inner_join_chain;
 /// Functional-dependency closure of `seed` under `fds`: the full set of columns
 /// determined by `seed` (fixpoint — adds an FD's targets whenever its full source
 /// is already in the set). Indices are positions in the schema the FDs describe.
-fn fd_closure(seed: &BTreeSet<usize>, fds: &FunctionalDependencies) -> BTreeSet<usize> {
+pub(crate) fn fd_closure(seed: &BTreeSet<usize>, fds: &FunctionalDependencies) -> BTreeSet<usize> {
     let mut closure = seed.clone();
     loop {
         let mut grew = false;
@@ -154,7 +154,7 @@ fn first_aggregate(plan: &LogicalPlan) -> Option<&Aggregate> {
 
 /// Descend the post-join wrappers (Projection/Filter/SubqueryAlias) to the first
 /// Inner-Join-rooted subtree.
-fn join_root(plan: &LogicalPlan) -> Option<&LogicalPlan> {
+pub(crate) fn join_root(plan: &LogicalPlan) -> Option<&LogicalPlan> {
     match plan {
         LogicalPlan::Join(_) => Some(plan),
         LogicalPlan::Projection(_) | LogicalPlan::Filter(_) | LogicalPlan::SubqueryAlias(_) => {
@@ -166,7 +166,7 @@ fn join_root(plan: &LogicalPlan) -> Option<&LogicalPlan> {
 
 /// Which leaf (by index) owns `col`? Matches the qualified column against each
 /// leaf's output schema (the flattened-chain leaves carry qualified columns).
-fn leaf_of_column(leaves: &[LogicalPlan], col: &Column) -> Option<usize> {
+pub(crate) fn leaf_of_column(leaves: &[LogicalPlan], col: &Column) -> Option<usize> {
     leaves
         .iter()
         .position(|l| l.schema().columns().iter().any(|c| c == col))
@@ -188,7 +188,7 @@ fn table_scan_of(plan: &LogicalPlan) -> Option<&TableScan> {
 /// The declared primary-key column NAMES of a chain leaf (empty if none). Reads
 /// the `TableSource::constraints()` PrimaryKey (indices into the table's FULL
 /// schema) → column names — the soundness witness for many-to-one dim folds.
-fn leaf_pk_names(leaf: &LogicalPlan) -> Vec<String> {
+pub(crate) fn leaf_pk_names(leaf: &LogicalPlan) -> Vec<String> {
     let Some(scan) = table_scan_of(leaf) else {
         return vec![];
     };
