@@ -21,17 +21,8 @@ use std::sync::Arc;
 
 use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::prelude::{SessionConfig, SessionContext};
-use ematix_flow_core::dedupe_aggregate_rule::DedupeAggregateForFloatDeterminism;
-use ematix_flow_core::dict_aggregate_rule::EnableDictGroupCountRule;
 use ematix_flow_core::ematix_fast_parquet::EmatixFastParquetTableProvider;
 use ematix_flow_core::fast_parquet::FastParquetTableProvider;
-use ematix_flow_core::fused_aggregate_filter_multi_agg_rule::InjectFilterMultiAggRule;
-use ematix_flow_core::fused_aggregate_filter_sum_rule::InjectFilterSumRule;
-use ematix_flow_core::push_down_left_semi_rule::PushDownLeftSemiRule;
-use ematix_flow_core::robin_hood_sum_f64_exec::EnableRobinHoodSumF64Rule;
-use ematix_flow_core::runtime_bloom_cascading_rule::EnableCascadingBloomRule;
-use ematix_flow_core::runtime_bloom_sideband_rule::EnableRuntimeBloomSidebandRule;
-use ematix_flow_core::swap_semi_join_build_rule::SwapSemiJoinBuildSideRule;
 
 const TPCH_TABLES: &[&str] = &[
     "region", "nation", "supplier", "customer", "part", "partsupp", "orders", "lineitem",
@@ -131,6 +122,17 @@ enum Outcome {
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Legacy lever-name compatibility (2026-07-02 hardening): the Q20
+    // transitive semi used to be applied manually, gated on
+    // `EMAT_Q20_TRANSITIVE_SEMI`; it now runs inside the production
+    // `FlowQueryPlanner`, whose gate is spelled `EMAT_Q20_SEMI`.
+    // SAFETY: first statement of main — nothing reads EMAT_* env yet.
+    if let (Ok(v), Err(_)) = (
+        std::env::var("EMAT_Q20_TRANSITIVE_SEMI"),
+        std::env::var("EMAT_Q20_SEMI"),
+    ) {
+        unsafe { std::env::set_var("EMAT_Q20_SEMI", v) };
+    }
     let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(|p| p.parent())
@@ -345,12 +347,17 @@ fn duckdb_cell(row: &duckdb::Row, idx: usize) -> Cell {
 
 // --------- ematix-flow ----------
 
-async fn run_ematix(
-    data_dir: &Path,
-    sql: &str,
-) -> Result<Vec<Vec<Cell>>, Box<dyn std::error::Error>> {
-    use arrow_array::ArrayRef;
-
+/// Build the value-gate session. 2026-07-02 hardening (docs/PERF_Q18.md
+/// § Hardening): the chain is assembled by the PRODUCTION preset via
+/// `preset::with_optimizer_rules_overridden` — this harness only maps
+/// its documented levers onto explicit, named `HarnessOverrides`, so
+/// value validation exercises the exact plans preset users run
+/// (including the FlowQueryPlanner walkers: agg_semi, dim_push,
+/// q20_semi, the Q05 transitive dim-semi, and the shape-gated reorder —
+/// the first three of which used to be re-applied by hand here, and the
+/// last of which was MISSING, so validate never checked production's
+/// reordered plans). Parity is pinned by `validate_preset_parity_tests`.
+fn build_ematix_session() -> SessionContext {
     let partitions: usize = std::env::var("PARTITIONS")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -359,100 +366,64 @@ async fn run_ematix(
                 .map(|n| n.get())
                 .unwrap_or(14)
         });
-    let mut builder = SessionStateBuilder::new()
-        .with_config(SessionConfig::new().with_target_partitions(partitions))
-        .with_default_features()
-        .with_physical_optimizer_rule(Arc::new(DedupeAggregateForFloatDeterminism::default()))
-        .with_physical_optimizer_rule(Arc::new(EnableDictGroupCountRule))
-        .with_physical_optimizer_rule(Arc::new(InjectFilterMultiAggRule))
-        .with_physical_optimizer_rule(Arc::new(InjectFilterSumRule));
-    // Σ.Q.M: synthetic LeftSemi producer. Must precede L10 in
-    // registration order.
-    if std::env::var_os("EMAT_SYNTHETIC_LEFT_SEMI").is_some() {
-        builder = builder.with_optimizer_rule(Arc::new(
-            ematix_flow_core::synthetic_left_semi_rule::SyntheticLeftSemiRule,
-        ));
-    }
-    builder = builder.with_optimizer_rule(Arc::new(PushDownLeftSemiRule));
-    builder = builder.with_physical_optimizer_rule(Arc::new(SwapSemiJoinBuildSideRule));
-    // REV.3/17.3 — force CollectLeft (semi-bounded) + relative broadcast,
-    // both via ::default(). DEFAULT-ON to value-validate the production
-    // preset config; opt-out via EMAT_FORCE_COLLECT_LEFT=0.
-    let force_cl = std::env::var("EMAT_FORCE_COLLECT_LEFT")
-        .ok()
-        .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
-        .unwrap_or(true);
-    if force_cl {
-        builder = builder.with_physical_optimizer_rule(Arc::new(
-            ematix_flow_core::force_collect_left_semi_build_rule::ForceCollectLeftForSemiBoundedBuildRule::default(),
-        ));
-    }
-    // RANGE.AGG (f15d2fc): production-preset default since 2026-06-10,
-    // but this harness (like the strict bench, fixed alongside) never
-    // installed it — so value validation never exercised the
-    // single-phase cluster-key agg plan the preset actually runs (the
-    // exact class of silent-corruption risk this script exists for:
-    // a mis-placed chunk split would split a group's sum across two
-    // output rows). Same registration position as preset.rs (after
-    // ForceCollectLeft, before the RobinHood-sum rewrite); self-gated
-    // on EMAT_RANGE_AGG (default ON, =0 to disable).
-    builder = builder.with_physical_optimizer_rule(Arc::new(
-        ematix_flow_core::clustered_agg_rule::ClusteredSinglePhaseAggRule,
-    ));
-    builder = builder.with_physical_optimizer_rule(Arc::new(EnableRobinHoodSumF64Rule::default()));
     // Σ.Q.L15: Inner-L9 + tight ratio + all-Emat. **Default ON at
-    // milestone config**; set `L15=0` to revert to pre-L15.
-    let l15 = std::env::var("L15")
+    // milestone config**; set `L15=0` to revert to pre-L15 (stock L9
+    // defaults + FastParquet for non-fact tables, below).
+    let l15 = l15_enabled();
+    let overrides = ematix_flow_core::preset::HarnessOverrides {
+        // Σ.Q.M: synthetic LeftSemi producer (precedes L10 by
+        // registration order inside the unified constructor).
+        synthetic_left_semi: std::env::var_os("EMAT_SYNTHETIC_LEFT_SEMI").is_some(),
+        // REV.3/17.3 — DEFAULT-ON to value-validate the production
+        // preset config; opt-out via EMAT_FORCE_COLLECT_LEFT=0.
+        force_collect_left: std::env::var("EMAT_FORCE_COLLECT_LEFT")
+            .ok()
+            .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
+            .unwrap_or(true),
+        // Σ.S.B legacy stem-fanout cascade — EMAT_L9_CASCADE_STEM=1
+        // swaps the base L9 rule out (Σ.Q05.CHAIN repurposed
+        // EMAT_L9_CASCADE as the tri-state gate INSIDE the base rule).
+        l9_cascade_stem_max_extras: ematix_flow_core::flags::opt_in("EMAT_L9_CASCADE_STEM").then(
+            || {
+                std::env::var("EMAT_L9_CASCADE_MAX")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(4)
+            },
+        ),
+        // L15=0 legacy A/B: revert L9 to its pre-L15 env-resolved
+        // defaults (ratio 64, Inner joins off).
+        l9_stock_defaults: !l15,
+        // HJ.4: SIMD-tag/RobinHood join-probe swap — registered last;
+        // dormant unless EMAT_HASH_JOIN=1. No-op for default runs.
+        swap_emat_hash_join: true,
+        ..ematix_flow_core::preset::HarnessOverrides::default()
+    };
+    let (builder, _handles) = ematix_flow_core::preset::with_optimizer_rules_overridden(
+        SessionStateBuilder::new()
+            .with_config(SessionConfig::new().with_target_partitions(partitions))
+            .with_default_features(),
+        &overrides,
+    );
+    SessionContext::new_with_state(builder.build())
+}
+
+/// Σ.Q.L15 lever shared by the session builder and the provider loop.
+fn l15_enabled() -> bool {
+    std::env::var("L15")
         .ok()
         .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
-        .unwrap_or(true);
-    // Σ.S.B legacy stem-fanout cascade — now selected via
-    // EMAT_L9_CASCADE_STEM=1 only. Σ.Q05.CHAIN repurposed EMAT_L9_CASCADE
-    // as the tri-state gate of the chain-cascade second phase INSIDE the
-    // base rule (=1 force, =0 off, unset auto), so setting it no longer
-    // swaps the rule out.
-    let cascade = ematix_flow_core::flags::opt_in("EMAT_L9_CASCADE_STEM");
-    if cascade {
-        let max_extras = std::env::var("EMAT_L9_CASCADE_MAX")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(4);
-        let rule = if l15 {
-            EnableCascadingBloomRule {
-                min_probe_to_build_ratio: 1024,
-                allow_inner_join: true,
-                require_filtered_build: true,
-                max_extras_per_emitter: max_extras,
-            }
-        } else {
-            EnableCascadingBloomRule::default()
-        };
-        builder = builder.with_physical_optimizer_rule(Arc::new(rule));
-    } else {
-        let l9_rule = if l15 {
-            EnableRuntimeBloomSidebandRule {
-                min_probe_to_build_ratio: 1024,
-                allow_inner_join: true,
-                require_filtered_build: true,
-                max_expected_keys_per_partition: 0,
-                min_probe_proj_cols: 0,
-                // Σ.AH.2: env-resolved NDV ceiling (EMAT_L9_NDV_MAX_ROWS /
-                // EMAT_L9_PARTITIONED) + any future fields track the default.
-                ..EnableRuntimeBloomSidebandRule::default()
-            }
-        } else {
-            EnableRuntimeBloomSidebandRule::default()
-        };
-        builder = builder.with_physical_optimizer_rule(Arc::new(l9_rule));
-    }
-    // HJ.4: SIMD-tag/RobinHood join-probe swap. Dormant unless EMAT_HASH_JOIN=1
-    // (Tag path additionally via EMAT_HJ_TAG=1); registered last so the join's
-    // partition_mode is already assigned. No-op for default validation runs.
-    builder = builder.with_physical_optimizer_rule(Arc::new(
-        ematix_flow_core::swap_emat_hash_join_rule::SwapEmatixHashJoinRule,
-    ));
-    let state = builder.build();
-    let ctx = SessionContext::new_with_state(state);
+        .unwrap_or(true)
+}
+
+async fn run_ematix(
+    data_dir: &Path,
+    sql: &str,
+) -> Result<Vec<Vec<Cell>>, Box<dyn std::error::Error>> {
+    use arrow_array::ArrayRef;
+
+    let l15 = l15_enabled();
+    let ctx = build_ematix_session();
     // Σ.AH.5: the FD group-by simplifier needs the PK-derived FDs to fire, so
     // validating it declares the TPC-H primary keys — harness scaffolding like
     // tpch_preset_rebench's EMAT_TPCH_PK (a real catalog declares PKs via DDL;
@@ -511,41 +482,18 @@ async fn run_ematix(
             .to_string();
         eprintln!("=== PHYSICAL PLAN ===\n{formatted}=====================");
     }
-    // Σ.Q20: validate the transitive semi-pushdown (no-op on the other
-    // 21 queries; rewrites Q20). Default-on; EMAT_Q20_TRANSITIVE_SEMI=0 to skip.
-    let batches = if std::env::var("EMAT_Q20_TRANSITIVE_SEMI")
-        .ok()
-        .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
-        .unwrap_or(true)
-    {
-        let optimized = ctx.sql(sql).await?.into_optimized_plan()?;
-        let optimized =
-            ematix_flow_core::agg_filter_pushdown::push_transitive_semi_into_agg(optimized)?;
-        // Σ.Q05 (#352): the transitive dim-semi is perf-OPT-IN
-        // (EMAT_TRANSITIVE_DIM_SEMI=1) in the planner/bench, but
-        // validate exercises it BY DEFAULT so every correctness run
-        // checks the splice (no-op on the other 21 queries; rewrites
-        // Q05). EMAT_TRANSITIVE_DIM_SEMI=0 to skip here too.
-        let optimized = if std::env::var("EMAT_TRANSITIVE_DIM_SEMI").as_deref() != Ok("0") {
-            ematix_flow_core::agg_filter_pushdown::push_transitive_dim_semi_into_join_chain(
-                optimized,
-            )?
-        } else {
-            optimized
-        };
-        // Σ.AH.5 (EMAT_FD_GROUPBY=1, default OFF): value-validate the FD
-        // group-by simplifier the same way the walkers above are validated —
-        // apply the pure rewrite to the optimized plan (fires on the proven
-        // unique-key shape only; None everywhere else).
-        let optimized = if ematix_flow_core::fd_groupby_simplify::enabled() {
-            ematix_flow_core::fd_groupby_simplify::simplify(&optimized).unwrap_or(optimized)
-        } else {
-            optimized
-        };
-        ctx.execute_logical_plan(optimized).await?.collect().await?
-    } else {
-        ctx.sql(sql).await?.collect().await?
-    };
+    // 2026-07-02 hardening: the production pre-plan walkers — agg_semi,
+    // dim_push, q20_semi (Σ.Q20), the Q05 transitive dim-semi (Σ.Q05 /
+    // #352), fd_groupby (Σ.AH.5), the shape-gated reorder — all run
+    // inside the session's `FlowQueryPlanner`, so this value gate now
+    // validates the EXACT production plan pipeline (it previously
+    // re-applied only q20_semi/q05_semi/fd_groupby by hand and never
+    // exercised agg_semi/dim_push/reorder plans at all). Their opt-out
+    // levers are the planner's env gates (EMAT_AGG_SEMI, EMAT_DIM_PUSH,
+    // EMAT_Q20_SEMI — legacy spelling EMAT_Q20_TRANSITIVE_SEMI is
+    // forwarded in main() — EMAT_TRANSITIVE_DIM_SEMI, EMAT_REORDER_QP,
+    // EMAT_FD_GROUPBY).
+    let batches = ctx.sql(sql).await?.collect().await?;
     let mut out: Vec<Vec<Cell>> = Vec::new();
     for batch in &batches {
         let n_rows = batch.num_rows();
@@ -562,6 +510,74 @@ async fn run_ematix(
     }
     out.sort_by(|a, b| row_lt(a, b));
     Ok(out)
+}
+
+/// Validate↔preset parity pins (2026-07-02 hardening — see the bench's
+/// `bench_preset_parity_tests` for the drift history). Run:
+/// `cargo test -p ematix-flow-core --example tpch_validate`.
+#[cfg(test)]
+mod validate_preset_parity_tests {
+    use super::*;
+    use ematix_flow_core::preset;
+
+    /// Harness-only rules the value gate may carry on top of the
+    /// production chain. `SwapEmatixHashJoinRule` is installed
+    /// unconditionally (HJ.4 measurement hook) but is dormant unless
+    /// `EMAT_HASH_JOIN=1`; the cascade-stem rule only appears under
+    /// `EMAT_L9_CASCADE_STEM=1`.
+    const HARNESS_ONLY_PHYSICAL_RULES: &[&str] = &[
+        "SwapEmatixHashJoinRule",             // always installed, dormant
+        "ematix_flow_enable_cascading_bloom", // EMAT_L9_CASCADE_STEM=1
+    ];
+    const HARNESS_ONLY_LOGICAL_RULES: &[&str] = &[
+        "ematix_flow_synthetic_left_semi", // EMAT_SYNTHETIC_LEFT_SEMI=1
+    ];
+
+    /// The value gate's ematix rule chain must EQUAL the production
+    /// preset's (registration order included), modulo the documented
+    /// allowlist — so a rule added to the preset can never again be
+    /// silently absent from value validation (the Q18 SF=100
+    /// RANGE.AGG gap), and vice versa (Σ.V).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn validate_rule_chain_name_set_equals_production_preset() {
+        let ctx = build_ematix_session();
+        let state = ctx.state();
+        let preset_state = preset::with_optimizer_rules(
+            SessionStateBuilder::new()
+                .with_config(SessionConfig::new().with_target_partitions(4))
+                .with_default_features(),
+        )
+        .build();
+
+        let (mut phys, logi) = preset::ematix_rule_names(&state);
+        phys.retain(|n| !HARNESS_ONLY_PHYSICAL_RULES.contains(&n.as_str()));
+        let logi: Vec<String> = logi
+            .into_iter()
+            .filter(|n| !HARNESS_ONLY_LOGICAL_RULES.contains(&n.as_str()))
+            .collect();
+        let (preset_phys, preset_logi) = preset::ematix_rule_names(&preset_state);
+        assert_eq!(
+            phys, preset_phys,
+            "tpch_validate PHYSICAL rule chain diverged from the production \
+             preset (allowlist-filtered) — the value gate would be \
+             validating plans production never runs"
+        );
+        assert_eq!(
+            logi, preset_logi,
+            "tpch_validate LOGICAL rule chain diverged from the production preset"
+        );
+        assert_eq!(preset_phys, preset::PRODUCTION_PHYSICAL_RULE_NAMES);
+        assert_eq!(preset_logi, preset::PRODUCTION_LOGICAL_RULE_NAMES);
+        // The production FlowQueryPlanner (agg_semi / dim_push /
+        // q20_semi / Q05 transitive dim-semi / shape-gated reorder /
+        // fd_groupby / scalar-agg boost) must be exercised by the
+        // value gate.
+        assert_eq!(
+            format!("{:?}", state.query_planner()),
+            format!("{:?}", preset_state.query_planner()),
+            "value-gate session's query planner differs from the production preset's"
+        );
+    }
 }
 
 fn arrow_cell(arr: &arrow_array::ArrayRef, row: usize) -> Cell {
