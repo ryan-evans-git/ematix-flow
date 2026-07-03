@@ -59,6 +59,15 @@ pub struct EmatProviderMetadata {
     pub column_stats: Vec<ColumnStatistics>,
     pub column_is_dict_encoded: Vec<bool>,
     pub column_has_no_nulls: Vec<bool>,
+    /// LPT.RG — per-(row-group, leaf-column) `total_compressed_size` in
+    /// bytes, `[rg][col]`, straight from the footer's column-chunk
+    /// metadata. Used by the scan's cost-balanced (LPT) row-group →
+    /// partition assignment: a row group's predicted decode cost is the
+    /// sum of its PROJECTED columns' compressed sizes. `0` where the
+    /// column-chunk metadata is missing (the assignment then falls back
+    /// to a count-balanced split). Built once here at open — never
+    /// re-read from the footer per scan.
+    pub rg_column_compressed_sizes: Vec<Vec<u64>>,
 }
 
 /// Map a leaf `SchemaElement` to an Arrow `DataType`. Covers the
@@ -213,9 +222,13 @@ pub fn load_provider_metadata<P: AsRef<Path>>(
     let mut no_nulls: Vec<bool> = vec![true; num_cols];
     // is_dict: every data page in every RG must be dict-encoded.
     let mut all_dict: Vec<bool> = vec![true; num_cols];
+    // LPT.RG — per-(rg, col) compressed byte sizes for the scan's
+    // cost-balanced assignment. Missing chunk metadata leaves 0.
+    let mut rg_column_compressed_sizes: Vec<Vec<u64>> = Vec::with_capacity(num_row_groups);
 
     for rg in &meta.row_groups {
         let cols = rg.columns.len().min(num_cols);
+        let mut rg_col_sizes: Vec<u64> = vec![0; num_cols];
         for col_idx in 0..num_cols {
             let arrow_ty = schema.field(col_idx).data_type().clone();
             if col_idx >= cols {
@@ -230,6 +243,7 @@ pub fn load_provider_metadata<P: AsRef<Path>>(
                 all_dict[col_idx] = false;
                 continue;
             };
+            rg_col_sizes[col_idx] = cm.total_compressed_size.max(0) as u64;
 
             // --- null_count + no_nulls + min/max from Statistics ---
             match cm.statistics.as_ref() {
@@ -298,6 +312,7 @@ pub fn load_provider_metadata<P: AsRef<Path>>(
                 }
             }
         }
+        rg_column_compressed_sizes.push(rg_col_sizes);
     }
 
     let column_stats: Vec<ColumnStatistics> = (0..num_cols)
@@ -328,6 +343,7 @@ pub fn load_provider_metadata<P: AsRef<Path>>(
         column_stats,
         column_is_dict_encoded: all_dict,
         column_has_no_nulls: no_nulls,
+        rg_column_compressed_sizes,
     })
 }
 

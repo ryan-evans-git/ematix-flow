@@ -108,6 +108,7 @@ fn is_off_value(v: &str) -> bool {
 /// complete — it scans the live environment.)
 pub const DEFAULT_ON: &[&str] = &[
     "EMAT_AGG_SEMI",
+    "EMAT_BALANCED_RG_ASSIGN",
     "EMAT_COLLECT_LEFT_SEMI_BROADCAST",
     "EMAT_CSE_FILTER_FUSION",
     "EMAT_CSE_PARALLEL",

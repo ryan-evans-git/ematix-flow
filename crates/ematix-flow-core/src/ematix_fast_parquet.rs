@@ -1859,6 +1859,14 @@ pub struct EmatixFastParquetTableProvider {
     /// can size its partitions and pick the right reader variant
     /// without re-decoding the thrift footer.
     rg_num_rows: Arc<Vec<usize>>,
+    /// LPT.RG — per-(row-group, leaf-column) `total_compressed_size`
+    /// bytes `[rg][col]`, cached at `try_new` time from the footer's
+    /// column-chunk metadata (never re-read per scan). `scan()` sums a
+    /// row group's PROJECTED columns to predict its decode cost, then
+    /// LPT bin-packs row groups across partitions so the slowest
+    /// partition no longer sets the scan's tail latency (round-robin
+    /// left ~54% effective parallelism on Q01 SF=10 — docs/PERF_Q01.md).
+    rg_col_compressed_bytes: Arc<Vec<Vec<u64>>>,
     /// Per-column typed min/max + null_count aggregated across row
     /// groups at `try_new` time. Mirrors what `FastParquetTableProvider`
     /// computes; the planner uses these for join-build-side selection
@@ -1985,6 +1993,9 @@ struct CachedProviderMeta {
     column_stats: Arc<Vec<datafusion::common::stats::ColumnStatistics>>,
     column_is_dict_encoded: Arc<Vec<bool>>,
     column_has_no_nulls: Arc<Vec<bool>>,
+    /// LPT.RG — per-(rg, col) compressed sizes for the scan's
+    /// cost-balanced assignment (see the provider field of the same name).
+    rg_col_compressed_bytes: Arc<Vec<Vec<u64>>>,
 }
 
 type ProviderMetaCacheKey = (PathBuf, u64, u128);
@@ -2120,6 +2131,7 @@ impl EmatixFastParquetTableProvider {
         let num_rows = em.num_rows;
         let num_row_groups = em.num_row_groups;
         let rg_num_rows: Arc<Vec<usize>> = Arc::new(em.rg_num_rows);
+        let rg_col_compressed_bytes: Arc<Vec<Vec<u64>>> = Arc::new(em.rg_column_compressed_sizes);
         let column_is_dict_encoded: Arc<Vec<bool>> = Arc::new(em.column_is_dict_encoded);
         let column_has_no_nulls: Arc<Vec<bool>> = Arc::new(em.column_has_no_nulls);
         // Σ.E5 (2026-05-18): promote Utf8 → Utf8View at `try_new` time.
@@ -2335,6 +2347,7 @@ impl EmatixFastParquetTableProvider {
                     column_stats: column_stats.clone(),
                     column_is_dict_encoded: column_is_dict_encoded.clone(),
                     column_has_no_nulls: column_has_no_nulls.clone(),
+                    rg_col_compressed_bytes: rg_col_compressed_bytes.clone(),
                 };
                 provider_meta_cache().lock().unwrap().insert(key, meta);
             }
@@ -2346,6 +2359,7 @@ impl EmatixFastParquetTableProvider {
             num_row_groups,
             num_rows,
             rg_num_rows,
+            rg_col_compressed_bytes,
             column_stats,
             column_is_dict_encoded,
             column_has_no_nulls,
@@ -2380,6 +2394,7 @@ impl EmatixFastParquetTableProvider {
             num_row_groups: meta.num_row_groups,
             num_rows: meta.num_rows,
             rg_num_rows: meta.rg_num_rows,
+            rg_col_compressed_bytes: meta.rg_col_compressed_bytes,
             column_stats: meta.column_stats,
             column_is_dict_encoded: meta.column_is_dict_encoded,
             column_has_no_nulls: meta.column_has_no_nulls,
@@ -2610,6 +2625,133 @@ impl EmatixFastParquetTableProvider {
     }
 }
 
+/// LPT.RG — the legacy round-robin row-group → partition assignment
+/// (`rg % num_partitions`). Kept verbatim as the `EMAT_BALANCED_RG_ASSIGN=0`
+/// A/B escape hatch: with the lever off, `scan()` must reproduce this
+/// exactly.
+pub fn round_robin_rg_assignments(num_rgs: usize, num_partitions: usize) -> Vec<Vec<usize>> {
+    let num_partitions = num_partitions.max(1);
+    let mut assignments: Vec<Vec<usize>> = vec![Vec::new(); num_partitions];
+    for rg in 0..num_rgs {
+        assignments[rg % num_partitions].push(rg);
+    }
+    assignments
+}
+
+/// LPT.RG — count-balanced fallback: contiguous ascending runs whose
+/// lengths differ by at most 1 (the first `num_rgs % num_partitions`
+/// partitions take the extra row group). Used when per-RG cost metadata
+/// is unavailable or carries no signal (all costs equal — LPT would
+/// degenerate to this anyway). Never panics: `num_rgs == 0` yields
+/// `num_partitions` empty lists, matching round-robin's shape.
+pub fn count_balanced_rg_assignments(num_rgs: usize, num_partitions: usize) -> Vec<Vec<usize>> {
+    let num_partitions = num_partitions.max(1);
+    let base = num_rgs / num_partitions;
+    let extra = num_rgs % num_partitions;
+    let mut assignments: Vec<Vec<usize>> = Vec::with_capacity(num_partitions);
+    let mut next = 0usize;
+    for p in 0..num_partitions {
+        let len = base + usize::from(p < extra);
+        assignments.push((next..next + len).collect());
+        next += len;
+    }
+    assignments
+}
+
+/// LPT.RG — deterministic longest-processing-time (LPT) bin-packing of
+/// row groups across partitions by predicted decode cost.
+///
+/// - Row groups are taken in descending `costs[rg]` order (stable
+///   tie-break: lower index first) and each is assigned to the currently
+///   least-loaded partition (tie-break: lowest partition index) — so the
+///   same input always produces the same assignment.
+/// - Within each partition the assigned list is sorted ascending, which
+///   preserves forward-sequential reads inside each producer.
+/// - If every cost is identical (including all-zero — no signal), falls
+///   back to [`count_balanced_rg_assignments`].
+///
+/// Classic LPT guarantee: final `max_load − min_load ≤ max(costs)` —
+/// the imbalance is bounded by one row group, vs round-robin's unbounded
+/// cost skew (SF=10 lineitem: 58 RGs / 14 partitions put +25% tail work
+/// on two partitions before per-RG cost skew even enters).
+pub fn lpt_rg_assignments(costs: &[u64], num_partitions: usize) -> Vec<Vec<usize>> {
+    let num_partitions = num_partitions.max(1);
+    let num_rgs = costs.len();
+    if num_rgs == 0 || costs.iter().all(|&c| c == costs[0]) {
+        return count_balanced_rg_assignments(num_rgs, num_partitions);
+    }
+    let mut order: Vec<usize> = (0..num_rgs).collect();
+    // Descending cost; ties broken by ascending RG index (determinism).
+    order.sort_by(|&a, &b| costs[b].cmp(&costs[a]).then_with(|| a.cmp(&b)));
+    let mut loads: Vec<u128> = vec![0; num_partitions];
+    let mut assignments: Vec<Vec<usize>> = vec![Vec::new(); num_partitions];
+    for rg in order {
+        // `min_by_key` returns the FIRST minimum → lowest partition index
+        // wins ties.
+        let p = (0..num_partitions)
+            .min_by_key(|&p| loads[p])
+            .expect("num_partitions >= 1");
+        assignments[p].push(rg);
+        loads[p] += costs[rg] as u128;
+    }
+    for part in &mut assignments {
+        part.sort_unstable();
+    }
+    assignments
+}
+
+/// LPT.RG — per-RG predicted decode cost: the sum over the PROJECTED
+/// columns of that row group's column-chunk `total_compressed_size`.
+/// Compressed bytes track both imbalance sources round-robin ignores:
+/// compression-ratio skew and projected-column width skew. Returns
+/// `None` when the cached footer metadata doesn't cover every row group
+/// (caller falls back to a count-balanced split).
+pub fn rg_projected_costs(
+    rg_col_compressed_bytes: &[Vec<u64>],
+    num_rgs: usize,
+    projection: &[usize],
+) -> Option<Vec<u64>> {
+    if rg_col_compressed_bytes.len() != num_rgs {
+        return None;
+    }
+    Some(
+        rg_col_compressed_bytes
+            .iter()
+            .map(|cols| {
+                projection
+                    .iter()
+                    .map(|&c| cols.get(c).copied().unwrap_or(0))
+                    .sum()
+            })
+            .collect(),
+    )
+}
+
+/// LPT.RG — the assignment `scan()` uses. Gated by
+/// `EMAT_BALANCED_RG_ASSIGN` (default **ON**, house `flags::enabled`
+/// pattern): `=0` restores the legacy round-robin exactly (A/B escape).
+/// With the lever on: LPT over per-RG projected compressed bytes;
+/// count-balanced split when metadata is unavailable; never panics.
+///
+/// Scope: ONLY the plain `scan()` path calls this. The RANGE.AGG
+/// key-disjoint chunk contracts (`EmatixFastParquetExec::with_assignments`
+/// / `with_assignments_claiming_hash`) inject their own assignments and
+/// are deliberately untouched.
+fn compute_scan_rg_assignments(
+    num_rgs: usize,
+    num_partitions: usize,
+    projection: &[usize],
+    rg_col_compressed_bytes: &[Vec<u64>],
+) -> Vec<Vec<usize>> {
+    if !crate::flags::enabled("EMAT_BALANCED_RG_ASSIGN") {
+        return round_robin_rg_assignments(num_rgs, num_partitions);
+    }
+    match rg_projected_costs(rg_col_compressed_bytes, num_rgs, projection) {
+        Some(costs) => lpt_rg_assignments(&costs, num_partitions),
+        None => count_balanced_rg_assignments(num_rgs, num_partitions),
+    }
+}
+
 #[async_trait::async_trait]
 impl TableProvider for EmatixFastParquetTableProvider {
     fn as_any(&self) -> &dyn Any {
@@ -2756,10 +2898,19 @@ impl TableProvider for EmatixFastParquetTableProvider {
         let target_partitions = state.config_options().execution.target_partitions;
         let num_rgs = self.num_row_groups;
         let num_partitions = num_rgs.min(target_partitions).max(1);
-        let mut assignments: Vec<Vec<usize>> = vec![Vec::new(); num_partitions];
-        for rg in 0..num_rgs {
-            assignments[rg % num_partitions].push(rg);
-        }
+        // LPT.RG — cost-balanced (LPT) row-group → partition assignment,
+        // replacing round-robin (`rg % num_partitions`). Each partition's
+        // producer decodes its list sequentially, so the most expensive
+        // partition sets the scan's tail latency; round-robin ignored
+        // both uneven counts (58 RGs / 14 partitions → +25% tail work)
+        // and per-RG decode-cost skew. `EMAT_BALANCED_RG_ASSIGN=0`
+        // restores round-robin exactly.
+        let assignments = compute_scan_rg_assignments(
+            num_rgs,
+            num_partitions,
+            &projection,
+            &self.rg_col_compressed_bytes,
+        );
 
         // Phase 3: extract pushable filters from DataFusion's filter
         // list. If all filters fit the shape, plumb them to the Exec
@@ -6673,5 +6824,308 @@ mod tests {
             "dict-encoded string col should report distinct_count=Inexact(5), got {:?}",
             cs.distinct_count
         );
+    }
+
+    // ------------- LPT.RG — cost-balanced scan assignment tests -------------
+
+    /// LPT.RG — per-call unique fixture dir (process id + atomic counter,
+    /// the 01e6a50 pattern) so parallel tests never collide on a re-write.
+    fn lpt_fixture_dir(name: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "lpt_rg_assign_{}_{}_{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed),
+            name
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        dir
+    }
+
+    /// LPT.RG — classic LPT balance guarantee on constructed skewed
+    /// inputs: every RG assigned exactly once, and the final
+    /// `max_load − min_load` never exceeds the largest single RG cost.
+    #[test]
+    fn lpt_balance_bounded_by_max_single_cost() {
+        let cases: Vec<(Vec<u64>, usize)> = vec![
+            (vec![100, 1, 1, 1, 90, 5, 60, 2, 80, 3, 40, 7], 3),
+            (vec![1000, 999, 998, 1, 1, 1, 1, 1, 1, 1], 4),
+            (vec![7, 7, 7, 7, 7, 100], 2),
+            // SF=10 lineitem shape: 58 RGs / 14 partitions with cost skew.
+            (
+                (0..58u64)
+                    .map(|i| 1_000_000 + (i * 37_919) % 500_000)
+                    .collect(),
+                14,
+            ),
+        ];
+        for (costs, parts) in cases {
+            let a = lpt_rg_assignments(&costs, parts);
+            assert_eq!(a.len(), parts);
+            let mut seen = vec![false; costs.len()];
+            for part in &a {
+                for &rg in part {
+                    assert!(!seen[rg], "rg {rg} assigned twice");
+                    seen[rg] = true;
+                }
+            }
+            assert!(seen.iter().all(|&s| s), "every rg assigned exactly once");
+            let loads: Vec<u64> = a
+                .iter()
+                .map(|p| p.iter().map(|&rg| costs[rg]).sum())
+                .collect();
+            let spread = loads.iter().max().unwrap() - loads.iter().min().unwrap();
+            let max_cost = *costs.iter().max().unwrap();
+            assert!(
+                spread <= max_cost,
+                "LPT balance property violated: spread {spread} > max cost {max_cost} \
+                 (loads {loads:?} for costs {costs:?} / {parts} partitions)"
+            );
+        }
+    }
+
+    /// LPT.RG — determinism (same input → same assignment; cost ties
+    /// break by RG index, load ties by partition index) and ascending
+    /// RG order within every partition (forward-sequential reads).
+    #[test]
+    fn lpt_deterministic_and_ascending_within_partitions() {
+        let costs: Vec<u64> = (0..37u64).map(|i| (i * 7_919) % 1_000 + 1).collect();
+        let a1 = lpt_rg_assignments(&costs, 5);
+        let a2 = lpt_rg_assignments(&costs, 5);
+        assert_eq!(a1, a2, "same input must produce the same assignment");
+        for part in &a1 {
+            assert!(
+                part.windows(2).all(|w| w[0] < w[1]),
+                "partition list must be strictly ascending: {part:?}"
+            );
+        }
+        // Heavy cost ties: still deterministic across calls.
+        let tied = vec![5u64, 5, 5, 9, 5, 5, 9, 5];
+        assert_eq!(lpt_rg_assignments(&tied, 3), lpt_rg_assignments(&tied, 3));
+    }
+
+    /// LPT.RG — no-signal costs (all zero / all equal) fall back to the
+    /// count-balanced split; unavailable metadata yields `None` costs;
+    /// projected costs sum ONLY the projected columns and never panic on
+    /// an out-of-range column index.
+    #[test]
+    fn lpt_fallbacks_count_balanced_and_projected_costs() {
+        for costs in [vec![0u64; 10], vec![42u64; 10]] {
+            let a = lpt_rg_assignments(&costs, 4);
+            assert_eq!(a, count_balanced_rg_assignments(10, 4));
+            let sizes: Vec<usize> = a.iter().map(Vec::len).collect();
+            assert_eq!(sizes.iter().sum::<usize>(), 10);
+            assert!(
+                sizes.iter().max().unwrap() - sizes.iter().min().unwrap() <= 1,
+                "as even as possible: {sizes:?}"
+            );
+        }
+        // Count-balanced shape: contiguous ascending runs, sizes differ ≤ 1.
+        assert_eq!(
+            count_balanced_rg_assignments(5, 3),
+            vec![vec![0, 1], vec![2, 3], vec![4]]
+        );
+        // Degenerate shapes never panic and mirror round-robin's layout.
+        let empty: Vec<Vec<usize>> = vec![vec![], vec![], vec![]];
+        assert_eq!(count_balanced_rg_assignments(0, 3), empty);
+        assert_eq!(round_robin_rg_assignments(0, 3), empty);
+
+        // Metadata unavailable (rg count mismatch) → None → caller falls back.
+        assert!(rg_projected_costs(&[vec![1, 2]], 3, &[0]).is_none());
+        // Cost = sum of PROJECTED columns only.
+        let meta = vec![vec![10u64, 100, 1], vec![20, 200, 2]];
+        assert_eq!(rg_projected_costs(&meta, 2, &[0, 2]), Some(vec![11, 22]));
+        // Out-of-range projected column contributes 0 (never panics).
+        assert_eq!(rg_projected_costs(&meta, 2, &[0, 9]), Some(vec![10, 20]));
+    }
+
+    /// LPT.RG — `EMAT_BALANCED_RG_ASSIGN=0` must reproduce the legacy
+    /// round-robin bit-for-bit; unset (default ON) takes the LPT path.
+    /// Mutates a production `EMAT_*` var → takes `EMAT_ENV_TEST_LOCK`
+    /// (blocking_lock — sync test) and restores the prior value.
+    #[test]
+    fn balanced_rg_assign_off_reproduces_round_robin() {
+        let _guard = crate::flags::EMAT_ENV_TEST_LOCK.blocking_lock();
+        let key = "EMAT_BALANCED_RG_ASSIGN";
+        let prev = std::env::var(key).ok();
+
+        // Strongly skewed per-RG costs (powers of two).
+        let meta: Vec<Vec<u64>> = (0..9).map(|i| vec![1u64 << i]).collect();
+        let proj = vec![0usize];
+
+        unsafe { std::env::set_var(key, "0") };
+        let off = compute_scan_rg_assignments(9, 4, &proj, &meta);
+        assert_eq!(
+            off,
+            round_robin_rg_assignments(9, 4),
+            "=0 must restore round-robin exactly"
+        );
+
+        unsafe { std::env::remove_var(key) };
+        let on = compute_scan_rg_assignments(9, 4, &proj, &meta);
+        let costs: Vec<u64> = (0..9).map(|i| 1u64 << i).collect();
+        assert_eq!(on, lpt_rg_assignments(&costs, 4), "default (unset) → LPT");
+        assert_ne!(
+            on, off,
+            "skewed costs must produce a non-round-robin packing"
+        );
+
+        match prev {
+            Some(v) => unsafe { std::env::set_var(key, v) },
+            None => unsafe { std::env::remove_var(key) },
+        }
+    }
+
+    /// LPT.RG scope pin — RANGE.AGG-style injected assignments must pass
+    /// through `with_assignments` / `with_assignments_claiming_hash`
+    /// UNTOUCHED (the key-disjoint chunk contract): no re-balancing, no
+    /// reordering, partition count taken verbatim.
+    #[tokio::test]
+    async fn injected_assignments_pass_through_unbalanced() {
+        use ematix_parquet_codec::write::ColumnData;
+        use ematix_parquet_codec::write::write_table_to_path_with_row_group_size;
+        use ematix_parquet_format::types::CompressionCodec;
+
+        let dir = lpt_fixture_dir("passthrough");
+        let path = dir.join("t.parquet");
+        let k: Vec<i64> = (0..600).collect();
+        write_table_to_path_with_row_group_size(
+            &path,
+            &[("k", ColumnData::I64(&k))],
+            CompressionCodec::Uncompressed,
+            100, // → 6 row groups
+        )
+        .unwrap();
+
+        let provider =
+            EmatixFastParquetTableProvider::try_new(path.to_string_lossy().to_string()).unwrap();
+        let ctx = SessionContext::new_with_config(
+            datafusion::prelude::SessionConfig::new().with_target_partitions(2),
+        );
+        let state = ctx.state();
+        let exec = provider.scan(&state, None, &[], None).await.unwrap();
+        let exec = exec
+            .as_any()
+            .downcast_ref::<EmatixFastParquetExec>()
+            .expect("plain scan produces EmatixFastParquetExec");
+
+        // Deliberately UNBALANCED key-disjoint chunks — a re-balancer
+        // would rewrite these; the contract forbids it.
+        let injected = vec![vec![0usize, 1, 2, 3, 4], vec![5]];
+        let with = exec.with_assignments(injected.clone());
+        assert_eq!(
+            with.assignments(),
+            injected.as_slice(),
+            "with_assignments must pass injected chunks through verbatim"
+        );
+        assert_eq!(
+            with.properties().output_partitioning().partition_count(),
+            2,
+            "partition count follows the injected assignment"
+        );
+
+        let hash_expr: Arc<dyn datafusion::physical_expr::PhysicalExpr> =
+            datafusion::physical_expr::expressions::col("k", &exec.schema()).unwrap();
+        let claiming = exec.with_assignments_claiming_hash(injected.clone(), vec![hash_expr]);
+        assert_eq!(
+            claiming.assignments(),
+            injected.as_slice(),
+            "with_assignments_claiming_hash must pass injected chunks through verbatim"
+        );
+        assert!(
+            matches!(
+                claiming.properties().output_partitioning(),
+                Partitioning::Hash(_, 2)
+            ),
+            "claiming variant advertises Hash partitioning over the injected chunks"
+        );
+    }
+
+    /// LPT.RG e2e — a file whose HEAVY row groups sit at indices 0 and 2
+    /// (round-robin with 2 partitions stacks both on partition 0): the
+    /// default-ON balanced scan must split them across partitions, keep
+    /// every partition ascending, and cover all RGs exactly once; `=0`
+    /// restores round-robin exactly. Mutates env → `EMAT_ENV_TEST_LOCK`
+    /// (held across awaits — tokio Mutex).
+    #[tokio::test]
+    async fn scan_balances_heavy_row_groups_and_flag_off_round_robins() {
+        use arrow_array::{Int64Array, RecordBatch};
+        use datafusion::parquet::arrow::ArrowWriter;
+
+        let _guard = crate::flags::EMAT_ENV_TEST_LOCK.lock().await;
+        let key = "EMAT_BALANCED_RG_ASSIGN";
+        let prev = std::env::var(key).ok();
+        unsafe { std::env::remove_var(key) }; // default ON
+
+        let dir = lpt_fixture_dir("scan_e2e");
+        let path = dir.join("t.parquet");
+        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "k",
+            DataType::Int64,
+            false,
+        )]));
+        let f = std::fs::File::create(&path).unwrap();
+        let mut w = ArrowWriter::try_new(f, schema.clone(), None).unwrap();
+        // RG row counts [4000, 10, 4000, 10, 10, 10] — each flush() ends
+        // a row group, so compressed sizes are heavily skewed.
+        for rows in [4000i64, 10, 4000, 10, 10, 10] {
+            let vals: Vec<i64> = (0..rows).map(|i| i * 31 + rows).collect();
+            let batch =
+                RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(vals))])
+                    .unwrap();
+            w.write(&batch).unwrap();
+            w.flush().unwrap();
+        }
+        w.close().unwrap();
+
+        let provider =
+            EmatixFastParquetTableProvider::try_new(path.to_string_lossy().to_string()).unwrap();
+        assert_eq!(provider.num_row_groups(), 6, "fixture must have 6 RGs");
+        let ctx = SessionContext::new_with_config(
+            datafusion::prelude::SessionConfig::new().with_target_partitions(2),
+        );
+        let state = ctx.state();
+
+        let exec = provider.scan(&state, None, &[], None).await.unwrap();
+        let exec = exec
+            .as_any()
+            .downcast_ref::<EmatixFastParquetExec>()
+            .expect("plain scan produces EmatixFastParquetExec");
+        let a = exec.assignments();
+        assert_eq!(a.len(), 2);
+        let mut all: Vec<usize> = a.iter().flatten().copied().collect();
+        all.sort_unstable();
+        assert_eq!(all, vec![0, 1, 2, 3, 4, 5], "all RGs exactly once");
+        for part in a {
+            assert!(
+                part.windows(2).all(|w| w[0] < w[1]),
+                "ascending within partition: {part:?}"
+            );
+        }
+        let part_of = |rg: usize| a.iter().position(|p| p.contains(&rg)).unwrap();
+        assert_ne!(
+            part_of(0),
+            part_of(2),
+            "LPT must split the two heavy RGs apart (round-robin stacks both on \
+             partition 0); assignments: {a:?}"
+        );
+
+        unsafe { std::env::set_var(key, "0") };
+        let exec = provider.scan(&state, None, &[], None).await.unwrap();
+        let exec = exec
+            .as_any()
+            .downcast_ref::<EmatixFastParquetExec>()
+            .unwrap();
+        assert_eq!(
+            exec.assignments(),
+            round_robin_rg_assignments(6, 2).as_slice(),
+            "=0 must reproduce the legacy round-robin exactly"
+        );
+
+        match prev {
+            Some(v) => unsafe { std::env::set_var(key, v) },
+            None => unsafe { std::env::remove_var(key) },
+        }
     }
 }
