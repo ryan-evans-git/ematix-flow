@@ -48,6 +48,27 @@
 //! (unwritable dir, weird TMPDIR, readdir error) falls back to legacy
 //! `available_parallelism()` — never panic, never block.
 //!
+//! ## The three registry-driven pools (campaign-2026-07-03)
+//!
+//! The resolved per-process core share S drives every per-process pool
+//! that would otherwise size itself at `available_parallelism()` and
+//! undo the reduction under concurrent processes:
+//!
+//! 1. **`target_partitions`** — [`resolve_target_partitions`], applied
+//!    by the preset session build path.
+//! 2. **Reader column-decode fan-out** — [`reader_decode_budget`]
+//!    (`max(1, S / outer_partitions)`), applied per partition by
+//!    `EmatixFastParquetExec`'s streaming dispatch; env escape
+//!    `EMAT_READER_PARALLELISM_BUDGET=N` keeps absolute precedence.
+//! 3. **Rayon global pool** (intra-column-chunk page decode) —
+//!    [`size_rayon_pool_once`], once per process at the preset session
+//!    build; env escapes `RAYON_NUM_THREADS` (rayon-native, we keep
+//!    hands off) and the `EMAT_RAYON_BUDGET` tri-state.
+//!
+//! Solo, `EMAT_TARGET_PARTITIONS=0` legacy, and registry failure all
+//! resolve S = full cores, so each consumer's solo behavior is
+//! bit-identical to the pre-lever default by construction.
+//!
 //! Set `EMAT_DEBUG=<anything>` to get a one-line stderr trace of the
 //! resolution (mode, cores, live count, chosen value).
 
@@ -245,12 +266,12 @@ fn cached_live_count(dir: &Path) -> Option<usize> {
     Some(n)
 }
 
-/// Resolve the session's `target_partitions` from the
-/// `EMAT_TARGET_PARTITIONS` tri-state (see module docs). AUTO
-/// registers this process on first call and senses the live ematix
-/// process count; every failure degrades silently to legacy
-/// `available_parallelism()`.
-pub fn resolve_target_partitions() -> usize {
+/// The ONE resolution code path behind [`resolve_target_partitions`]
+/// and [`resolved_core_share`]: `EMAT_TARGET_PARTITIONS` tri-state +
+/// registry + TTL cache + silent degradation to full cores. Returns
+/// `(resolved, detail, cores)` so callers can emit their own
+/// EMAT_DEBUG traces without re-resolving.
+fn resolve_core_share_with_detail() -> (usize, String, usize) {
     let cores = available_cores();
     let (resolved, detail) = match mode() {
         TargetPartitionsMode::Forced(n) => (n, "forced".to_string()),
@@ -267,6 +288,16 @@ pub fn resolve_target_partitions() -> usize {
             }
         },
     };
+    (resolved, detail, cores)
+}
+
+/// Resolve the session's `target_partitions` from the
+/// `EMAT_TARGET_PARTITIONS` tri-state (see module docs). AUTO
+/// registers this process on first call and senses the live ematix
+/// process count; every failure degrades silently to legacy
+/// `available_parallelism()`.
+pub fn resolve_target_partitions() -> usize {
+    let (resolved, detail, cores) = resolve_core_share_with_detail();
     if crate::flags::present("EMAT_DEBUG") {
         eprintln!(
             "[partition_registry] pid={} target_partitions={resolved} ({detail}, cores={cores})",
@@ -274,6 +305,99 @@ pub fn resolve_target_partitions() -> usize {
         );
     }
     resolved
+}
+
+/// This process's fair per-process core share S — the SAME resolution
+/// [`resolve_target_partitions`] performs (tri-state + registry + TTL
+/// cache + silent degradation to full cores), exposed for the OTHER
+/// per-process pools that would otherwise default to
+/// `available_parallelism()` and undo the reduction under concurrent
+/// processes (campaign-2026-07-03: the reader column-decode fan-out and
+/// the rayon global pool). Solo / `EMAT_TARGET_PARTITIONS=0` legacy /
+/// any registry failure all resolve to full cores, so every consumer's
+/// solo behavior is bit-identical by construction.
+pub fn resolved_core_share() -> usize {
+    resolve_core_share_with_detail().0
+}
+
+/// Σ.E5.1.c numerator swap (campaign-2026-07-03): the per-partition
+/// reader column-decode budget, derived from the per-process core
+/// share instead of raw `available_parallelism()`:
+/// `max(1, share / outer_partitions)`. With `share == cores` (solo,
+/// legacy `=0`, or registry failure) this equals the historical
+/// formula exactly. `outer_partitions` is floored at 1 defensively.
+pub fn reader_decode_budget(share: usize, outer_partitions: usize) -> usize {
+    std::cmp::max(1, share / outer_partitions.max(1))
+}
+
+/// Pure resolver for the rayon global-pool bound (testable without
+/// touching the process-global pool or the environment).
+///
+/// Precedence:
+/// 1. `RAYON_NUM_THREADS` set (any value) → `None` — rayon honors its
+///    own env var natively; we keep hands off.
+/// 2. `EMAT_RAYON_BUDGET` tri-state (same grammar as
+///    `EMAT_TARGET_PARTITIONS`, see [`mode`]): `=0` → `None` (legacy
+///    rayon default = all cores), `=N` (N≥1) → `Some(N)`,
+///    unset/unparseable → AUTO = `Some(share())`.
+///
+/// `share` is a closure so the AUTO-only registry resolution is never
+/// performed when an env escape short-circuits it.
+pub fn rayon_pool_bound(
+    rayon_num_threads: Option<&str>,
+    emat_rayon_budget: Option<&str>,
+    share: impl FnOnce() -> usize,
+) -> Option<usize> {
+    if rayon_num_threads.is_some() {
+        return None;
+    }
+    match mode_of(emat_rayon_budget) {
+        TargetPartitionsMode::Legacy => None,
+        TargetPartitionsMode::Forced(n) => Some(n),
+        TargetPartitionsMode::Auto => Some(share().max(1)),
+    }
+}
+
+/// One-shot guard for [`size_rayon_pool_once`].
+static RAYON_POOL_SIZING: OnceLock<()> = OnceLock::new();
+
+/// Size rayon's global thread pool once per process from the registry
+/// core share (campaign-2026-07-03: intra-column-chunk page decode —
+/// `emat_arrow_reader` fans pages out on the rayon GLOBAL pool, which
+/// defaults to all cores per process and undoes the partition
+/// reduction under concurrent ematix processes; `RAYON_NUM_THREADS=2`
+/// alone measured +2.9% at SF10 s10).
+///
+/// Resolution is [`rayon_pool_bound`]; a `None` bound means rayon is
+/// left completely untouched (its lazy default builds on first use).
+/// Solo AUTO resolves `share == cores` == rayon's own default, so the
+/// solo build is a no-op by construction. `build_global`'s `Err` (pool
+/// already built elsewhere) is deliberately ignored — silent
+/// degradation, traced under `EMAT_DEBUG`.
+pub fn size_rayon_pool_once() {
+    RAYON_POOL_SIZING.get_or_init(|| {
+        let Some(n) = rayon_pool_bound(
+            std::env::var("RAYON_NUM_THREADS").ok().as_deref(),
+            std::env::var("EMAT_RAYON_BUDGET").ok().as_deref(),
+            resolved_core_share,
+        ) else {
+            return;
+        };
+        let result = rayon::ThreadPoolBuilder::new()
+            .num_threads(n)
+            .build_global();
+        if crate::flags::present("EMAT_DEBUG") {
+            eprintln!(
+                "[partition_registry] pid={} rayon global pool num_threads={n} ({})",
+                std::process::id(),
+                if result.is_ok() {
+                    "built"
+                } else {
+                    "already built elsewhere — left as-is"
+                }
+            );
+        }
+    });
 }
 
 #[cfg(test)]
@@ -332,6 +456,98 @@ mod tests {
         assert_eq!(auto_partitions(1, 5), 1);
         assert_eq!(auto_partitions(2, 5), 2);
         assert_eq!(auto_partitions(0, 3), 1, "cores floored at 1");
+    }
+
+    // ---- share -> reader budget math (pure — no env mutation) ----
+
+    #[test]
+    fn reader_budget_from_forced_share() {
+        // The measured M4 Max throughput cases (share = clamp(14/live)).
+        assert_eq!(reader_decode_budget(7, 2), 3, "live=2: share 7, 2 parts");
+        assert_eq!(reader_decode_budget(4, 2), 2, "live=3: share 4, 2 parts");
+        assert_eq!(reader_decode_budget(4, 4), 1);
+        assert_eq!(reader_decode_budget(2, 2), 1, "heavy oversubscription");
+        // Never below 1, even when partitions exceed the share.
+        assert_eq!(reader_decode_budget(2, 14), 1);
+        assert_eq!(reader_decode_budget(1, 1), 1);
+        // Defensive: outer_partitions = 0 must not divide-by-zero.
+        assert_eq!(reader_decode_budget(14, 0), 14);
+    }
+
+    /// The hard no-op-solo requirement: with share == cores the new
+    /// formula must equal the historical
+    /// `max(1, available_parallelism() / outer_partitions)` exactly,
+    /// for every partition count that can reach the dispatch site.
+    #[test]
+    fn reader_budget_solo_identity_with_old_formula() {
+        for cores in [1usize, 2, 4, 7, 14, 56] {
+            for parts in 1..=(2 * cores) {
+                let old = std::cmp::max(1, cores / parts);
+                assert_eq!(
+                    reader_decode_budget(cores, parts),
+                    old,
+                    "share=cores={cores} parts={parts}: solo must be bit-identical"
+                );
+            }
+        }
+    }
+
+    // ---- rayon bound tri-state (pure resolver — no env, no pool) ----
+
+    #[test]
+    fn rayon_bound_tri_state_table() {
+        let share = || 4usize;
+        // RAYON_NUM_THREADS set (any value, even empty) => hands off.
+        assert_eq!(rayon_pool_bound(Some("2"), None, share), None);
+        assert_eq!(rayon_pool_bound(Some(""), Some("3"), share), None);
+        // EMAT_RAYON_BUDGET=0 => legacy rayon default, no bound.
+        assert_eq!(rayon_pool_bound(None, Some("0"), share), None);
+        // =N (N>=1) => forced N.
+        assert_eq!(rayon_pool_bound(None, Some("3"), share), Some(3));
+        assert_eq!(rayon_pool_bound(None, Some(" 6 "), share), Some(6));
+        // unset / unparseable => AUTO = the registry share.
+        assert_eq!(rayon_pool_bound(None, None, share), Some(4));
+        assert_eq!(rayon_pool_bound(None, Some("banana"), share), Some(4));
+        assert_eq!(rayon_pool_bound(None, Some(""), share), Some(4));
+        // AUTO floors a degenerate share at 1.
+        assert_eq!(rayon_pool_bound(None, None, || 0), Some(1));
+    }
+
+    /// The AUTO-only registry resolution must never run when an env
+    /// escape short-circuits it (the closure is the lazy contract).
+    #[test]
+    fn rayon_bound_share_is_lazy() {
+        let bang = || -> usize { panic!("share must not be resolved") };
+        assert_eq!(rayon_pool_bound(Some("8"), None, bang), None);
+        assert_eq!(rayon_pool_bound(None, Some("0"), bang), None);
+        assert_eq!(rayon_pool_bound(None, Some("5"), bang), Some(5));
+    }
+
+    // ---- resolved_core_share == resolve_target_partitions ----
+
+    /// The two public resolvers must share one code path: force each
+    /// non-registry mode via the env var and pin equality. (Mutates
+    /// EMAT_TARGET_PARTITIONS => takes the crate-wide env test lock and
+    /// restores; the AUTO arm is covered env-free by
+    /// `concurrent_processes_each_see_full_count` + `auto_resolve_in`.)
+    #[test]
+    fn core_share_matches_target_partitions_resolution() {
+        let _guard = crate::flags::EMAT_ENV_TEST_LOCK.blocking_lock();
+        let key = "EMAT_TARGET_PARTITIONS";
+        let prev = std::env::var(key).ok();
+
+        unsafe { std::env::set_var(key, "5") };
+        assert_eq!(resolved_core_share(), 5, "forced =5");
+        assert_eq!(resolved_core_share(), resolve_target_partitions());
+
+        unsafe { std::env::set_var(key, "0") };
+        assert_eq!(resolved_core_share(), available_cores(), "legacy =0");
+        assert_eq!(resolved_core_share(), resolve_target_partitions());
+
+        match prev {
+            Some(v) => unsafe { std::env::set_var(key, v) },
+            None => unsafe { std::env::remove_var(key) },
+        }
     }
 
     // ---- registry mechanics ----
