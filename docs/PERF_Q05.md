@@ -183,3 +183,20 @@ conservative AUTO; see `docs/EMAT_FLAGS.md`).
 Value validation: SF=1 22/22 PASS (forced + AUTO); Q05 SF=10 PASS vs
 DuckDB with lever off / AUTO / forced. Strict A/B decides shipped
 defaults.
+
+---
+
+## 2026-07-03 — the Q05 "losses" were a harness artifact; SF=100 flips to a clear win
+
+The rule-chain unification (`chore/unify-rule-chains`) found the strict
+bench binary planned Q05 without production's FlowQueryPlanner passes
+(no `customer ⋉ (nation ⋈ region)` dim-semi splice, zero
+BuildSideBloomEmitterExec wraps) at BOTH scales — every historical
+strict Q05 number measured a non-production plan. Corrected strict
+verdicts (`bench-results/q05-rebaseline-2026-07-03/`): SF=10 ematix
+129.0 vs DuckDB 128.2 ms (tie); **SF=100 ematix 1330.6 vs DuckDB
+1504.8 ms — clear WIN +174 ms**. The Σ.Q05.CHAIN cascade lever A/B'd
+noise (−0.6 ms) on top of the production shape at SF=10; stays
+conservative-AUTO. Remaining Q05 work: none as a loss-closure target;
+SF=10 tie could be revisited via the L9 cascade at higher selectivity
+shapes if it ever regresses.
