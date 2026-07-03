@@ -236,6 +236,61 @@ plan-cache keys — hence the reset-node cap and the plan-diff pins.
 Effort: 1–2 days including a strict SF=100 A/B and an SF=10 22q
 regression sweep.
 
+### Stage 2 LANDED (2026-07-02, branch `perf/q18-range-agg-stage2`)
+
+The sandwich shipped as designed, with one premise adaptation:
+
+- `EmatixFastParquetExec::with_assignments_claiming_hash(chunks,
+  [group_key])` — claims `Partitioning::Hash([k], n)`; equivalence
+  properties rebuilt fresh (no facts derived from the claim).
+- `PartitionClaimResetExec` (new node, `partition_claim_reset_exec.rs`)
+  caps the claim directly above the rewritten SinglePartitioned agg:
+  advertises `UnknownPartitioning(n)` + fresh equivalences, forwards
+  streams/schema/statistics 1:1. Stateless → plan-cache-safe (the
+  cache keys on canonicalised SQL, not plan nodes; per-node
+  participation is only re-execute-safe `with_new_children`, which
+  builds a fresh instance).
+- `is_pass_through_node` in the L9 sideband rule now recognizes the
+  reset node — otherwise the Q18 HAVING shape (FilterExec → reset →
+  agg) loses its selective-build classification and the RightSemi
+  build-side bloom emit declines.
+
+**Divergence found vs the design:** DF 53.1's `add_hash_on_top`
+re-inserts the hash repartition when `target_partitions > child
+partition count` EVEN IF the child's partitioning satisfies the
+requirement. So the shuffle stays eliminated only when the planner
+achieves `chunks == target_partitions` — true at SF=100 (573 RGs,
+dense strict gaps → 14 chunks / 14 targets), and self-correcting
+otherwise (the re-inserted repartition genuinely re-hashes, so
+sparse-gap files silently fall back to Stage 1 behavior, never to
+wrong results).
+
+Verified plan (SF=100, strict binary, EMAT_DUMP_PLAN of the executed
+plan):
+
+```
+BuildSideBloomEmitterExec (RightSemi build side)
+  RepartitionExec(Hash [l_orderkey], 14)     -- ← moved HERE: post-HAVING rows
+    FilterExec sum > 300
+      PartitionClaimResetExec partitions=14
+        AggregateExec(SinglePartitioned, gby=l_orderkey)
+          EmatixFastParquetExec(14 chunks, 573 RGs)   -- ← NO shuffle below
+```
+
+The orders side keeps its `RepartitionExec(Hash [o_orderkey], 14)` —
+the claim did not leak. Leak pin: a lib test plans a Partitioned hash
+join over the capped agg and asserts the agg-output repartition sits
+above the reset node, the other side keeps its repartition, and the
+join values are exact.
+
+Value gates: `tpch_validate` 22/22 PASS at SF=1; Q18 SF=100 PASS vs
+DuckDB (6398 rows value-match); rows identical with
+`EMAT_RANGE_AGG=0`. Informal single trials (1 warmup, warm-ish cache,
+NOT the strict protocol): Stage 2 at 2439/2297 ms vs Stage 1
+(ec9e464 binary) at 4479/3151 ms — direction consistent with the
+−200…−400 ms estimate; the strict SF=100 A/B and SF=10 22q sweep
+remain to be run.
+
 ### Hardening (recommended, separate from this branch)
 
 The three hand-maintained rule chains (preset, strict bench,
