@@ -829,6 +829,10 @@ mod tests {
     /// with explicit fields precisely to avoid env races).
     #[test]
     fn date_build_side_default_snapshots_tristate() {
+        // Crate-wide env lock: Default::default() snapshots the env; other
+        // tests constructing the rule mid-window would read this test's
+        // EMAT_DATE_BUILD_SIDE values.
+        let _env = crate::flags::EMAT_ENV_TEST_LOCK.blocking_lock();
         unsafe { std::env::remove_var("EMAT_DATE_BUILD_SIDE") };
         assert_eq!(
             ForceCollectLeftForSemiBoundedBuildRule::default().date_build_side,

@@ -1451,8 +1451,18 @@ mod tests {
     }
 
     fn tmp_parquet(name: &str) -> std::path::PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("l9_rule_test_{}_{}", std::process::id(), name));
+        // Unique per CALL (atomic counter), not just per process: shared
+        // fixture paths let the parallel runner interleave one test's
+        // re-write with another's read ("footer length 0 exceeds file
+        // size 0" flake class — same fix as 01e6a50).
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "l9_rule_test_{}_{}_{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed),
+            name
+        ));
         let _ = std::fs::create_dir_all(&dir);
         dir.join(format!("{name}.parquet"))
     }

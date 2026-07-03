@@ -393,8 +393,16 @@ mod tests {
     use ematix_parquet_format::types::CompressionCodec;
 
     fn tmp_parquet(name: &str) -> std::path::PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("cascade_rule_test_{}_{}", std::process::id(), name));
+        // Unique per CALL — see 01e6a50: PID+name-keyed fixture paths race
+        // under the parallel test runner (interleaved re-write vs read).
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "cascade_rule_test_{}_{}_{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed),
+            name
+        ));
         let _ = std::fs::create_dir_all(&dir);
         dir.join(format!("{name}.parquet"))
     }

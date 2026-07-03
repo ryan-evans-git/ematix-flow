@@ -624,7 +624,10 @@ mod tests {
     fn radix_probe_all_matches_naive_cross_batch() {
         // RADIX.2: force radix mode, build across 2 batches, probe across 2 batches
         // → exercises the scatter + the cross-batch interleave gather on BOTH sides.
-        // (No other test reads EMAT_HJ_RADIX; set is scoped tightly around the build.)
+        // Crate-wide env lock: radix_enabled() is read at BUILD time by any
+        // concurrently-executing test that constructs an EmatixHashJoinExec —
+        // the =1 window must not leak into their join kernels.
+        let _env = crate::flags::EMAT_ENV_TEST_LOCK.blocking_lock();
         unsafe { std::env::set_var("EMAT_HJ_RADIX", "1") };
         let b0 = kv_batch(vec![10, 20, 30], vec!["a", "b", "c"]); // build rows 0,1,2
         let b1 = kv_batch(vec![40, 50], vec!["d", "e"]); // build rows 3,4

@@ -162,6 +162,9 @@ mod tests {
     /// one test; parallel test threads share the process environment.)
     #[test]
     fn gate_modes() {
+        // Crate-wide env lock: serializes this test's EMAT_MI_COLLECT*
+        // windows against every other env-mutating test (sync → blocking).
+        let _env = crate::flags::EMAT_ENV_TEST_LOCK.blocking_lock();
         unsafe { std::env::remove_var("EMAT_MI_COLLECT_MIN_RSS_MB") };
         let ram = physical_ram_mb().expect("RAM size must be readable");
         assert_eq!(

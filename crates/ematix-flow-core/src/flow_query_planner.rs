@@ -265,12 +265,14 @@ mod tests {
     use datafusion::physical_plan::displayable;
     use datafusion::prelude::{SessionConfig, SessionContext};
     use std::path::PathBuf;
-    use std::sync::Mutex;
 
     /// Serializes the tests that mutate `EMAT_*` process env vars (late-mat +
     /// fd-groupby): a flag set in one test must not leak into the other's
     /// planning window. Held across each test's full plan+collect span.
-    static ENV_MUTEX: Mutex<()> = Mutex::new(());
+    /// Crate-wide (not module-local) because other modules mutate overlapping
+    /// vars — e.g. `EMAT_LARGE_SCALE_MIN_ROWS` is also toggled in
+    /// `ematix_fast_parquet` tests.
+    use crate::flags::EMAT_ENV_TEST_LOCK as ENV_MUTEX;
 
     fn sf1_dir() -> Option<PathBuf> {
         if let Ok(env) = std::env::var("TPCH_DATA_DIR") {
@@ -338,14 +340,14 @@ mod tests {
     /// flag-off (stock) path. With the flag off the plan is unchanged (no
     /// LateGatherExec). This is the sole test mutating `EMAT_LATE_MAT_AGG`.
     // ENV_MUTEX intentionally spans the awaits: it serializes the whole
-    // env-var-mutating test body against its sibling, not a data access.
-    #[allow(clippy::await_holding_lock)]
+    // env-var-mutating test body against its siblings (tokio Mutex — safe
+    // and clippy-clean to hold across await points).
     #[tokio::test]
     async fn flow_planner_wires_late_mat_agg_on_q10() {
         use datafusion::arrow::array::{Array, Float64Array};
         use datafusion::physical_plan::collect;
 
-        let _env = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = ENV_MUTEX.lock().await;
         let Some((ctx, dir)) = q10_ctx_with_planner().await else {
             eprintln!("skip: no SF=1 data");
             return;
@@ -427,13 +429,12 @@ mod tests {
     /// with both eligible, the reduced key defuses late-mat's shape gate
     /// (no LateGatherExec in the ON plan).
     // See flow_planner_wires_late_mat_agg_on_q10 — same intentional span.
-    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn flow_planner_wires_fd_groupby_on_q10() {
         use datafusion::arrow::array::{Array, Float64Array};
         use datafusion::physical_plan::collect;
 
-        let _env = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = ENV_MUTEX.lock().await;
         let Some((ctx, dir)) = q10_ctx_with_planner().await else {
             eprintln!("skip: no SF=1 data");
             return;
@@ -536,10 +537,9 @@ mod tests {
     /// and `flow_planner_wires_fd_groupby_on_q10` are the only tests
     /// mutating EMAT_FD_GROUPBY / EMAT_LARGE_SCALE_MIN_ROWS.
     // ENV_MUTEX intentionally spans the awaits (see the late-mat test).
-    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn flow_planner_fd_groupby_scale_gated_auto() {
-        let _env = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = ENV_MUTEX.lock().await;
         let Some((ctx, dir)) = q10_ctx_with_planner().await else {
             eprintln!("skip: no SF=1 data");
             return;
@@ -667,6 +667,9 @@ mod tests {
     /// `EMAT_TRANSITIVE_DIM_SEMI=0`.
     #[tokio::test]
     async fn rewrite_applies_q05_transitive_dim_semi_default_on() {
+        // Serialized: the =0 window below is visible to ANY concurrently
+        // running test whose planning path reads the flag.
+        let _env = ENV_MUTEX.lock().await;
         let Some((ctx, dir)) = ctx_with_planner().await else {
             eprintln!("skipping: sf1 data missing");
             return;
@@ -683,8 +686,7 @@ mod tests {
         };
         let optimized = ctx.sql(&sql).await.unwrap().into_optimized_plan().unwrap();
 
-        // SAFETY: test-local toggle; the only env reader is rewrite(), and this
-        // is the sole test mutating EMAT_TRANSITIVE_DIM_SEMI.
+        // SAFETY: env window serialized by ENV_MUTEX and restored below.
         // Default (env unset): the splice fires.
         unsafe { std::env::remove_var("EMAT_TRANSITIVE_DIM_SEMI") };
         let on = format!(

@@ -190,14 +190,10 @@ mod tests {
     /// serially when `cargo test` parallelizes the module.
     #[test]
     fn warn_threshold_env_override_parses() {
-        use std::sync::Mutex;
-        // OnceLock would suffice but Mutex<()> is the simplest
-        // serializer for a one-off env-touching test.
-        static GUARD: Mutex<()> = Mutex::new(());
-        let _g = GUARD.lock().unwrap();
+        // Crate-wide env lock (a module-local guard only serialized this
+        // test against itself). Restore the prior value before unlock.
+        let _g = crate::flags::EMAT_ENV_TEST_LOCK.blocking_lock();
         let prev = std::env::var(ENV_THRESHOLD_VAR).ok();
-        // SAFETY: GUARD ensures no other thread reads the env var
-        // mid-mutation. Restore the prior value before unlock.
         unsafe { std::env::set_var(ENV_THRESHOLD_VAR, "12345") };
         assert_eq!(warn_threshold_bytes(), 12345);
         unsafe { std::env::set_var(ENV_THRESHOLD_VAR, "not-a-number") };

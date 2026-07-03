@@ -162,6 +162,23 @@ pub fn dump_active() -> String {
         .join(", ")
 }
 
+/// Serializes every test in this crate that mutates a PRODUCTION `EMAT_*`
+/// environment variable. The environment is process-global and the parallel
+/// test runner interleaves tests freely, so two tests toggling flags — even
+/// different flags in different modules — can break each other's read-back
+/// assertions (observed: `EMAT_NARROW_KEY_DECODE` fire-counter flakes in
+/// `ematix_fast_parquet`, and `EMAT_LARGE_SCALE_MIN_ROWS` is mutated from two
+/// modules, which module-local locks cannot serialize). Async tests hold the
+/// guard across awaits — `tokio::sync::Mutex` makes that clippy-clean
+/// (`await_holding_lock`); sync tests use `blocking_lock()`.
+///
+/// Rule: any test doing `set_var`/`remove_var` on a real flag takes this lock
+/// first and restores the var before dropping the guard. Tests that only READ
+/// flags don't take it (pre-existing exposure, unchanged). `flags::tests`
+/// itself uses synthetic `EMAT_TEST_*` names and is exempt by design.
+#[cfg(test)]
+pub(crate) static EMAT_ENV_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;

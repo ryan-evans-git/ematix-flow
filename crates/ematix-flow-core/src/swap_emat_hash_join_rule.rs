@@ -348,6 +348,9 @@ mod tests {
     /// shape gate (Inner / CollectLeft / single i64 key / no filter) passes.
     #[test]
     fn try_swap_floor_then_shape_gate() {
+        // Crate-wide env lock: EMAT_HJ_MIN_PROBE is mutated here and in
+        // try_swap_rejects_non_inner; the parallel runner interleaves them.
+        let _env = crate::flags::EMAT_ENV_TEST_LOCK.blocking_lock();
         let hj = inner_collect_left(mem("b", 3), mem("a", 3));
         // Default 12M floor → a 3-row probe is blocked.
         unsafe { std::env::remove_var("EMAT_HJ_MIN_PROBE") };
@@ -368,6 +371,8 @@ mod tests {
     /// A non-Inner join is never swapped (the kernel is Inner-only).
     #[test]
     fn try_swap_rejects_non_inner() {
+        // See try_swap_floor_then_shape_gate — same EMAT_HJ_MIN_PROBE window.
+        let _env = crate::flags::EMAT_ENV_TEST_LOCK.blocking_lock();
         let on: Vec<(Arc<dyn PhysicalExpr>, Arc<dyn PhysicalExpr>)> =
             vec![(Arc::new(Column::new("b", 0)), Arc::new(Column::new("a", 0)))];
         let hj = HashJoinExec::try_new(

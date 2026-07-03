@@ -5210,11 +5210,14 @@ mod tests {
     /// Multi-RG file (3 RGs) so the dispatch routes to the eager
     /// `EmatArrowBatchReader` (single-RG files route to the page-
     /// streaming reader, which deliberately stays on decode-wide).
-    /// Serializes the two tests that toggle the process-global
-    /// `EMAT_NARROW_KEY_DECODE` env var. Their fire-counter assertions
-    /// break if a sibling test clears the var mid-window (the parallel
-    /// runner interleaves them; observed as "counter 6 → 6" flakes).
-    static NARROW_KEY_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    /// Serializes the tests that toggle process-global `EMAT_*` env vars
+    /// (`EMAT_NARROW_KEY_DECODE`, `EMAT_DOWNCAST_KEYS`,
+    /// `EMAT_LARGE_SCALE_MIN_ROWS`). Fire-counter / schema assertions break
+    /// if a sibling test clears a var mid-window (observed as "counter
+    /// 6 → 6" flakes). Crate-wide lock: `EMAT_LARGE_SCALE_MIN_ROWS` is also
+    /// mutated by `flow_query_planner` tests, which a module-local lock
+    /// cannot serialize.
+    use crate::flags::EMAT_ENV_TEST_LOCK as NARROW_KEY_ENV_LOCK;
 
     #[tokio::test]
     async fn narrow_key_decode_flag_toggles_path_with_identical_results() {
@@ -5335,6 +5338,10 @@ mod tests {
     /// explicit flag precisely to avoid env races).
     #[test]
     fn downcast_keys_scale_gated_auto() {
+        // Sync test → blocking_lock (no tokio runtime here). Serializes the
+        // EMAT_DOWNCAST_KEYS / EMAT_LARGE_SCALE_MIN_ROWS windows below
+        // against every other env-mutating test in the crate.
+        let _env_guard = NARROW_KEY_ENV_LOCK.blocking_lock();
         let Some(p) = lineitem_path() else {
             eprintln!("skip: no lineitem fixture");
             return;
@@ -6307,6 +6314,10 @@ mod tests {
         use ematix_parquet_codec::write::{ColumnData, write_table_to_path};
         use ematix_parquet_format::types::CompressionCodec;
 
+        // Crate-wide env lock: arm 2 below toggles EMAT_L9_FUSED_PROBE —
+        // result-identical for concurrent readers, but any test asserting
+        // on the fused PATH (fire counters) would flake mid-window.
+        let _env = NARROW_KEY_ENV_LOCK.lock().await;
         let dir = std::env::temp_dir().join(format!("sideband_scan_pin_{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("t.parquet");
