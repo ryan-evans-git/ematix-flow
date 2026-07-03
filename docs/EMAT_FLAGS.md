@@ -101,13 +101,46 @@ recovered it). Owner: [partition_registry.rs](../crates/ematix-flow-core/src/par
 applied by the preset path (`preset::with_optimizer_rules_overridden`)
 whenever the session config still carries the DataFusion default.
 
+The resolved per-process core share S = `clamp(cores / live, 2, cores)`
+drives **three** per-process pools (campaign-2026-07-03: the strict
+throughput diagnostics proved the other two stayed sized at
+`available_parallelism()` per process and undid the partition
+reduction — reader budget 1 + bounded rayon measured 26,882 →
+29,271 QPH at SF10 s10, DuckDB parity):
+
+1. **`target_partitions`** — `partition_registry::resolve_target_partitions`,
+   applied at preset session build when the config still carries the
+   DataFusion default. Harness `PARTITIONS=N` keeps absolute precedence.
+2. **Reader column-decode fan-out** — the per-partition budget in
+   `EmatixFastParquetExec`'s streaming dispatch is
+   `max(1, S / outer_partitions)` (was
+   `available_parallelism() / outer_partitions`). Env escape:
+   `EMAT_READER_PARALLELISM_BUDGET=N` overrides the derived value
+   outright (unchanged precedence; see the tunables table).
+3. **Rayon global pool** (intra-column-chunk page decode) — sized once
+   per process at preset session build via
+   `rayon::ThreadPoolBuilder::build_global`, resolution below
+   (`EMAT_RAYON_BUDGET`). Env escapes: `RAYON_NUM_THREADS` set (rayon
+   honors it natively — ematix keeps hands off) or
+   `EMAT_RAYON_BUDGET=0` (legacy: rayon's own all-cores default). A
+   `build_global` failure (pool already built elsewhere) is silently
+   ignored.
+
+Solo, `EMAT_TARGET_PARTITIONS=0` legacy, and any registry failure all
+resolve S = full cores, so each pool's solo behavior is bit-identical
+to the pre-lever defaults by construction.
+
 | Flag | Default | Value/Notes | Owner file | Purpose |
 | --- | --- | --- | --- | --- |
-| `EMAT_TARGET_PARTITIONS` | **AUTO** (tri-state) | `=N` (N≥1) force `target_partitions=N`; `=0` legacy `available_parallelism()`; unset/unrecognized = AUTO — register in the cross-process PID registry and use `clamp(cores / live_ematix_processes, 2, cores)`. Solo process ⇒ full cores (bit-identical to legacy). Any registry failure degrades silently to legacy. The TPC-H harnesses' explicit `PARTITIONS=N` env takes precedence over this flag. | [partition_registry.rs](../crates/ematix-flow-core/src/partition_registry.rs) | Concurrency-aware per-process partition count. |
+| `EMAT_TARGET_PARTITIONS` | **AUTO** (tri-state) | `=N` (N≥1) force `target_partitions=N`; `=0` legacy `available_parallelism()`; unset/unrecognized = AUTO — register in the cross-process PID registry and use `clamp(cores / live_ematix_processes, 2, cores)`. Solo process ⇒ full cores (bit-identical to legacy). Any registry failure degrades silently to legacy. The TPC-H harnesses' explicit `PARTITIONS=N` env takes precedence over this flag. Also the source of the core share S consumed by the reader budget and the rayon pool (above). | [partition_registry.rs](../crates/ematix-flow-core/src/partition_registry.rs) | Concurrency-aware per-process partition count + core share. |
+| `EMAT_RAYON_BUDGET` | **AUTO** (tri-state) | `=N` (N≥1) force the rayon global pool to N threads; `=0` legacy — leave rayon alone (its own default = all cores); unset/unrecognized = AUTO — size to the core share S. Ignored entirely when `RAYON_NUM_THREADS` is set (rayon-native precedence). | [partition_registry.rs](../crates/ematix-flow-core/src/partition_registry.rs) | Concurrency-aware rayon global-pool bound. |
 | `EMAT_PARTITION_REGISTRY_DIR` | `$TMPDIR/ematix-partition-registry` | path | [partition_registry.rs](../crates/ematix-flow-core/src/partition_registry.rs) | Registry directory override (test isolation / shared-tmpdir hygiene). |
 
-Observability: set `EMAT_DEBUG=<anything>` for a one-line stderr trace
-of the resolution (`pid`, mode, live count, cores, chosen value).
+Observability: set `EMAT_DEBUG=<anything>` for one-line stderr traces
+of all three resolutions: `[partition_registry] ... target_partitions=`
+(per session build), `[reader_budget] pid= share= outer_partitions=
+budget=` (per partition-stream dispatch), and `[partition_registry]
+... rayon global pool num_threads=` (once per process).
 
 ## Production gate (opt-in)
 
@@ -183,7 +216,7 @@ Read in `src/` via `.parse()...unwrap_or(N)`. Default value is in the **Default*
 | `EMAT_PARQUET_FILE_CACHE_MIN_RG` | `128` | row-groups | [ematix_parquet_bridge.rs:103](../crates/ematix-flow-core/src/ematix_parquet_bridge.rs) | Min row-groups for a file to enter the parquet file cache. |
 | `EMAT_PV4_BUFFER` | `64` | depth (min 1) | [emat_push_pipeline_exec.rs:79](../crates/ematix-flow-core/src/emat_push_pipeline_exec.rs) | PV4 overlap buffer depth (only when `EMAT_PV4_OVERLAP=1`). |
 | `EMAT_RANGE_AGG_MAX_SKEW` | `1.25` | f64 (≥1.0) | [clustered_agg_rule.rs:163](../crates/ematix-flow-core/src/clustered_agg_rule.rs) | Max chunk-size skew tolerated for RANGE.AGG to accept a clustering. |
-| `EMAT_READER_PARALLELISM_BUDGET` | `total_threads / outer_partitions` | min 1 | [ematix_fast_parquet.rs:3422](../crates/ematix-flow-core/src/ematix_fast_parquet.rs) | Per-reader decode parallelism budget. |
+| `EMAT_READER_PARALLELISM_BUDGET` | `core_share / outer_partitions` | min 1; overrides the registry-derived default (see "Concurrency-aware partitions") | [ematix_fast_parquet.rs](../crates/ematix-flow-core/src/ematix_fast_parquet.rs) | Per-reader decode parallelism budget. |
 | `EMAT_REORDER_BUMP_LEAVES` | `6` | leaves | [join_reorder.rs:194](../crates/ematix-flow-core/src/join_reorder.rs) | Leaf-count side of the reorder scale-bump (Q05.SF10). |
 | `EMAT_REORDER_BUMP_MIN_ROWS` | `100_000_000` | rows | [join_reorder.rs:193](../crates/ematix-flow-core/src/join_reorder.rs) | Min-rows side of the reorder scale-bump. |
 | `EMAT_RG_DECODE_CACHE_BYTES` | `1_073_741_824` (1 GiB) | bytes | [emat_arrow_reader.rs:237](../crates/ematix-flow-core/src/emat_arrow_reader.rs) | Capacity of the row-group decode cache (when enabled). |

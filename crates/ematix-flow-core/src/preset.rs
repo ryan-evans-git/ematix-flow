@@ -300,6 +300,17 @@ pub fn with_optimizer_rules_overridden(
 ) -> (SessionStateBuilder, HarnessHandles) {
     let registry = Arc::new(SharedSubtreeRegistry::new());
     let mut builder = builder;
+    // Registry-driven rayon global pool (campaign-2026-07-03): sized
+    // once per process at session build so the intra-column-chunk page
+    // decode fan-out (emat_arrow_reader's rayon par_iter) tracks the
+    // per-process core share instead of defaulting to all cores. NOT
+    // gated on `o.auto_target_partitions`: the harness `PARTITIONS`
+    // precedence that lever protects governs the session CONFIG only,
+    // while the rayon pool is process-global with its own escapes
+    // (`RAYON_NUM_THREADS` — rayon-native, we keep hands off — and the
+    // `EMAT_RAYON_BUDGET` tri-state, `=0` legacy). Solo AUTO resolves
+    // share == cores == rayon's own default: no-op by construction.
+    crate::partition_registry::size_rayon_pool_once();
     // Concurrency-aware target_partitions (campaign-2026-07-01 §3):
     // runs FIRST so the resolved partition count is in place before any
     // rule or planner reads the config. Only rewrites a config still at

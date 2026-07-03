@@ -3713,16 +3713,29 @@ fn build_partition_stream_dispatch(
 ) -> futures_util::stream::BoxStream<'static, DfResult<RecordBatch>> {
     if streaming_arrow_reader {
         // Σ.E5.1.c — per-partition column-decode thread budget; keep
-        // total concurrent decode threads aligned to core count.
-        let total_threads = std::thread::available_parallelism()
-            .map(|p| p.get())
-            .unwrap_or(1);
-        let computed_budget = std::cmp::max(1, total_threads / outer_partitions);
+        // total concurrent decode threads aligned to THIS PROCESS'S
+        // core share, not the raw core count (campaign-2026-07-03: an
+        // `available_parallelism()` numerator undid the registry's
+        // partition reduction under concurrent processes — 7 scoped
+        // decode threads per 2-partition process; budget=1 measured
+        // 26,882 → 29,271 QPH at SF10 s10). Solo, `=0` legacy, and
+        // registry failure all resolve share == cores, so those paths
+        // compute the historical formula bit-identically.
+        let share = crate::partition_registry::resolved_core_share();
+        let computed_budget =
+            crate::partition_registry::reader_decode_budget(share, outer_partitions);
+        // Explicit env override keeps absolute precedence, unchanged.
         let budget = std::env::var("EMAT_READER_PARALLELISM_BUDGET")
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
             .map(|n| n.max(1))
             .unwrap_or(computed_budget);
+        if crate::flags::present("EMAT_DEBUG") {
+            eprintln!(
+                "[reader_budget] pid={} share={share} outer_partitions={outer_partitions} budget={budget}",
+                std::process::id()
+            );
+        }
         let partition_rows: usize = row_groups
             .iter()
             .map(|&rg| rg_num_rows.get(rg).copied().unwrap_or(0))
@@ -3808,11 +3821,14 @@ fn build_partition_stream(
 /// Threading note (Σ.E5.1.c): the reader internally fan-outs per-column decode
 /// across `min(n_cols, parallelism_budget)` scoped threads. The
 /// `EmatixFastParquetExec` partition wrapper computes a per-partition
-/// budget = `max(1, available_parallelism() / n_outer_partitions)` so
-/// the global thread count tracks the core count rather than the
-/// product `N_partitions × N_cols`. For Q1 SF=1 (6 outer partitions on
-/// 14 cores) the budget is 2 — total ≈ 12 concurrent threads instead
-/// of the 42 the naive `available_parallelism()` cap produced.
+/// budget = `max(1, core_share / n_outer_partitions)` — where
+/// `core_share` is [`crate::partition_registry::resolved_core_share`]
+/// (== `available_parallelism()` solo, the historical numerator) — so
+/// the per-process thread count tracks the process's fair core slice
+/// rather than the product `N_partitions × N_cols`. For Q1 SF=1 (6
+/// outer partitions on 14 cores, solo) the budget is 2 — total ≈ 12
+/// concurrent threads instead of the 42 the naive
+/// `available_parallelism()` cap produced.
 /// Shape-aware default for `inline_row_threshold`.
 ///
 /// The original 900_000-row constant was hand-calibrated for the
