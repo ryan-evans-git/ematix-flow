@@ -1757,9 +1757,11 @@ fn write_benchmarks_md(
     writeln!(
         s,
         "- DuckDB runs at default settings (in-memory `read_parquet` views). \
-         ematix-flow runs with `target_partitions = std::thread::available_parallelism()` \
-         (override via `PARTITIONS=N`) and the InjectFusedQ1/Q3/Q5/Q6/Q12 + \
-         EnableDictGroupCount physical-optimizer rules registered."
+         ematix-flow's `target_partitions` resolves as: explicit `PARTITIONS=N`, \
+         else the `EMAT_TARGET_PARTITIONS` tri-state (`=N` force, `=0` legacy \
+         `available_parallelism()`, unset = AUTO cross-process sensing — solo \
+         processes get full cores). The InjectFusedQ1/Q3/Q5/Q6/Q12 + \
+         EnableDictGroupCount physical-optimizer rules are registered."
     )
     .unwrap();
 
