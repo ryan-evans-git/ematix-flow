@@ -125,6 +125,7 @@ pub const DEFAULT_ON: &[&str] = &[
     "EMAT_RH_AVG_F64_VEC",
     "EMAT_RH_SUM_F64_VEC",
     "EMAT_SCALAR_AGG_BOOST",
+    "EMAT_STATVEC",
     "EMAT_TRANSITIVE_DIM_SEMI",
 ];
 

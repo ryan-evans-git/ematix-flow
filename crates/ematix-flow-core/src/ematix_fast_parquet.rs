@@ -346,11 +346,13 @@ impl BridgeFilter {
         if self.predicates.len() == 1 {
             match &self.predicates[0] {
                 ColumnPredicate::I64InBloom { bloom, .. } => {
-                    probe_chunks_into_bitmap(values, &mut bitmap, |v| bloom.might_contain_i64(v));
+                    probe_membership_into_bitmap(values, &mut bitmap, |v| {
+                        bloom.might_contain_i64(v)
+                    });
                     return Some((first_col, bitmap));
                 }
                 ColumnPredicate::I64InSet { set, .. } => {
-                    probe_chunks_into_bitmap(values, &mut bitmap, |v| set.contains(v));
+                    probe_membership_into_bitmap(values, &mut bitmap, |v| set.contains(v));
                     return Some((first_col, bitmap));
                 }
                 ColumnPredicate::I64Range { lo, hi, .. } => {
@@ -599,6 +601,10 @@ impl BridgeFilter {
         };
 
         let mut first = true;
+        // Q05.STATVEC — default-ON opt-out (`EMAT_STATVEC=0`) so the
+        // strict harness can A/B the vectorised static first pass in
+        // isolation. One env read per row-group filter eval.
+        let statvec = crate::flags::enabled("EMAT_STATVEC");
         let apply = |b: &Bound<'_, 'a>, bitmap: &mut Vec<u8>, first: &mut bool| {
             if *first {
                 // Full pass, chunk-of-8 byte packing (avoids the
@@ -610,10 +616,10 @@ impl BridgeFilter {
                             probe_chunks_into_bitmap(v, bitmap, |x| x >= lo && x <= hi);
                         }
                         ColumnPredicate::I64InSet { set, .. } => {
-                            probe_chunks_into_bitmap(v, bitmap, |x| set.contains(x));
+                            probe_membership_into_bitmap(v, bitmap, |x| set.contains(x));
                         }
                         ColumnPredicate::I64InBloom { bloom, .. } => {
-                            probe_chunks_into_bitmap(v, bitmap, |x| bloom.might_contain_i64(x));
+                            probe_membership_into_bitmap(v, bitmap, |x| bloom.might_contain_i64(x));
                         }
                         _ => unreachable!("Bound::I64 holds only i64 predicate shapes"),
                     },
@@ -628,15 +634,39 @@ impl BridgeFilter {
                             });
                         }
                         ColumnPredicate::I64InSet { set, .. } => {
-                            probe_chunks_into_bitmap(v, bitmap, |x| set.contains(x as i64));
+                            probe_membership_into_bitmap(v, bitmap, |x| set.contains(x as i64));
                         }
                         ColumnPredicate::I64InBloom { bloom, .. } => {
-                            probe_chunks_into_bitmap(v, bitmap, |x| {
+                            probe_membership_into_bitmap(v, bitmap, |x| {
                                 bloom.might_contain_i64(x as i64)
                             });
                         }
                         _ => unreachable!("Bound::I64onI32 holds only i64 predicate shapes"),
                     },
+                    // Q05.STATVEC (2026-07-03) — the scalar fallback
+                    // below serialised the o_orderdate-class first-pass
+                    // statics through the bitmap read-modify-write
+                    // (Q05 SF=10 profile: `eval_i32` over the 15M-row
+                    // orders scan ≈ 90 ms Σ, ON the critical path that
+                    // gates the L9 l_orderkey bloom → lineitem phase).
+                    // Route i32/f64 single-column statics through the
+                    // same chunk-of-8 byte-packing loop the i64 shapes
+                    // already use — value-identical evaluation, packed
+                    // writes.
+                    Bound::I32(p, v) if statvec => {
+                        // Fold the dominant shape (pure comparison
+                        // clauses, e.g. the TPC-H date-range bridge
+                        // filters) into one [lo, hi] window so the
+                        // per-row clause loop disappears entirely.
+                        if let Some((lo, hi)) = p.i32_range_window() {
+                            probe_chunks_into_bitmap(v, bitmap, |x| x >= lo && x <= hi);
+                        } else {
+                            probe_chunks_into_bitmap(v, bitmap, |x| p.eval_i32(x));
+                        }
+                    }
+                    Bound::F64(p, v) if statvec => {
+                        probe_chunks_into_bitmap(v, bitmap, |x| p.eval_f64(x));
+                    }
                     _ => {
                         for row in 0..total {
                             if eval_row(b, row) {
@@ -763,6 +793,105 @@ fn probe_chunks_into_bitmap<T: Copy>(values: &[T], bitmap: &mut [u8], probe: imp
         if probe(v) {
             bitmap[row >> 3] |= 1 << (row & 7);
         }
+    }
+}
+
+/// Q05.MEMO (2026-07-03) — run-memoized variant of
+/// [`probe_chunks_into_bitmap`] for EXPENSIVE membership probes
+/// (bloom / hash-set). Fact tables clustered on the probed key repeat
+/// the previous key on most consecutive rows (TPC-H
+/// `lineitem.l_orderkey`: ~4 rows per order → 75% consecutive
+/// duplicates), so re-using the previous verdict replaces a ~4 ns
+/// hash+load probe with a compare. Q05 SF=10 stage profile: the L9
+/// l_orderkey bloom probe over 60M rows was ~285 ms Σ compute inside
+/// the dominant lineitem scan; memoization probes ~15M distinct runs
+/// instead.
+///
+/// Correctness: bit-identical to the plain helper — the probe is a
+/// pure function of the value, so equal adjacent values always share
+/// one verdict.
+#[inline(always)]
+fn probe_chunks_into_bitmap_memo<T: Copy + PartialEq>(
+    values: &[T],
+    bitmap: &mut [u8],
+    probe: impl Fn(T) -> bool,
+) {
+    let Some(&first) = values.first() else {
+        return;
+    };
+    let mut last_v = first;
+    let mut last_r = probe(first);
+    let chunks = values.chunks_exact(8);
+    let rem = chunks.remainder();
+    let n_chunks = values.len() / 8;
+    for (chunk_idx, chunk) in chunks.enumerate() {
+        let mut byte = 0u8;
+        for (lane, &v) in chunk.iter().enumerate() {
+            if v != last_v {
+                last_v = v;
+                last_r = probe(v);
+            }
+            byte |= (last_r as u8) << lane;
+        }
+        bitmap[chunk_idx] = byte;
+    }
+    for (i, &v) in rem.iter().enumerate() {
+        if v != last_v {
+            last_v = v;
+            last_r = probe(v);
+        }
+        if last_r {
+            let row = n_chunks * 8 + i;
+            bitmap[row >> 3] |= 1 << (row & 7);
+        }
+    }
+}
+
+/// Q05.MEMO — should the run-memo probe path be used for this column
+/// buffer? Pure core (the `tri_state_of` convention): `force` is the
+/// parsed `EMAT_PROBE_RUN_MEMO` tri-state — `Some(true)` always memo,
+/// `Some(false)` never, `None` = AUTO: sample the first
+/// [`RUN_MEMO_SAMPLE`] values and require ≥25% consecutive duplicates
+/// (memo wins from ~15% on the ~4 ns bloom probe; 25% keeps margin).
+/// Unique-key columns (dup fraction 0) and short buffers stay on the
+/// 8-lane vectorised path, so non-clustered shapes (Q20 l_partkey,
+/// dim-PK scans) never pay the loop-carried memo dependency.
+const RUN_MEMO_SAMPLE: usize = 1024;
+fn run_memo_pays<T: Copy + PartialEq>(values: &[T], force: Option<bool>) -> bool {
+    if let Some(f) = force {
+        return f;
+    }
+    let n = values.len().min(RUN_MEMO_SAMPLE);
+    if n < 64 {
+        return false;
+    }
+    let dups = values[..n].windows(2).filter(|w| w[0] == w[1]).count();
+    // dups/(n-1) ≥ 1/4
+    dups * 4 >= n - 1
+}
+
+/// Q05.MEMO — env resolver for the `EMAT_PROBE_RUN_MEMO` tri-state
+/// (unset = AUTO; see `docs/EMAT_FLAGS.md`). Read per row-group column
+/// — one `env::var` against a multi-ms decode, not a hot-path read.
+fn probe_run_memo_flag() -> Option<bool> {
+    crate::flags::tri_state("EMAT_PROBE_RUN_MEMO")
+}
+
+/// Q05.MEMO — dispatch an expensive membership probe (bloom /
+/// hash-set) over a full column buffer to the run-memoized or plain
+/// chunk-of-8 loop. Cheap static predicates (ranges) keep calling
+/// [`probe_chunks_into_bitmap`] directly — a compare-based memo can't
+/// beat a compare-based predicate.
+#[inline(always)]
+fn probe_membership_into_bitmap<T: Copy + PartialEq>(
+    values: &[T],
+    bitmap: &mut [u8],
+    probe: impl Fn(T) -> bool,
+) {
+    if run_memo_pays(values, probe_run_memo_flag()) {
+        probe_chunks_into_bitmap_memo(values, bitmap, probe);
+    } else {
+        probe_chunks_into_bitmap(values, bitmap, probe);
     }
 }
 
@@ -1400,6 +1529,39 @@ impl ColumnPredicate {
             }
             _ => false,
         }
+    }
+
+    /// Q05.STATVEC — fold an `I32Range` whose clauses are all plain
+    /// comparisons (`=`, `<`, `<=`, `>`, `>=`) into one inclusive
+    /// `[lo, hi]` window, so the first-pass scan filter tests two
+    /// compares per value instead of looping the clause list per row.
+    /// Returns `None` for any other predicate shape or any `!=` clause
+    /// (callers fall back to [`Self::eval_i32`], value-identical).
+    /// An unsatisfiable clause set folds to an empty window
+    /// (`lo > hi`) — the window test is then false for every value,
+    /// exactly like the clause loop.
+    pub(crate) fn i32_range_window(&self) -> Option<(i32, i32)> {
+        let ColumnPredicate::I32Range { clauses, .. } = self else {
+            return None;
+        };
+        let (mut lo, mut hi) = (i32::MIN, i32::MAX);
+        for c in clauses {
+            let l = c.literal_i32;
+            match c.op {
+                Operator::Eq => {
+                    lo = lo.max(l);
+                    hi = hi.min(l);
+                }
+                Operator::Lt => hi = hi.min(l.checked_sub(1)?),
+                Operator::LtEq => hi = hi.min(l),
+                Operator::Gt => lo = lo.max(l.checked_add(1)?),
+                Operator::GtEq => lo = lo.max(l),
+                // `!=` (or anything else) punches a hole in the
+                // window — not representable, keep the clause loop.
+                _ => return None,
+            }
+        }
+        Some((lo, hi))
     }
 
     /// Evaluate AND of all clauses against one i32 value (I32Range / I32In only).
@@ -4696,6 +4858,230 @@ mod tests {
     /// bit is set (the masked-probe contract: probe cost scales with
     /// survivors, not total rows). A counting closure proves the skip:
     /// 4 of 16 rows set → exactly 4 evals, on exactly those rows.
+    /// Q05.MEMO — the run-memoized probe loop must be bit-identical to
+    /// the plain chunk-of-8 loop for every buffer shape: clustered
+    /// runs, unique keys, all-duplicate, non-multiple-of-8 tails,
+    /// short, and empty inputs.
+    #[test]
+    fn run_memo_probe_bitmap_identical_to_plain() {
+        let probe = |v: i64| v % 3 == 0;
+        let shapes: Vec<Vec<i64>> = vec![
+            // clustered: ~4 consecutive rows per key (the l_orderkey shape)
+            (0..1000).map(|i| (i / 4) as i64).collect(),
+            // unique keys
+            (0..1000).map(|i| i as i64).collect(),
+            // all one key
+            vec![42i64; 333],
+            // tail not a multiple of 8
+            (0..77).map(|i| (i / 3) as i64).collect(),
+            // short
+            vec![1, 1, 2],
+            // empty
+            vec![],
+        ];
+        for values in shapes {
+            let mut plain = vec![0u8; values.len().div_ceil(8)];
+            let mut memo = vec![0u8; values.len().div_ceil(8)];
+            probe_chunks_into_bitmap(&values, &mut plain, probe);
+            probe_chunks_into_bitmap_memo(&values, &mut memo, probe);
+            assert_eq!(plain, memo, "diverged on len={}", values.len());
+        }
+    }
+
+    /// Q05.MEMO — the memo path must call the probe once per RUN, not
+    /// once per row (that's the whole lever).
+    #[test]
+    fn run_memo_probe_probes_once_per_run() {
+        use std::cell::RefCell;
+        let values: Vec<i64> = (0..64).map(|i| (i / 4) as i64).collect(); // 16 runs
+        let calls: RefCell<usize> = RefCell::new(0);
+        let mut bitmap = vec![0u8; 8];
+        probe_chunks_into_bitmap_memo(&values, &mut bitmap, |v| {
+            *calls.borrow_mut() += 1;
+            v % 2 == 0
+        });
+        // first-value seed probe + one per run-change (values[0] probed
+        // by the seed; the loop re-probes only on key changes).
+        assert_eq!(*calls.borrow(), 16, "expected one probe per run");
+    }
+
+    /// Q05.MEMO — pure gate table: force overrides win, AUTO requires
+    /// ≥64 sampled values and ≥25% consecutive duplicates.
+    #[test]
+    fn run_memo_pays_gate_table() {
+        let clustered: Vec<i64> = (0..2048).map(|i| (i / 4) as i64).collect(); // 75% dups
+        let unique: Vec<i64> = (0..2048).map(|i| i as i64).collect(); // 0% dups
+        let sparse_dups: Vec<i64> = (0..2048).map(|i| (i / 10 * 10 + i % 10) as i64).collect();
+        let short: Vec<i64> = vec![7; 32];
+        // AUTO (None): data decides.
+        assert!(run_memo_pays(&clustered, None));
+        assert!(!run_memo_pays(&unique, None));
+        assert!(
+            !run_memo_pays(&sparse_dups, None),
+            "0% dups after arithmetic"
+        );
+        assert!(
+            !run_memo_pays(&short, None),
+            "buffers under the 64-value floor stay on the vector path"
+        );
+        // Force ON/OFF override data entirely.
+        assert!(run_memo_pays(&unique, Some(true)));
+        assert!(!run_memo_pays(&clustered, Some(false)));
+        assert!(run_memo_pays(&short, Some(true)));
+        // Boundary: exactly 1 consecutive dup per 4 values passes the
+        // 25% gate (dups*4 >= n-1). Group g emits [3g, 3g, 3g+1, 3g+2].
+        let quarter: Vec<i64> = (0..1024)
+            .map(|i| {
+                let g = (i / 4) as i64 * 3;
+                match i % 4 {
+                    0 | 1 => g,
+                    r => g + r as i64 - 1,
+                }
+            })
+            .collect();
+        let n = quarter.len().min(RUN_MEMO_SAMPLE);
+        let dups = quarter[..n].windows(2).filter(|w| w[0] == w[1]).count();
+        assert!(
+            dups * 4 >= n - 1,
+            "constructed pattern must sit at the boundary"
+        );
+        assert!(run_memo_pays(&quarter, None));
+    }
+
+    /// Q05.MEMO — end-to-end via `probe_i64_values_from_decoded`: both
+    /// loop implementations must agree against a real bloom, and the
+    /// production entry point's bitmap must be exactly the bloom hits.
+    #[test]
+    fn run_memo_bridge_filter_bitmap_parity() {
+        use crate::bloom::BloomFilter;
+        let mut bloom = BloomFilter::for_keys(64);
+        for k in [3i64, 7, 11, 200] {
+            bloom.insert_i64(k);
+        }
+        let values: Vec<i64> = (0..600).map(|i| (i / 4) as i64).collect();
+        let filt = BridgeFilter::new(vec![ColumnPredicate::I64InBloom {
+            col_idx: 0,
+            bloom: std::sync::Arc::new(bloom),
+        }]);
+        // Env-independent check: compare the two loop implementations
+        // directly on the same predicate closure the filter would run.
+        let ColumnPredicate::I64InBloom { bloom, .. } = &filt.predicates[0] else {
+            unreachable!()
+        };
+        let mut plain = vec![0u8; values.len().div_ceil(8)];
+        let mut memo = vec![0u8; values.len().div_ceil(8)];
+        probe_chunks_into_bitmap(&values, &mut plain, |v| bloom.might_contain_i64(v));
+        probe_chunks_into_bitmap_memo(&values, &mut memo, |v| bloom.might_contain_i64(v));
+        assert_eq!(plain, memo);
+        // And the production entry point still produces a bitmap whose
+        // set rows are exactly the bloom hits.
+        let (col, bitmap) = filt.probe_i64_values_from_decoded(&values).unwrap();
+        assert_eq!(col, 0);
+        for (row, &v) in values.iter().enumerate() {
+            let bit = bitmap[row >> 3] & (1 << (row & 7)) != 0;
+            assert_eq!(bit, bloom.might_contain_i64(v), "row {row} key {v}");
+        }
+    }
+
+    /// Q05.STATVEC — the [lo, hi] window fold must agree with the
+    /// clause-loop `eval_i32` for every foldable clause combination,
+    /// and decline unfoldable shapes.
+    #[test]
+    fn statvec_i32_range_window_fold_table() {
+        let mk = |clauses: Vec<(Operator, i32)>| ColumnPredicate::I32Range {
+            col_idx: 0,
+            clauses: clauses
+                .into_iter()
+                .map(|(op, literal_i32)| RangeClause { op, literal_i32 })
+                .collect(),
+        };
+        // The Q05 orders shape: >= 8766 AND < 9131 (dates as i32 days).
+        let p = mk(vec![(Operator::GtEq, 8766), (Operator::Lt, 9131)]);
+        assert_eq!(p.i32_range_window(), Some((8766, 9130)));
+        // Every op folds.
+        assert_eq!(mk(vec![(Operator::Eq, 5)]).i32_range_window(), Some((5, 5)));
+        assert_eq!(
+            mk(vec![(Operator::Gt, 5), (Operator::LtEq, 9)]).i32_range_window(),
+            Some((6, 9))
+        );
+        // Unsatisfiable folds to an empty window, not None.
+        let empty = mk(vec![(Operator::Gt, 9), (Operator::Lt, 5)]).i32_range_window();
+        let (lo, hi) = empty.unwrap();
+        assert!(lo > hi, "contradictory clauses fold to an empty window");
+        // != declines.
+        assert_eq!(mk(vec![(Operator::NotEq, 5)]).i32_range_window(), None);
+        // Overflow edges decline (correct via the clause loop instead).
+        assert_eq!(mk(vec![(Operator::Lt, i32::MIN)]).i32_range_window(), None);
+        assert_eq!(mk(vec![(Operator::Gt, i32::MAX)]).i32_range_window(), None);
+        // Non-range shapes decline.
+        assert_eq!(
+            ColumnPredicate::I32In {
+                col_idx: 0,
+                values: vec![1, 2]
+            }
+            .i32_range_window(),
+            None
+        );
+        // Window agrees with eval_i32 across the whole boundary zone.
+        let p = mk(vec![(Operator::GtEq, 100), (Operator::Lt, 200)]);
+        let (lo, hi) = p.i32_range_window().unwrap();
+        for v in 95..205 {
+            assert_eq!(v >= lo && v <= hi, p.eval_i32(v), "value {v}");
+        }
+    }
+
+    /// Q05.STATVEC — first-pass i32/f64 statics through
+    /// `eval_on_decoded_views` (now chunk-packed) must produce the
+    /// same bitmap as a manual row-by-row eval, including tails.
+    #[test]
+    fn statvec_first_pass_i32_f64_bitmap_parity() {
+        let dates: Vec<i32> = (0..83).map(|i| 8760 + (i % 20)).collect();
+        let prices: Vec<f64> = (0..83).map(|i| i as f64).collect();
+        let date_pred = ColumnPredicate::I32Range {
+            col_idx: 0,
+            clauses: vec![
+                RangeClause {
+                    op: Operator::GtEq,
+                    literal_i32: 8766,
+                },
+                RangeClause {
+                    op: Operator::Lt,
+                    literal_i32: 8775,
+                },
+            ],
+        };
+        let price_pred = ColumnPredicate::F64Range {
+            col_idx: 1,
+            clauses: vec![F64RangeClause {
+                op: Operator::Lt,
+                literal_f64: 50.0,
+            }],
+        };
+        for filt in [
+            BridgeFilter::new(vec![date_pred.clone()]),
+            BridgeFilter::new(vec![price_pred.clone()]),
+            BridgeFilter::new(vec![date_pred.clone(), price_pred.clone()]),
+        ] {
+            let (bitmap, total) = filt
+                .eval_on_decoded_views(|idx| match idx {
+                    0 => Some(DecodedView::I32(&dates)),
+                    1 => Some(DecodedView::F64(&prices)),
+                    _ => None,
+                })
+                .expect("statics on decoded views must evaluate");
+            assert_eq!(total, 83);
+            for row in 0..total {
+                let expect = filt.predicates.iter().all(|p| match p {
+                    ColumnPredicate::I32Range { .. } => p.eval_i32(dates[row]),
+                    ColumnPredicate::F64Range { .. } => p.eval_f64(prices[row]),
+                    _ => unreachable!(),
+                });
+                let got = bitmap[row >> 3] & (1 << (row & 7)) != 0;
+                assert_eq!(got, expect, "row {row}");
+            }
+        }
+    }
+
     #[test]
     fn probeorder_and_eval_masked_skips_cleared_rows() {
         use std::cell::RefCell;

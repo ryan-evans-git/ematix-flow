@@ -64,6 +64,7 @@ These are read in `src/` and default to enabled. Disable with `=0`.
 | `EMAT_RH_AVG_F64_VEC` | ON (set =0 to disable) | `.map(\|s\| s != "0").unwrap_or(true)` | [robin_hood_avg_f64_exec.rs:286](../crates/ematix-flow-core/src/robin_hood_avg_f64_exec.rs) | Use the vectorized accumulator path in the RobinHood AVG(f64) exec. |
 | `EMAT_RH_SUM_F64_VEC` | ON (set =0 to disable) | `.map(\|s\| s != "0").unwrap_or(true)` | [robin_hood_sum_f64_exec.rs:252](../crates/ematix-flow-core/src/robin_hood_sum_f64_exec.rs) | Use the vectorized accumulator path in the RobinHood SUM(f64) exec. |
 | `EMAT_SCALAR_AGG_BOOST` | ON (set =0 to disable) | `.unwrap_or(true)` | [auto_target_partitions.rs:135](../crates/ematix-flow-core/src/auto_target_partitions.rs) | Scalar-aggregation partition oversubscription boost. |
+| `EMAT_STATVEC` | ON (set =0 to disable) | `enabled()` | [ematix_fast_parquet.rs (`eval_on_decoded_views`)](../crates/ematix-flow-core/src/ematix_fast_parquet.rs) | Q05.STATVEC: chunk-of-8 byte-packed first-pass eval for i32/f64 STATIC scan predicates (plus the I32Range→[lo,hi] window fold), replacing the scalar per-row bitmap read-modify-write loop. Value-identical bitmaps; Q05 SF=10 orders scan (15M-row o_orderdate range gating the L9 l_orderkey bloom): 322.6 → 233.4 ms Σ compute (−89 ms Σ, on the critical path). `=0` restores the scalar loop for A/B. |
 | `EMAT_TRANSITIVE_DIM_SEMI` | ON (set =0 to disable) | `enabled()` | [flow_query_planner.rs:106](../crates/ematix-flow-core/src/flow_query_planner.rs) | Σ.Q05/#352: transitive dim-semi splice into deep join inputs; the 22nd SF=10 win. |
 
 ## Scale-gated levers (tri-state, Σ.AI.5)
@@ -200,6 +201,7 @@ Read in `src/` via `.parse()...unwrap_or(N)`. Default value is in the **Default*
 | `EMAT_L9_CASCADE_MAX` | `4` | extras/emitter | [runtime_bloom_cascading_rule.rs:87](../crates/ematix-flow-core/src/runtime_bloom_cascading_rule.rs) | Max extra cascaded bloom targets per emitter. |
 | `EMAT_L9_CASCADE` | AUTO | `tri_state` | [runtime_bloom_cascade_chain.rs](../crates/ematix-flow-core/src/runtime_bloom_cascade_chain.rs) | Σ.Q05.CHAIN: cascade-CHAIN second phase of the L9 rule (filtered dim → … → large fact). `=1` force on (thresholds relaxed), `=0` off, unset = AUTO (chain start filtered, every build CollectLeft ≤ 4M rows, terminal scan ≥ 20M rows, ≥ 2 links). |
 | `EMAT_MULTIKEY_BLOOM` | AUTO | `tri_state` | [runtime_bloom_cascade_chain.rs](../crates/ematix-flow-core/src/runtime_bloom_cascade_chain.rs) | Σ.Q05.CHAIN: allow a chain link to emit a single-key bloom from a MULTI-key equi-join (superset pre-filter; the join still enforces all keys — Q05's 2-key supplier join). `=0` refuses multi-key links; `=1`/unset allow them inside an admitted chain. |
+| `EMAT_PROBE_RUN_MEMO` | AUTO | `tri_state` | [ematix_fast_parquet.rs (`probe_membership_into_bitmap`)](../crates/ematix-flow-core/src/ematix_fast_parquet.rs) | Q05.MEMO: run-memoized scan-side membership probes (L9 bloom / hash-set). When the probed column is clustered (consecutive duplicate keys — lineitem.l_orderkey has ~4 rows/order = 75% dups), reuse the previous key's verdict instead of re-probing. `=1` always memo, `=0` never, unset = AUTO — sample the first 1024 values per RG column and memo only at ≥25% consecutive duplicates (unique-key / non-clustered columns keep the 8-lane vectorised loop). Bit-identical bitmaps by construction. |
 | `EMAT_L9_CASCADE_MIN_TERMINAL_ROWS` | `20_000_000` (AUTO) / `0` (forced) | `usize` | [runtime_bloom_cascade_chain.rs](../crates/ematix-flow-core/src/runtime_bloom_cascade_chain.rs) | Σ.Q05.CHAIN: terminal-scan row floor — the chain must end at a scan at least this large. Explicit value wins over both mode defaults. |
 | `EMAT_L9_CASCADE_MAX_BUILD_ROWS` | `4_000_000` (AUTO) / unbounded (forced) | `usize` | [runtime_bloom_cascade_chain.rs](../crates/ematix-flow-core/src/runtime_bloom_cascade_chain.rs) | Σ.Q05.CHAIN: per-link ceiling on the emitting join's build-row estimate. |
 | `EMAT_L9_CASCADE_RT_SEL` | `0.5` | `f64`, 0 = off | [runtime_bloom_cascade_chain.rs](../crates/ematix-flow-core/src/runtime_bloom_cascade_chain.rs) | Σ.Q05.CHAIN: terminal-link runtime build-selectivity disarm — publish EMPTY when the chain kept more than this fraction of the terminal build's raw scan (the bloom would not prune enough to pay). |
@@ -336,13 +338,13 @@ production rule, the harness toggles it before constructing rules manually.
 
 | Bucket | Count |
 | --- | --- |
-| Production gate (default-ON) | 19 |
+| Production gate (default-ON) | 20 |
 | Production gate (opt-in) | 28 |
-| Numeric tunable | 41 |
+| Numeric tunable | 42 |
 | Diagnostic / trace | 21 |
 | Bench-harness only | 48 |
 | Comment-only (possibly dead) | 1 |
-| **Grand total (distinct flags)** | **158** |
+| **Grand total (distinct flags)** | **160** |
 
 > `EMAT_FAST_SNAPPY` is counted once, under Comment-only.
 > `EMAT_MI_COLLECT` is placed under Diagnostic/trace (allocator-operational,
