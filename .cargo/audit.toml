@@ -54,4 +54,25 @@ ignore = [
     # Arrow/DataFusion bump that unblocks pyo3 0.29.
     "RUSTSEC-2026-0176",
     "RUSTSEC-2026-0177",
+    # ----------------------------------------------------------------
+    # Two advisories in `quick-xml` (published 2026-06-29), both
+    # DoS-class (RUSTSEC-2026-0194: quadratic duplicate-attribute
+    # check; RUSTSEC-2026-0195: unbounded namespace-declaration
+    # allocation in NsReader). Fix line is quick-xml >= 0.41.0; we
+    # carry 0.38.4 via `polars 0.52` (bench-only: the `triangulation`
+    # feature's comparison harness, never a production code path) and
+    # 0.39.4 via `deltalake 0.32 → buoyant_kernel → object_store
+    # 0.13.2`, whose requirement ranges don't admit 0.41. No
+    # patch-level backport exists on either the 0.38 or 0.39 line.
+    #
+    # Risk assessment for ematix-flow: quick-xml parses (a) cloud
+    # object-store XML API responses (S3/Azure list + multipart
+    # responses) — XML authored by the storage endpoint the OPERATOR
+    # configures, not arbitrary third parties; a hostile/compromised
+    # endpoint could exhaust memory/CPU (availability only, no
+    # integrity impact), and (b) bench-only polars harness input.
+    # Net: not blocker-grade. Re-evaluate on the next deltalake /
+    # object_store / polars bump (each unlocks quick-xml 0.41+).
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
 ]
