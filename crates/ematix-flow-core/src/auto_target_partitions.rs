@@ -433,10 +433,13 @@ pub fn low_card_boost_cap() -> usize {
 }
 
 /// Gate-B RG-granularity partition policy (pure math, unit-tested):
-/// `num_row_groups` when it fits under `cap` (one RG per partition — the
-/// measured −7% Q01 SF=10 configuration), else `cap` (the ceil-balanced
-/// assignment then applies with a proportionally smaller tail). Never returns
-/// less than `session_target_partitions`, so a small table (SF=1 lineitem:
+/// `num_row_groups` when it fits under `cap` — one RG per partition, the
+/// measured −7% Q01 SF=10 configuration. When `num_row_groups > cap` the
+/// boost DECLINES entirely (returns the session count): clamping to `cap`
+/// was measured +7–8% on Q01 SF=100 (573 RGs / 112 partitions restores a
+/// ceil tail while oversubscribing the cores 8× on an out-of-page-cache
+/// dataset) — partial granulation is worse than none. Never returns less
+/// than `session_target_partitions`, so a small table (SF=1 lineitem:
 /// 6 RGs < the 14-partition session default, where `scan()` already caps
 /// partitions at `num_rgs`) is left exactly as-is.
 fn low_card_boosted_partitions(
@@ -444,7 +447,10 @@ fn low_card_boosted_partitions(
     cap: usize,
     session_target_partitions: usize,
 ) -> usize {
-    num_row_groups.min(cap).max(session_target_partitions)
+    if num_row_groups > cap {
+        return session_target_partitions;
+    }
+    num_row_groups.max(session_target_partitions)
 }
 
 /// Given the session's configured `session_target_partitions`, returns the
@@ -1357,8 +1363,9 @@ mod tests {
         );
         assert_eq!(
             low_card_boosted_partitions(573, cap, 14),
-            112,
-            "SF=100: 573 > 112 → clamp to CAP"
+            14,
+            "SF=100: 573 > 112 → boost DECLINES (partial granulation measured \
+             +7–8% on Q01 SF=100: ceil tail + 8× oversubscription out-of-cache)"
         );
         assert_eq!(
             low_card_boosted_partitions(6, cap, 14),
