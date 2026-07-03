@@ -1121,6 +1121,14 @@ fn is_pass_through_node(p: &dyn ExecutionPlan) -> bool {
             .downcast_ref::<CoalescePartitionsExec>()
             .is_some()
         || p.as_any().downcast_ref::<RepartitionExec>().is_some()
+        // RANGE.AGG Stage 2 (2026-07-02): the partitioning-reset cap
+        // over a rewritten SinglePartitioned aggregate is a 1:1
+        // pass-through — without this arm the Q18 HAVING shape
+        // (FilterExec → reset → AggregateExec) stops being recognized
+        // as selective and the L9 bloom emit declines.
+        || p.as_any()
+            .downcast_ref::<crate::partition_claim_reset_exec::PartitionClaimResetExec>()
+            .is_some()
 }
 
 fn first_shaping_node_is_aggregate(p: &dyn ExecutionPlan) -> bool {

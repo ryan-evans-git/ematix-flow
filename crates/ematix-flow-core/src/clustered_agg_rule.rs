@@ -46,6 +46,31 @@
 //! RG ranges overlap or lack stats, or fewer than 2 strict-gap split
 //! candidates exist.
 //!
+//! ## Stage 2 (2026-07-02) — shuffle-free sandwich
+//!
+//! Stage 1 rewrote the agg but the re-chunked scan advertised
+//! `UnknownPartitioning`, so the rule's own `EnforceDistribution`
+//! re-run put a hash `RepartitionExec` back between scan and agg —
+//! re-shuffling the full input (Q18 SF=100: 600M rows / ~9.6 GB) to
+//! satisfy a distribution requirement the key-disjoint chunking
+//! already satisfies row-wise. Stage 2 closes that:
+//!
+//! ```text
+//! PartitionClaimResetExec              // caps the claim: Unknown(n)
+//!   AggregateExec(SinglePartitioned)   // requirement satisfied ✓
+//!     EmatixFastParquetExec            // CLAIMS Hash([key], n)
+//! ```
+//!
+//! The scan claims `Partitioning::Hash([group_key], n)` — row-correct
+//! for the aggregation (every group's rows are in exactly one
+//! partition) but false about hash-bucket placement, so the claim is
+//! capped immediately above the agg by
+//! [`crate::partition_claim_reset_exec::PartitionClaimResetExec`].
+//! Any DOWNSTREAM hash requirement (e.g. a partitioned join consuming
+//! the agg output) is then re-satisfied by `EnforceDistribution`
+//! repartitioning the agg's OUTPUT (~10k rows post-HAVING on Q18)
+//! instead of its input.
+//!
 //! Re-runs `EnforceDistribution` after the rewrite (the Σ.BS repair
 //! pattern) so any downstream hash-distribution requirement is
 //! re-satisfied.
@@ -334,7 +359,19 @@ impl PhysicalOptimizerRule for ClusteredSinglePhaseAggRule {
                 );
             }
             // ---- rebuild: re-chunked scan + SinglePartitioned agg
-            let new_scan = scan.with_assignments(chunks);
+            //
+            // Stage 2 (2026-07-02): the re-chunked scan CLAIMS
+            // `Partitioning::Hash([group_key], n)`. The chunks are
+            // key-disjoint, not hash-bucketed — but hash-partitioned
+            // distribution only promises a consumer that every
+            // distinct key's rows land in exactly one partition, which
+            // the strict-gap chunking guarantees. The claim lets the
+            // EnforceDistribution re-run below accept the scan as the
+            // SinglePartitioned agg's input WITHOUT re-inserting the
+            // full-input hash shuffle (Q18 SF=100: 600M rows /
+            // ~9.6 GB re-shuffled for a requirement the chunking
+            // already satisfies row-wise).
+            let new_scan = scan.with_assignments_claiming_hash(chunks, vec![gexpr]);
             // SinglePartitioned: each partition aggregates its own key
             // range to completion (final values, no merge). Built from
             // the PARTIAL's expressions (they are against the scan
@@ -355,7 +392,19 @@ impl PhysicalOptimizerRule for ClusteredSinglePhaseAggRule {
                 }
                 return Ok(Transformed::no(node));
             }
-            Ok(Transformed::yes(Arc::new(single)))
+            // Stage 2 cap: the agg maps its input partitioning onto
+            // its output, so without a cap the false hash claim would
+            // leak upward — a partitioned HashJoin above could elide
+            // its build-side repartition and pair hash-partitions with
+            // range-chunks → WRONG RESULTS. The reset node advertises
+            // UnknownPartitioning(n) (and fresh equivalences), so
+            // EnforceDistribution re-satisfies any downstream hash
+            // requirement by repartitioning the agg's OUTPUT — for
+            // Q18 that repartition sits above the `HAVING sum > 300`
+            // filter: ~10k rows instead of 600M.
+            Ok(Transformed::yes(Arc::new(
+                crate::partition_claim_reset_exec::PartitionClaimResetExec::new(Arc::new(single)),
+            )))
         })?;
 
         if !rewritten.transformed {
@@ -380,27 +429,31 @@ impl PhysicalOptimizerRule for ClusteredSinglePhaseAggRule {
 mod tests {
     use super::*;
 
-    /// E2E: a multi-row-group parquet clustered on `k`, including a
-    /// key that SPANS a row-group boundary (k=199 ends RG 1 and starts
-    /// RG 2). The rule must fire (strict gaps exist elsewhere), place
-    /// no split inside the spanning key, and produce exactly the same
-    /// sums as a stock plan would — the spanning key's rows must land
-    /// in ONE partition.
-    #[tokio::test]
-    async fn e2e_clustered_group_by_is_exact_across_boundary_spans() {
+    /// Write the shared multi-row-group fixture: 1000 rows, `k =
+    /// row/5` (5 rows per key, keys 0..199), `v = 1`, k-sorted,
+    /// `rg_size` rows per row group.
+    ///
+    /// - `rg_size = 123` → 9 RGs whose boundaries cut inside keys at
+    ///   some seams (spans) and fall on strict gaps at others — the
+    ///   boundary-span e2e shape.
+    /// - `rg_size = 125` (divisible by 5) → 8 RGs, EVERY boundary a
+    ///   strict gap — with target_partitions=4 the planner chunks to
+    ///   exactly 4 partitions, which is the shuffle-free Stage 2
+    ///   shape (chunk count == target; `EnforceDistribution` adds a
+    ///   hash repartition on a satisfied-but-underpartitioned child
+    ///   when chunks < target, mirroring SF=100's 573 RGs → 14
+    ///   chunks == 14 targets).
+    ///
+    /// Returns the fixture dir (caller removes) and the parquet path.
+    fn write_clustered_fixture(
+        tag: &str,
+        rg_size: usize,
+    ) -> (std::path::PathBuf, std::path::PathBuf) {
         use arrow_array::{Int64Array, RecordBatch};
         use arrow_schema::{DataType, Field, Schema};
-        use datafusion::execution::session_state::SessionStateBuilder;
         use datafusion::parquet::arrow::ArrowWriter;
         use datafusion::parquet::file::properties::WriterProperties;
-        use datafusion::prelude::{SessionConfig, SessionContext};
 
-        // 1000 rows, k = row/5 (5 rows per key, keys 0..199), v = 1.
-        // max_row_group_size=125 → 8 RGs; 125 % 5 == 0 so most
-        // boundaries are strict gaps, but we FORCE a span: rows are
-        // k-sorted, and 125 doesn't divide... use 5-row keys with RG
-        // size 123 → boundaries cut inside keys at some seams, strict
-        // at others.
         let n = 1000i64;
         let keys: Vec<i64> = (0..n).map(|i| i / 5).collect();
         let vals: Vec<i64> = (0..n).map(|_| 1).collect();
@@ -416,19 +469,29 @@ mod tests {
             ],
         )
         .unwrap();
-        let dir = std::env::temp_dir().join(format!("range_agg_e2e_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("range_agg_{tag}_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("t.parquet");
         let props = WriterProperties::builder()
-            .set_max_row_group_row_count(Some(123))
+            .set_max_row_group_row_count(Some(rg_size))
             .build();
         let f = std::fs::File::create(&path).unwrap();
         let mut w = ArrowWriter::try_new(f, schema, Some(props)).unwrap();
         w.write(&batch).unwrap();
         w.close().unwrap();
+        (dir, path)
+    }
 
+    /// Session with default features + the rule under test, `t`
+    /// registered over the fixture parquet via the ematix provider.
+    fn ctx_over_fixture(
+        path: &std::path::Path,
+        config: datafusion::prelude::SessionConfig,
+    ) -> datafusion::prelude::SessionContext {
+        use datafusion::execution::session_state::SessionStateBuilder;
+        use datafusion::prelude::SessionContext;
         let state = SessionStateBuilder::new()
-            .with_config(SessionConfig::new().with_target_partitions(4))
+            .with_config(config)
             .with_default_features()
             .with_physical_optimizer_rule(Arc::new(ClusteredSinglePhaseAggRule))
             .build();
@@ -443,6 +506,22 @@ mod tests {
             ),
         )
         .unwrap();
+        ctx
+    }
+
+    /// E2E: a multi-row-group parquet clustered on `k`, including a
+    /// key that SPANS a row-group boundary (k=199 ends RG 1 and starts
+    /// RG 2). The rule must fire (strict gaps exist elsewhere), place
+    /// no split inside the spanning key, and produce exactly the same
+    /// sums as a stock plan would — the spanning key's rows must land
+    /// in ONE partition.
+    #[tokio::test]
+    async fn e2e_clustered_group_by_is_exact_across_boundary_spans() {
+        use arrow_array::Int64Array;
+        use datafusion::prelude::SessionConfig;
+
+        let (dir, path) = write_clustered_fixture("e2e", 123);
+        let ctx = ctx_over_fixture(&path, SessionConfig::new().with_target_partitions(4));
 
         let df = ctx
             .sql("SELECT k, sum(v) AS s FROM t GROUP BY k")
@@ -470,6 +549,183 @@ mod tests {
         // as two rows (e.g. (24, 3) and (24, 2)).
         let expect: Vec<(i64, i64)> = (0..200).map(|k| (k, 5)).collect();
         assert_eq!(got, expect, "cluster-key sums must be exact and unsplit");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Stage 2 plan pin (a): NO RepartitionExec between the re-chunked
+    /// scan and the SinglePartitioned agg — the scan's
+    /// `Partitioning::Hash` claim satisfies the agg's distribution
+    /// requirement, so the rule's EnforceDistribution re-run must not
+    /// re-insert the full-input shuffle. The claim must also be capped
+    /// by a PartitionClaimResetExec directly above the agg.
+    #[tokio::test]
+    async fn stage2_no_repartition_between_chunked_scan_and_agg() {
+        use datafusion::prelude::SessionConfig;
+
+        let (dir, path) = write_clustered_fixture("stage2_nosh", 125);
+        let ctx = ctx_over_fixture(&path, SessionConfig::new().with_target_partitions(4));
+
+        let df = ctx
+            .sql("SELECT k, sum(v) AS s FROM t GROUP BY k")
+            .await
+            .unwrap();
+        let plan = df.create_physical_plan().await.unwrap();
+        let rendered = datafusion::physical_plan::displayable(plan.as_ref())
+            .indent(true)
+            .to_string();
+        let lines: Vec<&str> = rendered.lines().collect();
+        let reset_idx = lines
+            .iter()
+            .position(|l| l.contains("PartitionClaimResetExec"))
+            .unwrap_or_else(|| panic!("reset cap missing:\n{rendered}"));
+        let agg_idx = lines
+            .iter()
+            .position(|l| l.contains("AggregateExec") && l.contains("SinglePartitioned"))
+            .unwrap_or_else(|| panic!("SinglePartitioned agg missing:\n{rendered}"));
+        let scan_idx = lines
+            .iter()
+            .position(|l| l.contains("EmatixFastParquetExec"))
+            .unwrap_or_else(|| panic!("chunked scan missing:\n{rendered}"));
+        assert!(
+            reset_idx < agg_idx && agg_idx < scan_idx,
+            "expected reset → agg → scan sandwich:\n{rendered}"
+        );
+        assert!(
+            lines[reset_idx..=scan_idx]
+                .iter()
+                .all(|l| !l.contains("RepartitionExec")),
+            "the input shuffle was re-inserted inside the sandwich:\n{rendered}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Stage 2 plan pin (b) + leak catcher: when a PARTITIONED hash
+    /// join consumes the rewritten agg's output, the false hash claim
+    /// must NOT leak past the reset cap — EnforceDistribution must
+    /// hash-repartition the agg's OUTPUT (above the reset node) and
+    /// the join's other side must get its own hash repartition, and
+    /// the join values must be exact. If the claim leaked, the join
+    /// would pair genuinely hash-partitioned `d` partitions with
+    /// range-chunked agg partitions and silently drop matches.
+    #[tokio::test]
+    async fn stage2_partitioned_join_repartitions_agg_output_not_input() {
+        use arrow_array::{Int64Array, RecordBatch, StringArray};
+        use arrow_schema::{DataType, Field, Schema};
+        use datafusion::datasource::MemTable;
+        use datafusion::prelude::SessionConfig;
+
+        let (dir, path) = write_clustered_fixture("stage2_join", 125);
+        // Force Partitioned hash-join mode (no CollectLeft shortcut on
+        // tiny inputs) so the join actually demands hash distribution
+        // on both children.
+        let mut config = SessionConfig::new().with_target_partitions(4);
+        config
+            .options_mut()
+            .optimizer
+            .hash_join_single_partition_threshold = 0;
+        config
+            .options_mut()
+            .optimizer
+            .hash_join_single_partition_threshold_rows = 0;
+        let ctx = ctx_over_fixture(&path, config);
+
+        // Dimension side: every key 0..199 with a name.
+        let d_schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+        let d_batch = RecordBatch::try_new(
+            d_schema.clone(),
+            vec![
+                Arc::new(Int64Array::from((0..200).collect::<Vec<i64>>())),
+                Arc::new(StringArray::from(
+                    (0..200).map(|k| format!("n{k}")).collect::<Vec<String>>(),
+                )),
+            ],
+        )
+        .unwrap();
+        ctx.register_table(
+            "d",
+            Arc::new(MemTable::try_new(d_schema, vec![vec![d_batch]]).unwrap()),
+        )
+        .unwrap();
+
+        let df = ctx
+            .sql(
+                "SELECT a.k, a.s, d.name \
+                 FROM (SELECT k, sum(v) AS s FROM t GROUP BY k) a \
+                 JOIN d ON a.k = d.k",
+            )
+            .await
+            .unwrap();
+        let plan = df.clone().create_physical_plan().await.unwrap();
+        let rendered = datafusion::physical_plan::displayable(plan.as_ref())
+            .indent(true)
+            .to_string();
+        let lines: Vec<&str> = rendered.lines().collect();
+
+        // The rewrite fired and is capped.
+        let reset_idx = lines
+            .iter()
+            .position(|l| l.contains("PartitionClaimResetExec"))
+            .unwrap_or_else(|| panic!("reset cap missing:\n{rendered}"));
+        let join_idx = lines
+            .iter()
+            .position(|l| l.contains("HashJoinExec") && l.contains("mode=Partitioned"))
+            .unwrap_or_else(|| panic!("expected a Partitioned hash join:\n{rendered}"));
+        let scan_idx = lines
+            .iter()
+            .position(|l| l.contains("EmatixFastParquetExec"))
+            .unwrap_or_else(|| panic!("chunked scan missing:\n{rendered}"));
+        assert!(join_idx < reset_idx && reset_idx < scan_idx);
+
+        // (b) The agg side IS repartitioned — ABOVE the reset node
+        // (i.e. on the agg's ~200-row output, not its input)…
+        assert!(
+            lines[join_idx..reset_idx]
+                .iter()
+                .any(|l| l.contains("RepartitionExec") && l.contains("Hash")),
+            "agg output must be hash-repartitioned above the reset cap:\n{rendered}"
+        );
+        // …and never between the reset cap and the chunked scan.
+        assert!(
+            lines[reset_idx..=scan_idx]
+                .iter()
+                .all(|l| !l.contains("RepartitionExec")),
+            "the input shuffle was re-inserted inside the sandwich:\n{rendered}"
+        );
+        // Leak pin: the join's OTHER side keeps its own hash
+        // repartition (two hash repartitions in the plan: one per
+        // join input).
+        let hash_reparts = lines
+            .iter()
+            .filter(|l| l.contains("RepartitionExec") && l.contains("Hash"))
+            .count();
+        assert!(
+            hash_reparts >= 2,
+            "expected a hash repartition on BOTH join inputs, found \
+             {hash_reparts}:\n{rendered}"
+        );
+
+        // Value gate: every key exactly once, sum 5, correct name — a
+        // partition mis-pairing would drop rows.
+        let batches = df.collect().await.unwrap();
+        let mut got: Vec<(i64, i64, String)> = Vec::new();
+        for b in &batches {
+            let k = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+            let s = b.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+            let nm = b.column(2).as_any().downcast_ref::<StringArray>().unwrap();
+            for i in 0..b.num_rows() {
+                got.push((k.value(i), s.value(i), nm.value(i).to_string()));
+            }
+        }
+        got.sort();
+        let expect: Vec<(i64, i64, String)> = (0..200).map(|k| (k, 5, format!("n{k}"))).collect();
+        assert_eq!(
+            got, expect,
+            "join over the capped agg must be exact — a leak of the \
+             hash claim would silently drop matches"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
