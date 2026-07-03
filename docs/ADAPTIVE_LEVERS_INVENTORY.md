@@ -85,6 +85,28 @@ Q21 SF=10 −5.9%**. The same sideband channel is reusable for any
 future AQE (adaptive skew detection, late-arrival selectivity,
 dynamic partition rebalancing).
 
+### Σ.Q05.CHAIN — L9 cascade chains (filtered dim → … → fact)
+**Where**: `runtime_bloom_cascade_chain.rs` (second phase of the L9
+rule); scan-side extras in `ematix_fast_parquet.rs`
+(`with_extra_runtime_sideband`).
+**What**: Detects CollectLeft build CHAINS whose top build is
+statically filtered and whose probe chain terminates in a large fact
+scan (Q05: region(ASIA) → nation → supplier(2-key) → lineitem), then
+installs one bloom per link. Runtime poll order sequences the links
+for free: each link's build scan is polled only after the parent
+link's bloom published, so the emitters sample already-narrowed
+builds (supplier 100K → 20K at SF=10). Intermediate links carry an
+`apply_when_dense` marker so the reader applies their bitmaps even
+above the REV.23 masked→dense discard threshold (dim-sized scans —
+negligible cost, and the next link's build sample depends on the
+prune). Multi-key equi-joins may emit a single-key superset bloom
+(`EMAT_MULTIKEY_BLOOM`). The terminal bloom composes with an existing
+wrap via an EXTRA sideband (a scan's primary slot is never displaced).
+**Gating**: tri-state `EMAT_L9_CASCADE` (+ `EMAT_MULTIKEY_BLOOM`),
+conservative AUTO: chain start filtered, every build CollectLeft ≤ 4M
+rows, terminal ≥ 20M rows, ≥ 2 links, bare (non-composed) terminals
+only under `EMAT_L9_CASCADE_TERMINAL_APPLY`.
+
 ---
 
 ## 3. Decode caches — never pay for the same column twice

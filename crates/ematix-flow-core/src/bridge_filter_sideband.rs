@@ -123,6 +123,16 @@ pub struct BridgeFilterSideband {
     /// and cheap. When the probe IS lazy-polled (Q9 lineitem) the build has
     /// already published by first peek, so this never costs the win.
     dimsel_gated: bool,
+    /// Σ.Q05.CHAIN (2026-07-02) — set on the INTERMEDIATE links of an
+    /// L9 cascade chain. The scan's `execute()` translates it into
+    /// `BridgeFilter::set_apply_when_dense`, so the reader's masked→
+    /// dense pass-rate routing stashes (applies) the bitmap instead of
+    /// discarding it — a chain link's whole value is the rows it
+    /// removes from the NEXT link's build sample, and intermediate
+    /// targets are dim-sized scans where the per-batch filter is
+    /// negligible. Default false: every other wrap keeps the REV.23
+    /// discard behavior.
+    chain_intermediate: bool,
     /// L9.ADAPT Guard 2 — shared runtime probe-outcome counters for
     /// this wrap. The scan threads a handle into the extended
     /// `BridgeFilter` iff the wrap is tight-admitted; the reader
@@ -158,6 +168,20 @@ impl BridgeFilterSideband {
     /// L9.DIMSEL.RT — is this a DIMSEL-gated wrap (no late-arm)?
     pub fn dimsel_gated(&self) -> bool {
         self.dimsel_gated
+    }
+
+    /// Σ.Q05.CHAIN — mark this sideband's wrap as a cascade-chain
+    /// INTERMEDIATE link (builder style; call before cloning into
+    /// emitter + scan). See the field docs.
+    pub fn mark_chain_intermediate(mut self) -> Self {
+        self.chain_intermediate = true;
+        self
+    }
+
+    /// Σ.Q05.CHAIN — is this a chain-intermediate wrap (bitmap must
+    /// apply even when the pass-rate routing picks dense)?
+    pub fn chain_intermediate(&self) -> bool {
+        self.chain_intermediate
     }
 
     /// L9.ADAPT Guard 2 — handle to this wrap's shared probe-disarm

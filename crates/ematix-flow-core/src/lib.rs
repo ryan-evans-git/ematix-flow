@@ -369,6 +369,10 @@ pub mod build_side_bloom_emitter_exec;
 // BuildSideBloomEmitterExec) and the probe-side EmatixFastParquetExec
 // (via with_runtime_sideband). Opt-in via install_runtime_bloom_sideband_rule.
 pub mod runtime_bloom_sideband_rule;
+// Σ.Q05.CHAIN (2026-07-02): second phase of the L9 rule — cascade
+// chains (filtered dim → … → large fact scan). Tri-state gated
+// (EMAT_L9_CASCADE / EMAT_MULTIKEY_BLOOM), conservative AUTO.
+pub mod runtime_bloom_cascade_chain;
 // Σ.S.B (2026-05-24): plan-time FK-chain detection helper shared by
 // the cascading-L9 prototype and the general rule. Pure-fn stem
 // extraction + plan walker that surfaces candidate EmatixFastParquetExec

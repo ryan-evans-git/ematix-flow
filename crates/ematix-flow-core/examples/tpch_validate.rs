@@ -406,9 +406,12 @@ async fn run_ematix(
         .ok()
         .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
         .unwrap_or(true);
-    // Σ.S.B: opt into the cascading variant via EMAT_L9_CASCADE=1.
-    // Strict superset of L9 base — same gates, plus FK-chain extras.
-    let cascade = std::env::var_os("EMAT_L9_CASCADE").is_some();
+    // Σ.S.B legacy stem-fanout cascade — now selected via
+    // EMAT_L9_CASCADE_STEM=1 only. Σ.Q05.CHAIN repurposed EMAT_L9_CASCADE
+    // as the tri-state gate of the chain-cascade second phase INSIDE the
+    // base rule (=1 force, =0 off, unset auto), so setting it no longer
+    // swaps the rule out.
+    let cascade = ematix_flow_core::flags::opt_in("EMAT_L9_CASCADE_STEM");
     if cascade {
         let max_extras = std::env::var("EMAT_L9_CASCADE_MAX")
             .ok()

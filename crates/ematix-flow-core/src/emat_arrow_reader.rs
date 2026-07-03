@@ -1247,7 +1247,13 @@ impl EmatArrowBatchReader {
                 // Same REV.23 threshold: gather wins ≤4.3%, dense wins
                 // ≥15%, 0.10 sits in the gap.
                 let popcount: usize = bitmap.iter().map(|b| b.count_ones() as usize).sum();
-                if total == 0
+                // Σ.Q05.CHAIN — a chain-intermediate filter's bitmap
+                // must APPLY regardless of the pass-rate routing: the
+                // next chain link samples this scan's output, and
+                // intermediate targets are dim-sized (per-batch filter
+                // is negligible). Everything else keeps REV.23.
+                if filter.apply_when_dense()
+                    || total == 0
                     || (popcount as f64 / total as f64) <= masked_dense_passrate_threshold()
                 {
                     self.cur_rg_filter_bitmap =
@@ -1333,7 +1339,10 @@ impl EmatArrowBatchReader {
         if should_route_masked_to_dense(popcount, total, masked_dense_passrate_threshold()) {
             self.cur_rg_total = self.cached_md.row_groups[rg].num_rows as usize;
             self.load_row_group_dense(rg)?;
-            if std::env::var_os("EMAT_EXACT_PUSHDOWN").is_some() {
+            // Σ.Q05.CHAIN — chain-intermediate filters must apply even
+            // when routed dense (see site above); Σ.AE.2 Exact mode
+            // stashes for correctness as before.
+            if filter.apply_when_dense() || std::env::var_os("EMAT_EXACT_PUSHDOWN").is_some() {
                 self.cur_rg_filter_bitmap =
                     Some(datafusion::arrow::buffer::Buffer::from_vec(bitmap));
             }

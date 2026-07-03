@@ -205,6 +205,12 @@ pub fn with_optimizer_rules_and_registry(
             // (10M; 32M under the EMAT_L9_PARTITIONED=1 opt-in so SF=100
             // dimensions stay NDV-correctable). See the field docs.
             ndv_max_rows: EnableRuntimeBloomSidebandRule::default().ndv_max_rows,
+            // Σ.Q05.CHAIN (2026-07-02): cascade-chain second phase.
+            // Tri-state env gated (EMAT_L9_CASCADE / EMAT_MULTIKEY_BLOOM,
+            // both AUTO by default — conservative structural thresholds:
+            // chain must start filtered, every build CollectLeft ≤ 4M,
+            // terminal scan ≥ 20M rows). See runtime_bloom_cascade_chain.rs.
+            cascade: crate::runtime_bloom_cascade_chain::CascadeChainConfig::default(),
         }));
     // Σ.AJ.1 Lever B POC: opt-in via EMAT_L9_BROADCAST_SIBLINGS=1.
     // Default OFF. See `crates/ematix-flow-core/src/broadcast_sibling_blooms_rule.rs`.

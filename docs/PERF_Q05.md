@@ -127,3 +127,59 @@ ematix is at its realistic-parallelism floor on every stage. The gap is **struct
 **Q05 is at realistic-parallelism floor; the 38 ms gap to DuckDB is structural** (plan shape), not kernel/operator inefficiency. Single highest-confidence lever: L9 cascade region→supplier→lineitem to pre-filter the 60M-row probe.
 
 **Next:** B.6 (Q06 — 76.08 ms; we lose to DuckDB by ~2%, decoder-bound).
+
+---
+
+## Σ.Q05.CHAIN — L9 cascade-chain lever (2026-07-02)
+
+Implemented on branch `perf/q05-multikey-bloom-cascade`. New second
+phase of `EnableRuntimeBloomSidebandRule`
+(`runtime_bloom_cascade_chain.rs`): install per-link blooms along the
+region(ASIA) → nation → supplier(2-key) → lineitem build chain.
+Tri-state gates `EMAT_L9_CASCADE` / `EMAT_MULTIKEY_BLOOM` (unset =
+conservative AUTO; see `docs/EMAT_FLAGS.md`).
+
+### Premise corrections vs this doc / the code diagnostic
+
+1. **The multi-key `break` was not the operative blocker.** The plan's
+   2-key supplier join lists `(s_suppkey, l_suppkey)` FIRST, so pass-1's
+   first-match loop would have picked the right key; what actually
+   blocks pass-1 on the chain joins is `require_filtered_build` (nation
+   / supplier builds carry no static FilterExec) plus the 1024× ratio
+   gate (region→nation: 5×1024 ≥ 25). Multi-key support was still
+   needed — the chain walker evaluates every key pair and picks the one
+   reaching the terminal fact scan.
+2. **The 2026-05 plan shape is stale for the preset path.** The
+   production preset now splices a transitive dim-semi (region⋈nation
+   RightSemi pre-filtering customer) and pass-1 already fires three
+   wraps at SF=10, including a tight-admitted `l_orderkey` bloom on the
+   lineitem scan (~3% pass — a stronger prefilter than the ~20%
+   `l_suppkey` bloom this doc proposed). The chain's terminal bloom
+   therefore COMPOSES with it (extra sideband, joint pass ≈ 0.6%)
+   rather than standing alone.
+3. **A standalone ~20%-pass bloom cannot prune the lineitem scan.**
+   The REV.23 masked→dense routing discards bitmaps above 10% pass, so
+   the "60M → 12M before the join" mechanism in this doc's candidate
+   ranking does not exist at the scan level; the bitmap is dropped and
+   the scan pays the filtered-path detour (+35 ms wall measured). AUTO
+   therefore only installs a terminal that composes with an existing
+   sub-threshold wrap; bare terminals are the
+   `EMAT_L9_CASCADE_TERMINAL_APPLY` A/B arm.
+4. **Intermediate links need `apply_when_dense`.** The same REV.23
+   discard silently neutered the nation/supplier prunes (both ~20%
+   pass): the chain published a full-supplier (100K-key) terminal set
+   and the runtime disarm correctly refused it. Chain-intermediate
+   sidebands now force the reader to stash/apply their bitmaps —
+   dim-sized scans, negligible cost. With the fix the terminal build
+   samples 20,037 ASIA suppliers (`DIMSEL.RT keep — 0.200 ≤ 0.5`).
+
+### Single-trial informational timings (SF=10, M4 Max — NOT official)
+
+| Shape | OFF (`EMAT_L9_CASCADE=0`) | AUTO |
+|-------|--------------------------:|-----:|
+| preset (`tpch_preset_rebench`, chain composes) | 128.7 ms | 126.5 ms |
+| strict bench (`tpch_triangulation_bench`, no pass-1 lineitem wrap → chain declines) | 106–127 ms | 111–122 ms (≈ noise) |
+
+Value validation: SF=1 22/22 PASS (forced + AUTO); Q05 SF=10 PASS vs
+DuckDB with lever off / AUTO / forced. Strict A/B decides shipped
+defaults.
