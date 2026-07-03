@@ -358,19 +358,25 @@ fn duckdb_cell(row: &duckdb::Row, idx: usize) -> Cell {
 /// last of which was MISSING, so validate never checked production's
 /// reordered plans). Parity is pinned by `validate_preset_parity_tests`.
 fn build_ematix_session() -> SessionContext {
+    // Concurrency-aware partitions (campaign-2026-07-01 §3): explicit
+    // `PARTITIONS=N` keeps precedence; otherwise the library's
+    // `EMAT_TARGET_PARTITIONS` tri-state resolves (`=N` force, `=0`
+    // legacy full cores, unset = AUTO cross-process sensing — solo
+    // stays at full cores). Resolved here, so the preset's auto hook
+    // is disabled in the overrides below.
     let partitions: usize = std::env::var("PARTITIONS")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or_else(|| {
-            std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(14)
-        });
+        .filter(|&n| n >= 1)
+        .unwrap_or_else(ematix_flow_core::partition_registry::resolve_target_partitions);
     // Σ.Q.L15: Inner-L9 + tight ratio + all-Emat. **Default ON at
     // milestone config**; set `L15=0` to revert to pre-L15 (stock L9
     // defaults + FastParquet for non-fact tables, below).
     let l15 = l15_enabled();
     let overrides = ematix_flow_core::preset::HarnessOverrides {
+        // Partitions already resolved above (PARTITIONS > tri-state);
+        // the preset must not re-resolve at a different instant.
+        auto_target_partitions: false,
         // Σ.Q.M: synthetic LeftSemi producer (precedes L10 by
         // registration order inside the unified constructor).
         synthetic_left_semi: std::env::var_os("EMAT_SYNTHETIC_LEFT_SEMI").is_some(),
