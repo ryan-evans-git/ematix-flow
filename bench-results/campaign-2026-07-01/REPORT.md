@@ -9,10 +9,14 @@
 > Q05 = SF=100 clear WIN +174 ms, SF=10 tie (`q05-rebaseline-2026-07-03/`);
 > (3) fresh Q01/Q16 verdicts = WIN +73 ms / noise (`q01-q16-2026-07-03/`);
 > (4) concurrency-aware EMAT_TARGET_PARTITIONS → SF=10 s10 throughput
-> 10,756 → 26,882 QPH (within ~10% of DuckDB; SF=100 throughput now an
-> ematix win at s1 AND s10) (`tput-rebaseline-2026-07-03/`).
-> **Standing: SF=1 22/22; SF=10 21W+1 tie; SF=100 19W/0L/3 noise —
-> zero clear DuckDB wins remain at any scale, single-stream.**
+> 10,756 → 26,882 QPH (`tput-rebaseline-2026-07-03/`); (5) scheduler
+> arc closed the rest — reader decode budget + rayon pool now size from
+> the registry core share (`sched-arc-2026-07-03/`): final co-measured
+> throughput ratios ematix/DuckDB = SF10 s1 1.28× / s10 1.07× / s100
+> 1.01×; SF100 s1 1.22× / s10 1.41×.
+> **Standing: SF=1 22/22; SF=10 21W+1 tie; SF=100 19W/0L/3 noise;
+> ematix leads EVERY scale × concurrency configuration, latency and
+> throughput.**
 
 > **2026-07-02 ADDENDUM — superseded SF=100 verdicts.** After this
 > campaign, two follow-up arcs landed on main: (1) the Q18 dig found the
