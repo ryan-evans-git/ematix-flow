@@ -56,8 +56,10 @@ use crate::dict_aggregate_rule::EnableDictGroupCountRule;
 use crate::ematix_fast_parquet::EmatixFastParquetTableProvider;
 use crate::fused_aggregate_filter_multi_agg_rule::InjectFilterMultiAggRule;
 use crate::fused_aggregate_filter_sum_rule::InjectFilterSumRule;
+use crate::inbloom_scan_pushdown_rule::EnableInBloomScanPushdownRule;
 use crate::push_down_left_semi_rule::PushDownLeftSemiRule;
 use crate::robin_hood_sum_f64_exec::EnableRobinHoodSumF64Rule;
+use crate::runtime_bloom_cascading_rule::EnableCascadingBloomRule;
 use crate::runtime_bloom_sideband_rule::EnableRuntimeBloomSidebandRule;
 use crate::shared_subtree_exec::SharedSubtreeRegistry;
 
@@ -125,100 +127,350 @@ pub fn with_optimizer_rules(builder: SessionStateBuilder) -> SessionStateBuilder
 pub fn with_optimizer_rules_and_registry(
     builder: SessionStateBuilder,
 ) -> (SessionStateBuilder, Arc<SharedSubtreeRegistry>) {
+    let (builder, handles) = with_optimizer_rules_overridden(builder, &HarnessOverrides::default());
+    (builder, handles.registry)
+}
+
+/// Explicit, named deltas a benchmark / validation harness may layer ON
+/// TOP of (or subtract from) the production optimizer chain.
+///
+/// **`HarnessOverrides::default()` means NO delta**: passing it to
+/// [`with_optimizer_rules_overridden`] produces exactly the chain
+/// [`with_optimizer_rules`] installs (that function is now literally
+/// implemented this way — there is ONE chain-assembly code path, so the
+/// preset stays the single source of truth and the Σ.V / Q18-SF=100
+/// class of "rule present in one copy, missing from another" drift is
+/// structurally impossible for the harnesses that use this API).
+///
+/// The three field groups:
+/// - **opt-outs** (default `true` = install): switch individual
+///   production members OFF for A/B isolation (the bench's
+///   `EMAT_RULES` / `EMAT_SWAP_SEMI` / ... levers).
+/// - **replacements / config overrides** (default `false`/`None` =
+///   production member with milestone config): swap an experimental
+///   variant in where the production rule would sit, or override one
+///   of the L9 sideband's milestone fields.
+/// - **diagnostic additions** (default `false` = not installed):
+///   harness-only rules that must NEVER ship in the production preset.
+///   These are the only names the harness parity tests allowlist.
+#[derive(Debug, Clone)]
+pub struct HarnessOverrides {
+    // ---- production-member opt-outs (true = install; all true in production) ----
+    /// `DedupeAggregateForFloatDeterminism` (bench: `EMAT_RULES=all|dedupe`).
+    pub dedupe_aggregate: bool,
+    /// The Σ.D/Σ.E inject trio: `EnableDictGroupCountRule` +
+    /// `InjectFilterMultiAggRule` + `InjectFilterSumRule`
+    /// (bench: `EMAT_RULES=all|v040`).
+    pub inject_fused_rules: bool,
+    /// `SwapSemiJoinBuildSideRule` (bench: `EMAT_SWAP_SEMI`).
+    pub swap_semi_join_build: bool,
+    /// `ForceCollectLeftForSemiBoundedBuildRule` (bench/validate:
+    /// `EMAT_FORCE_COLLECT_LEFT`).
+    pub force_collect_left: bool,
+    /// `ClusteredSinglePhaseAggRule` (RANGE.AGG). Note the rule ALSO
+    /// self-gates on `EMAT_RANGE_AGG` (default ON), so harnesses keep
+    /// this `true` and A/B via the env var.
+    pub clustered_single_phase_agg: bool,
+    /// `PushDownLeftSemiRule` — logical (bench: `EMAT_PUSH_SEMI`).
+    pub push_down_left_semi: bool,
+    /// `EnableRobinHoodSumF64Rule` (bench: `EMAT_RH_SUM_F64`).
+    pub robin_hood_sum_f64: bool,
+    /// `EnableRuntimeBloomSidebandRule` — the Σ.Q.L9/L15 milestone
+    /// bloom sideband (bench: `EMAT_RT_BLOOM_SIDEBAND`).
+    pub runtime_bloom_sideband: bool,
+    /// `FlowQueryPlanner` — the Σ.BR production pre-plan walker
+    /// pipeline (agg_semi → dim_push → q20_semi → transitive dim-semi
+    /// → shape-gated reorder) + scalar-agg partition boost + the
+    /// fd-groupby / late-mat / push-pipeline gated paths. Each step
+    /// self-gates on its own env var (`EMAT_AGG_SEMI`, `EMAT_DIM_PUSH`,
+    /// `EMAT_Q20_SEMI`, `EMAT_TRANSITIVE_DIM_SEMI`, `EMAT_REORDER_QP`,
+    /// ...), so harnesses keep this `true` and A/B via those.
+    pub flow_query_planner: bool,
+
+    // ---- replacements / L9 config overrides (None/false = production) ----
+    /// REV.8 (bench `EMAT_SINGLE_PASS_RADIX=1`): install
+    /// `EnableSinglePassRadixSumRule` INSTEAD of the RobinHood-sum
+    /// rewrite (the two match the same Partial aggregate and are
+    /// mutually exclusive by design).
+    pub single_pass_radix_replaces_rh_sum: bool,
+    /// Σ.S.B legacy stem-fanout cascade (bench/validate
+    /// `EMAT_L9_CASCADE_STEM=1`): install `EnableCascadingBloomRule`
+    /// with `max_extras_per_emitter = n` INSTEAD of the base L9 rule.
+    pub l9_cascade_stem_max_extras: Option<usize>,
+    /// Validate's legacy `L15=0` lever: install the L9 rule via
+    /// `::default()` (pre-L15 env-resolved config: ratio 64, Inner
+    /// joins off) instead of the milestone config.
+    pub l9_stock_defaults: bool,
+    /// Override the milestone `min_probe_to_build_ratio` (1024)
+    /// (bench: `EMAT_RT_BLOOM_RATIO`).
+    pub l9_min_probe_to_build_ratio: Option<usize>,
+    /// Override the milestone `allow_inner_join` (true)
+    /// (bench: `EMAT_RT_BLOOM_INNER_JOIN`).
+    pub l9_allow_inner_join: Option<bool>,
+    /// Override the milestone `require_filtered_build` (true)
+    /// (bench: `EMAT_L9_REQUIRE_FILTERED_BUILD`).
+    pub l9_require_filtered_build: Option<bool>,
+
+    // ---- harness-only diagnostic additions (false = production) ----
+    // Every rule name these can install MUST appear in the harness
+    // parity tests' documented allowlists.
+    /// Σ.Q.M `SyntheticLeftSemiRule` — logical, must precede
+    /// `PushDownLeftSemiRule` (bench/validate `EMAT_SYNTHETIC_LEFT_SEMI=1`).
+    pub synthetic_left_semi: bool,
+    /// REV.18c `EnableRobinHoodAggregateRule` (bench `EMAT_RH_COUNT=1`).
+    pub robin_hood_count: bool,
+    /// REV.18c `EnableRobinHoodAvgF64Rule` (bench `EMAT_RH_AVG=1`).
+    pub robin_hood_avg: bool,
+    /// Σ.AN.1 `AggPartitionBoostRule` (bench `EMAT_AGG_PARTITION_BOOST=1`).
+    pub agg_partition_boost: bool,
+    /// Σ.AE `DropRedundantBridgeFilterRule` — the install helper itself
+    /// no-ops unless `EMAT_DROP_REDUNDANT_FILTER=1` is set.
+    pub drop_redundant_filter: bool,
+    /// HJ.4 `SwapEmatixHashJoinRule` (validate) — registered last;
+    /// dormant unless `EMAT_HASH_JOIN=1`.
+    pub swap_emat_hash_join: bool,
+    /// Σ.Q.L4′ `EnableInBloomScanPushdownRule` (bench
+    /// `EMAT_BLOOM_PUSHDOWN=1`). The installed rule's handle comes back
+    /// in [`HarnessHandles::bloom_pushdown`] so the harness can swap
+    /// per-query `ContextBlooms` into the shared slot.
+    pub in_bloom_scan_pushdown: bool,
+}
+
+impl Default for HarnessOverrides {
+    /// The PRODUCTION configuration: every production member installed,
+    /// no replacements, no diagnostics.
+    fn default() -> Self {
+        Self {
+            dedupe_aggregate: true,
+            inject_fused_rules: true,
+            swap_semi_join_build: true,
+            force_collect_left: true,
+            clustered_single_phase_agg: true,
+            push_down_left_semi: true,
+            robin_hood_sum_f64: true,
+            runtime_bloom_sideband: true,
+            flow_query_planner: true,
+            single_pass_radix_replaces_rh_sum: false,
+            l9_cascade_stem_max_extras: None,
+            l9_stock_defaults: false,
+            l9_min_probe_to_build_ratio: None,
+            l9_allow_inner_join: None,
+            l9_require_filtered_build: None,
+            synthetic_left_semi: false,
+            robin_hood_count: false,
+            robin_hood_avg: false,
+            agg_partition_boost: false,
+            drop_redundant_filter: false,
+            swap_emat_hash_join: false,
+            in_bloom_scan_pushdown: false,
+        }
+    }
+}
+
+/// Handles the unified constructor hands back to harnesses.
+pub struct HarnessHandles {
+    /// The dedupe rule's shared-subtree registry (see
+    /// [`with_optimizer_rules_and_registry`]).
+    pub registry: Arc<SharedSubtreeRegistry>,
+    /// Present iff [`HarnessOverrides::in_bloom_scan_pushdown`] was set.
+    pub bloom_pushdown: Option<Arc<EnableInBloomScanPushdownRule>>,
+}
+
+/// THE single chain-assembly function. [`with_optimizer_rules`] /
+/// [`with_optimizer_rules_and_registry`] call it with
+/// `HarnessOverrides::default()` (= production); the TPC-H harnesses
+/// (`tpch_triangulation_bench`, `tpch_validate`) call it with their
+/// env-lever-derived overrides. Production members register in the
+/// exact order the preset has always used; harness additions register
+/// at their historical bench/validate positions.
+pub fn with_optimizer_rules_overridden(
+    builder: SessionStateBuilder,
+    o: &HarnessOverrides,
+) -> (SessionStateBuilder, HarnessHandles) {
     let registry = Arc::new(SharedSubtreeRegistry::new());
-    let builder = builder
-        .with_physical_optimizer_rule(Arc::new(DedupeAggregateForFloatDeterminism::with_registry(
-            registry.clone(),
-        )))
-        .with_physical_optimizer_rule(Arc::new(EnableDictGroupCountRule))
-        .with_physical_optimizer_rule(Arc::new(InjectFilterMultiAggRule))
-        .with_physical_optimizer_rule(Arc::new(InjectFilterSumRule))
-        .with_physical_optimizer_rule(Arc::new(
+    let mut builder = builder;
+    if o.dedupe_aggregate {
+        builder = builder.with_physical_optimizer_rule(Arc::new(
+            DedupeAggregateForFloatDeterminism::with_registry(registry.clone()),
+        ));
+    }
+    if o.inject_fused_rules {
+        builder = builder
+            .with_physical_optimizer_rule(Arc::new(EnableDictGroupCountRule))
+            .with_physical_optimizer_rule(Arc::new(InjectFilterMultiAggRule))
+            .with_physical_optimizer_rule(Arc::new(InjectFilterSumRule));
+    }
+    if o.swap_semi_join_build {
+        builder = builder.with_physical_optimizer_rule(Arc::new(
             crate::swap_semi_join_build_rule::SwapSemiJoinBuildSideRule,
-        ))
-        // ForceCollectLeftForSemiBoundedBuildRule (REV.3): forces
-        // PartitionMode::CollectLeft on Inner joins whose build side is
-        // semi-bounded (shrunk by a pushed LeftSemi/RightSemi), then
-        // re-runs EnforceDistribution to drop the now-unnecessary
-        // probe-side repartition (the Σ.BS "repair partitioning after a
-        // structural rewrite" pattern). Q18 SF=100: 6652 -> 398 ms
-        // (16.7x), value-validated — all 22 queries PASS vs DuckDB at
-        // SF=100 with this on. Runs right after SwapSemi so it sees the
-        // RightSemi. Was opt-in (EMAT_FORCE_COLLECT_LEFT); now default-on
-        // to match the settled decision + ship the banked win.
-        .with_physical_optimizer_rule(Arc::new(
+        ));
+    }
+    // ForceCollectLeftForSemiBoundedBuildRule (REV.3): forces
+    // PartitionMode::CollectLeft on Inner joins whose build side is
+    // semi-bounded (shrunk by a pushed LeftSemi/RightSemi), then
+    // re-runs EnforceDistribution to drop the now-unnecessary
+    // probe-side repartition (the Σ.BS "repair partitioning after a
+    // structural rewrite" pattern). Q18 SF=100: 6652 -> 398 ms
+    // (16.7x), value-validated — all 22 queries PASS vs DuckDB at
+    // SF=100 with this on. Runs right after SwapSemi so it sees the
+    // RightSemi. Was opt-in (EMAT_FORCE_COLLECT_LEFT); now default-on
+    // to match the settled decision + ship the banked win.
+    if o.force_collect_left {
+        builder = builder.with_physical_optimizer_rule(Arc::new(
             crate::force_collect_left_semi_build_rule::ForceCollectLeftForSemiBoundedBuildRule::default(),
-        ))
-        // RANGE.AGG (2026-06-10): collapse Partial→hash-shuffle→Final
-        // into one SinglePartitioned aggregate when the single group
-        // key is provably the file's cluster key (row-group min/max
-        // ranges monotone; splits placed only at strict key gaps so no
-        // group spans a partition). Q18 SF=100: the 600M-row/150M-group
-        // SUM drops from 43.5s CPU (two-phase + 2.2 GB shuffle) to one
-        // private-table pass per partition. Declines (stock plan) on
-        // any non-clustered key. Opt-out EMAT_RANGE_AGG=0.
-        .with_physical_optimizer_rule(Arc::new(
+        ));
+    }
+    // RANGE.AGG (2026-06-10): collapse Partial→hash-shuffle→Final
+    // into one SinglePartitioned aggregate when the single group
+    // key is provably the file's cluster key (row-group min/max
+    // ranges monotone; splits placed only at strict key gaps so no
+    // group spans a partition). Q18 SF=100: the 600M-row/150M-group
+    // SUM drops from 43.5s CPU (two-phase + 2.2 GB shuffle) to one
+    // private-table pass per partition. Declines (stock plan) on
+    // any non-clustered key. Opt-out EMAT_RANGE_AGG=0.
+    if o.clustered_single_phase_agg {
+        builder = builder.with_physical_optimizer_rule(Arc::new(
             crate::clustered_agg_rule::ClusteredSinglePhaseAggRule,
-        ))
-        // Σ.V (2026-05-26): align preset with the bench's milestone
-        // config. The bench has these three rules default-on but
-        // preset.rs was missing them — library users got materially
-        // different plan shapes than what we benchmarked. See
-        // [[Σ.V — preset alignment]].
-        //
-        // PushDownLeftSemiRule (Σ.Q.L10): LOGICAL rule that pushes a
-        // top-level LeftSemi join through Inner joins down to its
-        // target table, eliminating the N×M intermediate that would
-        // otherwise be built first. Closes Q18-shape gap to DuckDB
-        // when the rule was introduced (memory: Q18 SF=10 -54% at
-        // commit 50825c9, before other levers stacked).
-        .with_optimizer_rule(Arc::new(PushDownLeftSemiRule))
-        // EnableRobinHoodSumF64Rule (Σ.Q.L1b): routes
-        // SUM(Float64)/COUNT GROUP BY Int64 through
-        // RobinHoodSumF64Exec which beats DataFusion's stock
-        // vectorised AggregateExec by 1-5% (memory: project_sigma_nf3_beats_stock).
-        .with_physical_optimizer_rule(Arc::new(EnableRobinHoodSumF64Rule::default()))
-        // EnableRuntimeBloomSidebandRule (Σ.Q.L9 / Σ.Q.L15):
-        // threads a runtime bloom sideband between HashJoinExec
-        // build and probe-side EmatixFastParquetExec. The
-        // milestone config uses ratio=1024 (gates out L4'-style
-        // net-negative s⋈l firings while keeping small-dim→fact
-        // wins), allow_inner_join=true (Σ.Q.L15), and
-        // require_filtered_build=true (don't bloom on FK joins —
-        // [[l9_bloom_consumer_findings]]).
-        .with_physical_optimizer_rule(Arc::new(EnableRuntimeBloomSidebandRule {
-            min_probe_to_build_ratio: 1024,
-            allow_inner_join: true,
-            require_filtered_build: true,
-            // Σ.AH.3 Story 2a: per-partition absolute build-size ceiling.
-            // OPT-IN — default 0 (disabled). Story 2a measured no baseline
-            // wall-time effect (existing require_filtered_build + ratio gate
-            // already screen out FK-bloom emits; this gate only sees Inner
-            // joins with pre-filtered builds which turn out to be net-positive).
-            // Override via `EMAT_L9_MAX_EXPECTED_KEYS=N` if a future shape
-            // exposes a regression the existing gates miss.
-            max_expected_keys_per_partition: 0,
-            // L9.WIDTH (2026-06-10): probe-payoff gate, env-defaulted (4).
-            // See the field docs in runtime_bloom_sideband_rule.rs.
-            min_probe_proj_cols: EnableRuntimeBloomSidebandRule::default().min_probe_proj_cols,
-            // Σ.AH.2 (2026-07-01): NDV-walk file ceiling, env-defaulted
-            // (10M; 32M under the EMAT_L9_PARTITIONED=1 opt-in so SF=100
-            // dimensions stay NDV-correctable). See the field docs.
-            ndv_max_rows: EnableRuntimeBloomSidebandRule::default().ndv_max_rows,
-            // Σ.Q05.CHAIN (2026-07-02): cascade-chain second phase.
-            // Tri-state env gated (EMAT_L9_CASCADE / EMAT_MULTIKEY_BLOOM,
-            // both AUTO by default — conservative structural thresholds:
-            // chain must start filtered, every build CollectLeft ≤ 4M,
-            // terminal scan ≥ 20M rows). See runtime_bloom_cascade_chain.rs.
-            cascade: crate::runtime_bloom_cascade_chain::CascadeChainConfig::default(),
-        }));
+        ));
+    }
+    // Σ.Q.M SyntheticLeftSemiRule (harness diagnostic): logical
+    // producer that must precede the Σ.Q.L10 consumer — DataFusion
+    // runs custom logical rules in registration order.
+    if o.synthetic_left_semi {
+        builder = builder.with_optimizer_rule(Arc::new(
+            crate::synthetic_left_semi_rule::SyntheticLeftSemiRule,
+        ));
+    }
+    // Σ.V (2026-05-26): align preset with the bench's milestone
+    // config. The bench has these three rules default-on but
+    // preset.rs was missing them — library users got materially
+    // different plan shapes than what we benchmarked. See
+    // [[Σ.V — preset alignment]].
+    //
+    // PushDownLeftSemiRule (Σ.Q.L10): LOGICAL rule that pushes a
+    // top-level LeftSemi join through Inner joins down to its
+    // target table, eliminating the N×M intermediate that would
+    // otherwise be built first. Closes Q18-shape gap to DuckDB
+    // when the rule was introduced (memory: Q18 SF=10 -54% at
+    // commit 50825c9, before other levers stacked).
+    if o.push_down_left_semi {
+        builder = builder.with_optimizer_rule(Arc::new(PushDownLeftSemiRule));
+    }
+    // EnableRobinHoodSumF64Rule (Σ.Q.L1b): routes
+    // SUM(Float64)/COUNT GROUP BY Int64 through RobinHoodSumF64Exec
+    // which beats DataFusion's stock vectorised AggregateExec by 1-5%
+    // (memory: project_sigma_nf3_beats_stock). REV.8 (harness A/B):
+    // `single_pass_radix_replaces_rh_sum` swaps in the single-pass
+    // radix aggregate — the two match the same AggregateExec(Partial)
+    // and are mutually exclusive by design.
+    if o.single_pass_radix_replaces_rh_sum {
+        builder = builder.with_physical_optimizer_rule(Arc::new(
+            crate::single_pass_radix_sum_exec::EnableSinglePassRadixSumRule::default(),
+        ));
+    } else if o.robin_hood_sum_f64 {
+        builder =
+            builder.with_physical_optimizer_rule(Arc::new(EnableRobinHoodSumF64Rule::default()));
+    }
+    // REV.18c harness diagnostics: COUNT(*)/AVG(f64) GROUP BY i64
+    // RobinHood kernels — opt-in only (no TPC-H SF=10 shape lands in
+    // the 200K-256K group band where they win).
+    if o.robin_hood_count {
+        builder = builder.with_physical_optimizer_rule(Arc::new(
+            crate::robin_hood_agg_rule::EnableRobinHoodAggregateRule::default(),
+        ));
+    }
+    if o.robin_hood_avg {
+        builder = builder.with_physical_optimizer_rule(Arc::new(
+            crate::robin_hood_avg_f64_exec::EnableRobinHoodAvgF64Rule::default(),
+        ));
+    }
+    // Σ.AN.1 harness diagnostic: per-operator partition routing for
+    // high-cardinality FinalPartitioned aggregates.
+    if o.agg_partition_boost {
+        builder = builder.with_physical_optimizer_rule(Arc::new(
+            crate::agg_partition_boost::AggPartitionBoostRule,
+        ));
+    }
+    // EnableRuntimeBloomSidebandRule (Σ.Q.L9 / Σ.Q.L15):
+    // threads a runtime bloom sideband between HashJoinExec
+    // build and probe-side EmatixFastParquetExec. The
+    // milestone config uses ratio=1024 (gates out L4'-style
+    // net-negative s⋈l firings while keeping small-dim→fact
+    // wins), allow_inner_join=true (Σ.Q.L15), and
+    // require_filtered_build=true (don't bloom on FK joins —
+    // [[l9_bloom_consumer_findings]]). The remaining fields track
+    // `::default()`:
+    // - max_expected_keys_per_partition — Σ.AH.3 Story 2a ceiling,
+    //   OPT-IN (0 = disabled) via `EMAT_L9_MAX_EXPECTED_KEYS=N`.
+    // - min_probe_proj_cols — L9.WIDTH probe-payoff gate,
+    //   env-defaulted (`EMAT_L9_MIN_PROBE_PROJ_COLS`, default 0).
+    // - ndv_max_rows — Σ.AH.2 NDV-walk file ceiling, env-defaulted
+    //   (10M; 32M under EMAT_L9_PARTITIONED=1).
+    // - cascade — Σ.Q05.CHAIN cascade-chain second phase, tri-state
+    //   env gated (EMAT_L9_CASCADE / EMAT_MULTIKEY_BLOOM, both AUTO).
+    if o.runtime_bloom_sideband {
+        let ratio = o.l9_min_probe_to_build_ratio.unwrap_or(1024);
+        let allow_inner_join = o.l9_allow_inner_join.unwrap_or(true);
+        let require_filtered_build = o.l9_require_filtered_build.unwrap_or(true);
+        if let Some(max_extras) = o.l9_cascade_stem_max_extras {
+            // Σ.S.B legacy stem-fanout cascade (harness A/B) replaces
+            // the base rule; carries the same milestone gate config.
+            let rule = if o.l9_stock_defaults {
+                EnableCascadingBloomRule::default()
+            } else {
+                EnableCascadingBloomRule {
+                    min_probe_to_build_ratio: ratio,
+                    allow_inner_join,
+                    require_filtered_build,
+                    max_extras_per_emitter: max_extras,
+                }
+            };
+            builder = builder.with_physical_optimizer_rule(Arc::new(rule));
+        } else {
+            let rule = if o.l9_stock_defaults {
+                EnableRuntimeBloomSidebandRule::default()
+            } else {
+                EnableRuntimeBloomSidebandRule {
+                    min_probe_to_build_ratio: ratio,
+                    allow_inner_join,
+                    require_filtered_build,
+                    ..EnableRuntimeBloomSidebandRule::default()
+                }
+            };
+            builder = builder.with_physical_optimizer_rule(Arc::new(rule));
+        }
+    }
+    // Σ.AE harness diagnostic: the install helper itself no-ops unless
+    // `EMAT_DROP_REDUNDANT_FILTER=1` is set at construction time.
+    if o.drop_redundant_filter {
+        builder = crate::drop_redundant_filter_rule::install_drop_redundant_filter_rule(builder);
+    }
     // Σ.AJ.1 Lever B POC: opt-in via EMAT_L9_BROADCAST_SIBLINGS=1.
     // Default OFF. See `crates/ematix-flow-core/src/broadcast_sibling_blooms_rule.rs`.
-    let builder = if crate::flags::present("EMAT_L9_BROADCAST_SIBLINGS") {
+    // (Runs after the L9 sideband rule so it can broadcast existing
+    // bloom emitters to sibling same-parquet-path scans.)
+    let mut builder = if crate::flags::present("EMAT_L9_BROADCAST_SIBLINGS") {
         crate::broadcast_sibling_blooms_rule::install_broadcast_sibling_blooms_rule(builder)
     } else {
         builder
     };
+    // Σ.Q.L4′ harness diagnostic: in-scan bloom pushdown with an empty
+    // shared bloom slot; the bench swaps `ContextBlooms` in per query.
+    let bloom_pushdown: Option<Arc<EnableInBloomScanPushdownRule>> = if o.in_bloom_scan_pushdown {
+        let rule = Arc::new(EnableInBloomScanPushdownRule::default());
+        builder = builder.with_physical_optimizer_rule(rule.clone());
+        Some(rule)
+    } else {
+        None
+    };
+    // HJ.4 harness diagnostic: SIMD-tag/RobinHood join-probe swap.
+    // Registered LAST so the join's partition_mode is already assigned;
+    // dormant unless EMAT_HASH_JOIN=1.
+    if o.swap_emat_hash_join {
+        builder = builder.with_physical_optimizer_rule(Arc::new(
+            crate::swap_emat_hash_join_rule::SwapEmatixHashJoinRule,
+        ));
+    }
     // Σ.BR Phase 2 / #194 (2026-05-29): production wiring for the ematix
     // pre-plan walker pipeline (agg_semi → dim_push → reorder). These walkers
     // were previously applied only in the bench harness, so library users got
@@ -234,16 +486,23 @@ pub fn with_optimizer_rules_and_registry(
     // boost (morsel down-payment, 2026-06-20), which is independent of the
     // three walkers — so keep the planner installed when that lever is on even
     // if all three walkers are disabled.
-    let flow_qp_on = ["EMAT_AGG_SEMI", "EMAT_DIM_PUSH", "EMAT_REORDER_QP"]
-        .iter()
-        .any(|var| crate::flags::enabled(var))
-        || crate::auto_target_partitions::scalar_agg_boost_enabled();
+    let flow_qp_on = o.flow_query_planner
+        && (["EMAT_AGG_SEMI", "EMAT_DIM_PUSH", "EMAT_REORDER_QP"]
+            .iter()
+            .any(|var| crate::flags::enabled(var))
+            || crate::auto_target_partitions::scalar_agg_boost_enabled());
     let builder = if flow_qp_on {
         builder.with_query_planner(Arc::new(crate::flow_query_planner::FlowQueryPlanner))
     } else {
         builder
     };
-    (builder, registry)
+    (
+        builder,
+        HarnessHandles {
+            registry,
+            bloom_pushdown,
+        },
+    )
 }
 
 /// Register a parquet file as a table on `ctx` via
@@ -275,12 +534,121 @@ pub fn register_dict_aware_parquet(
     Ok(())
 }
 
+/// The production preset's ematix rule chain, BY NAME, in registration
+/// order — the pinned source of truth the harness parity tests compare
+/// against. **Adding/removing a rule in
+/// [`with_optimizer_rules_overridden`] requires updating this list**
+/// (the `production_chain_matches_pinned_names` test fails otherwise),
+/// which is the deliberate tripwire: every chain change is now a
+/// conscious, single-site act that the harnesses inherit automatically.
+pub const PRODUCTION_PHYSICAL_RULE_NAMES: &[&str] = &[
+    "ematix_flow_dedupe_aggregate_for_float_determinism",
+    "ematix_flow_enable_dict_group_count",
+    "ematix_flow_inject_filter_multi_agg",
+    "ematix_flow_inject_filter_sum",
+    "swap_semi_join_build_side",
+    "ematix_flow_force_collect_left_semi_bounded_build",
+    "ematix_flow_clustered_single_phase_agg",
+    "ematix_flow_enable_robin_hood_sum_f64",
+    "ematix_flow_enable_runtime_bloom_sideband",
+];
+
+/// The production preset's custom LOGICAL optimizer rules, by name, in
+/// registration order (see [`PRODUCTION_PHYSICAL_RULE_NAMES`]).
+pub const PRODUCTION_LOGICAL_RULE_NAMES: &[&str] = &["ematix_flow_push_down_left_semi"];
+
+/// Extract the non-stock (ematix-added) physical + logical optimizer
+/// rule names from `state`, in registration order. "Non-stock" =
+/// not present in a bare `SessionStateBuilder::new().with_default_features()`
+/// session — so ANY custom rule is caught regardless of its naming
+/// convention. Used by the preset pin test and the harness parity tests.
+pub fn ematix_rule_names(
+    state: &datafusion::execution::session_state::SessionState,
+) -> (Vec<String>, Vec<String>) {
+    use std::collections::HashSet;
+    let stock = SessionStateBuilder::new().with_default_features().build();
+    let stock_physical: HashSet<String> = stock
+        .physical_optimizers()
+        .iter()
+        .map(|r| r.name().to_string())
+        .collect();
+    let stock_logical: HashSet<String> = stock
+        .optimizers()
+        .iter()
+        .map(|r| r.name().to_string())
+        .collect();
+    let physical = state
+        .physical_optimizers()
+        .iter()
+        .map(|r| r.name().to_string())
+        .filter(|n| !stock_physical.contains(n))
+        .collect();
+    let logical = state
+        .optimizers()
+        .iter()
+        .map(|r| r.name().to_string())
+        .filter(|n| !stock_logical.contains(n))
+        .collect();
+    (physical, logical)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use datafusion::physical_plan::displayable;
     use datafusion::prelude::SessionConfig;
     use std::path::PathBuf;
+
+    /// The single-source-of-truth tripwire (2026-07-02 hardening, see
+    /// docs/PERF_Q18.md § Hardening): the production chain assembled by
+    /// `with_optimizer_rules` must match the pinned name lists above.
+    /// If you add/remove/rename a preset rule, update the pinned consts
+    /// — the TPC-H harnesses (tpch_triangulation_bench, tpch_validate)
+    /// build through `with_optimizer_rules_overridden` and inherit the
+    /// change automatically; their own parity tests re-check against
+    /// the preset session at default env.
+    #[test]
+    fn production_chain_matches_pinned_names() {
+        let state =
+            with_optimizer_rules(SessionStateBuilder::new().with_default_features()).build();
+        let (physical, logical) = ematix_rule_names(&state);
+        assert_eq!(
+            physical, PRODUCTION_PHYSICAL_RULE_NAMES,
+            "production preset physical chain drifted from the pinned list — \
+             update PRODUCTION_PHYSICAL_RULE_NAMES (and check the harnesses' \
+             parity tests still pass)"
+        );
+        assert_eq!(
+            logical, PRODUCTION_LOGICAL_RULE_NAMES,
+            "production preset logical chain drifted from the pinned list"
+        );
+        // FlowQueryPlanner ships by default (its walkers self-gate on
+        // EMAT_AGG_SEMI / EMAT_DIM_PUSH / EMAT_REORDER_QP, all default ON).
+        assert_eq!(
+            format!("{:?}", state.query_planner()),
+            "FlowQueryPlanner",
+            "production preset must install FlowQueryPlanner by default"
+        );
+    }
+
+    /// `HarnessOverrides::default()` == production: the overridden
+    /// constructor with no deltas produces the identical chain (and no
+    /// bloom-pushdown handle).
+    #[test]
+    fn default_overrides_equal_production_chain() {
+        let prod = with_optimizer_rules(SessionStateBuilder::new().with_default_features()).build();
+        let (builder, handles) = with_optimizer_rules_overridden(
+            SessionStateBuilder::new().with_default_features(),
+            &HarnessOverrides::default(),
+        );
+        let over = builder.build();
+        assert_eq!(ematix_rule_names(&prod), ematix_rule_names(&over));
+        assert_eq!(
+            format!("{:?}", prod.query_planner()),
+            format!("{:?}", over.query_planner()),
+        );
+        assert!(handles.bloom_pushdown.is_none());
+    }
 
     fn sf1_lineitem() -> Option<String> {
         let env = std::env::var("TPCH_DATA_DIR").ok().map(PathBuf::from);
