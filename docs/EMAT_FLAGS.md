@@ -46,6 +46,7 @@ These are read in `src/` and default to enabled. Disable with `=0`.
 | Flag | Default | Value/Notes | Owner file | Purpose |
 | --- | --- | --- | --- | --- |
 | `EMAT_AGG_SEMI` | ON (set =0 to disable) | `enabled()` | [flow_query_planner.rs:68](../crates/ematix-flow-core/src/flow_query_planner.rs) | Agg-side filter/semi pushdown walker (`push_filter_into_agg`); Q17/Q08/Q18. |
+| `EMAT_BALANCED_RG_ASSIGN` | ON (set =0 to disable) | `enabled()` | [ematix_fast_parquet.rs](../crates/ematix-flow-core/src/ematix_fast_parquet.rs) | LPT.RG: cost-balanced (LPT) row-group → partition assignment in the plain `scan()` path; per-RG cost = sum of the PROJECTED columns' column-chunk `total_compressed_size` from the cached footer metadata; deterministic (stable tie-breaks), ascending RG order within each partition; count-balanced fallback when metadata is unavailable or costs carry no signal. `=0` restores the legacy round-robin (`rg % num_partitions`) exactly. RANGE.AGG injected assignments (`with_assignments` / `with_assignments_claiming_hash`) are unaffected. |
 | `EMAT_COLLECT_LEFT_SEMI_BROADCAST` | ON (set =0 to disable) | `!= Ok("0")` | [force_collect_left_semi_build_rule.rs:377](../crates/ematix-flow-core/src/force_collect_left_semi_build_rule.rs) | REV.17.4b: broadcast (no-swap CollectLeft) for semi/anti joins. |
 | `EMAT_CSE_FILTER_FUSION` | ON (set =0 to disable) | `.unwrap_or(true)` | [dedupe_aggregate_rule.rs:311](../crates/ematix-flow-core/src/dedupe_aggregate_rule.rs) | CSE filter-fusion across deduped aggregate subtrees. |
 | `EMAT_CSE_PARALLEL` | ON (set =0 to disable) | `.unwrap_or(true)` | [shared_subtree_exec.rs:296](../crates/ematix-flow-core/src/shared_subtree_exec.rs) | Concurrent (vs serial) drain of SharedSubtree CSE consumers; Q15 −13%. |
@@ -334,13 +335,13 @@ production rule, the harness toggles it before constructing rules manually.
 
 | Bucket | Count |
 | --- | --- |
-| Production gate (default-ON) | 18 |
+| Production gate (default-ON) | 19 |
 | Production gate (opt-in) | 28 |
 | Numeric tunable | 41 |
 | Diagnostic / trace | 21 |
 | Bench-harness only | 48 |
 | Comment-only (possibly dead) | 1 |
-| **Grand total (distinct flags)** | **157** |
+| **Grand total (distinct flags)** | **158** |
 
 > `EMAT_FAST_SNAPPY` is counted once, under Comment-only.
 > `EMAT_MI_COLLECT` is placed under Diagnostic/trace (allocator-operational,
