@@ -16,10 +16,18 @@
 # Process model: one bench-binary process per stream, launched
 # concurrently; each runs its 22 queries sequentially with
 # TPCH_TRIALS=1 TPCH_WARMUPS=0 (throughput tests measure sustained
-# load, not steady-state repeats). Engine defaults govern per-process
-# threading (ematix: target_partitions = cores, override PARTITIONS=N;
-# DuckDB: its own defaults) — at N=100 on a laptop this oversubscribes
-# heavily BY DESIGN; that contention is the thing being measured.
+# load, not steady-state repeats). Per-process threading:
+#   --partitions auto    (default) set nothing — ematix's
+#                        EMAT_TARGET_PARTITIONS AUTO mode senses live
+#                        ematix processes via the partition registry
+#                        and picks clamp(cores/N, 2, cores) itself.
+#   --partitions legacy  EMAT_TARGET_PARTITIONS=0 — historical
+#                        behavior, target_partitions = cores per
+#                        process; at N=100 on a laptop this
+#                        oversubscribes heavily BY DESIGN.
+#   --partitions N       PARTITIONS=N — fixed per-process count
+#                        (the pre-lever diagnostic override).
+# DuckDB always uses its own defaults.
 #
 # MEMORY SAFETY (learned the hard way — an uncapped s100 launch OOM'd
 # and force-restarted a 36 GB machine TWICE): stream processes launch
@@ -36,7 +44,8 @@
 #   strict_throughput.sh [--sf N] [--streams "1,10,100"]
 #                        [--engines "ematix,duckdb"] [--batches 4]
 #                        [--max-inflight K] [--min-free-gb G]
-#                        [--plan-cache on|off] [--out PATH]
+#                        [--plan-cache on|off]
+#                        [--partitions legacy|auto|N] [--out PATH]
 #
 # Outputs:
 #   $OUT/<engine>/s<N>/batch-<b>/stream-<s>.md
@@ -53,9 +62,10 @@ BATCHES=4                  # first discarded per (engine, N)
 MAX_INFLIGHT=10            # hard cap on concurrent engine processes
 MIN_FREE_GB=6              # refuse to launch a batch below this headroom
 PLAN_CACHE="off"           # per-process cache is fresh anyway; kept for parity
+PARTITIONS_MODE="auto"     # legacy|auto|N — ematix per-process partitions
 OUT="/tmp/strict-throughput-$(date +%Y%m%d-%H%M%S)"
 
-usage() { sed -n '2,40p' "$0"; }
+usage() { sed -n '2,60p' "$0"; }
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -66,6 +76,7 @@ while [[ $# -gt 0 ]]; do
         --max-inflight) MAX_INFLIGHT="$2"; shift 2 ;;
         --min-free-gb) MIN_FREE_GB="$2"; shift 2 ;;
         --plan-cache) PLAN_CACHE="$2"; shift 2 ;;
+        --partitions) PARTITIONS_MODE="$2"; shift 2 ;;
         --out) OUT="$2"; shift 2 ;;
         -h|--help) usage; exit 0 ;;
         *) echo "unknown arg: $1" >&2; usage; exit 2 ;;
@@ -84,9 +95,22 @@ DATA="$REPO/examples/tpch/data/sf$SF"
 
 if [[ "$PLAN_CACHE" == "on" ]]; then PC_ENV="EMAT_PLAN_CACHE=1"; else PC_ENV="EMAT_PLAN_CACHE=0"; fi
 
+# --partitions → per-stream ematix env (bash 3.2-safe: PART_ENV is
+# always SET, possibly empty; the launch line expands it unquoted so
+# an empty value contributes no words).
+case "$PARTITIONS_MODE" in
+    auto)   PART_ENV="" ;;                             # engine senses via registry
+    legacy) PART_ENV="EMAT_TARGET_PARTITIONS=0" ;;     # cores per process
+    ''|0|*[!0-9]*)
+        echo "ERROR: --partitions must be legacy|auto|N (N>=1), got '$PARTITIONS_MODE'" >&2
+        exit 2 ;;
+    *)      PART_ENV="PARTITIONS=$PARTITIONS_MODE" ;;  # fixed count (back-compat)
+esac
+
 mkdir -p "$OUT"
 capture_env "$OUT" "sf=$SF" "streams=$STREAMS" "engines=$ENGINES" \
-    "batches=$BATCHES" "plan_cache=$PLAN_CACHE" "mode=throughput"
+    "batches=$BATCHES" "plan_cache=$PLAN_CACHE" \
+    "partitions=$PARTITIONS_MODE" "mode=throughput"
 
 # Deterministic per-stream query permutation (seeded shuffle).
 perm_for_stream() {
@@ -145,7 +169,7 @@ run_batch() {
         inflight_gate
         local perm; perm="$(perm_for_stream "$s")"
         # shellcheck disable=SC2086
-        caffeinate -i /usr/bin/env $skip_env $PC_ENV \
+        caffeinate -i /usr/bin/env $skip_env $PC_ENV $PART_ENV \
             "TPCH_DATA_DIR=$DATA" "TPCH_TRIALS=1" "TPCH_WARMUPS=0" \
             "TPCH_QUERIES=$perm" "TPCH_OUT=$bdir/stream-$s.md" \
             "$BIN" >"$bdir/stream-$s.log" 2>&1 &
@@ -178,7 +202,7 @@ EOF
 }
 
 echo "=== Σ.AI.3 strict throughput bench ==="
-echo "  sf: $SF | streams: $STREAMS | engines: $ENGINES | batches: $BATCHES (first discarded)"
+echo "  sf: $SF | streams: $STREAMS | engines: $ENGINES | batches: $BATCHES (first discarded) | partitions: $PARTITIONS_MODE"
 echo "  out: $OUT"
 echo
 
