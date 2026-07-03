@@ -134,6 +134,12 @@ pub struct EnableRuntimeBloomSidebandRule {
     /// yes, facts no" intent one scale up. An explicit
     /// `EMAT_L9_NDV_MAX_ROWS=N` always wins over both defaults.
     pub ndv_max_rows: usize,
+    /// Σ.Q05.CHAIN (2026-07-02) — config for the cascade-chain second
+    /// phase (`EMAT_L9_CASCADE` / `EMAT_MULTIKEY_BLOOM` tri-states +
+    /// structural thresholds). Runs after the per-join transform; see
+    /// [`crate::runtime_bloom_cascade_chain`]. `CascadeChainConfig::off()`
+    /// pins pass-1-only behavior in tests.
+    pub cascade: crate::runtime_bloom_cascade_chain::CascadeChainConfig,
 }
 
 /// Σ.AH.2 — the flag-off NDV-walk ceiling (dimensions at SF≤10).
@@ -203,6 +209,9 @@ impl Default for EnableRuntimeBloomSidebandRule {
             // Σ.AH.2 — see the field docs; explicit EMAT_L9_NDV_MAX_ROWS
             // wins, else EMAT_L9_PARTITIONED=1 raises 10M → 32M.
             ndv_max_rows: l9_ndv_max_rows(),
+            // Σ.Q05.CHAIN — env-resolved tri-states (EMAT_L9_CASCADE /
+            // EMAT_MULTIKEY_BLOOM) + structural thresholds.
+            cascade: crate::runtime_bloom_cascade_chain::CascadeChainConfig::default(),
         }
     }
 }
@@ -702,6 +711,18 @@ impl PhysicalOptimizerRule for EnableRuntimeBloomSidebandRule {
             Ok(Transformed::yes(new_join))
         })
         .data()
+        .and_then(|plan| {
+            // Σ.Q05.CHAIN — second phase: install runtime-bloom cascade
+            // chains (filtered dim → … → large fact) that the per-join
+            // gates above rightly reject in isolation. No-op unless the
+            // plan carries a qualifying chain (or EMAT_L9_CASCADE=0
+            // disables the pass outright).
+            crate::runtime_bloom_cascade_chain::install_cascade_chains(
+                plan,
+                &self.cascade,
+                trace,
+            )
+        })
     }
 
     fn name(&self) -> &str {
@@ -734,7 +755,7 @@ impl PhysicalOptimizerRule for EnableRuntimeBloomSidebandRule {
 /// names across joined tables would need column-index threading
 /// through join projections — substantially more code; not done
 /// here.
-fn find_probe_scan_for_column(
+pub(crate) fn find_probe_scan_for_column(
     plan: &Arc<dyn ExecutionPlan>,
     col_name: &str,
 ) -> Option<(Arc<dyn ExecutionPlan>, Arc<EmatixFastParquetExec>, usize)> {
@@ -831,7 +852,7 @@ fn rewrite_probe_subtree(
 ///   intermediate contains the orders date FilterExec)
 /// - true for Q17's filtered_part⋈lineitem build (filtered_part has
 ///   a FilterExec on p_brand + p_container)
-fn build_subtree_has_filter(plan: &Arc<dyn ExecutionPlan>) -> bool {
+pub(crate) fn build_subtree_has_filter(plan: &Arc<dyn ExecutionPlan>) -> bool {
     use datafusion::physical_plan::filter::FilterExec;
     if plan.as_any().downcast_ref::<FilterExec>().is_some() {
         return true;
@@ -881,7 +902,7 @@ pub(crate) fn build_subtree_has_semi_filter(plan: &Arc<dyn ExecutionPlan>) -> bo
 /// probe-side leaf scan. The scan exposes `num_rows` directly via its
 /// own field, so this is a cheap accessor. Returns the total row
 /// count across partitions.
-fn estimate_probe_scan_rows(scan: &EmatixFastParquetExec) -> Option<usize> {
+pub(crate) fn estimate_probe_scan_rows(scan: &EmatixFastParquetExec) -> Option<usize> {
     // EmatixFastParquetExec doesn't expose num_rows publicly, but
     // partition_statistics(None) returns total row count.
     use datafusion::common::stats::Precision;
@@ -902,7 +923,7 @@ fn estimate_probe_scan_rows(scan: &EmatixFastParquetExec) -> Option<usize> {
 /// and the cheap pre-gates passed — the eager dual-estimate design
 /// consulted NDV stats on every join of every query and re-sized
 /// default-admitted wraps' expected_keys, both measured regressions.
-fn estimate_build_rows(plan: &dyn ExecutionPlan) -> Option<usize> {
+pub(crate) fn estimate_build_rows(plan: &dyn ExecutionPlan) -> Option<usize> {
     // Σ.AH.2 — the ceiling is inert on the default (stats-only) path;
     // pass the flag-off constant for clarity.
     estimate_build_rows_mode(plan, false, DEFAULT_L9_NDV_MAX_ROWS)
@@ -971,7 +992,7 @@ fn dim_bloom_rt_max_sel() -> f64 {
 /// `EmatixFastParquetExec`, return that scan's TOTAL (pre-filter) row count.
 /// `None` for multi-scan builds (snowflake dims) where the single-dimension
 /// filter-selectivity model doesn't apply.
-fn single_dim_scan_total(plan: &dyn ExecutionPlan) -> Option<usize> {
+pub(crate) fn single_dim_scan_total(plan: &dyn ExecutionPlan) -> Option<usize> {
     fn walk(p: &dyn ExecutionPlan, count: &mut usize, total: &mut Option<usize>) {
         if let Some(scan) = p.as_any().downcast_ref::<EmatixFastParquetExec>() {
             *count += 1;
@@ -1504,6 +1525,7 @@ mod tests {
                 // exercising the wrap mechanics, not the payoff heuristic.
                 min_probe_proj_cols: 0,
                 ndv_max_rows: DEFAULT_L9_NDV_MAX_ROWS,
+                cascade: crate::runtime_bloom_cascade_chain::CascadeChainConfig::off(),
             }))
             .build();
         let ctx = SessionContext::new_with_state(state);
@@ -1570,6 +1592,7 @@ mod tests {
                 max_expected_keys_per_partition: 0,
                 min_probe_proj_cols: 0,
                 ndv_max_rows: l9_ndv_max_rows(),
+                cascade: crate::runtime_bloom_cascade_chain::CascadeChainConfig::off(),
             }))
             .build();
         let ctx = SessionContext::new_with_state(state);
@@ -1685,6 +1708,7 @@ mod tests {
                 // exercising the wrap mechanics, not the payoff heuristic.
                 min_probe_proj_cols: 0,
                 ndv_max_rows: DEFAULT_L9_NDV_MAX_ROWS,
+                cascade: crate::runtime_bloom_cascade_chain::CascadeChainConfig::off(),
             }))
             .build();
         let ctx = SessionContext::new_with_state(state);
@@ -1768,6 +1792,7 @@ mod tests {
                 // exercising the wrap mechanics, not the payoff heuristic.
                 min_probe_proj_cols: 0,
                 ndv_max_rows: DEFAULT_L9_NDV_MAX_ROWS,
+                cascade: crate::runtime_bloom_cascade_chain::CascadeChainConfig::off(),
             }))
             .build();
         let ctx = SessionContext::new_with_state(state);
@@ -1838,6 +1863,7 @@ mod tests {
                 // exercising the wrap mechanics, not the payoff heuristic.
                 min_probe_proj_cols: 0,
                 ndv_max_rows: DEFAULT_L9_NDV_MAX_ROWS,
+                cascade: crate::runtime_bloom_cascade_chain::CascadeChainConfig::off(),
             }))
             .build();
         let ctx = SessionContext::new_with_state(state);
@@ -1924,6 +1950,7 @@ mod tests {
                 // Width gate off: narrow synthetic fixtures.
                 min_probe_proj_cols: 0,
                 ndv_max_rows: DEFAULT_L9_NDV_MAX_ROWS,
+                cascade: crate::runtime_bloom_cascade_chain::CascadeChainConfig::off(),
             }))
             .build();
         let ctx = SessionContext::new_with_state(state);
@@ -1977,6 +2004,7 @@ mod tests {
                 // Width gate off: narrow synthetic fixtures.
                 min_probe_proj_cols: 0,
                 ndv_max_rows: DEFAULT_L9_NDV_MAX_ROWS,
+                cascade: crate::runtime_bloom_cascade_chain::CascadeChainConfig::off(),
             }))
             .build();
         let ctx = SessionContext::new_with_state(state);
@@ -2595,6 +2623,7 @@ mod tests {
                 max_expected_keys_per_partition: 0,
                 min_probe_proj_cols: 0,
                 ndv_max_rows: DEFAULT_L9_NDV_MAX_ROWS,
+                cascade: crate::runtime_bloom_cascade_chain::CascadeChainConfig::off(),
             }))
             .build();
         let ctx = SessionContext::new_with_state(state);

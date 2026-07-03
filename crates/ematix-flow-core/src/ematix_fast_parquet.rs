@@ -78,6 +78,17 @@ pub struct BridgeFilter {
     /// published predicates. `None` (the default, and all non-tight
     /// wraps): probe behavior is unchanged.
     probe_disarm: Option<Arc<crate::bridge_filter_sideband::ProbeDisarm>>,
+    /// Σ.Q05.CHAIN — when true, the reader's masked→dense pass-rate
+    /// routing must STASH the bitmap (per-batch Arrow filter) instead
+    /// of discarding it above the REV.23 threshold. Set by the scan's
+    /// `execute()` when merging a CHAIN-INTERMEDIATE sideband's
+    /// predicates: a chain link's whole value is the rows it removes
+    /// from the NEXT link's build sample — a discarded bitmap silently
+    /// neuters the cascade (Q05: the 20%-pass nation/supplier blooms
+    /// sit above the 10% threshold). Chain intermediates are dim-sized
+    /// scans, so the per-batch filter cost is negligible. `false` (the
+    /// default, every other wrap): routing behavior unchanged.
+    apply_when_dense: bool,
 }
 
 impl BridgeFilter {
@@ -89,6 +100,7 @@ impl BridgeFilter {
             predicates,
             predicted_pass_rate: 0.5,
             probe_disarm: None,
+            apply_when_dense: false,
         }
     }
 
@@ -97,6 +109,19 @@ impl BridgeFilter {
     /// merging the sideband's published predicates.
     pub fn set_probe_disarm(&mut self, d: Arc<crate::bridge_filter_sideband::ProbeDisarm>) {
         self.probe_disarm = Some(d);
+    }
+
+    /// Σ.Q05.CHAIN — mark this filter as carrying a chain-intermediate
+    /// predicate whose bitmap must be APPLIED even when the pass-rate
+    /// routing picks the dense decode. See the field docs.
+    pub fn set_apply_when_dense(&mut self) {
+        self.apply_when_dense = true;
+    }
+
+    /// Σ.Q05.CHAIN — must the dense-routed bitmap be stashed (applied
+    /// per-batch) instead of discarded?
+    pub fn apply_when_dense(&self) -> bool {
+        self.apply_when_dense
     }
 
     /// L9.ADAPT Guard 2 — the attached disarm counters, if this filter
@@ -1818,6 +1843,7 @@ fn extract_bridge_filter(
         predicates: merged,
         predicted_pass_rate: 0.5,
         probe_disarm: None,
+        apply_when_dense: false,
     })
 }
 
@@ -2825,6 +2851,17 @@ pub struct EmatixFastParquetExec {
     /// upstream HashJoin has had a chance to populate it; matching
     /// predicates are merged into the BridgeFilter before decode.
     runtime_sideband: Option<crate::bridge_filter_sideband::BridgeFilterSideband>,
+    /// Σ.Q05.CHAIN (2026-07-02) — ADDITIONAL runtime sidebands beyond the
+    /// primary slot. The L9 cascade-chain pass can want a second bloom on a
+    /// scan whose primary slot is already taken by a pass-1 wrap (Q05 SF=10:
+    /// the o⋈l tight wrap holds lineitem's primary with an `l_orderkey`
+    /// bloom; the supplier-chain bloom on `l_suppkey` rides here). Extras
+    /// are STRICTLY best-effort: `execute()` peeks each once (no wait, no
+    /// late-arm, no disarm threading) and merges any published non-empty
+    /// predicates. A missed publish just means that pass runs without the
+    /// extra filter — correctness never depends on it (the join re-applies
+    /// every key). Empty in every pre-existing plan shape.
+    extra_runtime_sidebands: Vec<crate::bridge_filter_sideband::BridgeFilterSideband>,
     properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
 }
@@ -2868,6 +2905,7 @@ impl EmatixFastParquetExec {
             column_stats,
             column_has_no_nulls,
             runtime_sideband: None,
+            extra_runtime_sidebands: Vec::new(),
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
         })
@@ -2898,6 +2936,27 @@ impl EmatixFastParquetExec {
 
     pub fn runtime_sideband(&self) -> Option<&crate::bridge_filter_sideband::BridgeFilterSideband> {
         self.runtime_sideband.as_ref()
+    }
+
+    /// Σ.Q05.CHAIN — attach an ADDITIONAL runtime sideband (used when the
+    /// primary slot is already occupied by another wrap). Best-effort
+    /// consumption: `execute()` peeks it once with no wait and no
+    /// late-arm. Returns a fresh Arc<Self> like
+    /// [`Self::with_runtime_sideband`].
+    pub fn with_extra_runtime_sideband(
+        &self,
+        sideband: crate::bridge_filter_sideband::BridgeFilterSideband,
+    ) -> Arc<Self> {
+        let mut next = self.clone_internals();
+        next.extra_runtime_sidebands.push(sideband);
+        Arc::new(next)
+    }
+
+    /// Σ.Q05.CHAIN — the additional (non-primary) runtime sidebands.
+    pub fn extra_runtime_sidebands(
+        &self,
+    ) -> &[crate::bridge_filter_sideband::BridgeFilterSideband] {
+        &self.extra_runtime_sidebands
     }
 
     /// Full (unprojected) file schema. Σ.E5: needed by
@@ -3004,6 +3063,7 @@ impl EmatixFastParquetExec {
             column_stats: self.column_stats.clone(),
             column_has_no_nulls: self.column_has_no_nulls.clone(),
             runtime_sideband: self.runtime_sideband.clone(),
+            extra_runtime_sidebands: self.extra_runtime_sidebands.clone(),
             properties: self.properties.clone(),
             metrics: ExecutionPlanMetricsSet::new(),
         }))
@@ -3033,6 +3093,7 @@ impl EmatixFastParquetExec {
             column_stats: self.column_stats.clone(),
             column_has_no_nulls: self.column_has_no_nulls.clone(),
             runtime_sideband: self.runtime_sideband.clone(),
+            extra_runtime_sidebands: self.extra_runtime_sidebands.clone(),
             properties: self.properties.clone(),
             metrics: ExecutionPlanMetricsSet::new(),
         })
@@ -3054,6 +3115,7 @@ impl EmatixFastParquetExec {
             column_stats: self.column_stats.clone(),
             column_has_no_nulls: self.column_has_no_nulls.clone(),
             runtime_sideband: self.runtime_sideband.clone(),
+            extra_runtime_sidebands: self.extra_runtime_sidebands.clone(),
             properties: self.properties.clone(),
             metrics: ExecutionPlanMetricsSet::new(),
         }
@@ -3236,6 +3298,7 @@ impl ExecutionPlan for EmatixFastParquetExec {
         // to first poll.
         let base_filter = self.filter.clone();
         let runtime_sideband = self.runtime_sideband.clone();
+        let extra_runtime_sidebands = self.extra_runtime_sidebands.clone();
         let column_stats = self.column_stats.clone();
         let trace_l9 = std::env::var("EMAT_L9_TRACE").ok().as_deref() == Some("1");
         let late_mat = self.late_mat;
@@ -3250,7 +3313,8 @@ impl ExecutionPlan for EmatixFastParquetExec {
         // SF=10 even when the sideband was None; that's pure waste
         // for plans that can't benefit. So: if there's no sideband,
         // skip the wrapper entirely and use the original eager path.
-        if runtime_sideband.is_none() {
+        // Σ.Q05.CHAIN — extras also require the deferred-peek wrapper.
+        if runtime_sideband.is_none() && extra_runtime_sidebands.is_empty() {
             let stream = build_partition_stream_dispatch(
                 path,
                 decode_schema.clone(),
@@ -3391,6 +3455,48 @@ impl ExecutionPlan for EmatixFastParquetExec {
                         // doesn't prune (payoff unproven at plan time).
                         if sb.tight_admitted() {
                             bf.set_probe_disarm(sb.probe_disarm_handle());
+                        }
+                        // Σ.Q05.CHAIN — intermediate chain links must
+                        // actually prune (the next link samples this
+                        // scan's output); tell the reader to keep the
+                        // bitmap even above the dense-route threshold.
+                        if sb.chain_intermediate() {
+                            bf.set_apply_when_dense();
+                        }
+                        let p = bf.estimate_pass_rate(&column_stats_for_async);
+                        filter = Some(bf.with_predicted_pass_rate(p));
+                    }
+                }
+            }
+            // Σ.Q05.CHAIN — additional sidebands (cascade extras). Best
+            // effort by design: peek once, no wait, no late-arm, no disarm
+            // threading (the primary keeps Guard 2 when it has one; with
+            // both merged into the same probe list the disarm judges their
+            // JOINT marginal pass-rate, which is the conservative
+            // direction). A not-yet-published extra just means this pass
+            // runs without that filter — the join re-applies every key so
+            // correctness never depends on the peek landing.
+            for esb in extra_runtime_sidebands.iter() {
+                let peeked = esb.peek();
+                if trace_l9 {
+                    let path_short = std::path::Path::new(&path_for_async)
+                        .file_name()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| path_for_async.clone());
+                    eprintln!(
+                        "[L9-trace] {path_short} p={partition} extra-sideband peek={}",
+                        match &peeked {
+                            Some(preds) => format!("Some(len={})", preds.len()),
+                            None => "None (bloom not published)".to_string(),
+                        }
+                    );
+                }
+                if let Some(preds) = peeked {
+                    if !preds.is_empty() {
+                        let mut bf = filter.unwrap_or_else(|| BridgeFilter::new(Vec::new()));
+                        bf.extend(preds);
+                        if esb.chain_intermediate() {
+                            bf.set_apply_when_dense();
                         }
                         let p = bf.estimate_pass_rate(&column_stats_for_async);
                         filter = Some(bf.with_predicted_pass_rate(p));
