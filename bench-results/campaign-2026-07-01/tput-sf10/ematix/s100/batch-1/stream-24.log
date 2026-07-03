@@ -1,0 +1,77 @@
+=== TPC-H 22 triangulation bench ===
+    data:    /Users/ryanevans/RustroverProjects/ematix-flow/examples/tpch/data/sf10
+    queries: 22 ([22, 17, 14, 10, 9, 16, 4, 8, 1, 5, 3, 12, 2, 15, 11, 18, 21, 20, 7, 6, 19, 13])
+    trials:  1 (after 0 warmups)
+    output:  /Users/ryanevans/RustroverProjects/ematix-flow/bench-results/campaign-2026-07-01/tput-sf10/ematix/s100/batch-1/stream-24.md
+
+    NOTE: single-invocation output is SMOKE-GRADE only. For win/loss
+    claims use scripts/bench/strict_22q.sh / strict_ab.sh /
+    strict_throughput.sh (see scripts/bench/README.md).
+
+--- Q22 ---
+  ematix-flow   270.89 ms ±  0.00  (7 rows)
+
+--- Q17 ---
+  ematix-flow   666.48 ms ±  0.00  (1 rows)
+
+--- Q14 ---
+  ematix-flow   409.54 ms ±  0.00  (1 rows)
+
+--- Q10 ---
+  ematix-flow  3708.94 ms ±  0.00  (381105 rows)
+
+--- Q09 ---
+  ematix-flow  12633.46 ms ±  0.00  (175 rows)
+
+--- Q16 ---
+  ematix-flow  1476.25 ms ±  0.00  (27840 rows)
+
+--- Q04 ---
+  ematix-flow  1683.85 ms ±  0.00  (5 rows)
+
+--- Q08 ---
+  ematix-flow  3982.38 ms ±  0.00  (2 rows)
+
+--- Q01 ---
+  ematix-flow  4200.35 ms ±  0.00  (4 rows)
+
+--- Q05 ---
+  ematix-flow  7853.83 ms ±  0.00  (5 rows)
+
+--- Q03 ---
+  ematix-flow  2625.30 ms ±  0.00  (114003 rows)
+
+--- Q12 ---
+  ematix-flow  1808.64 ms ±  0.00  (2 rows)
+
+--- Q02 ---
+  ematix-flow   566.25 ms ±  0.00  (4667 rows)
+
+--- Q15 ---
+  ematix-flow   532.10 ms ±  0.00  (1 rows)
+
+--- Q11 ---
+  ematix-flow   657.68 ms ±  0.00  (8685 rows)
+
+--- Q18 ---
+  ematix-flow  9626.20 ms ±  0.00  (624 rows)
+
+--- Q21 ---
+  ematix-flow  13338.98 ms ±  0.00  (4009 rows)
+
+--- Q20 ---
+  ematix-flow  4066.29 ms ±  0.00  (1804 rows)
+
+--- Q07 ---
+  ematix-flow  4207.97 ms ±  0.00  (4 rows)
+
+--- Q06 ---
+  ematix-flow  2016.26 ms ±  0.00  (1 rows)
+
+--- Q19 ---
+  ematix-flow  1026.08 ms ±  0.00  (1 rows)
+
+--- Q13 ---
+  ematix-flow  2185.68 ms ±  0.00  (46 rows)
+
+wrote /Users/ryanevans/RustroverProjects/ematix-flow/bench-results/campaign-2026-07-01/tput-sf10/ematix/s100/batch-1/stream-24.md

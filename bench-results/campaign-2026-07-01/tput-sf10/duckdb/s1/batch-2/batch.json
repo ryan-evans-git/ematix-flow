@@ -1,0 +1,10 @@
+{
+  "engine": "duckdb",
+  "sf": 10,
+  "streams": 1,
+  "batch": 2,
+  "makespan_ms": 3633,
+  "stream_failures": 0,
+  "thermal_pre": "nominal",
+  "thermal_post": "nominal"
+}

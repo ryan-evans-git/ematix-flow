@@ -1,0 +1,10 @@
+{
+  "engine": "ematix",
+  "sf": 10,
+  "streams": 1,
+  "batch": 1,
+  "makespan_ms": 2967,
+  "stream_failures": 0,
+  "thermal_pre": "nominal",
+  "thermal_post": "nominal"
+}

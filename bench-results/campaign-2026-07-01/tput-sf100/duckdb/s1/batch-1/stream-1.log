@@ -1,0 +1,77 @@
+=== TPC-H 22 triangulation bench ===
+    data:    /Users/ryanevans/RustroverProjects/ematix-flow/examples/tpch/data/sf100
+    queries: 22 ([20, 6, 14, 10, 21, 22, 12, 13, 1, 17, 2, 18, 7, 11, 8, 15, 16, 4, 9, 3, 19, 5])
+    trials:  1 (after 0 warmups)
+    output:  /Users/ryanevans/RustroverProjects/ematix-flow/bench-results/campaign-2026-07-01/tput-sf100/duckdb/s1/batch-1/stream-1.md
+
+    NOTE: single-invocation output is SMOKE-GRADE only. For win/loss
+    claims use scripts/bench/strict_22q.sh / strict_ab.sh /
+    strict_throughput.sh (see scripts/bench/README.md).
+
+--- Q20 ---
+  DuckDB       1731.99 ms ±  0.00  (17971 rows)
+
+--- Q06 ---
+  DuckDB        746.71 ms ±  0.00  (1 rows)
+
+--- Q14 ---
+  DuckDB       1041.38 ms ±  0.00  (1 rows)
+
+--- Q10 ---
+  DuckDB       2171.42 ms ±  0.00  (3884218 rows)
+
+--- Q21 ---
+  DuckDB       4560.09 ms ±  0.00  (39950 rows)
+
+--- Q22 ---
+  DuckDB        567.70 ms ±  0.00  (7 rows)
+
+--- Q12 ---
+  DuckDB       1133.48 ms ±  0.00  (2 rows)
+
+--- Q13 ---
+  DuckDB       2310.48 ms ±  0.00  (45 rows)
+
+--- Q01 ---
+  DuckDB       2545.74 ms ±  0.00  (4 rows)
+
+--- Q17 ---
+  DuckDB       1507.52 ms ±  0.00  (1 rows)
+
+--- Q02 ---
+  DuckDB        510.10 ms ±  0.00  (47107 rows)
+
+--- Q18 ---
+  DuckDB       2269.59 ms ±  0.00  (6398 rows)
+
+--- Q07 ---
+  DuckDB       1564.28 ms ±  0.00  (4 rows)
+
+--- Q11 ---
+  DuckDB        253.29 ms ±  0.00  (92698 rows)
+
+--- Q08 ---
+  DuckDB       1914.86 ms ±  0.00  (2 rows)
+
+--- Q15 ---
+  DuckDB        923.38 ms ±  0.00  (1 rows)
+
+--- Q16 ---
+  DuckDB        374.74 ms ±  0.00  (27840 rows)
+
+--- Q04 ---
+  DuckDB        898.55 ms ±  0.00  (5 rows)
+
+--- Q09 ---
+  DuckDB       4849.32 ms ±  0.00  (175 rows)
+
+--- Q03 ---
+  DuckDB       1855.22 ms ±  0.00  (1131041 rows)
+
+--- Q19 ---
+  DuckDB       2446.84 ms ±  0.00  (1 rows)
+
+--- Q05 ---
+  DuckDB       1774.03 ms ±  0.00  (5 rows)
+
+wrote /Users/ryanevans/RustroverProjects/ematix-flow/bench-results/campaign-2026-07-01/tput-sf100/duckdb/s1/batch-1/stream-1.md
