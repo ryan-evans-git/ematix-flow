@@ -28,6 +28,10 @@
 #                [--env-a "OTHER=VAL"] [--plan-cache on|off]
 #                [--cache-policy warm|cold] [--isolate]
 #                [--queries "1,6,14"] [--triangulate] [--out PATH]
+#                [--bin-a PATH] [--bin-b PATH]
+#
+# Binary A/B: pass --bin-a/--bin-b to compare two builds (e.g. pre/post a
+# rule change with no toggle flag). Either --env-b or --bin-b must be given.
 #
 # Outputs:
 #   $OUT/A/run-{1..N}.md  $OUT/A/strict-22q-summary.md
@@ -48,6 +52,8 @@ PLAN_CACHE="off"
 CACHE_POLICY="warm"
 ENV_A=""
 ENV_B=""
+BIN_A=""
+BIN_B=""
 QUERIES=""                 # comma-separated query IDs; empty = all 22
 OUT="/tmp/strict-ab-$(date +%Y%m%d-%H%M%S)"
 
@@ -68,6 +74,8 @@ while [[ $# -gt 0 ]]; do
         --cache-policy) CACHE_POLICY="$2"; shift 2 ;;
         --env-a) ENV_A="$2"; shift 2 ;;
         --env-b) ENV_B="$2"; shift 2 ;;
+        --bin-a) BIN_A="$2"; shift 2 ;;
+        --bin-b) BIN_B="$2"; shift 2 ;;
         --queries) QUERIES="$2"; shift 2 ;;
         --out) OUT="$2"; shift 2 ;;
         -h|--help) usage; exit 0 ;;
@@ -75,8 +83,8 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-if [[ -z "$ENV_B" ]]; then
-    echo "ERROR: --env-b is required (the variant being tested)" >&2
+if [[ -z "$ENV_B" && -z "$BIN_B" ]]; then
+    echo "ERROR: --env-b or --bin-b is required (the variant being tested)" >&2
     usage
     exit 2
 fi
@@ -90,10 +98,14 @@ source "$REPO/scripts/bench/strict_common.sh"
 BIN="$REPO/target/release/examples/tpch_triangulation_bench"
 DATA="$REPO/examples/tpch/data/sf$SF"
 
-if [[ ! -x "$BIN" ]]; then
-    echo "ERROR: bench binary not found at $BIN" >&2
-    exit 1
-fi
+BIN_A="${BIN_A:-$BIN}"
+BIN_B="${BIN_B:-$BIN}"
+for b in "$BIN_A" "$BIN_B"; do
+    if [[ ! -x "$b" ]]; then
+        echo "ERROR: bench binary not found at $b" >&2
+        exit 1
+    fi
+done
 if [[ ! -d "$DATA" ]]; then
     echo "ERROR: SF=$SF data dir not found at $DATA" >&2
     exit 1
@@ -125,11 +137,12 @@ QUERY_LIST="${QUERIES:-$(seq -s, 1 22)}"
 capture_env "$OUT" "sf=$SF" "plan_cache=$PLAN_CACHE" \
     "cache_policy=$CACHE_POLICY" "isolate=$ISOLATE" \
     "triangulate=$TRIANGULATE" "trials=$TRIALS" "warmups=$WARMUPS" \
-    "invocations=$INVOCATIONS" "env_a=${ENV_A:-none}" "env_b=$ENV_B"
+    "invocations=$INVOCATIONS" "env_a=${ENV_A:-none}" "env_b=${ENV_B:-none}" \
+    "bin_a=$BIN_A" "bin_b=$BIN_B"
 
 # Run the binary once for (mode, queries, out_file).
 invoke_bin() {
-    local extra_env="$1" queries="$2" out_file="$3"
+    local extra_env="$1" queries="$2" out_file="$3" the_bin="$4"
     local env_arr=("${COMMON_ENV[@]}" "TPCH_QUERIES=$queries" "TPCH_OUT=$out_file")
     if [[ -n "$extra_env" ]]; then
         # shellcheck disable=SC2206
@@ -137,7 +150,7 @@ invoke_bin() {
         env_arr+=("${extra_arr[@]}")
     fi
     caffeinate -i taskpolicy -a \
-        /usr/bin/env "${env_arr[@]}" "$BIN" \
+        /usr/bin/env "${env_arr[@]}" "$the_bin" \
         2>&1 | tail -1
 }
 
@@ -146,6 +159,8 @@ run_one() {
     local mode="$1" idx="$2"
     local extra_env="$3"
     local out_file="$OUT/$mode/run-$idx.md"
+    local mode_bin="$BIN_A"
+    if [[ "$mode" == "B" ]]; then mode_bin="$BIN_B"; fi
     echo "  → mode $mode invocation $idx → $out_file"
 
     thermal_wait 120
@@ -159,13 +174,13 @@ run_one() {
             if [[ "$CACHE_POLICY" == "cold" ]]; then
                 apply_cache_policy cold >/dev/null
             fi
-            invoke_bin "$extra_env" "$q" "$tmp_q" >/dev/null
+            invoke_bin "$extra_env" "$q" "$tmp_q" "$mode_bin" >/dev/null
             cat "$tmp_q" >> "$out_file"
             echo >> "$out_file"
             rm -f "$tmp_q"
         done
     else
-        invoke_bin "$extra_env" "$QUERY_LIST" "$out_file"
+        invoke_bin "$extra_env" "$QUERY_LIST" "$out_file" "$mode_bin"
     fi
 }
 

@@ -306,3 +306,16 @@ The campaign REPORT's Q18 SF=100 row (−1510 ms, and the Σ-medians it
 feeds) should be re-measured under the strict protocol with the fixed
 binary before it is quoted further; the pending strict-protocol
 rebaseline covers this.
+
+### Stage 2 strict verdict (2026-07-02, post-merge 90e6c7c)
+
+Strict interleaved binary A/B (ec9e464 vs Stage-2 main, SF=100, isolate,
+4 pairs × 10 trials): **−371.9 ms (−15.5%), clear WIN** (2400.4 →
+2028.5 ms, 2σ bar 109.8). Fresh same-session DuckDB solo: 2384.5 ms.
+**Q18 SF=100 flips to a clear ematix win (+356 ms ahead).**
+Results: `bench-results/q18-stage2-2026-07-02/`. Note: an earlier A/B
+accidentally compared the stale ec9e464 binary against itself (masked
+cargo failure — the example needs `--features triangulation`); that run
+is preserved evidence of the same-binary noise floor: Q18 SF=100 solo
+invocations are bimodal (~2500/~2880 ms), so interleaved A/B is
+mandatory for verdicts here.
