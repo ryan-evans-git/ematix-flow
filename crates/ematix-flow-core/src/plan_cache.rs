@@ -93,6 +93,14 @@ struct PlanCacheInner {
 struct CacheKey {
     sql_canonical: String,
     schema_epoch: u64,
+    /// Concurrency-aware partitions (campaign-2026-07-01 §3):
+    /// `target_partitions` is baked into the cached physical template
+    /// (RepartitionExec fan-outs, per-partition operators), and with
+    /// `EMAT_TARGET_PARTITIONS` AUTO sensing the session's value can
+    /// change across ctx builds within one process. Keying on it keeps
+    /// a template planned at one partition count from being replayed
+    /// into a session running at another.
+    target_partitions: usize,
 }
 
 impl PlanCache {
@@ -139,7 +147,7 @@ impl PlanCache {
         ctx: &SessionContext,
         sql: &str,
     ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
-        let key = self.key_for(sql);
+        let key = self.key_for(ctx, sql);
         // Σ.AG.2 (2026-05-26): fast path — rebuild the cached
         // PhysicalPlan template by bottom-up `with_new_children`.
         // Each operator's constructor creates a fresh node with no
@@ -177,11 +185,13 @@ impl PlanCache {
         rebuild_plan_tree(&physical)
     }
 
-    fn key_for(&self, sql: &str) -> CacheKey {
+    fn key_for(&self, ctx: &SessionContext, sql: &str) -> CacheKey {
+        let target_partitions = ctx.copied_config().target_partitions();
         let inner = self.inner.lock().unwrap();
         CacheKey {
             sql_canonical: canonicalise_sql(sql),
             schema_epoch: inner.schema_epoch,
+            target_partitions,
         }
     }
 
@@ -460,6 +470,47 @@ mod tests {
         // misses: 1, 2, 3, then re-1 = 4
         assert_eq!(m, 4);
         assert_eq!(h, 0);
+    }
+
+    /// Concurrency-aware partitions: the same SQL planned under
+    /// sessions with different `target_partitions` must occupy
+    /// DIFFERENT cache entries — a physical template planned at one
+    /// partition count is wrong for a session at another (the
+    /// EMAT_TARGET_PARTITIONS AUTO count can change between ctx builds
+    /// within one process).
+    #[tokio::test]
+    async fn different_target_partitions_get_different_entries() {
+        use datafusion::prelude::SessionConfig;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+        let mk_ctx = |tp: usize| {
+            let ctx =
+                SessionContext::new_with_config(SessionConfig::new().with_target_partitions(tp));
+            let mt = MemTable::try_new(schema.clone(), vec![vec![batch.clone()]]).unwrap();
+            ctx.register_table("t", Arc::new(mt)).unwrap();
+            ctx
+        };
+        let ctx2 = mk_ctx(2);
+        let ctx4 = mk_ctx(4);
+
+        let cache = PlanCache::new();
+        let _ = cache.get_or_plan(&ctx2, "SELECT * FROM t").await.unwrap();
+        let _ = cache.get_or_plan(&ctx4, "SELECT * FROM t").await.unwrap();
+        let (h, m) = cache.stats();
+        assert_eq!(h, 0, "different partition counts must not cross-hit");
+        assert_eq!(m, 2);
+
+        // Same-ctx repeats still hit their own entries.
+        let _ = cache.get_or_plan(&ctx2, "SELECT * FROM t").await.unwrap();
+        let _ = cache.get_or_plan(&ctx4, "SELECT * FROM t").await.unwrap();
+        let (h, m) = cache.stats();
+        assert_eq!(h, 2);
+        assert_eq!(m, 2);
     }
 
     #[test]

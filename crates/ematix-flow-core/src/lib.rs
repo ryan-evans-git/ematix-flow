@@ -428,6 +428,11 @@ pub mod mysql_backend;
 // PyO3 dependency. Glue Schema Registry decode + future warehouse
 // pipeline execution both route through this.
 pub mod objectstore_backend;
+// Concurrency-aware target_partitions (campaign-2026-07-01 §3 fix):
+// cross-process PID registry + the EMAT_TARGET_PARTITIONS tri-state so
+// N concurrent ematix processes stop oversubscribing cores N-fold.
+// Applied by the preset path (see preset::with_optimizer_rules_overridden).
+pub mod partition_registry;
 pub mod pg;
 pub mod py_callbacks;
 // Task #559 final slice: Rust-side invoker for warehouse-pipeline

@@ -92,6 +92,23 @@ Unrecognized values (e.g. `=yes`) mean AUTO, not ON.
 legacy per-predicate re-decode — fixed in `BridgeFilter::eval_on_decoded_views`
 (widened i32 binding, 2026-07-02). Re-A/B before promoting it.
 
+## Concurrency-aware partitions (tri-state)
+
+The campaign-2026-07-01 §3 throughput fix: under N concurrent ematix
+processes, per-process `target_partitions = cores` oversubscribes the
+box N-fold (SF10 s10: 3.5× QPH collapse vs DuckDB; `PARTITIONS=2`
+recovered it). Owner: [partition_registry.rs](../crates/ematix-flow-core/src/partition_registry.rs),
+applied by the preset path (`preset::with_optimizer_rules_overridden`)
+whenever the session config still carries the DataFusion default.
+
+| Flag | Default | Value/Notes | Owner file | Purpose |
+| --- | --- | --- | --- | --- |
+| `EMAT_TARGET_PARTITIONS` | **AUTO** (tri-state) | `=N` (N≥1) force `target_partitions=N`; `=0` legacy `available_parallelism()`; unset/unrecognized = AUTO — register in the cross-process PID registry and use `clamp(cores / live_ematix_processes, 2, cores)`. Solo process ⇒ full cores (bit-identical to legacy). Any registry failure degrades silently to legacy. The TPC-H harnesses' explicit `PARTITIONS=N` env takes precedence over this flag. | [partition_registry.rs](../crates/ematix-flow-core/src/partition_registry.rs) | Concurrency-aware per-process partition count. |
+| `EMAT_PARTITION_REGISTRY_DIR` | `$TMPDIR/ematix-partition-registry` | path | [partition_registry.rs](../crates/ematix-flow-core/src/partition_registry.rs) | Registry directory override (test isolation / shared-tmpdir hygiene). |
+
+Observability: set `EMAT_DEBUG=<anything>` for a one-line stderr trace
+of the resolution (`pid`, mode, live count, cores, chosen value).
+
 ## Production gate (opt-in)
 
 Read in `src/`, default-OFF. Enable with `=1` (or, where noted, presence).

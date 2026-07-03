@@ -1336,14 +1336,20 @@ async fn build_ematix_ctx(
     //   "v040"                  — dict + multi + sum (matches v0.4.0)
     //   "dedupe"                — dedupe only
     let rules = std::env::var("EMAT_RULES").unwrap_or_else(|_| "all".to_string());
+    // Concurrency-aware partitions (campaign-2026-07-01 §3): explicit
+    // `PARTITIONS=N` keeps absolute precedence (back-compat with every
+    // recorded bench invocation); otherwise resolve through the
+    // library's `EMAT_TARGET_PARTITIONS` tri-state (`=N` force, `=0`
+    // legacy available_parallelism, unset = AUTO cross-process
+    // sensing — a solo process still resolves to full cores). The
+    // harness resolves HERE, so the preset's own auto hook is disabled
+    // below (`auto_target_partitions: false`) and nothing can
+    // second-guess the PARTITIONS override.
     let session_partitions: usize = std::env::var("PARTITIONS")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or_else(|| {
-            std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(14)
-        });
+        .filter(|&n| n >= 1)
+        .unwrap_or_else(ematix_flow_core::partition_registry::resolve_target_partitions);
     // Σ.AΩ Phase 1.2 (2026-05-28): per-query target_partitions override.
     // When the plan-time recommender (auto_target_partitions) detects a
     // high-cardinality GROUP BY aggregate, the override raises this
@@ -1390,6 +1396,9 @@ async fn build_ematix_ctx(
     // bench-measured Q05 plans lacked the pass-1 L9 lineitem wrap
     // production produces).
     let overrides = ematix_flow_core::preset::HarnessOverrides {
+        // Partitions already resolved above (PARTITIONS > tri-state);
+        // the preset must not re-resolve at a different instant.
+        auto_target_partitions: false,
         // EMAT_RULES subsets ("all"/"none"/"v040"/"dedupe"/"swap").
         dedupe_aggregate: matches!(rules.as_str(), "all" | "dedupe"),
         inject_fused_rules: matches!(rules.as_str(), "all" | "v040"),
@@ -1748,9 +1757,11 @@ fn write_benchmarks_md(
     writeln!(
         s,
         "- DuckDB runs at default settings (in-memory `read_parquet` views). \
-         ematix-flow runs with `target_partitions = std::thread::available_parallelism()` \
-         (override via `PARTITIONS=N`) and the InjectFusedQ1/Q3/Q5/Q6/Q12 + \
-         EnableDictGroupCount physical-optimizer rules registered."
+         ematix-flow's `target_partitions` resolves as: explicit `PARTITIONS=N`, \
+         else the `EMAT_TARGET_PARTITIONS` tri-state (`=N` force, `=0` legacy \
+         `available_parallelism()`, unset = AUTO cross-process sensing — solo \
+         processes get full cores). The InjectFusedQ1/Q3/Q5/Q6/Q12 + \
+         EnableDictGroupCount physical-optimizer rules are registered."
     )
     .unwrap();
 

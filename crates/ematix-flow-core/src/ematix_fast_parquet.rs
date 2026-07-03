@@ -5210,11 +5210,18 @@ mod tests {
     /// Multi-RG file (3 RGs) so the dispatch routes to the eager
     /// `EmatArrowBatchReader` (single-RG files route to the page-
     /// streaming reader, which deliberately stays on decode-wide).
+    /// Serializes the two tests that toggle the process-global
+    /// `EMAT_NARROW_KEY_DECODE` env var. Their fire-counter assertions
+    /// break if a sibling test clears the var mid-window (the parallel
+    /// runner interleaves them; observed as "counter 6 → 6" flakes).
+    static NARROW_KEY_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     #[tokio::test]
     async fn narrow_key_decode_flag_toggles_path_with_identical_results() {
         use ematix_parquet_codec::write::{ColumnData, write_table_to_path_with_row_group_size};
         use ematix_parquet_format::types::CompressionCodec;
 
+        let _env_guard = NARROW_KEY_ENV_LOCK.lock().await;
         let dir = std::env::temp_dir().join(format!("narrow_flag_{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("t.parquet");
@@ -5401,6 +5408,7 @@ mod tests {
     /// flag (same policy as `examples/tpch_validate.rs`).
     #[tokio::test]
     async fn narrow_key_decode_q09_identity_on_off() {
+        let _env_guard = NARROW_KEY_ENV_LOCK.lock().await;
         // Resolve the data dir (real SF=1 via TPCH_DATA_DIR / workspace
         // layout, else mini fixture).
         let (dir, mini): (std::path::PathBuf, bool) = {

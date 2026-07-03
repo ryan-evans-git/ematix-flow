@@ -156,6 +156,16 @@ pub fn with_optimizer_rules_and_registry(
 #[derive(Debug, Clone)]
 pub struct HarnessOverrides {
     // ---- production-member opt-outs (true = install; all true in production) ----
+    /// Concurrency-aware `target_partitions` (campaign-2026-07-01 §3):
+    /// when the builder's config still carries the DataFusion default
+    /// (`available_parallelism()`), resolve it through
+    /// [`crate::partition_registry::resolve_target_partitions`]
+    /// (`EMAT_TARGET_PARTITIONS` tri-state + cross-process AUTO
+    /// sensing). A solo process resolves to `available_parallelism()`,
+    /// so single-process behavior is bit-identical. Harnesses that
+    /// resolve partitions themselves (bench `PARTITIONS` precedence)
+    /// set this `false` so the preset never second-guesses them.
+    pub auto_target_partitions: bool,
     /// `DedupeAggregateForFloatDeterminism` (bench: `EMAT_RULES=all|dedupe`).
     pub dedupe_aggregate: bool,
     /// The Σ.D/Σ.E inject trio: `EnableDictGroupCountRule` +
@@ -241,6 +251,7 @@ impl Default for HarnessOverrides {
     /// no replacements, no diagnostics.
     fn default() -> Self {
         Self {
+            auto_target_partitions: true,
             dedupe_aggregate: true,
             inject_fused_rules: true,
             swap_semi_join_build: true,
@@ -289,6 +300,14 @@ pub fn with_optimizer_rules_overridden(
 ) -> (SessionStateBuilder, HarnessHandles) {
     let registry = Arc::new(SharedSubtreeRegistry::new());
     let mut builder = builder;
+    // Concurrency-aware target_partitions (campaign-2026-07-01 §3):
+    // runs FIRST so the resolved partition count is in place before any
+    // rule or planner reads the config. Only rewrites a config still at
+    // the DataFusion default (available_parallelism()) — an explicit
+    // caller `with_target_partitions(k != cores)` is always preserved.
+    if o.auto_target_partitions {
+        builder = apply_concurrency_aware_target_partitions(builder);
+    }
     if o.dedupe_aggregate {
         builder = builder.with_physical_optimizer_rule(Arc::new(
             DedupeAggregateForFloatDeterminism::with_registry(registry.clone()),
@@ -505,6 +524,32 @@ pub fn with_optimizer_rules_overridden(
     )
 }
 
+/// Concurrency-aware `target_partitions` for the preset path
+/// (campaign-2026-07-01 §3): if the builder's `SessionConfig` still
+/// carries DataFusion's eager default (`available_parallelism()` —
+/// indistinguishable from a caller explicitly choosing full cores),
+/// replace it with [`crate::partition_registry::resolve_target_partitions`]:
+/// `EMAT_TARGET_PARTITIONS=N` forces N, `=0` keeps legacy full cores,
+/// unset senses live ematix processes and resolves
+/// `clamp(cores / live, 2, cores)`. A solo process resolves to `cores`,
+/// leaving the config bit-identical. Registry failures degrade silently
+/// to legacy (the resolver's contract) — this function never panics.
+fn apply_concurrency_aware_target_partitions(
+    mut builder: SessionStateBuilder,
+) -> SessionStateBuilder {
+    let cores = crate::partition_registry::available_cores();
+    let cfg = builder
+        .config()
+        .get_or_insert_with(datafusion::prelude::SessionConfig::new);
+    if cfg.target_partitions() == cores {
+        let resolved = crate::partition_registry::resolve_target_partitions();
+        if resolved >= 1 && resolved != cores {
+            cfg.options_mut().execution.target_partitions = resolved;
+        }
+    }
+    builder
+}
+
 /// Register a parquet file as a table on `ctx` via
 /// `EmatixFastParquetTableProvider` with dict preservation enabled.
 ///
@@ -648,6 +693,48 @@ mod tests {
             format!("{:?}", over.query_planner()),
         );
         assert!(handles.bloom_pushdown.is_none());
+    }
+
+    /// Concurrency-aware partitions: an explicit, non-default
+    /// `with_target_partitions(k)` must survive the preset untouched
+    /// (the auto hook only rewrites the DataFusion-default config), and
+    /// `auto_target_partitions: false` must leave ANY config untouched
+    /// — the harnesses rely on that for `PARTITIONS` precedence.
+    #[test]
+    fn explicit_target_partitions_survive_preset() {
+        let cores = crate::partition_registry::available_cores();
+        // Pick an explicit value that cannot collide with the default.
+        let explicit = if cores == 4 { 3 } else { 4 };
+
+        // auto ON (production default): explicit non-default preserved.
+        let state = with_optimizer_rules(
+            SessionStateBuilder::new()
+                .with_config(SessionConfig::new().with_target_partitions(explicit))
+                .with_default_features(),
+        )
+        .build();
+        assert_eq!(
+            state.config().target_partitions(),
+            explicit,
+            "explicit non-default target_partitions must never be rewritten"
+        );
+
+        // auto OFF (harness mode): even a config at the default
+        // (available_parallelism) is left alone.
+        let (builder, _handles) = with_optimizer_rules_overridden(
+            SessionStateBuilder::new()
+                .with_config(SessionConfig::new().with_target_partitions(cores))
+                .with_default_features(),
+            &HarnessOverrides {
+                auto_target_partitions: false,
+                ..HarnessOverrides::default()
+            },
+        );
+        assert_eq!(
+            builder.build().config().target_partitions(),
+            cores,
+            "auto_target_partitions: false must leave the config untouched"
+        );
     }
 
     fn sf1_lineitem() -> Option<String> {
