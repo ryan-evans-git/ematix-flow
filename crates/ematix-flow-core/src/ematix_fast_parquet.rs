@@ -3076,6 +3076,50 @@ impl EmatixFastParquetExec {
         next.assignments = assignments;
         Arc::new(next)
     }
+
+    /// RANGE.AGG Stage 2 — like [`Self::with_assignments`], but the
+    /// rebuilt scan ADVERTISES `Partitioning::Hash(hash_exprs, n)`
+    /// instead of `UnknownPartitioning(n)`.
+    ///
+    /// This is a deliberate over-claim: the chunks are KEY-DISJOINT
+    /// (planned at strict row-group key gaps), not hash-distributed.
+    /// For a hash-distribution CONSUMER the claim is row-correct —
+    /// all HashPartitioned promises is that every distinct key's rows
+    /// land in exactly one partition, which key-disjoint chunking
+    /// guarantees — so `EnforceDistribution` accepts the scan as
+    /// direct input to an `AggregateExec(SinglePartitioned)` without
+    /// inserting a full-input hash shuffle (Q18 SF=100: 600M rows /
+    /// ~9.6 GB saved).
+    ///
+    /// SAFETY CONTRACT: the claim must NOT propagate past the
+    /// aggregation it feeds. Chunk boundaries do not coincide with
+    /// hash buckets, so a partitioned HashJoin that paired these
+    /// partitions with genuinely hash-repartitioned partitions of its
+    /// other side would silently drop matches. The caller
+    /// (`ClusteredSinglePhaseAggRule`) caps the rewritten aggregate
+    /// with a [`crate::partition_claim_reset_exec::PartitionClaimResetExec`]
+    /// so everything above sees `UnknownPartitioning` again. Do not
+    /// use this constructor without an equivalent cap.
+    ///
+    /// The equivalence properties are rebuilt fresh from the schema
+    /// (same as `with_assignments`) so no ordering/equivalence claims
+    /// are derived from the false hash claim.
+    pub fn with_assignments_claiming_hash(
+        &self,
+        assignments: Vec<Vec<usize>>,
+        hash_exprs: Vec<Arc<dyn datafusion::physical_expr::PhysicalExpr>>,
+    ) -> Arc<Self> {
+        let mut next = self.clone_internals();
+        let eq_props = EquivalenceProperties::new(next.schema.clone());
+        next.properties = Arc::new(PlanProperties::new(
+            eq_props,
+            Partitioning::Hash(hash_exprs, assignments.len().max(1)),
+            EmissionType::Incremental,
+            Boundedness::Bounded,
+        ));
+        next.assignments = assignments;
+        Arc::new(next)
+    }
 }
 
 impl DisplayAs for EmatixFastParquetExec {

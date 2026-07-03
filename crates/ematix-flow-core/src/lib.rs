@@ -54,6 +54,11 @@ pub mod emat_push_pipeline_exec;
 // + direct parallel combine (no shuffle). Opt-in via the swap rule.
 pub mod clustered_agg_rule;
 pub mod combine_agg_exec;
+// RANGE.AGG Stage 2 (2026-07-02): partitioning-reset pass-through that
+// caps the chunked scan's `Partitioning::Hash` claim at the rewritten
+// SinglePartitioned aggregate, so the (deliberately false) claim can
+// never leak into join planning above.
+pub mod partition_claim_reset_exec;
 // FD-aware SUM-agg kernel (Q10 SF=100 lever): row-encode an FD-minimal composite key
 // subset only, carry FD-determined group cols by first-occurrence + interleave gather.
 // Operator + opt-in rule build on this. Correct ONLY under the FD the rule proves.
