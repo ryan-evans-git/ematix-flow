@@ -44,3 +44,17 @@ Verdicts:
   inside the 4.7 ms bar). Needs a ~5 ms pipeline lever; fresh
   production-shape profile is the next step (the PERF_Q05 waste map
   predates the dim-semi splice).
+
+## 2026-07-03 evening addendum — thermal-soak invalidates late-day solo verdicts
+
+The Q05-lever battery's end-of-day full verdict pass measured BOTH
+engines ~20-25% slower than morning (ematix Q01 258→277→307 ms drift
+WITHIN the battery; DuckDB 242→295), with ematix's bandwidth-heavy
+queries (Q01/Q08/Q09) losing disproportionately on the soaked machine
+— producing 3 spurious "duckdb faster" verdicts that contradict the
+morning's tight-bar wins. Interleaved A/Bs are immune (drift cancels
+across arms) and remain authoritative for lever effects: the
+STATVEC/MEMO battery shows zero regressions at all scales + Q20
+−27 ms clear win. Engine-vs-engine verdicts require a SETTLED machine;
+a 1h-cooldown re-run supersedes the soaked pass
+(`q05-lever-2026-07-04/verdict-sf10-settled.md`).
