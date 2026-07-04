@@ -650,15 +650,24 @@ impl DeadLetterStore for KafkaTopicDlq {
     }
 
     /// Inexpressible on a topic — records cannot change state in
-    /// place. Poison-parking under a Kafka DLQ is a Phase 2 concern
-    /// (re-publish with attempt metadata or park into a table
-    /// store); returning `Unsupported` keeps the semantics honest.
+    /// place. The DLQ Phase 2 replay engine catches this typed
+    /// `Unsupported` and parks poison records into the pipeline's
+    /// table fallback store instead (see
+    /// `StreamingPipeline::run_dlq_replay`).
     async fn park(&self, _pipeline: &str, _ids: &[DlqRecordId]) -> Result<(), DlqError> {
         Err(DlqError::Unsupported(
             "KafkaTopicDlq cannot park records: a topic is an immutable log with \
              no per-record state. Use the table store for park semantics."
                 .into(),
         ))
+    }
+
+    /// The lease is process-local + group-offset based (see module
+    /// docs) — overlapping replays of the same pipeline must be
+    /// serialized one layer up. The replay engine honors this flag
+    /// with an in-process per-pipeline mutex.
+    fn replay_requires_serialization(&self) -> bool {
+        true
     }
 
     /// `All` → seek-to-end (commit end offsets for the replay
