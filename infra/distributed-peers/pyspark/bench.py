@@ -2,16 +2,18 @@
 """
 Phase B4: PySpark TPC-H benchmark runner.
 
-Runs the 22 canonical TPC-H queries against a Spark 3.5.4 standalone
-cluster reading single-file-per-table parquet from S3. Designed to be
-invoked from the master node only — `spark-submit` is *not* used; we
-attach to the cluster directly via a long-lived SparkSession.
+Runs the 22 canonical TPC-H queries against a Spark 4.x standalone
+cluster (4.1.2 as of the 2026-07-04 refresh; the reported version is
+read from the live SparkSession, not hardcoded) reading
+single-file-per-table parquet from S3. Designed to be invoked from the
+master node only — `spark-submit` is *not* used; we attach to the
+cluster directly via a long-lived SparkSession.
 
 Output schema (per the AWS campaign plan):
 
     {
       "engine": "pyspark",
-      "version": "3.5.4",
+      "version": "<spark.version at runtime>",
       "scale_factor": 10,
       "cluster_size": 4,
       "queries": {
@@ -49,6 +51,10 @@ import time
 from pathlib import Path
 from typing import Dict, List
 
+# Shared campaign provenance capture (instance type, AZ, git SHA, env).
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import provenance  # noqa: E402
+
 # Located at $REPO/examples/tpch/queries/q{NN}.sql. install.sh does not
 # clone the repo; in practice this script runs from a checkout on the
 # master node, so the queries dir is resolved relative to this file or
@@ -77,14 +83,20 @@ TPCH_TABLES = [
 # parses most of these as-is, but a couple of constructs need rewriting:
 #
 #   1. `substring(col from N for M)` (ANSI form, q22) → `substring(col, N, M)`
-#      Spark Catalyst doesn't recognise the ANSI `FROM ... FOR` syntax in this
-#      position.
-#   2. `interval '90' day` (q01) — Spark 3.5 accepts the quoted-numeral form,
-#      but we normalise to `interval 90 day` for robustness across minor
-#      versions.
+#      The 3-arg form is unambiguous and valid on every Spark line we've run
+#      (3.5 and 4.x), so the mechanical rewrite stays.
+#   2. `interval '90' day` (q01) → `interval 90 day`. Re-checked against
+#      Spark 4 (ANSI mode is ON by default since 4.0): BOTH forms parse and
+#      both produce a DayTimeIntervalType under ANSI intervals, so
+#      `date '1998-12-01' - interval 90 day` keeps its Date result. The
+#      normalisation is retained as a harmless cross-version constant.
 #
 # extract(year from ...), date literals, CTEs with column aliases, and NOT
-# EXISTS all work natively in Spark 3.5.
+# EXISTS all work natively in Spark 3.5 and 4.x. Note Spark 4 defaults
+# spark.sql.ansi.enabled=true — TPC-H has no silent-cast/overflow reliance,
+# so no behavioural delta is expected; if a query ever errors under ANSI,
+# investigate the query rather than switching ANSI off (the campaign
+# measures engines at their production defaults).
 
 _SUBSTRING_ANSI = re.compile(
     r"substring\s*\(\s*([^,)]+?)\s+from\s+(\d+)\s+for\s+(\d+)\s*\)",
@@ -102,6 +114,17 @@ def adapt_sql_for_spark(sql: str) -> str:
     sql = _INTERVAL_QUOTED.sub(r"interval \1 \2", sql)
     # Strip a trailing semicolon — spark.sql() chokes on it.
     return sql.strip().rstrip(";").strip()
+
+
+def apply_tpch_query_params(n: int, sql: str, sf: int) -> str:
+    """Mirror of ematix_flow_core::tpch_params::apply_tpch_query_params —
+    Q11's HAVING fraction is 0.0001/SF per the TPC-H spec, so at SF>1 the
+    literal in q11.sql must be scaled or the query is degenerate AND the
+    ematix runner (which applies the same transform) would report a
+    different row count, tripping the aggregator's correctness flag."""
+    if n == 11 and sf > 1:
+        return sql.replace("0.0001", f"(0.0001 / {sf})", 1)
+    return sql
 
 
 # -----------------------------------------------------------------------------
@@ -173,6 +196,7 @@ def benchmark_all(
     queries_dir: Path,
     trials: int,
     warmups: int,
+    sf: int,
 ) -> Dict[str, dict]:
     """Run all 22 TPC-H queries, returning the per-query result dict."""
     out: Dict[str, dict] = {}
@@ -183,7 +207,7 @@ def benchmark_all(
             print(f"!! missing {path}, skipping", flush=True)
             continue
 
-        sql = adapt_sql_for_spark(path.read_text())
+        sql = apply_tpch_query_params(n, adapt_sql_for_spark(path.read_text()), sf)
 
         print(f"== {qid} (warmups={warmups}, trials={trials})", flush=True)
         # Warmups — JVM optimization, Catalyst codegen cache priming.
@@ -293,6 +317,10 @@ def main(argv: List[str]) -> int:
     spark = build_spark(app_name=f"tpch-sf{args.sf}-bench")
     cluster_size = 4
     try:
+        # Version comes from the LIVE session — never hardcode it, or a
+        # version bump in install.sh silently mislabels results.
+        spark_version = spark.version
+
         print("==> registering tables", flush=True)
         register_tables(spark, args.bucket, args.sf)
 
@@ -302,18 +330,19 @@ def main(argv: List[str]) -> int:
         cluster_size = cluster_size_from_spark(spark)
 
         print("==> running queries", flush=True)
-        results = benchmark_all(spark, args.queries_dir, args.trials, args.warmups)
+        results = benchmark_all(spark, args.queries_dir, args.trials, args.warmups, args.sf)
     finally:
         spark.stop()
 
     doc = {
         "engine": "pyspark",
-        "version": "3.5.4",
+        "version": spark_version,
         "scale_factor": args.sf,
         "cluster_size": cluster_size,
         "stamp": stamp,
         "trials": args.trials,
         "warmups": args.warmups,
+        "provenance": provenance.collect(),
         "queries": results,
     }
     body = json.dumps(doc, indent=2, sort_keys=True).encode("utf-8")

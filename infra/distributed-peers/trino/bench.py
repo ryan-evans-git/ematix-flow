@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""TPC-H benchmark runner for Trino 440 against the AWS-campaign cluster.
+"""TPC-H benchmark runner for Trino (482 at the 2026-07-04 refresh; the
+reported version is read from the live cluster, not hardcoded) against
+the AWS-campaign cluster.
 
 Reads SQL files from examples/tpch/queries/q*.sql, runs each one through
 the coordinator's HTTP API via the `trino` Python client, times trial
@@ -36,6 +38,10 @@ import time
 from pathlib import Path
 from typing import Iterable
 
+# Shared campaign provenance capture (instance type, AZ, git SHA, env).
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import provenance  # noqa: E402
+
 # These get imported lazily inside main() so --help works without them.
 # (When run on a fresh coordinator the script does `pip install` itself
 # first, so we want --help to still work pre-install.)
@@ -58,17 +64,30 @@ from typing import Iterable
 #        column-list form, so this works as-is. No rewrite needed.
 #
 #   Q22: SUBSTRING(c_phone FROM 1 FOR 2) — standard SQL syntax, Trino
-#        supports it natively. No rewrite needed.
+#        supports it natively. No rewrite needed. (Re-verified for the
+#        482 refresh, 2026-07-04: the ANSI FROM/FOR form is unchanged.)
 #
 #   Q01: `date '1998-12-01' - interval '90' day` — Trino accepts the
 #        interval-year-month and interval-day-second short forms with a
-#        unit keyword. No rewrite needed.
+#        unit keyword. No rewrite needed. (Re-verified for 482: ANSI
+#        interval literals unchanged.)
 #
 # Net result: all 22 queries currently pass through unmodified. The
 # REWRITES dict is kept here so we can patch a specific query without
 # touching the shared examples/tpch/queries/*.sql files (which are
 # DataFusion-canonical).
 REWRITES: dict[str, "callable[[str], str]"] = {}
+
+
+def apply_tpch_query_params(qid: str, sql: str, sf: int) -> str:
+    """Mirror of ematix_flow_core::tpch_params::apply_tpch_query_params —
+    Q11's HAVING fraction is 0.0001/SF per the TPC-H spec, so at SF>1 the
+    literal in q11.sql must be scaled or the query is degenerate AND the
+    ematix runner (which applies the same transform) would report a
+    different row count, tripping the aggregator's correctness flag."""
+    if qid == "Q11" and sf > 1:
+        return sql.replace("0.0001", f"(0.0001 / {sf})", 1)
+    return sql
 
 
 def load_query(queries_dir: Path, qid: str) -> str:
@@ -248,10 +267,22 @@ def main(argv: list[str] | None = None) -> int:
         request_timeout=600,
     )
 
+    # Engine version from the LIVE cluster — never hardcode it, or a
+    # version bump in install.sh silently mislabels results.
+    try:
+        vcur = conn.cursor()
+        vcur.execute("SELECT version()")
+        trino_version = str(vcur.fetchone()[0])
+        vcur.close()
+    except Exception as exc:  # noqa: BLE001
+        print(f"warning: could not read version(): {exc}", file=sys.stderr)
+        trino_version = "unknown"
+    print(f"==> trino version: {trino_version}")
+
     queries_out: dict[str, dict] = {}
     failures: dict[str, str] = {}
     for qid in qids:
-        sql = load_query(queries_dir, qid)
+        sql = apply_tpch_query_params(qid, load_query(queries_dir, qid), args.sf)
         try:
             queries_out[qid] = bench_one(conn, qid, sql, args.trials, args.warmups)
         except Exception as exc:  # noqa: BLE001 - we want to keep going
@@ -269,9 +300,12 @@ def main(argv: list[str] | None = None) -> int:
 
     result = {
         "engine": "trino",
-        "version": "440",
+        "version": trino_version,
         "scale_factor": args.sf,
         "cluster_size": args.cluster_size,
+        "trials": args.trials,
+        "warmups": args.warmups,
+        "provenance": provenance.collect(),
         "queries": queries_out,
     }
 

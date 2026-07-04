@@ -239,6 +239,7 @@ locals {
   base_userdata = templatefile("${path.module}/userdata/base.sh", {
     aws_region   = var.aws_region
     bench_bucket = var.bench_bucket
+    git_ref      = var.git_ref
   })
 
   # Engine bootstrap path. "none" → just base.
@@ -395,14 +396,4 @@ resource "aws_glue_catalog_database" "tpch" {
   name  = var.glue_database_name
 
   description = "TPC-H tables registered for Trino in the distributed bench campaign. Drop after teardown."
-}
-
-# Need cloudinit provider
-terraform {
-  required_providers {
-    cloudinit = {
-      source  = "hashicorp/cloudinit"
-      version = "~> 2.3"
-    }
-  }
 }
