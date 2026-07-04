@@ -6,6 +6,7 @@
 # Master host: ${coordinator_ip}
 # Bench bucket: ${bench_bucket}
 
+set -eo pipefail
 set -uo pipefail
 exec > >(tee /var/log/pyspark-userdata.log) 2>&1
 
