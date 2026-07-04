@@ -6,6 +6,24 @@
 //! `infra/test-validation-distributed/`. Workers are `flow-worker`
 //! processes listening on Arrow Flight (port 50051 by default).
 //!
+//! ## Session construction (2026-07-04 refresh)
+//!
+//! The session is built through `preset::with_optimizer_rules_overridden`
+//! with default `HarnessOverrides` — the PRODUCTION rule chain (dedupe +
+//! inject trio + swap-semi + force-collect-left + RANGE.AGG + push-semi +
+//! rh-sum + L9 milestone sideband + `FlowQueryPlanner`), exactly what
+//! `DistributedBackend::build_context` installs in production. The old
+//! hand-built `RULESET=bench|preset` fork predated the rule-chain
+//! unification (2026-07-02/03) and measured a STALE, non-production
+//! plan; it is gone. Parity is pinned by
+//! `campaign_preset_parity_tests` below (run:
+//! `cargo test -p ematix-flow-distributed --example tpch_distributed_campaign`).
+//!
+//! Levers stay auto-gated: with no env set, `EMAT_TARGET_PARTITIONS`
+//! resolves through the cross-process registry (a solo process — the
+//! normal state on a dedicated cloud node — senses live=1 and gets
+//! full cores), and each rule self-gates on its own `EMAT_*` var.
+//!
 //! ## Env vars
 //!
 //!   EMATIX_PEERS            comma-separated worker URLs, e.g.
@@ -19,11 +37,19 @@
 //!   TPCH_WARMUPS            untimed warmups per query. Default: 2
 //!   OUTPUT_PATH             where to write JSON. Default: stdout
 //!   TPCH_QUERIES            comma-separated 1-22 subset. Default: all 22
+//!   PARTITIONS              explicit target_partitions override (the
+//!                           strict-harness precedence; TARGET_PARTITIONS
+//!                           accepted as a legacy alias). Unset ⇒ the
+//!                           preset's concurrency-aware AUTO resolution.
+//!   NO_DISTRIBUTE           set ⇒ single-node diagnostic run (no mesh)
+//!   CUSTOM_SQL / EXPLAIN_ONLY  diagnostics, unchanged (see below)
 //!
 //! ## Output
 //!
 //! JSON conforming to the campaign schema (see
-//! `docs/AWS_CAMPAIGN_2026_05_PLAN.md`). Includes both `median_ms`
+//! `docs/AWS_CAMPAIGN_2026_05_PLAN.md`) plus a `provenance` block
+//! (instance type, AZ, git SHA, EMAT_* env, engine versions) mirroring
+//! the strict local protocol's env.json. Includes both `median_ms`
 //! across all trials and `median_trials_3_5_ms` so JVM/cache warmup
 //! costs are comparable across engines (PySpark + Trino bench scripts
 //! emit the same shape).
@@ -31,6 +57,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -42,17 +69,7 @@ use datafusion::prelude::{SessionConfig, SessionContext};
 use datafusion_distributed::{
     CompressionType, DistributedExt, DistributedPhysicalOptimizerRule, WorkerResolver,
 };
-use ematix_flow_core::preset;
-// Bench-parity rule set (NO_DISTRIBUTE diagnostic) — mirrors examples/explain_query.rs.
-use ematix_flow_core::dedupe_aggregate_rule::DedupeAggregateForFloatDeterminism;
-use ematix_flow_core::dict_aggregate_rule::EnableDictGroupCountRule;
-use ematix_flow_core::force_collect_left_semi_build_rule::ForceCollectLeftForSemiBoundedBuildRule;
-use ematix_flow_core::fused_aggregate_filter_multi_agg_rule::InjectFilterMultiAggRule;
-use ematix_flow_core::fused_aggregate_filter_sum_rule::InjectFilterSumRule;
-use ematix_flow_core::push_down_left_semi_rule::PushDownLeftSemiRule;
-use ematix_flow_core::runtime_bloom_sideband_rule::EnableRuntimeBloomSidebandRule;
-use ematix_flow_core::swap_emat_hash_join_rule::SwapEmatixHashJoinRule;
-use ematix_flow_core::swap_semi_join_build_rule::SwapSemiJoinBuildSideRule;
+use ematix_flow_core::preset::{self, HarnessOverrides};
 use serde::Serialize;
 use url::Url;
 
@@ -84,12 +101,44 @@ struct QueryStats {
     rows_returned: usize,
 }
 
+/// Run provenance — the campaign-side equivalent of the strict local
+/// protocol's `env.json` (`scripts/bench/strict_common.sh::capture_env`).
+/// Every field is best-effort: a missing IMDS endpoint (running off
+/// EC2), missing git, or missing Cargo.lock degrades to `null`, never
+/// to a failed run.
+#[derive(Serialize)]
+struct Provenance {
+    captured_at_unix: u64,
+    hostname: Option<String>,
+    os: &'static str,
+    arch: &'static str,
+    cores: usize,
+    /// EC2 instance type via IMDSv2 (`null` off-EC2 / local).
+    instance_type: Option<String>,
+    /// EC2 availability zone via IMDSv2 (`null` off-EC2 / local).
+    availability_zone: Option<String>,
+    git_sha: Option<String>,
+    git_branch: Option<String>,
+    git_dirty: Option<bool>,
+    rustc: Option<String>,
+    /// Key dependency versions parsed from the workspace Cargo.lock.
+    engine_versions: BTreeMap<&'static str, Option<String>>,
+    /// Every EMAT_* / EMATIX_* / TPCH_* / PARTITIONS / RAYON_NUM_THREADS
+    /// env var visible to this process — the lever state of the run.
+    emat_env: BTreeMap<String, String>,
+    peers: Vec<String>,
+    distributed: bool,
+}
+
 #[derive(Serialize)]
 struct CampaignOutput {
     engine: &'static str,
     version: &'static str,
     scale_factor: u32,
     cluster_size: usize,
+    trials: usize,
+    warmups: usize,
+    provenance: Provenance,
     queries: BTreeMap<String, QueryStats>,
 }
 
@@ -163,84 +212,59 @@ fn median_trials_3_5(ms: &[f64]) -> f64 {
     median(&ms[2..5])
 }
 
-/// Build the campaign `SessionState`.
-///
-/// Rule set is chosen by `RULESET`:
-///   - `bench` (DEFAULT): the production triangulation bench's EXPLICIT rule
-///     chain on plain parquet — the plan that runs Q05 SF=10 in ~214ms
-///     single-node (76× faster than preset). Mirrors examples/explain_query.rs.
-///   - `preset`: the public-library default (`preset::with_optimizer_rules`),
-///     kept as the diagnostic reference for the #315 Q05 pathology.
-///
-/// `distributed` appends `DistributedPhysicalOptimizerRule` LAST (the standard
-/// datafusion-distributed integration: split the *fully-optimized* plan into
-/// network stages) + the worker resolver + LZ4_FRAME exchange compression. The
-/// old code added the distributed rule BEFORE preset's rules, so preset ran on
-/// an already stage-split plan — part of what we're isolating here.
-///
-/// Custom emat operators (BloomEmitter via EnableRuntimeBloomSidebandRule,
-/// EmatixHashJoinExec via SwapEmatixHashJoinRule) emit physical nodes that
-/// datafusion-distributed must serialize across the Flight mesh. They are
-/// gated OUT of the distributed `bench` arm unless DIST_CUSTOM_OPS=1, so we can
-/// first establish whether the *standard*-operator rules alone survive
-/// distribution and fix Q05.
-fn build_session_state(distributed: bool, resolver: StaticPeers) -> SessionState {
-    let use_preset = matches!(std::env::var("RULESET").as_deref(), Ok("preset"));
-    // Custom-operator rules: always on single-node; opt-in for distributed.
-    let custom_ops = !distributed || std::env::var_os("DIST_CUSTOM_OPS").is_some();
-
-    // TARGET_PARTITIONS: positive int → with_target_partitions(N); "default"/"0"
-    // leaves DataFusion's default (available_parallelism). Lets us A/B the
-    // partition count — the suspected real Q05 lever (the old preset/distributed
-    // builder never set it; the bench arm set 14). Unset ⇒ 14 (bench parity).
-    let mut cfg = SessionConfig::new().with_collect_statistics(true);
-    match std::env::var("TARGET_PARTITIONS").ok().as_deref() {
-        Some("default") | Some("0") => {}
-        Some(n) if n.parse::<usize>().is_ok() => {
-            cfg = cfg.with_target_partitions(n.parse::<usize>().unwrap());
+/// Explicit `PARTITIONS=N` override (`TARGET_PARTITIONS` legacy alias,
+/// `PARTITIONS` wins when both are set). `None` ⇒ the preset's
+/// concurrency-aware AUTO resolution owns the value.
+fn explicit_partitions() -> Option<usize> {
+    for key in ["PARTITIONS", "TARGET_PARTITIONS"] {
+        if let Some(n) = std::env::var(key)
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&n| n >= 1)
+        {
+            return Some(n);
         }
-        _ => cfg = cfg.with_target_partitions(14),
     }
-    eprintln!(
-        "  (ruleset={} distributed={} custom_ops={} target_partitions={})",
-        if use_preset { "preset" } else { "bench" },
-        distributed,
-        custom_ops,
-        cfg.target_partitions(),
-    );
+    None
+}
+
+/// Build the campaign `SessionState` through the PRODUCTION preset
+/// constructor (`preset::with_optimizer_rules_overridden`, the
+/// rule-chain-unification single source of truth — same migration as
+/// `tpch_triangulation_bench` / `stage_profiler`).
+///
+/// The only override is partition precedence: an explicit
+/// `PARTITIONS=N` env sets `with_target_partitions(N)` and switches
+/// `auto_target_partitions` OFF so the preset never second-guesses it
+/// at a different instant. With no override the preset resolves
+/// `target_partitions` itself (`EMAT_TARGET_PARTITIONS` tri-state +
+/// cross-process AUTO sensing — a solo process on a dedicated cloud
+/// node resolves to full cores) and sizes the rayon decode pool once
+/// per process.
+///
+/// `distributed` appends `DistributedPhysicalOptimizerRule` LAST (the
+/// standard datafusion-distributed integration: split the
+/// *fully-optimized* plan into network stages) + the worker resolver +
+/// LZ4_FRAME exchange compression — identical composition to
+/// `DistributedBackend::build_context`.
+fn build_session_state(distributed: bool, resolver: StaticPeers) -> SessionState {
+    let explicit = explicit_partitions();
+    let mut cfg = SessionConfig::new().with_collect_statistics(true);
+    if let Some(n) = explicit {
+        cfg = cfg.with_target_partitions(n);
+    }
+    let overrides = HarnessOverrides {
+        auto_target_partitions: explicit.is_none(),
+        ..HarnessOverrides::default()
+    };
 
     let base = SessionStateBuilder::new()
         .with_config(cfg)
         .with_default_features();
-
-    let mut builder = if use_preset {
-        // Library default. Note: preset already bundles SwapSemiJoinBuildSideRule,
-        // ForceCollectLeftForSemiBoundedBuildRule, PushDownLeftSemiRule, the bloom
-        // sideband rule, and the FlowQueryPlanner reorder — so "add the build-side
-        // subset" is a no-op against preset; the Q05 lever is elsewhere.
-        preset::with_optimizer_rules_and_registry(base).0
-    } else {
-        // Explicit bench-parity chain (the 214ms single-node Q05 plan).
-        base.with_optimizer_rule(Arc::new(PushDownLeftSemiRule))
-            .with_physical_optimizer_rule(Arc::new(DedupeAggregateForFloatDeterminism::default()))
-            .with_physical_optimizer_rule(Arc::new(EnableDictGroupCountRule))
-            .with_physical_optimizer_rule(Arc::new(InjectFilterMultiAggRule))
-            .with_physical_optimizer_rule(Arc::new(InjectFilterSumRule))
-            .with_physical_optimizer_rule(Arc::new(SwapSemiJoinBuildSideRule))
-            .with_physical_optimizer_rule(Arc::new(
-                ForceCollectLeftForSemiBoundedBuildRule::default(),
-            ))
-    };
-
-    // Custom emat operators — only in the bench arm, gated for distributed.
-    if !use_preset && custom_ops {
-        builder = builder
-            .with_physical_optimizer_rule(Arc::new(EnableRuntimeBloomSidebandRule::default()))
-            .with_physical_optimizer_rule(Arc::new(SwapEmatixHashJoinRule));
-    }
+    let (builder, _handles) = preset::with_optimizer_rules_overridden(base, &overrides);
 
     if distributed {
-        builder = builder
+        let builder = builder
             .with_physical_optimizer_rule(Arc::new(DistributedPhysicalOptimizerRule))
             .with_distributed_worker_resolver(resolver);
         builder
@@ -249,6 +273,120 @@ fn build_session_state(distributed: bool, resolver: StaticPeers) -> SessionState
             .build()
     } else {
         builder.build()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Provenance capture
+// ---------------------------------------------------------------------------
+
+/// Run a command, return trimmed stdout on success.
+fn sh(cmd: &str, args: &[&str]) -> Option<String> {
+    let out = Command::new(cmd).args(args).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if s.is_empty() { None } else { Some(s) }
+}
+
+/// IMDSv2 lookup with a hard 1s budget per call — shells out to curl
+/// (present on AL2023 + macOS) so we don't grow an HTTP-client dep.
+/// Returns `None` off-EC2 (curl times out / non-2xx).
+fn imds(path: &str) -> Option<String> {
+    let token = sh(
+        "curl",
+        &[
+            "-fsS",
+            "-m",
+            "1",
+            "-X",
+            "PUT",
+            "-H",
+            "X-aws-ec2-metadata-token-ttl-seconds: 60",
+            "http://169.254.169.254/latest/api/token",
+        ],
+    )?;
+    sh(
+        "curl",
+        &[
+            "-fsS",
+            "-m",
+            "1",
+            "-H",
+            &format!("X-aws-ec2-metadata-token: {token}"),
+            &format!("http://169.254.169.254/latest/meta-data/{path}"),
+        ],
+    )
+}
+
+/// First `version` for `name` in the workspace Cargo.lock (registry deps).
+fn lock_version(workspace_root: &Path, name: &str) -> Option<String> {
+    let text = fs::read_to_string(workspace_root.join("Cargo.lock")).ok()?;
+    let needle = format!("name = \"{name}\"");
+    let mut lines = text.lines();
+    while let Some(line) = lines.next() {
+        if line.trim() == needle {
+            if let Some(v) = lines.next() {
+                return v
+                    .trim()
+                    .strip_prefix("version = \"")
+                    .and_then(|s| s.strip_suffix('"'))
+                    .map(str::to_string);
+            }
+        }
+    }
+    None
+}
+
+fn capture_provenance(workspace_root: &Path, peers: &[String], distributed: bool) -> Provenance {
+    let git = |args: &[&str]| {
+        let mut full = vec!["-C", workspace_root.to_str().unwrap_or(".")];
+        full.extend_from_slice(args);
+        sh("git", &full)
+    };
+    let emat_env: BTreeMap<String, String> = std::env::vars()
+        .filter(|(k, _)| {
+            k.starts_with("EMAT_")
+                || k.starts_with("EMATIX_")
+                || k.starts_with("TPCH_")
+                || k == "PARTITIONS"
+                || k == "TARGET_PARTITIONS"
+                || k == "RAYON_NUM_THREADS"
+                || k == "NO_DISTRIBUTE"
+        })
+        .collect();
+    let mut engine_versions = BTreeMap::new();
+    for dep in [
+        "datafusion",
+        "datafusion-distributed",
+        "ematix-parquet-codec",
+    ] {
+        engine_versions.insert(dep, lock_version(workspace_root, dep));
+    }
+    Provenance {
+        captured_at_unix: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+        hostname: sh("hostname", &[]),
+        os: std::env::consts::OS,
+        arch: std::env::consts::ARCH,
+        cores: std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1),
+        instance_type: imds("instance-type"),
+        availability_zone: imds("placement/availability-zone"),
+        git_sha: git(&["rev-parse", "HEAD"]),
+        git_branch: git(&["rev-parse", "--abbrev-ref", "HEAD"]),
+        git_dirty: git(&["status", "--porcelain"])
+            .map(|s| !s.is_empty())
+            .or(Some(false)),
+        rustc: sh("rustc", &["--version"]),
+        engine_versions,
+        emat_env,
+        peers: peers.to_vec(),
+        distributed,
     }
 }
 
@@ -291,21 +429,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Build the SessionState ourselves so we get BOTH the distributed
-    // planner AND our preset rules (dedupe-for-f64-determinism +
-    // multi-agg / sum / dict-group-count). Going through
-    // `DistributedBackend::open` would give us only the distributed
-    // planner; Q15 would non-deterministically return 0 rows because
-    // the dedupe rule wouldn't fire (caught in local smoke test
-    // 2026-05-22).
+    // planner AND the production preset chain (dedupe-for-f64-determinism
+    // included — without it Q15 non-deterministically returns 0 rows,
+    // caught in local smoke test 2026-05-22).
     let urls: Vec<Url> = peers
         .iter()
         .map(|s| Url::parse(s).unwrap_or_else(|e| panic!("bad EMATIX_PEERS url '{s}': {e}")))
         .collect();
     let resolver = StaticPeers { urls };
-    // Rule chain + topology selected by RULESET (bench|preset) and NO_DISTRIBUTE
-    // (single-node vs the Flight mesh). See build_session_state.
+    // NO_DISTRIBUTE: single-node diagnostic (same rules, no Flight mesh).
     let distributed = std::env::var_os("NO_DISTRIBUTE").is_none();
+    let provenance = capture_provenance(&workspace_root, &peers, distributed);
     let state = build_session_state(distributed, resolver);
+    eprintln!(
+        "  (distributed={distributed} target_partitions={} instance_type={:?})",
+        state.config().target_partitions(),
+        provenance.instance_type,
+    );
     let ctx = Arc::new(SessionContext::from(state));
     for table in TPCH_TABLES {
         let p = data_dir.join(format!("{table}.parquet"));
@@ -426,6 +566,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         version: env!("CARGO_PKG_VERSION"),
         scale_factor,
         cluster_size,
+        trials,
+        warmups,
+        provenance,
         queries,
     };
 
@@ -460,5 +603,75 @@ fn find_workspace_root() -> Option<PathBuf> {
             return Some(cur.to_path_buf());
         }
         cur = cur.parent()?;
+    }
+}
+
+/// Bench↔preset parity pins (2026-07-04 refresh, mirrors
+/// `bench_preset_parity_tests` in tpch_triangulation_bench and
+/// `profiler_preset_parity_tests` in stage_profiler): the campaign's
+/// single-node session must carry EXACTLY the production preset chain,
+/// and the distributed session must be that chain + the
+/// datafusion-distributed stage-splitter appended LAST.
+///
+/// Run: `cargo test -p ematix-flow-distributed --example tpch_distributed_campaign`
+#[cfg(test)]
+mod campaign_preset_parity_tests {
+    use super::*;
+
+    fn no_peers() -> StaticPeers {
+        StaticPeers { urls: vec![] }
+    }
+
+    #[test]
+    fn single_node_rule_chain_equals_production_preset() {
+        let state = build_session_state(false, no_peers());
+        let (physical, logical) = preset::ematix_rule_names(&state);
+        assert_eq!(
+            physical,
+            preset::PRODUCTION_PHYSICAL_RULE_NAMES,
+            "campaign PHYSICAL rule chain diverged from the production preset"
+        );
+        assert_eq!(
+            logical,
+            preset::PRODUCTION_LOGICAL_RULE_NAMES,
+            "campaign LOGICAL rule chain diverged from the production preset"
+        );
+        assert_eq!(
+            format!("{:?}", state.query_planner()),
+            "FlowQueryPlanner",
+            "campaign must ship the production FlowQueryPlanner"
+        );
+    }
+
+    #[test]
+    fn distributed_appends_stage_splitter_last() {
+        let state = build_session_state(
+            true,
+            StaticPeers {
+                urls: vec![Url::parse("http://127.0.0.1:50051").unwrap()],
+            },
+        );
+        let (physical, logical) = preset::ematix_rule_names(&state);
+        assert_eq!(
+            logical,
+            preset::PRODUCTION_LOGICAL_RULE_NAMES,
+            "distributed LOGICAL chain diverged from the production preset"
+        );
+        let n = preset::PRODUCTION_PHYSICAL_RULE_NAMES.len();
+        assert_eq!(
+            &physical[..n],
+            preset::PRODUCTION_PHYSICAL_RULE_NAMES,
+            "distributed PHYSICAL chain must start with the production preset"
+        );
+        assert_eq!(
+            physical.len(),
+            n + 1,
+            "distributed chain must add exactly one rule (the stage splitter): {physical:?}"
+        );
+        assert!(
+            physical[n].to_lowercase().contains("distributed"),
+            "the appended rule must be the datafusion-distributed stage splitter, got {}",
+            physical[n]
+        );
     }
 }
