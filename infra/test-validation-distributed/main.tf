@@ -85,7 +85,7 @@ data "aws_subnet" "anchor" {
 
 resource "aws_security_group" "cluster" {
   name        = "${local.base_name}-cluster"
-  description = "ematix-flow distributed cluster — intra-SG traffic only"
+  description = "ematix-flow distributed cluster - intra-SG traffic only"
   vpc_id      = data.aws_vpc.default.id
 
   # SSH only if pubkey provided (emergency console)
